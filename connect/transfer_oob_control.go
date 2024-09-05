@@ -8,7 +8,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	"bringyour.com/protocol"
+	"github.com/urnetwork/protocol"
 )
 
 // control messages for a client out of band with the client sequence

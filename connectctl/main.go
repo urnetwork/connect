@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+
 	// "os/exec"
 	// "path/filepath"
 	// "encoding/json"
@@ -20,6 +21,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+
 	// "encoding/base64"
 	"bytes"
 
@@ -29,8 +31,8 @@ import (
 
 	"github.com/docopt/docopt-go"
 
-	"bringyour.com/connect"
-	"bringyour.com/protocol"
+	"github.com/urnetwork/connect/connect"
+	"github.com/urnetwork/protocol"
 )
 
 const ConnectCtlVersion = "0.0.1"

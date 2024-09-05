@@ -4,11 +4,13 @@ import (
 	"context"
 	"sync"
 	"time"
+
 	// "errors"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
+
 	// "slices"
 	// "runtime/debug"
 
@@ -18,7 +20,7 @@ import (
 
 	"github.com/golang/glog"
 
-	"bringyour.com/protocol"
+	"github.com/urnetwork/protocol"
 )
 
 // manage contracts which are embedded into each transfer sequence

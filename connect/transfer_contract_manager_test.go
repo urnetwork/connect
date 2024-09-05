@@ -13,7 +13,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	"bringyour.com/protocol"
+	"github.com/urnetwork/protocol"
 )
 
 func TestTakeContract(t *testing.T) {

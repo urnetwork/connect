@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"strconv"
 	"time"
+
 	// "slices"
 
 	"crypto/tls"
@@ -23,6 +24,7 @@ import (
 	// "crypto/x509/pkix"
 	"crypto/hmac"
 	"crypto/sha256"
+
 	// "encoding/pem"
 	// "encoding/json"
 	// "flag"
@@ -44,7 +46,7 @@ import (
 
 	// "src.agwa.name/tlshacks"
 
-	"bringyour.com/protocol"
+	"github.com/urnetwork/protocol"
 )
 
 // an extender uses an independent url that is hard-coded to forward to the platform

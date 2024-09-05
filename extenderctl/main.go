@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+
 	// "os/exec"
 	// "path/filepath"
 	// "encoding/json"
@@ -19,6 +20,7 @@ import (
 	// "io"
 	"net"
 	"net/url"
+
 	// "net/http"
 	"log"
 	// "encoding/json"
@@ -32,9 +34,9 @@ import (
 
 	"github.com/docopt/docopt-go"
 
-	"bringyour.com/connect"
-	// "bringyour.com/connect"
-	// "bringyour.com/protocol"
+	"github.com/urnetwork/connect/connect"
+	// "github.com/urnetwork/connect/connect"
+	// "github.com/urnetwork/protocol"
 )
 
 // run [secret] [allowed host] [port]

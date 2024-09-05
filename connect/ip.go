@@ -23,7 +23,7 @@ import (
 
 	"github.com/golang/glog"
 
-	"bringyour.com/protocol"
+	"github.com/urnetwork/protocol"
 )
 
 // implements user-space NAT (UNAT) and packet inspection

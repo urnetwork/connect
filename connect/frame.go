@@ -5,7 +5,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	"bringyour.com/protocol"
+	"github.com/urnetwork/protocol"
 )
 
 func ToFrame(message proto.Message) (*protocol.Frame, error) {

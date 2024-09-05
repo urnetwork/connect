@@ -11,8 +11,8 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"bringyour.com/connect"
-	"bringyour.com/protocol"
+	"github.com/urnetwork/connect/connect"
+	"github.com/urnetwork/protocol"
 )
 
 // see https://android.googlesource.com/platform/development/+/master/samples/ToyVpn/server/linux/ToyVpnServer.cpp

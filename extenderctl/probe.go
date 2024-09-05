@@ -3,13 +3,14 @@ package main
 import (
 	"net"
 	"net/http"
+
 	// "net/url"
 	"crypto/tls"
 	"fmt"
 	mathrand "math/rand"
 	"time"
 
-	"bringyour.com/connect"
+	"github.com/urnetwork/connect/connect"
 )
 
 func SearchMailExtenders(
