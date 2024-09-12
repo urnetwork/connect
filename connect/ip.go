@@ -277,6 +277,10 @@ func (self *LocalUserNat) Run() {
 	forwardPort(8080)
 	forwardPort(80)
 	forwardPort(443)
+	forwardPort(465)
+	forwardPort(993)
+	forwardPort(995)
+	forwardPort(853)
 
 	for {
 		select {
