@@ -20,12 +20,14 @@ require (
 	golang.org/x/sys v0.25.0
 	golang.org/x/term v0.24.0
 	google.golang.org/protobuf v1.33.0
+	gvisor.dev/gvisor v0.0.0-20240912184249-d4480ca03532
 	src.agwa.name/tlshacks v0.0.0-20231008131857-90d701ba3225
 )
 
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/go-task/slim-sprig v0.0.0-20230315185526-52ccab3ef572 // indirect
+	github.com/google/btree v1.1.2 // indirect
 	github.com/google/pprof v0.0.0-20210407192527-94a9f03dee38 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/onsi/ginkgo/v2 v2.9.5 // indirect
@@ -52,6 +54,7 @@ require (
 	golang.org/x/mod v0.20.0 // indirect
 	golang.org/x/sync v0.8.0 // indirect
 	golang.org/x/text v0.18.0 // indirect
+	golang.org/x/time v0.5.0 // indirect
 	golang.org/x/tools v0.24.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
