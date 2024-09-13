@@ -219,6 +219,18 @@ func (self *LocalUserNat) Run() {
 		return
 	}
 
+	go func() {
+		buffer := make([]byte, 2000)
+		for self.ctx.Err() == nil {
+			n, err := dev.Read(buffer)
+			if err != nil {
+				glog.Infof("[lnr]read error = %s\n", err)
+				return
+			}
+			self.receive(TransferPath{}, IpProtocolUnknown, buffer[0:n])
+		}
+	}()
+
 	forwardPort := func(portNumber int) {
 
 		go func() {
@@ -237,7 +249,9 @@ func (self *LocalUserNat) Run() {
 
 				go func() {
 					defer c.Close()
-					glog.Info("Accepted connection to ", c.LocalAddr())
+					if glog.V(2) {
+						glog.Info("Accepted connection to ", c.LocalAddr())
+					}
 
 					local := c.LocalAddr()
 
