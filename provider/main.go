@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 	"syscall"
 
 	"golang.org/x/term"
@@ -22,7 +25,7 @@ import (
 const DefaultApiUrl = "https://api.bringyour.com"
 const DefaultConnectUrl = "wss://connect.bringyour.com"
 
-const LocalVersion = "0.0.0-local"
+const LocalVersion = "0.0.0"
 
 func main() {
 	usage := fmt.Sprintf(
@@ -33,7 +36,9 @@ The default urls are:
     connect_url: %s
 
 Usage:
-    provider provide [--port=<port>] --user_auth=<user_auth> [--password=<password>]
+    provider auth ([<auth_code>] | --user_auth=<user_auth> [--password=<password>]) [-f]
+    	[--api_url=<api_url>]
+    provider provide [--port=<port>]
         [--api_url=<api_url>]
         [--connect_url=<connect_url>]
     
@@ -44,7 +49,7 @@ Options:
     --connect_url=<connect_url>
     --user_auth=<user_auth>
     --password=<password>
-    -p --port=<port>   Listen port [default: 80].`,
+    -p --port=<port>   Status server port [default: no status server].`,
 		DefaultApiUrl,
 		DefaultConnectUrl,
 	)
@@ -54,25 +59,158 @@ Options:
 		panic(err)
 	}
 
-	if provide_, _ := opts.Bool("provide"); provide_ {
+	if auth_, _ := opts.Bool("auth"); auth_ {
+		auth(opts)
+	} else if provide_, _ := opts.Bool("provide"); provide_ {
 		provide(opts)
+	}
+}
+
+func auth(opts docopt.Opts) {
+
+	home, ok := os.LookupEnv("HOME")
+	if !ok {
+		panic(fmt.Errorf("HOME not set."))
+	}
+	urNetworkDir := filepath.Join(home, ".urnetwork")
+	jwtPath := filepath.Join(urNetworkDir, "jwt")
+
+	if _, err := os.Stat(jwtPath); !errors.Is(err, os.ErrNotExist) {
+		// jwt exists
+		if force, _ := opts.Bool("-f"); !force {
+			fmt.Printf("%s exists. Overwrite? [yN]\n", jwtPath)
+
+			reader := bufio.NewReader(os.Stdin)
+			confirm, _ := reader.ReadString('\n')
+			if strings.ToLower(strings.TrimSpace(confirm)) != "y" {
+				return
+			}
+
+		}
+	}
+
+	apiUrl, err := opts.String("--api_url")
+	if err != nil {
+		apiUrl = DefaultApiUrl
+	}
+
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	event := connect.NewEventWithContext(cancelCtx)
+	event.SetOnSignals(syscall.SIGINT, syscall.SIGQUIT, syscall.SIGTERM)
+
+	ctx := event.Ctx()
+
+	clientStrategy := connect.NewClientStrategyWithDefaults(ctx)
+
+	api := connect.NewBringYourApi(ctx, clientStrategy, apiUrl)
+
+	var byJwt string
+	if userAuth, err := opts.String("--user_auth"); err == nil {
+		// user_auth and password
+
+		var password string
+		if password, err = opts.String("--password"); err == nil {
+			fmt.Print("Enter password: ")
+			passwordBytes, err := term.ReadPassword(int(syscall.Stdin))
+			if err != nil {
+				panic(err)
+			}
+			password = string(passwordBytes)
+			fmt.Printf("\n")
+		}
+
+		// fmt.Printf("userAuth='%s'; password='%s'\n", userAuth, password)
+
+		loginCallback, loginChannel := connect.NewBlockingApiCallback[*connect.AuthLoginWithPasswordResult](ctx)
+
+		loginArgs := &connect.AuthLoginWithPasswordArgs{
+			UserAuth: userAuth,
+			Password: password,
+		}
+
+		api.AuthLoginWithPassword(loginArgs, loginCallback)
+
+		var loginResult connect.ApiCallbackResult[*connect.AuthLoginWithPasswordResult]
+		select {
+		case <-ctx.Done():
+			os.Exit(0)
+		case loginResult = <-loginChannel:
+		}
+
+		if loginResult.Error != nil {
+			panic(loginResult.Error)
+		}
+		if loginResult.Result.Error != nil {
+			panic(fmt.Errorf("%s", loginResult.Result.Error.Message))
+		}
+		if loginResult.Result.VerificationRequired != nil {
+			panic(fmt.Errorf("Verification required for %s. Use the app or web to complete account setup.", loginResult.Result.VerificationRequired.UserAuth))
+		}
+
+		byJwt = loginResult.Result.Network.ByJwt
+	} else {
+		// auth_code
+		authCode, _ := opts.String("<auth_code>")
+		if authCode == "" {
+			fmt.Print("Enter auth code: ")
+			authCodeBytes, err := term.ReadPassword(int(syscall.Stdin))
+			if err != nil {
+				panic(err)
+			}
+			authCode = strings.TrimSpace(string(authCodeBytes))
+			fmt.Printf("\n")
+		}
+
+		fmt.Printf("AUTH CODE: %s\n", authCode)
+
+		authCodeLogin := &connect.AuthCodeLoginArgs{
+			AuthCode: authCode,
+		}
+
+		authCodeLoginCallback, authCodeLoginChannel := connect.NewBlockingApiCallback[*connect.AuthCodeLoginResult](ctx)
+
+		api.AuthCodeLogin(authCodeLogin, authCodeLoginCallback)
+
+		var authCodeLoginResult connect.ApiCallbackResult[*connect.AuthCodeLoginResult]
+		select {
+		case <-ctx.Done():
+			os.Exit(0)
+		case authCodeLoginResult = <-authCodeLoginChannel:
+		}
+
+		if authCodeLoginResult.Error != nil {
+			panic(authCodeLoginResult.Error)
+		}
+		if authCodeLoginResult.Result.Error != nil {
+			panic(fmt.Errorf("%s", authCodeLoginResult.Result.Error.Message))
+		}
+
+		fmt.Printf("LOGIN RESULT: %+v\n", authCodeLoginResult.Result)
+
+		byJwt = authCodeLoginResult.Result.ByJwt
+	}
+
+	if byJwt != "" {
+		if err := os.MkdirAll(urNetworkDir, 0700); err != nil {
+			panic(err)
+		}
+		os.WriteFile(jwtPath, []byte(byJwt), 0700)
+		fmt.Printf("Jwt written to %s\n", jwtPath)
 	}
 }
 
 func provide(opts docopt.Opts) {
 	port, _ := opts.Int("--port")
 
-	var apiUrl string
-	if apiUrlAny := opts["--api_url"]; apiUrlAny != nil {
-		apiUrl = apiUrlAny.(string)
-	} else {
+	apiUrl, err := opts.String("--api_url")
+	if err != nil {
 		apiUrl = DefaultApiUrl
 	}
 
-	var connectUrl string
-	if connectUrlAny := opts["--connect_url"]; connectUrlAny != nil {
-		connectUrl = connectUrlAny.(string)
-	} else {
+	connectUrl, err := opts.String("--connect_url")
+	if err != nil {
 		connectUrl = DefaultConnectUrl
 	}
 
@@ -86,7 +224,10 @@ func provide(opts docopt.Opts) {
 
 	clientStrategy := connect.NewClientStrategyWithDefaults(ctx)
 
-	byClientJwt, clientId := provideAuth(ctx, clientStrategy, apiUrl, opts)
+	byClientJwt, clientId, err := provideAuth(ctx, clientStrategy, apiUrl, opts)
+	if err != nil {
+		panic(err)
+	}
 
 	instanceId := connect.NewId()
 
@@ -119,30 +260,34 @@ func provide(opts docopt.Opts) {
 	}
 	connectClient.ContractManager().SetProvideModes(provideModes)
 
-	fmt.Printf(
-		"Status %s on *:%d\n",
-		RequireVersion(),
-		port,
-	)
-
-	statusServer := &http.Server{
-		Addr:    fmt.Sprintf(":%d", port),
-		Handler: &Status{},
-	}
-
-	go func() {
-		defer cancel()
-		err := statusServer.ListenAndServe()
-		if err != nil {
-			fmt.Printf("status error: %s\n", err)
+	if 0 < port {
+		fmt.Printf(
+			"Provider %s started. Status on *:%d\n",
+			RequireVersion(),
+			port,
+		)
+		statusServer := &http.Server{
+			Addr:    fmt.Sprintf(":%d", port),
+			Handler: &Status{},
 		}
-	}()
+		defer statusServer.Shutdown(ctx)
 
+		go func() {
+			defer cancel()
+			err := statusServer.ListenAndServe()
+			if err != nil {
+				fmt.Printf("status error: %s\n", err)
+			}
+		}()
+	} else {
+		fmt.Printf(
+			"Provider %s started\n",
+			RequireVersion(),
+		)
+	}
 	select {
 	case <-ctx.Done():
 	}
-
-	statusServer.Shutdown(ctx)
 
 	remoteUserNatProvider.Close()
 	localUserNat.Close()
@@ -152,53 +297,29 @@ func provide(opts docopt.Opts) {
 	os.Exit(0)
 }
 
-func provideAuth(ctx context.Context, clientStrategy *connect.ClientStrategy, apiUrl string, opts docopt.Opts) (byClientJwt string, clientId connect.Id) {
-	userAuth := opts["--user_auth"].(string)
+func provideAuth(ctx context.Context, clientStrategy *connect.ClientStrategy, apiUrl string, opts docopt.Opts) (byClientJwt string, clientId connect.Id, returnErr error) {
+	home, ok := os.LookupEnv("HOME")
+	if !ok {
+		panic(fmt.Errorf("HOME not set."))
+	}
+	jwtPath := filepath.Join(home, ".urnetwork", "jwt")
 
-	var password string
-	if passwordAny := opts["--password"]; passwordAny != nil {
-		password = passwordAny.(string)
-	} else {
-		fmt.Print("Enter password: ")
-		passwordBytes, err := term.ReadPassword(int(syscall.Stdin))
-		if err != nil {
-			panic(err)
-		}
-		password = string(passwordBytes)
-		fmt.Printf("\n")
+	if _, err := os.Stat(jwtPath); errors.Is(err, os.ErrNotExist) {
+		// jwt does not exist
+		returnErr = fmt.Errorf("Jwt does not exist at %s", jwtPath)
+		return
 	}
 
-	// fmt.Printf("userAuth='%s'; password='%s'\n", userAuth, password)
+	byJwtBytes, err := os.ReadFile(jwtPath)
+	if err != nil {
+		returnErr = err
+		return
+	}
+	byJwt := strings.TrimSpace(string(byJwtBytes))
 
 	api := connect.NewBringYourApi(ctx, clientStrategy, apiUrl)
 
-	loginCallback, loginChannel := connect.NewBlockingApiCallback[*connect.AuthLoginWithPasswordResult](ctx)
-
-	loginArgs := &connect.AuthLoginWithPasswordArgs{
-		UserAuth: userAuth,
-		Password: password,
-	}
-
-	api.AuthLoginWithPassword(loginArgs, loginCallback)
-
-	var loginResult connect.ApiCallbackResult[*connect.AuthLoginWithPasswordResult]
-	select {
-	case <-ctx.Done():
-		os.Exit(0)
-	case loginResult = <-loginChannel:
-	}
-
-	if loginResult.Error != nil {
-		panic(loginResult.Error)
-	}
-	if loginResult.Result.Error != nil {
-		panic(fmt.Errorf("%s", loginResult.Result.Error.Message))
-	}
-	if loginResult.Result.VerificationRequired != nil {
-		panic(fmt.Errorf("Verification required for %s. Use the app or web to complete account setup.", loginResult.Result.VerificationRequired.UserAuth))
-	}
-
-	api.SetByJwt(loginResult.Result.Network.ByJwt)
+	api.SetByJwt(byJwt)
 
 	authClientCallback, authClientChannel := connect.NewBlockingApiCallback[*connect.AuthNetworkClientResult](ctx)
 
@@ -294,12 +415,12 @@ func RequireVersion() string {
 	if version := os.Getenv("WARP_VERSION"); version != "" {
 		return version
 	}
-	return LocalVersion
+	return fmt.Sprintf("%s-%s", LocalVersion, RequireHost())
 }
 
 func RequireConfigVersion() string {
 	if version := os.Getenv("WARP_CONFIG_VERSION"); version != "" {
 		return version
 	}
-	return LocalVersion
+	return fmt.Sprintf("%s-%s", LocalVersion, RequireHost())
 }
