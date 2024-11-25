@@ -376,3 +376,30 @@ func (self *BringYourApi) ConnectControl(connectControl *ConnectControlArgs, cal
 		callback,
 	)
 }
+
+type AuthCodeLoginCallback ApiCallback[*AuthCodeLoginResult]
+
+type AuthCodeLoginArgs struct {
+	AuthCode string `json:"auth_code"`
+}
+
+type AuthCodeLoginResult struct {
+	ByJwt string              `json:"by_jwt,omitempty"`
+	Error *AuthCodeLoginError `json:"error,omitempty"`
+}
+
+type AuthCodeLoginError struct {
+	Message string `json:"message"`
+}
+
+func (self *BringYourApi) AuthCodeLogin(authCodeLogin *AuthCodeLoginArgs, callback AuthCodeLoginCallback) {
+	go HttpPostWithStrategy(
+		self.ctx,
+		self.clientStrategy,
+		fmt.Sprintf("%s/auth/code-login", self.apiUrl),
+		authCodeLogin,
+		self.ByJwt(),
+		&AuthCodeLoginResult{},
+		callback,
+	)
+}

@@ -3,6 +3,7 @@ package tether
 import (
 	"errors"
 	"reflect"
+	"slices"
 	"testing"
 
 	uwgtun "github.com/urnetwork/userwireguard/tun"
@@ -196,8 +197,10 @@ func TestClientGetAvailableDevices(t *testing.T) {
 	c.AddDevice("device2", &mockDevice{name: "device2"})
 
 	deviceNames := c.GetAvailableDevices()
+	slices.Sort(deviceNames)
 
 	expectedDeviceNames := []string{"device1", "device2"}
+	slices.Sort(expectedDeviceNames)
 	if !reflect.DeepEqual(deviceNames, expectedDeviceNames) {
 		t.Errorf("Devices() returned unexpected device names:\nGot: %v\nWant: %v", deviceNames, expectedDeviceNames)
 	}
