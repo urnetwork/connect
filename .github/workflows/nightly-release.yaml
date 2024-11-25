@@ -18,6 +18,17 @@ jobs:
           fetch-depth: "0"
           fetch-tags: "true"
 
+      - name: "Setup nix env"
+        uses: JRMurr/direnv-nix-action@v4.1.0
+
+      - name: Use Latest userwireguard and protocol
+        working-directory: connect
+        run: |
+          go mod edit -dropreplace github.com/urnetwork/userwireguard@v0.0.0
+          go mod edit -dropreplace github.com/urnetwork/protocol@v0.0.0
+          go mod edit -require github.com/urnetwork/userwireguard@latest -require github.com/urnetwork/protocol@latest
+          go mod tidy
+
       - name: Install semver-release
         run: |
           go install github.com/urnetwork/semver-release@v0.0.8
@@ -27,10 +38,6 @@ jobs:
         id: releases_needed
         run: |
           echo "RELEASE_NEEDED=$(semver-release release-needed)" >> "$GITHUB_OUTPUT"
-
-      - name: "Setup nix env"
-        if: ${{ steps.releases_needed.outputs.RELEASE_NEEDED == 'true'}}
-        uses: JRMurr/direnv-nix-action@v4.1.0
 
       - name: run tests
         if: ${{ steps.releases_needed.outputs.RELEASE_NEEDED == 'true'}}

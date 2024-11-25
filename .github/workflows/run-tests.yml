@@ -19,11 +19,18 @@ jobs:
           path: bringyour
 
       - name: Checkout Another Repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "^1.23.0"
+      - name: "Setup env"
+        uses: JRMurr/direnv-nix-action@v4.1.0
+
+      - name: Use Latest userwireguard and protocol
+        working-directory: connect
+        run: |
+          go mod edit -dropreplace github.com/urnetwork/userwireguard@v0.0.0
+          go mod edit -dropreplace github.com/urnetwork/protocol@v0.0.0
+          go mod edit -require github.com/urnetwork/userwireguard@latest -require github.com/urnetwork/protocol@latest
+          go mod tidy
 
       - name: Run Tests
         run: |
