@@ -1,0 +1,64 @@
+name: Build Release
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch: # Allows manual triggering
+  schedule:
+    - cron: "50 18 * * *"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: "0"
+          fetch-tags: "true"
+
+      - name: Install semver-release
+        run: |
+          go install github.com/urnetwork/semver-release@v0.0.8
+          echo "$HOME/go/bin/" >> "$GITHUB_PATH"
+
+      - name: Check if releases are needed
+        id: releases_needed
+        run: |
+          echo "RELEASE_NEEDED=$(semver-release release-needed)" >> "$GITHUB_OUTPUT"
+
+      - name: "Setup nix env"
+        if: ${{ steps.releases_needed.outputs.RELEASE_NEEDED == 'true'}}
+        uses: JRMurr/direnv-nix-action@v4.1.0
+
+      - name: run tests
+        if: ${{ steps.releases_needed.outputs.RELEASE_NEEDED == 'true'}}
+        run: |
+          go test ./...
+
+      - name: Create Release
+        if: ${{ steps.releases_needed.outputs.RELEASE_NEEDED == 'true'}}
+        id: create-release
+        run: |
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/$GITHUB_REPOSITORY
+          PREVIOUS_RELEASE="$($HOME/go/bin/semver-release latest .)"
+          $HOME/go/bin/semver-release release
+          git push origin --tags
+          CURRENT_RELEASE="$($HOME/go/bin/semver-release latest .)"
+
+          set -x
+          echo "## Release Commits `v$PREVIOUS_RELEASE`..`v$CURRENT_RELEASE`" > release-commits.md
+          git log "v$PREVIOUS_RELEASE".."v$CURRENT_RELEASE^" --oneline | sed 's/^/- /' -  >> release-commits.md
+
+          echo "version=$($HOME/go/bin/semver-release latest .)" >> "$GITHUB_OUTPUT"
+
+      - name: Create Github Release
+        if: ${{ steps.releases_needed.outputs.RELEASE_NEEDED == 'true'}}
+        uses: "comnoco/create-release-action@v2"
+        with:
+          tag_name: v${{steps.create-release.outputs.version}}
+          release_name: Release ${{steps.create-release.outputs.version}}
+          body_path: release-commits.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
