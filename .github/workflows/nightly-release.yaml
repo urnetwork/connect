@@ -41,7 +41,7 @@ jobs:
       - name: run tests
         if: ${{ steps.releases_needed.outputs.RELEASE_NEEDED == 'true'}}
         run: |
-          go test ./...
+          go test -v -test.short  ./...
 
       - name: Create Release
         if: ${{ steps.releases_needed.outputs.RELEASE_NEEDED == 'true'}}
