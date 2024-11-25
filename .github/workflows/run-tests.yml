@@ -25,7 +25,6 @@ jobs:
         uses: JRMurr/direnv-nix-action@v4.1.0
 
       - name: Use Latest userwireguard and protocol
-        working-directory: connect
         run: |
           go mod edit -dropreplace github.com/urnetwork/userwireguard@v0.0.0
           go mod edit -dropreplace github.com/urnetwork/protocol@v0.0.0
