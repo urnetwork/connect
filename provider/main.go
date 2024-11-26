@@ -162,8 +162,6 @@ func auth(opts docopt.Opts) {
 			fmt.Printf("\n")
 		}
 
-		fmt.Printf("AUTH CODE: %s\n", authCode)
-
 		authCodeLogin := &connect.AuthCodeLoginArgs{
 			AuthCode: authCode,
 		}
@@ -185,8 +183,6 @@ func auth(opts docopt.Opts) {
 		if authCodeLoginResult.Result.Error != nil {
 			panic(fmt.Errorf("%s", authCodeLoginResult.Result.Error.Message))
 		}
-
-		fmt.Printf("LOGIN RESULT: %+v\n", authCodeLoginResult.Result)
 
 		byJwt = authCodeLoginResult.Result.ByJwt
 	}
