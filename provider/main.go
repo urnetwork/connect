@@ -67,10 +67,9 @@ Options:
 }
 
 func auth(opts docopt.Opts) {
-
-	home, ok := os.LookupEnv("HOME")
-	if !ok {
-		panic(fmt.Errorf("HOME not set."))
+	home, err := os.UserHomeDir()
+	if err != nil {
+		panic(err)
 	}
 	urNetworkDir := filepath.Join(home, ".urnetwork")
 	jwtPath := filepath.Join(urNetworkDir, "jwt")
@@ -298,9 +297,9 @@ func provide(opts docopt.Opts) {
 }
 
 func provideAuth(ctx context.Context, clientStrategy *connect.ClientStrategy, apiUrl string, opts docopt.Opts) (byClientJwt string, clientId connect.Id, returnErr error) {
-	home, ok := os.LookupEnv("HOME")
-	if !ok {
-		panic(fmt.Errorf("HOME not set."))
+	home, err := os.UserHomeDir()
+	if err != nil {
+		panic(err)
 	}
 	jwtPath := filepath.Join(home, ".urnetwork", "jwt")
 
