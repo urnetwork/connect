@@ -1429,6 +1429,9 @@ components:
                 user_auth:
                     description: email or phone number
                     type: string
+                use_numeric:
+                    description: optionally create a numeric 6 digit code instead of the default 8 digit
+                    type: boolean
 
         AuthVerifySendResult:
             type: object
