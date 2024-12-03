@@ -1902,7 +1902,7 @@ components:
                     type: array
                     items:
                         type: object
-                        properites:
+                        properties:
                             client_id:
                                 description: udid
                                 type: string
