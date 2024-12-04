@@ -403,3 +403,15 @@ func (self *BringYourApi) AuthCodeLogin(authCodeLogin *AuthCodeLoginArgs, callba
 		callback,
 	)
 }
+
+func (self *BringYourApi) AuthCodeLoginSync(authCodeLogin *AuthCodeLoginArgs) (*AuthCodeLoginResult, error) {
+	return HttpPostWithStrategy(
+		self.ctx,
+		self.clientStrategy,
+		fmt.Sprintf("%s/auth/code-login", self.apiUrl),
+		authCodeLogin,
+		self.ByJwt(),
+		&AuthCodeLoginResult{},
+		NewNoopApiCallback[*AuthCodeLoginResult](),
+	)
+}
