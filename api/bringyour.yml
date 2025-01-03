@@ -1567,8 +1567,11 @@ components:
         UpgradeGuestResult:
             type: object
             properties:
-                by_jwt:
-                    type: string
+                network:
+                    type: object
+                    properties:
+                        by_jwt:
+                            type: string
                 verification_required:
                     type: object
                     properties:
