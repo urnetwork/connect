@@ -321,6 +321,26 @@ paths:
                             schema:
                                 $ref: "#/components/schemas/AuthCodeLoginResult"
 
+    /auth/upgrade-guest:
+        post:
+            description: |
+                Authenticates a guest user, migrates to a normal account
+            operationId: Upgrade Guest
+            security:
+                - BearerAuth: []
+            requestBody:
+                required: true
+                content:
+                    application/json:
+                        schema:
+                            $ref: "#/components/schemas/UpgradeGuestArgs"
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: "#/components/schemas/UpgradeGuestResult"
+
     /network/auth-client:
         post:
             description: |
@@ -1514,6 +1534,41 @@ components:
                             type: string
                         network_name:
                             type: string
+                verification_required:
+                    type: object
+                    properties:
+                        user_auth:
+                            description: email or phone number
+                            type: string
+                error:
+                    type: object
+                    properties:
+                        message:
+                            type: string
+
+        UpgradeGuestArgs:
+            type: object
+            properties:
+                user_auth:
+                    description: email or phone number
+                    type: string
+                auth_jwt:
+                    type: string
+                auth_jwt_type:
+                    type: string
+                    enum:
+                        - apple
+                        - google
+                password:
+                    type: string
+                network_name:
+                    type: string
+
+        UpgradeGuestResult:
+            type: object
+            properties:
+                by_jwt:
+                    type: string
                 verification_required:
                     type: object
                     properties:
