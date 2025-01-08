@@ -97,8 +97,8 @@ github.com/twitchyliquid64/golang-asm v0.15.1 h1:SU5vSMR7hnwNxj24w34ZyCi/FmDZTkS
 github.com/twitchyliquid64/golang-asm v0.15.1/go.mod h1:a1lVb/DtPvCB8fslRZhAngC2+aY1QWCk3Cedj/Gdt08=
 github.com/ugorji/go/codec v1.2.12 h1:9LC83zGrHhuUA9l16C9AHXAqEV/2wBQ4nkvumAE65EE=
 github.com/ugorji/go/codec v1.2.12/go.mod h1:UNopzCgEMSXjBc6AOMqYvWC1ktqTAfzJZUZgYf6w6lg=
-github.com/urnetwork/protocol v0.1.0 h1:XgBEVJ+8K24jVJH37CwkBi/szzh54PWBQaODElto5KQ=
-github.com/urnetwork/protocol v0.1.0/go.mod h1:+JJm4mqeK95mTRMAGMeddzdUpPEnZmp2U8RYPjXb/JQ=
+github.com/urnetwork/connect/protocol v0.1.0 h1:XgBEVJ+8K24jVJH37CwkBi/szzh54PWBQaODElto5KQ=
+github.com/urnetwork/connect/protocol v0.1.0/go.mod h1:+JJm4mqeK95mTRMAGMeddzdUpPEnZmp2U8RYPjXb/JQ=
 github.com/urnetwork/userwireguard v0.0.1 h1:6tG7Oas3Ca1UPjenVmcuYmX87uRIyzc/3hz640wFwsM=
 github.com/urnetwork/userwireguard v0.0.1/go.mod h1:4o4/Mpn+ipHHx998wXkRt4yRXZh1bMMl2Ybivh71gLo=
 go.uber.org/mock v0.4.0 h1:VcM4ZOtdbR4f6VXfiOpwpVJDL6lCReaZ6mw31wqh7KU=

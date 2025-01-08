@@ -6,7 +6,7 @@ import (
 
 	"github.com/golang/glog"
 
-	"github.com/urnetwork/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 // control sync is a pattern to sync control messages between the server and client

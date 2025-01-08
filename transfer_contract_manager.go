@@ -21,7 +21,7 @@ import (
 
 	"github.com/golang/glog"
 
-	"github.com/urnetwork/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 // manage contracts which are embedded into each transfer sequence
