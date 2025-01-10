@@ -33,6 +33,9 @@ import (
 // note the net_* files are migrated from net.IP/IPNet to netip.Addr/Prefix
 // TODO generally the entire package should migrate over to these newer structs
 
+type HttpPostRawFunction func(ctx context.Context, requestUrl string, requestBodyBytes []byte, byJwt string) ([]byte, error)
+type HttpGetRawFunction func(ctx context.Context, requestUrl string, byJwt string) ([]byte, error)
+
 type DialTlsContextFunction = func(ctx context.Context, network string, addr string) (net.Conn, error)
 
 func DefaultClientStrategySettings() *ClientStrategySettings {
@@ -1037,7 +1040,80 @@ func NewBlockingApiCallback[R any](ctx context.Context) (ApiCallback[R], chan Ap
 	return apiCallback, c
 }
 
-func HttpPostWithStrategy[R any](ctx context.Context, clientStrategy *ClientStrategy, requestUrl string, args any, byJwt string, result R, callback ApiCallback[R]) (R, error) {
+func HttpPostWithStrategyRaw(
+	ctx context.Context,
+	clientStrategy *ClientStrategy,
+	requestUrl string,
+	requestBodyBytes []byte,
+	byJwt string,
+) ([]byte, error) {
+	request, err := http.NewRequestWithContext(
+		ctx,
+		"POST",
+		requestUrl,
+		bytes.NewReader(requestBodyBytes),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	request.Header.Add("Content-Type", "text/json")
+
+	if byJwt != "" {
+		auth := fmt.Sprintf("Bearer %s", byJwt)
+		request.Header.Add("Authorization", auth)
+	}
+
+	helloRequest, err := HelloRequestFromUrl(ctx, requestUrl, byJwt)
+	if err != nil {
+		return nil, err
+	}
+
+	r, err := clientStrategy.HttpSerial(request, helloRequest)
+	if err != nil {
+		return nil, err
+	}
+
+	if http.StatusOK != r.response.StatusCode {
+		// the response body is the error message
+		err = fmt.Errorf("%s: %s", r.response.Status, strings.TrimSpace(string(r.bodyBytes)))
+		return nil, err
+	}
+
+	return r.bodyBytes, nil
+}
+
+func HttpPostWithStrategy[R any](
+	ctx context.Context,
+	clientStrategy *ClientStrategy,
+	requestUrl string,
+	args any,
+	byJwt string,
+	result R,
+	callback ApiCallback[R],
+) (R, error) {
+	return HttpPostWithRawFunction(
+		ctx,
+		func(ctx context.Context, requestUrl string, requestBodyBytes []byte, byJwt string) ([]byte, error) {
+			return HttpPostWithStrategyRaw(ctx, clientStrategy, requestUrl, requestBodyBytes, byJwt)
+		},
+		requestUrl,
+		args,
+		byJwt,
+		result,
+		callback,
+	)
+}
+
+func HttpPostWithRawFunction[R any](
+	ctx context.Context,
+	httpPostRaw HttpPostRawFunction,
+	requestUrl string,
+	args any,
+	byJwt string,
+	result R,
+	callback ApiCallback[R],
+) (R, error) {
 	var requestBodyBytes []byte
 	if args == nil {
 		requestBodyBytes = make([]byte, 0)
@@ -1051,43 +1127,14 @@ func HttpPostWithStrategy[R any](ctx context.Context, clientStrategy *ClientStra
 		}
 	}
 
-	request, err := http.NewRequestWithContext(ctx, "POST", requestUrl, bytes.NewReader(requestBodyBytes))
+	bodyBytes, err := httpPostRaw(ctx, requestUrl, requestBodyBytes, byJwt)
 	if err != nil {
 		var empty R
 		callback.Result(empty, err)
 		return empty, err
 	}
 
-	request.Header.Add("Content-Type", "text/json")
-
-	if byJwt != "" {
-		auth := fmt.Sprintf("Bearer %s", byJwt)
-		request.Header.Add("Authorization", auth)
-	}
-
-	helloRequest, err := HelloRequestFromUrl(ctx, requestUrl, byJwt)
-	if err != nil {
-		var empty R
-		callback.Result(empty, err)
-		return empty, err
-	}
-
-	r, err := clientStrategy.HttpSerial(request, helloRequest)
-	if err != nil {
-		var empty R
-		callback.Result(empty, err)
-		return empty, err
-	}
-
-	if http.StatusOK != r.response.StatusCode {
-		// the response body is the error message
-		err = fmt.Errorf("%s: %s", r.response.Status, strings.TrimSpace(string(r.bodyBytes)))
-		var empty R
-		callback.Result(empty, err)
-		return empty, err
-	}
-
-	err = json.Unmarshal(r.bodyBytes, &result)
+	err = json.Unmarshal(bodyBytes, &result)
 	if err != nil {
 		var empty R
 		callback.Result(empty, err)
@@ -1099,7 +1146,6 @@ func HttpPostWithStrategy[R any](ctx context.Context, clientStrategy *ClientStra
 }
 
 func HelloRequestFromUrl(ctx context.Context, requestUrl string, byJwt string) (*http.Request, error) {
-
 	u, err := url.Parse(requestUrl)
 	if err != nil {
 		return nil, err
@@ -1121,12 +1167,15 @@ func HelloRequestFromUrl(ctx context.Context, requestUrl string, byJwt string) (
 	return req, nil
 }
 
-func HttpGetWithStrategy[R any](ctx context.Context, clientStrategy *ClientStrategy, requestUrl string, byJwt string, result R, callback ApiCallback[R]) (R, error) {
+func HttpGetWithStrategyRaw(
+	ctx context.Context,
+	clientStrategy *ClientStrategy,
+	requestUrl string,
+	byJwt string,
+) ([]byte, error) {
 	request, err := http.NewRequestWithContext(ctx, "GET", requestUrl, nil)
 	if err != nil {
-		var empty R
-		callback.Result(empty, err)
-		return empty, err
+		return nil, err
 	}
 
 	request.Header.Add("Content-Type", "text/json")
@@ -1138,20 +1187,54 @@ func HttpGetWithStrategy[R any](ctx context.Context, clientStrategy *ClientStrat
 
 	r, err := clientStrategy.HttpParallel(request)
 	if err != nil {
-		var empty R
-		callback.Result(empty, err)
-		return empty, err
+		return nil, err
 	}
 
 	if http.StatusOK != r.response.StatusCode {
 		// the response body is the error message
 		err = fmt.Errorf("%s: %s", r.response.Status, strings.TrimSpace(string(r.bodyBytes)))
+		return nil, err
+	}
+
+	return r.bodyBytes, nil
+}
+
+func HttpGetWithStrategy[R any](
+	ctx context.Context,
+	clientStrategy *ClientStrategy,
+	requestUrl string,
+	byJwt string,
+	result R,
+	callback ApiCallback[R],
+) (R, error) {
+	return HttpGetWithRawFunction[R](
+		ctx,
+		func(ctx context.Context, requestUrl string, byJwt string) ([]byte, error) {
+			return HttpGetWithStrategyRaw(ctx, clientStrategy, requestUrl, byJwt)
+		},
+		requestUrl,
+		byJwt,
+		result,
+		callback,
+	)
+}
+
+func HttpGetWithRawFunction[R any](
+	ctx context.Context,
+	httpGetRaw HttpGetRawFunction,
+	requestUrl string,
+	byJwt string,
+	result R,
+	callback ApiCallback[R],
+) (R, error) {
+	bodyBytes, err := httpGetRaw(ctx, requestUrl, byJwt)
+	if err != nil {
 		var empty R
 		callback.Result(empty, err)
 		return empty, err
 	}
 
-	err = json.Unmarshal(r.bodyBytes, &result)
+	err = json.Unmarshal(bodyBytes, &result)
 	if err != nil {
 		var empty R
 		callback.Result(empty, err)
