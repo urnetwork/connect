@@ -47,7 +47,7 @@ import (
 
 	// "src.agwa.name/tlshacks"
 
-	"github.com/urnetwork/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 // server listens for a tls connect and replies with a self-signed cert

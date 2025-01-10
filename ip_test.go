@@ -16,7 +16,7 @@ import (
 
 	"github.com/go-playground/assert/v2"
 
-	"github.com/urnetwork/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 func TestClientUdp4(t *testing.T) {

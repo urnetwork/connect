@@ -38,7 +38,7 @@ import (
 
 	"github.com/urnetwork/connect"
 	// "github.com/urnetwork/connect"
-	// "github.com/urnetwork/protocol"
+	// "github.com/urnetwork/connect/protocol"
 )
 
 // run [secret] [allowed host] [port]

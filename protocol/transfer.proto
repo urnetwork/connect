@@ -1,0 +1,274 @@
+syntax = "proto3";
+package bringyour;
+
+import "frame.proto";
+
+option go_package = "github.com/urnetwork/connect/protocol";
+
+
+// changes 2024-08: 
+// 1. transfer can now be addressed to/from a stream_id
+//    Anywhere transfer would be addressed to a destination_id or from a source_id,
+//    it can now be to/from a stream_id.
+// 2. stream_ids are created by adding intermediary_destination_ids to CreateContract
+// 3. multi-hop state is created with StreamOpen
+//    This is sent each time a stream contract is created,
+//    so that the hop state can time out the same as the sender state.
+
+
+// stream_id replaces the source_id and destination_id
+message TransferPath {
+    // ulid
+    optional bytes source_id = 2;
+    // ulid
+    optional bytes destination_id = 1;
+    // ulid
+    optional bytes stream_id = 3;
+}
+
+
+message TransferFrame {
+    TransferPath transfer_path = 1;
+    Frame frame = 2;
+}
+
+
+// this is the minimal subset of `TransferFrame` used when making a routing decision
+message FilteredTransferFrame {
+    TransferPath transfer_path = 1;
+}
+
+
+message FilteredTransferFrameWithFrame {
+    TransferPath transfer_path = 1;
+    FilteredFrame frame = 2;
+}
+
+
+message Pack {
+    // ulid
+    bytes message_id = 1;
+    // ulid
+    bytes sequence_id = 2;
+    uint64 sequence_number = 3;
+    // this marks the head message in the sender's sequence
+    // it means that any message with an earlier sequence_id won't arrive
+    // and is used when a receiver is recreated with zero state
+    bool head = 4;
+
+    repeated Frame frames = 5;
+
+    // when true, deliver out of sequence with no acks and no retry
+    // use true when there is an external transfer control
+    // default to false for backward compatibility
+    bool nack = 6;
+
+    optional Frame contract_frame = 7;
+
+    // this is threaded back by the `Ack`
+    // so that the client can compute a single message rtt
+    optional Tag tag = 8;
+
+    // contract_id lock
+    // this is required for nack messages. There is no need to set this for ack messages.
+    // ulid
+    optional bytes contract_id = 9;
+}
+
+
+// used for deep message inspection
+message FilteredPack {
+    optional Frame contract_frame = 7;
+}
+
+
+// ack of a later message means all prior messages have been ackd
+message Ack {
+    // ulid
+    bytes message_id = 1;
+    // ulid
+    bytes sequence_id = 2;
+    // all data buffered in the receiver is acked with `selective=true`. When released it is acked with `selective=false`
+    bool selective = 3;
+
+    // from the `Pack` this responds to
+    optional Tag tag = 4;
+}
+
+
+message Tag {
+    uint64 send_time = 1;
+}
+
+
+// this is a connection local message that is sent at the start of each connection to the control platform
+// there is no response. the other side will close the connection if no auth
+// no auth can happen if the jwt is not valid, or the client_id is not associated with the jwt
+// note that association of the client_id to the jwt uses the api (see openapi spec in the api dir)
+message Auth {
+    // the jwt will have the client_id in it
+    string by_jwt = 1;
+    // the version of the app, a semver managed by warp
+    string app_version = 2;
+
+    // the pair (client_id, instance_id) represents a single in memory instance
+    // this helps the platform distinguish multiple instances from multiple transports of the same instance
+    bytes instance_id = 3;
+}
+
+
+// CHANGE FROM PRIOR VERSION, modes should be considered individually as a mask and do not imply other modes
+enum ProvideMode {
+    None = 0; // this is interpreted the same as a `null` provide mode
+    Network = 1;
+    FriendsAndFamily = 2;
+    Public = 3;
+    Stream = 4;
+    PublicStream = 5;
+}
+
+
+message Provide {
+    repeated ProvideKey keys = 1;
+}
+
+
+message ProvideKey {
+    ProvideMode mode = 1;
+    // used to sign the `StoredContract` bytes
+    bytes provide_secret_key = 2;
+}
+
+
+// each hop on the stream receives this to configure its state,
+// including the first and last hops
+// this is sent each time a stream contract is created
+message StreamOpen {
+    // ulid
+    optional bytes source_id = 2;
+    // ulid
+    optional bytes destination_id = 1;
+    // ulid
+    bytes stream_id = 3;
+}
+
+// each hop on the stream receives this to configure its state
+// this is sent when all open contracts for the stream are closed
+message StreamClose {
+    // ulid
+    bytes stream_id = 3;
+}
+
+
+// control message to create a contract
+// platform sends a CreateContractResult
+message CreateContract {
+    // ulid
+    optional bytes destination_id = 1;
+    uint64 transfer_byte_count = 2;
+    // restrict the contract to a companion of an existing open contract
+    bool companion = 3;
+    // ulids
+    repeated bytes used_contract_ids = 4;
+
+    // ulids
+    repeated bytes intermediary_ids = 5;
+    // ulid
+    optional bytes stream_id = 6;
+    // stream will be used when intermediary_ids or stream_id is set
+    // in the case of wanting to use streams with no intermediaries, set `force_stream=true`
+    optional bool force_stream = 7;
+}
+// the creator knows all the hops on the stream from the enumerated linpaths
+// when evaluating the completed contracts, the send and receive count involving the source_id
+// is the baseline to evaluate the other contracts for disputes
+
+
+enum ContractError {
+    NoPermission = 0;
+    InsufficientBalance = 1;
+    Setup = 2;
+}
+
+
+message CreateContractResult {
+    optional ContractError error = 1;
+    // the public contract to share with the transfer destination
+    // note this may contain a `stream_id` which directs the client to switch to a stream
+    optional Contract contract = 2;
+
+    // echo the `CreateContract` to allow associating the result with the request
+    optional CreateContract create_contract = 3;
+}
+
+
+// append this message inline a pack to enable the connection
+message Contract {
+    // ulid
+    bytes stored_contract_bytes = 1;
+    // `stored_contract_bytes` signed with the `provider_secret_key`
+    bytes stored_contract_hmac = 2;
+    // the client must always verify the provide mode by matching the `provider_secret_key` for that mode to the hmac
+    ProvideMode provide_mode = 3;
+}
+
+
+// stream_id replaces the source_id and destination_id
+message StoredContract {
+    bytes contract_id = 1;
+    uint64 transfer_byte_count = 2;
+    // ulid
+    optional bytes source_id = 3;
+    // ulid
+    optional bytes destination_id = 4;
+    // ulid
+    optional bytes stream_id = 5;
+    
+    // relative priority
+    // 0 (missing) is least priority
+    // any positive priority value is 100% more than 0
+    // generally only positive priority data will matter for the community payouts,
+    // and priority will scale the payout amount,
+    // so it is in a provider's interest to prioritize data with positive priority
+    optional uint32 priority = 6;
+}
+
+
+// control message
+message CloseContract {
+    bytes contract_id = 1;
+    uint64 acked_byte_count = 2;
+    uint64 unacked_byte_count = 3;
+    bool checkpoint = 4;
+}
+
+
+// peer auditing
+// the acl will block contracts between between two parties with bad audits of each other
+message PeerAudit {
+    // ulid
+    bytes peer_id = 1;
+    // number of seconds in the audit
+    uint64 duration = 2;
+    bool abuse = 3;
+    uint64 bad_contract_count = 4;
+    uint64 discarded_byte_count = 5;
+    uint64 discarded_count = 6;
+    uint64 bad_message_byte_count = 7;
+    uint64 bad_message_count = 8;
+    uint64 send_byte_count = 9;
+    uint64 send_count = 10;
+    uint64 resend_byte_count = 11;
+    uint64 resend_count = 12;
+    // ulid
+    bytes stream_id = 13;
+}
+
+
+message ControlPing {
+}
+
+
+message ProvidePing {
+}
+

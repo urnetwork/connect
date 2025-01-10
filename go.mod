@@ -13,7 +13,6 @@ require (
 	github.com/mattn/go-shellwords v1.0.12
 	github.com/oklog/ulid/v2 v2.1.0
 	github.com/quic-go/quic-go v0.46.0
-	github.com/urnetwork/protocol v0.0.0
 	github.com/urnetwork/userwireguard v0.0.0
 	golang.org/x/exp v0.0.0-20240506185415-9bf2ced13842
 	golang.org/x/term v0.20.0
@@ -61,7 +60,5 @@ require (
 	golang.org/x/text v0.15.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-replace github.com/urnetwork/protocol v0.0.0 => ../protocol
 
 replace github.com/urnetwork/userwireguard v0.0.0 => ../userwireguard

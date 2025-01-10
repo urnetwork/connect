@@ -24,11 +24,16 @@ jobs:
       - name: "Setup env"
         uses: JRMurr/direnv-nix-action@v4.1.0
 
-      - name: Use Latest userwireguard and protocol
+      - name: Check if the current protobuf go files are up to date
+        working-directory: protocol
+        run: |
+          make
+          git diff --exit-code
+
+      - name: Use Latest userwireguard
         run: |
           go mod edit -dropreplace github.com/urnetwork/userwireguard@v0.0.0
-          go mod edit -dropreplace github.com/urnetwork/protocol@v0.0.0
-          go mod edit -require github.com/urnetwork/userwireguard@latest -require github.com/urnetwork/protocol@latest
+          go mod edit -require github.com/urnetwork/userwireguard@latest
           go mod tidy
 
       - name: Run Tests
