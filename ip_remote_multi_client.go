@@ -54,10 +54,10 @@ type MultiClientGenerator interface {
 
 func DefaultMultiClientSettings() *MultiClientSettings {
 	return &MultiClientSettings{
-		WindowSizeMin: 2,
+		WindowSizeMin: 6,
 		// TODO increase this when p2p is deployed
 		WindowSizeMinP2pOnly: 0,
-		WindowSizeMax:        8,
+		WindowSizeMax:        12,
 		// reconnects per source
 		WindowSizeReconnectScale: 1.0,
 		WriteRetryTimeout:        200 * time.Millisecond,
