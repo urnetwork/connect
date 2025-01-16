@@ -274,6 +274,21 @@ paths:
                             schema:
                                 $ref: "#/components/schemas/NetworkCreateResult"
 
+
+    /auth/network-delete:
+        post:
+            description: |
+                Delete network
+            operationId: Auth Network Delete
+            security:
+                - BearerAuth: []
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: "#/components/schemas/NetworkDeleteResult"
+
     /auth/code-create:
         post:
             description: |
@@ -1545,6 +1560,10 @@ components:
                     properties:
                         message:
                             type: string
+
+        NetworkDeleteResult:
+            type: object
+            properties: {}
 
         UpgradeGuestArgs:
             type: object
