@@ -9,7 +9,7 @@ import (
 
 // events surfaced to the end user
 
-type MonitorEventFunction = func(windowExpandEvent *WindowExpandEvent, providerEvents map[Id]*ProviderEvent)
+type MonitorEventFunction = func(windowExpandEvent *WindowExpandEvent, providerEvents map[Id]*ProviderEvent, reset bool)
 
 type WindowExpandEvent struct {
 	// EventTime   time.Time
@@ -177,7 +177,7 @@ func (self *RemoteUserNatMultiClientMonitor) AddWindowExpandEvent(minSatisfied b
 	if changed {
 		if callbacks := self.monitorEventCallbacks.Get(); 0 < len(callbacks) {
 			for _, callback := range callbacks {
-				callback(&windowExpandEvent, map[Id]*ProviderEvent{})
+				callback(&windowExpandEvent, map[Id]*ProviderEvent{}, false)
 			}
 		}
 	}
@@ -212,7 +212,7 @@ func (self *RemoteUserNatMultiClientMonitor) AddProviderEvent(clientId Id, state
 
 	if callbacks := self.monitorEventCallbacks.Get(); 0 < len(callbacks) {
 		for _, callback := range callbacks {
-			callback(&windowExpandEvent, clientIdProviderEvents)
+			callback(&windowExpandEvent, clientIdProviderEvents, false)
 		}
 	}
 }
