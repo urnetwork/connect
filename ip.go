@@ -1240,7 +1240,21 @@ func (self *TcpSequence) Run() {
 		}
 	}()
 
+	// connect to upstream before sending the syn+ack
+	glog.V(2).Infof("[init]tcp connect\n")
+	socket, err := net.DialTimeout(
+		"tcp",
+		self.DestinationAuthority(),
+		self.tcpBufferSettings.ConnectTimeout,
+	)
+	if err != nil {
+		glog.Infof("[init]tcp connect error = %s\n", err)
+		return
+	}
+	defer socket.Close()
+
 	for syn := false; !syn; {
+		checkpointId := self.idleCondition.Checkpoint()
 		select {
 		case <-self.ctx.Done():
 			return
@@ -1315,19 +1329,15 @@ func (self *TcpSequence) Run() {
 				glog.V(2).Infof("[init]waiting for SYN (%s)\n", tcpFlagsString(sendItem.tcp))
 			}
 		}
+		case <-time.After(self.tcpBufferSettings.ConnectTimeout):
+			if self.idleCondition.Close(checkpointId) {
+				// close the sequence
+				glog.V(2).Infof("[init]connect timeout\n")
+				return
+			}
+			// else there pending updates
 	}
 
-	glog.V(2).Infof("[init]tcp connect\n")
-	socket, err := net.DialTimeout(
-		"tcp",
-		self.DestinationAuthority(),
-		self.tcpBufferSettings.ConnectTimeout,
-	)
-	if err != nil {
-		glog.Infof("[init]tcp connect error = %s\n", err)
-		return
-	}
-	defer socket.Close()
 
 	/*
 		if v, ok := socket.(*net.TCPConn); ok {
