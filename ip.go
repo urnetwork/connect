@@ -54,6 +54,8 @@ type UserNatClient interface {
 	SendPacket(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool
 	Close()
 	Shuffle()
+
+	SecurityPolicyStats(reset bool) SecurityPolicyStats
 }
 
 func DefaultUdpBufferSettings() *UdpBufferSettings {
@@ -137,6 +139,10 @@ func NewLocalUserNat(ctx context.Context, clientTag string, settings *LocalUserN
 	go localUserNat.Run()
 
 	return localUserNat
+}
+
+func (self *LocalUserNat) SecurityPolicyStats(reset bool) SecurityPolicyStats {
+	return SecurityPolicyStats{}
 }
 
 // TODO provide mode of the destination determines filtering rules - e.g. local networks
@@ -2195,6 +2201,10 @@ func NewRemoteUserNatProvider(
 	return userNatProvider
 }
 
+func (self *RemoteUserNatProvider) SecurityPolicyStats(reset bool) SecurityPolicyStats {
+	return self.securityPolicy.Stats().Stats(reset)
+}
+
 // `ReceivePacketFunction`
 func (self *RemoteUserNatProvider) Receive(source TransferPath, ipProtocol IpProtocol, packet []byte) {
 	if self.client.ClientId() == source.SourceId {
@@ -2340,6 +2350,10 @@ func NewRemoteUserNatClient(
 	return userNatClient, nil
 }
 
+func (self *RemoteUserNatClient) SecurityPolicyStats(reset bool) SecurityPolicyStats {
+	return self.securityPolicy.Stats().Stats(reset)
+}
+
 // `SendPacketFunction`
 func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool {
 	minRelationship := max(provideMode, self.provideMode)
@@ -2470,6 +2484,17 @@ const (
 	IpProtocolTcp     IpProtocol = 1
 	IpProtocolUdp     IpProtocol = 2
 )
+
+func (self IpProtocol) String() string {
+	switch self {
+	case IpProtocolTcp:
+		return "tcp"
+	case IpProtocolUdp:
+		return "udp"
+	default:
+		return "unknown"
+	}
+}
 
 type IpPath struct {
 	Version         int
