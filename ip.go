@@ -54,6 +54,8 @@ type UserNatClient interface {
 	SendPacket(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool
 	Close()
 	Shuffle()
+
+	SecurityPolicyStats(reset bool) SecurityPolicyStats
 }
 
 func DefaultUdpBufferSettings() *UdpBufferSettings {
@@ -136,6 +138,10 @@ func NewLocalUserNat(ctx context.Context, clientTag string, settings *LocalUserN
 	go localUserNat.Run()
 
 	return localUserNat
+}
+
+func (self *LocalUserNat) SecurityPolicyStats(reset bool) SecurityPolicyStats {
+	return SecurityPolicyStats{}
 }
 
 // TODO provide mode of the destination determines filtering rules - e.g. local networks
@@ -2132,6 +2138,10 @@ func NewRemoteUserNatProvider(
 	return userNatProvider
 }
 
+func (self *RemoteUserNatProvider) SecurityPolicyStats(reset bool) SecurityPolicyStats {
+	return self.securityPolicy.Stats().Stats(reset)
+}
+
 // `ReceivePacketFunction`
 func (self *RemoteUserNatProvider) Receive(source TransferPath, ipProtocol IpProtocol, packet []byte) {
 	if self.client.ClientId() == source.SourceId {
@@ -2277,6 +2287,10 @@ func NewRemoteUserNatClient(
 	return userNatClient, nil
 }
 
+func (self *RemoteUserNatClient) SecurityPolicyStats(reset bool) SecurityPolicyStats {
+	return self.securityPolicy.Stats().Stats(reset)
+}
+
 // `SendPacketFunction`
 func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool {
 	minRelationship := max(provideMode, self.provideMode)
@@ -2407,6 +2421,17 @@ const (
 	IpProtocolTcp     IpProtocol = 1
 	IpProtocolUdp     IpProtocol = 2
 )
+
+func (self IpProtocol) String() string {
+	switch self {
+	case IpProtocolTcp:
+		return "tcp"
+	case IpProtocolUdp:
+		return "udp"
+	default:
+		return "unknown"
+	}
+}
 
 type IpPath struct {
 	Version         int
@@ -2599,95 +2624,6 @@ func (self *Ip6Path) Destination() Ip6Path {
 		Protocol:        self.Protocol,
 		DestinationIp:   self.DestinationIp,
 		DestinationPort: self.DestinationPort,
-	}
-}
-
-type SecurityPolicyResult int
-
-const (
-	SecurityPolicyResultDrop     SecurityPolicyResult = 0
-	SecurityPolicyResultAllow    SecurityPolicyResult = 1
-	SecurityPolicyResultIncident SecurityPolicyResult = 2
-)
-
-type SecurityPolicy struct {
-}
-
-func DefaultSecurityPolicy() *SecurityPolicy {
-	return &SecurityPolicy{}
-}
-
-func (self *SecurityPolicy) Inspect(provideMode protocol.ProvideMode, packet []byte) (*IpPath, SecurityPolicyResult, error) {
-	ipPath, err := ParseIpPath(packet)
-	if err != nil {
-		// bad ip packet
-		return ipPath, SecurityPolicyResultDrop, err
-	}
-
-	if protocol.ProvideMode_Public <= provideMode {
-		// apply public rules:
-		// - only public unicast network destinations
-		// - block insecure or known unencrypted traffic
-
-		if !isPublicUnicast(ipPath.DestinationIp) {
-			return ipPath, SecurityPolicyResultIncident, nil
-		}
-
-		// block insecure or unencrypted traffic
-		// block known destructive protocols
-		// - allow secure web and dns traffic (443)
-		// - allow email protocols (465, 993, 995)
-		// - allow dns over tls (853)
-		// - allow user ports (>=1024)
-		// - block bittorrent (6881-6889)
-		// - FIXME temporarily enabling 53 and 80 until inline protocol translation is implemented
-		// TODO in the future, allow a control message to dynamically adjust the security rules
-		allow := func() bool {
-			switch port := ipPath.DestinationPort; {
-			case port == 53:
-				// dns
-				// FIXME for now we allow plain dns. TODO to upgrade the protocol to doh inline.
-				return true
-			case port == 80:
-				// http
-				// FIXME for now we allow http. It's important for some radio streaming. TODO to upgrade the protcol to https inline.
-				return true
-			case port == 443:
-				// https
-				return true
-			case port == 465, port == 993, port == 995:
-				// email
-				return true
-			case port == 853:
-				// dns over tls
-				return true
-			case port < 1024:
-				return false
-			case 6881 <= port && port <= 6889:
-				// bittorrent
-				return false
-			default:
-				return true
-			}
-		}
-		if !allow() {
-			return ipPath, SecurityPolicyResultDrop, nil
-		}
-	}
-
-	return ipPath, SecurityPolicyResultAllow, nil
-}
-
-func isPublicUnicast(ip net.IP) bool {
-	switch {
-	case ip.IsPrivate(),
-		ip.IsLoopback(),
-		ip.IsLinkLocalUnicast(),
-		ip.IsMulticast(),
-		ip.IsUnspecified():
-		return false
-	default:
-		return true
 	}
 }
 

@@ -200,6 +200,10 @@ func NewRemoteUserNatMultiClient(
 	}
 }
 
+func (self *RemoteUserNatMultiClient) SecurityPolicyStats(reset bool) SecurityPolicyStats {
+	return self.securityPolicy.Stats().Stats(reset)
+}
+
 func (self *RemoteUserNatMultiClient) Monitor() *RemoteUserNatMultiClientMonitor {
 	return self.window.monitor
 }
