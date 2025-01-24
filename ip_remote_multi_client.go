@@ -208,6 +208,10 @@ func (self *RemoteUserNatMultiClient) Monitor() *RemoteUserNatMultiClientMonitor
 	return self.window.monitor
 }
 
+func (self *RemoteUserNatMultiClient) AddContractStatusCallback(contractStatusCallback ContractStatusFunction) func() {
+	return self.window.AddContractStatusCallback(contractStatusCallback)
+}
+
 func (self *RemoteUserNatMultiClient) updateClientPath(ipPath *IpPath, callback func(*multiClientChannelUpdate)) {
 	reserveUpdate := func() *multiClientChannelUpdate {
 		self.stateLock.Lock()
@@ -796,6 +800,8 @@ type multiClientWindow struct {
 
 	monitor *RemoteUserNatMultiClientMonitor
 
+	contractStatusCallbacks *CallbackList[ContractStatusFunction]
+
 	stateLock          sync.Mutex
 	destinationClients map[MultiHopId]*multiClientChannel
 }
@@ -808,20 +814,36 @@ func newMultiClientWindow(
 	settings *MultiClientSettings,
 ) *multiClientWindow {
 	window := &multiClientWindow{
-		ctx:                   ctx,
-		cancel:                cancel,
-		generator:             generator,
-		receivePacketCallback: receivePacketCallback,
-		settings:              settings,
-		clientChannelArgs:     make(chan *multiClientChannelArgs, settings.WindowSizeMin),
-		monitor:               NewRemoteUserNatMultiClientMonitor(&settings.RemoteUserNatMultiClientMonitorSettings),
-		destinationClients:    map[MultiHopId]*multiClientChannel{},
+		ctx:                     ctx,
+		cancel:                  cancel,
+		generator:               generator,
+		receivePacketCallback:   receivePacketCallback,
+		settings:                settings,
+		clientChannelArgs:       make(chan *multiClientChannelArgs, settings.WindowSizeMin),
+		monitor:                 NewRemoteUserNatMultiClientMonitor(&settings.RemoteUserNatMultiClientMonitorSettings),
+		contractStatusCallbacks: NewCallbackList[ContractStatusFunction](),
+		destinationClients:      map[MultiHopId]*multiClientChannel{},
 	}
 
 	go HandleError(window.randomEnumerateClientArgs, cancel)
 	go HandleError(window.resize, cancel)
 
 	return window
+}
+
+func (self *multiClientWindow) AddContractStatusCallback(contractStatusCallback ContractStatusFunction) func() {
+	callbackId := self.contractStatusCallbacks.Add(contractStatusCallback)
+	return func() {
+		self.contractStatusCallbacks.Remove(callbackId)
+	}
+}
+
+func (self *multiClientWindow) contractStatus(contractStatus *ContractStatus) {
+	for _, contractStatusCallback := range self.contractStatusCallbacks.Get() {
+		HandleError(func() {
+			contractStatusCallback(contractStatus)
+		})
+	}
 }
 
 func (self *multiClientWindow) randomEnumerateClientArgs() {
@@ -1152,6 +1174,7 @@ func (self *multiClientWindow) expand(currentWindowSize int, currentP2pOnlyWindo
 					args,
 					self.generator,
 					self.receivePacketCallback,
+					self.contractStatus,
 					self.settings,
 				)
 				if err == nil {
@@ -1435,6 +1458,7 @@ func newMultiClientChannel(
 	args *multiClientChannelArgs,
 	generator MultiClientGenerator,
 	receivePacketCallback ReceivePacketFunction,
+	contractStatusCallback ContractStatusFunction,
 	settings *MultiClientSettings,
 ) (*multiClientChannel, error) {
 	cancelCtx, cancel := context.WithCancel(ctx)
@@ -1450,12 +1474,14 @@ func newMultiClientChannel(
 	if err != nil {
 		return nil, err
 	}
+	contractStatusSub := client.ContractManager().AddContractStatusCallback(contractStatusCallback)
 	go HandleError(func() {
 		select {
 		case <-cancelCtx.Done():
 		case <-client.Done():
 		}
 		client.Cancel()
+		contractStatusSub()
 		generator.RemoveClientWithArgs(client, &args.MultiClientGeneratorClientArgs)
 	}, cancel)
 
