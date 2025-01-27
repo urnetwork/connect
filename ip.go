@@ -80,7 +80,8 @@ func DefaultTcpBufferSettings() *TcpBufferSettings {
 		Mtu:                DefaultMtu,
 		// avoid fragmentation
 		ReadBufferByteCount: DefaultMtu - max(Ipv4HeaderSizeWithoutExtensions, Ipv6HeaderSize) - max(UdpHeaderSize, TcpHeaderSizeWithoutExtensions),
-		WindowSize:          uint32(kib(128)),
+		MinWindowSize:       uint32(kib(4)),
+		MaxWindowSize:       uint32(mib(1)),
 		UserLimit:           128,
 	}
 	return tcpBufferSettings
@@ -925,7 +926,10 @@ type TcpBufferSettings struct {
 	// `WindowSize / 2^WindowScale` must fit in uint16
 	// see https://datatracker.ietf.org/doc/html/rfc1323#page-8
 	WindowScale uint32
-	WindowSize  uint32
+	// the initial window size
+	MinWindowSize uint32
+	// `MaxWindowSize` should be a power of 2 multiple of `MinWindowSize`
+	MaxWindowSize uint32
 	// the number of open sockets per user
 	// uses an lru cleanup where new sockets over the limit close old sockets
 	UserLimit int
@@ -1155,9 +1159,11 @@ func NewTcpSequence(ctx context.Context, receiveCallback ReceivePacketFunction,
 		destinationPort: destinationPort,
 		// the window size starts at the fixed value
 		enableWindowScale: false,
-		windowSize:        tcpBufferSettings.WindowSize,
-		windowScale:       0,
-		userLimited:       *newUserLimited(),
+		// FIXME start this at initial window size, and it grows up to max window size
+		// FIXME initial window size should be ~4k, set max window size as a 2^amount multiplier of initial size
+		windowSize:  tcpBufferSettings.MinWindowSize,
+		windowScale: 0,
+		userLimited: *newUserLimited(),
 	}
 	return &TcpSequence{
 		ctx:               cancelCtx,
@@ -1299,7 +1305,7 @@ func (self *TcpSequence) Run() {
 					self.receiveWindowSize = uint32(sendItem.tcp.Window) << self.receiveWindowScale
 					if self.enableWindowScale {
 						// compute the window scale to fit the window size in uint16
-						bits := math.Log2(float64(self.windowSize) / float64(math.MaxUint16))
+						bits := math.Log2(float64(self.tcpBufferSettings.MaxWindowSize) / float64(math.MaxUint16))
 						if 0 <= bits {
 							self.windowScale = uint32(math.Ceil(bits))
 						} else {
@@ -1328,7 +1334,6 @@ func (self *TcpSequence) Run() {
 				// an ACK here could be for a previous FIN
 				glog.V(2).Infof("[init]waiting for SYN (%s)\n", tcpFlagsString(sendItem.tcp))
 			}
-		}
 		case <-time.After(self.tcpBufferSettings.ConnectTimeout):
 			if self.idleCondition.Close(checkpointId) {
 				// close the sequence
@@ -1336,8 +1341,8 @@ func (self *TcpSequence) Run() {
 				return
 			}
 			// else there pending updates
+		}
 	}
-
 
 	/*
 		if v, ok := socket.(*net.TCPConn); ok {
@@ -1518,6 +1523,14 @@ func (self *TcpSequence) Run() {
 						j := i
 						i += n
 						glog.V(2).Infof("[f%d]tcp forward %d/%d -> %d/%d +%d\n", sendIter, j, len(payload), i, len(payload), n)
+
+						func() {
+							self.mutex.Lock()
+							defer self.mutex.Unlock()
+
+							self.sendSeq += uint32(n)
+							ackCond.Broadcast()
+						}()
 					}
 
 					if err != nil {
@@ -1593,6 +1606,9 @@ func (self *TcpSequence) Run() {
 		}
 	}()
 
+	// window scaling depends on `nonBlockingByteCount` and `blockingByteCount` per `self.windowSize`
+	nonBlockingByteCount := uint32(0)
+	blockingByteCount := uint32(0)
 	for sendIter := uint64(0); ; sendIter += 1 {
 		checkpointId := self.idleCondition.Checkpoint()
 		select {
@@ -1606,7 +1622,7 @@ func (self *TcpSequence) Run() {
 			}
 
 			drop := false
-			seq := uint32(0)
+			// seq := uint32(0)
 
 			func() {
 				self.mutex.Lock()
@@ -1636,32 +1652,69 @@ func (self *TcpSequence) Run() {
 
 			if sendItem.tcp.FIN {
 				glog.V(2).Infof("[r%d]FIN\n", sendIter)
-				seq += 1
+				func() {
+					self.mutex.Lock()
+					defer self.mutex.Unlock()
+
+					self.sendSeq += 1
+					ackCond.Broadcast()
+				}()
 			}
 
 			payload := sendItem.tcp.Payload
 			if 0 < len(payload) {
-				seq += uint32(len(payload))
+				// seq += uint32(len(payload))
 				writePayload := writePayload{
 					payload:  payload,
 					sendIter: sendIter,
+				}
+				// FIXME count the number of non-blocking versus blocking channel adds
+				// FIXME every window size, check the count:
+				// FIXME - if 0 blocking, double window size
+				// FIXME - if >half blocking, half the window size
+				// FIXME else leave the window size unchanged
+				select {
+				case writePayloads <- writePayload:
+					nonBlockingByteCount += uint32(len(payload))
+				default:
 				}
 				select {
 				case <-self.ctx.Done():
 					return
 				case writePayloads <- writePayload:
+					blockingByteCount += uint32(len(payload))
 				}
-			}
-
-			if 0 < seq {
 				func() {
 					self.mutex.Lock()
 					defer self.mutex.Unlock()
 
-					self.sendSeq += seq
-					ackCond.Broadcast()
+					if self.windowSize <= nonBlockingByteCount+blockingByteCount {
+						if self.windowSize <= nonBlockingByteCount {
+							nextWindowSize := min(self.windowSize*2, self.tcpBufferSettings.MaxWindowSize)
+							glog.Infof("[r%d]increase window size %d -> %d\n", sendIter, self.windowSize, nextWindowSize)
+							self.windowSize = nextWindowSize
+						} else if self.windowSize/2 <= nonBlockingByteCount {
+							nextWindowSize := max(self.windowSize/2, self.tcpBufferSettings.MinWindowSize)
+							glog.Infof("[r%d]decrease window size %d -> %d\n", sendIter, self.windowSize, nextWindowSize)
+							self.windowSize = nextWindowSize
+						}
+						// else no change to the window
+						// reset the stats
+						nonBlockingByteCount = 0
+						blockingByteCount = 0
+					}
 				}()
 			}
+
+			// if 0 < seq {
+			// 	func() {
+			// 		self.mutex.Lock()
+			// 		defer self.mutex.Unlock()
+
+			// 		self.sendSeq += seq
+			// 		ackCond.Broadcast()
+			// 	}()
+			// }
 
 			if sendItem.tcp.FIN {
 				// close the socket to propage the FIN and close the sequence
