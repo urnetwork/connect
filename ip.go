@@ -82,8 +82,8 @@ func DefaultTcpBufferSettings() *TcpBufferSettings {
 		Mtu:                DefaultMtu,
 		// avoid fragmentation
 		ReadBufferByteCount: DefaultMtu - max(Ipv4HeaderSizeWithoutExtensions, Ipv6HeaderSize) - max(UdpHeaderSize, TcpHeaderSizeWithoutExtensions),
-		MinWindowSize:       uint32(kib(4)),
-		MaxWindowSize:       uint32(mib(1)),
+		MinWindowSize:       uint32(kib(8)),
+		MaxWindowSize:       uint32(kib(256)),
 		UserLimit:           128,
 	}
 	return tcpBufferSettings
@@ -1322,10 +1322,6 @@ func (self *TcpSequence) Run() {
 						self.windowScale = 0
 					}
 					glog.V(2).Infof("[init]window=%d/%d, receive=%d/%d\n", self.windowSize, self.windowScale, self.receiveWindowSize, self.receiveWindowScale)
-					self.encodedWindowSize = uint16(min(
-						uint32(self.windowSize>>self.windowScale),
-						uint32(math.MaxUint16),
-					))
 
 					packet, err = self.SynAck()
 					self.receiveSeq += 1
@@ -1524,19 +1520,19 @@ func (self *TcpSequence) Run() {
 					}
 
 					if 0 < n {
+						// func() {
+						// 	self.mutex.Lock()
+						// 	defer self.mutex.Unlock()
+
+						// 	self.sendSeq += uint32(n)
+						// 	ackCond.Broadcast()
+						// }()
+
 						self.UpdateLastActivityTime()
 
 						j := i
 						i += n
 						glog.V(2).Infof("[f%d]tcp forward %d/%d -> %d/%d +%d\n", sendIter, j, len(payload), i, len(payload), n)
-
-						func() {
-							self.mutex.Lock()
-							defer self.mutex.Unlock()
-
-							self.sendSeq += uint32(n)
-							ackCond.Broadcast()
-						}()
 					}
 
 					if err != nil {
@@ -1683,32 +1679,39 @@ func (self *TcpSequence) Run() {
 				case writePayloads <- writePayload:
 					nonBlockingByteCount += uint32(len(payload))
 				default:
-				}
-				select {
-				case <-self.ctx.Done():
-					return
-				case writePayloads <- writePayload:
-					blockingByteCount += uint32(len(payload))
+					select {
+					case writePayloads <- writePayload:
+						blockingByteCount += uint32(len(payload))
+					case <-self.ctx.Done():
+						return
+					}
 				}
 				func() {
 					self.mutex.Lock()
 					defer self.mutex.Unlock()
-
-					if self.windowSize <= nonBlockingByteCount+blockingByteCount {
+					// glog.Infof("[r%d]eval window size (%d, %d, %d)\n", sendIter, self.windowSize, nonBlockingByteCount, blockingByteCount)
+					if self.windowSize <= blockingByteCount+nonBlockingByteCount {
 						if self.windowSize <= nonBlockingByteCount {
 							nextWindowSize := min(self.windowSize*2, self.tcpBufferSettings.MaxWindowSize)
-							glog.Infof("[r%d]increase window size %d -> %d\n", sendIter, self.windowSize, nextWindowSize)
-							self.windowSize = nextWindowSize
-						} else if self.windowSize/2 <= nonBlockingByteCount {
+							if self.windowSize != nextWindowSize {
+								glog.Infof("[r%d]increase window size %d -> %d\n", sendIter, self.windowSize, nextWindowSize)
+								self.windowSize = nextWindowSize
+							}
+						} else if self.windowSize/2 <= blockingByteCount {
 							nextWindowSize := max(self.windowSize/2, self.tcpBufferSettings.MinWindowSize)
-							glog.Infof("[r%d]decrease window size %d -> %d\n", sendIter, self.windowSize, nextWindowSize)
-							self.windowSize = nextWindowSize
+							if self.windowSize != nextWindowSize {
+								glog.Infof("[r%d]decrease window size %d -> %d\n", sendIter, self.windowSize, nextWindowSize)
+								self.windowSize = nextWindowSize
+							}
 						}
 						// else no change to the window
 						// reset the stats
-						nonBlockingByteCount = 0
-						blockingByteCount = 0
+						nonBlockingByteCount = uint32(0)
+						blockingByteCount = uint32(0)
 					}
+
+					self.sendSeq += uint32(len(payload))
+					ackCond.Broadcast()
 				}()
 			}
 
@@ -1775,9 +1778,16 @@ type ConnectionState struct {
 	enableWindowScale  bool
 	windowSize         uint32
 	windowScale        uint32
-	encodedWindowSize  uint16
+	// encodedWindowSize  uint16
 
 	userLimited
+}
+
+func (self *ConnectionState) encodedWindowSize() uint16 {
+	return uint16(min(
+		uint32(self.windowSize>>self.windowScale),
+		uint32(math.MaxUint16),
+	))
 }
 
 func (self *ConnectionState) SourceAuthority() string {
@@ -1840,7 +1850,7 @@ func (self *ConnectionState) SynAck() ([]byte, error) {
 		Ack:     self.sendSeq,
 		ACK:     true,
 		SYN:     true,
-		Window:  self.encodedWindowSize,
+		Window:  self.encodedWindowSize(),
 		Options: opts,
 	}
 	tcp.SetNetworkLayerForChecksum(ip)
@@ -1895,7 +1905,7 @@ func (self *ConnectionState) PureAck() ([]byte, error) {
 		Seq:     self.receiveSeq,
 		Ack:     self.sendSeq,
 		ACK:     true,
-		Window:  self.encodedWindowSize,
+		Window:  self.encodedWindowSize(),
 	}
 	tcp.SetNetworkLayerForChecksum(ip)
 	headerSize += TcpHeaderSizeWithoutExtensions
@@ -1950,7 +1960,7 @@ func (self *ConnectionState) FinAck() ([]byte, error) {
 		Ack:     self.sendSeq,
 		ACK:     true,
 		FIN:     true,
-		Window:  self.encodedWindowSize,
+		Window:  self.encodedWindowSize(),
 	}
 	tcp.SetNetworkLayerForChecksum(ip)
 	headerSize += TcpHeaderSizeWithoutExtensions
@@ -2005,7 +2015,7 @@ func (self *ConnectionState) RstAck() ([]byte, error) {
 		Ack:     self.sendSeq,
 		ACK:     true,
 		RST:     true,
-		Window:  self.encodedWindowSize,
+		Window:  self.encodedWindowSize(),
 	}
 	tcp.SetNetworkLayerForChecksum(ip)
 	headerSize += TcpHeaderSizeWithoutExtensions
@@ -2059,7 +2069,7 @@ func (self *ConnectionState) DataPackets(payload []byte, n int, mtu int) ([][]by
 		Seq:     self.receiveSeq,
 		Ack:     self.sendSeq,
 		ACK:     true,
-		Window:  self.encodedWindowSize,
+		Window:  self.encodedWindowSize(),
 	}
 	tcp.SetNetworkLayerForChecksum(ip)
 	headerSize += TcpHeaderSizeWithoutExtensions
