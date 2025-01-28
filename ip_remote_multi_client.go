@@ -175,21 +175,13 @@ func NewRemoteUserNatMultiClient(
 ) *RemoteUserNatMultiClient {
 	cancelCtx, cancel := context.WithCancel(ctx)
 
-	window := newMultiClientWindow(
-		cancelCtx,
-		cancel,
-		generator,
-		receivePacketCallback,
-		settings,
-	)
-
-	return &RemoteUserNatMultiClient{
+	multiClient := &RemoteUserNatMultiClient{
 		ctx:                   cancelCtx,
 		cancel:                cancel,
 		generator:             generator,
 		receivePacketCallback: receivePacketCallback,
 		settings:              settings,
-		window:                window,
+		// window:                window,
 		securityPolicy:        DefaultSecurityPolicy(),
 		provideMode:           provideMode,
 		ip4PathUpdates:        map[Ip4Path]*multiClientChannelUpdate{},
@@ -198,6 +190,16 @@ func NewRemoteUserNatMultiClient(
 		updateIp6Paths:        map[*multiClientChannelUpdate]map[Ip6Path]bool{},
 		clientUpdates:         map[*multiClientChannel]*multiClientChannelUpdate{},
 	}
+
+	multiClient.window = newMultiClientWindow(
+		cancelCtx,
+		cancel,
+		generator,
+		multiClient.clientReceivePacket,
+		settings,
+	)
+
+	return multiClient
 }
 
 func (self *RemoteUserNatMultiClient) SecurityPolicyStats(reset bool) SecurityPolicyStats {
@@ -300,7 +302,7 @@ func (self *RemoteUserNatMultiClient) updateClientPath(ipPath *IpPath, callback 
 		// spin to acquire the correct update lock
 		success := func() bool {
 			update := self.reserveUpdate(ipPath)
-			
+
 			update.lock.Lock()
 			defer update.lock.Unlock()
 
@@ -454,16 +456,17 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 				// else choose a new client
 			}
 
-			// FIXME if SYN, send to all clients
-			// FIXME on receive first SYN+ACK, the update.client will be set to the client that replied
-
 			// send to all clients in parallel
 			for _, client := range orderedClients {
 				if client.Send(parsedPacket, 0) {
-					state, ok := update.synAckStates[client]
+					if update.raceStates == nil {
+						update.raceStates = map[Client]X{}
+					}
+					state, ok := update.raceStates[client]
 					if ok && self.settings.MultiSetOnNoResponseTimeout <= state.sendTime.Sub(now) {
 						// no response in timeout, lock in this client
 						update.client = client
+						update.raceStates == nil
 						success = true
 						break
 					} else if !ok {
@@ -479,17 +482,6 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 				// `update.client` will be set by the packet receive
 				return
 			}
-			// } else {
-			// 	for _, client := range orderedClients {
-			// 		if client.Send(parsedPacket, 0) {
-			// 			glog.V(2).Infof("[multi]use new client ipv%d p%v -> %s:%d\n", parsedPacket.ipPath.Version, parsedPacket.ipPath.Protocol, parsedPacket.ipPath.DestinationIp, parsedPacket.ipPath.DestinationPort)
-			// 			// lock the path to the client
-			// 			update.client = client
-			// 			success = true
-			// 			return
-			// 		}
-			// 	}
-			// }
 
 			retryTimeout := self.settings.WriteRetryTimeout
 			if 0 <= timeout {
@@ -542,133 +534,88 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 }
 
 
-func ReceivePacket(client, packet) {
-	// open the update, add the response time to the update, store the packet
-	// start go routine to release after waiting period
-	// on event, if client is not set, choose client by random weight of response duration, and release the packet
-	// clear all ack state
+func (self *RemoteUserNatMultiClient) clientReceivePacket(client *multiClientChannel, source TransferPath, ipProtocol IpProtocol, packet []byte) {
+	ipPath, err := ParseIpPath(packet)
+	if err != nil {
+		// bad ip packet, drop
+		return
+	}
+	ipPath = ipPath.Reverse()
 
-	var releasePackets [][]byte
-
-	// FIXME get update
-	self.updateClientPath(ipPath, func(update *multiClientChannelUpdate) {
-		if update.client == client {
-			releasePackets = packet
-			return
-		}
-		if update.client != nil {
-			// another client already chosen, drop
-			return
-		}
-
-
-		// buffer the packets 
-		// if no more room in the buffer, choose immediately
-
-		if len(state.packets) < MAX_PACKET_BUFFER_SIZE {
-			state.packets = append(stats.packets, packet)
-			go func() {
-				// wait and assocaite 
-
-				select {
-				case <- self.ctx.Done():
-					return
-				case <- time.After(self.settings.MultiSetOnResponseTimeout):
-				}
-
-				releasePackets PACKET
-				self.updateClientPath(ipPath, func(update *multiClientChannelUpdate) {
-
-					if update.client != nil {
-						// another client already chosen, drop
-						return
-					}
-
-					// FIXME
-					// weighted shuffle clients by response times
-
-					client := orderedClients[0]
-					update.client = client
-					releasePackets = synAckStates[client].packets
-					
-					// FIXME if TCP, send RST packet to all the other clients
-
-					synAckStates = nil
-
-
-				})
-
-				for _, packet := releasePackets {
-					// FIXME release
-					RECEIVE(packet)
-				}
-			}()
-		} else {
-			// release immediately
-
-			releasePackets = state.packets
-			update.client = client
-			synAckStates = nil
-		}
-
-
-
-
-		// if SYN_ACK {
-		// 	// find and lock udpate
-
-			
-			
-
-		// 	now := time.Now()
-		// 	synAckResponseTimes[client] = now
-		// 	synAckPackets[client] = packet
-		// 	if !releaseActive {
-		// 		go func() {
-		// 			select {
-		// 			case <- self.ctx.Done():
-		// 				return
-		// 			case <- time.After(self.settings.SynAckReleaseTimeout):
-		// 			}
-
-		// 			releasePacket PACKET
-		// 			func() {
-		// 				// lock the update again
-		// 				update.lock.Lock()
-		// 				defer update.lock.Unlock()
-
-
-		// 				// FIXME
-		// 				// weighted shuffle clients by syn ack response times
-
-		// 				client := orderedClients[0]
-		// 				update.client = client
-		// 				releasePacket = synAckStates[client].packet
-		// 				synAckStates = nil
-		// 			}()
-
-		// 			RECEIVE(releasePacket)
-
-
-		// 		}()
-		// 		releaseActive = true
-
-				
-		// 	}
-		// } else if update.client == nil {
-			
-
-		// } else {
-		// 	releasePackets = packets
-		// }
-	})
-
-	for _, packet := releasePackets {
-		// FIXME release
-		RECEIVE(packet)
+	receivePacket := &ReceivePacket{
+		Source: source,
+		IpProtocol: ipProtocol,
+		Packet: packet,
 	}
 
+	var receivePackets []*ReceivePacket
 
+	self.updateClientPath(ipPath, func(update *multiClientChannelUpdate) {
+		if update.client == client {
+			receivePackets = []*ReceivePacket{receivePacket}
+		} else if update.client == nil {
+			if update.raceStates == nil {
+				receivePackets = []*ReceivePacket{receivePacket}
+				update.client = client
+			} else if len(state.packets) < self.settings.MultiPacketBufferMaxCount {
+				state.packets = append(stats.packets, packet)
+				if 1 == len(state.packets) {
+					state.receiveTime = time.Now()
+					go func() {
+						// wait for the race to finish, then choose
+
+						select {
+						case <- self.ctx.Done():
+							return
+						case <- time.After(self.settings.MultiSetOnResponseTimeout):
+						}
+
+						var receivePackets []*ReceivePacket
+						self.updateClientPath(ipPath, func(update *multiClientChannelUpdate) {
+							if update.raceStates != nil && update.client == nil {
+								// weighted shuffle clients by rtt
+								orderedClients := maps.Keys(raceStates)
+								weights := map[Client]float32{}
+								for client, state := range raceStates {
+									weights[client] = float32(state.receiveTime.Sub(state.startTime) / time.Millisecond)
+								}
+								WeightedShuffle(orderedClients, weights)
+
+								client := orderedClients[0]
+								update.client = client
+								receivePackets = synAckStates[client].packets
+								
+								// FIXME if TCP, send RST packets to other clients
+
+								update.raceStates = nil
+							}
+							// else another client already chosen, drop
+						})
+
+						for _, p := receivePackets {
+							self.receivePacketCallback(p.Source, p.IpProtocol, p.Packet)
+						}
+					}()
+				}
+			} else {
+				// release immediately
+
+				client := orderedClients[0]
+				update.client = client
+				receivePackets = append(synAckStates[client].packets, receivePacket)
+
+				// FIXME if TCP, send RST packets to other clients
+
+				update.raceStates = nil
+			}
+
+		}
+		// else another client already chosen, drop
+	})
+
+	for _, p := receivePackets {
+		self.receivePacketCallback(p.Source, p.IpProtocol, p.Packet)
+	}
 }
 
 
@@ -684,7 +631,7 @@ type multiClientChannelUpdate struct {
 	lock   sync.Mutex
 	client *multiClientChannel
 
-	synAckStates map[*multiClientChannel]*multiClientChannelSynAckState
+	raceStates map[*multiClientChannel]*multiClientChannelSynAckState
 }
 
 type multiClientChannelRaceState struct {

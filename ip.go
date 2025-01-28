@@ -47,7 +47,14 @@ const debugVerifyHeaders = false
 type SendPacketFunction func(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool
 
 // receive into a raw socket
+// FIXME add ipVersion, provideMode
 type ReceivePacketFunction func(source TransferPath, ipProtocol IpProtocol, packet []byte)
+
+type ReceivePacket struct {
+	Source     TransferPath
+	IpProtocol IpProtocol
+	Packet     []byte
+}
 
 type UserNatClient interface {
 	// `SendPacketFunction`
