@@ -212,103 +212,106 @@ func (self *RemoteUserNatMultiClient) AddContractStatusCallback(contractStatusCa
 	return self.window.AddContractStatusCallback(contractStatusCallback)
 }
 
-func (self *RemoteUserNatMultiClient) updateClientPath(ipPath *IpPath, callback func(*multiClientChannelUpdate)) {
-	reserveUpdate := func() *multiClientChannelUpdate {
-		self.stateLock.Lock()
-		defer self.stateLock.Unlock()
+func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) *multiClientChannelUpdate {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
 
+	switch ipPath.Version {
+	case 4:
+		ip4Path := ipPath.ToIp4Path()
+		update, ok := self.ip4PathUpdates[ip4Path]
+		if !ok {
+			update = &multiClientChannelUpdate{}
+			self.ip4PathUpdates[ip4Path] = update
+		}
+		ip4Paths, ok := self.updateIp4Paths[update]
+		if !ok {
+			ip4Paths = map[Ip4Path]bool{}
+			self.updateIp4Paths[update] = ip4Paths
+		}
+		ip4Paths[ip4Path] = true
+		return update
+	case 6:
+		ip6Path := ipPath.ToIp6Path()
+		update, ok := self.ip6PathUpdates[ip6Path]
+		if !ok {
+			update = &multiClientChannelUpdate{}
+			self.ip6PathUpdates[ip6Path] = update
+		}
+		ip6Paths, ok := self.updateIp6Paths[update]
+		if !ok {
+			ip6Paths = map[Ip6Path]bool{}
+			self.updateIp6Paths[update] = ip6Paths
+		}
+		ip6Paths[ip6Path] = true
+		return update
+	default:
+		panic(fmt.Errorf("Bad protocol version %d", ipPath.Version))
+	}
+}
+
+func (self *RemoteUserNatMultiClient) updatePaths(previousClient *multiClientChannel, update *multiClientChannelUpdate) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	client := update.client
+
+	if previousClient != client {
+		if previousClient != nil {
+			delete(self.clientUpdates, previousClient)
+		}
+		if client != nil {
+			self.clientUpdates[client] = update
+		}
+	}
+
+	if client == nil {
 		switch ipPath.Version {
 		case 4:
 			ip4Path := ipPath.ToIp4Path()
-			update, ok := self.ip4PathUpdates[ip4Path]
-			if !ok {
-				update = &multiClientChannelUpdate{}
-				self.ip4PathUpdates[ip4Path] = update
+			delete(self.ip4PathUpdates, ip4Path)
+			if ip4Paths, ok := self.updateIp4Paths[update]; ok {
+				delete(ip4Paths, ip4Path)
+				if len(ip4Paths) == 0 {
+					delete(self.updateIp4Paths, update)
+				}
 			}
-			ip4Paths, ok := self.updateIp4Paths[update]
-			if !ok {
-				ip4Paths = map[Ip4Path]bool{}
-				self.updateIp4Paths[update] = ip4Paths
-			}
-			ip4Paths[ip4Path] = true
-			return update
 		case 6:
 			ip6Path := ipPath.ToIp6Path()
-			update, ok := self.ip6PathUpdates[ip6Path]
-			if !ok {
-				update = &multiClientChannelUpdate{}
-				self.ip6PathUpdates[ip6Path] = update
+			delete(self.ip6PathUpdates, ip6Path)
+			if ip6Paths, ok := self.updateIp6Paths[update]; ok {
+				delete(ip6Paths, ip6Path)
+				if len(ip6Paths) == 0 {
+					delete(self.updateIp6Paths, update)
+				}
 			}
-			ip6Paths, ok := self.updateIp6Paths[update]
-			if !ok {
-				ip6Paths = map[Ip6Path]bool{}
-				self.updateIp6Paths[update] = ip6Paths
-			}
-			ip6Paths[ip6Path] = true
-			return update
 		default:
 			panic(fmt.Errorf("Bad protocol version %d", ipPath.Version))
 		}
 	}
+}
 
-	updatePaths := func(previousClient *multiClientChannel, update *multiClientChannelUpdate) {
-		self.stateLock.Lock()
-		defer self.stateLock.Unlock()
+func (self *RemoteUserNatMultiClient) updateClientPath(ipPath *IpPath, callback func(*multiClientChannelUpdate)) {
+	
 
-		client := update.client
-
-		if previousClient != client {
-			if previousClient != nil {
-				delete(self.clientUpdates, previousClient)
-			}
-			if client != nil {
-				self.clientUpdates[client] = update
-			}
-		}
-
-		if client == nil {
-			switch ipPath.Version {
-			case 4:
-				ip4Path := ipPath.ToIp4Path()
-				delete(self.ip4PathUpdates, ip4Path)
-				if ip4Paths, ok := self.updateIp4Paths[update]; ok {
-					delete(ip4Paths, ip4Path)
-					if len(ip4Paths) == 0 {
-						delete(self.updateIp4Paths, update)
-					}
-				}
-			case 6:
-				ip6Path := ipPath.ToIp6Path()
-				delete(self.ip6PathUpdates, ip6Path)
-				if ip6Paths, ok := self.updateIp6Paths[update]; ok {
-					delete(ip6Paths, ip6Path)
-					if len(ip6Paths) == 0 {
-						delete(self.updateIp6Paths, update)
-					}
-				}
-			default:
-				panic(fmt.Errorf("Bad protocol version %d", ipPath.Version))
-			}
-		}
-	}
-
-	// the client state lock can be acquired from inside the update lock
-	// ** important ** the update lock cannot be acquired from inside the client state lock
+	// the state lock can be acquired from inside the update lock
+	// ** important ** the update lock cannot be acquired from inside the state lock
 	for {
 		// spin to acquire the correct update lock
-		update := reserveUpdate()
 		success := func() bool {
+			update := self.reserveUpdate(ipPath)
+			
 			update.lock.Lock()
 			defer update.lock.Unlock()
 
 			// update might have changed
-			if updateInLock := reserveUpdate(); update != updateInLock {
+			if updateInLock := reserveUpdate(ipPath); update != updateInLock {
 				return false
 			}
 
 			previousClient := update.client
 			callback(update)
-			updatePaths(previousClient, update)
+			self.updatePaths(previousClient, update)
 			return true
 		}()
 		if success {
@@ -451,15 +454,42 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 				// else choose a new client
 			}
 
+			// FIXME if SYN, send to all clients
+			// FIXME on receive first SYN+ACK, the update.client will be set to the client that replied
+
+			// send to all clients in parallel
 			for _, client := range orderedClients {
 				if client.Send(parsedPacket, 0) {
-					glog.V(2).Infof("[multi]use new client ipv%d p%v -> %s:%d\n", parsedPacket.ipPath.Version, parsedPacket.ipPath.Protocol, parsedPacket.ipPath.DestinationIp, parsedPacket.ipPath.DestinationPort)
-					// lock the path to the client
-					update.client = client
+					state, ok := update.synAckStates[client]
+					if ok && self.settings.MultiSetOnNoResponseTimeout <= state.sendTime.Sub(now) {
+						// no response in timeout, lock in this client
+						update.client = client
+						success = true
+						break
+					} else if !ok {
+						state = &multiClientChannelSynAckState{
+							sendTime: time.Now(),
+						}
+						update.synAckStates[client] = state
+					}
 					success = true
-					return
 				}
 			}
+			if success {
+				// `update.client` will be set by the packet receive
+				return
+			}
+			// } else {
+			// 	for _, client := range orderedClients {
+			// 		if client.Send(parsedPacket, 0) {
+			// 			glog.V(2).Infof("[multi]use new client ipv%d p%v -> %s:%d\n", parsedPacket.ipPath.Version, parsedPacket.ipPath.Protocol, parsedPacket.ipPath.DestinationIp, parsedPacket.ipPath.DestinationPort)
+			// 			// lock the path to the client
+			// 			update.client = client
+			// 			success = true
+			// 			return
+			// 		}
+			// 	}
+			// }
 
 			retryTimeout := self.settings.WriteRetryTimeout
 			if 0 <= timeout {
@@ -511,6 +541,137 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 	return
 }
 
+
+func ReceivePacket(client, packet) {
+	// open the update, add the response time to the update, store the packet
+	// start go routine to release after waiting period
+	// on event, if client is not set, choose client by random weight of response duration, and release the packet
+	// clear all ack state
+
+	var releasePackets [][]byte
+
+	// FIXME get update
+	self.updateClientPath(ipPath, func(update *multiClientChannelUpdate) {
+		if update.client == client {
+			releasePackets = packet
+			return
+		}
+		if update.client != nil {
+			// another client already chosen, drop
+			return
+		}
+
+
+		// buffer the packets 
+		// if no more room in the buffer, choose immediately
+
+		if len(state.packets) < MAX_PACKET_BUFFER_SIZE {
+			state.packets = append(stats.packets, packet)
+			go func() {
+				// wait and assocaite 
+
+				select {
+				case <- self.ctx.Done():
+					return
+				case <- time.After(self.settings.MultiSetOnResponseTimeout):
+				}
+
+				releasePackets PACKET
+				self.updateClientPath(ipPath, func(update *multiClientChannelUpdate) {
+
+					if update.client != nil {
+						// another client already chosen, drop
+						return
+					}
+
+					// FIXME
+					// weighted shuffle clients by response times
+
+					client := orderedClients[0]
+					update.client = client
+					releasePackets = synAckStates[client].packets
+					
+					// FIXME if TCP, send RST packet to all the other clients
+
+					synAckStates = nil
+
+
+				})
+
+				for _, packet := releasePackets {
+					// FIXME release
+					RECEIVE(packet)
+				}
+			}()
+		} else {
+			// release immediately
+
+			releasePackets = state.packets
+			update.client = client
+			synAckStates = nil
+		}
+
+
+
+
+		// if SYN_ACK {
+		// 	// find and lock udpate
+
+			
+			
+
+		// 	now := time.Now()
+		// 	synAckResponseTimes[client] = now
+		// 	synAckPackets[client] = packet
+		// 	if !releaseActive {
+		// 		go func() {
+		// 			select {
+		// 			case <- self.ctx.Done():
+		// 				return
+		// 			case <- time.After(self.settings.SynAckReleaseTimeout):
+		// 			}
+
+		// 			releasePacket PACKET
+		// 			func() {
+		// 				// lock the update again
+		// 				update.lock.Lock()
+		// 				defer update.lock.Unlock()
+
+
+		// 				// FIXME
+		// 				// weighted shuffle clients by syn ack response times
+
+		// 				client := orderedClients[0]
+		// 				update.client = client
+		// 				releasePacket = synAckStates[client].packet
+		// 				synAckStates = nil
+		// 			}()
+
+		// 			RECEIVE(releasePacket)
+
+
+		// 		}()
+		// 		releaseActive = true
+
+				
+		// 	}
+		// } else if update.client == nil {
+			
+
+		// } else {
+		// 	releasePackets = packets
+		// }
+	})
+
+	for _, packet := releasePackets {
+		// FIXME release
+		RECEIVE(packet)
+	}
+
+
+}
+
+
 func (self *RemoteUserNatMultiClient) Shuffle() {
 	self.window.shuffle()
 }
@@ -522,7 +683,16 @@ func (self *RemoteUserNatMultiClient) Close() {
 type multiClientChannelUpdate struct {
 	lock   sync.Mutex
 	client *multiClientChannel
+
+	synAckStates map[*multiClientChannel]*multiClientChannelSynAckState
 }
+
+type multiClientChannelRaceState struct {
+	sendTime time.Time
+	responseTime time.Time
+	packets [][]byte
+}
+
 
 type parsedPacket struct {
 	packet []byte
