@@ -33,6 +33,8 @@ import (
 
 // TODO surface window stats to show to users
 
+type clientReceivePacketFunction func(client *multiClientChannel, source TransferPath, ipProtocol IpProtocol, packet []byte)
+
 // for each `NewClientArgs`,
 //
 //	`RemoveClientWithArgs` will be called if a client was created for the args,
@@ -83,6 +85,11 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		StatsSourceCountSelection:    0.95,
 		ClientAffinityTimeout:        0 * time.Second,
 
+		MultiSetOnNoResponseTimeout:   500 * time.Millisecond,
+		MultiSetOnResponseTimeout:     100 * time.Second,
+		MultiRaceClientPacketMaxCount: 8,
+		MultiRacePacketMaxCount:       64,
+
 		RemoteUserNatMultiClientMonitorSettings: *DefaultRemoteUserNatMultiClientMonitorSettings(),
 	}
 }
@@ -122,6 +129,13 @@ type MultiClientSettings struct {
 	// however, there may be some applications that assume the same ip across multiple connections
 	// in those cases, we would need some small affinity
 	ClientAffinityTimeout time.Duration
+
+	// time since first send to end the race, if no response
+	MultiSetOnNoResponseTimeout time.Duration
+	// time after the first response to end the race
+	MultiSetOnResponseTimeout     time.Duration
+	MultiRaceClientPacketMaxCount int
+	MultiRacePacketMaxCount       int
 
 	RemoteUserNatMultiClientMonitorSettings
 }
@@ -182,13 +196,13 @@ func NewRemoteUserNatMultiClient(
 		receivePacketCallback: receivePacketCallback,
 		settings:              settings,
 		// window:                window,
-		securityPolicy:        DefaultSecurityPolicy(),
-		provideMode:           provideMode,
-		ip4PathUpdates:        map[Ip4Path]*multiClientChannelUpdate{},
-		ip6PathUpdates:        map[Ip6Path]*multiClientChannelUpdate{},
-		updateIp4Paths:        map[*multiClientChannelUpdate]map[Ip4Path]bool{},
-		updateIp6Paths:        map[*multiClientChannelUpdate]map[Ip6Path]bool{},
-		clientUpdates:         map[*multiClientChannel]*multiClientChannelUpdate{},
+		securityPolicy: DefaultSecurityPolicy(),
+		provideMode:    provideMode,
+		ip4PathUpdates: map[Ip4Path]*multiClientChannelUpdate{},
+		ip6PathUpdates: map[Ip6Path]*multiClientChannelUpdate{},
+		updateIp4Paths: map[*multiClientChannelUpdate]map[Ip4Path]bool{},
+		updateIp6Paths: map[*multiClientChannelUpdate]map[Ip6Path]bool{},
+		clientUpdates:  map[*multiClientChannel]*multiClientChannelUpdate{},
 	}
 
 	multiClient.window = newMultiClientWindow(
@@ -223,7 +237,7 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) *multiClient
 		ip4Path := ipPath.ToIp4Path()
 		update, ok := self.ip4PathUpdates[ip4Path]
 		if !ok {
-			update = &multiClientChannelUpdate{}
+			update = newMultiClientChannelUpdate()
 			self.ip4PathUpdates[ip4Path] = update
 		}
 		ip4Paths, ok := self.updateIp4Paths[update]
@@ -237,7 +251,7 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) *multiClient
 		ip6Path := ipPath.ToIp6Path()
 		update, ok := self.ip6PathUpdates[ip6Path]
 		if !ok {
-			update = &multiClientChannelUpdate{}
+			update = newMultiClientChannelUpdate()
 			self.ip6PathUpdates[ip6Path] = update
 		}
 		ip6Paths, ok := self.updateIp6Paths[update]
@@ -252,7 +266,7 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) *multiClient
 	}
 }
 
-func (self *RemoteUserNatMultiClient) updatePaths(previousClient *multiClientChannel, update *multiClientChannelUpdate) {
+func (self *RemoteUserNatMultiClient) updatePaths(ipPath *IpPath, previousClient *multiClientChannel, update *multiClientChannelUpdate) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -294,8 +308,6 @@ func (self *RemoteUserNatMultiClient) updatePaths(previousClient *multiClientCha
 }
 
 func (self *RemoteUserNatMultiClient) updateClientPath(ipPath *IpPath, callback func(*multiClientChannelUpdate)) {
-	
-
 	// the state lock can be acquired from inside the update lock
 	// ** important ** the update lock cannot be acquired from inside the state lock
 	for {
@@ -307,13 +319,13 @@ func (self *RemoteUserNatMultiClient) updateClientPath(ipPath *IpPath, callback 
 			defer update.lock.Unlock()
 
 			// update might have changed
-			if updateInLock := reserveUpdate(ipPath); update != updateInLock {
+			if updateInLock := self.reserveUpdate(ipPath); update != updateInLock {
 				return false
 			}
 
 			previousClient := update.client
 			callback(update)
-			self.updatePaths(previousClient, update)
+			self.updatePaths(ipPath, previousClient, update)
 			return true
 		}()
 		if success {
@@ -459,21 +471,24 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 			// send to all clients in parallel
 			for _, client := range orderedClients {
 				if client.Send(parsedPacket, 0) {
-					if update.raceStates == nil {
-						update.raceStates = map[Client]X{}
-					}
-					state, ok := update.raceStates[client]
-					if ok && self.settings.MultiSetOnNoResponseTimeout <= state.sendTime.Sub(now) {
-						// no response in timeout, lock in this client
+					update.initRace()
+					now := time.Now()
+					state, ok := update.race.clientStates[client]
+					if ok && update.race.packetCount == 0 && self.settings.MultiSetOnNoResponseTimeout <= state.sendTime.Sub(now) {
+						// no client response in timeout, lock in this client
+						// this happens for example when the client only sends and does not receive (e.g. udp send)
 						update.client = client
-						update.raceStates == nil
+						update.clearRace()
+
+						// FIXME if TCP, send RST packets to other clients
+
 						success = true
 						break
 					} else if !ok {
-						state = &multiClientChannelSynAckState{
-							sendTime: time.Now(),
+						state = &multiClientChannelRaceClientState{
+							sendTime: now,
 						}
-						update.synAckStates[client] = state
+						update.race.clientStates[client] = state
 					}
 					success = true
 				}
@@ -533,7 +548,7 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 	return
 }
 
-
+// clientReceivePacketFunction
 func (self *RemoteUserNatMultiClient) clientReceivePacket(client *multiClientChannel, source TransferPath, ipProtocol IpProtocol, packet []byte) {
 	ipPath, err := ParseIpPath(packet)
 	if err != nil {
@@ -543,9 +558,9 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(client *multiClientCha
 	ipPath = ipPath.Reverse()
 
 	receivePacket := &ReceivePacket{
-		Source: source,
+		Source:     source,
 		IpProtocol: ipProtocol,
-		Packet: packet,
+		Packet:     packet,
 	}
 
 	var receivePackets []*ReceivePacket
@@ -554,70 +569,92 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(client *multiClientCha
 		if update.client == client {
 			receivePackets = []*ReceivePacket{receivePacket}
 		} else if update.client == nil {
-			if update.raceStates == nil {
+			if update.race == nil {
 				receivePackets = []*ReceivePacket{receivePacket}
 				update.client = client
-			} else if len(state.packets) < self.settings.MultiPacketBufferMaxCount {
-				state.packets = append(stats.packets, packet)
-				if 1 == len(state.packets) {
+			} else if state, ok := update.race.clientStates[client]; !ok {
+				// this client is not part of the race
+				// typically we would not be here, since the reply would typically require a companion contract
+				receivePackets = []*ReceivePacket{receivePacket}
+				update.client = client
+
+				// FIXME if TCP, send RST packets to other clients
+
+				update.clearRace()
+			} else if len(state.packets) < self.settings.MultiRaceClientPacketMaxCount && update.race.packetCount < self.settings.MultiRacePacketMaxCount {
+				state.packets = append(state.packets, receivePacket)
+				update.race.packetCount += 1
+				if update.race.packetCount == 1 {
+					// schedule the race evaluation on first packet
 					state.receiveTime = time.Now()
+					raceComplete := update.race.completeMonitor.NotifyChannel()
 					go func() {
 						// wait for the race to finish, then choose
 
 						select {
-						case <- self.ctx.Done():
+						case <-self.ctx.Done():
 							return
-						case <- time.After(self.settings.MultiSetOnResponseTimeout):
+						case <-raceComplete:
+						case <-time.After(self.settings.MultiSetOnResponseTimeout):
 						}
 
 						var receivePackets []*ReceivePacket
 						self.updateClientPath(ipPath, func(update *multiClientChannelUpdate) {
-							if update.raceStates != nil && update.client == nil {
+							if update.race != nil && update.client == nil {
 								// weighted shuffle clients by rtt
-								orderedClients := maps.Keys(raceStates)
-								weights := map[Client]float32{}
-								for client, state := range raceStates {
-									weights[client] = float32(state.receiveTime.Sub(state.startTime) / time.Millisecond)
+								orderedClients := []*multiClientChannel{}
+								weights := map[*multiClientChannel]float32{}
+								for client, state := range update.race.clientStates {
+									if 0 < len(state.packets) {
+										orderedClients = append(orderedClients, client)
+										rtt := state.receiveTime.Sub(state.sendTime)
+										weights[client] = float32(rtt / time.Millisecond)
+									}
 								}
 								WeightedShuffle(orderedClients, weights)
 
-								client := orderedClients[0]
+								// the last is the lowest rtt
+								client := orderedClients[len(orderedClients)-1]
 								update.client = client
-								receivePackets = synAckStates[client].packets
-								
+								receivePackets = update.race.clientStates[client].packets
+
 								// FIXME if TCP, send RST packets to other clients
 
-								update.raceStates = nil
+								update.clearRace()
 							}
 							// else another client already chosen, drop
 						})
 
-						for _, p := receivePackets {
+						for _, p := range receivePackets {
 							self.receivePacketCallback(p.Source, p.IpProtocol, p.Packet)
 						}
 					}()
 				}
+				if len(state.packets) == 1 {
+					update.race.clientsWithPacketCount += 1
+					if update.race.clientsWithPacketCount == len(update.race.clientStates) {
+						update.race.completeMonitor.NotifyAll()
+					}
+				}
 			} else {
 				// release immediately
 
-				client := orderedClients[0]
 				update.client = client
-				receivePackets = append(synAckStates[client].packets, receivePacket)
+				receivePackets = append(state.packets, receivePacket)
 
 				// FIXME if TCP, send RST packets to other clients
 
-				update.raceStates = nil
+				update.clearRace()
 			}
 
 		}
 		// else another client already chosen, drop
 	})
 
-	for _, p := receivePackets {
+	for _, p := range receivePackets {
 		self.receivePacketCallback(p.Source, p.IpProtocol, p.Packet)
 	}
 }
-
 
 func (self *RemoteUserNatMultiClient) Shuffle() {
 	self.window.shuffle()
@@ -631,15 +668,46 @@ type multiClientChannelUpdate struct {
 	lock   sync.Mutex
 	client *multiClientChannel
 
-	raceStates map[*multiClientChannel]*multiClientChannelSynAckState
+	race *multiClientChannelUpdateRace
 }
 
-type multiClientChannelRaceState struct {
-	sendTime time.Time
-	responseTime time.Time
-	packets [][]byte
+func newMultiClientChannelUpdate() *multiClientChannelUpdate {
+	return &multiClientChannelUpdate{}
 }
 
+func (self *multiClientChannelUpdate) initRace() {
+	if self.race == nil {
+		self.race = newMultiClientChannelUpdateRace()
+	}
+}
+
+func (self *multiClientChannelUpdate) clearRace() {
+	if self.race != nil {
+		self.race = nil
+	}
+}
+
+type multiClientChannelUpdateRace struct {
+	clientStates           map[*multiClientChannel]*multiClientChannelRaceClientState
+	packetCount            int
+	clientsWithPacketCount int
+	completeMonitor        *Monitor
+}
+
+func newMultiClientChannelUpdateRace() *multiClientChannelUpdateRace {
+	return &multiClientChannelUpdateRace{
+		clientStates:           map[*multiClientChannel]*multiClientChannelRaceClientState{},
+		packetCount:            0,
+		clientsWithPacketCount: 0,
+		completeMonitor:        NewMonitor(),
+	}
+}
+
+type multiClientChannelRaceClientState struct {
+	sendTime    time.Time
+	receiveTime time.Time
+	packets     []*ReceivePacket
+}
 
 type parsedPacket struct {
 	packet []byte
@@ -908,8 +976,8 @@ type multiClientWindow struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	generator             MultiClientGenerator
-	receivePacketCallback ReceivePacketFunction
+	generator                   MultiClientGenerator
+	clientReceivePacketCallback clientReceivePacketFunction
 
 	settings *MultiClientSettings
 
@@ -927,19 +995,19 @@ func newMultiClientWindow(
 	ctx context.Context,
 	cancel context.CancelFunc,
 	generator MultiClientGenerator,
-	receivePacketCallback ReceivePacketFunction,
+	clientReceivePacketCallback clientReceivePacketFunction,
 	settings *MultiClientSettings,
 ) *multiClientWindow {
 	window := &multiClientWindow{
-		ctx:                     ctx,
-		cancel:                  cancel,
-		generator:               generator,
-		receivePacketCallback:   receivePacketCallback,
-		settings:                settings,
-		clientChannelArgs:       make(chan *multiClientChannelArgs, settings.WindowSizeMin),
-		monitor:                 NewRemoteUserNatMultiClientMonitor(&settings.RemoteUserNatMultiClientMonitorSettings),
-		contractStatusCallbacks: NewCallbackList[ContractStatusFunction](),
-		destinationClients:      map[MultiHopId]*multiClientChannel{},
+		ctx:                         ctx,
+		cancel:                      cancel,
+		generator:                   generator,
+		clientReceivePacketCallback: clientReceivePacketCallback,
+		settings:                    settings,
+		clientChannelArgs:           make(chan *multiClientChannelArgs, settings.WindowSizeMin),
+		monitor:                     NewRemoteUserNatMultiClientMonitor(&settings.RemoteUserNatMultiClientMonitorSettings),
+		contractStatusCallbacks:     NewCallbackList[ContractStatusFunction](),
+		destinationClients:          map[MultiHopId]*multiClientChannel{},
 	}
 
 	go HandleError(window.randomEnumerateClientArgs, cancel)
@@ -1290,7 +1358,7 @@ func (self *multiClientWindow) expand(currentWindowSize int, currentP2pOnlyWindo
 					self.ctx,
 					args,
 					self.generator,
-					self.receivePacketCallback,
+					self.clientReceivePacketCallback,
 					self.contractStatus,
 					self.settings,
 				)
@@ -1548,7 +1616,7 @@ type multiClientChannel struct {
 
 	api *BringYourApi
 
-	receivePacketCallback ReceivePacketFunction
+	clientReceivePacketCallback clientReceivePacketFunction
 
 	settings *MultiClientSettings
 
@@ -1574,7 +1642,7 @@ func newMultiClientChannel(
 	ctx context.Context,
 	args *multiClientChannelArgs,
 	generator MultiClientGenerator,
-	receivePacketCallback ReceivePacketFunction,
+	clientReceivePacketCallback clientReceivePacketFunction,
 	contractStatusCallback ContractStatusFunction,
 	settings *MultiClientSettings,
 ) (*multiClientChannel, error) {
@@ -1607,11 +1675,11 @@ func newMultiClientChannel(
 	// }
 
 	clientChannel := &multiClientChannel{
-		ctx:                   cancelCtx,
-		cancel:                cancel,
-		args:                  args,
-		receivePacketCallback: receivePacketCallback,
-		settings:              settings,
+		ctx:                         cancelCtx,
+		cancel:                      cancel,
+		args:                        args,
+		clientReceivePacketCallback: clientReceivePacketCallback,
+		settings:                    settings,
 		// sourceFilter: sourceFilter,
 		client:                    client,
 		eventBuckets:              []*multiClientEventBucket{},
@@ -2091,7 +2159,7 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 
 				self.addReceiveAck(ByteCount(len(packet)))
 
-				self.receivePacketCallback(source, IpProtocolUnknown, packet)
+				self.clientReceivePacketCallback(self, source, IpProtocolUnknown, packet)
 			} else {
 				glog.V(2).Infof("[multi]receive drop %s<- = %s\n", self.args.Destination, err)
 			}

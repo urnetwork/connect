@@ -1506,7 +1506,10 @@ func (self *TcpSequence) Run() {
 			select {
 			case <-self.ctx.Done():
 				return
-			case writePayload := <-writePayloads:
+			case writePayload, ok := <-writePayloads:
+				if !ok {
+					return
+				}
 				payload := writePayload.payload
 				sendIter := writePayload.sendIter
 				writeEndTime := time.Now().Add(self.tcpBufferSettings.WriteTimeout)
@@ -1618,16 +1621,27 @@ func (self *TcpSequence) Run() {
 	// window scaling depends on `nonBlockingByteCount` and `blockingByteCount` per `self.windowSize`
 	nonBlockingByteCount := uint32(0)
 	blockingByteCount := uint32(0)
+	fin := false
 	for sendIter := uint64(0); ; sendIter += 1 {
 		checkpointId := self.idleCondition.Checkpoint()
 		select {
 		case <-self.ctx.Done():
 			return
 		case sendItem := <-self.sendItems:
+			if fin {
+				continue
+			}
+
 			if glog.V(2) {
 				if "ACK" != tcpFlagsString(sendItem.tcp) {
 					glog.Infof("[r%d]receive(%d %s)\n", sendIter, len(sendItem.tcp.Payload), tcpFlagsString(sendItem.tcp))
 				}
+			}
+
+			if sendItem.tcp.RST {
+				// a RST typically appears for a bad TCP segment
+				glog.V(2).Infof("[r%d]RST\n", sendIter)
+				return
 			}
 
 			drop := false
@@ -1733,14 +1747,9 @@ func (self *TcpSequence) Run() {
 			// }
 
 			if sendItem.tcp.FIN {
-				// close the socket to propage the FIN and close the sequence
-				socket.Close()
-			}
-
-			if sendItem.tcp.RST {
-				// a RST typically appears for a bad TCP segment
-				glog.V(2).Infof("[r%d]RST\n", sendIter)
-				return
+				// flush the write channel to propage the FIN and close the sequence
+				close(writePayloads)
+				fin = true
 			}
 
 		case <-time.After(self.tcpBufferSettings.IdleTimeout):
@@ -2654,6 +2663,17 @@ func (self *IpPath) Destination() *IpPath {
 		Version:         self.Version,
 		DestinationIp:   self.DestinationIp,
 		DestinationPort: self.DestinationPort,
+	}
+}
+
+func (self *IpPath) Reverse() *IpPath {
+	return &IpPath{
+		Protocol:        self.Protocol,
+		Version:         self.Version,
+		SourceIp:        self.DestinationIp,
+		SourcePort:      self.DestinationPort,
+		DestinationIp:   self.SourceIp,
+		DestinationPort: self.SourcePort,
 	}
 }
 
