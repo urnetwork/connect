@@ -469,12 +469,12 @@ func (self *ContractManager) InitProvideSecretKeys() {
 	}
 }
 
-func (self *ContractManager) SetProvidePaused(providePaused bool) {
+func (self *ContractManager) SetProvidePaused(providePaused bool) bool {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 
 	if self.providePaused == providePaused {
-		return
+		return false
 	}
 
 	self.providePaused = providePaused
@@ -510,6 +510,7 @@ func (self *ContractManager) SetProvidePaused(providePaused bool) {
 			nil,
 		)
 	}
+	return true
 }
 
 func (self *ContractManager) IsProvidePaused() bool {
