@@ -56,7 +56,7 @@ type MultiClientGenerator interface {
 
 func DefaultMultiClientSettings() *MultiClientSettings {
 	return &MultiClientSettings{
-		SequenceIdleTimeout: 60 * time.Second,
+		SequenceIdleTimeout: 30 * time.Second,
 		WindowSizeMin:       4,
 		// TODO increase this when p2p is deployed
 		WindowSizeMinP2pOnly: 0,
@@ -80,8 +80,8 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		WindowExpandScale:            2.0,
 		WindowCollapseScale:          0.5,
 		WindowExpandMaxOvershotScale: 4.0,
-		StatsWindowDuration:          120 * time.Second,
-		StatsWindowBucketDuration:    10 * time.Second,
+		StatsWindowDuration:          10 * time.Second,
+		StatsWindowBucketDuration:    1 * time.Second,
 		StatsSampleWeightsCount:      8,
 		StatsSourceCountSelection:    0.95,
 		// ClientAffinityTimeout:        0 * time.Second,
@@ -747,7 +747,8 @@ func newMultiClientChannelUpdate(
 		cancel: cancel,
 		// ip4Path: ip4Path,
 		// ip6Path: ip6Path,
-		settings: settings,
+		settings:     settings,
+		activityTime: time.Now(),
 	}
 }
 
@@ -2004,30 +2005,6 @@ func (self *multiClientChannel) detectBlackhole() {
 	}
 }
 
-func (self *multiClientChannel) eventBucket() *multiClientEventBucket {
-	// must be called with stateLock
-
-	now := time.Now()
-
-	var eventBucket *multiClientEventBucket
-	if n := len(self.eventBuckets); 0 < n {
-		eventBucket = self.eventBuckets[n-1]
-		if eventBucket.createTime.Add(self.settings.StatsWindowBucketDuration).Before(now) {
-			// expired
-			eventBucket = nil
-		}
-	}
-
-	if eventBucket == nil {
-		eventBucket = newMultiClientEventBucket()
-		self.eventBuckets = append(self.eventBuckets, eventBucket)
-	}
-
-	eventBucket.eventTime = now
-
-	return eventBucket
-}
-
 func (self *multiClientChannel) addSendNack(ackByteCount ByteCount) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -2038,8 +2015,6 @@ func (self *multiClientChannel) addSendNack(ackByteCount ByteCount) {
 	eventBucket := self.eventBucket()
 	eventBucket.sendNackCount += 1
 	eventBucket.sendNackByteCount += ackByteCount
-
-	self.coalesceEventBuckets()
 }
 
 func (self *multiClientChannel) addSendAck(ackByteCount ByteCount) {
@@ -2057,8 +2032,6 @@ func (self *multiClientChannel) addSendAck(ackByteCount ByteCount) {
 	}
 	eventBucket.sendAckCount += 1
 	eventBucket.sendAckByteCount += ackByteCount
-
-	self.coalesceEventBuckets()
 }
 
 func (self *multiClientChannel) addReceiveAck(ackByteCount ByteCount) {
@@ -2071,52 +2044,51 @@ func (self *multiClientChannel) addReceiveAck(ackByteCount ByteCount) {
 	eventBucket := self.eventBucket()
 	eventBucket.receiveAckCount += 1
 	eventBucket.receiveAckByteCount += ackByteCount
-
-	self.coalesceEventBuckets()
 }
 
 func (self *multiClientChannel) addSource(ipPath *IpPath) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
-	source := ipPath.Source()
-	destination := ipPath.Destination()
-	switch source.Version {
-	case 4:
-		sourceCount, ok := self.ip4DestinationSourceCount[destination.ToIp4Path()]
-		if !ok {
-			sourceCount = map[Ip4Path]int{}
-			self.ip4DestinationSourceCount[destination.ToIp4Path()] = sourceCount
-		}
-		sourceCount[source.ToIp4Path()] += 1
-	case 6:
-		sourceCount, ok := self.ip6DestinationSourceCount[destination.ToIp6Path()]
-		if !ok {
-			sourceCount = map[Ip6Path]int{}
-			self.ip6DestinationSourceCount[destination.ToIp6Path()] = sourceCount
-		}
-		sourceCount[source.ToIp6Path()] += 1
-	default:
-		panic(fmt.Errorf("Bad protocol version %d", source.Version))
-	}
-
 	eventBucket := self.eventBucket()
 	switch ipPath.Version {
 	case 4:
+		ip4Path := ipPath.ToIp4Path()
+
 		if eventBucket.ip4Paths == nil {
 			eventBucket.ip4Paths = map[Ip4Path]bool{}
 		}
-		eventBucket.ip4Paths[ipPath.ToIp4Path()] = true
+		eventBucket.ip4Paths[ip4Path] = true
+
+		source := ip4Path.Source()
+		destination := ip4Path.Destination()
+
+		sourceCount, ok := self.ip4DestinationSourceCount[destination]
+		if !ok {
+			sourceCount = map[Ip4Path]int{}
+			self.ip4DestinationSourceCount[destination] = sourceCount
+		}
+		sourceCount[source] += 1
 	case 6:
+		ip6Path := ipPath.ToIp6Path()
+
 		if eventBucket.ip6Paths == nil {
 			eventBucket.ip6Paths = map[Ip6Path]bool{}
 		}
-		eventBucket.ip6Paths[ipPath.ToIp6Path()] = true
-	default:
-		panic(fmt.Errorf("Bad protocol version %d", source.Version))
-	}
+		eventBucket.ip6Paths[ip6Path] = true
 
-	self.coalesceEventBuckets()
+		source := ip6Path.Source()
+		destination := ip6Path.Destination()
+
+		sourceCount, ok := self.ip6DestinationSourceCount[destination]
+		if !ok {
+			sourceCount = map[Ip6Path]int{}
+			self.ip6DestinationSourceCount[destination] = sourceCount
+		}
+		sourceCount[source] += 1
+	default:
+		panic(fmt.Errorf("Bad protocol version %d", ipPath.Version))
+	}
 }
 
 func (self *multiClientChannel) addError(err error) {
@@ -2129,8 +2101,28 @@ func (self *multiClientChannel) addError(err error) {
 
 	eventBucket := self.eventBucket()
 	eventBucket.errs = append(eventBucket.errs, err)
+}
+
+func (self *multiClientChannel) eventBucket() *multiClientEventBucket {
+	// must be called with stateLock
+
+	now := time.Now()
+
+	var eventBucket *multiClientEventBucket
+	if n := len(self.eventBuckets); 0 < n {
+		eventBucket = self.eventBuckets[n-1]
+	}
+
+	if eventBucket == nil || eventBucket.createTime.Add(self.settings.StatsWindowBucketDuration).Before(now) {
+		eventBucket = newMultiClientEventBucket()
+		self.eventBuckets = append(self.eventBuckets, eventBucket)
+	}
+
+	eventBucket.eventTime = now
 
 	self.coalesceEventBuckets()
+
+	return eventBucket
 }
 
 func (self *multiClientChannel) coalesceEventBuckets() {
