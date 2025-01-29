@@ -63,7 +63,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		WindowSizeMax:        8,
 		// reconnects per source
 		WindowSizeReconnectScale: 1.0,
-		WriteRetryTimeout:        200 * time.Millisecond,
+		SendRetryTimeout:         20 * time.Millisecond,
 		// this includes the time to establish the transport
 		PingWriteTimeout: 5 * time.Second,
 		PingTimeout:      10 * time.Second,
@@ -86,11 +86,13 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		StatsSourceCountSelection:    0.95,
 		// ClientAffinityTimeout:        0 * time.Second,
 
-		MultiSetOnNoResponseTimeout:          1000 * time.Millisecond,
-		MultiSetOnResponseTimeout:            100 * time.Millisecond,
+		MultiRaceSetOnNoResponseTimeout:      1000 * time.Millisecond,
+		MultiRaceSetOnResponseTimeout:        100 * time.Millisecond,
 		MultiRaceClientPacketMaxCount:        4,
 		MultiRacePacketMaxCount:              16,
 		MultiRaceClientEarlyCompleteFraction: 0.25,
+		// FIXME on platforms with more memory, increase this
+		MultiRaceClientCount: 4,
 
 		RemoteUserNatMultiClientMonitorSettings: *DefaultRemoteUserNatMultiClientMonitorSettings(),
 	}
@@ -110,7 +112,7 @@ type MultiClientSettings struct {
 	// ClientWriteTimeout time.Duration
 	// SendTimeout time.Duration
 	// WriteTimeout time.Duration
-	WriteRetryTimeout            time.Duration
+	SendRetryTimeout             time.Duration
 	PingWriteTimeout             time.Duration
 	PingTimeout                  time.Duration
 	AckTimeout                   time.Duration
@@ -134,12 +136,13 @@ type MultiClientSettings struct {
 	// ClientAffinityTimeout time.Duration
 
 	// time since first send to end the race, if no response
-	MultiSetOnNoResponseTimeout time.Duration
+	MultiRaceSetOnNoResponseTimeout time.Duration
 	// time after the first response to end the race
-	MultiSetOnResponseTimeout            time.Duration
+	MultiRaceSetOnResponseTimeout        time.Duration
 	MultiRaceClientPacketMaxCount        int
 	MultiRacePacketMaxCount              int
 	MultiRaceClientEarlyCompleteFraction float32
+	MultiRaceClientCount                 int
 
 	RemoteUserNatMultiClientMonitorSettings
 }
@@ -452,65 +455,20 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 		// 	}
 		// }()
 
-		for {
-			orderedClients := self.window.OrderedClients()
-
-			// for _, client := range removedClients {
-			// 	glog.V(2).Infof("[multi]remove client %s->%s.\n", client.args.ClientId, client.args.Destination)
-			// 	self.removeClient(client)
-			// }
-
-			// in order, try
-			// - the temporal affinity
-			//   connections initiated near each other in time will use the same client
-			// - clients in order
-
-			// if 0 < self.settings.ClientAffinityTimeout {
-			// 	// this implementation is a best-effort at affinity
-			// 	// it will not ensure affinity between parallel sends in all cases
-			// 	var mostRecentAffinityClient *multiClientChannel
-			// 	for _, client := range orderedClients {
-			// 		affinityCount, affinityTime := client.MostRecentAffinity()
-			// 		if 0 < affinityCount && enterTime.Sub(affinityTime) < self.settings.ClientAffinityTimeout {
-			// 			if mostRecentAffinityClient == nil {
-			// 				mostRecentAffinityClient = client
-			// 			} else if _, mostRecentAffinityTime := mostRecentAffinityClient.MostRecentAffinity(); mostRecentAffinityTime.Before(affinityTime) {
-			// 				mostRecentAffinityClient = client
-			// 			}
-			// 		}
-			// 	}
-			// 	if mostRecentAffinityClient != nil {
-			// 		affinityTimeout := min(self.settings.WriteRetryTimeout, self.settings.ClientAffinityTimeout)
-			// 		if 0 <= timeout {
-			// 			remainingTimeout := enterTime.Add(timeout).Sub(time.Now())
-
-			// 			if remainingTimeout <= 0 {
-			// 				// drop
-			// 				success = false
-			// 				return
-			// 			}
-
-			// 			affinityTimeout = min(affinityTimeout, remainingTimeout)
-			// 		}
-			// 		if mostRecentAffinityClient.Send(parsedPacket, affinityTimeout) {
-			// 			glog.V(2).Infof("[multi]use affinity client ipv%d p%v -> %s:%d\n", parsedPacket.ipPath.Version, parsedPacket.ipPath.Protocol, parsedPacket.ipPath.DestinationIp, parsedPacket.ipPath.DestinationPort)
-			// 			// lock the path to the client
-			// 			update.client = mostRecentAffinityClient
-			// 			success = true
-			// 			return
-			// 		}
-			// 		// else choose a new client
-			// 	}
-			// 	// else choose a new client
-			// }
-
-			// send to all clients in parallel
+		race := func(orderedClients []*multiClientChannel, sendTimeout time.Duration) {
+			successCount := 0
 			for _, client := range orderedClients {
-				if client.Send(parsedPacket, 0) {
+				select {
+				case <-self.ctx.Done():
+					return
+				default:
+				}
+
+				if client.Send(parsedPacket, sendTimeout) {
 					update.initRace()
 					now := time.Now()
 					state, ok := update.race.clientStates[client]
-					if ok && update.race.packetCount == 0 && self.settings.MultiSetOnNoResponseTimeout <= state.sendTime.Sub(now) {
+					if ok && update.race.packetCount == 0 && self.settings.MultiRaceSetOnNoResponseTimeout <= state.sendTime.Sub(now) {
 						// no client response in timeout, lock in this client
 						// this happens for example when the client only sends and does not receive (e.g. udp send)
 						update.client = client
@@ -519,22 +477,39 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 						// FIXME if TCP, send RST packets to other clients
 
 						success = true
-						break
+						return
 					} else if !ok {
 						state = &multiClientChannelRaceClientState{
 							sendTime: now,
 						}
 						update.race.clientStates[client] = state
+						// `update.client` will be set by the packet receive
+						success = true
+						successCount += 1
+						if self.settings.MultiRaceClientCount <= successCount {
+							return
+						}
+						// else continue sending to all clients
 					}
-					success = true
 				}
 			}
+		}
+
+		for {
+			select {
+			case <-self.ctx.Done():
+				success = false
+				return
+			default:
+			}
+
+			orderedClients := self.window.OrderedClients()
+			race(orderedClients, 0)
 			if success {
-				// `update.client` will be set by the packet receive
 				return
 			}
 
-			retryTimeout := self.settings.WriteRetryTimeout
+			var retryTimeout time.Duration
 			if 0 <= timeout {
 				remainingTimeout := enterTime.Add(timeout).Sub(time.Now())
 
@@ -544,31 +519,15 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 					return
 				}
 
-				retryTimeout = min(remainingTimeout, retryTimeout)
+				retryTimeout = min(remainingTimeout, self.settings.SendRetryTimeout)
 			}
 
 			if 0 < len(orderedClients) {
 				// distribute the timeout evenly via wait
 				retryTimeoutPerClient := retryTimeout / time.Duration(len(orderedClients))
-				for _, client := range orderedClients {
-					var err error
-					success, err = client.SendDetailed(parsedPacket, retryTimeoutPerClient)
-					if success && err == nil {
-						// lock the path to the client
-						glog.V(2).Infof("[multi]wait for new client ipv%d p%v -> %s:%d\n", parsedPacket.ipPath.Version, parsedPacket.ipPath.Protocol, parsedPacket.ipPath.DestinationIp, parsedPacket.ipPath.DestinationPort)
-						update.client = client
-						success = true
-						return
-					} else if err != nil {
-						glog.Infof("[multi]send error = %s\n", err)
-					}
-					select {
-					case <-self.ctx.Done():
-						// drop
-						success = false
-						return
-					default:
-					}
+				race(orderedClients, retryTimeoutPerClient)
+				if success {
+					return
 				}
 			} else {
 				select {
@@ -634,7 +593,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(client *multiClientCha
 						case <-race.ctx.Done():
 							return
 						case <-raceComplete:
-						case <-time.After(self.settings.MultiSetOnResponseTimeout):
+						case <-time.After(self.settings.MultiRaceSetOnResponseTimeout):
 						}
 
 						var receivePackets []*ReceivePacket
@@ -650,7 +609,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(client *multiClientCha
 										weights[client] = float32(rtt / time.Millisecond)
 									}
 								}
-								WeightedShuffle(orderedClients, weights)
+								WeightedShuffleWithEntropy(orderedClients, weights, self.settings.StatsWindowEntropy)
 
 								// the last is the lowest rtt
 								client := orderedClients[len(orderedClients)-1]
