@@ -233,8 +233,6 @@ func (self *RemoteUserNatMultiClient) AddContractStatusCallback(contractStatusCa
 }
 
 func (self *RemoteUserNatMultiClient) updateClientPath(ipPath *IpPath, callback func(*multiClientChannelUpdate)) {
-	// glog.Infof("[L17]")
-
 	update, client := self.reserveUpdate(ipPath)
 	callback(update)
 	self.updateClient(update, client)
@@ -254,7 +252,6 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClien
 
 			var idleTimeout time.Duration
 			func() {
-				// glog.Infof("[L20]")
 				self.stateLock.Lock()
 				defer self.stateLock.Unlock()
 
@@ -285,7 +282,6 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClien
 
 				var client *multiClientChannel
 				func() {
-					// glog.Infof("[L21]")
 					self.stateLock.Lock()
 					defer self.stateLock.Unlock()
 
@@ -324,7 +320,6 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClien
 
 				var client *multiClientChannel
 				func() {
-					// glog.Infof("[L22]")
 					self.stateLock.Lock()
 					defer self.stateLock.Unlock()
 
@@ -386,7 +381,6 @@ func (self *RemoteUserNatMultiClient) updateClient(update *multiClientChannelUpd
 
 // remove a client from all updates
 func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
-	// glog.Infof("[L23]")
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -441,7 +435,6 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 	parsedPacket *parsedPacket,
 	timeout time.Duration,
 ) (success bool) {
-	// glog.Infof("SEND %v", parsedPacket.ipPath)
 	self.updateClientPath(parsedPacket.ipPath, func(update *multiClientChannelUpdate) {
 		enterTime := time.Now()
 
@@ -586,7 +579,6 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(sourceClient *multiCli
 		// bad ip packet, drop
 		return
 	}
-	// glog.Infof("RECEIVE %v", ipPath)
 	ipPath = ipPath.Reverse()
 
 	receivePacket := &ReceivePacket{
@@ -598,31 +590,22 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(sourceClient *multiCli
 	var receivePackets []*ReceivePacket
 
 	self.updateClientPath(ipPath, func(update *multiClientChannelUpdate) {
-
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 
 		client := update.client
 
 		if client == sourceClient {
-			// glog.Infof("RETURN CLIENT SET %v", ipPath)
-
 			receivePackets = []*ReceivePacket{receivePacket}
 		} else if client != nil {
-			glog.Infof("RETURN ANOTHER CLIENT WON %v", ipPath)
-
 			// another client already chosen, drop
 		} else if race := update.race; race == nil {
-			glog.Infof("RETURN NO RACE %v", ipPath)
-			// receivePackets = []*ReceivePacket{receivePacket}
-			// nextClient = sourceClient
-			// drop
+			// no race, no client, drop
+			glog.Infof("[multi]receive no race and no client")
 		} else if state, ok := race.clientStates[sourceClient]; !ok {
 			// this client is not part of the race, drop
-			glog.Infof("RETURN PACKET NOT PART OF RACE")
-			// drop
+			glog.Infof("[multi]receive client not part of race")
 		} else if len(state.packets) < self.settings.MultiRaceClientPacketMaxCount && race.packetCount < self.settings.MultiRacePacketMaxCount {
-			// glog.Infof("RETURN RACE IN PROGRESS %v", ipPath)
 			state.packets = append(state.packets, receivePacket)
 			if 1 == len(state.packets) {
 				state.receiveTime = time.Now()
@@ -630,8 +613,8 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(sourceClient *multiCli
 			race.packetCount += 1
 			if race.packetCount == 1 {
 				// schedule the race evaluation on first packet
-				complete := race.completeMonitor.NotifyChannel()
-				self.scheduleCompleteRace(ipPath, race, complete)
+				earlyComplete := race.completeMonitor.NotifyChannel()
+				self.scheduleCompleteRace(ipPath, race, earlyComplete)
 			}
 			if len(state.packets) == 1 {
 				race.clientsWithPacketCount += 1
@@ -640,8 +623,8 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(sourceClient *multiCli
 				}
 			}
 		} else {
-			glog.Infof("RETURN RACE BUFFER LIMIT %v", ipPath)
 			// race buffer limits exceeded, end the race immediately
+			glog.Infof("[multi]receive race buffer limit reached")
 
 			// update.client = client
 			update.clearRace()
@@ -649,7 +632,6 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(sourceClient *multiCli
 			receivePackets = append(state.packets, receivePacket)
 
 			// FIXME if TCP, send RST packets to other clients
-
 		}
 	})
 
@@ -658,19 +640,20 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(sourceClient *multiCli
 	}
 }
 
-func (self *RemoteUserNatMultiClient) scheduleCompleteRace(ipPath *IpPath, race *multiClientChannelUpdateRace, complete <-chan struct{}) {
-
+func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
+	ipPath *IpPath,
+	race *multiClientChannelUpdateRace,
+	earlyComplete <-chan struct{},
+) {
 	go HandleError(func() {
 		// wait for the race to finish, then choose
 
 		select {
 		case <-race.ctx.Done():
 			return
-		case <-complete:
+		case <-earlyComplete:
 		case <-time.After(self.settings.MultiRaceSetOnResponseTimeout):
 		}
-
-		// glog.Infof("RETURN RACE ENDED %v", ipPath)
 
 		var receivePackets []*ReceivePacket
 		self.updateClientPath(ipPath, func(update *multiClientChannelUpdate) {
@@ -709,7 +692,6 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(ipPath *IpPath, race 
 		for _, p := range receivePackets {
 			self.receivePacketCallback(p.Source, p.IpProtocol, p.Packet)
 		}
-
 	})
 }
 
@@ -722,7 +704,6 @@ func (self *RemoteUserNatMultiClient) Close() {
 	self.window.Close()
 
 	func() {
-		// glog.Infof("[L1]")
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		for _, update := range self.ip4PathUpdates {
@@ -1170,7 +1151,6 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 		for len(destinationEstimatedBytesPerSecond) == 0 {
 			// exclude destinations that are already in the window
 			func() {
-				// glog.Infof("[L2]")
 				self.stateLock.Lock()
 				defer self.stateLock.Unlock()
 				for destination, _ := range self.destinationClients {
@@ -1195,7 +1175,6 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 				}
 				// remove destinations that are already in the window
 				func() {
-					// glog.Infof("[L3]")
 					self.stateLock.Lock()
 					defer self.stateLock.Unlock()
 					for destination, _ := range self.destinationClients {
@@ -1265,7 +1244,6 @@ func (self *multiClientWindow) resize() {
 
 		if 0 < len(removedClients) {
 			func() {
-				// glog.Infof("[L4]")
 				self.stateLock.Lock()
 				defer self.stateLock.Unlock()
 
@@ -1329,7 +1307,6 @@ func (self *multiClientWindow) resize() {
 			// try to remove the lowest weighted clients to resize the window to `windowSize`
 			// clients in the graceperiod or with activity cannot be removed
 
-			// glog.Infof("[L5]")
 			self.stateLock.Lock()
 			defer self.stateLock.Unlock()
 
@@ -1385,7 +1362,6 @@ func (self *multiClientWindow) resize() {
 
 			// evaluate the next overshot scale
 			func() {
-				// glog.Infof("[L6]")
 				self.stateLock.Lock()
 				defer self.stateLock.Unlock()
 				n = len(self.destinationClients) - len(clients)
@@ -1457,7 +1433,6 @@ func (self *multiClientWindow) expand(currentWindowSize int, currentP2pOnlyWindo
 				return
 			}
 			func() {
-				// glog.Infof("[L7]")
 				self.stateLock.Lock()
 				defer self.stateLock.Unlock()
 				_, ok = self.destinationClients[args.Destination]
@@ -1509,7 +1484,6 @@ func (self *multiClientWindow) expand(currentWindowSize int, currentP2pOnlyWindo
 								self.monitor.AddProviderEvent(args.ClientId, ProviderStateAdded)
 								var replacedClient *multiClientChannel
 								func() {
-									// glog.Infof("[L8]")
 									self.stateLock.Lock()
 									defer self.stateLock.Unlock()
 									replacedClient = self.destinationClients[args.Destination]
@@ -1583,7 +1557,6 @@ func (self *multiClientWindow) shuffle() {
 }
 
 func (self *multiClientWindow) clients() []*multiClientChannel {
-	// glog.Infof("[L9]")
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	return maps.Values(self.destinationClients)
@@ -1674,7 +1647,6 @@ func (self *multiClientWindow) statsSampleWeights(weights map[*multiClientChanne
 func (self *multiClientWindow) Close() {
 	var removedClients []*multiClientChannel
 	func() {
-		// glog.Infof("[L10]")
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		for _, client := range self.destinationClients {
@@ -2001,7 +1973,6 @@ func (self *multiClientChannel) detectBlackhole() {
 }
 
 func (self *multiClientChannel) addSendNack(ackByteCount ByteCount) {
-	// glog.Infof("[L11]")
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -2014,7 +1985,6 @@ func (self *multiClientChannel) addSendNack(ackByteCount ByteCount) {
 }
 
 func (self *multiClientChannel) addSendAck(ackByteCount ByteCount) {
-	// glog.Infof("[L12]")
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -2032,7 +2002,6 @@ func (self *multiClientChannel) addSendAck(ackByteCount ByteCount) {
 }
 
 func (self *multiClientChannel) addReceiveAck(ackByteCount ByteCount) {
-	// glog.Infof("[L13]")
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -2045,7 +2014,6 @@ func (self *multiClientChannel) addReceiveAck(ackByteCount ByteCount) {
 }
 
 func (self *multiClientChannel) addSource(ipPath *IpPath) {
-	// glog.Infof("[L14]")
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -2091,7 +2059,6 @@ func (self *multiClientChannel) addSource(ipPath *IpPath) {
 }
 
 func (self *multiClientChannel) addError(err error) {
-	// glog.Infof("[L15]")
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -2193,7 +2160,6 @@ func (self *multiClientChannel) WindowStats() (*clientWindowStats, error) {
 }
 
 func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientWindowStats, error) {
-	// glog.Infof("[L16]")
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
