@@ -88,10 +88,11 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 
 		MultiRaceSetOnNoResponseTimeout:      1000 * time.Millisecond,
 		MultiRaceSetOnResponseTimeout:        100 * time.Millisecond,
+		MultiRaceClientSentPacketMaxCount:    16,
 		MultiRaceClientPacketMaxCount:        4,
 		MultiRacePacketMaxCount:              16,
 		MultiRaceClientEarlyCompleteFraction: 0.25,
-		// FIXME on platforms with more memory, increase this
+		// TODO on platforms with more memory, increase this
 		MultiRaceClientCount: 4,
 
 		RemoteUserNatMultiClientMonitorSettings: *DefaultRemoteUserNatMultiClientMonitorSettings(),
@@ -139,6 +140,7 @@ type MultiClientSettings struct {
 	MultiRaceSetOnNoResponseTimeout time.Duration
 	// time after the first response to end the race
 	MultiRaceSetOnResponseTimeout        time.Duration
+	MultiRaceClientSentPacketMaxCount    int
 	MultiRaceClientPacketMaxCount        int
 	MultiRacePacketMaxCount              int
 	MultiRaceClientEarlyCompleteFraction float32
@@ -269,6 +271,22 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClien
 		}
 	}
 
+	rst := func(client *multiClientChannel) {
+		if client != nil {
+			// rst to destination
+			if packet, ok := ipOosRst(ipPath); ok {
+				client.Send(&parsedPacket{
+					packet: packet,
+					ipPath: ipPath,
+				}, 0)
+			}
+		}
+		// rst to source
+		if packet, ok := ipOosRst(ipPath.Reverse()); ok {
+			self.receivePacketCallback(TransferPath{}, ipPath.Protocol, packet)
+		}
+	}
+
 	switch ipPath.Version {
 	case 4:
 		ip4Path := ipPath.ToIp4Path()
@@ -300,10 +318,7 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClien
 					}
 				}()
 
-				if client != nil {
-					// FIXME send RST to client
-				}
-				// FIXME send RST to receivePacketFunction
+				rst(client)
 			}, update.cancel)
 			self.ip4PathUpdates[ip4Path] = update
 		}
@@ -338,11 +353,7 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClien
 					}
 				}()
 
-				if client != nil {
-					// FIXME send RST to client
-				}
-				// FIXME send RST to receivePacketFunction
-
+				rst(client)
 			}, update.cancel)
 			self.ip6PathUpdates[ip6Path] = update
 		}
@@ -432,10 +443,10 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 func (self *RemoteUserNatMultiClient) sendPacket(
 	source TransferPath,
 	provideMode protocol.ProvideMode,
-	parsedPacket *parsedPacket,
+	sendPacket *parsedPacket,
 	timeout time.Duration,
 ) (success bool) {
-	self.updateClientPath(parsedPacket.ipPath, func(update *multiClientChannelUpdate) {
+	self.updateClientPath(sendPacket.ipPath, func(update *multiClientChannelUpdate) {
 		enterTime := time.Now()
 
 		currentClient := func() *multiClientChannel {
@@ -443,24 +454,31 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 			defer self.stateLock.Unlock()
 			return update.client
 		}
-		for client := currentClient(); client != nil; {
-			var err error
-			success, err = client.SendDetailed(parsedPacket, timeout)
-			if err == nil {
-				return
-			}
-
-			func() {
-				self.stateLock.Lock()
-				defer self.stateLock.Unlock()
-				if client == update.client {
-					update.client = nil
-					client = nil
-				} else {
-					// a new client was set, try the new client
-					client = update.client
+		sendCurrent := func() bool {
+			for client := currentClient(); client != nil; {
+				var err error
+				success, err = client.SendDetailed(sendPacket, timeout)
+				if err == nil {
+					return true
 				}
-			}()
+
+				func() {
+					self.stateLock.Lock()
+					defer self.stateLock.Unlock()
+					if client == update.client {
+						update.client = nil
+						client = nil
+					} else {
+						// a new client was set, try the new client
+						client = update.client
+					}
+				}()
+			}
+			return false
+		}
+
+		if sendCurrent() {
+			return
 		}
 
 		// find a new client
@@ -474,16 +492,22 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 				default:
 				}
 
-				var race *multiClientChannelUpdateRace
-				var state *multiClientChannelRaceClientState
+				done := false
+
 				func() {
 					self.stateLock.Lock()
 					defer self.stateLock.Unlock()
 
-					update.initRace()
-					race = update.race
+					if update.client != nil {
+						// another client already chosen, done
+						done = true
+						return
+					}
 
-					state = race.clientStates[client]
+					update.initRace()
+					race := update.race
+					state := race.clientStates[client]
+
 					if state == nil {
 						state = &multiClientChannelRaceClientState{
 							sendTime: time.Now(),
@@ -491,23 +515,41 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 						race.clientStates[client] = state
 					}
 				}()
+				if done {
+					return
+				}
 
-				if client.Send(parsedPacket, sendTimeout) {
+				if client.Send(sendPacket, sendTimeout) {
 					successCount += 1
 					success = true
-					done := false
+					var abandonedClients []*multiClientChannel
 					func() {
 						self.stateLock.Lock()
 						defer self.stateLock.Unlock()
 
-						if race.packetCount == 0 && self.settings.MultiRaceSetOnNoResponseTimeout <= time.Now().Sub(state.sendTime) {
+						if update.client != nil {
+							// another client already chosen, done
+							done = true
+							return
+						}
+
+						update.initRace()
+						race := update.race
+						state := race.clientStates[client]
+						race.sentPacketCount += 1
+						bufferExceeded := self.settings.MultiRaceSetOnNoResponseTimeout <= time.Now().Sub(state.sendTime) || self.settings.MultiRaceClientSentPacketMaxCount < race.sentPacketCount
+						if race.packetCount == 0 && bufferExceeded {
 							// no client response in timeout, lock in this client
 							// this happens for example when the client only sends and does not receive (e.g. udp send)
-							// update.client = client
+
+							for abandonedClient, _ := range race.clientStates {
+								if abandonedClient != client {
+									abandonedClients = append(abandonedClients, abandonedClient)
+								}
+							}
+
 							update.clearRace()
 							update.client = client
-
-							// FIXME if TCP, send RST packets to other clients
 
 							done = true
 							return
@@ -519,6 +561,16 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 							// else continue sending to all clients
 						}
 					}()
+					if 0 < len(abandonedClients) {
+						if rstPacket, ok := ipOosRst(sendPacket.ipPath); ok {
+							for _, abandonedClient := range abandonedClients {
+								abandonedClient.Send(&parsedPacket{
+									packet: rstPacket,
+									ipPath: sendPacket.ipPath,
+								}, 0)
+							}
+						}
+					}
 					if done {
 						return
 					}
@@ -536,6 +588,10 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 			case <-update.ctx.Done():
 				return
 			default:
+			}
+
+			if sendCurrent() {
+				return
 			}
 
 			var retryTimeout time.Duration
@@ -587,8 +643,8 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(sourceClient *multiCli
 		Packet:     packet,
 	}
 
+	var abandonedClients []*multiClientChannel
 	var receivePackets []*ReceivePacket
-
 	self.updateClientPath(ipPath, func(update *multiClientChannelUpdate) {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -626,15 +682,27 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(sourceClient *multiCli
 			// race buffer limits exceeded, end the race immediately
 			glog.Infof("[multi]receive race buffer limit reached")
 
-			// update.client = client
+			for abandonedClient, _ := range race.clientStates {
+				if abandonedClient != client {
+					abandonedClients = append(abandonedClients, abandonedClient)
+				}
+			}
+
 			update.clearRace()
 			update.client = client
 			receivePackets = append(state.packets, receivePacket)
-
-			// FIXME if TCP, send RST packets to other clients
 		}
 	})
-
+	if 0 < len(abandonedClients) {
+		if rstPacket, ok := ipOosRst(ipPath); ok {
+			for _, abandonedClient := range abandonedClients {
+				abandonedClient.Send(&parsedPacket{
+					packet: rstPacket,
+					ipPath: ipPath,
+				}, 0)
+			}
+		}
+	}
 	for _, p := range receivePackets {
 		self.receivePacketCallback(p.Source, p.IpProtocol, p.Packet)
 	}
@@ -655,6 +723,7 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 		case <-time.After(self.settings.MultiRaceSetOnResponseTimeout):
 		}
 
+		var abandonedClients []*multiClientChannel
 		var receivePackets []*ReceivePacket
 		self.updateClientPath(ipPath, func(update *multiClientChannelUpdate) {
 			self.stateLock.Lock()
@@ -673,22 +742,31 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 					}
 				}
 				WeightedShuffleWithEntropy(orderedClients, weights, self.settings.StatsWindowEntropy)
-
 				// the last is the lowest rtt
+				client := orderedClients[len(orderedClients)-1]
+
+				for abandonedClient, _ := range race.clientStates {
+					if abandonedClient != client {
+						abandonedClients = append(abandonedClients, abandonedClient)
+					}
+				}
 
 				update.clearRace()
-				update.client = orderedClients[len(orderedClients)-1]
-				// update.client = client
-				// nextClient = client
+				update.client = client
 				receivePackets = race.clientStates[update.client].packets
-
-				// FIXME if TCP, send RST packets to other clients
 			}
 			// else a client was already chosen, ignore
-
-			return
 		})
-
+		if 0 < len(abandonedClients) {
+			if rstPacket, ok := ipOosRst(ipPath); ok {
+				for _, abandonedClient := range abandonedClients {
+					abandonedClient.Send(&parsedPacket{
+						packet: rstPacket,
+						ipPath: ipPath,
+					}, 0)
+				}
+			}
+		}
 		for _, p := range receivePackets {
 			self.receivePacketCallback(p.Source, p.IpProtocol, p.Packet)
 		}
@@ -770,6 +848,7 @@ type multiClientChannelUpdateRace struct {
 	ctx                    context.Context
 	cancel                 context.CancelFunc
 	clientStates           map[*multiClientChannel]*multiClientChannelRaceClientState
+	sentPacketCount        int
 	packetCount            int
 	clientsWithPacketCount int
 	completeMonitor        *Monitor
@@ -781,6 +860,7 @@ func newMultiClientChannelUpdateRace(ctx context.Context) *multiClientChannelUpd
 		ctx:                    cancelCtx,
 		cancel:                 cancel,
 		clientStates:           map[*multiClientChannel]*multiClientChannelRaceClientState{},
+		sentPacketCount:        0,
 		packetCount:            0,
 		clientsWithPacketCount: 0,
 		completeMonitor:        NewMonitor(),
