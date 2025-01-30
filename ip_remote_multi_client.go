@@ -33,7 +33,7 @@ import (
 
 // TODO surface window stats to show to users
 
-type clientReceivePacketFunction func(client *multiClientChannel, source TransferPath, ipProtocol IpProtocol, packet []byte)
+type clientReceivePacketFunction func(client *multiClientChannel, source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte)
 
 // for each `NewClientArgs`,
 //
@@ -283,7 +283,7 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClien
 		}
 		// rst to source
 		if packet, ok := ipOosRst(ipPath.Reverse()); ok {
-			self.receivePacketCallback(TransferPath{}, ipPath.Protocol, packet)
+			self.receivePacketCallback(TransferPath{}, protocol.ProvideMode_Network, ipPath, packet)
 		}
 	}
 
@@ -629,19 +629,26 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 }
 
 // clientReceivePacketFunction
-func (self *RemoteUserNatMultiClient) clientReceivePacket(sourceClient *multiClientChannel, source TransferPath, ipProtocol IpProtocol, packet []byte) {
-	ipPath, err := ParseIpPath(packet)
-	if err != nil {
-		// bad ip packet, drop
-		return
-	}
-	ipPath = ipPath.Reverse()
-
+func (self *RemoteUserNatMultiClient) clientReceivePacket(
+	sourceClient *multiClientChannel,
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	packet []byte,
+) {
+	// ipPath, err := ParseIpPath(packet)
+	// if err != nil {
+	// 	// bad ip packet, drop
+	// 	return
+	// }
 	receivePacket := &ReceivePacket{
-		Source:     source,
-		IpProtocol: ipProtocol,
-		Packet:     packet,
+		Source:      source,
+		ProvideMode: provideMode,
+		IpPath:      ipPath,
+		Packet:      packet,
 	}
+
+	ipPath = ipPath.Reverse()
 
 	var abandonedClients []*multiClientChannel
 	var receivePackets []*ReceivePacket
@@ -704,7 +711,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(sourceClient *multiCli
 		}
 	}
 	for _, p := range receivePackets {
-		self.receivePacketCallback(p.Source, p.IpProtocol, p.Packet)
+		self.receivePacketCallback(p.Source, p.ProvideMode, p.IpPath, p.Packet)
 	}
 }
 
@@ -768,7 +775,7 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 			}
 		}
 		for _, p := range receivePackets {
-			self.receivePacketCallback(p.Source, p.IpProtocol, p.Packet)
+			self.receivePacketCallback(p.Source, p.ProvideMode, p.IpPath, p.Packet)
 		}
 	})
 }
@@ -2351,7 +2358,11 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 
 				self.addReceiveAck(ByteCount(len(packet)))
 
-				self.clientReceivePacketCallback(self, source, IpProtocolUnknown, packet)
+				ipPath, err := ParseIpPath(packet)
+				if err == nil {
+					self.clientReceivePacketCallback(self, source, provideMode, ipPath, packet)
+				}
+				// else not an ip packet, drop
 			} else {
 				glog.V(2).Infof("[multi]receive drop %s<- = %s\n", self.args.Destination, err)
 			}

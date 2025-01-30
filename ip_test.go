@@ -304,7 +304,7 @@ func testClient[P comparable](
 
 	receivePackets := make(chan *receivePacket)
 
-	receivePacketCallback := func(source TransferPath, ipProtocol IpProtocol, packet []byte) {
+	receivePacketCallback := func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
 		// record the echo packet
 
 		// cMutex.Lock()

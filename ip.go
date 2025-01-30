@@ -44,17 +44,16 @@ const debugVerifyHeaders = false
 // send from a raw socket
 // note `ipProtocol` is not supplied. The implementation must do a packet inspection to determine protocol
 // `provideMode` is the relationship between the source and this device
-// FIXME remove source
-type SendPacketFunction func(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool
+type SendPacketFunction func(provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool
 
 // receive into a raw socket
-// FIXME remove source, add ipVersion, provideMode
-type ReceivePacketFunction func(source TransferPath, ipProtocol IpProtocol, packet []byte)
+type ReceivePacketFunction func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte)
 
 type ReceivePacket struct {
-	Source     TransferPath
-	IpProtocol IpProtocol
-	Packet     []byte
+	Source      TransferPath
+	ProvideMode protocol.ProvideMode
+	IpPath      *IpPath
+	Packet      []byte
 }
 
 type UserNatClient interface {
@@ -213,10 +212,10 @@ func (self *LocalUserNat) AddReceivePacketCallback(receiveCallback ReceivePacket
 // }
 
 // `ReceivePacketFunction`
-func (self *LocalUserNat) receive(source TransferPath, ipProtocol IpProtocol, packet []byte) {
+func (self *LocalUserNat) receive(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
 	for _, receiveCallback := range self.receiveCallbacks.Get() {
 		HandleError(func() {
-			receiveCallback(source, ipProtocol, packet)
+			receiveCallback(source, provideMode, ipPath, packet)
 		})
 	}
 }
@@ -545,6 +544,7 @@ func (self *UdpBuffer[BufferId]) udpSend(
 			self.ctx,
 			self.receiveCallback,
 			source,
+			provideMode,
 			ipVersion,
 			sourceIp,
 			udp.SrcPort,
@@ -600,6 +600,7 @@ type UdpSequence struct {
 
 func NewUdpSequence(ctx context.Context, receiveCallback ReceivePacketFunction,
 	source TransferPath,
+	provideMode protocol.ProvideMode,
 	ipVersion int,
 	sourceIp net.IP, sourcePort layers.UDPPort,
 	destinationIp net.IP, destinationPort layers.UDPPort,
@@ -607,6 +608,7 @@ func NewUdpSequence(ctx context.Context, receiveCallback ReceivePacketFunction,
 	cancelCtx, cancel := context.WithCancel(ctx)
 	streamState := StreamState{
 		source:          source,
+		provideMode:     provideMode,
 		ipVersion:       ipVersion,
 		sourceIp:        sourceIp,
 		sourcePort:      sourcePort,
@@ -669,13 +671,13 @@ func (self *UdpSequence) Run() {
 	defer self.cancel()
 
 	receive := func(packet []byte) {
-		self.receiveCallback(self.source, IpProtocolUdp, packet)
+		self.receiveCallback(self.source, self.provideMode, self.IpPath(), packet)
 	}
 
 	glog.V(2).Infof("[init]udp connect\n")
 	socket, err := net.Dial(
 		"udp",
-		self.DestinationAuthority(),
+		self.IpPath().DestinationHostPort(),
 	)
 	if err != nil {
 		glog.Infof("[init]udp connect error = %s\n", err)
@@ -813,27 +815,24 @@ type UdpSendItem struct {
 
 type StreamState struct {
 	source          TransferPath
+	provideMode     protocol.ProvideMode
 	ipVersion       int
 	sourceIp        net.IP
 	sourcePort      layers.UDPPort
 	destinationIp   net.IP
 	destinationPort layers.UDPPort
-
 	userLimited
 }
 
-func (self *StreamState) SourceAuthority() string {
-	return net.JoinHostPort(
-		self.sourceIp.String(),
-		strconv.Itoa(int(self.sourcePort)),
-	)
-}
-
-func (self *StreamState) DestinationAuthority() string {
-	return net.JoinHostPort(
-		self.destinationIp.String(),
-		strconv.Itoa(int(self.destinationPort)),
-	)
+func (self *StreamState) IpPath() *IpPath {
+	return &IpPath{
+		Version:         self.ipVersion,
+		Protocol:        IpProtocolUdp,
+		SourceIp:        self.sourceIp,
+		SourcePort:      int(self.sourcePort),
+		DestinationIp:   self.destinationIp,
+		DestinationPort: int(self.destinationPort),
+	}
 }
 
 func (self *StreamState) DataPackets(payload []byte, n int, mtu int) ([][]byte, error) {
@@ -1095,6 +1094,7 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 			self.ctx,
 			self.receiveCallback,
 			source,
+			provideMode,
 			ipVersion,
 			sourceIp,
 			tcp.SrcPort,
@@ -1158,6 +1158,7 @@ type TcpSequence struct {
 
 func NewTcpSequence(ctx context.Context, receiveCallback ReceivePacketFunction,
 	source TransferPath,
+	provideMode protocol.ProvideMode,
 	ipVersion int,
 	sourceIp net.IP, sourcePort layers.TCPPort,
 	destinationIp net.IP, destinationPort layers.TCPPort,
@@ -1166,6 +1167,7 @@ func NewTcpSequence(ctx context.Context, receiveCallback ReceivePacketFunction,
 
 	connectionState := ConnectionState{
 		source:          source,
+		provideMode:     provideMode,
 		ipVersion:       ipVersion,
 		sourceIp:        sourceIp,
 		sourcePort:      sourcePort,
@@ -1236,7 +1238,7 @@ func (self *TcpSequence) Run() {
 	// note receive is called from multiple go routines
 	// tcp packets with ack may be reordered due to being written in parallel
 	receive := func(packet []byte) {
-		self.receiveCallback(self.source, IpProtocolTcp, packet)
+		self.receiveCallback(self.source, self.provideMode, self.IpPath(), packet)
 	}
 
 	closed := false
@@ -1264,7 +1266,7 @@ func (self *TcpSequence) Run() {
 	glog.V(2).Infof("[init]tcp connect\n")
 	socket, err := net.DialTimeout(
 		"tcp",
-		self.DestinationAuthority(),
+		self.IpPath().DestinationHostPort(),
 		self.tcpBufferSettings.ConnectTimeout,
 	)
 	if err != nil {
@@ -1779,6 +1781,7 @@ type TcpSendItem struct {
 
 type ConnectionState struct {
 	source          TransferPath
+	provideMode     protocol.ProvideMode
 	ipVersion       int
 	sourceIp        net.IP
 	sourcePort      layers.TCPPort
@@ -1800,25 +1803,22 @@ type ConnectionState struct {
 	userLimited
 }
 
+func (self *ConnectionState) IpPath() *IpPath {
+	return &IpPath{
+		Version:         self.ipVersion,
+		Protocol:        IpProtocolTcp,
+		SourceIp:        self.sourceIp,
+		SourcePort:      int(self.sourcePort),
+		DestinationIp:   self.destinationIp,
+		DestinationPort: int(self.destinationPort),
+	}
+}
+
 func (self *ConnectionState) encodedWindowSize() uint16 {
 	return uint16(min(
 		uint32(self.windowSize>>self.windowScale),
 		uint32(math.MaxUint16),
 	))
-}
-
-func (self *ConnectionState) SourceAuthority() string {
-	return net.JoinHostPort(
-		self.sourceIp.String(),
-		strconv.Itoa(int(self.sourcePort)),
-	)
-}
-
-func (self *ConnectionState) DestinationAuthority() string {
-	return net.JoinHostPort(
-		self.destinationIp.String(),
-		strconv.Itoa(int(self.destinationPort)),
-	)
 }
 
 func (self *ConnectionState) SynAck() ([]byte, error) {
@@ -2233,7 +2233,12 @@ func (self *RemoteUserNatProvider) SecurityPolicyStats(reset bool) SecurityPolic
 }
 
 // `ReceivePacketFunction`
-func (self *RemoteUserNatProvider) Receive(source TransferPath, ipProtocol IpProtocol, packet []byte) {
+func (self *RemoteUserNatProvider) Receive(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	packet []byte,
+) {
 	if self.client.ClientId() == source.SourceId {
 		// locally generated traffic should use a separate local user nat
 		glog.V(2).Infof("drop remote user nat provider s packet ->%s\n", source.SourceId)
@@ -2254,7 +2259,7 @@ func (self *RemoteUserNatProvider) Receive(source TransferPath, ipProtocol IpPro
 	opts := []any{
 		CompanionContract(),
 	}
-	switch ipProtocol {
+	switch ipPath.Protocol {
 	case IpProtocolUdp:
 		opts = append(opts, NoAck())
 		c := func() bool {
@@ -2436,9 +2441,18 @@ func (self *RemoteUserNatClient) ClientReceive(source TransferPath, frames []*pr
 			}
 			ipPacketFromProvider := ipPacketFromProvider_.(*protocol.IpPacketFromProvider)
 
-			HandleError(func() {
-				self.receivePacketCallback(source, IpProtocolUnknown, ipPacketFromProvider.IpPacket.PacketBytes)
-			})
+			ipPath, err := ParseIpPath(ipPacketFromProvider.IpPacket.PacketBytes)
+			if err == nil {
+				HandleError(func() {
+					self.receivePacketCallback(
+						source,
+						provideMode,
+						ipPath,
+						ipPacketFromProvider.IpPacket.PacketBytes,
+					)
+				})
+			}
+			// else not an ip packet, drop
 		}
 	}
 }
@@ -2608,6 +2622,20 @@ func ParseIpPathWithPayload(ipPacket []byte) (*IpPath, []byte, error) {
 		// no support for this version
 		return nil, nil, fmt.Errorf("No support for ip version %d", ipVersion)
 	}
+}
+
+func (self *IpPath) SourceHostPort() string {
+	return net.JoinHostPort(
+		self.SourceIp.String(),
+		strconv.Itoa(self.SourcePort),
+	)
+}
+
+func (self *IpPath) DestinationHostPort() string {
+	return net.JoinHostPort(
+		self.DestinationIp.String(),
+		strconv.Itoa(self.DestinationPort),
+	)
 }
 
 func (self *IpPath) ToIp4Path() Ip4Path {

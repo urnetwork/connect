@@ -212,7 +212,7 @@ func TestMultiClientChannelWindowStats(t *testing.T) {
 		},
 	}
 
-	clientReceivePacket := func(client *multiClientChannel, source TransferPath, ipProtocol IpProtocol, packet []byte) {
+	clientReceivePacket := func(client *multiClientChannel, source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
 		// Do nothing
 	}
 
