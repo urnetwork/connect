@@ -92,7 +92,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		MultiRaceClientPacketMaxCount:        4,
 		MultiRacePacketMaxCount:              16,
 		MultiRaceClientEarlyCompleteFraction: 0.25,
-		// FIXME on platforms with more memory, increase this
+		// TODO on platforms with more memory, increase this
 		MultiRaceClientCount: 4,
 
 		RemoteUserNatMultiClientMonitorSettings: *DefaultRemoteUserNatMultiClientMonitorSettings(),
@@ -273,7 +273,7 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClien
 
 	rst := func(client *multiClientChannel) {
 		if client != nil {
-			// FIXME send RST to client
+			// rst to destination
 			if packet, ok := ipOosRst(ipPath); ok {
 				client.Send(&parsedPacket{
 					packet: packet,
@@ -281,7 +281,7 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClien
 				}, 0)
 			}
 		}
-		// FIXME send RST to receivePacketFunction
+		// rst to source
 		if packet, ok := ipOosRst(ipPath.Reverse()); ok {
 			self.receivePacketCallback(TransferPath{}, ipPath.Protocol, packet)
 		}
@@ -494,8 +494,6 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 
 				done := false
 
-				// var race *multiClientChannelUpdateRace
-				// var state *multiClientChannelRaceClientState
 				func() {
 					self.stateLock.Lock()
 					defer self.stateLock.Unlock()
@@ -543,7 +541,6 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 						if race.packetCount == 0 && bufferExceeded {
 							// no client response in timeout, lock in this client
 							// this happens for example when the client only sends and does not receive (e.g. udp send)
-							// update.client = client
 
 							for abandonedClient, _ := range race.clientStates {
 								if abandonedClient != client {
@@ -553,8 +550,6 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 
 							update.clearRace()
 							update.client = client
-
-							// FIXME if TCP, send RST packets to other clients
 
 							done = true
 							return
@@ -693,12 +688,9 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(sourceClient *multiCli
 				}
 			}
 
-			// update.client = client
 			update.clearRace()
 			update.client = client
 			receivePackets = append(state.packets, receivePacket)
-
-			// FIXME if TCP, send RST packets to other clients
 		}
 	})
 	if 0 < len(abandonedClients) {
@@ -761,11 +753,7 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 
 				update.clearRace()
 				update.client = client
-				// update.client = client
-				// nextClient = client
 				receivePackets = race.clientStates[update.client].packets
-
-				// FIXME if TCP, send RST packets to other clients
 			}
 			// else a client was already chosen, ignore
 		})
