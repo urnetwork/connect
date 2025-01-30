@@ -11,8 +11,8 @@ import (
 	// "sync"
 	"fmt"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
+	// "github.com/google/gopacket"
+	// "github.com/google/gopacket/layers"
 
 	"github.com/go-playground/assert/v2"
 
@@ -154,41 +154,7 @@ func udp4Packet(s int, i int, j int, k int) (packet []byte, payload []byte) {
 		DestinationPort: 443,
 	}
 
-	packet = ip4UdpPacket(ipPath, payload)
-	return
-}
-
-func ip4UdpPacket(ipPath *IpPath, payload []byte) (packet []byte) {
-	ip := &layers.IPv4{
-		Version:  4,
-		TTL:      64,
-		SrcIP:    ipPath.SourceIp.To4(),
-		DstIP:    ipPath.DestinationIp.To4(),
-		Protocol: layers.IPProtocolUDP,
-	}
-
-	udp := layers.UDP{
-		SrcPort: layers.UDPPort(ipPath.SourcePort),
-		DstPort: layers.UDPPort(ipPath.DestinationPort),
-	}
-	udp.SetNetworkLayerForChecksum(ip)
-
-	options := gopacket.SerializeOptions{
-		ComputeChecksums: true,
-		FixLengths:       true,
-	}
-
-	buffer := gopacket.NewSerializeBufferExpectedSize(1024, 0)
-	err := gopacket.SerializeLayers(buffer, options,
-		gopacket.SerializableLayer(ip),
-		&udp,
-		gopacket.Payload(payload),
-	)
-	if err != nil {
-		panic(err)
-	}
-	packet = buffer.Bytes()
-
+	packet = ip4OosUdpPacket(ipPath, payload)
 	return
 }
 
@@ -205,44 +171,7 @@ func tcp4Packet(s int, i int, j int, k int) (packet []byte, payload []byte) {
 		DestinationPort: 443,
 	}
 
-	packet = ip4TcpPacket(ipPath, payload)
-	return
-}
-
-func ip4TcpPacket(ipPath *IpPath, payload []byte) (packet []byte) {
-	ip := &layers.IPv4{
-		Version:  4,
-		TTL:      64,
-		SrcIP:    ipPath.SourceIp.To4(),
-		DstIP:    ipPath.DestinationIp.To4(),
-		Protocol: layers.IPProtocolTCP,
-	}
-
-	tcp := layers.TCP{
-		SrcPort: layers.TCPPort(ipPath.SourcePort),
-		DstPort: layers.TCPPort(ipPath.DestinationPort),
-		Seq:     0,
-		Ack:     0,
-		Window:  1024,
-	}
-	tcp.SetNetworkLayerForChecksum(ip)
-
-	options := gopacket.SerializeOptions{
-		ComputeChecksums: true,
-		FixLengths:       true,
-	}
-
-	buffer := gopacket.NewSerializeBufferExpectedSize(1024, 0)
-	err := gopacket.SerializeLayers(buffer, options,
-		gopacket.SerializableLayer(ip),
-		&tcp,
-		gopacket.Payload(payload),
-	)
-	if err != nil {
-		panic(err)
-	}
-	packet = buffer.Bytes()
-
+	packet = ip4OosTcpPacket(ipPath, payload)
 	return
 }
 
@@ -259,41 +188,7 @@ func udp6Packet(s int, i int, j int, k int) (packet []byte, payload []byte) {
 		DestinationPort: 443,
 	}
 
-	packet = ip6UdpPacket(ipPath, payload)
-	return
-}
-
-func ip6UdpPacket(ipPath *IpPath, payload []byte) (packet []byte) {
-	ip := &layers.IPv6{
-		Version:    6,
-		HopLimit:   64,
-		SrcIP:      ipPath.SourceIp.To16(),
-		DstIP:      ipPath.DestinationIp.To16(),
-		NextHeader: layers.IPProtocolUDP,
-	}
-
-	udp := layers.UDP{
-		SrcPort: layers.UDPPort(ipPath.SourcePort),
-		DstPort: layers.UDPPort(ipPath.DestinationPort),
-	}
-	udp.SetNetworkLayerForChecksum(ip)
-
-	options := gopacket.SerializeOptions{
-		ComputeChecksums: true,
-		FixLengths:       true,
-	}
-
-	buffer := gopacket.NewSerializeBufferExpectedSize(1024, 0)
-	err := gopacket.SerializeLayers(buffer, options,
-		gopacket.SerializableLayer(ip),
-		&udp,
-		gopacket.Payload(payload),
-	)
-	if err != nil {
-		panic(err)
-	}
-	packet = buffer.Bytes()
-
+	packet = ip6OosUdpPacket(ipPath, payload)
 	return
 }
 
@@ -310,71 +205,7 @@ func tcp6Packet(s int, i int, j int, k int) (packet []byte, payload []byte) {
 		DestinationPort: 443,
 	}
 
-	packet = ip6TcpPacket(ipPath, payload)
-	return
-}
-
-func ip6TcpPacket(ipPath *IpPath, payload []byte) (packet []byte) {
-
-	ip := &layers.IPv6{
-		Version:    6,
-		HopLimit:   64,
-		SrcIP:      ipPath.SourceIp.To16(),
-		DstIP:      ipPath.DestinationIp.To16(),
-		NextHeader: layers.IPProtocolTCP,
-	}
-
-	tcp := layers.TCP{
-		SrcPort: layers.TCPPort(ipPath.SourcePort),
-		DstPort: layers.TCPPort(ipPath.DestinationPort),
-		Seq:     0,
-		Ack:     0,
-		Window:  1024,
-	}
-	tcp.SetNetworkLayerForChecksum(ip)
-
-	options := gopacket.SerializeOptions{
-		ComputeChecksums: true,
-		FixLengths:       true,
-	}
-
-	buffer := gopacket.NewSerializeBufferExpectedSize(1024, 0)
-	err := gopacket.SerializeLayers(buffer, options,
-		gopacket.SerializableLayer(ip),
-		&tcp,
-		gopacket.Payload(payload),
-	)
-	if err != nil {
-		panic(err)
-	}
-	packet = buffer.Bytes()
-
-	return
-}
-
-func ipPacket(ipPath *IpPath, payload []byte) (packet []byte) {
-	switch ipPath.Version {
-	case 4:
-		switch ipPath.Protocol {
-		case IpProtocolUdp:
-			packet = ip4UdpPacket(ipPath, payload)
-		case IpProtocolTcp:
-			packet = ip4TcpPacket(ipPath, payload)
-		default:
-			panic(fmt.Errorf("Bad ip protocol: %d", ipPath.Protocol))
-		}
-	case 6:
-		switch ipPath.Protocol {
-		case IpProtocolUdp:
-			packet = ip6UdpPacket(ipPath, payload)
-		case IpProtocolTcp:
-			packet = ip6TcpPacket(ipPath, payload)
-		default:
-			panic(fmt.Errorf("Bad ip protocol: %d", ipPath.Protocol))
-		}
-	default:
-		panic(fmt.Errorf("Bad ip version: %d", ipPath.Version))
-	}
+	packet = ip6OosTcpPacket(ipPath, payload)
 	return
 }
 
@@ -485,7 +316,7 @@ func testClient[P comparable](
 		if err != nil {
 			panic(err)
 		}
-		packet = ipPacket(ipPath.Reverse(), payload)
+		packet = ipOosPacket(ipPath.Reverse(), payload)
 
 		receivePacket := &receivePacket{
 			source: source,
@@ -510,7 +341,7 @@ func testClient[P comparable](
 			if err != nil {
 				panic(err)
 			}
-			packet = ipPacket(ipPath.Reverse(), payload)
+			packet = ipOosPacket(ipPath.Reverse(), payload)
 
 			ipPacketFromProvider := &protocol.IpPacketFromProvider{
 				IpPacket: &protocol.IpPacket{
