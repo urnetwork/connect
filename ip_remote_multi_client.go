@@ -33,6 +33,8 @@ import (
 
 // TODO surface window stats to show to users
 
+type clientReceivePacketFunction func(client *multiClientChannel, source TransferPath, ipProtocol IpProtocol, packet []byte)
+
 // for each `NewClientArgs`,
 //
 //	`RemoveClientWithArgs` will be called if a client was created for the args,
@@ -54,13 +56,14 @@ type MultiClientGenerator interface {
 
 func DefaultMultiClientSettings() *MultiClientSettings {
 	return &MultiClientSettings{
-		WindowSizeMin: 6,
+		SequenceIdleTimeout: 30 * time.Second,
+		WindowSizeMin:       4,
 		// TODO increase this when p2p is deployed
 		WindowSizeMinP2pOnly: 0,
-		WindowSizeMax:        12,
+		WindowSizeMax:        8,
 		// reconnects per source
 		WindowSizeReconnectScale: 1.0,
-		WriteRetryTimeout:        200 * time.Millisecond,
+		SendRetryTimeout:         200 * time.Millisecond,
 		// this includes the time to establish the transport
 		PingWriteTimeout: 5 * time.Second,
 		PingTimeout:      10 * time.Second,
@@ -77,18 +80,27 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		WindowExpandScale:            2.0,
 		WindowCollapseScale:          0.5,
 		WindowExpandMaxOvershotScale: 4.0,
-		StatsWindowDuration:          120 * time.Second,
-		StatsWindowBucketDuration:    10 * time.Second,
+		StatsWindowDuration:          10 * time.Second,
+		StatsWindowBucketDuration:    1 * time.Second,
 		StatsSampleWeightsCount:      8,
 		StatsSourceCountSelection:    0.95,
-		ClientAffinityTimeout:        0 * time.Second,
+		// ClientAffinityTimeout:        0 * time.Second,
+
+		MultiRaceSetOnNoResponseTimeout:      1000 * time.Millisecond,
+		MultiRaceSetOnResponseTimeout:        100 * time.Millisecond,
+		MultiRaceClientPacketMaxCount:        4,
+		MultiRacePacketMaxCount:              16,
+		MultiRaceClientEarlyCompleteFraction: 0.25,
+		// FIXME on platforms with more memory, increase this
+		MultiRaceClientCount: 4,
 
 		RemoteUserNatMultiClientMonitorSettings: *DefaultRemoteUserNatMultiClientMonitorSettings(),
 	}
 }
 
 type MultiClientSettings struct {
-	WindowSizeMin int
+	SequenceIdleTimeout time.Duration
+	WindowSizeMin       int
 	// the minimumum number of items in the windows that must be connected via p2p only
 	WindowSizeMinP2pOnly int
 	WindowSizeMax        int
@@ -100,7 +112,7 @@ type MultiClientSettings struct {
 	// ClientWriteTimeout time.Duration
 	// SendTimeout time.Duration
 	// WriteTimeout time.Duration
-	WriteRetryTimeout            time.Duration
+	SendRetryTimeout             time.Duration
 	PingWriteTimeout             time.Duration
 	PingTimeout                  time.Duration
 	AckTimeout                   time.Duration
@@ -121,7 +133,16 @@ type MultiClientSettings struct {
 	// lower affinity is more private
 	// however, there may be some applications that assume the same ip across multiple connections
 	// in those cases, we would need some small affinity
-	ClientAffinityTimeout time.Duration
+	// ClientAffinityTimeout time.Duration
+
+	// time since first send to end the race, if no response
+	MultiRaceSetOnNoResponseTimeout time.Duration
+	// time after the first response to end the race
+	MultiRaceSetOnResponseTimeout        time.Duration
+	MultiRaceClientPacketMaxCount        int
+	MultiRacePacketMaxCount              int
+	MultiRaceClientEarlyCompleteFraction float32
+	MultiRaceClientCount                 int
 
 	RemoteUserNatMultiClientMonitorSettings
 }
@@ -146,9 +167,7 @@ type RemoteUserNatMultiClient struct {
 	stateLock      sync.Mutex
 	ip4PathUpdates map[Ip4Path]*multiClientChannelUpdate
 	ip6PathUpdates map[Ip6Path]*multiClientChannelUpdate
-	updateIp4Paths map[*multiClientChannelUpdate]map[Ip4Path]bool
-	updateIp6Paths map[*multiClientChannelUpdate]map[Ip6Path]bool
-	clientUpdates  map[*multiClientChannel]*multiClientChannelUpdate
+	clientUpdates  map[*multiClientChannel]map[*multiClientChannelUpdate]bool
 }
 
 func NewRemoteUserNatMultiClientWithDefaults(
@@ -175,29 +194,30 @@ func NewRemoteUserNatMultiClient(
 ) *RemoteUserNatMultiClient {
 	cancelCtx, cancel := context.WithCancel(ctx)
 
-	window := newMultiClientWindow(
-		cancelCtx,
-		cancel,
-		generator,
-		receivePacketCallback,
-		settings,
-	)
-
-	return &RemoteUserNatMultiClient{
+	multiClient := &RemoteUserNatMultiClient{
 		ctx:                   cancelCtx,
 		cancel:                cancel,
 		generator:             generator,
 		receivePacketCallback: receivePacketCallback,
 		settings:              settings,
-		window:                window,
-		securityPolicy:        DefaultSecurityPolicy(),
-		provideMode:           provideMode,
-		ip4PathUpdates:        map[Ip4Path]*multiClientChannelUpdate{},
-		ip6PathUpdates:        map[Ip6Path]*multiClientChannelUpdate{},
-		updateIp4Paths:        map[*multiClientChannelUpdate]map[Ip4Path]bool{},
-		updateIp6Paths:        map[*multiClientChannelUpdate]map[Ip6Path]bool{},
-		clientUpdates:         map[*multiClientChannel]*multiClientChannelUpdate{},
+		// window:                window,
+		securityPolicy: DefaultSecurityPolicy(),
+		provideMode:    provideMode,
+		ip4PathUpdates: map[Ip4Path]*multiClientChannelUpdate{},
+		ip6PathUpdates: map[Ip6Path]*multiClientChannelUpdate{},
+		clientUpdates:  map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
 	}
+
+	multiClient.window = newMultiClientWindow(
+		cancelCtx,
+		cancel,
+		generator,
+		multiClient.clientReceivePacket,
+		multiClient.removeClient,
+		settings,
+	)
+
+	return multiClient
 }
 
 func (self *RemoteUserNatMultiClient) SecurityPolicyStats(reset bool) SecurityPolicyStats {
@@ -213,136 +233,173 @@ func (self *RemoteUserNatMultiClient) AddContractStatusCallback(contractStatusCa
 }
 
 func (self *RemoteUserNatMultiClient) updateClientPath(ipPath *IpPath, callback func(*multiClientChannelUpdate)) {
-	reserveUpdate := func() *multiClientChannelUpdate {
-		self.stateLock.Lock()
-		defer self.stateLock.Unlock()
+	update, client := self.reserveUpdate(ipPath)
+	callback(update)
+	self.updateClient(update, client)
+}
 
-		switch ipPath.Version {
-		case 4:
-			ip4Path := ipPath.ToIp4Path()
-			update, ok := self.ip4PathUpdates[ip4Path]
-			if !ok {
-				update = &multiClientChannelUpdate{}
-				self.ip4PathUpdates[ip4Path] = update
-			}
-			ip4Paths, ok := self.updateIp4Paths[update]
-			if !ok {
-				ip4Paths = map[Ip4Path]bool{}
-				self.updateIp4Paths[update] = ip4Paths
-			}
-			ip4Paths[ip4Path] = true
-			return update
-		case 6:
-			ip6Path := ipPath.ToIp6Path()
-			update, ok := self.ip6PathUpdates[ip6Path]
-			if !ok {
-				update = &multiClientChannelUpdate{}
-				self.ip6PathUpdates[ip6Path] = update
-			}
-			ip6Paths, ok := self.updateIp6Paths[update]
-			if !ok {
-				ip6Paths = map[Ip6Path]bool{}
-				self.updateIp6Paths[update] = ip6Paths
-			}
-			ip6Paths[ip6Path] = true
-			return update
-		default:
-			panic(fmt.Errorf("Bad protocol version %d", ipPath.Version))
-		}
-	}
+func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClientChannelUpdate, *multiClientChannel) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
 
-	updatePaths := func(previousClient *multiClientChannel, update *multiClientChannelUpdate) {
-		self.stateLock.Lock()
-		defer self.stateLock.Unlock()
-
-		client := update.client
-
-		if previousClient != client {
-			if previousClient != nil {
-				delete(self.clientUpdates, previousClient)
-			}
-			if client != nil {
-				self.clientUpdates[client] = update
-			}
-		}
-
-		if client == nil {
-			switch ipPath.Version {
-			case 4:
-				ip4Path := ipPath.ToIp4Path()
-				delete(self.ip4PathUpdates, ip4Path)
-				if ip4Paths, ok := self.updateIp4Paths[update]; ok {
-					delete(ip4Paths, ip4Path)
-					if len(ip4Paths) == 0 {
-						delete(self.updateIp4Paths, update)
-					}
-				}
-			case 6:
-				ip6Path := ipPath.ToIp6Path()
-				delete(self.ip6PathUpdates, ip6Path)
-				if ip6Paths, ok := self.updateIp6Paths[update]; ok {
-					delete(ip6Paths, ip6Path)
-					if len(ip6Paths) == 0 {
-						delete(self.updateIp6Paths, update)
-					}
-				}
+	run := func(update *multiClientChannelUpdate) {
+		for {
+			select {
+			case <-update.ctx.Done():
+				return
 			default:
-				panic(fmt.Errorf("Bad protocol version %d", ipPath.Version))
+			}
+
+			var idleTimeout time.Duration
+			func() {
+				self.stateLock.Lock()
+				defer self.stateLock.Unlock()
+
+				idleTimeout = update.activityTime.Add(self.settings.SequenceIdleTimeout).Sub(time.Now())
+			}()
+			if idleTimeout <= 0 {
+				return
+			} else {
+				select {
+				case <-update.ctx.Done():
+					return
+				case <-time.After(idleTimeout):
+				}
 			}
 		}
 	}
 
-	// the client state lock can be acquired from inside the update lock
-	// ** important ** the update lock cannot be acquired from inside the client state lock
-	for {
-		// spin to acquire the correct update lock
-		update := reserveUpdate()
-		success := func() bool {
-			update.lock.Lock()
-			defer update.lock.Unlock()
+	switch ipPath.Version {
+	case 4:
+		ip4Path := ipPath.ToIp4Path()
+		update, ok := self.ip4PathUpdates[ip4Path]
+		if !ok || update.IsDone() {
+			update = newMultiClientChannelUpdate(self.ctx)
+			go HandleError(func() {
+				defer update.cancel()
 
-			// update might have changed
-			if updateInLock := reserveUpdate(); update != updateInLock {
-				return false
+				run(update)
+
+				var client *multiClientChannel
+				func() {
+					self.stateLock.Lock()
+					defer self.stateLock.Unlock()
+
+					client = update.client
+
+					if self.ip4PathUpdates[ip4Path] == update {
+						delete(self.ip4PathUpdates, ip4Path)
+					}
+					if client != nil {
+						if updates, ok := self.clientUpdates[client]; ok {
+							delete(updates, update)
+							if len(updates) == 0 {
+								delete(self.clientUpdates, client)
+							}
+						}
+					}
+				}()
+
+				if client != nil {
+					// FIXME send RST to client
+				}
+				// FIXME send RST to receivePacketFunction
+			}, update.cancel)
+			self.ip4PathUpdates[ip4Path] = update
+		}
+		return update, update.client
+	case 6:
+		ip6Path := ipPath.ToIp6Path()
+		update, ok := self.ip6PathUpdates[ip6Path]
+		if !ok || update.IsDone() {
+			update = newMultiClientChannelUpdate(self.ctx)
+			go HandleError(func() {
+				defer update.cancel()
+
+				run(update)
+
+				var client *multiClientChannel
+				func() {
+					self.stateLock.Lock()
+					defer self.stateLock.Unlock()
+
+					client = update.client
+
+					if self.ip6PathUpdates[ip6Path] == update {
+						delete(self.ip6PathUpdates, ip6Path)
+					}
+					if client != nil {
+						if updates, ok := self.clientUpdates[client]; ok {
+							delete(updates, update)
+							if len(updates) == 0 {
+								delete(self.clientUpdates, client)
+							}
+						}
+					}
+				}()
+
+				if client != nil {
+					// FIXME send RST to client
+				}
+				// FIXME send RST to receivePacketFunction
+
+			}, update.cancel)
+			self.ip6PathUpdates[ip6Path] = update
+		}
+		return update, update.client
+	default:
+		panic(fmt.Errorf("Bad protocol version %d", ipPath.Version))
+	}
+}
+
+func (self *RemoteUserNatMultiClient) updateClient(update *multiClientChannelUpdate, previousClient *multiClientChannel) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	client := update.client
+	update.activityTime = time.Now()
+
+	if previousClient != client {
+		if previousClient != nil {
+			if updates, ok := self.clientUpdates[previousClient]; ok {
+				delete(updates, update)
+				if len(updates) == 0 {
+					delete(self.clientUpdates, previousClient)
+				}
 			}
-
-			previousClient := update.client
-			callback(update)
-			updatePaths(previousClient, update)
-			return true
-		}()
-		if success {
-			return
+		}
+		if client != nil && !client.IsDone() {
+			updates, ok := self.clientUpdates[client]
+			if !ok {
+				updates = map[*multiClientChannelUpdate]bool{}
+				self.clientUpdates[client] = updates
+			}
+			updates[update] = true
 		}
 	}
 }
 
-// remove a client from all paths
-// this acts as a drop. it does not lock the client update
-/*
+// remove a client from all updates
 func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
-	if update, ok := self.clientUpdates[client]; ok {
+	// note client must be marked as done, otherwise it may be re-added by updates in flight
+	if !client.IsDone() {
+		glog.Errorf("[multi]removed client that is not marked as done. This might lead to memory leak.")
+	}
+
+	if updates, ok := self.clientUpdates[client]; ok {
 		delete(self.clientUpdates, client)
-
-		if ip4Paths, ok := self.updateIp4Paths[update]; ok {
-			delete(self.updateIp4Paths, update)
-			for ip4Path, _ := range ip4Paths {
-				delete(self.ip4PathUpdates, ip4Path)
-			}
-		}
-
-		if ip6Paths, ok := self.updateIp6Paths[update]; ok {
-			delete(self.updateIp6Paths, update)
-			for ip6Path, _ := range ip6Paths {
-				delete(self.ip6PathUpdates, ip6Path)
+		for update, _ := range updates {
+			if update.client == client {
+				update.client = nil
+			} else {
+				glog.Errorf("[multi]update associated with incorrect client")
 			}
 		}
 	}
 }
-*/
 
 // `SendPacketFunction`
 func (self *RemoteUserNatMultiClient) SendPacket(
@@ -381,127 +438,131 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 	self.updateClientPath(parsedPacket.ipPath, func(update *multiClientChannelUpdate) {
 		enterTime := time.Now()
 
-		if update.client != nil {
+		currentClient := func() *multiClientChannel {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			return update.client
+		}
+		for client := currentClient(); client != nil; {
 			var err error
-			success, err = update.client.SendDetailed(parsedPacket, timeout)
+			success, err = client.SendDetailed(parsedPacket, timeout)
 			if err == nil {
 				return
 			}
-			glog.Infof("[multi]send error = %s\n", err)
-			// find a new client
-			update.client.ClearAffinity()
-			update.client = nil
+
+			func() {
+				self.stateLock.Lock()
+				defer self.stateLock.Unlock()
+				if client == update.client {
+					update.client = nil
+					client = nil
+				} else {
+					// a new client was set, try the new client
+					client = update.client
+				}
+			}()
 		}
 
-		defer func() {
-			if update.client != nil {
-				update.client.UpdateAffinity()
-			}
-		}()
+		// find a new client
 
-		for {
-			orderedClients := self.window.OrderedClients()
-
-			// for _, client := range removedClients {
-			// 	glog.V(2).Infof("[multi]remove client %s->%s.\n", client.args.ClientId, client.args.Destination)
-			// 	self.removeClient(client)
-			// }
-
-			// in order, try
-			// - the temporal affinity
-			//   connections initiated near each other in time will use the same client
-			// - clients in order
-
-			if 0 < self.settings.ClientAffinityTimeout {
-				// this implementation is a best-effort at affinity
-				// it will not ensure affinity between parallel sends in all cases
-				var mostRecentAffinityClient *multiClientChannel
-				for _, client := range orderedClients {
-					affinityCount, affinityTime := client.MostRecentAffinity()
-					if 0 < affinityCount && enterTime.Sub(affinityTime) < self.settings.ClientAffinityTimeout {
-						if mostRecentAffinityClient == nil {
-							mostRecentAffinityClient = client
-						} else if _, mostRecentAffinityTime := mostRecentAffinityClient.MostRecentAffinity(); mostRecentAffinityTime.Before(affinityTime) {
-							mostRecentAffinityClient = client
-						}
-					}
+		raceClients := func(orderedClients []*multiClientChannel, sendTimeout time.Duration) {
+			successCount := 0
+			for _, client := range orderedClients {
+				select {
+				case <-update.ctx.Done():
+					return
+				default:
 				}
-				if mostRecentAffinityClient != nil {
-					affinityTimeout := min(self.settings.WriteRetryTimeout, self.settings.ClientAffinityTimeout)
-					if 0 <= timeout {
-						remainingTimeout := enterTime.Add(timeout).Sub(time.Now())
 
-						if remainingTimeout <= 0 {
-							// drop
-							success = false
-							return
+				var race *multiClientChannelUpdateRace
+				var state *multiClientChannelRaceClientState
+				func() {
+					self.stateLock.Lock()
+					defer self.stateLock.Unlock()
+
+					update.initRace()
+					race = update.race
+
+					state = race.clientStates[client]
+					if state == nil {
+						state = &multiClientChannelRaceClientState{
+							sendTime: time.Now(),
 						}
-
-						affinityTimeout = min(affinityTimeout, remainingTimeout)
+						race.clientStates[client] = state
 					}
-					if mostRecentAffinityClient.Send(parsedPacket, affinityTimeout) {
-						glog.V(2).Infof("[multi]use affinity client ipv%d p%v -> %s:%d\n", parsedPacket.ipPath.Version, parsedPacket.ipPath.Protocol, parsedPacket.ipPath.DestinationIp, parsedPacket.ipPath.DestinationPort)
-						// lock the path to the client
-						update.client = mostRecentAffinityClient
-						success = true
+				}()
+
+				if client.Send(parsedPacket, sendTimeout) {
+					successCount += 1
+					success = true
+					done := false
+					func() {
+						self.stateLock.Lock()
+						defer self.stateLock.Unlock()
+
+						if race.packetCount == 0 && self.settings.MultiRaceSetOnNoResponseTimeout <= time.Now().Sub(state.sendTime) {
+							// no client response in timeout, lock in this client
+							// this happens for example when the client only sends and does not receive (e.g. udp send)
+							// update.client = client
+							update.clearRace()
+							update.client = client
+
+							// FIXME if TCP, send RST packets to other clients
+
+							done = true
+							return
+						} else {
+							if self.settings.MultiRaceClientCount <= successCount {
+								done = true
+								return
+							}
+							// else continue sending to all clients
+						}
+					}()
+					if done {
 						return
 					}
-					// else choose a new client
-				}
-				// else choose a new client
-			}
-
-			for _, client := range orderedClients {
-				if client.Send(parsedPacket, 0) {
-					glog.V(2).Infof("[multi]use new client ipv%d p%v -> %s:%d\n", parsedPacket.ipPath.Version, parsedPacket.ipPath.Protocol, parsedPacket.ipPath.DestinationIp, parsedPacket.ipPath.DestinationPort)
-					// lock the path to the client
-					update.client = client
-					success = true
-					return
 				}
 			}
+		}
 
-			retryTimeout := self.settings.WriteRetryTimeout
+		raceClients(self.window.OrderedClients(), 0)
+		if success {
+			return
+		}
+
+		for {
+			select {
+			case <-update.ctx.Done():
+				return
+			default:
+			}
+
+			var retryTimeout time.Duration
 			if 0 <= timeout {
 				remainingTimeout := enterTime.Add(timeout).Sub(time.Now())
 
 				if remainingTimeout <= 0 {
 					// drop
-					success = false
 					return
 				}
 
-				retryTimeout = min(remainingTimeout, retryTimeout)
+				retryTimeout = min(remainingTimeout, self.settings.SendRetryTimeout)
+			} else {
+				retryTimeout = self.settings.SendRetryTimeout
 			}
 
-			if 0 < len(orderedClients) {
+			if orderedClients := self.window.OrderedClients(); 0 < len(orderedClients) {
 				// distribute the timeout evenly via wait
 				retryTimeoutPerClient := retryTimeout / time.Duration(len(orderedClients))
-				for _, client := range orderedClients {
-					var err error
-					success, err = client.SendDetailed(parsedPacket, retryTimeoutPerClient)
-					if success && err == nil {
-						// lock the path to the client
-						glog.V(2).Infof("[multi]wait for new client ipv%d p%v -> %s:%d\n", parsedPacket.ipPath.Version, parsedPacket.ipPath.Protocol, parsedPacket.ipPath.DestinationIp, parsedPacket.ipPath.DestinationPort)
-						update.client = client
-						success = true
-						return
-					} else if err != nil {
-						glog.Infof("[multi]send error = %s\n", err)
-					}
-					select {
-					case <-self.ctx.Done():
-						// drop
-						success = false
-						return
-					default:
-					}
+				raceClients(orderedClients, retryTimeoutPerClient)
+				if success {
+					return
 				}
 			} else {
 				select {
-				case <-self.ctx.Done():
+				case <-update.ctx.Done():
 					// drop
-					success = false
 					return
 				case <-time.After(retryTimeout):
 				}
@@ -511,17 +572,233 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 	return
 }
 
+// clientReceivePacketFunction
+func (self *RemoteUserNatMultiClient) clientReceivePacket(sourceClient *multiClientChannel, source TransferPath, ipProtocol IpProtocol, packet []byte) {
+	ipPath, err := ParseIpPath(packet)
+	if err != nil {
+		// bad ip packet, drop
+		return
+	}
+	ipPath = ipPath.Reverse()
+
+	receivePacket := &ReceivePacket{
+		Source:     source,
+		IpProtocol: ipProtocol,
+		Packet:     packet,
+	}
+
+	var receivePackets []*ReceivePacket
+
+	self.updateClientPath(ipPath, func(update *multiClientChannelUpdate) {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+
+		client := update.client
+
+		if client == sourceClient {
+			receivePackets = []*ReceivePacket{receivePacket}
+		} else if client != nil {
+			// another client already chosen, drop
+		} else if race := update.race; race == nil {
+			// no race, no client, drop
+			glog.Infof("[multi]receive no race and no client")
+		} else if state, ok := race.clientStates[sourceClient]; !ok {
+			// this client is not part of the race, drop
+			glog.Infof("[multi]receive client not part of race")
+		} else if len(state.packets) < self.settings.MultiRaceClientPacketMaxCount && race.packetCount < self.settings.MultiRacePacketMaxCount {
+			state.packets = append(state.packets, receivePacket)
+			if 1 == len(state.packets) {
+				state.receiveTime = time.Now()
+			}
+			race.packetCount += 1
+			if race.packetCount == 1 {
+				// schedule the race evaluation on first packet
+				earlyComplete := race.completeMonitor.NotifyChannel()
+				self.scheduleCompleteRace(ipPath, race, earlyComplete)
+			}
+			if len(state.packets) == 1 {
+				race.clientsWithPacketCount += 1
+				if int(float32(len(race.clientStates))*self.settings.MultiRaceClientEarlyCompleteFraction) <= race.clientsWithPacketCount {
+					race.completeMonitor.NotifyAll()
+				}
+			}
+		} else {
+			// race buffer limits exceeded, end the race immediately
+			glog.Infof("[multi]receive race buffer limit reached")
+
+			// update.client = client
+			update.clearRace()
+			update.client = client
+			receivePackets = append(state.packets, receivePacket)
+
+			// FIXME if TCP, send RST packets to other clients
+		}
+	})
+
+	for _, p := range receivePackets {
+		self.receivePacketCallback(p.Source, p.IpProtocol, p.Packet)
+	}
+}
+
+func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
+	ipPath *IpPath,
+	race *multiClientChannelUpdateRace,
+	earlyComplete <-chan struct{},
+) {
+	go HandleError(func() {
+		// wait for the race to finish, then choose
+
+		select {
+		case <-race.ctx.Done():
+			return
+		case <-earlyComplete:
+		case <-time.After(self.settings.MultiRaceSetOnResponseTimeout):
+		}
+
+		var receivePackets []*ReceivePacket
+		self.updateClientPath(ipPath, func(update *multiClientChannelUpdate) {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+
+			race := update.race
+			if update.client == nil && update.race == race {
+				// weighted shuffle clients by rtt
+				orderedClients := []*multiClientChannel{}
+				weights := map[*multiClientChannel]float32{}
+				for client, state := range race.clientStates {
+					if 0 < len(state.packets) {
+						orderedClients = append(orderedClients, client)
+						rtt := state.receiveTime.Sub(state.sendTime)
+						weights[client] = float32(rtt / time.Millisecond)
+					}
+				}
+				WeightedShuffleWithEntropy(orderedClients, weights, self.settings.StatsWindowEntropy)
+
+				// the last is the lowest rtt
+
+				update.clearRace()
+				update.client = orderedClients[len(orderedClients)-1]
+				// update.client = client
+				// nextClient = client
+				receivePackets = race.clientStates[update.client].packets
+
+				// FIXME if TCP, send RST packets to other clients
+			}
+			// else a client was already chosen, ignore
+
+			return
+		})
+
+		for _, p := range receivePackets {
+			self.receivePacketCallback(p.Source, p.IpProtocol, p.Packet)
+		}
+	})
+}
+
 func (self *RemoteUserNatMultiClient) Shuffle() {
 	self.window.shuffle()
 }
 
 func (self *RemoteUserNatMultiClient) Close() {
 	self.cancel()
+	self.window.Close()
+
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		for _, update := range self.ip4PathUpdates {
+			update.Close()
+		}
+		for _, update := range self.ip6PathUpdates {
+			update.Close()
+		}
+		clear(self.ip4PathUpdates)
+		clear(self.ip6PathUpdates)
+		// clear(self.updateIp4Paths)
+		// clear(self.updateIp6Paths)
+		// clear(clientUpdates)
+	}()
 }
 
 type multiClientChannelUpdate struct {
-	lock   sync.Mutex
-	client *multiClientChannel
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	client       *multiClientChannel
+	race         *multiClientChannelUpdateRace
+	activityTime time.Time
+}
+
+func newMultiClientChannelUpdate(ctx context.Context) *multiClientChannelUpdate {
+	cancelCtx, cancel := context.WithCancel(ctx)
+	return &multiClientChannelUpdate{
+		ctx:          cancelCtx,
+		cancel:       cancel,
+		activityTime: time.Now(),
+	}
+}
+
+func (self *multiClientChannelUpdate) initRace() {
+	if self.race == nil {
+		self.race = newMultiClientChannelUpdateRace(self.ctx)
+	}
+}
+
+func (self *multiClientChannelUpdate) clearRace() {
+	if self.race != nil {
+		self.race.Close()
+		self.race = nil
+	}
+}
+
+func (self *multiClientChannelUpdate) IsDone() bool {
+	select {
+	case <-self.ctx.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+func (self *multiClientChannelUpdate) Close() {
+	self.cancel()
+	self.client = nil
+	self.clearRace()
+}
+
+type multiClientChannelUpdateRace struct {
+	ctx                    context.Context
+	cancel                 context.CancelFunc
+	clientStates           map[*multiClientChannel]*multiClientChannelRaceClientState
+	packetCount            int
+	clientsWithPacketCount int
+	completeMonitor        *Monitor
+}
+
+func newMultiClientChannelUpdateRace(ctx context.Context) *multiClientChannelUpdateRace {
+	cancelCtx, cancel := context.WithCancel(ctx)
+	return &multiClientChannelUpdateRace{
+		ctx:                    cancelCtx,
+		cancel:                 cancel,
+		clientStates:           map[*multiClientChannel]*multiClientChannelRaceClientState{},
+		packetCount:            0,
+		clientsWithPacketCount: 0,
+		completeMonitor:        NewMonitor(),
+	}
+}
+
+func (self *multiClientChannelUpdateRace) Close() {
+	self.cancel()
+	// for _, state := range self.clientStates {
+	// 	state.packets = nil
+	// }
+	// clear(self.clientStates)
+}
+
+type multiClientChannelRaceClientState struct {
+	sendTime    time.Time
+	receiveTime time.Time
+	packets     []*ReceivePacket
 }
 
 type parsedPacket struct {
@@ -791,8 +1068,9 @@ type multiClientWindow struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	generator             MultiClientGenerator
-	receivePacketCallback ReceivePacketFunction
+	generator                   MultiClientGenerator
+	clientReceivePacketCallback clientReceivePacketFunction
+	clientRemoveCallback        func(client *multiClientChannel)
 
 	settings *MultiClientSettings
 
@@ -810,19 +1088,21 @@ func newMultiClientWindow(
 	ctx context.Context,
 	cancel context.CancelFunc,
 	generator MultiClientGenerator,
-	receivePacketCallback ReceivePacketFunction,
+	clientReceivePacketCallback clientReceivePacketFunction,
+	clientRemoveCallback func(client *multiClientChannel),
 	settings *MultiClientSettings,
 ) *multiClientWindow {
 	window := &multiClientWindow{
-		ctx:                     ctx,
-		cancel:                  cancel,
-		generator:               generator,
-		receivePacketCallback:   receivePacketCallback,
-		settings:                settings,
-		clientChannelArgs:       make(chan *multiClientChannelArgs, settings.WindowSizeMin),
-		monitor:                 NewRemoteUserNatMultiClientMonitor(&settings.RemoteUserNatMultiClientMonitorSettings),
-		contractStatusCallbacks: NewCallbackList[ContractStatusFunction](),
-		destinationClients:      map[MultiHopId]*multiClientChannel{},
+		ctx:                         ctx,
+		cancel:                      cancel,
+		generator:                   generator,
+		clientReceivePacketCallback: clientReceivePacketCallback,
+		clientRemoveCallback:        clientRemoveCallback,
+		settings:                    settings,
+		clientChannelArgs:           make(chan *multiClientChannelArgs, settings.WindowSizeMin),
+		monitor:                     NewRemoteUserNatMultiClientMonitor(&settings.RemoteUserNatMultiClientMonitorSettings),
+		contractStatusCallbacks:     NewCallbackList[ContractStatusFunction](),
+		destinationClients:          map[MultiHopId]*multiClientChannel{},
 	}
 
 	go HandleError(window.randomEnumerateClientArgs, cancel)
@@ -968,13 +1248,17 @@ func (self *multiClientWindow) resize() {
 				defer self.stateLock.Unlock()
 
 				for _, client := range removedClients {
-					client.Cancel()
+					client.Close()
 					delete(self.destinationClients, client.Destination())
 				}
 			}()
-			for _, client := range removedClients {
-				self.monitor.AddProviderEvent(client.ClientId(), ProviderStateRemoved)
-			}
+			// for _, client := range removedClients {
+			// 	self.monitor.AddProviderEvent(client.ClientId(), ProviderStateRemoved)
+			// }
+			// for _, client := range removedClients {
+			// 	self.clientClosed(removedClients)
+			// }
+			self.removeClients(removedClients)
 		}
 
 		slices.SortFunc(clients, func(a *multiClientChannel, b *multiClientChannel) int {
@@ -1033,10 +1317,10 @@ func (self *multiClientWindow) resize() {
 			// clients = clients[:windowSize]
 			for _, client := range clients[windowSize:] {
 				if self.settings.StatsWindowGraceperiod <= durations[client] && weights[client] <= 0 {
-					client.Cancel()
+					client.Close()
 					// n += 1
-					removedClients = append(removedClients, client)
 					delete(self.destinationClients, client.Destination())
+					removedClients = append(removedClients, client)
 				}
 				//  else {
 				// 	clients = append(clients, client)
@@ -1063,9 +1347,10 @@ func (self *multiClientWindow) resize() {
 			removedClients := collapseLowestWeighted(0)
 			if 0 < len(removedClients) {
 				glog.Infof("[multi]window optimize -%d ->%d\n", len(removedClients), len(clients))
-				for _, client := range removedClients {
-					self.monitor.AddProviderEvent(client.ClientId(), ProviderStateRemoved)
-				}
+				// for _, client := range removedClients {
+				// 	self.monitor.AddProviderEvent(client.ClientId(), ProviderStateRemoved)
+				// }
+				self.removeClients(removedClients)
 			}
 
 			// expand
@@ -1095,9 +1380,10 @@ func (self *multiClientWindow) resize() {
 			removedClients := collapseLowestWeighted(collapseWindowSize)
 			if 0 < len(removedClients) {
 				glog.Infof("[multi]window collapse -%d ->%d\n", len(removedClients), len(clients))
-				for _, client := range removedClients {
-					self.monitor.AddProviderEvent(client.ClientId(), ProviderStateRemoved)
-				}
+				// for _, client := range removedClients {
+				// 	self.monitor.AddProviderEvent(client.ClientId(), ProviderStateRemoved)
+				// }
+				self.removeClients(removedClients)
 			}
 			self.monitor.AddWindowExpandEvent(true, collapseWindowSize)
 		} else {
@@ -1173,7 +1459,7 @@ func (self *multiClientWindow) expand(currentWindowSize int, currentP2pOnlyWindo
 					self.ctx,
 					args,
 					self.generator,
-					self.receivePacketCallback,
+					self.clientReceivePacketCallback,
 					self.contractStatus,
 					self.settings,
 				)
@@ -1232,14 +1518,14 @@ func (self *multiClientWindow) expand(currentWindowSize int, currentP2pOnlyWindo
 					} else {
 						// async wait for the ping
 						pendingPingDones = append(pendingPingDones, pingDone)
-						go func() {
+						go HandleError(func() {
 							select {
 							case <-pingDone:
 							case <-time.After(self.settings.PingTimeout):
 								glog.V(2).Infof("[multi]expand window timeout waiting for ping\n")
 								client.Cancel()
 							}
-						}()
+						}, client.Cancel)
 					}
 				} else {
 					glog.Infof("[multi]create client error = %s\n", err)
@@ -1277,7 +1563,6 @@ func (self *multiClientWindow) clients() []*multiClientChannel {
 }
 
 func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
-
 	clients := []*multiClientChannel{}
 
 	weights := map[*multiClientChannel]float32{}
@@ -1359,6 +1644,29 @@ func (self *multiClientWindow) statsSampleWeights(weights map[*multiClientChanne
 	}
 }
 
+func (self *multiClientWindow) Close() {
+	var removedClients []*multiClientChannel
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		for _, client := range self.destinationClients {
+			client.Close()
+			removedClients = append(removedClients, client)
+		}
+		clear(self.destinationClients)
+	}()
+	self.removeClients(removedClients)
+}
+
+func (self *multiClientWindow) removeClients(removedClients []*multiClientChannel) {
+	for _, client := range removedClients {
+		self.monitor.AddProviderEvent(client.ClientId(), ProviderStateRemoved)
+	}
+	for _, client := range removedClients {
+		self.clientRemoveCallback(client)
+	}
+}
+
 type multiClientChannelArgs struct {
 	MultiClientGeneratorClientArgs
 
@@ -1431,7 +1739,7 @@ type multiClientChannel struct {
 
 	api *BringYourApi
 
-	receivePacketCallback ReceivePacketFunction
+	clientReceivePacketCallback clientReceivePacketFunction
 
 	settings *MultiClientSettings
 
@@ -1447,8 +1755,8 @@ type multiClientChannel struct {
 	packetStats               *clientWindowStats
 	endErr                    error
 
-	affinityCount int
-	affinityTime  time.Time
+	// affinityCount int
+	// affinityTime  time.Time
 
 	clientReceiveUnsub func()
 }
@@ -1457,7 +1765,7 @@ func newMultiClientChannel(
 	ctx context.Context,
 	args *multiClientChannelArgs,
 	generator MultiClientGenerator,
-	receivePacketCallback ReceivePacketFunction,
+	clientReceivePacketCallback clientReceivePacketFunction,
 	contractStatusCallback ContractStatusFunction,
 	settings *MultiClientSettings,
 ) (*multiClientChannel, error) {
@@ -1490,11 +1798,11 @@ func newMultiClientChannel(
 	// }
 
 	clientChannel := &multiClientChannel{
-		ctx:                   cancelCtx,
-		cancel:                cancel,
-		args:                  args,
-		receivePacketCallback: receivePacketCallback,
-		settings:              settings,
+		ctx:                         cancelCtx,
+		cancel:                      cancel,
+		args:                        args,
+		clientReceivePacketCallback: clientReceivePacketCallback,
+		settings:                    settings,
 		// sourceFilter: sourceFilter,
 		client:                    client,
 		eventBuckets:              []*multiClientEventBucket{},
@@ -1502,8 +1810,8 @@ func newMultiClientChannel(
 		ip6DestinationSourceCount: map[Ip6Path]map[Ip6Path]int{},
 		packetStats:               &clientWindowStats{},
 		endErr:                    nil,
-		affinityCount:             0,
-		affinityTime:              time.Time{},
+		// affinityCount:             0,
+		// affinityTime:              time.Time{},
 	}
 	go HandleError(clientChannel.detectBlackhole, cancel)
 
@@ -1521,28 +1829,28 @@ func (self *multiClientChannel) IsP2pOnly() bool {
 	return self.args.MultiClientGeneratorClientArgs.P2pOnly
 }
 
-func (self *multiClientChannel) UpdateAffinity() {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
+// func (self *multiClientChannel) UpdateAffinity() {
+// 	self.stateLock.Lock()
+// 	defer self.stateLock.Unlock()
 
-	self.affinityCount += 1
-	self.affinityTime = time.Now()
-}
+// 	self.affinityCount += 1
+// 	self.affinityTime = time.Now()
+// }
 
-func (self *multiClientChannel) ClearAffinity() {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
+// func (self *multiClientChannel) ClearAffinity() {
+// 	self.stateLock.Lock()
+// 	defer self.stateLock.Unlock()
 
-	self.affinityCount = 0
-	self.affinityTime = time.Time{}
-}
+// 	self.affinityCount = 0
+// 	self.affinityTime = time.Time{}
+// }
 
-func (self *multiClientChannel) MostRecentAffinity() (int, time.Time) {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
+// func (self *multiClientChannel) MostRecentAffinity() (int, time.Time) {
+// 	self.stateLock.Lock()
+// 	defer self.stateLock.Unlock()
 
-	return self.affinityCount, self.affinityTime
-}
+// 	return self.affinityCount, self.affinityTime
+// }
 
 func (self *multiClientChannel) Send(parsedPacket *parsedPacket, timeout time.Duration) bool {
 	success, err := self.SendDetailed(parsedPacket, timeout)
@@ -1664,30 +1972,6 @@ func (self *multiClientChannel) detectBlackhole() {
 	}
 }
 
-func (self *multiClientChannel) eventBucket() *multiClientEventBucket {
-	// must be called with stateLock
-
-	now := time.Now()
-
-	var eventBucket *multiClientEventBucket
-	if n := len(self.eventBuckets); 0 < n {
-		eventBucket = self.eventBuckets[n-1]
-		if eventBucket.createTime.Add(self.settings.StatsWindowBucketDuration).Before(now) {
-			// expired
-			eventBucket = nil
-		}
-	}
-
-	if eventBucket == nil {
-		eventBucket = newMultiClientEventBucket()
-		self.eventBuckets = append(self.eventBuckets, eventBucket)
-	}
-
-	eventBucket.eventTime = now
-
-	return eventBucket
-}
-
 func (self *multiClientChannel) addSendNack(ackByteCount ByteCount) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -1698,8 +1982,6 @@ func (self *multiClientChannel) addSendNack(ackByteCount ByteCount) {
 	eventBucket := self.eventBucket()
 	eventBucket.sendNackCount += 1
 	eventBucket.sendNackByteCount += ackByteCount
-
-	self.coalesceEventBuckets()
 }
 
 func (self *multiClientChannel) addSendAck(ackByteCount ByteCount) {
@@ -1717,8 +1999,6 @@ func (self *multiClientChannel) addSendAck(ackByteCount ByteCount) {
 	}
 	eventBucket.sendAckCount += 1
 	eventBucket.sendAckByteCount += ackByteCount
-
-	self.coalesceEventBuckets()
 }
 
 func (self *multiClientChannel) addReceiveAck(ackByteCount ByteCount) {
@@ -1731,52 +2011,51 @@ func (self *multiClientChannel) addReceiveAck(ackByteCount ByteCount) {
 	eventBucket := self.eventBucket()
 	eventBucket.receiveAckCount += 1
 	eventBucket.receiveAckByteCount += ackByteCount
-
-	self.coalesceEventBuckets()
 }
 
 func (self *multiClientChannel) addSource(ipPath *IpPath) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
-	source := ipPath.Source()
-	destination := ipPath.Destination()
-	switch source.Version {
-	case 4:
-		sourceCount, ok := self.ip4DestinationSourceCount[destination.ToIp4Path()]
-		if !ok {
-			sourceCount = map[Ip4Path]int{}
-			self.ip4DestinationSourceCount[destination.ToIp4Path()] = sourceCount
-		}
-		sourceCount[source.ToIp4Path()] += 1
-	case 6:
-		sourceCount, ok := self.ip6DestinationSourceCount[destination.ToIp6Path()]
-		if !ok {
-			sourceCount = map[Ip6Path]int{}
-			self.ip6DestinationSourceCount[destination.ToIp6Path()] = sourceCount
-		}
-		sourceCount[source.ToIp6Path()] += 1
-	default:
-		panic(fmt.Errorf("Bad protocol version %d", source.Version))
-	}
-
 	eventBucket := self.eventBucket()
 	switch ipPath.Version {
 	case 4:
+		ip4Path := ipPath.ToIp4Path()
+
 		if eventBucket.ip4Paths == nil {
 			eventBucket.ip4Paths = map[Ip4Path]bool{}
 		}
-		eventBucket.ip4Paths[ipPath.ToIp4Path()] = true
+		eventBucket.ip4Paths[ip4Path] = true
+
+		source := ip4Path.Source()
+		destination := ip4Path.Destination()
+
+		sourceCount, ok := self.ip4DestinationSourceCount[destination]
+		if !ok {
+			sourceCount = map[Ip4Path]int{}
+			self.ip4DestinationSourceCount[destination] = sourceCount
+		}
+		sourceCount[source] += 1
 	case 6:
+		ip6Path := ipPath.ToIp6Path()
+
 		if eventBucket.ip6Paths == nil {
 			eventBucket.ip6Paths = map[Ip6Path]bool{}
 		}
-		eventBucket.ip6Paths[ipPath.ToIp6Path()] = true
-	default:
-		panic(fmt.Errorf("Bad protocol version %d", source.Version))
-	}
+		eventBucket.ip6Paths[ip6Path] = true
 
-	self.coalesceEventBuckets()
+		source := ip6Path.Source()
+		destination := ip6Path.Destination()
+
+		sourceCount, ok := self.ip6DestinationSourceCount[destination]
+		if !ok {
+			sourceCount = map[Ip6Path]int{}
+			self.ip6DestinationSourceCount[destination] = sourceCount
+		}
+		sourceCount[source] += 1
+	default:
+		panic(fmt.Errorf("Bad protocol version %d", ipPath.Version))
+	}
 }
 
 func (self *multiClientChannel) addError(err error) {
@@ -1789,13 +2068,31 @@ func (self *multiClientChannel) addError(err error) {
 
 	eventBucket := self.eventBucket()
 	eventBucket.errs = append(eventBucket.errs, err)
-
-	self.coalesceEventBuckets()
 }
 
-func (self *multiClientChannel) coalesceEventBuckets() {
-	// must be called with `stateLock`
+// must be called with `stateLock`
+func (self *multiClientChannel) eventBucket() *multiClientEventBucket {
+	now := time.Now()
 
+	var eventBucket *multiClientEventBucket
+	if n := len(self.eventBuckets); 0 < n {
+		eventBucket = self.eventBuckets[n-1]
+	}
+
+	if eventBucket == nil || eventBucket.createTime.Add(self.settings.StatsWindowBucketDuration).Before(now) {
+		eventBucket = newMultiClientEventBucket()
+		self.eventBuckets = append(self.eventBuckets, eventBucket)
+	}
+
+	eventBucket.eventTime = now
+
+	self.coalesceEventBuckets()
+
+	return eventBucket
+}
+
+// must be called with `stateLock`
+func (self *multiClientChannel) coalesceEventBuckets() {
 	// if there is no activity (no new buckets), keep historical buckets around
 	minBucketCount := 1 + int(self.settings.StatsWindowDuration/self.settings.StatsWindowBucketDuration)
 
@@ -1974,7 +2271,7 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 
 				self.addReceiveAck(ByteCount(len(packet)))
 
-				self.receivePacketCallback(source, IpProtocolUnknown, packet)
+				self.clientReceivePacketCallback(self, source, IpProtocolUnknown, packet)
 			} else {
 				glog.V(2).Infof("[multi]receive drop %s<- = %s\n", self.args.Destination, err)
 			}
@@ -1996,4 +2293,13 @@ func (self *multiClientChannel) Close() {
 	self.client.Close()
 
 	self.clientReceiveUnsub()
+}
+
+func (self *multiClientChannel) IsDone() bool {
+	select {
+	case <-self.ctx.Done():
+		return true
+	default:
+		return false
+	}
 }

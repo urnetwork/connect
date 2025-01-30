@@ -212,7 +212,11 @@ func TestMultiClientChannelWindowStats(t *testing.T) {
 		},
 	}
 
-	receivePacket := func(source TransferPath, ipProtocol IpProtocol, packet []byte) {
+	clientReceivePacket := func(client *multiClientChannel, source TransferPath, ipProtocol IpProtocol, packet []byte) {
+		// Do nothing
+	}
+
+	contractStatus := func(contractStatus *ContractStatus) {
 		// Do nothing
 	}
 
@@ -231,7 +235,7 @@ func TestMultiClientChannelWindowStats(t *testing.T) {
 		EstimatedBytesPerSecond:        0,
 	}
 	assert.Equal(t, nil, err)
-	clientChannel, err := newMultiClientChannel(ctx, channelArgs, generator, receivePacket, settings)
+	clientChannel, err := newMultiClientChannel(ctx, channelArgs, generator, clientReceivePacket, contractStatus, settings)
 	assert.Equal(t, nil, err)
 
 	cancelCtxs := []context.Context{}

@@ -2090,16 +2090,17 @@ func (self *SendSequence) receiveAck(messageId Id, selective bool, tag *protocol
 
 func (self *SendSequence) ackItem(item *sendItem) {
 	if item.contractId != nil {
-		itemSendContract := self.openSendContracts[*item.contractId]
-		itemSendContract.ack(item.messageByteCount)
-		// not current and closed
-		if self.sendContract != itemSendContract && itemSendContract.unackedByteCount == 0 {
-			self.client.ContractManager().CloseContract(
-				itemSendContract.contractId,
-				itemSendContract.ackedByteCount,
-				itemSendContract.unackedByteCount,
-			)
-			delete(self.openSendContracts, itemSendContract.contractId)
+		if itemSendContract, ok := self.openSendContracts[*item.contractId]; ok {
+			itemSendContract.ack(item.messageByteCount)
+			// not current and closed
+			if self.sendContract != itemSendContract && itemSendContract.unackedByteCount == 0 {
+				self.client.ContractManager().CloseContract(
+					itemSendContract.contractId,
+					itemSendContract.ackedByteCount,
+					itemSendContract.unackedByteCount,
+				)
+				delete(self.openSendContracts, itemSendContract.contractId)
+			}
 		}
 	}
 	item.ackCallback(nil)
