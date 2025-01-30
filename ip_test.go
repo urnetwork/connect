@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"net"
-	"reflect"
+	// "reflect"
 	"testing"
 	"time"
 
@@ -145,22 +145,31 @@ func udp4Packet(s int, i int, j int, k int) (packet []byte, payload []byte) {
 	payload = make([]byte, 4)
 	binary.LittleEndian.PutUint32(payload, uint32(s))
 
-	sourceIp := net.IPv4(72, 0, 0, 1)
-	sourcePort := layers.UDPPort(40000 + s)
-	destinationIp := net.IPv4(byte(72), byte(1+i), byte(1+j), byte(1+k))
-	destinationPort := layers.UDPPort(443)
+	ipPath := &IpPath{
+		Version:         4,
+		Protocol:        IpProtocolUdp,
+		SourceIp:        net.IPv4(72, 0, 0, 1),
+		SourcePort:      40000 + s,
+		DestinationIp:   net.IPv4(byte(72), byte(1+i), byte(1+j), byte(1+k)),
+		DestinationPort: 443,
+	}
 
+	packet = ip4UdpPacket(ipPath, payload)
+	return
+}
+
+func ip4UdpPacket(ipPath *IpPath, payload []byte) (packet []byte) {
 	ip := &layers.IPv4{
 		Version:  4,
 		TTL:      64,
-		SrcIP:    sourceIp,
-		DstIP:    destinationIp,
+		SrcIP:    ipPath.SourceIp.To4(),
+		DstIP:    ipPath.DestinationIp.To4(),
 		Protocol: layers.IPProtocolUDP,
 	}
 
 	udp := layers.UDP{
-		SrcPort: sourcePort,
-		DstPort: destinationPort,
+		SrcPort: layers.UDPPort(ipPath.SourcePort),
+		DstPort: layers.UDPPort(ipPath.DestinationPort),
 	}
 	udp.SetNetworkLayerForChecksum(ip)
 
@@ -187,22 +196,31 @@ func tcp4Packet(s int, i int, j int, k int) (packet []byte, payload []byte) {
 	payload = make([]byte, 4)
 	binary.LittleEndian.PutUint32(payload, uint32(s))
 
-	sourceIp := net.IPv4(72, 0, 0, 1)
-	sourcePort := layers.TCPPort(40000 + s)
-	destinationIp := net.IPv4(byte(72), byte(1+i), byte(1+j), byte(1+k))
-	destinationPort := layers.TCPPort(443)
+	ipPath := &IpPath{
+		Version:         4,
+		Protocol:        IpProtocolTcp,
+		SourceIp:        net.IPv4(72, 0, 0, 1),
+		SourcePort:      40000 + s,
+		DestinationIp:   net.IPv4(byte(72), byte(1+i), byte(1+j), byte(1+k)),
+		DestinationPort: 443,
+	}
 
+	packet = ip4TcpPacket(ipPath, payload)
+	return
+}
+
+func ip4TcpPacket(ipPath *IpPath, payload []byte) (packet []byte) {
 	ip := &layers.IPv4{
 		Version:  4,
 		TTL:      64,
-		SrcIP:    sourceIp,
-		DstIP:    destinationIp,
+		SrcIP:    ipPath.SourceIp.To4(),
+		DstIP:    ipPath.DestinationIp.To4(),
 		Protocol: layers.IPProtocolTCP,
 	}
 
 	tcp := layers.TCP{
-		SrcPort: sourcePort,
-		DstPort: destinationPort,
+		SrcPort: layers.TCPPort(ipPath.SourcePort),
+		DstPort: layers.TCPPort(ipPath.DestinationPort),
 		Seq:     0,
 		Ack:     0,
 		Window:  1024,
@@ -232,22 +250,31 @@ func udp6Packet(s int, i int, j int, k int) (packet []byte, payload []byte) {
 	payload = make([]byte, 4)
 	binary.LittleEndian.PutUint32(payload, uint32(s))
 
-	sourceIp := net.IPv4(72, 0, 0, 1).To16()
-	sourcePort := layers.UDPPort(40000 + s)
-	destinationIp := net.IPv4(byte(72), byte(1+i), byte(1+j), byte(1+k)).To16()
-	destinationPort := layers.UDPPort(443)
+	ipPath := &IpPath{
+		Version:         6,
+		Protocol:        IpProtocolUdp,
+		SourceIp:        net.IPv4(72, 0, 0, 1),
+		SourcePort:      40000 + s,
+		DestinationIp:   net.IPv4(byte(72), byte(1+i), byte(1+j), byte(1+k)),
+		DestinationPort: 443,
+	}
 
+	packet = ip6UdpPacket(ipPath, payload)
+	return
+}
+
+func ip6UdpPacket(ipPath *IpPath, payload []byte) (packet []byte) {
 	ip := &layers.IPv6{
 		Version:    6,
 		HopLimit:   64,
-		SrcIP:      sourceIp,
-		DstIP:      destinationIp,
+		SrcIP:      ipPath.SourceIp.To16(),
+		DstIP:      ipPath.DestinationIp.To16(),
 		NextHeader: layers.IPProtocolUDP,
 	}
 
 	udp := layers.UDP{
-		SrcPort: sourcePort,
-		DstPort: destinationPort,
+		SrcPort: layers.UDPPort(ipPath.SourcePort),
+		DstPort: layers.UDPPort(ipPath.DestinationPort),
 	}
 	udp.SetNetworkLayerForChecksum(ip)
 
@@ -274,22 +301,32 @@ func tcp6Packet(s int, i int, j int, k int) (packet []byte, payload []byte) {
 	payload = make([]byte, 4)
 	binary.LittleEndian.PutUint32(payload, uint32(s))
 
-	sourceIp := net.IPv4(72, 0, 0, 1).To16()
-	sourcePort := layers.TCPPort(40000 + s)
-	destinationIp := net.IPv4(byte(72), byte(1+i), byte(1+j), byte(1+k)).To16()
-	destinationPort := layers.TCPPort(443)
+	ipPath := &IpPath{
+		Version:         6,
+		Protocol:        IpProtocolTcp,
+		SourceIp:        net.IPv4(72, 0, 0, 1),
+		SourcePort:      40000 + s,
+		DestinationIp:   net.IPv4(byte(72), byte(1+i), byte(1+j), byte(1+k)),
+		DestinationPort: 443,
+	}
+
+	packet = ip6TcpPacket(ipPath, payload)
+	return
+}
+
+func ip6TcpPacket(ipPath *IpPath, payload []byte) (packet []byte) {
 
 	ip := &layers.IPv6{
 		Version:    6,
 		HopLimit:   64,
-		SrcIP:      sourceIp,
-		DstIP:      destinationIp,
+		SrcIP:      ipPath.SourceIp.To16(),
+		DstIP:      ipPath.DestinationIp.To16(),
 		NextHeader: layers.IPProtocolTCP,
 	}
 
 	tcp := layers.TCP{
-		SrcPort: sourcePort,
-		DstPort: destinationPort,
+		SrcPort: layers.TCPPort(ipPath.SourcePort),
+		DstPort: layers.TCPPort(ipPath.DestinationPort),
 		Seq:     0,
 		Ack:     0,
 		Window:  1024,
@@ -312,6 +349,32 @@ func tcp6Packet(s int, i int, j int, k int) (packet []byte, payload []byte) {
 	}
 	packet = buffer.Bytes()
 
+	return
+}
+
+func ipPacket(ipPath *IpPath, payload []byte) (packet []byte) {
+	switch ipPath.Version {
+	case 4:
+		switch ipPath.Protocol {
+		case IpProtocolUdp:
+			packet = ip4UdpPacket(ipPath, payload)
+		case IpProtocolTcp:
+			packet = ip4TcpPacket(ipPath, payload)
+		default:
+			panic(fmt.Errorf("Bad ip protocol: %d", ipPath.Protocol))
+		}
+	case 6:
+		switch ipPath.Protocol {
+		case IpProtocolUdp:
+			packet = ip6UdpPacket(ipPath, payload)
+		case IpProtocolTcp:
+			packet = ip6TcpPacket(ipPath, payload)
+		default:
+			panic(fmt.Errorf("Bad ip protocol: %d", ipPath.Protocol))
+		}
+	default:
+		panic(fmt.Errorf("Bad ip version: %d", ipPath.Version))
+	}
 	return
 }
 
@@ -366,7 +429,7 @@ func testClient[P comparable](
 
 	// n destinations
 	// all have the same receiver callback, put into a channel of messages
-	// echo the received packet
+	// echo the received packet, with paths reversed
 
 	// create fake packets for all iterations of i,j,k in a range
 	// retransmit some packets by increasing source port s
@@ -418,6 +481,12 @@ func testClient[P comparable](
 		// // fmt.Printf("C Receive %d/%d (%.2f%%)\n", cReceiveCount, totalCount, 100.0 * float32(cReceiveCount) / float32(totalCount))
 		// cMutex.Unlock()
 
+		ipPath, payload, err := ParseIpPathWithPayload(packet)
+		if err != nil {
+			panic(err)
+		}
+		packet = ipPacket(ipPath.Reverse(), payload)
+
 		receivePacket := &receivePacket{
 			source: source,
 			packet: packet,
@@ -436,6 +505,13 @@ func testClient[P comparable](
 		// cMutex.Unlock()
 
 		echo := func(packet []byte) {
+			// reverse the packet
+			ipPath, payload, err := ParseIpPathWithPayload(packet)
+			if err != nil {
+				panic(err)
+			}
+			packet = ipPacket(ipPath.Reverse(), payload)
+
 			ipPacketFromProvider := &protocol.IpPacketFromProvider{
 				IpPacket: &protocol.IpPacket{
 					PacketBytes: packet,
@@ -516,31 +592,31 @@ func testClient[P comparable](
 		case receivePacket := <-receivePackets:
 			// fmt.Printf("Receive %d/%d (%.2f%%)\n", i + 1, totalCount, 100.0 * float32(i + 1) / float32(totalCount))
 
-			ipPath, err := ParseIpPath(receivePacket.packet)
+			ipPath, payload, err := ParseIpPathWithPayload(receivePacket.packet)
 			assert.Equal(t, err, nil)
 
-			var payload []byte
-			switch ipPath.Version {
-			case 4:
-				ipv4 := layers.IPv4{}
-				ipv4.DecodeFromBytes(receivePacket.packet, gopacket.NilDecodeFeedback)
-				payload = ipv4.Payload
-			case 6:
-				ipv6 := layers.IPv6{}
-				ipv6.DecodeFromBytes(receivePacket.packet, gopacket.NilDecodeFeedback)
-				payload = ipv6.Payload
-			}
+			// var payload []byte
+			// switch ipPath.Version {
+			// case 4:
+			// 	ipv4 := layers.IPv4{}
+			// 	ipv4.DecodeFromBytes(receivePacket.packet, gopacket.NilDecodeFeedback)
+			// 	payload = ipv4.Payload
+			// case 6:
+			// 	ipv6 := layers.IPv6{}
+			// 	ipv6.DecodeFromBytes(receivePacket.packet, gopacket.NilDecodeFeedback)
+			// 	payload = ipv6.Payload
+			// }
 
-			switch ipPath.Protocol {
-			case IpProtocolUdp:
-				udp := layers.UDP{}
-				udp.DecodeFromBytes(payload, gopacket.NilDecodeFeedback)
-				payload = udp.Payload
-			case IpProtocolTcp:
-				tcp := layers.TCP{}
-				tcp.DecodeFromBytes(payload, gopacket.NilDecodeFeedback)
-				payload = tcp.Payload
-			}
+			// switch ipPath.Protocol {
+			// case IpProtocolUdp:
+			// 	udp := layers.UDP{}
+			// 	udp.DecodeFromBytes(payload, gopacket.NilDecodeFeedback)
+			// 	payload = udp.Payload
+			// case IpProtocolTcp:
+			// 	tcp := layers.TCP{}
+			// 	tcp.DecodeFromBytes(payload, gopacket.NilDecodeFeedback)
+			// 	payload = tcp.Payload
+			// }
 
 			comparableIpPath := toComparableIpPath(ipPath)
 			comparableIpPathPayloads[comparableIpPath] = append(comparableIpPathPayloads[comparableIpPath], payload)
@@ -552,8 +628,15 @@ func testClient[P comparable](
 			}
 			sources[receivePacket.source] = true
 		case <-time.After(timeout):
+			fmt.Printf("[TIMEOUT]receive\n")
 			t.FailNow()
 		}
+	}
+	select {
+	case <-receivePackets:
+		// excesss packets received
+		t.FailNow()
+	case <-time.After(1 * time.Second):
 	}
 
 	// make sure all messages were received
@@ -570,15 +653,11 @@ func testClient[P comparable](
 
 					payloads := comparableIpPathPayloads[comparableIpPath]
 
-					count := 0
 					for _, b := range payloads {
-						e := reflect.DeepEqual(b, payload)
-						if e {
-							count += 1
-						}
+						assert.Equal(t, b, payload)
 					}
 
-					assert.Equal(t, parallelCount*repeatCount*(1+echoCount), count)
+					assert.Equal(t, parallelCount*repeatCount*(1+echoCount), len(payloads))
 
 					sources := comparableIpPathSources[comparableIpPath]
 

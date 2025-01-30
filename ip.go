@@ -1278,7 +1278,7 @@ func (self *TcpSequence) Run() {
 		case <-self.ctx.Done():
 			return
 		case sendItem := <-self.sendItems:
-			glog.V(2).Infof("[init]send(%d)\n", len(sendItem.tcp.BaseLayer.Payload))
+			glog.V(2).Infof("[init]send(%d)\n", len(sendItem.tcp.Payload))
 			// the first packet must be a syn
 			if sendItem.tcp.SYN {
 				glog.V(2).Infof("[init]SYN\n")
@@ -2532,6 +2532,11 @@ type IpPath struct {
 }
 
 func ParseIpPath(ipPacket []byte) (*IpPath, error) {
+	ipPath, _, err := ParseIpPathWithPayload(ipPacket)
+	return ipPath, err
+}
+
+func ParseIpPathWithPayload(ipPacket []byte) (*IpPath, []byte, error) {
 	ipVersion := uint8(ipPacket[0]) >> 4
 	switch ipVersion {
 	case 4:
@@ -2549,7 +2554,7 @@ func ParseIpPath(ipPacket []byte) (*IpPath, error) {
 				SourcePort:      int(udp.SrcPort),
 				DestinationIp:   ipv4.DstIP,
 				DestinationPort: int(udp.DstPort),
-			}, nil
+			}, udp.Payload, nil
 		case layers.IPProtocolTCP:
 			tcp := layers.TCP{}
 			tcp.DecodeFromBytes(ipv4.Payload, gopacket.NilDecodeFeedback)
@@ -2561,10 +2566,10 @@ func ParseIpPath(ipPacket []byte) (*IpPath, error) {
 				SourcePort:      int(tcp.SrcPort),
 				DestinationIp:   ipv4.DstIP,
 				DestinationPort: int(tcp.DstPort),
-			}, nil
+			}, tcp.Payload, nil
 		default:
 			// no support for this protocol
-			return nil, fmt.Errorf("No support for protocol %d", ipv4.Protocol)
+			return nil, nil, fmt.Errorf("No support for protocol %d", ipv4.Protocol)
 		}
 	case 6:
 		ipv6 := layers.IPv6{}
@@ -2581,7 +2586,7 @@ func ParseIpPath(ipPacket []byte) (*IpPath, error) {
 				SourcePort:      int(udp.SrcPort),
 				DestinationIp:   ipv6.DstIP,
 				DestinationPort: int(udp.DstPort),
-			}, nil
+			}, udp.Payload, nil
 		case layers.IPProtocolTCP:
 			tcp := layers.TCP{}
 			tcp.DecodeFromBytes(ipv6.Payload, gopacket.NilDecodeFeedback)
@@ -2593,14 +2598,14 @@ func ParseIpPath(ipPacket []byte) (*IpPath, error) {
 				SourcePort:      int(tcp.SrcPort),
 				DestinationIp:   ipv6.DstIP,
 				DestinationPort: int(tcp.DstPort),
-			}, nil
+			}, tcp.Payload, nil
 		default:
 			// no support for this protocol
-			return nil, fmt.Errorf("No support for protocol %d", ipv6.NextHeader)
+			return nil, nil, fmt.Errorf("No support for protocol %d", ipv6.NextHeader)
 		}
 	default:
 		// no support for this version
-		return nil, fmt.Errorf("No support for ip version %d", ipVersion)
+		return nil, nil, fmt.Errorf("No support for ip version %d", ipVersion)
 	}
 }
 
