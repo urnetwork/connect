@@ -55,12 +55,6 @@ import (
 // The connection to the platform is end-to-end encrypted with TLS,
 // using the hostname from `platformUrl`
 
-const ReadTimeout = 30 * time.Second
-const WriteTimeout = 30 * time.Second
-
-const ValidFrom = 180 * 24 * time.Hour
-const ValidFor = 180 * 24 * time.Hour
-
 type ExtenderConnectMode string
 
 const (
@@ -290,4 +284,46 @@ func NewExtenderDialTlsContext(
 
 		return tlsServerConn, nil
 	}
+}
+
+type streamConn struct {
+	stream quic.Stream
+}
+
+func newStreamConn(stream quic.Stream) *streamConn {
+	return &streamConn{
+		stream: stream,
+	}
+}
+
+func (self *streamConn) Read(b []byte) (int, error) {
+	return self.stream.Read(b)
+}
+
+func (self *streamConn) Write(b []byte) (int, error) {
+	return self.stream.Write(b)
+}
+
+func (self *streamConn) Close() error {
+	return self.stream.Close()
+}
+
+func (self *streamConn) LocalAddr() net.Addr {
+	return nil
+}
+
+func (self *streamConn) RemoteAddr() net.Addr {
+	return nil
+}
+
+func (self *streamConn) SetDeadline(t time.Time) error {
+	return self.stream.SetDeadline(t)
+}
+
+func (self *streamConn) SetReadDeadline(t time.Time) error {
+	return self.stream.SetReadDeadline(t)
+}
+
+func (self *streamConn) SetWriteDeadline(t time.Time) error {
+	return self.stream.SetWriteDeadline(t)
 }
