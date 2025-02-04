@@ -10,45 +10,54 @@ import (
 func EnumerateExtenderProfiles(n int, visited map[ExtenderProfile]bool) []ExtenderProfile {
 	out := map[ExtenderProfile]bool{}
 
-	maxIterations := 32 * n
-	for i := 0; len(out) < n && i < maxIterations; i += 1 {
-		var hosts []string
-		var portConnectModes map[int][]ExtenderConnectMode
+	type persona struct {
+		hosts            []string
+		portConnectModes map[int][]ExtenderConnectMode
+	}
 
-		// each persona is equally weighted
-		// TODO UDP
-		switch mathrand.Intn(2) {
-		case 0:
-			hosts = mailHosts
-			portConnectModes = MailPorts
-		default:
-			hosts = serviceHosts
-			portConnectModes = ServicePorts
-		}
+	personas := []*persona{}
+	if 0 < len(mailHosts) && 0 < len(mailPorts) {
+		personas = append(personas, &persona{
+			hosts:            mailHosts,
+			portConnectModes: mailPorts,
+		})
+	}
+	if 0 < len(serviceHosts) && 0 < len(servicePorts) {
+		personas = append(personas, &persona{
+			hosts:            serviceHosts,
+			portConnectModes: servicePorts,
+		})
+	}
 
-		ports := maps.Keys(portConnectModes)
-		port := ports[mathrand.Intn(len(ports))]
-		connectModes := portConnectModes[port]
-		connectMode := connectModes[mathrand.Intn(len(connectModes))]
+	if 0 < len(personas) {
+		maxIterations := 32 * n
+		for i := 0; len(out) < n && i < maxIterations; i += 1 {
+			persona := personas[mathrand.Intn(len(personas))]
 
-		var profile ExtenderProfile
-		switch connectMode {
-		// TODO Udp does not use a host
-		default:
-			host := hosts[mathrand.Intn(len(hosts))]
-			fragment := mathrand.Intn(2) != 0
-			reorder := mathrand.Intn(2) != 0
-			profile = ExtenderProfile{
-				ConnectMode: connectMode,
-				ServerName:  host,
-				Port:        port,
-				Fragment:    fragment,
-				Reorder:     reorder,
+			ports := maps.Keys(persona.portConnectModes)
+			port := ports[mathrand.Intn(len(ports))]
+			connectModes := persona.portConnectModes[port]
+			connectMode := connectModes[mathrand.Intn(len(connectModes))]
+
+			var profile ExtenderProfile
+			switch connectMode {
+			// TODO Udp does not use a host
+			default:
+				host := persona.hosts[mathrand.Intn(len(persona.hosts))]
+				fragment := mathrand.Intn(2) != 0
+				reorder := mathrand.Intn(2) != 0
+				profile = ExtenderProfile{
+					ConnectMode: connectMode,
+					ServerName:  host,
+					Port:        port,
+					Fragment:    fragment,
+					Reorder:     reorder,
+				}
 			}
-		}
-		if _, ok := visited[profile]; !ok {
-			if _, ok := out[profile]; !ok {
-				out[profile] = true
+			if _, ok := visited[profile]; !ok {
+				if _, ok := out[profile]; !ok {
+					out[profile] = true
+				}
 			}
 		}
 	}
@@ -56,7 +65,7 @@ func EnumerateExtenderProfiles(n int, visited map[ExtenderProfile]bool) []Extend
 	return maps.Keys(out)
 }
 
-var ServicePorts = map[int][]ExtenderConnectMode{
+var servicePorts = map[int][]ExtenderConnectMode{
 	// https and secure dns
 	443: []ExtenderConnectMode{ExtenderConnectModeTcpTls, ExtenderConnectModeQuic},
 	// dns
@@ -71,7 +80,7 @@ var ServicePorts = map[int][]ExtenderConnectMode{
 	4460: []ExtenderConnectMode{ExtenderConnectModeTcpTls},
 }
 
-var MailPorts = map[int][]ExtenderConnectMode{
+var mailPorts = map[int][]ExtenderConnectMode{
 	// imap
 	993: []ExtenderConnectMode{ExtenderConnectModeTcpTls},
 	// pop
