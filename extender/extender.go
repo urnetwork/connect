@@ -42,13 +42,13 @@ import (
 	// "golang.org/x/crypto/cryptobyte"
 	"golang.org/x/net/idna"
 
-	quic "github.com/quic-go/quic-go"
+	// quic "github.com/quic-go/quic-go"
 	"google.golang.org/protobuf/proto"
 
 	// "src.agwa.name/tlshacks"
 
 	"github.com/urnetwork/connect"
-	"github.com/urnetwork/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 // server listens for a tls connect and replies with a self-signed cert
@@ -65,24 +65,21 @@ import (
 
 // https://go.dev/src/crypto/tls/generate_cert.go
 
-
 func DefaultExtenderSettings() *ExtenderSettings {
 	return &ExtenderSettings{
-		ReadTimeout: 30 * time.Second,
+		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
-		ValidFrom: 180 * 24 * time.Hour,
-		ValidFor: 180 * 24 * time.Hour,
+		ValidFrom:    180 * 24 * time.Hour,
+		ValidFor:     180 * 24 * time.Hour,
 	}
 }
 
-
 type ExtenderSettings struct {
-	ReadTimeout time.Duration
+	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
-	ValidFrom time.Duration
-	ValidFor time.Duration
+	ValidFrom    time.Duration
+	ValidFor     time.Duration
 }
-
 
 type ExtenderServer struct {
 	ctx    context.Context
@@ -133,7 +130,7 @@ func NewExtenderServer(
 		allowedHosts:   allowedHosts,
 		ports:          ports,
 		forwardDialer:  forwardDialer,
-		settings: settings,
+		settings:       settings,
 	}
 
 }
@@ -141,7 +138,7 @@ func NewExtenderServer(
 func (self *ExtenderServer) ListenAndServe() error {
 
 	listeners := map[int]net.Listener{}
-	quicListeners := map[int]*quic.Listener{}
+	// quicListeners := map[int]*quic.Listener{}
 
 	for port, connectModes := range self.ports {
 		if !slices.Contains(connectModes, connect.ExtenderConnectModeTcpTls) {
@@ -176,70 +173,72 @@ func (self *ExtenderServer) ListenAndServe() error {
 		}()
 	}
 
-	for port, connectModes := range self.ports {
-		if !slices.Contains(connectModes, connect.ExtenderConnectModeQuic) {
-			continue
-		}
-
-		fmt.Printf("listen quic %d\n", port)
-		// certPemBytes, keyPemBytes, err := selfSign(
-		//     []string{"example.org"},
-		//     guessOrganizationName("example.org"),
-		// )
-		// if err != nil {
-		//     return err
-		// }
-		// // X509KeyPair
-		// cert, err := tls.X509KeyPair(certPemBytes, keyPemBytes)
-		// if err != nil {
-		//     return err
-		// }
-
-		tlsConfig := &tls.Config{
-			GetConfigForClient: func(clientHello *tls.ClientHelloInfo) (*tls.Config, error) {
-				certPemBytes, keyPemBytes, err := selfSign(
-					[]string{clientHello.ServerName},
-					guessOrganizationName(clientHello.ServerName),
-					self.settings.ValidFrom,
-					self.settings.ValidFor,
-				)
-				if err != nil {
-					return nil, err
-				}
-				// X509KeyPair
-				cert, err := tls.X509KeyPair(certPemBytes, keyPemBytes)
-				return &tls.Config{
-					Certificates: []tls.Certificate{cert},
-				}, err
-			},
-		}
-		quicConfig := &quic.Config{}
-		listener, err := quic.ListenAddr(fmt.Sprintf(":%d", port), tlsConfig, quicConfig)
-		if err != nil {
-			fmt.Printf("%s\n", err)
-			return err
-		}
-		quicListeners[port] = listener
-		go func() {
-			defer self.cancel()
-
-			for {
-				select {
-				case <-self.ctx.Done():
-					return
-				default:
-				}
-
-				conn, err := listener.Accept(self.ctx)
-				if err != nil {
-					fmt.Printf("%s\n", err)
-					return
-				}
-				// fmt.Printf("Extender pre\n")
-				go self.HandleQuicExtenderConnection(self.ctx, conn)
+	/*
+		for port, connectModes := range self.ports {
+			if !slices.Contains(connectModes, connect.ExtenderConnectModeQuic) {
+				continue
 			}
-		}()
-	}
+
+			fmt.Printf("listen quic %d\n", port)
+			// certPemBytes, keyPemBytes, err := selfSign(
+			//     []string{"example.org"},
+			//     guessOrganizationName("example.org"),
+			// )
+			// if err != nil {
+			//     return err
+			// }
+			// // X509KeyPair
+			// cert, err := tls.X509KeyPair(certPemBytes, keyPemBytes)
+			// if err != nil {
+			//     return err
+			// }
+
+			tlsConfig := &tls.Config{
+				GetConfigForClient: func(clientHello *tls.ClientHelloInfo) (*tls.Config, error) {
+					certPemBytes, keyPemBytes, err := selfSign(
+						[]string{clientHello.ServerName},
+						guessOrganizationName(clientHello.ServerName),
+						self.settings.ValidFrom,
+						self.settings.ValidFor,
+					)
+					if err != nil {
+						return nil, err
+					}
+					// X509KeyPair
+					cert, err := tls.X509KeyPair(certPemBytes, keyPemBytes)
+					return &tls.Config{
+						Certificates: []tls.Certificate{cert},
+					}, err
+				},
+			}
+			quicConfig := &quic.Config{}
+			listener, err := quic.ListenAddr(fmt.Sprintf(":%d", port), tlsConfig, quicConfig)
+			if err != nil {
+				fmt.Printf("%s\n", err)
+				return err
+			}
+			quicListeners[port] = listener
+			go func() {
+				defer self.cancel()
+
+				for {
+					select {
+					case <-self.ctx.Done():
+						return
+					default:
+					}
+
+					conn, err := listener.Accept(self.ctx)
+					if err != nil {
+						fmt.Printf("%s\n", err)
+						return
+					}
+					// fmt.Printf("Extender pre\n")
+					go self.HandleQuicExtenderConnection(self.ctx, conn)
+				}
+			}()
+		}
+	*/
 
 	// TODO
 	/*
@@ -296,9 +295,9 @@ func (self *ExtenderServer) ListenAndServe() error {
 	for _, listener := range listeners {
 		listener.Close()
 	}
-	for _, listener := range quicListeners {
-		listener.Close()
-	}
+	// for _, listener := range quicListeners {
+	// 	listener.Close()
+	// }
 
 	return nil
 }
@@ -578,6 +577,7 @@ func (self *ExtenderServer) HandleExtenderConnection(ctx context.Context, conn n
 	}
 }
 
+/*
 func (self *ExtenderServer) HandleQuicExtenderConnection(ctx context.Context, conn quic.Connection) {
 
 	fmt.Printf("quic conn\n")
@@ -728,6 +728,7 @@ func (self *ExtenderServer) HandleQuicExtenderConnection(ctx context.Context, co
 
 	fmt.Printf("q end\n")
 }
+*/
 
 func guessOrganizationName(host string) string {
 
@@ -916,4 +917,3 @@ func selfSign(hosts []string, organization string, validFrom time.Duration, vali
 
 	return
 }
-

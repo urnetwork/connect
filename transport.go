@@ -11,7 +11,7 @@ import (
 
 	"github.com/golang/glog"
 
-	"github.com/urnetwork/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 const TransportBufferSize = 1

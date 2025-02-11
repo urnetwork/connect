@@ -62,7 +62,7 @@ func TestExtender(t *testing.T) {
 		[]string{"montrose"},
 		[]string{"localhost"},
 		map[int][]connect.ExtenderConnectMode{
-			1442: []connect.ExtenderConnectMode{connect.ExtenderConnectModeTcpTls, connect.ExtenderConnectModeQuic},
+			1442: []connect.ExtenderConnectMode{connect.ExtenderConnectModeTcpTls},
 		},
 		&net.Dialer{},
 		settings,
@@ -86,7 +86,7 @@ func TestExtender(t *testing.T) {
 		connectSettings,
 		&connect.ExtenderConfig{
 			Profile: connect.ExtenderProfile{
-				ConnectMode: connect.ExtenderConnectModeQuic,
+				ConnectMode: connect.ExtenderConnectModeTcpTls,
 				ServerName:  "bringyour.com",
 				Port:        1442,
 			},
