@@ -67,13 +67,13 @@ func EnumerateExtenderProfiles(n int, visited map[ExtenderProfile]bool) []Extend
 
 var servicePorts = map[int][]ExtenderConnectMode{
 	// https and secure dns
-	443: []ExtenderConnectMode{ExtenderConnectModeTcpTls, ExtenderConnectModeQuic},
+	443: []ExtenderConnectMode{ExtenderConnectModeTcpTls},
 	// dns
 	853: []ExtenderConnectMode{ExtenderConnectModeTcpTls},
 	// ldap
 	636: []ExtenderConnectMode{ExtenderConnectModeTcpTls},
 	// docker
-	2376: []ExtenderConnectMode{ExtenderConnectModeTcpTls, ExtenderConnectModeQuic},
+	2376: []ExtenderConnectMode{ExtenderConnectModeTcpTls},
 	// ldap
 	3269: []ExtenderConnectMode{ExtenderConnectModeTcpTls},
 	// ntp, nts

@@ -41,12 +41,12 @@ import (
 	// "golang.org/x/crypto/cryptobyte"
 	// "golang.org/x/net/idna"
 
-	quic "github.com/quic-go/quic-go"
+	// quic "github.com/quic-go/quic-go"
 	"google.golang.org/protobuf/proto"
 
 	// "src.agwa.name/tlshacks"
 
-	"github.com/urnetwork/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 // an extender uses an independent url that is hard-coded to forward to the platform
@@ -59,7 +59,7 @@ type ExtenderConnectMode string
 
 const (
 	ExtenderConnectModeTcpTls ExtenderConnectMode = "tcptls"
-	ExtenderConnectModeQuic   ExtenderConnectMode = "quic"
+	// ExtenderConnectModeQuic   ExtenderConnectMode = "quic"
 	// TODO
 	// ExtenderConnectModeUdp ExtenderConnectMode = "udp"
 )
@@ -200,28 +200,30 @@ func NewExtenderDialTlsContext(
 			// fragmentConn.Off()
 
 			// fmt.Printf("Extender client 3\n")
-		case ExtenderConnectModeQuic:
-			// quic
+		/*
+			case ExtenderConnectModeQuic:
+				// quic
 
-			// the quic connect combines connect, tls, and handshake
-			quicConfig := &quic.Config{
-				HandshakeIdleTimeout: connectSettings.ConnectTimeout + connectSettings.TlsTimeout + connectSettings.HandshakeTimeout,
-			}
-			conn, err := quic.DialAddr(ctx, authority, extenderTlsConfig, quicConfig)
-			if err != nil {
-				return nil, err
-			}
+				// the quic connect combines connect, tls, and handshake
+				quicConfig := &quic.Config{
+					HandshakeIdleTimeout: connectSettings.ConnectTimeout + connectSettings.TlsTimeout + connectSettings.HandshakeTimeout,
+				}
+				conn, err := quic.DialAddr(ctx, authority, extenderTlsConfig, quicConfig)
+				if err != nil {
+					return nil, err
+				}
 
-			fmt.Printf("quic conn\n")
+				fmt.Printf("quic conn\n")
 
-			stream, err := conn.OpenStream()
-			if err != nil {
-				return nil, err
-			}
+				stream, err := conn.OpenStream()
+				if err != nil {
+					return nil, err
+				}
 
-			fmt.Printf("quic stream\n")
+				fmt.Printf("quic stream\n")
 
-			serverConn = newStreamConn(stream)
+				serverConn = newStreamConn(stream)
+		*/
 
 		// TODO
 		// case ExtenderConnectModeUdp:
@@ -286,6 +288,7 @@ func NewExtenderDialTlsContext(
 	}
 }
 
+/*
 type streamConn struct {
 	stream quic.Stream
 }
@@ -327,3 +330,4 @@ func (self *streamConn) SetReadDeadline(t time.Time) error {
 func (self *streamConn) SetWriteDeadline(t time.Time) error {
 	return self.stream.SetWriteDeadline(t)
 }
+*/

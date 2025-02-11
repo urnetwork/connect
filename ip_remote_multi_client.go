@@ -19,7 +19,7 @@ import (
 
 	"github.com/golang/glog"
 
-	"github.com/urnetwork/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 // multi client is a sender approach to mitigate bad destinations
