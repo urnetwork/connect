@@ -10,7 +10,7 @@ require (
 	github.com/google/gopacket v1.1.19
 	github.com/gorilla/websocket v1.5.3
 	github.com/oklog/ulid/v2 v2.1.0
-	github.com/urnetwork/connect/protocol v0.0.0
+	github.com/urnetwork/connect/protocol v0.0.0-20250211214612-4810b863a010
 	golang.org/x/crypto v0.33.0
 	golang.org/x/exp v0.0.0-20250210185358-939b2ce775ac
 	golang.org/x/net v0.35.0
