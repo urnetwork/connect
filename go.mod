@@ -12,7 +12,7 @@ require (
 	github.com/oklog/ulid/v2 v2.1.0
 	github.com/urnetwork/connect/protocol v0.0.0
 	golang.org/x/crypto v0.33.0
-	golang.org/x/exp v0.0.0-20250210185358-939b2ce775ac
+	golang.org/x/exp v0.0.0-20250218142911-aa4b98e5adaa
 	golang.org/x/net v0.35.0
 	golang.org/x/term v0.29.0
 	google.golang.org/protobuf v1.36.5
