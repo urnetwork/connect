@@ -736,7 +736,6 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 			self.stateLock.Lock()
 			defer self.stateLock.Unlock()
 
-			race := update.race
 			if update.client == nil && update.race == race {
 				// weighted shuffle clients by rtt
 				orderedClients := []*multiClientChannel{}
