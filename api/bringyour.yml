@@ -58,23 +58,6 @@ paths:
                             schema:
                                 $ref: "#/components/schemas/StatsResult"
 
-    /stats/providers-overview-last-90:
-        get:
-            description: |
-                Get statistics for all providers in the caller network
-                for the last 90 days.
-                This is meant to answer the top level question of how
-                the providers in a network are performing.
-            operationId: Stats Providers Overview Last 90
-            security:
-                - BearerAuth: []
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/StatsProvidersOverviewResult"
-
     /stats/providers:
         get:
             description: |
@@ -90,12 +73,33 @@ paths:
                             schema:
                                 $ref: "#/components/schemas/StatsProvidersResult"
 
-    /stats/provider-last-90:
+    /stats/providers-last-n:
+        post:
+            description: |
+                Get all providers in the caller network.
+                Each provider includes stats from the last n hours.
+            operationId: Stats Providers Last N hours
+            security:
+                - BearerAuth: []
+            requestBody:
+                required: true
+                content:
+                    application/json:
+                        schema:
+                            $ref: "#/components/schemas/StatsProvidersArgs"
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: "#/components/schemas/StatsProvidersResult"
+
+    /stats/provider-last-n:
         post:
             description: |
                 Get detailed stats on a single provider in the caller network.
                 This is meant to give the user complete visibility over usage.
-            operationId: Stats Provider Last 90
+            operationId: Stats Provider Last N hours
             security:
                 - BearerAuth: []
             requestBody:
@@ -2154,50 +2158,12 @@ components:
                 update_time:
                     type: string
 
-        StatsProvidersOverviewResult:
+        StatsProvidersArgs:
             type: object
             properties:
-                lookback:
-                    type: integer
-                created_time:
-                    description: datetime
-                    type: string
-                uptime:
-                    type: object
-                    description: yyyy-mm-dd to hours
-                    additionalProperties:
-                        x-additionalPropertiesName: yyyy-mm-dd
-                        type: number
-                transfer_data:
-                    type: object
-                    description: yyyy-mm-dd to gib
-                    additionalProperties:
-                        x-additionalPropertiesName: yyyy-mm-dd
-                        type: number
-                payout:
-                    type: object
-                    description: yyyy-mm-dd to payout USDC
-                    additionalProperties:
-                        x-additionalPropertiesName: yyyy-mm-dd
-                        type: number
-                search_interest:
-                    type: object
-                    description: yyyy-mm-dd to matching search count
-                    additionalProperties:
-                        x-additionalPropertiesName: yyyy-mm-dd
-                        type: integer
-                contracts:
-                    type: object
-                    description: yyyy-mm-dd to count
-                    additionalProperties:
-                        x-additionalPropertiesName: yyyy-mm-dd
-                        type: integer
-                clients:
-                    type: object
-                    description: yyyy-mm-dd to count
-                    additionalProperties:
-                        x-additionalPropertiesName: yyyy-mm-dd
-                        type: integer
+                last_n:
+                    description: n hours
+                    type: number
 
         StatsProvidersResult:
             type: object
@@ -2250,6 +2216,9 @@ components:
                 client_id:
                     description: udid
                     type: string
+                last_n:
+                    description: n hours
+                    type: number
 
         StatsProviderResult:
             type: object
@@ -2261,9 +2230,9 @@ components:
                     type: string
                 uptime:
                     type: object
-                    description: yyyy-mm-dd to hours
+                    description: yyyy-mm-dd-hh (utc) to minutes
                     additionalProperties:
-                        x-additionalPropertiesName: yyyy-mm-dd
+                        x-additionalPropertiesName: yyyy-mm-dd-hh
                         type: number
                 transfer_data:
                     type: object
