@@ -41,6 +41,10 @@ Usage:
     provider provide [--port=<port>]
         [--api_url=<api_url>]
         [--connect_url=<connect_url>]
+    provider auth-provide ([<auth_code>] | --user_auth=<user_auth> [--password=<password>]) [-f]
+    	[--port=<port>]
+        [--api_url=<api_url>]
+        [--connect_url=<connect_url>]
     
 Options:
     -h --help                        Show this screen.
@@ -62,6 +66,9 @@ Options:
 	if auth_, _ := opts.Bool("auth"); auth_ {
 		auth(opts)
 	} else if provide_, _ := opts.Bool("provide"); provide_ {
+		provide(opts)
+	} else if authProvide_, _ := opts.Bool("auth-provide"); authProvide_ {
+		auth(opts)
 		provide(opts)
 	}
 }
@@ -110,7 +117,7 @@ func auth(opts docopt.Opts) {
 		// user_auth and password
 
 		var password string
-		if password, err = opts.String("--password"); err == nil {
+		if password, err = opts.String("--password"); err == nil && password == "" {
 			fmt.Print("Enter password: ")
 			passwordBytes, err := term.ReadPassword(int(syscall.Stdin))
 			if err != nil {
