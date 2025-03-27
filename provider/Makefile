@@ -1,6 +1,6 @@
 
 
-all: clean build image
+all: clean build
 
 clean:
 	rm -rf build
@@ -15,7 +15,9 @@ build:
 	env CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -o build/windows/arm64/
 	env CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o build/windows/amd64/
 
-image:
+warp_build:
+	$(MAKE) clean
+	$(MAKE) build
 	docker buildx build --progress=plain \
 		--build-arg warp_env=${WARP_ENV} \
 		--platform linux/arm64/v8,linux/amd64 \
