@@ -1,4 +1,4 @@
-module github.com/urnetwork/connect/protocol
+module github.com/urnetwork/connect/protocol/v2025
 
 go 1.24.0
 
