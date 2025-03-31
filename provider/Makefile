@@ -29,4 +29,4 @@ warp_build:
 init:
 	go clean -cache
 	go clean -modcache
-	go get all
+	go get ./...
