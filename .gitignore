@@ -9,3 +9,5 @@ connectctl/connectctl
 tetherctl/*.conf
 api/redoc-static.html
 
+go.sum
+
