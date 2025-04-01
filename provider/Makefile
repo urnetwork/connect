@@ -16,8 +16,7 @@ build:
 	env CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o build/windows/amd64/
 
 warp_build:
-	$(MAKE) clean
-	$(MAKE) build
+	$(MAKE) all
 	docker buildx build --progress=plain \
 		--build-arg warp_env=${WARP_ENV} \
 		--platform linux/arm64/v8,linux/amd64 \
