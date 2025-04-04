@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+go get -t -u ./...
+
 for d in `find . -iname '*_test.go' | xargs -n 1 dirname | sort | uniq | paste -sd ' ' -`; do
     if [[ $1 == "" || $1 == `basename $d` ]]; then
         pushd $d
