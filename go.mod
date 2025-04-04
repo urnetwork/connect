@@ -25,3 +25,5 @@ require (
 )
 
 replace github.com/urnetwork/connect/protocol => ./protocol
+
+retract [v0.0.1, v0.1.13]
