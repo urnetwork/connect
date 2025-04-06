@@ -9,7 +9,7 @@ import (
 
 	"github.com/golang/glog"
 
-	"github.com/urnetwork/connect/protocol"
+	"github.com/urnetwork/connect/protocol/v2025"
 )
 
 type rttWindowItem struct {
