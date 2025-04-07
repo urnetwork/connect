@@ -2795,6 +2795,8 @@ components:
                 referral_code:
                     description: udid
                     type: string
+                total_referrals:
+                    type: integer
 
         TransferStatsResult:
             type: object
