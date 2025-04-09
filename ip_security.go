@@ -122,9 +122,10 @@ func (self *SecurityPolicy) inspect(provideMode protocol.ProvideMode, packet []b
 			case port == 123, port == 500:
 				// apple system ports
 				return true
-			case 6881 <= port && port <= 6889:
+			case 6881 <= port && port <= 6889, port == 6969:
 				// bittorrent
 				return false
+
 			default:
 				return true
 			}
