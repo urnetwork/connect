@@ -11,7 +11,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/oklog/ulid/v2 v2.1.0
 	golang.org/x/crypto v0.37.0
-	golang.org/x/exp v0.0.0-20250305212735-054e65f0b394
+	golang.org/x/exp v0.0.0-20250408133849-7e4ce0ab07d0
 	golang.org/x/net v0.39.0
 	golang.org/x/term v0.31.0
 	google.golang.org/protobuf v1.36.6
@@ -24,4 +24,4 @@ require (
 	golang.org/x/text v0.24.0 // indirect
 )
 
-retract [v0.0.1, v0.1.13]
+retract [v0.0.1, v0.1.14]
