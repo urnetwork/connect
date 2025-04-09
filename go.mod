@@ -19,10 +19,10 @@ require (
 )
 
 require (
-	github.com/golang/protobuf v1.5.4 // indirect
 	golang.org/x/sys v0.32.0 // indirect
 	golang.org/x/text v0.24.0 // indirect
 )
 
 retract [v0.0.1, v1.0.0]
+
 retract v0.1.15 // retract self
