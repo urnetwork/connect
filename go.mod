@@ -25,4 +25,4 @@ require (
 
 retract [v0.0.1, v1.0.0]
 
-retract v0.1.15 // retract self
+retract v0.2.0 // retract self
