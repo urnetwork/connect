@@ -1828,6 +1828,8 @@ components:
                             type: boolean
                         other:
                             type: string
+                star_count: 
+                    type: integer
 
         FeedbackSendResult:
             type: object
