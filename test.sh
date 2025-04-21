@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/env zsh
 
 go get -t -u ./...
 
@@ -9,8 +9,8 @@ for d in `find . -iname '*_test.go' | xargs -n 1 dirname | sort | uniq | paste -
         match="/$(basename $(pwd))/\\S*\.go\|^\\S*_test.go"
         GORACE="log_path=profile/race.out halt_on_error=1" go test -v -race -cpuprofile profile/cpu -memprofile profile/memory -timeout 30m | grep --color=always -e "^" -e "$match"
         # -trace profile/trace -coverprofile profile/cover 
-        if [[ ${PIPESTATUS[0]} != 0 ]]; then
-            exit ${PIPESTATUS[0]}
+        if [[ ${pipestatus[1]} != 0 ]]; then
+            exit ${pipestatus[1]}
         fi
         popd
     fi
