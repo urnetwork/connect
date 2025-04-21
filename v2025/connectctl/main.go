@@ -31,8 +31,8 @@ import (
 
 	"github.com/docopt/docopt-go"
 
-	"github.com/urnetwork/connect"
-	"github.com/urnetwork/connect/protocol"
+	"github.com/urnetwork/connect/v2025"
+	"github.com/urnetwork/connect/v2025/protocol"
 )
 
 const ConnectCtlVersion = "0.0.1"
