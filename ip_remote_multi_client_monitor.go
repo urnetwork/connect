@@ -9,6 +9,7 @@ import (
 
 // events surfaced to the end user
 
+// the callback only received the `providerEvent` diffs. To get the full list of provider events, use `Events`
 type MonitorEventFunction = func(windowExpandEvent *WindowExpandEvent, providerEvents map[Id]*ProviderEvent, reset bool)
 
 type WindowExpandEvent struct {
@@ -90,7 +91,8 @@ func NewRemoteUserNatMultiClientMonitor(settings *RemoteUserNatMultiClientMonito
 		windowExpandEvent: WindowExpandEvent{
 			// EventTime:   time.Now(),
 			// CurrentSize: 0,
-			TargetSize: 0,
+			TargetSize:   0,
+			MinSatisfied: false,
 		},
 		clientIdProviderEvents: map[Id]*ProviderEvent{},
 		monitorEventCallbacks:  NewCallbackList[MonitorEventFunction](),
