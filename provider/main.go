@@ -25,7 +25,9 @@ import (
 const DefaultApiUrl = "https://api.bringyour.com"
 const DefaultConnectUrl = "wss://connect.bringyour.com"
 
-const LocalVersion = "0.0.0"
+// this value is set via the linker, e.g.
+// -ldflags "-X main.Version=$WARP_VERSION-$WARP_VERSION_CODE"
+var Version string
 
 func main() {
 	usage := fmt.Sprintf(
@@ -378,10 +380,10 @@ func (self *Status) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result := &WarpStatusResult{
-		Version:       RequireVersion(),
-		ConfigVersion: RequireConfigVersion(),
-		Status:        "ok",
-		Host:          RequireHost(),
+		Version: RequireVersion(),
+		// ConfigVersion: RequireConfigVersion(),
+		Status: "ok",
+		Host:   RequireHost(),
 	}
 
 	responseJson, err := json.Marshal(result)
@@ -417,12 +419,5 @@ func RequireVersion() string {
 	if version := os.Getenv("WARP_VERSION"); version != "" {
 		return version
 	}
-	return fmt.Sprintf("%s-%s", LocalVersion, RequireHost())
-}
-
-func RequireConfigVersion() string {
-	if version := os.Getenv("WARP_CONFIG_VERSION"); version != "" {
-		return version
-	}
-	return fmt.Sprintf("%s-%s", LocalVersion, RequireHost())
+	return Version
 }
