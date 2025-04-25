@@ -1731,17 +1731,17 @@ func (self *multiClientWindow) statsSampleWeights(weights map[*multiClientChanne
 }
 
 func (self *multiClientWindow) Close() {
-	var removedClients []*multiClientChannel
+	// var removedClients []*multiClientChannel
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		for _, client := range self.destinationClients {
 			client.Close()
-			removedClients = append(removedClients, client)
+			// removedClients = append(removedClients, client)
 		}
 		clear(self.destinationClients)
 	}()
-	self.removeClients(removedClients)
+	// self.removeClients(removedClients)
 }
 
 func (self *multiClientWindow) removeClients(removedClients []*multiClientChannel) {
