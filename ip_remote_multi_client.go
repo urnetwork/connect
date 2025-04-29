@@ -1386,7 +1386,14 @@ func (self *multiClientWindow) resize() {
 					int(math.Ceil(self.settings.WindowExpandScale*float64(len(clients)))),
 				),
 			)
-			collapseWindowSize = int(math.Ceil(self.settings.WindowCollapseScale * float64(len(clients))))
+
+			collapseWindowSize = max(
+				self.settings.WindowSizeMin,
+				max(
+					self.settings.WindowSizeMin,
+					int(math.Ceil(self.settings.WindowCollapseScale*float64(len(clients)))),
+				),
+			)
 		}
 
 		collapseLowestWeighted := func(windowSize int) []*multiClientChannel {
@@ -1430,7 +1437,7 @@ func (self *multiClientWindow) resize() {
 		}
 		if expandWindowSize <= targetWindowSize && len(clients) < expandWindowSize || p2pOnlyWindowSize < self.settings.WindowSizeMinP2pOnly {
 			// collapse badly performing clients before expanding
-			removedClients := collapseLowestWeighted(0)
+			removedClients := collapseLowestWeighted(collapseWindowSize)
 			if 0 < len(removedClients) {
 				glog.Infof("[multi]window optimize -%d ->%d\n", len(removedClients), len(clients))
 				// for _, client := range removedClients {
