@@ -78,8 +78,10 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		WindowEnumerateEmptyTimeout:  60 * time.Second,
 		WindowEnumerateErrorTimeout:  1 * time.Second,
 		WindowExpandScale:            2.0,
-		WindowCollapseScale:          0.5,
+		WindowCollapseScale:          0.8,
 		WindowExpandMaxOvershotScale: 4.0,
+		WindowCollapseBeforeExpand:   false,
+		WindowRevisitTimeout:         2 * time.Minute,
 		StatsWindowDuration:          10 * time.Second,
 		StatsWindowBucketDuration:    1 * time.Second,
 		StatsSampleWeightsCount:      8,
@@ -127,6 +129,8 @@ type MultiClientSettings struct {
 	WindowExpandScale            float64
 	WindowCollapseScale          float64
 	WindowExpandMaxOvershotScale float64
+	WindowCollapseBeforeExpand   bool
+	WindowRevisitTimeout         time.Duration
 	StatsWindowDuration          time.Duration
 	StatsWindowBucketDuration    time.Duration
 	StatsSampleWeightsCount      int
@@ -1231,18 +1235,27 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 	}()
 
 	// continually reset the visited set when there are no more
-	visitedDestinations := map[MultiHopId]bool{}
+	// a destination can be revisited after `WindowRevisitTimeout`
+	visitedDestinations := map[MultiHopId]time.Time{}
 	for {
 		destinationEstimatedBytesPerSecond := map[MultiHopId]ByteCount{}
 		for len(destinationEstimatedBytesPerSecond) == 0 {
 			// exclude destinations that are already in the window
+			windowDestinations := map[MultiHopId]bool{}
 			func() {
 				self.stateLock.Lock()
 				defer self.stateLock.Unlock()
 				for destination, _ := range self.destinationClients {
-					visitedDestinations[destination] = true
+					windowDestinations[destination] = true
+					visitedDestinations[destination] = time.Now()
 				}
 			}()
+			revisitTime := time.Now().Add(-self.settings.WindowRevisitTimeout)
+			for destination, visitedTime := range visitedDestinations {
+				if visitedTime.Before(revisitTime) && !windowDestinations[destination] {
+					delete(visitedDestinations, destination)
+				}
+			}
 			nextDestinationEstimatedBytesPerSecond, err := self.generator.NextDestinations(
 				1,
 				maps.Keys(visitedDestinations),
@@ -1257,7 +1270,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			} else {
 				for destination, estimatedBytesPerSecond := range nextDestinationEstimatedBytesPerSecond {
 					destinationEstimatedBytesPerSecond[destination] = estimatedBytesPerSecond
-					visitedDestinations[destination] = true
+					visitedDestinations[destination] = time.Now()
 				}
 				// remove destinations that are already in the window
 				func() {
@@ -1270,7 +1283,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 
 				if len(destinationEstimatedBytesPerSecond) == 0 {
 					// reset
-					visitedDestinations = map[MultiHopId]bool{}
+					clear(visitedDestinations)
 					glog.Infof("[multi]window enumerate empty timeout.\n")
 					select {
 					case <-self.ctx.Done():
@@ -1386,7 +1399,14 @@ func (self *multiClientWindow) resize() {
 					int(math.Ceil(self.settings.WindowExpandScale*float64(len(clients)))),
 				),
 			)
-			collapseWindowSize = int(math.Ceil(self.settings.WindowCollapseScale * float64(len(clients))))
+
+			collapseWindowSize = max(
+				self.settings.WindowSizeMin,
+				max(
+					self.settings.WindowSizeMin,
+					int(math.Ceil(self.settings.WindowCollapseScale*float64(len(clients)))),
+				),
+			)
 		}
 
 		collapseLowestWeighted := func(windowSize int) []*multiClientChannel {
@@ -1429,14 +1449,16 @@ func (self *multiClientWindow) resize() {
 			}
 		}
 		if expandWindowSize <= targetWindowSize && len(clients) < expandWindowSize || p2pOnlyWindowSize < self.settings.WindowSizeMinP2pOnly {
-			// collapse badly performing clients before expanding
-			removedClients := collapseLowestWeighted(0)
-			if 0 < len(removedClients) {
-				glog.Infof("[multi]window optimize -%d ->%d\n", len(removedClients), len(clients))
-				// for _, client := range removedClients {
-				// 	self.monitor.AddProviderEvent(client.ClientId(), ProviderStateRemoved)
-				// }
-				self.removeClients(removedClients)
+			if self.settings.WindowCollapseBeforeExpand {
+				// collapse badly performing clients before expanding
+				removedClients := collapseLowestWeighted(collapseWindowSize)
+				if 0 < len(removedClients) {
+					glog.Infof("[multi]window optimize -%d ->%d\n", len(removedClients), len(clients))
+					// for _, client := range removedClients {
+					// 	self.monitor.AddProviderEvent(client.ClientId(), ProviderStateRemoved)
+					// }
+					self.removeClients(removedClients)
+				}
 			}
 
 			// expand
