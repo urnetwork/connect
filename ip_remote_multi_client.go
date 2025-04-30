@@ -80,6 +80,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		WindowExpandScale:            2.0,
 		WindowCollapseScale:          0.5,
 		WindowExpandMaxOvershotScale: 4.0,
+		WindowCollapseBeforeExpand:   false,
 		StatsWindowDuration:          10 * time.Second,
 		StatsWindowBucketDuration:    1 * time.Second,
 		StatsSampleWeightsCount:      8,
@@ -127,6 +128,7 @@ type MultiClientSettings struct {
 	WindowExpandScale            float64
 	WindowCollapseScale          float64
 	WindowExpandMaxOvershotScale float64
+	WindowCollapseBeforeExpand   bool
 	StatsWindowDuration          time.Duration
 	StatsWindowBucketDuration    time.Duration
 	StatsSampleWeightsCount      int
@@ -1436,14 +1438,16 @@ func (self *multiClientWindow) resize() {
 			}
 		}
 		if expandWindowSize <= targetWindowSize && len(clients) < expandWindowSize || p2pOnlyWindowSize < self.settings.WindowSizeMinP2pOnly {
-			// collapse badly performing clients before expanding
-			removedClients := collapseLowestWeighted(collapseWindowSize)
-			if 0 < len(removedClients) {
-				glog.Infof("[multi]window optimize -%d ->%d\n", len(removedClients), len(clients))
-				// for _, client := range removedClients {
-				// 	self.monitor.AddProviderEvent(client.ClientId(), ProviderStateRemoved)
-				// }
-				self.removeClients(removedClients)
+			if self.settings.WindowCollapseBeforeExpand {
+				// collapse badly performing clients before expanding
+				removedClients := collapseLowestWeighted(collapseWindowSize)
+				if 0 < len(removedClients) {
+					glog.Infof("[multi]window optimize -%d ->%d\n", len(removedClients), len(clients))
+					// for _, client := range removedClients {
+					// 	self.monitor.AddProviderEvent(client.ClientId(), ProviderStateRemoved)
+					// }
+					self.removeClients(removedClients)
+				}
 			}
 
 			// expand
