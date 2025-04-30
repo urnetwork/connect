@@ -78,7 +78,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		WindowEnumerateEmptyTimeout:  60 * time.Second,
 		WindowEnumerateErrorTimeout:  1 * time.Second,
 		WindowExpandScale:            2.0,
-		WindowCollapseScale:          0.5,
+		WindowCollapseScale:          0.8,
 		WindowExpandMaxOvershotScale: 4.0,
 		WindowCollapseBeforeExpand:   false,
 		WindowRevisitTimeout:         2 * time.Minute,
