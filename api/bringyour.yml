@@ -1376,6 +1376,8 @@ components:
                     enum:
                         - apple
                         - google
+                wallet_auth:
+                    $ref: "#/components/schemas/WalletAuthArgs"
 
         AuthLoginResult:
             type: object
@@ -1409,6 +1411,8 @@ components:
                     properties:
                         by_jwt:
                             type: string
+                wallet_auth:
+                    $ref: "#/components/schemas/WalletAuthArgs"
 
         AuthLoginWithPasswordArgs:
             type: object
@@ -1539,6 +1543,8 @@ components:
                 terms:
                     description: user consent to accept terms of service
                     type: boolean
+                wallet_auth:
+                    $ref: "#/components/schemas/WalletAuthArgs"
 
         NetworkCreateResult:
             type: object
@@ -2807,3 +2813,20 @@ components:
                     type: integer
                 unpaid_bytes_provided:
                     type: integer
+
+        WalletAuthArgs:
+            type: object
+            properties:
+                wallet_address:
+                    description: The user's wallet address
+                    type: string
+                wallet_message:
+                    description: The signed message
+                    type: string
+                wallet_signature:
+                    type: string
+                blockchain:
+                    type: string
+                    enum:
+                        - solana
+                
