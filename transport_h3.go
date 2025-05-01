@@ -1,51 +1,25 @@
 package connect
 
-import (
-	"bytes"
-	"context"
-	"fmt"
-	"net"
-	"time"
+// http3 platform transport
+// versus the default platform transport, h3 is:
+// - more cpu efficient.
+//   The quic stream does not need to mask/unmask each byte before TLS.
+// - faster to connect.
+//   The quic stream uses 0rtt connect when possible to speed up the initial connection.
+// - better throughput on poort networks.
+//   quic optimizes congestion control to better handle poor network conditions.
+// However, h3 is not available in all locations due to dpi/filtering.
+// When available, it takes precedence over the default transport.
 
-	"github.com/gorilla/websocket"
+// FIXME merge h3 into the normal platform transport:
+// - connect to both h1 and h3 in parallel
+// - both share one route and internal mode decides which transport is used to send.
+// - both transports receive .
+//   the non primary transport should send a drain message to the server to remove weight for the transport
+// - if a transport has not received a message in N seconds and is not the primary transport,
+//   close the transport until there is no primary again
 
-	"github.com/golang/glog"
-
-	"github.com/urnetwork/connect/protocol"
-)
-
-const TransportBufferSize = 1
-
-// note that it is possible to have multiple transports for the same client destination
-// e.g. platform, p2p, and a bunch of extenders
-
-// extenders are identified and credited with the platform by ip address
-// they forward to a special port, 8443, that whitelists their ip without rate limiting
-// when an extender gets an http message from a client, it always connects tcp to connect.bringyour.com:8443
-// appends the proxy protocol headers, and then forwards the bytes from the client
-// https://docs.nginx.com/nginx/admin-guide/load-balancer/using-proxy-protocol/
-// rate limit using $proxy_protocol_addr https://www.nginx.com/blog/rate-limiting-nginx/
-// add the source ip as the X-Extender header
-
-type ClientAuth struct {
-	ByJwt string
-	// ClientId Id
-	InstanceId Id
-	AppVersion string
-}
-
-func (self *ClientAuth) ClientId() (Id, error) {
-	byJwt, err := ParseByJwtUnverified(self.ByJwt)
-	if err != nil {
-		return Id{}, err
-	}
-	return byJwt.ClientId, nil
-}
-
-// (ctx, network, address)
-// type DialContextFunc func(ctx context.Context, network string, address string) (net.Conn, error)
-
-type PlatformTransportSettings struct {
+type H3PlatformTransportSettings struct {
 	HttpConnectTimeout time.Duration
 	WsHandshakeTimeout time.Duration
 	AuthTimeout        time.Duration
@@ -56,9 +30,9 @@ type PlatformTransportSettings struct {
 	TransportGenerator func() (sendTransport Transport, receiveTransport Transport)
 }
 
-func DefaultPlatformTransportSettings() *PlatformTransportSettings {
+func H3DefaultPlatformTransportSettings() *H3PlatformTransportSettings {
 	pingTimeout := 1 * time.Second
-	return &PlatformTransportSettings{
+	return &H3PlatformTransportSettings{
 		HttpConnectTimeout: 2 * time.Second,
 		WsHandshakeTimeout: 2 * time.Second,
 		AuthTimeout:        2 * time.Second,
@@ -69,46 +43,33 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 	}
 }
 
-type PlatformTransport struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-
-	clientStrategy *ClientStrategy
-	routeManager   *RouteManager
-
-	platformUrl string
-	auth        *ClientAuth
-
-	settings *PlatformTransportSettings
-}
-
-func NewPlatformTransportWithDefaults(
+func NewH3PlatformTransportWithDefaults(
 	ctx context.Context,
 	clientStrategy *ClientStrategy,
 	routeManager *RouteManager,
 	platformUrl string,
 	auth *ClientAuth,
-) *PlatformTransport {
-	return NewPlatformTransport(
+) *H3PlatformTransport {
+	return NewH3PlatformTransport(
 		ctx,
 		clientStrategy,
 		routeManager,
 		platformUrl,
 		auth,
-		DefaultPlatformTransportSettings(),
+		DefaultH3PlatformTransportSettings(),
 	)
 }
 
-func NewPlatformTransport(
+func NewH3PlatformTransport(
 	ctx context.Context,
 	clientStrategy *ClientStrategy,
 	routeManager *RouteManager,
 	platformUrl string,
 	auth *ClientAuth,
 	settings *PlatformTransportSettings,
-) *PlatformTransport {
+) *H3PlatformTransport {
 	cancelCtx, cancel := context.WithCancel(ctx)
-	transport := &PlatformTransport{
+	transport := &H3PlatformTransport{
 		ctx:            cancelCtx,
 		cancel:         cancel,
 		clientStrategy: clientStrategy,
@@ -121,7 +82,7 @@ func NewPlatformTransport(
 	return transport
 }
 
-func (self *PlatformTransport) run() {
+func (self *H3PlatformTransport) run() {
 	// connect and update route manager for this transport
 	defer self.cancel()
 
@@ -142,8 +103,47 @@ func (self *PlatformTransport) run() {
 
 	for {
 		reconnect := NewReconnect(self.settings.ReconnectTimeout)
-		connect := func() (*websocket.Conn, error) {
-			ws, _, err := self.clientStrategy.WsDialContext(self.ctx, self.platformUrl, nil)
+		connect := func() (*http3.Transport, *http3.RequestStream, error) {
+
+			quicConfig := &quic.Config{
+				HandshakeIdleTimeout: connectSettings.ConnectTimeout + connectSettings.TlsTimeout + connectSettings.HandshakeTimeout,
+				Allow0RTT:            true,
+				KeepAlivePeriod:      X,
+				MaxIdleTimeout:       X,
+				// FIXME other settigns?
+
+				InitialStreamReceiveWindow:     initialStreamReceiveWindow,
+				MaxStreamReceiveWindow:         maxStreamReceiveWindow,
+				InitialConnectionReceiveWindow: initialConnectionReceiveWindow,
+				MaxConnectionReceiveWindow:     maxConnectionReceiveWindow,
+				AllowConnectionWindowIncrease:  config.AllowConnectionWindowIncrease,
+				EnableDatagrams:                config.EnableDatagrams,
+				InitialPacketSize:              initialPacketSize,
+			}
+
+			tlsConfig := &tls.Config{
+				ServerName:         extenderConfig.Profile.ServerName,
+				InsecureSkipVerify: true,
+				// require 1.3 to mask self-signed certs
+				MinVersion: tls.VersionTLS13,
+			}
+
+			quicConfig := &quic.Config{
+				HandshakeIdleTimeout: connectSettings.ConnectTimeout + connectSettings.TlsTimeout + connectSettings.HandshakeTimeout,
+			}
+			quicConn, err := quic.DialAddr(ctx, authority, tlsConfig, quicConfig)
+			if err != nil {
+				return nil, err
+			}
+
+			h3Transport := &http3.Transport{
+				TLSClientConfig: tlsConfig,
+				QUICConfig:      quicConfig,
+				EnableDatagrams: quicConfig.EnableDatagrams,
+			}
+
+			conn := h3Transport.NewClientConn(quicConn)
+			stream, err := conn.OpenRequestStream()
 			if err != nil {
 				return nil, err
 			}
@@ -151,7 +151,7 @@ func (self *PlatformTransport) run() {
 			success := false
 			defer func() {
 				if !success {
-					ws.Close()
+					h3Transport.Close()
 				}
 			}()
 
@@ -177,6 +177,12 @@ func (self *PlatformTransport) run() {
 			success = true
 			return ws, nil
 		}
+
+		// quic
+
+		transport
+
+		t.NewClientConnection
 
 		var ws *websocket.Conn
 		var err error
@@ -211,8 +217,8 @@ func (self *PlatformTransport) run() {
 			if self.settings.TransportGenerator != nil {
 				sendTransport, receiveTransport = self.settings.TransportGenerator()
 			} else {
-				sendTransport = NewSendGatewayTransport()
-				receiveTransport = NewReceiveGatewayTransport()
+				sendTransport = NewPrioritySendGatewayTransport(0, 1.0)
+				receiveTransport = NewReceiveGatewayTransport(0, 1.0)
 			}
 
 			self.routeManager.UpdateTransport(sendTransport, []Route{send})
@@ -315,6 +321,48 @@ func (self *PlatformTransport) run() {
 	}
 }
 
-func (self *PlatformTransport) Close() {
+func (self *H3PlatformTransport) Close() {
 	self.cancel()
 }
+
+// type streamConn struct {
+// 	stream quic.Stream
+// }
+
+// func newStreamConn(stream quic.Stream) *streamConn {
+// 	return &streamConn{
+// 		stream: stream,
+// 	}
+// }
+
+// func (self *streamConn) Read(b []byte) (int, error) {
+// 	return self.stream.Read(b)
+// }
+
+// func (self *streamConn) Write(b []byte) (int, error) {
+// 	return self.stream.Write(b)
+// }
+
+// func (self *streamConn) Close() error {
+// 	return self.stream.Close()
+// }
+
+// func (self *streamConn) LocalAddr() net.Addr {
+// 	return nil
+// }
+
+// func (self *streamConn) RemoteAddr() net.Addr {
+// 	return nil
+// }
+
+// func (self *streamConn) SetDeadline(t time.Time) error {
+// 	return self.stream.SetDeadline(t)
+// }
+
+// func (self *streamConn) SetReadDeadline(t time.Time) error {
+// 	return self.stream.SetReadDeadline(t)
+// }
+
+// func (self *streamConn) SetWriteDeadline(t time.Time) error {
+// 	return self.stream.SetWriteDeadline(t)
+// }

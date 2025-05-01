@@ -807,46 +807,6 @@ func NewRouteStats() *RouteStats {
 }
 
 // conforms to `Transport`
-type sendGatewayTransport struct {
-	transportId Id
-}
-
-func NewSendGatewayTransport() *sendGatewayTransport {
-	return &sendGatewayTransport{
-		transportId: NewId(),
-	}
-}
-
-func (self *sendGatewayTransport) TransportId() Id {
-	return self.transportId
-}
-
-func (self *sendGatewayTransport) Priority() int {
-	return 100
-}
-
-func (self *sendGatewayTransport) CanEvalRouteWeight(stats *RouteStats, remainingStats map[Transport]*RouteStats) bool {
-	return true
-}
-
-func (self *sendGatewayTransport) RouteWeight(stats *RouteStats, remainingStats map[Transport]*RouteStats) float32 {
-	// uniform weight
-	return 1.0 / float32(1+len(remainingStats))
-}
-
-func (self *sendGatewayTransport) MatchesSend(destination TransferPath) bool {
-	return true
-}
-
-func (self *sendGatewayTransport) MatchesReceive(destination TransferPath) bool {
-	return false
-}
-
-func (self *sendGatewayTransport) Downgrade(source TransferPath) {
-	// nothing to downgrade
-}
-
-// conforms to `Transport`
 type sendClientTransport struct {
 	transportId  Id
 	complement   bool
@@ -899,6 +859,46 @@ func (self *sendClientTransport) Downgrade(source TransferPath) {
 }
 
 // conforms to `Transport`
+type sendGatewayTransport struct {
+	transportId Id
+}
+
+func NewSendGatewayTransport() *sendGatewayTransport {
+	return &sendGatewayTransport{
+		transportId: NewId(),
+	}
+}
+
+func (self *sendGatewayTransport) TransportId() Id {
+	return self.transportId
+}
+
+func (self *sendGatewayTransport) Priority() int {
+	return 100
+}
+
+func (self *sendGatewayTransport) CanEvalRouteWeight(stats *RouteStats, remainingStats map[Transport]*RouteStats) bool {
+	return true
+}
+
+func (self *sendGatewayTransport) RouteWeight(stats *RouteStats, remainingStats map[Transport]*RouteStats) float32 {
+	// uniform weight
+	return 1.0 / float32(1+len(remainingStats))
+}
+
+func (self *sendGatewayTransport) MatchesSend(destination TransferPath) bool {
+	return true
+}
+
+func (self *sendGatewayTransport) MatchesReceive(destination TransferPath) bool {
+	return false
+}
+
+func (self *sendGatewayTransport) Downgrade(source TransferPath) {
+	// nothing to downgrade
+}
+
+// conforms to `Transport`
 type receiveGatewayTransport struct {
 	transportId Id
 }
@@ -935,5 +935,91 @@ func (self *receiveGatewayTransport) MatchesReceive(destination TransferPath) bo
 }
 
 func (self *receiveGatewayTransport) Downgrade(source TransferPath) {
+	// nothing to downgrade
+}
+
+// conforms to `Transport`
+type prioritySendGatewayTransport struct {
+	transportId Id
+	priority    int
+	weight      float32
+}
+
+func NewPrioritySendGatewayTransport(priority int, weight float32) *prioritySendGatewayTransport {
+	return &prioritySendGatewayTransport{
+		transportId: NewId(),
+		priority:    priority,
+		weight:      weight,
+	}
+}
+
+func (self *prioritySendGatewayTransport) TransportId() Id {
+	return self.transportId
+}
+
+func (self *prioritySendGatewayTransport) Priority() int {
+	return self.priority
+}
+
+func (self *prioritySendGatewayTransport) CanEvalRouteWeight(stats *RouteStats, remainingStats map[Transport]*RouteStats) bool {
+	return true
+}
+
+func (self *prioritySendGatewayTransport) RouteWeight(stats *RouteStats, remainingStats map[Transport]*RouteStats) float32 {
+	return self.weight
+}
+
+func (self *prioritySendGatewayTransport) MatchesSend(destination TransferPath) bool {
+	return true
+}
+
+func (self *prioritySendGatewayTransport) MatchesReceive(destination TransferPath) bool {
+	return false
+}
+
+func (self *prioritySendGatewayTransport) Downgrade(source TransferPath) {
+	// nothing to downgrade
+}
+
+// conforms to `Transport`
+type priorityReceiveGatewayTransport struct {
+	transportId Id
+	priority    int
+	weight      float32
+}
+
+func NewPriorityReceiveGatewayTransport(priority int, weight float32) *priorityReceiveGatewayTransport {
+	return &receiveGatewayTransport{
+		transportId: NewId(),
+		priority:    priority,
+		weight:      weight,
+	}
+}
+
+func (self *priorityReceiveGatewayTransport) TransportId() Id {
+	return self.transportId
+}
+
+func (self *priorityReceiveGatewayTransport) Priority() int {
+	return self.priority
+}
+
+func (self *priorityReceiveGatewayTransport) CanEvalRouteWeight(stats *RouteStats, remainingStats map[Transport]*RouteStats) bool {
+	return true
+}
+
+func (self *priorityReceiveGatewayTransport) RouteWeight(stats *RouteStats, remainingStats map[Transport]*RouteStats) float32 {
+	return self.weight
+}
+
+func (self *priorityReceiveGatewayTransport) MatchesSend(destination TransferPath) bool {
+	return false
+}
+
+func (self *priorityReceiveGatewayTransport) MatchesReceive(destination TransferPath) bool {
+	return true
+}
+
+func (self *priorityReceiveGatewayTransport) Downgrade(source TransferPath) {
 	// nothing to downgrade
 }
