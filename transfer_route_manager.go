@@ -22,6 +22,11 @@ import (
 // routes are expected to have flow control and error detection and rejection
 type Route = chan []byte
 
+const TransportMaxPriority = 0
+const TransportMinPriority = 100
+const TransportMaxWeight = float32(1)
+const TransportMinWeight = float32(0)
+
 // each transport must have a unique local id
 // This solves an issue where some transports can be implemented with zero state.
 // Zero state transports makes it ambiguous whether the transport pointer can be used as a key.
@@ -31,6 +36,10 @@ type Transport interface {
 
 	// lower priority takes precedence
 	Priority() int
+
+	// the intrinsic weight of the transport, [0, 1]
+	// if the transport has no preference, use 0
+	Weight() float32
 
 	CanEvalRouteWeight(stats *RouteStats, remainingStats map[Transport]*RouteStats) bool
 	// returns the fraction of route weight that should be allocated to this transport
@@ -837,6 +846,10 @@ func (self *sendClientTransport) Priority() int {
 	return 100
 }
 
+func (self *sendClientTransport) Weight() float32 {
+	return 0
+}
+
 func (self *sendClientTransport) CanEvalRouteWeight(stats *RouteStats, remainingStats map[Transport]*RouteStats) bool {
 	return true
 }
@@ -877,6 +890,10 @@ func (self *sendGatewayTransport) Priority() int {
 	return 100
 }
 
+func (self *sendGatewayTransport) Weight() float32 {
+	return 0
+}
+
 func (self *sendGatewayTransport) CanEvalRouteWeight(stats *RouteStats, remainingStats map[Transport]*RouteStats) bool {
 	return true
 }
@@ -915,6 +932,10 @@ func (self *receiveGatewayTransport) TransportId() Id {
 
 func (self *receiveGatewayTransport) Priority() int {
 	return 100
+}
+
+func (self *receiveGatewayTransport) Weight() float32 {
+	return 0
 }
 
 func (self *receiveGatewayTransport) CanEvalRouteWeight(stats *RouteStats, remainingStats map[Transport]*RouteStats) bool {
@@ -961,12 +982,24 @@ func (self *prioritySendGatewayTransport) Priority() int {
 	return self.priority
 }
 
+func (self *prioritySendGatewayTransport) Weight() float32 {
+	return self.weight
+}
+
 func (self *prioritySendGatewayTransport) CanEvalRouteWeight(stats *RouteStats, remainingStats map[Transport]*RouteStats) bool {
 	return true
 }
 
 func (self *prioritySendGatewayTransport) RouteWeight(stats *RouteStats, remainingStats map[Transport]*RouteStats) float32 {
-	return self.weight
+	netWeight := self.weight
+	for t, _ := range remainingStats {
+		netWeight += t.Weight()
+	}
+	if 0 < netWeight {
+		return self.weight / netWeight
+	} else {
+		return 1.0 / float32(1+len(remainingStats))
+	}
 }
 
 func (self *prioritySendGatewayTransport) MatchesSend(destination TransferPath) bool {
@@ -989,7 +1022,7 @@ type priorityReceiveGatewayTransport struct {
 }
 
 func NewPriorityReceiveGatewayTransport(priority int, weight float32) *priorityReceiveGatewayTransport {
-	return &receiveGatewayTransport{
+	return &priorityReceiveGatewayTransport{
 		transportId: NewId(),
 		priority:    priority,
 		weight:      weight,
@@ -1004,12 +1037,24 @@ func (self *priorityReceiveGatewayTransport) Priority() int {
 	return self.priority
 }
 
+func (self *priorityReceiveGatewayTransport) Weight() float32 {
+	return self.weight
+}
+
 func (self *priorityReceiveGatewayTransport) CanEvalRouteWeight(stats *RouteStats, remainingStats map[Transport]*RouteStats) bool {
 	return true
 }
 
 func (self *priorityReceiveGatewayTransport) RouteWeight(stats *RouteStats, remainingStats map[Transport]*RouteStats) float32 {
-	return self.weight
+	netWeight := self.weight
+	for t, _ := range remainingStats {
+		netWeight += t.Weight()
+	}
+	if 0 < netWeight {
+		return self.weight / netWeight
+	} else {
+		return 1.0 / float32(1+len(remainingStats))
+	}
 }
 
 func (self *priorityReceiveGatewayTransport) MatchesSend(destination TransferPath) bool {
