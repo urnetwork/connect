@@ -65,7 +65,7 @@ func (self *SecurityPolicy) Stats() *securityPolicyStats {
 
 func (self *SecurityPolicy) Inspect(provideMode protocol.ProvideMode, packet []byte) (*IpPath, SecurityPolicyResult, error) {
 	ipPath, result, err := self.inspect(provideMode, packet)
-	if err == nil {
+	if ipPath != nil {
 		self.stats.Add(ipPath, result, 1)
 	}
 	return ipPath, result, err
@@ -75,67 +75,71 @@ func (self *SecurityPolicy) inspect(provideMode protocol.ProvideMode, packet []b
 	ipPath, err := ParseIpPath(packet)
 	if err != nil {
 		// bad ip packet
-		return ipPath, SecurityPolicyResultDrop, err
+		return nil, SecurityPolicyResultDrop, err
 	}
 
-	if protocol.ProvideMode_Public <= provideMode {
-		// apply public rules:
-		// - only public unicast network destinations
-		// - block insecure or known unencrypted traffic
+	// if protocol.ProvideMode_Network == provideMode {
+	// 	return ipPath, SecurityPolicyResultAllow, nil
+	// } else {
 
-		if !isPublicUnicast(ipPath.DestinationIp) {
-			return ipPath, SecurityPolicyResultIncident, nil
-		}
+	// apply public rules:
+	// - only public unicast network destinations
+	// - block insecure or known unencrypted traffic
 
-		// block insecure or unencrypted traffic
-		// block known destructive protocols
-		// - allow secure web and dns traffic (443)
-		// - allow email protocols (465, 993, 995)
-		// - allow dns over tls (853)
-		// - allow user ports (>=1024)
-		// - allow ports used by apply system: ntp (123), wifi calling (500)
-		//   see https://support.apple.com/en-us/103229
-		// - block bittorrent (6881-6889)
-		// - FIXME temporarily enabling 53 and 80 until inline protocol translation is implemented
-		// TODO in the future, allow a control message to dynamically adjust the security rules
-		allow := func() bool {
-			switch port := ipPath.DestinationPort; {
-			case port == 53:
-				// dns
-				// FIXME for now we allow plain dns. TODO to upgrade the protocol to doh inline.
-				return true
-			case port == 80:
-				// http
-				// FIXME for now we allow http. It's important for some radio streaming. TODO to upgrade the protcol to https inline.
-				return true
-			case port == 443:
-				// https
-				return true
-			case port == 465, port == 993, port == 995:
-				// email
-				return true
-			case port == 853:
-				// dns over tls
-				return true
-			case port < 1024:
-				return false
-			case port == 123, port == 500:
-				// apple system ports
-				return true
-			case 6881 <= port && port <= 6889, port == 6969:
-				// bittorrent
-				return false
-
-			default:
-				return true
-			}
-		}
-		if !allow() {
-			return ipPath, SecurityPolicyResultDrop, nil
-		}
+	if !isPublicUnicast(ipPath.DestinationIp) {
+		return ipPath, SecurityPolicyResultIncident, nil
 	}
 
-	return ipPath, SecurityPolicyResultAllow, nil
+	// block insecure or unencrypted traffic
+	// block known destructive protocols
+	// - allow secure web and dns traffic (443)
+	// - allow email protocols (465, 993, 995)
+	// - allow dns over tls (853)
+	// - allow user ports (>=1024)
+	// - allow ports used by apply system: ntp (123), wifi calling (500)
+	//   see https://support.apple.com/en-us/103229
+	// - block bittorrent (6881-6889)
+	// - FIXME temporarily enabling 53 and 80 until inline protocol translation is implemented
+	// TODO in the future, allow a control message to dynamically adjust the security rules
+	allow := func() bool {
+		switch port := ipPath.DestinationPort; {
+		case port == 53:
+			// dns
+			// FIXME for now we allow plain dns. TODO to upgrade the protocol to doh inline.
+			return true
+		case port == 80:
+			// http
+			// FIXME for now we allow http. It's important for some radio streaming. TODO to upgrade the protcol to https inline.
+			return true
+		case port == 443:
+			// https
+			return true
+		case port == 465, port == 993, port == 995:
+			// email
+			return true
+		case port == 853:
+			// dns over tls
+			return true
+		case port == 123, port == 500:
+			// apple system ports
+			return true
+		case 6881 <= port && port <= 6889, port == 6969:
+			// bittorrent
+			return false
+		case port < 1024:
+			return false
+		case 10000 <= port:
+			// rtp and p2p
+			// FIXME turn this off when we have better deep packet inspection
+			return false
+		default:
+			return true
+		}
+	}
+	if allow() {
+		return ipPath, SecurityPolicyResultAllow, nil
+	}
+	return ipPath, SecurityPolicyResultDrop, nil
 }
 
 func isPublicUnicast(ip net.IP) bool {
