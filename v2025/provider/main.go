@@ -18,8 +18,8 @@ import (
 
 	gojwt "github.com/golang-jwt/jwt/v5"
 
-	"github.com/urnetwork/connect"
-	"github.com/urnetwork/connect/protocol"
+	"github.com/urnetwork/connect/v2025"
+	"github.com/urnetwork/connect/v2025/protocol"
 )
 
 const DefaultApiUrl = "https://api.bringyour.com"
