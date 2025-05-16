@@ -1592,6 +1592,8 @@ components:
                     type: string
                 network_name:
                     type: string
+                wallet_auth:
+                    $ref: "#/components/schemas/WalletAuthArgs"
 
         UpgradeGuestResult:
             type: object
