@@ -41,12 +41,34 @@ import (
 // However, h3 is not available in all locations due to dpi/filtering.
 // When available, it takes precedence over the default transport.
 
+// packet translation mode gives options for how udp packets are formed on the wire
+// We include options here that are known to help with availability
+
+// When packet translation is set, the upgrade mode must be h3 only
+
 type TransportMode string
 
+// in order of increasing preference
 const (
-	H1 TransportMode = "h1"
-	H3 TransportMode = "h3"
+	// start all modes in skewed parallel and choose the best one
+	TransportModeAuto UpgradeMode = "auto"
+	TransportModeH3DnsPump UpgradeMode = "h3dnspump"
+	TransportModeH3Dns UpgradeMode = "h3dns"
+	TransportModeH1 UpgradeMode = "h1"
+	TransportModeH3 UpgradeMode = "h3"
 )
+
+type PacketTranslationMode string
+
+const (
+	PacketTranslationModeNone PacketTranslationMode = ""
+	// form packets to look like dns requests/responses on the wire
+	PacketTranslationModeDns PacketTranslationMode = "dns"
+	// uses a constant amount of upload bandwidth to establish a reply pump via dns zones
+	PacketTranslationModeDnsPump PacketTranslationMode = "dnspump"
+	PacketTranslationModeDecode53 PacketTranslationMode = "decode53"
+)
+
 
 type ClientAuth struct {
 	ByJwt string
@@ -180,6 +202,13 @@ func (self *PlatformTransport) modeAvailable(mode TransportMode) (bool, chan str
 	return self.availableModes[mode], self.modeMonitor.NotifyChannel()
 }
 
+func (self *PlatformTransport) modesAvailable() (map[TransportMode]bool, chan struct{}) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	return maps.Clone(self.availableModes), self.modeMonitor.NotifyChannel()
+}
+
 func (self *PlatformTransport) setActiveMode(mode TransportMode) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -197,15 +226,46 @@ func (self *PlatformTransport) activeMode() (TransportMode, chan struct{}) {
 func (self *PlatformTransport) run() {
 	defer self.cancel()
 
-	go self.runH1()
-	go self.runH3()
+	switch targetMode {
+	case auto:
+		go self.runH3(0)
+		go self.runH1(delay)
+		go self.runH3(dns,delay*2)
+		go self.runH3(dnspump,delay*3)
+	case h3:
+		go self.runH3(0)
+	case h1:
+		go self.runH1(0)
+	case dns:
+		go self.runH3(dns, 0)
+	case dnspump:
+		go self.runH3(dnspump, 0)
+	}
 
 	for {
-		h3, notify := self.modeAvailable(H3)
-		if h3 {
-			self.setActiveMode(H3)
+		available, notify := self.modesAvailable()
+
+		preferences := map[TransportMode]int{
+			TransportModeAuto: 0,
+			TransportModeH3DnsPump: 1,
+			TransportModeH3Dns: 2,
+			TransportModeH1: 3,
+			TransportModeH3: 4,
+		}
+		// descending preference
+		orderedModes := maps.Keys(preferences)
+		slices.SortFunc(orderedModes, func(a TransportMode, b TransportMode)(int) {
+			return b - a
+		})
+		if 0 < len(orderedModes) {
+			for _, mode := range orderedModes {
+				if available[mode] {
+					self.setActiveMode(mode)
+					break
+				}
+			}
 		} else {
-			self.setActiveMode(H1)
+			self.setActiveMode(auto)
 		}
 
 		select {
@@ -216,7 +276,21 @@ func (self *PlatformTransport) run() {
 	}
 }
 
-func (self *PlatformTransport) runH1() {
+// returns true is other is better than current
+func isBetterMode(current TransportMode, other TransportMode) bool {
+	preferences := map[TransportMode]int{
+		TransportModeAuto: 0,
+		TransportModeH3DnsPump: 1,
+		TransportModeH3Dns: 2,
+		TransportModeH1: 3,
+		TransportModeH3: 4,
+	}
+
+	return preference[current] < preference[other]
+}
+
+
+func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 	// connect and update route manager for this transport
 	defer self.cancel()
 
@@ -231,18 +305,20 @@ func (self *PlatformTransport) runH1() {
 	}
 
 	for {
-		// wait until we are back in h1 mode
+		// wait until we are back in h1 or auto mode
 		func() {
 			for {
 				mode, notify := self.activeMode()
-				if mode == H1 {
+				if isBetterMode(h1, mode) {
+					default:
+						select {
+						case <-self.ctx.Done():
+							return
+						case <-notify:
+						}
+					}
+				} else {
 					return
-				}
-
-				select {
-				case <-self.ctx.Done():
-					return
-				case <-notify:
 				}
 			}
 		}()
@@ -439,7 +515,7 @@ func (self *PlatformTransport) runH1() {
 	}
 }
 
-func (self *PlatformTransport) runH3() {
+func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.Duration) {
 	// connect and update route manager for this transport
 	defer self.cancel()
 
@@ -454,13 +530,74 @@ func (self *PlatformTransport) runH3() {
 		return
 	}
 
+	if 0 < self.settings.H1InitialDelay {
+		select {
+		case <-self.ctx.Done():
+			return
+		case <-time.After(self.settings.H1InitialDelay):
+		}
+	}
+
 	for {
+		// wait until we are back in the specific pt mode or auto mode
+		func() {
+			for {
+				mode, notify := self.activeMode()
+				if isBetterMode(ptMode, mode) {
+					default:
+						select {
+						case <-self.ctx.Done():
+							return
+						case <-notify:
+						}
+					}
+				} else {
+					return
+				}
+			}
+		}()
+
 		reconnect := NewReconnect(self.settings.ReconnectTimeout)
 		connect := func() (quic.Stream, error) {
 			quicConfig := &quic.Config{
 				HandshakeIdleTimeout: self.settings.QuicConnectTimeout + self.settings.QuicHandshakeTimeout,
 			}
-			conn, err := quic.DialAddr(self.ctx, self.platformUrl, self.settings.QuicTlsConfig, quicConfig)
+
+			var packetConn net.PacketConn
+
+			udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+			if err != nil {
+				return nil, err
+			}
+			// udpAddr, err := net.ResolveUDPAddr("udp", addr)
+			// if err != nil {
+			// 	return nil, err
+			// }
+
+			var udpAddr net.UDPAddr
+			switch ptMode {
+			case H3DNS:
+				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", self.platformUrl, 53))
+				packetConn = NewPacketTranslation(self.ctx, PacketTranslationModeDns, udpConn)
+			case H3DNSPUMP:
+				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", self.platformUrl, 53))
+				packetConn = NewPacketTranslation(self.ctx, PacketTranslationModeDnsPump, udpConn)
+			default:
+				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", self.platformUrl, 443))
+				packetConn = udpConn
+			}
+
+			
+			transport := &Transport{
+				Conn:        c,
+				createdConn: true,
+				isSingleUse: true,
+			}
+
+			// enable 0rtt if possible
+			conn, err := transport.DialEarly(ctx, udpAddr, addr, tlsConf, conf, false)
+
+			// conn, err := quic.Dial(self.ctx, packetConn, packetConn.ConnectedAddr(), self.settings.QuicTlsConfig, quicConfig)
 			if err != nil {
 				return nil, err
 			}
@@ -515,8 +652,8 @@ func (self *PlatformTransport) runH3() {
 		c := func() {
 			defer stream.Close()
 
-			self.setModeAvailable(H3, true)
-			defer self.setModeAvailable(H3, false)
+			self.setModeAvailable(ptMode, true)
+			defer self.setModeAvailable(ptMode, false)
 
 			handleCtx, handleCancel := context.WithCancel(self.ctx)
 			defer handleCancel()
@@ -544,6 +681,34 @@ func (self *PlatformTransport) runH3() {
 
 				// note `send` is not closed. This channel is left open.
 				// it used to be closed after a delay, but it is not needed to close it.
+			}()
+
+			go func() {
+				defer handleCancel()
+
+				for {
+					mode, notify := self.activeMode()
+					if mode != ptMode {
+						startReadCount := readCounter.Load()
+						startWriteCount := writeCounter.Load()
+						select {
+						case <-handleCtx.Done():
+							return
+						case <-time.After(self.settings.InactiveDrainTimeout):
+							// no activity after cool down, shut down this transport
+							if readCounter.Load() == startReadCount && writeCounter.Load() == startWriteCount {
+								handleCancel()
+							}
+						case <-notify:
+						}
+					} else {
+						select {
+						case <-handleCtx.Done():
+							return
+						case <-notify:
+						}
+					}
+				}
 			}()
 
 			go func() {
