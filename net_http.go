@@ -213,6 +213,11 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 			dialers[dialer3] = true
 		}
 	}
+	if settings.EnableDns {
+		// FIXME add a dial tls context where the quic stream is the connection
+		// FIXME add a version of the api into the connect server, and when the header is for the api hostnames, run the connection through the api handler
+		// FIXME one dns, one dns pump lower prio
+	}
 
 	return &ClientStrategy{
 		ctx:                 ctx,

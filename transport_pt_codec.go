@@ -3,8 +3,8 @@ package connect
 import (
 	"encoding/base32"
 	"encoding/base64"
-	"fmt"
-	mathrand "math/rand"
+	// "fmt"
+	// mathrand "math/rand"
 	"slices"
 
 	// "golang.org/x/net/idna"
@@ -243,7 +243,7 @@ func encodeDnsResponse(id uint16, pumpHeader [18]byte, header [18]byte, packet [
 	}
 
 	out, err = b.Finish()
-	fmt.Printf("F (%d) %d = %s\n", n, len(out), string(out))
+	// fmt.Printf("F (%d) %d = %s\n", n, len(out), string(out))
 	return
 }
 
@@ -255,8 +255,7 @@ func decodeDnsResponse(packet []byte, buf [1024]byte, tlds [][]byte) (id uint16,
 	var h dnsmessage.Header
 	h, err = p.Start(packet)
 	if err != nil {
-
-		fmt.Printf("ERROR 0\n")
+		// fmt.Printf("ERROR 0\n")
 		return
 	}
 	id = h.ID
@@ -266,7 +265,7 @@ func decodeDnsResponse(packet []byte, buf [1024]byte, tlds [][]byte) (id uint16,
 	var as []dnsmessage.Resource
 	as, err = p.AllAnswers()
 	if err != nil {
-		fmt.Printf("ERROR 1\n")
+		// fmt.Printf("ERROR 1\n")
 		return
 	}
 
@@ -309,8 +308,7 @@ func decodeDnsResponse(packet []byte, buf [1024]byte, tlds [][]byte) (id uint16,
 				var m int
 				m, err = rEnc.Decode(out[n:], []byte(txt))
 				if err != nil {
-
-					fmt.Printf("ERROR 3\n")
+					// fmt.Printf("ERROR 3\n")
 					return
 				}
 				n += m

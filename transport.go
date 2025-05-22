@@ -3,13 +3,17 @@ package connect
 import (
 	"bytes"
 	"context"
-	"fmt"
-	// "net"
 	"crypto/tls"
+	"fmt"
+	mathrand "math/rand"
+	"net"
 	"net/http"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/exp/maps"
 
 	"github.com/gorilla/websocket"
 	quic "github.com/quic-go/quic-go"
@@ -51,11 +55,11 @@ type TransportMode string
 // in order of increasing preference
 const (
 	// start all modes in skewed parallel and choose the best one
-	TransportModeAuto UpgradeMode = "auto"
-	TransportModeH3DnsPump UpgradeMode = "h3dnspump"
-	TransportModeH3Dns UpgradeMode = "h3dns"
-	TransportModeH1 UpgradeMode = "h1"
-	TransportModeH3 UpgradeMode = "h3"
+	TransportModeAuto      TransportMode = "auto"
+	TransportModeH3DnsPump TransportMode = "h3dnspump"
+	TransportModeH3Dns     TransportMode = "h3dns"
+	TransportModeH1        TransportMode = "h1"
+	TransportModeH3        TransportMode = "h3"
 )
 
 type PacketTranslationMode string
@@ -65,10 +69,9 @@ const (
 	// form packets to look like dns requests/responses on the wire
 	PacketTranslationModeDns PacketTranslationMode = "dns"
 	// uses a constant amount of upload bandwidth to establish a reply pump via dns zones
-	PacketTranslationModeDnsPump PacketTranslationMode = "dnspump"
+	PacketTranslationModeDnsPump  PacketTranslationMode = "dnspump"
 	PacketTranslationModeDecode53 PacketTranslationMode = "decode53"
 )
-
 
 type ClientAuth struct {
 	ByJwt string
@@ -103,7 +106,10 @@ type PlatformTransportSettings struct {
 	TransportBufferSize  int
 	InactiveDrainTimeout time.Duration
 	// it smoothes out the h3 transition to not start/stop h1 if h3 connects in this time
-	H1InitialDelay time.Duration
+	ModeInitialDelay time.Duration
+
+	// FIXME
+	DnsTlds [][]byte
 }
 
 func DefaultPlatformTransportSettings() *PlatformTransportSettings {
@@ -121,7 +127,9 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		ReadTimeout:          15 * time.Second,
 		TransportBufferSize:  1,
 		InactiveDrainTimeout: 15 * time.Second,
-		H1InitialDelay:       1 * time.Second,
+		ModeInitialDelay:     1 * time.Second,
+		// FIXME
+		DnsTlds: nil,
 	}
 }
 
@@ -142,6 +150,7 @@ type PlatformTransport struct {
 	stateLock      sync.Mutex
 	modeMonitor    *Monitor
 	availableModes map[TransportMode]bool
+	targetMode     TransportMode
 	mode           TransportMode
 }
 
@@ -170,6 +179,26 @@ func NewPlatformTransport(
 	auth *ClientAuth,
 	settings *PlatformTransportSettings,
 ) *PlatformTransport {
+	return NewPlatformTransportWithTargetMode(
+		ctx,
+		clientStrategy,
+		routeManager,
+		platformUrl,
+		auth,
+		TransportModeH1,
+		settings,
+	)
+}
+
+func NewPlatformTransportWithTargetMode(
+	ctx context.Context,
+	clientStrategy *ClientStrategy,
+	routeManager *RouteManager,
+	platformUrl string,
+	auth *ClientAuth,
+	targetMode TransportMode,
+	settings *PlatformTransportSettings,
+) *PlatformTransport {
 	cancelCtx, cancel := context.WithCancel(ctx)
 	transport := &PlatformTransport{
 		ctx:            cancelCtx,
@@ -182,7 +211,8 @@ func NewPlatformTransport(
 		h3Framer:       NewFramerWithDefaults(),
 		modeMonitor:    NewMonitor(),
 		availableModes: map[TransportMode]bool{},
-		mode:           H1,
+		targetMode:     targetMode,
+		mode:           TransportModeAuto,
 	}
 	go transport.run()
 	return transport
@@ -226,36 +256,42 @@ func (self *PlatformTransport) activeMode() (TransportMode, chan struct{}) {
 func (self *PlatformTransport) run() {
 	defer self.cancel()
 
-	switch targetMode {
-	case auto:
-		go self.runH3(0)
-		go self.runH1(delay)
-		go self.runH3(dns,delay*2)
-		go self.runH3(dnspump,delay*3)
-	case h3:
-		go self.runH3(0)
-	case h1:
+	switch self.targetMode {
+	case TransportModeAuto:
+		go self.runH3(TransportModeH3, 0)
+		go self.runH1(self.settings.ModeInitialDelay)
+		go self.runH3(TransportModeH3Dns, self.settings.ModeInitialDelay*2)
+		go self.runH3(TransportModeH3DnsPump, self.settings.ModeInitialDelay*3)
+	case TransportModeH3:
+		go self.runH3(TransportModeH3, 0)
+	case TransportModeH1:
 		go self.runH1(0)
-	case dns:
-		go self.runH3(dns, 0)
-	case dnspump:
-		go self.runH3(dnspump, 0)
+	case TransportModeH3Dns:
+		go self.runH3(TransportModeH3Dns, 0)
+	case TransportModeH3DnsPump:
+		go self.runH3(TransportModeH3DnsPump, 0)
 	}
 
 	for {
 		available, notify := self.modesAvailable()
 
 		preferences := map[TransportMode]int{
-			TransportModeAuto: 0,
+			TransportModeAuto:      0,
 			TransportModeH3DnsPump: 1,
-			TransportModeH3Dns: 2,
-			TransportModeH1: 3,
-			TransportModeH3: 4,
+			TransportModeH3Dns:     2,
+			TransportModeH1:        3,
+			TransportModeH3:        4,
 		}
 		// descending preference
 		orderedModes := maps.Keys(preferences)
-		slices.SortFunc(orderedModes, func(a TransportMode, b TransportMode)(int) {
-			return b - a
+		slices.SortFunc(orderedModes, func(a TransportMode, b TransportMode) int {
+			if a == b {
+				return 0
+			} else if isBetterMode(a, b) {
+				return -1
+			} else {
+				return 1
+			}
 		})
 		if 0 < len(orderedModes) {
 			for _, mode := range orderedModes {
@@ -265,7 +301,7 @@ func (self *PlatformTransport) run() {
 				}
 			}
 		} else {
-			self.setActiveMode(auto)
+			self.setActiveMode(TransportModeAuto)
 		}
 
 		select {
@@ -279,16 +315,15 @@ func (self *PlatformTransport) run() {
 // returns true is other is better than current
 func isBetterMode(current TransportMode, other TransportMode) bool {
 	preferences := map[TransportMode]int{
-		TransportModeAuto: 0,
+		TransportModeAuto:      0,
 		TransportModeH3DnsPump: 1,
-		TransportModeH3Dns: 2,
-		TransportModeH1: 3,
-		TransportModeH3: 4,
+		TransportModeH3Dns:     2,
+		TransportModeH1:        3,
+		TransportModeH3:        4,
 	}
 
-	return preference[current] < preference[other]
+	return preferences[current] < preferences[other]
 }
-
 
 func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 	// connect and update route manager for this transport
@@ -296,26 +331,24 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 	clientId, _ := self.auth.ClientId()
 
-	if 0 < self.settings.H1InitialDelay {
+	if 0 < initialTimeout {
 		select {
 		case <-self.ctx.Done():
 			return
-		case <-time.After(self.settings.H1InitialDelay):
+		case <-time.After(initialTimeout):
 		}
 	}
 
 	for {
-		// wait until we are back in h1 or auto mode
+		// wait until we are back in h1 or worse
 		func() {
 			for {
 				mode, notify := self.activeMode()
-				if isBetterMode(h1, mode) {
-					default:
-						select {
-						case <-self.ctx.Done():
-							return
-						case <-notify:
-						}
+				if isBetterMode(TransportModeH1, mode) {
+					select {
+					case <-self.ctx.Done():
+						return
+					case <-notify:
 					}
 				} else {
 					return
@@ -358,8 +391,8 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		c := func() {
 			defer ws.Close()
 
-			self.setModeAvailable(H1, true)
-			defer self.setModeAvailable(H1, false)
+			self.setModeAvailable(TransportModeH1, true)
+			defer self.setModeAvailable(TransportModeH1, false)
 
 			handleCtx, handleCancel := context.WithCancel(self.ctx)
 			defer handleCancel()
@@ -397,7 +430,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 				for {
 					mode, notify := self.activeMode()
-					if mode != H1 {
+					if mode != TransportModeH1 {
 						startReadCount := readCounter.Load()
 						startWriteCount := writeCounter.Load()
 						select {
@@ -530,11 +563,11 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 		return
 	}
 
-	if 0 < self.settings.H1InitialDelay {
+	if 0 < initialTimeout {
 		select {
 		case <-self.ctx.Done():
 			return
-		case <-time.After(self.settings.H1InitialDelay):
+		case <-time.After(initialTimeout):
 		}
 	}
 
@@ -544,12 +577,10 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			for {
 				mode, notify := self.activeMode()
 				if isBetterMode(ptMode, mode) {
-					default:
-						select {
-						case <-self.ctx.Done():
-							return
-						case <-notify:
-						}
+					select {
+					case <-self.ctx.Done():
+						return
+					case <-notify:
 					}
 				} else {
 					return
@@ -574,28 +605,41 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			// 	return nil, err
 			// }
 
-			var udpAddr net.UDPAddr
+			var udpAddr *net.UDPAddr
 			switch ptMode {
-			case H3DNS:
-				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", self.platformUrl, 53))
-				packetConn = NewPacketTranslation(self.ctx, PacketTranslationModeDns, udpConn)
-			case H3DNSPUMP:
-				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", self.platformUrl, 53))
-				packetConn = NewPacketTranslation(self.ctx, PacketTranslationModeDnsPump, udpConn)
+			case TransportModeH3Dns:
+				tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
+				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", tld, 53))
+				ptSettings := &PacketTranslationSettings{
+					DnsTlds: [][]byte{tld},
+				}
+				packetConn, err = NewPacketTranslation(self.ctx, PacketTranslationModeDns, udpConn, ptSettings)
+				if err != nil {
+					return nil, err
+				}
+			case TransportModeH3DnsPump:
+				tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
+				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", tld, 53))
+				ptSettings := &PacketTranslationSettings{
+					DnsTlds: [][]byte{tld},
+				}
+				packetConn, err = NewPacketTranslation(self.ctx, PacketTranslationModeDnsPump, udpConn, ptSettings)
+				if err != nil {
+					return nil, err
+				}
 			default:
 				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", self.platformUrl, 443))
 				packetConn = udpConn
 			}
 
-			
-			transport := &Transport{
-				Conn:        c,
-				createdConn: true,
-				isSingleUse: true,
+			quicTransport := &quic.Transport{
+				Conn: packetConn,
+				// createdConn: true,
+				// isSingleUse: true,
 			}
 
 			// enable 0rtt if possible
-			conn, err := transport.DialEarly(ctx, udpAddr, addr, tlsConf, conf, false)
+			conn, err := quicTransport.DialEarly(self.ctx, udpAddr, self.settings.QuicTlsConfig, quicConfig)
 
 			// conn, err := quic.Dial(self.ctx, packetConn, packetConn.ConnectedAddr(), self.settings.QuicTlsConfig, quicConfig)
 			if err != nil {
@@ -657,6 +701,9 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 
 			handleCtx, handleCancel := context.WithCancel(self.ctx)
 			defer handleCancel()
+
+			readCounter := atomic.Uint64{}
+			writeCounter := atomic.Uint64{}
 
 			send := make(chan []byte, self.settings.TransportBufferSize)
 			receive := make(chan []byte, self.settings.TransportBufferSize)
