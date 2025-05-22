@@ -145,8 +145,6 @@ type PlatformTransport struct {
 
 	settings *PlatformTransportSettings
 
-	h3Framer *Framer
-
 	stateLock      sync.Mutex
 	modeMonitor    *Monitor
 	availableModes map[TransportMode]bool
@@ -208,7 +206,6 @@ func NewPlatformTransportWithTargetMode(
 		platformUrl:    platformUrl,
 		auth:           auth,
 		settings:       settings,
-		h3Framer:       NewFramerWithDefaults(),
 		modeMonitor:    NewMonitor(),
 		availableModes: map[TransportMode]bool{},
 		targetMode:     targetMode,
@@ -563,6 +560,8 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 		return
 	}
 
+	h3Framer := NewFramerWithDefaults()
+
 	if 0 < initialTimeout {
 		select {
 		case <-self.ctx.Done():
@@ -659,11 +658,11 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			}()
 
 			stream.SetWriteDeadline(time.Now().Add(self.settings.AuthTimeout))
-			if err := self.h3Framer.Write(stream, authBytes); err != nil {
+			if err := h3Framer.Write(stream, authBytes); err != nil {
 				return nil, err
 			}
 			stream.SetReadDeadline(time.Now().Add(self.settings.AuthTimeout))
-			if message, err := self.h3Framer.Read(stream); err != nil {
+			if message, err := h3Framer.Read(stream); err != nil {
 				return nil, err
 			} else {
 				// verify the auth echo
@@ -771,7 +770,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 						}
 
 						stream.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
-						if err := self.h3Framer.Write(stream, message); err != nil {
+						if err := h3Framer.Write(stream, message); err != nil {
 							// note that for websocket a dealine timeout cannot be recovered
 							glog.Infof("[ts]%s-> error = %s\n", clientId, err)
 							return
@@ -779,7 +778,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 						glog.V(2).Infof("[ts]%s->\n", clientId)
 					case <-time.After(self.settings.PingTimeout):
 						stream.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
-						if err := self.h3Framer.Write(stream, make([]byte, 0)); err != nil {
+						if err := h3Framer.Write(stream, make([]byte, 0)); err != nil {
 							// note that for websocket a dealine timeout cannot be recovered
 							return
 						}
@@ -801,7 +800,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 					}
 
 					stream.SetReadDeadline(time.Now().Add(self.settings.ReadTimeout))
-					message, err := self.h3Framer.Read(stream)
+					message, err := h3Framer.Read(stream)
 					if err != nil {
 						glog.Infof("[tr]%s<- error = %s\n", clientId, err)
 						return
