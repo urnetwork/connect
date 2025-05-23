@@ -62,17 +62,6 @@ const (
 	TransportModeH3        TransportMode = "h3"
 )
 
-type PacketTranslationMode string
-
-const (
-	PacketTranslationModeNone PacketTranslationMode = ""
-	// form packets to look like dns requests/responses on the wire
-	PacketTranslationModeDns PacketTranslationMode = "dns"
-	// uses a constant amount of upload bandwidth to establish a reply pump via dns zones
-	PacketTranslationModeDnsPump  PacketTranslationMode = "dnspump"
-	PacketTranslationModeDecode53 PacketTranslationMode = "decode53"
-)
-
 type ClientAuth struct {
 	ByJwt string
 	// ClientId Id

@@ -1,4 +1,4 @@
-package connect
+package pt
 
 import (
 	"encoding/base32"
@@ -140,7 +140,7 @@ func decodeDnsRequest(packet []byte, buf [1024]byte, tlds [][]byte) (id uint16, 
 				if err != nil {
 					return
 				}
-				if i == 0 && m <= 18 {
+				if 0 < n && i == 0 && m <= 18 {
 					// header with no data, ignore this record
 					break
 				}

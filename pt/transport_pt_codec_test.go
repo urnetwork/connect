@@ -1,4 +1,4 @@
-package connect
+package pt
 
 import (
 	mathrand "math/rand"
@@ -28,18 +28,20 @@ func TestDnsRequestEncodeDecode(t *testing.T) {
 		for i < len(data) {
 
 			var header [18]byte
-			header[0] = 0
-			header[1] = uint8(c)
-			mathrand.Read(header[2:18])
+			mathrand.Read(header[0:16])
+			header[16] = uint8(c)
+			header[17] = 0
 
 			n, encoded, err := encodeDnsRequest(uint16(i), header, data[i:], encodeBuf, tld)
 			assert.Equal(t, err, nil)
 
-			id, decodedHeader, decoded, err := decodeDnsRequest(encoded, decodeBuf, tlds)
+			id, decodedHeader, decoded, decodedTld, err, otherData := decodeDnsRequest(encoded, decodeBuf, tlds)
 			assert.Equal(t, err, nil)
 			assert.Equal(t, id, uint16(i))
 			assert.Equal(t, data[i:i+n], decoded)
 			assert.Equal(t, header, decodedHeader)
+			assert.Equal(t, decodedTld, tld)
+			assert.Equal(t, otherData, false)
 
 			i += n
 			c += 1
@@ -69,9 +71,9 @@ func TestDnsResponseEncodeDecode(t *testing.T) {
 		i := 0
 		for i < len(data) {
 			var header [18]byte
-			header[0] = 0
-			header[1] = uint8(c)
-			mathrand.Read(header[2:18])
+			mathrand.Read(header[0:16])
+			header[16] = uint8(c)
+			header[17] = 0
 
 			n, encoded, err := encodeDnsResponse(uint16(i), header, header, data[i:], encodeBuf, tld)
 			assert.Equal(t, err, nil)

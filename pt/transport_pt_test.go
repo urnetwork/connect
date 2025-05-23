@@ -1,0 +1,356 @@
+package pt
+
+import (
+	"context"
+	"encoding/binary"
+	"fmt"
+	mathrand "math/rand"
+	"net"
+	"time"
+
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/tls"
+
+	// "crypto/elliptic"
+	// "crypto/hmac"
+	"crypto/rand"
+	"crypto/rsa"
+	// "crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+
+	"math/big"
+
+	quic "github.com/quic-go/quic-go"
+
+	"testing"
+
+	"github.com/go-playground/assert/v2"
+)
+
+func TestPtDnsEncodeDecode(t *testing.T) {
+	ptEncodeDecodeTest(t, PacketTranslationModeDns, PacketTranslationModeDecode53)
+}
+
+func TestPtDnsPumpEncodeDecode(t *testing.T) {
+	ptEncodeDecodeTest(t, PacketTranslationModeDnsPump, PacketTranslationModeDecode53RequireDnsPump)
+}
+
+func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, serverPtMode PacketTranslationMode) {
+	ctx := context.Background()
+
+	consecutive := func(n int) []byte {
+		out := make([]byte, 4*n)
+		for i := range n {
+			binary.BigEndian.PutUint32(out[4*i:4*i+4], uint32(i))
+		}
+		return out
+	}
+
+	for i := range 64 {
+		fmt.Printf("[%d]dns test (loss=%.1f%%)\n", i, 100.0/float32(10.0+i))
+		func() {
+			handleCtx, handleCancel := context.WithCancel(ctx)
+
+			n := 1024 * (128 + mathrand.Intn(128))
+			data := consecutive(n)
+
+			packetLossN := i + 10
+
+			tld := []byte("foo.com.")
+
+			serverAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5050 + i}
+
+			quicConfig := &quic.Config{
+				HandshakeIdleTimeout: time.Duration(5+max(10-i, 0)) * time.Second,
+				MaxIdleTimeout:       60 * time.Second,
+				Allow0RTT:            true,
+			}
+
+			func() {
+				serverTlsConfig := &tls.Config{
+					GetConfigForClient: func(clientHello *tls.ClientHelloInfo) (*tls.Config, error) {
+						certPemBytes, keyPemBytes, err := selfSign(
+							[]string{clientHello.ServerName},
+							clientHello.ServerName,
+							180*24*time.Hour,
+							180*24*time.Hour,
+						)
+						assert.Equal(t, err, nil)
+						// X509KeyPair
+						cert, err := tls.X509KeyPair(certPemBytes, keyPemBytes)
+						return &tls.Config{
+							Certificates: []tls.Certificate{cert},
+						}, err
+					},
+				}
+
+				serverConn, err := net.ListenUDP("udp", serverAddr)
+				assert.Equal(t, err, nil)
+
+				lossConn := newPacketLossPacketConn(packetLossN, serverConn)
+
+				ptSettings := DefaultPacketTranslationSettings()
+				ptSettings.DnsTlds = [][]byte{tld}
+				// settings.DnsAddr = serverAddr
+
+				ptConn, err := NewPacketTranslation(ctx, serverPtMode, lossConn, ptSettings)
+				assert.Equal(t, err, nil)
+				// defer ptConn.Close()
+
+				earlyListener, err := (&quic.Transport{
+					Conn: ptConn,
+					// createdConn: true,
+					// isSingleUse: true,
+				}).ListenEarly(serverTlsConfig, quicConfig)
+				// listenQuic(ctx, earlyListener)
+				assert.Equal(t, err, nil)
+				// defer earlyListener.Close()
+
+				go func() {
+					defer handleCancel()
+					defer ptConn.Close()
+					defer earlyListener.Close()
+
+					earlyConn, err := earlyListener.Accept(ctx)
+					assert.Equal(t, err, nil)
+					stream, err := earlyConn.AcceptStream(handleCtx)
+					assert.Equal(t, err, nil)
+
+					go func() {
+						m, err := stream.Write(data)
+						assert.Equal(t, err, nil)
+						assert.Equal(t, m, len(data))
+					}()
+
+					readData := make([]byte, 0, len(data))
+					buf := make([]byte, 2048)
+
+					for len(readData) < len(data) {
+						m, err := stream.Read(buf[:min(len(buf), len(data)-len(readData))])
+						assert.Equal(t, err, nil)
+						readData = append(readData, buf[:m]...)
+
+						// fmt.Printf("read[%d]\n", m)
+						fmt.Printf("+")
+					}
+
+					assert.Equal(t, data, readData)
+
+				}()
+
+			}()
+
+			clientTlsConfig := &tls.Config{
+				ServerName:         string(tld),
+				InsecureSkipVerify: true,
+			}
+
+			clientConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+			assert.Equal(t, err, nil)
+
+			lossConn := newPacketLossPacketConn(packetLossN, clientConn)
+
+			ptSettings := DefaultPacketTranslationSettings()
+			ptSettings.DnsTlds = [][]byte{tld}
+			ptSettings.DnsAddr = serverAddr
+			ptConn, err := NewPacketTranslation(handleCtx, clientPtMode, lossConn, ptSettings)
+			assert.Equal(t, err, nil)
+			defer ptConn.Close()
+
+			quicTransport := &quic.Transport{
+				Conn: ptConn,
+				// createdConn: true,
+				// isSingleUse: true,
+			}
+
+			// enable 0rtt if possible
+			conn, err := quicTransport.DialEarly(handleCtx, serverAddr, clientTlsConfig, quicConfig)
+			assert.Equal(t, err, nil)
+
+			stream, err := conn.OpenStream()
+			assert.Equal(t, err, nil)
+
+			go func() {
+				m, err := stream.Write(data)
+				assert.Equal(t, err, nil)
+				assert.Equal(t, m, len(data))
+			}()
+
+			readData := make([]byte, 0, len(data))
+			buf := make([]byte, 2048)
+
+			for len(readData) < len(data) {
+				m, err := stream.Read(buf[:min(len(buf), len(data)-len(readData))])
+				assert.Equal(t, err, nil)
+				readData = append(readData, buf[:m]...)
+
+				// fmt.Printf("read[%d]\n", m)
+				fmt.Printf(".")
+			}
+
+			assert.Equal(t, data, readData)
+
+			select {
+			case <-handleCtx.Done():
+				// case <- time.After(60 * time.Second):
+				// 	t.FailNow()
+			}
+
+			fmt.Printf("\n")
+		}()
+	}
+
+}
+
+// drops one of n outgoing packets randomly
+type packetLossPacketConn struct {
+	n          int
+	packetConn net.PacketConn
+}
+
+func newPacketLossPacketConn(n int, packetConn net.PacketConn) *packetLossPacketConn {
+	return &packetLossPacketConn{
+		n:          n,
+		packetConn: packetConn,
+	}
+}
+
+func (self *packetLossPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	return self.packetConn.ReadFrom(p)
+}
+
+func (self *packetLossPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	if 0 < self.n && mathrand.Intn(self.n) == 0 {
+		// pretent the packet was sent but drop it
+		n = len(p)
+		return
+	} else {
+		n, err = self.packetConn.WriteTo(p, addr)
+		return
+	}
+}
+
+func (self *packetLossPacketConn) LocalAddr() net.Addr {
+	return self.packetConn.LocalAddr()
+}
+
+func (self *packetLossPacketConn) SetDeadline(t time.Time) error {
+	return self.packetConn.SetDeadline(t)
+}
+
+func (self *packetLossPacketConn) SetReadDeadline(t time.Time) error {
+	return self.packetConn.SetReadDeadline(t)
+}
+
+func (self *packetLossPacketConn) SetWriteDeadline(t time.Time) error {
+	return self.packetConn.SetWriteDeadline(t)
+}
+
+func (self *packetLossPacketConn) Close() error {
+	return self.packetConn.Close()
+}
+
+func (self *packetLossPacketConn) SetReadBuffer(bytes int) error {
+	conn, ok := self.packetConn.(interface{ SetReadBuffer(int) error })
+	if !ok {
+		return fmt.Errorf("Set read buffer not supporter on underlying packet conn: %T", self.packetConn)
+	}
+	return conn.SetReadBuffer(bytes)
+}
+
+func (self *packetLossPacketConn) SetWriteBuffer(bytes int) error {
+	conn, ok := self.packetConn.(interface{ SetWriteBuffer(int) error })
+	if !ok {
+		return fmt.Errorf("Set write buffer not supporter on underlying packet conn: %T", self.packetConn)
+	}
+	return conn.SetWriteBuffer(bytes)
+}
+
+func selfSign(hosts []string, organization string, validFrom time.Duration, validFor time.Duration) (certPemBytes []byte, keyPemBytes []byte, returnErr error) {
+
+	var priv any
+	var err error
+
+	priv, err = rsa.GenerateKey(rand.Reader, 2048)
+	// priv, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		returnErr = err
+		return
+	}
+
+	publicKey := func(priv any) any {
+		switch k := priv.(type) {
+		case *rsa.PrivateKey:
+			return &k.PublicKey
+		case *ecdsa.PrivateKey:
+			return &k.PublicKey
+		case ed25519.PrivateKey:
+			return k.Public().(ed25519.PublicKey)
+		default:
+			return nil
+		}
+	}
+
+	// ECDSA, ED25519 and RSA subject keys should have the DigitalSignature
+	// KeyUsage bits set in the x509.Certificate template
+	keyUsage := x509.KeyUsageDigitalSignature
+	// Only RSA subject keys should have the KeyEncipherment KeyUsage bits set. In
+	// the context of TLS this KeyUsage is particular to RSA key exchange and
+	// authentication.
+	if _, isRSA := priv.(*rsa.PrivateKey); isRSA {
+		keyUsage |= x509.KeyUsageKeyEncipherment
+	}
+
+	notBefore := time.Now().Add(-validFrom)
+	notAfter := notBefore.Add(validFor)
+
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		panic(fmt.Errorf("Failed to generate serial number: %v", err))
+	}
+
+	template := x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			Organization: []string{organization},
+		},
+		NotBefore: notBefore,
+		NotAfter:  notAfter,
+
+		KeyUsage:              keyUsage,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+
+	for _, h := range hosts {
+		if ip := net.ParseIP(h); ip != nil {
+			template.IPAddresses = append(template.IPAddresses, ip)
+		} else {
+			template.DNSNames = append(template.DNSNames, h)
+		}
+	}
+
+	// we hope the client is using tls1.3 which hides the self signed cert
+	template.IsCA = true
+	template.KeyUsage |= x509.KeyUsageCertSign
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, publicKey(priv), priv)
+	if err != nil {
+		returnErr = err
+		return
+	}
+	certPemBytes = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+
+	privBytes, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		returnErr = err
+		return
+	}
+	keyPemBytes = pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privBytes})
+
+	return
+}
