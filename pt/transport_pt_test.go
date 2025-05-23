@@ -64,9 +64,11 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 			serverAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5050 + i}
 
 			quicConfig := &quic.Config{
-				HandshakeIdleTimeout: time.Duration(5+max(10-i, 0)) * time.Second,
-				MaxIdleTimeout:       60 * time.Second,
-				Allow0RTT:            true,
+				HandshakeIdleTimeout:    time.Duration(5+max(10-i, 0)) * time.Second,
+				MaxIdleTimeout:          60 * time.Second,
+				KeepAlivePeriod:         30 * time.Second,
+				Allow0RTT:               true,
+				DisablePathMTUDiscovery: true,
 			}
 
 			func() {

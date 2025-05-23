@@ -578,8 +578,15 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 
 		reconnect := NewReconnect(self.settings.ReconnectTimeout)
 		connect := func() (quic.Stream, error) {
+			// quicConfig := &quic.Config{
+			// 	HandshakeIdleTimeout: self.settings.QuicConnectTimeout + self.settings.QuicHandshakeTimeout,
+			// }
+
 			quicConfig := &quic.Config{
 				HandshakeIdleTimeout: self.settings.QuicConnectTimeout + self.settings.QuicHandshakeTimeout,
+				MaxIdleTimeout:       self.settings.PingTimeout * 2,
+				KeepAlivePeriod:      0,
+				Allow0RTT:            true,
 			}
 
 			var packetConn net.PacketConn
@@ -596,6 +603,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			var udpAddr *net.UDPAddr
 			switch ptMode {
 			case TransportModeH3Dns:
+				quicConfig.DisablePathMTUDiscovery = true
 				tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
 				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", tld, 53))
 				ptSettings := &PacketTranslationSettings{
@@ -606,6 +614,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 					return nil, err
 				}
 			case TransportModeH3DnsPump:
+				quicConfig.DisablePathMTUDiscovery = true
 				tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
 				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", tld, 53))
 				ptSettings := &PacketTranslationSettings{
