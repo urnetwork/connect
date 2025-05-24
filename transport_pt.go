@@ -1,4 +1,4 @@
-package pt
+package connect
 
 import (
 	"context"
@@ -456,10 +456,12 @@ func (self *packetTranslation) handleDnsOther(packetData []byte, addr net.Addr) 
 	return
 }
 
-// packetData cannot be modified after this is called
 func (self *packetTranslation) WriteTo(packetData []byte, addr net.Addr) (n int, err error) {
+	packetDataCopy := make([]byte, len(packetData))
+	copy(packetDataCopy, packetData)
+
 	p := &packet{
-		data: packetData,
+		data: packetDataCopy,
 		addr: addr,
 	}
 

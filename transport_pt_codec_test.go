@@ -1,4 +1,4 @@
-package pt
+package connect
 
 import (
 	mathrand "math/rand"
