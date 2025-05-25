@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	// "time"
 	// "github.com/urnetwork/connect"
 )
 
@@ -53,6 +54,7 @@ func NewFramer(settings *FramerSettings) *Framer {
 }
 
 func (self *Framer) Read(r io.Reader) ([]byte, error) {
+
 	h := self.readBuffer[:]
 	if _, err := io.ReadFull(r, h[0:4]); err != nil {
 		return nil, err
@@ -92,7 +94,7 @@ func (self *Framer) Read(r io.Reader) ([]byte, error) {
 	return message, nil
 }
 
-// use this version is the reader dequeues an entire packet per read
+// use this version if the reader dequeues an entire packet per read
 func (self *Framer) ReadPacket(r io.Reader) ([]byte, error) {
 	h := self.readBuffer[:]
 

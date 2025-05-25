@@ -208,7 +208,7 @@ func encodeDnsResponse(id uint16, pumpHeader [18]byte, header [18]byte, packet [
 			Name:  name,
 			Type:  dnsmessage.TypeTXT,
 			Class: dnsmessage.ClassINET,
-			TTL:   300,
+			TTL:   0,
 		},
 		dnsmessage.TXTResource{
 			TXT: []string{string(t)},
@@ -229,7 +229,7 @@ func encodeDnsResponse(id uint16, pumpHeader [18]byte, header [18]byte, packet [
 				Name:  name,
 				Type:  dnsmessage.TypeTXT,
 				Class: dnsmessage.ClassINET,
-				TTL:   300,
+				TTL:   0,
 			},
 			dnsmessage.TXTResource{
 				TXT: []string{string(t)},
