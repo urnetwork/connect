@@ -916,7 +916,7 @@ func (self *StreamState) DataPackets(payload []byte, n int, mtu int) ([][]byte, 
 			packet := buffer.Bytes()
 			// packetCopy := make([]byte, len(packet))
 			// copy(packetCopy, packet)
-			packedCopy := MessagePoolCopy(packet)
+			packetCopy := MessagePoolCopy(packet)
 			packets = append(packets, packetCopy)
 			buffer.Clear()
 			i = j
@@ -2390,6 +2390,8 @@ func (self *RemoteUserNatClient) SecurityPolicyStats(reset bool) SecurityPolicyS
 
 // `SendPacketFunction`
 func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool {
+	defer MessagePoolReturn(packet)
+
 	minRelationship := max(provideMode, self.provideMode)
 
 	ipPath, r, err := self.securityPolicy.Inspect(minRelationship, packet)

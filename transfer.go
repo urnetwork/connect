@@ -768,15 +768,18 @@ func (self *Client) run() {
 		filteredTransferFrame := &protocol.FilteredTransferFrame{}
 		if err := proto.Unmarshal(transferFrameBytes, filteredTransferFrame); err != nil {
 			// bad protobuf (unexpected, see route note above)
+			MessagePoolReturn(transferFrameBytes)
 			continue
 		}
 		if filteredTransferFrame.TransferPath == nil {
 			// bad protobuf (unexpected, see route note above)
+			MessagePoolReturn(transferFrameBytes)
 			continue
 		}
 		path, err := TransferPathFromProtobuf(filteredTransferFrame.TransferPath)
 		if err != nil {
 			// bad protobuf (unexpected, see route note above)
+			MessagePoolReturn(transferFrameBytes)
 			continue
 		}
 		source := path.SourceMask()
@@ -798,6 +801,7 @@ func (self *Client) run() {
 				updatePeerAudit(source, func(a *PeerAudit) {
 					a.badMessage(ByteCount(len(transferFrameBytes)))
 				})
+				MessagePoolReturn(transferFrameBytes)
 				continue
 			}
 			frame := transferFrame.GetFrame()
@@ -810,6 +814,7 @@ func (self *Client) run() {
 					updatePeerAudit(source, func(a *PeerAudit) {
 						a.badMessage(ByteCount(len(transferFrameBytes)))
 					})
+					MessagePoolReturn(transferFrameBytes)
 					continue
 				}
 				c := func() bool {
@@ -834,6 +839,7 @@ func (self *Client) run() {
 					updatePeerAudit(source, func(a *PeerAudit) {
 						a.badMessage(ByteCount(len(transferFrameBytes)))
 					})
+					MessagePoolReturn(transferFrameBytes)
 					continue
 				}
 				sequenceId, err := IdFromBytes(pack.SequenceId)
@@ -873,6 +879,7 @@ func (self *Client) run() {
 					updatePeerAudit(source, func(a *PeerAudit) {
 						a.badMessage(ByteCount(len(transferFrameBytes)))
 					})
+					MessagePoolReturn(transferFrameBytes)
 					continue
 				}
 				frame := transferFrame.GetFrame()
@@ -887,6 +894,7 @@ func (self *Client) run() {
 						updatePeerAudit(source, func(a *PeerAudit) {
 							a.badMessage(ByteCount(len(transferFrameBytes)))
 						})
+						MessagePoolReturn(transferFrameBytes)
 						continue
 					}
 				case protocol.MessageType_TransferPack:
@@ -896,6 +904,7 @@ func (self *Client) run() {
 						updatePeerAudit(source, func(a *PeerAudit) {
 							a.badMessage(ByteCount(len(transferFrameBytes)))
 						})
+						MessagePoolReturn(transferFrameBytes)
 						continue
 					}
 				default:
@@ -918,6 +927,7 @@ func (self *Client) run() {
 				c()
 			}
 		}
+		MessagePoolReturn(transferFrameBytes)
 	}
 }
 

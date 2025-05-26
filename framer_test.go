@@ -134,7 +134,6 @@ func TestFramerWriteReadPacket(t *testing.T) {
 					panic(err)
 				}
 				assert.Equal(t, message, randMessage(messageLen, i))
-
 			}
 		}
 	}()

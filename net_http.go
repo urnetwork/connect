@@ -940,9 +940,14 @@ func (self *clientDialer) WsDialer(settings *ClientStrategySettings) *websocket.
 	defer self.mutex.Unlock()
 
 	if self.websocketDialer == nil {
+		// pool, size := MessagePool(2048)
 		self.websocketDialer = &websocket.Dialer{
 			NetDialTLSContext: self.dialTlsContext,
 			HandshakeTimeout:  settings.HandshakeTimeout,
+			// ReadBufferSize: size,
+			// WriteBufferSize: size,
+			// WriteBufferPool: pool,
+			EnableCompression: false,
 		}
 	}
 	return self.websocketDialer

@@ -98,7 +98,8 @@ type PlatformTransportSettings struct {
 	ModeInitialDelay time.Duration
 
 	// FIXME
-	DnsTlds [][]byte
+	DnsTlds  [][]byte
+	V2H1Auth bool
 }
 
 func DefaultPlatformTransportSettings() *PlatformTransportSettings {
@@ -118,7 +119,8 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		InactiveDrainTimeout: 15 * time.Second,
 		ModeInitialDelay:     1 * time.Second,
 		// FIXME
-		DnsTlds: nil,
+		DnsTlds:  nil,
+		V2H1Auth: false,
 	}
 }
 
@@ -345,15 +347,55 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		reconnect := NewReconnect(self.settings.ReconnectTimeout)
 		connect := func() (*websocket.Conn, error) {
 			header := http.Header{}
-			header.Add("Authorization", fmt.Sprintf("Bearer %s", self.auth.ByJwt))
-			header.Add("X-UR-AppVersion", self.auth.AppVersion)
-			header.Add("X-UR-InstanceId", self.auth.InstanceId.String())
+			if self.settings.V2H1Auth {
+				header.Add("Authorization", fmt.Sprintf("Bearer %s", self.auth.ByJwt))
+				header.Add("X-UR-AppVersion", self.auth.AppVersion)
+				header.Add("X-UR-InstanceId", self.auth.InstanceId.String())
+			}
 
 			ws, _, err := self.clientStrategy.WsDialContext(self.ctx, self.platformUrl, header)
 			if err != nil {
 				return nil, err
 			}
 
+			success := false
+			defer func() {
+				if !success {
+					ws.Close()
+				}
+			}()
+
+			if !self.settings.V2H1Auth {
+				authBytes, err := EncodeFrame(&protocol.Auth{
+					ByJwt:      self.auth.ByJwt,
+					AppVersion: self.auth.AppVersion,
+					InstanceId: self.auth.InstanceId.Bytes(),
+				})
+				if err != nil {
+					return nil, err
+				}
+
+				ws.SetWriteDeadline(time.Now().Add(self.settings.AuthTimeout))
+				if err := ws.WriteMessage(websocket.BinaryMessage, authBytes); err != nil {
+					return nil, err
+				}
+				ws.SetReadDeadline(time.Now().Add(self.settings.AuthTimeout))
+				if messageType, message, err := ws.ReadMessage(); err != nil {
+					return nil, err
+				} else {
+					// verify the auth echo
+					switch messageType {
+					case websocket.BinaryMessage:
+						if !bytes.Equal(authBytes, message) {
+							return nil, fmt.Errorf("Auth response error: bad bytes.")
+						}
+					default:
+						return nil, fmt.Errorf("Auth response error.")
+					}
+				}
+			}
+
+			success = true
 			return ws, nil
 		}
 
@@ -485,7 +527,12 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					}
 
 					ws.SetReadDeadline(time.Now().Add(self.settings.ReadTimeout))
-					messageType, message, err := ws.ReadMessage()
+					messageType, r, err := ws.NextReader()
+					if err != nil {
+						glog.Infof("[tr]%s<- error = %s\n", clientId, err)
+						return
+					}
+					message, err := MessagePoolReadAll(r)
 					if err != nil {
 						glog.Infof("[tr]%s<- error = %s\n", clientId, err)
 						return
@@ -495,6 +542,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 					switch messageType {
 					case websocket.BinaryMessage:
+
 						if 0 == len(message) {
 							// ping
 							glog.V(2).Infof("[tr]ping %s<-\n", clientId)
@@ -512,6 +560,13 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					default:
 						glog.V(2).Infof("[tr]other=%s %s<-\n", messageType, clientId)
 					}
+
+					// messageType, message, err := ws.ReadMessage()
+					// if err != nil {
+					// 	glog.Infof("[tr]%s<- error = %s\n", clientId, err)
+					// 	return
+					// }
+
 				}
 			}()
 

@@ -118,6 +118,7 @@ func (self *combineQueue) Combine(addr net.Addr, header [18]byte, data []byte) (
 		data := MessagePoolGet(n)[:0]
 		for _, p := range item.packets {
 			data = append(data, p.data...)
+			MessagePoolReturn(p.data)
 		}
 		out = &packet{
 			data: data,
