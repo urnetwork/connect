@@ -67,7 +67,8 @@ func (self *Framer) Read(r io.Reader) ([]byte, error) {
 		return nil, fmt.Errorf("Max message len exceeded (%d<%d)", self.settings.MaxMessageLen, messageLen)
 	}
 
-	message := make([]byte, messageLen)
+	// message := make([]byte, messageLen)
+	message := MessagePoolGet(messageLen)
 
 	if splitIndex < 16 {
 		// no split
@@ -110,7 +111,8 @@ func (self *Framer) ReadPacket(r io.Reader) ([]byte, error) {
 		return nil, fmt.Errorf("Max message len exceeded (%d<%d)", self.settings.MaxMessageLen, messageLen)
 	}
 
-	message := make([]byte, messageLen)
+	// message := make([]byte, messageLen)
+	message := MessagePoolGet(messageLen)
 
 	if splitIndex < 16 {
 		// no split

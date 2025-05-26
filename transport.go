@@ -460,6 +460,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						glog.V(2).Infof("[ts]%s->\n", clientId)
 
 						writeCounter.Add(1)
+						MessagePoolReturn(message)
 					case <-time.After(self.settings.PingTimeout):
 						ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
 						if err := ws.WriteMessage(websocket.BinaryMessage, make([]byte, 0)); err != nil {
@@ -588,6 +589,13 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				KeepAlivePeriod:      0,
 				Allow0RTT:            true,
 			}
+			var tlsConfig *tls.Config
+			if self.settings.QuicTlsConfig != nil {
+				tlsConfig_ := *self.settings.QuicTlsConfig
+				tlsConfig = &tlsConfig_
+			} else {
+				tlsConfig = &tls.Config{}
+			}
 
 			var packetConn net.PacketConn
 
@@ -601,11 +609,13 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			// }
 
 			var udpAddr *net.UDPAddr
+			var serverName string
 			switch ptMode {
 			case TransportModeH3Dns:
 				quicConfig.DisablePathMTUDiscovery = true
 				tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
-				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", tld, 53))
+				serverName = connectHost(self.platformUrl)
+				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", serverName, 53))
 				ptSettings := &PacketTranslationSettings{
 					DnsTlds: [][]byte{tld},
 				}
@@ -616,7 +626,8 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			case TransportModeH3DnsPump:
 				quicConfig.DisablePathMTUDiscovery = true
 				tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
-				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", tld, 53))
+				serverName = pumpHost(self.platformUrl, tld)
+				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", serverName, 53))
 				ptSettings := &PacketTranslationSettings{
 					DnsTlds: [][]byte{tld},
 				}
@@ -625,18 +636,19 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 					return nil, err
 				}
 			default:
-				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", self.platformUrl, 443))
+				serverName = connectHost(self.platformUrl)
+				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", serverName, 443))
 				packetConn = udpConn
 			}
 
+			tlsConfig.ServerName = serverName
 			quicTransport := &quic.Transport{
 				Conn: packetConn,
 				// createdConn: true,
 				// isSingleUse: true,
 			}
-
 			// enable 0rtt if possible
-			conn, err := quicTransport.DialEarly(self.ctx, udpAddr, self.settings.QuicTlsConfig, quicConfig)
+			conn, err := quicTransport.DialEarly(self.ctx, udpAddr, tlsConfig, quicConfig)
 
 			// conn, err := quic.Dial(self.ctx, packetConn, packetConn.ConnectedAddr(), self.settings.QuicTlsConfig, quicConfig)
 			if err != nil {
@@ -774,6 +786,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 							return
 						}
 						glog.V(2).Infof("[ts]%s->\n", clientId)
+						MessagePoolReturn(message)
 					case <-time.After(self.settings.PingTimeout):
 						stream.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
 						if err := h3Framer.Write(stream, make([]byte, 0)); err != nil {
@@ -842,4 +855,14 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 
 func (self *PlatformTransport) Close() {
 	self.cancel()
+}
+
+// FIXME
+func connectHost(platformUrl string) string {
+	return platformUrl
+}
+
+// FIXME
+func pumpHost(platformUrl string, tld []byte) string {
+	return platformUrl
 }

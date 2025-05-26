@@ -914,8 +914,9 @@ func (self *StreamState) DataPackets(payload []byte, n int, mtu int) ([][]byte, 
 				return nil, err
 			}
 			packet := buffer.Bytes()
-			packetCopy := make([]byte, len(packet))
-			copy(packetCopy, packet)
+			// packetCopy := make([]byte, len(packet))
+			// copy(packetCopy, packet)
+			packedCopy := MessagePoolCopy(packet)
 			packets = append(packets, packetCopy)
 			buffer.Clear()
 			i = j
@@ -2140,8 +2141,9 @@ func (self *ConnectionState) DataPackets(payload []byte, n int, mtu int) ([][]by
 				return nil, err
 			}
 			packet := buffer.Bytes()
-			packetCopy := make([]byte, len(packet))
-			copy(packetCopy, packet)
+			// packetCopy := make([]byte, len(packet))
+			// copy(packetCopy, packet)
+			packetCopy := MessagePoolCopy(packet)
 			packets = append(packets, packetCopy)
 			buffer.Clear()
 			i = j

@@ -191,6 +191,7 @@ func (self *packetTranslation) encodeDns() {
 
 					n += m
 				}
+				MessagePoolReturn(p.data)
 				return nil
 			}
 
@@ -327,10 +328,12 @@ func (self *packetTranslation) encodeDns() {
 
 					n += m
 				}
+				MessagePoolReturn(p.data)
 			case p := <-self.forward:
 				// fmt.Printf("PACKET WRITE TO: %v\n", string(p.data))
 
 				_, err := self.packetConn.WriteTo(p.data, p.addr)
+				MessagePoolReturn(p.data)
 				if err != nil {
 					return
 				}
@@ -399,8 +402,9 @@ func (self *packetTranslation) decodeDns() {
 			continue
 		}
 
-		dataCopy := make([]byte, len(data))
-		copy(dataCopy, data)
+		// dataCopy := make([]byte, len(data))
+		// copy(dataCopy, data)
+		dataCopy := MessagePoolCopy(data)
 
 		out, limit, err := dnsCombineQueue.Combine(addr, header, dataCopy)
 
@@ -457,8 +461,9 @@ func (self *packetTranslation) handleDnsOther(packetData []byte, addr net.Addr) 
 }
 
 func (self *packetTranslation) WriteTo(packetData []byte, addr net.Addr) (n int, err error) {
-	packetDataCopy := make([]byte, len(packetData))
-	copy(packetDataCopy, packetData)
+	// packetDataCopy := make([]byte, len(packetData))
+	// copy(packetDataCopy, packetData)
+	packetDataCopy := MessagePoolCopy(packetData)
 
 	p := &packet{
 		data: packetDataCopy,
@@ -483,6 +488,7 @@ func (self *packetTranslation) ReadFrom(packetData []byte) (n int, addr net.Addr
 	case p := <-self.in:
 		addr = p.addr
 		n = copy(packetData, p.data)
+		MessagePoolReturn(p.data)
 		return
 	}
 }
