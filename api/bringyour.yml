@@ -1145,6 +1145,20 @@ paths:
                             schema:
                                 $ref: "#/components/schemas/GetPayoutWalletResult"
 
+    /account/points:
+        get:
+            description: |
+                Retrieves network points earned. Eventually, users will be able to convert points for tokens
+            operationId: Account Get Network points
+            security:
+                - BearerAuth: []
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: "#/components/schemas/NetworkPointsResult"
+
     /account/wallet:
         post:
             description: |
@@ -2831,4 +2845,29 @@ components:
                     type: string
                     enum:
                         - solana
+
+        NetworkPoint:
+            type: object
+            properties:
+                network_id:
+                    description: uuid
+                    type: string
+                event:
+                    type: string
+                    enum: 
+                        - referral
+                point_value:
+                    type: integer
+                create_time:
+                    description: datetime
+                    type: string
+
+        NetworkPointsResult:
+            type: object
+            properties:
+                network_points:
+                    type: array
+                    items:
+                        $ref: "#/components/schemas/NetworkPoint"
+
                 
