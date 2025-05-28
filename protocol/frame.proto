@@ -33,6 +33,7 @@ enum MessageType {
 message Frame {
     MessageType message_type = 1;
     bytes message_bytes = 2;
+    bool raw = 3;
 }
 
 

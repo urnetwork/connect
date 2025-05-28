@@ -210,26 +210,23 @@ func tcp6Packet(s int, i int, j int, k int) (packet []byte, payload []byte) {
 }
 
 func testingNewClient(ctx context.Context, providerClient *Client, receivePacketCallback ReceivePacketFunction) (UserNatClient, error) {
-	client := NewClientWithDefaults(ctx, NewId(), NewNoContractClientOob())
+	settings := DefaultClientSettings()
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 
-	routesSend := []Route{
-		make(chan []byte),
-	}
-	routesReceive := []Route{
-		make(chan []byte),
-	}
+	routeSend := make(chan []byte)
+	routeReceive := make(chan []byte)
 
 	transportSend := NewSendGatewayTransport()
 	transportReceive := NewReceiveGatewayTransport()
-	client.RouteManager().UpdateTransport(transportSend, routesSend)
-	client.RouteManager().UpdateTransport(transportReceive, routesReceive)
+	client.RouteManager().UpdateTransport(transportSend, []Route{routeSend})
+	client.RouteManager().UpdateTransport(transportReceive, []Route{routeReceive})
 
 	client.ContractManager().AddNoContractPeer(providerClient.ClientId())
 
 	providerTransportSend := NewSendClientTransport(DestinationId(client.ClientId()))
 	providerTransportReceive := NewReceiveGatewayTransport()
-	providerClient.RouteManager().UpdateTransport(providerTransportReceive, routesSend)
-	providerClient.RouteManager().UpdateTransport(providerTransportSend, routesReceive)
+	providerClient.RouteManager().UpdateTransport(providerTransportReceive, []Route{routeSend})
+	providerClient.RouteManager().UpdateTransport(providerTransportSend, []Route{routeReceive})
 
 	providerClient.ContractManager().AddNoContractPeer(client.ClientId())
 
@@ -348,7 +345,7 @@ func testClient[P comparable](
 					PacketBytes: packet,
 				},
 			}
-			frame, err := ToFrame(ipPacketFromProvider)
+			frame, err := ToFrame(ipPacketFromProvider, DefaultProtocolVersion)
 			if err != nil {
 				panic(err)
 			}

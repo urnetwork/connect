@@ -97,6 +97,8 @@ type PlatformTransportSettings struct {
 	// it smoothes out the h3 transition to not start/stop h1 if h3 connects in this time
 	ModeInitialDelay time.Duration
 
+	ProtocolVersion int
+
 	// FIXME
 	DnsTlds  [][]byte
 	V2H1Auth bool
@@ -118,6 +120,7 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		TransportBufferSize:  1,
 		InactiveDrainTimeout: 15 * time.Second,
 		ModeInitialDelay:     1 * time.Second,
+		ProtocolVersion:      DefaultProtocolVersion,
 		// FIXME
 		DnsTlds:  nil,
 		V2H1Auth: false,
@@ -370,7 +373,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					ByJwt:      self.auth.ByJwt,
 					AppVersion: self.auth.AppVersion,
 					InstanceId: self.auth.InstanceId.Bytes(),
-				})
+				}, self.settings.ProtocolVersion)
 				if err != nil {
 					return nil, err
 				}
@@ -502,7 +505,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						glog.V(2).Infof("[ts]%s->\n", clientId)
 
 						writeCounter.Add(1)
-						MessagePoolReturn(message)
+						MessagePoolOptionalReturn(message)
 					case <-time.After(self.settings.PingTimeout):
 						ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
 						if err := ws.WriteMessage(websocket.BinaryMessage, make([]byte, 0)); err != nil {
@@ -600,7 +603,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 		ByJwt:      self.auth.ByJwt,
 		AppVersion: self.auth.AppVersion,
 		InstanceId: self.auth.InstanceId.Bytes(),
-	})
+	}, self.settings.ProtocolVersion)
 	if err != nil {
 		return
 	}
@@ -841,7 +844,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 							return
 						}
 						glog.V(2).Infof("[ts]%s->\n", clientId)
-						MessagePoolReturn(message)
+						MessagePoolOptionalReturn(message)
 					case <-time.After(self.settings.PingTimeout):
 						stream.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
 						if err := h3Framer.Write(stream, make([]byte, 0)); err != nil {

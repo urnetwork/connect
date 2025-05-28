@@ -202,7 +202,9 @@ func (x *TransferPath) GetStreamId() []byte {
 type TransferFrame struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	TransferPath  *TransferPath          `protobuf:"bytes,1,opt,name=transfer_path,json=transferPath,proto3" json:"transfer_path,omitempty"`
-	Frame         *Frame                 `protobuf:"bytes,2,opt,name=frame,proto3" json:"frame,omitempty"`
+	Frame         *Frame                 `protobuf:"bytes,2,opt,name=frame,proto3,oneof" json:"frame,omitempty"`
+	Pack          *Pack                  `protobuf:"bytes,3,opt,name=pack,proto3,oneof" json:"pack,omitempty"`
+	Ack           *Ack                   `protobuf:"bytes,4,opt,name=ack,proto3,oneof" json:"ack,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -247,6 +249,20 @@ func (x *TransferFrame) GetTransferPath() *TransferPath {
 func (x *TransferFrame) GetFrame() *Frame {
 	if x != nil {
 		return x.Frame
+	}
+	return nil
+}
+
+func (x *TransferFrame) GetPack() *Pack {
+	if x != nil {
+		return x.Pack
+	}
+	return nil
+}
+
+func (x *TransferFrame) GetAck() *Ack {
+	if x != nil {
+		return x.Ack
 	}
 	return nil
 }
@@ -1530,10 +1546,15 @@ const file_transfer_proto_rawDesc = "" +
 	"_source_idB\x11\n" +
 	"\x0f_destination_idB\f\n" +
 	"\n" +
-	"_stream_id\"u\n" +
+	"_stream_id\"\xe6\x01\n" +
 	"\rTransferFrame\x12<\n" +
-	"\rtransfer_path\x18\x01 \x01(\v2\x17.bringyour.TransferPathR\ftransferPath\x12&\n" +
-	"\x05frame\x18\x02 \x01(\v2\x10.bringyour.FrameR\x05frame\"U\n" +
+	"\rtransfer_path\x18\x01 \x01(\v2\x17.bringyour.TransferPathR\ftransferPath\x12+\n" +
+	"\x05frame\x18\x02 \x01(\v2\x10.bringyour.FrameH\x00R\x05frame\x88\x01\x01\x12(\n" +
+	"\x04pack\x18\x03 \x01(\v2\x0f.bringyour.PackH\x01R\x04pack\x88\x01\x01\x12%\n" +
+	"\x03ack\x18\x04 \x01(\v2\x0e.bringyour.AckH\x02R\x03ack\x88\x01\x01B\b\n" +
+	"\x06_frameB\a\n" +
+	"\x05_packB\x06\n" +
+	"\x04_ack\"U\n" +
 	"\x15FilteredTransferFrame\x12<\n" +
 	"\rtransfer_path\x18\x01 \x01(\v2\x17.bringyour.TransferPathR\ftransferPath\"\x8e\x01\n" +
 	"\x1eFilteredTransferFrameWithFrame\x12<\n" +
@@ -1713,25 +1734,27 @@ var file_transfer_proto_goTypes = []any{
 var file_transfer_proto_depIdxs = []int32{
 	2,  // 0: bringyour.TransferFrame.transfer_path:type_name -> bringyour.TransferPath
 	23, // 1: bringyour.TransferFrame.frame:type_name -> bringyour.Frame
-	2,  // 2: bringyour.FilteredTransferFrame.transfer_path:type_name -> bringyour.TransferPath
-	2,  // 3: bringyour.FilteredTransferFrameWithFrame.transfer_path:type_name -> bringyour.TransferPath
-	24, // 4: bringyour.FilteredTransferFrameWithFrame.frame:type_name -> bringyour.FilteredFrame
-	23, // 5: bringyour.Pack.frames:type_name -> bringyour.Frame
-	23, // 6: bringyour.Pack.contract_frame:type_name -> bringyour.Frame
-	9,  // 7: bringyour.Pack.tag:type_name -> bringyour.Tag
-	23, // 8: bringyour.FilteredPack.contract_frame:type_name -> bringyour.Frame
-	9,  // 9: bringyour.Ack.tag:type_name -> bringyour.Tag
-	12, // 10: bringyour.Provide.keys:type_name -> bringyour.ProvideKey
-	0,  // 11: bringyour.ProvideKey.mode:type_name -> bringyour.ProvideMode
-	1,  // 12: bringyour.CreateContractResult.error:type_name -> bringyour.ContractError
-	17, // 13: bringyour.CreateContractResult.contract:type_name -> bringyour.Contract
-	15, // 14: bringyour.CreateContractResult.create_contract:type_name -> bringyour.CreateContract
-	0,  // 15: bringyour.Contract.provide_mode:type_name -> bringyour.ProvideMode
-	16, // [16:16] is the sub-list for method output_type
-	16, // [16:16] is the sub-list for method input_type
-	16, // [16:16] is the sub-list for extension type_name
-	16, // [16:16] is the sub-list for extension extendee
-	0,  // [0:16] is the sub-list for field type_name
+	6,  // 2: bringyour.TransferFrame.pack:type_name -> bringyour.Pack
+	8,  // 3: bringyour.TransferFrame.ack:type_name -> bringyour.Ack
+	2,  // 4: bringyour.FilteredTransferFrame.transfer_path:type_name -> bringyour.TransferPath
+	2,  // 5: bringyour.FilteredTransferFrameWithFrame.transfer_path:type_name -> bringyour.TransferPath
+	24, // 6: bringyour.FilteredTransferFrameWithFrame.frame:type_name -> bringyour.FilteredFrame
+	23, // 7: bringyour.Pack.frames:type_name -> bringyour.Frame
+	23, // 8: bringyour.Pack.contract_frame:type_name -> bringyour.Frame
+	9,  // 9: bringyour.Pack.tag:type_name -> bringyour.Tag
+	23, // 10: bringyour.FilteredPack.contract_frame:type_name -> bringyour.Frame
+	9,  // 11: bringyour.Ack.tag:type_name -> bringyour.Tag
+	12, // 12: bringyour.Provide.keys:type_name -> bringyour.ProvideKey
+	0,  // 13: bringyour.ProvideKey.mode:type_name -> bringyour.ProvideMode
+	1,  // 14: bringyour.CreateContractResult.error:type_name -> bringyour.ContractError
+	17, // 15: bringyour.CreateContractResult.contract:type_name -> bringyour.Contract
+	15, // 16: bringyour.CreateContractResult.create_contract:type_name -> bringyour.CreateContract
+	0,  // 17: bringyour.Contract.provide_mode:type_name -> bringyour.ProvideMode
+	18, // [18:18] is the sub-list for method output_type
+	18, // [18:18] is the sub-list for method input_type
+	18, // [18:18] is the sub-list for extension type_name
+	18, // [18:18] is the sub-list for extension extendee
+	0,  // [0:18] is the sub-list for field type_name
 }
 
 func init() { file_transfer_proto_init() }
@@ -1741,6 +1764,7 @@ func file_transfer_proto_init() {
 	}
 	file_frame_proto_init()
 	file_transfer_proto_msgTypes[0].OneofWrappers = []any{}
+	file_transfer_proto_msgTypes[1].OneofWrappers = []any{}
 	file_transfer_proto_msgTypes[4].OneofWrappers = []any{}
 	file_transfer_proto_msgTypes[5].OneofWrappers = []any{}
 	file_transfer_proto_msgTypes[6].OneofWrappers = []any{}

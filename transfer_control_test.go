@@ -65,7 +65,7 @@ func TestControlSync(t *testing.T) {
 			for j := range b {
 				frame, err := ToFrame(&protocol.SimpleMessage{
 					MessageIndex: uint32(i*b + j),
-				})
+				}, DefaultProtocolVersion)
 				assert.Equal(t, err, nil)
 				controlSyncM1.Send(
 					frame,

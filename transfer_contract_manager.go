@@ -17,7 +17,7 @@ import (
 
 	"golang.org/x/exp/maps"
 
-	"google.golang.org/protobuf/proto"
+	// "google.golang.org/protobuf/proto"
 
 	"github.com/golang/glog"
 
@@ -93,6 +93,8 @@ func DefaultContractManagerSettings() *ContractManagerSettings {
 		LegacyCreateContract: true,
 
 		ProvidePingTimeout: 5 * time.Second,
+
+		ProtocolVersion: DefaultProtocolVersion,
 	}
 }
 
@@ -113,6 +115,8 @@ type ContractManagerSettings struct {
 
 	// an active ping to the control fast-tracks any timeouts
 	ProvidePingTimeout time.Duration
+
+	ProtocolVersion int
 }
 
 func (self *ContractManagerSettings) ContractsEnabled() bool {
@@ -254,7 +258,7 @@ func (self *ContractManager) providePing() {
 
 		ack := make(chan error)
 		providePing := &protocol.ProvidePing{}
-		self.client.SendControl(RequireToFrame(providePing), func(err error) {
+		self.client.SendControl(RequireToFrame(providePing, self.settings.ProtocolVersion), func(err error) {
 			select {
 			case ack <- err:
 			case <-self.ctx.Done():
@@ -316,8 +320,8 @@ func (self *ContractManager) Receive(source TransferPath, frames []*protocol.Fra
 					}
 					return err
 				} else {
-					var storedContract protocol.StoredContract
-					err = proto.Unmarshal(contract.StoredContractBytes, &storedContract)
+					storedContract := &protocol.StoredContract{}
+					err = ProtoUnmarshal(contract.StoredContractBytes, storedContract)
 					if err != nil {
 						contractError := protocol.ContractError_Invalid
 						contractStatus = &ContractStatus{
@@ -407,8 +411,8 @@ func (self *ContractManager) parseControlFrame(frame *protocol.Frame) (
 			}
 			contractErrors[contractKey] = *contractError
 		} else if contract := v.Contract; contract != nil {
-			var storedContract protocol.StoredContract
-			err := proto.Unmarshal(contract.StoredContractBytes, &storedContract)
+			storedContract := &protocol.StoredContract{}
+			err := ProtoUnmarshal(contract.StoredContractBytes, storedContract)
 			if err != nil {
 				return
 			}
@@ -425,10 +429,14 @@ func (self *ContractManager) parseControlFrame(frame *protocol.Frame) (
 		}
 	}
 
-	if message, err := FromFrame(frame); err == nil {
-		switch v := message.(type) {
-		case *protocol.CreateContractResult:
-			addResult(v)
+	switch frame.MessageType {
+	case protocol.MessageType_TransferCreateContractResult:
+		b := make([]byte, len(frame.MessageBytes))
+		copy(b, frame.MessageBytes)
+		r := &protocol.CreateContractResult{}
+		err := ProtoUnmarshal(b, r)
+		if err == nil {
+			addResult(r)
 		}
 	}
 	return
@@ -485,7 +493,7 @@ func (self *ContractManager) SetProvidePaused(providePaused bool) bool {
 			Keys: []*protocol.ProvideKey{},
 		}
 		self.controlSyncProvide.Send(
-			RequireToFrame(provide),
+			RequireToFrame(provide, self.settings.ProtocolVersion),
 			nil,
 			nil,
 		)
@@ -505,7 +513,7 @@ func (self *ContractManager) SetProvidePaused(providePaused bool) bool {
 			Keys: provideKeys,
 		}
 		self.controlSyncProvide.Send(
-			RequireToFrame(provide),
+			RequireToFrame(provide, self.settings.ProtocolVersion),
 			nil,
 			nil,
 		)
@@ -570,7 +578,7 @@ func (self *ContractManager) SetProvideModesWithAckCallback(provideModes map[pro
 			Keys: provideKeys,
 		}
 		self.controlSyncProvide.Send(
-			RequireToFrame(provide),
+			RequireToFrame(provide, self.settings.ProtocolVersion),
 			nil,
 			ackCallback,
 		)
@@ -711,8 +719,8 @@ func (self *ContractManager) TakeContract(
 }
 
 func (self *ContractManager) addContract(contractKey ContractKey, contract *protocol.Contract) error {
-	var storedContract protocol.StoredContract
-	err := proto.Unmarshal(contract.StoredContractBytes, &storedContract)
+	storedContract := &protocol.StoredContract{}
+	err := ProtoUnmarshal(contract.StoredContractBytes, storedContract)
 	if err != nil {
 		return err
 	}
@@ -738,8 +746,7 @@ func (self *ContractManager) addContract(contractKey ContractKey, contract *prot
 	func() {
 		contractQueue := self.openContractQueue(contractKey)
 		defer self.closeContractQueue(contractKey)
-
-		contractQueue.Add(contract, &storedContract)
+		contractQueue.Add(contract, storedContract)
 	}()
 
 	func() {
@@ -769,7 +776,7 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, timeout tim
 		UsedContractIds:   contractQueue.UsedContractIdBytes(),
 	}
 	self.client.ClientOob().SendControl(
-		[]*protocol.Frame{RequireToFrame(createContract)},
+		[]*protocol.Frame{RequireToFrame(createContract, self.settings.ProtocolVersion)},
 		func(resultFrames []*protocol.Frame, err error) {
 			if err == nil {
 				self.Receive(SourceId(ControlId), resultFrames, protocol.ProvideMode_Network)
@@ -834,7 +841,7 @@ func (self *ContractManager) CloseContractWithCheckpoint(
 		Checkpoint:       checkpoint,
 	}
 	self.client.ClientOob().SendControl(
-		[]*protocol.Frame{RequireToFrame(closeContract)},
+		[]*protocol.Frame{RequireToFrame(closeContract, self.settings.ProtocolVersion)},
 		func(resultFrames []*protocol.Frame, err error) {
 			if err == nil && opened {
 				contractQueue := self.openContractQueue(contractKey)
@@ -899,8 +906,8 @@ func (self *ContractManager) FlushContractQueue(contractKey ContractKey, resetUs
 func (self *ContractManager) closeContracts(contracts []*protocol.Contract) []Id {
 	contractIds := []Id{}
 	for _, contract := range contracts {
-		var storedContract protocol.StoredContract
-		if err := proto.Unmarshal(contract.StoredContractBytes, &storedContract); err == nil {
+		storedContract := &protocol.StoredContract{}
+		if err := ProtoUnmarshal(contract.StoredContractBytes, storedContract); err == nil {
 			if contractId, err := IdFromBytes(storedContract.ContractId); err == nil {
 				contractIds = append(contractIds, contractId)
 				self.CloseContract(contractId, ByteCount(0), ByteCount(0))

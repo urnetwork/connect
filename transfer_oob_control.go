@@ -6,7 +6,7 @@ import (
 
 	"encoding/base64"
 
-	"google.golang.org/protobuf/proto"
+	// "google.golang.org/protobuf/proto"
 
 	"github.com/urnetwork/connect/protocol"
 )
@@ -63,11 +63,12 @@ func (self *ApiOutOfBandControl) SendControl(
 	pack := &protocol.Pack{
 		Frames: frames,
 	}
-	packBytes, err := proto.Marshal(pack)
+	packBytes, err := ProtoMarshal(pack)
 	if err != nil {
 		safeCallback(nil, err)
 		return
 	}
+	defer MessagePoolReturn(packBytes)
 
 	packByteStr := base64.StdEncoding.EncodeToString(packBytes)
 
@@ -88,7 +89,7 @@ func (self *ApiOutOfBandControl) SendControl(
 			}
 
 			responsePack := &protocol.Pack{}
-			err = proto.Unmarshal(packBytes, responsePack)
+			err = ProtoUnmarshal(packBytes, responsePack)
 			if err != nil {
 				safeCallback(nil, err)
 				return

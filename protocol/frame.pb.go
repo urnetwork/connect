@@ -128,6 +128,7 @@ type Frame struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	MessageType   MessageType            `protobuf:"varint,1,opt,name=message_type,json=messageType,proto3,enum=bringyour.MessageType" json:"message_type,omitempty"`
 	MessageBytes  []byte                 `protobuf:"bytes,2,opt,name=message_bytes,json=messageBytes,proto3" json:"message_bytes,omitempty"`
+	Raw           bool                   `protobuf:"varint,3,opt,name=raw,proto3" json:"raw,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -174,6 +175,13 @@ func (x *Frame) GetMessageBytes() []byte {
 		return x.MessageBytes
 	}
 	return nil
+}
+
+func (x *Frame) GetRaw() bool {
+	if x != nil {
+		return x.Raw
+	}
+	return false
 }
 
 type FilteredFrame struct {
@@ -224,10 +232,11 @@ var File_frame_proto protoreflect.FileDescriptor
 
 const file_frame_proto_rawDesc = "" +
 	"\n" +
-	"\vframe.proto\x12\tbringyour\"g\n" +
+	"\vframe.proto\x12\tbringyour\"y\n" +
 	"\x05Frame\x129\n" +
 	"\fmessage_type\x18\x01 \x01(\x0e2\x16.bringyour.MessageTypeR\vmessageType\x12#\n" +
-	"\rmessage_bytes\x18\x02 \x01(\fR\fmessageBytes\"J\n" +
+	"\rmessage_bytes\x18\x02 \x01(\fR\fmessageBytes\x12\x10\n" +
+	"\x03raw\x18\x03 \x01(\bR\x03raw\"J\n" +
 	"\rFilteredFrame\x129\n" +
 	"\fmessage_type\x18\x01 \x01(\x0e2\x16.bringyour.MessageTypeR\vmessageType*\xee\x03\n" +
 	"\vMessageType\x12\x10\n" +

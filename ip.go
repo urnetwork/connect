@@ -914,9 +914,9 @@ func (self *StreamState) DataPackets(payload []byte, n int, mtu int) ([][]byte, 
 				return nil, err
 			}
 			packet := buffer.Bytes()
-			// packetCopy := make([]byte, len(packet))
-			// copy(packetCopy, packet)
-			packetCopy := MessagePoolCopy(packet)
+			packetCopy := make([]byte, len(packet))
+			copy(packetCopy, packet)
+			// packetCopy := MessagePoolCopy(packet)
 			packets = append(packets, packetCopy)
 			buffer.Clear()
 			i = j
@@ -2141,9 +2141,9 @@ func (self *ConnectionState) DataPackets(payload []byte, n int, mtu int) ([][]by
 				return nil, err
 			}
 			packet := buffer.Bytes()
-			// packetCopy := make([]byte, len(packet))
-			// copy(packetCopy, packet)
-			packetCopy := MessagePoolCopy(packet)
+			packetCopy := make([]byte, len(packet))
+			copy(packetCopy, packet)
+			// packetCopy := MessagePoolCopy(packet)
 			packets = append(packets, packetCopy)
 			buffer.Clear()
 			i = j
@@ -2186,12 +2186,15 @@ func tcpFlagsString(tcp *layers.TCP) string {
 
 func DefaultRemoteUserNatProviderSettings() *RemoteUserNatProviderSettings {
 	return &RemoteUserNatProviderSettings{
-		WriteTimeout: 30 * time.Second,
+		WriteTimeout:    30 * time.Second,
+		ProtocolVersion: DefaultProtocolVersion,
 	}
 }
 
 type RemoteUserNatProviderSettings struct {
 	WriteTimeout time.Duration
+
+	ProtocolVersion int
 }
 
 type RemoteUserNatProvider struct {
@@ -2249,13 +2252,16 @@ func (self *RemoteUserNatProvider) Receive(
 
 	ipPacketFromProvider := &protocol.IpPacketFromProvider{
 		IpPacket: &protocol.IpPacket{
-			PacketBytes: packet,
+			PacketBytes: MessagePoolCopy(packet),
 		},
 	}
-	frame, err := ToFrame(ipPacketFromProvider)
+	frame, err := ToFrame(ipPacketFromProvider, self.settings.ProtocolVersion)
 	if err != nil {
 		glog.V(2).Infof("drop remote user nat provider s packet ->%s = %s\n", source.SourceId, err)
 		panic(err)
+	}
+	if !frame.Raw {
+		defer MessagePoolReturn(ipPacketFromProvider.IpPacket.PacketBytes)
 	}
 
 	opts := []any{
@@ -2316,13 +2322,24 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 			}
 			ipPacketToProvider := ipPacketToProvider_.(*protocol.IpPacketToProvider)
 
-			packet := ipPacketToProvider.IpPacket.PacketBytes
+			var packet []byte
+			if frame.Raw {
+				packet = MessagePoolCopy(ipPacketToProvider.IpPacket.PacketBytes)
+			} else {
+				packet = ipPacketToProvider.IpPacket.PacketBytes
+			}
+
 			_, r, err := self.securityPolicy.Inspect(provideMode, packet)
 			if err == nil {
 				switch r {
 				case SecurityPolicyResultAllow:
 					c := func() bool {
-						return self.localUserNat.SendPacketWithTimeout(source, provideMode, packet, self.settings.WriteTimeout)
+						return self.localUserNat.SendPacketWithTimeout(
+							source,
+							provideMode,
+							packet,
+							self.settings.WriteTimeout,
+						)
 					}
 					if glog.V(2) {
 						TraceWithReturn(
@@ -2390,8 +2407,6 @@ func (self *RemoteUserNatClient) SecurityPolicyStats(reset bool) SecurityPolicyS
 
 // `SendPacketFunction`
 func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool {
-	defer MessagePoolReturn(packet)
-
 	minRelationship := max(provideMode, self.provideMode)
 
 	ipPath, r, err := self.securityPolicy.Inspect(minRelationship, packet)
@@ -2411,9 +2426,12 @@ func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode pro
 				PacketBytes: packet,
 			},
 		}
-		frame, err := ToFrame(ipPacketToProvider)
+		frame, err := ToFrame(ipPacketToProvider, DefaultProtocolVersion)
 		if err != nil {
 			panic(err)
+		}
+		if !frame.Raw {
+			defer MessagePoolReturn(packet)
 		}
 
 		// the sender will control transfer
@@ -2445,14 +2463,21 @@ func (self *RemoteUserNatClient) ClientReceive(source TransferPath, frames []*pr
 			}
 			ipPacketFromProvider := ipPacketFromProvider_.(*protocol.IpPacketFromProvider)
 
-			ipPath, err := ParseIpPath(ipPacketFromProvider.IpPacket.PacketBytes)
+			var packet []byte
+			if frame.Raw {
+				packet = MessagePoolCopy(ipPacketFromProvider.IpPacket.PacketBytes)
+			} else {
+				packet = ipPacketFromProvider.IpPacket.PacketBytes
+			}
+
+			ipPath, err := ParseIpPath(packet)
 			if err == nil {
 				HandleError(func() {
 					self.receivePacketCallback(
 						source,
 						provideMode,
 						ipPath,
-						ipPacketFromProvider.IpPacket.PacketBytes,
+						packet,
 					)
 				})
 			}

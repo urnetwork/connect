@@ -97,6 +97,8 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// TODO on platforms with more memory, increase this
 		MultiRaceClientCount: 4,
 
+		ProtocolVersion: DefaultProtocolVersion,
+
 		RemoteUserNatMultiClientMonitorSettings: *DefaultRemoteUserNatMultiClientMonitorSettings(),
 	}
 }
@@ -149,6 +151,8 @@ type MultiClientSettings struct {
 	MultiRacePacketMaxCount              int
 	MultiRaceClientEarlyCompleteFraction float32
 	MultiRaceClientCount                 int
+
+	ProtocolVersion int
 
 	RemoteUserNatMultiClientMonitorSettings
 }
@@ -1971,10 +1975,13 @@ func (self *multiClientChannel) SendDetailed(parsedPacket *parsedPacket, timeout
 			PacketBytes: parsedPacket.packet,
 		},
 	}
-	if frame, err := ToFrame(ipPacketToProvider); err != nil {
+	if frame, err := ToFrame(ipPacketToProvider, self.settings.ProtocolVersion); err != nil {
 		self.addError(err)
 		return false, err
 	} else {
+		if !frame.Raw {
+			MessagePoolReturn(parsedPacket.packet)
+		}
 		packetByteCount := ByteCount(len(parsedPacket.packet))
 		self.addSendNack(packetByteCount)
 		self.addSource(parsedPacket.ipPath)
@@ -2004,7 +2011,7 @@ func (self *multiClientChannel) SendDetailed(parsedPacket *parsedPacket, timeout
 }
 
 func (self *multiClientChannel) SendDetailedMessage(message proto.Message, timeout time.Duration, ackCallback func(error)) (bool, error) {
-	if frame, err := ToFrame(message); err != nil {
+	if frame, err := ToFrame(message, self.settings.ProtocolVersion); err != nil {
 		return false, err
 	} else {
 		return self.client.SendMultiHopWithTimeoutDetailed(

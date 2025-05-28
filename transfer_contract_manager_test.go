@@ -11,7 +11,7 @@ import (
 
 	"github.com/go-playground/assert/v2"
 
-	"google.golang.org/protobuf/proto"
+	// "google.golang.org/protobuf/proto"
 
 	"github.com/urnetwork/connect/protocol"
 )
@@ -55,8 +55,9 @@ func TestTakeContract(t *testing.T) {
 				SourceId:          clientId.Bytes(),
 				DestinationId:     destinationId.Bytes(),
 			}
-			storedContractBytes, err := proto.Marshal(storedContract)
+			storedContractBytes, err := ProtoMarshal(storedContract)
 			assert.Equal(t, nil, err)
+			defer MessagePoolReturn(storedContractBytes)
 			mac := hmac.New(sha256.New, provideSecretKey)
 			storedContractHmac := mac.Sum(storedContractBytes)
 
@@ -70,7 +71,7 @@ func TestTakeContract(t *testing.T) {
 					ProvideMode:         relationship,
 				},
 			}
-			frame, err := ToFrame(result)
+			frame, err := ToFrame(result, DefaultProtocolVersion)
 			assert.Equal(t, nil, err)
 
 			contractManager.Receive(SourceId(ControlId), []*protocol.Frame{frame}, protocol.ProvideMode_Network)
@@ -109,7 +110,7 @@ func TestTakeContract(t *testing.T) {
 		select {
 		case contract := <-contracts:
 			var storedContract protocol.StoredContract
-			err := proto.Unmarshal(contract.StoredContractBytes, &storedContract)
+			err := ProtoUnmarshal(contract.StoredContractBytes, &storedContract)
 			assert.Equal(t, nil, err)
 
 			contractId, err := IdFromBytes(storedContract.ContractId)

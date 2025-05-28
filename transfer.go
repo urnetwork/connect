@@ -17,7 +17,7 @@ import (
 
 	"golang.org/x/exp/maps"
 
-	"google.golang.org/protobuf/proto"
+	// "google.golang.org/protobuf/proto"
 
 	"github.com/golang/glog"
 
@@ -60,7 +60,7 @@ Each transport should apply the forwarding ACL:
 // use 0 for deadlock testing
 const DefaultTransferBufferSize = 32
 
-const VerifyForwardMessages = false
+var DebugTransferCopyOnWrite = false
 
 type AckFunction = func(err error)
 
@@ -82,6 +82,7 @@ func DefaultClientSettings() *ClientSettings {
 		ForwardBufferSettings:   DefaultForwardBufferSettings(),
 		ContractManagerSettings: DefaultContractManagerSettings(),
 		StreamManagerSettings:   DefaultStreamManagerSettings(),
+		ProtocolVersion:         DefaultProtocolVersion,
 	}
 }
 
@@ -113,6 +114,7 @@ func DefaultSendBufferSettings() *SendBufferSettings {
 		WriteTimeout:            15 * time.Second,
 		ResendQueueMaxByteCount: mib(2),
 		ContractFillFraction:    0.5,
+		ProtocolVersion:         DefaultProtocolVersion,
 	}
 }
 
@@ -133,6 +135,7 @@ func DefaultReceiveBufferSettings() *ReceiveBufferSettings {
 		ReceiveQueueMaxByteCount: mib(2) + kib(512),
 		AllowLegacyNack:          true,
 		MaxOpenReceiveContract:   4,
+		ProtocolVersion:          DefaultProtocolVersion,
 	}
 }
 
@@ -159,12 +162,13 @@ type SendPack struct {
 }
 
 type ReceivePack struct {
-	Source           TransferPath
-	SequenceId       Id
-	Pack             *protocol.Pack
-	ReceiveCallback  ReceiveFunction
-	MessageByteCount ByteCount
-	Ctx              context.Context
+	Source             TransferPath
+	SequenceId         Id
+	Pack               *protocol.Pack
+	ReceiveCallback    ReceiveFunction
+	MessageByteCount   ByteCount
+	TransferFrameBytes []byte
+	Ctx                context.Context
 }
 
 type ForwardPack struct {
@@ -248,6 +252,8 @@ type ClientSettings struct {
 	ForwardBufferSettings   *ForwardBufferSettings
 	ContractManagerSettings *ContractManagerSettings
 	StreamManagerSettings   *StreamManagerSettings
+
+	ProtocolVersion int
 }
 
 // note all callbacks are wrapped to check for nil and recover from errors
@@ -388,7 +394,7 @@ func (self *Client) ForwardWithTimeoutDetailed(transferFrameBytes []byte, timeou
 	}
 
 	var filteredTransferFrame protocol.FilteredTransferFrame
-	if err := proto.Unmarshal(transferFrameBytes, &filteredTransferFrame); err != nil {
+	if err := ProtoUnmarshal(transferFrameBytes, &filteredTransferFrame); err != nil {
 		// bad protobuf
 		return false, err
 	}
@@ -694,7 +700,7 @@ func (self *Client) run() {
 
 				ack := make(chan error)
 				controlPing := &protocol.ControlPing{}
-				self.SendControl(RequireToFrame(controlPing), func(err error) {
+				self.SendControl(RequireToFrame(controlPing, self.settings.ProtocolVersion), func(err error) {
 					select {
 					case ack <- err:
 					case <-self.ctx.Done():
@@ -766,7 +772,7 @@ func (self *Client) run() {
 		// because of this, errors in parsing the `FilteredTransferFrame` are not expected
 		// decode a minimal subset of the full message needed to make a routing decision
 		filteredTransferFrame := &protocol.FilteredTransferFrame{}
-		if err := proto.Unmarshal(transferFrameBytes, filteredTransferFrame); err != nil {
+		if err := ProtoUnmarshal(transferFrameBytes, filteredTransferFrame); err != nil {
 			// bad protobuf (unexpected, see route note above)
 			MessagePoolReturn(transferFrameBytes)
 			continue
@@ -796,7 +802,7 @@ func (self *Client) run() {
 			// the transports have typically not parsed the full `TransferFrame`
 			// on error, discard the message and report the peer
 			transferFrame := &protocol.TransferFrame{}
-			if err := proto.Unmarshal(transferFrameBytes, transferFrame); err != nil {
+			if err := ProtoUnmarshal(transferFrameBytes, transferFrame); err != nil {
 				// bad protobuf
 				updatePeerAudit(source, func(a *PeerAudit) {
 					a.badMessage(ByteCount(len(transferFrameBytes)))
@@ -804,19 +810,43 @@ func (self *Client) run() {
 				MessagePoolReturn(transferFrameBytes)
 				continue
 			}
-			frame := transferFrame.GetFrame()
 
-			switch frame.GetMessageType() {
-			case protocol.MessageType_TransferAck:
-				ack := &protocol.Ack{}
-				if err := proto.Unmarshal(frame.GetMessageBytes(), ack); err != nil {
-					// bad protobuf
+			ack := transferFrame.Ack
+			pack := transferFrame.Pack
+
+			if frame := transferFrame.GetFrame(); frame != nil {
+
+				switch frame.GetMessageType() {
+				case protocol.MessageType_TransferAck:
+					ack = &protocol.Ack{}
+					if err := ProtoUnmarshal(frame.GetMessageBytes(), ack); err != nil {
+						// bad protobuf
+						updatePeerAudit(source, func(a *PeerAudit) {
+							a.badMessage(ByteCount(len(transferFrameBytes)))
+						})
+						MessagePoolReturn(transferFrameBytes)
+						continue
+					}
+
+				case protocol.MessageType_TransferPack:
+					pack = &protocol.Pack{}
+					if err := ProtoUnmarshal(frame.GetMessageBytes(), pack); err != nil {
+						// bad protobuf
+						updatePeerAudit(source, func(a *PeerAudit) {
+							a.badMessage(ByteCount(len(transferFrameBytes)))
+						})
+						MessagePoolReturn(transferFrameBytes)
+						continue
+					}
+
+				default:
 					updatePeerAudit(source, func(a *PeerAudit) {
 						a.badMessage(ByteCount(len(transferFrameBytes)))
 					})
-					MessagePoolReturn(transferFrameBytes)
-					continue
 				}
+			}
+
+			if ack != nil {
 				c := func() bool {
 					return self.sendBuffer.Ack(
 						source.Reverse(),
@@ -832,16 +862,8 @@ func (self *Client) run() {
 				} else {
 					c()
 				}
-			case protocol.MessageType_TransferPack:
-				pack := &protocol.Pack{}
-				if err := proto.Unmarshal(frame.GetMessageBytes(), pack); err != nil {
-					// bad protobuf
-					updatePeerAudit(source, func(a *PeerAudit) {
-						a.badMessage(ByteCount(len(transferFrameBytes)))
-					})
-					MessagePoolReturn(transferFrameBytes)
-					continue
-				}
+			}
+			if pack != nil {
 				sequenceId, err := IdFromBytes(pack.SequenceId)
 				if err != nil {
 					// bad protobuf
@@ -850,11 +872,12 @@ func (self *Client) run() {
 				messageByteCount := MessageByteCount(pack.Frames)
 				c := func() bool {
 					success, err := self.receiveBuffer.Pack(&ReceivePack{
-						Source:           source,
-						SequenceId:       sequenceId,
-						Pack:             pack,
-						ReceiveCallback:  self.receive,
-						MessageByteCount: messageByteCount,
+						Source:             source,
+						SequenceId:         sequenceId,
+						Pack:               pack,
+						ReceiveCallback:    self.receive,
+						MessageByteCount:   messageByteCount,
+						TransferFrameBytes: transferFrameBytes,
 					}, self.settings.BufferTimeout)
 					return success && err == nil
 				}
@@ -866,52 +889,8 @@ func (self *Client) run() {
 				} else {
 					c()
 				}
-			default:
-				updatePeerAudit(source, func(a *PeerAudit) {
-					a.badMessage(ByteCount(len(transferFrameBytes)))
-				})
 			}
 		} else {
-			if VerifyForwardMessages {
-				transferFrame := &protocol.TransferFrame{}
-				if err := proto.Unmarshal(transferFrameBytes, transferFrame); err != nil {
-					// bad protobuf
-					updatePeerAudit(source, func(a *PeerAudit) {
-						a.badMessage(ByteCount(len(transferFrameBytes)))
-					})
-					MessagePoolReturn(transferFrameBytes)
-					continue
-				}
-				frame := transferFrame.GetFrame()
-
-				// TODO apply source verification+decryption with pke
-
-				switch frame.GetMessageType() {
-				case protocol.MessageType_TransferAck:
-					ack := &protocol.Ack{}
-					if err := proto.Unmarshal(frame.GetMessageBytes(), ack); err != nil {
-						// bad protobuf
-						updatePeerAudit(source, func(a *PeerAudit) {
-							a.badMessage(ByteCount(len(transferFrameBytes)))
-						})
-						MessagePoolReturn(transferFrameBytes)
-						continue
-					}
-				case protocol.MessageType_TransferPack:
-					pack := &protocol.Pack{}
-					if err := proto.Unmarshal(frame.GetMessageBytes(), pack); err != nil {
-						// bad protobuf
-						updatePeerAudit(source, func(a *PeerAudit) {
-							a.badMessage(ByteCount(len(transferFrameBytes)))
-						})
-						MessagePoolReturn(transferFrameBytes)
-						continue
-					}
-				default:
-					// unknown message, ignore
-				}
-			}
-
 			c := func() {
 				self.forward(
 					path,
@@ -927,7 +906,6 @@ func (self *Client) run() {
 				c()
 			}
 		}
-		MessagePoolReturn(transferFrameBytes)
 	}
 }
 
@@ -1022,6 +1000,8 @@ type SendBufferSettings struct {
 
 	// as this ->1, there is more risk that noack messages will get dropped due to out of sync contracts
 	ContractFillFraction float32
+
+	ProtocolVersion int
 }
 
 type sendSequenceId struct {
@@ -1538,6 +1518,9 @@ func (self *SendSequence) Run() {
 						glog.Errorf("[s]%s->%s...%s s(%s) exit could not set head = %s\n", self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId, err)
 						return
 					}
+					MessagePoolReturn(item.transferFrameBytes)
+					item.head = true
+					item.transferFrameBytes = transferFrameBytes
 				} else {
 					// var err error
 					// transferFrameBytes, err = self.setTag(item)
@@ -1549,6 +1532,9 @@ func (self *SendSequence) Run() {
 				}
 
 				c := func() error {
+					if DebugTransferCopyOnWrite {
+						transferFrameBytes = MessagePoolCopy(transferFrameBytes)
+					}
 					return self.openContractMultiRouteWriter().Write(
 						self.ctx,
 						transferFrameBytes,
@@ -1866,17 +1852,23 @@ func (self *SendSequence) sendWithSetContract(
 
 	var contractFrame *protocol.Frame
 	if (head || setContract) && self.sendContract != nil {
-		contractMessageBytes, _ := proto.Marshal(self.sendContract.contract)
+		contractMessageBytes, _ := ProtoMarshal(self.sendContract.contract)
 		contractFrame = &protocol.Frame{
 			MessageType:  protocol.MessageType_TransferContract,
 			MessageBytes: contractMessageBytes,
 		}
+		defer MessagePoolReturn(contractMessageBytes)
 	}
 
 	frames := []*protocol.Frame{}
 	if frame != nil {
 		frames = append(frames, frame)
 	}
+	defer func() {
+		for _, frame := range frames {
+			MessagePoolReturn(frame.MessageBytes)
+		}
+	}()
 
 	pack := &protocol.Pack{
 		MessageId:      messageId.Bytes(),
@@ -1892,8 +1884,6 @@ func (self *SendSequence) sendWithSetContract(
 		pack.ContractId = contractId.Bytes()
 	}
 
-	packBytes, _ := proto.Marshal(pack)
-
 	var path TransferPath
 	if self.sendContract == nil {
 		path = self.destination.AddSource(self.client.ClientId())
@@ -1902,13 +1892,20 @@ func (self *SendSequence) sendWithSetContract(
 	}
 	transferFrame := &protocol.TransferFrame{
 		TransferPath: path.ToProtobuf(),
-		Frame: &protocol.Frame{
-			MessageType:  protocol.MessageType_TransferPack,
-			MessageBytes: packBytes,
-		},
 	}
 
-	transferFrameBytes, _ := proto.Marshal(transferFrame)
+	if 2 <= self.sendBufferSettings.ProtocolVersion {
+		transferFrame.Pack = pack
+	} else {
+		packBytes, _ := ProtoMarshal(pack)
+		defer MessagePoolReturn(packBytes)
+		transferFrame.Frame = &protocol.Frame{
+			MessageType:  protocol.MessageType_TransferPack,
+			MessageBytes: packBytes,
+		}
+	}
+
+	transferFrameBytes, _ := ProtoMarshal(transferFrame)
 
 	messageByteCount := MessageByteCount(pack.Frames)
 
@@ -1929,9 +1926,13 @@ func (self *SendSequence) sendWithSetContract(
 	}
 
 	c := func() error {
+		transferFrameBytes := item.transferFrameBytes
+		if DebugTransferCopyOnWrite {
+			transferFrameBytes = MessagePoolCopy(transferFrameBytes)
+		}
 		return self.openContractMultiRouteWriter().Write(
 			self.ctx,
-			item.transferFrameBytes,
+			transferFrameBytes,
 			self.sendBufferSettings.WriteTimeout,
 		)
 	}
@@ -1966,15 +1967,20 @@ func (self *SendSequence) setHead(item *sendItem) ([]byte, error) {
 	glog.Infof("[s]set head %s->%s...%s s(%s)\n", self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId)
 
 	var transferFrame protocol.TransferFrame
-	err := proto.Unmarshal(item.transferFrameBytes, &transferFrame)
+	err := ProtoUnmarshal(item.transferFrameBytes, &transferFrame)
 	if err != nil {
 		return nil, err
 	}
 
-	var pack protocol.Pack
-	err = proto.Unmarshal(transferFrame.Frame.MessageBytes, &pack)
-	if err != nil {
-		return nil, err
+	var pack *protocol.Pack
+	if transferFrame.Pack != nil {
+		pack = transferFrame.Pack
+	} else {
+		pack = &protocol.Pack{}
+		err = ProtoUnmarshal(transferFrame.Frame.MessageBytes, pack)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	pack.Head = true
@@ -1982,20 +1988,26 @@ func (self *SendSequence) setHead(item *sendItem) ([]byte, error) {
 	// attach the contract frame to the head
 	if item.contractId != nil && !item.hasContractFrame {
 		sendContract := self.openSendContracts[*item.contractId]
-		contractMessageBytes, _ := proto.Marshal(sendContract.contract)
+		contractMessageBytes, _ := ProtoMarshal(sendContract.contract)
 		pack.ContractFrame = &protocol.Frame{
 			MessageType:  protocol.MessageType_TransferContract,
 			MessageBytes: contractMessageBytes,
 		}
+		defer MessagePoolReturn(contractMessageBytes)
 	}
 
-	packBytes, err := proto.Marshal(&pack)
-	if err != nil {
-		return nil, err
+	if transferFrame.Pack != nil {
+		transferFrame.Pack = pack
+	} else {
+		packBytes, err := ProtoMarshal(pack)
+		if err != nil {
+			return nil, err
+		}
+		defer MessagePoolReturn(packBytes)
+		transferFrame.Frame.MessageBytes = packBytes
 	}
-	transferFrame.Frame.MessageBytes = packBytes
 
-	transferFrameBytesWithHead, err := proto.Marshal(&transferFrame)
+	transferFrameBytesWithHead, err := ProtoMarshal(&transferFrame)
 	if err != nil {
 		return nil, err
 	}
@@ -2114,6 +2126,10 @@ func (self *SendSequence) ackItem(item *sendItem) {
 		}
 	}
 	item.ackCallback(nil)
+	MessagePoolReturn(item.transferFrameBytes)
+	// for _, frame := range item.frames {
+	// 	MessagePoolReturn(frame.MessageBytes)
+	// }
 }
 
 func (self *SendSequence) openContractMultiRouteWriter() MultiRouteWriter {
@@ -2237,6 +2253,8 @@ type ReceiveBufferSettings struct {
 	AllowLegacyNack bool
 
 	MaxOpenReceiveContract int
+
+	ProtocolVersion int
 }
 
 type receiveSequenceId struct {
@@ -2580,18 +2598,25 @@ func (self *ReceiveSequence) Run() {
 				Tag:        sendAck.tag,
 			}
 
-			ackBytes, _ := proto.Marshal(ack)
-
 			path := self.source.Reverse().AddSource(self.client.ClientId())
 			transferFrame := &protocol.TransferFrame{
 				TransferPath: path.ToProtobuf(),
-				Frame: &protocol.Frame{
-					MessageType:  protocol.MessageType_TransferAck,
-					MessageBytes: ackBytes,
-				},
 			}
 
-			transferFrameBytes, _ := proto.Marshal(transferFrame)
+			if 2 <= self.receiveBufferSettings.ProtocolVersion {
+				transferFrame.Ack = ack
+			} else {
+				ackBytes, _ := ProtoMarshal(ack)
+				defer MessagePoolReturn(ackBytes)
+
+				transferFrame.Frame = &protocol.Frame{
+					MessageType:  protocol.MessageType_TransferAck,
+					MessageBytes: ackBytes,
+				}
+			}
+
+			transferFrameBytes, _ := ProtoMarshal(transferFrame)
+			MessagePoolSetOptionalReturn(transferFrameBytes, true)
 
 			c := func() error {
 				return multiRouteWriter.Write(
@@ -2814,13 +2839,14 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 		},
 
 		// contractId:      contractId,
-		receiveTime:     receiveTime,
-		frames:          receivePack.Pack.Frames,
-		contractFrame:   receivePack.Pack.ContractFrame,
-		receiveCallback: receivePack.ReceiveCallback,
-		head:            receivePack.Pack.Head,
-		ack:             !receivePack.Pack.Nack,
-		tag:             receivePack.Pack.Tag,
+		receiveTime:        receiveTime,
+		frames:             receivePack.Pack.Frames,
+		contractFrame:      receivePack.Pack.ContractFrame,
+		receiveCallback:    receivePack.ReceiveCallback,
+		head:               receivePack.Pack.Head,
+		ack:                !receivePack.Pack.Nack,
+		tag:                receivePack.Pack.Tag,
+		transferFrameBytes: receivePack.TransferFrameBytes,
 	}
 
 	// this case happens when the receiver is reformed or loses state.
@@ -3001,6 +3027,10 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 		item.frames,
 		provideMode,
 	)
+	MessagePoolReturn(item.transferFrameBytes)
+	for _, frame := range item.frames {
+		MessagePoolReturn(frame.MessageBytes)
+	}
 	if item.ack {
 		self.sendAck(item.sequenceNumber, item.messageId, false, item.tag)
 	}
@@ -3012,7 +3042,7 @@ func (self *ReceiveSequence) registerContracts(item *receiveItem) error {
 	}
 
 	var contract protocol.Contract
-	err := proto.Unmarshal(item.contractFrame.MessageBytes, &contract)
+	err := ProtoUnmarshal(item.contractFrame.MessageBytes, &contract)
 	if err != nil {
 		// bad message
 		// close sequence
@@ -3143,14 +3173,15 @@ func (self *ReceiveSequence) WaitForExit() {
 type receiveItem struct {
 	transferItem
 
-	contractId      *Id
-	head            bool
-	receiveTime     time.Time
-	frames          []*protocol.Frame
-	contractFrame   *protocol.Frame
-	receiveCallback ReceiveFunction
-	ack             bool
-	tag             *protocol.Tag
+	contractId         *Id
+	head               bool
+	receiveTime        time.Time
+	frames             []*protocol.Frame
+	contractFrame      *protocol.Frame
+	receiveCallback    ReceiveFunction
+	ack                bool
+	tag                *protocol.Tag
+	transferFrameBytes []byte
 }
 
 // ordered by sequenceNumber
@@ -3272,7 +3303,7 @@ type sequenceContract struct {
 
 func newSequenceContract(tag string, contract *protocol.Contract, minUpdateByteCount ByteCount, contractFillFraction float32) (*sequenceContract, error) {
 	storedContract := &protocol.StoredContract{}
-	err := proto.Unmarshal(contract.StoredContractBytes, storedContract)
+	err := ProtoUnmarshal(contract.StoredContractBytes, storedContract)
 	if err != nil {
 		return nil, err
 	}
@@ -3573,7 +3604,11 @@ func (self *ForwardSequence) Run() {
 				return
 			}
 			c := func() error {
-				return self.multiRouteWriter.Write(self.ctx, forwardPack.TransferFrameBytes, self.forwardBufferSettings.WriteTimeout)
+				transferFrameBytes := forwardPack.TransferFrameBytes
+				if DebugTransferCopyOnWrite {
+					transferFrameBytes = MessagePoolCopy(transferFrameBytes)
+				}
+				return self.multiRouteWriter.Write(self.ctx, transferFrameBytes, self.forwardBufferSettings.WriteTimeout)
 			}
 			if glog.V(2) {
 				TraceWithReturn(
@@ -3728,7 +3763,7 @@ func (self *SequencePeerAudit) Complete() {
 		ResendCount:         uint64(self.peerAudit.ResendCount),
 	}
 	self.client.ClientOob().SendControl(
-		[]*protocol.Frame{RequireToFrame(peerAudit)},
+		[]*protocol.Frame{RequireToFrame(peerAudit, DefaultProtocolVersion)},
 		func(resultFrames []*protocol.Frame, err error) {},
 	)
 	self.peerAudit = nil
