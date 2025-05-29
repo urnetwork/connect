@@ -169,7 +169,10 @@ type RemoteUserNatMultiClient struct {
 
 	window *multiClientWindow
 
-	securityPolicy *SecurityPolicy
+	securityPolicyStats   *securityPolicyStats
+	securityPolicy        SecurityPolicy
+	ingressSecurityPolicy SecurityPolicy
+
 	// the provide mode of the source packets
 	// for locally generated packets this is `ProvideMode_Network`
 	provideMode protocol.ProvideMode
@@ -204,6 +207,8 @@ func NewRemoteUserNatMultiClient(
 ) *RemoteUserNatMultiClient {
 	cancelCtx, cancel := context.WithCancel(ctx)
 
+	securityPolicyStats := DefaultSecurityPolicyStats()
+
 	multiClient := &RemoteUserNatMultiClient{
 		ctx:                   cancelCtx,
 		cancel:                cancel,
@@ -211,11 +216,13 @@ func NewRemoteUserNatMultiClient(
 		receivePacketCallback: receivePacketCallback,
 		settings:              settings,
 		// window:                window,
-		securityPolicy: DefaultSecurityPolicy(),
-		provideMode:    provideMode,
-		ip4PathUpdates: map[Ip4Path]*multiClientChannelUpdate{},
-		ip6PathUpdates: map[Ip6Path]*multiClientChannelUpdate{},
-		clientUpdates:  map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
+		securityPolicyStats:   securityPolicyStats,
+		securityPolicy:        DefaultEgressSecurityPolicyWithStats(securityPolicyStats),
+		ingressSecurityPolicy: DefaultIngressSecurityPolicyWithStats(securityPolicyStats),
+		provideMode:           provideMode,
+		ip4PathUpdates:        map[Ip4Path]*multiClientChannelUpdate{},
+		ip6PathUpdates:        map[Ip6Path]*multiClientChannelUpdate{},
+		clientUpdates:         map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
 	}
 
 	multiClient.window = newMultiClientWindow(
@@ -223,6 +230,7 @@ func NewRemoteUserNatMultiClient(
 		cancel,
 		generator,
 		multiClient.clientReceivePacket,
+		multiClient.ingressSecurityPolicy,
 		multiClient.removeClient,
 		settings,
 	)
@@ -231,7 +239,7 @@ func NewRemoteUserNatMultiClient(
 }
 
 func (self *RemoteUserNatMultiClient) SecurityPolicyStats(reset bool) SecurityPolicyStats {
-	return self.securityPolicy.Stats().Stats(reset)
+	return self.securityPolicyStats.Stats(reset)
 }
 
 func (self *RemoteUserNatMultiClient) Monitor() *RemoteUserNatMultiClientMonitor {
@@ -1164,6 +1172,7 @@ type multiClientWindow struct {
 
 	generator                   MultiClientGenerator
 	clientReceivePacketCallback clientReceivePacketFunction
+	ingressSecurityPolicy       SecurityPolicy
 	clientRemoveCallback        func(client *multiClientChannel)
 
 	settings *MultiClientSettings
@@ -1183,6 +1192,7 @@ func newMultiClientWindow(
 	cancel context.CancelFunc,
 	generator MultiClientGenerator,
 	clientReceivePacketCallback clientReceivePacketFunction,
+	ingressSecurityPolicy SecurityPolicy,
 	clientRemoveCallback func(client *multiClientChannel),
 	settings *MultiClientSettings,
 ) *multiClientWindow {
@@ -1191,6 +1201,7 @@ func newMultiClientWindow(
 		cancel:                      cancel,
 		generator:                   generator,
 		clientReceivePacketCallback: clientReceivePacketCallback,
+		ingressSecurityPolicy:       ingressSecurityPolicy,
 		clientRemoveCallback:        clientRemoveCallback,
 		settings:                    settings,
 		clientChannelArgs:           make(chan *multiClientChannelArgs, settings.WindowSizeMin),
@@ -1572,6 +1583,7 @@ func (self *multiClientWindow) expand(currentWindowSize int, currentP2pOnlyWindo
 					args,
 					self.generator,
 					self.clientReceivePacketCallback,
+					self.ingressSecurityPolicy,
 					self.contractStatus,
 					self.settings,
 				)
@@ -1852,6 +1864,7 @@ type multiClientChannel struct {
 	api *BringYourApi
 
 	clientReceivePacketCallback clientReceivePacketFunction
+	ingressSecurityPolicy       SecurityPolicy
 
 	settings *MultiClientSettings
 
@@ -1878,6 +1891,7 @@ func newMultiClientChannel(
 	args *multiClientChannelArgs,
 	generator MultiClientGenerator,
 	clientReceivePacketCallback clientReceivePacketFunction,
+	ingressSecurityPolicy SecurityPolicy,
 	contractStatusCallback ContractStatusFunction,
 	settings *MultiClientSettings,
 ) (*multiClientChannel, error) {
@@ -1914,6 +1928,7 @@ func newMultiClientChannel(
 		cancel:                      cancel,
 		args:                        args,
 		clientReceivePacketCallback: clientReceivePacketCallback,
+		ingressSecurityPolicy:       ingressSecurityPolicy,
 		settings:                    settings,
 		// sourceFilter: sourceFilter,
 		client:                    client,
@@ -2386,8 +2401,9 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 
 				self.addReceiveAck(ByteCount(len(packet)))
 
-				ipPath, err := ParseIpPath(packet)
-				if err == nil {
+				// ipPath, err := ParseIpPath(packet)
+				ipPath, r, err := self.ingressSecurityPolicy.Inspect(provideMode, packet)
+				if err == nil && r == SecurityPolicyResultAllow {
 					self.clientReceivePacketCallback(self, source, provideMode, ipPath, packet)
 				}
 				// else not an ip packet, drop

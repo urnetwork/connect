@@ -1145,6 +1145,20 @@ paths:
                             schema:
                                 $ref: "#/components/schemas/GetPayoutWalletResult"
 
+    /account/points:
+        get:
+            description: |
+                Retrieves account points earned. Eventually, users will be able to convert points for tokens
+            operationId: Account Get Points
+            security:
+                - BearerAuth: []
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: "#/components/schemas/AccountPointsResult"
+
     /account/wallet:
         post:
             description: |
@@ -1376,6 +1390,8 @@ components:
                     enum:
                         - apple
                         - google
+                wallet_auth:
+                    $ref: "#/components/schemas/WalletAuthArgs"
 
         AuthLoginResult:
             type: object
@@ -1409,6 +1425,8 @@ components:
                     properties:
                         by_jwt:
                             type: string
+                wallet_auth:
+                    $ref: "#/components/schemas/WalletAuthArgs"
 
         AuthLoginWithPasswordArgs:
             type: object
@@ -1539,6 +1557,8 @@ components:
                 terms:
                     description: user consent to accept terms of service
                     type: boolean
+                wallet_auth:
+                    $ref: "#/components/schemas/WalletAuthArgs"
 
         NetworkCreateResult:
             type: object
@@ -1586,6 +1606,8 @@ components:
                     type: string
                 network_name:
                     type: string
+                wallet_auth:
+                    $ref: "#/components/schemas/WalletAuthArgs"
 
         UpgradeGuestResult:
             type: object
@@ -2807,3 +2829,45 @@ components:
                     type: integer
                 unpaid_bytes_provided:
                     type: integer
+
+        WalletAuthArgs:
+            type: object
+            properties:
+                wallet_address:
+                    description: The user's wallet address
+                    type: string
+                wallet_message:
+                    description: The signed message
+                    type: string
+                wallet_signature:
+                    type: string
+                blockchain:
+                    type: string
+                    enum:
+                        - solana
+
+        AccountPoint:
+            type: object
+            properties:
+                network_id:
+                    description: uuid
+                    type: string
+                event:
+                    type: string
+                    enum: 
+                        - referral
+                point_value:
+                    type: integer
+                create_time:
+                    description: datetime
+                    type: string
+
+        AccountPointsResult:
+            type: object
+            properties:
+                network_points:
+                    type: array
+                    items:
+                        $ref: "#/components/schemas/AccountPoint"
+
+                

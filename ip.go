@@ -2200,7 +2200,7 @@ type RemoteUserNatProviderSettings struct {
 type RemoteUserNatProvider struct {
 	client            *Client
 	localUserNat      *LocalUserNat
-	securityPolicy    *SecurityPolicy
+	securityPolicy    SecurityPolicy
 	settings          *RemoteUserNatProviderSettings
 	localUserNatUnsub func()
 	clientUnsub       func()
@@ -2221,7 +2221,7 @@ func NewRemoteUserNatProvider(
 	userNatProvider := &RemoteUserNatProvider{
 		client:         client,
 		localUserNat:   localUserNat,
-		securityPolicy: DefaultSecurityPolicy(),
+		securityPolicy: DefaultEgressSecurityPolicy(),
 		settings:       settings,
 	}
 
@@ -2368,7 +2368,7 @@ func (self *RemoteUserNatProvider) Close() {
 type RemoteUserNatClient struct {
 	client                *Client
 	receivePacketCallback ReceivePacketFunction
-	securityPolicy        *SecurityPolicy
+	securityPolicy        SecurityPolicy
 	pathTable             *pathTable
 	// the provide mode of the source packets
 	// for locally generated packets this is `ProvideMode_Network`
@@ -2390,7 +2390,7 @@ func NewRemoteUserNatClient(
 	userNatClient := &RemoteUserNatClient{
 		client:                client,
 		receivePacketCallback: receivePacketCallback,
-		securityPolicy:        DefaultSecurityPolicy(),
+		securityPolicy:        DefaultEgressSecurityPolicy(),
 		pathTable:             pathTable,
 		provideMode:           provideMode,
 	}
