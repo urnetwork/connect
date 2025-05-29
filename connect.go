@@ -15,6 +15,14 @@ import (
 
 const MaxMultihopLength = 8
 
+// v1: original
+// v2: 2025-05-28 to optimize memory usage. Breaks compatibility with v1
+//
+//	Most clients need to be able to read v2 before we turn this on.
+//
+// TODO migrate to 2
+const DefaultProtocolVersion = 1
+
 // id for message to/from the platform
 var ControlId = Id{}
 

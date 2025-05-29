@@ -33,6 +33,9 @@ enum MessageType {
 message Frame {
     MessageType message_type = 1;
     bytes message_bytes = 2;
+    // true when the message_bytes is the message
+    // this is used for messages that are already packed e.g. network packets
+    bool raw = 3;
 }
 
 

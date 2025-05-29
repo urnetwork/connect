@@ -275,6 +275,10 @@ func (self *P2pSendTransport) Priority() int {
 	return 0
 }
 
+func (self *P2pSendTransport) Weight() float32 {
+	return 1.0
+}
+
 func (self *P2pSendTransport) CanEvalRouteWeight(stats *RouteStats, remainingStats map[Transport]*RouteStats) bool {
 	return true
 }
@@ -365,6 +369,10 @@ func (self *P2pReceiveTransport) TransportId() Id {
 // lower priority takes precedence
 func (self *P2pReceiveTransport) Priority() int {
 	return 0
+}
+
+func (self *P2pReceiveTransport) Weight() float32 {
+	return 1.0
 }
 
 func (self *P2pReceiveTransport) CanEvalRouteWeight(stats *RouteStats, remainingStats map[Transport]*RouteStats) bool {

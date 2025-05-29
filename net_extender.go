@@ -42,7 +42,7 @@ import (
 	// "golang.org/x/net/idna"
 
 	// quic "github.com/quic-go/quic-go"
-	"google.golang.org/protobuf/proto"
+	// "google.golang.org/protobuf/proto"
 
 	// "src.agwa.name/tlshacks"
 
@@ -255,10 +255,11 @@ func NewExtenderDialTlsContext(
 			header.Signature = mac.Sum(nil)
 		}
 
-		headerMessageBytes, err := proto.Marshal(header)
+		headerMessageBytes, err := ProtoMarshal(header)
 		if err != nil {
 			return nil, err
 		}
+		defer MessagePoolReturn(headerMessageBytes)
 
 		// fmt.Printf("Extender client 4\n")
 

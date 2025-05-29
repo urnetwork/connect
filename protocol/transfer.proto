@@ -1,9 +1,11 @@
 syntax = "proto3";
 package bringyour;
 
-import "frame.proto";
 
 option go_package = "github.com/urnetwork/connect/protocol";
+
+
+import "frame.proto";
 
 
 // changes 2024-08: 
@@ -29,7 +31,10 @@ message TransferPath {
 
 message TransferFrame {
     TransferPath transfer_path = 1;
-    Frame frame = 2;
+    optional Frame frame = 2;
+    optional MessageType message_type = 3;
+    optional Pack pack = 4;
+    optional Ack ack = 5;
 }
 
 
@@ -41,7 +46,8 @@ message FilteredTransferFrame {
 
 message FilteredTransferFrameWithFrame {
     TransferPath transfer_path = 1;
-    FilteredFrame frame = 2;
+    optional FilteredFrame frame = 2;
+    optional MessageType message_type = 3;
 }
 
 

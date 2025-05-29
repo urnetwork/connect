@@ -8,7 +8,7 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
-func ToFrame(message proto.Message) (*protocol.Frame, error) {
+func ToFrame(message proto.Message, protocolVersion int) (*protocol.Frame, error) {
 	var messageType protocol.MessageType
 	switch v := message.(type) {
 	case *protocol.Pack:
@@ -37,10 +37,30 @@ func ToFrame(message proto.Message) (*protocol.Frame, error) {
 		messageType = protocol.MessageType_TestSimpleMessage
 	case *protocol.IpPacketToProvider:
 		messageType = protocol.MessageType_IpIpPacketToProvider
+		if 2 <= protocolVersion {
+			return &protocol.Frame{
+				MessageType:  messageType,
+				MessageBytes: v.IpPacket.PacketBytes,
+				Raw:          true,
+			}, nil
+		}
 	case *protocol.IpPacketFromProvider:
 		messageType = protocol.MessageType_IpIpPacketFromProvider
+		if 2 <= protocolVersion {
+			return &protocol.Frame{
+				MessageType:  messageType,
+				MessageBytes: v.IpPacket.PacketBytes,
+				Raw:          true,
+			}, nil
+		}
 	case *protocol.IpPing:
 		messageType = protocol.MessageType_IpIpPing
+		if 2 <= protocolVersion {
+			return &protocol.Frame{
+				MessageType: messageType,
+				Raw:         true,
+			}, nil
+		}
 	case *protocol.ControlPing:
 		messageType = protocol.MessageType_TransferControlPing
 	case *protocol.ProvidePing:
@@ -48,7 +68,7 @@ func ToFrame(message proto.Message) (*protocol.Frame, error) {
 	default:
 		return nil, fmt.Errorf("Unknown message type: %T", v)
 	}
-	b, err := proto.Marshal(message)
+	b, err := ProtoMarshal(message)
 	if err != nil {
 		return nil, err
 	}
@@ -58,8 +78,8 @@ func ToFrame(message proto.Message) (*protocol.Frame, error) {
 	}, nil
 }
 
-func RequireToFrame(message proto.Message) *protocol.Frame {
-	frame, err := ToFrame(message)
+func RequireToFrame(message proto.Message, protocolVersion int) *protocol.Frame {
+	frame, err := ToFrame(message, protocolVersion)
 	if err != nil {
 		panic(err)
 	}
@@ -94,11 +114,29 @@ func FromFrame(frame *protocol.Frame) (proto.Message, error) {
 	case protocol.MessageType_TestSimpleMessage:
 		message = &protocol.SimpleMessage{}
 	case protocol.MessageType_IpIpPacketToProvider:
-		message = &protocol.IpPacketToProvider{}
+		v := &protocol.IpPacketToProvider{}
+		if frame.Raw {
+			v.IpPacket = &protocol.IpPacket{
+				PacketBytes: frame.MessageBytes,
+			}
+			return v, nil
+		}
+		message = v
 	case protocol.MessageType_IpIpPacketFromProvider:
-		message = &protocol.IpPacketFromProvider{}
+		v := &protocol.IpPacketFromProvider{}
+		if frame.Raw {
+			v.IpPacket = &protocol.IpPacket{
+				PacketBytes: frame.MessageBytes,
+			}
+			return v, nil
+		}
+		message = v
 	case protocol.MessageType_IpIpPing:
-		message = &protocol.IpPing{}
+		v := &protocol.IpPing{}
+		if frame.Raw {
+			return v, nil
+		}
+		message = v
 	case protocol.MessageType_TransferControlPing:
 		message = &protocol.ControlPing{}
 	case protocol.MessageType_TransferProvidePing:
@@ -106,7 +144,7 @@ func FromFrame(frame *protocol.Frame) (proto.Message, error) {
 	default:
 		return nil, fmt.Errorf("Unknown message type: %s", frame.MessageType)
 	}
-	err := proto.Unmarshal(frame.GetMessageBytes(), message)
+	err := ProtoUnmarshal(frame.GetMessageBytes(), message)
 	if err != nil {
 		return nil, err
 	}
@@ -121,18 +159,18 @@ func RequireFromFrame(frame *protocol.Frame) proto.Message {
 	return message
 }
 
-func EncodeFrame(message proto.Message) ([]byte, error) {
-	frame, err := ToFrame(message)
+func EncodeFrame(message proto.Message, protocolVersion int) ([]byte, error) {
+	frame, err := ToFrame(message, protocolVersion)
 	if err != nil {
 		return nil, err
 	}
-	b, err := proto.Marshal(frame)
+	b, err := ProtoMarshal(frame)
 	return b, err
 }
 
 func DecodeFrame(b []byte) (proto.Message, error) {
 	frame := &protocol.Frame{}
-	err := proto.Unmarshal(b, frame)
+	err := ProtoUnmarshal(b, frame)
 	if err != nil {
 		return nil, err
 	}

@@ -88,24 +88,20 @@ func testingNewMultiClient(ctx context.Context, providerClient *Client, receiveP
 		newClient: func(ctx context.Context, args *MultiClientGeneratorClientArgs, clientSettings *ClientSettings) (*Client, error) {
 			client := NewClient(ctx, args.ClientId, NewNoContractClientOob(), clientSettings)
 
-			routesSend := []Route{
-				make(chan []byte),
-			}
-			routesReceive := []Route{
-				make(chan []byte),
-			}
+			routeSend := make(chan []byte)
+			routeReceive := make(chan []byte)
 
 			transportSend := NewSendGatewayTransport()
 			transportReceive := NewReceiveGatewayTransport()
-			client.RouteManager().UpdateTransport(transportSend, routesSend)
-			client.RouteManager().UpdateTransport(transportReceive, routesReceive)
+			client.RouteManager().UpdateTransport(transportSend, []Route{routeSend})
+			client.RouteManager().UpdateTransport(transportReceive, []Route{routeReceive})
 
 			client.ContractManager().AddNoContractPeer(providerClient.ClientId())
 
 			providerTransportSend := NewSendClientTransport(DestinationId(args.ClientId))
 			providerTransportReceive := NewReceiveGatewayTransport()
-			providerClient.RouteManager().UpdateTransport(providerTransportReceive, routesSend)
-			providerClient.RouteManager().UpdateTransport(providerTransportSend, routesReceive)
+			providerClient.RouteManager().UpdateTransport(providerTransportReceive, []Route{routeSend})
+			providerClient.RouteManager().UpdateTransport(providerTransportSend, []Route{routeReceive})
 
 			providerClient.ContractManager().AddNoContractPeer(client.ClientId())
 
@@ -235,7 +231,8 @@ func TestMultiClientChannelWindowStats(t *testing.T) {
 		EstimatedBytesPerSecond:        0,
 	}
 	assert.Equal(t, nil, err)
-	clientChannel, err := newMultiClientChannel(ctx, channelArgs, generator, clientReceivePacket, contractStatus, settings)
+
+	clientChannel, err := newMultiClientChannel(ctx, channelArgs, generator, clientReceivePacket, DefaultIngressSecurityPolicy(), contractStatus, settings)
 	assert.Equal(t, nil, err)
 
 	cancelCtxs := []context.Context{}

@@ -11,6 +11,7 @@ import (
 
 func init() {
 	initGlog()
+	DebugTransferCopyOnWrite = true
 }
 
 func initGlog() {

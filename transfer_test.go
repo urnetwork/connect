@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"google.golang.org/protobuf/proto"
+	// "google.golang.org/protobuf/proto"
 
 	"github.com/go-playground/assert/v2"
 
@@ -146,7 +146,7 @@ func TestSendReceiveSenderReset(t *testing.T) {
 			message := &protocol.SimpleMessage{
 				Content: fmt.Sprintf("hi %d", i),
 			}
-			frame := RequireToFrame(message)
+			frame := RequireToFrame(message, DefaultProtocolVersion)
 			a.Send(frame, DestinationId(bClientId), func(err error) {
 				acks <- err
 			})
@@ -235,7 +235,7 @@ func TestSendReceiveSenderReset(t *testing.T) {
 			message := &protocol.SimpleMessage{
 				Content: fmt.Sprintf("hi %d", i),
 			}
-			frame := RequireToFrame(message)
+			frame := RequireToFrame(message, DefaultProtocolVersion)
 			a2.Send(frame, DestinationId(bClientId), func(err error) {
 				acks <- err
 			})
@@ -300,10 +300,11 @@ func createContractResultInitialPack(
 		SourceId:          sourceId.Bytes(),
 		DestinationId:     destinationId.Bytes(),
 	}
-	storedContractBytes, err := proto.Marshal(storedContract)
+	storedContractBytes, err := ProtoMarshal(storedContract)
 	if err != nil {
 		return nil, err
 	}
+	defer MessagePoolReturn(storedContractBytes)
 	mac := hmac.New(sha256.New, provideSecretKey)
 	storedContractHmac := mac.Sum(storedContractBytes)
 
@@ -315,10 +316,11 @@ func createContractResultInitialPack(
 		},
 	}
 
-	frame, err := ToFrame(message)
+	frame, err := ToFrame(message, DefaultProtocolVersion)
 	if err != nil {
 		return nil, err
 	}
+	defer MessagePoolReturn(frame.MessageBytes)
 
 	messageId := NewId()
 	sequenceId := NewId()
@@ -330,7 +332,7 @@ func createContractResultInitialPack(
 		Frames:         []*protocol.Frame{frame},
 	}
 
-	return ToFrame(pack)
+	return ToFrame(pack, DefaultProtocolVersion)
 }
 
 func requireContractResultInitialPack(
@@ -356,7 +358,7 @@ func createTransferFrameBytes(frame *protocol.Frame, sourceId Id, destinationId 
 		Frame: frame,
 	}
 
-	return proto.Marshal(transferFrame)
+	return ProtoMarshal(transferFrame)
 }
 
 func requireTransferFrameBytes(frame *protocol.Frame, sourceId Id, destinationId Id) []byte {
@@ -366,7 +368,7 @@ func requireTransferFrameBytes(frame *protocol.Frame, sourceId Id, destinationId
 	}
 
 	var filteredTransferFrame protocol.FilteredTransferFrame
-	if err := proto.Unmarshal(b, &filteredTransferFrame); err != nil {
+	if err := ProtoUnmarshal(b, &filteredTransferFrame); err != nil {
 		panic(err)
 	}
 	sourceId_, err := IdFromBytes(filteredTransferFrame.TransferPath.SourceId)
