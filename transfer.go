@@ -3376,12 +3376,16 @@ func (self *sequenceContract) update(byteCount ByteCount) bool {
 }
 
 func (self *sequenceContract) ack(byteCount ByteCount) {
-	effectiveByteCount := max(self.minUpdateByteCount, byteCount)
-
-	if self.unackedByteCount < effectiveByteCount {
+	if self.unackedByteCount < byteCount {
 		// debug.PrintStack()
-		panic(fmt.Errorf("Bad accounting %d <> %d", self.unackedByteCount, effectiveByteCount))
+		panic(fmt.Errorf("Bad accounting %d <> %d", self.unackedByteCount, byteCount))
 	}
+
+	effectiveByteCount := min(
+		max(self.minUpdateByteCount, byteCount),
+		self.unackedByteCount,
+	)
+
 	self.unackedByteCount -= effectiveByteCount
 	self.ackedByteCount += effectiveByteCount
 }
