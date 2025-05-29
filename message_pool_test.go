@@ -90,16 +90,18 @@ func TestMessagePoolShare(t *testing.T) {
 		assert.Equal(t, shared, false)
 	}
 
-	for i := holdCount - 1; 0 <= i; i -= 1 {
+	for i := holdCount - 1; 1 <= i; i -= 1 {
 		for _, message := range holdMessages[i] {
 			pooled, shared := MessagePoolCheck(message)
 			assert.Equal(t, pooled, len(message) <= 4096)
 			assert.Equal(t, shared, len(message) <= 4096)
 			r := MessagePoolReturn(message)
-			assert.Equal(t, r, i == 0)
+			assert.Equal(t, r, false)
 		}
 	}
 	for _, message := range holdMessages[0] {
+		r := MessagePoolReturn(message)
+		assert.Equal(t, r, true)
 		pooled, shared := MessagePoolCheck(message)
 		assert.Equal(t, pooled, false)
 		assert.Equal(t, shared, false)
