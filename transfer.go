@@ -695,7 +695,7 @@ func (self *Client) run() {
 				select {
 				case <-self.ctx.Done():
 					return
-				case <-time.After(timeout):
+				case <-WakeupAfter(timeout):
 				}
 
 				ack := make(chan error)
@@ -1537,7 +1537,7 @@ func (self *SendSequence) Run() {
 					}
 					return self.openContractMultiRouteWriter().Write(
 						self.ctx,
-						transferFrameBytes,
+						MessagePoolShareReadOnly(transferFrameBytes),
 						self.sendBufferSettings.WriteTimeout,
 					)
 				}
@@ -1895,6 +1895,8 @@ func (self *SendSequence) sendWithSetContract(
 	}
 
 	if 2 <= self.sendBufferSettings.ProtocolVersion {
+		messageType := protocol.MessageType_TransferPack
+		transferFrame.MessageType = &messageType
 		transferFrame.Pack = pack
 	} else {
 		packBytes, _ := ProtoMarshal(pack)
@@ -1932,7 +1934,7 @@ func (self *SendSequence) sendWithSetContract(
 		}
 		return self.openContractMultiRouteWriter().Write(
 			self.ctx,
-			transferFrameBytes,
+			MessagePoolShareReadOnly(transferFrameBytes),
 			self.sendBufferSettings.WriteTimeout,
 		)
 	}
@@ -2604,6 +2606,8 @@ func (self *ReceiveSequence) Run() {
 			}
 
 			if 2 <= self.receiveBufferSettings.ProtocolVersion {
+				messageType := protocol.MessageType_TransferAck
+				transferFrame.MessageType = &messageType
 				transferFrame.Ack = ack
 			} else {
 				ackBytes, _ := ProtoMarshal(ack)
@@ -2616,12 +2620,11 @@ func (self *ReceiveSequence) Run() {
 			}
 
 			transferFrameBytes, _ := ProtoMarshal(transferFrame)
-			MessagePoolSetOptionalReturn(transferFrameBytes, true)
-
+			defer MessagePoolReturn(transferFrameBytes)
 			c := func() error {
 				return multiRouteWriter.Write(
 					self.ctx,
-					transferFrameBytes,
+					MessagePoolShareReadOnly(transferFrameBytes),
 					self.receiveBufferSettings.WriteTimeout,
 				)
 			}
@@ -3608,7 +3611,11 @@ func (self *ForwardSequence) Run() {
 				if DebugTransferCopyOnWrite {
 					transferFrameBytes = MessagePoolCopy(transferFrameBytes)
 				}
-				return self.multiRouteWriter.Write(self.ctx, transferFrameBytes, self.forwardBufferSettings.WriteTimeout)
+				return self.multiRouteWriter.Write(
+					self.ctx,
+					MessagePoolShareReadOnly(transferFrameBytes),
+					self.forwardBufferSettings.WriteTimeout,
+				)
 			}
 			if glog.V(2) {
 				TraceWithReturn(

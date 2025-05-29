@@ -44,3 +44,64 @@ func TestMessagePool(t *testing.T) {
 		}
 	}
 }
+
+func TestMessagePoolShare(t *testing.T) {
+	holdCount := 16
+	holdMessages := make([][][]byte, holdCount)
+
+	for range 1024 {
+		message := MessagePoolGet(mathrand.Intn(4096))
+		pooled, shared := MessagePoolCheck(message)
+		assert.Equal(t, pooled, true)
+		assert.Equal(t, shared, false)
+		holdMessages[0] = append(holdMessages[0], message)
+		k := mathrand.Intn(holdCount)
+		for i := 1; i < k; i += 1 {
+			MessagePoolShareReadOnly(message)
+			pooled, shared = MessagePoolCheck(message)
+			assert.Equal(t, pooled, true)
+			assert.Equal(t, shared, true)
+			holdMessages[i] = append(holdMessages[i], message)
+		}
+	}
+
+	// add large messages that will not be shared
+	for range 1024 {
+		message := MessagePoolGet(mathrand.Intn(32 * 1024))
+		pooled, shared := MessagePoolCheck(message)
+		assert.Equal(t, pooled, len(message) <= 4096)
+		assert.Equal(t, shared, false)
+		k := mathrand.Intn(holdCount)
+		for i := 1; i < k; i += 1 {
+			MessagePoolShareReadOnly(message)
+			pooled, shared = MessagePoolCheck(message)
+			assert.Equal(t, pooled, len(message) <= 4096)
+			assert.Equal(t, shared, len(message) <= 4096)
+		}
+		for i := 1; i < k; i += 1 {
+			MessagePoolReturn(message)
+			pooled, shared = MessagePoolCheck(message)
+			assert.Equal(t, pooled, len(message) <= 4096)
+			assert.Equal(t, shared, len(message) <= 4096)
+		}
+		MessagePoolReturn(message)
+		pooled, shared = MessagePoolCheck(message)
+		assert.Equal(t, pooled, false)
+		assert.Equal(t, shared, false)
+	}
+
+	for i := holdCount - 1; 0 <= i; i -= 1 {
+		for _, message := range holdMessages[i] {
+			pooled, shared := MessagePoolCheck(message)
+			assert.Equal(t, pooled, len(message) <= 4096)
+			assert.Equal(t, shared, len(message) <= 4096)
+			r := MessagePoolReturn(message)
+			assert.Equal(t, r, i == 0)
+		}
+	}
+	for _, message := range holdMessages[0] {
+		pooled, shared := MessagePoolCheck(message)
+		assert.Equal(t, pooled, false)
+		assert.Equal(t, shared, false)
+	}
+}

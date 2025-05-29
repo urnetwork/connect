@@ -32,8 +32,9 @@ message TransferPath {
 message TransferFrame {
     TransferPath transfer_path = 1;
     optional Frame frame = 2;
-    optional Pack pack = 3;
-    optional Ack ack = 4;
+    optional MessageType message_type = 3;
+    optional Pack pack = 4;
+    optional Ack ack = 5;
 }
 
 
@@ -45,7 +46,8 @@ message FilteredTransferFrame {
 
 message FilteredTransferFrameWithFrame {
     TransferPath transfer_path = 1;
-    FilteredFrame frame = 2;
+    optional FilteredFrame frame = 2;
+    optional MessageType message_type = 3;
 }
 
 

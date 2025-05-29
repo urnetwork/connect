@@ -34,6 +34,10 @@ func TestFramerWriteRead(t *testing.T) {
 	settings.MaxMessageLen = maxMessageLen
 	framer := NewFramer(settings)
 
+	select {
+	case <- time.After(1 * time.Second):
+	}
+
 	listener, err := net.ListenTCP("tcp", &net.TCPAddr{
 		IP:   net.ParseIP("127.0.0.1"),
 		Port: 5050,
@@ -113,6 +117,10 @@ func TestFramerWriteReadPacket(t *testing.T) {
 	settings.MaxMessageLen = maxMessageLen
 	framer := NewFramer(settings)
 
+	select {
+	case <- time.After(1 * time.Second):
+	}
+
 	listener, err := net.ListenUDP("udp", &net.UDPAddr{
 		IP:   net.ParseIP("127.0.0.1"),
 		Port: 5051,
@@ -173,6 +181,10 @@ func TestFramerSpeedup(t *testing.T) {
 		handleCtx, handleCancel := context.WithCancel(ctx)
 		defer handleCancel()
 
+		select {
+		case <- time.After(1 * time.Second):
+		}
+
 		listener, err := net.ListenTCP("tcp", &net.TCPAddr{
 			IP:   net.ParseIP("127.0.0.1"),
 			Port: 5050,
@@ -213,6 +225,10 @@ func TestFramerSpeedup(t *testing.T) {
 	runUdp := func(framer *Framer) {
 		handleCtx, handleCancel := context.WithCancel(ctx)
 		defer handleCancel()
+
+		select {
+		case <- time.After(1 * time.Second):
+		}
 
 		listener, err := net.ListenUDP("udp", &net.UDPAddr{
 			IP:   net.ParseIP("127.0.0.1"),

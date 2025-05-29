@@ -495,6 +495,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						if !ok {
 							return
 						}
+						// if !MessagePoolCheckShared(message) {
+						// 	panic("[t]shared should be set")
+						// }
 
 						ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
 						if err := ws.WriteMessage(websocket.BinaryMessage, message); err != nil {
@@ -505,8 +508,8 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						glog.V(2).Infof("[ts]%s->\n", clientId)
 
 						writeCounter.Add(1)
-						MessagePoolOptionalReturn(message)
-					case <-time.After(self.settings.PingTimeout):
+						MessagePoolReturn(message)
+					case <-WakeupAfter(self.settings.PingTimeout):
 						ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
 						if err := ws.WriteMessage(websocket.BinaryMessage, make([]byte, 0)); err != nil {
 							// note that for websocket a dealine timeout cannot be recovered
@@ -836,6 +839,9 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 						if !ok {
 							return
 						}
+						// if !MessagePoolCheckShared(message) {
+						// 	panic("[t]shared should be set")
+						// }
 
 						stream.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
 						if err := h3Framer.Write(stream, message); err != nil {
@@ -844,8 +850,8 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 							return
 						}
 						glog.V(2).Infof("[ts]%s->\n", clientId)
-						MessagePoolOptionalReturn(message)
-					case <-time.After(self.settings.PingTimeout):
+						MessagePoolReturn(message)
+					case <-WakeupAfter(self.settings.PingTimeout):
 						stream.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
 						if err := h3Framer.Write(stream, make([]byte, 0)); err != nil {
 							// note that for websocket a dealine timeout cannot be recovered

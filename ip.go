@@ -2252,7 +2252,7 @@ func (self *RemoteUserNatProvider) Receive(
 
 	ipPacketFromProvider := &protocol.IpPacketFromProvider{
 		IpPacket: &protocol.IpPacket{
-			PacketBytes: MessagePoolCopy(packet),
+			PacketBytes: MessagePoolShareReadOnly(packet),
 		},
 	}
 	frame, err := ToFrame(ipPacketFromProvider, self.settings.ProtocolVersion)
@@ -2324,7 +2324,7 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 
 			var packet []byte
 			if frame.Raw {
-				packet = MessagePoolCopy(ipPacketToProvider.IpPacket.PacketBytes)
+				packet = MessagePoolShareReadOnly(ipPacketToProvider.IpPacket.PacketBytes)
 			} else {
 				packet = ipPacketToProvider.IpPacket.PacketBytes
 			}
@@ -2465,7 +2465,7 @@ func (self *RemoteUserNatClient) ClientReceive(source TransferPath, frames []*pr
 
 			var packet []byte
 			if frame.Raw {
-				packet = MessagePoolCopy(ipPacketFromProvider.IpPacket.PacketBytes)
+				packet = MessagePoolShareReadOnly(ipPacketFromProvider.IpPacket.PacketBytes)
 			} else {
 				packet = ipPacketFromProvider.IpPacket.PacketBytes
 			}

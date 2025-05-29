@@ -203,8 +203,9 @@ type TransferFrame struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	TransferPath  *TransferPath          `protobuf:"bytes,1,opt,name=transfer_path,json=transferPath,proto3" json:"transfer_path,omitempty"`
 	Frame         *Frame                 `protobuf:"bytes,2,opt,name=frame,proto3,oneof" json:"frame,omitempty"`
-	Pack          *Pack                  `protobuf:"bytes,3,opt,name=pack,proto3,oneof" json:"pack,omitempty"`
-	Ack           *Ack                   `protobuf:"bytes,4,opt,name=ack,proto3,oneof" json:"ack,omitempty"`
+	MessageType   *MessageType           `protobuf:"varint,3,opt,name=message_type,json=messageType,proto3,enum=bringyour.MessageType,oneof" json:"message_type,omitempty"`
+	Pack          *Pack                  `protobuf:"bytes,4,opt,name=pack,proto3,oneof" json:"pack,omitempty"`
+	Ack           *Ack                   `protobuf:"bytes,5,opt,name=ack,proto3,oneof" json:"ack,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -251,6 +252,13 @@ func (x *TransferFrame) GetFrame() *Frame {
 		return x.Frame
 	}
 	return nil
+}
+
+func (x *TransferFrame) GetMessageType() MessageType {
+	if x != nil && x.MessageType != nil {
+		return *x.MessageType
+	}
+	return MessageType_TransferPack
 }
 
 func (x *TransferFrame) GetPack() *Pack {
@@ -315,7 +323,8 @@ func (x *FilteredTransferFrame) GetTransferPath() *TransferPath {
 type FilteredTransferFrameWithFrame struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	TransferPath  *TransferPath          `protobuf:"bytes,1,opt,name=transfer_path,json=transferPath,proto3" json:"transfer_path,omitempty"`
-	Frame         *FilteredFrame         `protobuf:"bytes,2,opt,name=frame,proto3" json:"frame,omitempty"`
+	Frame         *FilteredFrame         `protobuf:"bytes,2,opt,name=frame,proto3,oneof" json:"frame,omitempty"`
+	MessageType   *MessageType           `protobuf:"varint,3,opt,name=message_type,json=messageType,proto3,enum=bringyour.MessageType,oneof" json:"message_type,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -362,6 +371,13 @@ func (x *FilteredTransferFrameWithFrame) GetFrame() *FilteredFrame {
 		return x.Frame
 	}
 	return nil
+}
+
+func (x *FilteredTransferFrameWithFrame) GetMessageType() MessageType {
+	if x != nil && x.MessageType != nil {
+		return *x.MessageType
+	}
+	return MessageType_TransferPack
 }
 
 type Pack struct {
@@ -1546,20 +1562,25 @@ const file_transfer_proto_rawDesc = "" +
 	"_source_idB\x11\n" +
 	"\x0f_destination_idB\f\n" +
 	"\n" +
-	"_stream_id\"\xe6\x01\n" +
+	"_stream_id\"\xb7\x02\n" +
 	"\rTransferFrame\x12<\n" +
 	"\rtransfer_path\x18\x01 \x01(\v2\x17.bringyour.TransferPathR\ftransferPath\x12+\n" +
-	"\x05frame\x18\x02 \x01(\v2\x10.bringyour.FrameH\x00R\x05frame\x88\x01\x01\x12(\n" +
-	"\x04pack\x18\x03 \x01(\v2\x0f.bringyour.PackH\x01R\x04pack\x88\x01\x01\x12%\n" +
-	"\x03ack\x18\x04 \x01(\v2\x0e.bringyour.AckH\x02R\x03ack\x88\x01\x01B\b\n" +
-	"\x06_frameB\a\n" +
+	"\x05frame\x18\x02 \x01(\v2\x10.bringyour.FrameH\x00R\x05frame\x88\x01\x01\x12>\n" +
+	"\fmessage_type\x18\x03 \x01(\x0e2\x16.bringyour.MessageTypeH\x01R\vmessageType\x88\x01\x01\x12(\n" +
+	"\x04pack\x18\x04 \x01(\v2\x0f.bringyour.PackH\x02R\x04pack\x88\x01\x01\x12%\n" +
+	"\x03ack\x18\x05 \x01(\v2\x0e.bringyour.AckH\x03R\x03ack\x88\x01\x01B\b\n" +
+	"\x06_frameB\x0f\n" +
+	"\r_message_typeB\a\n" +
 	"\x05_packB\x06\n" +
 	"\x04_ack\"U\n" +
 	"\x15FilteredTransferFrame\x12<\n" +
-	"\rtransfer_path\x18\x01 \x01(\v2\x17.bringyour.TransferPathR\ftransferPath\"\x8e\x01\n" +
+	"\rtransfer_path\x18\x01 \x01(\v2\x17.bringyour.TransferPathR\ftransferPath\"\xee\x01\n" +
 	"\x1eFilteredTransferFrameWithFrame\x12<\n" +
-	"\rtransfer_path\x18\x01 \x01(\v2\x17.bringyour.TransferPathR\ftransferPath\x12.\n" +
-	"\x05frame\x18\x02 \x01(\v2\x18.bringyour.FilteredFrameR\x05frame\"\xf7\x02\n" +
+	"\rtransfer_path\x18\x01 \x01(\v2\x17.bringyour.TransferPathR\ftransferPath\x123\n" +
+	"\x05frame\x18\x02 \x01(\v2\x18.bringyour.FilteredFrameH\x00R\x05frame\x88\x01\x01\x12>\n" +
+	"\fmessage_type\x18\x03 \x01(\x0e2\x16.bringyour.MessageTypeH\x01R\vmessageType\x88\x01\x01B\b\n" +
+	"\x06_frameB\x0f\n" +
+	"\r_message_type\"\xf7\x02\n" +
 	"\x04Pack\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\x01 \x01(\fR\tmessageId\x12\x1f\n" +
@@ -1729,32 +1750,35 @@ var file_transfer_proto_goTypes = []any{
 	(*ControlPing)(nil),                    // 21: bringyour.ControlPing
 	(*ProvidePing)(nil),                    // 22: bringyour.ProvidePing
 	(*Frame)(nil),                          // 23: bringyour.Frame
-	(*FilteredFrame)(nil),                  // 24: bringyour.FilteredFrame
+	(MessageType)(0),                       // 24: bringyour.MessageType
+	(*FilteredFrame)(nil),                  // 25: bringyour.FilteredFrame
 }
 var file_transfer_proto_depIdxs = []int32{
 	2,  // 0: bringyour.TransferFrame.transfer_path:type_name -> bringyour.TransferPath
 	23, // 1: bringyour.TransferFrame.frame:type_name -> bringyour.Frame
-	6,  // 2: bringyour.TransferFrame.pack:type_name -> bringyour.Pack
-	8,  // 3: bringyour.TransferFrame.ack:type_name -> bringyour.Ack
-	2,  // 4: bringyour.FilteredTransferFrame.transfer_path:type_name -> bringyour.TransferPath
-	2,  // 5: bringyour.FilteredTransferFrameWithFrame.transfer_path:type_name -> bringyour.TransferPath
-	24, // 6: bringyour.FilteredTransferFrameWithFrame.frame:type_name -> bringyour.FilteredFrame
-	23, // 7: bringyour.Pack.frames:type_name -> bringyour.Frame
-	23, // 8: bringyour.Pack.contract_frame:type_name -> bringyour.Frame
-	9,  // 9: bringyour.Pack.tag:type_name -> bringyour.Tag
-	23, // 10: bringyour.FilteredPack.contract_frame:type_name -> bringyour.Frame
-	9,  // 11: bringyour.Ack.tag:type_name -> bringyour.Tag
-	12, // 12: bringyour.Provide.keys:type_name -> bringyour.ProvideKey
-	0,  // 13: bringyour.ProvideKey.mode:type_name -> bringyour.ProvideMode
-	1,  // 14: bringyour.CreateContractResult.error:type_name -> bringyour.ContractError
-	17, // 15: bringyour.CreateContractResult.contract:type_name -> bringyour.Contract
-	15, // 16: bringyour.CreateContractResult.create_contract:type_name -> bringyour.CreateContract
-	0,  // 17: bringyour.Contract.provide_mode:type_name -> bringyour.ProvideMode
-	18, // [18:18] is the sub-list for method output_type
-	18, // [18:18] is the sub-list for method input_type
-	18, // [18:18] is the sub-list for extension type_name
-	18, // [18:18] is the sub-list for extension extendee
-	0,  // [0:18] is the sub-list for field type_name
+	24, // 2: bringyour.TransferFrame.message_type:type_name -> bringyour.MessageType
+	6,  // 3: bringyour.TransferFrame.pack:type_name -> bringyour.Pack
+	8,  // 4: bringyour.TransferFrame.ack:type_name -> bringyour.Ack
+	2,  // 5: bringyour.FilteredTransferFrame.transfer_path:type_name -> bringyour.TransferPath
+	2,  // 6: bringyour.FilteredTransferFrameWithFrame.transfer_path:type_name -> bringyour.TransferPath
+	25, // 7: bringyour.FilteredTransferFrameWithFrame.frame:type_name -> bringyour.FilteredFrame
+	24, // 8: bringyour.FilteredTransferFrameWithFrame.message_type:type_name -> bringyour.MessageType
+	23, // 9: bringyour.Pack.frames:type_name -> bringyour.Frame
+	23, // 10: bringyour.Pack.contract_frame:type_name -> bringyour.Frame
+	9,  // 11: bringyour.Pack.tag:type_name -> bringyour.Tag
+	23, // 12: bringyour.FilteredPack.contract_frame:type_name -> bringyour.Frame
+	9,  // 13: bringyour.Ack.tag:type_name -> bringyour.Tag
+	12, // 14: bringyour.Provide.keys:type_name -> bringyour.ProvideKey
+	0,  // 15: bringyour.ProvideKey.mode:type_name -> bringyour.ProvideMode
+	1,  // 16: bringyour.CreateContractResult.error:type_name -> bringyour.ContractError
+	17, // 17: bringyour.CreateContractResult.contract:type_name -> bringyour.Contract
+	15, // 18: bringyour.CreateContractResult.create_contract:type_name -> bringyour.CreateContract
+	0,  // 19: bringyour.Contract.provide_mode:type_name -> bringyour.ProvideMode
+	20, // [20:20] is the sub-list for method output_type
+	20, // [20:20] is the sub-list for method input_type
+	20, // [20:20] is the sub-list for extension type_name
+	20, // [20:20] is the sub-list for extension extendee
+	0,  // [0:20] is the sub-list for field type_name
 }
 
 func init() { file_transfer_proto_init() }
@@ -1765,6 +1789,7 @@ func file_transfer_proto_init() {
 	file_frame_proto_init()
 	file_transfer_proto_msgTypes[0].OneofWrappers = []any{}
 	file_transfer_proto_msgTypes[1].OneofWrappers = []any{}
+	file_transfer_proto_msgTypes[3].OneofWrappers = []any{}
 	file_transfer_proto_msgTypes[4].OneofWrappers = []any{}
 	file_transfer_proto_msgTypes[5].OneofWrappers = []any{}
 	file_transfer_proto_msgTypes[6].OneofWrappers = []any{}
