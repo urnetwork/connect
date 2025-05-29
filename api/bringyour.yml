@@ -1148,8 +1148,8 @@ paths:
     /account/points:
         get:
             description: |
-                Retrieves network points earned. Eventually, users will be able to convert points for tokens
-            operationId: Account Get Network points
+                Retrieves account points earned. Eventually, users will be able to convert points for tokens
+            operationId: Account Get Points
             security:
                 - BearerAuth: []
             responses:
@@ -1157,7 +1157,7 @@ paths:
                     content:
                         application/json:
                             schema:
-                                $ref: "#/components/schemas/NetworkPointsResult"
+                                $ref: "#/components/schemas/AccountPointsResult"
 
     /account/wallet:
         post:
@@ -2846,7 +2846,7 @@ components:
                     enum:
                         - solana
 
-        NetworkPoint:
+        AccountPoint:
             type: object
             properties:
                 network_id:
@@ -2862,12 +2862,12 @@ components:
                     description: datetime
                     type: string
 
-        NetworkPointsResult:
+        AccountPointsResult:
             type: object
             properties:
                 network_points:
                     type: array
                     items:
-                        $ref: "#/components/schemas/NetworkPoint"
+                        $ref: "#/components/schemas/AccountPoint"
 
                 
