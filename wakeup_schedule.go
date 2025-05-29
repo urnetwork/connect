@@ -4,6 +4,9 @@ import (
 	"time"
 )
 
+// all regular protocol ping messages should align to this schedule
+// this ensures the radio wakes up for as little as possible
+
 // FIXME when the server ping matches the client ping, we can increase this to 10s
 const WakeupEpoch = 1 * time.Second
 

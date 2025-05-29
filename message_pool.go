@@ -14,6 +14,20 @@ import (
 	"github.com/golang/glog"
 )
 
+// new byte allocations in the connect package use pooled message buffers,
+// either via `MessagePoolCopy` or `MessagePoolGet`.
+// There are three rules for pooled messages:
+// - an owner of a message should return the message to the pool with `MessagePoolReturn`
+//   when no longer used.
+// - message ownership is handed off on send/channel write.
+//   If the caller wants to retain the passed message, it should call `MessagePoolShareReadOnly`
+//   before calling send/channel write.
+// - messages are valid only for duration of a receive callback.
+//   If the receiver wants to keep the message longer, it shoudl call `MessagePoolShareReadOnly`
+//   before the callback returns.
+// Shared messages are returned to the pool the same as normal messages.
+// `MessagePoolReturn`/`MessagePoolShareReadOnly` is a noop when using a `[]byte` that is not part of the pool.
+
 // [8 byte id][1 byte tag][1 byte flags]
 const MessagePoolMetaByteCount = 10
 const MessagePoolFlagShared = uint8(0x01)
@@ -184,12 +198,11 @@ func MessagePoolGetWithTag(n int, tag uint8) []byte {
 			}
 			poolMessage[pool.size+8] = tag
 			pool.takenTags[tag].Add(1)
+			id := binary.BigEndian.Uint64(poolMessage[pool.size:])
 
 			func() {
 				pool.stateLock.Lock()
 				defer pool.stateLock.Unlock()
-
-				id := binary.BigEndian.Uint64(poolMessage[pool.size:])
 
 				c := pool.counts[id]
 				if c != 0 {
@@ -212,13 +225,12 @@ func MessagePoolReturn(message []byte) bool {
 	for _, pool := range orderedMessagePools {
 		if c == pool.size+MessagePoolMetaByteCount {
 			poolMessage := message[:c]
+			id := binary.BigEndian.Uint64(poolMessage[pool.size:])
 
 			r := false
 			func() {
 				pool.stateLock.Lock()
 				defer pool.stateLock.Unlock()
-
-				id := binary.BigEndian.Uint64(poolMessage[pool.size:])
 
 				c := pool.counts[id]
 				if c == 0 {
@@ -251,12 +263,11 @@ func MessagePoolShareReadOnly(message []byte) []byte {
 	for _, pool := range orderedMessagePools {
 		if c == pool.size+MessagePoolMetaByteCount {
 			poolMessage := message[:c]
+			id := binary.BigEndian.Uint64(poolMessage[pool.size:])
 
 			func() {
 				pool.stateLock.Lock()
 				defer pool.stateLock.Unlock()
-
-				id := binary.BigEndian.Uint64(poolMessage[pool.size:])
 
 				c := pool.counts[id]
 				if c == 0 {
@@ -279,12 +290,11 @@ func MessagePoolCheck(message []byte) (pooled bool, shared bool) {
 	for _, pool := range orderedMessagePools {
 		if c == pool.size+MessagePoolMetaByteCount {
 			poolMessage := message[:c]
+			id := binary.BigEndian.Uint64(poolMessage[pool.size:])
 
 			func() {
 				pool.stateLock.Lock()
 				defer pool.stateLock.Unlock()
-
-				id := binary.BigEndian.Uint64(poolMessage[pool.size:])
 
 				c := pool.counts[id]
 				if 0 < c {
@@ -299,54 +309,6 @@ func MessagePoolCheck(message []byte) (pooled bool, shared bool) {
 	// not a pool message
 	return
 }
-
-/*
-// returns if the optional bit is set
-func MessagePoolOptionalReturn(message []byte) {
-	c := cap(message)
-	for _, pool := range orderedMessagePools {
-		if c == pool.size+MessagePoolMetaByteCount {
-			poolMessage := message[:c]
-			if poolMessage[pool.size+9]&MessagePoolFlagOptionalReturn != 0 {
-				if DebugMessagePool {
-					func() {
-						pool.debugStateLock.Lock()
-						defer pool.debugStateLock.Unlock()
-
-						id := binary.BigEndian.Uint64(poolMessage[pool.size:])
-
-						// fmt.Printf("RETURN[%d]\n", id)
-						// debug.PrintStack()
-
-						if pool.debugInventory[id] {
-							panic(fmt.Errorf("message[%d] already returned", id))
-						}
-						pool.debugInventory[id] = true
-					}()
-				}
-				tag := poolMessage[pool.size+8]
-				poolMessage[pool.size+8] = 0
-				poolMessage[pool.size+9] = 0
-				pool.pool.Put(poolMessage)
-				pool.returnedTags[tag].Add(1)
-				return
-			}
-		}
-	}
-	// else do nothing
-}
-
-func MessagePoolSetOptionalReturn(message []byte, optionalReturn bool) {
-	c := cap(message)
-	for _, pool := range orderedMessagePools {
-		if c == pool.size+MessagePoolMetaByteCount {
-			poolMessage := message[:c]
-			poolMessage[pool.size+9] |= MessagePoolFlagOptionalReturn
-			return
-		}
-	}
-}
-*/
 
 func ProtoMarshal(m proto.Message) ([]byte, error) {
 	return ProtoMarshalWithTag(m, 0)
