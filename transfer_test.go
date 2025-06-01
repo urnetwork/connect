@@ -117,7 +117,11 @@ func TestSendReceiveSenderReset(t *testing.T) {
 
 	b.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode) {
 		for _, frame := range frames {
-			switch v := RequireFromFrame(frame).(type) {
+			m, err := FromFrame(frame)
+			if err != nil {
+				panic(err)
+			}
+			switch v := m.(type) {
 			case *protocol.SimpleMessage:
 				receives <- v
 			}
@@ -146,7 +150,10 @@ func TestSendReceiveSenderReset(t *testing.T) {
 			message := &protocol.SimpleMessage{
 				Content: fmt.Sprintf("hi %d", i),
 			}
-			frame := RequireToFrame(message, DefaultProtocolVersion)
+			frame, err := ToFrame(message, DefaultProtocolVersion)
+			if err != nil {
+				panic(err)
+			}
 			a.Send(frame, DestinationId(bClientId), func(err error) {
 				acks <- err
 			})
@@ -235,7 +242,10 @@ func TestSendReceiveSenderReset(t *testing.T) {
 			message := &protocol.SimpleMessage{
 				Content: fmt.Sprintf("hi %d", i),
 			}
-			frame := RequireToFrame(message, DefaultProtocolVersion)
+			frame, err := ToFrame(message, DefaultProtocolVersion)
+			if err != nil {
+				panic(err)
+			}
 			a2.Send(frame, DestinationId(bClientId), func(err error) {
 				acks <- err
 			})

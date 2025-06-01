@@ -462,6 +462,11 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 	sendPacket *parsedPacket,
 	timeout time.Duration,
 ) (success bool) {
+	defer func() {
+		if success {
+			MessagePoolReturn(sendPacket.packet)
+		}
+	}()
 	self.updateClientPath(sendPacket.ipPath, func(update *multiClientChannelUpdate) {
 		enterTime := time.Now()
 
@@ -472,8 +477,17 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 		}
 		sendCurrent := func() bool {
 			for client := currentClient(); client != nil; {
+				p := &parsedPacket{
+					packet: MessagePoolShareReadOnly(sendPacket.packet),
+					ipPath: sendPacket.ipPath,
+				}
+
 				var err error
-				success, err = client.SendDetailed(sendPacket, timeout)
+				success, err = client.SendDetailed(p, timeout)
+				if !success {
+					MessagePoolReturn(p.packet)
+				}
+				// note we do not check success also because it may be normal to drop packets under load
 				if err == nil {
 					return true
 				}
@@ -535,7 +549,12 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 					return
 				}
 
-				if client.Send(sendPacket, sendTimeout) {
+				p := &parsedPacket{
+					packet: MessagePoolShareReadOnly(sendPacket.packet),
+					ipPath: sendPacket.ipPath,
+				}
+				success := client.Send(p, sendTimeout)
+				if success {
 					successCount += 1
 					success = true
 					var abandonedClients []*multiClientChannel
@@ -553,7 +572,7 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 						race := update.race
 						state := race.clientStates[client]
 						race.sentPacketCount += 1
-						bufferExceeded := self.settings.MultiRaceSetOnNoResponseTimeout <= time.Now().Sub(state.sendTime) || self.settings.MultiRaceClientSentPacketMaxCount < race.sentPacketCount
+						bufferExceeded := state != nil && self.settings.MultiRaceSetOnNoResponseTimeout <= time.Now().Sub(state.sendTime) || self.settings.MultiRaceClientSentPacketMaxCount < race.sentPacketCount
 						if race.packetCount == 0 && bufferExceeded {
 							// no client response in timeout, lock in this client
 							// this happens for example when the client only sends and does not receive (e.g. udp send)
@@ -578,11 +597,11 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 						}
 					}()
 					if 0 < len(abandonedClients) {
-						if rstPacket, ok := ipOosRst(sendPacket.ipPath); ok {
+						if rstPacket, ok := ipOosRst(p.ipPath); ok {
 							for _, abandonedClient := range abandonedClients {
 								abandonedClient.Send(&parsedPacket{
 									packet: rstPacket,
-									ipPath: sendPacket.ipPath,
+									ipPath: p.ipPath,
 								}, 0)
 							}
 						}
@@ -590,6 +609,8 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 					if done {
 						return
 					}
+				} else {
+					MessagePoolReturn(p.packet)
 				}
 			}
 		}
@@ -1994,9 +2015,6 @@ func (self *multiClientChannel) SendDetailed(parsedPacket *parsedPacket, timeout
 		self.addError(err)
 		return false, err
 	} else {
-		if !frame.Raw {
-			MessagePoolReturn(parsedPacket.packet)
-		}
 		packetByteCount := ByteCount(len(parsedPacket.packet))
 		self.addSendNack(packetByteCount)
 		self.addSource(parsedPacket.ipPath)
@@ -2015,13 +2033,23 @@ func (self *multiClientChannel) SendDetailed(parsedPacket *parsedPacket, timeout
 		case IpProtocolUdp:
 			opts = append(opts, NoAck())
 		}
-		return self.client.SendMultiHopWithTimeoutDetailed(
+		success, err := self.client.SendMultiHopWithTimeoutDetailed(
 			frame,
 			self.args.Destination,
 			ackCallback,
 			timeout,
 			opts...,
 		)
+		if success {
+			if !frame.Raw {
+				MessagePoolReturn(parsedPacket.packet)
+			}
+		} else {
+			if !frame.Raw {
+				MessagePoolReturn(frame.MessageBytes)
+			}
+		}
+		return success, err
 	}
 }
 

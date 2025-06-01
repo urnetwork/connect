@@ -63,6 +63,11 @@ func (self *ApiOutOfBandControl) SendControl(
 	pack := &protocol.Pack{
 		Frames: frames,
 	}
+	defer func() {
+		for _, frame := range frames {
+			MessagePoolReturn(frame.MessageBytes)
+		}
+	}()
 	packBytes, err := ProtoMarshal(pack)
 	if err != nil {
 		safeCallback(nil, err)

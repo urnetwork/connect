@@ -3,11 +3,16 @@ package connect
 import (
 	"encoding/binary"
 	"fmt"
+	"hash/maphash"
 	"io"
+	"runtime"
+	"runtime/debug"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-	// "runtime/debug"
+
+	"golang.org/x/exp/maps"
 
 	"google.golang.org/protobuf/proto"
 
@@ -28,8 +33,10 @@ import (
 // Shared messages are returned to the pool the same as normal messages.
 // `MessagePoolReturn`/`MessagePoolShareReadOnly` is a noop when using a `[]byte` that is not part of the pool.
 
-// [8 byte id][1 byte tag][1 byte flags]
-const MessagePoolMetaByteCount = 10
+const debugTags = true
+
+// [8 byte id][1 byte tag][1 byte flags][2 byte ref count]
+const MessagePoolMetaByteCount = 12
 const MessagePoolFlagShared = uint8(0x01)
 
 var nextId atomic.Uint64
@@ -40,13 +47,11 @@ type messagePool struct {
 	takenTags    [256]atomic.Uint64
 	returnedTags [256]atomic.Uint64
 	createdTags  [256]atomic.Uint64
-
-	stateLock sync.Mutex
-	counts    map[uint64]int
+	stateLock    sync.Mutex
 }
 
 func newMessagePool(size int) *messagePool {
-	return &messagePool{
+	mp := &messagePool{
 		size: size,
 		pool: &sync.Pool{
 			New: func() any {
@@ -56,13 +61,42 @@ func newMessagePool(size int) *messagePool {
 				return poolMessage
 			},
 		},
-		counts: map[uint64]int{},
 	}
+	return mp
 }
 
 var orderedMessagePools = []*messagePool{
 	newMessagePool(2048),
 	newMessagePool(4096),
+}
+
+var seed = maphash.MakeSeed()
+var debugStateLock sync.Mutex
+var tagCallers = map[uint8]map[string]bool{}
+
+func debugTag() uint8 {
+	_, file2, line2, ok := runtime.Caller(2)
+	if !ok {
+		return 0
+	}
+	_, file3, line3, ok := runtime.Caller(3)
+	if !ok {
+		return 0
+	}
+	caller := fmt.Sprintf("%s:%d->%s:%d", file3, line3, file2, line2)
+	tag := uint8(maphash.String(seed, caller))
+	func() {
+		debugStateLock.Lock()
+		defer debugStateLock.Unlock()
+
+		callers, ok := tagCallers[tag]
+		if !ok {
+			callers = map[string]bool{}
+			tagCallers[tag] = callers
+		}
+		callers[caller] = true
+	}()
+	return tag
 }
 
 func init() {
@@ -80,8 +114,14 @@ func poolStats() {
 					created := pool.createdTags[tag].Load()
 					ratio := float32(returned) / float32(taken)
 					reuse := float32(taken-created) / float32(taken)
+					var caller string
+					func() {
+						debugStateLock.Lock()
+						defer debugStateLock.Unlock()
+						caller = strings.Join(maps.Keys(tagCallers[uint8(tag)]), "/")
+					}()
 
-					glog.Infof("pool[%d] tag=%d r=%d/t=%d/c=%d = %.2f%% return / %.2f%% reuse\n", pool.size, tag, returned, taken, created, 100*ratio, 100*reuse)
+					glog.Infof("pool[%d] tag=%d [%s] r=%d/t=%d/c=%d = %.2f%% return / %.2f%% reuse\n", pool.size, tag, caller, returned, taken, created, 100*ratio, 100*reuse)
 				}
 			}
 		}
@@ -176,7 +216,11 @@ func MessagePoolReadAllWithTag(r io.Reader, tag uint8) ([]byte, error) {
 }
 
 func MessagePoolCopy(message []byte) []byte {
-	return MessagePoolCopyWithTag(message, 0)
+	var tag uint8
+	if debugTags {
+		tag = debugTag()
+	}
+	return MessagePoolCopyWithTag(message, tag)
 }
 
 func MessagePoolCopyWithTag(message []byte, tag uint8) []byte {
@@ -186,7 +230,11 @@ func MessagePoolCopyWithTag(message []byte, tag uint8) []byte {
 }
 
 func MessagePoolGet(n int) []byte {
-	return MessagePoolGetWithTag(n, 0)
+	var tag uint8
+	if debugTags {
+		tag = debugTag()
+	}
+	return MessagePoolGetWithTag(n, tag)
 }
 
 func MessagePoolGetWithTag(n int, tag uint8) []byte {
@@ -204,11 +252,14 @@ func MessagePoolGetWithTag(n int, tag uint8) []byte {
 				pool.stateLock.Lock()
 				defer pool.stateLock.Unlock()
 
-				c := pool.counts[id]
-				if c != 0 {
-					panic(fmt.Errorf("message[%d] already taken", id))
+				count := binary.BigEndian.Uint16(poolMessage[pool.size+10:])
+
+				if count != 0 {
+					err := fmt.Errorf("message[%d] already taken", id)
+					glog.Errorf("[mp]%s", ErrorJson(err, debug.Stack()))
+					panic(err)
 				} else {
-					pool.counts[id] = 1
+					binary.BigEndian.PutUint16(poolMessage[pool.size+10:], 1)
 				}
 			}()
 
@@ -232,14 +283,16 @@ func MessagePoolReturn(message []byte) bool {
 				pool.stateLock.Lock()
 				defer pool.stateLock.Unlock()
 
-				c := pool.counts[id]
-				if c == 0 {
-					glog.Warningf("[mp]return message[%d] not taken", id)
-				} else if c == 1 {
-					delete(pool.counts, id)
+				count := binary.BigEndian.Uint16(poolMessage[pool.size+10:])
+				if count == 0 {
+					if debugTags {
+						err := fmt.Errorf("[mp]return message[%d] not taken", id)
+						glog.Errorf("[mp]%s", ErrorJson(err, debug.Stack()))
+					}
+				} else if count == 1 {
 					r = true
 				} else {
-					pool.counts[id] = c - 1
+					binary.BigEndian.PutUint16(poolMessage[pool.size+10:], count-1)
 				}
 			}()
 
@@ -247,6 +300,7 @@ func MessagePoolReturn(message []byte) bool {
 				tag := poolMessage[pool.size+8]
 				poolMessage[pool.size+8] = 0
 				poolMessage[pool.size+9] = 0
+				binary.BigEndian.PutUint16(poolMessage[pool.size+10:], 0)
 				pool.pool.Put(poolMessage)
 				pool.returnedTags[tag].Add(1)
 				return true
@@ -269,11 +323,11 @@ func MessagePoolShareReadOnly(message []byte) []byte {
 				pool.stateLock.Lock()
 				defer pool.stateLock.Unlock()
 
-				c := pool.counts[id]
-				if c == 0 {
+				count := binary.BigEndian.Uint16(poolMessage[pool.size+10:])
+				if count == 0 {
 					glog.Warningf("[mp]share message[%d] not taken", id)
 				} else {
-					pool.counts[id] = c + 1
+					binary.BigEndian.PutUint16(poolMessage[pool.size+10:], count+1)
 					poolMessage[pool.size+9] |= MessagePoolFlagShared
 				}
 			}()
@@ -290,14 +344,13 @@ func MessagePoolCheck(message []byte) (pooled bool, shared bool) {
 	for _, pool := range orderedMessagePools {
 		if c == pool.size+MessagePoolMetaByteCount {
 			poolMessage := message[:c]
-			id := binary.BigEndian.Uint64(poolMessage[pool.size:])
 
 			func() {
 				pool.stateLock.Lock()
 				defer pool.stateLock.Unlock()
 
-				c := pool.counts[id]
-				if 0 < c {
+				count := binary.BigEndian.Uint16(poolMessage[pool.size+10:])
+				if 0 < count {
 					pooled = true
 					shared = poolMessage[pool.size+9]&MessagePoolFlagShared != 0
 				}
@@ -311,7 +364,11 @@ func MessagePoolCheck(message []byte) (pooled bool, shared bool) {
 }
 
 func ProtoMarshal(m proto.Message) ([]byte, error) {
-	return ProtoMarshalWithTag(m, 0)
+	var tag uint8
+	if debugTags {
+		tag = debugTag()
+	}
+	return ProtoMarshalWithTag(m, tag)
 }
 
 func ProtoMarshalWithTag(m proto.Message, tag uint8) ([]byte, error) {
