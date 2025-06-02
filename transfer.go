@@ -3234,18 +3234,18 @@ func (self *receiveItem) messagePoolReturn() {
 	MessagePoolReturn(self.transferFrameBytes)
 	// note frames and contractFrame are slices/shared bytes of the transfer frame bytes
 	// we expect these both to be false
-	for _, frame := range self.frames {
-		r := MessagePoolReturn(frame.MessageBytes)
-		if r {
-			glog.Warningf("[ri]frame was not shared]\n")
-		}
-	}
-	if self.contractFrame != nil {
-		r := MessagePoolReturn(self.contractFrame.MessageBytes)
-		if r {
-			glog.Warningf("[ri]contract frame was not shared]\n")
-		}
-	}
+	// for _, frame := range self.frames {
+	// 	r := MessagePoolReturn(frame.MessageBytes)
+	// 	if r {
+	// 		glog.Warningf("[ri]frame was not shared]\n")
+	// 	}
+	// }
+	// if self.contractFrame != nil {
+	// 	r := MessagePoolReturn(self.contractFrame.MessageBytes)
+	// 	if r {
+	// 		glog.Warningf("[ri]contract frame was not shared]\n")
+	// 	}
+	// }
 }
 
 // ordered by sequenceNumber

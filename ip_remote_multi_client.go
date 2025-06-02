@@ -157,6 +157,14 @@ type MultiClientSettings struct {
 	RemoteUserNatMultiClientMonitorSettings
 }
 
+type ReceivePacket struct {
+	Source      TransferPath
+	ProvideMode protocol.ProvideMode
+	IpPath      *IpPath
+	Packet      []byte
+	Pooled      bool
+}
+
 type RemoteUserNatMultiClient struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -462,11 +470,6 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 	sendPacket *parsedPacket,
 	timeout time.Duration,
 ) (success bool) {
-	defer func() {
-		if success {
-			MessagePoolReturn(sendPacket.packet)
-		}
-	}()
 	self.updateClientPath(sendPacket.ipPath, func(update *multiClientChannelUpdate) {
 		enterTime := time.Now()
 
@@ -478,15 +481,12 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 		sendCurrent := func() bool {
 			for client := currentClient(); client != nil; {
 				p := &parsedPacket{
-					packet: MessagePoolShareReadOnly(sendPacket.packet),
+					packet: sendPacket.packet,
 					ipPath: sendPacket.ipPath,
 				}
 
 				var err error
 				success, err = client.SendDetailed(p, timeout)
-				if !success {
-					MessagePoolReturn(p.packet)
-				}
 				// note we do not check success also because it may be normal to drop packets under load
 				if err == nil {
 					return true
@@ -553,8 +553,7 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 					packet: MessagePoolShareReadOnly(sendPacket.packet),
 					ipPath: sendPacket.ipPath,
 				}
-				success := client.Send(p, sendTimeout)
-				if success {
+				if client.Send(p, sendTimeout) {
 					successCount += 1
 					success = true
 					var abandonedClients []*multiClientChannel
@@ -597,11 +596,11 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 						}
 					}()
 					if 0 < len(abandonedClients) {
-						if rstPacket, ok := ipOosRst(p.ipPath); ok {
+						if rstPacket, ok := ipOosRst(sendPacket.ipPath); ok {
 							for _, abandonedClient := range abandonedClients {
 								abandonedClient.Send(&parsedPacket{
 									packet: rstPacket,
-									ipPath: p.ipPath,
+									ipPath: sendPacket.ipPath,
 								}, 0)
 							}
 						}
@@ -617,6 +616,7 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 
 		raceClients(self.window.OrderedClients(), 0)
 		if success {
+			MessagePoolReturn(sendPacket.packet)
 			return
 		}
 
@@ -650,6 +650,7 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 				retryTimeoutPerClient := retryTimeout / time.Duration(len(orderedClients))
 				raceClients(orderedClients, retryTimeoutPerClient)
 				if success {
+					MessagePoolReturn(sendPacket.packet)
 					return
 				}
 			} else {
@@ -678,17 +679,12 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 	// 	// bad ip packet, drop
 	// 	return
 	// }
-	receivePacket := &ReceivePacket{
-		Source:      source,
-		ProvideMode: provideMode,
-		IpPath:      ipPath,
-		Packet:      packet,
-	}
 
 	ipPath = ipPath.Reverse()
 
 	var abandonedClients []*multiClientChannel
 	var receivePackets []*ReceivePacket
+	var returnPackets []*ReceivePacket
 	self.updateClientPath(ipPath, func(update *multiClientChannelUpdate) {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -696,6 +692,12 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 		client := update.client
 
 		if client == sourceClient {
+			receivePacket := &ReceivePacket{
+				Source:      source,
+				ProvideMode: provideMode,
+				IpPath:      ipPath,
+				Packet:      packet,
+			}
 			receivePackets = []*ReceivePacket{receivePacket}
 		} else if client != nil {
 			// another client already chosen, drop
@@ -706,6 +708,17 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 			// this client is not part of the race, drop
 			glog.Infof("[multi]receive client not part of race")
 		} else if len(state.packets) < self.settings.MultiRaceClientPacketMaxCount && race.packetCount < self.settings.MultiRacePacketMaxCount {
+			// note that `MessagePoolShare*` will not work on the packet
+			// since the packet is typically a slice of the received transfer frame
+			ipPathCopy := ipPath.Copy()
+			packetCopy, pooled := MessagePoolCopyDetailed(packet)
+			receivePacket := &ReceivePacket{
+				Source:      source,
+				ProvideMode: provideMode,
+				IpPath:      ipPathCopy,
+				Packet:      packetCopy,
+				Pooled:      pooled,
+			}
 			state.packets = append(state.packets, receivePacket)
 			if 1 == len(state.packets) {
 				state.receiveTime = time.Now()
@@ -714,7 +727,8 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 			if race.packetCount == 1 {
 				// schedule the race evaluation on first packet
 				earlyComplete := race.completeMonitor.NotifyChannel()
-				self.scheduleCompleteRace(ipPath, race, earlyComplete)
+				// copy the ip path since the first packet may not be ultimately retained to the end of the race
+				self.scheduleCompleteRace(ipPathCopy, race, earlyComplete)
 			}
 			if len(state.packets) == 1 {
 				race.clientsWithPacketCount += 1
@@ -726,15 +740,33 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 			// race buffer limits exceeded, end the race immediately
 			glog.Infof("[multi]receive race buffer limit reached")
 
-			for abandonedClient, _ := range race.clientStates {
+			for abandonedClient, abandonedState := range race.clientStates {
 				if abandonedClient != client {
 					abandonedClients = append(abandonedClients, abandonedClient)
+					for _, p := range abandonedState.packets {
+						if p.Pooled {
+							p.Pooled = false
+							returnPackets = append(returnPackets, p)
+						}
+					}
 				}
 			}
 
 			update.clearRace()
 			update.client = client
+			receivePacket := &ReceivePacket{
+				Source:      source,
+				ProvideMode: provideMode,
+				IpPath:      ipPath,
+				Packet:      packet,
+			}
 			receivePackets = append(state.packets, receivePacket)
+			for _, p := range receivePackets {
+				if p.Pooled {
+					p.Pooled = false
+					returnPackets = append(returnPackets, p)
+				}
+			}
 		}
 	})
 	if 0 < len(abandonedClients) {
@@ -749,6 +781,9 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 	}
 	for _, p := range receivePackets {
 		self.receivePacketCallback(p.Source, p.ProvideMode, p.IpPath, p.Packet)
+	}
+	for _, p := range returnPackets {
+		MessagePoolReturn(p.Packet)
 	}
 }
 
@@ -769,6 +804,7 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 
 		var abandonedClients []*multiClientChannel
 		var receivePackets []*ReceivePacket
+		var returnPackets []*ReceivePacket
 		self.updateClientPath(ipPath, func(update *multiClientChannelUpdate) {
 			self.stateLock.Lock()
 			defer self.stateLock.Unlock()
@@ -788,15 +824,27 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 				// the last is the lowest rtt
 				client := orderedClients[len(orderedClients)-1]
 
-				for abandonedClient, _ := range race.clientStates {
+				for abandonedClient, abandonedState := range race.clientStates {
 					if abandonedClient != client {
 						abandonedClients = append(abandonedClients, abandonedClient)
+						for _, p := range abandonedState.packets {
+							if p.Pooled {
+								p.Pooled = false
+								returnPackets = append(returnPackets, p)
+							}
+						}
 					}
 				}
 
 				update.clearRace()
 				update.client = client
 				receivePackets = race.clientStates[update.client].packets
+				for _, p := range receivePackets {
+					if p.Pooled {
+						p.Pooled = false
+						returnPackets = append(returnPackets, p)
+					}
+				}
 			}
 			// else a client was already chosen, ignore
 		})
@@ -812,6 +860,9 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 		}
 		for _, p := range receivePackets {
 			self.receivePacketCallback(p.Source, p.ProvideMode, p.IpPath, p.Packet)
+		}
+		for _, p := range returnPackets {
+			MessagePoolReturn(p.Packet)
 		}
 	})
 }
@@ -2040,6 +2091,9 @@ func (self *multiClientChannel) SendDetailed(parsedPacket *parsedPacket, timeout
 			timeout,
 			opts...,
 		)
+		if err != nil {
+			return success, err
+		}
 		if success {
 			if !frame.Raw {
 				MessagePoolReturn(parsedPacket.packet)

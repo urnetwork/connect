@@ -175,7 +175,7 @@ func MessagePoolReadAll(r io.Reader) ([]byte, error) {
 }
 
 func MessagePoolReadAllWithTag(r io.Reader, tag uint8) ([]byte, error) {
-	b := MessagePoolGetWithTag(orderedMessagePools[0].size, tag)
+	b, _ := MessagePoolGetDetailedWithTag(orderedMessagePools[0].size, tag)
 	i := 0
 	for j := 0; j < len(orderedMessagePools); j += 1 {
 		for i < len(b) {
@@ -194,7 +194,7 @@ func MessagePoolReadAllWithTag(r io.Reader, tag uint8) ([]byte, error) {
 			break
 		}
 
-		b2 := MessagePoolGetWithTag(orderedMessagePools[j+1].size, tag)
+		b2, _ := MessagePoolGetDetailedWithTag(orderedMessagePools[j+1].size, tag)
 		copy(b2, b)
 		MessagePoolReturn(b)
 		b = b2
@@ -216,28 +216,38 @@ func MessagePoolReadAllWithTag(r io.Reader, tag uint8) ([]byte, error) {
 }
 
 func MessagePoolCopy(message []byte) []byte {
+	b, _ := MessagePoolCopyDetailed(message)
+	return b
+}
+
+func MessagePoolCopyDetailed(message []byte) ([]byte, bool) {
 	var tag uint8
 	if debugTags {
 		tag = debugTag()
 	}
-	return MessagePoolCopyWithTag(message, tag)
+	return MessagePoolCopyDetailedWithTag(message, tag)
 }
 
-func MessagePoolCopyWithTag(message []byte, tag uint8) []byte {
-	poolMessage := MessagePoolGetWithTag(len(message), tag)
+func MessagePoolCopyDetailedWithTag(message []byte, tag uint8) ([]byte, bool) {
+	poolMessage, pooled := MessagePoolGetDetailedWithTag(len(message), tag)
 	copy(poolMessage, message)
-	return poolMessage
+	return poolMessage, pooled
 }
 
 func MessagePoolGet(n int) []byte {
+	b, _ := MessagePoolGetDetailed(n)
+	return b
+}
+
+func MessagePoolGetDetailed(n int) ([]byte, bool) {
 	var tag uint8
 	if debugTags {
 		tag = debugTag()
 	}
-	return MessagePoolGetWithTag(n, tag)
+	return MessagePoolGetDetailedWithTag(n, tag)
 }
 
-func MessagePoolGetWithTag(n int, tag uint8) []byte {
+func MessagePoolGetDetailedWithTag(n int, tag uint8) ([]byte, bool) {
 	for _, pool := range orderedMessagePools {
 		if n <= pool.size {
 			poolMessage := pool.pool.Get().([]byte)
@@ -263,12 +273,12 @@ func MessagePoolGetWithTag(n int, tag uint8) []byte {
 				}
 			}()
 
-			return poolMessage[:n]
+			return poolMessage[:n], true
 		}
 	}
 	// allocate a new message
 	poolMessage := make([]byte, n+MessagePoolMetaByteCount)
-	return poolMessage[:n]
+	return poolMessage[:n], false
 }
 
 func MessagePoolReturn(message []byte) bool {
@@ -376,7 +386,7 @@ func ProtoMarshalWithTag(m proto.Message, tag uint8) ([]byte, error) {
 		return nil, nil
 	}
 
-	buf := MessagePoolGetWithTag(proto.Size(m), tag)
+	buf, _ := MessagePoolGetDetailedWithTag(proto.Size(m), tag)
 
 	out, err := proto.MarshalOptions{}.MarshalAppend(buf[:0], m)
 	if err != nil {

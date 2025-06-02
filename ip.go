@@ -49,13 +49,6 @@ type SendPacketFunction func(provideMode protocol.ProvideMode, packet []byte, ti
 // receive into a raw socket
 type ReceivePacketFunction func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte)
 
-type ReceivePacket struct {
-	Source      TransferPath
-	ProvideMode protocol.ProvideMode
-	IpPath      *IpPath
-	Packet      []byte
-}
-
 type UserNatClient interface {
 	// `SendPacketFunction`
 	SendPacket(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool
@@ -288,6 +281,7 @@ func (self *LocalUserNat) Run() {
 					}
 				default:
 					// no support for this protocol, drop
+					MessagePoolReturn(ipPacket)
 				}
 			case 6:
 				ipv6 := layers.IPv6{}
@@ -341,6 +335,7 @@ func (self *LocalUserNat) Run() {
 					}
 				default:
 					// no support for this protocol, drop
+					MessagePoolReturn(ipPacket)
 				}
 			}
 		}
@@ -547,15 +542,21 @@ func (self *UdpBuffer[BufferId]) udpSend(
 		// limit the number of new connections per second per source
 		// self.sourceLimiter[source].Limit()
 
+		sourceIpCopy := make(net.IP, len(sourceIp))
+		copy(sourceIpCopy, sourceIp)
+
+		destinationIpCopy := make(net.IP, len(destinationIp))
+		copy(destinationIpCopy, destinationIp)
+
 		sequence = NewUdpSequence(
 			self.ctx,
 			self.receiveCallback,
 			source,
 			provideMode,
 			ipVersion,
-			sourceIp,
+			sourceIpCopy,
 			udp.SrcPort,
-			destinationIp,
+			destinationIpCopy,
 			udp.DstPort,
 			self.udpBufferSettings,
 		)
@@ -1070,6 +1071,7 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 				return sequence
 			}
 			// drop the packet; only create a new sequence on SYN
+			MessagePoolReturn(ipPacket)
 			glog.V(2).Infof("[lnr]tcp drop no syn (%s)\n", tcpFlagsString(tcp))
 			return nil
 		}
@@ -1106,15 +1108,21 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 		// limit the number of new connections per second per source
 		// self.sourceLimiter[source].Limit()
 
+		sourceIpCopy := make(net.IP, len(sourceIp))
+		copy(sourceIpCopy, sourceIp)
+
+		destinationIpCopy := make(net.IP, len(destinationIp))
+		copy(destinationIpCopy, destinationIp)
+
 		sequence := NewTcpSequence(
 			self.ctx,
 			self.receiveCallback,
 			source,
 			provideMode,
 			ipVersion,
-			sourceIp,
+			sourceIpCopy,
 			tcp.SrcPort,
-			destinationIp,
+			destinationIpCopy,
 			tcp.DstPort,
 			self.tcpBufferSettings,
 		)
@@ -1582,7 +1590,6 @@ func (self *TcpSequence) Run() {
 					}
 				}
 				MessagePoolReturn(writePayload.ipPacket)
-
 			}
 		}
 	}()
@@ -1767,6 +1774,8 @@ func (self *TcpSequence) Run() {
 					self.sendSeq += uint32(len(payload))
 					ackCond.Broadcast()
 				}()
+			} else {
+				MessagePoolReturn(sendItem.ipPacket)
 			}
 
 			// if 0 < seq {
@@ -2346,24 +2355,27 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 			}
 			ipPacketToProvider := ipPacketToProvider_.(*protocol.IpPacketToProvider)
 
-			var packet []byte
-			if frame.Raw {
-				packet = MessagePoolShareReadOnly(ipPacketToProvider.IpPacket.PacketBytes)
-			} else {
-				packet = MessagePoolCopy(ipPacketToProvider.IpPacket.PacketBytes)
-			}
-
-			_, r, err := self.securityPolicy.Inspect(provideMode, packet)
+			_, r, err := self.securityPolicy.Inspect(provideMode, ipPacketToProvider.IpPacket.PacketBytes)
 			if err == nil {
 				switch r {
 				case SecurityPolicyResultAllow:
 					c := func() bool {
-						return self.localUserNat.SendPacketWithTimeout(
+						var packet []byte
+						if frame.Raw {
+							packet = MessagePoolShareReadOnly(ipPacketToProvider.IpPacket.PacketBytes)
+						} else {
+							packet = MessagePoolCopy(ipPacketToProvider.IpPacket.PacketBytes)
+						}
+						success := self.localUserNat.SendPacketWithTimeout(
 							source,
 							provideMode,
 							packet,
 							self.settings.WriteTimeout,
 						)
+						if !success {
+							MessagePoolReturn(packet)
+						}
+						return success
 					}
 					if glog.V(2) {
 						TraceWithReturn(
@@ -2669,6 +2681,23 @@ func ParseIpPathWithPayload(ipPacket []byte) (*IpPath, []byte, error) {
 	default:
 		// no support for this version
 		return nil, nil, fmt.Errorf("No support for ip version %d", ipVersion)
+	}
+}
+
+func (self *IpPath) Copy() *IpPath {
+	sourceIpCopy := make(net.IP, len(self.SourceIp))
+	copy(sourceIpCopy, self.SourceIp)
+
+	destinationIpCopy := make(net.IP, len(self.DestinationIp))
+	copy(destinationIpCopy, self.DestinationIp)
+
+	return &IpPath{
+		Version:         self.Version,
+		Protocol:        self.Protocol,
+		SourceIp:        sourceIpCopy,
+		SourcePort:      self.SourcePort,
+		DestinationIp:   destinationIpCopy,
+		DestinationPort: self.DestinationPort,
 	}
 }
 
