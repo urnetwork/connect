@@ -33,7 +33,8 @@ import (
 // Shared messages are returned to the pool the same as normal messages.
 // `MessagePoolReturn`/`MessagePoolShareReadOnly` is a noop when using a `[]byte` that is not part of the pool.
 
-const debugTags = true
+// set this to true to tag messages with useful debugging information e.g. the creation site
+const debugTags = false
 
 // [8 byte id][1 byte tag][1 byte flags][2 byte ref count]
 const MessagePoolMetaByteCount = 12
