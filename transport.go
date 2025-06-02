@@ -377,6 +377,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				if err != nil {
 					return nil, err
 				}
+				defer MessagePoolReturn(authBytes)
 
 				ws.SetWriteDeadline(time.Now().Add(self.settings.AuthTimeout))
 				if err := ws.WriteMessage(websocket.BinaryMessage, authBytes); err != nil {
@@ -499,16 +500,18 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						// 	panic("[t]shared should be set")
 						// }
 
-						ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
-						if err := ws.WriteMessage(websocket.BinaryMessage, message); err != nil {
-							// note that for websocket a dealine timeout cannot be recovered
-							glog.Infof("[ts]%s-> error = %s\n", clientId, err)
-							return
-						}
-						glog.V(2).Infof("[ts]%s->\n", clientId)
+						func() {
+							defer MessagePoolReturn(message)
+							ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
+							if err := ws.WriteMessage(websocket.BinaryMessage, message); err != nil {
+								// note that for websocket a dealine timeout cannot be recovered
+								glog.Infof("[ts]%s-> error = %s\n", clientId, err)
+								return
+							}
+							glog.V(2).Infof("[ts]%s->\n", clientId)
 
-						writeCounter.Add(1)
-						MessagePoolReturn(message)
+							writeCounter.Add(1)
+						}()
 					case <-WakeupAfter(self.settings.PingTimeout):
 						ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
 						if err := ws.WriteMessage(websocket.BinaryMessage, make([]byte, 0)); err != nil {
@@ -538,30 +541,34 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						glog.Infof("[tr]%s<- error = %s\n", clientId, err)
 						return
 					}
-					message, err := MessagePoolReadAll(r)
-					if err != nil {
-						glog.Infof("[tr]%s<- error = %s\n", clientId, err)
-						return
-					}
-
-					readCounter.Add(1)
 
 					switch messageType {
 					case websocket.BinaryMessage:
 
+						message, err := MessagePoolReadAll(r)
+						if err != nil {
+							glog.Infof("[tr]%s<- error = %s\n", clientId, err)
+							return
+						}
+
+						readCounter.Add(1)
+
 						if 0 == len(message) {
 							// ping
 							glog.V(2).Infof("[tr]ping %s<-\n", clientId)
+							MessagePoolReturn(message)
 							continue
 						}
 
 						select {
 						case <-handleCtx.Done():
+							MessagePoolReturn(message)
 							return
 						case receive <- message:
 							glog.V(2).Infof("[tr]%s<-\n", clientId)
 						case <-time.After(self.settings.ReadTimeout):
 							glog.Infof("[tr]drop %s<-\n", clientId)
+							MessagePoolReturn(message)
 						}
 					default:
 						glog.V(2).Infof("[tr]other=%s %s<-\n", messageType, clientId)
@@ -842,15 +849,16 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 						// if !MessagePoolCheckShared(message) {
 						// 	panic("[t]shared should be set")
 						// }
-
-						stream.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
-						if err := h3Framer.Write(stream, message); err != nil {
-							// note that for websocket a dealine timeout cannot be recovered
-							glog.Infof("[ts]%s-> error = %s\n", clientId, err)
-							return
-						}
-						glog.V(2).Infof("[ts]%s->\n", clientId)
-						MessagePoolReturn(message)
+						func() {
+							defer MessagePoolReturn(message)
+							stream.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
+							if err := h3Framer.Write(stream, message); err != nil {
+								// note that for websocket a dealine timeout cannot be recovered
+								glog.Infof("[ts]%s-> error = %s\n", clientId, err)
+								return
+							}
+							glog.V(2).Infof("[ts]%s->\n", clientId)
+						}()
 					case <-WakeupAfter(self.settings.PingTimeout):
 						stream.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
 						if err := h3Framer.Write(stream, make([]byte, 0)); err != nil {
@@ -884,16 +892,19 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 					if 0 == len(message) {
 						// ping
 						glog.V(2).Infof("[tr]ping %s<-\n", clientId)
+						MessagePoolReturn(message)
 						continue
 					}
 
 					select {
 					case <-handleCtx.Done():
+						MessagePoolReturn(message)
 						return
 					case receive <- message:
 						glog.V(2).Infof("[tr]%s<-\n", clientId)
 					case <-time.After(self.settings.ReadTimeout):
 						glog.Infof("[tr]drop %s<-\n", clientId)
+						MessagePoolReturn(message)
 					}
 				}
 			}()

@@ -258,7 +258,12 @@ func (self *ContractManager) providePing() {
 
 		ack := make(chan error)
 		providePing := &protocol.ProvidePing{}
-		self.client.SendControl(RequireToFrame(providePing, self.settings.ProtocolVersion), func(err error) {
+		frame, err := ToFrame(providePing, self.settings.ProtocolVersion)
+		if err != nil {
+			glog.Infof("[contract]could not create provide ping frame = %s", err)
+			return
+		}
+		self.client.SendControl(frame, func(err error) {
 			select {
 			case ack <- err:
 			case <-self.ctx.Done():
@@ -492,8 +497,13 @@ func (self *ContractManager) SetProvidePaused(providePaused bool) bool {
 		provide := &protocol.Provide{
 			Keys: []*protocol.ProvideKey{},
 		}
+		frame, err := ToFrame(provide, self.settings.ProtocolVersion)
+		if err != nil {
+			glog.Infof("[contract]could not create provide frame = %s", err)
+			return false
+		}
 		self.controlSyncProvide.Send(
-			RequireToFrame(provide, self.settings.ProtocolVersion),
+			frame,
 			nil,
 			nil,
 		)
@@ -512,8 +522,13 @@ func (self *ContractManager) SetProvidePaused(providePaused bool) bool {
 		provide := &protocol.Provide{
 			Keys: provideKeys,
 		}
+		frame, err := ToFrame(provide, self.settings.ProtocolVersion)
+		if err != nil {
+			glog.Infof("[contract]could not create provide frame = %s", err)
+			return false
+		}
 		self.controlSyncProvide.Send(
-			RequireToFrame(provide, self.settings.ProtocolVersion),
+			frame,
 			nil,
 			nil,
 		)
@@ -577,8 +592,13 @@ func (self *ContractManager) SetProvideModesWithAckCallback(provideModes map[pro
 		provide := &protocol.Provide{
 			Keys: provideKeys,
 		}
+		frame, err := ToFrame(provide, self.settings.ProtocolVersion)
+		if err != nil {
+			glog.Infof("[contract]could not create provide frame = %s", err)
+			return
+		}
 		self.controlSyncProvide.Send(
-			RequireToFrame(provide, self.settings.ProtocolVersion),
+			frame,
 			nil,
 			ackCallback,
 		)
@@ -775,8 +795,13 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, timeout tim
 		ForceStream:       &contractKey.ForceStream,
 		UsedContractIds:   contractQueue.UsedContractIdBytes(),
 	}
+	frame, err := ToFrame(createContract, self.settings.ProtocolVersion)
+	if err != nil {
+		glog.Infof("[contract]could not create contract frame = %s", err)
+		return
+	}
 	self.client.ClientOob().SendControl(
-		[]*protocol.Frame{RequireToFrame(createContract, self.settings.ProtocolVersion)},
+		[]*protocol.Frame{frame},
 		func(resultFrames []*protocol.Frame, err error) {
 			if err == nil {
 				self.Receive(SourceId(ControlId), resultFrames, protocol.ProvideMode_Network)
@@ -840,8 +865,13 @@ func (self *ContractManager) CloseContractWithCheckpoint(
 		UnackedByteCount: uint64(unackedByteCount),
 		Checkpoint:       checkpoint,
 	}
+	frame, err := ToFrame(closeContract, self.settings.ProtocolVersion)
+	if err != nil {
+		glog.Infof("[contract]could not create close contract frame = %s", err)
+		return
+	}
 	self.client.ClientOob().SendControl(
-		[]*protocol.Frame{RequireToFrame(closeContract, self.settings.ProtocolVersion)},
+		[]*protocol.Frame{frame},
 		func(resultFrames []*protocol.Frame, err error) {
 			if err == nil && opened {
 				contractQueue := self.openContractQueue(contractKey)

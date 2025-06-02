@@ -9,6 +9,7 @@ import (
 	"math"
 	mathrand "math/rand"
 	"net"
+	// "syscall"
 	"slices"
 	"strconv"
 	"strings"
@@ -49,13 +50,6 @@ type SendPacketFunction func(provideMode protocol.ProvideMode, packet []byte, ti
 // receive into a raw socket
 type ReceivePacketFunction func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte)
 
-type ReceivePacket struct {
-	Source      TransferPath
-	ProvideMode protocol.ProvideMode
-	IpPath      *IpPath
-	Packet      []byte
-}
-
 type UserNatClient interface {
 	// `SendPacketFunction`
 	SendPacket(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool
@@ -67,14 +61,14 @@ type UserNatClient interface {
 
 func DefaultUdpBufferSettings() *UdpBufferSettings {
 	return &UdpBufferSettings{
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
-		Mtu:          DefaultMtu,
-		// avoid fragmentation
-		ReadBufferByteCount: DefaultMtu - max(Ipv4HeaderSizeWithoutExtensions, Ipv6HeaderSize) - max(UdpHeaderSize, TcpHeaderSizeWithoutExtensions),
+		ReadTimeout:         30 * time.Second,
+		WriteTimeout:        15 * time.Second,
+		IdleTimeout:         60 * time.Second,
+		Mtu:                 DefaultMtu,
+		ReadBufferByteCount: DefaultMtu,
 		SequenceBufferSize:  DefaultIpBufferSize,
 		UserLimit:           128,
+		MaxWindowSize:       uint32(mib(1)),
 	}
 }
 
@@ -90,7 +84,7 @@ func DefaultTcpBufferSettings() *TcpBufferSettings {
 		// avoid fragmentation
 		ReadBufferByteCount: DefaultMtu - max(Ipv4HeaderSizeWithoutExtensions, Ipv6HeaderSize) - max(UdpHeaderSize, TcpHeaderSizeWithoutExtensions),
 		MinWindowSize:       uint32(kib(8)),
-		MaxWindowSize:       uint32(kib(256)),
+		MaxWindowSize:       uint32(mib(1)),
 		UserLimit:           128,
 	}
 	return tcpBufferSettings
@@ -251,6 +245,7 @@ func (self *LocalUserNat) Run() {
 							&ipv4,
 							&udp,
 							self.settings.BufferTimeout,
+							ipPacket,
 						)
 						return success && err == nil
 					}
@@ -273,6 +268,7 @@ func (self *LocalUserNat) Run() {
 							&ipv4,
 							&tcp,
 							self.settings.BufferTimeout,
+							ipPacket,
 						)
 						return success && err == nil
 					}
@@ -286,6 +282,7 @@ func (self *LocalUserNat) Run() {
 					}
 				default:
 					// no support for this protocol, drop
+					MessagePoolReturn(ipPacket)
 				}
 			case 6:
 				ipv6 := layers.IPv6{}
@@ -302,6 +299,7 @@ func (self *LocalUserNat) Run() {
 							&ipv6,
 							&udp,
 							self.settings.BufferTimeout,
+							ipPacket,
 						)
 						return success && err == nil
 					}
@@ -324,6 +322,7 @@ func (self *LocalUserNat) Run() {
 							&ipv6,
 							&tcp,
 							self.settings.BufferTimeout,
+							ipPacket,
 						)
 						return success && err == nil
 					}
@@ -337,6 +336,7 @@ func (self *LocalUserNat) Run() {
 					}
 				default:
 					// no support for this protocol, drop
+					MessagePoolReturn(ipPacket)
 				}
 			}
 		}
@@ -400,7 +400,8 @@ type UdpBufferSettings struct {
 	SequenceBufferSize  int
 	// the number of open sockets per user
 	// uses an lru cleanup where new sockets over the limit close old sockets
-	UserLimit int
+	UserLimit     int
+	MaxWindowSize uint32
 }
 
 type Udp4Buffer struct {
@@ -415,7 +416,7 @@ func NewUdp4Buffer(ctx context.Context, receiveCallback ReceivePacketFunction,
 }
 
 func (self *Udp4Buffer) send(source TransferPath, provideMode protocol.ProvideMode,
-	ipv4 *layers.IPv4, udp *layers.UDP, timeout time.Duration) (bool, error) {
+	ipv4 *layers.IPv4, udp *layers.UDP, timeout time.Duration, ipPacket []byte) (bool, error) {
 	bufferId := NewBufferId4(
 		source,
 		ipv4.SrcIP, int(udp.SrcPort),
@@ -431,6 +432,7 @@ func (self *Udp4Buffer) send(source TransferPath, provideMode protocol.ProvideMo
 		4,
 		udp,
 		timeout,
+		ipPacket,
 	)
 }
 
@@ -446,7 +448,7 @@ func NewUdp6Buffer(ctx context.Context, receiveCallback ReceivePacketFunction,
 }
 
 func (self *Udp6Buffer) send(source TransferPath, provideMode protocol.ProvideMode,
-	ipv6 *layers.IPv6, udp *layers.UDP, timeout time.Duration) (bool, error) {
+	ipv6 *layers.IPv6, udp *layers.UDP, timeout time.Duration, ipPacket []byte) (bool, error) {
 	bufferId := NewBufferId6(
 		source,
 		ipv6.SrcIP, int(udp.SrcPort),
@@ -462,6 +464,7 @@ func (self *Udp6Buffer) send(source TransferPath, provideMode protocol.ProvideMo
 		6,
 		udp,
 		timeout,
+		ipPacket,
 	)
 }
 
@@ -499,6 +502,7 @@ func (self *UdpBuffer[BufferId]) udpSend(
 	ipVersion int,
 	udp *layers.UDP,
 	timeout time.Duration,
+	ipPacket []byte,
 ) (bool, error) {
 	initSequence := func(skip *UdpSequence) *UdpSequence {
 		self.mutex.Lock()
@@ -540,15 +544,21 @@ func (self *UdpBuffer[BufferId]) udpSend(
 		// limit the number of new connections per second per source
 		// self.sourceLimiter[source].Limit()
 
+		sourceIpCopy := make(net.IP, len(sourceIp))
+		copy(sourceIpCopy, sourceIp)
+
+		destinationIpCopy := make(net.IP, len(destinationIp))
+		copy(destinationIpCopy, destinationIp)
+
 		sequence = NewUdpSequence(
 			self.ctx,
 			self.receiveCallback,
 			source,
 			provideMode,
 			ipVersion,
-			sourceIp,
+			sourceIpCopy,
 			udp.SrcPort,
-			destinationIp,
+			destinationIpCopy,
 			udp.DstPort,
 			self.udpBufferSettings,
 		)
@@ -575,6 +585,7 @@ func (self *UdpBuffer[BufferId]) udpSend(
 	sendItem := &UdpSendItem{
 		provideMode: provideMode,
 		udp:         udp,
+		ipPacket:    ipPacket,
 	}
 	sequence := initSequence(nil)
 	if success, err := sequence.send(sendItem, timeout); err == nil {
@@ -614,6 +625,7 @@ func NewUdpSequence(ctx context.Context, receiveCallback ReceivePacketFunction,
 		sourcePort:      sourcePort,
 		destinationIp:   destinationIp,
 		destinationPort: destinationPort,
+		buffer:          gopacket.NewSerializeBufferExpectedSize(128, 2048),
 		userLimited:     *newUserLimited(),
 	}
 	return &UdpSequence{
@@ -672,6 +684,7 @@ func (self *UdpSequence) Run() {
 
 	receive := func(packet []byte) {
 		self.receiveCallback(self.source, self.provideMode, self.IpPath(), packet)
+		MessagePoolReturn(packet)
 	}
 
 	glog.V(2).Infof("[init]udp connect\n")
@@ -686,6 +699,96 @@ func (self *UdpSequence) Run() {
 	defer socket.Close()
 	self.UpdateLastActivityTime()
 	glog.V(2).Infof("[init]connect success\n")
+
+	udpConn := socket.(*net.UDPConn)
+	udpConn.SetReadBuffer(int(self.udpBufferSettings.MaxWindowSize))
+	udpConn.SetWriteBuffer(int(self.udpBufferSettings.MaxWindowSize))
+	// f, _ := udpConn.File()
+	// fd := SocketHandle(f.Fd())
+	// syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_MTU, self.udpBufferSettings.Mtu)
+
+	// pipelines
+
+	type writePayload struct {
+		sendIter uint64
+		payload  []byte
+		ipPacket []byte
+	}
+
+	writePayloads := make(chan writePayload, self.udpBufferSettings.SequenceBufferSize)
+	go func() {
+		defer self.cancel()
+
+		for {
+			select {
+			case <-self.ctx.Done():
+				return
+			case writePayload, ok := <-writePayloads:
+				if !ok {
+					return
+				}
+				payload := writePayload.payload
+				sendIter := writePayload.sendIter
+
+				writeEndTime := time.Now().Add(self.udpBufferSettings.WriteTimeout)
+
+				for i := 0; i < len(payload); {
+					select {
+					case <-self.ctx.Done():
+						MessagePoolReturn(writePayload.ipPacket)
+						return
+					default:
+					}
+
+					socket.SetWriteDeadline(writeEndTime)
+					n, err := socket.Write(payload[i:])
+
+					if err == nil {
+						glog.V(2).Infof("[f%d]udp forward %d\n", sendIter, n)
+					} else {
+						glog.Infof("[f%d]udp forward %d error = %s", sendIter, n, err)
+					}
+
+					if 0 < n {
+						self.UpdateLastActivityTime()
+
+						j := i
+						i += n
+						glog.V(2).Infof("[f%d]udp forward %d/%d -> %d/%d +%d\n", sendIter, j, len(payload), i, len(payload), n)
+					}
+
+					if err != nil {
+						if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+							MessagePoolReturn(writePayload.ipPacket)
+							return
+						} else {
+							// some other error
+							MessagePoolReturn(writePayload.ipPacket)
+							return
+						}
+					}
+				}
+				MessagePoolReturn(writePayload.ipPacket)
+			}
+		}
+	}()
+
+	readPackets := make(chan []byte, self.udpBufferSettings.SequenceBufferSize)
+	go func() {
+		defer self.cancel()
+
+		for {
+			select {
+			case <-self.ctx.Done():
+				return
+			case packet, ok := <-readPackets:
+				if !ok {
+					return
+				}
+				receive(packet)
+			}
+		}
+	}()
 
 	go func() {
 		defer self.cancel()
@@ -720,7 +823,11 @@ func (self *UdpSequence) Run() {
 				}
 				for _, packet := range packets {
 					glog.V(1).Infof("[f%d]udp receive %d\n", forwardIter, len(packet))
-					receive(packet)
+					select {
+					case <-self.ctx.Done():
+						MessagePoolReturn(packet)
+					case readPackets <- packet:
+					}
 				}
 			}
 
@@ -738,64 +845,36 @@ func (self *UdpSequence) Run() {
 		}
 	}()
 
-	go func() {
-		defer self.cancel()
+	for sendIter := uint64(0); ; sendIter += 1 {
+		checkpointId := self.idleCondition.Checkpoint()
+		select {
+		case <-self.ctx.Done():
+			return
+		case sendItem := <-self.sendItems:
+			payload := sendItem.udp.Payload
 
-		for sendIter := 0; ; sendIter += 1 {
-			checkpointId := self.idleCondition.Checkpoint()
-			select {
-			case <-self.ctx.Done():
-				return
-			case sendItem := <-self.sendItems:
-				writeEndTime := time.Now().Add(self.udpBufferSettings.WriteTimeout)
-
-				payload := sendItem.udp.Payload
-
-				for i := 0; i < len(payload); {
-					select {
-					case <-self.ctx.Done():
-						return
-					default:
-					}
-
-					socket.SetWriteDeadline(writeEndTime)
-					n, err := socket.Write(payload[i:])
-
-					if err == nil {
-						glog.V(2).Infof("[f%d]udp forward %d\n", sendIter, n)
-					} else {
-						glog.Infof("[f%d]udp forward %d error = %s", sendIter, n, err)
-					}
-
-					if 0 < n {
-						self.UpdateLastActivityTime()
-
-						j := i
-						i += n
-						glog.V(2).Infof("[f%d]udp forward %d/%d -> %d/%d +%d\n", sendIter, j, len(payload), i, len(payload), n)
-					}
-
-					if err != nil {
-						if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-							return
-						} else {
-							// some other error
-							return
-						}
-					}
+			if 0 < len(payload) {
+				writePayload := writePayload{
+					payload:  payload,
+					sendIter: sendIter,
+					ipPacket: sendItem.ipPacket,
 				}
-			case <-time.After(self.udpBufferSettings.IdleTimeout):
-				if self.idleCondition.Close(checkpointId) {
-					// close the sequence
+				select {
+				case writePayloads <- writePayload:
+				case <-self.ctx.Done():
+					MessagePoolReturn(sendItem.ipPacket)
 					return
 				}
-				// else there pending updates
+			} else {
+				MessagePoolReturn(sendItem.ipPacket)
 			}
+		case <-time.After(self.udpBufferSettings.IdleTimeout):
+			if self.idleCondition.Close(checkpointId) {
+				// close the sequence
+				return
+			}
+			// else there pending updates
 		}
-	}()
-
-	select {
-	case <-self.ctx.Done():
 	}
 }
 
@@ -811,6 +890,7 @@ type UdpSendItem struct {
 	source      TransferPath
 	provideMode protocol.ProvideMode
 	udp         *layers.UDP
+	ipPacket    []byte
 }
 
 type StreamState struct {
@@ -821,6 +901,7 @@ type StreamState struct {
 	sourcePort      layers.UDPPort
 	destinationIp   net.IP
 	destinationPort layers.UDPPort
+	buffer          gopacket.SerializeBuffer
 	userLimited
 }
 
@@ -835,6 +916,8 @@ func (self *StreamState) IpPath() *IpPath {
 	}
 }
 
+// this must only be called from one goroutine
+// this is called from the writer only and does not need to syncrhronize with the reader state
 func (self *StreamState) DataPackets(payload []byte, n int, mtu int) ([][]byte, error) {
 	headerSize := 0
 	var ip gopacket.NetworkLayer
@@ -887,8 +970,8 @@ func (self *StreamState) DataPackets(payload []byte, n int, mtu int) ([][]byte, 
 	}
 
 	if headerSize+n <= mtu {
-		buffer := gopacket.NewSerializeBufferExpectedSize(headerSize+n, 0)
-		err := gopacket.SerializeLayers(buffer, options,
+		self.buffer.Clear()
+		err := gopacket.SerializeLayers(self.buffer, options,
 			ip.(gopacket.SerializableLayer),
 			&udp,
 			gopacket.Payload(payload[0:n]),
@@ -896,16 +979,16 @@ func (self *StreamState) DataPackets(payload []byte, n int, mtu int) ([][]byte, 
 		if err != nil {
 			return nil, err
 		}
-		packet := buffer.Bytes()
+		packet := MessagePoolCopy(self.buffer.Bytes())
 		return [][]byte{packet}, nil
 	} else {
 		// fragment
-		buffer := gopacket.NewSerializeBufferExpectedSize(mtu, 0)
 		packetSize := mtu - headerSize
 		packets := make([][]byte, 0, (n+packetSize)/packetSize)
 		for i := 0; i < n; {
+			self.buffer.Clear()
 			j := min(i+packetSize, n)
-			err := gopacket.SerializeLayers(buffer, options,
+			err := gopacket.SerializeLayers(self.buffer, options,
 				ip.(gopacket.SerializableLayer),
 				&udp,
 				gopacket.Payload(payload[i:j]),
@@ -913,12 +996,8 @@ func (self *StreamState) DataPackets(payload []byte, n int, mtu int) ([][]byte, 
 			if err != nil {
 				return nil, err
 			}
-			packet := buffer.Bytes()
-			packetCopy := make([]byte, len(packet))
-			copy(packetCopy, packet)
-			// packetCopy := MessagePoolCopy(packet)
-			packets = append(packets, packetCopy)
-			buffer.Clear()
+			packet := MessagePoolCopy(self.buffer.Bytes())
+			packets = append(packets, packet)
 			i = j
 		}
 		return packets, nil
@@ -961,7 +1040,7 @@ func NewTcp4Buffer(ctx context.Context, receiveCallback ReceivePacketFunction,
 }
 
 func (self *Tcp4Buffer) send(source TransferPath, provideMode protocol.ProvideMode,
-	ipv4 *layers.IPv4, tcp *layers.TCP, timeout time.Duration) (bool, error) {
+	ipv4 *layers.IPv4, tcp *layers.TCP, timeout time.Duration, ipPacket []byte) (bool, error) {
 	bufferId := NewBufferId4(
 		source,
 		ipv4.SrcIP, int(tcp.SrcPort),
@@ -977,6 +1056,7 @@ func (self *Tcp4Buffer) send(source TransferPath, provideMode protocol.ProvideMo
 		4,
 		tcp,
 		timeout,
+		ipPacket,
 	)
 }
 
@@ -992,7 +1072,7 @@ func NewTcp6Buffer(ctx context.Context, receiveCallback ReceivePacketFunction,
 }
 
 func (self *Tcp6Buffer) send(source TransferPath, provideMode protocol.ProvideMode,
-	ipv6 *layers.IPv6, tcp *layers.TCP, timeout time.Duration) (bool, error) {
+	ipv6 *layers.IPv6, tcp *layers.TCP, timeout time.Duration, ipPacket []byte) (bool, error) {
 	bufferId := NewBufferId6(
 		source,
 		ipv6.SrcIP, int(tcp.SrcPort),
@@ -1008,6 +1088,7 @@ func (self *Tcp6Buffer) send(source TransferPath, provideMode protocol.ProvideMo
 		6,
 		tcp,
 		timeout,
+		ipPacket,
 	)
 }
 
@@ -1045,6 +1126,7 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 	ipVersion int,
 	tcp *layers.TCP,
 	timeout time.Duration,
+	ipPacket []byte,
 ) (bool, error) {
 	initSequence := func() *TcpSequence {
 		self.mutex.Lock()
@@ -1055,6 +1137,7 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 				return sequence
 			}
 			// drop the packet; only create a new sequence on SYN
+			MessagePoolReturn(ipPacket)
 			glog.V(2).Infof("[lnr]tcp drop no syn (%s)\n", tcpFlagsString(tcp))
 			return nil
 		}
@@ -1091,15 +1174,21 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 		// limit the number of new connections per second per source
 		// self.sourceLimiter[source].Limit()
 
+		sourceIpCopy := make(net.IP, len(sourceIp))
+		copy(sourceIpCopy, sourceIp)
+
+		destinationIpCopy := make(net.IP, len(destinationIp))
+		copy(destinationIpCopy, destinationIp)
+
 		sequence := NewTcpSequence(
 			self.ctx,
 			self.receiveCallback,
 			source,
 			provideMode,
 			ipVersion,
-			sourceIp,
+			sourceIpCopy,
 			tcp.SrcPort,
-			destinationIp,
+			destinationIpCopy,
 			tcp.DstPort,
 			self.tcpBufferSettings,
 		)
@@ -1125,6 +1214,7 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 	sendItem := &TcpSendItem{
 		provideMode: provideMode,
 		tcp:         tcp,
+		ipPacket:    ipPacket,
 	}
 	if sequence := initSequence(); sequence == nil {
 		// sequence does not exist and not a syn packet, drop
@@ -1180,6 +1270,7 @@ func NewTcpSequence(ctx context.Context, receiveCallback ReceivePacketFunction,
 		// FIXME initial window size should be ~4k, set max window size as a 2^amount multiplier of initial size
 		windowSize:  tcpBufferSettings.MinWindowSize,
 		windowScale: 0,
+		buffer:      gopacket.NewSerializeBufferExpectedSize(128, 2048),
 		userLimited: *newUserLimited(),
 	}
 	return &TcpSequence{
@@ -1240,6 +1331,7 @@ func (self *TcpSequence) Run() {
 	// tcp packets with ack may be reordered due to being written in parallel
 	receive := func(packet []byte) {
 		self.receiveCallback(self.source, self.provideMode, self.IpPath(), packet)
+		MessagePoolReturn(packet)
 	}
 
 	closed := false
@@ -1274,7 +1366,18 @@ func (self *TcpSequence) Run() {
 		glog.Infof("[init]tcp connect error = %s\n", err)
 		return
 	}
+	self.UpdateLastActivityTime()
+	glog.V(2).Infof("[init]connect success\n")
+
 	defer socket.Close()
+	tcpConn := socket.(*net.TCPConn)
+	tcpConn.SetKeepAlive(false)
+	tcpConn.SetNoDelay(true)
+	tcpConn.SetReadBuffer(int(self.tcpBufferSettings.MaxWindowSize))
+	tcpConn.SetWriteBuffer(int(self.tcpBufferSettings.MaxWindowSize))
+	// f, _ := tcpConn.File()
+	// fd := SocketHandle(f.Fd())
+	// syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_MTU, self.tcpBufferSettings.Mtu)
 
 	for syn := false; !syn; {
 		checkpointId := self.idleCondition.Checkpoint()
@@ -1347,6 +1450,7 @@ func (self *TcpSequence) Run() {
 				// an ACK here could be for a previous FIN
 				glog.V(2).Infof("[init]waiting for SYN (%s)\n", tcpFlagsString(sendItem.tcp))
 			}
+			MessagePoolReturn(sendItem.ipPacket)
 		case <-time.After(self.tcpBufferSettings.ConnectTimeout):
 			if self.idleCondition.Close(checkpointId) {
 				// close the sequence
@@ -1368,9 +1472,6 @@ func (self *TcpSequence) Run() {
 		}
 	*/
 
-	self.UpdateLastActivityTime()
-	glog.V(2).Infof("[init]connect success\n")
-
 	receiveAckCond := sync.NewCond(&self.mutex)
 	ackCond := sync.NewCond(&self.mutex)
 	defer func() {
@@ -1387,6 +1488,95 @@ func (self *TcpSequence) Run() {
 		defer self.mutex.Unlock()
 
 		ackedSendSeq = self.sendSeq
+	}()
+
+	// pipelines
+
+	type writePayload struct {
+		sendIter uint64
+		payload  []byte
+		ipPacket []byte
+	}
+
+	writePayloads := make(chan writePayload, self.tcpBufferSettings.SequenceBufferSize)
+	go func() {
+		defer self.cancel()
+
+		for {
+			select {
+			case <-self.ctx.Done():
+				return
+			case writePayload, ok := <-writePayloads:
+				if !ok {
+					return
+				}
+				payload := writePayload.payload
+				sendIter := writePayload.sendIter
+				writeEndTime := time.Now().Add(self.tcpBufferSettings.WriteTimeout)
+				for i := 0; i < len(payload); {
+					select {
+					case <-self.ctx.Done():
+						MessagePoolReturn(writePayload.ipPacket)
+						return
+					default:
+					}
+
+					socket.SetWriteDeadline(writeEndTime)
+					n, err := socket.Write(payload[i:])
+
+					if err == nil {
+						glog.V(2).Infof("[f%d]tcp forward %d\n", sendIter, n)
+					} else {
+						glog.Infof("[f%d]tcp forward %d error = %s\n", sendIter, n, err)
+					}
+
+					if 0 < n {
+						// func() {
+						// 	self.mutex.Lock()
+						// 	defer self.mutex.Unlock()
+
+						// 	self.sendSeq += uint32(n)
+						// 	ackCond.Broadcast()
+						// }()
+
+						self.UpdateLastActivityTime()
+
+						j := i
+						i += n
+						glog.V(2).Infof("[f%d]tcp forward %d/%d -> %d/%d +%d\n", sendIter, j, len(payload), i, len(payload), n)
+					}
+
+					if err != nil {
+						if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+							MessagePoolReturn(writePayload.ipPacket)
+							return
+						} else {
+							// some other error
+							MessagePoolReturn(writePayload.ipPacket)
+							return
+						}
+					}
+				}
+				MessagePoolReturn(writePayload.ipPacket)
+			}
+		}
+	}()
+
+	readPackets := make(chan []byte, self.tcpBufferSettings.SequenceBufferSize)
+	go func() {
+		defer self.cancel()
+
+		for {
+			select {
+			case <-self.ctx.Done():
+				return
+			case packet, ok := <-readPackets:
+				if !ok {
+					return
+				}
+				receive(packet)
+			}
+		}
 	}()
 
 	go func() {
@@ -1463,7 +1653,11 @@ func (self *TcpSequence) Run() {
 				}
 
 				for _, packet := range packets {
-					receive(packet)
+					select {
+					case <-self.ctx.Done():
+						MessagePoolReturn(packet)
+					case readPackets <- packet:
+					}
 				}
 			}
 
@@ -1483,7 +1677,11 @@ func (self *TcpSequence) Run() {
 					}()
 					if err == nil {
 						closed = true
-						receive(packet)
+						select {
+						case <-self.ctx.Done():
+							MessagePoolReturn(packet)
+						case readPackets <- packet:
+						}
 					}
 					return
 				} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
@@ -1493,72 +1691,6 @@ func (self *TcpSequence) Run() {
 					// some other error
 					return
 				}
-			}
-		}
-	}()
-
-	type writePayload struct {
-		sendIter uint64
-		payload  []byte
-	}
-
-	writePayloads := make(chan writePayload, self.tcpBufferSettings.SequenceBufferSize)
-	go func() {
-		defer self.cancel()
-
-		for {
-			select {
-			case <-self.ctx.Done():
-				return
-			case writePayload, ok := <-writePayloads:
-				if !ok {
-					return
-				}
-				payload := writePayload.payload
-				sendIter := writePayload.sendIter
-				writeEndTime := time.Now().Add(self.tcpBufferSettings.WriteTimeout)
-				for i := 0; i < len(payload); {
-					select {
-					case <-self.ctx.Done():
-						return
-					default:
-					}
-
-					socket.SetWriteDeadline(writeEndTime)
-					n, err := socket.Write(payload[i:])
-
-					if err == nil {
-						glog.V(2).Infof("[f%d]tcp forward %d\n", sendIter, n)
-					} else {
-						glog.Infof("[f%d]tcp forward %d error = %s\n", sendIter, n, err)
-					}
-
-					if 0 < n {
-						// func() {
-						// 	self.mutex.Lock()
-						// 	defer self.mutex.Unlock()
-
-						// 	self.sendSeq += uint32(n)
-						// 	ackCond.Broadcast()
-						// }()
-
-						self.UpdateLastActivityTime()
-
-						j := i
-						i += n
-						glog.V(2).Infof("[f%d]tcp forward %d/%d -> %d/%d +%d\n", sendIter, j, len(payload), i, len(payload), n)
-					}
-
-					if err != nil {
-						if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-							return
-						} else {
-							// some other error
-							return
-						}
-					}
-				}
-
 			}
 		}
 	}()
@@ -1633,6 +1765,7 @@ func (self *TcpSequence) Run() {
 			return
 		case sendItem := <-self.sendItems:
 			if fin {
+				MessagePoolReturn(sendItem.ipPacket)
 				continue
 			}
 
@@ -1645,6 +1778,7 @@ func (self *TcpSequence) Run() {
 			if sendItem.tcp.RST {
 				// a RST typically appears for a bad TCP segment
 				glog.V(2).Infof("[r%d]RST\n", sendIter)
+				MessagePoolReturn(sendItem.ipPacket)
 				return
 			}
 
@@ -1674,6 +1808,7 @@ func (self *TcpSequence) Run() {
 			}()
 
 			if drop {
+				MessagePoolReturn(sendItem.ipPacket)
 				continue
 			}
 
@@ -1694,6 +1829,7 @@ func (self *TcpSequence) Run() {
 				writePayload := writePayload{
 					payload:  payload,
 					sendIter: sendIter,
+					ipPacket: sendItem.ipPacket,
 				}
 				// FIXME count the number of non-blocking versus blocking channel adds
 				// FIXME every window size, check the count:
@@ -1708,6 +1844,7 @@ func (self *TcpSequence) Run() {
 					case writePayloads <- writePayload:
 						blockingByteCount += uint32(len(payload))
 					case <-self.ctx.Done():
+						MessagePoolReturn(sendItem.ipPacket)
 						return
 					}
 				}
@@ -1738,6 +1875,8 @@ func (self *TcpSequence) Run() {
 					self.sendSeq += uint32(len(payload))
 					ackCond.Broadcast()
 				}()
+			} else {
+				MessagePoolReturn(sendItem.ipPacket)
 			}
 
 			// if 0 < seq {
@@ -1778,6 +1917,7 @@ func (self *TcpSequence) Close() {
 type TcpSendItem struct {
 	provideMode protocol.ProvideMode
 	tcp         *layers.TCP
+	ipPacket    []byte
 }
 
 type ConnectionState struct {
@@ -1800,6 +1940,8 @@ type ConnectionState struct {
 	windowSize         uint32
 	windowScale        uint32
 	// encodedWindowSize  uint16
+
+	buffer gopacket.SerializeBuffer
 
 	userLimited
 }
@@ -1879,9 +2021,8 @@ func (self *ConnectionState) SynAck() ([]byte, error) {
 		FixLengths:       true,
 	}
 
-	buffer := gopacket.NewSerializeBufferExpectedSize(headerSize, 0)
-
-	err := gopacket.SerializeLayers(buffer, options,
+	self.buffer.Clear()
+	err := gopacket.SerializeLayers(self.buffer, options,
 		ip.(gopacket.SerializableLayer),
 		&tcp,
 	)
@@ -1889,7 +2030,7 @@ func (self *ConnectionState) SynAck() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	packet := buffer.Bytes()
+	packet := MessagePoolCopy(self.buffer.Bytes())
 	return packet, nil
 }
 
@@ -1933,9 +2074,8 @@ func (self *ConnectionState) PureAck() ([]byte, error) {
 		FixLengths:       true,
 	}
 
-	buffer := gopacket.NewSerializeBufferExpectedSize(headerSize, 0)
-
-	err := gopacket.SerializeLayers(buffer, options,
+	self.buffer.Clear()
+	err := gopacket.SerializeLayers(self.buffer, options,
 		ip.(gopacket.SerializableLayer),
 		&tcp,
 	)
@@ -1943,7 +2083,7 @@ func (self *ConnectionState) PureAck() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	packet := buffer.Bytes()
+	packet := MessagePoolCopy(self.buffer.Bytes())
 	return packet, nil
 }
 
@@ -1988,9 +2128,8 @@ func (self *ConnectionState) FinAck() ([]byte, error) {
 		FixLengths:       true,
 	}
 
-	buffer := gopacket.NewSerializeBufferExpectedSize(headerSize, 0)
-
-	err := gopacket.SerializeLayers(buffer, options,
+	self.buffer.Clear()
+	err := gopacket.SerializeLayers(self.buffer, options,
 		ip.(gopacket.SerializableLayer),
 		&tcp,
 	)
@@ -1998,7 +2137,7 @@ func (self *ConnectionState) FinAck() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	packet := buffer.Bytes()
+	packet := MessagePoolCopy(self.buffer.Bytes())
 	return packet, nil
 }
 
@@ -2043,9 +2182,8 @@ func (self *ConnectionState) RstAck() ([]byte, error) {
 		FixLengths:       true,
 	}
 
-	buffer := gopacket.NewSerializeBufferExpectedSize(headerSize, 0)
-
-	err := gopacket.SerializeLayers(buffer, options,
+	self.buffer.Clear()
+	err := gopacket.SerializeLayers(self.buffer, options,
 		ip.(gopacket.SerializableLayer),
 		&tcp,
 	)
@@ -2053,7 +2191,7 @@ func (self *ConnectionState) RstAck() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	packet := buffer.Bytes()
+	packet := MessagePoolCopy(self.buffer.Bytes())
 	return packet, nil
 }
 
@@ -2113,8 +2251,8 @@ func (self *ConnectionState) DataPackets(payload []byte, n int, mtu int) ([][]by
 	}
 
 	if headerSize+n <= mtu {
-		buffer := gopacket.NewSerializeBufferExpectedSize(headerSize+n, 0)
-		err := gopacket.SerializeLayers(buffer, options,
+		self.buffer.Clear()
+		err := gopacket.SerializeLayers(self.buffer, options,
 			ip.(gopacket.SerializableLayer),
 			&tcp,
 			gopacket.Payload(payload[0:n]),
@@ -2122,17 +2260,17 @@ func (self *ConnectionState) DataPackets(payload []byte, n int, mtu int) ([][]by
 		if err != nil {
 			return nil, err
 		}
-		packet := buffer.Bytes()
+		packet := MessagePoolCopy(self.buffer.Bytes())
 		return [][]byte{packet}, nil
 	} else {
 		// fragment
-		buffer := gopacket.NewSerializeBufferExpectedSize(mtu, 0)
 		packetSize := mtu - headerSize
 		packets := [][]byte{}
 		for i := 0; i < n; {
+			self.buffer.Clear()
 			j := min(i+packetSize, n)
 			tcp.Seq = self.receiveSeq + uint32(i)
-			err := gopacket.SerializeLayers(buffer, options,
+			err := gopacket.SerializeLayers(self.buffer, options,
 				ip.(gopacket.SerializableLayer),
 				&tcp,
 				gopacket.Payload(payload[i:j]),
@@ -2140,12 +2278,8 @@ func (self *ConnectionState) DataPackets(payload []byte, n int, mtu int) ([][]by
 			if err != nil {
 				return nil, err
 			}
-			packet := buffer.Bytes()
-			packetCopy := make([]byte, len(packet))
-			copy(packetCopy, packet)
-			// packetCopy := MessagePoolCopy(packet)
-			packets = append(packets, packetCopy)
-			buffer.Clear()
+			packet := MessagePoolCopy(self.buffer.Bytes())
+			packets = append(packets, packet)
 			i = j
 		}
 		return packets, nil
@@ -2322,24 +2456,27 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 			}
 			ipPacketToProvider := ipPacketToProvider_.(*protocol.IpPacketToProvider)
 
-			var packet []byte
-			if frame.Raw {
-				packet = MessagePoolShareReadOnly(ipPacketToProvider.IpPacket.PacketBytes)
-			} else {
-				packet = ipPacketToProvider.IpPacket.PacketBytes
-			}
-
-			_, r, err := self.securityPolicy.Inspect(provideMode, packet)
+			_, r, err := self.securityPolicy.Inspect(provideMode, ipPacketToProvider.IpPacket.PacketBytes)
 			if err == nil {
 				switch r {
 				case SecurityPolicyResultAllow:
 					c := func() bool {
-						return self.localUserNat.SendPacketWithTimeout(
+						var packet []byte
+						if frame.Raw {
+							packet = MessagePoolShareReadOnly(ipPacketToProvider.IpPacket.PacketBytes)
+						} else {
+							packet = MessagePoolCopy(ipPacketToProvider.IpPacket.PacketBytes)
+						}
+						success := self.localUserNat.SendPacketWithTimeout(
 							source,
 							provideMode,
 							packet,
 							self.settings.WriteTimeout,
 						)
+						if !success {
+							MessagePoolReturn(packet)
+						}
+						return success
 					}
 					if glog.V(2) {
 						TraceWithReturn(
@@ -2423,7 +2560,7 @@ func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode pro
 
 		ipPacketToProvider := &protocol.IpPacketToProvider{
 			IpPacket: &protocol.IpPacket{
-				PacketBytes: packet,
+				PacketBytes: MessagePoolShareReadOnly(packet),
 			},
 		}
 		frame, err := ToFrame(ipPacketToProvider, DefaultProtocolVersion)
@@ -2463,12 +2600,7 @@ func (self *RemoteUserNatClient) ClientReceive(source TransferPath, frames []*pr
 			}
 			ipPacketFromProvider := ipPacketFromProvider_.(*protocol.IpPacketFromProvider)
 
-			var packet []byte
-			if frame.Raw {
-				packet = MessagePoolShareReadOnly(ipPacketFromProvider.IpPacket.PacketBytes)
-			} else {
-				packet = ipPacketFromProvider.IpPacket.PacketBytes
-			}
+			packet := ipPacketFromProvider.IpPacket.PacketBytes
 
 			ipPath, err := ParseIpPath(packet)
 			if err == nil {
@@ -2650,6 +2782,23 @@ func ParseIpPathWithPayload(ipPacket []byte) (*IpPath, []byte, error) {
 	default:
 		// no support for this version
 		return nil, nil, fmt.Errorf("No support for ip version %d", ipVersion)
+	}
+}
+
+func (self *IpPath) Copy() *IpPath {
+	sourceIpCopy := make(net.IP, len(self.SourceIp))
+	copy(sourceIpCopy, self.SourceIp)
+
+	destinationIpCopy := make(net.IP, len(self.DestinationIp))
+	copy(destinationIpCopy, self.DestinationIp)
+
+	return &IpPath{
+		Version:         self.Version,
+		Protocol:        self.Protocol,
+		SourceIp:        sourceIpCopy,
+		SourcePort:      self.SourcePort,
+		DestinationIp:   destinationIpCopy,
+		DestinationPort: self.DestinationPort,
 	}
 }
 

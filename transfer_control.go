@@ -86,8 +86,8 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 		}
 	}()
 
-	var controlSync func()
-	controlSync = func() {
+	var controlSync func(*protocol.Frame)
+	controlSync = func(updatedFrame *protocol.Frame) {
 		defer handleCancel()
 
 		defer func() {
@@ -99,8 +99,6 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 				glog.V(2).Infof("[control][%d]replace sync for scope = %s\n", syncIndex, self.scopeTag)
 			}
 		}()
-
-		updatedFrame := frame
 
 		for {
 			glog.V(2).Infof("[control][%d]start sync for scope = %s\n", syncIndex, self.scopeTag)
@@ -123,48 +121,68 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 					return
 				}
 
+				updatedFrameCopy := &protocol.Frame{
+					MessageType:  updatedFrame.MessageType,
+					MessageBytes: MessagePoolShareReadOnly(updatedFrame.MessageBytes),
+				}
 				success, err = self.client.SendWithTimeoutDetailed(
-					updatedFrame,
+					updatedFrameCopy,
 					DestinationId(ControlId),
 					func(err error) {
 						if err == nil {
-							safeAckCallback(err)
+							safeAckCallback(nil)
+							MessagePoolReturn(updatedFrame.MessageBytes)
 						} else {
-							go controlSync()
+							go controlSync(updatedFrame)
 						}
 					},
 					-1,
 					Ctx(handleCtx),
 				)
 			}()
-			if done || success {
+			if done {
+				MessagePoolReturn(updatedFrame.MessageBytes)
+				return
+			}
+			if success {
 				return
 			}
 			if err != nil {
 				// only stop when the context or client is done
 				select {
 				case <-handleCtx.Done():
+					MessagePoolReturn(frame.MessageBytes)
 					return
 				case <-self.client.Done():
+					MessagePoolReturn(frame.MessageBytes)
 					return
 				default:
 				}
 			}
 			// else try again
 			if updateFrame != nil {
-				updatedFrame = updateFrame()
+				f := updateFrame()
+				if f != updatedFrame {
+					MessagePoolReturn(updatedFrame.MessageBytes)
+					updatedFrame = f
+				}
 			}
 		}
 	}
 
+	frameCopy := &protocol.Frame{
+		MessageType:  frame.MessageType,
+		MessageBytes: MessagePoolShareReadOnly(frame.MessageBytes),
+	}
 	success := self.client.SendWithTimeout(
-		frame,
+		frameCopy,
 		DestinationId(ControlId),
 		func(err error) {
 			if err == nil {
-				safeAckCallback(err)
+				safeAckCallback(nil)
+				MessagePoolReturn(frame.MessageBytes)
 			} else {
-				go controlSync()
+				go controlSync(frame)
 			}
 		},
 		0,
@@ -174,7 +192,7 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 		return
 	}
 
-	go controlSync()
+	go controlSync(frame)
 }
 
 func (self *ControlSync) Close() {

@@ -78,13 +78,13 @@ func ToFrame(message proto.Message, protocolVersion int) (*protocol.Frame, error
 	}, nil
 }
 
-func RequireToFrame(message proto.Message, protocolVersion int) *protocol.Frame {
-	frame, err := ToFrame(message, protocolVersion)
-	if err != nil {
-		panic(err)
-	}
-	return frame
-}
+// func RequireToFrame(message proto.Message, protocolVersion int) *protocol.Frame {
+// 	frame, err := ToFrame(message, protocolVersion)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	return frame
+// }
 
 func FromFrame(frame *protocol.Frame) (proto.Message, error) {
 	var message proto.Message
@@ -151,13 +151,13 @@ func FromFrame(frame *protocol.Frame) (proto.Message, error) {
 	return message, nil
 }
 
-func RequireFromFrame(frame *protocol.Frame) proto.Message {
-	message, err := FromFrame(frame)
-	if err != nil {
-		panic(err)
-	}
-	return message
-}
+// func RequireFromFrame(frame *protocol.Frame) proto.Message {
+// 	message, err := FromFrame(frame)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	return message
+// }
 
 func EncodeFrame(message proto.Message, protocolVersion int) ([]byte, error) {
 	frame, err := ToFrame(message, protocolVersion)
@@ -165,6 +165,9 @@ func EncodeFrame(message proto.Message, protocolVersion int) ([]byte, error) {
 		return nil, err
 	}
 	b, err := ProtoMarshal(frame)
+	if !frame.Raw {
+		MessagePoolReturn(frame.MessageBytes)
+	}
 	return b, err
 }
 

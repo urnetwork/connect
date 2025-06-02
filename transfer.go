@@ -699,8 +699,13 @@ func (self *Client) run() {
 				}
 
 				ack := make(chan error)
-				controlPing := &protocol.ControlPing{}
-				self.SendControl(RequireToFrame(controlPing, self.settings.ProtocolVersion), func(err error) {
+				frame, err := ToFrame(&protocol.ControlPing{}, self.settings.ProtocolVersion)
+				if err != nil {
+					glog.Errorf("[c]could not create ping frame = %s", err)
+					continue
+				}
+
+				self.SendControl(frame, func(err error) {
 					select {
 					case ack <- err:
 					case <-self.ctx.Done():
@@ -735,6 +740,7 @@ func (self *Client) run() {
 						protocol.ProvideMode_Network,
 					)
 					sendPack.AckCallback(nil)
+					MessagePoolReturn(sendPack.Frame.MessageBytes)
 				}, func(err error) {
 					sendPack.AckCallback(err)
 				})
@@ -843,11 +849,14 @@ func (self *Client) run() {
 					updatePeerAudit(source, func(a *PeerAudit) {
 						a.badMessage(ByteCount(len(transferFrameBytes)))
 					})
+					MessagePoolReturn(transferFrameBytes)
+					continue
 				}
 			}
 
 			if ack != nil {
 				c := func() bool {
+					defer MessagePoolReturn(transferFrameBytes)
 					return self.sendBuffer.Ack(
 						source.Reverse(),
 						ack,
@@ -867,6 +876,7 @@ func (self *Client) run() {
 				sequenceId, err := IdFromBytes(pack.SequenceId)
 				if err != nil {
 					// bad protobuf
+					MessagePoolReturn(transferFrameBytes)
 					continue
 				}
 				messageByteCount := MessageByteCount(pack.Frames)
@@ -1421,6 +1431,7 @@ func (self *SendSequence) Run() {
 		// drain the buffer
 		for _, item := range self.resendQueue.orderedItems {
 			item.ackCallback(errors.New("Send sequence closed."))
+			item.messagePoolReturn()
 		}
 
 		// flush queued up contracts
@@ -1626,6 +1637,7 @@ func (self *SendSequence) Run() {
 					// close the sequence
 					glog.Errorf("[s]%s->%s...%s s(%s) exit could not create contract.\n", self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId)
 					sendPack.AckCallback(errors.New("No contract"))
+					MessagePoolReturn(sendPack.Frame.MessageBytes)
 					return
 				}
 			case <-time.After(timeout):
@@ -1961,6 +1973,7 @@ func (self *SendSequence) sendWithSetContract(
 			self.ackItem(item)
 		} else {
 			item.ackCallback(err)
+			item.messagePoolReturn()
 		}
 	}
 }
@@ -2128,10 +2141,11 @@ func (self *SendSequence) ackItem(item *sendItem) {
 		}
 	}
 	item.ackCallback(nil)
-	MessagePoolReturn(item.transferFrameBytes)
+	// MessagePoolReturn(item.transferFrameBytes)
 	// for _, frame := range item.frames {
 	// 	MessagePoolReturn(frame.MessageBytes)
 	// }
+	item.messagePoolReturn()
 }
 
 func (self *SendSequence) openContractMultiRouteWriter() MultiRouteWriter {
@@ -2186,6 +2200,7 @@ func (self *SendSequence) Close() {
 					return
 				}
 				sendPack.AckCallback(errors.New("Send sequence closed."))
+				MessagePoolReturn(sendPack.Frame.MessageBytes)
 			default:
 				return
 			}
@@ -2210,6 +2225,10 @@ type sendItem struct {
 	ackCallback        AckFunction
 
 	// messageType protocol.MessageType
+}
+
+func (self *sendItem) messagePoolReturn() {
+	MessagePoolReturn(self.transferFrameBytes)
 }
 
 // a send event queue which is the union of:
@@ -2572,6 +2591,8 @@ func (self *ReceiveSequence) Run() {
 			self.peerAudit.Update(func(a *PeerAudit) {
 				a.discard(item.messageByteCount)
 			})
+			// MessagePoolReturn(item.transferFrameBytes)
+			item.messagePoolReturn()
 		}
 
 		self.peerAudit.Complete()
@@ -2622,11 +2643,15 @@ func (self *ReceiveSequence) Run() {
 			transferFrameBytes, _ := ProtoMarshal(transferFrame)
 			defer MessagePoolReturn(transferFrameBytes)
 			c := func() error {
-				return multiRouteWriter.Write(
+				err := multiRouteWriter.Write(
 					self.ctx,
 					MessagePoolShareReadOnly(transferFrameBytes),
 					self.receiveBufferSettings.WriteTimeout,
 				)
+				if err != nil {
+					MessagePoolReturn(transferFrameBytes)
+				}
+				return err
 			}
 			if glog.V(2) {
 				TraceWithReturn(
@@ -2760,6 +2785,7 @@ func (self *ReceiveSequence) Run() {
 					self.peerAudit.Update(func(a *PeerAudit) {
 						a.badMessage(receivePack.MessageByteCount)
 					})
+					MessagePoolReturn(receivePack.TransferFrameBytes)
 					return
 				} else if !received {
 					glog.V(1).Infof("[r]drop nack %s<-%s s(%s)\n", self.client.ClientTag(), self.source.SourceId, self.source.StreamId)
@@ -2767,6 +2793,7 @@ func (self *ReceiveSequence) Run() {
 					self.peerAudit.Update(func(a *PeerAudit) {
 						a.discard(receivePack.MessageByteCount)
 					})
+					MessagePoolReturn(receivePack.TransferFrameBytes)
 				}
 
 				// note messages of `size < MinMessageByteCount` get counted as `MinMessageByteCount` against the contract
@@ -2779,6 +2806,7 @@ func (self *ReceiveSequence) Run() {
 					self.peerAudit.Update(func(a *PeerAudit) {
 						a.badMessage(receivePack.MessageByteCount)
 					})
+					MessagePoolReturn(receivePack.TransferFrameBytes)
 					return
 				} else if !received {
 					glog.V(1).Infof("[r]drop ack %s<-%s s(%s)\n", self.client.ClientTag(), self.source.SourceId, self.source.StreamId)
@@ -2786,6 +2814,7 @@ func (self *ReceiveSequence) Run() {
 					self.peerAudit.Update(func(a *PeerAudit) {
 						a.discard(receivePack.MessageByteCount)
 					})
+					MessagePoolReturn(receivePack.TransferFrameBytes)
 				}
 			}
 		case <-time.After(timeout):
@@ -2900,7 +2929,7 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 			if item.ack {
 				self.sendAck(sequenceNumber, messageId, false, nil)
 			}
-			return true, nil
+			return false, nil
 		}
 	} else {
 		// store only up to a max size in the receive queue
@@ -2918,6 +2947,7 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 			lastItem := self.receiveQueue.PeekLast()
 			if receivePack.Pack.SequenceNumber < lastItem.sequenceNumber {
 				self.receiveQueue.RemoveByMessageId(lastItem.messageId)
+				lastItem.messagePoolReturn()
 			} else {
 				break
 			}
@@ -2968,14 +2998,15 @@ func (self *ReceiveSequence) receiveNack(receivePack *ReceivePack) (bool, error)
 			sequenceNumber:   sequenceNumber,
 			messageByteCount: receivePack.MessageByteCount,
 		},
-		contractId:      contractId,
-		receiveTime:     receiveTime,
-		frames:          receivePack.Pack.Frames,
-		contractFrame:   receivePack.Pack.ContractFrame,
-		receiveCallback: receivePack.ReceiveCallback,
-		head:            receivePack.Pack.Head,
-		ack:             !receivePack.Pack.Nack,
-		tag:             receivePack.Pack.Tag,
+		contractId:         contractId,
+		receiveTime:        receiveTime,
+		frames:             receivePack.Pack.Frames,
+		contractFrame:      receivePack.Pack.ContractFrame,
+		receiveCallback:    receivePack.ReceiveCallback,
+		head:               receivePack.Pack.Head,
+		ack:                !receivePack.Pack.Nack,
+		tag:                receivePack.Pack.Tag,
+		transferFrameBytes: receivePack.TransferFrameBytes,
 	}
 
 	if err := self.registerContracts(item); err != nil {
@@ -3030,13 +3061,10 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 		item.frames,
 		provideMode,
 	)
-	MessagePoolReturn(item.transferFrameBytes)
-	for _, frame := range item.frames {
-		MessagePoolReturn(frame.MessageBytes)
-	}
 	if item.ack {
 		self.sendAck(item.sequenceNumber, item.messageId, false, item.tag)
 	}
+	item.messagePoolReturn()
 }
 
 func (self *ReceiveSequence) registerContracts(item *receiveItem) error {
@@ -3161,6 +3189,21 @@ func (self *ReceiveSequence) Close() {
 		defer self.packMutex.Unlock()
 		close(self.packs)
 	}()
+
+	// drain the channel
+	func() {
+		for {
+			select {
+			case receivePack, ok := <-self.packs:
+				if !ok {
+					return
+				}
+				MessagePoolReturn(receivePack.TransferFrameBytes)
+			default:
+				return
+			}
+		}
+	}()
 }
 
 func (self *ReceiveSequence) Cancel() {
@@ -3185,6 +3228,24 @@ type receiveItem struct {
 	ack                bool
 	tag                *protocol.Tag
 	transferFrameBytes []byte
+}
+
+func (self *receiveItem) messagePoolReturn() {
+	MessagePoolReturn(self.transferFrameBytes)
+	// note frames and contractFrame are slices/shared bytes of the transfer frame bytes
+	// we expect these both to be false
+	// for _, frame := range self.frames {
+	// 	r := MessagePoolReturn(frame.MessageBytes)
+	// 	if r {
+	// 		glog.Warningf("[ri]frame was not shared]\n")
+	// 	}
+	// }
+	// if self.contractFrame != nil {
+	// 	r := MessagePoolReturn(self.contractFrame.MessageBytes)
+	// 	if r {
+	// 		glog.Warningf("[ri]contract frame was not shared]\n")
+	// 	}
+	// }
 }
 
 // ordered by sequenceNumber
@@ -3615,6 +3676,7 @@ func (self *ForwardSequence) Run() {
 				if DebugTransferCopyOnWrite {
 					transferFrameBytes = MessagePoolCopy(transferFrameBytes)
 				}
+				defer MessagePoolReturn(transferFrameBytes)
 				return self.multiRouteWriter.Write(
 					self.ctx,
 					MessagePoolShareReadOnly(transferFrameBytes),
@@ -3773,8 +3835,13 @@ func (self *SequencePeerAudit) Complete() {
 		ResendByteCount:     uint64(self.peerAudit.ResendByteCount),
 		ResendCount:         uint64(self.peerAudit.ResendCount),
 	}
+	frame, err := ToFrame(peerAudit, DefaultProtocolVersion)
+	if err != nil {
+		glog.Errorf("[c]could not create audit frame = %s", err)
+		return
+	}
 	self.client.ClientOob().SendControl(
-		[]*protocol.Frame{RequireToFrame(peerAudit, DefaultProtocolVersion)},
+		[]*protocol.Frame{frame},
 		func(resultFrames []*protocol.Frame, err error) {},
 	)
 	self.peerAudit = nil
