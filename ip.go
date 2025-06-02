@@ -9,6 +9,7 @@ import (
 	"math"
 	mathrand "math/rand"
 	"net"
+	// "syscall"
 	"slices"
 	"strconv"
 	"strings"
@@ -60,14 +61,14 @@ type UserNatClient interface {
 
 func DefaultUdpBufferSettings() *UdpBufferSettings {
 	return &UdpBufferSettings{
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
-		Mtu:          DefaultMtu,
-		// avoid fragmentation
-		ReadBufferByteCount: DefaultMtu - max(Ipv4HeaderSizeWithoutExtensions, Ipv6HeaderSize) - max(UdpHeaderSize, TcpHeaderSizeWithoutExtensions),
+		ReadTimeout:         30 * time.Second,
+		WriteTimeout:        15 * time.Second,
+		IdleTimeout:         60 * time.Second,
+		Mtu:                 DefaultMtu,
+		ReadBufferByteCount: DefaultMtu,
 		SequenceBufferSize:  DefaultIpBufferSize,
 		UserLimit:           128,
+		MaxWindowSize:       uint32(mib(1)),
 	}
 }
 
@@ -83,7 +84,7 @@ func DefaultTcpBufferSettings() *TcpBufferSettings {
 		// avoid fragmentation
 		ReadBufferByteCount: DefaultMtu - max(Ipv4HeaderSizeWithoutExtensions, Ipv6HeaderSize) - max(UdpHeaderSize, TcpHeaderSizeWithoutExtensions),
 		MinWindowSize:       uint32(kib(8)),
-		MaxWindowSize:       uint32(kib(256)),
+		MaxWindowSize:       uint32(mib(1)),
 		UserLimit:           128,
 	}
 	return tcpBufferSettings
@@ -399,7 +400,8 @@ type UdpBufferSettings struct {
 	SequenceBufferSize  int
 	// the number of open sockets per user
 	// uses an lru cleanup where new sockets over the limit close old sockets
-	UserLimit int
+	UserLimit     int
+	MaxWindowSize uint32
 }
 
 type Udp4Buffer struct {
@@ -698,6 +700,96 @@ func (self *UdpSequence) Run() {
 	self.UpdateLastActivityTime()
 	glog.V(2).Infof("[init]connect success\n")
 
+	udpConn := socket.(*net.UDPConn)
+	udpConn.SetReadBuffer(int(self.udpBufferSettings.MaxWindowSize))
+	udpConn.SetWriteBuffer(int(self.udpBufferSettings.MaxWindowSize))
+	// f, _ := udpConn.File()
+	// fd := SocketHandle(f.Fd())
+	// syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_MTU, self.udpBufferSettings.Mtu)
+
+	// pipelines
+
+	type writePayload struct {
+		sendIter uint64
+		payload  []byte
+		ipPacket []byte
+	}
+
+	writePayloads := make(chan writePayload, self.udpBufferSettings.SequenceBufferSize)
+	go func() {
+		defer self.cancel()
+
+		for {
+			select {
+			case <-self.ctx.Done():
+				return
+			case writePayload, ok := <-writePayloads:
+				if !ok {
+					return
+				}
+				payload := writePayload.payload
+				sendIter := writePayload.sendIter
+
+				writeEndTime := time.Now().Add(self.udpBufferSettings.WriteTimeout)
+
+				for i := 0; i < len(payload); {
+					select {
+					case <-self.ctx.Done():
+						MessagePoolReturn(writePayload.ipPacket)
+						return
+					default:
+					}
+
+					socket.SetWriteDeadline(writeEndTime)
+					n, err := socket.Write(payload[i:])
+
+					if err == nil {
+						glog.V(2).Infof("[f%d]udp forward %d\n", sendIter, n)
+					} else {
+						glog.Infof("[f%d]udp forward %d error = %s", sendIter, n, err)
+					}
+
+					if 0 < n {
+						self.UpdateLastActivityTime()
+
+						j := i
+						i += n
+						glog.V(2).Infof("[f%d]udp forward %d/%d -> %d/%d +%d\n", sendIter, j, len(payload), i, len(payload), n)
+					}
+
+					if err != nil {
+						if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+							MessagePoolReturn(writePayload.ipPacket)
+							return
+						} else {
+							// some other error
+							MessagePoolReturn(writePayload.ipPacket)
+							return
+						}
+					}
+				}
+				MessagePoolReturn(writePayload.ipPacket)
+			}
+		}
+	}()
+
+	readPackets := make(chan []byte, self.udpBufferSettings.SequenceBufferSize)
+	go func() {
+		defer self.cancel()
+
+		for {
+			select {
+			case <-self.ctx.Done():
+				return
+			case packet, ok := <-readPackets:
+				if !ok {
+					return
+				}
+				receive(packet)
+			}
+		}
+	}()
+
 	go func() {
 		defer self.cancel()
 
@@ -731,7 +823,11 @@ func (self *UdpSequence) Run() {
 				}
 				for _, packet := range packets {
 					glog.V(1).Infof("[f%d]udp receive %d\n", forwardIter, len(packet))
-					receive(packet)
+					select {
+					case <-self.ctx.Done():
+						MessagePoolReturn(packet)
+					case readPackets <- packet:
+					}
 				}
 			}
 
@@ -749,68 +845,36 @@ func (self *UdpSequence) Run() {
 		}
 	}()
 
-	go func() {
-		defer self.cancel()
+	for sendIter := uint64(0); ; sendIter += 1 {
+		checkpointId := self.idleCondition.Checkpoint()
+		select {
+		case <-self.ctx.Done():
+			return
+		case sendItem := <-self.sendItems:
+			payload := sendItem.udp.Payload
 
-		for sendIter := 0; ; sendIter += 1 {
-			checkpointId := self.idleCondition.Checkpoint()
-			select {
-			case <-self.ctx.Done():
-				return
-			case sendItem := <-self.sendItems:
-				writeEndTime := time.Now().Add(self.udpBufferSettings.WriteTimeout)
-
-				payload := sendItem.udp.Payload
-
-				for i := 0; i < len(payload); {
-					select {
-					case <-self.ctx.Done():
-						MessagePoolReturn(sendItem.ipPacket)
-						return
-					default:
-					}
-
-					socket.SetWriteDeadline(writeEndTime)
-					n, err := socket.Write(payload[i:])
-
-					if err == nil {
-						glog.V(2).Infof("[f%d]udp forward %d\n", sendIter, n)
-					} else {
-						glog.Infof("[f%d]udp forward %d error = %s", sendIter, n, err)
-					}
-
-					if 0 < n {
-						self.UpdateLastActivityTime()
-
-						j := i
-						i += n
-						glog.V(2).Infof("[f%d]udp forward %d/%d -> %d/%d +%d\n", sendIter, j, len(payload), i, len(payload), n)
-					}
-
-					if err != nil {
-						if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-							MessagePoolReturn(sendItem.ipPacket)
-							return
-						} else {
-							// some other error
-							MessagePoolReturn(sendItem.ipPacket)
-							return
-						}
-					}
+			if 0 < len(payload) {
+				writePayload := writePayload{
+					payload:  payload,
+					sendIter: sendIter,
+					ipPacket: sendItem.ipPacket,
 				}
-				MessagePoolReturn(sendItem.ipPacket)
-			case <-time.After(self.udpBufferSettings.IdleTimeout):
-				if self.idleCondition.Close(checkpointId) {
-					// close the sequence
+				select {
+				case writePayloads <- writePayload:
+				case <-self.ctx.Done():
+					MessagePoolReturn(sendItem.ipPacket)
 					return
 				}
-				// else there pending updates
+			} else {
+				MessagePoolReturn(sendItem.ipPacket)
 			}
+		case <-time.After(self.udpBufferSettings.IdleTimeout):
+			if self.idleCondition.Close(checkpointId) {
+				// close the sequence
+				return
+			}
+			// else there pending updates
 		}
-	}()
-
-	select {
-	case <-self.ctx.Done():
 	}
 }
 
@@ -852,6 +916,8 @@ func (self *StreamState) IpPath() *IpPath {
 	}
 }
 
+// this must only be called from one goroutine
+// this is called from the writer only and does not need to syncrhronize with the reader state
 func (self *StreamState) DataPackets(payload []byte, n int, mtu int) ([][]byte, error) {
 	headerSize := 0
 	var ip gopacket.NetworkLayer
@@ -1300,7 +1366,18 @@ func (self *TcpSequence) Run() {
 		glog.Infof("[init]tcp connect error = %s\n", err)
 		return
 	}
+	self.UpdateLastActivityTime()
+	glog.V(2).Infof("[init]connect success\n")
+
 	defer socket.Close()
+	tcpConn := socket.(*net.TCPConn)
+	tcpConn.SetKeepAlive(false)
+	tcpConn.SetNoDelay(true)
+	tcpConn.SetReadBuffer(int(self.tcpBufferSettings.MaxWindowSize))
+	tcpConn.SetWriteBuffer(int(self.tcpBufferSettings.MaxWindowSize))
+	// f, _ := tcpConn.File()
+	// fd := SocketHandle(f.Fd())
+	// syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_MTU, self.tcpBufferSettings.Mtu)
 
 	for syn := false; !syn; {
 		checkpointId := self.idleCondition.Checkpoint()
@@ -1395,9 +1472,6 @@ func (self *TcpSequence) Run() {
 		}
 	*/
 
-	self.UpdateLastActivityTime()
-	glog.V(2).Infof("[init]connect success\n")
-
 	receiveAckCond := sync.NewCond(&self.mutex)
 	ackCond := sync.NewCond(&self.mutex)
 	defer func() {
@@ -1414,6 +1488,95 @@ func (self *TcpSequence) Run() {
 		defer self.mutex.Unlock()
 
 		ackedSendSeq = self.sendSeq
+	}()
+
+	// pipelines
+
+	type writePayload struct {
+		sendIter uint64
+		payload  []byte
+		ipPacket []byte
+	}
+
+	writePayloads := make(chan writePayload, self.tcpBufferSettings.SequenceBufferSize)
+	go func() {
+		defer self.cancel()
+
+		for {
+			select {
+			case <-self.ctx.Done():
+				return
+			case writePayload, ok := <-writePayloads:
+				if !ok {
+					return
+				}
+				payload := writePayload.payload
+				sendIter := writePayload.sendIter
+				writeEndTime := time.Now().Add(self.tcpBufferSettings.WriteTimeout)
+				for i := 0; i < len(payload); {
+					select {
+					case <-self.ctx.Done():
+						MessagePoolReturn(writePayload.ipPacket)
+						return
+					default:
+					}
+
+					socket.SetWriteDeadline(writeEndTime)
+					n, err := socket.Write(payload[i:])
+
+					if err == nil {
+						glog.V(2).Infof("[f%d]tcp forward %d\n", sendIter, n)
+					} else {
+						glog.Infof("[f%d]tcp forward %d error = %s\n", sendIter, n, err)
+					}
+
+					if 0 < n {
+						// func() {
+						// 	self.mutex.Lock()
+						// 	defer self.mutex.Unlock()
+
+						// 	self.sendSeq += uint32(n)
+						// 	ackCond.Broadcast()
+						// }()
+
+						self.UpdateLastActivityTime()
+
+						j := i
+						i += n
+						glog.V(2).Infof("[f%d]tcp forward %d/%d -> %d/%d +%d\n", sendIter, j, len(payload), i, len(payload), n)
+					}
+
+					if err != nil {
+						if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+							MessagePoolReturn(writePayload.ipPacket)
+							return
+						} else {
+							// some other error
+							MessagePoolReturn(writePayload.ipPacket)
+							return
+						}
+					}
+				}
+				MessagePoolReturn(writePayload.ipPacket)
+			}
+		}
+	}()
+
+	readPackets := make(chan []byte, self.tcpBufferSettings.SequenceBufferSize)
+	go func() {
+		defer self.cancel()
+
+		for {
+			select {
+			case <-self.ctx.Done():
+				return
+			case packet, ok := <-readPackets:
+				if !ok {
+					return
+				}
+				receive(packet)
+			}
+		}
 	}()
 
 	go func() {
@@ -1490,7 +1653,11 @@ func (self *TcpSequence) Run() {
 				}
 
 				for _, packet := range packets {
-					receive(packet)
+					select {
+					case <-self.ctx.Done():
+						MessagePoolReturn(packet)
+					case readPackets <- packet:
+					}
 				}
 			}
 
@@ -1510,7 +1677,11 @@ func (self *TcpSequence) Run() {
 					}()
 					if err == nil {
 						closed = true
-						receive(packet)
+						select {
+						case <-self.ctx.Done():
+							MessagePoolReturn(packet)
+						case readPackets <- packet:
+						}
 					}
 					return
 				} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
@@ -1520,76 +1691,6 @@ func (self *TcpSequence) Run() {
 					// some other error
 					return
 				}
-			}
-		}
-	}()
-
-	type writePayload struct {
-		sendIter uint64
-		payload  []byte
-		ipPacket []byte
-	}
-
-	writePayloads := make(chan writePayload, self.tcpBufferSettings.SequenceBufferSize)
-	go func() {
-		defer self.cancel()
-
-		for {
-			select {
-			case <-self.ctx.Done():
-				return
-			case writePayload, ok := <-writePayloads:
-				if !ok {
-					return
-				}
-				payload := writePayload.payload
-				sendIter := writePayload.sendIter
-				writeEndTime := time.Now().Add(self.tcpBufferSettings.WriteTimeout)
-				for i := 0; i < len(payload); {
-					select {
-					case <-self.ctx.Done():
-						MessagePoolReturn(writePayload.ipPacket)
-						return
-					default:
-					}
-
-					socket.SetWriteDeadline(writeEndTime)
-					n, err := socket.Write(payload[i:])
-
-					if err == nil {
-						glog.V(2).Infof("[f%d]tcp forward %d\n", sendIter, n)
-					} else {
-						glog.Infof("[f%d]tcp forward %d error = %s\n", sendIter, n, err)
-					}
-
-					if 0 < n {
-						// func() {
-						// 	self.mutex.Lock()
-						// 	defer self.mutex.Unlock()
-
-						// 	self.sendSeq += uint32(n)
-						// 	ackCond.Broadcast()
-						// }()
-
-						self.UpdateLastActivityTime()
-
-						j := i
-						i += n
-						glog.V(2).Infof("[f%d]tcp forward %d/%d -> %d/%d +%d\n", sendIter, j, len(payload), i, len(payload), n)
-					}
-
-					if err != nil {
-						if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-							MessagePoolReturn(writePayload.ipPacket)
-							return
-						} else {
-							// some other error
-							MessagePoolReturn(writePayload.ipPacket)
-							return
-						}
-					}
-				}
-				MessagePoolReturn(writePayload.ipPacket)
 			}
 		}
 	}()
