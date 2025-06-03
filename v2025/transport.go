@@ -20,7 +20,7 @@ import (
 
 	"github.com/golang/glog"
 
-	"github.com/urnetwork/connect/protocol"
+	"github.com/urnetwork/connect/v2025/protocol"
 )
 
 // note that it is possible to have multiple transports for the same client destination
