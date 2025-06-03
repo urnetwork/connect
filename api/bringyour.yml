@@ -115,6 +115,26 @@ paths:
                             schema:
                                 $ref: "#/components/schemas/StatsProviderResult"
 
+    /stats/leaderboard:
+        post:
+            description: |
+                Fetches top 100 current leaderboard. This data is refreshed every payout.
+            operationId: Stats Leaderboard
+            security:
+                - BearerAuth: []
+            requestBody:
+                required: true
+                content:
+                    application/json:
+                        schema:
+                            $ref: "#/components/schemas/GetLeaderboardArgs"
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: "#/components/schemas/LeaderboardResult"
+
     /auth/login:
         post:
             description: |
@@ -604,6 +624,43 @@ paths:
                         application/json:
                             schema:
                                 $ref: "#/components/schemas/CreateProviderSpecResult"
+
+    /network/ranking:
+        get:
+            description: |
+                Get leaderboard ranking of current network
+            operationId: Network Get Ranking
+            security:
+                - BearerAuth: []
+
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: "#/components/schemas/NetworkRankingResult"
+
+    /network/ranking-visibility:
+        post:
+            description: |
+                Allow network to toggle leaderboard ranking visibility
+            operationId: Network Ranking Visibility
+            security:
+                - BearerAuth: []
+            requestBody:
+                required: true
+                content:
+                    application/json:
+                        schema:
+                            $ref: "#/components/schemas/SetNetworkRankingVisibilityArgs"
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: "#/components/schemas/SetNetworkRankingVisibilityResult"
+
+
 
     /wallet/balance:
         get:
@@ -2870,4 +2927,75 @@ components:
                     items:
                         $ref: "#/components/schemas/AccountPoint"
 
+        GetLeaderboardArgs:
+            type: object
+            properties: {}
+
+        LeaderboardEarner:
+            type: object
+            properties:
+                network_id:
+                    description: uuid
+                    type: string
+                network_name:
+                    type: string
+                net_mib_count:
+                    type: number
+                    format: float
+                is_public:
+                    description: Whether the network has opted in to being displayed on the leaderboard or not
+                    type: boolean
+
+        LeaderboardResult:
+            type: object
+            properties:
+                earners:
+                    type: array
+                    items:
+                        $ref: "#/components/schemas/LeaderboardEarner"
+                error:
+                    type: object
+                    properties:
+                        message:
+                            type: string
+
+        NetworkRanking:
+            type: object
+            properties:
+                net_mib_count:
+                    type: number
+                    format: float
+                leaderboard_rank:
+                    type: integer
+                leaderboard_public:
+                    description: Whether your network is publicly visibile on the leaderboard
+                    type: boolean
+
+        NetworkRankingResult:
+            type: object
+            properties:
+                network_ranking:
+                    $ref: "#/components/schemas/NetworkRanking"
+                error:
+                    type: object
+                    properties:
+                        message:
+                            type: string
+        
+        SetNetworkRankingVisibilityArgs:
+            type: object
+            properties:
+                is_public:
+                    description: User can set whether their network is visible on the leaderboard
+                    type: boolean
+
+        SetNetworkRankingVisibilityResult:
+            type: object
+            properties:
+                error:
+                    type: object
+                    properties:
+                        message:
+                            type: string
+        
                 
