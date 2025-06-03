@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"io"
 	// "time"
-	// "github.com/urnetwork/connect"
+	// "github.com/urnetwork/connect/v2025"
 )
 
 // a message framer that optimizes memory copies to reduce cpu+memory usage
