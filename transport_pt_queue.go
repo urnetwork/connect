@@ -115,11 +115,19 @@ func (self *combineQueue) Combine(addr net.Addr, header [18]byte, data []byte) (
 			n += len(p.data)
 		}
 		// data := make([]byte, 0, n)
-		data := MessagePoolGet(n)[:0]
+		data := MessagePoolGet(n)
+		i := 0
 		for _, p := range item.packets {
-			data = append(data, p.data...)
+			copy(data[i:], p.data)
+			// if m != len(p.data) {
+			// 	panic("MISMATCH LEN")
+			// }
+			i += len(p.data)
 			MessagePoolReturn(p.data)
 		}
+		// if i != n {
+		// 	panic("MISMATCH")
+		// }
 		out = &packet{
 			data: data,
 			addr: item.updateAddr,
