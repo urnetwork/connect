@@ -22,7 +22,7 @@ func TestCombine(t *testing.T) {
 	consecutive := func(n int) []byte {
 		out := make([]byte, 4*n)
 		for i := range n {
-			binary.BigEndian.PutUint32(out[4*i:4*i+4], uint32(i))
+			binary.BigEndian.PutUint32(out[4*i:], uint32(i))
 		}
 		return out
 	}
@@ -93,14 +93,14 @@ func TestCombine(t *testing.T) {
 		cq := newCombineQueue(DefaultPacketTranslationSettings())
 
 		for _, a := range as {
-			out, limit, err := cq.Combine(addrA, a.header, a.data)
+			out, limit, err := cq.Combine(addrA, a.header, MessagePoolCopy(a.data))
 			assert.Equal(t, err, nil)
 			assert.Equal(t, limit, false)
 			assert.Equal(t, out, nil)
 		}
 
 		for _, b := range bs {
-			out, limit, err := cq.Combine(addrB, b.header, b.data)
+			out, limit, err := cq.Combine(addrB, b.header, MessagePoolCopy(b.data))
 			assert.Equal(t, err, nil)
 			assert.Equal(t, limit, false)
 
