@@ -500,18 +500,17 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						// 	panic("[t]shared should be set")
 						// }
 
-						func() {
-							defer MessagePoolReturn(message)
-							ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
-							if err := ws.WriteMessage(websocket.BinaryMessage, message); err != nil {
-								// note that for websocket a dealine timeout cannot be recovered
-								glog.Infof("[ts]%s-> error = %s\n", clientId, err)
-								return
-							}
-							glog.V(2).Infof("[ts]%s->\n", clientId)
+						ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
+						err := ws.WriteMessage(websocket.BinaryMessage, message)
+						MessagePoolReturn(message)
+						if err != nil {
+							// note that for websocket a dealine timeout cannot be recovered
+							glog.Infof("[ts]%s-> error = %s\n", clientId, err)
+							return
+						}
+						glog.V(2).Infof("[ts]%s->\n", clientId)
 
-							writeCounter.Add(1)
-						}()
+						writeCounter.Add(1)
 					case <-WakeupAfter(self.settings.PingTimeout):
 						ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
 						if err := ws.WriteMessage(websocket.BinaryMessage, make([]byte, 0)); err != nil {
@@ -849,16 +848,15 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 						// if !MessagePoolCheckShared(message) {
 						// 	panic("[t]shared should be set")
 						// }
-						func() {
-							defer MessagePoolReturn(message)
-							stream.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
-							if err := h3Framer.Write(stream, message); err != nil {
-								// note that for websocket a dealine timeout cannot be recovered
-								glog.Infof("[ts]%s-> error = %s\n", clientId, err)
-								return
-							}
-							glog.V(2).Infof("[ts]%s->\n", clientId)
-						}()
+						stream.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
+						err := h3Framer.Write(stream, message)
+						MessagePoolReturn(message)
+						if err != nil {
+							// note that for websocket a dealine timeout cannot be recovered
+							glog.Infof("[ts]%s-> error = %s\n", clientId, err)
+							return
+						}
+						glog.V(2).Infof("[ts]%s->\n", clientId)
 					case <-WakeupAfter(self.settings.PingTimeout):
 						stream.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
 						if err := h3Framer.Write(stream, make([]byte, 0)); err != nil {
