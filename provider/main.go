@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"syscall"
 
@@ -40,13 +41,16 @@ The default urls are:
 Usage:
     provider auth ([<auth_code>] | --user_auth=<user_auth> [--password=<password>]) [-f]
     	[--api_url=<api_url>]
+    	[--max-memory=<mem>]
     provider provide [--port=<port>]
         [--api_url=<api_url>]
         [--connect_url=<connect_url>]
+        [--max-memory=<mem>]
     provider auth-provide ([<auth_code>] | --user_auth=<user_auth> [--password=<password>]) [-f]
     	[--port=<port>]
         [--api_url=<api_url>]
         [--connect_url=<connect_url>]
+        [--max-memory=<mem>]
     
 Options:
     -h --help                        Show this screen.
@@ -55,7 +59,8 @@ Options:
     --connect_url=<connect_url>
     --user_auth=<user_auth>
     --password=<password>
-    -p --port=<port>   Status server port [default: no status server].`,
+    -p --port=<port>   Status server port [default: no status server].
+    --max-memory=<mem> Set the maximum amount of memory in bytes, or the suffixes b, kib, mib, gib may be used.`,
 		DefaultApiUrl,
 		DefaultConnectUrl,
 	)
@@ -100,6 +105,18 @@ func auth(opts docopt.Opts) {
 	apiUrl, err := opts.String("--api_url")
 	if err != nil {
 		apiUrl = DefaultApiUrl
+	}
+
+	maxMemoryHumanReadable, err := opts.String("--max-memory")
+	var maxMemory connect.ByteCount
+	if err == nil {
+		maxMemory, err = connect.ParseByteCount(maxMemoryHumanReadable)
+		if err != nil {
+			panic(fmt.Errorf("Bad mem argument: %s", maxMemoryHumanReadable))
+		}
+	}
+	if 0 < maxMemory {
+		debug.SetMemoryLimit(maxMemory)
 	}
 
 	cancelCtx, cancel := context.WithCancel(context.Background())
@@ -216,6 +233,18 @@ func provide(opts docopt.Opts) {
 	connectUrl, err := opts.String("--connect_url")
 	if err != nil {
 		connectUrl = DefaultConnectUrl
+	}
+
+	maxMemoryHumanReadable, err := opts.String("--max-memory")
+	var maxMemory connect.ByteCount
+	if err == nil {
+		maxMemory, err = connect.ParseByteCount(maxMemoryHumanReadable)
+		if err != nil {
+			panic(fmt.Errorf("Bad mem argument: %s", maxMemoryHumanReadable))
+		}
+	}
+	if 0 < maxMemory {
+		debug.SetMemoryLimit(maxMemory)
 	}
 
 	cancelCtx, cancel := context.WithCancel(context.Background())
