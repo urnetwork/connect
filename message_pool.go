@@ -1,11 +1,12 @@
+//go:build !mininit
+// +build !mininit
+
 package connect
 
 import (
 	"encoding/binary"
 	"fmt"
-	"hash/maphash"
 	"io"
-	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -13,8 +14,6 @@ import (
 	"time"
 
 	"golang.org/x/exp/maps"
-
-	"google.golang.org/protobuf/proto"
 
 	"github.com/golang/glog"
 )
@@ -32,9 +31,6 @@ import (
 //   before the callback returns.
 // Shared messages are returned to the pool the same as normal messages.
 // `MessagePoolReturn`/`MessagePoolShareReadOnly` is a noop when using a `[]byte` that is not part of the pool.
-
-// set this to true to tag messages with useful debugging information e.g. the creation site
-const debugTags = false
 
 // [8 byte id][1 byte tag][1 byte flags][2 byte ref count]
 const MessagePoolMetaByteCount = 12
@@ -71,35 +67,6 @@ var orderedMessagePools = []*messagePool{
 	newMessagePool(4096),
 }
 
-var seed = maphash.MakeSeed()
-var debugStateLock sync.Mutex
-var tagCallers = map[uint8]map[string]bool{}
-
-func debugTag() uint8 {
-	_, file2, line2, ok := runtime.Caller(2)
-	if !ok {
-		return 0
-	}
-	_, file3, line3, ok := runtime.Caller(3)
-	if !ok {
-		return 0
-	}
-	caller := fmt.Sprintf("%s:%d->%s:%d", file3, line3, file2, line2)
-	tag := uint8(maphash.String(seed, caller))
-	func() {
-		debugStateLock.Lock()
-		defer debugStateLock.Unlock()
-
-		callers, ok := tagCallers[tag]
-		if !ok {
-			callers = map[string]bool{}
-			tagCallers[tag] = callers
-		}
-		callers[caller] = true
-	}()
-	return tag
-}
-
 func init() {
 	go poolStats()
 }
@@ -119,7 +86,7 @@ func poolStats() {
 					func() {
 						debugStateLock.Lock()
 						defer debugStateLock.Unlock()
-						caller = strings.Join(maps.Keys(tagCallers[uint8(tag)]), "/")
+						caller = strings.Join(maps.Keys(debugTagCallers[uint8(tag)]), "/")
 					}()
 
 					glog.Infof("pool[%d] tag=%d [%s] r=%d/t=%d/c=%d = %.2f%% return / %.2f%% reuse\n", pool.size, tag, caller, returned, taken, created, 100*ratio, 100*reuse)
@@ -171,10 +138,6 @@ func MessagePool(targetSize int) (*sync.Pool, int) {
 	return pool.pool, pool.size
 }
 
-func MessagePoolReadAll(r io.Reader) ([]byte, error) {
-	return MessagePoolReadAllWithTag(r, 0)
-}
-
 func MessagePoolReadAllWithTag(r io.Reader, tag uint8) ([]byte, error) {
 	b, _ := MessagePoolGetDetailedWithTag(orderedMessagePools[0].size, tag)
 	i := 0
@@ -214,38 +177,6 @@ func MessagePoolReadAllWithTag(r io.Reader, tag uint8) ([]byte, error) {
 		}
 		out = append(out, b[:n]...)
 	}
-}
-
-func MessagePoolCopy(message []byte) []byte {
-	b, _ := MessagePoolCopyDetailed(message)
-	return b
-}
-
-func MessagePoolCopyDetailed(message []byte) ([]byte, bool) {
-	var tag uint8
-	if debugTags {
-		tag = debugTag()
-	}
-	return MessagePoolCopyDetailedWithTag(message, tag)
-}
-
-func MessagePoolCopyDetailedWithTag(message []byte, tag uint8) ([]byte, bool) {
-	poolMessage, pooled := MessagePoolGetDetailedWithTag(len(message), tag)
-	copy(poolMessage, message)
-	return poolMessage, pooled
-}
-
-func MessagePoolGet(n int) []byte {
-	b, _ := MessagePoolGetDetailed(n)
-	return b
-}
-
-func MessagePoolGetDetailed(n int) ([]byte, bool) {
-	var tag uint8
-	if debugTags {
-		tag = debugTag()
-	}
-	return MessagePoolGetDetailedWithTag(n, tag)
 }
 
 func MessagePoolGetDetailedWithTag(n int, tag uint8) ([]byte, bool) {
@@ -372,31 +303,4 @@ func MessagePoolCheck(message []byte) (pooled bool, shared bool) {
 	}
 	// not a pool message
 	return
-}
-
-func ProtoMarshal(m proto.Message) ([]byte, error) {
-	var tag uint8
-	if debugTags {
-		tag = debugTag()
-	}
-	return ProtoMarshalWithTag(m, tag)
-}
-
-func ProtoMarshalWithTag(m proto.Message, tag uint8) ([]byte, error) {
-	if m == nil {
-		return nil, nil
-	}
-
-	buf, _ := MessagePoolGetDetailedWithTag(proto.Size(m), tag)
-
-	out, err := proto.MarshalOptions{}.MarshalAppend(buf[:0], m)
-	if err != nil {
-		MessagePoolReturn(buf)
-		return nil, err
-	}
-	return out, nil
-}
-
-func ProtoUnmarshal(b []byte, m proto.Message) error {
-	return proto.Unmarshal(b, m)
 }

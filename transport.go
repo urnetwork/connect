@@ -106,12 +106,16 @@ type PlatformTransportSettings struct {
 
 func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 	pingTimeout := 1 * time.Second
+	tlsConfig, err := DefaultTlsConfig()
+	if err != nil {
+		panic(err)
+	}
 	return &PlatformTransportSettings{
 		HttpConnectTimeout:   2 * time.Second,
 		WsHandshakeTimeout:   2 * time.Second,
 		QuicConnectTimeout:   2 * time.Second,
 		QuicHandshakeTimeout: 2 * time.Second,
-		QuicTlsConfig:        nil,
+		QuicTlsConfig:        tlsConfig,
 		AuthTimeout:          2 * time.Second,
 		ReconnectTimeout:     5 * time.Second,
 		PingTimeout:          pingTimeout,

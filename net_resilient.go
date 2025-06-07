@@ -80,10 +80,11 @@ func NewResilientDialTlsContext(
 		}
 
 		rconn := NewResilientTlsConn(conn, fragment, reorder)
-		tlsServerConn := tls.Client(rconn, &tls.Config{
-			ServerName: host,
-			MinVersion: tls.VersionTLS12,
-		})
+
+		// copy and extend
+		tlsConfig := *connectSettings.TlsConfig
+		tlsConfig.ServerName = host
+		tlsServerConn := tls.Client(rconn, &tlsConfig)
 
 		func() {
 			tlsCtx, tlsCancel := context.WithTimeout(ctx, connectSettings.TlsTimeout)
