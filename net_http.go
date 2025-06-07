@@ -65,6 +65,10 @@ func DefaultClientStrategySettings() *ClientStrategySettings {
 }
 
 func DefaultConnectSettings() *ConnectSettings {
+	tlsConfig, err := DefaultTlsConfig()
+	if err != nil {
+		panic(err)
+	}
 	return &ConnectSettings{
 		RequestTimeout:   30 * time.Second,
 		ConnectTimeout:   5 * time.Second,
@@ -78,7 +82,7 @@ func DefaultConnectSettings() *ConnectSettings {
 			Interval: 5 * time.Second,
 			Count:    1,
 		},
-		TlsConfig: nil,
+		TlsConfig: tlsConfig,
 	}
 }
 
