@@ -11,6 +11,7 @@ build:
 	env CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-w -s -X main.Version=${WARP_VERSION}" -o build/linux/amd64/
 	env CGO_ENABLED=0 GOOS=linux GOARCH=386 go build -trimpath -ldflags "-w -s -X main.Version=${WARP_VERSION}" -o build/linux/386/
 	env CGO_ENABLED=0 GOOS=linux GOARCH=mips GOMIPS=softfloat go build -trimpath -ldflags "-w -s -X main.Version=${WARP_VERSION}" -o build/linux/mips/
+	env CGO_ENABLED=0 GOOS=linux GOARCH=mips GOMIPS=softfloat go build -trimpath -ldflags "-w -s -X main.Version=${WARP_VERSION}" -tags mininit -o build/linux/mips-mininit/
 	env CGO_ENABLED=0 GOOS=linux GOARCH=mipsle go build -trimpath -ldflags "-w -s -w -s -X main.Version=${WARP_VERSION}" -o build/linux/mipsle/
 	env CGO_ENABLED=0 GOOS=linux GOARCH=mips64 GOMIPS=softfloat go build -trimpath -ldflags "-w -s -X main.Version=${WARP_VERSION}" -o build/linux/mips64/
 	env CGO_ENABLED=0 GOOS=linux GOARCH=mips64le go build -trimpath -ldflags "-w -s -w -s -X main.Version=${WARP_VERSION}" -o build/linux/mips64le/
