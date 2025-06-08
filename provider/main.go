@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"net/http"
 	"os"
@@ -14,8 +15,6 @@ import (
 	"syscall"
 
 	"golang.org/x/term"
-
-	"github.com/docopt/docopt-go"
 
 	gojwt "github.com/golang-jwt/jwt/v5"
 
@@ -30,7 +29,18 @@ const DefaultConnectUrl = "wss://connect.bringyour.com"
 // -ldflags "-X main.Version=$WARP_VERSION-$WARP_VERSION_CODE"
 var Version string
 
-func main() {
+type Options struct {
+	ApiUrl                 string
+	ConnectUrl             string
+	UserAuth               string
+	Password               string
+	Force                  bool
+	Port                   int
+	MaxMemoryHumanReadable string
+	Args                   []string
+}
+
+func usageAndExit() {
 	usage := fmt.Sprintf(
 		`Connect provider.
 
@@ -59,28 +69,50 @@ Options:
     --connect_url=<connect_url>
     --user_auth=<user_auth>
     --password=<password>
-    -p --port=<port>   Status server port [default: no status server].
-    --max-memory=<mem> Set the maximum amount of memory in bytes, or the suffixes b, kib, mib, gib may be used.`,
+    -f                               Force overwrite existing config.
+    -p --port=<port>                 Status server port [default: no status server].
+    --max-memory=<mem>               Set the maximum amount of memory in bytes, or the suffixes b, kib, mib, gib may be used.`,
 		DefaultApiUrl,
 		DefaultConnectUrl,
 	)
+	fmt.Printf("%s\n", usage)
+	os.Exit(1)
+}
 
-	opts, err := docopt.ParseArgs(usage, os.Args[1:], RequireVersion())
-	if err != nil {
-		panic(err)
+func main() {
+
+	opts := &Options{}
+	flag.StringVar(&opts.ApiUrl, "api_url", DefaultApiUrl, "The api url.")
+	flag.StringVar(&opts.ConnectUrl, "connect_url", DefaultConnectUrl, "The connect url.")
+	flag.StringVar(&opts.UserAuth, "user_auth", "", "Your network user auth.")
+	flag.StringVar(&opts.Password, "password", "", "Your network password.")
+	flag.BoolVar(&opts.Force, "f", false, "Force overwrite existing config.")
+	flag.IntVar(&opts.Port, "port", 0, "Status server port.")
+	flag.StringVar(&opts.MaxMemoryHumanReadable, "max-memory", "", "Set the maximum amount of memory in bytes, or the suffixes b, kib, mib, gib may be used.")
+
+	flag.Parse()
+	if !flag.Parsed() {
+		usageAndExit()
+	}
+	opts.Args = flag.Args()
+
+	if 0 == len(opts.Args) {
+		usageAndExit()
 	}
 
-	if auth_, _ := opts.Bool("auth"); auth_ {
+	if opts.Args[0] == "auth" {
 		auth(opts)
-	} else if provide_, _ := opts.Bool("provide"); provide_ {
+	} else if opts.Args[0] == "provide" {
 		provide(opts)
-	} else if authProvide_, _ := opts.Bool("auth-provide"); authProvide_ {
+	} else if opts.Args[0] == "auth-provide" {
 		auth(opts)
 		provide(opts)
+	} else {
+		usageAndExit()
 	}
 }
 
-func auth(opts docopt.Opts) {
+func auth(opts *Options) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		panic(err)
@@ -90,7 +122,7 @@ func auth(opts docopt.Opts) {
 
 	if _, err := os.Stat(jwtPath); !errors.Is(err, os.ErrNotExist) {
 		// jwt exists
-		if force, _ := opts.Bool("-f"); !force {
+		if !opts.Force {
 			fmt.Printf("%s exists. Overwrite? [yN]\n", jwtPath)
 
 			reader := bufio.NewReader(os.Stdin)
@@ -102,21 +134,17 @@ func auth(opts docopt.Opts) {
 		}
 	}
 
-	apiUrl, err := opts.String("--api_url")
-	if err != nil {
-		apiUrl = DefaultApiUrl
-	}
+	apiUrl := opts.ApiUrl
 
-	maxMemoryHumanReadable, err := opts.String("--max-memory")
-	var maxMemory connect.ByteCount
-	if err == nil {
-		maxMemory, err = connect.ParseByteCount(maxMemoryHumanReadable)
+	maxMemoryHumanReadable := opts.MaxMemoryHumanReadable
+	if maxMemoryHumanReadable != "" {
+		maxMemory, err := connect.ParseByteCount(maxMemoryHumanReadable)
 		if err != nil {
 			panic(fmt.Errorf("Bad mem argument: %s", maxMemoryHumanReadable))
 		}
-	}
-	if 0 < maxMemory {
-		debug.SetMemoryLimit(maxMemory)
+		if 0 < maxMemory {
+			debug.SetMemoryLimit(maxMemory)
+		}
 	}
 
 	cancelCtx, cancel := context.WithCancel(context.Background())
@@ -132,11 +160,12 @@ func auth(opts docopt.Opts) {
 	api := connect.NewBringYourApi(ctx, clientStrategy, apiUrl)
 
 	var byJwt string
-	if userAuth, err := opts.String("--user_auth"); err == nil {
+	userAuth := opts.UserAuth
+	if userAuth != "" {
 		// user_auth and password
 
-		var password string
-		if password, err = opts.String("--password"); err == nil && password == "" {
+		password := opts.Password
+		if password == "" {
 			fmt.Print("Enter password: ")
 			passwordBytes, err := term.ReadPassword(int(syscall.Stdin))
 			if err != nil {
@@ -177,8 +206,8 @@ func auth(opts docopt.Opts) {
 		byJwt = loginResult.Result.Network.ByJwt
 	} else {
 		// auth_code
-		authCode, _ := opts.String("<auth_code>")
-		if authCode == "" {
+		var authCode string
+		if len(opts.Args) < 2 {
 			fmt.Print("Enter auth code: ")
 			authCodeBytes, err := term.ReadPassword(int(syscall.Stdin))
 			if err != nil {
@@ -186,6 +215,8 @@ func auth(opts docopt.Opts) {
 			}
 			authCode = strings.TrimSpace(string(authCodeBytes))
 			fmt.Printf("\n")
+		} else {
+			authCode = opts.Args[1]
 		}
 
 		authCodeLogin := &connect.AuthCodeLoginArgs{
@@ -222,29 +253,20 @@ func auth(opts docopt.Opts) {
 	}
 }
 
-func provide(opts docopt.Opts) {
-	port, _ := opts.Int("--port")
+func provide(opts *Options) {
+	port := opts.Port
+	apiUrl := opts.ApiUrl
+	connectUrl := opts.ConnectUrl
 
-	apiUrl, err := opts.String("--api_url")
-	if err != nil {
-		apiUrl = DefaultApiUrl
-	}
-
-	connectUrl, err := opts.String("--connect_url")
-	if err != nil {
-		connectUrl = DefaultConnectUrl
-	}
-
-	maxMemoryHumanReadable, err := opts.String("--max-memory")
-	var maxMemory connect.ByteCount
-	if err == nil {
-		maxMemory, err = connect.ParseByteCount(maxMemoryHumanReadable)
+	maxMemoryHumanReadable := opts.MaxMemoryHumanReadable
+	if maxMemoryHumanReadable != "" {
+		maxMemory, err := connect.ParseByteCount(maxMemoryHumanReadable)
 		if err != nil {
 			panic(fmt.Errorf("Bad mem argument: %s", maxMemoryHumanReadable))
 		}
-	}
-	if 0 < maxMemory {
-		debug.SetMemoryLimit(maxMemory)
+		if 0 < maxMemory {
+			debug.SetMemoryLimit(maxMemory)
+		}
 	}
 
 	cancelCtx, cancel := context.WithCancel(context.Background())
@@ -330,7 +352,7 @@ func provide(opts docopt.Opts) {
 	os.Exit(0)
 }
 
-func provideAuth(ctx context.Context, clientStrategy *connect.ClientStrategy, apiUrl string, opts docopt.Opts) (byClientJwt string, clientId connect.Id, returnErr error) {
+func provideAuth(ctx context.Context, clientStrategy *connect.ClientStrategy, apiUrl string, opts *Options) (byClientJwt string, clientId connect.Id, returnErr error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		panic(err)
