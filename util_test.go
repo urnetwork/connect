@@ -160,7 +160,8 @@ func TestWeightedShuffle(t *testing.T) {
 	k := 64
 	n := 512
 
-	netIndexes := map[int]int64{}
+	netIndexes1 := map[int]int64{}
+	netIndexes2 := map[int]int64{}
 
 	for i := 0; i < n*k; i += 1 {
 		values := []int{}
@@ -172,32 +173,44 @@ func TestWeightedShuffle(t *testing.T) {
 
 		WeightedShuffle(values, weights)
 		for index, value := range values {
-			netIndexes[value] += int64(index)
+			netIndexes1[value] += int64(index)
+		}
+
+		WeightedShuffleFunc(values, func(i int) float32 {
+			return weights[i]
+		})
+		for index, value := range values {
+			netIndexes2[value] += int64(index)
 		}
 	}
 
-	orderedValues := []int{}
-	for i := 0; i < n; i += 1 {
-		orderedValues = append(orderedValues, i)
-	}
-	slices.SortFunc(orderedValues, func(a int, b int) int {
-		if netIndexes[a] < netIndexes[b] {
-			return -1
-		} else if netIndexes[b] < netIndexes[a] {
-			return 1
-		} else {
-			return 0
+	test := func(netIndexes map[int]int64) {
+		orderedValues := []int{}
+		for i := 0; i < n; i += 1 {
+			orderedValues = append(orderedValues, i)
 		}
-	})
+		slices.SortFunc(orderedValues, func(a int, b int) int {
+			if netIndexes[a] < netIndexes[b] {
+				return -1
+			} else if netIndexes[b] < netIndexes[a] {
+				return 1
+			} else {
+				return 0
+			}
+		})
 
-	errorThreshold := 2 * n / k
-	for i := 0; i < n; i += 1 {
-		e := i - orderedValues[i]
-		if -errorThreshold <= e && e <= errorThreshold {
-			e = 0
+		errorThreshold := 2 * n / k
+		for i := 0; i < n; i += 1 {
+			e := i - orderedValues[i]
+			if -errorThreshold <= e && e <= errorThreshold {
+				e = 0
+			}
+			assert.Equal(t, 0, e)
 		}
-		assert.Equal(t, 0, e)
 	}
+
+	test(netIndexes1)
+	test(netIndexes2)
 }
 
 func TestWeightedShuffleWithEntropy(t *testing.T) {
@@ -217,7 +230,8 @@ func TestWeightedShuffleWithEntropy(t *testing.T) {
 	}
 
 	for entropyIndex, entropy := range orderedEntropies {
-		netIndexes := map[int]int64{}
+		netIndexes1 := map[int]int64{}
+		netIndexes2 := map[int]int64{}
 
 		for i := 0; i < n*k; i += 1 {
 			values := []int{}
@@ -229,11 +243,18 @@ func TestWeightedShuffleWithEntropy(t *testing.T) {
 
 			WeightedShuffleWithEntropy(values, weights, entropy)
 			for index, value := range values {
-				netIndexes[value] += int64(index)
+				netIndexes1[value] += int64(index)
+			}
+
+			WeightedShuffleFuncWithEntropy(values, func(i int) float32 {
+				return weights[i]
+			}, entropy)
+			for index, value := range values {
+				netIndexes2[value] += int64(index)
 			}
 		}
 
-		testError := func(testEntropy float32, expected bool) {
+		testError := func(testEntropy float32, expected bool, netIndexes map[int]int64) {
 			// n * k * ((1-e)*n + e*n/k)
 			// == n^2 * ((1-e)*k+e)
 			errorThreshold := int64(float32(n) * float32(n) * ((1-testEntropy)*float32(k) + testEntropy))
@@ -260,10 +281,12 @@ func TestWeightedShuffleWithEntropy(t *testing.T) {
 		}
 
 		fmt.Printf("[entropy]%d\n", entropyIndex)
-		testError(entropy, true)
+		testError(entropy, true, netIndexes1)
+		testError(entropy, true, netIndexes2)
 		// the test should fail at the next entropy index (tigher error bound)
 		if entropyIndex+1 < len(orderedEntropies) {
-			testError(orderedEntropies[entropyIndex+1], false)
+			testError(orderedEntropies[entropyIndex+1], false, netIndexes1)
+			testError(orderedEntropies[entropyIndex+1], false, netIndexes2)
 		}
 	}
 }

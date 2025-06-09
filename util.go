@@ -277,6 +277,39 @@ func WeightedShuffleWithEntropy[T comparable](values []T, weights map[T]float32,
 	}
 }
 
+func WeightedShuffleFunc[T comparable](values []T, weight func(T) float32) {
+	WeightedShuffleFuncWithEntropy[T](values, weight, 0)
+}
+
+func WeightedShuffleFuncWithEntropy[T comparable](values []T, weight func(T) float32, entropy float32) {
+	mathrand.Shuffle(len(values), func(i int, j int) {
+		values[i], values[j] = values[j], values[i]
+	})
+
+	n := len(values)
+	for i := 0; i < n-1; i += 1 {
+		j := func() int {
+			var net float32
+			net = 0
+			for j := i; j < n; j += 1 {
+				net += weight(values[j])
+			}
+			r := mathrand.Float32()
+			rnet := r * net
+			net = entropy * net
+			for j := i; j < n; j += 1 {
+				net += weight(values[j])
+				if rnet < net {
+					return j
+				}
+			}
+			// zero weights, use the last value
+			return n - 1
+		}()
+		values[i], values[j] = values[j], values[i]
+	}
+}
+
 type Reconnect struct {
 	startTime  time.Time
 	minTimeout time.Duration
