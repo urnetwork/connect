@@ -5,7 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
+	// "flag"
 	"fmt"
 	"net/http"
 	"os"
@@ -81,9 +81,12 @@ Options:
 
 func main() {
 
-	fmt.Printf("[provider]start")
+	fmt.Printf("[provider]start\n")
 
-	opts := &Options{}
+	opts := &Options{
+		ApiUrl:     DefaultApiUrl,
+		ConnectUrl: DefaultConnectUrl,
+	}
 	// flag.StringVar(&opts.ApiUrl, "api_url", DefaultApiUrl, "The api url.")
 	// flag.StringVar(&opts.ConnectUrl, "connect_url", DefaultConnectUrl, "The connect url.")
 	// flag.StringVar(&opts.UserAuth, "user_auth", "", "Your network user auth.")
@@ -92,22 +95,24 @@ func main() {
 	// flag.IntVar(&opts.Port, "port", 0, "Status server port.")
 	// flag.StringVar(&opts.MaxMemoryHumanReadable, "max-memory", "", "Set the maximum amount of memory in bytes, or the suffixes b, kib, mib, gib may be used.")
 
-	fmt.Printf("[provider]pre-parse")
-	flag.Parse()
-	fmt.Printf("[provider]post-parse")
-	if !flag.Parsed() {
-		fmt.Printf("[provider]exit")
-		usageAndExit()
-	}
-	fmt.Printf("[provider]interpret")
-	opts.Args = flag.Args()
+	// fmt.Printf("[provider]pre-parse")
+	// flag.Parse()
+	// fmt.Printf("[provider]post-parse")
+	// if !flag.Parsed() {
+	// 	fmt.Printf("[provider]exit")
+	// 	usageAndExit()
+	// }
+	// fmt.Printf("[provider]interpret")
+	// opts.Args = flag.Args()
+
+	opts.Args = os.Args[1:]
 
 	if 0 == len(opts.Args) {
-		fmt.Printf("[provider]exit")
+		fmt.Printf("[provider]exit\n")
 		usageAndExit()
 	}
 
-	fmt.Printf("[provider]post-interpret")
+	fmt.Printf("[provider]post-interpret\n")
 
 	if opts.Args[0] == "auth" {
 		auth(opts)
@@ -117,7 +122,7 @@ func main() {
 		auth(opts)
 		provide(opts)
 	} else {
-		fmt.Printf("[provider]exit")
+		fmt.Printf("[provider]exit\n")
 		usageAndExit()
 	}
 }
