@@ -1,3001 +1,3062 @@
-
 openapi: "3.1.0"
 info:
-    version: 2023.12.19
-    title: BringYour
-    description: |
-        BringYour is a web-standards VPN marketplace with an emphasis on 
-        fast, secure internet everwhere.
+  version: 2023.12.19
+  title: BringYour
+  description: |
+    BringYour is a web-standards VPN marketplace with an emphasis on
+    fast, secure internet everwhere.
 
-        The API for BringYour bootstraps the `connect` protocol,
-        and is the source of JWTs and other match-making transactions.
-        
-        The JWT returned by /auth routes does not have a clientId.
-        The `connect` protocol requires a JWT with a clientId.
-        Use the /network routes to obtain a JWT with a clientId.
+    The API for BringYour bootstraps the `connect` protocol,
+    and is the source of JWTs and other match-making transactions.
 
-        In the BringYour network:
-        - a network name is a globally unique subnet (xyz.bringyour.network)
-        - a clientId is a globally unique 16-byte address
-        - clientIds are equivalent to IPv6, but are expressed as UDID
-        - clients also have an IPv6 and IPv4 mapped to their clientId
-        
-        Outside of IP translation like taptun/utun, 
-        clients are typically addressed via their clientId.
+    The JWT returned by /auth routes does not have a clientId.
+    The `connect` protocol requires a JWT with a clientId.
+    Use the /network routes to obtain a JWT with a clientId.
 
-        Unless otherwise specified, time/date strings will be formatted
-        in the Go default `2006-01-02 15:04:05.999999999 -0700 MST`.
+    In the BringYour network:
+    - a network name is a globally unique subnet (xyz.bringyour.network)
+    - a clientId is a globally unique 16-byte address
+    - clientIds are equivalent to IPv6, but are expressed as UDID
+    - clients also have an IPv6 and IPv4 mapped to their clientId
 
-    termsOfService: https://bringyour.com/terms
-    contact:
-        name: BringYour
-        email: support@bringyour.com
-        url: https://bringyour.com
-    x-logo:
-        url: https://bringyour.com/res/images/bringyour-wordmark-260.svg
-        altText: BringYour
-    license:
-        name: Mozilla Public License, v. 2.0
-        url: https://mozilla.org/MPL/2.0/
+    Outside of IP translation like taptun/utun,
+    clients are typically addressed via their clientId.
+
+    Unless otherwise specified, time/date strings will be formatted
+    in the Go default `2006-01-02 15:04:05.999999999 -0700 MST`.
+
+  termsOfService: https://bringyour.com/terms
+  contact:
+    name: BringYour
+    email: support@bringyour.com
+    url: https://bringyour.com
+  x-logo:
+    url: https://bringyour.com/res/images/bringyour-wordmark-260.svg
+    altText: BringYour
+  license:
+    name: Mozilla Public License, v. 2.0
+    url: https://mozilla.org/MPL/2.0/
 servers:
-    - url: https://api.bringyour.com
+  - url: https://api.bringyour.com
 
 security:
   - BearerAuth: []
 
 paths:
-    /stats/last-90:
-        get:
-            description: |
-                Get network statistics for the last 90 days.
-                The statistics are updated approximately every 60s.
-            operationId: Stats Last 90
-            security: []
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/StatsResult"
-
-    /stats/providers:
-        get:
-            description: |
-                Get all providers in the caller network.
-                Each provider includes stats from the last 24 hours.
-            operationId: Stats Providers
-            security:
-                - BearerAuth: []
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/StatsProvidersResult"
-
-    /stats/providers-last-n:
-        post:
-            description: |
-                Get all providers in the caller network.
-                Each provider includes stats from the last n hours.
-            operationId: Stats Providers Last N hours
-            security:
-                - BearerAuth: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/StatsProvidersArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/StatsProvidersResult"
-
-    /stats/provider-last-n:
-        post:
-            description: |
-                Get detailed stats on a single provider in the caller network.
-                This is meant to give the user complete visibility over usage.
-            operationId: Stats Provider Last N hours
-            security:
-                - BearerAuth: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/StatsProviderArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/StatsProviderResult"
-
-    /stats/leaderboard:
-        post:
-            description: |
-                Fetches top 100 current leaderboard. This data is refreshed every payout.
-            operationId: Stats Leaderboard
-            security:
-                - BearerAuth: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/GetLeaderboardArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/LeaderboardResult"
-
-    /auth/login:
-        post:
-            description: |
-                Start a login for a user authority.
-                The user authority may be:
-                - email
-                - phone number
-                - Apple JWT
-                - Google JWT
-            operationId: Auth Login
-            security: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/AuthLoginArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/AuthLoginResult"
-    
-    /auth/login-with-password:
-        post:
-            description: |
-                Password login for email and phone number.
-            operationId: Auth Login With Password
-            security: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/AuthLoginWithPasswordArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/AuthLoginWithPasswordResult"
-
-    /auth/verify:
-        post:
-            description: |
-                Verify ownership of email or phone number.
-            operationId: Auth Verify
-            security: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/AuthVerifyArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/AuthVerifyResult"
-
-    /auth/verify-send:
-        post:
-            description: |
-                Send verification code to email or phone number.
-            operationId: Auth Verify Send
-            security: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/AuthVerifySendArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/AuthVerifySendResult"
-
-    /auth/password-reset:
-        post:
-            description: |
-                Send password reset code to email or phone number.
-            operationId: Auth Password Reset
-            security: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/AuthPasswordResetArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/AuthPasswordResetResult"
-
-    /auth/password-set:
-        post:
-            description: |
-                Change password.
-            operationId: Auth Password Set
-            security: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/AuthPasswordSetArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/AuthPasswordSetResult"
-
-    /auth/network-check:
-        post:
-            description: |
-                Check if the network name is available.
-                A new network name must satisfy:
-                - at least 3 characters different from an existing network name
-                - at least 8 characters
-                - domain name compatible (see RFC 5890)
-                - not contain the dash (-) character (BringYour subdomains are reverse-flattened to a single level using dashes)
-            operationId: Auth Network Check
-            security: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/NetworkCheckArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/NetworkCheckResult"
-
-    /auth/network-create:
-        post:
-            description: |
-                Create a new network.
-                A user authority can be associated with at most one network.
-            operationId: Auth Network Create
-            security: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/NetworkCreateArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/NetworkCreateResult"
-
-
-    /auth/network-delete:
-        post:
-            description: |
-                Delete network
-            operationId: Auth Network Delete
-            security:
-                - BearerAuth: []
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/NetworkDeleteResult"
-
-    /auth/code-create:
-        post:
-            description: |
-                Create a limited use code (auth code) to share authentication 
-                with connected apps and tools.
-                The code is tied to the caller session, 
-                and will be expired with any of the caller's sessions.
-                Currently a code cannot be created for a client JWT
-                (from `/network/auth-client`).
-                This is a subset of an OAuth flow.
-            operationId: Auth Code Create
-            security: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/AuthCodeCreateArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/AuthCodeCreateResult"
-
-    /auth/code-login:
-        post:
-            description: |
-                Authenticate with an auth code.
-                The returned session is tied to the session that created the auth code,
-                and will be expired with any of the creator's sessions.
-                This is a subset of an OAuth flow.
-            operationId: Auth Code Login
-            security: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/AuthCodeLoginArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/AuthCodeLoginResult"
-
-    /auth/upgrade-guest:
-        post:
-            description: |
-                Authenticates a guest user, migrates to a normal account
-            operationId: Upgrade Guest
-            security:
-                - BearerAuth: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/UpgradeGuestArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/UpgradeGuestResult"
-
-    /network/auth-client:
-        post:
-            description: |
-                Gain permission to use the `connect` protocol as the requested clientId,
-                or assign a new clientId.
-                Each network can have at most 128 clientIds.
-                Above that number, new clientId requests will error until one or more
-                existing clientIds are removed.
-            operationId: Auth Network Client
-            security:
-                - BearerAuth: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/AuthNetworkClientArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/AuthNetworkClientResult"
-
-    /network/remove-client:
-        post:
-            description: |
-                Remove a client from the network.
-            operationId: Remove Network Client
-            security:
-                - BearerAuth: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/RemoveNetworkClientArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/RemoveNetworkClientResult"
-
-    /network/clients:
-        get:
-            description: |
-                Get the latest status of all clients on this network.
-
-                Includes:
-                
-                - Resident status, which is the platform counterpart
-                for the client that handles control commands.
-                - Connections, which are transports from the client to the platform.
-                Note there can be multiple active connections for a single client.
-                - Provide status
-            operationId: Network Clients
-            security:
-                - BearerAuth: []
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/NetworkClientsResult"
-
-    /preferences/set-preferences:
-        post:
-            description: |
-                Set account preferences.
-            operationId: Preferences Set
-            security:
-                - BearerAuth: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/PreferencesSetArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/PreferencesSetResult"
-
-
-    /preferences:
-        get:
-            description: |
-                Get account preferences.
-            operationId: Preferences Get
-            security:
-                - BearerAuth: []
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/PreferencesGetResult"
-
-    /feedback/send-feedback:
-        post:
-            description: |
-                Feedback.
-            operationId: Feedback Send
-            security:
-                - BearerAuth: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/FeedbackSendArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/FeedbackSendResult"
-
-    /network/provider-locations:
-        get:
-            description: |
-                A list of locations and groups where there are at least one active provider
-                in good health. 
-                Note that a location or group will need to be mapped to an actual provider
-                using `/network/find-providers`.
-            operationId: Network Provider Locations
-            security: []
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/FindLocationsResult"
-
-    /network/find-provider-locations:
-        post:
-            description: |
-                Search for locations and groups that match a query,
-                where there are at least one active provider in good health. 
-                The match algorithm accounts for typos and misspelling,
-                and the tolerance can be tuned in the input.
-                Note that a location or group will need to be mapped to an actual provider
-                using `/network/find-providers`.
-            operationId: Network Find Provider Locations
-            security: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/FindLocationsArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/FindLocationsResult"
-
-    /network/find-locations:
-        post:
-            description: |
-                Search for locations, groups, and devices that match a query,
-                regardless of whether an providers are active.
-            operationId: Network Find Locations
-            security: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/FindLocationsArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/FindLocationsResult"
-
-    /network/find-providers:
-        post:
-            description: |
-                Randomly sample providers that for a location or group,
-                which are active and in good health.
-                This allows random iteration by using the exclude input to mark
-                visited providers.
-            operationId: Network Find Providers
-            security: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/FindProvidersArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/FindProvidersResult"
-
-    /network/find-providers2:
-        post:
-            description: |
-                Randomly sample providers for locations, groups, or devices,
-                which are active and in good health.
-                This allows random iteration by using the exclude input to mark
-                visited providers.
-            operationId: Network Find Providers 2
-            security: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/FindProviders2Args"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/FindProviders2Result"
-
-    /network/create-provider-spec:
-        post:
-            description: |
-                Create a spec object for `find-providers2` using a description
-                of the intended use of the network.
-            operationId: Network Find Providers Spec
-            security: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/CreateProviderSpecArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/CreateProviderSpecResult"
-
-    /network/ranking:
-        get:
-            description: |
-                Get leaderboard ranking of current network
-            operationId: Network Get Ranking
-            security:
-                - BearerAuth: []
-
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/NetworkRankingResult"
-
-    /network/ranking-visibility:
-        post:
-            description: |
-                Allow network to toggle leaderboard ranking visibility
-            operationId: Network Ranking Visibility
-            security:
-                - BearerAuth: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/SetNetworkRankingVisibilityArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/SetNetworkRankingVisibilityResult"
-
-
-
-    /wallet/balance:
-        get:
-            description: |
-                Get the balance for the USDC user custody wallet.
-                The user custody wallet allows BringYour to query the balance,
-                but the user must take actions against the wallet.
-            operationId: Wallet Balance
-            security:
-                - BearerAuth: []
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/WalletBalanceResult"
-
-    /wallet/validate-address:
-        post:
-            description: |
-                Validate a USDC wallet address on the user custody wallet chain.
-                This can be used to check whether an address can receive
-                a transfer out from the user custody wallet.
-                Please use this before initiating any transfer out to avoid lost funds.
-            operationId: Wallet Validate Address
-            security:
-                - BearerAuth: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/WalletValidateAddressArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/WalletValidateAddressResult"
-
-    /wallet/circle-init:
-        post:
-            description: |
-                Initialize the Circle USDC user self custody wallet.
-                This starts a process that must be completed by the user.
-            operationId: Wallet Circle Init
-            security:
-                - BearerAuth: []
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/WalletCircleInitResult"
-
-    /wallet/circle-transfer-out:
-        post:
-            description: |
-                Set up a transfer from the Circle USDC user self custody wallet 
-                to an address.
-                This starts a process that must be completed by the user.
-            operationId: Wallet Circle Init
-            security:
-                - BearerAuth: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/WalletCircleTransferOutArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/WalletCircleTransferOutResult"
-
-    /subscription/balance:
-        get:
-            description: |
-                Get the current subscription status and transfer balance.
-            operationId: Subscription Balance
-            security:
-                - BearerAuth: []
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/SubscriptionBalanceResult"
-
-    /subscription/check-balance-code:
-        post:
-            description: |
-                Check if the balance code is valid.
-            operationId: Subscription Check Balance Code
-            security:
-                - BearerAuth: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/SubscriptionCheckBalanceCodeArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/SubscriptionCheckBalanceCodeResult"
-
-    /subscription/redeem-balance-code:
-        post:
-            description: |
-                Redeem the balance code and add the transfer balance to the caller network.
-            operationId: Subscription Redeem Balance Code
-            security:
-                - BearerAuth: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/SubscriptionRedeemBalanceCodeArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/SubscriptionRedeemBalanceCodeResult"
-
-    /subscription/create-payment-id:
-        post:
-            description: |
-                Creates an anonymous payment identifier to be used with purchases.
-                This keeps network information out of the payment processor system.
-                For example in Google Play this is called the "obfuscated account id".
-            operationId: Subscription Create Payment Id
-            security:
-                - BearerAuth: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/SubscriptionCreatePaymentIdArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/SubscriptionCreatePaymentIdResult"
-
-    /device/add:
-        post:
-            description: |
-                Add a device, which can either be owned by the network or shared with the network.
-                The code provided can be either adoption code or a share code.
-                Once a code is added, the device becomes an associated device until confirmation.
-                If the device is a shared device, it will remain an associated device after confirmation.
-            operationId: Device Add
-            security:
-                - BearerAuth: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/DeviceAddArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/DeviceAddResult"
-
-    /device/create-share-code:
-        post:
-            description: |
-                Creates a code to share a device.
-            operationId: Device Create Share Code
-            security:
-                - BearerAuth: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/DeviceCreateShareCodeArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/DeviceCreateShareCodeResult"
-
-    /device/share-code/{code}/qr.png:
-        get:
-            description: |
-                A QR code that maps to a URL to add the shared device.
-                Send it to someone to scan to add the device.
-            operationId: Device Share Code QR
-            security:
-                - BearerAuth: []
-            parameters:
-                - in: path
-                  name: code
-                  schema:
-                    type: string
-                  required: true
-                  description: Share code
-            responses:
-                "200":
-                    content:
-                        image/png:
-                            schema:
-                                type: string
-                                format: binary
-
-    /device/share-status:
-        post:
-            description: |
-                The status of the shared device.
-                The status can be one of:
-                - unassociated
-                - associated pending confirmation
-                - associated
-            operationId: Device Share Status
-            security:
-                - BearerAuth: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/DeviceShareStatusArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/DeviceShareStatusResult"
-
-    /device/confirm-share:
-        post:
-            description: |
-                Confirm the share of a device.
-                This must be called from the side that initiates the share.
-            operationId: Device Confirm Share
-            security:
-                - BearerAuth: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/DeviceConfirmShareArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/DeviceConfirmShareResult"
-
-    /device/create-adopt-code:
-        post:
-            description: |
-                Creates a code to adopt a device.
-                The adopt code is valid for a limited time.
-            operationId: Device Create Adopt Code
-            security: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/DeviceCreateAdoptCodeArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/DeviceCreateAdoptCodeResult"
-
-    /device/adopt-code/{code}/qr.png:
-        get:
-            description: |
-                A QR code that maps to a URL to adopt the device.
-                Send it to someone to scan to adopt the device.
-            operationId: Device Adopt Code QR
-            security: []
-            parameters:
-                - in: path
-                  name: code
-                  schema:
-                    type: string
-                  required: true
-                  description: Adopt code
-            responses:
-                "200":
-                    content:
-                        image/png:
-                            schema:
-                                type: string
-                                format: binary
-
-    /device/adopt-status:
-        post:
-            description: |
-                The status of the adopt-code device.
-                The status can be one of:
-                - unassociated
-                - associated pending confirmation
-                - associated
-            operationId: Device Adopt Status
-            security: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/DeviceAdoptStatusArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/DeviceAdoptStatusResult"
-
-    /device/confirm-adopt:
-        post:
-            description: |
-                Confirm the adoption of a device.
-                This must be called from the side that initiates the adoption.
-            operationId: Device Confirm Adopt
-            security: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/DeviceConfirmAdoptArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/DeviceConfirmAdoptResult"
-
-    /device/remove-adopt-code:
-        post:
-            description: |
-                Remove an adopt code.
-                This must be called from the side that initiates the adoption.
-            operationId: Remove Adopt Code
-            security: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/DeviceRemoveAdoptCodeArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/DeviceRemoveAdoptCodeResult"
-
-    /device/associations:
-        get:
-            description: |
-                The devices associated with the caller network.
-                Associated devices are:
-                - pending adoption devices
-                - incoming shared devices (not owned by the caller network)
-                - outgoing shared devices (owned by the caller network)
-            operationId: Device Associations
-            security:
-                - BearerAuth: []
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/DeviceAssociationsResult"
-
-    /device/remove-association:
-        post:
-            description: |
-                Remove a device association.
-                The association can be any of:
-                - pending adoption device
-                - incoming shared device (not owned by the caller network)
-                - outgoing shared device (owned by the caller network)
-            operationId: Device Remove Association
-            security:
-                - BearerAuth: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/DeviceRemoveAssociationArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/DeviceRemoveAssociationResult"
-
-    /device/set-association-name:
-        post:
-            description: |
-                Set the name of the association.
-                To set the name of devices owned by the network, use `/device/set-name`.
-            operationId: Device Set Association Name
-            security:
-                - BearerAuth: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/DeviceSetAssociationNameArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/DeviceSetAssociationNameResult"
-
-    /device/set-name:
-        post:
-            description: |
-                Sets the name of a device owned by the network.
-                To set the name of devices shared with the network, use `/device/set-association-name`.
-            operationId: Network Set Device Name
-            security:
-                - BearerAuth: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/DeviceSetNameArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/DeviceSetNameResult"
-
-    /device/set-provide:
-        post:
-            description: |
-                Set the provide mode for a device.
-            operationId: Device Set Provide
-            security:
-                - BearerAuth: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/DeviceSetProvideArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/DeviceSetProvideResult"
-
-    /connect/control:
-        post:
-            description: |
-                Out-of-band control messages for the connect protocol.
-                Blocking request-response control messages need to be handled out-of-band
-                to resolve the possibility of dedlocks in the client sequence.
-            operationId: Connect Control
-            security:
-                - BearerAuth: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/ConnectControlArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/ConnectControlResult"
-
-    /hello:
-        get:
-            description: |
-                Simple hello to the network that returns some useful information.
-                This can be used for discovery.
-            operationId: Hello
-            security: []
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/HelloResult"
-
-    /account/payout-wallet:
-        post:
-            description: |
-                Set an existing account wallet as the wallet to receive network payments.
-            operationId: Account Set Payout Wallet
-            security:
-                - BearerAuth: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/SetPayoutWalletArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/SetPayoutWalletResult"
-        get:
-            description: |
-                Fetches the payout wallet associated with the network
-            operationId: Account Get Payout Wallet
-            security:
-                - BearerAuth: []
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/GetPayoutWalletResult"
-
-    /account/points:
-        get:
-            description: |
-                Retrieves account points earned. Eventually, users will be able to convert points for tokens
-            operationId: Account Get Points
-            security:
-                - BearerAuth: []
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/AccountPointsResult"
-
-    /account/wallet:
-        post:
-            description: |
-                Create a new wallet for your network. You can then use it as a payout wallet
-                by posting to /account/payout-wallet.
-            operationId: Account Create Wallet
-            security:
-                - BearerAuth: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/CreateAccountWalletExternalArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/CreateAccountWalletResult"
-
-    /account/wallets:
-        get:
-            description: |
-                Get a list of wallets associated with your network
-            operationId: Account Get Wallets
-            security:
-                - BearerAuth: []
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/GetAccountWalletsResult"
-
-    /account/wallets/remove:
-        post:
-            description: |
-                Remove a wallet from your list of account wallets
-            operationId: Account Remove Wallet
-            security:
-                - BearerAuth: []
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema:
-                            $ref: "#/components/schemas/RemoveWalletArgs"
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/RemoveWalletResult"
-
-    /account/referral-code:
-        get:
-            description: |
-                Unique network code to refer new users
-            operationId: Account Referral Code
-            security:
-                - BearerAuth: []
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/NetworkReferralResult"
-
-    /transfer/stats:
-        get:
-            description: |
-                Retrieves the paid and unpaid byte count provided to the network
-            operationId: Transfer Stats
-            security:
-                - BearerAuth: []
-            responses:
-                "200":
-                    content:
-                        application/json:
-                            schema:
-                                $ref: "#/components/schemas/TransferStatsResult"
+  /stats/last-90:
+    get:
+      description: |
+        Get network statistics for the last 90 days.
+        The statistics are updated approximately every 60s.
+      operationId: Stats Last 90
+      security: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatsResult"
+
+  /stats/providers:
+    get:
+      description: |
+        Get all providers in the caller network.
+        Each provider includes stats from the last 24 hours.
+      operationId: Stats Providers
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatsProvidersResult"
+
+  /stats/providers-last-n:
+    post:
+      description: |
+        Get all providers in the caller network.
+        Each provider includes stats from the last n hours.
+      operationId: Stats Providers Last N hours
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StatsProvidersArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatsProvidersResult"
+
+  /stats/provider-last-n:
+    post:
+      description: |
+        Get detailed stats on a single provider in the caller network.
+        This is meant to give the user complete visibility over usage.
+      operationId: Stats Provider Last N hours
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StatsProviderArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatsProviderResult"
+
+  /stats/leaderboard:
+    post:
+      description: |
+        Fetches top 100 current leaderboard. This data is refreshed every payout.
+      operationId: Stats Leaderboard
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GetLeaderboardArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LeaderboardResult"
+
+  /auth/login:
+    post:
+      description: |
+        Start a login for a user authority.
+        The user authority may be:
+        - email
+        - phone number
+        - Apple JWT
+        - Google JWT
+      operationId: Auth Login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuthLoginArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthLoginResult"
+
+  /auth/login-with-password:
+    post:
+      description: |
+        Password login for email and phone number.
+      operationId: Auth Login With Password
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuthLoginWithPasswordArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthLoginWithPasswordResult"
+
+  /auth/verify:
+    post:
+      description: |
+        Verify ownership of email or phone number.
+      operationId: Auth Verify
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuthVerifyArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthVerifyResult"
+
+  /auth/verify-send:
+    post:
+      description: |
+        Send verification code to email or phone number.
+      operationId: Auth Verify Send
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuthVerifySendArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthVerifySendResult"
+
+  /auth/password-reset:
+    post:
+      description: |
+        Send password reset code to email or phone number.
+      operationId: Auth Password Reset
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuthPasswordResetArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthPasswordResetResult"
+
+  /auth/password-set:
+    post:
+      description: |
+        Change password.
+      operationId: Auth Password Set
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuthPasswordSetArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthPasswordSetResult"
+
+  /auth/network-check:
+    post:
+      description: |
+        Check if the network name is available.
+        A new network name must satisfy:
+        - at least 3 characters different from an existing network name
+        - at least 8 characters
+        - domain name compatible (see RFC 5890)
+        - not contain the dash (-) character (BringYour subdomains are reverse-flattened to a single level using dashes)
+      operationId: Auth Network Check
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkCheckArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkCheckResult"
+
+  /auth/network-create:
+    post:
+      description: |
+        Create a new network.
+        A user authority can be associated with at most one network.
+      operationId: Auth Network Create
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkCreateArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkCreateResult"
+
+  /auth/network-delete:
+    post:
+      description: |
+        Delete network
+      operationId: Auth Network Delete
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkDeleteResult"
+
+  /auth/code-create:
+    post:
+      description: |
+        Create a limited use code (auth code) to share authentication
+        with connected apps and tools.
+        The code is tied to the caller session,
+        and will be expired with any of the caller's sessions.
+        Currently a code cannot be created for a client JWT
+        (from `/network/auth-client`).
+        This is a subset of an OAuth flow.
+      operationId: Auth Code Create
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuthCodeCreateArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthCodeCreateResult"
+
+  /auth/code-login:
+    post:
+      description: |
+        Authenticate with an auth code.
+        The returned session is tied to the session that created the auth code,
+        and will be expired with any of the creator's sessions.
+        This is a subset of an OAuth flow.
+      operationId: Auth Code Login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuthCodeLoginArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthCodeLoginResult"
+
+  /auth/upgrade-guest:
+    post:
+      description: |
+        Authenticates a guest user, migrates to a normal account
+      operationId: Upgrade Guest
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpgradeGuestArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpgradeGuestResult"
+
+  /network/auth-client:
+    post:
+      description: |
+        Gain permission to use the `connect` protocol as the requested clientId,
+        or assign a new clientId.
+        Each network can have at most 128 clientIds.
+        Above that number, new clientId requests will error until one or more
+        existing clientIds are removed.
+      operationId: Auth Network Client
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuthNetworkClientArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthNetworkClientResult"
+
+  /network/remove-client:
+    post:
+      description: |
+        Remove a client from the network.
+      operationId: Remove Network Client
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RemoveNetworkClientArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RemoveNetworkClientResult"
+
+  /network/clients:
+    get:
+      description: |
+        Get the latest status of all clients on this network.
+
+        Includes:
+
+        - Resident status, which is the platform counterpart
+        for the client that handles control commands.
+        - Connections, which are transports from the client to the platform.
+        Note there can be multiple active connections for a single client.
+        - Provide status
+      operationId: Network Clients
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkClientsResult"
+
+  /preferences/set-preferences:
+    post:
+      description: |
+        Set account preferences.
+      operationId: Preferences Set
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PreferencesSetArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PreferencesSetResult"
+
+  /preferences:
+    get:
+      description: |
+        Get account preferences.
+      operationId: Preferences Get
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PreferencesGetResult"
+
+  /feedback/send-feedback:
+    post:
+      description: |
+        Feedback.
+      operationId: Feedback Send
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FeedbackSendArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FeedbackSendResult"
+
+  /network/provider-locations:
+    get:
+      description: |
+        A list of locations and groups where there are at least one active provider
+        in good health.
+        Note that a location or group will need to be mapped to an actual provider
+        using `/network/find-providers`.
+      operationId: Network Provider Locations
+      security: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FindLocationsResult"
+
+  /network/find-provider-locations:
+    post:
+      description: |
+        Search for locations and groups that match a query,
+        where there are at least one active provider in good health.
+        The match algorithm accounts for typos and misspelling,
+        and the tolerance can be tuned in the input.
+        Note that a location or group will need to be mapped to an actual provider
+        using `/network/find-providers`.
+      operationId: Network Find Provider Locations
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FindLocationsArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FindLocationsResult"
+
+  /network/find-locations:
+    post:
+      description: |
+        Search for locations, groups, and devices that match a query,
+        regardless of whether an providers are active.
+      operationId: Network Find Locations
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FindLocationsArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FindLocationsResult"
+
+  /network/find-providers:
+    post:
+      description: |
+        Randomly sample providers that for a location or group,
+        which are active and in good health.
+        This allows random iteration by using the exclude input to mark
+        visited providers.
+      operationId: Network Find Providers
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FindProvidersArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FindProvidersResult"
+
+  /network/find-providers2:
+    post:
+      description: |
+        Randomly sample providers for locations, groups, or devices,
+        which are active and in good health.
+        This allows random iteration by using the exclude input to mark
+        visited providers.
+      operationId: Network Find Providers 2
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FindProviders2Args"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FindProviders2Result"
+
+  /network/create-provider-spec:
+    post:
+      description: |
+        Create a spec object for `find-providers2` using a description
+        of the intended use of the network.
+      operationId: Network Find Providers Spec
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateProviderSpecArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateProviderSpecResult"
+
+  /network/ranking:
+    get:
+      description: |
+        Get leaderboard ranking of current network
+      operationId: Network Get Ranking
+      security:
+        - BearerAuth: []
+
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkRankingResult"
+
+  /network/ranking-visibility:
+    post:
+      description: |
+        Allow network to toggle leaderboard ranking visibility
+      operationId: Network Ranking Visibility
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetNetworkRankingVisibilityArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SetNetworkRankingVisibilityResult"
+
+  /wallet/balance:
+    get:
+      description: |
+        Get the balance for the USDC user custody wallet.
+        The user custody wallet allows BringYour to query the balance,
+        but the user must take actions against the wallet.
+      operationId: Wallet Balance
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WalletBalanceResult"
+
+  /wallet/validate-address:
+    post:
+      description: |
+        Validate a USDC wallet address on the user custody wallet chain.
+        This can be used to check whether an address can receive
+        a transfer out from the user custody wallet.
+        Please use this before initiating any transfer out to avoid lost funds.
+      operationId: Wallet Validate Address
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WalletValidateAddressArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WalletValidateAddressResult"
+
+  /wallet/circle-init:
+    post:
+      description: |
+        Initialize the Circle USDC user self custody wallet.
+        This starts a process that must be completed by the user.
+      operationId: Wallet Circle Init
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WalletCircleInitResult"
+
+  /wallet/circle-transfer-out:
+    post:
+      description: |
+        Set up a transfer from the Circle USDC user self custody wallet
+        to an address.
+        This starts a process that must be completed by the user.
+      operationId: Wallet Circle Init
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WalletCircleTransferOutArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WalletCircleTransferOutResult"
+
+  /subscription/balance:
+    get:
+      description: |
+        Get the current subscription status and transfer balance.
+      operationId: Subscription Balance
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionBalanceResult"
+
+  /subscription/check-balance-code:
+    post:
+      description: |
+        Check if the balance code is valid.
+      operationId: Subscription Check Balance Code
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubscriptionCheckBalanceCodeArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionCheckBalanceCodeResult"
+
+  /subscription/redeem-balance-code:
+    post:
+      description: |
+        Redeem the balance code and add the transfer balance to the caller network.
+      operationId: Subscription Redeem Balance Code
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubscriptionRedeemBalanceCodeArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionRedeemBalanceCodeResult"
+
+  /subscription/create-payment-id:
+    post:
+      description: |
+        Creates an anonymous payment identifier to be used with purchases.
+        This keeps network information out of the payment processor system.
+        For example in Google Play this is called the "obfuscated account id".
+      operationId: Subscription Create Payment Id
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubscriptionCreatePaymentIdArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionCreatePaymentIdResult"
+
+  /device/add:
+    post:
+      description: |
+        Add a device, which can either be owned by the network or shared with the network.
+        The code provided can be either adoption code or a share code.
+        Once a code is added, the device becomes an associated device until confirmation.
+        If the device is a shared device, it will remain an associated device after confirmation.
+      operationId: Device Add
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeviceAddArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceAddResult"
+
+  /device/create-share-code:
+    post:
+      description: |
+        Creates a code to share a device.
+      operationId: Device Create Share Code
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeviceCreateShareCodeArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceCreateShareCodeResult"
+
+  /device/share-code/{code}/qr.png:
+    get:
+      description: |
+        A QR code that maps to a URL to add the shared device.
+        Send it to someone to scan to add the device.
+      operationId: Device Share Code QR
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: path
+          name: code
+          schema:
+            type: string
+          required: true
+          description: Share code
+      responses:
+        "200":
+          content:
+            image/png:
+              schema:
+                type: string
+                format: binary
+
+  /device/share-status:
+    post:
+      description: |
+        The status of the shared device.
+        The status can be one of:
+        - unassociated
+        - associated pending confirmation
+        - associated
+      operationId: Device Share Status
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeviceShareStatusArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceShareStatusResult"
+
+  /device/confirm-share:
+    post:
+      description: |
+        Confirm the share of a device.
+        This must be called from the side that initiates the share.
+      operationId: Device Confirm Share
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeviceConfirmShareArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceConfirmShareResult"
+
+  /device/create-adopt-code:
+    post:
+      description: |
+        Creates a code to adopt a device.
+        The adopt code is valid for a limited time.
+      operationId: Device Create Adopt Code
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeviceCreateAdoptCodeArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceCreateAdoptCodeResult"
+
+  /device/adopt-code/{code}/qr.png:
+    get:
+      description: |
+        A QR code that maps to a URL to adopt the device.
+        Send it to someone to scan to adopt the device.
+      operationId: Device Adopt Code QR
+      security: []
+      parameters:
+        - in: path
+          name: code
+          schema:
+            type: string
+          required: true
+          description: Adopt code
+      responses:
+        "200":
+          content:
+            image/png:
+              schema:
+                type: string
+                format: binary
+
+  /device/adopt-status:
+    post:
+      description: |
+        The status of the adopt-code device.
+        The status can be one of:
+        - unassociated
+        - associated pending confirmation
+        - associated
+      operationId: Device Adopt Status
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeviceAdoptStatusArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceAdoptStatusResult"
+
+  /device/confirm-adopt:
+    post:
+      description: |
+        Confirm the adoption of a device.
+        This must be called from the side that initiates the adoption.
+      operationId: Device Confirm Adopt
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeviceConfirmAdoptArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceConfirmAdoptResult"
+
+  /device/remove-adopt-code:
+    post:
+      description: |
+        Remove an adopt code.
+        This must be called from the side that initiates the adoption.
+      operationId: Remove Adopt Code
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeviceRemoveAdoptCodeArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceRemoveAdoptCodeResult"
+
+  /device/associations:
+    get:
+      description: |
+        The devices associated with the caller network.
+        Associated devices are:
+        - pending adoption devices
+        - incoming shared devices (not owned by the caller network)
+        - outgoing shared devices (owned by the caller network)
+      operationId: Device Associations
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceAssociationsResult"
+
+  /device/remove-association:
+    post:
+      description: |
+        Remove a device association.
+        The association can be any of:
+        - pending adoption device
+        - incoming shared device (not owned by the caller network)
+        - outgoing shared device (owned by the caller network)
+      operationId: Device Remove Association
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeviceRemoveAssociationArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceRemoveAssociationResult"
+
+  /device/set-association-name:
+    post:
+      description: |
+        Set the name of the association.
+        To set the name of devices owned by the network, use `/device/set-name`.
+      operationId: Device Set Association Name
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeviceSetAssociationNameArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceSetAssociationNameResult"
+
+  /device/set-name:
+    post:
+      description: |
+        Sets the name of a device owned by the network.
+        To set the name of devices shared with the network, use `/device/set-association-name`.
+      operationId: Network Set Device Name
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeviceSetNameArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceSetNameResult"
+
+  /device/set-provide:
+    post:
+      description: |
+        Set the provide mode for a device.
+      operationId: Device Set Provide
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeviceSetProvideArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceSetProvideResult"
+
+  /connect/control:
+    post:
+      description: |
+        Out-of-band control messages for the connect protocol.
+        Blocking request-response control messages need to be handled out-of-band
+        to resolve the possibility of dedlocks in the client sequence.
+      operationId: Connect Control
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConnectControlArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConnectControlResult"
+
+  /hello:
+    get:
+      description: |
+        Simple hello to the network that returns some useful information.
+        This can be used for discovery.
+      operationId: Hello
+      security: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HelloResult"
+
+  /account/payout-wallet:
+    post:
+      description: |
+        Set an existing account wallet as the wallet to receive network payments.
+      operationId: Account Set Payout Wallet
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetPayoutWalletArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SetPayoutWalletResult"
+    get:
+      description: |
+        Fetches the payout wallet associated with the network
+      operationId: Account Get Payout Wallet
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetPayoutWalletResult"
+
+  /account/points:
+    get:
+      description: |
+        Retrieves account points earned. Eventually, users will be able to convert points for tokens
+      operationId: Account Get Points
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountPointsResult"
+
+  /account/wallet:
+    post:
+      description: |
+        Create a new wallet for your network. You can then use it as a payout wallet
+        by posting to /account/payout-wallet.
+      operationId: Account Create Wallet
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAccountWalletExternalArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateAccountWalletResult"
+
+  /account/wallets:
+    get:
+      description: |
+        Get a list of wallets associated with your network
+      operationId: Account Get Wallets
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetAccountWalletsResult"
+
+  /account/wallets/remove:
+    post:
+      description: |
+        Remove a wallet from your list of account wallets
+      operationId: Account Remove Wallet
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RemoveWalletArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RemoveWalletResult"
+
+  /account/referral-code:
+    get:
+      description: |
+        Unique network code to refer new users
+      operationId: Account Referral Code
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkReferralResult"
+
+  /account/referral-network:
+    get:
+      description: |
+        Get the network that was referred the authenticated network
+      operationId: Account Referral Network
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReferralNetworkResult"
+
+  /account/set-referral:
+    post:
+      description: |
+        Set the parent referral network for the authenticated network.
+      operationId: Account Set Referral
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetNetworkReferralArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SetNetworkReferralResult"
+
+  /transfer/stats:
+    get:
+      description: |
+        Retrieves the paid and unpaid byte count provided to the network
+      operationId: Transfer Stats
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TransferStatsResult"
 
 components:
-    securitySchemes:
-        BearerAuth:
-            type: http
-            scheme: bearer
-            description: BringYour JWT
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: BringYour JWT
 
-    schemas:
-        ProvideMode:
+  schemas:
+    ProvideMode:
+      type: integer
+      oneOf:
+        - title: ProvideModeDefault
+          const: -1
+        - title: ProvideModeNone
+          const: 0
+        - title: ProvideModeNetwork
+          const: 1
+        - title: ProvideModeFriendsAndFamily
+          const: 2
+        - title: ProvideModePublic
+          const: 3
+        - title: ProvideModeStream
+          const: 4
+
+    StatsResult:
+      type: object
+      properties:
+        lookback:
+          type: integer
+        created_time:
+          description: Unix epoch time UTC
+          type: integer
+        all_transfer_data:
+          type: object
+          description: yyyy-mm-dd to count
+          additionalProperties:
+            x-additionalPropertiesName: yyyy-mm-dd
             type: integer
-            oneOf:
-            - title: ProvideModeDefault
-              const: -1
-            - title: ProvideModeNone
-              const: 0
-            - title: ProvideModeNetwork
-              const: 1
-            - title: ProvideModeFriendsAndFamily
-              const: 2
-            - title: ProvideModePublic
-              const: 3
-            - title: ProvideModeStream
-              const: 4
+        all_transfer_summary:
+          type: integer
+        all_transfer_summary_rate:
+          type: integer
+        all_packets_data:
+          type: object
+          description: yyyy-mm-dd to count
+          additionalProperties:
+            x-additionalPropertiesName: yyyy-mm-dd
+            type: integer
+        all_packets_summary:
+          type: integer
+        all_packets_summary_rate:
+          type: integer
+        providers_data:
+          type: object
+          description: yyyy-mm-dd to count
+          additionalProperties:
+            x-additionalPropertiesName: yyyy-mm-dd
+            type: integer
+        providers_superspeed_data:
+          type: object
+          description: yyyy-mm-dd to count
+          additionalProperties:
+            x-additionalPropertiesName: yyyy-mm-dd
+            type: integer
+        providers_summary:
+          type: integer
+        providers_summary_superspeed:
+          type: integer
+        countries_data:
+          type: object
+          description: yyyy-mm-dd to count
+          additionalProperties:
+            x-additionalPropertiesName: yyyy-mm-dd
+            type: integer
+        countries_summary:
+          type: integer
+        regions_data:
+          type: object
+          description: yyyy-mm-dd to count
+          additionalProperties:
+            x-additionalPropertiesName: yyyy-mm-dd
+            type: integer
+        regions_summary:
+          type: integer
+        cities_data:
+          type: object
+          description: yyyy-mm-dd to count
+          additionalProperties:
+            x-additionalPropertiesName: yyyy-mm-dd
+            type: integer
+        cities_summary:
+          type: integer
+        extender_transfer_data:
+          type: object
+          description: yyyy-mm-dd to count
+          additionalProperties:
+            x-additionalPropertiesName: yyyy-mm-dd
+            type: integer
+        extender_transfer_summary:
+          type: integer
+        extender_transfer_summary_rate:
+          type: integer
+        extenders_data:
+          type: object
+          description: yyyy-mm-dd to count
+          additionalProperties:
+            x-additionalPropertiesName: yyyy-mm-dd
+            type: integer
+        extenders_superspeed_data:
+          type: object
+          description: yyyy-mm-dd to count
+          additionalProperties:
+            x-additionalPropertiesName: yyyy-mm-dd
+            type: integer
+        extenders_summary:
+          type: integer
+        extenders_summary_superspeed:
+          type: integer
+        networks_data:
+          type: object
+          description: yyyy-mm-dd to count
+          additionalProperties:
+            x-additionalPropertiesName: yyyy-mm-dd
+            type: integer
+        networks_summary:
+          type: integer
+        devices_data:
+          type: object
+          description: yyyy-mm-dd to count
+          additionalProperties:
+            x-additionalPropertiesName: yyyy-mm-dd
+            type: integer
+        devices_summary:
+          type: integer
 
-        StatsResult:
+    AuthLoginArgs:
+      type: object
+      properties:
+        user_auth:
+          description: email or phone number
+          type: string
+        auth_jwt:
+          type: string
+        auth_jwt_type:
+          type: string
+          enum:
+            - apple
+            - google
+        wallet_auth:
+          $ref: "#/components/schemas/WalletAuthArgs"
+
+    AuthLoginResult:
+      type: object
+      properties:
+        user_name:
+          type: string
+        user_auth:
+          description: email or phone number
+          type: string
+        auth_allowed:
+          type: array
+          items:
+            type: string
+            enum:
+              - password
+              - apple
+              - google
+        error:
+          type: object
+          properties:
+            suggested_user_auth:
+              type: string
+              enum:
+                - password
+                - apple
+                - google
+            message:
+              type: string
+        network:
+          type: object
+          properties:
+            by_jwt:
+              type: string
+        wallet_auth:
+          $ref: "#/components/schemas/WalletAuthArgs"
+
+    AuthLoginWithPasswordArgs:
+      type: object
+      properties:
+        user_auth:
+          description: email or phone number
+          type: string
+        password:
+          type: string
+
+    AuthLoginWithPasswordResult:
+      type: object
+      properties:
+        verification_required:
+          type: object
+          properties:
+            user_auth:
+              description: email or phone number
+              type: string
+        network:
+          type: object
+          properties:
+            by_jwt:
+              type: string
+            name:
+              type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    AuthVerifyArgs:
+      type: object
+      properties:
+        user_auth:
+          description: email or phone number
+          type: string
+        verify_code:
+          type: string
+
+    AuthVerifyResult:
+      type: object
+      properties:
+        network:
+          type: object
+          by_jwt:
+            type: string
+        error:
+          type: object
+          message:
+            type: string
+
+    AuthVerifySendArgs:
+      type: object
+      properties:
+        user_auth:
+          description: email or phone number
+          type: string
+        use_numeric:
+          description: optionally create a numeric 6 digit code instead of the default 8 digit
+          type: boolean
+
+    AuthVerifySendResult:
+      type: object
+      properties:
+        user_auth:
+          description: email or phone number
+          type: string
+
+    AuthPasswordResetArgs:
+      type: object
+      properties:
+        user_auth:
+          description: email or phone number
+          type: string
+
+    AuthPasswordResetResult:
+      type: object
+      properties:
+        user_auth:
+          description: email or phone number
+          type: string
+
+    AuthPasswordSetArgs:
+      type: object
+      properties:
+        reset_code:
+          type: string
+        password:
+          type: string
+
+    AuthPasswordSetResult:
+      type: object
+      properties: {}
+
+    NetworkCheckArgs:
+      type: object
+      properties:
+        network_name:
+          type: string
+
+    NetworkCheckResult:
+      type: object
+      properties:
+        available:
+          type: boolean
+
+    NetworkCreateArgs:
+      type: object
+      properties:
+        user_name:
+          type: string
+        user_auth:
+          description: email or phone number
+          type: string
+        auth_jwt:
+          type: string
+        auth_jwt_type:
+          type: string
+          enum:
+            - apple
+            - google
+        password:
+          type: string
+        network_name:
+          type: string
+        terms:
+          description: user consent to accept terms of service
+          type: boolean
+        wallet_auth:
+          $ref: "#/components/schemas/WalletAuthArgs"
+
+    NetworkCreateResult:
+      type: object
+      properties:
+        network:
+          type: object
+          properties:
+            by_jwt:
+              type: string
+            network_id:
+              description: uuid
+              type: string
+            network_name:
+              type: string
+        verification_required:
+          type: object
+          properties:
+            user_auth:
+              description: email or phone number
+              type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    NetworkDeleteResult:
+      type: object
+      properties: {}
+
+    UpgradeGuestArgs:
+      type: object
+      properties:
+        user_auth:
+          description: email or phone number
+          type: string
+        auth_jwt:
+          type: string
+        auth_jwt_type:
+          type: string
+          enum:
+            - apple
+            - google
+        password:
+          type: string
+        network_name:
+          type: string
+        wallet_auth:
+          $ref: "#/components/schemas/WalletAuthArgs"
+
+    UpgradeGuestResult:
+      type: object
+      properties:
+        network:
+          type: object
+          properties:
+            by_jwt:
+              type: string
+        verification_required:
+          type: object
+          properties:
+            user_auth:
+              description: email or phone number
+              type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    AuthCodeCreateArgs:
+      type: object
+      properties:
+        duration_minutes:
+          type: number
+        uses:
+          type: integer
+
+    AuthCodeCreateResult:
+      type: object
+      properties:
+        auth_code:
+          type: string
+        duration_minutes:
+          type: number
+        uses:
+          type: integer
+        error:
+          type: object
+          properties:
+            auth_code_limit_exceeded:
+              type: boolean
+            message:
+              type: string
+
+    AuthCodeLoginArgs:
+      type: object
+      properties:
+        auth_code:
+          type: string
+
+    AuthCodeLoginResult:
+      type: object
+      properties:
+        by_jwt:
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    AuthNetworkClientArgs:
+      type: object
+      properties:
+        client_id:
+          description: udid. Optional. If this is given, it must currently exist in the network. Omit this to assign a new client id.
+          type: string
+        description:
+          description: If this is a new device, sets the device name to the description of the device.
+          type: string
+        device_spec:
+          description: If this is a new device, sets the device spec.
+          type: string
+        derived_client_id:
+          description: udid. Optional. |
+            The client that the new client is derived from.
+            If this is called with a client jwt, the derived client id is inferred from the jwt.
+          type: string
+
+    AuthNetworkClientResult:
+      type: object
+      properties:
+        by_client_jwt:
+          type: string
+        error:
+          type: object
+          properties:
+            client_limit_exceeded:
+              type: boolean
+            message:
+              type: string
+
+    RemoveNetworkClientArgs:
+      type: object
+      properties:
+        client_id:
+          description: udid
+          type: string
+
+    RemoveNetworkClientResult:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    NetworkClientsResult:
+      type: object
+      properties:
+        clients:
+          type: array
+          items:
             type: object
             properties:
-                lookback:
-                    type: integer
-                created_time:
-                    description: Unix epoch time UTC
-                    type: integer
-                all_transfer_data:
-                    type: object
-                    description: yyyy-mm-dd to count
-                    additionalProperties:
-                        x-additionalPropertiesName: yyyy-mm-dd
-                        type: integer
-                all_transfer_summary:
-                    type: integer
-                all_transfer_summary_rate:
-                    type: integer
-                all_packets_data:
-                    type: object
-                    description: yyyy-mm-dd to count
-                    additionalProperties:
-                        x-additionalPropertiesName: yyyy-mm-dd
-                        type: integer
-                all_packets_summary:
-                    type: integer
-                all_packets_summary_rate:
-                    type: integer
-                providers_data:
-                    type: object
-                    description: yyyy-mm-dd to count
-                    additionalProperties:
-                        x-additionalPropertiesName: yyyy-mm-dd
-                        type: integer
-                providers_superspeed_data:
-                    type: object
-                    description: yyyy-mm-dd to count
-                    additionalProperties:
-                        x-additionalPropertiesName: yyyy-mm-dd
-                        type: integer
-                providers_summary:
-                    type: integer
-                providers_summary_superspeed:
-                    type: integer
-                countries_data:
-                    type: object
-                    description: yyyy-mm-dd to count
-                    additionalProperties:
-                        x-additionalPropertiesName: yyyy-mm-dd
-                        type: integer
-                countries_summary:
-                    type: integer
-                regions_data:
-                    type: object
-                    description: yyyy-mm-dd to count
-                    additionalProperties:
-                        x-additionalPropertiesName: yyyy-mm-dd
-                        type: integer
-                regions_summary:
-                    type: integer
-                cities_data:
-                    type: object
-                    description: yyyy-mm-dd to count
-                    additionalProperties:
-                        x-additionalPropertiesName: yyyy-mm-dd
-                        type: integer
-                cities_summary:
-                    type: integer
-                extender_transfer_data:
-                    type: object
-                    description: yyyy-mm-dd to count
-                    additionalProperties:
-                        x-additionalPropertiesName: yyyy-mm-dd
-                        type: integer
-                extender_transfer_summary:
-                    type: integer
-                extender_transfer_summary_rate:
-                    type: integer
-                extenders_data:
-                    type: object
-                    description: yyyy-mm-dd to count
-                    additionalProperties:
-                        x-additionalPropertiesName: yyyy-mm-dd
-                        type: integer
-                extenders_superspeed_data:
-                    type: object
-                    description: yyyy-mm-dd to count
-                    additionalProperties:
-                        x-additionalPropertiesName: yyyy-mm-dd
-                        type: integer
-                extenders_summary:
-                    type: integer
-                extenders_summary_superspeed:
-                    type: integer
-                networks_data:
-                    type: object
-                    description: yyyy-mm-dd to count
-                    additionalProperties:
-                        x-additionalPropertiesName: yyyy-mm-dd
-                        type: integer
-                networks_summary:
-                    type: integer
-                devices_data:
-                    type: object
-                    description: yyyy-mm-dd to count
-                    additionalProperties:
-                        x-additionalPropertiesName: yyyy-mm-dd
-                        type: integer
-                devices_summary:
-                    type: integer
-
-        AuthLoginArgs:
-            type: object
-            properties:
-                user_auth:
-                    description: email or phone number
-                    type: string
-                auth_jwt:
-                    type: string
-                auth_jwt_type:
-                    type: string
-                    enum:
-                        - apple
-                        - google
-                wallet_auth:
-                    $ref: "#/components/schemas/WalletAuthArgs"
-
-        AuthLoginResult:
-            type: object
-            properties:
-                user_name:
-                    type: string
-                user_auth:
-                    description: email or phone number
-                    type: string
-                auth_allowed:
-                    type: array
-                    items:
-                        type: string
-                        enum:
-                            - password
-                            - apple
-                            - google
-                error:
-                    type: object
-                    properties:
-                        suggested_user_auth:
-                            type: string
-                            enum:
-                                - password
-                                - apple
-                                - google
-                        message:
-                            type: string
-                network:
-                    type: object
-                    properties:
-                        by_jwt:
-                            type: string
-                wallet_auth:
-                    $ref: "#/components/schemas/WalletAuthArgs"
-
-        AuthLoginWithPasswordArgs:
-            type: object
-            properties:
-                user_auth:
-                    description: email or phone number
-                    type: string
-                password:
-                    type: string
-
-        AuthLoginWithPasswordResult:
-            type: object
-            properties:
-                verification_required:
-                    type: object
-                    properties:
-                        user_auth:
-                            description: email or phone number
-                            type: string
-                network:
-                    type: object
-                    properties:
-                        by_jwt:
-                            type: string
-                        name:
-                            type: string
-                error:
-                    type: object
-                    properties:
-                        message:
-                            type: string
-
-        AuthVerifyArgs:
-            type: object
-            properties:
-                user_auth:
-                    description: email or phone number
-                    type: string
-                verify_code:
-                    type: string
-
-        AuthVerifyResult:
-            type: object
-            properties:
-                network:
-                    type: object
-                    by_jwt:
-                        type: string
-                error:
-                    type: object
-                    message:
-                        type: string
-
-        AuthVerifySendArgs:
-            type: object
-            properties:
-                user_auth:
-                    description: email or phone number
-                    type: string
-                use_numeric:
-                    description: optionally create a numeric 6 digit code instead of the default 8 digit
-                    type: boolean
-
-        AuthVerifySendResult:
-            type: object
-            properties:
-                user_auth:
-                    description: email or phone number
-                    type: string
-
-        AuthPasswordResetArgs:
-            type: object
-            properties:
-                user_auth:
-                    description: email or phone number
-                    type: string
-
-        AuthPasswordResetResult:
-            type: object
-            properties:
-                user_auth:
-                    description: email or phone number
-                    type: string
-
-        AuthPasswordSetArgs:
-            type: object
-            properties:
-                reset_code:
-                    type: string
-                password:
-                    type: string
-
-        AuthPasswordSetResult:
-            type: object
-            properties: {}
-
-        NetworkCheckArgs:
-            type: object
-            properties:
-                network_name:
-                    type: string
-
-        NetworkCheckResult:
-            type: object
-            properties:
-                available:
-                    type: boolean
-
-        NetworkCreateArgs:
-            type: object
-            properties:
-                user_name:
-                    type: string
-                user_auth:
-                    description: email or phone number
-                    type: string
-                auth_jwt:
-                    type: string
-                auth_jwt_type:
-                    type: string
-                    enum:
-                        - apple
-                        - google
-                password:
-                    type: string
-                network_name:
-                    type: string
-                terms:
-                    description: user consent to accept terms of service
-                    type: boolean
-                wallet_auth:
-                    $ref: "#/components/schemas/WalletAuthArgs"
-
-        NetworkCreateResult:
-            type: object
-            properties:
-                network:
-                    type: object
-                    properties:
-                        by_jwt:
-                            type: string
-                        network_id:
-                            description: uuid
-                            type: string
-                        network_name:
-                            type: string
-                verification_required:
-                    type: object
-                    properties:
-                        user_auth:
-                            description: email or phone number
-                            type: string
-                error:
-                    type: object
-                    properties:
-                        message:
-                            type: string
-
-        NetworkDeleteResult:
-            type: object
-            properties: {}
-
-        UpgradeGuestArgs:
-            type: object
-            properties:
-                user_auth:
-                    description: email or phone number
-                    type: string
-                auth_jwt:
-                    type: string
-                auth_jwt_type:
-                    type: string
-                    enum:
-                        - apple
-                        - google
-                password:
-                    type: string
-                network_name:
-                    type: string
-                wallet_auth:
-                    $ref: "#/components/schemas/WalletAuthArgs"
-
-        UpgradeGuestResult:
-            type: object
-            properties:
-                network:
-                    type: object
-                    properties:
-                        by_jwt:
-                            type: string
-                verification_required:
-                    type: object
-                    properties:
-                        user_auth:
-                            description: email or phone number
-                            type: string
-                error:
-                    type: object
-                    properties:
-                        message:
-                            type: string
-
-        AuthCodeCreateArgs:
-            type: object
-            properties:
-                duration_minutes:
-                    type: number
-                uses:
-                    type: integer
-
-        AuthCodeCreateResult:
-            type: object
-            properties:
-                auth_code:
-                    type: string
-                duration_minutes:
-                    type: number
-                uses:
-                    type: integer
-                error:
-                    type: object
-                    properties:
-                        auth_code_limit_exceeded:
-                            type: boolean
-                        message:
-                            type: string
-
-        AuthCodeLoginArgs:
-            type: object
-            properties:
-                auth_code:
-                    type: string
-
-        AuthCodeLoginResult:
-            type: object
-            properties:
-                by_jwt:
-                    type: string
-                error:
-                    type: object
-                    properties:
-                        message:
-                            type: string
-
-        AuthNetworkClientArgs:
-            type: object
-            properties:
-                client_id:
-                    description: udid. Optional. If this is given, it must currently exist in the network. Omit this to assign a new client id.
-                    type: string
-                description:
-                    description: If this is a new device, sets the device name to the description of the device.
-                    type: string
-                device_spec:
-                    description: If this is a new device, sets the device spec.
-                    type: string
-                derived_client_id:
-                    description: udid. Optional. |
-                        The client that the new client is derived from. 
-                        If this is called with a client jwt, the derived client id is inferred from the jwt.
-                    type: string
-
-        AuthNetworkClientResult:
-            type: object
-            properties:
-                by_client_jwt:
-                    type: string
-                error:
-                    type: object
-                    properties:
-                        client_limit_exceeded:
-                            type: boolean
-                        message:
-                            type: string
-
-        RemoveNetworkClientArgs:
-            type: object
-            properties:
-                client_id:
+              client_id:
+                description: udid
+                type: string
+              device_id:
+                description: udid
+                type: string
+              network_id:
+                description: udid
+                type: string
+              description:
+                type: string
+              device_name:
+                type: string
+              device_spec:
+                type: string
+              create_time:
+                type: string
+              auth_time:
+                type: string
+              resident:
+                type: object
+                properties:
+                  client_id:
                     description: udid
                     type: string
-
-        RemoveNetworkClientResult:
-            type: object
-            properties:
-                error:
-                    type: object
-                    properties:
-                        message:
-                            type: string
-
-        NetworkClientsResult:
-            type: object
-            properties:
-                clients:
-                    type: array
-                    items:
-                        type: object
-                        properties:
-                            client_id:
-                                description: udid
-                                type: string
-                            device_id:
-                                description: udid
-                                type: string
-                            network_id:
-                                description: udid
-                                type: string
-                            description:
-                                type: string
-                            device_name:
-                                type: string
-                            device_spec:
-                                type: string
-                            create_time:
-                                type: string
-                            auth_time:
-                                type: string
-                            resident:
-                                type: object
-                                properties:
-                                    client_id:
-                                        description: udid
-                                        type: string
-                                    instance_id:
-                                        description: udid
-                                        type: string
-                                    resident_id:
-                                        description: udid
-                                        type: string
-                                    resident_host:
-                                        type: string
-                                    resident_service:
-                                        type: string
-                                    resident_block:
-                                        type: string
-                                    resident_internal_ports:
-                                        type: array
-                                        items:
-                                            type: integer
-                            provide_mode:
-                                $ref: "#/components/schemas/ProvideMode"
-                            connections:
-                                type: array
-                                items:
-                                    type: object
-                                    properties:
-                                        client_id:
-                                            description: udid
-                                            type: string
-                                        connection_id:
-                                            description: udid
-                                            type: string
-                                        connect_time:
-                                            type: string
-                                        disconnect_time:
-                                            type: string
-                                        connection_host:
-                                            type: string
-                                        connection_service:
-                                            type: string
-                                        connection_block:
-                                            type: string'
-
-        PreferencesSetArgs:
-            type: object
-            properties:
-                product_updates:
-                    type: boolean
-
-        PreferencesSetResult:
-            type: object
-            properties: {}
-
-        PreferencesGetResult:
-            type: object
-            properties:
-                product_updates:
-                    type: boolean
-
-        FeedbackSendArgs:
-            type: object
-            properties:
-                uses:
-                    type: object
-                    properties:
-                        personal:
-                            type: boolean
-                        business:
-                            type: boolean
-                needs:
-                    type: object
-                    properties:
-                        private:
-                            type: boolean
-                        safe:
-                            type: boolean
-                        global:
-                            type: boolean
-                        collaborate:
-                            type: boolean
-                        app_control:
-                            type: boolean
-                        block_data_brokers:
-                            type: boolean
-                        block_ads:
-                            type: boolean
-                        focus:
-                            type: boolean
-                        connect_servers:
-                            type: boolean
-                        run_servers:
-                            type: boolean
-                        prevent_cyber:
-                            type: boolean
-                        audit:
-                            type: boolean
-                        zero_trust:
-                            type: boolean
-                        visualize:
-                            type: boolean
-                        other:
-                            type: string
-                star_count: 
-                    type: integer
-
-        FeedbackSendResult:
-            type: object
-            properties: {}
-
-        FindLocationsArgs:
-            type: object
-            properties:
-                query:
-                    type: string
-                max_distance_fraction:
-                    type: number
-                enable_max_distance_fraction:
-                    type: boolean
-
-        FindLocationsResult:
-            type: object
-            properties:
-                # specs can be directly passed to `find-providers2` to enumerate clients for this result
-                specs:
-                    type: array
-                    items:
-                        $ref: "#/components/schemas/ProviderSpec"
-                groups:
-                    type: array
-                    items:
-                        type: object
-                        properties:
-                            location_group_id:
-                                description: udid
-                                type: string
-                            name:
-                                type: string
-                            provider_count:
-                                type: integer
-                            promoted:
-                                type: boolean
-                            match_distance:
-                                type: integer
-                locations:
-                    type: array
-                    items:
-                        type: object
-                        properties:
-                            location_id:
-                                description: udid
-                                type: string
-                            location_type:
-                                type: string
-                                enum:
-                                    - city
-                                    - region
-                                    - country
-                            name:
-                                type: string
-                            city:
-                                type: string
-                            city_location_id:
-                                description: udid
-                                type: string
-                            region:
-                                type: string
-                            region_location_id:
-                                description: udid
-                                type: string
-                            country:
-                                type: string
-                            country_location_id:
-                                description: udid
-                                type: string
-                            country_code:
-                                type: string
-                            provider_count:
-                                type: integer
-                            match_distance:
-                                type: integer
-                devices:
-                    type: array
-                    items:
-                        type: object
-                        properties:
-                            client_id:
-                                description: udid
-                                type: string
-                            device_name:
-                                type: string
-
-        FindProvidersArgs:
-            type: object
-            properties:
-                location_id:
+                  instance_id:
                     description: udid
                     type: string
-                location_group_id:
+                  resident_id:
                     description: udid
                     type: string
-                count:
-                    type: integer
-                exclude_location_ids:
+                  resident_host:
+                    type: string
+                  resident_service:
+                    type: string
+                  resident_block:
+                    type: string
+                  resident_internal_ports:
                     type: array
                     items:
-                        description: udid
-                        type: string
-
-        FindProvidersResult:
-            type: object
-            properties:
-                client_ids:
-                    type: array
-                    items:
-                        description: udid
-                        type: string
-
-        ProviderSpec:
-            type: object
-            properties:
-                location_id:
-                    description: udid
-                    type: string
-                location_group_id:
-                    description: udid
-                    type: string
-                client_id:
-                    description: udid
-                    type: string
-                best_available:
-                    type: boolean
-
-        FindProviders2Args:
-            type: object
-            properties:
-                # specs are unioned (or)
-                specs:
-                    type: array
-                    items:
-                        $ref: "#/components/schemas/ProviderSpec"
-                count:
-                    type: integer
-                exclude_client_ids:
-                    type: array
-                    items:
-                        description: udid
-                        type: string
-                exclude_destinations:
-                    type: array
-                    items:
-                        type: array
-                        items:
-                            description: udid
-                            type: string
-
-        FindProviders2Result:
-            type: object
-            properties:
-                providers:
-                    type: array
-                    items:
-                        type: object
-                        properties:
-                            client_id:
-                                description: udid
-                                type: string
-                            estimated_bytes_per_second:
-                                type: integer
-                            intermediary_ids:
-                                type: array
-                                items:
-                                    description: udid
-                                    type: string
-
-        CreateProviderSpecArgs:
-            type: object
-            properties:
-                query:
-                    description: description of the intended use of the connection
-                    type: string
-
-        CreateProviderSpecResult:
-            type: object
-            properties:
-                # specs are unioned (or)
-                specs:
-                    type: array
-                    items:
-                        $ref: "#/components/schemas/ProviderSpec"
-
-        WalletBalanceResult:
-            type: object
-            properties:
-                wallet_info:
-                    type: object
-                    properties:
-                        wallet_id:
-                            type: string
-                        token_id:
-                            type: string
-                        blockchain:
-                            type: string
-                        blockchain_symbol:
-                            type: string
-                        create_date:
-                            type: string
-                        balance_usdc_nano_cents:
-                            type: integer
-                        address:
-                            type: string
-
-        WalletValidateAddressArgs:
-            type: object
-            properties:
-                address:
-                    type: string
-
-        WalletValidateAddressResult:
-            type: object
-            properties:
-                valid:
-                    type: boolean
-
-        WalletCircleInitResult:
-            type: object
-            properties:
-                user_token:
-                    type: object
-                    properties:
-                        user_token:
-                            type: string
-                        encryption_key:
-                            type: string
-                challenge_id:
-                    type: string
-                error:
-                    type: object
-                    properties:
-                        message:
-                            type: string
-
-        WalletCircleTransferOutArgs:
-            type: object
-            properties:
-                to_address:
-                    type: string
-                amount_usdc_nano_cents:
-                    type: integer
-                terms:
-                    description: user consent to accept terms of transfer
-                    type: boolean
-
-        WalletCircleTransferOutResult:
-            type: object
-            properties:
-                user_token:
-                    type: object
-                    properties:
-                        user_token:
-                            type: string
-                        encryption_key:
-                            type: string
-                challenge_id:
-                    type: string
-                error:
-                    type: object
-                    properties:
-                        message:
-                            type: string
-
-        SubscriptionBalanceResult:
-            type: object
-            properties:
-                balance_byte_count:
-                    type: integer
-                current_subscription:
-                    type: object
-                    properties:
-                        subscription_id:
-                            description: udid
-                            type: string
-                        store:
-                            type: string
-                        plan:
-                            type: string
-                active_transfer_balances:
-                    type: array
-                    items:
-                        type: object
-                        properties:
-                            balance_id:
-                                description: udid
-                                type: string
-                            network_id:
-                                description: udid
-                                type: string
-                            start_time:
-                                type: string
-                            end_time:
-                                type: string
-                            start_balance_byte_count:
-                                type: integer
-                            net_revenue_nano_cents:
-                                type: integer
-                            balance_byte_count:
-                                type: integer
-                pending_payout_usd_nano_cents:
-                    type: integer
-                wallet_info:
-                    type: object
-                    properties:
-                        wallet_id:
-                            description: udid
-                            type: string
-                        token_id:
-                            description: udid
-                            type: string
-                        blockchain:
-                            type: string
-                            enum:
-                                - Polygon
-                        blockchain_symbol:
-                            type: string
-                            enum:
-                                - MATIC
-                        create_date:
-                            type: string
-                        balance_usdc_nano_cents:
-                            type: integer
-                        address:
-                            type: string
-                update_time:
-                    type: string
-
-        StatsProvidersArgs:
-            type: object
-            properties:
-                last_n:
-                    description: n hours
-                    type: number
-
-        StatsProvidersResult:
-            type: object
-            properties:
-                created_time:
-                    description: datetime
-                    type: string
-                providers:
-                    type: array
-                    items:
-                        type: object
-                        properties:
-                            client_id:
-                                description: udid
-                                type: string
-                            connected:
-                                type: boolean
-                            connected_events_last_24h:
-                                type: array
-                                items:
-                                    type: object
-                                    properties:
-                                        event_time:
-                                            description: datetime
-                                            type: string
-                                        connected:
-                                            type: boolean
-                            uptime_last_24h:
-                                description: hours up
-                                type: number
-                            transfer_data_last_24h:
-                                description: gib
-                                type: number
-                            payout_last_24h:
-                                description: usdc
-                                type: number
-                            search_interest_last_24h:
-                                description: matching search count
-                                type: integer
-                            contracts_last_24h:
-                                type: integer
-                            clients_last_24h:
-                                type: integer
-                            provide_mode:
-                                $ref: "#/components/schemas/ProvideMode"
-
-        StatsProviderArgs:
-            type: object
-            properties:
-                client_id:
-                    description: udid
-                    type: string
-                last_n:
-                    description: n hours
-                    type: number
-
-        StatsProviderResult:
-            type: object
-            properties:
-                lookback:
-                    type: integer
-                created_time:
-                    description: datetime
-                    type: string
-                uptime:
-                    type: object
-                    description: yyyy-mm-dd-hh (utc) to minutes
-                    additionalProperties:
-                        x-additionalPropertiesName: yyyy-mm-dd-hh
-                        type: number
-                transfer_data:
-                    type: object
-                    description: yyyy-mm-dd to gib
-                    additionalProperties:
-                        x-additionalPropertiesName: yyyy-mm-dd
-                        type: number
-                payout:
-                    type: object
-                    description: yyyy-mm-dd to payout USDC
-                    additionalProperties:
-                        x-additionalPropertiesName: yyyy-mm-dd
-                        type: number
-                search_interest:
-                    type: object
-                    description: yyyy-mm-dd to matching search count
-                    additionalProperties:
-                        x-additionalPropertiesName: yyyy-mm-dd
-                        type: integer
-                contracts:
-                    type: object
-                    description: yyyy-mm-dd to count
-                    additionalProperties:
-                        x-additionalPropertiesName: yyyy-mm-dd
-                        type: integer
-                clients:
-                    type: object
-                    description: yyyy-mm-dd to count
-                    additionalProperties:
-                        x-additionalPropertiesName: yyyy-mm-dd
-                        type: integer
-                client_details:
-                    type: array
-                    items:
-                        type: object
-                        properties:
-                            client_id:
-                                description: udid
-                                type: string
-                            transfer_data:
-                                type: object
-                                description: yyyy-mm-dd to gib
-                                additionalProperties:
-                                    x-additionalPropertiesName: yyyy-mm-dd
-                                    type: number
-
-        SubscriptionCheckBalanceCodeArgs:
-            type: object
-            properties:
-                secret:
-                    type: string
-
-        SubscriptionCheckBalanceCodeResult:
-            type: object
-            properties:
-                balance:
-                    type: object
-                    properties:
-                        start_time:
-                            type: string
-                        end_time:
-                            type: string
-                        balance_byte_count:
-                            type: integer
-                error:
-                    type: object
-                    properties:
-                        message:
-                            type: string
-
-        SubscriptionRedeemBalanceCodeArgs:
-            type: object
-            properties:
-                secret:
-                    type: string
-
-        SubscriptionRedeemBalanceCodeResult:
-            type: object
-            properties:
-                transfer_balance:
-                    type: object
-                    properties:
-                        transfer_balance_id:
-                            description: udid
-                            type: string
-                        start_time:
-                            type: string
-                        end_time:
-                            type: string
-                        balance_byte_count:
-                            type: integer
-                error:
-                    type: object
-                    properties:
-                        message:
-                            type: string
-
-        SubscriptionCreatePaymentIdArgs:
-            type: object
-            properties: {}
-
-        SubscriptionCreatePaymentIdResult:
-            type: object
-            properties:
-                subscription_payment_id:
-                    description: udid
-                    type: string
-                error:
-                    type: object
-                    properties:
-                        message:
-                            type: string
-
-        DeviceAddArgs:
-            type: object
-            properties:
-                code:
-                    description: share code or adopt code
-                    type: string
-
-        DeviceAddResult:
-            type: object
-            properties:
-                code_type:
-                    type: string
-                    enum:
-                        - share
-                        - adopt
-                code:
-                    type: string
-                device_name:
-                    description: Name of the device shared by the owner
-                    type: string
-                associated_network_name:
-                    description: The name of the source network. Only for share codes.
-                    type: string
-                client_id:
-                    description: udid. Only for share codes.
-                    type: string
-                duration_minutes:
-                    type: number
-                error:
-                    type: object
-                    properties:
-                        message:
-                            type: string
-
-        DeviceCreateShareCodeArgs:
-            type: object
-            properties:
-                client_id:
-                    description: udid
-                    type: string
-                device_name:
-                    description: Name of the device that will be shared to the guest
-                    type: string
-
-        DeviceCreateShareCodeResult:
-            type: object
-            properties:
-                share_code:
-                    type: string
-                error:
-                    type: object
-                    properties:
-                        message:
-                            type: string
-
-        DeviceShareStatusArgs:
-            type: object
-            properties:
-                share_code:
-                    type: string
-
-        DeviceShareStatusResult:
-            type: object
-            properties:
-                pending:
-                    type: boolean
-                associated_network_name:
-                    type: string
-                error:
-                    type: object
-                    properties:
-                        message:
-                            type: string
-
-        DeviceConfirmShareArgs:
-            type: object
-            properties:
-                share_code:
-                    type: string
-                associated_network_name:
-                    type: string
-
-        DeviceConfirmShareResult:
-            type: object
-            properties:
-                associated_network_name:
-                    type: string
-                error:
-                    type: object
-                    properties:
-                        message:
-                            type: string
-
-        DeviceCreateAdoptCodeArgs:
-            type: object
-            properties:
-                device_name:
-                    description: Name of the device that will be shared to the adopter
-                    type: string
-                device_spec:
-                    type: string
-
-        DeviceCreateAdoptCodeResult:
-            type: object
-            properties:
-                adopt_code:
-                    type: string
-                adopt_secret:
-                    description: keep this secret locally to use with confirm
-                    type: string
-                duration_minutes:
-                    type: integer
-                error:
-                    type: object
-                    properties:
-                        message:
-                            type: string
-
-        DeviceAdoptStatusArgs:
-            type: object
-            properties:
-                adopt_code:
-                    type: string
-
-        DeviceAdoptStatusResult:
-            type: object
-            properties:
-                pending:
-                    type: boolean
-                associated_network_name:
-                    type: string
-                error:
-                    type: object
-                    properties:
-                        message:
-                            type: string
-
-        DeviceConfirmAdoptArgs:
-            type: object
-            properties:
-                adopt_code:
-                    type: string
-                adopt_secret:
-                    type: string
-                associated_network_name:
-                    type: string
-
-        DeviceConfirmAdoptResult:
-            type: object
-            properties:
-                by_client_jwt:
-                    description: client auth
-                    type: string
-                error:
-                    type: object
-                    properties:
-                        message:
-                            type: string
-
-        DeviceRemoveAdoptCodeArgs:
-            type: object
-            properties:
-                adopt_code:
-                    type: string
-                adopt_secret:
-                    type: string
-
-        DeviceRemoveAdoptCodeResult:
-            type: object
-            properties:
-                error:
-                    type: object
-                    properties:
-                        message:
-                            type: string
-
-        DeviceAssociationsResult:
-            type: object
-            properties:
-                pending_adoption_devices:
-                    description: devices pending adoption that need to be confirmed by the offerer
-                    type: array
-                    items:
-                        type: object
-                        properties:
-                            code:
-                                type: string
-                            device_name:
-                                description: Name of the device
-                                type: string
-                            duration_minutes:
-                                type: number
-                incoming_shared_devices:
-                    description: devices owned by another network shared to the caller network
-                    type: array
-                    items:
-                        type: object
-                        properties:
-                            pending:
-                                type: boolean
-                            code:
-                                type: string
-                            device_name:
-                                description: Name of the device
-                                type: string
-                            client_id:
-                                description: udid
-                                type: string
-                            network_name:
-                                type: string
-                outgoing_shared_devices:
-                    description: devices owned by the caller network shared to another network
-                    type: array
-                    items:
-                        type: object
-                        properties:
-                            pending:
-                                type: boolean
-                            code:
-                                type: string
-                            device_name:
-                                description: Name of the device
-                                type: string
-                            client_id:
-                                description: udid
-                                type: string
-                            network_name:
-                                type: string
-
-        DeviceRemoveAssociationArgs:
-            type: object
-            properties:
-                code:
-                    type: string
-
-        DeviceRemoveAssociationResult:
-            type: object
-            properties:
-                error:
-                    type: object
-                    properties:
-                        message:
-                            type: string
-
-        DeviceSetAssociationNameArgs:
-            type: object
-            properties:
-                code:
-                    type: string
-                device_name:
-                    description: Name of the device
-                    type: string
-
-        DeviceSetAssociationNameResult:
-            type: object
-            properties:
-                error:
-                    type: object
-                    properties:
-                        message:
-                            type: string
-
-        DeviceSetNameArgs:
-            type: object
-            properties:
-                device_id:
-                    description: udid
-                    type: string
-                device_name:
-                    type: string
-        
-        DeviceSetNameResult:
-            type: object
-            properties:
-                error:
-                    type: object
-                    properties:
-                        message:
-                            type: string
-
-        DeviceSetProvideArgs:
-            type: object
-            properties:
-                client_id:
-                    description: udid
-                    type: string
-                provide_mode:
-                    $ref: "#/components/schemas/ProvideMode"
-
-        DeviceSetProvideResult:
-            type: object
-            properties:
-                provide_mode:
-                    $ref: "#/components/schemas/ProvideMode"
-                error:
-                    type: object
-                    properties:
-                        message:
-                            type: string
-
-        ConnectControlArgs:
-            type: object
-            properties:
-                pack:
-                    description: |
-                        base64 encoded connect protobuf `Pack` processed as control messages.
-                        As an inline message, these would be sent to the control id.
-                    type: array
-                    items:
-                        type: string
-
-        ConnectControlResult:
-            type: object
-            properties:
-                pack:
-                    description: |
-                        base64 encoded connect `Pack` resulting from processing the control messages.
-                        As an inline message, this is what would be sent from the control id after processing the control messages.
-                    type: array
-                    items:
-                        type: string
-                error:
-                    type: object
-                    properties:
-                        message:
-                            type: string
-
-        HelloResult:
-            type: object
-            properties:
-                client_address:
-                    type: string
-
-        SetPayoutWalletArgs:
-            type: object
-            properties:
-                wallet_id:
-                    description: udid
-                    type: string
-
-        SetPayoutWalletResult:
-            type: object
-            properties: {}
-
-        GetPayoutWalletResult:
-            type: object
-            properties:
-                wallet_id:
-                    description: udid
-                    type: string
-        
-        CreateAccountWalletExternalArgs:
-            type: object
-            properties:
-                blockchain:
-                    description: |
-                        The blockchain associated with the address
-                    type: string
-                    enum:
-                        - SOL
-                        - MATIC
-                wallet_address:
-                    description: The "SOL" or "MATIC" wallet address
-                    type: string
-                default_token_type:
-                    description: We only support "USDC"
-                    type: string
-                    enum:
-                        - USDC
-
-        CreateAccountWalletResult:
-            type: object
-            properties:
-                wallet_id:
-                    description: udid
-                    type: string
-
-        AccountWallet:
-            type: object
-            properties:
-                wallet_id:
-                    description: udid
-                    type: string
-                circle_wallet_id:
-                    description: |
-                        If the wallet was created through the Circle flow, it is the ID associated
-                        with the Circle wallet.
-                    type: string
-                network_id:
-                    description: udid
-                    type: string
-                wallet_type:
-                    type: string
-                    enum: 
-                        - circle_uc
-                        - external
-                blockchain:
-                    type: string
-                    enum:
-                        - SOL
-                        - MATIC
-                wallet_address:
-                    description: Blockchain wallet address
-                    type: string
-                active:
-                    type: boolean
-                default_token_type:
-                    type: string
-                    enum:
-                        - USDC
-                create_time:
-                    description: datetime
-                    type: string
-                    
-
-        GetAccountWalletsResult:
-            type: object
-            properties:
-                wallets:
-                    description: A list of wallets associated with your network
-                    type: array
-                    items:
-                        $ref: "#/components/schemas/AccountWallet"
-
-        RemoveWalletArgs:
-            type: object
-            properties:
-                wallet_id:
-                    description: udid
-                    type: string
-
-        RemoveWalletResult:
-            type: object
-            properties:
-                success:
-                    description: Wallet successfully removed
-                    type: boolean
-                error:
-                    type: object
-                    properties:
-                        message:
-                            type: string
-
-        NetworkReferralResult:
-            type: object
-            properties:
-                referral_code:
-                    description: udid
-                    type: string
-                total_referrals:
-                    type: integer
-
-        TransferStatsResult:
-            type: object
-            properties:
-                paid_bytes_provided:
-                    type: integer
-                unpaid_bytes_provided:
-                    type: integer
-
-        WalletAuthArgs:
-            type: object
-            properties:
-                wallet_address:
-                    description: The user's wallet address
-                    type: string
-                wallet_message:
-                    description: The signed message
-                    type: string
-                wallet_signature:
-                    type: string
-                blockchain:
-                    type: string
-                    enum:
-                        - solana
-
-        AccountPoint:
-            type: object
-            properties:
-                network_id:
-                    description: uuid
-                    type: string
-                event:
-                    type: string
-                    enum: 
-                        - referral
-                point_value:
-                    type: integer
-                create_time:
-                    description: datetime
-                    type: string
-
-        AccountPointsResult:
-            type: object
-            properties:
-                network_points:
-                    type: array
-                    items:
-                        $ref: "#/components/schemas/AccountPoint"
-
-        GetLeaderboardArgs:
-            type: object
-            properties: {}
-
-        LeaderboardEarner:
-            type: object
-            properties:
-                network_id:
-                    description: uuid
-                    type: string
-                network_name:
-                    type: string
-                net_mib_count:
-                    type: number
-                    format: float
-                is_public:
-                    description: Whether the network has opted in to being displayed on the leaderboard or not
-                    type: boolean
-
-        LeaderboardResult:
-            type: object
-            properties:
-                earners:
-                    type: array
-                    items:
-                        $ref: "#/components/schemas/LeaderboardEarner"
-                error:
-                    type: object
-                    properties:
-                        message:
-                            type: string
-
-        NetworkRanking:
-            type: object
-            properties:
-                net_mib_count:
-                    type: number
-                    format: float
-                leaderboard_rank:
-                    type: integer
-                leaderboard_public:
-                    description: Whether your network is publicly visibile on the leaderboard
-                    type: boolean
-
-        NetworkRankingResult:
-            type: object
-            properties:
-                network_ranking:
-                    $ref: "#/components/schemas/NetworkRanking"
-                error:
-                    type: object
-                    properties:
-                        message:
-                            type: string
-        
-        SetNetworkRankingVisibilityArgs:
-            type: object
-            properties:
-                is_public:
-                    description: User can set whether their network is visible on the leaderboard
-                    type: boolean
-
-        SetNetworkRankingVisibilityResult:
-            type: object
-            properties:
-                error:
-                    type: object
-                    properties:
-                        message:
-                            type: string
-        
-                
+                      type: integer
+              provide_mode:
+                $ref: "#/components/schemas/ProvideMode"
+              connections:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    client_id:
+                      description: udid
+                      type: string
+                    connection_id:
+                      description: udid
+                      type: string
+                    connect_time:
+                      type: string
+                    disconnect_time:
+                      type: string
+                    connection_host:
+                      type: string
+                    connection_service:
+                      type: string
+                    connection_block:
+                      type: string'
+
+    PreferencesSetArgs:
+      type: object
+      properties:
+        product_updates:
+          type: boolean
+
+    PreferencesSetResult:
+      type: object
+      properties: {}
+
+    PreferencesGetResult:
+      type: object
+      properties:
+        product_updates:
+          type: boolean
+
+    FeedbackSendArgs:
+      type: object
+      properties:
+        uses:
+          type: object
+          properties:
+            personal:
+              type: boolean
+            business:
+              type: boolean
+        needs:
+          type: object
+          properties:
+            private:
+              type: boolean
+            safe:
+              type: boolean
+            global:
+              type: boolean
+            collaborate:
+              type: boolean
+            app_control:
+              type: boolean
+            block_data_brokers:
+              type: boolean
+            block_ads:
+              type: boolean
+            focus:
+              type: boolean
+            connect_servers:
+              type: boolean
+            run_servers:
+              type: boolean
+            prevent_cyber:
+              type: boolean
+            audit:
+              type: boolean
+            zero_trust:
+              type: boolean
+            visualize:
+              type: boolean
+            other:
+              type: string
+        star_count:
+          type: integer
+
+    FeedbackSendResult:
+      type: object
+      properties: {}
+
+    FindLocationsArgs:
+      type: object
+      properties:
+        query:
+          type: string
+        max_distance_fraction:
+          type: number
+        enable_max_distance_fraction:
+          type: boolean
+
+    FindLocationsResult:
+      type: object
+      properties:
+        # specs can be directly passed to `find-providers2` to enumerate clients for this result
+        specs:
+          type: array
+          items:
+            $ref: "#/components/schemas/ProviderSpec"
+        groups:
+          type: array
+          items:
+            type: object
+            properties:
+              location_group_id:
+                description: udid
+                type: string
+              name:
+                type: string
+              provider_count:
+                type: integer
+              promoted:
+                type: boolean
+              match_distance:
+                type: integer
+        locations:
+          type: array
+          items:
+            type: object
+            properties:
+              location_id:
+                description: udid
+                type: string
+              location_type:
+                type: string
+                enum:
+                  - city
+                  - region
+                  - country
+              name:
+                type: string
+              city:
+                type: string
+              city_location_id:
+                description: udid
+                type: string
+              region:
+                type: string
+              region_location_id:
+                description: udid
+                type: string
+              country:
+                type: string
+              country_location_id:
+                description: udid
+                type: string
+              country_code:
+                type: string
+              provider_count:
+                type: integer
+              match_distance:
+                type: integer
+        devices:
+          type: array
+          items:
+            type: object
+            properties:
+              client_id:
+                description: udid
+                type: string
+              device_name:
+                type: string
+
+    FindProvidersArgs:
+      type: object
+      properties:
+        location_id:
+          description: udid
+          type: string
+        location_group_id:
+          description: udid
+          type: string
+        count:
+          type: integer
+        exclude_location_ids:
+          type: array
+          items:
+            description: udid
+            type: string
+
+    FindProvidersResult:
+      type: object
+      properties:
+        client_ids:
+          type: array
+          items:
+            description: udid
+            type: string
+
+    ProviderSpec:
+      type: object
+      properties:
+        location_id:
+          description: udid
+          type: string
+        location_group_id:
+          description: udid
+          type: string
+        client_id:
+          description: udid
+          type: string
+        best_available:
+          type: boolean
+
+    FindProviders2Args:
+      type: object
+      properties:
+        # specs are unioned (or)
+        specs:
+          type: array
+          items:
+            $ref: "#/components/schemas/ProviderSpec"
+        count:
+          type: integer
+        exclude_client_ids:
+          type: array
+          items:
+            description: udid
+            type: string
+        exclude_destinations:
+          type: array
+          items:
+            type: array
+            items:
+              description: udid
+              type: string
+
+    FindProviders2Result:
+      type: object
+      properties:
+        providers:
+          type: array
+          items:
+            type: object
+            properties:
+              client_id:
+                description: udid
+                type: string
+              estimated_bytes_per_second:
+                type: integer
+              intermediary_ids:
+                type: array
+                items:
+                  description: udid
+                  type: string
+
+    CreateProviderSpecArgs:
+      type: object
+      properties:
+        query:
+          description: description of the intended use of the connection
+          type: string
+
+    CreateProviderSpecResult:
+      type: object
+      properties:
+        # specs are unioned (or)
+        specs:
+          type: array
+          items:
+            $ref: "#/components/schemas/ProviderSpec"
+
+    WalletBalanceResult:
+      type: object
+      properties:
+        wallet_info:
+          type: object
+          properties:
+            wallet_id:
+              type: string
+            token_id:
+              type: string
+            blockchain:
+              type: string
+            blockchain_symbol:
+              type: string
+            create_date:
+              type: string
+            balance_usdc_nano_cents:
+              type: integer
+            address:
+              type: string
+
+    WalletValidateAddressArgs:
+      type: object
+      properties:
+        address:
+          type: string
+
+    WalletValidateAddressResult:
+      type: object
+      properties:
+        valid:
+          type: boolean
+
+    WalletCircleInitResult:
+      type: object
+      properties:
+        user_token:
+          type: object
+          properties:
+            user_token:
+              type: string
+            encryption_key:
+              type: string
+        challenge_id:
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    WalletCircleTransferOutArgs:
+      type: object
+      properties:
+        to_address:
+          type: string
+        amount_usdc_nano_cents:
+          type: integer
+        terms:
+          description: user consent to accept terms of transfer
+          type: boolean
+
+    WalletCircleTransferOutResult:
+      type: object
+      properties:
+        user_token:
+          type: object
+          properties:
+            user_token:
+              type: string
+            encryption_key:
+              type: string
+        challenge_id:
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    SubscriptionBalanceResult:
+      type: object
+      properties:
+        balance_byte_count:
+          type: integer
+        current_subscription:
+          type: object
+          properties:
+            subscription_id:
+              description: udid
+              type: string
+            store:
+              type: string
+            plan:
+              type: string
+        active_transfer_balances:
+          type: array
+          items:
+            type: object
+            properties:
+              balance_id:
+                description: udid
+                type: string
+              network_id:
+                description: udid
+                type: string
+              start_time:
+                type: string
+              end_time:
+                type: string
+              start_balance_byte_count:
+                type: integer
+              net_revenue_nano_cents:
+                type: integer
+              balance_byte_count:
+                type: integer
+        pending_payout_usd_nano_cents:
+          type: integer
+        wallet_info:
+          type: object
+          properties:
+            wallet_id:
+              description: udid
+              type: string
+            token_id:
+              description: udid
+              type: string
+            blockchain:
+              type: string
+              enum:
+                - Polygon
+            blockchain_symbol:
+              type: string
+              enum:
+                - MATIC
+            create_date:
+              type: string
+            balance_usdc_nano_cents:
+              type: integer
+            address:
+              type: string
+        update_time:
+          type: string
+
+    StatsProvidersArgs:
+      type: object
+      properties:
+        last_n:
+          description: n hours
+          type: number
+
+    StatsProvidersResult:
+      type: object
+      properties:
+        created_time:
+          description: datetime
+          type: string
+        providers:
+          type: array
+          items:
+            type: object
+            properties:
+              client_id:
+                description: udid
+                type: string
+              connected:
+                type: boolean
+              connected_events_last_24h:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    event_time:
+                      description: datetime
+                      type: string
+                    connected:
+                      type: boolean
+              uptime_last_24h:
+                description: hours up
+                type: number
+              transfer_data_last_24h:
+                description: gib
+                type: number
+              payout_last_24h:
+                description: usdc
+                type: number
+              search_interest_last_24h:
+                description: matching search count
+                type: integer
+              contracts_last_24h:
+                type: integer
+              clients_last_24h:
+                type: integer
+              provide_mode:
+                $ref: "#/components/schemas/ProvideMode"
+
+    StatsProviderArgs:
+      type: object
+      properties:
+        client_id:
+          description: udid
+          type: string
+        last_n:
+          description: n hours
+          type: number
+
+    StatsProviderResult:
+      type: object
+      properties:
+        lookback:
+          type: integer
+        created_time:
+          description: datetime
+          type: string
+        uptime:
+          type: object
+          description: yyyy-mm-dd-hh (utc) to minutes
+          additionalProperties:
+            x-additionalPropertiesName: yyyy-mm-dd-hh
+            type: number
+        transfer_data:
+          type: object
+          description: yyyy-mm-dd to gib
+          additionalProperties:
+            x-additionalPropertiesName: yyyy-mm-dd
+            type: number
+        payout:
+          type: object
+          description: yyyy-mm-dd to payout USDC
+          additionalProperties:
+            x-additionalPropertiesName: yyyy-mm-dd
+            type: number
+        search_interest:
+          type: object
+          description: yyyy-mm-dd to matching search count
+          additionalProperties:
+            x-additionalPropertiesName: yyyy-mm-dd
+            type: integer
+        contracts:
+          type: object
+          description: yyyy-mm-dd to count
+          additionalProperties:
+            x-additionalPropertiesName: yyyy-mm-dd
+            type: integer
+        clients:
+          type: object
+          description: yyyy-mm-dd to count
+          additionalProperties:
+            x-additionalPropertiesName: yyyy-mm-dd
+            type: integer
+        client_details:
+          type: array
+          items:
+            type: object
+            properties:
+              client_id:
+                description: udid
+                type: string
+              transfer_data:
+                type: object
+                description: yyyy-mm-dd to gib
+                additionalProperties:
+                  x-additionalPropertiesName: yyyy-mm-dd
+                  type: number
+
+    SubscriptionCheckBalanceCodeArgs:
+      type: object
+      properties:
+        secret:
+          type: string
+
+    SubscriptionCheckBalanceCodeResult:
+      type: object
+      properties:
+        balance:
+          type: object
+          properties:
+            start_time:
+              type: string
+            end_time:
+              type: string
+            balance_byte_count:
+              type: integer
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    SubscriptionRedeemBalanceCodeArgs:
+      type: object
+      properties:
+        secret:
+          type: string
+
+    SubscriptionRedeemBalanceCodeResult:
+      type: object
+      properties:
+        transfer_balance:
+          type: object
+          properties:
+            transfer_balance_id:
+              description: udid
+              type: string
+            start_time:
+              type: string
+            end_time:
+              type: string
+            balance_byte_count:
+              type: integer
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    SubscriptionCreatePaymentIdArgs:
+      type: object
+      properties: {}
+
+    SubscriptionCreatePaymentIdResult:
+      type: object
+      properties:
+        subscription_payment_id:
+          description: udid
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    DeviceAddArgs:
+      type: object
+      properties:
+        code:
+          description: share code or adopt code
+          type: string
+
+    DeviceAddResult:
+      type: object
+      properties:
+        code_type:
+          type: string
+          enum:
+            - share
+            - adopt
+        code:
+          type: string
+        device_name:
+          description: Name of the device shared by the owner
+          type: string
+        associated_network_name:
+          description: The name of the source network. Only for share codes.
+          type: string
+        client_id:
+          description: udid. Only for share codes.
+          type: string
+        duration_minutes:
+          type: number
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    DeviceCreateShareCodeArgs:
+      type: object
+      properties:
+        client_id:
+          description: udid
+          type: string
+        device_name:
+          description: Name of the device that will be shared to the guest
+          type: string
+
+    DeviceCreateShareCodeResult:
+      type: object
+      properties:
+        share_code:
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    DeviceShareStatusArgs:
+      type: object
+      properties:
+        share_code:
+          type: string
+
+    DeviceShareStatusResult:
+      type: object
+      properties:
+        pending:
+          type: boolean
+        associated_network_name:
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    DeviceConfirmShareArgs:
+      type: object
+      properties:
+        share_code:
+          type: string
+        associated_network_name:
+          type: string
+
+    DeviceConfirmShareResult:
+      type: object
+      properties:
+        associated_network_name:
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    DeviceCreateAdoptCodeArgs:
+      type: object
+      properties:
+        device_name:
+          description: Name of the device that will be shared to the adopter
+          type: string
+        device_spec:
+          type: string
+
+    DeviceCreateAdoptCodeResult:
+      type: object
+      properties:
+        adopt_code:
+          type: string
+        adopt_secret:
+          description: keep this secret locally to use with confirm
+          type: string
+        duration_minutes:
+          type: integer
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    DeviceAdoptStatusArgs:
+      type: object
+      properties:
+        adopt_code:
+          type: string
+
+    DeviceAdoptStatusResult:
+      type: object
+      properties:
+        pending:
+          type: boolean
+        associated_network_name:
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    DeviceConfirmAdoptArgs:
+      type: object
+      properties:
+        adopt_code:
+          type: string
+        adopt_secret:
+          type: string
+        associated_network_name:
+          type: string
+
+    DeviceConfirmAdoptResult:
+      type: object
+      properties:
+        by_client_jwt:
+          description: client auth
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    DeviceRemoveAdoptCodeArgs:
+      type: object
+      properties:
+        adopt_code:
+          type: string
+        adopt_secret:
+          type: string
+
+    DeviceRemoveAdoptCodeResult:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    DeviceAssociationsResult:
+      type: object
+      properties:
+        pending_adoption_devices:
+          description: devices pending adoption that need to be confirmed by the offerer
+          type: array
+          items:
+            type: object
+            properties:
+              code:
+                type: string
+              device_name:
+                description: Name of the device
+                type: string
+              duration_minutes:
+                type: number
+        incoming_shared_devices:
+          description: devices owned by another network shared to the caller network
+          type: array
+          items:
+            type: object
+            properties:
+              pending:
+                type: boolean
+              code:
+                type: string
+              device_name:
+                description: Name of the device
+                type: string
+              client_id:
+                description: udid
+                type: string
+              network_name:
+                type: string
+        outgoing_shared_devices:
+          description: devices owned by the caller network shared to another network
+          type: array
+          items:
+            type: object
+            properties:
+              pending:
+                type: boolean
+              code:
+                type: string
+              device_name:
+                description: Name of the device
+                type: string
+              client_id:
+                description: udid
+                type: string
+              network_name:
+                type: string
+
+    DeviceRemoveAssociationArgs:
+      type: object
+      properties:
+        code:
+          type: string
+
+    DeviceRemoveAssociationResult:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    DeviceSetAssociationNameArgs:
+      type: object
+      properties:
+        code:
+          type: string
+        device_name:
+          description: Name of the device
+          type: string
+
+    DeviceSetAssociationNameResult:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    DeviceSetNameArgs:
+      type: object
+      properties:
+        device_id:
+          description: udid
+          type: string
+        device_name:
+          type: string
+
+    DeviceSetNameResult:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    DeviceSetProvideArgs:
+      type: object
+      properties:
+        client_id:
+          description: udid
+          type: string
+        provide_mode:
+          $ref: "#/components/schemas/ProvideMode"
+
+    DeviceSetProvideResult:
+      type: object
+      properties:
+        provide_mode:
+          $ref: "#/components/schemas/ProvideMode"
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    ConnectControlArgs:
+      type: object
+      properties:
+        pack:
+          description: |
+            base64 encoded connect protobuf `Pack` processed as control messages.
+            As an inline message, these would be sent to the control id.
+          type: array
+          items:
+            type: string
+
+    ConnectControlResult:
+      type: object
+      properties:
+        pack:
+          description: |
+            base64 encoded connect `Pack` resulting from processing the control messages.
+            As an inline message, this is what would be sent from the control id after processing the control messages.
+          type: array
+          items:
+            type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    HelloResult:
+      type: object
+      properties:
+        client_address:
+          type: string
+
+    SetPayoutWalletArgs:
+      type: object
+      properties:
+        wallet_id:
+          description: udid
+          type: string
+
+    SetPayoutWalletResult:
+      type: object
+      properties: {}
+
+    GetPayoutWalletResult:
+      type: object
+      properties:
+        wallet_id:
+          description: udid
+          type: string
+
+    CreateAccountWalletExternalArgs:
+      type: object
+      properties:
+        blockchain:
+          description: |
+            The blockchain associated with the address
+          type: string
+          enum:
+            - SOL
+            - MATIC
+        wallet_address:
+          description: The "SOL" or "MATIC" wallet address
+          type: string
+        default_token_type:
+          description: We only support "USDC"
+          type: string
+          enum:
+            - USDC
+
+    CreateAccountWalletResult:
+      type: object
+      properties:
+        wallet_id:
+          description: udid
+          type: string
+
+    AccountWallet:
+      type: object
+      properties:
+        wallet_id:
+          description: udid
+          type: string
+        circle_wallet_id:
+          description: |
+            If the wallet was created through the Circle flow, it is the ID associated
+            with the Circle wallet.
+          type: string
+        network_id:
+          description: udid
+          type: string
+        wallet_type:
+          type: string
+          enum:
+            - circle_uc
+            - external
+        blockchain:
+          type: string
+          enum:
+            - SOL
+            - MATIC
+        wallet_address:
+          description: Blockchain wallet address
+          type: string
+        active:
+          type: boolean
+        default_token_type:
+          type: string
+          enum:
+            - USDC
+        create_time:
+          description: datetime
+          type: string
+
+    GetAccountWalletsResult:
+      type: object
+      properties:
+        wallets:
+          description: A list of wallets associated with your network
+          type: array
+          items:
+            $ref: "#/components/schemas/AccountWallet"
+
+    RemoveWalletArgs:
+      type: object
+      properties:
+        wallet_id:
+          description: udid
+          type: string
+
+    RemoveWalletResult:
+      type: object
+      properties:
+        success:
+          description: Wallet successfully removed
+          type: boolean
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    NetworkReferralResult:
+      type: object
+      properties:
+        referral_code:
+          description: udid
+          type: string
+        total_referrals:
+          type: integer
+
+    TransferStatsResult:
+      type: object
+      properties:
+        paid_bytes_provided:
+          type: integer
+        unpaid_bytes_provided:
+          type: integer
+
+    WalletAuthArgs:
+      type: object
+      properties:
+        wallet_address:
+          description: The user's wallet address
+          type: string
+        wallet_message:
+          description: The signed message
+          type: string
+        wallet_signature:
+          type: string
+        blockchain:
+          type: string
+          enum:
+            - solana
+
+    AccountPoint:
+      type: object
+      properties:
+        network_id:
+          description: uuid
+          type: string
+        event:
+          type: string
+          enum:
+            - referral
+        point_value:
+          type: integer
+        create_time:
+          description: datetime
+          type: string
+
+    AccountPointsResult:
+      type: object
+      properties:
+        network_points:
+          type: array
+          items:
+            $ref: "#/components/schemas/AccountPoint"
+
+    GetLeaderboardArgs:
+      type: object
+      properties: {}
+
+    LeaderboardEarner:
+      type: object
+      properties:
+        network_id:
+          description: uuid
+          type: string
+        network_name:
+          type: string
+        net_mib_count:
+          type: number
+          format: float
+        is_public:
+          description: Whether the network has opted in to being displayed on the leaderboard or not
+          type: boolean
+
+    LeaderboardResult:
+      type: object
+      properties:
+        earners:
+          type: array
+          items:
+            $ref: "#/components/schemas/LeaderboardEarner"
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    NetworkRanking:
+      type: object
+      properties:
+        net_mib_count:
+          type: number
+          format: float
+        leaderboard_rank:
+          type: integer
+        leaderboard_public:
+          description: Whether your network is publicly visibile on the leaderboard
+          type: boolean
+
+    NetworkRankingResult:
+      type: object
+      properties:
+        network_ranking:
+          $ref: "#/components/schemas/NetworkRanking"
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    SetNetworkRankingVisibilityArgs:
+      type: object
+      properties:
+        is_public:
+          description: User can set whether their network is visible on the leaderboard
+          type: boolean
+
+    SetNetworkRankingVisibilityResult:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    ReferralNetwork:
+      type: object
+      properties:
+        id:
+          description: uuid
+          type: string
+        name:
+          type: string
+
+    ReferralNetworkResult:
+      type: object
+      properties:
+        network:
+          $ref: "#/components/schemas/ReferralNetwork"
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    SetNetworkReferralArgs:
+      type: object
+      properties:
+        referral_code:
+          type: string
+
+    SetNetworkReferralResult:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string

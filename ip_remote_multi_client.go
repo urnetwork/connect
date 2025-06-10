@@ -273,7 +273,7 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClien
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
-	run := func(update *multiClientChannelUpdate) {
+	waitForIdle := func(update *multiClientChannelUpdate) {
 		for {
 			select {
 			case <-update.ctx.Done():
@@ -325,7 +325,7 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClien
 			go HandleError(func() {
 				defer update.cancel()
 
-				run(update)
+				waitForIdle(update)
 
 				var client *multiClientChannel
 				func() {
@@ -360,7 +360,7 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClien
 			go HandleError(func() {
 				defer update.cancel()
 
-				run(update)
+				waitForIdle(update)
 
 				var client *multiClientChannel
 				func() {
