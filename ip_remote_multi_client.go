@@ -35,6 +35,11 @@ import (
 
 type clientReceivePacketFunction func(client *multiClientChannel, source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte)
 
+type DestinationStats struct {
+	EstimatedBytesPerSecond ByteCount
+	Tier                    int
+}
+
 // for each `NewClientArgs`,
 //
 //	`RemoveClientWithArgs` will be called if a client was created for the args,
@@ -44,7 +49,7 @@ type MultiClientGenerator interface {
 	// the enumeration should typically
 	// 1. not repeat final destination ids from any path
 	// 2. not repeat intermediary elements from any path
-	NextDestinations(count int, excludeDestinations []MultiHopId) (map[MultiHopId]ByteCount, error)
+	NextDestinations(count int, excludeDestinations []MultiHopId) (map[MultiHopId]DestinationStats, error)
 	// client id, client auth
 	NewClientArgs() (*MultiClientGeneratorClientArgs, error)
 	RemoveClientArgs(args *MultiClientGeneratorClientArgs)
@@ -1087,7 +1092,7 @@ func NewApiMultiClientGenerator(
 	}
 }
 
-func (self *ApiMultiClientGenerator) NextDestinations(count int, excludeDestinations []MultiHopId) (map[MultiHopId]ByteCount, error) {
+func (self *ApiMultiClientGenerator) NextDestinations(count int, excludeDestinations []MultiHopId) (map[MultiHopId]DestinationStats, error) {
 	excludeClientIds := slices.Clone(self.excludeClientIds)
 	excludeDestinationsIds := [][]Id{}
 	for _, excludeDestination := range excludeDestinations {
@@ -1105,7 +1110,7 @@ func (self *ApiMultiClientGenerator) NextDestinations(count int, excludeDestinat
 		return nil, err
 	}
 
-	clientIdEstimatedBytesPerSecond := map[MultiHopId]ByteCount{}
+	destinations := map[MultiHopId]DestinationStats{}
 	for _, provider := range result.Providers {
 		ids := []Id{}
 		if 0 < len(provider.IntermediaryIds) {
@@ -1117,11 +1122,14 @@ func (self *ApiMultiClientGenerator) NextDestinations(count int, excludeDestinat
 			ids = ids[len(ids)-MaxMultihopLength:]
 		}
 		if destination, err := NewMultiHopId(ids...); err == nil {
-			clientIdEstimatedBytesPerSecond[destination] = provider.EstimatedBytesPerSecond
+			destinations[destination] = DestinationStats{
+				EstimatedBytesPerSecond: provider.EstimatedBytesPerSecond,
+				Tier:                    provider.Tier,
+			}
 		}
 	}
 
-	return clientIdEstimatedBytesPerSecond, nil
+	return destinations, nil
 }
 
 func (self *ApiMultiClientGenerator) NewClientArgs() (*MultiClientGeneratorClientArgs, error) {
@@ -1325,8 +1333,8 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 	// a destination can be revisited after `WindowRevisitTimeout`
 	visitedDestinations := map[MultiHopId]time.Time{}
 	for {
-		destinationEstimatedBytesPerSecond := map[MultiHopId]ByteCount{}
-		for len(destinationEstimatedBytesPerSecond) == 0 {
+		destinations := map[MultiHopId]DestinationStats{}
+		for len(destinations) == 0 {
 			// exclude destinations that are already in the window
 			windowDestinations := map[MultiHopId]bool{}
 			func() {
@@ -1343,7 +1351,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 					delete(visitedDestinations, destination)
 				}
 			}
-			nextDestinationEstimatedBytesPerSecond, err := self.generator.NextDestinations(
+			nextDestinations, err := self.generator.NextDestinations(
 				1,
 				maps.Keys(visitedDestinations),
 			)
@@ -1355,8 +1363,8 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 				case <-time.After(self.settings.WindowEnumerateErrorTimeout):
 				}
 			} else {
-				for destination, estimatedBytesPerSecond := range nextDestinationEstimatedBytesPerSecond {
-					destinationEstimatedBytesPerSecond[destination] = estimatedBytesPerSecond
+				for destination, stats := range nextDestinations {
+					destinations[destination] = stats
 					visitedDestinations[destination] = time.Now()
 				}
 				// remove destinations that are already in the window
@@ -1364,11 +1372,11 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 					self.stateLock.Lock()
 					defer self.stateLock.Unlock()
 					for destination, _ := range self.destinationClients {
-						delete(destinationEstimatedBytesPerSecond, destination)
+						delete(destinations, destination)
 					}
 				}()
 
-				if len(destinationEstimatedBytesPerSecond) == 0 {
+				if len(destinations) == 0 {
 					// reset
 					clear(visitedDestinations)
 					glog.Infof("[multi]window enumerate empty timeout.\n")
@@ -1381,11 +1389,11 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			}
 		}
 
-		for destination, estimatedBytesPerSecond := range destinationEstimatedBytesPerSecond {
+		for destination, stats := range destinations {
 			if clientArgs, err := self.generator.NewClientArgs(); err == nil {
 				args := &multiClientChannelArgs{
 					Destination:                    destination,
-					EstimatedBytesPerSecond:        estimatedBytesPerSecond,
+					DestinationStats:               stats,
 					MultiClientGeneratorClientArgs: *clientArgs,
 				}
 				select {
@@ -1764,6 +1772,8 @@ func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 	weights := map[*multiClientChannel]float32{}
 	durations := map[*multiClientChannel]time.Duration{}
 
+	// FIXME only keep clients with the same tier as the min tier
+
 	for _, client := range self.clients() {
 		if stats, err := client.WindowStats(); err == nil {
 			clients = append(clients, client)
@@ -1793,7 +1803,26 @@ func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 
 	WeightedShuffleWithEntropy(nonNegativeClients, weights, self.settings.StatsWindowEntropy)
 
-	return nonNegativeClients
+	if 0 == len(nonNegativeClients) {
+		return nonNegativeClients
+	}
+
+	// use only clients in the min tier
+	// this prevents the window from crossing rank until necessary
+	minTierClients := []*multiClientChannel{}
+	minTier := nonNegativeClients[0].Tier()
+	for _, client := range nonNegativeClients[1:] {
+		minTier = min(minTier, client.Tier())
+	}
+	for _, client := range nonNegativeClients {
+		if client.Tier() == minTier {
+			minTierClients = append(minTierClients, client)
+		} else {
+			glog.Infof("[multi]exclude tier from window %d>%d\n", client.Tier(), minTier)
+		}
+	}
+
+	return minTierClients
 }
 
 func (self *multiClientWindow) statsSampleWeights(weights map[*multiClientChannel]float32) {
@@ -1866,8 +1895,8 @@ func (self *multiClientWindow) removeClients(removedClients []*multiClientChanne
 type multiClientChannelArgs struct {
 	MultiClientGeneratorClientArgs
 
-	Destination             MultiHopId
-	EstimatedBytesPerSecond ByteCount
+	Destination MultiHopId
+	DestinationStats
 }
 
 type multiClientEventType int
@@ -2026,6 +2055,10 @@ func (self *multiClientChannel) ClientId() Id {
 
 func (self *multiClientChannel) IsP2pOnly() bool {
 	return self.args.MultiClientGeneratorClientArgs.P2pOnly
+}
+
+func (self *multiClientChannel) Tier() int {
+	return self.args.DestinationStats.Tier
 }
 
 // func (self *multiClientChannel) UpdateAffinity() {

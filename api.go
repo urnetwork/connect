@@ -315,6 +315,7 @@ type FindProviders2Args struct {
 	Count               int             `json:"count"`
 	ExcludeClientIds    []Id            `json:"exclude_client_ids"`
 	ExcludeDestinations [][]Id          `json:"exclude_destinations,omitempty"`
+	RankMode            string          `json:"rank_mode"`
 }
 
 type FindProviders2Result struct {
@@ -324,6 +325,7 @@ type FindProviders2Result struct {
 type FindProvidersProvider struct {
 	ClientId                Id        `json:"client_id"`
 	EstimatedBytesPerSecond ByteCount `json:"estimated_bytes_per_second"`
+	Tier                    int       `json:"tier"`
 	IntermediaryIds         []Id      `json:"intermediary_ids,omitempty"`
 }
 
