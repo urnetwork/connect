@@ -511,13 +511,14 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 	}
 }
 
-func (self *RemoteUserNatMultiClient) selectWindow(sendPacket *parsedPacket) *multiClientWindow {
+// ordered by choice descending
+func (self *RemoteUserNatMultiClient) selectWindowTypes(sendPacket *parsedPacket) []windowType {
 	// - web traffic is routed to quality providers
 	// - all other traffic is routed to speed providers
 	if sendPacket.ipPath.DestinationPort == 443 {
-		return self.windows[windowTypeQuality]
+		return []windowType{windowTypeQuality, windowTypeSpeed}
 	}
-	return self.windows[windowTypeSpeed]
+	return []windowType{windowTypeSpeed, windowTypeQuality}
 }
 
 func (self *RemoteUserNatMultiClient) sendPacket(
@@ -670,9 +671,21 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 			}
 		}
 
-		window := self.selectWindow(sendPacket)
+		windowTypes := self.selectWindowTypes(sendPacket)
 
-		raceClients(window.OrderedClients(), 0)
+		coalesceOrderedClients := func() []*multiClientChannel {
+			for _, windowType := range windowTypes {
+				if window, ok := self.windows[windowType]; ok {
+					orderedClients := window.OrderedClients()
+					if 0 < len(orderedClients) {
+						return orderedClients
+					}
+				}
+			}
+			return []*multiClientChannel{}
+		}
+
+		raceClients(coalesceOrderedClients(), 0)
 		if success {
 			MessagePoolReturn(sendPacket.packet)
 			return
@@ -703,7 +716,7 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 				retryTimeout = self.settings.SendRetryTimeout
 			}
 
-			if orderedClients := window.OrderedClients(); 0 < len(orderedClients) {
+			if orderedClients := coalesceOrderedClients(); 0 < len(orderedClients) {
 				// distribute the timeout evenly via wait
 				retryTimeoutPerClient := retryTimeout / time.Duration(len(orderedClients))
 				raceClients(orderedClients, retryTimeoutPerClient)
