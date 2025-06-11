@@ -512,6 +512,8 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 }
 
 func (self *RemoteUserNatMultiClient) selectWindow(sendPacket *parsedPacket) *multiClientWindow {
+	// - web traffic is routed to quality providers
+	// - all other traffic is routed to speed providers
 	if sendPacket.ipPath.DestinationPort == 443 {
 		return self.windows[windowTypeQuality]
 	}

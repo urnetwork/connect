@@ -164,6 +164,10 @@ func TestWeightedShuffle(t *testing.T) {
 	netIndexes2 := map[int]int64{}
 
 	for i := 0; i < n*k; i += 1 {
+		if i%100 == 0 {
+			fmt.Printf("[w]%d/%d\n", i+1, n*k)
+		}
+
 		values := []int{}
 		weights := map[int]float32{}
 		for j := 0; j < n; j += 1 {
@@ -234,6 +238,10 @@ func TestWeightedShuffleWithEntropy(t *testing.T) {
 		netIndexes2 := map[int]int64{}
 
 		for i := 0; i < n*k; i += 1 {
+			if i%100 == 0 {
+				fmt.Printf("[we]%d/%d\n", i+1, n*k)
+			}
+
 			values := []int{}
 			weights := map[int]float32{}
 			for j := 0; j < n; j += 1 {
