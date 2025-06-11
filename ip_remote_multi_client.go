@@ -524,8 +524,6 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 	sendPacket *parsedPacket,
 	timeout time.Duration,
 ) (success bool) {
-	window := self.selectWindow(sendPacket)
-
 	self.updateClientPath(sendPacket.ipPath, func(update *multiClientChannelUpdate) {
 		enterTime := time.Now()
 
@@ -669,6 +667,8 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 				}
 			}
 		}
+
+		window := self.selectWindow(sendPacket)
 
 		raceClients(window.OrderedClients(), 0)
 		if success {
