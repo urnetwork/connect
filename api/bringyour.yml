@@ -2088,6 +2088,10 @@ components:
             items:
               description: udid
               type: string
+        rank_mode:
+          type: string
+          enum: [quality, speed]
+          default: quality
 
     FindProviders2Result:
       type: object
@@ -2101,6 +2105,8 @@ components:
                 description: udid
                 type: string
               estimated_bytes_per_second:
+                type: integer
+              tier:
                 type: integer
               intermediary_ids:
                 type: array

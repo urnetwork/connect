@@ -36,8 +36,8 @@ func testingNewMultiClient(ctx context.Context, providerClient *Client, receiveP
 	unsubs := map[*Client]func(){}
 
 	generator := &TestMultiClientGenerator{
-		nextDestinations: func(count int, excludeDestinations []MultiHopId) (map[MultiHopId]ByteCount, error) {
-			next := map[MultiHopId]ByteCount{}
+		nextDestinations: func(count int, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error) {
+			next := map[MultiHopId]DestinationStats{}
 			containsTail := func() bool {
 				for _, destination := range excludeDestinations {
 					if 0 < destination.Len() && destination.Tail() == providerClient.ClientId() {
@@ -47,7 +47,10 @@ func testingNewMultiClient(ctx context.Context, providerClient *Client, receiveP
 				return false
 			}
 			if !containsTail() {
-				next[RequireMultiHopId(providerClient.ClientId())] = ByteCount(0)
+				next[RequireMultiHopId(providerClient.ClientId())] = DestinationStats{
+					EstimatedBytesPerSecond: ByteCount(0),
+					Tier:                    0,
+				}
 			}
 			return next, nil
 		},
@@ -133,7 +136,7 @@ func testingNewMultiClient(ctx context.Context, providerClient *Client, receiveP
 }
 
 type TestMultiClientGenerator struct {
-	nextDestinations     func(count int, excludeDestinations []MultiHopId) (map[MultiHopId]ByteCount, error)
+	nextDestinations     func(count int, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error)
 	newClientArgs        func() (*MultiClientGeneratorClientArgs, error)
 	removeClientArgs     func(args *MultiClientGeneratorClientArgs)
 	removeClientWithArgs func(client *Client, args *MultiClientGeneratorClientArgs)
@@ -141,8 +144,8 @@ type TestMultiClientGenerator struct {
 	newClient            func(ctx context.Context, args *MultiClientGeneratorClientArgs, clientSettings *ClientSettings) (*Client, error)
 }
 
-func (self *TestMultiClientGenerator) NextDestinations(count int, excludeDestinations []MultiHopId) (map[MultiHopId]ByteCount, error) {
-	return self.nextDestinations(count, excludeDestinations)
+func (self *TestMultiClientGenerator) NextDestinations(count int, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error) {
+	return self.nextDestinations(count, excludeDestinations, rankMode)
 }
 
 func (self *TestMultiClientGenerator) NewClientArgs() (*MultiClientGeneratorClientArgs, error) {
@@ -184,7 +187,7 @@ func TestMultiClientChannelWindowStats(t *testing.T) {
 	parallelCount := 6
 
 	generator := &TestMultiClientGenerator{
-		nextDestinations: func(count int, excludedDestinations []MultiHopId) (map[MultiHopId]ByteCount, error) {
+		nextDestinations: func(count int, excludedDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error) {
 			// not used
 			return nil, nil
 		},
@@ -228,7 +231,10 @@ func TestMultiClientChannelWindowStats(t *testing.T) {
 	channelArgs := &multiClientChannelArgs{
 		MultiClientGeneratorClientArgs: *args,
 		Destination:                    RequireMultiHopId(NewId()),
-		EstimatedBytesPerSecond:        0,
+		DestinationStats: DestinationStats{
+			EstimatedBytesPerSecond: 0,
+			Tier:                    0,
+		},
 	}
 	assert.Equal(t, nil, err)
 

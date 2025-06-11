@@ -35,6 +35,11 @@ import (
 
 type clientReceivePacketFunction func(client *multiClientChannel, source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte)
 
+type DestinationStats struct {
+	EstimatedBytesPerSecond ByteCount
+	Tier                    int
+}
+
 // for each `NewClientArgs`,
 //
 //	`RemoveClientWithArgs` will be called if a client was created for the args,
@@ -44,7 +49,7 @@ type MultiClientGenerator interface {
 	// the enumeration should typically
 	// 1. not repeat final destination ids from any path
 	// 2. not repeat intermediary elements from any path
-	NextDestinations(count int, excludeDestinations []MultiHopId) (map[MultiHopId]ByteCount, error)
+	NextDestinations(count int, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error)
 	// client id, client auth
 	NewClientArgs() (*MultiClientGeneratorClientArgs, error)
 	RemoveClientArgs(args *MultiClientGeneratorClientArgs)
@@ -157,13 +162,20 @@ type MultiClientSettings struct {
 	RemoteUserNatMultiClientMonitorSettings
 }
 
-type ReceivePacket struct {
+type receivePacket struct {
 	Source      TransferPath
 	ProvideMode protocol.ProvideMode
 	IpPath      *IpPath
 	Packet      []byte
 	Pooled      bool
 }
+
+type windowType int
+
+const (
+	windowTypeQuality windowType = 0
+	windowTypeSpeed   windowType = 1
+)
 
 type RemoteUserNatMultiClient struct {
 	ctx    context.Context
@@ -175,7 +187,8 @@ type RemoteUserNatMultiClient struct {
 
 	settings *MultiClientSettings
 
-	window *multiClientWindow
+	windows map[windowType]*multiClientWindow
+	monitor MultiClientMonitor
 
 	securityPolicyStats   *securityPolicyStats
 	securityPolicy        SecurityPolicy
@@ -223,7 +236,7 @@ func NewRemoteUserNatMultiClient(
 		generator:             generator,
 		receivePacketCallback: receivePacketCallback,
 		settings:              settings,
-		// window:                window,
+		windows:               map[windowType]*multiClientWindow{},
 		securityPolicyStats:   securityPolicyStats,
 		securityPolicy:        DefaultEgressSecurityPolicyWithStats(securityPolicyStats),
 		ingressSecurityPolicy: DefaultIngressSecurityPolicyWithStats(securityPolicyStats),
@@ -233,15 +246,32 @@ func NewRemoteUserNatMultiClient(
 		clientUpdates:         map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
 	}
 
-	multiClient.window = newMultiClientWindow(
+	multiClient.windows[windowTypeQuality] = newMultiClientWindow(
 		cancelCtx,
 		cancel,
 		generator,
 		multiClient.clientReceivePacket,
 		multiClient.ingressSecurityPolicy,
 		multiClient.removeClient,
+		"quality",
 		settings,
 	)
+	multiClient.windows[windowTypeSpeed] = newMultiClientWindow(
+		cancelCtx,
+		cancel,
+		generator,
+		multiClient.clientReceivePacket,
+		multiClient.ingressSecurityPolicy,
+		multiClient.removeClient,
+		"speed",
+		settings,
+	)
+
+	monitors := []MultiClientMonitor{}
+	for _, window := range multiClient.windows {
+		monitors = append(monitors, window.monitor)
+	}
+	multiClient.monitor = NewMergedMultiClientMonitor(monitors)
 
 	return multiClient
 }
@@ -250,12 +280,21 @@ func (self *RemoteUserNatMultiClient) SecurityPolicyStats(reset bool) SecurityPo
 	return self.securityPolicyStats.Stats(reset)
 }
 
-func (self *RemoteUserNatMultiClient) Monitor() *RemoteUserNatMultiClientMonitor {
-	return self.window.monitor
+func (self *RemoteUserNatMultiClient) Monitor() MultiClientMonitor {
+	return self.monitor
 }
 
 func (self *RemoteUserNatMultiClient) AddContractStatusCallback(contractStatusCallback ContractStatusFunction) func() {
-	return self.window.AddContractStatusCallback(contractStatusCallback)
+	subs := []func(){}
+	for _, window := range self.windows {
+		sub := window.AddContractStatusCallback(contractStatusCallback)
+		subs = append(subs, sub)
+	}
+	return func() {
+		for _, sub := range subs {
+			sub()
+		}
+	}
 }
 
 func (self *RemoteUserNatMultiClient) updateClientPath(ipPath *IpPath, callback func(*multiClientChannelUpdate)) {
@@ -342,7 +381,11 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClien
 					}
 				}()
 
-				rst(client)
+				select {
+				case <-self.ctx.Done():
+				default:
+					rst(client)
+				}
 			}, update.cancel)
 			self.ip4PathUpdates[ip4Path] = update
 		}
@@ -377,7 +420,11 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClien
 					}
 				}()
 
-				rst(client)
+				select {
+				case <-self.ctx.Done():
+				default:
+					rst(client)
+				}
 			}, update.cancel)
 			self.ip6PathUpdates[ip6Path] = update
 		}
@@ -464,12 +511,21 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 	}
 }
 
+func (self *RemoteUserNatMultiClient) selectWindow(sendPacket *parsedPacket) *multiClientWindow {
+	if sendPacket.ipPath.DestinationPort == 443 {
+		return self.windows[windowTypeQuality]
+	}
+	return self.windows[windowTypeSpeed]
+}
+
 func (self *RemoteUserNatMultiClient) sendPacket(
 	source TransferPath,
 	provideMode protocol.ProvideMode,
 	sendPacket *parsedPacket,
 	timeout time.Duration,
 ) (success bool) {
+	window := self.selectWindow(sendPacket)
+
 	self.updateClientPath(sendPacket.ipPath, func(update *multiClientChannelUpdate) {
 		enterTime := time.Now()
 
@@ -614,7 +670,7 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 			}
 		}
 
-		raceClients(self.window.OrderedClients(), 0)
+		raceClients(window.OrderedClients(), 0)
 		if success {
 			MessagePoolReturn(sendPacket.packet)
 			return
@@ -645,7 +701,7 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 				retryTimeout = self.settings.SendRetryTimeout
 			}
 
-			if orderedClients := self.window.OrderedClients(); 0 < len(orderedClients) {
+			if orderedClients := window.OrderedClients(); 0 < len(orderedClients) {
 				// distribute the timeout evenly via wait
 				retryTimeoutPerClient := retryTimeout / time.Duration(len(orderedClients))
 				raceClients(orderedClients, retryTimeoutPerClient)
@@ -683,8 +739,8 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 	ipPath = ipPath.Reverse()
 
 	var abandonedClients []*multiClientChannel
-	var receivePackets []*ReceivePacket
-	var returnPackets []*ReceivePacket
+	var receivePackets []*receivePacket
+	var returnPackets []*receivePacket
 	self.updateClientPath(ipPath, func(update *multiClientChannelUpdate) {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -692,13 +748,13 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 		client := update.client
 
 		if client == sourceClient {
-			receivePacket := &ReceivePacket{
+			p := &receivePacket{
 				Source:      source,
 				ProvideMode: provideMode,
 				IpPath:      ipPath,
 				Packet:      packet,
 			}
-			receivePackets = []*ReceivePacket{receivePacket}
+			receivePackets = []*receivePacket{p}
 		} else if client != nil {
 			// another client already chosen, drop
 		} else if race := update.race; race == nil {
@@ -712,7 +768,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 			// since the packet is typically a slice of the received transfer frame
 			ipPathCopy := ipPath.Copy()
 			packetCopy, pooled := MessagePoolCopyDetailed(packet)
-			receivePacket := &ReceivePacket{
+			receivePacket := &receivePacket{
 				Source:      source,
 				ProvideMode: provideMode,
 				IpPath:      ipPathCopy,
@@ -754,7 +810,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 
 			update.clearRace()
 			update.client = client
-			receivePacket := &ReceivePacket{
+			receivePacket := &receivePacket{
 				Source:      source,
 				ProvideMode: provideMode,
 				IpPath:      ipPath,
@@ -803,8 +859,8 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 		}
 
 		var abandonedClients []*multiClientChannel
-		var receivePackets []*ReceivePacket
-		var returnPackets []*ReceivePacket
+		var receivePackets []*receivePacket
+		var returnPackets []*receivePacket
 		self.updateClientPath(ipPath, func(update *multiClientChannelUpdate) {
 			self.stateLock.Lock()
 			defer self.stateLock.Unlock()
@@ -868,12 +924,16 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 }
 
 func (self *RemoteUserNatMultiClient) Shuffle() {
-	self.window.shuffle()
+	for _, window := range self.windows {
+		window.shuffle()
+	}
 }
 
 func (self *RemoteUserNatMultiClient) Close() {
 	self.cancel()
-	self.window.Close()
+	for _, window := range self.windows {
+		window.Close()
+	}
 
 	func() {
 		self.stateLock.Lock()
@@ -972,7 +1032,7 @@ func (self *multiClientChannelUpdateRace) Close() {
 type multiClientChannelRaceClientState struct {
 	sendTime    time.Time
 	receiveTime time.Time
-	packets     []*ReceivePacket
+	packets     []*receivePacket
 }
 
 type parsedPacket struct {
@@ -1087,7 +1147,7 @@ func NewApiMultiClientGenerator(
 	}
 }
 
-func (self *ApiMultiClientGenerator) NextDestinations(count int, excludeDestinations []MultiHopId) (map[MultiHopId]ByteCount, error) {
+func (self *ApiMultiClientGenerator) NextDestinations(count int, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error) {
 	excludeClientIds := slices.Clone(self.excludeClientIds)
 	excludeDestinationsIds := [][]Id{}
 	for _, excludeDestination := range excludeDestinations {
@@ -1098,6 +1158,7 @@ func (self *ApiMultiClientGenerator) NextDestinations(count int, excludeDestinat
 		ExcludeClientIds:    excludeClientIds,
 		ExcludeDestinations: excludeDestinationsIds,
 		Count:               count,
+		RankMode:            rankMode,
 	}
 
 	result, err := self.api.FindProviders2Sync(findProviders2)
@@ -1105,7 +1166,7 @@ func (self *ApiMultiClientGenerator) NextDestinations(count int, excludeDestinat
 		return nil, err
 	}
 
-	clientIdEstimatedBytesPerSecond := map[MultiHopId]ByteCount{}
+	destinations := map[MultiHopId]DestinationStats{}
 	for _, provider := range result.Providers {
 		ids := []Id{}
 		if 0 < len(provider.IntermediaryIds) {
@@ -1117,11 +1178,14 @@ func (self *ApiMultiClientGenerator) NextDestinations(count int, excludeDestinat
 			ids = ids[len(ids)-MaxMultihopLength:]
 		}
 		if destination, err := NewMultiHopId(ids...); err == nil {
-			clientIdEstimatedBytesPerSecond[destination] = provider.EstimatedBytesPerSecond
+			destinations[destination] = DestinationStats{
+				EstimatedBytesPerSecond: provider.EstimatedBytesPerSecond,
+				Tier:                    provider.Tier,
+			}
 		}
 	}
 
-	return clientIdEstimatedBytesPerSecond, nil
+	return destinations, nil
 }
 
 func (self *ApiMultiClientGenerator) NewClientArgs() (*MultiClientGeneratorClientArgs, error) {
@@ -1246,6 +1310,7 @@ type multiClientWindow struct {
 	clientReceivePacketCallback clientReceivePacketFunction
 	ingressSecurityPolicy       SecurityPolicy
 	clientRemoveCallback        func(client *multiClientChannel)
+	rankMode                    string
 
 	settings *MultiClientSettings
 
@@ -1266,6 +1331,7 @@ func newMultiClientWindow(
 	clientReceivePacketCallback clientReceivePacketFunction,
 	ingressSecurityPolicy SecurityPolicy,
 	clientRemoveCallback func(client *multiClientChannel),
+	rankMode string,
 	settings *MultiClientSettings,
 ) *multiClientWindow {
 	window := &multiClientWindow{
@@ -1275,6 +1341,7 @@ func newMultiClientWindow(
 		clientReceivePacketCallback: clientReceivePacketCallback,
 		ingressSecurityPolicy:       ingressSecurityPolicy,
 		clientRemoveCallback:        clientRemoveCallback,
+		rankMode:                    rankMode,
 		settings:                    settings,
 		clientChannelArgs:           make(chan *multiClientChannelArgs, settings.WindowSizeMin),
 		monitor:                     NewRemoteUserNatMultiClientMonitor(&settings.RemoteUserNatMultiClientMonitorSettings),
@@ -1325,8 +1392,8 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 	// a destination can be revisited after `WindowRevisitTimeout`
 	visitedDestinations := map[MultiHopId]time.Time{}
 	for {
-		destinationEstimatedBytesPerSecond := map[MultiHopId]ByteCount{}
-		for len(destinationEstimatedBytesPerSecond) == 0 {
+		destinations := map[MultiHopId]DestinationStats{}
+		for len(destinations) == 0 {
 			// exclude destinations that are already in the window
 			windowDestinations := map[MultiHopId]bool{}
 			func() {
@@ -1343,9 +1410,10 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 					delete(visitedDestinations, destination)
 				}
 			}
-			nextDestinationEstimatedBytesPerSecond, err := self.generator.NextDestinations(
+			nextDestinations, err := self.generator.NextDestinations(
 				1,
 				maps.Keys(visitedDestinations),
+				self.rankMode,
 			)
 			if err != nil {
 				glog.Infof("[multi]window enumerate error timeout = %s\n", err)
@@ -1355,8 +1423,8 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 				case <-time.After(self.settings.WindowEnumerateErrorTimeout):
 				}
 			} else {
-				for destination, estimatedBytesPerSecond := range nextDestinationEstimatedBytesPerSecond {
-					destinationEstimatedBytesPerSecond[destination] = estimatedBytesPerSecond
+				for destination, stats := range nextDestinations {
+					destinations[destination] = stats
 					visitedDestinations[destination] = time.Now()
 				}
 				// remove destinations that are already in the window
@@ -1364,11 +1432,11 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 					self.stateLock.Lock()
 					defer self.stateLock.Unlock()
 					for destination, _ := range self.destinationClients {
-						delete(destinationEstimatedBytesPerSecond, destination)
+						delete(destinations, destination)
 					}
 				}()
 
-				if len(destinationEstimatedBytesPerSecond) == 0 {
+				if len(destinations) == 0 {
 					// reset
 					clear(visitedDestinations)
 					glog.Infof("[multi]window enumerate empty timeout.\n")
@@ -1381,11 +1449,11 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			}
 		}
 
-		for destination, estimatedBytesPerSecond := range destinationEstimatedBytesPerSecond {
+		for destination, stats := range destinations {
 			if clientArgs, err := self.generator.NewClientArgs(); err == nil {
 				args := &multiClientChannelArgs{
 					Destination:                    destination,
-					EstimatedBytesPerSecond:        estimatedBytesPerSecond,
+					DestinationStats:               stats,
 					MultiClientGeneratorClientArgs: *clientArgs,
 				}
 				select {
@@ -1764,6 +1832,8 @@ func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 	weights := map[*multiClientChannel]float32{}
 	durations := map[*multiClientChannel]time.Duration{}
 
+	// FIXME only keep clients with the same tier as the min tier
+
 	for _, client := range self.clients() {
 		if stats, err := client.WindowStats(); err == nil {
 			clients = append(clients, client)
@@ -1793,7 +1863,26 @@ func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 
 	WeightedShuffleWithEntropy(nonNegativeClients, weights, self.settings.StatsWindowEntropy)
 
-	return nonNegativeClients
+	if 0 == len(nonNegativeClients) {
+		return nonNegativeClients
+	}
+
+	// use only clients in the min tier
+	// this prevents the window from crossing rank until necessary
+	minTierClients := []*multiClientChannel{}
+	minTier := nonNegativeClients[0].Tier()
+	for _, client := range nonNegativeClients[1:] {
+		minTier = min(minTier, client.Tier())
+	}
+	for _, client := range nonNegativeClients {
+		if client.Tier() == minTier {
+			minTierClients = append(minTierClients, client)
+		} else {
+			glog.Infof("[multi]exclude tier from window %d>%d\n", client.Tier(), minTier)
+		}
+	}
+
+	return minTierClients
 }
 
 func (self *multiClientWindow) statsSampleWeights(weights map[*multiClientChannel]float32) {
@@ -1866,8 +1955,8 @@ func (self *multiClientWindow) removeClients(removedClients []*multiClientChanne
 type multiClientChannelArgs struct {
 	MultiClientGeneratorClientArgs
 
-	Destination             MultiHopId
-	EstimatedBytesPerSecond ByteCount
+	Destination MultiHopId
+	DestinationStats
 }
 
 type multiClientEventType int
@@ -2026,6 +2115,10 @@ func (self *multiClientChannel) ClientId() Id {
 
 func (self *multiClientChannel) IsP2pOnly() bool {
 	return self.args.MultiClientGeneratorClientArgs.P2pOnly
+}
+
+func (self *multiClientChannel) Tier() int {
+	return self.args.DestinationStats.Tier
 }
 
 // func (self *multiClientChannel) UpdateAffinity() {

@@ -70,6 +70,14 @@ type RemoteUserNatMultiClientMonitorSettings struct {
 	// EventWindowDuration time.Duration
 }
 
+type MultiClientMonitor interface {
+	AddMonitorEventCallback(monitorEventCallback MonitorEventFunction) func()
+	Events() (*WindowExpandEvent, map[Id]*ProviderEvent)
+	WindowExpandEvent() *WindowExpandEvent
+	ProviderEvents() map[Id]*ProviderEvent
+}
+
+// conforms to `MultiClientMonitor`
 type RemoteUserNatMultiClientMonitor struct {
 	settings *RemoteUserNatMultiClientMonitorSettings
 
@@ -156,6 +164,24 @@ func (self *RemoteUserNatMultiClientMonitor) Events() (*WindowExpandEvent, map[I
 	return &windowExpandEvent, maps.Clone(self.clientIdProviderEvents)
 }
 
+func (self *RemoteUserNatMultiClientMonitor) WindowExpandEvent() *WindowExpandEvent {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	// make a copy
+	windowExpandEvent := self.windowExpandEvent
+	return &windowExpandEvent
+
+}
+
+func (self *RemoteUserNatMultiClientMonitor) ProviderEvents() map[Id]*ProviderEvent {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	// make a copy
+	return maps.Clone(self.clientIdProviderEvents)
+}
+
 func (self *RemoteUserNatMultiClientMonitor) AddWindowExpandEvent(minSatisfied bool, targetSize int) {
 	var windowExpandEvent WindowExpandEvent
 	changed := false
@@ -217,4 +243,58 @@ func (self *RemoteUserNatMultiClientMonitor) AddProviderEvent(clientId Id, state
 			callback(&windowExpandEvent, clientIdProviderEvents, false)
 		}
 	}
+}
+
+type MergedMultiClientMonitor struct {
+	monitors []MultiClientMonitor
+}
+
+func NewMergedMultiClientMonitor(monitors []MultiClientMonitor) *MergedMultiClientMonitor {
+	return &MergedMultiClientMonitor{
+		monitors: monitors,
+	}
+}
+
+func (self *MergedMultiClientMonitor) AddMonitorEventCallback(monitorEventCallback MonitorEventFunction) func() {
+	c := func(_ *WindowExpandEvent, providerEvents map[Id]*ProviderEvent, reset bool) {
+		windowExpandEvent := self.WindowExpandEvent()
+		monitorEventCallback(windowExpandEvent, providerEvents, reset)
+	}
+
+	subs := []func(){}
+	for _, monitor := range self.monitors {
+		sub := monitor.AddMonitorEventCallback(c)
+		subs = append(subs, sub)
+	}
+	return func() {
+		for _, sub := range subs {
+			sub()
+		}
+	}
+}
+
+func (self *MergedMultiClientMonitor) Events() (*WindowExpandEvent, map[Id]*ProviderEvent) {
+	return self.WindowExpandEvent(), self.ProviderEvents()
+}
+
+func (self *MergedMultiClientMonitor) WindowExpandEvent() *WindowExpandEvent {
+	netWindowExpandEvent := WindowExpandEvent{
+		TargetSize:   0,
+		MinSatisfied: true,
+	}
+	for _, monitor := range self.monitors {
+		windowExpandEvent := monitor.WindowExpandEvent()
+		netWindowExpandEvent.TargetSize += windowExpandEvent.TargetSize
+		netWindowExpandEvent.MinSatisfied = netWindowExpandEvent.MinSatisfied && windowExpandEvent.MinSatisfied
+	}
+	return &netWindowExpandEvent
+}
+
+func (self *MergedMultiClientMonitor) ProviderEvents() map[Id]*ProviderEvent {
+	netProviderEvents := map[Id]*ProviderEvent{}
+	for _, monitor := range self.monitors {
+		providerEvents := monitor.ProviderEvents()
+		maps.Copy(netProviderEvents, providerEvents)
+	}
+	return netProviderEvents
 }
