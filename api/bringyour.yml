@@ -43,6 +43,7 @@ security:
   - BearerAuth: []
 
 paths:
+
   /stats/last-90:
     get:
       description: |
@@ -1342,6 +1343,35 @@ paths:
               schema:
                 $ref: "#/components/schemas/TransferStatsResult"
 
+  /earn/{datetime}:
+    get:
+      description:
+        Return a map of wallet address to fraction of earning for the payout for `datetime`.
+        `sum(earning_fraction) <= 1` for all entries 
+        `datetime` is in format either yyyy-mm-dd, or integer days since the unix epoch
+      operationId: Earn Datetime
+      security: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EarnDatetimeResult"
+
+  /earn/{datetime}/payout:
+    get:
+      description:
+        Return meta data on the total payout for `datetime`.
+        `datetime` is in format either yyyy-mm-dd, or integer days since the unix epoch
+      operationId: Earn Datetime Payout
+      security: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EarnDatetimePayoutResult"
+
 components:
   securitySchemes:
     BearerAuth:
@@ -1350,6 +1380,7 @@ components:
       description: BringYour JWT
 
   schemas:
+
     ProvideMode:
       type: integer
       oneOf:
@@ -3083,3 +3114,21 @@ components:
 
     UnlinkReferralNetworkResult:
       type: object
+
+    EarnDatetimeResult:
+      type: object
+      properties:
+        earnings:
+          type: object
+          description: wallet address to fraction of earning
+          additionalProperties:
+            x-additionalPropertiesName: wallet_address
+            type: number
+
+    EarnDatetimePayoutResult:
+      type: object
+      properties:
+        total_payment:
+          type: number
+          description: Total payment in token
+
