@@ -126,8 +126,9 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		ModeInitialDelay:     1 * time.Second,
 		ProtocolVersion:      DefaultProtocolVersion,
 		// FIXME
-		DnsTlds:  nil,
-		V2H1Auth: false,
+		DnsTlds: nil,
+		// servers are migrated on 2025-06-12. We can remove this and always use true.
+		V2H1Auth: true,
 	}
 }
 
