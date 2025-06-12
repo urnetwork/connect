@@ -1294,6 +1294,20 @@ paths:
               schema:
                 $ref: "#/components/schemas/ReferralNetworkResult"
 
+  /account/unlink-referral-network:
+    get:
+      description: |
+        Unlink the referral network from the authenticated network.
+      operationId: Account Unlink Referral Network
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UnlinkReferralNetworkResult"
+
   /account/set-referral:
     post:
       description: |
@@ -3066,3 +3080,6 @@ components:
           properties:
             message:
               type: string
+
+    UnlinkReferralNetworkResult:
+      type: object
