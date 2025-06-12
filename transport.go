@@ -515,7 +515,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						glog.V(2).Infof("[ts]%s->\n", clientId)
 
 						writeCounter.Add(1)
-					case <-WakeupAfter(self.settings.PingTimeout):
+					case <-WakeupAfter(self.settings.PingTimeout, self.settings.PingTimeout):
 						ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
 						if err := ws.WriteMessage(websocket.BinaryMessage, make([]byte, 0)); err != nil {
 							// note that for websocket a dealine timeout cannot be recovered
@@ -861,7 +861,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 							return
 						}
 						glog.V(2).Infof("[ts]%s->\n", clientId)
-					case <-WakeupAfter(self.settings.PingTimeout):
+					case <-WakeupAfter(self.settings.PingTimeout, self.settings.PingTimeout):
 						stream.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
 						if err := h3Framer.Write(stream, make([]byte, 0)); err != nil {
 							// note that for websocket a dealine timeout cannot be recovered

@@ -695,7 +695,7 @@ func (self *Client) run() {
 				select {
 				case <-self.ctx.Done():
 					return
-				case <-WakeupAfter(timeout):
+				case <-WakeupAfter(timeout, self.settings.ControlPingTimeout):
 				}
 
 				ack := make(chan error)
