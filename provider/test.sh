@@ -1,4 +1,4 @@
 #!/usr/bin/env zsh
 
-go get -t -u ./...
-
+# FIXME
+# go test
