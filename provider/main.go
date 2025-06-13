@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"net/http"
 	"os"
@@ -30,6 +31,22 @@ const DefaultConnectUrl = "wss://connect.bringyour.com"
 // -ldflags "-X main.Version=$WARP_VERSION-$WARP_VERSION_CODE"
 var Version string
 
+func init() {
+	// debug.SetGCPercent(10)
+
+	initGlog()
+
+	// initPprof()
+}
+
+func initGlog() {
+	flag.Set("logtostderr", "true")
+	flag.Set("stderrthreshold", "INFO")
+	flag.Set("v", "0")
+	// unlike unix, the android/ios standard is for diagnostics to go to stdout
+	os.Stderr = os.Stdout
+}
+
 func main() {
 	usage := fmt.Sprintf(
 		`Connect provider.
@@ -42,15 +59,18 @@ Usage:
     provider auth ([<auth_code>] | --user_auth=<user_auth> [--password=<password>]) [-f]
     	[--api_url=<api_url>]
     	[--max-memory=<mem>]
+    	[-v...]
     provider provide [--port=<port>]
         [--api_url=<api_url>]
         [--connect_url=<connect_url>]
         [--max-memory=<mem>]
+        [-v...]
     provider auth-provide ([<auth_code>] | --user_auth=<user_auth> [--password=<password>]) [-f]
     	[--port=<port>]
         [--api_url=<api_url>]
         [--connect_url=<connect_url>]
         [--max-memory=<mem>]
+        [-v...]
     
 Options:
     -h --help                        Show this screen.
