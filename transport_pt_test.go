@@ -39,6 +39,10 @@ func TestPtDnsPumpEncodeDecode(t *testing.T) {
 }
 
 func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, serverPtMode PacketTranslationMode) {
+	if testing.Short() {
+		return
+	}
+
 	ctx := context.Background()
 
 	consecutive := func(n int) []byte {

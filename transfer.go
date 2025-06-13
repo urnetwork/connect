@@ -111,7 +111,7 @@ func DefaultSendBufferSettings() *SendBufferSettings {
 		AckBufferSize:       DefaultTransferBufferSize,
 		MinMessageByteCount: ByteCount(1),
 		// this includes transport reconnections
-		WriteTimeout:            15 * time.Second,
+		WriteTimeout:            30 * time.Second,
 		ResendQueueMaxByteCount: mib(2),
 		ContractFillFraction:    0.5,
 		ProtocolVersion:         DefaultProtocolVersion,
@@ -131,7 +131,7 @@ func DefaultReceiveBufferSettings() *ReceiveBufferSettings {
 		// ResendAbuseMultiple:  0.5,
 		MaxPeerAuditDuration: 60 * time.Second,
 		// this includes transport reconnections
-		WriteTimeout:             15 * time.Second,
+		WriteTimeout:             30 * time.Second,
 		ReceiveQueueMaxByteCount: mib(2) + kib(512),
 		AllowLegacyNack:          true,
 		MaxOpenReceiveContract:   4,
@@ -143,7 +143,7 @@ func DefaultForwardBufferSettings() *ForwardBufferSettings {
 	return &ForwardBufferSettings{
 		IdleTimeout:        60 * time.Second,
 		SequenceBufferSize: DefaultTransferBufferSize,
-		WriteTimeout:       15 * time.Second,
+		WriteTimeout:       30 * time.Second,
 	}
 }
 

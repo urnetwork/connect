@@ -8,7 +8,9 @@ import (
 	mathrand "math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -99,6 +101,9 @@ type PlatformTransportSettings struct {
 
 	ProtocolVersion int
 
+	H3Port  int
+	DnsPort int
+
 	// FIXME
 	DnsTlds  [][]byte
 	V2H1Auth bool
@@ -110,20 +115,22 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		panic(err)
 	}
 	return &PlatformTransportSettings{
-		HttpConnectTimeout:   2 * time.Second,
-		WsHandshakeTimeout:   2 * time.Second,
-		QuicConnectTimeout:   2 * time.Second,
-		QuicHandshakeTimeout: 2 * time.Second,
+		HttpConnectTimeout:   5 * time.Second,
+		WsHandshakeTimeout:   5 * time.Second,
+		QuicConnectTimeout:   5 * time.Second,
+		QuicHandshakeTimeout: 5 * time.Second,
 		QuicTlsConfig:        tlsConfig,
-		AuthTimeout:          2 * time.Second,
+		AuthTimeout:          5 * time.Second,
 		ReconnectTimeout:     5 * time.Second,
 		PingTimeout:          15 * time.Second,
-		WriteTimeout:         5 * time.Second,
-		ReadTimeout:          15 * time.Second,
+		WriteTimeout:         10 * time.Second,
+		ReadTimeout:          30 * time.Second,
 		TransportBufferSize:  1,
-		InactiveDrainTimeout: 15 * time.Second,
-		ModeInitialDelay:     1 * time.Second,
+		InactiveDrainTimeout: 30 * time.Second,
+		ModeInitialDelay:     2 * time.Second,
 		ProtocolVersion:      DefaultProtocolVersion,
+		H3Port:               443,
+		DnsPort:              53,
 		// FIXME
 		DnsTlds: nil,
 		// servers are migrated on 2025-06-12. We can remove this and always use true.
@@ -662,8 +669,9 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			}
 			var tlsConfig *tls.Config
 			if self.settings.QuicTlsConfig != nil {
-				tlsConfig_ := *self.settings.QuicTlsConfig
-				tlsConfig = &tlsConfig_
+				// copy
+				tlsConfigCopy := *self.settings.QuicTlsConfig
+				tlsConfig = &tlsConfigCopy
 			} else {
 				tlsConfig = &tls.Config{}
 			}
@@ -679,14 +687,20 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			// 	return nil, err
 			// }
 
+			serverName, err := connectHost(self.platformUrl)
+			if err != nil {
+				return nil, err
+			}
 			var udpAddr *net.UDPAddr
-			var serverName string
 			switch ptMode {
 			case TransportModeH3Dns:
 				quicConfig.DisablePathMTUDiscovery = true
 				tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
-				serverName = connectHost(self.platformUrl)
-				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", serverName, 53))
+				pumpServerName, err := pumpHost(self.platformUrl, tld)
+				if err != nil {
+					return nil, err
+				}
+				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", pumpServerName, self.settings.DnsPort))
 				ptSettings := &PacketTranslationSettings{
 					DnsTlds: [][]byte{tld},
 				}
@@ -697,8 +711,11 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			case TransportModeH3DnsPump:
 				quicConfig.DisablePathMTUDiscovery = true
 				tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
-				serverName = pumpHost(self.platformUrl, tld)
-				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", serverName, 53))
+				pumpServerName, err := pumpHost(self.platformUrl, tld)
+				if err != nil {
+					return nil, err
+				}
+				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", pumpServerName, self.settings.DnsPort))
 				ptSettings := &PacketTranslationSettings{
 					DnsTlds: [][]byte{tld},
 				}
@@ -707,8 +724,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 					return nil, err
 				}
 			default:
-				serverName = connectHost(self.platformUrl)
-				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", serverName, 443))
+				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", serverName, self.settings.H3Port))
 				packetConn = udpConn
 			}
 
@@ -934,12 +950,27 @@ func (self *PlatformTransport) Close() {
 	self.cancel()
 }
 
-// FIXME
-func connectHost(platformUrl string) string {
-	return platformUrl
+func connectHost(platformUrl string) (string, error) {
+	u, err := url.Parse(platformUrl)
+	if err != nil {
+		return "", err
+	}
+	return u.Hostname(), nil
 }
 
-// FIXME
-func pumpHost(platformUrl string, tld []byte) string {
-	return platformUrl
+// this host should resolve in dns to the root zone ips for the tld
+func pumpHost(platformUrl string, tld []byte) (string, error) {
+	u, err := url.Parse(platformUrl)
+	if err != nil {
+		return "", err
+	}
+	host := u.Hostname()
+	if net.ParseIP(host) != nil {
+		return host, nil
+	}
+	// tld replace . with -
+	// zone-<tld>.<base>
+	baseHost := strings.SplitN(host, ".", 2)[1]
+	pumpHost := fmt.Sprintf("zone-%s.%s", strings.ReplaceAll(string(tld), ".", "-"), baseHost)
+	return pumpHost, nil
 }
