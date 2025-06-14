@@ -82,7 +82,7 @@ func (self *combineQueue) Combine(addr net.Addr, header [18]byte, data []byte) (
 			return
 		}
 
-		if self.settings.DnsMaxCombine <= len(self.orderedItems) {
+		if self.settings.DnsMaxCombine <= int64(len(self.orderedItems)) {
 			// fmt.Printf("LIMIT ALL\n")
 			limit = true
 			return
@@ -289,7 +289,7 @@ func (self *pumpQueue) Add(item *pumpItem) (limit bool) {
 	// note a hard limit is enforced rather than replacing older with newer
 	// this is to prevent unlimited abuse where pump headers can be added forever
 
-	if self.settings.DnsMaxPumpHosts <= len(self.orderedItems) {
+	if self.settings.DnsMaxPumpHosts <= int64(len(self.orderedItems)) {
 		limit = true
 		return
 	}

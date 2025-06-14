@@ -71,10 +71,10 @@ type PacketTranslationSettings struct {
 	DnsStateTimeout time.Duration
 
 	DnsMaxCombinePerAddress int
-	DnsMaxCombine           int
+	DnsMaxCombine           int64
 
 	DnsMaxPumpHostsPerAddress int
-	DnsMaxPumpHosts           int
+	DnsMaxPumpHosts           int64
 
 	WritePacketsPerSecond int
 	SequenceBufferSize    int
