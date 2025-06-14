@@ -161,7 +161,7 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 
 			ptSettings := DefaultPacketTranslationSettings()
 			ptSettings.DnsTlds = [][]byte{tld}
-			ptSettings.DnsAddr = serverAddr
+			// ptSettings.DnsAddr = serverAddr
 			ptConn, err := NewPacketTranslation(handleCtx, clientPtMode, lossConn, ptSettings)
 			assert.Equal(t, err, nil)
 			defer ptConn.Close()

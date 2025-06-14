@@ -43,7 +43,7 @@ const (
 	PacketTranslationModeDecode53RequireDnsPump PacketTranslationMode = "decode53pumpreq"
 )
 
-// note the caller must set DnsTld and DnsAddr
+// note the caller must set DnsTld
 func DefaultPacketTranslationSettings() *PacketTranslationSettings {
 	return &PacketTranslationSettings{
 		DnsTlds: [][]byte{},
@@ -64,8 +64,8 @@ func DefaultPacketTranslationSettings() *PacketTranslationSettings {
 }
 
 type PacketTranslationSettings struct {
-	DnsTlds        [][]byte
-	DnsAddr        *net.UDPAddr
+	DnsTlds [][]byte
+	// DnsAddr        *net.UDPAddr
 	DnsPumpTimeout time.Duration
 	// DnsReadTimeout time.Duration
 	DnsStateTimeout time.Duration
@@ -161,6 +161,7 @@ func (self *packetTranslation) encodeDns() {
 
 	var buf [1024]byte
 	var id uint16
+	var mostRecentAddr net.Addr
 	for {
 		if self.dnsClient {
 			writeOne := func(p *packet) error {
@@ -229,36 +230,41 @@ func (self *packetTranslation) encodeDns() {
 					return
 				case p := <-self.out:
 					// each write includes one pump header
+					mostRecentAddr = p.addr
 					if err := writeOne(p); err != nil {
 						glog.Errorf("[pt]write err = %s\n", err)
 						return
 					}
 				case <-time.After(self.settings.DnsPumpTimeout):
 					// pump one header the server can use to repsond to
-					tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
+					if mostRecentAddr != nil {
+						tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
 
-					var header [18]byte
-					mathrand.Read(header[0:16])
+						var header [18]byte
+						mathrand.Read(header[0:16])
 
-					_, packetData, err := encodeDnsRequest(
-						id,
-						header,
-						make([]byte, 0),
-						buf,
-						tld,
-					)
-					id += 1
-					if err != nil {
-						// drop the packet
-						break
-					}
+						_, packetData, err := encodeDnsRequest(
+							id,
+							header,
+							make([]byte, 0),
+							buf,
+							tld,
+						)
+						id += 1
+						if err != nil {
+							// drop the packet
+							break
+						}
 
-					// fmt.Printf("PACKET WRITE TO: %v\n", string(packetData))
+						// fmt.Printf("PACKET WRITE TO: %v\n", string(packetData))
 
-					_, err = self.packetConn.WriteTo(packetData, self.settings.DnsAddr)
-					if err != nil {
-						glog.Errorf("[pt]write err = %s\n", err)
-						return
+						_, err = self.packetConn.WriteTo(packetData, mostRecentAddr)
+						if err != nil {
+							glog.Errorf("[pt]write err = %s\n", err)
+							return
+						}
+					} else {
+						glog.Infof("[pt]cannot pump dns due to missing most recent addr\n")
 					}
 				}
 			} else {
