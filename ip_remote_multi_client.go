@@ -40,6 +40,24 @@ type DestinationStats struct {
 	Tier                    int
 }
 
+type WindowType int
+
+func (self WindowType) RankMode() string {
+	switch self {
+	case WindowTypeQuality:
+		return "quality"
+	case WindowTypeSpeed:
+		return "speed"
+	default:
+		return ""
+	}
+}
+
+const (
+	WindowTypeQuality WindowType = 0
+	WindowTypeSpeed   WindowType = 1
+)
+
 // for each `NewClientArgs`,
 //
 //	`RemoveClientWithArgs` will be called if a client was created for the args,
@@ -62,13 +80,27 @@ type MultiClientGenerator interface {
 func DefaultMultiClientSettings() *MultiClientSettings {
 	return &MultiClientSettings{
 		SequenceIdleTimeout: 30 * time.Second,
-		WindowSizeMin:       4,
-		// TODO increase this when p2p is deployed
-		WindowSizeMinP2pOnly: 0,
-		WindowSizeMax:        8,
-		// reconnects per source
-		WindowSizeReconnectScale: 1.0,
-		SendRetryTimeout:         200 * time.Millisecond,
+
+		WindowSizes: map[WindowType]WindowSizeSettings{
+			WindowTypeQuality: WindowSizeSettings{
+				WindowSizeMin: 4,
+				// TODO increase this when p2p is deployed
+				WindowSizeMinP2pOnly: 0,
+				WindowSizeMax:        8,
+				// reconnects per source
+				WindowSizeReconnectScale: 1.0,
+			},
+			WindowTypeSpeed: WindowSizeSettings{
+				WindowSizeMin: 1,
+				// TODO increase this when p2p is deployed
+				WindowSizeMinP2pOnly: 0,
+				WindowSizeMax:        2,
+				WindowSizeUseMax:     1,
+				// reconnects per source
+				WindowSizeReconnectScale: 1.0,
+			},
+		},
+		SendRetryTimeout: 200 * time.Millisecond,
 		// this includes the time to establish the transport
 		PingWriteTimeout: 5 * time.Second,
 		PingTimeout:      10 * time.Second,
@@ -110,12 +142,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 
 type MultiClientSettings struct {
 	SequenceIdleTimeout time.Duration
-	WindowSizeMin       int
-	// the minimumum number of items in the windows that must be connected via p2p only
-	WindowSizeMinP2pOnly int
-	WindowSizeMax        int
-	// reconnects per source
-	WindowSizeReconnectScale float64
+	WindowSizes         map[WindowType]WindowSizeSettings
 	// ClientNackInitialLimit int
 	// ClientNackMaxLimit int
 	// ClientNackScale float64
@@ -162,6 +189,16 @@ type MultiClientSettings struct {
 	RemoteUserNatMultiClientMonitorSettings
 }
 
+type WindowSizeSettings struct {
+	WindowSizeMin int
+	// the minimumum number of items in the windows that must be connected via p2p only
+	WindowSizeMinP2pOnly int
+	WindowSizeMax        int
+	WindowSizeUseMax     int
+	// reconnects per source
+	WindowSizeReconnectScale float64
+}
+
 type receivePacket struct {
 	Source      TransferPath
 	ProvideMode protocol.ProvideMode
@@ -169,13 +206,6 @@ type receivePacket struct {
 	Packet      []byte
 	Pooled      bool
 }
-
-type windowType int
-
-const (
-	windowTypeQuality windowType = 0
-	windowTypeSpeed   windowType = 1
-)
 
 type RemoteUserNatMultiClient struct {
 	ctx    context.Context
@@ -187,7 +217,7 @@ type RemoteUserNatMultiClient struct {
 
 	settings *MultiClientSettings
 
-	windows map[windowType]*multiClientWindow
+	windows map[WindowType]*multiClientWindow
 	monitor MultiClientMonitor
 
 	securityPolicyStats   *securityPolicyStats
@@ -236,7 +266,7 @@ func NewRemoteUserNatMultiClient(
 		generator:             generator,
 		receivePacketCallback: receivePacketCallback,
 		settings:              settings,
-		windows:               map[windowType]*multiClientWindow{},
+		windows:               map[WindowType]*multiClientWindow{},
 		securityPolicyStats:   securityPolicyStats,
 		securityPolicy:        DefaultEgressSecurityPolicyWithStats(securityPolicyStats),
 		ingressSecurityPolicy: DefaultIngressSecurityPolicyWithStats(securityPolicyStats),
@@ -246,24 +276,24 @@ func NewRemoteUserNatMultiClient(
 		clientUpdates:         map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
 	}
 
-	multiClient.windows[windowTypeQuality] = newMultiClientWindow(
+	multiClient.windows[WindowTypeQuality] = newMultiClientWindow(
 		cancelCtx,
 		cancel,
 		generator,
 		multiClient.clientReceivePacket,
 		multiClient.ingressSecurityPolicy,
 		multiClient.removeClient,
-		"quality",
+		WindowTypeQuality,
 		settings,
 	)
-	multiClient.windows[windowTypeSpeed] = newMultiClientWindow(
+	multiClient.windows[WindowTypeSpeed] = newMultiClientWindow(
 		cancelCtx,
 		cancel,
 		generator,
 		multiClient.clientReceivePacket,
 		multiClient.ingressSecurityPolicy,
 		multiClient.removeClient,
-		"speed",
+		WindowTypeSpeed,
 		settings,
 	)
 
@@ -512,13 +542,13 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 }
 
 // ordered by choice descending
-func (self *RemoteUserNatMultiClient) selectWindowTypes(sendPacket *parsedPacket) []windowType {
+func (self *RemoteUserNatMultiClient) selectWindowTypes(sendPacket *parsedPacket) []WindowType {
 	// - web traffic is routed to quality providers
 	// - all other traffic is routed to speed providers
 	if sendPacket.ipPath.DestinationPort == 443 {
-		return []windowType{windowTypeQuality, windowTypeSpeed}
+		return []WindowType{WindowTypeQuality, WindowTypeSpeed}
 	}
-	return []windowType{windowTypeSpeed, windowTypeQuality}
+	return []WindowType{WindowTypeSpeed, WindowTypeQuality}
 }
 
 func (self *RemoteUserNatMultiClient) sendPacket(
@@ -1325,7 +1355,7 @@ type multiClientWindow struct {
 	clientReceivePacketCallback clientReceivePacketFunction
 	ingressSecurityPolicy       SecurityPolicy
 	clientRemoveCallback        func(client *multiClientChannel)
-	rankMode                    string
+	windowType                  WindowType
 
 	settings *MultiClientSettings
 
@@ -1346,7 +1376,7 @@ func newMultiClientWindow(
 	clientReceivePacketCallback clientReceivePacketFunction,
 	ingressSecurityPolicy SecurityPolicy,
 	clientRemoveCallback func(client *multiClientChannel),
-	rankMode string,
+	windowType WindowType,
 	settings *MultiClientSettings,
 ) *multiClientWindow {
 	window := &multiClientWindow{
@@ -1356,9 +1386,9 @@ func newMultiClientWindow(
 		clientReceivePacketCallback: clientReceivePacketCallback,
 		ingressSecurityPolicy:       ingressSecurityPolicy,
 		clientRemoveCallback:        clientRemoveCallback,
-		rankMode:                    rankMode,
+		windowType:                  windowType,
 		settings:                    settings,
-		clientChannelArgs:           make(chan *multiClientChannelArgs, settings.WindowSizeMin),
+		clientChannelArgs:           make(chan *multiClientChannelArgs, settings.WindowSizes[windowType].WindowSizeMin),
 		monitor:                     NewRemoteUserNatMultiClientMonitor(&settings.RemoteUserNatMultiClientMonitorSettings),
 		contractStatusCallbacks:     NewCallbackList[ContractStatusFunction](),
 		destinationClients:          map[MultiHopId]*multiClientChannel{},
@@ -1428,7 +1458,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			nextDestinations, err := self.generator.NextDestinations(
 				1,
 				maps.Keys(visitedDestinations),
-				self.rankMode,
+				self.windowType.RankMode(),
 			)
 			if err != nil {
 				glog.Infof("[multi]window enumerate error timeout = %s\n", err)
@@ -1543,6 +1573,8 @@ func (self *multiClientWindow) resize() {
 			}
 		})
 
+		windowSize := self.settings.WindowSizes[self.windowType]
+
 		var targetWindowSize int
 		var expandWindowSize int
 		var collapseWindowSize int
@@ -1553,27 +1585,27 @@ func (self *multiClientWindow) resize() {
 			collapseWindowSize = fixedDestinationSize
 		} else {
 			targetWindowSize = min(
-				self.settings.WindowSizeMax,
+				windowSize.WindowSizeMax,
 				max(
-					self.settings.WindowSizeMin,
-					int(math.Ceil(float64(maxSourceCount)*self.settings.WindowSizeReconnectScale)),
+					windowSize.WindowSizeMin,
+					int(math.Ceil(float64(maxSourceCount)*windowSize.WindowSizeReconnectScale)),
 				),
 			)
 
 			// expand and collapse have scale thresholds to avoid jittery resizing
 			// too much resing wastes device resources
 			expandWindowSize = min(
-				self.settings.WindowSizeMax,
+				windowSize.WindowSizeMax,
 				max(
-					self.settings.WindowSizeMin,
+					windowSize.WindowSizeMin,
 					int(math.Ceil(self.settings.WindowExpandScale*float64(len(clients)))),
 				),
 			)
 
 			collapseWindowSize = max(
-				self.settings.WindowSizeMin,
+				windowSize.WindowSizeMin,
 				max(
-					self.settings.WindowSizeMin,
+					windowSize.WindowSizeMin,
 					int(math.Ceil(self.settings.WindowCollapseScale*float64(len(clients)))),
 				),
 			)
@@ -1618,7 +1650,7 @@ func (self *multiClientWindow) resize() {
 				p2pOnlyWindowSize += 1
 			}
 		}
-		if expandWindowSize <= targetWindowSize && len(clients) < expandWindowSize || p2pOnlyWindowSize < self.settings.WindowSizeMinP2pOnly {
+		if expandWindowSize <= targetWindowSize && len(clients) < expandWindowSize || p2pOnlyWindowSize < windowSize.WindowSizeMinP2pOnly {
 			if self.settings.WindowCollapseBeforeExpand {
 				// collapse badly performing clients before expanding
 				removedClients := collapseLowestWeighted(collapseWindowSize)
@@ -1690,6 +1722,8 @@ func (self *multiClientWindow) expand(currentWindowSize int, currentP2pOnlyWindo
 	mutex := sync.Mutex{}
 	addedCount := 0
 
+	windowSize := self.settings.WindowSizes[self.windowType]
+
 	endTime := time.Now().Add(self.settings.WindowExpandTimeout)
 	pendingPingDones := []chan struct{}{}
 	added := 0
@@ -1722,8 +1756,8 @@ func (self *multiClientWindow) expand(currentWindowSize int, currentP2pOnlyWindo
 			} else {
 				// randomly set to p2p only to meet the minimum requirement
 				if !args.MultiClientGeneratorClientArgs.P2pOnly {
-					a := max(self.settings.WindowSizeMin-(currentWindowSize+added), 0)
-					b := max(self.settings.WindowSizeMinP2pOnly-(currentP2pOnlyWindowSize+addedP2pOnly), 0)
+					a := max(windowSize.WindowSizeMin-(currentWindowSize+added), 0)
+					b := max(windowSize.WindowSizeMinP2pOnly-(currentP2pOnlyWindowSize+addedP2pOnly), 0)
 					var p2pOnlyP float32
 					if a+b == 0 {
 						p2pOnlyP = 0
@@ -1844,10 +1878,10 @@ func (self *multiClientWindow) clients() []*multiClientChannel {
 func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 	clients := []*multiClientChannel{}
 
+	windowSize := self.settings.WindowSizes[self.windowType]
+
 	weights := map[*multiClientChannel]float32{}
 	durations := map[*multiClientChannel]time.Duration{}
-
-	// FIXME only keep clients with the same tier as the min tier
 
 	for _, client := range self.clients() {
 		if stats, err := client.WindowStats(); err == nil {
@@ -1858,7 +1892,6 @@ func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 	}
 
 	// iterate and adjust weights for clients with weights >= 0
-	nonNegativeClients := []*multiClientChannel{}
 	for _, client := range clients {
 		if weight := weights[client]; 0 <= weight {
 			if duration := durations[client]; duration < self.settings.StatsWindowGraceperiod {
@@ -1868,7 +1901,6 @@ func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 				// not used, use the estimate
 				weights[client] = float32(client.EstimatedByteCountPerSecond())
 			}
-			nonNegativeClients = append(nonNegativeClients, client)
 		}
 	}
 
@@ -1876,25 +1908,30 @@ func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 		self.statsSampleWeights(weights)
 	}
 
-	WeightedShuffleWithEntropy(nonNegativeClients, weights, self.settings.StatsWindowEntropy)
+	WeightedShuffleWithEntropy(clients, weights, self.settings.StatsWindowEntropy)
 
-	if 0 == len(nonNegativeClients) {
-		return nonNegativeClients
+	if 0 == len(clients) {
+		return clients
 	}
 
 	// use only clients in the min tier
 	// this prevents the window from crossing rank until necessary
 	minTierClients := []*multiClientChannel{}
-	minTier := nonNegativeClients[0].Tier()
-	for _, client := range nonNegativeClients[1:] {
+	minTier := clients[0].Tier()
+	for _, client := range clients[1:] {
 		minTier = min(minTier, client.Tier())
 	}
-	for _, client := range nonNegativeClients {
+	for _, client := range clients {
 		if client.Tier() == minTier {
 			minTierClients = append(minTierClients, client)
 		} else {
 			glog.Infof("[multi]exclude tier from window %d>%d\n", client.Tier(), minTier)
 		}
+	}
+
+	// use only the top n items from the window
+	if 0 < windowSize.WindowSizeUseMax {
+		minTierClients = minTierClients[:min(len(minTierClients), windowSize.WindowSizeUseMax)]
 	}
 
 	return minTierClients

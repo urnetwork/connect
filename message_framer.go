@@ -4,8 +4,10 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	// "time"
 	// "github.com/urnetwork/connect"
+	// "github.com/golang/glog"
 )
 
 // a message framer that optimizes memory copies to reduce cpu+memory usage
@@ -34,9 +36,9 @@ func DefaultFramerSettings() *FramerSettings {
 
 // Read/ReadPacket and Write must be called from a single goroutine each
 type Framer struct {
+	readBuffer  []byte
+	writeBuffer []byte
 	settings    *FramerSettings
-	readBuffer  [2048]byte
-	writeBuffer [2048]byte
 }
 
 func NewFramerWithDefaults() *Framer {
@@ -45,7 +47,9 @@ func NewFramerWithDefaults() *Framer {
 
 func NewFramer(settings *FramerSettings) *Framer {
 	framer := &Framer{
-		settings: settings,
+		readBuffer:  make([]byte, settings.MaxMessageLen),
+		writeBuffer: make([]byte, settings.MaxMessageLen),
+		settings:    settings,
 	}
 	if len(framer.writeBuffer) < settings.SplitMinimumLen+4 {
 		panic(fmt.Errorf("SplitMinimumLen must be less than %d", len(framer.writeBuffer)-4))
@@ -61,35 +65,18 @@ func (self *Framer) Read(r io.Reader) ([]byte, error) {
 	}
 
 	messageLen := int(binary.LittleEndian.Uint16(h[0:2]))
-	splitIndex := int(binary.LittleEndian.Uint16(h[2:4]))
+	// splitIndex := int(binary.LittleEndian.Uint16(h[2:4]))
 
 	if self.settings.MaxMessageLen < messageLen {
+		// glog.Infof("READ MAX\n")
 		return nil, fmt.Errorf("Max message len exceeded (%d<%d)", self.settings.MaxMessageLen, messageLen)
 	}
 
 	// message := make([]byte, messageLen)
 	message := MessagePoolGet(messageLen)
 
-	if splitIndex < 16 {
-		// no split
-		// note we could use 4 bit for additional signaling if needed
-
-		if _, err := io.ReadFull(r, message); err != nil {
-			return nil, err
-		}
-	} else {
-		if _, err := io.ReadFull(r, message[4:splitIndex]); err != nil {
-			return nil, err
-		}
-
-		copy(h[0:4], message[splitIndex-4:splitIndex])
-
-		if _, err := io.ReadFull(r, message[splitIndex-4:messageLen]); err != nil {
-			return nil, err
-		}
-
-		copy(message[0:4], message[splitIndex-4:splitIndex])
-		copy(message[splitIndex-4:splitIndex], h[0:4])
+	if _, err := io.ReadFull(r, message); err != nil {
+		return nil, err
 	}
 
 	return message, nil
@@ -108,6 +95,7 @@ func (self *Framer) ReadPacket(r io.Reader) ([]byte, error) {
 	splitIndex := int(binary.LittleEndian.Uint16(h[2:4]))
 
 	if self.settings.MaxMessageLen < messageLen {
+		// glog.Infof("READ MAX\n")
 		return nil, fmt.Errorf("Max message len exceeded (%d<%d)", self.settings.MaxMessageLen, messageLen)
 	}
 
@@ -126,22 +114,20 @@ func (self *Framer) ReadPacket(r io.Reader) ([]byte, error) {
 			}
 		}
 	} else {
-		copy(message[4:min(n, splitIndex)], h[4:min(n, splitIndex)])
+		copy(message[0:min(n-4, splitIndex)], h[4:min(n, splitIndex+4)])
 
-		if n < splitIndex {
+		if n-4 < splitIndex {
 			if _, err := io.ReadFull(r, message[n:splitIndex]); err != nil {
 				return nil, err
 			}
 		}
-
-		copy(h[0:4], message[splitIndex-4:splitIndex])
-
-		if _, err := io.ReadFull(r, message[splitIndex-4:messageLen]); err != nil {
-			return nil, err
+		if splitIndex < n-4 {
+			copy(message[splitIndex:n-4], h[splitIndex+4:n])
 		}
 
-		copy(message[0:4], message[splitIndex-4:splitIndex])
-		copy(message[splitIndex-4:splitIndex], h[0:4])
+		if _, err := io.ReadFull(r, message[n-4:messageLen]); err != nil {
+			return nil, err
+		}
 	}
 
 	return message, nil
@@ -151,11 +137,16 @@ func (self *Framer) ReadPacket(r io.Reader) ([]byte, error) {
 func (self *Framer) Write(w io.Writer, message []byte) error {
 	messageLen := len(message)
 	if self.settings.MaxMessageLen < messageLen {
+		// glog.Infof("WRITE MAX\n")
 		return fmt.Errorf("Max message len exceeded (%d<%d)", self.settings.MaxMessageLen, messageLen)
+	}
+	if math.MaxUint16 < messageLen {
+		return fmt.Errorf("Max possible message len exceeded (%d<%d)", math.MaxUint16, messageLen)
 	}
 	if messageLen < max(16, self.settings.SplitMinimumLen) {
 		messageWithHeader := self.writeBuffer[:]
 		binary.LittleEndian.PutUint16(messageWithHeader[0:2], uint16(messageLen))
+		binary.LittleEndian.PutUint16(messageWithHeader[2:4], uint16(0))
 		copy(messageWithHeader[4:4+messageLen], message)
 		if _, err := w.Write(messageWithHeader[0 : messageLen+4]); err != nil {
 			return err
@@ -166,23 +157,17 @@ func (self *Framer) Write(w io.Writer, message []byte) error {
 		splitIndex := messageLen / 2
 
 		h := self.writeBuffer[:]
-		copy(h[0:4], message[0:4])
-		binary.LittleEndian.PutUint16(message[0:2], uint16(messageLen))
-		binary.LittleEndian.PutUint16(message[2:4], uint16(splitIndex))
+		binary.LittleEndian.PutUint16(h[0:2], uint16(messageLen))
+		binary.LittleEndian.PutUint16(h[2:4], uint16(splitIndex))
+		copy(h[4:4+splitIndex], message[0:splitIndex])
 
-		if _, err := w.Write(message[0:splitIndex]); err != nil {
+		if _, err := w.Write(h[0 : 4+splitIndex]); err != nil {
 			return err
 		}
 
-		copy(message[0:4], message[splitIndex-4:splitIndex])
-		copy(message[splitIndex-4:splitIndex], h[0:4])
-
-		if _, err := w.Write(message[splitIndex-4 : messageLen]); err != nil {
+		if _, err := w.Write(message[splitIndex:messageLen]); err != nil {
 			return err
 		}
-
-		copy(message[splitIndex-4:splitIndex], message[0:4])
-		copy(message[0:4], h[0:4])
 	}
 
 	return nil

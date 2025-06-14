@@ -70,7 +70,7 @@ func DefaultConnectSettings() *ConnectSettings {
 		panic(err)
 	}
 	return &ConnectSettings{
-		RequestTimeout:   30 * time.Second,
+		RequestTimeout:   15 * time.Second,
 		ConnectTimeout:   5 * time.Second,
 		TlsTimeout:       5 * time.Second,
 		HandshakeTimeout: 5 * time.Second,
@@ -219,10 +219,35 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 	}
 	// FIXME
 	/*
-		if settings.EnableDns {
-			// FIXME add a dial tls context where the quic stream is the connection
-			// FIXME add a version of the api into the connect server, and when the header is for the api hostnames, run the connection through the api handler
-			// FIXME one dns, one dns pump lower prio
+		if settings.EnablePt {
+			// these route the api via the connect server
+			// the connect server runs the api listening for pt connections to the api host
+
+			ptDialer1 := &clientDialer{
+				description:    "dns",
+				minimumWeight:  0.25,
+				priority:       100,
+				dialTlsContext: NewPtDialTlsContext(
+					&settings.ConnectSettings,
+					PacketTranslationModeDns,
+					&settings.PacketTranslationSettings,
+				),
+				settings:       settings,
+			}
+			ptDialer2 := &clientDialer{
+				description:    "dnspump",
+				minimumWeight:  0.25,
+				priority:       125,
+				dialTlsContext: NewPtDialTlsContext(
+					&settings.ConnectSettings,
+					PacketTranslationModeDnsPump,
+					&settings.PacketTranslationSettings,
+				),
+				settings:       settings,
+			}
+
+			dialers[ptDialer1] = true
+			dialers[ptDialer2] = true
 		}
 	*/
 

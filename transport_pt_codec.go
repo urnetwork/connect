@@ -152,8 +152,10 @@ func decodeDnsRequest(packet []byte, buf [1024]byte, tlds [][]byte) (id uint16, 
 
 	}
 
-	header = [18]byte(out[0:18])
-	out = out[18:n]
+	if 18 <= n {
+		header = [18]byte(out[0:18])
+		out = out[18:n]
+	}
 
 	return
 }
@@ -318,8 +320,10 @@ func decodeDnsResponse(packet []byte, buf [1024]byte, tlds [][]byte) (id uint16,
 
 	}
 
-	header = [18]byte(out[0:18])
-	out = out[18:n]
+	if 18 <= n {
+		header = [18]byte(out[0:18])
+		out = out[18:n]
+	}
 
 	return
 }

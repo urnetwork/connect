@@ -111,7 +111,7 @@ func DefaultSendBufferSettings() *SendBufferSettings {
 		AckBufferSize:       DefaultTransferBufferSize,
 		MinMessageByteCount: ByteCount(1),
 		// this includes transport reconnections
-		WriteTimeout:            15 * time.Second,
+		WriteTimeout:            30 * time.Second,
 		ResendQueueMaxByteCount: mib(2),
 		ContractFillFraction:    0.5,
 		ProtocolVersion:         DefaultProtocolVersion,
@@ -131,7 +131,7 @@ func DefaultReceiveBufferSettings() *ReceiveBufferSettings {
 		// ResendAbuseMultiple:  0.5,
 		MaxPeerAuditDuration: 60 * time.Second,
 		// this includes transport reconnections
-		WriteTimeout:             15 * time.Second,
+		WriteTimeout:             30 * time.Second,
 		ReceiveQueueMaxByteCount: mib(2) + kib(512),
 		AllowLegacyNack:          true,
 		MaxOpenReceiveContract:   4,
@@ -143,7 +143,7 @@ func DefaultForwardBufferSettings() *ForwardBufferSettings {
 	return &ForwardBufferSettings{
 		IdleTimeout:        60 * time.Second,
 		SequenceBufferSize: DefaultTransferBufferSize,
-		WriteTimeout:       15 * time.Second,
+		WriteTimeout:       30 * time.Second,
 	}
 }
 
@@ -695,7 +695,7 @@ func (self *Client) run() {
 				select {
 				case <-self.ctx.Done():
 					return
-				case <-WakeupAfter(timeout):
+				case <-WakeupAfter(timeout, self.settings.ControlPingTimeout):
 				}
 
 				ack := make(chan error)
@@ -1613,7 +1613,7 @@ func (self *SendSequence) Run() {
 					}()
 					if done {
 						// close the sequence
-						glog.Infof("[s]%s->%s...%s s(%s) exit idle timeout\n", self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId)
+						glog.V(2).Infof("[s]%s->%s...%s s(%s) exit idle timeout\n", self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId)
 						return
 					}
 				}
@@ -1654,7 +1654,7 @@ func (self *SendSequence) Run() {
 					}()
 					if done {
 						// close the sequence
-						glog.Infof("[s]%s->%s...%s s(%s) exit idle timeout\n", self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId)
+						glog.V(2).Infof("[s]%s->%s...%s s(%s) exit idle timeout\n", self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId)
 						return
 					}
 				}
@@ -2831,7 +2831,7 @@ func (self *ReceiveSequence) Run() {
 				}()
 				if done {
 					// close the sequence
-					glog.Errorf("[r]%s<-%s s(%s) exit idle timeout\n", self.client.ClientTag(), self.source.SourceId, self.source.StreamId)
+					glog.V(2).Infof("[r]%s<-%s s(%s) exit idle timeout\n", self.client.ClientTag(), self.source.SourceId, self.source.StreamId)
 					return
 				}
 			}
@@ -3707,7 +3707,7 @@ func (self *ForwardSequence) Run() {
 			}()
 			if done {
 				// close the sequence
-				glog.Infof("[f]exit idle timeout %s->%s s(%s)", self.clientTag, self.destination.DestinationId, self.destination.StreamId)
+				glog.V(2).Infof("[f]exit idle timeout %s->%s s(%s)", self.clientTag, self.destination.DestinationId, self.destination.StreamId)
 				return
 			}
 		}
