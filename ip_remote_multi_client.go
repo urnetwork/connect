@@ -1881,28 +1881,44 @@ func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 	windowSize := self.settings.WindowSizes[self.windowType]
 
 	weights := map[*multiClientChannel]float32{}
-	durations := map[*multiClientChannel]time.Duration{}
+	// durations := map[*multiClientChannel]time.Duration{}
 
 	for _, client := range self.clients() {
 		if stats, err := client.WindowStats(); err == nil {
 			clients = append(clients, client)
-			weights[client] = float32(stats.ByteCountPerSecond())
-			durations[client] = stats.duration
+			// durations[client] = stats.duration
+
+			weight := float32(stats.ByteCountPerSecond())
+			if 0 <= weight {
+				if stats.duration < self.settings.StatsWindowGraceperiod {
+					// use the estimate
+					weight = float32(client.EstimatedByteCountPerSecond())
+				} else if 0 == weight {
+					// not used yet, use the estimate
+					weight = float32(client.EstimatedByteCountPerSecond())
+				}
+				// else use weight as-is
+			} else {
+				weight = 0
+			}
+			weights[client] = weight
 		}
 	}
 
-	// iterate and adjust weights for clients with weights >= 0
-	for _, client := range clients {
-		if weight := weights[client]; 0 <= weight {
-			if duration := durations[client]; duration < self.settings.StatsWindowGraceperiod {
-				// use the estimate
-				weights[client] = float32(client.EstimatedByteCountPerSecond())
-			} else if 0 == weight {
-				// not used, use the estimate
-				weights[client] = float32(client.EstimatedByteCountPerSecond())
-			}
-		}
-	}
+	// set weights for clients
+	// for _, client := range clients {
+	// 	if weight := float32(stats.ByteCountPerSecond()); 0 <= weight {
+	// 		if duration := durations[client]; duration < self.settings.StatsWindowGraceperiod {
+	// 			// use the estimate
+	// 			weights[client] = float32(client.EstimatedByteCountPerSecond())
+	// 		} else if 0 == weight {
+	// 			// not used, use the estimate
+	// 			weights[client] = float32(client.EstimatedByteCountPerSecond())
+	// 		}
+	// 	} else {
+	// 		weights[client] = 0
+	// 	}
+	// }
 
 	if glog.V(1) {
 		self.statsSampleWeights(weights)
