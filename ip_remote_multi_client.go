@@ -1883,8 +1883,6 @@ func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 	weights := map[*multiClientChannel]float32{}
 	durations := map[*multiClientChannel]time.Duration{}
 
-	// FIXME only keep clients with the same tier as the min tier
-
 	for _, client := range self.clients() {
 		if stats, err := client.WindowStats(); err == nil {
 			clients = append(clients, client)
@@ -1894,7 +1892,6 @@ func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 	}
 
 	// iterate and adjust weights for clients with weights >= 0
-	nonNegativeClients := []*multiClientChannel{}
 	for _, client := range clients {
 		if weight := weights[client]; 0 <= weight {
 			if duration := durations[client]; duration < self.settings.StatsWindowGraceperiod {
@@ -1904,7 +1901,6 @@ func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 				// not used, use the estimate
 				weights[client] = float32(client.EstimatedByteCountPerSecond())
 			}
-			nonNegativeClients = append(nonNegativeClients, client)
 		}
 	}
 
@@ -1912,20 +1908,20 @@ func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 		self.statsSampleWeights(weights)
 	}
 
-	WeightedShuffleWithEntropy(nonNegativeClients, weights, self.settings.StatsWindowEntropy)
+	WeightedShuffleWithEntropy(clients, weights, self.settings.StatsWindowEntropy)
 
-	if 0 == len(nonNegativeClients) {
-		return nonNegativeClients
+	if 0 == len(clients) {
+		return clients
 	}
 
 	// use only clients in the min tier
 	// this prevents the window from crossing rank until necessary
 	minTierClients := []*multiClientChannel{}
-	minTier := nonNegativeClients[0].Tier()
-	for _, client := range nonNegativeClients[1:] {
+	minTier := clients[0].Tier()
+	for _, client := range clients[1:] {
 		minTier = min(minTier, client.Tier())
 	}
-	for _, client := range nonNegativeClients {
+	for _, client := range clients {
 		if client.Tier() == minTier {
 			minTierClients = append(minTierClients, client)
 		} else {
