@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	// "runtime/debug"
 
 	"golang.org/x/exp/maps"
 
@@ -105,8 +106,11 @@ type PlatformTransportSettings struct {
 	DnsPort int
 
 	// FIXME
-	DnsTlds  [][]byte
-	V2H1Auth bool
+	DnsTlds        [][]byte
+	V2H1Auth       bool
+	FramerSettings *FramerSettings
+
+	PtDnsSlowMultiple int
 }
 
 func DefaultPlatformTransportSettings() *PlatformTransportSettings {
@@ -132,9 +136,11 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		H3Port:               443,
 		DnsPort:              53,
 		// FIXME
-		DnsTlds: nil,
+		DnsTlds: [][]byte{[]byte("ur.xyz.")},
 		// servers are migrated on 2025-06-12. We can remove this and always use true.
-		V2H1Auth: true,
+		V2H1Auth:          true,
+		FramerSettings:    DefaultFramerSettings(),
+		PtDnsSlowMultiple: 4,
 	}
 }
 
@@ -204,8 +210,11 @@ func NewPlatformTransportWithTargetMode(
 ) *PlatformTransport {
 	cancelCtx, cancel := context.WithCancel(ctx)
 	transport := &PlatformTransport{
-		ctx:            cancelCtx,
-		cancel:         cancel,
+		ctx: cancelCtx,
+		cancel: func() {
+			// debug.PrintStack()
+			cancel()
+		},
 		clientStrategy: clientStrategy,
 		routeManager:   routeManager,
 		platformUrl:    platformUrl,
@@ -260,18 +269,18 @@ func (self *PlatformTransport) run() {
 
 	switch self.targetMode {
 	case TransportModeAuto:
-		go self.runH3(TransportModeH3, 0)
+		go self.runH3(TransportModeH3, 0, 1)
 		go self.runH1(self.settings.ModeInitialDelay)
-		go self.runH3(TransportModeH3Dns, self.settings.ModeInitialDelay*2)
-		go self.runH3(TransportModeH3DnsPump, self.settings.ModeInitialDelay*3)
+		go self.runH3(TransportModeH3Dns, self.settings.ModeInitialDelay*2, self.settings.PtDnsSlowMultiple)
+		go self.runH3(TransportModeH3DnsPump, self.settings.ModeInitialDelay*3, self.settings.PtDnsSlowMultiple)
 	case TransportModeH3:
-		go self.runH3(TransportModeH3, 0)
+		go self.runH3(TransportModeH3, 0, 1)
 	case TransportModeH1:
 		go self.runH1(0)
 	case TransportModeH3Dns:
-		go self.runH3(TransportModeH3Dns, 0)
+		go self.runH3(TransportModeH3Dns, 0, self.settings.PtDnsSlowMultiple)
 	case TransportModeH3DnsPump:
-		go self.runH3(TransportModeH3DnsPump, 0)
+		go self.runH3(TransportModeH3DnsPump, 0, self.settings.PtDnsSlowMultiple)
 	}
 
 	for {
@@ -548,7 +557,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					ws.SetReadDeadline(time.Now().Add(self.settings.ReadTimeout))
 					messageType, r, err := ws.NextReader()
 					if err != nil {
-						glog.Infof("[tr]%s<- error = %s\n", clientId, err)
+						glog.V(2).Infof("[tr]%s<- error = %s\n", clientId, err)
 						return
 					}
 
@@ -557,7 +566,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 						message, err := MessagePoolReadAll(r)
 						if err != nil {
-							glog.Infof("[tr]%s<- error = %s\n", clientId, err)
+							glog.V(2).Infof("[tr]%s<- error = %s\n", clientId, err)
 							return
 						}
 
@@ -613,7 +622,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 	}
 }
 
-func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.Duration) {
+func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.Duration, slowMultiple int) {
 	// connect and update route manager for this transport
 	defer self.cancel()
 
@@ -627,8 +636,6 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 	if err != nil {
 		return
 	}
-
-	h3Framer := NewFramerWithDefaults()
 
 	if 0 < initialTimeout {
 		select {
@@ -662,7 +669,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			// }
 
 			quicConfig := &quic.Config{
-				HandshakeIdleTimeout: self.settings.QuicConnectTimeout + self.settings.QuicHandshakeTimeout,
+				HandshakeIdleTimeout: time.Duration(slowMultiple) * (self.settings.QuicConnectTimeout + self.settings.QuicHandshakeTimeout),
 				MaxIdleTimeout:       self.settings.PingTimeout * 2,
 				KeepAlivePeriod:      0,
 				Allow0RTT:            true,
@@ -701,9 +708,8 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 					return nil, err
 				}
 				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", pumpServerName, self.settings.DnsPort))
-				ptSettings := &PacketTranslationSettings{
-					DnsTlds: [][]byte{tld},
-				}
+				ptSettings := DefaultPacketTranslationSettings()
+				ptSettings.DnsTlds = [][]byte{tld}
 				packetConn, err = NewPacketTranslation(self.ctx, PacketTranslationModeDns, udpConn, ptSettings)
 				if err != nil {
 					return nil, err
@@ -716,17 +722,21 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 					return nil, err
 				}
 				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", pumpServerName, self.settings.DnsPort))
-				ptSettings := &PacketTranslationSettings{
-					DnsTlds: [][]byte{tld},
-				}
+				ptSettings := DefaultPacketTranslationSettings()
+				ptSettings.DnsTlds = [][]byte{tld}
 				packetConn, err = NewPacketTranslation(self.ctx, PacketTranslationModeDnsPump, udpConn, ptSettings)
 				if err != nil {
 					return nil, err
 				}
 			default:
 				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", serverName, self.settings.H3Port))
+				if err != nil {
+					return nil, err
+				}
 				packetConn = udpConn
 			}
+
+			glog.V(2).Infof("[c]connect to %v (%s)\n", udpAddr, serverName)
 
 			tlsConfig.ServerName = serverName
 			quicTransport := &quic.Transport{
@@ -754,12 +764,14 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				}
 			}()
 
-			stream.SetWriteDeadline(time.Now().Add(self.settings.AuthTimeout))
-			if err := h3Framer.Write(stream, authBytes); err != nil {
+			framer := NewFramer(self.settings.FramerSettings)
+
+			stream.SetWriteDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.AuthTimeout))
+			if err := framer.Write(stream, authBytes); err != nil {
 				return nil, err
 			}
-			stream.SetReadDeadline(time.Now().Add(self.settings.AuthTimeout))
-			if message, err := h3Framer.Read(stream); err != nil {
+			stream.SetReadDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.AuthTimeout))
+			if message, err := framer.Read(stream); err != nil {
 				return nil, err
 			} else {
 				// verify the auth echo
@@ -797,6 +809,8 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 
 			handleCtx, handleCancel := context.WithCancel(self.ctx)
 			defer handleCancel()
+
+			framer := NewFramer(self.settings.FramerSettings)
 
 			readCounter := atomic.Uint64{}
 			writeCounter := atomic.Uint64{}
@@ -837,7 +851,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 						select {
 						case <-handleCtx.Done():
 							return
-						case <-time.After(self.settings.InactiveDrainTimeout):
+						case <-time.After(time.Duration(slowMultiple) * self.settings.InactiveDrainTimeout):
 							// no activity after cool down, shut down this transport
 							if readCounter.Load() == startReadCount && writeCounter.Load() == startWriteCount {
 								handleCancel()
@@ -868,8 +882,8 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 						// if !MessagePoolCheckShared(message) {
 						// 	panic("[t]shared should be set")
 						// }
-						stream.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
-						err := h3Framer.Write(stream, message)
+						stream.SetWriteDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.WriteTimeout))
+						err := framer.Write(stream, message)
 						MessagePoolReturn(message)
 						if err != nil {
 							// note that for websocket a dealine timeout cannot be recovered
@@ -878,8 +892,8 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 						}
 						glog.V(2).Infof("[ts]%s->\n", clientId)
 					case <-WakeupAfter(self.settings.PingTimeout, self.settings.PingTimeout):
-						stream.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
-						if err := h3Framer.Write(stream, make([]byte, 0)); err != nil {
+						stream.SetWriteDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.WriteTimeout))
+						if err := framer.Write(stream, make([]byte, 0)); err != nil {
 							// note that for websocket a dealine timeout cannot be recovered
 							return
 						}
@@ -900,8 +914,8 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 					default:
 					}
 
-					stream.SetReadDeadline(time.Now().Add(self.settings.ReadTimeout))
-					message, err := h3Framer.Read(stream)
+					stream.SetReadDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.ReadTimeout))
+					message, err := framer.Read(stream)
 					if err != nil {
 						glog.Infof("[tr]%s<- error = %s\n", clientId, err)
 						return
@@ -920,7 +934,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 						return
 					case receive <- message:
 						glog.V(2).Infof("[tr]%s<-\n", clientId)
-					case <-time.After(self.settings.ReadTimeout):
+					case <-time.After(time.Duration(slowMultiple) * self.settings.ReadTimeout):
 						glog.Infof("[tr]drop %s<-\n", clientId)
 						MessagePoolReturn(message)
 					}

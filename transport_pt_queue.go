@@ -31,19 +31,19 @@ type combineItem struct {
 // not safe to call from multiple goroutines
 // ordered by update time
 type combineQueue struct {
+	settings *PacketTranslationSettings
+
 	orderedItems  []*combineItem
 	keyItems      map[[17]byte]*combineItem
 	addrItemCount map[string]int
-
-	settings *PacketTranslationSettings
 }
 
 func newCombineQueue(settings *PacketTranslationSettings) *combineQueue {
 	cq := &combineQueue{
+		settings:      settings,
 		orderedItems:  []*combineItem{},
 		keyItems:      map[[17]byte]*combineItem{},
 		addrItemCount: map[string]int{},
-		settings:      settings,
 	}
 	heap.Init(cq)
 	return cq
@@ -64,7 +64,6 @@ func (self *combineQueue) RemoveOlder(minUpdateTime time.Time) {
 }
 
 func (self *combineQueue) Combine(addr net.Addr, header [18]byte, data []byte) (out *packet, limit bool, err error) {
-
 	c := uint8(header[16])
 	i := uint8(header[17])
 

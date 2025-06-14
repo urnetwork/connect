@@ -50,13 +50,16 @@ func DefaultPacketTranslationSettings() *PacketTranslationSettings {
 		// a good baseline is 200 pumps per second
 		DnsPumpTimeout: 1 * time.Second / time.Duration(200),
 		// DnsReadTimeout: 1 * time.Second:
-		DnsStateTimeout: 5 * time.Second,
+		DnsStateTimeout: 15 * time.Second,
 
 		DnsMaxCombinePerAddress: 64 * 1024,
-		DnsMaxCombine:           1024 * 1024 * 1024,
+		DnsMaxCombine:           64 * 1024 * 1024 * 1024,
 
-		DnsMaxPumpHostsPerAddress: 1024,
+		DnsMaxPumpHostsPerAddress: 2 * 1024,
 		DnsMaxPumpHosts:           1024 * 1024 * 1024,
+
+		WritePacketsPerSecond: 200,
+		SequenceBufferSize:    32,
 	}
 }
 
@@ -72,6 +75,9 @@ type PacketTranslationSettings struct {
 
 	DnsMaxPumpHostsPerAddress int
 	DnsMaxPumpHosts           int
+
+	WritePacketsPerSecond int
+	SequenceBufferSize    int
 }
 
 type packet struct {
@@ -96,6 +102,9 @@ type packetTranslation struct {
 	in      chan *packet
 	out     chan *packet
 	forward chan *packet
+
+	readDeadline  time.Time
+	writeDeadline time.Time
 }
 
 // the caller should close in when done
@@ -170,8 +179,9 @@ func (self *packetTranslation) encodeDns() {
 
 				n := 0
 				for i := 0; i < c; i += 1 {
-					header[17] = uint8(i)
+					startTime := time.Now()
 
+					header[17] = uint8(i)
 					m, packetData, err := encodeDnsRequest(id, header, p.data[n:], buf, tld)
 					id += 1
 					if err != nil {
@@ -186,8 +196,26 @@ func (self *packetTranslation) encodeDns() {
 
 					_, err = self.packetConn.WriteTo(packetData, p.addr)
 					if err != nil {
+						glog.Infof("[pt]write err = %s\n", err)
 						return err
 					}
+					endTime := time.Now()
+					writeDuration := endTime.Sub(startTime)
+					if timeout := time.Second/time.Duration(self.settings.WritePacketsPerSecond) - writeDuration; 0 < timeout {
+						select {
+						case <-time.After(timeout):
+						case <-self.ctx.Done():
+							return nil
+						}
+					}
+
+					// _, err = self.packetConn.WriteTo(packetData, p.addr)
+					// if err != nil {
+					// 	glog.Infof("[pt]write err = %s\n", err)
+					// 	return err
+					// }
+
+					// glog.Infof("[pt]write raw\n")
 
 					n += m
 				}
@@ -323,6 +351,7 @@ func (self *packetTranslation) encodeDns() {
 
 					_, err = self.packetConn.WriteTo(packetData, p.addr)
 					if err != nil {
+						glog.Infof("[pt]write err = %s\n", err)
 						return
 					}
 
@@ -345,7 +374,76 @@ func (self *packetTranslation) encodeDns() {
 func (self *packetTranslation) decodeDns() {
 	defer self.cancel()
 
-	dnsCombineQueue := newCombineQueue(self.settings)
+	type readData struct {
+		addr   net.Addr
+		header [18]byte
+		data   []byte
+		tld    []byte
+	}
+
+	readPipeline := make(chan *readData, self.settings.SequenceBufferSize)
+	pumpPipeline := make(chan *pumpItem, self.settings.SequenceBufferSize)
+
+	go func() {
+		defer self.cancel()
+
+		dnsCombineQueue := newCombineQueue(self.settings)
+
+		for {
+			select {
+			case <-self.ctx.Done():
+				return
+			case r := <-readPipeline:
+				minUpdateTime := time.Now().Add(-self.settings.DnsStateTimeout)
+				dnsCombineQueue.RemoveOlder(minUpdateTime)
+
+				out, limit, err := dnsCombineQueue.Combine(r.addr, r.header, r.data)
+
+				if err != nil {
+					// drop the packet
+					// fmt.Printf("PACKET READ ONE DROP ERR = %s\n", err)
+					glog.Errorf("[pt]read err = %s", err)
+					continue
+				}
+
+				if limit {
+					// drop the packet
+					// fmt.Printf("PACKET READ ONE DROP LIMIT\n")
+					continue
+				}
+
+				if out == nil {
+					// packet not combined
+					continue
+				}
+
+				// fmt.Printf("PACKET COMBINE ONE %s\n", string(out.data))
+
+				select {
+				case <-self.ctx.Done():
+					return
+				case self.in <- out:
+				}
+			}
+		}
+	}()
+
+	go func() {
+		defer self.cancel()
+
+		for {
+			select {
+			case <-self.ctx.Done():
+				return
+			case item := <-pumpPipeline:
+				minUpdateTime := time.Now().Add(-self.settings.DnsStateTimeout)
+				self.dnsPumpQueue.RemoveOlder(minUpdateTime)
+				// if limit, drop the pump header but continue to process the packet
+				self.dnsPumpQueue.Add(item)
+			}
+		}
+	}()
+
 	packetData := make([]byte, 2048)
 	var buf [1024]byte
 
@@ -353,13 +451,10 @@ func (self *packetTranslation) decodeDns() {
 		// self.packetConn.SetReadDeadline(time.Now().Add(self.settings.DnsReadTimeout))
 		n, addr, err := self.packetConn.ReadFrom(packetData)
 		if err != nil {
+			glog.Infof("[pt]read err = %s\n", err)
 			return
 		}
-
-		// fmt.Printf("PACKET READ ONE\n")
-
-		minUpdateTime := time.Now().Add(-self.settings.DnsStateTimeout)
-		dnsCombineQueue.RemoveOlder(minUpdateTime)
+		// glog.Infof("[pt]read raw\n")
 
 		var header [18]byte
 		var data []byte
@@ -372,8 +467,6 @@ func (self *packetTranslation) decodeDns() {
 				self.settings.DnsTlds,
 			)
 		} else {
-			self.dnsPumpQueue.RemoveOlder(minUpdateTime)
-
 			var id uint16
 			var otherData bool
 			id, header, data, tld, err, otherData = decodeDnsRequest(
@@ -382,8 +475,13 @@ func (self *packetTranslation) decodeDns() {
 				self.settings.DnsTlds,
 			)
 			if otherData {
+				// a normal non-pt dns request
 				self.handleDnsOther(packetData[:n], addr)
 				continue
+			}
+
+			if glog.V(2) {
+				glog.Infof("[pt]decode one: %v, %v (%d/%d), (%d), %s, %s, %v\n", id, header, header[17], header[16], len(data), string(tld), err, otherData)
 			}
 
 			item := &pumpItem{
@@ -393,8 +491,13 @@ func (self *packetTranslation) decodeDns() {
 				tld:    tld,
 			}
 
-			self.dnsPumpQueue.Add(item)
+			select {
+			case pumpPipeline <- item:
+			case <-self.ctx.Done():
+				return
 			// if limit, drop the pump header but continue to process the packet
+			default:
+			}
 		}
 
 		if c := uint8(header[16]); c == 0 {
@@ -404,34 +507,18 @@ func (self *packetTranslation) decodeDns() {
 
 		// dataCopy := make([]byte, len(data))
 		// copy(dataCopy, data)
-		dataCopy := MessagePoolCopy(data)
-
-		out, limit, err := dnsCombineQueue.Combine(addr, header, dataCopy)
-
-		if err != nil {
-			// drop the packet
-			// fmt.Printf("PACKET READ ONE DROP ERR = %s\n", err)
-			glog.Errorf("[pt]read err = %s", err)
-			continue
+		r := &readData{
+			addr:   addr,
+			header: header,
+			data:   MessagePoolCopy(data),
+			tld:    tld,
 		}
-
-		if limit {
-			// drop the packet
-			// fmt.Printf("PACKET READ ONE DROP LIMIT\n")
-			continue
-		}
-
-		if out == nil {
-			// packet not combined
-			continue
-		}
-
-		// fmt.Printf("PACKET COMBINE ONE %s\n", string(out.data))
 
 		select {
+		case readPipeline <- r:
 		case <-self.ctx.Done():
+			MessagePoolReturn(r.data)
 			return
-		case self.in <- out:
 		}
 	}
 }
@@ -470,26 +557,62 @@ func (self *packetTranslation) WriteTo(packetData []byte, addr net.Addr) (n int,
 		addr: addr,
 	}
 
-	select {
-	case <-self.ctx.Done():
-		err = fmt.Errorf("Done.")
-		return
-	case self.out <- p:
-		n = len(packetData)
-		return
+	if self.writeDeadline.IsZero() {
+		select {
+		case <-self.ctx.Done():
+			err = fmt.Errorf("Done.")
+			return
+		case self.out <- p:
+			n = len(packetData)
+			glog.V(2).Infof("[pt]write packet\n")
+			return
+		}
+	} else {
+		select {
+		case <-self.ctx.Done():
+			err = fmt.Errorf("Done.")
+			return
+		case self.out <- p:
+			n = len(packetData)
+			glog.V(2).Infof("[pt]write packet\n")
+			return
+		case <-time.After(self.writeDeadline.Sub(time.Now())):
+			err = fmt.Errorf("Timeout.")
+			glog.Infof("[pt]write packet timeout\n")
+			return
+		}
 	}
 }
 
 func (self *packetTranslation) ReadFrom(packetData []byte) (n int, addr net.Addr, err error) {
-	select {
-	case <-self.ctx.Done():
-		err = fmt.Errorf("Done.")
-		return
-	case p := <-self.in:
-		addr = p.addr
-		n = copy(packetData, p.data)
-		MessagePoolReturn(p.data)
-		return
+	if self.readDeadline.IsZero() {
+		select {
+		case <-self.ctx.Done():
+			err = fmt.Errorf("Done.")
+			return
+		case p := <-self.in:
+			addr = p.addr
+			n = copy(packetData, p.data)
+			MessagePoolReturn(p.data)
+			glog.V(2).Infof("[pt]read packet\n")
+			return
+		}
+	} else {
+		select {
+		case <-self.ctx.Done():
+			err = fmt.Errorf("Done.")
+			return
+		case p := <-self.in:
+			addr = p.addr
+			n = copy(packetData, p.data)
+			MessagePoolReturn(p.data)
+			glog.V(2).Infof("[pt]read packet\n")
+			return
+		case <-time.After(self.readDeadline.Sub(time.Now())):
+			err = fmt.Errorf("Timeout.")
+			glog.Infof("[pt]read packet timeout\n")
+			return
+		}
 	}
 }
 
@@ -498,15 +621,19 @@ func (self *packetTranslation) LocalAddr() net.Addr {
 }
 
 func (self *packetTranslation) SetDeadline(t time.Time) error {
-	return self.packetConn.SetDeadline(t)
+	self.readDeadline = t
+	self.writeDeadline = t
+	return nil
 }
 
 func (self *packetTranslation) SetReadDeadline(t time.Time) error {
-	return self.packetConn.SetReadDeadline(t)
+	self.readDeadline = t
+	return nil
 }
 
 func (self *packetTranslation) SetWriteDeadline(t time.Time) error {
-	return self.packetConn.SetWriteDeadline(t)
+	self.writeDeadline = t
+	return nil
 }
 
 func (self *packetTranslation) Close() error {
