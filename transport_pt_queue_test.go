@@ -185,7 +185,7 @@ func TestCombineTrim(t *testing.T) {
 		assert.Equal(t, limit, settings.DnsMaxCombine <= i)
 		assert.Equal(t, out, nil)
 	}
-	assert.Equal(t, cq.Len(), settings.DnsMaxCombine)
+	assert.Equal(t, int64(cq.Len()), settings.DnsMaxCombine)
 
 }
 
@@ -338,5 +338,5 @@ func TestPumpTrim(t *testing.T) {
 		// fmt.Printf("[%d]\n", i)
 		assert.Equal(t, limit, settings.DnsMaxPumpHosts <= i)
 	}
-	assert.Equal(t, pq.Len(), settings.DnsMaxPumpHosts)
+	assert.Equal(t, int64(pq.Len()), settings.DnsMaxPumpHosts)
 }
