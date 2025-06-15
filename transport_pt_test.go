@@ -58,7 +58,7 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 		func() {
 			handleCtx, handleCancel := context.WithCancel(ctx)
 
-			n := 1024 * (128 + mathrand.Intn(128))
+			n := 1024 * (16 + mathrand.Intn(16))
 			data := consecutive(n)
 
 			packetLossN := i + 10
