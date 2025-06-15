@@ -703,11 +703,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			case TransportModeH3Dns:
 				quicConfig.DisablePathMTUDiscovery = true
 				tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
-				pumpServerName, err := pumpHost(self.platformUrl, tld)
-				if err != nil {
-					return nil, err
-				}
-				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", pumpServerName, self.settings.DnsPort))
+				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", serverName, self.settings.DnsPort))
 				ptSettings := DefaultPacketTranslationSettings()
 				ptSettings.DnsTlds = [][]byte{tld}
 				packetConn, err = NewPacketTranslation(self.ctx, PacketTranslationModeDns, udpConn, ptSettings)
