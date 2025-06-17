@@ -732,7 +732,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				packetConn = udpConn
 			}
 
-			glog.V(2).Infof("[c]connect to %v (%s)\n", udpAddr, serverName)
+			glog.V(2).Infof("[c]h3 connect to %v (%s)\n", udpAddr, serverName)
 
 			tlsConfig.ServerName = serverName
 			quicTransport := &quic.Transport{

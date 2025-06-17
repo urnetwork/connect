@@ -3691,7 +3691,7 @@ func (self *ForwardSequence) Run() {
 			} else {
 				err := c()
 				if err != nil {
-					glog.Infof("[f]drop = %s", err)
+					glog.V(2).Infof("[f]drop = %s", err)
 				}
 			}
 		case <-time.After(self.forwardBufferSettings.IdleTimeout):
