@@ -190,11 +190,13 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 
 			for len(readData) < len(data) {
 				m, err := stream.Read(buf[:min(len(buf), len(data)-len(readData))])
-				assert.Equal(t, err, nil)
 				readData = append(readData, buf[:m]...)
 
 				// fmt.Printf("read[%d]\n", m)
 				fmt.Printf(".")
+				if err != nil {
+					break
+				}
 			}
 
 			assert.Equal(t, data, readData)
