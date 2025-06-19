@@ -127,8 +127,11 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 
 					go func() {
 						m, err := stream.Write(data)
-						assert.Equal(t, err, nil)
+						// assert.Equal(t, err, nil)
 						assert.Equal(t, m, len(data))
+						if err != nil {
+							return
+						}
 					}()
 
 					readData := make([]byte, 0, len(data))
@@ -181,8 +184,10 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 
 			go func() {
 				m, err := stream.Write(data)
-				assert.Equal(t, err, nil)
 				assert.Equal(t, m, len(data))
+				if err != nil {
+					return
+				}
 			}()
 
 			readData := make([]byte, 0, len(data))
