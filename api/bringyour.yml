@@ -1211,6 +1211,20 @@ paths:
               schema:
                 $ref: "#/components/schemas/AccountPointsResult"
 
+  /account/payments:
+    get:
+      description: |
+        Retrieves list of account payments
+      operationId: Account Get Payouts
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetNetworkAccountPaymentsResult"
+
   /account/wallet:
     post:
       description: |
@@ -3083,3 +3097,83 @@ components:
 
     UnlinkReferralNetworkResult:
       type: object
+
+    GetNetworkAccountPaymentsError:
+      type: object
+      properties:
+        message:
+          type: string
+
+    AccountPayment:
+      type: object
+      properties:
+        payment_id:
+          type: string
+        payment_plan_id:
+          type: string
+        wallet_id:
+          type: string
+          nullable: true
+        network_id:
+          type: string
+        payout_byte_count:
+          type: integer
+        payout_nano_cents:
+          type: integer
+        subsidy_payout_nano_cents:
+          type: integer
+        min_sweep_time:
+          type: string
+          format: date-time
+        create_time:
+          type: string
+          format: date-time
+        payment_record:
+          type: string
+          nullable: true
+        token_type:
+          type: string
+          nullable: true
+        token_amount:
+          type: number
+          format: float
+          nullable: true
+        payment_time:
+          type: string
+          format: date-time
+          nullable: true
+        payment_receipt:
+          type: string
+          nullable: true
+        wallet_address:
+          type: string
+        blockchain:
+          type: string
+          enum:
+            - MATIC
+            - SOL
+        tx_hash:
+          type: string
+          nullable: true
+        completed:
+          type: boolean
+        complete_time:
+          type: string
+          format: date-time
+          nullable: true
+        canceled:
+          type: boolean
+        cancel_time:
+          type: string
+          format: date-time
+          nullable: true
+
+    GetNetworkAccountPaymentsResult:
+      type: object
+      properties:
+        account_payments:
+          type: array
+          items:
+            $ref: "#/components/schemas/AccountPayment"
+        error:
+          $ref: "#/components/schemas/GetNetworkAccountPaymentsError"
