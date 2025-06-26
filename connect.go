@@ -22,7 +22,7 @@ const MaxMultihopLength = 8
 //	Most clients need to be able to read v2 before we turn this on.
 //
 // TODO migrate to 2
-const DefaultProtocolVersion = 1
+const DefaultProtocolVersion = 2
 
 // id for message to/from the platform
 var ControlId = Id{}
