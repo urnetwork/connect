@@ -43,6 +43,10 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 		return
 	}
 
+	select {
+	case <-time.After(1 * time.Second):
+	}
+
 	ctx := context.Background()
 
 	consecutive := func(n int) []byte {
