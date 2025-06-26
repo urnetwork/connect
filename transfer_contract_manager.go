@@ -89,12 +89,12 @@ func DefaultContractManagerSettings() *ContractManagerSettings {
 
 		NetworkEventTimeEnableContracts: networkEventTimeEnableContracts,
 
-		// TODO change this once main has been deployed with the p2p contract changes
-		LegacyCreateContract: true,
-
-		ProvidePingTimeout: 5 * time.Second,
+		ProvidePingTimeout: 15 * time.Second,
 
 		ProtocolVersion: DefaultProtocolVersion,
+
+		// TODO change this once main has been deployed with the p2p contract changes
+		LegacyCreateContract: true,
 	}
 }
 
