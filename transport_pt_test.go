@@ -31,14 +31,14 @@ import (
 )
 
 func TestPtDnsEncodeDecode(t *testing.T) {
-	ptEncodeDecodeTest(t, PacketTranslationModeDns, PacketTranslationModeDecode53)
+	ptEncodeDecodeTest(t, PacketTranslationModeDns, PacketTranslationModeDecode53, 5555)
 }
 
 func TestPtDnsPumpEncodeDecode(t *testing.T) {
-	ptEncodeDecodeTest(t, PacketTranslationModeDnsPump, PacketTranslationModeDecode53RequireDnsPump)
+	ptEncodeDecodeTest(t, PacketTranslationModeDnsPump, PacketTranslationModeDecode53RequireDnsPump, 6555)
 }
 
-func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, serverPtMode PacketTranslationMode) {
+func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, serverPtMode PacketTranslationMode, basePort int) {
 	if testing.Short() {
 		return
 	}
@@ -58,27 +58,35 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 	}
 
 	for i := range 64 {
-		fmt.Printf("[%d]dns test (loss=%.1f%%)\n", i, 100.0/float32(10.0+i))
+		headerPrefix := make([]byte, 8)
+		mathrand.Read(headerPrefix)
+
+		// FIXME quic does not seem to recover well with packet loss
+		packetLossN := i + 1000
+
+		fmt.Printf("[%d]dns test (loss=%.1f%%)\n", i, 100.0/float32(packetLossN))
 		func() {
 			handleCtx, handleCancel := context.WithCancel(ctx)
+			defer handleCancel()
 
-			n := 1024 * (16 + mathrand.Intn(16))
+			n := 1024 * (8 + mathrand.Intn(8))
 			data := consecutive(n)
-
-			packetLossN := i + 10
 
 			tld := []byte("foo.com.")
 
-			serverAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5050 + i}
+			serverAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: basePort + i}
+
+			ioTimeout := 120 * time.Second
 
 			quicConfig := &quic.Config{
-				HandshakeIdleTimeout:    time.Duration(5+max(10-i, 0)) * time.Second,
-				MaxIdleTimeout:          60 * time.Second,
-				KeepAlivePeriod:         30 * time.Second,
+				HandshakeIdleTimeout:    ioTimeout,
+				MaxIdleTimeout:          ioTimeout,
+				KeepAlivePeriod:         5 * time.Second,
 				Allow0RTT:               true,
 				DisablePathMTUDiscovery: true,
 			}
 
+			serverCtx, serverCancel := context.WithCancel(handleCtx)
 			func() {
 				serverTlsConfig := &tls.Config{
 					GetConfigForClient: func(clientHello *tls.ClientHelloInfo) (*tls.Config, error) {
@@ -106,7 +114,7 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 				ptSettings.DnsTlds = [][]byte{tld}
 				// settings.DnsAddr = serverAddr
 
-				ptConn, err := NewPacketTranslation(ctx, serverPtMode, lossConn, ptSettings)
+				ptConn, err := NewPacketTranslationWithPrefix(handleCtx, serverPtMode, lossConn, ptSettings, headerPrefix)
 				assert.Equal(t, err, nil)
 				// defer ptConn.Close()
 
@@ -120,28 +128,29 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 				// defer earlyListener.Close()
 
 				go func() {
-					defer handleCancel()
+					defer serverCancel()
 					defer ptConn.Close()
 					defer earlyListener.Close()
 
-					earlyConn, err := earlyListener.Accept(ctx)
+					earlyConn, err := earlyListener.Accept(handleCtx)
 					assert.Equal(t, err, nil)
 					stream, err := earlyConn.AcceptStream(handleCtx)
 					assert.Equal(t, err, nil)
 
+					writeCtx, writeCancel := context.WithCancel(handleCtx)
 					go func() {
+						defer writeCancel()
+						stream.SetWriteDeadline(time.Now().Add(ioTimeout))
 						m, err := stream.Write(data)
-						// assert.Equal(t, err, nil)
+						assert.Equal(t, err, nil)
 						assert.Equal(t, m, len(data))
-						if err != nil {
-							return
-						}
 					}()
 
 					readData := make([]byte, 0, len(data))
 					buf := make([]byte, 2048)
 
 					for len(readData) < len(data) {
+						stream.SetReadDeadline(time.Now().Add(ioTimeout))
 						m, err := stream.Read(buf[:min(len(buf), len(data)-len(readData))])
 						assert.Equal(t, err, nil)
 						readData = append(readData, buf[:m]...)
@@ -151,6 +160,10 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 					}
 
 					assert.Equal(t, data, readData)
+
+					select {
+					case <-writeCtx.Done():
+					}
 
 				}()
 
@@ -169,7 +182,7 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 			ptSettings := DefaultPacketTranslationSettings()
 			ptSettings.DnsTlds = [][]byte{tld}
 			// ptSettings.DnsAddr = serverAddr
-			ptConn, err := NewPacketTranslation(handleCtx, clientPtMode, lossConn, ptSettings)
+			ptConn, err := NewPacketTranslationWithPrefix(handleCtx, clientPtMode, lossConn, ptSettings, headerPrefix)
 			assert.Equal(t, err, nil)
 			defer ptConn.Close()
 
@@ -186,32 +199,38 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 			stream, err := conn.OpenStream()
 			assert.Equal(t, err, nil)
 
+			writeCtx, writeCancel := context.WithCancel(handleCtx)
 			go func() {
+				defer writeCancel()
+				stream.SetWriteDeadline(time.Now().Add(ioTimeout))
 				m, err := stream.Write(data)
+				assert.Equal(t, err, nil)
 				assert.Equal(t, m, len(data))
-				if err != nil {
-					return
-				}
 			}()
 
 			readData := make([]byte, 0, len(data))
 			buf := make([]byte, 2048)
 
 			for len(readData) < len(data) {
+				stream.SetReadDeadline(time.Now().Add(ioTimeout))
 				m, err := stream.Read(buf[:min(len(buf), len(data)-len(readData))])
+				assert.Equal(t, err, nil)
 				readData = append(readData, buf[:m]...)
 
 				// fmt.Printf("read[%d]\n", m)
 				fmt.Printf(".")
-				if err != nil {
-					break
-				}
 			}
 
 			assert.Equal(t, data, readData)
 
 			select {
-			case <-handleCtx.Done():
+			case <-writeCtx.Done():
+				// case <- time.After(60 * time.Second):
+				// 	t.FailNow()
+			}
+
+			select {
+			case <-serverCtx.Done():
 				// case <- time.After(60 * time.Second):
 				// 	t.FailNow()
 			}
@@ -226,28 +245,44 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 type packetLossPacketConn struct {
 	n          int
 	packetConn net.PacketConn
+
+	readRand  *mathrand.Rand
+	writeRand *mathrand.Rand
 }
 
 func newPacketLossPacketConn(n int, packetConn net.PacketConn) *packetLossPacketConn {
 	return &packetLossPacketConn{
 		n:          n,
 		packetConn: packetConn,
+		readRand:   mathrand.New(mathrand.NewSource(time.Now().UnixMilli())),
+		writeRand:  mathrand.New(mathrand.NewSource(time.Now().UnixMilli())),
 	}
 }
 
 func (self *packetLossPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	return self.packetConn.ReadFrom(p)
+	for {
+		n, addr, err = self.packetConn.ReadFrom(p)
+		if err != nil {
+			return
+		}
+		if 0 < self.n && self.readRand.Intn(self.n+1) == 0 {
+			fmt.Printf("d")
+			continue
+		}
+		return
+	}
 }
 
 func (self *packetLossPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	if 0 < self.n && mathrand.Intn(self.n) == 0 {
+	if 0 < self.n && self.writeRand.Intn(self.n+1) == 0 {
 		// pretent the packet was sent but drop it
 		n = len(p)
-		return
-	} else {
-		n, err = self.packetConn.WriteTo(p, addr)
+		fmt.Printf("d")
 		return
 	}
+
+	n, err = self.packetConn.WriteTo(p, addr)
+	return
 }
 
 func (self *packetLossPacketConn) LocalAddr() net.Addr {
