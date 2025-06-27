@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"slices"
 	"time"
+	// "runtime/debug"
 
 	mathrand "math/rand"
 
+	"golang.org/x/crypto/sha3"
 	"golang.org/x/net/dns/dnsmessage"
 
 	"github.com/golang/glog"
@@ -50,7 +53,7 @@ func DefaultPacketTranslationSettings() *PacketTranslationSettings {
 		// a good baseline is 200 pumps per second
 		DnsPumpTimeout: 1 * time.Second / time.Duration(200),
 		// DnsReadTimeout: 1 * time.Second:
-		DnsStateTimeout: 15 * time.Second,
+		DnsStateTimeout: 5 * time.Second,
 
 		DnsMaxCombinePerAddress: 64 * 1024,
 		DnsMaxCombine:           64 * 1024 * 1024 * 1024,
@@ -58,7 +61,7 @@ func DefaultPacketTranslationSettings() *PacketTranslationSettings {
 		DnsMaxPumpHostsPerAddress: 2 * 1024,
 		DnsMaxPumpHosts:           1024 * 1024 * 1024,
 
-		WritePacketsPerSecond: 200,
+		WritePacketsPerSecond: 800,
 		SequenceBufferSize:    32,
 	}
 }
@@ -90,8 +93,9 @@ type packetTranslation struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	ptMode     PacketTranslationMode
-	packetConn net.PacketConn
+	ptMode       PacketTranslationMode
+	packetConn   net.PacketConn
+	headerPrefix []byte
 
 	settings *PacketTranslationSettings
 
@@ -107,12 +111,28 @@ type packetTranslation struct {
 	writeDeadline time.Time
 }
 
-// the caller should close in when done
 func NewPacketTranslation(
 	ctx context.Context,
 	ptMode PacketTranslationMode,
 	packetConn net.PacketConn,
 	settings *PacketTranslationSettings,
+) (*packetTranslation, error) {
+	return NewPacketTranslationWithPrefix(
+		ctx,
+		ptMode,
+		packetConn,
+		settings,
+		nil,
+	)
+}
+
+// the caller should close in when done
+func NewPacketTranslationWithPrefix(
+	ctx context.Context,
+	ptMode PacketTranslationMode,
+	packetConn net.PacketConn,
+	settings *PacketTranslationSettings,
+	headerPrefix []byte,
 ) (*packetTranslation, error) {
 	cancelCtx, cancel := context.WithCancel(ctx)
 
@@ -123,14 +143,18 @@ func NewPacketTranslation(
 	}
 
 	pt := &packetTranslation{
-		ctx:        cancelCtx,
-		cancel:     cancel,
-		ptMode:     ptMode,
-		packetConn: packetConn,
-		settings:   settings,
-		in:         make(chan *packet),
-		out:        make(chan *packet),
-		forward:    make(chan *packet),
+		ctx: cancelCtx,
+		cancel: func() {
+			// debug.PrintStack()
+			cancel()
+		},
+		ptMode:       ptMode,
+		packetConn:   packetConn,
+		headerPrefix: headerPrefix,
+		settings:     settings,
+		in:           make(chan *packet),
+		out:          make(chan *packet),
+		forward:      make(chan *packet),
 	}
 
 	switch ptMode {
@@ -156,6 +180,28 @@ func NewPacketTranslation(
 	return pt, nil
 }
 
+func (self *packetTranslation) newHeader() [18]byte {
+	var header [18]byte
+	if 0 < len(self.headerPrefix) {
+		copy(header[0:len(self.headerPrefix)], self.headerPrefix)
+		mathrand.Read(header[len(self.headerPrefix):16])
+	} else {
+		mathrand.Read(header[0:16])
+	}
+	return header
+}
+
+func (self *packetTranslation) newHeaderWithContentAddress(p []byte) [18]byte {
+	var header [18]byte
+	if 0 < len(self.headerPrefix) {
+		copy(header[0:len(self.headerPrefix)], self.headerPrefix)
+		sha3.ShakeSum128(header[len(self.headerPrefix):16], p)
+	} else {
+		sha3.ShakeSum128(header[0:16], p)
+	}
+	return header
+}
+
 func (self *packetTranslation) encodeDns() {
 	defer self.cancel()
 
@@ -165,6 +211,7 @@ func (self *packetTranslation) encodeDns() {
 	for {
 		if self.dnsClient {
 			writeOne := func(p *packet) error {
+				defer MessagePoolReturn(p.data)
 
 				// fmt.Printf("WRITE ONE\n")
 
@@ -174,8 +221,7 @@ func (self *packetTranslation) encodeDns() {
 
 				// fmt.Printf("WRITE ONE (%d)\n", c)
 
-				var header [18]byte
-				mathrand.Read(header[0:16])
+				header := self.newHeaderWithContentAddress(p.data)
 				header[16] = uint8(c)
 
 				n := 0
@@ -185,28 +231,30 @@ func (self *packetTranslation) encodeDns() {
 					header[17] = uint8(i)
 					m, packetData, err := encodeDnsRequest(id, header, p.data[n:], buf, tld)
 					id += 1
+					n += m
 					if err != nil {
-						// drop the packet
-						// FIXME glog
-						// fmt.Printf("WRITE ONE ERR = %s\n", err)
-						glog.Errorf("[pt]write err = %s", err)
-						return nil
+						return err
 					}
 
 					// fmt.Printf("PACKET WRITE TO: %v\n", string(packetData))
 
 					_, err = self.packetConn.WriteTo(packetData, p.addr)
 					if err != nil {
-						glog.Infof("[pt]write err = %s\n", err)
 						return err
 					}
 					endTime := time.Now()
-					writeDuration := endTime.Sub(startTime)
-					if timeout := time.Second/time.Duration(self.settings.WritePacketsPerSecond) - writeDuration; 0 < timeout {
-						select {
-						case <-time.After(timeout):
-						case <-self.ctx.Done():
-							return nil
+					if 0 < self.settings.WritePacketsPerSecond {
+						writeDuration := endTime.Sub(startTime)
+						timeout := time.Second/time.Duration(self.settings.WritePacketsPerSecond) - writeDuration
+						if 0 < timeout {
+							randTimeout := time.Duration(mathrand.Intn(
+								2*int(timeout/time.Nanosecond),
+							)) * time.Nanosecond
+							select {
+							case <-time.After(randTimeout):
+							case <-self.ctx.Done():
+								return nil
+							}
 						}
 					}
 
@@ -218,9 +266,10 @@ func (self *packetTranslation) encodeDns() {
 
 					// glog.Infof("[pt]write raw\n")
 
-					n += m
 				}
-				MessagePoolReturn(p.data)
+				if n != len(p.data) {
+					return fmt.Errorf("Header count estimate incorrect.")
+				}
 				return nil
 			}
 
@@ -232,16 +281,21 @@ func (self *packetTranslation) encodeDns() {
 					// each write includes one pump header
 					mostRecentAddr = p.addr
 					if err := writeOne(p); err != nil {
-						glog.Errorf("[pt]write err = %s\n", err)
+						select {
+						case <-self.ctx.Done():
+						default:
+							glog.Infof("[pt]write err = %s\n", err)
+						}
 						return
 					}
 				case <-time.After(self.settings.DnsPumpTimeout):
 					// pump one header the server can use to repsond to
 					if mostRecentAddr != nil {
+						// startTime := time.Now()
+
 						tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
 
-						var header [18]byte
-						mathrand.Read(header[0:16])
+						header := self.newHeader()
 
 						_, packetData, err := encodeDnsRequest(
 							id,
@@ -260,9 +314,26 @@ func (self *packetTranslation) encodeDns() {
 
 						_, err = self.packetConn.WriteTo(packetData, mostRecentAddr)
 						if err != nil {
-							glog.Errorf("[pt]write err = %s\n", err)
+							select {
+							case <-self.ctx.Done():
+							default:
+								glog.Infof("[pt]write err = %s\n", err)
+							}
 							return
 						}
+						// endTime := time.Now()
+						// writeDuration := endTime.Sub(startTime)
+						// timeout := time.Second/time.Duration(self.settings.WritePacketsPerSecond) - writeDuration
+						// if 0 < timeout {
+						// 	randTimeout := time.Duration(mathrand.Intn(
+						// 		2 * int(timeout / time.Nanosecond),
+						// 	)) * time.Nanosecond
+						// 	select {
+						// 	case <-time.After(randTimeout):
+						// 	case <-self.ctx.Done():
+						// 		return
+						// 	}
+						// }
 					} else {
 						glog.Infof("[pt]cannot pump dns due to missing most recent addr\n")
 					}
@@ -273,16 +344,19 @@ func (self *packetTranslation) encodeDns() {
 					return
 				case p := <-self.out:
 					if err := writeOne(p); err != nil {
-						glog.Errorf("[pt]write err = %s\n", err)
+						select {
+						case <-self.ctx.Done():
+						default:
+							glog.Infof("[pt]write err = %s\n", err)
+						}
 						return
 					}
 				}
 			}
 		} else {
-			select {
-			case <-self.ctx.Done():
-				return
-			case p := <-self.out:
+			writeOne := func(p *packet) error {
+				defer MessagePoolReturn(p.data)
+
 				minUpdateTime := time.Now().Add(-self.settings.DnsStateTimeout)
 				self.dnsPumpQueue.RemoveOlder(minUpdateTime)
 
@@ -301,7 +375,7 @@ func (self *packetTranslation) encodeDns() {
 
 					if pumpItems == nil {
 						// drop the packet since there aren't enough pump headers
-						continue
+						return nil
 					}
 				} else {
 
@@ -317,8 +391,7 @@ func (self *packetTranslation) encodeDns() {
 					}
 					// fill the rest with new headers
 					for ; i < c; i += 1 {
-						var header [18]byte
-						mathrand.Read(header[0:16])
+						header := self.newHeader()
 						tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
 						item := &pumpItem{
 							id:     id,
@@ -330,12 +403,14 @@ func (self *packetTranslation) encodeDns() {
 					}
 				}
 
-				var header [18]byte
-				mathrand.Read(header[0:16])
+				header := self.newHeaderWithContentAddress(p.data)
 				header[16] = uint8(c)
 
+				// on error, stop sending all since one is dropped
 				n := 0
 				for i := 0; i < c; i += 1 {
+					startTime := time.Now()
+
 					header[17] = uint8(i)
 
 					item := pumpItems[i]
@@ -348,22 +423,52 @@ func (self *packetTranslation) encodeDns() {
 						buf,
 						item.tld,
 					)
+					n += m
 					if err != nil {
-						// stop sending all since one is dropped
-						break
+						return err
 					}
 
 					// fmt.Printf("PACKET WRITE TO: %v\n", string(packetData))
 
 					_, err = self.packetConn.WriteTo(packetData, p.addr)
 					if err != nil {
-						glog.Infof("[pt]write err = %s\n", err)
-						return
+						return err
 					}
 
-					n += m
+					endTime := time.Now()
+					if 0 < self.settings.WritePacketsPerSecond {
+						writeDuration := endTime.Sub(startTime)
+						timeout := time.Second/time.Duration(self.settings.WritePacketsPerSecond) - writeDuration
+						if 0 < timeout {
+							randTimeout := time.Duration(mathrand.Intn(
+								2*int(timeout/time.Nanosecond),
+							)) * time.Nanosecond
+							select {
+							case <-time.After(randTimeout):
+							case <-self.ctx.Done():
+								return nil
+							}
+						}
+					}
 				}
-				MessagePoolReturn(p.data)
+				if n != len(p.data) {
+					return fmt.Errorf("Header count estimate incorrect.")
+				}
+				return nil
+			}
+
+			select {
+			case <-self.ctx.Done():
+				return
+			case p := <-self.out:
+				if err := writeOne(p); err != nil {
+					select {
+					case <-self.ctx.Done():
+					default:
+						glog.Infof("[pt]write err = %s\n", err)
+					}
+					return
+				}
 			case p := <-self.forward:
 				// fmt.Printf("PACKET WRITE TO: %v\n", string(p.data))
 
@@ -404,17 +509,18 @@ func (self *packetTranslation) decodeDns() {
 				dnsCombineQueue.RemoveOlder(minUpdateTime)
 
 				out, limit, err := dnsCombineQueue.Combine(r.addr, r.header, r.data)
-
 				if err != nil {
 					// drop the packet
-					// fmt.Printf("PACKET READ ONE DROP ERR = %s\n", err)
-					glog.Errorf("[pt]read err = %s", err)
+					MessagePoolReturn(r.data)
+					glog.Errorf("[pt]combine err = %s\n", err)
 					continue
 				}
 
 				if limit {
 					// drop the packet
+					MessagePoolReturn(r.data)
 					// fmt.Printf("PACKET READ ONE DROP LIMIT\n")
+					glog.Errorf("[pt]combine limit\n")
 					continue
 				}
 
@@ -457,7 +563,11 @@ func (self *packetTranslation) decodeDns() {
 		// self.packetConn.SetReadDeadline(time.Now().Add(self.settings.DnsReadTimeout))
 		n, addr, err := self.packetConn.ReadFrom(packetData)
 		if err != nil {
-			glog.Infof("[pt]read err = %s\n", err)
+			select {
+			case <-self.ctx.Done():
+			default:
+				glog.Infof("[pt]read err = %s\n", err)
+			}
 			return
 		}
 		// glog.Infof("[pt]read raw\n")
@@ -483,6 +593,11 @@ func (self *packetTranslation) decodeDns() {
 			if otherData {
 				// a normal non-pt dns request
 				self.handleDnsOther(packetData[:n], addr)
+				continue
+			}
+
+			if 0 < len(self.headerPrefix) && !slices.Equal(self.headerPrefix, header[0:len(self.headerPrefix)]) {
+				// the header does not match the prefix, drop
 				continue
 			}
 

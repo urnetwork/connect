@@ -105,12 +105,13 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		PingWriteTimeout: 5 * time.Second,
 		PingTimeout:      10 * time.Second,
 		// a lower ack timeout helps cycle through bad providers faster
-		AckTimeout:             15 * time.Second,
-		BlackholeTimeout:       15 * time.Second,
-		WindowResizeTimeout:    5 * time.Second,
-		StatsWindowGraceperiod: 5 * time.Second,
-		StatsWindowEntropy:     0.25,
-		WindowExpandTimeout:    15 * time.Second,
+		AckTimeout:               15 * time.Second,
+		BlackholeTimeout:         15 * time.Second,
+		WindowResizeTimeout:      5 * time.Second,
+		StatsWindowGraceperiod:   5 * time.Second,
+		StatsWindowEntropy:       0.25,
+		WindowExpandTimeout:      15 * time.Second,
+		WindowExpandBlockTimeout: 5 * time.Second,
 		// wait this time before enumerating potential clients again
 		WindowEnumerateEmptyTimeout:  60 * time.Second,
 		WindowEnumerateErrorTimeout:  1 * time.Second,
@@ -158,6 +159,7 @@ type MultiClientSettings struct {
 	StatsWindowGraceperiod       time.Duration
 	StatsWindowEntropy           float32
 	WindowExpandTimeout          time.Duration
+	WindowExpandBlockTimeout     time.Duration
 	WindowEnumerateEmptyTimeout  time.Duration
 	WindowEnumerateErrorTimeout  time.Duration
 	WindowExpandScale            float64
@@ -1725,6 +1727,7 @@ func (self *multiClientWindow) expand(currentWindowSize int, currentP2pOnlyWindo
 	windowSize := self.settings.WindowSizes[self.windowType]
 
 	endTime := time.Now().Add(self.settings.WindowExpandTimeout)
+	blockEndTime := time.Now().Add(self.settings.WindowExpandBlockTimeout)
 	pendingPingDones := []chan struct{}{}
 	added := 0
 	addedP2pOnly := 0
@@ -1853,10 +1856,16 @@ func (self *multiClientWindow) expand(currentWindowSize int, currentP2pOnlyWindo
 
 	// wait for pending pings
 	for _, pingDone := range pendingPingDones {
+		timeout := blockEndTime.Sub(time.Now())
+		if timeout <= 0 {
+			break
+		}
+
 		select {
 		case <-self.ctx.Done():
 			return
 		case <-pingDone:
+		case <-time.After(timeout):
 		}
 	}
 
