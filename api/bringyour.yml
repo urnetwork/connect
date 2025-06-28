@@ -3007,6 +3007,9 @@ components:
         is_public:
           description: Whether the network has opted in to being displayed on the leaderboard or not
           type: boolean
+        contains_profanity:
+          description: Whether the network name contains profanity
+          type: boolean
 
     LeaderboardResult:
       type: object
