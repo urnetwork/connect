@@ -246,7 +246,7 @@ func (self *ContractManager) providePing() {
 			select {
 			case <-self.ctx.Done():
 				return
-			case <-time.After(timeout):
+			case <-WakeupAfter(timeout, self.settings.ProvidePingTimeout):
 			}
 		} else {
 			select {
