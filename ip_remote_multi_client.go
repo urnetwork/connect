@@ -101,17 +101,19 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 			},
 		},
 		SendRetryTimeout: 200 * time.Millisecond,
-		// this includes the time to establish the transport
 		PingWriteTimeout: 5 * time.Second,
-		PingTimeout:      10 * time.Second,
+		// the initial ping includes creating the transports and contract
+		// ease up the timeout until perf issues are fully resolved
+		PingTimeout: 30 * time.Second,
 		// a lower ack timeout helps cycle through bad providers faster
-		AckTimeout:               15 * time.Second,
-		BlackholeTimeout:         15 * time.Second,
-		WindowResizeTimeout:      5 * time.Second,
-		StatsWindowGraceperiod:   5 * time.Second,
-		StatsWindowEntropy:       0.25,
-		WindowExpandTimeout:      15 * time.Second,
-		WindowExpandBlockTimeout: 5 * time.Second,
+		AckTimeout:             15 * time.Second,
+		BlackholeTimeout:       30 * time.Second,
+		WindowResizeTimeout:    15 * time.Second,
+		StatsWindowGraceperiod: 30 * time.Second,
+		StatsWindowEntropy:     0.25,
+		WindowExpandTimeout:    15 * time.Second,
+		// WindowExpandBlockTimeout: 5 * time.Second,
+		WindowExpandBlockCount: 8,
 		// wait this time before enumerating potential clients again
 		WindowEnumerateEmptyTimeout:  60 * time.Second,
 		WindowEnumerateErrorTimeout:  1 * time.Second,
@@ -150,16 +152,17 @@ type MultiClientSettings struct {
 	// ClientWriteTimeout time.Duration
 	// SendTimeout time.Duration
 	// WriteTimeout time.Duration
-	SendRetryTimeout             time.Duration
-	PingWriteTimeout             time.Duration
-	PingTimeout                  time.Duration
-	AckTimeout                   time.Duration
-	BlackholeTimeout             time.Duration
-	WindowResizeTimeout          time.Duration
-	StatsWindowGraceperiod       time.Duration
-	StatsWindowEntropy           float32
-	WindowExpandTimeout          time.Duration
-	WindowExpandBlockTimeout     time.Duration
+	SendRetryTimeout       time.Duration
+	PingWriteTimeout       time.Duration
+	PingTimeout            time.Duration
+	AckTimeout             time.Duration
+	BlackholeTimeout       time.Duration
+	WindowResizeTimeout    time.Duration
+	StatsWindowGraceperiod time.Duration
+	StatsWindowEntropy     float32
+	WindowExpandTimeout    time.Duration
+	// WindowExpandBlockTimeout     time.Duration
+	WindowExpandBlockCount       int
 	WindowEnumerateEmptyTimeout  time.Duration
 	WindowEnumerateErrorTimeout  time.Duration
 	WindowExpandScale            float64
@@ -1458,7 +1461,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 				}
 			}
 			nextDestinations, err := self.generator.NextDestinations(
-				1,
+				self.settings.WindowExpandBlockCount,
 				maps.Keys(visitedDestinations),
 				self.windowType.RankMode(),
 			)
@@ -1727,7 +1730,7 @@ func (self *multiClientWindow) expand(currentWindowSize int, currentP2pOnlyWindo
 	windowSize := self.settings.WindowSizes[self.windowType]
 
 	endTime := time.Now().Add(self.settings.WindowExpandTimeout)
-	blockEndTime := time.Now().Add(self.settings.WindowExpandBlockTimeout)
+	// blockEndTime := time.Now().Add(self.settings.WindowExpandBlockTimeout)
 	pendingPingDones := []chan struct{}{}
 	added := 0
 	addedP2pOnly := 0
@@ -1769,85 +1772,90 @@ func (self *multiClientWindow) expand(currentWindowSize int, currentP2pOnlyWindo
 					}
 					args.MultiClientGeneratorClientArgs.P2pOnly = mathrand.Float32() < p2pOnlyP
 				}
+				// send an initial ping on the client and let the ack timeout close it
+				pingDone := make(chan struct{})
+				pendingPingDones = append(pendingPingDones, pingDone)
 
-				client, err := newMultiClientChannel(
-					self.ctx,
-					args,
-					self.generator,
-					self.clientReceivePacketCallback,
-					self.ingressSecurityPolicy,
-					self.contractStatus,
-					self.settings,
-				)
-				if err == nil {
-					added += 1
-					if client.IsP2pOnly() {
-						addedP2pOnly += 1
-					}
-
-					self.monitor.AddProviderEvent(args.ClientId, ProviderStateInEvaluation)
-
-					// send an initial ping on the client and let the ack timeout close it
-					pingDone := make(chan struct{})
-					success, err := client.SendDetailedMessage(
-						&protocol.IpPing{},
-						self.settings.PingWriteTimeout,
-						func(err error) {
-							close(pingDone)
-							if err == nil {
-								glog.Infof("[multi]expand new client\n")
-
-								self.monitor.AddProviderEvent(args.ClientId, ProviderStateAdded)
-								var replacedClient *multiClientChannel
-								func() {
-									self.stateLock.Lock()
-									defer self.stateLock.Unlock()
-									replacedClient = self.destinationClients[args.Destination]
-									self.destinationClients[args.Destination] = client
-								}()
-								if replacedClient != nil {
-									replacedClient.Cancel()
-									self.monitor.AddProviderEvent(replacedClient.ClientId(), ProviderStateRemoved)
-								}
-								func() {
-									mutex.Lock()
-									defer mutex.Unlock()
-									addedCount += 1
-									self.monitor.AddWindowExpandEvent(
-										targetWindowSize <= currentWindowSize+addedCount,
-										targetWindowSize,
-									)
-								}()
-							} else {
-								glog.Infof("[multi]create ping error = %s\n", err)
-								client.Cancel()
-								self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed)
-							}
-						},
+				go func() {
+					client, err := newMultiClientChannel(
+						self.ctx,
+						args,
+						self.generator,
+						self.clientReceivePacketCallback,
+						self.ingressSecurityPolicy,
+						self.contractStatus,
+						self.settings,
 					)
-					if err != nil {
-						glog.Infof("[multi]create client ping error = %s\n", err)
-						client.Cancel()
-					} else if !success {
-						client.Cancel()
-						self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed)
+					if err == nil {
+						added += 1
+						if client.IsP2pOnly() {
+							addedP2pOnly += 1
+						}
+
+						self.monitor.AddProviderEvent(args.ClientId, ProviderStateInEvaluation)
+
+						success, err := client.SendDetailedMessage(
+							&protocol.IpPing{},
+							self.settings.PingWriteTimeout,
+							func(err error) {
+								close(pingDone)
+								if err == nil {
+									glog.Infof("[multi]expand new client\n")
+
+									self.monitor.AddProviderEvent(args.ClientId, ProviderStateAdded)
+									var replacedClient *multiClientChannel
+									func() {
+										self.stateLock.Lock()
+										defer self.stateLock.Unlock()
+										replacedClient = self.destinationClients[args.Destination]
+										self.destinationClients[args.Destination] = client
+									}()
+									if replacedClient != nil {
+										replacedClient.Cancel()
+										self.monitor.AddProviderEvent(replacedClient.ClientId(), ProviderStateRemoved)
+									}
+									func() {
+										mutex.Lock()
+										defer mutex.Unlock()
+										addedCount += 1
+										self.monitor.AddWindowExpandEvent(
+											targetWindowSize <= currentWindowSize+addedCount,
+											targetWindowSize,
+										)
+									}()
+								} else {
+									glog.Infof("[multi]create ping error = %s\n", err)
+									client.Cancel()
+									self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed)
+								}
+							},
+						)
+						if err != nil {
+							glog.Infof("[multi]create client ping error = %s\n", err)
+							close(pingDone)
+							client.Cancel()
+						} else if !success {
+							close(pingDone)
+							client.Cancel()
+							self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed)
+						} else {
+							// async wait for the ping
+							go HandleError(func() {
+								select {
+								case <-pingDone:
+								case <-time.After(self.settings.PingTimeout):
+									glog.V(2).Infof("[multi]expand window timeout waiting for ping\n")
+									client.Cancel()
+								}
+							}, client.Cancel)
+						}
 					} else {
-						// async wait for the ping
-						pendingPingDones = append(pendingPingDones, pingDone)
-						go HandleError(func() {
-							select {
-							case <-pingDone:
-							case <-time.After(self.settings.PingTimeout):
-								glog.V(2).Infof("[multi]expand window timeout waiting for ping\n")
-								client.Cancel()
-							}
-						}, client.Cancel)
+						glog.Infof("[multi]create client error = %s\n", err)
+						close(pingDone)
+						self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
+						self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed)
 					}
-				} else {
-					glog.Infof("[multi]create client error = %s\n", err)
-					self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
-					self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed)
-				}
+				}()
 			}
 		case <-time.After(timeout):
 			glog.V(2).Infof("[multi]expand window timeout waiting for args\n")
@@ -1856,7 +1864,7 @@ func (self *multiClientWindow) expand(currentWindowSize int, currentP2pOnlyWindo
 
 	// wait for pending pings
 	for _, pingDone := range pendingPingDones {
-		timeout := blockEndTime.Sub(time.Now())
+		timeout := endTime.Sub(time.Now())
 		if timeout <= 0 {
 			break
 		}
