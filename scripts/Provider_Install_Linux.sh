@@ -52,7 +52,7 @@ while [ $# -gt 0 ]; do
 
 	-t|--tag)
 	    require_arg "$1" "$2"
-	    tag="$2"
+	    tag="tags/$2"
 	    shift 2
 	    ;;
 
