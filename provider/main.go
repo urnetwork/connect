@@ -51,7 +51,7 @@ func main() {
 	usage := fmt.Sprintf(
 		`Connect provider.
 
-The default urls are:
+The default URLs are:
     api_url: %s
     connect_url: %s
 
@@ -73,19 +73,25 @@ Usage:
         [-v...]
     
 Options:
-    -h --help                        Show this screen.
+    -h --help                        Show this help and exit.
     --version                        Show version.
-    --api_url=<api_url>
-    --connect_url=<connect_url>
-    --user_auth=<user_auth>
-    --password=<password>
-    -p --port=<port>   Status server port [default: no status server].
-    --max-memory=<mem> Set the maximum amount of memory in bytes, or the suffixes b, kib, mib, gib may be used.`,
+    -v...                            Enable verbose mode. -v implies verbose level 1,
+    				     -vv implies level 2... etc.
+    -f                               Force overwrite the JWT token store file, if exists. By default,
+    				     if the JWT token store file already exists, it will not be overwritten.
+    --api_url=<api_url>              Specify a custom API URL to use.
+    --connect_url=<connect_url>      Specify a custom connect URL to use.
+    --user_auth=<user_auth>	     Login with a username.
+    --password=<password>            Login with a password. If --user_auth is used, you will be prompted for your
+    				     password anyways, if you don't specify it using this option.
+    -p --port=<port>                 Status server port [default: no status server].
+    --max-memory=<mem>               Set the maximum amount of memory in bytes, or the suffixes b, kib, mib, gib may be used [This is a soft limit].`,
 		DefaultApiUrl,
 		DefaultConnectUrl,
 	)
 
 	opts, err := docopt.ParseArgs(usage, os.Args[1:], RequireVersion())
+
 	if err != nil {
 		panic(err)
 	}
