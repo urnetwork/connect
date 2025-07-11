@@ -663,7 +663,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 		}()
 
 		reconnect := NewReconnect(self.settings.ReconnectTimeout)
-		connect := func() (*quic.Stream, error) {
+		connect := func() (quic.Stream, error) {
 			// quicConfig := &quic.Config{
 			// 	HandshakeIdleTimeout: self.settings.QuicConnectTimeout + self.settings.QuicHandshakeTimeout,
 			// }
@@ -780,7 +780,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			return stream, nil
 		}
 
-		var stream *quic.Stream
+		var stream quic.Stream
 		var err error
 		if glog.V(2) {
 			stream, err = TraceWithReturnError(fmt.Sprintf("[t]connect %s", clientId), connect)
