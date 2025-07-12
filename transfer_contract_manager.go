@@ -85,7 +85,7 @@ func DefaultContractManagerSettings() *ContractManagerSettings {
 		panic(err)
 	}
 	return &ContractManagerSettings{
-		StandardContractTransferByteCount: mib(32),
+		StandardContractTransferByteCount: mib(128),
 
 		NetworkEventTimeEnableContracts: networkEventTimeEnableContracts,
 
