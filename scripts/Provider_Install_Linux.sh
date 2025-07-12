@@ -1,7 +1,7 @@
 #!/bin/sh
 
 me="$0"
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 
 if [ "$me" = "sh" ] || [ "$me" = "bash" ] || [ "$me" = "zsh" ]; then
     me="urnetwork-installer"
@@ -52,7 +52,7 @@ while [ $# -gt 0 ]; do
 
 	-t|--tag)
 	    require_arg "$1" "$2"
-	    tag="$2"
+	    tag="tags/$2"
 	    shift 2
 	    ;;
 
