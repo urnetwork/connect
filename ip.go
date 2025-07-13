@@ -527,7 +527,7 @@ func (self *UdpBuffer[BufferId]) udpSend(
 			// limit the total connections per source to avoid blowing up the ulimit
 			if sourceSequences := self.sourceSequences[source]; self.udpBufferSettings.UserLimit < len(sourceSequences) {
 				applyLruUserLimit(maps.Values(sourceSequences), self.udpBufferSettings.UserLimit, func(sequence *UdpSequence) bool {
-					glog.Infof(
+					glog.V(1).Infof(
 						"[lnr]udp limit source %s->%s\n",
 						source,
 						net.JoinHostPort(
@@ -693,7 +693,7 @@ func (self *UdpSequence) Run() {
 		self.IpPath().DestinationHostPort(),
 	)
 	if err != nil {
-		glog.Infof("[init]udp connect error = %s\n", err)
+		glog.V(1).Infof("[init]udp connect error = %s\n", err)
 		return
 	}
 	defer socket.Close()
@@ -746,7 +746,7 @@ func (self *UdpSequence) Run() {
 					if err == nil {
 						glog.V(2).Infof("[f%d]udp forward %d\n", sendIter, n)
 					} else {
-						glog.Infof("[f%d]udp forward %d error = %s", sendIter, n, err)
+						glog.V(1).Infof("[f%d]udp forward %d error = %s", sendIter, n, err)
 					}
 
 					if 0 < n {
@@ -807,7 +807,7 @@ func (self *UdpSequence) Run() {
 			n, err := socket.Read(buffer)
 
 			if err != nil {
-				glog.Infof("[f%d]udp receive err = %s\n", forwardIter, err)
+				glog.V(1).Infof("[f%d]udp receive err = %s\n", forwardIter, err)
 			}
 
 			if 0 < n {
@@ -835,7 +835,7 @@ func (self *UdpSequence) Run() {
 				if err == io.EOF {
 					return
 				} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					glog.Infof("[f%d]timeout\n", forwardIter)
+					glog.V(1).Infof("[f%d]timeout\n", forwardIter)
 					return
 				} else {
 					// some other error
@@ -1157,7 +1157,7 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 			// limit the total connections per source to avoid blowing up the ulimit
 			if sourceSequences := self.sourceSequences[source]; self.tcpBufferSettings.UserLimit < len(sourceSequences) {
 				applyLruUserLimit(maps.Values(sourceSequences), self.tcpBufferSettings.UserLimit, func(sequence *TcpSequence) bool {
-					glog.Infof(
+					glog.V(1).Infof(
 						"[lnr]tcp limit source %s->%s\n",
 						source,
 						net.JoinHostPort(
@@ -1363,7 +1363,7 @@ func (self *TcpSequence) Run() {
 		self.tcpBufferSettings.ConnectTimeout,
 	)
 	if err != nil {
-		glog.Infof("[init]tcp connect error = %s\n", err)
+		glog.V(1).Infof("[init]tcp connect error = %s\n", err)
 		return
 	}
 	self.UpdateLastActivityTime()
@@ -1527,7 +1527,7 @@ func (self *TcpSequence) Run() {
 					if err == nil {
 						glog.V(2).Infof("[f%d]tcp forward %d\n", sendIter, n)
 					} else {
-						glog.Infof("[f%d]tcp forward %d error = %s\n", sendIter, n, err)
+						glog.V(1).Infof("[f%d]tcp forward %d error = %s\n", sendIter, n, err)
 					}
 
 					if 0 < n {
@@ -1597,7 +1597,7 @@ func (self *TcpSequence) Run() {
 			n, err := socket.Read(buffer)
 
 			if err != nil {
-				glog.Infof("[f%d]tcp receive error = %s\n", forwardIter, err)
+				glog.V(1).Infof("[f%d]tcp receive error = %s\n", forwardIter, err)
 			}
 
 			if 0 < n {
@@ -1856,13 +1856,13 @@ func (self *TcpSequence) Run() {
 						if self.windowSize <= nonBlockingByteCount {
 							nextWindowSize := min(self.windowSize*2, self.tcpBufferSettings.MaxWindowSize)
 							if self.windowSize != nextWindowSize {
-								glog.Infof("[r%d]increase window size %d -> %d\n", sendIter, self.windowSize, nextWindowSize)
+								glog.V(1).Infof("[r%d]increase window size %d -> %d\n", sendIter, self.windowSize, nextWindowSize)
 								self.windowSize = nextWindowSize
 							}
 						} else if self.windowSize/2 <= blockingByteCount {
 							nextWindowSize := max(self.windowSize/2, self.tcpBufferSettings.MinWindowSize)
 							if self.windowSize != nextWindowSize {
-								glog.Infof("[r%d]decrease window size %d -> %d\n", sendIter, self.windowSize, nextWindowSize)
+								glog.V(1).Infof("[r%d]decrease window size %d -> %d\n", sendIter, self.windowSize, nextWindowSize)
 								self.windowSize = nextWindowSize
 							}
 						}

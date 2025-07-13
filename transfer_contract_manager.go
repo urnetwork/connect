@@ -89,7 +89,7 @@ func DefaultContractManagerSettings() *ContractManagerSettings {
 
 		NetworkEventTimeEnableContracts: networkEventTimeEnableContracts,
 
-		ProvidePingTimeout: 15 * time.Second,
+		ProvidePingTimeout: 0,
 
 		ProtocolVersion: DefaultProtocolVersion,
 
@@ -198,6 +198,10 @@ func NewContractManager(
 }
 
 func (self *ContractManager) providePing() {
+	if self.settings.ProvidePingTimeout == 0 {
+		return
+	}
+
 	// used for logging states only
 	logWait := false
 
