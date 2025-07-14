@@ -40,35 +40,96 @@ const debugTags = false
 const MessagePoolMetaByteCount = 12
 const MessagePoolFlagShared = uint8(0x01)
 
+var InitialMessagePoolByteCount = mib(1)
+
 var nextId atomic.Uint64
 
 type messagePool struct {
 	size         int
-	pool         *sync.Pool
+	pool         [][]byte
+	count        int
 	takenTags    [256]atomic.Uint64
 	returnedTags [256]atomic.Uint64
 	createdTags  [256]atomic.Uint64
 	stateLock    sync.Mutex
 }
 
-func newMessagePool(size int) *messagePool {
+func newMessagePool(size int, maxCount int) *messagePool {
 	mp := &messagePool{
-		size: size,
-		pool: &sync.Pool{
-			New: func() any {
-				poolMessage := make([]byte, size+MessagePoolMetaByteCount)
-				binary.BigEndian.PutUint64(poolMessage[size:], nextId.Add(1))
-				poolMessage[size+8] = 255
-				return poolMessage
-			},
-		},
+		size:  size,
+		pool:  make([][]byte, maxCount),
+		count: 0,
 	}
 	return mp
 }
 
+func (self *messagePool) resize(maxCount int) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	newPool := make([][]byte, maxCount)
+	newCount := copy(newPool, self.pool[:self.count])
+	self.pool = newPool
+	self.count = newCount
+}
+
+func (self *messagePool) clear() {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	for i := range self.count {
+		self.pool[i] = nil
+	}
+	self.count = 0
+}
+
+// the returned does not come in an initialized zero state,
+// i.e. it can have garbage bytes
+func (self *messagePool) get() []byte {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	if 0 < self.count {
+		poolMessage := self.pool[self.count-1]
+		self.pool[self.count-1] = nil
+		self.count -= 1
+		return poolMessage
+	}
+
+	// create a new message
+	poolMessage := make([]byte, self.size+MessagePoolMetaByteCount)
+	binary.BigEndian.PutUint64(poolMessage[self.size:], nextId.Add(1))
+	poolMessage[self.size+8] = 255
+	return poolMessage
+}
+
+func (self *messagePool) put(poolMessage []byte) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	if self.count < len(self.pool) {
+		// note we do not need to zero out the message
+		self.pool[self.count] = poolMessage
+		self.count += 1
+	}
+	// else no capacity, discard the message
+}
+
 var orderedMessagePools = []*messagePool{
-	newMessagePool(2048),
-	newMessagePool(4096),
+	newMessagePool(2048, int(InitialMessagePoolByteCount/ByteCount(2048))),
+	newMessagePool(4096, int(InitialMessagePoolByteCount/ByteCount(4096))),
+}
+
+func ResizeMessagePools(maxByteCount ByteCount) {
+	for _, pool := range orderedMessagePools {
+		pool.resize(int(maxByteCount / ByteCount(pool.size)))
+	}
+}
+
+func ClearMessagePools() {
+	for _, pool := range orderedMessagePools {
+		pool.clear()
+	}
 }
 
 var seed = maphash.MakeSeed()
@@ -160,16 +221,18 @@ func MessagePoolStats() map[int]map[int]float32 {
 	return sizeTagRatios
 }
 
-func MessagePool(targetSize int) (*sync.Pool, int) {
+/*
+func MessagePool(targetSize int) (*messagePool, int) {
 	for _, pool := range orderedMessagePools {
 		if targetSize <= pool.size {
-			return pool.pool, pool.size
+			return pool, pool.size
 		}
 	}
 	// return the largest
 	pool := orderedMessagePools[len(orderedMessagePools)-1]
-	return pool.pool, pool.size
+	return pool, pool.size
 }
+*/
 
 func MessagePoolReadAll(r io.Reader) ([]byte, error) {
 	return MessagePoolReadAllWithTag(r, 0)
@@ -251,7 +314,7 @@ func MessagePoolGetDetailed(n int) ([]byte, bool) {
 func MessagePoolGetDetailedWithTag(n int, tag uint8) ([]byte, bool) {
 	for _, pool := range orderedMessagePools {
 		if n <= pool.size {
-			poolMessage := pool.pool.Get().([]byte)
+			poolMessage := pool.get()
 			if poolMessage[pool.size+8] == 255 {
 				pool.createdTags[tag].Add(1)
 			}
@@ -312,7 +375,7 @@ func MessagePoolReturn(message []byte) bool {
 				poolMessage[pool.size+8] = 0
 				poolMessage[pool.size+9] = 0
 				binary.BigEndian.PutUint16(poolMessage[pool.size+10:], 0)
-				pool.pool.Put(poolMessage)
+				pool.put(poolMessage)
 				pool.returnedTags[tag].Add(1)
 				return true
 			}
