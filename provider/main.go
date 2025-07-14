@@ -142,6 +142,7 @@ func auth(opts docopt.Opts) {
 		}
 	}
 	if 0 < maxMemory {
+		connect.ResizeMessagePools(maxMemory / 8)
 		debug.SetMemoryLimit(maxMemory)
 	}
 
