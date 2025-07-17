@@ -63,7 +63,7 @@ func newMessagePool(size int, maxCount int) *messagePool {
 	return mp
 }
 
-func (self *messagePool) resize(maxCount int) {
+func (self *messagePool) Resize(maxCount int) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -73,7 +73,7 @@ func (self *messagePool) resize(maxCount int) {
 	self.count = newCount
 }
 
-func (self *messagePool) clear() {
+func (self *messagePool) Clear() {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -85,7 +85,7 @@ func (self *messagePool) clear() {
 
 // the returned does not come in an initialized zero state,
 // i.e. it can have garbage bytes
-func (self *messagePool) get() []byte {
+func (self *messagePool) Get() []byte {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -103,7 +103,7 @@ func (self *messagePool) get() []byte {
 	return poolMessage
 }
 
-func (self *messagePool) put(poolMessage []byte) {
+func (self *messagePool) Put(poolMessage []byte) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -122,13 +122,13 @@ var orderedMessagePools = []*messagePool{
 
 func ResizeMessagePools(maxByteCount ByteCount) {
 	for _, pool := range orderedMessagePools {
-		pool.resize(int(maxByteCount / ByteCount(pool.size)))
+		pool.Resize(int(maxByteCount / ByteCount(pool.size)))
 	}
 }
 
 func ClearMessagePools() {
 	for _, pool := range orderedMessagePools {
-		pool.clear()
+		pool.Clear()
 	}
 }
 
@@ -314,7 +314,7 @@ func MessagePoolGetDetailed(n int) ([]byte, bool) {
 func MessagePoolGetDetailedWithTag(n int, tag uint8) ([]byte, bool) {
 	for _, pool := range orderedMessagePools {
 		if n <= pool.size {
-			poolMessage := pool.get()
+			poolMessage := pool.Get()
 			if poolMessage[pool.size+8] == 255 {
 				pool.createdTags[tag].Add(1)
 			}
@@ -375,7 +375,7 @@ func MessagePoolReturn(message []byte) bool {
 				poolMessage[pool.size+8] = 0
 				poolMessage[pool.size+9] = 0
 				binary.BigEndian.PutUint16(poolMessage[pool.size+10:], 0)
-				pool.put(poolMessage)
+				pool.Put(poolMessage)
 				pool.returnedTags[tag].Add(1)
 				return true
 			}
