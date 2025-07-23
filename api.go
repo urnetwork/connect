@@ -221,11 +221,10 @@ func (self *BringYourApi) AuthVerifySend(authVerifySend *AuthVerifySendArgs, cal
 type AuthNetworkClientCallback ApiCallback[*AuthNetworkClientResult]
 
 type AuthNetworkClientArgs struct {
-	// FIXME how to bring this back as optional with gomobile. Use a new type *OptionalId?
-	// if omitted, a new client_id is created
-	// ClientId string `json:"client_id",omitempty`
-	Description string `json:"description"`
-	DeviceSpec  string `json:"device_spec"`
+	ClientId       *Id    `json:"client_id",omitempty`
+	SourceClientId *Id    `json:"source_client_id",omitempty`
+	Description    string `json:"description"`
+	DeviceSpec     string `json:"device_spec"`
 }
 
 type AuthNetworkClientResult struct {

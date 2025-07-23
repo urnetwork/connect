@@ -1130,6 +1130,7 @@ type ApiMultiClientGenerator struct {
 	deviceDescription       string
 	deviceSpec              string
 	appVersion              string
+	sourceClientId          *Id
 	clientSettingsGenerator func() *ClientSettings
 	settings                *ApiMultiClientGeneratorSettings
 
@@ -1147,6 +1148,7 @@ func NewApiMultiClientGeneratorWithDefaults(
 	deviceDescription string,
 	deviceSpec string,
 	appVersion string,
+	sourceClientId *Id,
 ) *ApiMultiClientGenerator {
 	return NewApiMultiClientGenerator(
 		ctx,
@@ -1159,6 +1161,7 @@ func NewApiMultiClientGeneratorWithDefaults(
 		deviceDescription,
 		deviceSpec,
 		appVersion,
+		sourceClientId,
 		DefaultClientSettings,
 		DefaultApiMultiClientGeneratorSettings(),
 	)
@@ -1175,6 +1178,7 @@ func NewApiMultiClientGenerator(
 	deviceDescription string,
 	deviceSpec string,
 	appVersion string,
+	sourceClientId *Id,
 	clientSettingsGenerator func() *ClientSettings,
 	settings *ApiMultiClientGeneratorSettings,
 ) *ApiMultiClientGenerator {
@@ -1191,6 +1195,7 @@ func NewApiMultiClientGenerator(
 		deviceDescription:       deviceDescription,
 		deviceSpec:              deviceSpec,
 		appVersion:              appVersion,
+		sourceClientId:          sourceClientId,
 		clientSettingsGenerator: clientSettingsGenerator,
 		settings:                settings,
 		api:                     api,
@@ -1242,8 +1247,9 @@ func (self *ApiMultiClientGenerator) NewClientArgs() (*MultiClientGeneratorClien
 	auth := func() (string, error) {
 		// note the derived client id will be inferred by the api jwt
 		authNetworkClient := &AuthNetworkClientArgs{
-			Description: self.deviceDescription,
-			DeviceSpec:  self.deviceSpec,
+			SourceClientId: self.sourceClientId,
+			Description:    self.deviceDescription,
+			DeviceSpec:     self.deviceSpec,
 		}
 
 		result, err := self.api.AuthNetworkClientSync(authNetworkClient)

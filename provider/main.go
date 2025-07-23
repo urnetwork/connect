@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"strings"
 	"syscall"
@@ -384,7 +385,7 @@ func provideAuth(ctx context.Context, clientStrategy *connect.ClientStrategy, ap
 	authClientCallback, authClientChannel := connect.NewBlockingApiCallback[*connect.AuthNetworkClientResult](ctx)
 
 	authClientArgs := &connect.AuthNetworkClientArgs{
-		Description: fmt.Sprintf("provider %s", RequireVersion()),
+		Description: fmt.Sprintf("provider %s %s", runtime.GOOS, RequireVersion()),
 		DeviceSpec:  "",
 	}
 

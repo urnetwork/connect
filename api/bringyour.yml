@@ -1791,6 +1791,9 @@ components:
         client_id:
           description: udid. Optional. If this is given, it must currently exist in the network. Omit this to assign a new client id.
           type: string
+        source_client_id:
+          description: udid. Optional. The source client id when creating an ancillary client id.
+          type: string
         description:
           description: If this is a new device, sets the device name to the description of the device.
           type: string
@@ -1841,6 +1844,9 @@ components:
             type: object
             properties:
               client_id:
+                description: udid
+                type: string
+              source_client_id:
                 description: udid
                 type: string
               device_id:
