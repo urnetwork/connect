@@ -50,8 +50,8 @@ const (
 func DefaultPacketTranslationSettings() *PacketTranslationSettings {
 	return &PacketTranslationSettings{
 		DnsTlds: [][]byte{},
-		// a good baseline is 200 pumps per second
-		DnsPumpTimeout: 1 * time.Second / time.Duration(200),
+		// a good baseline is 100 pumps per second
+		DnsPumpTimeout: 1 * time.Second / time.Duration(100),
 		// DnsReadTimeout: 1 * time.Second:
 		DnsStateTimeout: 5 * time.Second,
 
@@ -291,7 +291,7 @@ func (self *packetTranslation) encodeDns() {
 				case <-time.After(self.settings.DnsPumpTimeout):
 					// pump one header the server can use to repsond to
 					if mostRecentAddr != nil {
-						// startTime := time.Now()
+						startTime := time.Now()
 
 						tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
 
@@ -321,19 +321,19 @@ func (self *packetTranslation) encodeDns() {
 							}
 							return
 						}
-						// endTime := time.Now()
-						// writeDuration := endTime.Sub(startTime)
-						// timeout := time.Second/time.Duration(self.settings.WritePacketsPerSecond) - writeDuration
-						// if 0 < timeout {
-						// 	randTimeout := time.Duration(mathrand.Intn(
-						// 		2 * int(timeout / time.Nanosecond),
-						// 	)) * time.Nanosecond
-						// 	select {
-						// 	case <-time.After(randTimeout):
-						// 	case <-self.ctx.Done():
-						// 		return
-						// 	}
-						// }
+						endTime := time.Now()
+						writeDuration := endTime.Sub(startTime)
+						timeout := time.Second/time.Duration(self.settings.WritePacketsPerSecond) - writeDuration
+						if 0 < timeout {
+							randTimeout := time.Duration(mathrand.Intn(
+								2*int(timeout/time.Nanosecond),
+							)) * time.Nanosecond
+							select {
+							case <-time.After(randTimeout):
+							case <-self.ctx.Done():
+								return
+							}
+						}
 					} else {
 						glog.Infof("[pt]cannot pump dns due to missing most recent addr\n")
 					}
