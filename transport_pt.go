@@ -61,7 +61,7 @@ func DefaultPacketTranslationSettings() *PacketTranslationSettings {
 		DnsMaxPumpHostsPerAddress: 2 * 1024,
 		DnsMaxPumpHosts:           1024 * 1024 * 1024,
 
-		WritePacketsPerSecond: 800,
+		WritePacketsPerSecond: 200,
 		SequenceBufferSize:    32,
 	}
 }
