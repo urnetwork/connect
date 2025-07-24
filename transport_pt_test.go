@@ -266,8 +266,9 @@ func (self *packetLossPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err 
 			return
 		}
 		if 0 < self.n && self.readRand.Intn(self.n+1) == 0 {
+			// scramble the packet
+			self.readRand.Read(p[:n])
 			fmt.Printf("d")
-			continue
 		}
 		return
 	}
@@ -275,10 +276,9 @@ func (self *packetLossPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err 
 
 func (self *packetLossPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	if 0 < self.n && self.writeRand.Intn(self.n+1) == 0 {
-		// pretent the packet was sent but drop it
-		n = len(p)
+		// scramble the packet
+		self.writeRand.Read(p)
 		fmt.Printf("d")
-		return
 	}
 
 	n, err = self.packetConn.WriteTo(p, addr)
