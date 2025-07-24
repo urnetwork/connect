@@ -2241,8 +2241,15 @@ components:
     SubscriptionBalanceResult:
       type: object
       properties:
+        start_balance_byte_count:
+          type: integer
+          description: The initial data balance in bytes for the period.
         balance_byte_count:
           type: integer
+          description: The current data balance in bytes.
+        open_transfer_byte_count:
+          type: integer
+          description: Data tied up in pending contracts.
         current_subscription:
           type: object
           properties:
@@ -2276,29 +2283,6 @@ components:
                 type: integer
         pending_payout_usd_nano_cents:
           type: integer
-        wallet_info:
-          type: object
-          properties:
-            wallet_id:
-              description: udid
-              type: string
-            token_id:
-              description: udid
-              type: string
-            blockchain:
-              type: string
-              enum:
-                - Polygon
-            blockchain_symbol:
-              type: string
-              enum:
-                - MATIC
-            create_date:
-              type: string
-            balance_usdc_nano_cents:
-              type: integer
-            address:
-              type: string
         update_time:
           type: string
 
