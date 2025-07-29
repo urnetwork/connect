@@ -657,6 +657,59 @@ paths:
               schema:
                 $ref: "#/components/schemas/SetNetworkRankingVisibilityResult"
 
+  /network/block-location:
+    post:
+      description: |
+        Block providing to a location
+      operationId: Network Block Location
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkBlockLocationArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkBlockLocationResult"
+
+  /network/unblock-location:
+    post:
+      description: |
+        Unblock providing to a location
+      operationId: Network Unblock Location
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkUnblockLocationArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkUnblockLocationResult"
+
+  /network/blocked-locations:
+    get:
+      description: Get list locations to block from providing for the network
+      operationId: Network Blocked Locations
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetNetworkBlockedLocationsResult"
+
   /wallet/balance:
     get:
       description: |
@@ -3170,3 +3223,40 @@ components:
             $ref: "#/components/schemas/AccountPayment"
         error:
           $ref: "#/components/schemas/GetNetworkAccountPaymentsError"
+
+    NetworkBlockLocationArgs:
+      type: object
+      properties:
+        location_id:
+          description: uuid
+          type: string
+
+    NetworkBlockLocationResult:
+      type: object
+
+    NetworkUnblockLocationArgs:
+      type: object
+      properties:
+        location_id:
+          description: uuid
+          type: string
+
+    NetworkUnblockLocationResult:
+      type: object
+
+    BlockedLocation:
+      type: object
+      properties:
+        location_id:
+          description: uuid
+          type: string
+        location_name:
+          type: string
+
+    GetNetworkBlockedLocationsResult:
+      type: object
+      properties:
+        blocked_locations:
+          type: array
+          items:
+            $ref: "#/components/schemas/BlockedLocation"
