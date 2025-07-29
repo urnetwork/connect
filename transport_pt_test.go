@@ -62,32 +62,34 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 		mathrand.Read(headerPrefix)
 
 		// FIXME quic does not seem to recover well with packet loss
-		packetLossN := i + 1000
+		packetLossN := i + 100
 
 		fmt.Printf("[%d]dns test (loss=%.1f%%)\n", i, 100.0/float32(packetLossN))
-		func() {
-			handleCtx, handleCancel := context.WithCancel(ctx)
-			defer handleCancel()
+		success := false
+		for range 8 {
+			success = func() bool {
+				handleCtx, handleCancel := context.WithCancel(ctx)
+				defer handleCancel()
 
-			n := 1024 * (8 + mathrand.Intn(8))
-			data := consecutive(n)
+				n := 1024 * (8 + mathrand.Intn(8))
+				data := consecutive(n)
 
-			tld := []byte("foo.com.")
+				tld := []byte("foo.com.")
 
-			serverAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: basePort + i}
+				serverAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: basePort + i}
 
-			ioTimeout := 300 * time.Second
+				ioTimeout := 300 * time.Second
 
-			quicConfig := &quic.Config{
-				HandshakeIdleTimeout:    ioTimeout,
-				MaxIdleTimeout:          ioTimeout,
-				KeepAlivePeriod:         5 * time.Second,
-				Allow0RTT:               true,
-				DisablePathMTUDiscovery: true,
-			}
+				quicConfig := &quic.Config{
+					HandshakeIdleTimeout:    ioTimeout,
+					MaxIdleTimeout:          ioTimeout,
+					KeepAlivePeriod:         5 * time.Second,
+					Allow0RTT:               true,
+					DisablePathMTUDiscovery: true,
+				}
 
-			serverCtx, serverCancel := context.WithCancel(handleCtx)
-			func() {
+				serverCtx, serverCancel := context.WithCancel(handleCtx)
+				// func() {
 				serverTlsConfig := &tls.Config{
 					GetConfigForClient: func(clientHello *tls.ClientHelloInfo) (*tls.Config, error) {
 						certPemBytes, keyPemBytes, err := selfSign(
@@ -107,30 +109,31 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 
 				serverConn, err := net.ListenUDP("udp", serverAddr)
 				assert.Equal(t, err, nil)
+				defer serverConn.Close()
 
-				lossConn := newPacketLossPacketConn(packetLossN, serverConn)
+				serverLossConn := newPacketLossPacketConn(packetLossN, serverConn)
 
-				ptSettings := DefaultPacketTranslationSettings()
-				ptSettings.DnsTlds = [][]byte{tld}
+				serverPtSettings := DefaultPacketTranslationSettings()
+				serverPtSettings.DnsTlds = [][]byte{tld}
 				// settings.DnsAddr = serverAddr
 
-				ptConn, err := NewPacketTranslationWithPrefix(handleCtx, serverPtMode, lossConn, ptSettings, headerPrefix)
+				serverPtConn, err := NewPacketTranslationWithPrefix(handleCtx, serverPtMode, serverLossConn, serverPtSettings, headerPrefix)
 				assert.Equal(t, err, nil)
-				// defer ptConn.Close()
+				defer serverPtConn.Close()
 
 				earlyListener, err := (&quic.Transport{
-					Conn: ptConn,
+					Conn: serverPtConn,
 					// createdConn: true,
 					// isSingleUse: true,
 				}).ListenEarly(serverTlsConfig, quicConfig)
 				// listenQuic(ctx, earlyListener)
 				assert.Equal(t, err, nil)
-				// defer earlyListener.Close()
+				defer earlyListener.Close()
 
 				go func() {
 					defer serverCancel()
-					defer ptConn.Close()
-					defer earlyListener.Close()
+					// defer ptConn.Close()
+					// defer earlyListener.Close()
 
 					earlyConn, err := earlyListener.Accept(handleCtx)
 					assert.Equal(t, err, nil)
@@ -167,76 +170,94 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 
 				}()
 
-			}()
+				// }()
 
-			clientTlsConfig := &tls.Config{
-				ServerName:         string(tld),
-				InsecureSkipVerify: true,
-			}
+				clientTlsConfig := &tls.Config{
+					ServerName:         string(tld),
+					InsecureSkipVerify: true,
+				}
 
-			clientConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
-			assert.Equal(t, err, nil)
-
-			lossConn := newPacketLossPacketConn(packetLossN, clientConn)
-
-			ptSettings := DefaultPacketTranslationSettings()
-			ptSettings.DnsTlds = [][]byte{tld}
-			// ptSettings.DnsAddr = serverAddr
-			ptConn, err := NewPacketTranslationWithPrefix(handleCtx, clientPtMode, lossConn, ptSettings, headerPrefix)
-			assert.Equal(t, err, nil)
-			defer ptConn.Close()
-
-			quicTransport := &quic.Transport{
-				Conn: ptConn,
-				// createdConn: true,
-				// isSingleUse: true,
-			}
-
-			// enable 0rtt if possible
-			conn, err := quicTransport.DialEarly(handleCtx, serverAddr, clientTlsConfig, quicConfig)
-			assert.Equal(t, err, nil)
-
-			stream, err := conn.OpenStream()
-			assert.Equal(t, err, nil)
-
-			writeCtx, writeCancel := context.WithCancel(handleCtx)
-			go func() {
-				defer writeCancel()
-				stream.SetWriteDeadline(time.Now().Add(ioTimeout))
-				m, err := stream.Write(data)
+				clientConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 				assert.Equal(t, err, nil)
-				assert.Equal(t, m, len(data))
-			}()
+				defer clientConn.Close()
 
-			readData := make([]byte, 0, len(data))
-			buf := make([]byte, 2048)
+				lossConn := newPacketLossPacketConn(packetLossN, clientConn)
 
-			for len(readData) < len(data) {
-				stream.SetReadDeadline(time.Now().Add(ioTimeout))
-				m, err := stream.Read(buf[:min(len(buf), len(data)-len(readData))])
+				ptSettings := DefaultPacketTranslationSettings()
+				ptSettings.DnsTlds = [][]byte{tld}
+				// ptSettings.DnsAddr = serverAddr
+				ptConn, err := NewPacketTranslationWithPrefix(handleCtx, clientPtMode, lossConn, ptSettings, headerPrefix)
 				assert.Equal(t, err, nil)
-				readData = append(readData, buf[:m]...)
+				defer ptConn.Close()
 
-				// fmt.Printf("read[%d]\n", m)
-				fmt.Printf(".")
-			}
+				quicTransport := &quic.Transport{
+					Conn: ptConn,
+					// createdConn: true,
+					// isSingleUse: true,
+				}
 
-			assert.Equal(t, data, readData)
+				// enable 0rtt if possible
+				conn, err := quicTransport.DialEarly(handleCtx, serverAddr, clientTlsConfig, quicConfig)
+				assert.Equal(t, err, nil)
 
-			select {
-			case <-writeCtx.Done():
-				// case <- time.After(60 * time.Second):
-				// 	t.FailNow()
-			}
+				stream, err := conn.OpenStream()
+				assert.Equal(t, err, nil)
 
-			select {
-			case <-serverCtx.Done():
-				// case <- time.After(60 * time.Second):
-				// 	t.FailNow()
-			}
+				writeCtx, writeCancel := context.WithCancel(handleCtx)
+				go func() {
+					defer writeCancel()
+					stream.SetWriteDeadline(time.Now().Add(ioTimeout))
+					m, err := stream.Write(data)
+					assert.Equal(t, err, nil)
+					assert.Equal(t, m, len(data))
+				}()
 
+				readData := make([]byte, 0, len(data))
+				buf := make([]byte, 2048)
+
+				for len(readData) < len(data) {
+					stream.SetReadDeadline(time.Now().Add(ioTimeout))
+					m, err := stream.Read(buf[:min(len(buf), len(data)-len(readData))])
+					if err != nil {
+						return false
+					}
+					// assert.Equal(t, err, nil)
+					readData = append(readData, buf[:m]...)
+
+					// fmt.Printf("read[%d]\n", m)
+					fmt.Printf(".")
+				}
+
+				assert.Equal(t, data, readData)
+
+				select {
+				case <-writeCtx.Done():
+					// case <- time.After(60 * time.Second):
+					// 	t.FailNow()
+				}
+
+				select {
+				case <-serverCtx.Done():
+					// case <- time.After(60 * time.Second):
+					// 	t.FailNow()
+				}
+
+				return true
+			}()
 			fmt.Printf("\n")
-		}()
+			if success {
+				// timeout. reform the sockets and retry
+				break
+			}
+			fmt.Printf("connection issue. retry.\n")
+			select {
+			case <-ctx.Done():
+			case <-time.After(1 * time.Second):
+			}
+		}
+		if !success {
+			t.FailNow()
+		}
 	}
 
 }
@@ -266,9 +287,15 @@ func (self *packetLossPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err 
 			return
 		}
 		if 0 < self.n && self.readRand.Intn(self.n+1) == 0 {
-			// scramble the packet
-			self.readRand.Read(p[:n])
-			fmt.Printf("d")
+			if self.readRand.Intn(2) == 0 {
+				// scramble the packet
+				self.readRand.Read(p[:n])
+				fmt.Printf("s")
+			} else {
+				// drop the packet
+				fmt.Printf("d")
+				continue
+			}
 		}
 		return
 	}
@@ -276,9 +303,16 @@ func (self *packetLossPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err 
 
 func (self *packetLossPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	if 0 < self.n && self.writeRand.Intn(self.n+1) == 0 {
-		// scramble the packet
-		self.writeRand.Read(p)
-		fmt.Printf("d")
+		if self.writeRand.Intn(2) == 0 {
+			// scramble the packet
+			self.writeRand.Read(p)
+			fmt.Printf("s")
+		} else {
+			// drop the packet
+			n = len(p)
+			fmt.Printf("d")
+			return
+		}
 	}
 
 	n, err = self.packetConn.WriteTo(p, addr)
