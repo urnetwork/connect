@@ -3252,6 +3252,10 @@ components:
           type: string
         location_name:
           type: string
+        location_type:
+          type: string
+        country_code:
+          type: string
 
     GetNetworkBlockedLocationsResult:
       type: object
