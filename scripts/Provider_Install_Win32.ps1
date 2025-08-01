@@ -64,11 +64,18 @@ $FileName = $ReleaseAsset.name
 $FilePath = Join-Path -Path $env:TEMP -ChildPath $FileName
 
 Write-Host "Downloading $FileName from $DownloadUrl"
-Start-BitsTransfer -Source $DownloadUrl -Destination $FilePath
-
-if (!$?) {
-  Write-Error "Failed to download the release asset. Are you sure the version exists and your internet connection is working?"
-  exit 1
+try {
+    Start-BitsTransfer -Source $DownloadUrl -Destination $FilePath -ErrorAction Stop
+}
+catch {
+    Write-Warning "Something went wrong during the download process. Reattempting using different technique."
+    try {
+        Invoke-WebRequest -Uri $DownloadUrl -OutFile $FilePath -UseBasicParsing -ErrorAction Stop
+    }
+    catch {
+        Write-Error "Failed to download the release asset. Are you sure the version exists and your internet connection is working?"
+        exit 1
+    }
 }
 
 $InstallDir = Join-Path -Path $env:LOCALAPPDATA -ChildPath "urnetwork\provider"
