@@ -41,8 +41,6 @@ import (
 // versus the h1 transport, h3 is:
 // - more cpu efficient.
 //   The quic stream does not need to mask/unmask each byte before TLS.
-// - faster to connect.
-//   The quic stream uses 0rtt connect when possible to speed up the initial connection.
 // - better throughput on poor networks.
 //   quic optimizes congestion control to better handle poor network conditions.
 // However, h3 is not available in all locations due to dpi/filtering.
@@ -194,7 +192,7 @@ func NewPlatformTransport(
 		routeManager,
 		platformUrl,
 		auth,
-		TransportModeH1,
+		TransportModeH3,
 		settings,
 	)
 }
@@ -223,7 +221,7 @@ func NewPlatformTransportWithTargetMode(
 		modeMonitor:    NewMonitor(),
 		availableModes: map[TransportMode]bool{},
 		targetMode:     targetMode,
-		mode:           TransportModeAuto,
+		mode:           targetMode,
 	}
 	go transport.run()
 	return transport
@@ -663,16 +661,25 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 		}()
 
 		reconnect := NewReconnect(self.settings.ReconnectTimeout)
-		connect := func() (*quic.Stream, error) {
+
+		type ConnStream struct {
+			conn   *quic.Conn
+			stream *quic.Stream
+		}
+
+		connect := func() (*ConnStream, error) {
 			// quicConfig := &quic.Config{
 			// 	HandshakeIdleTimeout: self.settings.QuicConnectTimeout + self.settings.QuicHandshakeTimeout,
 			// }
 
+			success := false
+
 			quicConfig := &quic.Config{
-				HandshakeIdleTimeout: time.Duration(slowMultiple) * (self.settings.QuicConnectTimeout + self.settings.QuicHandshakeTimeout),
-				MaxIdleTimeout:       self.settings.PingTimeout * 2,
-				KeepAlivePeriod:      0,
-				Allow0RTT:            true,
+				HandshakeIdleTimeout:    time.Duration(slowMultiple) * (self.settings.QuicConnectTimeout + self.settings.QuicHandshakeTimeout),
+				MaxIdleTimeout:          self.settings.PingTimeout * 4,
+				KeepAlivePeriod:         self.settings.PingTimeout * 2,
+				Allow0RTT:               false,
+				DisablePathMTUDiscovery: true,
 			}
 			var tlsConfig *tls.Config
 			if self.settings.QuicTlsConfig != nil {
@@ -689,6 +696,12 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			if err != nil {
 				return nil, err
 			}
+			defer func() {
+				if !success {
+					udpConn.Close()
+				}
+			}()
+
 			// udpAddr, err := net.ResolveUDPAddr("udp", addr)
 			// if err != nil {
 			// 	return nil, err
@@ -732,7 +745,13 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				packetConn = udpConn
 			}
 
-			glog.V(2).Infof("[c]h3 connect to %v (%s)\n", udpAddr, serverName)
+			defer func() {
+				if !success {
+					packetConn.Close()
+				}
+			}()
+
+			glog.Infof("[c]h3 connect to %v (%s)\n", udpAddr, serverName)
 
 			tlsConfig.ServerName = serverName
 			quicTransport := &quic.Transport{
@@ -740,25 +759,24 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				// createdConn: true,
 				// isSingleUse: true,
 			}
-			// enable 0rtt if possible
-			conn, err := quicTransport.DialEarly(self.ctx, udpAddr, tlsConfig, quicConfig)
+			conn, err := quicTransport.Dial(self.ctx, udpAddr, tlsConfig, quicConfig)
 
 			// conn, err := quic.Dial(self.ctx, packetConn, packetConn.ConnectedAddr(), self.settings.QuicTlsConfig, quicConfig)
 			if err != nil {
+				glog.Infof("[c]h3 connect err = %s\n", err)
 				return nil, err
 			}
-
-			stream, err := conn.OpenStream()
-			if err != nil {
-				return nil, err
-			}
-
-			success := false
 			defer func() {
 				if !success {
 					conn.CloseWithError(0, "")
 				}
 			}()
+
+			stream, err := conn.OpenStream()
+			if err != nil {
+				glog.Infof("[c]h3 open stream err = %s\n", err)
+				return nil, err
+			}
 
 			framer := NewFramer(self.settings.FramerSettings)
 
@@ -777,15 +795,18 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			}
 
 			success = true
-			return stream, nil
+			return &ConnStream{
+				conn:   conn,
+				stream: stream,
+			}, nil
 		}
 
-		var stream *quic.Stream
+		var connStream *ConnStream
 		var err error
 		if glog.V(2) {
-			stream, err = TraceWithReturnError(fmt.Sprintf("[t]connect %s", clientId), connect)
+			connStream, err = TraceWithReturnError(fmt.Sprintf("[t]connect %s", clientId), connect)
 		} else {
-			stream, err = connect()
+			connStream, err = connect()
 		}
 		if err != nil {
 			glog.Infof("[t]auth error %s = %s\n", clientId, err)
@@ -796,9 +817,11 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				continue
 			}
 		}
+		conn := connStream.conn
+		stream := connStream.stream
 
 		c := func() {
-			defer stream.Close()
+			defer conn.CloseWithError(0, "")
 
 			self.setModeAvailable(ptMode, true)
 			defer self.setModeAvailable(ptMode, false)
