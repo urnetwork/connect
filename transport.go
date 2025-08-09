@@ -192,7 +192,7 @@ func NewPlatformTransport(
 		routeManager,
 		platformUrl,
 		auth,
-		TransportModeH3,
+		TransportModeH1,
 		settings,
 	)
 }
