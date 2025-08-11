@@ -208,11 +208,16 @@ func NewPlatformTransportWithTargetMode(
 ) *PlatformTransport {
 	cancelCtx, cancel := context.WithCancel(ctx)
 	transport := &PlatformTransport{
-		ctx: cancelCtx,
-		cancel: func() {
-			// debug.PrintStack()
-			cancel()
-		},
+		ctx:    cancelCtx,
+		cancel: cancel,
+		// cancel: func() {
+		// 	select {
+		// 	case <- ctx.Done():
+		// 	default:
+		// 		debug.PrintStack()
+		// 		cancel()
+		// 	}
+		// },
 		clientStrategy: clientStrategy,
 		routeManager:   routeManager,
 		platformUrl:    platformUrl,
@@ -221,7 +226,7 @@ func NewPlatformTransportWithTargetMode(
 		modeMonitor:    NewMonitor(),
 		availableModes: map[TransportMode]bool{},
 		targetMode:     targetMode,
-		mode:           targetMode,
+		mode:           TransportModeAuto,
 	}
 	go transport.run()
 	return transport
@@ -262,13 +267,22 @@ func (self *PlatformTransport) activeMode() (TransportMode, chan struct{}) {
 	return self.mode, self.modeMonitor.NotifyChannel()
 }
 
+var transportModePreferences = map[TransportMode]int{
+	TransportModeAuto:      0,
+	TransportModeH3DnsPump: 1,
+	TransportModeH3Dns:     2,
+	// TODO currently we rank H3 below H1 in performance
+	TransportModeH3: 3,
+	TransportModeH1: 4,
+}
+
 func (self *PlatformTransport) run() {
 	defer self.cancel()
 
 	switch self.targetMode {
 	case TransportModeAuto:
-		go self.runH3(TransportModeH3, 0, 1)
-		go self.runH1(self.settings.ModeInitialDelay)
+		go self.runH1(0)
+		go self.runH3(TransportModeH3, self.settings.ModeInitialDelay, 1)
 		go self.runH3(TransportModeH3Dns, self.settings.ModeInitialDelay*2, self.settings.PtDnsSlowMultiple)
 		go self.runH3(TransportModeH3DnsPump, self.settings.ModeInitialDelay*3, self.settings.PtDnsSlowMultiple)
 	case TransportModeH3:
@@ -284,15 +298,8 @@ func (self *PlatformTransport) run() {
 	for {
 		available, notify := self.modesAvailable()
 
-		preferences := map[TransportMode]int{
-			TransportModeAuto:      0,
-			TransportModeH3DnsPump: 1,
-			TransportModeH3Dns:     2,
-			TransportModeH1:        3,
-			TransportModeH3:        4,
-		}
 		// descending preference
-		orderedModes := maps.Keys(preferences)
+		orderedModes := maps.Keys(transportModePreferences)
 		slices.SortFunc(orderedModes, func(a TransportMode, b TransportMode) int {
 			if a == b {
 				return 0
@@ -323,15 +330,7 @@ func (self *PlatformTransport) run() {
 
 // returns true is other is better than current
 func isBetterMode(current TransportMode, other TransportMode) bool {
-	preferences := map[TransportMode]int{
-		TransportModeAuto:      0,
-		TransportModeH3DnsPump: 1,
-		TransportModeH3Dns:     2,
-		TransportModeH1:        3,
-		TransportModeH3:        4,
-	}
-
-	return preferences[current] < preferences[other]
+	return transportModePreferences[current] < transportModePreferences[other]
 }
 
 func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
@@ -624,6 +623,10 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 	// connect and update route manager for this transport
 	defer self.cancel()
 
+	if slowMultiple < 1 {
+		panic(fmt.Errorf("Bad slow multiple: %d", slowMultiple))
+	}
+
 	clientId, _ := self.auth.ClientId()
 
 	authBytes, err := EncodeFrame(&protocol.Auth{
@@ -678,8 +681,9 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				HandshakeIdleTimeout:    time.Duration(slowMultiple) * (self.settings.QuicConnectTimeout + self.settings.QuicHandshakeTimeout),
 				MaxIdleTimeout:          self.settings.PingTimeout * 4,
 				KeepAlivePeriod:         self.settings.PingTimeout * 2,
-				Allow0RTT:               false,
+				Allow0RTT:               true,
 				DisablePathMTUDiscovery: true,
+				InitialPacketSize:       1440,
 			}
 			var tlsConfig *tls.Config
 			if self.settings.QuicTlsConfig != nil {
@@ -714,7 +718,6 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			var udpAddr *net.UDPAddr
 			switch ptMode {
 			case TransportModeH3Dns:
-				quicConfig.DisablePathMTUDiscovery = true
 				tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
 				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", serverName, self.settings.DnsPort))
 				ptSettings := DefaultPacketTranslationSettings()
@@ -724,7 +727,6 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 					return nil, err
 				}
 			case TransportModeH3DnsPump:
-				quicConfig.DisablePathMTUDiscovery = true
 				tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
 				pumpServerName, err := pumpHost(self.platformUrl, tld)
 				if err != nil {
@@ -759,7 +761,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				// createdConn: true,
 				// isSingleUse: true,
 			}
-			conn, err := quicTransport.Dial(self.ctx, udpAddr, tlsConfig, quicConfig)
+			conn, err := quicTransport.DialEarly(self.ctx, udpAddr, tlsConfig, quicConfig)
 
 			// conn, err := quic.Dial(self.ctx, packetConn, packetConn.ConnectedAddr(), self.settings.QuicTlsConfig, quicConfig)
 			if err != nil {
@@ -772,7 +774,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				}
 			}()
 
-			stream, err := conn.OpenStream()
+			stream, err := conn.OpenStreamSync(self.ctx)
 			if err != nil {
 				glog.Infof("[c]h3 open stream err = %s\n", err)
 				return nil, err
