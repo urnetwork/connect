@@ -1,17 +1,16 @@
-FROM ubuntu:22.04
+FROM alpine:3.18
 # https://www.docker.com/blog/faster-multi-platform-builds-dockerfile-cross-compilation-guide/
-
 ARG TARGETPLATFORM
 ARG warp_env
-ENV WARP_ENV=$warp_env
+ENV WARP_ENV=${warp_env}
 
-# see https://docs.docker.com/develop/develop-images/dockerfile_best-practices/
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
- && rm -rf /var/lib/apt/lists/*
-RUN update-ca-certificates
+RUN apk add --no-cache \
+      ca-certificates \
+ && update-ca-certificates
 
-COPY build/$TARGETPLATFORM/provider /usr/local/sbin/bringyour-provider
+# Copy your cross-compiled provider binary, ensure it's executable
+COPY build/${TARGETPLATFORM}/provider /usr/local/sbin/bringyour-provider
+RUN chmod +x /usr/local/sbin/bringyour-provider
 
 EXPOSE 80
 STOPSIGNAL SIGTERM
