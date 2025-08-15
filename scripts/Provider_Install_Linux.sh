@@ -72,7 +72,7 @@ get_arch ()
     if command -v arch > /dev/null; then
         arch="$(arch)"
     else
-        arch="$(uanme -m)"
+        arch="$(uname -m)"
     fi
 
     case "$arch" in
