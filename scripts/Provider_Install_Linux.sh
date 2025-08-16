@@ -72,7 +72,7 @@ get_arch ()
     if command -v arch > /dev/null; then
         arch="$(arch)"
     else
-        arch="$(uanme -m)"
+        arch="$(uname -m)"
     fi
 
     case "$arch" in
@@ -159,7 +159,7 @@ get_version_from_api_response ()
     if command -v python3 > /dev/null; then
         latest_version="$(echo "$1" | tr -d '\000-\037' | python3 -c 'import sys, json; data = json.load(sys.stdin); print(data["tag_name"])')"
     elif command -v jq > /dev/null; then
-        latest_version="$(echo "$1" | tr -d '\000-\037' | jq -r '.version')"
+        latest_version="$(echo "$1" | tr -d '\000-\037' | jq -r '.tag_name')"
     else
         pr_err "Neither python3 nor jq is available"
         exit 1
@@ -440,9 +440,7 @@ do_install ()
                 exit 1
             fi
 
-            if [ -z "$tag" ]; then
-                tag="$(cat "$version_file")"
-            fi
+	    tag="$(cat "$version_file")"
 
             while [ $# -gt 0 ]; do
                 case "$1" in
@@ -641,14 +639,18 @@ do_install ()
     fi
 
     if [ "$no_modify_bashrc" -eq 0 ]; then
-        pr_info "Adding '%s' to ~/.bashrc" "$install_path/bin"
-        cat >> "$HOME/.bashrc" <<EOF
+	if awk '/^[[:space:]]*# == urnetwork-provider start[[:space:]]*$/ { code=1; } END { exit code; }' "$HOME/.bashrc"; then
+	    pr_info "Adding '%s' to ~/.bashrc" "$install_path/bin"
+            cat >> "$HOME/.bashrc" <<EOF
 
 # == urnetwork-provider start
 export URNETWORK_PROVIDER_INSTALL="$install_path"
 export PATH="\$PATH:\$URNETWORK_PROVIDER_INSTALL/bin"
 # == urnetwork-provider end
 EOF
+	else
+	    pr_info "~/.bashrc is up-to-date"
+	fi
     fi
 
     case "$operation" in
