@@ -2,134 +2,111 @@
 
 param(
     [String]$Version = "latest",
-    [Switch]$ForAllUsers = $false
+    [String]$Destination = "",
+    [String]$ToolsScriptPath = "",
+    [String]$UpdaterScriptPath = "",
+    [Switch]$NoRestartDownload = $false,
+    [Switch]$NoCleanup = $false,
+    [Switch]$NonInteractive = $false,
+    [Switch]$AddToStartup = $false
 );
 
-if ($Version -contains "/") {
-    Write-Error "Version should not contain a slash. Use the tag name instead."
+$Bold = ""
+$Reset = ""
+
+if ($PSStyle) {
+    $Bold = $PSStyle.Bold
+    $Reset = $PSStyle.Reset
+}
+
+if ($Version -contains "/" -or $Version -contains "\") {
+    Write-Error "Version must not contain a forward-slash or backslash"
     exit 1
 }
 
-$CurrentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+$OS = ""
 
-if ($ForAllUsers) {
-    if (-not $CurrentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Write-Host "Not running as admin. Please run with elevated admin permissions."
-        exit 1
-    }
-    else {
-        Write-Host "Running as admin"
-    }
-}
-
-$Arch = (Get-CimInstance Win32_Processor).Architecture
-$Arch = switch ($Arch) {
-    9 { "amd64" }
-    12 { "arm64" }
-    default { "unsupported" }
-}
-
-Write-Debug "Detected architecture: $Arch"
-
-if ($Arch -eq "unsupported") {
-    Write-Error "Unsupported architecture. Urnetwork only supports Windows on x64 and ARM64."
-    exit 1
-}
-
-$ApiUrl = "https://api.github.com/repos/urnetwork/build/releases/"
-
-if ($Version -eq "latest") {
-    $ApiUrl += "latest"
+if ($IsLinux) {
+    $OS = "linux"
 }
 else {
-    $ApiUrl += "tags/$Version"
+    $OS = "windows"
 }
 
-$ReleaseInfo = Invoke-RestMethod -Uri "$ApiUrl"
-
-if (!$ReleaseInfo) {
-  Write-Error "Failed to fetch release information from GitHub API. Are you sure the version exists and your internet connection is working?"
-  exit 1
+if ($OS -ne "windows") {
+    Write-Host "Note: This script is supposed to be used on Windows systems, support for other platforms only exist for the ease of development of the script itself."
 }
 
-$ReleaseAsset = $ReleaseInfo.assets | Where-Object { $_.name -cmatch "^urnetwork-provider-" }
-
-if (!$ReleaseAsset) {
-  Write-Error "Failed to find the release asset. Are you sure the version exists?"
-  exit 1
+if (-not $Destination) {
+    if ($OS -eq "linux") {
+	$Destination = Join-Path -Path $env:HOME -ChildPath ".local/share/urnetwork"
+    }
+    else {
+	$Destination = Join-Path -Path $env:LOCALAPPDATA -ChildPath "urnetwork\provider"
+    }
 }
 
-$DownloadUrl = $ReleaseAsset.browser_download_url
-$FileName = $ReleaseAsset.name
-$FilePath = Join-Path -Path $env:TEMP -ChildPath $FileName
-
-Write-Host "Downloading $FileName from $DownloadUrl"
-Start-BitsTransfer -Source $DownloadUrl -Destination $FilePath
-
-if (!$?) {
-  Write-Error "Failed to download the release asset. Are you sure the version exists and your internet connection is working?"
-  exit 1
+if ($OS -eq "linux") {
+    $env:TEMP = "/tmp"
 }
 
-$InstallDir = Join-Path -Path $env:LOCALAPPDATA -ChildPath "urnetwork\provider"
-
-if ($ForAllUsers) {
-    $InstallDir = "C:\Program Files\urnetwork\provider"
+$Arch = switch ($OS) {
+    "windows" {
+	switch ((Get-CimInstance Win32_Processor).Architecture) {
+	    9 { "amd64" }
+	    12 { "arm64" }
+	    default { "unsupported" }
+	}
+    }
+    default {
+	switch ((uname -m)) {
+	    "x86_64" { "amd64" }
+	    "aarch64" { "arm64" }
+	    default { "unsupported" }
+	}
+    }
 }
 
-Write-Host "Installation directory: $InstallDir"
-
-$ProviderExe = "$InstallDir\windows\$Arch\urnetwork.exe"
-
-if (Test-Path $InstallDir) {
-    Write-Host "Removing old version from $InstallDir"
-    Get-WmiObject Win32_Process | Where-Object { $_.ExecutablePath -eq $ProviderExe } | ForEach-Object { $_.Terminate() }
-    Remove-Item -Path $InstallDir -Recurse -Force
-}
-
-Write-Host "Creating directory $InstallDir"
-New-Item -Path $InstallDir -ItemType Directory
-
-if (!$?) {
-    Write-Error "Failed to create directory $InstallDir. Please check your permissions."
+if ($Arch -eq "unsupported") {
+    Write-Error "Unsupported architecture: $Arch"
     exit 1
 }
 
-Write-Host "Extracting $FileName to $InstallDir"
-tar -xzf "$FilePath" -C "$InstallDir"
-
-if (!$?) {
-    Write-Error "Failed to extract the release asset. Are you sure the version exists?"
-    exit 1
+function Print-Settings {
+    Write-Host "Installation options:"
+    Write-Host ""
+    Write-Host "Version:      $Version"
+    Write-Host "Destination:  $Destination"
+    Write-Host "OS:           $OS"
+    Write-Host "Architecture: $Arch"
+    Write-Host ""
 }
 
-Remove-Item -Path "$InstallDir\darwin" -Recurse -Force
-Remove-Item -Path "$InstallDir\linux" -Recurse -Force
+function Download-File {
+    param(
+	[String]$URL,
+	[String]$Destination
+    );
 
-if ($Arch -eq "amd64") {
-    Remove-Item -Path "$InstallDir\windows\arm64" -Recurse -Force
-}
+    Write-Host "Downloading $URL => $Destination"
 
-if ($Arch -eq "arm64") {
-    Remove-Item -Path "$InstallDir\windows\amd64" -Recurse -Force
-}
+    if ($OS -ne "linux") {
+	try {
+	    Start-BitsTransfer -Source $URL -Destination $Destination
 
-Remove-Item -Path "$InstallDir\windows\$Arch\._provider.exe" -Force
-Rename-Item -Path "$InstallDir\windows\$Arch\provider.exe" "urnetwork.exe"
+	    if ($?) {
+		return
+	    }
+	}
+	catch {}
 
-Write-Host "Cleaning up temporary files"
-Remove-Item -Path $FilePath -Force
-
-if (!$?) {
-    Write-Error "Failed to remove temporary files. Please check your permissions."
-    exit 1
+	Write-Host "Download via BITS failed. Falling back to using a normal web request"
+    }
+    
+    Invoke-WebRequest -Uri $URL -OutFile $Destination
 }
 
 function Get-Path {
-    if ($ForAllUsers) {
-        return [System.Environment]::GetEnvironmentVariable("PATH", [System.EnvironmentVariableTarget]::Machine)
-    }
-
     return [Environment]::GetEnvironmentVariable("PATH", [System.EnvironmentVariableTarget]::User)
 }
 
@@ -139,91 +116,227 @@ function Set-Path {
         [String]$Value
     )
 
-    if ($ForAllUsers) {
-        [System.Environment]::SetEnvironmentVariable("PATH", $Value, [System.EnvironmentVariableTarget]::Machine)
-    }
-    else {
-        [Environment]::SetEnvironmentVariable("PATH", $Value, [System.EnvironmentVariableTarget]::User)
-    }
+    [Environment]::SetEnvironmentVariable("PATH", $Value, [System.EnvironmentVariableTarget]::User)
 }
 
-$EnvPath = Get-Path
-$EnvPathSplitted = $EnvPath.Split(";")
+Print-Settings
 
-if (-not ($EnvPathSplitted -contains "$InstallDir\windows\$Arch")) {
-    Write-Host "Updating PATH variable"
+$GithubURLBase = "https://api.github.com/repos/urnetwork/connect"
 
-    $Colon = ";";
-
-    if ($EnvPath -match ";$") {
-        $Colon = "";
-    }
-
-    $NewPath = "$EnvPath$Colon$InstallDir\windows\$Arch;"
-    Set-Path -Value $NewPath
-
-    if (!$?) {
-        Write-Error "Failed to update PATH variable. Please check your permissions."
-        exit 1
-    }
-}
-
-Write-Host "Installation complete."
-
-$DataDir = "$env:HOMEDRIVE$env:HOMEPATH\.urnetwork"
-
-if (Test-Path $DataDir) {
-    Write-Host "Found data directory at $DataDir"
-    Write-Host "Skipping authentication"
+if ($Version -eq "latest") {
+    $GithubURL = "$GithubURLBase/releases/latest"
 }
 else {
-    $AuthNow = Read-Host "Do you want to authenticate now? (Y/n)"
+    $GithubURL = "$GithubURLBase/releases/tags/$Version"
+}
 
-    if ($AuthNow.ToLower() -ne "n") {
-        while ($true) {
-            & $ProviderExe auth
+$ReleaseInfo = Invoke-RestMethod -Uri "$GithubURL"
 
-            if ($?) {
-                break
-            }
-        }
+if (-not $ReleaseInfo) {
+    Write-Error "Failed to fetch release information from GitHub API. Are you sure the version exists and your internet connection is working?"
+    exit 1
+}
+
+$ReleaseVersion = $ReleaseInfo.tag_name
+$ReleaseDate = $ReleaseInfo.published_at
+$ReleaseAsset = $ReleaseInfo.assets | Where-Object { $_.name -cmatch "^urnetwork-provider-" }
+
+if (-not $ReleaseAsset) {
+    Write-Error "Failed to find the release asset. Are you sure the version exists?"
+    exit 1
+}
+
+$DownloadURL = $ReleaseAsset.browser_download_url
+$FileName = $ReleaseAsset.name
+$FilePath = Join-Path -Path $env:TEMP -ChildPath $FileName
+
+if (-not $NoRestartDownload -or -not (Test-Path $FilePath)) {
+    Download-File -URL $DownloadURL -Destination $FilePath
+}
+
+$ExtractPath = Join-Path $env:TEMP -ChildPath "urnetwork-extracted"
+
+if (Test-Path $ExtractPath) {
+    Remove-Item -Path $ExtractPath -Recurse -Force
+}
+
+$null = New-Item -Path $ExtractPath -ItemType Directory
+
+Write-Host "Extracting $FilePath => $ExtractPath"
+tar -xzf $FilePath -C $ExtractPath
+
+$BinarySuffix = switch ($OS) {
+    "linux" { "" }
+    "windows" { ".exe" }
+}
+
+$BinaryPath = Join-Path $ExtractPath -ChildPath "$OS/$Arch/provider$BinarySuffix"
+
+if (-not (Test-Path $BinaryPath)) {
+    Write-Error "File $BinaryPath not found: The downloaded archive file is most likely corrupt"
+    exit 1
+}
+
+$InstalledBinaryPath = Join-Path $Destination -ChildPath "urnetwork$BinarySuffix"
+$VersionFile = Join-Path $Destination -ChildPath "version"
+$InstallDateFile = Join-Path $Destination -ChildPath "date"
+
+if (-not (Test-Path $Destination)) {
+    New-Item -Path $Destination -ItemType Directory
+}
+
+if (Test-Path $InstalledBinaryPath) {
+    Remove-Item -Path $InstalledBinaryPath -Force
+}
+
+Write-Host "Installing $BinaryPath => $InstalledBinaryPath"
+Move-Item -Path $BinaryPath $InstalledBinaryPath
+
+$InstalledToolsPath = Join-Path $Destination -ChildPath "urnet-tools.ps1"
+
+if (Test-Path $InstalledToolsPath) {
+    Remove-Item -Path $InstalledToolsPath -Force
+}
+
+Write-Host "Installing urnet-tools => $InstalledToolsPath"
+
+if ($ToolsScriptPath) {
+    Copy-Item $ToolsScriptPath $InstalledToolsPath
+}
+else {
+    Invoke-RestMethod "https://raw.githubusercontent.com/urnetwork/connect/refs/heads/main/scripts/urnetwork-tools.ps1" -OutFile $InstalledToolsPath
+}
+
+$InstalledUpdaterPath = Join-Path $Destination -ChildPath "urnetwork-updater.ps1"
+
+if (Test-Path $InstalledUpdaterPath) {
+    Remove-Item -Path $InstalledUpdaterPath -Force
+}
+
+Write-Host "Installing urnetwork-updater => $InstalledUpdaterPath"
+
+if ($UpdaterScriptPath) {
+    Copy-Item $UpdaterScriptPath $InstalledUpdaterPath
+}
+else {
+    Invoke-RestMethod "https://raw.githubusercontent.com/urnetwork/connect/refs/heads/main/scripts/urnetwork-updater.ps1" -OutFile $InstalledUpdaterPath
+}
+
+Set-Content $VersionFile $ReleaseVersion
+Set-Content $InstallDateFile $ReleaseDate
+
+if ($Version -eq "latest") {
+    Write-Host "Running: urnet-tools auto-update-enable"
+    & $InstalledToolsPath auto-update-enable
+}
+else {
+    Write-Host "Not enabling auto update since a version other than 'latest' was installed."
+}
+
+if ($OS -eq "windows") {
+    $CurrentPath = Get-Path
+    $CurrentPathSplitted = $CurrentPath.Split(";")
+
+    if (-not ($CurrentPathSplitted -contains $Destination)) {
+	Write-Host "Adding $Destination to %PATH%"
+    
+	$Colon = ";";
+
+	if ($EnvPath -match ";$") {
+            $Colon = "";
+	}
+
+	$NewPath = "$CurrentPath$Colon$Destination;"
+	Set-Path -Value $NewPath
+
+	if (-not $?) {
+            Write-Error "Failed to update %PATH%"
+            exit 1
+	}
+    }
+}
+else {
+    Write-Host "Not updating `$PATH variable automatically -- leaving that on you"
+    Write-Host "Add the following path to your `$PATH: $Destination"
+}
+
+if (-not $NoCleanup) {
+    Write-Host "Cleaning up temporary files"
+    Remove-Item -Path $FilePath
+    Remove-Item -Path $ExtractPath -Recurse -Force
+}
+
+Write-Host "Installation complete! Restart your terminal or command-line for the changes to take effect."
+
+Write-Host "$($Bold)Start in foreground:$($Reset) urnetwork provide"
+Write-Host "$($Bold)Start in background:$($Reset) urnet-tools start-bg"
+Write-Host "$($Bold)Authenticate:$($Reset)        urnetwork auth"
+Write-Host "$($Bold)More help:$($Reset)           urnetwork --help"
+
+if (-not $NonInteractive) {
+    $DataDir = ""
+
+    if ($OS -eq "windows") {
+	$DataDir = "$env:HOMEDRIVE$env:HOMEPATH\.urnetwork"
     }
     else {
-        Write-Host "Skipping authentication. Please run 'urnetwork auth' to authenticate later using an auth code."
+	$DataDir = "$env:HOME/.urnetwork"
     }
-}
-
-$AddToStartup = Read-Host "Do you want to add this service to startup? (Y/n)"
-
-if ($AddToStartup.ToLower() -ne "n") {
-    $StartupPath = Join-Path -Path $env:APPDATA -ChildPath "Microsoft\Windows\Start Menu\Programs\Startup"
-
-    if ($ForAllUsers) {
-        $StartupPath = Join-Path -Path "C:\ProgramData" -ChildPath "Microsoft\Windows\Start Menu\Programs\Startup"
-    }
-
-    $ShortcutPath = Join-Path -Path $StartupPath -ChildPath "urnetwork.lnk"
-
-    if (Test-Path $ShortcutPath) {
-        Remove-Item -Path $ShortcutPath -Force
-    }
-
-    $StartCommand = "Start-Process -FilePath '$ProviderExe' -ArgumentList 'provide' -WindowStyle Hidden"
-    $Arguments = '-NoProfile -WindowStyle Hidden -Command "' + $StartCommand + '"'
-
-    Write-Host "Startup command: powershell.exe $Arguments"
-
-    $WshShell = New-Object -ComObject WScript.Shell
-    $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
-    $Shortcut.TargetPath = "powershell.exe"
-    $Shortcut.Arguments = $Arguments
-    $Shortcut.WorkingDirectory = "$InstallDir\windows\$Arch"
-    $Shortcut.WindowStyle = 7
-    $Shortcut.IconLocation = $ProviderExe
-    $Shortcut.Save()
     
-    Write-Host "Added urnetwork provider to startup."
+    if (Test-Path $DataDir) {
+	Write-Host "Found data directory at $DataDir"
+	Write-Host "Skipping authentication"
+    }
+    else {
+	$Answer = Read-Host "Would you like to authenticate to URnetwork now? [Y/n]"
+
+	if ($Answer.ToLower() -eq "y") {
+	    Write-Host "Authenticating now"
+
+	    while ($true) {
+		& $InstalledBinaryPath auth
+
+		if ($?) {
+		    break
+		}
+
+		Write-Host "Trying again"
+	    }
+	}
+    }
 }
 
-Write-Host "Please restart your command line for the changes to take effect."
-Write-Host "You can now use the urnetwork provider by running 'urnetwork' in your command line."
+if ($OS -eq "windows") {
+    $Answer = "n"
+    
+    if ($AddToStartup) {
+	$Answer = "y"
+    }
+    elseif (-not $NonInteractive) {
+	$Answer = Read-Host "Do you want to add this service to startup? [Y/n]"
+    }
+    
+    if ($Answer.ToLower() -eq "y") {
+	$StartupPath = Join-Path -Path $env:APPDATA -ChildPath "Microsoft\Windows\Start Menu\Programs\Startup"
+	$ShortcutPath = Join-Path -Path $StartupPath -ChildPath "urnetwork.lnk"
+
+	if (Test-Path $ShortcutPath) {
+	    Remove-Item -Path $ShortcutPath -Force
+	}
+
+	$StartCommand = "Start-Process -FilePath '$InstalledBinaryPath' -ArgumentList 'provide' -WindowStyle Hidden"
+	$Arguments = '-NoProfile -WindowStyle Hidden -Command "' + $StartCommand + '"'
+
+	Write-Host "Startup command: powershell.exe $Arguments"
+
+	$WshShell = New-Object -ComObject WScript.Shell
+	$Shortcut = $WshShell.CreateShortcut($ShortcutPath)
+	$Shortcut.TargetPath = "powershell.exe"
+	$Shortcut.Arguments = $Arguments
+	$Shortcut.WorkingDirectory = $Destination
+	$Shortcut.WindowStyle = 7
+	$Shortcut.Save()
+	
+	Write-Host "Added URnetwork provider to startup"
+    }
+}
