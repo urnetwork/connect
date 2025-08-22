@@ -13,7 +13,6 @@ RUN update-ca-certificates
 
 COPY build/$TARGETPLATFORM/provider /usr/local/sbin/bringyour-provider
 
-EXPOSE 80
 STOPSIGNAL SIGTERM
 # additional arguments can be appended to the end
-ENTRYPOINT ["/usr/local/sbin/bringyour-provider", "auth-provide"]
+ENTRYPOINT ["/usr/local/sbin/bringyour-provider"]
