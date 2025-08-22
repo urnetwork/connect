@@ -149,10 +149,21 @@ func NewExtenderDialTlsContext(
 		switch extenderConfig.Profile.ConnectMode {
 		case ExtenderConnectModeTcpTls:
 			netDialer := &net.Dialer{
-				Timeout: connectSettings.ConnectTimeout,
+				Timeout:  connectSettings.ConnectTimeout,
+				Resolver: connectSettings.Resolver,
 			}
 
-			conn, err := netDialer.Dial("tcp", authority)
+			var dialContext DialContextFunction
+			if connectSettings.ProxySettings != nil {
+				dialContext = connectSettings.ProxySettings.NewDialContext(
+					ctx,
+					netDialer,
+				)
+			} else {
+				dialContext = netDialer.DialContext
+			}
+
+			conn, err := dialContext(ctx, "tcp", authority)
 			if err != nil {
 				return nil, err
 			}

@@ -63,12 +63,24 @@ func DohQuery(ctx context.Context, ipVersion int, recordType string, settings *D
 	}
 
 	netDialer := &net.Dialer{
-		Timeout: settings.ConnectTimeout,
+		Timeout:  settings.ConnectTimeout,
+		Resolver: settings.Resolver,
 	}
+
+	var dialContext DialContextFunction
+	if settings.ProxySettings != nil {
+		dialContext = settings.ProxySettings.NewDialContext(
+			ctx,
+			netDialer,
+		)
+	} else {
+		dialContext = netDialer.DialContext
+	}
+
 	httpClient := &http.Client{
 		Timeout: settings.RequestTimeout,
 		Transport: &http.Transport{
-			DialContext:         netDialer.DialContext,
+			DialContext:         dialContext,
 			TLSHandshakeTimeout: settings.TlsTimeout,
 			TLSClientConfig:     settings.TlsConfig,
 		},
