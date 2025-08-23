@@ -7,14 +7,17 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	// "net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"syscall"
 
+	"golang.org/x/net/proxy"
 	"golang.org/x/term"
 
 	"github.com/docopt/docopt-go"
@@ -72,21 +75,29 @@ Usage:
         [--connect_url=<connect_url>]
         [--max-memory=<mem>]
         [-v...]
+    provider proxy auth add [<key>] <proxy_user> <proxy_password> [-f]
+    provider proxy auth remove [<key>]
+    provider proxy add <key_address>... [-f]
+    provider proxy remove <key_address>...
     
 Options:
     -h --help                        Show this help and exit.
     --version                        Show version.
     -v...                            Enable verbose mode. -v implies verbose level 1,
-    				     -vv implies level 2... etc.
+    				                 -vv implies level 2... etc.
     -f                               Force overwrite the JWT token store file, if exists. By default,
-    				     if the JWT token store file already exists, it will not be overwritten.
+    				                 if the JWT token store file already exists, it will not be overwritten.
     --api_url=<api_url>              Specify a custom API URL to use.
     --connect_url=<connect_url>      Specify a custom connect URL to use.
-    --user_auth=<user_auth>	     Login with a username.
+    --user_auth=<user_auth>	         Login with a username.
     --password=<password>            Login with a password. If --user_auth is used, you will be prompted for your
-    				     password anyways, if you don't specify it using this option.
-    -p --port=<port>                 Status server port [default: no status server].
-    --max-memory=<mem>               Set the maximum amount of memory in bytes, or the suffixes b, kib, mib, gib may be used [This is a soft limit].`,
+    				                 password anyways, if you don't specify it using this option.
+    -p --port=<port>                 Status server port [default: 0].
+    --max-memory=<mem>               Set the maximum amount of memory in bytes, or the suffixes b, kib, mib, gib may be used [This is a soft limit].
+    <key>                            Authentication key
+    <proxy_user>                     The SOCKS5 user per RFC 1928/1929
+    <proxy_password>                 The SOCKS5 password per RFC 1928/1929
+    <key_address>                    SOCKS5 server as host:port or key@host:port`,
 		DefaultApiUrl,
 		DefaultConnectUrl,
 	)
@@ -97,11 +108,23 @@ Options:
 		panic(err)
 	}
 
-	if auth_, _ := opts.Bool("auth"); auth_ {
+	if proxy, _ := opts.Bool("proxy"); proxy {
+		if auth, _ := opts.Bool("auth"); auth {
+			if add, _ := opts.Bool("add"); add {
+				proxyAuthAdd(opts)
+			} else if remove, _ := opts.Bool("remove"); remove {
+				proxyAuthRemove(opts)
+			}
+		} else if add, _ := opts.Bool("add"); add {
+			proxyAdd(opts)
+		} else if remove, _ := opts.Bool("remove"); remove {
+			proxyRemove(opts)
+		}
+	} else if auth_, _ := opts.Bool("auth"); auth_ {
 		auth(opts)
 	} else if provide_, _ := opts.Bool("provide"); provide_ {
 		provide(opts)
-	} else if authProvide_, _ := opts.Bool("auth-provide"); authProvide_ {
+	} else if authProvide, _ := opts.Bool("auth-provide"); authProvide {
 		auth(opts)
 		provide(opts)
 	}
@@ -275,51 +298,81 @@ func provide(opts docopt.Opts) {
 		debug.SetMemoryLimit(maxMemory)
 	}
 
-	cancelCtx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	event := connect.NewEventWithContext(cancelCtx)
+	event := connect.NewEventWithContext(ctx)
 	event.SetOnSignals(syscall.SIGINT, syscall.SIGQUIT, syscall.SIGTERM)
 
-	ctx := event.Ctx()
+	provideWithProxy := func(proxySettings *connect.ProxySettings) {
+		proxyCtx, proxyCancel := context.WithCancel(event.Ctx())
+		defer proxyCancel()
 
-	clientStrategy := connect.NewClientStrategyWithDefaults(ctx)
+		clientStrategySettings := connect.DefaultClientStrategySettings()
+		clientStrategySettings.ProxySettings = proxySettings
+		clientStrategy := connect.NewClientStrategy(proxyCtx, clientStrategySettings)
 
-	byClientJwt, clientId, err := provideAuth(ctx, clientStrategy, apiUrl, opts)
-	if err != nil {
-		panic(err)
+		byClientJwt, clientId, err := provideAuth(proxyCtx, clientStrategy, apiUrl, opts)
+		if err != nil {
+			panic(err)
+		}
+
+		instanceId := connect.NewId()
+
+		clientOob := connect.NewApiOutOfBandControl(proxyCtx, clientStrategy, byClientJwt, apiUrl)
+		connectClient := connect.NewClientWithDefaults(proxyCtx, clientId, clientOob)
+		defer connectClient.Close()
+
+		// routeManager := connect.NewRouteManager(connectClient)
+		// contractManager := connect.NewContractManagerWithDefaults(connectClient)
+		// connectClient.Setup(routeManager, contractManager)
+		// go connectClient.Run()
+
+		fmt.Printf("client_id: %s\n", clientId)
+		fmt.Printf("instance_id: %s\n", instanceId)
+
+		auth := &connect.ClientAuth{
+			ByJwt: byClientJwt,
+			// ClientId: clientId,
+			InstanceId: instanceId,
+			AppVersion: RequireVersion(),
+		}
+		connect.NewPlatformTransportWithDefaults(proxyCtx, clientStrategy, connectClient.RouteManager(), connectUrl, auth)
+		// go platformTransport.Run(connectClient.RouteManager())
+
+		localUserNat := connect.NewLocalUserNatWithDefaults(proxyCtx, clientId.String())
+		defer localUserNat.Close()
+		remoteUserNatProvider := connect.NewRemoteUserNatProviderWithDefaults(connectClient, localUserNat)
+		defer remoteUserNatProvider.Close()
+
+		provideModes := map[protocol.ProvideMode]bool{
+			protocol.ProvideMode_Public:  true,
+			protocol.ProvideMode_Network: true,
+		}
+		connectClient.ContractManager().SetProvideModes(provideModes)
+
+		select {
+		case <-proxyCtx.Done():
+		}
 	}
 
-	instanceId := connect.NewId()
+	var wg sync.WaitGroup
 
-	clientOob := connect.NewApiOutOfBandControl(ctx, clientStrategy, byClientJwt, apiUrl)
-	connectClient := connect.NewClientWithDefaults(ctx, clientId, clientOob)
-
-	// routeManager := connect.NewRouteManager(connectClient)
-	// contractManager := connect.NewContractManagerWithDefaults(connectClient)
-	// connectClient.Setup(routeManager, contractManager)
-	// go connectClient.Run()
-
-	fmt.Printf("client_id: %s\n", clientId)
-	fmt.Printf("instance_id: %s\n", instanceId)
-
-	auth := &connect.ClientAuth{
-		ByJwt: byClientJwt,
-		// ClientId: clientId,
-		InstanceId: instanceId,
-		AppVersion: RequireVersion(),
+	if allProxySettings := readProxySettings(); 0 < len(allProxySettings) {
+		fmt.Printf("Using %d proxy servers:\n", len(allProxySettings))
+		for i, proxySettings := range allProxySettings {
+			fmt.Printf("  proxy[%d] %s\n", i, proxySettings.Address)
+		}
+		for _, proxySettings := range allProxySettings {
+			wg.Go(func() {
+				provideWithProxy(proxySettings)
+			})
+		}
+	} else {
+		wg.Go(func() {
+			provideWithProxy(nil)
+		})
 	}
-	connect.NewPlatformTransportWithDefaults(ctx, clientStrategy, connectClient.RouteManager(), connectUrl, auth)
-	// go platformTransport.Run(connectClient.RouteManager())
-
-	localUserNat := connect.NewLocalUserNatWithDefaults(ctx, clientId.String())
-	remoteUserNatProvider := connect.NewRemoteUserNatProviderWithDefaults(connectClient, localUserNat)
-
-	provideModes := map[protocol.ProvideMode]bool{
-		protocol.ProvideMode_Public:  true,
-		protocol.ProvideMode_Network: true,
-	}
-	connectClient.ContractManager().SetProvideModes(provideModes)
 
 	if 0 < port {
 		fmt.Printf(
@@ -346,13 +399,12 @@ func provide(opts docopt.Opts) {
 			RequireVersion(),
 		)
 	}
+
+	wg.Wait()
+
 	select {
 	case <-ctx.Done():
 	}
-
-	remoteUserNatProvider.Close()
-	localUserNat.Close()
-	connectClient.Cancel()
 
 	// exit
 	os.Exit(0)
@@ -477,4 +529,203 @@ func RequireVersion() string {
 		return version
 	}
 	return Version
+}
+
+func proxyAuthAdd(opts docopt.Opts) {
+	proxyConfig := readProxyConfig()
+
+	key, _ := opts.String("key")
+	user, _ := opts.String("proxy_user")
+	password, _ := opts.String("proxy_password")
+
+	if proxyConfig.Auths == nil {
+		proxyConfig.Auths = map[string]*ProxyAuth{}
+	}
+
+	if _, ok := proxyConfig.Auths[key]; ok {
+		if force, _ := opts.Bool("-f"); !force {
+			fmt.Printf("auth key \"%s\" exists. Overwrite? [yN]\n", key)
+
+			reader := bufio.NewReader(os.Stdin)
+			confirm, _ := reader.ReadString('\n')
+			if strings.ToLower(strings.TrimSpace(confirm)) != "y" {
+				return
+			}
+		}
+	}
+
+	proxyConfig.Auths[key] = &ProxyAuth{
+		User:     user,
+		Password: password,
+	}
+
+	writeProxyConfig(proxyConfig)
+}
+
+func proxyAuthRemove(opts docopt.Opts) {
+	proxyConfig := readProxyConfig()
+
+	key, _ := opts.String("key")
+
+	if proxyConfig.Auths == nil {
+		proxyConfig.Auths = map[string]*ProxyAuth{}
+	}
+
+	delete(proxyConfig.Auths, key)
+
+	writeProxyConfig(proxyConfig)
+}
+
+func proxyAdd(opts docopt.Opts) {
+	proxyConfig := readProxyConfig()
+
+	allKeyAddressAny, _ := opts["<key_address>"]
+	allKeyAddress := allKeyAddressAny.([]string)
+
+	if proxyConfig.Servers == nil {
+		proxyConfig.Servers = map[string]string{}
+	}
+
+	for _, keyAddress := range allKeyAddress {
+		var key string
+		var address string
+		i := strings.Index(keyAddress, "@")
+		if 0 <= i {
+			key = keyAddress[:i]
+			address = keyAddress[i+1:]
+		} else {
+			key = ""
+			address = keyAddress
+		}
+
+		if _, ok := proxyConfig.Servers[address]; ok {
+			if force, _ := opts.Bool("-f"); !force {
+				fmt.Printf("server \"%s\" exists. Overwrite? [yN]\n", address)
+
+				reader := bufio.NewReader(os.Stdin)
+				confirm, _ := reader.ReadString('\n')
+				if strings.ToLower(strings.TrimSpace(confirm)) != "y" {
+					return
+				}
+			}
+		}
+
+		proxyConfig.Servers[address] = key
+	}
+
+	writeProxyConfig(proxyConfig)
+}
+
+func proxyRemove(opts docopt.Opts) {
+	proxyConfig := readProxyConfig()
+
+	allKeyAddressAny, _ := opts["<key_address>"]
+	allKeyAddress := allKeyAddressAny.([]string)
+
+	if proxyConfig.Servers == nil {
+		proxyConfig.Servers = map[string]string{}
+	}
+
+	for _, keyAddress := range allKeyAddress {
+		var key string
+		var address string
+		i := strings.Index(keyAddress, "@")
+		if 0 <= i {
+			key = keyAddress[:i]
+			address = keyAddress[i+1:]
+		} else {
+			key = ""
+			address = keyAddress
+		}
+
+		if key == "" || proxyConfig.Servers[address] == key {
+			delete(proxyConfig.Servers, address)
+		}
+	}
+
+	writeProxyConfig(proxyConfig)
+}
+
+type ProxyConfig struct {
+	Auths map[string]*ProxyAuth `json:"auths"`
+	// TODO is there a use case for multiple keys to the same address?
+	// address -> key
+	Servers map[string]string `json:"servers"`
+}
+
+type ProxyAuth struct {
+	User     string `json:"user"`
+	Password string `json:"password"`
+}
+
+func readProxySettings() []*connect.ProxySettings {
+	proxyConfig := readProxyConfig()
+
+	if proxyConfig.Servers == nil {
+		return nil
+	}
+
+	var allProxySettings []*connect.ProxySettings
+	for address, key := range proxyConfig.Servers {
+		proxySettings := &connect.ProxySettings{
+			Network: "tcp",
+			Address: address,
+		}
+		if proxyConfig.Auths != nil {
+			proxyAuth, ok := proxyConfig.Auths[key]
+			if ok {
+				proxySettings.Auth = &proxy.Auth{
+					User:     proxyAuth.User,
+					Password: proxyAuth.Password,
+				}
+			}
+		}
+		allProxySettings = append(allProxySettings, proxySettings)
+	}
+
+	return allProxySettings
+}
+
+func readProxyConfig() *ProxyConfig {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		panic(err)
+	}
+	urNetworkDir := filepath.Join(home, ".urnetwork")
+	proxyPath := filepath.Join(urNetworkDir, "proxy")
+
+	if _, err := os.Stat(proxyPath); errors.Is(err, os.ErrNotExist) {
+		return &ProxyConfig{}
+	}
+
+	b, err := os.ReadFile(proxyPath)
+	if err != nil {
+		panic(err)
+	}
+
+	var proxyConfig ProxyConfig
+	err = json.Unmarshal(b, &proxyConfig)
+	if err != nil {
+		panic(err)
+	}
+	return &proxyConfig
+}
+
+func writeProxyConfig(proxyConfig *ProxyConfig) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		panic(err)
+	}
+	urNetworkDir := filepath.Join(home, ".urnetwork")
+	proxyPath := filepath.Join(urNetworkDir, "proxy")
+
+	b, err := json.Marshal(proxyConfig)
+	if err != nil {
+		panic(err)
+	}
+
+	err = os.WriteFile(proxyPath, b, 0700)
+	if err != nil {
+		panic(err)
+	}
 }
