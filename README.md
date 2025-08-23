@@ -24,7 +24,7 @@ Anywhere in the code that returns a `[]byte` will allocate it from the shared me
 
 ## Discord
 
-[https://bringyour.com/discord](https://discord.gg/urnetwork)
+[https://discord.gg/urnetwork](https://discord.gg/urnetwork)
 
 
 ## License
