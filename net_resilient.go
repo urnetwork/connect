@@ -43,9 +43,6 @@ import (
 
 // see https://upb-syssec.github.io/blog/2023/record-fragmentation/
 
-// (ctx, network, address)
-// type DialContextFunc func(ctx context.Context, network string, address string) (net.Conn, error)
-
 // set this as the `DialTLSContext` or equivalent
 // returns a tls connection
 func NewResilientDialTlsContext(
@@ -69,12 +66,9 @@ func NewResilientDialTlsContext(
 
 		// fmt.Printf("Extender client 1\n")
 
-		netDialer := &net.Dialer{
-			Timeout:         connectSettings.ConnectTimeout,
-			KeepAlive:       connectSettings.KeepAliveTimeout,
-			KeepAliveConfig: connectSettings.KeepAliveConfig,
-		}
-		conn, err := netDialer.Dial("tcp", address)
+		dialContext := connectSettings.NewDialContext(ctx)
+
+		conn, err := dialContext(ctx, "tcp", address)
 		if err != nil {
 			return nil, err
 		}

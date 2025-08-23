@@ -18,6 +18,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/net/proxy"
+
 	"golang.org/x/net/nettest"
 
 	"golang.org/x/exp/maps"
@@ -36,6 +38,7 @@ import (
 type HttpPostRawFunction func(ctx context.Context, requestUrl string, requestBodyBytes []byte, byJwt string) ([]byte, error)
 type HttpGetRawFunction func(ctx context.Context, requestUrl string, byJwt string) ([]byte, error)
 
+type DialContextFunction = func(ctx context.Context, network string, addr string) (net.Conn, error)
 type DialTlsContextFunction = func(ctx context.Context, network string, addr string) (net.Conn, error)
 
 func DefaultClientStrategySettings() *ClientStrategySettings {
@@ -96,6 +99,64 @@ type ConnectSettings struct {
 	KeepAliveConfig  net.KeepAliveConfig
 
 	TlsConfig *tls.Config
+
+	ProxySettings *ProxySettings
+	Resolver      *net.Resolver
+}
+
+func (self *ConnectSettings) NewDialContext(ctx context.Context) DialContextFunction {
+	netDialer := self.NetDialer()
+
+	var dialContext DialContextFunction
+	if self.ProxySettings != nil {
+		dialContext = self.ProxySettings.NewDialContext(
+			ctx,
+			netDialer,
+		)
+	} else {
+		dialContext = netDialer.DialContext
+	}
+	return dialContext
+}
+
+func (self *ConnectSettings) NetDialer() *net.Dialer {
+	return &net.Dialer{
+		Timeout:         self.ConnectTimeout,
+		KeepAlive:       self.KeepAliveTimeout,
+		KeepAliveConfig: self.KeepAliveConfig,
+		Resolver:        self.Resolver,
+	}
+}
+
+type ProxySettings struct {
+	Network string
+	Address string
+	Auth    *proxy.Auth
+}
+
+func (self *ProxySettings) NewDialContext(ctx context.Context, forward proxy.Dialer) DialContextFunction {
+	return func(ctx context.Context, network string, addr string) (net.Conn, error) {
+		proxyDialer, err := proxy.SOCKS5(
+			self.Network,
+			self.Address,
+			self.Auth,
+			forward,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		var conn net.Conn
+		if v, ok := proxyDialer.(proxy.ContextDialer); ok {
+			conn, err = v.DialContext(ctx, network, addr)
+		} else {
+			conn, err = proxyDialer.Dial(network, addr)
+		}
+		if err != nil {
+			return nil, err
+		}
+		return conn, nil
+	}
 }
 
 type ClientStrategySettings struct {
@@ -164,20 +225,72 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 	if settings.EnableNormal {
 		// TODO ECH support
 		if settings.ExposeServerHostNames && settings.ExposeServerIps {
-			tlsDialer := &tls.Dialer{
-				NetDialer: &net.Dialer{
-					Timeout:         settings.ConnectTimeout,
-					KeepAlive:       settings.KeepAliveTimeout,
-					KeepAliveConfig: settings.KeepAliveConfig,
-				},
-				Config: settings.TlsConfig,
+			netDialer := settings.NetDialer()
+
+			var tlsDialContext DialTlsContextFunction
+			if settings.ProxySettings != nil {
+				tlsDialContext = func(ctx context.Context, network string, addr string) (net.Conn, error) {
+					proxyDialContext := settings.ProxySettings.NewDialContext(
+						ctx,
+						netDialer,
+					)
+
+					// this rest of this function is adapted from `tls.dial` to use a proxy dialer
+
+					conn, err := proxyDialContext(ctx, network, addr)
+					if err != nil {
+						return nil, err
+					}
+
+					if netDialer.Timeout != 0 {
+						var cancel context.CancelFunc
+						ctx, cancel = context.WithTimeout(ctx, netDialer.Timeout)
+						defer cancel()
+					}
+
+					if !netDialer.Deadline.IsZero() {
+						var cancel context.CancelFunc
+						ctx, cancel = context.WithDeadline(ctx, netDialer.Deadline)
+						defer cancel()
+					}
+
+					colonPos := strings.LastIndex(addr, ":")
+					if colonPos == -1 {
+						colonPos = len(addr)
+					}
+					hostname := addr[:colonPos]
+
+					tlsConfig := settings.TlsConfig
+					if tlsConfig == nil {
+						// `tls.defaultConfig`
+						tlsConfig = &tls.Config{}
+					}
+					if tlsConfig.ServerName == "" {
+						c := tlsConfig.Clone()
+						c.ServerName = hostname
+						tlsConfig = c
+					}
+
+					tlsConn := tls.Client(conn, tlsConfig)
+					if err := tlsConn.HandshakeContext(ctx); err != nil {
+						conn.Close()
+						return nil, err
+					}
+					return tlsConn, nil
+				}
+			} else {
+				tlsDialer := &tls.Dialer{
+					NetDialer: netDialer,
+					Config:    settings.TlsConfig,
+				}
+				tlsDialContext = tlsDialer.DialContext
 			}
 
 			dialer := &clientDialer{
 				description:    "normal",
 				minimumWeight:  0.5,
 				priority:       25,
-				dialTlsContext: tlsDialer.DialContext,
+				dialTlsContext: tlsDialContext,
 				settings:       settings,
 			}
 			dialers[dialer] = true
