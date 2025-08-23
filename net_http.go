@@ -104,6 +104,30 @@ type ConnectSettings struct {
 	Resolver      *net.Resolver
 }
 
+func (self *ConnectSettings) NewDialContext(ctx context.Context) DialContextFunction {
+	netDialer := self.NetDialer()
+
+	var dialContext DialContextFunction
+	if self.ProxySettings != nil {
+		dialContext = self.ProxySettings.NewDialContext(
+			ctx,
+			netDialer,
+		)
+	} else {
+		dialContext = netDialer.DialContext
+	}
+	return dialContext
+}
+
+func (self *ConnectSettings) NetDialer() *net.Dialer {
+	return &net.Dialer{
+		Timeout:         self.ConnectTimeout,
+		KeepAlive:       self.KeepAliveTimeout,
+		KeepAliveConfig: self.KeepAliveConfig,
+		Resolver:        self.Resolver,
+	}
+}
+
 type ProxySettings struct {
 	Network string
 	Address string
@@ -201,12 +225,7 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 	if settings.EnableNormal {
 		// TODO ECH support
 		if settings.ExposeServerHostNames && settings.ExposeServerIps {
-			netDialer := &net.Dialer{
-				Timeout:         settings.ConnectTimeout,
-				KeepAlive:       settings.KeepAliveTimeout,
-				KeepAliveConfig: settings.KeepAliveConfig,
-				Resolver:        settings.Resolver,
-			}
+			netDialer := settings.NetDialer()
 
 			var tlsDialContext DialTlsContextFunction
 			if settings.ProxySettings != nil {

@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
+	// "net"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -62,20 +62,7 @@ func DohQuery(ctx context.Context, ipVersion int, recordType string, settings *D
 		return map[netip.Addr]bool{}
 	}
 
-	netDialer := &net.Dialer{
-		Timeout:  settings.ConnectTimeout,
-		Resolver: settings.Resolver,
-	}
-
-	var dialContext DialContextFunction
-	if settings.ProxySettings != nil {
-		dialContext = settings.ProxySettings.NewDialContext(
-			ctx,
-			netDialer,
-		)
-	} else {
-		dialContext = netDialer.DialContext
-	}
+	dialContext := settings.NewDialContext(ctx)
 
 	httpClient := &http.Client{
 		Timeout: settings.RequestTimeout,
