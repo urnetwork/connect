@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"runtime/debug"
 	"strings"
@@ -76,17 +77,17 @@ Usage:
         [--max-memory=<mem>]
         [-v...]
     provider proxy auth add [<key>] <proxy_user> <proxy_password> [-f]
-    provider proxy auth remove [<key>]
-    provider proxy add <key_address>... [-f]
-    provider proxy remove <key_address>...
+    provider proxy auth remove [<key>] [--all]
+    provider proxy add [<key_address>...] [--proxy_file=<proxy_file>] [-f]
+    provider proxy remove [<key_address>...] [--all]
     
 Options:
     -h --help                        Show this help and exit.
     --version                        Show version.
     -v...                            Enable verbose mode. -v implies verbose level 1,
     				                 -vv implies level 2... etc.
-    -f                               Force overwrite the JWT token store file, if exists. By default,
-    				                 if the JWT token store file already exists, it will not be overwritten.
+    -f                               Force overwrite the JWT token store file or proxy value, if exists.
+                                     By default, existing values will not be overwritten.
     --api_url=<api_url>              Specify a custom API URL to use.
     --connect_url=<connect_url>      Specify a custom connect URL to use.
     --user_auth=<user_auth>	         Login with a username.
@@ -95,9 +96,10 @@ Options:
     -p --port=<port>                 Status server port [default: 0].
     --max-memory=<mem>               Set the maximum amount of memory in bytes, or the suffixes b, kib, mib, gib may be used [This is a soft limit].
     <key>                            Authentication key
-    <proxy_user>                     The SOCKS5 user per RFC 1928/1929
-    <proxy_password>                 The SOCKS5 password per RFC 1928/1929
-    <key_address>                    SOCKS5 server as host:port or key@host:port`,
+    <proxy_user>                     SOCKS5 user
+    <proxy_password>                 SOCKS5 password
+    <key_address>                    SOCKS5 server as host:port, host:port:user:pass, host:port::, or key@host:port
+    --proxy_file=<proxy_file>        A path to a file where each line contains on entry as host:port, host:port:user:pass, host:port::, or key@host:port`,
 		DefaultApiUrl,
 		DefaultConnectUrl,
 	)
@@ -360,8 +362,39 @@ func provide(opts docopt.Opts) {
 
 	if allProxySettings := readProxySettings(); 0 < len(allProxySettings) {
 		fmt.Printf("Using %d proxy servers:\n", len(allProxySettings))
+
+		obfuscateUser := func(user string) string {
+			if user == "" {
+				return "<no user>"
+			} else if len(user) < 6 {
+				return "***"
+			} else {
+				return fmt.Sprintf("%s***%s", user[:2], user[len(user)-2:])
+			}
+		}
+		obfuscatePassword := func(password string) string {
+			if password == "" {
+				return "<no password>"
+			} else if len(password) < 6 {
+				return "***"
+			} else {
+				return fmt.Sprintf("%s***%s", password[:2], password[len(password)-2:])
+			}
+		}
+
 		for i, proxySettings := range allProxySettings {
-			fmt.Printf("  proxy[%d] %s\n", i, proxySettings.Address)
+			var user string
+			var password string
+			if proxySettings.Auth != nil {
+				user = proxySettings.Auth.User
+				password = proxySettings.Auth.Password
+			}
+			fmt.Printf("  proxy[%d] %s (%s/%s)\n",
+				i,
+				proxySettings.Address,
+				obfuscateUser(user),
+				obfuscatePassword(password),
+			)
 		}
 		for _, proxySettings := range allProxySettings {
 			wg.Go(func() {
@@ -565,13 +598,18 @@ func proxyAuthAdd(opts docopt.Opts) {
 func proxyAuthRemove(opts docopt.Opts) {
 	proxyConfig := readProxyConfig()
 
-	key, _ := opts.String("key")
+	if all, _ := opts.Bool("--all"); all {
+		clear(proxyConfig.Auths)
+	} else {
 
-	if proxyConfig.Auths == nil {
-		proxyConfig.Auths = map[string]*ProxyAuth{}
+		key, _ := opts.String("key")
+
+		if proxyConfig.Auths == nil {
+			proxyConfig.Auths = map[string]*ProxyAuth{}
+		}
+
+		delete(proxyConfig.Auths, key)
 	}
-
-	delete(proxyConfig.Auths, key)
 
 	writeProxyConfig(proxyConfig)
 }
@@ -579,8 +617,22 @@ func proxyAuthRemove(opts docopt.Opts) {
 func proxyAdd(opts docopt.Opts) {
 	proxyConfig := readProxyConfig()
 
-	allKeyAddressAny, _ := opts["<key_address>"]
-	allKeyAddress := allKeyAddressAny.([]string)
+	allKeyAddress := []string{}
+	if allKeyAddressAny, ok := opts["<key_address>"]; ok {
+		allKeyAddress = append(allKeyAddress, allKeyAddressAny.([]string)...)
+	}
+	if proxyPath, _ := opts.String("--proxy_file"); proxyPath != "" {
+		b, err := os.ReadFile(proxyPath)
+		if err != nil {
+			panic(err)
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			line = strings.TrimSpace(line)
+			if line != "" && line[0] != '#' {
+				allKeyAddress = append(allKeyAddress, line)
+			}
+		}
+	}
 
 	if proxyConfig.Servers == nil {
 		proxyConfig.Servers = map[string]string{}
@@ -619,27 +671,34 @@ func proxyAdd(opts docopt.Opts) {
 func proxyRemove(opts docopt.Opts) {
 	proxyConfig := readProxyConfig()
 
-	allKeyAddressAny, _ := opts["<key_address>"]
-	allKeyAddress := allKeyAddressAny.([]string)
+	if all, _ := opts.Bool("--all"); all {
+		clear(proxyConfig.Servers)
+	} else {
 
-	if proxyConfig.Servers == nil {
-		proxyConfig.Servers = map[string]string{}
-	}
-
-	for _, keyAddress := range allKeyAddress {
-		var key string
-		var address string
-		i := strings.Index(keyAddress, "@")
-		if 0 <= i {
-			key = keyAddress[:i]
-			address = keyAddress[i+1:]
-		} else {
-			key = ""
-			address = keyAddress
+		allKeyAddress := []string{}
+		if allKeyAddressAny, ok := opts["<key_address>"]; ok {
+			allKeyAddress = append(allKeyAddress, allKeyAddressAny.([]string)...)
 		}
 
-		if key == "" || proxyConfig.Servers[address] == key {
-			delete(proxyConfig.Servers, address)
+		if proxyConfig.Servers == nil {
+			proxyConfig.Servers = map[string]string{}
+		}
+
+		for _, keyAddress := range allKeyAddress {
+			var key string
+			var address string
+			i := strings.Index(keyAddress, "@")
+			if 0 <= i {
+				key = keyAddress[:i]
+				address = keyAddress[i+1:]
+			} else {
+				key = ""
+				address = keyAddress
+			}
+
+			if key == "" || proxyConfig.Servers[address] == key {
+				delete(proxyConfig.Servers, address)
+			}
 		}
 	}
 
@@ -666,10 +725,17 @@ func readProxySettings() []*connect.ProxySettings {
 	}
 
 	var allProxySettings []*connect.ProxySettings
-	for address, key := range proxyConfig.Servers {
+	for proxyAddress, key := range proxyConfig.Servers {
+		address, user, password := parseProxyAddress(proxyAddress)
 		proxySettings := &connect.ProxySettings{
 			Network: "tcp",
 			Address: address,
+		}
+		if user != "" || password != "" {
+			proxySettings.Auth = &proxy.Auth{
+				User:     user,
+				Password: password,
+			}
 		}
 		if proxyConfig.Auths != nil {
 			proxyAuth, ok := proxyConfig.Auths[key]
@@ -684,6 +750,20 @@ func readProxySettings() []*connect.ProxySettings {
 	}
 
 	return allProxySettings
+}
+
+func parseProxyAddress(proxyAddress string) (address string, user string, password string) {
+	r := regexp.MustCompile("^(.*:\\d*):([^:]*):([^:]*)$")
+	groups := r.FindStringSubmatch(proxyAddress)
+	if groups != nil {
+		address = groups[1]
+		user = groups[2]
+		password = groups[3]
+		return
+	}
+	// assume host:port
+	address = proxyAddress
+	return
 }
 
 func readProxyConfig() *ProxyConfig {
