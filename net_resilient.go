@@ -232,21 +232,21 @@ func (self *ResilientTlsConn) Write(b []byte) (int, error) {
 						} else {
 
 							if self.fragment {
-								if _, err := tcpConn.Write(tlsHeader.reconstruct(handshakeBytes[0:split])); err != nil {
+								if _, err := self.conn.Write(tlsHeader.reconstruct(handshakeBytes[0:split])); err != nil {
 									return 0, err
 								}
 
 								for i := split; i < meta.ServerNameValueEnd; i += step {
-									if _, err := tcpConn.Write(tlsHeader.reconstruct(handshakeBytes[i:min(i+step, meta.ServerNameValueEnd)])); err != nil {
+									if _, err := self.conn.Write(tlsHeader.reconstruct(handshakeBytes[i:min(i+step, meta.ServerNameValueEnd)])); err != nil {
 										return 0, err
 									}
 								}
 
-								if _, err := tcpConn.Write(tlsHeader.reconstruct(handshakeBytes[meta.ServerNameValueEnd:])); err != nil {
+								if _, err := self.conn.Write(tlsHeader.reconstruct(handshakeBytes[meta.ServerNameValueEnd:])); err != nil {
 									return 0, err
 								}
 							} else {
-								if _, err := tcpConn.Write(tlsHeader.reconstruct(handshakeBytes)); err != nil {
+								if _, err := self.conn.Write(tlsHeader.reconstruct(handshakeBytes)); err != nil {
 									return 0, err
 								}
 							}
