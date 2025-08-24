@@ -98,7 +98,6 @@ func DefaultLocalUserNatSettings() *LocalUserNatSettings {
 		BufferTimeout:      15 * time.Second,
 		UdpBufferSettings:  DefaultUdpBufferSettings(),
 		TcpBufferSettings:  DefaultTcpBufferSettings(),
-		ConnectSettings:    *DefaultConnectSettings(),
 	}
 }
 
@@ -107,8 +106,6 @@ type LocalUserNatSettings struct {
 	BufferTimeout      time.Duration
 	UdpBufferSettings  *UdpBufferSettings
 	TcpBufferSettings  *TcpBufferSettings
-
-	ConnectSettings
 }
 
 // forwards packets using user space sockets

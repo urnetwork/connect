@@ -314,7 +314,8 @@ func provide(opts docopt.Opts) {
 		clientStrategySettings.ProxySettings = proxySettings
 		clientSettings := connect.DefaultClientSettings()
 		localUserNatSettings := connect.DefaultLocalUserNatSettings()
-		localUserNatSettings.ConnectSettings = clientStrategySettings.ConnectSettings
+		localUserNatSettings.TcpBufferSettings.ConnectSettings = clientStrategySettings.ConnectSettings
+		localUserNatSettings.UdpBufferSettings.ConnectSettings = clientStrategySettings.ConnectSettings
 		remoteUserNatProviderSettings := connect.DefaultRemoteUserNatProviderSettings()
 
 		clientStrategy := connect.NewClientStrategy(proxyCtx, clientStrategySettings)
