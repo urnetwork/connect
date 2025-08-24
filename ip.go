@@ -705,9 +705,10 @@ func (self *UdpSequence) Run() {
 	self.UpdateLastActivityTime()
 	glog.V(2).Infof("[init]connect success\n")
 
-	udpConn := socket.(*net.UDPConn)
-	udpConn.SetReadBuffer(int(self.udpBufferSettings.MaxWindowSize))
-	udpConn.SetWriteBuffer(int(self.udpBufferSettings.MaxWindowSize))
+	if udpConn, ok := socket.(*net.UDPConn); ok {
+		udpConn.SetReadBuffer(int(self.udpBufferSettings.MaxWindowSize))
+		udpConn.SetWriteBuffer(int(self.udpBufferSettings.MaxWindowSize))
+	}
 	// f, _ := udpConn.File()
 	// fd := SocketHandle(f.Fd())
 	// syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_MTU, self.udpBufferSettings.Mtu)
@@ -1377,11 +1378,12 @@ func (self *TcpSequence) Run() {
 	glog.V(2).Infof("[init]connect success\n")
 
 	defer socket.Close()
-	tcpConn := socket.(*net.TCPConn)
-	tcpConn.SetKeepAlive(false)
-	tcpConn.SetNoDelay(true)
-	tcpConn.SetReadBuffer(int(self.tcpBufferSettings.MaxWindowSize))
-	tcpConn.SetWriteBuffer(int(self.tcpBufferSettings.MaxWindowSize))
+	if tcpConn, ok := socket.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(false)
+		tcpConn.SetNoDelay(true)
+		tcpConn.SetReadBuffer(int(self.tcpBufferSettings.MaxWindowSize))
+		tcpConn.SetWriteBuffer(int(self.tcpBufferSettings.MaxWindowSize))
+	}
 	// f, _ := tcpConn.File()
 	// fd := SocketHandle(f.Fd())
 	// syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_MTU, self.tcpBufferSettings.Mtu)
