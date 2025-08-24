@@ -378,14 +378,18 @@ func provide(opts docopt.Opts) {
 			)
 		}
 		for _, proxySettings := range allProxySettings {
-			wg.Go(func() {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
 				provideWithProxy(proxySettings)
-			})
+			}()
 		}
 	} else {
-		wg.Go(func() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 			provideWithProxy(nil)
-		})
+		}()
 	}
 
 	if 0 < port {
