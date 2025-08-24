@@ -363,25 +363,6 @@ func provide(opts docopt.Opts) {
 	if allProxySettings := readProxySettings(); 0 < len(allProxySettings) {
 		fmt.Printf("Using %d proxy servers:\n", len(allProxySettings))
 
-		obfuscateUser := func(user string) string {
-			if user == "" {
-				return "<no user>"
-			} else if len(user) < 6 {
-				return "***"
-			} else {
-				return fmt.Sprintf("%s***%s", user[:2], user[len(user)-2:])
-			}
-		}
-		obfuscatePassword := func(password string) string {
-			if password == "" {
-				return "<no password>"
-			} else if len(password) < 6 {
-				return "***"
-			} else {
-				return fmt.Sprintf("%s***%s", password[:2], password[len(password)-2:])
-			}
-		}
-
 		for i, proxySettings := range allProxySettings {
 			var user string
 			var password string
@@ -640,19 +621,33 @@ func proxyAdd(opts docopt.Opts) {
 
 	for _, keyAddress := range allKeyAddress {
 		var key string
-		var address string
+		var proxyAddress string
 		i := strings.Index(keyAddress, "@")
 		if 0 <= i {
 			key = keyAddress[:i]
-			address = keyAddress[i+1:]
+			proxyAddress = keyAddress[i+1:]
 		} else {
 			key = ""
-			address = keyAddress
+			proxyAddress = keyAddress
 		}
 
-		if _, ok := proxyConfig.Servers[address]; ok {
+		address, user, password := parseProxyAddress(proxyAddress)
+		if proxyConfig.Auths != nil {
+			proxyAuth, ok := proxyConfig.Auths[key]
+			if ok {
+				user = proxyAuth.User
+				password = proxyAuth.Password
+			}
+		}
+
+		if currentKey, ok := proxyConfig.Servers[proxyAddress]; ok && currentKey != key {
 			if force, _ := opts.Bool("-f"); !force {
-				fmt.Printf("server \"%s\" exists. Overwrite? [yN]\n", address)
+				fmt.Printf(
+					"server %s (%s/%s) exists with different key. Change key? [yN]\n",
+					address,
+					obfuscateUser(user),
+					obfuscatePassword(password),
+				)
 
 				reader := bufio.NewReader(os.Stdin)
 				confirm, _ := reader.ReadString('\n')
@@ -662,7 +657,14 @@ func proxyAdd(opts docopt.Opts) {
 			}
 		}
 
-		proxyConfig.Servers[address] = key
+		fmt.Printf(
+			"added server %s (%s/%s)\n",
+			address,
+			obfuscateUser(user),
+			obfuscatePassword(password),
+		)
+
+		proxyConfig.Servers[proxyAddress] = key
 	}
 
 	writeProxyConfig(proxyConfig)
@@ -764,6 +766,26 @@ func parseProxyAddress(proxyAddress string) (address string, user string, passwo
 	// assume host:port
 	address = proxyAddress
 	return
+}
+
+func obfuscateUser(user string) string {
+	if user == "" {
+		return "<no user>"
+	} else if len(user) < 6 {
+		return "***"
+	} else {
+		return fmt.Sprintf("%s***%s", user[:2], user[len(user)-2:])
+	}
+}
+
+func obfuscatePassword(password string) string {
+	if password == "" {
+		return "<no password>"
+	} else if len(password) < 6 {
+		return "***"
+	} else {
+		return fmt.Sprintf("%s***%s", password[:2], password[len(password)-2:])
+	}
 }
 
 func readProxyConfig() *ProxyConfig {
