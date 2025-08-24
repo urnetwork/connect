@@ -69,12 +69,13 @@ func DefaultUdpBufferSettings() *UdpBufferSettings {
 		SequenceBufferSize:  DefaultIpBufferSize,
 		UserLimit:           128,
 		MaxWindowSize:       uint32(mib(1)),
+		ConnectSettings:     *DefaultConnectSettings(),
 	}
 }
 
 func DefaultTcpBufferSettings() *TcpBufferSettings {
 	tcpBufferSettings := &TcpBufferSettings{
-		ConnectTimeout:     60 * time.Second,
+		// ConnectTimeout:     60 * time.Second,
 		ReadTimeout:        30 * time.Second,
 		WriteTimeout:       15 * time.Second,
 		AckCompressTimeout: time.Duration(0),
@@ -86,6 +87,7 @@ func DefaultTcpBufferSettings() *TcpBufferSettings {
 		MinWindowSize:       uint32(kib(8)),
 		MaxWindowSize:       uint32(mib(1)),
 		UserLimit:           128,
+		ConnectSettings:     *DefaultConnectSettings(),
 	}
 	return tcpBufferSettings
 }
@@ -96,6 +98,7 @@ func DefaultLocalUserNatSettings() *LocalUserNatSettings {
 		BufferTimeout:      15 * time.Second,
 		UdpBufferSettings:  DefaultUdpBufferSettings(),
 		TcpBufferSettings:  DefaultTcpBufferSettings(),
+		ConnectSettings:    *DefaultConnectSettings(),
 	}
 }
 
@@ -104,6 +107,8 @@ type LocalUserNatSettings struct {
 	BufferTimeout      time.Duration
 	UdpBufferSettings  *UdpBufferSettings
 	TcpBufferSettings  *TcpBufferSettings
+
+	ConnectSettings
 }
 
 // forwards packets using user space sockets
@@ -402,6 +407,8 @@ type UdpBufferSettings struct {
 	// uses an lru cleanup where new sockets over the limit close old sockets
 	UserLimit     int
 	MaxWindowSize uint32
+
+	ConnectSettings
 }
 
 type Udp4Buffer struct {
@@ -688,7 +695,8 @@ func (self *UdpSequence) Run() {
 	}
 
 	glog.V(2).Infof("[init]udp connect\n")
-	socket, err := net.Dial(
+	socket, err := self.udpBufferSettings.DialContext(
+		self.ctx,
 		"udp",
 		self.IpPath().DestinationHostPort(),
 	)
@@ -1005,7 +1013,7 @@ func (self *StreamState) DataPackets(payload []byte, n int, mtu int) ([][]byte, 
 }
 
 type TcpBufferSettings struct {
-	ConnectTimeout     time.Duration
+	// ConnectTimeout     time.Duration
 	ReadTimeout        time.Duration
 	WriteTimeout       time.Duration
 	AckCompressTimeout time.Duration
@@ -1026,6 +1034,8 @@ type TcpBufferSettings struct {
 	// the number of open sockets per user
 	// uses an lru cleanup where new sockets over the limit close old sockets
 	UserLimit int
+
+	ConnectSettings
 }
 
 type Tcp4Buffer struct {
@@ -1357,10 +1367,10 @@ func (self *TcpSequence) Run() {
 
 	// connect to upstream before sending the syn+ack
 	glog.V(2).Infof("[init]tcp connect\n")
-	socket, err := net.DialTimeout(
+	socket, err := self.tcpBufferSettings.DialContext(
+		self.ctx,
 		"tcp",
 		self.IpPath().DestinationHostPort(),
-		self.tcpBufferSettings.ConnectTimeout,
 	)
 	if err != nil {
 		glog.V(1).Infof("[init]tcp connect error = %s\n", err)

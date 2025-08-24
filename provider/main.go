@@ -312,6 +312,11 @@ func provide(opts docopt.Opts) {
 
 		clientStrategySettings := connect.DefaultClientStrategySettings()
 		clientStrategySettings.ProxySettings = proxySettings
+		clientSettings := connect.DefaultClientSettings()
+		localUserNatSettings := connect.DefaultLocalUserNatSettings()
+		localUserNatSettings.ConnectSettings = clientStrategySettings.ConnectSettings
+		remoteUserNatProviderSettings := connect.DefaultRemoteUserNatProviderSettings()
+
 		clientStrategy := connect.NewClientStrategy(proxyCtx, clientStrategySettings)
 
 		byClientJwt, clientId, err := provideAuth(proxyCtx, clientStrategy, apiUrl, opts)
@@ -322,7 +327,7 @@ func provide(opts docopt.Opts) {
 		instanceId := connect.NewId()
 
 		clientOob := connect.NewApiOutOfBandControl(proxyCtx, clientStrategy, byClientJwt, apiUrl)
-		connectClient := connect.NewClientWithDefaults(proxyCtx, clientId, clientOob)
+		connectClient := connect.NewClient(proxyCtx, clientId, clientOob, clientSettings)
 		defer connectClient.Close()
 
 		// routeManager := connect.NewRouteManager(connectClient)
@@ -342,9 +347,9 @@ func provide(opts docopt.Opts) {
 		connect.NewPlatformTransportWithDefaults(proxyCtx, clientStrategy, connectClient.RouteManager(), connectUrl, auth)
 		// go platformTransport.Run(connectClient.RouteManager())
 
-		localUserNat := connect.NewLocalUserNatWithDefaults(proxyCtx, clientId.String())
+		localUserNat := connect.NewLocalUserNat(proxyCtx, clientId.String(), localUserNatSettings)
 		defer localUserNat.Close()
-		remoteUserNatProvider := connect.NewRemoteUserNatProviderWithDefaults(connectClient, localUserNat)
+		remoteUserNatProvider := connect.NewRemoteUserNatProvider(connectClient, localUserNat, remoteUserNatProviderSettings)
 		defer remoteUserNatProvider.Close()
 
 		provideModes := map[protocol.ProvideMode]bool{

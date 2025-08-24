@@ -66,9 +66,7 @@ func NewResilientDialTlsContext(
 
 		// fmt.Printf("Extender client 1\n")
 
-		dialContext := connectSettings.NewDialContext(ctx)
-
-		conn, err := dialContext(ctx, "tcp", address)
+		conn, err := connectSettings.DialContext(ctx, "tcp", address)
 		if err != nil {
 			return nil, err
 		}

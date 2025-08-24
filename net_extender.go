@@ -148,9 +148,7 @@ func NewExtenderDialTlsContext(
 
 		switch extenderConfig.Profile.ConnectMode {
 		case ExtenderConnectModeTcpTls:
-			dialContext := connectSettings.NewDialContext(ctx)
-
-			conn, err := dialContext(ctx, "tcp", authority)
+			conn, err := connectSettings.DialContext(ctx, "tcp", authority)
 			if err != nil {
 				return nil, err
 			}

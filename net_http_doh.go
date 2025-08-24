@@ -62,12 +62,10 @@ func DohQuery(ctx context.Context, ipVersion int, recordType string, settings *D
 		return map[netip.Addr]bool{}
 	}
 
-	dialContext := settings.NewDialContext(ctx)
-
 	httpClient := &http.Client{
 		Timeout: settings.RequestTimeout,
 		Transport: &http.Transport{
-			DialContext:         dialContext,
+			DialContext:         settings.DialContext,
 			TLSHandshakeTimeout: settings.TlsTimeout,
 			TLSClientConfig:     settings.TlsConfig,
 		},
