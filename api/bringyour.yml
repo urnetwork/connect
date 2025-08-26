@@ -710,6 +710,19 @@ paths:
               schema:
                 $ref: "#/components/schemas/GetNetworkBlockedLocationsResult"
 
+  /network/reliability:
+    get:
+      description: Get network reliability stats
+      operationId: Network Reliability
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetNetworkReliabilityResult"
+
   /wallet/balance:
     get:
       description: |
@@ -3264,3 +3277,57 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/BlockedLocation"
+
+    ReliabilityWindow:
+      type: object
+      properties:
+        mean_reliability_weight:
+          type: number
+          format: float
+        min_time_unix_milli:
+          type: integer
+        min_bucket_number:
+          type: integer
+        max_time_unix_milli:
+          type: integer
+        max_bucket_number:
+          type: integer
+        bucket_duration_seconds:
+          type: integer
+        max_client_count:
+          type: integer
+        max_total_client_count:
+          type: integer
+        reliability_weights:
+          type: object
+          description: |
+            Map of reliability weights. Keys bucket number.
+            Values are float64 reliability weights.
+          additionalProperties:
+            type: number
+            format: float
+        client_counts:
+          type: object
+          description: |
+            Map of client counts. Keys are bucket number.
+            Values are int of client count.
+          additionalProperties:
+            type: integer
+        total_client_counts:
+          type: object
+          description: |
+            Map of total client counts. Keys are bucket number.
+            Values are int of client count.
+          additionalProperties:
+            type: integer
+
+    GetNetworkReliabilityResult:
+      type: object
+      properties:
+        reliability_window:
+          $ref: "#/components/schemas/ReliabilityWindow"
+        error:
+          type: object
+          properties:
+            message:
+              type: string
