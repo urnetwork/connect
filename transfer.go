@@ -1979,7 +1979,7 @@ func (self *SendSequence) sendWithSetContract(
 }
 
 func (self *SendSequence) setHead(item *sendItem) ([]byte, error) {
-	glog.Infof("[s]set head %s->%s...%s s(%s)\n", self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId)
+	glog.V(1).Infof("[s]set head %s->%s...%s s(%s)\n", self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId)
 
 	var transferFrame protocol.TransferFrame
 	err := ProtoUnmarshal(item.transferFrameBytes, &transferFrame)
