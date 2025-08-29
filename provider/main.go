@@ -174,13 +174,11 @@ func auth(opts docopt.Opts) {
 		debug.SetMemoryLimit(maxMemory)
 	}
 
-	cancelCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	event := connect.NewEventWithContext(cancelCtx)
+	event := connect.NewEventWithContext(context.Background())
 	event.SetOnSignals(syscall.SIGINT, syscall.SIGQUIT, syscall.SIGTERM)
 
-	ctx := event.Ctx()
+	ctx, cancel := context.WithCancel(event.Ctx())
+	defer cancel()
 
 	clientStrategy := connect.NewClientStrategyWithDefaults(ctx)
 
@@ -302,14 +300,14 @@ func provide(opts docopt.Opts) {
 		debug.SetMemoryLimit(maxMemory)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	event := connect.NewEventWithContext(ctx)
+	event := connect.NewEventWithContext(context.Background())
 	event.SetOnSignals(syscall.SIGINT, syscall.SIGQUIT, syscall.SIGTERM)
 
+	ctx, cancel := context.WithCancel(event.Ctx())
+	defer cancel()
+
 	provideWithProxy := func(proxySettings *connect.ProxySettings) {
-		proxyCtx, proxyCancel := context.WithCancel(event.Ctx())
+		proxyCtx, proxyCancel := context.WithCancel(ctx)
 		defer proxyCancel()
 
 		clientStrategySettings := connect.DefaultClientStrategySettings()
@@ -331,7 +329,7 @@ func provide(opts docopt.Opts) {
 				retryDelay := time.Duration(500+mathrand.Intn(10000)) * time.Millisecond
 				fmt.Printf("init proxy auth failed. Will retry in %.2fs\n", float64(retryDelay/time.Millisecond)/1000.0)
 				select {
-				case <-ctx.Done():
+				case <-proxyCtx.Done():
 				case <-time.After(retryDelay):
 				}
 			}
@@ -447,10 +445,6 @@ func provide(opts docopt.Opts) {
 	}
 
 	wg.Wait()
-
-	select {
-	case <-ctx.Done():
-	}
 
 	// exit
 	os.Exit(0)
