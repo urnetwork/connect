@@ -488,51 +488,24 @@ func (self *ContractManager) InitProvideSecretKeys() {
 
 func (self *ContractManager) SetProvidePaused(providePaused bool) bool {
 	changed := false
-	var provideFrame *protocol.Frame
 	func() {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
 
 		if self.providePaused != providePaused {
-			var provide *protocol.Provide
-			if providePaused {
-				provide = &protocol.Provide{
-					Keys: []*protocol.ProvideKey{},
-				}
-			} else {
-				provideKeys := []*protocol.ProvideKey{}
-				for provideMode, allow := range self.provideModes {
-					if allow {
-						provideSecretKey := self.provideSecretKeys[provideMode]
-						provideKeys = append(provideKeys, &protocol.ProvideKey{
-							Mode:             provideMode,
-							ProvideSecretKey: provideSecretKey,
-						})
-					}
-				}
-
-				provide = &protocol.Provide{
-					Keys: provideKeys,
-				}
-			}
-			var err error
-			provideFrame, err = ToFrame(provide, self.settings.ProtocolVersion)
-			if err != nil {
-				glog.Infof("[contract]could not create provide frame = %s", err)
-				return
-			}
-
 			self.providePaused = providePaused
 			self.provideMonitor.NotifyAll()
 			changed = true
 		}
 	}()
 	if changed {
-		self.controlSyncProvide.Send(
-			provideFrame,
-			nil,
-			nil,
-		)
+		if provideFrame, err := self.provideFrame(); err == nil && provideFrame != nil {
+			self.controlSyncProvide.Send(
+				provideFrame,
+				nil,
+				nil,
+			)
+		}
 		return true
 	}
 	return false
@@ -543,6 +516,47 @@ func (self *ContractManager) IsProvidePaused() bool {
 	defer self.mutex.Unlock()
 
 	return self.providePaused
+}
+
+func (self *ContractManager) provideFrame() (*protocol.Frame, error) {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+
+	// keep all keys (see note on `provideSecretKeys`)
+
+	provideKeys := []*protocol.ProvideKey{}
+	for provideMode, allow := range self.provideModes {
+		if allow {
+			provideSecretKey, ok := self.provideSecretKeys[provideMode]
+			if !ok {
+				// generate a new key
+				provideSecretKey = make([]byte, 32)
+				_, err := rand.Read(provideSecretKey)
+				if err != nil {
+					panic(err)
+				}
+				self.provideSecretKeys[provideMode] = provideSecretKey
+			}
+			provideKeys = append(provideKeys, &protocol.ProvideKey{
+				Mode:             provideMode,
+				ProvideSecretKey: provideSecretKey,
+			})
+		}
+	}
+
+	if !self.providePaused {
+		provide := &protocol.Provide{
+			Keys: provideKeys,
+		}
+		provideFrame, err := ToFrame(provide, self.settings.ProtocolVersion)
+		if err != nil {
+			glog.Infof("[contract]could not create provide frame = %s", err)
+			return nil, err
+		}
+		return provideFrame, nil
+	} else {
+		return nil, nil
+	}
 }
 
 func (self *ContractManager) SetProvideModesWithReturnTraffic(provideModes map[protocol.ProvideMode]bool) {
@@ -562,49 +576,18 @@ func (self *ContractManager) SetProvideModes(provideModes map[protocol.ProvideMo
 }
 
 func (self *ContractManager) SetProvideModesWithAckCallback(provideModes map[protocol.ProvideMode]bool, ackCallback func(err error)) {
-	var provideFrame *protocol.Frame
 	func() {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
 
 		// keep all keys (see note on `provideSecretKeys`)
 
-		provideKeys := []*protocol.ProvideKey{}
-		for provideMode, allow := range provideModes {
-			if allow {
-				provideSecretKey, ok := self.provideSecretKeys[provideMode]
-				if !ok {
-					// generate a new key
-					provideSecretKey = make([]byte, 32)
-					_, err := rand.Read(provideSecretKey)
-					if err != nil {
-						panic(err)
-					}
-					self.provideSecretKeys[provideMode] = provideSecretKey
-				}
-				provideKeys = append(provideKeys, &protocol.ProvideKey{
-					Mode:             provideMode,
-					ProvideSecretKey: provideSecretKey,
-				})
-			}
-		}
-
-		if !self.providePaused {
-			provide := &protocol.Provide{
-				Keys: provideKeys,
-			}
-			var err error
-			provideFrame, err = ToFrame(provide, self.settings.ProtocolVersion)
-			if err != nil {
-				glog.Infof("[contract]could not create provide frame = %s", err)
-				return
-			}
-		}
-
 		self.provideModes = maps.Clone(provideModes)
 		self.provideMonitor.NotifyAll()
 	}()
-	if provideFrame != nil {
+	if provideFrame, err := self.provideFrame(); err != nil {
+		ackCallback(err)
+	} else if provideFrame != nil {
 		self.controlSyncProvide.Send(
 			provideFrame,
 			nil,
