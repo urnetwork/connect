@@ -363,7 +363,7 @@ func (self *ContractManager) Receive(source TransferPath, frames []*protocol.Fra
 			}
 		}
 		for contractKey, contractError := range contractErrors {
-			glog.Infof("[contract]error = %s\n", contractError)
+			glog.V(1).Infof("[contract]error = %s\n", contractError)
 			c := func() {
 				contractStatus := &ContractStatus{
 					Key:   contractKey,
