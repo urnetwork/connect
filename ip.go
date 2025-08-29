@@ -2458,6 +2458,15 @@ func (self *RemoteUserNatProvider) Receive(
 func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode) {
 	for _, frame := range frames {
 		switch frame.MessageType {
+		case protocol.MessageType_IpIpPing:
+			glog.V(1).Infof("[ip]provider ping <- %s(%d)\n", source, provideMode)
+			// echo back
+			self.client.SendWithTimeout(
+				frame,
+				source.Reverse(),
+				func(err error) {},
+				self.settings.WriteTimeout,
+			)
 		case protocol.MessageType_IpIpPacketToProvider:
 			ipPacketToProvider_, err := FromFrame(frame)
 			if err != nil {

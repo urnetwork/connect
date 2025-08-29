@@ -2193,6 +2193,7 @@ func newMultiClientChannel(
 		// affinityTime:              time.Time{},
 	}
 	go HandleError(clientChannel.detectBlackhole, cancel)
+	go HandleError(clientChannel.ping, cancel)
 
 	clientReceiveUnsub := client.AddReceiveCallback(clientChannel.clientReceive)
 	clientChannel.clientReceiveUnsub = clientReceiveUnsub
@@ -2363,6 +2364,54 @@ func (self *multiClientChannel) detectBlackhole() {
 			case <-self.client.Done():
 				return
 			case <-time.After(timeout):
+			}
+		}
+	}
+}
+
+func (self *multiClientChannel) ping() {
+	defer self.cancel()
+
+	for {
+		select {
+		case <-self.ctx.Done():
+			return
+		case <-self.client.Done():
+			return
+		case <-WakeupAfter(self.settings.PingTimeout, self.settings.PingTimeout):
+		}
+
+		pingDone := make(chan error)
+		success, err := self.SendDetailedMessage(
+			&protocol.IpPing{},
+			self.settings.PingWriteTimeout,
+			func(err error) {
+				defer close(pingDone)
+				select {
+				case <-self.ctx.Done():
+					return
+				case pingDone <- err:
+				}
+			},
+		)
+		if err != nil {
+			close(pingDone)
+			return
+		} else if !success {
+			close(pingDone)
+			return
+		} else {
+			select {
+			case <-self.ctx.Done():
+				return
+			case <-self.client.Done():
+				return
+			case err := <-pingDone:
+				if err != nil {
+					return
+				}
+			case <-time.After(self.settings.PingTimeout):
+				return
 			}
 		}
 	}
