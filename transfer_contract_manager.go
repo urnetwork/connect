@@ -522,41 +522,53 @@ func (self *ContractManager) provideFrame() (*protocol.Frame, error) {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 
-	// keep all keys (see note on `provideSecretKeys`)
-
-	provideKeys := []*protocol.ProvideKey{}
-	for provideMode, allow := range self.provideModes {
-		if allow {
-			provideSecretKey, ok := self.provideSecretKeys[provideMode]
-			if !ok {
-				// generate a new key
-				provideSecretKey = make([]byte, 32)
-				_, err := rand.Read(provideSecretKey)
-				if err != nil {
-					panic(err)
+	var provide *protocol.Provide
+	if self.providePaused {
+		// keep only ProvideMode_Stream to allow return traffic, if set
+		provideKeys := []*protocol.ProvideKey{}
+		for provideMode, allow := range self.provideModes {
+			if allow && provideMode == protocol.ProvideMode_Stream {
+				provideSecretKey, ok := self.provideSecretKeys[provideMode]
+				if ok {
+					provideKeys = append(provideKeys, &protocol.ProvideKey{
+						Mode:             provideMode,
+						ProvideSecretKey: provideSecretKey,
+					})
+				} else {
+					glog.Infof("[contract]missing provide key for %d. Will omit.\n", provideMode)
 				}
-				self.provideSecretKeys[provideMode] = provideSecretKey
 			}
-			provideKeys = append(provideKeys, &protocol.ProvideKey{
-				Mode:             provideMode,
-				ProvideSecretKey: provideSecretKey,
-			})
 		}
-	}
 
-	if !self.providePaused {
-		provide := &protocol.Provide{
+		provide = &protocol.Provide{
 			Keys: provideKeys,
 		}
-		provideFrame, err := ToFrame(provide, self.settings.ProtocolVersion)
-		if err != nil {
-			glog.Infof("[contract]could not create provide frame = %s", err)
-			return nil, err
-		}
-		return provideFrame, nil
 	} else {
-		return nil, nil
+		provideKeys := []*protocol.ProvideKey{}
+		for provideMode, allow := range self.provideModes {
+			if allow {
+				provideSecretKey, ok := self.provideSecretKeys[provideMode]
+				if ok {
+					provideKeys = append(provideKeys, &protocol.ProvideKey{
+						Mode:             provideMode,
+						ProvideSecretKey: provideSecretKey,
+					})
+				} else {
+					glog.Infof("[contract]missing provide key for %d. Will omit.\n", provideMode)
+				}
+			}
+		}
+
+		provide = &protocol.Provide{
+			Keys: provideKeys,
+		}
 	}
+	provideFrame, err := ToFrame(provide, self.settings.ProtocolVersion)
+	if err != nil {
+		glog.Infof("[contract]could not create provide frame = %s", err)
+		return nil, err
+	}
+	return provideFrame, nil
 }
 
 func (self *ContractManager) SetProvideModesWithReturnTraffic(provideModes map[protocol.ProvideMode]bool) {
@@ -581,6 +593,20 @@ func (self *ContractManager) SetProvideModesWithAckCallback(provideModes map[pro
 		defer self.mutex.Unlock()
 
 		// keep all keys (see note on `provideSecretKeys`)
+		for provideMode, allow := range provideModes {
+			if allow {
+				provideSecretKey, ok := self.provideSecretKeys[provideMode]
+				if !ok {
+					// generate a new key
+					provideSecretKey = make([]byte, 32)
+					_, err := rand.Read(provideSecretKey)
+					if err != nil {
+						panic(err)
+					}
+					self.provideSecretKeys[provideMode] = provideSecretKey
+				}
+			}
+		}
 
 		self.provideModes = maps.Clone(provideModes)
 		self.provideMonitor.NotifyAll()
@@ -609,7 +635,8 @@ func (self *ContractManager) Verify(storedContractHmac []byte, storedContractByt
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 
-	if self.providePaused {
+	// only allow ProvideMode_Stream when paused, for return traffic
+	if self.providePaused && provideMode != protocol.ProvideMode_Stream {
 		return false
 	}
 
