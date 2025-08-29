@@ -100,11 +100,13 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 				WindowSizeReconnectScale: 1.0,
 			},
 		},
-		SendRetryTimeout: 200 * time.Millisecond,
-		PingWriteTimeout: 5 * time.Second,
+		SendRetryTimeout:  200 * time.Millisecond,
+		PingWriteTimeout:  5 * time.Second,
+		CPingWriteTimeout: 10 * time.Second,
 		// the initial ping includes creating the transports and contract
 		// ease up the timeout until perf issues are fully resolved
-		PingTimeout: 30 * time.Second,
+		PingTimeout:  15 * time.Second,
+		CPingTimeout: 30 * time.Second,
 		// a lower ack timeout helps cycle through bad providers faster
 		AckTimeout:             15 * time.Second,
 		BlackholeTimeout:       30 * time.Second,
@@ -154,7 +156,9 @@ type MultiClientSettings struct {
 	// WriteTimeout time.Duration
 	SendRetryTimeout       time.Duration
 	PingWriteTimeout       time.Duration
+	CPingWriteTimeout      time.Duration
 	PingTimeout            time.Duration
+	CPingTimeout           time.Duration
 	AckTimeout             time.Duration
 	BlackholeTimeout       time.Duration
 	WindowResizeTimeout    time.Duration
@@ -2378,13 +2382,13 @@ func (self *multiClientChannel) ping() {
 			return
 		case <-self.client.Done():
 			return
-		case <-WakeupAfter(self.settings.PingTimeout, self.settings.PingTimeout):
+		case <-WakeupAfter(self.settings.CPingTimeout, self.settings.CPingTimeout):
 		}
 
 		pingDone := make(chan error)
 		success, err := self.SendDetailedMessage(
 			&protocol.IpPing{},
-			self.settings.PingWriteTimeout,
+			self.settings.CPingWriteTimeout,
 			func(err error) {
 				defer close(pingDone)
 				select {
@@ -2408,9 +2412,10 @@ func (self *multiClientChannel) ping() {
 				return
 			case err := <-pingDone:
 				if err != nil {
+					self.addError(err)
 					return
 				}
-			case <-time.After(self.settings.PingTimeout):
+			case <-time.After(self.settings.CPingTimeout):
 				return
 			}
 		}
