@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	// "net"
+	mathrand "math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"golang.org/x/net/proxy"
 	"golang.org/x/term"
@@ -320,7 +322,20 @@ func provide(opts docopt.Opts) {
 
 		clientStrategy := connect.NewClientStrategy(proxyCtx, clientStrategySettings)
 
-		byClientJwt, clientId, err := provideAuth(proxyCtx, clientStrategy, apiUrl, opts)
+		byClientJwt, clientId, err := func() (string, connect.Id, error) {
+			for {
+				byClientJwt, clientId, err := provideAuth(proxyCtx, clientStrategy, apiUrl, opts)
+				if err == nil {
+					return byClientJwt, clientId, nil
+				}
+				retryDelay := time.Duration(500+mathrand.Intn(10000)) * time.Millisecond
+				fmt.Printf("init proxy auth failed. Will retry in %.2fs\n", float64(retryDelay/time.Millisecond)/1000.0)
+				select {
+				case <-ctx.Done():
+				case <-time.After(retryDelay):
+				}
+			}
+		}()
 		if err != nil {
 			panic(err)
 		}
@@ -383,19 +398,26 @@ func provide(opts docopt.Opts) {
 				obfuscatePassword(password),
 			)
 		}
-		for _, proxySettings := range allProxySettings {
+		for i, proxySettings := range allProxySettings {
 			wg.Add(1)
-			go func() {
+			go connect.HandleError(func() {
 				defer wg.Done()
+
+				initialDelay := time.Duration(i) * 100 * time.Millisecond
+				select {
+				case <-ctx.Done():
+				case <-time.After(initialDelay):
+				}
+
 				provideWithProxy(proxySettings)
-			}()
+			})
 		}
 	} else {
 		wg.Add(1)
-		go func() {
+		go connect.HandleError(func() {
 			defer wg.Done()
 			provideWithProxy(nil)
-		}()
+		})
 	}
 
 	if 0 < port {
