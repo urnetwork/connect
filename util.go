@@ -245,28 +245,31 @@ func (self *Event) SetOnSignals(signalValues ...syscall.Signal) func() {
 }
 
 func WeightedShuffle[T comparable](values []T, weights map[T]float32) {
-	WeightedShuffleWithEntropy[T](values, weights, 0)
+	WeightedShuffleWithEntropy[T](values, weights, float32(0))
 }
 
 func WeightedShuffleWithEntropy[T comparable](values []T, weights map[T]float32, entropy float32) {
-	mathrand.Shuffle(len(values), func(i int, j int) {
+	n := len(values)
+
+	mathrand.Shuffle(n, func(i int, j int) {
 		values[i], values[j] = values[j], values[i]
 	})
 
-	n := len(values)
+	netRemaining := float32(0)
+	for j := 0; j < n; j += 1 {
+		netRemaining += weights[values[j]]
+	}
+
 	for i := 0; i < n-1; i += 1 {
 		j := func() int {
-			var net float32
-			net = 0
-			for j := i; j < n; j += 1 {
-				net += weights[values[j]]
-			}
 			r := mathrand.Float32()
-			rnet := r * net
-			net = entropy * net
+			rnet := r * netRemaining
+			net := entropy * netRemaining
 			for j := i; j < n; j += 1 {
-				net += weights[values[j]]
+				w := weights[values[j]]
+				net += w
 				if rnet < net {
+					netRemaining -= w
 					return j
 				}
 			}
@@ -277,31 +280,72 @@ func WeightedShuffleWithEntropy[T comparable](values []T, weights map[T]float32,
 	}
 }
 
-func WeightedShuffleFunc[T comparable](values []T, weight func(T) float32) {
-	WeightedShuffleFuncWithEntropy[T](values, weight, 0)
+func WeightedShuffleFunc[T any](values []T, weight func(T) float32) {
+	WeightedShuffleFuncWithEntropy[T](values, weight, float32(0))
 }
 
-func WeightedShuffleFuncWithEntropy[T comparable](values []T, weight func(T) float32, entropy float32) {
-	mathrand.Shuffle(len(values), func(i int, j int) {
+func WeightedShuffleFuncWithEntropy[T any](values []T, weight func(T) float32, entropy float32) {
+	n := len(values)
+
+	mathrand.Shuffle(n, func(i int, j int) {
 		values[i], values[j] = values[j], values[i]
 	})
 
-	n := len(values)
+	netRemaining := float32(0)
+	for j := 0; j < n; j += 1 {
+		netRemaining += weight(values[j])
+	}
+
 	for i := 0; i < n-1; i += 1 {
 		j := func() int {
-			var net float32
-			net = 0
-			for j := i; j < n; j += 1 {
-				net += weight(values[j])
-			}
 			r := mathrand.Float32()
-			rnet := r * net
-			net = entropy * net
+			rnet := r * netRemaining
+			net := entropy * netRemaining
 			for j := i; j < n; j += 1 {
-				net += weight(values[j])
+				w := weight(values[j])
+				net += w
 				if rnet < net {
+					netRemaining -= w
 					return j
 				}
+			}
+			// zero weights, use the last value
+			return n - 1
+		}()
+		values[i], values[j] = values[j], values[i]
+	}
+}
+
+func WeightedSelectFunc[T any](values []T, n int, weight func(T) float32) {
+	WeightedSelectFuncWithEntropy[T](values, n, weight, float32(0))
+}
+
+// puts the result at the front of values
+func WeightedSelectFuncWithEntropy[T any](values []T, n int, weight func(T) float32, entropy float32) {
+	if n <= len(values) {
+		return
+	}
+
+	netRemaining := float32(0)
+	for j := 0; j < n; j += 1 {
+		netRemaining += weight(values[j])
+	}
+
+	for i := 0; i < n; i += 1 {
+		j := func() int {
+			r := mathrand.Float32()
+			rnet := r * netRemaining
+			net := entropy * netRemaining
+			j := i + (mathrand.Intn(n-i) % (n - i))
+			for c := 0; c < n-i; c += 1 {
+				w := weight(values[j])
+				net += w
+				if rnet < net {
+					netRemaining -= w
+					return j
+				}
+				// shuffle iteration
+				j = i + (mathrand.Intn(n-i) % (n - i))
 			}
 			// zero weights, use the last value
 			return n - 1

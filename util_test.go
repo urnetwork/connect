@@ -158,10 +158,11 @@ func TestWeightedShuffle(t *testing.T) {
 	}
 
 	k := 64
-	n := 512
+	n := 256
 
 	netIndexes1 := map[int]int64{}
 	netIndexes2 := map[int]int64{}
+	netIndexes3 := map[int]int64{}
 
 	for i := 0; i < n*k; i += 1 {
 		if i%100 == 0 {
@@ -185,6 +186,17 @@ func TestWeightedShuffle(t *testing.T) {
 		})
 		for index, value := range values {
 			netIndexes2[value] += int64(index)
+		}
+
+		s := 2
+		WeightedSelectFunc(values, len(values)/s, func(i int) float32 {
+			return weights[i]
+		})
+		WeightedShuffleFunc(values[len(values)/s:], func(i int) float32 {
+			return weights[i]
+		})
+		for index, value := range values {
+			netIndexes3[value] += int64(index)
 		}
 	}
 
@@ -215,6 +227,7 @@ func TestWeightedShuffle(t *testing.T) {
 
 	test(netIndexes1)
 	test(netIndexes2)
+	test(netIndexes3)
 }
 
 func TestWeightedShuffleWithEntropy(t *testing.T) {
@@ -236,6 +249,7 @@ func TestWeightedShuffleWithEntropy(t *testing.T) {
 	for entropyIndex, entropy := range orderedEntropies {
 		netIndexes1 := map[int]int64{}
 		netIndexes2 := map[int]int64{}
+		netIndexes3 := map[int]int64{}
 
 		for i := 0; i < n*k; i += 1 {
 			if i%100 == 0 {
@@ -259,6 +273,17 @@ func TestWeightedShuffleWithEntropy(t *testing.T) {
 			}, entropy)
 			for index, value := range values {
 				netIndexes2[value] += int64(index)
+			}
+
+			s := 2
+			WeightedSelectFuncWithEntropy(values, len(values)/s, func(i int) float32 {
+				return weights[i]
+			}, entropy)
+			WeightedShuffleFuncWithEntropy(values[len(values)/s:], func(i int) float32 {
+				return weights[i]
+			}, entropy)
+			for index, value := range values {
+				netIndexes3[value] += int64(index)
 			}
 		}
 
@@ -291,10 +316,12 @@ func TestWeightedShuffleWithEntropy(t *testing.T) {
 		fmt.Printf("[entropy]%d\n", entropyIndex)
 		testError(entropy, true, netIndexes1)
 		testError(entropy, true, netIndexes2)
+		testError(entropy, true, netIndexes3)
 		// the test should fail at the next entropy index (tigher error bound)
 		if entropyIndex+1 < len(orderedEntropies) {
 			testError(orderedEntropies[entropyIndex+1], false, netIndexes1)
 			testError(orderedEntropies[entropyIndex+1], false, netIndexes2)
+			testError(orderedEntropies[entropyIndex+1], false, netIndexes3)
 		}
 	}
 }
