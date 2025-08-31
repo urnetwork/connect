@@ -322,12 +322,10 @@ func WeightedSelectFunc[T any](values []T, n int, weight func(T) float32) {
 
 // puts the result at the front of values
 func WeightedSelectFuncWithEntropy[T any](values []T, n int, weight func(T) float32, entropy float32) {
-	if n <= len(values) {
-		return
-	}
+	n = min(n, len(values))
 
 	netRemaining := float32(0)
-	for j := 0; j < n; j += 1 {
+	for j := 0; j < len(values); j += 1 {
 		netRemaining += weight(values[j])
 	}
 
@@ -336,8 +334,8 @@ func WeightedSelectFuncWithEntropy[T any](values []T, n int, weight func(T) floa
 			r := mathrand.Float32()
 			rnet := r * netRemaining
 			net := entropy * netRemaining
-			j := i + (mathrand.Intn(n-i) % (n - i))
-			for c := 0; c < n-i; c += 1 {
+			j := i + (mathrand.Intn(len(values)-i) % (len(values) - i))
+			for c := 0; c < len(values)-i; c += 1 {
 				w := weight(values[j])
 				net += w
 				if rnet < net {
@@ -345,10 +343,10 @@ func WeightedSelectFuncWithEntropy[T any](values []T, n int, weight func(T) floa
 					return j
 				}
 				// shuffle iteration
-				j = i + (mathrand.Intn(n-i) % (n - i))
+				j = i + (mathrand.Intn(len(values)-i) % (len(values) - i))
 			}
 			// zero weights, use the last value
-			return n - 1
+			return j
 		}()
 		values[i], values[j] = values[j], values[i]
 	}

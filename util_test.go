@@ -188,11 +188,7 @@ func TestWeightedShuffle(t *testing.T) {
 			netIndexes2[value] += int64(index)
 		}
 
-		s := 2
-		WeightedSelectFunc(values, len(values)/s, func(i int) float32 {
-			return weights[i]
-		})
-		WeightedShuffleFunc(values[len(values)/s:], func(i int) float32 {
+		WeightedSelectFunc(values, len(values), func(i int) float32 {
 			return weights[i]
 		})
 		for index, value := range values {
@@ -275,11 +271,7 @@ func TestWeightedShuffleWithEntropy(t *testing.T) {
 				netIndexes2[value] += int64(index)
 			}
 
-			s := 2
-			WeightedSelectFuncWithEntropy(values, len(values)/s, func(i int) float32 {
-				return weights[i]
-			}, entropy)
-			WeightedShuffleFuncWithEntropy(values[len(values)/s:], func(i int) float32 {
+			WeightedSelectFuncWithEntropy(values, len(values), func(i int) float32 {
 				return weights[i]
 			}, entropy)
 			for index, value := range values {
