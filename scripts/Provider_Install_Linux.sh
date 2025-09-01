@@ -15,10 +15,13 @@ show_help ()
     echo "Usage: "
     
     if [ -n "$URNETWORK_TOOLS_MODE" ]; then
+        echo "  $me [options] start"
+        echo "  $me [options] stop"
         echo "  $me [options] update"
         echo "  $me [options] reinstall [-t=TAG] [-B]"
         echo "  $me [options] uninstall [-B]"
         echo "  $me [options] auto-update [on | off] [--interval=INTERVAL]"
+        echo "  $me [options] auto-start"
         echo "  $me [-h] [-v]"
     else
 	    echo "  $me [options] [-t=TAG] [-B]"
@@ -35,11 +38,14 @@ show_help ()
     if [ -n "$URNETWORK_TOOLS_MODE" ]; then
         echo ""
         echo "Operational modes:"
+        echo "  start                   Start URnetwork provider"
+        echo "  stop                    Stop URnetwork provider"
         echo "  update                  Upgrade URnetwork, if updates are available"
         echo "  reinstall               Reinstall URnetwork"
-	    echo "  uninstall               Uninstall URnetwork"
+        echo "  uninstall               Uninstall URnetwork"
         echo "  auto-update             Manage auto update settings.  If no argument is"
         echo "                          specified, it will print the current auto update state."
+	echo "  auto-start              Toggle auto-start of URnetwork provider on login"
         echo ""
         echo "Options for reinstall:"
         echo "  -t, --tag=TAG           Reinstall a specific version of URnetwork."
@@ -833,6 +839,39 @@ change_auto_update_prefs ()
     esac
 }
 
+toggle_auto_start ()
+{
+    if ! systemctl --user is-enabled --quiet urnetwork.service; then
+	pr_info "Enabling urnetwork.service (on login)"
+	systemctl --user enable urnetwork.service
+    else
+	pr_info "Disabling urnetwork.service"
+	systemctl --user disable urnetwork.service
+    fi
+}
+
+do_start ()
+{
+    if ! systemctl --user is-active --quiet urnetwork.service; then
+	pr_info "Starting urnetwork.service"
+	systemctl --user start urnetwork.service || { pr_err "Failed to start urnetwork.service"; exit 1; }
+    else
+	pr_info "Service urnetwork.service is already active"
+	exit 1
+    fi
+}
+
+do_stop ()
+{
+    if systemctl --user is-active --quiet urnetwork.service; then
+	pr_info "Stopping urnetwork.service"
+	systemctl --user stop urnetwork.service || { pr_err "Failed to stop urnetwork.service"; exit 1; }
+    else
+	pr_info "Service urnetwork.service is not active"
+	exit 1
+    fi
+}
+
 case "$operation" in
     install|update|reinstall)
         do_install "$@"
@@ -849,6 +888,21 @@ case "$operation" in
         exit 0
         ;;
 
+    auto-start)
+	toggle_auto_start
+	exit 0
+	;;
+
+    start)
+	do_start
+	exit 0
+	;;
+
+    stop)
+	do_stop
+	exit 0
+	;;
+    
     *)
         pr_err "Invalid operation '%s'" "$operation"
         exit 1
