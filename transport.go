@@ -51,6 +51,17 @@ import (
 
 // When packet translation is set, the upgrade mode must be h3 only
 
+// 1: initial version
+// 2: latency and speed test support
+const TransportVersion = 2
+
+type TransportControl = byte
+
+const (
+	TransportControlSpeedStart TransportControl = 1
+	TransportControlSpeedStop  TransportControl = 2
+)
+
 type TransportMode string
 
 // in order of increasing preference
@@ -371,6 +382,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				header.Add("Authorization", fmt.Sprintf("Bearer %s", self.auth.ByJwt))
 				header.Add("X-UR-AppVersion", self.auth.AppVersion)
 				header.Add("X-UR-InstanceId", self.auth.InstanceId.String())
+				header.Add("X-UR-TransportVersion", fmt.Sprintf("%d", TransportVersion))
 			}
 
 			ws, _, err := self.clientStrategy.WsDialContext(self.ctx, self.platformUrl, header)
@@ -451,6 +463,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 			send := make(chan []byte, self.settings.TransportBufferSize)
 			receive := make(chan []byte, self.settings.TransportBufferSize)
+			controlSend := make(chan []byte, self.settings.TransportBufferSize)
 
 			// the platform can route any destination,
 			// since every client has a platform transport
@@ -505,34 +518,84 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			go func() {
 				defer handleCancel()
 
+				speedTest := false
+
+				write := func(message []byte) error {
+					ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
+					err := ws.WriteMessage(websocket.BinaryMessage, message)
+					MessagePoolReturn(message)
+					if err != nil {
+						// note that for websocket a dealine timeout cannot be recovered
+						glog.Infof("[ts]%s-> error = %s\n", clientId, err)
+						return err
+					}
+					glog.V(2).Infof("[ts]%s->\n", clientId)
+
+					writeCounter.Add(1)
+					return nil
+				}
+
 				for {
-					select {
-					case <-handleCtx.Done():
-						return
-					case message, ok := <-send:
-						if !ok {
+					if speedTest {
+						select {
+						case <-handleCtx.Done():
 							return
+						case <-WakeupAfter(self.settings.PingTimeout, self.settings.PingTimeout):
+							ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
+							if err := ws.WriteMessage(websocket.BinaryMessage, make([]byte, 0)); err != nil {
+								// note that for websocket a dealine timeout cannot be recovered
+								return
+							}
+						case message, ok := <-controlSend:
+							if !ok {
+								return
+							}
+							if len(message) == 5 {
+								switch message[0] {
+								case TransportControlSpeedStop:
+									speedTest = false
+								}
+							}
+							if write(message) != nil {
+								return
+							}
 						}
-						// if !MessagePoolCheckShared(message) {
-						// 	panic("[t]shared should be set")
-						// }
-
-						ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
-						err := ws.WriteMessage(websocket.BinaryMessage, message)
-						MessagePoolReturn(message)
-						if err != nil {
-							// note that for websocket a dealine timeout cannot be recovered
-							glog.Infof("[ts]%s-> error = %s\n", clientId, err)
+					} else {
+						select {
+						case <-handleCtx.Done():
 							return
-						}
-						glog.V(2).Infof("[ts]%s->\n", clientId)
+						case message, ok := <-send:
+							if !ok {
+								return
+							}
+							// if !MessagePoolCheckShared(message) {
+							// 	panic("[t]shared should be set")
+							// }
 
-						writeCounter.Add(1)
-					case <-WakeupAfter(self.settings.PingTimeout, self.settings.PingTimeout):
-						ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
-						if err := ws.WriteMessage(websocket.BinaryMessage, make([]byte, 0)); err != nil {
-							// note that for websocket a dealine timeout cannot be recovered
-							return
+							if len(message) <= 16 {
+								glog.Infof("[ts]send message must be >16 bytes (%s)\n", len(message))
+							} else if write(message) != nil {
+								return
+							}
+						case <-WakeupAfter(self.settings.PingTimeout, self.settings.PingTimeout):
+							ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
+							if err := ws.WriteMessage(websocket.BinaryMessage, make([]byte, 0)); err != nil {
+								// note that for websocket a dealine timeout cannot be recovered
+								return
+							}
+						case message, ok := <-controlSend:
+							if !ok {
+								return
+							}
+							if len(message) == 5 {
+								switch message[0] {
+								case TransportControlSpeedStart:
+									speedTest = true
+								}
+							}
+							if write(message) != nil {
+								return
+							}
 						}
 					}
 				}
@@ -543,6 +606,8 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					handleCancel()
 					close(receive)
 				}()
+
+				speedTest := false
 
 				for {
 					select {
@@ -569,10 +634,43 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 						readCounter.Add(1)
 
-						if 0 == len(message) {
-							// ping
-							glog.V(2).Infof("[tr]ping %s<-\n", clientId)
-							MessagePoolReturn(message)
+						if len(message) <= 16 {
+							if len(message) == 0 {
+								// ping
+								glog.V(2).Infof("[tr]ping %s<-\n", clientId)
+								MessagePoolReturn(message)
+							} else if len(message) == 5 {
+								switch message[0] {
+								case TransportControlSpeedStart:
+									speedTest = true
+									// echo
+									select {
+									case <-self.ctx.Done():
+									case controlSend <- message:
+									}
+								case TransportControlSpeedStop:
+									speedTest = false
+									// echo
+									select {
+									case <-self.ctx.Done():
+									case controlSend <- message:
+									}
+								}
+							} else if len(message) == 16 {
+								// latency test echo
+								select {
+								case <-self.ctx.Done():
+								case controlSend <- message:
+								}
+							}
+							continue
+						}
+						if speedTest {
+							// speed test echo
+							select {
+							case <-self.ctx.Done():
+							case controlSend <- message:
+							}
 							continue
 						}
 
