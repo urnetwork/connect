@@ -2648,9 +2648,6 @@ func (self *ReceiveSequence) Run() {
 					MessagePoolShareReadOnly(transferFrameBytes),
 					self.receiveBufferSettings.WriteTimeout,
 				)
-				if err != nil {
-					MessagePoolReturn(transferFrameBytes)
-				}
 				return err
 			}
 			if glog.V(2) {
