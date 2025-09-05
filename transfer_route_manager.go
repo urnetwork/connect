@@ -586,12 +586,18 @@ func (self *MultiRouteSelector) WriteDetailed(ctx context.Context, transferFrame
 
 		// non-blocking priority
 		for _, route := range activeRoutes {
-			select {
-			case route <- transferFrameBytes:
-				glog.V(2).Infof("[mrw]nb %s->%s s(%s)\n", self.clientTag, self.destination.DestinationId, self.destination.StreamId)
-				self.updateSendStats(route, 1, ByteCount(len(transferFrameBytes)))
+			send := func() bool {
+				select {
+				case route <- transferFrameBytes:
+					glog.V(2).Infof("[mrw]nb %s->%s s(%s)\n", self.clientTag, self.destination.DestinationId, self.destination.StreamId)
+					self.updateSendStats(route, 1, ByteCount(len(transferFrameBytes)))
+					return true
+				default:
+					return false
+				}
+			}
+			if success, _ := ExpectErrorWithReturn(send, false); success {
 				return true, nil
-			default:
 			}
 		}
 
@@ -655,24 +661,32 @@ func (self *MultiRouteSelector) WriteDetailed(ctx context.Context, transferFrame
 			}
 		}
 
-		chosenIndex, _, _ := reflect.Select(selectCases)
-		glog.V(2).Infof("[mrw]b %s->%s s(%s)\n", self.clientTag, self.destination.DestinationId, self.destination.SourceId)
+		send := func() int {
+			chosenIndex, _, _ := reflect.Select(selectCases)
+			return chosenIndex
+		}
+		if chosenIndex, _ := ExpectErrorWithReturn(send, -1); 0 <= chosenIndex {
+			glog.V(2).Infof("[mrw]b %s->%s s(%s)\n", self.clientTag, self.destination.DestinationId, self.destination.SourceId)
 
-		switch chosenIndex {
-		case contextDoneIndex:
-			return false, errors.New("Context done")
-		case doneIndex:
-			return false, errors.New("Done")
-		case transportUpdateIndex:
-			// new routes, try again
-		case timeoutIndex:
-			return false, nil
-		default:
-			// a route
-			routeIndex := chosenIndex - routeStartIndex
-			route := activeRoutes[routeIndex]
-			self.updateSendStats(route, 1, ByteCount(len(transferFrameBytes)))
-			return true, nil
+			switch chosenIndex {
+			case contextDoneIndex:
+				// MessagePoolReturn(transferFrameBytes)
+				return false, errors.New("Context done")
+			case doneIndex:
+				// MessagePoolReturn(transferFrameBytes)
+				return false, errors.New("Done")
+			case transportUpdateIndex:
+				// new routes, try again
+			case timeoutIndex:
+				// MessagePoolReturn(transferFrameBytes)
+				return false, nil
+			default:
+				// a route
+				routeIndex := chosenIndex - routeStartIndex
+				route := activeRoutes[routeIndex]
+				self.updateSendStats(route, 1, ByteCount(len(transferFrameBytes)))
+				return true, nil
+			}
 		}
 	}
 }

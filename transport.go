@@ -483,8 +483,26 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				self.routeManager.RemoveTransport(sendTransport)
 				self.routeManager.RemoveTransport(receiveTransport)
 
-				// note `send` is not closed. This channel is left open.
-				// it used to be closed after a delay, but it is not needed to close it.
+				close(send)
+				close(receive)
+				close(controlSend)
+
+				drain := func(c chan []byte) {
+					for {
+						select {
+						case message, ok := <-c:
+							if !ok {
+								return
+							}
+							MessagePoolReturn(message)
+						default:
+							return
+						}
+					}
+				}
+				drain(send)
+				drain(receive)
+				drain(controlSend)
 			}()
 
 			go func() {
@@ -574,6 +592,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 							if len(message) <= 16 {
 								glog.Infof("[ts]send message must be >16 bytes (%s)\n", len(message))
+								MessagePoolReturn(message)
 							} else if write(message) != nil {
 								return
 							}
@@ -602,10 +621,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			}()
 
 			go func() {
-				defer func() {
-					handleCancel()
-					close(receive)
-				}()
+				defer handleCancel()
 
 				speedTest := false
 
@@ -646,6 +662,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 									// echo
 									select {
 									case <-self.ctx.Done():
+										MessagePoolReturn(message)
 									case controlSend <- message:
 									}
 								case TransportControlSpeedStop:
@@ -653,15 +670,21 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 									// echo
 									select {
 									case <-self.ctx.Done():
+										MessagePoolReturn(message)
 									case controlSend <- message:
 									}
+								default:
+									MessagePoolReturn(message)
 								}
 							} else if len(message) == 16 {
 								// latency test echo
 								select {
 								case <-self.ctx.Done():
+									MessagePoolReturn(message)
 								case controlSend <- message:
 								}
+							} else {
+								MessagePoolReturn(message)
 							}
 							continue
 						}
@@ -669,6 +692,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							// speed test echo
 							select {
 							case <-self.ctx.Done():
+								MessagePoolReturn(message)
 							case controlSend <- message:
 							}
 							continue

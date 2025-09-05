@@ -65,6 +65,28 @@ func HandleError(do func(), handlers ...any) (r any) {
 	return
 }
 
+func ExpectErrorWithReturn[R any](do func() R, defaultValue R, handlers ...any) (returnValue R, r any) {
+	defer func() {
+		if r = recover(); r != nil {
+			err, ok := r.(error)
+			if !ok {
+				err = fmt.Errorf("%s", r)
+			}
+			for _, handler := range handlers {
+				switch v := handler.(type) {
+				case func():
+					v()
+				case func(error):
+					v(err)
+				}
+			}
+		}
+	}()
+	returnValue = defaultValue
+	returnValue = do()
+	return
+}
+
 func ErrorJson(err any, stack []byte) string {
 	stackLines := []string{}
 	for _, line := range strings.Split(string(stack), "\n") {
