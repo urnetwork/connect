@@ -465,6 +465,46 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			receive := make(chan []byte, self.settings.TransportBufferSize)
 			controlSend := make(chan []byte, self.settings.TransportBufferSize)
 
+			drain := func(c chan []byte) {
+				for {
+					select {
+					case message, ok := <-c:
+						if !ok {
+							return
+						}
+						MessagePoolReturn(message)
+					default:
+						return
+					}
+				}
+			}
+
+			// use zero buffer here so that the transport can stop accepting and not drop messages
+			exportedSend := make(chan []byte)
+			go func() {
+				defer func() {
+					handleCancel()
+					close(send)
+					drain(send)
+				}()
+				for {
+					select {
+					case <-handleCtx.Done():
+						return
+					case message, ok := <-exportedSend:
+						if !ok {
+							return
+						}
+						select {
+						case <-handleCtx.Done():
+							MessagePoolReturn(message)
+							return
+						case send <- message:
+						}
+					}
+				}
+			}()
+
 			// the platform can route any destination,
 			// since every client has a platform transport
 			var sendTransport Transport
@@ -476,33 +516,12 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				receiveTransport = NewReceiveGatewayTransport()
 			}
 
-			self.routeManager.UpdateTransport(sendTransport, []Route{send})
+			self.routeManager.UpdateTransport(sendTransport, []Route{exportedSend})
 			self.routeManager.UpdateTransport(receiveTransport, []Route{receive})
 
 			defer func() {
 				self.routeManager.RemoveTransport(sendTransport)
 				self.routeManager.RemoveTransport(receiveTransport)
-
-				close(send)
-				close(receive)
-				close(controlSend)
-
-				drain := func(c chan []byte) {
-					for {
-						select {
-						case message, ok := <-c:
-							if !ok {
-								return
-							}
-							MessagePoolReturn(message)
-						default:
-							return
-						}
-					}
-				}
-				drain(send)
-				drain(receive)
-				drain(controlSend)
 			}()
 
 			go func() {
@@ -621,7 +640,14 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			}()
 
 			go func() {
-				defer handleCancel()
+				defer func() {
+					handleCancel()
+					close(receive)
+					close(controlSend)
+
+					drain(receive)
+					drain(controlSend)
+				}()
 
 				speedTest := false
 

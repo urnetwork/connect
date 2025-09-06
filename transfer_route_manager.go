@@ -586,18 +586,12 @@ func (self *MultiRouteSelector) WriteDetailed(ctx context.Context, transferFrame
 
 		// non-blocking priority
 		for _, route := range activeRoutes {
-			send := func() bool {
-				select {
-				case route <- transferFrameBytes:
-					glog.V(2).Infof("[mrw]nb %s->%s s(%s)\n", self.clientTag, self.destination.DestinationId, self.destination.StreamId)
-					self.updateSendStats(route, 1, ByteCount(len(transferFrameBytes)))
-					return true
-				default:
-					return false
-				}
-			}
-			if success, _ := ExpectErrorWithReturn(send, false); success {
+			select {
+			case route <- transferFrameBytes:
+				glog.V(2).Infof("[mrw]nb %s->%s s(%s)\n", self.clientTag, self.destination.DestinationId, self.destination.StreamId)
+				self.updateSendStats(route, 1, ByteCount(len(transferFrameBytes)))
 				return true, nil
+			default:
 			}
 		}
 
@@ -661,11 +655,7 @@ func (self *MultiRouteSelector) WriteDetailed(ctx context.Context, transferFrame
 			}
 		}
 
-		send := func() int {
-			chosenIndex, _, _ := reflect.Select(selectCases)
-			return chosenIndex
-		}
-		if chosenIndex, _ := ExpectErrorWithReturn(send, -1); 0 <= chosenIndex {
+		if chosenIndex, _, _ := reflect.Select(selectCases); 0 <= chosenIndex {
 			glog.V(2).Infof("[mrw]b %s->%s s(%s)\n", self.clientTag, self.destination.DestinationId, self.destination.SourceId)
 
 			switch chosenIndex {
