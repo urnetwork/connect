@@ -55,6 +55,10 @@ import (
 // 2: latency and speed test support
 const TransportVersion = 2
 
+// turn this on to be extra careful about returning all messages
+// note we don't run this because it's most efficient to let the gc handle some infrequent orphaned messages
+const DebugCloseSend = false
+
 type TransportControl = byte
 
 const (
@@ -479,31 +483,39 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				}
 			}
 
-			// use zero buffer here so that the transport can stop accepting and not drop messages
-			exportedSend := make(chan []byte)
-			go func() {
-				defer func() {
-					handleCancel()
-					close(send)
-					drain(send)
-				}()
-				for {
-					select {
-					case <-handleCtx.Done():
-						return
-					case message, ok := <-exportedSend:
-						if !ok {
-							return
-						}
+			var exportedSend chan []byte
+			// note: this should be false in production
+			//       it seems better to potentially leak messages than to
+			//       have an extra inefficiency on the packet path
+			if DebugCloseSend {
+				// use zero buffer here so that the transport can stop accepting and not drop messages
+				exportedSend = make(chan []byte)
+				go func() {
+					defer func() {
+						handleCancel()
+						close(send)
+						drain(send)
+					}()
+					for {
 						select {
 						case <-handleCtx.Done():
-							MessagePoolReturn(message)
 							return
-						case send <- message:
+						case message, ok := <-exportedSend:
+							if !ok {
+								return
+							}
+							select {
+							case <-handleCtx.Done():
+								MessagePoolReturn(message)
+								return
+							case send <- message:
+							}
 						}
 					}
-				}
-			}()
+				}()
+			} else {
+				exportedSend = send
+			}
 
 			// the platform can route any destination,
 			// since every client has a platform transport

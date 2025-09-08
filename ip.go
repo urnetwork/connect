@@ -606,6 +606,7 @@ type UdpSequence struct {
 	receiveCallback   ReceivePacketFunction
 	udpBufferSettings *UdpBufferSettings
 
+	sendMutex sync.Mutex
 	sendItems chan *UdpSendItem
 
 	idleCondition *IdleCondition
@@ -644,6 +645,15 @@ func NewUdpSequence(ctx context.Context, receiveCallback ReceivePacketFunction,
 }
 
 func (self *UdpSequence) send(sendItem *UdpSendItem, timeout time.Duration) (bool, error) {
+	self.sendMutex.Lock()
+	defer self.sendMutex.Unlock()
+
+	select {
+	case <-self.ctx.Done():
+		return false, errors.New("Done.")
+	default:
+	}
+
 	if !self.idleCondition.UpdateOpen() {
 		return false, nil
 	}
@@ -684,7 +694,30 @@ func (self *UdpSequence) send(sendItem *UdpSendItem, timeout time.Duration) (boo
 }
 
 func (self *UdpSequence) Run() {
-	defer self.cancel()
+	defer func() {
+		self.cancel()
+
+		func() {
+			self.sendMutex.Lock()
+			defer self.sendMutex.Unlock()
+			close(self.sendItems)
+		}()
+
+		// drain the channel
+		func() {
+			for {
+				select {
+				case sendItem, ok := <-self.sendItems:
+					if !ok {
+						return
+					}
+					MessagePoolReturn(sendItem.ipPacket)
+				default:
+					return
+				}
+			}
+		}()
+	}()
 
 	receive := func(packet []byte) {
 		self.receiveCallback(self.source, self.provideMode, self.IpPath(), packet)
@@ -856,7 +889,10 @@ func (self *UdpSequence) Run() {
 		select {
 		case <-self.ctx.Done():
 			return
-		case sendItem := <-self.sendItems:
+		case sendItem, ok := <-self.sendItems:
+			if !ok {
+				return
+			}
 			payload := sendItem.udp.Payload
 
 			if 0 < len(payload) {
@@ -875,7 +911,16 @@ func (self *UdpSequence) Run() {
 				MessagePoolReturn(sendItem.ipPacket)
 			}
 		case <-time.After(self.udpBufferSettings.IdleTimeout):
-			if self.idleCondition.Close(checkpointId) {
+			done := false
+			func() {
+				self.sendMutex.Lock()
+				defer self.sendMutex.Unlock()
+				if self.idleCondition.Close(checkpointId) {
+					// close the sequence
+					done = true
+				}
+			}()
+			if done {
 				// close the sequence
 				return
 			}
@@ -1248,6 +1293,7 @@ type TcpSequence struct {
 
 	tcpBufferSettings *TcpBufferSettings
 
+	sendMutex sync.Mutex
 	sendItems chan *TcpSendItem
 
 	idleCondition *IdleCondition
@@ -1293,6 +1339,15 @@ func NewTcpSequence(ctx context.Context, receiveCallback ReceivePacketFunction,
 }
 
 func (self *TcpSequence) send(sendItem *TcpSendItem, timeout time.Duration) (bool, error) {
+	self.sendMutex.Lock()
+	defer self.sendMutex.Unlock()
+
+	select {
+	case <-self.ctx.Done():
+		return false, errors.New("Done.")
+	default:
+	}
+
 	if !self.idleCondition.UpdateOpen() {
 		return false, nil
 	}
@@ -1333,7 +1388,30 @@ func (self *TcpSequence) send(sendItem *TcpSendItem, timeout time.Duration) (boo
 }
 
 func (self *TcpSequence) Run() {
-	defer self.cancel()
+	defer func() {
+		self.cancel()
+
+		func() {
+			self.sendMutex.Lock()
+			defer self.sendMutex.Unlock()
+			close(self.sendItems)
+		}()
+
+		// drain the channel
+		func() {
+			for {
+				select {
+				case sendItem, ok := <-self.sendItems:
+					if !ok {
+						return
+					}
+					MessagePoolReturn(sendItem.ipPacket)
+				default:
+					return
+				}
+			}
+		}()
+	}()
 
 	// note receive is called from multiple go routines
 	// tcp packets with ack may be reordered due to being written in parallel
@@ -1905,7 +1983,16 @@ func (self *TcpSequence) Run() {
 			}
 
 		case <-time.After(self.tcpBufferSettings.IdleTimeout):
-			if self.idleCondition.Close(checkpointId) {
+			done := false
+			func() {
+				self.sendMutex.Lock()
+				defer self.sendMutex.Unlock()
+				if self.idleCondition.Close(checkpointId) {
+					// close the sequence
+					done = true
+				}
+			}()
+			if done {
 				// close the sequence
 				glog.V(2).Infof("[r%d]timeout\n", sendIter)
 				return
