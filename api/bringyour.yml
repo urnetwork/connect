@@ -1422,6 +1422,26 @@ paths:
               schema:
                 $ref: "#/components/schemas/TransferStatsResult"
 
+  /solana/payment-intent:
+    post:
+      description: |
+        When paying for a subscription with Solana, we track the order through this intent.
+      operationId: Solana Payment Intent
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SolanaPaymentIntentArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SolanaPaymentIntentResult"
+
 components:
   securitySchemes:
     BearerAuth:
@@ -3337,6 +3357,23 @@ components:
           $ref: "#/components/schemas/ReliabilityWindow"
         error:
           type: object
+          properties:
+            message:
+              type: string
+
+    SolanaPaymentIntentArgs:
+      type: object
+      properties:
+        reference:
+          description: A unique reference string to identify the payment intent added to the Solana transaction
+          type: string
+
+    SolanaPaymentIntentResult:
+      type: object
+      properties:
+        error:
+          type: object
+          nullable: true
           properties:
             message:
               type: string
