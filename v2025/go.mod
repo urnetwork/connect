@@ -1,4 +1,4 @@
-module github.com/urnetwork/connect
+module github.com/urnetwork/connect/v2025
 
 go 1.24.4
 
@@ -29,9 +29,4 @@ require (
 	golang.org/x/sys v0.34.0 // indirect
 	golang.org/x/text v0.27.0 // indirect
 	golang.org/x/tools v0.34.0 // indirect
-
 )
-
-retract [v0.0.1, v1.0.0]
-
-retract v0.2.0 // retract self
