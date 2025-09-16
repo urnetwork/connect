@@ -162,10 +162,10 @@ opt_requires_arg ()
 
 get_version_from_api_response () 
 {    
-    if command -v python3 > /dev/null; then
-        latest_version="$(echo "$1" | tr -d '\000-\037' | python3 -c 'import sys, json; data = json.load(sys.stdin); print(data["tag_name"])')"
-    elif command -v jq > /dev/null; then
+    if command -v jq > /dev/null; then
         latest_version="$(echo "$1" | tr -d '\000-\037' | jq -r '.tag_name')"
+    elif command -v python3 > /dev/null; then
+        latest_version="$(echo "$1" | tr -d '\000-\037' | python3 -c 'import sys, json; data = json.load(sys.stdin); print(data["tag_name"])')"
     else
         pr_err "Neither python3 nor jq is available"
         exit 1
@@ -176,11 +176,11 @@ get_version_from_api_response ()
 
 # shellcheck disable=SC2317
 get_release_date_from_api_response () 
-{    
-    if command -v python3 > /dev/null; then
+{   
+    if command -v jq > /dev/null; then
+        date="$(echo "$1" | tr -d '\000-\037' | jq -r '.published_at | fromdateiso8601')" 
+    elif command -v python3 > /dev/null; then
         date="$(echo "$1" | tr -d '\000-\037' | python3 -c 'import sys, json; from datetime import datetime, timezone; data = json.load(sys.stdin); print(int(datetime.fromisoformat(data["published_at"]).replace(tzinfo=timezone.utc).timestamp() * 1000))')"
-    elif command -v jq > /dev/null; then
-        date="$(echo "$1" | tr -d '\000-\037' | jq -r '.published_at | fromdateiso8601')"
     else
         pr_err "Neither python3 nor jq is available"
         exit 1
@@ -192,10 +192,10 @@ get_release_date_from_api_response ()
 # shellcheck disable=SC2317
 get_current_date () 
 {
-    if command -v python3 > /dev/null; then
-        date="$(python3 -c 'from datetime import datetime, timezone; now = datetime.now(timezone.utc); print(int(now.timestamp() * 1000));')"
-    elif command -v jq > /dev/null; then
+    if command -v jq > /dev/null; then
         date="$(jq -n 'now * 1000 | floor')"
+    elif command -v python3 > /dev/null; then
+        date="$(python3 -c 'from datetime import datetime, timezone; now = datetime.now(timezone.utc); print(int(now.timestamp() * 1000));')"
     else
         pr_err "Neither python3 nor jq is available"
         exit 1
@@ -518,9 +518,7 @@ do_install ()
 
     dl_url=""
 
-    if command -v python3 > /dev/null; then
-        dl_url="$(echo "$release" | tr -d '\000-\037' | python3 -c 'import sys, json; data = json.load(sys.stdin); assets = data["assets"]; asset = next(a for a in assets if a["name"].startswith("urnetwork-provider")); print(asset["browser_download_url"] if asset else "")')"
-    elif command -v jq > /dev/null; then
+    if command -v jq > /dev/null; then
         asset="$(echo "$release" | tr -d '\000-\037' | jq -r '.assets[] | select(.name | startswith("urnetwork-provider-"))')"
 
         if [ -z "$asset" ]; then
@@ -529,6 +527,8 @@ do_install ()
         fi
 
         dl_url="$(echo "$asset" | jq -r '.browser_download_url')"
+    elif command -v python3 > /dev/null; then
+        dl_url="$(echo "$release" | tr -d '\000-\037' | python3 -c 'import sys, json; data = json.load(sys.stdin); assets = data["assets"]; asset = next(a for a in assets if a["name"].startswith("urnetwork-provider")); print(asset["browser_download_url"] if asset else "")')"
     else
         pr_err "Neither python3 nor jq is available"
         exit 1
