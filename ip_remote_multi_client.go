@@ -1547,7 +1547,7 @@ func (self *multiClientWindow) resize() {
 			if stats, err := client.WindowStats(); err == nil {
 				clients = append(clients, client)
 				maxSourceCount = max(maxSourceCount, stats.sourceCount)
-				weights[client] = stats.normalizedByteCountPerSecond
+				weights[client] = float32(stats.EffectiveByteCountPerSecond())
 				durations[client] = stats.duration
 			} else {
 				glog.Infof("[multi]remove client = %s\n", err)
@@ -1913,7 +1913,7 @@ func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 		if stats, err := client.WindowStats(); err == nil {
 			clients = append(clients, client)
 			// durations[client] = stats.duration
-			weights[client] = stats.normalizedByteCountPerSecond
+			weights[client] = float32(stats.ExpectedByteCountPerSecond())
 		}
 	}
 
@@ -2073,28 +2073,41 @@ func newMultiClientEventBucket() *multiClientEventBucket {
 }
 
 type clientWindowStats struct {
-	sourceCount                  int
-	sendAckCount                 int
-	sendAckByteCount             ByteCount
-	sendNackCount                int
-	sendNackByteCount            ByteCount
-	receiveAckCount              int
-	receiveAckByteCount          ByteCount
-	ackByteCount                 ByteCount
-	duration                     time.Duration
-	sendAckDuration              time.Duration
-	normalizedByteCountPerSecond float32
+	sourceCount                 int
+	sendAckCount                int
+	sendAckByteCount            ByteCount
+	sendNackCount               int
+	sendNackByteCount           ByteCount
+	receiveAckCount             int
+	receiveAckByteCount         ByteCount
+	ackByteCount                ByteCount
+	duration                    time.Duration
+	sendAckDuration             time.Duration
+	estimatedByteCountPerSecond ByteCount
 
 	// internal
 	bucketCount int
 }
 
-func (self *clientWindowStats) ByteCountPerSecond() ByteCount {
+func (self *clientWindowStats) EffectiveByteCountPerSecond() ByteCount {
 	millis := int64(self.duration / time.Millisecond)
 	if millis <= 0 {
 		return ByteCount(0)
 	}
-	return ByteCount((1000 * int64(self.sendAckByteCount /*-self.sendNackByteCount*/ +self.receiveAckByteCount+millis/2)) / millis)
+	netByteCount := int64(self.sendAckByteCount + self.receiveAckByteCount)
+	return ByteCount((1000*netByteCount + millis/2) / millis)
+}
+
+func (self *clientWindowStats) ExpectedByteCountPerSecond() ByteCount {
+	millis := int64(self.duration / time.Millisecond)
+	if millis <= 0 {
+		return ByteCount(0)
+	}
+	netByteCount := int64(self.sendAckByteCount + self.sendNackByteCount + self.receiveAckByteCount)
+	return max(
+		self.estimatedByteCountPerSecond-ByteCount((1000*netByteCount+millis/2)/millis),
+		0,
+	)
 }
 
 type multiClientChannel struct {
@@ -2638,7 +2651,10 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 	}
 	slices.Sort(netSourceCounts)
 	maxSourceCount := 0
-	if selectionIndex := int(math.Ceil(self.settings.StatsSourceCountSelection * float64(len(netSourceCounts)-1))); selectionIndex < len(netSourceCounts) {
+	selectionIndex := int(math.Ceil(
+		self.settings.StatsSourceCountSelection * float64(len(netSourceCounts)-1),
+	))
+	if selectionIndex < len(netSourceCounts) {
 		maxSourceCount = netSourceCounts[selectionIndex]
 	}
 	if glog.V(2) {
@@ -2657,17 +2673,19 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 			}
 		}
 	}
+
 	stats := &clientWindowStats{
-		sourceCount:         maxSourceCount,
-		sendAckCount:        self.packetStats.sendAckCount,
-		sendNackCount:       self.packetStats.sendNackCount,
-		sendAckByteCount:    self.packetStats.sendAckByteCount,
-		sendNackByteCount:   self.packetStats.sendNackByteCount,
-		receiveAckCount:     self.packetStats.receiveAckCount,
-		receiveAckByteCount: self.packetStats.receiveAckByteCount,
-		duration:            duration,
-		sendAckDuration:     sendAckDuration,
-		bucketCount:         len(self.eventBuckets),
+		sourceCount:                 maxSourceCount,
+		sendAckCount:                self.packetStats.sendAckCount,
+		sendNackCount:               self.packetStats.sendNackCount,
+		sendAckByteCount:            self.packetStats.sendAckByteCount,
+		sendNackByteCount:           self.packetStats.sendNackByteCount,
+		receiveAckCount:             self.packetStats.receiveAckCount,
+		receiveAckByteCount:         self.packetStats.receiveAckByteCount,
+		duration:                    duration,
+		sendAckDuration:             sendAckDuration,
+		bucketCount:                 len(self.eventBuckets),
+		estimatedByteCountPerSecond: self.EstimatedByteCountPerSecond(),
 	}
 	err := self.endErr
 	if err == nil {
@@ -2679,21 +2697,6 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 		default:
 		}
 	}
-
-	normalizedByteCountPerSecond := float32(stats.ByteCountPerSecond())
-	if 0 <= normalizedByteCountPerSecond {
-		if stats.duration < self.settings.StatsWindowGraceperiod {
-			// use the estimate
-			normalizedByteCountPerSecond = float32(self.EstimatedByteCountPerSecond())
-		} else if 0 == normalizedByteCountPerSecond {
-			// not used yet, use the estimate
-			normalizedByteCountPerSecond = float32(self.EstimatedByteCountPerSecond())
-		}
-		// else use as-is
-	} else {
-		normalizedByteCountPerSecond = 0
-	}
-	stats.normalizedByteCountPerSecond = normalizedByteCountPerSecond
 
 	return stats, err
 }
