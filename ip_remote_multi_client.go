@@ -112,8 +112,10 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		BlackholeTimeout:       30 * time.Second,
 		WindowResizeTimeout:    15 * time.Second,
 		StatsWindowGraceperiod: 30 * time.Second,
-		StatsWindowEntropy:     0.25,
-		WindowExpandTimeout:    15 * time.Second,
+		// when boost is used, we don't need entropy
+		StatsWindowEntropy:             0.0,
+		StatsWindowBoostBytesPerSecond: 100 * 1024,
+		WindowExpandTimeout:            15 * time.Second,
 		// WindowExpandBlockTimeout: 5 * time.Second,
 		WindowExpandBlockCount: 8,
 		// wait this time before enumerating potential clients again
@@ -124,7 +126,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		WindowExpandMaxOvershotScale: 4.0,
 		WindowCollapseBeforeExpand:   false,
 		WindowRevisitTimeout:         2 * time.Minute,
-		StatsWindowDuration:          10 * time.Second,
+		StatsWindowDuration:          60 * time.Second,
 		StatsWindowBucketDuration:    1 * time.Second,
 		StatsSampleWeightsCount:      8,
 		StatsSourceCountSelection:    0.95,
@@ -138,8 +140,6 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		MultiRaceClientEarlyCompleteFraction: 0.25,
 		// TODO on platforms with more memory, increase this
 		MultiRaceClientCount: 4,
-
-		BoostBytesPerSecond: 100 * 1024,
 
 		ProtocolVersion: DefaultProtocolVersion,
 
@@ -156,17 +156,18 @@ type MultiClientSettings struct {
 	// ClientWriteTimeout time.Duration
 	// SendTimeout time.Duration
 	// WriteTimeout time.Duration
-	SendRetryTimeout       time.Duration
-	PingWriteTimeout       time.Duration
-	CPingWriteTimeout      time.Duration
-	PingTimeout            time.Duration
-	CPingTimeout           time.Duration
-	AckTimeout             time.Duration
-	BlackholeTimeout       time.Duration
-	WindowResizeTimeout    time.Duration
-	StatsWindowGraceperiod time.Duration
-	StatsWindowEntropy     float32
-	WindowExpandTimeout    time.Duration
+	SendRetryTimeout               time.Duration
+	PingWriteTimeout               time.Duration
+	CPingWriteTimeout              time.Duration
+	PingTimeout                    time.Duration
+	CPingTimeout                   time.Duration
+	AckTimeout                     time.Duration
+	BlackholeTimeout               time.Duration
+	WindowResizeTimeout            time.Duration
+	StatsWindowGraceperiod         time.Duration
+	StatsWindowEntropy             float32
+	StatsWindowBoostBytesPerSecond ByteCount
+	WindowExpandTimeout            time.Duration
 	// WindowExpandBlockTimeout     time.Duration
 	WindowExpandBlockCount       int
 	WindowEnumerateEmptyTimeout  time.Duration
@@ -194,8 +195,6 @@ type MultiClientSettings struct {
 	MultiRacePacketMaxCount              int
 	MultiRaceClientEarlyCompleteFraction float32
 	MultiRaceClientCount                 int
-
-	BoostBytesPerSecond ByteCount
 
 	ProtocolVersion int
 
@@ -1917,7 +1916,7 @@ func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 		if stats, err := client.WindowStats(); err == nil {
 			clients = append(clients, client)
 			// durations[client] = stats.duration
-			boost := mathrand.Int63n(self.settings.BoostBytesPerSecond)
+			boost := mathrand.Int63n(self.settings.StatsWindowBoostBytesPerSecond)
 			weights[client] = float32(boost + stats.ExpectedByteCountPerSecond())
 		}
 	}
@@ -2109,6 +2108,7 @@ func (self *clientWindowStats) ExpectedByteCountPerSecond() ByteCount {
 		return ByteCount(0)
 	}
 	netByteCount := int64(self.sendAckByteCount + self.sendNackByteCount + self.receiveAckByteCount)
+	glog.V(2).Infof("[multi]expected use estimated = %dbps (net = %db/%dms)\n", self.estimatedByteCountPerSecond, netByteCount, millis)
 	return max(
 		self.estimatedByteCountPerSecond-ByteCount((1000*netByteCount+millis/2)/millis),
 		0,
@@ -2135,10 +2135,11 @@ type multiClientChannel struct {
 	stateLock    sync.Mutex
 	eventBuckets []*multiClientEventBucket
 	// destination -> source -> count
-	ip4DestinationSourceCount map[Ip4Path]map[Ip4Path]int
-	ip6DestinationSourceCount map[Ip6Path]map[Ip6Path]int
-	packetStats               *clientWindowStats
-	endErr                    error
+	ip4DestinationSourceCount      map[Ip4Path]map[Ip4Path]int
+	ip6DestinationSourceCount      map[Ip6Path]map[Ip6Path]int
+	packetStats                    *clientWindowStats
+	endErr                         error
+	maxEffectiveByteCountPerSecond ByteCount
 
 	// affinityCount int
 	// affinityTime  time.Time
@@ -2191,12 +2192,13 @@ func newMultiClientChannel(
 		ingressSecurityPolicy:       ingressSecurityPolicy,
 		settings:                    settings,
 		// sourceFilter: sourceFilter,
-		client:                    client,
-		eventBuckets:              []*multiClientEventBucket{},
-		ip4DestinationSourceCount: map[Ip4Path]map[Ip4Path]int{},
-		ip6DestinationSourceCount: map[Ip6Path]map[Ip6Path]int{},
-		packetStats:               &clientWindowStats{},
-		endErr:                    nil,
+		client:                         client,
+		eventBuckets:                   []*multiClientEventBucket{},
+		ip4DestinationSourceCount:      map[Ip4Path]map[Ip4Path]int{},
+		ip6DestinationSourceCount:      map[Ip6Path]map[Ip6Path]int{},
+		packetStats:                    &clientWindowStats{},
+		endErr:                         nil,
+		maxEffectiveByteCountPerSecond: 0,
 		// affinityCount:             0,
 		// affinityTime:              time.Time{},
 	}
@@ -2219,6 +2221,10 @@ func (self *multiClientChannel) IsP2pOnly() bool {
 
 func (self *multiClientChannel) Tier() int {
 	return self.args.DestinationStats.Tier
+}
+
+func (self *multiClientChannel) EstimatedByteCountPerSecond() ByteCount {
+	return self.args.EstimatedBytesPerSecond
 }
 
 // func (self *multiClientChannel) UpdateAffinity() {
@@ -2312,10 +2318,6 @@ func (self *multiClientChannel) SendDetailedMessage(message proto.Message, timeo
 			ForceStream(),
 		)
 	}
-}
-
-func (self *multiClientChannel) EstimatedByteCountPerSecond() ByteCount {
-	return self.args.EstimatedBytesPerSecond
 }
 
 func (self *multiClientChannel) Done() <-chan struct{} {
@@ -2552,13 +2554,13 @@ func (self *multiClientChannel) coalesceEventBuckets() {
 
 	windowStart := time.Now().Add(-self.settings.StatsWindowDuration)
 
-	// remove events before the window start
+	// remove all events before the window start
 	i := 0
+	for i < len(self.eventBuckets) && self.eventBuckets[i].eventTime.Before(windowStart) {
+		i += 1
+	}
 	for i < len(self.eventBuckets) && minBucketCount < len(self.eventBuckets) {
 		eventBucket := self.eventBuckets[i]
-		if windowStart.Before(eventBucket.eventTime) {
-			break
-		}
 
 		self.packetStats.sendAckCount -= eventBucket.sendAckCount
 		self.packetStats.sendAckByteCount -= eventBucket.sendAckByteCount
@@ -2623,7 +2625,7 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 
 	duration := time.Duration(0)
 	if 0 < len(self.eventBuckets) {
-		duration = time.Now().Sub(self.eventBuckets[0].createTime)
+		duration = self.eventBuckets[len(self.eventBuckets)-1].eventTime.Sub(self.eventBuckets[0].createTime)
 	}
 	sendAckDuration := time.Duration(0)
 	for _, eventBucket := range self.eventBuckets {
@@ -2702,6 +2704,15 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 		default:
 		}
 	}
+
+	self.maxEffectiveByteCountPerSecond = max(
+		self.maxEffectiveByteCountPerSecond,
+		stats.EffectiveByteCountPerSecond(),
+	)
+	stats.estimatedByteCountPerSecond = max(
+		stats.estimatedByteCountPerSecond,
+		self.maxEffectiveByteCountPerSecond,
+	)
 
 	return stats, err
 }
