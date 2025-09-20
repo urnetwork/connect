@@ -139,6 +139,8 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// TODO on platforms with more memory, increase this
 		MultiRaceClientCount: 4,
 
+		BoostBytesPerSecond: 100 * 1024,
+
 		ProtocolVersion: DefaultProtocolVersion,
 
 		RemoteUserNatMultiClientMonitorSettings: *DefaultRemoteUserNatMultiClientMonitorSettings(),
@@ -192,6 +194,8 @@ type MultiClientSettings struct {
 	MultiRacePacketMaxCount              int
 	MultiRaceClientEarlyCompleteFraction float32
 	MultiRaceClientCount                 int
+
+	BoostBytesPerSecond ByteCount
 
 	ProtocolVersion int
 
@@ -1913,7 +1917,8 @@ func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 		if stats, err := client.WindowStats(); err == nil {
 			clients = append(clients, client)
 			// durations[client] = stats.duration
-			weights[client] = float32(stats.ExpectedByteCountPerSecond())
+			boost := mathrand.Int63n(self.settings.BoostBytesPerSecond)
+			weights[client] = float32(boost + stats.ExpectedByteCountPerSecond())
 		}
 	}
 
