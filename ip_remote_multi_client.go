@@ -1569,7 +1569,16 @@ func (self *multiClientWindow) resize() {
 				if stats, err := client.WindowStats(); err == nil {
 					effectiveByteCountPerSecond := stats.EffectiveByteCountPerSecond()
 					expectedByteCountPerSecond := stats.ExpectedByteCountPerSecond()
-					if (0 < effectiveByteCountPerSecond || 0 < expectedByteCountPerSecond) && stats.unhealthyDuration < self.settings.StatsWindowMaxUnhealthyDuration {
+					var healthy bool
+					if _, fixed := self.generator.FixedDestinationSize(); fixed {
+						// we will not cycle fixed destinations
+						// any issue with routing is an issue with the destination
+						// TODO this would be susceptible to any protocol/stability issues also, which we need to focus on resolving
+						healthy = true
+					} else {
+						healthy = (0 < effectiveByteCountPerSecond || 0 < expectedByteCountPerSecond) && stats.unhealthyDuration < self.settings.StatsWindowMaxUnhealthyDuration
+					}
+					if healthy {
 						glog.Infof(
 							"[multi]client ok [%s]: effective=%db/s expected=%db/s send=%db sendNack=%db receive=%db\n",
 							client.ClientId(),
