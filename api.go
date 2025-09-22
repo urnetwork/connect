@@ -322,10 +322,11 @@ type FindProviders2Result struct {
 }
 
 type FindProvidersProvider struct {
-	ClientId                Id        `json:"client_id"`
-	EstimatedBytesPerSecond ByteCount `json:"estimated_bytes_per_second"`
-	Tier                    int       `json:"tier"`
-	IntermediaryIds         []Id      `json:"intermediary_ids,omitempty"`
+	ClientId                   Id        `json:"client_id"`
+	EstimatedBytesPerSecond    ByteCount `json:"estimated_bytes_per_second"`
+	HasEstimatedBytesPerSecond bool      `json:"has_estimated_bytes_per_second"`
+	Tier                       int       `json:"tier"`
+	IntermediaryIds            []Id      `json:"intermediary_ids,omitempty"`
 }
 
 func (self *BringYourApi) FindProviders2(findProviders2 *FindProviders2Args, callback FindProviders2Callback) {
