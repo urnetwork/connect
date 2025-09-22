@@ -31,6 +31,25 @@ import (
 // - the clients are chosen with probability weighted by their
 // net frame count statistics (acks - nacks)
 
+// the following functions handle moving clients in and out of the window:
+// - `resize`
+//   The goal of the resize is to meet a target window size based on the number
+//   of different source ip:port per destination ip:port.
+//   Two statistics are used: effective bytes per second ([ack used])
+//     and expected bytes per second ([capacity]-[ack used]-[unacked used]).
+//   Unhealthy clients are removed from the window based on low effective stats,
+//   unless the window is fixed size.
+//   Fundamentally this approach can't tell the difference between an
+//   unhealthy client and an idle client, so the norm is to continually change clients
+//   in the lull after a burst of usage.
+// - `detectBlackhole`
+//   When a client acks traffic but does not return traffic,
+//   it gets labeled a black hole. Black hole clients may be malicious
+//   or have network filtering. Black hole clients are removed.
+// - `ping`
+//   When a client is idle it must continually ack ping requests.
+//   Clients that fail to ack are removed.
+
 // TODO surface window stats to show to users
 
 type clientReceivePacketFunction func(client *multiClientChannel, source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte)
