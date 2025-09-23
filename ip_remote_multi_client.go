@@ -132,12 +132,11 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		BlackholeTimeout:       30 * time.Second,
 		WindowResizeTimeout:    15 * time.Second,
 		StatsWindowGraceperiod: 30 * time.Second,
-		StatsWindowMaxEstimatedByteCountPerSecond:      1024 * 1024,
+		StatsWindowMaxEstimatedByteCountPerSecond:      mib(8),
 		StatsWindowMaxEffectiveByteCountPerSecondScale: 0.2,
-		// when boost is used, we don't need entropy
-		StatsWindowEntropy:             0.0,
-		StatsWindowBoostBytesPerSecond: 100 * 1024,
-		WindowExpandTimeout:            15 * time.Second,
+		StatsWindowEntropy:                             0.1,
+		StatsWindowBoostBytesPerSecond:                 1024,
+		WindowExpandTimeout:                            15 * time.Second,
 		// WindowExpandBlockTimeout: 5 * time.Second,
 		WindowExpandBlockCount: 8,
 		// wait this time before enumerating potential clients again
