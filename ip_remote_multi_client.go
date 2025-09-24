@@ -132,7 +132,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		BlackholeTimeout:       15 * time.Second,
 		WindowResizeTimeout:    15 * time.Second,
 		StatsWindowGraceperiod: 30 * time.Second,
-		StatsWindowMaxEstimatedByteCountPerSecond:      mib(8),
+		StatsWindowMaxEstimatedByteCountPerSecond:      mib(1),
 		StatsWindowMaxEffectiveByteCountPerSecondScale: 0.2,
 		StatsWindowEntropy:                             0.1,
 		WindowExpandTimeout:                            15 * time.Second,
@@ -146,7 +146,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		WindowExpandMaxOvershotScale: 4.0,
 		WindowCollapseBeforeExpand:   false,
 		WindowRevisitTimeout:         2 * time.Minute,
-		StatsWindowDuration:          15 * time.Second,
+		StatsWindowDuration:          60 * time.Second,
 		StatsWindowBucketDuration:    1 * time.Second,
 		StatsSampleWeightsCount:      8,
 		StatsSourceCountSelection:    0.95,
@@ -161,8 +161,10 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// TODO on platforms with more memory, increase this
 		MultiRaceClientCount: 4,
 
-		StatsWindowMaxUnhealthyDuration:                  15 * time.Second,
-		StatsWindowMinHealthyEffectiveByteCountPerSecond: kib(2),
+		StatsWindowMaxUnhealthyDuration:                  60 * time.Second,
+		StatsWindowWarnUnhealthyDuration:                 15 * time.Second,
+		StatsWindowKeepHealthiestCount:                   2,
+		StatsWindowMinHealthyEffectiveByteCountPerSecond: kib(1),
 
 		ProtocolVersion: DefaultProtocolVersion,
 
@@ -222,6 +224,8 @@ type MultiClientSettings struct {
 	MultiRaceClientCount                 int
 
 	StatsWindowMaxUnhealthyDuration                  time.Duration
+	StatsWindowWarnUnhealthyDuration                 time.Duration
+	StatsWindowKeepHealthiestCount                   int
 	StatsWindowMinHealthyEffectiveByteCountPerSecond ByteCount
 
 	ProtocolVersion int
@@ -1602,55 +1606,109 @@ func (self *multiClientWindow) resize() {
 		weights := map[*multiClientChannel]float32{}
 		durations := map[*multiClientChannel]time.Duration{}
 
-		removedClientCount := 0
+		replaceClientCount := 0
 
 		func() {
 			removedClients := []*multiClientChannel{}
 
+			clientStats := map[*multiClientChannel]*clientWindowStats{}
 			for _, client := range self.clients() {
 				if stats, err := client.WindowStats(); err == nil {
-					effectiveByteCountPerSecond := stats.EffectiveByteCountPerSecond()
-					expectedByteCountPerSecond := stats.ExpectedByteCountPerSecond()
-					var healthy bool
-					if _, fixed := self.generator.FixedDestinationSize(); fixed {
-						// we will not cycle fixed destinations
-						// any issue with routing is an issue with the destination
-						// TODO this would be susceptible to any protocol/stability issues also, which we need to focus on resolving
-						healthy = true
-					} else {
-						healthy = (0 < effectiveByteCountPerSecond || 0 < expectedByteCountPerSecond) && stats.unhealthyDuration < self.settings.StatsWindowMaxUnhealthyDuration
-					}
-					if healthy {
-						glog.Infof(
-							"[multi]client ok [%s]: effective=%db/s expected=%db/s send=%db sendNack=%db receive=%db\n",
-							client.ClientId(),
-							effectiveByteCountPerSecond,
-							expectedByteCountPerSecond,
-							stats.sendAckByteCount,
-							stats.sendNackByteCount,
-							stats.receiveAckByteCount,
-						)
-						clients = append(clients, client)
-						maxSourceCount = max(maxSourceCount, stats.sourceCount)
-						weights[client] = float32(effectiveByteCountPerSecond)
-						durations[client] = stats.channelDuration
-					} else {
-						glog.Infof(
-							"[multi]unhealthy client [%s]: effective=%db/s expected=%db/s send=%db sendNack=%db receive=%db\n",
-							client.ClientId(),
-							effectiveByteCountPerSecond,
-							expectedByteCountPerSecond,
-							stats.sendAckByteCount,
-							stats.sendNackByteCount,
-							stats.receiveAckByteCount,
-						)
-						removedClients = append(removedClients, client)
-						removedClientCount += 1
-					}
+					clientStats[client] = stats
 				} else {
 					glog.Infof("[multi]remove error client [%s] = %s\n", client.ClientId(), err)
 					removedClients = append(removedClients, client)
-					removedClientCount += 1
+					replaceClientCount += 1
+				}
+			}
+
+			netHealthRanks := map[*multiClientChannel]int{}
+			func() {
+				orderedClients := maps.Keys(clientStats)
+				slices.SortFunc(orderedClients, func(a *multiClientChannel, b *multiClientChannel) int {
+					// descending net healthy duration
+					c := clientStats[b].netHealthyDuration - clientStats[a].netHealthyDuration
+					if c < 0 {
+						return -1
+					} else if 0 < c {
+						return 1
+					}
+					return 0
+				})
+				for i, client := range orderedClients {
+					netHealthRanks[client] = i
+				}
+			}()
+
+			keepClient := func(client *multiClientChannel, stats *clientWindowStats, effectiveByteCountPerSecond ByteCount, expectedByteCountPerSecond ByteCount) {
+				clients = append(clients, client)
+				maxSourceCount = max(maxSourceCount, stats.sourceCount)
+				weights[client] = float32(effectiveByteCountPerSecond)
+				durations[client] = stats.clientDuration
+			}
+
+			for client, stats := range clientStats {
+				effectiveByteCountPerSecond := stats.EffectiveByteCountPerSecond()
+				expectedByteCountPerSecond := stats.ExpectedByteCountPerSecond()
+				var healthy bool
+				if _, fixed := self.generator.FixedDestinationSize(); fixed {
+					// we will not cycle fixed destinations
+					// any issue with routing is an issue with the destination
+					// TODO this would be susceptible to any protocol/stability issues also, which we need to focus on resolving
+					healthy = true
+				} else {
+					healthy = (0 < effectiveByteCountPerSecond || 0 < expectedByteCountPerSecond) && stats.unhealthyDuration < self.settings.StatsWindowMaxUnhealthyDuration
+				}
+				if healthy {
+					if stats.unhealthyDuration < self.settings.StatsWindowWarnUnhealthyDuration {
+						glog.Infof(
+							"[multi]client ok [%s]: neth=%dms/netuh=%dms effective=%db/s expected=%db/s send=%db sendNack=%db receive=%db\n",
+							client.ClientId(),
+							stats.netHealthyDuration/time.Millisecond,
+							stats.netUnhealthyDuration/time.Millisecond,
+							effectiveByteCountPerSecond,
+							expectedByteCountPerSecond,
+							stats.sendAckByteCount,
+							stats.sendNackByteCount,
+							stats.receiveAckByteCount,
+						)
+					} else {
+						replaceClientCount += 1
+						glog.Infof(
+							"[multi]client health warning [%s]: neth=%dms/netuh=%dms effective=%db/s expected=%db/s send=%db sendNack=%db receive=%db\n",
+							client.ClientId(),
+							stats.netHealthyDuration/time.Millisecond,
+							stats.netUnhealthyDuration/time.Millisecond,
+							effectiveByteCountPerSecond,
+							expectedByteCountPerSecond,
+							stats.sendAckByteCount,
+							stats.sendNackByteCount,
+							stats.receiveAckByteCount,
+						)
+					}
+					keepClient(client, stats, effectiveByteCountPerSecond, expectedByteCountPerSecond)
+				} else {
+					netHealthRank := netHealthRanks[client]
+					remove := self.settings.StatsWindowKeepHealthiestCount <= netHealthRank
+					glog.Infof(
+						"[multi]unhealthy client [%s](#%d remove=%t): neth=%dms/netuh=%dms effective=%db/s expected=%db/s send=%db sendNack=%db receive=%db\n",
+						client.ClientId(),
+						netHealthRank,
+						remove,
+						stats.netHealthyDuration/time.Millisecond,
+						stats.netUnhealthyDuration/time.Millisecond,
+						effectiveByteCountPerSecond,
+						expectedByteCountPerSecond,
+						stats.sendAckByteCount,
+						stats.sendNackByteCount,
+						stats.receiveAckByteCount,
+					)
+					replaceClientCount += 1
+					if remove {
+						removedClients = append(removedClients, client)
+					} else {
+						keepClient(client, stats, effectiveByteCountPerSecond, expectedByteCountPerSecond)
+					}
 				}
 			}
 
@@ -1700,7 +1758,7 @@ func (self *multiClientWindow) resize() {
 			expandWindowSize = fixedDestinationSize
 			collapseWindowSize = fixedDestinationSize
 		} else {
-			targetWindowSize = removedClientCount + min(
+			targetWindowSize = replaceClientCount + min(
 				windowSize.WindowSizeMax,
 				max(
 					windowSize.WindowSizeMin,
@@ -2214,8 +2272,11 @@ type clientWindowStats struct {
 	firstSendNackTime           time.Time
 	estimatedByteCountPerSecond ByteCount
 	// FIXME firstStatDuration
-	channelDuration   time.Duration
-	unhealthyDuration time.Duration
+	clientDuration       time.Duration
+	healthyDuration      time.Duration
+	unhealthyDuration    time.Duration
+	netHealthyDuration   time.Duration
+	netUnhealthyDuration time.Duration
 
 	// internal
 	bucketCount int
@@ -2270,7 +2331,12 @@ type multiClientChannel struct {
 	maxEffectiveByteCountPerSecond     ByteCount
 	maxEffectiveByteCountPerSecondTime time.Time
 	firstEventTime                     time.Time
-	lastHealthyTime                    time.Time
+
+	healthy              bool
+	lastHealthyTime      time.Time
+	lastUnhealthyTime    time.Time
+	netHealthyDuration   time.Duration
+	netUnhealthyDuration time.Duration
 
 	// affinityCount int
 	// affinityTime  time.Time
@@ -2865,17 +2931,45 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 			self.maxEffectiveByteCountPerSecondTime = eventTime
 		}
 		if self.settings.StatsWindowMinHealthyEffectiveByteCountPerSecond <= effectiveByteCountPerSecond {
+			if self.lastUnhealthyTime.IsZero() {
+				self.lastUnhealthyTime = eventTime
+			}
+
+			if !self.healthy {
+				self.healthy = true
+				if !self.lastHealthyTime.IsZero() {
+					self.netUnhealthyDuration += self.lastUnhealthyTime.Sub(self.lastHealthyTime)
+				}
+			}
+
 			self.lastHealthyTime = eventTime
-		} else if !self.lastHealthyTime.IsZero() {
+
+			stats.healthyDuration = eventTime.Sub(self.lastUnhealthyTime)
+		} else {
+			if self.lastHealthyTime.IsZero() {
+				self.lastHealthyTime = eventTime
+			}
+
+			if self.healthy {
+				self.healthy = false
+				if !self.lastUnhealthyTime.IsZero() {
+					self.netHealthyDuration += self.lastHealthyTime.Sub(self.lastUnhealthyTime)
+				}
+			}
+
+			self.lastUnhealthyTime = eventTime
+
 			stats.unhealthyDuration = eventTime.Sub(self.lastHealthyTime)
 		}
+		stats.netHealthyDuration = self.netHealthyDuration + stats.healthyDuration
+		stats.netUnhealthyDuration = self.netUnhealthyDuration + stats.unhealthyDuration
 		if self.firstEventTime.IsZero() {
 			self.firstEventTime = self.eventBuckets[0].createTime
 		} else {
-			stats.channelDuration = eventTime.Sub(self.firstEventTime)
+			stats.clientDuration = eventTime.Sub(self.firstEventTime)
 		}
 	}
-	if self.settings.StatsWindowGraceperiod < stats.channelDuration {
+	if self.settings.StatsWindowGraceperiod < stats.clientDuration {
 		stats.estimatedByteCountPerSecond = self.maxEffectiveByteCountPerSecond
 	} else {
 		stats.estimatedByteCountPerSecond = max(
