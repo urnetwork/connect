@@ -121,21 +121,20 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		},
 		SendRetryTimeout:           200 * time.Millisecond,
 		PingWriteTimeout:           5 * time.Second,
-		CPingWriteTimeout:          10 * time.Second,
-		CPingMaxByteCountPerSecond: 64 * 1024,
+		CPingWriteTimeout:          5 * time.Second,
+		CPingMaxByteCountPerSecond: kib(8),
 		// the initial ping includes creating the transports and contract
 		// ease up the timeout until perf issues are fully resolved
 		PingTimeout:  15 * time.Second,
 		CPingTimeout: 15 * time.Second,
 		// a lower ack timeout helps cycle through bad providers faster
 		AckTimeout:             15 * time.Second,
-		BlackholeTimeout:       30 * time.Second,
+		BlackholeTimeout:       15 * time.Second,
 		WindowResizeTimeout:    15 * time.Second,
 		StatsWindowGraceperiod: 30 * time.Second,
 		StatsWindowMaxEstimatedByteCountPerSecond:      mib(8),
 		StatsWindowMaxEffectiveByteCountPerSecondScale: 0.2,
 		StatsWindowEntropy:                             0.1,
-		StatsWindowBoostBytesPerSecond:                 1024,
 		WindowExpandTimeout:                            15 * time.Second,
 		// WindowExpandBlockTimeout: 5 * time.Second,
 		WindowExpandBlockCount: 8,
@@ -162,8 +161,8 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// TODO on platforms with more memory, increase this
 		MultiRaceClientCount: 4,
 
-		StatsWindowMaxUnhealthyDuration:                  30 * time.Second,
-		StatsWindowMinHealthyEffectiveByteCountPerSecond: 256,
+		StatsWindowMaxUnhealthyDuration:                  15 * time.Second,
+		StatsWindowMinHealthyEffectiveByteCountPerSecond: kib(2),
 
 		ProtocolVersion: DefaultProtocolVersion,
 
@@ -193,7 +192,6 @@ type MultiClientSettings struct {
 	StatsWindowMaxEstimatedByteCountPerSecond      ByteCount
 	StatsWindowMaxEffectiveByteCountPerSecondScale float32
 	StatsWindowEntropy                             float32
-	StatsWindowBoostBytesPerSecond                 ByteCount
 	WindowExpandTimeout                            time.Duration
 	// WindowExpandBlockTimeout     time.Duration
 	WindowExpandBlockCount       int
@@ -427,7 +425,7 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClien
 		ip4Path := ipPath.ToIp4Path()
 		update, ok := self.ip4PathUpdates[ip4Path]
 		if !ok || update.IsDone() {
-			update = newMultiClientChannelUpdate(self.ctx)
+			update = newMultiClientChannelUpdate(self.ctx, ipPath)
 			go HandleError(func() {
 				defer update.cancel()
 
@@ -466,7 +464,7 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClien
 		ip6Path := ipPath.ToIp6Path()
 		update, ok := self.ip6PathUpdates[ip6Path]
 		if !ok || update.IsDone() {
-			update = newMultiClientChannelUpdate(self.ctx)
+			update = newMultiClientChannelUpdate(self.ctx, ipPath)
 			go HandleError(func() {
 				defer update.cancel()
 
@@ -535,22 +533,44 @@ func (self *RemoteUserNatMultiClient) updateClient(update *multiClientChannelUpd
 
 // remove a client from all updates
 func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
+	rstPackets := []*receivePacket{}
 
-	// note client must be marked as done, otherwise it may be re-added by updates in flight
-	if !client.IsDone() {
-		glog.Errorf("[multi]removed client that is not marked as done. This might lead to memory leak.")
-	}
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
 
-	if updates, ok := self.clientUpdates[client]; ok {
-		delete(self.clientUpdates, client)
-		for update, _ := range updates {
-			if update.client == client {
-				update.client = nil
-			} else {
-				glog.Errorf("[multi]update associated with incorrect client")
+		// note client must be marked as done, otherwise it may be re-added by updates in flight
+		if !client.IsDone() {
+			glog.Errorf("[multi]removed client that is not marked as done. This might lead to memory leak.")
+		}
+
+		if updates, ok := self.clientUpdates[client]; ok {
+			delete(self.clientUpdates, client)
+			for update, _ := range updates {
+				if update.client == client {
+					update.client = nil
+
+					if packet, ok := ipOosRst(update.ipPath.Reverse()); ok {
+						rstPacket := &receivePacket{
+							Source:      TransferPath{},
+							ProvideMode: protocol.ProvideMode_Network,
+							IpPath:      update.ipPath,
+							Packet:      packet,
+						}
+						rstPackets = append(rstPackets, rstPacket)
+					}
+				} else {
+					glog.Errorf("[multi]update associated with incorrect client")
+				}
 			}
+		}
+	}()
+
+	select {
+	case <-self.ctx.Done():
+	default:
+		for _, p := range rstPackets {
+			self.receivePacketCallback(p.Source, p.ProvideMode, p.IpPath, p.Packet)
 		}
 	}
 }
@@ -1052,14 +1072,16 @@ type multiClientChannelUpdate struct {
 	client       *multiClientChannel
 	race         *multiClientChannelUpdateRace
 	activityTime time.Time
+	ipPath       *IpPath
 }
 
-func newMultiClientChannelUpdate(ctx context.Context) *multiClientChannelUpdate {
+func newMultiClientChannelUpdate(ctx context.Context, ipPath *IpPath) *multiClientChannelUpdate {
 	cancelCtx, cancel := context.WithCancel(ctx)
 	return &multiClientChannelUpdate{
 		ctx:          cancelCtx,
 		cancel:       cancel,
 		activityTime: time.Now(),
+		ipPath:       ipPath,
 	}
 }
 
@@ -1580,6 +1602,8 @@ func (self *multiClientWindow) resize() {
 		weights := map[*multiClientChannel]float32{}
 		durations := map[*multiClientChannel]time.Duration{}
 
+		removedClientCount := 0
+
 		func() {
 			removedClients := []*multiClientChannel{}
 
@@ -1612,7 +1636,7 @@ func (self *multiClientWindow) resize() {
 						durations[client] = stats.channelDuration
 					} else {
 						glog.Infof(
-							"[multi]remove unhealthy client [%s]: effective=%db/s expected=%db/s send=%db sendNack=%db receive=%db\n",
+							"[multi]unhealthy client [%s]: effective=%db/s expected=%db/s send=%db sendNack=%db receive=%db\n",
 							client.ClientId(),
 							effectiveByteCountPerSecond,
 							expectedByteCountPerSecond,
@@ -1621,10 +1645,12 @@ func (self *multiClientWindow) resize() {
 							stats.receiveAckByteCount,
 						)
 						removedClients = append(removedClients, client)
+						removedClientCount += 1
 					}
 				} else {
 					glog.Infof("[multi]remove error client [%s] = %s\n", client.ClientId(), err)
 					removedClients = append(removedClients, client)
+					removedClientCount += 1
 				}
 			}
 
@@ -1674,7 +1700,7 @@ func (self *multiClientWindow) resize() {
 			expandWindowSize = fixedDestinationSize
 			collapseWindowSize = fixedDestinationSize
 		} else {
-			targetWindowSize = min(
+			targetWindowSize = removedClientCount + min(
 				windowSize.WindowSizeMax,
 				max(
 					windowSize.WindowSizeMin,
@@ -2011,8 +2037,7 @@ func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 		if stats, err := client.WindowStats(); err == nil {
 			clients = append(clients, client)
 			// durations[client] = stats.duration
-			boost := mathrand.Int63n(self.settings.StatsWindowBoostBytesPerSecond)
-			weights[client] = float32(boost + stats.ExpectedByteCountPerSecond())
+			weights[client] = float32(1 + stats.ExpectedByteCountPerSecond())
 		}
 	}
 

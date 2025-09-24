@@ -76,6 +76,7 @@ const (
 	TransportModeH3Dns     TransportMode = "h3dns"
 	TransportModeH1        TransportMode = "h1"
 	TransportModeH3        TransportMode = "h3"
+	TransportModeNone      TransportMode = ""
 )
 
 type ClientAuth struct {
@@ -132,10 +133,10 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		panic(err)
 	}
 	return &PlatformTransportSettings{
-		HttpConnectTimeout:   5 * time.Second,
-		WsHandshakeTimeout:   5 * time.Second,
-		QuicConnectTimeout:   5 * time.Second,
-		QuicHandshakeTimeout: 5 * time.Second,
+		HttpConnectTimeout:   15 * time.Second,
+		WsHandshakeTimeout:   15 * time.Second,
+		QuicConnectTimeout:   15 * time.Second,
+		QuicHandshakeTimeout: 15 * time.Second,
 		QuicTlsConfig:        tlsConfig,
 		AuthTimeout:          5 * time.Second,
 		ReconnectTimeout:     5 * time.Second,
@@ -207,7 +208,7 @@ func NewPlatformTransport(
 		routeManager,
 		platformUrl,
 		auth,
-		TransportModeH1,
+		TransportModeAuto,
 		settings,
 	)
 }
@@ -241,7 +242,7 @@ func NewPlatformTransportWithTargetMode(
 		modeMonitor:    NewMonitor(),
 		availableModes: map[TransportMode]bool{},
 		targetMode:     targetMode,
-		mode:           TransportModeAuto,
+		mode:           TransportModeNone,
 	}
 	go transport.run()
 	return transport
@@ -283,12 +284,10 @@ func (self *PlatformTransport) activeMode() (TransportMode, chan struct{}) {
 }
 
 var transportModePreferences = map[TransportMode]int{
-	TransportModeAuto:      0,
 	TransportModeH3DnsPump: 1,
 	TransportModeH3Dns:     2,
-	// TODO currently we rank H3 below H1 in performance
-	TransportModeH3: 3,
-	TransportModeH1: 4,
+	TransportModeH3:        3,
+	TransportModeH1:        3,
 }
 
 func (self *PlatformTransport) run() {
@@ -297,9 +296,9 @@ func (self *PlatformTransport) run() {
 	switch self.targetMode {
 	case TransportModeAuto:
 		go self.runH1(0)
-		go self.runH3(TransportModeH3, self.settings.ModeInitialDelay, 1)
-		go self.runH3(TransportModeH3Dns, self.settings.ModeInitialDelay*2, self.settings.PtDnsSlowMultiple)
-		go self.runH3(TransportModeH3DnsPump, self.settings.ModeInitialDelay*3, self.settings.PtDnsSlowMultiple)
+		// go self.runH3(TransportModeH3, 0, 1)
+		// go self.runH3(TransportModeH3Dns, self.settings.ModeInitialDelay, self.settings.PtDnsSlowMultiple)
+		// go self.runH3(TransportModeH3DnsPump, self.settings.ModeInitialDelay*2, self.settings.PtDnsSlowMultiple)
 	case TransportModeH3:
 		go self.runH3(TransportModeH3, 0, 1)
 	case TransportModeH1:
@@ -332,7 +331,7 @@ func (self *PlatformTransport) run() {
 				}
 			}
 		} else {
-			self.setActiveMode(TransportModeAuto)
+			self.setActiveMode(TransportModeNone)
 		}
 
 		select {
@@ -840,10 +839,10 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			quicConfig := &quic.Config{
 				HandshakeIdleTimeout:    time.Duration(slowMultiple) * (self.settings.QuicConnectTimeout + self.settings.QuicHandshakeTimeout),
 				MaxIdleTimeout:          self.settings.PingTimeout * 4,
-				KeepAlivePeriod:         self.settings.PingTimeout * 2,
+				KeepAlivePeriod:         0,
 				Allow0RTT:               true,
 				DisablePathMTUDiscovery: true,
-				InitialPacketSize:       1440,
+				InitialPacketSize:       1400,
 			}
 			var tlsConfig *tls.Config
 			if self.settings.QuicTlsConfig != nil {
