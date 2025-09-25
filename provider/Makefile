@@ -18,7 +18,7 @@ build:
 	env GOEXPERIMENT=greenteagc CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "-w -s -X main.Version=${WARP_VERSION}" -o build/darwin/amd64/
 	env GOEXPERIMENT=greenteagc CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -trimpath -ldflags "-w -s -X main.Version=${WARP_VERSION}" -o build/windows/arm64/
 	env GOEXPERIMENT=greenteagc CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-w -s -X main.Version=${WARP_VERSION}" -o build/windows/amd64/
-	tar -czf build/provider.tar.gz -C build linux darwin windows
+	COPYFILE_DISABLE=1 tar -czf build/provider.tar.gz -C build linux darwin windows
 
 warp_build:
 	$(MAKE) all
