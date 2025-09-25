@@ -1659,51 +1659,37 @@ func (self *multiClientWindow) resize() {
 				} else {
 					healthy = (0 < effectiveByteCountPerSecond || 0 < expectedByteCountPerSecond) && stats.unhealthyDuration < self.settings.StatsWindowMaxUnhealthyDuration
 				}
-				if healthy {
-					if stats.unhealthyDuration < self.settings.StatsWindowWarnUnhealthyDuration {
-						glog.Infof(
-							"[multi]client ok [%s]: neth=%dms/netuh=%dms effective=%db/s expected=%db/s send=%db sendNack=%db receive=%db\n",
-							client.ClientId(),
-							stats.netHealthyDuration/time.Millisecond,
-							stats.netUnhealthyDuration/time.Millisecond,
-							effectiveByteCountPerSecond,
-							expectedByteCountPerSecond,
-							stats.sendAckByteCount,
-							stats.sendNackByteCount,
-							stats.receiveAckByteCount,
-						)
-					} else {
-						replaceClientCount += 1
-						glog.Infof(
-							"[multi]client health warning [%s]: neth=%dms/netuh=%dms effective=%db/s expected=%db/s send=%db sendNack=%db receive=%db\n",
-							client.ClientId(),
-							stats.netHealthyDuration/time.Millisecond,
-							stats.netUnhealthyDuration/time.Millisecond,
-							effectiveByteCountPerSecond,
-							expectedByteCountPerSecond,
-							stats.sendAckByteCount,
-							stats.sendNackByteCount,
-							stats.receiveAckByteCount,
-						)
-					}
-					keepClient(client, stats, effectiveByteCountPerSecond, expectedByteCountPerSecond)
-				} else {
-					netHealthRank := netHealthRanks[client]
-					remove := self.settings.StatsWindowKeepHealthiestCount <= netHealthRank
+				printStats := func(status string) {
 					glog.Infof(
-						"[multi]unhealthy client [%s](#%d remove=%t): neth=%dms/netuh=%dms effective=%db/s expected=%db/s send=%db sendNack=%db receive=%db\n",
+						"[multi]%s [%s]: h=%d+%dms/u=%d+%dms effective=%db/s expected=%db/s send=%db sendNack=%db receive=%db\n",
+						status,
 						client.ClientId(),
-						netHealthRank,
-						remove,
 						stats.netHealthyDuration/time.Millisecond,
+						stats.healthyDuration/time.Millisecond,
 						stats.netUnhealthyDuration/time.Millisecond,
+						stats.unhealthyDuration/time.Millisecond,
 						effectiveByteCountPerSecond,
 						expectedByteCountPerSecond,
 						stats.sendAckByteCount,
 						stats.sendNackByteCount,
 						stats.receiveAckByteCount,
 					)
+				}
+				if healthy {
+					if stats.unhealthyDuration < self.settings.StatsWindowWarnUnhealthyDuration {
+						printStats("client ok")
+					} else {
+						replaceClientCount += 1
+						printStats("client health warning")
+					}
+					keepClient(client, stats, effectiveByteCountPerSecond, expectedByteCountPerSecond)
+				} else {
+					netHealthRank := netHealthRanks[client]
+					remove := self.settings.StatsWindowKeepHealthiestCount <= netHealthRank
+
 					replaceClientCount += 1
+					printStats(fmt.Sprintf("unhealthy client (#%d remove=%t)", netHealthRank, remove))
+
 					if remove {
 						removedClients = append(removedClients, client)
 					} else {
