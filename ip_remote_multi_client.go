@@ -1626,13 +1626,22 @@ func (self *multiClientWindow) resize() {
 			func() {
 				orderedClients := maps.Keys(clientStats)
 				slices.SortFunc(orderedClients, func(a *multiClientChannel, b *multiClientChannel) int {
-					// descending net healthy duration
-					c := clientStats[b].netHealthyDuration - clientStats[a].netHealthyDuration
-					if c < 0 {
+					// descending healthy duration, net healthy duration
+					statsA := clientStats[a]
+					statsB := clientStats[b]
+
+					if c := statsB.healthyDuration - statsA.healthyDuration; c < 0 {
 						return -1
 					} else if 0 < c {
 						return 1
 					}
+
+					if c := statsB.netHealthyDuration - statsA.netHealthyDuration; c < 0 {
+						return -1
+					} else if 0 < c {
+						return 1
+					}
+
 					return 0
 				})
 				for i, client := range orderedClients {
