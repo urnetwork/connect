@@ -587,6 +587,10 @@ do_install ()
             exit 1
         fi
     fi
+	
+    if [ "$has_systemd" -eq 1 ]; then
+        stop_systemd_units
+    fi
 
     if [ -d "$install_path" ] && [ "$operation" = "install" ]; then
         pr_info "Found existing installation in $install_path, updating instead"
@@ -626,10 +630,6 @@ do_install ()
     fi
 
     cd "$workdir" || exit 1
-	
-    if [ "$has_systemd" -eq 1 ]; then
-        stop_systemd_units
-    fi
     
     if [ -z "$script" ]; then
         pr_err "Invalid script contents"
