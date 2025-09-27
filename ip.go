@@ -3019,6 +3019,17 @@ func (self *Ip4Path) Destination() Ip4Path {
 	}
 }
 
+func (self *Ip4Path) ToIpPath() *IpPath {
+	return &IpPath{
+		Version:         4,
+		Protocol:        self.Protocol,
+		SourceIp:        net.IP(self.SourceIp[:]),
+		SourcePort:      self.SourcePort,
+		DestinationIp:   net.IP(self.DestinationIp[:]),
+		DestinationPort: self.DestinationPort,
+	}
+}
+
 // comparable
 type Ip6Path struct {
 	Protocol        IpProtocol
@@ -3040,6 +3051,17 @@ func (self *Ip6Path) Destination() Ip6Path {
 	return Ip6Path{
 		Protocol:        self.Protocol,
 		DestinationIp:   self.DestinationIp,
+		DestinationPort: self.DestinationPort,
+	}
+}
+
+func (self *Ip6Path) ToIpPath() *IpPath {
+	return &IpPath{
+		Version:         6,
+		Protocol:        self.Protocol,
+		SourceIp:        net.IP(self.SourceIp[:]),
+		SourcePort:      self.SourcePort,
+		DestinationIp:   net.IP(self.DestinationIp[:]),
 		DestinationPort: self.DestinationPort,
 	}
 }

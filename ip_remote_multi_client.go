@@ -166,7 +166,8 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		StatsWindowKeepHealthiestCount:                   2,
 		StatsWindowMinHealthyEffectiveByteCountPerSecond: kib(1),
 
-		ProtocolVersion: DefaultProtocolVersion,
+		ProtocolVersion:       DefaultProtocolVersion,
+		DestinationIpAffinity: true,
 
 		RemoteUserNatMultiClientMonitorSettings: *DefaultRemoteUserNatMultiClientMonitorSettings(),
 	}
@@ -228,7 +229,8 @@ type MultiClientSettings struct {
 	StatsWindowKeepHealthiestCount                   int
 	StatsWindowMinHealthyEffectiveByteCountPerSecond ByteCount
 
-	ProtocolVersion int
+	ProtocolVersion       int
+	DestinationIpAffinity bool
 
 	RemoteUserNatMultiClientMonitorSettings
 }
@@ -389,13 +391,7 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClien
 			default:
 			}
 
-			var idleTimeout time.Duration
-			func() {
-				self.stateLock.Lock()
-				defer self.stateLock.Unlock()
-
-				idleTimeout = update.activityTime.Add(self.settings.SequenceIdleTimeout).Sub(time.Now())
-			}()
+			idleTimeout := self.removeIdlePaths(update)
 			if idleTimeout <= 0 {
 				return
 			} else {
@@ -408,100 +404,118 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClien
 		}
 	}
 
-	rst := func(client *multiClientChannel) {
-		if client != nil {
-			// rst to destination
-			if packet, ok := ipOosRst(ipPath); ok {
-				client.Send(&parsedPacket{
-					packet: packet,
-					ipPath: ipPath,
-				}, 0)
-			}
-		}
-		// rst to source
-		if packet, ok := ipOosRst(ipPath.Reverse()); ok {
-			self.receivePacketCallback(TransferPath{}, protocol.ProvideMode_Network, ipPath, packet)
-		}
-	}
+	// rst := func(client *multiClientChannel) {
+	// 	if client != nil {
+	// 		// rst to destination
+	// 		if packet, ok := ipOosRst(ipPath); ok {
+	// 			client.Send(&parsedPacket{
+	// 				packet: packet,
+	// 				ipPath: ipPath,
+	// 			}, 0)
+	// 		}
+	// 	}
+	// 	// rst to source
+	// 	if packet, ok := ipOosRst(ipPath.Reverse()); ok {
+	// 		self.receivePacketCallback(TransferPath{}, protocol.ProvideMode_Network, ipPath, packet)
+	// 	}
+	// }
 
 	switch ipPath.Version {
 	case 4:
+		key4 := self.updateKey(ipPath).ToIp4Path()
 		ip4Path := ipPath.ToIp4Path()
-		update, ok := self.ip4PathUpdates[ip4Path]
+		update, ok := self.ip4PathUpdates[key4]
 		if !ok || update.IsDone() {
-			update = newMultiClientChannelUpdate(self.ctx, ipPath)
+			update = newMultiClientChannelUpdate(self.ctx)
 			go HandleError(func() {
 				defer update.cancel()
 
-				waitForIdle(update)
+				for {
+					waitForIdle(update)
 
-				var client *multiClientChannel
-				func() {
-					self.stateLock.Lock()
-					defer self.stateLock.Unlock()
+					success := func() bool {
+						self.stateLock.Lock()
+						defer self.stateLock.Unlock()
 
-					client = update.client
+						if 0 < len(update.ip4PathActivityTimes) || 0 < len(update.ip6PathActivityTimes) {
+							return false
+						}
 
-					if self.ip4PathUpdates[ip4Path] == update {
-						delete(self.ip4PathUpdates, ip4Path)
-					}
-					if client != nil {
-						if updates, ok := self.clientUpdates[client]; ok {
-							delete(updates, update)
-							if len(updates) == 0 {
-								delete(self.clientUpdates, client)
+						if self.ip4PathUpdates[key4] == update {
+							delete(self.ip4PathUpdates, key4)
+						}
+						if client := update.client; client != nil {
+							if updates, ok := self.clientUpdates[client]; ok {
+								delete(updates, update)
+								if len(updates) == 0 {
+									delete(self.clientUpdates, client)
+								}
 							}
 						}
+						return true
+					}()
+					if success {
+						break
 					}
-				}()
-
-				select {
-				case <-self.ctx.Done():
-				default:
-					rst(client)
 				}
+
+				// select {
+				// case <-self.ctx.Done():
+				// default:
+				// 	rst(client)
+				// }
 			}, update.cancel)
-			self.ip4PathUpdates[ip4Path] = update
+			self.ip4PathUpdates[key4] = update
 		}
+		update.ip4PathActivityTimes[ip4Path] = time.Now()
 		return update, update.client
 	case 6:
+		key6 := self.updateKey(ipPath).ToIp6Path()
 		ip6Path := ipPath.ToIp6Path()
-		update, ok := self.ip6PathUpdates[ip6Path]
+		update, ok := self.ip6PathUpdates[key6]
 		if !ok || update.IsDone() {
-			update = newMultiClientChannelUpdate(self.ctx, ipPath)
+			update = newMultiClientChannelUpdate(self.ctx)
 			go HandleError(func() {
 				defer update.cancel()
 
-				waitForIdle(update)
+				for {
+					waitForIdle(update)
 
-				var client *multiClientChannel
-				func() {
-					self.stateLock.Lock()
-					defer self.stateLock.Unlock()
+					success := func() bool {
+						self.stateLock.Lock()
+						defer self.stateLock.Unlock()
 
-					client = update.client
+						if 0 < len(update.ip4PathActivityTimes) || 0 < len(update.ip6PathActivityTimes) {
+							return false
+						}
 
-					if self.ip6PathUpdates[ip6Path] == update {
-						delete(self.ip6PathUpdates, ip6Path)
-					}
-					if client != nil {
-						if updates, ok := self.clientUpdates[client]; ok {
-							delete(updates, update)
-							if len(updates) == 0 {
-								delete(self.clientUpdates, client)
+						if self.ip6PathUpdates[key6] == update {
+							delete(self.ip6PathUpdates, key6)
+						}
+						if client := update.client; client != nil {
+							if updates, ok := self.clientUpdates[client]; ok {
+								delete(updates, update)
+								if len(updates) == 0 {
+									delete(self.clientUpdates, client)
+								}
 							}
 						}
+						return true
+					}()
+					if success {
+						break
 					}
-				}()
-
-				select {
-				case <-self.ctx.Done():
-				default:
-					rst(client)
 				}
+
+				// select {
+				// case <-self.ctx.Done():
+				// default:
+				// 	rst(client)
+				// }
 			}, update.cancel)
-			self.ip6PathUpdates[ip6Path] = update
+			self.ip6PathUpdates[key6] = update
 		}
+		update.ip6PathActivityTimes[ip6Path] = time.Now()
 		return update, update.client
 	default:
 		panic(fmt.Errorf("Bad protocol version %d", ipPath.Version))
@@ -513,7 +527,7 @@ func (self *RemoteUserNatMultiClient) updateClient(update *multiClientChannelUpd
 	defer self.stateLock.Unlock()
 
 	client := update.client
-	update.activityTime = time.Now()
+	// update.activityTime = time.Now()
 
 	if previousClient != client {
 		if previousClient != nil {
@@ -535,6 +549,105 @@ func (self *RemoteUserNatMultiClient) updateClient(update *multiClientChannelUpd
 	}
 }
 
+func (self *RemoteUserNatMultiClient) updateKey(ipPath *IpPath) *IpPath {
+	if self.settings.DestinationIpAffinity {
+		// this works because we use a race for new connections,
+		// so that we have more confidence the initial connection is responsive
+		return &IpPath{
+			Version:       ipPath.Version,
+			Protocol:      ipPath.Protocol,
+			DestinationIp: ipPath.DestinationIp,
+		}
+	} else {
+		return ipPath
+	}
+}
+
+func (self *RemoteUserNatMultiClient) removeIdlePaths(update *multiClientChannelUpdate) time.Duration {
+	clientRstPackets := map[*multiClientChannel][]*parsedPacket{}
+	rstPackets := []*receivePacket{}
+
+	now := time.Now()
+	var nextIdleTime time.Time
+
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+
+		idleIpPaths := []*IpPath{}
+
+		for ip4Path, activityTime := range update.ip4PathActivityTimes {
+			idleTime := activityTime.Add(self.settings.SequenceIdleTimeout)
+			if idleTime.After(now) {
+				if nextIdleTime.IsZero() || idleTime.Before(nextIdleTime) {
+					nextIdleTime = idleTime
+				}
+			} else {
+				delete(update.ip4PathActivityTimes, ip4Path)
+				idleIpPaths = append(idleIpPaths, ip4Path.ToIpPath())
+			}
+		}
+		for ip6Path, activityTime := range update.ip6PathActivityTimes {
+			idleTime := activityTime.Add(self.settings.SequenceIdleTimeout)
+			if idleTime.After(now) {
+				if nextIdleTime.IsZero() || idleTime.Before(nextIdleTime) {
+					nextIdleTime = idleTime
+				}
+			} else {
+				delete(update.ip6PathActivityTimes, ip6Path)
+				idleIpPaths = append(idleIpPaths, ip6Path.ToIpPath())
+			}
+		}
+
+		for _, ipPath := range idleIpPaths {
+			if client := update.client; client != nil {
+				// rst to destination
+				if packet, ok := ipOosRst(ipPath); ok {
+					clientRstPackets[client] = append(clientRstPackets[client], &parsedPacket{
+						packet: packet,
+						ipPath: ipPath,
+					})
+				}
+			}
+
+			if packet, ok := ipOosRst(ipPath.Reverse()); ok {
+				rstPacket := &receivePacket{
+					Source:      TransferPath{},
+					ProvideMode: protocol.ProvideMode_Network,
+					IpPath:      ipPath,
+					Packet:      packet,
+				}
+				rstPackets = append(rstPackets, rstPacket)
+			}
+		}
+
+		empty := len(update.ip4PathActivityTimes) == 0 && len(update.ip6PathActivityTimes) == 0
+		if empty != nextIdleTime.IsZero() {
+			panic("Failed invariant - empty paths")
+		}
+	}()
+
+	select {
+	case <-update.ctx.Done():
+		return 0
+	default:
+	}
+
+	for client, rstPackets := range clientRstPackets {
+		for _, packet := range rstPackets {
+			client.Send(packet, 0)
+		}
+	}
+	for _, p := range rstPackets {
+		self.receivePacketCallback(p.Source, p.ProvideMode, p.IpPath, p.Packet)
+	}
+
+	if nextIdleTime.IsZero() {
+		return 0
+	}
+	return nextIdleTime.Sub(now)
+}
+
 // remove a client from all updates
 func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 	rstPackets := []*receivePacket{}
@@ -554,14 +667,24 @@ func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 				if update.client == client {
 					update.client = nil
 
-					if packet, ok := ipOosRst(update.ipPath.Reverse()); ok {
-						rstPacket := &receivePacket{
-							Source:      TransferPath{},
-							ProvideMode: protocol.ProvideMode_Network,
-							IpPath:      update.ipPath,
-							Packet:      packet,
+					ipPaths := []*IpPath{}
+					for ip4Path, _ := range update.ip4PathActivityTimes {
+						ipPaths = append(ipPaths, ip4Path.ToIpPath())
+					}
+					for ip6Path, _ := range update.ip6PathActivityTimes {
+						ipPaths = append(ipPaths, ip6Path.ToIpPath())
+					}
+
+					for _, ipPath := range ipPaths {
+						if packet, ok := ipOosRst(ipPath.Reverse()); ok {
+							rstPacket := &receivePacket{
+								Source:      TransferPath{},
+								ProvideMode: protocol.ProvideMode_Network,
+								IpPath:      ipPath,
+								Packet:      packet,
+							}
+							rstPackets = append(rstPackets, rstPacket)
 						}
-						rstPackets = append(rstPackets, rstPacket)
 					}
 				} else {
 					glog.Errorf("[multi]update associated with incorrect client")
@@ -1073,19 +1196,20 @@ type multiClientChannelUpdate struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	client       *multiClientChannel
-	race         *multiClientChannelUpdateRace
-	activityTime time.Time
-	ipPath       *IpPath
+	client *multiClientChannel
+	race   *multiClientChannelUpdateRace
+	// activityTime time.Time
+	ip4PathActivityTimes map[Ip4Path]time.Time
+	ip6PathActivityTimes map[Ip6Path]time.Time
 }
 
-func newMultiClientChannelUpdate(ctx context.Context, ipPath *IpPath) *multiClientChannelUpdate {
+func newMultiClientChannelUpdate(ctx context.Context) *multiClientChannelUpdate {
 	cancelCtx, cancel := context.WithCancel(ctx)
 	return &multiClientChannelUpdate{
-		ctx:          cancelCtx,
-		cancel:       cancel,
-		activityTime: time.Now(),
-		ipPath:       ipPath,
+		ctx:                  cancelCtx,
+		cancel:               cancel,
+		ip4PathActivityTimes: map[Ip4Path]time.Time{},
+		ip6PathActivityTimes: map[Ip6Path]time.Time{},
 	}
 }
 
