@@ -291,20 +291,20 @@ if [ -z "$operation" ]; then
     exit 1
 fi
 
-install_systemd_units ()
+systemd_userdir="$HOME/.config/systemd/user"
+systemd_service="$systemd_userdir/urnetwork.service"
+systemd_update_service="$systemd_userdir/urnetwork-update.service"
+systemd_update_timer="$systemd_userdir/urnetwork-update.timer"
+systemd_units_stopped=0
+
+stop_systemd_units ()
 {
-    systemd_userdir="$HOME/.config/systemd/user"
-    systemd_service="$systemd_userdir/urnetwork.service"
-    systemd_update_service="$systemd_userdir/urnetwork-update.service"
-    systemd_update_timer="$systemd_userdir/urnetwork-update.timer"
-    start=0
-    
     if [ -f "$systemd_service" ]; then
         if [ "$(systemctl --user is-active urnetwork.service)" = "active" ]; then
             pr_err "warning: urnetwork.service is running, it will be stopped to perform an update/reinstall"
 	        pr_err "warning: It will be started again automatically, once the update finishes"
             pr_err "warning: You will need to restart this service after this update/reinstall if auto start fails"
-	        start=1
+	        systemd_units_stopped=1
         fi
 
         systemctl --user disable --now urnetwork.service || {
@@ -315,6 +315,11 @@ install_systemd_units ()
             pr_err "Failed to disable urnetwork-update.timer early before update/reinstall; continuing anyway"
         }
     fi
+}
+
+install_systemd_units ()
+{
+    start="$systemd_units_stopped"
 
     pr_info "Installing urnetwork.service in %s" "$systemd_service"
     mkdir -p "$systemd_userdir"
@@ -581,6 +586,10 @@ do_install ()
             pr_err "This indicates an issue with the tarball that was downloaded."
             exit 1
         fi
+    fi
+	
+    if [ "$has_systemd" -eq 1 ]; then
+        stop_systemd_units
     fi
 
     if [ -d "$install_path" ] && [ "$operation" = "install" ]; then
