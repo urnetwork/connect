@@ -166,8 +166,8 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		StatsWindowKeepHealthiestCount:                   2,
 		StatsWindowMinHealthyEffectiveByteCountPerSecond: kib(1),
 
-		ProtocolVersion:       DefaultProtocolVersion,
-		DestinationIpAffinity: true,
+		ProtocolVersion:     DefaultProtocolVersion,
+		DestinationAffinity: true,
 
 		RemoteUserNatMultiClientMonitorSettings: *DefaultRemoteUserNatMultiClientMonitorSettings(),
 	}
@@ -229,8 +229,8 @@ type MultiClientSettings struct {
 	StatsWindowKeepHealthiestCount                   int
 	StatsWindowMinHealthyEffectiveByteCountPerSecond ByteCount
 
-	ProtocolVersion       int
-	DestinationIpAffinity bool
+	ProtocolVersion     int
+	DestinationAffinity bool
 
 	RemoteUserNatMultiClientMonitorSettings
 }
@@ -274,12 +274,12 @@ type RemoteUserNatMultiClient struct {
 	// for locally generated packets this is `ProvideMode_Network`
 	provideMode protocol.ProvideMode
 
-	stateLock      sync.Mutex
-	ip4PathUpdates map[Ip4Path]*multiClientChannelUpdate
-	ip6PathUpdates map[Ip6Path]*multiClientChannelUpdate
-	ip4IpPaths     map[[4]byte]map[Ip4Path]bool
-	ip6IpPaths     map[[16]byte]map[Ip6Path]bool
-	clientUpdates  map[*multiClientChannel]map[*multiClientChannelUpdate]bool
+	stateLock        sync.Mutex
+	ip4PathUpdates   map[Ip4Path]*multiClientChannelUpdate
+	ip6PathUpdates   map[Ip6Path]*multiClientChannelUpdate
+	affinityIp4Paths map[Ip4Path]map[Ip4Path]bool
+	affinityIp6Paths map[Ip6Path]map[Ip6Path]bool
+	clientUpdates    map[*multiClientChannel]map[*multiClientChannelUpdate]bool
 }
 
 func NewRemoteUserNatMultiClientWithDefaults(
@@ -321,8 +321,8 @@ func NewRemoteUserNatMultiClient(
 		provideMode:           provideMode,
 		ip4PathUpdates:        map[Ip4Path]*multiClientChannelUpdate{},
 		ip6PathUpdates:        map[Ip6Path]*multiClientChannelUpdate{},
-		ip4IpPaths:            map[[4]byte]map[Ip4Path]bool{},
-		ip6IpPaths:            map[[16]byte]map[Ip6Path]bool{},
+		affinityIp4Paths:      map[Ip4Path]map[Ip4Path]bool{},
+		affinityIp6Paths:      map[Ip6Path]map[Ip6Path]bool{},
 		clientUpdates:         map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
 	}
 
@@ -374,6 +374,31 @@ func (self *RemoteUserNatMultiClient) AddContractStatusCallback(contractStatusCa
 		for _, sub := range subs {
 			sub()
 		}
+	}
+}
+
+// ordered by choice descending
+func (self *RemoteUserNatMultiClient) selectWindowTypes(sendPacket *parsedPacket) []WindowType {
+	// - web traffic is routed to quality providers
+	// - all other traffic is routed to speed providers
+	if sendPacket.ipPath.DestinationPort == 443 {
+		return []WindowType{WindowTypeQuality, WindowTypeSpeed}
+	}
+	return []WindowType{WindowTypeSpeed, WindowTypeQuality}
+}
+
+func (self *RemoteUserNatMultiClient) affinityIpPath(ipPath *IpPath) *IpPath {
+	// - web traffic has affinity per (source, source port, destination, destination port)
+	//   this is most resilient to retries
+	// - all other traffic has affinity for (destination, destination port)
+	if ipPath.DestinationPort == 443 {
+		return ipPath
+	}
+	return &IpPath{
+		Version:         ipPath.Version,
+		Protocol:        ipPath.Protocol,
+		DestinationIp:   ipPath.DestinationIp,
+		DestinationPort: ipPath.DestinationPort,
 	}
 }
 
@@ -480,15 +505,18 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClien
 
 						client = update.client
 
-						if self.ip4PathUpdates[ip4Path] == update {
-							delete(self.ip4PathUpdates, ip4Path)
-							if paths, ok := self.ip4IpPaths[ip4Path.DestinationIp]; ok {
+						delete(self.ip4PathUpdates, ip4Path)
+
+						if self.settings.DestinationAffinity {
+							affinityIp4Path := self.affinityIpPath(ipPath).ToIp4Path()
+							if paths, ok := self.affinityIp4Paths[affinityIp4Path]; ok {
 								delete(paths, ip4Path)
 								if len(paths) == 0 {
-									delete(self.ip4IpPaths, ip4Path.DestinationIp)
+									delete(self.affinityIp4Paths, affinityIp4Path)
 								}
 							}
 						}
+
 						if client != nil {
 							if updates, ok := self.clientUpdates[client]; ok {
 								delete(updates, update)
@@ -512,16 +540,18 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClien
 				}
 			}, update.cancel)
 			self.ip4PathUpdates[ip4Path] = update
-			paths, ok := self.ip4IpPaths[ip4Path.DestinationIp]
-			if !ok {
-				paths = map[Ip4Path]bool{}
-				self.ip4IpPaths[ip4Path.DestinationIp] = paths
-			}
-			paths[ip4Path] = true
 
-			if self.settings.DestinationIpAffinity {
+			if self.settings.DestinationAffinity {
+				affinityIp4Path := self.affinityIpPath(ipPath).ToIp4Path()
+				paths, ok := self.affinityIp4Paths[affinityIp4Path]
+				if !ok {
+					paths = map[Ip4Path]bool{}
+					self.affinityIp4Paths[affinityIp4Path] = paths
+				}
+				paths[ip4Path] = true
+
 				var mostRecentActivityTime time.Time
-				for copyIp4Path, _ := range self.ip4IpPaths[ip4Path.DestinationIp] {
+				for copyIp4Path, _ := range paths {
 					if copyUpdate, ok := self.ip4PathUpdates[copyIp4Path]; ok {
 						if copyUpdate.client != nil && copyUpdate.activityTime.After(mostRecentActivityTime) {
 							mostRecentActivityTime = copyUpdate.activityTime
@@ -556,15 +586,18 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClien
 
 						client = update.client
 
-						if self.ip6PathUpdates[ip6Path] == update {
-							delete(self.ip6PathUpdates, ip6Path)
-							if paths, ok := self.ip6IpPaths[ip6Path.DestinationIp]; ok {
+						delete(self.ip6PathUpdates, ip6Path)
+
+						if self.settings.DestinationAffinity {
+							affinityIp6Path := self.affinityIpPath(ipPath).ToIp6Path()
+							if paths, ok := self.affinityIp6Paths[affinityIp6Path]; ok {
 								delete(paths, ip6Path)
 								if len(paths) == 0 {
-									delete(self.ip6IpPaths, ip6Path.DestinationIp)
+									delete(self.affinityIp6Paths, affinityIp6Path)
 								}
 							}
 						}
+
 						if client != nil {
 							if updates, ok := self.clientUpdates[client]; ok {
 								delete(updates, update)
@@ -588,16 +621,18 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClien
 				}
 			}, update.cancel)
 			self.ip6PathUpdates[ip6Path] = update
-			paths, ok := self.ip6IpPaths[ip6Path.DestinationIp]
-			if !ok {
-				paths = map[Ip6Path]bool{}
-				self.ip6IpPaths[ip6Path.DestinationIp] = paths
-			}
-			paths[ip6Path] = true
 
-			if self.settings.DestinationIpAffinity {
+			if self.settings.DestinationAffinity {
+				affinityIp6Path := self.affinityIpPath(ipPath).ToIp6Path()
+				paths, ok := self.affinityIp6Paths[affinityIp6Path]
+				if !ok {
+					paths = map[Ip6Path]bool{}
+					self.affinityIp6Paths[affinityIp6Path] = paths
+				}
+				paths[ip6Path] = true
+
 				var mostRecentActivityTime time.Time
-				for copyIp6Path, _ := range self.ip6IpPaths[ip6Path.DestinationIp] {
+				for copyIp6Path, _ := range paths {
 					if copyUpdate, ok := self.ip6PathUpdates[copyIp6Path]; ok {
 						if copyUpdate.client != nil && copyUpdate.activityTime.After(mostRecentActivityTime) {
 							mostRecentActivityTime = copyUpdate.activityTime
@@ -712,16 +747,6 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 		glog.Infof("[multi]drop packet ipv%d p%v -> %s:%d\n", ipPath.Version, ipPath.Protocol, ipPath.DestinationIp, ipPath.DestinationPort)
 		return false
 	}
-}
-
-// ordered by choice descending
-func (self *RemoteUserNatMultiClient) selectWindowTypes(sendPacket *parsedPacket) []WindowType {
-	// - web traffic is routed to quality providers
-	// - all other traffic is routed to speed providers
-	if sendPacket.ipPath.DestinationPort == 443 {
-		return []WindowType{WindowTypeQuality, WindowTypeSpeed}
-	}
-	return []WindowType{WindowTypeSpeed, WindowTypeQuality}
 }
 
 func (self *RemoteUserNatMultiClient) sendPacket(
@@ -1167,8 +1192,8 @@ func (self *RemoteUserNatMultiClient) Close() {
 		}
 		clear(self.ip4PathUpdates)
 		clear(self.ip6PathUpdates)
-		clear(self.ip4IpPaths)
-		clear(self.ip6IpPaths)
+		clear(self.affinityIp4Paths)
+		clear(self.affinityIp6Paths)
 		// clear(self.updateIp4Paths)
 		// clear(self.updateIp6Paths)
 		// clear(clientUpdates)
