@@ -451,7 +451,7 @@ do_install ()
                 exit 1
             fi
 
-	    tag="$(cat "$version_file")"
+	   		tag="$(cat "$version_file")"
 
             while [ $# -gt 0 ]; do
                 case "$1" in
@@ -850,13 +850,28 @@ change_auto_update_prefs ()
 
 toggle_auto_start ()
 {
-    if ! systemctl --user is-enabled --quiet urnetwork.service; then
-	pr_info "Enabling urnetwork.service (on login)"
-	systemctl --user enable urnetwork.service
-    else
-	pr_info "Disabling urnetwork.service"
-	systemctl --user disable urnetwork.service
-    fi
+	if test "$1" != on && test "$1" != off; then
+		pr_err "Invalid value: %s, must be either on or off" "$1"
+		exit 1
+	fi
+
+	if test "$1" = on; then
+		if systemctl --user is-enabled --quiet urnetwork.service; then
+			pr_info "urnetwork.service is already enabled on login"
+			exit 0
+	    else
+			pr_info "Enabling urnetwork.service (on login)"
+			systemctl --user enable urnetwork.service
+	    fi
+	else
+		if ! systemctl --user is-enabled --quiet urnetwork.service; then
+			pr_info "urnetwork.service is already disabled"
+			exit 0
+	    else
+			pr_info "Disabling urnetwork.service"
+			systemctl --user disable urnetwork.service
+	    fi
+	fi
 }
 
 do_start ()
@@ -898,19 +913,19 @@ case "$operation" in
         ;;
 
     auto-start)
-	toggle_auto_start
-	exit 0
-	;;
+		toggle_auto_start "$@"
+		exit 0
+		;;
 
     start)
-	do_start
-	exit 0
-	;;
+		do_start
+		exit 0
+		;;
 
     stop)
-	do_stop
-	exit 0
-	;;
+		do_stop
+		exit 0
+		;;
     
     *)
         pr_err "Invalid operation '%s'" "$operation"
