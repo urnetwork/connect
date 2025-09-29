@@ -18,10 +18,11 @@ show_help ()
         echo "  $me [options] start"
         echo "  $me [options] stop"
         echo "  $me [options] update"
+        echo "  $me [options] status"
         echo "  $me [options] reinstall [-t=TAG] [-B]"
         echo "  $me [options] uninstall [-B]"
         echo "  $me [options] auto-update [on | off] [--interval=INTERVAL]"
-        echo "  $me [options] auto-start"
+        echo "  $me [options] auto-start [on | off]"
         echo "  $me [-h] [-v]"
     else
 	    echo "  $me [options] [-t=TAG] [-B]"
@@ -41,11 +42,12 @@ show_help ()
         echo "  start                   Start URnetwork provider"
         echo "  stop                    Stop URnetwork provider"
         echo "  update                  Upgrade URnetwork, if updates are available"
+        echo "  status                  Show the status of URnetwork provider service"
         echo "  reinstall               Reinstall URnetwork"
         echo "  uninstall               Uninstall URnetwork"
         echo "  auto-update             Manage auto update settings.  If no argument is"
         echo "                          specified, it will print the current auto update state."
-	echo "  auto-start              Toggle auto-start of URnetwork provider on login"
+		echo "  auto-start              Turn auto-start of URnetwork provider on login on or off"
         echo ""
         echo "Options for reinstall:"
         echo "  -t, --tag=TAG           Reinstall a specific version of URnetwork."
@@ -850,6 +852,11 @@ change_auto_update_prefs ()
 
 toggle_auto_start ()
 {
+	if test -z "$1"; then
+		pr_err "Must provide an argument: Either 'on' or 'off'"
+		exit 1
+	fi
+
 	if test "$1" != on && test "$1" != off; then
 		pr_err "Invalid value: %s, must be either on or off" "$1"
 		exit 1
