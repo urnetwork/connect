@@ -877,23 +877,28 @@ toggle_auto_start ()
 do_start ()
 {
     if ! systemctl --user is-active --quiet urnetwork.service; then
-	pr_info "Starting urnetwork.service"
-	systemctl --user start urnetwork.service || { pr_err "Failed to start urnetwork.service"; exit 1; }
+		pr_info "Starting urnetwork.service"
+		systemctl --user start urnetwork.service || { pr_err "Failed to start urnetwork.service"; exit 1; }
     else
-	pr_info "Service urnetwork.service is already active"
-	exit 1
+		pr_info "Service urnetwork.service is already active"
+		exit 1
     fi
 }
 
 do_stop ()
 {
     if systemctl --user is-active --quiet urnetwork.service; then
-	pr_info "Stopping urnetwork.service"
-	systemctl --user stop urnetwork.service || { pr_err "Failed to stop urnetwork.service"; exit 1; }
+		pr_info "Stopping urnetwork.service"
+		systemctl --user stop urnetwork.service || { pr_err "Failed to stop urnetwork.service"; exit 1; }
     else
-	pr_info "Service urnetwork.service is not active"
-	exit 1
+		pr_info "Service urnetwork.service is not active"
+		exit 1
     fi
+}
+
+show_status ()
+{
+	systemctl --user status urnetwork.service
 }
 
 case "$operation" in
@@ -924,6 +929,11 @@ case "$operation" in
 
     stop)
 		do_stop
+		exit 0
+		;;
+
+	status)
+		show_status
 		exit 0
 		;;
     
