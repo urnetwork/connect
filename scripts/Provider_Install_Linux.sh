@@ -18,10 +18,11 @@ show_help ()
         echo "  $me [options] start"
         echo "  $me [options] stop"
         echo "  $me [options] update"
+        echo "  $me [options] status"
         echo "  $me [options] reinstall [-t=TAG] [-B]"
         echo "  $me [options] uninstall [-B]"
         echo "  $me [options] auto-update [on | off] [--interval=INTERVAL]"
-        echo "  $me [options] auto-start"
+        echo "  $me [options] auto-start [on | off]"
         echo "  $me [-h] [-v]"
     else
 	    echo "  $me [options] [-t=TAG] [-B]"
@@ -41,11 +42,12 @@ show_help ()
         echo "  start                   Start URnetwork provider"
         echo "  stop                    Stop URnetwork provider"
         echo "  update                  Upgrade URnetwork, if updates are available"
+        echo "  status                  Show the status of URnetwork provider service"
         echo "  reinstall               Reinstall URnetwork"
         echo "  uninstall               Uninstall URnetwork"
         echo "  auto-update             Manage auto update settings.  If no argument is"
         echo "                          specified, it will print the current auto update state."
-	echo "  auto-start              Toggle auto-start of URnetwork provider on login"
+		echo "  auto-start              Turn auto-start of URnetwork provider on login on or off"
         echo ""
         echo "Options for reinstall:"
         echo "  -t, --tag=TAG           Reinstall a specific version of URnetwork."
@@ -451,7 +453,7 @@ do_install ()
                 exit 1
             fi
 
-	    tag="$(cat "$version_file")"
+	   		tag="$(cat "$version_file")"
 
             while [ $# -gt 0 ]; do
                 case "$1" in
@@ -850,35 +852,60 @@ change_auto_update_prefs ()
 
 toggle_auto_start ()
 {
-    if ! systemctl --user is-enabled --quiet urnetwork.service; then
-	pr_info "Enabling urnetwork.service (on login)"
-	systemctl --user enable urnetwork.service
-    else
-	pr_info "Disabling urnetwork.service"
-	systemctl --user disable urnetwork.service
-    fi
+	if test -z "$1"; then
+		pr_err "Must provide an argument: Either 'on' or 'off'"
+		exit 1
+	fi
+
+	if test "$1" != on && test "$1" != off; then
+		pr_err "Invalid value: %s, must be either on or off" "$1"
+		exit 1
+	fi
+
+	if test "$1" = on; then
+		if systemctl --user is-enabled --quiet urnetwork.service; then
+			pr_info "urnetwork.service is already enabled on login"
+			exit 0
+	    else
+			pr_info "Enabling urnetwork.service (on login)"
+			systemctl --user enable urnetwork.service
+	    fi
+	else
+		if ! systemctl --user is-enabled --quiet urnetwork.service; then
+			pr_info "urnetwork.service is already disabled"
+			exit 0
+	    else
+			pr_info "Disabling urnetwork.service"
+			systemctl --user disable urnetwork.service
+	    fi
+	fi
 }
 
 do_start ()
 {
     if ! systemctl --user is-active --quiet urnetwork.service; then
-	pr_info "Starting urnetwork.service"
-	systemctl --user start urnetwork.service || { pr_err "Failed to start urnetwork.service"; exit 1; }
+		pr_info "Starting urnetwork.service"
+		systemctl --user start urnetwork.service || { pr_err "Failed to start urnetwork.service"; exit 1; }
     else
-	pr_info "Service urnetwork.service is already active"
-	exit 1
+		pr_info "Service urnetwork.service is already active"
+		exit 1
     fi
 }
 
 do_stop ()
 {
     if systemctl --user is-active --quiet urnetwork.service; then
-	pr_info "Stopping urnetwork.service"
-	systemctl --user stop urnetwork.service || { pr_err "Failed to stop urnetwork.service"; exit 1; }
+		pr_info "Stopping urnetwork.service"
+		systemctl --user stop urnetwork.service || { pr_err "Failed to stop urnetwork.service"; exit 1; }
     else
-	pr_info "Service urnetwork.service is not active"
-	exit 1
+		pr_info "Service urnetwork.service is not active"
+		exit 1
     fi
+}
+
+show_status ()
+{
+	systemctl --user status urnetwork.service
 }
 
 case "$operation" in
@@ -898,19 +925,24 @@ case "$operation" in
         ;;
 
     auto-start)
-	toggle_auto_start
-	exit 0
-	;;
+		toggle_auto_start "$@"
+		exit 0
+		;;
 
     start)
-	do_start
-	exit 0
-	;;
+		do_start
+		exit 0
+		;;
 
     stop)
-	do_stop
-	exit 0
-	;;
+		do_stop
+		exit 0
+		;;
+
+	status)
+		show_status
+		exit 0
+		;;
     
     *)
         pr_err "Invalid operation '%s'" "$operation"
