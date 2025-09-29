@@ -2561,38 +2561,41 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 			}
 			ipPacketToProvider := ipPacketToProvider_.(*protocol.IpPacketToProvider)
 
-			_, r, err := self.securityPolicy.Inspect(provideMode, ipPacketToProvider.IpPacket.PacketBytes)
+			ipPath, err := ParseIpPath(ipPacketToProvider.IpPacket.PacketBytes)
 			if err == nil {
-				switch r {
-				case SecurityPolicyResultAllow:
-					c := func() bool {
-						var packet []byte
-						if frame.Raw {
-							packet = MessagePoolShareReadOnly(ipPacketToProvider.IpPacket.PacketBytes)
+				r, err := self.securityPolicy.Inspect(provideMode, ipPath)
+				if err == nil {
+					switch r {
+					case SecurityPolicyResultAllow:
+						c := func() bool {
+							var packet []byte
+							if frame.Raw {
+								packet = MessagePoolShareReadOnly(ipPacketToProvider.IpPacket.PacketBytes)
+							} else {
+								packet = MessagePoolCopy(ipPacketToProvider.IpPacket.PacketBytes)
+							}
+							success := self.localUserNat.SendPacketWithTimeout(
+								source,
+								provideMode,
+								packet,
+								self.settings.WriteTimeout,
+							)
+							if !success {
+								MessagePoolReturn(packet)
+							}
+							return success
+						}
+						if glog.V(2) {
+							TraceWithReturn(
+								fmt.Sprintf("[unpr] %s<-%s s(%s)", self.client.ClientTag(), source.SourceId, source.StreamId),
+								c,
+							)
 						} else {
-							packet = MessagePoolCopy(ipPacketToProvider.IpPacket.PacketBytes)
+							c()
 						}
-						success := self.localUserNat.SendPacketWithTimeout(
-							source,
-							provideMode,
-							packet,
-							self.settings.WriteTimeout,
-						)
-						if !success {
-							MessagePoolReturn(packet)
-						}
-						return success
+					case SecurityPolicyResultIncident:
+						self.client.ReportAbuse(source)
 					}
-					if glog.V(2) {
-						TraceWithReturn(
-							fmt.Sprintf("[unpr] %s<-%s s(%s)", self.client.ClientTag(), source.SourceId, source.StreamId),
-							c,
-						)
-					} else {
-						c()
-					}
-				case SecurityPolicyResultIncident:
-					self.client.ReportAbuse(source)
 				}
 			}
 		}
@@ -2651,7 +2654,11 @@ func (self *RemoteUserNatClient) SecurityPolicyStats(reset bool) SecurityPolicyS
 func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool {
 	minRelationship := max(provideMode, self.provideMode)
 
-	ipPath, r, err := self.securityPolicy.Inspect(minRelationship, packet)
+	ipPath, err := ParseIpPath(packet)
+	if err != nil {
+		return false
+	}
+	r, err := self.securityPolicy.Inspect(minRelationship, ipPath)
 	if err != nil {
 		return false
 	}

@@ -51,7 +51,7 @@ func (self SecurityPolicyResult) String() string {
 
 type SecurityPolicy interface {
 	Stats() *securityPolicyStats
-	Inspect(provideMode protocol.ProvideMode, packet []byte) (*IpPath, SecurityPolicyResult, error)
+	Inspect(provideMode protocol.ProvideMode, ipPath *IpPath) (SecurityPolicyResult, error)
 }
 
 type EgressSecurityPolicy struct {
@@ -72,21 +72,15 @@ func (self *EgressSecurityPolicy) Stats() *securityPolicyStats {
 	return self.stats
 }
 
-func (self *EgressSecurityPolicy) Inspect(provideMode protocol.ProvideMode, packet []byte) (*IpPath, SecurityPolicyResult, error) {
-	ipPath, result, err := self.inspect(provideMode, packet)
+func (self *EgressSecurityPolicy) Inspect(provideMode protocol.ProvideMode, ipPath *IpPath) (SecurityPolicyResult, error) {
+	result, err := self.inspect(provideMode, ipPath)
 	if ipPath != nil {
 		self.stats.AddDestination(ipPath, result, 1)
 	}
-	return ipPath, result, err
+	return result, err
 }
 
-func (self *EgressSecurityPolicy) inspect(provideMode protocol.ProvideMode, packet []byte) (*IpPath, SecurityPolicyResult, error) {
-	ipPath, err := ParseIpPath(packet)
-	if err != nil {
-		// bad ip packet
-		return nil, SecurityPolicyResultDrop, err
-	}
-
+func (self *EgressSecurityPolicy) inspect(provideMode protocol.ProvideMode, ipPath *IpPath) (SecurityPolicyResult, error) {
 	// if protocol.ProvideMode_Network == provideMode {
 	// 	return ipPath, SecurityPolicyResultAllow, nil
 	// } else {
@@ -96,14 +90,14 @@ func (self *EgressSecurityPolicy) inspect(provideMode protocol.ProvideMode, pack
 	// - block insecure or known unencrypted traffic
 
 	if !isPublicUnicast(ipPath.DestinationIp) {
-		return ipPath, SecurityPolicyResultIncident, nil
+		return SecurityPolicyResultIncident, nil
 	}
 
 	switch ipPath.Version {
 	case 4:
 		if dIp4 := ipPath.DestinationIp.To4(); dIp4 != nil {
 			if blockIp4s[[4]byte(dIp4)] {
-				return ipPath, SecurityPolicyResultDrop, nil
+				return SecurityPolicyResultDrop, nil
 			}
 		}
 	case 6:
@@ -163,9 +157,9 @@ func (self *EgressSecurityPolicy) inspect(provideMode protocol.ProvideMode, pack
 		}
 	}
 	if allow() {
-		return ipPath, SecurityPolicyResultAllow, nil
+		return SecurityPolicyResultAllow, nil
 	}
-	return ipPath, SecurityPolicyResultDrop, nil
+	return SecurityPolicyResultDrop, nil
 }
 
 type IngressSecurityPolicy struct {
@@ -186,21 +180,13 @@ func (self *IngressSecurityPolicy) Stats() *securityPolicyStats {
 	return self.stats
 }
 
-func (self *IngressSecurityPolicy) Inspect(provideMode protocol.ProvideMode, packet []byte) (*IpPath, SecurityPolicyResult, error) {
-	ipPath, result, err := self.inspect(provideMode, packet)
-	if ipPath != nil {
-		self.stats.AddSource(ipPath, result, 1)
-	}
-	return ipPath, result, err
+func (self *IngressSecurityPolicy) Inspect(provideMode protocol.ProvideMode, ipPath *IpPath) (SecurityPolicyResult, error) {
+	result, err := self.inspect(provideMode, ipPath)
+	self.stats.AddSource(ipPath, result, 1)
+	return result, err
 }
 
-func (self *IngressSecurityPolicy) inspect(provideMode protocol.ProvideMode, packet []byte) (*IpPath, SecurityPolicyResult, error) {
-	ipPath, err := ParseIpPath(packet)
-	if err != nil {
-		// bad ip packet
-		return nil, SecurityPolicyResultDrop, err
-	}
-
+func (self *IngressSecurityPolicy) inspect(provideMode protocol.ProvideMode, ipPath *IpPath) (SecurityPolicyResult, error) {
 	allow := func() bool {
 		// dPort := ipPath.DestinationPort
 		sPort := ipPath.SourcePort
@@ -215,9 +201,9 @@ func (self *IngressSecurityPolicy) inspect(provideMode protocol.ProvideMode, pac
 		}
 	}
 	if allow() {
-		return ipPath, SecurityPolicyResultAllow, nil
+		return SecurityPolicyResultAllow, nil
 	}
-	return ipPath, SecurityPolicyResultDrop, nil
+	return SecurityPolicyResultDrop, nil
 }
 
 func isPublicUnicast(ip net.IP) bool {
