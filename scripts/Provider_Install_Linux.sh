@@ -1,5 +1,5 @@
 #!/bin/sh
-
+# Credits: Ar Rakin, Ryan Mello
 # urnet-tools -- URnetwork manager script (also acts as an installation script)
 # GitHub: <https://github.com/urnetwork/connect>
 
