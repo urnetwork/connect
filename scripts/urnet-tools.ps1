@@ -1,4 +1,7 @@
 #!/usr/bin/env pwsh
+# Credits: Ar Rakin, Ryan Mello
+# urnet-tools -- URnetwork manager script (also acts as an installation script)
+# GitHub: <https://github.com/urnetwork/connect>
 
 <#
 .SYNOPSIS
@@ -43,11 +46,6 @@
 
 .INPUTS
     None. Does not take any input.
-
-.NOTES
-    Author: Ar Rakin
-    Date: Aug 10, 2025
-    Version: 1.0.0
 
 .LINK
     https://docs.ur.io/provider
