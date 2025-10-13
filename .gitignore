@@ -8,4 +8,4 @@ provider/provider
 connectctl/connectctl
 tetherctl/*.conf
 api/redoc-static.html
-
+security/ips.{go,txt}
