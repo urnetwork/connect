@@ -1354,13 +1354,10 @@ type MultiClientGeneratorClientArgs struct {
 }
 
 func DefaultApiMultiClientGeneratorSettings() *ApiMultiClientGeneratorSettings {
-	return &ApiMultiClientGeneratorSettings{
-		InitTimeout: 5 * time.Second,
-	}
+	return &ApiMultiClientGeneratorSettings{}
 }
 
 type ApiMultiClientGeneratorSettings struct {
-	InitTimeout time.Duration
 }
 
 type ApiMultiClientGenerator struct {
@@ -1577,19 +1574,10 @@ func (self *ApiMultiClientGenerator) NewClient(
 		settings,
 	)
 	// enable return traffic for this client
-	ack := make(chan struct{})
 	client.ContractManager().SetProvideModesWithReturnTrafficWithAckCallback(
 		map[protocol.ProvideMode]bool{},
-		func(err error) {
-			close(ack)
-		},
+		nil,
 	)
-	select {
-	case <-ack:
-	case <-time.After(self.settings.InitTimeout):
-		client.Cancel()
-		return nil, errors.New("Could not enable return traffic for client.")
-	}
 	return client, nil
 }
 
