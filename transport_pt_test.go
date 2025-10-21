@@ -31,7 +31,7 @@ import (
 )
 
 func TestPtDnsEncodeDecode(t *testing.T) {
-	ptEncodeDecodeTest(t, PacketTranslationModeDns, PacketTranslationModeDecode53, 5555)
+	ptEncodeDecodeTest(t, PacketTranslationModeDns, PacketTranslationModeDecode53, 6555)
 }
 
 func TestPtDnsPumpEncodeDecode(t *testing.T) {
