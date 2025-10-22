@@ -801,7 +801,7 @@ func (self *ContractManager) addContract(contractKey ContractKey, contract *prot
 	return nil
 }
 
-func (self *ContractManager) CreateContract(contractKey ContractKey, timeout time.Duration) {
+func (self *ContractManager) CreateContract(contractKey ContractKey) {
 	// look at destinationContracts and last contract to get previous contract id
 	contractQueue := self.openContractQueue(contractKey)
 	defer self.closeContractQueue(contractKey)

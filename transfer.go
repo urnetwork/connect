@@ -75,7 +75,6 @@ func DefaultClientSettings() *ClientSettings {
 		ForwardBufferSize:       DefaultTransferBufferSize,
 		ReadTimeout:             30 * time.Second,
 		BufferTimeout:           30 * time.Second,
-		ControlWriteTimeout:     15 * time.Second,
 		ControlPingTimeout:      time.Duration(0),
 		SendBufferSettings:      DefaultSendBufferSettings(),
 		ReceiveBufferSettings:   DefaultReceiveBufferSettings(),
@@ -239,11 +238,10 @@ func Ctx(ctx context.Context) transferCtx {
 }
 
 type ClientSettings struct {
-	SendBufferSize      int
-	ForwardBufferSize   int
-	ReadTimeout         time.Duration
-	BufferTimeout       time.Duration
-	ControlWriteTimeout time.Duration
+	SendBufferSize    int
+	ForwardBufferSize int
+	ReadTimeout       time.Duration
+	BufferTimeout     time.Duration
 	// if 0, the client will not send control pings
 	ControlPingTimeout time.Duration
 
@@ -1729,10 +1727,7 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 			}
 			if contract := self.client.ContractManager().TakeContract(self.ctx, contractKey, timeout); contract != nil && setNextContract(contract) {
 				// async queue up the next contract
-				self.client.ContractManager().CreateContract(
-					contractKey,
-					self.client.settings.ControlWriteTimeout,
-				)
+				self.client.ContractManager().CreateContract(contractKey)
 				return true
 			} else {
 				return false
@@ -1775,10 +1770,7 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 				CompanionContract: self.companionContract,
 				ForceStream:       self.forceStream,
 			}
-			self.client.ContractManager().CreateContract(
-				contractKey,
-				self.client.settings.ControlWriteTimeout,
-			)
+			self.client.ContractManager().CreateContract(contractKey)
 
 			if traceNextContract(min(timeout, self.sendBufferSettings.CreateContractRetryInterval)) {
 				return true
