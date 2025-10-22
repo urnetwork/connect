@@ -114,6 +114,9 @@ type PlatformTransportSettings struct {
 	// it smoothes out the h3 transition to not start/stop h1 if h3 connects in this time
 	ModeInitialDelay time.Duration
 
+	MinConnectDelay time.Duration
+	MaxConnectDelay time.Duration
+
 	ProtocolVersion int
 
 	H3Port  int
@@ -146,6 +149,8 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		TransportBufferSize:  1,
 		InactiveDrainTimeout: 30 * time.Second,
 		ModeInitialDelay:     2 * time.Second,
+		MinConnectDelay:      0,
+		MaxConnectDelay:      1 * time.Second,
 		ProtocolVersion:      DefaultProtocolVersion,
 		H3Port:               443,
 		DnsPort:              53,
@@ -433,6 +438,15 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 			success = true
 			return ws, nil
+		}
+
+		connectDelay := self.settings.MinConnectDelay + time.Duration(mathrand.Int63n(int64(
+			self.settings.MaxConnectDelay-self.settings.MinConnectDelay,
+		)))
+		select {
+		case <-self.ctx.Done():
+			return
+		case <-time.After(connectDelay):
 		}
 
 		var ws *websocket.Conn
