@@ -161,10 +161,10 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// TODO on platforms with more memory, increase this
 		MultiRaceClientCount: 4,
 
-		StatsWindowMaxUnhealthyDuration:                  60 * time.Second,
-		StatsWindowWarnUnhealthyDuration:                 15 * time.Second,
-		StatsWindowKeepHealthiestCount:                   2,
-		StatsWindowMinHealthyEffectiveByteCountPerSecond: kib(1),
+		StatsWindowMaxUnhealthyDuration:         30 * time.Second,
+		StatsWindowWarnUnhealthyDuration:        15 * time.Second,
+		StatsWindowKeepHealthiestCount:          2,
+		StatsWindowMinHealthyEffectiveByteCount: kib(4),
 
 		ProtocolVersion:     DefaultProtocolVersion,
 		DestinationAffinity: true,
@@ -224,10 +224,10 @@ type MultiClientSettings struct {
 	MultiRaceClientEarlyCompleteFraction float32
 	MultiRaceClientCount                 int
 
-	StatsWindowMaxUnhealthyDuration                  time.Duration
-	StatsWindowWarnUnhealthyDuration                 time.Duration
-	StatsWindowKeepHealthiestCount                   int
-	StatsWindowMinHealthyEffectiveByteCountPerSecond ByteCount
+	StatsWindowMaxUnhealthyDuration         time.Duration
+	StatsWindowWarnUnhealthyDuration        time.Duration
+	StatsWindowKeepHealthiestCount          int
+	StatsWindowMinHealthyEffectiveByteCount ByteCount
 
 	ProtocolVersion int
 
@@ -2451,6 +2451,15 @@ func (self *clientWindowStats) EffectiveByteCountPerSecond() ByteCount {
 	return ByteCount((1000*netByteCount + millis/2) / millis)
 }
 
+func (self *clientWindowStats) EffectiveByteCount() ByteCount {
+	millis := int64(self.duration / time.Millisecond)
+	if millis <= 0 {
+		return ByteCount(0)
+	}
+	netByteCount := int64(self.sendAckByteCount + self.receiveAckByteCount)
+	return netByteCount
+}
+
 func (self *clientWindowStats) ExpectedByteCountPerSecond() ByteCount {
 	millis := int64(self.duration / time.Millisecond)
 	if millis <= 0 {
@@ -3085,12 +3094,13 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 		eventTime := self.eventBuckets[len(self.eventBuckets)-1].eventTime
 
 		effectiveByteCountPerSecond := stats.EffectiveByteCountPerSecond()
+		effectiveByteCount := stats.EffectiveByteCount()
 		scaledEffectiveByteCountPerSecond := ByteCount(self.settings.StatsWindowMaxEffectiveByteCountPerSecondScale * float32(effectiveByteCountPerSecond))
 		if self.maxEffectiveByteCountPerSecond < scaledEffectiveByteCountPerSecond {
 			self.maxEffectiveByteCountPerSecond = scaledEffectiveByteCountPerSecond
 			self.maxEffectiveByteCountPerSecondTime = eventTime
 		}
-		if self.settings.StatsWindowMinHealthyEffectiveByteCountPerSecond <= effectiveByteCountPerSecond {
+		if self.settings.StatsWindowMinHealthyEffectiveByteCount <= effectiveByteCount {
 			if self.lastUnhealthyTime.IsZero() {
 				self.lastUnhealthyTime = eventTime
 			}
