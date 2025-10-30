@@ -60,6 +60,9 @@ func DefaultClientStrategySettings() *ClientStrategySettings {
 
 		HelloRetryTimeout: 5 * time.Second,
 
+		MinNextConnectDelay: 25 * time.Millisecond,
+		MaxNextConnectDelay: 100 * time.Millisecond,
+
 		ConnectSettings: *DefaultConnectSettings(),
 	}
 }
@@ -98,6 +101,9 @@ type ClientStrategySettings struct {
 
 	HelloRetryTimeout time.Duration
 
+	MinNextConnectDelay time.Duration
+	MaxNextConnectDelay time.Duration
+
 	ConnectSettings
 }
 
@@ -115,6 +121,8 @@ type ClientStrategy struct {
 	// custom extenders
 	// these take precedence over other extenders
 	extenderIpSecrets map[netip.Addr]string
+
+	nextConnectTime time.Time
 }
 
 func NewClientStrategyWithDefaults(ctx context.Context) *ClientStrategy {
@@ -296,6 +304,23 @@ func (self *ClientStrategy) CustomExtenders() map[netip.Addr]string {
 	defer self.mutex.Unlock()
 
 	return maps.Clone(self.extenderIpSecrets)
+}
+
+// new connections should use next connect time to avoid flooding the network at once
+func (self *ClientStrategy) NextConnectTime() time.Time {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+
+	now := time.Now()
+	connectDelay := self.settings.MinNextConnectDelay + time.Duration(mathrand.Int63n(int64(
+		self.settings.MaxNextConnectDelay-self.settings.MinNextConnectDelay,
+	)))
+	nextConnectTime := self.nextConnectTime.Add(connectDelay)
+	self.nextConnectTime = nextConnectTime
+	if nextConnectTime.After(now) {
+		return nextConnectTime
+	}
+	return now
 }
 
 func (self *ClientStrategy) dialerWeights() map[*clientDialer]float32 {

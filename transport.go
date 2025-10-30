@@ -114,8 +114,8 @@ type PlatformTransportSettings struct {
 	// it smoothes out the h3 transition to not start/stop h1 if h3 connects in this time
 	ModeInitialDelay time.Duration
 
-	MinConnectDelay time.Duration
-	MaxConnectDelay time.Duration
+	// MinConnectDelay time.Duration
+	// MaxConnectDelay time.Duration
 
 	ProtocolVersion int
 
@@ -149,11 +149,11 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		TransportBufferSize:  1,
 		InactiveDrainTimeout: 30 * time.Second,
 		ModeInitialDelay:     2 * time.Second,
-		MinConnectDelay:      0,
-		MaxConnectDelay:      1 * time.Second,
-		ProtocolVersion:      DefaultProtocolVersion,
-		H3Port:               443,
-		DnsPort:              53,
+		// MinConnectDelay:      0,
+		// MaxConnectDelay:      1 * time.Second,
+		ProtocolVersion: DefaultProtocolVersion,
+		H3Port:          443,
+		DnsPort:         53,
 		// FIXME
 		DnsTlds: [][]byte{[]byte("ur.xyz.")},
 		// servers are migrated on 2025-06-12. We can remove this and always use true.
@@ -440,13 +440,12 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			return ws, nil
 		}
 
-		connectDelay := self.settings.MinConnectDelay + time.Duration(mathrand.Int63n(int64(
-			self.settings.MaxConnectDelay-self.settings.MinConnectDelay,
-		)))
-		select {
-		case <-self.ctx.Done():
-			return
-		case <-time.After(connectDelay):
+		if connectDelay := self.clientStrategy.NextConnectTime().Sub(time.Now()); 0 < connectDelay {
+			select {
+			case <-self.ctx.Done():
+				return
+			case <-time.After(connectDelay):
+			}
 		}
 
 		var ws *websocket.Conn
