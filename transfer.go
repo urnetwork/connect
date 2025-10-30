@@ -58,7 +58,7 @@ Each transport should apply the forwarding ACL:
 // nacks are sent as ack until the contract is acked
 
 // use 0 for deadlock testing
-const DefaultTransferBufferSize = 64
+const DefaultTransferBufferSize = 16
 
 var DebugTransferCopyOnWrite = false
 
