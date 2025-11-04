@@ -1360,6 +1360,25 @@ paths:
               schema:
                 $ref: "#/components/schemas/NetworkReferralResult"
 
+  /referral-code/validate:
+    post:
+      description: Validate the referral code.
+      operationId: Validate Referral Code
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ValidateReferralCodeArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ValidateReferralCodeResult"
+
   /account/referral-network:
     get:
       description: |
@@ -3374,6 +3393,25 @@ components:
         error:
           type: object
           nullable: true
+          properties:
+            message:
+              type: string
+
+    ValidateReferralCodeArgs:
+      type: object
+      properties:
+        referral_code:
+          type: string
+
+    ValidateReferralCodeResult:
+      type: object
+      properties:
+        is_valid:
+          type: boolean
+        is_capped:
+          type: boolean
+        error:
+          type: object
           properties:
             message:
               type: string
