@@ -161,10 +161,11 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// TODO on platforms with more memory, increase this
 		MultiRaceClientCount: 4,
 
-		StatsWindowMaxUnhealthyDuration:         30 * time.Second,
-		StatsWindowWarnUnhealthyDuration:        15 * time.Second,
-		StatsWindowKeepHealthiestCount:          2,
-		StatsWindowMinHealthyEffectiveByteCount: kib(4),
+		StatsWindowMaxUnhealthyDuration:  30 * time.Second,
+		StatsWindowWarnUnhealthyDuration: 15 * time.Second,
+		StatsWindowKeepHealthiestCount:   2,
+		// aggressively cycle out providers when transfer is done
+		StatsWindowMinHealthyEffectiveByteCount: kib(32),
 
 		ProtocolVersion:     DefaultProtocolVersion,
 		DestinationAffinity: true,
