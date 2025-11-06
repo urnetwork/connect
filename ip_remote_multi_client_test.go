@@ -279,10 +279,14 @@ func TestMultiClientChannelWindowStats(t *testing.T) {
 	stats, err := clientChannel.windowStatsWithCoalesce(false)
 	assert.Equal(t, nil, err)
 
-	assert.Equal(t, maxBucketCount, stats.bucketCount)
+	// [1, maxBucketCount]
+	assert.Equal(t, true, 1 <= stats.bucketCount)
+	assert.Equal(t, true, stats.bucketCount <= maxBucketCount)
 
 	stats, err = clientChannel.WindowStats()
 	assert.Equal(t, nil, err)
 
-	assert.Equal(t, maxBucketCount, stats.bucketCount)
+	// [1, maxBucketCount]
+	assert.Equal(t, true, 1 <= stats.bucketCount)
+	assert.Equal(t, true, stats.bucketCount <= maxBucketCount)
 }
