@@ -85,6 +85,7 @@ func DefaultContractManagerSettings() *ContractManagerSettings {
 		panic(err)
 	}
 	return &ContractManagerSettings{
+		InitialContractTransferByteCount:  kib(4),
 		StandardContractTransferByteCount: mib(128),
 
 		NetworkEventTimeEnableContracts: networkEventTimeEnableContracts,
@@ -105,6 +106,8 @@ func DefaultContractManagerSettingsNoNetworkEvents() *ContractManagerSettings {
 }
 
 type ContractManagerSettings struct {
+	// this should be enough to do a single ping
+	InitialContractTransferByteCount  ByteCount
 	StandardContractTransferByteCount ByteCount
 
 	// enable contracts on the network
@@ -801,7 +804,7 @@ func (self *ContractManager) addContract(contractKey ContractKey, contract *prot
 	return nil
 }
 
-func (self *ContractManager) CreateContract(contractKey ContractKey) {
+func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeqIndex uint64) {
 	// look at destinationContracts and last contract to get previous contract id
 	contractQueue := self.openContractQueue(contractKey)
 	defer self.closeContractQueue(contractKey)
@@ -810,7 +813,7 @@ func (self *ContractManager) CreateContract(contractKey ContractKey) {
 		DestinationId:     contractKey.Destination.DestinationId.Bytes(),
 		IntermediaryIds:   contractKey.IntermediaryIds.Bytes(),
 		StreamId:          contractKey.Destination.StreamId.Bytes(),
-		TransferByteCount: uint64(self.settings.StandardContractTransferByteCount),
+		TransferByteCount: uint64(self.contractByteCount(contractSeqIndex)),
 		Companion:         contractKey.CompanionContract,
 		ForceStream:       &contractKey.ForceStream,
 		UsedContractIds:   contractQueue.UsedContractIdBytes(),
@@ -835,6 +838,14 @@ func (self *ContractManager) CreateContract(contractKey ContractKey) {
 			}
 		},
 	)
+}
+
+func (self *ContractManager) contractByteCount(contractSeqIndex uint64) ByteCount {
+	if contractSeqIndex == 0 {
+		return self.settings.InitialContractTransferByteCount
+	} else {
+		return self.settings.StandardContractTransferByteCount
+	}
 }
 
 func (self *ContractManager) CheckpointContract(

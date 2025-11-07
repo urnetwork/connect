@@ -1258,6 +1258,8 @@ type SendSequence struct {
 
 	contractMultiRouteWriter            MultiRouteWriter
 	contractMultiRouteWriterDestination TransferPath
+
+	contractSeqIndex uint64
 }
 
 func NewSendSequence(
@@ -1300,6 +1302,7 @@ func NewSendSequence(
 		nextSequenceNumber: 0,
 		idleCondition:      NewIdleCondition(),
 		rttWindow:          rttWindow,
+		contractSeqIndex:   0,
 	}
 }
 
@@ -1726,8 +1729,9 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 				ForceStream:       self.forceStream,
 			}
 			if contract := self.client.ContractManager().TakeContract(self.ctx, contractKey, timeout); contract != nil && setNextContract(contract) {
+				self.contractSeqIndex += 1
 				// async queue up the next contract
-				self.client.ContractManager().CreateContract(contractKey)
+				self.client.ContractManager().CreateContract(contractKey, self.contractSeqIndex)
 				return true
 			} else {
 				return false
@@ -1770,7 +1774,7 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 				CompanionContract: self.companionContract,
 				ForceStream:       self.forceStream,
 			}
-			self.client.ContractManager().CreateContract(contractKey)
+			self.client.ContractManager().CreateContract(contractKey, self.contractSeqIndex)
 
 			if traceNextContract(min(timeout, self.sendBufferSettings.CreateContractRetryInterval)) {
 				return true
