@@ -1731,7 +1731,11 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 			if contract := self.client.ContractManager().TakeContract(self.ctx, contractKey, timeout); contract != nil && setNextContract(contract) {
 				self.contractSeqIndex += 1
 				// async queue up the next contract
-				self.client.ContractManager().CreateContract(contractKey, self.contractSeqIndex, messageByteCount)
+				self.client.ContractManager().CreateContract(
+					contractKey,
+					self.contractSeqIndex,
+					ByteCount(32+float32(messageByteCount+self.sendBufferSettings.MinMessageByteCount)/self.sendBufferSettings.ContractFillFraction),
+				)
 				return true
 			} else {
 				return false
@@ -1774,7 +1778,11 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 				CompanionContract: self.companionContract,
 				ForceStream:       self.forceStream,
 			}
-			self.client.ContractManager().CreateContract(contractKey, self.contractSeqIndex, messageByteCount)
+			self.client.ContractManager().CreateContract(
+				contractKey,
+				self.contractSeqIndex,
+				ByteCount(32+float32(messageByteCount+messageByteCount+self.sendBufferSettings.MinMessageByteCount)/self.sendBufferSettings.ContractFillFraction),
+			)
 
 			if traceNextContract(min(timeout, self.sendBufferSettings.CreateContractRetryInterval)) {
 				return true
@@ -3430,15 +3438,12 @@ func (self *sequenceContract) update(byteCount ByteCount) bool {
 }
 
 func (self *sequenceContract) ack(byteCount ByteCount) {
-	if self.unackedByteCount < byteCount {
+	effectiveByteCount := max(self.minUpdateByteCount, byteCount)
+
+	if self.unackedByteCount < effectiveByteCount {
 		// debug.PrintStack()
 		panic(fmt.Errorf("Bad accounting %d <> %d", self.unackedByteCount, byteCount))
 	}
-
-	effectiveByteCount := min(
-		max(self.minUpdateByteCount, byteCount),
-		self.unackedByteCount,
-	)
 
 	self.unackedByteCount -= effectiveByteCount
 	self.ackedByteCount += effectiveByteCount
