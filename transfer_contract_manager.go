@@ -87,6 +87,7 @@ func DefaultContractManagerSettings() *ContractManagerSettings {
 	return &ContractManagerSettings{
 		InitialContractTransferByteCount:  kib(4),
 		StandardContractTransferByteCount: mib(128),
+		ContractTransferByteSeqScale:      4,
 
 		NetworkEventTimeEnableContracts: networkEventTimeEnableContracts,
 
@@ -109,6 +110,8 @@ type ContractManagerSettings struct {
 	// this should be enough to do a single ping
 	InitialContractTransferByteCount  ByteCount
 	StandardContractTransferByteCount ByteCount
+	// scale up the contract size over this many contracts
+	ContractTransferByteSeqScale uint64
 
 	// enable contracts on the network
 	// this can be removed after wide adoption
@@ -841,10 +844,13 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 }
 
 func (self *ContractManager) contractByteCount(contractSeqIndex uint64) ByteCount {
-	if contractSeqIndex == 0 {
-		return self.settings.InitialContractTransferByteCount
-	} else {
+	if self.settings.ContractTransferByteSeqScale <= contractSeqIndex {
 		return self.settings.StandardContractTransferByteCount
+	} else {
+		// lerp between initial and standard
+		return self.settings.InitialContractTransferByteCount + ByteCount(
+			(contractSeqIndex*uint64(self.settings.StandardContractTransferByteCount-self.settings.InitialContractTransferByteCount))/self.settings.ContractTransferByteSeqScale,
+		)
 	}
 }
 
