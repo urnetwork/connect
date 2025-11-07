@@ -807,7 +807,7 @@ func (self *ContractManager) addContract(contractKey ContractKey, contract *prot
 	return nil
 }
 
-func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeqIndex uint64) {
+func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeqIndex uint64, minByteCount ByteCount) {
 	// look at destinationContracts and last contract to get previous contract id
 	contractQueue := self.openContractQueue(contractKey)
 	defer self.closeContractQueue(contractKey)
@@ -816,7 +816,7 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 		DestinationId:     contractKey.Destination.DestinationId.Bytes(),
 		IntermediaryIds:   contractKey.IntermediaryIds.Bytes(),
 		StreamId:          contractKey.Destination.StreamId.Bytes(),
-		TransferByteCount: uint64(self.contractByteCount(contractSeqIndex)),
+		TransferByteCount: uint64(self.contractByteCount(contractSeqIndex, minByteCount)),
 		Companion:         contractKey.CompanionContract,
 		ForceStream:       &contractKey.ForceStream,
 		UsedContractIds:   contractQueue.UsedContractIdBytes(),
@@ -843,15 +843,18 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 	)
 }
 
-func (self *ContractManager) contractByteCount(contractSeqIndex uint64) ByteCount {
-	if self.settings.ContractTransferByteSeqScale <= contractSeqIndex {
-		return self.settings.StandardContractTransferByteCount
-	} else {
-		// lerp between initial and standard
-		return self.settings.InitialContractTransferByteCount + ByteCount(
-			(contractSeqIndex*uint64(self.settings.StandardContractTransferByteCount-self.settings.InitialContractTransferByteCount))/self.settings.ContractTransferByteSeqScale,
-		)
-	}
+func (self *ContractManager) contractByteCount(contractSeqIndex uint64, minByteCount ByteCount) ByteCount {
+	targetByteCount := func() ByteCount {
+		if self.settings.ContractTransferByteSeqScale <= contractSeqIndex {
+			return self.settings.StandardContractTransferByteCount
+		} else {
+			// lerp between initial and standard
+			return self.settings.InitialContractTransferByteCount + ByteCount(
+				(contractSeqIndex*uint64(self.settings.StandardContractTransferByteCount-self.settings.InitialContractTransferByteCount))/self.settings.ContractTransferByteSeqScale,
+			)
+		}
+	}()
+	return max(targetByteCount, minByteCount)
 }
 
 func (self *ContractManager) CheckpointContract(

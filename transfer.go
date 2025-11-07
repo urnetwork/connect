@@ -1731,7 +1731,7 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 			if contract := self.client.ContractManager().TakeContract(self.ctx, contractKey, timeout); contract != nil && setNextContract(contract) {
 				self.contractSeqIndex += 1
 				// async queue up the next contract
-				self.client.ContractManager().CreateContract(contractKey, self.contractSeqIndex)
+				self.client.ContractManager().CreateContract(contractKey, self.contractSeqIndex, messageByteCount)
 				return true
 			} else {
 				return false
@@ -1774,7 +1774,7 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 				CompanionContract: self.companionContract,
 				ForceStream:       self.forceStream,
 			}
-			self.client.ContractManager().CreateContract(contractKey, self.contractSeqIndex)
+			self.client.ContractManager().CreateContract(contractKey, self.contractSeqIndex, messageByteCount)
 
 			if traceNextContract(min(timeout, self.sendBufferSettings.CreateContractRetryInterval)) {
 				return true
