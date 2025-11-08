@@ -1214,10 +1214,10 @@ func (self *SendBuffer) Flush() {
 	defer self.mutex.Unlock()
 
 	// cancel all open sequences
-	for sendSequenceId, sendSequence := range self.sendSequences {
-		if !sendSequenceId.Destination.IsControlDestination() {
-			sendSequence.Cancel()
-		}
+	for _, sendSequence := range self.sendSequences {
+		// if !sendSequenceId.Destination.IsControlDestination() {
+		sendSequence.Cancel()
+		// }
 	}
 }
 
@@ -1258,6 +1258,8 @@ type SendSequence struct {
 
 	contractMultiRouteWriter            MultiRouteWriter
 	contractMultiRouteWriterDestination TransferPath
+
+	contractSeqIndex uint64
 }
 
 func NewSendSequence(
@@ -1300,6 +1302,7 @@ func NewSendSequence(
 		nextSequenceNumber: 0,
 		idleCondition:      NewIdleCondition(),
 		rttWindow:          rttWindow,
+		contractSeqIndex:   0,
 	}
 }
 
@@ -1697,6 +1700,10 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 				return false
 			}
 
+			if _, ok := self.openSendContracts[nextSendContract.contractId]; ok {
+				return false
+			}
+
 			// note `update(0)` will use `MinMessageByteCount` byte count
 			// the min message byte count is used to avoid spam
 			if nextSendContract.update(0) && nextSendContract.update(messageByteCount) {
@@ -1708,6 +1715,7 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 				}, true, true)
 
 				return true
+
 			} else {
 				// this contract doesn't fit the message
 				// the contract was requested with the correct size, so this is an error somewhere
@@ -1726,8 +1734,13 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 				ForceStream:       self.forceStream,
 			}
 			if contract := self.client.ContractManager().TakeContract(self.ctx, contractKey, timeout); contract != nil && setNextContract(contract) {
+				self.contractSeqIndex += 1
 				// async queue up the next contract
-				self.client.ContractManager().CreateContract(contractKey)
+				self.client.ContractManager().CreateContract(
+					contractKey,
+					self.contractSeqIndex,
+					ByteCount(32+float32(messageByteCount+self.sendBufferSettings.MinMessageByteCount)/self.sendBufferSettings.ContractFillFraction),
+				)
 				return true
 			} else {
 				return false
@@ -1770,7 +1783,11 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 				CompanionContract: self.companionContract,
 				ForceStream:       self.forceStream,
 			}
-			self.client.ContractManager().CreateContract(contractKey)
+			self.client.ContractManager().CreateContract(
+				contractKey,
+				self.contractSeqIndex,
+				ByteCount(32+float32(messageByteCount+messageByteCount+self.sendBufferSettings.MinMessageByteCount)/self.sendBufferSettings.ContractFillFraction),
+			)
 
 			if traceNextContract(min(timeout, self.sendBufferSettings.CreateContractRetryInterval)) {
 				return true
@@ -1789,10 +1806,6 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 }
 
 func (self *SendSequence) setContract(nextSendContract *sequenceContract) {
-	if self.sendContract != nil && self.sendContract.contractId == nextSendContract.contractId {
-		return
-	}
-
 	// do not close the current contract unless it has no pending data
 	// the contract is tracked in `openSendContracts` and will be closed on ack
 	if self.sendContract != nil && self.sendContract.unackedByteCount == 0 {
@@ -2433,10 +2446,10 @@ func (self *ReceiveBuffer) Flush() {
 	defer self.mutex.Unlock()
 
 	// cancel all open sequences
-	for receiveSequenceId, receiveSequence := range self.receiveSequences {
-		if !receiveSequenceId.Source.IsControlSource() {
-			receiveSequence.Cancel()
-		}
+	for _, receiveSequence := range self.receiveSequences {
+		// if !receiveSequenceId.Source.IsControlSource() {
+		receiveSequence.Cancel()
+		// }
 	}
 }
 
@@ -3426,15 +3439,12 @@ func (self *sequenceContract) update(byteCount ByteCount) bool {
 }
 
 func (self *sequenceContract) ack(byteCount ByteCount) {
-	if self.unackedByteCount < byteCount {
+	effectiveByteCount := max(self.minUpdateByteCount, byteCount)
+
+	if self.unackedByteCount < effectiveByteCount {
 		// debug.PrintStack()
 		panic(fmt.Errorf("Bad accounting %d <> %d", self.unackedByteCount, byteCount))
 	}
-
-	effectiveByteCount := min(
-		max(self.minUpdateByteCount, byteCount),
-		self.unackedByteCount,
-	)
 
 	self.unackedByteCount -= effectiveByteCount
 	self.ackedByteCount += effectiveByteCount
@@ -3549,10 +3559,10 @@ func (self *ForwardBuffer) Flush() {
 	defer self.mutex.Unlock()
 
 	// cancel all open sequences
-	for destination, forwardSequence := range self.forwardSequences {
-		if !destination.IsControlDestination() {
-			forwardSequence.Cancel()
-		}
+	for _, forwardSequence := range self.forwardSequences {
+		// if !destination.IsControlDestination() {
+		forwardSequence.Cancel()
+		// }
 	}
 }
 
