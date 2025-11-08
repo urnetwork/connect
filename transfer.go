@@ -1214,10 +1214,10 @@ func (self *SendBuffer) Flush() {
 	defer self.mutex.Unlock()
 
 	// cancel all open sequences
-	for sendSequenceId, sendSequence := range self.sendSequences {
-		if !sendSequenceId.Destination.IsControlDestination() {
-			sendSequence.Cancel()
-		}
+	for _, sendSequence := range self.sendSequences {
+		// if !sendSequenceId.Destination.IsControlDestination() {
+		sendSequence.Cancel()
+		// }
 	}
 }
 
@@ -1700,6 +1700,10 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 				return false
 			}
 
+			if _, ok := self.openSendContracts[nextSendContract.contractId]; ok {
+				return false
+			}
+
 			// note `update(0)` will use `MinMessageByteCount` byte count
 			// the min message byte count is used to avoid spam
 			if nextSendContract.update(0) && nextSendContract.update(messageByteCount) {
@@ -1711,6 +1715,7 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 				}, true, true)
 
 				return true
+
 			} else {
 				// this contract doesn't fit the message
 				// the contract was requested with the correct size, so this is an error somewhere
@@ -1801,10 +1806,6 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 }
 
 func (self *SendSequence) setContract(nextSendContract *sequenceContract) {
-	if self.sendContract != nil && self.sendContract.contractId == nextSendContract.contractId {
-		return
-	}
-
 	// do not close the current contract unless it has no pending data
 	// the contract is tracked in `openSendContracts` and will be closed on ack
 	if self.sendContract != nil && self.sendContract.unackedByteCount == 0 {
@@ -2445,10 +2446,10 @@ func (self *ReceiveBuffer) Flush() {
 	defer self.mutex.Unlock()
 
 	// cancel all open sequences
-	for receiveSequenceId, receiveSequence := range self.receiveSequences {
-		if !receiveSequenceId.Source.IsControlSource() {
-			receiveSequence.Cancel()
-		}
+	for _, receiveSequence := range self.receiveSequences {
+		// if !receiveSequenceId.Source.IsControlSource() {
+		receiveSequence.Cancel()
+		// }
 	}
 }
 
@@ -3558,10 +3559,10 @@ func (self *ForwardBuffer) Flush() {
 	defer self.mutex.Unlock()
 
 	// cancel all open sequences
-	for destination, forwardSequence := range self.forwardSequences {
-		if !destination.IsControlDestination() {
-			forwardSequence.Cancel()
-		}
+	for _, forwardSequence := range self.forwardSequences {
+		// if !destination.IsControlDestination() {
+		forwardSequence.Cancel()
+		// }
 	}
 }
 
