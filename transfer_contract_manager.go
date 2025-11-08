@@ -85,7 +85,7 @@ func DefaultContractManagerSettings() *ContractManagerSettings {
 		panic(err)
 	}
 	return &ContractManagerSettings{
-		InitialContractTransferByteCount:  kib(4),
+		InitialContractTransferByteCount:  kib(16),
 		StandardContractTransferByteCount: mib(128),
 		ContractTransferByteSeqScale:      4,
 
@@ -97,6 +97,7 @@ func DefaultContractManagerSettings() *ContractManagerSettings {
 
 		// TODO change this once main has been deployed with the p2p contract changes
 		LegacyCreateContract: true,
+		TrackUsedContracts:   false,
 	}
 }
 
@@ -123,6 +124,8 @@ type ContractManagerSettings struct {
 	ProvidePingTimeout time.Duration
 
 	ProtocolVersion int
+
+	TrackUsedContracts bool
 }
 
 func (self *ContractManagerSettings) ContractsEnabled() bool {
@@ -819,7 +822,9 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 		TransferByteCount: uint64(self.contractByteCount(contractSeqIndex, minByteCount)),
 		Companion:         contractKey.CompanionContract,
 		ForceStream:       &contractKey.ForceStream,
-		UsedContractIds:   contractQueue.UsedContractIdBytes(),
+	}
+	if self.settings.TrackUsedContracts {
+		createContract.UsedContractIds = contractQueue.UsedContractIdBytes()
 	}
 	frame, err := ToFrame(createContract, self.settings.ProtocolVersion)
 	if err != nil {
@@ -997,7 +1002,7 @@ func (self *ContractManager) openContractQueue(contractKey ContractKey) *contrac
 
 	contractQueue, ok := self.destinationContracts[contractKey]
 	if !ok {
-		contractQueue = newContractQueue()
+		contractQueue = newContractQueue(self.settings.TrackUsedContracts)
 		self.destinationContracts[contractKey] = contractQueue
 	}
 	contractQueue.Open()
@@ -1033,16 +1038,19 @@ type contractQueue struct {
 	mutex     sync.Mutex
 	openCount int
 	contracts map[Id]*protocol.Contract
+
 	// remember all added contract ids
-	usedContractIds map[Id]bool
+	trackUsedContracts bool
+	usedContractIds    map[Id]bool
 }
 
-func newContractQueue() *contractQueue {
+func newContractQueue(trackUsedContracts bool) *contractQueue {
 	return &contractQueue{
-		updateMonitor:   NewMonitor(),
-		openCount:       0,
-		contracts:       map[Id]*protocol.Contract{},
-		usedContractIds: map[Id]bool{},
+		updateMonitor:      NewMonitor(),
+		openCount:          0,
+		contracts:          map[Id]*protocol.Contract{},
+		trackUsedContracts: trackUsedContracts,
+		usedContractIds:    map[Id]bool{},
 	}
 }
 
@@ -1085,19 +1093,21 @@ func (self *contractQueue) Add(contract *protocol.Contract, storedContract *prot
 		return err
 	}
 
-	if self.usedContractIds[contractId] {
-		glog.V(2).Infof("[contract]add already used %s\n", contractId)
-		// update contract if present
-		if _, ok := self.contracts[contractId]; ok {
-			self.contracts[contractId] = contract
-			self.updateMonitor.NotifyAll()
-		}
-		// else drop this contract. it has already been used locally
-	} else {
-		glog.V(2).Infof("[contract]add %s\n", contractId)
-		self.usedContractIds[contractId] = true
+	// update contract if present
+	if _, ok := self.contracts[contractId]; ok {
+		glog.V(2).Infof("[contract]add update existing %s\n", contractId)
 		self.contracts[contractId] = contract
 		self.updateMonitor.NotifyAll()
+	} else if !self.usedContractIds[contractId] {
+		glog.V(2).Infof("[contract]add %s\n", contractId)
+		if self.trackUsedContracts {
+			self.usedContractIds[contractId] = true
+		}
+		self.contracts[contractId] = contract
+		self.updateMonitor.NotifyAll()
+	} else {
+		glog.V(2).Infof("[contract]add already used %s\n", contractId)
+		// drop this contract. it has already been used locally
 	}
 	return nil
 }
