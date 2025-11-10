@@ -272,7 +272,7 @@ if (-not $NoCleanup) {
 Write-Host "Installation complete! Restart your terminal or command-line for the changes to take effect."
 
 Write-Host "$($Bold)Start in foreground:$($Reset) urnetwork provide"
-Write-Host "$($Bold)Start in background:$($Reset) urnet-tools start-bg"
+Write-Host "$($Bold)Start in background:$($Reset) urnet-tools start"
 Write-Host "$($Bold)Authenticate:$($Reset)        urnetwork auth"
 Write-Host "$($Bold)More help:$($Reset)           urnetwork --help"
 
