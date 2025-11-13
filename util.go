@@ -371,6 +371,7 @@ func (self *Reconnect) After() <-chan time.Time {
 		close(c)
 		return c
 	} else {
-		return time.After(timeout)
+		randomTimeout := time.Duration(mathrand.Int63n(int64(timeout)))
+		return time.After(randomTimeout)
 	}
 }
