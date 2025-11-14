@@ -119,7 +119,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 				WindowSizeReconnectScale: 1.0,
 			},
 		},
-		SendRetryTimeout:           200 * time.Millisecond,
+		SendRetryTimeout:           20 * time.Millisecond,
 		PingWriteTimeout:           5 * time.Second,
 		CPingWriteTimeout:          5 * time.Second,
 		CPingMaxByteCountPerSecond: kib(8),
@@ -131,15 +131,15 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		AckTimeout:             15 * time.Second,
 		BlackholeTimeout:       15 * time.Second,
 		WindowResizeTimeout:    15 * time.Second,
-		StatsWindowGraceperiod: 30 * time.Second,
-		StatsWindowMaxEstimatedByteCountPerSecond:      mib(1),
-		StatsWindowMaxEffectiveByteCountPerSecondScale: 0.2,
-		StatsWindowEntropy:                             0.1,
+		StatsWindowGraceperiod: 15 * time.Second,
+		StatsWindowMaxEstimatedByteCountPerSecond:      mib(8),
+		StatsWindowMaxEffectiveByteCountPerSecondScale: 0.8,
+		StatsWindowEntropy:                             0.0,
 		WindowExpandTimeout:                            15 * time.Second,
 		// WindowExpandBlockTimeout: 5 * time.Second,
 		WindowExpandBlockCount: 8,
 		// wait this time before enumerating potential clients again
-		WindowEnumerateEmptyTimeout:  60 * time.Second,
+		WindowEnumerateEmptyTimeout:  15 * time.Second,
 		WindowEnumerateErrorTimeout:  1 * time.Second,
 		WindowExpandScale:            2.0,
 		WindowCollapseScale:          0.8,
@@ -152,20 +152,21 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		StatsSourceCountSelection:    0.95,
 		// ClientAffinityTimeout:        0 * time.Second,
 
-		MultiRaceSetOnNoResponseTimeout:      1000 * time.Millisecond,
-		MultiRaceSetOnResponseTimeout:        100 * time.Millisecond,
+		MultiRaceSetOnNoResponseTimeout:      2000 * time.Millisecond,
+		MultiRaceSetOnResponseTimeout:        50 * time.Millisecond,
 		MultiRaceClientSentPacketMaxCount:    16,
 		MultiRaceClientPacketMaxCount:        4,
 		MultiRacePacketMaxCount:              16,
 		MultiRaceClientEarlyCompleteFraction: 0.25,
 		// TODO on platforms with more memory, increase this
-		MultiRaceClientCount: 4,
+		MultiRaceClientCount: 8,
 
-		StatsWindowMaxUnhealthyDuration:  30 * time.Second,
+		StatsWindowMaxUnhealthyDuration:  60 * time.Second,
 		StatsWindowWarnUnhealthyDuration: 15 * time.Second,
 		StatsWindowKeepHealthiestCount:   2,
-		// aggressively cycle out providers when transfer is done
-		StatsWindowMinHealthyEffectiveByteCount: kib(32),
+		// the effective byte count is per stats window `StatsWindowDuration`
+		StatsWindowMinHealthyEffectiveSendByteCount:    kib(1),
+		StatsWindowMinHealthyEffectiveReceiveByteCount: kib(32),
 
 		ProtocolVersion:     DefaultProtocolVersion,
 		DestinationAffinity: true,
@@ -225,10 +226,11 @@ type MultiClientSettings struct {
 	MultiRaceClientEarlyCompleteFraction float32
 	MultiRaceClientCount                 int
 
-	StatsWindowMaxUnhealthyDuration         time.Duration
-	StatsWindowWarnUnhealthyDuration        time.Duration
-	StatsWindowKeepHealthiestCount          int
-	StatsWindowMinHealthyEffectiveByteCount ByteCount
+	StatsWindowMaxUnhealthyDuration                time.Duration
+	StatsWindowWarnUnhealthyDuration               time.Duration
+	StatsWindowKeepHealthiestCount                 int
+	StatsWindowMinHealthyEffectiveSendByteCount    ByteCount
+	StatsWindowMinHealthyEffectiveReceiveByteCount ByteCount
 
 	ProtocolVersion int
 
@@ -1853,8 +1855,10 @@ func (self *multiClientWindow) resize() {
 				if healthy {
 					if stats.unhealthyDuration < self.settings.StatsWindowWarnUnhealthyDuration {
 						printStats("client ok")
+						client.setWarning(false)
 					} else {
 						replaceClientCount += 1
+						client.setWarning(true)
 						printStats("client health warning")
 					}
 					keepClient(client, stats, effectiveByteCountPerSecond, expectedByteCountPerSecond)
@@ -2253,7 +2257,7 @@ func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 	// durations := map[*multiClientChannel]time.Duration{}
 
 	for _, client := range self.clients() {
-		if stats, err := client.WindowStats(); err == nil {
+		if stats, err := client.WindowStats(); err == nil && !client.isWarning() {
 			clients = append(clients, client)
 			// durations[client] = stats.duration
 			weights[client] = float32(1 + stats.ExpectedByteCountPerSecond())
@@ -2452,13 +2456,14 @@ func (self *clientWindowStats) EffectiveByteCountPerSecond() ByteCount {
 	return ByteCount((1000*netByteCount + millis/2) / millis)
 }
 
-func (self *clientWindowStats) EffectiveByteCount() ByteCount {
+func (self *clientWindowStats) EffectiveByteCount() (send ByteCount, receive ByteCount) {
 	millis := int64(self.duration / time.Millisecond)
 	if millis <= 0 {
-		return ByteCount(0)
+		return
 	}
-	netByteCount := int64(self.sendAckByteCount + self.receiveAckByteCount)
-	return netByteCount
+	send = self.sendAckByteCount
+	receive = self.receiveAckByteCount
+	return
 }
 
 func (self *clientWindowStats) ExpectedByteCountPerSecond() ByteCount {
@@ -2512,6 +2517,8 @@ type multiClientChannel struct {
 	// affinityTime  time.Time
 
 	clientReceiveUnsub func()
+
+	warning bool
 }
 
 func newMultiClientChannel(
@@ -2590,6 +2597,18 @@ func (self *multiClientChannel) Tier() int {
 
 func (self *multiClientChannel) EstimatedByteCountPerSecond() ByteCount {
 	return self.args.EstimatedBytesPerSecond
+}
+
+func (self *multiClientChannel) setWarning(warning bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.warning = warning
+}
+
+func (self *multiClientChannel) isWarning() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.warning
 }
 
 // func (self *multiClientChannel) UpdateAffinity() {
@@ -3094,14 +3113,15 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 	if 0 < len(self.eventBuckets) {
 		eventTime := self.eventBuckets[len(self.eventBuckets)-1].eventTime
 
-		effectiveByteCountPerSecond := stats.EffectiveByteCountPerSecond()
-		effectiveByteCount := stats.EffectiveByteCount()
-		scaledEffectiveByteCountPerSecond := ByteCount(self.settings.StatsWindowMaxEffectiveByteCountPerSecondScale * float32(effectiveByteCountPerSecond))
+		// effectiveByteCountPerSecond := stats.EffectiveByteCountPerSecond()
+		scaledEffectiveByteCountPerSecond := ByteCount(self.settings.StatsWindowMaxEffectiveByteCountPerSecondScale * float32(stats.EffectiveByteCountPerSecond()))
 		if self.maxEffectiveByteCountPerSecond < scaledEffectiveByteCountPerSecond {
 			self.maxEffectiveByteCountPerSecond = scaledEffectiveByteCountPerSecond
 			self.maxEffectiveByteCountPerSecondTime = eventTime
 		}
-		if self.settings.StatsWindowMinHealthyEffectiveByteCount <= effectiveByteCount {
+
+		effectiveSendByteCount, effectiveReceiveByteCount := stats.EffectiveByteCount()
+		if self.settings.StatsWindowMinHealthyEffectiveSendByteCount <= effectiveSendByteCount && self.settings.StatsWindowMinHealthyEffectiveReceiveByteCount <= effectiveReceiveByteCount {
 			if self.lastUnhealthyTime.IsZero() {
 				self.lastUnhealthyTime = eventTime
 			}
