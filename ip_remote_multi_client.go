@@ -132,10 +132,10 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		BlackholeTimeout:       15 * time.Second,
 		WindowResizeTimeout:    15 * time.Second,
 		StatsWindowGraceperiod: 15 * time.Second,
-		StatsWindowMaxEstimatedByteCountPerSecond:      mib(8),
-		StatsWindowMaxEffectiveByteCountPerSecondScale: 0.8,
-		StatsWindowEntropy:                             0.0,
-		WindowExpandTimeout:                            15 * time.Second,
+		StatsWindowMaxEstimatedByteCountPerSecond: mib(8),
+		// StatsWindowMaxEffectiveByteCountPerSecondScale: 0.8,
+		StatsWindowEntropy:  0.0,
+		WindowExpandTimeout: 15 * time.Second,
 		// WindowExpandBlockTimeout: 5 * time.Second,
 		WindowExpandBlockCount: 8,
 		// wait this time before enumerating potential clients again
@@ -184,20 +184,20 @@ type MultiClientSettings struct {
 	// ClientWriteTimeout time.Duration
 	// SendTimeout time.Duration
 	// WriteTimeout time.Duration
-	SendRetryTimeout                               time.Duration
-	PingWriteTimeout                               time.Duration
-	CPingWriteTimeout                              time.Duration
-	CPingMaxByteCountPerSecond                     ByteCount
-	PingTimeout                                    time.Duration
-	CPingTimeout                                   time.Duration
-	AckTimeout                                     time.Duration
-	BlackholeTimeout                               time.Duration
-	WindowResizeTimeout                            time.Duration
-	StatsWindowGraceperiod                         time.Duration
-	StatsWindowMaxEstimatedByteCountPerSecond      ByteCount
-	StatsWindowMaxEffectiveByteCountPerSecondScale float32
-	StatsWindowEntropy                             float32
-	WindowExpandTimeout                            time.Duration
+	SendRetryTimeout                          time.Duration
+	PingWriteTimeout                          time.Duration
+	CPingWriteTimeout                         time.Duration
+	CPingMaxByteCountPerSecond                ByteCount
+	PingTimeout                               time.Duration
+	CPingTimeout                              time.Duration
+	AckTimeout                                time.Duration
+	BlackholeTimeout                          time.Duration
+	WindowResizeTimeout                       time.Duration
+	StatsWindowGraceperiod                    time.Duration
+	StatsWindowMaxEstimatedByteCountPerSecond ByteCount
+	// StatsWindowMaxEffectiveByteCountPerSecondScale float32
+	StatsWindowEntropy  float32
+	WindowExpandTimeout time.Duration
 	// WindowExpandBlockTimeout     time.Duration
 	WindowExpandBlockCount       int
 	WindowEnumerateEmptyTimeout  time.Duration
@@ -3113,10 +3113,10 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 	if 0 < len(self.eventBuckets) {
 		eventTime := self.eventBuckets[len(self.eventBuckets)-1].eventTime
 
-		// effectiveByteCountPerSecond := stats.EffectiveByteCountPerSecond()
-		scaledEffectiveByteCountPerSecond := ByteCount(self.settings.StatsWindowMaxEffectiveByteCountPerSecondScale * float32(stats.EffectiveByteCountPerSecond()))
-		if self.maxEffectiveByteCountPerSecond < scaledEffectiveByteCountPerSecond {
-			self.maxEffectiveByteCountPerSecond = scaledEffectiveByteCountPerSecond
+		effectiveByteCountPerSecond := stats.EffectiveByteCountPerSecond()
+		// scaledEffectiveByteCountPerSecond := ByteCount(self.settings.StatsWindowMaxEffectiveByteCountPerSecondScale * float32(stats.EffectiveByteCountPerSecond()))
+		if self.maxEffectiveByteCountPerSecond < effectiveByteCountPerSecond {
+			self.maxEffectiveByteCountPerSecond = effectiveByteCountPerSecond
 			self.maxEffectiveByteCountPerSecondTime = eventTime
 		}
 
