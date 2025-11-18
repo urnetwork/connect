@@ -11,7 +11,7 @@ import (
 
 	"github.com/oklog/ulid/v2"
 
-	"github.com/urnetwork/connect/protocol"
+	"github.com/urnetwork/connect/v2025/protocol"
 )
 
 const MaxMultihopLength = 8
