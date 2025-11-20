@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+
 	// "errors"
 	"fmt"
 	"io"
@@ -1326,6 +1327,85 @@ func HttpGetWithRawFunction[R any](
 		return empty, err
 	}
 
+	callback.Result(result, nil)
+	return result, nil
+}
+
+/**
+ * Streaming POST
+ */
+// Streams an arbitrary body (file, pipe, large blob) without pre-buffering.
+func HttpPostStreamWithStrategyRaw(
+	ctx context.Context,
+	clientStrategy *ClientStrategy,
+	requestUrl string,
+	body io.Reader,
+	contentType string,
+	byJwt string,
+	contentLength int64, // pass -1 if unknown
+) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", requestUrl, body)
+	if err != nil {
+		return nil, err
+	}
+
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	if byJwt != "" {
+		req.Header.Set("Authorization", "Bearer "+byJwt)
+	}
+	if contentLength >= 0 {
+		req.ContentLength = contentLength
+	}
+
+	helloReq, err := HelloRequestFromUrl(ctx, requestUrl, byJwt)
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := clientStrategy.HttpSerial(req, helloReq)
+	if err != nil {
+		return nil, err
+	}
+	if res.response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%s: %s", res.response.Status, strings.TrimSpace(string(res.bodyBytes)))
+	}
+
+	return res.bodyBytes, nil
+}
+
+type HttpPostStreamRawFunction func(
+	ctx context.Context,
+	requestUrl string,
+	body io.Reader,
+	contentType string,
+	byJwt string,
+	contentLength int64, // -1 if unknown
+) ([]byte, error)
+
+func HttpPostWithStreamFunction[R any](
+	ctx context.Context,
+	httpPostRaw HttpPostStreamRawFunction,
+	requestUrl string,
+	body io.Reader,
+	contentType string,
+	byJwt string,
+	contentLength int64,
+	result R,
+	callback ApiCallback[R],
+) (R, error) {
+	bodyBytes, err := httpPostRaw(ctx, requestUrl, body, contentType, byJwt, contentLength)
+	if err != nil {
+		var empty R
+		callback.Result(empty, err)
+		return empty, err
+	}
+	if err := json.Unmarshal(bodyBytes, &result); err != nil {
+		var empty R
+		callback.Result(empty, err)
+		return empty, err
+	}
 	callback.Result(result, nil)
 	return result, nil
 }
