@@ -130,7 +130,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// a lower ack timeout helps cycle through bad providers faster
 		AckTimeout:             15 * time.Second,
 		BlackholeTimeout:       15 * time.Second,
-		WindowResizeTimeout:    15 * time.Second,
+		WindowResizeTimeout:    5 * time.Second,
 		StatsWindowGraceperiod: 15 * time.Second,
 		StatsWindowMaxEstimatedByteCountPerSecond: mib(8),
 		// StatsWindowMaxEffectiveByteCountPerSecondScale: 0.8,
@@ -162,7 +162,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		MultiRaceClientCount: 8,
 
 		StatsWindowMaxUnhealthyDuration:  60 * time.Second,
-		StatsWindowWarnUnhealthyDuration: 15 * time.Second,
+		StatsWindowWarnUnhealthyDuration: 10 * time.Second,
 		StatsWindowKeepHealthiestCount:   2,
 		// the effective byte count is per stats window `StatsWindowDuration`
 		StatsWindowMinHealthyEffectiveSendByteCount:    kib(1),
