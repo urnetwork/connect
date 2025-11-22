@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+
 	// "errors"
 	"fmt"
 	"io"
@@ -1326,6 +1327,76 @@ func HttpGetWithRawFunction[R any](
 		return empty, err
 	}
 
+	callback.Result(result, nil)
+	return result, nil
+}
+
+/**
+ * Streaming POST
+ */
+func HttpPostStreamWithStrategyRaw(
+	ctx context.Context,
+	requestUrl string,
+	body io.Reader,
+	byJwt string,
+) ([]byte, error) {
+
+	req, err := http.NewRequestWithContext(ctx, "POST", requestUrl, body)
+	if err != nil {
+		return nil, err
+	}
+
+	if byJwt != "" {
+		req.Header.Set("Authorization", "Bearer "+byJwt)
+	}
+
+	client := &http.Client{}
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(res.Body)
+		return nil, fmt.Errorf("%s: %s", res.Status, strings.TrimSpace(string(bodyBytes)))
+	}
+
+	bodyBytes, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	return bodyBytes, nil
+}
+
+type HttpPostStreamRawFunction func(
+	ctx context.Context,
+	requestUrl string,
+	body io.Reader,
+	byJwt string,
+) ([]byte, error)
+
+func HttpPostWithStreamFunction[R any](
+	ctx context.Context,
+	httpPostRaw HttpPostStreamRawFunction,
+	requestUrl string,
+	body io.Reader,
+	byJwt string,
+	result R,
+	callback ApiCallback[R],
+) (R, error) {
+	bodyBytes, err := httpPostRaw(ctx, requestUrl, body, byJwt)
+	if err != nil {
+		var empty R
+		callback.Result(empty, err)
+		return empty, err
+	}
+	if err := json.Unmarshal(bodyBytes, &result); err != nil {
+		var empty R
+		callback.Result(empty, err)
+		return empty, err
+	}
 	callback.Result(result, nil)
 	return result, nil
 }

@@ -2080,7 +2080,10 @@ components:
 
     FeedbackSendResult:
       type: object
-      properties: {}
+      properties:
+        feedback_id:
+          description: udid
+          type: string
 
     FindLocationsArgs:
       type: object
