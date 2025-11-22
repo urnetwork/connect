@@ -1338,7 +1338,6 @@ func HttpPostStreamWithStrategyRaw(
 	ctx context.Context,
 	requestUrl string,
 	body io.Reader,
-	contentType string,
 	byJwt string,
 ) ([]byte, error) {
 
@@ -1375,9 +1374,7 @@ type HttpPostStreamRawFunction func(
 	ctx context.Context,
 	requestUrl string,
 	body io.Reader,
-	contentType string,
 	byJwt string,
-	contentLength int64, // -1 if unknown
 ) ([]byte, error)
 
 func HttpPostWithStreamFunction[R any](
@@ -1385,13 +1382,11 @@ func HttpPostWithStreamFunction[R any](
 	httpPostRaw HttpPostStreamRawFunction,
 	requestUrl string,
 	body io.Reader,
-	contentType string,
 	byJwt string,
-	contentLength int64,
 	result R,
 	callback ApiCallback[R],
 ) (R, error) {
-	bodyBytes, err := httpPostRaw(ctx, requestUrl, body, contentType, byJwt, contentLength)
+	bodyBytes, err := httpPostRaw(ctx, requestUrl, body, byJwt)
 	if err != nil {
 		var empty R
 		callback.Result(empty, err)
