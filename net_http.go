@@ -1334,45 +1334,41 @@ func HttpGetWithRawFunction[R any](
 /**
  * Streaming POST
  */
-// Streams an arbitrary body (file, pipe, large blob) without pre-buffering.
 func HttpPostStreamWithStrategyRaw(
 	ctx context.Context,
-	clientStrategy *ClientStrategy,
 	requestUrl string,
 	body io.Reader,
 	contentType string,
 	byJwt string,
-	contentLength int64, // pass -1 if unknown
 ) ([]byte, error) {
+
 	req, err := http.NewRequestWithContext(ctx, "POST", requestUrl, body)
 	if err != nil {
 		return nil, err
 	}
 
-	if contentType != "" {
-		req.Header.Set("Content-Type", contentType)
-	}
 	if byJwt != "" {
 		req.Header.Set("Authorization", "Bearer "+byJwt)
 	}
-	if contentLength >= 0 {
-		req.ContentLength = contentLength
+
+	client := &http.Client{}
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(res.Body)
+		return nil, fmt.Errorf("%s: %s", res.Status, strings.TrimSpace(string(bodyBytes)))
 	}
 
-	helloReq, err := HelloRequestFromUrl(ctx, requestUrl, byJwt)
+	bodyBytes, err := io.ReadAll(res.Body)
 	if err != nil {
 		return nil, err
 	}
 
-	res, err := clientStrategy.HttpSerial(req, helloReq)
-	if err != nil {
-		return nil, err
-	}
-	if res.response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%s: %s", res.response.Status, strings.TrimSpace(string(res.bodyBytes)))
-	}
-
-	return res.bodyBytes, nil
+	return bodyBytes, nil
 }
 
 type HttpPostStreamRawFunction func(
