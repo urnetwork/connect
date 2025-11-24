@@ -27,7 +27,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/golang/glog"
+	"github.com/urnetwork/glog"
 )
 
 // censorship-resistant strategies for making https connections

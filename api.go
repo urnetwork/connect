@@ -12,7 +12,7 @@ import (
 	// "time"
 	// "errors"
 	// "strings"
-	// "github.com/golang/glog"
+	// "github.com/urnetwork/glog"
 	"sync"
 )
 

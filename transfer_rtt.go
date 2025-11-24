@@ -7,7 +7,7 @@ import (
 
 	"container/heap"
 
-	"github.com/golang/glog"
+	"github.com/urnetwork/glog"
 
 	"github.com/urnetwork/connect/protocol"
 )

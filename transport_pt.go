@@ -13,7 +13,7 @@ import (
 	"golang.org/x/crypto/sha3"
 	"golang.org/x/net/dns/dnsmessage"
 
-	"github.com/golang/glog"
+	"github.com/urnetwork/glog"
 )
 
 // "whodis" protocol refers to a suite of pre-authentication packet translation techniques

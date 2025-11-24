@@ -7,7 +7,7 @@ import (
 	"math"
 	// "time"
 	// "github.com/urnetwork/connect"
-	// "github.com/golang/glog"
+	// "github.com/urnetwork/glog"
 )
 
 // a message framer that optimizes memory copies to reduce cpu+memory usage

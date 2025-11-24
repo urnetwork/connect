@@ -16,7 +16,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	"github.com/golang/glog"
+	"github.com/urnetwork/glog"
 )
 
 // new byte allocations in the connect package use pooled message buffers,

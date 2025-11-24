@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"golang.org/x/net/proxy"
-	// "github.com/golang/glog"
+	// "github.com/urnetwork/glog"
 )
 
 type DialContextFunction = func(ctx context.Context, network string, addr string) (net.Conn, error)

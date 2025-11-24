@@ -8,7 +8,7 @@ require (
 	github.com/docopt/docopt-go v0.0.0-20180111231733-ee0de3bc6815
 	github.com/go-playground/assert/v2 v2.2.0
 	github.com/golang-jwt/jwt/v5 v5.3.0
-	github.com/golang/glog v1.2.5
+	github.com/urnetwork/glog v0.0.0
 	github.com/google/gopacket v1.1.19
 	github.com/gorilla/websocket v1.5.3
 	github.com/oklog/ulid/v2 v2.1.1
@@ -33,3 +33,5 @@ require (
 retract [v0.0.1, v1.0.0]
 
 retract v0.2.0 // retract self
+
+replace github.com/urnetwork/glog => ../glog

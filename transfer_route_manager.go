@@ -13,7 +13,7 @@ import (
 
 	"golang.org/x/exp/maps"
 
-	"github.com/golang/glog"
+	"github.com/urnetwork/glog"
 )
 
 // manage multiple routes to a destination, allowing weighted reads and writes to the routes

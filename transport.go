@@ -21,7 +21,7 @@ import (
 	"github.com/gorilla/websocket"
 	quic "github.com/quic-go/quic-go"
 
-	"github.com/golang/glog"
+	"github.com/urnetwork/glog"
 
 	"github.com/urnetwork/connect/protocol"
 )

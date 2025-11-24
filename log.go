@@ -2,7 +2,7 @@ package connect
 
 import (
 
-// "github.com/golang/glog"
+// "github.com/urnetwork/glog"
 )
 
 // Logging level convention in the `connect` package and generally for BringYour network components:
