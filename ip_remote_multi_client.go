@@ -168,6 +168,8 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		StatsWindowMinHealthyEffectiveSendByteCount:    kib(1),
 		StatsWindowMinHealthyEffectiveReceiveByteCount: kib(32),
 
+		MaxClientLifetime: 15 * time.Minute,
+
 		ProtocolVersion:     DefaultProtocolVersion,
 		DestinationAffinity: true,
 
@@ -231,6 +233,10 @@ type MultiClientSettings struct {
 	StatsWindowKeepHealthiestCount                 int
 	StatsWindowMinHealthyEffectiveSendByteCount    ByteCount
 	StatsWindowMinHealthyEffectiveReceiveByteCount ByteCount
+
+	// active clients longer than this lifetime will not be forced closed
+	// new connections will be routed to new clients
+	MaxClientLifetime time.Duration
 
 	ProtocolVersion int
 
@@ -1824,6 +1830,8 @@ func (self *multiClientWindow) resize() {
 				durations[client] = stats.clientDuration
 			}
 
+			now := time.Now()
+
 			for client, stats := range clientStats {
 				effectiveByteCountPerSecond := stats.EffectiveByteCountPerSecond()
 				expectedByteCountPerSecond := stats.ExpectedByteCountPerSecond()
@@ -1853,7 +1861,9 @@ func (self *multiClientWindow) resize() {
 					)
 				}
 				if healthy {
-					if stats.unhealthyDuration < self.settings.StatsWindowWarnUnhealthyDuration {
+					// a client after its `removeTime` will be in a permananent warning state as long as it continues to route traffic
+					// this prevents new connections from using the client
+					if stats.unhealthyDuration < self.settings.StatsWindowWarnUnhealthyDuration && now.Before(stats.removeTime) {
 						printStats("client ok")
 						client.setWarning(false)
 					} else {
@@ -2442,6 +2452,8 @@ type clientWindowStats struct {
 	unhealthyDuration    time.Duration
 	netHealthyDuration   time.Duration
 	netUnhealthyDuration time.Duration
+	healthy              bool
+	removeTime           time.Time
 
 	// internal
 	bucketCount int
@@ -2489,6 +2501,7 @@ type multiClientChannel struct {
 
 	clientReceivePacketCallback clientReceivePacketFunction
 	ingressSecurityPolicy       SecurityPolicy
+	createTime                  time.Time
 
 	settings *MultiClientSettings
 
@@ -2564,6 +2577,7 @@ func newMultiClientChannel(
 		args:                        args,
 		clientReceivePacketCallback: clientReceivePacketCallback,
 		ingressSecurityPolicy:       ingressSecurityPolicy,
+		createTime:                  time.Now(),
 		settings:                    settings,
 		// sourceFilter: sourceFilter,
 		client:                    client,
@@ -3109,6 +3123,7 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 		firstSendAckTime:    firstSendAckTime,
 		firstSendNackTime:   firstSendNackTime,
 		bucketCount:         len(self.eventBuckets),
+		removeTime:          self.createTime.Add(self.settings.MaxClientLifetime),
 	}
 	if 0 < len(self.eventBuckets) {
 		eventTime := self.eventBuckets[len(self.eventBuckets)-1].eventTime
@@ -3121,7 +3136,8 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 		}
 
 		effectiveSendByteCount, effectiveReceiveByteCount := stats.EffectiveByteCount()
-		if self.settings.StatsWindowMinHealthyEffectiveSendByteCount <= effectiveSendByteCount && self.settings.StatsWindowMinHealthyEffectiveReceiveByteCount <= effectiveReceiveByteCount {
+		healthy := self.settings.StatsWindowMinHealthyEffectiveSendByteCount <= effectiveSendByteCount && self.settings.StatsWindowMinHealthyEffectiveReceiveByteCount <= effectiveReceiveByteCount
+		if healthy {
 			if self.lastUnhealthyTime.IsZero() {
 				self.lastUnhealthyTime = eventTime
 			}
@@ -3152,6 +3168,7 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 
 			stats.unhealthyDuration = eventTime.Sub(self.lastHealthyTime)
 		}
+		stats.healthy = healthy
 		stats.netHealthyDuration = self.netHealthyDuration + stats.healthyDuration
 		stats.netUnhealthyDuration = self.netUnhealthyDuration + stats.unhealthyDuration
 		if self.firstEventTime.IsZero() {
