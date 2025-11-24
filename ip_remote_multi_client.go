@@ -1823,6 +1823,9 @@ func (self *multiClientWindow) resize() {
 				}
 			}()
 
+			removeClient := func(client *multiClientChannel) {
+				removedClients = append(removedClients, client)
+			}
 			keepClient := func(client *multiClientChannel, stats *clientWindowStats, effectiveByteCountPerSecond ByteCount, expectedByteCountPerSecond ByteCount) {
 				clients = append(clients, client)
 				maxSourceCount = max(maxSourceCount, stats.sourceCount)
@@ -1860,28 +1863,35 @@ func (self *multiClientWindow) resize() {
 						stats.receiveAckByteCount,
 					)
 				}
+				// the top `StatsWindowKeepHealthiestCount` won't be marked as warning or removed
+				netHealthRank := netHealthRanks[client]
+				remove := self.settings.StatsWindowKeepHealthiestCount <= netHealthRank
 				if healthy {
 					// a client after its `removeTime` will be in a permananent warning state as long as it continues to route traffic
 					// this prevents new connections from using the client
-					if stats.unhealthyDuration < self.settings.StatsWindowWarnUnhealthyDuration && now.Before(stats.removeTime) {
-						printStats("client ok")
-						client.setWarning(false)
+					if stats.unhealthyDuration < self.settings.StatsWindowWarnUnhealthyDuration {
+						if !stats.removeTime.IsZero() && stats.removeTime.Before(now) {
+							printStats("client drain")
+							replaceClientCount += 1
+							client.setWarning(remove)
+						} else {
+							printStats("client ok")
+							client.setWarning(false)
+						}
 					} else {
-						replaceClientCount += 1
-						client.setWarning(true)
 						printStats("client health warning")
+						replaceClientCount += 1
+						client.setWarning(remove)
 					}
 					keepClient(client, stats, effectiveByteCountPerSecond, expectedByteCountPerSecond)
 				} else {
-					netHealthRank := netHealthRanks[client]
-					remove := self.settings.StatsWindowKeepHealthiestCount <= netHealthRank
-
 					replaceClientCount += 1
 					printStats(fmt.Sprintf("unhealthy client (#%d remove=%t)", netHealthRank, remove))
 
 					if remove {
-						removedClients = append(removedClients, client)
+						removeClient(client)
 					} else {
+						client.setWarning(false)
 						keepClient(client, stats, effectiveByteCountPerSecond, expectedByteCountPerSecond)
 					}
 				}
@@ -2442,7 +2452,7 @@ type clientWindowStats struct {
 	receiveAckCount             int
 	receiveAckByteCount         ByteCount
 	ackByteCount                ByteCount
-	duration                    time.Duration
+	windowDuration              time.Duration
 	firstSendAckTime            time.Time
 	firstSendNackTime           time.Time
 	estimatedByteCountPerSecond ByteCount
@@ -2460,7 +2470,7 @@ type clientWindowStats struct {
 }
 
 func (self *clientWindowStats) EffectiveByteCountPerSecond() ByteCount {
-	millis := int64(self.duration / time.Millisecond)
+	millis := int64(self.windowDuration / time.Millisecond)
 	if millis <= 0 {
 		return ByteCount(0)
 	}
@@ -2469,7 +2479,7 @@ func (self *clientWindowStats) EffectiveByteCountPerSecond() ByteCount {
 }
 
 func (self *clientWindowStats) EffectiveByteCount() (send ByteCount, receive ByteCount) {
-	millis := int64(self.duration / time.Millisecond)
+	millis := int64(self.windowDuration / time.Millisecond)
 	if millis <= 0 {
 		return
 	}
@@ -2479,7 +2489,7 @@ func (self *clientWindowStats) EffectiveByteCount() (send ByteCount, receive Byt
 }
 
 func (self *clientWindowStats) ExpectedByteCountPerSecond() ByteCount {
-	millis := int64(self.duration / time.Millisecond)
+	millis := int64(self.windowDuration / time.Millisecond)
 	if millis <= 0 {
 		return self.estimatedByteCountPerSecond
 	}
@@ -3045,10 +3055,10 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 		self.coalesceEventBuckets()
 	}
 
-	duration := time.Duration(0)
+	windowDuration := time.Duration(0)
 	if 0 < len(self.eventBuckets) {
 		endTime := self.eventBuckets[len(self.eventBuckets)-1].eventTime
-		duration = endTime.Sub(self.eventBuckets[0].createTime)
+		windowDuration = endTime.Sub(self.eventBuckets[0].createTime)
 	}
 	var firstSendAckTime time.Time
 	for _, eventBucket := range self.eventBuckets {
@@ -3119,14 +3129,19 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 		sendNackByteCount:   self.packetStats.sendNackByteCount,
 		receiveAckCount:     self.packetStats.receiveAckCount,
 		receiveAckByteCount: self.packetStats.receiveAckByteCount,
-		duration:            duration,
+		windowDuration:      windowDuration,
 		firstSendAckTime:    firstSendAckTime,
 		firstSendNackTime:   firstSendNackTime,
 		bucketCount:         len(self.eventBuckets),
-		removeTime:          self.createTime.Add(self.settings.MaxClientLifetime),
 	}
-	if 0 < len(self.eventBuckets) {
-		eventTime := self.eventBuckets[len(self.eventBuckets)-1].eventTime
+	if 0 < len(self.eventBuckets) || !self.firstEventTime.IsZero() {
+		// var eventTime time.Time
+		// if 0 < len(self.eventBuckets) {
+		// 	eventTime = self.eventBuckets[len(self.eventBuckets)-1].eventTime
+		// } else {
+		// 	eventTime = time.Now()
+		// }
+		eventTime := time.Now()
 
 		effectiveByteCountPerSecond := stats.EffectiveByteCountPerSecond()
 		// scaledEffectiveByteCountPerSecond := ByteCount(self.settings.StatsWindowMaxEffectiveByteCountPerSecondScale * float32(stats.EffectiveByteCountPerSecond()))
@@ -3173,10 +3188,13 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 		stats.netUnhealthyDuration = self.netUnhealthyDuration + stats.unhealthyDuration
 		if self.firstEventTime.IsZero() {
 			self.firstEventTime = self.eventBuckets[0].createTime
-		} else {
-			stats.clientDuration = eventTime.Sub(self.firstEventTime)
 		}
+		stats.clientDuration = eventTime.Sub(self.firstEventTime)
+		stats.removeTime = self.firstEventTime.Add(self.settings.MaxClientLifetime)
 	}
+	// if !self.firstEventTime.IsZero() {
+	// 	stats.removeTime = self.firstEventTime.Add(self.settings.MaxClientLifetime)
+	// }
 	if self.settings.StatsWindowGraceperiod < stats.clientDuration {
 		stats.estimatedByteCountPerSecond = self.maxEffectiveByteCountPerSecond
 	} else {
