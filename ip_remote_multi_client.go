@@ -581,7 +581,7 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClien
 						var mostRecentCreateTime time.Time
 						for copyIp4Path, createTime := range paths {
 							if copyUpdate, ok := self.ip4PathUpdates[copyIp4Path]; ok {
-								if copyUpdate.client != nil && createTime.After(mostRecentCreateTime) {
+								if copyUpdate.client != nil && !copyUpdate.client.isWarning() && createTime.After(mostRecentCreateTime) {
 									mostRecentCreateTime = createTime
 									update.client = copyUpdate.client
 								}
