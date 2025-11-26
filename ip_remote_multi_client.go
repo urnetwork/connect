@@ -1774,7 +1774,7 @@ func (self *multiClientWindow) resize() {
 	for {
 		startTime := time.Now()
 
-		removedClients := []*multiClientChannel{}
+		removedClientCount := 0
 		warnedClients := []*multiClientChannel{}
 		clients := []*multiClientChannel{}
 		maxSourceCount := 0
@@ -1782,7 +1782,14 @@ func (self *multiClientWindow) resize() {
 		durations := map[*multiClientChannel]time.Duration{}
 
 		removeClient := func(client *multiClientChannel) {
-			removedClients = append(removedClients, client)
+			removedClientCount += 1
+			client.Close()
+			func() {
+				self.stateLock.Lock()
+				defer self.stateLock.Unlock()
+				delete(self.destinationClients, client.Destination())
+			}()
+			self.removeClients(client)
 		}
 		keepClient := func(client *multiClientChannel, stats *clientWindowStats, effectiveByteCountPerSecond ByteCount, expectedByteCountPerSecond ByteCount) {
 			clients = append(clients, client)
@@ -1800,7 +1807,7 @@ func (self *multiClientWindow) resize() {
 				clientStats[client] = stats
 			} else {
 				glog.Infof("[multi]remove error client [%s] = %s\n", client.ClientId(), err)
-				removedClients = append(removedClients, client)
+				removeClient(client)
 			}
 		}
 
@@ -1884,6 +1891,7 @@ func (self *multiClientWindow) resize() {
 				printStats(fmt.Sprintf("unhealthy client (#%d remove=%t)", netHealthRank, remove))
 
 				if remove {
+					client.setWarning(true)
 					removeClient(client)
 				} else {
 					client.setWarning(false)
@@ -1920,7 +1928,7 @@ func (self *multiClientWindow) resize() {
 				windowSize.WindowSizeMax,
 				max(
 					windowSize.WindowSizeMin,
-					len(removedClients)+len(warnedClients)+int(math.Ceil(float64(maxSourceCount)*windowSize.WindowSizeReconnectScale)),
+					removedClientCount+len(warnedClients)+int(math.Ceil(float64(maxSourceCount)*windowSize.WindowSizeReconnectScale)),
 				),
 			)
 
@@ -1930,7 +1938,7 @@ func (self *multiClientWindow) resize() {
 				windowSize.WindowSizeMax,
 				max(
 					windowSize.WindowSizeMin,
-					len(warnedClients)+int(math.Ceil(self.settings.WindowExpandScale*float64(len(clients)))),
+					removedClientCount+len(warnedClients)+int(math.Ceil(self.settings.WindowExpandScale*float64(len(clients)))),
 				),
 			)
 
@@ -2006,27 +2014,6 @@ func (self *multiClientWindow) resize() {
 		} else {
 			self.monitor.AddWindowExpandEvent(true, len(clients))
 			glog.Infof("[multi]window stable =%d\n", len(clients))
-		}
-
-		if 0 < len(removedClients) {
-			for _, client := range removedClients {
-				client.Close()
-			}
-			func() {
-				self.stateLock.Lock()
-				defer self.stateLock.Unlock()
-
-				for _, client := range removedClients {
-					delete(self.destinationClients, client.Destination())
-				}
-			}()
-			// for _, client := range removedClients {
-			// 	self.monitor.AddProviderEvent(client.ClientId(), ProviderStateRemoved)
-			// }
-			// for _, client := range removedClients {
-			// 	self.clientClosed(removedClients)
-			// }
-			self.removeClients(removedClients)
 		}
 
 		timeout := self.settings.WindowResizeTimeout - time.Now().Sub(startTime)
@@ -2340,7 +2327,7 @@ func (self *multiClientWindow) Close() {
 	// self.removeClients(removedClients)
 }
 
-func (self *multiClientWindow) removeClients(removedClients []*multiClientChannel) {
+func (self *multiClientWindow) removeClients(removedClients ...*multiClientChannel) {
 	for _, client := range removedClients {
 		self.monitor.AddProviderEvent(client.ClientId(), ProviderStateRemoved)
 	}
