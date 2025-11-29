@@ -139,15 +139,15 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// WindowExpandBlockTimeout: 5 * time.Second,
 		WindowExpandBlockCount: 8,
 		// wait this time before enumerating potential clients again
-		WindowEnumerateEmptyTimeout:  15 * time.Second,
-		WindowEnumerateErrorTimeout:  1 * time.Second,
-		WindowMaxScale:               4.0,
-		WindowExpandMaxOvershotScale: 2.0,
-		WindowRevisitTimeout:         2 * time.Minute,
-		StatsWindowDuration:          60 * time.Second,
-		StatsWindowBucketDuration:    1 * time.Second,
-		StatsSampleWeightsCount:      8,
-		StatsSourceCountSelection:    0.95,
+		WindowEnumerateEmptyTimeout: 15 * time.Second,
+		WindowEnumerateErrorTimeout: 1 * time.Second,
+		WindowMaxScale:              4.0,
+		// WindowExpandMaxOvershotScale: 2.0,
+		WindowRevisitTimeout:      2 * time.Minute,
+		StatsWindowDuration:       60 * time.Second,
+		StatsWindowBucketDuration: 1 * time.Second,
+		StatsSampleWeightsCount:   8,
+		StatsSourceCountSelection: 0.95,
 		// ClientAffinityTimeout:        0 * time.Second,
 
 		MultiRaceSetOnNoResponseTimeout:      2000 * time.Millisecond,
@@ -199,16 +199,16 @@ type MultiClientSettings struct {
 	StatsWindowEntropy  float32
 	WindowExpandTimeout time.Duration
 	// WindowExpandBlockTimeout     time.Duration
-	WindowExpandBlockCount       int
-	WindowEnumerateEmptyTimeout  time.Duration
-	WindowEnumerateErrorTimeout  time.Duration
-	WindowMaxScale               float64
-	WindowExpandMaxOvershotScale float64
-	WindowRevisitTimeout         time.Duration
-	StatsWindowDuration          time.Duration
-	StatsWindowBucketDuration    time.Duration
-	StatsSampleWeightsCount      int
-	StatsSourceCountSelection    float64
+	WindowExpandBlockCount      int
+	WindowEnumerateEmptyTimeout time.Duration
+	WindowEnumerateErrorTimeout time.Duration
+	WindowMaxScale              float64
+	// WindowExpandMaxOvershotScale float64
+	WindowRevisitTimeout      time.Duration
+	StatsWindowDuration       time.Duration
+	StatsWindowBucketDuration time.Duration
+	StatsSampleWeightsCount   int
+	StatsSourceCountSelection float64
 	// lower affinity is more private
 	// however, there may be some applications that assume the same ip across multiple connections
 	// in those cases, we would need some small affinity
@@ -1789,8 +1789,11 @@ func (self *multiClientWindow) resize() {
 			weights[client] = float32(stats.EffectiveByteCountPerSecond())
 			durations[client] = stats.clientDuration
 		}
-		warnClient := func(client *multiClientChannel) {
+		warnClient := func(client *multiClientChannel, stats *clientWindowStats) {
 			warnedClients = append(warnedClients, client)
+			maxSourceCount = max(maxSourceCount, stats.sourceCount)
+			weights[client] = float32(stats.EffectiveByteCountPerSecond())
+			durations[client] = stats.clientDuration
 		}
 
 		clientStats := map[*multiClientChannel]*clientWindowStats{}
@@ -1868,7 +1871,7 @@ func (self *multiClientWindow) resize() {
 					if !stats.removeTime.IsZero() && stats.removeTime.Before(startTime) {
 						printStats("client drain")
 						client.setWarning(remove)
-						warnClient(client)
+						warnClient(client, stats)
 					} else {
 						printStats("client ok")
 						client.setWarning(false)
@@ -1877,7 +1880,7 @@ func (self *multiClientWindow) resize() {
 				} else {
 					printStats("client health warning")
 					client.setWarning(remove)
-					warnClient(client)
+					warnClient(client, stats)
 				}
 			} else {
 				printStats(fmt.Sprintf("unhealthy client (#%d remove=%t)", netHealthRank, remove))
@@ -1887,29 +1890,12 @@ func (self *multiClientWindow) resize() {
 					removeClient(client)
 				} else {
 					client.setWarning(false)
-					warnClient(client)
+					warnClient(client, stats)
 				}
 			}
 		}
 
 		collapseLowestWeighted := func(targetWindowSize int) {
-
-			mathrand.Shuffle(len(warnedClients), func(i int, j int) {
-				warnedClients[i], warnedClients[j] = warnedClients[j], warnedClients[i]
-			})
-
-			slices.SortFunc(clients, func(a *multiClientChannel, b *multiClientChannel) int {
-				// descending weight
-				aWeight := weights[a]
-				bWeight := weights[b]
-				if aWeight < bWeight {
-					return 1
-				} else if bWeight < aWeight {
-					return -1
-				} else {
-					return 0
-				}
-			})
 
 			n := (len(warnedClients) + len(clients)) - targetWindowSize
 
@@ -1917,6 +1903,25 @@ func (self *multiClientWindow) resize() {
 				if 0 < n && 0 < len(cs) {
 					m := min(len(cs), n)
 					if 0 < m {
+						slices.SortFunc(cs, func(a *multiClientChannel, b *multiClientChannel) int {
+							// descending weight
+							aWeight := weights[a]
+							bWeight := weights[b]
+							if aWeight < bWeight {
+								return 1
+							} else if bWeight < aWeight {
+								return -1
+							}
+							aDuration := durations[a]
+							bDuration := durations[b]
+							if aDuration < bDuration {
+								return 1
+							} else if bDuration < aDuration {
+								return -1
+							}
+							return 0
+						})
+
 						for _, client := range cs[len(cs)-m : len(cs)] {
 							if self.settings.StatsWindowGraceperiod <= durations[client] && weights[client] <= 0 {
 								removeClient(client)
@@ -1943,7 +1948,6 @@ func (self *multiClientWindow) resize() {
 			windowSize.WindowSizeMax,
 			max(
 				windowSize.WindowSizeMin,
-				len(warnedClients),
 				targetWindowSize,
 			),
 		)
@@ -1962,10 +1966,10 @@ func (self *multiClientWindow) resize() {
 			// expand
 			n := targetWindowSize - len(clients)
 			self.monitor.AddWindowExpandEvent(false, targetWindowSize+len(warnedClients))
-			overN := int(math.Ceil(self.settings.WindowExpandMaxOvershotScale * float64(n)))
-			glog.Infof("[multi]window expand +%d(%d) %d->%d\n", n, overN, len(clients), targetWindowSize)
-			self.expand(len(clients), p2pOnlyWindowSize, targetWindowSize, overN)
-		} else if collapseWindowSize := int(math.Ceil(float64(targetWindowSize) * self.settings.WindowMaxScale)); collapseWindowSize < len(clients)+len(warnedClients) {
+			glog.Infof("[multi]window expand +%d %d->%d\n", n, len(clients), targetWindowSize)
+			self.expand(len(clients), p2pOnlyWindowSize, targetWindowSize, targetWindowSize-len(clients))
+		}
+		if collapseWindowSize := int(math.Ceil(float64(targetWindowSize) * self.settings.WindowMaxScale)); collapseWindowSize < len(clients)+len(warnedClients) {
 			self.monitor.AddWindowExpandEvent(true, collapseWindowSize)
 			collapseLowestWeighted(collapseWindowSize)
 			glog.Infof("[multi]window collapse -%d ->%d\n", (len(clients)+len(warnedClients))-collapseWindowSize, collapseWindowSize)
