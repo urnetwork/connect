@@ -1962,17 +1962,24 @@ func (self *multiClientWindow) resize() {
 			targetWindowSize += n
 		}
 
+		addedCount := 0
 		if len(clients) < targetWindowSize {
 			// expand
 			n := targetWindowSize - len(clients)
 			self.monitor.AddWindowExpandEvent(false, targetWindowSize+len(warnedClients))
 			glog.Infof("[multi]window expand +%d %d->%d\n", n, len(clients), targetWindowSize)
-			self.expand(len(clients), p2pOnlyWindowSize, targetWindowSize, targetWindowSize-len(clients))
+			addedCount = self.expand(
+				len(clients),
+				p2pOnlyWindowSize,
+				targetWindowSize,
+				targetWindowSize-len(clients),
+			)
 		}
-		if collapseWindowSize := int(math.Ceil(float64(targetWindowSize) * self.settings.WindowMaxScale)); collapseWindowSize < len(clients)+len(warnedClients) {
+		collapseWindowSize := int(math.Ceil(float64(targetWindowSize) * self.settings.WindowMaxScale))
+		if collapseWindowSize < len(clients)+len(warnedClients)+addedCount {
 			self.monitor.AddWindowExpandEvent(true, collapseWindowSize)
-			collapseLowestWeighted(collapseWindowSize)
-			glog.Infof("[multi]window collapse -%d ->%d\n", (len(clients)+len(warnedClients))-collapseWindowSize, collapseWindowSize)
+			collapseLowestWeighted(max(0, collapseWindowSize-addedCount))
+			glog.Infof("[multi]window collapse -%d ->%d\n", (len(clients)+len(warnedClients)+addedCount)-collapseWindowSize, collapseWindowSize)
 		} else {
 			self.monitor.AddWindowExpandEvent(true, targetWindowSize)
 		}
@@ -1994,9 +2001,8 @@ func (self *multiClientWindow) resize() {
 	}
 }
 
-func (self *multiClientWindow) expand(currentWindowSize int, currentP2pOnlyWindowSize int, targetWindowSize int, n int) {
+func (self *multiClientWindow) expand(currentWindowSize int, currentP2pOnlyWindowSize int, targetWindowSize int, n int) (addedCount int) {
 	mutex := sync.Mutex{}
-	addedCount := 0
 
 	windowSize := self.settings.WindowSizes[self.windowType]
 
