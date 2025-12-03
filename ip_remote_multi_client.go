@@ -101,11 +101,10 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		SequenceIdleTimeout: 120 * time.Second,
 
 		WindowSizes: map[WindowType]WindowSizeSettings{
+			// TODO increase `WindowSizeMinP2pOnly` when p2p is deployed
 			WindowTypeQuality: WindowSizeSettings{
 				WindowSizeMin: 4,
-				// TODO increase this when p2p is deployed
-				WindowSizeMinP2pOnly: 0,
-				WindowSizeMax:        12,
+				WindowSizeMax: 12,
 				// reconnects per source
 				WindowSizeReconnectScale: 1.0,
 				KeepHealthiestCount:      2,
@@ -113,10 +112,8 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 			},
 			WindowTypeSpeed: WindowSizeSettings{
 				WindowSizeMin: 1,
-				// TODO increase this when p2p is deployed
-				WindowSizeMinP2pOnly: 0,
-				WindowSizeMax:        2,
-				WindowSizeUseMax:     1,
+				WindowSizeMax: 1,
+				// WindowSizeUseMax:     1,
 				// reconnects per source
 				WindowSizeReconnectScale: 1.0,
 				KeepHealthiestCount:      1,
@@ -253,9 +250,10 @@ type WindowSizeSettings struct {
 	WindowSizeMin int
 	// the minimumum number of items in the windows that must be connected via p2p only
 	WindowSizeMinP2pOnly int
-	WindowSizeMax        int
-	WindowSizeUseMax     int
-	// reconnects per source
+	// inclusive
+	WindowSizeMax int
+	// WindowSizeUseMax     int
+	// clients per source
 	WindowSizeReconnectScale float64
 	KeepHealthiestCount      int
 	WindowMaxScale           float64
@@ -269,6 +267,30 @@ type PerformanceProfile struct {
 	// leave 0 to automatically size between `WindowSizeMin` and `WindowSizeMax`
 	FixedWindowSize int
 	WindowSize      WindowSizeSettings
+}
+
+func (self *PerformanceProfile) Validate() error {
+	if self.WindowSize.WindowSizeMax < self.WindowSize.WindowSizeMin {
+		return fmt.Errorf(
+			"Window size [%d, %d] invalid. Max must be >= min",
+			self.WindowSize.WindowSizeMin,
+			self.WindowSize.WindowSizeMax,
+			self.FixedWindowSize,
+		)
+	}
+
+	if 0 < self.FixedWindowSize {
+		if self.FixedWindowSize < self.WindowSize.WindowSizeMin || self.WindowSize.WindowSizeMax < self.FixedWindowSize {
+			return fmt.Errorf(
+				"Window size [%d, %d] must include the fixed size =%d",
+				self.WindowSize.WindowSizeMin,
+				self.WindowSize.WindowSizeMax,
+				self.FixedWindowSize,
+			)
+		}
+	}
+
+	return nil
 }
 
 func DefaultWindowSizeSettings() WindowSizeSettings {
@@ -417,6 +439,13 @@ func (self *RemoteUserNatMultiClient) AddContractStatusCallback(contractStatusCa
 
 // the performance profile will take effect at the next `resize` iteration
 func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *PerformanceProfile) {
+	if performanceProfile != nil {
+		err := performanceProfile.Validate()
+		if err != nil {
+			panic(err)
+		}
+	}
+
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -2274,16 +2303,12 @@ func (self *multiClientWindow) clients() []*multiClientChannel {
 }
 
 func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
-	var windowSize WindowSizeSettings
 	var fixedWindowSize int
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		if self.performanceProfile != nil {
 			fixedWindowSize = self.performanceProfile.FixedWindowSize
-			windowSize = self.performanceProfile.WindowSize
-		} else {
-			windowSize = self.settings.WindowSizes[self.windowType]
 		}
 	}()
 
@@ -2350,9 +2375,9 @@ func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 	}
 
 	// use only the top n items from the window
-	if 0 < windowSize.WindowSizeUseMax {
-		minTierClients = minTierClients[:min(len(minTierClients), windowSize.WindowSizeUseMax)]
-	}
+	// if 0 < windowSize.WindowSizeUseMax {
+	// 	minTierClients = minTierClients[:min(len(minTierClients), windowSize.WindowSizeUseMax)]
+	// }
 
 	return minTierClients
 }
