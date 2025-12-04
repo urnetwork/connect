@@ -103,8 +103,8 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		WindowSizes: map[WindowType]WindowSizeSettings{
 			// TODO increase `WindowSizeMinP2pOnly` when p2p is deployed
 			WindowTypeQuality: WindowSizeSettings{
-				WindowSizeMin: 4,
-				WindowSizeMax: 12,
+				WindowSizeMin: 2,
+				WindowSizeMax: 6,
 				// reconnects per source
 				WindowSizeReconnectScale: 1.0,
 				KeepHealthiestCount:      2,
