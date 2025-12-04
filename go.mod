@@ -11,10 +11,10 @@ require (
 	github.com/google/gopacket v1.1.19
 	github.com/gorilla/websocket v1.5.3
 	github.com/oklog/ulid/v2 v2.1.1
-	github.com/quic-go/quic-go v0.57.0
+	github.com/quic-go/quic-go v0.57.1
 	github.com/urnetwork/glog v0.0.0
 	golang.org/x/crypto v0.45.0
-	golang.org/x/exp v0.0.0-20251113190631-e25ba8c21ef6
+	golang.org/x/exp v0.0.0-20251125195548-87e1e737ad39
 	golang.org/x/net v0.47.0
 	golang.org/x/term v0.37.0
 	google.golang.org/protobuf v1.36.10
