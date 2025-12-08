@@ -275,7 +275,6 @@ func (self *PerformanceProfile) Validate() error {
 			"Window size [%d, %d] invalid. Max must be >= min",
 			self.WindowSize.WindowSizeMin,
 			self.WindowSize.WindowSizeMax,
-			self.FixedWindowSize,
 		)
 	}
 
@@ -2134,10 +2133,16 @@ func (self *multiClientWindow) expand(
 	currentP2pOnlyWindowSize int,
 	targetWindowSize int,
 	n int,
-) (
-	addedCount int,
-) {
+) (snapshotAddedCount int) {
 	mutex := sync.Mutex{}
+	addedCount := 0
+
+	defer func() {
+		mutex.Lock()
+		defer mutex.Unlock()
+
+		snapshotAddedCount = addedCount
+	}()
 
 	endTime := time.Now().Add(self.settings.WindowExpandTimeout)
 	// blockEndTime := time.Now().Add(self.settings.WindowExpandBlockTimeout)
