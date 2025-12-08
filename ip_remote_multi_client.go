@@ -101,22 +101,23 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		SequenceIdleTimeout: 120 * time.Second,
 
 		WindowSizes: map[WindowType]WindowSizeSettings{
+			// TODO increase `WindowSizeMinP2pOnly` when p2p is deployed
 			WindowTypeQuality: WindowSizeSettings{
-				WindowSizeMin: 4,
-				// TODO increase this when p2p is deployed
-				WindowSizeMinP2pOnly: 0,
-				WindowSizeMax:        12,
+				WindowSizeMin: 2,
+				WindowSizeMax: 6,
 				// reconnects per source
 				WindowSizeReconnectScale: 1.0,
+				KeepHealthiestCount:      2,
+				WindowMaxScale:           4.0,
 			},
 			WindowTypeSpeed: WindowSizeSettings{
 				WindowSizeMin: 1,
-				// TODO increase this when p2p is deployed
-				WindowSizeMinP2pOnly: 0,
-				WindowSizeMax:        2,
-				WindowSizeUseMax:     1,
+				WindowSizeMax: 1,
+				// WindowSizeUseMax:     1,
 				// reconnects per source
 				WindowSizeReconnectScale: 1.0,
+				KeepHealthiestCount:      1,
+				WindowMaxScale:           4.0,
 			},
 		},
 		SendRetryTimeout:           20 * time.Millisecond,
@@ -141,7 +142,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// wait this time before enumerating potential clients again
 		WindowEnumerateEmptyTimeout: 15 * time.Second,
 		WindowEnumerateErrorTimeout: 1 * time.Second,
-		WindowMaxScale:              4.0,
+		// WindowMaxScale:              4.0,
 		// WindowExpandMaxOvershotScale: 2.0,
 		WindowRevisitTimeout:      2 * time.Minute,
 		StatsWindowDuration:       60 * time.Second,
@@ -161,7 +162,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 
 		StatsWindowMaxUnhealthyDuration:  30 * time.Second,
 		StatsWindowWarnUnhealthyDuration: 10 * time.Second,
-		StatsWindowKeepHealthiestCount:   2,
+		// StatsWindowKeepHealthiestCount:   2,
 		// the effective byte count is per stats window `StatsWindowDuration`
 		StatsWindowMinHealthyEffectiveSendByteCount:    kib(1),
 		StatsWindowMinHealthyEffectiveReceiveByteCount: kib(32),
@@ -202,7 +203,7 @@ type MultiClientSettings struct {
 	WindowExpandBlockCount      int
 	WindowEnumerateEmptyTimeout time.Duration
 	WindowEnumerateErrorTimeout time.Duration
-	WindowMaxScale              float64
+	// WindowMaxScale              float64
 	// WindowExpandMaxOvershotScale float64
 	WindowRevisitTimeout      time.Duration
 	StatsWindowDuration       time.Duration
@@ -224,9 +225,9 @@ type MultiClientSettings struct {
 	MultiRaceClientEarlyCompleteFraction float32
 	MultiRaceClientCount                 int
 
-	StatsWindowMaxUnhealthyDuration                time.Duration
-	StatsWindowWarnUnhealthyDuration               time.Duration
-	StatsWindowKeepHealthiestCount                 int
+	StatsWindowMaxUnhealthyDuration  time.Duration
+	StatsWindowWarnUnhealthyDuration time.Duration
+	// StatsWindowKeepHealthiestCount                 int
 	StatsWindowMinHealthyEffectiveSendByteCount    ByteCount
 	StatsWindowMinHealthyEffectiveReceiveByteCount ByteCount
 
@@ -249,10 +250,57 @@ type WindowSizeSettings struct {
 	WindowSizeMin int
 	// the minimumum number of items in the windows that must be connected via p2p only
 	WindowSizeMinP2pOnly int
-	WindowSizeMax        int
-	WindowSizeUseMax     int
-	// reconnects per source
+	// inclusive
+	WindowSizeMax int
+	// WindowSizeUseMax     int
+	// clients per source
 	WindowSizeReconnectScale float64
+	KeepHealthiestCount      int
+	WindowMaxScale           float64
+	Ulimit                   int
+}
+
+// not setting a performance profile will use the default "auto" mode
+// which balances traffic across multiple window types with an internal set of profiles
+type PerformanceProfile struct {
+	WindowType WindowType
+	// leave 0 to automatically size between `WindowSizeMin` and `WindowSizeMax`
+	FixedWindowSize int
+	WindowSize      WindowSizeSettings
+}
+
+func (self *PerformanceProfile) Validate() error {
+	if self.WindowSize.WindowSizeMax < self.WindowSize.WindowSizeMin {
+		return fmt.Errorf(
+			"Window size [%d, %d] invalid. Max must be >= min",
+			self.WindowSize.WindowSizeMin,
+			self.WindowSize.WindowSizeMax,
+			self.FixedWindowSize,
+		)
+	}
+
+	if 0 < self.FixedWindowSize {
+		if self.FixedWindowSize < self.WindowSize.WindowSizeMin || self.WindowSize.WindowSizeMax < self.FixedWindowSize {
+			return fmt.Errorf(
+				"Window size [%d, %d] must include the fixed size =%d",
+				self.WindowSize.WindowSizeMin,
+				self.WindowSize.WindowSizeMax,
+				self.FixedWindowSize,
+			)
+		}
+	}
+
+	return nil
+}
+
+func DefaultWindowSizeSettings() WindowSizeSettings {
+	return WindowSizeSettings{
+		WindowSizeMin:            1,
+		WindowSizeMax:            1,
+		WindowSizeReconnectScale: 1.0,
+		KeepHealthiestCount:      1,
+		WindowMaxScale:           4.0,
+	}
 }
 
 type receivePacket struct {
@@ -290,6 +338,8 @@ type RemoteUserNatMultiClient struct {
 	affinityIp4Paths map[Ip4Path]map[Ip4Path]time.Time
 	affinityIp6Paths map[Ip6Path]map[Ip6Path]time.Time
 	clientUpdates    map[*multiClientChannel]map[*multiClientChannelUpdate]bool
+
+	performanceProfile *PerformanceProfile
 }
 
 func NewRemoteUserNatMultiClientWithDefaults(
@@ -387,14 +437,48 @@ func (self *RemoteUserNatMultiClient) AddContractStatusCallback(contractStatusCa
 	}
 }
 
+// the performance profile will take effect at the next `resize` iteration
+func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *PerformanceProfile) {
+	if performanceProfile != nil {
+		err := performanceProfile.Validate()
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+
+		self.performanceProfile = performanceProfile
+	}()
+	for _, window := range self.windows {
+		window.SetPerformanceProfile(performanceProfile)
+	}
+}
+
 // ordered by choice descending
 func (self *RemoteUserNatMultiClient) selectWindowTypes(sendPacket *parsedPacket) []WindowType {
 	// - web traffic is routed to quality providers
 	// - all other traffic is routed to speed providers
-	if sendPacket.ipPath.DestinationPort == 443 {
-		return []WindowType{WindowTypeQuality, WindowTypeSpeed}
+
+	var fixedWindowType *WindowType
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if self.performanceProfile != nil {
+			fixedWindowType = &self.performanceProfile.WindowType
+		}
+	}()
+
+	if fixedWindowType != nil {
+		return []WindowType{*fixedWindowType}
+	} else {
+		if sendPacket.ipPath.DestinationPort == 443 {
+			return []WindowType{WindowTypeQuality, WindowTypeSpeed}
+		}
+		return []WindowType{WindowTypeSpeed, WindowTypeQuality}
 	}
-	return []WindowType{WindowTypeSpeed, WindowTypeQuality}
 }
 
 func (self *RemoteUserNatMultiClient) affinityIpPaths(ipPath *IpPath) (affinityPaths []*IpPath, attach bool) {
@@ -1617,6 +1701,7 @@ type multiClientWindow struct {
 
 	stateLock          sync.Mutex
 	destinationClients map[MultiHopId]*multiClientChannel
+	performanceProfile *PerformanceProfile
 }
 
 func newMultiClientWindow(
@@ -1655,6 +1740,14 @@ func (self *multiClientWindow) AddContractStatusCallback(contractStatusCallback 
 	return func() {
 		self.contractStatusCallbacks.Remove(callbackId)
 	}
+}
+
+// the performance profile will take effect at the next `resize` iteration
+func (self *multiClientWindow) SetPerformanceProfile(performanceProfile *PerformanceProfile) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	self.performanceProfile = performanceProfile
 }
 
 func (self *multiClientWindow) contractStatus(contractStatus *ContractStatus) {
@@ -1766,6 +1859,21 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 
 func (self *multiClientWindow) resize() {
 	for {
+		var windowSize WindowSizeSettings
+		var fixedWindowSize int
+		var fixedWindowType *WindowType
+		func() {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			if self.performanceProfile != nil {
+				fixedWindowType = &self.performanceProfile.WindowType
+				fixedWindowSize = self.performanceProfile.FixedWindowSize
+				windowSize = self.performanceProfile.WindowSize
+			} else {
+				windowSize = self.settings.WindowSizes[self.windowType]
+			}
+		}()
+
 		startTime := time.Now()
 
 		warnedClients := []*multiClientChannel{}
@@ -1863,7 +1971,12 @@ func (self *multiClientWindow) resize() {
 			}
 			// the top `StatsWindowKeepHealthiestCount` won't be marked as warning or removed
 			netHealthRank := netHealthRanks[client]
-			remove := self.settings.StatsWindowKeepHealthiestCount <= netHealthRank
+			var remove bool
+			if 0 < fixedWindowSize {
+				remove = fixedWindowSize <= netHealthRank
+			} else {
+				remove = windowSize.KeepHealthiestCount <= netHealthRank
+			}
 			if healthy {
 				// a client after its `removeTime` will be in a permananent warning state as long as it continues to route traffic
 				// this prevents new connections from using the client
@@ -1874,8 +1987,14 @@ func (self *multiClientWindow) resize() {
 						warnClient(client, stats)
 					} else {
 						printStats("client ok")
-						client.setWarning(false)
-						keepClient(client, stats)
+						ulimit := 0 < windowSize.Ulimit && windowSize.Ulimit <= stats.netSourceCount
+						if ulimit {
+							client.setWarning(true)
+							warnClient(client, stats)
+						} else {
+							client.setWarning(false)
+							keepClient(client, stats)
+						}
 					}
 				} else {
 					printStats("client health warning")
@@ -1935,31 +2054,38 @@ func (self *multiClientWindow) resize() {
 			collapse(clients)
 		}
 
-		windowSize := self.settings.WindowSizes[self.windowType]
-		var targetWindowSize int
-		if fixedDestinationSize, fixed := self.generator.FixedDestinationSize(); fixed {
-			targetWindowSize = fixedDestinationSize
-		} else {
-			// scale the number of reconnects
-			targetWindowSize = int(math.Ceil(float64(maxSourceCount) * windowSize.WindowSizeReconnectScale))
-		}
-
-		targetWindowSize = min(
-			windowSize.WindowSizeMax,
-			max(
-				windowSize.WindowSizeMin,
-				targetWindowSize,
-			),
-		)
-
 		p2pOnlyWindowSize := 0
 		for _, client := range clients {
 			if client.IsP2pOnly() {
 				p2pOnlyWindowSize += 1
 			}
 		}
-		if n := windowSize.WindowSizeMinP2pOnly - p2pOnlyWindowSize; 0 < n {
-			targetWindowSize += n
+
+		var targetWindowSize int
+		if fixedDestinationSize, fixed := self.generator.FixedDestinationSize(); fixed {
+			targetWindowSize = fixedDestinationSize
+		} else if 0 < fixedWindowSize {
+			if fixedWindowType == nil || self.windowType == *fixedWindowType {
+				targetWindowSize = fixedWindowSize
+			} else {
+				// not the active window, disable resize
+				targetWindowSize = 0
+			}
+		} else {
+			// scale the number of reconnects
+			targetWindowSize = int(math.Ceil(float64(maxSourceCount) * windowSize.WindowSizeReconnectScale))
+
+			if n := windowSize.WindowSizeMinP2pOnly - p2pOnlyWindowSize; 0 < n {
+				targetWindowSize += n
+			}
+
+			targetWindowSize = min(
+				windowSize.WindowSizeMax,
+				max(
+					windowSize.WindowSizeMin,
+					targetWindowSize,
+				),
+			)
 		}
 
 		addedCount := 0
@@ -1969,19 +2095,20 @@ func (self *multiClientWindow) resize() {
 			self.monitor.AddWindowExpandEvent(false, targetWindowSize+len(warnedClients))
 			glog.Infof("[multi]window expand +%d %d->%d\n", n, len(clients), targetWindowSize)
 			addedCount = self.expand(
+				windowSize,
 				len(clients),
 				p2pOnlyWindowSize,
 				targetWindowSize,
 				targetWindowSize-len(clients),
 			)
 		}
-		collapseWindowSize := int(math.Ceil(float64(targetWindowSize) * self.settings.WindowMaxScale))
+		collapseWindowSize := int(math.Ceil(float64(targetWindowSize) * windowSize.WindowMaxScale))
 		if collapseWindowSize < len(clients)+len(warnedClients)+addedCount {
-			self.monitor.AddWindowExpandEvent(true, collapseWindowSize)
+			self.monitor.AddWindowExpandEvent(true, collapseWindowSize+addedCount)
 			collapseLowestWeighted(max(0, collapseWindowSize-addedCount))
 			glog.Infof("[multi]window collapse -%d ->%d\n", (len(clients)+len(warnedClients)+addedCount)-collapseWindowSize, collapseWindowSize)
 		} else {
-			self.monitor.AddWindowExpandEvent(true, targetWindowSize)
+			self.monitor.AddWindowExpandEvent(true, len(clients)+len(warnedClients)+addedCount)
 		}
 
 		timeout := self.settings.WindowResizeTimeout - time.Now().Sub(startTime)
@@ -2001,10 +2128,16 @@ func (self *multiClientWindow) resize() {
 	}
 }
 
-func (self *multiClientWindow) expand(currentWindowSize int, currentP2pOnlyWindowSize int, targetWindowSize int, n int) (addedCount int) {
+func (self *multiClientWindow) expand(
+	windowSize WindowSizeSettings,
+	currentWindowSize int,
+	currentP2pOnlyWindowSize int,
+	targetWindowSize int,
+	n int,
+) (
+	addedCount int,
+) {
 	mutex := sync.Mutex{}
-
-	windowSize := self.settings.WindowSizes[self.windowType]
 
 	endTime := time.Now().Add(self.settings.WindowExpandTimeout)
 	// blockEndTime := time.Now().Add(self.settings.WindowExpandBlockTimeout)
@@ -2170,45 +2303,61 @@ func (self *multiClientWindow) clients() []*multiClientChannel {
 }
 
 func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
+	var fixedWindowSize int
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if self.performanceProfile != nil {
+			fixedWindowSize = self.performanceProfile.FixedWindowSize
+		}
+	}()
+
 	clients := []*multiClientChannel{}
-
-	windowSize := self.settings.WindowSizes[self.windowType]
-
+	lruTimes := map[*multiClientChannel]time.Time{}
 	weights := map[*multiClientChannel]float32{}
-	// durations := map[*multiClientChannel]time.Duration{}
 
 	for _, client := range self.clients() {
 		if stats, err := client.WindowStats(); err == nil && !client.isWarning() {
 			clients = append(clients, client)
-			// durations[client] = stats.duration
+			if !stats.lastEventTime.IsZero() {
+				lruTimes[client] = stats.lastEventTime
+			}
 			weights[client] = float32(1 + stats.ExpectedByteCountPerSecond())
 		}
 	}
 
-	// set weights for clients
-	// for _, client := range clients {
-	// 	if weight := float32(stats.ByteCountPerSecond()); 0 <= weight {
-	// 		if duration := durations[client]; duration < self.settings.StatsWindowGraceperiod {
-	// 			// use the estimate
-	// 			weights[client] = float32(client.EstimatedByteCountPerSecond())
-	// 		} else if 0 == weight {
-	// 			// not used, use the estimate
-	// 			weights[client] = float32(client.EstimatedByteCountPerSecond())
-	// 		}
-	// 	} else {
-	// 		weights[client] = 0
-	// 	}
-	// }
+	if 0 == len(clients) {
+		return clients
+	}
 
 	if glog.V(1) {
 		self.statsSampleWeights(weights)
 	}
 
-	WeightedShuffleWithEntropy(clients, weights, self.settings.StatsWindowEntropy)
-
-	if 0 == len(clients) {
-		return clients
+	if 0 < fixedWindowSize && fixedWindowSize < len(clients) {
+		slices.SortFunc(clients, func(a *multiClientChannel, b *multiClientChannel) int {
+			lruTimeA := lruTimes[a]
+			lruTimeB := lruTimes[b]
+			// descending
+			if lruTimeA.Before(lruTimeB) {
+				return 1
+			} else if lruTimeB.Before(lruTimeA) {
+				return -1
+			}
+			weightA := weights[a]
+			weightB := weights[b]
+			// descending
+			if weightA < weightB {
+				return 1
+			} else if weightB < weightA {
+				return -1
+			}
+			return 0
+		})
+		clients = clients[:fixedWindowSize]
 	}
+
+	WeightedShuffleWithEntropy(clients, weights, self.settings.StatsWindowEntropy)
 
 	// use only clients in the min tier
 	// this prevents the window from crossing rank until necessary
@@ -2226,9 +2375,9 @@ func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 	}
 
 	// use only the top n items from the window
-	if 0 < windowSize.WindowSizeUseMax {
-		minTierClients = minTierClients[:min(len(minTierClients), windowSize.WindowSizeUseMax)]
-	}
+	// if 0 < windowSize.WindowSizeUseMax {
+	// 	minTierClients = minTierClients[:min(len(minTierClients), windowSize.WindowSizeUseMax)]
+	// }
 
 	return minTierClients
 }
@@ -2346,6 +2495,7 @@ func newMultiClientEventBucket() *multiClientEventBucket {
 
 type clientWindowStats struct {
 	sourceCount                 int
+	netSourceCount              int
 	sendAckCount                int
 	sendAckByteCount            ByteCount
 	sendNackCount               int
@@ -2365,6 +2515,7 @@ type clientWindowStats struct {
 	netUnhealthyDuration time.Duration
 	healthy              bool
 	removeTime           time.Time
+	lastEventTime        time.Time
 
 	// internal
 	bucketCount int
@@ -3005,6 +3156,13 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 	if selectionIndex < len(netSourceCounts) {
 		maxSourceCount = netSourceCounts[selectionIndex]
 	}
+	netSourceCount := 0
+	for _, sourceCounts := range self.ip4DestinationSourceCount {
+		netSourceCount += len(sourceCounts)
+	}
+	for _, sourceCounts := range self.ip6DestinationSourceCount {
+		netSourceCount += len(sourceCounts)
+	}
 	if glog.V(2) {
 		for ip4Path, sourceCounts := range self.ip4DestinationSourceCount {
 			if isPublicPort(ip4Path.DestinationPort) {
@@ -3024,6 +3182,7 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 
 	stats := &clientWindowStats{
 		sourceCount:         maxSourceCount,
+		netSourceCount:      netSourceCount,
 		sendAckCount:        self.packetStats.sendAckCount,
 		sendNackCount:       self.packetStats.sendNackCount,
 		sendAckByteCount:    self.packetStats.sendAckByteCount,
@@ -3043,6 +3202,10 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 		// 	eventTime = time.Now()
 		// }
 		eventTime := time.Now()
+
+		if 0 < len(self.eventBuckets) {
+			stats.lastEventTime = self.eventBuckets[len(self.eventBuckets)-1].eventTime
+		}
 
 		effectiveByteCountPerSecond := stats.EffectiveByteCountPerSecond()
 		// scaledEffectiveByteCountPerSecond := ByteCount(self.settings.StatsWindowMaxEffectiveByteCountPerSecondScale * float32(stats.EffectiveByteCountPerSecond()))
