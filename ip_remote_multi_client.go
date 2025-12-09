@@ -1812,7 +1812,6 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			} else {
 				for destination, stats := range nextDestinations {
 					destinations[destination] = stats
-					visitedDestinations[destination] = time.Now()
 				}
 				// remove destinations that are already in the window
 				func() {
@@ -1836,7 +1835,13 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			}
 		}
 
+		// destinations must be used by `expirationTime`
+		expirationTime := time.Now().Add(5 * time.Minute)
 		for destination, stats := range destinations {
+			timeout := expirationTime.Sub(time.Now())
+			if timeout <= 0 {
+				break
+			}
 			if clientArgs, err := self.generator.NewClientArgs(); err == nil {
 				args := &multiClientChannelArgs{
 					Destination:                    destination,
@@ -1848,6 +1853,11 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 					self.generator.RemoveClientArgs(clientArgs)
 					return
 				case self.clientChannelArgs <- args:
+					visitedDestinations[destination] = time.Now()
+				case <-time.After(timeout):
+					// destination expired
+					glog.Infof("[multi]create client args expired\n")
+					self.generator.RemoveClientArgs(clientArgs)
 				}
 			} else {
 				glog.Infof("[multi]create client args error = %s\n", err)
