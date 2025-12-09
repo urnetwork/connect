@@ -160,8 +160,8 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// TODO on platforms with more memory, increase this
 		MultiRaceClientCount: 8,
 
-		StatsWindowMaxUnhealthyDuration:  30 * time.Second,
-		StatsWindowWarnUnhealthyDuration: 10 * time.Second,
+		StatsWindowMaxUnhealthyDuration:  15 * time.Second,
+		StatsWindowWarnUnhealthyDuration: 5 * time.Second,
 		// StatsWindowKeepHealthiestCount:   2,
 		// the effective byte count is per stats window `StatsWindowDuration`
 		StatsWindowMinHealthyEffectiveSendByteCount:    kib(1),
