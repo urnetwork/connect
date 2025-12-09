@@ -103,21 +103,21 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		WindowSizes: map[WindowType]WindowSizeSettings{
 			// TODO increase `WindowSizeMinP2pOnly` when p2p is deployed
 			WindowTypeQuality: WindowSizeSettings{
-				WindowSizeMin: 2,
-				WindowSizeMax: 6,
+				WindowSizeMin:     2,
+				WindowSizeMax:     6,
+				WindowSizeHardMax: 12,
 				// reconnects per source
 				WindowSizeReconnectScale: 1.0,
 				KeepHealthiestCount:      2,
-				WindowMaxScale:           4.0,
 			},
 			WindowTypeSpeed: WindowSizeSettings{
-				WindowSizeMin: 1,
-				WindowSizeMax: 1,
+				WindowSizeMin:     1,
+				WindowSizeMax:     1,
+				WindowSizeHardMax: 4,
 				// WindowSizeUseMax:     1,
 				// reconnects per source
 				WindowSizeReconnectScale: 1.0,
 				KeepHealthiestCount:      1,
-				WindowMaxScale:           4.0,
 			},
 		},
 		SendRetryTimeout:           20 * time.Millisecond,
@@ -251,12 +251,12 @@ type WindowSizeSettings struct {
 	// the minimumum number of items in the windows that must be connected via p2p only
 	WindowSizeMinP2pOnly int
 	// inclusive
-	WindowSizeMax int
+	WindowSizeMax     int
+	WindowSizeHardMax int
 	// WindowSizeUseMax     int
 	// clients per source
 	WindowSizeReconnectScale float64
 	KeepHealthiestCount      int
-	WindowMaxScale           float64
 	Ulimit                   int
 }
 
@@ -296,9 +296,9 @@ func DefaultWindowSizeSettings() WindowSizeSettings {
 	return WindowSizeSettings{
 		WindowSizeMin:            1,
 		WindowSizeMax:            1,
+		WindowSizeHardMax:        4,
 		WindowSizeReconnectScale: 1.0,
 		KeepHealthiestCount:      1,
-		WindowMaxScale:           4.0,
 	}
 }
 
@@ -1701,6 +1701,8 @@ type multiClientWindow struct {
 	stateLock          sync.Mutex
 	destinationClients map[MultiHopId]*multiClientChannel
 	performanceProfile *PerformanceProfile
+
+	generatorMonitor *Monitor
 }
 
 func newMultiClientWindow(
@@ -1722,10 +1724,11 @@ func newMultiClientWindow(
 		clientRemoveCallback:        clientRemoveCallback,
 		windowType:                  windowType,
 		settings:                    settings,
-		clientChannelArgs:           make(chan *multiClientChannelArgs, settings.WindowSizes[windowType].WindowSizeMin),
+		clientChannelArgs:           make(chan *multiClientChannelArgs),
 		monitor:                     NewRemoteUserNatMultiClientMonitor(&settings.RemoteUserNatMultiClientMonitorSettings),
 		contractStatusCallbacks:     NewCallbackList[ContractStatusFunction](),
 		destinationClients:          map[MultiHopId]*multiClientChannel{},
+		generatorMonitor:            NewMonitor(),
 	}
 
 	go HandleError(window.randomEnumerateClientArgs, cancel)
@@ -1779,6 +1782,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 	// a destination can be revisited after `WindowRevisitTimeout`
 	visitedDestinations := map[MultiHopId]time.Time{}
 	for {
+		generatorNotify := self.generatorMonitor.NotifyChannel()
 		destinations := map[MultiHopId]DestinationStats{}
 		for len(destinations) == 0 {
 			// exclude destinations that are already in the window
@@ -1862,6 +1866,12 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			} else {
 				glog.Infof("[multi]create client args error = %s\n", err)
 			}
+		}
+
+		select {
+		case <-self.ctx.Done():
+			return
+		case <-generatorNotify:
 		}
 	}
 }
@@ -2111,11 +2121,10 @@ func (self *multiClientWindow) resize() {
 				targetWindowSize-len(clients),
 			)
 		}
-		collapseWindowSize := int(math.Ceil(float64(targetWindowSize) * windowSize.WindowMaxScale))
-		if collapseWindowSize < len(clients)+len(warnedClients)+addedCount {
-			self.monitor.AddWindowExpandEvent(true, collapseWindowSize+addedCount)
-			collapseLowestWeighted(max(0, collapseWindowSize-addedCount))
-			glog.Infof("[multi]window collapse -%d ->%d\n", (len(clients)+len(warnedClients)+addedCount)-collapseWindowSize, collapseWindowSize)
+		if 0 < windowSize.WindowSizeHardMax && windowSize.WindowSizeHardMax < len(clients)+len(warnedClients)+addedCount {
+			self.monitor.AddWindowExpandEvent(true, windowSize.WindowSizeHardMax)
+			collapseLowestWeighted(max(0, windowSize.WindowSizeHardMax-addedCount))
+			glog.Infof("[multi]window collapse -%d ->%d\n", (len(clients)+len(warnedClients)+addedCount)-windowSize.WindowSizeHardMax, windowSize.WindowSizeHardMax)
 		} else {
 			self.monitor.AddWindowExpandEvent(true, len(clients)+len(warnedClients)+addedCount)
 		}
@@ -2166,6 +2175,7 @@ func (self *multiClientWindow) expand(
 			return
 		}
 
+		self.generatorMonitor.NotifyAll()
 		select {
 		case <-self.ctx.Done():
 			return
