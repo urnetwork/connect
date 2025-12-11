@@ -48,19 +48,29 @@ type ConnectSettings struct {
 
 	ProxySettings *ProxySettings
 	Resolver      *net.Resolver
+
+	DialContextSettings *DialContextSettings
+}
+
+type DialContextSettings struct {
+	DialContext DialContextFunction
 }
 
 func (self *ConnectSettings) DialContext(ctx context.Context, network string, addr string) (net.Conn, error) {
-	netDialer := self.NetDialer()
-
 	var dialContext DialContextFunction
-	if self.ProxySettings != nil {
-		dialContext = self.ProxySettings.NewDialContext(
-			ctx,
-			netDialer,
-		)
+
+	if self.DialContextSettings != nil {
+		dialContext = self.DialContextSettings.DialContext
 	} else {
-		dialContext = netDialer.DialContext
+		netDialer := self.NetDialer()
+		if self.ProxySettings != nil {
+			dialContext = self.ProxySettings.NewDialContext(
+				ctx,
+				netDialer,
+			)
+		} else {
+			dialContext = netDialer.DialContext
+		}
 	}
 
 	return dialContext(ctx, network, addr)
