@@ -29,7 +29,7 @@ import (
 	// "crypto/md5"
 	"encoding/binary"
 	// "encoding/hex"
-	"syscall"
+	// "syscall"
 
 	mathrand "math/rand"
 
@@ -148,11 +148,11 @@ func (self *ResilientTlsConn) Write(b []byte) (int, error) {
 								f, _ := tcpConn.File()
 								fd := SocketHandle(f.Fd())
 
-								nativeTtl, _ := syscall.GetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_TTL)
+								nativeTtl := GetSocketTtl(fd)
 
 								// fmt.Printf("native ttl=%d, server name start=%d, end=%d\n", nativeTtl, meta.ServerNameValueStart, meta.ServerNameValueEnd)
 
-								syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_TTL, 0)
+								SetSocketTtl(fd, 0)
 								if _, err := tcpConn.Write(tlsHeader.reconstruct(handshakeBytes[0:split])); err != nil {
 									return 0, err
 								}
@@ -165,14 +165,14 @@ func (self *ResilientTlsConn) Write(b []byte) (int, error) {
 									} else {
 										ttl = nativeTtl
 									}
-									syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_TTL, ttl)
+									SetSocketTtl(fd, ttl)
 									if _, err := tcpConn.Write(tlsHeader.reconstruct(handshakeBytes[i:min(i+step, meta.ServerNameValueEnd)])); err != nil {
 										return 0, err
 									}
 									// fmt.Printf("frag ttl=%d\n", ttl)
 								}
 
-								syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_TTL, nativeTtl)
+								SetSocketTtl(fd, nativeTtl)
 
 								if _, err := tcpConn.Write(tlsHeader.reconstruct(handshakeBytes[meta.ServerNameValueEnd:])); err != nil {
 									return 0, err
@@ -203,7 +203,7 @@ func (self *ResilientTlsConn) Write(b []byte) (int, error) {
 								f, _ := tcpConn.File()
 								fd := SocketHandle(f.Fd())
 
-								nativeTtl, _ := syscall.GetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_TTL)
+								nativeTtl := GetSocketTtl(fd)
 
 								for i := 0; i*blockSize < len(tlsBytes); i += 1 {
 									var ttl int
@@ -212,14 +212,14 @@ func (self *ResilientTlsConn) Write(b []byte) (int, error) {
 									} else {
 										ttl = nativeTtl
 									}
-									syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_TTL, ttl)
+									SetSocketTtl(fd, ttl)
 									b := tlsBytes[i*blockSize : min((i+1)*blockSize, len(tlsBytes))]
 									if _, err := tcpConn.Write(b); err != nil {
 										return 0, err
 									}
 								}
 
-								syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_TTL, nativeTtl)
+								SetSocketTtl(fd, nativeTtl)
 
 							} else {
 								if _, err := tcpConn.Write(tlsHeader.reconstruct(handshakeBytes)); err != nil {
