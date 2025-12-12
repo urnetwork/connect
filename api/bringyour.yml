@@ -23,7 +23,7 @@ info:
     clients are typically addressed via their clientId.
 
     Unless otherwise specified, time/date strings will be formatted
-    in the Go default `2006-01-02 15:04:05.999999999 -0700 MST`.
+    in the Go default `2006-01-02 15:04:05.999999999 -0700 MST` (RFC 3339).
 
   termsOfService: https://bringyour.com/terms
   contact:
@@ -1911,11 +1911,72 @@ components:
             If this is called with a client jwt, the derived client id is inferred from the jwt.
           type: string
 
+        proxy_config:
+          description: Optional. |
+            Set if the intended use case of the client is cloud proxy. |
+            Note local traffic is not allowed on the cloud proxy. A destination must be set via the SDK.
+          type: object
+          properties:
+            lock_caller_ip:
+              description: Optional. |
+                Allow only the caller's IP subnet to access the proxy.
+              type: boolean
+            lock_ip_list:
+              description: Optional. |
+                Allow only IPs/subnets in the list to access the proxy. |
+                The IPs/subnets are converted to the internal IP subnet width.
+              type: array
+              items:
+                type: string
+            enable_socks:
+              description: Optional.
+              type: boolean
+            enable_http:
+              description: Optional.
+              type: boolean
+            http_require_auth:
+              description: Optional. |
+                If the client supports ECH, this is not needed, since the HTTP proxy URL will itself be the auth.
+              type: boolean
+
     AuthNetworkClientResult:
       type: object
       properties:
         by_client_jwt:
           type: string
+        proxy_config_result:
+          type: object
+          properties:
+            expiration_time:
+              description: The proxy must be used by this time or it will no longer be valid.
+              type: string
+            keepalive_seconds:
+              description: The proxy must receive a message at least once per this interval, to stay alive. |
+                The SDK ProxyDevice will automatically send a heartbeat with this many seconds.
+              type: integer
+            http_proxy_url:
+              description: Optional. Will not be set if `enable_http=false`
+              type: string
+            socks_proxy_url:
+              description: Optional. Will not be set if `enable_socks=false`
+              type: string
+            http_proxy_auth:
+              description: Optional. Will not be set if `http_require_auth=false`
+              type: object
+              properties:
+                username:
+                  type: string
+                password:
+                  type: string
+            socks_proxy_auth:
+              description: Optional.
+              type: object
+              properties:
+                username:
+                  type: string
+                password:
+                  type: string
+
         error:
           type: object
           properties:
@@ -1923,6 +1984,8 @@ components:
               type: boolean
             message:
               type: string
+
+            
 
     RemoveNetworkClientArgs:
       type: object

@@ -3,7 +3,7 @@ package connect
 import (
 	"context"
 	"strings"
-	// "time"
+	"time"
 	// "crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"sync"
 
 	"golang.org/x/net/idna"
 	// "golang.org/x/exp/maps"
@@ -53,13 +54,78 @@ type DohSettings struct {
 	ConnectSettings
 }
 
-func DohQuery(ctx context.Context, ipVersion int, recordType string, settings *DohSettings, domains ...string) map[netip.Addr]bool {
+type DohCache struct {
+	settings *DohSettings
+
+	stateLock             sync.Mutex
+	queryResultExpiration map[DohKey]map[netip.Addr]time.Time
+}
+
+func NewDohCache(settings *DohSettings) *DohCache {
+	return &DohCache{
+		settings:              settings,
+		queryResultExpiration: map[DohKey]map[netip.Addr]time.Time{},
+	}
+}
+
+func (self *DohCache) Query(ctx context.Context, recordType string, domain string) []netip.Addr {
+	q := NewDohKey(recordType, domain)
+
+	now := time.Now()
+
+	var ips []netip.Addr
+	ok := func() bool {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+
+		r, ok := self.queryResultExpiration[q]
+		if !ok {
+			return false
+		}
+		for ip, expireTime := range r {
+			if expireTime.Before(now) {
+				return false
+			}
+			ips = append(ips, ip)
+		}
+		return true
+	}()
+	if ok {
+		return ips
+	}
+
+	ipTtls := DohQuery(ctx, 0, q.RecordType, self.settings, q.Domain)
+	r := map[netip.Addr]time.Time{}
+	for ip, ttlSeconds := range ipTtls {
+		r[ip] = now.Add(time.Duration(ttlSeconds) * time.Second)
+	}
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+
+		self.queryResultExpiration[q] = r
+	}()
+
+	ips = nil
+	for ip, _ := range r {
+		ips = append(ips, ip)
+	}
+	return ips
+}
+
+func DohQueryWithDefaults(ctx context.Context, recordType string, domains ...string) map[netip.Addr]int {
+	return DohQuery(ctx, 0, recordType, DefaultDohSettings(), domains...)
+}
+
+// return ip -> ttl (seconds)
+// use `ipVersion=0` to try all versions
+func DohQuery(ctx context.Context, ipVersion int, recordType string, settings *DohSettings, domains ...string) map[netip.Addr]int {
 	// run all the queries in parallel to all servers
 
 	switch recordType {
 	case "A", "AAAA":
 	default:
-		return map[netip.Addr]bool{}
+		return map[netip.Addr]int{}
 	}
 
 	httpClient := &http.Client{
@@ -71,11 +137,12 @@ func DohQuery(ctx context.Context, ipVersion int, recordType string, settings *D
 		},
 	}
 
-	query := func(dohUrl string, domain string) []netip.Addr {
+	query := func(dohUrl string, domain string) (result map[netip.Addr]int) {
+		result = map[netip.Addr]int{}
 
 		name, err := Punycode(domain)
 		if err != nil {
-			return nil
+			return
 		}
 
 		params := url.Values{}
@@ -86,7 +153,7 @@ func DohQuery(ctx context.Context, ipVersion int, recordType string, settings *D
 
 		request, err := http.NewRequestWithContext(ctx, "GET", requestUrl, nil)
 		if err != nil {
-			return nil
+			return
 		}
 
 		request.Header.Set("Accept", "application/dns-json")
@@ -95,36 +162,37 @@ func DohQuery(ctx context.Context, ipVersion int, recordType string, settings *D
 
 		response, err := httpClient.Do(request)
 		if err != nil {
-			return nil
+			return
 		}
 		defer response.Body.Close()
 		if response.StatusCode != http.StatusOK {
-			return nil
+			return
 		}
 
 		data, err := io.ReadAll(response.Body)
 		if err != nil {
-			return nil
+			return
 		}
 
 		dohResponse := &DohResponse{}
 		err = json.Unmarshal(data, dohResponse)
 		if err != nil {
-			return nil
+			return
 		}
 
 		if dohResponse.Status != 0 {
-			return nil
+			return
 		}
 
-		ips := []netip.Addr{}
+		// ips := []netip.Addr{}
 		for _, answer := range dohResponse.Answer {
 			if ip, err := netip.ParseAddr(answer.Data); err == nil {
-				ips = append(ips, ip)
+				// ips = append(ips, ip)
+				result[ip] = max(result[ip], answer.TTL)
 			}
 		}
 
-		return ips
+		return
 	}
 
 	var dohUrls []string
@@ -134,30 +202,31 @@ func DohQuery(ctx context.Context, ipVersion int, recordType string, settings *D
 	case 6:
 		dohUrls = dohUrlsIpv6()
 	default:
-		dohUrls = []string{}
+		dohUrls = append(dohUrls, dohUrlsIpv4()...)
+		dohUrls = append(dohUrls, dohUrlsIpv6()...)
 	}
 
-	out := make(chan []netip.Addr)
+	out := make(chan map[netip.Addr]int)
 
 	for _, dohUrl := range dohUrls {
 		for _, domain := range domains {
-			go func() {
+			go HandleError(func() {
 				ips := query(dohUrl, domain)
 				select {
 				case out <- ips:
 				case <-ctx.Done():
 				}
-			}()
+			})
 		}
 	}
 
-	mergedIps := map[netip.Addr]bool{}
+	mergedIps := map[netip.Addr]int{}
 	for range dohUrls {
 		for range domains {
 			select {
 			case ips := <-out:
-				for _, ip := range ips {
-					mergedIps[ip] = true
+				for ip, ttl := range ips {
+					mergedIps[ip] = max(mergedIps[ip], ttl)
 				}
 			case <-ctx.Done():
 			}
@@ -165,6 +234,18 @@ func DohQuery(ctx context.Context, ipVersion int, recordType string, settings *D
 	}
 
 	return mergedIps
+}
+
+type DohKey struct {
+	RecordType string
+	Domain     string
+}
+
+func NewDohKey(recordType string, domain string) DohKey {
+	return DohKey{
+		RecordType: strings.ToUpper(recordType),
+		Domain:     strings.ToLower(recordType),
+	}
 }
 
 type DohQuestion struct {
