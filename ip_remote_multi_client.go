@@ -120,45 +120,46 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 				KeepHealthiestCount:      1,
 			},
 		},
-		SendRetryTimeout:           20 * time.Millisecond,
+		SendRetryTimeout:           5 * time.Millisecond,
 		PingWriteTimeout:           5 * time.Second,
-		CPingWriteTimeout:          5 * time.Second,
-		CPingMaxByteCountPerSecond: kib(8),
+		CPingWriteTimeout:          15 * time.Second,
+		CPingMaxByteCountPerSecond: kib(32),
 		// the initial ping includes creating the transports and contract
 		// ease up the timeout until perf issues are fully resolved
-		PingTimeout:  15 * time.Second,
-		CPingTimeout: 15 * time.Second,
+		PingTimeout:  30 * time.Second,
+		CPingTimeout: 30 * time.Second,
 		// a lower ack timeout helps cycle through bad providers faster
-		AckTimeout:             15 * time.Second,
+		AckTimeout:             30 * time.Second,
 		BlackholeTimeout:       15 * time.Second,
-		WindowResizeTimeout:    5 * time.Second,
-		StatsWindowGraceperiod: 15 * time.Second,
-		StatsWindowMaxEstimatedByteCountPerSecond: mib(8),
+		WindowResizeTimeout:    15 * time.Second,
+		StatsWindowGraceperiod: 30 * time.Second,
+		StatsWindowMaxEstimatedByteCountPerSecond: mib(16),
 		// StatsWindowMaxEffectiveByteCountPerSecondScale: 0.8,
 		StatsWindowEntropy:  0.0,
 		WindowExpandTimeout: 15 * time.Second,
 		// WindowExpandBlockTimeout: 5 * time.Second,
-		WindowExpandBlockCount: 8,
+		WindowExpandBlockCount: 4,
 		// wait this time before enumerating potential clients again
 		WindowEnumerateEmptyTimeout: 15 * time.Second,
 		WindowEnumerateErrorTimeout: 1 * time.Second,
 		// WindowMaxScale:              4.0,
 		// WindowExpandMaxOvershotScale: 2.0,
 		WindowRevisitTimeout:      2 * time.Minute,
-		StatsWindowDuration:       60 * time.Second,
+		StatsWindowDuration:       30 * time.Second,
 		StatsWindowBucketDuration: 1 * time.Second,
 		StatsSampleWeightsCount:   8,
-		StatsSourceCountSelection: 0.95,
+		// percentile
+		StatsSourceCountSelection: 0.9,
 		// ClientAffinityTimeout:        0 * time.Second,
 
-		MultiRaceSetOnNoResponseTimeout:      2000 * time.Millisecond,
-		MultiRaceSetOnResponseTimeout:        50 * time.Millisecond,
+		MultiRaceSetOnNoResponseTimeout:      5 * time.Second,
+		MultiRaceSetOnResponseTimeout:        2 * time.Second,
 		MultiRaceClientSentPacketMaxCount:    16,
-		MultiRaceClientPacketMaxCount:        4,
-		MultiRacePacketMaxCount:              16,
+		MultiRaceClientPacketMaxCount:        8,
+		MultiRacePacketMaxCount:              32,
 		MultiRaceClientEarlyCompleteFraction: 0.25,
 		// TODO on platforms with more memory, increase this
-		MultiRaceClientCount: 8,
+		MultiRaceClientCount: 2,
 
 		StatsWindowMaxUnhealthyDuration:  15 * time.Second,
 		StatsWindowWarnUnhealthyDuration: 5 * time.Second,
@@ -167,7 +168,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		StatsWindowMinHealthyEffectiveSendByteCount:    kib(1),
 		StatsWindowMinHealthyEffectiveReceiveByteCount: kib(32),
 
-		MaxClientLifetime: 15 * time.Minute,
+		MaxClientLifetime: 60 * time.Minute,
 
 		ProtocolVersion:     DefaultProtocolVersion,
 		DestinationAffinity: true,
@@ -209,6 +210,7 @@ type MultiClientSettings struct {
 	StatsWindowDuration       time.Duration
 	StatsWindowBucketDuration time.Duration
 	StatsSampleWeightsCount   int
+	// percentile
 	StatsSourceCountSelection float64
 	// lower affinity is more private
 	// however, there may be some applications that assume the same ip across multiple connections
@@ -2884,7 +2886,7 @@ func (self *multiClientChannel) ping() {
 	for {
 		if windowStats, err := self.WindowStats(); err != nil {
 			return
-		} else if windowStats.EffectiveByteCountPerSecond() <= self.settings.CPingMaxByteCountPerSecond {
+		} else if self.settings.CPingMaxByteCountPerSecond == 0 || windowStats.EffectiveByteCountPerSecond() <= self.settings.CPingMaxByteCountPerSecond {
 			pingDone := make(chan error)
 			success, err := self.SendDetailedMessage(
 				&protocol.IpPing{},
