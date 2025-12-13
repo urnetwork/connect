@@ -107,17 +107,18 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 				WindowSizeMax:     6,
 				WindowSizeHardMax: 12,
 				// reconnects per source
-				WindowSizeReconnectScale: 1.0,
-				KeepHealthiestCount:      2,
+				WindowSizeReconnectScale: 1.2,
+				KeepHealthiestCount:      0,
 			},
 			WindowTypeSpeed: WindowSizeSettings{
 				WindowSizeMin:     1,
-				WindowSizeMax:     1,
+				WindowSizeMax:     2,
 				WindowSizeHardMax: 4,
+				FixedWindowSize:   1,
 				// WindowSizeUseMax:     1,
 				// reconnects per source
 				WindowSizeReconnectScale: 1.0,
-				KeepHealthiestCount:      1,
+				KeepHealthiestCount:      0,
 			},
 		},
 		SendRetryTimeout:           5 * time.Millisecond,
@@ -255,6 +256,8 @@ type WindowSizeSettings struct {
 	// inclusive
 	WindowSizeMax     int
 	WindowSizeHardMax int
+	// leave 0 to automatically size between `WindowSizeMin` and `WindowSizeMax`
+	FixedWindowSize int
 	// WindowSizeUseMax     int
 	// clients per source
 	WindowSizeReconnectScale float64
@@ -262,33 +265,40 @@ type WindowSizeSettings struct {
 	Ulimit                   int
 }
 
-// not setting a performance profile will use the default "auto" mode
-// which balances traffic across multiple window types with an internal set of profiles
-type PerformanceProfile struct {
-	WindowType WindowType
-	// leave 0 to automatically size between `WindowSizeMin` and `WindowSizeMax`
-	FixedWindowSize int
-	WindowSize      WindowSizeSettings
-}
-
-func (self *PerformanceProfile) Validate() error {
-	if self.WindowSize.WindowSizeMax < self.WindowSize.WindowSizeMin {
+func (self *WindowSizeSettings) Validate() error {
+	if self.WindowSizeMax < self.WindowSizeMin {
 		return fmt.Errorf(
 			"Window size [%d, %d] invalid. Max must be >= min",
-			self.WindowSize.WindowSizeMin,
-			self.WindowSize.WindowSizeMax,
+			self.WindowSizeMin,
+			self.WindowSizeMax,
 		)
 	}
 
 	if 0 < self.FixedWindowSize {
-		if self.FixedWindowSize < self.WindowSize.WindowSizeMin || self.WindowSize.WindowSizeMax < self.FixedWindowSize {
+		if self.FixedWindowSize < self.WindowSizeMin || self.WindowSizeMax < self.FixedWindowSize {
 			return fmt.Errorf(
 				"Window size [%d, %d] must include the fixed size =%d",
-				self.WindowSize.WindowSizeMin,
-				self.WindowSize.WindowSizeMax,
+				self.WindowSizeMin,
+				self.WindowSizeMax,
 				self.FixedWindowSize,
 			)
 		}
+	}
+
+	return nil
+}
+
+// not setting a performance profile will use the default "auto" mode
+// which balances traffic across multiple window types with an internal set of profiles
+type PerformanceProfile struct {
+	WindowType WindowType
+	WindowSize WindowSizeSettings
+}
+
+func (self *PerformanceProfile) Validate() error {
+	err := self.WindowSize.Validate()
+	if err != nil {
+		return err
 	}
 
 	return nil
@@ -1881,14 +1891,12 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 func (self *multiClientWindow) resize() {
 	for {
 		var windowSize WindowSizeSettings
-		var fixedWindowSize int
 		var fixedWindowType *WindowType
 		func() {
 			self.stateLock.Lock()
 			defer self.stateLock.Unlock()
 			if self.performanceProfile != nil {
 				fixedWindowType = &self.performanceProfile.WindowType
-				fixedWindowSize = self.performanceProfile.FixedWindowSize
 				windowSize = self.performanceProfile.WindowSize
 			} else {
 				windowSize = self.settings.WindowSizes[self.windowType]
@@ -1993,8 +2001,8 @@ func (self *multiClientWindow) resize() {
 			// the top `StatsWindowKeepHealthiestCount` won't be marked as warning or removed
 			netHealthRank := netHealthRanks[client]
 			var remove bool
-			if 0 < fixedWindowSize {
-				remove = fixedWindowSize <= netHealthRank
+			if 0 < windowSize.FixedWindowSize {
+				remove = windowSize.FixedWindowSize <= netHealthRank
 			} else {
 				remove = windowSize.KeepHealthiestCount <= netHealthRank
 			}
@@ -2085,9 +2093,9 @@ func (self *multiClientWindow) resize() {
 		var targetWindowSize int
 		if fixedDestinationSize, fixed := self.generator.FixedDestinationSize(); fixed {
 			targetWindowSize = fixedDestinationSize
-		} else if 0 < fixedWindowSize {
+		} else if 0 < windowSize.FixedWindowSize {
 			if fixedWindowType == nil || self.windowType == *fixedWindowType {
-				targetWindowSize = fixedWindowSize
+				targetWindowSize = windowSize.FixedWindowSize
 			} else {
 				// not the active window, disable resize
 				targetWindowSize = 0
@@ -2113,7 +2121,10 @@ func (self *multiClientWindow) resize() {
 		if len(clients) < targetWindowSize {
 			// expand
 			n := targetWindowSize - len(clients)
-			self.monitor.AddWindowExpandEvent(false, targetWindowSize+len(warnedClients))
+			self.monitor.AddWindowExpandEvent(
+				windowSize.WindowSizeMin <= len(clients),
+				targetWindowSize+len(warnedClients),
+			)
 			glog.Infof("[multi]window expand +%d %d->%d\n", n, len(clients), targetWindowSize)
 			addedCount = self.expand(
 				windowSize,
@@ -2251,15 +2262,17 @@ func (self *multiClientWindow) expand(
 										replacedClient.Cancel()
 										self.monitor.AddProviderEvent(replacedClient.ClientId(), ProviderStateRemoved)
 									}
+									var minSatisfied bool
 									func() {
 										mutex.Lock()
 										defer mutex.Unlock()
 										addedCount += 1
-										self.monitor.AddWindowExpandEvent(
-											targetWindowSize <= currentWindowSize+addedCount,
-											targetWindowSize,
-										)
+										minSatisfied = windowSize.WindowSizeMin <= currentWindowSize+addedCount
 									}()
+									self.monitor.AddWindowExpandEvent(
+										minSatisfied,
+										targetWindowSize,
+									)
 								} else {
 									glog.Infof("[multi]create ping error = %s\n", err)
 									client.Cancel()
@@ -2330,12 +2343,14 @@ func (self *multiClientWindow) clients() []*multiClientChannel {
 }
 
 func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
-	var fixedWindowSize int
+	var windowSize WindowSizeSettings
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		if self.performanceProfile != nil {
-			fixedWindowSize = self.performanceProfile.FixedWindowSize
+			windowSize = self.performanceProfile.WindowSize
+		} else {
+			windowSize = self.settings.WindowSizes[self.windowType]
 		}
 	}()
 
@@ -2361,7 +2376,7 @@ func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 		self.statsSampleWeights(weights)
 	}
 
-	if 0 < fixedWindowSize && fixedWindowSize < len(clients) {
+	if 0 < windowSize.FixedWindowSize && windowSize.FixedWindowSize < len(clients) {
 		slices.SortFunc(clients, func(a *multiClientChannel, b *multiClientChannel) int {
 			lruTimeA := lruTimes[a]
 			lruTimeB := lruTimes[b]
@@ -2381,7 +2396,7 @@ func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 			}
 			return 0
 		})
-		clients = clients[:fixedWindowSize]
+		clients = clients[:windowSize.FixedWindowSize]
 	}
 
 	WeightedShuffleWithEntropy(clients, weights, self.settings.StatsWindowEntropy)

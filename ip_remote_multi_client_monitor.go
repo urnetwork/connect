@@ -280,12 +280,12 @@ func (self *MergedMultiClientMonitor) Events() (*WindowExpandEvent, map[Id]*Prov
 func (self *MergedMultiClientMonitor) WindowExpandEvent() *WindowExpandEvent {
 	netWindowExpandEvent := WindowExpandEvent{
 		TargetSize:   0,
-		MinSatisfied: true,
+		MinSatisfied: false,
 	}
 	for _, monitor := range self.monitors {
 		windowExpandEvent := monitor.WindowExpandEvent()
 		netWindowExpandEvent.TargetSize += windowExpandEvent.TargetSize
-		netWindowExpandEvent.MinSatisfied = netWindowExpandEvent.MinSatisfied && windowExpandEvent.MinSatisfied
+		netWindowExpandEvent.MinSatisfied = netWindowExpandEvent.MinSatisfied || windowExpandEvent.MinSatisfied
 	}
 	return &netWindowExpandEvent
 }
