@@ -2135,11 +2135,17 @@ func (self *multiClientWindow) resize() {
 			)
 		}
 		if 0 < windowSize.WindowSizeHardMax && windowSize.WindowSizeHardMax < len(clients)+len(warnedClients)+addedCount {
-			self.monitor.AddWindowExpandEvent(true, windowSize.WindowSizeHardMax)
+			self.monitor.AddWindowExpandEvent(
+				windowSize.WindowSizeMin <= len(clients)+addedCount,
+				windowSize.WindowSizeHardMax,
+			)
 			collapseLowestWeighted(max(0, windowSize.WindowSizeHardMax-addedCount))
 			glog.Infof("[multi]window collapse -%d ->%d\n", (len(clients)+len(warnedClients)+addedCount)-windowSize.WindowSizeHardMax, windowSize.WindowSizeHardMax)
 		} else {
-			self.monitor.AddWindowExpandEvent(true, len(clients)+len(warnedClients)+addedCount)
+			self.monitor.AddWindowExpandEvent(
+				windowSize.WindowSizeMin <= len(clients)+addedCount,
+				len(clients)+len(warnedClients)+addedCount,
+			)
 		}
 
 		timeout := self.settings.WindowResizeTimeout - time.Now().Sub(startTime)
