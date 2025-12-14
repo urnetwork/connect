@@ -1971,74 +1971,72 @@ func (self *multiClientWindow) resize() {
 		}()
 
 		for client, stats := range clientStats {
-			effectiveByteCountPerSecond := stats.EffectiveByteCountPerSecond()
-			expectedByteCountPerSecond := stats.ExpectedByteCountPerSecond()
 			var healthy bool
 			if _, fixed := self.generator.FixedDestinationSize(); fixed {
 				// we will not cycle fixed destinations
 				// any issue with routing is an issue with the destination
 				// TODO this would be susceptible to any protocol/stability issues also, which we need to focus on resolving
-				healthy = true
+				client.setWarning(false)
+				keepClient(client, stats)
 			} else {
+				effectiveByteCountPerSecond := stats.EffectiveByteCountPerSecond()
+				expectedByteCountPerSecond := stats.ExpectedByteCountPerSecond()
+
 				healthy = (0 < effectiveByteCountPerSecond || 0 < expectedByteCountPerSecond) && stats.unhealthyDuration < self.settings.StatsWindowMaxUnhealthyDuration
-			}
-			printStats := func(status string) {
-				glog.Infof(
-					"[multi]%s [%s]: h=%d+%dms/u=%d+%dms effective=%db/s expected=%db/s send=%db sendNack=%db receive=%db\n",
-					status,
-					client.ClientId(),
-					stats.netHealthyDuration/time.Millisecond,
-					stats.healthyDuration/time.Millisecond,
-					stats.netUnhealthyDuration/time.Millisecond,
-					stats.unhealthyDuration/time.Millisecond,
-					effectiveByteCountPerSecond,
-					expectedByteCountPerSecond,
-					stats.sendAckByteCount,
-					stats.sendNackByteCount,
-					stats.receiveAckByteCount,
-				)
-			}
-			// the top `StatsWindowKeepHealthiestCount` won't be marked as warning or removed
-			netHealthRank := netHealthRanks[client]
-			var remove bool
-			if 0 < windowSize.FixedWindowSize {
-				remove = windowSize.FixedWindowSize <= netHealthRank
-			} else {
-				remove = windowSize.KeepHealthiestCount <= netHealthRank
-			}
-			if healthy {
-				// a client after its `removeTime` will be in a permananent warning state as long as it continues to route traffic
-				// this prevents new connections from using the client
-				if stats.unhealthyDuration < self.settings.StatsWindowWarnUnhealthyDuration {
-					if !stats.removeTime.IsZero() && stats.removeTime.Before(startTime) {
-						printStats("client drain")
-						client.setWarning(remove)
-						warnClient(client, stats)
-					} else {
-						printStats("client ok")
-						ulimit := 0 < windowSize.Ulimit && windowSize.Ulimit <= stats.netSourceCount
-						if ulimit {
-							client.setWarning(true)
+
+				printStats := func(status string) {
+					glog.Infof(
+						"[multi]%s [%s]: h=%d+%dms/u=%d+%dms effective=%db/s expected=%db/s send=%db sendNack=%db receive=%db\n",
+						status,
+						client.ClientId(),
+						stats.netHealthyDuration/time.Millisecond,
+						stats.healthyDuration/time.Millisecond,
+						stats.netUnhealthyDuration/time.Millisecond,
+						stats.unhealthyDuration/time.Millisecond,
+						effectiveByteCountPerSecond,
+						expectedByteCountPerSecond,
+						stats.sendAckByteCount,
+						stats.sendNackByteCount,
+						stats.receiveAckByteCount,
+					)
+				}
+				// the top `StatsWindowKeepHealthiestCount` won't be marked as warning or removed
+				netHealthRank := netHealthRanks[client]
+				remove := max(windowSize.FixedWindowSize, windowSize.KeepHealthiestCount) <= netHealthRank
+				if healthy {
+					// a client after its `removeTime` will be in a permananent warning state as long as it continues to route traffic
+					// this prevents new connections from using the client
+					if stats.unhealthyDuration < self.settings.StatsWindowWarnUnhealthyDuration {
+						if !stats.removeTime.IsZero() && stats.removeTime.Before(startTime) {
+							printStats("client drain")
+							client.setWarning(remove)
 							warnClient(client, stats)
 						} else {
-							client.setWarning(false)
-							keepClient(client, stats)
+							printStats("client ok")
+							ulimit := 0 < windowSize.Ulimit && windowSize.Ulimit <= stats.netSourceCount
+							if ulimit {
+								client.setWarning(true)
+								warnClient(client, stats)
+							} else {
+								client.setWarning(false)
+								keepClient(client, stats)
+							}
 						}
+					} else {
+						printStats("client health warning")
+						client.setWarning(remove)
+						warnClient(client, stats)
 					}
 				} else {
-					printStats("client health warning")
-					client.setWarning(remove)
-					warnClient(client, stats)
-				}
-			} else {
-				printStats(fmt.Sprintf("unhealthy client (#%d remove=%t)", netHealthRank, remove))
+					printStats(fmt.Sprintf("unhealthy client (#%d remove=%t)", netHealthRank, remove))
 
-				if remove {
-					client.setWarning(true)
-					removeClient(client)
-				} else {
-					client.setWarning(false)
-					warnClient(client, stats)
+					if remove {
+						client.setWarning(true)
+						removeClient(client)
+					} else {
+						client.setWarning(false)
+						warnClient(client, stats)
+					}
 				}
 			}
 		}
