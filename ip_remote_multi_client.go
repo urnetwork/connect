@@ -2272,8 +2272,15 @@ func (self *multiClientWindow) expand(
 			// } else {
 			// randomly set to p2p only to meet the minimum requirement
 			if !args.MultiClientGeneratorClientArgs.P2pOnly {
-				a := max(windowSize.WindowSizeMin-(currentWindowSize+added), 0)
-				b := max(windowSize.WindowSizeMinP2pOnly-(currentP2pOnlyWindowSize+addedP2pOnly), 0)
+				var a int
+				var b int
+				func() {
+					mutex.Lock()
+					defer mutex.Unlock()
+
+					a = max(windowSize.WindowSizeMin-(currentWindowSize+added), 0)
+					b = max(windowSize.WindowSizeMinP2pOnly-(currentP2pOnlyWindowSize+addedP2pOnly), 0)
+				}()
 				var p2pOnlyP float32
 				if a+b == 0 {
 					p2pOnlyP = 0
