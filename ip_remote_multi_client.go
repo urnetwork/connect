@@ -3,6 +3,7 @@ package connect
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	// "reflect"
@@ -121,7 +122,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 				KeepHealthiestCount:      0,
 			},
 		},
-		SendRetryTimeout:           5 * time.Millisecond,
+		SendRetryTimeout:           50 * time.Millisecond,
 		PingWriteTimeout:           5 * time.Second,
 		CPingWriteTimeout:          15 * time.Second,
 		CPingMaxByteCountPerSecond: kib(32),
@@ -160,7 +161,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		MultiRacePacketMaxCount:              32,
 		MultiRaceClientEarlyCompleteFraction: 0.25,
 		// TODO on platforms with more memory, increase this
-		MultiRaceClientCount: 2,
+		MultiRaceClientCount: 0,
 
 		StatsWindowMaxUnhealthyDuration:  15 * time.Second,
 		StatsWindowWarnUnhealthyDuration: 5 * time.Second,
@@ -899,92 +900,135 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 	timeout time.Duration,
 ) (success bool) {
 	self.updateClientPath(sendPacket.ipPath, func(update *multiClientChannelUpdate) {
+
 		enterTime := time.Now()
+
+		// var protocolAck bool
+		// switch update.ipPath.Protocol {
+		// case IpProtocolUdp:
+		// 	protocolAck = false
+		// default:
+		// 	protocolAck = true
+		// }
+
+		// if protocolAck {
+		// 	// wait for the race to finish before sending more
+		// 	var raceDone <-chan struct{}
+		// 	func() {
+		// 		self.stateLock.Lock()
+		// 		defer self.stateLock.Unlock()
+
+		// 		race := update.race
+		// 		if race != nil {
+		// 			raceDone = race.ctx.Done()
+		// 		}
+		// 	}()
+
+		// 	if raceDone != nil {
+		// 		if 0 < timeout {
+		// 			select {
+		// 			case <-update.ctx.Done():
+		// 				return
+		// 			case <- raceDone:
+		// 			case <- time.After(timeout):
+		// 				// drop
+		// 				return
+		// 			}
+		// 		} else {
+		// 			// drop
+		// 			return
+		// 		}
+		// 	}
+		// }
 
 		currentClient := func() *multiClientChannel {
 			self.stateLock.Lock()
 			defer self.stateLock.Unlock()
 			return update.client
 		}
-		sendCurrent := func() bool {
+		sendCurrent := func() (bool, error) {
 			for client := currentClient(); client != nil; {
-				p := &parsedPacket{
-					packet: sendPacket.packet,
-					ipPath: sendPacket.ipPath,
-				}
-
-				var err error
-				success, err = client.SendDetailed(p, timeout)
-				// note we do not check success also because it may be normal to drop packets under load
-				if err == nil {
-					return true
-				}
-
-				func() {
-					self.stateLock.Lock()
-					defer self.stateLock.Unlock()
-					if client == update.client {
-						update.client = nil
-						client = nil
-					} else {
-						// a new client was set, try the new client
-						client = update.client
-					}
-				}()
+				return client.SendDetailed(sendPacket, timeout)
 			}
-			return false
+			return false, nil
 		}
 
-		if sendCurrent() {
+		var err error
+		success, err = sendCurrent()
+		if success {
+			return
+		}
+		if err != nil {
+			// reset this path
+
+			glog.Infof("[multi]RESET ERROR = %s\n", err)
+
+			update.client = nil
+
+			rstPackets := []*receivePacket{}
+
+			if packet, ok := ipOosRst(update.ipPath.Reverse()); ok {
+				rstPacket := &receivePacket{
+					Source:      TransferPath{},
+					ProvideMode: protocol.ProvideMode_Network,
+					IpPath:      update.ipPath,
+					Packet:      packet,
+				}
+				rstPackets = append(rstPackets, rstPacket)
+			}
+
+			select {
+			case <-self.ctx.Done():
+			default:
+				for _, p := range rstPackets {
+					self.receivePacketCallback(p.Source, p.ProvideMode, p.IpPath, p.Packet)
+				}
+			}
+
 			return
 		}
 
 		// find a new client
+		// the race is between as many clients as can send in parallel
 
 		raceClients := func(orderedClients []*multiClientChannel, sendTimeout time.Duration) {
-			successCount := 0
-			for _, client := range orderedClients {
-				select {
-				case <-update.ctx.Done():
-					return
-				default:
+			switch len(orderedClients) {
+			case 0:
+				return
+			case 1:
+				// send to one client, no race
+				client := orderedClients[0]
+				if client.Send(sendPacket, sendTimeout) {
+					success = true
+
+					func() {
+						self.stateLock.Lock()
+						defer self.stateLock.Unlock()
+
+						update.client = client
+					}()
 				}
+				return
 
-				done := false
+			default:
 
-				func() {
-					self.stateLock.Lock()
-					defer self.stateLock.Unlock()
-
-					if update.client != nil {
-						// another client already chosen, done
-						done = true
-						return
-					}
-
-					update.initRace()
-					race := update.race
-					state := race.clientStates[client]
-
-					if state == nil {
-						state = &multiClientChannelRaceClientState{
-							sendTime: time.Now(),
-						}
-						race.clientStates[client] = state
+				defer func() {
+					if success {
+						MessagePoolReturn(sendPacket.packet)
 					}
 				}()
-				if done {
-					return
-				}
 
-				p := &parsedPacket{
-					packet: MessagePoolShareReadOnly(sendPacket.packet),
-					ipPath: sendPacket.ipPath,
-				}
-				if client.Send(p, sendTimeout) {
-					successCount += 1
-					success = true
-					var abandonedClients []*multiClientChannel
+				var successCount atomic.Int32
+
+				send := func(client *multiClientChannel) {
+					select {
+					case <-update.ctx.Done():
+						return
+					default:
+					}
+
+					done := false
+
 					func() {
 						self.stateLock.Lock()
 						defer self.stateLock.Unlock()
@@ -995,50 +1039,136 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 							return
 						}
 
-						update.initRace()
-						race := update.race
-						state := race.clientStates[client]
-						race.sentPacketCount += 1
-						bufferExceeded := state != nil && self.settings.MultiRaceSetOnNoResponseTimeout <= time.Now().Sub(state.sendTime) || self.settings.MultiRaceClientSentPacketMaxCount < race.sentPacketCount
-						if race.packetCount == 0 && bufferExceeded {
-							// no client response in timeout, lock in this client
-							// this happens for example when the client only sends and does not receive (e.g. udp send)
+						// if protocolAck && update.race != nil {
+						// 	state := update.race.clientStates[client]
+						// 	if state != nil {
+						// 		if 0 < state.sentPacketCount {
+						// 			done = true
+						// 			return
+						// 		}
+						// 	}
+						// }
 
-							for abandonedClient, _ := range race.clientStates {
-								if abandonedClient != client {
-									abandonedClients = append(abandonedClients, abandonedClient)
-								}
-							}
-
-							update.clearRace()
-							update.client = client
-
-							done = true
-							return
-						} else {
-							if self.settings.MultiRaceClientCount <= successCount {
-								done = true
-								return
-							}
-							// else continue sending to all clients
-						}
 					}()
-					if 0 < len(abandonedClients) {
-						if rstPacket, ok := ipOosRst(sendPacket.ipPath); ok {
-							for _, abandonedClient := range abandonedClients {
-								abandonedClient.Send(&parsedPacket{
-									packet: rstPacket,
-									ipPath: sendPacket.ipPath,
-								}, 0)
-							}
-						}
-					}
 					if done {
 						return
 					}
-				} else {
-					MessagePoolReturn(p.packet)
+
+					p := &parsedPacket{
+						packet: MessagePoolShareReadOnly(sendPacket.packet),
+						ipPath: update.ipPath,
+					}
+					if client.SendWithAck(p, sendTimeout, true) {
+
+						successCount.Add(1)
+						// success = true
+
+						var abandonedClients []*multiClientChannel
+						func() {
+							self.stateLock.Lock()
+							defer self.stateLock.Unlock()
+
+							if update.client != nil {
+								// another client already chosen, done
+								done = true
+								return
+							}
+
+							// if update.race == nil {
+							// 	update.initRace()
+							// 	// schedule the race evaluation
+							// 	earlyComplete := update.race.completeMonitor.NotifyChannel()
+							// 	// copy the ip path since the first packet may not be ultimately retained to the end of the race
+							// 	ipPathCopy := sendPacket.ipPath.Copy()
+							// 	self.scheduleCompleteRace(ipPathCopy, update.race, earlyComplete)
+							// }
+
+							update.initRace()
+							race := update.race
+							state := race.clientStates[client]
+							if state == nil {
+								state = &multiClientChannelRaceClientState{
+									sendTime: time.Now(),
+								}
+								race.clientStates[client] = state
+							}
+							state.sentPacketCount += 1
+							race.sentPacketCount += 1
+							bufferExceeded := state != nil && self.settings.MultiRaceSetOnNoResponseTimeout <= time.Now().Sub(state.sendTime) || self.settings.MultiRaceClientSentPacketMaxCount < state.sentPacketCount
+							if race.packetCount == 0 && bufferExceeded {
+								// no client response in timeout, lock in this client
+								// this happens for example when the client only sends and does not receive (e.g. udp send)
+
+								for abandonedClient, _ := range race.clientStates {
+									if abandonedClient != client {
+										abandonedClients = append(abandonedClients, abandonedClient)
+									}
+								}
+
+								update.clearRace()
+								update.client = client
+
+								// done = true
+								// return
+							}
+							/*else {
+								if self.settings.MultiRaceClientCount <= successCount {
+									done = true
+									return
+								}
+								// else continue sending to all clients
+							}*/
+						}()
+						if 0 < len(abandonedClients) {
+							if rstPacket, ok := ipOosRst(update.ipPath); ok {
+								for _, abandonedClient := range abandonedClients {
+									abandonedClient.Send(&parsedPacket{
+										packet: rstPacket,
+										ipPath: update.ipPath,
+									}, 0)
+								}
+							}
+						}
+						// if done {
+						// 	return
+						// }
+					} else {
+						MessagePoolReturn(p.packet)
+					}
 				}
+
+				var raceOrderedClients []*multiClientChannel
+				if 0 < self.settings.MultiRaceClientCount && self.settings.MultiRaceClientCount < len(orderedClients) {
+					raceOrderedClients = orderedClients[:self.settings.MultiRaceClientCount]
+				} else {
+					raceOrderedClients = orderedClients
+				}
+
+				if 0 < timeout {
+					var wg sync.WaitGroup
+
+					for _, client := range raceOrderedClients {
+						wg.Add(1)
+						go HandleError(func() {
+							defer wg.Done()
+
+							send(client)
+						})
+					}
+
+					wg.Wait()
+				} else {
+					for _, client := range raceOrderedClients {
+						send(client)
+					}
+				}
+
+				if 0 < successCount.Load() {
+					success = true
+				}
+
+				return
+
 			}
 		}
 
@@ -1058,20 +1188,10 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 
 		raceClients(coalesceOrderedClients(), 0)
 		if success {
-			MessagePoolReturn(sendPacket.packet)
 			return
 		}
 
 		for {
-			select {
-			case <-update.ctx.Done():
-				return
-			default:
-			}
-
-			if sendCurrent() {
-				return
-			}
 
 			var retryTimeout time.Duration
 			if 0 <= timeout {
@@ -1087,15 +1207,15 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 				retryTimeout = self.settings.SendRetryTimeout
 			}
 
-			if orderedClients := coalesceOrderedClients(); 0 < len(orderedClients) {
-				// distribute the timeout evenly via wait
-				retryTimeoutPerClient := retryTimeout / time.Duration(len(orderedClients))
-				raceClients(orderedClients, retryTimeoutPerClient)
-				if success {
-					MessagePoolReturn(sendPacket.packet)
-					return
-				}
-			} else {
+			startTime := time.Now()
+			raceClients(coalesceOrderedClients(), retryTimeout)
+			if success {
+				return
+			}
+			endTime := time.Now()
+			retryTimeout -= endTime.Sub(startTime)
+
+			if 0 < retryTimeout {
 				select {
 				case <-update.ctx.Done():
 					// drop
@@ -1103,6 +1223,7 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 				case <-time.After(retryTimeout):
 				}
 			}
+
 		}
 	})
 	return
@@ -1229,6 +1350,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 	}
 }
 
+// this can be called inside the state lock
 func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 	ipPath *IpPath,
 	race *multiClientChannelUpdateRace,
@@ -1263,28 +1385,33 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 					}
 				}
 				WeightedShuffleWithEntropy(orderedClients, weights, self.settings.StatsWindowEntropy)
-				// the last is the lowest rtt
-				client := orderedClients[len(orderedClients)-1]
 
-				for abandonedClient, abandonedState := range race.clientStates {
-					if abandonedClient != client {
-						abandonedClients = append(abandonedClients, abandonedClient)
-						for _, p := range abandonedState.packets {
-							if p.Pooled {
-								p.Pooled = false
-								returnPackets = append(returnPackets, p)
+				if len(orderedClients) == 0 {
+					update.clearRace()
+				} else {
+					// the last is the lowest rtt
+					client := orderedClients[len(orderedClients)-1]
+
+					for abandonedClient, abandonedState := range race.clientStates {
+						if abandonedClient != client {
+							abandonedClients = append(abandonedClients, abandonedClient)
+							for _, p := range abandonedState.packets {
+								if p.Pooled {
+									p.Pooled = false
+									returnPackets = append(returnPackets, p)
+								}
 							}
 						}
 					}
-				}
 
-				update.clearRace()
-				update.client = client
-				receivePackets = race.clientStates[update.client].packets
-				for _, p := range receivePackets {
-					if p.Pooled {
-						p.Pooled = false
-						returnPackets = append(returnPackets, p)
+					update.clearRace()
+					update.client = client
+					receivePackets = race.clientStates[update.client].packets
+					for _, p := range receivePackets {
+						if p.Pooled {
+							p.Pooled = false
+							returnPackets = append(returnPackets, p)
+						}
 					}
 				}
 			}
@@ -1406,13 +1533,13 @@ type multiClientChannelUpdateRace struct {
 func newMultiClientChannelUpdateRace(ctx context.Context) *multiClientChannelUpdateRace {
 	cancelCtx, cancel := context.WithCancel(ctx)
 	return &multiClientChannelUpdateRace{
-		ctx:                    cancelCtx,
-		cancel:                 cancel,
-		clientStates:           map[*multiClientChannel]*multiClientChannelRaceClientState{},
-		sentPacketCount:        0,
-		packetCount:            0,
-		clientsWithPacketCount: 0,
-		completeMonitor:        NewMonitor(),
+		ctx:          cancelCtx,
+		cancel:       cancel,
+		clientStates: map[*multiClientChannel]*multiClientChannelRaceClientState{},
+		// sentPacketCount:        0,
+		// packetCount:            0,
+		// clientsWithPacketCount: 0,
+		completeMonitor: NewMonitor(),
 	}
 }
 
@@ -1425,9 +1552,10 @@ func (self *multiClientChannelUpdateRace) Close() {
 }
 
 type multiClientChannelRaceClientState struct {
-	sendTime    time.Time
-	receiveTime time.Time
-	packets     []*receivePacket
+	sendTime        time.Time
+	receiveTime     time.Time
+	packets         []*receivePacket
+	sentPacketCount int
 }
 
 type parsedPacket struct {
@@ -2762,6 +2890,22 @@ func (self *multiClientChannel) Send(parsedPacket *parsedPacket, timeout time.Du
 }
 
 func (self *multiClientChannel) SendDetailed(parsedPacket *parsedPacket, timeout time.Duration) (bool, error) {
+	var ack bool
+	switch parsedPacket.ipPath.Protocol {
+	case IpProtocolUdp:
+		ack = false
+	default:
+		ack = true
+	}
+	return self.SendDetailedWithAck(parsedPacket, timeout, ack)
+}
+
+func (self *multiClientChannel) SendWithAck(parsedPacket *parsedPacket, timeout time.Duration, ack bool) bool {
+	success, err := self.SendDetailedWithAck(parsedPacket, timeout, ack)
+	return success && err == nil
+}
+
+func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, timeout time.Duration, ack bool) (bool, error) {
 	ipPacketToProvider := &protocol.IpPacketToProvider{
 		IpPacket: &protocol.IpPacket{
 			PacketBytes: parsedPacket.packet,
@@ -2785,8 +2929,7 @@ func (self *multiClientChannel) SendDetailed(parsedPacket *parsedPacket, timeout
 		opts := []any{
 			ForceStream(),
 		}
-		switch parsedPacket.ipPath.Protocol {
-		case IpProtocolUdp:
+		if !ack {
 			opts = append(opts, NoAck())
 		}
 		success, err := self.client.SendMultiHopWithTimeoutDetailed(
