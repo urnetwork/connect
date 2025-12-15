@@ -1011,6 +1011,8 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 					if client.SendWithAck(p, sendTimeout, true) {
 						successCount.Add(1)
 
+						var initRace *multiClientChannelUpdateRace
+						var initRaceEarlyComplete <-chan struct{}
 						var abandonedClients []*multiClientChannel
 						func() {
 							self.stateLock.Lock()
@@ -1022,8 +1024,14 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 								return
 							}
 
-							update.initRace()
 							race := update.race
+							if race == nil {
+								update.initRace()
+								race = update.race
+
+								initRace = race
+								initRaceEarlyComplete = race.completeMonitor.NotifyChannel()
+							}
 							state := race.clientStates[client]
 							if state == nil {
 								state = &multiClientChannelRaceClientState{
@@ -1048,6 +1056,13 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 								update.client = client
 							}
 						}()
+
+						if initRace != nil {
+							// copy the ip path since the first packet may not be ultimately retained to the end of the race
+							ipPathCopy := update.ipPath.Copy()
+							self.scheduleCompleteRace(ipPathCopy, initRace, initRaceEarlyComplete)
+						}
+
 						if 0 < len(abandonedClients) {
 							if rstPacket, ok := ipOosRst(update.ipPath); ok {
 								for _, abandonedClient := range abandonedClients {
@@ -1207,12 +1222,14 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 				state.receiveTime = time.Now()
 			}
 			race.packetCount += 1
-			if race.packetCount == 1 {
-				// schedule the race evaluation on first packet
-				earlyComplete := race.completeMonitor.NotifyChannel()
-				// copy the ip path since the first packet may not be ultimately retained to the end of the race
-				self.scheduleCompleteRace(ipPathCopy, race, earlyComplete)
-			}
+			/*
+				if race.packetCount == 1 {
+					// schedule the race evaluation on first packet
+					earlyComplete := race.completeMonitor.NotifyChannel()
+					// copy the ip path since the first packet may not be ultimately retained to the end of the race
+					self.scheduleCompleteRace(ipPathCopy, race, earlyComplete)
+				}
+			*/
 			if len(state.packets) == 1 {
 				race.clientsWithPacketCount += 1
 				if int(float32(len(race.clientStates))*self.settings.MultiRaceClientEarlyCompleteFraction) <= race.clientsWithPacketCount {
@@ -1293,49 +1310,49 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 			self.stateLock.Lock()
 			defer self.stateLock.Unlock()
 
-			if update.client == nil && update.race == race {
-				// weighted shuffle clients by rtt
-				orderedClients := []*multiClientChannel{}
-				weights := map[*multiClientChannel]float32{}
-				for client, state := range race.clientStates {
-					if 0 < len(state.packets) {
-						orderedClients = append(orderedClients, client)
-						rtt := state.receiveTime.Sub(state.sendTime)
-						weights[client] = float32(rtt / time.Millisecond)
+			if update.race == race {
+				defer update.clearRace()
+
+				if update.client == nil {
+
+					// weighted shuffle clients by rtt
+					orderedClients := []*multiClientChannel{}
+					weights := map[*multiClientChannel]float32{}
+					for client, state := range race.clientStates {
+						if 0 < len(state.packets) {
+							orderedClients = append(orderedClients, client)
+							rtt := state.receiveTime.Sub(state.sendTime)
+							weights[client] = float32(rtt / time.Millisecond)
+						}
 					}
-				}
-				WeightedShuffleWithEntropy(orderedClients, weights, self.settings.StatsWindowEntropy)
+					WeightedShuffleWithEntropy(orderedClients, weights, self.settings.StatsWindowEntropy)
 
-				if len(orderedClients) == 0 {
-					update.clearRace()
-				} else {
-					// the last is the lowest rtt
-					client := orderedClients[len(orderedClients)-1]
+					if 0 < len(orderedClients) {
+						// the last is the lowest rtt
+						client := orderedClients[len(orderedClients)-1]
 
-					for abandonedClient, abandonedState := range race.clientStates {
-						if abandonedClient != client {
-							abandonedClients = append(abandonedClients, abandonedClient)
-							for _, p := range abandonedState.packets {
-								if p.Pooled {
-									p.Pooled = false
-									returnPackets = append(returnPackets, p)
-								}
+						update.client = client
+						receivePackets = race.clientStates[update.client].packets
+						for _, p := range receivePackets {
+							if p.Pooled {
+								returnPackets = append(returnPackets, p)
 							}
 						}
 					}
-
-					update.clearRace()
-					update.client = client
-					receivePackets = race.clientStates[update.client].packets
-					for _, p := range receivePackets {
-						if p.Pooled {
-							p.Pooled = false
-							returnPackets = append(returnPackets, p)
+				}
+				// else the client is already set
+				for abandonedClient, abandonedState := range race.clientStates {
+					if abandonedClient != update.client {
+						abandonedClients = append(abandonedClients, abandonedClient)
+						for _, p := range abandonedState.packets {
+							if p.Pooled {
+								returnPackets = append(returnPackets, p)
+							}
 						}
 					}
 				}
 			}
-			// else a client was already chosen, ignore
+			// else the client is on a new race
 		})
 		if 0 < len(abandonedClients) {
 			if rstPacket, ok := ipOosRst(ipPath); ok {
@@ -2276,7 +2293,7 @@ func (self *multiClientWindow) expand(
 				pingDone := make(chan struct{})
 				pendingPingDones = append(pendingPingDones, pingDone)
 
-				go func() {
+				go HandleError(func() {
 					client, err := newMultiClientChannel(
 						self.ctx,
 						args,
@@ -2357,7 +2374,7 @@ func (self *multiClientWindow) expand(
 						self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
 						self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed)
 					}
-				}()
+				})
 			}
 		case <-time.After(timeout):
 			glog.V(2).Infof("[multi]expand window timeout waiting for args\n")
