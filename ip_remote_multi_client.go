@@ -927,9 +927,14 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 		if err != nil {
 			// reset this path
 
-			glog.Infof("[multi]RESET ERROR = %s\n", err)
+			glog.Infof("[multi]reset error = %s\n", err)
 
-			update.client = nil
+			func() {
+				self.stateLock.Lock()
+				defer self.stateLock.Unlock()
+
+				update.client = nil
+			}()
 
 			rstPackets := []*receivePacket{}
 
