@@ -142,11 +142,12 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// WindowExpandBlockTimeout: 5 * time.Second,
 		WindowExpandBlockCount: 4,
 		// wait this time before enumerating potential clients again
-		WindowEnumerateEmptyTimeout: 15 * time.Second,
+		WindowEnumerateEmptyTimeout: 5 * time.Second,
 		WindowEnumerateErrorTimeout: 1 * time.Second,
 		// WindowMaxScale:              4.0,
 		// WindowExpandMaxOvershotScale: 2.0,
-		WindowRevisitTimeout:      2 * time.Minute,
+		// WindowRevisitTimeout:      2 * time.Minute,
+		WindowExpandArgsTimeout:   2 * time.Minute,
 		StatsWindowDuration:       30 * time.Second,
 		StatsWindowBucketDuration: 1 * time.Second,
 		StatsSampleWeightsCount:   8,
@@ -208,7 +209,8 @@ type MultiClientSettings struct {
 	WindowEnumerateErrorTimeout time.Duration
 	// WindowMaxScale              float64
 	// WindowExpandMaxOvershotScale float64
-	WindowRevisitTimeout      time.Duration
+	// WindowRevisitTimeout      time.Duration
+	WindowExpandArgsTimeout   time.Duration
 	StatsWindowDuration       time.Duration
 	StatsWindowBucketDuration time.Duration
 	StatsSampleWeightsCount   int
@@ -1779,7 +1781,7 @@ type multiClientWindow struct {
 	contractStatusCallbacks *CallbackList[ContractStatusFunction]
 
 	stateLock          sync.Mutex
-	destinationClients map[MultiHopId]*multiClientChannel
+	clients            map[Id]*multiClientChannel
 	performanceProfile *PerformanceProfile
 
 	generatorMonitor *Monitor
@@ -1807,7 +1809,7 @@ func newMultiClientWindow(
 		clientChannelArgs:           make(chan *multiClientChannelArgs),
 		monitor:                     NewRemoteUserNatMultiClientMonitor(&settings.RemoteUserNatMultiClientMonitorSettings),
 		contractStatusCallbacks:     NewCallbackList[ContractStatusFunction](),
-		destinationClients:          map[MultiHopId]*multiClientChannel{},
+		clients:                     map[Id]*multiClientChannel{},
 		generatorMonitor:            NewMonitor(),
 	}
 
@@ -1858,32 +1860,26 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 		}()
 	}()
 
-	// continually reset the visited set when there are no more
-	// a destination can be revisited after `WindowRevisitTimeout`
-	visitedDestinations := map[MultiHopId]time.Time{}
 	for {
 		generatorNotify := self.generatorMonitor.NotifyChannel()
 		destinations := map[MultiHopId]DestinationStats{}
 		for len(destinations) == 0 {
-			// exclude destinations that are already in the window
-			windowDestinations := map[MultiHopId]bool{}
-			func() {
+			// exclude healthy destinations that are already in the window
+			windowDestinations := func() map[MultiHopId]bool {
 				self.stateLock.Lock()
 				defer self.stateLock.Unlock()
-				for destination, _ := range self.destinationClients {
-					windowDestinations[destination] = true
-					visitedDestinations[destination] = time.Now()
+				windowDestinations := map[MultiHopId]bool{}
+				for _, client := range self.clients {
+					if !client.isWarning() {
+						windowDestinations[client.Destination()] = true
+					}
 				}
-			}()
-			revisitTime := time.Now().Add(-self.settings.WindowRevisitTimeout)
-			for destination, visitedTime := range visitedDestinations {
-				if visitedTime.Before(revisitTime) && !windowDestinations[destination] {
-					delete(visitedDestinations, destination)
-				}
+				return windowDestinations
 			}
+
 			nextDestinations, err := self.generator.NextDestinations(
 				self.settings.WindowExpandBlockCount,
-				maps.Keys(visitedDestinations),
+				maps.Keys(windowDestinations()),
 				self.windowType.RankMode(),
 			)
 			if err != nil {
@@ -1897,18 +1893,12 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 				for destination, stats := range nextDestinations {
 					destinations[destination] = stats
 				}
-				// remove destinations that are already in the window
-				func() {
-					self.stateLock.Lock()
-					defer self.stateLock.Unlock()
-					for destination, _ := range self.destinationClients {
-						delete(destinations, destination)
-					}
-				}()
+				for destination, _ := range windowDestinations() {
+					delete(destinations, destination)
+				}
 
 				if len(destinations) == 0 {
 					// reset
-					clear(visitedDestinations)
 					glog.Infof("[multi]window enumerate empty timeout.\n")
 					select {
 					case <-self.ctx.Done():
@@ -1920,7 +1910,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 		}
 
 		// destinations must be used by `expirationTime`
-		expirationTime := time.Now().Add(5 * time.Minute)
+		expirationTime := time.Now().Add(self.settings.WindowExpandArgsTimeout)
 		for destination, stats := range destinations {
 			timeout := expirationTime.Sub(time.Now())
 			if timeout <= 0 {
@@ -1937,7 +1927,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 					self.generator.RemoveClientArgs(clientArgs)
 					return
 				case self.clientChannelArgs <- args:
-					visitedDestinations[destination] = time.Now()
+					// visitedDestinations[destination] = time.Now()
 				case <-time.After(timeout):
 					// destination expired
 					glog.Infof("[multi]create client args expired\n")
@@ -1984,7 +1974,7 @@ func (self *multiClientWindow) resize() {
 			func() {
 				self.stateLock.Lock()
 				defer self.stateLock.Unlock()
-				delete(self.destinationClients, client.Destination())
+				delete(self.clients, client.ClientId())
 			}()
 			self.removeClients(client)
 		}
@@ -2002,7 +1992,7 @@ func (self *multiClientWindow) resize() {
 		}
 
 		clientStats := map[*multiClientChannel]*clientWindowStats{}
-		for _, client := range self.clients() {
+		for _, client := range self.unorderedClients() {
 			if stats, err := client.WindowStats(); err == nil {
 				clientStats[client] = stats
 			} else {
@@ -2237,22 +2227,22 @@ func (self *multiClientWindow) expand(
 	targetWindowSize int,
 	windowSizeMin int,
 	n int,
-) (snapshotAddedCount int) {
+) (returnPingSuccess int) {
 	mutex := sync.Mutex{}
-	addedCount := 0
+	pendingPingDones := []chan struct{}{}
+	added := 0
+	addedP2pOnly := 0
+	pingSuccess := 0
 
 	defer func() {
 		mutex.Lock()
 		defer mutex.Unlock()
 
-		snapshotAddedCount = addedCount
+		returnPingSuccess = pingSuccess
 	}()
 
 	endTime := time.Now().Add(self.settings.WindowExpandTimeout)
-	// blockEndTime := time.Now().Add(self.settings.WindowExpandBlockTimeout)
-	pendingPingDones := []chan struct{}{}
-	added := 0
-	addedP2pOnly := 0
+
 	for i := 0; i < n; i += 1 {
 		timeout := endTime.Sub(time.Now())
 		if timeout < 0 {
@@ -2270,115 +2260,118 @@ func (self *multiClientWindow) expand(
 			if !ok {
 				return
 			}
-			func() {
-				self.stateLock.Lock()
-				defer self.stateLock.Unlock()
-				_, ok = self.destinationClients[args.Destination]
-			}()
+			// func() {
+			// 	self.stateLock.Lock()
+			// 	defer self.stateLock.Unlock()
+			// 	_, ok = self.destinationClients[args.Destination]
+			// }()
 
-			if ok {
-				// already have a client in the window for this destination
-				self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
-			} else {
-				// randomly set to p2p only to meet the minimum requirement
-				if !args.MultiClientGeneratorClientArgs.P2pOnly {
-					a := max(windowSize.WindowSizeMin-(currentWindowSize+added), 0)
-					b := max(windowSize.WindowSizeMinP2pOnly-(currentP2pOnlyWindowSize+addedP2pOnly), 0)
-					var p2pOnlyP float32
-					if a+b == 0 {
-						p2pOnlyP = 0
-					} else {
-						p2pOnlyP = float32(b) / float32(a+b)
-					}
-					args.MultiClientGeneratorClientArgs.P2pOnly = mathrand.Float32() < p2pOnlyP
+			// if ok {
+			// 	// already have a client in the window for this destination
+			// 	self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
+			// } else {
+			// randomly set to p2p only to meet the minimum requirement
+			if !args.MultiClientGeneratorClientArgs.P2pOnly {
+				a := max(windowSize.WindowSizeMin-(currentWindowSize+added), 0)
+				b := max(windowSize.WindowSizeMinP2pOnly-(currentP2pOnlyWindowSize+addedP2pOnly), 0)
+				var p2pOnlyP float32
+				if a+b == 0 {
+					p2pOnlyP = 0
+				} else {
+					p2pOnlyP = float32(b) / float32(a+b)
 				}
-				// send an initial ping on the client and let the ack timeout close it
-				pingDone := make(chan struct{})
-				pendingPingDones = append(pendingPingDones, pingDone)
+				args.MultiClientGeneratorClientArgs.P2pOnly = mathrand.Float32() < p2pOnlyP
+			}
+			// send an initial ping on the client and let the ack timeout close it
+			pingDone := make(chan struct{})
+			pendingPingDones = append(pendingPingDones, pingDone)
 
-				go HandleError(func() {
-					client, err := newMultiClientChannel(
-						self.ctx,
-						args,
-						self.generator,
-						self.clientReceivePacketCallback,
-						self.ingressSecurityPolicy,
-						self.contractStatus,
-						self.settings,
-					)
-					if err == nil {
+			go HandleError(func() {
+				client, err := newMultiClientChannel(
+					self.ctx,
+					args,
+					self.generator,
+					self.clientReceivePacketCallback,
+					self.ingressSecurityPolicy,
+					self.contractStatus,
+					self.settings,
+				)
+				if err == nil {
+					p2pOnly := client.IsP2pOnly()
+
+					func() {
+						mutex.Lock()
+						defer mutex.Unlock()
+
 						added += 1
-						if client.IsP2pOnly() {
+						if p2pOnly {
 							addedP2pOnly += 1
 						}
+					}()
 
-						self.monitor.AddProviderEvent(args.ClientId, ProviderStateInEvaluation)
+					self.monitor.AddProviderEvent(args.ClientId, ProviderStateInEvaluation)
 
-						success, err := client.SendDetailedMessage(
-							&protocol.IpPing{},
-							self.settings.PingWriteTimeout,
-							func(err error) {
-								close(pingDone)
-								if err == nil {
-									glog.Infof("[multi]expand new client\n")
+					success, err := client.SendDetailedMessage(
+						&protocol.IpPing{},
+						self.settings.PingWriteTimeout,
+						func(err error) {
+							defer close(pingDone)
+							if err == nil {
+								glog.Infof("[multi]expand new client\n")
 
-									self.monitor.AddProviderEvent(args.ClientId, ProviderStateAdded)
-									var replacedClient *multiClientChannel
-									func() {
-										self.stateLock.Lock()
-										defer self.stateLock.Unlock()
-										replacedClient = self.destinationClients[args.Destination]
-										self.destinationClients[args.Destination] = client
-									}()
-									if replacedClient != nil {
-										replacedClient.Cancel()
-										self.monitor.AddProviderEvent(replacedClient.ClientId(), ProviderStateRemoved)
-									}
-									var minSatisfied bool
-									func() {
-										mutex.Lock()
-										defer mutex.Unlock()
-										addedCount += 1
-										minSatisfied = windowSizeMin <= currentWindowSize+addedCount
-									}()
-									self.monitor.AddWindowExpandEvent(
-										minSatisfied,
-										targetWindowSize,
-									)
-								} else {
-									glog.Infof("[multi]create ping error = %s\n", err)
-									client.Cancel()
-									self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed)
+								self.monitor.AddProviderEvent(args.ClientId, ProviderStateAdded)
+								var replacedClient *multiClientChannel
+								func() {
+									self.stateLock.Lock()
+									defer self.stateLock.Unlock()
+									clientId := client.ClientId()
+									replacedClient = self.clients[clientId]
+									self.clients[clientId] = client
+								}()
+								if replacedClient != nil {
+									replacedClient.Cancel()
+									self.monitor.AddProviderEvent(replacedClient.ClientId(), ProviderStateRemoved)
 								}
-							},
-						)
-						if err != nil {
-							glog.Infof("[multi]create client ping error = %s\n", err)
-							close(pingDone)
-							client.Cancel()
-						} else if !success {
-							close(pingDone)
-							client.Cancel()
-							self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed)
-						} else {
-							// async wait for the ping
-							go HandleError(func() {
-								select {
-								case <-pingDone:
-								case <-time.After(self.settings.PingTimeout):
-									glog.V(2).Infof("[multi]expand window timeout waiting for ping\n")
-									client.Cancel()
-								}
-							}, client.Cancel)
-						}
-					} else {
-						glog.Infof("[multi]create client error = %s\n", err)
+								func() {
+									mutex.Lock()
+									defer mutex.Unlock()
+
+									pingSuccess += 1
+								}()
+							} else {
+								glog.Infof("[multi]create ping error = %s\n", err)
+								client.Cancel()
+								self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed)
+							}
+						},
+					)
+					if err != nil {
+						glog.Infof("[multi]create client ping error = %s\n", err)
 						close(pingDone)
-						self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
+						client.Cancel()
+					} else if !success {
+						close(pingDone)
+						client.Cancel()
 						self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed)
+					} else {
+						// async wait for the ping
+						go HandleError(func() {
+							select {
+							case <-pingDone:
+							case <-time.After(self.settings.PingTimeout):
+								glog.V(2).Infof("[multi]expand window timeout waiting for ping\n")
+								client.Cancel()
+							}
+						}, client.Cancel)
 					}
-				})
-			}
+				} else {
+					glog.Infof("[multi]create client error = %s\n", err)
+					close(pingDone)
+					self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
+					self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed)
+				}
+			})
+			// }
 		case <-time.After(timeout):
 			glog.V(2).Infof("[multi]expand window timeout waiting for args\n")
 		}
@@ -2403,15 +2396,15 @@ func (self *multiClientWindow) expand(
 }
 
 func (self *multiClientWindow) shuffle() {
-	for _, client := range self.clients() {
+	for _, client := range self.unorderedClients() {
 		client.Cancel()
 	}
 }
 
-func (self *multiClientWindow) clients() []*multiClientChannel {
+func (self *multiClientWindow) unorderedClients() []*multiClientChannel {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	return maps.Values(self.destinationClients)
+	return maps.Values(self.clients)
 }
 
 func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
@@ -2430,7 +2423,7 @@ func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 	lruTimes := map[*multiClientChannel]time.Time{}
 	weights := map[*multiClientChannel]float32{}
 
-	for _, client := range self.clients() {
+	for _, client := range self.unorderedClients() {
 		if stats, err := client.WindowStats(); err == nil && !client.isWarning() {
 			clients = append(clients, client)
 			if !stats.lastEventTime.IsZero() {
@@ -2545,11 +2538,11 @@ func (self *multiClientWindow) Close() {
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
-		for _, client := range self.destinationClients {
+		for _, client := range self.clients {
 			// client.Close()
 			removedClients = append(removedClients, client)
 		}
-		clear(self.destinationClients)
+		clear(self.clients)
 	}()
 	for _, client := range removedClients {
 		client.Close()
