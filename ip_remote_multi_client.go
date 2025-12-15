@@ -900,46 +900,7 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 	timeout time.Duration,
 ) (success bool) {
 	self.updateClientPath(sendPacket.ipPath, func(update *multiClientChannelUpdate) {
-
 		enterTime := time.Now()
-
-		// var protocolAck bool
-		// switch update.ipPath.Protocol {
-		// case IpProtocolUdp:
-		// 	protocolAck = false
-		// default:
-		// 	protocolAck = true
-		// }
-
-		// if protocolAck {
-		// 	// wait for the race to finish before sending more
-		// 	var raceDone <-chan struct{}
-		// 	func() {
-		// 		self.stateLock.Lock()
-		// 		defer self.stateLock.Unlock()
-
-		// 		race := update.race
-		// 		if race != nil {
-		// 			raceDone = race.ctx.Done()
-		// 		}
-		// 	}()
-
-		// 	if raceDone != nil {
-		// 		if 0 < timeout {
-		// 			select {
-		// 			case <-update.ctx.Done():
-		// 				return
-		// 			case <- raceDone:
-		// 			case <- time.After(timeout):
-		// 				// drop
-		// 				return
-		// 			}
-		// 		} else {
-		// 			// drop
-		// 			return
-		// 		}
-		// 	}
-		// }
 
 		currentClient := func() *multiClientChannel {
 			self.stateLock.Lock()
@@ -1038,17 +999,6 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 							done = true
 							return
 						}
-
-						// if protocolAck && update.race != nil {
-						// 	state := update.race.clientStates[client]
-						// 	if state != nil {
-						// 		if 0 < state.sentPacketCount {
-						// 			done = true
-						// 			return
-						// 		}
-						// 	}
-						// }
-
 					}()
 					if done {
 						return
@@ -1059,9 +1009,7 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 						ipPath: update.ipPath,
 					}
 					if client.SendWithAck(p, sendTimeout, true) {
-
 						successCount.Add(1)
-						// success = true
 
 						var abandonedClients []*multiClientChannel
 						func() {
@@ -1073,15 +1021,6 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 								done = true
 								return
 							}
-
-							// if update.race == nil {
-							// 	update.initRace()
-							// 	// schedule the race evaluation
-							// 	earlyComplete := update.race.completeMonitor.NotifyChannel()
-							// 	// copy the ip path since the first packet may not be ultimately retained to the end of the race
-							// 	ipPathCopy := sendPacket.ipPath.Copy()
-							// 	self.scheduleCompleteRace(ipPathCopy, update.race, earlyComplete)
-							// }
 
 							update.initRace()
 							race := update.race
@@ -1107,17 +1046,7 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 
 								update.clearRace()
 								update.client = client
-
-								// done = true
-								// return
 							}
-							/*else {
-								if self.settings.MultiRaceClientCount <= successCount {
-									done = true
-									return
-								}
-								// else continue sending to all clients
-							}*/
 						}()
 						if 0 < len(abandonedClients) {
 							if rstPacket, ok := ipOosRst(update.ipPath); ok {
@@ -1129,9 +1058,6 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 								}
 							}
 						}
-						// if done {
-						// 	return
-						// }
 					} else {
 						MessagePoolReturn(p.packet)
 					}
@@ -1166,16 +1092,12 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 				if 0 < successCount.Load() {
 					success = true
 				}
-
 				return
-
 			}
 		}
 
-		windowTypes := self.selectWindowTypes(sendPacket)
-
 		coalesceOrderedClients := func() []*multiClientChannel {
-			for _, windowType := range windowTypes {
+			for _, windowType := range self.selectWindowTypes(sendPacket) {
 				if window, ok := self.windows[windowType]; ok {
 					orderedClients := window.OrderedClients()
 					if 0 < len(orderedClients) {
@@ -1192,7 +1114,6 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 		}
 
 		for {
-
 			var retryTimeout time.Duration
 			if 0 <= timeout {
 				remainingTimeout := enterTime.Add(timeout).Sub(time.Now())
@@ -1223,7 +1144,6 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 				case <-time.After(retryTimeout):
 				}
 			}
-
 		}
 	})
 	return
