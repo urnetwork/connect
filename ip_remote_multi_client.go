@@ -408,16 +408,19 @@ func NewRemoteUserNatMultiClient(
 		WindowTypeQuality,
 		settings,
 	)
-	multiClient.windows[WindowTypeSpeed] = newMultiClientWindow(
-		cancelCtx,
-		cancel,
-		generator,
-		multiClient.clientReceivePacket,
-		multiClient.ingressSecurityPolicy,
-		multiClient.removeClient,
-		WindowTypeSpeed,
-		settings,
-	)
+	if _, fixed := generator.FixedDestinationSize(); !fixed {
+		multiClient.windows[WindowTypeSpeed] = newMultiClientWindow(
+			cancelCtx,
+			cancel,
+			generator,
+			multiClient.clientReceivePacket,
+			multiClient.ingressSecurityPolicy,
+			multiClient.removeClient,
+			WindowTypeSpeed,
+			settings,
+		)
+	}
+	// else only keep the quality window for fixed destination
 
 	monitors := []MultiClientMonitor{}
 	for _, window := range multiClient.windows {
@@ -2036,72 +2039,66 @@ func (self *multiClientWindow) resize() {
 		}()
 
 		for client, stats := range clientStats {
-			var healthy bool
-			if _, fixed := self.generator.FixedDestinationSize(); fixed {
-				// we will not cycle fixed destinations
-				// any issue with routing is an issue with the destination
-				// TODO this would be susceptible to any protocol/stability issues also, which we need to focus on resolving
-				client.setWarning(false)
-				keepClient(client, stats)
-			} else {
-				effectiveByteCountPerSecond := stats.EffectiveByteCountPerSecond()
-				expectedByteCountPerSecond := stats.ExpectedByteCountPerSecond()
+			// note for fixed destination size, the destination might still be aliased with multiple clients
+			// TODO it's still not clear why one client might stop working occasionally
 
-				healthy = (0 < effectiveByteCountPerSecond || 0 < expectedByteCountPerSecond) && stats.unhealthyDuration < self.settings.StatsWindowMaxUnhealthyDuration
+			effectiveByteCountPerSecond := stats.EffectiveByteCountPerSecond()
+			expectedByteCountPerSecond := stats.ExpectedByteCountPerSecond()
 
-				printStats := func(status string) {
-					glog.Infof(
-						"[multi]%s [%s]: h=%d+%dms/u=%d+%dms effective=%db/s expected=%db/s send=%db sendNack=%db receive=%db\n",
-						status,
-						client.ClientId(),
-						stats.netHealthyDuration/time.Millisecond,
-						stats.healthyDuration/time.Millisecond,
-						stats.netUnhealthyDuration/time.Millisecond,
-						stats.unhealthyDuration/time.Millisecond,
-						effectiveByteCountPerSecond,
-						expectedByteCountPerSecond,
-						stats.sendAckByteCount,
-						stats.sendNackByteCount,
-						stats.receiveAckByteCount,
-					)
-				}
-				// the top `StatsWindowKeepHealthiestCount` won't be marked as warning or removed
-				netHealthRank := netHealthRanks[client]
-				remove := max(windowSize.FixedWindowSize, windowSize.KeepHealthiestCount) <= netHealthRank
-				if healthy {
-					// a client after its `removeTime` will be in a permananent warning state as long as it continues to route traffic
-					// this prevents new connections from using the client
-					if stats.unhealthyDuration < self.settings.StatsWindowWarnUnhealthyDuration {
-						if !stats.removeTime.IsZero() && stats.removeTime.Before(startTime) {
-							printStats("client drain")
-							client.setWarning(remove)
-							warnClient(client, stats)
-						} else {
-							printStats("client ok")
-							ulimit := 0 < windowSize.Ulimit && windowSize.Ulimit <= stats.netSourceCount
-							if ulimit {
-								client.setWarning(true)
-								warnClient(client, stats)
-							} else {
-								client.setWarning(false)
-								keepClient(client, stats)
-							}
-						}
-					} else {
-						printStats("client health warning")
+			healthy := (0 < effectiveByteCountPerSecond || 0 < expectedByteCountPerSecond) && stats.unhealthyDuration < self.settings.StatsWindowMaxUnhealthyDuration
+
+			printStats := func(status string) {
+				glog.Infof(
+					"[multi]%s [%s]: h=%d+%dms/u=%d+%dms effective=%db/s expected=%db/s send=%db sendNack=%db receive=%db\n",
+					status,
+					client.ClientId(),
+					stats.netHealthyDuration/time.Millisecond,
+					stats.healthyDuration/time.Millisecond,
+					stats.netUnhealthyDuration/time.Millisecond,
+					stats.unhealthyDuration/time.Millisecond,
+					effectiveByteCountPerSecond,
+					expectedByteCountPerSecond,
+					stats.sendAckByteCount,
+					stats.sendNackByteCount,
+					stats.receiveAckByteCount,
+				)
+			}
+			// the top `StatsWindowKeepHealthiestCount` won't be marked as warning or removed
+			netHealthRank := netHealthRanks[client]
+			remove := max(windowSize.FixedWindowSize, windowSize.KeepHealthiestCount) <= netHealthRank
+			if healthy {
+				// a client after its `removeTime` will be in a permananent warning state as long as it continues to route traffic
+				// this prevents new connections from using the client
+				if stats.unhealthyDuration < self.settings.StatsWindowWarnUnhealthyDuration {
+					if !stats.removeTime.IsZero() && stats.removeTime.Before(startTime) {
+						printStats("client drain")
 						client.setWarning(remove)
 						warnClient(client, stats)
+					} else {
+						printStats("client ok")
+						ulimit := 0 < windowSize.Ulimit && windowSize.Ulimit <= stats.netSourceCount
+						if ulimit {
+							client.setWarning(true)
+							warnClient(client, stats)
+						} else {
+							client.setWarning(false)
+							keepClient(client, stats)
+						}
 					}
 				} else {
-					printStats(fmt.Sprintf("unhealthy client (#%d remove=%t)", netHealthRank, remove))
+					printStats("client health warning")
+					client.setWarning(remove)
+					warnClient(client, stats)
+				}
+			} else {
+				printStats(fmt.Sprintf("unhealthy client (#%d remove=%t)", netHealthRank, remove))
 
-					if remove {
-						client.setWarning(true)
-						removeClient(client)
-					} else {
-						client.setWarning(false)
-						warnClient(client, stats)
-					}
+				if remove {
+					client.setWarning(true)
+					removeClient(client)
+				} else {
+					client.setWarning(false)
+					warnClient(client, stats)
 				}
 			}
 		}
@@ -2153,9 +2150,11 @@ func (self *multiClientWindow) resize() {
 			}
 		}
 
+		var windowSizeMin int
 		var targetWindowSize int
 		if fixedDestinationSize, fixed := self.generator.FixedDestinationSize(); fixed {
 			targetWindowSize = fixedDestinationSize
+			windowSizeMin = targetWindowSize
 		} else if 0 < windowSize.FixedWindowSize {
 			if fixedWindowType == nil || self.windowType == *fixedWindowType {
 				targetWindowSize = windowSize.FixedWindowSize
@@ -2163,6 +2162,7 @@ func (self *multiClientWindow) resize() {
 				// not the active window, disable resize
 				targetWindowSize = 0
 			}
+			windowSizeMin = targetWindowSize
 		} else {
 			// scale the number of reconnects
 			targetWindowSize = int(math.Ceil(float64(maxSourceCount) * windowSize.WindowSizeReconnectScale))
@@ -2178,6 +2178,7 @@ func (self *multiClientWindow) resize() {
 					targetWindowSize,
 				),
 			)
+			windowSizeMin = windowSize.WindowSizeMin
 		}
 
 		addedCount := 0
@@ -2185,7 +2186,7 @@ func (self *multiClientWindow) resize() {
 			// expand
 			n := targetWindowSize - len(clients)
 			self.monitor.AddWindowExpandEvent(
-				windowSize.WindowSizeMin <= len(clients),
+				windowSizeMin <= len(clients),
 				targetWindowSize+len(warnedClients),
 			)
 			glog.Infof("[multi]window expand +%d %d->%d\n", n, len(clients), targetWindowSize)
@@ -2194,19 +2195,20 @@ func (self *multiClientWindow) resize() {
 				len(clients),
 				p2pOnlyWindowSize,
 				targetWindowSize,
+				windowSizeMin,
 				targetWindowSize-len(clients),
 			)
 		}
 		if 0 < windowSize.WindowSizeHardMax && windowSize.WindowSizeHardMax < len(clients)+len(warnedClients)+addedCount {
 			self.monitor.AddWindowExpandEvent(
-				windowSize.WindowSizeMin <= len(clients)+addedCount,
+				windowSizeMin <= len(clients)+addedCount,
 				windowSize.WindowSizeHardMax,
 			)
 			collapseLowestWeighted(max(0, windowSize.WindowSizeHardMax-addedCount))
 			glog.Infof("[multi]window collapse -%d ->%d\n", (len(clients)+len(warnedClients)+addedCount)-windowSize.WindowSizeHardMax, windowSize.WindowSizeHardMax)
 		} else {
 			self.monitor.AddWindowExpandEvent(
-				windowSize.WindowSizeMin <= len(clients)+addedCount,
+				windowSizeMin <= len(clients)+addedCount,
 				len(clients)+len(warnedClients)+addedCount,
 			)
 		}
@@ -2233,6 +2235,7 @@ func (self *multiClientWindow) expand(
 	currentWindowSize int,
 	currentP2pOnlyWindowSize int,
 	targetWindowSize int,
+	windowSizeMin int,
 	n int,
 ) (snapshotAddedCount int) {
 	mutex := sync.Mutex{}
@@ -2336,7 +2339,7 @@ func (self *multiClientWindow) expand(
 										mutex.Lock()
 										defer mutex.Unlock()
 										addedCount += 1
-										minSatisfied = windowSize.WindowSizeMin <= currentWindowSize+addedCount
+										minSatisfied = windowSizeMin <= currentWindowSize+addedCount
 									}()
 									self.monitor.AddWindowExpandEvent(
 										minSatisfied,
