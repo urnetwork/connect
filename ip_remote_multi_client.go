@@ -142,7 +142,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// WindowExpandBlockTimeout: 5 * time.Second,
 		WindowExpandBlockCount: 4,
 		// wait this time before enumerating potential clients again
-		WindowEnumerateEmptyTimeout: 5 * time.Second,
+		// WindowEnumerateEmptyTimeout: 5 * time.Second,
 		WindowEnumerateErrorTimeout: 1 * time.Second,
 		// WindowMaxScale:              4.0,
 		// WindowExpandMaxOvershotScale: 2.0,
@@ -204,8 +204,8 @@ type MultiClientSettings struct {
 	StatsWindowEntropy  float32
 	WindowExpandTimeout time.Duration
 	// WindowExpandBlockTimeout     time.Duration
-	WindowExpandBlockCount      int
-	WindowEnumerateEmptyTimeout time.Duration
+	WindowExpandBlockCount int
+	// WindowEnumerateEmptyTimeout time.Duration
 	WindowEnumerateErrorTimeout time.Duration
 	// WindowMaxScale              float64
 	// WindowExpandMaxOvershotScale float64
@@ -1867,81 +1867,77 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 
 	for {
 		generatorNotify := self.generatorMonitor.NotifyChannel()
-		destinations := map[MultiHopId]DestinationStats{}
-		for len(destinations) == 0 {
-			// exclude healthy destinations that are already in the window
-			windowDestinations := func() map[MultiHopId]bool {
-				self.stateLock.Lock()
-				defer self.stateLock.Unlock()
-				windowDestinations := map[MultiHopId]bool{}
-				for _, client := range self.clients {
-					if !client.isWarning() {
-						windowDestinations[client.Destination()] = true
-					}
+
+		// exclude healthy destinations that are already in the window
+		windowDestinations := func() map[MultiHopId]bool {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			windowDestinations := map[MultiHopId]bool{}
+			for _, client := range self.clients {
+				if !client.isWarning() {
+					windowDestinations[client.Destination()] = true
 				}
-				return windowDestinations
 			}
+			return windowDestinations
+		}
 
-			nextDestinations, err := self.generator.NextDestinations(
-				self.settings.WindowExpandBlockCount,
-				maps.Keys(windowDestinations()),
-				self.windowType.RankMode(),
-			)
-			if err != nil {
-				glog.Infof("[multi]window enumerate error timeout = %s\n", err)
-				select {
-				case <-self.ctx.Done():
-					return
-				case <-time.After(self.settings.WindowEnumerateErrorTimeout):
-				}
-			} else {
-				for destination, stats := range nextDestinations {
-					destinations[destination] = stats
-				}
-				for destination, _ := range windowDestinations() {
-					delete(destinations, destination)
-				}
+		destinations, err := self.generator.NextDestinations(
+			self.settings.WindowExpandBlockCount,
+			maps.Keys(windowDestinations()),
+			self.windowType.RankMode(),
+		)
+		if err != nil {
+			glog.Infof("[multi]window enumerate error timeout = %s\n", err)
+			select {
+			case <-self.ctx.Done():
+				return
+			case <-time.After(self.settings.WindowEnumerateErrorTimeout):
+			}
+			continue
+		}
 
-				if len(destinations) == 0 {
-					// reset
-					glog.Infof("[multi]window enumerate empty timeout.\n")
+		func() {
+			// destinations must be used by `expirationTime`
+			expirationTime := time.Now().Add(self.settings.WindowExpandArgsTimeout)
+			for destination, stats := range destinations {
+
+				for {
+					timeout := expirationTime.Sub(time.Now())
+					if timeout <= 0 {
+						return
+					}
+
+					clientArgs, err := self.generator.NewClientArgs()
+					if err != nil {
+						glog.Infof("[multi]create client args error = %s\n", err)
+						select {
+						case <-self.ctx.Done():
+							return
+						case <-time.After(self.settings.WindowEnumerateErrorTimeout):
+						}
+						continue
+					}
+
+					args := &multiClientChannelArgs{
+						Destination:                    destination,
+						DestinationStats:               stats,
+						MultiClientGeneratorClientArgs: *clientArgs,
+					}
 					select {
 					case <-self.ctx.Done():
+						self.generator.RemoveClientArgs(clientArgs)
 						return
-					case <-time.After(self.settings.WindowEnumerateEmptyTimeout):
+					case self.clientChannelArgs <- args:
+					case <-time.After(timeout):
+						// destination expired
+						glog.Infof("[multi]create client args expired\n")
+						self.generator.RemoveClientArgs(clientArgs)
+						return
 					}
+					break
 				}
 			}
-		}
-
-		// destinations must be used by `expirationTime`
-		expirationTime := time.Now().Add(self.settings.WindowExpandArgsTimeout)
-		for destination, stats := range destinations {
-			timeout := expirationTime.Sub(time.Now())
-			if timeout <= 0 {
-				break
-			}
-			if clientArgs, err := self.generator.NewClientArgs(); err == nil {
-				args := &multiClientChannelArgs{
-					Destination:                    destination,
-					DestinationStats:               stats,
-					MultiClientGeneratorClientArgs: *clientArgs,
-				}
-				select {
-				case <-self.ctx.Done():
-					self.generator.RemoveClientArgs(clientArgs)
-					return
-				case self.clientChannelArgs <- args:
-					// visitedDestinations[destination] = time.Now()
-				case <-time.After(timeout):
-					// destination expired
-					glog.Infof("[multi]create client args expired\n")
-					self.generator.RemoveClientArgs(clientArgs)
-				}
-			} else {
-				glog.Infof("[multi]create client args error = %s\n", err)
-			}
-		}
+		}()
 
 		select {
 		case <-self.ctx.Done():
@@ -2184,7 +2180,6 @@ func (self *multiClientWindow) resize() {
 				windowSizeMin <= len(clients),
 				targetWindowSize+len(warnedClients),
 			)
-			glog.Infof("[multi]window expand +%d %d->%d\n", n, len(clients), targetWindowSize)
 			addedCount = self.expand(
 				windowSize,
 				len(clients),
@@ -2193,6 +2188,7 @@ func (self *multiClientWindow) resize() {
 				windowSizeMin,
 				targetWindowSize-len(clients),
 			)
+			glog.Infof("[multi]window expand +%d %d->%d (+%d)\n", n, len(clients), targetWindowSize, addedCount)
 		}
 		if 0 < windowSize.WindowSizeHardMax && windowSize.WindowSizeHardMax < len(clients)+len(warnedClients)+addedCount {
 			self.monitor.AddWindowExpandEvent(

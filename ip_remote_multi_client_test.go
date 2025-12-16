@@ -169,7 +169,7 @@ func (self *TestMultiClientGenerator) NewClient(ctx context.Context, args *Multi
 }
 
 func (self *TestMultiClientGenerator) FixedDestinationSize() (int, bool) {
-	return 0, false
+	return 1, true
 }
 
 func TestMultiClientChannelWindowStats(t *testing.T) {
