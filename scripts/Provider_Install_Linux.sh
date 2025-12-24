@@ -670,6 +670,8 @@ EOF
 	fi
     fi
 
+	loginctl enable-linger
+
     case "$operation" in
         install)
             pr_info "Installation complete"
