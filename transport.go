@@ -253,6 +253,14 @@ func NewPlatformTransportWithTargetMode(
 	return transport
 }
 
+// the auth is used on future connections
+func (self *PlatformTransport) SetAuth(auth *ClientAuth) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	self.auth = auth
+}
+
 func (self *PlatformTransport) setModeAvailable(mode TransportMode, available bool) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
