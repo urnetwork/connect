@@ -23,14 +23,16 @@ import (
 // the framer read/write op is called billions of times in a typical user hour
 
 type FramerSettings struct {
-	MaxMessageLen   int
-	SplitMinimumLen int
+	MaxMessageLen       int
+	MaxPacketMessageLen int
+	SplitMinimumLen     int
 }
 
 func DefaultFramerSettings() *FramerSettings {
 	return &FramerSettings{
-		MaxMessageLen:   2048,
-		SplitMinimumLen: 256,
+		MaxMessageLen:       2048 - 4,
+		MaxPacketMessageLen: 2048 - 4,
+		SplitMinimumLen:     256,
 	}
 }
 
@@ -58,24 +60,26 @@ func NewFramer(settings *FramerSettings) *Framer {
 }
 
 func (self *Framer) Read(r io.Reader) ([]byte, error) {
-
-	h := self.readBuffer[:]
-	if _, err := io.ReadFull(r, h[0:4]); err != nil {
+	var h [4]byte
+	n, err := r.Read(h[:])
+	if err != nil {
 		return nil, err
 	}
+	if n < 4 {
+		return nil, fmt.Errorf("Could not read header.")
+	}
 
-	messageLen := int(binary.LittleEndian.Uint16(h[0:2]))
-	// splitIndex := int(binary.LittleEndian.Uint16(h[2:4]))
+	messageLen := int(binary.BigEndian.Uint16(h[0:2]))
 
 	if self.settings.MaxMessageLen < messageLen {
 		// glog.Infof("READ MAX\n")
 		return nil, fmt.Errorf("Max message len exceeded (%d<%d)", self.settings.MaxMessageLen, messageLen)
 	}
 
-	// message := make([]byte, messageLen)
 	message := MessagePoolGet(messageLen)
 
 	if _, err := io.ReadFull(r, message); err != nil {
+		MessagePoolReturn(message)
 		return nil, err
 	}
 
@@ -84,48 +88,30 @@ func (self *Framer) Read(r io.Reader) ([]byte, error) {
 
 // use this version if the reader dequeues an entire packet per read
 func (self *Framer) ReadPacket(r io.Reader) ([]byte, error) {
-	h := self.readBuffer[:]
+	h := MessagePoolGet(self.settings.MaxPacketMessageLen + 4)
 
 	n, err := r.Read(h)
 	if err != nil {
 		return nil, err
 	}
+	if n < 4 {
+		MessagePoolReturn(h)
+		return nil, fmt.Errorf("Could not read header.")
+	}
 
-	messageLen := int(binary.LittleEndian.Uint16(h[0:2]))
-	splitIndex := int(binary.LittleEndian.Uint16(h[2:4]))
+	messageLen := int(binary.BigEndian.Uint16(h[0:2]))
 
 	if self.settings.MaxMessageLen < messageLen {
 		// glog.Infof("READ MAX\n")
+		MessagePoolReturn(h)
 		return nil, fmt.Errorf("Max message len exceeded (%d<%d)", self.settings.MaxMessageLen, messageLen)
 	}
 
-	// message := make([]byte, messageLen)
-	message := MessagePoolGet(messageLen)
+	message := h[4 : messageLen+4]
 
-	if splitIndex < 16 {
-		// no split
-		// note we could use 4 bit for additional signaling if needed
-
-		copy(message[0:min(n-4, messageLen)], h[4:min(n, messageLen+4)])
-
-		if n-4 < messageLen {
-			if _, err := io.ReadFull(r, message[n-4:messageLen]); err != nil {
-				return nil, err
-			}
-		}
-	} else {
-		copy(message[0:min(n-4, splitIndex)], h[4:min(n, splitIndex+4)])
-
-		if n-4 < splitIndex {
-			if _, err := io.ReadFull(r, message[n:splitIndex]); err != nil {
-				return nil, err
-			}
-		}
-		if splitIndex < n-4 {
-			copy(message[splitIndex:n-4], h[splitIndex+4:n])
-		}
-
+	if n-4 < messageLen {
 		if _, err := io.ReadFull(r, message[n-4:messageLen]); err != nil {
+			MessagePoolReturn(h)
 			return nil, err
 		}
 	}
@@ -144,9 +130,10 @@ func (self *Framer) Write(w io.Writer, message []byte) error {
 		return fmt.Errorf("Max possible message len exceeded (%d<%d)", math.MaxUint16, messageLen)
 	}
 	if messageLen < max(16, self.settings.SplitMinimumLen) {
-		messageWithHeader := self.writeBuffer[:]
-		binary.LittleEndian.PutUint16(messageWithHeader[0:2], uint16(messageLen))
-		binary.LittleEndian.PutUint16(messageWithHeader[2:4], uint16(0))
+		messageWithHeader := MessagePoolGet(messageLen + 4)
+		defer MessagePoolReturn(messageWithHeader)
+		binary.BigEndian.PutUint16(messageWithHeader[0:2], uint16(messageLen))
+		binary.BigEndian.PutUint16(messageWithHeader[2:4], uint16(0))
 		copy(messageWithHeader[4:4+messageLen], message)
 		if _, err := w.Write(messageWithHeader[0 : messageLen+4]); err != nil {
 			return err
@@ -156,9 +143,11 @@ func (self *Framer) Write(w io.Writer, message []byte) error {
 
 		splitIndex := messageLen / 2
 
-		h := self.writeBuffer[:]
-		binary.LittleEndian.PutUint16(h[0:2], uint16(messageLen))
-		binary.LittleEndian.PutUint16(h[2:4], uint16(splitIndex))
+		h := MessagePoolGet(splitIndex + 4)
+		defer MessagePoolReturn(h)
+
+		binary.BigEndian.PutUint16(h[0:2], uint16(messageLen))
+		binary.BigEndian.PutUint16(h[2:4], uint16(splitIndex))
 		copy(h[4:4+splitIndex], message[0:splitIndex])
 
 		if _, err := w.Write(h[0 : 4+splitIndex]); err != nil {
