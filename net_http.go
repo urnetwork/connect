@@ -295,6 +295,7 @@ func (self *ClientStrategy) SetCustomExtenders(extenderIpSecrets map[netip.Addr]
 	self.extenderIpSecrets = maps.Clone(extenderIpSecrets)
 	for dialer, _ := range self.dialers {
 		if dialer.IsExtender() {
+			dialer.Close()
 			delete(self.dialers, dialer)
 		}
 	}
@@ -770,6 +771,7 @@ func (self *ClientStrategy) collapseExtenderDialers() {
 	for dialer, _ := range self.dialers {
 		if dialer.IsExtender() && dialer.IsLastSuccess() {
 			if self.settings.ExtenderDropTimeout <= time.Now().Sub(dialer.lastErrorTime) {
+				dialer.Close()
 				delete(self.dialers, dialer)
 			}
 		}
@@ -1078,6 +1080,16 @@ func (self *clientDialer) String() string {
 		return fmt.Sprintf("extender (%v) success=%d error=%d", self.extenderConfig, self.successCount, self.errorCount)
 	} else {
 		return fmt.Sprintf("%s success=%d error=%d", self.description, self.successCount, self.errorCount)
+	}
+}
+
+func (self *clientDialer) Close() {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+
+	if self.httpClient != nil {
+		self.httpClient.CloseIdleConnections()
+		self.httpClient = nil
 	}
 }
 
