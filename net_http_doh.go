@@ -55,14 +55,25 @@ type DohSettings struct {
 }
 
 type DohCache struct {
-	settings *DohSettings
+	httpClient *http.Client
+	settings   *DohSettings
 
 	stateLock             sync.Mutex
 	queryResultExpiration map[DohKey]map[netip.Addr]time.Time
 }
 
 func NewDohCache(settings *DohSettings) *DohCache {
+	httpClient := &http.Client{
+		Timeout: settings.RequestTimeout,
+		Transport: &http.Transport{
+			DialContext:         settings.DialContext,
+			TLSHandshakeTimeout: settings.TlsTimeout,
+			TLSClientConfig:     settings.TlsConfig,
+		},
+	}
+
 	return &DohCache{
+		httpClient:            httpClient,
 		settings:              settings,
 		queryResultExpiration: map[DohKey]map[netip.Addr]time.Time{},
 	}
@@ -94,7 +105,7 @@ func (self *DohCache) Query(ctx context.Context, recordType string, domain strin
 		return ips
 	}
 
-	ipTtls := DohQuery(ctx, 0, q.RecordType, self.settings, q.Domain)
+	ipTtls := DohQueryWithClient(ctx, self.httpClient, 0, q.RecordType, self.settings, q.Domain)
 	r := map[netip.Addr]time.Time{}
 	for ip, ttlSeconds := range ipTtls {
 		r[ip] = now.Add(time.Duration(ttlSeconds) * time.Second)
@@ -120,14 +131,6 @@ func DohQueryWithDefaults(ctx context.Context, recordType string, domains ...str
 // return ip -> ttl (seconds)
 // use `ipVersion=0` to try all versions
 func DohQuery(ctx context.Context, ipVersion int, recordType string, settings *DohSettings, domains ...string) map[netip.Addr]int {
-	// run all the queries in parallel to all servers
-
-	switch recordType {
-	case "A", "AAAA":
-	default:
-		return map[netip.Addr]int{}
-	}
-
 	httpClient := &http.Client{
 		Timeout: settings.RequestTimeout,
 		Transport: &http.Transport{
@@ -135,6 +138,33 @@ func DohQuery(ctx context.Context, ipVersion int, recordType string, settings *D
 			TLSHandshakeTimeout: settings.TlsTimeout,
 			TLSClientConfig:     settings.TlsConfig,
 		},
+	}
+	defer httpClient.CloseIdleConnections()
+
+	return DohQueryWithClient(
+		ctx,
+		httpClient,
+		ipVersion,
+		recordType,
+		settings,
+		domains...,
+	)
+}
+
+func DohQueryWithClient(
+	ctx context.Context,
+	httpClient *http.Client,
+	ipVersion int,
+	recordType string,
+	settings *DohSettings,
+	domains ...string,
+) map[netip.Addr]int {
+	// run all the queries in parallel to all servers
+
+	switch recordType {
+	case "A", "AAAA":
+	default:
+		return map[netip.Addr]int{}
 	}
 
 	query := func(dohUrl string, domain string) (result map[netip.Addr]int) {
