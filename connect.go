@@ -392,12 +392,24 @@ func (self MultiHopId) String() string {
 // use this type when counting bytes
 type ByteCount = int64
 
+func Kib(c ByteCount) ByteCount {
+	return kib(c)
+}
+
 func kib(c ByteCount) ByteCount {
 	return c * ByteCount(1024)
 }
 
+func Mib(c ByteCount) ByteCount {
+	return mib(c)
+}
+
 func mib(c ByteCount) ByteCount {
 	return c * ByteCount(1024) * ByteCount(1024)
+}
+
+func Gib(c ByteCount) ByteCount {
+	return gib(c)
 }
 
 func gib(c ByteCount) ByteCount {
