@@ -1080,10 +1080,9 @@ func (self *SendBuffer) Pack(sendPack *SendPack, timeout time.Duration) (bool, e
 		// the sequence will call `AssociateDestination` before it writes
 		go HandleError(func() {
 			defer func() {
-				sendSequence.Close()
-
 				self.mutex.Lock()
 				defer self.mutex.Unlock()
+				sendSequence.Close()
 				// clean up
 				if sendSequence == self.sendSequences[sendSequenceId] {
 					delete(self.sendSequences, sendSequenceId)
@@ -2369,10 +2368,9 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 		self.headReceiveSequenceIds[receivePack.Source] = receiveSequenceId
 		go HandleError(func() {
 			defer func() {
-				receiveSequence.Close()
-
 				self.mutex.Lock()
 				defer self.mutex.Unlock()
+				receiveSequence.Close()
 				// clean up
 				if receiveSequence == self.receiveSequences[receiveSequenceId] {
 					delete(self.receiveSequences, receiveSequenceId)
@@ -3504,10 +3502,9 @@ func (self *ForwardBuffer) Pack(forwardPack *ForwardPack, timeout time.Duration)
 		self.forwardSequences[forwardPack.Destination] = forwardSequence
 		go HandleError(func() {
 			defer func() {
-				forwardSequence.Close()
-
 				self.mutex.Lock()
 				defer self.mutex.Unlock()
+				forwardSequence.Close()
 				// clean up
 				if forwardSequence == self.forwardSequences[forwardPack.Destination] {
 					delete(self.forwardSequences, forwardPack.Destination)

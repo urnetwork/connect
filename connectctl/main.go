@@ -555,7 +555,7 @@ func send(opts docopt.Opts) {
 
 	// FIXME break into 2k chunks?
 	acks := make(chan error)
-	go func() {
+	go connect.HandleError(func() {
 		for i := 0; i < messageCount; i += 1 {
 			var content string
 			if 0 < messageCount {
@@ -567,15 +567,19 @@ func send(opts docopt.Opts) {
 				Content: content,
 			}
 
+			frame, err := connect.ToFrame(message, connect.DefaultProtocolVersion)
+			if err != nil {
+				panic(err)
+			}
 			client.Send(
-				connect.RequireToFrame(message),
+				frame,
 				connect.DestinationId(destinationId),
 				func(err error) {
 					acks <- err
 				},
 			)
 		}
-	}()
+	})
 	for i := 0; i < messageCount; i += 1 {
 		select {
 		case err := <-acks:

@@ -207,10 +207,9 @@ func (self *StreamBuffer) OpenStream(sourceId *Id, destinationId *Id, streamId I
 		self.streamSequencesByStreamId[streamId] = streamSequence
 		go HandleError(func() {
 			defer func() {
-				streamSequence.Close()
-
 				self.mutex.Lock()
 				defer self.mutex.Unlock()
+				streamSequence.Close()
 				// clean up
 				if streamSequence == self.streamSequences[streamSequenceId] {
 					delete(self.streamSequences, streamSequenceId)

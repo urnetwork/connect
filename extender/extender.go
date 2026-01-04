@@ -152,7 +152,7 @@ func (self *ExtenderServer) ListenAndServe() error {
 			return err
 		}
 		listeners[port] = listener
-		go func() {
+		go connect.HandleError(func() {
 			defer self.cancel()
 
 			for {
@@ -170,7 +170,7 @@ func (self *ExtenderServer) ListenAndServe() error {
 				// fmt.Printf("Extender pre\n")
 				go self.HandleExtenderConnection(self.ctx, conn)
 			}
-		}()
+		}, self.cancel)
 	}
 
 	/*
@@ -520,7 +520,7 @@ func (self *ExtenderServer) HandleExtenderConnection(ctx context.Context, conn n
 	}
 	defer forwardConn.Close()
 
-	go func() {
+	go connect.HandleError(func() {
 		// read packet from clientConn, write to forwardConn
 		defer handleCancel()
 
@@ -544,9 +544,9 @@ func (self *ExtenderServer) HandleExtenderConnection(ctx context.Context, conn n
 				return
 			}
 		}
-	}()
+	}, handleCancel)
 
-	go func() {
+	go connect.HandleError(func() {
 		// read packet from forwardConn, write to clientConn
 		defer handleCancel()
 
@@ -570,7 +570,7 @@ func (self *ExtenderServer) HandleExtenderConnection(ctx context.Context, conn n
 				return
 			}
 		}
-	}()
+	}, handleCancel)
 
 	select {
 	case <-handleCtx.Done():

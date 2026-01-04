@@ -569,10 +569,9 @@ func (self *UdpBuffer[BufferId]) udpSend(
 		self.sequences[bufferId] = sequence
 		go HandleError(func() {
 			defer func() {
-				sequence.Close()
-
 				self.mutex.Lock()
 				defer self.mutex.Unlock()
+				sequence.Close()
 				// clean up
 				if sequence == self.sequences[bufferId] {
 					delete(self.sequences, bufferId)
@@ -1250,10 +1249,9 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 		self.sequences[bufferId] = sequence
 		go HandleError(func() {
 			defer func() {
-				sequence.Close()
-
 				self.mutex.Lock()
 				defer self.mutex.Unlock()
+				sequence.Close()
 				// clean up
 				if sequence == self.sequences[bufferId] {
 					delete(self.sequences, bufferId)

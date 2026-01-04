@@ -430,13 +430,13 @@ func provide(opts docopt.Opts) {
 		}
 		defer statusServer.Shutdown(ctx)
 
-		go func() {
+		go connect.HandleError(func() {
 			defer cancel()
 			err := statusServer.ListenAndServe()
 			if err != nil {
 				fmt.Printf("status error: %s\n", err)
 			}
-		}()
+		}, cancel)
 	} else {
 		fmt.Printf(
 			"Provider %s started\n",
