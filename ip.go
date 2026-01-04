@@ -139,7 +139,7 @@ func NewLocalUserNat(ctx context.Context, clientTag string, settings *LocalUserN
 		settings:         settings,
 		receiveCallbacks: NewCallbackList[ReceivePacketFunction](),
 	}
-	go localUserNat.Run()
+	go HandleError(localUserNat.Run)
 
 	return localUserNat
 }
@@ -567,22 +567,24 @@ func (self *UdpBuffer[BufferId]) udpSend(
 			self.udpBufferSettings,
 		)
 		self.sequences[bufferId] = sequence
-		go func() {
-			sequence.Run()
+		go HandleError(func() {
+			defer func() {
+				sequence.Close()
 
-			self.mutex.Lock()
-			defer self.mutex.Unlock()
-			sequence.Close()
-			// clean up
-			if sequence == self.sequences[bufferId] {
-				delete(self.sequences, bufferId)
-				sourceSequences := self.sourceSequences[sequence.source]
-				delete(sourceSequences, bufferId)
-				if 0 == len(sourceSequences) {
-					delete(self.sourceSequences, sequence.source)
+				self.mutex.Lock()
+				defer self.mutex.Unlock()
+				// clean up
+				if sequence == self.sequences[bufferId] {
+					delete(self.sequences, bufferId)
+					sourceSequences := self.sourceSequences[sequence.source]
+					delete(sourceSequences, bufferId)
+					if 0 == len(sourceSequences) {
+						delete(self.sourceSequences, sequence.source)
+					}
 				}
-			}
-		}()
+			}()
+			sequence.Run()
+		})
 		return sequence
 	}
 
@@ -755,7 +757,7 @@ func (self *UdpSequence) Run() {
 	}
 
 	writePayloads := make(chan writePayload, self.udpBufferSettings.SequenceBufferSize)
-	go func() {
+	go HandleError(func() {
 		defer self.cancel()
 
 		for {
@@ -810,10 +812,10 @@ func (self *UdpSequence) Run() {
 				MessagePoolReturn(writePayload.ipPacket)
 			}
 		}
-	}()
+	}, self.cancel)
 
 	readPackets := make(chan []byte, self.udpBufferSettings.SequenceBufferSize)
-	go func() {
+	go HandleError(func() {
 		defer self.cancel()
 
 		for {
@@ -827,9 +829,9 @@ func (self *UdpSequence) Run() {
 				receive(packet)
 			}
 		}
-	}()
+	}, self.cancel)
 
-	go func() {
+	go HandleError(func() {
 		defer self.cancel()
 
 		buffer := make([]byte, self.udpBufferSettings.ReadBufferByteCount)
@@ -882,7 +884,7 @@ func (self *UdpSequence) Run() {
 				}
 			}
 		}
-	}()
+	}, self.cancel)
 
 	for sendIter := uint64(0); ; sendIter += 1 {
 		checkpointId := self.idleCondition.Checkpoint()
@@ -1246,22 +1248,24 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 			self.tcpBufferSettings,
 		)
 		self.sequences[bufferId] = sequence
-		go func() {
-			sequence.Run()
+		go HandleError(func() {
+			defer func() {
+				sequence.Close()
 
-			self.mutex.Lock()
-			defer self.mutex.Unlock()
-			sequence.Close()
-			// clean up
-			if sequence == self.sequences[bufferId] {
-				delete(self.sequences, bufferId)
-				sourceSequences := self.sourceSequences[sequence.source]
-				delete(sourceSequences, bufferId)
-				if 0 == len(sourceSequences) {
-					delete(self.sourceSequences, sequence.source)
+				self.mutex.Lock()
+				defer self.mutex.Unlock()
+				// clean up
+				if sequence == self.sequences[bufferId] {
+					delete(self.sequences, bufferId)
+					sourceSequences := self.sourceSequences[sequence.source]
+					delete(sourceSequences, bufferId)
+					if 0 == len(sourceSequences) {
+						delete(self.sourceSequences, sequence.source)
+					}
 				}
-			}
-		}()
+			}()
+			sequence.Run()
+		})
 		return sequence
 	}
 	sendItem := &TcpSendItem{
@@ -1413,7 +1417,7 @@ func (self *TcpSequence) Run() {
 		}()
 	}()
 
-	// note receive is called from multiple go routines
+	// note receive is called from multiple goroutines
 	// tcp packets with ack may be reordered due to being written in parallel
 	receive := func(packet []byte) {
 		self.receiveCallback(self.source, self.provideMode, self.IpPath(), packet)
@@ -1586,7 +1590,7 @@ func (self *TcpSequence) Run() {
 	}
 
 	writePayloads := make(chan writePayload, self.tcpBufferSettings.SequenceBufferSize)
-	go func() {
+	go HandleError(func() {
 		defer self.cancel()
 
 		for {
@@ -1647,10 +1651,10 @@ func (self *TcpSequence) Run() {
 				MessagePoolReturn(writePayload.ipPacket)
 			}
 		}
-	}()
+	}, self.cancel)
 
 	readPackets := make(chan []byte, self.tcpBufferSettings.SequenceBufferSize)
-	go func() {
+	go HandleError(func() {
 		defer self.cancel()
 
 		for {
@@ -1664,9 +1668,9 @@ func (self *TcpSequence) Run() {
 				receive(packet)
 			}
 		}
-	}()
+	}, self.cancel)
 
-	go func() {
+	go HandleError(func() {
 		defer self.cancel()
 
 		buffer := make([]byte, self.tcpBufferSettings.ReadBufferByteCount)
@@ -1780,9 +1784,9 @@ func (self *TcpSequence) Run() {
 				}
 			}
 		}
-	}()
+	}, self.cancel)
 
-	go func() {
+	go HandleError(func() {
 		defer self.cancel()
 
 		for {
@@ -1839,7 +1843,7 @@ func (self *TcpSequence) Run() {
 				}
 			}
 		}
-	}()
+	}, self.cancel)
 
 	// window scaling depends on `nonBlockingByteCount` and `blockingByteCount` per `self.windowSize`
 	nonBlockingByteCount := uint32(0)

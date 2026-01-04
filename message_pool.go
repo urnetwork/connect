@@ -115,19 +115,56 @@ func (self *messagePool) Put(poolMessage []byte) {
 	// else no capacity, discard the message
 }
 
-var orderedMessagePools = []*messagePool{
-	newMessagePool(2048, int(InitialMessagePoolByteCount/ByteCount(2048))),
-	newMessagePool(4096, int(InitialMessagePoolByteCount/ByteCount(4096))),
+var orderedMessagePools = sync.OnceValue(func() []*messagePool {
+	pools := []*messagePool{
+		newMessagePool(2048, int(InitialMessagePoolByteCount/ByteCount(2048))),
+		newMessagePool(4096, int(InitialMessagePoolByteCount/ByteCount(4096))),
+	}
+
+	go HandleError(func() {
+		poolStats(pools)
+	})
+
+	return pools
+})
+
+func poolStats(pools []*messagePool) {
+	// print stats from all pools on a regular interval
+	for {
+		for _, pool := range pools {
+			for tag := range 256 {
+				taken := pool.takenTags[tag].Load()
+				if 0 < taken {
+					returned := pool.returnedTags[tag].Load()
+					created := pool.createdTags[tag].Load()
+					ratio := float32(returned) / float32(taken)
+					reuse := float32(taken-created) / float32(taken)
+					var caller string
+					func() {
+						debugStateLock.Lock()
+						defer debugStateLock.Unlock()
+						caller = strings.Join(maps.Keys(tagCallers[uint8(tag)]), "/")
+					}()
+
+					glog.Infof("pool[%d] tag=%d [%s] r=%d/t=%d/c=%d = %.2f%% return / %.2f%% reuse\n", pool.size, tag, caller, returned, taken, created, 100*ratio, 100*reuse)
+				}
+			}
+		}
+
+		select {
+		case <-time.After(60 * time.Second):
+		}
+	}
 }
 
 func ResizeMessagePools(maxByteCount ByteCount) {
-	for _, pool := range orderedMessagePools {
+	for _, pool := range orderedMessagePools() {
 		pool.Resize(int(maxByteCount / ByteCount(pool.size)))
 	}
 }
 
 func ClearMessagePools() {
-	for _, pool := range orderedMessagePools {
+	for _, pool := range orderedMessagePools() {
 		pool.Clear()
 	}
 }
@@ -161,41 +198,8 @@ func debugTag() uint8 {
 	return tag
 }
 
-func init() {
-	go poolStats()
-}
-
-func poolStats() {
-	// print stats from all pools on a regular interval
-	for {
-		for _, pool := range orderedMessagePools {
-			for tag := range 256 {
-				taken := pool.takenTags[tag].Load()
-				if 0 < taken {
-					returned := pool.returnedTags[tag].Load()
-					created := pool.createdTags[tag].Load()
-					ratio := float32(returned) / float32(taken)
-					reuse := float32(taken-created) / float32(taken)
-					var caller string
-					func() {
-						debugStateLock.Lock()
-						defer debugStateLock.Unlock()
-						caller = strings.Join(maps.Keys(tagCallers[uint8(tag)]), "/")
-					}()
-
-					glog.Infof("pool[%d] tag=%d [%s] r=%d/t=%d/c=%d = %.2f%% return / %.2f%% reuse\n", pool.size, tag, caller, returned, taken, created, 100*ratio, 100*reuse)
-				}
-			}
-		}
-
-		select {
-		case <-time.After(60 * time.Second):
-		}
-	}
-}
-
 func ResetMessagePoolStats() {
-	for _, pool := range orderedMessagePools {
+	for _, pool := range orderedMessagePools() {
 		for tag := range 256 {
 			pool.takenTags[tag].Store(0)
 			pool.returnedTags[tag].Store(0)
@@ -206,7 +210,7 @@ func ResetMessagePoolStats() {
 
 func MessagePoolStats() map[int]map[int]float32 {
 	sizeTagRatios := map[int]map[int]float32{}
-	for _, pool := range orderedMessagePools {
+	for _, pool := range orderedMessagePools() {
 		tagRatios := map[int]float32{}
 		for tag := range 256 {
 			taken := pool.takenTags[tag].Load()
@@ -239,6 +243,8 @@ func MessagePoolReadAll(r io.Reader) ([]byte, error) {
 }
 
 func MessagePoolReadAllWithTag(r io.Reader, tag uint8) ([]byte, error) {
+	orderedMessagePools := orderedMessagePools()
+
 	b, _ := MessagePoolGetDetailedWithTag(orderedMessagePools[0].size, tag)
 	i := 0
 	for j := 0; j < len(orderedMessagePools); j += 1 {
@@ -312,6 +318,8 @@ func MessagePoolGetDetailed(n int) ([]byte, bool) {
 }
 
 func MessagePoolGetDetailedWithTag(n int, tag uint8) ([]byte, bool) {
+	orderedMessagePools := orderedMessagePools()
+
 	for _, pool := range orderedMessagePools {
 		if n <= pool.size {
 			poolMessage := pool.Get()
@@ -346,6 +354,8 @@ func MessagePoolGetDetailedWithTag(n int, tag uint8) ([]byte, bool) {
 }
 
 func MessagePoolReturn(message []byte) bool {
+	orderedMessagePools := orderedMessagePools()
+
 	c := cap(message)
 	for _, pool := range orderedMessagePools {
 		if c == pool.size+MessagePoolMetaByteCount {
@@ -387,6 +397,8 @@ func MessagePoolReturn(message []byte) bool {
 }
 
 func MessagePoolShareReadOnly(message []byte) []byte {
+	orderedMessagePools := orderedMessagePools()
+
 	c := cap(message)
 	for _, pool := range orderedMessagePools {
 		if c == pool.size+MessagePoolMetaByteCount {
@@ -414,6 +426,8 @@ func MessagePoolShareReadOnly(message []byte) []byte {
 }
 
 func MessagePoolCheck(message []byte) (pooled bool, shared bool) {
+	orderedMessagePools := orderedMessagePools()
+
 	c := cap(message)
 	for _, pool := range orderedMessagePools {
 		if c == pool.size+MessagePoolMetaByteCount {

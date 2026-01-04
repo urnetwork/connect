@@ -333,7 +333,7 @@ func NewClientWithTag(
 
 	client.initBuffers(routeManager, contractManager, streamManager)
 
-	go client.run()
+	go HandleError(client.run, cancel)
 
 	return client
 }
@@ -686,7 +686,7 @@ func (self *Client) run() {
 
 	// control ping
 	if self.clientId != ControlId && 0 < self.settings.ControlPingTimeout {
-		go func() {
+		go HandleError(func() {
 			for {
 				// uniform timeout with mean `ControlPingTimeout`
 				timeout := time.Duration(mathrand.Int63n(int64(2 * self.settings.ControlPingTimeout)))
@@ -721,11 +721,11 @@ func (self *Client) run() {
 					return
 				}
 			}
-		}()
+		})
 	}
 
 	// loopback messages must be serialized
-	go func() {
+	go HandleError(func() {
 		for {
 			select {
 			case <-self.ctx.Done():
@@ -744,7 +744,7 @@ func (self *Client) run() {
 				})
 			}
 		}
-	}()
+	}, self.cancel)
 
 	for {
 		select {
@@ -1078,30 +1078,30 @@ func (self *SendBuffer) Pack(sendPack *SendPack, timeout time.Duration) (bool, e
 		self.sendSequences[sendSequenceId] = sendSequence
 		// note we do not associate destination here
 		// the sequence will call `AssociateDestination` before it writes
-		go func() {
-			HandleError(sendSequence.Run)
+		go HandleError(func() {
+			defer func() {
+				sendSequence.Close()
 
-			sendSequence.Close()
-
-			self.mutex.Lock()
-			defer self.mutex.Unlock()
-			// clean up
-			if sendSequence == self.sendSequences[sendSequenceId] {
-				delete(self.sendSequences, sendSequenceId)
-			}
-			if destinations, ok := self.sendSequenceDestinations[sendSequence]; ok {
-				for destination, _ := range destinations {
-					if sendSequences, ok := self.sendSequencesByDestination[destination]; ok {
-						delete(sendSequences, sendSequence)
-						if len(sendSequences) == 0 {
-							delete(self.sendSequencesByDestination, destination)
+				self.mutex.Lock()
+				defer self.mutex.Unlock()
+				// clean up
+				if sendSequence == self.sendSequences[sendSequenceId] {
+					delete(self.sendSequences, sendSequenceId)
+				}
+				if destinations, ok := self.sendSequenceDestinations[sendSequence]; ok {
+					for destination, _ := range destinations {
+						if sendSequences, ok := self.sendSequencesByDestination[destination]; ok {
+							delete(sendSequences, sendSequence)
+							if len(sendSequences) == 0 {
+								delete(self.sendSequencesByDestination, destination)
+							}
 						}
 					}
+					delete(self.sendSequenceDestinations, sendSequence)
 				}
-				delete(self.sendSequenceDestinations, sendSequence)
-			}
-
-		}()
+			}()
+			sendSequence.Run()
+		})
 		return sendSequence
 	}
 
@@ -1449,7 +1449,7 @@ func (self *SendSequence) Run() {
 	}()
 
 	ackWindow := newSequenceAckWindow()
-	go func() {
+	go HandleError(func() {
 		defer self.cancel()
 
 		for {
@@ -1473,7 +1473,7 @@ func (self *SendSequence) Run() {
 				}
 			}
 		}
-	}()
+	}, self.cancel)
 
 	for {
 		// apply the acks
@@ -2367,20 +2367,21 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 		)
 		self.receiveSequences[receiveSequenceId] = receiveSequence
 		self.headReceiveSequenceIds[receivePack.Source] = receiveSequenceId
-		go func() {
-			HandleError(receiveSequence.Run)
+		go HandleError(func() {
+			defer func() {
+				receiveSequence.Close()
 
-			receiveSequence.Close()
-
-			self.mutex.Lock()
-			defer self.mutex.Unlock()
-			// clean up
-			if receiveSequence == self.receiveSequences[receiveSequenceId] {
-				delete(self.receiveSequences, receiveSequenceId)
-				// use `receiveSequenceId.Source` instead of `receivePack.Source` to release pointer to receivePack
-				delete(self.headReceiveSequenceIds, receiveSequenceId.Source)
-			}
-		}()
+				self.mutex.Lock()
+				defer self.mutex.Unlock()
+				// clean up
+				if receiveSequence == self.receiveSequences[receiveSequenceId] {
+					delete(self.receiveSequences, receiveSequenceId)
+					// use `receiveSequenceId.Source` instead of `receivePack.Source` to release pointer to receivePack
+					delete(self.headReceiveSequenceIds, receiveSequenceId.Source)
+				}
+			}()
+			receiveSequence.Run()
+		})
 		return receiveSequence
 	}
 
@@ -2612,7 +2613,7 @@ func (self *ReceiveSequence) Run() {
 	)
 
 	// compress and send acks
-	go func() {
+	go HandleError(func() {
 		defer self.cancel()
 
 		multiRouteWriter := self.client.RouteManager().OpenMultiRouteWriter(self.source.Reverse())
@@ -2712,7 +2713,7 @@ func (self *ReceiveSequence) Run() {
 				})
 			}
 		}
-	}()
+	}, self.cancel)
 
 	for {
 		receiveTime := time.Now()
@@ -3501,17 +3502,19 @@ func (self *ForwardBuffer) Pack(forwardPack *ForwardPack, timeout time.Duration)
 			self.forwardBufferSettings,
 		)
 		self.forwardSequences[forwardPack.Destination] = forwardSequence
-		go func() {
-			HandleError(forwardSequence.Run)
-			forwardSequence.Close()
+		go HandleError(func() {
+			defer func() {
+				forwardSequence.Close()
 
-			self.mutex.Lock()
-			defer self.mutex.Unlock()
-			// clean up
-			if forwardSequence == self.forwardSequences[forwardPack.Destination] {
-				delete(self.forwardSequences, forwardPack.Destination)
-			}
-		}()
+				self.mutex.Lock()
+				defer self.mutex.Unlock()
+				// clean up
+				if forwardSequence == self.forwardSequences[forwardPack.Destination] {
+					delete(self.forwardSequences, forwardPack.Destination)
+				}
+			}()
+			forwardSequence.Run()
+		})
 		return forwardSequence
 	}
 

@@ -93,15 +93,17 @@ type AuthLoginResultNetwork struct {
 }
 
 func (self *BringYourApi) AuthLogin(authLogin *AuthLoginArgs, callback AuthLoginCallback) {
-	go HttpPostWithStrategy(
-		self.ctx,
-		self.clientStrategy,
-		fmt.Sprintf("%s/auth/login", self.apiUrl),
-		authLogin,
-		self.ByJwt(),
-		&AuthLoginResult{},
-		callback,
-	)
+	go HandleError(func() {
+		HttpPostWithStrategy(
+			self.ctx,
+			self.clientStrategy,
+			fmt.Sprintf("%s/auth/login", self.apiUrl),
+			authLogin,
+			self.ByJwt(),
+			&AuthLoginResult{},
+			callback,
+		)
+	})
 }
 
 type AuthLoginWithPasswordCallback ApiCallback[*AuthLoginWithPasswordResult]
@@ -131,15 +133,17 @@ type AuthLoginWithPasswordResultError struct {
 }
 
 func (self *BringYourApi) AuthLoginWithPassword(authLoginWithPassword *AuthLoginWithPasswordArgs, callback AuthLoginWithPasswordCallback) {
-	go HttpPostWithStrategy(
-		self.ctx,
-		self.clientStrategy,
-		fmt.Sprintf("%s/auth/login-with-password", self.apiUrl),
-		authLoginWithPassword,
-		self.ByJwt(),
-		&AuthLoginWithPasswordResult{},
-		callback,
-	)
+	go HandleError(func() {
+		HttpPostWithStrategy(
+			self.ctx,
+			self.clientStrategy,
+			fmt.Sprintf("%s/auth/login-with-password", self.apiUrl),
+			authLoginWithPassword,
+			self.ByJwt(),
+			&AuthLoginWithPasswordResult{},
+			callback,
+		)
+	})
 }
 
 type AuthVerifyCallback ApiCallback[*AuthVerifyResult]
@@ -163,15 +167,17 @@ type AuthVerifyResultError struct {
 }
 
 func (self *BringYourApi) AuthVerify(authVerify *AuthVerifyArgs, callback AuthVerifyCallback) {
-	go HttpPostWithStrategy(
-		self.ctx,
-		self.clientStrategy,
-		fmt.Sprintf("%s/auth/verify", self.apiUrl),
-		authVerify,
-		self.ByJwt(),
-		&AuthVerifyResult{},
-		callback,
-	)
+	go HandleError(func() {
+		HttpPostWithStrategy(
+			self.ctx,
+			self.clientStrategy,
+			fmt.Sprintf("%s/auth/verify", self.apiUrl),
+			authVerify,
+			self.ByJwt(),
+			&AuthVerifyResult{},
+			callback,
+		)
+	})
 }
 
 type AuthPasswordResetCallback ApiCallback[*AuthPasswordResetResult]
@@ -185,15 +191,17 @@ type AuthPasswordResetResult struct {
 }
 
 func (self *BringYourApi) AuthPasswordReset(authPasswordReset *AuthPasswordResetArgs, callback AuthPasswordResetCallback) {
-	go HttpPostWithStrategy(
-		self.ctx,
-		self.clientStrategy,
-		fmt.Sprintf("%s/auth/password-reset", self.apiUrl),
-		authPasswordReset,
-		self.ByJwt(),
-		&AuthPasswordResetResult{},
-		callback,
-	)
+	go HandleError(func() {
+		HttpPostWithStrategy(
+			self.ctx,
+			self.clientStrategy,
+			fmt.Sprintf("%s/auth/password-reset", self.apiUrl),
+			authPasswordReset,
+			self.ByJwt(),
+			&AuthPasswordResetResult{},
+			callback,
+		)
+	})
 }
 
 type AuthVerifySendCallback ApiCallback[*AuthVerifySendResult]
@@ -207,15 +215,17 @@ type AuthVerifySendResult struct {
 }
 
 func (self *BringYourApi) AuthVerifySend(authVerifySend *AuthVerifySendArgs, callback AuthVerifySendCallback) {
-	go HttpPostWithStrategy(
-		self.ctx,
-		self.clientStrategy,
-		fmt.Sprintf("%s/auth/verify-send", self.apiUrl),
-		authVerifySend,
-		self.ByJwt(),
-		&AuthVerifySendResult{},
-		callback,
-	)
+	go HandleError(func() {
+		HttpPostWithStrategy(
+			self.ctx,
+			self.clientStrategy,
+			fmt.Sprintf("%s/auth/verify-send", self.apiUrl),
+			authVerifySend,
+			self.ByJwt(),
+			&AuthVerifySendResult{},
+			callback,
+		)
+	})
 }
 
 type AuthNetworkClientCallback ApiCallback[*AuthNetworkClientResult]
@@ -239,15 +249,17 @@ type AuthNetworkClientError struct {
 }
 
 func (self *BringYourApi) AuthNetworkClient(authNetworkClient *AuthNetworkClientArgs, callback AuthNetworkClientCallback) {
-	go HttpPostWithStrategy(
-		self.ctx,
-		self.clientStrategy,
-		fmt.Sprintf("%s/network/auth-client", self.apiUrl),
-		authNetworkClient,
-		self.ByJwt(),
-		&AuthNetworkClientResult{},
-		callback,
-	)
+	go HandleError(func() {
+		HttpPostWithStrategy(
+			self.ctx,
+			self.clientStrategy,
+			fmt.Sprintf("%s/network/auth-client", self.apiUrl),
+			authNetworkClient,
+			self.ByJwt(),
+			&AuthNetworkClientResult{},
+			callback,
+		)
+	})
 }
 
 func (self *BringYourApi) AuthNetworkClientSync(authNetworkClient *AuthNetworkClientArgs) (*AuthNetworkClientResult, error) {
@@ -277,15 +289,17 @@ type RemoveNetworkClientError struct {
 }
 
 func (self *BringYourApi) RemoveNetworkClient(removeNetworkClient *RemoveNetworkClientArgs, callback RemoveNetworkClientCallback) {
-	go HttpPostWithStrategy(
-		self.ctx,
-		self.clientStrategy,
-		fmt.Sprintf("%s/network/remove-client", self.apiUrl),
-		removeNetworkClient,
-		self.ByJwt(),
-		&RemoveNetworkClientResult{},
-		callback,
-	)
+	go HandleError(func() {
+		HttpPostWithStrategy(
+			self.ctx,
+			self.clientStrategy,
+			fmt.Sprintf("%s/network/remove-client", self.apiUrl),
+			removeNetworkClient,
+			self.ByJwt(),
+			&RemoveNetworkClientResult{},
+			callback,
+		)
+	})
 }
 
 func (self *BringYourApi) RemoveNetworkClientSync(removeNetworkClient *RemoveNetworkClientArgs) (*RemoveNetworkClientResult, error) {
@@ -330,15 +344,17 @@ type FindProvidersProvider struct {
 }
 
 func (self *BringYourApi) FindProviders2(findProviders2 *FindProviders2Args, callback FindProviders2Callback) {
-	go HttpPostWithStrategy(
-		self.ctx,
-		self.clientStrategy,
-		fmt.Sprintf("%s/network/find-providers2", self.apiUrl),
-		findProviders2,
-		self.ByJwt(),
-		&FindProviders2Result{},
-		callback,
-	)
+	go HandleError(func() {
+		HttpPostWithStrategy(
+			self.ctx,
+			self.clientStrategy,
+			fmt.Sprintf("%s/network/find-providers2", self.apiUrl),
+			findProviders2,
+			self.ByJwt(),
+			&FindProviders2Result{},
+			callback,
+		)
+	})
 }
 
 func (self *BringYourApi) FindProviders2Sync(findProviders2 *FindProviders2Args) (*FindProviders2Result, error) {
@@ -368,15 +384,17 @@ type ConnectControlError struct {
 }
 
 func (self *BringYourApi) ConnectControl(connectControl *ConnectControlArgs, callback ConnectControlCallback) {
-	go HttpPostWithStrategy(
-		self.ctx,
-		self.clientStrategy,
-		fmt.Sprintf("%s/connect/control", self.apiUrl),
-		connectControl,
-		self.ByJwt(),
-		&ConnectControlResult{},
-		callback,
-	)
+	go HandleError(func() {
+		HttpPostWithStrategy(
+			self.ctx,
+			self.clientStrategy,
+			fmt.Sprintf("%s/connect/control", self.apiUrl),
+			connectControl,
+			self.ByJwt(),
+			&ConnectControlResult{},
+			callback,
+		)
+	})
 }
 
 type AuthCodeLoginCallback ApiCallback[*AuthCodeLoginResult]
@@ -395,15 +413,17 @@ type AuthCodeLoginError struct {
 }
 
 func (self *BringYourApi) AuthCodeLogin(authCodeLogin *AuthCodeLoginArgs, callback AuthCodeLoginCallback) {
-	go HttpPostWithStrategy(
-		self.ctx,
-		self.clientStrategy,
-		fmt.Sprintf("%s/auth/code-login", self.apiUrl),
-		authCodeLogin,
-		self.ByJwt(),
-		&AuthCodeLoginResult{},
-		callback,
-	)
+	go HandleError(func() {
+		HttpPostWithStrategy(
+			self.ctx,
+			self.clientStrategy,
+			fmt.Sprintf("%s/auth/code-login", self.apiUrl),
+			authCodeLogin,
+			self.ByJwt(),
+			&AuthCodeLoginResult{},
+			callback,
+		)
+	})
 }
 
 func (self *BringYourApi) AuthCodeLoginSync(authCodeLogin *AuthCodeLoginArgs) (*AuthCodeLoginResult, error) {

@@ -200,7 +200,7 @@ func NewContractManager(
 	}
 
 	if client.ClientId() != ControlId {
-		go contractManager.providePing()
+		go HandleError(contractManager.providePing, client.Cancel)
 	}
 
 	return contractManager

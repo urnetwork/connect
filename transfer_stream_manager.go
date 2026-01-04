@@ -205,20 +205,22 @@ func (self *StreamBuffer) OpenStream(sourceId *Id, destinationId *Id, streamId I
 
 		self.streamSequences[streamSequenceId] = streamSequence
 		self.streamSequencesByStreamId[streamId] = streamSequence
-		go func() {
-			HandleError(streamSequence.Run)
+		go HandleError(func() {
+			defer func() {
+				streamSequence.Close()
 
-			self.mutex.Lock()
-			defer self.mutex.Unlock()
-			streamSequence.Close()
-			// clean up
-			if streamSequence == self.streamSequences[streamSequenceId] {
-				delete(self.streamSequences, streamSequenceId)
-			}
-			if streamSequence == self.streamSequencesByStreamId[streamId] {
-				delete(self.streamSequencesByStreamId, streamId)
-			}
-		}()
+				self.mutex.Lock()
+				defer self.mutex.Unlock()
+				// clean up
+				if streamSequence == self.streamSequences[streamSequenceId] {
+					delete(self.streamSequences, streamSequenceId)
+				}
+				if streamSequence == self.streamSequencesByStreamId[streamId] {
+					delete(self.streamSequencesByStreamId, streamId)
+				}
+			}()
+			streamSequence.Run()
+		})
 		return streamSequence
 	}
 
@@ -427,8 +429,12 @@ func (self *StreamSequence) Run() {
 			}
 		}
 
-		go forward(p2pToDestinationRouteManager)
-		go forward(p2pToSourceRouteManager)
+		go HandleError(func() {
+			forward(p2pToDestinationRouteManager)
+		}, self.cancel)
+		go HandleError(func() {
+			forward(p2pToSourceRouteManager)
+		}, self.cancel)
 	}
 
 	select {

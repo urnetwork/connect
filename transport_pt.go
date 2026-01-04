@@ -160,19 +160,19 @@ func NewPacketTranslationWithPrefix(
 	switch ptMode {
 	case PacketTranslationModeDns, PacketTranslationModeDnsPump:
 		pt.dnsClient = true
-		go pt.encodeDns()
-		go pt.decodeDns()
+		go HandleError(pt.encodeDns, cancel)
+		go HandleError(pt.decodeDns, cancel)
 	case PacketTranslationModeDecode53:
 		pt.dnsClient = false
 		pt.dnsPumpQueue = newPumpQueue(settings)
-		go pt.encodeDns()
-		go pt.decodeDns()
+		go HandleError(pt.encodeDns, cancel)
+		go HandleError(pt.decodeDns, cancel)
 	case PacketTranslationModeDecode53RequireDnsPump:
 		pt.dnsClient = false
 		pt.dnsPumpQueue = newPumpQueue(settings)
 		pt.dnsRequirePump = true
-		go pt.encodeDns()
-		go pt.decodeDns()
+		go HandleError(pt.encodeDns, cancel)
+		go HandleError(pt.decodeDns, cancel)
 	default:
 		return nil, fmt.Errorf("Unsupported packet translation mode: %s", ptMode)
 	}
@@ -495,7 +495,7 @@ func (self *packetTranslation) decodeDns() {
 	readPipeline := make(chan *readData, self.settings.SequenceBufferSize)
 	pumpPipeline := make(chan *pumpItem, self.settings.SequenceBufferSize)
 
-	go func() {
+	go HandleError(func() {
 		defer self.cancel()
 
 		dnsCombineQueue := newCombineQueue(self.settings)
@@ -538,9 +538,9 @@ func (self *packetTranslation) decodeDns() {
 				}
 			}
 		}
-	}()
+	}, self.cancel)
 
-	go func() {
+	go HandleError(func() {
 		defer self.cancel()
 
 		for {
@@ -554,7 +554,7 @@ func (self *packetTranslation) decodeDns() {
 				self.dnsPumpQueue.Add(item)
 			}
 		}
-	}()
+	}, self.cancel)
 
 	packetData := make([]byte, 2048)
 	var buf [1024]byte

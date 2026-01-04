@@ -407,7 +407,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 	handleCtx, handleCancel := context.WithTimeout(ctx, self.settings.RequestTimeout)
 	defer handleCancel()
 	// merge handleCtx with self.ctx
-	go func() {
+	go HandleError(func() {
 		defer handleCancel()
 		select {
 		case <-handleCtx.Done():
@@ -415,7 +415,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 		case <-self.ctx.Done():
 			return
 		}
-	}()
+	}, handleCancel)
 
 	out := make(chan *evalResult)
 
@@ -474,7 +474,9 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 	WeightedShuffle(parallelDialers, dialerWeights)
 	n := min(len(parallelDialers), self.settings.ParallelBlockSize)
 	for _, dialer := range parallelDialers[0:n] {
-		go run(dialer)
+		go HandleError(func() {
+			run(dialer)
+		})
 	}
 	for _, dialer := range parallelDialers[n:] {
 		select {
@@ -489,7 +491,9 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 				glog.V(2).Infof("[net][p]select: %s = %s\n", result.dialer.String(), result.err)
 				result.Close()
 			}
-			go run(dialer)
+			go HandleError(func() {
+				run(dialer)
+			})
 		}
 	}
 
@@ -512,7 +516,9 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 		m := min(len(expandedDialers), self.settings.ParallelBlockSize-n)
 		n += m
 		for _, dialer := range expandedDialers[0:m] {
-			go run(dialer)
+			go HandleError(func() {
+				run(dialer)
+			})
 		}
 		for _, dialer := range expandedDialers[m:] {
 			select {
@@ -525,7 +531,9 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 				}
 				glog.V(2).Infof("[net][p]select: %s = %s\n", result.dialer.String(), result.err)
 				result.Close()
-				go run(dialer)
+				go HandleError(func() {
+					run(dialer)
+				})
 			}
 		}
 
@@ -563,7 +571,7 @@ func (self *ClientStrategy) serialEval(ctx context.Context, eval func(ctx contex
 	handleCtx, handleCancel := context.WithTimeout(ctx, self.settings.RequestTimeout)
 	defer handleCancel()
 	// merge handleCtx with self.ctx
-	go func() {
+	go HandleError(func() {
 		defer handleCancel()
 		select {
 		case <-handleCtx.Done():
@@ -571,7 +579,7 @@ func (self *ClientStrategy) serialEval(ctx context.Context, eval func(ctx contex
 		case <-self.ctx.Done():
 			return
 		}
-	}()
+	}, handleCancel)
 
 	// keep trying as long as there is time left
 	for {

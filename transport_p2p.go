@@ -136,7 +136,7 @@ func (self *P2pTransport) run() {
 			handleCtx, handleCancel := context.WithCancel(self.ctx)
 			defer handleCancel()
 
-			go func() {
+			go HandleError(func() {
 				defer self.cancel()
 
 				select {
@@ -159,9 +159,9 @@ func (self *P2pTransport) run() {
 				case <-handleCtx.Done():
 					return
 				}
-			}()
+			}, self.cancel)
 
-			go func() {
+			go HandleError(func() {
 				defer self.cancel()
 
 				select {
@@ -190,7 +190,7 @@ func (self *P2pTransport) run() {
 				case <-handleCtx.Done():
 					return
 				}
-			}()
+			}, self.cancel)
 
 			select {
 			case <-handleCtx.Done():
@@ -237,7 +237,7 @@ func NewP2pSendTransport(
 		send:                 send,
 		p2pTransportSettings: p2pTransportSettings,
 	}
-	go p2pSendTransport.run()
+	go HandleError(p2pSendTransport.run, cancel)
 	return p2pSendTransport, send
 }
 
@@ -330,7 +330,7 @@ func NewP2pReceiveTransport(
 		receive:              receive,
 		p2pTransportSettings: p2pTransportSettings,
 	}
-	go p2pReceiveTransport.run()
+	go HandleError(p2pReceiveTransport.run, cancel)
 	return p2pReceiveTransport, receive
 }
 

@@ -64,7 +64,7 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 	syncIndex := self.syncCount
 
 	notify := self.monitor.NotifyAll()
-	go func() {
+	go HandleError(func() {
 		defer handleCancel()
 
 		for {
@@ -84,7 +84,7 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 				return
 			}
 		}
-	}()
+	}, handleCancel)
 
 	var controlSync func(*protocol.Frame)
 	controlSync = func(updatedFrame *protocol.Frame) {
@@ -133,7 +133,9 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 							safeAckCallback(nil)
 							MessagePoolReturn(updatedFrame.MessageBytes)
 						} else {
-							go controlSync(updatedFrame)
+							go HandleError(func() {
+								controlSync(updatedFrame)
+							}, handleCancel)
 						}
 					},
 					-1,
@@ -182,7 +184,9 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 				safeAckCallback(nil)
 				MessagePoolReturn(frame.MessageBytes)
 			} else {
-				go controlSync(frame)
+				go HandleError(func() {
+					controlSync(frame)
+				}, handleCancel)
 			}
 		},
 		0,
@@ -192,7 +196,9 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 		return
 	}
 
-	go controlSync(frame)
+	go HandleError(func() {
+		controlSync(frame)
+	}, handleCancel)
 }
 
 func (self *ControlSync) Close() {

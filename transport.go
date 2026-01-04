@@ -249,7 +249,7 @@ func NewPlatformTransportWithTargetMode(
 		targetMode:     targetMode,
 		mode:           TransportModeNone,
 	}
-	go transport.run()
+	go HandleError(transport.run, cancel)
 	return transport
 }
 
@@ -308,18 +308,34 @@ func (self *PlatformTransport) run() {
 
 	switch self.targetMode {
 	case TransportModeAuto:
-		go self.runH1(0)
-		// go self.runH3(TransportModeH3, 0, 1)
-		// go self.runH3(TransportModeH3Dns, self.settings.ModeInitialDelay, self.settings.PtDnsSlowMultiple)
-		// go self.runH3(TransportModeH3DnsPump, self.settings.ModeInitialDelay*2, self.settings.PtDnsSlowMultiple)
+		go HandleError(func() {
+			self.runH1(0)
+		}, self.cancel)
+		// go HandleError(func() {
+		// 	self.runH3(TransportModeH3, 0, 1)
+		// }, self.cancel)
+		// go HandleError(func() {
+		// 	self.runH3(TransportModeH3Dns, self.settings.ModeInitialDelay, self.settings.PtDnsSlowMultiple)
+		// }, self.cancel)
+		// go HandleError(func() {
+		// 	self.runH3(TransportModeH3DnsPump, self.settings.ModeInitialDelay*2, self.settings.PtDnsSlowMultiple)
+		// }, self.cancel)
 	case TransportModeH3:
-		go self.runH3(TransportModeH3, 0, 1)
+		go HandleError(func() {
+			self.runH3(TransportModeH3, 0, 1)
+		}, self.cancel)
 	case TransportModeH1:
-		go self.runH1(0)
+		go HandleError(func() {
+			self.runH1(0)
+		}, self.cancel)
 	case TransportModeH3Dns:
-		go self.runH3(TransportModeH3Dns, 0, self.settings.PtDnsSlowMultiple)
+		go HandleError(func() {
+			self.runH3(TransportModeH3Dns, 0, self.settings.PtDnsSlowMultiple)
+		}, self.cancel)
 	case TransportModeH3DnsPump:
-		go self.runH3(TransportModeH3DnsPump, 0, self.settings.PtDnsSlowMultiple)
+		go HandleError(func() {
+			self.runH3(TransportModeH3DnsPump, 0, self.settings.PtDnsSlowMultiple)
+		}, self.cancel)
 	}
 
 	for {
@@ -510,7 +526,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			if DebugCloseSend {
 				// use zero buffer here so that the transport can stop accepting and not drop messages
 				exportedSend = make(chan []byte)
-				go func() {
+				go HandleError(func() {
 					defer func() {
 						handleCancel()
 						close(send)
@@ -532,7 +548,11 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							}
 						}
 					}
-				}()
+				}, func() {
+					handleCancel()
+					close(send)
+					drain(send)
+				})
 			} else {
 				exportedSend = send
 			}
@@ -556,7 +576,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				self.routeManager.RemoveTransport(receiveTransport)
 			}()
 
-			go func() {
+			go HandleError(func() {
 				defer handleCancel()
 
 				for {
@@ -582,9 +602,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						}
 					}
 				}
-			}()
+			}, handleCancel)
 
-			go func() {
+			go HandleError(func() {
 				defer handleCancel()
 
 				speedTest := false
@@ -669,9 +689,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						}
 					}
 				}
-			}()
+			}, handleCancel)
 
-			go func() {
+			go HandleError(func() {
 				defer func() {
 					handleCancel()
 					close(receive)
@@ -777,7 +797,14 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					// }
 
 				}
-			}()
+			}, func() {
+				handleCancel()
+				close(receive)
+				close(controlSend)
+
+				drain(receive)
+				drain(controlSend)
+			})
 
 			select {
 			case <-handleCtx.Done():
@@ -1041,7 +1068,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				// it used to be closed after a delay, but it is not needed to close it.
 			}()
 
-			go func() {
+			go HandleError(func() {
 				defer handleCancel()
 
 				for {
@@ -1067,9 +1094,9 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 						}
 					}
 				}
-			}()
+			}, handleCancel)
 
-			go func() {
+			go HandleError(func() {
 				defer handleCancel()
 
 				for {
@@ -1100,9 +1127,9 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 						}
 					}
 				}
-			}()
+			}, handleCancel)
 
-			go func() {
+			go HandleError(func() {
 				defer func() {
 					handleCancel()
 					close(receive)
@@ -1140,7 +1167,10 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 						MessagePoolReturn(message)
 					}
 				}
-			}()
+			}, func() {
+				handleCancel()
+				close(receive)
+			})
 
 			select {
 			case <-handleCtx.Done():

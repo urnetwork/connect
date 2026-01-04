@@ -227,7 +227,7 @@ func (self *Event) SetOnSignals(signalValues ...syscall.Signal) func() {
 	for _, signalValue := range signalValues {
 		signal.Notify(stopSignal, signalValue)
 	}
-	go func() {
+	go HandleError(func() {
 		for {
 			select {
 			case _, ok := <-stopSignal:
@@ -237,7 +237,11 @@ func (self *Event) SetOnSignals(signalValues ...syscall.Signal) func() {
 				self.Set()
 			}
 		}
-	}()
+	}, func() {
+		signal.Stop(stopSignal)
+		close(stopSignal)
+		self.Set()
+	})
 	return func() {
 		signal.Stop(stopSignal)
 		close(stopSignal)
