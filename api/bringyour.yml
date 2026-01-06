@@ -1,20 +1,20 @@
 openapi: "3.1.0"
 info:
-  version: 2023.12.19
-  title: BringYour
+  version: 2026.1.6
+  title: URnetwork
   description: |
-    BringYour is a web-standards VPN marketplace with an emphasis on
+    URnetwork is a web-standards VPN marketplace with an emphasis on
     fast, secure internet everwhere.
 
-    The API for BringYour bootstraps the `connect` protocol,
+    The API for URnetwork bootstraps the `connect` protocol,
     and is the source of JWTs and other match-making transactions.
 
     The JWT returned by /auth routes does not have a clientId.
     The `connect` protocol requires a JWT with a clientId.
     Use the /network routes to obtain a JWT with a clientId.
 
-    In the BringYour network:
-    - a network name is a globally unique subnet (xyz.bringyour.network)
+    In URnetwork:
+    - a network name is a globally unique subnet (xyz.ur.network)
     - a clientId is a globally unique 16-byte address
     - clientIds are equivalent to IPv6, but are expressed as UDID
     - clients also have an IPv6 and IPv4 mapped to their clientId
@@ -25,14 +25,14 @@ info:
     Unless otherwise specified, time/date strings will be formatted
     in the Go default `2006-01-02 15:04:05.999999999 -0700 MST` (RFC 3339).
 
-  termsOfService: https://bringyour.com/terms
+  termsOfService: https://ur.io/terms
   contact:
-    name: BringYour
-    email: support@bringyour.com
-    url: https://bringyour.com
+    name: URnetwork
+    email: support@ur.io
+    url: https://ur.io
   x-logo:
-    url: https://bringyour.com/res/images/bringyour-wordmark-260.svg
-    altText: BringYour
+    url: https://bringyour.com/res/images/URnetwork-logo-black-400-80.svg
+    altText: URnetwork
   license:
     name: Mozilla Public License, v. 2.0
     url: https://mozilla.org/MPL/2.0/
@@ -261,7 +261,7 @@ paths:
         - at least 3 characters different from an existing network name
         - at least 8 characters
         - domain name compatible (see RFC 5890)
-        - not contain the dash (-) character (BringYour subdomains are reverse-flattened to a single level using dashes)
+        - not contain the dash (-) character (URnetwork subdomains are reverse-flattened to a single level using dashes)
       operationId: Auth Network Check
       security: []
       requestBody:
@@ -727,7 +727,7 @@ paths:
     get:
       description: |
         Get the balance for the USDC user custody wallet.
-        The user custody wallet allows BringYour to query the balance,
+        The user custody wallet allows URnetwork to query the balance,
         but the user must take actions against the wallet.
       operationId: Wallet Balance
       security:
@@ -1466,7 +1466,7 @@ components:
     BearerAuth:
       type: http
       scheme: bearer
-      description: BringYour JWT
+      description: URnetwork JWT
 
   schemas:
     ProvideMode:
@@ -1911,6 +1911,7 @@ components:
             If this is called with a client jwt, the derived client id is inferred from the jwt.
           type: string
 
+        # the proxy auth will be the by_client_jwt as username, no password
         proxy_config:
           description: Optional. |
             Set if the intended use case of the client is cloud proxy. |
@@ -1928,22 +1929,92 @@ components:
               type: array
               items:
                 type: string
-            enable_socks:
-              description: Optional.
-              type: boolean
-            enable_http:
-              description: Optional.
-              type: boolean
             http_require_auth:
               description: Optional. |
                 If the client supports ECH, this is not needed, since the HTTP proxy URL will itself be the auth.
               type: boolean
+            initial_device_state:
+              description: Optional. |
+                Whenever the device is created, it will be set up with this initial state.
+                To configure the device beyond the initial state, the SDK ProxyDevice must be used.
+                Note that the SDK ProxyDevice must reconfigure the device each time it receives a change notice.
+              type: object
+              properties:
+                location:
+                  type: object
+                  properties:
+                    connect_location_id:
+                      type: object
+                      properties:
+                        client_id:
+                          description: udid. Optional.
+                          type: string
+                        location_id:
+                          description: udid. Optional.
+                          type: string
+                        location_group_id:
+                          description: udid. Optional.
+                          type: string
+                        best_available:
+                          description: udid. Optional.
+                          type: boolean
+                    name:
+                      type: string
+                    location_type:
+                      type: string
+                      oneOf:
+                        - title: LocationTypeCountry
+                          const: country
+                        - title: LocationTypeRegion
+                          const: region
+                        - title: LocationTypeCity
+                          const: city
+                performance_profile:
+                  type: object
+                  properties:
+                    window_type:
+                      description: Optional. The default is "quality"
+                      type: string
+                      oneOf:
+                        - title: WindowTypeQuality
+                          const: quality
+                        - title: WindowTypeSpeed
+                          const: speed
+                    window_size_settings:
+                      type: object
+                      properties:
+                        window_size_min:
+                          type: integer
+                        window_size_min_p2p_only:
+                          description: |
+                            The minimumum number of items in the windows that must be connected via p2p only.
+                            Leave 0 for default behavior.
+                          type: integer
+                        window_size_max:
+                          description: Inclusive, soft limit
+                          type: integer
+                        window_size_hard_max:
+                          description: Leave 0 to disable (no hard limit)
+                          type: integer
+                        fixed_window_size:
+                          description: Leave 0 to automatically size between `WindowSizeMin` and `WindowSizeMax`
+                          type: integer
+                        window_size_reconnect_scale:
+                          description: Clients per source per stream
+                          type: number
+                        keep_healthiest_count:
+                          description: Leave 0 to disable
+                          type: integer
+                        ulimit:
+                          description: Leave 0 to disable (no limit)
+                          type: integer
 
     AuthNetworkClientResult:
       type: object
       properties:
         by_client_jwt:
           type: string
+        # the returned proxy urls are valid as long as the client is not removed
         proxy_config_result:
           type: object
           properties:
@@ -1953,29 +2024,13 @@ components:
             keepalive_seconds:
               description: The proxy must receive a message at least once per this interval, to stay alive. |
                 The SDK ProxyDevice will automatically send a heartbeat with this many seconds.
+                If the proxy times out and `initial_device_state` is set, the next call to proxy will
+                create a new device set up to the initial state.
               type: integer
             http_proxy_url:
-              description: Optional. Will not be set if `enable_http=false`
               type: string
             socks_proxy_url:
-              description: Optional. Will not be set if `enable_socks=false`
               type: string
-            http_proxy_auth:
-              description: Optional. Will not be set if `http_require_auth=false`
-              type: object
-              properties:
-                username:
-                  type: string
-                password:
-                  type: string
-            socks_proxy_auth:
-              description: Optional.
-              type: object
-              properties:
-                username:
-                  type: string
-                password:
-                  type: string
 
         error:
           type: object
@@ -1984,8 +2039,6 @@ components:
               type: boolean
             message:
               type: string
-
-            
 
     RemoveNetworkClientArgs:
       type: object
