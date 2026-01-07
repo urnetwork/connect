@@ -176,6 +176,9 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		ProtocolVersion:     DefaultProtocolVersion,
 		DestinationAffinity: true,
 
+		DefaultReconnectScale: 1.0,
+		DefaultUlimit:         0,
+
 		RemoteUserNatMultiClientMonitorSettings: *DefaultRemoteUserNatMultiClientMonitorSettings(),
 	}
 }
@@ -249,6 +252,13 @@ type MultiClientSettings struct {
 	// all destinations should not route, so that the client can be detected as unhealthy
 	DestinationAffinity bool
 
+	DefaultPerformanceProfile *PerformanceProfile
+
+	// used when reconnect scale is not set in a custom performance profile
+	DefaultReconnectScale float64
+	// used when ulimit is not set in a custom performance profile
+	DefaultUlimit int
+
 	RemoteUserNatMultiClientMonitorSettings
 }
 
@@ -262,10 +272,11 @@ type WindowSizeSettings struct {
 	// leave 0 to automatically size between `WindowSizeMin` and `WindowSizeMax`
 	FixedWindowSize int
 	// WindowSizeUseMax     int
-	// clients per source
+	// clients per source (leave 0 for default)
 	WindowSizeReconnectScale float64
 	KeepHealthiestCount      int
-	Ulimit                   int
+	// (leave 0 for default)
+	Ulimit int
 }
 
 func (self *WindowSizeSettings) Validate() error {
@@ -398,6 +409,7 @@ func NewRemoteUserNatMultiClient(
 		affinityIp4Paths:      map[Ip4Path]map[Ip4Path]time.Time{},
 		affinityIp6Paths:      map[Ip6Path]map[Ip6Path]time.Time{},
 		clientUpdates:         map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
+		performanceProfile:    settings.DefaultPerformanceProfile,
 	}
 
 	multiClient.windows[WindowTypeQuality] = newMultiClientWindow(
@@ -1822,7 +1834,11 @@ func (self *multiClientWindow) resize() {
 						warnClient(client, stats)
 					} else {
 						printStats("client ok")
-						ulimit := 0 < windowSize.Ulimit && windowSize.Ulimit <= stats.netSourceCount
+						windowSizeUlimit := self.settings.DefaultUlimit
+						if 0 < windowSize.Ulimit {
+							windowSizeUlimit = windowSize.Ulimit
+						}
+						ulimit := 0 < windowSizeUlimit && windowSizeUlimit <= stats.netSourceCount
 						if ulimit {
 							client.setWarning(true)
 							warnClient(client, stats)
@@ -1911,7 +1927,11 @@ func (self *multiClientWindow) resize() {
 			windowSizeMin = targetWindowSize
 		} else {
 			// scale the number of reconnects
-			targetWindowSize = int(math.Ceil(float64(maxSourceCount) * windowSize.WindowSizeReconnectScale))
+			reconnectScale := self.settings.DefaultReconnectScale
+			if 0 < windowSize.WindowSizeReconnectScale {
+				reconnectScale = windowSize.WindowSizeReconnectScale
+			}
+			targetWindowSize = int(math.Ceil(float64(maxSourceCount) * reconnectScale))
 
 			if n := windowSize.WindowSizeMinP2pOnly - p2pOnlyWindowSize; 0 < n {
 				targetWindowSize += n
