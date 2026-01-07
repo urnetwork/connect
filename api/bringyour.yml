@@ -1929,7 +1929,7 @@ components:
               type: array
               items:
                 type: string
-            http_require_auth:
+            https_require_auth:
               description: Optional. |
                 If the client supports ECH, this is not needed, since the HTTP proxy URL will itself be the auth.
               type: boolean
@@ -1940,7 +1940,11 @@ components:
                 Note that the SDK ProxyDevice must reconfigure the device each time it receives a change notice.
               type: object
               properties:
+                country_code:
+                  description: Optional. Use one of country_code or location
+                  type: string
                 location:
+                  description: Optional. Use one of country_code or location
                   type: object
                   properties:
                     connect_location_id:
@@ -1991,13 +1995,11 @@ components:
                             Leave 0 for default behavior.
                           type: integer
                         window_size_max:
-                          description: Inclusive, soft limit
+                          description: Inclusive, soft limit. |
+                            When `window_size_max==window_size_min`, a special fixed size mode is enabled.
                           type: integer
                         window_size_hard_max:
                           description: Leave 0 to disable (no hard limit)
-                          type: integer
-                        fixed_window_size:
-                          description: Leave 0 to automatically size between `WindowSizeMin` and `WindowSizeMax`
                           type: integer
                         window_size_reconnect_scale:
                           description: Clients per source per stream
@@ -2018,18 +2020,21 @@ components:
         proxy_config_result:
           type: object
           properties:
-            expiration_time:
-              description: The proxy must be used by this time or it will no longer be valid.
-              type: string
             keepalive_seconds:
-              description: The proxy must receive a message at least once per this interval, to stay alive. |
+              description: |
+                The proxy url will be valid until the client is removed.
+                However, to keep the device and state in memory,
+                the proxy must receive a message at least once per this interval.
                 The SDK ProxyDevice will automatically send a heartbeat with this many seconds.
-                If the proxy times out and `initial_device_state` is set, the next call to proxy will
-                create a new device set up to the initial state.
+                If the proxy is removed from memmory, the next call to the proxy will
+                create a new device set up to the `initial_device_state` (if present).
               type: integer
-            http_proxy_url:
+            https_proxy_url:
               type: string
             socks_proxy_url:
+              type: string
+            instance_id:
+              description: udid. The instance_id of the proxy device.
               type: string
 
         error:
