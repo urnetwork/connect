@@ -226,12 +226,8 @@ func (self *ApiMultiClientGenerator) NewClient(
 	args *MultiClientGeneratorClientArgs,
 	clientSettings *ClientSettings,
 ) (*Client, error) {
-	byJwt, err := ParseByJwtUnverified(args.ClientAuth.ByJwt)
-	if err != nil {
-		return nil, err
-	}
 	clientOob := NewApiOutOfBandControl(ctx, self.clientStrategy, args.ClientAuth.ByJwt, self.apiUrl)
-	client := NewClient(ctx, byJwt.ClientId, clientOob, clientSettings)
+	client := NewClient(ctx, args.ClientId, clientOob, clientSettings)
 	settings := DefaultPlatformTransportSettings()
 	if args.P2pOnly {
 		settings.TransportGenerator = func() (sendTransport Transport, receiveTransport Transport) {
