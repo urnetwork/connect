@@ -50,29 +50,29 @@ func (self SecurityPolicyResult) String() string {
 }
 
 type SecurityPolicy interface {
-	Stats() *securityPolicyStats
+	Stats() *SecurityPolicyStatsCollector
 	Inspect(provideMode protocol.ProvideMode, ipPath *IpPath) (SecurityPolicyResult, error)
 }
 
-type EgressSecurityPolicy struct {
-	stats *securityPolicyStats
+type egressSecurityPolicy struct {
+	stats *SecurityPolicyStatsCollector
 }
 
-func DefaultEgressSecurityPolicy() *EgressSecurityPolicy {
-	return DefaultEgressSecurityPolicyWithStats(DefaultSecurityPolicyStats())
+func DefaultEgressSecurityPolicy() SecurityPolicy {
+	return DefaultEgressSecurityPolicyWithStats(DefaultSecurityPolicyStatsCollector())
 }
 
-func DefaultEgressSecurityPolicyWithStats(stats *securityPolicyStats) *EgressSecurityPolicy {
-	return &EgressSecurityPolicy{
+func DefaultEgressSecurityPolicyWithStats(stats *SecurityPolicyStatsCollector) SecurityPolicy {
+	return &egressSecurityPolicy{
 		stats: stats,
 	}
 }
 
-func (self *EgressSecurityPolicy) Stats() *securityPolicyStats {
+func (self *egressSecurityPolicy) Stats() *SecurityPolicyStatsCollector {
 	return self.stats
 }
 
-func (self *EgressSecurityPolicy) Inspect(provideMode protocol.ProvideMode, ipPath *IpPath) (SecurityPolicyResult, error) {
+func (self *egressSecurityPolicy) Inspect(provideMode protocol.ProvideMode, ipPath *IpPath) (SecurityPolicyResult, error) {
 	result, err := self.inspect(provideMode, ipPath)
 	if ipPath != nil {
 		self.stats.AddDestination(ipPath, result, 1)
@@ -80,7 +80,7 @@ func (self *EgressSecurityPolicy) Inspect(provideMode protocol.ProvideMode, ipPa
 	return result, err
 }
 
-func (self *EgressSecurityPolicy) inspect(provideMode protocol.ProvideMode, ipPath *IpPath) (SecurityPolicyResult, error) {
+func (self *egressSecurityPolicy) inspect(provideMode protocol.ProvideMode, ipPath *IpPath) (SecurityPolicyResult, error) {
 	// if protocol.ProvideMode_Network == provideMode {
 	// 	return ipPath, SecurityPolicyResultAllow, nil
 	// } else {
@@ -88,8 +88,6 @@ func (self *EgressSecurityPolicy) inspect(provideMode protocol.ProvideMode, ipPa
 	// apply public rules:
 	// - only public unicast network destinations
 	// - block insecure or known unencrypted traffic
-
-	// FIXME allow local traffic for testing
 	if !isPublicUnicast(ipPath.DestinationIp) {
 		return SecurityPolicyResultIncident, nil
 	}
@@ -163,31 +161,31 @@ func (self *EgressSecurityPolicy) inspect(provideMode protocol.ProvideMode, ipPa
 	return SecurityPolicyResultDrop, nil
 }
 
-type IngressSecurityPolicy struct {
-	stats *securityPolicyStats
+type ingressSecurityPolicy struct {
+	stats *SecurityPolicyStatsCollector
 }
 
-func DefaultIngressSecurityPolicy() *IngressSecurityPolicy {
-	return DefaultIngressSecurityPolicyWithStats(DefaultSecurityPolicyStats())
+func DefaultIngressSecurityPolicy() SecurityPolicy {
+	return DefaultIngressSecurityPolicyWithStats(DefaultSecurityPolicyStatsCollector())
 }
 
-func DefaultIngressSecurityPolicyWithStats(stats *securityPolicyStats) *IngressSecurityPolicy {
-	return &IngressSecurityPolicy{
+func DefaultIngressSecurityPolicyWithStats(stats *SecurityPolicyStatsCollector) SecurityPolicy {
+	return &ingressSecurityPolicy{
 		stats: stats,
 	}
 }
 
-func (self *IngressSecurityPolicy) Stats() *securityPolicyStats {
+func (self *ingressSecurityPolicy) Stats() *SecurityPolicyStatsCollector {
 	return self.stats
 }
 
-func (self *IngressSecurityPolicy) Inspect(provideMode protocol.ProvideMode, ipPath *IpPath) (SecurityPolicyResult, error) {
+func (self *ingressSecurityPolicy) Inspect(provideMode protocol.ProvideMode, ipPath *IpPath) (SecurityPolicyResult, error) {
 	result, err := self.inspect(provideMode, ipPath)
 	self.stats.AddSource(ipPath, result, 1)
 	return result, err
 }
 
-func (self *IngressSecurityPolicy) inspect(provideMode protocol.ProvideMode, ipPath *IpPath) (SecurityPolicyResult, error) {
+func (self *ingressSecurityPolicy) inspect(provideMode protocol.ProvideMode, ipPath *IpPath) (SecurityPolicyResult, error) {
 	allow := func() bool {
 		// dPort := ipPath.DestinationPort
 		sPort := ipPath.SourcePort
@@ -205,6 +203,28 @@ func (self *IngressSecurityPolicy) inspect(provideMode protocol.ProvideMode, ipP
 		return SecurityPolicyResultAllow, nil
 	}
 	return SecurityPolicyResultDrop, nil
+}
+
+type disableSecurityPolicy struct {
+	stats *SecurityPolicyStatsCollector
+}
+
+func DisableSecurityPolicy() SecurityPolicy {
+	return DisableSecurityPolicyWithStats(DefaultSecurityPolicyStatsCollector())
+}
+
+func DisableSecurityPolicyWithStats(stats *SecurityPolicyStatsCollector) SecurityPolicy {
+	return &disableSecurityPolicy{
+		stats: stats,
+	}
+}
+
+func (self *disableSecurityPolicy) Stats() *SecurityPolicyStatsCollector {
+	return self.stats
+}
+
+func (self *disableSecurityPolicy) Inspect(provideMode protocol.ProvideMode, ipPath *IpPath) (SecurityPolicyResult, error) {
+	return SecurityPolicyResultAllow, nil
 }
 
 func isPublicUnicast(ip net.IP) bool {
@@ -302,21 +322,21 @@ func (self *SecurityDestination) String() string {
 }
 
 // get current counts of outcomes per (protocol, destination port)
-type securityPolicyStats struct {
+type SecurityPolicyStatsCollector struct {
 	includeIp bool
 
 	stateLock               sync.Mutex
 	resultDestinationCounts SecurityPolicyStats
 }
 
-func DefaultSecurityPolicyStats() *securityPolicyStats {
-	return &securityPolicyStats{
+func DefaultSecurityPolicyStatsCollector() *SecurityPolicyStatsCollector {
+	return &SecurityPolicyStatsCollector{
 		includeIp:               false,
 		resultDestinationCounts: SecurityPolicyStats{},
 	}
 }
 
-func (self *securityPolicyStats) AddDestination(ipPath *IpPath, result SecurityPolicyResult, count uint64) {
+func (self *SecurityPolicyStatsCollector) AddDestination(ipPath *IpPath, result SecurityPolicyResult, count uint64) {
 	var destination SecurityDestination
 	if self.includeIp {
 		destination = newSecurityDestination(ipPath)
@@ -336,7 +356,7 @@ func (self *securityPolicyStats) AddDestination(ipPath *IpPath, result SecurityP
 	destinationCounts[destination] += count
 }
 
-func (self *securityPolicyStats) AddSource(ipPath *IpPath, result SecurityPolicyResult, count uint64) {
+func (self *SecurityPolicyStatsCollector) AddSource(ipPath *IpPath, result SecurityPolicyResult, count uint64) {
 	var destination SecurityDestination
 	if self.includeIp {
 		destination = newSecuritySource(ipPath)
@@ -356,7 +376,7 @@ func (self *securityPolicyStats) AddSource(ipPath *IpPath, result SecurityPolicy
 	destinationCounts[destination] += count
 }
 
-func (self *securityPolicyStats) Stats(reset bool) SecurityPolicyStats {
+func (self *SecurityPolicyStatsCollector) Stats(reset bool) SecurityPolicyStats {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 

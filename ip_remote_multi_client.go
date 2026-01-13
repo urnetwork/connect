@@ -179,6 +179,9 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		DefaultReconnectScale: 1.0,
 		DefaultUlimit:         0,
 
+		IngressSecurityPolicyGenerator: DefaultIngressSecurityPolicyWithStats,
+		EgressSecurityPolicyGenerator:  DefaultEgressSecurityPolicyWithStats,
+
 		RemoteUserNatMultiClientMonitorSettings: *DefaultRemoteUserNatMultiClientMonitorSettings(),
 	}
 }
@@ -258,6 +261,9 @@ type MultiClientSettings struct {
 	DefaultReconnectScale float64
 	// used when ulimit is not set in a custom performance profile
 	DefaultUlimit int
+
+	IngressSecurityPolicyGenerator func(*SecurityPolicyStatsCollector) SecurityPolicy
+	EgressSecurityPolicyGenerator  func(*SecurityPolicyStatsCollector) SecurityPolicy
 
 	RemoteUserNatMultiClientMonitorSettings
 }
@@ -349,7 +355,7 @@ type RemoteUserNatMultiClient struct {
 	windows map[WindowType]*multiClientWindow
 	monitor MultiClientMonitor
 
-	securityPolicyStats   *securityPolicyStats
+	securityPolicyStats   *SecurityPolicyStatsCollector
 	securityPolicy        SecurityPolicy
 	ingressSecurityPolicy SecurityPolicy
 
@@ -391,7 +397,7 @@ func NewRemoteUserNatMultiClient(
 ) *RemoteUserNatMultiClient {
 	cancelCtx, cancel := context.WithCancel(ctx)
 
-	securityPolicyStats := DefaultSecurityPolicyStats()
+	securityPolicyStats := DefaultSecurityPolicyStatsCollector()
 
 	multiClient := &RemoteUserNatMultiClient{
 		ctx:                   cancelCtx,
@@ -401,8 +407,8 @@ func NewRemoteUserNatMultiClient(
 		settings:              settings,
 		windows:               map[WindowType]*multiClientWindow{},
 		securityPolicyStats:   securityPolicyStats,
-		securityPolicy:        DefaultEgressSecurityPolicyWithStats(securityPolicyStats),
-		ingressSecurityPolicy: DefaultIngressSecurityPolicyWithStats(securityPolicyStats),
+		securityPolicy:        settings.EgressSecurityPolicyGenerator(securityPolicyStats),
+		ingressSecurityPolicy: settings.IngressSecurityPolicyGenerator(securityPolicyStats),
 		provideMode:           provideMode,
 		ip4PathUpdates:        map[Ip4Path]*multiClientChannelUpdate{},
 		ip6PathUpdates:        map[Ip6Path]*multiClientChannelUpdate{},

@@ -10,7 +10,7 @@ import (
 	mathrand "math/rand"
 	"net"
 	// "syscall"
-	"runtime/debug"
+	// "runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -2464,8 +2464,9 @@ func tcpFlagsString(tcp *layers.TCP) string {
 
 func DefaultRemoteUserNatProviderSettings() *RemoteUserNatProviderSettings {
 	return &RemoteUserNatProviderSettings{
-		WriteTimeout:    30 * time.Second,
-		ProtocolVersion: DefaultProtocolVersion,
+		WriteTimeout:                  30 * time.Second,
+		ProtocolVersion:               DefaultProtocolVersion,
+		EgressSecurityPolicyGenerator: DefaultEgressSecurityPolicyWithStats,
 	}
 }
 
@@ -2473,6 +2474,8 @@ type RemoteUserNatProviderSettings struct {
 	WriteTimeout time.Duration
 
 	ProtocolVersion int
+
+	EgressSecurityPolicyGenerator func(*SecurityPolicyStatsCollector) SecurityPolicy
 }
 
 type RemoteUserNatProvider struct {
@@ -2499,7 +2502,7 @@ func NewRemoteUserNatProvider(
 	userNatProvider := &RemoteUserNatProvider{
 		client:         client,
 		localUserNat:   localUserNat,
-		securityPolicy: DefaultEgressSecurityPolicy(),
+		securityPolicy: settings.EgressSecurityPolicyGenerator(DefaultSecurityPolicyStatsCollector()),
 		settings:       settings,
 	}
 
