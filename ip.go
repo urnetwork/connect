@@ -10,6 +10,7 @@ import (
 	mathrand "math/rand"
 	"net"
 	// "syscall"
+	// "runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -739,10 +740,10 @@ func (self *UdpSequence) Run() {
 	self.UpdateLastActivityTime()
 	glog.V(2).Infof("[init]connect success\n")
 
-	if udpConn, ok := socket.(*net.UDPConn); ok {
-		udpConn.SetReadBuffer(int(self.udpBufferSettings.MaxWindowSize))
-		udpConn.SetWriteBuffer(int(self.udpBufferSettings.MaxWindowSize))
-	}
+	// if udpConn, ok := socket.(*net.UDPConn); ok {
+	// 	udpConn.SetReadBuffer(int(self.udpBufferSettings.MaxWindowSize))
+	// 	udpConn.SetWriteBuffer(int(self.udpBufferSettings.MaxWindowSize))
+	// }
 	// f, _ := udpConn.File()
 	// fd := SocketHandle(f.Fd())
 	// syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_MTU, self.udpBufferSettings.Mtu)
@@ -817,6 +818,18 @@ func (self *UdpSequence) Run() {
 	go HandleError(func() {
 		defer self.cancel()
 
+		defer func() {
+			for {
+				select {
+				case packet, ok := <-readPackets:
+					if !ok {
+						return
+					}
+					receive(packet)
+				}
+			}
+		}()
+
 		for {
 			select {
 			case <-self.ctx.Done():
@@ -831,7 +844,10 @@ func (self *UdpSequence) Run() {
 	}, self.cancel)
 
 	go HandleError(func() {
-		defer self.cancel()
+		defer func() {
+			self.cancel()
+			close(readPackets)
+		}()
 
 		buffer := make([]byte, self.udpBufferSettings.ReadBufferByteCount)
 
@@ -1186,10 +1202,22 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
 
-		if !tcp.SYN {
-			if sequence, ok := self.sequences[bufferId]; ok {
-				return sequence
+		if sequence, ok := self.sequences[bufferId]; ok {
+			if tcp.RST {
+				// drop the packet
+				sequence.Cancel()
+				delete(self.sequences, bufferId)
+				sourceSequences := self.sourceSequences[sequence.source]
+				delete(sourceSequences, bufferId)
+				if 0 == len(sourceSequences) {
+					delete(self.sourceSequences, sequence.source)
+				}
+				return nil
 			}
+			return sequence
+		}
+
+		if !tcp.SYN {
 			// drop the packet; only create a new sequence on SYN
 			MessagePoolReturn(ipPacket)
 			glog.V(2).Infof("[lnr]tcp drop no syn (%s)\n", tcpFlagsString(tcp))
@@ -1197,16 +1225,15 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 		}
 
 		// else new sequence
-		if sequence, ok := self.sequences[bufferId]; ok {
-			sequence.Cancel()
-			delete(self.sequences, bufferId)
-			sourceSequences := self.sourceSequences[sequence.source]
-			delete(sourceSequences, bufferId)
-			if 0 == len(sourceSequences) {
-				delete(self.sourceSequences, sequence.source)
-			}
-		}
-
+		// if sequence, ok := self.sequences[bufferId]; ok {
+		// 	sequence.Cancel()
+		// 	delete(self.sequences, bufferId)
+		// 	sourceSequences := self.sourceSequences[sequence.source]
+		// 	delete(sourceSequences, bufferId)
+		// 	if 0 == len(sourceSequences) {
+		// 		delete(self.sourceSequences, sequence.source)
+		// 	}
+		// }
 		if 0 < self.tcpBufferSettings.UserLimit {
 			// limit the total connections per source to avoid blowing up the ulimit
 			if sourceSequences := self.sourceSequences[source]; self.tcpBufferSettings.UserLimit < len(sourceSequences) {
@@ -1422,52 +1449,12 @@ func (self *TcpSequence) Run() {
 		MessagePoolReturn(packet)
 	}
 
-	closed := false
-	// send a final FIN+ACK
-	defer func() {
-		if closed {
-			glog.V(2).Infof("[r]closed gracefully\n")
-		} else {
-			glog.V(2).Infof("[r]closed unexpected sending RST\n")
-			var packet []byte
-			var err error
-			func() {
-				self.mutex.Lock()
-				defer self.mutex.Unlock()
-
-				packet, err = self.RstAck()
-			}()
-			if err == nil {
-				receive(packet)
-			}
-		}
-	}()
-
-	// connect to upstream before sending the syn+ack
-	glog.V(2).Infof("[init]tcp connect\n")
-	socket, err := self.tcpBufferSettings.DialContext(
-		self.ctx,
-		"tcp",
-		self.IpPath().DestinationHostPort(),
-	)
-	if err != nil {
-		glog.V(1).Infof("[init]tcp connect error = %s\n", err)
-		return
-	}
-	self.UpdateLastActivityTime()
-	glog.V(2).Infof("[init]connect success\n")
-
-	defer socket.Close()
-	if tcpConn, ok := socket.(*net.TCPConn); ok {
-		tcpConn.SetKeepAlive(false)
-		tcpConn.SetNoDelay(true)
-		tcpConn.SetReadBuffer(int(self.tcpBufferSettings.MaxWindowSize))
-		tcpConn.SetWriteBuffer(int(self.tcpBufferSettings.MaxWindowSize))
-	}
 	// f, _ := tcpConn.File()
 	// fd := SocketHandle(f.Fd())
 	// syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_MTU, self.tcpBufferSettings.Mtu)
 
+	var packet []byte
+	var packetErr error
 	for syn := false; !syn; {
 		checkpointId := self.idleCondition.Checkpoint()
 		select {
@@ -1479,8 +1466,6 @@ func (self *TcpSequence) Run() {
 			if sendItem.tcp.SYN {
 				glog.V(2).Infof("[init]SYN\n")
 
-				var packet []byte
-				var err error
 				func() {
 					self.mutex.Lock()
 					defer self.mutex.Unlock()
@@ -1526,13 +1511,9 @@ func (self *TcpSequence) Run() {
 					}
 					glog.V(2).Infof("[init]window=%d/%d, receive=%d/%d\n", self.windowSize, self.windowScale, self.receiveWindowSize, self.receiveWindowScale)
 
-					packet, err = self.SynAck()
+					packet, packetErr = self.SynAck()
 					self.receiveSeq += 1
 				}()
-				if err == nil {
-					glog.V(2).Infof("[init]receive SYN+ACK\n")
-					receive(packet)
-				}
 
 				syn = true
 			} else {
@@ -1549,6 +1530,35 @@ func (self *TcpSequence) Run() {
 			// else there pending updates
 		}
 	}
+
+	if packetErr != nil {
+		return
+	}
+
+	// connect to upstream before sending the syn+ack
+	glog.V(2).Infof("[init]tcp connect\n")
+	socket, err := self.tcpBufferSettings.DialContext(
+		self.ctx,
+		"tcp",
+		self.IpPath().DestinationHostPort(),
+	)
+	if err != nil {
+		glog.V(1).Infof("[init]tcp connect error = %s\n", err)
+		return
+	}
+	self.UpdateLastActivityTime()
+	glog.V(2).Infof("[init]connect success\n")
+
+	defer socket.Close()
+	if tcpConn, ok := socket.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetNoDelay(true)
+		// tcpConn.SetReadBuffer(int(self.tcpBufferSettings.MaxWindowSize))
+		// tcpConn.SetWriteBuffer(int(self.tcpBufferSettings.MaxWindowSize))
+	}
+
+	glog.V(2).Infof("[init]receive SYN+ACK\n")
+	receive(packet)
 
 	/*
 		if v, ok := socket.(*net.TCPConn); ok {
@@ -1655,6 +1665,18 @@ func (self *TcpSequence) Run() {
 	go HandleError(func() {
 		defer self.cancel()
 
+		defer func() {
+			for {
+				select {
+				case packet, ok := <-readPackets:
+					if !ok {
+						return
+					}
+					receive(packet)
+				}
+			}
+		}()
+
 		for {
 			select {
 			case <-self.ctx.Done():
@@ -1669,7 +1691,29 @@ func (self *TcpSequence) Run() {
 	}, self.cancel)
 
 	go HandleError(func() {
-		defer self.cancel()
+		fin := false
+		defer func() {
+			self.cancel()
+
+			if !fin {
+				var packet []byte
+				var err error
+				func() {
+					self.mutex.Lock()
+					defer self.mutex.Unlock()
+
+					packet, err = self.RstAck()
+				}()
+				if err == nil {
+					select {
+					case readPackets <- packet:
+						fin = true
+					}
+				}
+			}
+
+			close(readPackets)
+		}()
 
 		buffer := make([]byte, self.tcpBufferSettings.ReadBufferByteCount)
 
@@ -1755,21 +1799,21 @@ func (self *TcpSequence) Run() {
 					// closed (FIN)
 					// propagate the FIN and close the sequence
 					glog.V(2).Infof("[final]FIN\n")
-					var packet []byte
-					var err error
+					var finPacket []byte
+					var finErr error
 					func() {
 						self.mutex.Lock()
 						defer self.mutex.Unlock()
 
-						packet, err = self.FinAck()
+						finPacket, finErr = self.FinAck()
 						self.receiveSeq += 1
 					}()
-					if err == nil {
-						closed = true
+					if finErr == nil {
 						select {
 						case <-self.ctx.Done():
-							MessagePoolReturn(packet)
-						case readPackets <- packet:
+							MessagePoolReturn(finPacket)
+						case readPackets <- finPacket:
+							fin = true
 						}
 					}
 					return
@@ -1847,17 +1891,12 @@ func (self *TcpSequence) Run() {
 	nonBlockingByteCount := uint32(0)
 	blockingByteCount := uint32(0)
 	fin := false
-	for sendIter := uint64(0); ; sendIter += 1 {
+	for sendIter := uint64(0); !fin; sendIter += 1 {
 		checkpointId := self.idleCondition.Checkpoint()
 		select {
 		case <-self.ctx.Done():
 			return
 		case sendItem := <-self.sendItems:
-			if fin {
-				MessagePoolReturn(sendItem.ipPacket)
-				continue
-			}
-
 			if glog.V(2) {
 				if "ACK" != tcpFlagsString(sendItem.tcp) {
 					glog.Infof("[r%d]receive(%d %s)\n", sendIter, len(sendItem.tcp.Payload), tcpFlagsString(sendItem.tcp))
@@ -1868,7 +1907,9 @@ func (self *TcpSequence) Run() {
 				// a RST typically appears for a bad TCP segment
 				glog.V(2).Infof("[r%d]RST\n", sendIter)
 				MessagePoolReturn(sendItem.ipPacket)
+				// FIXME
 				return
+				// continue
 			}
 
 			drop := false
@@ -1878,7 +1919,7 @@ func (self *TcpSequence) Run() {
 				self.mutex.Lock()
 				defer self.mutex.Unlock()
 
-				if self.sendSeq != sendItem.tcp.Seq {
+				if self.sendSeq != sendItem.tcp.Seq || sendItem.tcp.SYN {
 					// a retransmit
 					// since the transfer from local to remote is lossless and preserves order,
 					// the packet is already pending. Ignore.
@@ -2001,6 +2042,11 @@ func (self *TcpSequence) Run() {
 			}
 			// else there pending updates
 		}
+	}
+
+	// wait for `writePayloads` to finish
+	select {
+	case <-self.ctx.Done():
 	}
 }
 
@@ -2418,8 +2464,9 @@ func tcpFlagsString(tcp *layers.TCP) string {
 
 func DefaultRemoteUserNatProviderSettings() *RemoteUserNatProviderSettings {
 	return &RemoteUserNatProviderSettings{
-		WriteTimeout:    30 * time.Second,
-		ProtocolVersion: DefaultProtocolVersion,
+		WriteTimeout:                  30 * time.Second,
+		ProtocolVersion:               DefaultProtocolVersion,
+		EgressSecurityPolicyGenerator: DefaultEgressSecurityPolicyWithStats,
 	}
 }
 
@@ -2427,6 +2474,8 @@ type RemoteUserNatProviderSettings struct {
 	WriteTimeout time.Duration
 
 	ProtocolVersion int
+
+	EgressSecurityPolicyGenerator func(*SecurityPolicyStatsCollector) SecurityPolicy
 }
 
 type RemoteUserNatProvider struct {
@@ -2453,7 +2502,7 @@ func NewRemoteUserNatProvider(
 	userNatProvider := &RemoteUserNatProvider{
 		client:         client,
 		localUserNat:   localUserNat,
-		securityPolicy: DefaultEgressSecurityPolicy(),
+		securityPolicy: settings.EgressSecurityPolicyGenerator(DefaultSecurityPolicyStatsCollector()),
 		settings:       settings,
 	}
 
