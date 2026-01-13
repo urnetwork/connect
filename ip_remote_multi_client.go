@@ -1081,8 +1081,8 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 
 						if initRace != nil {
 							// copy the ip path since the first packet may not be ultimately retained to the end of the race
-							ipPathCopy := update.ipPath.Copy()
-							self.scheduleCompleteRace(ipPathCopy, initRace, initRaceEarlyComplete)
+							// ipPathCopy := update.ipPath.Copy()
+							self.scheduleCompleteRace(update.ipPath, initRace, initRaceEarlyComplete)
 						}
 
 						if 0 < len(abandonedClients) {
@@ -1447,7 +1447,7 @@ func newMultiClientChannelUpdate(ctx context.Context, ipPath *IpPath) *multiClie
 	return &multiClientChannelUpdate{
 		ctx:    cancelCtx,
 		cancel: cancel,
-		ipPath: ipPath,
+		ipPath: ipPath.Copy(),
 	}
 }
 

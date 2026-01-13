@@ -89,6 +89,7 @@ func (self *EgressSecurityPolicy) inspect(provideMode protocol.ProvideMode, ipPa
 	// - only public unicast network destinations
 	// - block insecure or known unencrypted traffic
 
+	// FIXME allow local traffic for testing
 	if !isPublicUnicast(ipPath.DestinationIp) {
 		return SecurityPolicyResultIncident, nil
 	}

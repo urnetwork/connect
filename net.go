@@ -20,8 +20,8 @@ func DefaultConnectSettings() *ConnectSettings {
 	}
 	return &ConnectSettings{
 		RequestTimeout:   15 * time.Second,
-		ConnectTimeout:   5 * time.Second,
-		TlsTimeout:       5 * time.Second,
+		ConnectTimeout:   15 * time.Second,
+		TlsTimeout:       15 * time.Second,
 		HandshakeTimeout: 5 * time.Second,
 		IdleConnTimeout:  90 * time.Second,
 		KeepAliveTimeout: 5 * time.Second,

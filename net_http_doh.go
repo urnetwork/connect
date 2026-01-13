@@ -21,8 +21,11 @@ import (
 func DefaultDohSettings() *DohSettings {
 	return &DohSettings{
 		ConnectSettings: *DefaultConnectSettings(),
+		IpVersion:       4,
 	}
 }
+
+// FIXME DoH certs need to be included in the pinned certs
 
 // see:
 // https://developers.cloudflare.com/1.1.1.1/ip-addresses/
@@ -32,8 +35,8 @@ func dohUrlsIpv4() []string {
 	return []string{
 		"https://1.1.1.1/dns-query",
 		"https://1.0.0.1/dns-query",
-		"https://9.9.9.9:5053/dns-query",
-		"https://149.112.112.112:5053/dns-query",
+		// "https://9.9.9.9:5053/dns-query",
+		// "https://149.112.112.112:5053/dns-query",
 		"https://208.67.222.222/dns-query",
 		"https://208.67.220.220/dns-query",
 	}
@@ -43,8 +46,8 @@ func dohUrlsIpv6() []string {
 	return []string{
 		"https://[2606:4700:4700::1111]/dns-query",
 		"https://[2606:4700:4700::1001]/dns-query",
-		"https://[2620:fe::fe]:5053/dns-query",
-		"https://[2620:fe::9]:5053/dns-query",
+		// "https://[2620:fe::fe]:5053/dns-query",
+		// "https://[2620:fe::9]:5053/dns-query",
 		"https://[2620:119:35::35]/dns-query",
 		"https://[2620:119:53::53]/dns-query",
 	}
@@ -52,6 +55,7 @@ func dohUrlsIpv6() []string {
 
 type DohSettings struct {
 	ConnectSettings
+	IpVersion int
 }
 
 type DohCache struct {
@@ -68,7 +72,8 @@ func NewDohCache(settings *DohSettings) *DohCache {
 		Transport: &http.Transport{
 			DialContext:         settings.DialContext,
 			TLSHandshakeTimeout: settings.TlsTimeout,
-			TLSClientConfig:     settings.TlsConfig,
+			// FIXME add the doh server certs to our pinned certs
+			// TLSClientConfig:     settings.TlsConfig,
 		},
 	}
 
@@ -105,7 +110,7 @@ func (self *DohCache) Query(ctx context.Context, recordType string, domain strin
 		return ips
 	}
 
-	ipTtls := DohQueryWithClient(ctx, self.httpClient, 0, q.RecordType, self.settings, q.Domain)
+	ipTtls := DohQueryWithClient(ctx, self.httpClient, self.settings.IpVersion, q.RecordType, self.settings, q.Domain)
 	r := map[netip.Addr]time.Time{}
 	for ip, ttlSeconds := range ipTtls {
 		r[ip] = now.Add(time.Duration(ttlSeconds) * time.Second)
@@ -161,6 +166,9 @@ func DohQueryWithClient(
 ) map[netip.Addr]int {
 	// run all the queries in parallel to all servers
 
+	queryCtx, queryCancel := context.WithCancel(ctx)
+	defer queryCancel()
+
 	switch recordType {
 	case "A", "AAAA":
 	default:
@@ -181,7 +189,7 @@ func DohQueryWithClient(
 
 		requestUrl := fmt.Sprintf("%s?%s", dohUrl, params.Encode())
 
-		request, err := http.NewRequestWithContext(ctx, "GET", requestUrl, nil)
+		request, err := http.NewRequestWithContext(queryCtx, "GET", requestUrl, nil)
 		if err != nil {
 			return
 		}
@@ -192,10 +200,12 @@ func DohQueryWithClient(
 
 		response, err := httpClient.Do(request)
 		if err != nil {
+			// fmt.Printf("DOH err=%s\n", err)
 			return
 		}
 		defer response.Body.Close()
 		if response.StatusCode != http.StatusOK {
+			// fmt.Printf("DOH BAD status=%d\n", response.StatusCode)
 			return
 		}
 
@@ -207,10 +217,12 @@ func DohQueryWithClient(
 		dohResponse := &DohResponse{}
 		err = json.Unmarshal(data, dohResponse)
 		if err != nil {
+			// fmt.Printf("DOH UNMARSHAL err=%s\n", err)
 			return
 		}
 
 		if dohResponse.Status != 0 {
+			// fmt.Printf("DOH BAD RESPONSE %v\n", dohResponse)
 			return
 		}
 
@@ -242,25 +254,24 @@ func DohQueryWithClient(
 		for _, domain := range domains {
 			go HandleError(func() {
 				ips := query(dohUrl, domain)
-				select {
-				case out <- ips:
-				case <-ctx.Done():
+				if 0 < len(ips) {
+					select {
+					case out <- ips:
+					case <-queryCtx.Done():
+					}
 				}
 			})
 		}
 	}
 
 	mergedIps := map[netip.Addr]int{}
-	for range dohUrls {
-		for range domains {
-			select {
-			case ips := <-out:
-				for ip, ttl := range ips {
-					mergedIps[ip] = max(mergedIps[ip], ttl)
-				}
-			case <-ctx.Done():
-			}
+	select {
+	case <-queryCtx.Done():
+	case ips := <-out:
+		for ip, ttl := range ips {
+			mergedIps[ip] = max(mergedIps[ip], ttl)
 		}
+	case <-time.After(settings.RequestTimeout):
 	}
 
 	return mergedIps
