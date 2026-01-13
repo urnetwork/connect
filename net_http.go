@@ -1031,9 +1031,6 @@ func (self *clientDialer) WsDialer(settings *ClientStrategySettings) *websocket.
 			// WriteBufferSize: size,
 			// WriteBufferPool: pool,
 			EnableCompression: false,
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-			},
 		}
 	}
 	return self.websocketDialer
