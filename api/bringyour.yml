@@ -1778,6 +1778,12 @@ components:
           type: boolean
         wallet_auth:
           $ref: "#/components/schemas/WalletAuthArgs"
+        referral_code:
+          type: string
+          description: Optional referral code of the network that referred this new network.
+        balance_code:
+          type: string
+          description: Optional balance code to add transfer balance to the new network.
 
     NetworkCreateResult:
       type: object
