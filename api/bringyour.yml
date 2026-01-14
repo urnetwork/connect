@@ -3576,6 +3576,8 @@ components:
         end_time:
           description: datetime
           type: string
+        secret:
+          type: string
 
     NetworkBalanceCodesError:
       type: object
