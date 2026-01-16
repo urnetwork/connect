@@ -643,6 +643,7 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClien
 						}
 
 						client = update.client
+						update.client = nil
 
 						delete(self.ip4PathUpdates, ip4Path)
 
@@ -738,6 +739,7 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClien
 						}
 
 						client = update.client
+						update.client = nil
 
 						delete(self.ip6PathUpdates, ip6Path)
 
@@ -922,7 +924,8 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 	sendPacket *parsedPacket,
 	timeout time.Duration,
 ) (success bool) {
-	self.updateClientPath(sendPacket.ipPath, func(update *multiClientChannelUpdate) {
+	ipPath := sendPacket.ipPath
+	self.updateClientPath(ipPath, func(update *multiClientChannelUpdate) {
 		enterTime := time.Now()
 
 		currentClient := func() *multiClientChannel {
@@ -1086,8 +1089,6 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 						}()
 
 						if initRace != nil {
-							// copy the ip path since the first packet may not be ultimately retained to the end of the race
-							// ipPathCopy := update.ipPath.Copy()
 							self.scheduleCompleteRace(update.ipPath, initRace, initRaceEarlyComplete)
 						}
 
@@ -1234,14 +1235,11 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 			// this client is not part of the race, drop
 			glog.Infof("[multi]receive client not part of race")
 		} else if len(state.packets) < self.settings.MultiRaceClientPacketMaxCount && race.packetCount < self.settings.MultiRacePacketMaxCount {
-			// note that `MessagePoolShare*` will not work on the packet
-			// since the packet is typically a slice of the received transfer frame
-			ipPathCopy := ipPath.Copy()
 			packetCopy, pooled := MessagePoolCopyDetailed(packet)
 			receivePacket := &receivePacket{
 				Source:      source,
 				ProvideMode: provideMode,
-				IpPath:      ipPathCopy,
+				IpPath:      ipPath,
 				Packet:      packetCopy,
 				Pooled:      pooled,
 			}
@@ -1360,7 +1358,7 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 						client := orderedClients[len(orderedClients)-1]
 
 						update.client = client
-						receivePackets = race.clientStates[update.client].packets
+						receivePackets = race.clientStates[client].packets
 						for _, p := range receivePackets {
 							if p.Pooled {
 								returnPackets = append(returnPackets, p)
@@ -1453,7 +1451,7 @@ func newMultiClientChannelUpdate(ctx context.Context, ipPath *IpPath) *multiClie
 	return &multiClientChannelUpdate{
 		ctx:    cancelCtx,
 		cancel: cancel,
-		ipPath: ipPath.Copy(),
+		ipPath: ipPath,
 	}
 }
 
@@ -1481,7 +1479,7 @@ func (self *multiClientChannelUpdate) IsDone() bool {
 
 func (self *multiClientChannelUpdate) Close() {
 	self.cancel()
-	self.client = nil
+	// self.client = nil
 	self.clearRace()
 }
 
@@ -1806,12 +1804,12 @@ func (self *multiClientWindow) resize() {
 			// note for fixed destination size, the destination might still be aliased with multiple clients
 			// TODO it's still not clear why one client might stop working occasionally
 
-			effectiveByteCountPerSecond := stats.EffectiveByteCountPerSecond()
-			expectedByteCountPerSecond := stats.ExpectedByteCountPerSecond()
-
-			healthy := (0 < effectiveByteCountPerSecond || 0 < expectedByteCountPerSecond) && stats.unhealthyDuration < self.settings.StatsWindowMaxUnhealthyDuration
+			healthy := stats.unhealthyDuration < self.settings.StatsWindowMaxUnhealthyDuration
 
 			printStats := func(status string) {
+				effectiveByteCountPerSecond := stats.EffectiveByteCountPerSecond()
+				expectedByteCountPerSecond := stats.ExpectedByteCountPerSecond()
+
 				glog.Infof(
 					"[multi]%s [%s]: h=%d+%dms/u=%d+%dms effective=%db/s expected=%db/s send=%db sendNack=%db receive=%db\n",
 					status,

@@ -2881,6 +2881,13 @@ func ParseIpPathWithPayload(ipPacket []byte) (*IpPath, []byte, error) {
 	case 4:
 		ipv4 := layers.IPv4{}
 		ipv4.DecodeFromBytes(ipPacket, gopacket.NilDecodeFeedback)
+
+		sourceIpCopy := make(net.IP, len(ipv4.SrcIP))
+		copy(sourceIpCopy, ipv4.SrcIP)
+
+		destinationIpCopy := make(net.IP, len(ipv4.DstIP))
+		copy(destinationIpCopy, ipv4.DstIP)
+
 		switch ipv4.Protocol {
 		case layers.IPProtocolUDP:
 			udp := layers.UDP{}
@@ -2889,9 +2896,9 @@ func ParseIpPathWithPayload(ipPacket []byte) (*IpPath, []byte, error) {
 			return &IpPath{
 				Version:         int(ipVersion),
 				Protocol:        IpProtocolUdp,
-				SourceIp:        ipv4.SrcIP,
+				SourceIp:        sourceIpCopy,
 				SourcePort:      int(udp.SrcPort),
-				DestinationIp:   ipv4.DstIP,
+				DestinationIp:   destinationIpCopy,
 				DestinationPort: int(udp.DstPort),
 			}, udp.Payload, nil
 		case layers.IPProtocolTCP:
@@ -2901,9 +2908,9 @@ func ParseIpPathWithPayload(ipPacket []byte) (*IpPath, []byte, error) {
 			return &IpPath{
 				Version:         int(ipVersion),
 				Protocol:        IpProtocolTcp,
-				SourceIp:        ipv4.SrcIP,
+				SourceIp:        sourceIpCopy,
 				SourcePort:      int(tcp.SrcPort),
-				DestinationIp:   ipv4.DstIP,
+				DestinationIp:   destinationIpCopy,
 				DestinationPort: int(tcp.DstPort),
 			}, tcp.Payload, nil
 		default:
@@ -2913,6 +2920,13 @@ func ParseIpPathWithPayload(ipPacket []byte) (*IpPath, []byte, error) {
 	case 6:
 		ipv6 := layers.IPv6{}
 		ipv6.DecodeFromBytes(ipPacket, gopacket.NilDecodeFeedback)
+
+		sourceIpCopy := make(net.IP, len(ipv6.SrcIP))
+		copy(sourceIpCopy, ipv6.SrcIP)
+
+		destinationIpCopy := make(net.IP, len(ipv6.DstIP))
+		copy(destinationIpCopy, ipv6.DstIP)
+
 		switch ipv6.NextHeader {
 		case layers.IPProtocolUDP:
 			udp := layers.UDP{}
@@ -2921,9 +2935,9 @@ func ParseIpPathWithPayload(ipPacket []byte) (*IpPath, []byte, error) {
 			return &IpPath{
 				Version:         int(ipVersion),
 				Protocol:        IpProtocolUdp,
-				SourceIp:        ipv6.SrcIP,
+				SourceIp:        sourceIpCopy,
 				SourcePort:      int(udp.SrcPort),
-				DestinationIp:   ipv6.DstIP,
+				DestinationIp:   destinationIpCopy,
 				DestinationPort: int(udp.DstPort),
 			}, udp.Payload, nil
 		case layers.IPProtocolTCP:
@@ -2933,9 +2947,9 @@ func ParseIpPathWithPayload(ipPacket []byte) (*IpPath, []byte, error) {
 			return &IpPath{
 				Version:         int(ipVersion),
 				Protocol:        IpProtocolTcp,
-				SourceIp:        ipv6.SrcIP,
+				SourceIp:        sourceIpCopy,
 				SourcePort:      int(tcp.SrcPort),
-				DestinationIp:   ipv6.DstIP,
+				DestinationIp:   destinationIpCopy,
 				DestinationPort: int(tcp.DstPort),
 			}, tcp.Payload, nil
 		default:
@@ -2948,22 +2962,22 @@ func ParseIpPathWithPayload(ipPacket []byte) (*IpPath, []byte, error) {
 	}
 }
 
-func (self *IpPath) Copy() *IpPath {
-	sourceIpCopy := make(net.IP, len(self.SourceIp))
-	copy(sourceIpCopy, self.SourceIp)
+// func (self *IpPath) Copy() *IpPath {
+// 	sourceIpCopy := make(net.IP, len(self.SourceIp))
+// 	copy(sourceIpCopy, self.SourceIp)
 
-	destinationIpCopy := make(net.IP, len(self.DestinationIp))
-	copy(destinationIpCopy, self.DestinationIp)
+// 	destinationIpCopy := make(net.IP, len(self.DestinationIp))
+// 	copy(destinationIpCopy, self.DestinationIp)
 
-	return &IpPath{
-		Version:         self.Version,
-		Protocol:        self.Protocol,
-		SourceIp:        sourceIpCopy,
-		SourcePort:      self.SourcePort,
-		DestinationIp:   destinationIpCopy,
-		DestinationPort: self.DestinationPort,
-	}
-}
+// 	return &IpPath{
+// 		Version:         self.Version,
+// 		Protocol:        self.Protocol,
+// 		SourceIp:        sourceIpCopy,
+// 		SourcePort:      self.SourcePort,
+// 		DestinationIp:   destinationIpCopy,
+// 		DestinationPort: self.DestinationPort,
+// 	}
+// }
 
 func (self *IpPath) SourceHostPort() string {
 	return net.JoinHostPort(
