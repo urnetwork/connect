@@ -168,8 +168,8 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		StatsWindowWarnUnhealthyDuration: 5 * time.Second,
 		// StatsWindowKeepHealthiestCount:   2,
 		// the effective byte count is per stats window `StatsWindowDuration`
-		StatsWindowMinHealthyEffectiveSendByteCount:    kib(1),
-		StatsWindowMinHealthyEffectiveReceiveByteCount: kib(32),
+		// StatsWindowMinHealthyEffectiveSendByteCount:    kib(1),
+		// StatsWindowMinHealthyEffectiveReceiveByteCount: kib(32),
 
 		MaxClientLifetime: 60 * time.Minute,
 
@@ -240,8 +240,8 @@ type MultiClientSettings struct {
 	StatsWindowMaxUnhealthyDuration  time.Duration
 	StatsWindowWarnUnhealthyDuration time.Duration
 	// StatsWindowKeepHealthiestCount                 int
-	StatsWindowMinHealthyEffectiveSendByteCount    ByteCount
-	StatsWindowMinHealthyEffectiveReceiveByteCount ByteCount
+	// StatsWindowMinHealthyEffectiveSendByteCount    ByteCount
+	// StatsWindowMinHealthyEffectiveReceiveByteCount ByteCount
 
 	// active clients longer than this lifetime will not be forced closed
 	// new connections will be routed to new clients
@@ -1113,24 +1113,24 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 					raceOrderedClients = orderedClients
 				}
 
-				if 0 < timeout {
-					var wg sync.WaitGroup
+				// if 0 < timeout {
+				var wg sync.WaitGroup
 
-					for _, client := range raceOrderedClients {
-						wg.Add(1)
-						go HandleError(func() {
-							defer wg.Done()
+				for _, client := range raceOrderedClients {
+					wg.Add(1)
+					go HandleError(func() {
+						defer wg.Done()
 
-							send(client)
-						})
-					}
-
-					wg.Wait()
-				} else {
-					for _, client := range raceOrderedClients {
 						send(client)
-					}
+					})
 				}
+
+				wg.Wait()
+				// } else {
+				// 	for _, client := range raceOrderedClients {
+				// 		send(client)
+				// 	}
+				// }
 
 				if 0 < successCount.Load() {
 					success = true
@@ -3018,20 +3018,26 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 		self.coalesceEventBuckets()
 	}
 
+	// omit the latest two event buckets since they may be partial
+	var eventBuckets []*multiClientEventBucket
+	if 2 <= len(self.eventBuckets) {
+		eventBuckets = self.eventBuckets[0 : len(self.eventBuckets)-2]
+	}
+
 	windowDuration := time.Duration(0)
-	if 0 < len(self.eventBuckets) {
-		endTime := self.eventBuckets[len(self.eventBuckets)-1].eventTime
-		windowDuration = endTime.Sub(self.eventBuckets[0].createTime)
+	if 0 < len(eventBuckets) {
+		endTime := eventBuckets[len(eventBuckets)-1].eventTime
+		windowDuration = endTime.Sub(eventBuckets[0].createTime)
 	}
 	var firstSendAckTime time.Time
-	for _, eventBucket := range self.eventBuckets {
+	for _, eventBucket := range eventBuckets {
 		if 0 < eventBucket.sendAckCount {
 			firstSendAckTime = eventBucket.sendAckTime
 			break
 		}
 	}
 	var firstSendNackTime time.Time
-	for _, eventBucket := range self.eventBuckets {
+	for _, eventBucket := range eventBuckets {
 		if 0 < eventBucket.sendNackCount {
 			firstSendNackTime = eventBucket.sendNackTime
 			break
@@ -3103,19 +3109,19 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 		windowDuration:      windowDuration,
 		firstSendAckTime:    firstSendAckTime,
 		firstSendNackTime:   firstSendNackTime,
-		bucketCount:         len(self.eventBuckets),
+		bucketCount:         len(eventBuckets),
 	}
-	if 0 < len(self.eventBuckets) || !self.firstEventTime.IsZero() {
+	if 0 < len(eventBuckets) || !self.firstEventTime.IsZero() {
 		// var eventTime time.Time
-		// if 0 < len(self.eventBuckets) {
-		// 	eventTime = self.eventBuckets[len(self.eventBuckets)-1].eventTime
+		// if 0 < len(eventBuckets) {
+		// 	eventTime = eventBuckets[len(eventBuckets)-1].eventTime
 		// } else {
 		// 	eventTime = time.Now()
 		// }
 		eventTime := time.Now()
 
-		if 0 < len(self.eventBuckets) {
-			stats.lastEventTime = self.eventBuckets[len(self.eventBuckets)-1].eventTime
+		if 0 < len(eventBuckets) {
+			stats.lastEventTime = eventBuckets[len(eventBuckets)-1].eventTime
 		}
 
 		effectiveByteCountPerSecond := stats.EffectiveByteCountPerSecond()
@@ -3126,7 +3132,7 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 		}
 
 		effectiveSendByteCount, effectiveReceiveByteCount := stats.EffectiveByteCount()
-		healthy := self.settings.StatsWindowMinHealthyEffectiveSendByteCount <= effectiveSendByteCount && self.settings.StatsWindowMinHealthyEffectiveReceiveByteCount <= effectiveReceiveByteCount
+		healthy := (0 < effectiveSendByteCount) == (0 < effectiveReceiveByteCount)
 		if healthy {
 			if self.lastUnhealthyTime.IsZero() {
 				self.lastUnhealthyTime = eventTime
@@ -3162,7 +3168,7 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 		stats.netHealthyDuration = self.netHealthyDuration + stats.healthyDuration
 		stats.netUnhealthyDuration = self.netUnhealthyDuration + stats.unhealthyDuration
 		if self.firstEventTime.IsZero() {
-			self.firstEventTime = self.eventBuckets[0].createTime
+			self.firstEventTime = eventBuckets[0].createTime
 		}
 		stats.clientDuration = eventTime.Sub(self.firstEventTime)
 		stats.removeTime = self.firstEventTime.Add(self.settings.MaxClientLifetime)
