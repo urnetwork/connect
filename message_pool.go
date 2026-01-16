@@ -9,7 +9,6 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"golang.org/x/exp/maps"
@@ -42,16 +41,15 @@ const MessagePoolFlagShared = uint8(0x01)
 
 var InitialMessagePoolByteCount = mib(1)
 
-var nextId atomic.Uint64
-
 type messagePool struct {
 	size         int
 	pool         [][]byte
 	count        int
-	takenTags    [256]atomic.Uint64
-	returnedTags [256]atomic.Uint64
-	createdTags  [256]atomic.Uint64
+	takenTags    [256]uint64
+	returnedTags [256]uint64
+	createdTags  [256]uint64
 	stateLock    sync.Mutex
+	nextId       uint64
 }
 
 func newMessagePool(size int, maxCount int) *messagePool {
@@ -98,7 +96,8 @@ func (self *messagePool) Get() []byte {
 
 	// create a new message
 	poolMessage := make([]byte, self.size+MessagePoolMetaByteCount)
-	binary.BigEndian.PutUint64(poolMessage[self.size:], nextId.Add(1))
+	self.nextId += 1
+	binary.BigEndian.PutUint64(poolMessage[self.size:], self.nextId)
 	poolMessage[self.size+8] = 255
 	return poolMessage
 }
@@ -133,10 +132,17 @@ func poolStats(pools []*messagePool) {
 	for {
 		for _, pool := range pools {
 			for tag := range 256 {
-				taken := pool.takenTags[tag].Load()
+				var taken uint64
+				var returned uint64
+				var created uint64
+				func() {
+					pool.stateLock.Lock()
+					defer pool.stateLock.Unlock()
+					taken = pool.takenTags[tag]
+					returned = pool.returnedTags[tag]
+					created = pool.createdTags[tag]
+				}()
 				if 0 < taken {
-					returned := pool.returnedTags[tag].Load()
-					created := pool.createdTags[tag].Load()
 					ratio := float32(returned) / float32(taken)
 					reuse := float32(taken-created) / float32(taken)
 					var caller string
@@ -200,11 +206,15 @@ func debugTag() uint8 {
 
 func ResetMessagePoolStats() {
 	for _, pool := range orderedMessagePools() {
-		for tag := range 256 {
-			pool.takenTags[tag].Store(0)
-			pool.returnedTags[tag].Store(0)
-			pool.createdTags[tag].Store(0)
-		}
+		func() {
+			pool.stateLock.Lock()
+			defer pool.stateLock.Unlock()
+			for tag := range 256 {
+				pool.takenTags[tag] = 0
+				pool.returnedTags[tag] = 0
+				pool.createdTags[tag] = 0
+			}
+		}()
 	}
 }
 
@@ -213,9 +223,16 @@ func MessagePoolStats() map[int]map[int]float32 {
 	for _, pool := range orderedMessagePools() {
 		tagRatios := map[int]float32{}
 		for tag := range 256 {
-			taken := pool.takenTags[tag].Load()
+			var taken uint64
+			var returned uint64
+			func() {
+				pool.stateLock.Lock()
+				defer pool.stateLock.Unlock()
+				taken = pool.takenTags[tag]
+				returned = pool.returnedTags[tag]
+			}()
+
 			if 0 < taken {
-				returned := pool.returnedTags[tag].Load()
 				ratio := float32(returned) / float32(taken)
 				tagRatios[tag] = ratio
 			}
@@ -323,16 +340,18 @@ func MessagePoolGetDetailedWithTag(n int, tag uint8) ([]byte, bool) {
 	for _, pool := range orderedMessagePools {
 		if n <= pool.size {
 			poolMessage := pool.Get()
-			if poolMessage[pool.size+8] == 255 {
-				pool.createdTags[tag].Add(1)
-			}
+			c := poolMessage[pool.size+8] == 255
 			poolMessage[pool.size+8] = tag
-			pool.takenTags[tag].Add(1)
 			id := binary.BigEndian.Uint64(poolMessage[pool.size:])
 
 			func() {
 				pool.stateLock.Lock()
 				defer pool.stateLock.Unlock()
+
+				if c {
+					pool.createdTags[tag] += 1
+				}
+				pool.takenTags[tag] += 1
 
 				count := binary.BigEndian.Uint16(poolMessage[pool.size+10:])
 
@@ -362,6 +381,8 @@ func MessagePoolReturn(message []byte) bool {
 			poolMessage := message[:c]
 			id := binary.BigEndian.Uint64(poolMessage[pool.size:])
 
+			tag := poolMessage[pool.size+8]
+
 			r := false
 			func() {
 				pool.stateLock.Lock()
@@ -375,18 +396,17 @@ func MessagePoolReturn(message []byte) bool {
 					}
 				} else if count == 1 {
 					r = true
+					pool.returnedTags[tag] += 1
 				} else {
 					binary.BigEndian.PutUint16(poolMessage[pool.size+10:], count-1)
 				}
 			}()
 
 			if r {
-				tag := poolMessage[pool.size+8]
 				poolMessage[pool.size+8] = 0
 				poolMessage[pool.size+9] = 0
 				binary.BigEndian.PutUint16(poolMessage[pool.size+10:], 0)
 				pool.Put(poolMessage)
-				pool.returnedTags[tag].Add(1)
 				return true
 			}
 			return false

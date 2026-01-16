@@ -498,8 +498,8 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			handleCtx, handleCancel := context.WithCancel(self.ctx)
 			defer handleCancel()
 
-			readCounter := atomic.Uint64{}
-			writeCounter := atomic.Uint64{}
+			var readCounter atomic.Uint64
+			var writeCounter atomic.Uint64
 
 			send := make(chan []byte, self.settings.TransportBufferSize)
 			receive := make(chan []byte, self.settings.TransportBufferSize)
@@ -1040,8 +1040,8 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 
 			framer := NewFramer(self.settings.FramerSettings)
 
-			readCounter := atomic.Uint64{}
-			writeCounter := atomic.Uint64{}
+			var readCounter atomic.Uint64
+			var writeCounter atomic.Uint64
 
 			send := make(chan []byte, self.settings.TransportBufferSize)
 			receive := make(chan []byte, self.settings.TransportBufferSize)
