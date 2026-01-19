@@ -8,20 +8,28 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	// "net"
+	mathrand "math/rand"
+	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
 	"sync"
 
+	"golang.org/x/exp/maps"
 	"golang.org/x/net/idna"
-	// "golang.org/x/exp/maps"
+
+	"golang.org/x/net/http2"
+
+	"github.com/urnetwork/glog"
 )
 
 func DefaultDohSettings() *DohSettings {
 	return &DohSettings{
-		ConnectSettings: *DefaultConnectSettings(),
-		IpVersion:       4,
+		ConnectSettings:    *DefaultConnectSettings(),
+		IpVersion:          4,
+		MissExpiration:     300 * time.Second,
+		AllowLocalResolver: true,
+		LocalExpiration:    300 * time.Second,
 	}
 }
 
@@ -34,53 +42,82 @@ func DefaultDohSettings() *DohSettings {
 func dohUrlsIpv4() []string {
 	return []string{
 		"https://1.1.1.1/dns-query",
-		"https://1.0.0.1/dns-query",
-		// "https://9.9.9.9:5053/dns-query",
-		// "https://149.112.112.112:5053/dns-query",
-		"https://208.67.222.222/dns-query",
-		"https://208.67.220.220/dns-query",
 	}
 }
 
+// FIXME
 func dohUrlsIpv6() []string {
 	return []string{
-		"https://[2606:4700:4700::1111]/dns-query",
-		"https://[2606:4700:4700::1001]/dns-query",
-		// "https://[2620:fe::fe]:5053/dns-query",
-		// "https://[2620:fe::9]:5053/dns-query",
-		"https://[2620:119:35::35]/dns-query",
-		"https://[2620:119:53::53]/dns-query",
+		// "https://1.1.1.1/dns-query",
 	}
+}
+
+func localIpv4() []string {
+	return []string{
+		"1.1.1.1",
+	}
+}
+
+func httpClientWithSettings(settings *DohSettings) *http.Client {
+	tr := &http.Transport{
+		DialContext:         settings.DialContext,
+		TLSHandshakeTimeout: settings.TlsTimeout,
+		// FIXME add the doh server certs to our pinned certs
+		// TLSClientConfig:     settings.TlsConfig,
+	}
+	// most doh providers discontinued http1.1 late 2025
+	// we force h2 instead of the default h1->h2 autonegotiate,
+	// since that no longer works
+	// see https://quad9.net/news/blog/doh-http-1-1-retirement/
+	err := http2.ConfigureTransport(tr)
+	if err != nil {
+		panic(err)
+	}
+	httpClient := &http.Client{
+		Timeout:   settings.RequestTimeout,
+		Transport: tr,
+	}
+	return httpClient
 }
 
 type DohSettings struct {
 	ConnectSettings
-	IpVersion int
+	IpVersion          int
+	MissExpiration     time.Duration
+	AllowLocalResolver bool
+	LocalExpiration    time.Duration
 }
 
 type DohCache struct {
-	httpClient *http.Client
-	settings   *DohSettings
+	httpClient    *http.Client
+	localResolver *net.Resolver
+	settings      *DohSettings
 
 	stateLock             sync.Mutex
-	queryResultExpiration map[DohKey]map[netip.Addr]time.Time
+	queryResultExpiration map[DohKey]*DohResult
 }
 
 func NewDohCache(settings *DohSettings) *DohCache {
-	httpClient := &http.Client{
-		Timeout: settings.RequestTimeout,
-		Transport: &http.Transport{
-			DialContext:         settings.DialContext,
-			TLSHandshakeTimeout: settings.TlsTimeout,
-			// FIXME add the doh server certs to our pinned certs
-			// TLSClientConfig:     settings.TlsConfig,
+	netDialer := settings.NetDialer()
+	localResolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network string, addr string) (net.Conn, error) {
+			_, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			localAddrs := localIpv4()
+			localAddr := localAddrs[mathrand.Intn(len(localAddrs))]
+			addr = net.JoinHostPort(localAddr, port)
+			return netDialer.DialContext(ctx, network, addr)
 		},
 	}
 
 	return &DohCache{
-		httpClient:            httpClient,
+		httpClient:            httpClientWithSettings(settings),
+		localResolver:         localResolver,
 		settings:              settings,
-		queryResultExpiration: map[DohKey]map[netip.Addr]time.Time{},
+		queryResultExpiration: map[DohKey]*DohResult{},
 	}
 }
 
@@ -89,41 +126,76 @@ func (self *DohCache) Query(ctx context.Context, recordType string, domain strin
 
 	now := time.Now()
 
-	var ips []netip.Addr
-	ok := func() bool {
-		self.stateLock.Lock()
-		defer self.stateLock.Unlock()
-
-		r, ok := self.queryResultExpiration[q]
-		if !ok {
-			return false
-		}
-		for ip, expireTime := range r {
-			if expireTime.Before(now) {
-				return false
-			}
-			ips = append(ips, ip)
-		}
-		return true
-	}()
-	if ok {
-		return ips
-	}
-
-	ipTtls := DohQueryWithClient(ctx, self.httpClient, self.settings.IpVersion, q.RecordType, self.settings, q.Domain)
-	r := map[netip.Addr]time.Time{}
-	for ip, ttlSeconds := range ipTtls {
-		r[ip] = now.Add(time.Duration(ttlSeconds) * time.Second)
-	}
+	var r *DohResult
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 
-		self.queryResultExpiration[q] = r
+		r = self.queryResultExpiration[q]
 	}()
+	if r != nil {
+		ok := func() bool {
+			if len(r.AddrExpirations) == 0 {
+				if r.Time.Add(self.settings.MissExpiration).Before(now) {
+					return false
+				}
+			}
+			for _, expireTime := range r.AddrExpirations {
+				if expireTime.Before(now) {
+					return false
+				}
+			}
+			return true
+		}()
+		if ok {
+			ips := []netip.Addr{}
+			for ip, _ := range r.AddrExpirations {
+				ips = append(ips, ip)
+			}
+			return ips
+		}
+	}
 
-	ips = nil
-	for ip, _ := range r {
+	addrExpirations := map[netip.Addr]time.Time{}
+
+	addrTtls := DohQueryWithClient(ctx, self.httpClient, self.settings.IpVersion, q.RecordType, self.settings, q.Domain)
+
+	now = time.Now()
+
+	for addr, ttlSeconds := range addrTtls {
+		addrExpirations[addr] = now.Add(time.Duration(ttlSeconds) * time.Second)
+	}
+
+	if len(addrExpirations) == 0 && self.settings.AllowLocalResolver {
+		// try the local resolver
+		resolvedIps, err := self.localResolver.LookupIP(ctx, "ip4", q.Domain)
+		if err == nil {
+			for _, ip := range resolvedIps {
+				addr, _ := netip.AddrFromSlice(ip.To4())
+
+				addrExpirations[addr] = now.Add(self.settings.LocalExpiration)
+			}
+		} else {
+			fmt.Printf("[doh]local (%s) err = %s\n", q.Domain, err)
+		}
+	}
+
+	// resolve misses are not stored
+	if 0 < len(addrExpirations) {
+		r = &DohResult{
+			Time:            now,
+			AddrExpirations: addrExpirations,
+		}
+		func() {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+
+			self.queryResultExpiration[q] = r
+		}()
+	}
+
+	ips := []netip.Addr{}
+	for ip, _ := range addrExpirations {
 		ips = append(ips, ip)
 	}
 	return ips
@@ -136,14 +208,7 @@ func DohQueryWithDefaults(ctx context.Context, recordType string, domains ...str
 // return ip -> ttl (seconds)
 // use `ipVersion=0` to try all versions
 func DohQuery(ctx context.Context, ipVersion int, recordType string, settings *DohSettings, domains ...string) map[netip.Addr]int {
-	httpClient := &http.Client{
-		Timeout: settings.RequestTimeout,
-		Transport: &http.Transport{
-			DialContext:         settings.DialContext,
-			TLSHandshakeTimeout: settings.TlsTimeout,
-			TLSClientConfig:     settings.TlsConfig,
-		},
-	}
+	httpClient := httpClientWithSettings(settings)
 	defer httpClient.CloseIdleConnections()
 
 	return DohQueryWithClient(
@@ -191,6 +256,7 @@ func DohQueryWithClient(
 
 		request, err := http.NewRequestWithContext(queryCtx, "GET", requestUrl, nil)
 		if err != nil {
+			glog.Infof("[doh]request create err=%s\n", err)
 			return
 		}
 
@@ -200,29 +266,30 @@ func DohQueryWithClient(
 
 		response, err := httpClient.Do(request)
 		if err != nil {
-			// fmt.Printf("DOH err=%s\n", err)
+			glog.Infof("[doh]request err=%s\n", err)
 			return
 		}
 		defer response.Body.Close()
 		if response.StatusCode != http.StatusOK {
-			// fmt.Printf("DOH BAD status=%d\n", response.StatusCode)
+			glog.Infof("[doh]http response bad status=%d\n", response.StatusCode)
 			return
 		}
 
 		data, err := io.ReadAll(response.Body)
 		if err != nil {
+			glog.Infof("[doh]read err=%s\n", err)
 			return
 		}
 
 		dohResponse := &DohResponse{}
 		err = json.Unmarshal(data, dohResponse)
 		if err != nil {
-			// fmt.Printf("DOH UNMARSHAL err=%s\n", err)
+			glog.Infof("[doh]response unmarshal err=%s\n", err)
 			return
 		}
 
 		if dohResponse.Status != 0 {
-			// fmt.Printf("DOH BAD RESPONSE %v\n", dohResponse)
+			glog.Infof("[doh]doh response bad status=%d\n", dohResponse.Status)
 			return
 		}
 
@@ -248,10 +315,12 @@ func DohQueryWithClient(
 		dohUrls = append(dohUrls, dohUrlsIpv6()...)
 	}
 
-	out := make(chan map[netip.Addr]int)
+	var outs []chan map[netip.Addr]int
 
 	for _, dohUrl := range dohUrls {
 		for _, domain := range domains {
+			out := make(chan map[netip.Addr]int)
+			outs = append(outs, out)
 			go HandleError(func() {
 				ips := query(dohUrl, domain)
 				if 0 < len(ips) {
@@ -260,20 +329,35 @@ func DohQueryWithClient(
 					case <-queryCtx.Done():
 					}
 				}
+				close(out)
 			})
 		}
 	}
 
+	endTime := time.Now().Add(settings.RequestTimeout)
 	mergedIps := map[netip.Addr]int{}
-	select {
-	case <-queryCtx.Done():
-	case ips := <-out:
-		for ip, ttl := range ips {
-			mergedIps[ip] = max(mergedIps[ip], ttl)
+	for _, out := range outs {
+		timeout := endTime.Sub(time.Now())
+		if timeout <= 0 {
+			select {
+			case <-queryCtx.Done():
+			case ips, ok := <-out:
+				if ok {
+					maps.Copy(mergedIps, ips)
+				}
+			default:
+			}
+		} else {
+			select {
+			case <-queryCtx.Done():
+			case ips, ok := <-out:
+				if ok {
+					maps.Copy(mergedIps, ips)
+				}
+			case <-time.After(timeout):
+			}
 		}
-	case <-time.After(settings.RequestTimeout):
 	}
-
 	return mergedIps
 }
 
@@ -285,8 +369,13 @@ type DohKey struct {
 func NewDohKey(recordType string, domain string) DohKey {
 	return DohKey{
 		RecordType: strings.ToUpper(recordType),
-		Domain:     strings.ToLower(recordType),
+		Domain:     strings.ToLower(domain),
 	}
+}
+
+type DohResult struct {
+	Time            time.Time
+	AddrExpirations map[netip.Addr]time.Time
 }
 
 type DohQuestion struct {

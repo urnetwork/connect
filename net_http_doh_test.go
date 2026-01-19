@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
+	"slices"
 	"time"
 
 	"testing"
@@ -32,10 +33,11 @@ func TestDohQuery(t *testing.T) {
 				continue
 			}
 		}
-		assert.Equal(t, ips, map[netip.Addr]bool{
-			testIp1: true,
-			testIp2: true,
-		})
+		assert.Equal(t, len(ips), 2)
+		ttl1 := ips[testIp1]
+		assert.NotEqual(t, ttl1, 0)
+		ttl2 := ips[testIp2]
+		assert.NotEqual(t, ttl2, 0)
 	}
 
 }
@@ -63,10 +65,14 @@ func TestDohCache(t *testing.T) {
 				continue
 			}
 		}
-		assert.Equal(t, ips, map[netip.Addr]bool{
-			testIp1: true,
-			testIp2: true,
-		})
+		assert.Equal(t, len(ips), 2)
+		assert.Equal(t, slices.Contains(ips, testIp1), true)
+		assert.Equal(t, slices.Contains(ips, testIp2), true)
+	}
+
+	for range 10 {
+		ips := dohCache.Query(ctx, "A", "test-local.bringyour.com")
+		assert.Equal(t, len(ips), 0)
 	}
 
 }
