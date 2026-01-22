@@ -186,8 +186,13 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 					}
 
 					tlsConn := tls.Client(conn, tlsConfig)
-					if err := tlsConn.HandshakeContext(ctx); err != nil {
-						conn.Close()
+					func() {
+						tlsCtx, tlsCancel := context.WithTimeout(ctx, settings.TlsTimeout)
+						defer tlsCancel()
+						err = tlsConn.HandshakeContext(tlsCtx)
+					}()
+					if err != nil {
+						tlsConn.Close()
 						return nil, err
 					}
 					return tlsConn, nil
@@ -1375,16 +1380,15 @@ func HttpPostStreamWithStrategyRaw(
 	if err != nil {
 		return nil, err
 	}
+
 	defer res.Body.Close()
-
-	if res.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(res.Body)
-		return nil, fmt.Errorf("%s: %s", res.Status, strings.TrimSpace(string(bodyBytes)))
-	}
-
 	bodyBytes, err := io.ReadAll(res.Body)
 	if err != nil {
 		return nil, err
+	}
+
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%s: %s", res.Status, strings.TrimSpace(string(bodyBytes)))
 	}
 
 	return bodyBytes, nil

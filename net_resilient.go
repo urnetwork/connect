@@ -76,20 +76,21 @@ func NewResilientDialTlsContext(
 		// copy and extend
 		tlsConfig := *connectSettings.TlsConfig
 		tlsConfig.ServerName = host
-		tlsServerConn := tls.Client(rconn, &tlsConfig)
+		tlsConn := tls.Client(rconn, &tlsConfig)
 
 		func() {
 			tlsCtx, tlsCancel := context.WithTimeout(ctx, connectSettings.TlsTimeout)
 			defer tlsCancel()
-			err = tlsServerConn.HandshakeContext(tlsCtx)
+			err = tlsConn.HandshakeContext(tlsCtx)
 		}()
 		if err != nil {
+			tlsConn.Close()
 			return nil, err
 		}
 		// once the stream is established, no longer need the resilient features
 		rconn.Off()
 
-		return tlsServerConn, nil
+		return tlsConn, nil
 	}
 }
 
