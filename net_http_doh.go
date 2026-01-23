@@ -256,7 +256,6 @@ func DohQueryWithClient(
 
 		request, err := http.NewRequestWithContext(queryCtx, "GET", requestUrl, nil)
 		if err != nil {
-			glog.Infof("[doh]request create err=%s\n", err)
 			return
 		}
 
@@ -266,30 +265,25 @@ func DohQueryWithClient(
 
 		response, err := httpClient.Do(request)
 		if err != nil {
-			glog.Infof("[doh]request err=%s\n", err)
 			return
 		}
 		defer response.Body.Close()
 		if response.StatusCode != http.StatusOK {
-			glog.Infof("[doh]http response bad status=%d\n", response.StatusCode)
 			return
 		}
 
 		data, err := io.ReadAll(response.Body)
 		if err != nil {
-			glog.Infof("[doh]read err=%s\n", err)
 			return
 		}
 
 		dohResponse := &DohResponse{}
 		err = json.Unmarshal(data, dohResponse)
 		if err != nil {
-			glog.Infof("[doh]response unmarshal err=%s\n", err)
 			return
 		}
 
 		if dohResponse.Status != 0 {
-			glog.Infof("[doh]doh response bad status=%d\n", dohResponse.Status)
 			return
 		}
 
