@@ -19,8 +19,7 @@ import (
 	"golang.org/x/net/idna"
 
 	"golang.org/x/net/http2"
-
-	"github.com/urnetwork/glog"
+	// "github.com/urnetwork/glog"
 )
 
 func DefaultDohSettings() *DohSettings {
