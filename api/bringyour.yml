@@ -2048,7 +2048,17 @@ components:
                 The SDK ProxyDevice will automatically send a heartbeat with this many seconds.
                 If the proxy is removed from memmory, the next call to the proxy will
                 create a new device set up to the `initial_device_state` (if present).
+
+                The following proxy URLs and auths may be used:
+                | URL | Auth |
+                |-----|------|
+                | https://<auth_token>.<proxy_host>:<https_proxy_port> | no auth needed when the client connects with TLS | 
+                | https://<proxy_host>:<https_proxy_port> | use HTTP Proxy-Authorization Basic with `access_token` as the username (empty pass), or Bearer with `access_token` as the bearer token | 
+                | http://<proxy_host>:<http_proxy_port> | use HTTP Proxy-Authorization Basic with `access_token` as the username (empty pass), or Bearer with `access_token` as the bearer token | 
+                | tcp://<proxy_host>:<socks_proxy_port> | use `access_token` as the username (empty pass) | 
               type: integer
+            http_proxy_url:
+              type: string
             https_proxy_url:
               type: string
             socks_proxy_url:
@@ -2058,6 +2068,14 @@ components:
             instance_id:
               description: udid. The instance_id of the proxy device.
               type: string
+            proxy_host:
+              type: string
+            socks_proxy_port:
+              type: integer
+            http_proxy_port:
+              type: integer
+            https_proxy_port:
+              type: integer
 
         error:
           type: object
