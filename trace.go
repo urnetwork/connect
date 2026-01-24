@@ -64,6 +64,38 @@ func HandleError(do func(), handlers ...any) (r any) {
 	return
 }
 
+func HandleError1[R any](do func() R, handlers ...any) (result R) {
+	HandleError(func() {
+		result = do()
+	}, func(err error) {
+		for _, handler := range handlers {
+			switch v := handler.(type) {
+			case func() R:
+				result = v()
+			case func(error) R:
+				result = v(err)
+			}
+		}
+	})
+	return
+}
+
+func HandleError2[R1 any, R2 any](do func() (R1, R2), handlers ...any) (result1 R1, result2 R2) {
+	HandleError(func() {
+		result1, result2 = do()
+	}, func(err error) {
+		for _, handler := range handlers {
+			switch v := handler.(type) {
+			case func() (R1, R2):
+				result1, result2 = v()
+			case func(error) (R1, R2):
+				result1, result2 = v(err)
+			}
+		}
+	})
+	return
+}
+
 func ExpectErrorWithReturn[R any](do func() R, defaultValue R, handlers ...any) (returnValue R, r any) {
 	defer func() {
 		if r = recover(); r != nil {
