@@ -61,8 +61,8 @@ func DefaultClientStrategySettings() *ClientStrategySettings {
 
 		HelloRetryTimeout: 5 * time.Second,
 
-		MinNextConnectDelay: 25 * time.Millisecond,
-		MaxNextConnectDelay: 100 * time.Millisecond,
+		MinNextConnectDelay: 100 * time.Millisecond,
+		MaxNextConnectDelay: 1000 * time.Millisecond,
 
 		ConnectSettings: *DefaultConnectSettings(),
 	}
@@ -323,10 +323,10 @@ func (self *ClientStrategy) NextConnectTime() time.Time {
 		self.settings.MaxNextConnectDelay-self.settings.MinNextConnectDelay,
 	)))
 	nextConnectTime := self.nextConnectTime.Add(connectDelay)
-	self.nextConnectTime = nextConnectTime
-	if nextConnectTime.After(now) {
-		return nextConnectTime
+	if nextConnectTime.Before(now) {
+		nextConnectTime = now
 	}
+	self.nextConnectTime = nextConnectTime
 	return now
 }
 
