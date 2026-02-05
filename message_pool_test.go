@@ -2,6 +2,7 @@ package connect
 
 import (
 	"bytes"
+	"encoding/base64"
 	"fmt"
 	mathrand "math/rand"
 	"testing"
@@ -105,5 +106,16 @@ func TestMessagePoolShare(t *testing.T) {
 		pooled, shared := MessagePoolCheck(message)
 		assert.Equal(t, pooled, false)
 		assert.Equal(t, shared, false)
+	}
+}
+
+func TestBase64(t *testing.T) {
+	for range 128 {
+		n := mathrand.Intn(512)
+		b := make([]byte, n)
+		mathrand.Read(b)
+		b2, err := DecodeBase64(base64.StdEncoding, EncodeBase64(base64.StdEncoding, b))
+		assert.Equal(t, err, nil)
+		assert.Equal(t, b, b2)
 	}
 }

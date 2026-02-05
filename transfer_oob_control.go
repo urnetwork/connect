@@ -75,11 +75,9 @@ func (self *ApiOutOfBandControl) SendControl(
 	}
 	defer MessagePoolReturn(packBytes)
 
-	packByteStr := base64.StdEncoding.EncodeToString(packBytes)
-
 	self.api.ConnectControl(
 		&ConnectControlArgs{
-			Pack: packByteStr,
+			Pack: EncodeBase64(base64.StdEncoding, packBytes),
 		},
 		NewApiCallback(func(result *ConnectControlResult, err error) {
 			if err != nil {
@@ -87,11 +85,12 @@ func (self *ApiOutOfBandControl) SendControl(
 				return
 			}
 
-			packBytes, err := base64.StdEncoding.DecodeString(result.Pack)
+			packBytes, err := DecodeBase64(base64.StdEncoding, result.Pack)
 			if err != nil {
 				safeCallback(nil, err)
 				return
 			}
+			defer MessagePoolReturn(packBytes)
 
 			responsePack := &protocol.Pack{}
 			err = ProtoUnmarshal(packBytes, responsePack)

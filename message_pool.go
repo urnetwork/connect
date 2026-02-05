@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"hash/maphash"
@@ -496,4 +497,24 @@ func ProtoMarshalWithTag(m proto.Message, tag uint8) ([]byte, error) {
 
 func ProtoUnmarshal(b []byte, m proto.Message) error {
 	return proto.Unmarshal(b, m)
+}
+
+func EncodeBase64(enc *base64.Encoding, src []byte) string {
+	buf := MessagePoolGet(enc.EncodedLen(len(src)))
+	defer MessagePoolReturn(buf)
+	enc.Encode(buf, src)
+	return string(buf)
+}
+
+func DecodeBase64(enc *base64.Encoding, s string) ([]byte, error) {
+	sbuf := MessagePoolGet(len(s))
+	defer MessagePoolReturn(sbuf)
+	copy(sbuf, s)
+	buf := MessagePoolGet(enc.DecodedLen(len(s)))
+	n, err := enc.Decode(buf, sbuf)
+	if err != nil {
+		MessagePoolReturn(buf)
+		return nil, err
+	}
+	return buf[:n], nil
 }
