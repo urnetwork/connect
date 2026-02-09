@@ -53,6 +53,21 @@ func RegionalDnsResolverSettings(countryCode string) *DnsResolverSettings {
 			},
 		}
 
+	case "tr":
+		return &DnsResolverSettings{
+			EnableRemoteDns: true,
+			EnableLocalDns:  true,
+			RemoteDnsIpv4: []string{
+				// TTNET
+				"195.175.39.39",
+				// Turkcell Superonline
+				"212.252.114.8",
+			},
+			LocalDnsIpv4: []string{
+				"1.1.1.1",
+			},
+		}
+
 	case "kz":
 		return &DnsResolverSettings{
 			EnableRemoteDns: true,
@@ -71,6 +86,8 @@ func RegionalDnsResolverSettings(countryCode string) *DnsResolverSettings {
 			EnableRemoteDns: true,
 			EnableLocalDns:  true,
 			RemoteDnsIpv4: []string{
+				// Turkmentelecom
+				"217.174.238.141",
 				// Google Public DNS
 				"8.8.4.4",
 			},
