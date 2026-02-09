@@ -22,39 +22,68 @@ import (
 	// "github.com/urnetwork/glog"
 )
 
+// FIXME DoH certs need to be included in the pinned certs
+
 func DefaultDohSettings() *DohSettings {
 	return &DohSettings{
-		ConnectSettings:    *DefaultConnectSettings(),
-		IpVersion:          4,
-		MissExpiration:     300 * time.Second,
-		AllowLocalResolver: true,
-		LocalExpiration:    300 * time.Second,
+		ConnectSettings:     *DefaultConnectSettings(),
+		IpVersion:           4,
+		MissExpiration:      300 * time.Second,
+		LocalExpiration:     300 * time.Second,
+		DnsResolverSettings: DefaultDnsResolverSettings(),
 	}
 }
 
-// FIXME DoH certs need to be included in the pinned certs
-
+// the resolver tries the following sequence until there is a found record:
+// 1. if enable remote doh, remote doh
+// 2. if enable remote dns, remote dns
+// 3. if enable local dns, local dns
 // see:
 // https://developers.cloudflare.com/1.1.1.1/ip-addresses/
 // https://www.quad9.net/
 // https://support.opendns.com/hc/en-us/articles/360038086532-Using-DNS-over-HTTPS-DoH-with-OpenDNS
-func dohUrlsIpv4() []string {
-	return []string{
-		"https://1.1.1.1/dns-query",
+func DefaultDnsResolverSettings() *DnsResolverSettings {
+	return &DnsResolverSettings{
+		EnableRemoteDoh: true,
+		EnableLocalDns:  true,
+		RemoteDohUrlsIpv4: []string{
+			"https://1.1.1.1/dns-query",
+		},
+		LocalDnsIpv4: []string{
+			"1.1.1.1",
+		},
 	}
 }
 
-// FIXME
-func dohUrlsIpv6() []string {
-	return []string{
-		// "https://1.1.1.1/dns-query",
+type DohSettings struct {
+	ConnectSettings
+	IpVersion           int
+	MissExpiration      time.Duration
+	LocalExpiration     time.Duration
+	DnsResolverSettings *DnsResolverSettings
+}
+
+func (self *DohSettings) ResolverIp() string {
+	switch self.IpVersion {
+	case 4:
+		return "ip4"
+	case 6:
+		return "ip6"
+	default:
+		return "ip"
 	}
 }
 
-func localIpv4() []string {
-	return []string{
-		"1.1.1.1",
-	}
+type DnsResolverSettings struct {
+	EnableRemoteDoh   bool     `json:"enable_remote_doh,omitempty"`
+	EnableRemoteDns   bool     `json:"enable_remote_dns,omitempty"`
+	EnableLocalDns    bool     `json:"enable_local_dns,omitempty"`
+	RemoteDohUrlsIpv4 []string `json:"remote_doh_urls_ipv4,omitempty"`
+	RemoteDohUrlsIpv6 []string `json:"remote_doh_urls_ipv6,omitempty"`
+	RemoteDnsIpv4     []string `json:"remote_dns_ipv4,omitempty"`
+	RemoteDnsIpv6     []string `json:"remote_dns_ipv6,omitempty"`
+	LocalDnsIpv4      []string `json:"local_dns_ipv4,omitempty"`
+	LocalDnsIpv6      []string `json:"local_dns_ipv6,omitempty"`
 }
 
 func httpClientWithSettings(settings *DohSettings) *http.Client {
@@ -79,24 +108,38 @@ func httpClientWithSettings(settings *DohSettings) *http.Client {
 	return httpClient
 }
 
-type DohSettings struct {
-	ConnectSettings
-	IpVersion          int
-	MissExpiration     time.Duration
-	AllowLocalResolver bool
-	LocalExpiration    time.Duration
-}
-
 type DohCache struct {
-	httpClient    *http.Client
-	localResolver *net.Resolver
-	settings      *DohSettings
+	httpClient     *http.Client
+	remoteResolver *net.Resolver
+	localResolver  *net.Resolver
+	settings       *DohSettings
 
 	stateLock             sync.Mutex
 	queryResultExpiration map[DohKey]*DohResult
 }
 
 func NewDohCache(settings *DohSettings) *DohCache {
+	remoteResolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network string, addr string) (net.Conn, error) {
+			_, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			var localAddrs []string
+			switch network {
+			case "ip6":
+				localAddrs = settings.DnsResolverSettings.RemoteDnsIpv6
+			default:
+				// the dialer can't race so use ipv4
+				localAddrs = settings.DnsResolverSettings.RemoteDnsIpv4
+			}
+			localAddr := localAddrs[mathrand.Intn(len(localAddrs))]
+			addr = net.JoinHostPort(localAddr, port)
+			return settings.DialContext(ctx, network, addr)
+		},
+	}
+
 	netDialer := settings.NetDialer()
 	localResolver := &net.Resolver{
 		PreferGo: true,
@@ -105,7 +148,14 @@ func NewDohCache(settings *DohSettings) *DohCache {
 			if err != nil {
 				return nil, err
 			}
-			localAddrs := localIpv4()
+			var localAddrs []string
+			switch network {
+			case "ip6":
+				localAddrs = settings.DnsResolverSettings.LocalDnsIpv6
+			default:
+				// the dialer can't race so use ipv4
+				localAddrs = settings.DnsResolverSettings.LocalDnsIpv4
+			}
 			localAddr := localAddrs[mathrand.Intn(len(localAddrs))]
 			addr = net.JoinHostPort(localAddr, port)
 			return netDialer.DialContext(ctx, network, addr)
@@ -114,6 +164,7 @@ func NewDohCache(settings *DohSettings) *DohCache {
 
 	return &DohCache{
 		httpClient:            httpClientWithSettings(settings),
+		remoteResolver:        remoteResolver,
 		localResolver:         localResolver,
 		settings:              settings,
 		queryResultExpiration: map[DohKey]*DohResult{},
@@ -157,17 +208,31 @@ func (self *DohCache) Query(ctx context.Context, recordType string, domain strin
 
 	addrExpirations := map[netip.Addr]time.Time{}
 
-	addrTtls := DohQueryWithClient(ctx, self.httpClient, self.settings.IpVersion, q.RecordType, self.settings, q.Domain)
+	if self.settings.DnsResolverSettings.EnableLocalDns {
+		addrTtls := DohQueryWithClient(ctx, self.httpClient, self.settings.IpVersion, q.RecordType, self.settings, q.Domain)
 
-	now = time.Now()
-
-	for addr, ttlSeconds := range addrTtls {
-		addrExpirations[addr] = now.Add(time.Duration(ttlSeconds) * time.Second)
+		for addr, ttlSeconds := range addrTtls {
+			addrExpirations[addr] = now.Add(time.Duration(ttlSeconds) * time.Second)
+		}
 	}
 
-	if len(addrExpirations) == 0 && self.settings.AllowLocalResolver {
+	if len(addrExpirations) == 0 && self.settings.DnsResolverSettings.EnableRemoteDns {
+		// try the remote resolver
+		resolvedIps, err := self.remoteResolver.LookupIP(ctx, self.settings.ResolverIp(), q.Domain)
+		if err == nil {
+			for _, ip := range resolvedIps {
+				addr, _ := netip.AddrFromSlice(ip.To4())
+
+				addrExpirations[addr] = now.Add(self.settings.LocalExpiration)
+			}
+		} else {
+			fmt.Printf("[doh]local (%s) err = %s\n", q.Domain, err)
+		}
+	}
+
+	if len(addrExpirations) == 0 && self.settings.DnsResolverSettings.EnableLocalDns {
 		// try the local resolver
-		resolvedIps, err := self.localResolver.LookupIP(ctx, "ip4", q.Domain)
+		resolvedIps, err := self.localResolver.LookupIP(ctx, self.settings.ResolverIp(), q.Domain)
 		if err == nil {
 			for _, ip := range resolvedIps {
 				addr, _ := netip.AddrFromSlice(ip.To4())
@@ -300,12 +365,13 @@ func DohQueryWithClient(
 	var dohUrls []string
 	switch ipVersion {
 	case 4:
-		dohUrls = dohUrlsIpv4()
+		dohUrls = settings.DnsResolverSettings.RemoteDohUrlsIpv4
 	case 6:
-		dohUrls = dohUrlsIpv6()
+		dohUrls = settings.DnsResolverSettings.RemoteDohUrlsIpv6
 	default:
-		dohUrls = append(dohUrls, dohUrlsIpv4()...)
-		dohUrls = append(dohUrls, dohUrlsIpv6()...)
+		// the resolver can race
+		dohUrls = append(dohUrls, settings.DnsResolverSettings.RemoteDohUrlsIpv4...)
+		dohUrls = append(dohUrls, settings.DnsResolverSettings.RemoteDohUrlsIpv6...)
 	}
 
 	var outs []chan map[netip.Addr]int
