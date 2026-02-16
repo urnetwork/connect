@@ -2080,7 +2080,7 @@ components:
               type: integer
             https_proxy_port:
               type: integer
-            wg_config_result:
+            wg_config:
               type: object
               properties:
                 wg_proxy_port:
