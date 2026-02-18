@@ -2094,6 +2094,7 @@ components:
                 proxy_public_key:
                   type: string
                 config:
+                  description: The WireGuard config file for this client.
                   type: string
 
         error:
