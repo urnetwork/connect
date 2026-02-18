@@ -1953,6 +1953,10 @@ components:
               description: Optional. |
                 If the client supports ECH, this is not needed, since the HTTP proxy URL will itself be the auth.
               type: boolean
+            enable_wg:
+              description: Optional. |
+                If enabled, a WireGuard configuration will be created for the proxy.
+              type: boolean
             initial_device_state:
               description: Optional. |
                 Whenever the device is created, it will be set up with this initial state.
@@ -2076,6 +2080,22 @@ components:
               type: integer
             https_proxy_port:
               type: integer
+            wg_config:
+              type: object
+              properties:
+                wg_proxy_port:
+                  type: integer
+                client_private_key:
+                  type: string
+                client_public_key:
+                  type: string
+                client_ipv4:
+                  type: string
+                proxy_public_key:
+                  type: string
+                config:
+                  description: The WireGuard config file for this client.
+                  type: string
 
         error:
           type: object
