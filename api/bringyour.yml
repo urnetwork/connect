@@ -1499,6 +1499,45 @@ components:
         - title: ProvideModeStream
           const: 4
 
+    ProxyClient:
+      type: object
+      properties:
+        http_proxy_url:
+          type: string
+        https_proxy_url:
+          type: string
+        socks_proxy_url:
+          type: string
+        auth_token:
+          type: string
+        instance_id:
+          description: udid. The instance_id of the proxy device.
+          type: string
+        proxy_host:
+          type: string
+        socks_proxy_port:
+          type: integer
+        http_proxy_port:
+          type: integer
+        https_proxy_port:
+          type: integer
+        wg_config:
+          type: object
+          properties:
+            wg_proxy_port:
+              type: integer
+            client_private_key:
+              type: string
+            client_public_key:
+              type: string
+            client_ipv4:
+              type: string
+            proxy_public_key:
+              type: string
+            config:
+              description: The WireGuard config file for this client.
+              type: string
+
     StatsResult:
       type: object
       properties:
@@ -2042,60 +2081,28 @@ components:
           type: string
         # the returned proxy urls are valid as long as the client is not removed
         proxy_config_result:
-          type: object
-          properties:
-            keepalive_seconds:
-              description: |
-                The proxy url will be valid until the client is removed.
-                However, to keep the device and state in memory,
-                the proxy must receive a message at least once per this interval.
-                The SDK ProxyDevice will automatically send a heartbeat with this many seconds.
-                If the proxy is removed from memmory, the next call to the proxy will
-                create a new device set up to the `initial_device_state` (if present).
-
-                The following proxy URLs and auths may be used:
-                | URL | Auth |
-                |-----|------|
-                | https://<auth_token>.<proxy_host>:<https_proxy_port> | no auth needed when the client connects with TLS | 
-                | https://<proxy_host>:<https_proxy_port> | use HTTP Proxy-Authorization Basic with `access_token` as the username (empty pass), or Bearer with `access_token` as the bearer token | 
-                | http://<proxy_host>:<http_proxy_port> | use HTTP Proxy-Authorization Basic with `access_token` as the username (empty pass), or Bearer with `access_token` as the bearer token | 
-                | tcp://<proxy_host>:<socks_proxy_port> | use `access_token` as the username (empty pass) | 
-              type: integer
-            http_proxy_url:
-              type: string
-            https_proxy_url:
-              type: string
-            socks_proxy_url:
-              type: string
-            auth_token:
-              type: string
-            instance_id:
-              description: udid. The instance_id of the proxy device.
-              type: string
-            proxy_host:
-              type: string
-            socks_proxy_port:
-              type: integer
-            http_proxy_port:
-              type: integer
-            https_proxy_port:
-              type: integer
-            wg_config:
-              type: object
+          description: |
+              The following proxy URLs and auths may be used:
+              | URL | Auth |
+              |-----|------|
+              | https://<auth_token>.<proxy_host>:<https_proxy_port> | no auth needed when the client connects with TLS | 
+              | https://<proxy_host>:<https_proxy_port> | use HTTP Proxy-Authorization Basic with `access_token` as the username (empty pass), or Bearer with `access_token` as the bearer token | 
+              | http://<proxy_host>:<http_proxy_port> | use HTTP Proxy-Authorization Basic with `access_token` as the username (empty pass), or Bearer with `access_token` as the bearer token | 
+              | tcp://<proxy_host>:<socks_proxy_port> | use `access_token` as the username (empty pass) | 
+              | wg://<proxy_host>:<wg_proxy_port> | use `wg_config.config` as the full WireGuard config file content, which contains all the necessary keys | 
+          allOf:
+            - type: object
               properties:
-                wg_proxy_port:
+                keepalive_seconds:
+                  description: |
+                    The proxy url will be valid until the client is removed.
+                    However, to keep the device and state in memory,
+                    the proxy must receive a message at least once per this interval.
+                    The SDK ProxyDevice will automatically send a heartbeat with this many seconds.
+                    If the proxy is removed from memmory, the next call to the proxy will
+                    create a new device set up to the `initial_device_state` (if present).
                   type: integer
-                client_private_key:
-                  type: string
-                client_public_key:
-                  type: string
-                client_ipv4:
-                  type: string
-                proxy_public_key:
-                  type: string
-                config:
-                  description: The WireGuard config file for this client.
-                  type: string
+            - $ref: '#/components/schemas/ProxyClient'
 
         error:
           type: object
@@ -2151,6 +2158,10 @@ components:
                 type: string
               auth_time:
                 type: string
+              provide_mode:
+                $ref: "#/components/schemas/ProvideMode"
+              proxy_client:
+                $ref: "#/components/schemas/ProxyClient"
               resident:
                 type: object
                 properties:
@@ -2173,8 +2184,6 @@ components:
                     type: array
                     items:
                       type: integer
-              provide_mode:
-                $ref: "#/components/schemas/ProvideMode"
               connections:
                 type: array
                 items:
