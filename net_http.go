@@ -619,7 +619,7 @@ func (self *ClientStrategy) serialEval(ctx context.Context, eval func(ctx contex
 			result := eval(handleCtx, dialer)
 			if result != nil {
 				if result.err == nil {
-					glog.Infof("[net][s]select: %s\n", dialer.String())
+					glog.V(2).Infof("[net][s]select: %s\n", dialer.String())
 					return result
 				}
 				glog.V(2).Infof("[net][s]select: %s = %s\n", dialer.String(), result.err)
