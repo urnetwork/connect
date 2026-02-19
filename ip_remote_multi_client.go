@@ -913,7 +913,7 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 		return self.sendPacket(source, provideMode, parsedPacket, timeout)
 	default:
 		// TODO upgrade port 53 and port 80 here with protocol specific conversions
-		glog.Infof("[multi]drop packet ipv%d p%v -> %s:%d\n", ipPath.Version, ipPath.Protocol, ipPath.DestinationIp, ipPath.DestinationPort)
+		glog.V(1).Infof("[multi]drop packet ipv%d p%v -> %s:%d\n", ipPath.Version, ipPath.Protocol, ipPath.DestinationIp, ipPath.DestinationPort)
 		return false
 	}
 }
@@ -1810,7 +1810,7 @@ func (self *multiClientWindow) resize() {
 				effectiveByteCountPerSecond := stats.EffectiveByteCountPerSecond()
 				expectedByteCountPerSecond := stats.ExpectedByteCountPerSecond()
 
-				glog.Infof(
+				glog.V(1).Infof(
 					"[multi]%s [%s]: h=%d+%dms/u=%d+%dms effective=%db/s expected=%db/s send=%db sendNack=%db receive=%db\n",
 					status,
 					client.ClientId(),
@@ -1967,7 +1967,7 @@ func (self *multiClientWindow) resize() {
 				windowSizeMin,
 				targetWindowSize-len(clients),
 			)
-			glog.Infof("[multi]window expand +%d %d->%d (+%d)\n", n, len(clients), targetWindowSize, addedCount)
+			glog.V(1).Infof("[multi]window expand +%d %d->%d (+%d)\n", n, len(clients), targetWindowSize, addedCount)
 		}
 		if 0 < windowSize.WindowSizeHardMax && windowSize.WindowSizeHardMax < len(clients)+len(warnedClients)+addedCount {
 			self.monitor.AddWindowExpandEvent(
@@ -1975,7 +1975,7 @@ func (self *multiClientWindow) resize() {
 				windowSize.WindowSizeHardMax,
 			)
 			collapseLowestWeighted(max(0, windowSize.WindowSizeHardMax-addedCount))
-			glog.Infof("[multi]window collapse -%d ->%d\n", (len(clients)+len(warnedClients)+addedCount)-windowSize.WindowSizeHardMax, windowSize.WindowSizeHardMax)
+			glog.V(1).Infof("[multi]window collapse -%d ->%d\n", (len(clients)+len(warnedClients)+addedCount)-windowSize.WindowSizeHardMax, windowSize.WindowSizeHardMax)
 		} else {
 			self.monitor.AddWindowExpandEvent(
 				windowSizeMin <= len(clients)+addedCount,
@@ -2026,7 +2026,7 @@ func (self *multiClientWindow) expand(
 	for i := 0; i < n; i += 1 {
 		timeout := endTime.Sub(time.Now())
 		if timeout < 0 {
-			glog.Infof("[multi]expand window timeout\n")
+			glog.V(1).Infof("[multi]expand window timeout\n")
 			return
 		}
 
@@ -2104,7 +2104,7 @@ func (self *multiClientWindow) expand(
 						func(err error) {
 							defer close(pingDone)
 							if err == nil {
-								glog.Infof("[multi]expand new client\n")
+								glog.V(1).Infof("[multi]expand new client\n")
 
 								self.monitor.AddProviderEvent(args.ClientId, ProviderStateAdded)
 								var replacedClient *multiClientChannel
@@ -2126,14 +2126,14 @@ func (self *multiClientWindow) expand(
 									pingSuccess += 1
 								}()
 							} else {
-								glog.Infof("[multi]create ping error = %s\n", err)
+								glog.V(1).Infof("[multi]create ping error = %s\n", err)
 								client.Cancel()
 								self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed)
 							}
 						},
 					)
 					if err != nil {
-						glog.Infof("[multi]create client ping error = %s\n", err)
+						glog.V(1).Infof("[multi]create client ping error = %s\n", err)
 						close(pingDone)
 						client.Cancel()
 					} else if !success {
@@ -2264,7 +2264,7 @@ func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 		if client.Tier() == minTier {
 			minTierClients = append(minTierClients, client)
 		} else {
-			glog.Infof("[multi]exclude tier from window %d>%d\n", client.Tier(), minTier)
+			glog.V(1).Infof("[multi]exclude tier from window %d>%d\n", client.Tier(), minTier)
 		}
 	}
 
@@ -2728,7 +2728,7 @@ func (self *multiClientChannel) detectBlackhole() {
 			if blackhole {
 				// the client has sent data but received nothing back
 				// this looks like a blackhole
-				glog.Infof("[multi]routing %s blackhole: %d %dB <> %d %dB\n",
+				glog.V(1).Infof("[multi]routing %s blackhole: %d %dB <> %d %dB\n",
 					self.args.Destination,
 					windowStats.sendAckCount,
 					windowStats.sendAckByteCount,
@@ -2741,7 +2741,7 @@ func (self *multiClientChannel) detectBlackhole() {
 				))
 				return
 			} else {
-				glog.Infof(
+				glog.V(1).Infof(
 					"[multi]routing ok %s: %d %dB <> %d %dB\n",
 					self.args.Destination,
 					windowStats.sendAckCount,
