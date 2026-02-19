@@ -467,7 +467,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 		result := eval(handleCtx, dialer)
 		if result != nil {
 			if result.err == nil {
-				glog.Infof("[net][p]select: %s\n", dialer.String())
+				glog.V(2).Infof("[net][p]select: %s\n", dialer.String())
 				return result
 			}
 			glog.V(2).Infof("[net][p]select: %s = %s\n", dialer.String(), result.err)
