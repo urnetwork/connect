@@ -125,11 +125,16 @@ func testingNewMultiClient(ctx context.Context, providerClient *Client, receiveP
 		},
 	}
 
-	multiClient := NewRemoteUserNatMultiClientWithDefaults(
+	settings := DefaultMultiClientSettings()
+	// TODO the tcp packets must use real seq numbers for this to work
+	settings.TcpCollapsePrevention = false
+
+	multiClient := NewRemoteUserNatMultiClient(
 		ctx,
 		generator,
 		receivePacketCallback,
 		protocol.ProvideMode_Network,
+		settings,
 	)
 
 	return multiClient, nil
@@ -222,6 +227,7 @@ func TestMultiClientChannelWindowStats(t *testing.T) {
 	settings := DefaultMultiClientSettings()
 	settings.StatsWindowBucketDuration = 100 * time.Millisecond
 	settings.StatsWindowDuration = 1 * time.Second
+	settings.BlackholeTimeout = 300 * time.Second
 
 	// the coalesce logic trims from the last event in a bucket
 	// if events are uniformly distributed in a bucket, this means there will be an extra bucket

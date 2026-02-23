@@ -179,6 +179,8 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		DefaultReconnectScale: 1.0,
 		DefaultUlimit:         0,
 
+		TcpCollapsePrevention: true,
+
 		IngressSecurityPolicyGenerator: DefaultIngressSecurityPolicyWithStats,
 		EgressSecurityPolicyGenerator:  DefaultEgressSecurityPolicyWithStats,
 
@@ -261,6 +263,8 @@ type MultiClientSettings struct {
 	DefaultReconnectScale float64
 	// used when ulimit is not set in a custom performance profile
 	DefaultUlimit int
+
+	TcpCollapsePrevention bool
 
 	IngressSecurityPolicyGenerator func(*SecurityPolicyStatsCollector) SecurityPolicy
 	EgressSecurityPolicyGenerator  func(*SecurityPolicyStatsCollector) SecurityPolicy
@@ -923,33 +927,39 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 	}
 }
 
-func (self *RemoteUserNatMultiClient) canSendPacket(ipPath *IpPath, update *multiClientChannelUpdate) bool {
+func (self *RemoteUserNatMultiClient) canSendPacket(ipPath *IpPath, update *multiClientChannelUpdate) (allow bool) {
 	switch ipPath.Protocol {
 	case IpProtocolTcp:
-		// limit sender tcp collapse
-		// as soon as a packet is sent to a client, either the client will eith reliabily transfer the packet,
-		// or the client will be dropped
-		// retransmits don't need to be sent as soon as the packet is committed to a client
+		if self.settings.TcpCollapsePrevention {
+			// limit sender tcp collapse
+			// as soon as a packet is sent to a client, either the client will eith reliabily transfer the packet,
+			// or the client will be dropped
+			// retransmits don't need to be sent as soon as the packet is committed to a client
+			if ipPath.Syn || ipPath.Rst || ipPath.Ack {
+				allow = true
+			} else {
+				func() {
+					self.stateLock.Lock()
+					defer self.stateLock.Unlock()
 
-		if ipPath.Syn || ipPath.Rst || ipPath.Ack {
-			return true
+					if update.normalPacketCount == 0 {
+						allow = true
+						return
+					}
+
+					if update.sequenceNumber < ipPath.SequenceNumber {
+						allow = true
+						return
+					}
+				}()
+			}
+		} else {
+			allow = true
 		}
-
-		self.stateLock.Lock()
-		defer self.stateLock.Unlock()
-
-		if update.normalPacketCount == 0 {
-			return true
-		}
-
-		if update.sequenceNumber < ipPath.SequenceNumber {
-			return true
-		}
-
-		return false
 	default:
-		return true
+		allow = true
 	}
+	return
 }
 
 func (self *RemoteUserNatMultiClient) sendPacket(
@@ -986,9 +996,7 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 						update.sequenceNumber = ipPath.SequenceNumber
 					}
 				}()
-				return
-			}
-			if err != nil {
+			} else if err != nil {
 				// reset the path
 
 				glog.Infof("[multi]reset error = %s\n", err)
@@ -1020,6 +1028,8 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 					}
 				}
 			}
+			// else the packet was dropped due to backpressure
+			// keep sending to the client until there is an error
 			return
 		}
 
