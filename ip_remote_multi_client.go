@@ -938,7 +938,7 @@ func (self *RemoteUserNatMultiClient) canSendPacket(ipPath *IpPath, update *mult
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 
-		if update.packetCount == 0 {
+		if update.normalPacketCount == 0 {
 			return true
 		}
 
@@ -963,18 +963,6 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 		if !self.canSendPacket(ipPath, update) {
 			return
 		}
-		defer func() {
-			if success {
-				self.stateLock.Lock()
-				defer self.stateLock.Unlock()
-
-				update.packetCount += 1
-
-				if update.sequenceNumber < ipPath.SequenceNumber {
-					update.sequenceNumber = ipPath.SequenceNumber
-				}
-			}
-		}()
 
 		enterTime := time.Now()
 
@@ -988,6 +976,16 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 			var err error
 			success, err = client.SendDetailed(sendPacket, timeout)
 			if success {
+				func() {
+					self.stateLock.Lock()
+					defer self.stateLock.Unlock()
+
+					update.normalPacketCount += 1
+
+					if update.sequenceNumber < ipPath.SequenceNumber {
+						update.sequenceNumber = ipPath.SequenceNumber
+					}
+				}()
 				return
 			}
 			if err != nil {
@@ -1490,8 +1488,10 @@ type multiClientChannelUpdate struct {
 	activityTime time.Time
 	ipPath       *IpPath
 
-	packetCount    int
-	sequenceNumber uint32
+	// this tracks packets send when the client is set
+	// race packets are not currently tracked
+	normalPacketCount int
+	sequenceNumber    uint32
 }
 
 func newMultiClientChannelUpdate(ctx context.Context, ipPath *IpPath) *multiClientChannelUpdate {
