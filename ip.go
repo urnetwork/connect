@@ -2868,6 +2868,11 @@ type IpPath struct {
 	SourcePort      int
 	DestinationIp   net.IP
 	DestinationPort int
+
+	SequenceNumber uint32
+	Syn            bool
+	Rst            bool
+	Ack            bool
 }
 
 func ParseIpPath(ipPacket []byte) (*IpPath, error) {
@@ -2912,6 +2917,10 @@ func ParseIpPathWithPayload(ipPacket []byte) (*IpPath, []byte, error) {
 				SourcePort:      int(tcp.SrcPort),
 				DestinationIp:   destinationIpCopy,
 				DestinationPort: int(tcp.DstPort),
+				SequenceNumber:  tcp.Seq,
+				Syn:             tcp.SYN,
+				Rst:             tcp.RST,
+				Ack:             tcp.ACK,
 			}, tcp.Payload, nil
 		default:
 			// no support for this protocol
@@ -2951,6 +2960,10 @@ func ParseIpPathWithPayload(ipPacket []byte) (*IpPath, []byte, error) {
 				SourcePort:      int(tcp.SrcPort),
 				DestinationIp:   destinationIpCopy,
 				DestinationPort: int(tcp.DstPort),
+				SequenceNumber:  tcp.Seq,
+				Syn:             tcp.SYN,
+				Rst:             tcp.RST,
+				Ack:             tcp.ACK,
 			}, tcp.Payload, nil
 		default:
 			// no support for this protocol

@@ -567,7 +567,12 @@ func (self *RemoteUserNatMultiClient) updateClientPath(ipPath *IpPath, callback 
 	}()
 }
 
-func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClientChannelUpdate, *multiClientChannel) {
+func (self *RemoteUserNatMultiClient) reserveUpdate(
+	ipPath *IpPath,
+) (
+	*multiClientChannelUpdate,
+	*multiClientChannel,
+) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -617,8 +622,8 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClien
 	switch ipPath.Version {
 	case 4:
 		ip4Path := ipPath.ToIp4Path()
-		update, ok := self.ip4PathUpdates[ip4Path]
 		var previousClient *multiClientChannel
+		update, ok := self.ip4PathUpdates[ip4Path]
 		if !ok || update.IsDone() {
 			var affinityIpPaths []*IpPath
 			var affinityAttach bool
@@ -713,8 +718,8 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(ipPath *IpPath) (*multiClien
 		return update, previousClient
 	case 6:
 		ip6Path := ipPath.ToIp6Path()
-		update, ok := self.ip6PathUpdates[ip6Path]
 		var previousClient *multiClientChannel
+		update, ok := self.ip6PathUpdates[ip6Path]
 		if !ok || update.IsDone() {
 			var affinityIpPaths []*IpPath
 			var affinityAttach bool
@@ -918,6 +923,35 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 	}
 }
 
+func (self *RemoteUserNatMultiClient) canSendPacket(ipPath *IpPath, update *multiClientChannelUpdate) bool {
+	switch ipPath.Protocol {
+	case IpProtocolTcp:
+		// limit sender tcp collapse
+		// as soon as a packet is sent to a client, either the client will eith reliabily transfer the packet,
+		// or the client will be dropped
+		// retransmits don't need to be sent as soon as the packet is committed to a client
+
+		if ipPath.Syn || ipPath.Rst || ipPath.Ack {
+			return true
+		}
+
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+
+		if update.packetCount == 0 {
+			return true
+		}
+
+		if update.sequenceNumber < ipPath.SequenceNumber {
+			return true
+		}
+
+		return false
+	default:
+		return true
+	}
+}
+
 func (self *RemoteUserNatMultiClient) sendPacket(
 	source TransferPath,
 	provideMode protocol.ProvideMode,
@@ -926,6 +960,22 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 ) (success bool) {
 	ipPath := sendPacket.ipPath
 	self.updateClientPath(ipPath, func(update *multiClientChannelUpdate) {
+		if !self.canSendPacket(ipPath, update) {
+			return
+		}
+		defer func() {
+			if success {
+				self.stateLock.Lock()
+				defer self.stateLock.Unlock()
+
+				update.packetCount += 1
+
+				if update.sequenceNumber < ipPath.SequenceNumber {
+					update.sequenceNumber = ipPath.SequenceNumber
+				}
+			}
+		}()
+
 		enterTime := time.Now()
 
 		currentClient := func() *multiClientChannel {
@@ -933,50 +983,45 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 			defer self.stateLock.Unlock()
 			return update.client
 		}
-		sendCurrent := func() (bool, error) {
-			for client := currentClient(); client != nil; {
-				return client.SendDetailed(sendPacket, timeout)
+
+		for client := currentClient(); client != nil; {
+			var err error
+			success, err = client.SendDetailed(sendPacket, timeout)
+			if success {
+				return
 			}
-			return false, nil
-		}
+			if err != nil {
+				// reset the path
 
-		var err error
-		success, err = sendCurrent()
-		if success {
-			return
-		}
-		if err != nil {
-			// reset this path
+				glog.Infof("[multi]reset error = %s\n", err)
 
-			glog.Infof("[multi]reset error = %s\n", err)
+				func() {
+					self.stateLock.Lock()
+					defer self.stateLock.Unlock()
 
-			func() {
-				self.stateLock.Lock()
-				defer self.stateLock.Unlock()
+					update.client = nil
+				}()
 
-				update.client = nil
-			}()
+				rstPackets := []*receivePacket{}
 
-			rstPackets := []*receivePacket{}
-
-			if packet, ok := ipOosRst(update.ipPath.Reverse()); ok {
-				rstPacket := &receivePacket{
-					Source:      TransferPath{},
-					ProvideMode: protocol.ProvideMode_Network,
-					IpPath:      update.ipPath,
-					Packet:      packet,
+				if packet, ok := ipOosRst(update.ipPath.Reverse()); ok {
+					rstPacket := &receivePacket{
+						Source:      TransferPath{},
+						ProvideMode: protocol.ProvideMode_Network,
+						IpPath:      update.ipPath,
+						Packet:      packet,
+					}
+					rstPackets = append(rstPackets, rstPacket)
 				}
-				rstPackets = append(rstPackets, rstPacket)
-			}
 
-			select {
-			case <-self.ctx.Done():
-			default:
-				for _, p := range rstPackets {
-					self.receivePacketCallback(p.Source, p.ProvideMode, p.IpPath, p.Packet)
+				select {
+				case <-self.ctx.Done():
+				default:
+					for _, p := range rstPackets {
+						self.receivePacketCallback(p.Source, p.ProvideMode, p.IpPath, p.Packet)
+					}
 				}
 			}
-
 			return
 		}
 
@@ -1444,6 +1489,9 @@ type multiClientChannelUpdate struct {
 	race         *multiClientChannelUpdateRace
 	activityTime time.Time
 	ipPath       *IpPath
+
+	packetCount    int
+	sequenceNumber uint32
 }
 
 func newMultiClientChannelUpdate(ctx context.Context, ipPath *IpPath) *multiClientChannelUpdate {
