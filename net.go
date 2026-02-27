@@ -3,11 +3,13 @@ package connect
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"time"
 
 	"golang.org/x/net/proxy"
-	// "github.com/urnetwork/glog"
+
+	"github.com/urnetwork/glog"
 )
 
 type DialContextFunction = func(ctx context.Context, network string, addr string) (net.Conn, error)
@@ -50,6 +52,9 @@ type ConnectSettings struct {
 	Resolver      *net.Resolver
 
 	DialContextSettings *DialContextSettings
+
+	DisableIpv4 bool
+	DisableIpv6 bool
 }
 
 type DialContextSettings struct {
@@ -57,6 +62,40 @@ type DialContextSettings struct {
 }
 
 func (self *ConnectSettings) DialContext(ctx context.Context, network string, addr string) (net.Conn, error) {
+	if self.DisableIpv4 && self.DisableIpv6 {
+		return nil, fmt.Errorf("ipv4 and ipv6 are both disabled")
+	}
+	switch network {
+	case "tcp":
+		if self.DisableIpv4 {
+			network = "tcp6"
+		} else if self.DisableIpv6 {
+			network = "tcp4"
+		}
+	case "tcp4":
+		if self.DisableIpv4 {
+			return nil, fmt.Errorf("ipv4 is disabled")
+		}
+	case "tcp6":
+		if self.DisableIpv6 {
+			return nil, fmt.Errorf("ipv6 is disabled")
+		}
+	case "udp":
+		if self.DisableIpv4 {
+			network = "udp6"
+		} else if self.DisableIpv6 {
+			network = "udp4"
+		}
+	case "udp4":
+		if self.DisableIpv4 {
+			return nil, fmt.Errorf("ipv4 is disabled")
+		}
+	case "udp6":
+		if self.DisableIpv6 {
+			return nil, fmt.Errorf("ipv6 is disabled")
+		}
+	}
+
 	var dialContext DialContextFunction
 
 	if self.DialContextSettings != nil {
@@ -73,7 +112,13 @@ func (self *ConnectSettings) DialContext(ctx context.Context, network string, ad
 		}
 	}
 
-	return dialContext(ctx, network, addr)
+	conn, err := dialContext(ctx, network, addr)
+	if err == nil {
+		glog.Infof("[net]dial %s %s success\n", network, addr)
+	} else {
+		glog.Infof("[net]dial %s %s err=%s\n", network, addr, err)
+	}
+	return conn, err
 }
 
 func (self *ConnectSettings) NetDialer() *net.Dialer {
