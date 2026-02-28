@@ -113,10 +113,12 @@ func (self *ConnectSettings) DialContext(ctx context.Context, network string, ad
 	}
 
 	conn, err := dialContext(ctx, network, addr)
-	if err == nil {
-		glog.Infof("[net]dial %s %s success\n", network, addr)
-	} else {
-		glog.Infof("[net]dial %s %s err=%s\n", network, addr, err)
+	if glog.V(2) {
+		if err == nil {
+			glog.Infof("[net]dial %s %s success\n", network, addr)
+		} else {
+			glog.Infof("[net]dial %s %s err=%s\n", network, addr, err)
+		}
 	}
 	return conn, err
 }
