@@ -425,80 +425,26 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 	out := make(chan *evalResult)
 
 	run := func(dialer *clientDialer) {
+		success := false
+		defer func() {
+			if !success {
+				select {
+				case out <- nil:
+				case <-handleCtx.Done():
+				}
+			}
+		}()
 		result := eval(handleCtx, dialer)
-		if result != nil {
-			result.dialer = dialer
+		if result == nil {
+			return
 		}
 
+		result.dialer = dialer
 		select {
 		case out <- result:
+			success = true
 		case <-handleCtx.Done():
-			if result != nil {
-				result.Close()
-			}
-		}
-	}
-
-	self.collapseExtenderDialers()
-
-	dialerWeights := self.dialerWeights()
-
-	serialDialers := []*clientDialer{}
-	parallelDialers := []*clientDialer{}
-
-	for dialer, _ := range dialerWeights {
-		if dialer.IsLastSuccess() {
-			serialDialers = append(serialDialers, dialer)
-		} else {
-			parallelDialers = append(parallelDialers, dialer)
-		}
-	}
-
-	slices.SortStableFunc(serialDialers, func(a *clientDialer, b *clientDialer) int {
-		return a.priority - b.priority
-	})
-	for _, dialer := range serialDialers {
-		select {
-		case <-handleCtx.Done():
-			return nil
-		default:
-		}
-
-		result := eval(handleCtx, dialer)
-		if result != nil {
-			if result.err == nil {
-				glog.V(2).Infof("[net][p]select: %s\n", dialer.String())
-				return result
-			}
-			glog.V(2).Infof("[net][p]select: %s = %s\n", dialer.String(), result.err)
 			result.Close()
-		}
-	}
-
-	// note parallel dialers is in the original weighted order
-	WeightedShuffle(parallelDialers, dialerWeights)
-	n := min(len(parallelDialers), self.settings.ParallelBlockSize)
-	for _, dialer := range parallelDialers[0:n] {
-		go HandleError(func() {
-			run(dialer)
-		})
-	}
-	for _, dialer := range parallelDialers[n:] {
-		select {
-		case <-handleCtx.Done():
-			return nil
-		case result := <-out:
-			if result != nil {
-				if result.err == nil {
-					glog.Infof("[net][p]select: %s\n", result.dialer.String())
-					return result
-				}
-				glog.V(2).Infof("[net][p]select: %s = %s\n", result.dialer.String(), result.err)
-				result.Close()
-			}
-			go HandleError(func() {
-				run(dialer)
-			})
 		}
 	}
 
@@ -510,6 +456,81 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 		default:
 		}
 
+		self.collapseExtenderDialers()
+
+		// the number of runs with pending out
+		p := 0
+
+		dialerWeights := self.dialerWeights()
+		if 0 < len(dialerWeights) {
+			serialDialers := []*clientDialer{}
+			parallelDialers := []*clientDialer{}
+
+			dialers := maps.Keys(dialerWeights)
+			WeightedShuffle(dialers, dialerWeights)
+
+			// always try the top options first
+			serialDialers = append(serialDialers, dialers[0])
+
+			for _, dialer := range dialers[1:] {
+				if dialer.IsLastSuccess() {
+					serialDialers = append(serialDialers, dialer)
+				} else {
+					parallelDialers = append(parallelDialers, dialer)
+				}
+			}
+
+			// WeightedShuffle(serialDialers, dialerWeights)
+			slices.SortStableFunc(serialDialers, func(a *clientDialer, b *clientDialer) int {
+				return a.priority - b.priority
+			})
+			for _, dialer := range serialDialers {
+				select {
+				case <-handleCtx.Done():
+					return nil
+				default:
+				}
+
+				result := eval(handleCtx, dialer)
+				if result != nil {
+					if result.err == nil {
+						glog.V(2).Infof("[net][p]select: %s\n", dialer.String())
+						return result
+					}
+					glog.V(2).Infof("[net][p]select: %s = %s\n", dialer.String(), result.err)
+					result.Close()
+				}
+			}
+
+			// note parallel dialers is in the original weighted order
+			// WeightedShuffle(parallelDialers, dialerWeights)
+			n := min(len(parallelDialers), self.settings.ParallelBlockSize)
+			p += n
+			for _, dialer := range parallelDialers[0:n] {
+				go HandleError(func() {
+					run(dialer)
+				})
+			}
+			for _, dialer := range parallelDialers[n:] {
+				select {
+				case <-handleCtx.Done():
+					return nil
+				case result := <-out:
+					if result != nil {
+						if result.err == nil {
+							glog.Infof("[net][p]select: %s\n", result.dialer.String())
+							return result
+						}
+						glog.V(2).Infof("[net][p]select: %s = %s\n", result.dialer.String(), result.err)
+						result.Close()
+					}
+					go HandleError(func() {
+						run(dialer)
+					})
+				}
+			}
+		}
+
 		expandStartTime := time.Now()
 
 		self.collapseExtenderDialers()
@@ -518,27 +539,43 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 			break
 		}
 
-		m := min(len(expandedDialers), self.settings.ParallelBlockSize-n)
-		n += m
-		for _, dialer := range expandedDialers[0:m] {
+		n := min(len(expandedDialers), self.settings.ParallelBlockSize-p)
+		p += n
+		for _, dialer := range expandedDialers[0:n] {
 			go HandleError(func() {
 				run(dialer)
 			})
 		}
-		for _, dialer := range expandedDialers[m:] {
+		for _, dialer := range expandedDialers[n:] {
 			select {
 			case <-handleCtx.Done():
 				return nil
 			case result := <-out:
-				if result.err == nil {
-					glog.Infof("[net][p]select: %s\n", result.dialer.String())
-					return result
+				if result != nil {
+					if result.err == nil {
+						glog.Infof("[net][p]select: %s\n", result.dialer.String())
+						return result
+					}
+					glog.V(2).Infof("[net][p]select: %s = %s\n", result.dialer.String(), result.err)
+					result.Close()
 				}
-				glog.V(2).Infof("[net][p]select: %s = %s\n", result.dialer.String(), result.err)
-				result.Close()
 				go HandleError(func() {
 					run(dialer)
 				})
+			}
+		}
+
+		for range p {
+			select {
+			case <-handleCtx.Done():
+				return nil
+			case result := <-out:
+				if result != nil {
+					if result.err == nil {
+						return result
+					}
+					result.Close()
+				}
 			}
 		}
 
@@ -552,18 +589,6 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 				return nil
 			case <-time.After(timeout):
 			}
-		}
-	}
-
-	for range n {
-		select {
-		case <-handleCtx.Done():
-			return nil
-		case result := <-out:
-			if result.err == nil {
-				return result
-			}
-			result.Close()
 		}
 	}
 
