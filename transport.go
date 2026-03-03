@@ -306,6 +306,8 @@ var transportModePreferences = map[TransportMode]int{
 func (self *PlatformTransport) run() {
 	defer self.cancel()
 
+	// TODO udp protocols need proxy protocol support in the load balancer
+	// see https://github.com/nginx/nginx/issues/1061
 	switch self.targetMode {
 	case TransportModeAuto:
 		go HandleError(func() {
