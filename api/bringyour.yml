@@ -1231,6 +1231,61 @@ paths:
               schema:
                 $ref: "#/components/schemas/HelloResult"
 
+  /account/api-key:
+    post:
+      description: |
+        Create an API key for the account.
+      operationId: Account Create API Key
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateApiKeyArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateApiKeyResult"
+
+  /account/api-key/remove:
+    post:
+      description: |
+        Remove an API key for the account.
+      operationId: Account Remove API Key
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeleteApiKeyArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeleteApiKeyResult"
+
+  /account/api-keys:
+    get:
+      description: |
+        Fetches a list of API keys associated with the account.
+        The list does not include the API key secrets, only metadata.
+      operationId: Account Get API Keys
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetApiKeysResult"
+
   /account/payout-wallet:
     post:
       description: |
@@ -2082,14 +2137,14 @@ components:
         # the returned proxy urls are valid as long as the client is not removed
         proxy_config_result:
           description: |
-              The following proxy URLs and auths may be used:
-              | URL | Auth |
-              |-----|------|
-              | https://<auth_token>.<proxy_host>:<https_proxy_port> | no auth needed when the client connects with TLS | 
-              | https://<proxy_host>:<https_proxy_port> | use HTTP Proxy-Authorization Basic with `access_token` as the username (empty pass), or Bearer with `access_token` as the bearer token | 
-              | http://<proxy_host>:<http_proxy_port> | use HTTP Proxy-Authorization Basic with `access_token` as the username (empty pass), or Bearer with `access_token` as the bearer token | 
-              | tcp://<proxy_host>:<socks_proxy_port> | use `access_token` as the username (empty pass) | 
-              | wg://<proxy_host>:<wg_proxy_port> | use `wg_config.config` as the full WireGuard config file content, which contains all the necessary keys | 
+            The following proxy URLs and auths may be used:
+            | URL | Auth |
+            |-----|------|
+            | https://<auth_token>.<proxy_host>:<https_proxy_port> | no auth needed when the client connects with TLS |
+            | https://<proxy_host>:<https_proxy_port> | use HTTP Proxy-Authorization Basic with `access_token` as the username (empty pass), or Bearer with `access_token` as the bearer token |
+            | http://<proxy_host>:<http_proxy_port> | use HTTP Proxy-Authorization Basic with `access_token` as the username (empty pass), or Bearer with `access_token` as the bearer token |
+            | tcp://<proxy_host>:<socks_proxy_port> | use `access_token` as the username (empty pass) |
+            | wg://<proxy_host>:<wg_proxy_port> | use `wg_config.config` as the full WireGuard config file content, which contains all the necessary keys |
           allOf:
             - type: object
               properties:
@@ -2102,7 +2157,7 @@ components:
                     If the proxy is removed from memmory, the next call to the proxy will
                     create a new device set up to the `initial_device_state` (if present).
                   type: integer
-            - $ref: '#/components/schemas/ProxyClient'
+            - $ref: "#/components/schemas/ProxyClient"
 
         error:
           type: object
@@ -3641,3 +3696,66 @@ components:
             $ref: "#/components/schemas/NetworkRedeemedBalanceCode"
         error:
           $ref: "#/components/schemas/NetworkBalanceCodesError"
+
+    CreateApiKeyArgs:
+      type: object
+      properties:
+        name:
+          type: string
+
+    CreateApiKeyResult:
+      type: object
+      properties:
+        id:
+          description: uuid
+          type: string
+        api_key:
+          type: string
+        name:
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    PublicAccountApiKey:
+      type: object
+      properties:
+        id:
+          description: uuid
+          type: string
+        name:
+          type: string
+        create_time:
+          description: datetime
+          type: string
+
+    GetApiKeysResult:
+      type: object
+      properties:
+        api_keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/PublicAccountApiKey"
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    DeleteApiKeyArgs:
+      type: object
+      properties:
+        id:
+          description: uuid
+          type: string
+
+    DeleteApiKeyResult:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string
