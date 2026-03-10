@@ -20,8 +20,6 @@ const MaxMultihopLength = 8
 // v2: 2025-05-28 to optimize memory usage. Breaks compatibility with v1
 //
 //	Most clients need to be able to read v2 before we turn this on.
-//
-// TODO migrate to 2
 const DefaultProtocolVersion = 2
 
 // id for message to/from the platform
@@ -31,13 +29,17 @@ var ControlId = Id{}
 // TODO SourceTransferPath, DestinationTransferPath
 // TODO this would avoid the need to check the "masks"
 
-// there are three types of transfer paths:
-//  1. a full path, which can have either source id and destination id, or stream id
-//  2. a source, which can have either source id or stream id.
+// there are four types of transfer paths:
+//  1. a full path, which will have source id, destination id, and optional stream id
+//  2. a full path without stream, which will have source id and/or destination id, but no stream id.
+//     This is called the "local mask".
+//  3. a source, which will have source id and optional stream id.
 //     This is called the "source mask".
-//  3. a destination, which can have either destination id or stream id.
+//  4. a destination, which will have destination id and optional stream id.
 //     This is called the "destination mask".
-//
+// Normally a local mask should be stored in the protobuf message transfer path,
+// and the destination mask should be used to match routes.
+
 // comparable
 type TransferPath struct {
 	SourceId      Id
@@ -64,11 +66,9 @@ func StreamId(streamId Id) TransferPath {
 }
 
 func NewTransferPath(sourceId Id, destinationId Id, streamId Id) (path TransferPath) {
+	path.SourceId = sourceId
+	path.DestinationId = destinationId
 	path.StreamId = streamId
-	if (path.StreamId == Id{}) {
-		path.SourceId = sourceId
-		path.DestinationId = destinationId
-	}
 	return
 }
 
@@ -87,35 +87,33 @@ func TransferPathFromBytes(
 	destinationIdBytes []byte,
 	streamIdBytes []byte,
 ) (path TransferPath, err error) {
+	if sourceIdBytes != nil {
+		path.SourceId, err = IdFromBytes(sourceIdBytes)
+		if err != nil {
+			return
+		}
+	}
+	if destinationIdBytes != nil {
+		path.DestinationId, err = IdFromBytes(destinationIdBytes)
+		if err != nil {
+			return
+		}
+	}
 	if streamIdBytes != nil {
 		path.StreamId, err = IdFromBytes(streamIdBytes)
 		if err != nil {
 			return
 		}
 	}
-	if (path.StreamId == Id{}) {
-		if sourceIdBytes != nil {
-			path.SourceId, err = IdFromBytes(sourceIdBytes)
-			if err != nil {
-				return
-			}
-		}
-		if destinationIdBytes != nil {
-			path.DestinationId, err = IdFromBytes(destinationIdBytes)
-			if err != nil {
-				return
-			}
-		}
-	}
 	return
 }
 
 func (self TransferPath) IsControlSource() bool {
-	return self.IsSourceMask() && !self.IsStream() && self.SourceId == ControlId
+	return self.SourceId == ControlId && (self.DestinationId == Id{}) && (self.StreamId == Id{})
 }
 
 func (self TransferPath) IsControlDestination() bool {
-	return self.IsDestinationMask() && !self.IsStream() && self.DestinationId == ControlId
+	return self.DestinationId == ControlId && (self.SourceId == Id{}) && (self.StreamId == Id{})
 }
 
 func (self TransferPath) IsStream() bool {
@@ -123,19 +121,15 @@ func (self TransferPath) IsStream() bool {
 }
 
 func (self TransferPath) IsSourceMask() bool {
-	if self.IsStream() {
-		return self.SourceId == Id{} && self.DestinationId == Id{}
-	} else {
-		return self.DestinationId == Id{}
-	}
+	return self.DestinationId == Id{}
 }
 
 func (self TransferPath) IsDestinationMask() bool {
-	if self.IsStream() {
-		return self.SourceId == Id{} && self.DestinationId == Id{}
-	} else {
-		return self.SourceId == Id{}
-	}
+	return self.SourceId == Id{}
+}
+
+func (self TransferPath) IsLocalMask() bool {
+	return self.StreamId == Id{}
 }
 
 func (self TransferPath) SourceMask() TransferPath {
@@ -152,6 +146,13 @@ func (self TransferPath) DestinationMask() TransferPath {
 	}
 }
 
+func (self TransferPath) LocalMask() TransferPath {
+	return TransferPath{
+		SourceId:      self.SourceId,
+		DestinationId: self.DestinationId,
+	}
+}
+
 func (self TransferPath) Reverse() TransferPath {
 	return TransferPath{
 		SourceId:      self.DestinationId,
@@ -161,40 +162,49 @@ func (self TransferPath) Reverse() TransferPath {
 }
 
 func (self TransferPath) AddSource(sourceId Id) TransferPath {
-	if self.IsStream() {
-		return self
-	}
 	return TransferPath{
 		SourceId:      sourceId,
 		DestinationId: self.DestinationId,
+		StreamId:      self.StreamId,
 	}
 }
 
 func (self TransferPath) AddDestination(destinationId Id) TransferPath {
-	if self.IsStream() {
-		return self
-	}
 	return TransferPath{
 		SourceId:      self.SourceId,
 		DestinationId: destinationId,
+		StreamId:      self.StreamId,
 	}
 }
 
 func (self TransferPath) String() string {
+	var spart string
+	var dpart string
 	if (self.StreamId != Id{}) {
-		return fmt.Sprintf("s(%s)", self.StreamId)
+		spart = fmt.Sprintf("s(%s)", self.StreamId)
+	}
+	if (self.SourceId != Id{}) || (self.DestinationId != Id{}) {
+		dpart = fmt.Sprintf("%s->%s", self.SourceId, self.DestinationId)
+	}
+	if spart != "" && dpart != "" {
+		return fmt.Sprintf("%s %s", spart, dpart)
+	} else if spart != "" {
+		return spart
 	} else {
-		return fmt.Sprintf("%s->%s", self.SourceId, self.DestinationId)
+		return dpart
 	}
 }
 
 func (self TransferPath) ToProtobuf() *protocol.TransferPath {
 	protoTransferPath := &protocol.TransferPath{}
-	if self.IsStream() {
-		protoTransferPath.StreamId = self.StreamId.Bytes()
-	} else {
+	if (self.SourceId != Id{}) {
 		protoTransferPath.SourceId = self.SourceId.Bytes()
+	}
+	if (self.DestinationId != Id{}) {
 		protoTransferPath.DestinationId = self.DestinationId.Bytes()
+	}
+	if (self.StreamId != Id{}) {
+		protoTransferPath.StreamId = self.StreamId.Bytes()
 	}
 	return protoTransferPath
 }

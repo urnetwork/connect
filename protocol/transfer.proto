@@ -18,7 +18,6 @@ import "frame.proto";
 //    so that the hop state can time out the same as the sender state.
 
 
-// stream_id replaces the source_id and destination_id
 message TransferPath {
     // ulid
     optional bytes source_id = 2;
@@ -165,6 +164,38 @@ message StreamClose {
     bytes stream_id = 3;
 }
 
+message StreamReset {
+    repeated StreamOpen streams = 1;
+}
+
+
+enum SignalType {
+    // reset means clear all previous signals for the transfer peer pair
+    NoSignal = 0;
+    SdpOffer = 1;
+    SdpAnswer = 2;
+    IceCandidate = 3;
+    WaitingForSdpOffer = 4;
+}
+
+message ExchangeSignals {
+    // ulid
+    bytes stream_id = 1;
+    bool reset_signals = 2;
+    repeated ExchangeSignal signals = 3;
+}
+
+// signals are sent in real time to the destination of the peer pair
+message ExchangeSignal {
+    SignalType signal_type = 3;
+
+    // json encoded using the structure in the code
+    optional bytes sdp = 4;
+    // json encoded using the structure in the code
+    optional bytes ice_candidate = 5;
+}
+
+
 
 // control message to create a contract
 // platform sends a CreateContractResult
@@ -220,8 +251,6 @@ message Contract {
     ProvideMode provide_mode = 3;
 }
 
-
-// stream_id replaces the source_id and destination_id
 message StoredContract {
     bytes contract_id = 1;
     uint64 transfer_byte_count = 2;

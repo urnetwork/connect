@@ -86,6 +86,7 @@ func TestTransferPath(t *testing.T) {
 	assert.Equal(t, path.IsStream(), false)
 	assert.Equal(t, path.IsSourceMask(), true)
 	assert.Equal(t, path.IsDestinationMask(), true)
+	assert.Equal(t, path.IsLocalMask(), true)
 	assert.Equal(t, path.IsControlSource(), true)
 	assert.Equal(t, path.IsControlDestination(), true)
 
@@ -95,6 +96,7 @@ func TestTransferPath(t *testing.T) {
 	assert.Equal(t, path.IsStream(), false)
 	assert.Equal(t, path.IsSourceMask(), true)
 	assert.Equal(t, path.IsDestinationMask(), false)
+	assert.Equal(t, path.IsLocalMask(), true)
 	assert.Equal(t, path.IsControlSource(), false)
 	assert.Equal(t, path.IsControlDestination(), false)
 
@@ -103,6 +105,7 @@ func TestTransferPath(t *testing.T) {
 	assert.Equal(t, path.IsStream(), false)
 	assert.Equal(t, path.IsSourceMask(), true)
 	assert.Equal(t, path.IsDestinationMask(), false)
+	assert.Equal(t, path.IsLocalMask(), true)
 	assert.Equal(t, path.IsControlSource(), false)
 	assert.Equal(t, path.IsControlDestination(), false)
 
@@ -112,6 +115,7 @@ func TestTransferPath(t *testing.T) {
 	assert.Equal(t, path.IsStream(), false)
 	assert.Equal(t, path.IsSourceMask(), false)
 	assert.Equal(t, path.IsDestinationMask(), false)
+	assert.Equal(t, path.IsLocalMask(), true)
 	assert.Equal(t, path.IsControlSource(), false)
 	assert.Equal(t, path.IsControlDestination(), false)
 
@@ -121,6 +125,7 @@ func TestTransferPath(t *testing.T) {
 	assert.Equal(t, path.IsStream(), false)
 	assert.Equal(t, path.IsSourceMask(), false)
 	assert.Equal(t, path.IsDestinationMask(), true)
+	assert.Equal(t, path.IsLocalMask(), true)
 	assert.Equal(t, path.IsControlSource(), false)
 	assert.Equal(t, path.IsControlDestination(), false)
 
@@ -129,15 +134,17 @@ func TestTransferPath(t *testing.T) {
 	assert.Equal(t, path.IsStream(), false)
 	assert.Equal(t, path.IsSourceMask(), false)
 	assert.Equal(t, path.IsDestinationMask(), true)
+	assert.Equal(t, path.IsLocalMask(), true)
 	assert.Equal(t, path.IsControlSource(), false)
 	assert.Equal(t, path.IsControlDestination(), false)
 
 	path, err = TransferPathFromBytes(a.Bytes(), b.Bytes(), c.Bytes())
 	assert.Equal(t, err, nil)
-	assert.Equal(t, path, TransferPath{StreamId: c})
+	assert.NotEqual(t, path, TransferPath{StreamId: c})
 	assert.Equal(t, path.IsStream(), true)
-	assert.Equal(t, path.IsSourceMask(), true)
-	assert.Equal(t, path.IsDestinationMask(), true)
+	assert.Equal(t, path.IsSourceMask(), false)
+	assert.Equal(t, path.IsDestinationMask(), false)
+	assert.Equal(t, path.IsLocalMask(), false)
 	assert.Equal(t, path.IsControlSource(), false)
 	assert.Equal(t, path.IsControlDestination(), false)
 
@@ -147,6 +154,7 @@ func TestTransferPath(t *testing.T) {
 	assert.Equal(t, path.IsStream(), true)
 	assert.Equal(t, path.IsSourceMask(), true)
 	assert.Equal(t, path.IsDestinationMask(), true)
+	assert.Equal(t, path.IsLocalMask(), false)
 	assert.Equal(t, path.IsControlSource(), false)
 	assert.Equal(t, path.IsControlDestination(), false)
 
@@ -155,6 +163,7 @@ func TestTransferPath(t *testing.T) {
 	assert.Equal(t, path.IsStream(), true)
 	assert.Equal(t, path.IsSourceMask(), true)
 	assert.Equal(t, path.IsDestinationMask(), true)
+	assert.Equal(t, path.IsLocalMask(), false)
 	assert.Equal(t, path.IsControlSource(), false)
 	assert.Equal(t, path.IsControlDestination(), false)
 
@@ -163,12 +172,15 @@ func TestTransferPath(t *testing.T) {
 	path = NewTransferPath(a, b, Id{})
 	assert.Equal(t, path.IsSourceMask(), false)
 	assert.Equal(t, path.IsDestinationMask(), false)
+	assert.Equal(t, path.IsLocalMask(), true)
 	s := path.SourceMask()
 	assert.Equal(t, s.IsSourceMask(), true)
 	assert.Equal(t, s.IsDestinationMask(), false)
+	assert.Equal(t, s.IsLocalMask(), true)
 	d := path.DestinationMask()
 	assert.Equal(t, d.IsSourceMask(), false)
 	assert.Equal(t, d.IsDestinationMask(), true)
+	assert.Equal(t, d.IsLocalMask(), true)
 
 	assert.Equal(t, path.Reverse(), TransferPath{SourceId: b, DestinationId: a})
 }

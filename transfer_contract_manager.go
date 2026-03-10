@@ -95,8 +95,7 @@ func DefaultContractManagerSettings() *ContractManagerSettings {
 
 		ProtocolVersion: DefaultProtocolVersion,
 
-		// TODO change this once main has been deployed with the p2p contract changes
-		LegacyCreateContract: true,
+		LegacyCreateContract: false,
 		TrackUsedContracts:   false,
 	}
 }
@@ -318,13 +317,16 @@ func (self *ContractManager) contractStatus(contractStatus *ContractStatus) {
 // ReceiveFunction
 func (self *ContractManager) Receive(source TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode) {
 	if source.IsControlSource() {
-		contracts := map[ContractKey]*protocol.Contract{}
-		contractErrors := map[ContractKey]protocol.ContractError{}
 		for _, frame := range frames {
-			frameContracts, frameContractErrors := self.parseControlFrame(frame)
-			maps.Copy(contracts, frameContracts)
-			maps.Copy(contractErrors, frameContractErrors)
+			self.handleControlFrame(frame)
 		}
+	}
+}
+
+func (self *ContractManager) handleControlFrame(frame *protocol.Frame) error {
+	switch frame.MessageType {
+	case protocol.MessageType_TransferCreateContractResult:
+		contracts, contractErrors := self.parseControlFrame(frame)
 		for contractKey, contract := range contracts {
 			c := func() error {
 				err := self.addContract(contractKey, contract)
@@ -391,6 +393,7 @@ func (self *ContractManager) Receive(source TransferPath, frames []*protocol.Fra
 			}
 		}
 	}
+	return nil
 }
 
 // frames are verified before calling to be from source ControlId
@@ -435,13 +438,25 @@ func (self *ContractManager) parseControlFrame(frame *protocol.Frame) (
 				return
 			}
 
-			contractKey.Destination, err = TransferPathFromBytes(
-				nil,
-				storedContract.DestinationId,
-				storedContract.StreamId,
-			)
-			if err != nil {
-				return
+			if v.CreateContract != nil {
+				var err error
+				contractKey.Destination, err = TransferPathFromBytes(
+					nil,
+					v.CreateContract.DestinationId,
+					v.CreateContract.StreamId,
+				)
+				if err != nil {
+					return
+				}
+			} else {
+				contractKey.Destination, err = TransferPathFromBytes(
+					nil,
+					storedContract.DestinationId,
+					storedContract.StreamId,
+				)
+				if err != nil {
+					return
+				}
 			}
 			contracts[contractKey] = contract
 		}
@@ -736,6 +751,20 @@ func (self *ContractManager) TakeContract(
 		contract := contractQueue.Poll()
 
 		if contract != nil {
+			storedContract := &protocol.StoredContract{}
+			if err := ProtoUnmarshal(contract.StoredContractBytes, storedContract); err == nil {
+				if contractId, err := IdFromBytes(storedContract.ContractId); err == nil {
+					func() {
+						self.mutex.Lock()
+						defer self.mutex.Unlock()
+
+						self.localStats.ContractOpenCount += 1
+						self.localStats.ContractOpenByteCounts[contractId] = ByteCount(storedContract.TransferByteCount)
+						self.localStats.ContractOpenKeys[contractId] = contractKey
+					}()
+				}
+			}
+
 			return contract
 		}
 
@@ -787,24 +816,10 @@ func (self *ContractManager) addContract(contractKey ContractKey, contract *prot
 		return fmt.Errorf("Contract source must be this client: %s<>%s", path.SourceId, self.client.ClientId())
 	}
 
-	contractId, err := IdFromBytes(storedContract.ContractId)
-	if err != nil {
-		return err
-	}
-
 	func() {
 		contractQueue := self.openContractQueue(contractKey)
 		defer self.closeContractQueue(contractKey)
 		contractQueue.Add(contract, storedContract)
-	}()
-
-	func() {
-		self.mutex.Lock()
-		defer self.mutex.Unlock()
-
-		self.localStats.ContractOpenCount += 1
-		self.localStats.ContractOpenByteCounts[contractId] = ByteCount(storedContract.TransferByteCount)
-		self.localStats.ContractOpenKeys[contractId] = contractKey
 	}()
 
 	return nil

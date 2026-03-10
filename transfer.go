@@ -81,7 +81,9 @@ func DefaultClientSettings() *ClientSettings {
 		ForwardBufferSettings:   DefaultForwardBufferSettings(),
 		ContractManagerSettings: DefaultContractManagerSettings(),
 		StreamManagerSettings:   DefaultStreamManagerSettings(),
+		WebRtcSettings:          DefaultWebRtcSettings(),
 		ProtocolVersion:         DefaultProtocolVersion,
+		DefaultTransferOpts:     DefaultTransferOpts(),
 	}
 }
 
@@ -250,8 +252,11 @@ type ClientSettings struct {
 	ForwardBufferSettings   *ForwardBufferSettings
 	ContractManagerSettings *ContractManagerSettings
 	StreamManagerSettings   *StreamManagerSettings
+	WebRtcSettings          *WebRtcSettings
 
 	ProtocolVersion int
+
+	DefaultTransferOpts TransferOptions
 }
 
 // note all callbacks are wrapped to check for nil and recover from errors
@@ -272,12 +277,14 @@ type Client struct {
 
 	routeManager    *RouteManager
 	contractManager *ContractManager
+	webRtcManager   *WebRtcManager
 	streamManager   *StreamManager
 	sendBuffer      *SendBuffer
 	receiveBuffer   *ReceiveBuffer
 	forwardBuffer   *ForwardBuffer
 
 	contractManagerUnsub func()
+	webRtcManagerUnsub   func()
 	streamManagerUnsub   func()
 }
 
@@ -326,12 +333,14 @@ func NewClientWithTag(
 
 	routeManager := NewRouteManager(ctx, clientTag)
 	contractManager := NewContractManager(ctx, client, settings.ContractManagerSettings)
-	streamManager := NewStreamManager(ctx, client, settings.StreamManagerSettings)
+	webRtcManager := NewWebRtcManager(ctx, client, settings.WebRtcSettings)
+	streamManager := NewStreamManager(ctx, client, webRtcManager, settings.StreamManagerSettings)
 
 	client.contractManagerUnsub = client.AddReceiveCallback(contractManager.Receive)
+	client.webRtcManagerUnsub = client.AddReceiveCallback(webRtcManager.Receive)
 	client.streamManagerUnsub = client.AddReceiveCallback(streamManager.Receive)
 
-	client.initBuffers(routeManager, contractManager, streamManager)
+	client.initBuffers(routeManager, contractManager, webRtcManager, streamManager)
 
 	go HandleError(client.run, cancel)
 
@@ -341,10 +350,12 @@ func NewClientWithTag(
 func (self *Client) initBuffers(
 	routeManager *RouteManager,
 	contractManager *ContractManager,
+	webRtcManager *WebRtcManager,
 	streamManager *StreamManager,
 ) {
 	self.routeManager = routeManager
 	self.contractManager = contractManager
+	self.webRtcManager = webRtcManager
 	self.streamManager = streamManager
 	self.sendBuffer = NewSendBuffer(self.ctx, self, self.settings.SendBufferSettings)
 	self.receiveBuffer = NewReceiveBuffer(self.ctx, self, self.settings.ReceiveBufferSettings)
@@ -405,7 +416,7 @@ func (self *Client) ForwardWithTimeoutDetailed(transferFrameBytes []byte, timeou
 
 	destination := path.DestinationMask()
 
-	ctx := context.Background()
+	ctx := self.ctx
 	for _, opt := range opts {
 		switch v := opt.(type) {
 		case transferCtx:
@@ -511,6 +522,9 @@ func (self *Client) sendWithTimeoutDetailed(
 	if !destination.IsDestinationMask() {
 		panic(fmt.Errorf("Destination required for send: %s", destination))
 	}
+	if destination.IsStream() {
+		panic(fmt.Errorf("Destination must not be a stream: %s", destination))
+	}
 
 	select {
 	case <-self.ctx.Done():
@@ -526,8 +540,9 @@ func (self *Client) sendWithTimeoutDetailed(
 		}
 	}
 
-	ctx := context.Background()
-	transferOpts := DefaultTransferOpts()
+	ctx := self.ctx
+	var transferOpts TransferOptions
+	transferOpts = self.settings.DefaultTransferOpts
 	for _, opt := range opts {
 		switch v := opt.(type) {
 		case TransferOptions:
@@ -792,17 +807,17 @@ func (self *Client) run() {
 			MessagePoolReturn(transferFrameBytes)
 			continue
 		}
+		if path.IsStream() {
+			glog.V(1).Infof("[cr] %s cannot route message with stream\n", self.clientTag)
+			MessagePoolReturn(transferFrameBytes)
+			continue
+		}
+
 		source := path.SourceMask()
 
 		glog.V(1).Infof("[cr] %s %s<-%s s(%s)\n", self.clientTag, path.DestinationId, path.SourceId, path.StreamId)
 
-		var toLocal bool
-		if path.IsStream() {
-			toLocal = self.streamManager.IsStreamOpen(path.StreamId)
-		} else {
-			toLocal = path.DestinationId == self.clientId
-		}
-		if toLocal {
+		if path.DestinationId == self.clientId {
 			// the transports have typically not parsed the full `TransferFrame`
 			// on error, discard the message and report the peer
 			transferFrame := &protocol.TransferFrame{}
@@ -959,6 +974,7 @@ func (self *Client) Close() {
 	self.forwardBuffer.Close()
 
 	self.contractManagerUnsub()
+	self.webRtcManagerUnsub()
 	self.streamManagerUnsub()
 }
 
@@ -1143,7 +1159,7 @@ func (self *SendBuffer) Ack(destination TransferPath, ack *protocol.Ack, timeout
 		break
 	}
 	if !anyFound {
-		glog.Infof("[sb]ack miss sequence does not exist\n")
+		glog.Infof("[sb]ack miss sequence does not exist %s\n", destination)
 	}
 	return anySuccess
 }
@@ -1683,7 +1699,7 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 		if effectiveContractTransferByteCount < messageByteCount+self.sendBufferSettings.MinMessageByteCount /*+ maxContractMessageByteCount*/ {
 			// this pack does not fit into a standard contract
 			// TODO allow requesting larger contracts
-			panic("Message too large for contract. It can never be sent.")
+			panic(fmt.Errorf("Message too large for contract. It can never be sent (%d).", messageByteCount))
 		}
 
 		setNextContract := func(contract *protocol.Contract) bool {
@@ -1900,12 +1916,13 @@ func (self *SendSequence) sendWithSetContract(
 		pack.ContractId = contractId.Bytes()
 	}
 
-	var path TransferPath
-	if self.sendContract == nil {
-		path = self.destination.AddSource(self.client.ClientId())
-	} else {
-		path = self.sendContract.path
-	}
+	// var path TransferPath
+	// if self.sendContract == nil {
+	// 	path = self.destination.AddSource(self.client.ClientId())
+	// } else {
+	// 	path = self.sendContract.path.LocalMask()
+	// }
+	path := self.destination.AddSource(self.client.ClientId())
 	transferFrame := &protocol.TransferFrame{
 		TransferPath: path.ToProtobuf(),
 	}
@@ -2167,7 +2184,7 @@ func (self *SendSequence) openContractMultiRouteWriter() MultiRouteWriter {
 		self.contractMultiRouteWriterDestination = destination
 
 		// associate the destination with this sequence to receive acks
-		self.sendBuffer.AssociateDestination(self, destination)
+		self.sendBuffer.AssociateDestination(self, destination.LocalMask())
 	}
 	return self.contractMultiRouteWriter
 }

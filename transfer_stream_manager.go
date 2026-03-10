@@ -15,7 +15,7 @@ import (
 func DefaultStreamManagerSettings() *StreamManagerSettings {
 	return &StreamManagerSettings{
 		StreamBufferSettings: DefaultStreamBufferSettings(),
-		WebRtcSettings:       DefaultWebRtcSettings(),
+		// WebRtcSettings:       DefaultWebRtcSettings(),
 	}
 }
 
@@ -29,8 +29,6 @@ func DefaultStreamBufferSettings() *StreamBufferSettings {
 
 type StreamManagerSettings struct {
 	StreamBufferSettings *StreamBufferSettings
-
-	WebRtcSettings *WebRtcSettings
 }
 
 type StreamManager struct {
@@ -45,14 +43,14 @@ type StreamManager struct {
 	streamManagerSettings *StreamManagerSettings
 }
 
-func NewStreamManager(ctx context.Context, client *Client, streamManagerSettings *StreamManagerSettings) *StreamManager {
+func NewStreamManager(ctx context.Context, client *Client, webRtcManager *WebRtcManager, streamManagerSettings *StreamManagerSettings) *StreamManager {
 	streamManager := &StreamManager{
 		ctx:                   ctx,
 		client:                client,
 		streamManagerSettings: streamManagerSettings,
 	}
 
-	webRtcManager := NewWebRtcManager(ctx, streamManagerSettings.WebRtcSettings)
+	// webRtcManager := NewWebRtcManager(ctx, streamManagerSettings.WebRtcSettings)
 
 	streamManager.initBuffers(webRtcManager)
 
@@ -83,41 +81,62 @@ func (self *StreamManager) Receive(source TransferPath, frames []*protocol.Frame
 }
 
 func (self *StreamManager) handleControlFrame(frame *protocol.Frame) error {
-	if message, err := FromFrame(frame); err == nil {
-		switch v := message.(type) {
-		case *protocol.StreamOpen:
-			var sourceId *Id
-			if v.SourceId != nil {
-				sourceId_, err := IdFromBytes(v.SourceId)
+	switch frame.MessageType {
+	case protocol.MessageType_TransferStreamOpen, protocol.MessageType_TransferStreamClose, protocol.MessageType_TransferStreamReset:
+		if message, err := FromFrame(frame); err == nil {
+
+			streamOpen := func(v *protocol.StreamOpen) error {
+				var sourceId *Id
+				if v.SourceId != nil {
+					sourceId_, err := IdFromBytes(v.SourceId)
+					if err != nil {
+						return err
+					}
+					sourceId = &sourceId_
+				}
+
+				var destinationId *Id
+				if v.DestinationId != nil {
+					destinationId_, err := IdFromBytes(v.DestinationId)
+					if err != nil {
+						return err
+					}
+					destinationId = &destinationId_
+				}
+
+				streamId, err := IdFromBytes(v.StreamId)
 				if err != nil {
 					return err
 				}
-				sourceId = &sourceId_
+
+				self.streamBuffer.OpenStream(sourceId, destinationId, streamId)
+				return nil
 			}
 
-			var destinationId *Id
-			if v.DestinationId != nil {
-				destinationId_, err := IdFromBytes(v.DestinationId)
+			switch v := message.(type) {
+			case *protocol.StreamOpen:
+				err := streamOpen(v)
 				if err != nil {
 					return err
 				}
-				destinationId = &destinationId_
+
+			case *protocol.StreamClose:
+				streamId, err := IdFromBytes(v.StreamId)
+				if err != nil {
+					return err
+				}
+
+				self.streamBuffer.CloseStream(streamId)
+
+			case *protocol.StreamReset:
+				self.streamBuffer.ResetStreams()
+				for _, m := range v.Streams {
+					err := streamOpen(m)
+					if err != nil {
+						return err
+					}
+				}
 			}
-
-			streamId, err := IdFromBytes(v.StreamId)
-			if err != nil {
-				return err
-			}
-
-			self.streamBuffer.OpenStream(sourceId, destinationId, streamId)
-
-		case *protocol.StreamClose:
-			streamId, err := IdFromBytes(v.StreamId)
-			if err != nil {
-				return err
-			}
-
-			self.streamBuffer.CloseStream(streamId)
 		}
 	}
 	return nil
@@ -176,6 +195,14 @@ func NewStreamBuffer(ctx context.Context, streamManager *StreamManager, streamBu
 		streamBufferSettings:      streamBufferSettings,
 		streamSequences:           map[streamSequenceId]*StreamSequence{},
 		streamSequencesByStreamId: map[Id]*StreamSequence{},
+	}
+}
+
+func (self *StreamBuffer) ResetStreams() {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	for _, streamSequence := range self.streamSequences {
+		streamSequence.Cancel()
 	}
 }
 
@@ -315,8 +342,6 @@ func (self *StreamSequence) Run() {
 	if self.sourceId == nil || self.destinationId == nil {
 		clientRouteManager := self.streamManager.Client().RouteManager()
 
-		sendReady := make(chan struct{})
-		receiveReady := make(chan struct{})
 		if self.sourceId != nil {
 			NewP2pTransport(
 				self.ctx,
@@ -327,8 +352,6 @@ func (self *StreamSequence) Run() {
 				*self.sourceId,
 				self.streamId,
 				PeerTypeSource,
-				sendReady,
-				receiveReady,
 				self.streamBufferSettings.P2pTransportSettings,
 			)
 		} else if self.destinationId != nil {
@@ -341,8 +364,6 @@ func (self *StreamSequence) Run() {
 				*self.destinationId,
 				self.streamId,
 				PeerTypeDestination,
-				sendReady,
-				receiveReady,
 				self.streamBufferSettings.P2pTransportSettings,
 			)
 		} else {
@@ -350,16 +371,10 @@ func (self *StreamSequence) Run() {
 			glog.V(1).Infof("[sm] s(%s) missing source or destination.\n", self.streamId)
 			return
 		}
-
-		// this will propagate to the other side of the stream
-		// p2pTransport.SetReceiveReady(true)
-		close(receiveReady)
 	} else {
 		p2pToDestinationRouteManager := NewRouteManager(self.ctx, fmt.Sprintf("->s(%s)", self.streamId))
 		p2pToSourceRouteManager := NewRouteManager(self.ctx, fmt.Sprintf("<-s(%s)", self.streamId))
 
-		toDestinationReady := make(chan struct{})
-		toSourceReady := make(chan struct{})
 		// to destination
 		NewP2pTransport(
 			self.ctx,
@@ -370,8 +385,6 @@ func (self *StreamSequence) Run() {
 			*self.destinationId,
 			self.streamId,
 			PeerTypeDestination,
-			toDestinationReady,
-			toSourceReady,
 			self.streamBufferSettings.P2pTransportSettings,
 		)
 		// to source
@@ -384,8 +397,6 @@ func (self *StreamSequence) Run() {
 			*self.sourceId,
 			self.streamId,
 			PeerTypeSource,
-			toSourceReady,
-			toDestinationReady,
 			self.streamBufferSettings.P2pTransportSettings,
 		)
 
@@ -402,14 +413,12 @@ func (self *StreamSequence) Run() {
 			defer routeManager.CloseMultiRouteWriter(mrw)
 
 			for {
-				select {
-				case <-self.ctx.Done():
-					return
-				}
-
 				checkpointId := self.idleCondition.Checkpoint()
 				transferFrameBytes, err := mrr.Read(self.ctx, self.streamBufferSettings.ReadTimeout)
-				if transferFrameBytes == nil && err == nil {
+				if err != nil {
+					return
+				}
+				if transferFrameBytes == nil {
 					// idle timeout
 					if self.idleCondition.Close(checkpointId) {
 						// close the sequence
@@ -420,10 +429,12 @@ func (self *StreamSequence) Run() {
 				}
 				success, err := mrw.WriteDetailed(self.ctx, transferFrameBytes, self.streamBufferSettings.WriteTimeout)
 				if err != nil {
+					MessagePoolReturn(transferFrameBytes)
 					return
 				}
 				if !success {
 					// drop it
+					MessagePoolReturn(transferFrameBytes)
 				}
 			}
 		}
