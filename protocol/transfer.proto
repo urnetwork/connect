@@ -18,7 +18,6 @@ import "frame.proto";
 //    so that the hop state can time out the same as the sender state.
 
 
-// stream_id replaces the source_id and destination_id
 message TransferPath {
     // ulid
     optional bytes source_id = 2;
@@ -148,7 +147,7 @@ message ProvideKey {
 
 // each hop on the stream receives this to configure its state,
 // including the first and last hops
-// this is sent each time a stream contract is created or a direct stream is created
+// this is sent each time a stream contract is created
 message StreamOpen {
     // ulid
     optional bytes source_id = 2;
@@ -165,37 +164,35 @@ message StreamClose {
     bytes stream_id = 3;
 }
 
+message StreamReset {
+    repeated StreamOpen streams = 1;
+}
+
 
 enum SignalType {
     // reset means clear all previous signals for the transfer peer pair
-    SdpOffer = 0;
-    SdpAnswer = 1;
-    IceCandidate = 2;
+    NoSignal = 0;
+    SdpOffer = 1;
+    SdpAnswer = 2;
+    IceCandidate = 3;
+    WaitingForSdpOffer = 4;
 }
 
 message ExchangeSignals {
-    bool reset = 1;
-    repeated ExchangeSignal signals = 2;
+    // ulid
+    bytes stream_id = 1;
+    bool reset_signals = 2;
+    repeated ExchangeSignal signals = 3;
 }
 
 // signals are sent in real time to the destination of the peer pair
 message ExchangeSignal {
-    // ulid
-    bytes stream_id = 1;
-    // ulid
-    bytes conn_id = 2;
-    
     SignalType signal_type = 3;
 
     // json encoded using the structure in the code
-    optional bytes Sdp = 4;
+    optional bytes sdp = 4;
     // json encoded using the structure in the code
-    optional bytes IceCandidate = 5;
-}
-
-message RequestExchangeSignals {
-    // ulid
-    bytes stream_id = 1;
+    optional bytes ice_candidate = 5;
 }
 
 
@@ -254,8 +251,6 @@ message Contract {
     ProvideMode provide_mode = 3;
 }
 
-
-// stream_id replaces the source_id and destination_id
 message StoredContract {
     bytes contract_id = 1;
     uint64 transfer_byte_count = 2;

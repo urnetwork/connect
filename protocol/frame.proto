@@ -27,6 +27,9 @@ enum MessageType {
     IpIpPing = 17;
     TransferControlPing = 18;
     TransferProvidePing = 19;
+    TransferExchangeSignals = 20;
+    TransferExchangeSignal = 21;
+    TransferStreamReset = 22;
 }
 
 
