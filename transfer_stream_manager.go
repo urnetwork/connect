@@ -413,14 +413,12 @@ func (self *StreamSequence) Run() {
 			defer routeManager.CloseMultiRouteWriter(mrw)
 
 			for {
-				select {
-				case <-self.ctx.Done():
-					return
-				}
-
 				checkpointId := self.idleCondition.Checkpoint()
 				transferFrameBytes, err := mrr.Read(self.ctx, self.streamBufferSettings.ReadTimeout)
-				if transferFrameBytes == nil && err == nil {
+				if err != nil {
+					return
+				}
+				if transferFrameBytes == nil {
 					// idle timeout
 					if self.idleCondition.Close(checkpointId) {
 						// close the sequence
@@ -431,10 +429,12 @@ func (self *StreamSequence) Run() {
 				}
 				success, err := mrw.WriteDetailed(self.ctx, transferFrameBytes, self.streamBufferSettings.WriteTimeout)
 				if err != nil {
+					MessagePoolReturn(transferFrameBytes)
 					return
 				}
 				if !success {
 					// drop it
+					MessagePoolReturn(transferFrameBytes)
 				}
 			}
 		}

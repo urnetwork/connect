@@ -26,21 +26,6 @@ type WebRtcConn interface {
 	AddConnectedCallback(func(connected bool)) func()
 }
 
-// type SignalType int
-// const (
-// 	SignalTypeSdpOffer SignalType = 1
-// 	SignalTypeSdpAnswer SignalType = 2
-// 	SignalTypeIceCandidate SignalType = 3
-// )
-
-// type WebRtcSignal struct {
-// 	SignalType SignalType
-// 	// Path TransferPath
-
-// 	SDP       *webrtc.SessionDescription `json:"sdp,omitempty"`
-// 	Candidate *webrtc.ICECandidateInit   `json:"candidate,omitempty"`
-// }
-
 func DefaultWebRtcSettings() *WebRtcSettings {
 	return &WebRtcSettings{
 		// FIXME
@@ -67,21 +52,15 @@ func DefaultWebRtcSettings() *WebRtcSettings {
 }
 
 type WebRtcSettings struct {
-
-	// ReceiveBufferSize
-	// ReceiveMtu
-	// StunServers
-
 	ReceiveBufferSize   ByteCount
 	ReceiveMtu          ByteCount
 	DisconnectedTimeout time.Duration
 	FailedTimeout       time.Duration
 	KeepAliveTimeout    time.Duration
 
-	// SendBufferSize ByteCount
-
 	DataChannelLabel string
 
+	// add stun:xxx urls here
 	IceServerUrls []string
 }
 
