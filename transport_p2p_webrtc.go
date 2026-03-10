@@ -2,102 +2,173 @@ package connect
 
 import (
 	"context"
-	"fmt"
+	// "fmt"
+	"encoding/json"
 	"net"
+	"os"
+	"sync"
+	"time"
+	// "slices"
+	// "fmt"
 
+	// "golang.org/x/exp/maps"
+
+	"github.com/pion/datachannel"
 	"github.com/pion/webrtc/v4"
+
+	"github.com/urnetwork/connect/protocol"
+	"github.com/urnetwork/glog"
 )
 
-
-type WebRtcSignal struct {
-	SignalType SignalType
-	Path TransferPath
-
+type WebRtcConn interface {
+	net.Conn
+	Connected() bool
+	AddConnectedCallback(func(connected bool)) func()
 }
 
-type WebRtcSettings struct {
-	SendBufferSize ByteCount
-}
+// type SignalType int
+// const (
+// 	SignalTypeSdpOffer SignalType = 1
+// 	SignalTypeSdpAnswer SignalType = 2
+// 	SignalTypeIceCandidate SignalType = 3
+// )
+
+// type WebRtcSignal struct {
+// 	SignalType SignalType
+// 	// Path TransferPath
+
+// 	SDP       *webrtc.SessionDescription `json:"sdp,omitempty"`
+// 	Candidate *webrtc.ICECandidateInit   `json:"candidate,omitempty"`
+// }
 
 func DefaultWebRtcSettings() *WebRtcSettings {
 	return &WebRtcSettings{
 		// FIXME
-		SendBufferSize: mib(1),
+		// SendBufferSize: mib(1),
+
+		ReceiveBufferSize:   mib(4),
+		ReceiveMtu:          kib(4),
+		DisconnectedTimeout: 30 * time.Second,
+		FailedTimeout:       30 * time.Second,
+		KeepAliveTimeout:    1 * time.Second,
+
+		DataChannelLabel: "data",
+		IceServerUrls: []string{
+			"stun:openrelay.metered.ca:80",
+			"stun:openrelay.metered.ca:443",
+			"stun:stun.stunprotocol.org:3478",
+			"stun:stun.l.google.com:19302",
+			"stun:stun1.l.google.com:19302",
+			"stun:stun2.l.google.com:19302",
+			"stun:stun3.l.google.com:19302",
+			"stun:stun4.l.google.com:19302",
+		},
 	}
 }
 
-// FIXME register as a listener on the client like stream manager
+type WebRtcSettings struct {
+
+	// ReceiveBufferSize
+	// ReceiveMtu
+	// StunServers
+
+	ReceiveBufferSize   ByteCount
+	ReceiveMtu          ByteCount
+	DisconnectedTimeout time.Duration
+	FailedTimeout       time.Duration
+	KeepAliveTimeout    time.Duration
+
+	// SendBufferSize ByteCount
+
+	DataChannelLabel string
+
+	IceServerUrls []string
+}
+
 type WebRtcManager struct {
 	ctx context.Context
 
-	// FIXME api
+	client *Client
 
-	// clientId
-	// clientOob
+	settings *WebRtcSettings
 
-	webRtcSettings *WebRtcSettings
+	stateLock sync.Mutex
+	peerConns map[peerConnKey]*peerConn
 }
 
-func NewWebRtcManager(ctx context.Context, webRtcSettings *WebRtcSettings) *WebRtcManager {
+func NewWebRtcManager(ctx context.Context, client *Client, settings *WebRtcSettings) *WebRtcManager {
 	return &WebRtcManager{
-		ctx:            ctx,
-		webRtcSettings: webRtcSettings,
+		ctx:       ctx,
+		client:    client,
+		settings:  settings,
+		peerConns: map[peerConnKey]*peerConn{},
 	}
 }
 
-
-// FIXME client handle SignalExchange message
-
-
-// FIXME receive active signal
-// add to signal channel
-
-func Receive(message MESSAGE) {
-
-	// peer messages will have a reversed path from the local key
-	transferPath := message.Path.Reverse()
+// ReceiveFunction
+func (self *WebRtcManager) Receive(source TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode) {
+	for _, frame := range frames {
+		err := self.handleControlFrame(source, frame)
+		if err != nil {
+			glog.Infof("[peerconn]handle err=%s\n", err)
+			// ignore error
+		}
+	}
 }
 
-
-
-
-
-
-
+func (self *WebRtcManager) handleControlFrame(source TransferPath, frame *protocol.Frame) error {
+	switch frame.MessageType {
+	case protocol.MessageType_TransferExchangeSignals:
+		message, err := FromFrame(frame)
+		if err != nil {
+			return err
+		}
+		switch v := message.(type) {
+		case *protocol.ExchangeSignals:
+			key := peerConnKey{
+				PeerId:   source.SourceId,
+				StreamId: Id(v.StreamId),
+				// ConnId: Id(v.ConnId),
+			}
+			var conn *peerConn
+			func() {
+				self.stateLock.Lock()
+				defer self.stateLock.Unlock()
+				conn = self.peerConns[key]
+			}()
+			if conn != nil {
+				for _, signal := range v.Signals {
+					err := conn.ReceiveSignalFromPeer(signal)
+					if err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
 
 // this should return an active, tested connection
-func (self *WebRtcManager) NewP2pConnActive(ctx context.Context, peerId Id, streamId Id) (net.Conn, error) {
-	// FIXME
-	// 1. create active signal, set active signal to peer on stream id
-	// 2. on close, remove active signal from source to peer
-	// return nil, fmt.Errorf("Not implemented.")
-
-	// FIXME oob send signal exchange message
-
+func (self *WebRtcManager) NewP2pConnActive(ctx context.Context, peerId Id, streamId Id) (WebRtcConn, error) {
 	return self.newP2pConn(ctx, peerId, streamId, true)
-
-
 }
 
 // this should return an active, tested connection
-func (self *WebRtcManager) NewP2pConnPassive(ctx context.Context, peerId Id, streamId Id) (net.Conn, error) {
-	// FIXME
-	// 1. on receive active signal, create passive signal and set from peer on stream id
-	// 2. on close, remove passive signal
-	// return nil, fmt.Errorf("Not implemented.")
-
+func (self *WebRtcManager) NewP2pConnPassive(ctx context.Context, peerId Id, streamId Id) (WebRtcConn, error) {
 	return self.newP2pConn(ctx, peerId, streamId, false)
-
 }
 
-func newP2pConn(ctx context.Context, peerId Id, streamId Id, active bool) (net.Conn, error) {
+func (self *WebRtcManager) newP2pConn(ctx context.Context, peerId Id, streamId Id, active bool) (conn *peerConn, err error) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
-	connId := NewId()
-	path := PATH()
+	key := peerConnKey{
+		PeerId:   peerId,
+		StreamId: streamId,
+	}
 
-	conn, err = newPeerConn()
+	conn, err = newPeerConn(ctx, key, active, self.client, self.settings)
 	if err != nil {
 		return
 	}
@@ -105,375 +176,519 @@ func newP2pConn(ctx context.Context, peerId Id, streamId Id, active bool) (net.C
 		defer func() {
 			self.stateLock.Lock()
 			defer self.stateLock.Unlock()
-			
-			delete(self.conns, path, connId)
-		}
+
+			if conn == self.peerConns[key] {
+				delete(self.peerConns, key)
+			}
+		}()
 		conn.Run()
 	})
 
-	self.conns[path][connId] = conn
+	replacedConn := self.peerConns[key]
+	if replacedConn != nil {
+		replacedConn.Cancel()
+	}
+	self.peerConns[key] = conn
 	return
 }
 
-
-
-
-
-// SignalMessage is the JSON envelope exchanged over the signaling WebSocket.
-type SignalMessage struct {
-	Type      string                     `json:"type"`
-	SDP       *webrtc.SessionDescription `json:"sdp,omitempty"`
-	Candidate *webrtc.ICECandidateInit   `json:"candidate,omitempty"`
+type peerConnKey struct {
+	PeerId   Id
+	StreamId Id
 }
 
-
-
-
-// conforms to net.Conn
+// conforms to WebRtcConn
 type peerConn struct {
-	transferPath TransferPath
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	key    peerConnKey
 	active bool
 
-	pc *webrtc.PeerConnection
+	client   *Client
+	settings *WebRtcSettings
+
+	api *webrtc.API
+	pc  *webrtc.PeerConnection
+
+	connectedCallbacks *CallbackList[func(connected bool)]
+	connMonitor        *Monitor
+
+	stateLock sync.Mutex
+	// signals []*protocol.ExchangeSignal
+	conn      datachannel.ReadWriteCloserDeadliner
+	connected bool
+	offer     *protocol.ExchangeSignal
+	answer    *protocol.ExchangeSignal
+
+	readDeadline  time.Time
+	writeDeadline time.Time
 }
 
-func newPeerConn() error {
+func newPeerConn(ctx context.Context, key peerConnKey, active bool, client *Client, settings *WebRtcSettings) (*peerConn, error) {
 	s := webrtc.SettingEngine{}
 	s.DetachDataChannels()
-	s.SetSCTPMaxReceiveBufferSize(16 * 1024 * 1024)
-	s.SetReceiveMTU(16384)
+	s.SetSCTPMaxReceiveBufferSize( /*16 * 1024 * 1024*/ uint32(settings.ReceiveBufferSize))
+	s.SetReceiveMTU( /*16384*/ uint(settings.ReceiveMtu))
 	s.SetICETimeouts(
-		30*time.Second,       // disconnectedTimeout
-		60*time.Second,       // failedTimeout
-		500*time.Millisecond, // keepAliveInterval
+		settings.DisconnectedTimeout,
+		settings.FailedTimeout,
+		settings.KeepAliveTimeout,
 	)
-
-	iceServers := []webrtc.ICEServer{
-		{URLs: []string{
-			"stun:stun.l.google.com:19302",
-			"stun:stun1.l.google.com:19302",
-			"stun:stun2.l.google.com:19302",
-		}},
-	}
-	if turnServer != "" {
-		iceServers = append(iceServers, webrtc.ICEServer{
-			URLs: []string{turnServer},
-		})
-	}
 
 	api := webrtc.NewAPI(webrtc.WithSettingEngine(s))
 	pc, err := api.NewPeerConnection(webrtc.Configuration{
-		ICEServers: iceServers,
+		ICEServers: []webrtc.ICEServer{
+			webrtc.ICEServer{
+				URLs: settings.IceServerUrls,
+			},
+		},
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	cancelCtx, cancel := context.WithCancel(ctx)
 
 	conn := &peerConn{
-
+		ctx:                cancelCtx,
+		cancel:             cancel,
+		key:                key,
+		active:             active,
+		client:             client,
+		settings:           settings,
+		api:                api,
+		pc:                 pc,
+		connectedCallbacks: NewCallbackList[func(connected bool)](),
+		connMonitor:        NewMonitor(),
 	}
-
-	if active {
-		dc, err := pc.CreateDataChannel("data", nil)
-		if err != nil {
-			log.Fatalf("Failed to create data channel: %v", err)
-		}
-
-		dc.OnOpen(func() {
-			conn.setOpenDataChannel(dc)
-		})
-	} else {
-		pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-			dc.OnOpen(func() {
-				conn.setOpenDataChannel(dc)
-			})
-		})
-	}
-
-	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
-		if c == nil {
-			return
-		}
-		init := c.ToJSON()
-		if err := sendSignal(conn, SignalMessage{Type: "candidate", Candidate: &init}); err != nil {
-			log.Printf("Failed to send ICE candidate: %v", err)
-		}
-
-		signal := &SIGNAL{}
-		client.Send(signal)
-	})
-
-	client.Send(RequestSendSignals())
-
-	// go HandleError(conn.run)
-
 	return conn, nil
 }
 
 func (self *peerConn) Run() {
+	defer func() {
+		self.cancel()
 
+		self.pc.Close()
+		self.connMonitor.NotifyAll()
+	}()
 
+	self.pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
+		connected := state == webrtc.ICEConnectionStateConnected
+		glog.Infof("[peerconn]state=%v (%t)\n", state, connected)
+		self.setConnected(connected)
+	})
 
-	// pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-	// 	log.Printf("ICE connection state: %s", state.String())
-	// 	if state == webrtc.ICEConnectionStateConnected {
-	// 		logSelectedPair(pc)
-	// 	}
-	// })
-
-	if active {
-		offer, err := pc.CreateOffer(nil)
+	if self.active {
+		dc, err := self.pc.CreateDataChannel(self.settings.DataChannelLabel, nil)
 		if err != nil {
-			log.Fatalf("Failed to create offer: %v", err)
-		}
-		if err := pc.SetLocalDescription(offer); err != nil {
-			log.Fatalf("Failed to set local description: %v", err)
-		}
-
-		if err := sendSignal(conn, SignalMessage{Type: "offer", SDP: &offer}); err != nil {
-			log.Fatalf("Failed to send SDP offer: %v", err)
-		}
-		log.Println("Sent SDP offer")
-	}
-
-
-	update := func(signal SIGNAL) error {
-		switch SIGNAL.SignalType {
-		case SdpOffer:
-			if !self.active {
-				if err := pc.SetRemoteDescription(*msg.SDP); err != nil {
-					log.Fatalf("Failed to set remote description: %v", err)
-				}
-
-				answer, err := pc.CreateAnswer(nil)
-				if err != nil {
-					log.Fatalf("Failed to create answer: %v", err)
-				}
-				if err := pc.SetLocalDescription(answer); err != nil {
-					log.Fatalf("Failed to set local description: %v", err)
-				}
-			} else {
-				ERROR()
-			}
-		case SdpAnswer:
-			if self.active {
-				if err := pc.SetRemoteDescription(*msg.SDP); err != nil {
-					log.Fatalf("Failed to set remote description: %v", err)
-				}
-			} else {
-				ERROR()
-			}
-		case IceCandidate:
-			if err := pc.AddICECandidate(*msg.Candidate); err != nil {
-				log.Printf("Failed to add ICE candidate: %v", err)
-			}
-		}
-	}
-
-	for {
-		select {
-		case <- ctx.Done():
 			return
-		case message := <- self.messages:
-			if SIGNAL {
-				update(signal)
-			} else if SIGNALS {
-				for _, signal := SIGNALS.Signals {
-					update(signal)
-				}
-
-			} else if REQUESTSENDSIGNALS {
-				// get all signals and send
-				client.Send(ExchangeSignals{
-					Reset: true,
-					Signals: signals(),
-				})
-			}
 		}
+
+		dc.OnOpen(func() {
+			self.setOpenDataChannel(dc)
+		})
+	} else {
+		self.pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+			dc.OnOpen(func() {
+				self.setOpenDataChannel(dc)
+			})
+		})
+	}
+
+	if self.active {
+		offer, err := self.pc.CreateOffer(nil)
+		if err != nil {
+			return
+		}
+		err = self.pc.SetLocalDescription(offer)
+		if err != nil {
+			return
+		}
+
+		offerBytes, err := json.Marshal(&offer)
+		if err != nil {
+			return
+		}
+
+		signal := &protocol.ExchangeSignal{
+			SignalType: protocol.SignalType_SdpOffer,
+			Sdp:        offerBytes,
+		}
+		self.setOfferSignal(signal)
+		self.sendSignal(signal)
+	} else {
+		signal := &protocol.ExchangeSignal{
+			SignalType: protocol.SignalType_WaitingForSdpOffer,
+		}
+		self.sendSignal(signal)
+	}
+
+	select {
+	case <-self.ctx.Done():
 	}
 }
 
-func setOpenDataChannel(dc *webrtc.DataChannel) {
+func (self *peerConn) ReceiveSignalFromPeer(signal *protocol.ExchangeSignal) error {
+	switch signal.SignalType {
+	case protocol.SignalType_SdpOffer:
+		if !self.active && self.setOfferSignal(signal) {
+			var offer webrtc.SessionDescription
+			err := json.Unmarshal(signal.Sdp, &offer)
+			if err != nil {
+				return err
+			}
+			err = self.pc.SetRemoteDescription(offer)
+			if err != nil {
+				return err
+			}
+			answer, err := self.pc.CreateAnswer(nil)
+			if err != nil {
+				return err
+			}
+			err = self.pc.SetLocalDescription(answer)
+			if err != nil {
+				return err
+			}
+
+			answerBytes, err := json.Marshal(&answer)
+			if err != nil {
+				return err
+			}
+
+			signal := &protocol.ExchangeSignal{
+				SignalType: protocol.SignalType_SdpAnswer,
+				Sdp:        answerBytes,
+			}
+			self.setAnswerSignal(signal)
+			self.sendSignal(signal)
+
+			self.addIceCandidates()
+		}
+	case protocol.SignalType_SdpAnswer:
+		if self.active && self.setAnswerSignal(signal) {
+			var answer webrtc.SessionDescription
+			err := json.Unmarshal(signal.Sdp, &answer)
+			if err != nil {
+				return err
+			}
+			err = self.pc.SetRemoteDescription(answer)
+			if err != nil {
+				return err
+			}
+
+			self.addIceCandidates()
+		}
+	case protocol.SignalType_IceCandidate:
+		var candidate webrtc.ICECandidateInit
+		err := json.Unmarshal(signal.IceCandidate, &candidate)
+		if err != nil {
+			return err
+		}
+		err = self.pc.AddICECandidate(candidate)
+		if err != nil {
+			return err
+		}
+	case protocol.SignalType_WaitingForSdpOffer:
+		if self.active {
+
+			if self.answerSignal() == nil {
+				if signal := self.offerSignal(); signal != nil {
+					self.sendSignal(signal)
+				}
+			} else {
+				// already negotiated an answer with a peer
+				// cancel this connection so a new one can start in the expected state
+				self.cancel()
+			}
+		}
+		// else ignore
+	}
+	return nil
+}
+
+func (self *peerConn) addIceCandidates() {
+	self.pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
+		if candidate == nil {
+			return
+		}
+		candidateBytes, err := json.Marshal(candidate.ToJSON())
+		if err != nil {
+			return
+		}
+		signal := &protocol.ExchangeSignal{
+			SignalType:   protocol.SignalType_IceCandidate,
+			IceCandidate: candidateBytes,
+		}
+		self.sendSignal(signal)
+	})
+}
+
+func (self *peerConn) Connected() bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
-
-	self.dcMonitor.NotifyAll()
+	return self.connected
 }
 
-func addSignal() {
-	// TODO save signal
-	// TODO send signal
-}
+func (self *peerConn) setConnected(connected bool) {
+	changed := false
 
-func signals() []SIGNAL {
-	
-}
-
-func dataChannel(deadline time.Time) (*webrtc.DataChannel, error) {
-	dc := func()(*webrtc.DataChannel) {
+	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
-		return self.dc
+
+		if self.connected != connected {
+			self.connected = connected
+			changed = true
+		}
+	}()
+
+	if changed {
+		self.connectedChanged(self.Connected())
 	}
-	if dc := dc(); dc != nil {
-		return dc
+}
+
+func (self *peerConn) AddConnectedCallback(connectedCallback func(connected bool)) func() {
+	callbackId := self.connectedCallbacks.Add(connectedCallback)
+	return func() {
+		self.connectedCallbacks.Remove(callbackId)
 	}
-	update := self.dcMonitor.NotifyChannel()
+}
+
+func (self *peerConn) connectedChanged(connected bool) {
+	for _, callback := range self.connectedCallbacks.Get() {
+		HandleError(func() {
+			callback(connected)
+		})
+	}
+}
+
+func (self *peerConn) setOfferSignal(offer *protocol.ExchangeSignal) bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.offer != nil {
+		return false
+	}
+	self.offer = offer
+	return true
+}
+
+func (self *peerConn) offerSignal() *protocol.ExchangeSignal {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.offer
+}
+
+func (self *peerConn) setAnswerSignal(answer *protocol.ExchangeSignal) bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.answer != nil {
+		return false
+	}
+	self.answer = answer
+	return true
+}
+
+func (self *peerConn) answerSignal() *protocol.ExchangeSignal {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.answer
+}
+
+func (self *peerConn) sendSignal(signal *protocol.ExchangeSignal) {
+	signals := &protocol.ExchangeSignals{
+		StreamId: self.key.StreamId.Bytes(),
+		Signals:  []*protocol.ExchangeSignal{signal},
+	}
+	self.client.Send(
+		RequireToFrameWithDefaultProtocolVersion(signals),
+		DestinationId(self.key.PeerId),
+		nil,
+	)
+}
+
+func (self *peerConn) setOpenDataChannel(dc *webrtc.DataChannel) error {
+	conn, err := dc.DetachWithDeadline()
+	if err != nil {
+		return err
+	}
+
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+
+		if self.conn != nil {
+			self.conn.Close()
+		}
+		self.conn = conn
+		self.connMonitor.NotifyAll()
+	}()
+
+	return nil
+}
+
+func (self *peerConn) dataChannelConn(deadline time.Time) (datachannel.ReadWriteCloserDeadliner, error) {
+	conn := func() (datachannel.ReadWriteCloserDeadliner, chan struct{}) {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		return self.conn, self.connMonitor.NotifyChannel()
+	}
 	for {
+		c, update := conn()
+		if c != nil {
+			return c, nil
+		}
 		if deadline.IsZero() {
 			select {
-			case <- self.ctx.Done():
-				return
-			case <- update:
+			case <-self.ctx.Done():
+				return nil, os.ErrClosed
+			case <-update:
 			}
 		} else {
 			timeout := deadline.Sub(time.Now())
 			if timeout <= 0 {
-				return nil, os.DeadlineError
+				return nil, os.ErrDeadlineExceeded
 			}
 			select {
-			case <- self.ctx.Done():
-				return
-			case <- update:
-			case <- time.After(timeout):
-				return nil, os.DeadlineError
+			case <-self.ctx.Done():
+				return nil, os.ErrClosed
+			case <-update:
+			case <-time.After(timeout):
+				return nil, os.ErrDeadlineExceeded
 			}
 		}
-		if dc := dc(); dc != nil {
-			return dc
-		}
 	}
 }
 
-
-Read(b []byte) (n int, err error) {
+func (self *peerConn) Read(b []byte) (n int, err error) {
 	var deadline time.Time
-	func()(*webrtc.DataChannel) {
+	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
-		self.deadline = self.readDeadline
-	}
-	var dc *webrtc.DataChannel
-	dc, err = self.dataChannel(deadline)
+		deadline = self.readDeadline
+	}()
+	var c datachannel.ReadWriteCloserDeadliner
+	c, err = self.dataChannelConn(deadline)
 	if err != nil {
 		return
 	}
-	n, err = dc.Read(b)
+	c.SetReadDeadline(deadline)
+	n, err = c.Read(b)
 	return
 }
 
-Write(b []byte) (n int, err error) {
+func (self *peerConn) Write(b []byte) (n int, err error) {
 	var deadline time.Time
-	func()(*webrtc.DataChannel) {
+	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
-		self.deadline = self.writeDeadline
-	}
-	var dc *webrtc.DataChannel
-	dc, err = self.dataChannel(deadline)
+		deadline = self.writeDeadline
+	}()
+	var c datachannel.ReadWriteCloserDeadliner
+	c, err = self.dataChannelConn(deadline)
 	if err != nil {
 		return
 	}
-	n, err = dc.Write(b)
+	c.SetWriteDeadline(deadline)
+	n, err = c.Write(b)
 	return
-}
-
-Close() error {
-	return self.pc.Close()
 }
 
 // LocalAddr returns the local network address, if known.
-LocalAddr() Addr {
-	sctp := pc.SCTP()
+func (self *peerConn) LocalAddr() net.Addr {
+	sctp := self.pc.SCTP()
 	if sctp == nil {
-		return ""
+		return newWebRtcAddr("")
 	}
 	dtls := sctp.Transport()
 	if dtls == nil {
-		return ""
+		return newWebRtcAddr("")
 	}
 	ice := dtls.ICETransport()
 	if ice == nil {
-		return ""
+		return newWebRtcAddr("")
 	}
 	pair, err := ice.GetSelectedCandidatePair()
 	if err != nil || pair == nil {
-		return ""
+		return newWebRtcAddr("")
 	}
-	return pair.Local.Address
+	return newWebRtcAddr(pair.Local.Address)
 }
 
 // RemoteAddr returns the remote network address, if known.
-RemoteAddr() Addr {
-	sctp := pc.SCTP()
+func (self *peerConn) RemoteAddr() net.Addr {
+	sctp := self.pc.SCTP()
 	if sctp == nil {
-		return ""
+		return newWebRtcAddr("")
 	}
 	dtls := sctp.Transport()
 	if dtls == nil {
-		return ""
+		return newWebRtcAddr("")
 	}
 	ice := dtls.ICETransport()
 	if ice == nil {
-		return ""
+		return newWebRtcAddr("")
 	}
 	pair, err := ice.GetSelectedCandidatePair()
 	if err != nil || pair == nil {
-		return ""
+		return newWebRtcAddr("")
 	}
-	return pair.Remote.Address
+	return newWebRtcAddr(pair.Remote.Address)
 }
 
-
-SetDeadline(t time.Time) error {
+func (self *peerConn) SetDeadline(t time.Time) error {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
 	self.readDeadline = t
 	self.writeDeadline = t
+
+	return nil
 }
 
-SetReadDeadline(t time.Time) error {
+func (self *peerConn) SetReadDeadline(t time.Time) error {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
 	self.readDeadline = t
+
+	return nil
 }
 
-SetWriteDeadline(t time.Time) error {
+func (self *peerConn) SetWriteDeadline(t time.Time) error {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
 	self.writeDeadline = t
+
+	return nil
 }
 
+func (self *peerConn) Close() error {
+	self.cancel()
+	return nil
+}
 
+func (self *peerConn) Cancel() {
+	self.cancel()
+}
 
+// conforms to `net.Addr`
+type webRtcAddr struct {
+	addr string
+}
 
+func newWebRtcAddr(addr string) net.Addr {
+	return &webRtcAddr{
+		addr: addr,
+	}
+}
 
+func (self *webRtcAddr) Network() string {
+	return "udp"
+}
 
-// enum SignalType {
-//     // reset means clear all previous signals for the transfer peer pair
-//     Reset = 0;
-//     SdpOffer = 1;
-//     SdpAnswer = 2;
-//     IceCandidate = 3;
-// }
-
-// // signals are sent in real time to the destination of the peer pair
-// message ExchangeSignal {
-//     // ulid
-//     bytes stream_id = 1;
-//     SignalType signal_type = 2;
-
-//     // json encoded using the structure in the code
-//     optional bytes Sdp = 3;
-//     // json encoded using the structure in the code
-//     optional bytes IceCandidate = 4;
-// }
-
-// message RequestExchangeSignals {
-//     // ulid
-//     bytes stream_id = 1;
-// }
-
-
-
+func (self *webRtcAddr) String() string {
+	return self.addr
+}

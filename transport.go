@@ -1055,8 +1055,8 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			if self.settings.TransportGenerator != nil {
 				sendTransport, receiveTransport = self.settings.TransportGenerator()
 			} else {
-				sendTransport = NewPrioritySendGatewayTransport(TransportMaxPriority, TransportMaxWeight)
-				receiveTransport = NewPriorityReceiveGatewayTransport(TransportMaxPriority, TransportMaxWeight)
+				sendTransport = NewSendGatewayTransport()
+				receiveTransport = NewReceiveGatewayTransport()
 			}
 
 			self.routeManager.UpdateTransport(sendTransport, []Route{send})
