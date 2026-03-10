@@ -65,6 +65,12 @@ func ToFrame(message proto.Message, protocolVersion int) (*protocol.Frame, error
 		messageType = protocol.MessageType_TransferControlPing
 	case *protocol.ProvidePing:
 		messageType = protocol.MessageType_TransferProvidePing
+	case *protocol.ExchangeSignals:
+		messageType = protocol.MessageType_TransferExchangeSignals
+	case *protocol.ExchangeSignal:
+		messageType = protocol.MessageType_TransferExchangeSignal
+	case *protocol.StreamReset:
+		messageType = protocol.MessageType_TransferStreamReset
 	default:
 		return nil, fmt.Errorf("Unknown message type: %T", v)
 	}
@@ -78,13 +84,17 @@ func ToFrame(message proto.Message, protocolVersion int) (*protocol.Frame, error
 	}, nil
 }
 
-// func RequireToFrame(message proto.Message, protocolVersion int) *protocol.Frame {
-// 	frame, err := ToFrame(message, protocolVersion)
-// 	if err != nil {
-// 		panic(err)
-// 	}
-// 	return frame
-// }
+func RequireToFrameWithDefaultProtocolVersion(message proto.Message) *protocol.Frame {
+	return RequireToFrame(message, DefaultProtocolVersion)
+}
+
+func RequireToFrame(message proto.Message, protocolVersion int) *protocol.Frame {
+	frame, err := ToFrame(message, protocolVersion)
+	if err != nil {
+		panic(err)
+	}
+	return frame
+}
 
 func FromFrame(frame *protocol.Frame) (proto.Message, error) {
 	var message proto.Message
@@ -141,6 +151,12 @@ func FromFrame(frame *protocol.Frame) (proto.Message, error) {
 		message = &protocol.ControlPing{}
 	case protocol.MessageType_TransferProvidePing:
 		message = &protocol.ProvidePing{}
+	case protocol.MessageType_TransferExchangeSignals:
+		message = &protocol.ExchangeSignals{}
+	case protocol.MessageType_TransferExchangeSignal:
+		message = &protocol.ExchangeSignal{}
+	case protocol.MessageType_TransferStreamReset:
+		message = &protocol.StreamReset{}
 	default:
 		return nil, fmt.Errorf("Unknown message type: %s", frame.MessageType)
 	}
