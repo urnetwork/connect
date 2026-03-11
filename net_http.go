@@ -52,7 +52,7 @@ func DefaultClientStrategySettings() *ClientStrategySettings {
 		ExpandExtenderProfileCount: 8,
 		ExtenderNetworks:           []netip.Prefix{},
 		ExtenderHostnames:          []string{},
-		ExpandExtenderRateLimit:    1 * time.Second,
+		ReconnectTimeout:           15 * time.Second,
 		MaxExtenderCount:           128,
 		ExtenderMinimumWeight:      0.1,
 		ExtenderDropTimeout:        5 * time.Minute,
@@ -90,9 +90,9 @@ type ClientStrategySettings struct {
 	ExpandExtenderProfileCount int
 	ExtenderNetworks           []netip.Prefix
 	// these are evaluated with DoH to grow the extender ips
-	ExtenderHostnames       []string
-	ExpandExtenderRateLimit time.Duration
-	MaxExtenderCount        int
+	ExtenderHostnames []string
+	ReconnectTimeout  time.Duration
+	MaxExtenderCount  int
 	// extender minimum weight
 	ExtenderMinimumWeight float32
 	// drop dialers that have not had a successful connect in this timeout
@@ -168,11 +168,10 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 						defer cancel()
 					}
 
-					colonPos := strings.LastIndex(addr, ":")
-					if colonPos == -1 {
-						colonPos = len(addr)
+					host, _, err := net.SplitHostPort(addr)
+					if err != nil {
+						panic(err)
 					}
-					hostname := addr[:colonPos]
 
 					tlsConfig := settings.TlsConfig
 					if tlsConfig == nil {
@@ -181,7 +180,7 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 					}
 					if tlsConfig.ServerName == "" {
 						c := tlsConfig.Clone()
-						c.ServerName = hostname
+						c.ServerName = host
 						tlsConfig = c
 					}
 
@@ -420,7 +419,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 		case <-self.ctx.Done():
 			return
 		}
-	}, handleCancel)
+	})
 
 	out := make(chan *evalResult)
 
@@ -456,12 +455,15 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 		default:
 		}
 
+		reconnect := NewReconnect(self.settings.ReconnectTimeout)
+
 		self.collapseExtenderDialers()
 
 		// the number of runs with pending out
 		p := 0
 
 		dialerWeights := self.dialerWeights()
+
 		if 0 < len(dialerWeights) {
 			serialDialers := []*clientDialer{}
 			parallelDialers := []*clientDialer{}
@@ -518,7 +520,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 				case result := <-out:
 					if result != nil {
 						if result.err == nil {
-							glog.Infof("[net][p]select: %s\n", result.dialer.String())
+							glog.V(2).Infof("[net][p]select: %s\n", result.dialer.String())
 							return result
 						}
 						glog.V(2).Infof("[net][p]select: %s = %s\n", result.dialer.String(), result.err)
@@ -531,37 +533,31 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 			}
 		}
 
-		expandStartTime := time.Now()
-
-		self.collapseExtenderDialers()
-		expandedDialers, _ := self.expandExtenderDialers()
-		if len(expandedDialers) == 0 {
-			break
-		}
-
-		n := min(len(expandedDialers), self.settings.ParallelBlockSize-p)
-		p += n
-		for _, dialer := range expandedDialers[0:n] {
-			go HandleError(func() {
-				run(dialer)
-			})
-		}
-		for _, dialer := range expandedDialers[n:] {
-			select {
-			case <-handleCtx.Done():
-				return nil
-			case result := <-out:
-				if result != nil {
-					if result.err == nil {
-						glog.Infof("[net][p]select: %s\n", result.dialer.String())
-						return result
-					}
-					glog.V(2).Infof("[net][p]select: %s = %s\n", result.dialer.String(), result.err)
-					result.Close()
-				}
+		if expandedDialers, _ := self.expandExtenderDialers(); 0 < len(expandedDialers) {
+			n := min(len(expandedDialers), self.settings.ParallelBlockSize-p)
+			p += n
+			for _, dialer := range expandedDialers[0:n] {
 				go HandleError(func() {
 					run(dialer)
 				})
+			}
+			for _, dialer := range expandedDialers[n:] {
+				select {
+				case <-handleCtx.Done():
+					return nil
+				case result := <-out:
+					if result != nil {
+						if result.err == nil {
+							glog.V(2).Infof("[net][p]select: %s\n", result.dialer.String())
+							return result
+						}
+						glog.V(2).Infof("[net][p]select: %s = %s\n", result.dialer.String(), result.err)
+						result.Close()
+					}
+					go HandleError(func() {
+						run(dialer)
+					})
+				}
 			}
 		}
 
@@ -581,14 +577,10 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 
 		// the rate limit is important when when the connect timeout is small
 		// e.g. local closes due to disconnected network
-		expandEndTime := time.Now()
-		expandDuration := expandEndTime.Sub(expandStartTime)
-		if timeout := self.settings.ExpandExtenderRateLimit - expandDuration; 0 < timeout {
-			select {
-			case <-handleCtx.Done():
-				return nil
-			case <-time.After(timeout):
-			}
+		select {
+		case <-handleCtx.Done():
+			return nil
+		case <-reconnect.After():
 		}
 	}
 
