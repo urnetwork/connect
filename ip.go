@@ -2668,8 +2668,9 @@ type RemoteUserNatClient struct {
 	pathTable             *pathTable
 	// the provide mode of the source packets
 	// for locally generated packets this is `ProvideMode_Network`
-	provideMode protocol.ProvideMode
-	clientUnsub func()
+	provideMode   protocol.ProvideMode
+	closeCallback func()
+	clientUnsub   func()
 }
 
 func NewRemoteUserNatClient(
@@ -2677,11 +2678,18 @@ func NewRemoteUserNatClient(
 	receivePacketCallback ReceivePacketFunction,
 	destinations []MultiHopId,
 	provideMode protocol.ProvideMode,
-) (*RemoteUserNatClient, error) {
-	pathTable, err := newPathTable(destinations)
-	if err != nil {
-		return nil, err
-	}
+) *RemoteUserNatClient {
+	return NewRemoteUserNatClientWithClose(client, receivePacketCallback, destinations, provideMode, nil)
+}
+
+func NewRemoteUserNatClientWithClose(
+	client *Client,
+	receivePacketCallback ReceivePacketFunction,
+	destinations []MultiHopId,
+	provideMode protocol.ProvideMode,
+	closeCallback func(),
+) *RemoteUserNatClient {
+	pathTable := newPathTable(destinations)
 
 	userNatClient := &RemoteUserNatClient{
 		client:                client,
@@ -2689,12 +2697,17 @@ func NewRemoteUserNatClient(
 		securityPolicy:        DefaultEgressSecurityPolicy(),
 		pathTable:             pathTable,
 		provideMode:           provideMode,
+		closeCallback:         closeCallback,
 	}
 
 	clientUnsub := client.AddReceiveCallback(userNatClient.ClientReceive)
 	userNatClient.clientUnsub = clientUnsub
 
-	return userNatClient, nil
+	return userNatClient
+}
+
+func (self *RemoteUserNatClient) DestinationCount() int {
+	return self.pathTable.DestinationCount()
 }
 
 func (self *RemoteUserNatClient) SecurityPolicyStats(reset bool) SecurityPolicyStats {
@@ -2787,6 +2800,9 @@ func (self *RemoteUserNatClient) Shuffle() {
 func (self *RemoteUserNatClient) Close() {
 	// self.client.RemoveReceiveCallback(self.clientCallbackId)
 	self.clientUnsub()
+	if self.closeCallback != nil {
+		self.closeCallback()
+	}
 }
 
 type pathTable struct {
@@ -2797,18 +2813,22 @@ type pathTable struct {
 	paths6 map[Ip6Path]MultiHopId
 }
 
-func newPathTable(destinations []MultiHopId) (*pathTable, error) {
-	if len(destinations) == 0 {
-		return nil, errors.New("No destinations.")
-	}
+func newPathTable(destinations []MultiHopId) *pathTable {
 	return &pathTable{
 		destinations: destinations,
 		paths4:       map[Ip4Path]MultiHopId{},
 		paths6:       map[Ip6Path]MultiHopId{},
-	}, nil
+	}
+}
+
+func (self *pathTable) DestinationCount() int {
+	return len(self.destinations)
 }
 
 func (self *pathTable) SelectDestination(packet []byte) (MultiHopId, error) {
+	if len(self.destinations) == 0 {
+		return MultiHopId{}, fmt.Errorf("No destinations")
+	}
 	if len(self.destinations) == 1 {
 		return self.destinations[0], nil
 	}

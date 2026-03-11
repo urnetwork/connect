@@ -375,6 +375,9 @@ type RemoteUserNatMultiClient struct {
 	clientUpdates    map[*multiClientChannel]map[*multiClientChannelUpdate]bool
 
 	performanceProfile *PerformanceProfile
+
+	localUserNat    *LocalUserNat
+	localUserNatSub func()
 }
 
 func NewRemoteUserNatMultiClientWithDefaults(
@@ -403,6 +406,8 @@ func NewRemoteUserNatMultiClient(
 
 	securityPolicyStats := DefaultSecurityPolicyStatsCollector()
 
+	localUserNat := NewLocalUserNatWithDefaults(cancelCtx, "multi local")
+
 	multiClient := &RemoteUserNatMultiClient{
 		ctx:                   cancelCtx,
 		cancel:                cancel,
@@ -420,6 +425,7 @@ func NewRemoteUserNatMultiClient(
 		affinityIp6Paths:      map[Ip6Path]map[Ip6Path]time.Time{},
 		clientUpdates:         map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
 		performanceProfile:    settings.DefaultPerformanceProfile,
+		localUserNat:          localUserNat,
 	}
 
 	multiClient.windows[WindowTypeQuality] = newMultiClientWindow(
@@ -445,6 +451,8 @@ func NewRemoteUserNatMultiClient(
 		)
 	}
 	// else only keep the quality window for fixed destination
+
+	multiClient.localUserNatSub = localUserNat.AddReceivePacketCallback(receivePacketCallback)
 
 	monitors := []MultiClientMonitor{}
 	for _, window := range multiClient.windows {
@@ -912,18 +920,23 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 		glog.Infof("[multi]send bad packet = %s\n", err)
 		return false
 	}
-	switch r {
-	case SecurityPolicyResultAllow:
+	if r == SecurityPolicyResultAllow {
 		parsedPacket := &parsedPacket{
 			packet:  packet,
 			ipPath:  ipPath,
 			payload: payload,
 		}
 		return self.sendPacket(source, provideMode, parsedPacket, timeout)
-	default:
-		// TODO upgrade port 53 and port 80 here with protocol specific conversions
-		glog.V(1).Infof("[multi]drop packet ipv%d p%v -> %s:%d\n", ipPath.Version, ipPath.Protocol, ipPath.DestinationIp, ipPath.DestinationPort)
-		return false
+	} else {
+		// FIXME allow local defaults to true but can be set
+		allowLocal := true
+		if allowLocal {
+			return self.localUserNat.SendPacket(source, provideMode, packet, timeout)
+		} else {
+			// TODO upgrade port 53 and port 80 here with protocol specific conversions
+			glog.V(1).Infof("[multi]drop packet ipv%d p%v -> %s:%d\n", ipPath.Version, ipPath.Protocol, ipPath.DestinationIp, ipPath.DestinationPort)
+			return false
+		}
 	}
 }
 
@@ -1254,11 +1267,13 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 	ipPath *IpPath,
 	packet []byte,
 ) {
-	// ipPath, err := ParseIpPath(packet)
-	// if err != nil {
-	// 	// bad ip packet, drop
-	// 	return
-	// }
+	r, err := self.ingressSecurityPolicy.Inspect(provideMode, ipPath)
+	if err != nil {
+		return
+	}
+	if r != SecurityPolicyResultAllow {
+		return
+	}
 
 	ipPath = ipPath.Reverse()
 
@@ -1464,10 +1479,12 @@ func (self *RemoteUserNatMultiClient) Close() {
 		window.Close()
 	}
 
-	removedUpdates := []*multiClientChannelUpdate{}
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
+
+		removedUpdates := []*multiClientChannelUpdate{}
+
 		for _, update := range self.ip4PathUpdates {
 			removedUpdates = append(removedUpdates, update)
 			// update.Close()
@@ -1483,10 +1500,14 @@ func (self *RemoteUserNatMultiClient) Close() {
 		// clear(self.updateIp4Paths)
 		// clear(self.updateIp6Paths)
 		// clear(clientUpdates)
+
+		for _, update := range removedUpdates {
+			update.Close()
+		}
 	}()
-	for _, update := range removedUpdates {
-		update.Close()
-	}
+
+	self.localUserNat.Close()
+	self.localUserNatSub()
 }
 
 type multiClientChannelUpdate struct {
@@ -3280,8 +3301,7 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 				self.addReceiveAck(ByteCount(len(packet)))
 
 				ipPath, err := ParseIpPath(packet)
-				r, err := self.ingressSecurityPolicy.Inspect(provideMode, ipPath)
-				if err == nil && r == SecurityPolicyResultAllow {
+				if err == nil {
 					self.clientReceivePacketCallback(self, source, provideMode, ipPath, packet)
 				}
 				// else not an ip packet, drop
