@@ -95,8 +95,10 @@ func DefaultContractManagerSettings() *ContractManagerSettings {
 
 		ProtocolVersion: DefaultProtocolVersion,
 
+		// TODO remove
 		LegacyCreateContract: false,
-		TrackUsedContracts:   false,
+		// TODO remove
+		TrackUsedContracts: false,
 	}
 }
 
@@ -117,13 +119,14 @@ type ContractManagerSettings struct {
 	// this can be removed after wide adoption
 	NetworkEventTimeEnableContracts time.Time
 
-	LegacyCreateContract bool
-
 	// an active ping to the control fast-tracks any timeouts
 	ProvidePingTimeout time.Duration
 
 	ProtocolVersion int
 
+	// TODO remove
+	LegacyCreateContract bool
+	// TODO remove
 	TrackUsedContracts bool
 }
 
