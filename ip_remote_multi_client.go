@@ -2088,7 +2088,7 @@ func (self *multiClientWindow) expand(
 	n int,
 ) (returnPingSuccess int) {
 	mutex := sync.Mutex{}
-	pendingPingDones := []chan struct{}{}
+	pendingPingDones := []context.Context{}
 	added := 0
 	addedP2pOnly := 0
 	pingSuccess := 0
@@ -2148,32 +2148,55 @@ func (self *multiClientWindow) expand(
 				}
 				args.MultiClientGeneratorClientArgs.P2pOnly = mathrand.Float32() < p2pOnlyP
 			}
-			// send an initial ping on the client and let the ack timeout close it
-			pingDone := make(chan struct{})
-			pendingPingDones = append(pendingPingDones, pingDone)
 
-			go HandleError(func() {
-				client, err := newMultiClientChannel(
-					self.ctx,
-					args,
-					self.generator,
-					self.clientReceivePacketCallback,
-					self.ingressSecurityPolicy,
-					self.contractStatus,
-					self.settings,
-				)
-				if err == nil {
-					p2pOnly := client.IsP2pOnly()
+			client, err := newMultiClientChannel(
+				self.ctx,
+				args,
+				self.generator,
+				self.clientReceivePacketCallback,
+				self.ingressSecurityPolicy,
+				self.contractStatus,
+				self.settings,
+			)
+			if err != nil {
+				self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
+				self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed)
+			} else {
 
-					func() {
-						mutex.Lock()
-						defer mutex.Unlock()
+				// send an initial ping on the client and let the ack timeout close it
+				pingDone, pingCancel := context.WithCancel(self.ctx)
+				pendingPingDones = append(pendingPingDones, pingDone)
 
-						added += 1
-						if p2pOnly {
-							addedP2pOnly += 1
-						}
-					}()
+				// must be called with mutex
+				fail := func() {
+					select {
+					case <-pingDone.Done():
+						// already done
+						return
+					default:
+					}
+
+					pingCancel()
+					client.Cancel()
+					self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
+					self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed)
+				}
+
+				go HandleError(func() {
+					mutex.Lock()
+					defer mutex.Unlock()
+
+					select {
+					case <-pingDone.Done():
+						// already done
+						return
+					default:
+					}
+
+					added += 1
+					if client.IsP2pOnly() {
+						addedP2pOnly += 1
+					}
 
 					self.monitor.AddProviderEvent(args.ClientId, ProviderStateInEvaluation)
 
@@ -2181,7 +2204,16 @@ func (self *multiClientWindow) expand(
 						&protocol.IpPing{},
 						self.settings.PingWriteTimeout,
 						func(err error) {
-							defer close(pingDone)
+							mutex.Lock()
+							defer mutex.Unlock()
+
+							select {
+							case <-pingDone.Done():
+								// already done
+								return
+							default:
+							}
+
 							if err == nil {
 								glog.V(1).Infof("[multi]expand new client\n")
 
@@ -2198,46 +2230,36 @@ func (self *multiClientWindow) expand(
 									replacedClient.Cancel()
 									self.monitor.AddProviderEvent(replacedClient.ClientId(), ProviderStateRemoved)
 								}
-								func() {
-									mutex.Lock()
-									defer mutex.Unlock()
-
-									pingSuccess += 1
-								}()
+								pingSuccess += 1
+								pingCancel()
 							} else {
 								glog.V(1).Infof("[multi]create ping error = %s\n", err)
-								client.Cancel()
-								self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed)
+								fail()
 							}
 						},
 					)
 					if err != nil {
-						glog.V(1).Infof("[multi]create client ping error = %s\n", err)
-						close(pingDone)
-						client.Cancel()
+						glog.Infof("[multi]create client ping error = %s\n", err)
+						fail()
 					} else if !success {
-						close(pingDone)
-						client.Cancel()
-						self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed)
+						fail()
 					} else {
 						// async wait for the ping
 						go HandleError(func() {
 							select {
-							case <-pingDone:
+							case <-pingDone.Done():
 							case <-time.After(self.settings.PingTimeout):
 								glog.V(2).Infof("[multi]expand window timeout waiting for ping\n")
-								client.Cancel()
+								func() {
+									mutex.Lock()
+									defer mutex.Unlock()
+									fail()
+								}()
 							}
 						}, client.Cancel)
 					}
-				} else {
-					glog.Infof("[multi]create client error = %s\n", err)
-					close(pingDone)
-					self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
-					self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed)
-				}
-			})
-			// }
+				})
+			}
 		case <-time.After(timeout):
 			glog.V(2).Infof("[multi]expand window timeout waiting for args\n")
 		}
@@ -2253,7 +2275,7 @@ func (self *multiClientWindow) expand(
 		select {
 		case <-self.ctx.Done():
 			return
-		case <-pingDone:
+		case <-pingDone.Done():
 		case <-time.After(timeout):
 		}
 	}
