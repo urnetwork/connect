@@ -2748,7 +2748,8 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 		}
 
 		opts := []any{
-			ForceStream(),
+			// FIXME direct mode setting
+			// ForceStream(),
 		}
 		if !ack {
 			opts = append(opts, NoAck())
@@ -2780,12 +2781,16 @@ func (self *multiClientChannel) SendDetailedMessage(message proto.Message, timeo
 	if frame, err := ToFrame(message, self.settings.ProtocolVersion); err != nil {
 		return false, err
 	} else {
+		opts := []any{
+			// FIXME direct mode setting
+			// ForceStream(),
+		}
 		return self.client.SendMultiHopWithTimeoutDetailed(
 			frame,
 			self.args.Destination,
 			ackCallback,
 			timeout,
-			ForceStream(),
+			opts...,
 		)
 	}
 }
