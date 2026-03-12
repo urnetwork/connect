@@ -833,6 +833,8 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 	contractQueue := self.openContractQueue(contractKey)
 	defer self.closeContractQueue(contractKey)
 
+	streamVersion := uint32(DefaultStreamVersion)
+
 	createContract := &protocol.CreateContract{
 		DestinationId:     contractKey.Destination.DestinationId.Bytes(),
 		IntermediaryIds:   contractKey.IntermediaryIds.Bytes(),
@@ -840,6 +842,7 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 		TransferByteCount: uint64(self.contractByteCount(contractSeqIndex, minByteCount)),
 		Companion:         contractKey.CompanionContract,
 		ForceStream:       &contractKey.ForceStream,
+		StreamVersion:     &streamVersion,
 	}
 	if self.settings.TrackUsedContracts {
 		createContract.UsedContractIds = contractQueue.UsedContractIdBytes()

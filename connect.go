@@ -22,6 +22,11 @@ const MaxMultihopLength = 8
 //	Most clients need to be able to read v2 before we turn this on.
 const DefaultProtocolVersion = 2
 
+// v1: the first versioned stream version
+//
+//	this version requires that TransferPath allow simultaneous source, destination, and stream ids
+const DefaultStreamVersion = 1
+
 // id for message to/from the platform
 var ControlId = Id{}
 
