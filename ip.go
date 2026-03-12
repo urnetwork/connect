@@ -58,6 +58,9 @@ type UserNatClient interface {
 	Shuffle()
 
 	SecurityPolicyStats(reset bool) SecurityPolicyStats
+
+	// allow traffic that fails the security policy of the peers to stay local
+	SetLocalSecurityBypass(localSecurityBypass bool)
 }
 
 func DefaultUdpBufferSettings() *UdpBufferSettings {
@@ -2669,8 +2672,13 @@ type RemoteUserNatClient struct {
 	// the provide mode of the source packets
 	// for locally generated packets this is `ProvideMode_Network`
 	provideMode   protocol.ProvideMode
+	localUserNat  *LocalUserNat
 	closeCallback func()
 	clientUnsub   func()
+
+	stateLock           sync.Mutex
+	allowDirect         bool
+	localSecurityBypass bool
 }
 
 func NewRemoteUserNatClient(
@@ -2691,12 +2699,15 @@ func NewRemoteUserNatClientWithClose(
 ) *RemoteUserNatClient {
 	pathTable := newPathTable(destinations)
 
+	localUserNat := NewLocalUserNatWithDefaults(client.Ctx(), "remote local")
+
 	userNatClient := &RemoteUserNatClient{
 		client:                client,
 		receivePacketCallback: receivePacketCallback,
 		securityPolicy:        DefaultEgressSecurityPolicy(),
 		pathTable:             pathTable,
 		provideMode:           provideMode,
+		localUserNat:          localUserNat,
 		closeCallback:         closeCallback,
 	}
 
@@ -2706,8 +2717,12 @@ func NewRemoteUserNatClientWithClose(
 	return userNatClient
 }
 
-func (self *RemoteUserNatClient) DestinationCount() int {
-	return self.pathTable.DestinationCount()
+func (self *RemoteUserNatClient) Destinations() []MultiHopId {
+	return self.pathTable.Destinations()
+}
+
+func (self *RemoteUserNatClient) DestinationIds() []Id {
+	return self.pathTable.DestinationIds()
 }
 
 func (self *RemoteUserNatClient) SecurityPolicyStats(reset bool) SecurityPolicyStats {
@@ -2726,8 +2741,7 @@ func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode pro
 	if err != nil {
 		return false
 	}
-	switch r {
-	case SecurityPolicyResultAllow:
+	if r == SecurityPolicyResultAllow {
 		destination, err := self.pathTable.SelectDestination(packet)
 		if err != nil {
 			// drop
@@ -2755,7 +2769,9 @@ func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode pro
 		}
 		success := self.client.SendMultiHopWithTimeout(frame, destination, func(err error) {}, timeout, opts...)
 		return success
-	default:
+	} else if self.LocalSecurityBypass() {
+		return self.localUserNat.SendPacket(source, provideMode, packet, timeout)
+	} else {
 		return false
 	}
 }
@@ -2799,10 +2815,35 @@ func (self *RemoteUserNatClient) Shuffle() {
 
 func (self *RemoteUserNatClient) Close() {
 	// self.client.RemoveReceiveCallback(self.clientCallbackId)
+	self.localUserNat.Close()
 	self.clientUnsub()
 	if self.closeCallback != nil {
 		self.closeCallback()
 	}
+}
+
+func (self *RemoteUserNatClient) SetAllowDirect(allowDirect bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.allowDirect = allowDirect
+}
+
+func (self *RemoteUserNatClient) AllowDirect() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.allowDirect
+}
+
+func (self *RemoteUserNatClient) SetLocalSecurityBypass(localSecurityBypass bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.localSecurityBypass = localSecurityBypass
+}
+
+func (self *RemoteUserNatClient) LocalSecurityBypass() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.localSecurityBypass
 }
 
 type pathTable struct {
@@ -2821,8 +2862,16 @@ func newPathTable(destinations []MultiHopId) *pathTable {
 	}
 }
 
-func (self *pathTable) DestinationCount() int {
-	return len(self.destinations)
+func (self *pathTable) Destinations() []MultiHopId {
+	return slices.Clone(self.destinations)
+}
+
+func (self *pathTable) DestinationIds() []Id {
+	var clientIds []Id
+	for _, destination := range self.destinations {
+		clientIds = append(clientIds, destination.Tail())
+	}
+	return clientIds
 }
 
 func (self *pathTable) SelectDestination(packet []byte) (MultiHopId, error) {

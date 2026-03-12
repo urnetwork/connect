@@ -315,8 +315,9 @@ func (self *WindowSizeSettings) Validate() error {
 // not setting a performance profile will use the default "auto" mode
 // which balances traffic across multiple window types with an internal set of profiles
 type PerformanceProfile struct {
-	WindowType WindowType
-	WindowSize WindowSizeSettings
+	WindowType  WindowType
+	WindowSize  WindowSizeSettings
+	AllowDirect bool
 }
 
 func (self *PerformanceProfile) Validate() error {
@@ -374,7 +375,8 @@ type RemoteUserNatMultiClient struct {
 	affinityIp6Paths map[Ip6Path]map[Ip6Path]time.Time
 	clientUpdates    map[*multiClientChannel]map[*multiClientChannelUpdate]bool
 
-	performanceProfile *PerformanceProfile
+	performanceProfile  *PerformanceProfile
+	localSecurityBypass bool
 
 	localUserNat    *LocalUserNat
 	localUserNatSub func()
@@ -501,7 +503,21 @@ func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *
 	}()
 	for _, window := range self.windows {
 		window.SetPerformanceProfile(performanceProfile)
+		// reset the window
+		window.shuffle()
 	}
+}
+
+func (self *RemoteUserNatMultiClient) SetLocalSecurityBypass(localSecurityBypass bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.localSecurityBypass = localSecurityBypass
+}
+
+func (self *RemoteUserNatMultiClient) LocalSecurityBypass() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.localSecurityBypass
 }
 
 // ordered by choice descending
@@ -927,16 +943,12 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 			payload: payload,
 		}
 		return self.sendPacket(source, provideMode, parsedPacket, timeout)
+	} else if self.LocalSecurityBypass() {
+		return self.localUserNat.SendPacket(source, provideMode, packet, timeout)
 	} else {
-		// FIXME allow local defaults to true but can be set
-		allowLocal := true
-		if allowLocal {
-			return self.localUserNat.SendPacket(source, provideMode, packet, timeout)
-		} else {
-			// TODO upgrade port 53 and port 80 here with protocol specific conversions
-			glog.V(1).Infof("[multi]drop packet ipv%d p%v -> %s:%d\n", ipPath.Version, ipPath.Protocol, ipPath.DestinationIp, ipPath.DestinationPort)
-			return false
-		}
+		// TODO upgrade port 53 and port 80 here with protocol specific conversions
+		glog.V(1).Infof("[multi]drop packet ipv%d p%v -> %s:%d\n", ipPath.Version, ipPath.Protocol, ipPath.DestinationIp, ipPath.DestinationPort)
+		return false
 	}
 }
 
@@ -1640,6 +1652,7 @@ type multiClientWindow struct {
 	performanceProfile *PerformanceProfile
 
 	generatorMonitor *Monitor
+	resizeMonitor    *Monitor
 }
 
 func newMultiClientWindow(
@@ -1666,6 +1679,7 @@ func newMultiClientWindow(
 		contractStatusCallbacks:     NewCallbackList[ContractStatusFunction](),
 		clients:                     map[Id]*multiClientChannel{},
 		generatorMonitor:            NewMonitor(),
+		resizeMonitor:               NewMonitor(),
 	}
 
 	go HandleError(window.randomEnumerateClientArgs, cancel)
@@ -1681,20 +1695,20 @@ func (self *multiClientWindow) AddContractStatusCallback(contractStatusCallback 
 	}
 }
 
-// the performance profile will take effect at the next `resize` iteration
-func (self *multiClientWindow) SetPerformanceProfile(performanceProfile *PerformanceProfile) {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
-
-	self.performanceProfile = performanceProfile
-}
-
 func (self *multiClientWindow) contractStatus(contractStatus *ContractStatus) {
 	for _, contractStatusCallback := range self.contractStatusCallbacks.Get() {
 		HandleError(func() {
 			contractStatusCallback(contractStatus)
 		})
 	}
+}
+
+// the performance profile will take effect at the next `resize` iteration
+func (self *multiClientWindow) SetPerformanceProfile(performanceProfile *PerformanceProfile) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	self.performanceProfile = performanceProfile
 }
 
 func (self *multiClientWindow) randomEnumerateClientArgs() {
@@ -1799,6 +1813,8 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 
 func (self *multiClientWindow) resize() {
 	for {
+		update := self.resizeMonitor.NotifyChannel()
+
 		var windowSize WindowSizeSettings
 		var fixedWindowType *WindowType
 		func() {
@@ -2073,6 +2089,7 @@ func (self *multiClientWindow) resize() {
 			select {
 			case <-self.ctx.Done():
 				return
+			case <-update:
 			case <-time.After(timeout):
 			}
 		}
@@ -2156,6 +2173,7 @@ func (self *multiClientWindow) expand(
 				self.clientReceivePacketCallback,
 				self.ingressSecurityPolicy,
 				self.contractStatus,
+				self.performanceProfile,
 				self.settings,
 			)
 			if err != nil {
@@ -2287,6 +2305,7 @@ func (self *multiClientWindow) shuffle() {
 	for _, client := range self.unorderedClients() {
 		client.Cancel()
 	}
+	self.resizeMonitor.NotifyAll()
 }
 
 func (self *multiClientWindow) unorderedClients() []*multiClientChannel {
@@ -2558,6 +2577,7 @@ type multiClientChannel struct {
 
 	clientReceivePacketCallback clientReceivePacketFunction
 	ingressSecurityPolicy       SecurityPolicy
+	performanceProfile          *PerformanceProfile
 	createTime                  time.Time
 
 	settings *MultiClientSettings
@@ -2598,6 +2618,7 @@ func newMultiClientChannel(
 	clientReceivePacketCallback clientReceivePacketFunction,
 	ingressSecurityPolicy SecurityPolicy,
 	contractStatusCallback ContractStatusFunction,
+	performanceProfile *PerformanceProfile,
 	settings *MultiClientSettings,
 ) (*multiClientChannel, error) {
 	cancelCtx, cancel := context.WithCancel(ctx)
@@ -2634,6 +2655,7 @@ func newMultiClientChannel(
 		args:                        args,
 		clientReceivePacketCallback: clientReceivePacketCallback,
 		ingressSecurityPolicy:       ingressSecurityPolicy,
+		performanceProfile:          performanceProfile,
 		createTime:                  time.Now(),
 		settings:                    settings,
 		// sourceFilter: sourceFilter,
@@ -2747,9 +2769,9 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 			}
 		}
 
-		opts := []any{
-			// FIXME direct mode setting
-			// ForceStream(),
+		var opts []any
+		if self.performanceProfile.AllowDirect {
+			opts = append(opts, ForceStream())
 		}
 		if !ack {
 			opts = append(opts, NoAck())
@@ -2781,9 +2803,9 @@ func (self *multiClientChannel) SendDetailedMessage(message proto.Message, timeo
 	if frame, err := ToFrame(message, self.settings.ProtocolVersion); err != nil {
 		return false, err
 	} else {
-		opts := []any{
-			// FIXME direct mode setting
-			// ForceStream(),
+		var opts []any
+		if self.performanceProfile.AllowDirect {
+			opts = append(opts, ForceStream())
 		}
 		return self.client.SendMultiHopWithTimeoutDetailed(
 			frame,
