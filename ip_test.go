@@ -237,7 +237,7 @@ func testingNewClient(ctx context.Context, providerClient *Client, receivePacket
 			RequireMultiHopId(providerClient.ClientId()),
 		},
 		protocol.ProvideMode_Network,
-	)
+	), nil
 }
 
 // test with all sequence buffer sizes set to 0

@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 	// "slices"
-	// "fmt"
+	"fmt"
 
 	// "golang.org/x/exp/maps"
 
@@ -24,6 +24,61 @@ type WebRtcConn interface {
 	net.Conn
 	Connected() bool
 	AddConnectedCallback(func(connected bool)) func()
+}
+
+type SignalSender interface {
+	SendSignal(path TransferPath, signal *protocol.Frame)
+}
+
+type SignalReceiver interface {
+	ReceiveSignal(source TransferPath, signal *protocol.Frame) error
+}
+
+// conforms to `SignalSender`
+type ClientSignalSender struct {
+	client *Client
+}
+
+func NewClientSignalSender(client *Client) *ClientSignalSender {
+	return &ClientSignalSender{
+		client: client,
+	}
+}
+
+func (self *ClientSignalSender) SendSignal(path TransferPath, signal *protocol.Frame) {
+	self.client.Send(signal, path.DestinationMask(), nil)
+}
+
+type clientSignalReceiver struct {
+	client   *Client
+	receiver SignalReceiver
+}
+
+func ReceiveSignalsFromClient(client *Client, receiver SignalReceiver) func() {
+	r := &clientSignalReceiver{
+		client:   client,
+		receiver: receiver,
+	}
+	return client.AddReceiveCallback(r.Receive)
+}
+
+// ReceiveFunction
+func (self *clientSignalReceiver) Receive(source TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode) {
+	for _, frame := range frames {
+		err := self.handleControlFrame(source, frame)
+		if err != nil {
+			glog.Infof("[signal]receive err=%s\n", err)
+			// ignore error
+		}
+	}
+}
+
+func (self *clientSignalReceiver) handleControlFrame(source TransferPath, frame *protocol.Frame) error {
+	switch frame.MessageType {
+	case protocol.MessageType_TransferExchangeSignals:
+		self.receiver.ReceiveSignal(source, frame)
+	}
+	return nil
 }
 
 func DefaultWebRtcSettings() *WebRtcSettings {
@@ -65,89 +120,78 @@ type WebRtcSettings struct {
 }
 
 type WebRtcManager struct {
-	ctx context.Context
-
-	client *Client
-
-	settings *WebRtcSettings
+	ctx          context.Context
+	signalSender SignalSender
+	settings     *WebRtcSettings
 
 	stateLock sync.Mutex
 	peerConns map[peerConnKey]*peerConn
 }
 
-func NewWebRtcManager(ctx context.Context, client *Client, settings *WebRtcSettings) *WebRtcManager {
+func NewWebRtcManager(ctx context.Context, signalSender SignalSender, settings *WebRtcSettings) *WebRtcManager {
 	return &WebRtcManager{
-		ctx:       ctx,
-		client:    client,
-		settings:  settings,
-		peerConns: map[peerConnKey]*peerConn{},
+		ctx:          ctx,
+		signalSender: signalSender,
+		settings:     settings,
+		peerConns:    map[peerConnKey]*peerConn{},
 	}
 }
 
-// ReceiveFunction
-func (self *WebRtcManager) Receive(source TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode) {
-	for _, frame := range frames {
-		err := self.handleControlFrame(source, frame)
-		if err != nil {
-			glog.Infof("[peerconn]handle err=%s\n", err)
-			// ignore error
-		}
+// SignalReceiver
+func (self *WebRtcManager) ReceiveSignal(source TransferPath, frame *protocol.Frame) error {
+	message, err := FromFrame(frame)
+	if err != nil {
+		return err
 	}
-}
-
-func (self *WebRtcManager) handleControlFrame(source TransferPath, frame *protocol.Frame) error {
-	switch frame.MessageType {
-	case protocol.MessageType_TransferExchangeSignals:
-		message, err := FromFrame(frame)
-		if err != nil {
-			return err
+	switch v := message.(type) {
+	case *protocol.ExchangeSignals:
+		key := peerConnKey{
+			PeerId:   source.SourceId,
+			StreamId: Id(v.StreamId),
 		}
-		switch v := message.(type) {
-		case *protocol.ExchangeSignals:
-			key := peerConnKey{
-				PeerId:   source.SourceId,
-				StreamId: Id(v.StreamId),
-				// ConnId: Id(v.ConnId),
+		var conn *peerConn
+		func() {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			conn = self.peerConns[key]
+			if glog.V(2) {
+				if conn == nil {
+					glog.Infof("[signal]miss %s (%v)\n", key, self.peerConns)
+				}
 			}
-			var conn *peerConn
-			func() {
-				self.stateLock.Lock()
-				defer self.stateLock.Unlock()
-				conn = self.peerConns[key]
-			}()
-			if conn != nil {
-				for _, signal := range v.Signals {
-					err := conn.ReceiveSignalFromPeer(signal)
-					if err != nil {
-						return err
-					}
+		}()
+		if conn != nil {
+			for _, signal := range v.Signals {
+				glog.V(2).Infof("[signal]%s\n", signal.SignalType)
+				err := conn.ReceiveSignalFromPeer(signal)
+				if err != nil {
+					return err
 				}
 			}
 		}
+
 	}
 	return nil
 }
 
-// this should return an active, tested connection
-func (self *WebRtcManager) NewP2pConnActive(ctx context.Context, peerId Id, streamId Id) (WebRtcConn, error) {
-	return self.newP2pConn(ctx, peerId, streamId, true)
+func (self *WebRtcManager) NewP2pConnActive(ctx context.Context, path TransferPath) (WebRtcConn, error) {
+	return self.newP2pConn(ctx, path, true)
 }
 
-// this should return an active, tested connection
-func (self *WebRtcManager) NewP2pConnPassive(ctx context.Context, peerId Id, streamId Id) (WebRtcConn, error) {
-	return self.newP2pConn(ctx, peerId, streamId, false)
+func (self *WebRtcManager) NewP2pConnPassive(ctx context.Context, path TransferPath) (WebRtcConn, error) {
+	return self.newP2pConn(ctx, path, false)
 }
 
-func (self *WebRtcManager) newP2pConn(ctx context.Context, peerId Id, streamId Id, active bool) (conn *peerConn, err error) {
+func (self *WebRtcManager) newP2pConn(ctx context.Context, path TransferPath, active bool) (conn *peerConn, err error) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
 	key := peerConnKey{
-		PeerId:   peerId,
-		StreamId: streamId,
+		PeerId:   path.DestinationId,
+		StreamId: path.StreamId,
 	}
 
-	conn, err = newPeerConn(ctx, key, active, self.client, self.settings)
+	conn, err = newPeerConn(ctx, key, path.SourceId, active, self.signalSender, self.settings)
 	if err != nil {
 		return
 	}
@@ -155,7 +199,7 @@ func (self *WebRtcManager) newP2pConn(ctx context.Context, peerId Id, streamId I
 		defer func() {
 			self.stateLock.Lock()
 			defer self.stateLock.Unlock()
-
+			conn.Cancel()
 			if conn == self.peerConns[key] {
 				delete(self.peerConns, key)
 			}
@@ -176,16 +220,21 @@ type peerConnKey struct {
 	StreamId Id
 }
 
+func (self peerConnKey) String() string {
+	return fmt.Sprintf("s(%s) <>%s", self.StreamId, self.PeerId)
+}
+
 // conforms to WebRtcConn
 type peerConn struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	key    peerConnKey
-	active bool
+	key      peerConnKey
+	sourceId Id
+	active   bool
 
-	client   *Client
-	settings *WebRtcSettings
+	signalSender SignalSender
+	settings     *WebRtcSettings
 
 	// api *webrtc.API
 	pc *webrtc.PeerConnection
@@ -204,7 +253,7 @@ type peerConn struct {
 	writeDeadline time.Time
 }
 
-func newPeerConn(ctx context.Context, key peerConnKey, active bool, client *Client, settings *WebRtcSettings) (*peerConn, error) {
+func newPeerConn(ctx context.Context, key peerConnKey, sourceId Id, active bool, signalSender SignalSender, settings *WebRtcSettings) (*peerConn, error) {
 	pc, err := createWebRtcPeerConnection(ctx, active, settings)
 	if err != nil {
 		return nil, err
@@ -213,12 +262,13 @@ func newPeerConn(ctx context.Context, key peerConnKey, active bool, client *Clie
 	cancelCtx, cancel := context.WithCancel(ctx)
 
 	conn := &peerConn{
-		ctx:      cancelCtx,
-		cancel:   cancel,
-		key:      key,
-		active:   active,
-		client:   client,
-		settings: settings,
+		ctx:          cancelCtx,
+		cancel:       cancel,
+		key:          key,
+		sourceId:     sourceId,
+		active:       active,
+		signalSender: signalSender,
+		settings:     settings,
 		// api:                api,
 		pc:                 pc,
 		connectedCallbacks: NewCallbackList[func(connected bool)](),
@@ -237,7 +287,7 @@ func (self *peerConn) Run() {
 
 	self.pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		connected := state == webrtc.ICEConnectionStateConnected
-		glog.Infof("[peerconn]state=%v (%t)\n", state, connected)
+		glog.V(2).Infof("[peerconn]state=%v (%t)\n", state, connected)
 		self.setConnected(connected)
 	})
 
@@ -463,10 +513,9 @@ func (self *peerConn) sendSignal(signal *protocol.ExchangeSignal) {
 		StreamId: self.key.StreamId.Bytes(),
 		Signals:  []*protocol.ExchangeSignal{signal},
 	}
-	self.client.Send(
+	self.signalSender.SendSignal(
+		DestinationId(self.key.PeerId).AddSource(self.sourceId),
 		RequireToFrameWithDefaultProtocolVersion(signals),
-		DestinationId(self.key.PeerId),
-		nil,
 	)
 }
 

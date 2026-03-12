@@ -8,6 +8,11 @@ option go_package = "github.com/urnetwork/connect/protocol";
 import "frame.proto";
 
 
+// changes 2026-03:
+// 1. stream_version added to create contract.
+//    unset (default) disables streams on companion contracts
+//    1 enables streams on companion contracts
+// 2. TransferPath now allows source, destination, and stream to be set simultaneously
 // changes 2024-08: 
 // 1. transfer can now be addressed to/from a stream_id
 //    Anywhere transfer would be addressed to a destination_id or from a source_id,
@@ -16,7 +21,6 @@ import "frame.proto";
 // 3. multi-hop state is created with StreamOpen
 //    This is sent each time a stream contract is created,
 //    so that the hop state can time out the same as the sender state.
-
 
 message TransferPath {
     // ulid
@@ -215,6 +219,8 @@ message CreateContract {
     // stream will be used when intermediary_ids or stream_id is set
     // in the case of wanting to use streams with no intermediaries, set `force_stream=true`
     optional bool force_stream = 7;
+    // see stream version reference at top
+    optional uint32 stream_version = 8;
 }
 // the creator knows all the hops on the stream from the enumerated linpaths
 // when evaluating the completed contracts, the send and receive count involving the source_id

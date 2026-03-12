@@ -113,9 +113,9 @@ func (self *P2pTransport) run() {
 		// We arbitrarily choose the sender (peer is destination) as active.
 		switch self.peerType {
 		case PeerTypeDestination:
-			conn, err = self.webRtcManager.NewP2pConnActive(self.ctx, self.peerId, self.streamId)
+			conn, err = self.webRtcManager.NewP2pConnActive(self.ctx, NewTransferPath(self.client.ClientId(), self.peerId, self.streamId))
 		case PeerTypeSource:
-			conn, err = self.webRtcManager.NewP2pConnPassive(self.ctx, self.peerId, self.streamId)
+			conn, err = self.webRtcManager.NewP2pConnPassive(self.ctx, NewTransferPath(self.client.ClientId(), self.peerId, self.streamId))
 		default:
 			// unknown peer type
 			return
