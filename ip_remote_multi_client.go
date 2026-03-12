@@ -2770,7 +2770,7 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 		}
 
 		var opts []any
-		if self.performanceProfile.AllowDirect {
+		if self.performanceProfile != nil && self.performanceProfile.AllowDirect {
 			opts = append(opts, ForceStream())
 		}
 		if !ack {
@@ -2804,7 +2804,7 @@ func (self *multiClientChannel) SendDetailedMessage(message proto.Message, timeo
 		return false, err
 	} else {
 		var opts []any
-		if self.performanceProfile.AllowDirect {
+		if self.performanceProfile != nil && self.performanceProfile.AllowDirect {
 			opts = append(opts, ForceStream())
 		}
 		return self.client.SendMultiHopWithTimeoutDetailed(
