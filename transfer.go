@@ -333,11 +333,11 @@ func NewClientWithTag(
 
 	routeManager := NewRouteManager(ctx, clientTag)
 	contractManager := NewContractManager(ctx, client, settings.ContractManagerSettings)
-	webRtcManager := NewWebRtcManager(ctx, client, settings.WebRtcSettings)
+	webRtcManager := NewWebRtcManager(ctx, NewClientSignalSender(client), settings.WebRtcSettings)
 	streamManager := NewStreamManager(ctx, client, webRtcManager, settings.StreamManagerSettings)
 
 	client.contractManagerUnsub = client.AddReceiveCallback(contractManager.Receive)
-	client.webRtcManagerUnsub = client.AddReceiveCallback(webRtcManager.Receive)
+	client.webRtcManagerUnsub = ReceiveSignalsFromClient(client, webRtcManager)
 	client.streamManagerUnsub = client.AddReceiveCallback(streamManager.Receive)
 
 	client.initBuffers(routeManager, contractManager, webRtcManager, streamManager)
