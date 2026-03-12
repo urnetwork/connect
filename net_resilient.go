@@ -39,6 +39,7 @@ import (
 	// "google.golang.org/protobuf/proto"
 
 	"src.agwa.name/tlshacks"
+	// "github.com/urnetwork/glog"
 )
 
 // see https://upb-syssec.github.io/blog/2023/record-fragmentation/
@@ -53,20 +54,22 @@ func NewResilientDialTlsContext(
 	return func(
 		ctx context.Context,
 		network string,
-		address string,
+		addr string,
 	) (net.Conn, error) {
-		if network != "tcp" {
+		switch network {
+		case "tcp", "tcp4", "tcp6":
+		default:
 			panic(fmt.Errorf("Resilient connections only support tcp network."))
 		}
 
-		host, _, err := net.SplitHostPort(address)
+		host, _, err := net.SplitHostPort(addr)
 		if err != nil {
 			panic(err)
 		}
 
 		// fmt.Printf("Extender client 1\n")
 
-		conn, err := connectSettings.DialContext(ctx, "tcp", address)
+		conn, err := connectSettings.DialContext(ctx, "tcp", addr)
 		if err != nil {
 			return nil, err
 		}

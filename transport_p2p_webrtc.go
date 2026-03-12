@@ -187,8 +187,8 @@ type peerConn struct {
 	client   *Client
 	settings *WebRtcSettings
 
-	api *webrtc.API
-	pc  *webrtc.PeerConnection
+	// api *webrtc.API
+	pc *webrtc.PeerConnection
 
 	connectedCallbacks *CallbackList[func(connected bool)]
 	connMonitor        *Monitor
@@ -205,24 +205,7 @@ type peerConn struct {
 }
 
 func newPeerConn(ctx context.Context, key peerConnKey, active bool, client *Client, settings *WebRtcSettings) (*peerConn, error) {
-	s := webrtc.SettingEngine{}
-	s.DetachDataChannels()
-	s.SetSCTPMaxReceiveBufferSize( /*16 * 1024 * 1024*/ uint32(settings.ReceiveBufferSize))
-	s.SetReceiveMTU( /*16384*/ uint(settings.ReceiveMtu))
-	s.SetICETimeouts(
-		settings.DisconnectedTimeout,
-		settings.FailedTimeout,
-		settings.KeepAliveTimeout,
-	)
-
-	api := webrtc.NewAPI(webrtc.WithSettingEngine(s))
-	pc, err := api.NewPeerConnection(webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			webrtc.ICEServer{
-				URLs: settings.IceServerUrls,
-			},
-		},
-	})
+	pc, err := createWebRtcPeerConnection(ctx, active, settings)
 	if err != nil {
 		return nil, err
 	}
@@ -230,13 +213,13 @@ func newPeerConn(ctx context.Context, key peerConnKey, active bool, client *Clie
 	cancelCtx, cancel := context.WithCancel(ctx)
 
 	conn := &peerConn{
-		ctx:                cancelCtx,
-		cancel:             cancel,
-		key:                key,
-		active:             active,
-		client:             client,
-		settings:           settings,
-		api:                api,
+		ctx:      cancelCtx,
+		cancel:   cancel,
+		key:      key,
+		active:   active,
+		client:   client,
+		settings: settings,
+		// api:                api,
 		pc:                 pc,
 		connectedCallbacks: NewCallbackList[func(connected bool)](),
 		connMonitor:        NewMonitor(),
@@ -488,7 +471,7 @@ func (self *peerConn) sendSignal(signal *protocol.ExchangeSignal) {
 }
 
 func (self *peerConn) setOpenDataChannel(dc *webrtc.DataChannel) error {
-	conn, err := dc.DetachWithDeadline()
+	conn, err := detachWithDeadline(dc)
 	if err != nil {
 		return err
 	}

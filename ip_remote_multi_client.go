@@ -315,8 +315,9 @@ func (self *WindowSizeSettings) Validate() error {
 // not setting a performance profile will use the default "auto" mode
 // which balances traffic across multiple window types with an internal set of profiles
 type PerformanceProfile struct {
-	WindowType WindowType
-	WindowSize WindowSizeSettings
+	WindowType  WindowType
+	WindowSize  WindowSizeSettings
+	AllowDirect bool
 }
 
 func (self *PerformanceProfile) Validate() error {
@@ -374,7 +375,11 @@ type RemoteUserNatMultiClient struct {
 	affinityIp6Paths map[Ip6Path]map[Ip6Path]time.Time
 	clientUpdates    map[*multiClientChannel]map[*multiClientChannelUpdate]bool
 
-	performanceProfile *PerformanceProfile
+	performanceProfile  *PerformanceProfile
+	localSecurityBypass bool
+
+	localUserNat    *LocalUserNat
+	localUserNatSub func()
 }
 
 func NewRemoteUserNatMultiClientWithDefaults(
@@ -403,6 +408,8 @@ func NewRemoteUserNatMultiClient(
 
 	securityPolicyStats := DefaultSecurityPolicyStatsCollector()
 
+	localUserNat := NewLocalUserNatWithDefaults(cancelCtx, "multi local")
+
 	multiClient := &RemoteUserNatMultiClient{
 		ctx:                   cancelCtx,
 		cancel:                cancel,
@@ -420,6 +427,7 @@ func NewRemoteUserNatMultiClient(
 		affinityIp6Paths:      map[Ip6Path]map[Ip6Path]time.Time{},
 		clientUpdates:         map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
 		performanceProfile:    settings.DefaultPerformanceProfile,
+		localUserNat:          localUserNat,
 	}
 
 	multiClient.windows[WindowTypeQuality] = newMultiClientWindow(
@@ -445,6 +453,8 @@ func NewRemoteUserNatMultiClient(
 		)
 	}
 	// else only keep the quality window for fixed destination
+
+	multiClient.localUserNatSub = localUserNat.AddReceivePacketCallback(receivePacketCallback)
 
 	monitors := []MultiClientMonitor{}
 	for _, window := range multiClient.windows {
@@ -493,7 +503,21 @@ func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *
 	}()
 	for _, window := range self.windows {
 		window.SetPerformanceProfile(performanceProfile)
+		// reset the window
+		window.shuffle()
 	}
+}
+
+func (self *RemoteUserNatMultiClient) SetLocalSecurityBypass(localSecurityBypass bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.localSecurityBypass = localSecurityBypass
+}
+
+func (self *RemoteUserNatMultiClient) LocalSecurityBypass() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.localSecurityBypass
 }
 
 // ordered by choice descending
@@ -912,15 +936,16 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 		glog.Infof("[multi]send bad packet = %s\n", err)
 		return false
 	}
-	switch r {
-	case SecurityPolicyResultAllow:
+	if r == SecurityPolicyResultAllow {
 		parsedPacket := &parsedPacket{
 			packet:  packet,
 			ipPath:  ipPath,
 			payload: payload,
 		}
 		return self.sendPacket(source, provideMode, parsedPacket, timeout)
-	default:
+	} else if self.LocalSecurityBypass() {
+		return self.localUserNat.SendPacket(source, provideMode, packet, timeout)
+	} else {
 		// TODO upgrade port 53 and port 80 here with protocol specific conversions
 		glog.V(1).Infof("[multi]drop packet ipv%d p%v -> %s:%d\n", ipPath.Version, ipPath.Protocol, ipPath.DestinationIp, ipPath.DestinationPort)
 		return false
@@ -1254,11 +1279,13 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 	ipPath *IpPath,
 	packet []byte,
 ) {
-	// ipPath, err := ParseIpPath(packet)
-	// if err != nil {
-	// 	// bad ip packet, drop
-	// 	return
-	// }
+	r, err := self.ingressSecurityPolicy.Inspect(provideMode, ipPath)
+	if err != nil {
+		return
+	}
+	if r != SecurityPolicyResultAllow {
+		return
+	}
 
 	ipPath = ipPath.Reverse()
 
@@ -1464,10 +1491,12 @@ func (self *RemoteUserNatMultiClient) Close() {
 		window.Close()
 	}
 
-	removedUpdates := []*multiClientChannelUpdate{}
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
+
+		removedUpdates := []*multiClientChannelUpdate{}
+
 		for _, update := range self.ip4PathUpdates {
 			removedUpdates = append(removedUpdates, update)
 			// update.Close()
@@ -1483,10 +1512,14 @@ func (self *RemoteUserNatMultiClient) Close() {
 		// clear(self.updateIp4Paths)
 		// clear(self.updateIp6Paths)
 		// clear(clientUpdates)
+
+		for _, update := range removedUpdates {
+			update.Close()
+		}
 	}()
-	for _, update := range removedUpdates {
-		update.Close()
-	}
+
+	self.localUserNat.Close()
+	self.localUserNatSub()
 }
 
 type multiClientChannelUpdate struct {
@@ -1619,6 +1652,7 @@ type multiClientWindow struct {
 	performanceProfile *PerformanceProfile
 
 	generatorMonitor *Monitor
+	resizeMonitor    *Monitor
 }
 
 func newMultiClientWindow(
@@ -1645,6 +1679,7 @@ func newMultiClientWindow(
 		contractStatusCallbacks:     NewCallbackList[ContractStatusFunction](),
 		clients:                     map[Id]*multiClientChannel{},
 		generatorMonitor:            NewMonitor(),
+		resizeMonitor:               NewMonitor(),
 	}
 
 	go HandleError(window.randomEnumerateClientArgs, cancel)
@@ -1660,20 +1695,20 @@ func (self *multiClientWindow) AddContractStatusCallback(contractStatusCallback 
 	}
 }
 
-// the performance profile will take effect at the next `resize` iteration
-func (self *multiClientWindow) SetPerformanceProfile(performanceProfile *PerformanceProfile) {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
-
-	self.performanceProfile = performanceProfile
-}
-
 func (self *multiClientWindow) contractStatus(contractStatus *ContractStatus) {
 	for _, contractStatusCallback := range self.contractStatusCallbacks.Get() {
 		HandleError(func() {
 			contractStatusCallback(contractStatus)
 		})
 	}
+}
+
+// the performance profile will take effect at the next `resize` iteration
+func (self *multiClientWindow) SetPerformanceProfile(performanceProfile *PerformanceProfile) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	self.performanceProfile = performanceProfile
 }
 
 func (self *multiClientWindow) randomEnumerateClientArgs() {
@@ -1778,6 +1813,8 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 
 func (self *multiClientWindow) resize() {
 	for {
+		update := self.resizeMonitor.NotifyChannel()
+
 		var windowSize WindowSizeSettings
 		var fixedWindowType *WindowType
 		func() {
@@ -2052,6 +2089,7 @@ func (self *multiClientWindow) resize() {
 			select {
 			case <-self.ctx.Done():
 				return
+			case <-update:
 			case <-time.After(timeout):
 			}
 		}
@@ -2067,7 +2105,7 @@ func (self *multiClientWindow) expand(
 	n int,
 ) (returnPingSuccess int) {
 	mutex := sync.Mutex{}
-	pendingPingDones := []chan struct{}{}
+	pendingPingDones := []context.Context{}
 	added := 0
 	addedP2pOnly := 0
 	pingSuccess := 0
@@ -2127,32 +2165,56 @@ func (self *multiClientWindow) expand(
 				}
 				args.MultiClientGeneratorClientArgs.P2pOnly = mathrand.Float32() < p2pOnlyP
 			}
-			// send an initial ping on the client and let the ack timeout close it
-			pingDone := make(chan struct{})
-			pendingPingDones = append(pendingPingDones, pingDone)
 
-			go HandleError(func() {
-				client, err := newMultiClientChannel(
-					self.ctx,
-					args,
-					self.generator,
-					self.clientReceivePacketCallback,
-					self.ingressSecurityPolicy,
-					self.contractStatus,
-					self.settings,
-				)
-				if err == nil {
-					p2pOnly := client.IsP2pOnly()
+			client, err := newMultiClientChannel(
+				self.ctx,
+				args,
+				self.generator,
+				self.clientReceivePacketCallback,
+				self.ingressSecurityPolicy,
+				self.contractStatus,
+				self.performanceProfile,
+				self.settings,
+			)
+			if err != nil {
+				self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
+				self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed)
+			} else {
 
-					func() {
-						mutex.Lock()
-						defer mutex.Unlock()
+				// send an initial ping on the client and let the ack timeout close it
+				pingDone, pingCancel := context.WithCancel(self.ctx)
+				pendingPingDones = append(pendingPingDones, pingDone)
 
-						added += 1
-						if p2pOnly {
-							addedP2pOnly += 1
-						}
-					}()
+				// must be called with mutex
+				fail := func() {
+					select {
+					case <-pingDone.Done():
+						// already done
+						return
+					default:
+					}
+
+					pingCancel()
+					client.Cancel()
+					self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
+					self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed)
+				}
+
+				go HandleError(func() {
+					mutex.Lock()
+					defer mutex.Unlock()
+
+					select {
+					case <-pingDone.Done():
+						// already done
+						return
+					default:
+					}
+
+					added += 1
+					if client.IsP2pOnly() {
+						addedP2pOnly += 1
+					}
 
 					self.monitor.AddProviderEvent(args.ClientId, ProviderStateInEvaluation)
 
@@ -2160,7 +2222,16 @@ func (self *multiClientWindow) expand(
 						&protocol.IpPing{},
 						self.settings.PingWriteTimeout,
 						func(err error) {
-							defer close(pingDone)
+							mutex.Lock()
+							defer mutex.Unlock()
+
+							select {
+							case <-pingDone.Done():
+								// already done
+								return
+							default:
+							}
+
 							if err == nil {
 								glog.V(1).Infof("[multi]expand new client\n")
 
@@ -2177,46 +2248,36 @@ func (self *multiClientWindow) expand(
 									replacedClient.Cancel()
 									self.monitor.AddProviderEvent(replacedClient.ClientId(), ProviderStateRemoved)
 								}
-								func() {
-									mutex.Lock()
-									defer mutex.Unlock()
-
-									pingSuccess += 1
-								}()
+								pingSuccess += 1
+								pingCancel()
 							} else {
 								glog.V(1).Infof("[multi]create ping error = %s\n", err)
-								client.Cancel()
-								self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed)
+								fail()
 							}
 						},
 					)
 					if err != nil {
-						glog.V(1).Infof("[multi]create client ping error = %s\n", err)
-						close(pingDone)
-						client.Cancel()
+						glog.Infof("[multi]create client ping error = %s\n", err)
+						fail()
 					} else if !success {
-						close(pingDone)
-						client.Cancel()
-						self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed)
+						fail()
 					} else {
 						// async wait for the ping
 						go HandleError(func() {
 							select {
-							case <-pingDone:
+							case <-pingDone.Done():
 							case <-time.After(self.settings.PingTimeout):
 								glog.V(2).Infof("[multi]expand window timeout waiting for ping\n")
-								client.Cancel()
+								func() {
+									mutex.Lock()
+									defer mutex.Unlock()
+									fail()
+								}()
 							}
 						}, client.Cancel)
 					}
-				} else {
-					glog.Infof("[multi]create client error = %s\n", err)
-					close(pingDone)
-					self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
-					self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed)
-				}
-			})
-			// }
+				})
+			}
 		case <-time.After(timeout):
 			glog.V(2).Infof("[multi]expand window timeout waiting for args\n")
 		}
@@ -2232,7 +2293,7 @@ func (self *multiClientWindow) expand(
 		select {
 		case <-self.ctx.Done():
 			return
-		case <-pingDone:
+		case <-pingDone.Done():
 		case <-time.After(timeout):
 		}
 	}
@@ -2244,6 +2305,7 @@ func (self *multiClientWindow) shuffle() {
 	for _, client := range self.unorderedClients() {
 		client.Cancel()
 	}
+	self.resizeMonitor.NotifyAll()
 }
 
 func (self *multiClientWindow) unorderedClients() []*multiClientChannel {
@@ -2515,6 +2577,7 @@ type multiClientChannel struct {
 
 	clientReceivePacketCallback clientReceivePacketFunction
 	ingressSecurityPolicy       SecurityPolicy
+	performanceProfile          *PerformanceProfile
 	createTime                  time.Time
 
 	settings *MultiClientSettings
@@ -2555,6 +2618,7 @@ func newMultiClientChannel(
 	clientReceivePacketCallback clientReceivePacketFunction,
 	ingressSecurityPolicy SecurityPolicy,
 	contractStatusCallback ContractStatusFunction,
+	performanceProfile *PerformanceProfile,
 	settings *MultiClientSettings,
 ) (*multiClientChannel, error) {
 	cancelCtx, cancel := context.WithCancel(ctx)
@@ -2591,6 +2655,7 @@ func newMultiClientChannel(
 		args:                        args,
 		clientReceivePacketCallback: clientReceivePacketCallback,
 		ingressSecurityPolicy:       ingressSecurityPolicy,
+		performanceProfile:          performanceProfile,
 		createTime:                  time.Now(),
 		settings:                    settings,
 		// sourceFilter: sourceFilter,
@@ -2704,8 +2769,9 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 			}
 		}
 
-		opts := []any{
-			ForceStream(),
+		var opts []any
+		if self.performanceProfile.AllowDirect {
+			opts = append(opts, ForceStream())
 		}
 		if !ack {
 			opts = append(opts, NoAck())
@@ -2737,12 +2803,16 @@ func (self *multiClientChannel) SendDetailedMessage(message proto.Message, timeo
 	if frame, err := ToFrame(message, self.settings.ProtocolVersion); err != nil {
 		return false, err
 	} else {
+		var opts []any
+		if self.performanceProfile.AllowDirect {
+			opts = append(opts, ForceStream())
+		}
 		return self.client.SendMultiHopWithTimeoutDetailed(
 			frame,
 			self.args.Destination,
 			ackCallback,
 			timeout,
-			ForceStream(),
+			opts...,
 		)
 	}
 }
@@ -3280,8 +3350,7 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 				self.addReceiveAck(ByteCount(len(packet)))
 
 				ipPath, err := ParseIpPath(packet)
-				r, err := self.ingressSecurityPolicy.Inspect(provideMode, ipPath)
-				if err == nil && r == SecurityPolicyResultAllow {
+				if err == nil {
 					self.clientReceivePacketCallback(self, source, provideMode, ipPath, packet)
 				}
 				// else not an ip packet, drop
