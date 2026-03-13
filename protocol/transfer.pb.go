@@ -1177,8 +1177,6 @@ type CreateContract struct {
 	UsedContractIds [][]byte `protobuf:"bytes,4,rep,name=used_contract_ids,json=usedContractIds,proto3" json:"used_contract_ids,omitempty"`
 	// ulids
 	IntermediaryIds [][]byte `protobuf:"bytes,5,rep,name=intermediary_ids,json=intermediaryIds,proto3" json:"intermediary_ids,omitempty"`
-	// ulid
-	StreamId []byte `protobuf:"bytes,6,opt,name=stream_id,json=streamId,proto3,oneof" json:"stream_id,omitempty"`
 	// stream will be used when intermediary_ids or stream_id is set
 	// in the case of wanting to use streams with no intermediaries, set `force_stream=true`
 	ForceStream *bool `protobuf:"varint,7,opt,name=force_stream,json=forceStream,proto3,oneof" json:"force_stream,omitempty"`
@@ -1249,13 +1247,6 @@ func (x *CreateContract) GetUsedContractIds() [][]byte {
 func (x *CreateContract) GetIntermediaryIds() [][]byte {
 	if x != nil {
 		return x.IntermediaryIds
-	}
-	return nil
-}
-
-func (x *CreateContract) GetStreamId() []byte {
-	if x != nil {
-		return x.StreamId
 	}
 	return nil
 }
@@ -1875,21 +1866,18 @@ const file_transfer_proto_rawDesc = "" +
 	"\x03sdp\x18\x04 \x01(\fH\x00R\x03sdp\x88\x01\x01\x12(\n" +
 	"\rice_candidate\x18\x05 \x01(\fH\x01R\ficeCandidate\x88\x01\x01B\x06\n" +
 	"\x04_sdpB\x10\n" +
-	"\x0e_ice_candidate\"\x9c\x03\n" +
+	"\x0e_ice_candidate\"\xfd\x02\n" +
 	"\x0eCreateContract\x12*\n" +
 	"\x0edestination_id\x18\x01 \x01(\fH\x00R\rdestinationId\x88\x01\x01\x12.\n" +
 	"\x13transfer_byte_count\x18\x02 \x01(\x04R\x11transferByteCount\x12\x1c\n" +
 	"\tcompanion\x18\x03 \x01(\bR\tcompanion\x12*\n" +
 	"\x11used_contract_ids\x18\x04 \x03(\fR\x0fusedContractIds\x12)\n" +
-	"\x10intermediary_ids\x18\x05 \x03(\fR\x0fintermediaryIds\x12 \n" +
-	"\tstream_id\x18\x06 \x01(\fH\x01R\bstreamId\x88\x01\x01\x12&\n" +
-	"\fforce_stream\x18\a \x01(\bH\x02R\vforceStream\x88\x01\x01\x12*\n" +
-	"\x0estream_version\x18\b \x01(\rH\x03R\rstreamVersion\x88\x01\x01B\x11\n" +
-	"\x0f_destination_idB\f\n" +
-	"\n" +
-	"_stream_idB\x0f\n" +
+	"\x10intermediary_ids\x18\x05 \x03(\fR\x0fintermediaryIds\x12&\n" +
+	"\fforce_stream\x18\a \x01(\bH\x01R\vforceStream\x88\x01\x01\x12*\n" +
+	"\x0estream_version\x18\b \x01(\rH\x02R\rstreamVersion\x88\x01\x01B\x11\n" +
+	"\x0f_destination_idB\x0f\n" +
 	"\r_force_streamB\x11\n" +
-	"\x0f_stream_version\"\xf5\x01\n" +
+	"\x0f_stream_versionJ\x04\b\x06\x10\aR\tstream_id\"\xf5\x01\n" +
 	"\x14CreateContractResult\x123\n" +
 	"\x05error\x18\x01 \x01(\x0e2\x18.bringyour.ContractErrorH\x00R\x05error\x88\x01\x01\x124\n" +
 	"\bcontract\x18\x02 \x01(\v2\x13.bringyour.ContractH\x01R\bcontract\x88\x01\x01\x12G\n" +
