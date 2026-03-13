@@ -321,15 +321,15 @@ func (self *ContractManager) contractStatus(contractStatus *ContractStatus) {
 func (self *ContractManager) Receive(source TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode) {
 	if source.IsControlSource() {
 		for _, frame := range frames {
-			self.handleControlFrame(frame)
+			self.handleControlFrame(nil, frame)
 		}
 	}
 }
 
-func (self *ContractManager) handleControlFrame(frame *protocol.Frame) error {
+func (self *ContractManager) handleControlFrame(createContractKey *ContractKey, frame *protocol.Frame) error {
 	switch frame.MessageType {
 	case protocol.MessageType_TransferCreateContractResult:
-		contracts, contractErrors := self.parseControlFrame(frame)
+		contracts, contractErrors := self.parseControlFrame(createContractKey, frame)
 		for contractKey, contract := range contracts {
 			c := func() error {
 				err := self.addContract(contractKey, contract)
@@ -400,7 +400,7 @@ func (self *ContractManager) handleControlFrame(frame *protocol.Frame) error {
 }
 
 // frames are verified before calling to be from source ControlId
-func (self *ContractManager) parseControlFrame(frame *protocol.Frame) (
+func (self *ContractManager) parseControlFrame(createContractKey *ContractKey, frame *protocol.Frame) (
 	contracts map[ContractKey]*protocol.Contract,
 	contractErrors map[ContractKey]protocol.ContractError,
 ) {
@@ -408,32 +408,37 @@ func (self *ContractManager) parseControlFrame(frame *protocol.Frame) (
 	contractErrors = map[ContractKey]protocol.ContractError{}
 
 	addResult := func(v *protocol.CreateContractResult) {
-		contractKey := ContractKey{}
-		if v.CreateContract != nil {
-			contractKey.CompanionContract = v.CreateContract.Companion
-			if v.CreateContract.ForceStream != nil {
-				contractKey.ForceStream = *v.CreateContract.ForceStream
+		var contractKey *ContractKey
+		if createContractKey != nil {
+			contractKey = createContractKey
+		} else if createContract := v.CreateContract; createContract != nil {
+			contractKey = &ContractKey{}
+			var err error
+			contractKey.Destination, err = TransferPathFromBytes(
+				nil,
+				createContract.DestinationId,
+				nil,
+			)
+			if err != nil {
+				return
 			}
-			if v.CreateContract.IntermediaryIds != nil {
-				if intermediaryIds, err := MultiHopIdFromBytes(v.CreateContract.IntermediaryIds); err == nil {
+			contractKey.CompanionContract = createContract.Companion
+			if createContract.ForceStream != nil {
+				contractKey.ForceStream = *createContract.ForceStream
+			}
+			if createContract.IntermediaryIds != nil {
+				if intermediaryIds, err := MultiHopIdFromBytes(createContract.IntermediaryIds); err == nil {
 					contractKey.IntermediaryIds = intermediaryIds
 				}
 			}
 		}
 
 		if contractError := v.Error; contractError != nil {
-			if v.CreateContract != nil {
-				var err error
-				contractKey.Destination, err = TransferPathFromBytes(
-					nil,
-					v.CreateContract.DestinationId,
-					v.CreateContract.StreamId,
-				)
-				if err != nil {
-					return
-				}
+			if contractKey != nil {
+				contractErrors[*contractKey] = *contractError
+			} else {
+				glog.Infof("[contract]error with unassociated contract = %s\n", contractError)
 			}
-			contractErrors[contractKey] = *contractError
 		} else if contract := v.Contract; contract != nil {
 			storedContract := &protocol.StoredContract{}
 			err := ProtoUnmarshal(contract.StoredContractBytes, storedContract)
@@ -441,27 +446,25 @@ func (self *ContractManager) parseControlFrame(frame *protocol.Frame) (
 				return
 			}
 
-			if v.CreateContract != nil {
-				var err error
-				contractKey.Destination, err = TransferPathFromBytes(
-					nil,
-					v.CreateContract.DestinationId,
-					v.CreateContract.StreamId,
-				)
-				if err != nil {
-					return
-				}
-			} else {
+			if contractKey == nil && self.settings.LegacyCreateContract {
+				// this only makes sense for legacy contracts
+				contractKey = &ContractKey{}
 				contractKey.Destination, err = TransferPathFromBytes(
 					nil,
 					storedContract.DestinationId,
-					storedContract.StreamId,
+					nil,
 				)
 				if err != nil {
 					return
 				}
 			}
-			contracts[contractKey] = contract
+
+			if contractKey != nil {
+				contracts[*contractKey] = contract
+			} else {
+				// this contract can't be associated (TODO close it)
+				glog.Errorf("[contract]unassociated contract %s\n", Id(storedContract.ContractId))
+			}
 		}
 	}
 
@@ -806,18 +809,11 @@ func (self *ContractManager) addContract(contractKey ContractKey, contract *prot
 		return err
 	}
 
-	path, err := TransferPathFromBytes(
-		storedContract.SourceId,
-		storedContract.DestinationId,
-		storedContract.StreamId,
-	)
-	if err != nil {
-		return err
+	if Id(storedContract.SourceId) != self.client.ClientId() {
+		return fmt.Errorf("Contract source must be this client: %s<>%s", Id(storedContract.SourceId), self.client.ClientId())
 	}
 
-	if !path.IsStream() && path.SourceId != self.client.ClientId() {
-		return fmt.Errorf("Contract source must be this client: %s<>%s", path.SourceId, self.client.ClientId())
-	}
+	glog.V(1).Infof("[contract]add %s %s\n", self.client.ClientId(), contractKey.Destination)
 
 	func() {
 		contractQueue := self.openContractQueue(contractKey)
@@ -838,7 +834,6 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 	createContract := &protocol.CreateContract{
 		DestinationId:     contractKey.Destination.DestinationId.Bytes(),
 		IntermediaryIds:   contractKey.IntermediaryIds.Bytes(),
-		StreamId:          contractKey.Destination.StreamId.Bytes(),
 		TransferByteCount: uint64(self.contractByteCount(contractSeqIndex, minByteCount)),
 		Companion:         contractKey.CompanionContract,
 		ForceStream:       &contractKey.ForceStream,
@@ -852,11 +847,16 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 		glog.Infof("[contract]could not create contract frame = %s", err)
 		return
 	}
+
+	glog.V(1).Infof("[contract]create %s %s\n", self.client.ClientId(), contractKey.Destination)
+
 	self.client.ClientOob().SendControl(
 		[]*protocol.Frame{frame},
 		func(resultFrames []*protocol.Frame, err error) {
 			if err == nil {
-				self.Receive(SourceId(ControlId), resultFrames, protocol.ProvideMode_Network)
+				for _, resultFrame := range resultFrames {
+					self.handleControlFrame(&contractKey, resultFrame)
+				}
 			} else {
 				select {
 				case <-self.client.Done():
@@ -978,10 +978,15 @@ func (self *ContractManager) Flush(resetUsedContractIds bool) []Id {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
 
+		glog.V(1).Infof("[contract]flush %s %s\n", self.client.ClientId(), maps.Keys(self.destinationContracts))
+
 		contracts := []*protocol.Contract{}
-		for _, contractQueue := range self.destinationContracts {
+		for contractKey, contractQueue := range self.destinationContracts {
 			for _, contract := range contractQueue.Flush(resetUsedContractIds) {
 				contracts = append(contracts, contract)
+			}
+			if contractQueue.IsDone() {
+				delete(self.destinationContracts, contractKey)
 			}
 		}
 		return contracts
@@ -1119,7 +1124,7 @@ func (self *contractQueue) Add(contract *protocol.Contract, storedContract *prot
 		glog.V(2).Infof("[contract]add update existing %s\n", contractId)
 		self.contracts[contractId] = contract
 		self.updateMonitor.NotifyAll()
-	} else if !self.usedContractIds[contractId] {
+	} else if !self.trackUsedContracts || !self.usedContractIds[contractId] {
 		glog.V(2).Infof("[contract]add %s\n", contractId)
 		if self.trackUsedContracts {
 			self.usedContractIds[contractId] = true

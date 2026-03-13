@@ -73,6 +73,7 @@ func TestSendReceiveSenderReset(t *testing.T) {
 	// clientSettingsA.ReceiveBufferSettings.AckBufferSize = 0
 	clientSettingsA.ForwardBufferSettings.SequenceBufferSize = 0
 	clientSettingsA.ForwardBufferSettings.IdleTimeout = 180 * time.Second
+	clientSettingsA.ContractManagerSettings.LegacyCreateContract = true
 	a := NewClient(ctx, aClientId, NewNoContractClientOob(), clientSettingsA)
 	aRouteManager := a.RouteManager()
 	aContractManager := a.ContractManager()
@@ -98,6 +99,7 @@ func TestSendReceiveSenderReset(t *testing.T) {
 	// clientSettingsB.ReceiveBufferSettings.AckBufferSize = 0
 	clientSettingsB.ForwardBufferSettings.SequenceBufferSize = 0
 	clientSettingsB.ForwardBufferSettings.IdleTimeout = 180 * time.Second
+	clientSettingsB.ContractManagerSettings.LegacyCreateContract = true
 	b := NewClient(ctx, bClientId, NewNoContractClientOob(), clientSettingsB)
 	bRouteManager := b.RouteManager()
 	bContractManager := b.ContractManager()

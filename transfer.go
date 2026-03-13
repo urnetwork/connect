@@ -96,7 +96,7 @@ func DefaultClientSettingsNoNetworkEvents() *ClientSettings {
 func DefaultSendBufferSettings() *SendBufferSettings {
 	return &SendBufferSettings{
 		CreateContractTimeout:       30 * time.Second,
-		CreateContractRetryInterval: 5 * time.Second,
+		CreateContractRetryInterval: 15 * time.Second,
 		MinResendInterval:           1 * time.Second,
 		MaxResendInterval:           5 * time.Second,
 		// no backoff
@@ -1442,6 +1442,14 @@ func (self *SendSequence) Run() {
 				sendContract.ackedByteCount,
 				sendContract.unackedByteCount,
 			)
+			// flush queued contracts for already sent contracts
+			// contractKey = ContractKey{
+			// 	Destination:       sendContract.path.DestinationMask(),
+			// 	IntermediaryIds:   self.intermediaryIds,
+			// 	CompanionContract: self.companionContract,
+			// 	ForceStream:       self.forceStream,
+			// }
+			// self.client.ContractManager().FlushContractQueue(contractKey, true)
 		}
 
 		// drain the buffer
@@ -1682,8 +1690,7 @@ func (self *SendSequence) Run() {
 func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 	// `sendNoContract` is a mutual configuration
 	// both sides must configure themselves to require no contract from each other
-	isStream := self.destination.IsStream() || 0 < self.intermediaryIds.Len()
-	if !isStream && self.client.ContractManager().SendNoContract(self.destination.DestinationId) {
+	if self.client.ContractManager().SendNoContract(self.destination.DestinationId) {
 		return true
 	}
 	if self.sendContract != nil && self.sendContract.update(messageByteCount) {
@@ -1774,11 +1781,15 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 			}
 		}
 
-		if traceNextContract(0) {
-			return true
+		endTime := time.Now().Add(self.sendBufferSettings.CreateContractTimeout)
+
+		if self.sendContract != nil {
+			// there should be a queued up contract
+			if traceNextContract(min(self.sendBufferSettings.CreateContractTimeout, self.sendBufferSettings.CreateContractRetryInterval)) {
+				return true
+			}
 		}
 
-		endTime := time.Now().Add(self.sendBufferSettings.CreateContractTimeout)
 		for {
 			select {
 			case <-self.ctx.Done():
@@ -3193,7 +3204,7 @@ func (self *ReceiveSequence) updateContract(item *receiveItem) bool {
 	}
 	// `receiveNoContract` is a mutual configuration
 	// both sides must configure themselves to require no contract from each other
-	if !self.source.IsStream() && self.client.ContractManager().ReceiveNoContract(self.source.SourceId) {
+	if self.client.ContractManager().ReceiveNoContract(self.source.SourceId) {
 		return true
 	}
 	return false
