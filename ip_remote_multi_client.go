@@ -378,8 +378,8 @@ type RemoteUserNatMultiClient struct {
 	performanceProfile  *PerformanceProfile
 	localSecurityBypass bool
 
-	localUserNat    *LocalUserNat
-	localUserNatSub func()
+	localUserNat      *LocalUserNat
+	localUserNatUnsub func()
 }
 
 func NewRemoteUserNatMultiClientWithDefaults(
@@ -408,7 +408,11 @@ func NewRemoteUserNatMultiClient(
 
 	securityPolicyStats := DefaultSecurityPolicyStatsCollector()
 
-	localUserNat := NewLocalUserNatWithDefaults(cancelCtx, "multi local")
+	localUserNatSettings := DefaultLocalUserNatSettings()
+	// no ulimit for local traffic
+	localUserNatSettings.UdpBufferSettings.UserLimit = 0
+	localUserNatSettings.TcpBufferSettings.UserLimit = 0
+	localUserNat := NewLocalUserNat(cancelCtx, "multi local", localUserNatSettings)
 
 	multiClient := &RemoteUserNatMultiClient{
 		ctx:                   cancelCtx,
@@ -454,7 +458,7 @@ func NewRemoteUserNatMultiClient(
 	}
 	// else only keep the quality window for fixed destination
 
-	multiClient.localUserNatSub = localUserNat.AddReceivePacketCallback(receivePacketCallback)
+	multiClient.localUserNatUnsub = localUserNat.AddReceivePacketCallback(receivePacketCallback)
 
 	monitors := []MultiClientMonitor{}
 	for _, window := range multiClient.windows {
@@ -1061,6 +1065,26 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 		// find a new client
 		// the race is between as many clients as can send in parallel
 
+		if _, fixed := self.generator.FixedDestinationSize(); fixed {
+			window := self.windows[WindowTypeQuality]
+			orderedClients := window.OrderedClients()
+
+			for _, client := range orderedClients {
+				if client.Send(sendPacket, timeout) {
+					success = true
+
+					func() {
+						self.stateLock.Lock()
+						defer self.stateLock.Unlock()
+
+						update.client = client
+					}()
+				}
+			}
+
+			return
+		}
+
 		raceClients := func(orderedClients []*multiClientChannel, sendTimeout time.Duration) {
 			switch len(orderedClients) {
 			case 0:
@@ -1519,7 +1543,7 @@ func (self *RemoteUserNatMultiClient) Close() {
 	}()
 
 	self.localUserNat.Close()
-	self.localUserNatSub()
+	self.localUserNatUnsub()
 }
 
 type multiClientChannelUpdate struct {
