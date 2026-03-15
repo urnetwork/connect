@@ -2528,6 +2528,8 @@ func (self *RemoteUserNatProvider) Receive(
 	ipPath *IpPath,
 	packet []byte,
 ) {
+	// glog.Infof("[trace]provider return packet for %s\n", source.SourceId)
+
 	if self.client.ClientId() == source.SourceId {
 		// locally generated traffic should use a separate local user nat
 		glog.V(2).Infof("drop remote user nat provider s packet ->%s\n", source.SourceId)
@@ -2554,43 +2556,29 @@ func (self *RemoteUserNatProvider) Receive(
 	switch ipPath.Protocol {
 	case IpProtocolUdp:
 		opts = append(opts, NoAck())
-		c := func() bool {
-			// ack := make(chan error)
-			sent := self.client.SendWithTimeout(
-				frame,
-				source.Reverse(),
-				func(err error) {},
-				self.settings.WriteTimeout,
-				opts...,
-			)
-			return sent
-		}
-		if glog.V(2) {
-			TraceWithReturn(
-				fmt.Sprintf("[unps]udp %s->%s s(%s)", self.client.ClientTag(), source.SourceId, source.StreamId),
-				c,
-			)
-		} else {
-			c()
-		}
-	case IpProtocolTcp:
-		c := func() bool {
-			return self.client.SendWithTimeout(
-				frame,
-				source.Reverse(),
-				func(err error) {},
-				self.settings.WriteTimeout,
-				opts...,
-			)
-		}
-		if glog.V(2) {
-			TraceWithReturn(
-				fmt.Sprintf("[unps]tcp %s->%s s(%s)", self.client.ClientTag(), source.SourceId, source.StreamId),
-				c,
-			)
-		} else {
-			c()
-		}
+	}
+
+	c := func() bool {
+		// ack := make(chan error)
+		sent := self.client.SendWithTimeout(
+			frame,
+			source.Reverse(),
+			func(err error) {},
+			self.settings.WriteTimeout,
+			opts...,
+		)
+		// if sent {
+		// 	glog.Infof("[trace]provider return packet sent for %s\n", source.SourceId)
+		// }
+		return sent
+	}
+	if glog.V(2) {
+		TraceWithReturn(
+			fmt.Sprintf("[unps]%s %s->%s s(%s)", ipPath.Protocol, self.client.ClientTag(), source.SourceId, source.StreamId),
+			c,
+		)
+	} else {
+		c()
 	}
 
 }
@@ -2628,6 +2616,7 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 							} else {
 								packet = MessagePoolCopy(ipPacketToProvider.IpPacket.PacketBytes)
 							}
+							// glog.Infof("[trace]provider send packet from %s\n", source.SourceId)
 							success := self.localUserNat.SendPacketWithTimeout(
 								source,
 								provideMode,
@@ -2671,10 +2660,11 @@ type RemoteUserNatClient struct {
 	pathTable             *pathTable
 	// the provide mode of the source packets
 	// for locally generated packets this is `ProvideMode_Network`
-	provideMode   protocol.ProvideMode
-	localUserNat  *LocalUserNat
-	closeCallback func()
-	clientUnsub   func()
+	provideMode       protocol.ProvideMode
+	localUserNat      *LocalUserNat
+	closeCallback     func()
+	clientUnsub       func()
+	localUserNatUnsub func()
 
 	stateLock           sync.Mutex
 	allowDirect         bool
@@ -2699,7 +2689,11 @@ func NewRemoteUserNatClientWithClose(
 ) *RemoteUserNatClient {
 	pathTable := newPathTable(destinations)
 
-	localUserNat := NewLocalUserNatWithDefaults(client.Ctx(), "remote local")
+	localUserNatSettings := DefaultLocalUserNatSettings()
+	// no ulimit for local traffic
+	localUserNatSettings.UdpBufferSettings.UserLimit = 0
+	localUserNatSettings.TcpBufferSettings.UserLimit = 0
+	localUserNat := NewLocalUserNat(client.Ctx(), "remote local", localUserNatSettings)
 
 	userNatClient := &RemoteUserNatClient{
 		client:                client,
@@ -2713,6 +2707,8 @@ func NewRemoteUserNatClientWithClose(
 
 	clientUnsub := client.AddReceiveCallback(userNatClient.ClientReceive)
 	userNatClient.clientUnsub = clientUnsub
+
+	userNatClient.localUserNatUnsub = localUserNat.AddReceivePacketCallback(receivePacketCallback)
 
 	return userNatClient
 }
@@ -2784,6 +2780,7 @@ func (self *RemoteUserNatClient) ClientReceive(source TransferPath, frames []*pr
 	// }
 
 	for _, frame := range frames {
+		// glog.Infof("[trace]receive frame %s\n", frame.MessageType)
 		switch frame.MessageType {
 		case protocol.MessageType_IpIpPacketFromProvider:
 			ipPacketFromProvider_, err := FromFrame(frame)
@@ -2816,6 +2813,7 @@ func (self *RemoteUserNatClient) Shuffle() {
 func (self *RemoteUserNatClient) Close() {
 	// self.client.RemoveReceiveCallback(self.clientCallbackId)
 	self.localUserNat.Close()
+	self.localUserNatUnsub()
 	self.clientUnsub()
 	if self.closeCallback != nil {
 		self.closeCallback()
