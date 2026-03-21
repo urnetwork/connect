@@ -2737,7 +2737,9 @@ func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode pro
 	if err != nil {
 		return false
 	}
-	if r == SecurityPolicyResultAllow {
+
+	switch r {
+	case SecurityPolicyResultAllow:
 		destination, err := self.pathTable.SelectDestination(packet)
 		if err != nil {
 			// drop
@@ -2765,9 +2767,13 @@ func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode pro
 		}
 		success := self.client.SendMultiHopWithTimeout(frame, destination, func(err error) {}, timeout, opts...)
 		return success
-	} else if self.LocalSecurityBypass() {
-		return self.localUserNat.SendPacket(source, provideMode, packet, timeout)
-	} else {
+	case SecurityPolicyResultDrop:
+		if self.LocalSecurityBypass() {
+			return self.localUserNat.SendPacket(source, provideMode, packet, timeout)
+		} else {
+			return false
+		}
+	default:
 		return false
 	}
 }
