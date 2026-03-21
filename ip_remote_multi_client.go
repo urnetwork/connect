@@ -940,17 +940,21 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 		glog.Infof("[multi]send bad packet = %s\n", err)
 		return false
 	}
-	if r == SecurityPolicyResultAllow {
+	switch r {
+	case SecurityPolicyResultAllow:
 		parsedPacket := &parsedPacket{
 			packet:  packet,
 			ipPath:  ipPath,
 			payload: payload,
 		}
 		return self.sendPacket(source, provideMode, parsedPacket, timeout)
-	} else if self.LocalSecurityBypass() {
-		return self.localUserNat.SendPacket(source, provideMode, packet, timeout)
-	} else {
-		// TODO upgrade port 53 and port 80 here with protocol specific conversions
+	case SecurityPolicyResultDrop:
+		if self.LocalSecurityBypass() {
+			return self.localUserNat.SendPacket(source, provideMode, packet, timeout)
+		} else {
+			return false
+		}
+	default:
 		glog.V(1).Infof("[multi]drop packet ipv%d p%v -> %s:%d\n", ipPath.Version, ipPath.Protocol, ipPath.DestinationIp, ipPath.DestinationPort)
 		return false
 	}
@@ -2514,10 +2518,13 @@ type multiClientEventBucket struct {
 	sendAckByteCount    ByteCount
 	sendNackCount       int
 	sendNackByteCount   ByteCount
+	sendSynCount        int
 	receiveAckCount     int
 	receiveAckByteCount ByteCount
+	receiveSynCount     int
 	sendAckTime         time.Time
 	sendNackTime        time.Time
+	sendSynTime         time.Time
 	errs                []error
 	ip4Paths            map[Ip4Path]bool
 	ip6Paths            map[Ip6Path]bool
@@ -2538,12 +2545,15 @@ type clientWindowStats struct {
 	sendAckByteCount            ByteCount
 	sendNackCount               int
 	sendNackByteCount           ByteCount
+	sendSynCount                int
 	receiveAckCount             int
 	receiveAckByteCount         ByteCount
+	receiveSynCount             int
 	ackByteCount                ByteCount
 	windowDuration              time.Duration
 	firstSendAckTime            time.Time
 	firstSendNackTime           time.Time
+	firstSendSynTime            time.Time
 	estimatedByteCountPerSecond ByteCount
 	// FIXME firstStatDuration
 	clientDuration       time.Duration
@@ -2784,6 +2794,9 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 	} else {
 		packetByteCount := ByteCount(len(parsedPacket.packet))
 		self.addSendNack(packetByteCount)
+		if parsedPacket.ipPath.Syn {
+			self.addSendSyn(1)
+		}
 		self.addSource(parsedPacket.ipPath)
 		ackCallback := func(err error) {
 			if err == nil {
@@ -2858,21 +2871,20 @@ func (self *multiClientChannel) detectBlackhole() {
 		if windowStats, err := self.WindowStats(); err != nil {
 			return
 		} else {
-
 			blackhole := func() bool {
-				if 0 < windowStats.sendAckCount {
-					timeout := self.settings.BlackholeTimeout - time.Now().Sub(windowStats.firstSendAckTime)
-					if timeout <= 0 {
-						return windowStats.receiveAckCount <= 0
+				now := time.Now()
+				if !windowStats.firstSendNackTime.IsZero() && self.settings.BlackholeTimeout-now.Sub(windowStats.firstSendNackTime) <= 0 {
+					if windowStats.sendAckCount <= 0 {
+						return true
 					}
-					return false
+					if windowStats.receiveAckCount <= 0 {
+						return true
+					}
 				}
-				if 0 < windowStats.sendNackCount {
-					timeout := self.settings.BlackholeTimeout - time.Now().Sub(windowStats.firstSendNackTime)
-					if timeout <= 0 {
-						return windowStats.receiveAckCount <= 0
+				if !windowStats.firstSendSynTime.IsZero() && self.settings.BlackholeTimeout-now.Sub(windowStats.firstSendSynTime) <= 0 {
+					if windowStats.receiveSynCount <= 0 {
+						return true
 					}
-					return false
 				}
 				return false
 			}()
@@ -2880,12 +2892,14 @@ func (self *multiClientChannel) detectBlackhole() {
 			if blackhole {
 				// the client has sent data but received nothing back
 				// this looks like a blackhole
-				glog.V(1).Infof("[multi]routing %s blackhole: %d %dB <> %d %dB\n",
+				glog.V(1).Infof("[multi]routing %s blackhole: %d %dB <> %d %dB (%d <> %d)\n",
 					self.args.Destination,
 					windowStats.sendAckCount,
 					windowStats.sendAckByteCount,
 					windowStats.receiveAckCount,
 					windowStats.receiveAckByteCount,
+					windowStats.sendSynCount,
+					windowStats.receiveSynCount,
 				)
 				self.addError(fmt.Errorf("Blackhole (%d %dB)",
 					windowStats.sendAckCount,
@@ -2894,12 +2908,14 @@ func (self *multiClientChannel) detectBlackhole() {
 				return
 			} else {
 				glog.V(1).Infof(
-					"[multi]routing ok %s: %d %dB <> %d %dB\n",
+					"[multi]routing ok %s: %d %dB <> %d %dB (%d <> %d)\n",
 					self.args.Destination,
 					windowStats.sendAckCount,
 					windowStats.sendAckByteCount,
 					windowStats.receiveAckCount,
 					windowStats.receiveAckByteCount,
+					windowStats.sendSynCount,
+					windowStats.receiveSynCount,
 				)
 			}
 
@@ -2908,7 +2924,7 @@ func (self *multiClientChannel) detectBlackhole() {
 				return
 			case <-self.client.Done():
 				return
-			case <-time.After(self.settings.BlackholeTimeout / 2):
+			case <-time.After(self.settings.BlackholeTimeout / 4):
 			}
 		}
 	}
@@ -2999,6 +3015,19 @@ func (self *multiClientChannel) addSendAck(ackByteCount ByteCount) {
 	eventBucket.sendAckByteCount += ackByteCount
 }
 
+func (self *multiClientChannel) addSendSyn(synCount int) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	self.packetStats.sendSynCount += synCount
+
+	eventBucket := self.eventBucket()
+	if eventBucket.sendSynCount == 0 {
+		eventBucket.sendSynTime = time.Now()
+	}
+	eventBucket.sendSynCount += synCount
+}
+
 func (self *multiClientChannel) addReceiveAck(ackByteCount ByteCount) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -3009,6 +3038,16 @@ func (self *multiClientChannel) addReceiveAck(ackByteCount ByteCount) {
 	eventBucket := self.eventBucket()
 	eventBucket.receiveAckCount += 1
 	eventBucket.receiveAckByteCount += ackByteCount
+}
+
+func (self *multiClientChannel) addReceiveSyn(synCount int) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	self.packetStats.receiveSynCount += synCount
+
+	eventBucket := self.eventBucket()
+	eventBucket.receiveSynCount += synCount
 }
 
 func (self *multiClientChannel) addSource(ipPath *IpPath) {
@@ -3099,8 +3138,10 @@ func (self *multiClientChannel) coalesceEventBuckets() {
 	removeEventBucket := func(eventBucket *multiClientEventBucket) {
 		self.packetStats.sendAckCount -= eventBucket.sendAckCount
 		self.packetStats.sendAckByteCount -= eventBucket.sendAckByteCount
+		self.packetStats.sendSynCount -= eventBucket.sendSynCount
 		self.packetStats.receiveAckCount -= eventBucket.receiveAckCount
 		self.packetStats.receiveAckByteCount -= eventBucket.receiveAckByteCount
+		self.packetStats.receiveSynCount -= eventBucket.receiveSynCount
 
 		for ip4Path, _ := range eventBucket.ip4Paths {
 			source := ip4Path.Source()
@@ -3193,6 +3234,13 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 			break
 		}
 	}
+	var firstSendSynTime time.Time
+	for _, eventBucket := range eventBuckets {
+		if 0 < eventBucket.sendSynCount {
+			firstSendSynTime = eventBucket.sendSynTime
+			break
+		}
+	}
 
 	// public internet resource ports
 	isPublicPort := func(port int) bool {
@@ -3253,12 +3301,15 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 		sendAckCount:        self.packetStats.sendAckCount,
 		sendNackCount:       self.packetStats.sendNackCount,
 		sendAckByteCount:    self.packetStats.sendAckByteCount,
+		sendSynCount:        self.packetStats.sendSynCount,
 		sendNackByteCount:   self.packetStats.sendNackByteCount,
 		receiveAckCount:     self.packetStats.receiveAckCount,
 		receiveAckByteCount: self.packetStats.receiveAckByteCount,
+		receiveSynCount:     self.packetStats.receiveSynCount,
 		windowDuration:      windowDuration,
 		firstSendAckTime:    firstSendAckTime,
 		firstSendNackTime:   firstSendNackTime,
+		firstSendSynTime:    firstSendSynTime,
 		bucketCount:         len(eventBuckets),
 	}
 	if 0 < len(eventBuckets) || !self.firstEventTime.IsZero() {
@@ -3371,10 +3422,12 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 
 				packet := ipPacketFromProvider.IpPacket.PacketBytes
 
-				self.addReceiveAck(ByteCount(len(packet)))
-
 				ipPath, err := ParseIpPath(packet)
 				if err == nil {
+					self.addReceiveAck(ByteCount(len(packet)))
+					if ipPath.Syn {
+						self.addReceiveSyn(1)
+					}
 					self.clientReceivePacketCallback(self, source, provideMode, ipPath, packet)
 				}
 				// else not an ip packet, drop
