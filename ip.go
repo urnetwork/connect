@@ -65,13 +65,13 @@ type UserNatClient interface {
 
 func DefaultUdpBufferSettings() *UdpBufferSettings {
 	return &UdpBufferSettings{
-		ReadTimeout:         30 * time.Second,
+		ReadTimeout:         300 * time.Second,
 		WriteTimeout:        15 * time.Second,
-		IdleTimeout:         60 * time.Second,
+		IdleTimeout:         300 * time.Second,
 		Mtu:                 DefaultMtu,
 		ReadBufferByteCount: DefaultMtu,
 		SequenceBufferSize:  DefaultIpBufferSize,
-		UserLimit:           512,
+		UserLimit:           0,
 		MaxWindowSize:       uint32(mib(1)),
 		ConnectSettings:     *DefaultConnectSettings(),
 	}
@@ -80,17 +80,17 @@ func DefaultUdpBufferSettings() *UdpBufferSettings {
 func DefaultTcpBufferSettings() *TcpBufferSettings {
 	tcpBufferSettings := &TcpBufferSettings{
 		// ConnectTimeout:     60 * time.Second,
-		ReadTimeout:        30 * time.Second,
+		ReadTimeout:        300 * time.Second,
 		WriteTimeout:       15 * time.Second,
 		AckCompressTimeout: time.Duration(0),
-		IdleTimeout:        60 * time.Second,
+		IdleTimeout:        300 * time.Second,
 		SequenceBufferSize: DefaultIpBufferSize,
 		Mtu:                DefaultMtu,
 		// avoid fragmentation
 		ReadBufferByteCount: DefaultMtu - max(Ipv4HeaderSizeWithoutExtensions, Ipv6HeaderSize) - max(UdpHeaderSize, TcpHeaderSizeWithoutExtensions),
-		MinWindowSize:       uint32(kib(8)),
+		MinWindowSize:       uint32(kib(64)),
 		MaxWindowSize:       uint32(mib(1)),
-		UserLimit:           512,
+		UserLimit:           0,
 		ConnectSettings:     *DefaultConnectSettings(),
 	}
 	return tcpBufferSettings
@@ -99,17 +99,17 @@ func DefaultTcpBufferSettings() *TcpBufferSettings {
 func DefaultLocalUserNatSettings() *LocalUserNatSettings {
 	return &LocalUserNatSettings{
 		SequenceBufferSize: DefaultIpBufferSize,
-		BufferTimeout:      15 * time.Second,
-		UdpBufferSettings:  DefaultUdpBufferSettings(),
-		TcpBufferSettings:  DefaultTcpBufferSettings(),
+		// BufferTimeout:      15 * time.Second,
+		UdpBufferSettings: DefaultUdpBufferSettings(),
+		TcpBufferSettings: DefaultTcpBufferSettings(),
 	}
 }
 
 type LocalUserNatSettings struct {
 	SequenceBufferSize int
-	BufferTimeout      time.Duration
-	UdpBufferSettings  *UdpBufferSettings
-	TcpBufferSettings  *TcpBufferSettings
+	// BufferTimeout      time.Duration
+	UdpBufferSettings *UdpBufferSettings
+	TcpBufferSettings *TcpBufferSettings
 }
 
 // forwards packets using user space sockets
@@ -250,7 +250,7 @@ func (self *LocalUserNat) Run() {
 							sendPacket.provideMode,
 							&ipv4,
 							&udp,
-							self.settings.BufferTimeout,
+							self.settings.UdpBufferSettings.WriteTimeout,
 							ipPacket,
 						)
 						return success && err == nil
@@ -273,7 +273,7 @@ func (self *LocalUserNat) Run() {
 							sendPacket.provideMode,
 							&ipv4,
 							&tcp,
-							self.settings.BufferTimeout,
+							self.settings.TcpBufferSettings.WriteTimeout,
 							ipPacket,
 						)
 						return success && err == nil
@@ -304,7 +304,7 @@ func (self *LocalUserNat) Run() {
 							sendPacket.provideMode,
 							&ipv6,
 							&udp,
-							self.settings.BufferTimeout,
+							self.settings.UdpBufferSettings.WriteTimeout,
 							ipPacket,
 						)
 						return success && err == nil
@@ -327,7 +327,7 @@ func (self *LocalUserNat) Run() {
 							sendPacket.provideMode,
 							&ipv6,
 							&tcp,
-							self.settings.BufferTimeout,
+							self.settings.TcpBufferSettings.WriteTimeout,
 							ipPacket,
 						)
 						return success && err == nil
