@@ -65,14 +65,14 @@ func TestSendReceiveSenderReset(t *testing.T) {
 	clientSettingsA := DefaultClientSettings()
 	clientSettingsA.SendBufferSettings.SequenceBufferSize = 0
 	clientSettingsA.SendBufferSettings.AckBufferSize = 0
-	clientSettingsA.SendBufferSettings.AckTimeout = 90 * time.Second
-	clientSettingsA.SendBufferSettings.IdleTimeout = 180 * time.Second
+	clientSettingsA.SendBufferSettings.AckTimeout = 300 * time.Second
+	clientSettingsA.SendBufferSettings.IdleTimeout = 300 * time.Second
 	clientSettingsA.ReceiveBufferSettings.SequenceBufferSize = 0
-	clientSettingsA.ReceiveBufferSettings.GapTimeout = 90 * time.Second
-	clientSettingsA.ReceiveBufferSettings.IdleTimeout = 180 * time.Second
+	clientSettingsA.ReceiveBufferSettings.GapTimeout = 300 * time.Second
+	clientSettingsA.ReceiveBufferSettings.IdleTimeout = 300 * time.Second
 	// clientSettingsA.ReceiveBufferSettings.AckBufferSize = 0
 	clientSettingsA.ForwardBufferSettings.SequenceBufferSize = 0
-	clientSettingsA.ForwardBufferSettings.IdleTimeout = 180 * time.Second
+	clientSettingsA.ForwardBufferSettings.IdleTimeout = 300 * time.Second
 	clientSettingsA.ContractManagerSettings.LegacyCreateContract = true
 	a := NewClient(ctx, aClientId, NewNoContractClientOob(), clientSettingsA)
 	aRouteManager := a.RouteManager()
@@ -91,14 +91,14 @@ func TestSendReceiveSenderReset(t *testing.T) {
 	clientSettingsB := DefaultClientSettings()
 	clientSettingsB.SendBufferSettings.SequenceBufferSize = 0
 	clientSettingsB.SendBufferSettings.AckBufferSize = 0
-	clientSettingsB.SendBufferSettings.AckTimeout = 90 * time.Second
-	clientSettingsB.SendBufferSettings.IdleTimeout = 180 * time.Second
+	clientSettingsB.SendBufferSettings.AckTimeout = 300 * time.Second
+	clientSettingsB.SendBufferSettings.IdleTimeout = 300 * time.Second
 	clientSettingsB.ReceiveBufferSettings.SequenceBufferSize = 0
-	clientSettingsB.ReceiveBufferSettings.GapTimeout = 90 * time.Second
-	clientSettingsB.ReceiveBufferSettings.IdleTimeout = 180 * time.Second
+	clientSettingsB.ReceiveBufferSettings.GapTimeout = 300 * time.Second
+	clientSettingsB.ReceiveBufferSettings.IdleTimeout = 300 * time.Second
 	// clientSettingsB.ReceiveBufferSettings.AckBufferSize = 0
 	clientSettingsB.ForwardBufferSettings.SequenceBufferSize = 0
-	clientSettingsB.ForwardBufferSettings.IdleTimeout = 180 * time.Second
+	clientSettingsB.ForwardBufferSettings.IdleTimeout = 300 * time.Second
 	clientSettingsB.ContractManagerSettings.LegacyCreateContract = true
 	b := NewClient(ctx, bClientId, NewNoContractClientOob(), clientSettingsB)
 	bRouteManager := b.RouteManager()
@@ -156,9 +156,10 @@ func TestSendReceiveSenderReset(t *testing.T) {
 			if err != nil {
 				panic(err)
 			}
-			a.Send(frame, DestinationId(bClientId), func(err error) {
+			success := a.Send(frame, DestinationId(bClientId), func(err error) {
 				acks <- err
 			})
+			assert.Equal(t, success, true)
 		}
 	}()
 
@@ -248,9 +249,10 @@ func TestSendReceiveSenderReset(t *testing.T) {
 			if err != nil {
 				panic(err)
 			}
-			a2.Send(frame, DestinationId(bClientId), func(err error) {
+			success := a2.Send(frame, DestinationId(bClientId), func(err error) {
 				acks <- err
 			})
+			assert.Equal(t, success, true)
 		}
 	}()
 
