@@ -1159,7 +1159,7 @@ func (self *SendBuffer) Ack(destination TransferPath, ack *protocol.Ack, timeout
 		break
 	}
 	if !anyFound {
-		glog.Infof("[sb]ack miss sequence does not exist %s\n", destination)
+		glog.V(1).Infof("[sb]ack miss sequence does not exist %s\n", destination)
 	}
 	return anySuccess
 }
