@@ -81,9 +81,9 @@ func (self *egressSecurityPolicy) Inspect(provideMode protocol.ProvideMode, ipPa
 }
 
 func (self *egressSecurityPolicy) inspect(provideMode protocol.ProvideMode, ipPath *IpPath) (SecurityPolicyResult, error) {
-	// if protocol.ProvideMode_Network == provideMode {
-	// 	return ipPath, SecurityPolicyResultAllow, nil
-	// } else {
+	if protocol.ProvideMode_Network == provideMode {
+		return SecurityPolicyResultAllow, nil
+	}
 
 	// apply public rules:
 	// - only public unicast network destinations
