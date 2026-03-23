@@ -353,8 +353,8 @@ func testClient[P comparable](
 				panic(err)
 			}
 
-			providerClient.SendWithTimeout(frame, source.Reverse(), func(err error) {}, -1)
-			// assert.Equal(t, true, success)
+			success := providerClient.SendWithTimeout(frame, source.Reverse(), func(err error) {}, -1)
+			assert.Equal(t, true, success)
 
 			// cMutex.Lock()
 			// cSendCount += 1
@@ -388,17 +388,19 @@ func testClient[P comparable](
 	for p := 0; p < parallelCount; p += 1 {
 		go func() {
 			source := SourceId(clientId)
+			packetCount := 0
 			for s := 0; s < m; s += 1 {
 				for i := 0; i < n; i += 1 {
 					for j := 0; j < n; j += 1 {
 						for k := 0; k < n; k += 1 {
 							for a := 0; a < repeatCount; a += 1 {
+								packetCount += 1
 								packet, _ := packetGenerator(s, i, j, k)
-								natClient.SendPacket(source, protocol.ProvideMode_Network, packet, -1)
-								// if !success {
-								// 	fmt.Printf("[TIMEOUT]%T\n", natClient)
-								// }
-								// assert.Equal(t, true, success)
+								success := natClient.SendPacket(source, protocol.ProvideMode_Network, packet, -1)
+								if !success {
+									fmt.Printf("[TIMEOUT][%d] %T\n", packetCount, natClient)
+								}
+								assert.Equal(t, true, success)
 
 								// cMutex.Lock()
 								// cSendCount += 1
