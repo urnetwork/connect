@@ -74,7 +74,7 @@ func DefaultClientSettings() *ClientSettings {
 		SendBufferSize:          DefaultTransferBufferSize,
 		ForwardBufferSize:       DefaultTransferBufferSize,
 		ReadTimeout:             30 * time.Second,
-		BufferTimeout:           30 * time.Second,
+		BufferTimeout:           15 * time.Second,
 		ControlPingTimeout:      time.Duration(0),
 		SendBufferSettings:      DefaultSendBufferSettings(),
 		ReceiveBufferSettings:   DefaultReceiveBufferSettings(),
@@ -96,32 +96,32 @@ func DefaultClientSettingsNoNetworkEvents() *ClientSettings {
 func DefaultSendBufferSettings() *SendBufferSettings {
 	return &SendBufferSettings{
 		CreateContractTimeout:       30 * time.Second,
-		CreateContractRetryInterval: 15 * time.Second,
-		MinResendInterval:           1 * time.Second,
-		MaxResendInterval:           5 * time.Second,
+		CreateContractRetryInterval: 5 * time.Second,
+		MinResendInterval:           2 * time.Second,
+		MaxResendInterval:           8 * time.Second,
 		// no backoff
 		// ResendBackoffScale: 0,
 		RttScale:         1.2,
 		RttWindowSize:    128,
-		RttWindowTimeout: 5 * time.Second,
-		AckTimeout:       30 * time.Second,
-		IdleTimeout:      60 * time.Second,
+		RttWindowTimeout: 60 * time.Second,
+		AckTimeout:       60 * time.Second,
+		IdleTimeout:      300 * time.Second,
 		// pause on resend for selectively acked messaged
-		SelectiveAckTimeout: 30 * time.Second,
+		SelectiveAckTimeout: 60 * time.Second,
 		SequenceBufferSize:  DefaultTransferBufferSize,
 		AckBufferSize:       DefaultTransferBufferSize,
 		MinMessageByteCount: ByteCount(1),
 		// this includes transport reconnections
-		WriteTimeout:            30 * time.Second,
+		WriteTimeout:            15 * time.Second,
 		ResendQueueMaxByteCount: mib(2),
-		ContractFillFraction:    0.5,
+		ContractFillFraction:    0.8,
 		ProtocolVersion:         DefaultProtocolVersion,
 	}
 }
 
 func DefaultReceiveBufferSettings() *ReceiveBufferSettings {
 	return &ReceiveBufferSettings{
-		GapTimeout: 30 * time.Second,
+		GapTimeout: 60 * time.Second,
 		// the receive idle timeout should be a bit longer than the send idle timeout
 		IdleTimeout:        120 * time.Second,
 		SequenceBufferSize: DefaultTransferBufferSize,
@@ -132,7 +132,7 @@ func DefaultReceiveBufferSettings() *ReceiveBufferSettings {
 		// ResendAbuseMultiple:  0.5,
 		MaxPeerAuditDuration: 60 * time.Second,
 		// this includes transport reconnections
-		WriteTimeout:             30 * time.Second,
+		WriteTimeout:             15 * time.Second,
 		ReceiveQueueMaxByteCount: mib(2) + kib(512),
 		AllowLegacyNack:          true,
 		MaxOpenReceiveContract:   4,
@@ -142,9 +142,9 @@ func DefaultReceiveBufferSettings() *ReceiveBufferSettings {
 
 func DefaultForwardBufferSettings() *ForwardBufferSettings {
 	return &ForwardBufferSettings{
-		IdleTimeout:        60 * time.Second,
+		IdleTimeout:        300 * time.Second,
 		SequenceBufferSize: DefaultTransferBufferSize,
-		WriteTimeout:       30 * time.Second,
+		WriteTimeout:       15 * time.Second,
 	}
 }
 
