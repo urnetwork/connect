@@ -122,7 +122,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 				KeepHealthiestCount:      0,
 			},
 		},
-		SendRetryTimeout:           50 * time.Millisecond,
+		SendRetryTimeout:           2000 * time.Millisecond,
 		PingWriteTimeout:           5 * time.Second,
 		CPingWriteTimeout:          15 * time.Second,
 		CPingMaxByteCountPerSecond: kib(32),
@@ -131,10 +131,11 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		PingTimeout:  30 * time.Second,
 		CPingTimeout: 30 * time.Second,
 		// a lower ack timeout helps cycle through bad providers faster
-		AckTimeout:             30 * time.Second,
-		BlackholeTimeout:       15 * time.Second,
-		WindowResizeTimeout:    15 * time.Second,
-		StatsWindowGraceperiod: 30 * time.Second,
+		AckTimeout:                                30 * time.Second,
+		BlackholeTimeout:                          5 * time.Second,
+		BlackholeConnectTimeout:                   30 * time.Second,
+		WindowResizeTimeout:                       15 * time.Second,
+		StatsWindowGraceperiod:                    30 * time.Second,
 		StatsWindowMaxEstimatedByteCountPerSecond: mib(16),
 		// StatsWindowMaxEffectiveByteCountPerSecondScale: 0.8,
 		StatsWindowEntropy:  0.0,
@@ -205,6 +206,7 @@ type MultiClientSettings struct {
 	CPingTimeout                              time.Duration
 	AckTimeout                                time.Duration
 	BlackholeTimeout                          time.Duration
+	BlackholeConnectTimeout                   time.Duration
 	WindowResizeTimeout                       time.Duration
 	StatsWindowGraceperiod                    time.Duration
 	StatsWindowMaxEstimatedByteCountPerSecond ByteCount
@@ -528,6 +530,10 @@ func (self *RemoteUserNatMultiClient) LocalSecurityBypass() bool {
 func (self *RemoteUserNatMultiClient) selectWindowTypes(sendPacket *parsedPacket) []WindowType {
 	// - web traffic is routed to quality providers
 	// - all other traffic is routed to speed providers
+
+	if _, fixed := self.generator.FixedDestinationSize(); fixed {
+		return []WindowType{WindowTypeQuality}
+	}
 
 	var fixedWindowType *WindowType
 	func() {
@@ -1069,25 +1075,25 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 		// find a new client
 		// the race is between as many clients as can send in parallel
 
-		if _, fixed := self.generator.FixedDestinationSize(); fixed {
-			window := self.windows[WindowTypeQuality]
-			orderedClients := window.OrderedClients()
+		// if _, fixed := self.generator.FixedDestinationSize(); fixed {
+		// 	window := self.windows[WindowTypeQuality]
+		// 	orderedClients := window.OrderedClients()
 
-			for _, client := range orderedClients {
-				if client.Send(sendPacket, timeout) {
-					success = true
+		// 	for _, client := range orderedClients {
+		// 		if client.Send(sendPacket, timeout) {
+		// 			success = true
 
-					func() {
-						self.stateLock.Lock()
-						defer self.stateLock.Unlock()
+		// 			func() {
+		// 				self.stateLock.Lock()
+		// 				defer self.stateLock.Unlock()
 
-						update.client = client
-					}()
-				}
-			}
+		// 				update.client = client
+		// 			}()
+		// 		}
+		// 	}
 
-			return
-		}
+		// 	return
+		// }
 
 		raceClients := func(orderedClients []*multiClientChannel, sendTimeout time.Duration) {
 			switch len(orderedClients) {
@@ -1289,7 +1295,6 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 			if 0 < retryTimeout {
 				select {
 				case <-update.ctx.Done():
-					// drop
 					return
 				case <-time.After(retryTimeout):
 				}
@@ -2881,7 +2886,7 @@ func (self *multiClientChannel) detectBlackhole() {
 						return true
 					}
 				}
-				if !windowStats.firstSendSynTime.IsZero() && self.settings.BlackholeTimeout-now.Sub(windowStats.firstSendSynTime) <= 0 {
+				if !windowStats.firstSendSynTime.IsZero() && self.settings.BlackholeConnectTimeout-now.Sub(windowStats.firstSendSynTime) <= 0 {
 					if windowStats.receiveSynCount <= 0 {
 						return true
 					}
