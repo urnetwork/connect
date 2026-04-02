@@ -2553,11 +2553,7 @@ func (self *RemoteUserNatProvider) Receive(
 	opts := []any{
 		CompanionContract(),
 	}
-	switch ipPath.Protocol {
-	case IpProtocolUdp:
-		opts = append(opts, NoAck())
-	}
-
+	// note udp is sent with ack because because otherwise the delivery reliability will mulitply with the egress
 	c := func() bool {
 		// ack := make(chan error)
 		sent := self.client.SendWithTimeout(
@@ -2761,10 +2757,7 @@ func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode pro
 
 		// the sender will control transfer
 		opts := []any{}
-		switch ipPath.Protocol {
-		case IpProtocolUdp:
-			opts = append(opts, NoAck())
-		}
+		// note udp is sent with ack because because otherwise the delivery reliability will mulitply with the egress
 		success := self.client.SendMultiHopWithTimeout(frame, destination, func(err error) {}, timeout, opts...)
 		return success
 	case SecurityPolicyResultDrop:

@@ -181,6 +181,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		DefaultUlimit:         0,
 
 		TcpCollapsePrevention: true,
+		UdpCollapsePrevention: false,
 
 		IngressSecurityPolicyGenerator: DefaultIngressSecurityPolicyWithStats,
 		EgressSecurityPolicyGenerator:  DefaultEgressSecurityPolicyWithStats,
@@ -267,6 +268,7 @@ type MultiClientSettings struct {
 	DefaultUlimit int
 
 	TcpCollapsePrevention bool
+	UdpCollapsePrevention bool
 
 	IngressSecurityPolicyGenerator func(*SecurityPolicyStatsCollector) SecurityPolicy
 	EgressSecurityPolicyGenerator  func(*SecurityPolicyStatsCollector) SecurityPolicy
@@ -2775,7 +2777,11 @@ func (self *multiClientChannel) SendDetailed(parsedPacket *parsedPacket, timeout
 	var ack bool
 	switch parsedPacket.ipPath.Protocol {
 	case IpProtocolUdp:
-		ack = false
+		if self.settings.UdpCollapsePrevention {
+			ack = false
+		} else {
+			ack = true
+		}
 	default:
 		ack = true
 	}
