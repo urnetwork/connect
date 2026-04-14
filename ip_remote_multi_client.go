@@ -556,21 +556,42 @@ func (self *RemoteUserNatMultiClient) selectWindowTypes(sendPacket *parsedPacket
 	}
 }
 
-func (self *RemoteUserNatMultiClient) affinityIpPaths(ipPath *IpPath) (affinityPaths []*IpPath, attach bool) {
-	// - for all traffic, use affinity for (destination, destination port)
-	destinationPath := ipPath.Destination()
-
-	// sourceCount := 1
-	// switch ipPath.Version {
-	// case 4:
-	// 	sourceCount += len(self.affinityIp4Paths[destinationPath.ToIp4Path()])
-	// case 6:
-	// 	sourceCount += len(self.affinityIp6Paths[destinationPath.ToIp6Path()])
-	// }
-	// attach = sourceCount <= 8
-
+// called with stateLock
+func (self *RemoteUserNatMultiClient) affinityIpPathsWithLock(ipPath *IpPath) (affinityPaths []*IpPath, attach bool) {
 	attach = true
-	affinityPaths = append(affinityPaths, destinationPath)
+
+	singleIp := false
+	if self.performanceProfile != nil {
+		singleIp = (self.performanceProfile.WindowSize.FixedWindowSize == 1)
+	}
+
+	if singleIp {
+		singlePath := &IpPath{
+			Version: ipPath.Version,
+		}
+		affinityPaths = append(affinityPaths, singlePath)
+	} else if ipPath.DestinationPort == 80 || ipPath.DestinationPort == 53 || ipPath.DestinationPort == 443 {
+		// for these ports, cycle the path per destination ip, regardless of protocol
+		destinationPath := &IpPath{
+			Version:         ipPath.Version,
+			DestinationIp:   ipPath.DestinationIp,
+			DestinationPort: ipPath.DestinationPort,
+		}
+		affinityPaths = append(affinityPaths, destinationPath)
+	} else if ipPath.DestinationPort < 1024 {
+		// for these ports, cycle the path per destination port, regardless of protocol or ip
+		destinationPortPath := &IpPath{
+			Version:         ipPath.Version,
+			DestinationPort: ipPath.DestinationPort,
+		}
+		affinityPaths = append(affinityPaths, destinationPortPath)
+	} else {
+		// for user space ports, use a single path, regardless of protocol, ip, or port
+		singlePath := &IpPath{
+			Version: ipPath.Version,
+		}
+		affinityPaths = append(affinityPaths, singlePath)
+	}
 
 	return
 }
@@ -668,7 +689,7 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(
 			var affinityIpPaths []*IpPath
 			var affinityAttach bool
 			if self.settings.DestinationAffinity {
-				affinityIpPaths, affinityAttach = self.affinityIpPaths(ipPath)
+				affinityIpPaths, affinityAttach = self.affinityIpPathsWithLock(ipPath)
 			}
 			update = newMultiClientChannelUpdate(self.ctx, ipPath)
 			go HandleError(func() {
@@ -764,7 +785,7 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(
 			var affinityIpPaths []*IpPath
 			var affinityAttach bool
 			if self.settings.DestinationAffinity {
-				affinityIpPaths, affinityAttach = self.affinityIpPaths(ipPath)
+				affinityIpPaths, affinityAttach = self.affinityIpPathsWithLock(ipPath)
 			}
 			update = newMultiClientChannelUpdate(self.ctx, ipPath)
 			go HandleError(func() {
