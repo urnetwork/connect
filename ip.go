@@ -2939,6 +2939,8 @@ type IpPath struct {
 	Syn            bool
 	Rst            bool
 	Ack            bool
+
+	ServerName string
 }
 
 func ParseIpPath(ipPacket []byte) (*IpPath, error) {
@@ -3091,6 +3093,7 @@ func (self *IpPath) ToIp4Path() Ip4Path {
 		SourcePort:      self.SourcePort,
 		DestinationIp:   destinationIp,
 		DestinationPort: self.DestinationPort,
+		ServerName:      self.ServerName,
 	}
 }
 
@@ -3113,6 +3116,7 @@ func (self *IpPath) ToIp6Path() Ip6Path {
 		SourcePort:      self.SourcePort,
 		DestinationIp:   destinationIp,
 		DestinationPort: self.DestinationPort,
+		ServerName:      self.ServerName,
 	}
 }
 
@@ -3152,6 +3156,7 @@ type Ip4Path struct {
 	SourcePort      int
 	DestinationIp   [4]byte
 	DestinationPort int
+	ServerName      string
 }
 
 func (self *Ip4Path) Source() Ip4Path {
@@ -3177,6 +3182,7 @@ type Ip6Path struct {
 	SourcePort      int
 	DestinationIp   [16]byte
 	DestinationPort int
+	ServerName      string
 }
 
 func (self *Ip6Path) Source() Ip6Path {

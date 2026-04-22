@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"golang.org/x/exp/maps"
+	"golang.org/x/net/publicsuffix"
 
 	"google.golang.org/protobuf/proto"
 
@@ -557,9 +558,7 @@ func (self *RemoteUserNatMultiClient) selectWindowTypes(sendPacket *parsedPacket
 }
 
 // called with stateLock
-func (self *RemoteUserNatMultiClient) affinityIpPathsWithLock(ipPath *IpPath) (affinityPaths []*IpPath, attach bool) {
-	attach = true
-
+func (self *RemoteUserNatMultiClient) affinityIpPathsWithLock(ipPath *IpPath) (affinityPaths []*IpPath) {
 	singleIp := false
 	if self.performanceProfile != nil {
 		singleIp = (self.performanceProfile.WindowSize.FixedWindowSize == 1)
@@ -570,34 +569,71 @@ func (self *RemoteUserNatMultiClient) affinityIpPathsWithLock(ipPath *IpPath) (a
 			Version: ipPath.Version,
 		}
 		affinityPaths = append(affinityPaths, singlePath)
-	} else if ipPath.DestinationPort == 80 || ipPath.DestinationPort == 53 || ipPath.DestinationPort == 443 {
-		// for these ports, cycle the path per destination ip, regardless of protocol
-		destinationPath := &IpPath{
-			Version:         ipPath.Version,
-			DestinationIp:   ipPath.DestinationIp,
-			DestinationPort: ipPath.DestinationPort,
-		}
-		affinityPaths = append(affinityPaths, destinationPath)
-	} else if ipPath.DestinationPort < 1024 {
-		// for these ports, cycle the path per destination port, regardless of protocol or ip
-		destinationPortPath := &IpPath{
-			Version:         ipPath.Version,
-			DestinationPort: ipPath.DestinationPort,
-		}
-		affinityPaths = append(affinityPaths, destinationPortPath)
 	} else {
-		// for user space ports, use a single path, regardless of protocol, ip, or port
-		singlePath := &IpPath{
-			Version: ipPath.Version,
+		var serverNames []string
+		// for 5 <= len(payload) {
+		// 	tlsHeader := parseTlsHeader(payload[0:5])
+		// 	if tlsHeader.valid() && 5+int(tlsHeader.contentLength) <= len(payload) {
+		// 		if tlsHeader.contentType == TlsContentTypeHandshake {
+		// 			// handshake
+		// 			handshakeBytes := payload[5 : 5+tlsHeader.contentLength]
+		// 			serverName := UnmarshalClientHelloServerName(handshakeBytes)
+		// 			if serverName != "" {
+		// 				serverNames = append(serverNames, serverName)
+		// 			}
+		// 		}
+		// 	}
+		// }
+
+		// FIXME
+		// if serverName == "" {
+		// 	// attempt to use a reverse lookup of the associated name resolution
+		// }
+
+		if 0 < len(serverNames) {
+			for _, serverName := range serverNames {
+				rootDomain, err := publicsuffix.EffectiveTLDPlusOne(serverName)
+				if err == nil {
+					rootDomainPath := &IpPath{
+						ServerName: rootDomain,
+					}
+					affinityPaths = append(affinityPaths, rootDomainPath)
+				} else {
+					serverNamePath := &IpPath{
+						ServerName: serverName,
+					}
+					affinityPaths = append(affinityPaths, serverNamePath)
+				}
+			}
+		} else if ipPath.DestinationPort == 80 || ipPath.DestinationPort == 53 || ipPath.DestinationPort == 443 {
+			// for these ports, cycle the path per destination ip/port, regardless of protocol
+			destinationPath := &IpPath{
+				Version:         ipPath.Version,
+				DestinationIp:   ipPath.DestinationIp,
+				DestinationPort: ipPath.DestinationPort,
+			}
+			affinityPaths = append(affinityPaths, destinationPath)
+		} else if ipPath.DestinationPort < 1024 {
+			// for these ports, cycle the path per destination port, regardless of protocol or ip
+			destinationPortPath := &IpPath{
+				Version:         ipPath.Version,
+				DestinationPort: ipPath.DestinationPort,
+			}
+			affinityPaths = append(affinityPaths, destinationPortPath)
+		} else {
+			// for user space ports, use a single path, regardless of protocol, ip, or port
+			singlePath := &IpPath{
+				Version: ipPath.Version,
+			}
+			affinityPaths = append(affinityPaths, singlePath)
 		}
-		affinityPaths = append(affinityPaths, singlePath)
 	}
 
 	return
 }
 
-func (self *RemoteUserNatMultiClient) updateClientPath(ipPath *IpPath, callback func(*multiClientChannelUpdate)) {
-	update, previousClient := self.reserveUpdate(ipPath)
+func (self *RemoteUserNatMultiClient) sendClientPath(ipPath *IpPath, callback func(*multiClientChannelUpdate)) {
+	update, previousClient := self.sendUpdate(ipPath)
 	callback(update)
 	// self.updateClient(update, client)
 
@@ -628,9 +664,7 @@ func (self *RemoteUserNatMultiClient) updateClientPath(ipPath *IpPath, callback 
 	}()
 }
 
-func (self *RemoteUserNatMultiClient) reserveUpdate(
-	ipPath *IpPath,
-) (
+func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 	*multiClientChannelUpdate,
 	*multiClientChannel,
 ) {
@@ -686,11 +720,6 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(
 		var previousClient *multiClientChannel
 		update, ok := self.ip4PathUpdates[ip4Path]
 		if !ok || update.IsDone() {
-			var affinityIpPaths []*IpPath
-			var affinityAttach bool
-			if self.settings.DestinationAffinity {
-				affinityIpPaths, affinityAttach = self.affinityIpPathsWithLock(ipPath)
-			}
 			update = newMultiClientChannelUpdate(self.ctx, ipPath)
 			go HandleError(func() {
 				defer update.cancel()
@@ -713,14 +742,11 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(
 
 						delete(self.ip4PathUpdates, ip4Path)
 
-						if affinityAttach {
-							for _, affinityIpPath := range affinityIpPaths {
-								affinityIp4Path := affinityIpPath.ToIp4Path()
-								if paths, ok := self.affinityIp4Paths[affinityIp4Path]; ok {
-									delete(paths, ip4Path)
-									if len(paths) == 0 {
-										delete(self.affinityIp4Paths, affinityIp4Path)
-									}
+						for affinityIp4Path, _ := range update.affinityIp4Paths {
+							if paths, ok := self.affinityIp4Paths[affinityIp4Path]; ok {
+								delete(paths, ip4Path)
+								if len(paths) == 0 {
+									delete(self.affinityIp4Paths, affinityIp4Path)
 								}
 							}
 						}
@@ -749,24 +775,28 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(
 			}, update.cancel)
 			self.ip4PathUpdates[ip4Path] = update
 
-			if affinityAttach {
-				for _, affinityIpPath := range affinityIpPaths {
-					affinityIp4Path := affinityIpPath.ToIp4Path()
-					paths, ok := self.affinityIp4Paths[affinityIp4Path]
-					if !ok {
-						paths = map[Ip4Path]time.Time{}
-						self.affinityIp4Paths[affinityIp4Path] = paths
-					}
-					paths[ip4Path] = time.Now()
+			var affinityIpPaths []*IpPath
+			if self.settings.DestinationAffinity {
+				affinityIpPaths = self.affinityIpPathsWithLock(ipPath)
+			}
 
-					if update.client == nil {
-						var mostRecentCreateTime time.Time
-						for copyIp4Path, createTime := range paths {
-							if copyUpdate, ok := self.ip4PathUpdates[copyIp4Path]; ok {
-								if copyUpdate.client != nil && !copyUpdate.client.isWarning() && createTime.After(mostRecentCreateTime) {
-									mostRecentCreateTime = createTime
-									update.client = copyUpdate.client
-								}
+			for _, affinityIpPath := range affinityIpPaths {
+				affinityIp4Path := affinityIpPath.ToIp4Path()
+				update.affinityIp4Paths[affinityIp4Path] = true
+				paths, ok := self.affinityIp4Paths[affinityIp4Path]
+				if !ok {
+					paths = map[Ip4Path]time.Time{}
+					self.affinityIp4Paths[affinityIp4Path] = paths
+				}
+				paths[ip4Path] = time.Now()
+
+				if update.client == nil {
+					var mostRecentCreateTime time.Time
+					for copyIp4Path, createTime := range paths {
+						if copyUpdate, ok := self.ip4PathUpdates[copyIp4Path]; ok {
+							if copyUpdate.client != nil && !copyUpdate.client.IsDone() && !copyUpdate.client.isWarning() && createTime.After(mostRecentCreateTime) {
+								mostRecentCreateTime = createTime
+								update.client = copyUpdate.client
 							}
 						}
 					}
@@ -775,6 +805,7 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(
 		} else {
 			previousClient = update.client
 		}
+
 		update.activityTime = time.Now()
 		return update, previousClient
 	case 6:
@@ -782,11 +813,6 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(
 		var previousClient *multiClientChannel
 		update, ok := self.ip6PathUpdates[ip6Path]
 		if !ok || update.IsDone() {
-			var affinityIpPaths []*IpPath
-			var affinityAttach bool
-			if self.settings.DestinationAffinity {
-				affinityIpPaths, affinityAttach = self.affinityIpPathsWithLock(ipPath)
-			}
 			update = newMultiClientChannelUpdate(self.ctx, ipPath)
 			go HandleError(func() {
 				defer update.cancel()
@@ -809,14 +835,11 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(
 
 						delete(self.ip6PathUpdates, ip6Path)
 
-						if affinityAttach {
-							for _, affinityIpPath := range affinityIpPaths {
-								affinityIp6Path := affinityIpPath.ToIp6Path()
-								if paths, ok := self.affinityIp6Paths[affinityIp6Path]; ok {
-									delete(paths, ip6Path)
-									if len(paths) == 0 {
-										delete(self.affinityIp6Paths, affinityIp6Path)
-									}
+						for affinityIp6Path, _ := range update.affinityIp6Paths {
+							if paths, ok := self.affinityIp6Paths[affinityIp6Path]; ok {
+								delete(paths, ip6Path)
+								if len(paths) == 0 {
+									delete(self.affinityIp6Paths, affinityIp6Path)
 								}
 							}
 						}
@@ -845,24 +868,28 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(
 			}, update.cancel)
 			self.ip6PathUpdates[ip6Path] = update
 
-			if affinityAttach {
-				for _, affinityIpPath := range affinityIpPaths {
-					affinityIp6Path := affinityIpPath.ToIp6Path()
-					paths, ok := self.affinityIp6Paths[affinityIp6Path]
-					if !ok {
-						paths = map[Ip6Path]time.Time{}
-						self.affinityIp6Paths[affinityIp6Path] = paths
-					}
-					paths[ip6Path] = time.Now()
+			var affinityIpPaths []*IpPath
+			if self.settings.DestinationAffinity {
+				affinityIpPaths = self.affinityIpPathsWithLock(ipPath)
+			}
 
-					if update.client == nil {
-						var mostRecentCreateTime time.Time
-						for copyIp6Path, createTime := range paths {
-							if copyUpdate, ok := self.ip6PathUpdates[copyIp6Path]; ok {
-								if copyUpdate.client != nil && createTime.After(mostRecentCreateTime) {
-									mostRecentCreateTime = createTime
-									update.client = copyUpdate.client
-								}
+			for _, affinityIpPath := range affinityIpPaths {
+				affinityIp6Path := affinityIpPath.ToIp6Path()
+				update.affinityIp6Paths[affinityIp6Path] = true
+				paths, ok := self.affinityIp6Paths[affinityIp6Path]
+				if !ok {
+					paths = map[Ip6Path]time.Time{}
+					self.affinityIp6Paths[affinityIp6Path] = paths
+				}
+				paths[ip6Path] = time.Now()
+
+				if update.client == nil {
+					var mostRecentCreateTime time.Time
+					for copyIp6Path, createTime := range paths {
+						if copyUpdate, ok := self.ip6PathUpdates[copyIp6Path]; ok {
+							if copyUpdate.client != nil && !copyUpdate.client.IsDone() && !copyUpdate.client.isWarning() && createTime.After(mostRecentCreateTime) {
+								mostRecentCreateTime = createTime
+								update.client = copyUpdate.client
 							}
 						}
 					}
@@ -871,11 +898,47 @@ func (self *RemoteUserNatMultiClient) reserveUpdate(
 		} else {
 			previousClient = update.client
 		}
+
 		update.activityTime = time.Now()
 		return update, previousClient
 	default:
 		panic(fmt.Errorf("Bad protocol version %d", ipPath.Version))
 	}
+}
+
+func (self *RemoteUserNatMultiClient) receiveClientPath(ipPath *IpPath, callback func(*multiClientChannelUpdate)) bool {
+	update := self.receiveUpdate(ipPath)
+	if update == nil {
+		return false
+	}
+	callback(update)
+	return true
+}
+
+func (self *RemoteUserNatMultiClient) receiveUpdate(ipPath *IpPath) *multiClientChannelUpdate {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	switch ipPath.Version {
+	case 4:
+		ip4Path := ipPath.ToIp4Path()
+		update := self.ip4PathUpdates[ip4Path]
+		if update != nil {
+			update.activityTime = time.Now()
+			return update
+		}
+	case 6:
+		ip6Path := ipPath.ToIp6Path()
+		update := self.ip6PathUpdates[ip6Path]
+		if update != nil {
+			update.activityTime = time.Now()
+			return update
+		}
+	default:
+		panic(fmt.Errorf("Bad protocol version %d", ipPath.Version))
+	}
+
+	return nil
 }
 
 /*
@@ -997,19 +1060,19 @@ func (self *RemoteUserNatMultiClient) canSendPacket(ipPath *IpPath, update *mult
 			// as soon as a packet is sent to a client, either the client will eith reliabily transfer the packet,
 			// or the client will be dropped
 			// retransmits don't need to be sent as soon as the packet is committed to a client
-			if ipPath.Syn || ipPath.Rst || ipPath.Ack {
+			if ipPath.Syn || ipPath.Rst {
 				allow = true
 			} else {
 				func() {
 					self.stateLock.Lock()
 					defer self.stateLock.Unlock()
 
-					if update.normalPacketCount == 0 {
+					if update.sequencePacketCount == 0 {
 						allow = true
 						return
 					}
 
-					if update.sequenceNumber < ipPath.SequenceNumber {
+					if update.sequenceNumber <= ipPath.SequenceNumber {
 						allow = true
 						return
 					}
@@ -1031,19 +1094,28 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 	timeout time.Duration,
 ) (success bool) {
 	ipPath := sendPacket.ipPath
-	self.updateClientPath(ipPath, func(update *multiClientChannelUpdate) {
+	self.sendClientPath(ipPath, func(update *multiClientChannelUpdate) {
 		if !self.canSendPacket(ipPath, update) {
 			return
 		}
 
 		enterTime := time.Now()
 
+		if ipPath.Syn || ipPath.Rst {
+			func() {
+				self.stateLock.Lock()
+				defer self.stateLock.Unlock()
+
+				update.sequencePacketCount = 0
+				update.sequenceNumber = ipPath.SequenceNumber
+			}()
+		}
+
 		currentClient := func() *multiClientChannel {
 			self.stateLock.Lock()
 			defer self.stateLock.Unlock()
 			return update.client
 		}
-
 		for client := currentClient(); client != nil; {
 			var err error
 			success, err = client.SendDetailed(sendPacket, timeout)
@@ -1052,10 +1124,9 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 					self.stateLock.Lock()
 					defer self.stateLock.Unlock()
 
-					update.normalPacketCount += 1
-
 					if update.sequenceNumber < ipPath.SequenceNumber {
-						update.sequenceNumber = ipPath.SequenceNumber
+						update.sequencePacketCount += 1
+						update.sequenceNumber = uint32(int(ipPath.SequenceNumber) + len(sendPacket.payload))
 					}
 				}()
 			} else if err != nil {
@@ -1348,7 +1419,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 	var abandonedClients []*multiClientChannel
 	var receivePackets []*receivePacket
 	var returnPackets []*receivePacket
-	self.updateClientPath(ipPath, func(update *multiClientChannelUpdate) {
+	success := self.receiveClientPath(ipPath, func(update *multiClientChannelUpdate) {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 
@@ -1431,21 +1502,26 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 			}
 		}
 	})
-	if 0 < len(abandonedClients) {
-		if rstPacket, ok := ipOosRst(ipPath); ok {
-			for _, abandonedClient := range abandonedClients {
-				abandonedClient.Send(&parsedPacket{
-					packet: rstPacket,
-					ipPath: ipPath,
-				}, 0)
+	if success {
+		if 0 < len(abandonedClients) {
+			if rstPacket, ok := ipOosRst(ipPath); ok {
+				for _, abandonedClient := range abandonedClients {
+					abandonedClient.Send(&parsedPacket{
+						packet: rstPacket,
+						ipPath: ipPath,
+					}, 0)
+				}
 			}
 		}
-	}
-	for _, p := range receivePackets {
-		self.receivePacketCallback(p.Source, p.ProvideMode, p.IpPath, p.Packet)
-	}
-	for _, p := range returnPackets {
-		MessagePoolReturn(p.Packet)
+		for _, p := range receivePackets {
+			self.receivePacketCallback(p.Source, p.ProvideMode, p.IpPath, p.Packet)
+		}
+		for _, p := range returnPackets {
+			MessagePoolReturn(p.Packet)
+		}
+	} else {
+		// incoming packets not in response to outgoing packets
+		self.receivePacketCallback(source, provideMode, ipPath, packet)
 	}
 }
 
@@ -1468,7 +1544,7 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 		var abandonedClients []*multiClientChannel
 		var receivePackets []*receivePacket
 		var returnPackets []*receivePacket
-		self.updateClientPath(ipPath, func(update *multiClientChannelUpdate) {
+		self.receiveClientPath(ipPath, func(update *multiClientChannelUpdate) {
 			self.stateLock.Lock()
 			defer self.stateLock.Unlock()
 
@@ -1587,18 +1663,21 @@ type multiClientChannelUpdate struct {
 	activityTime time.Time
 	ipPath       *IpPath
 
-	// this tracks packets send when the client is set
-	// race packets are not currently tracked
-	normalPacketCount int
-	sequenceNumber    uint32
+	sequencePacketCount int
+	sequenceNumber      uint32
+
+	affinityIp4Paths map[Ip4Path]bool
+	affinityIp6Paths map[Ip6Path]bool
 }
 
 func newMultiClientChannelUpdate(ctx context.Context, ipPath *IpPath) *multiClientChannelUpdate {
 	cancelCtx, cancel := context.WithCancel(ctx)
 	return &multiClientChannelUpdate{
-		ctx:    cancelCtx,
-		cancel: cancel,
-		ipPath: ipPath,
+		ctx:              cancelCtx,
+		cancel:           cancel,
+		ipPath:           ipPath,
+		affinityIp4Paths: map[Ip4Path]bool{},
+		affinityIp6Paths: map[Ip6Path]bool{},
 	}
 }
 
