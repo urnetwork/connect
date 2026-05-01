@@ -2935,10 +2935,13 @@ type IpPath struct {
 	DestinationIp   net.IP
 	DestinationPort int
 
-	SequenceNumber uint32
-	Syn            bool
-	Rst            bool
-	Ack            bool
+	SequenceNumber    uint32
+	AckSequenceNumber uint32
+	Syn               bool
+	Rst               bool
+	Ack               bool
+
+	ServerName string
 }
 
 func ParseIpPath(ipPacket []byte) (*IpPath, error) {
@@ -2977,16 +2980,17 @@ func ParseIpPathWithPayload(ipPacket []byte) (*IpPath, []byte, error) {
 			tcp.DecodeFromBytes(ipv4.Payload, gopacket.NilDecodeFeedback)
 
 			return &IpPath{
-				Version:         int(ipVersion),
-				Protocol:        IpProtocolTcp,
-				SourceIp:        sourceIpCopy,
-				SourcePort:      int(tcp.SrcPort),
-				DestinationIp:   destinationIpCopy,
-				DestinationPort: int(tcp.DstPort),
-				SequenceNumber:  tcp.Seq,
-				Syn:             tcp.SYN,
-				Rst:             tcp.RST,
-				Ack:             tcp.ACK,
+				Version:           int(ipVersion),
+				Protocol:          IpProtocolTcp,
+				SourceIp:          sourceIpCopy,
+				SourcePort:        int(tcp.SrcPort),
+				DestinationIp:     destinationIpCopy,
+				DestinationPort:   int(tcp.DstPort),
+				SequenceNumber:    tcp.Seq,
+				AckSequenceNumber: tcp.Ack,
+				Syn:               tcp.SYN,
+				Rst:               tcp.RST,
+				Ack:               tcp.ACK,
 			}, tcp.Payload, nil
 		default:
 			// no support for this protocol
@@ -3091,6 +3095,7 @@ func (self *IpPath) ToIp4Path() Ip4Path {
 		SourcePort:      self.SourcePort,
 		DestinationIp:   destinationIp,
 		DestinationPort: self.DestinationPort,
+		ServerName:      self.ServerName,
 	}
 }
 
@@ -3113,6 +3118,7 @@ func (self *IpPath) ToIp6Path() Ip6Path {
 		SourcePort:      self.SourcePort,
 		DestinationIp:   destinationIp,
 		DestinationPort: self.DestinationPort,
+		ServerName:      self.ServerName,
 	}
 }
 
@@ -3152,6 +3158,7 @@ type Ip4Path struct {
 	SourcePort      int
 	DestinationIp   [4]byte
 	DestinationPort int
+	ServerName      string
 }
 
 func (self *Ip4Path) Source() Ip4Path {
@@ -3177,6 +3184,7 @@ type Ip6Path struct {
 	SourcePort      int
 	DestinationIp   [16]byte
 	DestinationPort int
+	ServerName      string
 }
 
 func (self *Ip6Path) Source() Ip6Path {
