@@ -1052,7 +1052,8 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 	}
 }
 
-func (self *RemoteUserNatMultiClient) canSendPacket(ipPath *IpPath, update *multiClientChannelUpdate) (allow bool) {
+func (self *RemoteUserNatMultiClient) canSendPacket(sendPacket *parsedPacket, update *multiClientChannelUpdate) (allow bool) {
+	ipPath := sendPacket.ipPath
 	switch ipPath.Protocol {
 	case IpProtocolTcp:
 		if self.settings.TcpCollapsePrevention {
@@ -1067,12 +1068,7 @@ func (self *RemoteUserNatMultiClient) canSendPacket(ipPath *IpPath, update *mult
 					self.stateLock.Lock()
 					defer self.stateLock.Unlock()
 
-					if update.sequencePacketCount == 0 {
-						allow = true
-						return
-					}
-
-					if update.sequenceNumber <= ipPath.SequenceNumber {
+					if update.canUpdateSequence(sendPacket) {
 						allow = true
 						return
 					}
@@ -1095,7 +1091,7 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 ) (success bool) {
 	ipPath := sendPacket.ipPath
 	self.sendClientPath(ipPath, func(update *multiClientChannelUpdate) {
-		if !self.canSendPacket(ipPath, update) {
+		if !self.canSendPacket(sendPacket, update) {
 			return
 		}
 
@@ -1105,9 +1101,7 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 			func() {
 				self.stateLock.Lock()
 				defer self.stateLock.Unlock()
-
-				update.sequencePacketCount = 0
-				update.sequenceNumber = ipPath.SequenceNumber
+				update.resetSequence(sendPacket)
 			}()
 		}
 
@@ -1123,11 +1117,7 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 				func() {
 					self.stateLock.Lock()
 					defer self.stateLock.Unlock()
-
-					if update.sequenceNumber < ipPath.SequenceNumber {
-						update.sequencePacketCount += 1
-						update.sequenceNumber = uint32(int(ipPath.SequenceNumber) + len(sendPacket.payload))
-					}
+					update.updateSequence(sendPacket)
 				}()
 			} else if err != nil {
 				// reset the path
@@ -1664,7 +1654,9 @@ type multiClientChannelUpdate struct {
 	ipPath       *IpPath
 
 	sequencePacketCount int
+	ackSequenceNumber   uint32
 	sequenceNumber      uint32
+	sequenceNumber64    uint64
 
 	affinityIp4Paths map[Ip4Path]bool
 	affinityIp6Paths map[Ip6Path]bool
@@ -1679,6 +1671,63 @@ func newMultiClientChannelUpdate(ctx context.Context, ipPath *IpPath) *multiClie
 		affinityIp4Paths: map[Ip4Path]bool{},
 		affinityIp6Paths: map[Ip6Path]bool{},
 	}
+}
+
+func (self *multiClientChannelUpdate) resetSequence(sendPacket *parsedPacket) {
+	ipPath := sendPacket.ipPath
+
+	nextAckSequenceNumber := ipPath.AckSequenceNumber
+	self.ackSequenceNumber = nextAckSequenceNumber
+
+	nextSequenceNumber64 := uint64(ipPath.SequenceNumber)
+	nextSequenceNumber := uint32(nextSequenceNumber64)
+	self.sequenceNumber = nextSequenceNumber
+	self.sequenceNumber64 = nextSequenceNumber64
+
+	self.sequencePacketCount = 0
+}
+
+func (self *multiClientChannelUpdate) updateSequence(sendPacket *parsedPacket) {
+	ipPath := sendPacket.ipPath
+	update := false
+
+	nextAckSequenceNumber := ipPath.AckSequenceNumber
+	if self.ackSequenceNumber != nextAckSequenceNumber {
+		self.ackSequenceNumber = nextAckSequenceNumber
+		update = true
+	}
+
+	nextSequenceNumber64 := uint64(ipPath.SequenceNumber) + uint64(len(sendPacket.payload))
+	nextSequenceNumber := uint32(nextSequenceNumber64)
+	if self.sequenceNumber < nextSequenceNumber || self.sequenceNumber64 < nextSequenceNumber64 {
+		self.sequenceNumber = nextSequenceNumber
+		self.sequenceNumber64 = nextSequenceNumber64
+		update = true
+	}
+
+	if update {
+		self.sequencePacketCount += 1
+	}
+}
+
+func (self *multiClientChannelUpdate) canUpdateSequence(sendPacket *parsedPacket) bool {
+	if self.sequencePacketCount == 0 {
+		return true
+	}
+
+	ipPath := sendPacket.ipPath
+
+	if self.ackSequenceNumber != ipPath.AckSequenceNumber {
+		return true
+	}
+
+	nextSequenceNumber64 := uint64(ipPath.SequenceNumber) + uint64(len(sendPacket.payload))
+	nextSequenceNumber := uint32(nextSequenceNumber64)
+	if self.sequenceNumber <= nextSequenceNumber || self.sequenceNumber64 <= nextSequenceNumber64 {
+		return true
+	}
+
+	return false
 }
 
 func (self *multiClientChannelUpdate) initRace() {

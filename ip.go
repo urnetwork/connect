@@ -2935,10 +2935,11 @@ type IpPath struct {
 	DestinationIp   net.IP
 	DestinationPort int
 
-	SequenceNumber uint32
-	Syn            bool
-	Rst            bool
-	Ack            bool
+	SequenceNumber    uint32
+	AckSequenceNumber uint32
+	Syn               bool
+	Rst               bool
+	Ack               bool
 
 	ServerName string
 }
@@ -2979,16 +2980,17 @@ func ParseIpPathWithPayload(ipPacket []byte) (*IpPath, []byte, error) {
 			tcp.DecodeFromBytes(ipv4.Payload, gopacket.NilDecodeFeedback)
 
 			return &IpPath{
-				Version:         int(ipVersion),
-				Protocol:        IpProtocolTcp,
-				SourceIp:        sourceIpCopy,
-				SourcePort:      int(tcp.SrcPort),
-				DestinationIp:   destinationIpCopy,
-				DestinationPort: int(tcp.DstPort),
-				SequenceNumber:  tcp.Seq,
-				Syn:             tcp.SYN,
-				Rst:             tcp.RST,
-				Ack:             tcp.ACK,
+				Version:           int(ipVersion),
+				Protocol:          IpProtocolTcp,
+				SourceIp:          sourceIpCopy,
+				SourcePort:        int(tcp.SrcPort),
+				DestinationIp:     destinationIpCopy,
+				DestinationPort:   int(tcp.DstPort),
+				SequenceNumber:    tcp.Seq,
+				AckSequenceNumber: tcp.Ack,
+				Syn:               tcp.SYN,
+				Rst:               tcp.RST,
+				Ack:               tcp.ACK,
 			}, tcp.Payload, nil
 		default:
 			// no support for this protocol
