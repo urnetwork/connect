@@ -85,7 +85,7 @@ func DefaultContractManagerSettings() *ContractManagerSettings {
 		panic(err)
 	}
 	return &ContractManagerSettings{
-		InitialContractTransferByteCount:  kib(16),
+		InitialContractTransferByteCount:  kib(256),
 		StandardContractTransferByteCount: mib(128),
 		ContractTransferByteSeqScale:      4,
 
