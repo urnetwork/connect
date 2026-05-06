@@ -113,6 +113,7 @@ func (self *egressSecurityPolicy) inspect(provideMode protocol.ProvideMode, ipPa
 	//   see https://support.apple.com/en-us/103229
 	// - block bittorrent (6881-6889)
 	// - FIXME temporarily enabling 53 and 80 until inline protocol translation is implemented
+	// - allow Electrum related ports (50001, 50002)
 	// TODO in the future, allow a control message to dynamically adjust the security rules
 	allow := func() bool {
 		dPort := ipPath.DestinationPort
@@ -137,6 +138,9 @@ func (self *egressSecurityPolicy) inspect(provideMode protocol.ProvideMode, ipPa
 			return true
 		case dPort == 123, dPort == 500:
 			// apple system ports
+			return true
+		case dPort == 50001, dPort == 50002:
+			// electrum
 			return true
 		case 6881 <= dPort && dPort <= 6889, dPort == 6969:
 			// bittorrent
@@ -190,6 +194,8 @@ func (self *ingressSecurityPolicy) inspect(provideMode protocol.ProvideMode, ipP
 		// dPort := ipPath.DestinationPort
 		sPort := ipPath.SourcePort
 		switch {
+		case sPort == 50001, sPort == 50002:
+			return true
 		case 11000 <= sPort:
 			// rtp and p2p
 			// note many games use 10xxx so we allow this
