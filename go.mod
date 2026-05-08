@@ -37,7 +37,6 @@ require (
 	github.com/pion/srtp/v3 v3.0.10 // indirect
 	github.com/pion/stun/v3 v3.1.2 // indirect
 	github.com/pion/transport/v4 v4.0.1 // indirect
-	github.com/pion/turn/v4 v4.1.4 // indirect
 	github.com/pion/turn/v5 v5.0.3 // indirect
 	go.uber.org/mock v0.6.0 // indirect
 	golang.org/x/sys v0.43.0 // indirect
