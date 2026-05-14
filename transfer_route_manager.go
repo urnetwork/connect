@@ -104,10 +104,13 @@ func (self *RouteManager) OpenMultiRouteWriter(destination TransferPath) MultiRo
 }
 
 func (self *RouteManager) CloseMultiRouteWriter(w MultiRouteWriter) {
-	self.mutex.Lock()
-	defer self.mutex.Unlock()
+	func() {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
 
-	self.writerMatchState.closeMultiRouteSelector(w.(*MultiRouteSelector))
+		self.writerMatchState.closeMultiRouteSelector(w.(*MultiRouteSelector))
+	}()
+	w.(*MultiRouteSelector).Close()
 }
 
 func (self *RouteManager) OpenMultiRouteReader(destination TransferPath) MultiRouteReader {
@@ -122,10 +125,13 @@ func (self *RouteManager) OpenMultiRouteReader(destination TransferPath) MultiRo
 }
 
 func (self *RouteManager) CloseMultiRouteReader(r MultiRouteReader) {
-	self.mutex.Lock()
-	defer self.mutex.Unlock()
+	func() {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
 
-	self.readerMatchState.closeMultiRouteSelector(r.(*MultiRouteSelector))
+		self.readerMatchState.closeMultiRouteSelector(r.(*MultiRouteSelector))
+	}()
+	r.(*MultiRouteSelector).Close()
 }
 
 func (self *RouteManager) UpdateTransport(transport Transport, routes []Route) {
@@ -238,10 +244,12 @@ func (self *MatchState) closeMultiRouteSelector(multiRouteSelector *MultiRouteSe
 	delete(multiRouteSelectors, multiRouteSelector)
 
 	if len(multiRouteSelectors) == 0 {
-		// clean up the destination
+		// clean up the destination so the maps don't grow monotonically
+		// for every destination ever talked to
 		for _, matchedDestinations := range self.transportMatchedDestinations {
 			delete(matchedDestinations, destination)
 		}
+		delete(self.destinationMultiRouteSelectors, destination)
 	}
 }
 
@@ -533,7 +541,7 @@ func (self *MultiRouteSelector) setActive(route Route, active bool) {
 	defer self.mutex.Unlock()
 
 	if _, ok := self.routeActive[route]; ok {
-		self.routeActive[route] = false
+		self.routeActive[route] = active
 	}
 }
 
@@ -725,7 +733,7 @@ func (self *MultiRouteSelector) Read(ctx context.Context, timeout time.Duration)
 		contextDoneIndex := len(selectCases)
 		selectCases = append(selectCases, reflect.SelectCase{
 			Dir:  reflect.SelectRecv,
-			Chan: reflect.ValueOf(self.ctx.Done()),
+			Chan: reflect.ValueOf(ctx.Done()),
 		})
 
 		// add the done case

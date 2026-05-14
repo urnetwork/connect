@@ -61,12 +61,8 @@ func NewFramer(settings *FramerSettings) *Framer {
 
 func (self *Framer) Read(r io.Reader) ([]byte, error) {
 	var h [4]byte
-	n, err := r.Read(h[:])
-	if err != nil {
+	if _, err := io.ReadFull(r, h[:]); err != nil {
 		return nil, err
-	}
-	if n < 4 {
-		return nil, fmt.Errorf("Could not read header.")
 	}
 
 	messageLen := int(binary.BigEndian.Uint16(h[0:2]))
@@ -92,6 +88,7 @@ func (self *Framer) ReadPacket(r io.Reader) ([]byte, error) {
 
 	n, err := r.Read(h)
 	if err != nil {
+		MessagePoolReturn(h)
 		return nil, err
 	}
 	if n < 4 {
@@ -105,6 +102,14 @@ func (self *Framer) ReadPacket(r io.Reader) ([]byte, error) {
 		// glog.Infof("READ MAX\n")
 		MessagePoolReturn(h)
 		return nil, fmt.Errorf("Max message len exceeded (%d<%d)", self.settings.MaxMessageLen, messageLen)
+	}
+
+	// packet readers deliver one framed message per Read; the packet must
+	// contain exactly the 4-byte header plus messageLen bytes of body.
+	// reject under- or over-sized packets rather than accepting garbage tails.
+	if n > 4+messageLen {
+		MessagePoolReturn(h)
+		return nil, fmt.Errorf("Packet body too long (%d>%d)", n-4, messageLen)
 	}
 
 	message := h[4 : messageLen+4]

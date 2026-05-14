@@ -2,12 +2,12 @@ package connect
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"testing"
 	"time"
 
 	// mathrand "math/rand"
-	"crypto/hmac"
-	"crypto/sha256"
 
 	"github.com/go-playground/assert/v2"
 
@@ -60,8 +60,7 @@ func TestTakeContract(t *testing.T) {
 			storedContractBytes, err := ProtoMarshal(storedContract)
 			assert.Equal(t, nil, err)
 			defer MessagePoolReturn(storedContractBytes)
-			mac := hmac.New(sha256.New, provideSecretKey)
-			storedContractHmac := mac.Sum(storedContractBytes)
+			storedContractHmac := SignStoredContract(contractManager.settings, provideSecretKey, storedContractBytes)
 
 			verified := contractManager.Verify(storedContractHmac, storedContractBytes, relationship)
 			assert.Equal(t, true, verified)
@@ -136,4 +135,69 @@ func TestTakeContract(t *testing.T) {
 	assert.Equal(t, nil, contract)
 
 	// all the contracts are accounted for
+}
+
+// TestStoredContractHmacCutover exercises the NetworkEventTimeChangeHmac
+// cutover by setting an artificial cutoff time in ContractManagerSettings and
+// asserting:
+//   - SignStoredContract emits the legacy format when the cutoff is in the future
+//   - SignStoredContract emits the standard format when the cutoff is in the past
+//   - VerifyStoredContract accepts BOTH formats regardless of the cutoff time
+//   - Tampered bytes and wrong keys are rejected for both formats
+func TestStoredContractHmacCutover(t *testing.T) {
+	provideSecretKey := []byte("test-provide-secret-key-which-is-long-enough")
+	storedContractBytes := []byte("test stored contract bytes payload")
+
+	pastSettings := DefaultContractManagerSettings()
+	pastSettings.NetworkEventTimeChangeHmac = time.Now().Add(-time.Hour)
+
+	futureSettings := DefaultContractManagerSettings()
+	futureSettings.NetworkEventTimeChangeHmac = time.Now().Add(time.Hour)
+
+	// canonical encodings of both formats computed independently of the helper
+	legacyExpected := func() []byte {
+		mac := hmac.New(sha256.New, provideSecretKey)
+		return mac.Sum(storedContractBytes)
+	}()
+	standardExpected := func() []byte {
+		mac := hmac.New(sha256.New, provideSecretKey)
+		mac.Write(storedContractBytes)
+		return mac.Sum(nil)
+	}()
+
+	// sanity: the two formats have different lengths and contents
+	assert.Equal(t, len(storedContractBytes)+sha256.Size, len(legacyExpected))
+	assert.Equal(t, sha256.Size, len(standardExpected))
+
+	// future cutoff → signer emits legacy
+	futureHmac := SignStoredContract(futureSettings, provideSecretKey, storedContractBytes)
+	assert.Equal(t, legacyExpected, futureHmac)
+
+	// past cutoff → signer emits standard
+	pastHmac := SignStoredContract(pastSettings, provideSecretKey, storedContractBytes)
+	assert.Equal(t, standardExpected, pastHmac)
+
+	// VerifyStoredContract accepts both formats regardless of the cutoff time
+	assert.Equal(t, true, VerifyStoredContract(pastSettings, provideSecretKey, storedContractBytes, legacyExpected))
+	assert.Equal(t, true, VerifyStoredContract(pastSettings, provideSecretKey, storedContractBytes, standardExpected))
+	assert.Equal(t, true, VerifyStoredContract(futureSettings, provideSecretKey, storedContractBytes, legacyExpected))
+	assert.Equal(t, true, VerifyStoredContract(futureSettings, provideSecretKey, storedContractBytes, standardExpected))
+
+	// tampered contract bytes are rejected for both formats and both settings
+	tampered := []byte("tampered stored contract bytes payload")
+	assert.Equal(t, false, VerifyStoredContract(pastSettings, provideSecretKey, tampered, legacyExpected))
+	assert.Equal(t, false, VerifyStoredContract(pastSettings, provideSecretKey, tampered, standardExpected))
+	assert.Equal(t, false, VerifyStoredContract(futureSettings, provideSecretKey, tampered, legacyExpected))
+	assert.Equal(t, false, VerifyStoredContract(futureSettings, provideSecretKey, tampered, standardExpected))
+
+	// wrong provide key is rejected for both formats and both settings
+	wrongKey := []byte("wrong-provide-secret-key-which-is-long-enough")
+	assert.Equal(t, false, VerifyStoredContract(pastSettings, wrongKey, storedContractBytes, legacyExpected))
+	assert.Equal(t, false, VerifyStoredContract(pastSettings, wrongKey, storedContractBytes, standardExpected))
+	assert.Equal(t, false, VerifyStoredContract(futureSettings, wrongKey, storedContractBytes, legacyExpected))
+	assert.Equal(t, false, VerifyStoredContract(futureSettings, wrongKey, storedContractBytes, standardExpected))
+
+	// an HMAC of an unsupported length is rejected
+	bogus := []byte("not-a-valid-hmac")
+	assert.Equal(t, false, VerifyStoredContract(pastSettings, provideSecretKey, storedContractBytes, bogus))
 }

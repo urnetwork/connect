@@ -152,6 +152,14 @@ func NewExtenderDialTlsContext(
 			if err != nil {
 				return nil, err
 			}
+			// close the underlying conn on any failure path before we return a
+			// successful serverConn to the caller
+			success := false
+			defer func() {
+				if !success {
+					conn.Close()
+				}
+			}()
 
 			if extenderConfig.Profile.Fragment || extenderConfig.Profile.Reorder {
 				rconn := NewResilientTlsConn(conn, extenderConfig.Profile.Fragment, extenderConfig.Profile.Reorder)
@@ -192,6 +200,7 @@ func NewExtenderDialTlsContext(
 
 				serverConn = tlsServerConn
 			}
+			success = true
 
 			// fragmentConn.Off()
 
@@ -276,10 +285,23 @@ func NewExtenderDialTlsContext(
 			connectSettings.TlsConfig,
 		)
 
-		err = tlsServerConn.HandshakeContext(ctx)
+		// inner handshake; bound the timeout so a slow/malicious extender cannot
+		// hold the dial open indefinitely
+		innerSuccess := false
+		defer func() {
+			if !innerSuccess {
+				tlsServerConn.Close()
+			}
+		}()
+		func() {
+			innerCtx, innerCancel := context.WithTimeout(ctx, connectSettings.TlsTimeout)
+			defer innerCancel()
+			err = tlsServerConn.HandshakeContext(innerCtx)
+		}()
 		if err != nil {
 			return nil, err
 		}
+		innerSuccess = true
 
 		return tlsServerConn, nil
 	}

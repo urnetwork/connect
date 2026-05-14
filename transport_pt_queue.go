@@ -60,6 +60,12 @@ func (self *combineQueue) RemoveOlder(minUpdateTime time.Time) {
 		} else {
 			self.addrItemCount[item.addr.String()] = c - 1
 		}
+
+		for _, p := range item.packets {
+			if p != nil {
+				MessagePoolReturn(p.data)
+			}
+		}
 	}
 }
 
@@ -99,6 +105,9 @@ func (self *combineQueue) Combine(addr net.Addr, header [18]byte, data []byte) (
 
 	if item.packets[i] == nil {
 		item.n += 1
+	} else {
+		// duplicate fragment index; release the prior buffer
+		MessagePoolReturn(item.packets[i].data)
 	}
 	item.packets[i] = &packet{
 		data: data,

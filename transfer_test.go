@@ -2,8 +2,6 @@ package connect
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
 	"fmt"
 	mathrand "math/rand"
 	"sync"
@@ -319,8 +317,7 @@ func createContractResultInitialPack(
 		return nil, err
 	}
 	defer MessagePoolReturn(storedContractBytes)
-	mac := hmac.New(sha256.New, provideSecretKey)
-	storedContractHmac := mac.Sum(storedContractBytes)
+	storedContractHmac := SignStoredContract(DefaultContractManagerSettings(), provideSecretKey, storedContractBytes)
 
 	message := &protocol.CreateContractResult{
 		Contract: &protocol.Contract{

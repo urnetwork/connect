@@ -77,10 +77,51 @@ func (self *ContractManagerStats) ContractOpenByteCount() ByteCount {
 	return netContractOpenByteCount
 }
 
+// SignStoredContract returns the HMAC signature for a stored contract using the
+// format appropriate for the current time relative to
+// settings.NetworkEventTimeChangeHmac. Before that time, signers emit the
+// legacy form (`mac.Sum(storedContractBytes)`, which appends a key-only HMAC
+// to the contract bytes). At or after that time, signers emit the standard
+// form (`mac.Write(storedContractBytes); mac.Sum(nil)`).
+//
+// Both connect and server/connect must use this helper so the cutover is
+// consistent across client and server.
+func SignStoredContract(settings *ContractManagerSettings, provideSecretKey []byte, storedContractBytes []byte) []byte {
+	mac := hmac.New(sha256.New, provideSecretKey)
+	if time.Now().Before(settings.NetworkEventTimeChangeHmac) {
+		// legacy: this leaves HMAC(key, "") in the trailing 32 bytes of the
+		// returned slice. preserved for backward compatibility.
+		return mac.Sum(storedContractBytes)
+	}
+	mac.Write(storedContractBytes)
+	return mac.Sum(nil)
+}
+
+// VerifyStoredContract validates a stored-contract HMAC against the provide
+// secret key, accepting both the legacy and standard HMAC formats so that
+// signers may cross over at settings.NetworkEventTimeChangeHmac without
+// breaking compatibility with peers that have not yet cut over.
+func VerifyStoredContract(settings *ContractManagerSettings, provideSecretKey []byte, storedContractBytes []byte, storedContractHmac []byte) bool {
+	legacyMac := hmac.New(sha256.New, provideSecretKey)
+	if hmac.Equal(storedContractHmac, legacyMac.Sum(storedContractBytes)) {
+		return true
+	}
+	standardMac := hmac.New(sha256.New, provideSecretKey)
+	standardMac.Write(storedContractBytes)
+	return hmac.Equal(storedContractHmac, standardMac.Sum(nil))
+}
+
 func DefaultContractManagerSettings() *ContractManagerSettings {
 	// NETWORK EVENT: at the enable contracts date, all clients will require contracts
 	// up to that time, contracts are optional for the sender and match for the receiver
 	networkEventTimeEnableContracts, err := time.Parse(time.RFC3339, "2024-05-01T00:00:00Z")
+	if err != nil {
+		panic(err)
+	}
+	// NETWORK EVENT: at the change-hmac date, signers cut over from the legacy
+	// HMAC format to the standard form. verifiers accept both forms at all
+	// times so the cutover can be deployed asymmetrically.
+	networkEventTimeChangeHmac, err := time.Parse(time.RFC3339, "2026-07-01T00:00:00Z")
 	if err != nil {
 		panic(err)
 	}
@@ -90,6 +131,7 @@ func DefaultContractManagerSettings() *ContractManagerSettings {
 		ContractTransferByteSeqScale:      4,
 
 		NetworkEventTimeEnableContracts: networkEventTimeEnableContracts,
+		NetworkEventTimeChangeHmac:      networkEventTimeChangeHmac,
 
 		ProvidePingTimeout: 0,
 
@@ -105,6 +147,7 @@ func DefaultContractManagerSettings() *ContractManagerSettings {
 func DefaultContractManagerSettingsNoNetworkEvents() *ContractManagerSettings {
 	settings := DefaultContractManagerSettings()
 	settings.NetworkEventTimeEnableContracts = time.Time{}
+	settings.NetworkEventTimeChangeHmac = time.Time{}
 	return settings
 }
 
@@ -118,6 +161,12 @@ type ContractManagerSettings struct {
 	// enable contracts on the network
 	// this can be removed after wide adoption
 	NetworkEventTimeEnableContracts time.Time
+
+	// cut over the stored-contract HMAC signing format. before this time,
+	// SignStoredContract emits the legacy form (mac.Sum(bytes)); at or after,
+	// it emits the standard form (mac.Write(bytes); mac.Sum(nil)). verifiers
+	// accept both forms at all times.
+	NetworkEventTimeChangeHmac time.Time
 
 	// an active ping to the control fast-tracks any timeouts
 	ProvidePingTimeout time.Duration
@@ -332,8 +381,13 @@ func (self *ContractManager) handleControlFrame(createContractKey *ContractKey, 
 		contracts, contractErrors := self.parseControlFrame(createContractKey, frame)
 		for contractKey, contract := range contracts {
 			c := func() error {
-				err := self.addContract(contractKey, contract)
 				var contractStatus *ContractStatus
+				defer func() {
+					if contractStatus != nil {
+						self.contractStatus(contractStatus)
+					}
+				}()
+				err := self.addContract(contractKey, contract)
 				if err != nil {
 					// contract rejected
 					contractError := protocol.ContractError_Trust
@@ -342,30 +396,26 @@ func (self *ContractManager) handleControlFrame(createContractKey *ContractKey, 
 						Error: &contractError,
 					}
 					return err
-				} else {
-					storedContract := &protocol.StoredContract{}
-					err = ProtoUnmarshal(contract.StoredContractBytes, storedContract)
-					if err != nil {
-						contractError := protocol.ContractError_Invalid
-						contractStatus = &ContractStatus{
-							Key:   contractKey,
-							Error: &contractError,
-						}
-						return err
-					} else {
-						premium := false
-						if storedContract.Priority != nil {
-							premium = 0 < *storedContract.Priority
-						}
-						contractStatus = &ContractStatus{
-							Key:     contractKey,
-							Premium: premium,
-						}
-
-						self.contractStatus(contractStatus)
-						return nil
-					}
 				}
+				storedContract := &protocol.StoredContract{}
+				err = ProtoUnmarshal(contract.StoredContractBytes, storedContract)
+				if err != nil {
+					contractError := protocol.ContractError_Invalid
+					contractStatus = &ContractStatus{
+						Key:   contractKey,
+						Error: &contractError,
+					}
+					return err
+				}
+				premium := false
+				if storedContract.Priority != nil {
+					premium = 0 < *storedContract.Priority
+				}
+				contractStatus = &ContractStatus{
+					Key:     contractKey,
+					Premium: premium,
+				}
+				return nil
 			}
 			if glog.V(2) {
 				TraceWithReturn(
@@ -680,9 +730,7 @@ func (self *ContractManager) Verify(storedContractHmac []byte, storedContractByt
 		return false
 	}
 
-	mac := hmac.New(sha256.New, provideSecretKey)
-	expectedHmac := mac.Sum(storedContractBytes)
-	return hmac.Equal(storedContractHmac, expectedHmac)
+	return VerifyStoredContract(self.settings, provideSecretKey, storedContractBytes, storedContractHmac)
 }
 
 func (self *ContractManager) GetProvideSecretKey(provideMode protocol.ProvideMode) ([]byte, bool) {
@@ -756,6 +804,13 @@ func (self *ContractManager) TakeContract(
 		notify := contractQueue.updateMonitor.NotifyChannel()
 		contract := contractQueue.Poll()
 
+		if contract == nil && contractQueue.Drained() {
+			// the queue was force-removed (e.g., the owning send sequence closed).
+			// notifications now go to a fresh queue at this key; bail out instead
+			// of waiting forever on this orphan's monitor.
+			return nil
+		}
+
 		if contract != nil {
 			storedContract := &protocol.StoredContract{}
 			if err := ProtoUnmarshal(contract.StoredContractBytes, storedContract); err == nil {
@@ -809,8 +864,12 @@ func (self *ContractManager) addContract(contractKey ContractKey, contract *prot
 		return err
 	}
 
-	if Id(storedContract.SourceId) != self.client.ClientId() {
-		return fmt.Errorf("Contract source must be this client: %s<>%s", Id(storedContract.SourceId), self.client.ClientId())
+	sourceId, err := IdFromBytes(storedContract.SourceId)
+	if err != nil {
+		return fmt.Errorf("Contract source id malformed: %w", err)
+	}
+	if sourceId != self.client.ClientId() {
+		return fmt.Errorf("Contract source must be this client: %s<>%s", sourceId, self.client.ClientId())
 	}
 
 	glog.V(1).Infof("[contract]add %s %s\n", self.client.ClientId(), contractKey.Destination)
@@ -1045,17 +1104,29 @@ func (self *ContractManager) closeContractQueueWithForceRemove(contractKey Contr
 		contractKey = contractKey.Legacy()
 	}
 
-	self.mutex.Lock()
-	defer self.mutex.Unlock()
+	var toDrain *contractQueue
+	func() {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
 
-	contractQueue, ok := self.destinationContracts[contractKey]
-	if ok {
+		contractQueue, ok := self.destinationContracts[contractKey]
+		if !ok {
+			return
+		}
 		contractQueue.Close()
-		if contractQueue.IsDone() || forceRemove {
+		if forceRemove {
+			// remove from the map so future addContract creates a fresh queue.
+			// existing waiters on the old monitor would never wake up
+			// otherwise; drain wakes them so they can bail.
+			delete(self.destinationContracts, contractKey)
+			toDrain = contractQueue
+		} else if contractQueue.IsDone() {
 			delete(self.destinationContracts, contractKey)
 		}
+	}()
+	if toDrain != nil {
+		toDrain.Drain()
 	}
-	// else the contract was already force removed
 }
 
 type contractQueue struct {
@@ -1064,6 +1135,7 @@ type contractQueue struct {
 	mutex     sync.Mutex
 	openCount int
 	contracts map[Id]*protocol.Contract
+	drained   bool
 
 	// remember all added contract ids
 	trackUsedContracts bool
@@ -1156,6 +1228,24 @@ func (self *contractQueue) Flush(removeUsedContractIds bool) []*protocol.Contrac
 	}
 
 	return contracts
+}
+
+// Drain marks the queue as no longer accepting new contracts and wakes any
+// waiters so they can exit cleanly. Used when the queue is being force-removed
+// from the manager while waiters still hold references.
+func (self *contractQueue) Drain() {
+	func() {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		self.drained = true
+	}()
+	self.updateMonitor.NotifyAll()
+}
+
+func (self *contractQueue) Drained() bool {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	return self.drained
 }
 
 func (self *contractQueue) IsDone() bool {

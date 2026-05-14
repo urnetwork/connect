@@ -24,10 +24,15 @@ type WebRtcConn interface {
 	net.Conn
 	Connected() bool
 	AddConnectedCallback(func(connected bool)) func()
+	// closed when the conn cancels for a reason where the outer transport
+	// should reconnect without backoff (e.g., remote requested fresh
+	// negotiation). returns a never-closed channel for impls that don't
+	// surface this signal.
+	ImmediateReconnect() <-chan struct{}
 }
 
 type SignalSender interface {
-	SendSignal(path TransferPath, signal *protocol.Frame)
+	SendSignal(path TransferPath, signal *protocol.Frame, opts ...any)
 }
 
 type SignalReceiver interface {
@@ -45,8 +50,8 @@ func NewClientSignalSender(client *Client) *ClientSignalSender {
 	}
 }
 
-func (self *ClientSignalSender) SendSignal(path TransferPath, signal *protocol.Frame) {
-	self.client.Send(signal, path.DestinationMask(), nil)
+func (self *ClientSignalSender) SendSignal(path TransferPath, signal *protocol.Frame, opts ...any) {
+	self.client.SendWithTimeout(signal, path.DestinationMask(), nil, -1, opts...)
 }
 
 type clientSignalReceiver struct {
@@ -241,6 +246,13 @@ type peerConn struct {
 
 	connectedCallbacks *CallbackList[func(connected bool)]
 	connMonitor        *Monitor
+	connectedMonitor   *Monitor
+
+	// notified once when the outer transport should reconnect without
+	// honoring the usual backoff delay (e.g., WaitingForSdpOffer after
+	// answer). callers must capture the notify channel via
+	// ImmediateReconnect() BEFORE the work that could trigger it.
+	immediateReconnectMonitor *Monitor
 
 	stateLock sync.Mutex
 	// signals []*protocol.ExchangeSignal
@@ -248,6 +260,11 @@ type peerConn struct {
 	connected bool
 	offer     *protocol.ExchangeSignal
 	answer    *protocol.ExchangeSignal
+
+	// candidates emitted before sdp negotiation completes are buffered
+	// here so they aren't dropped. flushed once iceCandidatesReady is set.
+	iceCandidateBuffer []*webrtc.ICECandidate
+	iceCandidatesReady bool
 
 	readDeadline  time.Time
 	writeDeadline time.Time
@@ -270,9 +287,11 @@ func newPeerConn(ctx context.Context, key peerConnKey, sourceId Id, active bool,
 		signalSender: signalSender,
 		settings:     settings,
 		// api:                api,
-		pc:                 pc,
-		connectedCallbacks: NewCallbackList[func(connected bool)](),
-		connMonitor:        NewMonitor(),
+		pc:                        pc,
+		connectedCallbacks:        NewCallbackList[func(connected bool)](),
+		connMonitor:               NewMonitor(),
+		connectedMonitor:          NewMonitor(),
+		immediateReconnectMonitor: NewMonitor(),
 	}
 	return conn, nil
 }
@@ -283,12 +302,77 @@ func (self *peerConn) Run() {
 
 		self.pc.Close()
 		self.connMonitor.NotifyAll()
+		self.connectedMonitor.NotifyAll()
+
+		// drop any candidates that arrived before negotiation completed but
+		// after Run started its early-exit path; they would otherwise be
+		// retained until the peerConn is GC'd
+		func() {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			self.iceCandidateBuffer = nil
+		}()
 	}()
 
+	// single dispatch goroutine: serializes callback invocation and
+	// always emits the latest connected state, so flap-collapsing is
+	// in-order. user callbacks no longer run on pion's state-change
+	// goroutine. only emits on transition; late subscribers see the
+	// current state via AddConnectedCallback.
+	go HandleError(func() {
+		lastEmitted := false
+		for {
+			notify := self.connectedMonitor.NotifyChannel()
+			var current bool
+			func() {
+				self.stateLock.Lock()
+				defer self.stateLock.Unlock()
+				current = self.connected
+			}()
+			if current != lastEmitted {
+				lastEmitted = current
+				for _, callback := range self.connectedCallbacks.Get() {
+					HandleError(func() {
+						callback(current)
+					})
+				}
+			}
+			select {
+			case <-self.ctx.Done():
+				return
+			case <-notify:
+			}
+		}
+	}, self.cancel)
+
 	self.pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-		connected := state == webrtc.ICEConnectionStateConnected
+		connected := state == webrtc.ICEConnectionStateConnected ||
+			state == webrtc.ICEConnectionStateCompleted
 		glog.V(2).Infof("[peerconn]state=%v (%t)\n", state, connected)
 		self.setConnected(connected)
+	})
+
+	// register ice candidate handler before SetLocalDescription so candidates
+	// emitted during gathering aren't dropped. candidates are buffered until
+	// the negotiation is far enough along to send them (after the peer has
+	// our sdp). flushIceCandidates flips the ready flag and drains the buffer.
+	self.pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
+		if candidate == nil {
+			return
+		}
+		var send bool
+		func() {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			if self.iceCandidatesReady {
+				send = true
+			} else {
+				self.iceCandidateBuffer = append(self.iceCandidateBuffer, candidate)
+			}
+		}()
+		if send {
+			self.sendIceCandidate(candidate)
+		}
 	})
 
 	if self.active {
@@ -344,96 +428,126 @@ func (self *peerConn) Run() {
 func (self *peerConn) ReceiveSignalFromPeer(signal *protocol.ExchangeSignal) error {
 	switch signal.SignalType {
 	case protocol.SignalType_SdpOffer:
-		if !self.active && self.setOfferSignal(signal) {
-			var offer webrtc.SessionDescription
-			err := json.Unmarshal(signal.Sdp, &offer)
-			if err != nil {
-				return err
-			}
-			err = self.pc.SetRemoteDescription(offer)
-			if err != nil {
-				return err
-			}
-			answer, err := self.pc.CreateAnswer(nil)
-			if err != nil {
-				return err
-			}
-			err = self.pc.SetLocalDescription(answer)
-			if err != nil {
-				return err
-			}
-
-			answerBytes, err := json.Marshal(&answer)
-			if err != nil {
-				return err
-			}
-
-			signal := &protocol.ExchangeSignal{
-				SignalType: protocol.SignalType_SdpAnswer,
-				Sdp:        answerBytes,
-			}
-			self.setAnswerSignal(signal)
-			self.sendSignal(signal)
-
-			self.addIceCandidates()
+		if self.active {
+			return nil
 		}
+		// validate before committing state: a malformed first offer
+		// would otherwise "win" via setOfferSignal and cause retransmits
+		// to be silently dropped.
+		var offer webrtc.SessionDescription
+		if err := json.Unmarshal(signal.Sdp, &offer); err != nil {
+			return err
+		}
+		if !self.setOfferSignal(signal) {
+			// already accepted an offer; ignore the duplicate
+			return nil
+		}
+		if err := self.pc.SetRemoteDescription(offer); err != nil {
+			return err
+		}
+		answer, err := self.pc.CreateAnswer(nil)
+		if err != nil {
+			return err
+		}
+		if err := self.pc.SetLocalDescription(answer); err != nil {
+			return err
+		}
+		answerBytes, err := json.Marshal(&answer)
+		if err != nil {
+			return err
+		}
+		answerSignal := &protocol.ExchangeSignal{
+			SignalType: protocol.SignalType_SdpAnswer,
+			Sdp:        answerBytes,
+		}
+		self.setAnswerSignal(answerSignal)
+		self.sendSignal(answerSignal)
+		self.flushIceCandidates()
+
 	case protocol.SignalType_SdpAnswer:
-		if self.active && self.setAnswerSignal(signal) {
-			var answer webrtc.SessionDescription
-			err := json.Unmarshal(signal.Sdp, &answer)
-			if err != nil {
-				return err
-			}
-			err = self.pc.SetRemoteDescription(answer)
-			if err != nil {
-				return err
-			}
-
-			self.addIceCandidates()
+		if !self.active {
+			return nil
 		}
+		// validate before committing state
+		var answer webrtc.SessionDescription
+		if err := json.Unmarshal(signal.Sdp, &answer); err != nil {
+			return err
+		}
+		if !self.setAnswerSignal(signal) {
+			// already accepted an answer; ignore the duplicate
+			return nil
+		}
+		if err := self.pc.SetRemoteDescription(answer); err != nil {
+			return err
+		}
+		self.flushIceCandidates()
+
 	case protocol.SignalType_IceCandidate:
 		var candidate webrtc.ICECandidateInit
-		err := json.Unmarshal(signal.IceCandidate, &candidate)
-		if err != nil {
+		if err := json.Unmarshal(signal.IceCandidate, &candidate); err != nil {
 			return err
 		}
-		err = self.pc.AddICECandidate(candidate)
-		if err != nil {
-			return err
+		// AddICECandidate fails if no remote description is set yet.
+		// log and continue rather than tearing down the connection; ICE
+		// has multiple candidates and the peer will retransmit on retry.
+		if err := self.pc.AddICECandidate(candidate); err != nil {
+			glog.V(1).Infof("[peerconn]AddICECandidate err = %s\n", err)
 		}
-	case protocol.SignalType_WaitingForSdpOffer:
-		if self.active {
 
-			if self.answerSignal() == nil {
-				if signal := self.offerSignal(); signal != nil {
-					self.sendSignal(signal)
-				}
-			} else {
-				// already negotiated an answer with a peer
-				// cancel this connection so a new one can start in the expected state
-				self.cancel()
-			}
+	case protocol.SignalType_WaitingForSdpOffer:
+		if !self.active {
+			break
 		}
-		// else ignore
+		if self.answerSignal() == nil {
+			// not yet negotiated; re-send our cached offer
+			if signal := self.offerSignal(); signal != nil {
+				self.sendSignal(signal)
+			}
+		} else {
+			// peer is asking for a fresh offer despite our prior answer.
+			// they likely restarted; signal the outer transport to reconnect
+			// without backoff, then cancel.
+			glog.V(1).Infof("[peerconn]waiting-for-offer after answer; requesting immediate reconnect\n")
+			self.immediateReconnectMonitor.NotifyAll()
+			self.cancel()
+		}
 	}
 	return nil
 }
 
-func (self *peerConn) addIceCandidates() {
-	self.pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
-		if candidate == nil {
-			return
-		}
-		candidateBytes, err := json.Marshal(candidate.ToJSON())
-		if err != nil {
-			return
-		}
-		signal := &protocol.ExchangeSignal{
-			SignalType:   protocol.SignalType_IceCandidate,
-			IceCandidate: candidateBytes,
-		}
-		self.sendSignal(signal)
-	})
+func (self *peerConn) sendIceCandidate(candidate *webrtc.ICECandidate) {
+	candidateBytes, err := json.Marshal(candidate.ToJSON())
+	if err != nil {
+		return
+	}
+	signal := &protocol.ExchangeSignal{
+		SignalType:   protocol.SignalType_IceCandidate,
+		IceCandidate: candidateBytes,
+	}
+	self.sendSignal(signal)
+}
+
+func (self *peerConn) flushIceCandidates() {
+	var toSend []*webrtc.ICECandidate
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		self.iceCandidatesReady = true
+		toSend = self.iceCandidateBuffer
+		self.iceCandidateBuffer = nil
+	}()
+	for _, candidate := range toSend {
+		self.sendIceCandidate(candidate)
+	}
+}
+
+// ImmediateReconnect returns a channel that closes when the outer transport
+// should reconnect without backoff (e.g., the remote requested fresh
+// negotiation). Callers must capture this channel BEFORE the work that
+// could trigger the signal; the underlying Monitor returns a fresh channel
+// after NotifyAll, so a late caller would receive a never-firing channel.
+func (self *peerConn) ImmediateReconnect() <-chan struct{} {
+	return self.immediateReconnectMonitor.NotifyChannel()
 }
 
 func (self *peerConn) Connected() bool {
@@ -457,22 +571,23 @@ func (self *peerConn) setConnected(connected bool) {
 	}()
 
 	if changed {
-		self.connectedChanged(self.Connected())
+		// signal the dispatch goroutine; it will read the latest state
+		// under the lock and serialize callback invocation. this avoids
+		// out-of-order observation if two setConnected calls race.
+		self.connectedMonitor.NotifyAll()
 	}
 }
 
 func (self *peerConn) AddConnectedCallback(connectedCallback func(connected bool)) func() {
 	callbackId := self.connectedCallbacks.Add(connectedCallback)
+	// fire current state so a late subscriber doesn't miss a transition
+	// that the dispatch goroutine has already emitted.
+	connected := self.Connected()
+	HandleError(func() {
+		connectedCallback(connected)
+	})
 	return func() {
 		self.connectedCallbacks.Remove(callbackId)
-	}
-}
-
-func (self *peerConn) connectedChanged(connected bool) {
-	for _, callback := range self.connectedCallbacks.Get() {
-		HandleError(func() {
-			callback(connected)
-		})
 	}
 }
 
@@ -513,9 +628,21 @@ func (self *peerConn) sendSignal(signal *protocol.ExchangeSignal) {
 		StreamId: self.key.StreamId.Bytes(),
 		Signals:  []*protocol.ExchangeSignal{signal},
 	}
+	// passive peers send signals in the return direction of the stream,
+	// so they ask for a companion contract (verified as
+	// ProvideMode_Stream). this is what the destination is willing to
+	// accept in the asymmetric case where it only enables Stream for
+	// return traffic. active peers continue to use the default opts
+	// (regular contract), so their forward signals are accepted via the
+	// peer's normal Public/Network provide.
+	var opts []any
+	if !self.active {
+		opts = append(opts, CompanionContract())
+	}
 	self.signalSender.SendSignal(
 		DestinationId(self.key.PeerId).AddSource(self.sourceId),
 		RequireToFrameWithDefaultProtocolVersion(signals),
+		opts...,
 	)
 }
 
@@ -525,16 +652,18 @@ func (self *peerConn) setOpenDataChannel(dc *webrtc.DataChannel) error {
 		return err
 	}
 
+	var prev datachannel.ReadWriteCloserDeadliner
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 
-		if self.conn != nil {
-			self.conn.Close()
-		}
+		prev = self.conn
 		self.conn = conn
 		self.connMonitor.NotifyAll()
 	}()
+	if prev != nil {
+		prev.Close()
+	}
 
 	return nil
 }

@@ -1464,7 +1464,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 			glog.Infof("[multi]receive race buffer limit reached")
 
 			for abandonedClient, abandonedState := range race.clientStates {
-				if abandonedClient != client {
+				if abandonedClient != sourceClient {
 					abandonedClients = append(abandonedClients, abandonedClient)
 					for _, p := range abandonedState.packets {
 						if p.Pooled {
@@ -1476,7 +1476,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 			}
 
 			update.clearRace()
-			update.client = client
+			update.client = sourceClient
 			receivePacket := &receivePacket{
 				Source:      source,
 				ProvideMode: provideMode,
@@ -1563,6 +1563,7 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 						receivePackets = race.clientStates[client].packets
 						for _, p := range receivePackets {
 							if p.Pooled {
+								p.Pooled = false
 								returnPackets = append(returnPackets, p)
 							}
 						}
@@ -1574,6 +1575,7 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 						abandonedClients = append(abandonedClients, abandonedClient)
 						for _, p := range abandonedState.packets {
 							if p.Pooled {
+								p.Pooled = false
 								returnPackets = append(returnPackets, p)
 							}
 						}
@@ -1655,8 +1657,10 @@ type multiClientChannelUpdate struct {
 
 	sequencePacketCount int
 	ackSequenceNumber   uint32
-	sequenceNumber      uint32
-	sequenceNumber64    uint64
+	// sequenceNumber wraps at 2^32. ordering is determined via
+	// `int32(a - b)` signed-delta arithmetic (per RFC 1323 PAWS / RFC 7323),
+	// which is wraparound-tolerant across the 32-bit boundary.
+	sequenceNumber uint32
 
 	affinityIp4Paths map[Ip4Path]bool
 	affinityIp6Paths map[Ip6Path]bool
@@ -1676,14 +1680,8 @@ func newMultiClientChannelUpdate(ctx context.Context, ipPath *IpPath) *multiClie
 func (self *multiClientChannelUpdate) resetSequence(sendPacket *parsedPacket) {
 	ipPath := sendPacket.ipPath
 
-	nextAckSequenceNumber := ipPath.AckSequenceNumber
-	self.ackSequenceNumber = nextAckSequenceNumber
-
-	nextSequenceNumber64 := uint64(ipPath.SequenceNumber)
-	nextSequenceNumber := uint32(nextSequenceNumber64)
-	self.sequenceNumber = nextSequenceNumber
-	self.sequenceNumber64 = nextSequenceNumber64
-
+	self.ackSequenceNumber = ipPath.AckSequenceNumber
+	self.sequenceNumber = ipPath.SequenceNumber
 	self.sequencePacketCount = 0
 }
 
@@ -1697,11 +1695,12 @@ func (self *multiClientChannelUpdate) updateSequence(sendPacket *parsedPacket) {
 		update = true
 	}
 
-	nextSequenceNumber64 := uint64(ipPath.SequenceNumber) + uint64(len(sendPacket.payload))
-	nextSequenceNumber := uint32(nextSequenceNumber64)
-	if self.sequenceNumber < nextSequenceNumber || self.sequenceNumber64 < nextSequenceNumber64 {
+	// modular uint32 add wraps correctly across the 4 GB boundary
+	nextSequenceNumber := ipPath.SequenceNumber + uint32(len(sendPacket.payload))
+	// signed-delta comparison is wraparound-tolerant: > 0 means nextSequenceNumber
+	// is later in TCP sequence space than self.sequenceNumber
+	if 0 < int32(nextSequenceNumber-self.sequenceNumber) {
 		self.sequenceNumber = nextSequenceNumber
-		self.sequenceNumber64 = nextSequenceNumber64
 		update = true
 	}
 
@@ -1721,9 +1720,11 @@ func (self *multiClientChannelUpdate) canUpdateSequence(sendPacket *parsedPacket
 		return true
 	}
 
-	nextSequenceNumber64 := uint64(ipPath.SequenceNumber) + uint64(len(sendPacket.payload))
-	nextSequenceNumber := uint32(nextSequenceNumber64)
-	if self.sequenceNumber <= nextSequenceNumber || self.sequenceNumber64 <= nextSequenceNumber64 {
+	nextSequenceNumber := ipPath.SequenceNumber + uint32(len(sendPacket.payload))
+	// strict signed-delta > 0 mirrors updateSequence; treating equality as
+	// "can update" would let identical retransmits pass the gate even though
+	// updateSequence won't advance state, defeating TcpCollapsePrevention.
+	if 0 < int32(nextSequenceNumber-self.sequenceNumber) {
 		return true
 	}
 
@@ -1783,10 +1784,22 @@ func newMultiClientChannelUpdateRace(ctx context.Context) *multiClientChannelUpd
 
 func (self *multiClientChannelUpdateRace) Close() {
 	self.cancel()
-	// for _, state := range self.clientStates {
-	// 	state.packets = nil
-	// }
-	// clear(self.clientStates)
+	// return any still-pooled packets that no other path has claimed.
+	// the Pooled flag is the single-owner marker: paths that consume a
+	// receivePacket (race-buffer-exceeded in clientReceivePacket, the
+	// scheduleCompleteRace winner/abandoned drains) set Pooled=false
+	// before appending to their own return list. anything still
+	// Pooled=true here was abandoned without a cleanup pass.
+	for _, state := range self.clientStates {
+		for _, p := range state.packets {
+			if p.Pooled {
+				p.Pooled = false
+				MessagePoolReturn(p.Packet)
+			}
+		}
+		state.packets = nil
+	}
+	clear(self.clientStates)
 }
 
 type multiClientChannelRaceClientState struct {
@@ -3604,6 +3617,10 @@ func (self *multiClientChannel) Cancel() {
 	self.addError(errors.New("Done."))
 	self.cancel()
 	self.client.Cancel()
+	// unsubscribe even on Cancel so the underlying Client's callback list
+	// doesn't retain a dangling reference for channels that are shuffled out
+	// without ever going through Close. unsub is idempotent.
+	self.clientReceiveUnsub()
 }
 
 func (self *multiClientChannel) Close() {

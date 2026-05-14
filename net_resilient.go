@@ -32,6 +32,7 @@ import (
 	// "syscall"
 
 	mathrand "math/rand"
+	"sync"
 	// "golang.org/x/crypto/cryptobyte"
 	// "golang.org/x/net/idna"
 	// "google.golang.org/protobuf/proto"
@@ -103,7 +104,9 @@ type ResilientTlsConn struct {
 	fragment bool
 	reorder  bool
 	buffer   []byte
-	enabled  bool
+
+	stateLock sync.Mutex
+	enabled   bool
 }
 
 // must be created before the tls connection starts
@@ -118,12 +121,20 @@ func NewResilientTlsConn(conn net.Conn, fragment bool, reorder bool) *ResilientT
 }
 
 func (self *ResilientTlsConn) Off() {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
 	// can't turn back on after off because we don't know where to align the tls header
 	self.enabled = false
 }
 
+func (self *ResilientTlsConn) Enabled() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.enabled
+}
+
 func (self *ResilientTlsConn) Write(b []byte) (int, error) {
-	if self.enabled {
+	if self.Enabled() {
 		self.buffer = append(self.buffer, b...)
 		for 5 <= len(self.buffer) {
 			tlsHeader := parseTlsHeader(self.buffer[0:5])
@@ -137,8 +148,21 @@ func (self *ResilientTlsConn) Write(b []byte) (int, error) {
 						// for each fragment, alternate the ttl of the connection to force retransmits and out-of-order arrival
 
 						// initialSplitLen := mathrand.Intn((meta.ServerNameValueEnd+meta.ServerNameValueStart)/2-meta.ServerNameValueStart)
-						split := meta.ServerNameValueStart + mathrand.Intn((meta.ServerNameValueEnd+meta.ServerNameValueStart)/2-meta.ServerNameValueStart)
-						step := 1 + mathrand.Intn(meta.ServerNameValueEnd-split)
+						// guard mathrand.Intn against zero/negative bounds (very short ServerName values panic Intn)
+						splitRangeMid := (meta.ServerNameValueEnd + meta.ServerNameValueStart) / 2
+						splitRange := splitRangeMid - meta.ServerNameValueStart
+						stepRange := meta.ServerNameValueEnd - (meta.ServerNameValueStart + splitRange)
+						if splitRange <= 0 || stepRange <= 0 {
+							// the server name is too short to fragment;
+							// fall back to a single write
+							if _, err := self.conn.Write(tlsHeader.reconstruct(handshakeBytes)); err != nil {
+								return 0, err
+							}
+							self.buffer = self.buffer[5+tlsHeader.contentLength:]
+							continue
+						}
+						split := meta.ServerNameValueStart + mathrand.Intn(splitRange)
+						step := 1 + mathrand.Intn(stepRange)
 						blockSize := 64
 
 						if tcpConn, ok := self.conn.(*net.TCPConn); ok {
@@ -146,10 +170,23 @@ func (self *ResilientTlsConn) Write(b []byte) (int, error) {
 							if self.fragment && self.reorder {
 								tcpConn.SetNoDelay(true)
 
-								f, _ := tcpConn.File()
+								f, err := tcpConn.File()
+								if err != nil {
+									return 0, err
+								}
 								fd := SocketHandle(f.Fd())
+								defer f.Close()
 
 								nativeTtl := GetSocketTtl(fd)
+								if nativeTtl <= 0 {
+									// syscall failed or returned a value we can't safely restore
+									// (setting back to 0 would drop all packets at the first hop)
+									if _, err := tcpConn.Write(tlsHeader.reconstruct(handshakeBytes)); err != nil {
+										return 0, err
+									}
+									self.buffer = self.buffer[5+tlsHeader.contentLength:]
+									continue
+								}
 
 								// fmt.Printf("native ttl=%d, server name start=%d, end=%d\n", nativeTtl, meta.ServerNameValueStart, meta.ServerNameValueEnd)
 
@@ -201,10 +238,22 @@ func (self *ResilientTlsConn) Write(b []byte) (int, error) {
 
 								tcpConn.SetNoDelay(true)
 
-								f, _ := tcpConn.File()
+								f, err := tcpConn.File()
+								if err != nil {
+									return 0, err
+								}
 								fd := SocketHandle(f.Fd())
+								defer f.Close()
 
 								nativeTtl := GetSocketTtl(fd)
+								if nativeTtl <= 0 {
+									// syscall failed; fall back to a single write
+									if _, err := tcpConn.Write(tlsBytes); err != nil {
+										return 0, err
+									}
+									self.buffer = self.buffer[5+tlsHeader.contentLength:]
+									continue
+								}
 
 								for i := 0; i*blockSize < len(tlsBytes); i += 1 {
 									var ttl int

@@ -746,17 +746,19 @@ func (self *Client) run() {
 			case <-self.ctx.Done():
 				return
 			case sendPack := <-self.loopback:
-				HandleError(func() {
-					self.receive(
-						SourceId(self.clientId),
-						[]*protocol.Frame{sendPack.Frame},
-						protocol.ProvideMode_Network,
-					)
-					sendPack.AckCallback(nil)
-					MessagePoolReturn(sendPack.Frame.MessageBytes)
-				}, func(err error) {
-					sendPack.AckCallback(err)
-				})
+				func() {
+					defer MessagePoolReturn(sendPack.Frame.MessageBytes)
+					HandleError(func() {
+						self.receive(
+							SourceId(self.clientId),
+							[]*protocol.Frame{sendPack.Frame},
+							protocol.ProvideMode_Network,
+						)
+						sendPack.AckCallback(nil)
+					}, func(err error) {
+						sendPack.AckCallback(err)
+					})
+				}()
 			}
 		}
 	}, self.cancel)
@@ -1078,7 +1080,7 @@ func (self *SendBuffer) Pack(sendPack *SendPack, timeout time.Duration) (bool, e
 				return sendSequence
 			} else {
 				sendSequence.Cancel()
-				// delete(self.sendSequences, sendSequenceId)
+				delete(self.sendSequences, sendSequenceId)
 			}
 		}
 		sendSequence = NewSendSequence(
@@ -1156,7 +1158,6 @@ func (self *SendBuffer) Ack(destination TransferPath, ack *protocol.Ack, timeout
 		if success, err := seq.Ack(ack, timeout); success && err == nil {
 			anySuccess = true
 		}
-		break
 	}
 	if !anyFound {
 		glog.V(1).Infof("[sb]ack miss sequence does not exist %s\n", destination)
@@ -2113,7 +2114,9 @@ func (self *SendSequence) receiveAck(messageId Id, selective bool, tag *protocol
 		if removed == nil {
 			panic(errors.New("Missing item"))
 		}
-		item.resendTime = time.Now().Add(self.sendBufferSettings.SelectiveAckTimeout)
+		// refresh sendTime so the ack-timeout deadline includes the selective-ack window
+		item.sendTime = time.Now()
+		item.resendTime = item.sendTime.Add(self.sendBufferSettings.SelectiveAckTimeout)
 		self.resendQueue.Add(item)
 		return
 	}
@@ -2925,6 +2928,7 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 		self.peerAudit.Update(func(a *PeerAudit) {
 			a.resend(removedItem.messageByteCount)
 		})
+		removedItem.messagePoolReturn()
 	}
 
 	// replace with the latest value (check both messageId and sequenceNumber)
@@ -2932,6 +2936,7 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 		self.peerAudit.Update(func(a *PeerAudit) {
 			a.resend(removedItem.messageByteCount)
 		})
+		removedItem.messagePoolReturn()
 	}
 
 	if sequenceNumber <= self.nextSequenceNumber {

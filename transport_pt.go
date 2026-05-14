@@ -152,9 +152,9 @@ func NewPacketTranslationWithPrefix(
 		packetConn:   packetConn,
 		headerPrefix: headerPrefix,
 		settings:     settings,
-		in:           make(chan *packet),
-		out:          make(chan *packet),
-		forward:      make(chan *packet),
+		in:           make(chan *packet, settings.SequenceBufferSize),
+		out:          make(chan *packet, settings.SequenceBufferSize),
+		forward:      make(chan *packet, settings.SequenceBufferSize),
 	}
 
 	switch ptMode {
@@ -495,10 +495,38 @@ func (self *packetTranslation) decodeDns() {
 	readPipeline := make(chan *readData, self.settings.SequenceBufferSize)
 	pumpPipeline := make(chan *pumpItem, self.settings.SequenceBufferSize)
 
+	defer func() {
+		// the goroutines below see ctx.Done() and exit; drain any
+		// queued readData items so their pooled bytes are returned.
+		// (producer-consumer race may leak at most one item per goroutine
+		// after this drain, which is acceptable.)
+		for {
+			select {
+			case r, ok := <-readPipeline:
+				if !ok {
+					return
+				}
+				MessagePoolReturn(r.data)
+			default:
+				return
+			}
+		}
+	}()
+
 	go HandleError(func() {
 		defer self.cancel()
 
 		dnsCombineQueue := newCombineQueue(self.settings)
+		defer func() {
+			// release any partially-assembled packets when the consumer exits
+			for _, item := range dnsCombineQueue.orderedItems {
+				for _, p := range item.packets {
+					if p != nil {
+						MessagePoolReturn(p.data)
+					}
+				}
+			}
+		}()
 
 		for {
 			select {

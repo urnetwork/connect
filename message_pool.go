@@ -391,11 +391,15 @@ func MessagePoolReturn(message []byte) bool {
 
 				count := binary.BigEndian.Uint16(poolMessage[pool.size+10:])
 				if count == 0 {
-					if debugTags {
-						err := fmt.Errorf("[mp]return message[%d] not taken", id)
-						glog.Errorf("[mp]%s", ErrorJson(err, debug.Stack()))
-					}
+					// double-return: log unconditionally so production sees it
+					err := fmt.Errorf("[mp]return message[%d] not taken", id)
+					glog.Errorf("[mp]%s", ErrorJson(err, debug.Stack()))
 				} else if count == 1 {
+					// reset metadata under the lock so a concurrent Share sees
+					// count==0 and bails before the buffer reaches the freelist
+					poolMessage[pool.size+8] = 0
+					poolMessage[pool.size+9] = 0
+					binary.BigEndian.PutUint16(poolMessage[pool.size+10:], 0)
 					r = true
 					pool.returnedTags[tag] += 1
 				} else {
@@ -404,9 +408,6 @@ func MessagePoolReturn(message []byte) bool {
 			}()
 
 			if r {
-				poolMessage[pool.size+8] = 0
-				poolMessage[pool.size+9] = 0
-				binary.BigEndian.PutUint16(poolMessage[pool.size+10:], 0)
 				pool.Put(poolMessage)
 				return true
 			}
@@ -491,6 +492,12 @@ func ProtoMarshalWithTag(m proto.Message, tag uint8) ([]byte, error) {
 	if err != nil {
 		MessagePoolReturn(buf)
 		return nil, err
+	}
+	// if proto.Size underestimated, MarshalAppend may have allocated a fresh
+	// slice; the pool buffer is then orphaned and must be returned to balance
+	// the Get above. detected by a cap change (append only grows cap).
+	if cap(out) != cap(buf) {
+		MessagePoolReturn(buf)
 	}
 	return out, nil
 }
