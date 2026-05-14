@@ -44,7 +44,10 @@ func (self *Monitor) NotifyAll() chan struct{} {
 // makes a copy of the list on update
 type CallbackList[T any] struct {
 	mutex sync.Mutex
-	// `callbacks` and `callbackIds` are parallel arrays
+	// `callbacks` and `callbackIds` are parallel arrays.
+	// `callbackIds` is kept sorted ascending because `Add` always appends
+	// `nextCallbackId` which is monotonically increasing. `Remove` relies on
+	// this invariant to use `slices.BinarySearch`.
 	callbacks      []T
 	callbackIds    []int
 	nextCallbackId int
@@ -165,6 +168,9 @@ func (self *IdleCondition) UpdateOpen() bool {
 func (self *IdleCondition) UpdateClose() {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
+	if self.updateOpenCount <= 0 {
+		panic("IdleCondition.UpdateClose underflow: called more times than UpdateOpen")
+	}
 	self.updateOpenCount -= 1
 	self.condition.Signal()
 }
@@ -222,6 +228,14 @@ func (self *Event) WaitForSet(timeout time.Duration) bool {
 	}
 }
 
+// SetOnSignals registers the Event to be Set when any of signalValues is
+// received. The returned cleanup function unregisters the handler.
+//
+// Side effect: if the spawned watcher goroutine panics, it will call Set()
+// as part of its panic recovery. Callers should be aware that any
+// unexpected failure in the signal-watcher will fire the Event, since the
+// safest assumption on panic is that we should treat the program as
+// shutting down.
 func (self *Event) SetOnSignals(signalValues ...syscall.Signal) func() {
 	stopSignal := make(chan os.Signal, len(signalValues))
 	for _, signalValue := range signalValues {

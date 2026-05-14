@@ -28,11 +28,12 @@ const ReadyHeader = "rdy"
 
 func DefaultP2pTransportSettings() *P2pTransportSettings {
 	return &P2pTransportSettings{
-		WriteTimeout:     15 * time.Second,
-		ReadTimeout:      15 * time.Second,
-		ConnectTimeout:   15 * time.Second,
-		ReconnectTimeout: 5 * time.Second,
-		FramerSettings:   DefaultFramerSettings(),
+		WriteTimeout:      15 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		ConnectTimeout:    15 * time.Second,
+		ReconnectTimeout:  5 * time.Second,
+		ChannelBufferSize: 32,
+		FramerSettings:    DefaultFramerSettings(),
 	}
 }
 
@@ -46,11 +47,12 @@ const (
 )
 
 type P2pTransportSettings struct {
-	WriteTimeout     time.Duration
-	ReadTimeout      time.Duration
-	ConnectTimeout   time.Duration
-	ReconnectTimeout time.Duration
-	FramerSettings   *FramerSettings
+	WriteTimeout      time.Duration
+	ReadTimeout       time.Duration
+	ConnectTimeout    time.Duration
+	ReconnectTimeout  time.Duration
+	ChannelBufferSize int
+	FramerSettings    *FramerSettings
 }
 
 type P2pTransport struct {
@@ -96,7 +98,7 @@ func NewP2pTransport(
 		peerType:            peerType,
 		settings:            settings,
 	}
-	HandleError(p2pTransport.run)
+	go HandleError(p2pTransport.run, cancel)
 	return p2pTransport
 }
 
@@ -129,6 +131,12 @@ func (self *P2pTransport) run() {
 			continue
 		}
 
+		// capture the immediate-reconnect signal BEFORE c() runs so it
+		// observes any NotifyAll fired during c(); the underlying Monitor
+		// returns a fresh (non-firing) channel after NotifyAll, so a late
+		// capture would miss the signal.
+		immediateReconnect := conn.ImmediateReconnect()
+
 		// at this point, the connection should be able to ping the other side
 		// now we wait for the entire stream to be ready by propagating the `ReaderHeader`
 		c := func() {
@@ -138,7 +146,7 @@ func (self *P2pTransport) run() {
 			defer handleCancel()
 
 			go HandleError(func() {
-				defer self.cancel()
+				defer handleCancel()
 
 				conn.SetReadDeadline(time.Now().Add(self.settings.ConnectTimeout))
 				_, err := conn.Write([]byte(ReadyHeader))
@@ -164,10 +172,10 @@ func (self *P2pTransport) run() {
 				case <-handleCtx.Done():
 					return
 				}
-			}, self.cancel)
+			}, handleCancel)
 
 			go HandleError(func() {
-				defer self.cancel()
+				defer handleCancel()
 
 				select {
 				case <-handleCtx.Done():
@@ -189,9 +197,9 @@ func (self *P2pTransport) run() {
 
 				updateRoute := func(connected bool) {
 					if connected {
-						self.receiveRouteManager.UpdateTransport(t, []Route{route})
+						self.sendRouteManager.UpdateTransport(t, []Route{route})
 					} else {
-						self.receiveRouteManager.RemoveTransport(t)
+						self.sendRouteManager.RemoveTransport(t)
 					}
 				}
 				unsub := conn.AddConnectedCallback(updateRoute)
@@ -203,7 +211,7 @@ func (self *P2pTransport) run() {
 				case <-handleCtx.Done():
 					return
 				}
-			}, self.cancel)
+			}, handleCancel)
 
 			select {
 			case <-handleCtx.Done():
@@ -215,6 +223,8 @@ func (self *P2pTransport) run() {
 		select {
 		case <-self.ctx.Done():
 			return
+		case <-immediateReconnect:
+			// peer requested fresh negotiation; skip the backoff delay
 		case <-reconnect.After():
 		}
 	}
@@ -239,7 +249,7 @@ func NewP2pSendTransport(
 	streamId Id,
 	settings *P2pTransportSettings,
 ) (Transport, Route) {
-	send := make(chan []byte)
+	send := make(chan []byte, settings.ChannelBufferSize)
 	p2pSendTransport := &P2pSendTransport{
 		transportId: NewId(),
 		ctx:         ctx,
@@ -255,6 +265,22 @@ func NewP2pSendTransport(
 
 func (self *P2pSendTransport) run() {
 	defer self.cancel()
+	// drain any pooled bytes the route manager already enqueued; the route
+	// manager removes the transport asynchronously, so a brief window remains
+	// where it may have written and the writer never consumed.
+	defer func() {
+		for {
+			select {
+			case b, ok := <-self.send:
+				if !ok {
+					return
+				}
+				MessagePoolReturn(b)
+			default:
+				return
+			}
+		}
+	}()
 
 	framer := NewFramer(self.settings.FramerSettings)
 
@@ -334,7 +360,7 @@ func NewP2pReceiveTransport(
 	streamId Id,
 	settings *P2pTransportSettings,
 ) (Transport, Route) {
-	receive := make(chan []byte)
+	receive := make(chan []byte, settings.ChannelBufferSize)
 	p2pReceiveTransport := &P2pReceiveTransport{
 		transportId: NewId(),
 		ctx:         ctx,
@@ -350,6 +376,21 @@ func NewP2pReceiveTransport(
 
 func (self *P2pReceiveTransport) run() {
 	defer self.cancel()
+	// drain any pooled bytes we wrote that the route manager hasn't consumed
+	// yet at shutdown.
+	defer func() {
+		for {
+			select {
+			case b, ok := <-self.receive:
+				if !ok {
+					return
+				}
+				MessagePoolReturn(b)
+			default:
+				return
+			}
+		}
+	}()
 
 	framer := NewFramer(self.settings.FramerSettings)
 

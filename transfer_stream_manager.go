@@ -109,7 +109,9 @@ func (self *StreamManager) handleControlFrame(frame *protocol.Frame) error {
 					return err
 				}
 
-				self.streamBuffer.OpenStream(sourceId, destinationId, streamId)
+				if _, err := self.streamBuffer.OpenStream(sourceId, destinationId, streamId); err != nil {
+					return err
+				}
 				return nil
 			}
 

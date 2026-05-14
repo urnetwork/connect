@@ -344,6 +344,9 @@ func (self *LocalUserNat) Run() {
 					// no support for this protocol, drop
 					MessagePoolReturn(ipPacket)
 				}
+			default:
+				// unknown IP version, drop
+				MessagePoolReturn(ipPacket)
 			}
 		}
 	}
@@ -571,6 +574,12 @@ func (self *UdpBuffer[BufferId]) udpSend(
 			self.udpBufferSettings,
 		)
 		self.sequences[bufferId] = sequence
+		sourceSequences := self.sourceSequences[source]
+		if sourceSequences == nil {
+			sourceSequences = map[BufferId]*UdpSequence{}
+			self.sourceSequences[source] = sourceSequences
+		}
+		sourceSequences[bufferId] = sequence
 		go HandleError(func() {
 			defer func() {
 				self.mutex.Lock()
@@ -824,6 +833,8 @@ func (self *UdpSequence) Run() {
 		defer func() {
 			for {
 				select {
+				case <-self.ctx.Done():
+					return
 				case packet, ok := <-readPackets:
 					if !ok {
 						return
@@ -1215,6 +1226,7 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 				if 0 == len(sourceSequences) {
 					delete(self.sourceSequences, sequence.source)
 				}
+				MessagePoolReturn(ipPacket)
 				return nil
 			}
 			return sequence
@@ -1277,6 +1289,12 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 			self.tcpBufferSettings,
 		)
 		self.sequences[bufferId] = sequence
+		sourceSequences := self.sourceSequences[source]
+		if sourceSequences == nil {
+			sourceSequences = map[BufferId]*TcpSequence{}
+			self.sourceSequences[source] = sourceSequences
+		}
+		sourceSequences[bufferId] = sequence
 		go HandleError(func() {
 			defer func() {
 				self.mutex.Lock()
@@ -1671,6 +1689,8 @@ func (self *TcpSequence) Run() {
 		defer func() {
 			for {
 				select {
+				case <-self.ctx.Done():
+					return
 				case packet, ok := <-readPackets:
 					if !ok {
 						return
@@ -1922,17 +1942,19 @@ func (self *TcpSequence) Run() {
 				self.mutex.Lock()
 				defer self.mutex.Unlock()
 
-				if self.sendSeq != sendItem.tcp.Seq || sendItem.tcp.SYN {
-					// a retransmit
-					// since the transfer from local to remote is lossless and preserves order,
-					// the packet is already pending. Ignore.
+				// signed-delta comparisons are wraparound-tolerant across the
+				// 4 GB uint32 boundary. since the transfer from local to remote
+				// is lossless and preserves order, any seq other than the
+				// exact expected sendSeq must be a retransmit.
+				if int32(sendItem.tcp.Seq-self.sendSeq) != 0 || sendItem.tcp.SYN {
+					// a retransmit; ignore
 					drop = true
 				} else if sendItem.tcp.ACK {
-					// acks are reliably delivered (see above)
-					// we do not need to resend receive packets on missing acks
-					// note the window size can be be adjusted at any time for the same receive seq number,
-					// e.g. ->0 then ->full on receiver full
-					if self.receiveSeqAck <= sendItem.tcp.Ack {
+					// acks are reliably delivered (see above).
+					// note the window size can be adjusted at any time for the same
+					// receive seq number, e.g. ->0 then ->full on receiver full.
+					// use signed delta so wrapped ack numbers compare correctly.
+					if 0 <= int32(sendItem.tcp.Ack-self.receiveSeqAck) {
 						self.receiveWindowSize = uint32(sendItem.tcp.Window) << self.receiveWindowScale
 						self.receiveSeqAck = sendItem.tcp.Ack
 						receiveAckCond.Broadcast()

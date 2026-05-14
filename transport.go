@@ -146,7 +146,7 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		PingTimeout:          5 * time.Second,
 		WriteTimeout:         10 * time.Second,
 		ReadTimeout:          30 * time.Second,
-		TransportBufferSize:  1,
+		TransportBufferSize:  32,
 		InactiveDrainTimeout: 30 * time.Second,
 		ModeInitialDelay:     2 * time.Second,
 		// MinConnectDelay:      0,
@@ -573,9 +573,22 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			self.routeManager.UpdateTransport(sendTransport, []Route{exportedSend})
 			self.routeManager.UpdateTransport(receiveTransport, []Route{receive})
 
+			// scoped to the writer goroutine; canceled when it exits so the
+			// outer defer can drain `send` without racing the writer.
+			writerCtx, writerCancel := context.WithCancel(context.Background())
 			defer func() {
 				self.routeManager.RemoveTransport(sendTransport)
 				self.routeManager.RemoveTransport(receiveTransport)
+				handleCancel()
+				// once the writer has exited and no new writes can be routed,
+				// drain any pooled messages still sitting in send. a stale
+				// reflect.Select in MultiRouteSelector that captured our
+				// route snapshot may still resolve after RemoveTransport;
+				// drain again briefly to catch any final messages.
+				<-writerCtx.Done()
+				drain(send)
+				time.Sleep(time.Millisecond)
+				drain(send)
 			}()
 
 			go HandleError(func() {
@@ -607,6 +620,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			}, handleCancel)
 
 			go HandleError(func() {
+				defer writerCancel()
 				defer handleCancel()
 
 				speedTest := false
@@ -628,6 +642,10 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 				for {
 					if speedTest {
+						// during speed test, continue draining user traffic
+						// so the route manager does not back up. mixing user
+						// traffic with the speed-test echo slightly reduces
+						// measurement accuracy but avoids stalling the client.
 						select {
 						case <-handleCtx.Done():
 							return
@@ -650,6 +668,16 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							if write(message) != nil {
 								return
 							}
+						case message, ok := <-send:
+							if !ok {
+								return
+							}
+							if len(message) <= 16 {
+								glog.Infof("[ts]send message must be >16 bytes (%d)\n", len(message))
+								MessagePoolReturn(message)
+							} else if write(message) != nil {
+								return
+							}
 						}
 					} else {
 						select {
@@ -664,7 +692,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							// }
 
 							if len(message) <= 16 {
-								glog.Infof("[ts]send message must be >16 bytes (%s)\n", len(message))
+								glog.Infof("[ts]send message must be >16 bytes (%d)\n", len(message))
 								MessagePoolReturn(message)
 							} else if write(message) != nil {
 								return
@@ -741,16 +769,18 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 									speedTest = true
 									// echo
 									select {
-									case <-self.ctx.Done():
+									case <-handleCtx.Done():
 										MessagePoolReturn(message)
+										return
 									case controlSend <- message:
 									}
 								case TransportControlSpeedStop:
 									speedTest = false
 									// echo
 									select {
-									case <-self.ctx.Done():
+									case <-handleCtx.Done():
 										MessagePoolReturn(message)
+										return
 									case controlSend <- message:
 									}
 								default:
@@ -759,8 +789,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							} else if len(message) == 16 {
 								// latency test echo
 								select {
-								case <-self.ctx.Done():
+								case <-handleCtx.Done():
 									MessagePoolReturn(message)
+									return
 								case controlSend <- message:
 								}
 							} else {
@@ -771,8 +802,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						if speedTest {
 							// speed test echo
 							select {
-							case <-self.ctx.Done():
+							case <-handleCtx.Done():
 								MessagePoolReturn(message)
+								return
 							case controlSend <- message:
 							}
 							continue
@@ -846,6 +878,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 	if err != nil {
 		return
 	}
+	defer MessagePoolReturn(authBytes)
 
 	if 0 < initialTimeout {
 		select {
@@ -909,16 +942,21 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			if err != nil {
 				return nil, err
 			}
+			// single close path: once packetConn is bound (either directly
+			// to udpConn or wrapping it via packetTranslation), it owns the
+			// close. before that, we close udpConn directly. avoids the
+			// double-close on udpConn when packetConn == udpConn or when
+			// packetTranslation.Close closes its inner udpConn.
 			defer func() {
-				if !success {
+				if success {
+					return
+				}
+				if packetConn != nil {
+					packetConn.Close()
+				} else {
 					udpConn.Close()
 				}
 			}()
-
-			// udpAddr, err := net.ResolveUDPAddr("udp", addr)
-			// if err != nil {
-			// 	return nil, err
-			// }
 
 			serverName, err := connectHost(self.platformUrl)
 			if err != nil {
@@ -929,6 +967,9 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			case TransportModeH3Dns:
 				tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
 				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", serverName, self.settings.DnsPort))
+				if err != nil {
+					return nil, err
+				}
 				ptSettings := DefaultPacketTranslationSettings()
 				ptSettings.DnsTlds = [][]byte{tld}
 				packetConn, err = NewPacketTranslation(self.ctx, PacketTranslationModeDns, udpConn, ptSettings)
@@ -942,6 +983,9 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 					return nil, err
 				}
 				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", pumpServerName, self.settings.DnsPort))
+				if err != nil {
+					return nil, err
+				}
 				ptSettings := DefaultPacketTranslationSettings()
 				ptSettings.DnsTlds = [][]byte{tld}
 				packetConn, err = NewPacketTranslation(self.ctx, PacketTranslationModeDnsPump, udpConn, ptSettings)
@@ -955,12 +999,6 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				}
 				packetConn = udpConn
 			}
-
-			defer func() {
-				if !success {
-					packetConn.Close()
-				}
-			}()
 
 			glog.Infof("[c]h3 connect to %v (%s)\n", udpAddr, serverName)
 
@@ -1000,7 +1038,9 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				return nil, err
 			} else {
 				// verify the auth echo
-				if !bytes.Equal(authBytes, message) {
+				equal := bytes.Equal(authBytes, message)
+				MessagePoolReturn(message)
+				if !equal {
 					return nil, fmt.Errorf("Auth response error: bad bytes.")
 				}
 			}
@@ -1010,6 +1050,14 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				conn:   conn,
 				stream: stream,
 			}, nil
+		}
+
+		if connectDelay := self.clientStrategy.NextConnectTime().Sub(time.Now()); 0 < connectDelay {
+			select {
+			case <-self.ctx.Done():
+				return
+			case <-time.After(connectDelay):
+			}
 		}
 
 		var connStream *ConnStream
@@ -1048,6 +1096,20 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			send := make(chan []byte, self.settings.TransportBufferSize)
 			receive := make(chan []byte, self.settings.TransportBufferSize)
 
+			drain := func(c chan []byte) {
+				for {
+					select {
+					case message, ok := <-c:
+						if !ok {
+							return
+						}
+						MessagePoolReturn(message)
+					default:
+						return
+					}
+				}
+			}
+
 			// the platform can route any destination,
 			// since every client has a platform transport
 			var sendTransport Transport
@@ -1062,12 +1124,22 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			self.routeManager.UpdateTransport(sendTransport, []Route{send})
 			self.routeManager.UpdateTransport(receiveTransport, []Route{receive})
 
+			// scoped to the writer goroutine; canceled when it exits so the
+			// outer defer can drain `send` without racing the writer.
+			h3WriterCtx, h3WriterCancel := context.WithCancel(context.Background())
 			defer func() {
 				self.routeManager.RemoveTransport(sendTransport)
 				self.routeManager.RemoveTransport(receiveTransport)
-
-				// note `send` is not closed. This channel is left open.
-				// it used to be closed after a delay, but it is not needed to close it.
+				handleCancel()
+				// note `send` is not closed. drain any pooled bytes still
+				// queued after the writer exits and RemoveTransport has
+				// stopped new route writes. a stale reflect.Select may
+				// still resolve after RemoveTransport; drain again briefly
+				// to catch any final messages.
+				<-h3WriterCtx.Done()
+				drain(send)
+				time.Sleep(time.Millisecond)
+				drain(send)
 			}()
 
 			go HandleError(func() {
@@ -1099,6 +1171,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			}, handleCancel)
 
 			go HandleError(func() {
+				defer h3WriterCancel()
 				defer handleCancel()
 
 				for {

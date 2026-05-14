@@ -106,7 +106,7 @@ func (self *signalPipe) SignalReceiver() SignalReceiver {
 	return self.signalReceiver
 }
 
-func (self *signalPipe) SendSignal(path TransferPath, signal *protocol.Frame) {
+func (self *signalPipe) SendSignal(path TransferPath, signal *protocol.Frame, opts ...any) {
 	signalReceiver := self.SignalReceiver()
 	if signalReceiver != nil {
 		fmt.Printf("[signal]%s (%s)\n", path, signal.MessageType)
