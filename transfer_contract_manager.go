@@ -206,6 +206,8 @@ func DefaultContractManagerSettingsWithBufferSize(bufferSize int) *ContractManag
 
 		ContractQueueExpireTimeout: 120 * time.Second,
 
+		CreateContractOobErrorBackoff: time.Minute,
+
 		ProtocolVersion: DefaultProtocolVersion,
 
 		// TODO remove
@@ -259,6 +261,10 @@ type ContractManagerSettings struct {
 	// window (5 minutes). <= 0 disables expiry.
 	ContractQueueExpireTimeout time.Duration
 
+	// back off create-contract OOB API calls after an OOB error to avoid
+	// repeatedly hitting the API while it is timing out or unavailable.
+	CreateContractOobErrorBackoff time.Duration
+
 	ProtocolVersion int
 
 	// TODO remove
@@ -299,10 +305,34 @@ type ContractManager struct {
 
 	controlSyncProvide    *ControlSync
 	controlSyncProvideOob *ControlSyncOob
+
+	createContractOobErrorBackoffUntil time.Time
 }
 
 func NewContractManagerWithDefaults(ctx context.Context, client *Client) *ContractManager {
 	return NewContractManager(ctx, client, DefaultContractManagerSettings())
+}
+
+func (self *ContractManager) createContractOobErrorBackoffActive() bool {
+	if self.settings.CreateContractOobErrorBackoff <= 0 {
+		return false
+	}
+
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+
+	return time.Now().Before(self.createContractOobErrorBackoffUntil)
+}
+
+func (self *ContractManager) markCreateContractOobError() {
+	if self.settings.CreateContractOobErrorBackoff <= 0 {
+		return
+	}
+
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+
+	self.createContractOobErrorBackoffUntil = time.Now().Add(self.settings.CreateContractOobErrorBackoff)
 }
 
 func NewContractManager(
@@ -1055,6 +1085,10 @@ func (self *ContractManager) addContract(contractKey ContractKey, contract *prot
 }
 
 func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeqIndex uint64, minByteCount ByteCount) {
+	if self.createContractOobErrorBackoffActive() {
+		return
+	}
+
 	// look at destinationContracts and last contract to get previous contract id
 	contractQueue := self.openContractQueue(contractKey)
 	defer self.closeContractQueue(contractKey)
@@ -1092,7 +1126,8 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 				case <-self.client.Done():
 					// no need to log warnings when the client closes
 				default:
-					self.client.log.Infof("[contract]oob err = %s\n", err)
+					self.markCreateContractOobError()
+					self.client.log.Infof("[contract]oob err = %s; backing off create contract OOB requests for %s\n", err, self.settings.CreateContractOobErrorBackoff)
 				}
 			}
 		},
