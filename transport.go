@@ -392,6 +392,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		}
 	}
 
+	authErrLogged := false
 	for {
 		// wait until we are back in h1 or worse
 		func() {
@@ -482,7 +483,12 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			ws, err = connect()
 		}
 		if err != nil {
-			glog.Infof("[t]auth error %s = %s\n", clientId, err)
+			if !authErrLogged {
+				glog.Infof("[t]auth error %s = %s\n", clientId, err)
+				authErrLogged = true
+			} else {
+				glog.V(1).Infof("[t]auth error %s = %s\n", clientId, err)
+			}
 			select {
 			case <-self.ctx.Done():
 				return
@@ -490,6 +496,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				continue
 			}
 		}
+		authErrLogged = false
 
 		c := func() {
 			defer ws.Close()
@@ -855,6 +862,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 		}
 	}
 
+	authErrLogged := false
 	for {
 		// wait until we are back in the specific pt mode or auto mode
 		func() {
@@ -1020,7 +1028,12 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			connStream, err = connect()
 		}
 		if err != nil {
-			glog.Infof("[t]auth error %s = %s\n", clientId, err)
+			if !authErrLogged {
+				glog.Infof("[t]auth error %s = %s\n", clientId, err)
+				authErrLogged = true
+			} else {
+				glog.V(1).Infof("[t]auth error %s = %s\n", clientId, err)
+			}
 			select {
 			case <-self.ctx.Done():
 				return
@@ -1028,6 +1041,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				continue
 			}
 		}
+		authErrLogged = false
 		conn := connStream.conn
 		stream := connStream.stream
 

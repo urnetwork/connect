@@ -77,10 +77,51 @@ func (self *ContractManagerStats) ContractOpenByteCount() ByteCount {
 	return netContractOpenByteCount
 }
 
+// SignStoredContract returns the HMAC signature for a stored contract using the
+// format appropriate for the current time relative to
+// settings.NetworkEventTimeChangeHmac. Before that time, signers emit the
+// legacy form (`mac.Sum(storedContractBytes)`, which appends a key-only HMAC
+// to the contract bytes). At or after that time, signers emit the standard
+// form (`mac.Write(storedContractBytes); mac.Sum(nil)`).
+//
+// Both connect and server/connect must use this helper so the cutover is
+// consistent across client and server.
+func SignStoredContract(settings *ContractManagerSettings, provideSecretKey []byte, storedContractBytes []byte) []byte {
+	mac := hmac.New(sha256.New, provideSecretKey)
+	if time.Now().Before(settings.NetworkEventTimeChangeHmac) {
+		// legacy: this leaves HMAC(key, "") in the trailing 32 bytes of the
+		// returned slice. preserved for backward compatibility.
+		return mac.Sum(storedContractBytes)
+	}
+	mac.Write(storedContractBytes)
+	return mac.Sum(nil)
+}
+
+// VerifyStoredContract validates a stored-contract HMAC against the provide
+// secret key, accepting both the legacy and standard HMAC formats so that
+// signers may cross over at settings.NetworkEventTimeChangeHmac without
+// breaking compatibility with peers that have not yet cut over.
+func VerifyStoredContract(settings *ContractManagerSettings, provideSecretKey []byte, storedContractBytes []byte, storedContractHmac []byte) bool {
+	legacyMac := hmac.New(sha256.New, provideSecretKey)
+	if hmac.Equal(storedContractHmac, legacyMac.Sum(storedContractBytes)) {
+		return true
+	}
+	standardMac := hmac.New(sha256.New, provideSecretKey)
+	standardMac.Write(storedContractBytes)
+	return hmac.Equal(storedContractHmac, standardMac.Sum(nil))
+}
+
 func DefaultContractManagerSettings() *ContractManagerSettings {
 	// NETWORK EVENT: at the enable contracts date, all clients will require contracts
 	// up to that time, contracts are optional for the sender and match for the receiver
 	networkEventTimeEnableContracts, err := time.Parse(time.RFC3339, "2024-05-01T00:00:00Z")
+	if err != nil {
+		panic(err)
+	}
+	// NETWORK EVENT: at the change-hmac date, signers cut over from the legacy
+	// HMAC format to the standard form. verifiers accept both forms at all
+	// times so the cutover can be deployed asymmetrically.
+	networkEventTimeChangeHmac, err := time.Parse(time.RFC3339, "2026-07-01T00:00:00Z")
 	if err != nil {
 		panic(err)
 	}
@@ -90,8 +131,11 @@ func DefaultContractManagerSettings() *ContractManagerSettings {
 		ContractTransferByteSeqScale:      4,
 
 		NetworkEventTimeEnableContracts: networkEventTimeEnableContracts,
+		NetworkEventTimeChangeHmac:      networkEventTimeChangeHmac,
 
 		ProvidePingTimeout: 0,
+
+		CreateContractOobErrorBackoff: time.Minute,
 
 		ProtocolVersion: DefaultProtocolVersion,
 
@@ -105,6 +149,7 @@ func DefaultContractManagerSettings() *ContractManagerSettings {
 func DefaultContractManagerSettingsNoNetworkEvents() *ContractManagerSettings {
 	settings := DefaultContractManagerSettings()
 	settings.NetworkEventTimeEnableContracts = time.Time{}
+	settings.NetworkEventTimeChangeHmac = time.Time{}
 	return settings
 }
 
@@ -119,8 +164,18 @@ type ContractManagerSettings struct {
 	// this can be removed after wide adoption
 	NetworkEventTimeEnableContracts time.Time
 
+	// cut over the stored-contract HMAC signing format. before this time,
+	// SignStoredContract emits the legacy form (mac.Sum(bytes)); at or after,
+	// it emits the standard form (mac.Write(bytes); mac.Sum(nil)). verifiers
+	// accept both forms at all times.
+	NetworkEventTimeChangeHmac time.Time
+
 	// an active ping to the control fast-tracks any timeouts
 	ProvidePingTimeout time.Duration
+
+	// back off create-contract OOB API calls after an OOB error to avoid
+	// repeatedly hitting the API while it is timing out or unavailable.
+	CreateContractOobErrorBackoff time.Duration
 
 	ProtocolVersion int
 
@@ -161,10 +216,34 @@ type ContractManager struct {
 	localStats *ContractManagerStats
 
 	controlSyncProvide *ControlSync
+
+	createContractOobErrorBackoffUntil time.Time
 }
 
 func NewContractManagerWithDefaults(ctx context.Context, client *Client) *ContractManager {
 	return NewContractManager(ctx, client, DefaultContractManagerSettings())
+}
+
+func (self *ContractManager) createContractOobErrorBackoffActive() bool {
+	if self.settings.CreateContractOobErrorBackoff <= 0 {
+		return false
+	}
+
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+
+	return time.Now().Before(self.createContractOobErrorBackoffUntil)
+}
+
+func (self *ContractManager) markCreateContractOobError() {
+	if self.settings.CreateContractOobErrorBackoff <= 0 {
+		return
+	}
+
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+
+	self.createContractOobErrorBackoffUntil = time.Now().Add(self.settings.CreateContractOobErrorBackoff)
 }
 
 func NewContractManager(
@@ -825,6 +904,10 @@ func (self *ContractManager) addContract(contractKey ContractKey, contract *prot
 }
 
 func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeqIndex uint64, minByteCount ByteCount) {
+	if self.createContractOobErrorBackoffActive() {
+		return
+	}
+
 	// look at destinationContracts and last contract to get previous contract id
 	contractQueue := self.openContractQueue(contractKey)
 	defer self.closeContractQueue(contractKey)
@@ -862,7 +945,8 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 				case <-self.client.Done():
 					// no need to log warnings when the client closes
 				default:
-					glog.Infof("[contract]oob err = %s\n", err)
+					self.markCreateContractOobError()
+					glog.Infof("[contract]oob err = %s; backing off create contract OOB requests for %s\n", err, self.settings.CreateContractOobErrorBackoff)
 				}
 			}
 		},
