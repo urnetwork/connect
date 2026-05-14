@@ -58,7 +58,7 @@ Each transport should apply the forwarding ACL:
 // nacks are sent as ack until the contract is acked
 
 // use 0 for deadlock testing
-const DefaultTransferBufferSize = 16
+const defaultTransferBufferSize = 32
 
 var DebugTransferCopyOnWrite = false
 
@@ -70,15 +70,19 @@ type ReceiveFunction = func(source TransferPath, frames []*protocol.Frame, provi
 type ForwardFunction = func(path TransferPath, transferFrameBytes []byte)
 
 func DefaultClientSettings() *ClientSettings {
+	return DefaultClientSettingsWithBufferSize(defaultTransferBufferSize)
+}
+
+func DefaultClientSettingsWithBufferSize(bufferSize int) *ClientSettings {
 	return &ClientSettings{
-		SendBufferSize:          DefaultTransferBufferSize,
-		ForwardBufferSize:       DefaultTransferBufferSize,
+		SendBufferSize:          bufferSize,
+		ForwardBufferSize:       bufferSize,
 		ReadTimeout:             30 * time.Second,
 		BufferTimeout:           15 * time.Second,
 		ControlPingTimeout:      time.Duration(0),
-		SendBufferSettings:      DefaultSendBufferSettings(),
-		ReceiveBufferSettings:   DefaultReceiveBufferSettings(),
-		ForwardBufferSettings:   DefaultForwardBufferSettings(),
+		SendBufferSettings:      DefaultSendBufferSettingsWithBufferSize(bufferSize),
+		ReceiveBufferSettings:   DefaultReceiveBufferSettingsWithBufferSize(bufferSize),
+		ForwardBufferSettings:   DefaultForwardBufferSettingsWithBufferSize(bufferSize),
 		ContractManagerSettings: DefaultContractManagerSettings(),
 		StreamManagerSettings:   DefaultStreamManagerSettings(),
 		WebRtcSettings:          DefaultWebRtcSettings(),
@@ -94,6 +98,10 @@ func DefaultClientSettingsNoNetworkEvents() *ClientSettings {
 }
 
 func DefaultSendBufferSettings() *SendBufferSettings {
+	return DefaultSendBufferSettingsWithBufferSize(defaultTransferBufferSize)
+}
+
+func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings {
 	return &SendBufferSettings{
 		CreateContractTimeout:       30 * time.Second,
 		CreateContractRetryInterval: 5 * time.Second,
@@ -108,8 +116,8 @@ func DefaultSendBufferSettings() *SendBufferSettings {
 		IdleTimeout:      300 * time.Second,
 		// pause on resend for selectively acked messaged
 		SelectiveAckTimeout: 60 * time.Second,
-		SequenceBufferSize:  DefaultTransferBufferSize,
-		AckBufferSize:       DefaultTransferBufferSize,
+		SequenceBufferSize:  bufferSize,
+		AckBufferSize:       bufferSize,
 		MinMessageByteCount: ByteCount(1),
 		// this includes transport reconnections
 		WriteTimeout:            15 * time.Second,
@@ -120,11 +128,15 @@ func DefaultSendBufferSettings() *SendBufferSettings {
 }
 
 func DefaultReceiveBufferSettings() *ReceiveBufferSettings {
+	return DefaultReceiveBufferSettingsWithBufferSize(defaultTransferBufferSize)
+}
+
+func DefaultReceiveBufferSettingsWithBufferSize(bufferSize int) *ReceiveBufferSettings {
 	return &ReceiveBufferSettings{
 		GapTimeout: 60 * time.Second,
 		// the receive idle timeout should be a bit longer than the send idle timeout
 		IdleTimeout:        120 * time.Second,
-		SequenceBufferSize: DefaultTransferBufferSize,
+		SequenceBufferSize: bufferSize,
 		// AckBufferSize: DefaultTransferBufferSize,
 		AckCompressTimeout:  time.Duration(0),
 		MinMessageByteCount: ByteCount(1),
@@ -141,9 +153,13 @@ func DefaultReceiveBufferSettings() *ReceiveBufferSettings {
 }
 
 func DefaultForwardBufferSettings() *ForwardBufferSettings {
+	return DefaultForwardBufferSettingsWithBufferSize(defaultTransferBufferSize)
+}
+
+func DefaultForwardBufferSettingsWithBufferSize(bufferSize int) *ForwardBufferSettings {
 	return &ForwardBufferSettings{
 		IdleTimeout:        300 * time.Second,
-		SequenceBufferSize: DefaultTransferBufferSize,
+		SequenceBufferSize: bufferSize,
 		WriteTimeout:       15 * time.Second,
 	}
 }
