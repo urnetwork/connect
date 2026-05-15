@@ -235,15 +235,19 @@ func (self *ContractManager) createContractOobErrorBackoffActive() bool {
 	return time.Now().Before(self.createContractOobErrorBackoffUntil)
 }
 
-func (self *ContractManager) markCreateContractOobError() {
+func (self *ContractManager) markCreateContractOobError() bool {
 	if self.settings.CreateContractOobErrorBackoff <= 0 {
-		return
+		return true
 	}
 
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 
+	if time.Now().Before(self.createContractOobErrorBackoffUntil) {
+		return false
+	}
 	self.createContractOobErrorBackoffUntil = time.Now().Add(self.settings.CreateContractOobErrorBackoff)
+	return true
 }
 
 func NewContractManager(
@@ -945,8 +949,9 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 				case <-self.client.Done():
 					// no need to log warnings when the client closes
 				default:
-					self.markCreateContractOobError()
-					glog.Infof("[contract]oob err = %s; backing off create contract OOB requests for %s\n", err, self.settings.CreateContractOobErrorBackoff)
+					if self.markCreateContractOobError() {
+						glog.Infof("[contract]oob err = %s; backing off create contract OOB requests for %s\n", err, self.settings.CreateContractOobErrorBackoff)
+					}
 				}
 			}
 		},
