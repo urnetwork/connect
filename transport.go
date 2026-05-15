@@ -186,6 +186,9 @@ type PlatformTransport struct {
 	availableModes map[TransportMode]bool
 	targetMode     TransportMode
 	mode           TransportMode
+
+	authErrMu      sync.Mutex
+	lastAuthErrLog time.Time
 }
 
 func NewPlatformTransportWithDefaults(
@@ -390,6 +393,16 @@ func isBetterMode(current TransportMode, other TransportMode) bool {
 	return transportModePreferences[current] < transportModePreferences[other]
 }
 
+func (self *PlatformTransport) shouldLogAuthErr() bool {
+	self.authErrMu.Lock()
+	defer self.authErrMu.Unlock()
+	if time.Since(self.lastAuthErrLog) < time.Minute {
+		return false
+	}
+	self.lastAuthErrLog = time.Now()
+	return true
+}
+
 func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 	// connect and update route manager for this transport
 	defer self.cancel()
@@ -495,7 +508,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			ws, err = connect()
 		}
 		if err != nil {
-			if !authErrLogged {
+			if !authErrLogged && self.shouldLogAuthErr() {
 				self.log.Infof("[t]auth error %s = %s\n", clientId, err)
 				authErrLogged = true
 			} else {
@@ -1087,7 +1100,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			connStream, err = connect()
 		}
 		if err != nil {
-			if !authErrLogged {
+			if !authErrLogged && self.shouldLogAuthErr() {
 				self.log.Infof("[t]auth error %s = %s\n", clientId, err)
 				authErrLogged = true
 			} else {
