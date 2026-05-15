@@ -1,10 +1,11 @@
 package connect
 
 import (
+	"context"
 	"iter"
 	"net"
 	"net/netip"
-	"sync"
+	// "sync"
 )
 
 func IpsInNet(ipNet *net.IPNet) iter.Seq[net.IP] {
@@ -57,26 +58,43 @@ func AddrsInPrefix(prefix netip.Prefix) iter.Seq[netip.Addr] {
 	}
 }
 
+// this is safe to share across goroutines
 type AddrGenerator struct {
-	next      func() (netip.Addr, bool)
-	stop      func()
-	stateLock sync.Mutex
+	ctx    context.Context
+	cancel context.CancelFunc
+	prefix netip.Prefix
+	next   chan netip.Addr
 }
 
 func NewAddrGenerator(prefix netip.Prefix) *AddrGenerator {
-	next, stop := iter.Pull(AddrsInPrefix(prefix))
-	return &AddrGenerator{
-		next: next,
-		stop: stop,
+	ctx, cancel := context.WithCancel(context.Background())
+	ag := &AddrGenerator{
+		ctx:    ctx,
+		cancel: cancel,
+		prefix: prefix,
+		next:   make(chan netip.Addr),
+	}
+	go HandleError(ag.run)
+	return ag
+}
+
+func (self *AddrGenerator) run() {
+	defer self.cancel()
+	defer close(self.next)
+	for addr := range AddrsInPrefix(self.prefix) {
+		select {
+		case self.next <- addr:
+		case <-self.ctx.Done():
+			return
+		}
 	}
 }
 
 func (self *AddrGenerator) Next() (netip.Addr, bool) {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
-	return self.next()
+	addr, ok := <-self.next
+	return addr, ok
 }
 
 func (self *AddrGenerator) Close() {
-	self.stop()
+	self.cancel()
 }
