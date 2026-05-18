@@ -33,7 +33,7 @@ import (
 // The UNAT emulates a raw socket using user-space sockets.
 
 // use 0 for deadlock testing
-const DefaultIpBufferSize = 32
+const defaultIpBufferSize = 1024
 
 const DefaultMtu = 1440
 const Ipv4HeaderSizeWithoutExtensions = 20
@@ -64,13 +64,17 @@ type UserNatClient interface {
 }
 
 func DefaultUdpBufferSettings() *UdpBufferSettings {
+	return DefaultUdpBufferSettingsWithBufferSize(defaultIpBufferSize)
+}
+
+func DefaultUdpBufferSettingsWithBufferSize(bufferSize int) *UdpBufferSettings {
 	return &UdpBufferSettings{
 		ReadTimeout:         300 * time.Second,
 		WriteTimeout:        15 * time.Second,
 		IdleTimeout:         300 * time.Second,
 		Mtu:                 DefaultMtu,
 		ReadBufferByteCount: DefaultMtu,
-		SequenceBufferSize:  DefaultIpBufferSize,
+		SequenceBufferSize:  bufferSize,
 		UserLimit:           0,
 		MaxWindowSize:       uint32(mib(1)),
 		ConnectSettings:     *DefaultConnectSettings(),
@@ -78,13 +82,17 @@ func DefaultUdpBufferSettings() *UdpBufferSettings {
 }
 
 func DefaultTcpBufferSettings() *TcpBufferSettings {
+	return DefaultTcpBufferSettingsWithBufferSize(defaultIpBufferSize)
+}
+
+func DefaultTcpBufferSettingsWithBufferSize(bufferSize int) *TcpBufferSettings {
 	tcpBufferSettings := &TcpBufferSettings{
 		// ConnectTimeout:     60 * time.Second,
 		ReadTimeout:        300 * time.Second,
 		WriteTimeout:       15 * time.Second,
 		AckCompressTimeout: time.Duration(0),
 		IdleTimeout:        300 * time.Second,
-		SequenceBufferSize: DefaultIpBufferSize,
+		SequenceBufferSize: bufferSize,
 		Mtu:                DefaultMtu,
 		// avoid fragmentation
 		ReadBufferByteCount: DefaultMtu - max(Ipv4HeaderSizeWithoutExtensions, Ipv6HeaderSize) - max(UdpHeaderSize, TcpHeaderSizeWithoutExtensions),
@@ -97,11 +105,15 @@ func DefaultTcpBufferSettings() *TcpBufferSettings {
 }
 
 func DefaultLocalUserNatSettings() *LocalUserNatSettings {
+	return DefaultLocalUserNatSettingsWithBufferSize(defaultIpBufferSize)
+}
+
+func DefaultLocalUserNatSettingsWithBufferSize(bufferSize int) *LocalUserNatSettings {
 	return &LocalUserNatSettings{
-		SequenceBufferSize: DefaultIpBufferSize,
+		SequenceBufferSize: bufferSize,
 		// BufferTimeout:      15 * time.Second,
-		UdpBufferSettings: DefaultUdpBufferSettings(),
-		TcpBufferSettings: DefaultTcpBufferSettings(),
+		UdpBufferSettings: DefaultUdpBufferSettingsWithBufferSize(bufferSize),
+		TcpBufferSettings: DefaultTcpBufferSettingsWithBufferSize(bufferSize),
 	}
 }
 
@@ -2603,6 +2615,8 @@ func (self *RemoteUserNatProvider) Receive(
 
 // `connect.ReceiveFunction`
 func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode) {
+	// receive functions should be non-blocking
+	// clients should manage their own congestion protocols on top to avoid overflowing the sequence queues
 	for _, frame := range frames {
 		switch frame.MessageType {
 		case protocol.MessageType_IpIpPing:
@@ -2612,7 +2626,7 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 				frame,
 				source.Reverse(),
 				func(err error) {},
-				self.settings.WriteTimeout,
+				0,
 			)
 		case protocol.MessageType_IpIpPacketToProvider:
 			ipPacketToProvider_, err := FromFrame(frame)
@@ -2639,7 +2653,7 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 								source,
 								provideMode,
 								packet,
-								self.settings.WriteTimeout,
+								0,
 							)
 							if !success {
 								MessagePoolReturn(packet)
@@ -2784,7 +2798,7 @@ func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode pro
 		return success
 	case SecurityPolicyResultDrop:
 		if self.LocalSecurityBypass() {
-			return self.localUserNat.SendPacket(source, provideMode, packet, timeout)
+			return self.localUserNat.SendPacket(source, provideMode, packet, 0)
 		} else {
 			return false
 		}

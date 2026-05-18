@@ -1042,7 +1042,7 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 		return self.sendPacket(source, provideMode, parsedPacket, timeout)
 	case SecurityPolicyResultDrop:
 		if self.LocalSecurityBypass() {
-			return self.localUserNat.SendPacket(source, provideMode, packet, timeout)
+			return self.localUserNat.SendPacket(source, provideMode, packet, 0)
 		} else {
 			return false
 		}
