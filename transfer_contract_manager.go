@@ -3,6 +3,7 @@ package connect
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	// "errors"
@@ -23,6 +24,24 @@ import (
 
 	"github.com/urnetwork/connect/protocol"
 )
+
+var lastOobErrLogNano atomic.Int64
+var suppressedOobErrCount atomic.Int64
+
+func shouldLogOobErr() (bool, int64) {
+	now := time.Now().UnixNano()
+	last := lastOobErrLogNano.Load()
+	if now-last < int64(time.Minute) {
+		suppressedOobErrCount.Add(1)
+		return false, 0
+	}
+	if !lastOobErrLogNano.CompareAndSwap(last, now) {
+		suppressedOobErrCount.Add(1)
+		return false, 0
+	}
+	suppressed := suppressedOobErrCount.Swap(0)
+	return true, suppressed
+}
 
 // manage contracts which are embedded into each transfer sequence
 
@@ -235,19 +254,17 @@ func (self *ContractManager) createContractOobErrorBackoffActive() bool {
 	return time.Now().Before(self.createContractOobErrorBackoffUntil)
 }
 
-func (self *ContractManager) markCreateContractOobError() bool {
+func (self *ContractManager) markCreateContractOobError() {
 	if self.settings.CreateContractOobErrorBackoff <= 0 {
-		return true
+		return
 	}
 
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 
-	if time.Now().Before(self.createContractOobErrorBackoffUntil) {
-		return false
+	if !time.Now().Before(self.createContractOobErrorBackoffUntil) {
+		self.createContractOobErrorBackoffUntil = time.Now().Add(self.settings.CreateContractOobErrorBackoff)
 	}
-	self.createContractOobErrorBackoffUntil = time.Now().Add(self.settings.CreateContractOobErrorBackoff)
-	return true
 }
 
 func NewContractManager(
@@ -949,8 +966,13 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 				case <-self.client.Done():
 					// no need to log warnings when the client closes
 				default:
-					if self.markCreateContractOobError() {
-						glog.Infof("[contract]oob err = %s; backing off create contract OOB requests for %s\n", err, self.settings.CreateContractOobErrorBackoff)
+					self.markCreateContractOobError()
+					if ok, suppressed := shouldLogOobErr(); ok {
+						if suppressed > 0 {
+							glog.Infof("[contract]oob err = %s; backing off create contract OOB requests for %s (%d suppressed)\n", err, self.settings.CreateContractOobErrorBackoff, suppressed)
+						} else {
+							glog.Infof("[contract]oob err = %s; backing off create contract OOB requests for %s\n", err, self.settings.CreateContractOobErrorBackoff)
+						}
 					}
 				}
 			}
