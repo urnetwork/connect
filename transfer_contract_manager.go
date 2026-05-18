@@ -3,6 +3,7 @@ package connect
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	// "errors"
@@ -23,6 +24,24 @@ import (
 
 	"github.com/urnetwork/connect/protocol"
 )
+
+var lastOobErrLogNano atomic.Int64
+var suppressedOobErrCount atomic.Int64
+
+func shouldLogOobErr() (bool, int64) {
+	now := time.Now().UnixNano()
+	last := lastOobErrLogNano.Load()
+	if now-last < int64(time.Minute) {
+		suppressedOobErrCount.Add(1)
+		return false, 0
+	}
+	if !lastOobErrLogNano.CompareAndSwap(last, now) {
+		suppressedOobErrCount.Add(1)
+		return false, 0
+	}
+	suppressed := suppressedOobErrCount.Swap(0)
+	return true, suppressed
+}
 
 // manage contracts which are embedded into each transfer sequence
 
@@ -135,6 +154,8 @@ func DefaultContractManagerSettings() *ContractManagerSettings {
 
 		ProvidePingTimeout: 0,
 
+		CreateContractOobErrorBackoff: time.Minute,
+
 		ProtocolVersion: DefaultProtocolVersion,
 
 		// TODO remove
@@ -170,6 +191,10 @@ type ContractManagerSettings struct {
 
 	// an active ping to the control fast-tracks any timeouts
 	ProvidePingTimeout time.Duration
+
+	// back off create-contract OOB API calls after an OOB error to avoid
+	// repeatedly hitting the API while it is timing out or unavailable.
+	CreateContractOobErrorBackoff time.Duration
 
 	ProtocolVersion int
 
@@ -210,10 +235,36 @@ type ContractManager struct {
 	localStats *ContractManagerStats
 
 	controlSyncProvide *ControlSync
+
+	createContractOobErrorBackoffUntil time.Time
 }
 
 func NewContractManagerWithDefaults(ctx context.Context, client *Client) *ContractManager {
 	return NewContractManager(ctx, client, DefaultContractManagerSettings())
+}
+
+func (self *ContractManager) createContractOobErrorBackoffActive() bool {
+	if self.settings.CreateContractOobErrorBackoff <= 0 {
+		return false
+	}
+
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+
+	return time.Now().Before(self.createContractOobErrorBackoffUntil)
+}
+
+func (self *ContractManager) markCreateContractOobError() {
+	if self.settings.CreateContractOobErrorBackoff <= 0 {
+		return
+	}
+
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+
+	if !time.Now().Before(self.createContractOobErrorBackoffUntil) {
+		self.createContractOobErrorBackoffUntil = time.Now().Add(self.settings.CreateContractOobErrorBackoff)
+	}
 }
 
 func NewContractManager(
@@ -884,6 +935,10 @@ func (self *ContractManager) addContract(contractKey ContractKey, contract *prot
 }
 
 func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeqIndex uint64, minByteCount ByteCount) {
+	if self.createContractOobErrorBackoffActive() {
+		return
+	}
+
 	// look at destinationContracts and last contract to get previous contract id
 	contractQueue := self.openContractQueue(contractKey)
 	defer self.closeContractQueue(contractKey)
@@ -921,7 +976,14 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 				case <-self.client.Done():
 					// no need to log warnings when the client closes
 				default:
-					glog.Infof("[contract]oob err = %s\n", err)
+					self.markCreateContractOobError()
+					if ok, suppressed := shouldLogOobErr(); ok {
+						if suppressed > 0 {
+							glog.Infof("[contract]oob err = %s; backing off create contract OOB requests for %s (%d suppressed)\n", err, self.settings.CreateContractOobErrorBackoff, suppressed)
+						} else {
+							glog.Infof("[contract]oob err = %s; backing off create contract OOB requests for %s\n", err, self.settings.CreateContractOobErrorBackoff)
+						}
+					}
 				}
 			}
 		},
