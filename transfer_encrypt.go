@@ -402,6 +402,19 @@ type peerEncryptionSession struct {
 	cipher       *sequenceCipher
 	certVerified bool
 	refs         int // protected by stateLock
+	// serverFlightSent flips true the first time `outboxLoop` drains a
+	// batch in TLS-server role. For TLS 1.3 servers, that first batch is
+	// the full server flight (ServerHello + EncryptedExtensions + Cert +
+	// CertVerify + Finished). Once set, the session is in the brief
+	// "sent server Finished, awaiting client Finished" window where
+	// `Cipher()` will flip non-nil as soon as the client Finished is
+	// processed. The unwrap path uses this as the *only* state in which
+	// it's willing to block the receive loop on `ReadyNotify`; all
+	// other server-side states (cipher already set, handshake failed,
+	// no ClientHello processed yet) drop the wrapped frame immediately
+	// to keep the receive-loop blocking surface — and therefore the
+	// DoS surface — minimal.
+	serverFlightSent bool
 	// trustedPeerCertPems is the union of all peer cert PEM blocks the
 	// session has learned about — one entry per PEM block (leaf + any
 	// intermediates), keyed by the PEM bytes themselves so duplicates
@@ -528,11 +541,25 @@ func (self *peerEncryptionSession) outboxLoop() {
 		if len(b) == 0 {
 			continue
 		}
+		// In TLS-server role, the first outbox batch is the server
+		// flight (which contains the server's Finished). Mark the
+		// "awaiting client Finished" state so the unwrap path knows
+		// this session is in the narrow window where briefly blocking
+		// the receive loop on `ReadyNotify` can pay off. Idempotent.
+		if self.role == sequenceTlsRoleServer {
+			self.markServerFlightSent()
+		}
 		self.sendEncryptedControl(&protocol.EncryptedControl{
 			ControlType: protocol.EncryptedControlType_EncryptedControlHandshake,
 			Payload:     b,
 		})
 	}
+}
+
+func (self *peerEncryptionSession) markServerFlightSent() {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.serverFlightSent = true
 }
 
 // sendEncryptedControl pushes an EncryptedControl through the normal Pack
@@ -585,12 +612,106 @@ func (self *peerEncryptionSession) completeHandshake(err error) {
 // are gone (a sender that doesn't want encryption just doesn't start
 // the session; the TLS-client side starts its handshake on its own as
 // soon as it's created).
+//
+// `Client.run` may have already applied this same payload via
+// `OptimisticallyDeliverHandshake` (for handshake bytes that arrive
+// when we're in the awaiting-client-Finished window) — if so, the
+// handshake has completed by now and the TLS state machine no longer
+// reads from `transport.inbox`. Re-delivering would just enlarge the
+// inbox buffer to no purpose. Skip in that case.
 func (self *peerEncryptionSession) DeliverEncryptedControl(ec *protocol.EncryptedControl) {
-	if ec.ControlType == protocol.EncryptedControlType_EncryptedControlHandshake {
-		self.startInternal()
-		if self.transport != nil {
-			self.transport.Deliver(ec.Payload)
+	if ec.ControlType != protocol.EncryptedControlType_EncryptedControlHandshake {
+		return
+	}
+	select {
+	case <-self.handshakeDone:
+		return
+	default:
+	}
+	self.startInternal()
+	if self.transport != nil {
+		self.transport.Deliver(ec.Payload)
+	}
+}
+
+// OptimisticallyDeliverHandshake feeds handshake payload bytes directly
+// into the per-peer TLS transport from `Client.run` — bypassing the
+// ReceiveSequence drain that would otherwise reach the session via
+// `DeliverEncryptedControl`. The intent is to set the cipher *in the
+// same receive-loop turn* that processed the inbound EncryptedControl
+// frame, so any wrapped app-data frames in the immediately-following
+// reads (which the unwrap path used to wait on `ReadyNotify` for) find
+// the cipher already set.
+//
+// Gated on `IsAwaitingClientFinished` so it's a no-op outside the
+// narrow TLS-server window where it pays off (and where the
+// just-arrived EC frame is, by construction, the expected client
+// second flight). Once the handshake completes, `IsAwaitingClientFinished`
+// returns false and subsequent calls do nothing.
+//
+// Called from the single-threaded receive loop, so it must not block:
+// `transport.Deliver` just appends to the inbox buffer under a quick
+// lock and notifies the runHandshake goroutine to wake up and read.
+//
+// The normal-path `DeliverEncryptedControl` will still see this EC
+// frame when the ReceiveSequence drains it; by then the handshake is
+// (almost always) complete and the redelivery short-circuits via the
+// `handshakeDone` check. The tiny race window where both paths
+// deliver the same bytes just costs a few KB of bytes left in the
+// inbox buffer — bounded by the size of the client second flight.
+//
+// Retransmit filter: the source of this pack is already validated by
+// the transfer layer (every hop verifies source), so the only way
+// stale handshake bytes can reach us is a sender-side resend of an
+// earlier handshake message — practically, a ClientHello retransmit
+// from before our server flight went out (the sender's resend timer
+// for the ClientHello pack fired before our ack got back). We can't
+// dedupe by (sequenceId, sequenceNumber) here without reaching into
+// the ReceiveSequence's state; instead we use a one-byte structural
+// check on the TLS record header. In TLS 1.3 the legitimate client
+// second flight starts with either:
+//   - record type 20 (legacy `ChangeCipherSpec`, sent for middlebox
+//     compatibility), or
+//   - record type 23 (encrypted `application_data`, which is how
+//     post-handshake-secrets handshake messages are wrapped).
+//
+// A ClientHello (initial or HRR retry) is record type 22 — caught by
+// this filter. Anything else (unencrypted alert at type 21, etc.) is
+// not a legitimate client-second-flight prefix either. Skip and let
+// the ReceiveSequence's normal dedupe handle the retransmit through
+// the normal path (which short-circuits if duplicate or applies
+// correctly if new — its sequence-number bookkeeping is what makes it
+// safe to feed bytes to the TLS state machine).
+func (self *peerEncryptionSession) OptimisticallyDeliverHandshake(payload []byte) {
+	if !self.IsAwaitingClientFinished() {
+		return
+	}
+	// isClientSecondFlightPrefix: the first byte of `payload` is a TLS
+	// 1.3 record content type compatible with the start of a
+	// legitimate client second flight: 20 (legacy ChangeCipherSpec) or
+	// 23 (encrypted application_data carrying handshake messages).
+	// Type 22 (unencrypted Handshake) is rejected — that's the type
+	// used by ClientHello and HRR retry ClientHello, i.e. the messages
+	// a sender would retransmit before our server flight reached them.
+	// Type 21 (Alert) is also rejected — alerts after handshake-secrets
+	// are derived are encrypted under type 23.
+	isClientSecondFlightPrefix := func() bool {
+		if len(payload) == 0 {
+			return false
 		}
+		switch payload[0] {
+		case 20, 23:
+			return true
+		default:
+			return false
+		}
+	}
+	if !isClientSecondFlightPrefix() {
+		return
+	}
+	self.startInternal()
+	if self.transport != nil {
+		self.transport.Deliver(payload)
 	}
 }
 
@@ -609,6 +730,43 @@ func (self *peerEncryptionSession) Cipher() *sequenceCipher {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	return self.cipher
+}
+
+// IsAwaitingClientFinished reports whether this session is in the narrow
+// TLS-server-role window after sending its own Finished and before
+// receiving the peer's Finished — the only state in which it's
+// meaningful for the unwrap path to briefly block the receive loop
+// waiting for the cipher.
+//
+// Returns false:
+//   - in TLS-client role (the local cipher is already set first; a
+//     wrapped frame arriving in that direction is the result of the
+//     peer racing ahead with its own cipher, not anything we can
+//     resolve by waiting locally — drop and let the sender resend);
+//   - before this side has produced its server flight (no ClientHello
+//     processed yet, so blocking can't resolve within any reasonable
+//     window; also the natural state of a freshly-created session that
+//     hasn't seen any handshake input — keeping wait off here closes
+//     the obvious DoS surface where an attacker creates a session
+//     reference and then stalls);
+//   - once the handshake has completed (success: cipher is already
+//     non-nil; failure: cipher will never be set and waiting is
+//     pointless).
+//
+// Keeping this predicate tight bounds how long the single-threaded
+// `Client.run` receive loop can be parked by any one wrapped frame.
+func (self *peerEncryptionSession) IsAwaitingClientFinished() bool {
+	if self.role != sequenceTlsRoleServer {
+		return false
+	}
+	select {
+	case <-self.handshakeDone:
+		return false
+	default:
+	}
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.serverFlightSent
 }
 
 func (self *peerEncryptionSession) closeTls() {

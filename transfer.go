@@ -80,7 +80,6 @@ func DefaultClientSettingsWithBufferSize(bufferSize int) *ClientSettings {
 		ReadTimeout:             30 * time.Second,
 		BufferTimeout:           15 * time.Second,
 		ControlPingTimeout:      time.Duration(0),
-		UnwrapReadyTimeout:      2 * time.Second,
 		SendBufferSettings:      DefaultSendBufferSettingsWithBufferSize(bufferSize),
 		ReceiveBufferSettings:   DefaultReceiveBufferSettingsWithBufferSize(bufferSize),
 		ForwardBufferSettings:   DefaultForwardBufferSettingsWithBufferSize(bufferSize),
@@ -277,15 +276,6 @@ type ClientSettings struct {
 	BufferTimeout     time.Duration
 	// if 0, the client will not send control pings
 	ControlPingTimeout time.Duration
-	// UnwrapReadyTimeout bounds how long the unwrap path in `Client.run`
-	// waits for the per-peer encryption session's cipher to come up before
-	// dropping a wrapped frame. A wrapped frame can arrive before this
-	// side's TLS handshake has completed (the sender's handshake completes
-	// first, and inbound EncryptedControl handshake bytes are still being
-	// drained by the ReceiveSequence). Waiting briefly absorbs that small
-	// gap so we don't drop wrapped frames purely on a startup race; the
-	// sender's resend covers anything that does drop on timeout.
-	UnwrapReadyTimeout time.Duration
 
 	SendBufferSettings      *SendBufferSettings
 	ReceiveBufferSettings   *ReceiveBufferSettings
@@ -926,18 +916,19 @@ func (self *Client) run() {
 			// look at the outer TransferPath, which is plaintext.
 			if 0 < len(transferFrame.EncryptedTransferFrame) {
 				unwrapped = false
-				// A wrapped frame can arrive before our handshake has
-				// completed on this side: the sender wraps as soon as
-				// ITS handshake completes (which in TLS 1.3 client role
-				// happens right after writing client Finished), but the
-				// receiver's cipher is only set once its TLS state has
-				// processed all incoming handshake bytes — and the
-				// processing runs in `ReceiveSequence.Run`, separate
-				// from `Client.run`. Wait briefly for the cipher (the
-				// session's `ReadyNotify` fires when the state changes)
-				// so we don't drop the wrapped frame purely because
-				// `ReceiveSequence.Run` hasn't drained the handshake
-				// packs queued in `receiveBuffer` yet.
+				// Unwrap is fully non-blocking: if the cipher isn't
+				// set yet, drop the frame and let the sender's resend
+				// recover. The previous implementation parked the
+				// receive loop on `ReadyNotify` to absorb the small
+				// window where a wrapped pack could arrive before our
+				// TLS state machine had processed the client Finished;
+				// that has been replaced by `OptimisticallyDeliverHandshake`
+				// in the pack-handling branch below, which advances
+				// the TLS state synchronously inside this same receive
+				// loop turn. Keeping the unwrap path itself wait-free
+				// means no single peer can ever park the (single-
+				// threaded, all-peers) receive loop — closing that DoS
+				// surface entirely.
 				unwrap := func(peerId Id, wrapped []byte) ([]byte, error) {
 					if self.encryptionSessionManager == nil {
 						return nil, fmt.Errorf("encryption disabled")
@@ -947,16 +938,6 @@ func (self *Client) run() {
 						return nil, fmt.Errorf("no encryption session for peer %s", peerId)
 					}
 					cipher := session.Cipher()
-					if cipher == nil && 0 < self.settings.UnwrapReadyTimeout {
-						// give the session a chance to set the cipher
-						ready := session.ReadyNotify()
-						select {
-						case <-ready:
-						case <-time.After(self.settings.UnwrapReadyTimeout):
-						case <-self.ctx.Done():
-						}
-						cipher = session.Cipher()
-					}
 					if cipher == nil {
 						return nil, fmt.Errorf("encryption session for peer %s has no cipher", peerId)
 					}
@@ -1056,6 +1037,39 @@ func (self *Client) run() {
 					// bad protobuf
 					MessagePoolReturn(transferFrameBytes)
 					continue
+				}
+				// Optimistic handshake apply: if this pack carries
+				// EncryptedControl handshake bytes and the per-peer
+				// session is in the narrow "awaiting client Finished"
+				// window, feed the bytes into the TLS transport from
+				// the receive loop directly, instead of waiting for
+				// the ReceiveSequence to drain and call
+				// `session.DeliverEncryptedControl` asynchronously.
+				// The cipher then flips non-nil in time for any
+				// wrapped app-data packs that follow within the same
+				// receive cycle, so the unwrap path no longer needs
+				// to block. The ReceiveSequence's later delivery
+				// short-circuits (handshakeDone is closed by then).
+				// Only plaintext-on-wire packs can carry EC frames
+				// (EC packs always set ForceUnwrapped on send), so
+				// gating on `unwrapped` avoids unmarshalling work on
+				// the wrapped (app-data) hot path.
+				if unwrapped && self.encryptionSessionManager != nil {
+					if session := self.encryptionSessionManager.Lookup(path.SourceId); session != nil && session.IsAwaitingClientFinished() {
+						for _, frame := range pack.Frames {
+							if frame == nil || frame.MessageType != protocol.MessageType_TransferEncryptedControl {
+								continue
+							}
+							ec := &protocol.EncryptedControl{}
+							if err := ProtoUnmarshal(frame.MessageBytes, ec); err != nil {
+								continue
+							}
+							if ec.ControlType != protocol.EncryptedControlType_EncryptedControlHandshake {
+								continue
+							}
+							session.OptimisticallyDeliverHandshake(ec.Payload)
+						}
+					}
 				}
 				messageByteCount := MessageByteCount(pack.Frames)
 				c := func() bool {
