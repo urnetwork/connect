@@ -32,25 +32,21 @@ message TransferPath {
 }
 
 
+// when `EncryptedTransferFrame` is set, only `TransferPath` is expected to set
+// the rest of the values will come from decrypting the `EncryptedTransferFrame` bytes
 message TransferFrame {
     TransferPath transfer_path = 1;
-    optional Frame frame = 2;
-    optional MessageType message_type = 3;
+    optional Frame frame = 2 [deprecated = true];
+    optional MessageType message_type = 3 [deprecated = true];
     optional Pack pack = 4;
     optional Ack ack = 5;
+    optional bytes encryptedTransferFrame = 6;
 }
 
 
 // this is the minimal subset of `TransferFrame` used when making a routing decision
 message FilteredTransferFrame {
     TransferPath transfer_path = 1;
-}
-
-
-message FilteredTransferFrameWithFrame {
-    TransferPath transfer_path = 1;
-    optional FilteredFrame frame = 2;
-    optional MessageType message_type = 3;
 }
 
 
@@ -257,6 +253,13 @@ message Contract {
     bytes stored_contract_hmac = 2;
     // the client must always verify the provide mode by matching the `provider_secret_key` for that mode to the hmac
     ProvideMode provide_mode = 3;
+    // PEM-encoded X.509 certificate chain (leaf first) that the destination is
+    // bound to use as its server TLS identity for this contract. Each entry is
+    // one PEM block. The sender verifies that the certificate observed during
+    // the SendSequence TLS handshake matches a certificate in this chain. The
+    // platform populates this from the destination's
+    // `ProvideKey.provide_tls_certificate`.
+    repeated bytes provide_tls_certificate = 4;
 }
 
 message StoredContract {
@@ -268,7 +271,7 @@ message StoredContract {
     optional bytes destination_id = 4;
     // ulid
     optional bytes stream_id = 5;
-    
+
     // relative priority
     // 0 (missing) is least priority
     // any positive priority value is 100% more than 0
@@ -277,6 +280,11 @@ message StoredContract {
     // so it is in a provider's interest to prioritize data with positive priority
     optional uint32 priority = 6;
 
+    // PEM-encoded X.509 certificate chain (leaf first) committed by the
+    // destination at provide time. Each entry is one PEM block. Sealed into
+    // the platform-signed contract bytes so the sender can rely on the
+    // certificate identity for the TLS session with the destination.
+    repeated bytes provide_tls_certificate = 7;
 
     // FIXME companion contract id
 }
@@ -318,5 +326,43 @@ message ControlPing {
 
 
 message ProvidePing {
+}
+
+
+enum EncryptedControlType {
+    EncryptedControlNone = 0;
+    // Raw TLS handshake bytes. The peer's encryption session feeds these
+    // straight into its `tls.Conn` state machine. Pack delivery is reliable
+    // and in order, so no chunk indexing is needed.
+    EncryptedControlHandshake = 1;
+}
+
+// EncryptedKey publishes this client's public TLS certificate to the
+// platform. Sent as a control message (MessageType = TransferEncryptedKey).
+// Each client has exactly one such certificate, generated and held by the
+// local `EncryptionSessionManager` and shared across every per-peer
+// encryption session this client owns. The platform stores it per
+// `client_id` (NOT per provide mode) and attaches it to every contract
+// whose destination is this client so the sender can verify the cert
+// observed during the per-peer TLS handshake.
+message EncryptedKey {
+    // PEM-encoded X.509 certificate chain (leaf first). Each entry is one
+    // PEM block (`-----BEGIN CERTIFICATE-----` ... `-----END CERTIFICATE-----`).
+    repeated bytes provide_tls_certificate = 1;
+}
+
+
+// out-of-band control messages between paired encryption sessions on two
+// peers. Carried inside a regular `Pack` as a `Frame` with
+// `message_type = TransferEncryptedControl`, so delivery is reliable and in
+// order. The destination `ReceiveSequence` intercepts these frames and
+// delivers the payload to the encryption session instead of the application
+// receive callback. Sent unencrypted (no outer wrap) because they describe
+// the encryption itself, including bootstrap before any cipher exists.
+message EncryptedControl {
+    EncryptedControlType control_type = 1;
+    // For `EncryptedControlHandshake`: raw TLS handshake bytes. Empty for
+    // other control types.
+    bytes payload = 2;
 }
 

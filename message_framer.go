@@ -23,20 +23,21 @@ import (
 // the framer read/write op is called billions of times in a typical user hour
 
 type FramerSettings struct {
-	MaxMessageLen       int
-	MaxPacketMessageLen int
-	SplitMinimumLen     int
+	MaxMessageLen int
+	// SplitMinimumLen is the minimum message length above which `Write`
+	// splits the body into two `io.Writer.Write` calls to save a memcpy.
+	// This is a stream-transport optimization.
+	SplitMinimumLen int
 }
 
 func DefaultFramerSettings() *FramerSettings {
 	return &FramerSettings{
-		MaxMessageLen:       2048 - 4,
-		MaxPacketMessageLen: 2048 - 4,
-		SplitMinimumLen:     256,
+		MaxMessageLen:   2048 - 4,
+		SplitMinimumLen: 256,
 	}
 }
 
-// Read/ReadPacket and Write must be called from a single goroutine each
+// Read and Write must be called from a single goroutine each
 type Framer struct {
 	readBuffer  []byte
 	writeBuffer []byte
@@ -82,53 +83,17 @@ func (self *Framer) Read(r io.Reader) ([]byte, error) {
 	return message, nil
 }
 
-// use this version if the reader dequeues an entire packet per read
-func (self *Framer) ReadPacket(r io.Reader) ([]byte, error) {
-	h := MessagePoolGet(self.settings.MaxPacketMessageLen + 4)
-
-	n, err := r.Read(h)
-	if err != nil {
-		MessagePoolReturn(h)
-		return nil, err
-	}
-	if n < 4 {
-		MessagePoolReturn(h)
-		return nil, fmt.Errorf("Could not read header.")
-	}
-
-	messageLen := int(binary.BigEndian.Uint16(h[0:2]))
-
-	if self.settings.MaxMessageLen < messageLen {
-		// glog.Infof("READ MAX\n")
-		MessagePoolReturn(h)
-		return nil, fmt.Errorf("Max message len exceeded (%d<%d)", self.settings.MaxMessageLen, messageLen)
-	}
-
-	// packet readers deliver one framed message per Read; the packet must
-	// contain exactly the 4-byte header plus messageLen bytes of body.
-	// reject under- or over-sized packets rather than accepting garbage tails.
-	if n > 4+messageLen {
-		MessagePoolReturn(h)
-		return nil, fmt.Errorf("Packet body too long (%d>%d)", n-4, messageLen)
-	}
-
-	message := h[4 : messageLen+4]
-
-	if n-4 < messageLen {
-		if _, err := io.ReadFull(r, message[n-4:messageLen]); err != nil {
-			MessagePoolReturn(h)
-			return nil, err
-		}
-	}
-
-	return message, nil
-}
-
-// we assume a packet writer will fragment the message internally as needed
+// Write emits a length-prefixed framed message to a stream writer (TCP,
+// QUIC stream, WebSocket frame body, etc.). For messages at or above
+// `SplitMinimumLen`, the body is written as two `io.Writer.Write` calls —
+// header + first half, then second half — saving one memcpy of the second
+// half. This is unsafe on packet transports because each Write becomes one
+// packet on the wire and there is no in-band way to detect a dropped or
+// reordered second packet; message-preserving transports should bypass
+// the framer and write/read directly.
 func (self *Framer) Write(w io.Writer, message []byte) error {
 	messageLen := len(message)
 	if self.settings.MaxMessageLen < messageLen {
-		// glog.Infof("WRITE MAX\n")
 		return fmt.Errorf("Max message len exceeded (%d<%d)", self.settings.MaxMessageLen, messageLen)
 	}
 	if math.MaxUint16 < messageLen {
@@ -143,26 +108,19 @@ func (self *Framer) Write(w io.Writer, message []byte) error {
 		if _, err := w.Write(messageWithHeader[0 : messageLen+4]); err != nil {
 			return err
 		}
-	} else {
-		// use half size packets and avoid large memory copy by writing the message in two parts
-
-		splitIndex := messageLen / 2
-
-		h := MessagePoolGet(splitIndex + 4)
-		defer MessagePoolReturn(h)
-
-		binary.BigEndian.PutUint16(h[0:2], uint16(messageLen))
-		binary.BigEndian.PutUint16(h[2:4], uint16(splitIndex))
-		copy(h[4:4+splitIndex], message[0:splitIndex])
-
-		if _, err := w.Write(h[0 : 4+splitIndex]); err != nil {
-			return err
-		}
-
-		if _, err := w.Write(message[splitIndex:messageLen]); err != nil {
-			return err
-		}
+		return nil
 	}
-
+	splitIndex := messageLen / 2
+	h := MessagePoolGet(splitIndex + 4)
+	defer MessagePoolReturn(h)
+	binary.BigEndian.PutUint16(h[0:2], uint16(messageLen))
+	binary.BigEndian.PutUint16(h[2:4], uint16(splitIndex))
+	copy(h[4:4+splitIndex], message[0:splitIndex])
+	if _, err := w.Write(h[0 : 4+splitIndex]); err != nil {
+		return err
+	}
+	if _, err := w.Write(message[splitIndex:messageLen]); err != nil {
+		return err
+	}
 	return nil
 }

@@ -2,6 +2,8 @@ package connect
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	mathrand "math/rand"
 	"sync"
@@ -15,18 +17,81 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
-func TestSendReceiveSenderReset(t *testing.T) {
-	// in this case two senders with the same client_id send after each other
-	// The receiver should be able to reset using the new sequence_id
+// encryptionMode selects how the SendSequence <-> ReceiveSequence TLS
+// encryption is configured for a test. It is used to run the same scenario
+// under both unencrypted and encrypted settings.
+type encryptionMode int
 
+const (
+	encryptionModeOff encryptionMode = iota
+	// encryptionModeOn: both sides Encrypt=true,
+	// EncryptAllowUnwrappedFallback=false. The handshake must succeed for
+	// any application data to flow (the SendSequence gates app packs on
+	// session readiness).
+	encryptionModeOn
+	// encryptionModeOnAllowFallback: both sides Encrypt=true,
+	// EncryptAllowUnwrappedFallback=true. The handshake is still expected
+	// to succeed under normal conditions, but app packs are allowed to flow
+	// in parallel during the handshake (gating off) and the sender will opt
+	// out gracefully if the handshake fails.
+	encryptionModeOnAllowFallback
+	// encryptionModeFallback exercises the opt-out path: encryption is enabled
+	// on the sender but the handshake is expected to time out, so the sender
+	// falls back to plaintext.
+	encryptionModeFallback
+)
+
+func TestSendReceiveSenderReset(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping testing in short mode")
 	}
+	runSendReceiveSenderReset(t, encryptionModeOff)
+}
+
+func TestSendReceiveSenderResetEncrypted(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping testing in short mode")
+	}
+	runSendReceiveSenderReset(t, encryptionModeOn)
+}
+
+func TestSendReceiveSenderResetEncryptedAllowFallback(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping testing in short mode")
+	}
+	runSendReceiveSenderReset(t, encryptionModeOnAllowFallback)
+}
+
+func runSendReceiveSenderReset(t *testing.T, encMode encryptionMode) {
+	// in this case two senders with the same client_id send after each other
+	// The receiver should be able to reset using the new sequence_id
 
 	// timeout between receives or acks
-	timeout := 60 * time.Second
+	// receive timeout. Large enough to absorb -race instrumentation overhead,
+	// which can slow per-message processing by 5-10x.
+	timeout := 5 * time.Minute
 	// number of messages
 	n := 16 * 1024
+
+	// random delay / loss; the encrypted scenarios use a tighter conditioner
+	// because TLS records still need to be delivered eventually for the
+	// session to complete the handshake.
+	var conditionerDelay time.Duration
+	var conditionerLoss float32
+	switch encMode {
+	case encryptionModeOff:
+		conditionerDelay = 5 * time.Second
+		conditionerLoss = 0.5
+	case encryptionModeOn, encryptionModeOnAllowFallback:
+		conditionerDelay = 200 * time.Millisecond
+		conditionerLoss = 0.1
+	case encryptionModeFallback:
+		// no loss/delay so the opt-out and follow-on plaintext frames flow;
+		// the handshake is forced to fail by configuring a tiny timeout
+		// in `applyTestEncryptionSettings`.
+		conditionerDelay = 0
+		conditionerLoss = 0
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -41,13 +106,13 @@ func TestSendReceiveSenderReset(t *testing.T) {
 	bConditioner, aReceive := newConditioner(ctx, bSend)
 
 	aConditioner.update(func() {
-		aConditioner.randomDelay = 5 * time.Second
-		aConditioner.lossProbability = 0.5
+		aConditioner.randomDelay = conditionerDelay
+		aConditioner.lossProbability = conditionerLoss
 	})
 
 	bConditioner.update(func() {
-		bConditioner.randomDelay = 5 * time.Second
-		bConditioner.lossProbability = 0.5
+		bConditioner.randomDelay = conditionerDelay
+		bConditioner.lossProbability = conditionerLoss
 	})
 
 	aSendTransport := NewSendGatewayTransport()
@@ -72,6 +137,7 @@ func TestSendReceiveSenderReset(t *testing.T) {
 	clientSettingsA.ForwardBufferSettings.SequenceBufferSize = 0
 	clientSettingsA.ForwardBufferSettings.IdleTimeout = 300 * time.Second
 	clientSettingsA.ContractManagerSettings.LegacyCreateContract = true
+	applyTestEncryptionSettings(clientSettingsA, encMode)
 	a := NewClient(ctx, aClientId, NewNoContractClientOob(), clientSettingsA)
 	aRouteManager := a.RouteManager()
 	aContractManager := a.ContractManager()
@@ -98,6 +164,7 @@ func TestSendReceiveSenderReset(t *testing.T) {
 	clientSettingsB.ForwardBufferSettings.SequenceBufferSize = 0
 	clientSettingsB.ForwardBufferSettings.IdleTimeout = 300 * time.Second
 	clientSettingsB.ContractManagerSettings.LegacyCreateContract = true
+	applyTestEncryptionSettings(clientSettingsB, encMode)
 	b := NewClient(ctx, bClientId, NewNoContractClientOob(), clientSettingsB)
 	bRouteManager := b.RouteManager()
 	bContractManager := b.ContractManager()
@@ -496,6 +563,71 @@ func (self *conditioner) run(in chan []byte, out chan []byte) {
 			}
 		}
 	}
+}
+
+// applyTestEncryptionSettings configures the per-client encryption settings.
+// In the new design, encryption is a binary property of the per-peer
+// `EncryptionSessionManager` session: cipher set → all traffic encrypted;
+// cipher nil → all traffic plaintext. There is no per-frame fallback flag.
+func applyTestEncryptionSettings(clientSettings *ClientSettings, encMode encryptionMode) {
+	switch encMode {
+	case encryptionModeOff:
+		clientSettings.EncryptionSettings.Encrypt = false
+	case encryptionModeOn, encryptionModeOnAllowFallback:
+		clientSettings.EncryptionSettings.Encrypt = true
+		clientSettings.EncryptionSettings.HandshakeTimeout = 60 * time.Second
+	case encryptionModeFallback:
+		// sender enables encryption with a tight timeout but the receiver
+		// has encryption disabled, so the handshake never completes; the
+		// session stays in the cipher-nil state and all traffic flows in
+		// plaintext.
+		clientSettings.EncryptionSettings.Encrypt = true
+		clientSettings.EncryptionSettings.HandshakeTimeout = 50 * time.Millisecond
+	}
+}
+
+// TestSendReceiveEncryptedFallback exercises the opt-out path. The sender's
+// TLS handshake is forced to time out (lossy conditioner) and the receiver
+// accepts plaintext fallback.
+func TestSendReceiveEncryptedFallback(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping testing in short mode")
+	}
+	runSendReceiveSenderReset(t, encryptionModeFallback)
+}
+
+// TestVerifyPeerCertificateAgainstContract covers the sender-side TLS
+// certificate verification against the contract's PEM commitment.
+func TestVerifyPeerCertificateAgainstContract(t *testing.T) {
+	cert, _ := generateSequenceTlsCertificate()
+	leaf := cert.Leaf
+	leafPem := pemEncodeCertificate(leaf.Raw)
+
+	// no commitment in the contract -> verification is skipped, no error
+	ok, err := verifyPeerCertificateAgainstContract([]*x509.Certificate{leaf}, nil)
+	assert.Equal(t, err, nil)
+	assert.Equal(t, ok, true)
+
+	// matching commitment -> success
+	ok, err = verifyPeerCertificateAgainstContract([]*x509.Certificate{leaf}, [][]byte{leafPem})
+	assert.Equal(t, err, nil)
+	assert.Equal(t, ok, true)
+
+	// mismatched commitment -> failure
+	otherCert, _ := generateSequenceTlsCertificate()
+	otherLeafPem := pemEncodeCertificate(otherCert.Leaf.Raw)
+	ok, err = verifyPeerCertificateAgainstContract([]*x509.Certificate{leaf}, [][]byte{otherLeafPem})
+	assert.NotEqual(t, err, nil)
+	assert.Equal(t, ok, false)
+
+	// peer presented no cert but contract has a commitment -> failure
+	ok, err = verifyPeerCertificateAgainstContract(nil, [][]byte{leafPem})
+	assert.NotEqual(t, err, nil)
+	assert.Equal(t, ok, false)
+}
+
+func pemEncodeCertificate(der []byte) []byte {
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }
 
 // FIXME TestAckTimeout

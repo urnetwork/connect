@@ -262,6 +262,16 @@ func (self *ContractManager) providePing() {
 		return
 	}
 
+	// Wait for the client to finish wiring before our first send. This
+	// goroutine is started from `NewContractManager`, which runs inside
+	// `NewClientWithTag` before `initBuffers` constructs `sendBuffer`.
+	// Without this gate the ping path can race the buffer wiring.
+	select {
+	case <-self.client.ReadyNotify():
+	case <-self.ctx.Done():
+		return
+	}
+
 	// used for logging states only
 	logWait := false
 

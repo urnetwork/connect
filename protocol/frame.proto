@@ -30,6 +30,19 @@ enum MessageType {
     TransferExchangeSignals = 20;
     TransferExchangeSignal = 21;
     TransferStreamReset = 22;
+    // out-of-band control for the per-peer TLS encryption session.
+    // `Frame.message_bytes` is a marshaled `EncryptedControl`. Carried inside
+    // a regular `Pack`/`Ack` flow, so it is delivered reliably and in order
+    // by the existing sequence machinery; the destination `ReceiveSequence`
+    // intercepts these frames and routes them into the encryption session
+    // instead of the application receive callback.
+    TransferEncryptedControl = 23;
+    // control message that publishes this client's public TLS certificate
+    // chain to the platform. `Frame.message_bytes` is a marshaled
+    // `EncryptedKey`. Sent once per client on startup (and again when the
+    // cert rotates). The platform stores the cert per `client_id` and
+    // attaches it to every contract whose destination is this client.
+    TransferEncryptedKey = 24;
 }
 
 
@@ -40,9 +53,3 @@ message Frame {
     // this is used for messages that are already packed e.g. network packets
     bool raw = 3;
 }
-
-
-message FilteredFrame {
-    MessageType message_type = 1;
-}
-
