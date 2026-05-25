@@ -63,6 +63,14 @@ const (
 	// cert rotates). The platform stores the cert per `client_id` and
 	// attaches it to every contract whose destination is this client.
 	MessageType_TransferEncryptedKey MessageType = 24
+	// control message that publishes this client's long-lived public
+	// identity key (Ed25519) to the platform. `Frame.message_bytes` is
+	// a marshaled `ClientKey`. The platform stores the public key per
+	// `client_id` and serves it via an unauthenticated lookup API, so
+	// remote peers can fetch the binding independently of the contract
+	// pipeline that the platform itself authors. The corresponding
+	// private key is held only by the client process.
+	MessageType_TransferClientKey MessageType = 25
 )
 
 // Enum value maps for MessageType.
@@ -93,6 +101,7 @@ var (
 		22: "TransferStreamReset",
 		23: "TransferEncryptedControl",
 		24: "TransferEncryptedKey",
+		25: "TransferClientKey",
 	}
 	MessageType_value = map[string]int32{
 		"TransferPack":                 0,
@@ -120,6 +129,7 @@ var (
 		"TransferStreamReset":          22,
 		"TransferEncryptedControl":     23,
 		"TransferEncryptedKey":         24,
+		"TransferClientKey":            25,
 	}
 )
 
@@ -220,7 +230,7 @@ const file_frame_proto_rawDesc = "" +
 	"\x05Frame\x129\n" +
 	"\fmessage_type\x18\x01 \x01(\x0e2\x16.bringyour.MessageTypeR\vmessageType\x12#\n" +
 	"\rmessage_bytes\x18\x02 \x01(\fR\fmessageBytes\x12\x10\n" +
-	"\x03raw\x18\x03 \x01(\bR\x03raw*\xf8\x04\n" +
+	"\x03raw\x18\x03 \x01(\bR\x03raw*\x8f\x05\n" +
 	"\vMessageType\x12\x10\n" +
 	"\fTransferPack\x10\x00\x12\x0f\n" +
 	"\vTransferAck\x10\x01\x12\x14\n" +
@@ -247,7 +257,8 @@ const file_frame_proto_rawDesc = "" +
 	"\x16TransferExchangeSignal\x10\x15\x12\x17\n" +
 	"\x13TransferStreamReset\x10\x16\x12\x1c\n" +
 	"\x18TransferEncryptedControl\x10\x17\x12\x18\n" +
-	"\x14TransferEncryptedKey\x10\x18B'Z%github.com/urnetwork/connect/protocolb\x06proto3"
+	"\x14TransferEncryptedKey\x10\x18\x12\x15\n" +
+	"\x11TransferClientKey\x10\x19B'Z%github.com/urnetwork/connect/protocolb\x06proto3"
 
 var (
 	file_frame_proto_rawDescOnce sync.Once

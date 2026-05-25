@@ -260,6 +260,20 @@ message Contract {
     // platform populates this from the destination's
     // `ProvideKey.provide_tls_certificate`.
     repeated bytes provide_tls_certificate = 4;
+    // Destination's 32-byte Ed25519 public identity key (see `ClientKey`).
+    // Authoritative copy lives in `StoredContract`; this is a convenience
+    // copy for clients that don't unmarshal the stored bytes.
+    bytes destination_client_public_key = 5;
+    // Destination's Ed25519 signature over the canonical concatenation
+    // of every PEM block in `provide_tls_certificate`, made with the
+    // destination's long-lived client identity private key (see
+    // `EncryptedKey.client_key_signed_tls_certificate`). The sender
+    // verifies this signature against the destination's public client
+    // key (fetched out-of-band, NOT trusted from this field of the
+    // contract) before treating the cert chain as a valid commitment.
+    // Authoritative copy lives in `StoredContract`; this is a
+    // convenience copy.
+    bytes destination_client_key_signed_tls_certificate = 6;
 }
 
 message StoredContract {
@@ -285,6 +299,20 @@ message StoredContract {
     // the platform-signed contract bytes so the sender can rely on the
     // certificate identity for the TLS session with the destination.
     repeated bytes provide_tls_certificate = 7;
+
+    // Destination's 32-byte Ed25519 public identity key (see `ClientKey`).
+    // Sealed into the platform-signed contract bytes so the sender can
+    // bind the cert commitment in this contract to a stable long-lived
+    // identity. Sender SHOULD additionally cross-check this key against
+    // the out-of-band public-key lookup before extending trust.
+    bytes destination_client_public_key = 8;
+    // Destination's Ed25519 signature over the canonical concatenation
+    // of every PEM block in `provide_tls_certificate`, made with the
+    // destination's long-lived client identity private key. Verified by
+    // the sender against the destination's public client key — gating
+    // whether the cert chain in this contract is admitted into the
+    // session's trusted-peer-cert set.
+    bytes destination_client_key_signed_tls_certificate = 9;
 
     // FIXME companion contract id
 }
@@ -335,6 +363,16 @@ enum EncryptedControlType {
     // straight into its `tls.Conn` state machine. Pack delivery is reliable
     // and in order, so no chunk indexing is needed.
     EncryptedControlHandshake = 1;
+    // Post-handshake identity proof. `payload` is the sender's Ed25519
+    // signature, made with its long-lived client identity key, over the
+    // 32-byte TLS exporter output for label
+    // `urnetwork-sequence-identity-proof`. The receiver verifies the
+    // signature against the sender's public client key (fetched
+    // out-of-band, not from the platform-authored contract). A valid
+    // proof binds the negotiated TLS session keys to the sender's
+    // long-lived identity, defeating an active MITM whose substituted
+    // TLS cert would produce a different exporter on each leg.
+    EncryptedControlIdentityProof = 2;
 }
 
 // EncryptedKey publishes this client's public TLS certificate to the
@@ -349,6 +387,29 @@ message EncryptedKey {
     // PEM-encoded X.509 certificate chain (leaf first). Each entry is one
     // PEM block (`-----BEGIN CERTIFICATE-----` ... `-----END CERTIFICATE-----`).
     repeated bytes provide_tls_certificate = 1;
+    // Ed25519 signature over the canonical concatenation of every PEM
+    // block in `provide_tls_certificate`, made with this client's
+    // long-lived identity private key (see `ClientKey`). Lets a remote
+    // peer verify that the cert chain attached to a contract by the
+    // platform was authentically committed by this client — substituting
+    // the cert without also forging this signature requires the client
+    // private key, which never leaves the client process.
+    bytes client_key_signed_tls_certificate = 2;
+}
+
+
+// ClientKey publishes this client's long-lived public identity key
+// (Ed25519) to the platform. Sent as a control message
+// (MessageType = TransferClientKey). One key per client; the private
+// half stays in the client process. The platform stores the public key
+// per `client_id` and serves it to remote peers via an unauthenticated
+// lookup API — peers fetch it directly from that API, not via the
+// contract pipeline, so a malicious platform that substitutes a cert
+// in a contract cannot also substitute the identity key that would
+// validate the substituted cert's signature.
+message ClientKey {
+    // 32-byte Ed25519 public key.
+    bytes public_key = 1;
 }
 
 

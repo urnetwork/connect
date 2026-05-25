@@ -6,6 +6,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/tls"
@@ -65,9 +66,16 @@ import (
 // by `Client.run` on receipt, using the session's cipher.
 
 const (
-	sequenceTlsKeyLabel      = "urnetwork-sequence-aead"
+	sequenceTlsKeyLabel      = "urnetwork-connect-aead"
 	sequenceTlsKeyLength     = 32
 	sequenceTlsAeadNonceSize = 12
+	// sequenceTlsIdentityProofLabel is the exporter label that both
+	// peers use to derive the 32-byte payload that gets signed with
+	// the long-lived client identity key. A distinct label from
+	// `sequenceTlsKeyLabel` so the two derivations are
+	// cryptographically separated (per RFC 5705 exporter rules).
+	sequenceTlsIdentityProofLabel  = "urnetwork-connect-identity-proof"
+	sequenceTlsIdentityProofLength = 32
 )
 
 type sequenceTlsRole int
@@ -366,6 +374,59 @@ type EncryptionSettings struct {
 	// traffic flows in plaintext. Sessions never block sequences; whether
 	// to accept plaintext traffic is the caller's choice via `Encrypt`.
 	HandshakeTimeout time.Duration
+	// NewPeerClientPublicKeyFetcher, when non-nil, is invoked once per
+	// per-peer encryption session at session creation time with the
+	// peer's ClientId. The returned function is the per-session
+	// fetcher: the session invokes it at most once, asynchronously,
+	// the first time the peer's long-lived public client identity key
+	// is learned from a contract (`SetPeerClientPublicKey`). The
+	// session compares the returned key against the contract-supplied
+	// key and logs a loud warning on mismatch; today no further
+	// action is taken (the contract-supplied key is still used). This
+	// gives operators an early-warning signal for a platform that's
+	// substituting keys in contracts (a possible MITM attack); a
+	// future iteration will harden this into a refusal to trust the
+	// substituted key.
+	//
+	// Per-session shape (factory) is deliberate. The fetcher reference
+	// is held only by the session; when the session is released, the
+	// fetcher and any state it captures are eligible for GC. A
+	// shared-across-all-sessions fetcher would invite a manager-wide
+	// per-peer cache that grows unboundedly with the number of peers
+	// the local client ever talks to. The factory contract makes the
+	// session-bounded lifetime explicit in the API.
+	//
+	// A typical implementation just closes over a `*BringYourApi` and
+	// the peerId:
+	//
+	//   func(peerId Id) func(context.Context) ([]byte, error) {
+	//       return func(ctx context.Context) ([]byte, error) {
+	//           r, err := api.GetClientKeySync(&GetClientKeyArgs{ClientId: peerId})
+	//           if err != nil { return nil, err }
+	//           return r.PublicKey, nil
+	//       }
+	//   }
+	//
+	// Leaving nil disables the cross-check entirely.
+	NewPeerClientPublicKeyFetcher func(peerId Id) func(ctx context.Context) ([]byte, error)
+
+	// ProvideTlsCertificatePem, when set together with
+	// `ProvideTlsPrivateKeyPem`, loads the local sequence-level TLS
+	// server-role cert + private key instead of generating a fresh
+	// pair on construction. Both must be PEM-encoded; the cert value
+	// is one or more concatenated `-----BEGIN CERTIFICATE-----` blocks
+	// (leaf first), the key value is a single `-----BEGIN ... PRIVATE
+	// KEY-----` block. Persisting and reloading these across restarts
+	// keeps the client's `EncryptedKey` cert commitment stable —
+	// other peers that hold contracts against the old commitment
+	// still recognize the cert when it shows up in a TLS handshake.
+	//
+	// When either field is empty the manager generates a fresh
+	// ephemeral self-signed cert (same behavior as before this field
+	// existed). Setting `ServerTlsConfig` independently overrides
+	// both fields.
+	ProvideTlsCertificatePem []byte
+	ProvideTlsPrivateKeyPem  []byte
 }
 
 func DefaultEncryptionSettings() *EncryptionSettings {
@@ -397,11 +458,61 @@ type peerEncryptionSession struct {
 	handshakeDone      chan struct{}
 	handshakeErr       error
 
+	// peerClientPublicKeyFetcher is the session's own out-of-band
+	// fetcher for the peer's public client identity key, produced by
+	// `EncryptionSettings.NewPeerClientPublicKeyFetcher(peerId)` at
+	// session creation. Nil when the manager has no factory
+	// configured. Held by the session and nowhere else; releasing the
+	// session releases this reference (and any state the application's
+	// factory captured for this peer).
+	peerClientPublicKeyFetcher func(ctx context.Context) ([]byte, error)
+
 	// state (locked)
-	stateLock    sync.Mutex
-	cipher       *sequenceCipher
-	certVerified bool
-	refs         int // protected by stateLock
+	stateLock sync.Mutex
+	// derivedTlsCipher holds the AEAD derived from the completed TLS
+	// handshake. It is NOT exposed via `Cipher()` until the
+	// post-handshake identity exchange validates the peer (see
+	// `peerIdentityVerified`). Held separately so identity-proof code
+	// can sign the exporter without exposing the cipher early.
+	derivedTlsCipher *sequenceCipher
+	certVerified     bool
+	refs             int // protected by stateLock
+	// tlsExporter holds the 32-byte output of
+	// `ExportKeyingMaterial("urnetwork-sequence-identity-proof", ...)`
+	// taken from the completed TLS connection. Used as the input that
+	// both peers sign with their client identity keys, binding the
+	// session's negotiated key material to the long-lived identities
+	// (defeats active MITM that splits the TLS session). Set once on
+	// successful handshake completion; nil before that.
+	tlsExporter []byte
+	// peerClientPublicKey is the peer's long-lived Ed25519 public
+	// identity key, set via `SetPeerClientPublicKey` (called from the
+	// SendSequence after a contract for the peer arrives). May be nil
+	// if no contract has been seen yet; in that case any peer identity
+	// proof that arrives is buffered in `pendingPeerIdentityProof`
+	// until the key is known.
+	peerClientPublicKey ed25519.PublicKey
+	// identityProofSent flips true after we've sent our identity proof
+	// over the wire. Used so we don't double-send if the handshake or
+	// the peer-key-arrival path tries to trigger it again.
+	identityProofSent bool
+	// pendingPeerIdentityProof buffers the peer's `IdentityProof`
+	// payload when it arrives before we can verify it (either we
+	// haven't completed the TLS handshake yet, so we have no
+	// `tlsExporter`, or we don't yet have the peer's public key).
+	// `maybeVerifyPendingPeerIdentityProof` drains this when both
+	// pieces become available.
+	pendingPeerIdentityProof []byte
+	// peerIdentityVerified flips true after we've successfully
+	// verified a peer identity proof against `peerClientPublicKey`
+	// over `tlsExporter`. `Cipher()` returns nil until this is true:
+	// without identity verification the session is treated as
+	// unauthenticated and traffic flows in plaintext.
+	peerIdentityVerified bool
+	// identityFailed flips true on a definitive identity-proof
+	// verification failure (wrong signature against a known peer
+	// key). Sticky: the session never exposes a cipher after this.
+	identityFailed bool
 	// serverFlightSent flips true the first time `outboxLoop` drains a
 	// batch in TLS-server role. For TLS 1.3 servers, that first batch is
 	// the full server flight (ServerHello + EncryptedExtensions + Cert +
@@ -451,6 +562,14 @@ func newPeerEncryptionSession(
 		settings:      settings,
 		handshakeDone: make(chan struct{}),
 		readyMonitor:  NewMonitor(),
+	}
+	// Mint a per-session out-of-band peer key fetcher from the
+	// settings factory. Held by the session for its lifetime only —
+	// any state the application captures in the returned closure dies
+	// with the session, so the peer's key is not retained across
+	// session boundaries.
+	if settings != nil && settings.NewPeerClientPublicKeyFetcher != nil {
+		s.peerClientPublicKeyFetcher = settings.NewPeerClientPublicKeyFetcher(peerId)
 	}
 	return s
 }
@@ -533,14 +652,25 @@ func (self *peerEncryptionSession) handshakeTimeoutWatcher() {
 }
 
 func (self *peerEncryptionSession) outboxLoop() {
+	batchIndex := 0
 	for {
 		b, err := self.transport.TakeOutbox(self.ctx)
 		if err != nil {
+			glog.V(1).Infof("[tls]%s outbox loop exit: %s\n", self.logTag, err)
 			return
 		}
 		if len(b) == 0 {
 			continue
 		}
+		var firstByte byte
+		if 0 < len(b) {
+			firstByte = b[0]
+		}
+		glog.V(1).Infof(
+			"[tls]%s outbox batch %d: %d bytes (record type 0x%02x)\n",
+			self.logTag, batchIndex, len(b), firstByte,
+		)
+		batchIndex += 1
 		// In TLS-server role, the first outbox batch is the server
 		// flight (which contains the server's Finished). Mark the
 		// "awaiting client Finished" state so the unwrap path knows
@@ -590,48 +720,376 @@ func (self *peerEncryptionSession) completeHandshake(err error) {
 			if cipherErr != nil {
 				err = cipherErr
 			} else {
-				self.cipher = c
+				// Hold the AEAD on `derivedTlsCipher`, NOT on the
+				// publicly observable `Cipher()`. The cipher only
+				// becomes visible after the post-handshake identity
+				// proof exchange validates the peer (see
+				// `peerIdentityVerified`). Until then, the wrap path
+				// observes cipher == nil and traffic flows in
+				// plaintext, mirroring how a not-yet-completed
+				// handshake is observed.
+				self.derivedTlsCipher = c
+				state := self.tlsConn.ConnectionState()
+				exporter, exportErr := state.ExportKeyingMaterial(
+					sequenceTlsIdentityProofLabel, nil, sequenceTlsIdentityProofLength,
+				)
+				if exportErr != nil {
+					err = fmt.Errorf("identity-proof exporter: %w", exportErr)
+				} else {
+					self.tlsExporter = exporter
+				}
 			}
 		}
 		self.handshakeErr = err
 		close(self.handshakeDone)
 	}()
 	glogTlsHandshake(self.logTag, err)
-	if err == nil && self.role == sequenceTlsRoleClient {
-		glogTlsHandshakePeerCert(self.logTag, self.PeerCertificates())
+	if err == nil {
+		glog.V(1).Infof(
+			"[tls]%s completeHandshake: cipher derived, exporter %d bytes — starting identity proof exchange\n",
+			self.logTag, len(self.tlsExporter),
+		)
+		if self.role == sequenceTlsRoleClient {
+			glogTlsHandshakePeerCert(self.logTag, self.PeerCertificates())
+		}
+		// Send our identity proof and try to verify any peer proof
+		// that arrived early. Both happen on completed-handshake
+		// success; on failure neither path is meaningful.
+		self.sendIdentityProofOnce()
+		self.maybeVerifyPendingPeerIdentityProof()
+	} else {
+		glog.Errorf("[tls]%s completeHandshake FAILED: %s\n", self.logTag, err)
 	}
-	// Always notify subscribers — both the success case (cipher available)
-	// and the failure case (cipher will stay nil; subscribers waiting on
-	// the cipher need to wake up and observe the final state).
+	// Always notify subscribers — both the success case (cipher
+	// derived; identity exchange may still need to complete before
+	// it's observable) and the failure case (cipher will stay nil;
+	// subscribers waiting on the cipher need to wake up and observe
+	// the final state).
 	self.readyMonitor.NotifyAll()
 }
 
-// DeliverEncryptedControl is called by a ReceiveSequence when it sees a
-// TransferEncryptedControl frame addressed to this session's peer. The
-// only control type now is `Handshake` — opt-out and request-handshake
-// are gone (a sender that doesn't want encryption just doesn't start
-// the session; the TLS-client side starts its handshake on its own as
-// soon as it's created).
+// sendIdentityProofOnce signs the TLS exporter output with the local
+// client key and ships it to the peer in an
+// `EncryptedControl{IdentityProof}`. Runs at most once per session
+// (`identityProofSent` flag). Safe to call before the manager's
+// client key is configured: in that case we log and skip — without a
+// client key the session is unauthenticated and the peer will
+// (correctly) never grant us authentication, so the cipher will
+// never become observable and traffic stays plaintext.
+func (self *peerEncryptionSession) sendIdentityProofOnce() {
+	exporter, payload, skipReason := func() ([]byte, []byte, string) {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if self.identityProofSent {
+			return nil, nil, "already sent"
+		}
+		if len(self.tlsExporter) == 0 {
+			return nil, nil, "no tls exporter (handshake not done?)"
+		}
+		if self.manager == nil || self.manager.clientKeyManager == nil {
+			return nil, nil, "no client key manager configured"
+		}
+		self.identityProofSent = true
+		return self.tlsExporter, self.manager.clientKeyManager.Sign(self.tlsExporter), ""
+	}()
+	if exporter == nil || payload == nil {
+		glog.V(1).Infof("[tls]%s sendIdentityProofOnce skipped: %s\n", self.logTag, skipReason)
+		return
+	}
+	glog.V(1).Infof(
+		"[tls]%s sendIdentityProofOnce: signing %d-byte exporter, sending %d-byte proof\n",
+		self.logTag, len(exporter), len(payload),
+	)
+	self.sendEncryptedControl(&protocol.EncryptedControl{
+		ControlType: protocol.EncryptedControlType_EncryptedControlIdentityProof,
+		Payload:     payload,
+	})
+}
+
+// maybeVerifyPendingPeerIdentityProof tries to verify a buffered peer
+// identity-proof payload. The proof can arrive over the wire before
+// any of: our TLS handshake completing (no `tlsExporter` yet), or the
+// peer's public client key being set via `SetPeerClientPublicKey`
+// (the contract hasn't been delivered yet). Called from any path that
+// could fill in the missing piece: `completeHandshake`,
+// `DeliverEncryptedControl(IdentityProof, ...)`, and
+// `SetPeerClientPublicKey`.
+func (self *peerEncryptionSession) maybeVerifyPendingPeerIdentityProof() {
+	payload, exporter, peerPub, ready, skipReason := func() ([]byte, []byte, ed25519.PublicKey, bool, string) {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if self.peerIdentityVerified {
+			return nil, nil, nil, false, "already verified"
+		}
+		if self.identityFailed {
+			return nil, nil, nil, false, "identity already marked failed"
+		}
+		if len(self.pendingPeerIdentityProof) == 0 {
+			return nil, nil, nil, false, "no peer identity proof received yet"
+		}
+		if len(self.tlsExporter) == 0 {
+			return nil, nil, nil, false, "tls exporter not derived (handshake not done)"
+		}
+		if len(self.peerClientPublicKey) != ed25519.PublicKeySize {
+			return nil, nil, nil, false, "peer client public key not yet known"
+		}
+		// Snapshot under the lock; verification (ed25519 check) is
+		// cheap but we don't want to hold the lock across it.
+		return self.pendingPeerIdentityProof, self.tlsExporter, self.peerClientPublicKey, true, ""
+	}()
+	if !ready {
+		glog.V(2).Infof("[tls]%s maybeVerifyPendingPeerIdentityProof skipped: %s\n", self.logTag, skipReason)
+		return
+	}
+	ok := VerifyClientKeySignature(peerPub, exporter, payload)
+	flipped := func() bool {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		// Drop the buffered payload either way: success means it's
+		// served its purpose; failure means we don't want to keep
+		// re-checking a known-bad proof.
+		self.pendingPeerIdentityProof = nil
+		if ok {
+			self.peerIdentityVerified = true
+		} else {
+			self.identityFailed = true
+		}
+		return true
+	}()
+	if !flipped {
+		return
+	}
+	if ok {
+		glog.V(1).Infof("[tls]%s peer identity proof verified — cipher is now usable\n", self.logTag)
+	} else {
+		glog.Errorf(
+			"[tls]%s peer identity proof FAILED (peer key %d bytes, exporter %d bytes, sig %d bytes) — session left unauthenticated\n",
+			self.logTag, len(peerPub), len(exporter), len(payload),
+		)
+	}
+	self.readyMonitor.NotifyAll()
+}
+
+// SetPeerClientPublicKey records the peer's long-lived Ed25519 public
+// identity key for this session. Called from the SendSequence when a
+// contract for the peer arrives (the contract carries the peer's
+// public key in `destination_client_public_key`). Once set, the
+// session can verify a buffered peer identity proof; if a proof
+// already arrived, this triggers verification immediately.
 //
-// `Client.run` may have already applied this same payload via
-// `OptimisticallyDeliverHandshake` (for handshake bytes that arrive
-// when we're in the awaiting-client-Finished window) — if so, the
-// handshake has completed by now and the TLS state machine no longer
-// reads from `transport.inbox`. Re-delivering would just enlarge the
-// inbox buffer to no purpose. Skip in that case.
+// First-write-wins for the key value: subsequent calls with a
+// matching key are no-ops; subsequent calls with a *different* key
+// are logged and ignored (this would indicate either a bug in the
+// platform's contract authoring or, more concerning, an MITM
+// substituting different keys in different contracts to the same
+// peer — either way, refusing to switch keys mid-session is the safe
+// behavior).
+func (self *peerEncryptionSession) SetPeerClientPublicKey(pub ed25519.PublicKey) {
+	if len(pub) != ed25519.PublicKeySize {
+		glog.V(1).Infof(
+			"[tls]%s SetPeerClientPublicKey rejected: key length %d (expected %d)\n",
+			self.logTag, len(pub), ed25519.PublicKeySize,
+		)
+		return
+	}
+	changed := func() bool {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if len(self.peerClientPublicKey) == 0 {
+			self.peerClientPublicKey = append(ed25519.PublicKey(nil), pub...)
+			return true
+		}
+		if !bytes.Equal(self.peerClientPublicKey, pub) {
+			glog.Errorf(
+				"[tls]%s peer client public key mismatch with prior commitment — refusing to rotate mid-session\n",
+				self.logTag,
+			)
+		}
+		return false
+	}()
+	if changed {
+		glog.V(1).Infof("[tls]%s peer client public key set (first-time)\n", self.logTag)
+		self.maybeVerifyPendingPeerIdentityProof()
+		// Out-of-band cross-check: ask the per-session fetcher
+		// (typically the platform's unauthenticated `/key/<peerId>`
+		// API) what it thinks this peer's public key is, and log a
+		// loud warning if that value disagrees with what the contract
+		// just told us. We only do this once per session (`changed`
+		// is true only on the first set) and asynchronously so the
+		// contract-processing path is never blocked on an HTTP round
+		// trip. Today we only log on mismatch; we still trust the
+		// contract-supplied key for verification. The fetcher is
+		// session-scoped; the fetched key is compared and discarded,
+		// never retained on the session.
+		if self.peerClientPublicKeyFetcher != nil {
+			contractPub := append(ed25519.PublicKey(nil), pub...)
+			go HandleError(func() {
+				self.crossCheckPeerClientPublicKey(contractPub)
+			})
+		}
+	}
+}
+
+// crossCheckPeerClientPublicKey fetches the peer's public client key
+// via the session's per-session fetcher (set from
+// `EncryptionSettings.NewPeerClientPublicKeyFetcher` at session
+// creation) and compares it against `contractPub` — the value just
+// delivered to `SetPeerClientPublicKey` by the contract. A mismatch
+// is logged loudly: the platform either (a) is racing different
+// contracts with inconsistent keys (data bug), or (b) is substituting
+// keys to mount a MITM (security bug). Today, log only — the
+// contract-supplied key is still trusted for cert and identity-proof
+// verification. A future iteration will harden this to refuse the
+// substituted key. The fetched key lives only on the goroutine
+// stack: not stored on the session, not cached by the manager.
+func (self *peerEncryptionSession) crossCheckPeerClientPublicKey(contractPub ed25519.PublicKey) {
+	fetched, err := self.peerClientPublicKeyFetcher(self.ctx)
+	if err != nil {
+		glog.V(1).Infof("[key]%s peer public-key fetch failed: %s\n", self.logTag, err)
+		return
+	}
+	if len(fetched) == 0 {
+		glog.V(1).Infof("[key]%s peer public-key fetch returned no key (peer has not published yet)\n", self.logTag)
+		return
+	}
+	if len(fetched) != ed25519.PublicKeySize {
+		glog.Errorf(
+			"[key]%s peer public-key fetch returned %d bytes (expected %d)\n",
+			self.logTag, len(fetched), ed25519.PublicKeySize,
+		)
+		return
+	}
+	if !bytes.Equal(fetched, contractPub) {
+		glog.Errorf(
+			"[key]%s CONTRACT vs FETCHED peer client public key MISMATCH for %s — possible platform MITM (today: log only, contract value still trusted)\n",
+			self.logTag, self.peerId,
+		)
+		return
+	}
+	glog.V(1).Infof("[key]%s peer public-key cross-check OK\n", self.logTag)
+}
+
+// PeerClientPublicKey returns the recorded peer public key (may be
+// nil if none has been set yet). Read under stateLock and returned by
+// value so callers can use it without coordination.
+func (self *peerEncryptionSession) PeerClientPublicKey() ed25519.PublicKey {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if len(self.peerClientPublicKey) == 0 {
+		return nil
+	}
+	return append(ed25519.PublicKey(nil), self.peerClientPublicKey...)
+}
+
+// DeliverEncryptedControl is called by a ReceiveSequence when it sees a
+// TransferEncryptedControl frame addressed to this session's peer.
+//
+// Two control types are recognized:
+//
+//   - `EncryptedControlHandshake`: raw TLS handshake bytes. Fed into
+//     the per-peer TLS transport for the TLS state machine to process.
+//     `Client.run` may have already applied this same payload via
+//     `OptimisticallyDeliverHandshake` (for handshake bytes that
+//     arrive when we're in the awaiting-client-Finished window) — if
+//     so, the handshake has completed by now and the TLS state
+//     machine no longer reads from `transport.inbox`. Re-delivering
+//     would just enlarge the inbox buffer to no purpose. Skip when
+//     `handshakeDone` is already closed.
+//
+//   - `EncryptedControlIdentityProof`: the peer's Ed25519 signature
+//     over the TLS exporter output, made with its long-lived client
+//     identity key. Verified against the peer's public client key
+//     (set via `SetPeerClientPublicKey` from contract data). Verifies
+//     immediately if both the peer key and our own exporter are
+//     available; otherwise buffered and tried again as those become
+//     available. Success flips `peerIdentityVerified`, at which point
+//     `Cipher()` exposes the AEAD; failure flips `identityFailed`
+//     (sticky), permanently keeping the cipher hidden so the session
+//     stays plaintext.
 func (self *peerEncryptionSession) DeliverEncryptedControl(ec *protocol.EncryptedControl) {
-	if ec.ControlType != protocol.EncryptedControlType_EncryptedControlHandshake {
-		return
-	}
-	select {
-	case <-self.handshakeDone:
-		return
+	switch ec.ControlType {
+	case protocol.EncryptedControlType_EncryptedControlHandshake:
+		select {
+		case <-self.handshakeDone:
+			glog.V(2).Infof(
+				"[tls]%s DeliverEncryptedControl(Handshake) %d bytes — skipped, handshake already done\n",
+				self.logTag, len(ec.Payload),
+			)
+			return
+		default:
+		}
+		var firstByte byte
+		if 0 < len(ec.Payload) {
+			firstByte = ec.Payload[0]
+		}
+		glog.V(1).Infof(
+			"[tls]%s DeliverEncryptedControl(Handshake): feeding %d bytes (record type 0x%02x) to TLS state\n",
+			self.logTag, len(ec.Payload), firstByte,
+		)
+		self.startInternal()
+		if self.transport != nil {
+			self.transport.Deliver(ec.Payload)
+		}
+	case protocol.EncryptedControlType_EncryptedControlIdentityProof:
+		glog.V(1).Infof(
+			"[tls]%s DeliverEncryptedControl(IdentityProof): received %d-byte proof\n",
+			self.logTag, len(ec.Payload),
+		)
+		self.receivePeerIdentityProof(ec.Payload)
 	default:
+		glog.V(1).Infof(
+			"[tls]%s DeliverEncryptedControl: unknown control type %v (%d bytes)\n",
+			self.logTag, ec.ControlType, len(ec.Payload),
+		)
 	}
-	self.startInternal()
-	if self.transport != nil {
-		self.transport.Deliver(ec.Payload)
+}
+
+// receivePeerIdentityProof buffers the peer's identity-proof payload
+// and attempts verification. If the peer key and our TLS exporter are
+// both already known, verification runs immediately. Otherwise the
+// payload sits in `pendingPeerIdentityProof` and gets retried by
+// `maybeVerifyPendingPeerIdentityProof` whenever one of the missing
+// pieces becomes available (TLS handshake completes;
+// `SetPeerClientPublicKey` is called).
+//
+// A second proof arriving while one is already buffered or after a
+// definitive verification (success or failure) is ignored: the
+// session has at most one identity-proof exchange per session
+// lifetime, and a second proof from the peer is either a benign
+// retransmit or a manipulation attempt — either way, refusing to
+// re-evaluate is safe.
+func (self *peerEncryptionSession) receivePeerIdentityProof(payload []byte) {
+	stored, skipReason := func() (bool, string) {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if self.peerIdentityVerified {
+			return false, "already verified"
+		}
+		if self.identityFailed {
+			return false, "identity already failed"
+		}
+		if len(self.pendingPeerIdentityProof) != 0 {
+			return false, "another proof already buffered"
+		}
+		if len(payload) != ed25519.SignatureSize {
+			// invalid shape; record as failed to keep the session
+			// from ever exposing its cipher.
+			self.identityFailed = true
+			return false, fmt.Sprintf("malformed sig length %d (expected %d)", len(payload), ed25519.SignatureSize)
+		}
+		self.pendingPeerIdentityProof = append([]byte(nil), payload...)
+		return true, ""
+	}()
+	if !stored {
+		// either we already have a proof in flight, the session is
+		// already in a final identity state, or we marked failure
+		// because the payload was malformed.
+		glog.V(1).Infof("[tls]%s receivePeerIdentityProof skipped: %s\n", self.logTag, skipReason)
+		self.readyMonitor.NotifyAll()
+		return
 	}
+	glog.V(1).Infof("[tls]%s receivePeerIdentityProof buffered %d-byte proof — attempting verify\n", self.logTag, len(payload))
+	self.maybeVerifyPendingPeerIdentityProof()
 }
 
 // OptimisticallyDeliverHandshake feeds handshake payload bytes directly
@@ -684,6 +1142,10 @@ func (self *peerEncryptionSession) DeliverEncryptedControl(ec *protocol.Encrypte
 // safe to feed bytes to the TLS state machine).
 func (self *peerEncryptionSession) OptimisticallyDeliverHandshake(payload []byte) {
 	if !self.IsAwaitingClientFinished() {
+		glog.V(2).Infof(
+			"[tls]%s OptimisticallyDeliverHandshake skipped: not awaiting client Finished\n",
+			self.logTag,
+		)
 		return
 	}
 	// isClientSecondFlightPrefix: the first byte of `payload` is a TLS
@@ -707,8 +1169,20 @@ func (self *peerEncryptionSession) OptimisticallyDeliverHandshake(payload []byte
 		}
 	}
 	if !isClientSecondFlightPrefix() {
+		var firstByte byte
+		if 0 < len(payload) {
+			firstByte = payload[0]
+		}
+		glog.V(1).Infof(
+			"[tls]%s OptimisticallyDeliverHandshake filtered out: %d bytes, first byte 0x%02x (not a client-second-flight prefix)\n",
+			self.logTag, len(payload), firstByte,
+		)
 		return
 	}
+	glog.V(1).Infof(
+		"[tls]%s OptimisticallyDeliverHandshake: feeding %d bytes (record type 0x%02x) to TLS state\n",
+		self.logTag, len(payload), payload[0],
+	)
 	self.startInternal()
 	if self.transport != nil {
 		self.transport.Deliver(payload)
@@ -723,13 +1197,47 @@ func (self *peerEncryptionSession) ReadyNotify() chan struct{} {
 	return self.readyMonitor.NotifyChannel()
 }
 
-// Cipher returns the AEAD cipher, or nil if the handshake has not
-// completed (or failed — leaving the cipher unset is the steady-state
-// signal that traffic should flow in plaintext for this peer).
+// Cipher returns the AEAD cipher, or nil if the session is not in a
+// state where it can be safely used to wrap/unwrap application
+// frames. Nil means "treat as plaintext for this peer." The AEAD is
+// withheld until ALL of:
+//   - the TLS handshake has completed successfully (cipher derived),
+//   - the peer's identity proof has been verified against the peer's
+//     long-lived public client key.
+//
+// If either prerequisite fails — TLS handshake errors out, identity
+// proof verifies to the wrong signature, or never arrives at all —
+// the cipher stays nil for the lifetime of the session and traffic
+// flows in plaintext. This matches the existing "cipher is a binary
+// property of the session" wire semantics (see
+// `writeMaybeWrappedBytes`): peers that cannot mutually authenticate
+// fall back to plaintext rather than encrypted-but-unauthenticated.
 func (self *peerEncryptionSession) Cipher() *sequenceCipher {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	return self.cipher
+	if !self.peerIdentityVerified {
+		if glog.V(2) {
+			// Only at V(2): this is called per send. We trace the
+			// specific reason the cipher isn't available so the
+			// caller can correlate plaintext writes to the underlying
+			// gate.
+			reason := "tls handshake not done"
+			if self.derivedTlsCipher != nil {
+				if self.identityFailed {
+					reason = "identity proof verification FAILED"
+				} else if len(self.peerClientPublicKey) == 0 {
+					reason = "peer client public key not yet known"
+				} else if len(self.pendingPeerIdentityProof) == 0 {
+					reason = "peer identity proof not yet received"
+				} else {
+					reason = "identity verification pending"
+				}
+			}
+			glog.V(2).Infof("[tls]%s Cipher()=nil: %s\n", self.logTag, reason)
+		}
+		return nil
+	}
+	return self.derivedTlsCipher
 }
 
 // IsAwaitingClientFinished reports whether this session is in the narrow
@@ -815,24 +1323,69 @@ func (self *peerEncryptionSession) MarkCertVerified() {
 	self.certVerified = true
 }
 
-// AddTrustedPeerCertChain extends the session's trusted peer cert set with
-// `chain` (PEM-encoded, leaf first). The verification routine accepts the
-// peer's TLS-handshake leaf cert if it matches any entry currently in the
-// set.
+// AddTrustedPeerCertChain extends the session's trusted peer cert set
+// with `chain` (PEM-encoded, leaf first), gated on a successful
+// signature check. `chainSig` must be the peer's Ed25519 signature
+// over the canonical encoding of `chain` (concatenation of PEM
+// blocks), made under the peer's long-lived client identity key. The
+// verifier is the session's currently-known peer public client key
+// (`peerClientPublicKey`, set via `SetPeerClientPublicKey`).
 //
-// When `chain` is empty — i.e., the contract carried no
-// `ProvideTlsCertificate` commitment — the trusted set is left as-is.
-// Verification then either skips (set still empty) or runs against
-// whatever certs were added by earlier contracts. This means a
-// race between the local sender getting a contract and the peer's
-// `EncryptedKey` propagating doesn't permanently disable verification:
-// once a later contract carries the peer's cert, verification turns on.
-func (self *peerEncryptionSession) AddTrustedPeerCertChain(chain [][]byte) {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
+// All four states are handled:
+//   - empty chain → no-op (no commitment to add).
+//   - non-empty chain + no peer client key known yet → no-op; the
+//     chain is dropped (and the contract's commitment is effectively
+//     unverifiable until the peer key is delivered). A later contract
+//     that arrives with both pieces will succeed.
+//   - non-empty chain + peer key known + signature absent → no-op;
+//     log a warning. Pre-identity-rollout peers may not carry sigs
+//     yet; once they do, the cert is admitted.
+//   - non-empty chain + peer key known + signature present and
+//     verifies → admit all PEM blocks into `trustedPeerCertPems`.
+//   - non-empty chain + peer key known + signature present and
+//     FAILS → log and drop. Signals a substitution attempt
+//     (platform-authored MITM) or a misbehaving peer; in either case
+//     we refuse to extend trust to this cert.
+//
+// Skipping (rather than latching failure) on any of the "no-op" cases
+// is deliberate: a single missing piece doesn't poison the session;
+// a later contract that has everything still works. Hard-failure is
+// reserved for an actively-bad signature.
+func (self *peerEncryptionSession) AddTrustedPeerCertChain(chain [][]byte, chainSig []byte) {
 	if len(chain) == 0 {
 		return
 	}
+	peerPub := func() ed25519.PublicKey {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if len(self.peerClientPublicKey) != ed25519.PublicKeySize {
+			return nil
+		}
+		return append(ed25519.PublicKey(nil), self.peerClientPublicKey...)
+	}()
+	if peerPub == nil {
+		glog.V(1).Infof(
+			"[tls]%s contract cert chain dropped: peer client public key not yet known\n",
+			self.logTag,
+		)
+		return
+	}
+	if len(chainSig) == 0 {
+		glog.Errorf(
+			"[tls]%s contract cert chain dropped: no client-key signature provided\n",
+			self.logTag,
+		)
+		return
+	}
+	if !VerifyCertChainSignature(peerPub, chain, chainSig) {
+		glog.Errorf(
+			"[tls]%s contract cert chain dropped: client-key signature verification FAILED\n",
+			self.logTag,
+		)
+		return
+	}
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
 	if self.trustedPeerCertPems == nil {
 		self.trustedPeerCertPems = map[string]bool{}
 	}
@@ -902,9 +1455,10 @@ func (self *peerEncryptionSession) close() {
 // original handshake is reused for every direction (including companion
 // replies) until the session is torn down.
 type EncryptionSessionManager struct {
-	ctx      context.Context
-	client   *Client
-	settings *EncryptionSettings
+	ctx              context.Context
+	client           *Client
+	clientKeyManager *ClientKeyManager
+	settings         *EncryptionSettings
 
 	// `serverTlsConfig` is the receiver-role TLS config used by every
 	// per-peer session this manager owns. It carries one persistent
@@ -919,6 +1473,14 @@ type EncryptionSessionManager struct {
 	// PEM-encoded chain of the local cert (leaf first). Published via
 	// `EncryptedKey`. Empty when encryption is disabled.
 	selfCertPem [][]byte
+	// PEM-encoded private key (PKCS#8, single block) that matches the
+	// leaf cert in `selfCertPem`. Held so persistence callers can read
+	// the matched pair back through
+	// `ProvideTlsCertificatePem()` / `ProvideTlsPrivateKeyPem()` and
+	// load it on a subsequent run. Empty when encryption is disabled
+	// or when the caller provided a `tls.Config` whose certificate
+	// has no exposed private key (e.g., a `GetCertificate` callback).
+	selfPrivateKeyPem []byte
 
 	controlSyncEncryptedKey *ControlSync
 
@@ -926,23 +1488,29 @@ type EncryptionSessionManager struct {
 	sessions  map[Id]*peerEncryptionSession
 }
 
-func NewEncryptionSessionManager(ctx context.Context, client *Client, settings *EncryptionSettings) *EncryptionSessionManager {
+func NewEncryptionSessionManager(ctx context.Context, client *Client, clientKeyManager *ClientKeyManager, settings *EncryptionSettings) *EncryptionSessionManager {
 	if settings == nil {
 		settings = DefaultEncryptionSettings()
 	}
 	m := &EncryptionSessionManager{
-		ctx:      ctx,
-		client:   client,
-		settings: settings,
-		sessions: map[Id]*peerEncryptionSession{},
+		ctx:              ctx,
+		client:           client,
+		clientKeyManager: clientKeyManager,
+		settings:         settings,
+		sessions:         map[Id]*peerEncryptionSession{},
 	}
 	if settings.Encrypt {
-		serverTlsConfig, selfCertPem, err := resolveReceiveTlsConfig(settings.ServerTlsConfig)
+		serverTlsConfig, selfCertPem, selfPrivateKeyPem, err := resolveReceiveTlsConfig(
+			settings.ServerTlsConfig,
+			settings.ProvideTlsCertificatePem,
+			settings.ProvideTlsPrivateKeyPem,
+		)
 		if err != nil {
 			glog.Errorf("[tls]%s could not initialize server TLS config: %s\n", client.ClientTag(), err)
 		} else {
 			m.serverTlsConfig = serverTlsConfig
 			m.selfCertPem = selfCertPem
+			m.selfPrivateKeyPem = selfPrivateKeyPem
 		}
 		m.clientTlsConfig = resolveSendTlsConfig(settings.ClientTlsConfig)
 		// Mutual TLS: the TLS-client side presents the same self cert the
@@ -992,8 +1560,18 @@ func (self *EncryptionSessionManager) publishEncryptedKey() {
 	case <-self.ctx.Done():
 		return
 	}
+	// Sign the cert chain with our long-lived client identity key.
+	// Senders that fetch our public client key out-of-band can then
+	// verify the cert chain attached to a contract by the platform
+	// was authentically committed by us — substituting the cert
+	// without forging this signature requires our private key.
+	var certSig []byte
+	if self.clientKeyManager != nil && 0 < len(self.selfCertPem) {
+		certSig = self.clientKeyManager.SignCertChain(self.selfCertPem)
+	}
 	frame, err := ToFrame(&protocol.EncryptedKey{
-		ProvideTlsCertificate: self.selfCertPem,
+		ProvideTlsCertificate:         self.selfCertPem,
+		ClientKeySignedTlsCertificate: certSig,
 	}, self.client.settings.ProtocolVersion)
 	if err != nil {
 		glog.Errorf("[tls]%s could not build EncryptedKey frame: %s\n", self.client.ClientTag(), err)
@@ -1007,6 +1585,37 @@ func (self *EncryptionSessionManager) publishEncryptedKey() {
 // encryption is disabled or cert setup failed.
 func (self *EncryptionSessionManager) SelfCertPem() [][]byte {
 	return self.selfCertPem
+}
+
+// ProvideTlsCertificatePem returns the local TLS cert chain as a
+// single concatenated PEM byte slice (one or more
+// `-----BEGIN CERTIFICATE-----` blocks, leaf first). Pair with
+// `ProvideTlsPrivateKeyPem` to persist and reload the cert across
+// restarts via `EncryptionSettings.ProvideTlsCertificatePem` /
+// `ProvideTlsPrivateKeyPem`. Returns nil when encryption is disabled
+// or cert setup failed.
+func (self *EncryptionSessionManager) ProvideTlsCertificatePem() []byte {
+	if len(self.selfCertPem) == 0 {
+		return nil
+	}
+	var n int
+	for _, b := range self.selfCertPem {
+		n += len(b)
+	}
+	out := make([]byte, 0, n)
+	for _, b := range self.selfCertPem {
+		out = append(out, b...)
+	}
+	return out
+}
+
+// ProvideTlsPrivateKeyPem returns the PEM-encoded PKCS#8 private key
+// matching the leaf of `ProvideTlsCertificatePem()`. Empty when
+// encryption is disabled, when the cert was supplied via a
+// `tls.Config` with no exposed private key (e.g. `GetCertificate`
+// callback), or when cert setup failed.
+func (self *EncryptionSessionManager) ProvideTlsPrivateKeyPem() []byte {
+	return self.selfPrivateKeyPem
 }
 
 // ServerTlsConfig returns the TLS config used by every per-peer session
@@ -1145,18 +1754,59 @@ func resolveSendTlsConfig(cfg *tls.Config) *tls.Config {
 }
 
 // resolveReceiveTlsConfig returns a usable TLS config for the TLS-server
-// side along with the PEM-encoded chain (leaf first) of the cert it will
-// present. When `cfg` provides a certificate, that cert is used and its
-// chain is returned; otherwise a fresh self-signed cert is generated and
-// folded into a default config.
-func resolveReceiveTlsConfig(cfg *tls.Config) (*tls.Config, [][]byte, error) {
+// side along with the PEM-encoded chain (leaf first) of the cert it
+// will present and the PEM-encoded private key matching the leaf.
+// Resolution precedence:
+//
+//  1. `cfg.Certificates` (or `cfg.GetCertificate`) — caller-supplied
+//     full `tls.Config` wins; the leaf cert/key are exported for
+//     persistence callers via the returned PEM values.
+//  2. `certPem` + `keyPem` — pre-loaded PEM bytes (e.g., from a
+//     previous run saved by `Client.EncryptionSessionManager().
+//     ProvideTlsCertificatePem()` / `ProvideTlsPrivateKeyPem()`).
+//     Parsed into a `tls.Certificate` and folded into a default
+//     config.
+//  3. Otherwise, generate a fresh ephemeral self-signed cert via
+//     `DefaultSequenceServerTlsConfig`.
+func resolveReceiveTlsConfig(cfg *tls.Config, certPem, keyPem []byte) (*tls.Config, [][]byte, []byte, error) {
 	if cfg != nil && (0 < len(cfg.Certificates) || cfg.GetCertificate != nil) {
 		out := cfg.Clone()
-		return out, certificateToPemChain(out.Certificates), nil
+		_, exportedKey := exportCertAndKeyPem(out.Certificates)
+		return out, certificateToPemChain(out.Certificates), exportedKey, nil
+	}
+	if 0 < len(certPem) && 0 < len(keyPem) {
+		cert, err := tls.X509KeyPair(certPem, keyPem)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("load provide tls cert/key: %w", err)
+		}
+		if cert.Leaf == nil && 0 < len(cert.Certificate) {
+			if leaf, leafErr := x509.ParseCertificate(cert.Certificate[0]); leafErr == nil {
+				cert.Leaf = leaf
+			}
+		}
+		out := &tls.Config{
+			Certificates:     []tls.Certificate{cert},
+			ClientAuth:       tls.RequireAnyClientCert,
+			MinVersion:       tls.VersionTLS13,
+			NextProtos:       []string{"urnetwork/sequence"},
+			CurvePreferences: append([]tls.CurveID(nil), DefaultSequencePostQuantumCurves...),
+		}
+		if cfg != nil {
+			if 0 < cfg.MinVersion {
+				out.MinVersion = cfg.MinVersion
+			}
+			if 0 < len(cfg.NextProtos) {
+				out.NextProtos = cfg.NextProtos
+			}
+			if cfg.ClientAuth != tls.NoClientCert {
+				out.ClientAuth = cfg.ClientAuth
+			}
+		}
+		return out, certificateToPemChain(out.Certificates), keyPem, nil
 	}
 	out, err := DefaultSequenceServerTlsConfig()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if cfg != nil {
 		if 0 < cfg.MinVersion {
@@ -1169,7 +1819,29 @@ func resolveReceiveTlsConfig(cfg *tls.Config) (*tls.Config, [][]byte, error) {
 			out.ClientAuth = cfg.ClientAuth
 		}
 	}
-	return out, certificateToPemChain(out.Certificates), nil
+	_, generatedKey := exportCertAndKeyPem(out.Certificates)
+	return out, certificateToPemChain(out.Certificates), generatedKey, nil
+}
+
+// exportCertAndKeyPem returns the leaf cert chain and the private key
+// of `certs[0]` as PEM bytes, suitable for persistence and later
+// reload through `resolveReceiveTlsConfig`. Returns nil for the key
+// if the cert has no private key set (e.g., when the caller supplied
+// a `tls.Config` with only a `GetCertificate` callback).
+func exportCertAndKeyPem(certs []tls.Certificate) (certPem []byte, keyPem []byte) {
+	if len(certs) == 0 {
+		return nil, nil
+	}
+	cert := certs[0]
+	for _, der := range cert.Certificate {
+		certPem = append(certPem, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})...)
+	}
+	if cert.PrivateKey != nil {
+		if der, err := x509.MarshalPKCS8PrivateKey(cert.PrivateKey); err == nil {
+			keyPem = pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+		}
+	}
+	return certPem, keyPem
 }
 
 // certificateToPemChain extracts the PEM-encoded chain of the first

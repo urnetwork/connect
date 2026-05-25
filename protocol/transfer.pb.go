@@ -198,18 +198,30 @@ const (
 	// Raw TLS handshake bytes. The peer's encryption session feeds these
 	// straight into its `tls.Conn` state machine. Pack delivery is reliable
 	// and in order, so no chunk indexing is needed.
-	EncryptedControlType_EncryptedControlHandshake EncryptedControlType = 2
+	EncryptedControlType_EncryptedControlHandshake EncryptedControlType = 1
+	// Post-handshake identity proof. `payload` is the sender's Ed25519
+	// signature, made with its long-lived client identity key, over the
+	// 32-byte TLS exporter output for label
+	// `urnetwork-sequence-identity-proof`. The receiver verifies the
+	// signature against the sender's public client key (fetched
+	// out-of-band, not from the platform-authored contract). A valid
+	// proof binds the negotiated TLS session keys to the sender's
+	// long-lived identity, defeating an active MITM whose substituted
+	// TLS cert would produce a different exporter on each leg.
+	EncryptedControlType_EncryptedControlIdentityProof EncryptedControlType = 2
 )
 
 // Enum value maps for EncryptedControlType.
 var (
 	EncryptedControlType_name = map[int32]string{
 		0: "EncryptedControlNone",
-		2: "EncryptedControlHandshake",
+		1: "EncryptedControlHandshake",
+		2: "EncryptedControlIdentityProof",
 	}
 	EncryptedControlType_value = map[string]int32{
-		"EncryptedControlNone":      0,
-		"EncryptedControlHandshake": 2,
+		"EncryptedControlNone":          0,
+		"EncryptedControlHandshake":     1,
+		"EncryptedControlIdentityProof": 2,
 	}
 )
 
@@ -1347,8 +1359,22 @@ type Contract struct {
 	// platform populates this from the destination's
 	// `ProvideKey.provide_tls_certificate`.
 	ProvideTlsCertificate [][]byte `protobuf:"bytes,4,rep,name=provide_tls_certificate,json=provideTlsCertificate,proto3" json:"provide_tls_certificate,omitempty"`
-	unknownFields         protoimpl.UnknownFields
-	sizeCache             protoimpl.SizeCache
+	// Destination's 32-byte Ed25519 public identity key (see `ClientKey`).
+	// Authoritative copy lives in `StoredContract`; this is a convenience
+	// copy for clients that don't unmarshal the stored bytes.
+	DestinationClientPublicKey []byte `protobuf:"bytes,5,opt,name=destination_client_public_key,json=destinationClientPublicKey,proto3" json:"destination_client_public_key,omitempty"`
+	// Destination's Ed25519 signature over the canonical concatenation
+	// of every PEM block in `provide_tls_certificate`, made with the
+	// destination's long-lived client identity private key (see
+	// `EncryptedKey.client_key_signed_tls_certificate`). The sender
+	// verifies this signature against the destination's public client
+	// key (fetched out-of-band, NOT trusted from this field of the
+	// contract) before treating the cert chain as a valid commitment.
+	// Authoritative copy lives in `StoredContract`; this is a
+	// convenience copy.
+	DestinationClientKeySignedTlsCertificate []byte `protobuf:"bytes,6,opt,name=destination_client_key_signed_tls_certificate,json=destinationClientKeySignedTlsCertificate,proto3" json:"destination_client_key_signed_tls_certificate,omitempty"`
+	unknownFields                            protoimpl.UnknownFields
+	sizeCache                                protoimpl.SizeCache
 }
 
 func (x *Contract) Reset() {
@@ -1409,6 +1435,20 @@ func (x *Contract) GetProvideTlsCertificate() [][]byte {
 	return nil
 }
 
+func (x *Contract) GetDestinationClientPublicKey() []byte {
+	if x != nil {
+		return x.DestinationClientPublicKey
+	}
+	return nil
+}
+
+func (x *Contract) GetDestinationClientKeySignedTlsCertificate() []byte {
+	if x != nil {
+		return x.DestinationClientKeySignedTlsCertificate
+	}
+	return nil
+}
+
 type StoredContract struct {
 	state             protoimpl.MessageState `protogen:"open.v1"`
 	ContractId        []byte                 `protobuf:"bytes,1,opt,name=contract_id,json=contractId,proto3" json:"contract_id,omitempty"`
@@ -1431,8 +1471,21 @@ type StoredContract struct {
 	// the platform-signed contract bytes so the sender can rely on the
 	// certificate identity for the TLS session with the destination.
 	ProvideTlsCertificate [][]byte `protobuf:"bytes,7,rep,name=provide_tls_certificate,json=provideTlsCertificate,proto3" json:"provide_tls_certificate,omitempty"`
-	unknownFields         protoimpl.UnknownFields
-	sizeCache             protoimpl.SizeCache
+	// Destination's 32-byte Ed25519 public identity key (see `ClientKey`).
+	// Sealed into the platform-signed contract bytes so the sender can
+	// bind the cert commitment in this contract to a stable long-lived
+	// identity. Sender SHOULD additionally cross-check this key against
+	// the out-of-band public-key lookup before extending trust.
+	DestinationClientPublicKey []byte `protobuf:"bytes,8,opt,name=destination_client_public_key,json=destinationClientPublicKey,proto3" json:"destination_client_public_key,omitempty"`
+	// Destination's Ed25519 signature over the canonical concatenation
+	// of every PEM block in `provide_tls_certificate`, made with the
+	// destination's long-lived client identity private key. Verified by
+	// the sender against the destination's public client key — gating
+	// whether the cert chain in this contract is admitted into the
+	// session's trusted-peer-cert set.
+	DestinationClientKeySignedTlsCertificate []byte `protobuf:"bytes,9,opt,name=destination_client_key_signed_tls_certificate,json=destinationClientKeySignedTlsCertificate,proto3" json:"destination_client_key_signed_tls_certificate,omitempty"`
+	unknownFields                            protoimpl.UnknownFields
+	sizeCache                                protoimpl.SizeCache
 }
 
 func (x *StoredContract) Reset() {
@@ -1510,6 +1563,20 @@ func (x *StoredContract) GetPriority() uint32 {
 func (x *StoredContract) GetProvideTlsCertificate() [][]byte {
 	if x != nil {
 		return x.ProvideTlsCertificate
+	}
+	return nil
+}
+
+func (x *StoredContract) GetDestinationClientPublicKey() []byte {
+	if x != nil {
+		return x.DestinationClientPublicKey
+	}
+	return nil
+}
+
+func (x *StoredContract) GetDestinationClientKeySignedTlsCertificate() []byte {
+	if x != nil {
+		return x.DestinationClientKeySignedTlsCertificate
 	}
 	return nil
 }
@@ -1813,8 +1880,16 @@ type EncryptedKey struct {
 	// PEM-encoded X.509 certificate chain (leaf first). Each entry is one
 	// PEM block (`-----BEGIN CERTIFICATE-----` ... `-----END CERTIFICATE-----`).
 	ProvideTlsCertificate [][]byte `protobuf:"bytes,1,rep,name=provide_tls_certificate,json=provideTlsCertificate,proto3" json:"provide_tls_certificate,omitempty"`
-	unknownFields         protoimpl.UnknownFields
-	sizeCache             protoimpl.SizeCache
+	// Ed25519 signature over the canonical concatenation of every PEM
+	// block in `provide_tls_certificate`, made with this client's
+	// long-lived identity private key (see `ClientKey`). Lets a remote
+	// peer verify that the cert chain attached to a contract by the
+	// platform was authentically committed by this client — substituting
+	// the cert without also forging this signature requires the client
+	// private key, which never leaves the client process.
+	ClientKeySignedTlsCertificate []byte `protobuf:"bytes,2,opt,name=client_key_signed_tls_certificate,json=clientKeySignedTlsCertificate,proto3" json:"client_key_signed_tls_certificate,omitempty"`
+	unknownFields                 protoimpl.UnknownFields
+	sizeCache                     protoimpl.SizeCache
 }
 
 func (x *EncryptedKey) Reset() {
@@ -1854,6 +1929,67 @@ func (x *EncryptedKey) GetProvideTlsCertificate() [][]byte {
 	return nil
 }
 
+func (x *EncryptedKey) GetClientKeySignedTlsCertificate() []byte {
+	if x != nil {
+		return x.ClientKeySignedTlsCertificate
+	}
+	return nil
+}
+
+// ClientKey publishes this client's long-lived public identity key
+// (Ed25519) to the platform. Sent as a control message
+// (MessageType = TransferClientKey). One key per client; the private
+// half stays in the client process. The platform stores the public key
+// per `client_id` and serves it to remote peers via an unauthenticated
+// lookup API — peers fetch it directly from that API, not via the
+// contract pipeline, so a malicious platform that substitutes a cert
+// in a contract cannot also substitute the identity key that would
+// validate the substituted cert's signature.
+type ClientKey struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 32-byte Ed25519 public key.
+	PublicKey     []byte `protobuf:"bytes,1,opt,name=public_key,json=publicKey,proto3" json:"public_key,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ClientKey) Reset() {
+	*x = ClientKey{}
+	mi := &file_transfer_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ClientKey) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ClientKey) ProtoMessage() {}
+
+func (x *ClientKey) ProtoReflect() protoreflect.Message {
+	mi := &file_transfer_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ClientKey.ProtoReflect.Descriptor instead.
+func (*ClientKey) Descriptor() ([]byte, []int) {
+	return file_transfer_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *ClientKey) GetPublicKey() []byte {
+	if x != nil {
+		return x.PublicKey
+	}
+	return nil
+}
+
 // out-of-band control messages between paired encryption sessions on two
 // peers. Carried inside a regular `Pack` as a `Frame` with
 // `message_type = TransferEncryptedControl`, so delivery is reliable and in
@@ -1873,7 +2009,7 @@ type EncryptedControl struct {
 
 func (x *EncryptedControl) Reset() {
 	*x = EncryptedControl{}
-	mi := &file_transfer_proto_msgTypes[24]
+	mi := &file_transfer_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1885,7 +2021,7 @@ func (x *EncryptedControl) String() string {
 func (*EncryptedControl) ProtoMessage() {}
 
 func (x *EncryptedControl) ProtoReflect() protoreflect.Message {
-	mi := &file_transfer_proto_msgTypes[24]
+	mi := &file_transfer_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1898,7 +2034,7 @@ func (x *EncryptedControl) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EncryptedControl.ProtoReflect.Descriptor instead.
 func (*EncryptedControl) Descriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{24}
+	return file_transfer_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *EncryptedControl) GetControlType() EncryptedControlType {
@@ -2024,12 +2160,14 @@ const file_transfer_proto_rawDesc = "" +
 	"\x0fcreate_contract\x18\x03 \x01(\v2\x19.bringyour.CreateContractH\x02R\x0ecreateContract\x88\x01\x01B\b\n" +
 	"\x06_errorB\v\n" +
 	"\t_contractB\x12\n" +
-	"\x10_create_contract\"\xe3\x01\n" +
+	"\x10_create_contract\"\x87\x03\n" +
 	"\bContract\x122\n" +
 	"\x15stored_contract_bytes\x18\x01 \x01(\fR\x13storedContractBytes\x120\n" +
 	"\x14stored_contract_hmac\x18\x02 \x01(\fR\x12storedContractHmac\x129\n" +
 	"\fprovide_mode\x18\x03 \x01(\x0e2\x16.bringyour.ProvideModeR\vprovideMode\x126\n" +
-	"\x17provide_tls_certificate\x18\x04 \x03(\fR\x15provideTlsCertificate\"\xe6\x02\n" +
+	"\x17provide_tls_certificate\x18\x04 \x03(\fR\x15provideTlsCertificate\x12A\n" +
+	"\x1ddestination_client_public_key\x18\x05 \x01(\fR\x1adestinationClientPublicKey\x12_\n" +
+	"-destination_client_key_signed_tls_certificate\x18\x06 \x01(\fR(destinationClientKeySignedTlsCertificate\"\x8a\x04\n" +
 	"\x0eStoredContract\x12\x1f\n" +
 	"\vcontract_id\x18\x01 \x01(\fR\n" +
 	"contractId\x12.\n" +
@@ -2038,7 +2176,9 @@ const file_transfer_proto_rawDesc = "" +
 	"\x0edestination_id\x18\x04 \x01(\fH\x01R\rdestinationId\x88\x01\x01\x12 \n" +
 	"\tstream_id\x18\x05 \x01(\fH\x02R\bstreamId\x88\x01\x01\x12\x1f\n" +
 	"\bpriority\x18\x06 \x01(\rH\x03R\bpriority\x88\x01\x01\x126\n" +
-	"\x17provide_tls_certificate\x18\a \x03(\fR\x15provideTlsCertificateB\f\n" +
+	"\x17provide_tls_certificate\x18\a \x03(\fR\x15provideTlsCertificate\x12A\n" +
+	"\x1ddestination_client_public_key\x18\b \x01(\fR\x1adestinationClientPublicKey\x12_\n" +
+	"-destination_client_key_signed_tls_certificate\x18\t \x01(\fR(destinationClientKeySignedTlsCertificateB\f\n" +
 	"\n" +
 	"_source_idB\x11\n" +
 	"\x0f_destination_idB\f\n" +
@@ -2070,9 +2210,13 @@ const file_transfer_proto_rawDesc = "" +
 	"\fresend_count\x18\f \x01(\x04R\vresendCount\x12\x1b\n" +
 	"\tstream_id\x18\r \x01(\fR\bstreamId\"\r\n" +
 	"\vControlPing\"\r\n" +
-	"\vProvidePing\"F\n" +
+	"\vProvidePing\"\x90\x01\n" +
 	"\fEncryptedKey\x126\n" +
-	"\x17provide_tls_certificate\x18\x01 \x03(\fR\x15provideTlsCertificate\"p\n" +
+	"\x17provide_tls_certificate\x18\x01 \x03(\fR\x15provideTlsCertificate\x12H\n" +
+	"!client_key_signed_tls_certificate\x18\x02 \x01(\fR\x1dclientKeySignedTlsCertificate\"*\n" +
+	"\tClientKey\x12\x1d\n" +
+	"\n" +
+	"public_key\x18\x01 \x01(\fR\tpublicKey\"p\n" +
 	"\x10EncryptedControl\x12B\n" +
 	"\fcontrol_type\x18\x01 \x01(\x0e2\x1f.bringyour.EncryptedControlTypeR\vcontrolType\x12\x18\n" +
 	"\apayload\x18\x02 \x01(\fR\apayload*d\n" +
@@ -2097,10 +2241,11 @@ const file_transfer_proto_rawDesc = "" +
 	"\x13InsufficientBalance\x10\x01\x12\t\n" +
 	"\x05Setup\x10\x02\x12\t\n" +
 	"\x05Trust\x10\x03\x12\v\n" +
-	"\aInvalid\x10\x04*\x95\x01\n" +
+	"\aInvalid\x10\x04*r\n" +
 	"\x14EncryptedControlType\x12\x18\n" +
 	"\x14EncryptedControlNone\x10\x00\x12\x1d\n" +
-	"\x19EncryptedControlHandshake\x10\x02\"\x04\b\x01\x10\x01\"\x04\b\x03\x10\x03*\x16EncryptedControlOptOut* EncryptedControlRequestHandshakeB'Z%github.com/urnetwork/connect/protocolb\x06proto3"
+	"\x19EncryptedControlHandshake\x10\x01\x12!\n" +
+	"\x1dEncryptedControlIdentityProof\x10\x02B'Z%github.com/urnetwork/connect/protocolb\x06proto3"
 
 var (
 	file_transfer_proto_rawDescOnce sync.Once
@@ -2115,7 +2260,7 @@ func file_transfer_proto_rawDescGZIP() []byte {
 }
 
 var file_transfer_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
-var file_transfer_proto_msgTypes = make([]protoimpl.MessageInfo, 25)
+var file_transfer_proto_msgTypes = make([]protoimpl.MessageInfo, 26)
 var file_transfer_proto_goTypes = []any{
 	(ProvideMode)(0),              // 0: bringyour.ProvideMode
 	(SignalType)(0),               // 1: bringyour.SignalType
@@ -2145,21 +2290,22 @@ var file_transfer_proto_goTypes = []any{
 	(*ControlPing)(nil),           // 25: bringyour.ControlPing
 	(*ProvidePing)(nil),           // 26: bringyour.ProvidePing
 	(*EncryptedKey)(nil),          // 27: bringyour.EncryptedKey
-	(*EncryptedControl)(nil),      // 28: bringyour.EncryptedControl
-	(*Frame)(nil),                 // 29: bringyour.Frame
-	(MessageType)(0),              // 30: bringyour.MessageType
+	(*ClientKey)(nil),             // 28: bringyour.ClientKey
+	(*EncryptedControl)(nil),      // 29: bringyour.EncryptedControl
+	(*Frame)(nil),                 // 30: bringyour.Frame
+	(MessageType)(0),              // 31: bringyour.MessageType
 }
 var file_transfer_proto_depIdxs = []int32{
 	4,  // 0: bringyour.TransferFrame.transfer_path:type_name -> bringyour.TransferPath
-	29, // 1: bringyour.TransferFrame.frame:type_name -> bringyour.Frame
-	30, // 2: bringyour.TransferFrame.message_type:type_name -> bringyour.MessageType
+	30, // 1: bringyour.TransferFrame.frame:type_name -> bringyour.Frame
+	31, // 2: bringyour.TransferFrame.message_type:type_name -> bringyour.MessageType
 	7,  // 3: bringyour.TransferFrame.pack:type_name -> bringyour.Pack
 	9,  // 4: bringyour.TransferFrame.ack:type_name -> bringyour.Ack
 	4,  // 5: bringyour.FilteredTransferFrame.transfer_path:type_name -> bringyour.TransferPath
-	29, // 6: bringyour.Pack.frames:type_name -> bringyour.Frame
-	29, // 7: bringyour.Pack.contract_frame:type_name -> bringyour.Frame
+	30, // 6: bringyour.Pack.frames:type_name -> bringyour.Frame
+	30, // 7: bringyour.Pack.contract_frame:type_name -> bringyour.Frame
 	10, // 8: bringyour.Pack.tag:type_name -> bringyour.Tag
-	29, // 9: bringyour.FilteredPack.contract_frame:type_name -> bringyour.Frame
+	30, // 9: bringyour.FilteredPack.contract_frame:type_name -> bringyour.Frame
 	10, // 10: bringyour.Ack.tag:type_name -> bringyour.Tag
 	13, // 11: bringyour.Provide.keys:type_name -> bringyour.ProvideKey
 	0,  // 12: bringyour.ProvideKey.mode:type_name -> bringyour.ProvideMode
@@ -2200,7 +2346,7 @@ func file_transfer_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_transfer_proto_rawDesc), len(file_transfer_proto_rawDesc)),
 			NumEnums:      4,
-			NumMessages:   25,
+			NumMessages:   26,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

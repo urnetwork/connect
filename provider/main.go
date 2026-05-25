@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -313,6 +314,21 @@ func provide(opts docopt.Opts) {
 		clientStrategySettings := connect.DefaultClientStrategySettings()
 		clientStrategySettings.ProxySettings = proxySettings
 		clientSettings := connect.DefaultClientSettings()
+		// Load previously-persisted long-lived identity material — the
+		// Ed25519 client-key seed and the sequence-level TLS server
+		// cert + private key. Missing or invalid files are silently
+		// ignored; the client will then generate fresh values and we
+		// save them back after construction.
+		if seed, err := readProviderClientKeySeed(); err == nil && 0 < len(seed) {
+			clientSettings.ClientKeySeed = seed
+		}
+		if certPem, keyPem, err := readProviderTlsCertAndKey(); err == nil && 0 < len(certPem) && 0 < len(keyPem) {
+			if clientSettings.EncryptionSettings == nil {
+				clientSettings.EncryptionSettings = connect.DefaultEncryptionSettings()
+			}
+			clientSettings.EncryptionSettings.ProvideTlsCertificatePem = certPem
+			clientSettings.EncryptionSettings.ProvideTlsPrivateKeyPem = keyPem
+		}
 		localUserNatSettings := connect.DefaultLocalUserNatSettings()
 		localUserNatSettings.TcpBufferSettings.ConnectSettings = clientStrategySettings.ConnectSettings
 		localUserNatSettings.UdpBufferSettings.ConnectSettings = clientStrategySettings.ConnectSettings
@@ -343,6 +359,28 @@ func provide(opts docopt.Opts) {
 		clientOob := connect.NewApiOutOfBandControl(proxyCtx, clientStrategy, byClientJwt, apiUrl)
 		connectClient := connect.NewClient(proxyCtx, clientId, clientOob, clientSettings)
 		defer connectClient.Close()
+
+		// Persist the live identity material so the next process
+		// start loads the same values. On a fresh install both
+		// reads above returned empty and the connect.Client just
+		// generated; on subsequent starts we're writing back the
+		// same bytes (cheap no-op-equivalent).
+		if keyManager := connectClient.ClientKeyManager(); keyManager != nil {
+			if seed := keyManager.Seed(); 0 < len(seed) {
+				if err := writeProviderClientKeySeed(seed); err != nil {
+					fmt.Printf("provider client key save failed: %s\n", err)
+				}
+			}
+		}
+		if encManager := connectClient.EncryptionSessionManager(); encManager != nil {
+			certPem := encManager.ProvideTlsCertificatePem()
+			keyPem := encManager.ProvideTlsPrivateKeyPem()
+			if 0 < len(certPem) && 0 < len(keyPem) {
+				if err := writeProviderTlsCertAndKey(certPem, keyPem); err != nil {
+					fmt.Printf("provider tls cert/key save failed: %s\n", err)
+				}
+			}
+		}
 
 		// routeManager := connect.NewRouteManager(connectClient)
 		// contractManager := connect.NewContractManagerWithDefaults(connectClient)
@@ -448,6 +486,108 @@ func provide(opts docopt.Opts) {
 
 	// exit
 	os.Exit(0)
+}
+
+// providerStatePath returns the absolute filesystem path of a named
+// provider state file under ~/.urnetwork (alongside `jwt`). Does not
+// create the directory.
+func providerStatePath(name string) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".urnetwork", name), nil
+}
+
+// readProviderClientKeySeed loads the Ed25519 seed for the provider
+// client's long-lived identity key from `~/.urnetwork/.provider.key`.
+// Returns (nil, nil) when the file does not exist — a fresh install.
+// The file is the raw 32-byte seed; no encoding.
+func readProviderClientKeySeed() ([]byte, error) {
+	p, err := providerStatePath(".provider.key")
+	if err != nil {
+		return nil, err
+	}
+	b, err := os.ReadFile(p)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	return b, err
+}
+
+// writeProviderClientKeySeed persists the Ed25519 seed to
+// `~/.urnetwork/.provider.key` with 0600 permissions (sensitive
+// material — anyone with this file can impersonate the provider
+// against the platform identity layer).
+func writeProviderClientKeySeed(seed []byte) error {
+	p, err := providerStatePath(".provider.key")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
+		return err
+	}
+	return os.WriteFile(p, seed, 0600)
+}
+
+// readProviderTlsCertAndKey loads the sequence-level TLS server cert
+// chain and matching private key from `~/.urnetwork/.provider.cert`
+// (PEM, leaf first, possibly chained) and the private key from the
+// same file (the PEM blocks are concatenated: cert blocks first,
+// then a single `PRIVATE KEY` block). Returns (nil, nil, nil) when
+// the file does not exist.
+func readProviderTlsCertAndKey() (certPem []byte, keyPem []byte, returnErr error) {
+	p, err := providerStatePath(".provider.cert")
+	if err != nil {
+		return nil, nil, err
+	}
+	b, err := os.ReadFile(p)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	// Split into cert blocks and the private key block.
+	rest := b
+	for {
+		block, next := pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		// re-encode the block so the output is canonical PEM (one
+		// trailing newline per block).
+		blockPem := pem.EncodeToMemory(block)
+		if block.Type == "CERTIFICATE" {
+			certPem = append(certPem, blockPem...)
+		} else {
+			// First non-cert block (typically `PRIVATE KEY` or
+			// `EC PRIVATE KEY`) is treated as the key. Stop after
+			// the first key block.
+			keyPem = blockPem
+			break
+		}
+		rest = next
+	}
+	return certPem, keyPem, nil
+}
+
+// writeProviderTlsCertAndKey persists the sequence-level TLS server
+// cert and private key to `~/.urnetwork/.provider.cert` with 0600
+// permissions. The cert blocks are written first, then the private
+// key block, so the on-disk file is a self-contained PEM bundle.
+func writeProviderTlsCertAndKey(certPem, keyPem []byte) error {
+	p, err := providerStatePath(".provider.cert")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
+		return err
+	}
+	out := make([]byte, 0, len(certPem)+len(keyPem))
+	out = append(out, certPem...)
+	out = append(out, keyPem...)
+	return os.WriteFile(p, out, 0600)
 }
 
 func provideAuth(ctx context.Context, clientStrategy *connect.ClientStrategy, apiUrl string, opts docopt.Opts) (byClientJwt string, clientId connect.Id, returnErr error) {

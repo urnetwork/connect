@@ -2,6 +2,7 @@ package connect
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"math"
@@ -285,9 +286,76 @@ type ClientSettings struct {
 	WebRtcSettings          *WebRtcSettings
 	EncryptionSettings      *EncryptionSettings
 
+	// ClientKeySeed, when set, is loaded as the long-lived Ed25519
+	// client identity key seed (`ed25519.NewKeyFromSeed`). Must be
+	// exactly `ed25519.SeedSize` (32) bytes if set. When empty, the
+	// `ClientKeyManager` generates a fresh seed on construction. The
+	// running value is readable via
+	// `Client.ClientKeyManager().Seed()` so callers can persist it
+	// across restarts; loading the saved seed on the next run keeps
+	// the client's published `ClientKey` (and any contract bindings
+	// to it) stable across process lifetimes.
+	ClientKeySeed []byte
+
 	ProtocolVersion int
 
 	DefaultTransferOpts TransferOptions
+}
+
+// MinimumMessageLenLimit returns the smallest per-transport framer
+// `MaxMessageLen` (and equivalent receive-side caps, e.g.
+// `websocket.SetReadLimit`) under which the connect runtime can
+// reliably operate. Anything below this number can deadlock the
+// per-peer encryption session: the TLS handshake produces a single
+// large outbox batch (notably the server-side flight) that ships as
+// one `EncryptedControl{Handshake}` Pack; if any hop's framer
+// rejects the wrapped pack as oversized, the transport stream
+// closes mid-handshake, the SendSequence's retransmit keeps
+// re-sending the same oversized pack, every reconnect immediately
+// re-closes, and both sides eventually time out.
+//
+// Worst-case sizing (verified against the active TLS profile):
+//
+//	TLS 1.3 server flight, post-quantum hybrid group
+//	`X25519MLKEM768` + ephemeral ECDSA P-256 cert + mTLS
+//	`CertificateRequest`:
+//	    ServerHello (~1.2 KiB — the MLKEM768 key share is ~1.1 KiB)
+//	    ChangeCipherSpec (legacy compat, ~6 B)
+//	    EncryptedExtensions (~10 B)
+//	    CertificateRequest (~30 B)
+//	    Certificate (~500–600 B, ECDSA P-256 leaf with ASN.1 width
+//	                 variability)
+//	    CertificateVerify (~80 B)
+//	    Finished (~45 B)
+//	    plus ~5 B TLS record header per record
+//	  ≈ 2 KiB raw
+//
+//	Wrap overhead, single EncryptedControl pack carrying that flight:
+//	    EncryptedControl proto (control_type + payload tag+len varint)  ~ 16 B
+//	    Frame proto (message_type + message_bytes tag+len varint)        ~ 16 B
+//	    Pack proto (message_id + sequence_id + sequence_number + head +
+//	                contract_id + frames + tag + repeated field tags)    ~ 90 B
+//	    TransferFrame proto (transfer_path + Pack tag+len varint)        ~ 70 B
+//	  ≈ 200 B
+//
+//	Total ≈ 2.2 KiB
+//
+// Rounded up to 4 KiB to comfortably absorb the ASN.1 size jitter
+// in cert generation (~ ± 15 B per signature/cert), any future
+// addition of a larger post-quantum key share, and a few bytes of
+// per-frame protobuf field-tag drift. Production transports default
+// well above this; tests and embedded callers should plumb this
+// value through their framer caps:
+//
+//	settings.FramerSettings.MaxMessageLen = max(
+//	    yourValue,
+//	    int(client.MinimumMessageLenLimit()),
+//	)
+//
+// and the corresponding receive-side limits
+// (`websocket.SetReadLimit` etc.).
+func (self *ClientSettings) MinimumMessageLenLimit() ByteCount {
+	return ByteCount(4 * 1024)
 }
 
 // note all callbacks are wrapped to check for nil and recover from errors
@@ -313,6 +381,7 @@ type Client struct {
 	sendBuffer               *SendBuffer
 	receiveBuffer            *ReceiveBuffer
 	forwardBuffer            *ForwardBuffer
+	clientKeyManager         *ClientKeyManager
 	encryptionSessionManager *EncryptionSessionManager
 
 	// ready is closed by NewClientWithTag right before it returns —
@@ -378,13 +447,22 @@ func NewClientWithTag(
 	contractManager := NewContractManager(ctx, client, settings.ContractManagerSettings)
 	webRtcManager := NewWebRtcManager(ctx, NewClientSignalSender(client), settings.WebRtcSettings)
 	streamManager := NewStreamManager(ctx, client, webRtcManager, settings.StreamManagerSettings)
-	encryptionSessionManager := NewEncryptionSessionManager(client.ctx, client, client.settings.EncryptionSettings)
+	// ClientKeyManager must be constructed before EncryptionSessionManager
+	// — the latter holds a reference so it can sign the published TLS cert
+	// (`EncryptedKey.ClientKeySignedTlsCertificate`) and so per-peer
+	// sessions can sign post-handshake identity proofs.
+	clientKeyManager, err := NewClientKeyManager(client.ctx, client)
+	if err != nil {
+		glog.Errorf("[key]%s could not initialize client key: %s\n", client.ClientTag(), err)
+		clientKeyManager = nil
+	}
+	encryptionSessionManager := NewEncryptionSessionManager(client.ctx, client, clientKeyManager, client.settings.EncryptionSettings)
 
 	client.contractManagerUnsub = client.AddReceiveCallback(contractManager.Receive)
 	client.webRtcManagerUnsub = ReceiveSignalsFromClient(client, webRtcManager)
 	client.streamManagerUnsub = client.AddReceiveCallback(streamManager.Receive)
 
-	client.initBuffers(routeManager, contractManager, webRtcManager, streamManager, encryptionSessionManager)
+	client.initBuffers(routeManager, contractManager, webRtcManager, streamManager, clientKeyManager, encryptionSessionManager)
 
 	go HandleError(client.run, cancel)
 
@@ -412,12 +490,14 @@ func (self *Client) initBuffers(
 	contractManager *ContractManager,
 	webRtcManager *WebRtcManager,
 	streamManager *StreamManager,
+	clientKeyManager *ClientKeyManager,
 	encryptionSessionManager *EncryptionSessionManager,
 ) {
 	self.routeManager = routeManager
 	self.contractManager = contractManager
 	self.webRtcManager = webRtcManager
 	self.streamManager = streamManager
+	self.clientKeyManager = clientKeyManager
 	self.encryptionSessionManager = encryptionSessionManager
 
 	// sendBuffer / receiveBuffer / forwardBuffer come first because
@@ -431,6 +511,10 @@ func (self *Client) initBuffers(
 
 func (self *Client) EncryptionSessionManager() *EncryptionSessionManager {
 	return self.encryptionSessionManager
+}
+
+func (self *Client) ClientKeyManager() *ClientKeyManager {
+	return self.clientKeyManager
 }
 
 func (self *Client) RouteManager() *RouteManager {
@@ -2101,8 +2185,22 @@ func (self *SendSequence) setContract(nextSendContract *sequenceContract) {
 	// the cert in this contract and any cert in a previously seen contract.
 	// An empty chain turns off verification entirely (the destination is
 	// not committing to a TLS identity).
+	//
+	// In addition, contracts carry the destination's long-lived client
+	// public identity key plus the destination's signature over the cert
+	// chain by that key. Pass the public key to the session so it can
+	// (a) verify the cert chain before trusting it (defeats a platform
+	// MITM that substitutes the cert), and (b) verify the post-handshake
+	// identity proof exchanged inside the per-peer TLS session (defeats
+	// an active MITM that re-handshakes TLS on each leg).
 	if self.session != nil {
-		self.session.AddTrustedPeerCertChain(nextSendContract.provideTlsCertificate)
+		if 0 < len(nextSendContract.destinationClientPublicKey) {
+			self.session.SetPeerClientPublicKey(ed25519.PublicKey(nextSendContract.destinationClientPublicKey))
+		}
+		self.session.AddTrustedPeerCertChain(
+			nextSendContract.provideTlsCertificate,
+			nextSendContract.destinationClientKeySignedTlsCertificate,
+		)
 	}
 }
 
@@ -2462,6 +2560,15 @@ func (self *SendSequence) writeMaybeWrappedBytes(transferFrameBytes []byte, path
 		cipher = self.session.Cipher()
 	}
 	if cipher == nil {
+		glog.V(2).Infof(
+			"[s]%s->%s s(%s) write plaintext %d bytes (forceUnwrapped=%t, session=%t, cipher=nil)\n",
+			self.client.ClientTag(),
+			self.destination.DestinationId,
+			self.destination.StreamId,
+			len(transferFrameBytes),
+			forceUnwrapped,
+			self.session != nil,
+		)
 		bytes := transferFrameBytes
 		if DebugTransferCopyOnWrite {
 			bytes = MessagePoolCopy(transferFrameBytes)
@@ -2479,6 +2586,13 @@ func (self *SendSequence) writeMaybeWrappedBytes(transferFrameBytes []byte, path
 	if err != nil {
 		return fmt.Errorf("outer wrap marshal: %w", err)
 	}
+	glog.V(2).Infof(
+		"[s]%s->%s s(%s) write wrapped %d -> %d bytes\n",
+		self.client.ClientTag(),
+		self.destination.DestinationId,
+		self.destination.StreamId,
+		len(transferFrameBytes), len(wrapped),
+	)
 	defer MessagePoolReturn(wrapped)
 	return writer.Write(self.ctx, MessagePoolShareReadOnly(wrapped), self.sendBufferSettings.WriteTimeout)
 }
@@ -3896,6 +4010,22 @@ type sequenceContract struct {
 	// SendSequence uses this to verify the peer presented during the
 	// per-peer TLS handshake against the platform-signed contract.
 	provideTlsCertificate [][]byte
+	// destinationClientPublicKey is the peer's 32-byte Ed25519
+	// long-lived public identity key, as committed by the platform in
+	// `Contract.destination_client_public_key`. The sender uses it to
+	// (a) verify `destinationClientKeySignedTlsCertificate` against
+	// `provideTlsCertificate` — only then is the cert chain admitted
+	// to the per-peer session's trusted set — and (b) verify the
+	// peer's post-handshake identity proof exchanged inside the per-
+	// peer TLS session. Empty when the contract carries no key.
+	destinationClientPublicKey []byte
+	// destinationClientKeySignedTlsCertificate is the peer's Ed25519
+	// signature over the canonical concatenation of every PEM block
+	// in `provideTlsCertificate`. The signing key is the peer's
+	// long-lived client identity key (private half held only by the
+	// peer); the verifier is `destinationClientPublicKey`. Empty when
+	// the contract carries no signature.
+	destinationClientKeySignedTlsCertificate []byte
 }
 
 func newSequenceContract(tag string, contract *protocol.Contract, minUpdateByteCount ByteCount, contractFillFraction float32) (*sequenceContract, error) {
@@ -3929,19 +4059,33 @@ func newSequenceContract(tag string, contract *protocol.Contract, minUpdateByteC
 		provideTlsCertificate = contract.ProvideTlsCertificate
 	}
 
+	// Same prefer-stored-fallback-to-outer convention for the destination's
+	// client-identity public key and the destination's signature over the
+	// cert chain (Option 1 of the long-lived-identity verification design).
+	destinationClientPublicKey := storedContract.DestinationClientPublicKey
+	if len(destinationClientPublicKey) == 0 && contract != nil {
+		destinationClientPublicKey = contract.DestinationClientPublicKey
+	}
+	destinationClientKeySignedTlsCertificate := storedContract.DestinationClientKeySignedTlsCertificate
+	if len(destinationClientKeySignedTlsCertificate) == 0 && contract != nil {
+		destinationClientKeySignedTlsCertificate = contract.DestinationClientKeySignedTlsCertificate
+	}
+
 	return &sequenceContract{
-		localId:                    NewId(),
-		tag:                        tag,
-		contract:                   contract,
-		contractId:                 contractId,
-		transferByteCount:          ByteCount(storedContract.TransferByteCount),
-		effectiveTransferByteCount: ByteCount(float32(storedContract.TransferByteCount) * contractFillFraction),
-		provideMode:                contract.ProvideMode,
-		minUpdateByteCount:         minUpdateByteCount,
-		path:                       path,
-		ackedByteCount:             ByteCount(0),
-		unackedByteCount:           ByteCount(0),
-		provideTlsCertificate:      provideTlsCertificate,
+		localId:                                  NewId(),
+		tag:                                      tag,
+		contract:                                 contract,
+		contractId:                               contractId,
+		transferByteCount:                        ByteCount(storedContract.TransferByteCount),
+		effectiveTransferByteCount:               ByteCount(float32(storedContract.TransferByteCount) * contractFillFraction),
+		provideMode:                              contract.ProvideMode,
+		minUpdateByteCount:                       minUpdateByteCount,
+		path:                                     path,
+		ackedByteCount:                           ByteCount(0),
+		unackedByteCount:                         ByteCount(0),
+		provideTlsCertificate:                    provideTlsCertificate,
+		destinationClientPublicKey:               destinationClientPublicKey,
+		destinationClientKeySignedTlsCertificate: destinationClientKeySignedTlsCertificate,
 	}, nil
 }
 
