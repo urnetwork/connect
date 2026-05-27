@@ -336,6 +336,34 @@ func provide(opts docopt.Opts) {
 
 		clientStrategy := connect.NewClientStrategy(proxyCtx, clientStrategySettings)
 
+		// Plumb the out-of-band peer-client-key fetcher so each
+		// per-peer encryption session can cross-check the
+		// contract-supplied public client key against the
+		// canonical value served by the platform's unauthenticated
+		// `/key/<peerId>` API. Today the session only logs on
+		// mismatch; the contract value is still trusted, but
+		// operators get an early-warning signal for a substitution
+		// attack. Skipped if `EncryptionSettings` is nil
+		// (encryption disabled).
+		if clientSettings.EncryptionSettings != nil && clientSettings.EncryptionSettings.NewPeerClientPublicKeyFetcher == nil {
+			clientSettings.EncryptionSettings.NewPeerClientPublicKeyFetcher = func(peerId connect.Id) func(context.Context) ([]byte, error) {
+				return func(fetchCtx context.Context) ([]byte, error) {
+					r, err := connect.HttpGetWithStrategy(
+						fetchCtx,
+						clientStrategy,
+						fmt.Sprintf("%s/key/%s", apiUrl, peerId),
+						"",
+						&connect.GetClientKeyResult{},
+						connect.NewNoopApiCallback[*connect.GetClientKeyResult](),
+					)
+					if err != nil {
+						return nil, err
+					}
+					return r.PublicKey, nil
+				}
+			}
+		}
+
 		byClientJwt, clientId, err := func() (string, connect.Id, error) {
 			for {
 				byClientJwt, clientId, err := provideAuth(proxyCtx, clientStrategy, apiUrl, opts)

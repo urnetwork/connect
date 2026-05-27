@@ -1122,36 +1122,56 @@ func (self *Client) run() {
 					MessagePoolReturn(transferFrameBytes)
 					continue
 				}
-				// Optimistic handshake apply: if this pack carries
-				// EncryptedControl handshake bytes and the per-peer
-				// session is in the narrow "awaiting client Finished"
-				// window, feed the bytes into the TLS transport from
-				// the receive loop directly, instead of waiting for
-				// the ReceiveSequence to drain and call
-				// `session.DeliverEncryptedControl` asynchronously.
-				// The cipher then flips non-nil in time for any
-				// wrapped app-data packs that follow within the same
-				// receive cycle, so the unwrap path no longer needs
-				// to block. The ReceiveSequence's later delivery
-				// short-circuits (handshakeDone is closed by then).
-				// Only plaintext-on-wire packs can carry EC frames
-				// (EC packs always set ForceUnwrapped on send), so
-				// gating on `unwrapped` avoids unmarshalling work on
-				// the wrapped (app-data) hot path.
+				// Optimistic EC apply: deliver EncryptedControl frames
+				// directly to the per-peer encryption session from the
+				// receive loop, bypassing the ReceiveSequence drain.
+				// The ReceiveSequence is in-order and can stall on a
+				// missing sequence gap (transport reform, lost packs
+				// under load); EC frames piggyback that ordering only
+				// to reuse the retransmit/route plumbing, but they
+				// don't need it for correctness — each handler below
+				// is independently safe to invoke off-order.
+				//
+				//   - Handshake EC: gated on
+				//     `IsAwaitingClientFinished` + a structural
+				//     prefix check inside
+				//     `OptimisticallyDeliverHandshake` that rejects
+				//     ClientHello-shaped retransmits, so we don't
+				//     feed duplicate bytes into the TLS state machine.
+				//   - IdentityProof EC: `receivePeerIdentityProof`
+				//     short-circuits if the session already verified,
+				//     already failed, or already has a buffered proof
+				//     — safe to re-deliver on sender retransmit.
+				//
+				// The ReceiveSequence's later, in-order delivery still
+				// runs and short-circuits in both handlers, costing only
+				// a re-unmarshal. Only plaintext-on-wire packs can carry
+				// EC frames (EC packs always set `ForceUnwrapped` on
+				// send), so gating on `unwrapped` avoids unmarshalling
+				// work on the wrapped (app-data) hot path.
 				if unwrapped && self.encryptionSessionManager != nil {
-					if session := self.encryptionSessionManager.Lookup(path.SourceId); session != nil && session.IsAwaitingClientFinished() {
-						for _, frame := range pack.Frames {
-							if frame == nil || frame.MessageType != protocol.MessageType_TransferEncryptedControl {
-								continue
+					var session *peerEncryptionSession
+					for _, frame := range pack.Frames {
+						if frame == nil || frame.MessageType != protocol.MessageType_TransferEncryptedControl {
+							continue
+						}
+						if session == nil {
+							session = self.encryptionSessionManager.Lookup(path.SourceId)
+							if session == nil {
+								break
 							}
-							ec := &protocol.EncryptedControl{}
-							if err := ProtoUnmarshal(frame.MessageBytes, ec); err != nil {
-								continue
+						}
+						ec := &protocol.EncryptedControl{}
+						if err := ProtoUnmarshal(frame.MessageBytes, ec); err != nil {
+							continue
+						}
+						switch ec.ControlType {
+						case protocol.EncryptedControlType_EncryptedControlHandshake:
+							if session.IsAwaitingClientFinished() {
+								session.OptimisticallyDeliverHandshake(ec.Payload)
 							}
-							if ec.ControlType != protocol.EncryptedControlType_EncryptedControlHandshake {
-								continue
-							}
-							session.OptimisticallyDeliverHandshake(ec.Payload)
+						case protocol.EncryptedControlType_EncryptedControlIdentityProof:
+							session.receivePeerIdentityProof(ec.Payload)
 						}
 					}
 				}
@@ -1418,31 +1438,36 @@ func (self *SendBuffer) Pack(sendPack *SendPack, timeout time.Duration) (bool, e
 // operations — the session's ctx must NOT propagate into `SendPack.Ctx`,
 // because SendBuffer.Pack interprets a canceled `SendPack.Ctx` as a
 // sequence problem and cancels the existing SendSequence.
-func (self *SendBuffer) SendEncryptedControl(ctx context.Context, peerId Id, ec *protocol.EncryptedControl) {
+// SendEncryptedControl enqueues an EncryptedControl pack for delivery
+// to `peerId`. Retries until the pack is accepted into a SendSequence
+// or `ctx` is canceled. Returns true on success, false if the session
+// context was canceled before the pack could be enqueued.
+func (self *SendBuffer) SendEncryptedControl(ctx context.Context, peerId Id, ec *protocol.EncryptedControl) bool {
 	select {
 	case <-ctx.Done():
-		return
+		return false
 	default:
 	}
 	ecBytes, err := ProtoMarshal(ec)
 	if err != nil {
-		return
+		return false
 	}
 	frame := &protocol.Frame{
 		MessageType:  protocol.MessageType_TransferEncryptedControl,
 		MessageBytes: ecBytes,
 	}
-	// EncryptedControl packs must travel the same route the application
-	// uses, otherwise the destination's ReceiveSequence (which intercepts
-	// these frames and feeds them to the per-peer session) never sees them.
-	// Mirror the client's default TransferOptions — especially `ForceStream`
-	// — so the SendSequence chosen by `SendBuffer.Pack` matches the one
-	// the application's `Client.Send` chooses for this destination. Always
-	// require ack (the session's reliability depends on retransmit) and
-	// never route through a companion contract (control is not a reply).
+	// Mirror the client's default TransferOptions — especially
+	// `ForceStream` — so the SendSequence chosen by `SendBuffer.Pack`
+	// matches the one the application's `Client.Send` chooses for this
+	// destination.
+	// Use companion contracts when EncryptionControlUseCompanion is set
+	// (default true) so the TLS responder can send handshake bytes back
+	// even in asymmetric contract setups where it has no regular contract
+	// to the initiator.
 	opts := self.client.settings.DefaultTransferOpts
 	opts.Ack = true
-	opts.CompanionContract = false
+	opts.CompanionContract = self.client.settings.EncryptionSettings != nil &&
+		self.client.settings.EncryptionSettings.EncryptionControlUseCompanion
 	sendPack := &SendPack{
 		TransferOptions:  opts,
 		Frame:            frame,
@@ -1456,9 +1481,18 @@ func (self *SendBuffer) SendEncryptedControl(ctx context.Context, peerId Id, ec 
 		// the peer's side completes its half. See writeMaybeWrappedBytes.
 		ForceUnwrapped: true,
 	}
-	go HandleError(func() {
-		self.Pack(sendPack, self.client.settings.BufferTimeout)
-	}, nil)
+	for {
+		if success, _ := self.Pack(sendPack, self.client.settings.BufferTimeout); success {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-self.ctx.Done():
+			return false
+		default:
+		}
+	}
 }
 
 func (self *SendBuffer) Ack(destination TransferPath, ack *protocol.Ack, timeout time.Duration) bool {
@@ -1803,6 +1837,7 @@ func (self *SendSequence) Run() {
 		self.closeContractMultiRouteWriter()
 
 		if self.session != nil {
+			self.session.CloseIfHandshakeIncomplete()
 			self.session.Release()
 		}
 	}()

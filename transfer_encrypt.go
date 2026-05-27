@@ -427,12 +427,21 @@ type EncryptionSettings struct {
 	// both fields.
 	ProvideTlsCertificatePem []byte
 	ProvideTlsPrivateKeyPem  []byte
+
+	// EncryptionControlUseCompanion, when true (default), sends
+	// EncryptedControl handshake packs as companion-contract traffic.
+	// This is required for asymmetric contract setups where the TLS
+	// responder has no regular contract back to the initiator. Set
+	// false only for test configurations that disable companion
+	// contracts (e.g. symmetric-provide tests).
+	EncryptionControlUseCompanion bool
 }
 
 func DefaultEncryptionSettings() *EncryptionSettings {
 	return &EncryptionSettings{
-		Encrypt:          false,
-		HandshakeTimeout: 30 * time.Second,
+		Encrypt:                       false,
+		HandshakeTimeout:              30 * time.Second,
+		EncryptionControlUseCompanion: true,
 	}
 }
 
@@ -693,12 +702,18 @@ func (self *peerEncryptionSession) markServerFlightSent() {
 }
 
 // sendEncryptedControl pushes an EncryptedControl through the normal Pack
-// flow to this session's peer.
+// flow to this session's peer. If the pack cannot be enqueued (all
+// SendSequences for this destination closed), the session is closed so
+// that the next Acquire creates a fresh session with a fresh handshake.
 func (self *peerEncryptionSession) sendEncryptedControl(ec *protocol.EncryptedControl) {
 	if self.client == nil || self.client.sendBuffer == nil {
 		return
 	}
-	self.client.sendBuffer.SendEncryptedControl(self.ctx, self.peerId, ec)
+	go HandleError(func() {
+		if !self.client.sendBuffer.SendEncryptedControl(self.ctx, self.peerId, ec) {
+			self.close()
+		}
+	}, self.cancel)
 }
 
 // completeHandshake sets the AEAD cipher (or records the error) and notifies
@@ -842,23 +857,16 @@ func (self *peerEncryptionSession) maybeVerifyPendingPeerIdentityProof() {
 		return
 	}
 	ok := VerifyClientKeySignature(peerPub, exporter, payload)
-	flipped := func() bool {
+	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
-		// Drop the buffered payload either way: success means it's
-		// served its purpose; failure means we don't want to keep
-		// re-checking a known-bad proof.
 		self.pendingPeerIdentityProof = nil
 		if ok {
 			self.peerIdentityVerified = true
 		} else {
 			self.identityFailed = true
 		}
-		return true
 	}()
-	if !flipped {
-		return
-	}
 	if ok {
 		glog.V(1).Infof("[tls]%s peer identity proof verified — cipher is now usable\n", self.logTag)
 	} else {
@@ -1445,6 +1453,22 @@ func (self *peerEncryptionSession) retain() {
 func (self *peerEncryptionSession) close() {
 	self.cancel()
 	self.closeTls()
+}
+
+// CloseIfHandshakeIncomplete cancels the session when the TLS handshake
+// has not yet completed. Called when a SendSequence that was carrying
+// EncryptedControl handshake packs closes — the in-flight EC packs are
+// lost with the sequence, so a fresh session (and fresh handshake) must
+// be established on the next Acquire.
+func (self *peerEncryptionSession) CloseIfHandshakeIncomplete() {
+	if self == nil {
+		return
+	}
+	select {
+	case <-self.handshakeDone:
+	default:
+		self.close()
+	}
 }
 
 // EncryptionSessionManager owns per-peer TLS sessions for the local Client.

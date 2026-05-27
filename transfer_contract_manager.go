@@ -994,30 +994,41 @@ func (self *ContractManager) CloseContractWithCheckpoint(
 		}
 	}()
 
-	closeContract := &protocol.CloseContract{
+	// Reliable delivery via a per-contract `ControlSync`. The
+	// previous implementation called `ClientOob().SendControl(...)`
+	// once and dropped the result on the floor — a single transient
+	// transport failure would leave the contract `open=true` on the
+	// server, its escrow permanently deducted from the network
+	// balance with no way for the client to ever signal completion.
+	//
+	// `ControlSync` retries the send until the platform acks (or
+	// the client's context is canceled). One `ControlSync` per
+	// close: each contract's close is independent and must not be
+	// superseded by another close's `Send` (which is what would
+	// happen on a shared `ControlSync` — its `syncCount` would
+	// abandon the older close as "replaced"). The per-call instance
+	// holds little state — a mutex, a monitor, and a derived context
+	// — and its supervisor goroutine exits on success or when the
+	// parent context closes, so there's no long-lived leak.
+	frame, err := ToFrame(&protocol.CloseContract{
 		ContractId:       contractId.Bytes(),
 		AckedByteCount:   uint64(ackedByteCount),
 		UnackedByteCount: uint64(unackedByteCount),
 		Checkpoint:       checkpoint,
-	}
-	frame, err := ToFrame(closeContract, self.settings.ProtocolVersion)
+	}, self.settings.ProtocolVersion)
 	if err != nil {
-		glog.Infof("[contract]could not create close contract frame = %s", err)
+		glog.Infof("[contract]could not create close contract frame = %s\n", err)
 		return
 	}
-	self.client.ClientOob().SendControl(
-		[]*protocol.Frame{frame},
-		func(resultFrames []*protocol.Frame, err error) {
-			if err == nil && opened {
-				contractQueue := self.openContractQueue(contractKey)
-				defer self.closeContractQueue(contractKey)
-
-				// the contract is partially closed on the platform now
-				// it can be safely removed from the local used list
-				contractQueue.RemoveUsedContract(contractId)
-			}
-		},
-	)
+	closeControlSync := NewControlSync(self.ctx, self.client, fmt.Sprintf("close-contract-%s", contractId))
+	closeControlSync.Send(frame, nil, func(sendErr error) {
+		defer closeControlSync.Close()
+		if sendErr == nil && opened {
+			contractQueue := self.openContractQueue(contractKey)
+			contractQueue.RemoveUsedContract(contractId)
+			self.closeContractQueue(contractKey)
+		}
+	})
 }
 
 func (self *ContractManager) LocalStats() *ContractManagerStats {

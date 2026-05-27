@@ -630,4 +630,53 @@ func pemEncodeCertificate(der []byte) []byte {
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }
 
+// TestMinimumMessageLenLimitFitsWorstCaseHandshake verifies that
+// `ClientSettings.MinimumMessageLenLimit()` is at least as large as
+// the actual upper bound the per-peer encryption handshake can
+// produce on the wire. The contract is: any framer / transport
+// receive-cap configured to `>= MinimumMessageLenLimit()` must be
+// able to deliver the largest single `EncryptedControl{Handshake}`
+// Pack the runtime ever produces. If this invariant slips (e.g.,
+// the post-quantum key share grows, or someone adds a field to the
+// outer wraps), the runtime would silently deadlock the handshake.
+//
+// This test exercises just the math: it asserts the limit is
+// generous enough to cover the documented worst-case in the
+// method's comment block, with margin for ASN.1 size jitter and
+// protobuf field-tag drift. It is intentionally a coarse-grained
+// check; the integration tests under `server/connect` verify the
+// end-to-end behavior.
+func TestMinimumMessageLenLimitFitsWorstCaseHandshake(t *testing.T) {
+	settings := DefaultClientSettings()
+	limit := settings.MinimumMessageLenLimit()
+
+	// Documented worst-case sizing from the comment on
+	// `MinimumMessageLenLimit`: TLS 1.3 server flight with the
+	// post-quantum hybrid key share + mTLS CertificateRequest +
+	// ephemeral ECDSA P-256 cert is observed at ~1947 bytes. Round
+	// to a conservative 2 KiB for "actual raw handshake bytes."
+	const observedHandshakeRawBytes = ByteCount(2 * 1024)
+
+	// Protobuf wrap overhead (EncryptedControl + Frame + Pack +
+	// TransferFrame): documented at ~200 bytes, with ample slop.
+	const protobufWrapOverhead = ByteCount(300)
+
+	worstCaseWireBytes := observedHandshakeRawBytes + protobufWrapOverhead
+	if limit < worstCaseWireBytes {
+		t.Fatalf(
+			"MinimumMessageLenLimit %d < worst-case handshake wire bytes %d (TLS %d + wrap %d)",
+			limit, worstCaseWireBytes, observedHandshakeRawBytes, protobufWrapOverhead,
+		)
+	}
+
+	// And the limit must not be absurdly large either — that would
+	// indicate someone forgot to read the comment. A few MiB is
+	// a sane upper bound for "this is a per-message handshake
+	// payload cap."
+	const sanityUpperBound = ByteCount(4 * 1024 * 1024)
+	if sanityUpperBound < limit {
+		t.Fatalf("MinimumMessageLenLimit %d > sanity upper bound %d; review the value", limit, sanityUpperBound)
+	}
+}
+
 // FIXME TestAckTimeout
