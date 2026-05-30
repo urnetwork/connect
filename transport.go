@@ -930,8 +930,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			var tlsConfig *tls.Config
 			if self.settings.QuicTlsConfig != nil {
 				// copy
-				tlsConfigCopy := *self.settings.QuicTlsConfig
-				tlsConfig = &tlsConfigCopy
+				tlsConfig = self.settings.QuicTlsConfig.Clone()
 			} else {
 				tlsConfig = &tls.Config{}
 			}

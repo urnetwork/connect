@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"slices"
+	"sync"
 	"time"
 	// "runtime/debug"
 
@@ -107,8 +108,11 @@ type packetTranslation struct {
 	out     chan *packet
 	forward chan *packet
 
-	readDeadline  time.Time
-	writeDeadline time.Time
+	deadlineLock         sync.Mutex
+	readDeadline         time.Time
+	writeDeadline        time.Time
+	readDeadlineMonitor  *Monitor
+	writeDeadlineMonitor *Monitor
 }
 
 func NewPacketTranslation(
@@ -134,13 +138,13 @@ func NewPacketTranslationWithPrefix(
 	settings *PacketTranslationSettings,
 	headerPrefix []byte,
 ) (*packetTranslation, error) {
-	cancelCtx, cancel := context.WithCancel(ctx)
-
 	for _, tld := range settings.DnsTlds {
-		if tld[len(tld)-1] != '.' || tld[0] == '.' {
+		if len(tld) == 0 || tld[len(tld)-1] != '.' || tld[0] == '.' {
 			return nil, fmt.Errorf("TLD must be canonical (end with a ., not start with a .): %s", string(tld))
 		}
 	}
+
+	cancelCtx, cancel := context.WithCancel(ctx)
 
 	pt := &packetTranslation{
 		ctx: cancelCtx,
@@ -148,13 +152,15 @@ func NewPacketTranslationWithPrefix(
 			// debug.PrintStack()
 			cancel()
 		},
-		ptMode:       ptMode,
-		packetConn:   packetConn,
-		headerPrefix: headerPrefix,
-		settings:     settings,
-		in:           make(chan *packet, settings.SequenceBufferSize),
-		out:          make(chan *packet, settings.SequenceBufferSize),
-		forward:      make(chan *packet, settings.SequenceBufferSize),
+		ptMode:               ptMode,
+		packetConn:           packetConn,
+		headerPrefix:         headerPrefix,
+		settings:             settings,
+		in:                   make(chan *packet, settings.SequenceBufferSize),
+		out:                  make(chan *packet, settings.SequenceBufferSize),
+		forward:              make(chan *packet, settings.SequenceBufferSize),
+		readDeadlineMonitor:  NewMonitor(),
+		writeDeadlineMonitor: NewMonitor(),
 	}
 
 	switch ptMode {
@@ -174,6 +180,7 @@ func NewPacketTranslationWithPrefix(
 		go HandleError(pt.encodeDns, cancel)
 		go HandleError(pt.decodeDns, cancel)
 	default:
+		cancel()
 		return nil, fmt.Errorf("Unsupported packet translation mode: %s", ptMode)
 	}
 
@@ -696,71 +703,115 @@ func (self *packetTranslation) handleDnsOther(packetData []byte, addr net.Addr) 
 	return
 }
 
+func (self *packetTranslation) currentReadDeadline() (time.Time, <-chan struct{}) {
+	self.deadlineLock.Lock()
+	defer self.deadlineLock.Unlock()
+	return self.readDeadline, self.readDeadlineMonitor.NotifyChannel()
+}
+
+func (self *packetTranslation) currentWriteDeadline() (time.Time, <-chan struct{}) {
+	self.deadlineLock.Lock()
+	defer self.deadlineLock.Unlock()
+	return self.writeDeadline, self.writeDeadlineMonitor.NotifyChannel()
+}
+
 func (self *packetTranslation) WriteTo(packetData []byte, addr net.Addr) (n int, err error) {
 	// packetDataCopy := make([]byte, len(packetData))
 	// copy(packetDataCopy, packetData)
 	packetDataCopy := MessagePoolCopy(packetData)
+	queued := false
+	defer func() {
+		if !queued {
+			MessagePoolReturn(packetDataCopy)
+		}
+	}()
 
 	p := &packet{
 		data: packetDataCopy,
 		addr: addr,
 	}
 
-	if self.writeDeadline.IsZero() {
-		select {
-		case <-self.ctx.Done():
-			err = fmt.Errorf("Done.")
-			return
-		case self.out <- p:
-			n = len(packetData)
-			glog.V(2).Infof("[pt]write packet\n")
-			return
+	for {
+		writeDeadline, deadlineChanged := self.currentWriteDeadline()
+		if writeDeadline.IsZero() {
+			select {
+			case <-self.ctx.Done():
+				err = fmt.Errorf("Done.")
+				return
+			case self.out <- p:
+				queued = true
+				n = len(packetData)
+				glog.V(2).Infof("[pt]write packet\n")
+				return
+			case <-deadlineChanged:
+			}
+			continue
 		}
-	} else {
-		select {
-		case <-self.ctx.Done():
-			err = fmt.Errorf("Done.")
-			return
-		case self.out <- p:
-			n = len(packetData)
-			glog.V(2).Infof("[pt]write packet\n")
-			return
-		case <-time.After(self.writeDeadline.Sub(time.Now())):
+
+		timeout := writeDeadline.Sub(time.Now())
+		if timeout <= 0 {
 			err = fmt.Errorf("Timeout.")
 			glog.Infof("[pt]write packet timeout\n")
 			return
+		}
+		select {
+		case <-self.ctx.Done():
+			err = fmt.Errorf("Done.")
+			return
+		case self.out <- p:
+			queued = true
+			n = len(packetData)
+			glog.V(2).Infof("[pt]write packet\n")
+			return
+		case <-time.After(timeout):
+			err = fmt.Errorf("Timeout.")
+			glog.Infof("[pt]write packet timeout\n")
+			return
+		case <-deadlineChanged:
 		}
 	}
 }
 
 func (self *packetTranslation) ReadFrom(packetData []byte) (n int, addr net.Addr, err error) {
-	if self.readDeadline.IsZero() {
-		select {
-		case <-self.ctx.Done():
-			err = fmt.Errorf("Done.")
-			return
-		case p := <-self.in:
-			addr = p.addr
-			n = copy(packetData, p.data)
-			MessagePoolReturn(p.data)
-			glog.V(2).Infof("[pt]read packet\n")
-			return
+	for {
+		readDeadline, deadlineChanged := self.currentReadDeadline()
+		if readDeadline.IsZero() {
+			select {
+			case <-self.ctx.Done():
+				err = fmt.Errorf("Done.")
+				return
+			case p := <-self.in:
+				addr = p.addr
+				n = copy(packetData, p.data)
+				MessagePoolReturn(p.data)
+				glog.V(2).Infof("[pt]read packet\n")
+				return
+			case <-deadlineChanged:
+			}
+			continue
 		}
-	} else {
-		select {
-		case <-self.ctx.Done():
-			err = fmt.Errorf("Done.")
-			return
-		case p := <-self.in:
-			addr = p.addr
-			n = copy(packetData, p.data)
-			MessagePoolReturn(p.data)
-			glog.V(2).Infof("[pt]read packet\n")
-			return
-		case <-time.After(self.readDeadline.Sub(time.Now())):
+
+		timeout := readDeadline.Sub(time.Now())
+		if timeout <= 0 {
 			err = fmt.Errorf("Timeout.")
 			glog.Infof("[pt]read packet timeout\n")
 			return
+		}
+		select {
+		case <-self.ctx.Done():
+			err = fmt.Errorf("Done.")
+			return
+		case p := <-self.in:
+			addr = p.addr
+			n = copy(packetData, p.data)
+			MessagePoolReturn(p.data)
+			glog.V(2).Infof("[pt]read packet\n")
+			return
+		case <-time.After(timeout):
+			err = fmt.Errorf("Timeout.")
+			glog.Infof("[pt]read packet timeout\n")
+			return
+		case <-deadlineChanged:
 		}
 	}
 }
@@ -770,18 +821,28 @@ func (self *packetTranslation) LocalAddr() net.Addr {
 }
 
 func (self *packetTranslation) SetDeadline(t time.Time) error {
+	self.deadlineLock.Lock()
+	defer self.deadlineLock.Unlock()
 	self.readDeadline = t
 	self.writeDeadline = t
+	self.readDeadlineMonitor.NotifyAll()
+	self.writeDeadlineMonitor.NotifyAll()
 	return nil
 }
 
 func (self *packetTranslation) SetReadDeadline(t time.Time) error {
+	self.deadlineLock.Lock()
+	defer self.deadlineLock.Unlock()
 	self.readDeadline = t
+	self.readDeadlineMonitor.NotifyAll()
 	return nil
 }
 
 func (self *packetTranslation) SetWriteDeadline(t time.Time) error {
+	self.deadlineLock.Lock()
+	defer self.deadlineLock.Unlock()
 	self.writeDeadline = t
+	self.writeDeadlineMonitor.NotifyAll()
 	return nil
 }
 

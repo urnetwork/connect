@@ -83,6 +83,159 @@ func TestWebRtc(t *testing.T) {
 
 }
 
+func TestClientSignalReceiverCoalescesAdjacentCandidatesOnly(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	source := SourceId(NewId())
+	streamId := NewId()
+	receiver := &clientSignalReceiver{
+		ctx:          ctx,
+		cancel:       cancel,
+		queueLimit:   8,
+		queueMonitor: NewMonitor(),
+		spaceMonitor: NewMonitor(),
+	}
+
+	candidateFrame := func(candidate string) *protocol.Frame {
+		messageBytes, err := ProtoMarshal(&protocol.ExchangeSignals{
+			StreamId: streamId.Bytes(),
+			Signals: []*protocol.ExchangeSignal{
+				{
+					SignalType:   protocol.SignalType_IceCandidate,
+					IceCandidate: []byte(candidate),
+				},
+			},
+		})
+		assert.Equal(t, err, nil)
+		return &protocol.Frame{
+			MessageType:  protocol.MessageType_TransferExchangeSignals,
+			MessageBytes: messageBytes,
+		}
+	}
+
+	sdpFrame := func(sdp string) *protocol.Frame {
+		messageBytes, err := ProtoMarshal(&protocol.ExchangeSignals{
+			StreamId: streamId.Bytes(),
+			Signals: []*protocol.ExchangeSignal{
+				{
+					SignalType: protocol.SignalType_SdpOffer,
+					Sdp:        []byte(sdp),
+				},
+			},
+		})
+		assert.Equal(t, err, nil)
+		return &protocol.Frame{
+			MessageType:  protocol.MessageType_TransferExchangeSignals,
+			MessageBytes: messageBytes,
+		}
+	}
+
+	frames := []*protocol.Frame{
+		candidateFrame("c1"),
+		sdpFrame("sdp"),
+		candidateFrame("c2"),
+	}
+	defer func() {
+		for _, frame := range frames {
+			MessagePoolReturn(frame.MessageBytes)
+		}
+	}()
+
+	for _, frame := range frames {
+		received, err := newReceivedSignalFrame(source, frame)
+		assert.Equal(t, err, nil)
+		assert.Equal(t, receiver.enqueue(received), true)
+	}
+
+	readSignals := func() []*protocol.ExchangeSignal {
+		received := receiver.dequeue()
+		assert.NotEqual(t, received, nil)
+		defer received.Close()
+		err := received.prepareFrame()
+		assert.Equal(t, err, nil)
+		exchangeSignals := &protocol.ExchangeSignals{}
+		err = ProtoUnmarshal(received.frame.MessageBytes, exchangeSignals)
+		assert.Equal(t, err, nil)
+		return exchangeSignals.Signals
+	}
+
+	signals := readSignals()
+	assert.Equal(t, len(signals), 1)
+	assert.Equal(t, signals[0].SignalType, protocol.SignalType_IceCandidate)
+	assert.Equal(t, string(signals[0].IceCandidate), "c1")
+
+	signals = readSignals()
+	assert.Equal(t, len(signals), 1)
+	assert.Equal(t, signals[0].SignalType, protocol.SignalType_SdpOffer)
+	assert.Equal(t, string(signals[0].Sdp), "sdp")
+
+	signals = readSignals()
+	assert.Equal(t, len(signals), 1)
+	assert.Equal(t, signals[0].SignalType, protocol.SignalType_IceCandidate)
+	assert.Equal(t, string(signals[0].IceCandidate), "c2")
+}
+
+func TestClientSignalReceiverCoalescesAdjacentCandidates(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	source := SourceId(NewId())
+	streamId := NewId()
+	receiver := &clientSignalReceiver{
+		ctx:          ctx,
+		cancel:       cancel,
+		queueLimit:   8,
+		queueMonitor: NewMonitor(),
+		spaceMonitor: NewMonitor(),
+	}
+
+	candidateFrame := func(candidate string) *protocol.Frame {
+		messageBytes, err := ProtoMarshal(&protocol.ExchangeSignals{
+			StreamId: streamId.Bytes(),
+			Signals: []*protocol.ExchangeSignal{
+				{
+					SignalType:   protocol.SignalType_IceCandidate,
+					IceCandidate: []byte(candidate),
+				},
+			},
+		})
+		assert.Equal(t, err, nil)
+		return &protocol.Frame{
+			MessageType:  protocol.MessageType_TransferExchangeSignals,
+			MessageBytes: messageBytes,
+		}
+	}
+
+	frames := []*protocol.Frame{
+		candidateFrame("c1"),
+		candidateFrame("c2"),
+	}
+	defer func() {
+		for _, frame := range frames {
+			MessagePoolReturn(frame.MessageBytes)
+		}
+	}()
+
+	for _, frame := range frames {
+		received, err := newReceivedSignalFrame(source, frame)
+		assert.Equal(t, err, nil)
+		assert.Equal(t, receiver.enqueue(received), true)
+	}
+
+	received := receiver.dequeue()
+	assert.NotEqual(t, received, nil)
+	defer received.Close()
+	err := received.prepareFrame()
+	assert.Equal(t, err, nil)
+	exchangeSignals := &protocol.ExchangeSignals{}
+	err = ProtoUnmarshal(received.frame.MessageBytes, exchangeSignals)
+	assert.Equal(t, err, nil)
+	assert.Equal(t, len(exchangeSignals.Signals), 2)
+	assert.Equal(t, string(exchangeSignals.Signals[0].IceCandidate), "c1")
+	assert.Equal(t, string(exchangeSignals.Signals[1].IceCandidate), "c2")
+}
+
 type signalPipe struct {
 	stateLock      sync.Mutex
 	signalReceiver SignalReceiver

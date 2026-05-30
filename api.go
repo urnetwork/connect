@@ -231,8 +231,8 @@ func (self *BringYourApi) AuthVerifySend(authVerifySend *AuthVerifySendArgs, cal
 type AuthNetworkClientCallback ApiCallback[*AuthNetworkClientResult]
 
 type AuthNetworkClientArgs struct {
-	ClientId       *Id    `json:"client_id",omitempty`
-	SourceClientId *Id    `json:"source_client_id",omitempty`
+	ClientId       *Id    `json:"client_id,omitempty"`
+	SourceClientId *Id    `json:"source_client_id,omitempty"`
 	Description    string `json:"description"`
 	DeviceSpec     string `json:"device_spec"`
 }

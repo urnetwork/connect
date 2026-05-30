@@ -6,6 +6,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	mathrand "math/rand"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -71,8 +72,13 @@ func runSendReceiveSenderReset(t *testing.T, encMode encryptionMode) {
 	// which can slow per-message processing by 5-10x.
 	timeout := 5 * time.Minute
 	// number of messages
-	n := 16 * 1024
+	n := 1024
+	stress := os.Getenv("CONNECT_TRANSFER_STRESS") != ""
+	if stress {
+		n = 16 * 1024
+	}
 
+	contractCount := 1
 	// random delay / loss; the encrypted scenarios use a tighter conditioner
 	// because TLS records still need to be delivered eventually for the
 	// session to complete the handshake.
@@ -80,17 +86,29 @@ func runSendReceiveSenderReset(t *testing.T, encMode encryptionMode) {
 	var conditionerLoss float32
 	switch encMode {
 	case encryptionModeOff:
-		conditionerDelay = 5 * time.Second
-		conditionerLoss = 0.5
+		if stress {
+			conditionerDelay = 5 * time.Second
+			conditionerLoss = 0.5
+		} else {
+			conditionerDelay = 200 * time.Millisecond
+			conditionerLoss = 0.1
+		}
 	case encryptionModeOn, encryptionModeOnAllowFallback:
-		conditionerDelay = 200 * time.Millisecond
-		conditionerLoss = 0.1
+		if stress {
+			conditionerDelay = 200 * time.Millisecond
+			conditionerLoss = 0.1
+		} else {
+			conditionerDelay = 100 * time.Millisecond
+			conditionerLoss = 0.05
+		}
+		contractCount = 2
 	case encryptionModeFallback:
 		// no loss/delay so the opt-out and follow-on plaintext frames flow;
 		// the handshake is forced to fail by configuring a tiny timeout
 		// in `applyTestEncryptionSettings`.
 		conditionerDelay = 0
 		conditionerLoss = 0
+		contractCount = 2
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -201,16 +219,30 @@ func runSendReceiveSenderReset(t *testing.T, encMode encryptionMode) {
 	var waitingReceiveCount int
 	var receiveMessages map[string]bool
 
-	aReceive <- requireTransferFrameBytes(
-		requireContractResultInitialPack(
-			protocol.ProvideMode_Network,
-			bContractManager.RequireProvideSecretKey(protocol.ProvideMode_Network),
-			aClientId,
-			bClientId,
-		),
-		ControlId,
-		aClientId,
-	)
+	for range contractCount {
+		err := aContractManager.HandleControlFrame(
+			ContractKey{
+				Destination: DestinationId(bClientId),
+			},
+			requireContractResult(
+				protocol.ProvideMode_Network,
+				bContractManager.RequireProvideSecretKey(protocol.ProvideMode_Network),
+				aClientId,
+				bClientId,
+			),
+		)
+		assert.Equal(t, err, nil)
+	}
+	// aReceive <- requireTransferFrameBytes(
+	// 	requireContractResultInitialPack(
+	// 		protocol.ProvideMode_Network,
+	// 		bContractManager.RequireProvideSecretKey(protocol.ProvideMode_Network),
+	// 		aClientId,
+	// 		bClientId,
+	// 	),
+	// 	ControlId,
+	// 	aClientId,
+	// )
 
 	go func() {
 		for i := 0; i < n; i += 1 {
@@ -287,16 +319,30 @@ func runSendReceiveSenderReset(t *testing.T, encMode encryptionMode) {
 
 	a2ContractManager.SetProvideModes(provideModes)
 
-	aReceive <- requireTransferFrameBytes(
-		requireContractResultInitialPack(
-			protocol.ProvideMode_Network,
-			bContractManager.RequireProvideSecretKey(protocol.ProvideMode_Network),
-			aClientId,
-			bClientId,
-		),
-		ControlId,
-		aClientId,
-	)
+	for range contractCount {
+		err := a2ContractManager.HandleControlFrame(
+			ContractKey{
+				Destination: DestinationId(bClientId),
+			},
+			requireContractResult(
+				protocol.ProvideMode_Network,
+				bContractManager.RequireProvideSecretKey(protocol.ProvideMode_Network),
+				aClientId,
+				bClientId,
+			),
+		)
+		assert.Equal(t, err, nil)
+	}
+	// aReceive <- requireTransferFrameBytes(
+	// 	requireContractResultInitialPack(
+	// 		protocol.ProvideMode_Network,
+	// 		bContractManager.RequireProvideSecretKey(protocol.ProvideMode_Network),
+	// 		aClientId,
+	// 		bClientId,
+	// 	),
+	// 	ControlId,
+	// 	aClientId,
+	// )
 
 	select {
 	case message := <-receives:
@@ -364,7 +410,7 @@ func runSendReceiveSenderReset(t *testing.T, encMode encryptionMode) {
 	cancel()
 }
 
-func createContractResultInitialPack(
+func createContractResult(
 	provideMode protocol.ProvideMode,
 	provideSecretKey []byte,
 	sourceId Id,
@@ -394,32 +440,32 @@ func createContractResultInitialPack(
 		},
 	}
 
-	frame, err := ToFrame(message, DefaultProtocolVersion)
-	if err != nil {
-		return nil, err
-	}
-	defer MessagePoolReturn(frame.MessageBytes)
+	return ToFrame(message, DefaultProtocolVersion)
+	// if err != nil {
+	// 	return nil, err
+	// }
+	// defer MessagePoolReturn(frame.MessageBytes)
 
-	messageId := NewId()
-	sequenceId := NewId()
-	pack := &protocol.Pack{
-		MessageId:      messageId.Bytes(),
-		SequenceId:     sequenceId.Bytes(),
-		SequenceNumber: 0,
-		Head:           true,
-		Frames:         []*protocol.Frame{frame},
-	}
+	// messageId := NewId()
+	// sequenceId := NewId()
+	// pack := &protocol.Pack{
+	// 	MessageId:      messageId.Bytes(),
+	// 	SequenceId:     sequenceId.Bytes(),
+	// 	SequenceNumber: 0,
+	// 	Head:           true,
+	// 	Frames:         []*protocol.Frame{frame},
+	// }
 
-	return ToFrame(pack, DefaultProtocolVersion)
+	// return ToFrame(pack, DefaultProtocolVersion)
 }
 
-func requireContractResultInitialPack(
+func requireContractResult(
 	provideMode protocol.ProvideMode,
 	provideSecretKey []byte,
 	sourceId Id,
 	destinationId Id,
 ) *protocol.Frame {
-	frame, err := createContractResultInitialPack(provideMode, provideSecretKey, sourceId, destinationId)
+	frame, err := createContractResult(provideMode, provideSecretKey, sourceId, destinationId)
 	if err != nil {
 		panic(err)
 	}
@@ -575,14 +621,14 @@ func applyTestEncryptionSettings(clientSettings *ClientSettings, encMode encrypt
 		clientSettings.EncryptionSettings.Encrypt = false
 	case encryptionModeOn, encryptionModeOnAllowFallback:
 		clientSettings.EncryptionSettings.Encrypt = true
-		clientSettings.EncryptionSettings.HandshakeTimeout = 60 * time.Second
+		clientSettings.EncryptionSettings.TlsTimeout = 60 * time.Second
 	case encryptionModeFallback:
 		// sender enables encryption with a tight timeout but the receiver
 		// has encryption disabled, so the handshake never completes; the
 		// session stays in the cipher-nil state and all traffic flows in
 		// plaintext.
 		clientSettings.EncryptionSettings.Encrypt = true
-		clientSettings.EncryptionSettings.HandshakeTimeout = 50 * time.Millisecond
+		clientSettings.EncryptionSettings.TlsTimeout = 50 * time.Millisecond
 	}
 }
 

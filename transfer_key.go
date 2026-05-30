@@ -1,10 +1,12 @@
 package connect
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"fmt"
+	"sync"
 
 	"github.com/urnetwork/glog"
 
@@ -63,6 +65,8 @@ type ClientKeyManager struct {
 	publicKey  ed25519.PublicKey
 
 	controlSync *ControlSync
+
+	stateLock sync.RWMutex
 }
 
 // NewClientKeyManager constructs the manager and seeds (or generates)
@@ -117,6 +121,9 @@ func NewClientKeyManager(ctx context.Context, client *Client) (*ClientKeyManager
 // via `ed25519.NewKeyFromSeed`. Sensitive: hand it only to local
 // persistent storage that the user has authorized.
 func (self *ClientKeyManager) Seed() []byte {
+	self.stateLock.RLock()
+	defer self.stateLock.RUnlock()
+
 	if self.privateKey == nil {
 		return nil
 	}
@@ -127,7 +134,10 @@ func (self *ClientKeyManager) Seed() []byte {
 // Safe to publish; this is the value the platform stores per
 // `client_id` and serves via the public-key lookup API.
 func (self *ClientKeyManager) PublicKey() ed25519.PublicKey {
-	return self.publicKey
+	self.stateLock.RLock()
+	defer self.stateLock.RUnlock()
+
+	return ed25519.PublicKey(bytes.Clone(self.publicKey))
 }
 
 // Sign produces an Ed25519 signature of `data` under the local client
@@ -135,7 +145,29 @@ func (self *ClientKeyManager) PublicKey() ed25519.PublicKey {
 // proofs; both verifications go through `VerifyClientKeySignature`
 // (or `VerifyCertChainSignature` for the cert-chain shape).
 func (self *ClientKeyManager) Sign(data []byte) []byte {
+	self.stateLock.RLock()
+	defer self.stateLock.RUnlock()
+
 	return ed25519.Sign(self.privateKey, data)
+}
+
+// SetSeed replaces the local client's long-lived Ed25519 identity keypair
+// with the key derived from seed and republishes the public key.
+func (self *ClientKeyManager) SetSeed(seed []byte) error {
+	if len(seed) != ed25519.SeedSize {
+		return fmt.Errorf("client key seed length %d (expected %d)", len(seed), ed25519.SeedSize)
+	}
+
+	privateKey := ed25519.NewKeyFromSeed(bytes.Clone(seed))
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+
+	self.stateLock.Lock()
+	self.privateKey = privateKey
+	self.publicKey = publicKey
+	self.stateLock.Unlock()
+
+	go HandleError(self.publishClientKey)
+	return nil
 }
 
 // SignCertChain signs the canonical encoding of a PEM cert chain
@@ -204,7 +236,7 @@ func (self *ClientKeyManager) publishClientKey() {
 		return
 	}
 	frame, err := ToFrame(&protocol.ClientKey{
-		PublicKey: []byte(self.publicKey),
+		PublicKey: []byte(self.PublicKey()),
 	}, self.client.settings.ProtocolVersion)
 	if err != nil {
 		glog.Errorf("[key]%s could not build ClientKey frame: %s\n", self.client.ClientTag(), err)

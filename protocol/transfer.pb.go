@@ -21,6 +21,70 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// SequenceRole identifies which side of a per-peer encryption session
+// (TLS client/initiator or TLS server/responder) a frame or control
+// message originated from. Each ordered pair of peers can run up to two
+// independent sessions: one where the local client is the TLS client
+// (carrying the local client's outbound application data) and one where
+// it is the TLS server (responding to the peer's initiation). The
+// receiver of a session-tagged message routes to the COMPLEMENT local
+// session: a `SequenceRoleClient` message is consumed by the receiver's
+// server-role session, and vice versa.
+type SequenceRole int32
+
+const (
+	// Unset. On a `TransferFrame` this means "no hint" (trial-decrypt).
+	// On an `EncryptedControl` it is invalid — the sender always sets a
+	// concrete role.
+	SequenceRole_SequenceRoleUnknown SequenceRole = 0
+	// The sender holds the TLS-client (initiator) role for the session
+	// that produced this frame/control.
+	SequenceRole_SequenceRoleClient SequenceRole = 1
+	// The sender holds the TLS-server (responder) role.
+	SequenceRole_SequenceRoleServer SequenceRole = 2
+)
+
+// Enum value maps for SequenceRole.
+var (
+	SequenceRole_name = map[int32]string{
+		0: "SequenceRoleUnknown",
+		1: "SequenceRoleClient",
+		2: "SequenceRoleServer",
+	}
+	SequenceRole_value = map[string]int32{
+		"SequenceRoleUnknown": 0,
+		"SequenceRoleClient":  1,
+		"SequenceRoleServer":  2,
+	}
+)
+
+func (x SequenceRole) Enum() *SequenceRole {
+	p := new(SequenceRole)
+	*p = x
+	return p
+}
+
+func (x SequenceRole) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (SequenceRole) Descriptor() protoreflect.EnumDescriptor {
+	return file_transfer_proto_enumTypes[0].Descriptor()
+}
+
+func (SequenceRole) Type() protoreflect.EnumType {
+	return &file_transfer_proto_enumTypes[0]
+}
+
+func (x SequenceRole) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use SequenceRole.Descriptor instead.
+func (SequenceRole) EnumDescriptor() ([]byte, []int) {
+	return file_transfer_proto_rawDescGZIP(), []int{0}
+}
+
 // CHANGE FROM PRIOR VERSION, modes should be considered individually as a mask and do not imply other modes
 type ProvideMode int32
 
@@ -64,11 +128,11 @@ func (x ProvideMode) String() string {
 }
 
 func (ProvideMode) Descriptor() protoreflect.EnumDescriptor {
-	return file_transfer_proto_enumTypes[0].Descriptor()
+	return file_transfer_proto_enumTypes[1].Descriptor()
 }
 
 func (ProvideMode) Type() protoreflect.EnumType {
-	return &file_transfer_proto_enumTypes[0]
+	return &file_transfer_proto_enumTypes[1]
 }
 
 func (x ProvideMode) Number() protoreflect.EnumNumber {
@@ -77,7 +141,7 @@ func (x ProvideMode) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ProvideMode.Descriptor instead.
 func (ProvideMode) EnumDescriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{0}
+	return file_transfer_proto_rawDescGZIP(), []int{1}
 }
 
 type SignalType int32
@@ -120,11 +184,11 @@ func (x SignalType) String() string {
 }
 
 func (SignalType) Descriptor() protoreflect.EnumDescriptor {
-	return file_transfer_proto_enumTypes[1].Descriptor()
+	return file_transfer_proto_enumTypes[2].Descriptor()
 }
 
 func (SignalType) Type() protoreflect.EnumType {
-	return &file_transfer_proto_enumTypes[1]
+	return &file_transfer_proto_enumTypes[2]
 }
 
 func (x SignalType) Number() protoreflect.EnumNumber {
@@ -133,7 +197,7 @@ func (x SignalType) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use SignalType.Descriptor instead.
 func (SignalType) EnumDescriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{1}
+	return file_transfer_proto_rawDescGZIP(), []int{2}
 }
 
 type ContractError int32
@@ -175,11 +239,11 @@ func (x ContractError) String() string {
 }
 
 func (ContractError) Descriptor() protoreflect.EnumDescriptor {
-	return file_transfer_proto_enumTypes[2].Descriptor()
+	return file_transfer_proto_enumTypes[3].Descriptor()
 }
 
 func (ContractError) Type() protoreflect.EnumType {
-	return &file_transfer_proto_enumTypes[2]
+	return &file_transfer_proto_enumTypes[3]
 }
 
 func (x ContractError) Number() protoreflect.EnumNumber {
@@ -188,7 +252,7 @@ func (x ContractError) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ContractError.Descriptor instead.
 func (ContractError) EnumDescriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{2}
+	return file_transfer_proto_rawDescGZIP(), []int{3}
 }
 
 type EncryptedControlType int32
@@ -236,11 +300,11 @@ func (x EncryptedControlType) String() string {
 }
 
 func (EncryptedControlType) Descriptor() protoreflect.EnumDescriptor {
-	return file_transfer_proto_enumTypes[3].Descriptor()
+	return file_transfer_proto_enumTypes[4].Descriptor()
 }
 
 func (EncryptedControlType) Type() protoreflect.EnumType {
-	return &file_transfer_proto_enumTypes[3]
+	return &file_transfer_proto_enumTypes[4]
 }
 
 func (x EncryptedControlType) Number() protoreflect.EnumNumber {
@@ -249,7 +313,7 @@ func (x EncryptedControlType) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use EncryptedControlType.Descriptor instead.
 func (EncryptedControlType) EnumDescriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{3}
+	return file_transfer_proto_rawDescGZIP(), []int{4}
 }
 
 type TransferPath struct {
@@ -327,8 +391,15 @@ type TransferFrame struct {
 	Pack                   *Pack        `protobuf:"bytes,4,opt,name=pack,proto3,oneof" json:"pack,omitempty"`
 	Ack                    *Ack         `protobuf:"bytes,5,opt,name=ack,proto3,oneof" json:"ack,omitempty"`
 	EncryptedTransferFrame []byte       `protobuf:"bytes,6,opt,name=encryptedTransferFrame,proto3,oneof" json:"encryptedTransferFrame,omitempty"`
-	unknownFields          protoimpl.UnknownFields
-	sizeCache              protoimpl.SizeCache
+	// Performance hint for `encryptedTransferFrame`: the role of the
+	// per-peer session that produced the wrapped bytes. The receiver
+	// decrypts with the complement local session. When unset
+	// (`SequenceRoleUnknown`) the receiver trial-decrypts against every
+	// per-peer session it holds — senders may leave it unset for
+	// additional on-wire anonymity. Ignored for plaintext frames.
+	SessionRole   *SequenceRole `protobuf:"varint,7,opt,name=session_role,json=sessionRole,proto3,enum=bringyour.SequenceRole,oneof" json:"session_role,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *TransferFrame) Reset() {
@@ -403,6 +474,13 @@ func (x *TransferFrame) GetEncryptedTransferFrame() []byte {
 		return x.EncryptedTransferFrame
 	}
 	return nil
+}
+
+func (x *TransferFrame) GetSessionRole() SequenceRole {
+	if x != nil && x.SessionRole != nil {
+		return *x.SessionRole
+	}
+	return SequenceRole_SequenceRoleUnknown
 }
 
 // this is the minimal subset of `TransferFrame` used when making a routing decision
@@ -2002,7 +2080,15 @@ type EncryptedControl struct {
 	ControlType EncryptedControlType   `protobuf:"varint,1,opt,name=control_type,json=controlType,proto3,enum=bringyour.EncryptedControlType" json:"control_type,omitempty"`
 	// For `EncryptedControlHandshake`: raw TLS handshake bytes. Empty for
 	// other control types.
-	Payload       []byte `protobuf:"bytes,2,opt,name=payload,proto3" json:"payload,omitempty"`
+	Payload []byte `protobuf:"bytes,2,opt,name=payload,proto3" json:"payload,omitempty"`
+	// The role of the sending per-peer session: `SequenceRoleClient` for
+	// handshake/identity bytes from the sender's TLS-client session,
+	// `SequenceRoleServer` for its TLS-server session. The receiver feeds
+	// the payload into its COMPLEMENT session (client->server,
+	// server->client), creating that session if it does not exist yet.
+	// Always set on send; `SequenceRoleUnknown` is treated as a protocol
+	// error and dropped.
+	SessionRole   SequenceRole `protobuf:"varint,3,opt,name=session_role,json=sessionRole,proto3,enum=bringyour.SequenceRole" json:"session_role,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2051,6 +2137,13 @@ func (x *EncryptedControl) GetPayload() []byte {
 	return nil
 }
 
+func (x *EncryptedControl) GetSessionRole() SequenceRole {
+	if x != nil {
+		return x.SessionRole
+	}
+	return SequenceRole_SequenceRoleUnknown
+}
+
 var File_transfer_proto protoreflect.FileDescriptor
 
 const file_transfer_proto_rawDesc = "" +
@@ -2064,19 +2157,21 @@ const file_transfer_proto_rawDesc = "" +
 	"_source_idB\x11\n" +
 	"\x0f_destination_idB\f\n" +
 	"\n" +
-	"_stream_id\"\x97\x03\n" +
+	"_stream_id\"\xe9\x03\n" +
 	"\rTransferFrame\x12<\n" +
 	"\rtransfer_path\x18\x01 \x01(\v2\x17.bringyour.TransferPathR\ftransferPath\x12/\n" +
 	"\x05frame\x18\x02 \x01(\v2\x10.bringyour.FrameB\x02\x18\x01H\x00R\x05frame\x88\x01\x01\x12B\n" +
 	"\fmessage_type\x18\x03 \x01(\x0e2\x16.bringyour.MessageTypeB\x02\x18\x01H\x01R\vmessageType\x88\x01\x01\x12(\n" +
 	"\x04pack\x18\x04 \x01(\v2\x0f.bringyour.PackH\x02R\x04pack\x88\x01\x01\x12%\n" +
 	"\x03ack\x18\x05 \x01(\v2\x0e.bringyour.AckH\x03R\x03ack\x88\x01\x01\x12;\n" +
-	"\x16encryptedTransferFrame\x18\x06 \x01(\fH\x04R\x16encryptedTransferFrame\x88\x01\x01B\b\n" +
+	"\x16encryptedTransferFrame\x18\x06 \x01(\fH\x04R\x16encryptedTransferFrame\x88\x01\x01\x12?\n" +
+	"\fsession_role\x18\a \x01(\x0e2\x17.bringyour.SequenceRoleH\x05R\vsessionRole\x88\x01\x01B\b\n" +
 	"\x06_frameB\x0f\n" +
 	"\r_message_typeB\a\n" +
 	"\x05_packB\x06\n" +
 	"\x04_ackB\x19\n" +
-	"\x17_encryptedTransferFrame\"U\n" +
+	"\x17_encryptedTransferFrameB\x0f\n" +
+	"\r_session_role\"U\n" +
 	"\x15FilteredTransferFrame\x12<\n" +
 	"\rtransfer_path\x18\x01 \x01(\v2\x17.bringyour.TransferPathR\ftransferPath\"\xf7\x02\n" +
 	"\x04Pack\x12\x1d\n" +
@@ -2216,10 +2311,15 @@ const file_transfer_proto_rawDesc = "" +
 	"!client_key_signed_tls_certificate\x18\x02 \x01(\fR\x1dclientKeySignedTlsCertificate\"*\n" +
 	"\tClientKey\x12\x1d\n" +
 	"\n" +
-	"public_key\x18\x01 \x01(\fR\tpublicKey\"p\n" +
+	"public_key\x18\x01 \x01(\fR\tpublicKey\"\xac\x01\n" +
 	"\x10EncryptedControl\x12B\n" +
 	"\fcontrol_type\x18\x01 \x01(\x0e2\x1f.bringyour.EncryptedControlTypeR\vcontrolType\x12\x18\n" +
-	"\apayload\x18\x02 \x01(\fR\apayload*d\n" +
+	"\apayload\x18\x02 \x01(\fR\apayload\x12:\n" +
+	"\fsession_role\x18\x03 \x01(\x0e2\x17.bringyour.SequenceRoleR\vsessionRole*W\n" +
+	"\fSequenceRole\x12\x17\n" +
+	"\x13SequenceRoleUnknown\x10\x00\x12\x16\n" +
+	"\x12SequenceRoleClient\x10\x01\x12\x16\n" +
+	"\x12SequenceRoleServer\x10\x02*d\n" +
 	"\vProvideMode\x12\b\n" +
 	"\x04None\x10\x00\x12\v\n" +
 	"\aNetwork\x10\x01\x12\x14\n" +
@@ -2259,69 +2359,72 @@ func file_transfer_proto_rawDescGZIP() []byte {
 	return file_transfer_proto_rawDescData
 }
 
-var file_transfer_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
+var file_transfer_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
 var file_transfer_proto_msgTypes = make([]protoimpl.MessageInfo, 26)
 var file_transfer_proto_goTypes = []any{
-	(ProvideMode)(0),              // 0: bringyour.ProvideMode
-	(SignalType)(0),               // 1: bringyour.SignalType
-	(ContractError)(0),            // 2: bringyour.ContractError
-	(EncryptedControlType)(0),     // 3: bringyour.EncryptedControlType
-	(*TransferPath)(nil),          // 4: bringyour.TransferPath
-	(*TransferFrame)(nil),         // 5: bringyour.TransferFrame
-	(*FilteredTransferFrame)(nil), // 6: bringyour.FilteredTransferFrame
-	(*Pack)(nil),                  // 7: bringyour.Pack
-	(*FilteredPack)(nil),          // 8: bringyour.FilteredPack
-	(*Ack)(nil),                   // 9: bringyour.Ack
-	(*Tag)(nil),                   // 10: bringyour.Tag
-	(*Auth)(nil),                  // 11: bringyour.Auth
-	(*Provide)(nil),               // 12: bringyour.Provide
-	(*ProvideKey)(nil),            // 13: bringyour.ProvideKey
-	(*StreamOpen)(nil),            // 14: bringyour.StreamOpen
-	(*StreamClose)(nil),           // 15: bringyour.StreamClose
-	(*StreamReset)(nil),           // 16: bringyour.StreamReset
-	(*ExchangeSignals)(nil),       // 17: bringyour.ExchangeSignals
-	(*ExchangeSignal)(nil),        // 18: bringyour.ExchangeSignal
-	(*CreateContract)(nil),        // 19: bringyour.CreateContract
-	(*CreateContractResult)(nil),  // 20: bringyour.CreateContractResult
-	(*Contract)(nil),              // 21: bringyour.Contract
-	(*StoredContract)(nil),        // 22: bringyour.StoredContract
-	(*CloseContract)(nil),         // 23: bringyour.CloseContract
-	(*PeerAudit)(nil),             // 24: bringyour.PeerAudit
-	(*ControlPing)(nil),           // 25: bringyour.ControlPing
-	(*ProvidePing)(nil),           // 26: bringyour.ProvidePing
-	(*EncryptedKey)(nil),          // 27: bringyour.EncryptedKey
-	(*ClientKey)(nil),             // 28: bringyour.ClientKey
-	(*EncryptedControl)(nil),      // 29: bringyour.EncryptedControl
-	(*Frame)(nil),                 // 30: bringyour.Frame
-	(MessageType)(0),              // 31: bringyour.MessageType
+	(SequenceRole)(0),             // 0: bringyour.SequenceRole
+	(ProvideMode)(0),              // 1: bringyour.ProvideMode
+	(SignalType)(0),               // 2: bringyour.SignalType
+	(ContractError)(0),            // 3: bringyour.ContractError
+	(EncryptedControlType)(0),     // 4: bringyour.EncryptedControlType
+	(*TransferPath)(nil),          // 5: bringyour.TransferPath
+	(*TransferFrame)(nil),         // 6: bringyour.TransferFrame
+	(*FilteredTransferFrame)(nil), // 7: bringyour.FilteredTransferFrame
+	(*Pack)(nil),                  // 8: bringyour.Pack
+	(*FilteredPack)(nil),          // 9: bringyour.FilteredPack
+	(*Ack)(nil),                   // 10: bringyour.Ack
+	(*Tag)(nil),                   // 11: bringyour.Tag
+	(*Auth)(nil),                  // 12: bringyour.Auth
+	(*Provide)(nil),               // 13: bringyour.Provide
+	(*ProvideKey)(nil),            // 14: bringyour.ProvideKey
+	(*StreamOpen)(nil),            // 15: bringyour.StreamOpen
+	(*StreamClose)(nil),           // 16: bringyour.StreamClose
+	(*StreamReset)(nil),           // 17: bringyour.StreamReset
+	(*ExchangeSignals)(nil),       // 18: bringyour.ExchangeSignals
+	(*ExchangeSignal)(nil),        // 19: bringyour.ExchangeSignal
+	(*CreateContract)(nil),        // 20: bringyour.CreateContract
+	(*CreateContractResult)(nil),  // 21: bringyour.CreateContractResult
+	(*Contract)(nil),              // 22: bringyour.Contract
+	(*StoredContract)(nil),        // 23: bringyour.StoredContract
+	(*CloseContract)(nil),         // 24: bringyour.CloseContract
+	(*PeerAudit)(nil),             // 25: bringyour.PeerAudit
+	(*ControlPing)(nil),           // 26: bringyour.ControlPing
+	(*ProvidePing)(nil),           // 27: bringyour.ProvidePing
+	(*EncryptedKey)(nil),          // 28: bringyour.EncryptedKey
+	(*ClientKey)(nil),             // 29: bringyour.ClientKey
+	(*EncryptedControl)(nil),      // 30: bringyour.EncryptedControl
+	(*Frame)(nil),                 // 31: bringyour.Frame
+	(MessageType)(0),              // 32: bringyour.MessageType
 }
 var file_transfer_proto_depIdxs = []int32{
-	4,  // 0: bringyour.TransferFrame.transfer_path:type_name -> bringyour.TransferPath
-	30, // 1: bringyour.TransferFrame.frame:type_name -> bringyour.Frame
-	31, // 2: bringyour.TransferFrame.message_type:type_name -> bringyour.MessageType
-	7,  // 3: bringyour.TransferFrame.pack:type_name -> bringyour.Pack
-	9,  // 4: bringyour.TransferFrame.ack:type_name -> bringyour.Ack
-	4,  // 5: bringyour.FilteredTransferFrame.transfer_path:type_name -> bringyour.TransferPath
-	30, // 6: bringyour.Pack.frames:type_name -> bringyour.Frame
-	30, // 7: bringyour.Pack.contract_frame:type_name -> bringyour.Frame
-	10, // 8: bringyour.Pack.tag:type_name -> bringyour.Tag
-	30, // 9: bringyour.FilteredPack.contract_frame:type_name -> bringyour.Frame
-	10, // 10: bringyour.Ack.tag:type_name -> bringyour.Tag
-	13, // 11: bringyour.Provide.keys:type_name -> bringyour.ProvideKey
-	0,  // 12: bringyour.ProvideKey.mode:type_name -> bringyour.ProvideMode
-	14, // 13: bringyour.StreamReset.streams:type_name -> bringyour.StreamOpen
-	18, // 14: bringyour.ExchangeSignals.signals:type_name -> bringyour.ExchangeSignal
-	1,  // 15: bringyour.ExchangeSignal.signal_type:type_name -> bringyour.SignalType
-	2,  // 16: bringyour.CreateContractResult.error:type_name -> bringyour.ContractError
-	21, // 17: bringyour.CreateContractResult.contract:type_name -> bringyour.Contract
-	19, // 18: bringyour.CreateContractResult.create_contract:type_name -> bringyour.CreateContract
-	0,  // 19: bringyour.Contract.provide_mode:type_name -> bringyour.ProvideMode
-	3,  // 20: bringyour.EncryptedControl.control_type:type_name -> bringyour.EncryptedControlType
-	21, // [21:21] is the sub-list for method output_type
-	21, // [21:21] is the sub-list for method input_type
-	21, // [21:21] is the sub-list for extension type_name
-	21, // [21:21] is the sub-list for extension extendee
-	0,  // [0:21] is the sub-list for field type_name
+	5,  // 0: bringyour.TransferFrame.transfer_path:type_name -> bringyour.TransferPath
+	31, // 1: bringyour.TransferFrame.frame:type_name -> bringyour.Frame
+	32, // 2: bringyour.TransferFrame.message_type:type_name -> bringyour.MessageType
+	8,  // 3: bringyour.TransferFrame.pack:type_name -> bringyour.Pack
+	10, // 4: bringyour.TransferFrame.ack:type_name -> bringyour.Ack
+	0,  // 5: bringyour.TransferFrame.session_role:type_name -> bringyour.SequenceRole
+	5,  // 6: bringyour.FilteredTransferFrame.transfer_path:type_name -> bringyour.TransferPath
+	31, // 7: bringyour.Pack.frames:type_name -> bringyour.Frame
+	31, // 8: bringyour.Pack.contract_frame:type_name -> bringyour.Frame
+	11, // 9: bringyour.Pack.tag:type_name -> bringyour.Tag
+	31, // 10: bringyour.FilteredPack.contract_frame:type_name -> bringyour.Frame
+	11, // 11: bringyour.Ack.tag:type_name -> bringyour.Tag
+	14, // 12: bringyour.Provide.keys:type_name -> bringyour.ProvideKey
+	1,  // 13: bringyour.ProvideKey.mode:type_name -> bringyour.ProvideMode
+	15, // 14: bringyour.StreamReset.streams:type_name -> bringyour.StreamOpen
+	19, // 15: bringyour.ExchangeSignals.signals:type_name -> bringyour.ExchangeSignal
+	2,  // 16: bringyour.ExchangeSignal.signal_type:type_name -> bringyour.SignalType
+	3,  // 17: bringyour.CreateContractResult.error:type_name -> bringyour.ContractError
+	22, // 18: bringyour.CreateContractResult.contract:type_name -> bringyour.Contract
+	20, // 19: bringyour.CreateContractResult.create_contract:type_name -> bringyour.CreateContract
+	1,  // 20: bringyour.Contract.provide_mode:type_name -> bringyour.ProvideMode
+	4,  // 21: bringyour.EncryptedControl.control_type:type_name -> bringyour.EncryptedControlType
+	0,  // 22: bringyour.EncryptedControl.session_role:type_name -> bringyour.SequenceRole
+	23, // [23:23] is the sub-list for method output_type
+	23, // [23:23] is the sub-list for method input_type
+	23, // [23:23] is the sub-list for extension type_name
+	23, // [23:23] is the sub-list for extension extendee
+	0,  // [0:23] is the sub-list for field type_name
 }
 
 func init() { file_transfer_proto_init() }
@@ -2345,7 +2448,7 @@ func file_transfer_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_transfer_proto_rawDesc), len(file_transfer_proto_rawDesc)),
-			NumEnums:      4,
+			NumEnums:      5,
 			NumMessages:   26,
 			NumExtensions: 0,
 			NumServices:   0,

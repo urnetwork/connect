@@ -648,17 +648,6 @@ func NewUdpSequence(ctx context.Context, receiveCallback ReceivePacketFunction,
 	destinationIp net.IP, destinationPort layers.UDPPort,
 	udpBufferSettings *UdpBufferSettings) *UdpSequence {
 	cancelCtx, cancel := context.WithCancel(ctx)
-	streamState := StreamState{
-		source:          source,
-		provideMode:     provideMode,
-		ipVersion:       ipVersion,
-		sourceIp:        sourceIp,
-		sourcePort:      sourcePort,
-		destinationIp:   destinationIp,
-		destinationPort: destinationPort,
-		buffer:          gopacket.NewSerializeBufferExpectedSize(128, 2048),
-		userLimited:     *newUserLimited(),
-	}
 	return &UdpSequence{
 		ctx:               cancelCtx,
 		cancel:            cancel,
@@ -666,7 +655,19 @@ func NewUdpSequence(ctx context.Context, receiveCallback ReceivePacketFunction,
 		sendItems:         make(chan *UdpSendItem, udpBufferSettings.SequenceBufferSize),
 		udpBufferSettings: udpBufferSettings,
 		idleCondition:     NewIdleCondition(),
-		StreamState:       streamState,
+		StreamState: StreamState{
+			source:          source,
+			provideMode:     provideMode,
+			ipVersion:       ipVersion,
+			sourceIp:        sourceIp,
+			sourcePort:      sourcePort,
+			destinationIp:   destinationIp,
+			destinationPort: destinationPort,
+			buffer:          gopacket.NewSerializeBufferExpectedSize(128, 2048),
+			userLimited: userLimited{
+				lastActivityTime: time.Now(),
+			},
+		},
 	}
 }
 
@@ -1372,23 +1373,6 @@ func NewTcpSequence(ctx context.Context, receiveCallback ReceivePacketFunction,
 	tcpBufferSettings *TcpBufferSettings) *TcpSequence {
 	cancelCtx, cancel := context.WithCancel(ctx)
 
-	connectionState := ConnectionState{
-		source:          source,
-		provideMode:     provideMode,
-		ipVersion:       ipVersion,
-		sourceIp:        sourceIp,
-		sourcePort:      sourcePort,
-		destinationIp:   destinationIp,
-		destinationPort: destinationPort,
-		// the window size starts at the fixed value
-		enableWindowScale: false,
-		// FIXME start this at initial window size, and it grows up to max window size
-		// FIXME initial window size should be ~4k, set max window size as a 2^amount multiplier of initial size
-		windowSize:  tcpBufferSettings.MinWindowSize,
-		windowScale: 0,
-		buffer:      gopacket.NewSerializeBufferExpectedSize(128, 2048),
-		userLimited: *newUserLimited(),
-	}
 	return &TcpSequence{
 		ctx:               cancelCtx,
 		cancel:            cancel,
@@ -1396,7 +1380,25 @@ func NewTcpSequence(ctx context.Context, receiveCallback ReceivePacketFunction,
 		tcpBufferSettings: tcpBufferSettings,
 		sendItems:         make(chan *TcpSendItem, tcpBufferSettings.SequenceBufferSize),
 		idleCondition:     NewIdleCondition(),
-		ConnectionState:   connectionState,
+		ConnectionState: ConnectionState{
+			source:          source,
+			provideMode:     provideMode,
+			ipVersion:       ipVersion,
+			sourceIp:        sourceIp,
+			sourcePort:      sourcePort,
+			destinationIp:   destinationIp,
+			destinationPort: destinationPort,
+			// the window size starts at the fixed value
+			enableWindowScale: false,
+			// FIXME start this at initial window size, and it grows up to max window size
+			// FIXME initial window size should be ~4k, set max window size as a 2^amount multiplier of initial size
+			windowSize:  tcpBufferSettings.MinWindowSize,
+			windowScale: 0,
+			buffer:      gopacket.NewSerializeBufferExpectedSize(128, 2048),
+			userLimited: userLimited{
+				lastActivityTime: time.Now(),
+			},
+		},
 	}
 }
 

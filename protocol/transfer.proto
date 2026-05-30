@@ -41,6 +41,34 @@ message TransferFrame {
     optional Pack pack = 4;
     optional Ack ack = 5;
     optional bytes encryptedTransferFrame = 6;
+    // Performance hint for `encryptedTransferFrame`: the role of the
+    // per-peer session that produced the wrapped bytes. The receiver
+    // decrypts with the complement local session. When unset
+    // (`SequenceRoleUnknown`) the receiver trial-decrypts against every
+    // per-peer session it holds — senders may leave it unset for
+    // additional on-wire anonymity. Ignored for plaintext frames.
+    optional SequenceRole session_role = 7;
+}
+
+// SequenceRole identifies which side of a per-peer encryption session
+// (TLS client/initiator or TLS server/responder) a frame or control
+// message originated from. Each ordered pair of peers can run up to two
+// independent sessions: one where the local client is the TLS client
+// (carrying the local client's outbound application data) and one where
+// it is the TLS server (responding to the peer's initiation). The
+// receiver of a session-tagged message routes to the COMPLEMENT local
+// session: a `SequenceRoleClient` message is consumed by the receiver's
+// server-role session, and vice versa.
+enum SequenceRole {
+    // Unset. On a `TransferFrame` this means "no hint" (trial-decrypt).
+    // On an `EncryptedControl` it is invalid — the sender always sets a
+    // concrete role.
+    SequenceRoleUnknown = 0;
+    // The sender holds the TLS-client (initiator) role for the session
+    // that produced this frame/control.
+    SequenceRoleClient = 1;
+    // The sender holds the TLS-server (responder) role.
+    SequenceRoleServer = 2;
 }
 
 
@@ -425,5 +453,13 @@ message EncryptedControl {
     // For `EncryptedControlHandshake`: raw TLS handshake bytes. Empty for
     // other control types.
     bytes payload = 2;
+    // The role of the sending per-peer session: `SequenceRoleClient` for
+    // handshake/identity bytes from the sender's TLS-client session,
+    // `SequenceRoleServer` for its TLS-server session. The receiver feeds
+    // the payload into its COMPLEMENT session (client->server,
+    // server->client), creating that session if it does not exist yet.
+    // Always set on send; `SequenceRoleUnknown` is treated as a protocol
+    // error and dropped.
+    SequenceRole session_role = 3;
 }
 

@@ -55,35 +55,317 @@ func (self *ClientSignalSender) SendSignal(path TransferPath, signal *protocol.F
 }
 
 type clientSignalReceiver struct {
-	client   *Client
-	receiver SignalReceiver
+	client           *Client
+	receiver         SignalReceiver
+	ctx              context.Context
+	cancel           context.CancelFunc
+	queueLock        sync.Mutex
+	closed           bool
+	queueLimit       int
+	receiveFrames    []*receivedSignalFrame
+	receiveFrameHead int
+	queueMonitor     *Monitor
+	spaceMonitor     *Monitor
+}
+
+type receivedSignalFrame struct {
+	source          TransferPath
+	frame           *protocol.Frame
+	exchangeSignals *protocol.ExchangeSignals
+	candidateBatch  bool
+	key             receivedSignalFrameKey
+}
+
+type receivedSignalFrameKey struct {
+	source   TransferPath
+	streamId Id
 }
 
 func ReceiveSignalsFromClient(client *Client, receiver SignalReceiver) func() {
-	r := &clientSignalReceiver{
-		client:   client,
-		receiver: receiver,
+	cancelCtx, cancel := context.WithCancel(client.Ctx())
+	bufferSize := defaultTransferBufferSize
+	if client.settings != nil && client.settings.ReceiveBufferSettings != nil {
+		bufferSize = client.settings.ReceiveBufferSettings.SequenceBufferSize
 	}
-	return client.AddReceiveCallback(r.Receive)
+	bufferSize = max(1, bufferSize)
+	r := &clientSignalReceiver{
+		client:       client,
+		receiver:     receiver,
+		ctx:          cancelCtx,
+		cancel:       cancel,
+		queueLimit:   bufferSize,
+		queueMonitor: NewMonitor(),
+		spaceMonitor: NewMonitor(),
+	}
+	go HandleError(r.run, cancel)
+	go HandleError(func() {
+		<-cancelCtx.Done()
+		r.Close()
+	})
+	unsub := client.AddReceiveCallback(r.Receive)
+	return func() {
+		unsub()
+		r.Close()
+	}
 }
 
 // ReceiveFunction
 func (self *clientSignalReceiver) Receive(source TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode) {
 	for _, frame := range frames {
-		err := self.handleControlFrame(source, frame)
+		self.handleControlFrame(source, frame)
+	}
+}
+
+func (self *clientSignalReceiver) handleControlFrame(source TransferPath, frame *protocol.Frame) {
+	switch frame.MessageType {
+	case protocol.MessageType_TransferExchangeSignals:
+		select {
+		case <-self.ctx.Done():
+			return
+		default:
+		}
+
+		received, err := newReceivedSignalFrame(source, frame)
 		if err != nil {
-			glog.Infof("[signal]receive err=%s\n", err)
-			// ignore error
+			glog.Infof("[signal]receive frame err=%s\n", err)
+			return
+		}
+		if !self.enqueue(received) {
+			received.Close()
 		}
 	}
 }
 
-func (self *clientSignalReceiver) handleControlFrame(source TransferPath, frame *protocol.Frame) error {
-	switch frame.MessageType {
-	case protocol.MessageType_TransferExchangeSignals:
-		self.receiver.ReceiveSignal(source, frame)
+func (self *clientSignalReceiver) Close() {
+	self.queueLock.Lock()
+	if !self.closed {
+		self.closed = true
+		for _, received := range self.receiveFrames[self.receiveFrameHead:] {
+			if received != nil {
+				received.Close()
+			}
+		}
+		self.receiveFrames = nil
+		self.receiveFrameHead = 0
 	}
+	self.queueLock.Unlock()
+	self.cancel()
+	self.queueMonitor.NotifyAll()
+	self.spaceMonitor.NotifyAll()
+}
+
+func (self *clientSignalReceiver) run() {
+	for {
+		received := self.dequeue()
+		if received == nil {
+			return
+		}
+		func() {
+			defer received.Close()
+			if err := received.prepareFrame(); err != nil {
+				glog.Infof("[signal]receive frame err=%s\n", err)
+				return
+			}
+			if err := self.receiver.ReceiveSignal(received.source, received.frame); err != nil {
+				glog.Infof("[signal]receive err=%s\n", err)
+			}
+		}()
+	}
+}
+
+func newReceivedSignalFrame(source TransferPath, frame *protocol.Frame) (*receivedSignalFrame, error) {
+	exchangeSignals := &protocol.ExchangeSignals{}
+	if err := ProtoUnmarshal(frame.MessageBytes, exchangeSignals); err != nil {
+		return &receivedSignalFrame{
+			source: source,
+			frame: &protocol.Frame{
+				MessageType:  frame.MessageType,
+				Raw:          frame.Raw,
+				MessageBytes: MessagePoolCopy(frame.MessageBytes),
+			},
+		}, nil
+	}
+
+	exchangeSignals = cloneExchangeSignals(exchangeSignals)
+	candidateBatch := false
+	var key receivedSignalFrameKey
+	if isCandidateBatch(exchangeSignals) {
+		if streamId, err := IdFromBytes(exchangeSignals.StreamId); err == nil {
+			candidateBatch = true
+			key = receivedSignalFrameKey{
+				source:   source,
+				streamId: streamId,
+			}
+		}
+	}
+	var messageBytes []byte
+	if !candidateBatch {
+		messageBytes = MessagePoolCopy(frame.MessageBytes)
+	}
+	received := &receivedSignalFrame{
+		source: source,
+		frame: &protocol.Frame{
+			MessageType:  frame.MessageType,
+			Raw:          frame.Raw,
+			MessageBytes: messageBytes,
+		},
+		exchangeSignals: exchangeSignals,
+	}
+	if candidateBatch {
+		received.candidateBatch = true
+		received.key = key
+	} else {
+		received.exchangeSignals = nil
+	}
+	return received, nil
+}
+
+func (self *receivedSignalFrame) Close() {
+	if self.frame != nil {
+		if self.frame.MessageBytes != nil {
+			MessagePoolReturn(self.frame.MessageBytes)
+		}
+		self.frame = nil
+	}
+	self.exchangeSignals = nil
+}
+
+func (self *receivedSignalFrame) prepareFrame() error {
+	if self.frame == nil || self.frame.MessageBytes != nil || self.exchangeSignals == nil {
+		return nil
+	}
+	messageBytes, err := ProtoMarshal(self.exchangeSignals)
+	if err != nil {
+		return err
+	}
+	self.frame.MessageBytes = messageBytes
 	return nil
+}
+
+func (self *receivedSignalFrame) isCandidateBatch() bool {
+	return isCandidateBatch(self.exchangeSignals)
+}
+
+func isCandidateBatch(exchangeSignals *protocol.ExchangeSignals) bool {
+	if exchangeSignals == nil || exchangeSignals.ResetSignals || len(exchangeSignals.Signals) == 0 {
+		return false
+	}
+	for _, signal := range exchangeSignals.Signals {
+		if signal == nil || signal.SignalType != protocol.SignalType_IceCandidate {
+			return false
+		}
+	}
+	return true
+}
+
+func (self *receivedSignalFrame) appendCandidateBatch(received *receivedSignalFrame) error {
+	if !self.candidateBatch || !received.candidateBatch || self.key != received.key {
+		return fmt.Errorf("candidate batch mismatch")
+	}
+	self.exchangeSignals.Signals = append(self.exchangeSignals.Signals, received.exchangeSignals.Signals...)
+	return nil
+}
+
+func (self *clientSignalReceiver) enqueue(received *receivedSignalFrame) bool {
+	for {
+		var spaceNotify chan struct{}
+		self.queueLock.Lock()
+		if self.closed || self.ctx.Err() != nil {
+			self.queueLock.Unlock()
+			return false
+		}
+		if received.candidateBatch {
+			if batch := self.tailLocked(); batch != nil && batch.candidateBatch && batch.key == received.key {
+				err := batch.appendCandidateBatch(received)
+				self.queueLock.Unlock()
+				if err != nil {
+					glog.Infof("[signal]coalesce candidate err=%s\n", err)
+					return false
+				}
+				received.Close()
+				return true
+			}
+		}
+		if self.queueLenLocked() < self.queueLimit {
+			self.receiveFrames = append(self.receiveFrames, received)
+			self.queueLock.Unlock()
+			self.queueMonitor.NotifyAll()
+			return true
+		}
+		spaceNotify = self.spaceMonitor.NotifyChannel()
+		self.queueLock.Unlock()
+
+		select {
+		case <-self.ctx.Done():
+			return false
+		case <-spaceNotify:
+		}
+	}
+}
+
+func (self *clientSignalReceiver) queueLenLocked() int {
+	return len(self.receiveFrames) - self.receiveFrameHead
+}
+
+func (self *clientSignalReceiver) tailLocked() *receivedSignalFrame {
+	if self.queueLenLocked() == 0 {
+		return nil
+	}
+	return self.receiveFrames[len(self.receiveFrames)-1]
+}
+
+func (self *clientSignalReceiver) dequeue() *receivedSignalFrame {
+	for {
+		var queueNotify chan struct{}
+		self.queueLock.Lock()
+		if 0 < self.queueLenLocked() {
+			received := self.receiveFrames[self.receiveFrameHead]
+			self.receiveFrames[self.receiveFrameHead] = nil
+			self.receiveFrameHead += 1
+			if self.receiveFrameHead == len(self.receiveFrames) {
+				self.receiveFrames = self.receiveFrames[:0]
+				self.receiveFrameHead = 0
+			}
+			self.queueLock.Unlock()
+			self.spaceMonitor.NotifyAll()
+			return received
+		}
+		if self.closed || self.ctx.Err() != nil {
+			self.queueLock.Unlock()
+			return nil
+		}
+		queueNotify = self.queueMonitor.NotifyChannel()
+		self.queueLock.Unlock()
+
+		select {
+		case <-self.ctx.Done():
+			return nil
+		case <-queueNotify:
+		}
+	}
+}
+
+func cloneExchangeSignals(exchangeSignals *protocol.ExchangeSignals) *protocol.ExchangeSignals {
+	out := &protocol.ExchangeSignals{
+		StreamId:     append([]byte(nil), exchangeSignals.StreamId...),
+		ResetSignals: exchangeSignals.ResetSignals,
+		Signals:      make([]*protocol.ExchangeSignal, 0, len(exchangeSignals.Signals)),
+	}
+	for _, signal := range exchangeSignals.Signals {
+		out.Signals = append(out.Signals, cloneExchangeSignal(signal))
+	}
+	return out
+}
+
+func cloneExchangeSignal(signal *protocol.ExchangeSignal) *protocol.ExchangeSignal {
+	if signal == nil {
+		return nil
+	}
+	return &protocol.ExchangeSignal{
+		SignalType:   signal.SignalType,
+		Sdp:          append([]byte(nil), signal.Sdp...),
+		IceCandidate: append([]byte(nil), signal.IceCandidate...),
+	}
 }
 
 func DefaultWebRtcSettings() *WebRtcSettings {
