@@ -29,8 +29,7 @@ func TestFramerWriteRead(t *testing.T) {
 		return message
 	}
 
-	settings := DefaultFramerSettings()
-	settings.MaxMessageLen = maxMessageLen
+	settings := DefaultFramerSettings(maxMessageLen)
 	framer := NewFramer(settings)
 
 	select {
@@ -145,7 +144,7 @@ func TestFramerSpeedup(t *testing.T) {
 		}
 	}
 
-	settings := DefaultFramerSettings()
+	settings := DefaultFramerSettings(2048)
 
 	var startTime time.Time
 	var endTime time.Time

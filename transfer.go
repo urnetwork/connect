@@ -18,7 +18,7 @@ import (
 
 	"golang.org/x/exp/maps"
 
-	// "google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/urnetwork/glog"
 
@@ -75,7 +75,7 @@ func DefaultClientSettings() *ClientSettings {
 }
 
 func DefaultClientSettingsWithBufferSize(bufferSize int) *ClientSettings {
-	return &ClientSettings{
+	settings := &ClientSettings{
 		SendBufferSize:          bufferSize,
 		ForwardBufferSize:       bufferSize,
 		ReadTimeout:             30 * time.Second,
@@ -91,6 +91,16 @@ func DefaultClientSettingsWithBufferSize(bufferSize int) *ClientSettings {
 		ProtocolVersion:         DefaultProtocolVersion,
 		DefaultTransferOpts:     DefaultTransferOpts(),
 	}
+	// A per-peer encryption session is ref-held by both a send sequence and a
+	// receive sequence, so it must outlive the longer of the two for the next
+	// burst (after a transport reform or lull) to reuse the live cipher instead
+	// of churning a fresh handshake. Tie the session idle timeout to
+	// max(send-sequence idle, receive-sequence idle).
+	settings.EncryptionSettings.IdleTimeout = max(
+		settings.SendBufferSettings.IdleTimeout,
+		settings.ReceiveBufferSettings.IdleTimeout,
+	)
+	return settings
 }
 
 func DefaultClientSettingsNoNetworkEvents() *ClientSettings {
@@ -1240,7 +1250,15 @@ func (self *Client) run() {
 								session.OptimisticallyDeliverHandshake(ec.Payload)
 							}
 						case protocol.EncryptedControlType_EncryptedControlIdentityProof:
-							session.receivePeerIdentityProof(ec.Payload)
+							// Optimistic path must not create epoch state from a
+							// stale/reordered/retransmitted proof; only deliver
+							// against an epoch that already exists. The in-order
+							// path (DeliverEncryptedControl) still handles a proof
+							// that races ahead of the local handshake by creating
+							// the epoch to buffer it.
+							if session.currentEpoch() != nil {
+								session.receivePeerIdentityProof(ec.Payload)
+							}
 						}
 					}
 				}
@@ -1290,18 +1308,38 @@ func (self *Client) run() {
 }
 
 func (self *Client) ResendQueueSize(destination TransferPath, intermediaryIds MultiHopId, companionContract bool, forceStream bool) (int, ByteCount, Id) {
+	count, byteSize, sequenceId, _ := self.ResendQueueSizeAndMessageTypes(destination, intermediaryIds, companionContract, forceStream)
+	return count, byteSize, sequenceId
+}
+
+func (self *Client) ResendQueueSizeAndMessageTypes(
+	destination TransferPath,
+	intermediaryIds MultiHopId,
+	companionContract bool,
+	forceStream bool,
+) (
+	int,
+	ByteCount,
+	Id,
+	[]protocol.MessageType,
+) {
 	if self.sendBuffer == nil {
-		return 0, 0, Id{}
+		return 0, 0, Id{}, nil
 	} else {
-		return self.sendBuffer.ResendQueueSize(destination, intermediaryIds, companionContract, forceStream)
+		return self.sendBuffer.ResendQueueSizeAndMessageTypes(destination, intermediaryIds, companionContract, forceStream)
 	}
 }
 
 func (self *Client) ReceiveQueueSize(source TransferPath, sequenceId Id) (int, ByteCount) {
+	count, byteSize, _ := self.ReceiveQueueSizeAndMessageTypes(source, sequenceId)
+	return count, byteSize
+}
+
+func (self *Client) ReceiveQueueSizeAndMessageTypes(source TransferPath, sequenceId Id) (int, ByteCount, []protocol.MessageType) {
 	if self.receiveBuffer == nil {
-		return 0, 0
+		return 0, 0, nil
 	} else {
-		return self.receiveBuffer.ReceiveQueueSize(source, sequenceId)
+		return self.receiveBuffer.ReceiveQueueSizeAndMessageTypes(source, sequenceId)
 	}
 }
 
@@ -1518,29 +1556,7 @@ func (self *SendBuffer) Pack(sendPack *SendPack, timeout time.Duration) (bool, e
 // operations — the session's ctx must NOT propagate into `SendPack.Ctx`,
 // because SendBuffer.Pack interprets a canceled `SendPack.Ctx` as a
 // sequence problem and cancels the existing SendSequence.
-// hasCompanionSendSequence reports whether an existing send sequence to
-// `peerId` for the encryption `role` was created as a companion sender. The
-// EncryptedControl carrier reuses that sequence (a client-role ClientHello
-// rides the application data send sequence), so it must inherit the companion
-// flag rather than fork a second sequence to the same (peer, role).
-func (self *SendBuffer) hasCompanionSendSequence(peerId Id, role sequenceTlsRole) bool {
-	self.mutex.Lock()
-	defer self.mutex.Unlock()
-	for id := range self.sendSequences {
-		if id.Destination.DestinationId == peerId &&
-			id.EncryptionRole == role &&
-			id.CompanionContract {
-			return true
-		}
-	}
-	return false
-}
-
-// SendEncryptedControl enqueues an EncryptedControl pack for delivery
-// to `peerId`. Retries until the pack is accepted into a SendSequence
-// or `ctx` is canceled. Returns true on success, false if the session
-// context was canceled before the pack could be enqueued.
-func (self *SendBuffer) SendEncryptedControl(ctx context.Context, peerId Id, role sequenceTlsRole, ec *protocol.EncryptedControl) bool {
+func (self *SendBuffer) SendEncryptedControl(ctx context.Context, peerId Id, role sequenceTlsRole, ec *protocol.EncryptedControl, companion bool) bool {
 	select {
 	case <-ctx.Done():
 		return false
@@ -1561,24 +1577,23 @@ func (self *SendBuffer) SendEncryptedControl(ctx context.Context, peerId Id, rol
 	//
 	// The carrier rides ONE send sequence per (peer, role); its companion flag
 	// must match that sequence so the EncryptedControl is not forked onto a
-	// second sequence whose ContractKey can't be satisfied. Two cases make it a
-	// companion carrier:
-	//   - an existing (peer, role) send sequence is already a companion sender
-	//     (e.g. the application sends to this peer with CompanionContract; the
-	//     client-role ClientHello, enqueued by that sequence's own restart,
-	//     must ride it), or
-	//   - this is the server (TLS responder) role and EncryptionControlUseCompanion
-	//     is set (default true), so the responder can reply even in asymmetric
-	//     setups where it has no regular contract to the initiator.
-	// In the symmetric configuration the setting is false and the application
-	// is not a companion sender, so every send sequence to the peer (data +
-	// both carriers) is a regular-contract sequence.
+	// second sequence whose ContractKey can't be satisfied. The session knows
+	// its own companion mode (set at creation from the SendSequence that
+	// triggered it, or from EncryptionControlUseCompanion for a server-role
+	// responder) and passes it in as `companion` — so the carrier rides exactly
+	// that session's send sequence. In the symmetric configuration this is
+	// false, so every send sequence to the peer (data + both carriers) is a
+	// regular-contract sequence.
 	opts := self.client.settings.DefaultTransferOpts
 	opts.Ack = true
-	opts.CompanionContract = self.hasCompanionSendSequence(peerId, role) ||
-		(role == sequenceTlsRoleServer &&
-			self.client.settings.EncryptionSettings != nil &&
-			self.client.settings.EncryptionSettings.EncryptionControlUseCompanion)
+	opts.CompanionContract = companion
+	// V(2) diagnostic: in symmetric mode no encryption-control carrier should
+	// be a companion. Log the decision so a companion carrier (whose Stream-mode
+	// contract the platform rejects → handshake stalls) can be caught.
+	glog.V(2).Infof(
+		"[sb][enc-ctrl]%s peer=%s role=%v companion=%t\n",
+		self.client.ClientTag(), peerId, role, companion,
+	)
 	sendPack := &SendPack{
 		TransferOptions:  opts,
 		Frame:            frame,
@@ -1641,7 +1656,7 @@ func (self *SendBuffer) Ack(destination TransferPath, ack *protocol.Ack, timeout
 	return anySuccess
 }
 
-func (self *SendBuffer) ResendQueueSize(destination TransferPath, intermediaryIds MultiHopId, companionContract bool, forceStream bool) (int, ByteCount, Id) {
+func (self *SendBuffer) ResendQueueSizeAndMessageTypes(destination TransferPath, intermediaryIds MultiHopId, companionContract bool, forceStream bool) (int, ByteCount, Id, []protocol.MessageType) {
 	sendSequence := func() *SendSequence {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
@@ -1654,9 +1669,9 @@ func (self *SendBuffer) ResendQueueSize(destination TransferPath, intermediaryId
 	}
 
 	if seq := sendSequence(); seq != nil {
-		return seq.ResendQueueSize()
+		return seq.ResendQueueSizeAndMessageTypes()
 	}
-	return 0, 0, Id{}
+	return 0, 0, Id{}, nil
 }
 
 // called before a send sequence writes a transfer frame with a stream id,
@@ -1819,14 +1834,29 @@ func NewSendSequence(
 		// re-initiates, rebuilding a peer's lost responder session); a
 		// server-role send sequence (EncryptedControl carrier / server
 		// reply) never restarts.
-		seq.session = client.encryptionSessionManager.AcquireForSend(destination.DestinationId, encryptionRole)
+		seq.session = client.encryptionSessionManager.AcquireForSend(destination.DestinationId, encryptionRole, companionContract)
 	}
 	return seq
 }
 
-func (self *SendSequence) ResendQueueSize() (int, ByteCount, Id) {
-	count, byteSize := self.resendQueue.QueueSize()
-	return count, byteSize, self.sequenceId
+func (self *SendSequence) ResendQueueSizeAndMessageTypes() (int, ByteCount, Id, []protocol.MessageType) {
+	unpackMessageTypes := func(item *sendItem) any {
+		var messageTypes []protocol.MessageType
+		var transferFrame protocol.TransferFrame
+		err := proto.Unmarshal(item.transferFrameBytes, &transferFrame)
+		if err == nil && transferFrame.Pack != nil {
+			for _, frame := range transferFrame.Pack.Frames {
+				messageTypes = append(messageTypes, frame.MessageType)
+			}
+		}
+		return messageTypes
+	}
+	count, byteSize, summary := self.resendQueue.QueueSizeAndSummary(unpackMessageTypes)
+	var messageTypes []protocol.MessageType
+	for _, summaryMessageTypes := range summary {
+		messageTypes = append(messageTypes, summaryMessageTypes.([]protocol.MessageType)...)
+	}
+	return count, byteSize, self.sequenceId, messageTypes
 }
 
 // success, error
@@ -2835,7 +2865,19 @@ func (self *SendSequence) verifyPeerCertAgainstContract() error {
 		return nil
 	}
 	expected := self.session.trustedPeerCertSnapshot()
-	peerCerts := self.session.PeerCertificates()
+	// V(2) diagnostic: verify against the established epoch (whose cipher seals
+	// this frame), not the in-flight currentEpoch() whose ConnectionState()
+	// blocks on the running handshake. Logged so this path being reached
+	// (non-empty trusted set armed by an attached contract cert) is observable.
+	glog.V(2).Infof(
+		"[s][cert-verify]%s->%s s(%s) verifying established-epoch peer certs (non-blocking); trustedSet=%d companion=%t\n",
+		self.client.ClientTag(),
+		self.destination.DestinationId,
+		self.destination.StreamId,
+		len(expected),
+		self.companionContract,
+	)
+	peerCerts := self.session.establishedPeerCertificates()
 	ok, err := verifyPeerCertificateAgainstContract(peerCerts, expected)
 	if err != nil {
 		glog.Errorf(
@@ -3145,7 +3187,7 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 	return success, err
 }
 
-func (self *ReceiveBuffer) ReceiveQueueSize(source TransferPath, sequenceId Id) (int, ByteCount) {
+func (self *ReceiveBuffer) ReceiveQueueSizeAndMessageTypes(source TransferPath, sequenceId Id) (int, ByteCount, []protocol.MessageType) {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 
@@ -3158,10 +3200,10 @@ func (self *ReceiveBuffer) ReceiveQueueSize(source TransferPath, sequenceId Id) 
 			EncryptionRole: role,
 		}
 		if receiveSequence, ok := self.receiveSequences[receiveSequenceId]; ok {
-			return receiveSequence.ReceiveQueueSize()
+			return receiveSequence.ReceiveQueueSizeAndMessageTypes()
 		}
 	}
-	return 0, 0
+	return 0, 0, nil
 }
 
 func (self *ReceiveBuffer) Close() {
@@ -3276,8 +3318,24 @@ func NewReceiveSequence(
 	return seq
 }
 
-func (self *ReceiveSequence) ReceiveQueueSize() (int, ByteCount) {
-	return self.receiveQueue.QueueSize()
+func (self *ReceiveSequence) ReceiveQueueSizeAndMessageTypes() (int, ByteCount, []protocol.MessageType) {
+	unpackMessageTypes := func(item *receiveItem) any {
+		var messageTypes []protocol.MessageType
+		var transferFrame protocol.TransferFrame
+		err := proto.Unmarshal(item.transferFrameBytes, &transferFrame)
+		if err == nil && transferFrame.Pack != nil {
+			for _, frame := range transferFrame.Pack.Frames {
+				messageTypes = append(messageTypes, frame.MessageType)
+			}
+		}
+		return messageTypes
+	}
+	count, byteSize, summary := self.receiveQueue.QueueSizeAndSummary(unpackMessageTypes)
+	var messageTypes []protocol.MessageType
+	for _, summaryMessageTypes := range summary {
+		messageTypes = append(messageTypes, summaryMessageTypes.([]protocol.MessageType)...)
+	}
+	return count, byteSize, messageTypes
 }
 
 // success, error

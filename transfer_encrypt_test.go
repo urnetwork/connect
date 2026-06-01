@@ -47,6 +47,7 @@ func newTestSessionForIdentityProof(t *testing.T) (
 		ctx, manager, client, peerId,
 		sequenceTlsRoleServer,
 		settings.EncryptionSettings,
+		false,
 	)
 
 	// Pre-populate the TLS-handshake-derived state. In production
@@ -292,6 +293,7 @@ func TestIsAwaitingClientFinishedClientRole(t *testing.T) {
 		ctx, manager, client, NewId(),
 		sequenceTlsRoleClient,
 		settings.EncryptionSettings,
+		false,
 	)
 	clientRoleSess.epoch = &tlsHandshakeEpoch{handshakeDone: make(chan struct{})}
 
@@ -401,7 +403,7 @@ func newTestEncryptionSession(t *testing.T, role sequenceTlsRole) (*peerEncrypti
 		t.Fatalf("NewClientKeyManager: %s", err)
 	}
 	manager := NewEncryptionSessionManager(ctx, client, keyManager, settings.EncryptionSettings)
-	sess := newPeerEncryptionSession(ctx, manager, client, NewId(), role, settings.EncryptionSettings)
+	sess := newPeerEncryptionSession(ctx, manager, client, NewId(), role, settings.EncryptionSettings, false)
 	return sess, func() {
 		client.Cancel()
 		cancel()
@@ -546,6 +548,10 @@ func TestReleasedSessionRemovedFromManager(t *testing.T) {
 	settings := DefaultClientSettings()
 	settings.EncryptionSettings.Encrypt = true
 	settings.EncryptionSettings.TlsTimeout = 2 * time.Second
+	// Short idle timeout so the reap is observable quickly. The session is kept
+	// registered for this long after its last reference drops, then the Run
+	// loop's CancelIfIdle removes it.
+	settings.EncryptionSettings.IdleTimeout = 200 * time.Millisecond
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 	defer client.Cancel()
 	keyManager, err := NewClientKeyManager(ctx, client)
@@ -561,14 +567,21 @@ func TestReleasedSessionRemovedFromManager(t *testing.T) {
 		t.Fatal("expected the session to be registered in the manager")
 	}
 
-	sess.Release() // refs -> 0 -> close + unregister, atomically
-	// Removal is synchronous with Release; poll defensively in case the
-	// supervisor goroutine races.
+	sess.Release() // refs -> 0; kept registered until idle for IdleTimeout
+
+	// Removal is NOT synchronous with Release: the session is kept registered
+	// so a transport reform / next burst reuses the live cipher instead of
+	// churning a fresh handshake. The idle time here (~0) is below IdleTimeout.
+	if manager.Lookup(peerId, sequenceTlsRoleServer) != sess {
+		t.Fatal("expected the session to remain registered immediately after Release (idle keep-alive)")
+	}
+
+	// After IdleTimeout the Run loop's CancelIfIdle reaps it.
 	deadline := time.After(2 * time.Second)
 	for manager.Lookup(peerId, sequenceTlsRoleServer) != nil {
 		select {
 		case <-deadline:
-			t.Fatal("expected the session to be removed from the manager after Release")
+			t.Fatal("expected the session to be removed from the manager after the idle timeout")
 		case <-time.After(5 * time.Millisecond):
 		}
 	}
@@ -610,14 +623,14 @@ func TestAcquireForSendRestartPolicy(t *testing.T) {
 			manager := NewEncryptionSessionManager(ctx, client, km, settings.EncryptionSettings)
 
 			peerId := NewId()
-			s1 := manager.AcquireForSend(peerId, role)
+			s1 := manager.AcquireForSend(peerId, role, false)
 			if s1 == nil || s1.role != role {
 				t.Fatalf("expected a %v-role session", role)
 			}
 
 			// An in-flight handshake is never restarted by a later send.
 			inflight := injectTestEpoch(s1, false, nil)
-			s2 := manager.AcquireForSend(peerId, role)
+			s2 := manager.AcquireForSend(peerId, role, false)
 			if s2 != s1 {
 				t.Fatal("expected the same per-peer/role session")
 			}
@@ -629,7 +642,7 @@ func TestAcquireForSendRestartPolicy(t *testing.T) {
 			// rekey) while keeping the established epoch serving; the server
 			// role reuses.
 			established := injectEstablishedTestEpoch(s1)
-			s3 := manager.AcquireForSend(peerId, role)
+			s3 := manager.AcquireForSend(peerId, role, false)
 			if s3 != s1 {
 				t.Fatal("expected the same per-peer/role session")
 			}

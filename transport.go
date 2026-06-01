@@ -157,8 +157,10 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		// FIXME
 		DnsTlds: [][]byte{[]byte("ur.xyz.")},
 		// servers are migrated on 2025-06-12. We can remove this and always use true.
-		V2H1Auth:          true,
-		FramerSettings:    DefaultFramerSettings(),
+		V2H1Auth: true,
+		// the platform transport must carry the per-peer encryption handshake,
+		// so its framer max is the connect runtime minimum message length
+		FramerSettings:    DefaultFramerSettings(int(DefaultClientSettings().MinimumMessageLenLimit())),
 		PtDnsSlowMultiple: 4,
 	}
 }

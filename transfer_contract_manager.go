@@ -896,8 +896,7 @@ func (self *ContractManager) addContract(contractKey ContractKey, contract *prot
 		return fmt.Errorf("Contract source must be this client: %s<>%s", sourceId, self.client.ClientId())
 	}
 
-	// FIXME
-	glog.Infof("[contract]add %s %s\n", self.client.ClientId(), contractKey.Destination)
+	glog.V(1).Infof("[contract]add %s %s\n", self.client.ClientId(), contractKey.Destination)
 
 	func() {
 		contractQueue := self.openContractQueue(contractKey)
@@ -932,8 +931,7 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 		return
 	}
 
-	// FIXME
-	glog.Infof("[contract]create %s %s\n", self.client.ClientId(), contractKey.Destination)
+	glog.V(1).Infof("[contract]create %s %s\n", self.client.ClientId(), contractKey.Destination)
 
 	self.client.ClientOob().SendControl(
 		[]*protocol.Frame{frame},

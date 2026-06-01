@@ -87,8 +87,21 @@ func newTransferQueue[T transferQueueItem](cmp TransferQueueCmpFunction[T]) *tra
 func (self *transferQueue[T]) QueueSize() (int, ByteCount) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-
 	return len(self.orderedItems), self.byteCount
+}
+
+func (self *transferQueue[T]) QueueSizeAndSummary(summaryf func(T) any) (int, ByteCount, []any) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	var summary []any
+	if summaryf != nil {
+		for _, item := range self.orderedItems {
+			summary = append(summary, summaryf(item))
+		}
+	}
+
+	return len(self.orderedItems), self.byteCount, summary
 }
 
 func (self *transferQueue[T]) Add(item T) {

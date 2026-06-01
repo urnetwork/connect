@@ -18,6 +18,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -432,6 +433,10 @@ type EncryptionSettings struct {
 	// the session stays in the cipher-nil state — Cipher() returns nil and
 	// traffic flows in plaintext. Sessions never block sequences; whether
 	// to accept plaintext traffic is the caller's choice via `Encrypt`.
+	//
+	// A negative value (the default) disables the timeout: the handshake is
+	// allowed to run until it completes or the session is closed. The
+	// timeout watcher is armed only for a strictly positive duration.
 	TlsTimeout time.Duration
 	// NewPeerClientPublicKeyFetcher, when non-nil, is invoked once per
 	// per-peer encryption session at session creation time with the
@@ -494,13 +499,41 @@ type EncryptionSettings struct {
 	// false only for test configurations that disable companion
 	// contracts (e.g. symmetric-provide tests).
 	EncryptionControlUseCompanion bool
+
+	// IdleTimeout governs how long an established (not in-flight) per-peer
+	// session with zero references is kept registered before it is reaped.
+	// Sessions are ref-counted by the send/receive sequences that use them; a
+	// transport reform — or any brief lull between bursts — can drop the ref
+	// count to zero. Reaping immediately destroys the established cipher, so the
+	// next burst opens a fresh session while the peer is still wrapping under
+	// the prior cipher and can no longer be decrypted until a full re-handshake
+	// completes (and, because the two peers reap independently, this desync is
+	// asymmetric and can wedge). Keeping the session lets the next burst reuse
+	// it — cipher intact, no handshake churn.
+	//
+	// Three regimes:
+	//   < 0  keep the session in memory forever (never idle-reap),
+	//   == 0 reap immediately at refs==0 (legacy behavior),
+	//   > 0  keep it registered and reap it once it has been idle
+	//        (unreferenced) for this long (the Run loop's CancelIfIdle).
+	// A handshake in flight is always kept regardless.
+	//
+	// DefaultClientSettings derives this as max(send-sequence idle,
+	// receive-sequence idle), since the session is ref-held by both a send and
+	// a receive sequence and must outlive the longer of the two.
+	IdleTimeout time.Duration
 }
 
 func DefaultEncryptionSettings() *EncryptionSettings {
 	return &EncryptionSettings{
 		Encrypt:                       false,
-		TlsTimeout:                    30 * time.Second,
+		TlsTimeout:                    -1, // negative disables the handshake timeout
 		EncryptionControlUseCompanion: true,
+		// 0 reaps a standalone session immediately at refs==0 (<0 would keep it
+		// forever, >0 idle-reaps after the timeout). DefaultClientSettings
+		// overrides this with max(send-sequence idle, receive-sequence idle) so
+		// the session outlives the sequences that ref-hold it.
+		IdleTimeout: 0,
 	}
 }
 
@@ -585,7 +618,15 @@ type peerEncryptionSession struct {
 	client  *Client
 	peerId  Id // the other client's ClientId; the session is shared across every transport/route/stream to this peer
 	role    sequenceTlsRole
-	logTag  string
+	// companion records whether this session's EncryptedControl carriers ride
+	// a companion contract. For a client-role session it is the companion flag
+	// of the SendSequence that created it (so the carrier rides exactly that
+	// sequence's contract); for a server-role session it is
+	// EncryptionControlUseCompanion (the responder replies via companion in
+	// asymmetric setups where it has no regular contract to the initiator).
+	// Set once at creation. Replaces the fuzzy hasCompanionSendSequence lookup.
+	companion bool
+	logTag    string
 
 	settings *EncryptionSettings
 
@@ -620,6 +661,13 @@ type peerEncryptionSession struct {
 	// rekey.
 	priorEstablishedEpoch *tlsHandshakeEpoch
 	refs                  int // protected by stateLock
+	// lastActivityTime is the last time a sequence acquired or released this
+	// session (retain/Release). While refs is zero, the session's Run loop
+	// periodically calls CancelIfIdle, which reaps the session once
+	// now-lastActivityTime exceeds EncryptionSettings.IdleTimeout — so a
+	// transport reform or brief lull reuses the live cipher instead of churning
+	// a fresh handshake. Protected by stateLock.
+	lastActivityTime time.Time
 	// peerClientPublicKey is the peer's long-lived Ed25519 public
 	// identity key, set via `SetPeerClientPublicKey` (called from the
 	// SendSequence after a contract for the peer arrives). May be nil
@@ -651,18 +699,30 @@ func newPeerEncryptionSession(
 	peerId Id,
 	role sequenceTlsRole,
 	settings *EncryptionSettings,
+	// sendSeqCompanion is the companion flag of the SendSequence that
+	// triggered this session's creation (false for sessions created off the
+	// receive / inbound-handshake path). It is used as-is for a client-role
+	// session; a server-role session instead replies under
+	// EncryptionControlUseCompanion.
+	sendSeqCompanion bool,
 ) *peerEncryptionSession {
 	ctx, cancel := context.WithCancel(parentCtx)
+	companion := sendSeqCompanion
+	if role == sequenceTlsRoleServer {
+		companion = settings != nil && settings.EncryptionControlUseCompanion
+	}
 	s := &peerEncryptionSession{
-		ctx:          ctx,
-		cancel:       cancel,
-		manager:      manager,
-		client:       client,
-		peerId:       peerId,
-		role:         role,
-		logTag:       fmt.Sprintf("%s %s %s", client.ClientTag(), role, peerId),
-		settings:     settings,
-		readyMonitor: NewMonitor(),
+		ctx:              ctx,
+		cancel:           cancel,
+		manager:          manager,
+		client:           client,
+		peerId:           peerId,
+		role:             role,
+		companion:        companion,
+		logTag:           fmt.Sprintf("%s %s %s", client.ClientTag(), role, peerId),
+		settings:         settings,
+		readyMonitor:     NewMonitor(),
+		lastActivityTime: time.Now(),
 	}
 	// Mint a per-session out-of-band peer key fetcher from the
 	// settings factory. Held by the session for its lifetime only —
@@ -687,8 +747,36 @@ func newPeerEncryptionSession(
 // zero, or the manager shuts down), Run tears down the current epoch's
 // transport and returns; the manager then removes the session.
 func (self *peerEncryptionSession) Run() {
+	defer self.closeTls()
+
+	idleTimeout := time.Duration(0)
+	if self.settings != nil {
+		idleTimeout = self.settings.IdleTimeout
+	}
+
+	// Idle reaping is only armed for a strictly positive timeout. Otherwise a
+	// zero-ref session is reaped immediately by Release, and Run just waits for
+	// cancellation.
+	if 0 < idleTimeout {
+		// Poll for idle the same way resident connections do (see
+		// server/connect/resident.go): once the session has been unreferenced —
+		// and is not mid-handshake — for longer than IdleTimeout, reap it. This
+		// keeps the established cipher alive across a transport reform or brief
+		// lull (the next burst reuses it) without leaking sessions indefinitely.
+		for {
+			if self.CancelIfIdle() {
+				glog.V(1).Infof("[tls]%s session idle — reaped\n", self.logTag)
+				return
+			}
+			select {
+			case <-self.ctx.Done():
+				return
+			case <-time.After(idleTimeout):
+			}
+		}
+	}
+
 	<-self.ctx.Done()
-	self.closeTls()
 }
 
 // currentEpoch returns the session's current handshake epoch, or nil if
@@ -819,14 +907,12 @@ func (self *peerEncryptionSession) runHandshake(e *tlsHandshakeEpoch) {
 }
 
 func (self *peerEncryptionSession) handshakeTimeoutWatcher(e *tlsHandshakeEpoch) {
-	t := time.NewTimer(self.settings.TlsTimeout)
-	defer t.Stop()
 	select {
 	case <-e.ctx.Done():
 		return
 	case <-e.handshakeDone:
 		return
-	case <-t.C:
+	case <-time.After(self.settings.TlsTimeout):
 		// give the run loop a synthetic timeout error if it hasn't completed
 		self.completeHandshake(e, fmt.Errorf("tls handshake timeout after %s", self.settings.TlsTimeout))
 	}
@@ -909,6 +995,22 @@ func peerCertificatesOfEpoch(e *tlsHandshakeEpoch) []*x509.Certificate {
 	if e == nil || e.tlsConn == nil {
 		return nil
 	}
+	// V(2) diagnostic: tls.Conn.ConnectionState() acquires the handshake mutex
+	// and blocks until any in-progress handshake completes. The watchdog (only
+	// armed under V(2) so it costs nothing otherwise) flags whether this call is
+	// parking a caller (e.g. a SendSequence Run loop) instead of returning
+	// promptly.
+	if glog.V(2) {
+		pcDone := make(chan struct{})
+		defer close(pcDone)
+		go func() {
+			select {
+			case <-pcDone:
+			case <-time.After(2 * time.Second):
+				glog.Infof("[tls][peercert-block]ConnectionState() blocked >2s (handshake in progress)\n%s", debug.Stack())
+			}
+		}()
+	}
 	state := e.tlsConn.ConnectionState()
 	if !state.HandshakeComplete {
 		return nil
@@ -932,7 +1034,7 @@ func (self *peerEncryptionSession) sendEncryptedControl(ec *protocol.EncryptedCo
 		// that session referenced (alive) for the duration of the handshake —
 		// and the receiver maps the stream to the complement local session
 		// (the one the EC drives).
-		if !self.client.sendBuffer.SendEncryptedControl(self.ctx, self.peerId, self.role, ec) {
+		if !self.client.sendBuffer.SendEncryptedControl(self.ctx, self.peerId, self.role, ec, self.companion) {
 			self.close()
 		}
 	}, self.cancel)
@@ -1006,7 +1108,7 @@ func (self *peerEncryptionSession) completeHandshake(e *tlsHandshakeEpoch, err e
 		self.sendIdentityProofOnce(e)
 		self.maybeVerifyPendingPeerIdentityProof(e)
 	} else {
-		glog.Errorf("[tls]%s completeHandshake FAILED: %s\n", self.logTag, err)
+		glog.Errorf("[tls]%s completeHandshake failed: %s\n", self.logTag, err)
 	}
 	// Always notify subscribers — both the success case (cipher
 	// derived; identity exchange may still need to complete before
@@ -1470,8 +1572,14 @@ func (self *peerEncryptionSession) OptimisticallyDeliverHandshake(payload []byte
 		"[tls]%s OptimisticallyDeliverHandshake: feeding %d bytes (record type 0x%02x) to TLS state\n",
 		self.logTag, len(payload), payload[0],
 	)
-	self.startEpoch()
-	if e := self.currentEpoch(); e != nil && e.transport != nil {
+	// Only complete an already in-flight handshake; never create or restart an
+	// epoch from the optimistic path. This path runs on every EC frame the
+	// receive loop sees — including stale, reordered, and retransmitted ones —
+	// so it must not mutate epoch lifecycle state. IsAwaitingClientFinished
+	// already established that a current in-flight epoch (server flight sent,
+	// handshake not yet done) exists; deliver the client second flight to it
+	// and nothing more.
+	if e := self.currentEpoch(); e != nil && e.transport != nil && !isClosed(e.handshakeDone) {
 		e.transport.Deliver(payload)
 	}
 }
@@ -1525,6 +1633,18 @@ func (self *peerEncryptionSession) Cipher() *sequenceCipher {
 			}
 			glog.V(2).Infof("[tls]%s Cipher()=nil: %s\n", self.logTag, reason)
 		}
+		return nil
+	}
+	// A send must not wrap under the previous (established) epoch while a NEW
+	// handshake is in flight — fall back to plaintext until the new epoch
+	// establishes. The receiver keeps the previous epoch in `decryptCiphers`,
+	// so frames already on the wire under it stay decryptable; this asymmetry
+	// (sends drop the old epoch on a restart, receives keep it) is what lets a
+	// rekey proceed without the sender wrapping under an epoch the peer may have
+	// already moved past. In particular the contract-open ride-along is sent in
+	// the clear during a restart, so the contract always opens.
+	if self.handshakeInFlightLocked() {
+		glog.V(2).Infof("[tls]%s Cipher()=nil: new handshake in flight\n", self.logTag)
 		return nil
 	}
 	return self.establishedEpoch.derivedTlsCipher
@@ -1621,6 +1741,31 @@ func (self *peerEncryptionSession) closeTls() {
 // completed.
 func (self *peerEncryptionSession) PeerCertificates() []*x509.Certificate {
 	return peerCertificatesOfEpoch(self.currentEpoch())
+}
+
+// establishedPeerCertificates returns the peer certificate chain from the
+// established epoch — the epoch whose cipher `Cipher()` hands out and which
+// therefore seals outbound frames. That is the identity a SendSequence must
+// verify against the contract commitment.
+//
+// Unlike `currentEpoch()` — which during a re-handshake is an in-flight
+// epoch whose `tls.Conn.ConnectionState()` blocks on the handshake mutex —
+// the established epoch's handshake is by definition complete (it is only
+// promoted after the handshake finished and the identity proof verified,
+// see markEstablishedWithLock), so reading its peer certificates never
+// blocks. Verifying the in-flight epoch here was the source of a deadlock:
+// the SendSequence Run loop parked on the in-flight handshake's mutex while
+// that same handshake's ClientHello waited to be packed onto the very same
+// (unbuffered) send sequence.
+//
+// Returns nil if no epoch has established yet; in practice verification is
+// only reached once `Cipher()` is non-nil, which implies an established
+// epoch is present.
+func (self *peerEncryptionSession) establishedPeerCertificates() []*x509.Certificate {
+	self.stateLock.Lock()
+	e := self.establishedEpoch
+	self.stateLock.Unlock()
+	return peerCertificatesOfEpoch(e)
 }
 
 // CertVerificationState returns the cached certificate verification
@@ -1758,6 +1903,7 @@ func (self *peerEncryptionSession) Release() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		self.refs--
+		self.lastActivityTime = time.Now()
 		if 0 < self.refs {
 			return false
 		}
@@ -1765,9 +1911,23 @@ func (self *peerEncryptionSession) Release() {
 		// down cancels the epoch ctx and aborts the handshake. Leaving it
 		// REGISTERED is the important part — the next send reuses it instead
 		// of creating a fresh session, which the peer would see as a brand
-		// new ClientHello and reset to, churning the handshake forever. It is
-		// reclaimed when the handshake resolves (see `reapIfUnreferenced`).
+		// new ClientHello and reset to, churning the handshake forever.
 		if self.handshakeInFlightLocked() {
+			return false
+		}
+		// Established/idle with no refs. IdleTimeout semantics:
+		//   < 0  keep the session in memory forever (never idle-reap),
+		//   > 0  keep it registered; the Run loop's CancelIfIdle reaps it once
+		//        it has been idle (unreferenced) for IdleTimeout,
+		//   == 0 reap immediately here at refs==0.
+		// Keeping it registered (the non-zero cases) lets the next burst reuse
+		// the live cipher rather than churning a fresh handshake, and avoids the
+		// two peers reaping independently and desyncing.
+		idleTimeout := time.Duration(0)
+		if self.settings != nil {
+			idleTimeout = self.settings.IdleTimeout
+		}
+		if idleTimeout != 0 {
 			return false
 		}
 		key := sessionKey{self.peerId, self.role}
@@ -1790,21 +1950,43 @@ func (self *peerEncryptionSession) handshakeInFlightLocked() bool {
 	return e != nil && e != self.establishedEpoch && e.handshakeErr == nil && !e.identityFailed
 }
 
-// reapIfUnreferenced tears the session down if it has no references and no
-// in-flight handshake. Called when a handshake resolves, to reclaim a session
-// that `Release` kept alive only for an in-flight handshake.
-func (self *peerEncryptionSession) reapIfUnreferenced() {
+// CancelIfIdle reaps the session if it has no references, no in-flight
+// handshake, and has been idle (unreferenced) for at least
+// EncryptionSettings.IdleTimeout. Called periodically from Run, mirroring the
+// resident idle poll in server/connect/resident.go. Returns true if the
+// session was reaped or was already cancelled.
+//
+// The map delete happens under the manager lock, atomically with the refs/idle
+// check, so a concurrent acquireSession can never adopt a session that is being
+// torn down (the revival race that produced "no encryption session for peer").
+func (self *peerEncryptionSession) CancelIfIdle() bool {
 	if self == nil || self.manager == nil {
-		return
+		return true
 	}
-	self.manager.stateLock.Lock()
+	select {
+	case <-self.ctx.Done():
+		return true
+	default:
+	}
+	idleTimeout := time.Duration(0)
+	if self.settings != nil {
+		idleTimeout = self.settings.IdleTimeout
+	}
+
 	free := func() bool {
+		self.manager.stateLock.Lock()
+		self.manager.stateLock.Unlock()
+
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
+
 		if 0 < self.refs {
 			return false
 		}
 		if self.handshakeInFlightLocked() {
+			return false
+		}
+		if 0 < idleTimeout && time.Now().Sub(self.lastActivityTime) < idleTimeout {
 			return false
 		}
 		key := sessionKey{self.peerId, self.role}
@@ -1813,20 +1995,23 @@ func (self *peerEncryptionSession) reapIfUnreferenced() {
 		}
 		return true
 	}()
-	self.manager.stateLock.Unlock()
 	if free {
 		self.close()
 	}
+	return free
 }
 
-// retain bumps the reference count. Always called by the manager under its
-// stateLock (in `acquireSession`), so the get-or-create and the retain are
-// atomic — that closes the revival race where a session could be torn down
-// between being handed out and retained.
+// retain bumps the reference count and marks activity. Always called by the
+// manager under its stateLock (in `acquireSession`), so the get-or-create and
+// the retain are atomic — that closes the revival race where a session could
+// be torn down between being handed out and retained. Marking activity here
+// (together with Release) is what makes the next burst's acquire reset the
+// idle clock, so a reused session is never reaped out from under it.
 func (self *peerEncryptionSession) retain() {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	self.refs++
+	self.lastActivityTime = time.Now()
 }
 
 // close cancels the session context and tears down TLS state. Idempotent.
@@ -2130,7 +2315,7 @@ func (self *EncryptionSessionManager) ReceiveNoSession(sourceId Id) bool {
 // The get-or-create and the retain run under the manager lock so a
 // concurrent `Release` can't tear the session down between the two — the
 // revival race that produced "no encryption session for peer".
-func (self *EncryptionSessionManager) acquireSession(peerId Id, role sequenceTlsRole) *peerEncryptionSession {
+func (self *EncryptionSessionManager) acquireSession(peerId Id, role sequenceTlsRole, sendSeqCompanion bool) *peerEncryptionSession {
 	if !self.settings.Encrypt {
 		return nil
 	}
@@ -2139,7 +2324,7 @@ func (self *EncryptionSessionManager) acquireSession(peerId Id, role sequenceTls
 	}
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	session := self.getOrCreateWithLock(peerId, role)
+	session := self.getOrCreateWithLock(peerId, role, sendSeqCompanion)
 	session.retain()
 	return session
 }
@@ -2151,7 +2336,10 @@ func (self *EncryptionSessionManager) acquireSession(peerId Id, role sequenceTls
 // callers call `session.Release()`. Returns nil when encryption is disabled
 // or `peerId` is the zero Id (e.g., control destinations).
 func (self *EncryptionSessionManager) Acquire(peerId Id, role sequenceTlsRole) *peerEncryptionSession {
-	return self.acquireSession(peerId, role)
+	// Receive-side sessions are not created by a send sequence, so they carry
+	// no send-sequence companion flag (a server-role session derives its
+	// companion from EncryptionControlUseCompanion at creation).
+	return self.acquireSession(peerId, role, false)
 }
 
 // AcquireForSend returns the (peerId, role) session for a SendSequence. A
@@ -2161,8 +2349,8 @@ func (self *EncryptionSessionManager) Acquire(peerId Id, role sequenceTlsRole) *
 // peer that lost its responder session rebuilds it on the next burst. A
 // server-role send sequence never restarts; it only carries EncryptedControl
 // and server-session replies and otherwise follows the peer's ClientHello.
-func (self *EncryptionSessionManager) AcquireForSend(peerId Id, role sequenceTlsRole) *peerEncryptionSession {
-	session := self.acquireSession(peerId, role)
+func (self *EncryptionSessionManager) AcquireForSend(peerId Id, role sequenceTlsRole, companion bool) *peerEncryptionSession {
+	session := self.acquireSession(peerId, role, companion)
 	if session == nil {
 		return nil
 	}
@@ -2174,20 +2362,20 @@ func (self *EncryptionSessionManager) AcquireForSend(peerId Id, role sequenceTls
 
 // getOrCreate returns the (peerId, role) session, creating and supervising
 // it if absent. Takes the manager's stateLock internally.
-func (self *EncryptionSessionManager) getOrCreate(peerId Id, role sequenceTlsRole) *peerEncryptionSession {
+func (self *EncryptionSessionManager) getOrCreate(peerId Id, role sequenceTlsRole, sendSeqCompanion bool) *peerEncryptionSession {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	return self.getOrCreateWithLock(peerId, role)
+	return self.getOrCreateWithLock(peerId, role, sendSeqCompanion)
 }
 
 // getOrCreateWithLock returns the (peerId, role) session, creating and
 // supervising it if absent. Caller holds stateLock.
-func (self *EncryptionSessionManager) getOrCreateWithLock(peerId Id, role sequenceTlsRole) *peerEncryptionSession {
+func (self *EncryptionSessionManager) getOrCreateWithLock(peerId Id, role sequenceTlsRole, sendSeqCompanion bool) *peerEncryptionSession {
 	key := sessionKey{peerId, role}
 	if s, ok := self.sessions[key]; ok {
 		return s
 	}
-	s := newPeerEncryptionSession(self.ctx, self, self.client, peerId, role, self.settings)
+	s := newPeerEncryptionSession(self.ctx, self, self.client, peerId, role, self.settings, sendSeqCompanion)
 	self.sessions[key] = s
 	glog.V(1).Infof("[tls]%s opened session for peer %s as %s\n", self.client.ClientTag(), peerId, role)
 	go func() {
@@ -2244,7 +2432,10 @@ func (self *EncryptionSessionManager) DeliverEncryptedControl(peerId Id, role se
 	if (peerId == Id{}) {
 		return
 	}
-	session := self.getOrCreate(peerId, role)
+	// Inbound handshake delivery is not driven by a send sequence; a
+	// server-role session derives its companion from
+	// EncryptionControlUseCompanion at creation, so pass false here.
+	session := self.getOrCreate(peerId, role, false)
 	if session == nil {
 		return
 	}
