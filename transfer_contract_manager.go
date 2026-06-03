@@ -40,6 +40,15 @@ type ContractKey struct {
 	// handshake carrier. Zero value is client, so non-encrypted traffic and
 	// legacy/pushed contracts key the same as before.
 	EncryptionRole sequenceTlsRole
+	// EncryptionCompanion separates the contract queues of two same-role send
+	// sequences differing only by session identity companion — the two
+	// server-role reply carriers that echo a companion vs non-companion
+	// initiator both ride the same EncryptionControlUseCompanion contract, so
+	// `CompanionContract` alone doesn't separate them. Without this they share a
+	// queue and starve each other on exit-flush, as `EncryptionRole` guards for
+	// the client/server split. Zero value false, so non-encrypted and
+	// legacy/pushed contracts key as before.
+	EncryptionCompanion bool
 }
 
 func (self ContractKey) Legacy() ContractKey {
@@ -1053,6 +1062,7 @@ func (self *ContractManager) LocalStats() *ContractManagerStats {
 		ContractOpenCount:      self.localStats.ContractOpenCount,
 		ContractCloseCount:     self.localStats.ContractCloseCount,
 		ContractOpenByteCounts: maps.Clone(self.localStats.ContractOpenByteCounts),
+		ContractOpenKeys:       maps.Clone(self.localStats.ContractOpenKeys),
 		// ContractOpenDestinationIds: maps.Clone(self.localStats.ContractOpenDestinationIds),
 		ContractCloseByteCount:        self.localStats.ContractCloseByteCount,
 		ReceiveContractCloseByteCount: self.localStats.ReceiveContractCloseByteCount,

@@ -84,7 +84,7 @@ func (self *grantingClientOob) SendControl(frames []*protocol.Frame, callback fu
 }
 
 // dataGatewayTransport is a send gateway that matches every destination
-// EXCEPT ControlId. Control-plane frames (addressed to ControlId) are routed
+// except ControlId. Control-plane frames (addressed to ControlId) are routed
 // to controlBlackholeTransport instead, so they are never forwarded
 // peer-to-peer by a catch-all gateway (which, with no platform to terminate
 // them, would loop forever).
@@ -111,7 +111,7 @@ func (self *dataGatewayTransport) MatchesSend(destination TransferPath) bool {
 func (self *dataGatewayTransport) MatchesReceive(destination TransferPath) bool { return false }
 func (self *dataGatewayTransport) Downgrade(source TransferPath)                {}
 
-// controlBlackholeTransport sinks SEND traffic addressed to ControlId. The
+// controlBlackholeTransport sinks send traffic addressed to ControlId. The
 // two-client test harness has no platform to terminate control-plane frames
 // (e.g. the EncryptedKey publish, which correctly retries via ControlSync), so
 // without a sink those frames would be forwarded peer-to-peer forever by the
@@ -280,14 +280,14 @@ func TestSendReceiveEncryptedWithContracts(t *testing.T) {
 		client.Send(frame, DestinationId(dst), func(error) {})
 	}
 
-	// Drive BOTH directions in parallel: A and B each initiate to the other at
+	// Drive both directions in parallel: A and B each initiate to the other at
 	// the same time, so each client holds four sequences for the peer —
 	// send/receive on its client role (its own outbound handshake) and
 	// send/receive on its server role (the peer's). Each send reuses its
 	// per-role send sequence, so the handshake runs once and completes (rather
 	// than restarting per burst) while keeping the per-peer sessions referenced
 	// through it. Encryption is confirmed by (a) the per-peer client cipher
-	// coming up in BOTH directions and (b) messages continuing to round-trip
+	// coming up in both directions and (b) messages continuing to round-trip
 	// after that — encrypted messages whose receipt necessarily waited for the
 	// handshake.
 	stop := make(chan struct{})
@@ -325,7 +325,7 @@ func TestSendReceiveEncryptedWithContracts(t *testing.T) {
 	}()
 
 	cipherUp := func(client *Client, peer Id) bool {
-		sess := client.EncryptionSessionManager().Lookup(peer, sequenceTlsRoleClient)
+		sess := client.EncryptionSessionManager().Lookup(peer, sequenceTlsRoleClient, false)
 		return sess != nil && sess.Cipher() != nil
 	}
 
@@ -352,4 +352,216 @@ func TestSendReceiveEncryptedWithContracts(t *testing.T) {
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
+}
+
+// TestEncryptedCompanionSessionsCreateSeparateContracts verifies that the
+// per-peer encryption session key includes the companion bit: when A and B each
+// send to the other in both companion and non-companion mode, the four
+// application flows must run over four cleanly separated client sessions, and
+// each peer's two server-role EncryptedControl reply carriers (one echoing the
+// companion initiator, one the non-companion initiator) must not collapse onto
+// a shared session/contract.
+//
+// Concretely there are eight send sequences:
+//
+//	A: client(companion=false)  client(companion=true)  server(companion=false)  server(companion=true)
+//	B: client(companion=false)  client(companion=true)  server(companion=false)  server(companion=true)
+//
+// where each client-role sequence carries A/B's own application data + its
+// ClientHello, and each server-role sequence is the reply carrier for the
+// peer's corresponding flow. Each send sequence owns a distinct ContractKey
+// (and therefore opens its own contract), so exactly four distinct contract
+// keys appear in each client's local stats — eight total.
+//
+// Before companion was added to the session/sequence/contract keys, the two
+// server-role reply carriers shared a key (same role, same
+// EncryptionControlUseCompanion contract) and collapsed to three keys per
+// client — this test pins that they stay separated.
+func TestEncryptedCompanionSessionsCreateSeparateContracts(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	aClientId := NewId()
+	bClientId := NewId()
+
+	aSend := make(chan []byte)
+	bSend := make(chan []byte)
+
+	aConditioner, bReceive := newConditioner(ctx, aSend)
+	bConditioner, aReceive := newConditioner(ctx, bSend)
+	aConditioner.update(func() { aConditioner.randomDelay = 20 * time.Millisecond })
+	bConditioner.update(func() { bConditioner.randomDelay = 20 * time.Millisecond })
+
+	aSendTransport := newDataGatewayTransport()
+	aReceiveTransport := NewReceiveGatewayTransport()
+	bSendTransport := newDataGatewayTransport()
+	bReceiveTransport := NewReceiveGatewayTransport()
+
+	provideModes := map[protocol.ProvideMode]bool{protocol.ProvideMode_Network: true}
+
+	makeSettings := func() *ClientSettings {
+		s := DefaultClientSettings()
+		s.SendBufferSettings.SequenceBufferSize = 0
+		s.SendBufferSettings.AckBufferSize = 0
+		s.SendBufferSettings.AckTimeout = 60 * time.Second
+		// Long send idle so all eight sequences stay alive (and keep their
+		// contracts open) through the assertion — this test is about how many
+		// distinct sequences/contracts exist, not contract-flush churn.
+		s.SendBufferSettings.IdleTimeout = 60 * time.Second
+		s.SendBufferSettings.MinResendInterval = 10 * time.Millisecond
+		s.ReceiveBufferSettings.SequenceBufferSize = 0
+		s.ReceiveBufferSettings.GapTimeout = 60 * time.Second
+		s.ReceiveBufferSettings.IdleTimeout = 60 * time.Second
+		s.ForwardBufferSettings.SequenceBufferSize = 0
+		s.ForwardBufferSettings.IdleTimeout = 1 * time.Second
+		s.ContractManagerSettings.LegacyCreateContract = false
+		s.EncryptionSettings.Encrypt = true
+		s.EncryptionSettings.TlsTimeout = 30 * time.Second
+		// Server reply carriers ride regular (non-companion) contracts. This is
+		// the case that exercises the ContractKey companion split: both server
+		// carriers then share Destination/role/CompanionContract and differ only
+		// by the session identity companion.
+		s.EncryptionSettings.EncryptionControlUseCompanion = false
+		return s
+	}
+
+	var a, b *Client
+	aOob := &grantingClientOob{
+		sourceId: aClientId,
+		settings: DefaultContractManagerSettings(),
+		destSecretKey: func(destinationId Id) ([]byte, bool) {
+			return b.ContractManager().GetProvideSecretKey(protocol.ProvideMode_Network)
+		},
+		destClientPublicKey: func(destinationId Id) []byte {
+			return b.ClientKeyManager().PublicKey()
+		},
+	}
+	bOob := &grantingClientOob{
+		sourceId: bClientId,
+		settings: DefaultContractManagerSettings(),
+		destSecretKey: func(destinationId Id) ([]byte, bool) {
+			return a.ContractManager().GetProvideSecretKey(protocol.ProvideMode_Network)
+		},
+		destClientPublicKey: func(destinationId Id) []byte {
+			return a.ClientKeyManager().PublicKey()
+		},
+	}
+
+	a = NewClient(ctx, aClientId, aOob, makeSettings())
+	defer a.Cancel()
+	a.RouteManager().UpdateTransport(aSendTransport, []Route{aSend})
+	a.RouteManager().UpdateTransport(aReceiveTransport, []Route{aReceive})
+	blackholeControlId(ctx, a.RouteManager())
+	a.ContractManager().SetProvideModes(provideModes)
+
+	b = NewClient(ctx, bClientId, bOob, makeSettings())
+	defer b.Cancel()
+	b.RouteManager().UpdateTransport(bSendTransport, []Route{bSend})
+	b.RouteManager().UpdateTransport(bReceiveTransport, []Route{bReceive})
+	blackholeControlId(ctx, b.RouteManager())
+	b.ContractManager().SetProvideModes(provideModes)
+
+	// send drives one application message; companion=true rides a companion
+	// contract (and so a companion-keyed per-peer session).
+	send := func(client *Client, dst Id, label string, companion bool) {
+		m := &protocol.SimpleMessage{Content: label}
+		frame, err := ToFrame(m, DefaultProtocolVersion)
+		if err != nil {
+			panic(err)
+		}
+		if companion {
+			client.SendWithTimeout(frame, DestinationId(dst), func(error) {}, 1*time.Second, CompanionContract())
+		} else {
+			client.SendWithTimeout(frame, DestinationId(dst), func(error) {}, 1*time.Second)
+		}
+	}
+
+	// Drive all four flows continuously so every handshake starts (and its
+	// peer's server reply carrier opens a contract), and so all eight sequences
+	// stay referenced.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for i := 0; ; i += 1 {
+			select {
+			case <-stop:
+				return
+			case <-ctx.Done():
+				return
+			default:
+			}
+			send(a, bClientId, fmt.Sprintf("a%d", i), false)
+			send(a, bClientId, fmt.Sprintf("ac%d", i), true)
+			send(b, aClientId, fmt.Sprintf("b%d", i), false)
+			send(b, aClientId, fmt.Sprintf("bc%d", i), true)
+			select {
+			case <-stop:
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+	}()
+
+	// distinctContractKeys returns the set of distinct ContractKeys for which
+	// this client currently holds an open send contract — one per live send
+	// sequence. Control-plane traffic (the EncryptedKey publish to ControlId)
+	// is NoContract, so it never appears here.
+	distinctContractKeys := func(client *Client) map[ContractKey]bool {
+		keys := map[ContractKey]bool{}
+		for _, key := range client.ContractManager().LocalStats().ContractOpenKeys {
+			keys[key] = true
+		}
+		return keys
+	}
+
+	// Wait until each client has opened its four distinct send-sequence
+	// contracts. If the companion sessions collapsed, a client would stall at
+	// three (its two server reply carriers sharing one key) and this times out.
+	deadline := time.After(45 * time.Second)
+	for {
+		aKeys := distinctContractKeys(a)
+		bKeys := distinctContractKeys(b)
+		if 4 <= len(aKeys) && 4 <= len(bKeys) {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf(
+				"expected 4 distinct send-sequence contracts per client (8 total); got a=%d b=%d — the companion and non-companion server reply carriers collapsed onto a shared contract",
+				len(aKeys), len(bKeys),
+			)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+
+	// Confirm exactly four per client (eight total) with the expected
+	// (role, companion) breakdown: for each role, one companion and one
+	// non-companion sequence.
+	type roleCompanion struct {
+		role      sequenceTlsRole
+		companion bool
+	}
+	assertBreakdown := func(client *Client, peer Id, tag string) {
+		keys := distinctContractKeys(client)
+		if len(keys) != 4 {
+			t.Fatalf("%s: expected exactly 4 distinct contract keys, got %d: %+v", tag, len(keys), keys)
+		}
+		combos := map[roleCompanion]int{}
+		for key := range keys {
+			if key.Destination.DestinationId != peer {
+				t.Fatalf("%s: unexpected contract destination %s (want peer %s)", tag, key.Destination.DestinationId, peer)
+			}
+			combos[roleCompanion{role: key.EncryptionRole, companion: key.EncryptionCompanion}] += 1
+		}
+		for _, role := range []sequenceTlsRole{sequenceTlsRoleClient, sequenceTlsRoleServer} {
+			for _, companion := range []bool{false, true} {
+				rc := roleCompanion{role: role, companion: companion}
+				if combos[rc] != 1 {
+					t.Fatalf("%s: expected exactly one contract for %v companion=%t, got %d (combos=%v)", tag, role, companion, combos[rc], combos)
+				}
+			}
+		}
+	}
+	assertBreakdown(a, bClientId, "a")
+	assertBreakdown(b, aClientId, "b")
 }

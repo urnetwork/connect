@@ -27,7 +27,7 @@ const (
 // independent sessions: one where the local client is the TLS client
 // (carrying the local client's outbound application data) and one where
 // it is the TLS server (responding to the peer's initiation). The
-// receiver of a session-tagged message routes to the COMPLEMENT local
+// receiver of a session-tagged message routes to the complement local
 // session: a `SequenceRoleClient` message is consumed by the receiver's
 // server-role session, and vice versa.
 type SequenceRole int32
@@ -397,9 +397,18 @@ type TransferFrame struct {
 	// (`SequenceRoleUnknown`) the receiver trial-decrypts against every
 	// per-peer session it holds — senders may leave it unset for
 	// additional on-wire anonymity. Ignored for plaintext frames.
-	SessionRole   *SequenceRole `protobuf:"varint,7,opt,name=session_role,json=sessionRole,proto3,enum=bringyour.SequenceRole,oneof" json:"session_role,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	SessionRole *SequenceRole `protobuf:"varint,7,opt,name=session_role,json=sessionRole,proto3,enum=bringyour.SequenceRole,oneof" json:"session_role,omitempty"`
+	// Performance hint paired with `session_role`: the companion bit of the
+	// producing session. Stamped on EncryptedControl carrier packs and on
+	// wrapped frames. When unset, the receiver trial-decrypts / trial-routes
+	// across both companion values for the (complement) role — exactly as an
+	// unset `session_role` trials both roles. Unlike `session_role`, companion
+	// is not complemented by the receiver: both peers of a session share the
+	// same companion identity. `optional` so "unset" (trial) stays
+	// distinguishable from an explicit `false`.
+	SessionCompanion *bool `protobuf:"varint,8,opt,name=session_companion,json=sessionCompanion,proto3,oneof" json:"session_companion,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *TransferFrame) Reset() {
@@ -481,6 +490,13 @@ func (x *TransferFrame) GetSessionRole() SequenceRole {
 		return *x.SessionRole
 	}
 	return SequenceRole_SequenceRoleUnknown
+}
+
+func (x *TransferFrame) GetSessionCompanion() bool {
+	if x != nil && x.SessionCompanion != nil {
+		return *x.SessionCompanion
+	}
+	return false
 }
 
 // this is the minimal subset of `TransferFrame` used when making a routing decision
@@ -1446,7 +1462,7 @@ type Contract struct {
 	// destination's long-lived client identity private key (see
 	// `EncryptedKey.client_key_signed_tls_certificate`). The sender
 	// verifies this signature against the destination's public client
-	// key (fetched out-of-band, NOT trusted from this field of the
+	// key (fetched out-of-band, not trusted from this field of the
 	// contract) before treating the cert chain as a valid commitment.
 	// Authoritative copy lives in `StoredContract`; this is a
 	// convenience copy.
@@ -1552,7 +1568,7 @@ type StoredContract struct {
 	// Destination's 32-byte Ed25519 public identity key (see `ClientKey`).
 	// Sealed into the platform-signed contract bytes so the sender can
 	// bind the cert commitment in this contract to a stable long-lived
-	// identity. Sender SHOULD additionally cross-check this key against
+	// identity. Sender should additionally cross-check this key against
 	// the out-of-band public-key lookup before extending trust.
 	DestinationClientPublicKey []byte `protobuf:"bytes,8,opt,name=destination_client_public_key,json=destinationClientPublicKey,proto3" json:"destination_client_public_key,omitempty"`
 	// Destination's Ed25519 signature over the canonical concatenation
@@ -1950,7 +1966,7 @@ func (*ProvidePing) Descriptor() ([]byte, []int) {
 // Each client has exactly one such certificate, generated and held by the
 // local `EncryptionSessionManager` and shared across every per-peer
 // encryption session this client owns. The platform stores it per
-// `client_id` (NOT per provide mode) and attaches it to every contract
+// `client_id` (not per provide mode) and attaches it to every contract
 // whose destination is this client so the sender can verify the cert
 // observed during the per-peer TLS handshake.
 type EncryptedKey struct {
@@ -2084,11 +2100,24 @@ type EncryptedControl struct {
 	// The role of the sending per-peer session: `SequenceRoleClient` for
 	// handshake/identity bytes from the sender's TLS-client session,
 	// `SequenceRoleServer` for its TLS-server session. The receiver feeds
-	// the payload into its COMPLEMENT session (client->server,
+	// the payload into its complement session (client->server,
 	// server->client), creating that session if it does not exist yet.
 	// Always set on send; `SequenceRoleUnknown` is treated as a protocol
 	// error and dropped.
-	SessionRole   SequenceRole `protobuf:"varint,3,opt,name=session_role,json=sessionRole,proto3,enum=bringyour.SequenceRole" json:"session_role,omitempty"`
+	SessionRole SequenceRole `protobuf:"varint,3,opt,name=session_role,json=sessionRole,proto3,enum=bringyour.SequenceRole" json:"session_role,omitempty"`
+	// The companion bit of the per-peer session that produced this control:
+	// the TLS-client initiator's contract-companion mode, echoed unchanged by
+	// the TLS-server responder. Together with `session_role` it pins the exact
+	// local session the receiver routes this control into —
+	// `(peerId, companion, complement(session_role))` — so a peer that runs
+	// both a companion and a non-companion session of the same role keeps
+	// their handshakes cleanly separated. A responder stores this value at
+	// session creation (from the initiator's ClientHello) and stamps it on
+	// every reply, so the initiator's reply state matches the originating
+	// session. Distinct from which contract the carrier itself rides (a
+	// responder replies under `EncryptionControlUseCompanion`, independent of
+	// this bit).
+	Companion     bool `protobuf:"varint,4,opt,name=companion,proto3" json:"companion,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2144,6 +2173,13 @@ func (x *EncryptedControl) GetSessionRole() SequenceRole {
 	return SequenceRole_SequenceRoleUnknown
 }
 
+func (x *EncryptedControl) GetCompanion() bool {
+	if x != nil {
+		return x.Companion
+	}
+	return false
+}
+
 var File_transfer_proto protoreflect.FileDescriptor
 
 const file_transfer_proto_rawDesc = "" +
@@ -2157,7 +2193,7 @@ const file_transfer_proto_rawDesc = "" +
 	"_source_idB\x11\n" +
 	"\x0f_destination_idB\f\n" +
 	"\n" +
-	"_stream_id\"\xe9\x03\n" +
+	"_stream_id\"\xb1\x04\n" +
 	"\rTransferFrame\x12<\n" +
 	"\rtransfer_path\x18\x01 \x01(\v2\x17.bringyour.TransferPathR\ftransferPath\x12/\n" +
 	"\x05frame\x18\x02 \x01(\v2\x10.bringyour.FrameB\x02\x18\x01H\x00R\x05frame\x88\x01\x01\x12B\n" +
@@ -2165,13 +2201,15 @@ const file_transfer_proto_rawDesc = "" +
 	"\x04pack\x18\x04 \x01(\v2\x0f.bringyour.PackH\x02R\x04pack\x88\x01\x01\x12%\n" +
 	"\x03ack\x18\x05 \x01(\v2\x0e.bringyour.AckH\x03R\x03ack\x88\x01\x01\x12;\n" +
 	"\x16encryptedTransferFrame\x18\x06 \x01(\fH\x04R\x16encryptedTransferFrame\x88\x01\x01\x12?\n" +
-	"\fsession_role\x18\a \x01(\x0e2\x17.bringyour.SequenceRoleH\x05R\vsessionRole\x88\x01\x01B\b\n" +
+	"\fsession_role\x18\a \x01(\x0e2\x17.bringyour.SequenceRoleH\x05R\vsessionRole\x88\x01\x01\x120\n" +
+	"\x11session_companion\x18\b \x01(\bH\x06R\x10sessionCompanion\x88\x01\x01B\b\n" +
 	"\x06_frameB\x0f\n" +
 	"\r_message_typeB\a\n" +
 	"\x05_packB\x06\n" +
 	"\x04_ackB\x19\n" +
 	"\x17_encryptedTransferFrameB\x0f\n" +
-	"\r_session_role\"U\n" +
+	"\r_session_roleB\x14\n" +
+	"\x12_session_companion\"U\n" +
 	"\x15FilteredTransferFrame\x12<\n" +
 	"\rtransfer_path\x18\x01 \x01(\v2\x17.bringyour.TransferPathR\ftransferPath\"\xf7\x02\n" +
 	"\x04Pack\x12\x1d\n" +
@@ -2311,11 +2349,12 @@ const file_transfer_proto_rawDesc = "" +
 	"!client_key_signed_tls_certificate\x18\x02 \x01(\fR\x1dclientKeySignedTlsCertificate\"*\n" +
 	"\tClientKey\x12\x1d\n" +
 	"\n" +
-	"public_key\x18\x01 \x01(\fR\tpublicKey\"\xac\x01\n" +
+	"public_key\x18\x01 \x01(\fR\tpublicKey\"\xca\x01\n" +
 	"\x10EncryptedControl\x12B\n" +
 	"\fcontrol_type\x18\x01 \x01(\x0e2\x1f.bringyour.EncryptedControlTypeR\vcontrolType\x12\x18\n" +
 	"\apayload\x18\x02 \x01(\fR\apayload\x12:\n" +
-	"\fsession_role\x18\x03 \x01(\x0e2\x17.bringyour.SequenceRoleR\vsessionRole*W\n" +
+	"\fsession_role\x18\x03 \x01(\x0e2\x17.bringyour.SequenceRoleR\vsessionRole\x12\x1c\n" +
+	"\tcompanion\x18\x04 \x01(\bR\tcompanion*W\n" +
 	"\fSequenceRole\x12\x17\n" +
 	"\x13SequenceRoleUnknown\x10\x00\x12\x16\n" +
 	"\x12SequenceRoleClient\x10\x01\x12\x16\n" +

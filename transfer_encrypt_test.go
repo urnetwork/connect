@@ -134,7 +134,7 @@ func TestPeerSessionIdentityProofInvalid(t *testing.T) {
 
 	peerPub := peerPriv.Public().(ed25519.PublicKey)
 
-	// Sign with a DIFFERENT private key — the proof must fail
+	// Sign with a different private key — the proof must fail
 	// verification against `peerPub`.
 	_, wrongPriv, err := ed25519.GenerateKey(rand.Reader)
 	assert.Equal(t, nil, err)
@@ -240,7 +240,7 @@ func TestPeerSessionIdentityProofSecondIgnored(t *testing.T) {
 	assert.Equal(t, true, sess.epoch.peerIdentityVerified)
 	assert.Equal(t, false, sess.epoch.identityFailed)
 
-	// Also: a second SetPeerClientPublicKey with a DIFFERENT key
+	// Also: a second SetPeerClientPublicKey with a different key
 	// must be rejected (first-write-wins, no mid-session rotation).
 	_, otherPriv, err := ed25519.GenerateKey(rand.Reader)
 	assert.Equal(t, nil, err)
@@ -329,7 +329,7 @@ func TestOptimisticallyDeliverHandshakeFilter(t *testing.T) {
 
 	// We can't directly observe "did the optimistic apply call
 	// transport.Deliver?" without instrumenting the transport.
-	// What we CAN do is verify the predicate behavior end-to-end:
+	// What we can do is verify the predicate behavior end-to-end:
 	// the filter returns early on rejected prefixes, and the
 	// session state is unchanged.
 	for _, prefix := range prefixesRejected {
@@ -536,7 +536,7 @@ func TestDeliverClientHelloResetsCompletedServerHandshake(t *testing.T) {
 // TestReleasedSessionRemovedFromManager verifies a per-peer session's
 // lifecycle is bounded by its references: once the last send/receive sequence
 // releases it, it is closed and unregistered (the send/receive sequences idle
-// out on their own timers, so they ARE the session's lifecycle). A subsequent
+// out on their own timers, so they are the session's lifecycle). A subsequent
 // wrapped frame finds no session and is dropped — but that is transient, not a
 // wedge: a client-role send sequence restarts the handshake on its next burst,
 // so the peer's responder session is rebuilt. Removal is synchronous with the
@@ -559,26 +559,26 @@ func TestReleasedSessionRemovedFromManager(t *testing.T) {
 	manager := NewEncryptionSessionManager(ctx, client, keyManager, settings.EncryptionSettings)
 
 	peerId := NewId()
-	sess := manager.Acquire(peerId, sequenceTlsRoleServer)
+	sess := manager.Acquire(peerId, sequenceTlsRoleServer, false)
 	if sess == nil {
 		t.Fatal("expected Acquire to return a session")
 	}
-	if manager.Lookup(peerId, sequenceTlsRoleServer) != sess {
+	if manager.Lookup(peerId, sequenceTlsRoleServer, false) != sess {
 		t.Fatal("expected the session to be registered in the manager")
 	}
 
 	sess.Release() // refs -> 0; kept registered until idle for IdleTimeout
 
-	// Removal is NOT synchronous with Release: the session is kept registered
+	// Removal is not synchronous with Release: the session is kept registered
 	// so a transport reform / next burst reuses the live cipher instead of
 	// churning a fresh handshake. The idle time here (~0) is below IdleTimeout.
-	if manager.Lookup(peerId, sequenceTlsRoleServer) != sess {
+	if manager.Lookup(peerId, sequenceTlsRoleServer, false) != sess {
 		t.Fatal("expected the session to remain registered immediately after Release (idle keep-alive)")
 	}
 
 	// After IdleTimeout the Run loop's CancelIfIdle reaps it.
 	deadline := time.After(2 * time.Second)
-	for manager.Lookup(peerId, sequenceTlsRoleServer) != nil {
+	for manager.Lookup(peerId, sequenceTlsRoleServer, false) != nil {
 		select {
 		case <-deadline:
 			t.Fatal("expected the session to be removed from the manager after the idle timeout")
@@ -602,11 +602,11 @@ func injectEstablishedTestEpoch(sess *peerEncryptionSession) *tlsHandshakeEpoch 
 
 // TestAcquireForSendRestartPolicy verifies the per-role send-acquisition
 // rules. AcquireForSend returns the same session per (peer, role) and never
-// thrashes an in-flight handshake. Only the CLIENT role restarts an
-// ESTABLISHED session — the recovery mechanism: every new client send
+// thrashes an in-flight handshake. Only the client role restarts an
+// established session — the recovery mechanism: every new client send
 // re-initiates, so a peer that lost its responder session rebuilds it — and
 // the restart keeps the established epoch serving its cipher (gap-free rekey).
-// The SERVER role never restarts; it only carries EncryptedControl/replies and
+// The server role never restarts; it only carries EncryptedControl/replies and
 // follows the peer's ClientHello.
 func TestAcquireForSendRestartPolicy(t *testing.T) {
 	for _, role := range []sequenceTlsRole{sequenceTlsRoleClient, sequenceTlsRoleServer} {

@@ -48,6 +48,15 @@ message TransferFrame {
     // per-peer session it holds — senders may leave it unset for
     // additional on-wire anonymity. Ignored for plaintext frames.
     optional SequenceRole session_role = 7;
+    // Performance hint paired with `session_role`: the companion bit of the
+    // producing session. Stamped on EncryptedControl carrier packs and on
+    // wrapped frames. When unset, the receiver trial-decrypts / trial-routes
+    // across both companion values for the (complement) role — exactly as an
+    // unset `session_role` trials both roles. Unlike `session_role`, companion
+    // is not complemented by the receiver: both peers of a session share the
+    // same companion identity. `optional` so "unset" (trial) stays
+    // distinguishable from an explicit `false`.
+    optional bool session_companion = 8;
 }
 
 // SequenceRole identifies which side of a per-peer encryption session
@@ -56,7 +65,7 @@ message TransferFrame {
 // independent sessions: one where the local client is the TLS client
 // (carrying the local client's outbound application data) and one where
 // it is the TLS server (responding to the peer's initiation). The
-// receiver of a session-tagged message routes to the COMPLEMENT local
+// receiver of a session-tagged message routes to the complement local
 // session: a `SequenceRoleClient` message is consumed by the receiver's
 // server-role session, and vice versa.
 enum SequenceRole {
@@ -297,7 +306,7 @@ message Contract {
     // destination's long-lived client identity private key (see
     // `EncryptedKey.client_key_signed_tls_certificate`). The sender
     // verifies this signature against the destination's public client
-    // key (fetched out-of-band, NOT trusted from this field of the
+    // key (fetched out-of-band, not trusted from this field of the
     // contract) before treating the cert chain as a valid commitment.
     // Authoritative copy lives in `StoredContract`; this is a
     // convenience copy.
@@ -331,7 +340,7 @@ message StoredContract {
     // Destination's 32-byte Ed25519 public identity key (see `ClientKey`).
     // Sealed into the platform-signed contract bytes so the sender can
     // bind the cert commitment in this contract to a stable long-lived
-    // identity. Sender SHOULD additionally cross-check this key against
+    // identity. Sender should additionally cross-check this key against
     // the out-of-band public-key lookup before extending trust.
     bytes destination_client_public_key = 8;
     // Destination's Ed25519 signature over the canonical concatenation
@@ -408,7 +417,7 @@ enum EncryptedControlType {
 // Each client has exactly one such certificate, generated and held by the
 // local `EncryptionSessionManager` and shared across every per-peer
 // encryption session this client owns. The platform stores it per
-// `client_id` (NOT per provide mode) and attaches it to every contract
+// `client_id` (not per provide mode) and attaches it to every contract
 // whose destination is this client so the sender can verify the cert
 // observed during the per-peer TLS handshake.
 message EncryptedKey {
@@ -456,10 +465,23 @@ message EncryptedControl {
     // The role of the sending per-peer session: `SequenceRoleClient` for
     // handshake/identity bytes from the sender's TLS-client session,
     // `SequenceRoleServer` for its TLS-server session. The receiver feeds
-    // the payload into its COMPLEMENT session (client->server,
+    // the payload into its complement session (client->server,
     // server->client), creating that session if it does not exist yet.
     // Always set on send; `SequenceRoleUnknown` is treated as a protocol
     // error and dropped.
     SequenceRole session_role = 3;
+    // The companion bit of the per-peer session that produced this control:
+    // the TLS-client initiator's contract-companion mode, echoed unchanged by
+    // the TLS-server responder. Together with `session_role` it pins the exact
+    // local session the receiver routes this control into —
+    // `(peerId, companion, complement(session_role))` — so a peer that runs
+    // both a companion and a non-companion session of the same role keeps
+    // their handshakes cleanly separated. A responder stores this value at
+    // session creation (from the initiator's ClientHello) and stamps it on
+    // every reply, so the initiator's reply state matches the originating
+    // session. Distinct from which contract the carrier itself rides (a
+    // responder replies under `EncryptionControlUseCompanion`, independent of
+    // this bit).
+    bool companion = 4;
 }
 
