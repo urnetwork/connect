@@ -2,9 +2,13 @@ package connect
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"testing"
@@ -75,4 +79,36 @@ func TestDohCache(t *testing.T) {
 		assert.Equal(t, len(ips), 0)
 	}
 
+}
+
+func TestDohCacheCachesMiss(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requestCount, 1)
+		w.Header().Set("Content-Type", "application/dns-json")
+		err := json.NewEncoder(w).Encode(&DohResponse{
+			Status: 3,
+		})
+		assert.Equal(t, err, nil)
+	}))
+	defer server.Close()
+
+	settings := DefaultDohSettings()
+	settings.RequestTimeout = 1 * time.Second
+	settings.MissExpiration = 1 * time.Minute
+	settings.DnsResolverSettings.EnableRemoteDoh = true
+	settings.DnsResolverSettings.EnableRemoteDns = false
+	settings.DnsResolverSettings.EnableLocalDns = false
+	settings.DnsResolverSettings.RemoteDohUrlsIpv4 = []string{server.URL}
+
+	dohCache := NewDohCache(settings)
+
+	for range 3 {
+		ips := dohCache.Query(ctx, "A", "missing.example")
+		assert.Equal(t, len(ips), 0)
+	}
+	assert.Equal(t, int32(1), atomic.LoadInt32(&requestCount))
 }

@@ -89,6 +89,7 @@ func TestControlSync(t *testing.T) {
 
 				select {
 				case <-ctx.Done():
+					return
 				case <-time.After(time.Duration(mathrand.Int63n(int64(dropTimeout)))):
 				}
 
@@ -109,6 +110,12 @@ func TestControlSync(t *testing.T) {
 
 				select {
 				case <-ctx.Done():
+					clientA.RouteManager().UpdateTransport(clientASendTransport, nil)
+					clientA.RouteManager().UpdateTransport(clientAReceiveTransport, nil)
+
+					controlClientA.RouteManager().UpdateTransport(controlClientASendTransport, nil)
+					controlClientA.RouteManager().UpdateTransport(controlClientAReceiveTransport, nil)
+					return
 				case <-time.After(time.Duration(mathrand.Int63n(int64(allowTimeout)))):
 				}
 

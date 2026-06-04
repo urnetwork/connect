@@ -7,7 +7,7 @@ import (
 	"math"
 	// "time"
 	// "github.com/urnetwork/connect"
-	// "github.com/urnetwork/glog"
+	"github.com/urnetwork/glog"
 )
 
 // a message framer that optimizes memory copies to reduce cpu+memory usage
@@ -23,40 +23,46 @@ import (
 // the framer read/write op is called billions of times in a typical user hour
 
 type FramerSettings struct {
-	MaxMessageLen       int
-	MaxPacketMessageLen int
-	SplitMinimumLen     int
+	// MaxMessageLen is the maximum message (payload) length, in bytes, this
+	// framer will read or write. The on-wire frame is `MaxMessageLen + 4`:
+	// the framer prepends a 4-byte length header and accounts for it
+	// internally (see NewFramer). There is intentionally no global default
+	// max -- every framer must declare the largest message its context can
+	// carry (see DefaultFramerSettings), so a transport or relay hop cannot
+	// silently inherit a cap too small for, e.g., the per-peer encryption
+	// handshake (ClientSettings.MinimumMessageLenLimit).
+	MaxMessageLen int
+	// SplitMinimumLen is the minimum message length above which `Write`
+	// splits the body into two `io.Writer.Write` calls to save a memcpy.
+	// This is a stream-transport optimization.
+	SplitMinimumLen int
 }
 
-func DefaultFramerSettings() *FramerSettings {
+// DefaultFramerSettings returns framer settings for a context whose maximum
+// message (payload) length is maxMessageLen bytes. There is no default
+// maxMessageLen: each call site must pass the largest message its context
+// carries, making the cap explicit rather than an inherited global.
+func DefaultFramerSettings(maxMessageLen int) *FramerSettings {
 	return &FramerSettings{
-		MaxMessageLen:       2048 - 4,
-		MaxPacketMessageLen: 2048 - 4,
-		SplitMinimumLen:     256,
+		MaxMessageLen:   maxMessageLen,
+		SplitMinimumLen: 256,
 	}
 }
 
-// Read/ReadPacket and Write must be called from a single goroutine each
+// Read and Write must be called from a single goroutine each
 type Framer struct {
-	readBuffer  []byte
-	writeBuffer []byte
+	// maxFrameLen is the maximum on-wire frame length the framer reads or
+	// writes: the configured max message (payload) length plus the 4-byte
+	// length header it prepends.
+	maxFrameLen int
 	settings    *FramerSettings
 }
 
-func NewFramerWithDefaults() *Framer {
-	return NewFramer(DefaultFramerSettings())
-}
-
 func NewFramer(settings *FramerSettings) *Framer {
-	framer := &Framer{
-		readBuffer:  make([]byte, settings.MaxMessageLen),
-		writeBuffer: make([]byte, settings.MaxMessageLen),
+	return &Framer{
+		maxFrameLen: settings.MaxMessageLen + 4,
 		settings:    settings,
 	}
-	if len(framer.writeBuffer) < settings.SplitMinimumLen+4 {
-		panic(fmt.Errorf("SplitMinimumLen must be less than %d", len(framer.writeBuffer)-4))
-	}
-	return framer
 }
 
 func (self *Framer) Read(r io.Reader) ([]byte, error) {
@@ -67,8 +73,14 @@ func (self *Framer) Read(r io.Reader) ([]byte, error) {
 
 	messageLen := int(binary.BigEndian.Uint16(h[0:2]))
 
-	if self.settings.MaxMessageLen < messageLen {
-		// glog.Infof("READ MAX\n")
+	if self.maxFrameLen < messageLen+4 {
+		// Surface framer length rejection on the read path so an oversized frame
+		// (e.g. an encryption handshake flight too large for a hop's cap) shows
+		// up in logs rather than silently closing the transport.
+		glog.Infof(
+			"[framer][reject]read messageLen=%d > MaxMessageLen=%d (maxFrameLen=%d)\n",
+			messageLen, self.settings.MaxMessageLen, self.maxFrameLen,
+		)
 		return nil, fmt.Errorf("Max message len exceeded (%d<%d)", self.settings.MaxMessageLen, messageLen)
 	}
 
@@ -82,53 +94,24 @@ func (self *Framer) Read(r io.Reader) ([]byte, error) {
 	return message, nil
 }
 
-// use this version if the reader dequeues an entire packet per read
-func (self *Framer) ReadPacket(r io.Reader) ([]byte, error) {
-	h := MessagePoolGet(self.settings.MaxPacketMessageLen + 4)
-
-	n, err := r.Read(h)
-	if err != nil {
-		MessagePoolReturn(h)
-		return nil, err
-	}
-	if n < 4 {
-		MessagePoolReturn(h)
-		return nil, fmt.Errorf("Could not read header.")
-	}
-
-	messageLen := int(binary.BigEndian.Uint16(h[0:2]))
-
-	if self.settings.MaxMessageLen < messageLen {
-		// glog.Infof("READ MAX\n")
-		MessagePoolReturn(h)
-		return nil, fmt.Errorf("Max message len exceeded (%d<%d)", self.settings.MaxMessageLen, messageLen)
-	}
-
-	// packet readers deliver one framed message per Read; the packet must
-	// contain exactly the 4-byte header plus messageLen bytes of body.
-	// reject under- or over-sized packets rather than accepting garbage tails.
-	if n > 4+messageLen {
-		MessagePoolReturn(h)
-		return nil, fmt.Errorf("Packet body too long (%d>%d)", n-4, messageLen)
-	}
-
-	message := h[4 : messageLen+4]
-
-	if n-4 < messageLen {
-		if _, err := io.ReadFull(r, message[n-4:messageLen]); err != nil {
-			MessagePoolReturn(h)
-			return nil, err
-		}
-	}
-
-	return message, nil
-}
-
-// we assume a packet writer will fragment the message internally as needed
+// Write emits a length-prefixed framed message to a stream writer (TCP,
+// QUIC stream, WebSocket frame body, etc.). For messages at or above
+// `SplitMinimumLen`, the body is written as two `io.Writer.Write` calls —
+// header + first half, then second half — saving one memcpy of the second
+// half. This is unsafe on packet transports because each Write becomes one
+// packet on the wire and there is no in-band way to detect a dropped or
+// reordered second packet; message-preserving transports should bypass
+// the framer and write/read directly.
 func (self *Framer) Write(w io.Writer, message []byte) error {
 	messageLen := len(message)
-	if self.settings.MaxMessageLen < messageLen {
-		// glog.Infof("WRITE MAX\n")
+	if self.maxFrameLen < messageLen+4 {
+		// Surface framer length rejection on the write path so a component
+		// trying to send a frame larger than its framer cap (the classic
+		// encryption-handshake deadlock trigger) shows up in logs.
+		glog.Infof(
+			"[framer][reject]write messageLen=%d > MaxMessageLen=%d (maxFrameLen=%d)\n",
+			messageLen, self.settings.MaxMessageLen, self.maxFrameLen,
+		)
 		return fmt.Errorf("Max message len exceeded (%d<%d)", self.settings.MaxMessageLen, messageLen)
 	}
 	if math.MaxUint16 < messageLen {
@@ -143,26 +126,19 @@ func (self *Framer) Write(w io.Writer, message []byte) error {
 		if _, err := w.Write(messageWithHeader[0 : messageLen+4]); err != nil {
 			return err
 		}
-	} else {
-		// use half size packets and avoid large memory copy by writing the message in two parts
-
-		splitIndex := messageLen / 2
-
-		h := MessagePoolGet(splitIndex + 4)
-		defer MessagePoolReturn(h)
-
-		binary.BigEndian.PutUint16(h[0:2], uint16(messageLen))
-		binary.BigEndian.PutUint16(h[2:4], uint16(splitIndex))
-		copy(h[4:4+splitIndex], message[0:splitIndex])
-
-		if _, err := w.Write(h[0 : 4+splitIndex]); err != nil {
-			return err
-		}
-
-		if _, err := w.Write(message[splitIndex:messageLen]); err != nil {
-			return err
-		}
+		return nil
 	}
-
+	splitIndex := messageLen / 2
+	h := MessagePoolGet(splitIndex + 4)
+	defer MessagePoolReturn(h)
+	binary.BigEndian.PutUint16(h[0:2], uint16(messageLen))
+	binary.BigEndian.PutUint16(h[2:4], uint16(splitIndex))
+	copy(h[4:4+splitIndex], message[0:splitIndex])
+	if _, err := w.Write(h[0 : 4+splitIndex]); err != nil {
+		return err
+	}
+	if _, err := w.Write(message[splitIndex:messageLen]); err != nil {
+		return err
+	}
 	return nil
 }

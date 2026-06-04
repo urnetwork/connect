@@ -2,6 +2,7 @@ package connect
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 	// "crypto/tls"
@@ -30,6 +31,7 @@ func DefaultDohSettings() *DohSettings {
 		IpVersion:           4,
 		MissExpiration:      300 * time.Second,
 		LocalExpiration:     300 * time.Second,
+		CacheMaxEntries:     4096,
 		DnsResolverSettings: DefaultDnsResolverSettings(),
 	}
 }
@@ -60,6 +62,7 @@ type DohSettings struct {
 	IpVersion           int
 	MissExpiration      time.Duration
 	LocalExpiration     time.Duration
+	CacheMaxEntries     int
 	DnsResolverSettings *DnsResolverSettings
 }
 
@@ -118,6 +121,51 @@ type DohCache struct {
 	queryResultExpiration map[DohKey]*DohResult
 }
 
+func dnsResolverAddrs(settings *DohSettings, remote bool, network string) []string {
+	var ipv4 []string
+	var ipv6 []string
+	if remote {
+		ipv4 = settings.DnsResolverSettings.RemoteDnsIpv4
+		ipv6 = settings.DnsResolverSettings.RemoteDnsIpv6
+	} else {
+		ipv4 = settings.DnsResolverSettings.LocalDnsIpv4
+		ipv6 = settings.DnsResolverSettings.LocalDnsIpv6
+	}
+
+	switch {
+	case strings.HasSuffix(network, "6") || settings.IpVersion == 6:
+		if 0 < len(ipv6) {
+			return ipv6
+		}
+		return ipv4
+	case strings.HasSuffix(network, "4") || settings.IpVersion == 4:
+		if 0 < len(ipv4) {
+			return ipv4
+		}
+		return ipv6
+	default:
+		addrs := append([]string{}, ipv4...)
+		return append(addrs, ipv6...)
+	}
+}
+
+func netIPAddr(ip net.IP) (netip.Addr, bool) {
+	if ip4 := ip.To4(); ip4 != nil {
+		addr, ok := netip.AddrFromSlice(ip4)
+		return addr, ok
+	}
+	if ip16 := ip.To16(); ip16 != nil {
+		addr, ok := netip.AddrFromSlice(ip16)
+		return addr, ok
+	}
+	return netip.Addr{}, false
+}
+
+func authoritativeDnsMiss(err error) bool {
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr) && dnsErr.IsNotFound
+}
+
 func NewDohCache(settings *DohSettings) *DohCache {
 	remoteResolver := &net.Resolver{
 		PreferGo: true,
@@ -126,13 +174,9 @@ func NewDohCache(settings *DohSettings) *DohCache {
 			if err != nil {
 				return nil, err
 			}
-			var localAddrs []string
-			switch network {
-			case "ip6":
-				localAddrs = settings.DnsResolverSettings.RemoteDnsIpv6
-			default:
-				// the dialer can't race so use ipv4
-				localAddrs = settings.DnsResolverSettings.RemoteDnsIpv4
+			localAddrs := dnsResolverAddrs(settings, true, network)
+			if len(localAddrs) == 0 {
+				return nil, fmt.Errorf("no remote DNS resolvers configured")
 			}
 			localAddr := localAddrs[mathrand.Intn(len(localAddrs))]
 			addr = net.JoinHostPort(localAddr, port)
@@ -148,13 +192,9 @@ func NewDohCache(settings *DohSettings) *DohCache {
 			if err != nil {
 				return nil, err
 			}
-			var localAddrs []string
-			switch network {
-			case "ip6":
-				localAddrs = settings.DnsResolverSettings.LocalDnsIpv6
-			default:
-				// the dialer can't race so use ipv4
-				localAddrs = settings.DnsResolverSettings.LocalDnsIpv4
+			localAddrs := dnsResolverAddrs(settings, false, network)
+			if len(localAddrs) == 0 {
+				return nil, fmt.Errorf("no local DNS resolvers configured")
 			}
 			localAddr := localAddrs[mathrand.Intn(len(localAddrs))]
 			addr = net.JoinHostPort(localAddr, port)
@@ -171,6 +211,32 @@ func NewDohCache(settings *DohSettings) *DohCache {
 	}
 }
 
+func (self *DohCache) pruneCacheLocked(now time.Time, reserve int) {
+	for key, result := range self.queryResultExpiration {
+		if !result.Valid(now, self.settings.MissExpiration) {
+			delete(self.queryResultExpiration, key)
+		}
+	}
+
+	maxEntries := self.settings.CacheMaxEntries
+	for maxEntries < len(self.queryResultExpiration)+reserve {
+		var oldestKey DohKey
+		var oldestTime time.Time
+		found := false
+		for key, result := range self.queryResultExpiration {
+			if !found || result.Time.Before(oldestTime) {
+				oldestKey = key
+				oldestTime = result.Time
+				found = true
+			}
+		}
+		if !found {
+			return
+		}
+		delete(self.queryResultExpiration, oldestKey)
+	}
+}
+
 func (self *DohCache) Query(ctx context.Context, recordType string, domain string) []netip.Addr {
 	q := NewDohKey(recordType, domain)
 
@@ -182,37 +248,26 @@ func (self *DohCache) Query(ctx context.Context, recordType string, domain strin
 		defer self.stateLock.Unlock()
 
 		r = self.queryResultExpiration[q]
+		if r != nil && !r.Valid(now, self.settings.MissExpiration) {
+			delete(self.queryResultExpiration, q)
+			r = nil
+		}
 	}()
 	if r != nil {
-		ok := func() bool {
-			if len(r.AddrExpirations) == 0 {
-				if r.Time.Add(self.settings.MissExpiration).Before(now) {
-					return false
-				}
-			}
-			for _, expireTime := range r.AddrExpirations {
-				if expireTime.Before(now) {
-					return false
-				}
-			}
-			return true
-		}()
-		if ok {
-			ips := []netip.Addr{}
-			for ip, _ := range r.AddrExpirations {
-				ips = append(ips, ip)
-			}
-			return ips
-		}
+		return r.Addrs()
 	}
 
 	addrExpirations := map[netip.Addr]time.Time{}
+	cacheMiss := false
 
-	if self.settings.DnsResolverSettings.EnableLocalDns {
-		addrTtls := DohQueryWithClient(ctx, self.httpClient, self.settings.IpVersion, q.RecordType, self.settings, q.Domain)
+	if self.settings.DnsResolverSettings.EnableRemoteDoh {
+		queryResult := dohQueryWithClientResult(ctx, self.httpClient, self.settings.IpVersion, q.RecordType, self.settings, q.Domain)
 
-		for addr, ttlSeconds := range addrTtls {
+		for addr, ttlSeconds := range queryResult.AddrTtls {
 			addrExpirations[addr] = now.Add(time.Duration(ttlSeconds) * time.Second)
+		}
+		if len(addrExpirations) == 0 && queryResult.Miss {
+			cacheMiss = true
 		}
 	}
 
@@ -220,13 +275,20 @@ func (self *DohCache) Query(ctx context.Context, recordType string, domain strin
 		// try the remote resolver
 		resolvedIps, err := self.remoteResolver.LookupIP(ctx, self.settings.ResolverIp(), q.Domain)
 		if err == nil {
+			found := false
 			for _, ip := range resolvedIps {
-				addr, _ := netip.AddrFromSlice(ip.To4())
-
-				addrExpirations[addr] = now.Add(self.settings.LocalExpiration)
+				if addr, ok := netIPAddr(ip); ok {
+					addrExpirations[addr] = now.Add(self.settings.LocalExpiration)
+					found = true
+				}
 			}
+			if !found {
+				cacheMiss = true
+			}
+		} else if authoritativeDnsMiss(err) {
+			cacheMiss = true
 		} else {
-			fmt.Printf("[doh]local (%s) err = %s\n", q.Domain, err)
+			fmt.Printf("[doh]remote (%s) err = %s\n", q.Domain, err)
 		}
 	}
 
@@ -234,35 +296,42 @@ func (self *DohCache) Query(ctx context.Context, recordType string, domain strin
 		// try the local resolver
 		resolvedIps, err := self.localResolver.LookupIP(ctx, self.settings.ResolverIp(), q.Domain)
 		if err == nil {
+			found := false
 			for _, ip := range resolvedIps {
-				addr, _ := netip.AddrFromSlice(ip.To4())
-
-				addrExpirations[addr] = now.Add(self.settings.LocalExpiration)
+				if addr, ok := netIPAddr(ip); ok {
+					addrExpirations[addr] = now.Add(self.settings.LocalExpiration)
+					found = true
+				}
 			}
+			if !found {
+				cacheMiss = true
+			}
+		} else if authoritativeDnsMiss(err) {
+			cacheMiss = true
 		} else {
 			fmt.Printf("[doh]local (%s) err = %s\n", q.Domain, err)
 		}
 	}
 
-	// resolve misses are not stored
-	if 0 < len(addrExpirations) {
+	if ctx.Err() == nil && (0 < len(addrExpirations) || cacheMiss) {
 		r = &DohResult{
 			Time:            now,
 			AddrExpirations: addrExpirations,
+			Miss:            cacheMiss && len(addrExpirations) == 0,
 		}
 		func() {
 			self.stateLock.Lock()
 			defer self.stateLock.Unlock()
 
+			self.pruneCacheLocked(now, 1)
 			self.queryResultExpiration[q] = r
 		}()
 	}
 
-	ips := []netip.Addr{}
-	for ip, _ := range addrExpirations {
-		ips = append(ips, ip)
-	}
-	return ips
+	return (&DohResult{
+		Time:            now,
+		AddrExpirations: addrExpirations,
+	}).Addrs()
 }
 
 func DohQueryWithDefaults(ctx context.Context, recordType string, domains ...string) map[netip.Addr]int {
@@ -293,6 +362,28 @@ func DohQueryWithClient(
 	settings *DohSettings,
 	domains ...string,
 ) map[netip.Addr]int {
+	return dohQueryWithClientResult(ctx, httpClient, ipVersion, recordType, settings, domains...).AddrTtls
+}
+
+type dohQueryResult struct {
+	AddrTtls map[netip.Addr]int
+	Miss     bool
+}
+
+func newDohQueryResult() *dohQueryResult {
+	return &dohQueryResult{
+		AddrTtls: map[netip.Addr]int{},
+	}
+}
+
+func dohQueryWithClientResult(
+	ctx context.Context,
+	httpClient *http.Client,
+	ipVersion int,
+	recordType string,
+	settings *DohSettings,
+	domains ...string,
+) *dohQueryResult {
 	// run all the queries in parallel to all servers
 
 	queryCtx, queryCancel := context.WithCancel(ctx)
@@ -301,15 +392,15 @@ func DohQueryWithClient(
 	switch recordType {
 	case "A", "AAAA":
 	default:
-		return map[netip.Addr]int{}
+		return newDohQueryResult()
 	}
 
-	query := func(dohUrl string, domain string) (result map[netip.Addr]int) {
-		result = map[netip.Addr]int{}
+	query := func(dohUrl string, domain string) *dohQueryResult {
+		result := newDohQueryResult()
 
 		name, err := Punycode(domain)
 		if err != nil {
-			return
+			return result
 		}
 
 		params := url.Values{}
@@ -320,7 +411,7 @@ func DohQueryWithClient(
 
 		request, err := http.NewRequestWithContext(queryCtx, "GET", requestUrl, nil)
 		if err != nil {
-			return
+			return result
 		}
 
 		request.Header.Set("Accept", "application/dns-json")
@@ -329,37 +420,45 @@ func DohQueryWithClient(
 
 		response, err := httpClient.Do(request)
 		if err != nil {
-			return
+			return result
 		}
 		defer response.Body.Close()
 		if response.StatusCode != http.StatusOK {
-			return
+			return result
 		}
 
 		data, err := io.ReadAll(response.Body)
 		if err != nil {
-			return
+			return result
 		}
 
 		dohResponse := &DohResponse{}
 		err = json.Unmarshal(data, dohResponse)
 		if err != nil {
-			return
+			return result
 		}
 
-		if dohResponse.Status != 0 {
-			return
+		switch dohResponse.Status {
+		case 0:
+		case 3:
+			result.Miss = true
+			return result
+		default:
+			return result
 		}
 
 		// ips := []netip.Addr{}
 		for _, answer := range dohResponse.Answer {
 			if ip, err := netip.ParseAddr(answer.Data); err == nil {
 				// ips = append(ips, ip)
-				result[ip] = max(result[ip], answer.TTL)
+				result.AddrTtls[ip] = max(result.AddrTtls[ip], answer.TTL)
 			}
 		}
+		if len(result.AddrTtls) == 0 {
+			result.Miss = true
+		}
 
-		return
+		return result
 	}
 
 	var dohUrls []string
@@ -374,50 +473,50 @@ func DohQueryWithClient(
 		dohUrls = append(dohUrls, settings.DnsResolverSettings.RemoteDohUrlsIpv6...)
 	}
 
-	var outs []chan map[netip.Addr]int
-
+	queryCount := len(dohUrls) * len(domains)
+	if queryCount == 0 || settings.RequestTimeout <= 0 {
+		return newDohQueryResult()
+	}
+	receiveResults := make(chan *dohQueryResult, queryCount)
 	for _, dohUrl := range dohUrls {
 		for _, domain := range domains {
-			out := make(chan map[netip.Addr]int)
-			outs = append(outs, out)
 			go HandleError(func() {
-				ips := query(dohUrl, domain)
-				if 0 < len(ips) {
-					select {
-					case out <- ips:
-					case <-queryCtx.Done():
-					}
+				result := query(dohUrl, domain)
+				select {
+				case receiveResults <- result:
+				case <-queryCtx.Done():
 				}
-				close(out)
 			})
 		}
 	}
 
 	endTime := time.Now().Add(settings.RequestTimeout)
-	mergedIps := map[netip.Addr]int{}
-	for _, out := range outs {
+	mergedResult := newDohQueryResult()
+	for range queryCount {
 		timeout := endTime.Sub(time.Now())
 		if timeout <= 0 {
-			select {
-			case <-queryCtx.Done():
-			case ips, ok := <-out:
-				if ok {
-					maps.Copy(mergedIps, ips)
-				}
-			default:
+			return &dohQueryResult{
+				AddrTtls: mergedResult.AddrTtls,
 			}
-		} else {
-			select {
-			case <-queryCtx.Done():
-			case ips, ok := <-out:
-				if ok {
-					maps.Copy(mergedIps, ips)
-				}
-			case <-time.After(timeout):
+		}
+		select {
+		case <-queryCtx.Done():
+			return &dohQueryResult{
+				AddrTtls: mergedResult.AddrTtls,
+			}
+		case result := <-receiveResults:
+			maps.Copy(mergedResult.AddrTtls, result.AddrTtls)
+			if result.Miss {
+				mergedResult.Miss = true
+			}
+		case <-time.After(timeout):
+			return &dohQueryResult{
+				AddrTtls: mergedResult.AddrTtls,
 			}
 		}
 	}
-	return mergedIps
+	mergedResult.Miss = len(mergedResult.AddrTtls) == 0 && mergedResult.Miss
+	return mergedResult
 }
 
 type DohKey struct {
@@ -435,6 +534,27 @@ func NewDohKey(recordType string, domain string) DohKey {
 type DohResult struct {
 	Time            time.Time
 	AddrExpirations map[netip.Addr]time.Time
+	Miss            bool
+}
+
+func (self *DohResult) Valid(now time.Time, missExpiration time.Duration) bool {
+	if len(self.AddrExpirations) == 0 {
+		return self.Miss && !self.Time.Add(missExpiration).Before(now)
+	}
+	for _, expireTime := range self.AddrExpirations {
+		if expireTime.Before(now) {
+			return false
+		}
+	}
+	return true
+}
+
+func (self *DohResult) Addrs() []netip.Addr {
+	ips := []netip.Addr{}
+	for ip := range self.AddrExpirations {
+		ips = append(ips, ip)
+	}
+	return ips
 }
 
 type DohQuestion struct {

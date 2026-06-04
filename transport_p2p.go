@@ -28,12 +28,12 @@ const ReadyHeader = "rdy"
 
 func DefaultP2pTransportSettings() *P2pTransportSettings {
 	return &P2pTransportSettings{
-		WriteTimeout:      15 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		ConnectTimeout:    15 * time.Second,
-		ReconnectTimeout:  5 * time.Second,
-		ChannelBufferSize: 32,
-		FramerSettings:    DefaultFramerSettings(),
+		WriteTimeout:        15 * time.Second,
+		ReadTimeout:         15 * time.Second,
+		ConnectTimeout:      15 * time.Second,
+		ReconnectTimeout:    5 * time.Second,
+		ChannelBufferSize:   32,
+		MaxMessageByteCount: 64 * 1024,
 	}
 }
 
@@ -52,7 +52,14 @@ type P2pTransportSettings struct {
 	ConnectTimeout    time.Duration
 	ReconnectTimeout  time.Duration
 	ChannelBufferSize int
-	FramerSettings    *FramerSettings
+	// MaxMessageByteCount is the largest single message the transport reads or
+	// writes. The detached WebRTC data channel is message-oriented: one pion
+	// Read returns exactly one whole SCTP user message, and pion/sctp returns
+	// io.ErrShortBuffer (leaving the message queued) when the read buffer is
+	// smaller than the message. The on-wire framing is therefore the SCTP
+	// message boundary itself — no length prefix — and the receive buffer must
+	// be >= the largest TransferFrame that can arrive.
+	MaxMessageByteCount int
 }
 
 type P2pTransport struct {
@@ -282,8 +289,6 @@ func (self *P2pSendTransport) run() {
 		}
 	}()
 
-	framer := NewFramer(self.settings.FramerSettings)
-
 	for {
 		select {
 		case <-self.ctx.Done():
@@ -293,8 +298,16 @@ func (self *P2pSendTransport) run() {
 				return
 			}
 
+			// The detached WebRTC data channel is message-oriented: one Write
+			// becomes one whole SCTP user message the peer reads back whole, so
+			// the SCTP message boundary frames each TransferFrame natively — no
+			// length prefix. Enforce the max message size up front.
+			if len(transferFrameBytes) > self.settings.MaxMessageByteCount {
+				MessagePoolReturn(transferFrameBytes)
+				return
+			}
 			self.conn.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
-			err := framer.Write(self.conn, transferFrameBytes)
+			_, err := self.conn.Write(transferFrameBytes)
 			MessagePoolReturn(transferFrameBytes)
 			if err != nil {
 				return
@@ -392,14 +405,22 @@ func (self *P2pReceiveTransport) run() {
 		}
 	}()
 
-	framer := NewFramer(self.settings.FramerSettings)
+	// The detached WebRTC data channel is message-oriented: one Read returns one
+	// whole SCTP user message (io.ErrShortBuffer if the buffer is too small for
+	// it). Read each whole message into a single reused buffer, then copy the
+	// exact bytes into a right-sized pooled buffer for the receive queue. This
+	// keeps one max-message-sized allocation for the life of the transport
+	// rather than taking — and, above a pool size class, un-pooling — a
+	// max-message-sized buffer from the message pool on every read.
+	readBuf := make([]byte, self.settings.MaxMessageByteCount)
 
 	for {
 		self.conn.SetReadDeadline(time.Now().Add(self.settings.ReadTimeout))
-		transferFrameBytes, err := framer.Read(self.conn)
+		n, err := self.conn.Read(readBuf)
 		if err != nil {
 			return
 		}
+		transferFrameBytes := MessagePoolCopy(readBuf[:n])
 		select {
 		case <-self.ctx.Done():
 			MessagePoolReturn(transferFrameBytes)

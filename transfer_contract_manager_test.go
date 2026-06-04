@@ -41,6 +41,7 @@ func TestTakeContract(t *testing.T) {
 	})
 
 	contracts := make(chan *protocol.Contract)
+	contractTimeout := make(chan struct{}, 1)
 
 	go func() {
 		for i := 0; i < k*n; i += 1 {
@@ -75,7 +76,12 @@ func TestTakeContract(t *testing.T) {
 			frame, err := ToFrame(result, DefaultProtocolVersion)
 			assert.Equal(t, nil, err)
 
-			contractManager.Receive(SourceId(ControlId), []*protocol.Frame{frame}, protocol.ProvideMode_Network)
+			contractManager.HandleControlFrame(
+				ContractKey{
+					Destination: DestinationId(destinationId),
+				},
+				frame,
+			)
 		}
 	}()
 
@@ -94,7 +100,11 @@ func TestTakeContract(t *testing.T) {
 					select {
 					case contracts <- contract:
 					case <-time.After(timeout):
-						t.FailNow()
+						select {
+						case contractTimeout <- struct{}{}:
+						default:
+						}
+						return
 					}
 					i += 1
 					// }
@@ -121,6 +131,8 @@ func TestTakeContract(t *testing.T) {
 			contractIds[contractId] = true
 
 		case <-time.After(timeout):
+			t.FailNow()
+		case <-contractTimeout:
 			t.FailNow()
 		}
 	}

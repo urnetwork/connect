@@ -2,8 +2,11 @@ package connect
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	mathrand "math/rand"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -15,18 +18,98 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
-func TestSendReceiveSenderReset(t *testing.T) {
-	// in this case two senders with the same client_id send after each other
-	// The receiver should be able to reset using the new sequence_id
+// encryptionMode selects how the SendSequence <-> ReceiveSequence TLS
+// encryption is configured for a test. It is used to run the same scenario
+// under both unencrypted and encrypted settings.
+type encryptionMode int
 
+const (
+	encryptionModeOff encryptionMode = iota
+	// encryptionModeOn: both sides Encrypt=true,
+	// EncryptAllowUnwrappedFallback=false. The handshake must succeed for
+	// any application data to flow (the SendSequence gates app packs on
+	// session readiness).
+	encryptionModeOn
+	// encryptionModeOnAllowFallback: both sides Encrypt=true,
+	// EncryptAllowUnwrappedFallback=true. The handshake is still expected
+	// to succeed under normal conditions, but app packs are allowed to flow
+	// in parallel during the handshake (gating off) and the sender will opt
+	// out gracefully if the handshake fails.
+	encryptionModeOnAllowFallback
+	// encryptionModeFallback exercises the opt-out path: encryption is enabled
+	// on the sender but the handshake is expected to time out, so the sender
+	// falls back to plaintext.
+	encryptionModeFallback
+)
+
+func TestSendReceiveSenderReset(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping testing in short mode")
 	}
+	runSendReceiveSenderReset(t, encryptionModeOff)
+}
+
+func TestSendReceiveSenderResetEncrypted(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping testing in short mode")
+	}
+	runSendReceiveSenderReset(t, encryptionModeOn)
+}
+
+func TestSendReceiveSenderResetEncryptedAllowFallback(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping testing in short mode")
+	}
+	runSendReceiveSenderReset(t, encryptionModeOnAllowFallback)
+}
+
+func runSendReceiveSenderReset(t *testing.T, encMode encryptionMode) {
+	// in this case two senders with the same client_id send after each other
+	// The receiver should be able to reset using the new sequence_id
 
 	// timeout between receives or acks
-	timeout := 60 * time.Second
+	// receive timeout. Large enough to absorb -race instrumentation overhead,
+	// which can slow per-message processing by 5-10x.
+	timeout := 5 * time.Minute
 	// number of messages
-	n := 16 * 1024
+	n := 1024
+	stress := os.Getenv("CONNECT_TRANSFER_STRESS") != ""
+	if stress {
+		n = 16 * 1024
+	}
+
+	contractCount := 1
+	// random delay / loss; the encrypted scenarios use a tighter conditioner
+	// because TLS records still need to be delivered eventually for the
+	// session to complete the handshake.
+	var conditionerDelay time.Duration
+	var conditionerLoss float32
+	switch encMode {
+	case encryptionModeOff:
+		if stress {
+			conditionerDelay = 5 * time.Second
+			conditionerLoss = 0.5
+		} else {
+			conditionerDelay = 200 * time.Millisecond
+			conditionerLoss = 0.1
+		}
+	case encryptionModeOn, encryptionModeOnAllowFallback:
+		if stress {
+			conditionerDelay = 200 * time.Millisecond
+			conditionerLoss = 0.1
+		} else {
+			conditionerDelay = 100 * time.Millisecond
+			conditionerLoss = 0.05
+		}
+		contractCount = 2
+	case encryptionModeFallback:
+		// no loss/delay so the opt-out and follow-on plaintext frames flow;
+		// the handshake is forced to fail by configuring a tiny timeout
+		// in `applyTestEncryptionSettings`.
+		conditionerDelay = 0
+		conditionerLoss = 0
+		contractCount = 2
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -41,13 +124,13 @@ func TestSendReceiveSenderReset(t *testing.T) {
 	bConditioner, aReceive := newConditioner(ctx, bSend)
 
 	aConditioner.update(func() {
-		aConditioner.randomDelay = 5 * time.Second
-		aConditioner.lossProbability = 0.5
+		aConditioner.randomDelay = conditionerDelay
+		aConditioner.lossProbability = conditionerLoss
 	})
 
 	bConditioner.update(func() {
-		bConditioner.randomDelay = 5 * time.Second
-		bConditioner.lossProbability = 0.5
+		bConditioner.randomDelay = conditionerDelay
+		bConditioner.lossProbability = conditionerLoss
 	})
 
 	aSendTransport := NewSendGatewayTransport()
@@ -72,6 +155,7 @@ func TestSendReceiveSenderReset(t *testing.T) {
 	clientSettingsA.ForwardBufferSettings.SequenceBufferSize = 0
 	clientSettingsA.ForwardBufferSettings.IdleTimeout = 300 * time.Second
 	clientSettingsA.ContractManagerSettings.LegacyCreateContract = true
+	applyTestEncryptionSettings(clientSettingsA, encMode)
 	a := NewClient(ctx, aClientId, NewNoContractClientOob(), clientSettingsA)
 	aRouteManager := a.RouteManager()
 	aContractManager := a.ContractManager()
@@ -98,6 +182,7 @@ func TestSendReceiveSenderReset(t *testing.T) {
 	clientSettingsB.ForwardBufferSettings.SequenceBufferSize = 0
 	clientSettingsB.ForwardBufferSettings.IdleTimeout = 300 * time.Second
 	clientSettingsB.ContractManagerSettings.LegacyCreateContract = true
+	applyTestEncryptionSettings(clientSettingsB, encMode)
 	b := NewClient(ctx, bClientId, NewNoContractClientOob(), clientSettingsB)
 	bRouteManager := b.RouteManager()
 	bContractManager := b.ContractManager()
@@ -134,16 +219,30 @@ func TestSendReceiveSenderReset(t *testing.T) {
 	var waitingReceiveCount int
 	var receiveMessages map[string]bool
 
-	aReceive <- requireTransferFrameBytes(
-		requireContractResultInitialPack(
-			protocol.ProvideMode_Network,
-			bContractManager.RequireProvideSecretKey(protocol.ProvideMode_Network),
-			aClientId,
-			bClientId,
-		),
-		ControlId,
-		aClientId,
-	)
+	for range contractCount {
+		err := aContractManager.HandleControlFrame(
+			ContractKey{
+				Destination: DestinationId(bClientId),
+			},
+			requireContractResult(
+				protocol.ProvideMode_Network,
+				bContractManager.RequireProvideSecretKey(protocol.ProvideMode_Network),
+				aClientId,
+				bClientId,
+			),
+		)
+		assert.Equal(t, err, nil)
+	}
+	// aReceive <- requireTransferFrameBytes(
+	// 	requireContractResultInitialPack(
+	// 		protocol.ProvideMode_Network,
+	// 		bContractManager.RequireProvideSecretKey(protocol.ProvideMode_Network),
+	// 		aClientId,
+	// 		bClientId,
+	// 	),
+	// 	ControlId,
+	// 	aClientId,
+	// )
 
 	go func() {
 		for i := 0; i < n; i += 1 {
@@ -220,16 +319,30 @@ func TestSendReceiveSenderReset(t *testing.T) {
 
 	a2ContractManager.SetProvideModes(provideModes)
 
-	aReceive <- requireTransferFrameBytes(
-		requireContractResultInitialPack(
-			protocol.ProvideMode_Network,
-			bContractManager.RequireProvideSecretKey(protocol.ProvideMode_Network),
-			aClientId,
-			bClientId,
-		),
-		ControlId,
-		aClientId,
-	)
+	for range contractCount {
+		err := a2ContractManager.HandleControlFrame(
+			ContractKey{
+				Destination: DestinationId(bClientId),
+			},
+			requireContractResult(
+				protocol.ProvideMode_Network,
+				bContractManager.RequireProvideSecretKey(protocol.ProvideMode_Network),
+				aClientId,
+				bClientId,
+			),
+		)
+		assert.Equal(t, err, nil)
+	}
+	// aReceive <- requireTransferFrameBytes(
+	// 	requireContractResultInitialPack(
+	// 		protocol.ProvideMode_Network,
+	// 		bContractManager.RequireProvideSecretKey(protocol.ProvideMode_Network),
+	// 		aClientId,
+	// 		bClientId,
+	// 	),
+	// 	ControlId,
+	// 	aClientId,
+	// )
 
 	select {
 	case message := <-receives:
@@ -297,7 +410,7 @@ func TestSendReceiveSenderReset(t *testing.T) {
 	cancel()
 }
 
-func createContractResultInitialPack(
+func createContractResult(
 	provideMode protocol.ProvideMode,
 	provideSecretKey []byte,
 	sourceId Id,
@@ -327,32 +440,32 @@ func createContractResultInitialPack(
 		},
 	}
 
-	frame, err := ToFrame(message, DefaultProtocolVersion)
-	if err != nil {
-		return nil, err
-	}
-	defer MessagePoolReturn(frame.MessageBytes)
+	return ToFrame(message, DefaultProtocolVersion)
+	// if err != nil {
+	// 	return nil, err
+	// }
+	// defer MessagePoolReturn(frame.MessageBytes)
 
-	messageId := NewId()
-	sequenceId := NewId()
-	pack := &protocol.Pack{
-		MessageId:      messageId.Bytes(),
-		SequenceId:     sequenceId.Bytes(),
-		SequenceNumber: 0,
-		Head:           true,
-		Frames:         []*protocol.Frame{frame},
-	}
+	// messageId := NewId()
+	// sequenceId := NewId()
+	// pack := &protocol.Pack{
+	// 	MessageId:      messageId.Bytes(),
+	// 	SequenceId:     sequenceId.Bytes(),
+	// 	SequenceNumber: 0,
+	// 	Head:           true,
+	// 	Frames:         []*protocol.Frame{frame},
+	// }
 
-	return ToFrame(pack, DefaultProtocolVersion)
+	// return ToFrame(pack, DefaultProtocolVersion)
 }
 
-func requireContractResultInitialPack(
+func requireContractResult(
 	provideMode protocol.ProvideMode,
 	provideSecretKey []byte,
 	sourceId Id,
 	destinationId Id,
 ) *protocol.Frame {
-	frame, err := createContractResultInitialPack(provideMode, provideSecretKey, sourceId, destinationId)
+	frame, err := createContractResult(provideMode, provideSecretKey, sourceId, destinationId)
 	if err != nil {
 		panic(err)
 	}
@@ -495,6 +608,120 @@ func (self *conditioner) run(in chan []byte, out chan []byte) {
 				}()
 			}
 		}
+	}
+}
+
+// applyTestEncryptionSettings configures the per-client encryption settings.
+// In the new design, encryption is a binary property of the per-peer
+// `EncryptionSessionManager` session: cipher set → all traffic encrypted;
+// cipher nil → all traffic plaintext. There is no per-frame fallback flag.
+func applyTestEncryptionSettings(clientSettings *ClientSettings, encMode encryptionMode) {
+	switch encMode {
+	case encryptionModeOff:
+		clientSettings.EncryptionSettings.Encrypt = false
+	case encryptionModeOn, encryptionModeOnAllowFallback:
+		clientSettings.EncryptionSettings.Encrypt = true
+		clientSettings.EncryptionSettings.TlsTimeout = 60 * time.Second
+	case encryptionModeFallback:
+		// sender enables encryption with a tight timeout but the receiver
+		// has encryption disabled, so the handshake never completes; the
+		// session stays in the cipher-nil state and all traffic flows in
+		// plaintext.
+		clientSettings.EncryptionSettings.Encrypt = true
+		clientSettings.EncryptionSettings.TlsTimeout = 50 * time.Millisecond
+	}
+}
+
+// TestSendReceiveEncryptedFallback exercises the opt-out path. The sender's
+// TLS handshake is forced to time out (lossy conditioner) and the receiver
+// accepts plaintext fallback.
+func TestSendReceiveEncryptedFallback(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping testing in short mode")
+	}
+	runSendReceiveSenderReset(t, encryptionModeFallback)
+}
+
+// TestVerifyPeerCertificateAgainstContract covers the sender-side TLS
+// certificate verification against the contract's PEM commitment.
+func TestVerifyPeerCertificateAgainstContract(t *testing.T) {
+	cert, _ := generateSequenceTlsCertificate()
+	leaf := cert.Leaf
+	leafPem := pemEncodeCertificate(leaf.Raw)
+
+	// no commitment in the contract -> verification is skipped, no error
+	ok, err := verifyPeerCertificateAgainstContract([]*x509.Certificate{leaf}, nil)
+	assert.Equal(t, err, nil)
+	assert.Equal(t, ok, true)
+
+	// matching commitment -> success
+	ok, err = verifyPeerCertificateAgainstContract([]*x509.Certificate{leaf}, [][]byte{leafPem})
+	assert.Equal(t, err, nil)
+	assert.Equal(t, ok, true)
+
+	// mismatched commitment -> failure
+	otherCert, _ := generateSequenceTlsCertificate()
+	otherLeafPem := pemEncodeCertificate(otherCert.Leaf.Raw)
+	ok, err = verifyPeerCertificateAgainstContract([]*x509.Certificate{leaf}, [][]byte{otherLeafPem})
+	assert.NotEqual(t, err, nil)
+	assert.Equal(t, ok, false)
+
+	// peer presented no cert but contract has a commitment -> failure
+	ok, err = verifyPeerCertificateAgainstContract(nil, [][]byte{leafPem})
+	assert.NotEqual(t, err, nil)
+	assert.Equal(t, ok, false)
+}
+
+func pemEncodeCertificate(der []byte) []byte {
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+// TestMinimumMessageLenLimitFitsWorstCaseHandshake verifies that
+// `ClientSettings.MinimumMessageLenLimit()` is at least as large as
+// the actual upper bound the per-peer encryption handshake can
+// produce on the wire. The contract is: any framer / transport
+// receive-cap configured to `>= MinimumMessageLenLimit()` must be
+// able to deliver the largest single `EncryptedControl{Handshake}`
+// Pack the runtime ever produces. If this invariant slips (e.g.,
+// the post-quantum key share grows, or someone adds a field to the
+// outer wraps), the runtime would silently deadlock the handshake.
+//
+// This test exercises just the math: it asserts the limit is
+// generous enough to cover the documented worst-case in the
+// method's comment block, with margin for ASN.1 size jitter and
+// protobuf field-tag drift. It is intentionally a coarse-grained
+// check; the integration tests under `server/connect` verify the
+// end-to-end behavior.
+func TestMinimumMessageLenLimitFitsWorstCaseHandshake(t *testing.T) {
+	settings := DefaultClientSettings()
+	limit := settings.MinimumMessageLenLimit()
+
+	// Documented worst-case sizing from the comment on
+	// `MinimumMessageLenLimit`: TLS 1.3 server flight with the
+	// post-quantum hybrid key share + mTLS CertificateRequest +
+	// ephemeral ECDSA P-256 cert is observed at ~1947 bytes. Round
+	// to a conservative 2 KiB for "actual raw handshake bytes."
+	const observedHandshakeRawBytes = ByteCount(2 * 1024)
+
+	// Protobuf wrap overhead (EncryptedControl + Frame + Pack +
+	// TransferFrame): documented at ~200 bytes, with ample slop.
+	const protobufWrapOverhead = ByteCount(300)
+
+	worstCaseWireBytes := observedHandshakeRawBytes + protobufWrapOverhead
+	if limit < worstCaseWireBytes {
+		t.Fatalf(
+			"MinimumMessageLenLimit %d < worst-case handshake wire bytes %d (TLS %d + wrap %d)",
+			limit, worstCaseWireBytes, observedHandshakeRawBytes, protobufWrapOverhead,
+		)
+	}
+
+	// And the limit must not be absurdly large either — that would
+	// indicate someone forgot to read the comment. A few MiB is
+	// a sane upper bound for "this is a per-message handshake
+	// payload cap."
+	const sanityUpperBound = ByteCount(4 * 1024 * 1024)
+	if sanityUpperBound < limit {
+		t.Fatalf("MinimumMessageLenLimit %d > sanity upper bound %d; review the value", limit, sanityUpperBound)
 	}
 }
 

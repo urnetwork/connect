@@ -318,15 +318,17 @@ func (self *ClientStrategy) NextConnectTime() time.Time {
 	defer self.mutex.Unlock()
 
 	now := time.Now()
-	connectDelay := self.settings.MinNextConnectDelay + time.Duration(mathrand.Int63n(int64(
-		self.settings.MaxNextConnectDelay-self.settings.MinNextConnectDelay,
-	)))
+	connectDelayRange := self.settings.MaxNextConnectDelay - self.settings.MinNextConnectDelay
+	connectDelay := self.settings.MinNextConnectDelay
+	if 0 < connectDelayRange {
+		connectDelay += time.Duration(mathrand.Int63n(int64(connectDelayRange)))
+	}
 	nextConnectTime := self.nextConnectTime.Add(connectDelay)
 	if nextConnectTime.Before(now) {
 		nextConnectTime = now
 	}
 	self.nextConnectTime = nextConnectTime
-	return now
+	return nextConnectTime
 }
 
 func (self *ClientStrategy) dialerWeights() map[*clientDialer]float32 {
@@ -584,9 +586,6 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 		}
 	}
 
-	return &evalResult{
-		err: fmt.Errorf("No successful strategy found."),
-	}
 }
 
 func (self *ClientStrategy) serialEval(ctx context.Context, eval func(ctx context.Context, dialer *clientDialer) *evalResult, helloEval func(ctx context.Context, dialer *clientDialer) *evalResult) *evalResult {
@@ -687,9 +686,6 @@ func (self *ClientStrategy) serialEval(ctx context.Context, eval func(ctx contex
 		// }
 	}
 
-	return &evalResult{
-		err: fmt.Errorf("No successful strategy found."),
-	}
 }
 
 func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, error) {

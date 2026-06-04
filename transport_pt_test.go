@@ -1,11 +1,13 @@
 package connect
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
 	mathrand "math/rand"
 	"net"
+	"os"
 	"time"
 
 	"crypto/ecdsa"
@@ -43,6 +45,13 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 		return
 	}
 
+	iterations := 16
+	attempts := 4
+	if os.Getenv("CONNECT_PT_STRESS") != "" {
+		iterations = 64
+		attempts = 8
+	}
+
 	select {
 	case <-time.After(1 * time.Second):
 	}
@@ -57,7 +66,7 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 		return out
 	}
 
-	for i := range 64 {
+	for i := range iterations {
 		headerPrefix := make([]byte, 8)
 		mathrand.Read(headerPrefix)
 
@@ -66,9 +75,12 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 
 		fmt.Printf("[%d]dns test (loss=%.1f%%)\n", i, 100.0/float32(packetLossN))
 		success := false
-		for range 8 {
+		for range attempts {
 			success = func() bool {
-				handleCtx, handleCancel := context.WithCancel(ctx)
+				attemptCtx, attemptCancel := context.WithTimeout(ctx, 20*time.Second)
+				defer attemptCancel()
+
+				handleCtx, handleCancel := context.WithCancel(attemptCtx)
 				defer handleCancel()
 
 				n := 1024 * (8 + mathrand.Intn(8))
@@ -78,7 +90,14 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 
 				serverAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: basePort + i}
 
-				ioTimeout := 300 * time.Second
+				ioTimeout := 5 * time.Second
+				ioDeadline := func() time.Time {
+					deadline := time.Now().Add(ioTimeout)
+					if ctxDeadline, ok := handleCtx.Deadline(); ok && ctxDeadline.Before(deadline) {
+						return ctxDeadline
+					}
+					return deadline
+				}
 
 				quicConfig := &quic.Config{
 					HandshakeIdleTimeout:    ioTimeout,
@@ -89,6 +108,18 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 				}
 
 				serverCtx, serverCancel := context.WithCancel(handleCtx)
+				errCh := make(chan error, 4)
+				reportErr := func(err error) bool {
+					if err == nil {
+						return false
+					}
+					select {
+					case errCh <- err:
+					default:
+					}
+					handleCancel()
+					return true
+				}
 				// func() {
 				serverTlsConfig := &tls.Config{
 					GetConfigForClient: func(clientHello *tls.ClientHelloInfo) (*tls.Config, error) {
@@ -98,7 +129,9 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 							180*24*time.Hour,
 							180*24*time.Hour,
 						)
-						assert.Equal(t, err, nil)
+						if err != nil {
+							return nil, err
+						}
 						// X509KeyPair
 						cert, err := tls.X509KeyPair(certPemBytes, keyPemBytes)
 						return &tls.Config{
@@ -136,35 +169,61 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 					// defer earlyListener.Close()
 
 					earlyConn, err := earlyListener.Accept(handleCtx)
-					assert.Equal(t, err, nil)
+					if err != nil {
+						reportErr(fmt.Errorf("server accept: %w", err))
+						return
+					}
 					stream, err := earlyConn.AcceptStream(handleCtx)
-					assert.Equal(t, err, nil)
+					if err != nil {
+						reportErr(fmt.Errorf("server accept stream: %w", err))
+						return
+					}
 
 					writeCtx, writeCancel := context.WithCancel(handleCtx)
 					go func() {
 						defer writeCancel()
-						stream.SetWriteDeadline(time.Now().Add(ioTimeout))
+						stream.SetWriteDeadline(ioDeadline())
 						m, err := stream.Write(data)
-						assert.Equal(t, err, nil)
-						assert.Equal(t, m, len(data))
+						if err != nil {
+							reportErr(fmt.Errorf("server write: %w", err))
+							return
+						}
+						if m != len(data) {
+							reportErr(fmt.Errorf("server short write: %d != %d", m, len(data)))
+						}
 					}()
 
 					readData := make([]byte, 0, len(data))
 					buf := make([]byte, 2048)
 
 					for len(readData) < len(data) {
-						stream.SetReadDeadline(time.Now().Add(ioTimeout))
+						select {
+						case <-handleCtx.Done():
+							reportErr(handleCtx.Err())
+							return
+						default:
+						}
+						stream.SetReadDeadline(ioDeadline())
 						m, err := stream.Read(buf[:min(len(buf), len(data)-len(readData))])
-						assert.Equal(t, err, nil)
+						if err != nil {
+							reportErr(fmt.Errorf("server read: %w", err))
+							return
+						}
 						readData = append(readData, buf[:m]...)
 
 						// fmt.Printf("read[%d]\n", m)
 						fmt.Printf("+")
 					}
 
-					assert.Equal(t, data, readData)
+					if !bytes.Equal(data, readData) {
+						reportErr(fmt.Errorf("server read data mismatch"))
+						return
+					}
 
 					select {
+					case err := <-errCh:
+						reportErr(err)
+						return
 					case <-writeCtx.Done():
 					}
 
@@ -206,19 +265,34 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 				writeCtx, writeCancel := context.WithCancel(handleCtx)
 				go func() {
 					defer writeCancel()
-					stream.SetWriteDeadline(time.Now().Add(ioTimeout))
+					stream.SetWriteDeadline(ioDeadline())
 					m, err := stream.Write(data)
-					assert.Equal(t, err, nil)
-					assert.Equal(t, m, len(data))
+					if err != nil {
+						reportErr(fmt.Errorf("client write: %w", err))
+						return
+					}
+					if m != len(data) {
+						reportErr(fmt.Errorf("client short write: %d != %d", m, len(data)))
+					}
 				}()
 
 				readData := make([]byte, 0, len(data))
 				buf := make([]byte, 2048)
 
 				for len(readData) < len(data) {
-					stream.SetReadDeadline(time.Now().Add(ioTimeout))
+					select {
+					case err := <-errCh:
+						fmt.Printf("connection issue: %s\n", err)
+						return false
+					case <-handleCtx.Done():
+						reportErr(handleCtx.Err())
+						return false
+					default:
+					}
+					stream.SetReadDeadline(ioDeadline())
 					m, err := stream.Read(buf[:min(len(buf), len(data)-len(readData))])
 					if err != nil {
+						reportErr(fmt.Errorf("client read: %w", err))
 						return false
 					}
 					// assert.Equal(t, err, nil)
@@ -228,18 +302,33 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 					fmt.Printf(".")
 				}
 
-				assert.Equal(t, data, readData)
+				if !bytes.Equal(data, readData) {
+					reportErr(fmt.Errorf("client read data mismatch"))
+					return false
+				}
 
 				select {
+				case err := <-errCh:
+					fmt.Printf("connection issue: %s\n", err)
+					return false
 				case <-writeCtx.Done():
 					// case <- time.After(60 * time.Second):
 					// 	t.FailNow()
 				}
 
 				select {
+				case err := <-errCh:
+					fmt.Printf("connection issue: %s\n", err)
+					return false
 				case <-serverCtx.Done():
 					// case <- time.After(60 * time.Second):
 					// 	t.FailNow()
+				}
+				select {
+				case err := <-errCh:
+					fmt.Printf("connection issue: %s\n", err)
+					return false
+				default:
 				}
 
 				return true

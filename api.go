@@ -231,8 +231,8 @@ func (self *BringYourApi) AuthVerifySend(authVerifySend *AuthVerifySendArgs, cal
 type AuthNetworkClientCallback ApiCallback[*AuthNetworkClientResult]
 
 type AuthNetworkClientArgs struct {
-	ClientId       *Id    `json:"client_id",omitempty`
-	SourceClientId *Id    `json:"source_client_id",omitempty`
+	ClientId       *Id    `json:"client_id,omitempty"`
+	SourceClientId *Id    `json:"source_client_id,omitempty"`
 	Description    string `json:"description"`
 	DeviceSpec     string `json:"device_spec"`
 }
@@ -395,6 +395,48 @@ func (self *BringYourApi) ConnectControl(connectControl *ConnectControlArgs, cal
 			callback,
 		)
 	})
+}
+
+type GetClientKeyCallback ApiCallback[*GetClientKeyResult]
+
+type GetClientKeyArgs struct {
+	ClientId Id `json:"client_id"`
+}
+
+type GetClientKeyResult struct {
+	PublicKey []byte `json:"public_key"`
+}
+
+// GetClientKey fetches a peer client's long-lived public identity key
+// from the unauthenticated `/key/<client_id>` API. Used as the
+// out-of-band cross-check against the
+// `Contract.destination_client_public_key` value the platform
+// attaches to contracts — if the two disagree, the platform may be
+// substituting keys to mount a MITM attack.
+//
+// The route is unauthenticated by design; no `byJwt` is sent.
+func (self *BringYourApi) GetClientKey(args *GetClientKeyArgs, callback GetClientKeyCallback) {
+	go HandleError(func() {
+		HttpGetWithStrategy(
+			self.ctx,
+			self.clientStrategy,
+			fmt.Sprintf("%s/key/%s", self.apiUrl, args.ClientId),
+			"",
+			&GetClientKeyResult{},
+			callback,
+		)
+	})
+}
+
+func (self *BringYourApi) GetClientKeySync(args *GetClientKeyArgs) (*GetClientKeyResult, error) {
+	return HttpGetWithStrategy(
+		self.ctx,
+		self.clientStrategy,
+		fmt.Sprintf("%s/key/%s", self.apiUrl, args.ClientId),
+		"",
+		&GetClientKeyResult{},
+		NewNoopApiCallback[*GetClientKeyResult](),
+	)
 }
 
 type AuthCodeLoginCallback ApiCallback[*AuthCodeLoginResult]

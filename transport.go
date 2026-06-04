@@ -157,8 +157,10 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		// FIXME
 		DnsTlds: [][]byte{[]byte("ur.xyz.")},
 		// servers are migrated on 2025-06-12. We can remove this and always use true.
-		V2H1Auth:          true,
-		FramerSettings:    DefaultFramerSettings(),
+		V2H1Auth: true,
+		// the platform transport must carry the per-peer encryption handshake,
+		// so its framer max is the connect runtime minimum message length
+		FramerSettings:    DefaultFramerSettings(int(DefaultClientSettings().MinimumMessageLenLimit())),
 		PtDnsSlowMultiple: 4,
 	}
 }
@@ -930,8 +932,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			var tlsConfig *tls.Config
 			if self.settings.QuicTlsConfig != nil {
 				// copy
-				tlsConfigCopy := *self.settings.QuicTlsConfig
-				tlsConfig = &tlsConfigCopy
+				tlsConfig = self.settings.QuicTlsConfig.Clone()
 			} else {
 				tlsConfig = &tls.Config{}
 			}

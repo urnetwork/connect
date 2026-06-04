@@ -2,6 +2,7 @@ package connect
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"math"
@@ -17,7 +18,7 @@ import (
 
 	"golang.org/x/exp/maps"
 
-	// "google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/urnetwork/glog"
 
@@ -74,7 +75,7 @@ func DefaultClientSettings() *ClientSettings {
 }
 
 func DefaultClientSettingsWithBufferSize(bufferSize int) *ClientSettings {
-	return &ClientSettings{
+	settings := &ClientSettings{
 		SendBufferSize:          bufferSize,
 		ForwardBufferSize:       bufferSize,
 		ReadTimeout:             30 * time.Second,
@@ -83,12 +84,22 @@ func DefaultClientSettingsWithBufferSize(bufferSize int) *ClientSettings {
 		SendBufferSettings:      DefaultSendBufferSettingsWithBufferSize(bufferSize),
 		ReceiveBufferSettings:   DefaultReceiveBufferSettingsWithBufferSize(bufferSize),
 		ForwardBufferSettings:   DefaultForwardBufferSettingsWithBufferSize(bufferSize),
-		ContractManagerSettings: DefaultContractManagerSettings(),
+		ContractManagerSettings: DefaultContractManagerSettingsWithBufferSize(bufferSize),
 		StreamManagerSettings:   DefaultStreamManagerSettings(),
 		WebRtcSettings:          DefaultWebRtcSettings(),
+		EncryptionSettings:      DefaultEncryptionSettings(),
 		ProtocolVersion:         DefaultProtocolVersion,
 		DefaultTransferOpts:     DefaultTransferOpts(),
 	}
+	// A per-peer session is ref-held by both a send and a receive sequence, so
+	// it must outlive the longer of the two — otherwise the next burst (after a
+	// transport reform or lull) churns a fresh handshake instead of reusing the
+	// live cipher.
+	settings.EncryptionSettings.IdleTimeout = max(
+		settings.SendBufferSettings.IdleTimeout,
+		settings.ReceiveBufferSettings.IdleTimeout,
+	)
+	return settings
 }
 
 func DefaultClientSettingsNoNetworkEvents() *ClientSettings {
@@ -176,6 +187,23 @@ type SendPack struct {
 	AckCallback      AckFunction
 	MessageByteCount ByteCount
 	Ctx              context.Context
+	// ForceUnwrapped pins the wire frame to plaintext for the item's lifetime,
+	// including retransmits. Used by session control messages (TLS handshake
+	// bytes) that bootstrap the cipher: they must never be sent encrypted, since
+	// the peer may not have completed its half of the handshake even after our
+	// local cipher is established.
+	ForceUnwrapped bool
+	// EncryptionRole selects which per-peer session this pack uses, keying the
+	// SendSequence so the roles run as distinct sequences: client (the default —
+	// the client's own outbound data, whose handshake it initiates/restarts) or
+	// server (EncryptedControl carriers and server-session replies, which never
+	// restart the handshake).
+	EncryptionRole sequenceTlsRole
+	// EncryptionCompanion is the per-peer session identity companion this pack
+	// uses — keys the SendSequence and its session, distinct from
+	// `TransferOptions.CompanionContract` (the contract it rides; the two differ
+	// only for a server-role EncryptedControl reply carrier).
+	EncryptionCompanion bool
 }
 
 type ReceivePack struct {
@@ -186,6 +214,22 @@ type ReceivePack struct {
 	MessageByteCount   ByteCount
 	TransferFrameBytes []byte
 	Ctx                context.Context
+	// Unwrapped is true when the inbound TransferFrame arrived as plaintext (no
+	// outer wrap). The ack for this pack (and any aggregated ack including it) is
+	// sent plaintext to mirror, so a peer whose cipher isn't up yet isn't handed
+	// a wrapped ack it can't open.
+	Unwrapped bool
+	// EncryptionRole is the local per-peer session role that owns this inbound
+	// stream — the complement of the sender's role, keying the ReceiveSequence
+	// and the session it holds. Normal peer data (peer is the TLS client) maps
+	// to our server session (the default); EncryptedControl carriers and
+	// server-session replies map to our client session.
+	EncryptionRole sequenceTlsRole
+	// EncryptionCompanion is the local session identity companion that owns this
+	// inbound stream (shared by both peers, not complemented). Derived from the
+	// wire companion hint, the decrypting session, or the EncryptedControl;
+	// defaults false. Keys the ReceiveSequence and its session.
+	EncryptionCompanion bool
 }
 
 type ForwardPack struct {
@@ -269,10 +313,45 @@ type ClientSettings struct {
 	ContractManagerSettings *ContractManagerSettings
 	StreamManagerSettings   *StreamManagerSettings
 	WebRtcSettings          *WebRtcSettings
+	EncryptionSettings      *EncryptionSettings
+
+	// ClientKeySeed, when set, is the long-lived Ed25519 client identity key
+	// seed (`ed25519.NewKeyFromSeed`); must be `ed25519.SeedSize` (32) bytes.
+	// When empty, `ClientKeyManager` generates a fresh seed. Persist the running
+	// value (`Client.ClientKeyManager().Seed()`) and reload it on the next run
+	// to keep the published `ClientKey` (and contract bindings to it) stable
+	// across process lifetimes.
+	ClientKeySeed []byte
 
 	ProtocolVersion int
 
 	DefaultTransferOpts TransferOptions
+}
+
+// MinimumMessageLenLimit returns the smallest per-transport framer
+// `MaxMessageLen` (and receive-side caps, e.g. `websocket.SetReadLimit`) the
+// runtime can reliably operate under. Below it, the per-peer handshake can
+// deadlock: the TLS server flight ships as one large `EncryptedControl{Handshake}`
+// Pack, and if any hop's framer rejects it as oversized the stream closes
+// mid-handshake, the retransmit re-sends the same oversized pack, and both sides
+// time out.
+//
+// Worst-case sizing (verified against the active TLS profile — TLS 1.3,
+// X25519MLKEM768 hybrid group, ephemeral ECDSA P-256 cert, mTLS):
+//
+//	ServerHello ~1.2 KiB (MLKEM768 key share ~1.1 KiB), ChangeCipherSpec ~6 B,
+//	EncryptedExtensions ~10 B, CertificateRequest ~30 B, Certificate ~500–600 B,
+//	CertificateVerify ~80 B, Finished ~45 B, + ~5 B record header each
+//	  ≈ 2 KiB raw; + ~200 B EC/Frame/Pack/TransferFrame proto wrap ≈ 2.2 KiB
+//
+// Rounded up to 4 KiB to absorb ASN.1 cert-size jitter, a future larger
+// post-quantum key share, and protobuf field-tag drift. Production transports
+// default well above this; tests and embedded callers should plumb it through
+// their framer caps (and matching receive-side limits):
+//
+//	settings.FramerSettings.MaxMessageLen = max(yourValue, int(client.MinimumMessageLenLimit()))
+func (self *ClientSettings) MinimumMessageLenLimit() ByteCount {
+	return ByteCount(4 * 1024)
 }
 
 // note all callbacks are wrapped to check for nil and recover from errors
@@ -291,17 +370,24 @@ type Client struct {
 
 	loopback chan *SendPack
 
-	routeManager    *RouteManager
-	contractManager *ContractManager
-	webRtcManager   *WebRtcManager
-	streamManager   *StreamManager
-	sendBuffer      *SendBuffer
-	receiveBuffer   *ReceiveBuffer
-	forwardBuffer   *ForwardBuffer
+	routeManager             *RouteManager
+	contractManager          *ContractManager
+	webRtcManager            *WebRtcManager
+	streamManager            *StreamManager
+	sendBuffer               *SendBuffer
+	receiveBuffer            *ReceiveBuffer
+	forwardBuffer            *ForwardBuffer
+	clientKeyManager         *ClientKeyManager
+	encryptionSessionManager *EncryptionSessionManager
 
-	contractManagerUnsub func()
-	webRtcManagerUnsub   func()
-	streamManagerUnsub   func()
+	// ready is closed by NewClientWithTag right before it returns, once every
+	// manager, buffer, callback, and the `run` loop are wired up. See
+	// ReadyNotify for the gating contract.
+	ready chan struct{}
+
+	// contractManagerUnsub func()
+	webRtcManagerUnsub func()
+	streamManagerUnsub func()
 }
 
 func NewClientWithDefaults(
@@ -345,22 +431,45 @@ func NewClientWithTag(
 		receiveCallbacks: NewCallbackList[ReceiveFunction](),
 		forwardCallbacks: NewCallbackList[ForwardFunction](),
 		loopback:         make(chan *SendPack),
+		ready:            make(chan struct{}),
 	}
 
 	routeManager := NewRouteManager(ctx, clientTag)
 	contractManager := NewContractManager(ctx, client, settings.ContractManagerSettings)
 	webRtcManager := NewWebRtcManager(ctx, NewClientSignalSender(client), settings.WebRtcSettings)
 	streamManager := NewStreamManager(ctx, client, webRtcManager, settings.StreamManagerSettings)
+	// ClientKeyManager must precede EncryptionSessionManager — the latter holds
+	// a reference to sign the published TLS cert
+	// (`EncryptedKey.ClientKeySignedTlsCertificate`) and per-peer identity proofs.
+	clientKeyManager, err := NewClientKeyManager(client.ctx, client)
+	if err != nil {
+		glog.Errorf("[key]%s could not initialize client key: %s\n", client.ClientTag(), err)
+		clientKeyManager = nil
+	}
+	encryptionSessionManager := NewEncryptionSessionManager(client.ctx, client, clientKeyManager, client.settings.EncryptionSettings)
 
-	client.contractManagerUnsub = client.AddReceiveCallback(contractManager.Receive)
+	// client.contractManagerUnsub = client.AddReceiveCallback(contractManager.Receive)
 	client.webRtcManagerUnsub = ReceiveSignalsFromClient(client, webRtcManager)
 	client.streamManagerUnsub = client.AddReceiveCallback(streamManager.Receive)
 
-	client.initBuffers(routeManager, contractManager, webRtcManager, streamManager)
+	client.initBuffers(routeManager, contractManager, webRtcManager, streamManager, clientKeyManager, encryptionSessionManager)
 
 	go HandleError(client.run, cancel)
 
+	// Mark the client fully constructed: manager goroutines started above (e.g.
+	// `publishEncryptedKey`, `providePing`) gate their first send on this so they
+	// don't race the wiring above.
+	close(client.ready)
+
 	return client
+}
+
+// ReadyNotify returns a channel closed once `NewClientWithTag` has finished
+// wiring the client (managers, callbacks, buffers, `run` loop). Any goroutine
+// launched during construction must wait on it (or `ctx.Done()`) before its
+// first send into the client's send path.
+func (self *Client) ReadyNotify() <-chan struct{} {
+	return self.ready
 }
 
 func (self *Client) initBuffers(
@@ -368,14 +477,79 @@ func (self *Client) initBuffers(
 	contractManager *ContractManager,
 	webRtcManager *WebRtcManager,
 	streamManager *StreamManager,
+	clientKeyManager *ClientKeyManager,
+	encryptionSessionManager *EncryptionSessionManager,
 ) {
 	self.routeManager = routeManager
 	self.contractManager = contractManager
 	self.webRtcManager = webRtcManager
 	self.streamManager = streamManager
+	self.clientKeyManager = clientKeyManager
+	self.encryptionSessionManager = encryptionSessionManager
+
+	// sendBuffer / receiveBuffer / forwardBuffer come first because
+	// `EncryptionSessionManager` publishes its cert (via `EncryptedKey`)
+	// at construction time, and the publish path goes through
+	// `sendBuffer.Pack`.
 	self.sendBuffer = NewSendBuffer(self.ctx, self, self.settings.SendBufferSettings)
 	self.receiveBuffer = NewReceiveBuffer(self.ctx, self, self.settings.ReceiveBufferSettings)
 	self.forwardBuffer = NewForwardBuffer(self.ctx, self, self.settings.ForwardBufferSettings)
+}
+
+func (self *Client) EncryptionSessionManager() *EncryptionSessionManager {
+	return self.encryptionSessionManager
+}
+
+// unwrapFrame opens an outer-wrapped TransferFrame from `sourceId`. `roleHint`
+// (the sender's session role; may be `SequenceRoleUnknown`) selects the
+// complement local session to try first; `companionHint` (the sender's session
+// companion; nil when the sender omitted it) further pins the exact companion
+// session. With a role hint but no companion hint, both companion sessions of
+// the complement role are tried; with no role hint, every per-peer session is
+// tried. Each candidate session's ciphers are tried (established plus, briefly
+// during a rekey, the prior established) until one authenticates. Returns the
+// plaintext inner bytes and the local session role and companion that
+// decrypted them (used as the receive sequence's role/companion). Wait-free:
+// it never blocks the receive loop.
+func (self *Client) unwrapFrame(sourceId Id, roleHint protocol.SequenceRole, companionHint *bool, wrapped []byte) ([]byte, sequenceTlsRole, bool, error) {
+	if self.encryptionSessionManager == nil {
+		return nil, sequenceTlsRoleServer, false, fmt.Errorf("encryption disabled")
+	}
+	// A wrapped frame can only be opened by the complement of the sender's
+	// session role (the other local session is the opposite TLS direction
+	// with a different key), so a present role hint narrows us to that role —
+	// and a present companion hint pins exactly one session (Option 1). A role
+	// hint without a companion hint leaves both companion sessions as
+	// candidates. With no role hint — the sender omitted it for on-wire
+	// anonymity — trial-decrypt against every per-peer session (Option 2).
+	var ordered []*peerEncryptionSession
+	if senderRole, ok := sequenceTlsRoleFromProtobuf(roleHint); ok {
+		complement := senderRole.complement()
+		if companionHint != nil {
+			if s := self.encryptionSessionManager.Lookup(sourceId, complement, *companionHint); s != nil {
+				ordered = append(ordered, s)
+			}
+		} else {
+			ordered = self.encryptionSessionManager.sessionsForPeerRole(sourceId, complement)
+		}
+	} else {
+		ordered = self.encryptionSessionManager.sessionsForPeer(sourceId)
+	}
+	if len(ordered) == 0 {
+		return nil, sequenceTlsRoleServer, false, fmt.Errorf("no encryption session for peer %s", sourceId)
+	}
+	for _, session := range ordered {
+		for _, cipher := range session.decryptCiphers() {
+			if plaintext, err := cipher.Open(wrapped); err == nil {
+				return plaintext, session.role, session.companion, nil
+			}
+		}
+	}
+	return nil, sequenceTlsRoleServer, false, fmt.Errorf("no encryption session for peer %s could decrypt", sourceId)
+}
+
+func (self *Client) ClientKeyManager() *ClientKeyManager {
+	return self.clientKeyManager
 }
 
 func (self *Client) RouteManager() *RouteManager {
@@ -583,6 +757,9 @@ func (self *Client) sendWithTimeoutDetailed(
 		AckCallback:      safeAckCallback,
 		MessageByteCount: messageByteCount,
 		Ctx:              ctx,
+		// Ordinary application data: the session identity companion is the
+		// sequence's own contract-companion bit (no client/server split here).
+		EncryptionCompanion: transferOpts.CompanionContract,
 	}
 
 	if sendPack.Destination.DestinationId == self.clientId {
@@ -848,6 +1025,94 @@ func (self *Client) run() {
 				continue
 			}
 
+			// unwrapped tracks whether the frame arrived on the wire as
+			// plaintext (true) or wrapped (false). Propagated through the
+			// ReceivePack → receiveItem → ack path so an ack mirrors the
+			// wrap state of the messages it acknowledges. Mirroring keeps
+			// acks legible to peers whose ciphers haven't come up yet.
+			unwrapped := true
+
+			// receiveRole is the local per-peer session role that owns this
+			// inbound stream, handed to the ReceiveBuffer so the
+			// ReceiveSequence holds the right session. Default server: normal
+			// peer data (the peer is the TLS client) decrypts under our
+			// server session. Adjusted below to the role that actually
+			// decrypted a wrapped frame, and to client for a plaintext
+			// EncryptedControl carrier (the peer's server-role stream).
+			receiveRole := sequenceTlsRoleServer
+			// receiveCompanion is the local session identity companion owning
+			// this inbound stream (not complemented). Default false; set below
+			// from the decrypting session, the plaintext companion hint, or the
+			// EncryptedControl.
+			receiveCompanion := false
+
+			// outer encrypted wrap: the inner bytes are themselves a
+			// `TransferFrame`. A per-peer session for `source` carries the
+			// cipher. Forwarders never see this branch — they only look at
+			// the outer TransferPath, which is plaintext.
+			if 0 < len(transferFrame.EncryptedTransferFrame) {
+				unwrapped = false
+				// Unwrap is fully non-blocking: if no session can decrypt
+				// yet, drop the frame and let the sender's resend recover. A
+				// client-role send sequence restarts the handshake on its
+				// next burst, so a peer that lost (or never built) its
+				// responder session rebuilds it — the drop is transient, not
+				// a wedge. Keeping the unwrap path wait-free means no single
+				// peer can park the single-threaded, all-peers receive loop.
+				unwrappedTransferFrameBytes, decryptRole, decryptCompanion, err := self.unwrapFrame(
+					path.SourceId, transferFrame.GetSessionRole(), transferFrame.SessionCompanion, transferFrame.EncryptedTransferFrame)
+				if err != nil {
+					glog.V(1).Infof("[cr]unwrap err = %s\n", err)
+					MessagePoolReturn(transferFrameBytes)
+					continue
+				}
+				receiveRole = decryptRole
+				receiveCompanion = decryptCompanion
+				unwrappedTransferFrame := &protocol.TransferFrame{}
+				if err := ProtoUnmarshal(unwrappedTransferFrameBytes, unwrappedTransferFrame); err != nil {
+					updatePeerAudit(source, func(a *PeerAudit) {
+						a.badMessage(ByteCount(len(transferFrameBytes)))
+					})
+					MessagePoolReturn(transferFrameBytes)
+					MessagePoolReturn(unwrappedTransferFrameBytes)
+					continue
+				}
+				// the inner TransferPath is AEAD-authenticated; the outer
+				// is only the routing hint. A mismatch implies tampering
+				// in flight or a routing/sender bug. Drop and audit.
+				unwrappedPath, err := TransferPathFromProtobuf(unwrappedTransferFrame.TransferPath)
+				if err != nil || unwrappedPath != path {
+					glog.V(1).Infof("[cr] %s outer/inner TransferPath mismatch from %s\n", self.clientTag, path.SourceId)
+					updatePeerAudit(source, func(a *PeerAudit) {
+						a.badMessage(ByteCount(len(transferFrameBytes)))
+					})
+					MessagePoolReturn(transferFrameBytes)
+					MessagePoolReturn(unwrappedTransferFrameBytes)
+					continue
+				}
+				MessagePoolReturn(transferFrameBytes)
+				transferFrameBytes = unwrappedTransferFrameBytes
+				transferFrame = unwrappedTransferFrame
+			}
+
+			// A plaintext pack with a sender-role hint is the peer's
+			// EncryptedControl carrier (its server-role stream). Map the whole
+			// sequence to the complement local session — across both the EC packs
+			// and the non-EC open/contract packs — so they share one receive
+			// sequence; deriving the role per-pack (from the EC frames below)
+			// would split the open pack off and gap the handshake. Wrapped packs
+			// use the decrypt role from above; the no-hint default is server. The
+			// companion hint, when present, pins the companion session (shared by
+			// both peers, so taken as-is, not complemented).
+			if unwrapped {
+				if senderRole, ok := sequenceTlsRoleFromProtobuf(transferFrame.GetSessionRole()); ok {
+					receiveRole = senderRole.complement()
+				}
+				if transferFrame.SessionCompanion != nil {
+					receiveCompanion = transferFrame.GetSessionCompanion()
+				}
+			}
+
 			ack := transferFrame.Ack
 			pack := transferFrame.Pack
 
@@ -910,16 +1175,83 @@ func (self *Client) run() {
 					MessagePoolReturn(transferFrameBytes)
 					continue
 				}
+				// Optimistic EC apply: deliver EncryptedControl frames straight to
+				// the per-peer session from the receive loop, bypassing the in-order
+				// ReceiveSequence drain (which can stall on a sequence gap from a
+				// transport reform or loss). EC frames only piggyback that ordering
+				// to reuse the retransmit/route plumbing; each handler below is safe
+				// to invoke off-order:
+				//   - Handshake: gated on `IsAwaitingClientFinished` + a record-prefix
+				//     check in `OptimisticallyDeliverHandshake` that rejects
+				//     ClientHello-shaped retransmits, so no duplicate bytes reach the
+				//     TLS state machine.
+				//   - IdentityProof: `receivePeerIdentityProof` short-circuits once
+				//     verified, failed, or already buffered — safe to re-deliver.
+				// The ReceiveSequence's later in-order delivery still runs and
+				// short-circuits in both handlers (just a re-unmarshal). Gated on
+				// `unwrapped` (EC packs are always ForceUnwrapped) to skip the
+				// wrapped app-data hot path.
+				if unwrapped && self.encryptionSessionManager != nil {
+					for _, frame := range pack.Frames {
+						if frame == nil || frame.MessageType != protocol.MessageType_TransferEncryptedControl {
+							continue
+						}
+						ec := &protocol.EncryptedControl{}
+						if err := ProtoUnmarshal(frame.MessageBytes, ec); err != nil {
+							continue
+						}
+						senderRole, ok := sequenceTlsRoleFromProtobuf(ec.SessionRole)
+						if !ok {
+							continue
+						}
+						// This stream maps to the complement local session —
+						// the one the EncryptedControl drives — keyed by the
+						// EC's echoed identity companion. The receive sequence
+						// holds it (keeping it alive through the handshake),
+						// matching where the EC routes below.
+						receiveRole = senderRole.complement()
+						receiveCompanion = ec.GetCompanion()
+						// Optimistically apply to the complement local session
+						// if it already exists; the ReceiveSequence's in-order
+						// delivery getOrCreates it otherwise.
+						session := self.encryptionSessionManager.Lookup(path.SourceId, senderRole.complement(), ec.GetCompanion())
+						if session == nil {
+							continue
+						}
+						switch ec.ControlType {
+						case protocol.EncryptedControlType_EncryptedControlHandshake:
+							if session.IsAwaitingClientFinished() {
+								session.OptimisticallyDeliverHandshake(ec.Payload)
+							}
+						case protocol.EncryptedControlType_EncryptedControlIdentityProof:
+							// Optimistic path must not create epoch state from a
+							// stale/reordered/retransmitted proof; only deliver
+							// against an epoch that already exists. The in-order
+							// path (DeliverEncryptedControl) still handles a proof
+							// that races ahead of the local handshake by creating
+							// the epoch to buffer it.
+							if session.currentEpoch() != nil {
+								session.receivePeerIdentityProof(ec.Payload)
+							}
+						}
+					}
+				}
 				messageByteCount := MessageByteCount(pack.Frames)
 				c := func() bool {
 					success, err := self.receiveBuffer.Pack(&ReceivePack{
-						Source:             source,
-						SequenceId:         sequenceId,
-						Pack:               pack,
-						ReceiveCallback:    self.receive,
-						MessageByteCount:   messageByteCount,
-						TransferFrameBytes: transferFrameBytes,
+						Source:              source,
+						SequenceId:          sequenceId,
+						Pack:                pack,
+						ReceiveCallback:     self.receive,
+						MessageByteCount:    messageByteCount,
+						TransferFrameBytes:  transferFrameBytes,
+						Unwrapped:           unwrapped,
+						EncryptionRole:      receiveRole,
+						EncryptionCompanion: receiveCompanion,
 					}, self.settings.BufferTimeout)
+					if !success {
+						MessagePoolReturn(transferFrameBytes)
+					}
 					return success && err == nil
 				}
 				if glog.V(2) {
@@ -951,18 +1283,38 @@ func (self *Client) run() {
 }
 
 func (self *Client) ResendQueueSize(destination TransferPath, intermediaryIds MultiHopId, companionContract bool, forceStream bool) (int, ByteCount, Id) {
+	count, byteSize, sequenceId, _ := self.ResendQueueSizeAndMessageTypes(destination, intermediaryIds, companionContract, forceStream)
+	return count, byteSize, sequenceId
+}
+
+func (self *Client) ResendQueueSizeAndMessageTypes(
+	destination TransferPath,
+	intermediaryIds MultiHopId,
+	companionContract bool,
+	forceStream bool,
+) (
+	int,
+	ByteCount,
+	Id,
+	[]protocol.MessageType,
+) {
 	if self.sendBuffer == nil {
-		return 0, 0, Id{}
+		return 0, 0, Id{}, nil
 	} else {
-		return self.sendBuffer.ResendQueueSize(destination, intermediaryIds, companionContract, forceStream)
+		return self.sendBuffer.ResendQueueSizeAndMessageTypes(destination, intermediaryIds, companionContract, forceStream)
 	}
 }
 
 func (self *Client) ReceiveQueueSize(source TransferPath, sequenceId Id) (int, ByteCount) {
+	count, byteSize, _ := self.ReceiveQueueSizeAndMessageTypes(source, sequenceId)
+	return count, byteSize
+}
+
+func (self *Client) ReceiveQueueSizeAndMessageTypes(source TransferPath, sequenceId Id) (int, ByteCount, []protocol.MessageType) {
 	if self.receiveBuffer == nil {
-		return 0, 0
+		return 0, 0, nil
 	} else {
-		return self.receiveBuffer.ReceiveQueueSize(source, sequenceId)
+		return self.receiveBuffer.ReceiveQueueSizeAndMessageTypes(source, sequenceId)
 	}
 }
 
@@ -990,8 +1342,11 @@ func (self *Client) Close() {
 	self.sendBuffer.Close()
 	self.receiveBuffer.Close()
 	self.forwardBuffer.Close()
+	if self.encryptionSessionManager != nil {
+		self.encryptionSessionManager.Close()
+	}
 
-	self.contractManagerUnsub()
+	// self.contractManagerUnsub()
 	self.webRtcManagerUnsub()
 	self.streamManagerUnsub()
 }
@@ -1051,6 +1406,16 @@ type sendSequenceId struct {
 	IntermediaryIds   MultiHopId
 	CompanionContract bool
 	ForceStream       bool
+	// EncryptionRole separates the client-role send sequence (normal
+	// application data, which restarts the handshake) from the server-role
+	// send sequence (EncryptedControl carriers + server replies, which never
+	// restart). Zero value is client.
+	EncryptionRole sequenceTlsRole
+	// EncryptionCompanion is the per-peer session identity companion, distinct
+	// from `CompanionContract`: a server-role reply carrier echoes the
+	// initiator's bit while riding EncryptionControlUseCompanion, so it must key
+	// the sequence separately to keep each session's carrier distinct.
+	EncryptionCompanion bool
 }
 
 type SendBuffer struct {
@@ -1080,10 +1445,12 @@ func NewSendBuffer(ctx context.Context,
 
 func (self *SendBuffer) Pack(sendPack *SendPack, timeout time.Duration) (bool, error) {
 	sendSequenceId := sendSequenceId{
-		Destination:       sendPack.Destination,
-		IntermediaryIds:   sendPack.IntermediaryIds,
-		CompanionContract: sendPack.TransferOptions.CompanionContract,
-		ForceStream:       sendPack.TransferOptions.ForceStream,
+		Destination:         sendPack.Destination,
+		IntermediaryIds:     sendPack.IntermediaryIds,
+		CompanionContract:   sendPack.TransferOptions.CompanionContract,
+		ForceStream:         sendPack.TransferOptions.ForceStream,
+		EncryptionRole:      sendPack.EncryptionRole,
+		EncryptionCompanion: sendPack.EncryptionCompanion,
 	}
 
 	initSendSequence := func(skip *SendSequence) *SendSequence {
@@ -1107,6 +1474,8 @@ func (self *SendBuffer) Pack(sendPack *SendPack, timeout time.Duration) (bool, e
 			sendPack.IntermediaryIds,
 			sendPack.TransferOptions.CompanionContract,
 			sendPack.TransferOptions.ForceStream,
+			sendPack.EncryptionRole,
+			sendPack.EncryptionCompanion,
 			self.sendBufferSettings,
 		)
 		self.sendSequences[sendSequenceId] = sendSequence
@@ -1156,6 +1525,89 @@ func (self *SendBuffer) Pack(sendPack *SendPack, timeout time.Duration) (bool, e
 	return success, err
 }
 
+// SendEncryptedControl enqueues an `EncryptedControl` to `destination` as a
+// regular Pack Frame (`MessageType = TransferEncryptedControl`); routing,
+// retransmit, and in-order delivery reuse the sequence machinery, and the
+// destination's ReceiveSequence intercepts these frames into the per-peer
+// session.
+//
+// `ctx` gates whether the spawned goroutine may enqueue (it bails if done). The
+// pack uses the SendBuffer's ctx — the session ctx must not propagate into
+// `SendPack.Ctx`, since SendBuffer.Pack treats a canceled `SendPack.Ctx` as a
+// sequence problem and cancels the SendSequence.
+func (self *SendBuffer) SendEncryptedControl(ctx context.Context, peerId Id, role sequenceTlsRole, ec *protocol.EncryptedControl, encryptionCompanion bool, contractCompanion bool) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	default:
+	}
+	ecBytes, err := ProtoMarshal(ec)
+	if err != nil {
+		return false
+	}
+	frame := &protocol.Frame{
+		MessageType:  protocol.MessageType_TransferEncryptedControl,
+		MessageBytes: ecBytes,
+	}
+	// Mirror the client's default TransferOptions — especially
+	// `ForceStream` — so the SendSequence chosen by `SendBuffer.Pack`
+	// matches the one the application's `Client.Send` chooses for this
+	// destination.
+	//
+	// The carrier rides one send sequence per (peer, companion, role).
+	// `contractCompanion` (the session's carrierCompanion) is which contract it
+	// rides; `encryptionCompanion` (the session identity bit) keys the
+	// sequence/session. They differ only for a server reply, where the identity
+	// is the initiator's echoed bit but the contract is
+	// EncryptionControlUseCompanion. Symmetric config: both false.
+	opts := self.client.settings.DefaultTransferOpts
+	opts.Ack = true
+	opts.CompanionContract = contractCompanion
+	// V(2) diagnostic: in symmetric mode no encryption-control carrier should
+	// be a companion. Log the decision so a companion carrier (whose Stream-mode
+	// contract the platform rejects → handshake stalls) can be caught.
+	glog.V(2).Infof(
+		"[sb][enc-ctrl]%s peer=%s role=%v companion=%t contract-companion=%t\n",
+		self.client.ClientTag(), peerId, role, encryptionCompanion, contractCompanion,
+	)
+	sendPack := &SendPack{
+		TransferOptions:  opts,
+		Frame:            frame,
+		Destination:      DestinationId(peerId),
+		AckCallback:      func(error) {},
+		MessageByteCount: ByteCount(len(ecBytes)),
+		Ctx:              self.ctx,
+		// Pin to plaintext on every (re)send. These frames bootstrap the
+		// per-peer cipher; sending them wrapped would deadlock the
+		// handshake whenever the local cipher becomes available before
+		// the peer's side completes its half. See writeMaybeWrappedBytes.
+		ForceUnwrapped: true,
+		// Carry EncryptedControl on the send sequence of the originating
+		// session's role (client-session handshake bytes on the (peer,client)
+		// sequence, server-session bytes on the (peer,server) one). For the
+		// client role this is the same sequence the application data uses, so
+		// the ClientHello produced by that sequence's own restart rides it
+		// without spawning a second sequence (no recursion); the restart is a
+		// no-op while a handshake is already in flight. The EncryptedControl's
+		// `session_role` + `companion` tell the receiver which complement
+		// session to route each frame to.
+		EncryptionRole:      role,
+		EncryptionCompanion: encryptionCompanion,
+	}
+	for {
+		if success, _ := self.Pack(sendPack, self.client.settings.BufferTimeout); success {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-self.ctx.Done():
+			return false
+		default:
+		}
+	}
+}
+
 func (self *SendBuffer) Ack(destination TransferPath, ack *protocol.Ack, timeout time.Duration) bool {
 	sendSequences := func() []*SendSequence {
 		self.mutex.Lock()
@@ -1181,7 +1633,7 @@ func (self *SendBuffer) Ack(destination TransferPath, ack *protocol.Ack, timeout
 	return anySuccess
 }
 
-func (self *SendBuffer) ResendQueueSize(destination TransferPath, intermediaryIds MultiHopId, companionContract bool, forceStream bool) (int, ByteCount, Id) {
+func (self *SendBuffer) ResendQueueSizeAndMessageTypes(destination TransferPath, intermediaryIds MultiHopId, companionContract bool, forceStream bool) (int, ByteCount, Id, []protocol.MessageType) {
 	sendSequence := func() *SendSequence {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
@@ -1194,9 +1646,9 @@ func (self *SendBuffer) ResendQueueSize(destination TransferPath, intermediaryId
 	}
 
 	if seq := sendSequence(); seq != nil {
-		return seq.ResendQueueSize()
+		return seq.ResendQueueSizeAndMessageTypes()
 	}
-	return 0, 0, Id{}
+	return 0, 0, Id{}, nil
 }
 
 // called before a send sequence writes a transfer frame with a stream id,
@@ -1264,7 +1716,15 @@ type SendSequence struct {
 	intermediaryIds   MultiHopId
 	companionContract bool
 	forceStream       bool
-	sequenceId        Id
+	// encryptionRole is the per-peer session role this send sequence uses:
+	// client for normal application data (the default), server for
+	// EncryptedControl carriers and server-session replies.
+	encryptionRole sequenceTlsRole
+	// encryptionCompanion is the per-peer session identity companion this
+	// sequence uses (distinct from `companionContract`). Keys the acquired
+	// session and is stamped on every pack as the `session_companion` wire hint.
+	encryptionCompanion bool
+	sequenceId          Id
 
 	sendBufferSettings *SendBufferSettings
 
@@ -1292,6 +1752,12 @@ type SendSequence struct {
 	contractMultiRouteWriterDestination TransferPath
 
 	contractSeqIndex uint64
+
+	// session is the per-peer TLS session shared by every local SendSequence
+	// and ReceiveSequence to the same peer/stream. Acquired from the
+	// `EncryptionSessionManager` at construction; released when the sequence
+	// terminates. Nil when encryption is disabled on this client.
+	session *peerEncryptionSession
 }
 
 func NewSendSequence(
@@ -1302,6 +1768,8 @@ func NewSendSequence(
 	intermediaryIds MultiHopId,
 	companionContract bool,
 	forceStream bool,
+	encryptionRole sequenceTlsRole,
+	encryptionCompanion bool,
 	sendBufferSettings *SendBufferSettings) *SendSequence {
 	cancelCtx, cancel := context.WithCancel(ctx)
 
@@ -1313,34 +1781,65 @@ func NewSendSequence(
 		sendBufferSettings.MaxResendInterval,
 	)
 
-	return &SendSequence{
-		ctx:                cancelCtx,
-		cancel:             cancel,
-		client:             client,
-		sendBuffer:         sendBuffer,
-		destination:        destination,
-		intermediaryIds:    intermediaryIds,
-		companionContract:  companionContract,
-		forceStream:        forceStream,
-		sequenceId:         NewId(),
-		sendBufferSettings: sendBufferSettings,
-		sendContract:       nil,
-		sendContractAcked:  false,
-		openSendContracts:  map[Id]*sequenceContract{},
-		packs:              make(chan *SendPack, sendBufferSettings.SequenceBufferSize),
-		acks:               make(chan *protocol.Ack, sendBufferSettings.AckBufferSize),
-		resendQueue:        newResendQueue(),
-		sendItems:          []*sendItem{},
-		nextSequenceNumber: 0,
-		idleCondition:      NewIdleCondition(),
-		rttWindow:          rttWindow,
-		contractSeqIndex:   0,
+	seq := &SendSequence{
+		ctx:                 cancelCtx,
+		cancel:              cancel,
+		client:              client,
+		sendBuffer:          sendBuffer,
+		destination:         destination,
+		intermediaryIds:     intermediaryIds,
+		companionContract:   companionContract,
+		forceStream:         forceStream,
+		encryptionRole:      encryptionRole,
+		encryptionCompanion: encryptionCompanion,
+		sequenceId:          NewId(),
+		sendBufferSettings:  sendBufferSettings,
+		sendContract:        nil,
+		sendContractAcked:   false,
+		openSendContracts:   map[Id]*sequenceContract{},
+		packs:               make(chan *SendPack, sendBufferSettings.SequenceBufferSize),
+		acks:                make(chan *protocol.Ack, sendBufferSettings.AckBufferSize),
+		resendQueue:         newResendQueue(),
+		sendItems:           []*sendItem{},
+		nextSequenceNumber:  0,
+		idleCondition:       NewIdleCondition(),
+		rttWindow:           rttWindow,
+		contractSeqIndex:    0,
 	}
+	// Never encrypt control-plane traffic. A SendSequence's data source is
+	// always this client (sourceId == client.ClientId()) and its destination
+	// is destination.DestinationId; when `SendNoSession` holds for either
+	// endpoint, no session is acquired and traffic flows in plaintext.
+	if client != nil && client.encryptionSessionManager != nil &&
+		!client.encryptionSessionManager.SendNoSession(destination.DestinationId) {
+		// Acquire the (peer, encryptionRole) session. A client-role send
+		// sequence restarts the handshake (recovery: every new client send
+		// re-initiates, rebuilding a peer's lost responder session); a
+		// server-role send sequence (EncryptedControl carrier / server
+		// reply) never restarts.
+		seq.session = client.encryptionSessionManager.AcquireForSend(destination.DestinationId, encryptionRole, encryptionCompanion)
+	}
+	return seq
 }
 
-func (self *SendSequence) ResendQueueSize() (int, ByteCount, Id) {
-	count, byteSize := self.resendQueue.QueueSize()
-	return count, byteSize, self.sequenceId
+func (self *SendSequence) ResendQueueSizeAndMessageTypes() (int, ByteCount, Id, []protocol.MessageType) {
+	unpackMessageTypes := func(item *sendItem) any {
+		var messageTypes []protocol.MessageType
+		var transferFrame protocol.TransferFrame
+		err := proto.Unmarshal(item.transferFrameBytes, &transferFrame)
+		if err == nil && transferFrame.Pack != nil {
+			for _, frame := range transferFrame.Pack.Frames {
+				messageTypes = append(messageTypes, frame.MessageType)
+			}
+		}
+		return messageTypes
+	}
+	count, byteSize, summary := self.resendQueue.QueueSizeAndSummary(unpackMessageTypes)
+	var messageTypes []protocol.MessageType
+	for _, summaryMessageTypes := range summary {
+		messageTypes = append(messageTypes, summaryMessageTypes.([]protocol.MessageType)...)
+	}
+	return count, byteSize, self.sequenceId, messageTypes
 }
 
 // success, error
@@ -1475,17 +1974,29 @@ func (self *SendSequence) Run() {
 			item.messagePoolReturn()
 		}
 
-		// flush queued up contracts
-		// remove used contract ids because all used contracts were closed above
+		// flush queued contracts (used ids were closed above). Keyed by
+		// (EncryptionRole, EncryptionCompanion) so this exit-flush doesn't discard
+		// a peer-paired sequence's pending contracts — the EC carrier and normal
+		// data are separate sequences to the same destination.
 		contractKey := ContractKey{
-			Destination:       self.destination,
-			IntermediaryIds:   self.intermediaryIds,
-			CompanionContract: self.companionContract,
-			ForceStream:       self.forceStream,
+			Destination:         self.destination,
+			IntermediaryIds:     self.intermediaryIds,
+			CompanionContract:   self.companionContract,
+			ForceStream:         self.forceStream,
+			EncryptionRole:      self.encryptionRole,
+			EncryptionCompanion: self.encryptionCompanion,
 		}
 		self.client.ContractManager().FlushContractQueue(contractKey, true)
 
 		self.closeContractMultiRouteWriter()
+
+		if self.session != nil {
+			// No explicit close: a closing SendSequence must not tear down
+			// the shared session (a concurrent ReceiveSequence may still be
+			// using it) and must not emit anything on the wire. A future
+			// initiator SendSequence resets the handshake when it resumes.
+			self.session.Release()
+		}
 	}()
 
 	ackWindow := newSequenceAckWindow()
@@ -1583,15 +2094,12 @@ func (self *SendSequence) Run() {
 					transferFrameBytes = item.transferFrameBytes
 				}
 
+				// resend uses the same path the item was originally sent on
+				resendPath := self.destination.AddSource(self.client.ClientId())
+				resendBytes := transferFrameBytes
+				resendForceUnwrapped := item.forceUnwrapped
 				c := func() error {
-					if DebugTransferCopyOnWrite {
-						transferFrameBytes = MessagePoolCopy(transferFrameBytes)
-					}
-					return self.openContractMultiRouteWriter().Write(
-						self.ctx,
-						MessagePoolShareReadOnly(transferFrameBytes),
-						self.sendBufferSettings.WriteTimeout,
-					)
+					return self.writeMaybeWrappedBytes(resendBytes, resendPath, resendForceUnwrapped)
 				}
 				if glog.V(2) {
 					TraceWithReturn(
@@ -1654,7 +2162,7 @@ func (self *SendSequence) Run() {
 					}()
 					if done {
 						// close the sequence
-						glog.V(2).Infof("[s]%s->%s...%s s(%s) exit idle timeout\n", self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId)
+						glog.Errorf("[s]%s->%s...%s s(%s) exit idle timeout\n", self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId)
 						return
 					}
 				}
@@ -1671,7 +2179,7 @@ func (self *SendSequence) Run() {
 
 				// note messages of `size < MinMessageByteCount` get counted as `MinMessageByteCount` against the contract
 				if self.updateContract(sendPack.MessageByteCount) {
-					self.send(sendPack.Frame, sendPack.AckCallback, sendPack.Ack)
+					self.send(sendPack.Frame, sendPack.AckCallback, sendPack.Ack, sendPack.ForceUnwrapped)
 					// ignore the error since there will be a retry
 				} else {
 					// no contract
@@ -1695,7 +2203,7 @@ func (self *SendSequence) Run() {
 					}()
 					if done {
 						// close the sequence
-						glog.V(2).Infof("[s]%s->%s...%s s(%s) exit idle timeout\n", self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId)
+						glog.Errorf("[s]%s->%s...%s s(%s) exit idle timeout\n", self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId)
 						return
 					}
 				}
@@ -1751,7 +2259,10 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 				// append the contract to the sequence
 				self.sendWithSetContract(nil, func(error) {
 					self.setContractAcked(nextSendContract, true)
-				}, true, true)
+				}, true, true, false)
+
+				// FIXME
+				glog.Infof("[s]%s->%s...%s s(%s) contract set %s\n", self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId, nextSendContract.contractId)
 
 				return true
 
@@ -1767,10 +2278,12 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 
 		nextContract := func(timeout time.Duration) bool {
 			contractKey := ContractKey{
-				Destination:       self.destination,
-				IntermediaryIds:   self.intermediaryIds,
-				CompanionContract: self.companionContract,
-				ForceStream:       self.forceStream,
+				Destination:         self.destination,
+				IntermediaryIds:     self.intermediaryIds,
+				CompanionContract:   self.companionContract,
+				ForceStream:         self.forceStream,
+				EncryptionRole:      self.encryptionRole,
+				EncryptionCompanion: self.encryptionCompanion,
 			}
 			if contract := self.client.ContractManager().TakeContract(self.ctx, contractKey, timeout); contract != nil && setNextContract(contract) {
 				self.contractSeqIndex += 1
@@ -1821,10 +2334,12 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 
 			// async queue up the next contract
 			contractKey := ContractKey{
-				Destination:       self.destination,
-				IntermediaryIds:   self.intermediaryIds,
-				CompanionContract: self.companionContract,
-				ForceStream:       self.forceStream,
+				Destination:         self.destination,
+				IntermediaryIds:     self.intermediaryIds,
+				CompanionContract:   self.companionContract,
+				ForceStream:         self.forceStream,
+				EncryptionRole:      self.encryptionRole,
+				EncryptionCompanion: self.encryptionCompanion,
 			}
 			self.client.ContractManager().CreateContract(
 				contractKey,
@@ -1862,6 +2377,30 @@ func (self *SendSequence) setContract(nextSendContract *sequenceContract) {
 	self.openSendContracts[nextSendContract.contractId] = nextSendContract
 	self.sendContract = nextSendContract
 	self.sendContractAcked = false
+	// The contract carries the destination's `ProvideTlsCertificate`
+	// commitment (possibly empty). Fold the chain into the session's
+	// trusted-peer-cert set so the peer's TLS-handshake cert can be matched
+	// against any cert version the destination has ever published — both
+	// the cert in this contract and any cert in a previously seen contract.
+	// An empty chain turns off verification entirely (the destination is
+	// not committing to a TLS identity).
+	//
+	// In addition, contracts carry the destination's long-lived client
+	// public identity key plus the destination's signature over the cert
+	// chain by that key. Pass the public key to the session so it can
+	// (a) verify the cert chain before trusting it (defeats a platform
+	// MITM that substitutes the cert), and (b) verify the post-handshake
+	// identity proof exchanged inside the per-peer TLS session (defeats
+	// an active MITM that re-handshakes TLS on each leg).
+	if self.session != nil {
+		if 0 < len(nextSendContract.destinationClientPublicKey) {
+			self.session.SetPeerClientPublicKey(ed25519.PublicKey(nextSendContract.destinationClientPublicKey))
+		}
+		self.session.AddTrustedPeerCertChain(
+			nextSendContract.provideTlsCertificate,
+			nextSendContract.destinationClientKeySignedTlsCertificate,
+		)
+	}
 }
 
 func (self *SendSequence) setContractAcked(nextSendContract *sequenceContract, ack bool) {
@@ -1874,8 +2413,9 @@ func (self *SendSequence) send(
 	frame *protocol.Frame,
 	ackCallback AckFunction,
 	ack bool,
+	forceUnwrapped bool,
 ) {
-	self.sendWithSetContract(frame, ackCallback, ack, false)
+	self.sendWithSetContract(frame, ackCallback, ack, false, forceUnwrapped)
 }
 
 func (self *SendSequence) sendWithSetContract(
@@ -1883,6 +2423,7 @@ func (self *SendSequence) sendWithSetContract(
 	ackCallback AckFunction,
 	ack bool,
 	setContract bool,
+	forceUnwrapped bool,
 ) {
 	sendTime := time.Now()
 	messageId := NewId()
@@ -1954,6 +2495,25 @@ func (self *SendSequence) sendWithSetContract(
 	transferFrame := &protocol.TransferFrame{
 		TransferPath: path.ToProtobuf(),
 	}
+	// A server-role sequence is the peer's EncryptedControl carrier. Stamp its
+	// role on every pack — including the non-EC open/contract packs that carry no
+	// EC frame to derive it from — so the receiver maps the whole sequence to one
+	// complement session; otherwise the open pack splits into a separate receive
+	// sequence and the handshake bytes (ServerHello, identity proof) gap forever.
+	// Only the server role is marked: a client-role stream is the unencrypted
+	// default, already the receiver's complement, so it stays off the wire.
+	if self.encryptionRole == sequenceTlsRoleServer {
+		sessionRole := self.encryptionRole.toProtobuf()
+		transferFrame.SessionRole = &sessionRole
+	}
+	// Stamp the companion on every pack (mirroring the role stamp, but for
+	// either role) so the receiver maps the whole sequence — EC carriers and
+	// non-EC open/contract packs — to the matching companion session. Only when
+	// true; false is the receiver's default and stays off the wire.
+	if self.encryptionCompanion {
+		sessionCompanion := true
+		transferFrame.SessionCompanion = &sessionCompanion
+	}
 
 	if 2 <= self.sendBufferSettings.ProtocolVersion {
 		messageType := protocol.MessageType_TransferPack
@@ -1986,18 +2546,11 @@ func (self *SendSequence) sendWithSetContract(
 		hasContractFrame:   (contractFrame != nil),
 		transferFrameBytes: transferFrameBytes,
 		ackCallback:        ackCallback,
+		forceUnwrapped:     forceUnwrapped,
 	}
 
 	c := func() error {
-		transferFrameBytes := item.transferFrameBytes
-		if DebugTransferCopyOnWrite {
-			transferFrameBytes = MessagePoolCopy(transferFrameBytes)
-		}
-		return self.openContractMultiRouteWriter().Write(
-			self.ctx,
-			MessagePoolShareReadOnly(transferFrameBytes),
-			self.sendBufferSettings.WriteTimeout,
-		)
+		return self.writeMaybeWrappedBytes(item.transferFrameBytes, path, item.forceUnwrapped)
 	}
 	var err error
 	if glog.V(2) {
@@ -2199,6 +2752,144 @@ func (self *SendSequence) ackItem(item *sendItem) {
 	item.messagePoolReturn()
 }
 
+// writeMaybeWrappedBytes writes `transferFrameBytes` through the contract
+// multi-route writer. When the per-peer session has a cipher, the bytes are
+// outer-wrapped as `TransferFrame{TransferPath, encryptedTransferFrame:
+// <ciphertext>}` before being written. Encryption is a binary property of
+// the session: cipher set → wrap; cipher nil → pass-through. `path` is the
+// wire TransferPath the outer wrap reproduces so forwarders see the same
+// routing path either way.
+//
+// `forceUnwrapped` pins this frame to plaintext regardless of cipher
+// state. TLS handshake EncryptedControl frames use this to keep the
+// handshake bootstrap legible to the peer — including on retransmit,
+// where the local cipher may have become available after the original
+// send but the peer has not yet completed its half of the handshake.
+//
+// Before wrapping, the peer's TLS certificate is verified against the
+// active contract's `ProvideTlsCertificate` commitment. A mismatch is a
+// loud error: the frame is dropped (the SendSequence will retry, and
+// eventually time out, rather than transmit application data sealed under
+// the wrong identity).
+func (self *SendSequence) writeMaybeWrappedBytes(transferFrameBytes []byte, path TransferPath, forceUnwrapped bool) error {
+	writer := self.openContractMultiRouteWriter()
+	var cipher *sequenceCipher
+	if self.session != nil && !forceUnwrapped {
+		cipher = self.session.Cipher()
+	}
+	if cipher == nil {
+		glog.V(2).Infof(
+			"[s]%s->%s s(%s) write plaintext %d bytes (forceUnwrapped=%t, session=%t, cipher=nil)\n",
+			self.client.ClientTag(),
+			self.destination.DestinationId,
+			self.destination.StreamId,
+			len(transferFrameBytes),
+			forceUnwrapped,
+			self.session != nil,
+		)
+		bytes := transferFrameBytes
+		if DebugTransferCopyOnWrite {
+			bytes = MessagePoolCopy(transferFrameBytes)
+		}
+		return writer.Write(self.ctx, MessagePoolShareReadOnly(bytes), self.sendBufferSettings.WriteTimeout)
+	}
+	if err := self.verifyPeerCertAgainstContract(); err != nil {
+		return err
+	}
+	ciphertext, err := cipher.Seal(transferFrameBytes)
+	if err != nil {
+		return fmt.Errorf("outer wrap seal: %w", err)
+	}
+	// Carry the wrapping session's role + companion as the destination's
+	// decrypt hint; the destination routes to its complement role / matching
+	// companion session.
+	wrapped, err := buildEncryptedOuterFrameBytes(path, ciphertext, self.session.role.toProtobuf(), self.session.companion)
+	if err != nil {
+		return fmt.Errorf("outer wrap marshal: %w", err)
+	}
+	glog.V(2).Infof(
+		"[s]%s->%s s(%s) write wrapped %d -> %d bytes\n",
+		self.client.ClientTag(),
+		self.destination.DestinationId,
+		self.destination.StreamId,
+		len(transferFrameBytes), len(wrapped),
+	)
+	defer MessagePoolReturn(wrapped)
+	return writer.Write(self.ctx, MessagePoolShareReadOnly(wrapped), self.sendBufferSettings.WriteTimeout)
+}
+
+// verifyPeerCertAgainstContract checks (and caches) that the peer's TLS cert
+// matches a chain the destination committed to in some contract this session
+// has seen. The trusted set is maintained by `AddTrustedPeerCertChain` (from
+// `setContract`); every cert the peer has published is acceptable, so rotation
+// is tolerated without breaking in-flight sessions. Skipped when:
+//
+//   - this is a companion-mode reply: the companion sender re-uses the session
+//     cipher established by the original direction's handshake.
+//   - the trusted set is empty (no contract seen, or all carried an empty
+//     `ProvideTlsCertificate`): skip without latching, so a later contract with
+//     a cert re-arms verification.
+//
+// Once matched, the result is cached and not re-run for this session.
+func (self *SendSequence) verifyPeerCertAgainstContract() error {
+	if self.session == nil {
+		return nil
+	}
+	if self.companionContract {
+		glog.V(1).Infof(
+			"[s]%s->%s s(%s) companion reply: reusing per-peer session cipher; skipping cert verification\n",
+			self.client.ClientTag(),
+			self.destination.DestinationId,
+			self.destination.StreamId,
+		)
+		return nil
+	}
+	verified, noCommitment := self.session.CertVerificationState()
+	if verified || noCommitment {
+		return nil
+	}
+	expected := self.session.trustedPeerCertSnapshot()
+	// V(2) diagnostic: verify against the established epoch (whose cipher seals
+	// this frame), not the in-flight currentEpoch() whose ConnectionState() blocks
+	// on the running handshake. Logged so reaching this path (trusted set armed) is
+	// observable.
+	glog.V(2).Infof(
+		"[s][cert-verify]%s->%s s(%s) verifying established-epoch peer certs (non-blocking); trustedSet=%d companion=%t\n",
+		self.client.ClientTag(),
+		self.destination.DestinationId,
+		self.destination.StreamId,
+		len(expected),
+		self.companionContract,
+	)
+	peerCerts := self.session.establishedPeerCertificates()
+	ok, err := verifyPeerCertificateAgainstContract(peerCerts, expected)
+	if err != nil {
+		glog.Errorf(
+			"[s]%s->%s s(%s) sequence TLS cert verification failed: %s (peer presented %d cert(s); trusted set has %d)\n",
+			self.client.ClientTag(),
+			self.destination.DestinationId,
+			self.destination.StreamId,
+			err,
+			len(peerCerts),
+			len(expected),
+		)
+		return fmt.Errorf("sequence TLS cert verification failed: %w", err)
+	}
+	if !ok {
+		glog.Errorf(
+			"[s]%s->%s s(%s) sequence TLS cert mismatch (peer presented %d cert(s); trusted set has %d)\n",
+			self.client.ClientTag(),
+			self.destination.DestinationId,
+			self.destination.StreamId,
+			len(peerCerts),
+			len(expected),
+		)
+		return errors.New("sequence TLS cert verification failed")
+	}
+	self.session.MarkCertVerified()
+	return nil
+}
+
 func (self *SendSequence) openContractMultiRouteWriter() MultiRouteWriter {
 	var destination TransferPath
 	if self.sendContract == nil {
@@ -2274,6 +2965,10 @@ type sendItem struct {
 	sendCount          int
 	transferFrameBytes []byte
 	ackCallback        AckFunction
+	// forceUnwrapped pins this item to plaintext on every (re)send, so the
+	// outer wrap is skipped even if the per-peer cipher becomes available
+	// between the initial send and a retransmit.
+	forceUnwrapped bool
 
 	// messageType protocol.MessageType
 }
@@ -2332,6 +3027,27 @@ type ReceiveBufferSettings struct {
 type receiveSequenceId struct {
 	Source     TransferPath
 	SequenceId Id
+	// EncryptionRole separates the inbound streams that map to our server
+	// session (normal peer data — the default) from those that map to our
+	// client session (the peer's EncryptedControl carrier + server replies).
+	// SequenceId alone is already unique; the role makes the owning session
+	// explicit and keys the per-role head tracking.
+	EncryptionRole sequenceTlsRole
+	// EncryptionCompanion separates the inbound streams owned by the companion
+	// session from those owned by the regular session of the same role, so a
+	// peer running both modes maps each stream to the right per-peer session.
+	EncryptionCompanion bool
+}
+
+// receiveSequenceHeadKey identifies the head (newest) receive sequence for a
+// given (source, companion, role). Supersession — drop-older / upgrade-newer
+// by SequenceId — happens within a single (source, companion, role): the
+// peer's client and server streams, and its companion and regular streams,
+// reform independently, so they must not supersede each other.
+type receiveSequenceHeadKey struct {
+	Source              TransferPath
+	EncryptionRole      sequenceTlsRole
+	EncryptionCompanion bool
 }
 
 type ReceiveBuffer struct {
@@ -2344,7 +3060,7 @@ type ReceiveBuffer struct {
 	// the head receive sequences
 	// source id -> receive sequence
 	receiveSequences       map[receiveSequenceId]*ReceiveSequence
-	headReceiveSequenceIds map[TransferPath]receiveSequenceId
+	headReceiveSequenceIds map[receiveSequenceHeadKey]receiveSequenceId
 }
 
 func NewReceiveBuffer(ctx context.Context,
@@ -2355,14 +3071,24 @@ func NewReceiveBuffer(ctx context.Context,
 		client:                 client,
 		receiveBufferSettings:  receiveBufferSettings,
 		receiveSequences:       map[receiveSequenceId]*ReceiveSequence{},
-		headReceiveSequenceIds: map[TransferPath]receiveSequenceId{},
+		headReceiveSequenceIds: map[receiveSequenceHeadKey]receiveSequenceId{},
 	}
 }
 
 func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration) (bool, error) {
 	receiveSequenceId := receiveSequenceId{
-		Source:     receivePack.Source,
-		SequenceId: receivePack.SequenceId,
+		Source:              receivePack.Source,
+		SequenceId:          receivePack.SequenceId,
+		EncryptionRole:      receivePack.EncryptionRole,
+		EncryptionCompanion: receivePack.EncryptionCompanion,
+	}
+	// Head/supersession is tracked per (source, companion, role): the peer's
+	// client and server streams, and its companion and regular streams, reform
+	// independently and must not supersede each other.
+	headKey := receiveSequenceHeadKey{
+		Source:              receiveSequenceId.Source,
+		EncryptionRole:      receiveSequenceId.EncryptionRole,
+		EncryptionCompanion: receiveSequenceId.EncryptionCompanion,
 	}
 
 	initReceiveSequence := func(skip *ReceiveSequence) *ReceiveSequence {
@@ -2376,17 +3102,18 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 			} else {
 				receiveSequence.Cancel()
 				// delete(self.receiveSequences, receiveSequenceId)
-				// delete(self.headSequenceIds, receiveSequenceId.Source)
+				// delete(self.headSequenceIds, headKey)
 			}
-			if headReceiveSequenceId := self.headReceiveSequenceIds[receivePack.Source]; headReceiveSequenceId != receiveSequenceId {
+			if headReceiveSequenceId := self.headReceiveSequenceIds[headKey]; headReceiveSequenceId != receiveSequenceId {
 				panic(fmt.Errorf("[r]incorrect head sequence %s != %s\n", headReceiveSequenceId.SequenceId, receivePack.SequenceId))
 			}
-		} else if headReceiveSequenceId, ok := self.headReceiveSequenceIds[receivePack.Source]; ok {
+		} else if headReceiveSequenceId, ok := self.headReceiveSequenceIds[headKey]; ok {
 			if receivePack.SequenceId.LessThan(headReceiveSequenceId.SequenceId) {
 				// drop older sequences for source
 				// this case happens when a client closes a sequence, then opens a new one,
 				// before messages from the first are received
 				glog.V(2).Infof("[r]drop older sequence %s < %s\n", receivePack.SequenceId, headReceiveSequenceId.SequenceId)
+				MessagePoolReturn(receivePack.TransferFrameBytes)
 				return nil
 			} else {
 				// newer sequence for source
@@ -2409,10 +3136,12 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 			self.client,
 			receivePack.Source,
 			receivePack.SequenceId,
+			receivePack.EncryptionRole,
+			receivePack.EncryptionCompanion,
 			self.receiveBufferSettings,
 		)
 		self.receiveSequences[receiveSequenceId] = receiveSequence
-		self.headReceiveSequenceIds[receivePack.Source] = receiveSequenceId
+		self.headReceiveSequenceIds[headKey] = receiveSequenceId
 		go HandleError(func() {
 			defer func() {
 				self.mutex.Lock()
@@ -2421,8 +3150,8 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 				// clean up
 				if receiveSequence == self.receiveSequences[receiveSequenceId] {
 					delete(self.receiveSequences, receiveSequenceId)
-					// use `receiveSequenceId.Source` instead of `receivePack.Source` to release pointer to receivePack
-					delete(self.headReceiveSequenceIds, receiveSequenceId.Source)
+					// `headKey`/`receiveSequenceId` are values (no pointer to receivePack)
+					delete(self.headReceiveSequenceIds, headKey)
 				}
 			}()
 			receiveSequence.Run()
@@ -2452,18 +3181,27 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 	return success, err
 }
 
-func (self *ReceiveBuffer) ReceiveQueueSize(source TransferPath, sequenceId Id) (int, ByteCount) {
+func (self *ReceiveBuffer) ReceiveQueueSizeAndMessageTypes(source TransferPath, sequenceId Id) (int, ByteCount, []protocol.MessageType) {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 
-	receiveSequenceId := receiveSequenceId{
-		Source:     source,
-		SequenceId: sequenceId,
+	// SequenceId already uniquely identifies the sequence; the caller does not
+	// know the encryption role or companion, so check every per-(role,companion)
+	// key.
+	for _, role := range []sequenceTlsRole{sequenceTlsRoleClient, sequenceTlsRoleServer} {
+		for _, companion := range []bool{false, true} {
+			receiveSequenceId := receiveSequenceId{
+				Source:              source,
+				SequenceId:          sequenceId,
+				EncryptionRole:      role,
+				EncryptionCompanion: companion,
+			}
+			if receiveSequence, ok := self.receiveSequences[receiveSequenceId]; ok {
+				return receiveSequence.ReceiveQueueSizeAndMessageTypes()
+			}
+		}
 	}
-	if receiveSequence, ok := self.receiveSequences[receiveSequenceId]; ok {
-		return receiveSequence.ReceiveQueueSize()
-	}
-	return 0, 0
+	return 0, 0, nil
 }
 
 func (self *ReceiveBuffer) Close() {
@@ -2507,6 +3245,15 @@ type ReceiveSequence struct {
 
 	source     TransferPath
 	sequenceId Id
+	// encryptionRole is the local per-peer session role that owns this
+	// inbound stream (complement of the sender's role): server for normal
+	// peer data (the default), client for the peer's EncryptedControl
+	// carrier + server replies.
+	encryptionRole sequenceTlsRole
+	// encryptionCompanion is the per-peer session identity companion that owns
+	// this inbound stream (not complemented); with encryptionRole it selects
+	// which session the sequence holds.
+	encryptionCompanion bool
 
 	receiveBufferSettings *ReceiveBufferSettings
 
@@ -2526,6 +3273,15 @@ type ReceiveSequence struct {
 	ackWindow *sequenceAckWindow
 
 	exit chan struct{}
+
+	// session is the per-peer TLS session that decrypts this inbound stream,
+	// of role `encryptionRole` (the complement of the sender's role).
+	// Acquired from the `EncryptionSessionManager` at construction without
+	// starting a handshake — a ReceiveSequence follows the peer's handshake,
+	// it never initiates one. Holding it keeps the session (and its cipher)
+	// alive for the stream's lifetime; released when the sequence terminates.
+	// Nil when encryption is disabled or this is control-plane traffic.
+	session *peerEncryptionSession
 }
 
 func NewReceiveSequence(
@@ -2533,14 +3289,18 @@ func NewReceiveSequence(
 	client *Client,
 	source TransferPath,
 	sequenceId Id,
+	encryptionRole sequenceTlsRole,
+	encryptionCompanion bool,
 	receiveBufferSettings *ReceiveBufferSettings) *ReceiveSequence {
 	cancelCtx, cancel := context.WithCancel(ctx)
-	return &ReceiveSequence{
+	seq := &ReceiveSequence{
 		ctx:                   cancelCtx,
 		cancel:                cancel,
 		client:                client,
 		source:                source,
 		sequenceId:            sequenceId,
+		encryptionRole:        encryptionRole,
+		encryptionCompanion:   encryptionCompanion,
 		receiveBufferSettings: receiveBufferSettings,
 		openReceiveContracts:  map[Id]*sequenceContract{},
 		receiveContract:       nil,
@@ -2551,10 +3311,35 @@ func NewReceiveSequence(
 		ackWindow:             newSequenceAckWindow(),
 		exit:                  make(chan struct{}),
 	}
+	// Never encrypt control-plane traffic. A ReceiveSequence's data source is
+	// the peer (source.SourceId) and its destination is always this client
+	// (client.ClientId()); when `ReceiveNoSession` holds for either endpoint,
+	// no session is acquired and inbound traffic is taken in plaintext.
+	if client != nil && client.encryptionSessionManager != nil &&
+		!client.encryptionSessionManager.ReceiveNoSession(source.SourceId) {
+		seq.session = client.encryptionSessionManager.Acquire(source.SourceId, encryptionRole, encryptionCompanion)
+	}
+	return seq
 }
 
-func (self *ReceiveSequence) ReceiveQueueSize() (int, ByteCount) {
-	return self.receiveQueue.QueueSize()
+func (self *ReceiveSequence) ReceiveQueueSizeAndMessageTypes() (int, ByteCount, []protocol.MessageType) {
+	unpackMessageTypes := func(item *receiveItem) any {
+		var messageTypes []protocol.MessageType
+		var transferFrame protocol.TransferFrame
+		err := proto.Unmarshal(item.transferFrameBytes, &transferFrame)
+		if err == nil && transferFrame.Pack != nil {
+			for _, frame := range transferFrame.Pack.Frames {
+				messageTypes = append(messageTypes, frame.MessageType)
+			}
+		}
+		return messageTypes
+	}
+	count, byteSize, summary := self.receiveQueue.QueueSizeAndSummary(unpackMessageTypes)
+	var messageTypes []protocol.MessageType
+	for _, summaryMessageTypes := range summary {
+		messageTypes = append(messageTypes, summaryMessageTypes.([]protocol.MessageType)...)
+	}
+	return count, byteSize, messageTypes
 }
 
 // success, error
@@ -2648,6 +3433,10 @@ func (self *ReceiveSequence) Run() {
 
 		self.peerAudit.Complete()
 
+		if self.session != nil {
+			self.session.Release()
+		}
+
 		close(self.exit)
 	}()
 
@@ -2694,12 +3483,41 @@ func (self *ReceiveSequence) Run() {
 			transferFrameBytes, _ := ProtoMarshal(transferFrame)
 			defer MessagePoolReturn(transferFrameBytes)
 			c := func() error {
-				err := multiRouteWriter.Write(
+				// outer-wrap the ack TransferFrame with the per-peer
+				// session cipher when available. Mirror the wrap state
+				// of the acked pack: if any pack covered by this ack
+				// arrived plaintext, send the ack plaintext too — the
+				// sender's cipher may not yet be established (it sent
+				// plaintext because it had no cipher at send time), so
+				// a wrapped ack would be unreadable on arrival.
+				var cipher *sequenceCipher
+				if self.session != nil && !sendAck.unwrapped {
+					cipher = self.session.Cipher()
+				}
+				if cipher == nil {
+					return multiRouteWriter.Write(
+						self.ctx,
+						MessagePoolShareReadOnly(transferFrameBytes),
+						self.receiveBufferSettings.WriteTimeout,
+					)
+				}
+				ciphertext, sealErr := cipher.Seal(transferFrameBytes)
+				if sealErr != nil {
+					return fmt.Errorf("ack outer wrap seal: %w", sealErr)
+				}
+				// Carry our receive session's role + companion as the peer's
+				// decrypt hint (it routes to the complement of our role / the
+				// matching companion on its side).
+				wrapped, marshalErr := buildEncryptedOuterFrameBytes(path, ciphertext, self.session.role.toProtobuf(), self.session.companion)
+				if marshalErr != nil {
+					return fmt.Errorf("ack outer wrap marshal: %w", marshalErr)
+				}
+				defer MessagePoolReturn(wrapped)
+				return multiRouteWriter.Write(
 					self.ctx,
-					MessagePoolShareReadOnly(transferFrameBytes),
+					MessagePoolShareReadOnly(wrapped),
 					self.receiveBufferSettings.WriteTimeout,
 				)
-				return err
 			}
 			if glog.V(2) {
 				TraceWithReturn(
@@ -2755,6 +3573,7 @@ func (self *ReceiveSequence) Run() {
 					sequenceNumber: ack.sequenceNumber,
 					selective:      true,
 					tag:            ack.tag,
+					unwrapped:      ack.unwrapped,
 				})
 			}
 		}
@@ -2809,7 +3628,7 @@ func (self *ReceiveSequence) Run() {
 				} else {
 					// this item is a resend of a previous item
 					if item.ack {
-						self.sendAck(item.sequenceNumber, item.messageId, false, nil)
+						self.sendAck(item.sequenceNumber, item.messageId, false, nil, item.unwrapped)
 					}
 				}
 			}
@@ -2887,12 +3706,13 @@ func (self *ReceiveSequence) Run() {
 	}
 }
 
-func (self *ReceiveSequence) sendAck(sequenceNumber uint64, messageId Id, selective bool, tag *protocol.Tag) {
+func (self *ReceiveSequence) sendAck(sequenceNumber uint64, messageId Id, selective bool, tag *protocol.Tag, unwrapped bool) {
 	ack := &sequenceAck{
 		sequenceNumber: sequenceNumber,
 		messageId:      messageId,
 		selective:      selective,
 		tag:            tag,
+		unwrapped:      unwrapped,
 	}
 	self.ackWindow.Update(ack)
 }
@@ -2927,6 +3747,7 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 		ack:                !receivePack.Pack.Nack,
 		tag:                receivePack.Pack.Tag,
 		transferFrameBytes: receivePack.TransferFrameBytes,
+		unwrapped:          receivePack.Unwrapped,
 	}
 
 	// this case happens when the receiver is reformed or loses state.
@@ -2977,7 +3798,7 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 			glog.V(1).Infof("[r]drop past sequence number %d <> %d ack=%t %s<-%s s(%s)\n", sequenceNumber, self.nextSequenceNumber, item.ack, self.client.ClientTag(), self.source.SourceId, self.source.StreamId)
 			// this item is a resend of a previous item
 			if item.ack {
-				self.sendAck(sequenceNumber, messageId, false, nil)
+				self.sendAck(sequenceNumber, messageId, false, nil, item.unwrapped)
 			}
 			return false, nil
 		}
@@ -3005,7 +3826,7 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 
 		if canQueue(receivePack.MessageByteCount) {
 			self.receiveQueue.Add(item)
-			self.sendAck(sequenceNumber, messageId, true, item.tag)
+			self.sendAck(sequenceNumber, messageId, true, item.tag, item.unwrapped)
 			return true, nil
 		} else {
 			glog.V(1).Infof("[r]drop ack cannot queue %s<-%s s(%s)\n", self.client.ClientTag(), self.source.SourceId, self.source.StreamId)
@@ -3106,15 +3927,59 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 		// no contract peers are considered in network
 		provideMode = protocol.ProvideMode_Network
 	}
-	item.receiveCallback(
-		self.source,
-		item.frames,
-		provideMode,
-	)
+	// EncryptedControl frames are routed into the per-peer session instead
+	// of bubbling up to the receive callback. They carry the TLS handshake
+	// bytes that bootstrap the per-peer cipher; the application shouldn't
+	// see them.
+	appFrames := item.frames
+	if self.session != nil {
+		appFrames = self.deliverEncryptedControlFrames(item.frames)
+	}
+	if 0 < len(appFrames) {
+		item.receiveCallback(
+			self.source,
+			appFrames,
+			provideMode,
+		)
+	}
 	if item.ack {
-		self.sendAck(item.sequenceNumber, item.messageId, false, item.tag)
+		self.sendAck(item.sequenceNumber, item.messageId, false, item.tag, item.unwrapped)
 	}
 	item.messagePoolReturn()
+}
+
+// deliverEncryptedControlFrames splits an incoming Pack's frames: any
+// `TransferEncryptedControl` frames are decoded and routed into the per-peer
+// session of the complement of the sender's role (a client-role control —
+// the peer's ClientHello — drives our server session, and vice versa),
+// creating that session if needed. The remaining application frames are
+// returned for delivery to the receive callback.
+func (self *ReceiveSequence) deliverEncryptedControlFrames(frames []*protocol.Frame) []*protocol.Frame {
+	var passthrough []*protocol.Frame
+	for _, frame := range frames {
+		if frame == nil {
+			continue
+		}
+		if frame.MessageType != protocol.MessageType_TransferEncryptedControl {
+			passthrough = append(passthrough, frame)
+			continue
+		}
+		if self.client == nil || self.client.encryptionSessionManager == nil {
+			continue
+		}
+		ec := &protocol.EncryptedControl{}
+		if err := ProtoUnmarshal(frame.MessageBytes, ec); err != nil {
+			glog.V(1).Infof("[r]%s<-%s bad encrypted control = %s\n", self.client.ClientTag(), self.source.SourceId, err)
+			continue
+		}
+		senderRole, ok := sequenceTlsRoleFromProtobuf(ec.SessionRole)
+		if !ok {
+			glog.V(1).Infof("[r]%s<-%s encrypted control with no session role — dropped\n", self.client.ClientTag(), self.source.SourceId)
+			continue
+		}
+		self.client.encryptionSessionManager.DeliverEncryptedControl(self.source.SourceId, senderRole.complement(), ec)
+	}
+	return passthrough
 }
 
 func (self *ReceiveSequence) registerContracts(item *receiveItem) error {
@@ -3278,6 +4143,10 @@ type receiveItem struct {
 	ack                bool
 	tag                *protocol.Tag
 	transferFrameBytes []byte
+	// unwrapped is true when the originating TransferFrame arrived on
+	// the wire as plaintext (no outer encrypted wrap). Propagated into
+	// the sequenceAck so the ack format mirrors the incoming pack.
+	unwrapped bool
 }
 
 func (self *receiveItem) messagePoolReturn() {
@@ -3318,6 +4187,12 @@ type sequenceAck struct {
 	messageId      Id
 	selective      bool
 	tag            *protocol.Tag
+	// unwrapped is true when any pack covered by this ack arrived on
+	// the wire as plaintext. The ack writer mirrors that state — a
+	// plaintext-acked window emits a plaintext ack — so peers whose
+	// ciphers haven't been established yet can read the ack. Cumulative
+	// head acks or-in the bit across every absorbed lower ack.
+	unwrapped bool
 }
 
 type sequenceAckWindowSnapshot struct {
@@ -3350,8 +4225,30 @@ func (self *sequenceAckWindow) Update(ack *sequenceAck) {
 
 	if self.headAck == nil || self.headAck.sequenceNumber < ack.sequenceNumber {
 		if ack.selective {
+			if prior, ok := self.selectiveAcks[ack.messageId]; ok && prior.unwrapped {
+				// coalesced selective ack for the same message: preserve
+				// any prior plaintext bit so a single late wrapped resend
+				// doesn't upgrade the ack format past the sender's reach.
+				ack.unwrapped = true
+			}
 			self.selectiveAcks[ack.messageId] = ack
 		} else {
+			// cumulative head ack: or-in the prior head's plaintext bit
+			// (and any absorbed selective acks below the new head) so a
+			// single plaintext pack anywhere under the head keeps the
+			// ack plaintext. Selective acks at or below the new head are
+			// already dropped by the Snapshot pass.
+			if self.headAck != nil && self.headAck.unwrapped {
+				ack.unwrapped = true
+			}
+			if !ack.unwrapped {
+				for _, sel := range self.selectiveAcks {
+					if sel.unwrapped && sel.sequenceNumber <= ack.sequenceNumber {
+						ack.unwrapped = true
+						break
+					}
+				}
+			}
 			self.ackUpdateCount += 1
 			self.headAck = ack
 			// no need to clean up `selectiveAcks` here
@@ -3359,7 +4256,17 @@ func (self *sequenceAckWindow) Update(ack *sequenceAck) {
 		}
 	} else {
 		// past the head
-		// resend the head
+		// resend the head — fold this late ack's plaintext bit into the
+		// head so the resend covers it. Copy-on-write: a prior Snapshot
+		// may have published the current `headAck` pointer to writeAck,
+		// which reads `unwrapped` without holding ackLock, so mutating
+		// the struct in place would race. Swap in a fresh copy with the
+		// bit set instead.
+		if ack.unwrapped && self.headAck != nil && !self.headAck.unwrapped {
+			updated := *self.headAck
+			updated.unwrapped = true
+			self.headAck = &updated
+		}
 		self.ackUpdateCount += 1
 	}
 
@@ -3413,6 +4320,30 @@ type sequenceContract struct {
 
 	ackedByteCount   ByteCount
 	unackedByteCount ByteCount
+
+	// provideTlsCertificate is the PEM-encoded X.509 chain (leaf first)
+	// that the destination committed to as its server TLS identity for
+	// this contract. Empty when the destination did not publish a
+	// certificate via `ContractManager.SetProvideTlsCertificate`. The
+	// SendSequence uses this to verify the peer presented during the
+	// per-peer TLS handshake against the platform-signed contract.
+	provideTlsCertificate [][]byte
+	// destinationClientPublicKey is the peer's 32-byte Ed25519
+	// long-lived public identity key, as committed by the platform in
+	// `Contract.destination_client_public_key`. The sender uses it to
+	// (a) verify `destinationClientKeySignedTlsCertificate` against
+	// `provideTlsCertificate` — only then is the cert chain admitted
+	// to the per-peer session's trusted set — and (b) verify the
+	// peer's post-handshake identity proof exchanged inside the per-
+	// peer TLS session. Empty when the contract carries no key.
+	destinationClientPublicKey []byte
+	// destinationClientKeySignedTlsCertificate is the peer's Ed25519
+	// signature over the canonical concatenation of every PEM block
+	// in `provideTlsCertificate`. The signing key is the peer's
+	// long-lived client identity key (private half held only by the
+	// peer); the verifier is `destinationClientPublicKey`. Empty when
+	// the contract carries no signature.
+	destinationClientKeySignedTlsCertificate []byte
 }
 
 func newSequenceContract(tag string, contract *protocol.Contract, minUpdateByteCount ByteCount, contractFillFraction float32) (*sequenceContract, error) {
@@ -3436,18 +4367,43 @@ func newSequenceContract(tag string, contract *protocol.Contract, minUpdateByteC
 		return nil, err
 	}
 
+	// The platform-signed `StoredContract.ProvideTlsCertificate` is the
+	// authoritative cert commitment (signed under `storedContractHmac`); the
+	// outer `Contract.ProvideTlsCertificate` is a convenience copy for
+	// clients that don't unmarshal the stored bytes. Prefer the stored value;
+	// fall back to the outer value only when the inner is missing.
+	provideTlsCertificate := storedContract.ProvideTlsCertificate
+	if len(provideTlsCertificate) == 0 && contract != nil {
+		provideTlsCertificate = contract.ProvideTlsCertificate
+	}
+
+	// Same prefer-stored-fallback-to-outer convention for the destination's
+	// client-identity public key and the destination's signature over the
+	// cert chain (Option 1 of the long-lived-identity verification design).
+	destinationClientPublicKey := storedContract.DestinationClientPublicKey
+	if len(destinationClientPublicKey) == 0 && contract != nil {
+		destinationClientPublicKey = contract.DestinationClientPublicKey
+	}
+	destinationClientKeySignedTlsCertificate := storedContract.DestinationClientKeySignedTlsCertificate
+	if len(destinationClientKeySignedTlsCertificate) == 0 && contract != nil {
+		destinationClientKeySignedTlsCertificate = contract.DestinationClientKeySignedTlsCertificate
+	}
+
 	return &sequenceContract{
-		localId:                    NewId(),
-		tag:                        tag,
-		contract:                   contract,
-		contractId:                 contractId,
-		transferByteCount:          ByteCount(storedContract.TransferByteCount),
-		effectiveTransferByteCount: ByteCount(float32(storedContract.TransferByteCount) * contractFillFraction),
-		provideMode:                contract.ProvideMode,
-		minUpdateByteCount:         minUpdateByteCount,
-		path:                       path,
-		ackedByteCount:             ByteCount(0),
-		unackedByteCount:           ByteCount(0),
+		localId:                                  NewId(),
+		tag:                                      tag,
+		contract:                                 contract,
+		contractId:                               contractId,
+		transferByteCount:                        ByteCount(storedContract.TransferByteCount),
+		effectiveTransferByteCount:               ByteCount(float32(storedContract.TransferByteCount) * contractFillFraction),
+		provideMode:                              contract.ProvideMode,
+		minUpdateByteCount:                       minUpdateByteCount,
+		path:                                     path,
+		ackedByteCount:                           ByteCount(0),
+		unackedByteCount:                         ByteCount(0),
+		provideTlsCertificate:                    provideTlsCertificate,
+		destinationClientPublicKey:               destinationClientPublicKey,
+		destinationClientKeySignedTlsCertificate: destinationClientKeySignedTlsCertificate,
 	}, nil
 }
 

@@ -71,6 +71,10 @@ func ToFrame(message proto.Message, protocolVersion int) (*protocol.Frame, error
 		messageType = protocol.MessageType_TransferExchangeSignal
 	case *protocol.StreamReset:
 		messageType = protocol.MessageType_TransferStreamReset
+	case *protocol.EncryptedKey:
+		messageType = protocol.MessageType_TransferEncryptedKey
+	case *protocol.ClientKey:
+		messageType = protocol.MessageType_TransferClientKey
 	default:
 		return nil, fmt.Errorf("Unknown message type: %T", v)
 	}
@@ -157,6 +161,10 @@ func FromFrame(frame *protocol.Frame) (proto.Message, error) {
 		message = &protocol.ExchangeSignal{}
 	case protocol.MessageType_TransferStreamReset:
 		message = &protocol.StreamReset{}
+	case protocol.MessageType_TransferEncryptedKey:
+		message = &protocol.EncryptedKey{}
+	case protocol.MessageType_TransferClientKey:
+		message = &protocol.ClientKey{}
 	default:
 		return nil, fmt.Errorf("Unknown message type: %s", frame.MessageType)
 	}

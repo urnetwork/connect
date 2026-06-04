@@ -31,6 +31,24 @@ type ContractKey struct {
 	IntermediaryIds   MultiHopId
 	CompanionContract bool
 	ForceStream       bool
+	// EncryptionRole separates the contract queues of the two per-peer
+	// encryption send sequences to the same destination: the client-role
+	// sequence (normal application data) and the server-role sequence
+	// (EncryptedControl carrier + server replies). Without this, both would
+	// share one queue, and one sequence's exit-flush (`FlushContractQueue`
+	// on idle) would discard the other's pending contracts — starving the
+	// handshake carrier. Zero value is client, so non-encrypted traffic and
+	// legacy/pushed contracts key the same as before.
+	EncryptionRole sequenceTlsRole
+	// EncryptionCompanion separates the contract queues of two same-role send
+	// sequences differing only by session identity companion — the two
+	// server-role reply carriers that echo a companion vs non-companion
+	// initiator both ride the same EncryptionControlUseCompanion contract, so
+	// `CompanionContract` alone doesn't separate them. Without this they share a
+	// queue and starve each other on exit-flush, as `EncryptionRole` guards for
+	// the client/server split. Zero value false, so non-encrypted and
+	// legacy/pushed contracts key as before.
+	EncryptionCompanion bool
 }
 
 func (self ContractKey) Legacy() ContractKey {
@@ -46,6 +64,52 @@ type ContractStatus struct {
 }
 
 type ContractStatusFunction = func(ContractStatus *ContractStatus)
+
+type contractStatusCallbackWorker struct {
+	ctx                     context.Context
+	cancel                  context.CancelFunc
+	callback                ContractStatusFunction
+	receiveContractStatuses chan *ContractStatus
+}
+
+func newContractStatusCallbackWorker(ctx context.Context, callback ContractStatusFunction, bufferSize int) *contractStatusCallbackWorker {
+	callbackCtx, cancel := context.WithCancel(ctx)
+	worker := &contractStatusCallbackWorker{
+		ctx:                     callbackCtx,
+		cancel:                  cancel,
+		callback:                callback,
+		receiveContractStatuses: make(chan *ContractStatus, bufferSize),
+	}
+	go HandleError(worker.run, cancel)
+	return worker
+}
+
+func (self *contractStatusCallbackWorker) run() {
+	for {
+		select {
+		case <-self.ctx.Done():
+			return
+		case contractStatus := <-self.receiveContractStatuses:
+			if self.ctx.Err() != nil {
+				return
+			}
+			HandleError(func() {
+				self.callback(contractStatus)
+			})
+		}
+	}
+}
+
+func (self *contractStatusCallbackWorker) Dispatch(contractStatus *ContractStatus) {
+	select {
+	case <-self.ctx.Done():
+	case self.receiveContractStatuses <- contractStatus:
+	}
+}
+
+func (self *contractStatusCallbackWorker) Close() {
+	self.cancel()
+}
 
 type ContractManagerStats struct {
 	ContractOpenCount  int64
@@ -112,6 +176,10 @@ func VerifyStoredContract(settings *ContractManagerSettings, provideSecretKey []
 }
 
 func DefaultContractManagerSettings() *ContractManagerSettings {
+	return DefaultContractManagerSettingsWithBufferSize(defaultTransferBufferSize)
+}
+
+func DefaultContractManagerSettingsWithBufferSize(bufferSize int) *ContractManagerSettings {
 	// NETWORK EVENT: at the enable contracts date, all clients will require contracts
 	// up to that time, contracts are optional for the sender and match for the receiver
 	networkEventTimeEnableContracts, err := time.Parse(time.RFC3339, "2024-05-01T00:00:00Z")
@@ -126,6 +194,7 @@ func DefaultContractManagerSettings() *ContractManagerSettings {
 		panic(err)
 	}
 	return &ContractManagerSettings{
+		SequenceBufferSize:                bufferSize,
 		InitialContractTransferByteCount:  kib(16),
 		StandardContractTransferByteCount: mib(128),
 		ContractTransferByteSeqScale:      4,
@@ -152,6 +221,8 @@ func DefaultContractManagerSettingsNoNetworkEvents() *ContractManagerSettings {
 }
 
 type ContractManagerSettings struct {
+	SequenceBufferSize int
+
 	// this should be enough to do a single ping
 	InitialContractTransferByteCount  ByteCount
 	StandardContractTransferByteCount ByteCount
@@ -205,7 +276,7 @@ type ContractManager struct {
 	receiveNoContractClientIds map[Id]bool
 	sendNoContractClientIds    map[Id]bool
 
-	contractStatusCallbacks *CallbackList[ContractStatusFunction]
+	contractStatusCallbacks *CallbackList[*contractStatusCallbackWorker]
 
 	localStats *ContractManagerStats
 
@@ -245,7 +316,7 @@ func NewContractManager(
 		destinationContracts:       map[ContractKey]*contractQueue{},
 		receiveNoContractClientIds: receiveNoContractClientIds,
 		sendNoContractClientIds:    sendNoContractClientIds,
-		contractStatusCallbacks:    NewCallbackList[ContractStatusFunction](),
+		contractStatusCallbacks:    NewCallbackList[*contractStatusCallbackWorker](),
 		localStats:                 NewContractManagerStats(),
 		controlSyncProvide:         NewControlSync(ctx, client, "provide"),
 	}
@@ -259,6 +330,16 @@ func NewContractManager(
 
 func (self *ContractManager) providePing() {
 	if self.settings.ProvidePingTimeout == 0 {
+		return
+	}
+
+	// Wait for the client to finish wiring before our first send. This
+	// goroutine is started from `NewContractManager`, which runs inside
+	// `NewClientWithTag` before `initBuffers` constructs `sendBuffer`.
+	// Without this gate the ping path can race the buffer wiring.
+	select {
+	case <-self.client.ReadyNotify():
+	case <-self.ctx.Done():
 		return
 	}
 
@@ -351,21 +432,22 @@ func (self *ContractManager) StandardContractTransferByteCount() ByteCount {
 }
 
 func (self *ContractManager) AddContractStatusCallback(contractStatusCallback ContractStatusFunction) func() {
-	callbackId := self.contractStatusCallbacks.Add(contractStatusCallback)
+	worker := newContractStatusCallbackWorker(self.ctx, contractStatusCallback, self.settings.SequenceBufferSize)
+	callbackId := self.contractStatusCallbacks.Add(worker)
 	return func() {
 		self.contractStatusCallbacks.Remove(callbackId)
+		worker.Close()
 	}
 }
 
 // ContractStatusFunction
 func (self *ContractManager) contractStatus(contractStatus *ContractStatus) {
 	for _, contractStatusCallback := range self.contractStatusCallbacks.Get() {
-		HandleError(func() {
-			contractStatusCallback(contractStatus)
-		})
+		contractStatusCallback.Dispatch(contractStatus)
 	}
 }
 
+/*
 // ReceiveFunction
 func (self *ContractManager) Receive(source TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode) {
 	if source.IsControlSource() {
@@ -374,12 +456,13 @@ func (self *ContractManager) Receive(source TransferPath, frames []*protocol.Fra
 		}
 	}
 }
+*/
 
-func (self *ContractManager) handleControlFrame(createContractKey *ContractKey, frame *protocol.Frame) error {
+func (self *ContractManager) HandleControlFrame(contractKey ContractKey, frame *protocol.Frame) error {
 	switch frame.MessageType {
 	case protocol.MessageType_TransferCreateContractResult:
-		contracts, contractErrors := self.parseControlFrame(createContractKey, frame)
-		for contractKey, contract := range contracts {
+		contracts, contractErrors := self.parseControlFrame(frame)
+		for _, contract := range contracts {
 			c := func() error {
 				var contractStatus *ContractStatus
 				defer func() {
@@ -426,7 +509,7 @@ func (self *ContractManager) handleControlFrame(createContractKey *ContractKey, 
 				c()
 			}
 		}
-		for contractKey, contractError := range contractErrors {
+		for _, contractError := range contractErrors {
 			glog.V(1).Infof("[contract]error = %s\n", contractError)
 			c := func() {
 				contractStatus := &ContractStatus{
@@ -450,45 +533,13 @@ func (self *ContractManager) handleControlFrame(createContractKey *ContractKey, 
 }
 
 // frames are verified before calling to be from source ControlId
-func (self *ContractManager) parseControlFrame(createContractKey *ContractKey, frame *protocol.Frame) (
-	contracts map[ContractKey]*protocol.Contract,
-	contractErrors map[ContractKey]protocol.ContractError,
+func (self *ContractManager) parseControlFrame(frame *protocol.Frame) (
+	contracts []*protocol.Contract,
+	contractErrors []protocol.ContractError,
 ) {
-	contracts = map[ContractKey]*protocol.Contract{}
-	contractErrors = map[ContractKey]protocol.ContractError{}
-
 	addResult := func(v *protocol.CreateContractResult) {
-		var contractKey *ContractKey
-		if createContractKey != nil {
-			contractKey = createContractKey
-		} else if createContract := v.CreateContract; createContract != nil {
-			contractKey = &ContractKey{}
-			var err error
-			contractKey.Destination, err = TransferPathFromBytes(
-				nil,
-				createContract.DestinationId,
-				nil,
-			)
-			if err != nil {
-				return
-			}
-			contractKey.CompanionContract = createContract.Companion
-			if createContract.ForceStream != nil {
-				contractKey.ForceStream = *createContract.ForceStream
-			}
-			if createContract.IntermediaryIds != nil {
-				if intermediaryIds, err := MultiHopIdFromBytes(createContract.IntermediaryIds); err == nil {
-					contractKey.IntermediaryIds = intermediaryIds
-				}
-			}
-		}
-
 		if contractError := v.Error; contractError != nil {
-			if contractKey != nil {
-				contractErrors[*contractKey] = *contractError
-			} else {
-				glog.Infof("[contract]error with unassociated contract = %s\n", contractError)
-			}
+			contractErrors = append(contractErrors, *contractError)
 		} else if contract := v.Contract; contract != nil {
 			storedContract := &protocol.StoredContract{}
 			err := ProtoUnmarshal(contract.StoredContractBytes, storedContract)
@@ -496,25 +547,7 @@ func (self *ContractManager) parseControlFrame(createContractKey *ContractKey, f
 				return
 			}
 
-			if contractKey == nil && self.settings.LegacyCreateContract {
-				// this only makes sense for legacy contracts
-				contractKey = &ContractKey{}
-				contractKey.Destination, err = TransferPathFromBytes(
-					nil,
-					storedContract.DestinationId,
-					nil,
-				)
-				if err != nil {
-					return
-				}
-			}
-
-			if contractKey != nil {
-				contracts[*contractKey] = contract
-			} else {
-				// this contract can't be associated (TODO close it)
-				glog.Errorf("[contract]unassociated contract %s\n", Id(storedContract.ContractId))
-			}
+			contracts = append(contracts, contract)
 		}
 	}
 
@@ -914,7 +947,7 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 		func(resultFrames []*protocol.Frame, err error) {
 			if err == nil {
 				for _, resultFrame := range resultFrames {
-					self.handleControlFrame(&contractKey, resultFrame)
+					self.HandleControlFrame(contractKey, resultFrame)
 				}
 			} else {
 				select {
@@ -984,30 +1017,41 @@ func (self *ContractManager) CloseContractWithCheckpoint(
 		}
 	}()
 
-	closeContract := &protocol.CloseContract{
+	// Reliable delivery via a per-contract `ControlSync`. The
+	// previous implementation called `ClientOob().SendControl(...)`
+	// once and dropped the result on the floor — a single transient
+	// transport failure would leave the contract `open=true` on the
+	// server, its escrow permanently deducted from the network
+	// balance with no way for the client to ever signal completion.
+	//
+	// `ControlSync` retries the send until the platform acks (or
+	// the client's context is canceled). One `ControlSync` per
+	// close: each contract's close is independent and must not be
+	// superseded by another close's `Send` (which is what would
+	// happen on a shared `ControlSync` — its `syncCount` would
+	// abandon the older close as "replaced"). The per-call instance
+	// holds little state — a mutex, a monitor, and a derived context
+	// — and its supervisor goroutine exits on success or when the
+	// parent context closes, so there's no long-lived leak.
+	frame, err := ToFrame(&protocol.CloseContract{
 		ContractId:       contractId.Bytes(),
 		AckedByteCount:   uint64(ackedByteCount),
 		UnackedByteCount: uint64(unackedByteCount),
 		Checkpoint:       checkpoint,
-	}
-	frame, err := ToFrame(closeContract, self.settings.ProtocolVersion)
+	}, self.settings.ProtocolVersion)
 	if err != nil {
-		glog.Infof("[contract]could not create close contract frame = %s", err)
+		glog.Infof("[contract]could not create close contract frame = %s\n", err)
 		return
 	}
-	self.client.ClientOob().SendControl(
-		[]*protocol.Frame{frame},
-		func(resultFrames []*protocol.Frame, err error) {
-			if err == nil && opened {
-				contractQueue := self.openContractQueue(contractKey)
-				defer self.closeContractQueue(contractKey)
-
-				// the contract is partially closed on the platform now
-				// it can be safely removed from the local used list
-				contractQueue.RemoveUsedContract(contractId)
-			}
-		},
-	)
+	closeControlSync := NewControlSync(self.ctx, self.client, fmt.Sprintf("close-contract-%s", contractId))
+	closeControlSync.Send(frame, nil, func(sendErr error) {
+		defer closeControlSync.Close()
+		if sendErr == nil && opened {
+			contractQueue := self.openContractQueue(contractKey)
+			contractQueue.RemoveUsedContract(contractId)
+			self.closeContractQueue(contractKey)
+		}
+	})
 }
 
 func (self *ContractManager) LocalStats() *ContractManagerStats {
@@ -1018,6 +1062,7 @@ func (self *ContractManager) LocalStats() *ContractManagerStats {
 		ContractOpenCount:      self.localStats.ContractOpenCount,
 		ContractCloseCount:     self.localStats.ContractCloseCount,
 		ContractOpenByteCounts: maps.Clone(self.localStats.ContractOpenByteCounts),
+		ContractOpenKeys:       maps.Clone(self.localStats.ContractOpenKeys),
 		// ContractOpenDestinationIds: maps.Clone(self.localStats.ContractOpenDestinationIds),
 		ContractCloseByteCount:        self.localStats.ContractCloseByteCount,
 		ReceiveContractCloseByteCount: self.localStats.ReceiveContractCloseByteCount,
