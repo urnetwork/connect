@@ -45,3 +45,11 @@ In the URnetwork code, the following Go style is used. A few conventions — not
 ## Capitalization
 
 - In comments we do not use all upper case. If there is an important concept, use a concise name in lowercase for readability. Use plain words for names where possible e.g. "identity companion"
+
+## Locking
+
+- Functions that are expected to be called with one or more state locks should be named "*WithLock". Inversely, functions that do not have "*WithLock" should expect to be called with no state locks.
+- Operations on locked state should be as tightly scoped as possible.
+- Calls to external objects must not hold a state lock. This is generally an implication of the "WithLock" rule.
+- Locks must always be acquired in consistent order. 
+- Do not use re-entrant locks because they will mask locking issues.

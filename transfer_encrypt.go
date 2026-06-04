@@ -1850,8 +1850,10 @@ func (self *peerEncryptionSession) Release() {
 	if self == nil {
 		return
 	}
-	self.manager.stateLock.Lock()
 	free := func() bool {
+		self.manager.stateLock.Lock()
+		defer self.manager.stateLock.Unlock()
+
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		self.refs--
@@ -1888,7 +1890,6 @@ func (self *peerEncryptionSession) Release() {
 		}
 		return true
 	}()
-	self.manager.stateLock.Unlock()
 	if free {
 		self.close()
 	}
@@ -1925,9 +1926,16 @@ func (self *peerEncryptionSession) CancelIfIdle() bool {
 		idleTimeout = self.settings.IdleTimeout
 	}
 
+	// Hold the manager lock across the entire refs/idle check and the map delete
+	// (mirroring Release), so a concurrent acquireSession can't read this session
+	// out of the map and retain it while it is being torn down, and so the delete
+	// doesn't race acquireSession's getOrCreateWithLock on the sessions map. The
+	// prior `Lock(); Unlock()` released the manager lock immediately, leaving the
+	// delete guarded only by the per-session lock — a concurrent map write. close()
+	// runs after the manager lock is dropped.
 	free := func() bool {
 		self.manager.stateLock.Lock()
-		self.manager.stateLock.Unlock()
+		defer self.manager.stateLock.Unlock()
 
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
