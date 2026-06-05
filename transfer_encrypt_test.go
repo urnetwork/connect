@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/tls"
 	"errors"
 	"testing"
 	"time"
@@ -47,6 +48,7 @@ func newTestSessionForIdentityProof(t *testing.T) (
 		ctx, manager, client, peerId,
 		sequenceTlsRoleServer,
 		settings.EncryptionSettings,
+		manager.ServerTlsConfig(),
 		false,
 	)
 
@@ -293,6 +295,7 @@ func TestIsAwaitingClientFinishedClientRole(t *testing.T) {
 		ctx, manager, client, NewId(),
 		sequenceTlsRoleClient,
 		settings.EncryptionSettings,
+		manager.ClientTlsConfig(),
 		false,
 	)
 	clientRoleSess.epoch = &tlsHandshakeEpoch{handshakeDone: make(chan struct{})}
@@ -403,7 +406,14 @@ func newTestEncryptionSession(t *testing.T, role sequenceTlsRole) (*peerEncrypti
 		t.Fatalf("NewClientKeyManager: %s", err)
 	}
 	manager := NewEncryptionSessionManager(ctx, client, keyManager, settings.EncryptionSettings)
-	sess := newPeerEncryptionSession(ctx, manager, client, NewId(), role, settings.EncryptionSettings, false)
+	var roleTlsConfig *tls.Config
+	switch role {
+	case sequenceTlsRoleClient:
+		roleTlsConfig = manager.ClientTlsConfig()
+	case sequenceTlsRoleServer:
+		roleTlsConfig = manager.ServerTlsConfig()
+	}
+	sess := newPeerEncryptionSession(ctx, manager, client, NewId(), role, settings.EncryptionSettings, roleTlsConfig, false)
 	return sess, func() {
 		client.Cancel()
 		cancel()

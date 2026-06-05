@@ -632,6 +632,18 @@ type peerEncryptionSession struct {
 
 	settings *EncryptionSettings
 
+	// tlsConfig is the TLS config this session presents for its fixed role,
+	// snapshotted from the manager's current key material at creation (in
+	// `getOrCreateWithLock`, under the manager lock). Immutable for the session's
+	// lifetime: every handshake epoch — the first and any re-handshake — reads it
+	// without a lock. Snapshotting here is what lets `buildAndStartEpochWithLock`
+	// build an epoch while holding the session lock without calling back into the
+	// manager; doing so would take the manager lock under the session lock and
+	// invert the manager→session order that `Release`/`CancelIfIdle` acquire them
+	// in (an ABBA deadlock). Client role is always non-nil; server role is nil
+	// only when no server cert is configured, which fails the epoch closed.
+	tlsConfig *tls.Config
+
 	// peerClientPublicKeyFetcher is the session's own out-of-band fetcher for
 	// the peer's public client identity key, produced by
 	// `EncryptionSettings.NewPeerClientPublicKeyFetcher(peerId)` at session
@@ -696,6 +708,9 @@ func newPeerEncryptionSession(
 	peerId Id,
 	role sequenceTlsRole,
 	settings *EncryptionSettings,
+	// tlsConfig is the role's TLS config, snapshotted by the caller from the
+	// manager under the manager lock (see the `tlsConfig` field).
+	tlsConfig *tls.Config,
 	// companion is the session's identity companion (see the `companion` field).
 	companion bool,
 ) *peerEncryptionSession {
@@ -717,6 +732,7 @@ func newPeerEncryptionSession(
 		carrierCompanion: carrierCompanion,
 		logTag:           fmt.Sprintf("%s %s c=%t %s", client.ClientTag(), role, companion, peerId),
 		settings:         settings,
+		tlsConfig:        tlsConfig,
 		readyMonitor:     NewMonitor(),
 		lastActivityTime: time.Now(),
 	}
@@ -853,16 +869,16 @@ func (self *peerEncryptionSession) buildAndStartEpochWithLock() {
 		transport:     newSequenceTlsTransport(ctx),
 		handshakeDone: make(chan struct{}),
 	}
-	var tlsCfg *tls.Config
+	// Use the role's TLS config snapshotted at session creation (see the
+	// `tlsConfig` field). Reading it here — instead of calling back into
+	// self.manager.ClientTlsConfig()/ServerTlsConfig() — keeps this path from
+	// taking the manager lock while holding the session lock, which would invert
+	// the manager→session lock order Release/CancelIfIdle rely on (ABBA deadlock).
+	tlsCfg := self.tlsConfig
 	switch self.role {
 	case sequenceTlsRoleClient:
-		tlsCfg = self.manager.ClientTlsConfig()
-		if tlsCfg == nil {
-			tlsCfg = resolveSendTlsConfig(self.settings.ClientTlsConfig)
-		}
 		e.tlsConn = tls.Client(e.transport, tlsCfg)
 	case sequenceTlsRoleServer:
-		tlsCfg = self.manager.ServerTlsConfig()
 		if tlsCfg == nil {
 			// Encryption misconfigured (no server cert): fail the epoch
 			// closed so the cipher stays nil and traffic flows in
@@ -2189,6 +2205,30 @@ func (self *EncryptionSessionManager) ClientTlsConfig() *tls.Config {
 	return self.clientTlsConfig.Clone()
 }
 
+// sessionTlsConfigWithLock snapshots the TLS config a new session in `role`
+// should present, from the manager's current key material. Caller holds
+// stateLock. Mirrors the prior on-demand ClientTlsConfig/ServerTlsConfig
+// resolution, but taken once at session creation so the handshake-build path
+// never reaches back into the manager (see `peerEncryptionSession.tlsConfig`).
+// A later `SetProvideTlsKeyMaterial` rotation swaps the manager's configs and so
+// is picked up by sessions created afterward; live sessions keep the identity
+// they were created with. Server role returns nil when no cert is configured —
+// the misconfigured case the epoch build fails closed on.
+func (self *EncryptionSessionManager) sessionTlsConfigWithLock(role sequenceTlsRole) *tls.Config {
+	switch role {
+	case sequenceTlsRoleClient:
+		if self.clientTlsConfig != nil {
+			return self.clientTlsConfig.Clone()
+		}
+		return resolveSendTlsConfig(self.settings.ClientTlsConfig)
+	case sequenceTlsRoleServer:
+		if self.serverTlsConfig != nil {
+			return self.serverTlsConfig.Clone()
+		}
+	}
+	return nil
+}
+
 // SetProvideTlsKeyMaterial replaces the local sequence-level TLS identity
 // and republishes the EncryptedKey commitment.
 func (self *EncryptionSessionManager) SetProvideTlsKeyMaterial(certPem []byte, keyPem []byte) error {
@@ -2325,7 +2365,7 @@ func (self *EncryptionSessionManager) getOrCreateWithLock(peerId Id, role sequen
 	if s, ok := self.sessions[key]; ok {
 		return s
 	}
-	s := newPeerEncryptionSession(self.ctx, self, self.client, peerId, role, self.settings, companion)
+	s := newPeerEncryptionSession(self.ctx, self, self.client, peerId, role, self.settings, self.sessionTlsConfigWithLock(role), companion)
 	self.sessions[key] = s
 	glog.V(1).Infof("[tls]%s opened session for peer %s as %s c=%t\n", self.client.ClientTag(), peerId, role, companion)
 	go func() {
