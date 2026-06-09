@@ -2623,12 +2623,15 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 		switch frame.MessageType {
 		case protocol.MessageType_IpIpPing:
 			glog.V(1).Infof("[ip]provider ping <- %s(%d)\n", source, provideMode)
-			// echo back
+			// echo back over a companion contract, like the provider's other
+			// return traffic; the source only provides ProvideMode_Stream, so a
+			// forward contract here would be rejected (no permission).
 			self.client.SendWithTimeout(
 				frame,
 				source.Reverse(),
 				func(err error) {},
 				0,
+				CompanionContract(),
 			)
 		case protocol.MessageType_IpIpPacketToProvider:
 			ipPacketToProvider_, err := FromFrame(frame)

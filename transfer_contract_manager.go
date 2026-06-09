@@ -280,7 +280,8 @@ type ContractManager struct {
 
 	localStats *ContractManagerStats
 
-	controlSyncProvide *ControlSync
+	controlSyncProvide    *ControlSync
+	controlSyncProvideOob *ControlSyncOob
 }
 
 func NewContractManagerWithDefaults(ctx context.Context, client *Client) *ContractManager {
@@ -319,6 +320,7 @@ func NewContractManager(
 		contractStatusCallbacks:    NewCallbackList[*contractStatusCallbackWorker](),
 		localStats:                 NewContractManagerStats(),
 		controlSyncProvide:         NewControlSync(ctx, client, "provide"),
+		controlSyncProvideOob:      NewControlSyncOob(ctx, client, "provide-oob"),
 	}
 
 	if client.ClientId() != ControlId {
@@ -700,36 +702,69 @@ func (self *ContractManager) SetProvideModes(provideModes map[protocol.ProvideMo
 	self.SetProvideModesWithAckCallback(provideModes, func(err error) {})
 }
 
-func (self *ContractManager) SetProvideModesWithAckCallback(provideModes map[protocol.ProvideMode]bool, ackCallback func(err error)) {
-	func() {
-		self.mutex.Lock()
-		defer self.mutex.Unlock()
+// applyProvideModes generates any missing provide secret keys and updates the
+// active provide modes. The provide frame must be (re)sent afterward to register
+// the change with the platform.
+func (self *ContractManager) applyProvideModes(provideModes map[protocol.ProvideMode]bool) {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
 
-		// keep all keys (see note on `provideSecretKeys`)
-		for provideMode, allow := range provideModes {
-			if allow {
-				provideSecretKey, ok := self.provideSecretKeys[provideMode]
-				if !ok {
-					// generate a new key
-					provideSecretKey = make([]byte, 32)
-					_, err := rand.Read(provideSecretKey)
-					if err != nil {
-						panic(err)
-					}
-					self.provideSecretKeys[provideMode] = provideSecretKey
+	// keep all keys (see note on `provideSecretKeys`)
+	for provideMode, allow := range provideModes {
+		if allow {
+			provideSecretKey, ok := self.provideSecretKeys[provideMode]
+			if !ok {
+				// generate a new key
+				provideSecretKey = make([]byte, 32)
+				_, err := rand.Read(provideSecretKey)
+				if err != nil {
+					panic(err)
 				}
+				self.provideSecretKeys[provideMode] = provideSecretKey
 			}
 		}
+	}
 
-		self.provideModes = maps.Clone(provideModes)
-		self.provideMonitor.NotifyAll()
-	}()
+	self.provideModes = maps.Clone(provideModes)
+	self.provideMonitor.NotifyAll()
+}
+
+func (self *ContractManager) SetProvideModesWithAckCallback(provideModes map[protocol.ProvideMode]bool, ackCallback func(err error)) {
+	self.applyProvideModes(provideModes)
 	if provideFrame, err := self.provideFrame(); err != nil {
 		ackCallback(err)
 	} else if provideFrame != nil {
 		self.controlSyncProvide.Send(
 			provideFrame,
 			nil,
+			ackCallback,
+		)
+	} else {
+		ackCallback(nil)
+	}
+}
+
+// SetProvideModesWithReturnTrafficWithOobAckCallback is like
+// SetProvideModesWithReturnTrafficWithAckCallback, but registers the provide via
+// the out-of-band control, so the ack means the platform has committed the
+// provide secret (the in-band control ack only means the message was delivered).
+// Use this when a caller must wait for the secret to be registered before using
+// the client — e.g. the return path of a multi-client client, whose companion
+// (Stream) contracts are verified against this secret.
+func (self *ContractManager) SetProvideModesWithReturnTrafficWithOobAckCallback(provideModes map[protocol.ProvideMode]bool, ackCallback func(err error)) {
+	updatedProvideModes := map[protocol.ProvideMode]bool{}
+	maps.Copy(updatedProvideModes, provideModes)
+	updatedProvideModes[protocol.ProvideMode_Stream] = true
+	self.SetProvideModesWithOobAckCallback(updatedProvideModes, ackCallback)
+}
+
+func (self *ContractManager) SetProvideModesWithOobAckCallback(provideModes map[protocol.ProvideMode]bool, ackCallback func(err error)) {
+	self.applyProvideModes(provideModes)
+	if provideFrame, err := self.provideFrame(); err != nil {
+		ackCallback(err)
+	} else if provideFrame != nil {
+		self.controlSyncProvideOob.Send(
+			provideFrame,
 			ackCallback,
 		)
 	} else {

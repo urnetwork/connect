@@ -53,3 +53,8 @@ In the URnetwork code, the following Go style is used. A few conventions — not
 - Calls to external objects must not hold a state lock. This is generally an implication of the "WithLock" rule.
 - Locks must always be acquired in consistent order. 
 - Do not use re-entrant locks because they will mask locking issues.
+
+## Message Pool
+
+- When byte slices are handed into a sender, the sender will own the slice if it returns "success=false". The caller will continue to own the slice if the sender returns "success=false".
+- Slices passed to callbacks are only valid for the call context. They must be retained with `MessagePoolShareReadOnly` to keep them after the call duration.
