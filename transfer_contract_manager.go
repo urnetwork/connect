@@ -204,6 +204,8 @@ func DefaultContractManagerSettingsWithBufferSize(bufferSize int) *ContractManag
 
 		ProvidePingTimeout: 0,
 
+		OriginContractLinger: 300 * time.Second,
+
 		ProtocolVersion: DefaultProtocolVersion,
 
 		// TODO remove
@@ -241,6 +243,12 @@ type ContractManagerSettings struct {
 
 	// an active ping to the control fast-tracks any timeouts
 	ProvidePingTimeout time.Duration
+
+	// server-side companion policy: allow a return (companion) contract to be
+	// created for up to this long after the origin contract in the opposite
+	// direction was closed, so reply traffic can resume after the request side
+	// goes idle.
+	OriginContractLinger time.Duration
 
 	ProtocolVersion int
 
