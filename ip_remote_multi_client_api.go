@@ -3,7 +3,9 @@ package connect
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
+	"time"
 
 	// "golang.org/x/exp/maps"
 
@@ -236,11 +238,39 @@ func (self *ApiMultiClientGenerator) NewClient(
 		args.ClientAuth,
 		settings,
 	)
-	// enable return traffic for this client
-	client.ContractManager().SetProvideModesWithReturnTrafficWithAckCallback(
+	// Enable return traffic for this client and block until the platform has
+	// committed the provide secret. The companion (Stream) contract on the return
+	// path is verified against this secret, so using the client before it is
+	// registered races and fails verification ("Contract verification failed").
+	// The oob ack means the secret is committed (an in-band control ack only
+	// means the message was delivered, not processed).
+	provideAck := make(chan error, 1)
+	client.ContractManager().SetProvideModesWithReturnTrafficWithOobAckCallback(
 		map[protocol.ProvideMode]bool{},
-		nil,
+		func(err error) {
+			select {
+			case provideAck <- err:
+			default:
+			}
+		},
 	)
+	provideTimeout := clientSettings.ControlPingTimeout
+	if provideTimeout <= 0 {
+		provideTimeout = 30 * time.Second
+	}
+	select {
+	case err := <-provideAck:
+		if err != nil {
+			client.Cancel()
+			return nil, err
+		}
+	case <-time.After(provideTimeout):
+		client.Cancel()
+		return nil, fmt.Errorf("provide secret registration timed out")
+	case <-ctx.Done():
+		client.Cancel()
+		return nil, ctx.Err()
+	}
 	return client, nil
 }
 
