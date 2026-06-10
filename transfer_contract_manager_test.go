@@ -213,3 +213,171 @@ func TestStoredContractHmacCutover(t *testing.T) {
 	bogus := []byte("not-a-valid-hmac")
 	assert.Equal(t, false, VerifyStoredContract(pastSettings, provideSecretKey, storedContractBytes, bogus))
 }
+
+// TestContractQueueExpire verifies that queued contracts no sequence takes are
+// expired: the janitor closes them and removes the emptied queue from
+// `destinationContracts` (orphan retention), and `Poll` never hands out a
+// contract older than the expire window.
+func TestContractQueueExpire(t *testing.T) {
+	ctx := context.Background()
+	clientId := NewId()
+	settings := DefaultClientSettings()
+	settings.ContractManagerSettings.LegacyCreateContract = true
+	settings.ContractManagerSettings.ContractQueueExpireTimeout = 500 * time.Millisecond
+	client := NewClient(ctx, clientId, NewNoContractClientOob(), settings)
+	defer client.Cancel()
+	contractManager := client.ContractManager()
+
+	destinationId := NewId()
+
+	contractManager.SetProvideModesWithReturnTraffic(map[protocol.ProvideMode]bool{
+		protocol.ProvideMode_Network: true,
+		protocol.ProvideMode_Public:  true,
+	})
+
+	makeContract := func() (*protocol.Contract, *protocol.StoredContract) {
+		contractId := NewId()
+		relationship := protocol.ProvideMode_Public
+		provideSecretKey, ok := contractManager.GetProvideSecretKey(relationship)
+		assert.Equal(t, true, ok)
+
+		storedContract := &protocol.StoredContract{
+			ContractId:        contractId.Bytes(),
+			TransferByteCount: uint64(gib(1)),
+			SourceId:          clientId.Bytes(),
+			DestinationId:     destinationId.Bytes(),
+		}
+		storedContractBytes, err := ProtoMarshal(storedContract)
+		assert.Equal(t, nil, err)
+		storedContractHmac := SignStoredContract(contractManager.settings, provideSecretKey, storedContractBytes)
+		contract := &protocol.Contract{
+			StoredContractBytes: storedContractBytes,
+			StoredContractHmac:  storedContractHmac,
+			ProvideMode:         relationship,
+		}
+		return contract, storedContract
+	}
+
+	contractKey := ContractKey{
+		Destination: DestinationId(destinationId),
+	}
+
+	// queue an orphan via the control frame path (no sequence ever takes it)
+	contract, _ := makeContract()
+	result := &protocol.CreateContractResult{
+		Contract: contract,
+	}
+	frame, err := ToFrame(result, DefaultProtocolVersion)
+	assert.Equal(t, nil, err)
+	err = contractManager.HandleControlFrame(contractKey, frame)
+	assert.Equal(t, nil, err)
+
+	queueCount := func() int {
+		contractManager.mutex.Lock()
+		defer contractManager.mutex.Unlock()
+		return len(contractManager.destinationContracts)
+	}
+	assert.Equal(t, 1, queueCount())
+
+	// the janitor expires the orphan and removes the emptied queue
+	expired := false
+	for range 50 {
+		if queueCount() == 0 {
+			expired = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	assert.Equal(t, true, expired)
+
+	// the expired contract is no longer takeable
+	takenContract := contractManager.TakeContract(ctx, contractKey, 0)
+	assert.Equal(t, nil, takenContract)
+
+	// Poll guard: a stale queued contract is never handed out
+	queue := newContractQueue(false)
+	staleContract, staleStoredContract := makeContract()
+	queue.Add(staleContract, staleStoredContract)
+	polled, expiredContracts := queue.Poll(time.Now().Add(time.Minute))
+	assert.Equal(t, nil, polled)
+	assert.Equal(t, 1, len(expiredContracts))
+
+	// a fresh contract polled with expiry disabled (zero minEnqueueTime) is handed out
+	freshContract, freshStoredContract := makeContract()
+	queue.Add(freshContract, freshStoredContract)
+	polled, expiredContracts = queue.Poll(time.Time{})
+	assert.Equal(t, freshContract, polled)
+	assert.Equal(t, 0, len(expiredContracts))
+}
+
+// TestContractQueueShutdownFlush verifies that when the contract manager
+// closes (client context canceled), still-queued pending contracts are
+// flushed and closed rather than abandoned. The expire timeout is set long so
+// only the shutdown path can drain the queue.
+func TestContractQueueShutdownFlush(t *testing.T) {
+	ctx := context.Background()
+	clientId := NewId()
+	settings := DefaultClientSettings()
+	settings.ContractManagerSettings.LegacyCreateContract = true
+	settings.ContractManagerSettings.ContractQueueExpireTimeout = 1 * time.Hour
+	client := NewClient(ctx, clientId, NewNoContractClientOob(), settings)
+	defer client.Cancel()
+	contractManager := client.ContractManager()
+
+	destinationId := NewId()
+
+	contractManager.SetProvideModesWithReturnTraffic(map[protocol.ProvideMode]bool{
+		protocol.ProvideMode_Network: true,
+		protocol.ProvideMode_Public:  true,
+	})
+
+	contractId := NewId()
+	relationship := protocol.ProvideMode_Public
+	provideSecretKey, ok := contractManager.GetProvideSecretKey(relationship)
+	assert.Equal(t, true, ok)
+	storedContract := &protocol.StoredContract{
+		ContractId:        contractId.Bytes(),
+		TransferByteCount: uint64(gib(1)),
+		SourceId:          clientId.Bytes(),
+		DestinationId:     destinationId.Bytes(),
+	}
+	storedContractBytes, err := ProtoMarshal(storedContract)
+	assert.Equal(t, nil, err)
+	storedContractHmac := SignStoredContract(contractManager.settings, provideSecretKey, storedContractBytes)
+	contract := &protocol.Contract{
+		StoredContractBytes: storedContractBytes,
+		StoredContractHmac:  storedContractHmac,
+		ProvideMode:         relationship,
+	}
+
+	contractKey := ContractKey{
+		Destination: DestinationId(destinationId),
+	}
+	result := &protocol.CreateContractResult{
+		Contract: contract,
+	}
+	frame, err := ToFrame(result, DefaultProtocolVersion)
+	assert.Equal(t, nil, err)
+	err = contractManager.HandleControlFrame(contractKey, frame)
+	assert.Equal(t, nil, err)
+
+	queueCount := func() int {
+		contractManager.mutex.Lock()
+		defer contractManager.mutex.Unlock()
+		return len(contractManager.destinationContracts)
+	}
+	assert.Equal(t, 1, queueCount())
+
+	// closing the client triggers the shutdown flush of pending contracts
+	client.Cancel()
+
+	flushed := false
+	for range 50 {
+		if queueCount() == 0 {
+			flushed = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	assert.Equal(t, true, flushed)
+}

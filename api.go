@@ -384,9 +384,17 @@ type ConnectControlError struct {
 }
 
 func (self *BringYourApi) ConnectControl(connectControl *ConnectControlArgs, callback ConnectControlCallback) {
+	self.ConnectControlWithCtx(self.ctx, connectControl, callback)
+}
+
+// ConnectControlWithCtx sends control with a caller-chosen context, so control
+// messages can outlive the api context (e.g. closing pending contracts after
+// the client context is closed). Each request is bounded by the client
+// strategy's `RequestTimeout` regardless of the context passed.
+func (self *BringYourApi) ConnectControlWithCtx(ctx context.Context, connectControl *ConnectControlArgs, callback ConnectControlCallback) {
 	go HandleError(func() {
 		HttpPostWithStrategy(
-			self.ctx,
+			ctx,
 			self.clientStrategy,
 			fmt.Sprintf("%s/connect/control", self.apiUrl),
 			connectControl,

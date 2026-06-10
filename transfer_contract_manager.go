@@ -206,6 +206,8 @@ func DefaultContractManagerSettingsWithBufferSize(bufferSize int) *ContractManag
 
 		OriginContractLinger: 300 * time.Second,
 
+		ContractQueueExpireTimeout: 120 * time.Second,
+
 		ProtocolVersion: DefaultProtocolVersion,
 
 		// TODO remove
@@ -249,6 +251,15 @@ type ContractManagerSettings struct {
 	// direction was closed, so reply traffic can resume after the request side
 	// goes idle.
 	OriginContractLinger time.Duration
+
+	// expire queued contracts that no sequence has taken within this window.
+	// Bounds `destinationContracts` growth from orphans (e.g. a
+	// `CreateContractResult` that lands after the owning sequence exit-flushed
+	// its queue, for a destination that is never used again), and prevents
+	// handing out a stale contract the platform may have already force-closed
+	// server-side — keep this below the platform's unused-contract force-close
+	// window (5 minutes). <= 0 disables expiry.
+	ContractQueueExpireTimeout time.Duration
 
 	ProtocolVersion int
 
@@ -335,7 +346,84 @@ func NewContractManager(
 		go HandleError(contractManager.providePing, client.Cancel)
 	}
 
+	go HandleError(contractManager.expireQueuedContracts, client.Cancel)
+
 	return contractManager
+}
+
+// expireQueuedContracts periodically closes queued contracts that no sequence
+// took within `ContractQueueExpireTimeout` and removes the emptied queues.
+// This bounds `destinationContracts` against orphans — e.g. a
+// `CreateContractResult` that lands after the owning sequence exit-flushed its
+// queue (`FlushContractQueue` force-remove) re-creates the queue entry, and if
+// that destination is never used again (provider rotation) the entry would
+// otherwise be retained forever.
+func (self *ContractManager) expireQueuedContracts() {
+	timeout := self.settings.ContractQueueExpireTimeout
+
+	// the contract manager is closing: close all still-queued (pending)
+	// contracts so their escrow is released promptly. `closeContracts`
+	// routes shutdown closes over the out-of-band api on a Background
+	// context, since the client context (and the in-band transport) is
+	// already closed.
+	finalFlush := func() {
+		pending := []*protocol.Contract{}
+		func() {
+			self.mutex.Lock()
+			defer self.mutex.Unlock()
+
+			for contractKey, contractQueue := range self.destinationContracts {
+				pending = append(pending, contractQueue.Flush(false)...)
+				if contractQueue.IsDone() {
+					delete(self.destinationContracts, contractKey)
+				}
+			}
+		}()
+		if 0 < len(pending) {
+			glog.V(1).Infof("[contract]closing %d pending contracts on close\n", len(pending))
+			self.closeContracts(pending)
+		}
+	}
+
+	for {
+		// when expiry is disabled the nil tick channel blocks forever and the
+		// loop only waits for shutdown
+		var tick <-chan time.Time
+		if 0 < timeout {
+			tick = time.After(timeout / 2)
+		}
+
+		select {
+		case <-self.ctx.Done():
+			finalFlush()
+			return
+		case <-self.client.Done():
+			// the manager ctx is the client's parent ctx; the client closing
+			// is the shutdown signal
+			finalFlush()
+			return
+		case <-tick:
+		}
+
+		minEnqueueTime := time.Now().Add(-timeout)
+		expired := []*protocol.Contract{}
+		func() {
+			self.mutex.Lock()
+			defer self.mutex.Unlock()
+
+			for contractKey, contractQueue := range self.destinationContracts {
+				expired = append(expired, contractQueue.Expire(minEnqueueTime)...)
+				if contractQueue.IsDone() {
+					delete(self.destinationContracts, contractKey)
+				}
+			}
+		}()
+		if 0 < len(expired) {
+			glog.V(1).Infof("[contract]expired %d queued contracts\n", len(expired))
+			// close outside the manager mutex: CloseContract re-takes it
+			self.closeContracts(expired)
+		}
+	}
 }
 
 func (self *ContractManager) providePing() {
@@ -878,7 +966,16 @@ func (self *ContractManager) TakeContract(
 	enterTime := time.Now()
 	for {
 		notify := contractQueue.updateMonitor.NotifyChannel()
-		contract := contractQueue.Poll()
+		var minEnqueueTime time.Time
+		if 0 < self.settings.ContractQueueExpireTimeout {
+			minEnqueueTime = time.Now().Add(-self.settings.ContractQueueExpireTimeout)
+		}
+		contract, expired := contractQueue.Poll(minEnqueueTime)
+		if 0 < len(expired) {
+			// stale queued contracts may already be force-closed server-side;
+			// close them rather than handing them to a sequence
+			self.closeContracts(expired)
+		}
 
 		if contract == nil && contractQueue.Drained() {
 			// the queue was force-removed (e.g., the owning send sequence closed).
@@ -1086,6 +1183,32 @@ func (self *ContractManager) CloseContractWithCheckpoint(
 		glog.Infof("[contract]could not create close contract frame = %s\n", err)
 		return
 	}
+
+	if self.ctx.Err() != nil || self.client.IsDone() {
+		// the client context is closed (the contract manager is closing).
+		// note the manager ctx is the client's parent ctx, so check both.
+		// `ControlSync` rides the in-band client transport, which is gone —
+		// it would drop the close without a single attempt. Send a one-shot
+		// cleanup over the out-of-band api on a Background context instead,
+		// since the lifecycle context is closed. One shot, never retried, so
+		// cleanup cannot run away; the server's expired-contract force-close
+		// remains the backstop if the single attempt fails.
+		sendCallback := func(resultFrames []*protocol.Frame, sendErr error) {
+			if sendErr == nil {
+				glog.V(1).Infof("[contract]closed %s after client close\n", contractId)
+			} else {
+				glog.Infof("[contract]could not close %s after client close = %s\n", contractId, sendErr)
+			}
+		}
+		frames := []*protocol.Frame{frame}
+		if clientOob, ok := self.client.ClientOob().(OutOfBandControlWithCtx); ok {
+			clientOob.SendControlWithCtx(context.Background(), frames, sendCallback)
+		} else {
+			self.client.ClientOob().SendControl(frames, sendCallback)
+		}
+		return
+	}
+
 	closeControlSync := NewControlSync(self.ctx, self.client, fmt.Sprintf("close-contract-%s", contractId))
 	closeControlSync.Send(frame, nil, func(sendErr error) {
 		defer closeControlSync.Close()
@@ -1217,12 +1340,19 @@ func (self *ContractManager) closeContractQueueWithForceRemove(contractKey Contr
 	}
 }
 
+// a contract waiting in the queue, stamped so unconsumed contracts can be
+// expired (see `ContractQueueExpireTimeout`)
+type queuedContract struct {
+	contract    *protocol.Contract
+	enqueueTime time.Time
+}
+
 type contractQueue struct {
 	updateMonitor *Monitor
 
 	mutex     sync.Mutex
 	openCount int
-	contracts map[Id]*protocol.Contract
+	contracts map[Id]*queuedContract
 	drained   bool
 
 	// remember all added contract ids
@@ -1234,7 +1364,7 @@ func newContractQueue(trackUsedContracts bool) *contractQueue {
 	return &contractQueue{
 		updateMonitor:      NewMonitor(),
 		openCount:          0,
-		contracts:          map[Id]*protocol.Contract{},
+		contracts:          map[Id]*queuedContract{},
 		trackUsedContracts: trackUsedContracts,
 		usedContractIds:    map[Id]bool{},
 	}
@@ -1254,20 +1384,42 @@ func (self *contractQueue) Close() {
 	self.openCount -= 1
 }
 
-func (self *contractQueue) Poll() *protocol.Contract {
+// Poll returns one queued contract, never one enqueued before
+// `minEnqueueTime` — stale entries are removed and returned as `expired` for
+// the caller to close (the platform force-closes unused contracts, so a stale
+// queued contract may already be settled server-side). A zero `minEnqueueTime`
+// expires nothing.
+func (self *contractQueue) Poll(minEnqueueTime time.Time) (*protocol.Contract, []*protocol.Contract) {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 
-	if len(self.contracts) == 0 {
-		return nil
-	}
+	expired := self.expireWithLock(minEnqueueTime)
 
-	contractIds := maps.Keys(self.contracts)
 	// choose arbitrarily
-	contractId := contractIds[0]
-	contract := self.contracts[contractId]
-	delete(self.contracts, contractId)
-	return contract
+	for contractId, queuedContract := range self.contracts {
+		delete(self.contracts, contractId)
+		return queuedContract.contract, expired
+	}
+	return nil, expired
+}
+
+// Expire removes and returns all contracts enqueued before `minEnqueueTime`.
+func (self *contractQueue) Expire(minEnqueueTime time.Time) []*protocol.Contract {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+
+	return self.expireWithLock(minEnqueueTime)
+}
+
+func (self *contractQueue) expireWithLock(minEnqueueTime time.Time) []*protocol.Contract {
+	var expired []*protocol.Contract
+	for contractId, queuedContract := range self.contracts {
+		if queuedContract.enqueueTime.Before(minEnqueueTime) {
+			expired = append(expired, queuedContract.contract)
+			delete(self.contracts, contractId)
+		}
+	}
+	return expired
 }
 
 func (self *contractQueue) Add(contract *protocol.Contract, storedContract *protocol.StoredContract) error {
@@ -1282,14 +1434,20 @@ func (self *contractQueue) Add(contract *protocol.Contract, storedContract *prot
 	// update contract if present
 	if _, ok := self.contracts[contractId]; ok {
 		glog.V(2).Infof("[contract]add update existing %s\n", contractId)
-		self.contracts[contractId] = contract
+		self.contracts[contractId] = &queuedContract{
+			contract:    contract,
+			enqueueTime: time.Now(),
+		}
 		self.updateMonitor.NotifyAll()
 	} else if !self.trackUsedContracts || !self.usedContractIds[contractId] {
 		glog.V(2).Infof("[contract]add %s\n", contractId)
 		if self.trackUsedContracts {
 			self.usedContractIds[contractId] = true
 		}
-		self.contracts[contractId] = contract
+		self.contracts[contractId] = &queuedContract{
+			contract:    contract,
+			enqueueTime: time.Now(),
+		}
 		self.updateMonitor.NotifyAll()
 	} else {
 		glog.V(2).Infof("[contract]add already used %s\n", contractId)
@@ -1309,8 +1467,11 @@ func (self *contractQueue) Flush(removeUsedContractIds bool) []*protocol.Contrac
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 
-	contracts := maps.Values(self.contracts)
-	self.contracts = map[Id]*protocol.Contract{}
+	contracts := []*protocol.Contract{}
+	for _, queuedContract := range self.contracts {
+		contracts = append(contracts, queuedContract.contract)
+	}
+	self.contracts = map[Id]*queuedContract{}
 	if removeUsedContractIds {
 		self.usedContractIds = map[Id]bool{}
 	}

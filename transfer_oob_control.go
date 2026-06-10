@@ -25,6 +25,16 @@ type OutOfBandControl interface {
 	SendControl(frames []*protocol.Frame, callback OobResultFunction)
 }
 
+// OutOfBandControlWithCtx is an optional upgrade interface for one-shot
+// control with a caller-chosen context — e.g. shutdown cleanup that must
+// outlive the closed client lifecycle (closing pending contracts). Normal
+// control should use `SendControl`, which stays bound to the lifecycle
+// context.
+type OutOfBandControlWithCtx interface {
+	OutOfBandControl
+	SendControlWithCtx(ctx context.Context, frames []*protocol.Frame, callback OobResultFunction)
+}
+
 type ApiOutOfBandControl struct {
 	api *BringYourApi
 }
@@ -52,6 +62,30 @@ func (self *ApiOutOfBandControl) SendControl(
 	frames []*protocol.Frame,
 	callback OobResultFunction,
 ) {
+	// bound to the api lifecycle context: keep trying as long as the
+	// lifecycle is active
+	self.sendControl(self.api.ConnectControl, frames, callback)
+}
+
+// SendControlWithCtx is a one-shot send on a caller-chosen context, for
+// cleanup that must not be bound to the (possibly closed) lifecycle context.
+// The request stays bounded by the client strategy's `RequestTimeout`.
+func (self *ApiOutOfBandControl) SendControlWithCtx(
+	ctx context.Context,
+	frames []*protocol.Frame,
+	callback OobResultFunction,
+) {
+	connectControl := func(connectControlArgs *ConnectControlArgs, apiCallback ConnectControlCallback) {
+		self.api.ConnectControlWithCtx(ctx, connectControlArgs, apiCallback)
+	}
+	self.sendControl(connectControl, frames, callback)
+}
+
+func (self *ApiOutOfBandControl) sendControl(
+	connectControl func(*ConnectControlArgs, ConnectControlCallback),
+	frames []*protocol.Frame,
+	callback OobResultFunction,
+) {
 	safeCallback := func(resultFrames []*protocol.Frame, err error) {
 		if callback != nil {
 			HandleError(func() {
@@ -75,7 +109,7 @@ func (self *ApiOutOfBandControl) SendControl(
 	}
 	defer MessagePoolReturn(packBytes)
 
-	self.api.ConnectControl(
+	connectControl(
 		&ConnectControlArgs{
 			Pack: EncodeBase64(base64.StdEncoding, packBytes),
 		},
