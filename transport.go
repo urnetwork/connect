@@ -397,6 +397,14 @@ func isBetterMode(current TransportMode, other TransportMode) bool {
 var lastAuthErrLogNano atomic.Int64
 var suppressedAuthErrCount atomic.Int64
 
+// lastWriteErrLogNano and suppressedWriteErrCount rate-limit [ts] write-error
+// log lines. A socket that is broken but still open keeps accepting writes that
+// immediately fail, so the writer goroutine retries in a tight loop and every
+// failed write logs a line. During an outage this floods the log just like the
+// auth path, so the same once-per-minute throttle is applied here.
+var lastWriteErrLogNano atomic.Int64
+var suppressedWriteErrCount atomic.Int64
+
 // shouldLogAuthErr returns (true, suppressedCount) if a log line should be emitted,
 // resetting the suppressed counter. Returns (false, 0) if the error is suppressed.
 func shouldLogAuthErr() (bool, int64) {
@@ -411,6 +419,25 @@ func shouldLogAuthErr() (bool, int64) {
 		return false, 0
 	}
 	suppressed := suppressedAuthErrCount.Swap(0)
+	return true, suppressed
+}
+
+// shouldLogWriteErr returns (true, suppressedCount) if a [ts] write-error line
+// should be emitted, resetting the suppressed counter. Returns (false, 0) if
+// suppressed. A broken-but-open socket retries writes in a tight loop; this
+// throttles that flood to one line per minute with a suppressed count.
+func shouldLogWriteErr() (bool, int64) {
+	now := time.Now().UnixNano()
+	last := lastWriteErrLogNano.Load()
+	if now-last < int64(time.Minute) {
+		suppressedWriteErrCount.Add(1)
+		return false, 0
+	}
+	if !lastWriteErrLogNano.CompareAndSwap(last, now) {
+		suppressedWriteErrCount.Add(1)
+		return false, 0
+	}
+	suppressed := suppressedWriteErrCount.Swap(0)
 	return true, suppressed
 }
 
@@ -682,7 +709,13 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					MessagePoolReturn(message)
 					if err != nil {
 						// note that for websocket a dealine timeout cannot be recovered
-						self.log.Infof("[ts]%s-> error = %s\n", clientId, err)
+						if ok, suppressed := shouldLogWriteErr(); ok {
+							if suppressed > 0 {
+								self.log.Infof("[ts]%s-> error = %s (%d suppressed)\n", clientId, err, suppressed)
+							} else {
+								self.log.Infof("[ts]%s-> error = %s\n", clientId, err)
+							}
+						}
 						return err
 					}
 					self.log.V(2).Infof("[ts]%s->\n", clientId)
