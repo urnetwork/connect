@@ -5,8 +5,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/urnetwork/glog"
-
 	"github.com/urnetwork/connect/protocol"
 )
 
@@ -101,7 +99,7 @@ func (self *ControlSyncOob) Send(frame *protocol.Frame, ackCallback AckFunction)
 					handleCancel()
 					return
 				}
-				glog.V(2).Infof("[control-oob][%d]retry scope = %s err = %s\n", syncIndex, self.scopeTag, err)
+				self.client.log.V(2).Infof("[control-oob][%d]retry scope = %s err = %s\n", syncIndex, self.scopeTag, err)
 				select {
 				case <-handleCtx.Done():
 				case <-self.client.Done():

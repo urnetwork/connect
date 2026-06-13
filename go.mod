@@ -1,6 +1,6 @@
 module github.com/urnetwork/connect
 
-go 1.25.0
+go 1.25.5
 
 require (
 	github.com/docopt/docopt-go v0.0.0-20180111231733-ee0de3bc6815
@@ -10,6 +10,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/oklog/ulid/v2 v2.1.1
 	github.com/pion/datachannel v1.6.0
+	github.com/pion/logging v0.2.4
 	github.com/pion/webrtc/v4 v4.2.12
 	github.com/quic-go/quic-go v0.59.0
 	github.com/urnetwork/glog v0.0.0
@@ -19,15 +20,16 @@ require (
 	golang.org/x/net v0.53.0
 	golang.org/x/term v0.42.0
 	google.golang.org/protobuf v1.36.11
+	gvisor.dev/gvisor v0.0.0-20260501174236-38fac1bddd3c
 	src.agwa.name/tlshacks v0.0.2
 )
 
 require (
+	github.com/google/btree v1.1.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/pion/dtls/v3 v3.1.2 // indirect
 	github.com/pion/ice/v4 v4.2.5 // indirect
 	github.com/pion/interceptor v0.1.45 // indirect
-	github.com/pion/logging v0.2.4 // indirect
 	github.com/pion/mdns/v2 v2.1.0 // indirect
 	github.com/pion/randutil v0.1.0 // indirect
 	github.com/pion/rtcp v1.2.16 // indirect

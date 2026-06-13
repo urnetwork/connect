@@ -8,7 +8,7 @@ import (
 )
 
 func TestRttWindow(t *testing.T) {
-	rttWindow := NewRttWindow(4, 1*time.Second, 1.0, 0, time.Second)
+	rttWindow := NewRttWindow(nil, 4, 1*time.Second, 1.0, 0, time.Second)
 
 	assert.Equal(t, rttWindow.ScaledRtt(), time.Duration(0))
 

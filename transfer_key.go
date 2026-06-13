@@ -8,8 +8,6 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/urnetwork/glog"
-
 	"github.com/urnetwork/connect/protocol"
 )
 
@@ -239,7 +237,7 @@ func (self *ClientKeyManager) publishClientKey() {
 		PublicKey: []byte(self.PublicKey()),
 	}, self.client.settings.ProtocolVersion)
 	if err != nil {
-		glog.Errorf("[key]%s could not build ClientKey frame: %s\n", self.client.ClientTag(), err)
+		self.client.log.Errorf("[key]%s could not build ClientKey frame: %s\n", self.client.ClientTag(), err)
 		return
 	}
 	self.controlSync.Send(frame, nil, nil)

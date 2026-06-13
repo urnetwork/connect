@@ -295,7 +295,7 @@ func TestContractQueueExpire(t *testing.T) {
 	assert.Equal(t, nil, takenContract)
 
 	// Poll guard: a stale queued contract is never handed out
-	queue := newContractQueue(false)
+	queue := newContractQueue(nil, false)
 	staleContract, staleStoredContract := makeContract()
 	queue.Add(staleContract, staleStoredContract)
 	polled, expiredContracts := queue.Poll(time.Now().Add(time.Minute))

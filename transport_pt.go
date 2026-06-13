@@ -13,8 +13,6 @@ import (
 
 	"golang.org/x/crypto/sha3"
 	"golang.org/x/net/dns/dnsmessage"
-
-	"github.com/urnetwork/glog"
 )
 
 // "whodis" protocol refers to a suite of pre-authentication packet translation techniques
@@ -68,6 +66,10 @@ func DefaultPacketTranslationSettings() *PacketTranslationSettings {
 }
 
 type PacketTranslationSettings struct {
+	// Log, when set, is used by the packet translation.
+	// nil resolves to `DefaultLogger()`.
+	Log Logger
+
 	DnsTlds [][]byte
 	// DnsAddr        *net.UDPAddr
 	DnsPumpTimeout time.Duration
@@ -93,6 +95,7 @@ type packet struct {
 type packetTranslation struct {
 	ctx    context.Context
 	cancel context.CancelFunc
+	log    Logger
 
 	ptMode       PacketTranslationMode
 	packetConn   net.PacketConn
@@ -152,6 +155,7 @@ func NewPacketTranslationWithPrefix(
 			// debug.PrintStack()
 			cancel()
 		},
+		log:                  loggerOrDefault(settings.Log),
 		ptMode:               ptMode,
 		packetConn:           packetConn,
 		headerPrefix:         headerPrefix,
@@ -267,11 +271,11 @@ func (self *packetTranslation) encodeDns() {
 
 					// _, err = self.packetConn.WriteTo(packetData, p.addr)
 					// if err != nil {
-					// 	glog.Infof("[pt]write err = %s\n", err)
+					// 	self.log.Infof("[pt]write err = %s\n", err)
 					// 	return err
 					// }
 
-					// glog.Infof("[pt]write raw\n")
+					// self.log.Infof("[pt]write raw\n")
 
 				}
 				if n != len(p.data) {
@@ -291,7 +295,7 @@ func (self *packetTranslation) encodeDns() {
 						select {
 						case <-self.ctx.Done():
 						default:
-							glog.Infof("[pt]write err = %s\n", err)
+							self.log.Infof("[pt]write err = %s\n", err)
 						}
 						return
 					}
@@ -324,7 +328,7 @@ func (self *packetTranslation) encodeDns() {
 							select {
 							case <-self.ctx.Done():
 							default:
-								glog.Infof("[pt]write err = %s\n", err)
+								self.log.Infof("[pt]write err = %s\n", err)
 							}
 							return
 						}
@@ -342,7 +346,7 @@ func (self *packetTranslation) encodeDns() {
 							}
 						}
 					} else {
-						glog.Infof("[pt]cannot pump dns due to missing most recent addr\n")
+						self.log.Infof("[pt]cannot pump dns due to missing most recent addr\n")
 					}
 				}
 			} else {
@@ -354,7 +358,7 @@ func (self *packetTranslation) encodeDns() {
 						select {
 						case <-self.ctx.Done():
 						default:
-							glog.Infof("[pt]write err = %s\n", err)
+							self.log.Infof("[pt]write err = %s\n", err)
 						}
 						return
 					}
@@ -472,7 +476,7 @@ func (self *packetTranslation) encodeDns() {
 					select {
 					case <-self.ctx.Done():
 					default:
-						glog.Infof("[pt]write err = %s\n", err)
+						self.log.Infof("[pt]write err = %s\n", err)
 					}
 					return
 				}
@@ -547,7 +551,7 @@ func (self *packetTranslation) decodeDns() {
 				if err != nil {
 					// drop the packet
 					MessagePoolReturn(r.data)
-					glog.Errorf("[pt]combine err = %s\n", err)
+					self.log.Errorf("[pt]combine err = %s\n", err)
 					continue
 				}
 
@@ -555,7 +559,7 @@ func (self *packetTranslation) decodeDns() {
 					// drop the packet
 					MessagePoolReturn(r.data)
 					// fmt.Printf("PACKET READ ONE DROP LIMIT\n")
-					glog.Errorf("[pt]combine limit\n")
+					self.log.Errorf("[pt]combine limit\n")
 					continue
 				}
 
@@ -601,11 +605,11 @@ func (self *packetTranslation) decodeDns() {
 			select {
 			case <-self.ctx.Done():
 			default:
-				glog.Infof("[pt]read err = %s\n", err)
+				self.log.Infof("[pt]read err = %s\n", err)
 			}
 			return
 		}
-		// glog.Infof("[pt]read raw\n")
+		// self.log.Infof("[pt]read raw\n")
 
 		var header [18]byte
 		var data []byte
@@ -636,8 +640,8 @@ func (self *packetTranslation) decodeDns() {
 				continue
 			}
 
-			if glog.V(2) {
-				glog.Infof("[pt]decode one: %v, %v (%d/%d), (%d), %s, %s, %v\n", id, header, header[17], header[16], len(data), string(tld), err, otherData)
+			if self.log.V(2).Enabled() {
+				self.log.Infof("[pt]decode one: %v, %v (%d/%d), (%d), %s, %s, %v\n", id, header, header[17], header[16], len(data), string(tld), err, otherData)
 			}
 
 			item := &pumpItem{
@@ -741,7 +745,7 @@ func (self *packetTranslation) WriteTo(packetData []byte, addr net.Addr) (n int,
 			case self.out <- p:
 				queued = true
 				n = len(packetData)
-				glog.V(2).Infof("[pt]write packet\n")
+				self.log.V(2).Infof("[pt]write packet\n")
 				return
 			case <-deadlineChanged:
 			}
@@ -751,7 +755,7 @@ func (self *packetTranslation) WriteTo(packetData []byte, addr net.Addr) (n int,
 		timeout := writeDeadline.Sub(time.Now())
 		if timeout <= 0 {
 			err = fmt.Errorf("Timeout.")
-			glog.Infof("[pt]write packet timeout\n")
+			self.log.Infof("[pt]write packet timeout\n")
 			return
 		}
 		select {
@@ -761,11 +765,11 @@ func (self *packetTranslation) WriteTo(packetData []byte, addr net.Addr) (n int,
 		case self.out <- p:
 			queued = true
 			n = len(packetData)
-			glog.V(2).Infof("[pt]write packet\n")
+			self.log.V(2).Infof("[pt]write packet\n")
 			return
 		case <-time.After(timeout):
 			err = fmt.Errorf("Timeout.")
-			glog.Infof("[pt]write packet timeout\n")
+			self.log.Infof("[pt]write packet timeout\n")
 			return
 		case <-deadlineChanged:
 		}
@@ -784,7 +788,7 @@ func (self *packetTranslation) ReadFrom(packetData []byte) (n int, addr net.Addr
 				addr = p.addr
 				n = copy(packetData, p.data)
 				MessagePoolReturn(p.data)
-				glog.V(2).Infof("[pt]read packet\n")
+				self.log.V(2).Infof("[pt]read packet\n")
 				return
 			case <-deadlineChanged:
 			}
@@ -794,7 +798,7 @@ func (self *packetTranslation) ReadFrom(packetData []byte) (n int, addr net.Addr
 		timeout := readDeadline.Sub(time.Now())
 		if timeout <= 0 {
 			err = fmt.Errorf("Timeout.")
-			glog.Infof("[pt]read packet timeout\n")
+			self.log.Infof("[pt]read packet timeout\n")
 			return
 		}
 		select {
@@ -805,11 +809,11 @@ func (self *packetTranslation) ReadFrom(packetData []byte) (n int, addr net.Addr
 			addr = p.addr
 			n = copy(packetData, p.data)
 			MessagePoolReturn(p.data)
-			glog.V(2).Infof("[pt]read packet\n")
+			self.log.V(2).Infof("[pt]read packet\n")
 			return
 		case <-time.After(timeout):
 			err = fmt.Errorf("Timeout.")
-			glog.Infof("[pt]read packet timeout\n")
+			self.log.Infof("[pt]read packet timeout\n")
 			return
 		case <-deadlineChanged:
 		}

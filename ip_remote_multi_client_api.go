@@ -244,9 +244,15 @@ func (self *ApiMultiClientGenerator) NewClient(
 	// registered races and fails verification ("Contract verification failed").
 	// The oob ack means the secret is committed (an in-band control ack only
 	// means the message was delivered, not processed).
+	// Network is also enabled so a same-network provider can return traffic
+	// under the network relationship (no companion contract), which the
+	// provider echoes for network-mode flows. Cross-network providers continue
+	// to use the companion (Stream) return path.
 	provideAck := make(chan error, 1)
 	client.ContractManager().SetProvideModesWithReturnTrafficWithOobAckCallback(
-		map[protocol.ProvideMode]bool{},
+		map[protocol.ProvideMode]bool{
+			protocol.ProvideMode_Network: true,
+		},
 		func(err error) {
 			select {
 			case provideAck <- err:
@@ -281,6 +287,6 @@ func (self *ApiMultiClientGenerator) FixedDestinationSize() (int, bool) {
 			specClientIds = append(specClientIds, *spec.ClientId)
 		}
 	}
-	// glog.Infof("[multi]eval fixed %d/%d\n", len(specClientIds), len(self.specs))
+	// self.log.Infof("[multi]eval fixed %d/%d\n", len(specClientIds), len(self.specs))
 	return len(specClientIds), len(specClientIds) == len(self.specs)
 }

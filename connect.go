@@ -200,6 +200,161 @@ func (self TransferPath) String() string {
 	}
 }
 
+// parseFilteredTransferPath extracts the transfer path from an encoded
+// `protocol.TransferFrame` without reflection or allocation. This runs for
+// every frame a client routes (see `Client.run` and `Client.Forward`),
+// where the reflection-based `FilteredTransferFrame` unmarshal dominates
+// the allocation profile. Unknown fields are skipped the same as the
+// protobuf decoder. `ok` is false on any unexpected encoding, in which
+// case the caller must fall back to the full unmarshal.
+func parseFilteredTransferPath(b []byte) (path TransferPath, exists bool, ok bool) {
+	i := 0
+	n := len(b)
+
+	readVarint := func(limit int) (uint64, bool) {
+		var v uint64
+		var shift uint
+		for {
+			if limit <= i || 63 < shift {
+				return 0, false
+			}
+			c := b[i]
+			i += 1
+			v |= uint64(c&0x7f) << shift
+			if c < 0x80 {
+				return v, true
+			}
+			shift += 7
+		}
+	}
+
+	skipField := func(wireType uint64, limit int) bool {
+		switch wireType {
+		case 0:
+			// varint
+			_, varintOk := readVarint(limit)
+			return varintOk
+		case 1:
+			// fixed 64
+			if limit < i+8 {
+				return false
+			}
+			i += 8
+			return true
+		case 2:
+			// length delimited
+			length, lengthOk := readVarint(limit)
+			if !lengthOk || uint64(limit-i) < length {
+				return false
+			}
+			i += int(length)
+			return true
+		case 5:
+			// fixed 32
+			if limit < i+4 {
+				return false
+			}
+			i += 4
+			return true
+		default:
+			// group types are not used by the protocol
+			return false
+		}
+	}
+
+	for i < n {
+		tag, tagOk := readVarint(n)
+		if !tagOk {
+			return TransferPath{}, false, false
+		}
+		fieldNumber := tag >> 3
+		wireType := tag & 0x7
+
+		// TransferFrame { TransferPath transfer_path = 1; ... }
+		if fieldNumber != 1 {
+			if !skipField(wireType, n) {
+				return TransferPath{}, false, false
+			}
+			continue
+		}
+		if wireType != 2 {
+			return TransferPath{}, false, false
+		}
+		length, lengthOk := readVarint(n)
+		if !lengthOk || uint64(n-i) < length {
+			return TransferPath{}, false, false
+		}
+		end := i + int(length)
+		exists = true
+
+		// TransferPath {
+		//     optional bytes destination_id = 1;
+		//     optional bytes source_id = 2;
+		//     optional bytes stream_id = 3;
+		// }
+		for i < end {
+			pathTag, pathTagOk := readVarint(end)
+			if !pathTagOk {
+				return TransferPath{}, false, false
+			}
+			pathFieldNumber := pathTag >> 3
+			pathWireType := pathTag & 0x7
+
+			switch pathFieldNumber {
+			case 1, 2, 3:
+				if pathWireType != 2 {
+					return TransferPath{}, false, false
+				}
+				idLength, idLengthOk := readVarint(end)
+				if !idLengthOk || uint64(end-i) < idLength {
+					return TransferPath{}, false, false
+				}
+				if idLength != 16 {
+					// ids are always 16 bytes
+					return TransferPath{}, false, false
+				}
+				var id Id
+				copy(id[:], b[i:i+16])
+				i += 16
+				switch pathFieldNumber {
+				case 1:
+					path.DestinationId = id
+				case 2:
+					path.SourceId = id
+				case 3:
+					path.StreamId = id
+				}
+			default:
+				if !skipField(pathWireType, end) {
+					return TransferPath{}, false, false
+				}
+			}
+		}
+	}
+	return path, exists, true
+}
+
+// FilteredTransferPath parses the transfer path of an encoded
+// `protocol.TransferFrame`, using the allocation-free fast path with a
+// full `FilteredTransferFrame` unmarshal fallback
+func FilteredTransferPath(transferFrameBytes []byte) (TransferPath, error) {
+	if path, exists, ok := parseFilteredTransferPath(transferFrameBytes); ok {
+		if !exists {
+			return TransferPath{}, errors.New("Missing transfer path")
+		}
+		return path, nil
+	}
+	// fall back to the full unmarshal
+	filteredTransferFrame := &protocol.FilteredTransferFrame{}
+	if err := ProtoUnmarshal(transferFrameBytes, filteredTransferFrame); err != nil {
+		return TransferPath{}, err
+	}
+	if filteredTransferFrame.TransferPath == nil {
+		return TransferPath{}, errors.New("Missing transfer path")
+	}
+	return TransferPathFromProtobuf(filteredTransferFrame.TransferPath)
+}
+
 func (self TransferPath) ToProtobuf() *protocol.TransferPath {
 	protoTransferPath := &protocol.TransferPath{}
 	if (self.SourceId != Id{}) {

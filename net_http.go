@@ -26,8 +26,6 @@ import (
 	"golang.org/x/exp/maps"
 
 	"github.com/gorilla/websocket"
-
-	"github.com/urnetwork/glog"
 )
 
 // censorship-resistant strategies for making https connections
@@ -69,6 +67,10 @@ func DefaultClientStrategySettings() *ClientStrategySettings {
 }
 
 type ClientStrategySettings struct {
+	// Log, when set, is used by the client strategy. nil resolves to
+	// `DefaultLogger()`.
+	Log Logger
+
 	// expose consistent ips
 	// if true, enables ech
 	ExposeServerIps bool
@@ -111,6 +113,7 @@ type ClientStrategySettings struct {
 // stores statistics on client strategies
 type ClientStrategy struct {
 	ctx context.Context
+	log Logger
 
 	settings *ClientStrategySettings
 
@@ -132,6 +135,11 @@ func NewClientStrategyWithDefaults(ctx context.Context) *ClientStrategy {
 
 // extender udp 53 to platform extender
 func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *ClientStrategy {
+	// propagate so a strategy-level logger covers dial logging
+	if settings.ConnectSettings.Log == nil {
+		settings.ConnectSettings.Log = settings.Log
+	}
+
 	// create dialers to match settings
 	dialers := map[*clientDialer]bool{}
 	resolvedExtenderIps := []netip.Addr{}
@@ -284,6 +292,7 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 
 	return &ClientStrategy{
 		ctx:                 ctx,
+		log:                 loggerOrDefault(settings.Log),
 		settings:            settings,
 		dialers:             dialers,
 		resolvedExtenderIps: resolvedExtenderIps,
@@ -498,10 +507,10 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 				result := eval(handleCtx, dialer)
 				if result != nil {
 					if result.err == nil {
-						glog.V(2).Infof("[net][p]select: %s\n", dialer.String())
+						self.log.V(2).Infof("[net][p]select: %s\n", dialer.String())
 						return result
 					}
-					glog.V(2).Infof("[net][p]select: %s = %s\n", dialer.String(), result.err)
+					self.log.V(2).Infof("[net][p]select: %s = %s\n", dialer.String(), result.err)
 					result.Close()
 				}
 			}
@@ -522,10 +531,10 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 				case result := <-out:
 					if result != nil {
 						if result.err == nil {
-							glog.V(2).Infof("[net][p]select: %s\n", result.dialer.String())
+							self.log.V(2).Infof("[net][p]select: %s\n", result.dialer.String())
 							return result
 						}
-						glog.V(2).Infof("[net][p]select: %s = %s\n", result.dialer.String(), result.err)
+						self.log.V(2).Infof("[net][p]select: %s = %s\n", result.dialer.String(), result.err)
 						result.Close()
 					}
 					go HandleError(func() {
@@ -550,10 +559,10 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 				case result := <-out:
 					if result != nil {
 						if result.err == nil {
-							glog.V(2).Infof("[net][p]select: %s\n", result.dialer.String())
+							self.log.V(2).Infof("[net][p]select: %s\n", result.dialer.String())
 							return result
 						}
-						glog.V(2).Infof("[net][p]select: %s = %s\n", result.dialer.String(), result.err)
+						self.log.V(2).Infof("[net][p]select: %s = %s\n", result.dialer.String(), result.err)
 						result.Close()
 					}
 					go HandleError(func() {
@@ -635,10 +644,10 @@ func (self *ClientStrategy) serialEval(ctx context.Context, eval func(ctx contex
 			result := eval(handleCtx, dialer)
 			if result != nil {
 				if result.err == nil {
-					glog.V(2).Infof("[net][s]select: %s\n", dialer.String())
+					self.log.V(2).Infof("[net][s]select: %s\n", dialer.String())
 					return result
 				}
-				glog.V(2).Infof("[net][s]select: %s = %s\n", dialer.String(), result.err)
+				self.log.V(2).Infof("[net][s]select: %s = %s\n", dialer.String(), result.err)
 				result.Close()
 			}
 		}
@@ -692,11 +701,11 @@ func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, er
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
 		httpClient := dialer.HttpClient()
 		response, err := httpClient.Do(request.WithContext(handleCtx))
-		if glog.V(2) {
+		if self.log.V(2).Enabled() {
 			if err != nil {
-				glog.Infof("[net]http parallel %s %s = %s\n", request.Method, request.URL, err)
+				self.log.Infof("[net]http parallel %s %s = %s\n", request.Method, request.URL, err)
 			} else {
-				glog.Infof("[net]http parallel %s %s = %s\n", request.Method, request.URL, response.Status)
+				self.log.Infof("[net]http parallel %s %s = %s\n", request.Method, request.URL, response.Status)
 			}
 		}
 
@@ -722,11 +731,11 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
 		httpClient := dialer.HttpClient()
 		response, err := httpClient.Do(request.WithContext(handleCtx))
-		if glog.V(2) {
+		if self.log.V(2).Enabled() {
 			if err != nil {
-				glog.Infof("[net]http serial %s %s = %s\n", request.Method, request.URL, err)
+				self.log.Infof("[net]http serial %s %s = %s\n", request.Method, request.URL, err)
 			} else {
-				glog.Infof("[net]http serial %s %s = %s\n", request.Method, request.URL, response.Status)
+				self.log.Infof("[net]http serial %s %s = %s\n", request.Method, request.URL, response.Status)
 			}
 		}
 
@@ -737,11 +746,11 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 	helloEval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
 		httpClient := dialer.HttpClient()
 		response, err := httpClient.Do(helloRequest.WithContext(handleCtx))
-		if glog.V(2) {
+		if self.log.V(2).Enabled() {
 			if err != nil {
-				glog.Infof("[net]http serial hello %s %s = %s\n", helloRequest.Method, helloRequest.URL, err)
+				self.log.Infof("[net]http serial hello %s %s = %s\n", helloRequest.Method, helloRequest.URL, err)
 			} else {
-				glog.Infof("[net]http serial hello %s %s = %s\n", helloRequest.Method, helloRequest.URL, response.Status)
+				self.log.Infof("[net]http serial hello %s %s = %s\n", helloRequest.Method, helloRequest.URL, response.Status)
 			}
 		}
 
@@ -761,11 +770,11 @@ func (self *ClientStrategy) WsDialContext(ctx context.Context, url string, reque
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
 		wsDialer := dialer.WsDialer(self.settings)
 		wsConn, response, err := wsDialer.DialContext(handleCtx, url, requestHeader)
-		if glog.V(2) {
+		if self.log.V(2).Enabled() {
 			if err != nil {
-				glog.Infof("[net]ws dial %s = %s\n", url, err)
+				self.log.Infof("[net]ws dial %s = %s\n", url, err)
 			} else {
-				glog.Infof("[net]ws dial %s = %s\n", url, response.Status)
+				self.log.Infof("[net]ws dial %s = %s\n", url, response.Status)
 			}
 		}
 

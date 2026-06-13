@@ -1,9 +1,12 @@
 package connect
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
+	"io"
 	"net"
+	"net/netip"
 	// "reflect"
 	"testing"
 	"time"
@@ -11,8 +14,8 @@ import (
 	// "sync"
 	"fmt"
 
-	// "github.com/google/gopacket"
-	// "github.com/google/gopacket/layers"
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
 
 	"github.com/go-playground/assert/v2"
 
@@ -503,4 +506,1128 @@ func testClient[P comparable](
 			}
 		}
 	}
+}
+
+// egress tests
+//
+// these tests use a `Tun` as the client network stack, bridged to a
+// `LocalUserNat` that egresses to servers on loopback. the bridge mirrors the
+// provider data path: tun read -> local user nat send, and
+// local user nat receive -> tun write. the bridge is lossless and in order in
+// both directions, which the tcp and udp sequence implementations assume.
+
+// connects the packet side of `tun` to `localUserNat`.
+// returns a function that removes the receive callback.
+func bridgeTunToLocalUserNat(tun *Tun, localUserNat *LocalUserNat, source TransferPath) func() {
+	go HandleError(func() {
+		packets := make([][]byte, 64)
+		for {
+			n, err := tun.ReadBatch(packets)
+			if err != nil {
+				return
+			}
+			// the local user nat owns the batch when send succeeds
+			batch := make([][]byte, n)
+			copy(batch, packets[0:n])
+			if !localUserNat.SendPackets(source, protocol.ProvideMode_Network, batch, -1) {
+				for _, packet := range batch {
+					MessagePoolReturn(packet)
+				}
+				return
+			}
+		}
+	})
+	return localUserNat.AddReceivePacketCallback(func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
+		// `Tun.Write` copies the packet into the gvisor stack,
+		// so the packet is not retained past the callback
+		tun.Write(packet)
+	})
+}
+
+// creates a deterministic payload so that corrupted, reordered,
+// or cross-flow echo bytes are detected
+func testingEgressPayload(seed int, payloadSize int) []byte {
+	payload := make([]byte, payloadSize)
+	for i := range payload {
+		payload[i] = byte(31*seed + i)
+	}
+	return payload
+}
+
+// tests tcp egress through the local user nat with parallel connections and
+// payload sizes that cross the socket read buffer and mtu segmentation boundaries
+func TestIpEgressTcp4(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	// tcp echo server on loopback
+	echoListener, err := net.Listen("tcp4", "127.0.0.1:0")
+	assert.Equal(t, err, nil)
+	defer echoListener.Close()
+	go HandleError(func() {
+		for {
+			conn, err := echoListener.Accept()
+			if err != nil {
+				return
+			}
+			go HandleError(func() {
+				defer conn.Close()
+				io.Copy(conn, conn)
+			})
+		}
+	})
+
+	tun, err := CreateTunWithDefaults(ctx)
+	assert.Equal(t, err, nil)
+	defer tun.Close()
+
+	localUserNatSettings := DefaultLocalUserNatSettings()
+	localUserNatSettings.SendShardCount = 4
+	localUserNat := NewLocalUserNat(ctx, "testEgress", localUserNatSettings)
+	defer localUserNat.Close()
+
+	removeReceiveCallback := bridgeTunToLocalUserNat(tun, localUserNat, SourceId(NewId()))
+	defer removeReceiveCallback()
+
+	// the tcp socket read buffer is `DefaultMtu` minus the maximum headers (1380),
+	// and data packets segment at `DefaultMtu`
+	payloadSizes := []int{1, 1379, 1380, 1381, 2048, 16384, 1 << 20}
+
+	parallelCount := 4
+	flowErrs := make(chan error, parallelCount)
+	for p := 0; p < parallelCount; p += 1 {
+		go HandleError(func() {
+			flowErrs <- func() error {
+				conn, err := tun.DialContext(ctx, "tcp", echoListener.Addr().String())
+				if err != nil {
+					return fmt.Errorf("dial: %w", err)
+				}
+				defer conn.Close()
+
+				for _, payloadSize := range payloadSizes {
+					payload := testingEgressPayload(p, payloadSize)
+
+					// read the echo concurrently with the write
+					// so that neither side blocks on full buffers
+					readErr := make(chan error, 1)
+					go HandleError(func() {
+						readErr <- func() error {
+							echoPayload := make([]byte, payloadSize)
+							conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+							if _, err := io.ReadFull(conn, echoPayload); err != nil {
+								return fmt.Errorf("read size=%d: %w", payloadSize, err)
+							}
+							if !bytes.Equal(payload, echoPayload) {
+								return fmt.Errorf("echo mismatch size=%d", payloadSize)
+							}
+							return nil
+						}()
+					})
+
+					conn.SetWriteDeadline(time.Now().Add(60 * time.Second))
+					if _, err := conn.Write(payload); err != nil {
+						return fmt.Errorf("write size=%d: %w", payloadSize, err)
+					}
+					if err := <-readErr; err != nil {
+						return err
+					}
+				}
+				return nil
+			}()
+		})
+	}
+	for p := 0; p < parallelCount; p += 1 {
+		select {
+		case err := <-flowErrs:
+			assert.Equal(t, err, nil)
+		case <-ctx.Done():
+			t.Fatal("timeout")
+		}
+	}
+}
+
+// tests that a server-side close propagates to the client as a fin
+// ordered after all of the stream data
+func TestIpEgressTcp4ServerClose(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	closeMessage := testingEgressPayload(7, 4096)
+
+	// server writes one message and closes
+	serverListener, err := net.Listen("tcp4", "127.0.0.1:0")
+	assert.Equal(t, err, nil)
+	defer serverListener.Close()
+	go HandleError(func() {
+		for {
+			conn, err := serverListener.Accept()
+			if err != nil {
+				return
+			}
+			go HandleError(func() {
+				conn.Write(closeMessage)
+				conn.Close()
+			})
+		}
+	})
+
+	tun, err := CreateTunWithDefaults(ctx)
+	assert.Equal(t, err, nil)
+	defer tun.Close()
+
+	localUserNatSettings := DefaultLocalUserNatSettings()
+	localUserNatSettings.SendShardCount = 4
+	localUserNat := NewLocalUserNat(ctx, "testEgress", localUserNatSettings)
+	defer localUserNat.Close()
+
+	removeReceiveCallback := bridgeTunToLocalUserNat(tun, localUserNat, SourceId(NewId()))
+	defer removeReceiveCallback()
+
+	conn, err := tun.DialContext(ctx, "tcp", serverListener.Addr().String())
+	assert.Equal(t, err, nil)
+	defer conn.Close()
+
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	echoPayload := make([]byte, len(closeMessage))
+	_, err = io.ReadFull(conn, echoPayload)
+	assert.Equal(t, err, nil)
+	assert.Equal(t, bytes.Equal(closeMessage, echoPayload), true)
+
+	// the server close must propagate as eof
+	_, err = conn.Read(make([]byte, 1))
+	assert.Equal(t, err, io.EOF)
+}
+
+// tests that a dial to a destination that refuses the connection
+// fails within the tun dial timeout
+func TestIpEgressTcp4ConnectFailure(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// reserve a loopback port with no listener
+	probeListener, err := net.Listen("tcp4", "127.0.0.1:0")
+	assert.Equal(t, err, nil)
+	unusedAddr := probeListener.Addr().String()
+	probeListener.Close()
+
+	tunSettings := DefaultTunSettings()
+	tunSettings.DialRace = 1
+	tunSettings.DialRaceTimeout = 500 * time.Millisecond
+	tunSettings.DialTimeout = 2 * time.Second
+	tun, err := CreateTun(ctx, tunSettings)
+	assert.Equal(t, err, nil)
+	defer tun.Close()
+
+	localUserNatSettings := DefaultLocalUserNatSettings()
+	localUserNatSettings.SendShardCount = 4
+	localUserNat := NewLocalUserNat(ctx, "testEgress", localUserNatSettings)
+	defer localUserNat.Close()
+
+	removeReceiveCallback := bridgeTunToLocalUserNat(tun, localUserNat, SourceId(NewId()))
+	defer removeReceiveCallback()
+
+	_, err = tun.DialContext(ctx, "tcp", unusedAddr)
+	assert.NotEqual(t, err, nil)
+}
+
+// tests udp egress through the local user nat with parallel flows.
+// each flow echoes serially so that the number of packets in flight stays
+// below all of the buffer sizes, which makes the test lossless by construction.
+func TestIpEgressUdp4(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	// udp echo server on loopback
+	echoConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	assert.Equal(t, err, nil)
+	defer echoConn.Close()
+	go HandleError(func() {
+		buffer := make([]byte, 2048)
+		for {
+			n, addr, err := echoConn.ReadFromUDP(buffer)
+			if err != nil {
+				return
+			}
+			echoConn.WriteToUDP(buffer[0:n], addr)
+		}
+	})
+
+	tun, err := CreateTunWithDefaults(ctx)
+	assert.Equal(t, err, nil)
+	defer tun.Close()
+
+	localUserNatSettings := DefaultLocalUserNatSettings()
+	localUserNatSettings.SendShardCount = 4
+	localUserNat := NewLocalUserNat(ctx, "testEgress", localUserNatSettings)
+	defer localUserNat.Close()
+
+	removeReceiveCallback := bridgeTunToLocalUserNat(tun, localUserNat, SourceId(NewId()))
+	defer removeReceiveCallback()
+
+	// the maximum payload that stays a single packet within the tun mtu
+	maxPayloadSize := DefaultMtu - Ipv4HeaderSizeWithoutExtensions - UdpHeaderSize
+	payloadSizes := []int{1, 512, maxPayloadSize}
+
+	parallelCount := 4
+	roundCount := 16
+	flowErrs := make(chan error, parallelCount)
+	for p := 0; p < parallelCount; p += 1 {
+		go HandleError(func() {
+			flowErrs <- func() error {
+				conn, err := tun.DialContext(ctx, "udp", echoConn.LocalAddr().String())
+				if err != nil {
+					return fmt.Errorf("dial: %w", err)
+				}
+				defer conn.Close()
+
+				echoPayload := make([]byte, maxPayloadSize+1)
+				for round := 0; round < roundCount; round += 1 {
+					for _, payloadSize := range payloadSizes {
+						payload := testingEgressPayload(31*p+round, payloadSize)
+						if _, err := conn.Write(payload); err != nil {
+							return fmt.Errorf("write round=%d size=%d: %w", round, payloadSize, err)
+						}
+						conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+						n, err := conn.Read(echoPayload)
+						if err != nil {
+							return fmt.Errorf("read round=%d size=%d: %w", round, payloadSize, err)
+						}
+						if !bytes.Equal(payload, echoPayload[0:n]) {
+							return fmt.Errorf("echo mismatch round=%d size=%d n=%d", round, payloadSize, n)
+						}
+					}
+				}
+				return nil
+			}()
+		})
+	}
+	for p := 0; p < parallelCount; p += 1 {
+		select {
+		case err := <-flowErrs:
+			assert.Equal(t, err, nil)
+		case <-ctx.Done():
+			t.Fatal("timeout")
+		}
+	}
+}
+
+// egress benchmarks
+//
+// these measure throughput of the tcp and udp egress flows through the
+// local user nat, using the same bridge as the egress tests. run with e.g.
+//   go test -run xxx -bench BenchmarkIpEgress -benchtime 3s -cpuprofile profile/cpu -memprofile profile/memory
+// the tun buffer size mirrors the server proxy device sequence buffer size,
+// so the tun is not the bottleneck.
+
+// creates a tun bridged to a local user nat for benchmarks.
+// returns the tun and a function that tears the bridge down.
+func newBenchmarkEgressBridge(b *testing.B, ctx context.Context) (*Tun, func()) {
+	return newBenchmarkEgressBridgeWithMtu(b, ctx, DefaultMtu)
+}
+
+// `newBenchmarkEgressBridge` with the send shard count applied to the
+// local user nat. zero uses the default.
+// the per flow tcp max window is capped so that the aggregate in-flight
+// bytes of parallel flows stay below the tun channel capacity. the tun
+// link drops on overflow and the sequences do not support fast retransmit,
+// so an overflow collapses tcp throughput to retransmit timeouts.
+func newBenchmarkEgressBridgeWithShardCount(b *testing.B, ctx context.Context, sendShardCount int) (*Tun, func()) {
+	tunSettings := DefaultTunSettingsWithBufferSize(2048)
+	tun, err := CreateTun(ctx, tunSettings)
+	if err != nil {
+		b.Fatal(err)
+	}
+	localUserNatSettings := DefaultLocalUserNatSettings()
+	if 0 < sendShardCount {
+		localUserNatSettings.SendShardCount = sendShardCount
+	}
+	localUserNatSettings.TcpBufferSettings.MaxWindowSize = uint32(kib(256))
+	localUserNat := NewLocalUserNat(ctx, "benchEgress", localUserNatSettings)
+	removeReceiveCallback := bridgeTunToLocalUserNat(tun, localUserNat, SourceId(NewId()))
+	closeBridge := func() {
+		removeReceiveCallback()
+		localUserNat.Close()
+		tun.Close()
+	}
+	return tun, closeBridge
+}
+
+// `newBenchmarkEgressBridge` with the mtu applied to both the tun and the
+// local user nat. for an in-process bridge the mtu is not constrained by any
+// network, so this measures the per-packet overhead of the pipeline.
+// the maximum is 65535, the ipv4 total length limit.
+// production packets must stay at `DefaultMtu` since they are written
+// directly into the receiver tap/tun interface. the large mtu benchmark
+// variants are diagnostics only.
+func newBenchmarkEgressBridgeWithMtu(b *testing.B, ctx context.Context, mtu int) (*Tun, func()) {
+	tunSettings := DefaultTunSettingsWithBufferSize(2048)
+	tunSettings.Mtu = mtu
+	tun, err := CreateTun(ctx, tunSettings)
+	if err != nil {
+		b.Fatal(err)
+	}
+	localUserNatSettings := DefaultLocalUserNatSettings()
+	localUserNatSettings.TcpBufferSettings.Mtu = mtu
+	localUserNatSettings.UdpBufferSettings.Mtu = mtu
+	localUserNat := NewLocalUserNat(ctx, "benchEgress", localUserNatSettings)
+	removeReceiveCallback := bridgeTunToLocalUserNat(tun, localUserNat, SourceId(NewId()))
+	closeBridge := func() {
+		removeReceiveCallback()
+		localUserNat.Close()
+		tun.Close()
+	}
+	return tun, closeBridge
+}
+
+// measures bulk upload throughput, source -> egress socket.
+// this exercises the tcp send path: sequence buffering, the write pipeline,
+// window adjustment, and pure acks back to the source.
+func BenchmarkIpEgressTcp4Up(b *testing.B) {
+	benchmarkIpEgressTcp4Up(b, DefaultMtu)
+}
+
+// `BenchmarkIpEgressTcp4Up` at the maximum mtu.
+// the gap to the default mtu run is the per-packet overhead of the pipeline.
+func BenchmarkIpEgressTcp4UpMtu64k(b *testing.B) {
+	benchmarkIpEgressTcp4Up(b, 65535)
+}
+
+func benchmarkIpEgressTcp4Up(b *testing.B, mtu int) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// sink server: reads an 8 byte total, sinks total bytes, then acks with one byte
+	sinkListener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer sinkListener.Close()
+	go HandleError(func() {
+		for {
+			conn, err := sinkListener.Accept()
+			if err != nil {
+				return
+			}
+			go HandleError(func() {
+				defer conn.Close()
+				header := make([]byte, 8)
+				if _, err := io.ReadFull(conn, header); err != nil {
+					return
+				}
+				total := int64(binary.BigEndian.Uint64(header))
+				if _, err := io.CopyN(io.Discard, conn, total); err != nil {
+					return
+				}
+				conn.Write([]byte{1})
+			})
+		}
+	})
+
+	tun, closeBridge := newBenchmarkEgressBridgeWithMtu(b, ctx, mtu)
+	defer closeBridge()
+
+	conn, err := tun.DialContext(ctx, "tcp", sinkListener.Addr().String())
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer conn.Close()
+
+	chunk := testingEgressPayload(1, 32*1024)
+	header := make([]byte, 8)
+	binary.BigEndian.PutUint64(header, uint64(len(chunk))*uint64(b.N))
+
+	b.SetBytes(int64(len(chunk)))
+	b.ResetTimer()
+
+	if _, err := conn.Write(header); err != nil {
+		b.Fatal(err)
+	}
+	for i := 0; i < b.N; i += 1 {
+		if _, err := conn.Write(chunk); err != nil {
+			b.Fatal(err)
+		}
+	}
+	// the ack means all bytes reached the egress socket
+	conn.SetReadDeadline(time.Now().Add(300 * time.Second))
+	if _, err := io.ReadFull(conn, make([]byte, 1)); err != nil {
+		b.Fatal(err)
+	}
+	b.StopTimer()
+}
+
+// measures bulk download throughput, egress socket -> source.
+// this exercises the tcp receive path: socket reads, data packet
+// serialization, and window waits against the source acks.
+func BenchmarkIpEgressTcp4Down(b *testing.B) {
+	benchmarkIpEgressTcp4Down(b, DefaultMtu)
+}
+
+// `BenchmarkIpEgressTcp4Down` at the maximum mtu.
+// the gap to the default mtu run is the per-packet overhead of the pipeline.
+func BenchmarkIpEgressTcp4DownMtu64k(b *testing.B) {
+	benchmarkIpEgressTcp4Down(b, 65535)
+}
+
+func benchmarkIpEgressTcp4Down(b *testing.B, mtu int) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	chunkSize := 32 * 1024
+
+	// source server: reads an 8 byte total then writes total bytes
+	sourceListener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer sourceListener.Close()
+	go HandleError(func() {
+		for {
+			conn, err := sourceListener.Accept()
+			if err != nil {
+				return
+			}
+			go HandleError(func() {
+				defer conn.Close()
+				header := make([]byte, 8)
+				if _, err := io.ReadFull(conn, header); err != nil {
+					return
+				}
+				total := int64(binary.BigEndian.Uint64(header))
+				chunk := testingEgressPayload(2, chunkSize)
+				for written := int64(0); written < total; {
+					n := min(int64(len(chunk)), total-written)
+					if _, err := conn.Write(chunk[0:n]); err != nil {
+						return
+					}
+					written += n
+				}
+			})
+		}
+	})
+
+	tun, closeBridge := newBenchmarkEgressBridgeWithMtu(b, ctx, mtu)
+	defer closeBridge()
+
+	conn, err := tun.DialContext(ctx, "tcp", sourceListener.Addr().String())
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer conn.Close()
+
+	total := int64(chunkSize) * int64(b.N)
+	header := make([]byte, 8)
+	binary.BigEndian.PutUint64(header, uint64(total))
+
+	b.SetBytes(int64(chunkSize))
+	b.ResetTimer()
+
+	if _, err := conn.Write(header); err != nil {
+		b.Fatal(err)
+	}
+	conn.SetReadDeadline(time.Now().Add(300 * time.Second))
+	if _, err := io.CopyN(io.Discard, conn, total); err != nil {
+		b.Fatal(err)
+	}
+	b.StopTimer()
+}
+
+// measures udp round trips with a fixed window of datagrams in flight.
+// the per-packet cost dominates, so this surfaces the per-packet overhead of
+// the udp flow: decode, sequence dispatch, socket write, and the
+// packet serialization on the return path.
+func BenchmarkIpEgressUdp4RoundTrip(b *testing.B) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// udp echo server on loopback
+	echoConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer echoConn.Close()
+	go HandleError(func() {
+		buffer := make([]byte, 2048)
+		for {
+			n, addr, err := echoConn.ReadFromUDP(buffer)
+			if err != nil {
+				return
+			}
+			echoConn.WriteToUDP(buffer[0:n], addr)
+		}
+	})
+
+	tun, closeBridge := newBenchmarkEgressBridge(b, ctx)
+	defer closeBridge()
+
+	conn, err := tun.DialContext(ctx, "udp", echoConn.LocalAddr().String())
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer conn.Close()
+
+	payloadSize := 1200
+	windowSize := 16
+	payload := testingEgressPayload(3, payloadSize)
+	echoPayload := make([]byte, payloadSize)
+
+	// warm up the flow so the sequence setup and socket dial are not measured
+	if _, err := conn.Write(payload); err != nil {
+		b.Fatal(err)
+	}
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	if _, err := conn.Read(echoPayload); err != nil {
+		b.Fatal(err)
+	}
+
+	b.SetBytes(int64(payloadSize))
+	b.ResetTimer()
+
+	// keep `windowSize` datagrams in flight. the window stays below all of
+	// the buffer sizes so the flow is lossless by construction.
+	sent := 0
+	for ; sent < min(windowSize, b.N); sent += 1 {
+		if _, err := conn.Write(payload); err != nil {
+			b.Fatal(err)
+		}
+	}
+	for received := 0; received < b.N; received += 1 {
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		if _, err := conn.Read(echoPayload); err != nil {
+			b.Fatal(err)
+		}
+		if sent < b.N {
+			if _, err := conn.Write(payload); err != nil {
+				b.Fatal(err)
+			}
+			sent += 1
+		}
+	}
+	b.StopTimer()
+}
+
+// measures bulk udp upload throughput, source -> egress socket.
+// the sink acks a cumulative count every `creditCount` datagrams, and the
+// source keeps at most `windowSize` datagrams unacked. the window stays below
+// all of the buffer sizes so the flow is lossless by construction.
+func BenchmarkIpEgressUdp4Up(b *testing.B) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	payloadSize := 1200
+	windowSize := 256
+	creditCount := 32
+
+	// sink server: counts data datagrams and acks the cumulative count.
+	// a 1 byte datagram requests an immediate ack.
+	sinkConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer sinkConn.Close()
+	sinkConn.SetReadBuffer(4 * 1024 * 1024)
+	go HandleError(func() {
+		buffer := make([]byte, 2048)
+		ackBuffer := make([]byte, 8)
+		receivedCount := uint64(0)
+		for {
+			n, addr, err := sinkConn.ReadFromUDP(buffer)
+			if err != nil {
+				return
+			}
+			if 1 < n {
+				receivedCount += 1
+				if receivedCount%uint64(creditCount) != 0 {
+					continue
+				}
+			}
+			binary.BigEndian.PutUint64(ackBuffer, receivedCount)
+			sinkConn.WriteToUDP(ackBuffer, addr)
+		}
+	})
+
+	tun, closeBridge := newBenchmarkEgressBridge(b, ctx)
+	defer closeBridge()
+
+	conn, err := tun.DialContext(ctx, "udp", sinkConn.LocalAddr().String())
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer conn.Close()
+
+	payload := testingEgressPayload(4, payloadSize)
+	flush := []byte{0}
+	ackBuffer := make([]byte, 8)
+
+	readAck := func() uint64 {
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		n, err := conn.Read(ackBuffer)
+		if err != nil || n != 8 {
+			b.Fatalf("ack read n=%d err=%v", n, err)
+		}
+		return binary.BigEndian.Uint64(ackBuffer)
+	}
+
+	// warm up the flow so the sequence setup and socket dial are not measured
+	if _, err := conn.Write(flush); err != nil {
+		b.Fatal(err)
+	}
+	readAck()
+
+	b.SetBytes(int64(payloadSize))
+	b.ResetTimer()
+
+	totalCount := uint64(b.N)
+	sentCount := uint64(0)
+	ackedCount := uint64(0)
+	for ackedCount < totalCount {
+		if sentCount < totalCount && sentCount-ackedCount < uint64(windowSize) {
+			if _, err := conn.Write(payload); err != nil {
+				b.Fatal(err)
+			}
+			sentCount += 1
+		} else if sentCount < totalCount {
+			ackedCount = readAck()
+		} else {
+			// all sent. flush until the sink has counted everything.
+			if _, err := conn.Write(flush); err != nil {
+				b.Fatal(err)
+			}
+			ackedCount = readAck()
+		}
+	}
+	b.StopTimer()
+}
+
+// measures bulk udp download throughput, egress socket -> source.
+// the source acks a cumulative count every `creditCount` datagrams, and the
+// server keeps at most `windowSize` datagrams unacked. the window stays below
+// all of the buffer sizes so the flow is lossless by construction.
+func BenchmarkIpEgressUdp4Down(b *testing.B) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	payloadSize := 1200
+	windowSize := 256
+	creditCount := 32
+
+	// source server: a 9 byte datagram requests the encoded count of
+	// datagrams. an 8 byte datagram is a cumulative receive ack.
+	sourceConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer sourceConn.Close()
+	go HandleError(func() {
+		buffer := make([]byte, 2048)
+		payload := testingEgressPayload(5, payloadSize)
+		for {
+			sourceConn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			n, addr, err := sourceConn.ReadFromUDP(buffer)
+			if err != nil {
+				return
+			}
+			if n != 9 {
+				continue
+			}
+			requestCount := binary.BigEndian.Uint64(buffer[1:9])
+			sentCount := uint64(0)
+			ackedCount := uint64(0)
+			for sentCount < requestCount {
+				if sentCount-ackedCount < uint64(windowSize) {
+					if _, err := sourceConn.WriteToUDP(payload, addr); err != nil {
+						return
+					}
+					sentCount += 1
+				} else {
+					sourceConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+					n, _, err := sourceConn.ReadFromUDP(buffer)
+					if err != nil {
+						return
+					}
+					if n == 8 {
+						ackedCount = binary.BigEndian.Uint64(buffer[0:8])
+					}
+				}
+			}
+		}
+	})
+
+	tun, closeBridge := newBenchmarkEgressBridge(b, ctx)
+	defer closeBridge()
+
+	conn, err := tun.DialContext(ctx, "udp", sourceConn.LocalAddr().String())
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer conn.Close()
+
+	b.SetBytes(int64(payloadSize))
+	b.ResetTimer()
+
+	totalCount := uint64(b.N)
+	start := make([]byte, 9)
+	start[0] = 1
+	binary.BigEndian.PutUint64(start[1:9], totalCount)
+	if _, err := conn.Write(start); err != nil {
+		b.Fatal(err)
+	}
+
+	buffer := make([]byte, 2048)
+	ackBuffer := make([]byte, 8)
+	for receivedCount := uint64(0); receivedCount < totalCount; {
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		n, err := conn.Read(buffer)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if n != payloadSize {
+			b.Fatalf("datagram size %d", n)
+		}
+		receivedCount += 1
+		if receivedCount%uint64(creditCount) == 0 || receivedCount == totalCount {
+			binary.BigEndian.PutUint64(ackBuffer, receivedCount)
+			if _, err := conn.Write(ackBuffer); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+	b.StopTimer()
+}
+
+// verifies the hand-rolled packet writers byte for byte against a
+// gopacket reference, including checksums
+func TestIpPacketWriters(t *testing.T) {
+	payloadSizes := []int{0, 1, 2, 3, 64, 1379, 1380}
+
+	for _, ipVersion := range []int{4, 6} {
+		var sourceIp net.IP
+		var destinationIp net.IP
+		switch ipVersion {
+		case 4:
+			sourceIp = net.IP{72, 0, 0, 1}
+			destinationIp = net.IP{72, 2, 3, 4}
+		case 6:
+			sourceIp = net.ParseIP("2001:db8::1").To16()
+			destinationIp = net.ParseIP("2001:db8::2").To16()
+		}
+
+		serializeReference := func(ipProtocol layers.IPProtocol, transport gopacket.SerializableLayer, payload []byte) []byte {
+			var ip gopacket.NetworkLayer
+			switch ipVersion {
+			case 4:
+				ip = &layers.IPv4{
+					Version:  4,
+					TTL:      64,
+					SrcIP:    destinationIp,
+					DstIP:    sourceIp,
+					Protocol: ipProtocol,
+				}
+			case 6:
+				ip = &layers.IPv6{
+					Version:    6,
+					HopLimit:   64,
+					SrcIP:      destinationIp,
+					DstIP:      sourceIp,
+					NextHeader: ipProtocol,
+				}
+			}
+			switch v := transport.(type) {
+			case *layers.TCP:
+				v.SetNetworkLayerForChecksum(ip)
+			case *layers.UDP:
+				v.SetNetworkLayerForChecksum(ip)
+			}
+			buffer := gopacket.NewSerializeBuffer()
+			err := gopacket.SerializeLayers(buffer, gopacket.SerializeOptions{ComputeChecksums: true, FixLengths: true},
+				ip.(gopacket.SerializableLayer),
+				transport,
+				gopacket.Payload(payload),
+			)
+			assert.Equal(t, err, nil)
+			reference := make([]byte, len(buffer.Bytes()))
+			copy(reference, buffer.Bytes())
+			return reference
+		}
+
+		connectionState := &ConnectionState{
+			ipVersion:       ipVersion,
+			sourceIp:        sourceIp,
+			sourcePort:      layers.TCPPort(40000),
+			destinationIp:   destinationIp,
+			destinationPort: layers.TCPPort(443),
+			receiveSeq:      0x01020304,
+			sendSeq:         0x0a0b0c0d,
+			windowSize:      262144,
+			windowScale:     3,
+		}
+
+		for _, payloadSize := range payloadSizes {
+			payload := testingEgressPayload(9, payloadSize)
+			for _, flags := range []byte{tcpFlagAck, tcpFlagAck | tcpFlagFin, tcpFlagAck | tcpFlagRst} {
+				packet := connectionState.tcpPacket(flags, connectionState.receiveSeq, payload)
+				reference := serializeReference(layers.IPProtocolTCP, &layers.TCP{
+					SrcPort: connectionState.destinationPort,
+					DstPort: connectionState.sourcePort,
+					Seq:     connectionState.receiveSeq,
+					Ack:     connectionState.sendSeq,
+					FIN:     (flags & tcpFlagFin) != 0,
+					RST:     (flags & tcpFlagRst) != 0,
+					ACK:     true,
+					Window:  connectionState.encodedWindowSize(),
+				}, payload)
+				assert.Equal(t, bytes.Equal(reference, packet), true)
+				MessagePoolReturn(packet)
+			}
+		}
+
+		streamState := &StreamState{
+			ipVersion:       ipVersion,
+			sourceIp:        sourceIp,
+			sourcePort:      layers.UDPPort(40000),
+			destinationIp:   destinationIp,
+			destinationPort: layers.UDPPort(53),
+		}
+
+		for _, payloadSize := range payloadSizes {
+			payload := testingEgressPayload(11, payloadSize)
+			packet := streamState.udpPacket(payload)
+			reference := serializeReference(layers.IPProtocolUDP, &layers.UDP{
+				SrcPort: streamState.destinationPort,
+				DstPort: streamState.sourcePort,
+			}, payload)
+			assert.Equal(t, bytes.Equal(reference, packet), true)
+			MessagePoolReturn(packet)
+		}
+	}
+}
+
+// measures aggregate bulk upload throughput with parallel tcp connections.
+// this exercises the send dispatch path under multi-flow load.
+func BenchmarkIpEgressTcp4UpParallel(b *testing.B) {
+	benchmarkIpEgressTcp4UpParallel(b, 0)
+}
+
+// `BenchmarkIpEgressTcp4UpParallel` with eight send shards, for comparison
+func BenchmarkIpEgressTcp4UpParallelShard8(b *testing.B) {
+	benchmarkIpEgressTcp4UpParallel(b, 8)
+}
+
+func benchmarkIpEgressTcp4UpParallel(b *testing.B, sendShardCount int) {
+	parallelCount := 8
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// sink server: reads an 8 byte total, sinks total bytes, then acks with one byte
+	sinkListener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer sinkListener.Close()
+	go HandleError(func() {
+		for {
+			conn, err := sinkListener.Accept()
+			if err != nil {
+				return
+			}
+			go HandleError(func() {
+				defer conn.Close()
+				header := make([]byte, 8)
+				if _, err := io.ReadFull(conn, header); err != nil {
+					return
+				}
+				total := int64(binary.BigEndian.Uint64(header))
+				if _, err := io.CopyN(io.Discard, conn, total); err != nil {
+					return
+				}
+				conn.Write([]byte{1})
+			})
+		}
+	})
+
+	tun, closeBridge := newBenchmarkEgressBridgeWithShardCount(b, ctx, sendShardCount)
+	defer closeBridge()
+
+	chunk := testingEgressPayload(1, 32*1024)
+
+	conns := make([]net.Conn, parallelCount)
+	for p := range conns {
+		conn, err := tun.DialContext(ctx, "tcp", sinkListener.Addr().String())
+		if err != nil {
+			b.Fatal(err)
+		}
+		defer conn.Close()
+		conns[p] = conn
+	}
+
+	b.SetBytes(int64(len(chunk)))
+	b.ResetTimer()
+
+	flowErrs := make(chan error, parallelCount)
+	for p := 0; p < parallelCount; p += 1 {
+		chunkCount := b.N / parallelCount
+		if p == 0 {
+			chunkCount += b.N % parallelCount
+		}
+		conn := conns[p]
+		go HandleError(func() {
+			flowErrs <- func() error {
+				header := make([]byte, 8)
+				binary.BigEndian.PutUint64(header, uint64(len(chunk))*uint64(chunkCount))
+				if _, err := conn.Write(header); err != nil {
+					return err
+				}
+				for i := 0; i < chunkCount; i += 1 {
+					if _, err := conn.Write(chunk); err != nil {
+						return err
+					}
+				}
+				// the ack means all bytes reached the egress socket
+				conn.SetReadDeadline(time.Now().Add(300 * time.Second))
+				if _, err := io.ReadFull(conn, make([]byte, 1)); err != nil {
+					return err
+				}
+				return nil
+			}()
+		})
+	}
+	for p := 0; p < parallelCount; p += 1 {
+		if err := <-flowErrs; err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+
+	stats := tunStack().Stats()
+	b.Logf(
+		"ip outgoing errors=%d tcp retransmits=%d tcp timeouts=%d tcp fast retransmits=%d",
+		stats.IP.OutgoingPacketErrors.Value(),
+		stats.TCP.Retransmits.Value(),
+		stats.TCP.Timeouts.Value(),
+		stats.TCP.FastRetransmit.Value(),
+	)
+}
+
+// measures aggregate bulk udp upload throughput with parallel flows.
+// each flow uses the same credit scheme as the single flow benchmark.
+func BenchmarkIpEgressUdp4UpParallel(b *testing.B) {
+	benchmarkIpEgressUdp4UpParallel(b, 0)
+}
+
+// `BenchmarkIpEgressUdp4UpParallel` with eight send shards, for comparison
+func BenchmarkIpEgressUdp4UpParallelShard8(b *testing.B) {
+	benchmarkIpEgressUdp4UpParallel(b, 8)
+}
+
+func benchmarkIpEgressUdp4UpParallel(b *testing.B, sendShardCount int) {
+	parallelCount := 8
+	payloadSize := 1200
+	windowSize := 64
+	creditCount := 16
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// sink server: counts data datagrams per flow and acks cumulative counts.
+	// a 1 byte datagram requests an immediate ack.
+	sinkConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer sinkConn.Close()
+	sinkConn.SetReadBuffer(4 * 1024 * 1024)
+	go HandleError(func() {
+		buffer := make([]byte, 2048)
+		ackBuffer := make([]byte, 8)
+		receivedCounts := map[netip.AddrPort]uint64{}
+		for {
+			n, addrPort, err := sinkConn.ReadFromUDPAddrPort(buffer)
+			if err != nil {
+				return
+			}
+			if 1 < n {
+				receivedCounts[addrPort] += 1
+				if receivedCounts[addrPort]%uint64(creditCount) != 0 {
+					continue
+				}
+			}
+			binary.BigEndian.PutUint64(ackBuffer, receivedCounts[addrPort])
+			sinkConn.WriteToUDPAddrPort(ackBuffer, addrPort)
+		}
+	})
+
+	tun, closeBridge := newBenchmarkEgressBridgeWithShardCount(b, ctx, sendShardCount)
+	defer closeBridge()
+
+	payload := testingEgressPayload(4, payloadSize)
+	flush := []byte{0}
+
+	conns := make([]net.Conn, parallelCount)
+	for p := range conns {
+		conn, err := tun.DialContext(ctx, "udp", sinkConn.LocalAddr().String())
+		if err != nil {
+			b.Fatal(err)
+		}
+		defer conn.Close()
+		conns[p] = conn
+	}
+
+	b.SetBytes(int64(payloadSize))
+	b.ResetTimer()
+
+	flowErrs := make(chan error, parallelCount)
+	for p := 0; p < parallelCount; p += 1 {
+		flowCount := uint64(b.N / parallelCount)
+		if p == 0 {
+			flowCount += uint64(b.N % parallelCount)
+		}
+		conn := conns[p]
+		go HandleError(func() {
+			flowErrs <- func() error {
+				ackBuffer := make([]byte, 8)
+				readAck := func() (uint64, error) {
+					conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+					n, err := conn.Read(ackBuffer)
+					if err != nil || n != 8 {
+						return 0, fmt.Errorf("ack read n=%d err=%v", n, err)
+					}
+					return binary.BigEndian.Uint64(ackBuffer), nil
+				}
+
+				sentCount := uint64(0)
+				ackedCount := uint64(0)
+				for ackedCount < flowCount {
+					if sentCount < flowCount && sentCount-ackedCount < uint64(windowSize) {
+						if _, err := conn.Write(payload); err != nil {
+							return err
+						}
+						sentCount += 1
+					} else if sentCount < flowCount {
+						count, err := readAck()
+						if err != nil {
+							return err
+						}
+						ackedCount = count
+					} else {
+						// all sent. flush until the sink has counted everything.
+						if _, err := conn.Write(flush); err != nil {
+							return err
+						}
+						count, err := readAck()
+						if err != nil {
+							return err
+						}
+						ackedCount = count
+					}
+				}
+				return nil
+			}()
+		})
+	}
+	for p := 0; p < parallelCount; p += 1 {
+		if err := <-flowErrs; err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
 }

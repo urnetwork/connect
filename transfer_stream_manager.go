@@ -7,8 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/urnetwork/glog"
-
 	"github.com/urnetwork/connect/protocol"
 )
 
@@ -370,12 +368,12 @@ func (self *StreamSequence) Run() {
 			)
 		} else {
 			// the stream must have one of source or destination
-			glog.V(1).Infof("[sm] s(%s) missing source or destination.\n", self.streamId)
+			self.streamManager.client.log.V(1).Infof("[sm] s(%s) missing source or destination.\n", self.streamId)
 			return
 		}
 	} else {
-		p2pToDestinationRouteManager := NewRouteManager(self.ctx, fmt.Sprintf("->s(%s)", self.streamId))
-		p2pToSourceRouteManager := NewRouteManager(self.ctx, fmt.Sprintf("<-s(%s)", self.streamId))
+		p2pToDestinationRouteManager := NewRouteManagerWithLogger(self.ctx, fmt.Sprintf("->s(%s)", self.streamId), self.streamManager.client.log)
+		p2pToSourceRouteManager := NewRouteManagerWithLogger(self.ctx, fmt.Sprintf("<-s(%s)", self.streamId), self.streamManager.client.log)
 
 		// to destination
 		NewP2pTransport(
