@@ -186,6 +186,14 @@ func (self *ingressSecurityPolicy) Inspect(provideMode protocol.ProvideMode, ipP
 }
 
 func (self *ingressSecurityPolicy) inspect(provideMode protocol.ProvideMode, ipPath *IpPath) (SecurityPolicyResult, error) {
+	// network-relationship traffic (e.g. same network_id) bypasses the public
+	// rules, mirroring the egress policy. The return path of a network-mode
+	// flow echoes the network provide mode, so a private service on any port
+	// (including the p2p range) is not filtered here.
+	if protocol.ProvideMode_Network == provideMode {
+		return SecurityPolicyResultAllow, nil
+	}
+
 	allow := func() bool {
 		// dPort := ipPath.DestinationPort
 		sPort := ipPath.SourcePort

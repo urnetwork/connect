@@ -12,6 +12,7 @@ import (
 
 func createWebRtcPeerConnection(ctx context.Context, active bool, settings *WebRtcSettings) (*webrtc.PeerConnection, error) {
 	s := webrtc.SettingEngine{}
+	s.LoggerFactory = &pionLoggerFactory{log: loggerOrDefault(settings.Log)}
 
 	api := webrtc.NewAPI(webrtc.WithSettingEngine(s))
 	return api.NewPeerConnection(webrtc.Configuration{

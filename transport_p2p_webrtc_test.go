@@ -17,7 +17,8 @@ import (
 )
 
 func TestWebRtc(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// the 1MiB transfer over local ice varies widely in time under -race
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	settingsA := DefaultWebRtcSettings()
@@ -50,17 +51,17 @@ func TestWebRtc(t *testing.T) {
 
 	received := make(chan []byte)
 
+	// the helpers must not panic on conn errors. reads and writes that race
+	// the test teardown see closed-conn errors, and a panic in a test
+	// goroutine kills the whole test binary. missing data is detected by
+	// the receive loop timeout below.
 	send := func(conn net.Conn) {
-		_, err := conn.Write(b)
-		if err != nil {
-			panic(err)
-		}
+		conn.Write(b)
 	}
 	receive := func(conn net.Conn) {
 		b2 := make([]byte, len(b))
-		_, err := io.ReadFull(conn, b2)
-		if err != nil {
-			panic(err)
+		if _, err := io.ReadFull(conn, b2); err != nil {
+			return
 		}
 		select {
 		case <-ctx.Done():
@@ -76,7 +77,7 @@ func TestWebRtc(t *testing.T) {
 	for range 2 {
 		select {
 		case <-ctx.Done():
-			panic("Timeout.")
+			t.Fatal("timeout")
 		case b2 := <-received:
 			assert.Equal(t, b, b2)
 		}

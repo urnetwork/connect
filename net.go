@@ -8,8 +8,6 @@ import (
 	"time"
 
 	"golang.org/x/net/proxy"
-
-	"github.com/urnetwork/glog"
 )
 
 type DialContextFunction = func(ctx context.Context, network string, addr string) (net.Conn, error)
@@ -38,6 +36,11 @@ func DefaultConnectSettings() *ConnectSettings {
 }
 
 type ConnectSettings struct {
+	// Log, when set, is used for dial logging. nil resolves to
+	// `DefaultLogger()`. `NewClientStrategy` propagates the strategy log
+	// here when nil.
+	Log Logger
+
 	RequestTimeout   time.Duration
 	ConnectTimeout   time.Duration
 	TlsTimeout       time.Duration
@@ -113,11 +116,11 @@ func (self *ConnectSettings) DialContext(ctx context.Context, network string, ad
 	}
 
 	conn, err := dialContext(ctx, network, addr)
-	if glog.V(2) {
+	if log := loggerOrDefault(self.Log).V(2); log.Enabled() {
 		if err == nil {
-			glog.Infof("[net]dial %s %s success\n", network, addr)
+			log.Infof("[net]dial %s %s success\n", network, addr)
 		} else {
-			glog.Infof("[net]dial %s %s err=%s\n", network, addr, err)
+			log.Infof("[net]dial %s %s err=%s\n", network, addr, err)
 		}
 	}
 	return conn, err

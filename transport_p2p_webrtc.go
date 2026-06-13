@@ -14,10 +14,10 @@ import (
 	// "golang.org/x/exp/maps"
 
 	"github.com/pion/datachannel"
+	"github.com/pion/logging"
 	"github.com/pion/webrtc/v4"
 
 	"github.com/urnetwork/connect/protocol"
-	"github.com/urnetwork/glog"
 )
 
 type WebRtcConn interface {
@@ -127,7 +127,7 @@ func (self *clientSignalReceiver) handleControlFrame(source TransferPath, frame 
 
 		received, err := newReceivedSignalFrame(source, frame)
 		if err != nil {
-			glog.Infof("[signal]receive frame err=%s\n", err)
+			self.client.log.Infof("[signal]receive frame err=%s\n", err)
 			return
 		}
 		if !self.enqueue(received) {
@@ -163,11 +163,11 @@ func (self *clientSignalReceiver) run() {
 		func() {
 			defer received.Close()
 			if err := received.prepareFrame(); err != nil {
-				glog.Infof("[signal]receive frame err=%s\n", err)
+				self.client.log.Infof("[signal]receive frame err=%s\n", err)
 				return
 			}
 			if err := self.receiver.ReceiveSignal(received.source, received.frame); err != nil {
-				glog.Infof("[signal]receive err=%s\n", err)
+				self.client.log.Infof("[signal]receive err=%s\n", err)
 			}
 		}()
 	}
@@ -279,7 +279,7 @@ func (self *clientSignalReceiver) enqueue(received *receivedSignalFrame) bool {
 				err := batch.appendCandidateBatch(received)
 				self.queueLock.Unlock()
 				if err != nil {
-					glog.Infof("[signal]coalesce candidate err=%s\n", err)
+					self.client.log.Infof("[signal]coalesce candidate err=%s\n", err)
 					return false
 				}
 				received.Close()
@@ -394,6 +394,11 @@ func DefaultWebRtcSettings() *WebRtcSettings {
 }
 
 type WebRtcSettings struct {
+	// Log, when set, is used by the webrtc manager, p2p transports, and the
+	// pion stack. nil resolves to `DefaultLogger()`.
+	// `NewClientWithTag` propagates the client log here when nil.
+	Log Logger
+
 	ReceiveBufferSize   ByteCount
 	ReceiveMtu          ByteCount
 	DisconnectedTimeout time.Duration
@@ -406,8 +411,76 @@ type WebRtcSettings struct {
 	IceServerUrls []string
 }
 
+// pionLoggerFactory routes pion logs through a `Logger`, so the webrtc stack
+// follows the same logger as the peer connection that created it (and is
+// silenced with it). Without this, pion writes to its own default factory
+// (stdout), bypassing per-client logging entirely.
+// pion levels map: Error->Errorf, Warn->Warningf, Info->V(1), Debug/Trace->V(2).
+type pionLoggerFactory struct {
+	log Logger
+}
+
+func (self *pionLoggerFactory) NewLogger(scope string) logging.LeveledLogger {
+	return &pionLeveledLogger{
+		log:   self.log,
+		scope: scope,
+	}
+}
+
+type pionLeveledLogger struct {
+	log   Logger
+	scope string
+}
+
+func (self *pionLeveledLogger) Trace(msg string) {
+	self.log.V(2).Infof("[pion:%s]%s", self.scope, msg)
+}
+
+func (self *pionLeveledLogger) Tracef(format string, args ...any) {
+	if v := self.log.V(2); v.Enabled() {
+		v.Infof("[pion:"+self.scope+"]"+format, args...)
+	}
+}
+
+func (self *pionLeveledLogger) Debug(msg string) {
+	self.log.V(2).Infof("[pion:%s]%s", self.scope, msg)
+}
+
+func (self *pionLeveledLogger) Debugf(format string, args ...any) {
+	if v := self.log.V(2); v.Enabled() {
+		v.Infof("[pion:"+self.scope+"]"+format, args...)
+	}
+}
+
+func (self *pionLeveledLogger) Info(msg string) {
+	self.log.V(1).Infof("[pion:%s]%s", self.scope, msg)
+}
+
+func (self *pionLeveledLogger) Infof(format string, args ...any) {
+	if v := self.log.V(1); v.Enabled() {
+		v.Infof("[pion:"+self.scope+"]"+format, args...)
+	}
+}
+
+func (self *pionLeveledLogger) Warn(msg string) {
+	self.log.Warningf("[pion:%s]%s", self.scope, msg)
+}
+
+func (self *pionLeveledLogger) Warnf(format string, args ...any) {
+	self.log.Warningf("[pion:"+self.scope+"]"+format, args...)
+}
+
+func (self *pionLeveledLogger) Error(msg string) {
+	self.log.Errorf("[pion:%s]%s", self.scope, msg)
+}
+
+func (self *pionLeveledLogger) Errorf(format string, args ...any) {
+	self.log.Errorf("[pion:"+self.scope+"]"+format, args...)
+}
+
 type WebRtcManager struct {
 	ctx          context.Context
+	log          Logger
 	signalSender SignalSender
 	settings     *WebRtcSettings
 
@@ -418,6 +491,7 @@ type WebRtcManager struct {
 func NewWebRtcManager(ctx context.Context, signalSender SignalSender, settings *WebRtcSettings) *WebRtcManager {
 	return &WebRtcManager{
 		ctx:          ctx,
+		log:          loggerOrDefault(settings.Log),
 		signalSender: signalSender,
 		settings:     settings,
 		peerConns:    map[peerConnKey]*peerConn{},
@@ -441,15 +515,15 @@ func (self *WebRtcManager) ReceiveSignal(source TransferPath, frame *protocol.Fr
 			self.stateLock.Lock()
 			defer self.stateLock.Unlock()
 			conn = self.peerConns[key]
-			if glog.V(2) {
+			if self.log.V(2).Enabled() {
 				if conn == nil {
-					glog.Infof("[signal]miss %s (%v)\n", key, self.peerConns)
+					self.log.Infof("[signal]miss %s (%v)\n", key, self.peerConns)
 				}
 			}
 		}()
 		if conn != nil {
 			for _, signal := range v.Signals {
-				glog.V(2).Infof("[signal]%s\n", signal.SignalType)
+				self.log.V(2).Infof("[signal]%s\n", signal.SignalType)
 				err := conn.ReceiveSignalFromPeer(signal)
 				if err != nil {
 					return err
@@ -515,6 +589,7 @@ func (self peerConnKey) String() string {
 type peerConn struct {
 	ctx    context.Context
 	cancel context.CancelFunc
+	log    Logger
 
 	key      peerConnKey
 	sourceId Id
@@ -563,6 +638,7 @@ func newPeerConn(ctx context.Context, key peerConnKey, sourceId Id, active bool,
 	conn := &peerConn{
 		ctx:          cancelCtx,
 		cancel:       cancel,
+		log:          loggerOrDefault(settings.Log),
 		key:          key,
 		sourceId:     sourceId,
 		active:       active,
@@ -630,7 +706,7 @@ func (self *peerConn) Run() {
 	self.pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		connected := state == webrtc.ICEConnectionStateConnected ||
 			state == webrtc.ICEConnectionStateCompleted
-		glog.V(2).Infof("[peerconn]state=%v (%t)\n", state, connected)
+		self.log.V(2).Infof("[peerconn]state=%v (%t)\n", state, connected)
 		self.setConnected(connected)
 	})
 
@@ -773,7 +849,7 @@ func (self *peerConn) ReceiveSignalFromPeer(signal *protocol.ExchangeSignal) err
 		// log and continue rather than tearing down the connection; ICE
 		// has multiple candidates and the peer will retransmit on retry.
 		if err := self.pc.AddICECandidate(candidate); err != nil {
-			glog.V(1).Infof("[peerconn]AddICECandidate err = %s\n", err)
+			self.log.V(1).Infof("[peerconn]AddICECandidate err = %s\n", err)
 		}
 
 	case protocol.SignalType_WaitingForSdpOffer:
@@ -789,7 +865,7 @@ func (self *peerConn) ReceiveSignalFromPeer(signal *protocol.ExchangeSignal) err
 			// peer is asking for a fresh offer despite our prior answer.
 			// they likely restarted; signal the outer transport to reconnect
 			// without backoff, then cancel.
-			glog.V(1).Infof("[peerconn]waiting-for-offer after answer; requesting immediate reconnect\n")
+			self.log.V(1).Infof("[peerconn]waiting-for-offer after answer; requesting immediate reconnect\n")
 			self.immediateReconnectMonitor.NotifyAll()
 			self.cancel()
 		}

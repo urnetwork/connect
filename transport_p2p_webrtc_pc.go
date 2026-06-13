@@ -11,6 +11,7 @@ import (
 
 func createWebRtcPeerConnection(ctx context.Context, active bool, settings *WebRtcSettings) (*webrtc.PeerConnection, error) {
 	s := webrtc.SettingEngine{}
+	s.LoggerFactory = &pionLoggerFactory{log: loggerOrDefault(settings.Log)}
 	s.DetachDataChannels()
 	s.SetSCTPMaxReceiveBufferSize( /*16 * 1024 * 1024*/ uint32(settings.ReceiveBufferSize))
 	s.SetReceiveMTU( /*16384*/ uint(settings.ReceiveMtu))

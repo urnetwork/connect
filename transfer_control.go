@@ -4,8 +4,6 @@ import (
 	"context"
 	"sync"
 
-	"github.com/urnetwork/glog"
-
 	"github.com/urnetwork/connect/protocol"
 )
 
@@ -94,14 +92,14 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 			self.sendLock.Lock()
 			defer self.sendLock.Unlock()
 			if self.syncCount == syncIndex {
-				glog.V(2).Infof("[control][%d]stop sync for scope = %s\n", syncIndex, self.scopeTag)
+				self.client.log.V(2).Infof("[control][%d]stop sync for scope = %s\n", syncIndex, self.scopeTag)
 			} else {
-				glog.V(2).Infof("[control][%d]replace sync for scope = %s\n", syncIndex, self.scopeTag)
+				self.client.log.V(2).Infof("[control][%d]replace sync for scope = %s\n", syncIndex, self.scopeTag)
 			}
 		}()
 
 		for {
-			glog.V(2).Infof("[control][%d]start sync for scope = %s\n", syncIndex, self.scopeTag)
+			self.client.log.V(2).Infof("[control][%d]start sync for scope = %s\n", syncIndex, self.scopeTag)
 
 			done := false
 			success := false

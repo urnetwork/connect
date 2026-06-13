@@ -7,8 +7,6 @@ import (
 
 	"container/heap"
 
-	"github.com/urnetwork/glog"
-
 	"github.com/urnetwork/connect/protocol"
 )
 
@@ -29,6 +27,7 @@ func newRttWindowItem(sendTime time.Time, receiveTime time.Time) *rttWindowItem 
 }
 
 type RttWindow struct {
+	log           Logger
 	windowTimeout time.Duration
 	rttScale      float32
 	minScaledRtt  time.Duration
@@ -43,6 +42,7 @@ type RttWindow struct {
 }
 
 func NewRttWindow(
+	log Logger,
 	windowSize int,
 	windowTimeout time.Duration,
 	rttScale float32,
@@ -55,6 +55,7 @@ func NewRttWindow(
 	window := make([]*rttWindowItem, windowSize)
 
 	return &RttWindow{
+		log:             loggerOrDefault(log),
 		windowTimeout:   windowTimeout,
 		rttScale:        rttScale,
 		minScaledRtt:    minScaledRtt,
@@ -142,7 +143,7 @@ func (self *RttWindow) scaledRtt(sendTime time.Time) time.Duration {
 		),
 		self.maxScaledRtt,
 	)
-	glog.V(2).Infof("[rtt]scaled=%dms\n", scaledRtt/time.Millisecond)
+	self.log.V(2).Infof("[rtt]scaled=%dms\n", scaledRtt/time.Millisecond)
 	return scaledRtt
 }
 
