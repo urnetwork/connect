@@ -222,6 +222,8 @@ func (self *ApiMultiClientGenerator) NewClient(
 	clientOob := NewApiOutOfBandControl(ctx, self.clientStrategy, args.ClientAuth.ByJwt, self.apiUrl)
 	client := NewClient(ctx, args.ClientId, clientOob, clientSettings)
 	settings := DefaultPlatformTransportSettings()
+	// propagate so the client-level logger covers the platform transport
+	settings.Log = client.Log()
 	if args.P2pOnly {
 		settings.TransportGenerator = func() (sendTransport Transport, receiveTransport Transport) {
 			// only use the platform transport for control

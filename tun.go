@@ -274,6 +274,7 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 	}
 
 	dohSettings := DefaultDohSettings()
+	dohSettings.ConnectSettings.Log = tun.log
 	dohSettings.RequestTimeout = 60 * time.Second
 	dohSettings.TlsTimeout = 30 * time.Second
 	dohSettings.DialContextSettings = &DialContextSettings{

@@ -116,6 +116,7 @@ type DohCache struct {
 	remoteResolver *net.Resolver
 	localResolver  *net.Resolver
 	settings       *DohSettings
+	log            Logger
 
 	stateLock             sync.Mutex
 	queryResultExpiration map[DohKey]*DohResult
@@ -207,6 +208,7 @@ func NewDohCache(settings *DohSettings) *DohCache {
 		remoteResolver:        remoteResolver,
 		localResolver:         localResolver,
 		settings:              settings,
+		log:                   loggerOrDefault(settings.Log),
 		queryResultExpiration: map[DohKey]*DohResult{},
 	}
 }
@@ -287,8 +289,8 @@ func (self *DohCache) Query(ctx context.Context, recordType string, domain strin
 			}
 		} else if authoritativeDnsMiss(err) {
 			cacheMiss = true
-		} else {
-			fmt.Printf("[doh]remote (%s) err = %s\n", q.Domain, err)
+		} else if log := self.log.V(2); log.Enabled() {
+			log.Infof("[doh]remote (%s) err = %s\n", q.Domain, err)
 		}
 	}
 
@@ -308,8 +310,8 @@ func (self *DohCache) Query(ctx context.Context, recordType string, domain strin
 			}
 		} else if authoritativeDnsMiss(err) {
 			cacheMiss = true
-		} else {
-			fmt.Printf("[doh]local (%s) err = %s\n", q.Domain, err)
+		} else if log := self.log.V(2); log.Enabled() {
+			log.Infof("[doh]local (%s) err = %s\n", q.Domain, err)
 		}
 	}
 
