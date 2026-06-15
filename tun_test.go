@@ -99,3 +99,126 @@ func bridgeTun(ctx context.Context, dst *Tun, src *Tun) {
 		}
 	}()
 }
+
+// bridgeTunBatch forwards packets from src to dst using the batched read path
+// (`ReadBatch`), the same way the proxy's ProxyDevice.Run drains the tun. This
+// exercises the batch drain under sustained load.
+func bridgeTunBatch(ctx context.Context, dst *Tun, src *Tun) {
+	go func() {
+		packets := make([][]byte, 64)
+		for {
+			n, err := src.ReadBatch(packets)
+			if err != nil {
+				return
+			}
+			for _, packet := range packets[:n] {
+				_, _ = dst.Write(packet)
+				MessagePoolReturn(packet)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+		}
+	}()
+}
+
+// TestTunTCPThroughput drives a sustained one-way TCP transfer through two tuns
+// bridged together (the bridge stands in for the network between two endpoints),
+// using the batched read path. It asserts the full byte count arrives and that
+// throughput clears a conservative floor — a regression that stalls or
+// head-of-line-blocks the tun receive loop (e.g. holding a lock across a blocking
+// enqueue) collapses this number.
+func TestTunTCPThroughput(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// size the ring buffers well above the default (32) so the bridge can keep
+	// the pipe full under load, the way the proxy sizes its tun.
+	left, err := CreateTun(ctx, DefaultTunSettingsWithBufferSize(2048))
+	if err != nil {
+		t.Fatalf("create left tun: %v", err)
+	}
+	defer left.Close()
+
+	right, err := CreateTun(ctx, DefaultTunSettingsWithBufferSize(2048))
+	if err != nil {
+		t.Fatalf("create right tun: %v", err)
+	}
+	defer right.Close()
+
+	// bidirectional bridge: data flows left->right, acks flow right->left
+	bridgeTunBatch(ctx, left, right)
+	bridgeTunBatch(ctx, right, left)
+
+	rightIP := net.IP(right.localAddresses[0].AsSlice())
+	ln, err := right.ListenTCP(&net.TCPAddr{IP: rightIP, Port: 0})
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	defer ln.Close()
+
+	const totalBytes = int64(128) << 20 // 128 MiB
+	const minThroughputMiBs = 5.0       // conservative floor; a stall is ~0
+
+	recvDone := make(chan int64, 1)
+	recvErr := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			recvErr <- err
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetReadDeadline(time.Now().Add(55 * time.Second))
+		// drain exactly totalBytes, so neither side needs a half-close
+		n, err := io.CopyN(io.Discard, conn, totalBytes)
+		if err != nil {
+			recvErr <- err
+			return
+		}
+		recvDone <- n
+	}()
+
+	conn, err := left.DialContext(ctx, "tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial through tun: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetWriteDeadline(time.Now().Add(55 * time.Second))
+
+	payload := make([]byte, 128*1024) // 128 KiB write chunks
+
+	start := time.Now()
+	written := int64(0)
+	for written < totalBytes {
+		chunk := payload
+		if remaining := totalBytes - written; remaining < int64(len(chunk)) {
+			chunk = payload[:remaining]
+		}
+		n, err := conn.Write(chunk)
+		if err != nil {
+			t.Fatalf("write through tun after %d bytes: %v", written, err)
+		}
+		written += int64(n)
+	}
+
+	select {
+	case err := <-recvErr:
+		t.Fatalf("receiver error: %v", err)
+	case n := <-recvDone:
+		elapsed := time.Since(start)
+		if n != written {
+			t.Fatalf("received %d bytes, sent %d", n, written)
+		}
+		mib := float64(n) / (1024 * 1024)
+		mibs := mib / elapsed.Seconds()
+		t.Logf("tun tcp throughput: %.0f MiB in %v = %.1f MiB/s", mib, elapsed.Round(time.Millisecond), mibs)
+		if mibs < minThroughputMiBs {
+			t.Fatalf("throughput %.1f MiB/s below floor %.1f MiB/s", mibs, minThroughputMiBs)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out after writing %d/%d bytes", written, totalBytes)
+	}
+}

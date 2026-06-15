@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"os"
 	// "regexp"
 	mathrand "math/rand"
 	"strconv"
@@ -39,11 +38,9 @@ import (
 )
 
 // const DefaultChannelSize = 64
-// const DefaultProxySequenceSize = 64
-// const DefaultWriteTimeout = 15 * time.Second
 
 func DefaultTunSettings() *TunSettings {
-	return DefaultTunSettingsWithBufferSize(32)
+	return DefaultTunSettingsWithBufferSize(1024)
 }
 
 func DefaultTunSettingsWithBufferSize(bufferSize int) *TunSettings {
@@ -57,10 +54,6 @@ func DefaultTunSettingsWithBufferSize(bufferSize int) *TunSettings {
 		DialRace:        4,
 		DialRaceTimeout: 2 * time.Second,
 		DialTimeout:     30 * time.Second,
-
-		// this works with `ProxySequenceSize` to control packet loss during back pressure
-		WriteTimeout:      5 * time.Second,
-		ProxySequenceSize: bufferSize,
 
 		// the gvisor udp endpoint buffers default to 32KiB,
 		// which is too small for fast transfer.
@@ -80,9 +73,6 @@ type TunSettings struct {
 	DialRace        int
 	DialRaceTimeout time.Duration
 	DialTimeout     time.Duration
-
-	WriteTimeout      time.Duration
-	ProxySequenceSize int
 
 	UdpReceiveBufferByteCount int
 	UdpSendBufferByteCount    int
@@ -209,13 +199,9 @@ type Tun struct {
 	nicIdAllocator            *NicIdAllocator
 	localAddresses            []netip.Addr
 	localIpv4AddressAllocator *LocalIpv4AddressAllocator
-	receivePacket             chan []byte
 	// mtu                 int
 	// registeredAddresses map[netip.Addr]bool
 	dohResolver *DohCache
-
-	// serializes the endpoint queue pop and receive queue add in `WriteNotify`
-	writeNotifyLock sync.Mutex
 
 	stateLock sync.Mutex
 }
@@ -270,7 +256,6 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 		nicIdAllocator:            nicIdAllocator,
 		localAddresses:            localAddresses,
 		localIpv4AddressAllocator: localIpv4AddressAllocator,
-		receivePacket:             make(chan []byte, settings.ProxySequenceSize),
 	}
 
 	dohSettings := DefaultDohSettings()
@@ -311,8 +296,6 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 	}
 	tun.stack.AddRoute(tcpip.Route{Destination: header.IPv4EmptySubnet, NIC: nicId})
 
-	ep.AddNotify(tun)
-
 	return tun, nil
 }
 
@@ -321,15 +304,17 @@ func (self *Tun) DohCache() *DohCache {
 }
 
 func (self *Tun) Read() ([]byte, error) {
-	select {
-	case <-self.ctx.Done():
+	// read directly from the gvisor endpoint's outbound queue. that queue is
+	// itself a buffered FIFO (size `ChannelSize`) that drops on overflow, so it
+	// is the sequence buffer. ReadContext blocks until a packet is available or
+	// the ctx is canceled.
+	pkt := self.ep.ReadContext(self.ctx)
+	if pkt == nil {
 		return nil, fmt.Errorf("Done")
-	case m, ok := <-self.receivePacket:
-		if !ok {
-			return nil, os.ErrClosed
-		}
-		return m, nil
 	}
+	packet := MessagePoolCopy(pkt.ToView().AsSlice())
+	pkt.DecRef()
+	return packet, nil
 }
 
 // reads one or more packets, blocking until at least one is available.
@@ -339,29 +324,24 @@ func (self *Tun) ReadBatch(packets [][]byte) (int, error) {
 	if len(packets) == 0 {
 		return 0, nil
 	}
-	select {
-	case <-self.ctx.Done():
+	// block for the first packet, then drain whatever else is already queued
+	// without blocking. the gvisor endpoint queue is the sequence buffer (it
+	// drops on overflow), and a single reader popping it preserves per-flow order.
+	pkt := self.ep.ReadContext(self.ctx)
+	if pkt == nil {
 		return 0, fmt.Errorf("Done")
-	case m, ok := <-self.receivePacket:
-		if !ok {
-			return 0, os.ErrClosed
-		}
-		packets[0] = m
-		n := 1
-		for n < len(packets) {
-			select {
-			case m, ok := <-self.receivePacket:
-				if !ok {
-					return n, nil
-				}
-				packets[n] = m
-				n += 1
-			default:
-				return n, nil
-			}
-		}
-		return n, nil
 	}
+	n := 0
+	for pkt != nil {
+		packets[n] = MessagePoolCopy(pkt.ToView().AsSlice())
+		pkt.DecRef()
+		n += 1
+		if n >= len(packets) {
+			break
+		}
+		pkt = self.ep.Read()
+	}
+	return n, nil
 }
 
 // safe to call from multiple goroutines
@@ -383,53 +363,6 @@ func (self *Tun) Write(packet []byte) (int, error) {
 		return len(packet), nil
 	default:
 		return 0, syscall.EAFNOSUPPORT
-	}
-}
-
-func (self *Tun) WriteNotify() {
-	// the stack notifies inline from concurrent writer goroutines, which all
-	// pop a shared endpoint queue. the pop and the receive queue add must be
-	// one atomic step, since packets of one flow that pass through different
-	// notify handlers would otherwise reorder. receivers treat each flow as
-	// in order, so a reorder shows up as packet loss.
-	self.writeNotifyLock.Lock()
-	defer self.writeNotifyLock.Unlock()
-
-	pkt := self.ep.Read()
-
-	// if pkt.IsNil() {
-	// 	return
-	// }
-
-	// FIXME
-	view := pkt.ToView()
-	// m := MessagePoolGet(view.Capacity())
-	// view.Read(m)
-	packet := MessagePoolCopy(view.AsSlice())
-	pkt.DecRef()
-
-	// fast path without arming a timer
-	select {
-	case self.receivePacket <- packet:
-		return
-	default:
-	}
-
-	if 0 < self.settings.WriteTimeout {
-		select {
-		case <-self.ctx.Done():
-			MessagePoolReturn(packet)
-		case self.receivePacket <- packet:
-		case <-time.After(self.settings.WriteTimeout):
-			// drop
-			MessagePoolReturn(packet)
-		}
-	} else {
-		select {
-		case <-self.ctx.Done():
-			MessagePoolReturn(packet)
-		case self.receivePacket <- packet:
-		}
 	}
 }
 
@@ -616,18 +549,8 @@ func (self *Tun) Dial(network, address string) (net.Conn, error) {
 func (self *Tun) Close() error {
 	self.cancel()
 	self.stack.RemoveNIC(self.nicId)
+	// ep.Close() drains and DecRefs any packets still queued in the endpoint.
 	self.ep.Close()
-	// Drain any queued packets so their pool buffers can be returned. Any
-	// in-flight WriteNotify will see ctx.Done() and return its own packet.
-drain:
-	for {
-		select {
-		case packet := <-self.receivePacket:
-			MessagePoolReturn(packet)
-		default:
-			break drain
-		}
-	}
 	self.nicIdAllocator.ReturnNicId(self.nicId)
 	for _, addr := range self.localAddresses {
 		if addr.Is4() {
