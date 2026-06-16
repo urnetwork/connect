@@ -2377,9 +2377,18 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 
 		endTime := time.Now().Add(self.sendBufferSettings.CreateContractTimeout)
 
+		// Back off contract retries when the backend is unreachable. The normal
+		// retry interval against a dead control API is one of the main bandwidth-leak
+		// sources during an outage; 30s throttles that while still recovering promptly
+		// once the API returns.
+		contractRetryInterval := self.sendBufferSettings.CreateContractRetryInterval
+		if isBackendDegraded() {
+			contractRetryInterval = 30 * time.Second
+		}
+
 		if self.sendContract != nil {
 			// there should be a queued up contract
-			if traceNextContract(min(self.sendBufferSettings.CreateContractTimeout, self.sendBufferSettings.CreateContractRetryInterval)) {
+			if traceNextContract(min(self.sendBufferSettings.CreateContractTimeout, contractRetryInterval)) {
 				return true
 			}
 		}
@@ -2405,13 +2414,17 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 				EncryptionRole:      self.encryptionRole,
 				EncryptionCompanion: self.encryptionCompanion,
 			}
-			self.client.ContractManager().CreateContract(
-				contractKey,
-				self.contractSeqIndex,
-				ByteCount(32+float32(messageByteCount+messageByteCount+self.sendBufferSettings.MinMessageByteCount)/self.sendBufferSettings.ContractFillFraction),
-			)
 
-			if traceNextContract(min(timeout, self.sendBufferSettings.CreateContractRetryInterval)) {
+			// Gate contract creation when backend is degraded to prevent bandwidth leak
+			if !isBackendDegraded() {
+				self.client.ContractManager().CreateContract(
+					contractKey,
+					self.contractSeqIndex,
+					ByteCount(32+float32(messageByteCount+messageByteCount+self.sendBufferSettings.MinMessageByteCount)/self.sendBufferSettings.ContractFillFraction),
+				)
+			}
+
+			if traceNextContract(min(timeout, contractRetryInterval)) {
 				return true
 			}
 		}
