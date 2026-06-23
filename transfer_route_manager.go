@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 	// "runtime/debug"
 
@@ -323,11 +324,58 @@ type MultiRouteSelector struct {
 	routeStats      map[Route]*RouteStats
 	routeActive     map[Route]bool
 	routeWeight     map[Route]float32
+
+	// activeRoutesSnapshot is an immutable snapshot of the active routes, their
+	// weights, and the transport-update notify channel. it is rebuilt under
+	// `mutex` (via `updateActiveRoutesWithLock`) whenever the active routes,
+	// weights, or transport set change, and read lock-free on the per-packet
+	// `Read`/`Write` path. previously each `Read`/`Write` took `mutex` (and
+	// allocated a new slice) in `GetActiveRoutes` plus took the monitor lock in
+	// `NotifyChannel` — both on every packet. the route set changes rarely, so
+	// the snapshot moves that work off the hot path.
+	activeRoutesSnapshot atomic.Pointer[routeSnapshot]
+}
+
+// routeSnapshot is an immutable view of the selector's active routes published
+// to the hot path. all fields are set at construction and never mutated, so
+// readers need no synchronization.
+type routeSnapshot struct {
+	routes []Route
+	// weight is the route weight map for `WeightedShuffle`; nil when the
+	// selector does not use weighted routes.
+	weight map[Route]float32
+	// notify is the transport-update channel valid for this snapshot
+	// generation. it is closed when the routes change, waking blocked readers
+	// so they reload the next snapshot.
+	notify chan struct{}
+}
+
+// shuffled returns the active routes in randomized priority order. for zero or
+// one routes it returns the shared immutable slice (no allocation); otherwise
+// it returns a freshly shuffled copy so the immutable snapshot is never
+// mutated.
+func (self *routeSnapshot) shuffled() []Route {
+	n := len(self.routes)
+	if n <= 1 {
+		return self.routes
+	}
+	routes := make([]Route, n)
+	copy(routes, self.routes)
+	if self.weight != nil {
+		// prioritize the routes (weighted shuffle)
+		// if all weights are equal, this is the same as a shuffle
+		WeightedShuffle(routes, self.weight)
+	} else {
+		mathrand.Shuffle(n, func(i int, j int) {
+			routes[i], routes[j] = routes[j], routes[i]
+		})
+	}
+	return routes
 }
 
 func NewMultiRouteSelector(ctx context.Context, clientTag string, log Logger, destination TransferPath, weightedRoutes bool) *MultiRouteSelector {
 	cancelCtx, cancel := context.WithCancel(ctx)
-	return &MultiRouteSelector{
+	multiRouteSelector := &MultiRouteSelector{
 		ctx:             cancelCtx,
 		cancel:          cancel,
 		clientTag:       clientTag,
@@ -340,6 +388,39 @@ func NewMultiRouteSelector(ctx context.Context, clientTag string, log Logger, de
 		routeActive:     map[Route]bool{},
 		routeWeight:     map[Route]float32{},
 	}
+	// publish the initial (empty) snapshot so the hot path always has a non-nil
+	// snapshot to read
+	multiRouteSelector.updateActiveRoutesWithLock()
+	return multiRouteSelector
+}
+
+// rebuilds the immutable active-routes snapshot from the current route state
+// and publishes it for the lock-free hot path. must be called with `mutex`
+// (it reads the route maps and captures the current transport-update channel).
+func (self *MultiRouteSelector) updateActiveRoutesWithLock() {
+	activeRoutes := []Route{}
+	for _, routes := range self.transportRoutes {
+		for _, route := range routes {
+			if self.routeActive[route] {
+				activeRoutes = append(activeRoutes, route)
+			}
+		}
+	}
+
+	var weight map[Route]float32
+	if self.weightedRoutes {
+		// copy so the published map is immutable
+		weight = make(map[Route]float32, len(self.routeWeight))
+		for route, w := range self.routeWeight {
+			weight[route] = w
+		}
+	}
+
+	self.activeRoutesSnapshot.Store(&routeSnapshot{
+		routes: activeRoutes,
+		weight: weight,
+		notify: self.transportUpdate.NotifyChannel(),
+	})
 }
 
 func (self *MultiRouteSelector) getTransportStats(transport Transport) *RouteStats {
@@ -428,7 +509,11 @@ func (self *MultiRouteSelector) updateTransport(transport Transport, routes []Ro
 		self.updateRouteWeights()
 	}
 
+	// notify first so the rebuilt snapshot captures the new transport-update
+	// channel; readers on the old snapshot wake on the old (now closed) channel
+	// and reload
 	self.transportUpdate.NotifyAll()
+	self.updateActiveRoutesWithLock()
 }
 
 func (self *MultiRouteSelector) updateRouteWeights() {
@@ -549,8 +634,11 @@ func (self *MultiRouteSelector) setActive(route Route, active bool) {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 
-	if _, ok := self.routeActive[route]; ok {
+	if current, ok := self.routeActive[route]; ok && current != active {
 		self.routeActive[route] = active
+		// the active set changed, so republish the snapshot. the hot path that
+		// deactivated a closed route reloads on its next loop iteration.
+		self.updateActiveRoutesWithLock()
 	}
 }
 
@@ -596,8 +684,12 @@ func (self *MultiRouteSelector) WriteDetailed(ctx context.Context, transferFrame
 	// write to the first channel available, in random priority
 	enterTime := time.Now()
 	for {
-		notify := self.transportUpdate.NotifyChannel()
-		activeRoutes := self.GetActiveRoutes()
+		// read the active routes and the transport-update channel from the
+		// lock-free snapshot instead of taking the selector and monitor locks
+		// on every packet
+		snapshot := self.activeRoutesSnapshot.Load()
+		notify := snapshot.notify
+		activeRoutes := snapshot.shuffled()
 
 		if self.log.V(2).Enabled() {
 			self.log.Infof("[mrw] %s->%s s(%s) routes = %d\n", self.clientTag, self.destination.DestinationId, self.destination.StreamId, len(activeRoutes))
@@ -749,8 +841,12 @@ func (self *MultiRouteSelector) Read(ctx context.Context, timeout time.Duration)
 	// read from the first channel available, in random priority
 	enterTime := time.Now()
 	for {
-		notify := self.transportUpdate.NotifyChannel()
-		activeRoutes := self.GetActiveRoutes()
+		// read the active routes and the transport-update channel from the
+		// lock-free snapshot instead of taking the selector and monitor locks
+		// on every packet
+		snapshot := self.activeRoutesSnapshot.Load()
+		notify := snapshot.notify
+		activeRoutes := snapshot.shuffled()
 
 		if self.log.V(2).Enabled() {
 			self.log.Infof("[mrr] %s/%s<- s(%s) routes = %d\n", self.clientTag, self.destination.DestinationId, self.destination.StreamId, len(activeRoutes))

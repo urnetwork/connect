@@ -641,9 +641,9 @@ func (self *RemoteUserNatMultiClient) affinityIpPathsWithLock(ipPath *IpPath) (a
 	return
 }
 
-func (self *RemoteUserNatMultiClient) sendClientPath(ipPath *IpPath, callback func(*multiClientChannelUpdate)) {
-	update, previousClient := self.sendUpdate(ipPath)
-	callback(update)
+func (self *RemoteUserNatMultiClient) sendClientPath(ipPath *IpPath, callback func(*multiClientChannelUpdate, *multiClientChannel)) {
+	update, previousClient, currentClient := self.sendUpdate(ipPath)
+	callback(update, currentClient)
 	// self.updateClient(update, client)
 
 	func() {
@@ -673,8 +673,13 @@ func (self *RemoteUserNatMultiClient) sendClientPath(ipPath *IpPath, callback fu
 	}()
 }
 
+// returns the flow's update, the client it was previously associated with (for
+// the caller's `clientUpdates` bookkeeping), and the current client to send to.
+// the current client is read here under the parent lock that is already held,
+// so the egress hot path does not reacquire the parent lock to read it.
 func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 	*multiClientChannelUpdate,
+	*multiClientChannel,
 	*multiClientChannel,
 ) {
 	self.stateLock.Lock()
@@ -820,7 +825,7 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 		}
 
 		update.activityTime = time.Now()
-		return update, previousClient
+		return update, previousClient, update.client
 	case 6:
 		ip6Path := ipPath.ToIp6Path()
 		var previousClient *multiClientChannel
@@ -917,7 +922,7 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 		}
 
 		update.activityTime = time.Now()
-		return update, previousClient
+		return update, previousClient, update.client
 	default:
 		panic(fmt.Errorf("Bad protocol version %d", ipPath.Version))
 	}
@@ -1080,16 +1085,10 @@ func (self *RemoteUserNatMultiClient) canSendPacket(sendPacket *parsedPacket, up
 			// retransmits don't need to be sent as soon as the packet is committed to a client
 			if ipPath.Syn || ipPath.Rst {
 				allow = true
-			} else {
-				func() {
-					self.stateLock.Lock()
-					defer self.stateLock.Unlock()
-
-					if update.canUpdateSequence(sendPacket) {
-						allow = true
-						return
-					}
-				}()
+			} else if update.canUpdateSequence(sendPacket) {
+				// sequence state is guarded by the per-flow `sequenceLock`, not
+				// the parent `stateLock`
+				allow = true
 			}
 		} else {
 			allow = true
@@ -1107,7 +1106,7 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 	timeout time.Duration,
 ) (success bool) {
 	ipPath := sendPacket.ipPath
-	self.sendClientPath(ipPath, func(update *multiClientChannelUpdate) {
+	self.sendClientPath(ipPath, func(update *multiClientChannelUpdate, currentClient *multiClientChannel) {
 		if !self.canSendPacket(sendPacket, update) {
 			return
 		}
@@ -1115,27 +1114,19 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 		enterTime := time.Now()
 
 		if ipPath.Syn || ipPath.Rst {
-			func() {
-				self.stateLock.Lock()
-				defer self.stateLock.Unlock()
-				update.resetSequence(sendPacket)
-			}()
+			// sequence state is guarded by the per-flow `sequenceLock`
+			update.resetSequence(sendPacket)
 		}
 
-		currentClient := func() *multiClientChannel {
-			self.stateLock.Lock()
-			defer self.stateLock.Unlock()
-			return update.client
-		}
-		for client := currentClient(); client != nil; {
+		// `currentClient` is the client snapshot read by `sendClientPath` under
+		// the parent lock it already held, so the steady-state send no longer
+		// takes the parent lock again just to read `update.client`.
+		for client := currentClient; client != nil; {
 			var err error
 			success, err = client.SendDetailed(sendPacket, timeout)
 			if success {
-				func() {
-					self.stateLock.Lock()
-					defer self.stateLock.Unlock()
-					update.updateSequence(sendPacket)
-				}()
+				// sequence state is guarded by the per-flow `sequenceLock`
+				update.updateSequence(sendPacket)
 			} else if err != nil {
 				// reset the path
 
@@ -1672,6 +1663,15 @@ type multiClientChannelUpdate struct {
 	activityTime time.Time
 	ipPath       *IpPath
 
+	// sequenceLock guards only the tcp collapse-prevention sequence state
+	// below (`sequencePacketCount`, `ackSequenceNumber`, `sequenceNumber`).
+	// these are read/written on the egress hot path once per packet via
+	// `canUpdateSequence`/`updateSequence`/`resetSequence`. keeping them under a
+	// per-flow lock instead of the parent `RemoteUserNatMultiClient.stateLock`
+	// means independent flows no longer serialize on the parent lock for
+	// sequence tracking. these three methods never touch parent state, so this
+	// lock is a leaf (no ordering constraint with the parent lock).
+	sequenceLock        sync.Mutex
 	sequencePacketCount int
 	ackSequenceNumber   uint32
 	// sequenceNumber wraps at 2^32. ordering is determined via
@@ -1695,6 +1695,9 @@ func newMultiClientChannelUpdate(ctx context.Context, ipPath *IpPath) *multiClie
 }
 
 func (self *multiClientChannelUpdate) resetSequence(sendPacket *parsedPacket) {
+	self.sequenceLock.Lock()
+	defer self.sequenceLock.Unlock()
+
 	ipPath := sendPacket.ipPath
 
 	self.ackSequenceNumber = ipPath.AckSequenceNumber
@@ -1703,6 +1706,9 @@ func (self *multiClientChannelUpdate) resetSequence(sendPacket *parsedPacket) {
 }
 
 func (self *multiClientChannelUpdate) updateSequence(sendPacket *parsedPacket) {
+	self.sequenceLock.Lock()
+	defer self.sequenceLock.Unlock()
+
 	ipPath := sendPacket.ipPath
 	update := false
 
@@ -1727,6 +1733,9 @@ func (self *multiClientChannelUpdate) updateSequence(sendPacket *parsedPacket) {
 }
 
 func (self *multiClientChannelUpdate) canUpdateSequence(sendPacket *parsedPacket) bool {
+	self.sequenceLock.Lock()
+	defer self.sequenceLock.Unlock()
+
 	if self.sequencePacketCount == 0 {
 		return true
 	}
@@ -3280,12 +3289,24 @@ func (self *multiClientChannel) addSource(ipPath *IpPath) {
 
 // must be called with `stateLock`
 func (self *multiClientChannel) addSourceToEventBucketWithLock(eventBucket *multiClientEventBucket, ipPath *IpPath) {
+	// `ip{4,6}DestinationSourceCount[destination][source]` is a reference count
+	// of how many event buckets currently hold the path. `removeEventBucket`
+	// decrements it once per path in the bucket's set, so the increment here
+	// must also happen exactly once per (bucket, path) — i.e. only when the path
+	// is newly added to this bucket's set. doing it on every packet (the prior
+	// behavior) both over-counted (the count never returned to zero, so sources
+	// were never released — unbounded growth) and did redundant per-packet map
+	// writes under the lock. after the first packet of a flow in a bucket, this
+	// is a single map read and no writes.
 	switch ipPath.Version {
 	case 4:
 		ip4Path := ipPath.ToIp4Path()
 
 		if eventBucket.ip4Paths == nil {
 			eventBucket.ip4Paths = map[Ip4Path]bool{}
+		}
+		if eventBucket.ip4Paths[ip4Path] {
+			return
 		}
 		eventBucket.ip4Paths[ip4Path] = true
 
@@ -3303,6 +3324,9 @@ func (self *multiClientChannel) addSourceToEventBucketWithLock(eventBucket *mult
 
 		if eventBucket.ip6Paths == nil {
 			eventBucket.ip6Paths = map[Ip6Path]bool{}
+		}
+		if eventBucket.ip6Paths[ip6Path] {
+			return
 		}
 		eventBucket.ip6Paths[ip6Path] = true
 
