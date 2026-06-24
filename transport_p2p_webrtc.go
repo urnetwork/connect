@@ -463,11 +463,15 @@ func (self *pionLeveledLogger) Infof(format string, args ...any) {
 }
 
 func (self *pionLeveledLogger) Warn(msg string) {
-	self.log.Warningf("[pion:%s]%s", self.scope, msg)
+	if v := self.log.V(1); v.Enabled() {
+		self.log.Warningf("[pion:%s]%s", self.scope, msg)
+	}
 }
 
 func (self *pionLeveledLogger) Warnf(format string, args ...any) {
-	self.log.Warningf("[pion:"+self.scope+"]"+format, args...)
+	if v := self.log.V(1); v.Enabled() {
+		self.log.Warningf("[pion:"+self.scope+"]"+format, args...)
+	}
 }
 
 func (self *pionLeveledLogger) Error(msg string) {

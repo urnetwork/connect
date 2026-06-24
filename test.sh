@@ -1,13 +1,24 @@
 #!/usr/bin/env zsh
 
-# The packet-translation tests (TestPtDns*) drive real-time QUIC-over-DNS
-# transfers with tight per-stream deadlines. They pass in a fresh process but
-# stall and time out late in the full -race suite, once accumulated GC/race
-# overhead slows UDP delivery. Run them first, in their own process, so they
-# execute under the same unpressured conditions as an isolated run, and skip
-# them from the main run below.
+# Some tests are timing-sensitive: they pass in a fresh process but stall or
+# fail late in the full -race suite, once accumulated GC/race overhead slows
+# delivery. Run each such group first, in its own process, so it executes under
+# the same unpressured conditions as an isolated run, and skip them from the
+# main run below.
+#   - TestPtDns*: real-time QUIC-over-DNS transfers with tight per-stream deadlines.
+#   - TestWebRtc*: pion/ice WebRTC transports whose ICE timing flakes under load.
 pt_filter='TestPtDnsEncodeDecode|TestPtDnsPumpEncodeDecode'
+webrtc_filter='TestWebRtc'
+skip_filter="$pt_filter|$webrtc_filter"
 
+# run the WebRTC tests first, in their own process
+match="/$(basename $(pwd))/\\S*\.go\|^\\S*_test.go"
+GORACE="log_path=profile/race.out halt_on_error=1" go test -timeout 0 -v -race -run "$webrtc_filter" "$@" | grep --color=always -e "^" -e "$match"
+if [[ ${pipestatus[1]} != 0 ]]; then
+    exit ${pipestatus[1]}
+fi
+
+# run the packet-translation tests next, in their own process
 match="/$(basename $(pwd))/\\S*\.go\|^\\S*_test.go"
 GORACE="log_path=profile/race.out halt_on_error=1" go test -timeout 0 -v -race -run "$pt_filter" "$@" | grep --color=always -e "^" -e "$match"
 if [[ ${pipestatus[1]} != 0 ]]; then
@@ -19,7 +30,7 @@ for d in `find . -iname '*_test.go' | xargs -n 1 dirname | sort | uniq | paste -
         pushd $d
         # highlight source files in this dir
         match="/$(basename $(pwd))/\\S*\.go\|^\\S*_test.go"
-        GORACE="log_path=profile/race.out halt_on_error=1" go test -timeout 0 -v -race -skip "$pt_filter" -cpuprofile profile/cpu -memprofile profile/memory "$@" | grep --color=always -e "^" -e "$match"
+        GORACE="log_path=profile/race.out halt_on_error=1" go test -timeout 0 -v -race -skip "$skip_filter" -cpuprofile profile/cpu -memprofile profile/memory "$@" | grep --color=always -e "^" -e "$match"
         # -trace profile/trace -coverprofile profile/cover
         if [[ ${pipestatus[1]} != 0 ]]; then
             exit ${pipestatus[1]}

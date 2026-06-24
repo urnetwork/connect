@@ -136,3 +136,95 @@ func BenchmarkMultiClientEgressParallel(b *testing.B) {
 	})
 	b.StopTimer()
 }
+
+// drives bidirectional traffic through the RemoteUserNatMultiClient: parallel
+// egress senders plus a provider that echoes every packet back, so the parent
+// stateLock, per-channel stats, transfer send/receive buffers, and route
+// selector are all exercised on both the send and receive paths. this is the
+// measurement vehicle for the de-contention work; profile with -mutexprofile.
+func BenchmarkMultiClientBidirectional(b *testing.B) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	providerClientId := NewId()
+	settings := DefaultClientSettings()
+	settings.SendBufferSettings.SequenceBufferSize = 0
+	settings.SendBufferSettings.AckBufferSize = 0
+	settings.ReceiveBufferSettings.SequenceBufferSize = 0
+	settings.ForwardBufferSettings.SequenceBufferSize = 0
+	providerClient := NewClient(ctx, providerClientId, NewNoContractClientOob(), settings)
+	defer providerClient.Cancel()
+
+	// the provider echoes each received packet back with the path reversed, so
+	// the echo lands on the originating flow's update (the steady-state ingress
+	// path).
+	providerClient.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode) {
+		for _, frame := range frames {
+			v, err := FromFrame(frame)
+			if err != nil {
+				continue
+			}
+			ipToProvider, ok := v.(*protocol.IpPacketToProvider)
+			if !ok {
+				continue
+			}
+			ipPath, payload, err := ParseIpPathWithPayload(ipToProvider.IpPacket.PacketBytes)
+			if err != nil {
+				continue
+			}
+			echo := ipOosPacket(ipPath.Reverse(), payload)
+			ipFromProvider := &protocol.IpPacketFromProvider{
+				IpPacket: &protocol.IpPacket{PacketBytes: echo},
+			}
+			echoFrame, err := ToFrame(ipFromProvider, DefaultProtocolVersion)
+			if err != nil {
+				continue
+			}
+			providerClient.SendWithTimeout(echoFrame, source.Reverse(), func(err error) {}, -1)
+		}
+	})
+
+	var receiveCount atomic.Int64
+	natClient, err := testingNewMultiClient(
+		ctx,
+		providerClient,
+		func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
+			receiveCount.Add(1)
+		},
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	clientId := NewId()
+	source := SourceId(clientId)
+
+	send := func(s int) {
+		template, _ := tcp4Packet(s, 0, 0, 0)
+		packet := MessagePoolCopy(template)
+		if !natClient.SendPacket(source, protocol.ProvideMode_Network, packet, -1) {
+			MessagePoolReturn(packet)
+		}
+	}
+
+	g := runtime.GOMAXPROCS(0)
+	for s := 1; s <= g; s += 1 {
+		for i := 0; i < 32; i += 1 {
+			send(s)
+		}
+	}
+
+	var flowCounter atomic.Int32
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		s := int(flowCounter.Add(1))
+		template, _ := tcp4Packet(s, 0, 0, 0)
+		for pb.Next() {
+			packet := MessagePoolCopy(template)
+			if !natClient.SendPacket(source, protocol.ProvideMode_Network, packet, -1) {
+				MessagePoolReturn(packet)
+			}
+		}
+	})
+	b.StopTimer()
+}

@@ -343,10 +343,10 @@ func (self *signalPipe) SignalReceiver() SignalReceiver {
 func (self *signalPipe) SendSignal(path TransferPath, signal *protocol.Frame, opts ...any) {
 	signalReceiver := self.SignalReceiver()
 	if signalReceiver != nil {
-		fmt.Printf("[signal]%s (%s)\n", path, signal.MessageType)
+		fmt.Printf("[signal][%s]%s\n", signal.MessageType, path)
 		signalReceiver.ReceiveSignal(path.SourceMask(), signal)
 	} else {
-		fmt.Printf("[signal]drop %s (%s)\n", path, signal.MessageType)
+		fmt.Printf("[signal][%s]drop %s\n", signal.MessageType, path)
 
 	}
 }

@@ -385,11 +385,19 @@ type RemoteUserNatMultiClient struct {
 	affinityIp6Paths map[Ip6Path]map[Ip6Path]time.Time
 	clientUpdates    map[*multiClientChannel]map[*multiClientChannelUpdate]bool
 
-	performanceProfile  *PerformanceProfile
-	localSecurityBypass bool
+	// config is an immutable snapshot of the rarely-changed routing config
+	// (performance profile + local security bypass). it is rebuilt under
+	// stateLock by the setters and read lock-free by selectWindowTypes, the
+	// affinity selection, and the SendPacket drop path.
+	config atomic.Pointer[multiClientConfig]
 
 	localUserNat      *LocalUserNat
 	localUserNatUnsub func()
+}
+
+type multiClientConfig struct {
+	performanceProfile  *PerformanceProfile
+	localSecurityBypass bool
 }
 
 func NewRemoteUserNatMultiClientWithDefaults(
@@ -444,9 +452,12 @@ func NewRemoteUserNatMultiClient(
 		affinityIp4Paths:      map[Ip4Path]map[Ip4Path]time.Time{},
 		affinityIp6Paths:      map[Ip6Path]map[Ip6Path]time.Time{},
 		clientUpdates:         map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
-		performanceProfile:    settings.DefaultPerformanceProfile,
 		localUserNat:          localUserNat,
 	}
+	multiClient.config.Store(&multiClientConfig{
+		performanceProfile:  settings.DefaultPerformanceProfile,
+		localSecurityBypass: false,
+	})
 
 	multiClient.windows[WindowTypeQuality] = newMultiClientWindow(
 		cancelCtx,
@@ -517,7 +528,13 @@ func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 
-		self.performanceProfile = performanceProfile
+		// rebuild the immutable config snapshot under the lock so concurrent
+		// setters do not lose each other's field
+		prev := self.config.Load()
+		self.config.Store(&multiClientConfig{
+			performanceProfile:  performanceProfile,
+			localSecurityBypass: prev.localSecurityBypass,
+		})
 	}()
 	for _, window := range self.windows {
 		window.SetPerformanceProfile(performanceProfile)
@@ -529,13 +546,15 @@ func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *
 func (self *RemoteUserNatMultiClient) SetLocalSecurityBypass(localSecurityBypass bool) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	self.localSecurityBypass = localSecurityBypass
+	prev := self.config.Load()
+	self.config.Store(&multiClientConfig{
+		performanceProfile:  prev.performanceProfile,
+		localSecurityBypass: localSecurityBypass,
+	})
 }
 
 func (self *RemoteUserNatMultiClient) LocalSecurityBypass() bool {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
-	return self.localSecurityBypass
+	return self.config.Load().localSecurityBypass
 }
 
 // ordered by choice descending
@@ -548,13 +567,9 @@ func (self *RemoteUserNatMultiClient) selectWindowTypes(sendPacket *parsedPacket
 	}
 
 	var fixedWindowType *WindowType
-	func() {
-		self.stateLock.Lock()
-		defer self.stateLock.Unlock()
-		if self.performanceProfile != nil {
-			fixedWindowType = &self.performanceProfile.WindowType
-		}
-	}()
+	if pp := self.config.Load().performanceProfile; pp != nil {
+		fixedWindowType = &pp.WindowType
+	}
 
 	if fixedWindowType != nil {
 		return []WindowType{*fixedWindowType}
@@ -569,8 +584,8 @@ func (self *RemoteUserNatMultiClient) selectWindowTypes(sendPacket *parsedPacket
 // called with stateLock
 func (self *RemoteUserNatMultiClient) affinityIpPathsWithLock(ipPath *IpPath) (affinityPaths []*IpPath) {
 	singleIp := false
-	if self.performanceProfile != nil {
-		singleIp = (self.performanceProfile.WindowSize.FixedWindowSize == 1)
+	if pp := self.config.Load().performanceProfile; pp != nil {
+		singleIp = (pp.WindowSize.FixedWindowSize == 1)
 	}
 
 	if singleIp {
@@ -644,13 +659,21 @@ func (self *RemoteUserNatMultiClient) affinityIpPathsWithLock(ipPath *IpPath) (a
 func (self *RemoteUserNatMultiClient) sendClientPath(ipPath *IpPath, callback func(*multiClientChannelUpdate, *multiClientChannel)) {
 	update, previousClient, currentClient := self.sendUpdate(ipPath)
 	callback(update, currentClient)
-	// self.updateClient(update, client)
+
+	// fast path: if the flow's client did not change during the callback, no
+	// clientUpdates bookkeeping is needed, so skip the parent lock entirely
+	// (client is atomic). this is the steady-state egress path.
+	if previousClient == update.client.Load() {
+		return
+	}
 
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 
-		client := update.client
+		// re-read under the lock (the lock-free check above can race a
+		// concurrent client change)
+		client := update.client.Load()
 
 		if previousClient != client {
 			if previousClient != nil {
@@ -754,8 +777,8 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 							}
 						}
 
-						client = update.client
-						update.client = nil
+						client = update.client.Load()
+						update.client.Store(nil)
 
 						delete(self.ip4PathUpdates, ip4Path)
 
@@ -808,24 +831,24 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 				}
 				paths[ip4Path] = time.Now()
 
-				if update.client == nil {
+				if update.client.Load() == nil {
 					var mostRecentCreateTime time.Time
 					for copyIp4Path, createTime := range paths {
 						if copyUpdate, ok := self.ip4PathUpdates[copyIp4Path]; ok {
-							if copyUpdate.client != nil && !copyUpdate.client.IsDone() && !copyUpdate.client.isWarning() && createTime.After(mostRecentCreateTime) {
+							if c := copyUpdate.client.Load(); c != nil && !c.IsDone() && !c.isWarning() && createTime.After(mostRecentCreateTime) {
 								mostRecentCreateTime = createTime
-								update.client = copyUpdate.client
+								update.client.Store(c)
 							}
 						}
 					}
 				}
 			}
 		} else {
-			previousClient = update.client
+			previousClient = update.client.Load()
 		}
 
 		update.activityTime = time.Now()
-		return update, previousClient, update.client
+		return update, previousClient, update.client.Load()
 	case 6:
 		ip6Path := ipPath.ToIp6Path()
 		var previousClient *multiClientChannel
@@ -851,8 +874,8 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 							}
 						}
 
-						client = update.client
-						update.client = nil
+						client = update.client.Load()
+						update.client.Store(nil)
 
 						delete(self.ip6PathUpdates, ip6Path)
 
@@ -905,24 +928,24 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 				}
 				paths[ip6Path] = time.Now()
 
-				if update.client == nil {
+				if update.client.Load() == nil {
 					var mostRecentCreateTime time.Time
 					for copyIp6Path, createTime := range paths {
 						if copyUpdate, ok := self.ip6PathUpdates[copyIp6Path]; ok {
-							if copyUpdate.client != nil && !copyUpdate.client.IsDone() && !copyUpdate.client.isWarning() && createTime.After(mostRecentCreateTime) {
+							if c := copyUpdate.client.Load(); c != nil && !c.IsDone() && !c.isWarning() && createTime.After(mostRecentCreateTime) {
 								mostRecentCreateTime = createTime
-								update.client = copyUpdate.client
+								update.client.Store(c)
 							}
 						}
 					}
 				}
 			}
 		} else {
-			previousClient = update.client
+			previousClient = update.client.Load()
 		}
 
 		update.activityTime = time.Now()
-		return update, previousClient, update.client
+		return update, previousClient, update.client.Load()
 	default:
 		panic(fmt.Errorf("Bad protocol version %d", ipPath.Version))
 	}
@@ -1007,8 +1030,8 @@ func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 		if updates, ok := self.clientUpdates[client]; ok {
 			delete(self.clientUpdates, client)
 			for update, _ := range updates {
-				if update.client == client {
-					update.client = nil
+				if update.client.Load() == client {
+					update.client.Store(nil)
 
 					if packet, ok := ipOosRst(update.ipPath.Reverse()); ok {
 						rstPacket := &receivePacket{
@@ -1086,7 +1109,7 @@ func (self *RemoteUserNatMultiClient) canSendPacket(sendPacket *parsedPacket, up
 			if ipPath.Syn || ipPath.Rst {
 				allow = true
 			} else if update.canUpdateSequence(sendPacket) {
-				// sequence state is guarded by the per-flow `sequenceLock`, not
+				// sequence state is guarded by the per-flow `stateLock`, not
 				// the parent `stateLock`
 				allow = true
 			}
@@ -1114,7 +1137,7 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 		enterTime := time.Now()
 
 		if ipPath.Syn || ipPath.Rst {
-			// sequence state is guarded by the per-flow `sequenceLock`
+			// sequence state is guarded by the per-flow `stateLock`
 			update.resetSequence(sendPacket)
 		}
 
@@ -1125,19 +1148,14 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 			var err error
 			success, err = client.SendDetailed(sendPacket, timeout)
 			if success {
-				// sequence state is guarded by the per-flow `sequenceLock`
+				// sequence state is guarded by the per-flow `stateLock`
 				update.updateSequence(sendPacket)
 			} else if err != nil {
 				// reset the path
 
 				self.log.Infof("[multi]reset error = %s\n", err)
 
-				func() {
-					self.stateLock.Lock()
-					defer self.stateLock.Unlock()
-
-					update.client = nil
-				}()
+				update.client.Store(nil)
 
 				rstPackets := []*receivePacket{}
 
@@ -1197,12 +1215,8 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 				if client.Send(sendPacket, sendTimeout) {
 					success = true
 
-					func() {
-						self.stateLock.Lock()
-						defer self.stateLock.Unlock()
-
-						update.client = client
-					}()
+					// client is atomic; lock-free store
+					update.client.Store(client)
 				}
 				return
 
@@ -1223,19 +1237,8 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 					default:
 					}
 
-					done := false
-
-					func() {
-						self.stateLock.Lock()
-						defer self.stateLock.Unlock()
-
-						if update.client != nil {
-							// another client already chosen, done
-							done = true
-							return
-						}
-					}()
-					if done {
+					if update.client.Load() != nil {
+						// another client already chosen, done
 						return
 					}
 
@@ -1250,18 +1253,19 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 						var initRaceEarlyComplete <-chan struct{}
 						var abandonedClients []*multiClientChannel
 						func() {
-							self.stateLock.Lock()
-							defer self.stateLock.Unlock()
+							// race state is guarded by the per-flow stateLock (a
+							// leaf); client is atomic
+							update.stateLock.Lock()
+							defer update.stateLock.Unlock()
 
-							if update.client != nil {
+							if update.client.Load() != nil {
 								// another client already chosen, done
-								done = true
 								return
 							}
 
 							race := update.race
 							if race == nil {
-								update.initRace()
+								update.initRaceWithLock()
 								race = update.race
 
 								initRace = race
@@ -1287,8 +1291,8 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 									}
 								}
 
-								update.clearRace()
-								update.client = client
+								update.clearRaceWithLock()
+								update.client.Store(client)
 							}
 						}()
 
@@ -1418,12 +1422,28 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 	var receivePackets []*receivePacket
 	var returnPackets []*receivePacket
 	success := self.receiveClientPath(ipPath, func(update *multiClientChannelUpdate) {
-		self.stateLock.Lock()
-		defer self.stateLock.Unlock()
+		// steady-state fast path: the flow is already committed to this client,
+		// so deliver without taking any lock (client is atomic). this is the
+		// common download path and no longer contends the parent stateLock.
+		if update.client.Load() == sourceClient {
+			p := &receivePacket{
+				Source:      source,
+				ProvideMode: provideMode,
+				IpPath:      ipPath,
+				Packet:      packet,
+			}
+			receivePackets = []*receivePacket{p}
+			return
+		}
 
-		client := update.client
+		// race / not-yet-committed paths are guarded by the per-flow stateLock
+		update.stateLock.Lock()
+		defer update.stateLock.Unlock()
+
+		client := update.client.Load()
 
 		if client == sourceClient {
+			// committed between the lock-free check and acquiring the lock
 			p := &receivePacket{
 				Source:      source,
 				ProvideMode: provideMode,
@@ -1483,8 +1503,8 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 				}
 			}
 
-			update.clearRace()
-			update.client = sourceClient
+			update.clearRaceWithLock()
+			update.client.Store(sourceClient)
 			receivePacket := &receivePacket{
 				Source:      source,
 				ProvideMode: provideMode,
@@ -1523,7 +1543,8 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 	}
 }
 
-// this can be called inside the state lock
+// spawns a goroutine that completes the race after a timeout. it acquires the
+// per-flow stateLock (not the parent lock) when it evaluates the race.
 func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 	ipPath *IpPath,
 	race *multiClientChannelUpdateRace,
@@ -1543,13 +1564,15 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 		var receivePackets []*receivePacket
 		var returnPackets []*receivePacket
 		self.receiveClientPath(ipPath, func(update *multiClientChannelUpdate) {
-			self.stateLock.Lock()
-			defer self.stateLock.Unlock()
+			// race state is guarded by the per-flow stateLock (a leaf); client
+			// is atomic
+			update.stateLock.Lock()
+			defer update.stateLock.Unlock()
 
 			if update.race == race {
-				defer update.clearRace()
+				defer update.clearRaceWithLock()
 
-				if update.client == nil {
+				if update.client.Load() == nil {
 
 					// weighted shuffle clients by rtt
 					orderedClients := []*multiClientChannel{}
@@ -1567,7 +1590,7 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 						// the last is the lowest rtt
 						client := orderedClients[len(orderedClients)-1]
 
-						update.client = client
+						update.client.Store(client)
 						receivePackets = race.clientStates[client].packets
 						for _, p := range receivePackets {
 							if p.Pooled {
@@ -1578,8 +1601,9 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 					}
 				}
 				// else the client is already set
+				committedClient := update.client.Load()
 				for abandonedClient, abandonedState := range race.clientStates {
-					if abandonedClient != update.client {
+					if abandonedClient != committedClient {
 						abandonedClients = append(abandonedClients, abandonedClient)
 						for _, p := range abandonedState.packets {
 							if p.Pooled {
@@ -1623,32 +1647,29 @@ func (self *RemoteUserNatMultiClient) Close() {
 		window.Close()
 	}
 
+	var removedUpdates []*multiClientChannelUpdate
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 
-		removedUpdates := []*multiClientChannelUpdate{}
-
 		for _, update := range self.ip4PathUpdates {
 			removedUpdates = append(removedUpdates, update)
-			// update.Close()
 		}
 		for _, update := range self.ip6PathUpdates {
 			removedUpdates = append(removedUpdates, update)
-			// update.Close()
 		}
 		clear(self.ip4PathUpdates)
 		clear(self.ip6PathUpdates)
 		clear(self.affinityIp4Paths)
 		clear(self.affinityIp6Paths)
-		// clear(self.updateIp4Paths)
-		// clear(self.updateIp6Paths)
-		// clear(clientUpdates)
-
-		for _, update := range removedUpdates {
-			update.Close()
-		}
 	}()
+
+	// close updates outside the parent lock: update.Close() takes the per-flow
+	// stateLock (clearRaceWithLock), and keeping it off the parent lock means
+	// the per-flow stateLock never nests under the parent lock anywhere.
+	for _, update := range removedUpdates {
+		update.Close()
+	}
 
 	self.localUserNat.Close()
 	self.localUserNatUnsub()
@@ -1658,27 +1679,35 @@ type multiClientChannelUpdate struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	client       *multiClientChannel
-	race         *multiClientChannelUpdateRace
+	// client is the channel this flow is committed to. it is read on the
+	// per-packet hot path (egress send target, ingress steady-state match) and
+	// across flows by affinity selection, so it is an atomic for lock-free
+	// reads. writes happen under the parent stateLock (which serializes them
+	// against the path maps) or a context where the writer has exclusive access.
+	client atomic.Pointer[multiClientChannel]
+
+	// stateLock guards the per-flow mutable state below: the active race and the
+	// tcp collapse-prevention sequence counters. it is a leaf — its holders
+	// never take the parent `RemoteUserNatMultiClient.stateLock` — so
+	// independent flows never serialize on the parent lock for race or sequence
+	// work, and there is no ordering constraint with the parent lock.
+	stateLock sync.Mutex
+	// race is guarded by stateLock.
+	race *multiClientChannelUpdateRace
+
+	// activityTime is guarded by the parent stateLock (written during the path
+	// map lookup in send/receiveUpdate).
 	activityTime time.Time
 	ipPath       *IpPath
 
-	// sequenceLock guards only the tcp collapse-prevention sequence state
-	// below (`sequencePacketCount`, `ackSequenceNumber`, `sequenceNumber`).
-	// these are read/written on the egress hot path once per packet via
-	// `canUpdateSequence`/`updateSequence`/`resetSequence`. keeping them under a
-	// per-flow lock instead of the parent `RemoteUserNatMultiClient.stateLock`
-	// means independent flows no longer serialize on the parent lock for
-	// sequence tracking. these three methods never touch parent state, so this
-	// lock is a leaf (no ordering constraint with the parent lock).
-	sequenceLock        sync.Mutex
-	sequencePacketCount int
-	ackSequenceNumber   uint32
-	// sequenceNumber wraps at 2^32. ordering is determined via
-	// `int32(a - b)` signed-delta arithmetic (per RFC 1323 PAWS / RFC 7323),
-	// which is wraparound-tolerant across the 32-bit boundary.
-	sequenceNumber uint32
+	sequencePacketCount int    // guarded by stateLock
+	ackSequenceNumber   uint32 // guarded by stateLock
+	// sequenceNumber wraps at 2^32. ordering is determined via `int32(a - b)`
+	// signed-delta arithmetic (per RFC 1323 PAWS / RFC 7323), wraparound-tolerant
+	// across the 32-bit boundary.
+	sequenceNumber uint32 // guarded by stateLock
 
+	// affinityIp{4,6}Paths are guarded by the parent stateLock (creation only).
 	affinityIp4Paths map[Ip4Path]bool
 	affinityIp6Paths map[Ip6Path]bool
 }
@@ -1695,8 +1724,8 @@ func newMultiClientChannelUpdate(ctx context.Context, ipPath *IpPath) *multiClie
 }
 
 func (self *multiClientChannelUpdate) resetSequence(sendPacket *parsedPacket) {
-	self.sequenceLock.Lock()
-	defer self.sequenceLock.Unlock()
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
 
 	ipPath := sendPacket.ipPath
 
@@ -1706,8 +1735,8 @@ func (self *multiClientChannelUpdate) resetSequence(sendPacket *parsedPacket) {
 }
 
 func (self *multiClientChannelUpdate) updateSequence(sendPacket *parsedPacket) {
-	self.sequenceLock.Lock()
-	defer self.sequenceLock.Unlock()
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
 
 	ipPath := sendPacket.ipPath
 	update := false
@@ -1733,8 +1762,8 @@ func (self *multiClientChannelUpdate) updateSequence(sendPacket *parsedPacket) {
 }
 
 func (self *multiClientChannelUpdate) canUpdateSequence(sendPacket *parsedPacket) bool {
-	self.sequenceLock.Lock()
-	defer self.sequenceLock.Unlock()
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
 
 	if self.sequencePacketCount == 0 {
 		return true
@@ -1757,13 +1786,15 @@ func (self *multiClientChannelUpdate) canUpdateSequence(sendPacket *parsedPacket
 	return false
 }
 
-func (self *multiClientChannelUpdate) initRace() {
+// must be called with `stateLock`
+func (self *multiClientChannelUpdate) initRaceWithLock() {
 	if self.race == nil {
 		self.race = newMultiClientChannelUpdateRace(self.ctx)
 	}
 }
 
-func (self *multiClientChannelUpdate) clearRace() {
+// must be called with `stateLock`
+func (self *multiClientChannelUpdate) clearRaceWithLock() {
 	if self.race != nil {
 		self.race.Close()
 		self.race = nil
@@ -1781,8 +1812,9 @@ func (self *multiClientChannelUpdate) IsDone() bool {
 
 func (self *multiClientChannelUpdate) Close() {
 	self.cancel()
-	// self.client = nil
-	self.clearRace()
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.clearRaceWithLock()
 }
 
 type multiClientChannelUpdateRace struct {
