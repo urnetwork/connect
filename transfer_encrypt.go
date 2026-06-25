@@ -770,7 +770,9 @@ func (self *peerEncryptionSession) Run() {
 		// (the next burst reuses it) without leaking sessions indefinitely.
 		for {
 			if self.CancelIfIdle() {
-				self.client.log.V(1).Infof("[tls]%s session idle — reaped\n", self.logTag)
+				if self.client.log.V(1).Enabled() {
+					self.client.log.Infof("[tls]%s session idle — reaped\n", self.logTag)
+				}
 				return
 			}
 			select {
@@ -887,10 +889,12 @@ func (self *peerEncryptionSession) buildAndStartEpochWithLock() {
 			return
 		}
 		if 0 < len(tlsCfg.Certificates) && tlsCfg.Certificates[0].Leaf != nil {
-			self.client.log.V(1).Infof(
-				"[tls]%s server presenting cert subject=%q\n",
-				self.logTag, tlsCfg.Certificates[0].Leaf.Subject.String(),
-			)
+			if self.client.log.V(1).Enabled() {
+				self.client.log.Infof(
+					"[tls]%s server presenting cert subject=%q\n",
+					self.logTag, tlsCfg.Certificates[0].Leaf.Subject.String(),
+				)
+			}
 		}
 		e.tlsConn = tls.Server(e.transport, tlsCfg)
 	}
@@ -928,7 +932,9 @@ func (self *peerEncryptionSession) outboxLoop(e *tlsHandshakeEpoch) {
 	for {
 		b, err := e.transport.TakeOutbox(e.ctx)
 		if err != nil {
-			self.client.log.V(1).Infof("[tls]%s outbox loop exit: %s\n", self.logTag, err)
+			if self.client.log.V(1).Enabled() {
+				self.client.log.Infof("[tls]%s outbox loop exit: %s\n", self.logTag, err)
+			}
 			return
 		}
 		// TakeOutbox returns buffered bytes even after the epoch ctx is
@@ -946,10 +952,12 @@ func (self *peerEncryptionSession) outboxLoop(e *tlsHandshakeEpoch) {
 		if 0 < len(b) {
 			firstByte = b[0]
 		}
-		self.client.log.V(1).Infof(
-			"[tls]%s outbox batch %d: %d bytes (record type 0x%02x)\n",
-			self.logTag, batchIndex, len(b), firstByte,
-		)
+		if self.client.log.V(1).Enabled() {
+			self.client.log.Infof(
+				"[tls]%s outbox batch %d: %d bytes (record type 0x%02x)\n",
+				self.logTag, batchIndex, len(b), firstByte,
+			)
+		}
 		batchIndex += 1
 		// In TLS-server role the first outbox batch is the server flight
 		// (containing the server's Finished). Mark the "awaiting client
@@ -1094,10 +1102,12 @@ func (self *peerEncryptionSession) completeHandshake(e *tlsHandshakeEpoch, err e
 	}
 	logTlsHandshake(self.client.log, self.logTag, err)
 	if err == nil {
-		self.client.log.V(1).Infof(
-			"[tls]%s completeHandshake: cipher derived, exporter %d bytes — starting identity proof exchange\n",
-			self.logTag, len(e.tlsExporter),
-		)
+		if self.client.log.V(1).Enabled() {
+			self.client.log.Infof(
+				"[tls]%s completeHandshake: cipher derived, exporter %d bytes — starting identity proof exchange\n",
+				self.logTag, len(e.tlsExporter),
+			)
+		}
 		if self.role == sequenceTlsRoleClient {
 			logTlsHandshakePeerCert(self.client.log, self.logTag, peerCertificatesOfEpoch(self.client.log, e))
 		}
@@ -1140,13 +1150,17 @@ func (self *peerEncryptionSession) sendIdentityProofOnce(e *tlsHandshakeEpoch) {
 		return e.tlsExporter, self.manager.clientKeyManager.Sign(e.tlsExporter), ""
 	}()
 	if exporter == nil || payload == nil {
-		self.client.log.V(1).Infof("[tls]%s sendIdentityProofOnce skipped: %s\n", self.logTag, skipReason)
+		if self.client.log.V(1).Enabled() {
+			self.client.log.Infof("[tls]%s sendIdentityProofOnce skipped: %s\n", self.logTag, skipReason)
+		}
 		return
 	}
-	self.client.log.V(1).Infof(
-		"[tls]%s sendIdentityProofOnce: signing %d-byte exporter, sending %d-byte proof\n",
-		self.logTag, len(exporter), len(payload),
-	)
+	if self.client.log.V(1).Enabled() {
+		self.client.log.Infof(
+			"[tls]%s sendIdentityProofOnce: signing %d-byte exporter, sending %d-byte proof\n",
+			self.logTag, len(exporter), len(payload),
+		)
+	}
 	self.sendEncryptedControl(&protocol.EncryptedControl{
 		ControlType: protocol.EncryptedControlType_EncryptedControlIdentityProof,
 		Payload:     payload,
@@ -1190,7 +1204,9 @@ func (self *peerEncryptionSession) maybeVerifyPendingPeerIdentityProof(e *tlsHan
 		return e.pendingPeerIdentityProof, e.tlsExporter, self.peerClientPublicKey, true, ""
 	}()
 	if !ready {
-		self.client.log.V(2).Infof("[tls]%s maybeVerifyPendingPeerIdentityProof skipped: %s\n", self.logTag, skipReason)
+		if self.client.log.V(2).Enabled() {
+			self.client.log.Infof("[tls]%s maybeVerifyPendingPeerIdentityProof skipped: %s\n", self.logTag, skipReason)
+		}
 		return
 	}
 	ok := VerifyClientKeySignature(peerPub, exporter, payload)
@@ -1211,7 +1227,9 @@ func (self *peerEncryptionSession) maybeVerifyPendingPeerIdentityProof(e *tlsHan
 		}
 	}()
 	if ok {
-		self.client.log.V(1).Infof("[tls]%s peer identity proof verified — cipher is now usable\n", self.logTag)
+		if self.client.log.V(1).Enabled() {
+			self.client.log.Infof("[tls]%s peer identity proof verified — cipher is now usable\n", self.logTag)
+		}
 	} else {
 		self.client.log.Errorf(
 			"[tls]%s peer identity proof FAILED (peer key %d bytes, exporter %d bytes, sig %d bytes) — session left unauthenticated\n",
@@ -1235,10 +1253,12 @@ func (self *peerEncryptionSession) maybeVerifyPendingPeerIdentityProof(e *tlsHan
 // way, refusing to switch keys mid-session is the safe behavior).
 func (self *peerEncryptionSession) SetPeerClientPublicKey(pub ed25519.PublicKey) {
 	if len(pub) != ed25519.PublicKeySize {
-		self.client.log.V(1).Infof(
-			"[tls]%s SetPeerClientPublicKey rejected: key length %d (expected %d)\n",
-			self.logTag, len(pub), ed25519.PublicKeySize,
-		)
+		if self.client.log.V(1).Enabled() {
+			self.client.log.Infof(
+				"[tls]%s SetPeerClientPublicKey rejected: key length %d (expected %d)\n",
+				self.logTag, len(pub), ed25519.PublicKeySize,
+			)
+		}
 		return
 	}
 	changed := func() bool {
@@ -1257,7 +1277,9 @@ func (self *peerEncryptionSession) SetPeerClientPublicKey(pub ed25519.PublicKey)
 		return false
 	}()
 	if changed {
-		self.client.log.V(1).Infof("[tls]%s peer client public key set (first-time)\n", self.logTag)
+		if self.client.log.V(1).Enabled() {
+			self.client.log.Infof("[tls]%s peer client public key set (first-time)\n", self.logTag)
+		}
 		self.maybeVerifyPendingPeerIdentityProof(self.currentEpoch())
 		// Out-of-band cross-check: ask the per-session fetcher (typically the
 		// platform's unauthenticated `/key/<peerId>` API) for this peer's public
@@ -1290,11 +1312,15 @@ func (self *peerEncryptionSession) SetPeerClientPublicKey(pub ed25519.PublicKey)
 func (self *peerEncryptionSession) crossCheckPeerClientPublicKey(contractPub ed25519.PublicKey) {
 	fetched, err := self.peerClientPublicKeyFetcher(self.ctx)
 	if err != nil {
-		self.client.log.V(1).Infof("[key]%s peer public-key fetch failed: %s\n", self.logTag, err)
+		if self.client.log.V(1).Enabled() {
+			self.client.log.Infof("[key]%s peer public-key fetch failed: %s\n", self.logTag, err)
+		}
 		return
 	}
 	if len(fetched) == 0 {
-		self.client.log.V(1).Infof("[key]%s peer public-key fetch returned no key (peer has not published yet)\n", self.logTag)
+		if self.client.log.V(1).Enabled() {
+			self.client.log.Infof("[key]%s peer public-key fetch returned no key (peer has not published yet)\n", self.logTag)
+		}
 		return
 	}
 	if len(fetched) != ed25519.PublicKeySize {
@@ -1311,7 +1337,9 @@ func (self *peerEncryptionSession) crossCheckPeerClientPublicKey(contractPub ed2
 		)
 		return
 	}
-	self.client.log.V(1).Infof("[key]%s peer public-key cross-check OK\n", self.logTag)
+	if self.client.log.V(1).Enabled() {
+		self.client.log.Infof("[key]%s peer public-key cross-check OK\n", self.logTag)
+	}
 }
 
 // PeerClientPublicKey returns the recorded peer public key (may be
@@ -1354,16 +1382,20 @@ func (self *peerEncryptionSession) DeliverEncryptedControl(ec *protocol.Encrypte
 	case protocol.EncryptedControlType_EncryptedControlHandshake:
 		self.deliverHandshake(ec.Payload)
 	case protocol.EncryptedControlType_EncryptedControlIdentityProof:
-		self.client.log.V(1).Infof(
-			"[tls]%s DeliverEncryptedControl(IdentityProof): received %d-byte proof\n",
-			self.logTag, len(ec.Payload),
-		)
+		if self.client.log.V(1).Enabled() {
+			self.client.log.Infof(
+				"[tls]%s DeliverEncryptedControl(IdentityProof): received %d-byte proof\n",
+				self.logTag, len(ec.Payload),
+			)
+		}
 		self.receivePeerIdentityProof(ec.Payload)
 	default:
-		self.client.log.V(1).Infof(
-			"[tls]%s DeliverEncryptedControl: unknown control type %v (%d bytes)\n",
-			self.logTag, ec.ControlType, len(ec.Payload),
-		)
+		if self.client.log.V(1).Enabled() {
+			self.client.log.Infof(
+				"[tls]%s DeliverEncryptedControl: unknown control type %v (%d bytes)\n",
+				self.logTag, ec.ControlType, len(ec.Payload),
+			)
+		}
 	}
 }
 
@@ -1384,17 +1416,21 @@ func (self *peerEncryptionSession) DeliverEncryptedControl(ec *protocol.Encrypte
 func (self *peerEncryptionSession) deliverHandshake(payload []byte) {
 	if self.role == sequenceTlsRoleServer && isClientHelloRecord(payload) {
 		if e := self.currentEpoch(); e == nil || isClosed(e.handshakeDone) {
-			self.client.log.V(1).Infof(
-				"[tls]%s inbound ClientHello after prior handshake — resetting to a new handshake\n",
-				self.logTag,
-			)
+			if self.client.log.V(1).Enabled() {
+				self.client.log.Infof(
+					"[tls]%s inbound ClientHello after prior handshake — resetting to a new handshake\n",
+					self.logTag,
+				)
+			}
 			self.reset()
 		}
 	} else if e := self.currentEpoch(); e != nil && isClosed(e.handshakeDone) {
-		self.client.log.V(2).Infof(
-			"[tls]%s DeliverEncryptedControl(Handshake) %d bytes — skipped, handshake already done\n",
-			self.logTag, len(payload),
-		)
+		if self.client.log.V(2).Enabled() {
+			self.client.log.Infof(
+				"[tls]%s DeliverEncryptedControl(Handshake) %d bytes — skipped, handshake already done\n",
+				self.logTag, len(payload),
+			)
+		}
 		return
 	}
 	self.startEpoch()
@@ -1406,10 +1442,12 @@ func (self *peerEncryptionSession) deliverHandshake(payload []byte) {
 	if 0 < len(payload) {
 		firstByte = payload[0]
 	}
-	self.client.log.V(1).Infof(
-		"[tls]%s DeliverEncryptedControl(Handshake): feeding %d bytes (record type 0x%02x) to TLS state\n",
-		self.logTag, len(payload), firstByte,
-	)
+	if self.client.log.V(1).Enabled() {
+		self.client.log.Infof(
+			"[tls]%s DeliverEncryptedControl(Handshake): feeding %d bytes (record type 0x%02x) to TLS state\n",
+			self.logTag, len(payload), firstByte,
+		)
+	}
 	e.transport.Deliver(payload)
 }
 
@@ -1457,11 +1495,15 @@ func (self *peerEncryptionSession) receivePeerIdentityProof(payload []byte) {
 	if !stored {
 		// already have a proof in flight, in a final identity state, or marked
 		// failure because the payload was malformed.
-		self.client.log.V(1).Infof("[tls]%s receivePeerIdentityProof skipped: %s\n", self.logTag, skipReason)
+		if self.client.log.V(1).Enabled() {
+			self.client.log.Infof("[tls]%s receivePeerIdentityProof skipped: %s\n", self.logTag, skipReason)
+		}
 		self.readyMonitor.NotifyAll()
 		return
 	}
-	self.client.log.V(1).Infof("[tls]%s receivePeerIdentityProof buffered %d-byte proof — attempting verify\n", self.logTag, len(payload))
+	if self.client.log.V(1).Enabled() {
+		self.client.log.Infof("[tls]%s receivePeerIdentityProof buffered %d-byte proof — attempting verify\n", self.logTag, len(payload))
+	}
 	self.maybeVerifyPendingPeerIdentityProof(e)
 }
 
@@ -1511,10 +1553,12 @@ func (self *peerEncryptionSession) receivePeerIdentityProof(payload []byte) {
 // makes feeding bytes to the TLS state machine safe).
 func (self *peerEncryptionSession) OptimisticallyDeliverHandshake(payload []byte) {
 	if !self.IsAwaitingClientFinished() {
-		self.client.log.V(2).Infof(
-			"[tls]%s OptimisticallyDeliverHandshake skipped: not awaiting client Finished\n",
-			self.logTag,
-		)
+		if self.client.log.V(2).Enabled() {
+			self.client.log.Infof(
+				"[tls]%s OptimisticallyDeliverHandshake skipped: not awaiting client Finished\n",
+				self.logTag,
+			)
+		}
 		return
 	}
 	// isClientSecondFlightPrefix: the first byte of `payload` is a TLS 1.3
@@ -1540,16 +1584,20 @@ func (self *peerEncryptionSession) OptimisticallyDeliverHandshake(payload []byte
 		if 0 < len(payload) {
 			firstByte = payload[0]
 		}
-		self.client.log.V(1).Infof(
-			"[tls]%s OptimisticallyDeliverHandshake filtered out: %d bytes, first byte 0x%02x (not a client-second-flight prefix)\n",
-			self.logTag, len(payload), firstByte,
-		)
+		if self.client.log.V(1).Enabled() {
+			self.client.log.Infof(
+				"[tls]%s OptimisticallyDeliverHandshake filtered out: %d bytes, first byte 0x%02x (not a client-second-flight prefix)\n",
+				self.logTag, len(payload), firstByte,
+			)
+		}
 		return
 	}
-	self.client.log.V(1).Infof(
-		"[tls]%s OptimisticallyDeliverHandshake: feeding %d bytes (record type 0x%02x) to TLS state\n",
-		self.logTag, len(payload), payload[0],
-	)
+	if self.client.log.V(1).Enabled() {
+		self.client.log.Infof(
+			"[tls]%s OptimisticallyDeliverHandshake: feeding %d bytes (record type 0x%02x) to TLS state\n",
+			self.logTag, len(payload), payload[0],
+		)
+	}
 	// Only complete an already in-flight handshake; never create or restart an
 	// epoch from the optimistic path. This runs on every EC frame the receive
 	// loop sees — including stale, reordered, and retransmitted ones — so it
@@ -1619,7 +1667,9 @@ func (self *peerEncryptionSession) Cipher() *sequenceCipher {
 	// already moved past. In particular the contract-open ride-along is sent in
 	// the clear during a restart, so the contract always opens.
 	if self.handshakeInFlightLocked() {
-		self.client.log.V(2).Infof("[tls]%s Cipher()=nil: new handshake in flight\n", self.logTag)
+		if self.client.log.V(2).Enabled() {
+			self.client.log.Infof("[tls]%s Cipher()=nil: new handshake in flight\n", self.logTag)
+		}
 		return nil
 	}
 	return self.establishedEpoch.derivedTlsCipher
@@ -1803,10 +1853,12 @@ func (self *peerEncryptionSession) AddTrustedPeerCertChain(chain [][]byte, chain
 		return append(ed25519.PublicKey(nil), self.peerClientPublicKey...)
 	}()
 	if peerPub == nil {
-		self.client.log.V(1).Infof(
-			"[tls]%s contract cert chain dropped: peer client public key not yet known\n",
-			self.logTag,
-		)
+		if self.client.log.V(1).Enabled() {
+			self.client.log.Infof(
+				"[tls]%s contract cert chain dropped: peer client public key not yet known\n",
+				self.logTag,
+			)
+		}
 		return
 	}
 	if len(chainSig) == 0 {
@@ -2365,7 +2417,9 @@ func (self *EncryptionSessionManager) getOrCreateWithLock(peerId Id, role sequen
 	}
 	s := newPeerEncryptionSession(self.ctx, self, self.client, peerId, role, self.settings, self.sessionTlsConfigWithLock(role), companion)
 	self.sessions[key] = s
-	self.client.log.V(1).Infof("[tls]%s opened session for peer %s as %s c=%t\n", self.client.ClientTag(), peerId, role, companion)
+	if self.client.log.V(1).Enabled() {
+		self.client.log.Infof("[tls]%s opened session for peer %s as %s c=%t\n", self.client.ClientTag(), peerId, role, companion)
+	}
 	go func() {
 		defer func() {
 			self.stateLock.Lock()
@@ -2599,9 +2653,13 @@ func cloneByteSlices(in [][]byte) [][]byte {
 
 func logTlsHandshake(log Logger, tag string, err error) {
 	if err != nil {
-		log.V(1).Infof("[tls]%s handshake error = %s\n", tag, err)
+		if log.V(1).Enabled() {
+			log.Infof("[tls]%s handshake error = %s\n", tag, err)
+		}
 	} else {
-		log.V(1).Infof("[tls]%s handshake complete\n", tag)
+		if log.V(1).Enabled() {
+			log.Infof("[tls]%s handshake complete\n", tag)
+		}
 	}
 }
 
@@ -2611,10 +2669,14 @@ func logTlsHandshake(log Logger, tag string, err error) {
 // presented, the mismatch log which cert the contract committed to.
 func logTlsHandshakePeerCert(log Logger, tag string, peerCerts []*x509.Certificate) {
 	if len(peerCerts) == 0 {
-		log.V(1).Infof("[tls]%s peer presented no certificate\n", tag)
+		if log.V(1).Enabled() {
+			log.Infof("[tls]%s peer presented no certificate\n", tag)
+		}
 		return
 	}
-	log.V(1).Infof("[tls]%s peer leaf subject=%q (chain length=%d)\n", tag, peerCerts[0].Subject.String(), len(peerCerts))
+	if log.V(1).Enabled() {
+		log.Infof("[tls]%s peer leaf subject=%q (chain length=%d)\n", tag, peerCerts[0].Subject.String(), len(peerCerts))
+	}
 }
 
 // parsePemCertificates parses PEM-encoded certificate blocks into

@@ -499,7 +499,9 @@ func (self *Tun) dialContext(ctx context.Context, network string, address string
 		// resolve ips using doh, local
 
 		resolvedAddrs := self.dohResolver.Query(dialCtx, "A", host)
-		self.log.V(1).Infof("[tun]query doh (%s) found %v\n", host, resolvedAddrs)
+		if self.log.V(1).Enabled() {
+			self.log.Infof("[tun]query doh (%s) found %v\n", host, resolvedAddrs)
+		}
 		for _, addr := range resolvedAddrs {
 			addrs = append(addrs, addr)
 		}
@@ -520,19 +522,27 @@ func (self *Tun) dialContext(ctx context.Context, network string, address string
 		fa, pn := self.convertToFullAddr(addrPort)
 		conn, err := gonet.DialContextTCP(dialCtx, self.stack, fa, pn)
 		if err == nil {
-			self.log.V(1).Infof("[tun]tcp connect (%s)->%s success\n", host, addrPort)
+			if self.log.V(1).Enabled() {
+				self.log.Infof("[tun]tcp connect (%s)->%s success\n", host, addrPort)
+			}
 			return conn, nil
 		}
-		self.log.V(1).Infof("[tun]tcp connect (%s)->%s err = %s\n", host, addrPort, err)
+		if self.log.V(1).Enabled() {
+			self.log.Infof("[tun]tcp connect (%s)->%s err = %s\n", host, addrPort, err)
+		}
 		return nil, err
 	case "udp", "udp4", "udp6":
 		fa, pn := self.convertToFullAddr(addrPort)
 		conn, err := self.dialUdp(nil, &fa, pn)
 		if err == nil {
-			self.log.V(1).Infof("[tun]udp connect (%s)->%s success\n", host, addrPort)
+			if self.log.V(1).Enabled() {
+				self.log.Infof("[tun]udp connect (%s)->%s success\n", host, addrPort)
+			}
 			return conn, nil
 		}
-		self.log.V(1).Infof("[tun]tcp connect (%s)->%s err = %s\n", host, addrPort, err)
+		if self.log.V(1).Enabled() {
+			self.log.Infof("[tun]tcp connect (%s)->%s err = %s\n", host, addrPort, err)
+		}
 		return nil, err
 	default:
 		return nil, fmt.Errorf("Unsupported network %s", network)

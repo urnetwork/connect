@@ -977,14 +977,16 @@ func (self *UdpBuffer[BufferId]) udpSend(
 			// limit the total connections per source to avoid blowing up the ulimit
 			if sourceSequences := self.sourceSequences[source]; self.udpBufferSettings.UserLimit < len(sourceSequences) {
 				applyLruUserLimit(maps.Values(sourceSequences), self.udpBufferSettings.UserLimit, func(sequence *UdpSequence) bool {
-					self.log.V(1).Infof(
-						"[lnr]udp limit source %s->%s\n",
-						source,
-						net.JoinHostPort(
-							sequence.destinationIp.String(),
-							strconv.Itoa(int(sequence.destinationPort)),
-						),
-					)
+					if self.log.V(1).Enabled() {
+						self.log.Infof(
+							"[lnr]udp limit source %s->%s\n",
+							source,
+							net.JoinHostPort(
+								sequence.destinationIp.String(),
+								strconv.Itoa(int(sequence.destinationPort)),
+							),
+						)
+					}
 					return true
 				})
 			}
@@ -1193,7 +1195,9 @@ func (self *UdpSequence) Run() {
 		self.IpPath().DestinationHostPort(),
 	)
 	if err != nil {
-		self.log.V(1).Infof("[init]udp connect error = %s\n", err)
+		if self.log.V(1).Enabled() {
+			self.log.Infof("[init]udp connect error = %s\n", err)
+		}
 		return
 	}
 	defer socket.Close()
@@ -1273,9 +1277,13 @@ func (self *UdpSequence) Run() {
 					// each payload is one datagram. datagrams cannot be coalesced.
 					n, err := socket.Write(writePayload.payload)
 					if err == nil {
-						self.log.V(2).Infof("[f%d]udp forward %d\n", writePayload.sendIter, n)
+						if self.log.V(2).Enabled() {
+							self.log.Infof("[f%d]udp forward %d\n", writePayload.sendIter, n)
+						}
 					} else {
-						self.log.V(1).Infof("[f%d]udp forward %d error = %s", writePayload.sendIter, n, err)
+						if self.log.V(1).Enabled() {
+							self.log.Infof("[f%d]udp forward %d error = %s", writePayload.sendIter, n, err)
+						}
 					}
 					if 0 < n {
 						self.UpdateLastActivityTime()
@@ -1354,7 +1362,9 @@ func (self *UdpSequence) Run() {
 			n, err := socket.Read(buffer)
 
 			if err != nil {
-				self.log.V(1).Infof("[f%d]udp receive err = %s\n", forwardIter, err)
+				if self.log.V(1).Enabled() {
+					self.log.Infof("[f%d]udp receive err = %s\n", forwardIter, err)
+				}
 			}
 
 			if 0 < n {
@@ -1366,10 +1376,14 @@ func (self *UdpSequence) Run() {
 					return
 				}
 				if 1 < len(packets) {
-					self.log.V(2).Infof("[f%d]udp receive segemented packets = %d\n", forwardIter, len(packets))
+					if self.log.V(2).Enabled() {
+						self.log.Infof("[f%d]udp receive segemented packets = %d\n", forwardIter, len(packets))
+					}
 				}
 				for _, packet := range packets {
-					self.log.V(1).Infof("[f%d]udp receive %d\n", forwardIter, len(packet))
+					if self.log.V(1).Enabled() {
+						self.log.Infof("[f%d]udp receive %d\n", forwardIter, len(packet))
+					}
 					select {
 					case <-self.ctx.Done():
 						MessagePoolReturn(packet)
@@ -1382,7 +1396,9 @@ func (self *UdpSequence) Run() {
 				if err == io.EOF {
 					return
 				} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					self.log.V(1).Infof("[f%d]timeout\n", forwardIter)
+					if self.log.V(1).Enabled() {
+						self.log.Infof("[f%d]timeout\n", forwardIter)
+					}
 					return
 				} else {
 					// some other error
@@ -1415,9 +1431,16 @@ func (self *UdpSequence) Run() {
 		return true
 	}
 
+	// reusable idle timer: this send loop wakes per datagram, so a per-iteration
+	// time.After allocated a timer per packet (the dominant alloc in the udp
+	// egress profile). hot-path timer reuse per CODESTYLE.
+	idleTimer := time.NewTimer(0)
+	defer idleTimer.Stop()
+
 send:
 	for {
 		checkpointId := self.idleCondition.Checkpoint()
+		idleTimer.Reset(self.udpBufferSettings.IdleTimeout)
 		select {
 		case <-self.ctx.Done():
 			return
@@ -1444,7 +1467,7 @@ send:
 					continue send
 				}
 			}
-		case <-time.After(self.udpBufferSettings.IdleTimeout):
+		case <-idleTimer.C:
 			done := false
 			func() {
 				self.sendMutex.Lock()
@@ -1487,17 +1510,33 @@ type StreamState struct {
 	destinationIp   net.IP
 	destinationPort layers.UDPPort
 	userLimited
+
+	// cached immutable ip path for this stream (see IpPath). primed by the
+	// first call, which happens at sequence setup (DialContext) before the
+	// per-packet goroutines start, so it is written once and then read-only.
+	ipPath *IpPath
+
+	// reusable backing for the common single-datagram DataPackets result.
+	// DataPackets is called from one goroutine and its result is consumed
+	// before the next call, so the backing can be reused; fragmented payloads
+	// allocate a fresh slice.
+	singleDataPacket [1][]byte
 }
 
+// IpPath returns the immutable ip path for this stream. The path is built once
+// and cached; the stream identity (version, ips, ports) never changes.
 func (self *StreamState) IpPath() *IpPath {
-	return &IpPath{
-		Version:         self.ipVersion,
-		Protocol:        IpProtocolUdp,
-		SourceIp:        self.sourceIp,
-		SourcePort:      int(self.sourcePort),
-		DestinationIp:   self.destinationIp,
-		DestinationPort: int(self.destinationPort),
+	if self.ipPath == nil {
+		self.ipPath = &IpPath{
+			Version:         self.ipVersion,
+			Protocol:        IpProtocolUdp,
+			SourceIp:        self.sourceIp,
+			SourcePort:      int(self.sourcePort),
+			DestinationIp:   self.destinationIp,
+			DestinationPort: int(self.destinationPort),
+		}
 	}
+	return self.ipPath
 }
 
 // this must only be called from one goroutine
@@ -1513,7 +1552,10 @@ func (self *StreamState) DataPackets(payload []byte, n int, mtu int) ([][]byte, 
 
 	packetByteCount := mtu - headerByteCount
 	if n <= packetByteCount {
-		return [][]byte{self.udpPacket(payload[0:n])}, nil
+		// reuse the single-packet backing for the common unfragmented case
+		// (see singleDataPacket); the result is consumed before the next call.
+		self.singleDataPacket[0] = self.udpPacket(payload[0:n])
+		return self.singleDataPacket[:], nil
 	}
 	// fragment into separate datagrams
 	packets := make([][]byte, 0, (n+packetByteCount-1)/packetByteCount)
@@ -1713,7 +1755,9 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 		if !tcp.syn {
 			// drop the packet; only create a new sequence on SYN
 			MessagePoolReturn(ipPacket)
-			self.log.V(2).Infof("[lnr]tcp drop no syn (%s)\n", tcp.flagsString())
+			if self.log.V(2).Enabled() {
+				self.log.Infof("[lnr]tcp drop no syn (%s)\n", tcp.flagsString())
+			}
 			return nil
 		}
 
@@ -1731,14 +1775,16 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 			// limit the total connections per source to avoid blowing up the ulimit
 			if sourceSequences := self.sourceSequences[source]; self.tcpBufferSettings.UserLimit < len(sourceSequences) {
 				applyLruUserLimit(maps.Values(sourceSequences), self.tcpBufferSettings.UserLimit, func(sequence *TcpSequence) bool {
-					self.log.V(1).Infof(
-						"[lnr]tcp limit source %s->%s\n",
-						source,
-						net.JoinHostPort(
-							sequence.destinationIp.String(),
-							strconv.Itoa(int(sequence.destinationPort)),
-						),
-					)
+					if self.log.V(1).Enabled() {
+						self.log.Infof(
+							"[lnr]tcp limit source %s->%s\n",
+							source,
+							net.JoinHostPort(
+								sequence.destinationIp.String(),
+								strconv.Itoa(int(sequence.destinationPort)),
+							),
+						)
+					}
 					return true
 				})
 			}
@@ -1970,7 +2016,9 @@ func (self *TcpSequence) Run() {
 		case <-self.ctx.Done():
 			return
 		case sendItem := <-self.sendItems:
-			self.log.V(2).Infof("[init]send(%d)\n", len(sendItem.tcp.payload))
+			if self.log.V(2).Enabled() {
+				self.log.Infof("[init]send(%d)\n", len(sendItem.tcp.payload))
+			}
 			// the first packet must be a syn
 			if sendItem.tcp.syn {
 				self.log.V(2).Infof("[init]SYN\n")
@@ -2030,7 +2078,9 @@ func (self *TcpSequence) Run() {
 						// turn off window scale for send
 						self.windowScale = 0
 					}
-					self.log.V(2).Infof("[init]window=%d/%d, receive=%d/%d\n", self.windowSize, self.windowScale, self.receiveWindowSize, self.receiveWindowScale)
+					if self.log.V(2).Enabled() {
+						self.log.Infof("[init]window=%d/%d, receive=%d/%d\n", self.windowSize, self.windowScale, self.receiveWindowSize, self.receiveWindowScale)
+					}
 
 					packet, packetErr = self.SynAck(self.tcpBufferSettings.Mtu)
 					self.receiveSeq += 1
@@ -2039,7 +2089,9 @@ func (self *TcpSequence) Run() {
 				syn = true
 			} else {
 				// an ACK here could be for a previous FIN
-				self.log.V(2).Infof("[init]waiting for SYN (%s)\n", sendItem.tcp.flagsString())
+				if self.log.V(2).Enabled() {
+					self.log.Infof("[init]waiting for SYN (%s)\n", sendItem.tcp.flagsString())
+				}
 			}
 			MessagePoolReturn(sendItem.ipPacket)
 		case <-time.After(self.tcpBufferSettings.ConnectTimeout):
@@ -2064,7 +2116,9 @@ func (self *TcpSequence) Run() {
 		self.IpPath().DestinationHostPort(),
 	)
 	if err != nil {
-		self.log.V(1).Infof("[init]tcp connect error = %s\n", err)
+		if self.log.V(1).Enabled() {
+			self.log.Infof("[init]tcp connect error = %s\n", err)
+		}
 		return
 	}
 	self.UpdateLastActivityTime()
@@ -2186,9 +2240,13 @@ func (self *TcpSequence) Run() {
 			n, err := buffers.WriteTo(socket)
 
 			if err == nil {
-				self.log.V(2).Infof("[f%d]tcp forward %d/%d\n", batch[0].sendIter, n, byteCount)
+				if self.log.V(2).Enabled() {
+					self.log.Infof("[f%d]tcp forward %d/%d\n", batch[0].sendIter, n, byteCount)
+				}
 			} else {
-				self.log.V(1).Infof("[f%d]tcp forward %d/%d error = %s\n", batch[0].sendIter, n, byteCount, err)
+				if self.log.V(1).Enabled() {
+					self.log.Infof("[f%d]tcp forward %d/%d error = %s\n", batch[0].sendIter, n, byteCount, err)
+				}
 			}
 			if 0 < n {
 				self.UpdateLastActivityTime()
@@ -2287,7 +2345,9 @@ func (self *TcpSequence) Run() {
 			n, err := socket.Read(buffer)
 
 			if err != nil {
-				self.log.V(1).Infof("[f%d]tcp receive error = %s\n", forwardIter, err)
+				if self.log.V(1).Enabled() {
+					self.log.Infof("[f%d]tcp receive error = %s\n", forwardIter, err)
+				}
 			}
 
 			if 0 < n {
@@ -2332,7 +2392,9 @@ func (self *TcpSequence) Run() {
 								return
 							}
 
-							self.log.V(2).Infof("[f%d]tcp receive window wait\n", forwardIter)
+							if self.log.V(2).Enabled() {
+								self.log.Infof("[f%d]tcp receive window wait\n", forwardIter)
+							}
 							receiveAckCond.Wait()
 						}
 					}()
@@ -2355,9 +2417,13 @@ func (self *TcpSequence) Run() {
 				}
 
 				if 1 < packetCount {
-					self.log.V(2).Infof("[f%d]tcp receive segmented packets %d\n", forwardIter, packetCount)
+					if self.log.V(2).Enabled() {
+						self.log.Infof("[f%d]tcp receive segmented packets %d\n", forwardIter, packetCount)
+					}
 				}
-				self.log.V(2).Infof("[f%d]tcp receive %d %d\n", forwardIter, n, packetCount)
+				if self.log.V(2).Enabled() {
+					self.log.Infof("[f%d]tcp receive %d %d\n", forwardIter, n, packetCount)
+				}
 			}
 
 			if err != nil {
@@ -2384,7 +2450,9 @@ func (self *TcpSequence) Run() {
 					}
 					return
 				} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					self.log.V(2).Infof("[f%d]timeout\n", forwardIter)
+					if self.log.V(2).Enabled() {
+						self.log.Infof("[f%d]timeout\n", forwardIter)
+					}
 					return
 				} else {
 					// some other error
@@ -2474,7 +2542,9 @@ func (self *TcpSequence) Run() {
 
 		if sendItem.tcp.rst {
 			// a RST typically appears for a bad TCP segment
-			self.log.V(2).Infof("[r%d]RST\n", sendIter)
+			if self.log.V(2).Enabled() {
+				self.log.Infof("[r%d]RST\n", sendIter)
+			}
 			MessagePoolReturn(sendItem.ipPacket)
 			// FIXME
 			return false
@@ -2514,7 +2584,9 @@ func (self *TcpSequence) Run() {
 		}
 
 		if sendItem.tcp.fin {
-			self.log.V(2).Infof("[r%d]FIN\n", sendIter)
+			if self.log.V(2).Enabled() {
+				self.log.Infof("[r%d]FIN\n", sendIter)
+			}
 			func() {
 				self.mutex.Lock()
 				defer self.mutex.Unlock()
@@ -2557,13 +2629,17 @@ func (self *TcpSequence) Run() {
 					if self.windowSize <= nonBlockingByteCount {
 						nextWindowSize := min(self.windowSize*2, self.tcpBufferSettings.MaxWindowSize)
 						if self.windowSize != nextWindowSize {
-							self.log.V(1).Infof("[r%d]increase window size %d -> %d\n", sendIter, self.windowSize, nextWindowSize)
+							if self.log.V(1).Enabled() {
+								self.log.Infof("[r%d]increase window size %d -> %d\n", sendIter, self.windowSize, nextWindowSize)
+							}
 							self.windowSize = nextWindowSize
 						}
 					} else if self.windowSize/2 <= blockingByteCount {
 						nextWindowSize := max(self.windowSize/2, self.tcpBufferSettings.MinWindowSize)
 						if self.windowSize != nextWindowSize {
-							self.log.V(1).Infof("[r%d]decrease window size %d -> %d\n", sendIter, self.windowSize, nextWindowSize)
+							if self.log.V(1).Enabled() {
+								self.log.Infof("[r%d]decrease window size %d -> %d\n", sendIter, self.windowSize, nextWindowSize)
+							}
 							self.windowSize = nextWindowSize
 						}
 					}
@@ -2647,7 +2723,9 @@ send:
 			}()
 			if done {
 				// close the sequence
-				self.log.V(2).Infof("[r%d]timeout\n", sendIter)
+				if self.log.V(2).Enabled() {
+					self.log.Infof("[r%d]timeout\n", sendIter)
+				}
 				return
 			}
 			// else there pending updates
@@ -2968,7 +3046,9 @@ func (self *RemoteUserNatProvider) Receive(
 
 	if self.client.ClientId() == source.SourceId {
 		// locally generated traffic should use a separate local user nat
-		self.client.log.V(2).Infof("drop remote user nat provider s packet ->%s\n", source.SourceId)
+		if self.client.log.V(2).Enabled() {
+			self.client.log.Infof("drop remote user nat provider s packet ->%s\n", source.SourceId)
+		}
 		return
 	}
 
@@ -2979,7 +3059,9 @@ func (self *RemoteUserNatProvider) Receive(
 	}
 	frame, err := ToFrame(ipPacketFromProvider, self.settings.ProtocolVersion)
 	if err != nil {
-		self.client.log.V(2).Infof("drop remote user nat provider s packet ->%s = %s\n", source.SourceId, err)
+		if self.client.log.V(2).Enabled() {
+			self.client.log.Infof("drop remote user nat provider s packet ->%s = %s\n", source.SourceId, err)
+		}
 		panic(err)
 	}
 	if !frame.Raw {
@@ -3032,7 +3114,9 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 	for _, frame := range frames {
 		switch frame.MessageType {
 		case protocol.MessageType_IpIpPing:
-			self.client.log.V(1).Infof("[ip]provider ping <- %s(%d)\n", source, provideMode)
+			if self.client.log.V(1).Enabled() {
+				self.client.log.Infof("[ip]provider ping <- %s(%d)\n", source, provideMode)
+			}
 			// echo back over a companion contract, like the provider's other
 			// return traffic; the source only provides ProvideMode_Stream, so a
 			// forward contract here would be rejected (no permission).
@@ -3429,12 +3513,14 @@ func ParseIpPathWithPayload(ipPacket []byte) (*IpPath, []byte, error) {
 		return nil, nil, fmt.Errorf("Malformed ip packet.")
 	}
 
-	// copy the ips so the ip path can be retained independently of the packet
-	sourceIpCopy := make(net.IP, len(sourceIp))
-	copy(sourceIpCopy, sourceIp)
-
-	destinationIpCopy := make(net.IP, len(destinationIp))
-	copy(destinationIpCopy, destinationIp)
+	// copy the ips so the ip path can be retained independently of the shared
+	// packet buffer (which is recycled after the handoff call). both copies share
+	// one backing allocation instead of one per address.
+	ipBacking := make(net.IP, len(sourceIp)+len(destinationIp))
+	sn := copy(ipBacking, sourceIp)
+	copy(ipBacking[sn:], destinationIp)
+	sourceIpCopy := ipBacking[:sn:sn]
+	destinationIpCopy := ipBacking[sn:]
 
 	switch ipProtocol {
 	case layers.IPProtocolUDP:

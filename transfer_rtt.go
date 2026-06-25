@@ -143,7 +143,12 @@ func (self *RttWindow) scaledRtt(sendTime time.Time) time.Duration {
 		),
 		self.maxScaledRtt,
 	)
-	self.log.V(2).Infof("[rtt]scaled=%dms\n", scaledRtt/time.Millisecond)
+	// guard the V(2) diagnostic: this runs per packet (resend timing), and the
+	// disabled-level call would still box the Duration arg into []any and build
+	// the variadic slice on the heap. the guard keeps the hot path allocation-free.
+	if self.log.V(2).Enabled() {
+		self.log.Infof("[rtt]scaled=%dms\n", scaledRtt/time.Millisecond)
+	}
 	return scaledRtt
 }
 

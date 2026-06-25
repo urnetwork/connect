@@ -1,0 +1,630 @@
+package connect
+
+// Wire-compatibility tests for the hand-rolled transfer-frame codec in
+// frame_protobuf.go. Clients on the network still use the official protobuf
+// library, so the hand-rolled encoding MUST match it byte-for-byte. These tests
+// build the equivalent protocol structs, marshal them with the official library
+// (the same proto.MarshalOptions the package uses via ProtoMarshal), and assert
+// the hand-rolled output is identical and decodes back to an equal message.
+
+import (
+	"bytes"
+	mathrandv2 "math/rand/v2"
+	"testing"
+
+	"google.golang.org/protobuf/proto"
+
+	"github.com/urnetwork/connect/protocol"
+)
+
+// buildEquivalentTransferFrame builds the protocol.TransferFrame that
+// sendWithSetContract (v2 path) would build for the given sendPackFrame.
+func buildEquivalentTransferFrame(m *sendPackFrame) *protocol.TransferFrame {
+	pack := &protocol.Pack{
+		MessageId:      m.messageId.Bytes(),
+		SequenceId:     m.sequenceId.Bytes(),
+		SequenceNumber: m.sequenceNumber,
+		Head:           m.head,
+		Frames:         m.frames,
+		ContractFrame:  m.contractFrame,
+		Nack:           m.nack,
+		Tag:            &protocol.Tag{SendTime: m.tagSendTime},
+	}
+	if m.contractId != nil {
+		pack.ContractId = m.contractId.Bytes()
+	}
+	tf := &protocol.TransferFrame{
+		TransferPath: m.path.ToProtobuf(),
+	}
+	mt := protocol.MessageType_TransferPack
+	tf.MessageType = &mt
+	tf.Pack = pack
+	if m.sessionRoleSet {
+		sr := m.sessionRole
+		tf.SessionRole = &sr
+	}
+	if m.companion {
+		c := true
+		tf.SessionCompanion = &c
+	}
+	return tf
+}
+
+// assertCodecMatches checks that the hand-rolled marshal is byte-identical to
+// the official library and round-trips back to an equal message.
+func assertCodecMatches(t *testing.T, m *sendPackFrame) {
+	t.Helper()
+
+	want, err := proto.Marshal(buildEquivalentTransferFrame(m))
+	if err != nil {
+		t.Fatalf("proto.Marshal: %s", err)
+	}
+
+	got := marshalSendPackTransferFrame(m)
+	defer MessagePoolReturn(got)
+
+	if !bytes.Equal(got, want) {
+		t.Fatalf("hand-rolled bytes != proto bytes\n got (%d): %x\nwant (%d): %x", len(got), got, len(want), want)
+	}
+
+	// the hand-rolled bytes must decode under the official library to an equal
+	// message (this is the wire contract for peers still on the proto lib, and
+	// for our own setHead re-marshal path).
+	var decoded protocol.TransferFrame
+	if err := proto.Unmarshal(got, &decoded); err != nil {
+		t.Fatalf("proto.Unmarshal(hand-rolled): %s", err)
+	}
+	if !proto.Equal(&decoded, buildEquivalentTransferFrame(m)) {
+		t.Fatalf("decoded hand-rolled frame != equivalent frame\n decoded: %v", &decoded)
+	}
+}
+
+func TestFrameCodecEdgeCases(t *testing.T) {
+	idA := NewId()
+	idB := NewId()
+	idC := NewId()
+	rawFrame := &protocol.Frame{
+		MessageType:  protocol.MessageType_IpIpPacketToProvider,
+		MessageBytes: []byte{0x45, 0x00, 0x00, 0x28, 0xde, 0xad},
+		Raw:          true,
+	}
+	contractFrame := &protocol.Frame{
+		MessageType:  protocol.MessageType_TransferContract,
+		MessageBytes: []byte{0x01, 0x02, 0x03},
+	}
+	emptyFrame := &protocol.Frame{}
+	cid := NewId()
+
+	cases := map[string]*sendPackFrame{
+		"minimal": {
+			path:        TransferPath{DestinationId: idA, SourceId: idB},
+			messageId:   idC,
+			sequenceId:  idA,
+			tagSendTime: 0,
+		},
+		"typical ack pack": {
+			path:           TransferPath{DestinationId: idA, SourceId: idB},
+			messageId:      idC,
+			sequenceId:     idA,
+			sequenceNumber: 42,
+			head:           true,
+			frames:         []*protocol.Frame{rawFrame},
+			tagSendTime:    1_700_000_000_000,
+		},
+		"nack with contract id": {
+			path:        TransferPath{DestinationId: idA, SourceId: idB},
+			messageId:   idC,
+			sequenceId:  idA,
+			nack:        true,
+			frames:      []*protocol.Frame{rawFrame},
+			tagSendTime: 1_700_000_000_001,
+			contractId:  &cid,
+		},
+		"head with contract frame": {
+			path:           TransferPath{DestinationId: idA, SourceId: idB},
+			messageId:      idC,
+			sequenceId:     idA,
+			sequenceNumber: 1,
+			head:           true,
+			frames:         []*protocol.Frame{rawFrame},
+			contractFrame:  contractFrame,
+			tagSendTime:    1_700_000_000_002,
+		},
+		"server role companion": {
+			path:           TransferPath{DestinationId: idA, SourceId: idB, StreamId: idC},
+			messageId:      idC,
+			sequenceId:     idA,
+			sequenceNumber: 7,
+			head:           true,
+			frames:         []*protocol.Frame{rawFrame},
+			tagSendTime:    1_700_000_000_003,
+			sessionRole:    protocol.SequenceRole_SequenceRoleServer,
+			sessionRoleSet: true,
+			companion:      true,
+		},
+		"stream id only path": {
+			path:        TransferPath{StreamId: idC},
+			messageId:   idC,
+			sequenceId:  idA,
+			tagSendTime: 5,
+		},
+		"empty frame in pack": {
+			path:        TransferPath{DestinationId: idA, SourceId: idB},
+			messageId:   idC,
+			sequenceId:  idA,
+			frames:      []*protocol.Frame{emptyFrame},
+			tagSendTime: 9,
+		},
+		"multiple frames": {
+			path:           TransferPath{DestinationId: idA, SourceId: idB},
+			messageId:      idC,
+			sequenceId:     idA,
+			sequenceNumber: 100,
+			head:           false,
+			frames:         []*protocol.Frame{rawFrame, contractFrame, emptyFrame},
+			tagSendTime:    1_700_000_000_004,
+		},
+		"client role set": {
+			path:           TransferPath{DestinationId: idA, SourceId: idB},
+			messageId:      idC,
+			sequenceId:     idA,
+			tagSendTime:    11,
+			sessionRole:    protocol.SequenceRole_SequenceRoleClient,
+			sessionRoleSet: true,
+		},
+	}
+
+	for name, m := range cases {
+		t.Run(name, func(t *testing.T) {
+			assertCodecMatches(t, m)
+		})
+	}
+}
+
+func TestFrameCodecRandomized(t *testing.T) {
+	randId := func() Id {
+		var id Id
+		for i := range id {
+			id[i] = byte(mathrandv2.UintN(256))
+		}
+		return id
+	}
+	randFrame := func() *protocol.Frame {
+		f := &protocol.Frame{}
+		// message types span the implicit-zero (TransferPack) and non-zero range
+		f.MessageType = protocol.MessageType(mathrandv2.IntN(26))
+		n := mathrandv2.IntN(64)
+		if 0 < n {
+			f.MessageBytes = make([]byte, n)
+			for i := range f.MessageBytes {
+				f.MessageBytes[i] = byte(mathrandv2.UintN(256))
+			}
+		}
+		f.Raw = mathrandv2.IntN(2) == 0
+		return f
+	}
+
+	for iter := 0; iter < 5000; iter++ {
+		m := &sendPackFrame{
+			messageId:  randId(),
+			sequenceId: randId(),
+		}
+		// path ids present at random
+		if mathrandv2.IntN(2) == 0 {
+			m.path.DestinationId = randId()
+		}
+		if mathrandv2.IntN(2) == 0 {
+			m.path.SourceId = randId()
+		}
+		if mathrandv2.IntN(3) == 0 {
+			m.path.StreamId = randId()
+		}
+		if mathrandv2.IntN(2) == 0 {
+			m.sequenceNumber = mathrandv2.Uint64()
+		}
+		m.head = mathrandv2.IntN(2) == 0
+		m.nack = mathrandv2.IntN(2) == 0
+		if mathrandv2.IntN(4) != 0 {
+			frameCount := mathrandv2.IntN(3)
+			for i := 0; i < frameCount; i++ {
+				m.frames = append(m.frames, randFrame())
+			}
+		}
+		if mathrandv2.IntN(3) == 0 {
+			m.contractFrame = randFrame()
+		}
+		if mathrandv2.IntN(2) == 0 {
+			m.tagSendTime = mathrandv2.Uint64()
+		}
+		if mathrandv2.IntN(3) == 0 {
+			cid := randId()
+			m.contractId = &cid
+		}
+		switch mathrandv2.IntN(3) {
+		case 0:
+			m.sessionRoleSet = true
+			m.sessionRole = protocol.SequenceRole_SequenceRoleServer
+		case 1:
+			m.sessionRoleSet = true
+			m.sessionRole = protocol.SequenceRole_SequenceRoleClient
+		}
+		m.companion = mathrandv2.IntN(2) == 0
+
+		assertCodecMatches(t, m)
+	}
+}
+
+func buildEquivalentAckFrame(m *sendAckFrame) *protocol.TransferFrame {
+	ack := &protocol.Ack{
+		MessageId:  m.messageId.Bytes(),
+		SequenceId: m.sequenceId.Bytes(),
+		Selective:  m.selective,
+		Tag:        m.tag,
+	}
+	tf := &protocol.TransferFrame{
+		TransferPath: m.path.ToProtobuf(),
+	}
+	mt := protocol.MessageType_TransferAck
+	tf.MessageType = &mt
+	tf.Ack = ack
+	return tf
+}
+
+func assertAckCodecMatches(t *testing.T, m *sendAckFrame) {
+	t.Helper()
+	want, err := proto.Marshal(buildEquivalentAckFrame(m))
+	if err != nil {
+		t.Fatalf("proto.Marshal: %s", err)
+	}
+	got := marshalSendAckTransferFrame(m)
+	defer MessagePoolReturn(got)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("hand-rolled ack bytes != proto bytes\n got (%d): %x\nwant (%d): %x", len(got), got, len(want), want)
+	}
+	var decoded protocol.TransferFrame
+	if err := proto.Unmarshal(got, &decoded); err != nil {
+		t.Fatalf("proto.Unmarshal(hand-rolled ack): %s", err)
+	}
+	if !proto.Equal(&decoded, buildEquivalentAckFrame(m)) {
+		t.Fatalf("decoded hand-rolled ack != equivalent\n decoded: %v", &decoded)
+	}
+}
+
+func TestAckCodecEdgeCases(t *testing.T) {
+	idA, idB, idC := NewId(), NewId(), NewId()
+	cases := map[string]*sendAckFrame{
+		"minimal no tag": {
+			path:       TransferPath{DestinationId: idA, SourceId: idB},
+			messageId:  idC,
+			sequenceId: idA,
+		},
+		"selective with tag": {
+			path:       TransferPath{DestinationId: idA, SourceId: idB},
+			messageId:  idC,
+			sequenceId: idA,
+			selective:  true,
+			tag:        &protocol.Tag{SendTime: 1_700_000_000_000},
+		},
+		"tag zero send time": {
+			path:       TransferPath{DestinationId: idA, SourceId: idB, StreamId: idC},
+			messageId:  idC,
+			sequenceId: idA,
+			tag:        &protocol.Tag{SendTime: 0},
+		},
+		"stream only path": {
+			path:       TransferPath{StreamId: idC},
+			messageId:  idC,
+			sequenceId: idA,
+			selective:  true,
+		},
+	}
+	for name, m := range cases {
+		t.Run(name, func(t *testing.T) { assertAckCodecMatches(t, m) })
+	}
+}
+
+func TestAckCodecRandomized(t *testing.T) {
+	randId := func() Id {
+		var id Id
+		for i := range id {
+			id[i] = byte(mathrandv2.UintN(256))
+		}
+		return id
+	}
+	for iter := 0; iter < 3000; iter++ {
+		m := &sendAckFrame{messageId: randId(), sequenceId: randId()}
+		if mathrandv2.IntN(2) == 0 {
+			m.path.DestinationId = randId()
+		}
+		if mathrandv2.IntN(2) == 0 {
+			m.path.SourceId = randId()
+		}
+		if mathrandv2.IntN(3) == 0 {
+			m.path.StreamId = randId()
+		}
+		m.selective = mathrandv2.IntN(2) == 0
+		switch mathrandv2.IntN(3) {
+		case 0:
+			m.tag = &protocol.Tag{SendTime: mathrandv2.Uint64()}
+		case 1:
+			m.tag = &protocol.Tag{SendTime: 0}
+		}
+		assertAckCodecMatches(t, m)
+	}
+}
+
+// assertDecodeMatches marshals ref with the official library, decodes it with
+// the hand-rolled decoder, and checks equality after accounting for the
+// intentional skips (message_type always; transfer_path when !decodePath).
+func assertDecodeMatches(t *testing.T, ref *protocol.TransferFrame, decodePath bool) {
+	t.Helper()
+	b, err := proto.Marshal(ref)
+	if err != nil {
+		t.Fatalf("proto.Marshal: %s", err)
+	}
+	var got protocol.TransferFrame
+	if !unmarshalTransferFrame(b, &got, decodePath) {
+		t.Fatalf("unmarshalTransferFrame returned false for valid frame: %x", b)
+	}
+	want := proto.Clone(ref).(*protocol.TransferFrame)
+	want.MessageType = nil
+	if !decodePath {
+		want.TransferPath = nil
+	}
+	if !proto.Equal(&got, want) {
+		t.Fatalf("decoded != expected (decodePath=%v)\n got: %v\nwant: %v", decodePath, &got, want)
+	}
+}
+
+func TestDecodeTransferFrameEdgeCases(t *testing.T) {
+	idA, idB, idC := NewId(), NewId(), NewId()
+	mtPack := protocol.MessageType_TransferPack
+	mtAck := protocol.MessageType_TransferAck
+	roleServer := protocol.SequenceRole_SequenceRoleServer
+	yes := true
+
+	frames := []*protocol.TransferFrame{
+		{
+			TransferPath: TransferPath{DestinationId: idA, SourceId: idB}.ToProtobuf(),
+			MessageType:  &mtPack,
+			Pack: &protocol.Pack{
+				MessageId:      idC.Bytes(),
+				SequenceId:     idA.Bytes(),
+				SequenceNumber: 9,
+				Head:           true,
+				Frames: []*protocol.Frame{
+					{MessageType: protocol.MessageType_IpIpPacketToProvider, MessageBytes: []byte{1, 2, 3, 4}, Raw: true},
+				},
+				Tag: &protocol.Tag{SendTime: 1_700_000_000_000},
+			},
+		},
+		{
+			TransferPath:     TransferPath{DestinationId: idA, SourceId: idB, StreamId: idC}.ToProtobuf(),
+			MessageType:      &mtPack,
+			SessionRole:      &roleServer,
+			SessionCompanion: &yes,
+			Pack: &protocol.Pack{
+				MessageId:     idC.Bytes(),
+				SequenceId:    idA.Bytes(),
+				Nack:          true,
+				ContractId:    idB.Bytes(),
+				ContractFrame: &protocol.Frame{MessageType: protocol.MessageType_TransferContract, MessageBytes: []byte{9, 9}},
+				Tag:           &protocol.Tag{SendTime: 5},
+			},
+		},
+		{
+			TransferPath: TransferPath{DestinationId: idA, SourceId: idB}.ToProtobuf(),
+			MessageType:  &mtAck,
+			Ack: &protocol.Ack{
+				MessageId:  idC.Bytes(),
+				SequenceId: idA.Bytes(),
+				Selective:  true,
+				Tag:        &protocol.Tag{SendTime: 7},
+			},
+		},
+		{
+			// encrypted carrier: only path + encrypted bytes + session hints
+			TransferPath:           TransferPath{DestinationId: idA, SourceId: idB}.ToProtobuf(),
+			EncryptedTransferFrame: []byte{0xaa, 0xbb, 0xcc, 0xdd},
+			SessionRole:            &roleServer,
+		},
+		{
+			// v1 deprecated Frame carrier
+			TransferPath: TransferPath{DestinationId: idA, SourceId: idB}.ToProtobuf(),
+			Frame:        &protocol.Frame{MessageType: protocol.MessageType_TransferPack, MessageBytes: []byte{1, 2, 3}},
+		},
+	}
+	for i, ref := range frames {
+		t.Run(string(rune('a'+i))+"/path", func(t *testing.T) { assertDecodeMatches(t, ref, true) })
+		t.Run(string(rune('a'+i))+"/nopath", func(t *testing.T) { assertDecodeMatches(t, ref, false) })
+	}
+}
+
+func TestDecodeTransferFrameRandomized(t *testing.T) {
+	randId := func() Id {
+		var id Id
+		for i := range id {
+			id[i] = byte(mathrandv2.UintN(256))
+		}
+		return id
+	}
+	randBytes := func(maxLen int) []byte {
+		n := mathrandv2.IntN(maxLen)
+		if n == 0 {
+			return nil
+		}
+		out := make([]byte, n)
+		for i := range out {
+			out[i] = byte(mathrandv2.UintN(256))
+		}
+		return out
+	}
+	randFrame := func() *protocol.Frame {
+		return &protocol.Frame{
+			MessageType:  protocol.MessageType(mathrandv2.IntN(26)),
+			MessageBytes: randBytes(48),
+			Raw:          mathrandv2.IntN(2) == 0,
+		}
+	}
+	randTag := func() *protocol.Tag {
+		if mathrandv2.IntN(3) == 0 {
+			return nil
+		}
+		return &protocol.Tag{SendTime: mathrandv2.Uint64()}
+	}
+
+	for iter := 0; iter < 5000; iter++ {
+		ref := &protocol.TransferFrame{}
+		// transfer_path present in most frames
+		if mathrandv2.IntN(5) != 0 {
+			tp := TransferPath{}
+			if mathrandv2.IntN(2) == 0 {
+				tp.DestinationId = randId()
+			}
+			if mathrandv2.IntN(2) == 0 {
+				tp.SourceId = randId()
+			}
+			if mathrandv2.IntN(3) == 0 {
+				tp.StreamId = randId()
+			}
+			ref.TransferPath = tp.ToProtobuf()
+		}
+		switch mathrandv2.IntN(4) {
+		case 0: // pack
+			mt := protocol.MessageType_TransferPack
+			ref.MessageType = &mt
+			pack := &protocol.Pack{
+				MessageId:      randId().Bytes(),
+				SequenceId:     randId().Bytes(),
+				SequenceNumber: mathrandv2.Uint64(),
+				Head:           mathrandv2.IntN(2) == 0,
+				Nack:           mathrandv2.IntN(2) == 0,
+				Tag:            randTag(),
+			}
+			for n := mathrandv2.IntN(3); 0 < n; n-- {
+				pack.Frames = append(pack.Frames, randFrame())
+			}
+			if mathrandv2.IntN(3) == 0 {
+				pack.ContractFrame = randFrame()
+			}
+			if mathrandv2.IntN(3) == 0 {
+				pack.ContractId = randId().Bytes()
+			}
+			ref.Pack = pack
+		case 1: // ack
+			mt := protocol.MessageType_TransferAck
+			ref.MessageType = &mt
+			ref.Ack = &protocol.Ack{
+				MessageId:  randId().Bytes(),
+				SequenceId: randId().Bytes(),
+				Selective:  mathrandv2.IntN(2) == 0,
+				Tag:        randTag(),
+			}
+		case 2: // encrypted
+			ref.EncryptedTransferFrame = randBytes(64)
+			if ref.EncryptedTransferFrame == nil {
+				ref.EncryptedTransferFrame = []byte{1}
+			}
+		case 3: // v1 frame
+			ref.Frame = randFrame()
+		}
+		if mathrandv2.IntN(3) == 0 {
+			sr := protocol.SequenceRole(mathrandv2.IntN(3))
+			ref.SessionRole = &sr
+		}
+		if mathrandv2.IntN(3) == 0 {
+			c := mathrandv2.IntN(2) == 0
+			ref.SessionCompanion = &c
+		}
+
+		assertDecodeMatches(t, ref, true)
+		assertDecodeMatches(t, ref, false)
+	}
+}
+
+// TestDecodeRoundTripFromMarshal feeds the hand-rolled marshal output through
+// the hand-rolled decoder (the real hot-path round trip).
+func TestDecodeRoundTripFromMarshal(t *testing.T) {
+	idA, idB, idC := NewId(), NewId(), NewId()
+	m := &sendPackFrame{
+		path:           TransferPath{DestinationId: idA, SourceId: idB},
+		messageId:      idC,
+		sequenceId:     idA,
+		sequenceNumber: 33,
+		head:           true,
+		frames:         []*protocol.Frame{{MessageType: protocol.MessageType_IpIpPacketToProvider, MessageBytes: []byte{0x45, 0, 0, 20}, Raw: true}},
+		tagSendTime:    1_700_000_000_000,
+	}
+	b := marshalSendPackTransferFrame(m)
+	defer MessagePoolReturn(b)
+	var got protocol.TransferFrame
+	if !unmarshalTransferFrame(b, &got, true) {
+		t.Fatal("decode of hand-rolled marshal failed")
+	}
+	want := proto.Clone(buildEquivalentTransferFrame(m)).(*protocol.TransferFrame)
+	want.MessageType = nil
+	if !proto.Equal(&got, want) {
+		t.Fatalf("round-trip mismatch\n got: %v\nwant: %v", &got, want)
+	}
+}
+
+func TestDecodeTransferFrameMalformed(t *testing.T) {
+	// a valid frame, truncated at every prefix, must never panic and must fail
+	// rather than produce garbage past the truncation.
+	idA, idB := NewId(), NewId()
+	mt := protocol.MessageType_TransferPack
+	valid, _ := proto.Marshal(&protocol.TransferFrame{
+		TransferPath: TransferPath{DestinationId: idA, SourceId: idB}.ToProtobuf(),
+		MessageType:  &mt,
+		Pack: &protocol.Pack{
+			MessageId:  idA.Bytes(),
+			SequenceId: idB.Bytes(),
+			Frames:     []*protocol.Frame{{MessageType: protocol.MessageType_IpIpPacketToProvider, MessageBytes: []byte{1, 2, 3}, Raw: true}},
+			Tag:        &protocol.Tag{SendTime: 1},
+		},
+	})
+	for i := 0; i < len(valid); i++ {
+		var tf protocol.TransferFrame
+		// must not panic; truncated input should be rejected
+		if unmarshalTransferFrame(valid[:i], &tf, true) {
+			// a prefix could in rare cases be a self-consistent frame; only flag
+			// if it also fails to decode under the official library
+			var ref protocol.TransferFrame
+			if proto.Unmarshal(valid[:i], &ref) != nil {
+				t.Fatalf("accepted truncation at %d that proto rejects", i)
+			}
+		}
+	}
+	// pure garbage must not panic
+	for iter := 0; iter < 2000; iter++ {
+		n := mathrandv2.IntN(32)
+		g := make([]byte, n)
+		for i := range g {
+			g[i] = byte(mathrandv2.UintN(256))
+		}
+		var tf protocol.TransferFrame
+		_ = unmarshalTransferFrame(g, &tf, true)
+	}
+}
+
+func TestFrameCodecAllocs(t *testing.T) {
+	idA := NewId()
+	m := &sendPackFrame{
+		path:           TransferPath{DestinationId: idA, SourceId: NewId()},
+		messageId:      NewId(),
+		sequenceId:     idA,
+		sequenceNumber: 5,
+		head:           true,
+		frames:         []*protocol.Frame{{MessageType: protocol.MessageType_IpIpPacketToProvider, MessageBytes: make([]byte, 1400), Raw: true}},
+		tagSendTime:    1_700_000_000_000,
+	}
+	// one allocation expected: the pooled output buffer is drawn from the pool
+	// after warmup, so steady-state allocs should be 0.
+	allocs := testing.AllocsPerRun(1000, func() {
+		b := marshalSendPackTransferFrame(m)
+		MessagePoolReturn(b)
+	})
+	if 1 < allocs {
+		t.Fatalf("marshalSendPackTransferFrame allocates %v per call, want <=1", allocs)
+	}
+}

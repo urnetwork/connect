@@ -92,14 +92,20 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 			self.sendLock.Lock()
 			defer self.sendLock.Unlock()
 			if self.syncCount == syncIndex {
-				self.client.log.V(2).Infof("[control][%d]stop sync for scope = %s\n", syncIndex, self.scopeTag)
+				if self.client.log.V(2).Enabled() {
+					self.client.log.Infof("[control][%d]stop sync for scope = %s\n", syncIndex, self.scopeTag)
+				}
 			} else {
-				self.client.log.V(2).Infof("[control][%d]replace sync for scope = %s\n", syncIndex, self.scopeTag)
+				if self.client.log.V(2).Enabled() {
+					self.client.log.Infof("[control][%d]replace sync for scope = %s\n", syncIndex, self.scopeTag)
+				}
 			}
 		}()
 
 		for {
-			self.client.log.V(2).Infof("[control][%d]start sync for scope = %s\n", syncIndex, self.scopeTag)
+			if self.client.log.V(2).Enabled() {
+				self.client.log.Infof("[control][%d]start sync for scope = %s\n", syncIndex, self.scopeTag)
+			}
 
 			done := false
 			success := false

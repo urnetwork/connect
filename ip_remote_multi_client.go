@@ -696,6 +696,56 @@ func (self *RemoteUserNatMultiClient) sendClientPath(ipPath *IpPath, callback fu
 	}()
 }
 
+// waitForIdleUpdate blocks until the flow update has been idle for
+// SequenceIdleTimeout, or the update ctx is done. it runs only inside the
+// per-flow teardown goroutine; hoisted out of sendUpdate (rather than an inline
+// closure) so the per-packet steady-state path does not allocate it.
+func (self *RemoteUserNatMultiClient) waitForIdleUpdate(update *multiClientChannelUpdate) {
+	for {
+		select {
+		case <-update.ctx.Done():
+			return
+		default:
+		}
+
+		var idleTimeout time.Duration
+		func() {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+
+			idleTimeout = update.activityTime.Add(self.settings.SequenceIdleTimeout).Sub(time.Now())
+		}()
+		if idleTimeout <= 0 {
+			return
+		} else {
+			select {
+			case <-update.ctx.Done():
+				return
+			case <-time.After(idleTimeout):
+			}
+		}
+	}
+}
+
+// rstFlow sends a reset to both ends of a flow being torn down. like
+// waitForIdleUpdate it runs only in the teardown goroutine and is a method, not
+// an inline closure, to avoid a per-packet allocation in sendUpdate.
+func (self *RemoteUserNatMultiClient) rstFlow(ipPath *IpPath, client *multiClientChannel) {
+	if client != nil {
+		// rst to destination
+		if packet, ok := ipOosRst(ipPath); ok {
+			client.Send(&parsedPacket{
+				packet: packet,
+				ipPath: ipPath,
+			}, 0)
+		}
+	}
+	// rst to source
+	if packet, ok := ipOosRst(ipPath.Reverse()); ok {
+		self.receivePacketCallback(TransferPath{}, protocol.ProvideMode_Network, ipPath, packet)
+	}
+}
+
 // returns the flow's update, the client it was previously associated with (for
 // the caller's `clientUpdates` bookkeeping), and the current client to send to.
 // the current client is read here under the parent lock that is already held,
@@ -707,49 +757,6 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 ) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-
-	waitForIdle := func(update *multiClientChannelUpdate) {
-		for {
-			select {
-			case <-update.ctx.Done():
-				return
-			default:
-			}
-
-			var idleTimeout time.Duration
-			func() {
-				self.stateLock.Lock()
-				defer self.stateLock.Unlock()
-
-				idleTimeout = update.activityTime.Add(self.settings.SequenceIdleTimeout).Sub(time.Now())
-			}()
-			if idleTimeout <= 0 {
-				return
-			} else {
-				select {
-				case <-update.ctx.Done():
-					return
-				case <-time.After(idleTimeout):
-				}
-			}
-		}
-	}
-
-	rst := func(client *multiClientChannel) {
-		if client != nil {
-			// rst to destination
-			if packet, ok := ipOosRst(ipPath); ok {
-				client.Send(&parsedPacket{
-					packet: packet,
-					ipPath: ipPath,
-				}, 0)
-			}
-		}
-		// rst to source
-		if packet, ok := ipOosRst(ipPath.Reverse()); ok {
-			self.receivePacketCallback(TransferPath{}, protocol.ProvideMode_Network, ipPath, packet)
-		}
-	}
 
 	switch ipPath.Version {
 	case 4:
@@ -763,7 +770,7 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 
 				var client *multiClientChannel
 				for {
-					waitForIdle(update)
+					self.waitForIdleUpdate(update)
 
 					success := func() bool {
 						self.stateLock.Lock()
@@ -811,7 +818,7 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 				case <-self.ctx.Done():
 				case <-update.ctx.Done():
 				default:
-					rst(client)
+					self.rstFlow(ipPath, client)
 				}
 			}, update.cancel)
 			self.ip4PathUpdates[ip4Path] = update
@@ -860,7 +867,7 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 
 				var client *multiClientChannel
 				for {
-					waitForIdle(update)
+					self.waitForIdleUpdate(update)
 
 					success := func() bool {
 						self.stateLock.Lock()
@@ -908,7 +915,7 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 				case <-self.ctx.Done():
 				case <-update.ctx.Done():
 				default:
-					rst(client)
+					self.rstFlow(ipPath, client)
 				}
 			}, update.cancel)
 			self.ip6PathUpdates[ip6Path] = update
@@ -1092,7 +1099,9 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 			return false
 		}
 	default:
-		self.log.V(1).Infof("[multi]drop packet ipv%d p%v -> %s:%d\n", ipPath.Version, ipPath.Protocol, ipPath.DestinationIp, ipPath.DestinationPort)
+		if self.log.V(1).Enabled() {
+			self.log.Infof("[multi]drop packet ipv%d p%v -> %s:%d\n", ipPath.Version, ipPath.Protocol, ipPath.DestinationIp, ipPath.DestinationPort)
+		}
 		return false
 	}
 }
@@ -2162,20 +2171,22 @@ func (self *multiClientWindow) resize() {
 				effectiveByteCountPerSecond := stats.EffectiveByteCountPerSecond()
 				expectedByteCountPerSecond := stats.ExpectedByteCountPerSecond()
 
-				self.log.V(1).Infof(
-					"[multi]%s [%s]: h=%d+%dms/u=%d+%dms effective=%db/s expected=%db/s send=%db sendNack=%db receive=%db\n",
-					status,
-					client.ClientId(),
-					stats.netHealthyDuration/time.Millisecond,
-					stats.healthyDuration/time.Millisecond,
-					stats.netUnhealthyDuration/time.Millisecond,
-					stats.unhealthyDuration/time.Millisecond,
-					effectiveByteCountPerSecond,
-					expectedByteCountPerSecond,
-					stats.sendAckByteCount,
-					stats.sendNackByteCount,
-					stats.receiveAckByteCount,
-				)
+				if self.log.V(1).Enabled() {
+					self.log.Infof(
+						"[multi]%s [%s]: h=%d+%dms/u=%d+%dms effective=%db/s expected=%db/s send=%db sendNack=%db receive=%db\n",
+						status,
+						client.ClientId(),
+						stats.netHealthyDuration/time.Millisecond,
+						stats.healthyDuration/time.Millisecond,
+						stats.netUnhealthyDuration/time.Millisecond,
+						stats.unhealthyDuration/time.Millisecond,
+						effectiveByteCountPerSecond,
+						expectedByteCountPerSecond,
+						stats.sendAckByteCount,
+						stats.sendNackByteCount,
+						stats.receiveAckByteCount,
+					)
+				}
 			}
 			// the top `StatsWindowKeepHealthiestCount` won't be marked as warning or removed
 			netHealthRank := netHealthRanks[client]
@@ -2319,7 +2330,9 @@ func (self *multiClientWindow) resize() {
 				windowSizeMin,
 				targetWindowSize-len(clients),
 			)
-			self.log.V(1).Infof("[multi]window expand +%d %d->%d (+%d)\n", n, len(clients), targetWindowSize, addedCount)
+			if self.log.V(1).Enabled() {
+				self.log.Infof("[multi]window expand +%d %d->%d (+%d)\n", n, len(clients), targetWindowSize, addedCount)
+			}
 		}
 		if 0 < windowSize.WindowSizeHardMax && windowSize.WindowSizeHardMax < len(clients)+len(warnedClients)+addedCount {
 			self.monitor.AddWindowExpandEvent(
@@ -2327,7 +2340,9 @@ func (self *multiClientWindow) resize() {
 				windowSize.WindowSizeHardMax,
 			)
 			collapseLowestWeighted(max(0, windowSize.WindowSizeHardMax-addedCount))
-			self.log.V(1).Infof("[multi]window collapse -%d ->%d\n", (len(clients)+len(warnedClients)+addedCount)-windowSize.WindowSizeHardMax, windowSize.WindowSizeHardMax)
+			if self.log.V(1).Enabled() {
+				self.log.Infof("[multi]window collapse -%d ->%d\n", (len(clients)+len(warnedClients)+addedCount)-windowSize.WindowSizeHardMax, windowSize.WindowSizeHardMax)
+			}
 		} else {
 			self.monitor.AddWindowExpandEvent(
 				windowSizeMin <= len(clients)+addedCount,
@@ -2508,7 +2523,9 @@ func (self *multiClientWindow) expand(
 								pingSuccess += 1
 								pingCancel()
 							} else {
-								self.log.V(1).Infof("[multi]create ping error = %s\n", err)
+								if self.log.V(1).Enabled() {
+									self.log.Infof("[multi]create ping error = %s\n", err)
+								}
 								fail()
 							}
 						},
@@ -2641,7 +2658,9 @@ func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 		if client.Tier() == minTier {
 			minTierClients = append(minTierClients, client)
 		} else {
-			self.log.V(1).Infof("[multi]exclude tier from window %d>%d\n", client.Tier(), minTier)
+			if self.log.V(1).Enabled() {
+				self.log.Infof("[multi]exclude tier from window %d>%d\n", client.Tier(), minTier)
+			}
 		}
 	}
 
@@ -2825,7 +2844,9 @@ func (self *clientWindowStats) ExpectedByteCountPerSecond() ByteCount {
 		return self.estimatedByteCountPerSecond
 	}
 	netByteCount := int64(self.sendAckByteCount + self.sendNackByteCount + self.receiveAckByteCount)
-	self.log.V(2).Infof("[multi]expected use estimated = %dbps (net = %db/%dms)\n", self.estimatedByteCountPerSecond, netByteCount, millis)
+	if self.log.V(2).Enabled() {
+		self.log.Infof("[multi]expected use estimated = %dbps (net = %db/%dms)\n", self.estimatedByteCountPerSecond, netByteCount, millis)
+	}
 	return max(
 		self.estimatedByteCountPerSecond-ByteCount((1000*netByteCount+millis/2)/millis),
 		0,
@@ -3021,12 +3042,7 @@ func (self *multiClientChannel) SendWithAck(parsedPacket *parsedPacket, timeout 
 }
 
 func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, timeout time.Duration, ack bool) (bool, error) {
-	ipPacketToProvider := &protocol.IpPacketToProvider{
-		IpPacket: &protocol.IpPacket{
-			PacketBytes: parsedPacket.packet,
-		},
-	}
-	if frame, err := ToFrame(ipPacketToProvider, self.settings.ProtocolVersion); err != nil {
+	if frame, err := ipPacketToProviderFrame(parsedPacket.packet, self.settings.ProtocolVersion); err != nil {
 		self.addError(err)
 		return false, err
 	} else {
@@ -3126,31 +3142,35 @@ func (self *multiClientChannel) detectBlackhole() {
 			if blackhole {
 				// the client has sent data but received nothing back
 				// this looks like a blackhole
-				self.log.V(1).Infof("[multi]routing %s blackhole: %d %dB <> %d %dB (%d <> %d)\n",
-					self.args.Destination,
-					windowStats.sendAckCount,
-					windowStats.sendAckByteCount,
-					windowStats.receiveAckCount,
-					windowStats.receiveAckByteCount,
-					windowStats.sendSynCount,
-					windowStats.receiveSynCount,
-				)
+				if self.log.V(1).Enabled() {
+					self.log.Infof("[multi]routing %s blackhole: %d %dB <> %d %dB (%d <> %d)\n",
+						self.args.Destination,
+						windowStats.sendAckCount,
+						windowStats.sendAckByteCount,
+						windowStats.receiveAckCount,
+						windowStats.receiveAckByteCount,
+						windowStats.sendSynCount,
+						windowStats.receiveSynCount,
+					)
+				}
 				self.addError(fmt.Errorf("Blackhole (%d %dB)",
 					windowStats.sendAckCount,
 					windowStats.sendAckByteCount,
 				))
 				return
 			} else {
-				self.log.V(1).Infof(
-					"[multi]routing ok %s: %d %dB <> %d %dB (%d <> %d)\n",
-					self.args.Destination,
-					windowStats.sendAckCount,
-					windowStats.sendAckByteCount,
-					windowStats.receiveAckCount,
-					windowStats.receiveAckByteCount,
-					windowStats.sendSynCount,
-					windowStats.receiveSynCount,
-				)
+				if self.log.V(1).Enabled() {
+					self.log.Infof(
+						"[multi]routing ok %s: %d %dB <> %d %dB (%d <> %d)\n",
+						self.args.Destination,
+						windowStats.sendAckCount,
+						windowStats.sendAckByteCount,
+						windowStats.receiveAckCount,
+						windowStats.receiveAckByteCount,
+						windowStats.sendSynCount,
+						windowStats.receiveSynCount,
+					)
+				}
 			}
 
 			select {
@@ -3714,7 +3734,9 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 				}
 				// else not an ip packet, drop
 			} else {
-				self.log.V(2).Infof("[multi]receive drop %s<- = %s\n", self.args.Destination, err)
+				if self.log.V(2).Enabled() {
+					self.log.Infof("[multi]receive drop %s<- = %s\n", self.args.Destination, err)
+				}
 			}
 		default:
 			// unknown message, drop

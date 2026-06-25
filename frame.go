@@ -88,6 +88,43 @@ func ToFrame(message proto.Message, protocolVersion int) (*protocol.Frame, error
 	}, nil
 }
 
+// ipPacketToProviderFrame builds the egress send frame for a raw IP packet.
+// on the v2+ raw path (the default) the packet bytes are carried directly on
+// the Frame, so this avoids allocating the protocol.IpPacketToProvider and
+// protocol.IpPacket wrappers that ToFrame would build and immediately discard.
+// the legacy (<v2) path falls back to the wrapped encoding.
+func ipPacketToProviderFrame(packet []byte, protocolVersion int) (*protocol.Frame, error) {
+	if 2 <= protocolVersion {
+		return &protocol.Frame{
+			MessageType:  protocol.MessageType_IpIpPacketToProvider,
+			MessageBytes: packet,
+			Raw:          true,
+		}, nil
+	}
+	return ToFrame(&protocol.IpPacketToProvider{
+		IpPacket: &protocol.IpPacket{
+			PacketBytes: packet,
+		},
+	}, protocolVersion)
+}
+
+// ipPacketFromProviderFrame mirrors ipPacketToProviderFrame for the provider's
+// return path, avoiding the wrapper allocations on the v2+ raw path.
+func ipPacketFromProviderFrame(packet []byte, protocolVersion int) (*protocol.Frame, error) {
+	if 2 <= protocolVersion {
+		return &protocol.Frame{
+			MessageType:  protocol.MessageType_IpIpPacketFromProvider,
+			MessageBytes: packet,
+			Raw:          true,
+		}, nil
+	}
+	return ToFrame(&protocol.IpPacketFromProvider{
+		IpPacket: &protocol.IpPacket{
+			PacketBytes: packet,
+		},
+	}, protocolVersion)
+}
+
 func RequireToFrameWithDefaultProtocolVersion(message proto.Message) *protocol.Frame {
 	return RequireToFrame(message, DefaultProtocolVersion)
 }

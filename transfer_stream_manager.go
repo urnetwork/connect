@@ -368,7 +368,9 @@ func (self *StreamSequence) Run() {
 			)
 		} else {
 			// the stream must have one of source or destination
-			self.streamManager.client.log.V(1).Infof("[sm] s(%s) missing source or destination.\n", self.streamId)
+			if self.streamManager.client.log.V(1).Enabled() {
+				self.streamManager.client.log.Infof("[sm] s(%s) missing source or destination.\n", self.streamId)
+			}
 			return
 		}
 	} else {

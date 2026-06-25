@@ -99,7 +99,9 @@ func (self *ControlSyncOob) Send(frame *protocol.Frame, ackCallback AckFunction)
 					handleCancel()
 					return
 				}
-				self.client.log.V(2).Infof("[control-oob][%d]retry scope = %s err = %s\n", syncIndex, self.scopeTag, err)
+				if self.client.log.V(2).Enabled() {
+					self.client.log.Infof("[control-oob][%d]retry scope = %s err = %s\n", syncIndex, self.scopeTag, err)
+				}
 				select {
 				case <-handleCtx.Done():
 				case <-self.client.Done():

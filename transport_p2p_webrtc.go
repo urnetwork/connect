@@ -433,7 +433,9 @@ type pionLeveledLogger struct {
 }
 
 func (self *pionLeveledLogger) Trace(msg string) {
-	self.log.V(2).Infof("[pion:%s]%s", self.scope, msg)
+	if self.log.V(2).Enabled() {
+		self.log.Infof("[pion:%s]%s", self.scope, msg)
+	}
 }
 
 func (self *pionLeveledLogger) Tracef(format string, args ...any) {
@@ -443,7 +445,9 @@ func (self *pionLeveledLogger) Tracef(format string, args ...any) {
 }
 
 func (self *pionLeveledLogger) Debug(msg string) {
-	self.log.V(2).Infof("[pion:%s]%s", self.scope, msg)
+	if self.log.V(2).Enabled() {
+		self.log.Infof("[pion:%s]%s", self.scope, msg)
+	}
 }
 
 func (self *pionLeveledLogger) Debugf(format string, args ...any) {
@@ -453,7 +457,9 @@ func (self *pionLeveledLogger) Debugf(format string, args ...any) {
 }
 
 func (self *pionLeveledLogger) Info(msg string) {
-	self.log.V(1).Infof("[pion:%s]%s", self.scope, msg)
+	if self.log.V(1).Enabled() {
+		self.log.Infof("[pion:%s]%s", self.scope, msg)
+	}
 }
 
 func (self *pionLeveledLogger) Infof(format string, args ...any) {
@@ -527,7 +533,9 @@ func (self *WebRtcManager) ReceiveSignal(source TransferPath, frame *protocol.Fr
 		}()
 		if conn != nil {
 			for _, signal := range v.Signals {
-				self.log.V(2).Infof("[signal]%s\n", signal.SignalType)
+				if self.log.V(2).Enabled() {
+					self.log.Infof("[signal]%s\n", signal.SignalType)
+				}
 				err := conn.ReceiveSignalFromPeer(signal)
 				if err != nil {
 					return err
@@ -710,7 +718,9 @@ func (self *peerConn) Run() {
 	self.pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		connected := state == webrtc.ICEConnectionStateConnected ||
 			state == webrtc.ICEConnectionStateCompleted
-		self.log.V(2).Infof("[peerconn]state=%v (%t)\n", state, connected)
+		if self.log.V(2).Enabled() {
+			self.log.Infof("[peerconn]state=%v (%t)\n", state, connected)
+		}
 		self.setConnected(connected)
 	})
 
@@ -853,7 +863,9 @@ func (self *peerConn) ReceiveSignalFromPeer(signal *protocol.ExchangeSignal) err
 		// log and continue rather than tearing down the connection; ICE
 		// has multiple candidates and the peer will retransmit on retry.
 		if err := self.pc.AddICECandidate(candidate); err != nil {
-			self.log.V(1).Infof("[peerconn]AddICECandidate err = %s\n", err)
+			if self.log.V(1).Enabled() {
+				self.log.Infof("[peerconn]AddICECandidate err = %s\n", err)
+			}
 		}
 
 	case protocol.SignalType_WaitingForSdpOffer:

@@ -646,7 +646,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						self.log.Infof("[ts]%s-> error = %s\n", clientId, err)
 						return err
 					}
-					self.log.V(2).Infof("[ts]%s->\n", clientId)
+					if self.log.V(2).Enabled() {
+						self.log.Infof("[ts]%s->\n", clientId)
+					}
 
 					writeCounter.Add(1)
 					return nil
@@ -755,7 +757,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					ws.SetReadDeadline(time.Now().Add(self.settings.ReadTimeout))
 					messageType, r, err := ws.NextReader()
 					if err != nil {
-						self.log.V(2).Infof("[tr]%s<- error = %s\n", clientId, err)
+						if self.log.V(2).Enabled() {
+							self.log.Infof("[tr]%s<- error = %s\n", clientId, err)
+						}
 						return
 					}
 
@@ -764,7 +768,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 						message, err := MessagePoolReadAll(r)
 						if err != nil {
-							self.log.V(2).Infof("[tr]%s<- error = %s\n", clientId, err)
+							if self.log.V(2).Enabled() {
+								self.log.Infof("[tr]%s<- error = %s\n", clientId, err)
+							}
 							return
 						}
 
@@ -773,7 +779,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						if len(message) <= 16 {
 							if len(message) == 0 {
 								// ping
-								self.log.V(2).Infof("[tr]ping %s<-\n", clientId)
+								if self.log.V(2).Enabled() {
+									self.log.Infof("[tr]ping %s<-\n", clientId)
+								}
 								MessagePoolReturn(message)
 							} else if len(message) == 5 {
 								switch message[0] {
@@ -827,13 +835,17 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							MessagePoolReturn(message)
 							return
 						case receive <- message:
-							self.log.V(2).Infof("[tr]%s<-\n", clientId)
+							if self.log.V(2).Enabled() {
+								self.log.Infof("[tr]%s<-\n", clientId)
+							}
 						case <-time.After(self.settings.ReadTimeout):
 							self.log.Infof("[tr]drop %s<-\n", clientId)
 							MessagePoolReturn(message)
 						}
 					default:
-						self.log.V(2).Infof("[tr]other=%s %s<-\n", messageType, clientId)
+						if self.log.V(2).Enabled() {
+							self.log.Infof("[tr]other=%s %s<-\n", messageType, clientId)
+						}
 					}
 
 					// messageType, message, err := ws.ReadMessage()
@@ -1204,7 +1216,9 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 							self.log.Infof("[ts]%s-> error = %s\n", clientId, err)
 							return
 						}
-						self.log.V(2).Infof("[ts]%s->\n", clientId)
+						if self.log.V(2).Enabled() {
+							self.log.Infof("[ts]%s->\n", clientId)
+						}
 					case <-WakeupAfter(self.settings.PingTimeout, self.settings.PingTimeout):
 						stream.SetWriteDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.WriteTimeout))
 						if err := framer.Write(stream, make([]byte, 0)); err != nil {
@@ -1237,7 +1251,9 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 
 					if 0 == len(message) {
 						// ping
-						self.log.V(2).Infof("[tr]ping %s<-\n", clientId)
+						if self.log.V(2).Enabled() {
+							self.log.Infof("[tr]ping %s<-\n", clientId)
+						}
 						MessagePoolReturn(message)
 						continue
 					}
@@ -1247,7 +1263,9 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 						MessagePoolReturn(message)
 						return
 					case receive <- message:
-						self.log.V(2).Infof("[tr]%s<-\n", clientId)
+						if self.log.V(2).Enabled() {
+							self.log.Infof("[tr]%s<-\n", clientId)
+						}
 					case <-time.After(time.Duration(slowMultiple) * self.settings.ReadTimeout):
 						self.log.Infof("[tr]drop %s<-\n", clientId)
 						MessagePoolReturn(message)

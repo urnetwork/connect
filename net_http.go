@@ -507,10 +507,14 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 				result := eval(handleCtx, dialer)
 				if result != nil {
 					if result.err == nil {
-						self.log.V(2).Infof("[net][p]select: %s\n", dialer.String())
+						if self.log.V(2).Enabled() {
+							self.log.Infof("[net][p]select: %s\n", dialer.String())
+						}
 						return result
 					}
-					self.log.V(2).Infof("[net][p]select: %s = %s\n", dialer.String(), result.err)
+					if self.log.V(2).Enabled() {
+						self.log.Infof("[net][p]select: %s = %s\n", dialer.String(), result.err)
+					}
 					result.Close()
 				}
 			}
@@ -531,10 +535,14 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 				case result := <-out:
 					if result != nil {
 						if result.err == nil {
-							self.log.V(2).Infof("[net][p]select: %s\n", result.dialer.String())
+							if self.log.V(2).Enabled() {
+								self.log.Infof("[net][p]select: %s\n", result.dialer.String())
+							}
 							return result
 						}
-						self.log.V(2).Infof("[net][p]select: %s = %s\n", result.dialer.String(), result.err)
+						if self.log.V(2).Enabled() {
+							self.log.Infof("[net][p]select: %s = %s\n", result.dialer.String(), result.err)
+						}
 						result.Close()
 					}
 					go HandleError(func() {
@@ -559,10 +567,14 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 				case result := <-out:
 					if result != nil {
 						if result.err == nil {
-							self.log.V(2).Infof("[net][p]select: %s\n", result.dialer.String())
+							if self.log.V(2).Enabled() {
+								self.log.Infof("[net][p]select: %s\n", result.dialer.String())
+							}
 							return result
 						}
-						self.log.V(2).Infof("[net][p]select: %s = %s\n", result.dialer.String(), result.err)
+						if self.log.V(2).Enabled() {
+							self.log.Infof("[net][p]select: %s = %s\n", result.dialer.String(), result.err)
+						}
 						result.Close()
 					}
 					go HandleError(func() {
@@ -644,10 +656,14 @@ func (self *ClientStrategy) serialEval(ctx context.Context, eval func(ctx contex
 			result := eval(handleCtx, dialer)
 			if result != nil {
 				if result.err == nil {
-					self.log.V(2).Infof("[net][s]select: %s\n", dialer.String())
+					if self.log.V(2).Enabled() {
+						self.log.Infof("[net][s]select: %s\n", dialer.String())
+					}
 					return result
 				}
-				self.log.V(2).Infof("[net][s]select: %s = %s\n", dialer.String(), result.err)
+				if self.log.V(2).Enabled() {
+					self.log.Infof("[net][s]select: %s = %s\n", dialer.String(), result.err)
+				}
 				result.Close()
 			}
 		}

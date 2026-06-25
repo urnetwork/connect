@@ -36,6 +36,28 @@ func IsDoneError(r any) bool {
 	}
 }
 
+// safeAck invokes an ack callback with the same nil-check, done-error handling,
+// and panic isolation that wrapping it in HandleError would give, but without
+// allocating a closure. The per-packet send path stores the caller's raw
+// AckFunction in SendPack and passes it here at ack time, instead of allocating
+// a wrapper closure per send. Allocation-free in the happy path: the deferred
+// recover closure captures no variables, so it is a static func value.
+func safeAck(ackCallback AckFunction, err error) {
+	if ackCallback == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			if IsDoneError(r) {
+				// the context was canceled and raised; standard pattern, do not log
+			} else {
+				DefaultLogger().Warningf("Unexpected error: %s\n", ErrorJson(r, debug.Stack()))
+			}
+		}
+	}()
+	ackCallback(err)
+}
+
 func HandleError(do func(), handlers ...any) (r any) {
 	defer func() {
 		if r = recover(); r != nil {

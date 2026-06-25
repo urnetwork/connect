@@ -378,7 +378,9 @@ func (self *ContractManager) expireQueuedContracts() {
 			}
 		}()
 		if 0 < len(pending) {
-			self.client.log.V(1).Infof("[contract]closing %d pending contracts on close\n", len(pending))
+			if self.client.log.V(1).Enabled() {
+				self.client.log.Infof("[contract]closing %d pending contracts on close\n", len(pending))
+			}
 			self.closeContracts(pending)
 		}
 	}
@@ -417,7 +419,9 @@ func (self *ContractManager) expireQueuedContracts() {
 			}
 		}()
 		if 0 < len(expired) {
-			self.client.log.V(1).Infof("[contract]expired %d queued contracts\n", len(expired))
+			if self.client.log.V(1).Enabled() {
+				self.client.log.Infof("[contract]expired %d queued contracts\n", len(expired))
+			}
 			// close outside the manager mutex: CloseContract re-takes it
 			self.closeContracts(expired)
 		}
@@ -606,7 +610,9 @@ func (self *ContractManager) HandleControlFrame(contractKey ContractKey, frame *
 			}
 		}
 		for _, contractError := range contractErrors {
-			self.client.log.V(1).Infof("[contract]error = %s\n", contractError)
+			if self.client.log.V(1).Enabled() {
+				self.client.log.Infof("[contract]error = %s\n", contractError)
+			}
 			c := func() {
 				contractStatus := &ContractStatus{
 					Key:   contractKey,
@@ -1043,7 +1049,9 @@ func (self *ContractManager) addContract(contractKey ContractKey, contract *prot
 		return fmt.Errorf("Contract source must be this client: %s<>%s", sourceId, self.client.ClientId())
 	}
 
-	self.client.log.V(1).Infof("[contract]add %s %s\n", self.client.ClientId(), contractKey.Destination)
+	if self.client.log.V(1).Enabled() {
+		self.client.log.Infof("[contract]add %s %s\n", self.client.ClientId(), contractKey.Destination)
+	}
 
 	func() {
 		contractQueue := self.openContractQueue(contractKey)
@@ -1078,7 +1086,9 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 		return
 	}
 
-	self.client.log.V(1).Infof("[contract]create %s %s\n", self.client.ClientId(), contractKey.Destination)
+	if self.client.log.V(1).Enabled() {
+		self.client.log.Infof("[contract]create %s %s\n", self.client.ClientId(), contractKey.Destination)
+	}
 
 	self.client.ClientOob().SendControl(
 		[]*protocol.Frame{frame},
@@ -1193,7 +1203,9 @@ func (self *ContractManager) CloseContractWithCheckpoint(
 		// remains the backstop if the single attempt fails.
 		sendCallback := func(resultFrames []*protocol.Frame, sendErr error) {
 			if sendErr == nil {
-				self.client.log.V(1).Infof("[contract]closed %s after client close\n", contractId)
+				if self.client.log.V(1).Enabled() {
+					self.client.log.Infof("[contract]closed %s after client close\n", contractId)
+				}
 			} else {
 				self.client.log.Infof("[contract]could not close %s after client close = %s\n", contractId, sendErr)
 			}
@@ -1246,7 +1258,9 @@ func (self *ContractManager) Flush(resetUsedContractIds bool) []Id {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
 
-		self.client.log.V(1).Infof("[contract]flush %s %s\n", self.client.ClientId(), maps.Keys(self.destinationContracts))
+		if self.client.log.V(1).Enabled() {
+			self.client.log.Infof("[contract]flush %s %s\n", self.client.ClientId(), maps.Keys(self.destinationContracts))
+		}
 
 		contracts := []*protocol.Contract{}
 		for contractKey, contractQueue := range self.destinationContracts {
@@ -1433,14 +1447,18 @@ func (self *contractQueue) Add(contract *protocol.Contract, storedContract *prot
 
 	// update contract if present
 	if _, ok := self.contracts[contractId]; ok {
-		self.log.V(2).Infof("[contract]add update existing %s\n", contractId)
+		if self.log.V(2).Enabled() {
+			self.log.Infof("[contract]add update existing %s\n", contractId)
+		}
 		self.contracts[contractId] = &queuedContract{
 			contract:    contract,
 			enqueueTime: time.Now(),
 		}
 		self.updateMonitor.NotifyAll()
 	} else if !self.trackUsedContracts || !self.usedContractIds[contractId] {
-		self.log.V(2).Infof("[contract]add %s\n", contractId)
+		if self.log.V(2).Enabled() {
+			self.log.Infof("[contract]add %s\n", contractId)
+		}
 		if self.trackUsedContracts {
 			self.usedContractIds[contractId] = true
 		}
@@ -1450,7 +1468,9 @@ func (self *contractQueue) Add(contract *protocol.Contract, storedContract *prot
 		}
 		self.updateMonitor.NotifyAll()
 	} else {
-		self.log.V(2).Infof("[contract]add already used %s\n", contractId)
+		if self.log.V(2).Enabled() {
+			self.log.Infof("[contract]add already used %s\n", contractId)
+		}
 		// drop this contract. it has already been used locally
 	}
 	return nil
