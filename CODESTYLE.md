@@ -31,7 +31,14 @@ In the URnetwork code, the following Go style is used. A few conventions — not
 
 - Start a type's internal management goroutines in its constructor, so the returned object is already fully running. The lifecycle loop is conventionally `func (self *T) run()` — lowercase, internal, started by the constructor.
 - Exception: when an external manager must clean up after the lifecycle, expose `func (self *T) Run()` (uppercase) instead. The manager calls `Run()` after construction and tears the object down when `Run()` returns. Casing carries the meaning: lowercase `run()` is internal and self-started; uppercase `Run()` is externally driven.
-- Wait with `time.After` inside the run loop; we don't use `time.Timer`. Reusing a `time.Timer` would save the per-iteration allocation, but we don't optimize for that.
+- Wait with `time.After` inside the run loop by default; we don't reach for `time.Timer` for the convenience of it.
+- Exception — hot-path timer reuse: in a per-packet (or otherwise hot) loop, where profiling shows the per-iteration `time.After` allocation is a significant share of allocations, reuse a single `time.Timer` instead. Create it with `time.NewTimer(0)` before the loop, `defer timer.Stop()`, and `timer.Reset(d)` immediately before each blocking `select` that reads `timer.C`. This relies on go1.23+ timer semantics, where `Reset` guarantees no stale fire is delivered afterward, so the drain dance is unnecessary and the initial already-fired state is harmless. Reach for this only with a profile that justifies it, not preemptively.
+
+## Logging
+
+- Components log through a `Logger` (see `log.go`), not the global glog functions.
+- Guard every verbose log statement that takes format arguments — `if self.log.V(2).Enabled() { self.log.Infof("[tag]...", a, b) }`, never a bare `self.log.V(2).Infof("[tag]...", a, b)`. The variadic arguments (and any `fmt` / `.String()` work among them) are boxed into an `[]any` at the call site *before* the level is checked: Go's variadic + interface-dispatch semantics defeat escape analysis, so a disabled level still heap-allocates on every call. The `Enabled()` guard skips all of it. This matters most on per-packet paths but is the rule everywhere, for consistency.
+- Unconditional `Infof` / `Warningf` / `Errorf` (no `V(n)`) always emit, so they need no guard; a verbose call with no arguments boxes nothing and needs none either.
 
 ## Formatting and structure
 
@@ -56,5 +63,8 @@ In the URnetwork code, the following Go style is used. A few conventions — not
 
 ## Message Pool
 
-- When byte slices are handed into a sender, the sender will own the slice if it returns "success=false". The caller will continue to own the slice if the sender returns "success=false".
-- Slices passed to callbacks are only valid for the call context. They must be retained with `MessagePoolShareReadOnly` to keep them after the call duration.
+Pool buffers (`MessagePoolGet`) have a single owner that is responsible for returning them (`MessagePoolReturn`). Ownership moves by these rules:
+
+1. **A successful send takes ownership.** When a buffer is handed to a sender and the send returns success, the sender now owns the buffer and is responsible for returning it.
+2. **An unsuccessful send leaves ownership with the caller.** If the send returns not-success, the caller still owns the buffer and must return it (or reuse/retry it).
+3. **A callback buffer is borrowed, valid only for the call.** A buffer passed to a callback is owned by the caller and is only valid for the duration of that call. To use it beyond the callback (e.g. to forward it on a channel or hand it to another goroutine), the callback must take a shared copy with `MessagePoolShareReadOnly` and pass that copy on; ownership of the copy then follows the send rules above.
