@@ -186,6 +186,7 @@ type PlatformTransport struct {
 	availableModes map[TransportMode]bool
 	targetMode     TransportMode
 	mode           TransportMode
+
 }
 
 func NewPlatformTransportWithDefaults(
@@ -390,6 +391,56 @@ func isBetterMode(current TransportMode, other TransportMode) bool {
 	return transportModePreferences[current] < transportModePreferences[other]
 }
 
+// lastAuthErrLogNano and suppressedAuthErrCount are package-level atomics shared
+// across all PlatformTransport instances, rate-limiting [t]auth error log lines to
+// at most once per minute and tracking how many were suppressed in the interval.
+var lastAuthErrLogNano atomic.Int64
+var suppressedAuthErrCount atomic.Int64
+
+// lastWriteErrLogNano and suppressedWriteErrCount rate-limit [ts] write-error
+// log lines. A socket that is broken but still open keeps accepting writes that
+// immediately fail, so the writer goroutine retries in a tight loop and every
+// failed write logs a line. During an outage this floods the log just like the
+// auth path, so the same once-per-minute throttle is applied here.
+var lastWriteErrLogNano atomic.Int64
+var suppressedWriteErrCount atomic.Int64
+
+// shouldLogAuthErr returns (true, suppressedCount) if a log line should be emitted,
+// resetting the suppressed counter. Returns (false, 0) if the error is suppressed.
+func shouldLogAuthErr() (bool, int64) {
+	now := time.Now().UnixNano()
+	last := lastAuthErrLogNano.Load()
+	if now-last < int64(time.Minute) {
+		suppressedAuthErrCount.Add(1)
+		return false, 0
+	}
+	if !lastAuthErrLogNano.CompareAndSwap(last, now) {
+		suppressedAuthErrCount.Add(1)
+		return false, 0
+	}
+	suppressed := suppressedAuthErrCount.Swap(0)
+	return true, suppressed
+}
+
+// shouldLogWriteErr returns (true, suppressedCount) if a [ts] write-error line
+// should be emitted, resetting the suppressed counter. Returns (false, 0) if
+// suppressed. A broken-but-open socket retries writes in a tight loop; this
+// throttles that flood to one line per minute with a suppressed count.
+func shouldLogWriteErr() (bool, int64) {
+	now := time.Now().UnixNano()
+	last := lastWriteErrLogNano.Load()
+	if now-last < int64(time.Minute) {
+		suppressedWriteErrCount.Add(1)
+		return false, 0
+	}
+	if !lastWriteErrLogNano.CompareAndSwap(last, now) {
+		suppressedWriteErrCount.Add(1)
+		return false, 0
+	}
+	suppressed := suppressedWriteErrCount.Swap(0)
+	return true, suppressed
+}
+
 func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 	// connect and update route manager for this transport
 	defer self.cancel()
@@ -404,6 +455,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		}
 	}
 
+	authErrLogged := false
 	for {
 		// wait until we are back in h1 or worse
 		func() {
@@ -494,7 +546,20 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			ws, err = connect()
 		}
 		if err != nil {
-			self.log.Infof("[t]auth error %s = %s\n", clientId, err)
+			if !authErrLogged {
+				if ok, suppressed := shouldLogAuthErr(); ok {
+					if suppressed > 0 {
+						self.log.Infof("[t]auth error %s = %s (%d suppressed)\n", clientId, err, suppressed)
+					} else {
+						self.log.Infof("[t]auth error %s = %s\n", clientId, err)
+					}
+					authErrLogged = true
+				} else {
+					self.log.V(1).Infof("[t]auth error %s = %s\n", clientId, err)
+				}
+			} else {
+				self.log.V(1).Infof("[t]auth error %s = %s\n", clientId, err)
+			}
 			select {
 			case <-self.ctx.Done():
 				return
@@ -502,6 +567,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				continue
 			}
 		}
+		authErrLogged = false
 
 		c := func() {
 			defer ws.Close()
@@ -643,7 +709,13 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					MessagePoolReturn(message)
 					if err != nil {
 						// note that for websocket a dealine timeout cannot be recovered
-						self.log.Infof("[ts]%s-> error = %s\n", clientId, err)
+						if ok, suppressed := shouldLogWriteErr(); ok {
+							if suppressed > 0 {
+								self.log.Infof("[ts]%s-> error = %s (%d suppressed)\n", clientId, err, suppressed)
+							} else {
+								self.log.Infof("[ts]%s-> error = %s\n", clientId, err)
+							}
+						}
 						return err
 					}
 					if self.log.V(2).Enabled() {
@@ -912,6 +984,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 		}
 	}
 
+	authErrLogged := false
 	for {
 		// wait until we are back in the specific pt mode or auto mode
 		func() {
@@ -1091,7 +1164,20 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			connStream, err = connect()
 		}
 		if err != nil {
-			self.log.Infof("[t]auth error %s = %s\n", clientId, err)
+			if !authErrLogged {
+				if ok, suppressed := shouldLogAuthErr(); ok {
+					if suppressed > 0 {
+						self.log.Infof("[t]auth error %s = %s (%d suppressed)\n", clientId, err, suppressed)
+					} else {
+						self.log.Infof("[t]auth error %s = %s\n", clientId, err)
+					}
+					authErrLogged = true
+				} else {
+					self.log.V(1).Infof("[t]auth error %s = %s\n", clientId, err)
+				}
+			} else {
+				self.log.V(1).Infof("[t]auth error %s = %s\n", clientId, err)
+			}
 			select {
 			case <-self.ctx.Done():
 				return
@@ -1099,6 +1185,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				continue
 			}
 		}
+		authErrLogged = false
 		conn := connStream.conn
 		stream := connStream.stream
 
