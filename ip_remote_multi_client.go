@@ -1079,7 +1079,7 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 		self.log.Infof("[multi]send bad packet = %s\n", err)
 		return false
 	}
-	r, err := self.securityPolicy.Inspect(minRelationship, ipPath)
+	r, err := self.securityPolicy.Inspect(minRelationship, ipPath, payload)
 	if err != nil {
 		self.log.Infof("[multi]send bad packet = %s\n", err)
 		return false
@@ -1417,7 +1417,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 	ipPath *IpPath,
 	packet []byte,
 ) {
-	r, err := self.ingressSecurityPolicy.Inspect(provideMode, ipPath)
+	r, err := self.ingressSecurityPolicy.Inspect(provideMode, ipPath, nil)
 	if err != nil {
 		return
 	}

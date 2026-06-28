@@ -190,8 +190,6 @@ func (self *LocalUserNat) SecurityPolicyStats(reset bool) SecurityPolicyStats {
 	return SecurityPolicyStats{}
 }
 
-// TODO provide mode of the destination determines filtering rules - e.g. local networks
-// TODO currently filter all local networks and non-encrypted traffic
 func (self *LocalUserNat) SendPacketWithTimeout(source TransferPath, provideMode protocol.ProvideMode,
 	packet []byte, timeout time.Duration) bool {
 	return self.SendPacketsWithTimeout(source, provideMode, [][]byte{packet}, timeout)
@@ -3134,9 +3132,9 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 			}
 			ipPacketToProvider := ipPacketToProvider_.(*protocol.IpPacketToProvider)
 
-			ipPath, err := ParseIpPath(ipPacketToProvider.IpPacket.PacketBytes)
+			ipPath, payload, err := ParseIpPathWithPayload(ipPacketToProvider.IpPacket.PacketBytes)
 			if err == nil {
-				r, err := self.securityPolicy.Inspect(provideMode, ipPath)
+				r, err := self.securityPolicy.Inspect(provideMode, ipPath, payload)
 				if err == nil {
 					switch r {
 					case SecurityPolicyResultAllow:
@@ -3266,11 +3264,11 @@ func (self *RemoteUserNatClient) SecurityPolicyStats(reset bool) SecurityPolicyS
 func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool {
 	minRelationship := max(provideMode, self.provideMode)
 
-	ipPath, err := ParseIpPath(packet)
+	ipPath, payload, err := ParseIpPathWithPayload(packet)
 	if err != nil {
 		return false
 	}
-	r, err := self.securityPolicy.Inspect(minRelationship, ipPath)
+	r, err := self.securityPolicy.Inspect(minRelationship, ipPath, payload)
 	if err != nil {
 		return false
 	}
