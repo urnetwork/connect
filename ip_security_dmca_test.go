@@ -66,12 +66,10 @@ func TestDmcaBittorrentSignatures(t *testing.T) {
 		{"udp random not bt", IpProtocolUdp, encryptedPayload(256), false},
 	}
 	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			ipPath := &IpPath{Protocol: c.proto}
-			if got := detectBittorrentSignature(ipPath, c.b); got != c.want {
-				t.Fatalf("detectBittorrentSignature = %v, want %v", got, c.want)
-			}
-		})
+		ipPath := &IpPath{Protocol: c.proto}
+		if got := detectBittorrentSignature(ipPath, c.b); got != c.want {
+			t.Errorf("%s: detectBittorrentSignature = %v, want %v", c.name, got, c.want)
+		}
 	}
 }
 
@@ -101,82 +99,165 @@ func dmcaPath(proto IpProtocol, sport int, dport int, syn bool) *IpPath {
 	}
 }
 
-func TestDmcaStateMachine(t *testing.T) {
+// plaintext bittorrent handshake -> incident on the first data packet
+func TestDmcaStateMachineHandshakeIncident(t *testing.T) {
 	settings := DefaultDmcaSecurityPolicySettings()
 	web := newWebStandardDetector(DefaultWebStandardSettings())
 
-	// plaintext bittorrent handshake -> incident on the first data packet
-	t.Run("handshake incident", func(t *testing.T) {
-		d := newDmcaDetector(settings, web)
-		if r := d.inspect(dmcaPath(IpProtocolTcp, 40001, 51413, false), btHandshake()); r != SecurityPolicyResultIncident {
-			t.Fatalf("handshake -> %v, want incident", r)
-		}
-	})
+	d := newDmcaDetector(settings, web)
+	if r := d.inspect(dmcaPath(IpProtocolTcp, 40001, 51413, false), btHandshake()); r != SecurityPolicyResultIncident {
+		t.Fatalf("handshake -> %v, want incident", r)
+	}
+}
 
-	// encrypted, non-web-standard TCP observed from SYN -> drop after the budget
-	t.Run("encrypted tcp dropped", func(t *testing.T) {
-		d := newDmcaDetector(settings, web)
-		path := dmcaPath(IpProtocolTcp, 40002, 50000, true)
-		if r := d.inspect(path, nil); r != SecurityPolicyResultAllow {
-			t.Fatalf("syn -> %v, want allow (inspecting)", r)
-		}
-		data := dmcaPath(IpProtocolTcp, 40002, 50000, false)
-		var last SecurityPolicyResult
-		for i := 0; i < settings.EncryptedDecisionPackets; i += 1 {
-			last = d.inspect(data, encryptedPayload(512))
-		}
-		if last != SecurityPolicyResultDrop {
-			t.Fatalf("encrypted tcp from syn -> %v, want drop", last)
-		}
-	})
+// encrypted, non-web-standard TCP observed from SYN -> drop after the budget
+func TestDmcaStateMachineEncryptedTcpDropped(t *testing.T) {
+	settings := DefaultDmcaSecurityPolicySettings()
+	web := newWebStandardDetector(DefaultWebStandardSettings())
 
-	// same bytes, but joined mid-stream (no SYN seen) -> must NOT drop
-	t.Run("encrypted tcp midstream allowed", func(t *testing.T) {
-		d := newDmcaDetector(settings, web)
-		data := dmcaPath(IpProtocolTcp, 40003, 50000, false)
-		var last SecurityPolicyResult
-		for i := 0; i < settings.InspectionPacketBudget+1; i += 1 {
-			last = d.inspect(data, encryptedPayload(512))
-		}
-		if last != SecurityPolicyResultAllow {
-			t.Fatalf("encrypted tcp mid-stream -> %v, want allow", last)
-		}
-	})
+	d := newDmcaDetector(settings, web)
+	path := dmcaPath(IpProtocolTcp, 40002, 50000, true)
+	if r := d.inspect(path, nil); r != SecurityPolicyResultAllow {
+		t.Fatalf("syn -> %v, want allow (inspecting)", r)
+	}
+	data := dmcaPath(IpProtocolTcp, 40002, 50000, false)
+	var last SecurityPolicyResult
+	for i := 0; i < settings.EncryptedDecisionPackets; i += 1 {
+		last = d.inspect(data, encryptedPayload(512))
+	}
+	if last != SecurityPolicyResultDrop {
+		t.Fatalf("encrypted tcp from syn -> %v, want drop", last)
+	}
+}
 
-	// encrypted UDP (first datagram is the start) -> drop
-	t.Run("encrypted udp dropped", func(t *testing.T) {
-		d := newDmcaDetector(settings, web)
-		path := dmcaPath(IpProtocolUdp, 40004, 50000, false)
-		var last SecurityPolicyResult
-		for i := 0; i < settings.EncryptedDecisionPackets; i += 1 {
-			last = d.inspect(path, encryptedPayload(512))
-		}
-		if last != SecurityPolicyResultDrop {
-			t.Fatalf("encrypted udp -> %v, want drop", last)
-		}
-	})
+// same bytes, but joined mid-stream (no SYN seen) -> must NOT drop
+func TestDmcaStateMachineEncryptedTcpMidstreamAllowed(t *testing.T) {
+	settings := DefaultDmcaSecurityPolicySettings()
+	web := newWebStandardDetector(DefaultWebStandardSettings())
 
-	// whitelisted web standard that looks encrypted on later packets stays allowed
-	t.Run("quic allowed", func(t *testing.T) {
-		d := newDmcaDetector(settings, web)
-		path := dmcaPath(IpProtocolUdp, 40005, 50000, false)
-		if r := d.inspect(path, quicInitial()); r != SecurityPolicyResultAllow {
-			t.Fatalf("quic initial -> %v, want allow", r)
-		}
-		// subsequent encrypted 1-RTT packets must remain allowed (terminal)
-		if r := d.inspect(path, encryptedPayload(512)); r != SecurityPolicyResultAllow {
-			t.Fatalf("quic post-handshake -> %v, want allow", r)
-		}
-	})
+	d := newDmcaDetector(settings, web)
+	data := dmcaPath(IpProtocolTcp, 40003, 50000, false)
+	var last SecurityPolicyResult
+	for i := 0; i < settings.InspectionPacketBudget+1; i += 1 {
+		last = d.inspect(data, encryptedPayload(512))
+	}
+	if last != SecurityPolicyResultAllow {
+		t.Fatalf("encrypted tcp mid-stream -> %v, want allow", last)
+	}
+}
 
-	// an unknown plaintext protocol is allowed (only encrypted non-web is dropped)
-	t.Run("plaintext allowed", func(t *testing.T) {
-		d := newDmcaDetector(settings, web)
-		path := dmcaPath(IpProtocolUdp, 40006, 50000, false)
-		if r := d.inspect(path, []byte("PLAINTEXT GAME PROTOCOL HELLO v1 ............")); r != SecurityPolicyResultAllow {
-			t.Fatalf("plaintext -> %v, want allow", r)
+// encrypted UDP (first datagram is the start) -> drop
+func TestDmcaStateMachineEncryptedUdpDropped(t *testing.T) {
+	settings := DefaultDmcaSecurityPolicySettings()
+	web := newWebStandardDetector(DefaultWebStandardSettings())
+
+	d := newDmcaDetector(settings, web)
+	path := dmcaPath(IpProtocolUdp, 40004, 50000, false)
+	var last SecurityPolicyResult
+	for i := 0; i < settings.EncryptedDecisionPackets; i += 1 {
+		last = d.inspect(path, encryptedPayload(512))
+	}
+	if last != SecurityPolicyResultDrop {
+		t.Fatalf("encrypted udp -> %v, want drop", last)
+	}
+}
+
+// whitelisted web standard that looks encrypted on later packets stays allowed
+func TestDmcaStateMachineQuicAllowed(t *testing.T) {
+	settings := DefaultDmcaSecurityPolicySettings()
+	web := newWebStandardDetector(DefaultWebStandardSettings())
+
+	d := newDmcaDetector(settings, web)
+	path := dmcaPath(IpProtocolUdp, 40005, 50000, false)
+	if r := d.inspect(path, quicInitial()); r != SecurityPolicyResultAllow {
+		t.Fatalf("quic initial -> %v, want allow", r)
+	}
+	// subsequent encrypted 1-RTT packets must remain allowed (terminal)
+	if r := d.inspect(path, encryptedPayload(512)); r != SecurityPolicyResultAllow {
+		t.Fatalf("quic post-handshake -> %v, want allow", r)
+	}
+}
+
+// an unknown plaintext protocol is allowed (only encrypted non-web is dropped)
+func TestDmcaStateMachinePlaintextAllowed(t *testing.T) {
+	settings := DefaultDmcaSecurityPolicySettings()
+	web := newWebStandardDetector(DefaultWebStandardSettings())
+
+	d := newDmcaDetector(settings, web)
+	path := dmcaPath(IpProtocolUdp, 40006, 50000, false)
+	if r := d.inspect(path, []byte("PLAINTEXT GAME PROTOCOL HELLO v1 ............")); r != SecurityPolicyResultAllow {
+		t.Fatalf("plaintext -> %v, want allow", r)
+	}
+}
+
+// TestDmcaRawHttpShortRequestAllowed: a short HTTP request line (below MinEncryptedPayload)
+// observed from SYN is allowed immediately and terminally — so a later high-entropy body on
+// the same flow cannot trip the encrypted-traffic heuristic. Without the explicit HTTP
+// detection the short request would stay inspecting and be dropped once the high-entropy
+// packets arrived.
+func TestDmcaRawHttpShortRequestAllowed(t *testing.T) {
+	settings := DefaultDmcaSecurityPolicySettings()
+	d := newDmcaDetector(settings, newWebStandardDetector(DefaultWebStandardSettings()))
+	if r := d.inspect(dmcaPath(IpProtocolTcp, 40010, 40000, true), nil); r != SecurityPolicyResultAllow {
+		t.Fatalf("syn -> %v, want allow", r)
+	}
+	data := dmcaPath(IpProtocolTcp, 40010, 40000, false)
+	if r := d.inspect(data, []byte("GET /a HTTP/1.1\r\n\r\n")); r != SecurityPolicyResultAllow {
+		t.Fatalf("short http get -> %v, want allow", r)
+	}
+	for i := 0; i < settings.EncryptedDecisionPackets+1; i += 1 {
+		if r := d.inspect(data, encryptedPayload(512)); r != SecurityPolicyResultAllow {
+			t.Fatalf("post-http high-entropy -> %v, want allow (terminal)", r)
 		}
-	})
+	}
+}
+
+// TestDmcaHttpTrackerIsBittorrent: an HTTP-tracker GET (info_hash + /announce) is still
+// BitTorrent, not allowed as raw HTTP — the HTTP check runs after the BitTorrent signatures.
+func TestDmcaHttpTrackerIsBittorrent(t *testing.T) {
+	d := newDmcaDetector(DefaultDmcaSecurityPolicySettings(), newWebStandardDetector(DefaultWebStandardSettings()))
+	tracker := []byte("GET /announce?info_hash=%01%02&peer_id=x HTTP/1.1\r\nHost: t\r\n\r\n")
+	if r := d.inspect(dmcaPath(IpProtocolTcp, 40012, 40000, false), tracker); r != SecurityPolicyResultIncident {
+		t.Fatalf("http tracker -> %v, want incident", r)
+	}
+}
+
+// TestEgressAllowsRawHttpNonStandardPort: end-to-end through the egress policy, CFAA passes
+// the ephemeral port to DPI and DPI allows the raw HTTP request.
+func TestEgressAllowsRawHttpNonStandardPort(t *testing.T) {
+	policy := DefaultEgressSecurityPolicy()
+	get := []byte("GET /stream/audio.mp3 HTTP/1.1\r\nHost: stream.example.com\r\n\r\n")
+	r, err := policy.Inspect(protocol.ProvideMode_Public, dmcaPath(IpProtocolTcp, 41010, 40000, false), get)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r != SecurityPolicyResultAllow {
+		t.Fatalf("raw http on :40000 -> %v, want allow", r)
+	}
+}
+
+func TestIsHttpRequest(t *testing.T) {
+	yes := [][]byte{
+		[]byte("GET / HTTP/1.1\r\n"),
+		[]byte("POST /x HTTP/1.0\r\n"),
+		[]byte("HEAD /y HTTP/1.1\r\nHost: a\r\n"),
+	}
+	no := [][]byte{
+		[]byte("GET /no-version\r\n"),
+		[]byte("CONNECT host:443 HTTP/1.1\r\n"), // opaque tunnel, not allowed as raw http
+		tlsClientHello(),
+		[]byte("random bytes without a method"),
+	}
+	for _, b := range yes {
+		if !isHttpRequest(b) {
+			t.Errorf("isHttpRequest(%q) = false, want true", b)
+		}
+	}
+	for _, b := range no {
+		if isHttpRequest(b) {
+			t.Errorf("isHttpRequest(%q) = true, want false", b)
+		}
+	}
 }
 
 func TestEgressSecurityPolicyDpi(t *testing.T) {

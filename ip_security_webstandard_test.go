@@ -21,11 +21,9 @@ func TestWebStandardDetection(t *testing.T) {
 		{"tls bytes over udp not web", IpProtocolUdp, tlsClientHello(), false},
 	}
 	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := d.match(&IpPath{Protocol: c.proto}, c.b); got != c.want {
-				t.Fatalf("match = %v, want %v", got, c.want)
-			}
-		})
+		if got := d.match(&IpPath{Protocol: c.proto}, c.b); got != c.want {
+			t.Errorf("%s: match = %v, want %v", c.name, got, c.want)
+		}
 	}
 }
 

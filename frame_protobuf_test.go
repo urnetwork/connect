@@ -174,10 +174,8 @@ func TestFrameCodecEdgeCases(t *testing.T) {
 		},
 	}
 
-	for name, m := range cases {
-		t.Run(name, func(t *testing.T) {
-			assertCodecMatches(t, m)
-		})
+	for _, m := range cases {
+		assertCodecMatches(t, m)
 	}
 }
 
@@ -318,8 +316,8 @@ func TestAckCodecEdgeCases(t *testing.T) {
 			selective:  true,
 		},
 	}
-	for name, m := range cases {
-		t.Run(name, func(t *testing.T) { assertAckCodecMatches(t, m) })
+	for _, m := range cases {
+		assertAckCodecMatches(t, m)
 	}
 }
 
@@ -434,9 +432,9 @@ func TestDecodeTransferFrameEdgeCases(t *testing.T) {
 			Frame:        &protocol.Frame{MessageType: protocol.MessageType_TransferPack, MessageBytes: []byte{1, 2, 3}},
 		},
 	}
-	for i, ref := range frames {
-		t.Run(string(rune('a'+i))+"/path", func(t *testing.T) { assertDecodeMatches(t, ref, true) })
-		t.Run(string(rune('a'+i))+"/nopath", func(t *testing.T) { assertDecodeMatches(t, ref, false) })
+	for _, ref := range frames {
+		assertDecodeMatches(t, ref, true)
+		assertDecodeMatches(t, ref, false)
 	}
 }
 

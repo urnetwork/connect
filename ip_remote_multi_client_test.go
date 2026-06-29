@@ -3,6 +3,7 @@ package connect
 import (
 	"context"
 	"math"
+	"net"
 	"testing"
 	"time"
 
@@ -13,6 +14,66 @@ import (
 
 	"github.com/urnetwork/connect/protocol"
 )
+
+type stubServerNameLookup struct {
+	names []string
+}
+
+func (self stubServerNameLookup) ServerNames(ip string) []string {
+	return self.names
+}
+
+// TestMultiClientServerNameAffinity verifies ServerName path affinity collapses to the
+// base domain: a.foo.com, b.c.foo.com and foo.com all share a single foo.com path.
+func TestMultiClientServerNameAffinity(t *testing.T) {
+	ipPath := &IpPath{
+		Version:         4,
+		Protocol:        IpProtocolTcp,
+		DestinationIp:   net.ParseIP("93.184.216.34"),
+		DestinationPort: 443,
+	}
+
+	// with a lookup returning sub-domains of one site, affinity is one base-domain path
+	{
+		mc := &RemoteUserNatMultiClient{}
+		mc.config.Store(&multiClientConfig{
+			serverNameLookup: stubServerNameLookup{names: []string{"a.foo.com", "b.c.foo.com", "foo.com"}},
+		})
+		paths := mc.affinityIpPathsWithLock(ipPath)
+		if len(paths) != 1 {
+			t.Fatalf("affinity paths = %d, want 1 (collapsed to base domain): %+v", len(paths), paths)
+		}
+		if paths[0].ServerName != "foo.com" {
+			t.Fatalf("affinity ServerName = %q, want foo.com", paths[0].ServerName)
+		}
+	}
+
+	// distinct sites get distinct affinity paths
+	{
+		mc := &RemoteUserNatMultiClient{}
+		mc.config.Store(&multiClientConfig{
+			serverNameLookup: stubServerNameLookup{names: []string{"a.foo.com", "x.bar.com"}},
+		})
+		paths := mc.affinityIpPathsWithLock(ipPath)
+		names := map[string]bool{}
+		for _, p := range paths {
+			names[p.ServerName] = true
+		}
+		if !names["foo.com"] || !names["bar.com"] || len(paths) != 2 {
+			t.Fatalf("affinity paths = %+v, want {foo.com, bar.com}", paths)
+		}
+	}
+
+	// with no lookup, :443 falls back to destination ip/port affinity (no ServerName)
+	{
+		mc := &RemoteUserNatMultiClient{}
+		mc.config.Store(&multiClientConfig{})
+		paths := mc.affinityIpPathsWithLock(ipPath)
+		if len(paths) != 1 || paths[0].ServerName != "" || !paths[0].DestinationIp.Equal(ipPath.DestinationIp) {
+			t.Fatalf("affinity paths = %+v, want one destination-ip path (no lookup)", paths)
+		}
+	}
+}
 
 func TestMultiClientUdp4(t *testing.T) {
 	testClient(t, testingNewMultiClient, udp4Packet, (*IpPath).ToIp4Path)
@@ -30,12 +91,11 @@ func TestMultiClientTcp6(t *testing.T) {
 	testClient(t, testingNewMultiClient, tcp6Packet, (*IpPath).ToIp6Path)
 }
 
-func testingNewMultiClient(ctx context.Context, providerClient *Client, receivePacketCallback ReceivePacketFunction) (UserNatClient, error) {
-
+func testMultiClientGenerator(providerClient *Client) *TestMultiClientGenerator {
 	mutex := sync.Mutex{}
 	unsubs := map[*Client]func(){}
 
-	generator := &TestMultiClientGenerator{
+	return &TestMultiClientGenerator{
 		nextDestinations: func(count int, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error) {
 			next := map[MultiHopId]DestinationStats{}
 			containsTail := func() bool {
@@ -124,6 +184,10 @@ func testingNewMultiClient(ctx context.Context, providerClient *Client, receiveP
 			return client, nil
 		},
 	}
+}
+
+func testingNewMultiClient(ctx context.Context, providerClient *Client, receivePacketCallback ReceivePacketFunction) (UserNatClient, error) {
+	generator := testMultiClientGenerator(providerClient)
 
 	settings := DefaultMultiClientSettings()
 	// TODO the tcp packets must use real seq numbers for this to work

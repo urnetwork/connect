@@ -17,6 +17,7 @@ import (
 	mathrand "math/rand"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -51,15 +52,21 @@ func DefaultTunSettingsWithBufferSize(bufferSize int) *TunSettings {
 		// interface mtu.
 		Mtu: 1440,
 
-		DialRace:        4,
+		DialRace:        2,
 		DialRaceTimeout: 2 * time.Second,
 		DialTimeout:     30 * time.Second,
 
-		// the gvisor udp endpoint buffers default to 32KiB,
-		// which is too small for fast transfer.
-		// gvisor clamps these to at most 4MiB.
-		UdpReceiveBufferByteCount: 4 * 1024 * 1024,
-		UdpSendBufferByteCount:    4 * 1024 * 1024,
+		// the gvisor udp endpoint buffers default to 32KiB, which is too small for fast
+		// transfer; cap at 1MiB (gvisor clamps to at most 4MiB) to bound per-endpoint
+		// memory on the shared stack used by the server/proxy.
+		UdpReceiveBufferByteCount: 1024 * 1024,
+		UdpSendBufferByteCount:    1024 * 1024,
+
+		// tcp buffer auto-tuning ranges for the server/proxy data plane (the shared
+		// stack). Max applies per connection, so it caps per-connection memory; a
+		// memory-constrained IpMux on a private stack shrinks these much further.
+		TcpReceiveBuffer: TcpBufferRange{Min: 4 * 1024, Default: 256 * 1024, Max: 1024 * 1024},
+		TcpSendBuffer:    TcpBufferRange{Min: 4 * 1024, Default: 256 * 1024, Max: 1024 * 1024},
 	}
 }
 
@@ -76,9 +83,29 @@ type TunSettings struct {
 
 	UdpReceiveBufferByteCount int
 	UdpSendBufferByteCount    int
+
+	// TcpReceiveBuffer/TcpSendBuffer are the gVisor TCP buffer auto-tuning ranges. Max
+	// applies per connection, so these dominate per-connection memory; a memory-bound
+	// consumer should lower them. Applied only to a private stack — the shared stack uses
+	// the default-settings values.
+	TcpReceiveBuffer TcpBufferRange
+	TcpSendBuffer    TcpBufferRange
+
+	// PrivateStack, when true, gives this Tun its own isolated gVisor stack instead of
+	// the process-wide shared stack. Used when the Tun terminates connections whose
+	// peer addresses also live on the shared stack (e.g. a test client), so the Tun's
+	// replies are emitted via Read() rather than delivered intra-stack.
+	PrivateStack bool
 }
 
-var tunStack = sync.OnceValue(func() *stack.Stack {
+// TcpBufferRange is a gVisor TCP buffer auto-tuning range in bytes.
+type TcpBufferRange struct {
+	Min     int
+	Default int
+	Max     int
+}
+
+func newTunStack(tcpReceive TcpBufferRange, tcpSend TcpBufferRange) *stack.Stack {
 	opts := stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocolWithOptions(ipv4.Options{AllowExternalLoopbackTraffic: true})},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol4},
@@ -93,22 +120,29 @@ var tunStack = sync.OnceValue(func() *stack.Stack {
 	// above the advertised window.
 	{
 		opt := tcpip.TCPReceiveBufferSizeRangeOption{
-			Min:     4 << 10,
-			Default: 4 << 20,
-			Max:     16 << 20,
+			Min:     tcpReceive.Min,
+			Default: tcpReceive.Default,
+			Max:     tcpReceive.Max,
 		}
 		s.SetTransportProtocolOption(tcp.ProtocolNumber, &opt)
 	}
 	{
 		opt := tcpip.TCPSendBufferSizeRangeOption{
-			Min:     4 << 10,
-			Default: 4 << 20,
-			Max:     16 << 20,
+			Min:     tcpSend.Min,
+			Default: tcpSend.Default,
+			Max:     tcpSend.Max,
 		}
 		s.SetTransportProtocolOption(tcp.ProtocolNumber, &opt)
 	}
 
 	return s
+}
+
+// tunStack is the process-wide shared stack used by all Tuns unless TunSettings
+// requests a private stack. It uses the default-settings buffer ranges.
+var tunStack = sync.OnceValue(func() *stack.Stack {
+	settings := DefaultTunSettings()
+	return newTunStack(settings.TcpReceiveBuffer, settings.TcpSendBuffer)
 })
 
 type NicIdAllocator struct {
@@ -181,10 +215,28 @@ func (self *LocalIpv4AddressAllocator) ReturnAddr(addr netip.Addr) {
 	self.freeList = append(self.freeList, addr)
 }
 
-var defaultLocalIpv4AddressAllocator = NewLocalIpv4AddressAllocator(
-	netip.MustParsePrefix("169.254.0.0/16"),
-	128,
-)
+// defaultLocalIpv4AddressAllocator is created lazily on first use so that merely
+// importing connect does not spin up the generator goroutine (NewAddrGenerator
+// launches one) unless a local address is actually reserved.
+var defaultLocalIpv4AddressAllocator = sync.OnceValue(func() *LocalIpv4AddressAllocator {
+	return NewLocalIpv4AddressAllocator(
+		netip.MustParsePrefix("169.254.0.0/16"),
+		128,
+	)
+})
+
+// TakeLocalIpv4Address reserves a process-unique local IPv4 address from the default
+// 169.254.0.0/16 pool shared by Tun and the SDK tunnel address. Return it with
+// ReturnLocalIpv4Address when the address is no longer in use.
+func TakeLocalIpv4Address() (netip.Addr, bool) {
+	return defaultLocalIpv4AddressAllocator().TakeAddr()
+}
+
+// ReturnLocalIpv4Address returns an address previously taken with
+// TakeLocalIpv4Address to the pool's free list.
+func ReturnLocalIpv4Address(addr netip.Addr) {
+	defaultLocalIpv4AddressAllocator().ReturnAddr(addr)
+}
 
 type Tun struct {
 	ctx    context.Context
@@ -195,13 +247,14 @@ type Tun struct {
 
 	ep                        *channel.Endpoint
 	stack                     *stack.Stack
+	ownsStack                 bool
 	nicId                     tcpip.NICID
 	nicIdAllocator            *NicIdAllocator
 	localAddresses            []netip.Addr
 	localIpv4AddressAllocator *LocalIpv4AddressAllocator
 	// mtu                 int
 	// registeredAddresses map[netip.Addr]bool
-	dohResolver *DohCache
+	dohResolver atomic.Pointer[DohCache]
 
 	stateLock sync.Mutex
 }
@@ -218,7 +271,7 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 	cancelCtx, cancel := context.WithCancel(ctx)
 
 	nicIdAllocator := defaultNicIdAllocator
-	localIpv4AddressAllocator := defaultLocalIpv4AddressAllocator
+	localIpv4AddressAllocator := defaultLocalIpv4AddressAllocator()
 
 	localIpv4Address, ok := localIpv4AddressAllocator.TakeAddr()
 	if !ok {
@@ -227,6 +280,11 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 	}
 
 	nicId := nicIdAllocator.TakeNicId()
+
+	tunStackInstance := tunStack()
+	if settings.PrivateStack {
+		tunStackInstance = newTunStack(settings.TcpReceiveBuffer, settings.TcpSendBuffer)
+	}
 
 	localAddresses := []netip.Addr{
 		localIpv4Address,
@@ -251,25 +309,15 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 		log:                       loggerOrDefault(settings.Log),
 		settings:                  settings,
 		ep:                        ep,
-		stack:                     tunStack(),
+		stack:                     tunStackInstance,
+		ownsStack:                 settings.PrivateStack,
 		nicId:                     nicId,
 		nicIdAllocator:            nicIdAllocator,
 		localAddresses:            localAddresses,
 		localIpv4AddressAllocator: localIpv4AddressAllocator,
 	}
 
-	dohSettings := DefaultDohSettings()
-	dohSettings.ConnectSettings.Log = tun.log
-	dohSettings.RequestTimeout = 60 * time.Second
-	dohSettings.TlsTimeout = 30 * time.Second
-	dohSettings.DialContextSettings = &DialContextSettings{
-		DialContext: tun.DialContext,
-	}
-
-	if dnsResolverSettings != nil {
-		dohSettings.DnsResolverSettings = dnsResolverSettings
-	}
-	tun.dohResolver = NewDohCache(dohSettings)
+	tun.dohResolver.Store(tun.buildDohCache(dnsResolverSettings))
 
 	if tcpipErr := tun.stack.CreateNIC(nicId, ep); tcpipErr != nil {
 		releaseOnError()
@@ -300,7 +348,36 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 }
 
 func (self *Tun) DohCache() *DohCache {
-	return self.dohResolver
+	return self.dohResolver.Load()
+}
+
+// buildDohCache constructs a DohCache resolving through this tun (remote paths dial via
+// the tun; local paths use the host), with the given resolver settings (nil = default).
+func (self *Tun) buildDohCache(dnsResolverSettings *DnsResolverSettings) *DohCache {
+	dohSettings := DefaultDohSettings()
+	dohSettings.ConnectSettings.Log = self.log
+	dohSettings.RequestTimeout = 60 * time.Second
+	dohSettings.TlsTimeout = 30 * time.Second
+	dohSettings.DialContextSettings = &DialContextSettings{
+		DialContext: self.DialContext,
+	}
+	if dnsResolverSettings != nil {
+		dohSettings.DnsResolverSettings = dnsResolverSettings
+	}
+	return NewDohCache(dohSettings)
+}
+
+// SetDnsResolverSettings rebuilds the tun's DohCache with new resolver settings, taking
+// effect for subsequent queries (the prior cache's in-flight queries are unaffected).
+// Safe to call concurrently with DohCache()/Query.
+func (self *Tun) SetDnsResolverSettings(dnsResolverSettings *DnsResolverSettings) {
+	self.dohResolver.Store(self.buildDohCache(dnsResolverSettings))
+}
+
+// LocalAddresses returns the addresses assigned to the internal stack's NIC
+// (reserved from the shared local-address pool). Callers must not mutate it.
+func (self *Tun) LocalAddresses() []netip.Addr {
+	return self.localAddresses
 }
 
 func (self *Tun) Read() ([]byte, error) {
@@ -498,7 +575,7 @@ func (self *Tun) dialContext(ctx context.Context, network string, address string
 	} else {
 		// resolve ips using doh, local
 
-		resolvedAddrs := self.dohResolver.Query(dialCtx, "A", host)
+		resolvedAddrs := self.DohCache().Query(dialCtx, "A", host)
 		if self.log.V(1).Enabled() {
 			self.log.Infof("[tun]query doh (%s) found %v\n", host, resolvedAddrs)
 		}
@@ -566,6 +643,14 @@ func (self *Tun) Close() error {
 		if addr.Is4() {
 			self.localIpv4AddressAllocator.ReturnAddr(addr)
 		}
+	}
+	if self.ownsStack {
+		// destroy the private stack so its endpoints and background goroutines are released
+		// (the shared stack is never closed). Do NOT stack.Wait() here: Close() can run under
+		// the device stateLock during a reconfigure (SetDestination), and Wait() blocks until
+		// every stack goroutine halts — one stuck goroutine would wedge the device, and DNS,
+		// until restart. The stack's goroutines exit asynchronously after Close().
+		self.stack.Close()
 	}
 	return nil
 }

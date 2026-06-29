@@ -29,7 +29,7 @@ In the URnetwork code, the following Go style is used. A few conventions — not
 
 ## Goroutine lifecycle
 
-- Start a type's internal management goroutines in its constructor, so the returned object is already fully running. The lifecycle loop is conventionally `func (self *T) run()` — lowercase, internal, started by the constructor.
+- Start a type's internal management goroutines in its constructor, so the returned object is already fully running. The lifecycle loop is conventionally `func (self *T) run()` — lowercase, internal, started by the constructor. When a type has a single internal lifecycle/maintenance loop (e.g. one goroutine that periodically evicts TTL state), name it `run`; give specific names only when a type has several distinct long-lived loops.
 - Exception: when an external manager must clean up after the lifecycle, expose `func (self *T) Run()` (uppercase) instead. The manager calls `Run()` after construction and tears the object down when `Run()` returns. Casing carries the meaning: lowercase `run()` is internal and self-started; uppercase `Run()` is externally driven.
 - Wait with `time.After` inside the run loop by default; we don't reach for `time.Timer` for the convenience of it.
 - Exception — hot-path timer reuse: in a per-packet (or otherwise hot) loop, where profiling shows the per-iteration `time.After` allocation is a significant share of allocations, reuse a single `time.Timer` instead. Create it with `time.NewTimer(0)` before the loop, `defer timer.Stop()`, and `timer.Reset(d)` immediately before each blocking `select` that reads `timer.C`. This relies on go1.23+ timer semantics, where `Reset` guarantees no stale fire is delivered afterward, so the drain dance is unnecessary and the initial already-fired state is harmless. Reach for this only with a profile that justifies it, not preemptively.
@@ -44,6 +44,11 @@ In the URnetwork code, the following Go style is used. A few conventions — not
 
 - Format with `gofmt`.
 - Inline single-use helper logic as a local closure at its call site (`f := func(...){ ... }; f()`) rather than pulling it out into a separate named function.
+
+## Tests
+
+- Each test is a top-level `func TestXxx(t *testing.T)`. Normal (positive) tests do not use `t.Run` subtests: if cases are logically separate, write separate top-level tests; if they are homogeneous variations of one thing, use a plain table loop (`for _, c := range cases { ... }`) reporting with `t.Errorf`/`t.Fatalf`.
+- `t.Run` is appropriate only when the subtest boundary itself is the point — notably when a test deliberately runs a subtest that is expected to FAIL and asserts that failure. The subtest isolates and captures the failure so the parent can check it.
 
 ## Struct creation
 

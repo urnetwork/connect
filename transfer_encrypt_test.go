@@ -505,42 +505,43 @@ func TestSendAcquireReusesAnyExistingEpoch(t *testing.T) {
 	}
 }
 
-// TestDeliverClientHelloResetsCompletedServerHandshake covers point (b): a new
-// inbound ClientHello at the TLS-server role after the current handshake has
-// completed resets to a fresh handshake (so a peer that re-initiates — e.g. a
-// resumed SendSequence on the client side — is followed), while stale
-// non-ClientHello bytes after completion are dropped without a reset.
-func TestDeliverClientHelloResetsCompletedServerHandshake(t *testing.T) {
+// TestDeliverClientHelloResetsCompletedServerHandshakeClientHelloAfterCompletionResets
+// covers point (b): a new inbound ClientHello at the TLS-server role after the
+// current handshake has completed resets to a fresh handshake (so a peer that
+// re-initiates — e.g. a resumed SendSequence on the client side — is followed).
+func TestDeliverClientHelloResetsCompletedServerHandshakeClientHelloAfterCompletionResets(t *testing.T) {
 	// record type 22 (handshake), handshake message type 1 (ClientHello)
 	clientHello := []byte{22, 3, 3, 0, 100, 1, 0, 0, 96}
 	if !isClientHelloRecord(clientHello) {
 		t.Fatal("test ClientHello bytes should satisfy isClientHelloRecord")
 	}
+
+	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleServer)
+	defer cleanup()
+	e1 := injectTestEpoch(sess, true, nil)
+	sess.deliverHandshake(clientHello)
+	if sess.currentEpoch() == e1 {
+		t.Fatal("expected a new ClientHello to reset the completed server handshake")
+	}
+}
+
+// TestDeliverClientHelloResetsCompletedServerHandshakeStaleNonClientHelloAfterCompletionIsDropped
+// is the counterpart: stale non-ClientHello bytes after completion are dropped
+// without a reset.
+func TestDeliverClientHelloResetsCompletedServerHandshakeStaleNonClientHelloAfterCompletionIsDropped(t *testing.T) {
 	// record type 23 (application_data) — not a ClientHello
 	appData := []byte{23, 3, 3, 0, 100, 0, 0, 0, 0}
 	if isClientHelloRecord(appData) {
 		t.Fatal("test app-data bytes should not satisfy isClientHelloRecord")
 	}
 
-	t.Run("ClientHello after completion resets", func(t *testing.T) {
-		sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleServer)
-		defer cleanup()
-		e1 := injectTestEpoch(sess, true, nil)
-		sess.deliverHandshake(clientHello)
-		if sess.currentEpoch() == e1 {
-			t.Fatal("expected a new ClientHello to reset the completed server handshake")
-		}
-	})
-
-	t.Run("stale non-ClientHello after completion is dropped", func(t *testing.T) {
-		sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleServer)
-		defer cleanup()
-		e1 := injectTestEpoch(sess, true, nil)
-		sess.deliverHandshake(appData)
-		if sess.currentEpoch() != e1 {
-			t.Fatal("expected stale post-completion bytes to be dropped without reset")
-		}
-	})
+	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleServer)
+	defer cleanup()
+	e1 := injectTestEpoch(sess, true, nil)
+	sess.deliverHandshake(appData)
+	if sess.currentEpoch() != e1 {
+		t.Fatal("expected stale post-completion bytes to be dropped without reset")
+	}
 }
 
 // TestReleasedSessionRemovedFromManager verifies a per-peer session's
@@ -620,52 +621,50 @@ func injectEstablishedTestEpoch(sess *peerEncryptionSession) *tlsHandshakeEpoch 
 // follows the peer's ClientHello.
 func TestAcquireForSendRestartPolicy(t *testing.T) {
 	for _, role := range []sequenceTlsRole{sequenceTlsRoleClient, sequenceTlsRoleServer} {
-		t.Run(role.String(), func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			settings := DefaultClientSettings()
-			settings.EncryptionSettings.Encrypt = true
-			settings.EncryptionSettings.TlsTimeout = 2 * time.Second
-			client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
-			defer client.Cancel()
-			km, err := NewClientKeyManager(ctx, client)
-			assert.Equal(t, nil, err)
-			manager := NewEncryptionSessionManager(ctx, client, km, settings.EncryptionSettings)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		settings := DefaultClientSettings()
+		settings.EncryptionSettings.Encrypt = true
+		settings.EncryptionSettings.TlsTimeout = 2 * time.Second
+		client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+		defer client.Cancel()
+		km, err := NewClientKeyManager(ctx, client)
+		assert.Equal(t, nil, err)
+		manager := NewEncryptionSessionManager(ctx, client, km, settings.EncryptionSettings)
 
-			peerId := NewId()
-			s1 := manager.AcquireForSend(peerId, role, false)
-			if s1 == nil || s1.role != role {
-				t.Fatalf("expected a %v-role session", role)
-			}
+		peerId := NewId()
+		s1 := manager.AcquireForSend(peerId, role, false)
+		if s1 == nil || s1.role != role {
+			t.Fatalf("expected a %v-role session", role)
+		}
 
-			// An in-flight handshake is never restarted by a later send.
-			inflight := injectTestEpoch(s1, false, nil)
-			s2 := manager.AcquireForSend(peerId, role, false)
-			if s2 != s1 {
-				t.Fatal("expected the same per-peer/role session")
-			}
-			if s2.currentEpoch() != inflight {
-				t.Fatal("AcquireForSend must not restart an in-flight handshake")
-			}
+		// An in-flight handshake is never restarted by a later send.
+		inflight := injectTestEpoch(s1, false, nil)
+		s2 := manager.AcquireForSend(peerId, role, false)
+		if s2 != s1 {
+			t.Fatalf("%v: expected the same per-peer/role session", role)
+		}
+		if s2.currentEpoch() != inflight {
+			t.Fatalf("%v: AcquireForSend must not restart an in-flight handshake", role)
+		}
 
-			// An established session: the client role restarts (background
-			// rekey) while keeping the established epoch serving; the server
-			// role reuses.
-			established := injectEstablishedTestEpoch(s1)
-			s3 := manager.AcquireForSend(peerId, role, false)
-			if s3 != s1 {
-				t.Fatal("expected the same per-peer/role session")
+		// An established session: the client role restarts (background
+		// rekey) while keeping the established epoch serving; the server
+		// role reuses.
+		established := injectEstablishedTestEpoch(s1)
+		s3 := manager.AcquireForSend(peerId, role, false)
+		if s3 != s1 {
+			t.Fatalf("%v: expected the same per-peer/role session", role)
+		}
+		if role == sequenceTlsRoleClient {
+			if s3.currentEpoch() == established {
+				t.Fatal("client AcquireForSend should start a new in-flight epoch on an established session")
 			}
-			if role == sequenceTlsRoleClient {
-				if s3.currentEpoch() == established {
-					t.Fatal("client AcquireForSend should start a new in-flight epoch on an established session")
-				}
-				if s3.establishedEpoch != established {
-					t.Fatal("the established epoch must keep serving its cipher during the rekey")
-				}
-			} else if s3.currentEpoch() != established {
-				t.Fatal("server AcquireForSend must never restart the handshake")
+			if s3.establishedEpoch != established {
+				t.Fatal("the established epoch must keep serving its cipher during the rekey")
 			}
-		})
+		} else if s3.currentEpoch() != established {
+			t.Fatal("server AcquireForSend must never restart the handshake")
+		}
 	}
 }

@@ -395,9 +395,18 @@ type RemoteUserNatMultiClient struct {
 	localUserNatUnsub func()
 }
 
+// ServerNameLookup resolves a destination IP to the server name(s) previously observed
+// for it — e.g. a DNS upgrade mux that recorded which hostnames resolved to the IP. The
+// multi-client uses it for ServerName-based path affinity, so flows to the same site
+// share a client channel even when the SNI is not visible on the wire (point 4).
+type ServerNameLookup interface {
+	ServerNames(ip string) []string
+}
+
 type multiClientConfig struct {
 	performanceProfile  *PerformanceProfile
 	localSecurityBypass bool
+	serverNameLookup    ServerNameLookup
 }
 
 func NewRemoteUserNatMultiClientWithDefaults(
@@ -457,6 +466,7 @@ func NewRemoteUserNatMultiClient(
 	multiClient.config.Store(&multiClientConfig{
 		performanceProfile:  settings.DefaultPerformanceProfile,
 		localSecurityBypass: false,
+		serverNameLookup:    nil,
 	})
 
 	multiClient.windows[WindowTypeQuality] = newMultiClientWindow(
@@ -534,6 +544,7 @@ func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *
 		self.config.Store(&multiClientConfig{
 			performanceProfile:  performanceProfile,
 			localSecurityBypass: prev.localSecurityBypass,
+			serverNameLookup:    prev.serverNameLookup,
 		})
 	}()
 	for _, window := range self.windows {
@@ -550,6 +561,20 @@ func (self *RemoteUserNatMultiClient) SetLocalSecurityBypass(localSecurityBypass
 	self.config.Store(&multiClientConfig{
 		performanceProfile:  prev.performanceProfile,
 		localSecurityBypass: localSecurityBypass,
+		serverNameLookup:    prev.serverNameLookup,
+	})
+}
+
+// SetServerNameLookup installs (or clears, with nil) the ServerNameLookup used for
+// ServerName-based path affinity. Safe to call at runtime.
+func (self *RemoteUserNatMultiClient) SetServerNameLookup(serverNameLookup ServerNameLookup) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	prev := self.config.Load()
+	self.config.Store(&multiClientConfig{
+		performanceProfile:  prev.performanceProfile,
+		localSecurityBypass: prev.localSecurityBypass,
+		serverNameLookup:    serverNameLookup,
 	})
 }
 
@@ -583,8 +608,10 @@ func (self *RemoteUserNatMultiClient) selectWindowTypes(sendPacket *parsedPacket
 
 // called with stateLock
 func (self *RemoteUserNatMultiClient) affinityIpPathsWithLock(ipPath *IpPath) (affinityPaths []*IpPath) {
+	config := self.config.Load()
+
 	singleIp := false
-	if pp := self.config.Load().performanceProfile; pp != nil {
+	if pp := config.performanceProfile; pp != nil {
 		singleIp = (pp.WindowSize.FixedWindowSize == 1)
 	}
 
@@ -595,39 +622,28 @@ func (self *RemoteUserNatMultiClient) affinityIpPathsWithLock(ipPath *IpPath) (a
 		affinityPaths = append(affinityPaths, singlePath)
 	} else {
 		var serverNames []string
-		// for 5 <= len(payload) {
-		// 	tlsHeader := parseTlsHeader(payload[0:5])
-		// 	if tlsHeader.valid() && 5+int(tlsHeader.contentLength) <= len(payload) {
-		// 		if tlsHeader.contentType == TlsContentTypeHandshake {
-		// 			// handshake
-		// 			handshakeBytes := payload[5 : 5+tlsHeader.contentLength]
-		// 			serverName := UnmarshalClientHelloServerName(handshakeBytes)
-		// 			if serverName != "" {
-		// 				serverNames = append(serverNames, serverName)
-		// 			}
-		// 		}
-		// 	}
-		// }
-
-		// FIXME
-		// if serverName == "" {
-		// 	// attempt to use a reverse lookup of the associated name resolution
-		// }
+		// resolve the destination IP to the server name(s) observed for it (e.g. by a
+		// DNS upgrade mux), giving ServerName path affinity without parsing the SNI off
+		// the wire. affinity is by the base domain — a.foo.com, b.c.foo.com and foo.com
+		// all collapse to foo.com — so a site's flows pin to one client channel.
+		if config.serverNameLookup != nil && ipPath.DestinationIp != nil {
+			serverNames = config.serverNameLookup.ServerNames(ipPath.DestinationIp.String())
+		}
 
 		if 0 < len(serverNames) {
+			seen := map[string]bool{}
 			for _, serverName := range serverNames {
-				rootDomain, err := publicsuffix.EffectiveTLDPlusOne(serverName)
-				if err == nil {
-					rootDomainPath := &IpPath{
-						ServerName: rootDomain,
-					}
-					affinityPaths = append(affinityPaths, rootDomainPath)
-				} else {
-					serverNamePath := &IpPath{
-						ServerName: serverName,
-					}
-					affinityPaths = append(affinityPaths, serverNamePath)
+				affinityName := serverName
+				if rootDomain, err := publicsuffix.EffectiveTLDPlusOne(serverName); err == nil {
+					affinityName = rootDomain
 				}
+				if seen[affinityName] {
+					continue
+				}
+				seen[affinityName] = true
+				affinityPaths = append(affinityPaths, &IpPath{
+					ServerName: affinityName,
+				})
 			}
 		} else if ipPath.DestinationPort == 80 || ipPath.DestinationPort == 53 || ipPath.DestinationPort == 443 {
 			// for these ports, cycle the path per destination ip/port, regardless of protocol

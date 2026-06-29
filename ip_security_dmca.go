@@ -200,6 +200,14 @@ func (self *dmcaFlowState) advance(ipPath *IpPath, payload []byte, settings *Dmc
 		// the encrypted-traffic heuristic from dropping a legitimate encrypted flow
 		return self.setTerminal(dmcaAllow)
 	}
+	if isHttpRequest(b) {
+		// raw plaintext HTTP (a request line) — media/radio streaming relies on it,
+		// including on non-standard ports. Allow definitively (and early, before any
+		// budget/entropy bookkeeping) so a later high-entropy body never trips the
+		// encrypted-traffic heuristic. Checked after the BitTorrent signatures so an
+		// HTTP-tracker GET is still classified as BitTorrent.
+		return self.setTerminal(dmcaAllow)
+	}
 	if payloadLooksEncrypted(b, settings) {
 		self.encryptedPackets += 1
 	} else if settings.MinEncryptedPayload <= len(b) {
@@ -377,6 +385,34 @@ func hasHttpTrackerRequest(b []byte) bool {
 		return false
 	}
 	return bytes.Contains(line, []byte("/announce")) || bytes.Contains(line, []byte("/scrape"))
+}
+
+// HTTP/1.x request methods (RFC 9110) — the leading token of a request line. CONNECT
+// is deliberately excluded: it opens an opaque tunnel that could carry anything.
+var httpRequestMethods = [][]byte{
+	[]byte("GET "), []byte("HEAD "), []byte("POST "), []byte("PUT "),
+	[]byte("DELETE "), []byte("OPTIONS "), []byte("PATCH "), []byte("TRACE "),
+}
+
+// isHttpRequest reports whether b begins with a plaintext HTTP/1.x request line — a
+// method token followed by an "HTTP/1." version on the first line. Used to positively
+// allow raw HTTP (e.g. media/radio streaming) on any port, including non-standard ones.
+func isHttpRequest(b []byte) bool {
+	method := false
+	for _, m := range httpRequestMethods {
+		if bytes.HasPrefix(b, m) {
+			method = true
+			break
+		}
+	}
+	if !method {
+		return false
+	}
+	line := b
+	if i := bytes.IndexByte(b, '\n'); 0 <= i {
+		line = b[:i]
+	}
+	return bytes.Contains(line, []byte(" HTTP/1."))
 }
 
 // BEP 5 DHT (Kademlia KRPC over UDP): bencoded dictionaries. Bencode keys are

@@ -64,7 +64,9 @@ func newControlSyncOobTestClient(ctx context.Context, oob OutOfBandControl) *Cli
 	return NewClient(ctx, NewId(), oob, settings)
 }
 
-func TestControlSyncOob(t *testing.T) {
+// the oob ack fires once after the platform succeeds, retrying through
+// transient failures
+func TestControlSyncOobRetryUntilSuccess(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping testing in short mode")
 	}
@@ -75,173 +77,199 @@ func TestControlSyncOob(t *testing.T) {
 		return frame
 	}
 
-	// the oob ack fires once after the platform succeeds, retrying through
-	// transient failures
-	t.Run("retry until success", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-		oob := &testOobControl{failUntil: 3}
-		client := newControlSyncOobTestClient(ctx, oob)
+	oob := &testOobControl{failUntil: 3}
+	client := newControlSyncOobTestClient(ctx, oob)
 
-		cs := NewControlSyncOob(ctx, client, "m1")
-		cs.retryTimeout = 10 * time.Millisecond
-		defer cs.Close()
+	cs := NewControlSyncOob(ctx, client, "m1")
+	cs.retryTimeout = 10 * time.Millisecond
+	defer cs.Close()
 
-		var ackLock sync.Mutex
-		ackCount := 0
-		ackCh := make(chan error, 1)
-		cs.Send(makeFrame(1), func(err error) {
-			ackLock.Lock()
-			ackCount += 1
-			ackLock.Unlock()
-			select {
-			case ackCh <- err:
-			default:
-			}
-		})
-
-		select {
-		case err := <-ackCh:
-			assert.Equal(t, err, nil)
-		case <-time.After(10 * time.Second):
-			t.Fatal("oob ack did not fire")
-		}
-
-		// 3 failures + 1 success
-		assert.Equal(t, oob.attemptCount(), 4)
-
-		// the ack fires exactly once
-		select {
-		case <-time.After(500 * time.Millisecond):
-		}
+	var ackLock sync.Mutex
+	ackCount := 0
+	ackCh := make(chan error, 1)
+	cs.Send(makeFrame(1), func(err error) {
 		ackLock.Lock()
-		assert.Equal(t, ackCount, 1)
+		ackCount += 1
 		ackLock.Unlock()
-	})
-
-	// immediate success acks without retrying
-	t.Run("immediate success", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		oob := &testOobControl{failUntil: 0}
-		client := newControlSyncOobTestClient(ctx, oob)
-
-		cs := NewControlSyncOob(ctx, client, "m1")
-		cs.retryTimeout = 10 * time.Millisecond
-		defer cs.Close()
-
-		ackCh := make(chan error, 1)
-		cs.Send(makeFrame(1), func(err error) {
-			select {
-			case ackCh <- err:
-			default:
-			}
-		})
-
 		select {
-		case err := <-ackCh:
-			assert.Equal(t, err, nil)
-		case <-time.After(5 * time.Second):
-			t.Fatal("oob ack did not fire")
-		}
-		assert.Equal(t, oob.attemptCount(), 1)
-	})
-
-	// a newer Send for the same scope supersedes an older one still retrying
-	t.Run("latest supersedes", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		// keep failing so neither send completes until allowed
-		oob := &testOobControl{failUntil: 1 << 30}
-		client := newControlSyncOobTestClient(ctx, oob)
-
-		cs := NewControlSyncOob(ctx, client, "m1")
-		cs.retryTimeout = 10 * time.Millisecond
-		defer cs.Close()
-
-		firstAcked := make(chan struct{}, 1)
-		cs.Send(makeFrame(1), func(err error) {
-			select {
-			case firstAcked <- struct{}{}:
-			default:
-			}
-		})
-
-		// let the first send fail a few times
-		select {
-		case <-time.After(100 * time.Millisecond):
-		}
-
-		// supersede with a newer send (still failing), then allow success — so
-		// the first send is superseded while it can never succeed
-		secondAcked := make(chan error, 1)
-		cs.Send(makeFrame(2), func(err error) {
-			select {
-			case secondAcked <- err:
-			default:
-			}
-		})
-		oob.setFailUntil(0)
-
-		select {
-		case err := <-secondAcked:
-			assert.Equal(t, err, nil)
-		case <-time.After(5 * time.Second):
-			t.Fatal("second oob ack did not fire")
-		}
-
-		// the superseded first send must not ack
-		select {
-		case <-firstAcked:
-			t.Fatal("superseded send unexpectedly acked")
-		case <-time.After(200 * time.Millisecond):
-		}
-	})
-
-	// Close stops retrying
-	t.Run("close stops retries", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		oob := &testOobControl{failUntil: 1 << 30} // always fail
-		client := newControlSyncOobTestClient(ctx, oob)
-
-		cs := NewControlSyncOob(ctx, client, "m1")
-		cs.retryTimeout = 10 * time.Millisecond
-
-		acked := make(chan struct{}, 1)
-		cs.Send(makeFrame(1), func(err error) {
-			select {
-			case acked <- struct{}{}:
-			default:
-			}
-		})
-
-		// let it retry a few times
-		select {
-		case <-time.After(100 * time.Millisecond):
-		}
-		attemptsBefore := oob.attemptCount()
-		assert.Equal(t, 0 < attemptsBefore, true)
-
-		cs.Close()
-
-		select {
-		case <-time.After(300 * time.Millisecond):
-		}
-		// retries stop promptly (allow a couple of in-flight attempts at close,
-		// but not the ~30 that would accrue over the wait if it kept retrying)
-		attemptsAfter := oob.attemptCount()
-		assert.Equal(t, attemptsAfter <= attemptsBefore+2, true)
-
-		// it never acked (always failing)
-		select {
-		case <-acked:
-			t.Fatal("send acked despite always failing")
+		case ackCh <- err:
 		default:
 		}
 	})
+
+	select {
+	case err := <-ackCh:
+		assert.Equal(t, err, nil)
+	case <-time.After(10 * time.Second):
+		t.Fatal("oob ack did not fire")
+	}
+
+	// 3 failures + 1 success
+	assert.Equal(t, oob.attemptCount(), 4)
+
+	// the ack fires exactly once
+	select {
+	case <-time.After(500 * time.Millisecond):
+	}
+	ackLock.Lock()
+	assert.Equal(t, ackCount, 1)
+	ackLock.Unlock()
+}
+
+// immediate success acks without retrying
+func TestControlSyncOobImmediateSuccess(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping testing in short mode")
+	}
+
+	makeFrame := func(index uint32) *protocol.Frame {
+		frame, err := ToFrame(&protocol.SimpleMessage{MessageIndex: index}, DefaultProtocolVersion)
+		assert.Equal(t, err, nil)
+		return frame
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	oob := &testOobControl{failUntil: 0}
+	client := newControlSyncOobTestClient(ctx, oob)
+
+	cs := NewControlSyncOob(ctx, client, "m1")
+	cs.retryTimeout = 10 * time.Millisecond
+	defer cs.Close()
+
+	ackCh := make(chan error, 1)
+	cs.Send(makeFrame(1), func(err error) {
+		select {
+		case ackCh <- err:
+		default:
+		}
+	})
+
+	select {
+	case err := <-ackCh:
+		assert.Equal(t, err, nil)
+	case <-time.After(5 * time.Second):
+		t.Fatal("oob ack did not fire")
+	}
+	assert.Equal(t, oob.attemptCount(), 1)
+}
+
+// a newer Send for the same scope supersedes an older one still retrying
+func TestControlSyncOobLatestSupersedes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping testing in short mode")
+	}
+
+	makeFrame := func(index uint32) *protocol.Frame {
+		frame, err := ToFrame(&protocol.SimpleMessage{MessageIndex: index}, DefaultProtocolVersion)
+		assert.Equal(t, err, nil)
+		return frame
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// keep failing so neither send completes until allowed
+	oob := &testOobControl{failUntil: 1 << 30}
+	client := newControlSyncOobTestClient(ctx, oob)
+
+	cs := NewControlSyncOob(ctx, client, "m1")
+	cs.retryTimeout = 10 * time.Millisecond
+	defer cs.Close()
+
+	firstAcked := make(chan struct{}, 1)
+	cs.Send(makeFrame(1), func(err error) {
+		select {
+		case firstAcked <- struct{}{}:
+		default:
+		}
+	})
+
+	// let the first send fail a few times
+	select {
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// supersede with a newer send (still failing), then allow success — so
+	// the first send is superseded while it can never succeed
+	secondAcked := make(chan error, 1)
+	cs.Send(makeFrame(2), func(err error) {
+		select {
+		case secondAcked <- err:
+		default:
+		}
+	})
+	oob.setFailUntil(0)
+
+	select {
+	case err := <-secondAcked:
+		assert.Equal(t, err, nil)
+	case <-time.After(5 * time.Second):
+		t.Fatal("second oob ack did not fire")
+	}
+
+	// the superseded first send must not ack
+	select {
+	case <-firstAcked:
+		t.Fatal("superseded send unexpectedly acked")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// Close stops retrying
+func TestControlSyncOobCloseStopsRetries(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping testing in short mode")
+	}
+
+	makeFrame := func(index uint32) *protocol.Frame {
+		frame, err := ToFrame(&protocol.SimpleMessage{MessageIndex: index}, DefaultProtocolVersion)
+		assert.Equal(t, err, nil)
+		return frame
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	oob := &testOobControl{failUntil: 1 << 30} // always fail
+	client := newControlSyncOobTestClient(ctx, oob)
+
+	cs := NewControlSyncOob(ctx, client, "m1")
+	cs.retryTimeout = 10 * time.Millisecond
+
+	acked := make(chan struct{}, 1)
+	cs.Send(makeFrame(1), func(err error) {
+		select {
+		case acked <- struct{}{}:
+		default:
+		}
+	})
+
+	// let it retry a few times
+	select {
+	case <-time.After(100 * time.Millisecond):
+	}
+	attemptsBefore := oob.attemptCount()
+	assert.Equal(t, 0 < attemptsBefore, true)
+
+	cs.Close()
+
+	select {
+	case <-time.After(300 * time.Millisecond):
+	}
+	// retries stop promptly (allow a couple of in-flight attempts at close,
+	// but not the ~30 that would accrue over the wait if it kept retrying)
+	attemptsAfter := oob.attemptCount()
+	assert.Equal(t, attemptsAfter <= attemptsBefore+2, true)
+
+	// it never acked (always failing)
+	select {
+	case <-acked:
+		t.Fatal("send acked despite always failing")
+	default:
+	}
 }
