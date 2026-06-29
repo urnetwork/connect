@@ -1,16 +1,12 @@
 package connect
 
-// UpgradeMux is the concrete IpMux that intercepts and (optionally) upgrades local
-// DNS (UDP/53) and HTTP (TCP/80) egress. It wraps the remote UserNat (the exit
-// path) and is held by the SDK device.
-//
-// In this step it is a PASS-THROUGH: onSend claims nothing, so all traffic flows to
-// the upstream unchanged and behavior is identical to having no mux. Step 3 adds DNS
-// interception/upgrade and the IP→hostname reverse lookup; step 4 adds HTTP.
+// UpgradeMux is the concrete IpMux that intercepts local DNS (UDP/53) — resolving it over DoH
+// that egresses the tunnel and recording the IP→hostname reverse index for ServerName path
+// affinity — and applies the HTTP (TCP/80) policy: pass through to the egress, or drop. It
+// wraps the remote UserNat (the exit path) and is held by the SDK device.
 
 import (
 	"context"
-	"crypto/tls"
 	"net"
 	"net/netip"
 	"strings"
@@ -23,60 +19,27 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
-// HttpUpgradeMode selects how intercepted plaintext HTTP (TCP/80) is handled. HTTP
-// always egresses remotely (there is no local-egress option). String-valued so it is
-// readable in configs and logs; an empty/unrecognized value is treated as Unencrypted
-// (pass-through).
+// HttpUpgradeMode selects how intercepted plaintext HTTP (TCP/80) is handled: passed through to
+// the egress unchanged, or dropped. String-valued so it is readable in configs and logs; an
+// empty/unrecognized value is treated as Unencrypted (pass-through).
 type HttpUpgradeMode string
 
 const (
-	// HttpUpgradeUnencrypted egresses the HTTP request unencrypted, remotely.
+	// HttpUpgradeUnencrypted passes the HTTP request through to the egress unchanged.
 	HttpUpgradeUnencrypted HttpUpgradeMode = "unencrypted"
-	// HttpUpgradeHttps converts the request to HTTPS (modern tls.Config) and egresses remotely.
-	HttpUpgradeHttps HttpUpgradeMode = "https"
-	// HttpUpgradeHttpsFallback tries HTTPS and, on TLS-handshake failure, falls back to unencrypted HTTP.
-	HttpUpgradeHttpsFallback HttpUpgradeMode = "https_fallback"
 	// HttpUpgradeBlock drops the request.
 	HttpUpgradeBlock HttpUpgradeMode = "block"
 )
 
-// HttpUpgradeSettings configures HTTP handling. The detailed shape is finalized in
-// step 4; the Mode is the agreed behavior selector.
+// HttpUpgradeSettings configures HTTP handling.
 type HttpUpgradeSettings struct {
+	// Mode is HttpUpgradeUnencrypted (pass plaintext HTTP/80 through to the egress) or
+	// HttpUpgradeBlock (drop it). Empty is treated as Unencrypted.
 	Mode HttpUpgradeMode
-	// HttpsPort is the port the HTTPS upgrade connects to (default 443; configurable for
-	// non-standard HTTPS ports and for tests). 0 falls back to 443.
-	HttpsPort int
-	// TlsConfig, if set, is the base TLS config for the HTTPS upgrade (cert pinning in
-	// production; trusting a local server's cert in tests). ServerName is set per
-	// request. Not serialized.
-	TlsConfig *tls.Config
-	// UpgradeTimeout bounds the HTTPS dial + TLS handshake. On expiry the request falls
-	// back to plaintext (HttpsFallback) or errors (Https), so a closed/filtered/stalled
-	// :443 cannot hang the request (the mux ctx itself has no deadline). 0 means no bound.
-	UpgradeTimeout time.Duration
-	// UpgradeFailureHoldOff: after an HTTPS upgrade fails for a server name in
-	// HttpsFallback mode, skip the upgrade for that name for this long and go straight to
-	// plaintext — so a server without HTTPS on the original IP is not re-probed (and
-	// re-stalled) on every request. It also serves as the TTL of the failure record: an
-	// active maintenance goroutine clears records older than this. 0 disables the hold-off
-	// (every request retries HTTPS).
-	UpgradeFailureHoldOff time.Duration
-	// NatIdleTimeout bounds how long an HTTP-upgrade NAT record (client flow → original
-	// destination) is retained without traffic. The record is normally deleted when the
-	// terminated connection closes; this TTL is the backstop that frees records for flows
-	// that are DNAT'd but never establish (abandoned/half-open handshakes). 0 disables it.
-	NatIdleTimeout time.Duration
 }
 
 func DefaultHttpUpgradeSettings() *HttpUpgradeSettings {
-	return &HttpUpgradeSettings{
-		Mode:                  HttpUpgradeUnencrypted,
-		HttpsPort:             443,
-		UpgradeTimeout:        5 * time.Second,
-		UpgradeFailureHoldOff: 5 * time.Minute,
-		NatIdleTimeout:        5 * time.Minute,
-	}
+	return &HttpUpgradeSettings{Mode: HttpUpgradeUnencrypted}
 }
 
 // DnsUpgradeSettings configures how the mux intercepts and resolves DNS (UDP/53),
@@ -108,10 +71,7 @@ type UpgradeMuxSettings struct {
 // DefaultUpgradeMuxSettings is the app/device default: DNS (UDP/53) is intercepted and
 // resolved over DoH that egresses the tunnel — DoH only, with no plaintext or off-tunnel
 // fallback, so a DoH failure fails the query rather than leaking DNS — and plaintext HTTP
-// (TCP/80) is passed through to the egress unchanged. HTTP upgrade terminates the client
-// connection and re-originates it from the mux, which changes the egress identity the origin
-// sees and breaks IP-bound services (e.g. Pandora audio), so passthrough is the default and
-// intended behavior; the HttpUpgrade* modes are slated for removal.
+// (TCP/80) is passed through to the egress unchanged.
 //
 // For pure pass-through to the egress (the server/proxy use case — no DNS interception,
 // no HTTP upgrade), do not install a mux at all: pass nil settings, which avoids a
@@ -132,17 +92,7 @@ func DefaultUpgradeMuxSettings() *UpgradeMuxSettings {
 			ResponseTtl:    60,
 			ReverseTtl:     5 * time.Minute,
 		},
-		Http: &HttpUpgradeSettings{
-			// pass plaintext HTTP through to the egress unchanged. the HttpUpgrade* modes
-			// terminate and re-originate the connection from the mux, changing the egress
-			// identity and breaking IP-bound services (Pandora) — slated for removal. the fields
-			// below apply only if Mode is set to an upgrade mode.
-			Mode:                  HttpUpgradeUnencrypted,
-			HttpsPort:             443,
-			UpgradeTimeout:        5 * time.Second,
-			UpgradeFailureHoldOff: 5 * time.Minute,
-			NatIdleTimeout:        5 * time.Minute,
-		},
+		Http: &HttpUpgradeSettings{Mode: HttpUpgradeUnencrypted},
 	}
 }
 
@@ -153,7 +103,7 @@ type UpgradeMux struct {
 	mux      *IpMux
 	settings atomic.Pointer[UpgradeMuxSettings]
 
-	// source/provideMode stamp packets the mux injects downstream (un-NAT'd HTTP replies).
+	// source/provideMode stamp packets the mux injects downstream (DNS replies).
 	source      TransferPath
 	provideMode protocol.ProvideMode
 
@@ -161,25 +111,6 @@ type UpgradeMux struct {
 	// multi-client's ServerName path affinity (point 4).
 	reverseLock sync.Mutex
 	reverse     map[netip.Addr]reverseEntry
-
-	// HTTP upgrade (TCP/80) state. muxAddr is the internal stack's address: claimed
-	// TCP/80 is DNAT'd to it for local termination, and it discriminates the stack's
-	// client-bound replies (src muxAddr:80) from its own upstream connections in the
-	// pump. httpNat maps a client (ip,port) to the original destination for un-NAT.
-	muxAddr     netip.Addr
-	httpOnce    sync.Once
-	httpNatLock sync.Mutex
-	httpNat     map[httpNatKey]httpNatEntry
-
-	// httpsUpgradeFail records, per server name, the last time an HTTPS upgrade failed. In
-	// HttpsFallback mode a recently-failed name skips the upgrade and goes straight to
-	// plaintext (see HttpUpgradeSettings.UpgradeFailureHoldOff).
-	httpsUpgradeFailLock sync.Mutex
-	httpsUpgradeFail     map[string]time.Time
-
-	// dialUpstream originates the mux's own connections (the HTTPS upgrade) through the
-	// internal tun (→ pump → exit). Overridable in tests to reach a local server.
-	dialUpstream func(ctx context.Context, network string, address string) (net.Conn, error)
 }
 
 // dnsResolverSettings extracts the resolver config from the mux settings (nil = no DNS
@@ -203,15 +134,12 @@ func NewUpgradeMux(
 	cancelCtx, cancel := context.WithCancel(ctx)
 	tunSettings := DefaultTunSettings()
 	tunSettings.Log = log
-	// the mux terminates client connections on its stack; an isolated stack ensures its
-	// replies are emitted via the tun (pump → un-NAT → downstream) rather than delivered
-	// intra-stack to a peer that happens to share the process-wide stack
+	// the mux's DoH connections run on an isolated stack so their packets are emitted via the
+	// tun (pump → exit) rather than delivered intra-stack to a peer sharing the process-wide stack
 	tunSettings.PrivateStack = true
-	// the mux's connections (DoH, HTTP upgrade) run on a private stack inside a
-	// memory-constrained host (notably the iOS network extension). Keep the gVisor
-	// TCP/UDP buffers small (16KB) — Max applies per connection, so a large data-plane
-	// buffer would blow the extension's memory limit under upgrade load. DoH responses and
-	// the HTTP-upgrade request/response fit comfortably in 16KB.
+	// the DoH connections run inside a memory-constrained host (notably the iOS network
+	// extension). Keep the gVisor TCP/UDP buffers small (16KB) — Max applies per connection,
+	// and DoH responses fit comfortably in 16KB.
 	tunSettings.TcpReceiveBuffer = TcpBufferRange{Min: 4 * 1024, Default: 16 * 1024, Max: 16 * 1024}
 	tunSettings.TcpSendBuffer = TcpBufferRange{Min: 4 * 1024, Default: 16 * 1024, Max: 16 * 1024}
 	tunSettings.UdpReceiveBufferByteCount = 16 * 1024
@@ -221,25 +149,16 @@ func NewUpgradeMux(
 		cancel()
 		return nil, err
 	}
-	muxAddr := netip.Addr{}
-	if addrs := tun.LocalAddresses(); 0 < len(addrs) {
-		muxAddr = addrs[0]
-	}
 	self := &UpgradeMux{
-		ctx:              cancelCtx,
-		cancel:           cancel,
-		source:           source,
-		provideMode:      provideMode,
-		reverse:          map[netip.Addr]reverseEntry{},
-		muxAddr:          muxAddr,
-		httpNat:          map[httpNatKey]httpNatEntry{},
-		httpsUpgradeFail: map[string]time.Time{},
+		ctx:         cancelCtx,
+		cancel:      cancel,
+		source:      source,
+		provideMode: provideMode,
+		reverse:     map[netip.Addr]reverseEntry{},
 	}
 	self.settings.Store(settings)
-	self.mux = NewIpMux(cancelCtx, tun, source, provideMode, sendTimeout, self.onSend, self.onPump, initialReceiver, log)
-	self.dialUpstream = self.mux.Tun().DialContext
-	// active maintenance: TTL-evict the mux's accumulating state (upgrade-failure records,
-	// the HTTP-upgrade NAT table, and the IP→hostname affinity map)
+	self.mux = NewIpMux(cancelCtx, tun, source, provideMode, sendTimeout, self.onSend, nil, initialReceiver, log)
+	// active maintenance: TTL-evict the IP→hostname affinity map so it doesn't grow unbounded
 	go HandleError(self.run)
 	return self, nil
 }
@@ -250,87 +169,98 @@ func NewUpgradeMux(
 // header the peek can't classify, e.g. IPv6 extension headers) needs the allocating full
 // parse. This keeps the pass-through bulk off the parse/allocation path entirely.
 func (self *UpgradeMux) onSend(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool {
-	if claim, decided := peekClaim(packet); decided && !claim {
-		return false
+	switch peekClaim(packet) {
+	case peekOther:
+		return false // not a claimable flow — pass through without parsing
+	case peekHttp:
+		// block drops claimed plaintext HTTP; otherwise it passes through unchanged. neither
+		// needs the full parse, so the pass-through :80 bulk stays off the allocating parse path.
+		return self.httpBlocked()
 	}
+	// peekDns or peekUndecided — classify with the authoritative full parse
 	ipPath, payload, err := ParseIpPathWithPayload(packet)
 	if err != nil {
 		return false
 	}
 	switch {
 	case IpProtocolUdp == ipPath.Protocol && 53 == ipPath.DestinationPort:
-		if dns := self.settings.Load().Dns; dns == nil || dns.Resolver == nil {
-			// DNS interception disabled; pass through to the egress
-			return false
+		if dns := self.settings.Load().Dns; dns != nil && dns.Resolver != nil {
+			return self.handleDns(source, provideMode, ipPath, payload)
 		}
-		return self.handleDns(source, provideMode, ipPath, payload)
+		return false // DNS interception disabled — pass through to the egress
 	case IpProtocolTcp == ipPath.Protocol && 80 == ipPath.DestinationPort:
-		return self.handleHttp(source, provideMode, ipPath, packet)
+		return self.httpBlocked() // reached via peekUndecided (e.g. IPv6 extension headers)
 	}
 	return false
 }
 
-// peekClaim reports whether a packet targets a flow the mux claims (UDP/53 or TCP/80), read
-// from the fixed IP/L4 header offsets without allocating (ParseIpPathWithPayload allocates
-// the IpPath and an address backing per call). decided is false when the packet can't be
-// classified cheaply — IPv6 with extension headers, or a short/unsupported header — and the
-// caller must fall back to the full parse.
-func peekClaim(packet []byte) (claim bool, decided bool) {
+// httpBlocked reports whether claimed plaintext HTTP (TCP/80) should be dropped (block mode);
+// otherwise it passes through to the egress unchanged.
+func (self *UpgradeMux) httpBlocked() bool {
+	s := self.settings.Load()
+	return s.Http != nil && HttpUpgradeBlock == s.Http.Mode
+}
+
+// peekResult classifies a send packet by the flow the mux may claim, so the common pass-through
+// bulk (peekOther) and pass-through TCP/80 (peekHttp, not blocking) are decided without the
+// allocating full parse. Only DNS and unclassifiable packets parse.
+type peekResult int
+
+const (
+	peekOther     peekResult = iota // not a claimable flow → pass through
+	peekDns                         // UDP/53 (DNS)
+	peekHttp                        // TCP/80 (HTTP)
+	peekUndecided                   // header can't be classified cheaply → full parse
+)
+
+// peekClaim classifies a packet from the fixed IP/L4 header offsets without allocating
+// (ParseIpPathWithPayload allocates the IpPath and an address backing per call). peekUndecided
+// means the header can't be classified cheaply — IPv6 with extension headers, or a
+// short/unsupported header — and the caller must fall back to the full parse.
+func peekClaim(packet []byte) peekResult {
 	if len(packet) < 20 {
-		return false, false
+		return peekUndecided
 	}
 	switch packet[0] >> 4 {
 	case 4:
 		ihl := int(packet[0]&0x0f) * 4
 		if ihl < 20 || len(packet) < ihl+4 {
-			return false, false
+			return peekUndecided
 		}
 		switch packet[9] { // protocol
 		case 6: // tcp
-			dstPort := int(packet[ihl+2])<<8 | int(packet[ihl+3])
-			return 80 == dstPort, true
+			if 80 == int(packet[ihl+2])<<8|int(packet[ihl+3]) {
+				return peekHttp
+			}
+			return peekOther
 		case 17: // udp
-			dstPort := int(packet[ihl+2])<<8 | int(packet[ihl+3])
-			return 53 == dstPort, true
+			if 53 == int(packet[ihl+2])<<8|int(packet[ihl+3]) {
+				return peekDns
+			}
+			return peekOther
 		default:
-			return false, true // not tcp/udp: never claimed
+			return peekOther // not tcp/udp: never claimed
 		}
 	case 6:
 		if len(packet) < 44 {
-			return false, false
+			return peekUndecided
 		}
 		switch packet[6] { // next header
 		case 6: // tcp
-			dstPort := int(packet[42])<<8 | int(packet[43])
-			return 80 == dstPort, true
+			if 80 == int(packet[42])<<8|int(packet[43]) {
+				return peekHttp
+			}
+			return peekOther
 		case 17: // udp
-			dstPort := int(packet[42])<<8 | int(packet[43])
-			return 53 == dstPort, true
+			if 53 == int(packet[42])<<8|int(packet[43]) {
+				return peekDns
+			}
+			return peekOther
 		default:
-			return false, false // extension header / other: needs the full parse
+			return peekUndecided // extension header / other: needs the full parse
 		}
 	default:
-		return false, false
-	}
-}
-
-// handleHttp applies the HTTP upgrade policy to a TCP/80 packet:
-//   - Unencrypted: pass through to the upstream (plaintext egress, unchanged)
-//   - Block:       claim and drop
-//   - Https / HttpsFallback: DNAT onto the internal stack and terminate, re-issuing
-//     the request as HTTPS (see handleHttpUpgrade)
-func (self *UpgradeMux) handleHttp(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) bool {
-	mode := HttpUpgradeUnencrypted
-	if settings := self.settings.Load(); settings.Http != nil {
-		mode = settings.Http.Mode
-	}
-	switch mode {
-	case HttpUpgradeBlock:
-		return true
-	case HttpUpgradeHttps, HttpUpgradeHttpsFallback:
-		return self.handleHttpUpgrade(source, provideMode, ipPath, packet)
-	default:
-		return false
+		return peekUndecided
 	}
 }
 
@@ -548,6 +478,25 @@ func (self *UpgradeMux) evictReverse(ttl time.Duration) {
 				delete(self.reverse, addr)
 			}
 		}
+	}
+}
+
+// run is the mux's lifecycle loop: it TTL-evicts the IP→hostname affinity map so it doesn't grow
+// unbounded with every resolved IP. It ticks on the reverse TTL (a default cadence when disabled)
+// and runs until the mux ctx is done.
+func (self *UpgradeMux) run() {
+	for {
+		ttl := self.reverseTtl()
+		interval := ttl
+		if interval <= 0 {
+			interval = 5 * time.Minute
+		}
+		select {
+		case <-self.ctx.Done():
+			return
+		case <-time.After(interval):
+		}
+		self.evictReverse(ttl)
 	}
 }
 
