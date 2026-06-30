@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
+	"golang.org/x/net/dns/dnsmessage"
 )
 
 // TestUpgradeMuxPassthrough verifies that traffic the mux does not claim flows through
@@ -75,9 +76,8 @@ func newDnsClientHarness(t *testing.T, ctx context.Context, dns *DnsResolverSett
 
 	settings := DefaultUpgradeMuxSettings()
 	settings.Dns.Resolver = dns
-	// short resolve budget so failure tests (which now retry within the budget, and which the
-	// OS resolver then re-queries several times) stay fast; success resolves on attempt 1
-	settings.Dns.ResolveTimeout = 200 * time.Millisecond
+	// these harness tests exercise the tunnel-DoH path only; disable the local fallback
+	settings.Dns.Fallback = nil
 
 	writeToClient := func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
 		clientTun.Write(packet)
@@ -179,14 +179,12 @@ func TestUpgradeMuxDnsDoh(t *testing.T) {
 	}
 }
 
-// TestUpgradeMuxDnsServfail: a resolution failure (the resolver errors rather than returning
-// an authoritative no-record answer) is surfaced to the client as SERVFAIL — a temporary error
-// the client retries — not NOERROR with no answers, which a client treats as an authoritative
-// "no address" and gives up on (caching the negative).
-func TestUpgradeMuxDnsServfail(t *testing.T) {
-	const queryName = "fail.example.test"
-
-	// a DoH server that always fails: empty (no records) but not an authoritative no-record
+// TestUpgradeMuxDnsNoReplyOnFailure: on a DoH resolution failure (the resolver errors, not an
+// authoritative no-record answer) the mux sends NO downstream response at all — the client's
+// query then times out and is retried, rather than getting a SERVFAIL or empty answer that a
+// browser surfaces as "can't resolve address".
+func TestUpgradeMuxDnsNoReplyOnFailure(t *testing.T) {
+	// a DoH server that always fails: empty (no records) and not an authoritative no-record
 	dohServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
@@ -195,23 +193,142 @@ func TestUpgradeMuxDnsServfail(t *testing.T) {
 	pool := x509.NewCertPool()
 	pool.AddCert(dohServer.Certificate())
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	h := newDnsClientHarness(t, ctx, &DnsResolverSettings{
+	rec := &ipMuxRecorder{}
+	settings := DefaultUpgradeMuxSettings()
+	settings.Dns.Resolver = &DnsResolverSettings{
 		EnableLocalDoh:   true,
 		LocalDohUrlsIpv4: []string{dohServer.URL},
 		TlsConfig:        &tls.Config{RootCAs: pool},
-	})
-	defer h.close()
-
-	_, err := h.resolver().LookupHost(ctx, queryName)
-	if err == nil {
-		t.Fatal("want an error when the resolver fails")
 	}
-	// the failure must not look authoritative — otherwise the client gives up instead of retrying
-	if dnsErr, ok := err.(*net.DNSError); ok && dnsErr.IsNotFound {
-		t.Fatalf("resolver failure surfaced as authoritative not-found (%v); client would give up", err)
+	// isolate the no-reply-on-failure behavior: no local fallback to answer
+	settings.Dns.Fallback = nil
+	settings.Dns.ResolveTimeout = 200 * time.Millisecond
+	mux, err := NewUpgradeMux(ctx, TransferPath{}, protocol.ProvideMode_Network, 0, rec.receive, settings, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mux.Close()
+	mux.SetUpstream(rec.upstream)
+
+	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacket(t, "fail.example.test."), 0) {
+		t.Fatal("SendPacket returned false; the DNS query was not claimed")
+	}
+
+	// let the resolve budget (200ms) be exhausted, then confirm nothing was sent back downstream
+	time.Sleep(1 * time.Second)
+	if _, received := rec.counts(); received != 0 {
+		t.Fatalf("mux sent %d downstream replies on a resolution failure; want 0 (no response)", received)
+	}
+}
+
+// dnsQueryPacket crafts the IPv4/UDP DNS A-query packet for an FQDN (name must end in ".") as the
+// mux sees it on the send path (destined for :53).
+func dnsQueryPacket(t *testing.T, name string) []byte {
+	t.Helper()
+	qb := dnsmessage.NewBuilder(nil, dnsmessage.Header{ID: 0x1234, RecursionDesired: true})
+	if err := qb.StartQuestions(); err != nil {
+		t.Fatal(err)
+	}
+	if err := qb.Question(dnsmessage.Question{
+		Name:  dnsmessage.MustNewName(name),
+		Type:  dnsmessage.TypeA,
+		Class: dnsmessage.ClassINET,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	queryPayload, err := qb.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ipOosPacket(&IpPath{
+		Version:         4,
+		Protocol:        IpProtocolUdp,
+		SourceIp:        net.ParseIP("169.254.9.9"),
+		SourcePort:      33333,
+		DestinationIp:   net.ParseIP("10.0.0.1"),
+		DestinationPort: 53,
+	}, queryPayload)
+}
+
+// TestUpgradeMuxDnsLocalFallback: when the tunnel-DoH can't resolve, a query is raced — after the
+// LocalFallbackTimeout handicap — against the local-egress fallback resolver, which answers so the
+// client (and the OS) gets a timely response rather than DNS hanging while the tunnel comes up.
+func TestUpgradeMuxDnsLocalFallback(t *testing.T) {
+	// the tunnel-DoH always fails (503)
+	tunnelServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer tunnelServer.Close()
+	tunnelPool := x509.NewCertPool()
+	tunnelPool.AddCert(tunnelServer.Certificate())
+
+	// the local fallback resolves to a fixed IP
+	fallbackServer, fallbackResolver := newDohJsonServer(t, "203.0.113.77")
+	defer fallbackServer.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rec := &ipMuxRecorder{}
+	settings := DefaultUpgradeMuxSettings()
+	settings.Dns.Resolver = &DnsResolverSettings{
+		EnableLocalDoh:   true,
+		LocalDohUrlsIpv4: []string{tunnelServer.URL},
+		TlsConfig:        &tls.Config{RootCAs: tunnelPool},
+	}
+	settings.Dns.Fallback = fallbackResolver
+	settings.Dns.LocalFallbackTimeout = 200 * time.Millisecond
+	mux, err := NewUpgradeMux(ctx, TransferPath{}, protocol.ProvideMode_Network, 0, rec.receive, settings, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mux.Close()
+	mux.SetUpstream(rec.upstream)
+
+	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacket(t, "fallback.example.test."), 0) {
+		t.Fatal("SendPacket returned false; the DNS query was not claimed")
+	}
+
+	// the tunnel-DoH fails, so the handicapped fallback should answer shortly after its 200ms delay
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, received := rec.counts(); 0 < received {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("no fallback reply; the local fallback must answer when the tunnel-DoH fails")
+}
+
+// TestUpgradeMuxResolveTimeoutReDerived: ResolveTimeout is the single DNS timeout — the tun's DoH
+// request timeout is derived from it at creation and re-derived on SetSettings, so a runtime
+// settings change fully propagates.
+func TestUpgradeMuxResolveTimeoutReDerived(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rec := &ipMuxRecorder{}
+	settings := DefaultUpgradeMuxSettings()
+	settings.Dns.ResolveTimeout = 12 * time.Second
+	mux, err := NewUpgradeMux(ctx, TransferPath{}, protocol.ProvideMode_Network, 0, rec.receive, settings, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mux.Close()
+
+	if got := mux.mux.Tun().DohCache().settings.RequestTimeout; got != 12*time.Second {
+		t.Fatalf("initial DoH request timeout = %v, want 12s (derived from ResolveTimeout)", got)
+	}
+
+	next := DefaultUpgradeMuxSettings()
+	next.Dns.ResolveTimeout = 27 * time.Second
+	mux.SetSettings(next)
+
+	if got := mux.mux.Tun().DohCache().settings.RequestTimeout; got != 27*time.Second {
+		t.Fatalf("after SetSettings, DoH request timeout = %v, want 27s (re-derived from ResolveTimeout)", got)
 	}
 }
 

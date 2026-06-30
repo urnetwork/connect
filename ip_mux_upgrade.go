@@ -48,9 +48,11 @@ type DnsUpgradeSettings struct {
 	// Resolver is how intercepted queries are resolved (DoH etc.). nil disables DNS
 	// interception entirely (queries pass through to the egress).
 	Resolver *DnsResolverSettings
-	// ResolveTimeout bounds a single intercepted query's resolution; 0 means no bound
-	// (rely on the resolver's own timeout). A slow query should reply (empty) quickly,
-	// since clients retry fast and — under matchDomains — all DNS funnels through here.
+	// ResolveTimeout is the single timeout for resolving an intercepted query: it bounds the
+	// tunnel-DoH retry loop (the per-query context) and the underlying DoH request alike — the
+	// tun's DoH request timeout is derived from it, so they don't diverge. Sized to cover a slow
+	// first connect + TLS handshake while a tunnel is still establishing. 0 means no bound (rely
+	// on the resolver's own timeout).
 	ResolveTimeout time.Duration
 	// ResponseTtl is the TTL (seconds) set on synthesized DNS replies.
 	ResponseTtl uint32
@@ -59,6 +61,17 @@ type DnsUpgradeSettings struct {
 	// looked up; an active maintenance goroutine evicts records idle longer than this so the
 	// reverse map does not grow unbounded with every resolved IP. 0 disables eviction.
 	ReverseTtl time.Duration
+	// LocalFallbackTimeout handicaps the local fallback: if the tunnel-DoH (Resolver, egressing
+	// the tunnel) hasn't answered a query within this delay, the query is also raced against
+	// Fallback (a DoH resolver over the LOCAL host egress). The delay is the handicap — the tunnel
+	// result is preferred whenever it arrives first, so the fallback only wins while the tunnel is
+	// still establishing. 0 (or a nil Fallback) disables the fallback.
+	LocalFallbackTimeout time.Duration
+	// Fallback resolves over the local host egress (not the tunnel), used as the handicapped
+	// fallback above so DNS stays responsive while the tunnel-DoH is still coming up — preventing
+	// the OS from tearing down an apparently-unresponsive tunnel, at the cost of a brief DNS leak
+	// during startup. nil disables the fallback.
+	Fallback *DnsResolverSettings
 }
 
 // UpgradeMuxSettings holds the DNS and HTTP upgrade policies. Each consumer (apps,
@@ -68,10 +81,13 @@ type UpgradeMuxSettings struct {
 	Http *HttpUpgradeSettings
 }
 
-// DefaultUpgradeMuxSettings is the app/device default: DNS (UDP/53) is intercepted and
-// resolved over DoH that egresses the tunnel — DoH only, with no plaintext or off-tunnel
-// fallback, so a DoH failure fails the query rather than leaking DNS — and plaintext HTTP
-// (TCP/80) is passed through to the egress unchanged.
+// DefaultUpgradeMuxSettings is the app/device default: DNS (UDP/53) is intercepted and resolved
+// over DoH that egresses the tunnel, and plaintext HTTP (TCP/80) is passed through to the egress
+// unchanged. While the tunnel-DoH is still establishing on a fresh connect (its connect and TLS
+// budgets are tens of seconds), a query the tunnel can't answer within LocalFallbackTimeout is
+// raced against a handicapped DoH resolver over the LOCAL host egress (Fallback), so DNS stays
+// responsive and the OS doesn't tear the tunnel down — at the cost of a brief DNS leak during
+// startup. The tunnel result is always preferred when it arrives first.
 //
 // For pure pass-through to the egress (the server/proxy use case — no DNS interception,
 // no HTTP upgrade), do not install a mux at all: pass nil settings, which avoids a
@@ -88,9 +104,21 @@ func DefaultUpgradeMuxSettings() *UpgradeMuxSettings {
 				RemoteDohServersIpv4: DefaultDnsResolverSettings().RemoteDohServersIpv4,
 				RemoteDohServersIpv6: DefaultDnsResolverSettings().RemoteDohServersIpv6,
 			},
-			ResolveTimeout: 5 * time.Second,
+			// the tunnel/upstream can take tens of seconds to establish on first connect; the
+			// budget must cover a full slow connect (tun dial 30s) plus TLS handshake (30s) so a
+			// query racing startup waits for the tunnel rather than failing early.
+			ResolveTimeout: 60 * time.Second,
 			ResponseTtl:    60,
 			ReverseTtl:     5 * time.Minute,
+			// handicapped local fallback: if the tunnel-DoH hasn't answered within 5s, also resolve
+			// over the local host egress so DNS stays responsive while the tunnel comes up. Same DoH
+			// servers, but via the host (EnableLocalDoh) rather than the tunnel.
+			LocalFallbackTimeout: 5 * time.Second,
+			Fallback: &DnsResolverSettings{
+				EnableLocalDoh:      true,
+				LocalDohServersIpv4: DefaultDnsResolverSettings().RemoteDohServersIpv4,
+				LocalDohServersIpv6: DefaultDnsResolverSettings().RemoteDohServersIpv6,
+			},
 		},
 		Http: &HttpUpgradeSettings{Mode: HttpUpgradeUnencrypted},
 	}
@@ -102,6 +130,10 @@ type UpgradeMux struct {
 
 	mux      *IpMux
 	settings atomic.Pointer[UpgradeMuxSettings]
+
+	// fallbackDohCache resolves over the local host egress (not the tun); the handicapped local
+	// fallback used when the tunnel-DoH is slow to come up. nil when no Fallback is configured.
+	fallbackDohCache atomic.Pointer[DohCache]
 
 	// source/provideMode stamp packets the mux injects downstream (DNS replies).
 	source      TransferPath
@@ -120,6 +152,38 @@ func dnsResolverSettings(settings *UpgradeMuxSettings) *DnsResolverSettings {
 		return settings.Dns.Resolver
 	}
 	return nil
+}
+
+// fallbackResolverSettings extracts the local-egress fallback resolver config from the mux
+// settings (nil = no fallback).
+func fallbackResolverSettings(settings *UpgradeMuxSettings) *DnsResolverSettings {
+	if settings != nil && settings.Dns != nil {
+		return settings.Dns.Fallback
+	}
+	return nil
+}
+
+// dohRequestTimeout is the per-DoH-request timeout derived from the mux's resolve budget: a single
+// ResolveTimeout bounds both the resolve retry loop and each underlying DoH request. 0 (no Dns, or
+// no bound) lets the tun fall back to its default.
+func dohRequestTimeout(settings *UpgradeMuxSettings) time.Duration {
+	if settings != nil && settings.Dns != nil {
+		return settings.Dns.ResolveTimeout
+	}
+	return 0
+}
+
+// buildFallbackDohCache builds a DoH resolver that egresses the LOCAL host network (not the tun),
+// used as the handicapped local fallback when the tunnel-DoH is slow to come up. A nil rs (no
+// Fallback configured) disables it. The resolver dials the host net dialer (DefaultDohSettings
+// leaves DialContextSettings nil) and queries rs's local DoH servers (EnableLocalDoh).
+func buildFallbackDohCache(rs *DnsResolverSettings) *DohCache {
+	if rs == nil {
+		return nil
+	}
+	dohSettings := DefaultDohSettings()
+	dohSettings.DnsResolverSettings = rs
+	return NewDohCache(dohSettings)
 }
 
 func NewUpgradeMux(
@@ -144,6 +208,10 @@ func NewUpgradeMux(
 	tunSettings.TcpSendBuffer = TcpBufferRange{Min: 4 * 1024, Default: 16 * 1024, Max: 16 * 1024}
 	tunSettings.UdpReceiveBufferByteCount = 16 * 1024
 	tunSettings.UdpSendBufferByteCount = 16 * 1024
+	// ResolveTimeout is the single DNS-resolution timeout: it bounds each handleDns attempt (the
+	// query context) and the underlying DoH request through the tun alike. SetSettings re-derives
+	// it too, so a runtime settings change updates both.
+	tunSettings.DohRequestTimeout = dohRequestTimeout(settings)
 	tun, err := CreateTunWithResolver(cancelCtx, tunSettings, dnsResolverSettings(settings))
 	if err != nil {
 		cancel()
@@ -157,6 +225,7 @@ func NewUpgradeMux(
 		reverse:     map[netip.Addr]reverseEntry{},
 	}
 	self.settings.Store(settings)
+	self.fallbackDohCache.Store(buildFallbackDohCache(fallbackResolverSettings(settings)))
 	self.mux = NewIpMux(cancelCtx, tun, source, provideMode, sendTimeout, self.onSend, nil, initialReceiver, log)
 	// active maintenance: TTL-evict the IP→hostname affinity map so it doesn't grow unbounded
 	go HandleError(self.run)
@@ -297,69 +366,117 @@ func (self *UpgradeMux) handleDns(source TransferPath, provideMode protocol.Prov
 
 	var resolveTimeout time.Duration
 	var responseTtl uint32
+	var localFallbackTimeout time.Duration
 	if dns := self.settings.Load().Dns; dns != nil {
 		resolveTimeout = dns.ResolveTimeout
 		responseTtl = dns.ResponseTtl
+		localFallbackTimeout = dns.LocalFallbackTimeout
+	}
+	fallback := self.fallbackDohCache.Load()
+
+	queryContext := func() (context.Context, context.CancelFunc) {
+		if 0 < resolveTimeout {
+			return context.WithTimeout(self.ctx, resolveTimeout)
+		}
+		return self.ctx, func() {}
 	}
 
-	go HandleError(func() {
-		// hold the query until the resolver returns a real answer (records, or an authoritative
-		// no-record), retrying within the resolve budget. on a freshly-connected tunnel the DoH
-		// connection isn't up yet and the dial fails fast; without the retry we'd reply SERVFAIL
-		// immediately and the client's lookups would fail until the tunnel settled. bounded by
-		// ResolveTimeout so a genuinely-dead resolver still turns over to SERVFAIL (below).
-		queryCtx := self.ctx
-		if 0 < resolveTimeout {
-			var queryCancel context.CancelFunc
-			queryCtx, queryCancel = context.WithTimeout(self.ctx, resolveTimeout)
-			defer queryCancel()
-		}
-		retryInterval := 250 * time.Millisecond
-		const maxRetryInterval = 1 * time.Second
-		var addrs []netip.Addr
-		var authoritative bool
-		for {
-			addrs, authoritative = self.mux.Tun().DohCache().QueryResult(queryCtx, recordType, domain)
-			if 0 < len(addrs) || authoritative {
-				break
-			}
-			// resolution failed (not an authoritative no-record) — wait briefly and retry until
-			// the budget is exhausted, so a query racing tunnel startup waits for DoH to come up
-			select {
-			case <-time.After(retryInterval):
-			case <-queryCtx.Done():
-			}
-			if queryCtx.Err() != nil {
-				break
-			}
-			// back off so a first-connect burst doesn't hammer the not-yet-ready tunnel
-			retryInterval = min(2*retryInterval, maxRetryInterval)
-		}
-		if 0 < len(addrs) {
-			self.recordServerNames(addrs, domain)
-		}
-		// the retries above were exhausted without a real answer — SERVFAIL so the client retries;
-		// replying NOERROR with no answers would be read as an authoritative "no address" and the
-		// client would give up
-		rcode := dnsmessage.RCodeSuccess
+	// reply delivers the first successful resolution downstream, exactly once. A failure — no
+	// records and no authoritative no-record answer, from both the tunnel and the fallback — sends
+	// nothing: the client times out and retries, which the OS tolerates far better than a SERVFAIL
+	// or empty NOERROR reply it would surface as "can't resolve address".
+	var replyOnce sync.Once
+	reply := func(addrs []netip.Addr, authoritative bool) {
 		if len(addrs) == 0 && !authoritative {
-			rcode = dnsmessage.RCodeServerFailure
-		}
-		respPayload, err := buildDnsResponse(id, question, addrs, responseTtl, rcode)
-		if err != nil {
 			return
 		}
-		self.mux.deliverDownstream(source, provideMode, reverse, ipOosPacket(reverse, respPayload))
+		replyOnce.Do(func() {
+			if 0 < len(addrs) {
+				self.recordServerNames(addrs, domain)
+			}
+			respPayload, err := buildDnsResponse(id, question, addrs, responseTtl)
+			if err != nil {
+				return
+			}
+			self.mux.deliverDownstream(source, provideMode, reverse, ipOosPacket(reverse, respPayload))
+		})
+	}
+
+	// primary: resolve over the tunnel-DoH (preferred — egresses the tunnel, no DNS leak), retrying
+	// on the dnsRetryBackoff schedule. The first connect/TLS over a freshly-connecting tunnel can
+	// take tens of seconds (the tun dial and TLS handshake budgets are 30s each, within the 60s
+	// ResolveTimeout), so a slow attempt waits for the tunnel rather than failing fast.
+	tunnelOk := make(chan struct{})
+	go HandleError(func() {
+		queryCtx, queryCancel := queryContext()
+		defer queryCancel()
+		addrs, authoritative := self.resolveTunnelDoh(queryCtx, recordType, domain)
+		if 0 < len(addrs) || authoritative {
+			close(tunnelOk) // the tunnel won — signal the fallback to skip its local query (no leak)
+		}
+		reply(addrs, authoritative)
 	})
+
+	// handicapped local fallback: if the tunnel-DoH hasn't produced an answer within
+	// LocalFallbackTimeout, also resolve over the LOCAL host egress (bypassing the tunnel). The
+	// delay handicaps the local resolver so the tunnel wins whenever it can; the fallback only
+	// answers while the tunnel is still establishing, keeping DNS responsive so the OS doesn't tear
+	// down the tunnel (at the cost of a brief DNS leak during startup).
+	if fallback != nil && 0 < localFallbackTimeout {
+		go HandleError(func() {
+			select {
+			case <-time.After(localFallbackTimeout):
+			case <-tunnelOk:
+				return
+			case <-self.ctx.Done():
+				return
+			}
+			queryCtx, queryCancel := queryContext()
+			defer queryCancel()
+			addrs, authoritative := fallback.QueryResult(queryCtx, recordType, domain)
+			reply(addrs, authoritative)
+		})
+	}
 	return true
 }
 
-func buildDnsResponse(id uint16, question dnsmessage.Question, addrs []netip.Addr, ttl uint32, rcode dnsmessage.RCode) ([]byte, error) {
+// dnsRetryBackoff is the wait between tunnel-DoH resolution attempts. The intervals grow because a
+// freshly-connecting tunnel drops the first packets while the upstream establishes; retrying
+// aggressively up front only re-hits the not-yet-ready path, so back off and give it time to settle.
+var dnsRetryBackoff = []time.Duration{
+	1 * time.Second,
+	2 * time.Second,
+	5 * time.Second,
+	10 * time.Second,
+}
+
+// resolveTunnelDoh resolves over the tun's DoH cache, retrying on dnsRetryBackoff until it gets a
+// real answer (records, or an authoritative no-record), the backoff is exhausted, or ctx is done.
+func (self *UpgradeMux) resolveTunnelDoh(ctx context.Context, recordType string, domain string) ([]netip.Addr, bool) {
+	doh := self.mux.Tun().DohCache()
+	var addrs []netip.Addr
+	var authoritative bool
+	for i := 0; ; i++ {
+		addrs, authoritative = doh.QueryResult(ctx, recordType, domain)
+		if 0 < len(addrs) || authoritative {
+			return addrs, authoritative
+		}
+		if len(dnsRetryBackoff) <= i {
+			return addrs, authoritative
+		}
+		select {
+		case <-time.After(dnsRetryBackoff[i]):
+		case <-ctx.Done():
+			return addrs, authoritative
+		}
+	}
+}
+
+func buildDnsResponse(id uint16, question dnsmessage.Question, addrs []netip.Addr, ttl uint32) ([]byte, error) {
 	builder := dnsmessage.NewBuilder(nil, dnsmessage.Header{
 		ID:                 id,
 		Response:           true,
 		RecursionAvailable: true,
-		RCode:              rcode,
 	})
 	builder.EnableCompression()
 	if err := builder.StartQuestions(); err != nil {
@@ -529,7 +646,8 @@ func (self *UpgradeMux) SetUpstream(upstream IpMuxSend) {
 // settings change.
 func (self *UpgradeMux) SetSettings(settings *UpgradeMuxSettings) {
 	self.settings.Store(settings)
-	self.mux.Tun().SetDnsResolverSettings(dnsResolverSettings(settings))
+	self.mux.Tun().SetDnsResolverSettings(dnsResolverSettings(settings), dohRequestTimeout(settings))
+	self.fallbackDohCache.Store(buildFallbackDohCache(fallbackResolverSettings(settings)))
 }
 
 func (self *UpgradeMux) Close() {

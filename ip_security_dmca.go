@@ -1,12 +1,17 @@
 package connect
 
-// Stateful, all-ports BitTorrent / unsanctioned-encrypted egress detector.
+// Stateful BitTorrent / unsanctioned-encrypted egress detector for non-privileged (>=1024)
+// destination ports.
 //
 // This is the deep-packet-inspection backstop the port rules in ip_security.go
 // were always waiting for (see the "better deep packet inspection" FIXMEs). It
 // advances a small state machine over the first payload-bearing packets of each
 // egress flow until it reaches a terminal verdict:
 //
+//   - a privileged destination port (<1024) -> Allow without inspection: peers, DHT, uTP, and
+//     plaintext trackers run on ephemeral/high ports, so a privileged port can't host a p2p hole;
+//     skipping it lets legitimate non-web-standard encrypted services (e.g. Telegram MTProto on
+//     443) through. Peer traffic on high ports is still inspected.
 //   - a positive, plaintext BitTorrent signature  -> Incident (report) + Drop
 //   - an initial payload that looks fully encrypted/random AND is NOT a
 //     whitelisted web standard (TLS, DTLS, QUIC, STUN/TURN) -> Drop
@@ -287,6 +292,15 @@ func (self *dmcaDetector) classify(ipPath *IpPath, payload []byte) dmcaVerdict {
 	switch ipPath.Protocol {
 	case IpProtocolTcp, IpProtocolUdp:
 	default:
+		return dmcaAllow
+	}
+
+	// A privileged destination port (<1024) can't host a peer-to-peer / BitTorrent hole — peers,
+	// DHT, uTP, and plaintext trackers all run on ephemeral/high ports — so allow it without
+	// payload inspection or flow tracking. This lets legitimate non-web-standard encrypted services
+	// on privileged ports (e.g. Telegram MTProto on 443) through, which the unsanctioned-encrypted
+	// heuristic would otherwise drop. Peer traffic on high ports is still inspected.
+	if ipPath.DestinationPort < 1024 {
 		return dmcaAllow
 	}
 

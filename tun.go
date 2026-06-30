@@ -52,9 +52,10 @@ func DefaultTunSettingsWithBufferSize(bufferSize int) *TunSettings {
 		// interface mtu.
 		Mtu: 1440,
 
-		DialRace:        2,
-		DialRaceTimeout: 2 * time.Second,
-		DialTimeout:     30 * time.Second,
+		DialRace:          2,
+		DialRaceTimeout:   2 * time.Second,
+		DialTimeout:       30 * time.Second,
+		DohRequestTimeout: 60 * time.Second,
 
 		// the gvisor udp endpoint buffers default to 32KiB, which is too small for fast
 		// transfer; cap at 1MiB (gvisor clamps to at most 4MiB) to bound per-endpoint
@@ -80,6 +81,11 @@ type TunSettings struct {
 	DialRace        int
 	DialRaceTimeout time.Duration
 	DialTimeout     time.Duration
+
+	// DohRequestTimeout bounds a single DoH request through this tun's resolver (total connect +
+	// TLS + query). The IpMux sets it from DnsUpgradeSettings.ResolveTimeout so DNS resolution has
+	// a single timeout knob. 0 falls back to a default.
+	DohRequestTimeout time.Duration
 
 	UdpReceiveBufferByteCount int
 	UdpSendBufferByteCount    int
@@ -238,6 +244,69 @@ func ReturnLocalIpv4Address(addr netip.Addr) {
 	defaultLocalIpv4AddressAllocator().ReturnAddr(addr)
 }
 
+// LocalIpv4Networks returns the IPv4 networks currently assigned to the device's
+// interfaces (each masked to its prefix), best-effort. Callers use it to avoid
+// handing out a tunnel address that overlaps a real local subnet. On platforms
+// where interface enumeration is restricted it returns nil, and the caller falls
+// back to an unchecked random address.
+func LocalIpv4Networks() []netip.Prefix {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	var networks []netip.Prefix
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip4 := ipNet.IP.To4()
+			if ip4 == nil {
+				continue
+			}
+			ones, bits := ipNet.Mask.Size()
+			if bits != 32 {
+				continue
+			}
+			prefix := netip.PrefixFrom(netip.AddrFrom4([4]byte{ip4[0], ip4[1], ip4[2], ip4[3]}), ones)
+			networks = append(networks, prefix.Masked())
+		}
+	}
+	return networks
+}
+
+// RandomLocalIpv4 returns a tunnel address in 10.0.0.0/8 whose /24 is the
+// lexicographically smallest 10.a.b.0/24 that does not overlap any prefix in
+// `avoid` (the device's real local subnets), with the host octet randomized in
+// [2, 254] so it looks like an ordinary DHCP lease (never .0/.1/.255) instead of
+// a fixed value that could fingerprint the network. Preferring the minimum free
+// /24 lands on common subnets such as 10.0.0.0/24 that blend in. If every /24 is
+// excluded (e.g. the device holds all of 10/8), it falls back to 10.0.0.h.
+func RandomLocalIpv4(avoid []netip.Prefix) netip.Addr {
+	h := byte(2 + mathrand.Intn(253)) // 2..254, never .0/.1/.255
+	for a := 0; a < 256; a++ {
+		for b := 0; b < 256; b++ {
+			subnet := netip.PrefixFrom(netip.AddrFrom4([4]byte{10, byte(a), byte(b), 0}), 24)
+			conflict := false
+			for _, network := range avoid {
+				if network.Overlaps(subnet) {
+					conflict = true
+					break
+				}
+			}
+			if !conflict {
+				return netip.AddrFrom4([4]byte{10, byte(a), byte(b), h})
+			}
+		}
+	}
+	return netip.AddrFrom4([4]byte{10, 0, 0, h})
+}
+
 type Tun struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -317,7 +386,7 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 		localIpv4AddressAllocator: localIpv4AddressAllocator,
 	}
 
-	tun.dohResolver.Store(tun.buildDohCache(dnsResolverSettings))
+	tun.dohResolver.Store(tun.buildDohCache(dnsResolverSettings, settings.DohRequestTimeout))
 
 	if tcpipErr := tun.stack.CreateNIC(nicId, ep); tcpipErr != nil {
 		releaseOnError()
@@ -353,10 +422,13 @@ func (self *Tun) DohCache() *DohCache {
 
 // buildDohCache constructs a DohCache resolving through this tun (remote paths dial via
 // the tun; local paths use the host), with the given resolver settings (nil = default).
-func (self *Tun) buildDohCache(dnsResolverSettings *DnsResolverSettings) *DohCache {
+func (self *Tun) buildDohCache(dnsResolverSettings *DnsResolverSettings, requestTimeout time.Duration) *DohCache {
 	dohSettings := DefaultDohSettings()
 	dohSettings.ConnectSettings.Log = self.log
-	dohSettings.RequestTimeout = 60 * time.Second
+	dohSettings.RequestTimeout = requestTimeout
+	if dohSettings.RequestTimeout <= 0 {
+		dohSettings.RequestTimeout = 60 * time.Second
+	}
 	dohSettings.TlsTimeout = 30 * time.Second
 	dohSettings.DialContextSettings = &DialContextSettings{
 		DialContext: self.DialContext,
@@ -367,11 +439,11 @@ func (self *Tun) buildDohCache(dnsResolverSettings *DnsResolverSettings) *DohCac
 	return NewDohCache(dohSettings)
 }
 
-// SetDnsResolverSettings rebuilds the tun's DohCache with new resolver settings, taking
-// effect for subsequent queries (the prior cache's in-flight queries are unaffected).
-// Safe to call concurrently with DohCache()/Query.
-func (self *Tun) SetDnsResolverSettings(dnsResolverSettings *DnsResolverSettings) {
-	self.dohResolver.Store(self.buildDohCache(dnsResolverSettings))
+// SetDnsResolverSettings rebuilds the tun's DohCache with new resolver settings and DoH request
+// timeout, taking effect for subsequent queries (the prior cache's in-flight queries are
+// unaffected). Safe to call concurrently with DohCache()/Query.
+func (self *Tun) SetDnsResolverSettings(dnsResolverSettings *DnsResolverSettings, requestTimeout time.Duration) {
+	self.dohResolver.Store(self.buildDohCache(dnsResolverSettings, requestTimeout))
 }
 
 // LocalAddresses returns the addresses assigned to the internal stack's NIC

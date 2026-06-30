@@ -57,22 +57,33 @@ extension's memory limit under upgrade load.
 When `Dns.Resolver` is set, `onSend` claims single A/AAAA queries to UDP/53:
 
 1. Parse the query (`golang.org/x/net/dns/dnsmessage`).
-2. Resolve via the tun's `DohCache` (DoH over the tunnel) — bounded by `ResolveTimeout`
-   (default `5s`). The resolver fans out to multiple providers in parallel and the first to
-   return records wins (default set: Cloudflare + Google via the JSON API, Quad9 via RFC 8484
-   wire-format — each `DohServer` is tagged with the format it speaks). Concurrent identical
-   queries coalesce onto one resolution (single-flight), concurrent resolutions are bounded
-   (`MaxConcurrentResolutions`), and each DoH h2 connection is kept warm with keepalive PINGs so
-   bursty lookups don't re-pay a handshake over the tunnel.
-3. Build a reply and inject it downstream (the question's reverse path). Records — or an
-   authoritative no-record answer — reply `NOERROR` (`ResponseTtl`); a *resolution failure*
-   (timeout / resolver error) replies **SERVFAIL** so the client retries, rather than `NOERROR`
-   with no answers, which a client treats as an authoritative "no address" and gives up on.
-4. Record the resolved IPs → hostname for ServerName affinity.
+2. Resolve via the tun's `DohCache` (DoH over the tunnel), retrying on a fixed `[1s, 2s, 5s, 10s]`
+   backoff within the `ResolveTimeout` budget (default `60s`). The budget is large because the
+   tunnel/upstream can take tens of seconds to establish on a fresh connect — the tun dial and TLS
+   handshake budgets are `30s` each — so a slow first attempt *waits* for the tunnel rather than
+   failing fast; retrying aggressively up front would only re-hit the not-yet-ready path. The
+   resolver fans out to multiple providers in parallel and the first to return records wins (default
+   set: Cloudflare + Google via the JSON API, Quad9 + OpenDNS via RFC 8484 wire-format — each
+   `DohServer` is tagged with the format it speaks). Concurrent identical queries coalesce onto one
+   resolution (single-flight), concurrent resolutions are bounded (`MaxConcurrentResolutions`), and
+   each DoH h2 connection is kept warm with keepalive PINGs so bursty lookups don't re-pay a
+   handshake over the tunnel.
+3. **Handicapped local fallback.** If the tunnel-DoH hasn't produced an answer within
+   `LocalFallbackTimeout` (default `5s`), the query is *also* raced against `Fallback` — a DoH
+   resolver over the **local host egress**, bypassing the tunnel. The delay is the handicap: the
+   tunnel result is preferred whenever it arrives first, so the fallback only wins while the tunnel
+   is still establishing. This keeps DNS responsive so the OS doesn't tear down an
+   apparently-unresponsive tunnel on first connect, at the cost of a brief DNS leak during startup.
+4. On a real answer — records, or an authoritative no-record (NXDOMAIN/NODATA) from *either* path —
+   build a reply and inject it downstream (the question's reverse path) as `NOERROR` (`ResponseTtl`),
+   exactly once. If **both** the tunnel and the fallback fail, send **no reply at all**: the client's
+   query times out and is retried, re-driving resolution once the tunnel settles — a SERVFAIL or
+   empty `NOERROR` reply instead makes a browser give up ("can't resolve address").
+5. Record the resolved IPs → hostname for ServerName affinity.
 
-Non-A/AAAA queries, and all DNS when `Dns`/`Dns.Resolver` is `nil`, pass through to the
-egress unchanged. The app default is **DoH-only** (no plaintext `:53` and no off-tunnel host
-resolution), so a DoH failure fails the query rather than leaking DNS.
+Non-A/AAAA queries, and all DNS when `Dns`/`Dns.Resolver` is `nil`, pass through to the egress
+unchanged. The app default resolves over DoH through the tunnel (no plaintext `:53`), with the
+handicapped local-egress fallback above so DNS stays responsive while the tunnel comes up.
 
 ---
 
@@ -97,18 +108,26 @@ UpgradeMuxSettings{
     Http *HttpUpgradeSettings // nil → HTTP passes through
 }
 
-DnsUpgradeSettings{ Resolver *DnsResolverSettings; ResolveTimeout; ResponseTtl }
+DnsUpgradeSettings{
+    Resolver             *DnsResolverSettings // tunnel-DoH (egresses the tunnel)
+    ResolveTimeout                            // tunnel-DoH budget (default 60s; covers a slow connect+TLS)
+    ResponseTtl
+    ReverseTtl
+    LocalFallbackTimeout                      // handicap delay before racing the fallback (default 5s; 0 disables)
+    Fallback             *DnsResolverSettings // local host-egress DoH fallback (nil disables)
+}
 
 HttpUpgradeSettings{ Mode HttpUpgradeMode } // unencrypted (pass-through, default) or block (drop)
 ```
 
-`SetSettings` applies at runtime: the DohCache is rebuilt immediately, and the HTTP mode change
-takes effect on subsequent packets.
+`SetSettings` applies at runtime: both the tunnel and fallback DohCaches are rebuilt immediately,
+and the HTTP mode change takes effect on subsequent packets.
 
 ### Per-use-case defaults
 
-- **App / device** (`DefaultUpgradeMuxSettings`): DNS intercepted and resolved over
-  **DoH only**, egressing the tunnel; HTTP **passed through unchanged** (or dropped with `block`).
+- **App / device** (`DefaultUpgradeMuxSettings`): DNS intercepted and resolved over DoH
+  egressing the tunnel, with a handicapped local-egress DoH fallback (after `5s`) so DNS stays
+  responsive during tunnel startup; HTTP **passed through unchanged** (or dropped with `block`).
 - **Server / proxy**: **no mux** — `nil` settings, pure pass-through to the egress. The
   proxy runs on the shared stack, whose buffers are sized for throughput (TCP up to `1MB`).
 
