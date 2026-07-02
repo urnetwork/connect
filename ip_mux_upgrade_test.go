@@ -4,12 +4,12 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -58,7 +58,6 @@ type dnsClientHarness struct {
 // (which makes the suite hang). The mux already runs on a private stack.
 func createPrivateClientTun(ctx context.Context) (*Tun, error) {
 	settings := DefaultTunSettings()
-	settings.PrivateStack = true
 	// a single deterministic dial — the default DialRace fans each client dial into
 	// several racing SYNs, multiplying DNAT'd connections and adding cross-test timing
 	// nondeterminism that can hang the suite
@@ -129,22 +128,12 @@ func TestUpgradeMuxDnsDoh(t *testing.T) {
 	const resolved = "203.0.113.45"
 	const queryName = "host.example.test"
 
-	// local DoH server (Google/Cloudflare JSON API) over TLS
-	var dohRequests int
+	// local RFC 8484 wire DoH server over TLS
+	var dohRequests int32
 	dohServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		dohRequests++
-		resp := DohResponse{Status: 0}
+		atomic.AddInt32(&dohRequests, 1)
 		// answer A queries; AAAA returns an empty answer so LookupHost resolves to the A record
-		if qtype := r.URL.Query().Get("type"); qtype == "A" || qtype == "1" {
-			resp.Answer = []DohAnswer{{
-				Name: r.URL.Query().Get("name"),
-				Type: 1,
-				TTL:  60,
-				Data: resolved,
-			}}
-		}
-		w.Header().Set("Content-Type", "application/dns-json")
-		json.NewEncoder(w).Encode(resp)
+		writeDohWire(w, r, []netip.Addr{netip.MustParseAddr(resolved)}, 60, false)
 	}))
 	defer dohServer.Close()
 
@@ -168,7 +157,7 @@ func TestUpgradeMuxDnsDoh(t *testing.T) {
 	if !slices.Contains(addrs, resolved) {
 		t.Fatalf("LookupHost = %v, want to contain %s", addrs, resolved)
 	}
-	if dohRequests == 0 {
+	if atomic.LoadInt32(&dohRequests) == 0 {
 		t.Fatal("mux did not resolve via the local DoH server")
 	}
 
@@ -266,7 +255,7 @@ func TestUpgradeMuxDnsLocalFallback(t *testing.T) {
 	tunnelPool.AddCert(tunnelServer.Certificate())
 
 	// the local fallback resolves to a fixed IP
-	fallbackServer, fallbackResolver := newDohJsonServer(t, "203.0.113.77")
+	fallbackServer, fallbackResolver := newDohWireServer(t, "203.0.113.77")
 	defer fallbackServer.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -332,22 +321,14 @@ func TestUpgradeMuxResolveTimeoutReDerived(t *testing.T) {
 	}
 }
 
-// newDohJsonServer starts a local TLS DoH server (JSON API) that answers A queries with
+// newDohWireServer starts a local TLS DoH server (RFC 8484 wire) that answers A queries with
 // a fixed IP, and returns resolver settings wired to trust and use it (local DoH).
-func newDohJsonServer(t *testing.T, resolvedIp string) (*httptest.Server, *DnsResolverSettings) {
+func newDohWireServer(t *testing.T, resolvedIp string) (*httptest.Server, *DnsResolverSettings) {
 	t.Helper()
+	ip := netip.MustParseAddr(resolvedIp)
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		resp := DohResponse{Status: 0}
-		if qtype := r.URL.Query().Get("type"); qtype == "A" || qtype == "1" {
-			resp.Answer = []DohAnswer{{
-				Name: r.URL.Query().Get("name"),
-				Type: 1,
-				TTL:  60,
-				Data: resolvedIp,
-			}}
-		}
-		w.Header().Set("Content-Type", "application/dns-json")
-		json.NewEncoder(w).Encode(resp)
+		// answer A queries; AAAA gets an empty answer (NODATA)
+		writeDohWire(w, r, []netip.Addr{ip}, 60, false)
 	}))
 	pool := x509.NewCertPool()
 	pool.AddCert(server.Certificate())
@@ -365,9 +346,9 @@ func TestUpgradeMuxDnsRebuild(t *testing.T) {
 	const ipA = "203.0.113.10"
 	const ipB = "203.0.113.20"
 
-	serverA, dnsA := newDohJsonServer(t, ipA)
+	serverA, dnsA := newDohWireServer(t, ipA)
 	defer serverA.Close()
-	serverB, dnsB := newDohJsonServer(t, ipB)
+	serverB, dnsB := newDohWireServer(t, ipB)
 	defer serverB.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)

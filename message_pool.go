@@ -217,6 +217,27 @@ func ResetMessagePoolStats() {
 	}
 }
 
+// MessagePoolCounts returns the cumulative taken/returned/created message counts summed
+// across all pools and tags. taken-returned is the number of pool messages currently held
+// by consumers: it returns to a stable baseline when every taken buffer is eventually
+// returned, so growth across a load-then-teardown cycle attributes a lost return (a buffer
+// leak) even though the heap does not move (the GC quietly collects lost buffers). This is
+// always tracked (independent of debugTags), so tests can assert pool balance in any build.
+func MessagePoolCounts() (taken uint64, returned uint64, created uint64) {
+	for _, pool := range orderedMessagePools() {
+		func() {
+			pool.stateLock.Lock()
+			defer pool.stateLock.Unlock()
+			for tag := range 256 {
+				taken += pool.takenTags[tag]
+				returned += pool.returnedTags[tag]
+				created += pool.createdTags[tag]
+			}
+		}()
+	}
+	return
+}
+
 func MessagePoolStats() map[int]map[int]float32 {
 	sizeTagRatios := map[int]map[int]float32{}
 	for _, pool := range orderedMessagePools() {

@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"context"
 	"encoding/binary"
 	"net"
 	"testing"
@@ -124,10 +125,12 @@ func TestCfaaDisabled(t *testing.T) {
 }
 
 func TestCfaaIngressMirrorsSourceDrops(t *testing.T) {
-	policy := DefaultIngressSecurityPolicy()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	policy := DefaultSecurityPolicy(ctx)
 
 	// blocked source port -> drop (ingress mirrors the egress port policy)
-	r, err := policy.Inspect(protocol.ProvideMode_Public, dmcaPath(IpProtocolTcp, 6881, 40000, false), nil)
+	r, err := policy.InspectIngress(protocol.ProvideMode_Public, dmcaPath(IpProtocolTcp, 6881, 40000, false), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,13 +139,13 @@ func TestCfaaIngressMirrorsSourceDrops(t *testing.T) {
 	}
 
 	// ordinary source port -> allow
-	r, _ = policy.Inspect(protocol.ProvideMode_Public, dmcaPath(IpProtocolTcp, 443, 40000, false), nil)
+	r, _ = policy.InspectIngress(protocol.ProvideMode_Public, dmcaPath(IpProtocolTcp, 443, 40000, false), nil)
 	if r != SecurityPolicyResultAllow {
 		t.Fatalf("ingress source port 443: got %v, want allow", r)
 	}
 
 	// network-mode bypasses the source policy
-	r, _ = policy.Inspect(protocol.ProvideMode_Network, dmcaPath(IpProtocolTcp, 6881, 40000, false), nil)
+	r, _ = policy.InspectIngress(protocol.ProvideMode_Network, dmcaPath(IpProtocolTcp, 6881, 40000, false), nil)
 	if r != SecurityPolicyResultAllow {
 		t.Fatalf("ingress network-mode: got %v, want allow", r)
 	}

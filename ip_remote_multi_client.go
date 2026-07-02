@@ -183,8 +183,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		TcpCollapsePrevention: true,
 		UdpCollapsePrevention: false,
 
-		IngressSecurityPolicyGenerator: DefaultIngressSecurityPolicyWithStats,
-		EgressSecurityPolicyGenerator:  DefaultEgressSecurityPolicyWithStats,
+		SecurityPolicyGenerator: DefaultSecurityPolicyWithStats,
 
 		RemoteUserNatMultiClientMonitorSettings: *DefaultRemoteUserNatMultiClientMonitorSettings(),
 	}
@@ -275,8 +274,7 @@ type MultiClientSettings struct {
 	TcpCollapsePrevention bool
 	UdpCollapsePrevention bool
 
-	IngressSecurityPolicyGenerator func(*SecurityPolicyStatsCollector) SecurityPolicy
-	EgressSecurityPolicyGenerator  func(*SecurityPolicyStatsCollector) SecurityPolicy
+	SecurityPolicyGenerator func(context.Context, *SecurityPolicyStatsCollector) SecurityPolicy
 
 	RemoteUserNatMultiClientMonitorSettings
 }
@@ -370,9 +368,8 @@ type RemoteUserNatMultiClient struct {
 	windows map[WindowType]*multiClientWindow
 	monitor MultiClientMonitor
 
-	securityPolicyStats   *SecurityPolicyStatsCollector
-	securityPolicy        SecurityPolicy
-	ingressSecurityPolicy SecurityPolicy
+	securityPolicyStats *SecurityPolicyStatsCollector
+	securityPolicy      SecurityPolicy
 
 	// the provide mode of the source packets
 	// for locally generated packets this is `ProvideMode_Network`
@@ -453,8 +450,7 @@ func NewRemoteUserNatMultiClient(
 		settings:              settings,
 		windows:               map[WindowType]*multiClientWindow{},
 		securityPolicyStats:   securityPolicyStats,
-		securityPolicy:        settings.EgressSecurityPolicyGenerator(securityPolicyStats),
-		ingressSecurityPolicy: settings.IngressSecurityPolicyGenerator(securityPolicyStats),
+		securityPolicy:        settings.SecurityPolicyGenerator(cancelCtx, securityPolicyStats),
 		provideMode:           provideMode,
 		ip4PathUpdates:        map[Ip4Path]*multiClientChannelUpdate{},
 		ip6PathUpdates:        map[Ip6Path]*multiClientChannelUpdate{},
@@ -474,7 +470,7 @@ func NewRemoteUserNatMultiClient(
 		cancel,
 		generator,
 		multiClient.clientReceivePacket,
-		multiClient.ingressSecurityPolicy,
+		multiClient.securityPolicy,
 		multiClient.removeClient,
 		WindowTypeQuality,
 		settings,
@@ -485,7 +481,7 @@ func NewRemoteUserNatMultiClient(
 			cancel,
 			generator,
 			multiClient.clientReceivePacket,
-			multiClient.ingressSecurityPolicy,
+			multiClient.securityPolicy,
 			multiClient.removeClient,
 			WindowTypeSpeed,
 			settings,
@@ -1095,11 +1091,13 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 		self.log.Infof("[multi]send bad packet = %s\n", err)
 		return false
 	}
-	r, err := self.securityPolicy.Inspect(minRelationship, ipPath, payload)
+	r, err := self.securityPolicy.InspectEgress(minRelationship, ipPath, payload)
 	if err != nil {
 		self.log.Infof("[multi]send bad packet = %s\n", err)
 		return false
 	}
+	// refresh the flow's activity on the send direction (keeps a download-heavy flow alive)
+	self.securityPolicy.RefreshEgress(ipPath)
 	switch r {
 	case SecurityPolicyResultAllow:
 		parsedPacket := &parsedPacket{
@@ -1271,7 +1269,14 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 						packet: MessagePoolShareReadOnly(sendPacket.packet),
 						ipPath: update.ipPath,
 					}
-					if client.SendWithAck(p, sendTimeout, true) {
+					sent := client.SendWithAck(p, sendTimeout, true)
+					if !sent {
+						// a failed attempt retains ownership here: undo this
+						// attempt's share or the packet never reaches zero
+						// references (the race takes one share per client)
+						MessagePoolReturn(p.packet)
+					}
+					if sent {
 						successCount.Add(1)
 
 						var initRace *multiClientChannelUpdateRace
@@ -1433,10 +1438,12 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 	ipPath *IpPath,
 	packet []byte,
 ) {
-	r, err := self.ingressSecurityPolicy.Inspect(provideMode, ipPath, nil)
+	r, err := self.securityPolicy.InspectIngress(provideMode, ipPath, nil)
 	if err != nil {
 		return
 	}
+	// refresh on the return direction before ipPath is reversed for downstream delivery
+	self.securityPolicy.RefreshIngress(ipPath)
 	if r != SecurityPolicyResultAllow {
 		return
 	}
@@ -3086,7 +3093,14 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 			timeout,
 			opts...,
 		)
+		// ownership: `parsedPacket.packet` is consumed on success and stays with the
+		// caller on any failure. The wrapped (!raw) marshal buffer is internal and
+		// must be freed on any failure; for raw frames the frame bytes ARE the
+		// caller's packet, so they are never freed here on failure.
 		if err != nil {
+			if !frame.Raw {
+				MessagePoolReturn(frame.MessageBytes)
+			}
 			return success, err
 		}
 		if success {

@@ -93,6 +93,7 @@ type UpgradeMuxSettings struct {
 // no HTTP upgrade), do not install a mux at all: pass nil settings, which avoids a
 // per-device tun/stack. A mux with nil Dns still passes DNS through but exists for HTTP.
 func DefaultUpgradeMuxSettings() *UpgradeMuxSettings {
+	resolver := DefaultDnsResolverSettings()
 	return &UpgradeMuxSettings{
 		Dns: &DnsUpgradeSettings{
 			// DoH only, using the DoH client's configured servers, resolved through the
@@ -100,9 +101,9 @@ func DefaultUpgradeMuxSettings() *UpgradeMuxSettings {
 			// (host dialer) or EnableRemoteDns (plaintext :53), which would resolve
 			// off-tunnel or in the clear.
 			Resolver: &DnsResolverSettings{
-				EnableRemoteDoh:      true,
-				RemoteDohServersIpv4: DefaultDnsResolverSettings().RemoteDohServersIpv4,
-				RemoteDohServersIpv6: DefaultDnsResolverSettings().RemoteDohServersIpv6,
+				EnableRemoteDoh:   true,
+				RemoteDohUrlsIpv4: resolver.RemoteDohUrlsIpv4,
+				RemoteDohUrlsIpv6: resolver.RemoteDohUrlsIpv6,
 			},
 			// the tunnel/upstream can take tens of seconds to establish on first connect; the
 			// budget must cover a full slow connect (tun dial 30s) plus TLS handshake (30s) so a
@@ -115,9 +116,9 @@ func DefaultUpgradeMuxSettings() *UpgradeMuxSettings {
 			// servers, but via the host (EnableLocalDoh) rather than the tunnel.
 			LocalFallbackTimeout: 5 * time.Second,
 			Fallback: &DnsResolverSettings{
-				EnableLocalDoh:      true,
-				LocalDohServersIpv4: DefaultDnsResolverSettings().RemoteDohServersIpv4,
-				LocalDohServersIpv6: DefaultDnsResolverSettings().RemoteDohServersIpv6,
+				EnableLocalDoh:   true,
+				LocalDohUrlsIpv4: resolver.RemoteDohUrlsIpv4,
+				LocalDohUrlsIpv6: resolver.RemoteDohUrlsIpv6,
 			},
 		},
 		Http: &HttpUpgradeSettings{Mode: HttpUpgradeUnencrypted},
@@ -183,6 +184,10 @@ func buildFallbackDohCache(rs *DnsResolverSettings) *DohCache {
 	}
 	dohSettings := DefaultDohSettings()
 	dohSettings.DnsResolverSettings = rs
+	// the fallback only bridges tunnel startup; keep its in-flight footprint small so it adds
+	// little to the (memory-constrained) extension on top of the primary tunnel-DoH cache.
+	dohSettings.MaxConcurrentHttpRequests = 4
+	dohSettings.MaxConcurrentResolutions = 8
 	return NewDohCache(dohSettings)
 }
 
@@ -198,9 +203,6 @@ func NewUpgradeMux(
 	cancelCtx, cancel := context.WithCancel(ctx)
 	tunSettings := DefaultTunSettings()
 	tunSettings.Log = log
-	// the mux's DoH connections run on an isolated stack so their packets are emitted via the
-	// tun (pump → exit) rather than delivered intra-stack to a peer sharing the process-wide stack
-	tunSettings.PrivateStack = true
 	// the DoH connections run inside a memory-constrained host (notably the iOS network
 	// extension). Keep the gVisor TCP/UDP buffers small (16KB) — Max applies per connection,
 	// and DoH responses fit comfortably in 16KB.

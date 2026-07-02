@@ -92,16 +92,9 @@ type TunSettings struct {
 
 	// TcpReceiveBuffer/TcpSendBuffer are the gVisor TCP buffer auto-tuning ranges. Max
 	// applies per connection, so these dominate per-connection memory; a memory-bound
-	// consumer should lower them. Applied only to a private stack — the shared stack uses
-	// the default-settings values.
+	// consumer should lower them.
 	TcpReceiveBuffer TcpBufferRange
 	TcpSendBuffer    TcpBufferRange
-
-	// PrivateStack, when true, gives this Tun its own isolated gVisor stack instead of
-	// the process-wide shared stack. Used when the Tun terminates connections whose
-	// peer addresses also live on the shared stack (e.g. a test client), so the Tun's
-	// replies are emitted via Read() rather than delivered intra-stack.
-	PrivateStack bool
 }
 
 // TcpBufferRange is a gVisor TCP buffer auto-tuning range in bytes.
@@ -143,13 +136,6 @@ func newTunStack(tcpReceive TcpBufferRange, tcpSend TcpBufferRange) *stack.Stack
 
 	return s
 }
-
-// tunStack is the process-wide shared stack used by all Tuns unless TunSettings
-// requests a private stack. It uses the default-settings buffer ranges.
-var tunStack = sync.OnceValue(func() *stack.Stack {
-	settings := DefaultTunSettings()
-	return newTunStack(settings.TcpReceiveBuffer, settings.TcpSendBuffer)
-})
 
 type NicIdAllocator struct {
 	stateLock   sync.Mutex
@@ -316,7 +302,6 @@ type Tun struct {
 
 	ep                        *channel.Endpoint
 	stack                     *stack.Stack
-	ownsStack                 bool
 	nicId                     tcpip.NICID
 	nicIdAllocator            *NicIdAllocator
 	localAddresses            []netip.Addr
@@ -350,10 +335,10 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 
 	nicId := nicIdAllocator.TakeNicId()
 
-	tunStackInstance := tunStack()
-	if settings.PrivateStack {
-		tunStackInstance = newTunStack(settings.TcpReceiveBuffer, settings.TcpSendBuffer)
-	}
+	// each Tun owns a private gVisor stack, destroyed on Close() so all of its
+	// endpoints are reclaimed. (There is no shared stack: it could not reclaim a
+	// closed Tun's connection endpoints, leaking them under Tun churn.)
+	tunStackInstance := newTunStack(settings.TcpReceiveBuffer, settings.TcpSendBuffer)
 
 	localAddresses := []netip.Addr{
 		localIpv4Address,
@@ -379,7 +364,6 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 		settings:                  settings,
 		ep:                        ep,
 		stack:                     tunStackInstance,
-		ownsStack:                 settings.PrivateStack,
 		nicId:                     nicId,
 		nicIdAllocator:            nicIdAllocator,
 		localAddresses:            localAddresses,
@@ -716,13 +700,16 @@ func (self *Tun) Close() error {
 			self.localIpv4AddressAllocator.ReturnAddr(addr)
 		}
 	}
-	if self.ownsStack {
-		// destroy the private stack so its endpoints and background goroutines are released
-		// (the shared stack is never closed). Do NOT stack.Wait() here: Close() can run under
-		// the device stateLock during a reconfigure (SetDestination), and Wait() blocks until
-		// every stack goroutine halts — one stuck goroutine would wedge the device, and DNS,
-		// until restart. The stack's goroutines exit asynchronously after Close().
-		self.stack.Close()
-	}
+	// destroy this Tun's stack so its endpoints and background goroutines are released.
+	// Do NOT stack.Wait() here: Close() can run under the device stateLock during a
+	// reconfigure (SetDestination), and Wait() blocks until every stack goroutine halts —
+	// one stuck goroutine would wedge the device, and DNS, until restart. The stack's
+	// goroutines exit asynchronously after Close().
+	self.stack.Close()
 	return nil
+}
+
+// Stats returns the gVisor stack statistics for this Tun's private stack.
+func (self *Tun) Stats() tcpip.Stats {
+	return self.stack.Stats()
 }

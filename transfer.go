@@ -66,6 +66,12 @@ type AckFunction = func(err error)
 // provideMode is the mode of where these frames are from: network, friends and family, public
 // provideMode nil means no contract
 type ReceiveFunction = func(source TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode)
+
+// a forward callback receives a transfer frame addressed to another destination.
+// like a receive callback, `transferFrameBytes` is valid only for the duration of
+// the callback; the caller returns it after the callbacks run. A callback that
+// retains the bytes (e.g. hands them off to a send or a channel) must
+// `MessagePoolShareReadOnly` (or copy) them first.
 type ForwardFunction = func(path TransferPath, transferFrameBytes []byte)
 
 func DefaultClientSettings() *ClientSettings {
@@ -863,6 +869,9 @@ func (self *Client) receive(source TransferPath, frames []*protocol.Frame, provi
 }
 
 // ForwardFunction
+// forward dispatches to the forward callbacks. It is itself a `ForwardFunction`:
+// the bytes are valid only for the duration of the call, and the caller returns
+// them after (mirrors `receive`).
 func (self *Client) forward(path TransferPath, transferFrameBytes []byte) {
 	for _, forwardCallback := range self.forwardCallbacks.Get() {
 		c := func() any {
@@ -928,12 +937,19 @@ func (self *Client) run() {
 					continue
 				}
 
-				self.SendControl(frame, func(err error) {
+				success := self.SendControl(frame, func(err error) {
 					select {
 					case ack <- err:
 					case <-self.ctx.Done():
 					}
 				})
+				if !success {
+					// the send did not take the frame: no ack will ever fire, so
+					// free the frame and try again next interval instead of
+					// wedging this loop on an ack that cannot come
+					MessagePoolReturn(frame.MessageBytes)
+					continue
+				}
 				// wait for the ack before sending another ping
 				select {
 				case err := <-ack:
@@ -1284,6 +1300,12 @@ func (self *Client) run() {
 			}
 		} else {
 			c := func() {
+				// forward is a callback: the bytes are valid only for its duration
+				// and are returned here. Without the return, a client with no
+				// forwarder leaks one pool buffer for every frame that arrives
+				// addressed to another destination (e.g. control-addressed frames
+				// accepted by a gateway transport).
+				defer MessagePoolReturn(transferFrameBytes)
 				self.forward(
 					path,
 					transferFrameBytes,
@@ -2927,8 +2949,19 @@ func (self *SendSequence) writeMaybeWrappedBytes(transferFrameBytes []byte, path
 		bytes := transferFrameBytes
 		if DebugTransferCopyOnWrite {
 			bytes = MessagePoolCopy(transferFrameBytes)
+			// the copy is scoped to this write; the item's transferFrameBytes stays
+			// owned by the sequence
+			defer MessagePoolReturn(bytes)
 		}
-		return writer.Write(self.ctx, MessagePoolShareReadOnly(bytes), self.sendBufferSettings.WriteTimeout)
+		shared := MessagePoolShareReadOnly(bytes)
+		err := writer.Write(self.ctx, shared, self.sendBufferSettings.WriteTimeout)
+		if err != nil {
+			// on failure (abort/timeout) no route consumer took the message, so
+			// ownership stays here: undo the consumer's share or the buffer can
+			// never reach zero references and silently leaves the pool
+			MessagePoolReturn(shared)
+		}
+		return err
 	}
 	if err := self.verifyPeerCertAgainstContract(); err != nil {
 		return err
@@ -2956,7 +2989,13 @@ func (self *SendSequence) writeMaybeWrappedBytes(transferFrameBytes []byte, path
 		)
 	}
 	defer MessagePoolReturn(wrapped)
-	return writer.Write(self.ctx, MessagePoolShareReadOnly(wrapped), self.sendBufferSettings.WriteTimeout)
+	shared := MessagePoolShareReadOnly(wrapped)
+	err = writer.Write(self.ctx, shared, self.sendBufferSettings.WriteTimeout)
+	if err != nil {
+		// see the plaintext branch: a failed write leaves ownership here
+		MessagePoolReturn(shared)
+	}
+	return err
 }
 
 // verifyPeerCertAgainstContract checks (and caches) that the peer's TLS cert
@@ -3674,11 +3713,17 @@ func (self *ReceiveSequence) Run() {
 					cipher = self.session.Cipher()
 				}
 				if cipher == nil {
-					return multiRouteWriter.Write(
+					shared := MessagePoolShareReadOnly(transferFrameBytes)
+					writeErr := multiRouteWriter.Write(
 						self.ctx,
-						MessagePoolShareReadOnly(transferFrameBytes),
+						shared,
 						self.receiveBufferSettings.WriteTimeout,
 					)
+					if writeErr != nil {
+						// a failed write leaves ownership here: undo the consumer's share
+						MessagePoolReturn(shared)
+					}
+					return writeErr
 				}
 				ciphertext, sealErr := cipher.Seal(transferFrameBytes)
 				if sealErr != nil {
@@ -3692,11 +3737,17 @@ func (self *ReceiveSequence) Run() {
 					return fmt.Errorf("ack outer wrap marshal: %w", marshalErr)
 				}
 				defer MessagePoolReturn(wrapped)
-				return multiRouteWriter.Write(
+				shared := MessagePoolShareReadOnly(wrapped)
+				writeErr := multiRouteWriter.Write(
 					self.ctx,
-					MessagePoolShareReadOnly(wrapped),
+					shared,
 					self.receiveBufferSettings.WriteTimeout,
 				)
+				if writeErr != nil {
+					// a failed write leaves ownership here: undo the consumer's share
+					MessagePoolReturn(shared)
+				}
+				return writeErr
 			}
 			if self.log.V(2).Enabled() {
 				TraceWithReturn(
@@ -4935,14 +4986,22 @@ func (self *ForwardSequence) Run() {
 			c := func() error {
 				transferFrameBytes := forwardPack.TransferFrameBytes
 				if DebugTransferCopyOnWrite {
-					transferFrameBytes = MessagePoolCopy(transferFrameBytes)
+					transferFrameBytes = MessagePoolCopy(forwardPack.TransferFrameBytes)
+					// the write proceeds on the copy; the original is done here
+					MessagePoolReturn(forwardPack.TransferFrameBytes)
 				}
 				defer MessagePoolReturn(transferFrameBytes)
-				return self.multiRouteWriter.Write(
+				shared := MessagePoolShareReadOnly(transferFrameBytes)
+				err := self.multiRouteWriter.Write(
 					self.ctx,
-					MessagePoolShareReadOnly(transferFrameBytes),
+					shared,
 					self.forwardBufferSettings.WriteTimeout,
 				)
+				if err != nil {
+					// a failed write leaves ownership here: undo the consumer's share
+					MessagePoolReturn(shared)
+				}
+				return err
 			}
 			if self.log.V(2).Enabled() {
 				TraceWithReturn(
@@ -5010,6 +5069,22 @@ func (self *ForwardSequence) Close() {
 		self.packMutex.Lock()
 		defer self.packMutex.Unlock()
 		close(self.packs)
+	}()
+
+	// drain the channel (mirrors SendSequence.Close/ReceiveSequence.Close: queued
+	// packs are owned by the sequence and must be returned)
+	func() {
+		for {
+			select {
+			case forwardPack, ok := <-self.packs:
+				if !ok {
+					return
+				}
+				MessagePoolReturn(forwardPack.TransferFrameBytes)
+			default:
+				return
+			}
+		}
 	}()
 }
 

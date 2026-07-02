@@ -145,6 +145,12 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 					-1,
 					Ctx(handleCtx),
 				)
+				if !success {
+					// the send did not accept the frame (no enqueue), so no ack will
+					// ever fire for the copy: undo its share or the base return alone
+					// only ever decrements the count to 1 and the buffer leaks
+					MessagePoolReturn(updatedFrameCopy.MessageBytes)
+				}
 			}()
 			if done {
 				MessagePoolReturn(updatedFrame.MessageBytes)
@@ -199,6 +205,10 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 	if success {
 		return
 	}
+
+	// the non-blocking send did not accept the frame, so no ack will ever fire for
+	// the copy: undo its share (see the retry loop above for the same rule)
+	MessagePoolReturn(frameCopy.MessageBytes)
 
 	go HandleError(func() {
 		controlSync(frame)

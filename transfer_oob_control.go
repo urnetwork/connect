@@ -154,5 +154,11 @@ func (self *NoContractClientOob) SendControl(frames []*protocol.Frame, callback 
 		}
 	}
 
+	// SendControl takes ownership of the frames; this oob cannot deliver them but
+	// must still release the pooled bytes (mirrors ApiOutOfBandControl.sendControl)
+	for _, frame := range frames {
+		MessagePoolReturn(frame.MessageBytes)
+	}
+
 	safeCallback(nil, errors.New("Not supported."))
 }

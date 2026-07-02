@@ -1,7 +1,7 @@
 package connect
 
 import (
-	// "context"
+	"context"
 	// "encoding/binary"
 	// "errors"
 	"fmt"
@@ -51,23 +51,36 @@ func (self SecurityPolicyResult) String() string {
 
 type SecurityPolicy interface {
 	Stats() *SecurityPolicyStatsCollector
-	// Inspect decides the fate of a packet. payload is the L4 payload (may be nil
-	// for header-only inspection); it is valid only for the duration of the call.
-	Inspect(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error)
+	// InspectEgress decides the fate of a packet on the send (client->destination)
+	// direction. payload is the L4 payload (may be nil for header-only inspection); it is
+	// valid only for the duration of the call.
+	InspectEgress(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error)
+	// InspectIngress decides the fate of a packet on the return (destination->client)
+	// direction.
+	InspectIngress(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error)
+	// RefreshEgress and RefreshIngress refresh a tracked flow's DPI activity time from a sent or
+	// received packet respectively, so an active flow is not reclaimed by the idle scan (or the
+	// capacity-LRU) while traffic still flows in either direction. They make no security decision;
+	// call them at every forwarding point alongside (or in place of) the inspection.
+	RefreshEgress(ipPath *IpPath)
+	RefreshIngress(ipPath *IpPath)
 }
 
-type egressSecurityPolicy struct {
+// securityPolicy inspects both directions of a flow from one object, so the egress DPI
+// detector's flow table is shared with the ingress activity refresh (see dmcaDetector.touch).
+type securityPolicy struct {
 	stats *SecurityPolicyStatsCollector
 	cfaa  *cfaaDetector
 	dmca  *dmcaDetector
 }
 
-func DefaultEgressSecurityPolicy() SecurityPolicy {
-	return DefaultEgressSecurityPolicyWithStats(DefaultSecurityPolicyStatsCollector())
+func DefaultSecurityPolicy(ctx context.Context) SecurityPolicy {
+	return DefaultSecurityPolicyWithStats(ctx, DefaultSecurityPolicyStatsCollector())
 }
 
-func DefaultEgressSecurityPolicyWithStats(stats *SecurityPolicyStatsCollector) SecurityPolicy {
-	return NewEgressSecurityPolicy(
+func DefaultSecurityPolicyWithStats(ctx context.Context, stats *SecurityPolicyStatsCollector) SecurityPolicy {
+	return NewSecurityPolicy(
+		ctx,
 		DefaultCfaaSecurityPolicySettings(),
 		DefaultDmcaSecurityPolicySettings(),
 		DefaultWebStandardSettings(),
@@ -75,27 +88,40 @@ func DefaultEgressSecurityPolicyWithStats(stats *SecurityPolicyStatsCollector) S
 	)
 }
 
-func NewEgressSecurityPolicy(cfaaSettings *CfaaSecurityPolicySettings, dmcaSettings *DmcaSecurityPolicySettings, webSettings *WebStandardSettings, stats *SecurityPolicyStatsCollector) SecurityPolicy {
-	return &egressSecurityPolicy{
+func NewSecurityPolicy(ctx context.Context, cfaaSettings *CfaaSecurityPolicySettings, dmcaSettings *DmcaSecurityPolicySettings, webSettings *WebStandardSettings, stats *SecurityPolicyStatsCollector) SecurityPolicy {
+	return &securityPolicy{
 		stats: stats,
 		cfaa:  newCfaaDetector(cfaaSettings),
-		dmca:  newDmcaDetector(dmcaSettings, newWebStandardDetector(webSettings)),
+		dmca:  newDmcaDetector(ctx, dmcaSettings, newWebStandardDetector(webSettings)),
 	}
 }
 
-func (self *egressSecurityPolicy) Stats() *SecurityPolicyStatsCollector {
+// DefaultProviderSecurityPolicy is the policy for the provider (exit) role: it egresses a remote
+// client's traffic, so it runs Reverse(client policy). The provider's ingress (the remote client's
+// outbound, received from the tunnel) gets the client policy's egress DPI; the provider's egress
+// (the return into the tunnel) gets the client policy's ingress source check. A provider keeps its
+// own detector + stats, independent of the device's multi-client policy.
+func DefaultProviderSecurityPolicy(ctx context.Context) SecurityPolicy {
+	return DefaultProviderSecurityPolicyWithStats(ctx, DefaultSecurityPolicyStatsCollector())
+}
+
+func DefaultProviderSecurityPolicyWithStats(ctx context.Context, stats *SecurityPolicyStatsCollector) SecurityPolicy {
+	return Reverse(DefaultSecurityPolicyWithStats(ctx, stats))
+}
+
+func (self *securityPolicy) Stats() *SecurityPolicyStatsCollector {
 	return self.stats
 }
 
-func (self *egressSecurityPolicy) Inspect(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error) {
-	result, err := self.inspect(provideMode, ipPath, payload)
+func (self *securityPolicy) InspectEgress(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error) {
+	result, err := self.inspectEgress(provideMode, ipPath, payload)
 	if ipPath != nil {
 		self.stats.AddDestination(ipPath, result, 1)
 	}
 	return result, err
 }
 
-func (self *egressSecurityPolicy) inspect(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error) {
+func (self *securityPolicy) inspectEgress(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error) {
 	if protocol.ProvideMode_Network == provideMode {
 		return SecurityPolicyResultAllow, nil
 	}
@@ -133,37 +159,29 @@ func (self *egressSecurityPolicy) inspect(provideMode protocol.ProvideMode, ipPa
 	}
 }
 
-type ingressSecurityPolicy struct {
-	stats *SecurityPolicyStatsCollector
-	cfaa  *cfaaDetector
-}
-
-func DefaultIngressSecurityPolicy() SecurityPolicy {
-	return DefaultIngressSecurityPolicyWithStats(DefaultSecurityPolicyStatsCollector())
-}
-
-func DefaultIngressSecurityPolicyWithStats(stats *SecurityPolicyStatsCollector) SecurityPolicy {
-	return NewIngressSecurityPolicy(DefaultCfaaSecurityPolicySettings(), stats)
-}
-
-func NewIngressSecurityPolicy(cfaaSettings *CfaaSecurityPolicySettings, stats *SecurityPolicyStatsCollector) SecurityPolicy {
-	return &ingressSecurityPolicy{
-		stats: stats,
-		cfaa:  newCfaaDetector(cfaaSettings),
+func (self *securityPolicy) InspectIngress(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error) {
+	result, err := self.inspectIngress(provideMode, ipPath)
+	if ipPath != nil {
+		self.stats.AddSource(ipPath, result, 1)
 	}
-}
-
-func (self *ingressSecurityPolicy) Stats() *SecurityPolicyStatsCollector {
-	return self.stats
-}
-
-func (self *ingressSecurityPolicy) Inspect(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error) {
-	result, err := self.inspect(provideMode, ipPath)
-	self.stats.AddSource(ipPath, result, 1)
 	return result, err
 }
 
-func (self *ingressSecurityPolicy) inspect(provideMode protocol.ProvideMode, ipPath *IpPath) (SecurityPolicyResult, error) {
+// RefreshEgress/RefreshIngress refresh the flow's DPI activity time without making a decision (see
+// the SecurityPolicy interface).
+func (self *securityPolicy) RefreshEgress(ipPath *IpPath) {
+	if ipPath != nil {
+		self.dmca.touchEgress(ipPath)
+	}
+}
+
+func (self *securityPolicy) RefreshIngress(ipPath *IpPath) {
+	if ipPath != nil {
+		self.dmca.touchIngress(ipPath)
+	}
+}
+
+func (self *securityPolicy) inspectIngress(provideMode protocol.ProvideMode, ipPath *IpPath) (SecurityPolicyResult, error) {
 	// network-relationship traffic (e.g. same network_id) bypasses the public
 	// rules, mirroring the egress policy. The return path of a network-mode
 	// flow echoes the network provide mode, so a private service on any port
@@ -185,10 +203,14 @@ type disableSecurityPolicy struct {
 }
 
 func DisableSecurityPolicy() SecurityPolicy {
-	return DisableSecurityPolicyWithStats(DefaultSecurityPolicyStatsCollector())
+	return &disableSecurityPolicy{
+		stats: DefaultSecurityPolicyStatsCollector(),
+	}
 }
 
-func DisableSecurityPolicyWithStats(stats *SecurityPolicyStatsCollector) SecurityPolicy {
+// DisableSecurityPolicyWithStats matches the SecurityPolicyGenerator signature (ctx is
+// unused — the disabled policy keeps no flow state and runs no scan).
+func DisableSecurityPolicyWithStats(ctx context.Context, stats *SecurityPolicyStatsCollector) SecurityPolicy {
 	return &disableSecurityPolicy{
 		stats: stats,
 	}
@@ -198,8 +220,64 @@ func (self *disableSecurityPolicy) Stats() *SecurityPolicyStatsCollector {
 	return self.stats
 }
 
-func (self *disableSecurityPolicy) Inspect(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error) {
+func (self *disableSecurityPolicy) InspectEgress(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error) {
 	return SecurityPolicyResultAllow, nil
+}
+
+func (self *disableSecurityPolicy) InspectIngress(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error) {
+	return SecurityPolicyResultAllow, nil
+}
+
+func (self *disableSecurityPolicy) RefreshEgress(ipPath *IpPath) {}
+
+func (self *disableSecurityPolicy) RefreshIngress(ipPath *IpPath) {}
+
+// reverseSecurityPolicy swaps the egress and ingress directions of an underlying policy — the
+// provider's view of a flow. The remote client's egress (the outbound packet the provider receives
+// from the tunnel) is the provider's ingress, and the return is the provider's egress; so a provider
+// runs Reverse(client policy), wired with the same convention as the multi-client. The flow key is
+// unchanged (the underlying policy still keys by the egress 5-tuple), so only the method is swapped.
+type reverseSecurityPolicy struct {
+	policy SecurityPolicy
+}
+
+func Reverse(policy SecurityPolicy) SecurityPolicy {
+	return &reverseSecurityPolicy{policy: policy}
+}
+
+func (self *reverseSecurityPolicy) Stats() *SecurityPolicyStatsCollector {
+	return self.policy.Stats()
+}
+
+func (self *reverseSecurityPolicy) InspectEgress(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error) {
+	return self.policy.InspectIngress(provideMode, ipPath, payload)
+}
+
+func (self *reverseSecurityPolicy) InspectIngress(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error) {
+	return self.policy.InspectEgress(provideMode, ipPath, payload)
+}
+
+func (self *reverseSecurityPolicy) RefreshEgress(ipPath *IpPath) {
+	self.policy.RefreshIngress(ipPath)
+}
+
+func (self *reverseSecurityPolicy) RefreshIngress(ipPath *IpPath) {
+	self.policy.RefreshEgress(ipPath)
+}
+
+// Testing_FlowCount reports the number of tracked DMCA flows. Test hook: exact flow-table
+// assertions (fill == n, reclaim -> 0) are deterministic where heap-delta assertions are
+// not (allocator noise, -race). Reach it by type-asserting a SecurityPolicy to
+// interface{ Testing_FlowCount() int }.
+func (self *securityPolicy) Testing_FlowCount() int {
+	return self.dmca.flowCount()
+}
+
+func (self *reverseSecurityPolicy) Testing_FlowCount() int {
+	if p, ok := self.policy.(interface{ Testing_FlowCount() int }); ok {
+		return p.Testing_FlowCount()
+	}
+	return 0
 }
 
 func isPublicUnicast(ip net.IP) bool {

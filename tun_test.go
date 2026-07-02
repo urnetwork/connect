@@ -157,8 +157,17 @@ func TestTunTCPThroughput(t *testing.T) {
 
 	rightIP := net.IP(right.localAddresses[0].AsSlice())
 
-	const totalBytes = int64(128) << 20 // 128 MiB
-	const minThroughputMiBs = 1.0       // conservative floor; a stall is ~0
+	// full speed moves ~300 MiB/s; under -race the gvisor stack runs ~250x slower
+	// (~1 MiB/s), so 128 MiB cannot complete within the 55s per-conn deadline below.
+	// Scale the transfer down under -race so it still streams enough bytes to catch a
+	// stall / head-of-line-block regression while finishing inside the deadline; drop
+	// the floor to a value that only a genuine stall (~0) falls under.
+	totalBytes := int64(128) << 20 // 128 MiB
+	minThroughputMiBs := 1.0       // conservative floor; a stall is ~0
+	if raceEnabled {
+		totalBytes = int64(16) << 20 // 16 MiB (~13s under -race, well within 55s)
+		minThroughputMiBs = 0.1
+	}
 	// measure several times and take the max, to ride out host scheduling noise
 	const throughputRuns = 3
 

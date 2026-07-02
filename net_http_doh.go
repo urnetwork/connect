@@ -4,15 +4,15 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	mathrand "math/rand"
 	"net"
 	"net/http"
 	"net/netip"
-	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -27,16 +27,37 @@ import (
 
 // FIXME DoH certs need to be included in the pinned certs
 
+const (
+	// dohServerWeightFloor keeps every server a small chance of being tried first (exploration), so
+	// a server that recovers can climb back even after a streak of failures.
+	dohServerWeightFloor = 0.05
+	// maxDohResponseBytes caps a DoH response body read (a memory guard); a real DNS answer is tiny,
+	// so this only bounds a hostile or broken server.
+	maxDohResponseBytes = 64 * 1024
+)
+
+// dohServerWindows are the trailing time spans over which each server's successful resolutions are
+// counted (per-window token buckets). A success falls inside every window whose span covers it, so a
+// recent success is counted in more windows and weighted more — the fan-out order then favors
+// servers that have resolved most recently and most often. See serverStats.
+var dohServerWindows = []time.Duration{
+	5 * time.Minute,
+	15 * time.Minute,
+	60 * time.Minute,
+}
+
 func DefaultDohSettings() *DohSettings {
 	return &DohSettings{
-		ConnectSettings:          *DefaultConnectSettings(),
-		IpVersion:                4,
-		MissExpiration:           300 * time.Second,
-		LocalExpiration:          300 * time.Second,
-		MinCacheTtl:              30 * time.Second,
-		CacheMaxEntries:          4096,
-		MaxConcurrentResolutions: 64,
-		DnsResolverSettings:      DefaultDnsResolverSettings(),
+		ConnectSettings:           *DefaultConnectSettings(),
+		IpVersion:                 4,
+		MissExpiration:            300 * time.Second,
+		LocalExpiration:           300 * time.Second,
+		MinCacheTtl:               30 * time.Second,
+		CacheMaxEntries:           4096,
+		MaxConcurrentResolutions:  64,
+		MaxConcurrentHttpRequests: 16,
+		DohServerStagger:          750 * time.Millisecond,
+		DnsResolverSettings:       DefaultDnsResolverSettings(),
 	}
 }
 
@@ -46,22 +67,21 @@ func DefaultDohSettings() *DohSettings {
 // 3. if enable remote dns, remote dns
 // 4. if enable local dns, local dns
 //
-// the remote doh servers are queried in parallel and the first server to return records wins
-// (see dohQueryWithClientResult). each server is tagged with the format it speaks: Cloudflare and
-// Google use the JSON API (application/dns-json, ?name=&type=); Quad9 and OpenDNS speak RFC 8484
-// wire-format on :443 — both are supported. each must present an IP-SAN cert (these do). Quad9's
-// JSON :5053 endpoint is retired / port-blocked, so it is queried as wire.
-// https://developers.cloudflare.com/1.1.1.1/ip-addresses/
-// https://developers.google.com/speed/public-dns/docs/doh/json
+// the remote doh servers are queried as RFC 8484 wire-format (application/dns-message) in a
+// staggered, weighted-random order (see dohClient.queryResult); the first server to return records
+// wins. each must present an IP-SAN cert when addressed by IP (these do). Cloudflare, Google, Quad9,
+// and OpenDNS all serve wire-format on :443 /dns-query.
+// https://developers.cloudflare.com/1.1.1.1/encryption/dns-over-https/
+// https://developers.google.com/speed/public-dns/docs/doh
 func DefaultDnsResolverSettings() *DnsResolverSettings {
 	return &DnsResolverSettings{
 		EnableRemoteDoh: true,
 		EnableLocalDns:  true,
-		RemoteDohServersIpv4: []DohServer{
-			{Url: "https://1.1.1.1/dns-query", Format: DohFormatJson},        // Cloudflare
-			{Url: "https://8.8.8.8/resolve", Format: DohFormatJson},          // Google
-			{Url: "https://9.9.9.9/dns-query", Format: DohFormatWire},        // Quad9 (RFC 8484)
-			{Url: "https://208.67.222.222/dns-query", Format: DohFormatWire}, // OpenDNS (RFC 8484)
+		RemoteDohUrlsIpv4: []string{
+			"https://1.1.1.1/dns-query",        // Cloudflare
+			"https://8.8.8.8/dns-query",        // Google
+			"https://9.9.9.9/dns-query",        // Quad9
+			"https://208.67.222.222/dns-query", // OpenDNS
 		},
 		LocalDnsIpv4: []string{
 			"1.1.1.1",
@@ -81,7 +101,17 @@ type DohSettings struct {
 	// MaxConcurrentResolutions bounds in-flight resolutions (DohCache.resolveSem) so a burst
 	// or flood of distinct names cannot fan out unbounded. 0 uses a sane default.
 	MaxConcurrentResolutions int
-	DnsResolverSettings      *DnsResolverSettings
+	// MaxConcurrentHttpRequests hard-caps concurrent in-flight DoH HTTP requests (DohCache.httpSem),
+	// the dominant memory cost under load on a constrained host (the iOS network extension). It
+	// bounds the actual requests regardless of resolution count or per-server fan-out. 0 uses a sane
+	// default.
+	MaxConcurrentHttpRequests int
+	// DohServerStagger delays launching each additional DoH server within a fan-out: the first
+	// server is queried immediately and each next one only if no answer has arrived within this
+	// interval, so a healthy primary answers before the redundant servers fire. 0 fans out to all
+	// servers at once.
+	DohServerStagger    time.Duration
+	DnsResolverSettings *DnsResolverSettings
 }
 
 func (self *DohSettings) ResolverIp() string {
@@ -95,46 +125,21 @@ func (self *DohSettings) ResolverIp() string {
 	}
 }
 
-// DohFormat is the query encoding a DoH server speaks; the client picks the request format per
-// server (see dohQueryWithClientResult).
-type DohFormat string
-
-const (
-	// DohFormatJson is the Google-style JSON API (GET ?name=&type=, Accept application/dns-json).
-	// Cloudflare and Google support it; it is the default for an empty format and for the legacy
-	// RemoteDohUrls/LocalDohUrls fields.
-	DohFormatJson DohFormat = "json"
-	// DohFormatWire is RFC 8484 (GET ?dns=<base64url DNS message>, Accept application/dns-message).
-	// Universally supported (Cloudflare, Google, Quad9, OpenDNS, ...).
-	DohFormatWire DohFormat = "wire"
-)
-
-// DohServer is a DoH endpoint tagged with the query format it speaks.
-type DohServer struct {
-	Url    string    `json:"url"`
-	Format DohFormat `json:"format,omitempty"` // empty == DohFormatJson
-}
-
 type DnsResolverSettings struct {
-	EnableRemoteDoh   bool     `json:"enable_remote_doh,omitempty"`
-	EnableLocalDoh    bool     `json:"enable_local_doh,omitempty"`
-	EnableRemoteDns   bool     `json:"enable_remote_dns,omitempty"`
-	EnableLocalDns    bool     `json:"enable_local_dns,omitempty"`
+	EnableRemoteDoh bool `json:"enable_remote_doh,omitempty"`
+	EnableLocalDoh  bool `json:"enable_local_doh,omitempty"`
+	EnableRemoteDns bool `json:"enable_remote_dns,omitempty"`
+	EnableLocalDns  bool `json:"enable_local_dns,omitempty"`
+	// DoH server URLs, queried as RFC 8484 wire-format (GET ?dns=<base64url DNS message>,
+	// Accept application/dns-message). Each must present an IP-SAN cert when addressed by IP.
 	RemoteDohUrlsIpv4 []string `json:"remote_doh_urls_ipv4,omitempty"`
 	RemoteDohUrlsIpv6 []string `json:"remote_doh_urls_ipv6,omitempty"`
 	LocalDohUrlsIpv4  []string `json:"local_doh_urls_ipv4,omitempty"`
 	LocalDohUrlsIpv6  []string `json:"local_doh_urls_ipv6,omitempty"`
-	// the *DohServers fields carry a per-server format tag (json or RFC 8484 wire). the legacy
-	// *DohUrls []string fields above are still honored and treated as json; prefer these for new
-	// config and for any wire-only server (e.g. Quad9, OpenDNS).
-	RemoteDohServersIpv4 []DohServer `json:"remote_doh_servers_ipv4,omitempty"`
-	RemoteDohServersIpv6 []DohServer `json:"remote_doh_servers_ipv6,omitempty"`
-	LocalDohServersIpv4  []DohServer `json:"local_doh_servers_ipv4,omitempty"`
-	LocalDohServersIpv6  []DohServer `json:"local_doh_servers_ipv6,omitempty"`
-	RemoteDnsIpv4        []string    `json:"remote_dns_ipv4,omitempty"`
-	RemoteDnsIpv6        []string    `json:"remote_dns_ipv6,omitempty"`
-	LocalDnsIpv4         []string    `json:"local_dns_ipv4,omitempty"`
-	LocalDnsIpv6         []string    `json:"local_dns_ipv6,omitempty"`
+	RemoteDnsIpv4     []string `json:"remote_dns_ipv4,omitempty"`
+	RemoteDnsIpv6     []string `json:"remote_dns_ipv6,omitempty"`
+	LocalDnsIpv4      []string `json:"local_dns_ipv4,omitempty"`
+	LocalDnsIpv6      []string `json:"local_dns_ipv6,omitempty"`
 
 	// TlsConfig, if set, is used by the DoH HTTP clients — production cert pinning,
 	// or trusting a local server's cert in tests. Not serialized.
@@ -179,12 +184,14 @@ func httpClientWithDialer(settings *DohSettings, dialContext DialContextFunction
 }
 
 type DohCache struct {
-	httpClient      *http.Client
-	localHttpClient *http.Client
-	remoteResolver  *net.Resolver
-	localResolver   *net.Resolver
-	settings        *DohSettings
-	log             Logger
+	// remoteClient resolves over the tun (settings.DialContext); localClient over the host. Both
+	// share httpSem (the global in-flight cap) and the per-server success stats.
+	remoteClient   *dohClient
+	localClient    *dohClient
+	remoteResolver *net.Resolver
+	localResolver  *net.Resolver
+	settings       *DohSettings
+	log            Logger
 
 	stateLock             sync.Mutex
 	queryResultExpiration map[DohKey]*DohResult
@@ -291,9 +298,16 @@ func NewDohCache(settings *DohSettings) *DohCache {
 		maxResolutions = 64
 	}
 
+	httpClient := httpClientWithSettings(settings)
+	localHttpClient := httpClientWithDialer(settings, netDialer.DialContext)
+	// one in-flight-request semaphore and one stats table shared across the remote + local clients,
+	// so the cap bounds the cache's total concurrent DoH requests
+	httpSem := make(chan struct{}, maxConcurrentHttpRequests(settings))
+	stats := newServerStats()
+
 	return &DohCache{
-		httpClient:            httpClientWithSettings(settings),
-		localHttpClient:       httpClientWithDialer(settings, settings.NetDialer().DialContext),
+		remoteClient:          &dohClient{httpClient: httpClient, httpSem: httpSem, stats: stats},
+		localClient:           &dohClient{httpClient: localHttpClient, httpSem: httpSem, stats: stats},
 		remoteResolver:        remoteResolver,
 		localResolver:         localResolver,
 		settings:              settings,
@@ -302,6 +316,13 @@ func NewDohCache(settings *DohSettings) *DohCache {
 		inflight:              map[DohKey]*dohFlight{},
 		resolveSem:            make(chan struct{}, maxResolutions),
 	}
+}
+
+func maxConcurrentHttpRequests(settings *DohSettings) int {
+	if 0 < settings.MaxConcurrentHttpRequests {
+		return settings.MaxConcurrentHttpRequests
+	}
+	return 16
 }
 
 func (self *DohCache) pruneCacheLocked(now time.Time, reserve int) {
@@ -416,7 +437,7 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]n
 	minCacheTtl := self.settings.MinCacheTtl
 
 	if self.settings.DnsResolverSettings.EnableRemoteDoh {
-		queryResult := dohQueryWithClientResult(ctx, self.httpClient, remoteDohServers(self.settings, self.settings.IpVersion), self.settings.IpVersion, q.RecordType, self.settings, q.Domain)
+		queryResult := self.remoteClient.queryResult(ctx, remoteDohUrls(self.settings, self.settings.IpVersion), q.RecordType, self.settings, q.Domain)
 
 		for addr, ttlSeconds := range queryResult.AddrTtls {
 			addrExpirations[addr] = now.Add(max(time.Duration(ttlSeconds)*time.Second, minCacheTtl))
@@ -427,7 +448,7 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]n
 	}
 
 	if len(addrExpirations) == 0 && self.settings.DnsResolverSettings.EnableLocalDoh {
-		queryResult := dohQueryWithClientResult(ctx, self.localHttpClient, localDohServers(self.settings, self.settings.IpVersion), self.settings.IpVersion, q.RecordType, self.settings, q.Domain)
+		queryResult := self.localClient.queryResult(ctx, localDohUrls(self.settings, self.settings.IpVersion), q.RecordType, self.settings, q.Domain)
 
 		for addr, ttlSeconds := range queryResult.AddrTtls {
 			addrExpirations[addr] = now.Add(max(time.Duration(ttlSeconds)*time.Second, minCacheTtl))
@@ -529,42 +550,37 @@ func DohQueryWithClient(
 	settings *DohSettings,
 	domains ...string,
 ) map[netip.Addr]int {
-	return dohQueryWithClientResult(ctx, httpClient, remoteDohServers(settings, ipVersion), ipVersion, recordType, settings, domains...).AddrTtls
+	// a one-shot client: bound its in-flight requests, but keep no persistent per-server stats
+	// (nil stats -> uniform-random fan-out order)
+	c := &dohClient{
+		httpClient: httpClient,
+		httpSem:    make(chan struct{}, maxConcurrentHttpRequests(settings)),
+		stats:      nil,
+	}
+	return c.queryResult(ctx, remoteDohUrls(settings, ipVersion), recordType, settings, domains...).AddrTtls
 }
 
-func dohServersFor(ipv4 []DohServer, ipv6 []DohServer, ipVersion int) []DohServer {
+func dohUrlsFor(ipv4 []string, ipv6 []string, ipVersion int) []string {
 	switch ipVersion {
 	case 4:
 		return ipv4
 	case 6:
 		return ipv6
 	default:
-		servers := append([]DohServer{}, ipv4...)
-		return append(servers, ipv6...)
+		urls := append([]string{}, ipv4...)
+		return append(urls, ipv6...)
 	}
 }
 
-// legacyDohServers adapts the format-less *DohUrls []string fields as json servers.
-func legacyDohServers(urls []string) []DohServer {
-	servers := make([]DohServer, len(urls))
-	for i, u := range urls {
-		servers[i] = DohServer{Url: u, Format: DohFormatJson}
-	}
-	return servers
+// remoteDohUrls/localDohUrls return the configured wire-format DoH server URLs for the ip version.
+func remoteDohUrls(settings *DohSettings, ipVersion int) []string {
+	rs := settings.DnsResolverSettings
+	return dohUrlsFor(rs.RemoteDohUrlsIpv4, rs.RemoteDohUrlsIpv6, ipVersion)
 }
 
-// remoteDohServers/localDohServers return the tagged servers for the ip version, with the legacy
-// *DohUrls fields appended as json servers.
-func remoteDohServers(settings *DohSettings, ipVersion int) []DohServer {
+func localDohUrls(settings *DohSettings, ipVersion int) []string {
 	rs := settings.DnsResolverSettings
-	servers := append([]DohServer{}, dohServersFor(rs.RemoteDohServersIpv4, rs.RemoteDohServersIpv6, ipVersion)...)
-	return append(servers, dohServersFor(legacyDohServers(rs.RemoteDohUrlsIpv4), legacyDohServers(rs.RemoteDohUrlsIpv6), ipVersion)...)
-}
-
-func localDohServers(settings *DohSettings, ipVersion int) []DohServer {
-	rs := settings.DnsResolverSettings
-	servers := append([]DohServer{}, dohServersFor(rs.LocalDohServersIpv4, rs.LocalDohServersIpv6, ipVersion)...)
-	return append(servers, dohServersFor(legacyDohServers(rs.LocalDohUrlsIpv4), legacyDohServers(rs.LocalDohUrlsIpv6), ipVersion)...)
+	return dohUrlsFor(rs.LocalDohUrlsIpv4, rs.LocalDohUrlsIpv6, ipVersion)
 }
 
 type dohQueryResult struct {
@@ -578,63 +594,99 @@ func newDohQueryResult() *dohQueryResult {
 	}
 }
 
-func dohQueryWithClientResult(
+// dohClient issues RFC 8484 wire-format queries over one HTTP client. httpSem hard-caps concurrent
+// in-flight requests (shared across a DohCache's remote + local clients); stats biases the fan-out
+// order toward recently-successful servers. stats may be nil (one-shot queries: uniform-random
+// order, no recording).
+type dohClient struct {
+	httpClient *http.Client
+	httpSem    chan struct{}
+	stats      *serverStats
+}
+
+// queryResult resolves recordType for the given domains across dohUrls (RFC 8484 wire), returning
+// as soon as any server returns records. Servers are tried in a weighted-random order biased toward
+// recent success, and launched one wave per DohServerStagger so a fast primary answers before the
+// rest fire — which bounds concurrent in-flight requests and skips the redundant fan-out entirely
+// when an early server wins.
+func (self *dohClient) queryResult(
 	ctx context.Context,
-	httpClient *http.Client,
-	dohServers []DohServer,
-	ipVersion int,
+	dohUrls []string,
 	recordType string,
 	settings *DohSettings,
 	domains ...string,
 ) *dohQueryResult {
-	// run all the queries in parallel to all servers
-
-	queryCtx, queryCancel := context.WithCancel(ctx)
-	defer queryCancel()
-
 	switch recordType {
 	case "A", "AAAA":
 	default:
 		return newDohQueryResult()
 	}
-
-	query := func(server DohServer, domain string) *dohQueryResult {
-		name, err := Punycode(domain)
-		if err != nil {
-			return newDohQueryResult()
-		}
-		if server.Format == DohFormatWire {
-			return dohQueryWire(queryCtx, httpClient, server.Url, recordType, name)
-		}
-		return dohQueryJson(queryCtx, httpClient, server.Url, recordType, name)
-	}
-
-	queryCount := len(dohServers) * len(domains)
-	if queryCount == 0 || settings.RequestTimeout <= 0 {
+	if len(dohUrls) == 0 || settings.RequestTimeout <= 0 {
 		return newDohQueryResult()
 	}
-	receiveResults := make(chan *dohQueryResult, queryCount)
-	for _, server := range dohServers {
-		for _, domain := range domains {
-			go HandleError(func() {
-				result := query(server, domain)
-				select {
-				case receiveResults <- result:
-				case <-queryCtx.Done():
-				}
-			})
+
+	names := make([]string, 0, len(domains))
+	for _, domain := range domains {
+		name, err := Punycode(domain)
+		if err != nil {
+			continue
 		}
+		names = append(names, name)
+	}
+	if len(names) == 0 {
+		return newDohQueryResult()
 	}
 
-	endTime := time.Now().Add(settings.RequestTimeout)
-	mergedResult := newDohQueryResult()
-	for range queryCount {
-		timeout := endTime.Sub(time.Now())
-		if timeout <= 0 {
-			return &dohQueryResult{
-				AddrTtls: mergedResult.AddrTtls,
+	queryCtx, queryCancel := context.WithTimeout(ctx, settings.RequestTimeout)
+	defer queryCancel()
+
+	// weighted-random order: the best recent performers tend to fire first (and the rest are
+	// skipped when an early server wins)
+	ordered := self.stats.order(dohUrls)
+
+	queryCount := len(ordered) * len(names)
+	receiveResults := make(chan *dohQueryResult, queryCount)
+
+	stop := make(chan struct{})
+	var stopOnce sync.Once
+	stopLaunching := func() { stopOnce.Do(func() { close(stop) }) }
+	defer stopLaunching()
+
+	stagger := settings.DohServerStagger
+
+	// launcher: start one server-wave per stagger interval (in weighted order) until an early
+	// server wins (stop), the deadline passes, or every server has been launched.
+	go HandleError(func() {
+		for i, dohUrl := range ordered {
+			if 0 < i && 0 < stagger {
+				select {
+				case <-time.After(stagger):
+				case <-stop:
+					return
+				case <-queryCtx.Done():
+					return
+				}
+			}
+			for _, name := range names {
+				go HandleError(func() {
+					result := self.queryWire(queryCtx, dohUrl, recordType, name)
+					// a server that returns records or an authoritative no-record answer is healthy;
+					// anything else (error, non-200, or no answer before it was beaten) counts
+					// against it. The large stagger means the first wave is the usual winner, so a
+					// later wave is only launched — and only judged — when an earlier server was
+					// slow or failed.
+					self.stats.record(dohUrl, 0 < len(result.AddrTtls) || result.Miss)
+					select {
+					case receiveResults <- result:
+					case <-queryCtx.Done():
+					}
+				})
 			}
 		}
+	})
+
+	mergedResult := newDohQueryResult()
+	for range queryCount {
 		select {
 		case <-queryCtx.Done():
 			return &dohQueryResult{
@@ -650,13 +702,10 @@ func dohQueryWithClientResult(
 			// authoritative miss is not short-circuited — keep collecting so a filtering
 			// resolver's NXDOMAIN can't override a server that resolves the name.
 			if 0 < len(mergedResult.AddrTtls) {
+				stopLaunching()
 				return &dohQueryResult{
 					AddrTtls: mergedResult.AddrTtls,
 				}
-			}
-		case <-time.After(timeout):
-			return &dohQueryResult{
-				AddrTtls: mergedResult.AddrTtls,
 			}
 		}
 	}
@@ -664,63 +713,9 @@ func dohQueryWithClientResult(
 	return mergedResult
 }
 
-// dohQueryJson runs a Google-style JSON DoH query (Accept application/dns-json, GET ?name=&type=).
-// name must already be punycoded ascii.
-func dohQueryJson(ctx context.Context, httpClient *http.Client, dohUrl string, recordType string, name string) *dohQueryResult {
-	result := newDohQueryResult()
-
-	params := url.Values{}
-	params.Add("name", name)
-	params.Add("type", recordType)
-	requestUrl := fmt.Sprintf("%s?%s", dohUrl, params.Encode())
-
-	request, err := http.NewRequestWithContext(ctx, "GET", requestUrl, nil)
-	if err != nil {
-		return result
-	}
-	request.Header.Set("Accept", "application/dns-json")
-	// note, we do not set the User-Agent for DoH requests
-	// see https://bugzilla.mozilla.org/show_bug.cgi?id=1543201#c4
-
-	response, err := httpClient.Do(request)
-	if err != nil {
-		return result
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		return result
-	}
-	data, err := io.ReadAll(response.Body)
-	if err != nil {
-		return result
-	}
-
-	dohResponse := &DohResponse{}
-	if err := json.Unmarshal(data, dohResponse); err != nil {
-		return result
-	}
-	switch dohResponse.Status {
-	case 0:
-	case 3:
-		result.Miss = true
-		return result
-	default:
-		return result
-	}
-	for _, answer := range dohResponse.Answer {
-		if ip, err := netip.ParseAddr(answer.Data); err == nil {
-			result.AddrTtls[ip] = max(result.AddrTtls[ip], answer.TTL)
-		}
-	}
-	if len(result.AddrTtls) == 0 {
-		result.Miss = true
-	}
-	return result
-}
-
-// dohQueryWire runs an RFC 8484 wire-format DoH query (Accept application/dns-message,
+// queryWire runs an RFC 8484 wire-format DoH query (Accept application/dns-message,
 // GET ?dns=<base64url DNS message>). name must already be punycoded ascii.
-func dohQueryWire(ctx context.Context, httpClient *http.Client, dohUrl string, recordType string, name string) *dohQueryResult {
+func (self *dohClient) queryWire(ctx context.Context, dohUrl string, recordType string, name string) *dohQueryResult {
 	result := newDohQueryResult()
 
 	dnsName, err := dnsmessage.NewName(name + ".")
@@ -753,7 +748,19 @@ func dohQueryWire(ctx context.Context, httpClient *http.Client, dohUrl string, r
 	}
 	request.Header.Set("Accept", "application/dns-message")
 
-	response, err := httpClient.Do(request)
+	// bound concurrent in-flight HTTP requests across this cache — the memory governor for the
+	// iOS network extension. Hold a slot across the request and body read (the lifetime of the h2
+	// stream and the response buffer); block here under load rather than allocating a new stream.
+	if self.httpSem != nil {
+		select {
+		case self.httpSem <- struct{}{}:
+			defer func() { <-self.httpSem }()
+		case <-ctx.Done():
+			return result
+		}
+	}
+
+	response, err := self.httpClient.Do(request)
 	if err != nil {
 		return result
 	}
@@ -761,7 +768,7 @@ func dohQueryWire(ctx context.Context, httpClient *http.Client, dohUrl string, r
 	if response.StatusCode != http.StatusOK {
 		return result
 	}
-	data, err := io.ReadAll(response.Body)
+	data, err := io.ReadAll(io.LimitReader(response.Body, maxDohResponseBytes))
 	if err != nil {
 		return result
 	}
@@ -824,6 +831,144 @@ func parseDohWire(data []byte, qType dnsmessage.Type) *dohQueryResult {
 	return result
 }
 
+// serverStats tracks each DoH server's recent successful resolutions in per-window token buckets — a
+// current and a previous bucket per dohServerWindows span — and scores a server by summing the
+// trailing-window estimates, so the fan-out order favors servers that have resolved most recently
+// and most often. All methods are safe for concurrent use and safe to call on a nil *serverStats (a
+// no-op / uniform-random order).
+type serverStats struct {
+	lock  sync.Mutex
+	byUrl map[string]*serverStat
+}
+
+func newServerStats() *serverStats {
+	return &serverStats{byUrl: map[string]*serverStat{}}
+}
+
+// serverStat holds one tokenBucket per dohServerWindows span (parallel index), counting the
+// server's successful resolutions.
+type serverStat struct {
+	windows []tokenBucket
+}
+
+// tokenBucket is a sliding-window-counter approximation over a fixed span: current counts events in
+// the current interval [epoch*span, (epoch+1)*span) and previous the interval before it. The
+// trailing-window estimate prorates previous by how much of it still falls within the last span.
+type tokenBucket struct {
+	epoch    int64
+	current  float64
+	previous float64
+}
+
+// roll advances the bucket to the interval containing now: a single-interval step shifts
+// current->previous; a longer gap clears both (the events fell out of the trailing window).
+func (self *tokenBucket) roll(span time.Duration, now time.Time) {
+	epoch := now.UnixNano() / int64(span)
+	switch {
+	case epoch == self.epoch:
+	case epoch == self.epoch+1:
+		self.previous = self.current
+		self.current = 0
+	default:
+		self.previous = 0
+		self.current = 0
+	}
+	self.epoch = epoch
+}
+
+func (self *tokenBucket) add(span time.Duration, now time.Time, n float64) {
+	self.roll(span, now)
+	self.current += n
+}
+
+// estimate returns the prorated event count over the trailing span ending at now.
+func (self *tokenBucket) estimate(span time.Duration, now time.Time) float64 {
+	self.roll(span, now)
+	elapsed := now.UnixNano() - self.epoch*int64(span)
+	frac := float64(int64(span)-elapsed) / float64(span)
+	return self.current + self.previous*frac
+}
+
+// record credits a server with a successful resolution (ok == it returned records or an
+// authoritative no-record answer); failures earn nothing and simply let the buckets decay.
+func (self *serverStats) record(url string, ok bool) {
+	self.recordAt(url, ok, time.Now())
+}
+
+func (self *serverStats) recordAt(url string, ok bool, now time.Time) {
+	if self == nil || !ok {
+		return
+	}
+	self.lock.Lock()
+	defer self.lock.Unlock()
+
+	st := self.byUrl[url]
+	if st == nil {
+		st = &serverStat{windows: make([]tokenBucket, len(dohServerWindows))}
+		self.byUrl[url] = st
+	}
+	for k, span := range dohServerWindows {
+		st.windows[k].add(span, now, 1)
+	}
+}
+
+// scoreLocked sums a server's trailing-window success estimates; an untried server scores 0.
+func (self *serverStats) scoreLocked(url string, now time.Time) float64 {
+	st := self.byUrl[url]
+	if st == nil {
+		return 0
+	}
+	var score float64
+	for k, span := range dohServerWindows {
+		score += st.windows[k].estimate(span, now)
+	}
+	return score
+}
+
+// order returns urls in a weighted-random permutation: a server's weight is its summed recent
+// success score plus an exploration floor. Uses the Efraimidis–Spirakis weighted-permutation method
+// (key = u^(1/w); higher weight -> earlier). A nil *serverStats yields a uniform-random shuffle.
+func (self *serverStats) order(urls []string) []string {
+	return self.orderAt(urls, time.Now())
+}
+
+func (self *serverStats) orderAt(urls []string, now time.Time) []string {
+	ordered := append([]string{}, urls...)
+	if len(ordered) <= 1 {
+		return ordered
+	}
+	if self == nil {
+		mathrand.Shuffle(len(ordered), func(i, j int) {
+			ordered[i], ordered[j] = ordered[j], ordered[i]
+		})
+		return ordered
+	}
+
+	type weighted struct {
+		url string
+		key float64
+	}
+	ws := make([]weighted, len(ordered))
+	self.lock.Lock()
+	for i, url := range ordered {
+		weight := dohServerWeightFloor + self.scoreLocked(url, now)
+		u := mathrand.Float64()
+		if u <= 0 {
+			u = math.SmallestNonzeroFloat64
+		}
+		ws[i] = weighted{url: url, key: math.Pow(u, 1/weight)}
+	}
+	self.lock.Unlock()
+
+	sort.Slice(ws, func(i, j int) bool {
+		return ws[i].key > ws[j].key
+	})
+	for i := range ws {
+		ordered[i] = ws[i].url
+	}
+	return ordered
+}
+
 type DohKey struct {
 	RecordType string
 	Domain     string
@@ -860,29 +1005,6 @@ func (self *DohResult) Addrs() []netip.Addr {
 		ips = append(ips, ip)
 	}
 	return ips
-}
-
-type DohQuestion struct {
-	Name string `json:"name"`
-	Type int    `json:"type"`
-}
-
-type DohAnswer struct {
-	Name string `json:"name"`
-	Type int    `json:"type"`
-	TTL  int    `json:"TTL"`
-	Data string `json:"data"`
-}
-
-type DohResponse struct {
-	Status   int           `json:"Status"`
-	TC       bool          `json:"TC"`
-	RD       bool          `json:"RD"`
-	RA       bool          `json:"RA"`
-	AD       bool          `json:"AD"`
-	CD       bool          `json:"CD"`
-	Question []DohQuestion `json:"Question"`
-	Answer   []DohAnswer   `json:"Answer"`
 }
 
 func Punycode(domain string) (string, error) {

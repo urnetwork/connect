@@ -74,7 +74,7 @@ func TestUpgradeMuxMultiClientIntegration(t *testing.T) {
 	// the mux resolves DNS through a local DoH server
 	const resolvedIp = "203.0.113.77"
 	const queryName = "a.foo.com"
-	dohServer, dns := newDohJsonServer(t, resolvedIp)
+	dohServer, dns := newDohWireServer(t, resolvedIp)
 	defer dohServer.Close()
 
 	muxSettings := DefaultUpgradeMuxSettings()
@@ -204,14 +204,14 @@ func TestUpgradeMuxDefaultDnsThroughTunnel(t *testing.T) {
 
 	providerLocalUserNat := NewLocalUserNatWithDefaults(ctx, "test-exit")
 	providerNatSettings := DefaultRemoteUserNatProviderSettings()
-	providerNatSettings.EgressSecurityPolicyGenerator = DisableSecurityPolicyWithStats
+	providerNatSettings.SecurityPolicyGenerator = DisableSecurityPolicyWithStats
 	provider := NewRemoteUserNatProvider(providerClient, providerLocalUserNat, providerNatSettings)
 	defer provider.Close()
 
 	// local DoH server (reachable on the host loopback via the provider's LocalUserNat)
 	const resolvedIp = "203.0.113.88"
 	const queryName = "a.foo.com"
-	dohServer, localDns := newDohJsonServer(t, resolvedIp)
+	dohServer, localDns := newDohWireServer(t, resolvedIp)
 	defer dohServer.Close()
 
 	received := make(chan []byte, 32)
@@ -235,8 +235,7 @@ func TestUpgradeMuxDefaultDnsThroughTunnel(t *testing.T) {
 
 	multiSettings := DefaultMultiClientSettings()
 	multiSettings.TcpCollapsePrevention = false
-	multiSettings.EgressSecurityPolicyGenerator = DisableSecurityPolicyWithStats
-	multiSettings.IngressSecurityPolicyGenerator = DisableSecurityPolicyWithStats
+	multiSettings.SecurityPolicyGenerator = DisableSecurityPolicyWithStats
 	multi := NewRemoteUserNatMultiClient(ctx, testMultiClientGenerator(providerClient), mux.Receive, protocol.ProvideMode_Network, multiSettings)
 	defer multi.Close()
 	mux.SetUpstream(multi.SendPacket)

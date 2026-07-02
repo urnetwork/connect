@@ -1498,7 +1498,7 @@ func benchmarkIpEgressTcp4UpParallel(b *testing.B, sendShardCount int) {
 	}
 	b.StopTimer()
 
-	stats := tunStack().Stats()
+	stats := tun.Stats()
 	b.Logf(
 		"ip outgoing errors=%d tcp retransmits=%d tcp timeouts=%d tcp fast retransmits=%d",
 		stats.IP.OutgoingPacketErrors.Value(),

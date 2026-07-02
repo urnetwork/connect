@@ -2949,9 +2949,9 @@ func (self *ConnectionState) tcpPacket(flags byte, seq uint32, payload []byte) [
 
 func DefaultRemoteUserNatProviderSettings() *RemoteUserNatProviderSettings {
 	return &RemoteUserNatProviderSettings{
-		WriteTimeout:                  30 * time.Second,
-		ProtocolVersion:               DefaultProtocolVersion,
-		EgressSecurityPolicyGenerator: DefaultEgressSecurityPolicyWithStats,
+		WriteTimeout:            30 * time.Second,
+		ProtocolVersion:         DefaultProtocolVersion,
+		SecurityPolicyGenerator: DefaultProviderSecurityPolicyWithStats,
 	}
 }
 
@@ -2960,11 +2960,12 @@ type RemoteUserNatProviderSettings struct {
 
 	ProtocolVersion int
 
-	EgressSecurityPolicyGenerator func(*SecurityPolicyStatsCollector) SecurityPolicy
+	SecurityPolicyGenerator func(context.Context, *SecurityPolicyStatsCollector) SecurityPolicy
 }
 
 type RemoteUserNatProvider struct {
 	client            *Client
+	cancel            context.CancelFunc
 	localUserNat      *LocalUserNat
 	securityPolicy    SecurityPolicy
 	settings          *RemoteUserNatProviderSettings
@@ -2991,10 +2992,14 @@ func NewRemoteUserNatProvider(
 	localUserNat *LocalUserNat,
 	settings *RemoteUserNatProviderSettings,
 ) *RemoteUserNatProvider {
+	// the security policy runs a background scan goroutine; scope it to this provider (a child of
+	// the client ctx) so Close stops it, rather than leaking it for the life of the client
+	cancelCtx, cancel := context.WithCancel(client.Ctx())
 	userNatProvider := &RemoteUserNatProvider{
 		client:            client,
+		cancel:            cancel,
 		localUserNat:      localUserNat,
-		securityPolicy:    settings.EgressSecurityPolicyGenerator(DefaultSecurityPolicyStatsCollector()),
+		securityPolicy:    settings.SecurityPolicyGenerator(cancelCtx, DefaultSecurityPolicyStatsCollector()),
 		settings:          settings,
 		sourceProvideMode: map[Id]protocol.ProvideMode{},
 	}
@@ -3050,6 +3055,18 @@ func (self *RemoteUserNatProvider) Receive(
 		return
 	}
 
+	// the provider's egress is the return into the tunnel (destination->client); the reversed
+	// provider policy applies the client-ingress source check here, then refreshes the flow so an
+	// active download isn't reclaimed while the outbound side is quiet
+	r, err := self.securityPolicy.InspectEgress(provideMode, ipPath, nil)
+	if err != nil {
+		return
+	}
+	self.securityPolicy.RefreshEgress(ipPath)
+	if r != SecurityPolicyResultAllow {
+		return
+	}
+
 	ipPacketFromProvider := &protocol.IpPacketFromProvider{
 		IpPacket: &protocol.IpPacket{
 			PacketBytes: MessagePoolShareReadOnly(packet),
@@ -3086,6 +3103,11 @@ func (self *RemoteUserNatProvider) Receive(
 			self.settings.WriteTimeout,
 			opts...,
 		)
+		if !sent {
+			// the send did not take the frame: free it. For raw frames this undoes
+			// the packet share above; for wrapped frames it frees the marshal buffer.
+			MessagePoolReturn(frame.MessageBytes)
+		}
 		// if sent {
 		// 	self.client.log.Infof("[trace]provider return packet sent for %s\n", source.SourceId)
 		// }
@@ -3134,7 +3156,10 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 
 			ipPath, payload, err := ParseIpPathWithPayload(ipPacketToProvider.IpPacket.PacketBytes)
 			if err == nil {
-				r, err := self.securityPolicy.Inspect(provideMode, ipPath, payload)
+				// the provider's ingress is the remote client's egress (outbound, received from the
+				// tunnel); the reversed provider policy applies the client-egress DPI here
+				r, err := self.securityPolicy.InspectIngress(provideMode, ipPath, payload)
+				self.securityPolicy.RefreshIngress(ipPath)
 				if err == nil {
 					switch r {
 					case SecurityPolicyResultAllow:
@@ -3183,6 +3208,7 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 func (self *RemoteUserNatProvider) Close() {
 	// self.client.RemoveReceiveCallback(self.clientCallbackId)
 	// self.localUserNat.RemoveReceivePacketCallback(self.localUserNatCallbackId)
+	self.cancel()
 	self.clientUnsub()
 	self.localUserNatUnsub()
 }
@@ -3190,6 +3216,7 @@ func (self *RemoteUserNatProvider) Close() {
 // this is a basic implementation. See `RemoteUserNatWindowedClient` for a more robust implementation
 type RemoteUserNatClient struct {
 	client                *Client
+	cancel                context.CancelFunc
 	receivePacketCallback ReceivePacketFunction
 	securityPolicy        SecurityPolicy
 	pathTable             *pathTable
@@ -3230,10 +3257,14 @@ func NewRemoteUserNatClientWithClose(
 	localUserNatSettings.TcpBufferSettings.UserLimit = 0
 	localUserNat := NewLocalUserNat(client.Ctx(), "remote local", localUserNatSettings)
 
+	// the security policy runs a background scan goroutine; scope it to this client (a child of
+	// the client ctx) so Close stops it rather than leaking it for the life of the client
+	cancelCtx, cancel := context.WithCancel(client.Ctx())
 	userNatClient := &RemoteUserNatClient{
 		client:                client,
+		cancel:                cancel,
 		receivePacketCallback: receivePacketCallback,
-		securityPolicy:        DefaultEgressSecurityPolicy(),
+		securityPolicy:        DefaultSecurityPolicy(cancelCtx),
 		pathTable:             pathTable,
 		provideMode:           provideMode,
 		localUserNat:          localUserNat,
@@ -3268,10 +3299,11 @@ func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode pro
 	if err != nil {
 		return false
 	}
-	r, err := self.securityPolicy.Inspect(minRelationship, ipPath, payload)
+	r, err := self.securityPolicy.InspectEgress(minRelationship, ipPath, payload)
 	if err != nil {
 		return false
 	}
+	self.securityPolicy.RefreshEgress(ipPath)
 
 	switch r {
 	case SecurityPolicyResultAllow:
@@ -3298,6 +3330,11 @@ func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode pro
 		opts := []any{}
 		// note udp is sent with ack because because otherwise the delivery reliability will mulitply with the egress
 		success := self.client.SendMultiHopWithTimeout(frame, destination, func(err error) {}, timeout, opts...)
+		if !success {
+			// the send did not take the frame: free it. For raw frames this undoes
+			// the packet share above; for wrapped frames it frees the marshal buffer.
+			MessagePoolReturn(frame.MessageBytes)
+		}
 		return success
 	case SecurityPolicyResultDrop:
 		if self.LocalSecurityBypass() {
@@ -3331,6 +3368,7 @@ func (self *RemoteUserNatClient) ClientReceive(source TransferPath, frames []*pr
 
 			ipPath, err := ParseIpPath(packet)
 			if err == nil {
+				self.securityPolicy.RefreshIngress(ipPath)
 				HandleError(func() {
 					self.receivePacketCallback(
 						source,
@@ -3350,6 +3388,7 @@ func (self *RemoteUserNatClient) Shuffle() {
 
 func (self *RemoteUserNatClient) Close() {
 	// self.client.RemoveReceiveCallback(self.clientCallbackId)
+	self.cancel()
 	self.localUserNat.Close()
 	self.localUserNatUnsub()
 	self.clientUnsub()
