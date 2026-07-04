@@ -55,8 +55,10 @@ func initGlog() {
 	os.Stderr = os.Stdout
 }
 
-func main() {
-	usage := fmt.Sprintf(
+// mainUsage returns the docopt usage string. Package-level (rather than
+// inline in `main`) so tests can parse argv against the real usage.
+func mainUsage() string {
+	return fmt.Sprintf(
 		`Connect provider.
 
 The default URLs are:
@@ -71,19 +73,31 @@ Usage:
     provider provide [--port=<port>]
         [--api_url=<api_url>]
         [--connect_url=<connect_url>]
+        [--wallet=<coldkey_ss58>]
         [--max-memory=<mem>]
         [-v...]
     provider auth-provide ([<auth_code>] | --user_auth=<user_auth> [--password=<password>]) [-f]
     	[--port=<port>]
         [--api_url=<api_url>]
         [--connect_url=<connect_url>]
+        [--wallet=<coldkey_ss58>]
         [--max-memory=<mem>]
+        [-v...]
+    provider wallet set <coldkey_ss58>
+        [--api_url=<api_url>]
+        [-v...]
+    provider claim [--epoch=<epoch>] [--rpc=<rpc_url>]... [--dry-run]
+        [--api_url=<api_url>]
+        [-v...]
+    provider bind-head --hotkey=<hex> --registrant=<registrant> --contract=<contract> [--rpc=<rpc_url>]...
+        [-v...]
+    provider unbind-head --hotkey=<hex> [--contract=<contract>]
         [-v...]
     provider proxy auth add [<key>] <proxy_user> <proxy_password> [-f]
     provider proxy auth remove [<key>] [--all]
     provider proxy add [<key_address>...] [--proxy_file=<proxy_file>] [-f]
     provider proxy remove [<key_address>...] [--all]
-    
+
 Options:
     -h --help                        Show this help and exit.
     --version                        Show version.
@@ -98,6 +112,20 @@ Options:
     				                 password anyways, if you don't specify it using this option.
     -p --port=<port>                 Status server port [default: 0].
     --max-memory=<mem>               Set the maximum amount of memory in bytes, or the suffixes b, kib, mib, gib may be used [This is a soft limit].
+    --wallet=<coldkey_ss58>          Also set the subnet claim wallet at startup, same as provider wallet set.
+                                     A failure is logged and does not block providing.
+    <coldkey_ss58>                   Subnet claim wallet: an ss58 coldkey address (prefix 42).
+    --epoch=<epoch>                  Epoch to fetch the subnet pool claim for. Defaults to the last
+                                     finalized epoch, which is the epoch before the current one.
+    --rpc=<rpc_url>                  EVM json-rpc endpoint used to check the payout root on-chain.
+                                     May be repeated; endpoints are tried in order until one answers.
+    --dry-run                        Accepted for symmetry with snclaim; claim always verifies only
+                                     and never submits a transaction.
+    --hotkey=<hex>                   Head-tier miner hotkey as a 0x-optional 32-byte hex account id.
+    --registrant=<registrant>        The EVM address that will submit bindHead via snclaim (0x, 20 bytes).
+                                     The head-bind digest is bound to this address, so it MUST equal the
+                                     snclaim sender, whose mirror must be the hotkey's on-chain coldkey.
+    --contract=<contract>            STSubnet proxy contract address (0x, 20 bytes).
     <key>                            Authentication key
     <proxy_user>                     SOCKS5 user
     <proxy_password>                 SOCKS5 password
@@ -106,8 +134,10 @@ Options:
 		DefaultApiUrl,
 		DefaultConnectUrl,
 	)
+}
 
-	opts, err := docopt.ParseArgs(usage, os.Args[1:], RequireVersion())
+func main() {
+	opts, err := docopt.ParseArgs(mainUsage(), os.Args[1:], RequireVersion())
 
 	if err != nil {
 		panic(err)
@@ -125,6 +155,16 @@ Options:
 		} else if remove, _ := opts.Bool("remove"); remove {
 			proxyRemove(opts)
 		}
+	} else if wallet, _ := opts.Bool("wallet"); wallet {
+		if set, _ := opts.Bool("set"); set {
+			walletSet(opts)
+		}
+	} else if claim_, _ := opts.Bool("claim"); claim_ {
+		claim(opts)
+	} else if bindHead_, _ := opts.Bool("bind-head"); bindHead_ {
+		bindHead(opts)
+	} else if unbindHead_, _ := opts.Bool("unbind-head"); unbindHead_ {
+		unbindHead(opts)
 	} else if auth_, _ := opts.Bool("auth"); auth_ {
 		auth(opts)
 	} else if provide_, _ := opts.Bool("provide"); provide_ {
@@ -306,6 +346,19 @@ func provide(opts docopt.Opts) {
 
 	ctx, cancel := context.WithCancel(event.Ctx())
 	defer cancel()
+
+	// subnet claim wallet (sn/PLAN.md 7.3, decision D-2): validate the
+	// ss58 coldkey locally and idempotently register it with the platform
+	// before providing starts. A failure warns and does not block
+	// providing — the wallet may already be set from a previous run, and
+	// the call can be retried any time with `provider wallet set`.
+	if coldkeySs58, walletErr := opts.String("--wallet"); walletErr == nil && coldkeySs58 != "" {
+		walletClientStrategy := connect.NewClientStrategyWithDefaults(ctx)
+		if err := snSetWallet(ctx, walletClientStrategy, apiUrl, coldkeySs58); err != nil {
+			fmt.Printf("subnet wallet not set: %s\n", err)
+			fmt.Printf("continuing to provide. Retry with: provider wallet set <coldkey_ss58>\n")
+		}
+	}
 
 	provideWithProxy := func(proxySettings *connect.ProxySettings) {
 		proxyCtx, proxyCancel := context.WithCancel(ctx)
