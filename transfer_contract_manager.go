@@ -187,7 +187,11 @@ func DefaultContractManagerSettingsWithBufferSize(bufferSize int) *ContractManag
 	// NETWORK EVENT: at the change-hmac date, signers cut over from the legacy
 	// HMAC format to the standard form. verifiers accept both forms at all
 	// times so the cutover can be deployed asymmetrically.
-	networkEventTimeChangeHmac, err := time.Parse(time.RFC3339, "2026-07-01T00:00:00Z")
+	// Pushed out from the original 2026-07-01: clients on connect < v2026.5.14
+	// (2026-05-13) have legacy-only verifiers and cannot verify the standard
+	// form, so the original date broke them the moment it passed. Hold the
+	// cutover until that older fleet has drained.
+	networkEventTimeChangeHmac, err := time.Parse(time.RFC3339, "2026-09-01T00:00:00Z")
 	if err != nil {
 		panic(err)
 	}

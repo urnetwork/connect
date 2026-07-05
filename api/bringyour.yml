@@ -1530,6 +1530,113 @@ paths:
               schema:
                 $ref: "#/components/schemas/SolanaPaymentIntentResult"
 
+  /verify:
+    post:
+      description: |
+        One step of the validator's routing-verification protocol.
+        The route accepts two body shapes:
+        - SEED starts a new trail through the validator-chosen entry provider.
+        - EXTEND claims the pending assigned hop of an active trail.
+        The request must egress from the provider being claimed - the server
+        resolves the hop from the request source IP, never from the body.
+        Authentication is the protocol's own Ed25519 signatures (over the
+        canonical binary messages, not the JSON), not a JWT.
+        A non-final step returns the assign result (the server's signed
+        commitment to the next hop); the final step returns status "complete"
+        and the published proof.
+      operationId: Verify
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: "#/components/schemas/VerifySeedArgs"
+                - $ref: "#/components/schemas/VerifyExtendArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/VerifyAssignResult"
+                  - $ref: "#/components/schemas/VerifyFinalResult"
+
+  /verify/keys:
+    get:
+      description: |
+        The published server Ed25519 verify keys, by server_key_id.
+        All historical keys are listed so old proofs remain verifiable
+        across key rotations.
+      operationId: Verify Keys
+      security: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VerifyKeysResult"
+
+  /sn/wallet:
+    post:
+      description: |
+        Set the caller network's subnet coldkey - the ss58 address that pool
+        payouts for this network are claimable by. This wallet is deliberately
+        separate from the account payout wallet.
+      operationId: Sn Set Wallet
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnSetWalletArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnSetWalletResult"
+
+  /sn/pool/claim:
+    get:
+      description: |
+        The caller network's merkle pool-payout claim for an epoch:
+        everything needed to call claim on the subnet contract.
+        Claims are served once the epoch is finalized on chain.
+      operationId: Sn Pool Claim
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: query
+          name: epoch
+          schema:
+            type: integer
+          required: true
+          description: Epoch index
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnPoolClaimResult"
+
+  /sn/epoch:
+    get:
+      description: |
+        The current subnet epoch index, boundaries, and deadlines mirrored
+        from chain, so clients do not need their own RPC.
+      operationId: Sn Epoch
+      security: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnEpochResult"
+
 components:
   securitySchemes:
     BearerAuth:
@@ -3759,3 +3866,245 @@ components:
           properties:
             message:
               type: string
+
+    VerifySeedArgs:
+      type: object
+      description: |
+        SEED request body - starts a new trail. seed_sig is an Ed25519
+        signature over the canonical SEED message
+        (ctx "urnetwork/verify/v1", msg_type 0x01), not over this JSON.
+      required:
+        - client_id
+        - vpk
+        - client_nonce
+        - seed_sig
+        - M
+      properties:
+        client_id:
+          description: uuid. The validator's own client_id; the server checks vpk equals this client's registered Ed25519 key.
+          type: string
+        vpk:
+          description: base64 encoded 32-byte Ed25519 validator path key.
+          type: string
+        client_nonce:
+          description: base64 encoded 32-byte nonce.
+          type: string
+        seed_sig:
+          description: base64 encoded 64-byte Ed25519 SEED signature.
+          type: string
+        M:
+          description: Requested trail depth. The server clamps to its allowed range.
+          type: integer
+
+    VerifyExtendArgs:
+      type: object
+      description: |
+        EXTEND request body - claims the pending assigned hop. extend_sig is
+        an Ed25519 signature over the canonical EXTEND message
+        (ctx "urnetwork/verify/v1", msg_type 0x02), not over this JSON.
+      required:
+        - client_id
+        - trail_id
+        - trail
+        - extend_sig
+      properties:
+        client_id:
+          description: uuid. The validator's own client_id.
+          type: string
+        trail_id:
+          description: uuid
+          type: string
+        trail:
+          description: The ordered confirmed hop client_ids plus the single pending hop being claimed.
+          type: array
+          items:
+            description: uuid
+            type: string
+        extend_sig:
+          description: base64 encoded 64-byte Ed25519 EXTEND signature.
+          type: string
+
+    VerifyAssignResult:
+      type: object
+      description: |
+        Non-final /verify response - the server's signed commitment to the
+        next hop. The next EXTEND submits trail + next_hop.
+      properties:
+        trail_id:
+          description: uuid
+          type: string
+        server_nonce:
+          description: base64 encoded 32-byte per-trail server nonce.
+          type: string
+        trail:
+          description: The ordered confirmed hop client_ids (ids only; times are published only in the final proof).
+          type: array
+          items:
+            description: uuid
+            type: string
+        next_hop:
+          description: uuid. The newly assigned pending hop.
+          type: string
+        M:
+          description: The server-clamped effective trail depth.
+          type: integer
+        server_key_id:
+          description: 1-byte id of the server key that signed assign_sig. See /verify/keys.
+          type: integer
+        assign_sig:
+          description: base64 encoded 64-byte Ed25519 ASSIGN signature by the server (msg_type 0x03).
+          type: string
+
+    VerifyFinalResult:
+      type: object
+      description: Final /verify response at depth M.
+      properties:
+        status:
+          description: '"complete"'
+          type: string
+        proof:
+          $ref: "#/components/schemas/VerifyProof"
+
+    VerifyProofHeader:
+      type: object
+      properties:
+        trail_id:
+          description: uuid
+          type: string
+        server_nonce:
+          description: base64 encoded 32-byte per-trail server nonce.
+          type: string
+        vpk:
+          description: base64 encoded 32-byte Ed25519 validator path key.
+          type: string
+        M:
+          description: Trail depth.
+          type: integer
+
+    VerifyProofHop:
+      type: object
+      properties:
+        client_id:
+          description: uuid. The canonical provider at this hop.
+          type: string
+        time_ms:
+          description: Server-stamped confirmation time, unix milliseconds UTC.
+          type: integer
+
+    VerifyProof:
+      type: object
+      description: |
+        The published, non-repudiable completed trail. final_sig verifies
+        under the /verify/keys key for server_key_id (msg_type 0x04);
+        verifier_sig is the validator's depth-M EXTEND signature
+        (msg_type 0x02).
+      properties:
+        header:
+          $ref: "#/components/schemas/VerifyProofHeader"
+        hops:
+          type: array
+          items:
+            $ref: "#/components/schemas/VerifyProofHop"
+        server_key_id:
+          description: 1-byte id of the server key that signed final_sig.
+          type: integer
+        final_sig:
+          description: base64 encoded 64-byte Ed25519 FINAL signature by the server.
+          type: string
+        verifier_sig:
+          description: base64 encoded 64-byte Ed25519 depth-M EXTEND signature by the validator.
+          type: string
+
+    VerifyServerKey:
+      type: object
+      properties:
+        server_key_id:
+          description: 1-byte key rotation id.
+          type: integer
+        public_key:
+          description: base64 encoded 32-byte Ed25519 public key.
+          type: string
+
+    VerifyKeysResult:
+      type: object
+      properties:
+        keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/VerifyServerKey"
+
+    SnSetWalletArgs:
+      type: object
+      required:
+        - coldkey_ss58
+      properties:
+        coldkey_ss58:
+          description: The subnet coldkey as an ss58 address.
+          type: string
+
+    SnSetWalletResult:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    SnPoolClaimResult:
+      type: object
+      properties:
+        epoch:
+          description: Epoch index.
+          type: integer
+        no_id:
+          description: base64 encoded 32-byte network operator id, as committed on chain.
+          type: string
+        coldkey:
+          description: base64 encoded 32-byte coldkey public key (the ss58-decoded key set via /sn/wallet).
+          type: string
+        share_bps:
+          description: The caller's payout share in basis points.
+          type: integer
+        proof:
+          description: Merkle proof from the (no_id, coldkey, share_bps) leaf to payout_root.
+          type: array
+          items:
+            description: base64 encoded 32-byte node hash.
+            type: string
+        payout_root:
+          description: base64 encoded 32-byte committed payout merkle root.
+          type: string
+        contract_address:
+          description: 0x-hex EVM address of the subnet contract.
+          type: string
+        chain_id:
+          description: EVM chain id of the subnet contract chain.
+          type: integer
+        claim_open_block:
+          description: Block number claims open at.
+          type: integer
+
+    SnEpochResult:
+      type: object
+      properties:
+        epoch:
+          description: Epoch index.
+          type: integer
+        start_block:
+          type: integer
+        commit_deadline_block:
+          type: integer
+        trails_deadline_block:
+          type: integer
+        finalize_block:
+          type: integer
+        t_epoch_blocks:
+          description: Epoch length in blocks.
+          type: integer
+        chain_id:
+          description: EVM chain id of the subnet contract chain.
+          type: integer
+        contract_address:
+          description: 0x-hex EVM address of the subnet contract.
+          type: string
