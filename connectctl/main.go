@@ -252,19 +252,16 @@ func verifySend(opts docopt.Opts) {
 	res, err := client.Do(req)
 	if err != nil {
 		panic(err)
-		return
 	}
 	resBody, err := io.ReadAll(res.Body)
 	if err != nil {
 		panic(err)
-		return
 	}
 
 	result := map[string]any{}
 	err = json.Unmarshal(resBody, &result)
 	if err != nil {
 		panic(err)
-		return
 	}
 
 	printResult(result)
@@ -306,19 +303,16 @@ func verifyNetwork(opts docopt.Opts) {
 	res, err := client.Do(req)
 	if err != nil {
 		panic(err)
-		return
 	}
 	resBody, err := io.ReadAll(res.Body)
 	if err != nil {
 		panic(err)
-		return
 	}
 
 	result := map[string]any{}
 	err = json.Unmarshal(resBody, &result)
 	if err != nil {
 		panic(err)
-		return
 	}
 
 	printResult(result)
@@ -360,19 +354,16 @@ func loginNetwork(opts docopt.Opts) {
 	res, err := client.Do(req)
 	if err != nil {
 		panic(err)
-		return
 	}
 	resBody, err := io.ReadAll(res.Body)
 	if err != nil {
 		panic(err)
-		return
 	}
 
 	result := map[string]any{}
 	err = json.Unmarshal(resBody, &result)
 	if err != nil {
 		panic(err)
-		return
 	}
 
 	printResult(result)
@@ -418,12 +409,10 @@ func clientId(opts docopt.Opts) {
 	res, err := client.Do(req)
 	if err != nil {
 		panic(err)
-		return
 	}
 	resBody, err := io.ReadAll(res.Body)
 	if err != nil {
 		panic(err)
-		return
 	}
 
 	fmt.Printf("response: %s\n", resBody)
@@ -432,7 +421,6 @@ func clientId(opts docopt.Opts) {
 	err = json.Unmarshal(resBody, &result)
 	if err != nil {
 		panic(err)
-		return
 	}
 
 	printResult(result)
