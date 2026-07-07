@@ -25,6 +25,9 @@ info:
     Unless otherwise specified, time/date strings will be formatted
     in the Go default `2006-01-02 15:04:05.999999999 -0700 MST` (RFC 3339).
 
+    Responses may include additional fields beyond those documented here.
+    Clients should ignore unknown fields (be liberal in what you accept).
+
   termsOfService: https://ur.io/terms
   contact:
     name: URnetwork
@@ -114,6 +117,27 @@ paths:
               schema:
                 $ref: "#/components/schemas/StatsProviderResult"
 
+  /stats/providers-overview-last-n:
+    post:
+      description: |
+        Get a network-wide time series aggregated across all providers in the
+        caller network, over the last n hours.
+      operationId: Stats Providers Overview Last N hours
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StatsProvidersOverviewArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatsProvidersOverviewResult"
+
   /stats/leaderboard:
     post:
       description: |
@@ -195,6 +219,21 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AuthVerifyResult"
+
+  /auth/refresh:
+    get:
+      description: |
+        Refresh the client JWT (by_jwt) for the caller's client.
+        Requires a client JWT (from `/network/auth-client`).
+      operationId: Auth Refresh Token
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RefreshTokenResult"
 
   /auth/verify-send:
     post:
@@ -322,7 +361,8 @@ paths:
         (from `/network/auth-client`).
         This is a subset of an OAuth flow.
       operationId: Auth Code Create
-      security: []
+      security:
+        - BearerAuth: []
       requestBody:
         required: true
         content:
@@ -377,6 +417,26 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/UpgradeGuestResult"
+
+  /auth/upgrade-guest-existing:
+    post:
+      description: |
+        Authenticate a guest user and migrate into an existing account.
+      operationId: Upgrade Guest Existing
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpgradeGuestExistingArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpgradeGuestExistingResult"
 
   /network/auth-client:
     post:
@@ -498,6 +558,37 @@ paths:
               schema:
                 $ref: "#/components/schemas/FeedbackSendResult"
 
+  /log/{clientId}/upload:
+    post:
+      description: |
+        Upload a log file for the caller, associated with a feedback id.
+        The request body is the raw log file content, streamed to storage.
+        Note the `{clientId}` path segment is actually the feedback id the log
+        is attached to.
+      operationId: Log Upload
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: path
+          name: clientId
+          schema:
+            type: string
+          required: true
+          description: udid. The feedback id the log file is associated with.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadLogFileResult"
+
   /network/provider-locations:
     get:
       description: |
@@ -538,48 +629,6 @@ paths:
               schema:
                 $ref: "#/components/schemas/FindLocationsResult"
 
-  /network/find-locations:
-    post:
-      description: |
-        Search for locations, groups, and devices that match a query,
-        regardless of whether an providers are active.
-      operationId: Network Find Locations
-      security: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/FindLocationsArgs"
-      responses:
-        "200":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/FindLocationsResult"
-
-  /network/find-providers:
-    post:
-      description: |
-        Randomly sample providers that for a location or group,
-        which are active and in good health.
-        This allows random iteration by using the exclude input to mark
-        visited providers.
-      operationId: Network Find Providers
-      security: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/FindProvidersArgs"
-      responses:
-        "200":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/FindProvidersResult"
-
   /network/find-providers2:
     post:
       description: |
@@ -601,26 +650,6 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/FindProviders2Result"
-
-  /network/create-provider-spec:
-    post:
-      description: |
-        Create a spec object for `find-providers2` using a description
-        of the intended use of the network.
-      operationId: Network Find Providers Spec
-      security: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/CreateProviderSpecArgs"
-      responses:
-        "200":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/CreateProviderSpecResult"
 
   /network/ranking:
     get:
@@ -723,6 +752,40 @@ paths:
               schema:
                 $ref: "#/components/schemas/GetNetworkReliabilityResult"
 
+  /network/user:
+    get:
+      description: |
+        Get the user and configured auth methods for the caller network.
+      operationId: Get Network User
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetNetworkUserResult"
+
+  /network/user/update:
+    post:
+      description: |
+        Update the caller network's name.
+      operationId: Update Network Name
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateNetworkNameArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpdateNetworkNameResult"
+
   /wallet/balance:
     get:
       description: |
@@ -783,7 +846,7 @@ paths:
         Set up a transfer from the Circle USDC user self custody wallet
         to an address.
         This starts a process that must be completed by the user.
-      operationId: Wallet Circle Init
+      operationId: Wallet Circle Transfer Out
       security:
         - BearerAuth: []
       requestBody:
@@ -1175,25 +1238,33 @@ paths:
               schema:
                 $ref: "#/components/schemas/DeviceSetNameResult"
 
-  /device/set-provide:
+  /connect:
+    get:
+      description: |
+        Redirect (303) to the single sign-on (SSO) start URL.
+        Used to begin the browser SSO/OAuth flow.
+      operationId: Auth Connect
+      security: []
+      responses:
+        "303":
+          description: Redirect to the SSO start URL.
+          headers:
+            Location:
+              schema:
+                type: string
     post:
       description: |
-        Set the provide mode for a device.
-      operationId: Device Set Provide
-      security:
-        - BearerAuth: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/DeviceSetProvideArgs"
+        Redirect (303) to the single sign-on (SSO) start URL.
+        Used to begin the browser SSO/OAuth flow.
+      operationId: Auth Connect Post
+      security: []
       responses:
-        "200":
-          content:
-            application/json:
+        "303":
+          description: Redirect to the SSO start URL.
+          headers:
+            Location:
               schema:
-                $ref: "#/components/schemas/DeviceSetProvideResult"
+                type: string
 
   /connect/control:
     post:
@@ -1217,6 +1288,29 @@ paths:
               schema:
                 $ref: "#/components/schemas/ConnectControlResult"
 
+  /key/{clientId}:
+    get:
+      description: |
+        Fetch the published Ed25519 public key for a client id.
+        Unauthenticated by design - the value is a public key meant to be
+        fetchable by any peer. A client that has never published a key
+        returns `{"public_key": null}` with HTTP 200.
+      operationId: Get Client Key
+      security: []
+      parameters:
+        - in: path
+          name: clientId
+          schema:
+            type: string
+          required: true
+          description: udid. The client id to look up.
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetClientKeyResult"
+
   /hello:
     get:
       description: |
@@ -1230,6 +1324,22 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HelloResult"
+
+  /my-ip-info:
+    get:
+      description: |
+        Information about the caller's IP as seen by the platform:
+        geolocation, privacy/VPN classification, whether the IP is currently
+        connected to the network, and expected round-trip times to nearby
+        landmarks.
+      operationId: My IP Info
+      security: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MyIPInfoResult"
 
   /account/api-key:
     post:
@@ -1401,6 +1511,26 @@ paths:
               schema:
                 $ref: "#/components/schemas/RemoveWalletResult"
 
+  /account/wallets/verify-seeker:
+    post:
+      description: |
+        Verify that a wallet holds a Seeker token by validating a signed message.
+      operationId: Account Verify Seeker Token
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VerifySeekerNftHolderArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VerifySeekerNftHolderResult"
+
   /account/balance-codes:
     get:
       description: |
@@ -1529,6 +1659,48 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SolanaPaymentIntentResult"
+
+  /stripe/payment-intent:
+    post:
+      description: |
+        When paying for a subscription with Stripe, create the payment intents,
+        ephemeral key, and customer id needed to complete the purchase.
+      operationId: Stripe Payment Intent
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StripeCreatePaymentIntentArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StripeCreatePaymentIntentResult"
+
+  /stripe/customer-portal:
+    post:
+      description: |
+        Create a Stripe customer portal URL for the caller to manage their
+        subscription.
+      operationId: Stripe Customer Portal
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StripeCreateCustomerPortalArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StripeCreateCustomerPortalResult"
 
   /verify:
     post:
@@ -1664,6 +1836,23 @@ components:
     ProxyClient:
       type: object
       properties:
+        change_id:
+          type: integer
+        create_time:
+          description: datetime
+          type: string
+        proxy_id:
+          description: udid
+          type: string
+        client_id:
+          description: udid
+          type: string
+        api_base_url:
+          type: string
+        block:
+          type: string
+        api_port:
+          type: integer
         http_proxy_url:
           type: string
         https_proxy_url:
@@ -1870,6 +2059,8 @@ components:
           type: string
         password:
           type: string
+        verify_otp_numeric:
+          type: boolean
 
     AuthLoginWithPasswordResult:
       type: object
@@ -1907,12 +2098,14 @@ components:
       properties:
         network:
           type: object
-          by_jwt:
-            type: string
+          properties:
+            by_jwt:
+              type: string
         error:
           type: object
-          message:
-            type: string
+          properties:
+            message:
+              type: string
 
     AuthVerifySendArgs:
       type: object
@@ -1991,6 +2184,10 @@ components:
         terms:
           description: user consent to accept terms of service
           type: boolean
+        guest_mode:
+          type: boolean
+        verify_use_numeric:
+          type: boolean
         wallet_auth:
           $ref: "#/components/schemas/WalletAuthArgs"
         referral_code:
@@ -2013,6 +2210,13 @@ components:
               type: string
             network_name:
               type: string
+            is_pro:
+              type: boolean
+        user_auth:
+          description: email or phone number
+          type: string
+        is_pro:
+          type: boolean
         verification_required:
           type: object
           properties:
@@ -2027,7 +2231,12 @@ components:
 
     NetworkDeleteResult:
       type: object
-      properties: {}
+      properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string
 
     UpgradeGuestArgs:
       type: object
@@ -2057,6 +2266,9 @@ components:
           properties:
             by_jwt:
               type: string
+        user_auth:
+          description: email or phone number
+          type: string
         verification_required:
           type: object
           properties:
@@ -2126,12 +2338,6 @@ components:
         device_spec:
           description: If this is a new device, sets the device spec.
           type: string
-        derived_client_id:
-          description: udid. Optional. |
-            The client that the new client is derived from.
-            If this is called with a client jwt, the derived client id is inferred from the jwt.
-          type: string
-
         # the proxy auth will be the by_client_jwt as username, no password
         proxy_config:
           description: Optional. |
@@ -2209,7 +2415,7 @@ components:
                           const: quality
                         - title: WindowTypeSpeed
                           const: speed
-                    window_size_settings:
+                    window_size:
                       type: object
                       properties:
                         window_size_min:
@@ -2240,6 +2446,9 @@ components:
       type: object
       properties:
         by_client_jwt:
+          type: string
+        client_id:
+          description: udid
           type: string
         # the returned proxy urls are valid as long as the client is not removed
         proxy_config_result:
@@ -2446,15 +2655,12 @@ components:
           type: number
         enable_max_distance_fraction:
           type: boolean
+        rank_mode:
+          type: string
 
     FindLocationsResult:
       type: object
       properties:
-        # specs can be directly passed to `find-providers2` to enumerate clients for this result
-        specs:
-          type: array
-          items:
-            $ref: "#/components/schemas/ProviderSpec"
         groups:
           type: array
           items:
@@ -2508,6 +2714,10 @@ components:
                 type: integer
               match_distance:
                 type: integer
+              stable:
+                type: boolean
+              strong_privacy:
+                type: boolean
         devices:
           type: array
           items:
@@ -2518,6 +2728,16 @@ components:
                 type: string
               device_name:
                 type: string
+        country_count:
+          type: integer
+        region_count:
+          type: integer
+        city_count:
+          type: integer
+        stable_count:
+          type: integer
+        strong_privacy_count:
+          type: integer
 
     FindProvidersArgs:
       type: object
@@ -2570,6 +2790,8 @@ components:
             $ref: "#/components/schemas/ProviderSpec"
         count:
           type: integer
+        force_count:
+          type: boolean
         exclude_client_ids:
           type: array
           items:
@@ -2586,6 +2808,8 @@ components:
           type: string
           enum: [quality, speed]
           default: quality
+        force_minimum:
+          type: boolean
 
     FindProviders2Result:
       type: object
@@ -2600,6 +2824,8 @@ components:
                 type: string
               estimated_bytes_per_second:
                 type: integer
+              has_estimated_bytes_per_second:
+                type: boolean
               tier:
                 type: integer
               intermediary_ids:
@@ -2649,6 +2875,11 @@ components:
       type: object
       properties:
         address:
+          type: string
+        chain:
+          description: |
+            Optional. The Circle blockchain param for the address.
+            See https://developers.circle.com/w3s/reference/createvalidateaddress
           type: string
 
     WalletValidateAddressResult:
@@ -2745,8 +2976,14 @@ components:
                 type: integer
               net_revenue_nano_cents:
                 type: integer
+              subsidy_net_revenue_nano_cents:
+                type: integer
               balance_byte_count:
                 type: integer
+              purchase_token:
+                type: string
+              paid:
+                type: boolean
         pending_payout_usd_nano_cents:
           type: integer
         update_time:
@@ -2872,6 +3109,58 @@ components:
                 additionalProperties:
                   x-additionalPropertiesName: yyyy-mm-dd
                   type: number
+
+    StatsProvidersOverviewArgs:
+      type: object
+      properties:
+        last_n:
+          description: n hours
+          type: number
+
+    StatsProvidersOverviewResult:
+      type: object
+      properties:
+        lookback:
+          type: integer
+        created_time:
+          description: datetime
+          type: string
+        uptime:
+          type: object
+          description: yyyy-mm-dd to avg hours up per provider
+          additionalProperties:
+            x-additionalPropertiesName: yyyy-mm-dd
+            type: number
+        transfer_data:
+          type: object
+          description: yyyy-mm-dd to gib
+          additionalProperties:
+            x-additionalPropertiesName: yyyy-mm-dd
+            type: number
+        payout:
+          type: object
+          description: yyyy-mm-dd to payout USDC
+          additionalProperties:
+            x-additionalPropertiesName: yyyy-mm-dd
+            type: number
+        search_interest:
+          type: object
+          description: yyyy-mm-dd to matching search count
+          additionalProperties:
+            x-additionalPropertiesName: yyyy-mm-dd
+            type: integer
+        contracts:
+          type: object
+          description: yyyy-mm-dd to count
+          additionalProperties:
+            x-additionalPropertiesName: yyyy-mm-dd
+            type: integer
+        clients:
+          type: object
+          description: yyyy-mm-dd to count
+          additionalProperties:
+            x-additionalPropertiesName: yyyy-mm-dd
+            type: integer
 
     SubscriptionCheckBalanceCodeArgs:
       type: object
@@ -3051,7 +3340,7 @@ components:
           description: keep this secret locally to use with confirm
           type: string
         duration_minutes:
-          type: integer
+          type: number
         error:
           type: object
           properties:
@@ -3125,6 +3414,8 @@ components:
           items:
             type: object
             properties:
+              pending:
+                type: boolean
               code:
                 type: string
               device_name:
@@ -3247,9 +3538,7 @@ components:
           description: |
             base64 encoded connect protobuf `Pack` processed as control messages.
             As an inline message, these would be sent to the control id.
-          type: array
-          items:
-            type: string
+          type: string
 
     ConnectControlResult:
       type: object
@@ -3258,9 +3547,7 @@ components:
           description: |
             base64 encoded connect `Pack` resulting from processing the control messages.
             As an inline message, this is what would be sent from the control id after processing the control messages.
-          type: array
-          items:
-            type: string
+          type: string
         error:
           type: object
           properties:
@@ -3353,6 +3640,8 @@ components:
         create_time:
           description: datetime
           type: string
+        has_seeker_token:
+          type: boolean
 
     GetAccountWalletsResult:
       type: object
@@ -3418,6 +3707,9 @@ components:
     AccountPoint:
       type: object
       properties:
+        account_point_id:
+          description: uuid
+          type: string
         network_id:
           description: uuid
           type: string
@@ -3425,8 +3717,21 @@ components:
           type: string
           enum:
             - referral
+            - payout
+            - payout_linked_account
+            - payout_multiplier
+            - payout_reliability
         point_value:
           type: integer
+        payment_plan_id:
+          description: uuid
+          type: string
+        account_payment_id:
+          description: uuid
+          type: string
+        linked_network_id:
+          description: uuid
+          type: string
         create_time:
           description: datetime
           type: string
@@ -3575,6 +3880,8 @@ components:
           type: integer
         subsidy_payout_nano_cents:
           type: integer
+        reliability_subsidy_nano_cents:
+          type: integer
         min_sweep_time:
           type: string
           format: date-time
@@ -3600,6 +3907,7 @@ components:
           nullable: true
         wallet_address:
           type: string
+          nullable: true
         blockchain:
           type: string
           enum:
@@ -3640,6 +3948,12 @@ components:
 
     NetworkBlockLocationResult:
       type: object
+      properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string
 
     NetworkUnblockLocationArgs:
       type: object
@@ -3650,6 +3964,12 @@ components:
 
     NetworkUnblockLocationResult:
       type: object
+      properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string
 
     BlockedLocation:
       type: object
@@ -3671,6 +3991,11 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/BlockedLocation"
+        error:
+          type: object
+          properties:
+            message:
+              type: string
 
     ReliabilityWindow:
       type: object
@@ -3990,6 +4315,14 @@ components:
         time_ms:
           description: Server-stamped confirmation time, unix milliseconds UTC.
           type: integer
+        egress_ip_hash:
+          description: |
+            The 32-byte hash of the provider's egress IP at the subnet's
+            configured prefix granularity. Marshals on the wire as a JSON
+            array of 32 integers (a Go [32]byte), not a base64 string.
+          type: array
+          items:
+            type: integer
 
     VerifyProof:
       type: object
@@ -4007,6 +4340,11 @@ components:
             $ref: "#/components/schemas/VerifyProofHop"
         server_key_id:
           description: 1-byte id of the server key that signed final_sig.
+          type: integer
+        coverage:
+          description: |
+            The server-attested coverage of the trail (v1 = M-1, the
+            server-assigned confirmed hops with the seed excluded).
           type: integer
         final_sig:
           description: base64 encoded 64-byte Ed25519 FINAL signature by the server.
@@ -4084,6 +4422,11 @@ components:
         claim_open_block:
           description: Block number claims open at.
           type: integer
+        error:
+          type: object
+          properties:
+            message:
+              type: string
 
     SnEpochResult:
       type: object
@@ -4108,3 +4451,289 @@ components:
         contract_address:
           description: 0x-hex EVM address of the subnet contract.
           type: string
+
+    RefreshTokenResult:
+      type: object
+      properties:
+        by_jwt:
+          description: The refreshed client JWT.
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    GetClientKeyResult:
+      type: object
+      properties:
+        public_key:
+          description: |
+            base64 encoded Ed25519 public key for the client id.
+            null when the client has never published a key.
+          type: string
+          nullable: true
+
+    MyIPInfoResult:
+      type: object
+      properties:
+        info:
+          type: object
+          properties:
+            ip:
+              type: string
+            location:
+              type: object
+              properties:
+                coordinates:
+                  type: object
+                  properties:
+                    lat:
+                      type: number
+                    lon:
+                      type: number
+                city:
+                  type: string
+                region:
+                  type: string
+                country:
+                  type: object
+                  properties:
+                    code:
+                      type: string
+                    name:
+                      type: string
+                    flag_url:
+                      type: string
+                continent:
+                  type: object
+                  properties:
+                    code:
+                      type: string
+                    name:
+                      type: string
+                timezone:
+                  type: string
+            privacy:
+              type: object
+              properties:
+                vpn:
+                  type: boolean
+                proxy:
+                  type: boolean
+                tor:
+                  type: boolean
+                relay:
+                  type: boolean
+                hosting:
+                  type: boolean
+                service:
+                  type: string
+        landmarks:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              ip:
+                type: string
+              url:
+                type: string
+              rtt:
+                type: number
+              ws_url:
+                type: string
+              coordinates:
+                type: array
+                items:
+                  type: number
+        connected_to_network:
+          type: boolean
+
+    GetNetworkUserResult:
+      type: object
+      properties:
+        network_user:
+          type: object
+          properties:
+            user_id:
+              description: udid
+              type: string
+            user_auth:
+              description: email or phone number
+              type: string
+            verified:
+              type: boolean
+            auth_type:
+              type: string
+            network_name:
+              type: string
+            wallet_address:
+              type: string
+            user_auths:
+              type: array
+              items:
+                type: object
+                properties:
+                  user_auth:
+                    type: string
+                  auth_type:
+                    type: string
+            sso_auths:
+              type: array
+              items:
+                type: object
+                properties:
+                  user_id:
+                    description: udid
+                    type: string
+                  auth_type:
+                    type: string
+                  auth_jwt:
+                    type: string
+                  user_auth:
+                    type: string
+            wallet_auths:
+              type: array
+              items:
+                type: object
+                properties:
+                  user_id:
+                    description: udid
+                    type: string
+                  wallet_address:
+                    type: string
+                  blockchain:
+                    type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    UpdateNetworkNameArgs:
+      type: object
+      properties:
+        network_name:
+          type: string
+
+    UpdateNetworkNameResult:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    VerifySeekerNftHolderArgs:
+      type: object
+      properties:
+        wallet_address:
+          description: The wallet public key
+          type: string
+        wallet_signature:
+          type: string
+        wallet_message:
+          description: The signed message
+          type: string
+
+    VerifySeekerNftHolderResult:
+      type: object
+      properties:
+        success:
+          type: boolean
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    UpgradeGuestExistingArgs:
+      type: object
+      properties:
+        user_auth:
+          description: email or phone number
+          type: string
+        password:
+          type: string
+        auth_jwt:
+          type: string
+        auth_jwt_type:
+          type: string
+          enum:
+            - apple
+            - google
+        wallet_auth:
+          $ref: "#/components/schemas/WalletAuthArgs"
+
+    UpgradeGuestExistingResult:
+      type: object
+      properties:
+        network:
+          type: object
+          properties:
+            by_jwt:
+              type: string
+        verification_required:
+          type: object
+          properties:
+            user_auth:
+              description: email or phone number
+              type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    UploadLogFileResult:
+      type: object
+      properties: {}
+
+    StripePaymentIntent:
+      type: object
+      properties:
+        subscription_type:
+          type: string
+        client_secret:
+          type: string
+
+    StripeCreatePaymentIntentArgs:
+      type: object
+      properties: {}
+
+    StripeCreatePaymentIntentResult:
+      type: object
+      properties:
+        payment_intents:
+          type: array
+          items:
+            $ref: "#/components/schemas/StripePaymentIntent"
+        ephemeral_key:
+          type: string
+        customer_id:
+          type: string
+        publishable_key:
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    StripeCreateCustomerPortalArgs:
+      type: object
+      properties: {}
+
+    StripeCreateCustomerPortalResult:
+      type: object
+      properties:
+        url:
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
