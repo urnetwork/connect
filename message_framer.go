@@ -128,8 +128,11 @@ func (self *Framer) Write(w io.Writer, message []byte) error {
 		binary.BigEndian.PutUint16(messageWithHeader[0:2], uint16(messageLen))
 		binary.BigEndian.PutUint16(messageWithHeader[2:4], uint16(0))
 		copy(messageWithHeader[4:4+messageLen], message)
-		if _, err := w.Write(messageWithHeader[0 : messageLen+4]); err != nil {
-			return err
+		if nw, writeErr := w.Write(messageWithHeader[0 : messageLen+4]); nw < messageLen+4 {
+			if writeErr == nil {
+				writeErr = io.ErrShortWrite
+			}
+			return writeErr
 		}
 		return nil
 	}
@@ -139,11 +142,17 @@ func (self *Framer) Write(w io.Writer, message []byte) error {
 	binary.BigEndian.PutUint16(h[0:2], uint16(messageLen))
 	binary.BigEndian.PutUint16(h[2:4], uint16(splitIndex))
 	copy(h[4:4+splitIndex], message[0:splitIndex])
-	if _, err := w.Write(h[0 : 4+splitIndex]); err != nil {
-		return err
+	if nw, writeErr := w.Write(h[0 : 4+splitIndex]); nw < 4+splitIndex {
+		if writeErr == nil {
+			writeErr = io.ErrShortWrite
+		}
+		return writeErr
 	}
-	if _, err := w.Write(message[splitIndex:messageLen]); err != nil {
-		return err
+	if nw, writeErr := w.Write(message[splitIndex:messageLen]); nw < len(message)-splitIndex {
+		if writeErr == nil {
+			writeErr = io.ErrShortWrite
+		}
+		return writeErr
 	}
 	return nil
 }

@@ -307,8 +307,11 @@ func (self *P2pSendTransport) run() {
 				return
 			}
 			self.conn.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
-			_, err := self.conn.Write(transferFrameBytes)
+			nw, err := self.conn.Write(transferFrameBytes)
 			MessagePoolReturn(transferFrameBytes)
+			if nw < len(transferFrameBytes) && err == nil {
+				err = io.ErrShortWrite
+			}
 			if err != nil {
 				return
 			}
@@ -417,15 +420,17 @@ func (self *P2pReceiveTransport) run() {
 	for {
 		self.conn.SetReadDeadline(time.Now().Add(self.settings.ReadTimeout))
 		n, err := self.conn.Read(readBuf)
+		if n > 0 {
+			transferFrameBytes := MessagePoolCopy(readBuf[:n])
+			select {
+			case <-self.ctx.Done():
+				MessagePoolReturn(transferFrameBytes)
+				return
+			case self.receive <- transferFrameBytes:
+			}
+		}
 		if err != nil {
 			return
-		}
-		transferFrameBytes := MessagePoolCopy(readBuf[:n])
-		select {
-		case <-self.ctx.Done():
-			MessagePoolReturn(transferFrameBytes)
-			return
-		case self.receive <- transferFrameBytes:
 		}
 	}
 }

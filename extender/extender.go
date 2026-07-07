@@ -474,10 +474,10 @@ func (self *ExtenderServer) HandleExtenderConnection(ctx context.Context, conn n
 	clientConn.SetReadDeadline(time.Now().Add(self.settings.ReadTimeout))
 	for i := 0; i < 4; {
 		n, err := clientConn.Read(headerBytes[i:4])
+		i += n
 		if err != nil {
 			return
 		}
-		i += n
 	}
 	headerByteCount := int(binary.BigEndian.Uint32(headerBytes[0:4]))
 	if 1024 < headerByteCount {
@@ -488,10 +488,10 @@ func (self *ExtenderServer) HandleExtenderConnection(ctx context.Context, conn n
 	for i := 0; i < headerByteCount; {
 		clientConn.SetReadDeadline(time.Now().Add(self.settings.ReadTimeout))
 		n, err := clientConn.Read(headerBytes[i:headerByteCount])
+		i += n
 		if err != nil {
 			return
 		}
-		i += n
 	}
 	// fmt.Printf("Extender 7\n")
 
@@ -535,11 +535,19 @@ func (self *ExtenderServer) HandleExtenderConnection(ctx context.Context, conn n
 
 			clientConn.SetReadDeadline(time.Now().Add(self.settings.ReadTimeout))
 			n, err := clientConn.Read(buffer)
-			if err != nil {
-				return
+			if n > 0 {
+				forwardConn.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
+				toWrite := buffer[0:n]
+				for len(toWrite) > 0 {
+					nw, werr := forwardConn.Write(toWrite)
+					if nw > 0 {
+						toWrite = toWrite[nw:]
+					}
+					if werr != nil {
+						return
+					}
+				}
 			}
-			forwardConn.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
-			_, err = forwardConn.Write(buffer[0:n])
 			if err != nil {
 				return
 			}
@@ -561,11 +569,19 @@ func (self *ExtenderServer) HandleExtenderConnection(ctx context.Context, conn n
 
 			forwardConn.SetReadDeadline(time.Now().Add(self.settings.ReadTimeout))
 			n, err := forwardConn.Read(buffer)
-			if err != nil {
-				return
+			if n > 0 {
+				clientConn.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
+				toWrite := buffer[0:n]
+				for len(toWrite) > 0 {
+					nw, werr := clientConn.Write(toWrite)
+					if nw > 0 {
+						toWrite = toWrite[nw:]
+					}
+					if werr != nil {
+						return
+					}
+				}
 			}
-			clientConn.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
-			_, err = clientConn.Write(buffer[0:n])
 			if err != nil {
 				return
 			}
