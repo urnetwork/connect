@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	// "runtime/debug"
@@ -22,6 +23,26 @@ import (
 
 	"github.com/urnetwork/connect/protocol"
 )
+
+var (
+	lastDropErrLogNano     atomic.Int64
+	suppressedDropErrCount atomic.Int64
+)
+
+func shouldLogDropErr() (bool, int64) {
+	now := time.Now().UnixNano()
+	last := lastDropErrLogNano.Load()
+	if now-last < int64(time.Minute) {
+		suppressedDropErrCount.Add(1)
+		return false, 0
+	}
+	if !lastDropErrLogNano.CompareAndSwap(last, now) {
+		suppressedDropErrCount.Add(1)
+		return false, 0
+	}
+	suppressed := suppressedDropErrCount.Swap(0)
+	return true, suppressed
+}
 
 /*
 Sends frames to destinations with properties:
@@ -3763,7 +3784,13 @@ func (self *ReceiveSequence) Run() {
 			} else {
 				err := c()
 				if err != nil {
-					self.log.Infof("[r]drop = %s", err)
+					if ok, suppressed := shouldLogDropErr(); ok {
+						if suppressed > 0 {
+							self.log.Infof("[r]drop = %s (%d suppressed)", err, suppressed)
+						} else {
+							self.log.Infof("[r]drop = %s", err)
+						}
+					}
 				}
 			}
 		}
