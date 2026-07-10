@@ -57,7 +57,7 @@ func TestRemoteUserNatProviderPacketStats(t *testing.T) {
 	// an allowed outbound flow received from the tunnel is the provider's
 	// ingress, counted when handed to the exit local user nat
 	outboundPacket := craftSecurityPacket(IpProtocolTcp, srcIP, 42001, dstIP, 8080, false, []byte("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"))
-	provider.ClientReceive(source, []*protocol.Frame{toProviderFrame(outboundPacket)}, protocol.ProvideMode_Public)
+	provider.ClientReceive(source, []*protocol.Frame{toProviderFrame(outboundPacket)}, Peer{ProvideMode: protocol.ProvideMode_Public})
 
 	stats := provider.PacketStats()
 	if stats.RemoteIngressPacketCount != 1 || stats.RemoteIngressByteCount != ByteCount(len(outboundPacket)) {
@@ -67,7 +67,7 @@ func TestRemoteUserNatProviderPacketStats(t *testing.T) {
 	// a tunneled BitTorrent handshake is dropped by the reversed policy DPI
 	// and counts as blocked
 	blockedPacket := craftSecurityPacket(IpProtocolTcp, srcIP, 42000, dstIP, 51413, false, bittorrentHandshakePacketPayload())
-	provider.ClientReceive(source, []*protocol.Frame{toProviderFrame(blockedPacket)}, protocol.ProvideMode_Public)
+	provider.ClientReceive(source, []*protocol.Frame{toProviderFrame(blockedPacket)}, Peer{ProvideMode: protocol.ProvideMode_Public})
 
 	stats = provider.PacketStats()
 	if stats.BlockIngressPacketCount != 1 || stats.BlockIngressByteCount != ByteCount(len(blockedPacket)) {

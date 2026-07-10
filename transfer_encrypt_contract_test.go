@@ -252,7 +252,7 @@ func TestSendReceiveEncryptedWithContracts(t *testing.T) {
 
 	receivesA := make(chan string, 1024)
 	receivesB := make(chan string, 1024)
-	a.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, _ protocol.ProvideMode) {
+	a.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, _ Peer) {
 		for _, frame := range frames {
 			if m, err := FromFrame(frame); err == nil {
 				if sm, ok := m.(*protocol.SimpleMessage); ok {
@@ -261,7 +261,7 @@ func TestSendReceiveEncryptedWithContracts(t *testing.T) {
 			}
 		}
 	})
-	b.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, _ protocol.ProvideMode) {
+	b.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, _ Peer) {
 		for _, frame := range frames {
 			if m, err := FromFrame(frame); err == nil {
 				if sm, ok := m.(*protocol.SimpleMessage); ok {

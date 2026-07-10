@@ -69,7 +69,7 @@ func (self *StreamManager) WebRtcManager() *WebRtcManager {
 }
 
 // ReceiveFunction
-func (self *StreamManager) Receive(source TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode) {
+func (self *StreamManager) Receive(source TransferPath, frames []*protocol.Frame, peer Peer) {
 	if source.IsControlSource() {
 		for _, frame := range frames {
 			// ignore error

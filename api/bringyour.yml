@@ -504,6 +504,28 @@ paths:
               schema:
                 $ref: "#/components/schemas/NetworkClientsResult"
 
+  /network/peers:
+    get:
+      description: |
+        Fast network peer discovery.
+
+        Lists the currently connected network peers: the top-level clients
+        of the network (clients with no source_client_id) and their identity
+        metadata (provide modes, principal, roles), plus disconnect markers
+        for peers that disconnected within the recent window.
+
+        Allowed for network sessions and top-level client sessions.
+        A client session's own client is excluded from the list.
+      operationId: Network Peers
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkPeersResult"
+
   /preferences/set-preferences:
     post:
       description: |
@@ -2288,6 +2310,18 @@ components:
           type: number
         uses:
           type: integer
+        roles:
+          description: Optional. |
+            Identity roles carried by logins minted from this code. |
+            Only a network session may set these. The values have no meaning to the network.
+          type: array
+          items:
+            type: string
+        principal:
+          description: Optional. |
+            Identity principal carried by logins minted from this code. |
+            Only a network session may set this.
+          type: string
 
     AuthCodeCreateResult:
       type: object
@@ -2337,6 +2371,19 @@ components:
           type: string
         device_spec:
           description: If this is a new device, sets the device spec.
+          type: string
+        roles:
+          description: Optional. |
+            Identity roles assigned to the client at creation, immutable after. |
+            Only a network session may set these; when omitted, the session's own roles are inherited. |
+            The values have no meaning to the network.
+          type: array
+          items:
+            type: string
+        principal:
+          description: Optional. |
+            Identity principal assigned to the client at creation, immutable after. |
+            Only a network session may set this; when omitted, the session's own principal is inherited.
           type: string
         # the proxy auth will be the by_client_jwt as username, no password
         proxy_config:
@@ -2529,6 +2576,14 @@ components:
                 type: string
               auth_time:
                 type: string
+              roles:
+                description: identity roles assigned at creation
+                type: array
+                items:
+                  type: string
+              principal:
+                description: identity principal assigned at creation
+                type: string
               provide_mode:
                 $ref: "#/components/schemas/ProvideMode"
               proxy_client:
@@ -2576,6 +2631,54 @@ components:
                       type: string
                     connection_block:
                       type: string'
+
+    NetworkPeer:
+      type: object
+      properties:
+        client_id:
+          description: udid
+          type: string
+        provide_modes:
+          description: the peer's enabled provide modes
+          type: array
+          items:
+            $ref: "#/components/schemas/ProvideMode"
+        principal:
+          description: identity principal assigned at creation
+          type: string
+        roles:
+          description: identity roles assigned at creation
+          type: array
+          items:
+            type: string
+        device_name:
+          type: string
+        device_spec:
+          type: string
+        disconnect_time:
+          description: set when the entry is a disconnect marker for a recently disconnected peer
+          type: string
+
+    NetworkPeersResult:
+      type: object
+      properties:
+        peers:
+          description: connected peers
+          type: array
+          items:
+            $ref: "#/components/schemas/NetworkPeer"
+        disconnected:
+          description: disconnect markers within the recent window
+          type: array
+          items:
+            $ref: "#/components/schemas/NetworkPeer"
+        disconnected_count:
+          type: integer
+        error:
+          type: object
+          properties:
+            message:
+              type: string
 
     PreferencesSetArgs:
       type: object

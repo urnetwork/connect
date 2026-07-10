@@ -406,7 +406,7 @@ func TestTransferBudgetLiveness(t *testing.T) {
 	receiveNotify := make(chan struct{}, peerCount*messagesPerPeer)
 	peers := []*budgetTestPeer{}
 	for i := 0; i < peerCount; i += 1 {
-		peer := attachBudgetTestPeer(ctx, sender, true, func(source TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode) {
+		peer := attachBudgetTestPeer(ctx, sender, true, func(source TransferPath, frames []*protocol.Frame, peer Peer) {
 			receiveCount.Add(int64(len(frames)))
 			select {
 			case receiveNotify <- struct{}{}:

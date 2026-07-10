@@ -568,7 +568,7 @@ func (self *ContractManager) contractStatus(contractStatus *ContractStatus) {
 
 /*
 // ReceiveFunction
-func (self *ContractManager) Receive(source TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode) {
+func (self *ContractManager) Receive(source TransferPath, frames []*protocol.Frame, peer Peer) {
 	if source.IsControlSource() {
 		for _, frame := range frames {
 			self.handleControlFrame(nil, frame)
@@ -758,10 +758,12 @@ func (self *ContractManager) provideFrame() (*protocol.Frame, error) {
 
 	var provide *protocol.Provide
 	if self.providePaused {
-		// keep only ProvideMode_Stream to allow return traffic, if set
+		// pause stops providing to public/ff only.
+		// keep ProvideMode_Stream to allow return traffic and
+		// ProvideMode_Network so network peers never fall back to stream, if set
 		provideKeys := []*protocol.ProvideKey{}
 		for provideMode, allow := range self.provideModes {
-			if allow && provideMode == protocol.ProvideMode_Stream {
+			if allow && (provideMode == protocol.ProvideMode_Stream || provideMode == protocol.ProvideMode_Network) {
 				provideSecretKey, ok := self.provideSecretKeys[provideMode]
 				if ok {
 					provideKeys = append(provideKeys, &protocol.ProvideKey{
@@ -902,8 +904,9 @@ func (self *ContractManager) Verify(storedContractHmac []byte, storedContractByt
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 
-	// only allow ProvideMode_Stream when paused, for return traffic
-	if self.providePaused && provideMode != protocol.ProvideMode_Stream {
+	// when paused, only allow ProvideMode_Stream for return traffic and
+	// ProvideMode_Network for network peers (pause stops public/ff only)
+	if self.providePaused && provideMode != protocol.ProvideMode_Stream && provideMode != protocol.ProvideMode_Network {
 		return false
 	}
 

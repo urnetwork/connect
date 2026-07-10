@@ -51,6 +51,15 @@ enum MessageType {
     // pipeline that the platform itself authors. The corresponding
     // private key is held only by the client process.
     TransferClientKey = 25;
+    // control message that marks the start of a complete network peers
+    // list for the receiving client. `Frame.message_bytes` is a marshaled
+    // `NetworkPeersReset`. The receiver clears its peer state; the
+    // complete list follows as `TransferNetworkPeersUpdate` messages.
+    TransferNetworkPeersReset = 26;
+    // control message that upserts network peers (and disconnect markers)
+    // into the receiving client's peer state. `Frame.message_bytes` is a
+    // marshaled `NetworkPeersUpdate`.
+    TransferNetworkPeersUpdate = 27;
 }
 
 

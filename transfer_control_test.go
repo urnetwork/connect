@@ -44,7 +44,7 @@ func TestControlSync(t *testing.T) {
 	receive := make(chan *protocol.SimpleMessage)
 
 	// on receive a test message, set the channel
-	controlClientA.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode) {
+	controlClientA.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, peer Peer) {
 		for _, frame := range frames {
 			m, err := FromFrame(frame)
 			assert.Equal(t, err, nil)

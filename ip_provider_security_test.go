@@ -66,12 +66,12 @@ func TestRemoteUserNatProviderEnforcesReversedPolicy(t *testing.T) {
 	// the reversed policy runs the client-egress DPI and reports an incident
 	provider.ClientReceive(source, []*protocol.Frame{
 		toProviderFrame(IpProtocolTcp, 42000, 51413, false, bittorrentHandshakePacketPayload()),
-	}, protocol.ProvideMode_Public)
+	}, Peer{ProvideMode: protocol.ProvideMode_Public})
 
 	// an ordinary plaintext HTTP request must pass the provider policy
 	provider.ClientReceive(source, []*protocol.Frame{
 		toProviderFrame(IpProtocolTcp, 42001, 8080, false, []byte("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")),
-	}, protocol.ProvideMode_Public)
+	}, Peer{ProvideMode: protocol.ProvideMode_Public})
 
 	stats := provider.SecurityPolicyStats(false)
 	A, I := SecurityPolicyResultAllow, SecurityPolicyResultIncident

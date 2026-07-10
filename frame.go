@@ -75,6 +75,10 @@ func ToFrame(message proto.Message, protocolVersion int) (*protocol.Frame, error
 		messageType = protocol.MessageType_TransferEncryptedKey
 	case *protocol.ClientKey:
 		messageType = protocol.MessageType_TransferClientKey
+	case *protocol.NetworkPeersReset:
+		messageType = protocol.MessageType_TransferNetworkPeersReset
+	case *protocol.NetworkPeersUpdate:
+		messageType = protocol.MessageType_TransferNetworkPeersUpdate
 	default:
 		return nil, fmt.Errorf("Unknown message type: %T", v)
 	}
@@ -202,6 +206,10 @@ func FromFrame(frame *protocol.Frame) (proto.Message, error) {
 		message = &protocol.EncryptedKey{}
 	case protocol.MessageType_TransferClientKey:
 		message = &protocol.ClientKey{}
+	case protocol.MessageType_TransferNetworkPeersReset:
+		message = &protocol.NetworkPeersReset{}
+	case protocol.MessageType_TransferNetworkPeersUpdate:
+		message = &protocol.NetworkPeersUpdate{}
 	default:
 		return nil, fmt.Errorf("Unknown message type: %s", frame.MessageType)
 	}

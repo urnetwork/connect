@@ -4082,7 +4082,7 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 }
 
 // `connect.ReceiveFunction`
-func (self *multiClientChannel) clientReceive(source TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode) {
+func (self *multiClientChannel) clientReceive(source TransferPath, frames []*protocol.Frame, peer Peer) {
 	select {
 	case <-self.ctx.Done():
 		return
@@ -4109,7 +4109,7 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 					if ipPath.Syn {
 						self.addReceiveSyn(1)
 					}
-					self.clientReceivePacketCallback(self, source, provideMode, ipPath, packet)
+					self.clientReceivePacketCallback(self, source, peer.ProvideMode, ipPath, packet)
 				}
 				// else not an ip packet, drop
 			} else {

@@ -40,7 +40,7 @@ func TestUpgradeMuxMultiClientIntegration(t *testing.T) {
 	providerClient := NewClient(ctx, NewId(), NewNoContractClientOob(), clientSettings)
 	defer providerClient.Cancel()
 
-	providerClient.AddReceiveCallback(func(src TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode) {
+	providerClient.AddReceiveCallback(func(src TransferPath, frames []*protocol.Frame, peer Peer) {
 		for _, frame := range frames {
 			msg, err := FromFrame(frame)
 			if err != nil {

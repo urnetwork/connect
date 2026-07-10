@@ -206,6 +206,38 @@ message StreamReset {
 }
 
 
+// a network peer: a connected top-level client in the same network and its
+// identity metadata. When `disconnect_time` is set, this entry is a
+// disconnect marker for a recently disconnected peer.
+message NetworkPeer {
+    // ulid
+    bytes client_id = 1;
+    // the peer's enabled provide modes
+    repeated ProvideMode provide_modes = 2;
+    // identity principal assigned at client creation
+    string principal = 3;
+    // roles assigned at client creation
+    repeated string roles = 4;
+    string device_name = 5;
+    string device_spec = 6;
+    // unix milliseconds. Set when the peer recently disconnected;
+    // the receiver ages the marker out locally
+    optional uint64 disconnect_time = 7;
+}
+
+// control message. Marks the start of a complete network peers list;
+// the receiver clears its peer state. The complete list follows as
+// `NetworkPeersUpdate` messages.
+message NetworkPeersReset {
+}
+
+// control message. Upserts peers (and disconnect markers) into the
+// receiver's peer state.
+message NetworkPeersUpdate {
+    repeated NetworkPeer peers = 1;
+}
+
+
 enum SignalType {
     // reset means clear all previous signals for the transfer peer pair
     NoSignal = 0;
@@ -350,6 +382,15 @@ message StoredContract {
     // whether the cert chain in this contract is admitted into the
     // session's trusted-peer-cert set.
     bytes destination_client_key_signed_tls_certificate = 9;
+
+    // roles assigned to the source client at creation. Sealed into the
+    // platform-signed contract bytes. Set only when `provide_mode` is
+    // `Network`; empty for all other provide modes.
+    repeated string roles = 10;
+    // identity principal assigned to the source client at creation.
+    // Sealed into the platform-signed contract bytes. Set only when
+    // `provide_mode` is `Network`; empty for all other provide modes.
+    string principal = 11;
 
     // FIXME companion contract id
 }

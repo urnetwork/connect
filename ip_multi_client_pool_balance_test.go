@@ -74,7 +74,7 @@ func runMultiClientPoolCycle(ctx context.Context, t *testing.T) {
 	defer providerClient.Cancel()
 
 	// echo any IpPacketToProvider back with the path reversed, like an exit would
-	providerClient.AddReceiveCallback(func(src TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode) {
+	providerClient.AddReceiveCallback(func(src TransferPath, frames []*protocol.Frame, peer Peer) {
 		for _, frame := range frames {
 			if frame.MessageType != protocol.MessageType_IpIpPacketToProvider {
 				continue

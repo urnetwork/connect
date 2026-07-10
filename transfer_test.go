@@ -200,7 +200,7 @@ func runSendReceiveSenderReset(t *testing.T, encMode encryptionMode) {
 	acks := make(chan error)
 	receives := make(chan *protocol.SimpleMessage)
 
-	b.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode) {
+	b.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, peer Peer) {
 		for _, frame := range frames {
 			m, err := FromFrame(frame)
 			if err != nil {

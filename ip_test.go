@@ -332,7 +332,7 @@ func testClient[P comparable](
 	natClient, err := userNatClientGenerator(ctx, providerClient, receivePacketCallback)
 	assert.Equal(t, err, nil)
 
-	providerClient.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode) {
+	providerClient.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, peer Peer) {
 		// cMutex.Lock()
 		// cReceiveCount += 1
 		// // fmt.Printf("C Receive %d/%d (%.2f%%)\n", cReceiveCount, totalCount, 100.0 * float32(cReceiveCount) / float32(totalCount))

@@ -694,11 +694,11 @@ func sink(opts docopt.Opts) {
 
 	receives := make(chan *Receive)
 
-	client.AddReceiveCallback(func(source connect.TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode) {
+	client.AddReceiveCallback(func(source connect.TransferPath, frames []*protocol.Frame, peer connect.Peer) {
 		receives <- &Receive{
 			source:      source,
 			frames:      frames,
-			provideMode: provideMode,
+			provideMode: peer.ProvideMode,
 		}
 	})
 

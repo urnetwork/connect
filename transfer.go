@@ -63,9 +63,17 @@ var DebugTransferCopyOnWrite = false
 
 type AckFunction = func(err error)
 
-// provideMode is the mode of where these frames are from: network, friends and family, public
-// provideMode nil means no contract
-type ReceiveFunction = func(source TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode)
+// the identity of the source of received frames.
+// `ProvideMode` is the mode of where these frames are from: network, friends and family, public.
+// `Roles` and `Principal` are the source client's identity from the active contract,
+// set only when the provide mode is network; nil roles and empty principal otherwise.
+type Peer struct {
+	ProvideMode protocol.ProvideMode
+	Roles       []string
+	Principal   string
+}
+
+type ReceiveFunction = func(source TransferPath, frames []*protocol.Frame, peer Peer)
 
 // a forward callback receives a transfer frame addressed to another destination.
 // like a receive callback, `transferFrameBytes` is valid only for the duration of
@@ -90,6 +98,7 @@ func DefaultClientSettingsWithBufferSize(bufferSize int) *ClientSettings {
 		ForwardBufferSettings:   DefaultForwardBufferSettingsWithBufferSize(bufferSize),
 		ContractManagerSettings: DefaultContractManagerSettingsWithBufferSize(bufferSize),
 		StreamManagerSettings:   DefaultStreamManagerSettings(),
+		PeerManagerSettings:     DefaultPeerManagerSettings(),
 		WebRtcSettings:          DefaultWebRtcSettings(),
 		EncryptionSettings:      DefaultEncryptionSettings(),
 		ProtocolVersion:         DefaultProtocolVersion,
@@ -334,6 +343,7 @@ type ClientSettings struct {
 	ForwardBufferSettings   *ForwardBufferSettings
 	ContractManagerSettings *ContractManagerSettings
 	StreamManagerSettings   *StreamManagerSettings
+	PeerManagerSettings     *PeerManagerSettings
 	WebRtcSettings          *WebRtcSettings
 	EncryptionSettings      *EncryptionSettings
 
@@ -398,6 +408,7 @@ type Client struct {
 	contractManager          *ContractManager
 	webRtcManager            *WebRtcManager
 	streamManager            *StreamManager
+	peerManager              *PeerManager
 	sendBuffer               *SendBuffer
 	receiveBuffer            *ReceiveBuffer
 	forwardBuffer            *ForwardBuffer
@@ -412,6 +423,7 @@ type Client struct {
 	// contractManagerUnsub func()
 	webRtcManagerUnsub func()
 	streamManagerUnsub func()
+	peerManagerUnsub   func()
 }
 
 func NewClientWithDefaults(
@@ -469,6 +481,7 @@ func NewClientWithTag(
 	contractManager := NewContractManager(ctx, client, settings.ContractManagerSettings)
 	webRtcManager := NewWebRtcManager(ctx, NewClientSignalSender(client), settings.WebRtcSettings)
 	streamManager := NewStreamManager(ctx, client, webRtcManager, settings.StreamManagerSettings)
+	peerManager := NewPeerManager(ctx, client, settings.PeerManagerSettings)
 	// ClientKeyManager must precede EncryptionSessionManager — the latter holds
 	// a reference to sign the published TLS cert
 	// (`EncryptedKey.ClientKeySignedTlsCertificate`) and per-peer identity proofs.
@@ -482,6 +495,8 @@ func NewClientWithTag(
 	// client.contractManagerUnsub = client.AddReceiveCallback(contractManager.Receive)
 	client.webRtcManagerUnsub = ReceiveSignalsFromClient(client, webRtcManager)
 	client.streamManagerUnsub = client.AddReceiveCallback(streamManager.Receive)
+	client.peerManager = peerManager
+	client.peerManagerUnsub = client.AddReceiveCallback(peerManager.Receive)
 
 	client.initBuffers(routeManager, contractManager, webRtcManager, streamManager, clientKeyManager, encryptionSessionManager)
 
@@ -610,7 +625,10 @@ func (self *Client) ClientOob() OutOfBandControl {
 
 // a peer of this client on the network
 type NetworkPeer struct {
-	ClientId       Id
+	ClientId Id
+	// the peer's enabled provide modes
+	ProvideModes []protocol.ProvideMode
+	// whether the peer has the network provide mode enabled
 	ProvideEnabled bool
 	Principal      string
 	Roles          []string
@@ -618,12 +636,16 @@ type NetworkPeer struct {
 	DeviceName     string
 }
 
+func (self *Client) PeerManager() *PeerManager {
+	return self.peerManager
+}
+
 // NetworkPeers enumerates the connected peers and the count of
 // recently disconnected peers.
-// FUTURE this is a stub pending the peer tracking implementation.
-// clients with provide disabled have no network peers
+// The platform announces peers only to top-level clients;
+// all other clients have no network peers.
 func (self *Client) NetworkPeers() (connected []*NetworkPeer, disconnectedCount int) {
-	return nil, 0
+	return self.peerManager.NetworkPeers()
 }
 
 func (self *Client) ReportAbuse(source TransferPath) {
@@ -876,11 +898,11 @@ func (self *Client) SendMultiHop(frame *protocol.Frame, destination MultiHopId, 
 }
 
 // ReceiveFunction
-func (self *Client) receive(source TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode) {
+func (self *Client) receive(source TransferPath, frames []*protocol.Frame, peer Peer) {
 	for _, receiveCallback := range self.receiveCallbacks.Get() {
 		c := func() any {
 			return HandleError(func() {
-				receiveCallback(source, frames, provideMode)
+				receiveCallback(source, frames, peer)
 			})
 		}
 		if self.log.V(2).Enabled() {
@@ -1004,7 +1026,7 @@ func (self *Client) run() {
 						self.receive(
 							SourceId(self.clientId),
 							[]*protocol.Frame{sendPack.Frame},
-							protocol.ProvideMode_Network,
+							Peer{ProvideMode: protocol.ProvideMode_Network},
 						)
 						safeAck(sendPack.AckCallback, nil)
 					}, func(err error) {
@@ -1416,6 +1438,7 @@ func (self *Client) Close() {
 	// self.contractManagerUnsub()
 	self.webRtcManagerUnsub()
 	self.streamManagerUnsub()
+	self.peerManagerUnsub()
 }
 
 func (self *Client) Cancel() {
@@ -4240,15 +4263,21 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 	self.peerAudit.Update(func(a *PeerAudit) {
 		a.received(item.messageByteCount)
 	})
-	var provideMode protocol.ProvideMode
+	var peer Peer
 
 	if item.contractId != nil {
 		receiveContract := self.openReceiveContracts[*item.contractId]
 		receiveContract.ack(item.messageByteCount)
-		provideMode = receiveContract.provideMode
+		peer = Peer{
+			ProvideMode: receiveContract.provideMode,
+			Roles:       receiveContract.roles,
+			Principal:   receiveContract.principal,
+		}
 	} else {
 		// no contract peers are considered in network
-		provideMode = protocol.ProvideMode_Network
+		peer = Peer{
+			ProvideMode: protocol.ProvideMode_Network,
+		}
 	}
 	// EncryptedControl frames are routed into the per-peer session instead
 	// of bubbling up to the receive callback. They carry the TLS handshake
@@ -4262,7 +4291,7 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 		item.receiveCallback(
 			self.source,
 			appFrames,
-			provideMode,
+			peer,
 		)
 	}
 	if item.ack {
@@ -4698,6 +4727,12 @@ type sequenceContract struct {
 	// peer); the verifier is `destinationClientPublicKey`. Empty when
 	// the contract carries no signature.
 	destinationClientKeySignedTlsCertificate []byte
+
+	// roles and principal are the source client's identity, sealed into the
+	// platform-signed contract bytes. Honored only when the provide mode is
+	// network; nil/empty for all other provide modes.
+	roles     []string
+	principal string
 }
 
 func newSequenceContract(log Logger, tag string, contract *protocol.Contract, minUpdateByteCount ByteCount, contractFillFraction float32) (*sequenceContract, error) {
@@ -4743,6 +4778,15 @@ func newSequenceContract(log Logger, tag string, contract *protocol.Contract, mi
 		destinationClientKeySignedTlsCertificate = contract.DestinationClientKeySignedTlsCertificate
 	}
 
+	// roles/principal live only in the signed stored bytes (no outer copy)
+	// and apply only to network provide mode
+	var roles []string
+	var principal string
+	if contract.ProvideMode == protocol.ProvideMode_Network {
+		roles = storedContract.Roles
+		principal = storedContract.Principal
+	}
+
 	return &sequenceContract{
 		log:                                      log,
 		localId:                                  NewId(),
@@ -4759,6 +4803,8 @@ func newSequenceContract(log Logger, tag string, contract *protocol.Contract, mi
 		provideTlsCertificate:                    provideTlsCertificate,
 		destinationClientPublicKey:               destinationClientPublicKey,
 		destinationClientKeySignedTlsCertificate: destinationClientKeySignedTlsCertificate,
+		roles:                                    roles,
+		principal:                                principal,
 	}, nil
 }
 

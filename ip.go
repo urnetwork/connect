@@ -3219,9 +3219,11 @@ func (self *RemoteUserNatProvider) Receive(
 }
 
 // `connect.ReceiveFunction`
-func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode) {
+func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*protocol.Frame, peer Peer) {
 	// receive functions should be non-blocking
 	// clients should manage their own congestion protocols on top to avoid overflowing the sequence queues
+
+	provideMode := peer.ProvideMode
 
 	// collect the allowed packets and queue them into the local user nat as one batch
 	var packets [][]byte
@@ -3232,15 +3234,22 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 			if self.client.log.V(1).Enabled() {
 				self.client.log.Infof("[ip]provider ping <- %s(%d)\n", source, provideMode)
 			}
-			// echo back over a companion contract, like the provider's other
-			// return traffic; the source only provides ProvideMode_Stream, so a
-			// forward contract here would be rejected (no permission).
+			// echo the min provide mode the source sent under, like the
+			// provider's other return traffic. A same-network source pings
+			// under ProvideMode_Network; its echo is also network mode (no
+			// companion contract). For other modes the source only provides
+			// ProvideMode_Stream, so a forward contract would be rejected
+			// (no permission); the echo rides a companion contract instead.
+			echoOpts := []any{}
+			if self.minSourceProvideMode(source.SourceId, provideMode) != protocol.ProvideMode_Network {
+				echoOpts = append(echoOpts, CompanionContract())
+			}
 			self.client.SendWithTimeout(
 				frame,
 				source.Reverse(),
 				func(err error) {},
 				0,
-				CompanionContract(),
+				echoOpts...,
 			)
 		case protocol.MessageType_IpIpPacketToProvider:
 			ipPacketToProvider_, err := FromFrame(frame)
@@ -3452,7 +3461,7 @@ func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode pro
 }
 
 // `connect.ReceiveFunction`
-func (self *RemoteUserNatClient) ClientReceive(source TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode) {
+func (self *RemoteUserNatClient) ClientReceive(source TransferPath, frames []*protocol.Frame, peer Peer) {
 	// only process frames from the destinations
 	// if allow := self.sourceFilter[source]; !allow {
 	//     return
@@ -3476,7 +3485,7 @@ func (self *RemoteUserNatClient) ClientReceive(source TransferPath, frames []*pr
 				HandleError(func() {
 					self.receivePacketCallback(
 						source,
-						provideMode,
+						peer.ProvideMode,
 						ipPath,
 						packet,
 					)

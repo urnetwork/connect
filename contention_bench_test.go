@@ -92,7 +92,7 @@ func BenchmarkMultiClientEgressParallel(b *testing.B) {
 	providerClient := NewClient(ctx, providerClientId, NewNoContractClientOob(), settings)
 	defer providerClient.Cancel()
 
-	providerClient.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode) {})
+	providerClient.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, peer Peer) {})
 
 	natClient, err := testingNewMultiClient(
 		ctx,
@@ -158,7 +158,7 @@ func BenchmarkMultiClientBidirectional(b *testing.B) {
 	// the provider echoes each received packet back with the path reversed, so
 	// the echo lands on the originating flow's update (the steady-state ingress
 	// path).
-	providerClient.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode) {
+	providerClient.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, peer Peer) {
 		for _, frame := range frames {
 			v, err := FromFrame(frame)
 			if err != nil {
