@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -217,7 +218,14 @@ func TestUpgradeMuxDnsNoReplyOnFailure(t *testing.T) {
 // mux sees it on the send path (destined for :53).
 func dnsQueryPacket(t *testing.T, name string) []byte {
 	t.Helper()
-	qb := dnsmessage.NewBuilder(nil, dnsmessage.Header{ID: 0x1234, RecursionDesired: true})
+	return dnsQueryPacketFrom(t, name, 0x1234, 33333)
+}
+
+// dnsQueryPacketFrom is dnsQueryPacket with the requester identity (transaction id and client
+// source port) controlled, so tests can model retransmits vs distinct duplicate queries.
+func dnsQueryPacketFrom(t *testing.T, name string, id uint16, sourcePort int) []byte {
+	t.Helper()
+	qb := dnsmessage.NewBuilder(nil, dnsmessage.Header{ID: id, RecursionDesired: true})
 	if err := qb.StartQuestions(); err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +244,7 @@ func dnsQueryPacket(t *testing.T, name string) []byte {
 		Version:         4,
 		Protocol:        IpProtocolUdp,
 		SourceIp:        net.ParseIP("169.254.9.9"),
-		SourcePort:      33333,
+		SourcePort:      sourcePort,
 		DestinationIp:   net.ParseIP("10.0.0.1"),
 		DestinationPort: 53,
 	}, queryPayload)
@@ -506,4 +514,307 @@ func TestReverseTouchKeepsActive(t *testing.T) {
 	if _, ok := mux.reverse[ip]; !ok {
 		t.Fatal("an affinity record refreshed by return traffic should not be idle-evicted")
 	}
+}
+
+// gatedDohWireServer starts a local TLS DoH server that blocks each request until the
+// gate is closed, then answers A queries with the given IP. It counts requests, so tests
+// can hold a resolution in flight and observe how many resolutions actually fired.
+func gatedDohWireServer(t *testing.T, resolvedIp string) (server *httptest.Server, dns *DnsResolverSettings, gate chan struct{}, requests *int32) {
+	t.Helper()
+	ip := netip.MustParseAddr(resolvedIp)
+	gate = make(chan struct{})
+	requests = new(int32)
+	server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(requests, 1)
+		select {
+		case <-gate:
+		case <-r.Context().Done():
+			return
+		}
+		writeDohWire(w, r, []netip.Addr{ip}, 60, false)
+	}))
+	pool := x509.NewCertPool()
+	pool.AddCert(server.Certificate())
+	dns = &DnsResolverSettings{
+		EnableLocalDoh:   true,
+		LocalDohUrlsIpv4: []string{server.URL},
+		TlsConfig:        &tls.Config{RootCAs: pool},
+	}
+	return
+}
+
+// waitForCondition polls cond until it holds or the timeout passes.
+func waitForCondition(timeout time.Duration, cond func() bool) bool {
+	end := time.Now().Add(timeout)
+	for {
+		if cond() {
+			return true
+		}
+		if end.Before(time.Now()) {
+			return false
+		}
+		select {
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
+// parseDnsReply extracts (client port, transaction id, answer A records) from a downstream
+// DNS reply packet.
+func parseDnsReply(t *testing.T, packet []byte) (clientPort int, id uint16, addrs []netip.Addr) {
+	t.Helper()
+	ipPath, payload, err := ParseIpPathWithPayload(packet)
+	if err != nil {
+		t.Fatalf("parse reply packet: %v", err)
+	}
+	var p dnsmessage.Parser
+	header, err := p.Start(payload)
+	if err != nil {
+		t.Fatalf("parse reply dns: %v", err)
+	}
+	result := parseDohWire(payload, dnsmessage.TypeA)
+	for addr := range result.AddrTtls {
+		addrs = append(addrs, addr)
+	}
+	return ipPath.DestinationPort, header.ID, addrs
+}
+
+// TestUpgradeMuxDnsCoalesce: concurrent identical questions — distinct requesters and an
+// exact retransmit — coalesce onto ONE resolution pipeline, and each distinct requester
+// still gets its own reply (its transaction id, its port). This is what bounds burst
+// memory under a client retransmit storm while the tunnel establishes.
+func TestUpgradeMuxDnsCoalesce(t *testing.T) {
+	const resolved = "203.0.113.99"
+	server, dns, gate, requests := gatedDohWireServer(t, resolved)
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rec := &ipMuxRecorder{}
+	settings := DefaultUpgradeMuxSettings()
+	settings.Dns.Resolver = dns
+	settings.Dns.Fallback = nil
+	settings.Dns.ResolveTimeout = 10 * time.Second
+	mux, err := NewUpgradeMux(ctx, TransferPath{}, protocol.ProvideMode_Network, 0, rec.receive, settings, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mux.Close()
+	mux.SetUpstream(rec.upstream)
+
+	send := func(id uint16, port int) {
+		if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketFrom(t, "coalesce.example.test.", id, port), 0) {
+			t.Fatal("SendPacket returned false; the DNS query was not claimed")
+		}
+	}
+
+	// first requester starts the pipeline; hold the resolution in flight on the gate
+	send(0x1111, 40001)
+	if !waitForCondition(5*time.Second, func() bool { return 1 <= atomic.LoadInt32(requests) }) {
+		t.Fatal("the resolution pipeline did not reach the DoH server")
+	}
+	// two more distinct requesters and one exact retransmit attach to the same pipeline
+	send(0x2222, 40002)
+	send(0x3333, 40003)
+	send(0x1111, 40001)
+
+	func() {
+		mux.inflightLock.Lock()
+		defer mux.inflightLock.Unlock()
+		if len(mux.inflight) != 1 {
+			t.Fatalf("in-flight questions = %d, want 1 (coalesced)", len(mux.inflight))
+		}
+		for _, fl := range mux.inflight {
+			if len(fl.responders) != 3 {
+				t.Fatalf("responders = %d, want 3 (the retransmit must not add one)", len(fl.responders))
+			}
+		}
+	}()
+
+	// release the resolution; every distinct requester gets its own reply
+	close(gate)
+	if !waitForCondition(5*time.Second, func() bool { _, received := rec.counts(); return 3 <= received }) {
+		_, received := rec.counts()
+		t.Fatalf("received %d downstream replies, want 3 (one per distinct requester)", received)
+	}
+
+	wantIdByPort := map[int]uint16{40001: 0x1111, 40002: 0x2222, 40003: 0x3333}
+	rec.mu.Lock()
+	replies := append([][]byte{}, rec.received...)
+	rec.mu.Unlock()
+	seenPorts := map[int]bool{}
+	for _, reply := range replies {
+		port, id, addrs := parseDnsReply(t, reply)
+		wantId, ok := wantIdByPort[port]
+		if !ok || seenPorts[port] {
+			t.Fatalf("unexpected or duplicate reply port %d", port)
+		}
+		seenPorts[port] = true
+		if id != wantId {
+			t.Fatalf("reply to port %d has id %04x, want %04x (each requester gets its own id)", port, id, wantId)
+		}
+		if !slices.Contains(addrs, netip.MustParseAddr(resolved)) {
+			t.Fatalf("reply to port %d resolves %v, want %s", port, addrs, resolved)
+		}
+	}
+	if len(seenPorts) != 3 {
+		t.Fatalf("distinct reply ports = %d, want 3", len(seenPorts))
+	}
+	// the shared pipeline resolved once
+	if got := atomic.LoadInt32(requests); got != 1 {
+		t.Fatalf("DoH requests = %d, want 1 (one resolution for the coalesced question)", got)
+	}
+}
+
+// TestUpgradeMuxDnsInflightCap: at MaxInflightQueries, a claimed query for a NEW question is
+// dropped unanswered (bounding burst memory); the slot frees once the in-flight pipeline
+// finishes, and the client's retry then resolves normally.
+func TestUpgradeMuxDnsInflightCap(t *testing.T) {
+	const resolved = "203.0.113.44"
+	server, dns, gate, requests := gatedDohWireServer(t, resolved)
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rec := &ipMuxRecorder{}
+	settings := DefaultUpgradeMuxSettings()
+	settings.Dns.Resolver = dns
+	settings.Dns.Fallback = nil
+	settings.Dns.ResolveTimeout = 10 * time.Second
+	settings.Dns.MaxInflightQueries = 1
+	mux, err := NewUpgradeMux(ctx, TransferPath{}, protocol.ProvideMode_Network, 0, rec.receive, settings, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mux.Close()
+	mux.SetUpstream(rec.upstream)
+
+	// the first question fills the only slot and holds on the gate
+	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketFrom(t, "one.example.test.", 0xAAAA, 41001), 0) {
+		t.Fatal("first query was not claimed")
+	}
+	if !waitForCondition(5*time.Second, func() bool { return 1 <= atomic.LoadInt32(requests) }) {
+		t.Fatal("the resolution pipeline did not reach the DoH server")
+	}
+
+	// a second, distinct question is claimed (the mux owns DNS) but dropped at the cap
+	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketFrom(t, "two.example.test.", 0xBBBB, 41002), 0) {
+		t.Fatal("over-cap query should still be claimed (claim-and-drop)")
+	}
+	func() {
+		mux.inflightLock.Lock()
+		defer mux.inflightLock.Unlock()
+		if len(mux.inflight) != 1 {
+			t.Fatalf("in-flight questions = %d, want 1 (the over-cap question must not start a pipeline)", len(mux.inflight))
+		}
+	}()
+
+	// release; the first question resolves, the dropped one stays unanswered
+	close(gate)
+	if !waitForCondition(5*time.Second, func() bool { _, received := rec.counts(); return 1 <= received }) {
+		t.Fatal("no reply for the in-flight question")
+	}
+	// the slot has freed; the client's retry of the dropped question now resolves
+	if !waitForCondition(5*time.Second, func() bool {
+		mux.inflightLock.Lock()
+		defer mux.inflightLock.Unlock()
+		return len(mux.inflight) == 0
+	}) {
+		t.Fatal("the resolved question did not free its slot")
+	}
+	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketFrom(t, "two.example.test.", 0xBBBB, 41002), 0) {
+		t.Fatal("retried query was not claimed")
+	}
+	if !waitForCondition(5*time.Second, func() bool { _, received := rec.counts(); return 2 <= received }) {
+		t.Fatal("no reply for the retried question")
+	}
+	rec.mu.Lock()
+	replies := append([][]byte{}, rec.received...)
+	rec.mu.Unlock()
+	port1, id1, _ := parseDnsReply(t, replies[0])
+	port2, id2, _ := parseDnsReply(t, replies[1])
+	if port1 != 41001 || id1 != 0xAAAA {
+		t.Fatalf("first reply port/id = %d/%04x, want 41001/aaaa", port1, id1)
+	}
+	if port2 != 41002 || id2 != 0xBBBB {
+		t.Fatalf("second reply port/id = %d/%04x, want 41002/bbbb", port2, id2)
+	}
+}
+
+// TestReverseBounds: the affinity map is hard-capped between TTL sweeps (over-cap inserts
+// evict the least-recently-active of a sample) and each record keeps at most the most
+// recent maxServerNamesPerIp names.
+func TestReverseBounds(t *testing.T) {
+	settings := DefaultUpgradeMuxSettings()
+	settings.Dns.ReverseMaxEntries = 8
+	mux := &UpgradeMux{reverse: map[netip.Addr]reverseEntry{}}
+	mux.settings.Store(settings)
+
+	for i := range 20 {
+		addr := netip.AddrFrom4([4]byte{198, 51, 100, byte(i + 1)})
+		mux.recordServerNames([]netip.Addr{addr}, "host.example.test")
+		if 8 < len(mux.reverse) {
+			t.Fatalf("reverse map grew to %d entries, cap is 8", len(mux.reverse))
+		}
+	}
+	if len(mux.reverse) != 8 {
+		t.Fatalf("reverse map has %d entries after 20 inserts, want the cap (8)", len(mux.reverse))
+	}
+
+	// names per IP: the most recent maxServerNamesPerIp are kept, oldest dropped
+	addr := netip.MustParseAddr("198.51.100.200")
+	for i := range 6 {
+		mux.recordServerNames([]netip.Addr{addr}, fmt.Sprintf("n%d.example.test", i))
+	}
+	// a repeat of a kept name must not duplicate it
+	mux.recordServerNames([]netip.Addr{addr}, "n5.example.test")
+	e := mux.reverse[addr]
+	want := []string{"n2.example.test", "n3.example.test", "n4.example.test", "n5.example.test"}
+	if !slices.Equal(e.serverNames, want) {
+		t.Fatalf("serverNames = %v, want the most recent %d: %v", e.serverNames, maxServerNamesPerIp, want)
+	}
+}
+
+// TestUpgradeMuxShedMemory: the host memory-pressure hook drops the recoverable caches —
+// the affinity map and the resolver query cache.
+func TestUpgradeMuxShedMemory(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rec := &ipMuxRecorder{}
+	mux, err := NewUpgradeMux(ctx, TransferPath{}, protocol.ProvideMode_Network, 0, rec.receive, DefaultUpgradeMuxSettings(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mux.Close()
+
+	ip := netip.MustParseAddr("203.0.113.7")
+	mux.recordServerNames([]netip.Addr{ip}, "shed.example.test")
+	if names := mux.ServerNames(ip.String()); len(names) == 0 {
+		t.Fatal("affinity record missing before shed")
+	}
+	dohCache := mux.mux.Tun().DohCache()
+	func() {
+		dohCache.stateLock.Lock()
+		defer dohCache.stateLock.Unlock()
+		dohCache.queryResultExpiration[NewDohKey("A", "seed.example.test")] = &DohResult{
+			Time:            time.Now(),
+			AddrExpirations: map[netip.Addr]time.Time{ip: time.Now().Add(time.Hour)},
+		}
+	}()
+
+	mux.ShedMemory()
+
+	if names := mux.ServerNames(ip.String()); 0 < len(names) {
+		t.Fatalf("affinity records survive shed: %v", names)
+	}
+	func() {
+		dohCache.stateLock.Lock()
+		defer dohCache.stateLock.Unlock()
+		if 0 < len(dohCache.queryResultExpiration) {
+			t.Fatalf("resolver query cache survives shed: %d entries", len(dohCache.queryResultExpiration))
+		}
+	}()
 }

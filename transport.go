@@ -950,6 +950,17 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				Allow0RTT:               true,
 				DisablePathMTUDiscovery: true,
 				InitialPacketSize:       1400,
+				// pin the receive windows and stream counts. the library
+				// defaults allow ~15mib per connection plus ~6mib per stream;
+				// the max windows are per connection, so scaled by the memory
+				// budget. the platform transport uses one bidirectional
+				// stream, so the stream counts only bound abuse.
+				InitialStreamReceiveWindow:     uint64(kib(256)),
+				MaxStreamReceiveWindow:         uint64(MemoryScaledByteCount(mib(3), kib(384))),
+				InitialConnectionReceiveWindow: uint64(kib(512)),
+				MaxConnectionReceiveWindow:     uint64(MemoryScaledByteCount(mib(4), kib(512))),
+				MaxIncomingStreams:             8,
+				MaxIncomingUniStreams:          8,
 			}
 			var tlsConfig *tls.Config
 			if self.settings.QuicTlsConfig != nil {
@@ -965,6 +976,10 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			if err != nil {
 				return nil, err
 			}
+			// bind to the physical egress interface so the platform QUIC
+			// connection never loops into the tunnel this process provides
+			// (R1); a no-op off Windows and when no egress index is set.
+			_ = applyEgress(udpConn)
 			// single close path: once packetConn is bound (either directly
 			// to udpConn or wrapping it via packetTranslation), it owns the
 			// close. before that, we close udpConn directly. avoids the

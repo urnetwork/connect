@@ -157,7 +157,7 @@ func udp4Packet(s int, i int, j int, k int) (packet []byte, payload []byte) {
 		DestinationPort: 443,
 	}
 
-	packet = ip4OosUdpPacket(ipPath, payload)
+	packet = ipOosUdpPacket(ipPath, payload)
 	return
 }
 
@@ -174,7 +174,7 @@ func tcp4Packet(s int, i int, j int, k int) (packet []byte, payload []byte) {
 		DestinationPort: 443,
 	}
 
-	packet = ip4OosTcpPacket(ipPath, payload)
+	packet = ipOosTcpPacket(ipPath, 0, payload)
 	return
 }
 
@@ -191,7 +191,7 @@ func udp6Packet(s int, i int, j int, k int) (packet []byte, payload []byte) {
 		DestinationPort: 443,
 	}
 
-	packet = ip6OosUdpPacket(ipPath, payload)
+	packet = ipOosUdpPacket(ipPath, payload)
 	return
 }
 
@@ -208,7 +208,7 @@ func tcp6Packet(s int, i int, j int, k int) (packet []byte, payload []byte) {
 		DestinationPort: 443,
 	}
 
-	packet = ip6OosTcpPacket(ipPath, payload)
+	packet = ipOosTcpPacket(ipPath, 0, payload)
 	return
 }
 
@@ -1352,9 +1352,9 @@ func TestIpPacketWriters(t *testing.T) {
 		connectionState := &ConnectionState{
 			ipVersion:       ipVersion,
 			sourceIp:        sourceIp,
-			sourcePort:      layers.TCPPort(40000),
+			sourcePort:      40000,
 			destinationIp:   destinationIp,
-			destinationPort: layers.TCPPort(443),
+			destinationPort: 443,
 			receiveSeq:      0x01020304,
 			sendSeq:         0x0a0b0c0d,
 			windowSize:      262144,
@@ -1366,8 +1366,8 @@ func TestIpPacketWriters(t *testing.T) {
 			for _, flags := range []byte{tcpFlagAck, tcpFlagAck | tcpFlagFin, tcpFlagAck | tcpFlagRst} {
 				packet := connectionState.tcpPacket(flags, connectionState.receiveSeq, payload)
 				reference := serializeReference(layers.IPProtocolTCP, &layers.TCP{
-					SrcPort: connectionState.destinationPort,
-					DstPort: connectionState.sourcePort,
+					SrcPort: layers.TCPPort(connectionState.destinationPort),
+					DstPort: layers.TCPPort(connectionState.sourcePort),
 					Seq:     connectionState.receiveSeq,
 					Ack:     connectionState.sendSeq,
 					FIN:     (flags & tcpFlagFin) != 0,
@@ -1383,17 +1383,17 @@ func TestIpPacketWriters(t *testing.T) {
 		streamState := &StreamState{
 			ipVersion:       ipVersion,
 			sourceIp:        sourceIp,
-			sourcePort:      layers.UDPPort(40000),
+			sourcePort:      40000,
 			destinationIp:   destinationIp,
-			destinationPort: layers.UDPPort(53),
+			destinationPort: 53,
 		}
 
 		for _, payloadSize := range payloadSizes {
 			payload := testingEgressPayload(11, payloadSize)
 			packet := streamState.udpPacket(payload)
 			reference := serializeReference(layers.IPProtocolUDP, &layers.UDP{
-				SrcPort: streamState.destinationPort,
-				DstPort: streamState.sourcePort,
+				SrcPort: layers.UDPPort(streamState.destinationPort),
+				DstPort: layers.UDPPort(streamState.sourcePort),
 			}, payload)
 			assert.Equal(t, bytes.Equal(reference, packet), true)
 			MessagePoolReturn(packet)

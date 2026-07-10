@@ -135,8 +135,12 @@ func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings
 		AckBufferSize:       bufferSize,
 		MinMessageByteCount: ByteCount(1),
 		// this includes transport reconnections
-		WriteTimeout:            15 * time.Second,
-		ResendQueueMaxByteCount: mib(2),
+		WriteTimeout: 15 * time.Second,
+		// per send sequence (per peer), so scaled by the memory budget.
+		// when a shared budget is set, the max acts as the per-sequence
+		// borrow cap and the min as the guaranteed floor.
+		ResendQueueMaxByteCount: MemoryScaledByteCount(mib(2), kib(256)),
+		ResendQueueMinByteCount: kib(256),
 		ContractFillFraction:    0.8,
 		ProtocolVersion:         DefaultProtocolVersion,
 	}
@@ -164,8 +168,12 @@ func DefaultReceiveBufferSettingsWithBufferSize(bufferSize int) *ReceiveBufferSe
 		// ResendAbuseMultiple:  0.5,
 		MaxPeerAuditDuration: 60 * time.Second,
 		// this includes transport reconnections
-		WriteTimeout:             15 * time.Second,
-		ReceiveQueueMaxByteCount: mib(2) + kib(512),
+		WriteTimeout: 15 * time.Second,
+		// per receive sequence (per peer), so scaled by the memory budget.
+		// when a shared budget is set, the max acts as the per-sequence
+		// borrow cap and the min as the guaranteed floor.
+		ReceiveQueueMaxByteCount: MemoryScaledByteCount(mib(2)+kib(512), kib(320)),
+		ReceiveQueueMinByteCount: kib(320),
 		AllowLegacyNack:          true,
 		MaxOpenReceiveContract:   4,
 		ProtocolVersion:          DefaultProtocolVersion,
@@ -598,6 +606,24 @@ func (self *Client) ClientTag() string {
 
 func (self *Client) ClientOob() OutOfBandControl {
 	return self.clientOob
+}
+
+// a peer of this client on the network
+type NetworkPeer struct {
+	ClientId       Id
+	ProvideEnabled bool
+	Principal      string
+	Roles          []string
+	DeviceSpec     string
+	DeviceName     string
+}
+
+// NetworkPeers enumerates the connected peers and the count of
+// recently disconnected peers.
+// FUTURE this is a stub pending the peer tracking implementation.
+// clients with provide disabled have no network peers
+func (self *Client) NetworkPeers() (connected []*NetworkPeer, disconnectedCount int) {
+	return nil, 0
 }
 
 func (self *Client) ReportAbuse(source TransferPath) {
@@ -1435,6 +1461,15 @@ type SendBufferSettings struct {
 	WriteTimeout time.Duration
 
 	ResendQueueMaxByteCount ByteCount
+	// ResendQueueMinByteCount is the guaranteed per-sequence floor when
+	// `ResendQueueBudget` is set: below it admission never consults the
+	// shared budget, so every sequence progresses on floor capacity alone
+	ResendQueueMinByteCount ByteCount
+	// ResendQueueBudget, when set, is a byte budget shared across sequences
+	// (typically all clients of one device): resend queue bytes above the
+	// floor reserve from it, and admission pauses above the floor while it
+	// is empty. nil keeps independent per-sequence caps.
+	ResendQueueBudget *TransferMemoryBudget
 
 	// as this ->1, there is more risk that noack messages will get dropped due to out of sync contracts
 	ContractFillFraction float32
@@ -1849,7 +1884,7 @@ func NewSendSequence(
 		openSendContracts:   map[Id]*sequenceContract{},
 		packs:               make(chan *SendPack, sendBufferSettings.SequenceBufferSize),
 		acks:                make(chan *protocol.Ack, sendBufferSettings.AckBufferSize),
-		resendQueue:         newResendQueue(),
+		resendQueue:         newResendQueue(sendBufferSettings.ResendQueueBudget, sendBufferSettings.ResendQueueMinByteCount),
 		sendItems:           []*sendItem{},
 		nextSequenceNumber:  0,
 		idleCondition:       NewIdleCondition(),
@@ -2032,8 +2067,8 @@ func (self *SendSequence) Run() {
 			// self.client.ContractManager().FlushContractQueue(contractKey, true)
 		}
 
-		// drain the buffer
-		for _, item := range self.resendQueue.orderedItems {
+		// drain the buffer, releasing any borrowed budget
+		for _, item := range self.resendQueue.Clear() {
 			safeAck(item.ackCallback, errors.New("Send sequence closed."))
 			item.messagePoolReturn()
 		}
@@ -2219,14 +2254,10 @@ func (self *SendSequence) Run() {
 
 		checkpointId := self.idleCondition.Checkpoint()
 
-		// approximate since this cannot consider the next message byte size
+		// approximate since this cannot consider the next message byte size.
+		// an empty queue always admits at least one item (see CanAdd).
 		canQueue := func() bool {
-			// always allow at least one item in the resend queue
-			queueSize, queueByteCount := self.resendQueue.QueueSize()
-			if 0 == queueSize {
-				return true
-			}
-			return queueByteCount < self.sendBufferSettings.ResendQueueMaxByteCount
+			return self.resendQueue.CanAdd(0, self.sendBufferSettings.ResendQueueMaxByteCount)
 		}
 		if !canQueue() {
 			// wait for acks
@@ -2497,6 +2528,13 @@ func (self *SendSequence) setContract(nextSendContract *sequenceContract) {
 	self.openSendContracts[nextSendContract.contractId] = nextSendContract
 	self.sendContract = nextSendContract
 	self.sendContractAcked = false
+	nextSendContract.statsEntry = self.client.ContractManager().registerContractStats(
+		nextSendContract.contractId,
+		false,
+		self.companionContract,
+		nextSendContract.path,
+		nextSendContract.transferByteCount,
+	)
 	// The contract carries the destination's `ProvideTlsCertificate`
 	// commitment (possibly empty). Fold the chain into the session's
 	// trusted-peer-cert set so the peer's TLS-handshake cert can be matched
@@ -3178,8 +3216,8 @@ func (self *sendItem) MessageByteCount() ByteCount {
 // - ack timeouts
 type resendQueue = transferQueue[*sendItem]
 
-func newResendQueue() *resendQueue {
-	return newTransferQueue[*sendItem](func(a *sendItem, b *sendItem) int {
+func newResendQueue(budget *TransferMemoryBudget, minByteCount ByteCount) *resendQueue {
+	queue := newTransferQueue[*sendItem](func(a *sendItem, b *sendItem) int {
 		if a.resendTime.Before(b.resendTime) {
 			return -1
 		} else if b.resendTime.Before(a.resendTime) {
@@ -3188,6 +3226,8 @@ func newResendQueue() *resendQueue {
 			return 0
 		}
 	})
+	queue.setBudget(budget, minByteCount)
+	return queue
 }
 
 type ReceiveBufferSettings struct {
@@ -3211,6 +3251,12 @@ type ReceiveBufferSettings struct {
 	WriteTimeout time.Duration
 
 	ReceiveQueueMaxByteCount ByteCount
+	// ReceiveQueueMinByteCount is the guaranteed per-sequence floor when
+	// `ReceiveQueueBudget` is set (see `ResendQueueMinByteCount`)
+	ReceiveQueueMinByteCount ByteCount
+	// ReceiveQueueBudget, when set, is a byte budget shared across sequences
+	// (see `ResendQueueBudget`)
+	ReceiveQueueBudget *TransferMemoryBudget
 
 	// whether to allow nacks without a contract_id
 	AllowLegacyNack bool
@@ -3511,7 +3557,7 @@ func NewReceiveSequence(
 		openReceiveContracts:  map[Id]*sequenceContract{},
 		receiveContract:       nil,
 		packs:                 make(chan *ReceivePack, receiveBufferSettings.SequenceBufferSize),
-		receiveQueue:          newReceiveQueue(),
+		receiveQueue:          newReceiveQueue(receiveBufferSettings.ReceiveQueueBudget, receiveBufferSettings.ReceiveQueueMinByteCount),
 		nextSequenceNumber:    0,
 		idleCondition:         NewIdleCondition(),
 		ackWindow:             newSequenceAckWindow(),
@@ -3635,8 +3681,8 @@ func (self *ReceiveSequence) Run() {
 			)
 		}
 
-		// drain the buffer
-		for _, item := range self.receiveQueue.orderedItems {
+		// drain the buffer, releasing any borrowed budget
+		for _, item := range self.receiveQueue.Clear() {
 			self.peerAudit.Update(func(a *PeerAudit) {
 				a.discard(item.messageByteCount)
 			})
@@ -4080,14 +4126,10 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 			return false, nil
 		}
 	} else {
-		// store only up to a max size in the receive queue
+		// store only up to a max size in the receive queue.
+		// an empty queue always admits at least one item (see CanAdd).
 		canQueue := func(byteCount ByteCount) bool {
-			// always allow at least one item in the receive queue
-			queueSize, queueByteCount := self.receiveQueue.QueueSize()
-			if 0 == queueSize {
-				return true
-			}
-			return queueByteCount+byteCount < self.receiveBufferSettings.ReceiveQueueMaxByteCount
+			return self.receiveQueue.CanAdd(byteCount, self.receiveBufferSettings.ReceiveQueueMaxByteCount)
 		}
 
 		// remove later items to fit
@@ -4340,6 +4382,15 @@ func (self *ReceiveSequence) setContract(nextReceiveContract *sequenceContract) 
 
 	self.openReceiveContracts[nextReceiveContract.contractId] = nextReceiveContract
 	self.receiveContract = nextReceiveContract
+	// the receive side does not know companion-ness (the wire contract does not
+	// carry it). listeners pair contracts to companions with the peer client id
+	nextReceiveContract.statsEntry = self.client.ContractManager().registerContractStats(
+		nextReceiveContract.contractId,
+		true,
+		false,
+		nextReceiveContract.path,
+		nextReceiveContract.transferByteCount,
+	)
 
 	if d := len(self.openReceiveContracts) - self.receiveBufferSettings.MaxOpenReceiveContract; 0 < d {
 		// remove the least recently added
@@ -4456,8 +4507,8 @@ func (self *receiveItem) messagePoolReturn() {
 // ordered by sequenceNumber
 type receiveQueue = transferQueue[*receiveItem]
 
-func newReceiveQueue() *receiveQueue {
-	return newTransferQueue[*receiveItem](func(a *receiveItem, b *receiveItem) int {
+func newReceiveQueue(budget *TransferMemoryBudget, minByteCount ByteCount) *receiveQueue {
+	queue := newTransferQueue[*receiveItem](func(a *receiveItem, b *receiveItem) int {
 		if a.sequenceNumber < b.sequenceNumber {
 			return -1
 		} else if b.sequenceNumber < a.sequenceNumber {
@@ -4466,6 +4517,8 @@ func newReceiveQueue() *receiveQueue {
 			return 0
 		}
 	})
+	queue.setBudget(budget, minByteCount)
+	return queue
 }
 
 type sequenceAck struct {
@@ -4617,6 +4670,11 @@ type sequenceContract struct {
 	ackedByteCount   ByteCount
 	unackedByteCount ByteCount
 
+	// when set, the sequence stores the used byte count here on each debit,
+	// so ongoing contract usage can be reported to stats listeners
+	// (see transfer_contract_stats.go)
+	statsEntry *contractStatsEntry
+
 	// provideTlsCertificate is the PEM-encoded X.509 chain (leaf first)
 	// that the destination committed to as its server TLS identity for
 	// this contract. Empty when the destination did not publish a
@@ -4724,6 +4782,9 @@ func (self *sequenceContract) update(byteCount ByteCount) bool {
 		return false
 	}
 	self.unackedByteCount += effectiveByteCount
+	if self.statsEntry != nil {
+		self.statsEntry.updateUsedByteCount(self.ackedByteCount + self.unackedByteCount)
+	}
 	if self.log.V(1).Enabled() {
 		self.log.Infof(
 			"[%s]debit contract %s passed +%d->%d (%d/%d total %.1f%% full)\n",

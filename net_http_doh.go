@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -48,12 +49,13 @@ var dohServerWindows = []time.Duration{
 
 func DefaultDohSettings() *DohSettings {
 	return &DohSettings{
-		ConnectSettings:           *DefaultConnectSettings(),
-		IpVersion:                 4,
-		MissExpiration:            300 * time.Second,
-		LocalExpiration:           300 * time.Second,
-		MinCacheTtl:               30 * time.Second,
-		CacheMaxEntries:           4096,
+		ConnectSettings: *DefaultConnectSettings(),
+		IpVersion:       4,
+		MissExpiration:  300 * time.Second,
+		LocalExpiration: 300 * time.Second,
+		MinCacheTtl:     30 * time.Second,
+		// per doh cache, so scaled by the memory budget
+		CacheMaxEntries:           MemoryScaledCount(4096, 512),
 		MaxConcurrentResolutions:  64,
 		MaxConcurrentHttpRequests: 16,
 		DohServerStagger:          750 * time.Millisecond,
@@ -83,6 +85,17 @@ func DefaultDnsResolverSettings() *DnsResolverSettings {
 			"https://9.9.9.9/dns-query",        // Quad9
 			"https://208.67.222.222/dns-query", // OpenDNS
 		},
+		// remote plain-dns servers, dialed through the tunnel. remote dns
+		// stays disabled by default for general resolution — while disabled,
+		// the doh server names are the only names permitted to resolve over
+		// it (see DohCache.resolve), so a hostname-form doh server never
+		// leaks to the local resolver
+		RemoteDnsIpv4: []string{
+			"1.1.1.1",        // Cloudflare
+			"9.9.9.9",        // Quad9
+			"8.8.8.8",        // Google
+			"208.67.222.222", // OpenDNS
+		},
 		LocalDnsIpv4: []string{
 			"1.1.1.1",
 		},
@@ -110,8 +123,21 @@ type DohSettings struct {
 	// server is queried immediately and each next one only if no answer has arrived within this
 	// interval, so a healthy primary answers before the redundant servers fire. 0 fans out to all
 	// servers at once.
-	DohServerStagger    time.Duration
+	DohServerStagger time.Duration
+	// MaxServersPerQuery caps how many DoH servers a single query fans out to (in weighted
+	// order, so the best recent performers are the ones tried). On a dead path every launched
+	// request hangs until the deadline holding memory, so a memory-constrained host caps the
+	// fan-out and relies on the weighted rotation across queries to explore the other servers.
+	// 0 fans out to all servers.
+	MaxServersPerQuery  int
 	DnsResolverSettings *DnsResolverSettings
+	// DohServerResolvedCallback, when set, is called after a doh server name
+	// (the hostname of a remote doh url) resolves, with the resolved
+	// addresses. the upgrade mux records these into its ip→hostname reverse
+	// index, so the server addresses are excluded from the override and
+	// association logic along with the server names
+	// (see `UpgradeMux.recordServerNames` and `SetBlockActionIgnoreHosts`)
+	DohServerResolvedCallback func(domain string, addrs []netip.Addr)
 }
 
 func (self *DohSettings) ResolverIp() string {
@@ -192,6 +218,12 @@ type DohCache struct {
 	localResolver  *net.Resolver
 	settings       *DohSettings
 	log            Logger
+
+	// the hostname-form remote doh server names (lowercase). these can not
+	// resolve through remote doh (circular), so they resolve over remote
+	// plain dns through the tunnel even when EnableRemoteDns is false — the
+	// one permitted consumer while it is disabled (see resolve)
+	dohServerNames map[string]bool
 
 	stateLock             sync.Mutex
 	queryResultExpiration map[DohKey]*DohResult
@@ -305,6 +337,30 @@ func NewDohCache(settings *DohSettings) *DohCache {
 	httpSem := make(chan struct{}, maxConcurrentHttpRequests(settings))
 	stats := newServerStats()
 
+	// the hostname-form remote doh server names (see the field doc)
+	dohServerNames := map[string]bool{}
+	if settings.DnsResolverSettings != nil {
+		dohUrlLists := [][]string{
+			settings.DnsResolverSettings.RemoteDohUrlsIpv4,
+			settings.DnsResolverSettings.RemoteDohUrlsIpv6,
+		}
+		for _, dohUrls := range dohUrlLists {
+			for _, dohUrl := range dohUrls {
+				u, err := url.Parse(strings.TrimSpace(dohUrl))
+				if err != nil {
+					continue
+				}
+				host := u.Hostname()
+				if host == "" {
+					continue
+				}
+				if _, err := netip.ParseAddr(host); err != nil {
+					dohServerNames[strings.ToLower(host)] = true
+				}
+			}
+		}
+	}
+
 	return &DohCache{
 		remoteClient:          &dohClient{httpClient: httpClient, httpSem: httpSem, stats: stats},
 		localClient:           &dohClient{httpClient: localHttpClient, httpSem: httpSem, stats: stats},
@@ -312,6 +368,7 @@ func NewDohCache(settings *DohSettings) *DohCache {
 		localResolver:         localResolver,
 		settings:              settings,
 		log:                   loggerOrDefault(settings.Log),
+		dohServerNames:        dohServerNames,
 		queryResultExpiration: map[DohKey]*DohResult{},
 		inflight:              map[DohKey]*dohFlight{},
 		resolveSem:            make(chan struct{}, maxResolutions),
@@ -323,6 +380,26 @@ func maxConcurrentHttpRequests(settings *DohSettings) int {
 		return settings.MaxConcurrentHttpRequests
 	}
 	return 16
+}
+
+// Close releases the cache's pooled DoH connections (each an h2+TLS connection with its
+// buffers and, for tun-dialed paths, its gVisor endpoint — plus keepalive pings while it
+// idles). An owner replacing or discarding a cache must call it; without it the connections
+// linger until the idle timeout. The cache remains usable — a later query re-dials.
+func (self *DohCache) Close() {
+	self.remoteClient.httpClient.CloseIdleConnections()
+	self.localClient.httpClient.CloseIdleConnections()
+}
+
+// ShedMemory drops the query result cache and releases the pooled connections, for the host's
+// memory pressure signal. Subsequent queries re-resolve and re-dial.
+func (self *DohCache) ShedMemory() {
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		clear(self.queryResultExpiration)
+	}()
+	self.Close()
 }
 
 func (self *DohCache) pruneCacheLocked(now time.Time, reserve int) {
@@ -436,7 +513,14 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]n
 	cacheMiss := false
 	minCacheTtl := self.settings.MinCacheTtl
 
-	if self.settings.DnsResolverSettings.EnableRemoteDoh {
+	// a doh server name can not resolve through doh (circular). it resolves
+	// over remote plain dns through the tunnel instead — permitted even when
+	// EnableRemoteDns is false, so a hostname-form doh server resolves
+	// remotely rather than falling through to the local resolver. remote dns
+	// remains disabled for every other name.
+	dohServerName := self.dohServerNames[q.Domain]
+
+	if !dohServerName && self.settings.DnsResolverSettings.EnableRemoteDoh {
 		queryResult := self.remoteClient.queryResult(ctx, remoteDohUrls(self.settings, self.settings.IpVersion), q.RecordType, self.settings, q.Domain)
 
 		for addr, ttlSeconds := range queryResult.AddrTtls {
@@ -447,7 +531,7 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]n
 		}
 	}
 
-	if len(addrExpirations) == 0 && self.settings.DnsResolverSettings.EnableLocalDoh {
+	if len(addrExpirations) == 0 && !dohServerName && self.settings.DnsResolverSettings.EnableLocalDoh {
 		queryResult := self.localClient.queryResult(ctx, localDohUrls(self.settings, self.settings.IpVersion), q.RecordType, self.settings, q.Domain)
 
 		for addr, ttlSeconds := range queryResult.AddrTtls {
@@ -458,7 +542,7 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]n
 		}
 	}
 
-	if len(addrExpirations) == 0 && self.settings.DnsResolverSettings.EnableRemoteDns {
+	if len(addrExpirations) == 0 && (dohServerName || self.settings.DnsResolverSettings.EnableRemoteDns) {
 		// try the remote resolver
 		resolvedIps, err := self.remoteResolver.LookupIP(ctx, self.settings.ResolverIp(), q.Domain)
 		if err == nil {
@@ -498,6 +582,18 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]n
 		} else if log := self.log.V(2); log.Enabled() {
 			log.Infof("[doh]local (%s) err = %s\n", q.Domain, err)
 		}
+	}
+
+	if dohServerName && 0 < len(addrExpirations) && self.settings.DohServerResolvedCallback != nil {
+		// surface the server addresses (e.g. into the mux reverse index, so
+		// the ignore matcher covers them alongside the server name)
+		addrs := []netip.Addr{}
+		for addr := range addrExpirations {
+			addrs = append(addrs, addr)
+		}
+		HandleError(func() {
+			self.settings.DohServerResolvedCallback(q.Domain, addrs)
+		})
 	}
 
 	authoritative := 0 < len(addrExpirations) || cacheMiss
@@ -643,6 +739,9 @@ func (self *dohClient) queryResult(
 	// weighted-random order: the best recent performers tend to fire first (and the rest are
 	// skipped when an early server wins)
 	ordered := self.stats.order(dohUrls)
+	if 0 < settings.MaxServersPerQuery && settings.MaxServersPerQuery < len(ordered) {
+		ordered = ordered[:settings.MaxServersPerQuery]
+	}
 
 	queryCount := len(ordered) * len(names)
 	receiveResults := make(chan *dohQueryResult, queryCount)
@@ -668,7 +767,22 @@ func (self *dohClient) queryResult(
 				}
 			}
 			for _, name := range names {
+				// acquire the in-flight slot here so work waiting on the cap parks in
+				// this one launcher instead of one parked goroutine per (server, name);
+				// the request goroutine owns the slot and releases it when done
+				if self.httpSem != nil {
+					select {
+					case self.httpSem <- struct{}{}:
+					case <-stop:
+						return
+					case <-queryCtx.Done():
+						return
+					}
+				}
 				go HandleError(func() {
+					if self.httpSem != nil {
+						defer func() { <-self.httpSem }()
+					}
 					result := self.queryWire(queryCtx, dohUrl, recordType, name)
 					// a server that returns records or an authoritative no-record answer is healthy;
 					// anything else (error, non-200, or no answer before it was beaten) counts
@@ -748,18 +862,9 @@ func (self *dohClient) queryWire(ctx context.Context, dohUrl string, recordType 
 	}
 	request.Header.Set("Accept", "application/dns-message")
 
-	// bound concurrent in-flight HTTP requests across this cache — the memory governor for the
-	// iOS network extension. Hold a slot across the request and body read (the lifetime of the h2
-	// stream and the response buffer); block here under load rather than allocating a new stream.
-	if self.httpSem != nil {
-		select {
-		case self.httpSem <- struct{}{}:
-			defer func() { <-self.httpSem }()
-		case <-ctx.Done():
-			return result
-		}
-	}
-
+	// the caller holds an httpSem slot for the lifetime of this request (acquired before this
+	// goroutine was spawned), bounding concurrent in-flight HTTP requests across the cache —
+	// the memory governor for the iOS network extension
 	response, err := self.httpClient.Do(request)
 	if err != nil {
 		return result

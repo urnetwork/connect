@@ -127,12 +127,15 @@ func (self *ConnectSettings) DialContext(ctx context.Context, network string, ad
 }
 
 func (self *ConnectSettings) NetDialer() *net.Dialer {
-	return &net.Dialer{
+	// egressDialer forces the physical egress interface on Windows so the
+	// service's own connections never loop into the tunnel it provides (R1);
+	// a no-op on other platforms and when no egress index is set.
+	return egressDialer(&net.Dialer{
 		Timeout:         self.ConnectTimeout,
 		KeepAlive:       self.KeepAliveTimeout,
 		KeepAliveConfig: self.KeepAliveConfig,
 		Resolver:        self.Resolver,
-	}
+	})
 }
 
 type ProxySettings struct {

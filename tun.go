@@ -60,14 +60,24 @@ func DefaultTunSettingsWithBufferSize(bufferSize int) *TunSettings {
 		// the gvisor udp endpoint buffers default to 32KiB, which is too small for fast
 		// transfer; cap at 1MiB (gvisor clamps to at most 4MiB) to bound per-endpoint
 		// memory on the shared stack used by the server/proxy.
-		UdpReceiveBufferByteCount: 1024 * 1024,
-		UdpSendBufferByteCount:    1024 * 1024,
+		// per endpoint, so scaled by the memory budget.
+		UdpReceiveBufferByteCount: int(MemoryScaledByteCount(mib(1), kib(128))),
+		UdpSendBufferByteCount:    int(MemoryScaledByteCount(mib(1), kib(128))),
 
 		// tcp buffer auto-tuning ranges for the server/proxy data plane (the shared
 		// stack). Max applies per connection, so it caps per-connection memory; a
 		// memory-constrained IpMux on a private stack shrinks these much further.
-		TcpReceiveBuffer: TcpBufferRange{Min: 4 * 1024, Default: 256 * 1024, Max: 1024 * 1024},
-		TcpSendBuffer:    TcpBufferRange{Min: 4 * 1024, Default: 256 * 1024, Max: 1024 * 1024},
+		// default and max are per connection, so scaled by the memory budget.
+		TcpReceiveBuffer: TcpBufferRange{
+			Min:     4 * 1024,
+			Default: int(MemoryScaledByteCount(kib(256), kib(64))),
+			Max:     int(MemoryScaledByteCount(mib(1), kib(256))),
+		},
+		TcpSendBuffer: TcpBufferRange{
+			Min:     4 * 1024,
+			Default: int(MemoryScaledByteCount(kib(256), kib(64))),
+			Max:     int(MemoryScaledByteCount(mib(1), kib(256))),
+		},
 	}
 }
 
@@ -86,6 +96,12 @@ type TunSettings struct {
 	// TLS + query). The IpMux sets it from DnsUpgradeSettings.ResolveTimeout so DNS resolution has
 	// a single timeout knob. 0 falls back to a default.
 	DohRequestTimeout time.Duration
+
+	// DohSettings, when set, is the base settings for the tun's resolver cache — a
+	// memory-constrained consumer bounds the cache and fan-out here (see the UpgradeMux).
+	// buildDohCache copies it and overlays the tun dialer, log, timeouts, and resolver
+	// settings, so those fields of the base are ignored. nil uses DefaultDohSettings.
+	DohSettings *DohSettings
 
 	UdpReceiveBufferByteCount int
 	UdpSendBufferByteCount    int
@@ -310,6 +326,11 @@ type Tun struct {
 	// registeredAddresses map[netip.Addr]bool
 	dohResolver atomic.Pointer[DohCache]
 
+	// closeOnce makes Close idempotent: a second Close must not return the nic id and
+	// local address to the shared allocators again — a double return hands the same
+	// address out twice, and two later tuns silently share it (breaking their routing).
+	closeOnce sync.Once
+
 	stateLock sync.Mutex
 }
 
@@ -407,7 +428,14 @@ func (self *Tun) DohCache() *DohCache {
 // buildDohCache constructs a DohCache resolving through this tun (remote paths dial via
 // the tun; local paths use the host), with the given resolver settings (nil = default).
 func (self *Tun) buildDohCache(dnsResolverSettings *DnsResolverSettings, requestTimeout time.Duration) *DohCache {
-	dohSettings := DefaultDohSettings()
+	var dohSettings *DohSettings
+	if self.settings.DohSettings != nil {
+		// copy so the overlays below don't mutate the caller's base
+		copied := *self.settings.DohSettings
+		dohSettings = &copied
+	} else {
+		dohSettings = DefaultDohSettings()
+	}
 	dohSettings.ConnectSettings.Log = self.log
 	dohSettings.RequestTimeout = requestTimeout
 	if dohSettings.RequestTimeout <= 0 {
@@ -427,7 +455,11 @@ func (self *Tun) buildDohCache(dnsResolverSettings *DnsResolverSettings, request
 // timeout, taking effect for subsequent queries (the prior cache's in-flight queries are
 // unaffected). Safe to call concurrently with DohCache()/Query.
 func (self *Tun) SetDnsResolverSettings(dnsResolverSettings *DnsResolverSettings, requestTimeout time.Duration) {
-	self.dohResolver.Store(self.buildDohCache(dnsResolverSettings, requestTimeout))
+	if replaced := self.dohResolver.Swap(self.buildDohCache(dnsResolverSettings, requestTimeout)); replaced != nil {
+		// release the replaced cache's pooled connections (and their endpoints on this
+		// tun's stack) now instead of holding both generations until the idle timeout
+		replaced.Close()
+	}
 }
 
 // LocalAddresses returns the addresses assigned to the internal stack's NIC
@@ -445,9 +477,31 @@ func (self *Tun) Read() ([]byte, error) {
 	if pkt == nil {
 		return nil, fmt.Errorf("Done")
 	}
-	packet := MessagePoolCopy(pkt.ToView().AsSlice())
+	packet := messagePoolCopyPacketBuffer(pkt)
 	pkt.DecRef()
 	return packet, nil
+}
+
+// messagePoolCopyPacketBuffer copies a packet buffer's bytes into a pooled message
+// with a single copy and no intermediate allocation (ToView would deep-copy into an
+// intermediate view first, on every packet the stack emits).
+func messagePoolCopyPacketBuffer(pkt *stack.PacketBuffer) []byte {
+	packet := MessagePoolGet(pkt.Size())
+	vl, offset := pkt.AsViewList()
+	i := 0
+	for v := vl.Front(); v != nil; v = v.Next() {
+		s := v.AsSlice()
+		if 0 < offset {
+			if len(s) <= offset {
+				offset -= len(s)
+				continue
+			}
+			s = s[offset:]
+			offset = 0
+		}
+		i += copy(packet[i:], s)
+	}
+	return packet[:i]
 }
 
 // reads one or more packets, blocking until at least one is available.
@@ -466,7 +520,7 @@ func (self *Tun) ReadBatch(packets [][]byte) (int, error) {
 	}
 	n := 0
 	for pkt != nil {
-		packets[n] = MessagePoolCopy(pkt.ToView().AsSlice())
+		packets[n] = messagePoolCopyPacketBuffer(pkt)
 		pkt.DecRef()
 		n += 1
 		if n >= len(packets) {
@@ -690,22 +744,27 @@ func (self *Tun) Dial(network, address string) (net.Conn, error) {
 }
 
 func (self *Tun) Close() error {
-	self.cancel()
-	self.stack.RemoveNIC(self.nicId)
-	// ep.Close() drains and DecRefs any packets still queued in the endpoint.
-	self.ep.Close()
-	self.nicIdAllocator.ReturnNicId(self.nicId)
-	for _, addr := range self.localAddresses {
-		if addr.Is4() {
-			self.localIpv4AddressAllocator.ReturnAddr(addr)
+	self.closeOnce.Do(func() {
+		self.cancel()
+		// release the resolver cache's pooled h2/TLS connections promptly; their endpoints on
+		// this stack are destroyed with it below either way
+		self.dohResolver.Load().Close()
+		self.stack.RemoveNIC(self.nicId)
+		// ep.Close() drains and DecRefs any packets still queued in the endpoint.
+		self.ep.Close()
+		self.nicIdAllocator.ReturnNicId(self.nicId)
+		for _, addr := range self.localAddresses {
+			if addr.Is4() {
+				self.localIpv4AddressAllocator.ReturnAddr(addr)
+			}
 		}
-	}
-	// destroy this Tun's stack so its endpoints and background goroutines are released.
-	// Do NOT stack.Wait() here: Close() can run under the device stateLock during a
-	// reconfigure (SetDestination), and Wait() blocks until every stack goroutine halts —
-	// one stuck goroutine would wedge the device, and DNS, until restart. The stack's
-	// goroutines exit asynchronously after Close().
-	self.stack.Close()
+		// destroy this Tun's stack so its endpoints and background goroutines are released.
+		// Do NOT stack.Wait() here: Close() can run under the device stateLock during a
+		// reconfigure (SetDestination), and Wait() blocks until every stack goroutine halts —
+		// one stuck goroutine would wedge the device, and DNS, until restart. The stack's
+		// goroutines exit asynchronously after Close().
+		self.stack.Close()
+	})
 	return nil
 }
 

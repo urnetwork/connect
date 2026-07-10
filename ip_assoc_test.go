@@ -1,0 +1,347 @@
+package connect
+
+import (
+	"context"
+	"net/netip"
+	"testing"
+	"time"
+
+	"github.com/go-playground/assert/v2"
+)
+
+func testingIpAssocAddr(s string) netip.Addr {
+	return netip.MustParseAddr(s)
+}
+
+func testingIpAssocPath(s string) *IpPath {
+	addr := testingIpAssocAddr(s)
+	version := 4
+	if addr.Is6() {
+		version = 6
+	}
+	return &IpPath{
+		Version:       version,
+		Protocol:      IpProtocolTcp,
+		DestinationIp: addr.AsSlice(),
+	}
+}
+
+func TestClusterIpAssocThresholdSplit(t *testing.T) {
+	a := testingIpAssocAddr("1.0.0.1")
+	b := testingIpAssocAddr("1.0.0.2")
+	c := testingIpAssocAddr("1.0.0.3")
+	d := testingIpAssocAddr("1.0.0.4")
+
+	// a, b, c strongly co-associated. d weakly attached to a only
+	counts := map[netip.Addr]uint32{
+		a: 10,
+		b: 10,
+		c: 10,
+		d: 10,
+	}
+	coCounts := map[ipAssocPair]uint32{
+		newIpAssocPair(a, b): 9,
+		newIpAssocPair(a, c): 9,
+		newIpAssocPair(b, c): 9,
+		newIpAssocPair(a, d): 1,
+	}
+
+	members := clusterIpAssoc(counts, coCounts, map[netip.Addr][]string{}, 0.5)
+
+	assert.Equal(t, 3, len(members[a]))
+	assert.Equal(t, 3, len(members[b]))
+	assert.Equal(t, 3, len(members[c]))
+	_, ok := members[d]
+	assert.Equal(t, false, ok)
+}
+
+func TestClusterIpAssocComponents(t *testing.T) {
+	a := testingIpAssocAddr("1.0.0.1")
+	b := testingIpAssocAddr("1.0.0.2")
+	c := testingIpAssocAddr("1.0.0.3")
+	d := testingIpAssocAddr("1.0.0.4")
+
+	// two independent pairs
+	counts := map[netip.Addr]uint32{
+		a: 10,
+		b: 10,
+		c: 4,
+		d: 4,
+	}
+	coCounts := map[ipAssocPair]uint32{
+		newIpAssocPair(a, b): 8,
+		newIpAssocPair(c, d): 4,
+	}
+
+	members := clusterIpAssoc(counts, coCounts, map[netip.Addr][]string{}, 0.5)
+
+	assert.Equal(t, 2, len(members[a]))
+	assert.Equal(t, 2, len(members[b]))
+	assert.Equal(t, 2, len(members[c]))
+	assert.Equal(t, 2, len(members[d]))
+	memberSet := map[netip.Addr]bool{}
+	for _, member := range members[a] {
+		memberSet[member] = true
+	}
+	assert.Equal(t, true, memberSet[a])
+	assert.Equal(t, true, memberSet[b])
+	assert.Equal(t, false, memberSet[c])
+}
+
+func TestClusterIpAssocBaseNameMerge(t *testing.T) {
+	a := testingIpAssocAddr("1.0.0.1")
+	b := testingIpAssocAddr("1.0.0.2")
+	c := testingIpAssocAddr("1.0.0.3")
+
+	// a and b share a base name with no co-occurrence.
+	// c co-occurs with a only, but the merged node carries the association
+	counts := map[netip.Addr]uint32{
+		a: 10,
+		b: 2,
+		c: 10,
+	}
+	coCounts := map[ipAssocPair]uint32{
+		newIpAssocPair(a, c): 8,
+	}
+	baseNames := map[netip.Addr][]string{
+		a: {"example.com"},
+		b: {"example.com"},
+	}
+
+	members := clusterIpAssoc(counts, coCounts, baseNames, 0.5)
+
+	// all three cluster together: a+b merged by name, c associated with the merged node
+	assert.Equal(t, 3, len(members[a]))
+	assert.Equal(t, 3, len(members[b]))
+	assert.Equal(t, 3, len(members[c]))
+}
+
+func TestClusterIpAssocBaseNameOnly(t *testing.T) {
+	a := testingIpAssocAddr("1.0.0.1")
+	b := testingIpAssocAddr("1.0.0.2")
+
+	// no co-occurrence at all. the shared base name alone forms a cluster
+	counts := map[netip.Addr]uint32{
+		a: 1,
+		b: 1,
+	}
+	baseNames := map[netip.Addr][]string{
+		a: {"example.com"},
+		b: {"example.com"},
+	}
+
+	members := clusterIpAssoc(counts, map[ipAssocPair]uint32{}, baseNames, 0.5)
+
+	assert.Equal(t, 2, len(members[a]))
+	assert.Equal(t, 2, len(members[b]))
+}
+
+func TestIpAssocActivityClustering(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	settings := DefaultIpAssocSettings()
+	settings.ActivityGranule = 1 * time.Millisecond
+	settings.PacketAssociationTime = 100 * time.Millisecond
+	// keep the epoch long so the test drives updateClusters directly
+	settings.ClusterEpoch = 60 * time.Second
+
+	ipAssoc := NewIpAssoc(ctx, settings)
+	defer ipAssoc.Close()
+
+	// a and b are active together
+	for range 8 {
+		ipAssoc.AddEgressPacket(testingIpAssocPath("1.0.0.1"))
+		ipAssoc.AddIngressPacket(&IpPath{
+			Version:  4,
+			Protocol: IpProtocolTcp,
+			SourceIp: testingIpAssocAddr("1.0.0.2").AsSlice(),
+		})
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// c is active alone, outside the association time
+	time.Sleep(150 * time.Millisecond)
+	for range 8 {
+		ipAssoc.AddEgressPacket(testingIpAssocPath("1.0.0.3"))
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	ipAssoc.updateClusters()
+
+	cluster := ipAssoc.GetCluster(testingIpAssocPath("1.0.0.1"))
+	assert.Equal(t, 2, len(cluster))
+	memberSet := map[string]bool{}
+	for _, memberPath := range cluster {
+		memberSet[memberPath.DestinationIp.String()] = true
+	}
+	assert.Equal(t, true, memberSet["1.0.0.1"])
+	assert.Equal(t, true, memberSet["1.0.0.2"])
+
+	assert.Equal(t, 0, len(ipAssoc.GetCluster(testingIpAssocPath("1.0.0.3"))))
+
+	// version changes only when the clustering changes
+	version := ipAssoc.ClusterVersion()
+	ipAssoc.AddEgressPacket(testingIpAssocPath("1.0.0.1"))
+	ipAssoc.updateClusters()
+	assert.Equal(t, version, ipAssoc.ClusterVersion())
+}
+
+func TestIpAssocGranuleDedup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	settings := DefaultIpAssocSettings()
+	settings.ActivityGranule = 10 * time.Second
+	settings.ClusterEpoch = 60 * time.Second
+
+	ipAssoc := NewIpAssoc(ctx, settings)
+	defer ipAssoc.Close()
+
+	for range 100 {
+		ipAssoc.AddEgressPacket(testingIpAssocPath("1.0.0.1"))
+	}
+
+	func() {
+		ipAssoc.stateLock.Lock()
+		defer ipAssoc.stateLock.Unlock()
+		assert.Equal(t, 1, len(ipAssoc.blocks))
+		assert.Equal(t, uint32(1), ipAssoc.blocks[0].countFor(testingIpAssocAddr("1.0.0.1")))
+	}()
+}
+
+func TestIpAssocEntityCap(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	settings := DefaultIpAssocSettings()
+	settings.ActivityGranule = 1 * time.Millisecond
+	settings.ClusterEpoch = 60 * time.Second
+	settings.MaxEntityCount = 2
+
+	ipAssoc := NewIpAssoc(ctx, settings)
+	defer ipAssoc.Close()
+
+	ipAssoc.AddEgressPacket(testingIpAssocPath("1.0.0.1"))
+	ipAssoc.AddEgressPacket(testingIpAssocPath("1.0.0.2"))
+	ipAssoc.AddEgressPacket(testingIpAssocPath("1.0.0.3"))
+
+	func() {
+		ipAssoc.stateLock.Lock()
+		defer ipAssoc.stateLock.Unlock()
+		assert.Equal(t, 2, len(ipAssoc.blocks[0].addrs))
+		_, ok := ipAssoc.blocks[0].indexes[testingIpAssocAddr("1.0.0.3")]
+		assert.Equal(t, false, ok)
+	}()
+}
+
+func TestIpAssocBlockRotation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	settings := DefaultIpAssocSettings()
+	settings.ActivityGranule = 1 * time.Millisecond
+	settings.AssociationBlockDuration = 20 * time.Millisecond
+	settings.AssociationBlockCount = 2
+	settings.ClusterEpoch = 60 * time.Second
+
+	ipAssoc := NewIpAssoc(ctx, settings)
+	defer ipAssoc.Close()
+
+	for range 4 {
+		ipAssoc.AddEgressPacket(testingIpAssocPath("1.0.0.1"))
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	func() {
+		ipAssoc.stateLock.Lock()
+		defer ipAssoc.stateLock.Unlock()
+		assert.Equal(t, 2, len(ipAssoc.blocks))
+	}()
+}
+
+type testingServerNameLookup struct {
+	serverNames map[string][]string
+}
+
+func (self *testingServerNameLookup) ServerNames(ip string) []string {
+	return self.serverNames[ip]
+}
+
+func TestIpAssocMultipleIpsPerHost(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	settings := DefaultIpAssocSettings()
+	settings.ActivityGranule = 1 * time.Millisecond
+	settings.PacketAssociationTime = 100 * time.Millisecond
+	settings.ClusterEpoch = 60 * time.Second
+
+	ipAssoc := NewIpAssoc(ctx, settings)
+	defer ipAssoc.Close()
+
+	// one host name resolves to multiple ips (multiple a records).
+	// activity may land on either ip, and both must associate with the cluster
+	ipAssoc.SetServerNameLookup(&testingServerNameLookup{
+		serverNames: map[string][]string{
+			"1.0.0.1": {"cdn.example.com"},
+			"1.0.0.2": {"cdn.example.com"},
+		},
+	})
+
+	// only the first host ip co-occurs with the api ip
+	for range 8 {
+		ipAssoc.AddEgressPacket(testingIpAssocPath("1.0.0.1"))
+		ipAssoc.AddEgressPacket(testingIpAssocPath("9.0.0.9"))
+		time.Sleep(2 * time.Millisecond)
+	}
+	// the second host ip is active outside the association time
+	time.Sleep(150 * time.Millisecond)
+	ipAssoc.AddEgressPacket(testingIpAssocPath("1.0.0.2"))
+
+	ipAssoc.updateClusters()
+
+	// either host ip resolves to the full cluster: both host ips + the associated api ip
+	for _, hostIp := range []string{"1.0.0.1", "1.0.0.2"} {
+		cluster := ipAssoc.GetCluster(testingIpAssocPath(hostIp))
+		memberSet := map[string]bool{}
+		for _, memberPath := range cluster {
+			memberSet[memberPath.DestinationIp.String()] = true
+		}
+		assert.Equal(t, 3, len(cluster))
+		assert.Equal(t, true, memberSet["1.0.0.1"])
+		assert.Equal(t, true, memberSet["1.0.0.2"])
+		assert.Equal(t, true, memberSet["9.0.0.9"])
+	}
+}
+
+func TestIpAssocServerNameLookup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	settings := DefaultIpAssocSettings()
+	settings.ActivityGranule = 1 * time.Millisecond
+	settings.ClusterEpoch = 60 * time.Second
+
+	ipAssoc := NewIpAssoc(ctx, settings)
+	defer ipAssoc.Close()
+
+	// subdomains collapse to the base name, so both ips merge into one node
+	ipAssoc.SetServerNameLookup(&testingServerNameLookup{
+		serverNames: map[string][]string{
+			"1.0.0.1": {"a.example.com"},
+			"1.0.0.2": {"b.c.example.com"},
+		},
+	})
+
+	ipAssoc.AddEgressPacket(testingIpAssocPath("1.0.0.1"))
+	// outside the association time in block terms is fine.
+	// the base name alone merges the entities
+	time.Sleep(2 * time.Millisecond)
+	ipAssoc.AddEgressPacket(testingIpAssocPath("1.0.0.2"))
+
+	ipAssoc.updateClusters()
+
+	cluster := ipAssoc.GetCluster(testingIpAssocPath("1.0.0.1"))
+	assert.Equal(t, 2, len(cluster))
+}

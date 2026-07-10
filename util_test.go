@@ -317,3 +317,33 @@ func TestWeightedShuffleWithEntropy(t *testing.T) {
 		}
 	}
 }
+
+// TestMemoryShedders: the registry runs registered shedders on ShedMemory, and an
+// unregistered shedder no longer runs.
+func TestMemoryShedders(t *testing.T) {
+	var mu sync.Mutex
+	count := 0
+	unregister := AddMemoryShedder(func() {
+		mu.Lock()
+		defer mu.Unlock()
+		count += 1
+	})
+
+	ShedMemory()
+	ShedMemory()
+	mu.Lock()
+	got := count
+	mu.Unlock()
+	if got != 2 {
+		t.Fatalf("shedder ran %d times, want 2", got)
+	}
+
+	unregister()
+	ShedMemory()
+	mu.Lock()
+	got = count
+	mu.Unlock()
+	if got != 2 {
+		t.Fatalf("shedder ran %d times after unregister, want still 2", got)
+	}
+}

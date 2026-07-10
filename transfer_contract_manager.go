@@ -210,6 +210,8 @@ func DefaultContractManagerSettingsWithBufferSize(bufferSize int) *ContractManag
 
 		ContractQueueExpireTimeout: 120 * time.Second,
 
+		ContractStatsEpoch: 1 * time.Second,
+
 		ProtocolVersion: DefaultProtocolVersion,
 
 		// TODO remove
@@ -263,6 +265,10 @@ type ContractManagerSettings struct {
 	// window (5 minutes). <= 0 disables expiry.
 	ContractQueueExpireTimeout time.Duration
 
+	// the epoch for emitting open contract usage events to
+	// `AddContractStatsCallback` listeners
+	ContractStatsEpoch time.Duration
+
 	ProtocolVersion int
 
 	// TODO remove
@@ -300,6 +306,13 @@ type ContractManager struct {
 	contractStatusCallbacks *CallbackList[*contractStatusCallbackWorker]
 
 	localStats *ContractManagerStats
+
+	// open contract usage, updated by the owning sequences and
+	// emitted per epoch (see transfer_contract_stats.go)
+	contractStatsLock      sync.Mutex
+	contractStatsEntries   map[contractStatsKey]*contractStatsEntry
+	contractStatsCallbacks *CallbackList[ContractStatsFunction]
+	contractStatsStarted   bool
 
 	controlSyncProvide    *ControlSync
 	controlSyncProvideOob *ControlSyncOob
@@ -340,6 +353,8 @@ func NewContractManager(
 		sendNoContractClientIds:    sendNoContractClientIds,
 		contractStatusCallbacks:    NewCallbackList[*contractStatusCallbackWorker](),
 		localStats:                 NewContractManagerStats(),
+		contractStatsEntries:       map[contractStatsKey]*contractStatsEntry{},
+		contractStatsCallbacks:     NewCallbackList[ContractStatsFunction](),
 		controlSyncProvide:         NewControlSync(ctx, client, "provide"),
 		controlSyncProvideOob:      NewControlSyncOob(ctx, client, "provide-oob"),
 	}
@@ -1149,6 +1164,10 @@ func (self *ContractManager) CloseContractWithCheckpoint(
 	unackedByteCount ByteCount,
 	checkpoint bool,
 ) {
+	// the sequence stops updating the contract at close/checkpoint,
+	// so this is final for the stats entry either way
+	self.closeContractStats(contractId)
+
 	opened := false
 	var contractKey ContractKey
 

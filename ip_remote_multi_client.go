@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math"
 	mathrand "math/rand"
+	"net/netip"
 	"slices"
 	"strings"
 
@@ -185,6 +186,13 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 
 		SecurityPolicyGenerator: DefaultSecurityPolicyWithStats,
 
+		// the epoch for flushing block action and packet stats events to listeners
+		EventEpoch:                  1 * time.Second,
+		BlockActionDecisionTtl:      30 * time.Second,
+		BlockActionDecisionMaxCount: 4096,
+		BlockActionAggMaxCount:      1024,
+		IpAssocSettings:             DefaultIpAssocSettings(),
+
 		RemoteUserNatMultiClientMonitorSettings: *DefaultRemoteUserNatMultiClientMonitorSettings(),
 	}
 }
@@ -275,6 +283,17 @@ type MultiClientSettings struct {
 	UdpCollapsePrevention bool
 
 	SecurityPolicyGenerator func(context.Context, *SecurityPolicyStatsCollector) SecurityPolicy
+
+	// the epoch for flushing block action and packet stats events to listeners
+	EventEpoch time.Duration
+	// how long a cached block action decision stays valid while the overrides
+	// and cluster versions are unchanged (server names for a destination can drift)
+	BlockActionDecisionTtl      time.Duration
+	BlockActionDecisionMaxCount int
+	// max distinct block actions aggregated per epoch
+	BlockActionAggMaxCount int
+	// nil disables activity association (`IpAssoc`)
+	IpAssocSettings *IpAssocSettings
 
 	RemoteUserNatMultiClientMonitorSettings
 }
@@ -390,6 +409,19 @@ type RemoteUserNatMultiClient struct {
 
 	localUserNat      *LocalUserNat
 	localUserNatUnsub func()
+
+	// nil when `IpAssocSettings` is not set
+	ipAssoc *IpAssoc
+	// immutable snapshot of the compiled overrides, swapped by `SetBlockActionOverrides`
+	blockActionState     atomic.Pointer[blockActionState]
+	blockActionCache     *blockActionCache
+	blockActionCollector *blockActionCollector
+	// immutable snapshot of the compiled ignore host values,
+	// swapped by `SetBlockActionIgnoreHosts`
+	blockActionIgnoreState atomic.Pointer[blockActionIgnoreState]
+	blockActionIgnoreCache *blockActionIgnoreCache
+	packetStatsCounters    *packetStatsCounters
+	packetStatsCallbacks   *CallbackList[PacketStatsFunction]
 }
 
 // ServerNameLookup resolves a destination IP to the server name(s) previously observed
@@ -442,27 +474,43 @@ func NewRemoteUserNatMultiClient(
 	localUserNat := NewLocalUserNat(cancelCtx, "multi local", localUserNatSettings)
 
 	multiClient := &RemoteUserNatMultiClient{
-		ctx:                   cancelCtx,
-		cancel:                cancel,
-		log:                   log,
-		generator:             generator,
-		receivePacketCallback: receivePacketCallback,
-		settings:              settings,
-		windows:               map[WindowType]*multiClientWindow{},
-		securityPolicyStats:   securityPolicyStats,
-		securityPolicy:        settings.SecurityPolicyGenerator(cancelCtx, securityPolicyStats),
-		provideMode:           provideMode,
-		ip4PathUpdates:        map[Ip4Path]*multiClientChannelUpdate{},
-		ip6PathUpdates:        map[Ip6Path]*multiClientChannelUpdate{},
-		affinityIp4Paths:      map[Ip4Path]map[Ip4Path]time.Time{},
-		affinityIp6Paths:      map[Ip6Path]map[Ip6Path]time.Time{},
-		clientUpdates:         map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
-		localUserNat:          localUserNat,
+		ctx:                    cancelCtx,
+		cancel:                 cancel,
+		log:                    log,
+		generator:              generator,
+		receivePacketCallback:  receivePacketCallback,
+		settings:               settings,
+		windows:                map[WindowType]*multiClientWindow{},
+		securityPolicyStats:    securityPolicyStats,
+		securityPolicy:         settings.SecurityPolicyGenerator(cancelCtx, securityPolicyStats),
+		provideMode:            provideMode,
+		ip4PathUpdates:         map[Ip4Path]*multiClientChannelUpdate{},
+		ip6PathUpdates:         map[Ip6Path]*multiClientChannelUpdate{},
+		affinityIp4Paths:       map[Ip4Path]map[Ip4Path]time.Time{},
+		affinityIp6Paths:       map[Ip6Path]map[Ip6Path]time.Time{},
+		clientUpdates:          map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
+		localUserNat:           localUserNat,
+		blockActionCache:       newBlockActionCache(settings.BlockActionDecisionTtl, settings.BlockActionDecisionMaxCount),
+		blockActionCollector:   newBlockActionCollector(settings.BlockActionAggMaxCount),
+		blockActionIgnoreCache: newBlockActionIgnoreCache(settings.BlockActionDecisionTtl, settings.BlockActionDecisionMaxCount),
+		packetStatsCounters:    &packetStatsCounters{},
+		packetStatsCallbacks:   NewCallbackList[PacketStatsFunction](),
+	}
+	if settings.IpAssocSettings != nil {
+		multiClient.ipAssoc = NewIpAssoc(cancelCtx, settings.IpAssocSettings)
 	}
 	multiClient.config.Store(&multiClientConfig{
 		performanceProfile:  settings.DefaultPerformanceProfile,
 		localSecurityBypass: false,
 		serverNameLookup:    nil,
+	})
+	multiClient.blockActionState.Store(&blockActionState{
+		version: 0,
+		matcher: nil,
+	})
+	multiClient.blockActionIgnoreState.Store(&blockActionIgnoreState{
+		version: 0,
+		matcher: nil,
 	})
 
 	multiClient.windows[WindowTypeQuality] = newMultiClientWindow(
@@ -489,7 +537,7 @@ func NewRemoteUserNatMultiClient(
 	}
 	// else only keep the quality window for fixed destination
 
-	multiClient.localUserNatUnsub = localUserNat.AddReceivePacketCallback(receivePacketCallback)
+	multiClient.localUserNatUnsub = localUserNat.AddReceivePacketCallback(multiClient.localReceivePacket)
 
 	monitors := []MultiClientMonitor{}
 	for _, window := range multiClient.windows {
@@ -497,7 +545,54 @@ func NewRemoteUserNatMultiClient(
 	}
 	multiClient.monitor = NewMergedMultiClientMonitor(monitors)
 
+	go HandleError(multiClient.runEventEpoch, cancel)
+
 	return multiClient
+}
+
+// flushes block action and packet stats events to listeners on the event epoch
+func (self *RemoteUserNatMultiClient) runEventEpoch() {
+	defer self.cancel()
+
+	lastPacketStats := PacketStats{}
+	for {
+		select {
+		case <-self.ctx.Done():
+			return
+		case <-time.After(self.settings.EventEpoch):
+		}
+
+		self.blockActionCollector.flush()
+
+		if callbacks := self.packetStatsCallbacks.Get(); 0 < len(callbacks) {
+			packetStats := self.packetStatsCounters.snapshot()
+			if *packetStats != lastPacketStats {
+				lastPacketStats = *packetStats
+				for _, callback := range callbacks {
+					HandleError(func() {
+						callback(packetStats)
+					})
+				}
+			}
+		}
+	}
+}
+
+// the local user nat receive callback. return traffic for locally routed flows
+func (self *RemoteUserNatMultiClient) localReceivePacket(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	packet []byte,
+) {
+	self.packetStatsCounters.localIngressPacketCount.Add(1)
+	self.packetStatsCounters.localIngressByteCount.Add(int64(len(packet)))
+	if self.ipAssoc != nil && !self.blockActionIgnored(ipPath) {
+		// the local user nat delivers the flow's egress-oriented path
+		// (the remote endpoint is the destination)
+		self.ipAssoc.AddEgressPacket(ipPath)
+	}
+	self.receivePacketCallback(source, provideMode, ipPath, packet)
 }
 
 func (self *RemoteUserNatMultiClient) SecurityPolicyStats(reset bool) SecurityPolicyStats {
@@ -512,6 +607,21 @@ func (self *RemoteUserNatMultiClient) AddContractStatusCallback(contractStatusCa
 	subs := []func(){}
 	for _, window := range self.windows {
 		sub := window.AddContractStatusCallback(contractStatusCallback)
+		subs = append(subs, sub)
+	}
+	return func() {
+		for _, sub := range subs {
+			sub()
+		}
+	}
+}
+
+// AddContractStatsCallback registers a listener for the epoch contract stats
+// events of all the window clients (see `ContractManager.AddContractStatsCallback`)
+func (self *RemoteUserNatMultiClient) AddContractStatsCallback(contractStatsCallback ContractStatsFunction) func() {
+	subs := []func(){}
+	for _, window := range self.windows {
+		sub := window.AddContractStatsCallback(contractStatsCallback)
 		subs = append(subs, sub)
 	}
 	return func() {
@@ -564,14 +674,20 @@ func (self *RemoteUserNatMultiClient) SetLocalSecurityBypass(localSecurityBypass
 // SetServerNameLookup installs (or clears, with nil) the ServerNameLookup used for
 // ServerName-based path affinity. Safe to call at runtime.
 func (self *RemoteUserNatMultiClient) SetServerNameLookup(serverNameLookup ServerNameLookup) {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
-	prev := self.config.Load()
-	self.config.Store(&multiClientConfig{
-		performanceProfile:  prev.performanceProfile,
-		localSecurityBypass: prev.localSecurityBypass,
-		serverNameLookup:    serverNameLookup,
-	})
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		prev := self.config.Load()
+		self.config.Store(&multiClientConfig{
+			performanceProfile:  prev.performanceProfile,
+			localSecurityBypass: prev.localSecurityBypass,
+			serverNameLookup:    serverNameLookup,
+		})
+	}()
+	if self.ipAssoc != nil {
+		self.ipAssoc.SetServerNameLookup(serverNameLookup)
+	}
+	self.blockActionCache.clear()
 }
 
 func (self *RemoteUserNatMultiClient) LocalSecurityBypass() bool {
@@ -1098,25 +1214,228 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 	}
 	// refresh the flow's activity on the send direction (keeps a download-heavy flow alive)
 	self.securityPolicy.RefreshEgress(ipPath)
-	switch r {
-	case SecurityPolicyResultAllow:
-		parsedPacket := &parsedPacket{
-			packet:  packet,
-			ipPath:  ipPath,
-			payload: payload,
-		}
-		return self.sendPacket(source, provideMode, parsedPacket, timeout)
-	case SecurityPolicyResultDrop:
-		if self.LocalSecurityBypass() {
-			return self.localUserNat.SendPacket(source, provideMode, packet, 0)
-		} else {
-			return false
-		}
-	default:
+
+	// infrastructure destinations (the resolver endpoints) are excluded
+	// from the association and override logic
+	ignored := self.blockActionIgnored(ipPath)
+
+	if !ignored && self.ipAssoc != nil {
+		self.ipAssoc.AddEgressPacket(ipPath)
+	}
+
+	if r != SecurityPolicyResultAllow && r != SecurityPolicyResultDrop {
+		// incident (martian/malformed). always blocked, not overridable
 		if self.log.V(1).Enabled() {
 			self.log.Infof("[multi]drop packet ipv%d p%v -> %s:%d\n", ipPath.Version, ipPath.Protocol, ipPath.DestinationIp, ipPath.DestinationPort)
 		}
+	}
+
+	// the overrides take precedence over the default decision
+	blockActionState := self.blockActionState.Load()
+	var decision *blockActionDecision
+	if !ignored && (blockActionState.matcher != nil || self.blockActionCollector.hasCallbacks()) {
+		decision = self.blockActionDecision(blockActionState, ipPath)
+	}
+	var match *blockActionMatch
+	if decision != nil {
+		match = decision.match
+	}
+	block, local := blockActionApply(r, self.LocalSecurityBypass(), match)
+
+	byteCount := ByteCount(len(packet))
+	if decision != nil && self.blockActionCollector.hasCallbacks() {
+		self.blockActionCollector.add(decision, block, local, match, byteCount)
+	}
+
+	if block {
+		self.packetStatsCounters.blockEgressPacketCount.Add(1)
+		self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
 		return false
+	}
+	if local {
+		success := self.localUserNat.SendPacket(source, provideMode, packet, 0)
+		if success {
+			self.packetStatsCounters.localEgressPacketCount.Add(1)
+			self.packetStatsCounters.localEgressByteCount.Add(int64(byteCount))
+		}
+		return success
+	}
+	parsedPacket := &parsedPacket{
+		packet:  packet,
+		ipPath:  ipPath,
+		payload: payload,
+	}
+	success := self.sendPacket(source, provideMode, parsedPacket, timeout)
+	if success {
+		self.packetStatsCounters.remoteEgressPacketCount.Add(1)
+		self.packetStatsCounters.remoteEgressByteCount.Add(int64(byteCount))
+	}
+	return success
+}
+
+// the cached override match and server names for a destination.
+// the external lookups (server names, cluster) run outside the cache lock
+func (self *RemoteUserNatMultiClient) blockActionDecision(state *blockActionState, ipPath *IpPath) *blockActionDecision {
+	addr, ok := ipAssocAddr(ipPath.DestinationIp)
+	if !ok {
+		return nil
+	}
+
+	var clusterVersion uint64
+	if self.ipAssoc != nil {
+		clusterVersion = self.ipAssoc.ClusterVersion()
+	}
+	now := time.Now()
+
+	if decision := self.blockActionCache.get(addr, state.version, clusterVersion, now); decision != nil {
+		return decision
+	}
+
+	// decisions are made on the cluster level.
+	// a destination with no cluster is a cluster of itself
+	clusterIps := []netip.Addr{addr}
+	if self.ipAssoc != nil {
+		if members := self.ipAssoc.GetClusterAddrs(addr); 0 < len(members) {
+			clusterIps = members
+		}
+	}
+	slices.SortFunc(clusterIps, func(a netip.Addr, b netip.Addr) int {
+		return a.Compare(b)
+	})
+
+	decision := &blockActionDecision{
+		overridesVersion: state.version,
+		clusterVersion:   clusterVersion,
+		expireTime:       now.Add(self.blockActionCache.ttl),
+		clusterKey:       clusterIps[0],
+		clusterIps:       clusterIps,
+	}
+	var match *blockActionMatch
+	if state.matcher != nil {
+		match = &blockActionMatch{}
+	}
+	seenHosts := map[string]bool{}
+	for _, member := range clusterIps {
+		memberServerNames := self.serverNames(member)
+		for _, serverName := range memberServerNames {
+			if !seenHosts[serverName] {
+				seenHosts[serverName] = true
+				decision.clusterHosts = append(decision.clusterHosts, serverName)
+			}
+		}
+		if match != nil {
+			// the match extends over the destination's entire cluster
+			state.matcher.matchAddr(match, member, memberServerNames)
+		}
+	}
+	if match != nil && match.any() {
+		decision.match = match
+	}
+	self.blockActionCache.put(addr, decision)
+	return decision
+}
+
+func (self *RemoteUserNatMultiClient) serverNames(addr netip.Addr) []string {
+	config := self.config.Load()
+	if config.serverNameLookup == nil {
+		return nil
+	}
+	return config.serverNameLookup.ServerNames(addr.String())
+}
+
+// SetBlockActionOverrides replaces the override rules.
+// overrides take precedence over the default security and local routing decisions.
+// safe to call at runtime
+func (self *RemoteUserNatMultiClient) SetBlockActionOverrides(overrides []*BlockActionOverride) {
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		prev := self.blockActionState.Load()
+		self.blockActionState.Store(&blockActionState{
+			version: prev.version + 1,
+			matcher: newBlockActionMatcher(overrides),
+		})
+	}()
+	self.blockActionCache.clear()
+}
+
+// SetBlockActionIgnoreHosts replaces the host values (hostnames and ips, in
+// the same forms as `BlockActionOverride.Hosts`) excluded from the override
+// and association logic. used for infrastructure destinations like the dns
+// resolver endpoints, which must never be captured by user override rules or
+// cluster with user traffic. the default security and routing decisions and
+// the packet stats still apply to ignored destinations, but no block actions
+// are surfaced for them. safe to call at runtime.
+// the hard coded remote doh resolver ips are always excluded in addition to
+// these host values (see `defaultRemoteDohIgnoreAddrs`).
+func (self *RemoteUserNatMultiClient) SetBlockActionIgnoreHosts(hostValues []string) {
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		prev := self.blockActionIgnoreState.Load()
+		var matcher *blockActionMatcher
+		if 0 < len(hostValues) {
+			matcher = newBlockActionMatcher([]*BlockActionOverride{{
+				Hosts:         hostValues,
+				BlockOverride: &BlockOverride{},
+			}})
+		}
+		self.blockActionIgnoreState.Store(&blockActionIgnoreState{
+			version: prev.version + 1,
+			matcher: matcher,
+		})
+	}()
+	self.blockActionIgnoreCache.clear()
+}
+
+// blockActionIgnored returns whether the destination is excluded from the
+// override and association logic. the result is cached per destination.
+// the hard coded remote doh resolver ips are always excluded (see
+// `defaultRemoteDohIgnoreAddrs`), independent of `SetBlockActionIgnoreHosts`.
+func (self *RemoteUserNatMultiClient) blockActionIgnored(ipPath *IpPath) bool {
+	addr, ok := ipAssocAddr(ipPath.DestinationIp)
+	if !ok {
+		return false
+	}
+	if defaultRemoteDohIgnoreAddrs()[addr] {
+		return true
+	}
+	state := self.blockActionIgnoreState.Load()
+	if state.matcher == nil {
+		return false
+	}
+	now := time.Now()
+	if entry := self.blockActionIgnoreCache.get(addr, state.version, now); entry != nil {
+		return entry.ignored
+	}
+	match := &blockActionMatch{}
+	state.matcher.matchAddr(match, addr, self.serverNames(addr))
+	entry := &blockActionIgnoreEntry{
+		ignored:    match.any(),
+		version:    state.version,
+		expireTime: now.Add(self.blockActionIgnoreCache.ttl),
+	}
+	self.blockActionIgnoreCache.put(addr, entry)
+	return entry.ignored
+}
+
+// AddBlockActionCallback registers a listener for the epoch block action events.
+// all egress routing decisions are surfaced, deduplicated per destination per epoch
+func (self *RemoteUserNatMultiClient) AddBlockActionCallback(blockActionCallback BlockActionFunction) func() {
+	return self.blockActionCollector.addCallback(blockActionCallback)
+}
+
+// PacketStats returns the cumulative packet counts by route
+func (self *RemoteUserNatMultiClient) PacketStats() *PacketStats {
+	return self.packetStatsCounters.snapshot()
+}
+
+// AddPacketStatsCallback registers a listener fired on the event epoch when the
+// packet stats change
+func (self *RemoteUserNatMultiClient) AddPacketStatsCallback(packetStatsCallback PacketStatsFunction) func() {
+	callbackId := self.packetStatsCallbacks.Add(packetStatsCallback)
+	return func() {
+		self.packetStatsCallbacks.Remove(callbackId)
 	}
 }
 
@@ -1446,6 +1765,13 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 	self.securityPolicy.RefreshIngress(ipPath)
 	if r != SecurityPolicyResultAllow {
 		return
+	}
+
+	self.packetStatsCounters.remoteIngressPacketCount.Add(1)
+	self.packetStatsCounters.remoteIngressByteCount.Add(int64(len(packet)))
+	if self.ipAssoc != nil {
+		// before reverse, the remote endpoint is the source
+		self.ipAssoc.AddIngressPacket(ipPath)
 	}
 
 	ipPath = ipPath.Reverse()
@@ -1934,6 +2260,7 @@ type multiClientWindow struct {
 	monitor *RemoteUserNatMultiClientMonitor
 
 	contractStatusCallbacks *CallbackList[*contractStatusCallbackWorker]
+	contractStatsCallbacks  *CallbackList[ContractStatsFunction]
 
 	stateLock          sync.Mutex
 	clients            map[Id]*multiClientChannel
@@ -1966,6 +2293,7 @@ func newMultiClientWindow(
 		clientChannelArgs:           make(chan *multiClientChannelArgs),
 		monitor:                     NewRemoteUserNatMultiClientMonitor(&settings.RemoteUserNatMultiClientMonitorSettings),
 		contractStatusCallbacks:     NewCallbackList[*contractStatusCallbackWorker](),
+		contractStatsCallbacks:      NewCallbackList[ContractStatsFunction](),
 		clients:                     map[Id]*multiClientChannel{},
 		generatorMonitor:            NewMonitor(),
 		resizeMonitor:               NewMonitor(),
@@ -1989,6 +2317,23 @@ func (self *multiClientWindow) AddContractStatusCallback(contractStatusCallback 
 func (self *multiClientWindow) contractStatus(contractStatus *ContractStatus) {
 	for _, contractStatusCallback := range self.contractStatusCallbacks.Get() {
 		contractStatusCallback.Dispatch(contractStatus)
+	}
+}
+
+func (self *multiClientWindow) AddContractStatsCallback(contractStatsCallback ContractStatsFunction) func() {
+	callbackId := self.contractStatsCallbacks.Add(contractStatsCallback)
+	return func() {
+		self.contractStatsCallbacks.Remove(callbackId)
+	}
+}
+
+// registered on every window client's contract manager.
+// the manager's epoch worker calls this off the packet paths
+func (self *multiClientWindow) contractStats(contractStatsEvents []*ContractStatsEvent) {
+	for _, contractStatsCallback := range self.contractStatsCallbacks.Get() {
+		HandleError(func() {
+			contractStatsCallback(contractStatsEvents)
+		})
 	}
 }
 
@@ -2468,6 +2813,7 @@ func (self *multiClientWindow) expand(
 				self.clientReceivePacketCallback,
 				self.ingressSecurityPolicy,
 				self.contractStatus,
+				self.contractStats,
 				self.performanceProfile,
 				self.settings,
 			)
@@ -2928,6 +3274,7 @@ func newMultiClientChannel(
 	clientReceivePacketCallback clientReceivePacketFunction,
 	ingressSecurityPolicy SecurityPolicy,
 	contractStatusCallback ContractStatusFunction,
+	contractStatsCallback ContractStatsFunction,
 	performanceProfile *PerformanceProfile,
 	settings *MultiClientSettings,
 ) (*multiClientChannel, error) {
@@ -2946,6 +3293,7 @@ func newMultiClientChannel(
 		return nil, err
 	}
 	contractStatusSub := client.ContractManager().AddContractStatusCallback(contractStatusCallback)
+	contractStatsSub := client.ContractManager().AddContractStatsCallback(contractStatsCallback)
 	go HandleError(func() {
 		select {
 		case <-cancelCtx.Done():
@@ -2953,6 +3301,7 @@ func newMultiClientChannel(
 		}
 		client.Cancel()
 		contractStatusSub()
+		contractStatsSub()
 		generator.RemoveClientWithArgs(client, &args.MultiClientGeneratorClientArgs)
 	}, cancel)
 

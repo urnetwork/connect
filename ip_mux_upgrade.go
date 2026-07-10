@@ -61,6 +61,16 @@ type DnsUpgradeSettings struct {
 	// looked up; an active maintenance goroutine evicts records idle longer than this so the
 	// reverse map does not grow unbounded with every resolved IP. 0 disables eviction.
 	ReverseTtl time.Duration
+	// ReverseMaxEntries hard-caps the IP→hostname affinity map between TTL sweeps: inserting
+	// a new IP at the cap evicts the least-recently-active of a sample first, so a resolve
+	// burst cannot grow the map without bound on a memory-constrained host. 0 uses a default.
+	ReverseMaxEntries int
+	// MaxInflightQueries caps the distinct DNS questions the mux resolves concurrently.
+	// Identical concurrent queries (client retransmits, duplicate lookups) coalesce onto one
+	// resolution pipeline, so this bounds the pipelines — and with them the mux's burst
+	// memory — regardless of client behavior. A claimed query beyond the cap is dropped
+	// unanswered; the client retries and lands in a freed slot. 0 uses a default.
+	MaxInflightQueries int
 	// LocalFallbackTimeout handicaps the local fallback: if the tunnel-DoH (Resolver, egressing
 	// the tunnel) hasn't answered a query within this delay, the query is also raced against
 	// Fallback (a DoH resolver over the LOCAL host egress). The delay is the handicap — the tunnel
@@ -99,18 +109,24 @@ func DefaultUpgradeMuxSettings() *UpgradeMuxSettings {
 			// DoH only, using the DoH client's configured servers, resolved through the
 			// tun (egresses via the exit). Deliberately no EnableLocalDns/EnableLocalDoh
 			// (host dialer) or EnableRemoteDns (plaintext :53), which would resolve
-			// off-tunnel or in the clear.
+			// off-tunnel or in the clear. The remote dns servers are carried for the one
+			// permitted plaintext use while EnableRemoteDns is off: resolving a
+			// hostname-form doh server name through the tunnel (see DohCache.resolve).
 			Resolver: &DnsResolverSettings{
 				EnableRemoteDoh:   true,
 				RemoteDohUrlsIpv4: resolver.RemoteDohUrlsIpv4,
 				RemoteDohUrlsIpv6: resolver.RemoteDohUrlsIpv6,
+				RemoteDnsIpv4:     resolver.RemoteDnsIpv4,
+				RemoteDnsIpv6:     resolver.RemoteDnsIpv6,
 			},
 			// the tunnel/upstream can take tens of seconds to establish on first connect; the
 			// budget must cover a full slow connect (tun dial 30s) plus TLS handshake (30s) so a
 			// query racing startup waits for the tunnel rather than failing early.
-			ResolveTimeout: 60 * time.Second,
-			ResponseTtl:    60,
-			ReverseTtl:     5 * time.Minute,
+			ResolveTimeout:     60 * time.Second,
+			ResponseTtl:        60,
+			ReverseTtl:         5 * time.Minute,
+			ReverseMaxEntries:  defaultReverseMaxEntries,
+			MaxInflightQueries: defaultMaxInflightDnsQueries,
 			// handicapped local fallback: if the tunnel-DoH hasn't answered within 5s, also resolve
 			// over the local host egress so DNS stays responsive while the tunnel comes up. Same DoH
 			// servers, but via the host (EnableLocalDoh) rather than the tunnel.
@@ -124,6 +140,23 @@ func DefaultUpgradeMuxSettings() *UpgradeMuxSettings {
 		Http: &HttpUpgradeSettings{Mode: HttpUpgradeUnencrypted},
 	}
 }
+
+const (
+	// defaultMaxInflightDnsQueries is the DnsUpgradeSettings.MaxInflightQueries default.
+	defaultMaxInflightDnsQueries = 96
+	// maxDnsRespondersPerQuestion caps the responders attached to one in-flight question, so
+	// a flood of same-question queries with distinct transaction ids stays bounded. A dropped
+	// responder's client retries and is answered from the resolver cache.
+	maxDnsRespondersPerQuestion = 32
+	// defaultReverseMaxEntries is the DnsUpgradeSettings.ReverseMaxEntries default.
+	defaultReverseMaxEntries = 4096
+	// maxServerNamesPerIp caps the hostnames retained per affinity record (a CDN IP fronting
+	// many hosts); the oldest name is dropped for a new one.
+	maxServerNamesPerIp = 4
+	// reverseEvictSampleSize is how many affinity records an over-cap insert samples to evict
+	// the least-recently-active from (approximate LRU, O(sample) instead of a full scan).
+	reverseEvictSampleSize = 32
+)
 
 type UpgradeMux struct {
 	ctx    context.Context
@@ -139,6 +172,16 @@ type UpgradeMux struct {
 	// source/provideMode stamp packets the mux injects downstream (DNS replies).
 	source      TransferPath
 	provideMode protocol.ProvideMode
+
+	// unregisterShed removes this mux from the memory-shedder registry on Close.
+	unregisterShed func()
+
+	// inflight coalesces claimed DNS queries by question: one resolution pipeline per
+	// distinct in-flight question, fanning the answer out to the attached responders. Burst
+	// memory then scales with distinct questions (capped by MaxInflightQueries), not with
+	// claimed packets (client stub resolvers retransmit unanswered queries every ~1s).
+	inflightLock sync.Mutex
+	inflight     map[DohKey]*dnsFlight
 
 	// reverse maps a resolved IP to the hostname(s) the mux served for it, for the
 	// multi-client's ServerName path affinity (point 4).
@@ -184,10 +227,13 @@ func buildFallbackDohCache(rs *DnsResolverSettings) *DohCache {
 	}
 	dohSettings := DefaultDohSettings()
 	dohSettings.DnsResolverSettings = rs
-	// the fallback only bridges tunnel startup; keep its in-flight footprint small so it adds
-	// little to the (memory-constrained) extension on top of the primary tunnel-DoH cache.
+	// the fallback only bridges tunnel startup; keep its in-flight footprint and cache small
+	// so it adds little to the (memory-constrained) extension on top of the primary
+	// tunnel-DoH cache.
 	dohSettings.MaxConcurrentHttpRequests = 4
 	dohSettings.MaxConcurrentResolutions = 8
+	dohSettings.MaxServersPerQuery = 2
+	dohSettings.CacheMaxEntries = 256
 	return NewDohCache(dohSettings)
 }
 
@@ -210,6 +256,36 @@ func NewUpgradeMux(
 	tunSettings.TcpSendBuffer = TcpBufferRange{Min: 4 * 1024, Default: 16 * 1024, Max: 16 * 1024}
 	tunSettings.UdpReceiveBufferByteCount = 16 * 1024
 	tunSettings.UdpSendBufferByteCount = 16 * 1024
+	// this stack only carries DoH resolution traffic, so the endpoint queue can be much
+	// smaller than the data-plane default (1024), which bounds a stack-emit burst
+	tunSettings.ChannelSize = 128
+	// a single dial per attempt: the DoH servers are anycast and reliable, and each raced
+	// dial holds an extra gVisor endpoint (and its goroutines) for up to the dial timeout
+	// while the tunnel is still establishing
+	tunSettings.DialRace = 1
+	self := &UpgradeMux{
+		ctx:         cancelCtx,
+		cancel:      cancel,
+		source:      source,
+		provideMode: provideMode,
+		inflight:    map[DohKey]*dnsFlight{},
+		reverse:     map[netip.Addr]reverseEntry{},
+	}
+	self.settings.Store(settings)
+	// bound the resolver cache and fan-out below the server/proxy defaults (see
+	// DefaultDohSettings); the mux resolves a device's queries, not a data plane's
+	dohSettings := DefaultDohSettings()
+	dohSettings.CacheMaxEntries = 1024
+	dohSettings.MaxConcurrentResolutions = 24
+	dohSettings.MaxConcurrentHttpRequests = 8
+	dohSettings.MaxServersPerQuery = 2
+	// record doh server name resolutions into the ip→hostname reverse index,
+	// so the block action ignore matcher (which lists the server names)
+	// also matches the resolved server addresses
+	dohSettings.DohServerResolvedCallback = func(domain string, addrs []netip.Addr) {
+		self.recordServerNames(addrs, domain)
+	}
+	tunSettings.DohSettings = dohSettings
 	// ResolveTimeout is the single DNS-resolution timeout: it bounds each handleDns attempt (the
 	// query context) and the underlying DoH request through the tun alike. SetSettings re-derives
 	// it too, so a runtime settings change updates both.
@@ -219,16 +295,10 @@ func NewUpgradeMux(
 		cancel()
 		return nil, err
 	}
-	self := &UpgradeMux{
-		ctx:         cancelCtx,
-		cancel:      cancel,
-		source:      source,
-		provideMode: provideMode,
-		reverse:     map[netip.Addr]reverseEntry{},
-	}
-	self.settings.Store(settings)
 	self.fallbackDohCache.Store(buildFallbackDohCache(fallbackResolverSettings(settings)))
 	self.mux = NewIpMux(cancelCtx, tun, source, provideMode, sendTimeout, self.onSend, nil, initialReceiver, log)
+	// drop recoverable caches when the host signals memory pressure
+	self.unregisterShed = AddMemoryShedder(self.ShedMemory)
 	// active maintenance: TTL-evict the IP→hostname affinity map so it doesn't grow unbounded
 	go HandleError(self.run)
 	return self, nil
@@ -335,13 +405,39 @@ func peekClaim(packet []byte) peekResult {
 	}
 }
 
-// handleDns claims a single A/AAAA DNS query and resolves it via the Tun's DohCache
-// asynchronously (resolution can block on the network), writes the response back to
-// the client, and records the IP→hostname mapping. Other query types are not claimed
-// and pass through to the upstream.
+// dnsResponder is one claimed client query awaiting the shared resolution of its
+// question: enough to synthesize that client's exact reply — its transaction id and
+// question (casing preserved, for clients that randomize it) — on its reversed path.
+type dnsResponder struct {
+	id          uint16
+	question    dnsmessage.Question
+	source      TransferPath
+	provideMode protocol.ProvideMode
+	reverse     *IpPath
+}
+
+// dnsFlight is the shared resolution pipeline for one in-flight question (see
+// UpgradeMux.inflight). All fields are guarded by inflightLock.
+type dnsFlight struct {
+	responders []dnsResponder
+	// replied is set when the answer was delivered (the flight is removed at the same
+	// time); a slower worker's answer is dropped
+	replied bool
+	// workers is the outstanding pipeline goroutine count; the flight is removed when it
+	// reaches 0 without a reply (resolution failed: send nothing, the clients retry)
+	workers int
+}
+
+// handleDns claims a single A/AAAA DNS query and attaches it to the resolution
+// pipeline for its question — joining the in-flight pipeline when one exists, else
+// starting one (resolution can block on the network, so it runs asynchronously via
+// the Tun's DohCache). The pipeline writes each attached client its own response and
+// records the IP→hostname mapping. Other query types are not claimed and pass
+// through to the upstream.
 //
-// The parsed question is a value (dnsmessage copies the name into a fixed array), so
-// nothing aliases the recycled packet buffer across the goroutine.
+// The parsed question is a value (dnsmessage copies the name into a fixed array), and
+// the reversed path owns its address bytes, so nothing aliases the recycled packet
+// buffer across the pipeline goroutines.
 func (self *UpgradeMux) handleDns(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) bool {
 	var parser dnsmessage.Parser
 	header, err := parser.Start(payload)
@@ -362,10 +458,64 @@ func (self *UpgradeMux) handleDns(source TransferPath, provideMode protocol.Prov
 		return false
 	}
 	domain := strings.TrimSuffix(question.Name.String(), ".")
-	id := header.ID
-	// the response flows from the queried resolver back to the client
-	reverse := ipPath.Reverse()
 
+	responder := dnsResponder{
+		id:          header.ID,
+		question:    question,
+		source:      source,
+		provideMode: provideMode,
+		// the response flows from the queried resolver back to the client
+		reverse: ipPath.Reverse(),
+	}
+	key := NewDohKey(recordType, domain)
+	if fl := self.attachDnsResponder(key, responder); fl != nil {
+		self.startDnsPipeline(key, fl, recordType, domain)
+	}
+	return true
+}
+
+// attachDnsResponder attaches a claimed query to the resolution pipeline for its
+// question: it joins the in-flight pipeline when one exists (client retransmits and
+// a burst's duplicate lookups attach as responders, ~100 bytes, instead of spawning
+// their own pipelines), starts a new flight otherwise, or drops the query at the
+// caps — the client retries into a freed slot, which bounds burst memory regardless
+// of client behavior. It returns the new flight when the caller must start the
+// pipeline, else nil.
+func (self *UpgradeMux) attachDnsResponder(key DohKey, responder dnsResponder) *dnsFlight {
+	self.inflightLock.Lock()
+	defer self.inflightLock.Unlock()
+	if fl, ok := self.inflight[key]; ok {
+		for _, r := range fl.responders {
+			if r.id == responder.id && r.reverse.DestinationPort == responder.reverse.DestinationPort && r.reverse.DestinationIp.Equal(responder.reverse.DestinationIp) {
+				// a retransmit of an attached query; it is answered when the pipeline replies
+				return nil
+			}
+		}
+		if len(fl.responders) < maxDnsRespondersPerQuestion {
+			fl.responders = append(fl.responders, responder)
+		}
+		// else over the responder cap: drop (the client retries into the answer cache)
+		return nil
+	}
+	maxInflight := defaultMaxInflightDnsQueries
+	if dns := self.settings.Load().Dns; dns != nil && 0 < dns.MaxInflightQueries {
+		maxInflight = dns.MaxInflightQueries
+	}
+	if maxInflight <= len(self.inflight) {
+		// at the question cap: drop (the client retries; slots free as pipelines finish)
+		return nil
+	}
+	fl := &dnsFlight{
+		responders: []dnsResponder{responder},
+	}
+	self.inflight[key] = fl
+	return fl
+}
+
+// startDnsPipeline resolves one question and fans the first successful answer out to
+// the flight's responders, exactly once, retiring the flight. A later identical query
+// starts a fresh pipeline, answered immediately from the resolver cache.
+func (self *UpgradeMux) startDnsPipeline(key DohKey, fl *dnsFlight, recordType string, domain string) {
 	var resolveTimeout time.Duration
 	var responseTtl uint32
 	var localFallbackTimeout time.Duration
@@ -383,26 +533,64 @@ func (self *UpgradeMux) handleDns(source TransferPath, provideMode protocol.Prov
 		return self.ctx, func() {}
 	}
 
-	// reply delivers the first successful resolution downstream, exactly once. A failure — no
-	// records and no authoritative no-record answer, from both the tunnel and the fallback — sends
-	// nothing: the client times out and retries, which the OS tolerates far better than a SERVFAIL
-	// or empty NOERROR reply it would surface as "can't resolve address".
-	var replyOnce sync.Once
+	// reply delivers the first successful resolution to every attached responder, exactly
+	// once. A failure — no records and no authoritative no-record answer, from both the
+	// tunnel and the fallback — sends nothing: the clients time out and retry, which the OS
+	// tolerates far better than a SERVFAIL or empty NOERROR reply it would surface as
+	// "can't resolve address".
 	reply := func(addrs []netip.Addr, authoritative bool) {
 		if len(addrs) == 0 && !authoritative {
 			return
 		}
-		replyOnce.Do(func() {
-			if 0 < len(addrs) {
-				self.recordServerNames(addrs, domain)
-			}
-			respPayload, err := buildDnsResponse(id, question, addrs, responseTtl)
-			if err != nil {
+		var responders []dnsResponder
+		func() {
+			self.inflightLock.Lock()
+			defer self.inflightLock.Unlock()
+			if fl.replied {
 				return
 			}
-			self.mux.deliverDownstream(source, provideMode, reverse, ipOosPacket(reverse, respPayload))
-		})
+			fl.replied = true
+			responders = fl.responders
+			if self.inflight[key] == fl {
+				delete(self.inflight, key)
+			}
+		}()
+		if responders == nil {
+			return
+		}
+		if 0 < len(addrs) {
+			self.recordServerNames(addrs, domain)
+		}
+		for i := range responders {
+			r := &responders[i]
+			respPayload, err := buildDnsResponse(r.id, r.question, addrs, responseTtl)
+			if err != nil {
+				continue
+			}
+			self.mux.deliverDownstream(r.source, r.provideMode, r.reverse, ipOosPacket(r.reverse, respPayload))
+		}
 	}
+
+	// workerDone retires the flight once every worker has exited without an answer, so a
+	// failed question frees its slot for the clients' retries to start a fresh pipeline.
+	workerDone := func() {
+		self.inflightLock.Lock()
+		defer self.inflightLock.Unlock()
+		fl.workers -= 1
+		if fl.workers == 0 && !fl.replied && self.inflight[key] == fl {
+			delete(self.inflight, key)
+		}
+	}
+
+	workers := 1
+	if fallback != nil && 0 < localFallbackTimeout {
+		workers = 2
+	}
+	func() {
+		self.inflightLock.Lock()
+		defer self.inflightLock.Unlock()
+		fl.workers = workers
+	}()
 
 	// primary: resolve over the tunnel-DoH (preferred — egresses the tunnel, no DNS leak), retrying
 	// on the dnsRetryBackoff schedule. The first connect/TLS over a freshly-connecting tunnel can
@@ -410,6 +598,7 @@ func (self *UpgradeMux) handleDns(source TransferPath, provideMode protocol.Prov
 	// ResolveTimeout), so a slow attempt waits for the tunnel rather than failing fast.
 	tunnelOk := make(chan struct{})
 	go HandleError(func() {
+		defer workerDone()
 		queryCtx, queryCancel := queryContext()
 		defer queryCancel()
 		addrs, authoritative := self.resolveTunnelDoh(queryCtx, recordType, domain)
@@ -424,8 +613,9 @@ func (self *UpgradeMux) handleDns(source TransferPath, provideMode protocol.Prov
 	// delay handicaps the local resolver so the tunnel wins whenever it can; the fallback only
 	// answers while the tunnel is still establishing, keeping DNS responsive so the OS doesn't tear
 	// down the tunnel (at the cost of a brief DNS leak during startup).
-	if fallback != nil && 0 < localFallbackTimeout {
+	if workers == 2 {
 		go HandleError(func() {
+			defer workerDone()
 			select {
 			case <-time.After(localFallbackTimeout):
 			case <-tunnelOk:
@@ -439,17 +629,16 @@ func (self *UpgradeMux) handleDns(source TransferPath, provideMode protocol.Prov
 			reply(addrs, authoritative)
 		})
 	}
-	return true
 }
 
-// dnsRetryBackoff is the wait between tunnel-DoH resolution attempts. The intervals grow because a
-// freshly-connecting tunnel drops the first packets while the upstream establishes; retrying
-// aggressively up front only re-hits the not-yet-ready path, so back off and give it time to settle.
+// dnsRetryBackoff is the wait between tunnel-DoH resolution attempts, for attempts that fail
+// fast (a hanging attempt already waits inside its request until ResolveTimeout). The schedule
+// is short: each retry rebuilds a full server fan-out, and once the pipeline retires, the
+// clients' own retransmits start a fresh one anyway — so long mux-side backoff only holds
+// pipeline memory without improving resolution.
 var dnsRetryBackoff = []time.Duration{
 	1 * time.Second,
 	2 * time.Second,
-	5 * time.Second,
-	10 * time.Second,
 }
 
 // resolveTunnelDoh resolves over the tun's DoH cache, retrying on dnsRetryBackoff until it gets a
@@ -523,11 +712,20 @@ type reverseEntry struct {
 }
 
 func (self *UpgradeMux) recordServerNames(addrs []netip.Addr, domain string) {
+	maxEntries := defaultReverseMaxEntries
+	if dns := self.settings.Load().Dns; dns != nil && 0 < dns.ReverseMaxEntries {
+		maxEntries = dns.ReverseMaxEntries
+	}
 	now := time.Now().UnixNano()
 	self.reverseLock.Lock()
 	defer self.reverseLock.Unlock()
 	for _, addr := range addrs {
-		e := self.reverse[addr]
+		e, ok := self.reverse[addr]
+		if !ok && maxEntries <= len(self.reverse) {
+			// at the cap: make room by evicting the least-recently-active of a sample,
+			// so a resolve burst cannot grow the map without bound between TTL sweeps
+			self.evictOldestReverseSampleLocked()
+		}
 		found := false
 		for _, name := range e.serverNames {
 			if name == domain {
@@ -536,10 +734,41 @@ func (self *UpgradeMux) recordServerNames(addrs []netip.Addr, domain string) {
 			}
 		}
 		if !found {
-			e.serverNames = append(e.serverNames, domain)
+			if maxServerNamesPerIp <= len(e.serverNames) {
+				// keep the most recent names for a shared IP (CDN fronting many hosts):
+				// drop the oldest
+				copy(e.serverNames, e.serverNames[1:])
+				e.serverNames[len(e.serverNames)-1] = domain
+			} else {
+				e.serverNames = append(e.serverNames, domain)
+			}
 		}
 		e.lastActivityNanos = now
 		self.reverse[addr] = e
+	}
+}
+
+// evictOldestReverseSampleLocked deletes the least-recently-active record of a
+// reverseEvictSampleSize sample (map iteration starts at a random bucket, so the
+// sample is effectively random): approximate LRU at O(sample) per over-cap insert.
+func (self *UpgradeMux) evictOldestReverseSampleLocked() {
+	var oldestAddr netip.Addr
+	var oldestNanos int64
+	found := false
+	i := 0
+	for addr, e := range self.reverse {
+		if !found || e.lastActivityNanos < oldestNanos {
+			oldestAddr = addr
+			oldestNanos = e.lastActivityNanos
+			found = true
+		}
+		i += 1
+		if reverseEvictSampleSize <= i {
+			break
+		}
+	}
+	if found {
+		delete(self.reverse, oldestAddr)
 	}
 }
 
@@ -649,10 +878,32 @@ func (self *UpgradeMux) SetUpstream(upstream IpMuxSend) {
 func (self *UpgradeMux) SetSettings(settings *UpgradeMuxSettings) {
 	self.settings.Store(settings)
 	self.mux.Tun().SetDnsResolverSettings(dnsResolverSettings(settings), dohRequestTimeout(settings))
-	self.fallbackDohCache.Store(buildFallbackDohCache(fallbackResolverSettings(settings)))
+	if replaced := self.fallbackDohCache.Swap(buildFallbackDohCache(fallbackResolverSettings(settings))); replaced != nil {
+		// release the replaced cache's pooled connections now instead of holding them
+		// (and their keepalive pings) until the idle timeout
+		replaced.Close()
+	}
+}
+
+// ShedMemory drops the mux's recoverable caches — the resolver caches (with their pooled
+// connections) and the IP→hostname affinity map — under host memory pressure. Subsequent
+// queries re-resolve and re-dial; flows that re-look-up affinity fall back to by-IP routing
+// until re-resolved.
+func (self *UpgradeMux) ShedMemory() {
+	self.mux.Tun().DohCache().ShedMemory()
+	if fallback := self.fallbackDohCache.Load(); fallback != nil {
+		fallback.ShedMemory()
+	}
+	self.reverseLock.Lock()
+	defer self.reverseLock.Unlock()
+	clear(self.reverse)
 }
 
 func (self *UpgradeMux) Close() {
 	self.cancel()
+	self.unregisterShed()
+	if fallback := self.fallbackDohCache.Load(); fallback != nil {
+		fallback.Close()
+	}
 	self.mux.Close()
 }

@@ -21,6 +21,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -153,10 +154,26 @@ func (self *IpMux) Receive(source TransferPath, provideMode protocol.ProvideMode
 // the downstream.
 func (self *IpMux) deliverDownstream(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
 	for _, receiver := range self.receivers.Get() {
-		HandleError(func() {
-			receiver(source, provideMode, ipPath, packet)
-		})
+		safeReceive(receiver, source, provideMode, ipPath, packet)
 	}
+}
+
+// safeReceive calls one receiver with the panic isolation that wrapping it in
+// HandleError would give, but without allocating a closure. This runs once per
+// received packet per receiver (the whole inbound path), so it must not allocate:
+// the deferred recover closure captures no variables, so it is a static func value
+// (see safeAck).
+func safeReceive(receiver ReceivePacketFunction, source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
+	defer func() {
+		if r := recover(); r != nil {
+			if IsDoneError(r) {
+				// the context was canceled and raised; standard pattern, do not log
+			} else {
+				DefaultLogger().Warningf("Unexpected error: %s\n", ErrorJson(r, debug.Stack()))
+			}
+		}
+	}()
+	receiver(source, provideMode, ipPath, packet)
 }
 
 func (self *IpMux) isLocalDestination(dst net.IP) bool {

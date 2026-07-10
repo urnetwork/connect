@@ -41,6 +41,28 @@ func (self *Monitor) NotifyAll() chan struct{} {
 	return self.notify
 }
 
+// memoryShedders are callbacks that drop recoverable caches (resolver caches, pooled
+// connections, affinity maps) so a memory-constrained host can shed before it approaches
+// its process memory limit.
+var memoryShedders = NewCallbackList[func()]()
+
+// AddMemoryShedder registers a callback invoked by ShedMemory. It returns an unregister
+// closure; an owner must unregister its shedder when it closes.
+func AddMemoryShedder(shed func()) func() {
+	callbackId := memoryShedders.Add(shed)
+	return func() {
+		memoryShedders.Remove(callbackId)
+	}
+}
+
+// ShedMemory invokes the registered shedders. The host calls this on its memory pressure
+// signal (e.g. the iOS network extension pressure warning) to drop recoverable caches.
+func ShedMemory() {
+	for _, shed := range memoryShedders.Get() {
+		HandleError(shed)
+	}
+}
+
 // makes a copy of the list on update
 type CallbackList[T any] struct {
 	mutex sync.Mutex

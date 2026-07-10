@@ -2,6 +2,8 @@ package connect
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"fmt"
 	"net/http"
@@ -502,5 +504,102 @@ func TestServerStatsOrderBias(t *testing.T) {
 	// good's weight (~60) dwarfs bad's floor (0.05), so it should lead the vast majority
 	if goodFirst < 900 {
 		t.Fatalf("good server led %d/1000, want >= 900", goodFirst)
+	}
+}
+
+// TestDohMaxServersPerQuery: a query's fan-out is capped at MaxServersPerQuery servers (in
+// weighted order); 0 fans out to all. On a dead path every launched request hangs holding
+// memory until the deadline, so a memory-constrained host caps this.
+func TestDohMaxServersPerQuery(t *testing.T) {
+	newFailingServer := func(hits *int32) *httptest.Server {
+		return httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(hits, 1)
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+	}
+	var hitsA, hitsB int32
+	serverA := newFailingServer(&hitsA)
+	defer serverA.Close()
+	serverB := newFailingServer(&hitsB)
+	defer serverB.Close()
+
+	pool := x509.NewCertPool()
+	pool.AddCert(serverA.Certificate())
+	pool.AddCert(serverB.Certificate())
+
+	newSettings := func(maxServers int) *DohSettings {
+		settings := DefaultDohSettings()
+		settings.RequestTimeout = 5 * time.Second
+		settings.DohServerStagger = 1 * time.Millisecond
+		settings.MaxServersPerQuery = maxServers
+		settings.DnsResolverSettings = &DnsResolverSettings{
+			EnableLocalDoh:   true,
+			LocalDohUrlsIpv4: []string{serverA.URL, serverB.URL},
+			TlsConfig:        &tls.Config{RootCAs: pool},
+		}
+		return settings
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// capped: exactly one server is tried (both fail, so nothing short-circuits the wave)
+	NewDohCache(newSettings(1)).QueryResult(ctx, "A", "cap.example.test")
+	if got := atomic.LoadInt32(&hitsA) + atomic.LoadInt32(&hitsB); got != 1 {
+		t.Fatalf("with MaxServersPerQuery=1, servers hit = %d, want 1", got)
+	}
+
+	// uncapped: the fan-out reaches both servers
+	atomic.StoreInt32(&hitsA, 0)
+	atomic.StoreInt32(&hitsB, 0)
+	NewDohCache(newSettings(0)).QueryResult(ctx, "A", "nocap.example.test")
+	if got := atomic.LoadInt32(&hitsA) + atomic.LoadInt32(&hitsB); got != 2 {
+		t.Fatalf("with MaxServersPerQuery=0, servers hit = %d, want 2", got)
+	}
+}
+
+// TestDohCacheShedMemory: shedding drops the query result cache (a later query re-resolves)
+// and leaves the cache usable.
+func TestDohCacheShedMemory(t *testing.T) {
+	var requests int32
+	ip := netip.MustParseAddr("203.0.113.31")
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		writeDohWire(w, r, []netip.Addr{ip}, 300, false)
+	}))
+	defer server.Close()
+	pool := x509.NewCertPool()
+	pool.AddCert(server.Certificate())
+
+	settings := DefaultDohSettings()
+	settings.RequestTimeout = 5 * time.Second
+	settings.DnsResolverSettings = &DnsResolverSettings{
+		EnableLocalDoh:   true,
+		LocalDohUrlsIpv4: []string{server.URL},
+		TlsConfig:        &tls.Config{RootCAs: pool},
+	}
+	cache := NewDohCache(settings)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	assertResolves := func(label string) {
+		addrs, authoritative := cache.QueryResult(ctx, "A", "shed.example.test")
+		if !authoritative || !slices.Contains(addrs, ip) {
+			t.Fatalf("%s: QueryResult = %v (authoritative %t), want %s", label, addrs, authoritative, ip)
+		}
+	}
+
+	assertResolves("first query")
+	assertResolves("cached query")
+	if got := atomic.LoadInt32(&requests); got != 1 {
+		t.Fatalf("requests before shed = %d, want 1 (second query served from cache)", got)
+	}
+
+	cache.ShedMemory()
+
+	assertResolves("query after shed")
+	if got := atomic.LoadInt32(&requests); got != 2 {
+		t.Fatalf("requests after shed = %d, want 2 (the shed cache re-resolves)", got)
 	}
 }
