@@ -41,6 +41,78 @@ func (self *Monitor) NotifyAll() chan struct{} {
 	return self.notify
 }
 
+// MonitorValue pairs a value with its change notification so the two halves of
+// the monitor contract cannot be separated. A bare `Monitor` leaves both halves
+// to the caller — every mutation must remember to notify, and every consumer
+// must subscribe immediately before its read — and both are silent when missed:
+// forgetting to notify parks the waiter forever, subscribing across a blocking
+// wait re-wakes it on state it already read. `MonitorValue` makes neither
+// representable. The value can only be read together with a channel armed at the
+// instant of the read (`Get`), and can only be written through `Set`/`Update`,
+// which notify inside the same critical section.
+//
+// `Set` notifies only when the value actually changes. That is what lets a
+// consumer that both reads and writes the value — an election loop that picks
+// the mode it also watches — converge instead of waking itself forever.
+//
+// Methods are safe for concurrent use. `Update`'s function runs under the lock,
+// so it must not call back into this value.
+type MonitorValue[T comparable] struct {
+	stateLock sync.Mutex
+	value     T
+	notify    chan struct{}
+}
+
+func NewMonitorValue[T comparable](value T) *MonitorValue[T] {
+	return &MonitorValue[T]{
+		value:  value,
+		notify: make(chan struct{}),
+	}
+}
+
+// Get returns the current value and a channel that closes on the next change.
+// The pair is taken atomically, so no change can slip between the read and the
+// subscribe. Act on the value, then wait on the channel — never wait in between.
+func (self *MonitorValue[T]) Get() (T, chan struct{}) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.value, self.notify
+}
+
+// Value returns the current value without subscribing. Use it only where no wait
+// follows; anything that waits for a change must use `Get`.
+func (self *MonitorValue[T]) Value() T {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.value
+}
+
+// Set stores the value, notifying the waiters when it changed. It reports
+// whether it changed.
+func (self *MonitorValue[T]) Set(value T) bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.setWithLock(value)
+}
+
+// Update applies f to the current value and stores the result, notifying the
+// waiters when it changed. It reports whether it changed. f runs under the lock.
+func (self *MonitorValue[T]) Update(f func(T) T) bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.setWithLock(f(self.value))
+}
+
+func (self *MonitorValue[T]) setWithLock(value T) bool {
+	if self.value == value {
+		return false
+	}
+	self.value = value
+	close(self.notify)
+	self.notify = make(chan struct{})
+	return true
+}
+
 // memoryShedders are callbacks that drop recoverable caches (resolver caches, pooled
 // connections, affinity maps) so a memory-constrained host can shed before it approaches
 // its process memory limit.

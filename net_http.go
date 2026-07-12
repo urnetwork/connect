@@ -1224,12 +1224,41 @@ func HttpPostWithStrategyRaw(
 	}
 
 	if http.StatusOK != r.response.StatusCode {
-		// the response body is the error message
-		err = fmt.Errorf("%s: %s", r.response.Status, strings.TrimSpace(string(r.bodyBytes)))
-		return nil, err
+		// the response body is the error message. Typed so a caller can act on the
+		// status -- notably 402, whose body carries x402 payment terms.
+		return nil, &HttpStatusError{
+			StatusCode: r.response.StatusCode,
+			Status:     r.response.Status,
+			Body:       r.bodyBytes,
+		}
 	}
 
 	return r.bodyBytes, nil
+}
+
+// HttpStatusError carries a non-200 response so callers can act on the STATUS rather
+// than string-matching an error message.
+//
+// This matters for 402: when a network is over its plan, the server answers 402 and
+// the body carries x402 payment terms. An agent needs to see the status and the body
+// to sign a payment and retry -- an opaque error string is unusable for that.
+//
+// Error() renders exactly as the untyped error it replaces, so existing callers that
+// only log or string-match are unaffected.
+type HttpStatusError struct {
+	StatusCode int
+	Status     string
+	Body       []byte
+}
+
+func (self *HttpStatusError) Error() string {
+	return fmt.Sprintf("%s: %s", self.Status, strings.TrimSpace(string(self.Body)))
+}
+
+// PaymentRequired reports whether the server answered 402 Payment Required. The Body
+// holds the x402 payment terms.
+func (self *HttpStatusError) PaymentRequired() bool {
+	return self.StatusCode == http.StatusPaymentRequired
 }
 
 func HttpPostWithStrategy[R any](
@@ -1340,9 +1369,13 @@ func HttpGetWithStrategyRaw(
 	}
 
 	if http.StatusOK != r.response.StatusCode {
-		// the response body is the error message
-		err = fmt.Errorf("%s: %s", r.response.Status, strings.TrimSpace(string(r.bodyBytes)))
-		return nil, err
+		// the response body is the error message. Typed so a caller can act on the
+		// status -- notably 402, whose body carries x402 payment terms.
+		return nil, &HttpStatusError{
+			StatusCode: r.response.StatusCode,
+			Status:     r.response.Status,
+			Body:       r.bodyBytes,
+		}
 	}
 
 	return r.bodyBytes, nil
@@ -1426,7 +1459,13 @@ func HttpPostStreamWithStrategyRaw(
 	}
 
 	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%s: %s", res.Status, strings.TrimSpace(string(bodyBytes)))
+		// typed so a caller can act on the status -- notably 402, whose body carries
+		// x402 payment terms
+		return nil, &HttpStatusError{
+			StatusCode: res.StatusCode,
+			Status:     res.Status,
+			Body:       bodyBytes,
+		}
 	}
 
 	return bodyBytes, nil

@@ -1724,6 +1724,37 @@ paths:
               schema:
                 $ref: "#/components/schemas/StripeCreateCustomerPortalResult"
 
+  /stripe/create-checkout-session:
+    post:
+      description: |
+        Create a Stripe Checkout Session for a subscription or data pack.
+
+        `ui_mode` selects which shape the result carries -- a single Stripe
+        session cannot produce both:
+          - "hosted" (the default, so existing callers are unchanged): returns
+            `checkout_url`, which the client opens in a browser.
+          - "embedded": returns `client_secret` and `publishable_key`, which the
+            client uses to mount Stripe Embedded Checkout inline (the desktop
+            apps load ur.io/checkout in a webview with these).
+
+        The subscription is granted by the `invoice.paid` webhook, never by the
+        client; the client only polls /subscription/balance afterwards.
+      operationId: Stripe Create Checkout Session
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StripeCreateCheckoutSessionArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StripeCreateCheckoutSessionResult"
+
   /verify:
     post:
       description: |
@@ -4820,6 +4851,43 @@ components:
           type: string
         publishable_key:
           type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    StripeCreateCheckoutSessionArgs:
+      type: object
+      properties:
+        item_id:
+          type: string
+        ui_mode:
+          type: string
+          description: |
+            "hosted" (default) or "embedded".
+          enum:
+            - hosted
+            - embedded
+
+    StripeCreateCheckoutSessionResult:
+      type: object
+      properties:
+        ui_mode:
+          type: string
+          description: which of the two shapes below is populated
+        checkout_url:
+          type: string
+          description: hosted mode only
+        client_secret:
+          type: string
+          description: embedded mode only
+        publishable_key:
+          type: string
+          description: embedded mode only
+        session_id:
+          type: string
+          description: both modes; the caller can reconcile the purchase with this
         error:
           type: object
           properties:

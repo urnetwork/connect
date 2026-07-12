@@ -65,36 +65,46 @@ type feed struct {
 	url        string
 	kind       feedKind
 	csvCol     int    // for kindCSV: 0-based column holding the IP / "ip:port"
+	csvTypeCol int    // for kindCSV: 0-based column to filter on (with csvTypeVal); ignored when csvTypeVal is ""
+	csvTypeVal string // for kindCSV: only rows whose csvTypeCol equals this are taken
 	minCount   int    // hard-fail the build if fewer valid entries than this
 	deprecated bool   // tolerate emptiness (warn, never hard-fail); kept for the record
 	credit     string // attribution line embedded in the generated header
 }
 
-// feeds is the full set pulled into the blocklist. Counts and floors were
-// calibrated against live data; floors sit well under observed volume so normal
-// daily churn never trips them, but a dead or reformatted feed does.
+// feeds is the full set pulled into the blocklist. It is sourced under a
+// permissive-first policy for commercial redistribution (the transformed table
+// ships embedded in released binaries): included are permissive/public-domain
+// feeds (CC0, BSD), Spamhaus DROP (free for product use, attribution retained
+// in the header below), and openly-published feeds that state no license
+// (treated as usable). Feeds whose terms explicitly forbid commercial use or
+// redistribution are excluded — AlienVault OTX (EULA forbids distribution),
+// Binary Defense (non-commercial), AbuseIPDB / GreenSnow / DShield (via the
+// dropped aggregates), and abuse.ch ThreatFox (as of 2025-11-04 its CC0 grant
+// was replaced by Spamhaus-managed terms: auth-gated, commercial use may
+// require a subscription, revocable — re-add only under an abuse.ch/Spamhaus
+// agreement). Contaminated aggregates that re-bundle those terms (ipsum,
+// FireHOL level1, romainmarcoux) are excluded in favor of pulling clean
+// sources directly. Dead sources (CruzIt frozen 2023, NiX Spam ceased 2025,
+// SSLBL/darklist empty) are removed outright.
 //
-// darklist.de and abuse.ch SSLBL are retained for the record but currently
-// serve no entries (darklist returns only its header; SSLBL's plaintext and CSV
-// endpoints have been frozen/empty since early 2025). They are marked deprecated
-// so they warn instead of aborting.
+// Counts and floors were calibrated against live data (2026-07-11); floors sit
+// well under observed volume so normal churn never trips them, but a dead or
+// reformatted feed does.
 var feeds = []feed{
-	{name: "alienvault", url: "https://reputation.alienvault.com/reputation.generic", kind: kindText, minCount: 300, credit: "AlienVault OTX IP reputation — reputation.alienvault.com"},
-	{name: "binarydefense", url: "https://www.binarydefense.com/banlist.txt", kind: kindText, minCount: 700, credit: "Binary Defense Systems banlist — binarydefense.com"},
-	{name: "blocklistde", url: "https://lists.blocklist.de/lists/all.txt", kind: kindText, minCount: 8000, credit: "Blocklist.de fail2ban reports — lists.blocklist.de"},
-	{name: "bruteforce", url: "https://iplists.firehol.org/files/bruteforceblocker.ipset", kind: kindText, minCount: 300, credit: "BruteForceBlocker (via FireHOL) — iplists.firehol.org"},
-	{name: "cins", url: "https://cinsscore.com/list/ci-badguys.txt", kind: kindText, minCount: 7000, credit: "CINS Army / CI Army ci-badguys — cinsscore.com"},
-	{name: "cruzit", url: "https://iplists.firehol.org/files/cruzit_web_attacks.ipset", kind: kindText, minCount: 6000, credit: "CruzIt.com web attackers (via FireHOL) — iplists.firehol.org"},
-	{name: "darklist", url: "https://www.darklist.de/raw.php", kind: kindText, minCount: 0, deprecated: true, credit: "darklist.de blacklisted IPs — darklist.de (source currently empty)"},
-	{name: "et_compromised", url: "https://rules.emergingthreats.net/blockrules/compromised-ips.txt", kind: kindText, minCount: 300, credit: "Emerging Threats compromised IPs — rules.emergingthreats.net"},
-	{name: "feodo", url: "https://feodotracker.abuse.ch/downloads/ipblocklist.txt", kind: kindText, minCount: 0, credit: "abuse.ch Feodo Tracker botnet C2 (CC0) — feodotracker.abuse.ch"},
-	{name: "nixspam", url: "https://iplists.firehol.org/files/nixspam.ipset", kind: kindText, minCount: 6000, credit: "NiX Spam (via FireHOL) — iplists.firehol.org"},
-	{name: "sslbl", url: "https://sslbl.abuse.ch/blacklist/sslipblacklist.txt", kind: kindText, minCount: 0, deprecated: true, credit: "abuse.ch SSL Blacklist (CC0) — sslbl.abuse.ch (source currently empty)"},
-	{name: "ipsum", url: "https://raw.githubusercontent.com/stamparm/ipsum/master/levels/3.txt", kind: kindText, minCount: 7000, credit: "stamparm/ipsum level>=3 aggregate (Unlicense) — github.com/stamparm/ipsum"},
-	{name: "firehol1", url: "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset", kind: kindText, minCount: 2000, credit: "FireHOL level1 (dshield + feodo + fullbogons + spamhaus_drop) — iplists.firehol.org"},
+	// permissive / public-domain (egress-relevant: botnet C2, malware/phishing hosting)
+	{name: "feodo", url: "https://feodotracker.abuse.ch/downloads/ipblocklist.txt", kind: kindText, minCount: 0, deprecated: true, credit: "abuse.ch Feodo Tracker botnet C2, recommended (CC0) — feodotracker.abuse.ch (often empty after botnet takedowns)"},
+	{name: "feodo_aggressive", url: "https://feodotracker.abuse.ch/downloads/ipblocklist_aggressive.txt", kind: kindText, minCount: 4000, credit: "abuse.ch Feodo Tracker botnet C2, aggressive (CC0) — feodotracker.abuse.ch"},
+	{name: "tweetfeed", url: "https://raw.githubusercontent.com/0xDanielLopez/TweetFeed/master/month.csv", kind: kindCSV, csvCol: 3, csvTypeCol: 2, csvTypeVal: "ip", minCount: 150, credit: "TweetFeed community IOCs, IP rows (CC0-1.0) — github.com/0xDanielLopez/TweetFeed"},
+	{name: "viriback", url: "https://tracker.viriback.com/dump.php", kind: kindCSV, csvCol: 2, minCount: 5000, credit: "ViriBack C2 Tracker (no stated license; openly published) — tracker.viriback.com"},
+	{name: "et_compromised", url: "https://rules.emergingthreats.net/blockrules/compromised-ips.txt", kind: kindText, minCount: 300, credit: "Emerging Threats Open compromised IPs (BSD, sids 2000000-2799999) — rules.emergingthreats.net"},
+	// free for product use with attribution (Spamhaus credit retained in the header below)
 	{name: "spamhaus", url: "https://www.spamhaus.org/drop/drop.txt", kind: kindText, minCount: 800, credit: "The Spamhaus DROP list — spamhaus.org/drop (© The Spamhaus Project; credit retained below)"},
-	{name: "threatfox", url: "https://threatfox.abuse.ch/export/csv/ip-port/recent/", kind: kindCSV, csvCol: 2, minCount: 500, credit: "abuse.ch ThreatFox botnet C2 (CC0) — threatfox.abuse.ch"},
 	{name: "spamhaus6", url: "https://www.spamhaus.org/drop/dropv6.txt", kind: kindText, minCount: 0, credit: "The Spamhaus DROPv6 list — spamhaus.org/drop (© The Spamhaus Project)"},
+	// openly published, no stated license (treated as usable per the sourcing policy)
+	{name: "blocklistde", url: "https://lists.blocklist.de/lists/all.txt", kind: kindText, minCount: 8000, credit: "Blocklist.de fail2ban reports (no stated license) — lists.blocklist.de"},
+	{name: "cins", url: "https://cinsscore.com/list/ci-badguys.txt", kind: kindText, minCount: 7000, credit: "CINS Army / CI Army ci-badguys (no stated license) — cinsscore.com"},
+	{name: "bruteforce", url: "https://iplists.firehol.org/files/bruteforceblocker.ipset", kind: kindText, minCount: 300, credit: "BruteForceBlocker (no stated license; via FireHOL) — iplists.firehol.org"},
 }
 
 // reservedCIDRs is non-global / special-purpose IPv4 space (RFC 6890 et al.).
@@ -156,6 +166,7 @@ func main() {
 	allowStale := flag.Bool("allow-stale", false, "generate even if some feeds fail or fall below min-count (skips them)")
 	maxCoverage := flag.Uint64("max-coverage", 64_000_000, "fail if total blocked address count exceeds this (poison guard)")
 	minRanges := flag.Int("min-ranges", 10_000, "fail if fewer than this many merged ranges result")
+	maxBytes := flag.Int("max-bytes", 1<<20, "size budget: fail if the EMBEDDED table exceeds this many bytes (the packed rodata that ships in the sdk binary, not the .go source, which is ~4x larger from \\xNN escapes)")
 	force := flag.Bool("force", false, "overwrite the output even if it lacks a generated-file marker")
 	flag.Parse()
 
@@ -239,6 +250,17 @@ func main() {
 		fatal(fmt.Errorf("coverage %d exceeds max %d — possible over-broad/poisoned feed; aborting", coverage, *maxCoverage))
 	}
 
+	// size budget. the packed tables are string constants: the compiler puts
+	// them in the binary's read-only data, so these bytes — not the ~4x larger
+	// .go source (each byte is a \xNN escape) — are what the sdk ships.
+	embedded := len(final)*8 + len(final6)*32
+	fmt.Fprintf(os.Stderr, "embedded table: %d bytes (%.3f MiB) of %d budget (%.3f MiB)\n",
+		embedded, float64(embedded)/(1<<20), *maxBytes, float64(*maxBytes)/(1<<20))
+	if *maxBytes < embedded {
+		fatal(fmt.Errorf("embedded table %d bytes (%.3f MiB) exceeds the size budget of %d bytes (%.3f MiB) — drop feeds or raise -max-bytes",
+			embedded, float64(embedded)/(1<<20), *maxBytes, float64(*maxBytes)/(1<<20)))
+	}
+
 	src := emit(final, final6, spamhausCredit)
 	formatted, ferr := format.Source(src)
 	if ferr != nil {
@@ -282,7 +304,7 @@ func fetchParse(f feed, timeout time.Duration) result {
 	case kindText:
 		res.ranges, res.ranges6, res.host, res.cidr, res.bad = parseText(data)
 	case kindCSV:
-		res.ranges, res.ranges6, res.host, res.bad = parseCSV(data, f.csvCol)
+		res.ranges, res.ranges6, res.host, res.bad = parseCSV(data, f.csvCol, f.csvTypeCol, f.csvTypeVal)
 	}
 	return res
 }
@@ -363,9 +385,12 @@ func parseText(data []byte) (ranges []iprange, ranges6 []ip6range, host, cidr, b
 	return
 }
 
-// parseCSV handles abuse.ch-style quoted CSV. The IP column may hold a bare IP
-// or an "ip:port" pair.
-func parseCSV(data []byte, col int) (ranges []iprange, ranges6 []ip6range, host, bad int) {
+// parseCSV handles CSV feeds. The IP lives in column col and may be a bare IP
+// or an "ip:port" pair. When typeVal is non-empty, only rows whose typeCol
+// equals typeVal are considered (e.g. TweetFeed rows tagged "ip"); other rows
+// are skipped, not counted as bad. Header rows are skipped naturally: their IP
+// column fails to parse.
+func parseCSV(data []byte, col int, typeCol int, typeVal string) (ranges []iprange, ranges6 []ip6range, host, bad int) {
 	r := csv.NewReader(bytes.NewReader(data))
 	r.Comma = ','
 	r.Comment = '#'
@@ -379,6 +404,11 @@ func parseCSV(data []byte, col int) (ranges []iprange, ranges6 []ip6range, host,
 		}
 		if err != nil {
 			continue // skip malformed rows
+		}
+		if typeVal != "" {
+			if typeCol >= len(rec) || strings.TrimSpace(rec[typeCol]) != typeVal {
+				continue // not a row of the requested type
+			}
 		}
 		if col >= len(rec) {
 			bad++

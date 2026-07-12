@@ -262,7 +262,7 @@ func TestCfaaSearch6(t *testing.T) {
 		{be16Addr(0x3000_0000_0000_0000, 0x0), be16Addr(0x3000_0000_0000_0000, 0xff)},
 	}
 	data, count := packV6(ranges)
-	hit := func(hi, lo uint64) bool { return cfaaSearch6(data, count, hi, lo) }
+	hit := func(hi, lo uint64) bool { return searchRange6(data, count, hi, lo) }
 
 	// independent linear reference
 	contains := func(hi, lo uint64) bool {
@@ -349,10 +349,10 @@ func TestCfaaBlockedPrefix6Invariant(t *testing.T) {
 	var prevHiHi, prevHiLo uint64
 	for i := 0; i < cfaaBlockedPrefix6Count; i += 1 {
 		o := i * 32
-		loHi := cfaaBe64(cfaaBlockedPrefix6Data, o)
-		loLo := cfaaBe64(cfaaBlockedPrefix6Data, o+8)
-		hiHi := cfaaBe64(cfaaBlockedPrefix6Data, o+16)
-		hiLo := cfaaBe64(cfaaBlockedPrefix6Data, o+24)
+		loHi := be64(cfaaBlockedPrefix6Data, o)
+		loLo := be64(cfaaBlockedPrefix6Data, o+8)
+		hiHi := be64(cfaaBlockedPrefix6Data, o+16)
+		hiLo := be64(cfaaBlockedPrefix6Data, o+24)
 		if hiHi < loHi || (hiHi == loHi && hiLo < loLo) {
 			t.Fatalf("range %d: lo > hi", i)
 		}

@@ -1,0 +1,18 @@
+# urnetwork blocker in-house allowlist, subtracted from the blocked host set
+# at generation time (blocker/main.go). exact hostnames only: subtraction
+# removes an entry equal to the name; it cannot punch a hole under a blocked
+# parent domain. grow this file from breakage reports.
+
+# urnetwork control plane — never block our own services
+ur.network
+api.ur.network
+connect.ur.network
+extender.ur.network
+
+# well known doh resolver hostnames (belt and braces; the resolver endpoints
+# from DefaultDnsResolverSettings are excluded automatically)
+dns.google
+dns.google.com
+cloudflare-dns.com
+one.one.one.one
+dns.quad9.net

@@ -14,6 +14,42 @@ In the URnetwork code, the following Go style is used. A few conventions — not
   - When the value already implies its type, drop the type token: concrete objects are named by usage alone (`session`, `client`, `transferBalance`). Keep the type when dropping it would confuse an identifier with the object it names — an `Id` stays `clientId`, never `client`.
   - Short names like `t`, `s`, `ts` are fine in a small scope with few locals, where the type is obvious from nearby context.
 
+## Package layering
+
+**A package must never import its own subpackages.** Dependencies point one way:
+a subpackage may import its parent or a peer, never a child. This is the same rule
+the Go standard library follows.
+
+The reason is that a parent importing a child inverts the dependency: the child is
+supposed to be a detail of the parent, but the compiler now treats the parent as
+depending on it, so the child's API is frozen by its own parent, cycles become easy
+to create, and "what depends on what" stops being readable from the directory tree.
+
+If a parent and a child need to share code, that code belongs in the **parent**, not
+in a child the parent then imports. Do not reach for `internal/` to get around this
+— `internal/` controls *visibility*, not *direction*, and a parent importing
+`internal/x` is still a parent importing a child.
+
+Shared code that several files in one package need is just a file in that package.
+Name it for what it is, and prefix the files of a cohesive group so the grouping
+survives the flattening:
+
+```
+proxy/
+  relay.go            <- the shared bidirectional copy, used by http and socks
+  http.go
+  socks.go            <- the public SocksProxy
+  socks5_server.go    <- the socks5 protocol implementation, one package,
+  socks5_addr.go         grouped by filename prefix rather than by directory
+  socks5_associate.go
+  socks/main.go       <- a CHILD (package main) importing its parent: allowed
+```
+
+An identifier that no longer crosses a package boundary should be unexported. A
+name is exported to cross a boundary, not as decoration; collapsing a subpackage
+into its parent is a good moment to shrink the public surface back to what callers
+actually use.
+
 ## Comments
 
 - Prefer short inline comments (`// ...` inside a function), 1–2 lines per point unless more is truly needed.
@@ -25,7 +61,16 @@ In the URnetwork code, the following Go style is used. A few conventions — not
 - Hold a lock across the smallest scope that needs it. The idiom is an immediately-invoked closure: `func() { self.stateLock.Lock(); defer self.stateLock.Unlock(); ... }()`.
 - Every potentially infinite loop must take a context (for cancellation) and rate-limit itself (to avoid busy-spinning).
 - Use `connect.Reconnect` for reconnect rate limiting.
-- Use `connect.Monitor` for change notifications. Grab the channel before reading the monitored state — `update := monitor.NotifyChannel()` — then `select` on it while waiting for changes. Subscribing before the read guarantees an update can't be missed.
+- Prefer `connect.MonitorValue[T]` over a bare `Monitor` whenever the thing being watched is a value. It pairs the value with its notification so neither half of the contract below can be broken: `Get` hands back the value and a channel armed at the same instant, and `Set`/`Update` notify inside the same critical section (and only on an actual change, so a loop that elects the value it also watches converges instead of waking itself forever). Reach for a bare `Monitor` only when the state is not a single comparable value.
+- A `Monitor` has two halves, and both fail silently. **Every mutation of the monitored state must notify**, and **every consumer must subscribe immediately before its read**. A mutation that forgets to notify parks its waiters forever — a monitor with no `NotifyAll` at all is dead on arrival and nothing will tell you.
+- Notify from inside the same locked scope as the mutation, so the state change and its notification cannot be separated: `func() { self.stateLock.Lock(); defer self.stateLock.Unlock(); if self.x == x { return }; self.x = x; self.monitor.NotifyAll() }()`. Gate the notify on an actual change — an unconditional notify lets a loop that also writes the state wake itself in a cycle.
+- `NotifyAll` closes the live channel and swaps in a fresh one, so a channel from `NotifyChannel` is a one-shot edge: once it fires it stays fired until you re-subscribe. A loop that waits on a channel it never re-subscribes to will hot spin the moment it takes a wake without exiting.
+- Subscribe *immediately* before reading the monitored state — `update := monitor.NotifyChannel()` — then `select` on it while waiting for changes. When the state is lock-guarded, subscribe and read in the same locked scope.
+- Nothing may block between the subscribe and the read. Both orderings fail silently, in opposite directions:
+  - subscribing *after* the read loses an update: a change in between closes the channel that was already discarded, so the loop stalls until an unrelated change arrives.
+  - subscribing well *before* the read duplicates work: a change in that gap is already carried by the read, and it also closed the channel that was subscribed, so the next iteration fires immediately and redoes the same work on identical state.
+- The monitor delivers edges, but a read of the current state delivers a level. Any change that lands before the read is already in the result, so re-arming for it does not "avoid missing" it — it double counts it. Keep the gap between subscribe and read empty and the two agree.
+- A coalescing emitter — at most one emit per epoch, carrying the complete state — waits for the change, sleeps the epoch, and only *then* subscribes and reads/emits. Subscribing before the epoch sleep is the duplicate case above: the burst's changes are already in the snapshot, and they leave the next round armed, so an identical emit fires one epoch later. See `DeviceLocal.watchNetworkPeers` in the sdk for the reference shape.
 
 ## Goroutine lifecycle
 

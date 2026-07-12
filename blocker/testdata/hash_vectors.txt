@@ -1,0 +1,13 @@
+# blocker hash vectors: the leading hostRecordLen (6) bytes of
+# SHA256(pepper || name), big endian, hex.
+# names are in normalized form (lower case, punycode, no trailing dot).
+# asserted by BOTH blocker/main_test.go (generator hashHost) and
+# ip_blocker_test.go (runtime blockHash / test helpers), pinning
+# generator/runtime normalization+hash agreement without cross-imports.
+pepper-hex 3031323334353637383961626364656630313233343536373839616263646566
+ads.example.com 1fe91be0c085
+tracker.net d4e0f3baf585
+xn--bcher-kva.example 3f1fbdc4a8f5
+a.very.deep.sub.domain.example.org 2644a4d92518
+0-9digits-and-hyphens.example.net 681664516070
+x.co beb9e873fc74

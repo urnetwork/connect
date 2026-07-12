@@ -436,6 +436,8 @@ type multiClientConfig struct {
 	performanceProfile  *PerformanceProfile
 	localSecurityBypass bool
 	serverNameLookup    ServerNameLookup
+	// the ad/tracker blocker consulted in the egress decision (nil = none)
+	blocker Blocker
 }
 
 func NewRemoteUserNatMultiClientWithDefaults(
@@ -491,7 +493,7 @@ func NewRemoteUserNatMultiClient(
 		clientUpdates:          map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
 		localUserNat:           localUserNat,
 		blockActionCache:       newBlockActionCache(settings.BlockActionDecisionTtl, settings.BlockActionDecisionMaxCount),
-		blockActionCollector:   newBlockActionCollector(settings.BlockActionAggMaxCount),
+		blockActionCollector:   newBlockActionCollector(settings.BlockActionAggMaxCount, log),
 		blockActionIgnoreCache: newBlockActionIgnoreCache(settings.BlockActionDecisionTtl, settings.BlockActionDecisionMaxCount),
 		packetStatsCounters:    &packetStatsCounters{},
 		packetStatsCallbacks:   NewCallbackList[PacketStatsFunction](),
@@ -503,6 +505,7 @@ func NewRemoteUserNatMultiClient(
 		performanceProfile:  settings.DefaultPerformanceProfile,
 		localSecurityBypass: false,
 		serverNameLookup:    nil,
+		blocker:             nil,
 	})
 	multiClient.blockActionState.Store(&blockActionState{
 		version: 0,
@@ -651,6 +654,7 @@ func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *
 			performanceProfile:  performanceProfile,
 			localSecurityBypass: prev.localSecurityBypass,
 			serverNameLookup:    prev.serverNameLookup,
+			blocker:             prev.blocker,
 		})
 	}()
 	for _, window := range self.windows {
@@ -668,6 +672,7 @@ func (self *RemoteUserNatMultiClient) SetLocalSecurityBypass(localSecurityBypass
 		performanceProfile:  prev.performanceProfile,
 		localSecurityBypass: localSecurityBypass,
 		serverNameLookup:    prev.serverNameLookup,
+		blocker:             prev.blocker,
 	})
 }
 
@@ -682,11 +687,36 @@ func (self *RemoteUserNatMultiClient) SetServerNameLookup(serverNameLookup Serve
 			performanceProfile:  prev.performanceProfile,
 			localSecurityBypass: prev.localSecurityBypass,
 			serverNameLookup:    serverNameLookup,
+			blocker:             prev.blocker,
 		})
 	}()
 	if self.ipAssoc != nil {
 		self.ipAssoc.SetServerNameLookup(serverNameLookup)
 	}
+	self.blockActionCache.clear()
+}
+
+// SetBlocker installs (or clears, with nil) the ad/tracker Blocker consulted
+// in the egress decision: a destination is blocked when its ip falls in the
+// blocker's ranges or any of its own observed server names is a blocked
+// hostname. the check is destination scoped — deliberately not extended over
+// the IpAssoc cluster, which would over-block co-clustered infrastructure.
+// user overrides take precedence: an un-blocked blocker match egresses
+// remotely as normal. enabling/disabling happens on the blocker itself and
+// takes effect immediately (cached decisions revalidate against the enabled
+// state). safe to call at runtime.
+func (self *RemoteUserNatMultiClient) SetBlocker(blocker Blocker) {
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		prev := self.config.Load()
+		self.config.Store(&multiClientConfig{
+			performanceProfile:  prev.performanceProfile,
+			localSecurityBypass: prev.localSecurityBypass,
+			serverNameLookup:    prev.serverNameLookup,
+			blocker:             blocker,
+		})
+	}()
 	self.blockActionCache.clear()
 }
 
@@ -1230,17 +1260,22 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 		}
 	}
 
-	// the overrides take precedence over the default decision
+	// the overrides take precedence over the default decisions (the security
+	// result and the ad/tracker blocker)
 	blockActionState := self.blockActionState.Load()
+	config := self.config.Load()
+	blockerActive := config.blocker != nil && config.blocker.Enabled()
 	var decision *blockActionDecision
-	if !ignored && (blockActionState.matcher != nil || self.blockActionCollector.hasCallbacks()) {
-		decision = self.blockActionDecision(blockActionState, ipPath)
+	if !ignored && (blockActionState.matcher != nil || self.blockActionCollector.hasCallbacks() || blockerActive) {
+		decision = self.blockActionDecision(blockActionState, config.blocker, blockerActive, ipPath)
 	}
 	var match *blockActionMatch
+	blockerBlock := false
 	if decision != nil {
 		match = decision.match
+		blockerBlock = decision.blockerBlock
 	}
-	block, local := blockActionApply(r, self.LocalSecurityBypass(), match)
+	block, local := blockActionApply(r, config.localSecurityBypass, blockerBlock, match)
 
 	byteCount := ByteCount(len(packet))
 	if decision != nil && self.blockActionCollector.hasCallbacks() {
@@ -1273,9 +1308,10 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 	return success
 }
 
-// the cached override match and server names for a destination.
-// the external lookups (server names, cluster) run outside the cache lock
-func (self *RemoteUserNatMultiClient) blockActionDecision(state *blockActionState, ipPath *IpPath) *blockActionDecision {
+// the cached override match, blocker match, and server names for a
+// destination. the external lookups (server names, cluster) run outside the
+// cache lock
+func (self *RemoteUserNatMultiClient) blockActionDecision(state *blockActionState, blocker Blocker, blockerActive bool, ipPath *IpPath) *blockActionDecision {
 	addr, ok := ipAssocAddr(ipPath.DestinationIp)
 	if !ok {
 		return nil
@@ -1287,7 +1323,7 @@ func (self *RemoteUserNatMultiClient) blockActionDecision(state *blockActionStat
 	}
 	now := time.Now()
 
-	if decision := self.blockActionCache.get(addr, state.version, clusterVersion, now); decision != nil {
+	if decision := self.blockActionCache.get(addr, state.version, clusterVersion, blockerActive, now); decision != nil {
 		return decision
 	}
 
@@ -1306,6 +1342,7 @@ func (self *RemoteUserNatMultiClient) blockActionDecision(state *blockActionStat
 	decision := &blockActionDecision{
 		overridesVersion: state.version,
 		clusterVersion:   clusterVersion,
+		blockerEnabled:   blockerActive,
 		expireTime:       now.Add(self.blockActionCache.ttl),
 		clusterKey:       clusterIps[0],
 		clusterIps:       clusterIps,
@@ -1314,6 +1351,7 @@ func (self *RemoteUserNatMultiClient) blockActionDecision(state *blockActionStat
 	if state.matcher != nil {
 		match = &blockActionMatch{}
 	}
+	destSeen := false
 	seenHosts := map[string]bool{}
 	for _, member := range clusterIps {
 		memberServerNames := self.serverNames(member)
@@ -1327,12 +1365,37 @@ func (self *RemoteUserNatMultiClient) blockActionDecision(state *blockActionStat
 			// the match extends over the destination's entire cluster
 			state.matcher.matchAddr(match, member, memberServerNames)
 		}
+		if blockerActive && member == addr {
+			// the blocker matches the destination itself: its ip and its own
+			// observed server names, never the cluster's (over-blocking
+			// co-clustered infrastructure would break sites)
+			destSeen = true
+			decision.blockerBlock = blockerCheck(blocker, addr, memberServerNames)
+		}
+	}
+	if blockerActive && !destSeen {
+		decision.blockerBlock = blockerCheck(blocker, addr, self.serverNames(addr))
 	}
 	if match != nil && match.any() {
 		decision.match = match
 	}
 	self.blockActionCache.put(addr, decision)
 	return decision
+}
+
+// blockerCheck is the destination-scoped blocker match: the destination ip
+// against the blocked ranges, and each of the destination's own observed
+// server names against the blocked host set.
+func blockerCheck(blocker Blocker, addr netip.Addr, serverNames []string) bool {
+	if blocker.BlockIp(addr) {
+		return true
+	}
+	for _, serverName := range serverNames {
+		if blocker.BlockHost(serverName) {
+			return true
+		}
+	}
+	return false
 }
 
 func (self *RemoteUserNatMultiClient) serverNames(addr netip.Addr) []string {
@@ -1831,14 +1894,6 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 				state.receiveTime = time.Now()
 			}
 			race.packetCount += 1
-			/*
-				if race.packetCount == 1 {
-					// schedule the race evaluation on first packet
-					earlyComplete := race.completeMonitor.NotifyChannel()
-					// copy the ip path since the first packet may not be ultimately retained to the end of the race
-					self.scheduleCompleteRace(ipPathCopy, race, earlyComplete)
-				}
-			*/
 			if len(state.packets) == 1 {
 				race.clientsWithPacketCount += 1
 				if int(float32(len(race.clientStates))*self.settings.MultiRaceClientEarlyCompleteFraction) <= race.clientsWithPacketCount {

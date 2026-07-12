@@ -20,6 +20,11 @@ import (
 // destination per event epoch, so listeners see all routing decisions without
 // per-packet dispatch.
 
+// blockActionEvictSampleSize is how many entries an over-cap insert into the
+// decision or ignore cache samples to evict the soonest-to-expire from
+// (approximate lru, O(sample) instead of a full scan).
+const blockActionEvictSampleSize = 32
+
 type BlockOverride struct {
 	Block bool
 }
@@ -54,6 +59,9 @@ type BlockAction struct {
 	Hosts []string
 	Block bool
 	Local bool
+	// set when the ad/tracker blocker matched the destination (the final
+	// decision may still be un-blocked by an override; see Block)
+	Blocker bool
 	// set when an override determined the decision
 	BlockOverrideId *Id
 	RouteOverrideId *Id
@@ -208,15 +216,18 @@ func (self *blockActionMatch) merge(override *BlockActionOverride) {
 	}
 }
 
-// blockActionApply combines the security policy result with the matched overrides
-// into the final egress decision. the rules are
+// blockActionApply combines the security policy result, the ad/tracker
+// blocker, and the matched overrides into the final egress decision. the
+// rules are
 //  1. an incident (martian/malformed) is always blocked and not overridable
-//  2. the block override takes precedence over the security decision,
+//  2. a blocker match blocks by default, like a security drop
+//  3. the block override takes precedence over both default decisions,
 //     and the route override over the default route (local when the security
 //     result is drop and the local security bypass is on, else egress)
-//  3. drop-classified traffic never egresses to a provider.
-//     un-blocking it routes it locally
-func blockActionApply(r SecurityPolicyResult, localSecurityBypass bool, match *blockActionMatch) (block bool, local bool) {
+//  4. drop-classified traffic never egresses to a provider: un-blocking it
+//     routes it locally. an un-blocked blocker match (allow-classified)
+//     egresses remotely as normal
+func blockActionApply(r SecurityPolicyResult, localSecurityBypass bool, blockerBlock bool, match *blockActionMatch) (block bool, local bool) {
 	switch r {
 	case SecurityPolicyResultAllow:
 	case SecurityPolicyResultDrop:
@@ -229,6 +240,11 @@ func blockActionApply(r SecurityPolicyResult, localSecurityBypass bool, match *b
 		// incident. always blocked, not overridable
 		block = true
 		return
+	}
+
+	if blockerBlock {
+		block = true
+		local = false
 	}
 
 	if match != nil {
@@ -279,10 +295,16 @@ type blockActionState struct {
 }
 
 // a cached decision for a destination.
-// valid while the overrides and cluster versions are unchanged, up to a ttl
-// (server names for the destination can drift as dns is observed)
+// valid while the overrides and cluster versions and the blocker-active
+// state are unchanged, up to a ttl (server names for the destination can
+// drift as dns is observed)
 type blockActionDecision struct {
-	match            *blockActionMatch
+	match *blockActionMatch
+	// the ad/tracker blocker matched the destination (its ip or its own
+	// observed server names — destination scoped, not the cluster)
+	blockerBlock bool
+	// the blocker-active state the decision was computed under
+	blockerEnabled   bool
 	overridesVersion uint64
 	clusterVersion   uint64
 	expireTime       time.Time
@@ -310,14 +332,14 @@ func newBlockActionCache(ttl time.Duration, maxCount int) *blockActionCache {
 	}
 }
 
-func (self *blockActionCache) get(addr netip.Addr, overridesVersion uint64, clusterVersion uint64, now time.Time) *blockActionDecision {
+func (self *blockActionCache) get(addr netip.Addr, overridesVersion uint64, clusterVersion uint64, blockerActive bool, now time.Time) *blockActionDecision {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	decision, ok := self.decisions[addr]
 	if !ok {
 		return nil
 	}
-	if decision.overridesVersion != overridesVersion || decision.clusterVersion != clusterVersion || decision.expireTime.Before(now) {
+	if decision.overridesVersion != overridesVersion || decision.clusterVersion != clusterVersion || decision.blockerEnabled != blockerActive || decision.expireTime.Before(now) {
 		delete(self.decisions, addr)
 		return nil
 	}
@@ -328,9 +350,37 @@ func (self *blockActionCache) put(addr netip.Addr, decision *blockActionDecision
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	if self.maxCount <= len(self.decisions) {
-		clear(self.decisions)
+		self.evictSoonestSampleLocked()
 	}
 	self.decisions[addr] = decision
+}
+
+// evictSoonestSampleLocked deletes the soonest-to-expire decision of a
+// blockActionEvictSampleSize sample (map iteration starts at a random bucket, so
+// the sample is unbiased): approximate lru, O(sample) instead of a full scan.
+// clearing the whole map at capacity instead would make every active destination
+// recompute its decision at once — a server names lookup, a cluster walk, the
+// override matcher and the blocker, per flow — and a device that stays over the
+// cap would repeat that storm on every insert.
+func (self *blockActionCache) evictSoonestSampleLocked() {
+	var evictAddr netip.Addr
+	var evictTime time.Time
+	found := false
+	i := 0
+	for addr, decision := range self.decisions {
+		if !found || decision.expireTime.Before(evictTime) {
+			evictAddr = addr
+			evictTime = decision.expireTime
+			found = true
+		}
+		i += 1
+		if blockActionEvictSampleSize <= i {
+			break
+		}
+	}
+	if found {
+		delete(self.decisions, evictAddr)
+	}
 }
 
 func (self *blockActionCache) clear() {
@@ -421,9 +471,33 @@ func (self *blockActionIgnoreCache) put(addr netip.Addr, entry *blockActionIgnor
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	if self.maxCount <= len(self.entries) {
-		clear(self.entries)
+		self.evictSoonestSampleLocked()
 	}
 	self.entries[addr] = entry
+}
+
+// evictSoonestSampleLocked is the `blockActionCache` eviction for the ignore
+// entries: drop the soonest-to-expire of a bounded sample rather than clearing
+// the whole map at capacity.
+func (self *blockActionIgnoreCache) evictSoonestSampleLocked() {
+	var evictAddr netip.Addr
+	var evictTime time.Time
+	found := false
+	i := 0
+	for addr, entry := range self.entries {
+		if !found || entry.expireTime.Before(evictTime) {
+			evictAddr = addr
+			evictTime = entry.expireTime
+			found = true
+		}
+		i += 1
+		if blockActionEvictSampleSize <= i {
+			break
+		}
+	}
+	if found {
+		delete(self.entries, evictAddr)
+	}
 }
 
 func (self *blockActionIgnoreCache) clear() {
@@ -435,12 +509,16 @@ func (self *blockActionIgnoreCache) clear() {
 // aggregates decisions per destination per epoch
 type blockActionCollector struct {
 	maxCount int
+	log      Logger
 
 	callbacks     *CallbackList[BlockActionFunction]
 	callbackCount atomic.Int64
 
 	stateLock sync.Mutex
 	agg       map[blockActionKey]*blockActionAgg
+	// aggregations dropped at the cap this epoch. surfaced at flush so the
+	// under-reporting is visible rather than silent
+	droppedCount int
 }
 
 type blockActionKey struct {
@@ -448,6 +526,8 @@ type blockActionKey struct {
 	clusterKey netip.Addr
 	block      bool
 	local      bool
+	// the ad/tracker blocker matched the destination
+	blocker bool
 	// zero when no override applied
 	blockOverrideId Id
 	routeOverrideId Id
@@ -461,9 +541,10 @@ type blockActionAgg struct {
 	byteCount   ByteCount
 }
 
-func newBlockActionCollector(maxCount int) *blockActionCollector {
+func newBlockActionCollector(maxCount int, log Logger) *blockActionCollector {
 	return &blockActionCollector{
 		maxCount:  maxCount,
+		log:       loggerOrDefault(log),
 		callbacks: NewCallbackList[BlockActionFunction](),
 		agg:       map[blockActionKey]*blockActionAgg{},
 	}
@@ -493,6 +574,7 @@ func (self *blockActionCollector) add(
 		clusterKey: decision.clusterKey,
 		block:      block,
 		local:      local,
+		blocker:    decision.blockerBlock,
 	}
 	if match != nil {
 		if match.blockOverride != nil {
@@ -508,7 +590,12 @@ func (self *blockActionCollector) add(
 	agg, ok := self.agg[key]
 	if !ok {
 		if self.maxCount <= len(self.agg) {
-			// at capacity. drop the aggregation for this epoch
+			// at capacity. drop the aggregation for this epoch, and count the
+			// drop: the itemized block action list then under-reports exactly
+			// during the destination bursts a user would most want to inspect,
+			// so the loss must not be silent. the packet and block stats
+			// counters are unaffected (separate atomics)
+			self.droppedCount += 1
 			return
 		}
 		agg = &blockActionAgg{
@@ -524,15 +611,25 @@ func (self *blockActionCollector) add(
 
 func (self *blockActionCollector) flush() {
 	var agg map[blockActionKey]*blockActionAgg
+	dropped := 0
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
+		dropped = self.droppedCount
+		self.droppedCount = 0
 		if len(self.agg) == 0 {
 			return
 		}
 		agg = self.agg
 		self.agg = map[blockActionKey]*blockActionAgg{}
 	}()
+	if 0 < dropped {
+		self.log.Warningf(
+			"[block]dropped %d block action aggregations at the %d per-epoch cap; the block action list under-reports this epoch\n",
+			dropped,
+			self.maxCount,
+		)
+	}
 	if len(agg) == 0 {
 		return
 	}
@@ -545,6 +642,7 @@ func (self *blockActionCollector) flush() {
 			Hosts:       keyAgg.hosts,
 			Block:       key.block,
 			Local:       key.local,
+			Blocker:     key.blocker,
 			PacketCount: keyAgg.packetCount,
 			ByteCount:   keyAgg.byteCount,
 		}

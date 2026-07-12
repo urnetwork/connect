@@ -66,18 +66,24 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 		defer handleCancel()
 
 		for {
-			done := false
 			select {
 			case <-notify:
-				func() {
-					self.sendLock.Lock()
-					defer self.sendLock.Unlock()
-					done = syncIndex != self.syncCount
-				}()
 			case <-handleCtx.Done():
-				done = true
+				return
 			}
-
+			// re-subscribe and read syncCount in the same locked scope. the
+			// notify channel is closed by `NotifyAll`, so without the
+			// re-subscribe a wake that does not exit the loop would re-select
+			// the already closed channel and hot spin. today the only notifier
+			// (above) always bumps syncCount first, so this loop always exits on
+			// its first wake — a second notifier that did not would spin
+			done := false
+			func() {
+				self.sendLock.Lock()
+				defer self.sendLock.Unlock()
+				notify = self.monitor.NotifyChannel()
+				done = syncIndex != self.syncCount
+			}()
 			if done {
 				return
 			}

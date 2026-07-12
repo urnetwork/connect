@@ -175,7 +175,7 @@ func TestBlockActionApply(t *testing.T) {
 		{SecurityPolicyResultIncident, false, localTrue, true, false},
 	}
 	for i, c := range cases {
-		block, local := blockActionApply(c.r, c.bypass, c.match)
+		block, local := blockActionApply(c.r, c.bypass, false, c.match)
 		assert.Equal(t, c.block, block)
 		assert.Equal(t, c.local, local)
 		if c.block != block || c.local != local {
@@ -185,7 +185,7 @@ func TestBlockActionApply(t *testing.T) {
 }
 
 func TestBlockActionCollector(t *testing.T) {
-	collector := newBlockActionCollector(8)
+	collector := newBlockActionCollector(8, nil)
 
 	assert.Equal(t, false, collector.hasCallbacks())
 

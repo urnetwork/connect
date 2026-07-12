@@ -165,6 +165,12 @@ type UpgradeMux struct {
 	mux      *IpMux
 	settings atomic.Pointer[UpgradeMuxSettings]
 
+	// blocker, when set and enabled, blocks resolution of ad/tracking
+	// hostnames in handleDns. installed by the device via SetBlocker —
+	// deliberately not part of the swappable settings, so SetSettings
+	// cannot clear it.
+	blocker atomic.Pointer[Blocker]
+
 	// fallbackDohCache resolves over the local host egress (not the tun); the handicapped local
 	// fallback used when the tunnel-DoH is slow to come up. nil when no Fallback is configured.
 	fallbackDohCache atomic.Pointer[DohCache]
@@ -342,6 +348,25 @@ func (self *UpgradeMux) httpBlocked() bool {
 	return s.Http != nil && HttpUpgradeBlock == s.Http.Mode
 }
 
+// SetBlocker installs (or, with nil, removes) the ad/tracker Blocker
+// consulted by handleDns for every claimed dns query. the blocker is shared
+// with the multi client and owned by the device; enabling/disabling happens
+// on the blocker itself.
+func (self *UpgradeMux) SetBlocker(blocker Blocker) {
+	if blocker == nil {
+		self.blocker.Store(nil)
+	} else {
+		self.blocker.Store(&blocker)
+	}
+}
+
+func (self *UpgradeMux) getBlocker() Blocker {
+	if b := self.blocker.Load(); b != nil {
+		return *b
+	}
+	return nil
+}
+
 // peekResult classifies a send packet by the flow the mux may claim, so the common pass-through
 // bulk (peekOther) and pass-through TCP/80 (peekHttp, not blocking) are decided without the
 // allocating full parse. Only DNS and unclassifiable packets parse.
@@ -448,6 +473,36 @@ func (self *UpgradeMux) handleDns(source TransferPath, provideMode protocol.Prov
 	if err != nil {
 		return false
 	}
+	domain := strings.TrimSuffix(question.Name.String(), ".")
+
+	// the blocker consults every query type, ahead of any resolution or
+	// caching: a blocked name answers A/AAAA with the unspecified address
+	// (the OS fails the connect instantly and locally) and every other type
+	// — notably HTTPS/SVCB (65), whose ipv4hint/ipv6hint would bypass the
+	// null A/AAAA — with an empty NOERROR. blocked replies never populate
+	// the reverse index or the resolver cache, so toggling the blocker
+	// takes effect immediately.
+	if blocker := self.getBlocker(); blocker != nil && blocker.BlockHost(domain) {
+		var responseTtl uint32
+		if dns := self.settings.Load().Dns; dns != nil {
+			responseTtl = dns.ResponseTtl
+		}
+		var addrs []netip.Addr
+		switch question.Type {
+		case dnsmessage.TypeA:
+			addrs = []netip.Addr{netip.IPv4Unspecified()}
+		case dnsmessage.TypeAAAA:
+			addrs = []netip.Addr{netip.IPv6Unspecified()}
+		}
+		respPayload, err := buildDnsResponse(header.ID, question, addrs, responseTtl)
+		if err != nil {
+			return false
+		}
+		reverse := ipPath.Reverse()
+		self.mux.deliverDownstream(source, provideMode, reverse, ipOosPacket(reverse, respPayload))
+		return true
+	}
+
 	var recordType string
 	switch question.Type {
 	case dnsmessage.TypeA:
@@ -457,7 +512,6 @@ func (self *UpgradeMux) handleDns(source TransferPath, provideMode protocol.Prov
 	default:
 		return false
 	}
-	domain := strings.TrimSuffix(question.Name.String(), ".")
 
 	responder := dnsResponder{
 		id:          header.ID,

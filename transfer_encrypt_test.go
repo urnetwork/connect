@@ -369,24 +369,33 @@ func TestSetPeerClientPublicKeyWrongSize(t *testing.T) {
 	}
 }
 
-// TestPeerSessionReadyNotifyOnVerify verifies that the readyMonitor
-// fires when peerIdentityVerified flips, so any waiters wake up.
-func TestPeerSessionReadyNotifyOnVerify(t *testing.T) {
+// TestPeerSessionIdentityVerifiedOnProof verifies that a valid identity proof
+// signed over the session's tls exporter flips `peerIdentityVerified`.
+//
+// (This previously asserted that the session's `readyMonitor` fired. That
+// monitor had six notifiers and no consumer outside this test — the receive
+// loop that once waited on it was replaced by `OptimisticallyDeliverHandshake`
+// — so it was removed, and the test now asserts the outcome it was standing in
+// for.)
+func TestPeerSessionIdentityVerifiedOnProof(t *testing.T) {
 	sess, _, _, peerPriv, cleanup := newTestSessionForIdentityProof(t)
 	defer cleanup()
 
 	peerPub := peerPriv.Public().(ed25519.PublicKey)
 	proof := ed25519.Sign(peerPriv, sess.epoch.tlsExporter)
 
-	ready := sess.ReadyNotify()
+	if sess.epoch.peerIdentityVerified {
+		t.Fatal("peer identity verified before any proof was received")
+	}
+
 	sess.SetPeerClientPublicKey(peerPub)
 	sess.receivePeerIdentityProof(proof)
 
-	select {
-	case <-ready:
-		// expected
-	case <-time.After(time.Second):
-		t.Fatal("expected ReadyNotify to fire after identity verification")
+	sess.stateLock.Lock()
+	verified := sess.epoch.peerIdentityVerified
+	sess.stateLock.Unlock()
+	if !verified {
+		t.Fatal("expected the peer identity to be verified after a valid proof")
 	}
 }
 
