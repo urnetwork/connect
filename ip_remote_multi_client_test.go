@@ -10,8 +10,6 @@ import (
 	// "slices"
 	"sync"
 
-	"github.com/go-playground/assert/v2"
-
 	"github.com/urnetwork/connect/protocol"
 )
 
@@ -306,10 +304,10 @@ func TestMultiClientChannelWindowStats(t *testing.T) {
 			Tier:                    0,
 		},
 	}
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 
 	clientChannel, err := newMultiClientChannel(ctx, channelArgs, generator, clientReceivePacket, DefaultSecurityPolicy(ctx), contractStatus, func(contractStatsEvents []*ContractStatsEvent) {}, nil, settings)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 
 	cancelCtxs := []context.Context{}
 
@@ -326,7 +324,7 @@ func TestMultiClientChannelWindowStats(t *testing.T) {
 								for a := 0; a < repeatCount; a += 1 {
 									packet, _ := udp4Packet(s, i, j, k)
 									ipPath, err := ParseIpPath(packet)
-									assert.Equal(t, nil, err)
+									AssertEqual(t, nil, err)
 
 									clientChannel.addSendNack(1)
 									clientChannel.addSendAck(1)
@@ -347,16 +345,16 @@ func TestMultiClientChannelWindowStats(t *testing.T) {
 	}
 
 	stats, err := clientChannel.windowStatsWithCoalesce(false)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 
 	// [1, maxBucketCount]
-	assert.Equal(t, true, 1 <= stats.bucketCount)
-	assert.Equal(t, true, stats.bucketCount <= maxBucketCount)
+	AssertEqual(t, true, 1 <= stats.bucketCount)
+	AssertEqual(t, true, stats.bucketCount <= maxBucketCount)
 
 	stats, err = clientChannel.WindowStats()
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 
 	// [1, maxBucketCount]
-	assert.Equal(t, true, 1 <= stats.bucketCount)
-	assert.Equal(t, true, stats.bucketCount <= maxBucketCount)
+	AssertEqual(t, true, 1 <= stats.bucketCount)
+	AssertEqual(t, true, stats.bucketCount <= maxBucketCount)
 }

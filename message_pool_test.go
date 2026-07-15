@@ -6,8 +6,6 @@ import (
 	"fmt"
 	mathrand "math/rand"
 	"testing"
-
-	"github.com/go-playground/assert/v2"
 )
 
 func TestMessagePool(t *testing.T) {
@@ -21,8 +19,8 @@ func TestMessagePool(t *testing.T) {
 			mathrand.Read(message)
 
 			messageCopy := MessagePoolCopy(message)
-			assert.Equal(t, len(messageCopy), n)
-			assert.Equal(t, message, messageCopy)
+			AssertEqual(t, len(messageCopy), n)
+			AssertEqual(t, message, messageCopy)
 
 			MessagePoolReturn(messageCopy)
 		}
@@ -34,14 +32,14 @@ func TestMessagePool(t *testing.T) {
 		b := make([]byte, mathrand.Intn(32*1024))
 		mathrand.Read(b)
 		bCopy, err := MessagePoolReadAll(bytes.NewReader(b))
-		assert.Equal(t, err, nil)
-		assert.Equal(t, b, bCopy)
+		AssertEqual(t, err, nil)
+		AssertEqual(t, b, bCopy)
 		MessagePoolReturn(bCopy)
 	}
 	stats := MessagePoolStats()
 	for _, tagRatios := range stats {
 		for _, ratio := range tagRatios {
-			assert.Equal(t, ratio, float32(1.0))
+			AssertEqual(t, ratio, float32(1.0))
 		}
 	}
 }
@@ -53,15 +51,15 @@ func TestMessagePoolShare(t *testing.T) {
 	for range 1024 {
 		message := MessagePoolGet(mathrand.Intn(4096))
 		pooled, shared := MessagePoolCheck(message)
-		assert.Equal(t, pooled, true)
-		assert.Equal(t, shared, false)
+		AssertEqual(t, pooled, true)
+		AssertEqual(t, shared, false)
 		holdMessages[0] = append(holdMessages[0], message)
 		k := mathrand.Intn(holdCount)
 		for i := 1; i < k; i += 1 {
 			MessagePoolShareReadOnly(message)
 			pooled, shared = MessagePoolCheck(message)
-			assert.Equal(t, pooled, true)
-			assert.Equal(t, shared, true)
+			AssertEqual(t, pooled, true)
+			AssertEqual(t, shared, true)
 			holdMessages[i] = append(holdMessages[i], message)
 		}
 	}
@@ -70,42 +68,42 @@ func TestMessagePoolShare(t *testing.T) {
 	for range 1024 {
 		message := MessagePoolGet(mathrand.Intn(32 * 1024))
 		pooled, shared := MessagePoolCheck(message)
-		assert.Equal(t, pooled, len(message) <= 4096)
-		assert.Equal(t, shared, false)
+		AssertEqual(t, pooled, len(message) <= 4096)
+		AssertEqual(t, shared, false)
 		k := mathrand.Intn(holdCount)
 		for i := 1; i < k; i += 1 {
 			MessagePoolShareReadOnly(message)
 			pooled, shared = MessagePoolCheck(message)
-			assert.Equal(t, pooled, len(message) <= 4096)
-			assert.Equal(t, shared, len(message) <= 4096)
+			AssertEqual(t, pooled, len(message) <= 4096)
+			AssertEqual(t, shared, len(message) <= 4096)
 		}
 		for i := 1; i < k; i += 1 {
 			MessagePoolReturn(message)
 			pooled, shared = MessagePoolCheck(message)
-			assert.Equal(t, pooled, len(message) <= 4096)
-			assert.Equal(t, shared, len(message) <= 4096)
+			AssertEqual(t, pooled, len(message) <= 4096)
+			AssertEqual(t, shared, len(message) <= 4096)
 		}
 		MessagePoolReturn(message)
 		pooled, shared = MessagePoolCheck(message)
-		assert.Equal(t, pooled, false)
-		assert.Equal(t, shared, false)
+		AssertEqual(t, pooled, false)
+		AssertEqual(t, shared, false)
 	}
 
 	for i := holdCount - 1; 1 <= i; i -= 1 {
 		for _, message := range holdMessages[i] {
 			pooled, shared := MessagePoolCheck(message)
-			assert.Equal(t, pooled, len(message) <= 4096)
-			assert.Equal(t, shared, len(message) <= 4096)
+			AssertEqual(t, pooled, len(message) <= 4096)
+			AssertEqual(t, shared, len(message) <= 4096)
 			r := MessagePoolReturn(message)
-			assert.Equal(t, r, false)
+			AssertEqual(t, r, false)
 		}
 	}
 	for _, message := range holdMessages[0] {
 		r := MessagePoolReturn(message)
-		assert.Equal(t, r, true)
+		AssertEqual(t, r, true)
 		pooled, shared := MessagePoolCheck(message)
-		assert.Equal(t, pooled, false)
-		assert.Equal(t, shared, false)
+		AssertEqual(t, pooled, false)
+		AssertEqual(t, shared, false)
 	}
 }
 
@@ -115,7 +113,7 @@ func TestBase64(t *testing.T) {
 		b := make([]byte, n)
 		mathrand.Read(b)
 		b2, err := DecodeBase64(base64.StdEncoding, EncodeBase64(base64.StdEncoding, b))
-		assert.Equal(t, err, nil)
-		assert.Equal(t, b, b2)
+		AssertEqual(t, err, nil)
+		AssertEqual(t, b, b2)
 	}
 }

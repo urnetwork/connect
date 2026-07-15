@@ -9,8 +9,6 @@ import (
 
 	// "math"
 	mathrand "math/rand"
-
-	"github.com/go-playground/assert/v2"
 )
 
 func TestMonitor(t *testing.T) {
@@ -43,13 +41,13 @@ func TestCallbackList(t *testing.T) {
 
 	testingCallbackIds := []int{}
 
-	assert.Equal(t, 0, len(callbacks.Get()))
+	AssertEqual(t, 0, len(callbacks.Get()))
 	for i := 0; i < n; i += 1 {
 		callbackId := callbacks.Add(testingCallbacks[i].Callback)
 		testingCallbackIds = append(testingCallbackIds, callbackId)
-		assert.Equal(t, i+1, len(callbacks.Get()))
+		AssertEqual(t, i+1, len(callbacks.Get()))
 	}
-	assert.Equal(t, n, len(callbacks.Get()))
+	AssertEqual(t, n, len(callbacks.Get()))
 	// note callbacks can be added multiple times
 
 	mathrand.Shuffle(len(testingCallbackIds), func(i int, j int) {
@@ -58,13 +56,13 @@ func TestCallbackList(t *testing.T) {
 
 	for i := 0; i < n; i += 1 {
 		callbacks.Remove(testingCallbackIds[i])
-		assert.Equal(t, n-1-i, len(callbacks.Get()))
+		AssertEqual(t, n-1-i, len(callbacks.Get()))
 	}
-	assert.Equal(t, 0, len(callbacks.Get()))
+	AssertEqual(t, 0, len(callbacks.Get()))
 
 	for i := 0; i < n; i += 1 {
 		callbacks.Add(testingCallbacks[i].Callback)
-		assert.Equal(t, i+1, len(callbacks.Get()))
+		AssertEqual(t, i+1, len(callbacks.Get()))
 	}
 
 	for i := 0; i < m; i += 1 {
@@ -76,7 +74,7 @@ func TestCallbackList(t *testing.T) {
 	for i := 0; i < n; i += 1 {
 		values := testingCallbacks[i].Values()
 		for j := 0; j < m; j += 1 {
-			assert.Equal(t, j, values[j])
+			AssertEqual(t, j, values[j])
 		}
 	}
 
@@ -105,22 +103,22 @@ func TestIdleCondition(t *testing.T) {
 
 	a := idleCondition.Checkpoint()
 	success := idleCondition.UpdateOpen()
-	assert.Equal(t, true, success)
+	AssertEqual(t, true, success)
 	success = idleCondition.Close(a)
-	assert.Equal(t, false, success)
+	AssertEqual(t, false, success)
 	success = idleCondition.UpdateOpen()
-	assert.Equal(t, true, success)
+	AssertEqual(t, true, success)
 	success = idleCondition.Close(a)
-	assert.Equal(t, false, success)
+	AssertEqual(t, false, success)
 	idleCondition.UpdateClose()
 	idleCondition.UpdateClose()
 	b := idleCondition.Checkpoint()
 	go func() {
 		success := idleCondition.Close(b)
-		assert.Equal(t, true, success)
+		AssertEqual(t, true, success)
 	}()
 	success = idleCondition.WaitForClose()
-	assert.Equal(t, true, success)
+	AssertEqual(t, true, success)
 
 }
 
@@ -130,7 +128,7 @@ func TestEvent(t *testing.T) {
 		event.Set()
 	}()
 	success := event.WaitForSet(30 * time.Second)
-	assert.Equal(t, true, success)
+	AssertEqual(t, true, success)
 }
 
 func TestMinTime(t *testing.T) {
@@ -146,7 +144,7 @@ func TestMinTime(t *testing.T) {
 	})
 
 	foundA := MinTime(bs[0], bs[1:]...)
-	assert.Equal(t, a, foundA)
+	AssertEqual(t, a, foundA)
 }
 
 func TestWeightedShuffle(t *testing.T) {
@@ -217,7 +215,7 @@ func TestWeightedShuffle(t *testing.T) {
 			if -errorThreshold <= e && e <= errorThreshold {
 				e = 0
 			}
-			assert.Equal(t, 0, e)
+			AssertEqual(t, 0, e)
 		}
 	}
 
@@ -293,7 +291,7 @@ func TestWeightedShuffleWithEntropy(t *testing.T) {
 				}
 				if expected {
 					// all must pass
-					assert.Equal(t, int64(0), e)
+					AssertEqual(t, int64(0), e)
 				} else if int64(0) != e {
 					failed = true
 				}
@@ -301,7 +299,7 @@ func TestWeightedShuffleWithEntropy(t *testing.T) {
 			if !expected {
 				// at least one of the comparisons must have failed
 				// not all must fail
-				assert.Equal(t, true, failed)
+				AssertEqual(t, true, failed)
 			}
 		}
 

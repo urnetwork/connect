@@ -7,8 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-playground/assert/v2"
-
 	"github.com/urnetwork/connect/protocol"
 )
 
@@ -73,7 +71,7 @@ func TestControlSyncOobRetryUntilSuccess(t *testing.T) {
 
 	makeFrame := func(index uint32) *protocol.Frame {
 		frame, err := ToFrame(&protocol.SimpleMessage{MessageIndex: index}, DefaultProtocolVersion)
-		assert.Equal(t, err, nil)
+		AssertEqual(t, err, nil)
 		return frame
 	}
 
@@ -102,20 +100,20 @@ func TestControlSyncOobRetryUntilSuccess(t *testing.T) {
 
 	select {
 	case err := <-ackCh:
-		assert.Equal(t, err, nil)
+		AssertEqual(t, err, nil)
 	case <-time.After(10 * time.Second):
 		t.Fatal("oob ack did not fire")
 	}
 
 	// 3 failures + 1 success
-	assert.Equal(t, oob.attemptCount(), 4)
+	AssertEqual(t, oob.attemptCount(), 4)
 
 	// the ack fires exactly once
 	select {
 	case <-time.After(500 * time.Millisecond):
 	}
 	ackLock.Lock()
-	assert.Equal(t, ackCount, 1)
+	AssertEqual(t, ackCount, 1)
 	ackLock.Unlock()
 }
 
@@ -127,7 +125,7 @@ func TestControlSyncOobImmediateSuccess(t *testing.T) {
 
 	makeFrame := func(index uint32) *protocol.Frame {
 		frame, err := ToFrame(&protocol.SimpleMessage{MessageIndex: index}, DefaultProtocolVersion)
-		assert.Equal(t, err, nil)
+		AssertEqual(t, err, nil)
 		return frame
 	}
 
@@ -151,11 +149,11 @@ func TestControlSyncOobImmediateSuccess(t *testing.T) {
 
 	select {
 	case err := <-ackCh:
-		assert.Equal(t, err, nil)
+		AssertEqual(t, err, nil)
 	case <-time.After(5 * time.Second):
 		t.Fatal("oob ack did not fire")
 	}
-	assert.Equal(t, oob.attemptCount(), 1)
+	AssertEqual(t, oob.attemptCount(), 1)
 }
 
 // a newer Send for the same scope supersedes an older one still retrying
@@ -166,7 +164,7 @@ func TestControlSyncOobLatestSupersedes(t *testing.T) {
 
 	makeFrame := func(index uint32) *protocol.Frame {
 		frame, err := ToFrame(&protocol.SimpleMessage{MessageIndex: index}, DefaultProtocolVersion)
-		assert.Equal(t, err, nil)
+		AssertEqual(t, err, nil)
 		return frame
 	}
 
@@ -207,7 +205,7 @@ func TestControlSyncOobLatestSupersedes(t *testing.T) {
 
 	select {
 	case err := <-secondAcked:
-		assert.Equal(t, err, nil)
+		AssertEqual(t, err, nil)
 	case <-time.After(5 * time.Second):
 		t.Fatal("second oob ack did not fire")
 	}
@@ -228,7 +226,7 @@ func TestControlSyncOobCloseStopsRetries(t *testing.T) {
 
 	makeFrame := func(index uint32) *protocol.Frame {
 		frame, err := ToFrame(&protocol.SimpleMessage{MessageIndex: index}, DefaultProtocolVersion)
-		assert.Equal(t, err, nil)
+		AssertEqual(t, err, nil)
 		return frame
 	}
 
@@ -254,7 +252,7 @@ func TestControlSyncOobCloseStopsRetries(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 	attemptsBefore := oob.attemptCount()
-	assert.Equal(t, 0 < attemptsBefore, true)
+	AssertEqual(t, 0 < attemptsBefore, true)
 
 	cs.Close()
 
@@ -264,7 +262,7 @@ func TestControlSyncOobCloseStopsRetries(t *testing.T) {
 	// retries stop promptly (allow a couple of in-flight attempts at close,
 	// but not the ~30 that would accrue over the wait if it kept retrying)
 	attemptsAfter := oob.attemptCount()
-	assert.Equal(t, attemptsAfter <= attemptsBefore+2, true)
+	AssertEqual(t, attemptsAfter <= attemptsBefore+2, true)
 
 	// it never acked (always failing)
 	select {

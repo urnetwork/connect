@@ -4,8 +4,6 @@ import (
 	"context"
 	"testing"
 	"time"
-
-	"github.com/go-playground/assert/v2"
 )
 
 func TestContractStatsEvents(t *testing.T) {
@@ -36,7 +34,7 @@ func TestContractStatsEvents(t *testing.T) {
 		select {
 		case events := <-eventsChannel:
 			// the test drives one contract, so each epoch has at most one event
-			assert.Equal(t, 1, len(events))
+			AssertEqual(t, 1, len(events))
 			return events[0]
 		case <-time.After(5 * time.Second):
 			t.Fatal("timeout waiting for contract stats events")
@@ -46,25 +44,25 @@ func TestContractStatsEvents(t *testing.T) {
 
 	// the initial event for the open contract
 	event := nextEvent()
-	assert.Equal(t, contractId, event.ContractId)
-	assert.Equal(t, false, event.Receive)
-	assert.Equal(t, true, event.Companion)
-	assert.Equal(t, path, event.Path)
-	assert.Equal(t, ByteCount(1000), event.TransferByteCount)
-	assert.Equal(t, ByteCount(0), event.UsedByteCount)
-	assert.Equal(t, true, event.Open)
+	AssertEqual(t, contractId, event.ContractId)
+	AssertEqual(t, false, event.Receive)
+	AssertEqual(t, true, event.Companion)
+	AssertEqual(t, path, event.Path)
+	AssertEqual(t, ByteCount(1000), event.TransferByteCount)
+	AssertEqual(t, ByteCount(0), event.UsedByteCount)
+	AssertEqual(t, true, event.Open)
 
 	// ongoing usage is reported with deltas
 	entry.updateUsedByteCount(100)
 	event = nextEvent()
-	assert.Equal(t, ByteCount(100), event.UsedByteCount)
-	assert.Equal(t, ByteCount(100), event.UsedByteCountDelta)
-	assert.Equal(t, true, event.Open)
+	AssertEqual(t, ByteCount(100), event.UsedByteCount)
+	AssertEqual(t, ByteCount(100), event.UsedByteCountDelta)
+	AssertEqual(t, true, event.Open)
 
 	entry.updateUsedByteCount(250)
 	event = nextEvent()
-	assert.Equal(t, ByteCount(250), event.UsedByteCount)
-	assert.Equal(t, ByteCount(150), event.UsedByteCountDelta)
+	AssertEqual(t, ByteCount(250), event.UsedByteCount)
+	AssertEqual(t, ByteCount(150), event.UsedByteCountDelta)
 
 	// no change, no event
 	select {
@@ -76,13 +74,13 @@ func TestContractStatsEvents(t *testing.T) {
 	// close emits a final closed event and removes the entry
 	contractManager.CloseContract(contractId, 250, 0)
 	event = nextEvent()
-	assert.Equal(t, false, event.Open)
-	assert.Equal(t, ByteCount(250), event.UsedByteCount)
+	AssertEqual(t, false, event.Open)
+	AssertEqual(t, ByteCount(250), event.UsedByteCount)
 
 	func() {
 		contractManager.contractStatsLock.Lock()
 		defer contractManager.contractStatsLock.Unlock()
-		assert.Equal(t, 0, len(contractManager.contractStatsEntries))
+		AssertEqual(t, 0, len(contractManager.contractStatsEntries))
 	}()
 }
 
@@ -103,6 +101,6 @@ func TestContractStatsCloseWithoutListeners(t *testing.T) {
 	func() {
 		contractManager.contractStatsLock.Lock()
 		defer contractManager.contractStatsLock.Unlock()
-		assert.Equal(t, 0, len(contractManager.contractStatsEntries))
+		AssertEqual(t, 0, len(contractManager.contractStatsEntries))
 	}()
 }

@@ -8,11 +8,12 @@ import (
 	"io"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
-	"golang.org/x/exp/maps"
+	"maps"
 
 	"google.golang.org/protobuf/proto"
 )
@@ -153,7 +154,7 @@ func poolStats(pools []*messagePool) {
 					func() {
 						debugStateLock.Lock()
 						defer debugStateLock.Unlock()
-						caller = strings.Join(maps.Keys(tagCallers[uint8(tag)]), "/")
+						caller = strings.Join(slices.Collect(maps.Keys(tagCallers[uint8(tag)])), "/")
 					}()
 
 					DefaultLogger().Infof("pool[%d] tag=%d [%s] r=%d/t=%d/c=%d = %.2f%% return / %.2f%% reuse\n", pool.size, tag, caller, returned, taken, created, 100*ratio, 100*reuse)

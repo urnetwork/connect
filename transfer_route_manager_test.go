@@ -7,8 +7,6 @@ import (
 	"slices"
 	"testing"
 	"time"
-
-	"github.com/go-playground/assert/v2"
 )
 
 func TestMultiRoute(t *testing.T) {
@@ -77,12 +75,12 @@ func TestMultiRoute(t *testing.T) {
 
 	for i := 0; i < burstSize; i += 1 {
 		b, err := multiRouteReader.Read(ctx, ReadTimeout)
-		assert.Equal(t, err, nil)
-		// assert.Equal(t, messageBytes(i), b)
+		AssertEqual(t, err, nil)
+		// AssertEqual(t, messageBytes(i), b)
 		messages = append(messages, b)
 	}
 
-	assert.Equal(t, burstSize, len(messages))
+	AssertEqual(t, burstSize, len(messages))
 
 	littleEndianCmp := func(a []byte, b []byte) int {
 		if len(a) < len(b) {
@@ -105,7 +103,7 @@ func TestMultiRoute(t *testing.T) {
 	}
 	slices.SortStableFunc(messages, littleEndianCmp)
 	for i := 0; i < burstSize; i += 1 {
-		assert.Equal(t, messageBytes(i), messages[i])
+		AssertEqual(t, messageBytes(i), messages[i])
 	}
 
 	for sendTransport, _ := range sendTransports {

@@ -19,7 +19,7 @@ import (
 	// "github.com/google/gopacket"
 	// "github.com/google/gopacket/layers"
 
-	"golang.org/x/exp/maps"
+	"maps"
 
 	// "google.golang.org/protobuf/proto"
 

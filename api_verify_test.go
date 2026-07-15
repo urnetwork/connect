@@ -7,8 +7,6 @@ package connect
 import (
 	"encoding/json"
 	"testing"
-
-	"github.com/go-playground/assert/v2"
 )
 
 // TestVerifyKeysResultJson pins the `GET /verify/keys` result shape:
@@ -23,15 +21,15 @@ func TestVerifyKeysResultJson(t *testing.T) {
 		},
 	}
 	keysResultJson, err := json.Marshal(keysResult)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 	expectedJson := `{"keys":[{"server_key_id":7,"public_key":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="}]}`
-	assert.Equal(t, expectedJson, string(keysResultJson))
+	AssertEqual(t, expectedJson, string(keysResultJson))
 
 	var parsedKeysResult VerifyKeysResult
 	err = json.Unmarshal(keysResultJson, &parsedKeysResult)
-	assert.Equal(t, nil, err)
-	assert.Equal(t, 1, len(parsedKeysResult.Keys))
-	assert.Equal(t, *keysResult.Keys[0], *parsedKeysResult.Keys[0])
+	AssertEqual(t, nil, err)
+	AssertEqual(t, 1, len(parsedKeysResult.Keys))
+	AssertEqual(t, *keysResult.Keys[0], *parsedKeysResult.Keys[0])
 }
 
 // TestSnSetWalletJson pins the `POST /sn/wallet` args/result shapes,
@@ -41,34 +39,34 @@ func TestSnSetWalletJson(t *testing.T) {
 		ColdkeySs58: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
 	}
 	setWalletArgsJson, err := json.Marshal(setWalletArgs)
-	assert.Equal(t, nil, err)
-	assert.Equal(
+	AssertEqual(t, nil, err)
+	AssertEqual(
 		t,
 		`{"coldkey_ss58":"5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"}`,
 		string(setWalletArgsJson),
 	)
 	var parsedSetWalletArgs SnSetWalletArgs
 	err = json.Unmarshal(setWalletArgsJson, &parsedSetWalletArgs)
-	assert.Equal(t, nil, err)
-	assert.Equal(t, *setWalletArgs, parsedSetWalletArgs)
+	AssertEqual(t, nil, err)
+	AssertEqual(t, *setWalletArgs, parsedSetWalletArgs)
 
 	// empty result omits the error
 	emptyResultJson, err := json.Marshal(&SnSetWalletResult{})
-	assert.Equal(t, nil, err)
-	assert.Equal(t, `{}`, string(emptyResultJson))
+	AssertEqual(t, nil, err)
+	AssertEqual(t, `{}`, string(emptyResultJson))
 
 	errorResultJson, err := json.Marshal(&SnSetWalletResult{
 		Error: &SnSetWalletError{
 			Message: "invalid ss58",
 		},
 	})
-	assert.Equal(t, nil, err)
-	assert.Equal(t, `{"error":{"message":"invalid ss58"}}`, string(errorResultJson))
+	AssertEqual(t, nil, err)
+	AssertEqual(t, `{"error":{"message":"invalid ss58"}}`, string(errorResultJson))
 
 	var parsedErrorResult SnSetWalletResult
 	err = json.Unmarshal(errorResultJson, &parsedErrorResult)
-	assert.Equal(t, nil, err)
-	assert.Equal(t, "invalid ss58", parsedErrorResult.Error.Message)
+	AssertEqual(t, nil, err)
+	AssertEqual(t, "invalid ss58", parsedErrorResult.Error.Message)
 }
 
 // TestSnPoolClaimJson round-trips the `GET /sn/pool/claim` args and result
@@ -78,8 +76,8 @@ func TestSnPoolClaimJson(t *testing.T) {
 		Epoch: 42,
 	}
 	poolClaimArgsJson, err := json.Marshal(poolClaimArgs)
-	assert.Equal(t, nil, err)
-	assert.Equal(t, `{"epoch":42}`, string(poolClaimArgsJson))
+	AssertEqual(t, nil, err)
+	AssertEqual(t, `{"epoch":42}`, string(poolClaimArgsJson))
 
 	poolClaimResult := &SnPoolClaimResult{
 		Epoch:    42,
@@ -96,11 +94,11 @@ func TestSnPoolClaimJson(t *testing.T) {
 		ClaimOpenBlock:  123456,
 	}
 	poolClaimResultJson, err := json.Marshal(poolClaimResult)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 	var parsedPoolClaimResult SnPoolClaimResult
 	err = json.Unmarshal(poolClaimResultJson, &parsedPoolClaimResult)
-	assert.Equal(t, nil, err)
-	assert.Equal(t, *poolClaimResult, parsedPoolClaimResult)
+	AssertEqual(t, nil, err)
+	AssertEqual(t, *poolClaimResult, parsedPoolClaimResult)
 }
 
 // TestSnEpochResultJson pins the `GET /sn/epoch` result wire names and
@@ -117,7 +115,7 @@ func TestSnEpochResultJson(t *testing.T) {
 		ContractAddress:     "0x00000000000000000000000000000000000009c4",
 	}
 	epochResultJson, err := json.Marshal(epochResult)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 	expectedJson := `{"epoch":42,` +
 		`"start_block":1000000,` +
 		`"commit_deadline_block":1001200,` +
@@ -126,10 +124,10 @@ func TestSnEpochResultJson(t *testing.T) {
 		`"t_epoch_blocks":14400,` +
 		`"chain_id":964,` +
 		`"contract_address":"0x00000000000000000000000000000000000009c4"}`
-	assert.Equal(t, expectedJson, string(epochResultJson))
+	AssertEqual(t, expectedJson, string(epochResultJson))
 
 	var parsedEpochResult SnEpochResult
 	err = json.Unmarshal(epochResultJson, &parsedEpochResult)
-	assert.Equal(t, nil, err)
-	assert.Equal(t, *epochResult, parsedEpochResult)
+	AssertEqual(t, nil, err)
+	AssertEqual(t, *epochResult, parsedEpochResult)
 }

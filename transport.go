@@ -17,7 +17,7 @@ import (
 	"time"
 	// "runtime/debug"
 
-	"golang.org/x/exp/maps"
+	"maps"
 
 	"github.com/gorilla/websocket"
 	quic "github.com/quic-go/quic-go"
@@ -398,7 +398,7 @@ func (self *PlatformTransport) run() {
 		// (h3 and h1 do), and `maps.Keys` is randomly ordered, so the election
 		// picked an arbitrary winner among tied modes on every pass — flipping
 		// the active mode and thrashing the gates. break ties on the mode name
-		orderedModes := maps.Keys(transportModePreferences)
+		orderedModes := slices.Collect(maps.Keys(transportModePreferences))
 		slices.SortFunc(orderedModes, func(a TransportMode, b TransportMode) int {
 			preferenceA := modePreference(a)
 			preferenceB := modePreference(b)

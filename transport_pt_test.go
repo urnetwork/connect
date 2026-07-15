@@ -28,8 +28,6 @@ import (
 	quic "github.com/quic-go/quic-go"
 
 	"testing"
-
-	"github.com/go-playground/assert/v2"
 )
 
 func TestPtDnsEncodeDecode(t *testing.T) {
@@ -141,7 +139,7 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 				}
 
 				serverConn, err := net.ListenUDP("udp", serverAddr)
-				assert.Equal(t, err, nil)
+				AssertEqual(t, err, nil)
 				defer serverConn.Close()
 
 				serverLossConn := newPacketLossPacketConn(packetLossN, serverConn)
@@ -151,7 +149,7 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 				// settings.DnsAddr = serverAddr
 
 				serverPtConn, err := NewPacketTranslationWithPrefix(handleCtx, serverPtMode, serverLossConn, serverPtSettings, headerPrefix)
-				assert.Equal(t, err, nil)
+				AssertEqual(t, err, nil)
 				defer serverPtConn.Close()
 
 				earlyListener, err := (&quic.Transport{
@@ -160,7 +158,7 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 					// isSingleUse: true,
 				}).ListenEarly(serverTlsConfig, quicConfig)
 				// listenQuic(ctx, earlyListener)
-				assert.Equal(t, err, nil)
+				AssertEqual(t, err, nil)
 				defer earlyListener.Close()
 
 				go func() {
@@ -237,7 +235,7 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 				}
 
 				clientConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
-				assert.Equal(t, err, nil)
+				AssertEqual(t, err, nil)
 				defer clientConn.Close()
 
 				lossConn := newPacketLossPacketConn(packetLossN, clientConn)
@@ -246,7 +244,7 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 				ptSettings.DnsTlds = [][]byte{tld}
 				// ptSettings.DnsAddr = serverAddr
 				ptConn, err := NewPacketTranslationWithPrefix(handleCtx, clientPtMode, lossConn, ptSettings, headerPrefix)
-				assert.Equal(t, err, nil)
+				AssertEqual(t, err, nil)
 				defer ptConn.Close()
 
 				quicTransport := &quic.Transport{
@@ -257,10 +255,10 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 
 				// enable 0rtt if possible
 				conn, err := quicTransport.DialEarly(handleCtx, serverAddr, clientTlsConfig, quicConfig)
-				assert.Equal(t, err, nil)
+				AssertEqual(t, err, nil)
 
 				stream, err := conn.OpenStream()
-				assert.Equal(t, err, nil)
+				AssertEqual(t, err, nil)
 
 				writeCtx, writeCancel := context.WithCancel(handleCtx)
 				go func() {
@@ -295,7 +293,7 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 						reportErr(fmt.Errorf("client read: %w", err))
 						return false
 					}
-					// assert.Equal(t, err, nil)
+					// AssertEqual(t, err, nil)
 					readData = append(readData, buf[:m]...)
 
 					// fmt.Printf("read[%d]\n", m)

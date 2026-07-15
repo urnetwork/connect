@@ -3172,8 +3172,9 @@ components:
                 type: integer
               clients_last_24h:
                 type: integer
-              provide_mode:
-                $ref: "#/components/schemas/ProvideMode"
+              # provide_mode was speced but never implemented by the live-query
+              # stats rework (model.ProviderStats); removed 2026-07-15 to match
+              # the implementation (spec conformance test)
 
     StatsProviderArgs:
       type: object

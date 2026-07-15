@@ -3,8 +3,6 @@ package connect
 import (
 	mathrand "math/rand"
 	"testing"
-
-	"github.com/go-playground/assert/v2"
 )
 
 func TestTransferQueue(t *testing.T) {
@@ -24,8 +22,8 @@ func TestTransferQueue(t *testing.T) {
 	})
 
 	size, byteSize := queue.QueueSize()
-	assert.Equal(t, 0, size)
-	assert.Equal(t, ByteCount(0), byteSize)
+	AssertEqual(t, 0, size)
+	AssertEqual(t, ByteCount(0), byteSize)
 
 	n := 100
 
@@ -54,30 +52,30 @@ func TestTransferQueue(t *testing.T) {
 
 	for sequenceNumber, messageId := range sequenceNumberMessageIds {
 		item := queue.GetByMessageId(messageId)
-		assert.NotEqual(t, item, nil)
-		assert.Equal(t, sequenceNumber, item.sequenceNumber)
+		AssertNotEqual(t, item, nil)
+		AssertEqual(t, sequenceNumber, item.sequenceNumber)
 	}
 
 	for sequenceNumber, messageId := range sequenceNumberMessageIds {
 		item := queue.GetBySequenceNumber(sequenceNumber)
-		assert.NotEqual(t, item, nil)
-		assert.Equal(t, messageId, item.messageId)
+		AssertNotEqual(t, item, nil)
+		AssertEqual(t, messageId, item.messageId)
 	}
 
 	for i := 0; i < n; i += 1 {
 		size, byteSize = queue.QueueSize()
-		assert.Equal(t, n-i, size)
-		assert.Equal(t, ByteCount(n-i), byteSize)
+		AssertEqual(t, n-i, size)
+		AssertEqual(t, ByteCount(n-i), byteSize)
 
-		assert.Equal(t, uint64(i), queue.PeekFirst().sequenceNumber)
-		assert.Equal(t, uint64(n-1), queue.PeekLast().sequenceNumber)
+		AssertEqual(t, uint64(i), queue.PeekFirst().sequenceNumber)
+		AssertEqual(t, uint64(n-1), queue.PeekLast().sequenceNumber)
 
 		first := queue.RemoveFirst()
-		assert.Equal(t, uint64(i), first.sequenceNumber)
+		AssertEqual(t, uint64(i), first.sequenceNumber)
 	}
 	size, byteSize = queue.QueueSize()
-	assert.Equal(t, 0, size)
-	assert.Equal(t, ByteCount(0), byteSize)
+	AssertEqual(t, 0, size)
+	AssertEqual(t, ByteCount(0), byteSize)
 
 	// add a bunch and test peekFirst, peekLast
 	// remove by id
@@ -90,19 +88,19 @@ func TestTransferQueue(t *testing.T) {
 
 	for i := 0; i < n; i += 1 {
 		size, byteSize = queue.QueueSize()
-		assert.Equal(t, n-i, size)
-		assert.Equal(t, ByteCount(n-i), byteSize)
+		AssertEqual(t, n-i, size)
+		AssertEqual(t, ByteCount(n-i), byteSize)
 
-		assert.Equal(t, uint64(i), queue.PeekFirst().sequenceNumber)
-		assert.Equal(t, uint64(n-1), queue.PeekLast().sequenceNumber)
+		AssertEqual(t, uint64(i), queue.PeekFirst().sequenceNumber)
+		AssertEqual(t, uint64(n-1), queue.PeekLast().sequenceNumber)
 
 		messageId := sequenceNumberMessageIds[uint64(i)]
 		first := queue.RemoveByMessageId(messageId)
-		assert.Equal(t, uint64(i), first.sequenceNumber)
+		AssertEqual(t, uint64(i), first.sequenceNumber)
 	}
 	size, byteSize = queue.QueueSize()
-	assert.Equal(t, 0, size)
-	assert.Equal(t, ByteCount(0), byteSize)
+	AssertEqual(t, 0, size)
+	AssertEqual(t, ByteCount(0), byteSize)
 
 	// add a bunch and test peekFirst, peekLast
 	// remove by sequence number
@@ -115,17 +113,17 @@ func TestTransferQueue(t *testing.T) {
 
 	for i := 0; i < n; i += 1 {
 		size, byteSize = queue.QueueSize()
-		assert.Equal(t, n-i, size)
-		assert.Equal(t, ByteCount(n-i), byteSize)
+		AssertEqual(t, n-i, size)
+		AssertEqual(t, ByteCount(n-i), byteSize)
 
-		assert.Equal(t, uint64(i), queue.PeekFirst().sequenceNumber)
-		assert.Equal(t, uint64(n-1), queue.PeekLast().sequenceNumber)
+		AssertEqual(t, uint64(i), queue.PeekFirst().sequenceNumber)
+		AssertEqual(t, uint64(n-1), queue.PeekLast().sequenceNumber)
 
 		first := queue.RemoveBySequenceNumber(uint64(i))
-		assert.Equal(t, uint64(i), first.sequenceNumber)
+		AssertEqual(t, uint64(i), first.sequenceNumber)
 	}
 	size, byteSize = queue.QueueSize()
-	assert.Equal(t, 0, size)
-	assert.Equal(t, ByteCount(0), byteSize)
+	AssertEqual(t, 0, size)
+	AssertEqual(t, ByteCount(0), byteSize)
 
 }

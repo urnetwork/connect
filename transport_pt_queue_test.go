@@ -8,8 +8,6 @@ import (
 	"net"
 	"testing"
 	"time"
-
-	"github.com/go-playground/assert/v2"
 )
 
 func TestCombine(t *testing.T) {
@@ -94,20 +92,20 @@ func TestCombine(t *testing.T) {
 
 		for _, a := range as {
 			out, limit, err := cq.Combine(addrA, a.header, MessagePoolCopy(a.data))
-			assert.Equal(t, err, nil)
-			assert.Equal(t, limit, false)
-			assert.Equal(t, out, nil)
+			AssertEqual(t, err, nil)
+			AssertEqual(t, limit, false)
+			AssertEqual(t, out, nil)
 		}
 
 		for _, b := range bs {
 			out, limit, err := cq.Combine(addrB, b.header, MessagePoolCopy(b.data))
-			assert.Equal(t, err, nil)
-			assert.Equal(t, limit, false)
+			AssertEqual(t, err, nil)
+			AssertEqual(t, limit, false)
 
-			assert.Equal(t, out.addr, addrB)
+			AssertEqual(t, out.addr, addrB)
 			m := keyLens[[17]byte(b.header[:])]
-			assert.Equal(t, len(out.data), 4*m)
-			assert.Equal(t, out.data, consecutive(m))
+			AssertEqual(t, len(out.data), 4*m)
+			AssertEqual(t, out.data, consecutive(m))
 		}
 	}
 
@@ -143,9 +141,9 @@ func TestCombineTrim(t *testing.T) {
 			data := make([]byte, 16+mathrand.Intn(1024))
 			mathrand.Read(data)
 			out, limit, err := cq.Combine(addr, header, data)
-			assert.Equal(t, err, nil)
-			assert.Equal(t, limit, false)
-			assert.Equal(t, out, nil)
+			AssertEqual(t, err, nil)
+			AssertEqual(t, limit, false)
+			AssertEqual(t, out, nil)
 		}
 
 		batchTimes[i] = time.Now()
@@ -159,12 +157,12 @@ func TestCombineTrim(t *testing.T) {
 		for _, n := range batchCounts[i:] {
 			c += n
 		}
-		assert.Equal(t, cq.Len(), c)
+		AssertEqual(t, cq.Len(), c)
 
 		cq.RemoveOlder(batchTimes[i])
 	}
 
-	assert.Equal(t, cq.Len(), 0)
+	AssertEqual(t, cq.Len(), 0)
 
 	// pump beyond the limits
 	for i := range 4 * settings.DnsMaxCombine {
@@ -181,11 +179,11 @@ func TestCombineTrim(t *testing.T) {
 		data := make([]byte, 16+mathrand.Intn(1024))
 		mathrand.Read(data)
 		out, limit, err := cq.Combine(addr, header, data)
-		assert.Equal(t, err, nil)
-		assert.Equal(t, limit, settings.DnsMaxCombine <= i)
-		assert.Equal(t, out, nil)
+		AssertEqual(t, err, nil)
+		AssertEqual(t, limit, settings.DnsMaxCombine <= i)
+		AssertEqual(t, out, nil)
 	}
-	assert.Equal(t, int64(cq.Len()), settings.DnsMaxCombine)
+	AssertEqual(t, int64(cq.Len()), settings.DnsMaxCombine)
 
 }
 
@@ -213,7 +211,7 @@ func TestPump(t *testing.T) {
 			tld:    tld,
 		}
 		limit := pq.Add(item)
-		assert.Equal(t, limit, false)
+		AssertEqual(t, limit, false)
 		added = append(added, item)
 	}
 
@@ -223,7 +221,7 @@ func TestPump(t *testing.T) {
 			Port: 8081 + j,
 		}
 		lastItem := pq.RemoveLast(otherAddr)
-		assert.Equal(t, lastItem, nil)
+		AssertEqual(t, lastItem, nil)
 	}
 
 	for i := range settings.DnsMaxPumpHostsPerAddress {
@@ -239,17 +237,17 @@ func TestPump(t *testing.T) {
 			tld:    tld,
 		}
 		limit := pq.Add(item)
-		assert.Equal(t, limit, true)
+		AssertEqual(t, limit, true)
 		// not added
 	}
 
 	for i := len(added) - 1; 0 <= i; i -= 1 {
 		item := added[i]
 		lastItem := pq.RemoveLast(addr)
-		assert.Equal(t, lastItem.addr, item.addr)
-		assert.Equal(t, lastItem.id, item.id)
-		assert.Equal(t, lastItem.header, item.header)
-		assert.Equal(t, lastItem.tld, item.tld)
+		AssertEqual(t, lastItem.addr, item.addr)
+		AssertEqual(t, lastItem.id, item.id)
+		AssertEqual(t, lastItem.header, item.header)
+		AssertEqual(t, lastItem.tld, item.tld)
 	}
 
 	// add n random items
@@ -295,7 +293,7 @@ func TestPumpTrim(t *testing.T) {
 				tld:    tld,
 			}
 			limit := pq.Add(item)
-			assert.Equal(t, limit, false)
+			AssertEqual(t, limit, false)
 		}
 
 		batchTimes[i] = time.Now()
@@ -309,12 +307,12 @@ func TestPumpTrim(t *testing.T) {
 		for _, n := range batchCounts[i:] {
 			c += n
 		}
-		assert.Equal(t, pq.Len(), c)
+		AssertEqual(t, pq.Len(), c)
 
 		pq.RemoveOlder(batchTimes[i])
 	}
 
-	assert.Equal(t, pq.Len(), 0)
+	AssertEqual(t, pq.Len(), 0)
 
 	// pump beyond the limits
 	for i := range 4 * settings.DnsMaxPumpHosts {
@@ -336,7 +334,7 @@ func TestPumpTrim(t *testing.T) {
 		}
 		limit := pq.Add(item)
 		// fmt.Printf("[%d]\n", i)
-		assert.Equal(t, limit, settings.DnsMaxPumpHosts <= i)
+		AssertEqual(t, limit, settings.DnsMaxPumpHosts <= i)
 	}
-	assert.Equal(t, int64(pq.Len()), settings.DnsMaxPumpHosts)
+	AssertEqual(t, int64(pq.Len()), settings.DnsMaxPumpHosts)
 }

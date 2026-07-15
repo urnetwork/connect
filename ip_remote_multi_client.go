@@ -15,8 +15,8 @@ import (
 	"slices"
 	"strings"
 
-	"golang.org/x/exp/maps"
 	"golang.org/x/net/publicsuffix"
+	"maps"
 
 	"google.golang.org/protobuf/proto"
 
@@ -2436,7 +2436,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 
 		destinations, err := self.generator.NextDestinations(
 			self.settings.WindowExpandBlockCount,
-			maps.Keys(windowDestinations()),
+			slices.Collect(maps.Keys(windowDestinations())),
 			self.windowType.RankMode(),
 		)
 		if err != nil {
@@ -2559,7 +2559,7 @@ func (self *multiClientWindow) resize() {
 
 		netHealthRanks := map[*multiClientChannel]int{}
 		func() {
-			orderedClients := maps.Keys(clientStats)
+			orderedClients := slices.Collect(maps.Keys(clientStats))
 			slices.SortFunc(orderedClients, func(a *multiClientChannel, b *multiClientChannel) int {
 				// descending healthy duration, net healthy duration
 				statsA := clientStats[a]
@@ -3009,7 +3009,7 @@ func (self *multiClientWindow) shuffle() {
 func (self *multiClientWindow) unorderedClients() []*multiClientChannel {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	return maps.Values(self.clients)
+	return slices.Collect(maps.Values(self.clients))
 }
 
 func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
@@ -3100,7 +3100,7 @@ func (self *multiClientWindow) statsSampleWeights(weights map[*multiClientChanne
 	// randonly sample log statistics for weights
 	if mathrand.Intn(self.settings.StatsSampleWeightsCount) == 0 {
 		// sample the weights
-		weightValues := maps.Values(weights)
+		weightValues := slices.Collect(maps.Values(weights))
 		slices.SortFunc(weightValues, func(a float32, b float32) int {
 			// descending
 			if a < b {

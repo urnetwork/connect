@@ -3,8 +3,6 @@ package connect
 import (
 	"encoding/json"
 	"testing"
-
-	"github.com/go-playground/assert/v2"
 )
 
 func TestIdOrder(t *testing.T) {
@@ -14,11 +12,11 @@ func TestIdOrder(t *testing.T) {
 	a := NewId()
 	for range 1024 * 1024 {
 		b := NewId()
-		assert.Equal(t, a.LessThan(b), true)
-		assert.Equal(t, b.LessThan(a), false)
-		assert.Equal(t, b.LessThan(b), false)
-		assert.Equal(t, b == a, false)
-		assert.Equal(t, b == b, true)
+		AssertEqual(t, a.LessThan(b), true)
+		AssertEqual(t, b.LessThan(a), false)
+		AssertEqual(t, b.LessThan(b), false)
+		AssertEqual(t, b == a, false)
+		AssertEqual(t, b == b, true)
 		a = b
 	}
 }
@@ -47,26 +45,26 @@ func TestIdJsonCodec(t *testing.T) {
 	test1.B = &b_
 
 	test1Json, err := json.Marshal(test1)
-	assert.Equal(t, err, nil)
+	AssertEqual(t, err, nil)
 
 	test2 := &Test{}
 	err = json.Unmarshal(test1Json, test2)
-	assert.Equal(t, err, nil)
+	AssertEqual(t, err, nil)
 
-	assert.Equal(t, test1.A, test2.A)
-	assert.Equal(t, test1.B, test2.B)
+	AssertEqual(t, test1.A, test2.A)
+	AssertEqual(t, test1.B, test2.B)
 
 	test3 := &Test{}
 	test3.A = NewId()
 
 	test3Json, err := json.Marshal(test3)
-	assert.Equal(t, err, nil)
+	AssertEqual(t, err, nil)
 
 	test4 := &Test{}
 	err = json.Unmarshal(test3Json, test4)
-	assert.Equal(t, err, nil)
+	AssertEqual(t, err, nil)
 
-	assert.Equal(t, test3.A, test4.A)
-	assert.Equal(t, test3.B, nil)
-	assert.Equal(t, test3.B, test4.B)
+	AssertEqual(t, test3.A, test4.A)
+	AssertEqual(t, test3.B, nil)
+	AssertEqual(t, test3.B, test4.B)
 }

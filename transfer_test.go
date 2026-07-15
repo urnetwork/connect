@@ -13,8 +13,6 @@ import (
 
 	// "google.golang.org/protobuf/proto"
 
-	"github.com/go-playground/assert/v2"
-
 	"github.com/urnetwork/connect/protocol"
 )
 
@@ -231,7 +229,7 @@ func runSendReceiveSenderReset(t *testing.T, encMode encryptionMode) {
 				bClientId,
 			),
 		)
-		assert.Equal(t, err, nil)
+		AssertEqual(t, err, nil)
 	}
 	// aReceive <- requireTransferFrameBytes(
 	// 	requireContractResultInitialPack(
@@ -256,7 +254,7 @@ func runSendReceiveSenderReset(t *testing.T, encMode encryptionMode) {
 			success := a.Send(frame, DestinationId(bClientId), func(err error) {
 				acks <- err
 			})
-			assert.Equal(t, success, true)
+			AssertEqual(t, success, true)
 		}
 	}()
 
@@ -278,10 +276,10 @@ func runSendReceiveSenderReset(t *testing.T, encMode encryptionMode) {
 			return
 		case message := <-receives:
 			receiveMessages[message.Content] = true
-			assert.Equal(t, fmt.Sprintf("hi %d", receiveCount), message.Content)
+			AssertEqual(t, fmt.Sprintf("hi %d", receiveCount), message.Content)
 			receiveCount += 1
 		case err := <-acks:
-			assert.Equal(t, err, nil)
+			AssertEqual(t, err, nil)
 			ackCount += 1
 		case <-time.After(timeout):
 			t.Fatal("Timeout.")
@@ -290,11 +288,11 @@ func runSendReceiveSenderReset(t *testing.T, encMode encryptionMode) {
 	for i := 0; i < n; i += 1 {
 		message := fmt.Sprintf("hi %d", i)
 		found := receiveMessages[message]
-		assert.Equal(t, found, true)
+		AssertEqual(t, found, true)
 	}
 
-	assert.Equal(t, n, len(receiveMessages))
-	assert.Equal(t, n, ackCount)
+	AssertEqual(t, n, len(receiveMessages))
+	AssertEqual(t, n, ackCount)
 
 	a.Cancel()
 	aRouteManager.RemoveTransport(aSendTransport)
@@ -331,7 +329,7 @@ func runSendReceiveSenderReset(t *testing.T, encMode encryptionMode) {
 				bClientId,
 			),
 		)
-		assert.Equal(t, err, nil)
+		AssertEqual(t, err, nil)
 	}
 	// aReceive <- requireTransferFrameBytes(
 	// 	requireContractResultInitialPack(
@@ -347,7 +345,7 @@ func runSendReceiveSenderReset(t *testing.T, encMode encryptionMode) {
 	select {
 	case message := <-receives:
 		// an older message was delivered
-		assert.Equal(t, message, nil)
+		AssertEqual(t, message, nil)
 	default:
 	}
 
@@ -363,7 +361,7 @@ func runSendReceiveSenderReset(t *testing.T, encMode encryptionMode) {
 			success := a2.Send(frame, DestinationId(bClientId), func(err error) {
 				acks <- err
 			})
-			assert.Equal(t, success, true)
+			AssertEqual(t, success, true)
 		}
 	}()
 
@@ -385,10 +383,10 @@ func runSendReceiveSenderReset(t *testing.T, encMode encryptionMode) {
 			return
 		case message := <-receives:
 			receiveMessages[message.Content] = true
-			assert.Equal(t, fmt.Sprintf("hi %d", receiveCount), message.Content)
+			AssertEqual(t, fmt.Sprintf("hi %d", receiveCount), message.Content)
 			receiveCount += 1
 		case err := <-acks:
-			assert.Equal(t, err, nil)
+			AssertEqual(t, err, nil)
 			ackCount += 1
 		case <-time.After(timeout):
 			t.Fatal("Timeout.")
@@ -397,13 +395,13 @@ func runSendReceiveSenderReset(t *testing.T, encMode encryptionMode) {
 	for i := 0; i < n; i += 1 {
 		message := fmt.Sprintf("hi %d", i)
 		found := receiveMessages[message]
-		assert.Equal(t, found, true)
+		AssertEqual(t, found, true)
 	}
 
 	fmt.Printf("[2] done\n")
 
-	assert.Equal(t, n, len(receiveMessages))
-	assert.Equal(t, n, ackCount)
+	AssertEqual(t, n, len(receiveMessages))
+	AssertEqual(t, n, ackCount)
 
 	a2.Cancel()
 	b.Cancel()
@@ -651,25 +649,25 @@ func TestVerifyPeerCertificateAgainstContract(t *testing.T) {
 
 	// no commitment in the contract -> verification is skipped, no error
 	ok, err := verifyPeerCertificateAgainstContract([]*x509.Certificate{leaf}, nil)
-	assert.Equal(t, err, nil)
-	assert.Equal(t, ok, true)
+	AssertEqual(t, err, nil)
+	AssertEqual(t, ok, true)
 
 	// matching commitment -> success
 	ok, err = verifyPeerCertificateAgainstContract([]*x509.Certificate{leaf}, [][]byte{leafPem})
-	assert.Equal(t, err, nil)
-	assert.Equal(t, ok, true)
+	AssertEqual(t, err, nil)
+	AssertEqual(t, ok, true)
 
 	// mismatched commitment -> failure
 	otherCert, _ := generateSequenceTlsCertificate()
 	otherLeafPem := pemEncodeCertificate(otherCert.Leaf.Raw)
 	ok, err = verifyPeerCertificateAgainstContract([]*x509.Certificate{leaf}, [][]byte{otherLeafPem})
-	assert.NotEqual(t, err, nil)
-	assert.Equal(t, ok, false)
+	AssertNotEqual(t, err, nil)
+	AssertEqual(t, ok, false)
 
 	// peer presented no cert but contract has a commitment -> failure
 	ok, err = verifyPeerCertificateAgainstContract(nil, [][]byte{leafPem})
-	assert.NotEqual(t, err, nil)
-	assert.Equal(t, ok, false)
+	AssertNotEqual(t, err, nil)
+	AssertEqual(t, ok, false)
 }
 
 func pemEncodeCertificate(der []byte) []byte {

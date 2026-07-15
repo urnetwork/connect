@@ -17,8 +17,6 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 
-	"github.com/go-playground/assert/v2"
-
 	"github.com/urnetwork/connect/protocol"
 )
 
@@ -43,11 +41,11 @@ type PacketGeneratorFunction func(int, int, int, int) ([]byte, []byte)
 func TestUdp4Path(t *testing.T) {
 	packet, _ := udp4Packet(1, 1, 1, 1)
 	ipPath, err := ParseIpPath(packet)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 
-	assert.Equal(t, IpProtocolUdp, ipPath.Protocol)
+	AssertEqual(t, IpProtocolUdp, ipPath.Protocol)
 
-	assert.Equal(t, &IpPath{
+	AssertEqual(t, &IpPath{
 		Version:         4,
 		Protocol:        IpProtocolUdp,
 		SourceIp:        net.IPv4(byte(72), byte(0), byte(0), byte(1)).To4(),
@@ -57,7 +55,7 @@ func TestUdp4Path(t *testing.T) {
 	}, ipPath)
 
 	ip4Path := ipPath.ToIp4Path()
-	assert.Equal(t, Ip4Path{
+	AssertEqual(t, Ip4Path{
 		Protocol:        IpProtocolUdp,
 		SourceIp:        [4]byte(net.IPv4(byte(72), byte(0), byte(0), byte(1)).To4()),
 		SourcePort:      40000 + 1,
@@ -69,11 +67,11 @@ func TestUdp4Path(t *testing.T) {
 func TestTcp4Path(t *testing.T) {
 	packet, _ := tcp4Packet(1, 1, 1, 1)
 	ipPath, err := ParseIpPath(packet)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 
-	assert.Equal(t, IpProtocolTcp, ipPath.Protocol)
+	AssertEqual(t, IpProtocolTcp, ipPath.Protocol)
 
-	assert.Equal(t, &IpPath{
+	AssertEqual(t, &IpPath{
 		Version:         4,
 		Protocol:        IpProtocolTcp,
 		SourceIp:        net.IPv4(byte(72), byte(0), byte(0), byte(1)).To4(),
@@ -83,7 +81,7 @@ func TestTcp4Path(t *testing.T) {
 	}, ipPath)
 
 	ip4Path := ipPath.ToIp4Path()
-	assert.Equal(t, Ip4Path{
+	AssertEqual(t, Ip4Path{
 		Protocol:        IpProtocolTcp,
 		SourceIp:        [4]byte(net.IPv4(byte(72), byte(0), byte(0), byte(1)).To4()),
 		SourcePort:      40000 + 1,
@@ -95,11 +93,11 @@ func TestTcp4Path(t *testing.T) {
 func TestUdp6Path(t *testing.T) {
 	packet, _ := udp6Packet(1, 1, 1, 1)
 	ipPath, err := ParseIpPath(packet)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 
-	assert.Equal(t, IpProtocolUdp, ipPath.Protocol)
+	AssertEqual(t, IpProtocolUdp, ipPath.Protocol)
 
-	assert.Equal(t, &IpPath{
+	AssertEqual(t, &IpPath{
 		Version:         6,
 		Protocol:        IpProtocolUdp,
 		SourceIp:        net.IPv4(byte(72), byte(0), byte(0), byte(1)).To16(),
@@ -109,7 +107,7 @@ func TestUdp6Path(t *testing.T) {
 	}, ipPath)
 
 	ip6Path := ipPath.ToIp6Path()
-	assert.Equal(t, Ip6Path{
+	AssertEqual(t, Ip6Path{
 		Protocol:        IpProtocolUdp,
 		SourceIp:        [16]byte(net.IPv4(byte(72), byte(0), byte(0), byte(1)).To16()),
 		SourcePort:      40000 + 1,
@@ -121,11 +119,11 @@ func TestUdp6Path(t *testing.T) {
 func TestTcp6Path(t *testing.T) {
 	packet, _ := tcp6Packet(1, 1, 1, 1)
 	ipPath, err := ParseIpPath(packet)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 
-	assert.Equal(t, IpProtocolTcp, ipPath.Protocol)
+	AssertEqual(t, IpProtocolTcp, ipPath.Protocol)
 
-	assert.Equal(t, &IpPath{
+	AssertEqual(t, &IpPath{
 		Version:         6,
 		Protocol:        IpProtocolTcp,
 		SourceIp:        net.IPv4(byte(72), byte(0), byte(0), byte(1)).To16(),
@@ -135,7 +133,7 @@ func TestTcp6Path(t *testing.T) {
 	}, ipPath)
 
 	ip6Path := ipPath.ToIp6Path()
-	assert.Equal(t, Ip6Path{
+	AssertEqual(t, Ip6Path{
 		Protocol:        IpProtocolTcp,
 		SourceIp:        [16]byte(net.IPv4(byte(72), byte(0), byte(0), byte(1)).To16()),
 		SourcePort:      40000 + 1,
@@ -330,7 +328,7 @@ func testClient[P comparable](
 	}
 
 	natClient, err := userNatClientGenerator(ctx, providerClient, receivePacketCallback)
-	assert.Equal(t, err, nil)
+	AssertEqual(t, err, nil)
 
 	providerClient.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, peer Peer) {
 		// cMutex.Lock()
@@ -357,7 +355,7 @@ func testClient[P comparable](
 			}
 
 			success := providerClient.SendWithTimeout(frame, source.Reverse(), func(err error) {}, -1)
-			assert.Equal(t, true, success)
+			AssertEqual(t, true, success)
 
 			// cMutex.Lock()
 			// cSendCount += 1
@@ -403,7 +401,7 @@ func testClient[P comparable](
 								if !success {
 									fmt.Printf("[TIMEOUT][%d] %T\n", packetCount, natClient)
 								}
-								assert.Equal(t, true, success)
+								AssertEqual(t, true, success)
 
 								// cMutex.Lock()
 								// cSendCount += 1
@@ -429,7 +427,7 @@ func testClient[P comparable](
 			// fmt.Printf("Receive %d/%d (%.2f%%)\n", i + 1, totalCount, 100.0 * float32(i + 1) / float32(totalCount))
 
 			ipPath, payload, err := ParseIpPathWithPayload(receivePacket.packet)
-			assert.Equal(t, err, nil)
+			AssertEqual(t, err, nil)
 
 			// var payload []byte
 			// switch ipPath.Version {
@@ -484,23 +482,23 @@ func testClient[P comparable](
 
 					packet, payload := packetGenerator(s, i, j, k)
 					ipPath, err := ParseIpPath(packet)
-					assert.Equal(t, err, nil)
+					AssertEqual(t, err, nil)
 					comparableIpPath := toComparableIpPath(ipPath)
 
 					payloads := comparableIpPathPayloads[comparableIpPath]
 
 					for _, b := range payloads {
-						assert.Equal(t, b, payload)
+						AssertEqual(t, b, payload)
 					}
 
-					assert.Equal(t, parallelCount*repeatCount*(1+echoCount), len(payloads))
+					AssertEqual(t, parallelCount*repeatCount*(1+echoCount), len(payloads))
 
 					sources := comparableIpPathSources[comparableIpPath]
 
 					if 0 < echoCount {
-						assert.Equal(t, 2, len(sources))
+						AssertEqual(t, 2, len(sources))
 					} else {
-						assert.Equal(t, 1, len(sources))
+						AssertEqual(t, 1, len(sources))
 					}
 				}
 			}
@@ -562,7 +560,7 @@ func TestIpEgressTcp4(t *testing.T) {
 
 	// tcp echo server on loopback
 	echoListener, err := net.Listen("tcp4", "127.0.0.1:0")
-	assert.Equal(t, err, nil)
+	AssertEqual(t, err, nil)
 	defer echoListener.Close()
 	go HandleError(func() {
 		for {
@@ -578,7 +576,7 @@ func TestIpEgressTcp4(t *testing.T) {
 	})
 
 	tun, err := CreateTunWithDefaults(ctx)
-	assert.Equal(t, err, nil)
+	AssertEqual(t, err, nil)
 	defer tun.Close()
 
 	localUserNatSettings := DefaultLocalUserNatSettings()
@@ -639,7 +637,7 @@ func TestIpEgressTcp4(t *testing.T) {
 	for p := 0; p < parallelCount; p += 1 {
 		select {
 		case err := <-flowErrs:
-			assert.Equal(t, err, nil)
+			AssertEqual(t, err, nil)
 		case <-ctx.Done():
 			t.Fatal("timeout")
 		}
@@ -656,7 +654,7 @@ func TestIpEgressTcp4ServerClose(t *testing.T) {
 
 	// server writes one message and closes
 	serverListener, err := net.Listen("tcp4", "127.0.0.1:0")
-	assert.Equal(t, err, nil)
+	AssertEqual(t, err, nil)
 	defer serverListener.Close()
 	go HandleError(func() {
 		for {
@@ -672,7 +670,7 @@ func TestIpEgressTcp4ServerClose(t *testing.T) {
 	})
 
 	tun, err := CreateTunWithDefaults(ctx)
-	assert.Equal(t, err, nil)
+	AssertEqual(t, err, nil)
 	defer tun.Close()
 
 	localUserNatSettings := DefaultLocalUserNatSettings()
@@ -684,18 +682,18 @@ func TestIpEgressTcp4ServerClose(t *testing.T) {
 	defer removeReceiveCallback()
 
 	conn, err := tun.DialContext(ctx, "tcp", serverListener.Addr().String())
-	assert.Equal(t, err, nil)
+	AssertEqual(t, err, nil)
 	defer conn.Close()
 
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	echoPayload := make([]byte, len(closeMessage))
 	_, err = io.ReadFull(conn, echoPayload)
-	assert.Equal(t, err, nil)
-	assert.Equal(t, bytes.Equal(closeMessage, echoPayload), true)
+	AssertEqual(t, err, nil)
+	AssertEqual(t, bytes.Equal(closeMessage, echoPayload), true)
 
 	// the server close must propagate as eof
 	_, err = conn.Read(make([]byte, 1))
-	assert.Equal(t, err, io.EOF)
+	AssertEqual(t, err, io.EOF)
 }
 
 // tests that a dial to a destination that refuses the connection
@@ -706,7 +704,7 @@ func TestIpEgressTcp4ConnectFailure(t *testing.T) {
 
 	// reserve a loopback port with no listener
 	probeListener, err := net.Listen("tcp4", "127.0.0.1:0")
-	assert.Equal(t, err, nil)
+	AssertEqual(t, err, nil)
 	unusedAddr := probeListener.Addr().String()
 	probeListener.Close()
 
@@ -715,7 +713,7 @@ func TestIpEgressTcp4ConnectFailure(t *testing.T) {
 	tunSettings.DialRaceTimeout = 500 * time.Millisecond
 	tunSettings.DialTimeout = 2 * time.Second
 	tun, err := CreateTun(ctx, tunSettings)
-	assert.Equal(t, err, nil)
+	AssertEqual(t, err, nil)
 	defer tun.Close()
 
 	localUserNatSettings := DefaultLocalUserNatSettings()
@@ -727,7 +725,7 @@ func TestIpEgressTcp4ConnectFailure(t *testing.T) {
 	defer removeReceiveCallback()
 
 	_, err = tun.DialContext(ctx, "tcp", unusedAddr)
-	assert.NotEqual(t, err, nil)
+	AssertNotEqual(t, err, nil)
 }
 
 // tests udp egress through the local user nat with parallel flows.
@@ -739,7 +737,7 @@ func TestIpEgressUdp4(t *testing.T) {
 
 	// udp echo server on loopback
 	echoConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
-	assert.Equal(t, err, nil)
+	AssertEqual(t, err, nil)
 	defer echoConn.Close()
 	go HandleError(func() {
 		buffer := make([]byte, 2048)
@@ -753,7 +751,7 @@ func TestIpEgressUdp4(t *testing.T) {
 	})
 
 	tun, err := CreateTunWithDefaults(ctx)
-	assert.Equal(t, err, nil)
+	AssertEqual(t, err, nil)
 	defer tun.Close()
 
 	localUserNatSettings := DefaultLocalUserNatSettings()
@@ -804,7 +802,7 @@ func TestIpEgressUdp4(t *testing.T) {
 	for p := 0; p < parallelCount; p += 1 {
 		select {
 		case err := <-flowErrs:
-			assert.Equal(t, err, nil)
+			AssertEqual(t, err, nil)
 		case <-ctx.Done():
 			t.Fatal("timeout")
 		}
@@ -1343,7 +1341,7 @@ func TestIpPacketWriters(t *testing.T) {
 				transport,
 				gopacket.Payload(payload),
 			)
-			assert.Equal(t, err, nil)
+			AssertEqual(t, err, nil)
 			reference := make([]byte, len(buffer.Bytes()))
 			copy(reference, buffer.Bytes())
 			return reference
@@ -1375,7 +1373,7 @@ func TestIpPacketWriters(t *testing.T) {
 					ACK:     true,
 					Window:  connectionState.encodedWindowSize(),
 				}, payload)
-				assert.Equal(t, bytes.Equal(reference, packet), true)
+				AssertEqual(t, bytes.Equal(reference, packet), true)
 				MessagePoolReturn(packet)
 			}
 		}
@@ -1395,7 +1393,7 @@ func TestIpPacketWriters(t *testing.T) {
 				SrcPort: layers.UDPPort(streamState.destinationPort),
 				DstPort: layers.UDPPort(streamState.sourcePort),
 			}, payload)
-			assert.Equal(t, bytes.Equal(reference, packet), true)
+			AssertEqual(t, bytes.Equal(reference, packet), true)
 			MessagePoolReturn(packet)
 		}
 	}

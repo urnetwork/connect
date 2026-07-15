@@ -11,8 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-playground/assert/v2"
-
 	"github.com/urnetwork/connect/protocol"
 )
 
@@ -39,11 +37,11 @@ func TestWebRtc(t *testing.T) {
 	streamId := NewId()
 
 	connA, err := webRtcManagerA.NewP2pConnActive(ctx, NewTransferPath(peerIdA, peerIdB, streamId))
-	assert.Equal(t, err, nil)
+	AssertEqual(t, err, nil)
 	defer connA.Close()
 
 	connB, err := webRtcManagerB.NewP2pConnPassive(ctx, NewTransferPath(peerIdB, peerIdA, streamId))
-	assert.Equal(t, err, nil)
+	AssertEqual(t, err, nil)
 	defer connB.Close()
 
 	b := make([]byte, 1024*1024)
@@ -79,7 +77,7 @@ func TestWebRtc(t *testing.T) {
 		case <-ctx.Done():
 			t.Fatal("timeout")
 		case b2 := <-received:
-			assert.Equal(t, b, b2)
+			AssertEqual(t, b, b2)
 		}
 	}
 
@@ -112,11 +110,11 @@ func TestWebRtcMessageRoundTrip(t *testing.T) {
 	streamId := NewId()
 
 	connA, err := webRtcManagerA.NewP2pConnActive(ctx, NewTransferPath(peerIdA, peerIdB, streamId))
-	assert.Equal(t, err, nil)
+	AssertEqual(t, err, nil)
 	defer connA.Close()
 
 	connB, err := webRtcManagerB.NewP2pConnPassive(ctx, NewTransferPath(peerIdB, peerIdA, streamId))
-	assert.Equal(t, err, nil)
+	AssertEqual(t, err, nil)
 	defer connB.Close()
 
 	sizes := []int{1, 100, 255, 256, 257, 1000, int(kib(4))}
@@ -160,7 +158,7 @@ func TestWebRtcMessageRoundTrip(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("timeout waiting for frames")
 	case err := <-readErr:
-		assert.Equal(t, err, nil)
+		AssertEqual(t, err, nil)
 	}
 }
 
@@ -188,7 +186,7 @@ func TestClientSignalReceiverCoalescesAdjacentCandidatesOnly(t *testing.T) {
 				},
 			},
 		})
-		assert.Equal(t, err, nil)
+		AssertEqual(t, err, nil)
 		return &protocol.Frame{
 			MessageType:  protocol.MessageType_TransferExchangeSignals,
 			MessageBytes: messageBytes,
@@ -205,7 +203,7 @@ func TestClientSignalReceiverCoalescesAdjacentCandidatesOnly(t *testing.T) {
 				},
 			},
 		})
-		assert.Equal(t, err, nil)
+		AssertEqual(t, err, nil)
 		return &protocol.Frame{
 			MessageType:  protocol.MessageType_TransferExchangeSignals,
 			MessageBytes: messageBytes,
@@ -225,36 +223,36 @@ func TestClientSignalReceiverCoalescesAdjacentCandidatesOnly(t *testing.T) {
 
 	for _, frame := range frames {
 		received, err := newReceivedSignalFrame(source, frame)
-		assert.Equal(t, err, nil)
-		assert.Equal(t, receiver.enqueue(received), true)
+		AssertEqual(t, err, nil)
+		AssertEqual(t, receiver.enqueue(received), true)
 	}
 
 	readSignals := func() []*protocol.ExchangeSignal {
 		received := receiver.dequeue()
-		assert.NotEqual(t, received, nil)
+		AssertNotEqual(t, received, nil)
 		defer received.Close()
 		err := received.prepareFrame()
-		assert.Equal(t, err, nil)
+		AssertEqual(t, err, nil)
 		exchangeSignals := &protocol.ExchangeSignals{}
 		err = ProtoUnmarshal(received.frame.MessageBytes, exchangeSignals)
-		assert.Equal(t, err, nil)
+		AssertEqual(t, err, nil)
 		return exchangeSignals.Signals
 	}
 
 	signals := readSignals()
-	assert.Equal(t, len(signals), 1)
-	assert.Equal(t, signals[0].SignalType, protocol.SignalType_IceCandidate)
-	assert.Equal(t, string(signals[0].IceCandidate), "c1")
+	AssertEqual(t, len(signals), 1)
+	AssertEqual(t, signals[0].SignalType, protocol.SignalType_IceCandidate)
+	AssertEqual(t, string(signals[0].IceCandidate), "c1")
 
 	signals = readSignals()
-	assert.Equal(t, len(signals), 1)
-	assert.Equal(t, signals[0].SignalType, protocol.SignalType_SdpOffer)
-	assert.Equal(t, string(signals[0].Sdp), "sdp")
+	AssertEqual(t, len(signals), 1)
+	AssertEqual(t, signals[0].SignalType, protocol.SignalType_SdpOffer)
+	AssertEqual(t, string(signals[0].Sdp), "sdp")
 
 	signals = readSignals()
-	assert.Equal(t, len(signals), 1)
-	assert.Equal(t, signals[0].SignalType, protocol.SignalType_IceCandidate)
-	assert.Equal(t, string(signals[0].IceCandidate), "c2")
+	AssertEqual(t, len(signals), 1)
+	AssertEqual(t, signals[0].SignalType, protocol.SignalType_IceCandidate)
+	AssertEqual(t, string(signals[0].IceCandidate), "c2")
 }
 
 func TestClientSignalReceiverCoalescesAdjacentCandidates(t *testing.T) {
@@ -281,7 +279,7 @@ func TestClientSignalReceiverCoalescesAdjacentCandidates(t *testing.T) {
 				},
 			},
 		})
-		assert.Equal(t, err, nil)
+		AssertEqual(t, err, nil)
 		return &protocol.Frame{
 			MessageType:  protocol.MessageType_TransferExchangeSignals,
 			MessageBytes: messageBytes,
@@ -300,21 +298,21 @@ func TestClientSignalReceiverCoalescesAdjacentCandidates(t *testing.T) {
 
 	for _, frame := range frames {
 		received, err := newReceivedSignalFrame(source, frame)
-		assert.Equal(t, err, nil)
-		assert.Equal(t, receiver.enqueue(received), true)
+		AssertEqual(t, err, nil)
+		AssertEqual(t, receiver.enqueue(received), true)
 	}
 
 	received := receiver.dequeue()
-	assert.NotEqual(t, received, nil)
+	AssertNotEqual(t, received, nil)
 	defer received.Close()
 	err := received.prepareFrame()
-	assert.Equal(t, err, nil)
+	AssertEqual(t, err, nil)
 	exchangeSignals := &protocol.ExchangeSignals{}
 	err = ProtoUnmarshal(received.frame.MessageBytes, exchangeSignals)
-	assert.Equal(t, err, nil)
-	assert.Equal(t, len(exchangeSignals.Signals), 2)
-	assert.Equal(t, string(exchangeSignals.Signals[0].IceCandidate), "c1")
-	assert.Equal(t, string(exchangeSignals.Signals[1].IceCandidate), "c2")
+	AssertEqual(t, err, nil)
+	AssertEqual(t, len(exchangeSignals.Signals), 2)
+	AssertEqual(t, string(exchangeSignals.Signals[0].IceCandidate), "c1")
+	AssertEqual(t, string(exchangeSignals.Signals[1].IceCandidate), "c2")
 }
 
 type signalPipe struct {

@@ -34,11 +34,12 @@ import (
 	"encoding/binary"
 	"math"
 	"math/bits"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/exp/maps"
+	"maps"
 )
 
 // number of flow-table shards. Sharding keeps the per-packet table lookup off a
@@ -463,7 +464,7 @@ func (self *dmcaDetector) evictWithLock(shard *dmcaFlowShard) {
 	if len(shard.flows) < self.perShardCap {
 		return
 	}
-	applyLruUserLimit(maps.Values(shard.flows), self.perShardCap-1, func(st *dmcaFlowState) bool {
+	applyLruUserLimit(slices.Collect(maps.Values(shard.flows)), self.perShardCap-1, func(st *dmcaFlowState) bool {
 		delete(shard.flows, st.key)
 		return true
 	})

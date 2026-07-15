@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/exp/maps"
+	"maps"
 )
 
 // testingPlatformTransportModes builds just the mode state of a
@@ -125,7 +125,7 @@ func TestPlatformTransportElectPreference(t *testing.T) {
 	// the election exactly as `run` performs it
 	elect := func() TransportMode {
 		available, _ := transport.modesAvailable()
-		orderedModes := maps.Keys(transportModePreferences)
+		orderedModes := slices.Collect(maps.Keys(transportModePreferences))
 		slices.SortFunc(orderedModes, func(a TransportMode, b TransportMode) int {
 			preferenceA := modePreference(a)
 			preferenceB := modePreference(b)
@@ -320,7 +320,7 @@ func TestPlatformTransportStandDown(t *testing.T) {
 // every pass — flipping the active mode and thrashing the gates.
 func TestTransportModeOrderDeterministic(t *testing.T) {
 	order := func() []TransportMode {
-		orderedModes := maps.Keys(transportModePreferences)
+		orderedModes := slices.Collect(maps.Keys(transportModePreferences))
 		slices.SortFunc(orderedModes, func(a TransportMode, b TransportMode) int {
 			preferenceA := modePreference(a)
 			preferenceB := modePreference(b)

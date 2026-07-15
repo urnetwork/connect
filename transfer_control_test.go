@@ -7,8 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-playground/assert/v2"
-
 	"github.com/urnetwork/connect/protocol"
 )
 
@@ -47,7 +45,7 @@ func TestControlSync(t *testing.T) {
 	controlClientA.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, peer Peer) {
 		for _, frame := range frames {
 			m, err := FromFrame(frame)
-			assert.Equal(t, err, nil)
+			AssertEqual(t, err, nil)
 			switch v := m.(type) {
 			case *protocol.SimpleMessage:
 				select {
@@ -66,7 +64,7 @@ func TestControlSync(t *testing.T) {
 				frame, err := ToFrame(&protocol.SimpleMessage{
 					MessageIndex: uint32(i*b + j),
 				}, DefaultProtocolVersion)
-				assert.Equal(t, err, nil)
+				AssertEqual(t, err, nil)
 				controlSyncM1.Send(
 					frame,
 					nil,
@@ -139,7 +137,7 @@ func TestControlSync(t *testing.T) {
 					end := uint32(b*i + b - 1)
 					fmt.Printf("[csync]%d/%d (%d)\n", m.MessageIndex, end, p)
 
-					assert.Equal(t, p <= m.MessageIndex, true)
+					AssertEqual(t, p <= m.MessageIndex, true)
 					p = m.MessageIndex
 					if m.MessageIndex == end {
 						return

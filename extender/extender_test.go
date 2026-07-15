@@ -14,8 +14,6 @@ import (
 
 	"testing"
 
-	"github.com/go-playground/assert/v2"
-
 	"github.com/urnetwork/connect"
 )
 
@@ -40,10 +38,10 @@ func TestExtender(t *testing.T) {
 	defer cancel()
 
 	certPemBytes, keyPemBytes, err := selfSign([]string{"localhost"}, "Connect Test", settings.ValidFrom, settings.ValidFor)
-	assert.Equal(t, err, nil)
+	connect.AssertEqual(t, err, nil)
 
 	tempDirPath, err := os.MkdirTemp("", "connect")
-	assert.Equal(t, err, nil)
+	connect.AssertEqual(t, err, nil)
 
 	certFile := filepath.Join(tempDirPath, "localhost.pem")
 	keyFile := filepath.Join(tempDirPath, "localhost.key")
@@ -75,7 +73,7 @@ func TestExtender(t *testing.T) {
 	}
 
 	localIp, err := netip.ParseAddr("127.0.0.1")
-	assert.Equal(t, err, nil)
+	connect.AssertEqual(t, err, nil)
 
 	connectSettings := connect.DefaultConnectSettings()
 	connectSettings.TlsConfig = &tls.Config{
@@ -97,12 +95,12 @@ func TestExtender(t *testing.T) {
 
 	r, err := client.Get("https://localhost/hello")
 
-	assert.Equal(t, err, nil)
-	assert.Equal(t, r.StatusCode, 200)
+	connect.AssertEqual(t, err, nil)
+	connect.AssertEqual(t, r.StatusCode, 200)
 
 	body, err := io.ReadAll(r.Body)
-	assert.Equal(t, err, nil)
-	assert.Equal(t, string(body), "{}")
+	connect.AssertEqual(t, err, nil)
+	connect.AssertEqual(t, string(body), "{}")
 
 }
 

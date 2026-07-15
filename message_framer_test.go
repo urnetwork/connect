@@ -8,8 +8,6 @@ import (
 	"time"
 
 	"testing"
-
-	"github.com/go-playground/assert/v2"
 )
 
 func TestFramerWriteRead(t *testing.T) {
@@ -62,7 +60,7 @@ func TestFramerWriteRead(t *testing.T) {
 				if err != nil {
 					panic(err)
 				}
-				assert.Equal(t, message, randMessage(messageLen, i))
+				AssertEqual(t, message, randMessage(messageLen, i))
 
 			}
 		}
@@ -82,7 +80,7 @@ func TestFramerWriteRead(t *testing.T) {
 				panic(err)
 			}
 			// check that write does not modify the message
-			assert.Equal(t, message, randMessage(messageLen, i))
+			AssertEqual(t, message, randMessage(messageLen, i))
 		}
 	}
 

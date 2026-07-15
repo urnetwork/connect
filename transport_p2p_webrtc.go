@@ -11,7 +11,7 @@ import (
 	// "slices"
 	"fmt"
 
-	// "golang.org/x/exp/maps"
+	// "maps"
 
 	"github.com/pion/datachannel"
 	"github.com/pion/logging"

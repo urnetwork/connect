@@ -18,9 +18,9 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/exp/maps"
 	"golang.org/x/net/dns/dnsmessage"
 	"golang.org/x/net/idna"
+	"maps"
 
 	"golang.org/x/net/http2"
 	// "github.com/urnetwork/glog"
@@ -96,8 +96,13 @@ func DefaultDnsResolverSettings() *DnsResolverSettings {
 			"8.8.8.8",        // Google
 			"208.67.222.222", // OpenDNS
 		},
+		// local plain-dns servers: host-side resolution, and the tunnel resolver
+		// when the local-dns toggle is enabled. Quad9 (9.9.9.9) leads so the OS does
+		// not auto-upgrade the tunnel resolver to encrypted DNS (which would bypass
+		// the UpgradeMux); see the sdk's defaultTunnelDnsServersIpv4
 		LocalDnsIpv4: []string{
-			"1.1.1.1",
+			"9.9.9.9", // Quad9
+			"1.1.1.1", // Cloudflare
 		},
 	}
 }

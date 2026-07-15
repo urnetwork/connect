@@ -3,8 +3,6 @@ package connect
 import (
 	mathrand "math/rand"
 	"testing"
-
-	"github.com/go-playground/assert/v2"
 )
 
 func TestDnsRequestEncodeDecode(t *testing.T) {
@@ -33,21 +31,21 @@ func TestDnsRequestEncodeDecode(t *testing.T) {
 			header[17] = 0
 
 			n, encoded, err := encodeDnsRequest(uint16(i), header, data[i:], encodeBuf, tld)
-			assert.Equal(t, err, nil)
+			AssertEqual(t, err, nil)
 
 			id, decodedHeader, decoded, decodedTld, err, otherData := decodeDnsRequest(encoded, decodeBuf, tlds)
-			assert.Equal(t, err, nil)
-			assert.Equal(t, id, uint16(i))
-			assert.Equal(t, data[i:i+n], decoded)
-			assert.Equal(t, header, decodedHeader)
-			assert.Equal(t, decodedTld, tld)
-			assert.Equal(t, otherData, false)
+			AssertEqual(t, err, nil)
+			AssertEqual(t, id, uint16(i))
+			AssertEqual(t, data[i:i+n], decoded)
+			AssertEqual(t, header, decodedHeader)
+			AssertEqual(t, decodedTld, tld)
+			AssertEqual(t, otherData, false)
 
 			i += n
 			c += 1
 		}
 
-		assert.Equal(t, encodeDnsRequestCount(data, tld), c)
+		AssertEqual(t, encodeDnsRequestCount(data, tld), c)
 	}
 
 	var header [18]byte
@@ -56,15 +54,15 @@ func TestDnsRequestEncodeDecode(t *testing.T) {
 	header[17] = 0
 
 	_, encoded, err := encodeDnsRequest(uint16(0), header, make([]byte, 0), encodeBuf, tld)
-	assert.Equal(t, err, nil)
+	AssertEqual(t, err, nil)
 
 	id, decodedHeader, decoded, decodedTld, err, otherData := decodeDnsRequest(encoded, decodeBuf, tlds)
-	assert.Equal(t, err, nil)
-	assert.Equal(t, id, uint16(0))
-	assert.Equal(t, make([]byte, 0), decoded)
-	assert.Equal(t, header, decodedHeader)
-	assert.Equal(t, decodedTld, tld)
-	assert.Equal(t, otherData, false)
+	AssertEqual(t, err, nil)
+	AssertEqual(t, id, uint16(0))
+	AssertEqual(t, make([]byte, 0), decoded)
+	AssertEqual(t, header, decodedHeader)
+	AssertEqual(t, decodedTld, tld)
+	AssertEqual(t, otherData, false)
 }
 
 func TestDnsResponseEncodeDecode(t *testing.T) {
@@ -92,20 +90,20 @@ func TestDnsResponseEncodeDecode(t *testing.T) {
 			header[17] = 0
 
 			n, encoded, err := encodeDnsResponse(uint16(i), header, header, data[i:], encodeBuf, tld)
-			assert.Equal(t, err, nil)
+			AssertEqual(t, err, nil)
 
 			id, decodedPumpHeader, decodedHeader, decoded, err := decodeDnsResponse(encoded, decodeBuf, tlds)
-			assert.Equal(t, err, nil)
-			assert.Equal(t, id, uint16(i))
-			assert.Equal(t, data[i:i+n], decoded)
-			assert.Equal(t, header, decodedPumpHeader)
-			assert.Equal(t, header, decodedHeader)
+			AssertEqual(t, err, nil)
+			AssertEqual(t, id, uint16(i))
+			AssertEqual(t, data[i:i+n], decoded)
+			AssertEqual(t, header, decodedPumpHeader)
+			AssertEqual(t, header, decodedHeader)
 
 			i += n
 			c += 1
 		}
 
-		assert.Equal(t, encodeDnsResponseCount(data, tld), c)
+		AssertEqual(t, encodeDnsResponseCount(data, tld), c)
 	}
 
 	var header [18]byte
@@ -114,12 +112,12 @@ func TestDnsResponseEncodeDecode(t *testing.T) {
 	header[17] = 0
 
 	_, encoded, err := encodeDnsResponse(uint16(0), header, header, make([]byte, 0), encodeBuf, tld)
-	assert.Equal(t, err, nil)
+	AssertEqual(t, err, nil)
 
 	id, decodedPumpHeader, decodedHeader, decoded, err := decodeDnsResponse(encoded, decodeBuf, tlds)
-	assert.Equal(t, err, nil)
-	assert.Equal(t, id, uint16(0))
-	assert.Equal(t, make([]byte, 0), decoded)
-	assert.Equal(t, header, decodedPumpHeader)
-	assert.Equal(t, header, decodedHeader)
+	AssertEqual(t, err, nil)
+	AssertEqual(t, id, uint16(0))
+	AssertEqual(t, make([]byte, 0), decoded)
+	AssertEqual(t, header, decodedPumpHeader)
+	AssertEqual(t, header, decodedHeader)
 }

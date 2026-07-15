@@ -8,8 +8,6 @@ import (
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
-
-	"github.com/go-playground/assert/v2"
 )
 
 // differential tests for the hand-rolled packet builders against gopacket
@@ -79,7 +77,7 @@ func TestSynAckMatchesGopacketReference(t *testing.T) {
 			ip.(gopacket.SerializableLayer),
 			&tcp,
 		)
-		assert.Equal(t, err, nil)
+		AssertEqual(t, err, nil)
 		reference := make([]byte, len(buffer.Bytes()))
 		copy(reference, buffer.Bytes())
 		return reference
@@ -113,7 +111,7 @@ func TestSynAckMatchesGopacketReference(t *testing.T) {
 			enableWindowScale: c.enableWindowScale,
 		}
 		packet, err := connectionState.SynAck(mtu)
-		assert.Equal(t, err, nil)
+		AssertEqual(t, err, nil)
 		reference := synAckReference(connectionState)
 		if !bytes.Equal(reference, packet) {
 			t.Fatalf("syn ack mismatch (v%d ws=%v):\n  packet    %x\n  reference %x", c.ipVersion, c.enableWindowScale, packet, reference)
@@ -165,7 +163,7 @@ func TestOosPacketsMatchGopacketReference(t *testing.T) {
 			serializable = append(serializable, gopacket.Payload(payload))
 		}
 		err := gopacket.SerializeLayers(buffer, gopacket.SerializeOptions{ComputeChecksums: true, FixLengths: true}, serializable...)
-		assert.Equal(t, err, nil)
+		AssertEqual(t, err, nil)
 		reference := make([]byte, len(buffer.Bytes()))
 		copy(reference, buffer.Bytes())
 		return reference
@@ -230,7 +228,7 @@ func TestOosPacketsMatchGopacketReference(t *testing.T) {
 
 		// the oos rst
 		packet, ok := ipOosRst(tcpPath)
-		assert.Equal(t, ok, true)
+		AssertEqual(t, ok, true)
 		reference := oosReference(tcpPath, &layers.TCP{
 			SrcPort: layers.TCPPort(tcpPath.SourcePort),
 			DstPort: layers.TCPPort(tcpPath.DestinationPort),
@@ -245,6 +243,6 @@ func TestOosPacketsMatchGopacketReference(t *testing.T) {
 
 		// udp is not resettable
 		_, ok = ipOosRst(udpPath)
-		assert.Equal(t, ok, false)
+		AssertEqual(t, ok, false)
 	}
 }

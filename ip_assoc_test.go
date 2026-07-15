@@ -5,8 +5,6 @@ import (
 	"net/netip"
 	"testing"
 	"time"
-
-	"github.com/go-playground/assert/v2"
 )
 
 func testingIpAssocAddr(s string) netip.Addr {
@@ -48,11 +46,11 @@ func TestClusterIpAssocThresholdSplit(t *testing.T) {
 
 	members := clusterIpAssoc(counts, coCounts, map[netip.Addr][]string{}, 0.5)
 
-	assert.Equal(t, 3, len(members[a]))
-	assert.Equal(t, 3, len(members[b]))
-	assert.Equal(t, 3, len(members[c]))
+	AssertEqual(t, 3, len(members[a]))
+	AssertEqual(t, 3, len(members[b]))
+	AssertEqual(t, 3, len(members[c]))
 	_, ok := members[d]
-	assert.Equal(t, false, ok)
+	AssertEqual(t, false, ok)
 }
 
 func TestClusterIpAssocComponents(t *testing.T) {
@@ -75,17 +73,17 @@ func TestClusterIpAssocComponents(t *testing.T) {
 
 	members := clusterIpAssoc(counts, coCounts, map[netip.Addr][]string{}, 0.5)
 
-	assert.Equal(t, 2, len(members[a]))
-	assert.Equal(t, 2, len(members[b]))
-	assert.Equal(t, 2, len(members[c]))
-	assert.Equal(t, 2, len(members[d]))
+	AssertEqual(t, 2, len(members[a]))
+	AssertEqual(t, 2, len(members[b]))
+	AssertEqual(t, 2, len(members[c]))
+	AssertEqual(t, 2, len(members[d]))
 	memberSet := map[netip.Addr]bool{}
 	for _, member := range members[a] {
 		memberSet[member] = true
 	}
-	assert.Equal(t, true, memberSet[a])
-	assert.Equal(t, true, memberSet[b])
-	assert.Equal(t, false, memberSet[c])
+	AssertEqual(t, true, memberSet[a])
+	AssertEqual(t, true, memberSet[b])
+	AssertEqual(t, false, memberSet[c])
 }
 
 func TestClusterIpAssocBaseNameMerge(t *testing.T) {
@@ -111,9 +109,9 @@ func TestClusterIpAssocBaseNameMerge(t *testing.T) {
 	members := clusterIpAssoc(counts, coCounts, baseNames, 0.5)
 
 	// all three cluster together: a+b merged by name, c associated with the merged node
-	assert.Equal(t, 3, len(members[a]))
-	assert.Equal(t, 3, len(members[b]))
-	assert.Equal(t, 3, len(members[c]))
+	AssertEqual(t, 3, len(members[a]))
+	AssertEqual(t, 3, len(members[b]))
+	AssertEqual(t, 3, len(members[c]))
 }
 
 func TestClusterIpAssocBaseNameOnly(t *testing.T) {
@@ -132,8 +130,8 @@ func TestClusterIpAssocBaseNameOnly(t *testing.T) {
 
 	members := clusterIpAssoc(counts, map[ipAssocPair]uint32{}, baseNames, 0.5)
 
-	assert.Equal(t, 2, len(members[a]))
-	assert.Equal(t, 2, len(members[b]))
+	AssertEqual(t, 2, len(members[a]))
+	AssertEqual(t, 2, len(members[b]))
 }
 
 func TestIpAssocActivityClustering(t *testing.T) {
@@ -170,21 +168,21 @@ func TestIpAssocActivityClustering(t *testing.T) {
 	ipAssoc.updateClusters()
 
 	cluster := ipAssoc.GetCluster(testingIpAssocPath("1.0.0.1"))
-	assert.Equal(t, 2, len(cluster))
+	AssertEqual(t, 2, len(cluster))
 	memberSet := map[string]bool{}
 	for _, memberPath := range cluster {
 		memberSet[memberPath.DestinationIp.String()] = true
 	}
-	assert.Equal(t, true, memberSet["1.0.0.1"])
-	assert.Equal(t, true, memberSet["1.0.0.2"])
+	AssertEqual(t, true, memberSet["1.0.0.1"])
+	AssertEqual(t, true, memberSet["1.0.0.2"])
 
-	assert.Equal(t, 0, len(ipAssoc.GetCluster(testingIpAssocPath("1.0.0.3"))))
+	AssertEqual(t, 0, len(ipAssoc.GetCluster(testingIpAssocPath("1.0.0.3"))))
 
 	// version changes only when the clustering changes
 	version := ipAssoc.ClusterVersion()
 	ipAssoc.AddEgressPacket(testingIpAssocPath("1.0.0.1"))
 	ipAssoc.updateClusters()
-	assert.Equal(t, version, ipAssoc.ClusterVersion())
+	AssertEqual(t, version, ipAssoc.ClusterVersion())
 }
 
 func TestIpAssocGranuleDedup(t *testing.T) {
@@ -205,8 +203,8 @@ func TestIpAssocGranuleDedup(t *testing.T) {
 	func() {
 		ipAssoc.stateLock.Lock()
 		defer ipAssoc.stateLock.Unlock()
-		assert.Equal(t, 1, len(ipAssoc.blocks))
-		assert.Equal(t, uint32(1), ipAssoc.blocks[0].countFor(testingIpAssocAddr("1.0.0.1")))
+		AssertEqual(t, 1, len(ipAssoc.blocks))
+		AssertEqual(t, uint32(1), ipAssoc.blocks[0].countFor(testingIpAssocAddr("1.0.0.1")))
 	}()
 }
 
@@ -229,9 +227,9 @@ func TestIpAssocEntityCap(t *testing.T) {
 	func() {
 		ipAssoc.stateLock.Lock()
 		defer ipAssoc.stateLock.Unlock()
-		assert.Equal(t, 2, len(ipAssoc.blocks[0].addrs))
+		AssertEqual(t, 2, len(ipAssoc.blocks[0].addrs))
 		_, ok := ipAssoc.blocks[0].indexes[testingIpAssocAddr("1.0.0.3")]
-		assert.Equal(t, false, ok)
+		AssertEqual(t, false, ok)
 	}()
 }
 
@@ -256,7 +254,7 @@ func TestIpAssocBlockRotation(t *testing.T) {
 	func() {
 		ipAssoc.stateLock.Lock()
 		defer ipAssoc.stateLock.Unlock()
-		assert.Equal(t, 2, len(ipAssoc.blocks))
+		AssertEqual(t, 2, len(ipAssoc.blocks))
 	}()
 }
 
@@ -308,10 +306,10 @@ func TestIpAssocMultipleIpsPerHost(t *testing.T) {
 		for _, memberPath := range cluster {
 			memberSet[memberPath.DestinationIp.String()] = true
 		}
-		assert.Equal(t, 3, len(cluster))
-		assert.Equal(t, true, memberSet["1.0.0.1"])
-		assert.Equal(t, true, memberSet["1.0.0.2"])
-		assert.Equal(t, true, memberSet["9.0.0.9"])
+		AssertEqual(t, 3, len(cluster))
+		AssertEqual(t, true, memberSet["1.0.0.1"])
+		AssertEqual(t, true, memberSet["1.0.0.2"])
+		AssertEqual(t, true, memberSet["9.0.0.9"])
 	}
 }
 
@@ -343,5 +341,5 @@ func TestIpAssocServerNameLookup(t *testing.T) {
 	ipAssoc.updateClusters()
 
 	cluster := ipAssoc.GetCluster(testingIpAssocPath("1.0.0.1"))
-	assert.Equal(t, 2, len(cluster))
+	AssertEqual(t, 2, len(cluster))
 }

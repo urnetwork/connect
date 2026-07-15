@@ -9,8 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-playground/assert/v2"
-
 	"github.com/urnetwork/connect/protocol"
 )
 
@@ -18,26 +16,26 @@ import (
 func TestTransferMemoryBudgetAccounting(t *testing.T) {
 	budget := NewTransferMemoryBudget(kib(64))
 
-	assert.Equal(t, budget.TotalByteCount(), kib(64))
-	assert.Equal(t, budget.Available(), kib(64))
-	assert.Equal(t, budget.UsedByteCount(), ByteCount(0))
+	AssertEqual(t, budget.TotalByteCount(), kib(64))
+	AssertEqual(t, budget.Available(), kib(64))
+	AssertEqual(t, budget.UsedByteCount(), ByteCount(0))
 
 	budget.Reserve(kib(16))
-	assert.Equal(t, budget.Available(), kib(48))
-	assert.Equal(t, budget.UsedByteCount(), kib(16))
+	AssertEqual(t, budget.Available(), kib(48))
+	AssertEqual(t, budget.UsedByteCount(), kib(16))
 
 	// reserve always succeeds; available floors at zero on overdraft
 	budget.Reserve(kib(64))
-	assert.Equal(t, budget.Available(), ByteCount(0))
-	assert.Equal(t, budget.UsedByteCount(), kib(80))
+	AssertEqual(t, budget.Available(), ByteCount(0))
+	AssertEqual(t, budget.UsedByteCount(), kib(80))
 
 	budget.Release(kib(80))
-	assert.Equal(t, budget.Available(), kib(64))
-	assert.Equal(t, budget.UsedByteCount(), ByteCount(0))
+	AssertEqual(t, budget.Available(), kib(64))
+	AssertEqual(t, budget.UsedByteCount(), ByteCount(0))
 
 	reserved, released := budget.Counts()
-	assert.Equal(t, reserved, kib(80))
-	assert.Equal(t, released, kib(80))
+	AssertEqual(t, reserved, kib(80))
+	AssertEqual(t, released, kib(80))
 }
 
 // essential test 1a: concurrent reserve/release keeps exact balance (run
@@ -59,10 +57,10 @@ func TestTransferMemoryBudgetConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 
-	assert.Equal(t, budget.UsedByteCount(), ByteCount(0))
+	AssertEqual(t, budget.UsedByteCount(), ByteCount(0))
 	reserved, released := budget.Counts()
-	assert.Equal(t, reserved, ByteCount(8*10000*1000))
-	assert.Equal(t, reserved, released)
+	AssertEqual(t, reserved, ByteCount(8*10000*1000))
+	AssertEqual(t, reserved, released)
 }
 
 // essential test 1b: the queue maintains borrowed = max(0, byteCount-floor)
@@ -91,44 +89,44 @@ func TestTransferQueueBudgetBorrow(t *testing.T) {
 	// below the floor there is no borrowing
 	a := newItem(1, kib(2))
 	queue.Add(a)
-	assert.Equal(t, budget.UsedByteCount(), ByteCount(0))
+	AssertEqual(t, budget.UsedByteCount(), ByteCount(0))
 	// crossing the floor borrows the excess
 	b := newItem(2, kib(4))
 	queue.Add(b)
-	assert.Equal(t, budget.UsedByteCount(), kib(2))
+	AssertEqual(t, budget.UsedByteCount(), kib(2))
 	// removal below the floor releases everything borrowed
 	queue.RemoveByMessageId(b.messageId)
-	assert.Equal(t, budget.UsedByteCount(), ByteCount(0))
+	AssertEqual(t, budget.UsedByteCount(), ByteCount(0))
 
 	// CanAdd: under floor always; above floor requires headroom under max
-	assert.Equal(t, queue.CanAdd(kib(1), kib(64)), true)
+	AssertEqual(t, queue.CanAdd(kib(1), kib(64)), true)
 	// would exceed max
-	assert.Equal(t, queue.CanAdd(kib(64), kib(4)), false)
+	AssertEqual(t, queue.CanAdd(kib(64), kib(4)), false)
 	// zero byte count probe: at the floor, requires headroom
 	queue.Add(newItem(3, kib(2)))
-	assert.Equal(t, queue.CanAdd(0, kib(64)), true)
+	AssertEqual(t, queue.CanAdd(0, kib(64)), true)
 	// exhaust the budget elsewhere: above-floor growth is refused, and a
 	// same-size add below max but above floor is refused too
 	budget.Reserve(kib(8))
-	assert.Equal(t, queue.CanAdd(0, kib(64)), false)
-	assert.Equal(t, queue.CanAdd(kib(2), kib(64)), false)
+	AssertEqual(t, queue.CanAdd(0, kib(64)), false)
+	AssertEqual(t, queue.CanAdd(kib(2), kib(64)), false)
 	budget.Release(kib(8))
-	assert.Equal(t, queue.CanAdd(0, kib(64)), true)
+	AssertEqual(t, queue.CanAdd(0, kib(64)), true)
 
 	// grow above the floor, then Clear releases all borrowed bytes
 	// (2 + 2 + 4 + 2 KiB queued - 4 KiB floor = 6 KiB borrowed)
 	queue.Add(newItem(4, kib(4)))
 	queue.Add(newItem(5, kib(2)))
-	assert.Equal(t, budget.UsedByteCount(), kib(6))
+	AssertEqual(t, budget.UsedByteCount(), kib(6))
 	items := queue.Clear()
-	assert.Equal(t, len(items), 4)
-	assert.Equal(t, budget.UsedByteCount(), ByteCount(0))
-	assert.Equal(t, queue.Len(), 0)
+	AssertEqual(t, len(items), 4)
+	AssertEqual(t, budget.UsedByteCount(), ByteCount(0))
+	AssertEqual(t, queue.Len(), 0)
 	_, queueByteCount := queue.QueueSize()
-	assert.Equal(t, queueByteCount, ByteCount(0))
+	AssertEqual(t, queueByteCount, ByteCount(0))
 
 	reserved, released := budget.Counts()
-	assert.Equal(t, reserved, released)
+	AssertEqual(t, reserved, released)
 }
 
 // budgetTestPeer wires a sender client to one receiver client over direct
@@ -283,9 +281,9 @@ func TestTransferBudgetSingleSequenceParity(t *testing.T) {
 	}
 
 	used := settleBudgetUsed(budget)
-	assert.Equal(t, used, ByteCount(0))
+	AssertEqual(t, used, ByteCount(0))
 	reserved, released := budget.Counts()
-	assert.Equal(t, reserved, released)
+	AssertEqual(t, reserved, released)
 	if reserved == 0 {
 		t.Errorf("expected borrowing to have happened")
 	}
@@ -380,9 +378,9 @@ func TestTransferBudgetAggregateCeiling(t *testing.T) {
 	cancel()
 	<-samplerDone
 	used := settleBudgetUsed(budget)
-	assert.Equal(t, used, ByteCount(0))
+	AssertEqual(t, used, ByteCount(0))
 	reserved, released := budget.Counts()
-	assert.Equal(t, reserved, released)
+	AssertEqual(t, reserved, released)
 }
 
 // essential test 2 (liveness): many sequences over a pool much smaller than
@@ -455,14 +453,14 @@ func TestTransferBudgetLiveness(t *testing.T) {
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	assert.Equal(t, ackCount.Load(), int64(peerCount*messagesPerPeer))
-	assert.Equal(t, receiveCount.Load(), int64(peerCount*messagesPerPeer))
+	AssertEqual(t, ackCount.Load(), int64(peerCount*messagesPerPeer))
+	AssertEqual(t, receiveCount.Load(), int64(peerCount*messagesPerPeer))
 
 	cancel()
 	used := settleBudgetUsed(budget)
-	assert.Equal(t, used, ByteCount(0))
+	AssertEqual(t, used, ByteCount(0))
 	reserved, released := budget.Counts()
-	assert.Equal(t, reserved, released)
+	AssertEqual(t, reserved, released)
 }
 
 // essential test 1c (churn balance): repeated build/load/teardown cycles
@@ -501,7 +499,7 @@ func TestTransferBudgetChurnBalance(t *testing.T) {
 	}
 
 	reserved, released := sendBudget.Counts()
-	assert.Equal(t, reserved, released)
+	AssertEqual(t, reserved, released)
 	if reserved == 0 {
 		t.Errorf("expected borrowing across the churn cycles")
 	}

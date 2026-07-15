@@ -5,8 +5,6 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"testing"
-
-	"github.com/go-playground/assert/v2"
 )
 
 // TestClientKeyManagerGenerateFresh verifies that constructing a
@@ -22,17 +20,17 @@ func TestClientKeyManagerGenerateFresh(t *testing.T) {
 	defer client.Cancel()
 
 	m, err := NewClientKeyManager(ctx, client)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 
 	seed := m.Seed()
-	assert.Equal(t, ed25519.SeedSize, len(seed))
+	AssertEqual(t, ed25519.SeedSize, len(seed))
 
 	pub := m.PublicKey()
-	assert.Equal(t, ed25519.PublicKeySize, len(pub))
+	AssertEqual(t, ed25519.PublicKeySize, len(pub))
 
 	// Public key must be the one derived from the seed.
 	derived := ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)
-	assert.Equal(t, true, ed25519.PublicKey(pub).Equal(derived))
+	AssertEqual(t, true, ed25519.PublicKey(pub).Equal(derived))
 }
 
 // TestClientKeyManagerLoadSeed verifies that a 32-byte seed in
@@ -46,19 +44,19 @@ func TestClientKeyManagerLoadSeed(t *testing.T) {
 
 	seed := make([]byte, ed25519.SeedSize)
 	_, err := rand.Read(seed)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 	settings.ClientKeySeed = seed
 
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 	defer client.Cancel()
 
 	m, err := NewClientKeyManager(ctx, client)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 
-	assert.Equal(t, seed, m.Seed())
+	AssertEqual(t, seed, m.Seed())
 
 	expectedPub := ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)
-	assert.Equal(t, true, ed25519.PublicKey(m.PublicKey()).Equal(expectedPub))
+	AssertEqual(t, true, ed25519.PublicKey(m.PublicKey()).Equal(expectedPub))
 }
 
 // TestClientKeyManagerLoadSeedWrongSize verifies that a non-zero
@@ -91,29 +89,29 @@ func TestClientKeyManagerSignVerifyRoundTrip(t *testing.T) {
 	defer client.Cancel()
 
 	m, err := NewClientKeyManager(ctx, client)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 
 	data := []byte("identity proof exporter material")
 	sig := m.Sign(data)
-	assert.Equal(t, ed25519.SignatureSize, len(sig))
+	AssertEqual(t, ed25519.SignatureSize, len(sig))
 
-	assert.Equal(t, true, VerifyClientKeySignature(m.PublicKey(), data, sig))
+	AssertEqual(t, true, VerifyClientKeySignature(m.PublicKey(), data, sig))
 
 	// Tampered data must fail.
 	tampered := append([]byte(nil), data...)
 	tampered[0] ^= 0x01
-	assert.Equal(t, false, VerifyClientKeySignature(m.PublicKey(), tampered, sig))
+	AssertEqual(t, false, VerifyClientKeySignature(m.PublicKey(), tampered, sig))
 
 	// Tampered signature must fail.
 	badSig := append([]byte(nil), sig...)
 	badSig[0] ^= 0x01
-	assert.Equal(t, false, VerifyClientKeySignature(m.PublicKey(), data, badSig))
+	AssertEqual(t, false, VerifyClientKeySignature(m.PublicKey(), data, badSig))
 
 	// Wrong public key must fail.
 	_, otherPriv, err := ed25519.GenerateKey(rand.Reader)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 	otherPub := otherPriv.Public().(ed25519.PublicKey)
-	assert.Equal(t, false, VerifyClientKeySignature(otherPub, data, sig))
+	AssertEqual(t, false, VerifyClientKeySignature(otherPub, data, sig))
 }
 
 // TestClientKeyManagerCertChainSignature exercises the cert-chain
@@ -129,30 +127,30 @@ func TestClientKeyManagerCertChainSignature(t *testing.T) {
 	defer client.Cancel()
 
 	m, err := NewClientKeyManager(ctx, client)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 
 	chain := [][]byte{
 		[]byte("-----BEGIN CERTIFICATE-----\nAAA=\n-----END CERTIFICATE-----\n"),
 		[]byte("-----BEGIN CERTIFICATE-----\nBBB=\n-----END CERTIFICATE-----\n"),
 	}
 	sig := m.SignCertChain(chain)
-	assert.Equal(t, ed25519.SignatureSize, len(sig))
+	AssertEqual(t, ed25519.SignatureSize, len(sig))
 
-	assert.Equal(t, true, VerifyCertChainSignature(m.PublicKey(), chain, sig))
+	AssertEqual(t, true, VerifyCertChainSignature(m.PublicKey(), chain, sig))
 
 	// Tampering any block must invalidate.
 	tampered := make([][]byte, len(chain))
 	copy(tampered, chain)
 	tampered[1] = []byte("-----BEGIN CERTIFICATE-----\nCCC=\n-----END CERTIFICATE-----\n")
-	assert.Equal(t, false, VerifyCertChainSignature(m.PublicKey(), tampered, sig))
+	AssertEqual(t, false, VerifyCertChainSignature(m.PublicKey(), tampered, sig))
 
 	// Reordering blocks must invalidate (concatenation is
 	// position-sensitive).
 	reordered := [][]byte{chain[1], chain[0]}
-	assert.Equal(t, false, VerifyCertChainSignature(m.PublicKey(), reordered, sig))
+	AssertEqual(t, false, VerifyCertChainSignature(m.PublicKey(), reordered, sig))
 
 	// Dropping a block must invalidate.
-	assert.Equal(t, false, VerifyCertChainSignature(m.PublicKey(), chain[:1], sig))
+	AssertEqual(t, false, VerifyCertChainSignature(m.PublicKey(), chain[:1], sig))
 }
 
 // TestVerifyClientKeySignatureMalformedInput documents the
@@ -161,18 +159,18 @@ func TestClientKeyManagerCertChainSignature(t *testing.T) {
 // empty inputs all return false rather than panicking.
 func TestVerifyClientKeySignatureMalformedInput(t *testing.T) {
 	// Empty key.
-	assert.Equal(t, false, VerifyClientKeySignature(nil, []byte("data"), make([]byte, ed25519.SignatureSize)))
+	AssertEqual(t, false, VerifyClientKeySignature(nil, []byte("data"), make([]byte, ed25519.SignatureSize)))
 
 	// Wrong-size key.
-	assert.Equal(t, false, VerifyClientKeySignature(make([]byte, 10), []byte("data"), make([]byte, ed25519.SignatureSize)))
+	AssertEqual(t, false, VerifyClientKeySignature(make([]byte, 10), []byte("data"), make([]byte, ed25519.SignatureSize)))
 
 	// Wrong-size signature.
 	pub, _, err := ed25519.GenerateKey(rand.Reader)
-	assert.Equal(t, nil, err)
-	assert.Equal(t, false, VerifyClientKeySignature(pub, []byte("data"), []byte{0, 1, 2}))
+	AssertEqual(t, nil, err)
+	AssertEqual(t, false, VerifyClientKeySignature(pub, []byte("data"), []byte{0, 1, 2}))
 
 	// Empty signature.
-	assert.Equal(t, false, VerifyClientKeySignature(pub, []byte("data"), nil))
+	AssertEqual(t, false, VerifyClientKeySignature(pub, []byte("data"), nil))
 }
 
 // TestCanonicalCertChainBytes documents the concatenation contract:
@@ -185,9 +183,9 @@ func TestCanonicalCertChainBytes(t *testing.T) {
 		[]byte("C"),
 	}
 	got := canonicalCertChainBytes(chain)
-	assert.Equal(t, []byte("AAABBC"), got)
+	AssertEqual(t, []byte("AAABBC"), got)
 
 	// Empty chain → empty bytes (and nil-safe).
-	assert.Equal(t, 0, len(canonicalCertChainBytes(nil)))
-	assert.Equal(t, 0, len(canonicalCertChainBytes([][]byte{})))
+	AssertEqual(t, 0, len(canonicalCertChainBytes(nil)))
+	AssertEqual(t, 0, len(canonicalCertChainBytes([][]byte{})))
 }

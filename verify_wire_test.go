@@ -27,8 +27,6 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
-
-	"github.com/go-playground/assert/v2"
 )
 
 const (
@@ -44,7 +42,7 @@ const (
 
 func testVerifyHexBytes(t *testing.T, hexStr string) []byte {
 	b, err := hex.DecodeString(hexStr)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 	return b
 }
 
@@ -55,8 +53,8 @@ func testVerifyHexId(t *testing.T, hexStr string) Id {
 // TestVerifyCtxBytes pins the context string itself: 19 ASCII bytes, written
 // verbatim at the start of every canonical message.
 func TestVerifyCtxBytes(t *testing.T) {
-	assert.Equal(t, 19, len(VerifyCtx))
-	assert.Equal(t, testVerifyCtxHex, hex.EncodeToString([]byte(VerifyCtx)))
+	AssertEqual(t, 19, len(VerifyCtx))
+	AssertEqual(t, testVerifyCtxHex, hex.EncodeToString([]byte(VerifyCtx)))
 }
 
 // TestBuildVerifySeedMessageGolden pins the SEED (A.1) layout, 85 bytes:
@@ -72,14 +70,14 @@ func TestBuildVerifySeedMessageGolden(t *testing.T) {
 		testVerifyHexBytes(t, testVerifyClientNonceHex),
 		8,
 	)
-	assert.Equal(t, nil, err)
-	assert.Equal(t, 85, len(message))
+	AssertEqual(t, nil, err)
+	AssertEqual(t, 85, len(message))
 	expectedHex := testVerifyCtxHex +
 		"01" +
 		testVerifyVpkHex +
 		testVerifyClientNonceHex +
 		"08"
-	assert.Equal(t, expectedHex, hex.EncodeToString(message))
+	AssertEqual(t, expectedHex, hex.EncodeToString(message))
 }
 
 // TestBuildVerifyExtendMessageGolden pins the EXTEND (A.2) layout at depth
@@ -105,8 +103,8 @@ func TestBuildVerifyExtendMessageGolden(t *testing.T) {
 			testVerifyHexId(t, testVerifyClientId2Hex),
 		},
 	)
-	assert.Equal(t, nil, err)
-	assert.Equal(t, 134, len(message))
+	AssertEqual(t, nil, err)
+	AssertEqual(t, 134, len(message))
 	expectedHex := testVerifyCtxHex +
 		"02" +
 		testVerifyTrailIdHex +
@@ -116,7 +114,7 @@ func TestBuildVerifyExtendMessageGolden(t *testing.T) {
 		"02" +
 		testVerifyClientId1Hex +
 		testVerifyClientId2Hex
-	assert.Equal(t, expectedHex, hex.EncodeToString(message))
+	AssertEqual(t, expectedHex, hex.EncodeToString(message))
 }
 
 // TestBuildVerifyAssignMessageGolden pins the ASSIGN (A.3) layout at depth 3
@@ -146,8 +144,8 @@ func TestBuildVerifyAssignMessageGolden(t *testing.T) {
 			testVerifyHexId(t, testVerifyClientId3Hex),
 		},
 	)
-	assert.Equal(t, nil, err)
-	assert.Equal(t, 151, len(message))
+	AssertEqual(t, nil, err)
+	AssertEqual(t, 151, len(message))
 	expectedHex := testVerifyCtxHex +
 		"03" +
 		"07" +
@@ -159,7 +157,7 @@ func TestBuildVerifyAssignMessageGolden(t *testing.T) {
 		testVerifyClientId1Hex +
 		testVerifyClientId2Hex +
 		testVerifyClientId3Hex
-	assert.Equal(t, expectedHex, hex.EncodeToString(message))
+	AssertEqual(t, expectedHex, hex.EncodeToString(message))
 }
 
 // TestBuildVerifyFinalMessageGolden pins the FINAL (A.4) layout at M=2, 150
@@ -199,8 +197,8 @@ func TestBuildVerifyFinalMessageGolden(t *testing.T) {
 			},
 		},
 	)
-	assert.Equal(t, nil, err)
-	assert.Equal(t, 214, len(message))
+	AssertEqual(t, nil, err)
+	AssertEqual(t, 214, len(message))
 	expectedHex := testVerifyCtxHex +
 		"04" +
 		"07" +
@@ -214,7 +212,7 @@ func TestBuildVerifyFinalMessageGolden(t *testing.T) {
 		testVerifyClientId2Hex +
 		"99aabbccddeeff00" +
 		strings.Repeat("bb", 32)
-	assert.Equal(t, expectedHex, hex.EncodeToString(message))
+	AssertEqual(t, expectedHex, hex.EncodeToString(message))
 }
 
 // testVerifyFill32 returns a [32]byte filled with b (D27 egress-IP-hash test vectors).
@@ -252,9 +250,9 @@ func TestVerifyFinalDigestGolden(t *testing.T) {
 			},
 		},
 	)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 	digest := VerifyFinalDigest(message)
-	assert.Equal(
+	AssertEqual(
 		t,
 		"5fd6b821ebe7815e67b6b1ea65de0d4cf2d6acb5646895928fa10149e97c6395",
 		hex.EncodeToString(digest[:]),
@@ -273,13 +271,13 @@ func TestVerifyEffortDigestGolden(t *testing.T) {
 	copy(finalDigest[:], fd)
 
 	d1 := VerifyEffortDigest(finalDigest, 1)
-	assert.Equal(
+	AssertEqual(
 		t,
 		"706d76c16b69676f8a4f22ec332440903f0cfb4edb61cceb1bd00705aaead5c4",
 		hex.EncodeToString(d1[:]),
 	)
 	d7 := VerifyEffortDigest(finalDigest, 7)
-	assert.Equal(
+	AssertEqual(
 		t,
 		"75ee47fe12ab6bdedc0d9884c6d293eadb8891948d5647426ab0b38d02c792b4",
 		hex.EncodeToString(d7[:]),
@@ -298,28 +296,28 @@ func TestVerifySeedSignatureGolden(t *testing.T) {
 	}
 	signingKey := ed25519.NewKeyFromSeed(keySeed)
 	vpk := signingKey.Public().(ed25519.PublicKey)
-	assert.Equal(
+	AssertEqual(
 		t,
 		"2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
 		hex.EncodeToString(vpk),
 	)
 
 	message, err := BuildVerifySeedMessage(vpk, testVerifyHexBytes(t, testVerifyClientNonceHex), 8)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 	expectedMessageHex := testVerifyCtxHex +
 		"01" +
 		"2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12" +
 		testVerifyClientNonceHex +
 		"08"
-	assert.Equal(t, expectedMessageHex, hex.EncodeToString(message))
+	AssertEqual(t, expectedMessageHex, hex.EncodeToString(message))
 
 	seedSig := SignVerifyMessage(signingKey, message)
-	assert.Equal(
+	AssertEqual(
 		t,
 		"e54aa51676a585dd9ed2b714cad985fc84f78e951bb05833190999eeb81934720bfd3dc443044eece951cfd14a98f56615223437a1efc65409d58e8273ac4608",
 		hex.EncodeToString(seedSig),
 	)
-	assert.Equal(t, true, VerifyVerifyMessageSignature(vpk, message, seedSig))
+	AssertEqual(t, true, VerifyVerifyMessageSignature(vpk, message, seedSig))
 }
 
 // TestVerifyMessageSignRoundTrip signs each of the four canonical message
@@ -328,9 +326,9 @@ func TestVerifySeedSignatureGolden(t *testing.T) {
 // sizes return false defensively.
 func TestVerifyMessageSignRoundTrip(t *testing.T) {
 	publicKey, signingKey, err := ed25519.GenerateKey(nil)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 	otherPublicKey, _, err := ed25519.GenerateKey(nil)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 
 	serverNonce := testVerifyHexBytes(t, testVerifyServerNonceHex)
 	trailId := testVerifyHexId(t, testVerifyTrailIdHex)
@@ -340,40 +338,40 @@ func TestVerifyMessageSignRoundTrip(t *testing.T) {
 	}
 
 	seedMessage, err := BuildVerifySeedMessage(publicKey, testVerifyHexBytes(t, testVerifyClientNonceHex), 8)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 	extendMessage, err := BuildVerifyExtendMessage(trailId, serverNonce, publicKey, 8, trailClientIds)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 	assignMessage, err := BuildVerifyAssignMessage(7, trailId, serverNonce, publicKey, 8, trailClientIds)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 	finalMessage, err := BuildVerifyFinalMessage(7, trailId, serverNonce, publicKey, 2, []VerifyProofHop{
 		{ClientId: trailClientIds[0], TimeMs: 1000},
 		{ClientId: trailClientIds[1], TimeMs: 2000},
 	})
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 
 	for _, message := range [][]byte{seedMessage, extendMessage, assignMessage, finalMessage} {
 		signature := SignVerifyMessage(signingKey, message)
-		assert.Equal(t, ed25519.SignatureSize, len(signature))
-		assert.Equal(t, true, VerifyVerifyMessageSignature(publicKey, message, signature))
+		AssertEqual(t, ed25519.SignatureSize, len(signature))
+		AssertEqual(t, true, VerifyVerifyMessageSignature(publicKey, message, signature))
 
 		// tampered message must fail
 		tamperedMessage := append([]byte(nil), message...)
 		tamperedMessage[0] ^= 0x01
-		assert.Equal(t, false, VerifyVerifyMessageSignature(publicKey, tamperedMessage, signature))
+		AssertEqual(t, false, VerifyVerifyMessageSignature(publicKey, tamperedMessage, signature))
 
 		// tampered signature must fail
 		tamperedSignature := append([]byte(nil), signature...)
 		tamperedSignature[0] ^= 0x01
-		assert.Equal(t, false, VerifyVerifyMessageSignature(publicKey, message, tamperedSignature))
+		AssertEqual(t, false, VerifyVerifyMessageSignature(publicKey, message, tamperedSignature))
 
 		// wrong key must fail
-		assert.Equal(t, false, VerifyVerifyMessageSignature(otherPublicKey, message, signature))
+		AssertEqual(t, false, VerifyVerifyMessageSignature(otherPublicKey, message, signature))
 
 		// malformed inputs return false, not panic
-		assert.Equal(t, false, VerifyVerifyMessageSignature(nil, message, signature))
-		assert.Equal(t, false, VerifyVerifyMessageSignature(publicKey[:16], message, signature))
-		assert.Equal(t, false, VerifyVerifyMessageSignature(publicKey, message, signature[:32]))
-		assert.Equal(t, false, VerifyVerifyMessageSignature(publicKey, message, nil))
+		AssertEqual(t, false, VerifyVerifyMessageSignature(nil, message, signature))
+		AssertEqual(t, false, VerifyVerifyMessageSignature(publicKey[:16], message, signature))
+		AssertEqual(t, false, VerifyVerifyMessageSignature(publicKey, message, signature[:32]))
+		AssertEqual(t, false, VerifyVerifyMessageSignature(publicKey, message, nil))
 	}
 }
 
@@ -452,18 +450,18 @@ func TestVerifySeedArgsJson(t *testing.T) {
 		M:           8,
 	}
 	seedArgsJson, err := json.Marshal(seedArgs)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 	expectedJson := `{"client_id":"50515253-5455-5657-5859-5a5b5c5d5e5f",` +
 		`"vpk":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",` +
 		`"client_nonce":"oKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr8=",` +
 		`"seed_sig":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==",` +
 		`"M":8}`
-	assert.Equal(t, expectedJson, string(seedArgsJson))
+	AssertEqual(t, expectedJson, string(seedArgsJson))
 
 	var parsedSeedArgs VerifySeedArgs
 	err = json.Unmarshal(seedArgsJson, &parsedSeedArgs)
-	assert.Equal(t, nil, err)
-	assert.Equal(t, *seedArgs, parsedSeedArgs)
+	AssertEqual(t, nil, err)
+	AssertEqual(t, *seedArgs, parsedSeedArgs)
 }
 
 // TestVerifyWireJsonRoundTrip round-trips the EXTEND request body and the
@@ -479,11 +477,11 @@ func TestVerifyWireJsonRoundTrip(t *testing.T) {
 		ExtendSig: testVerifyHexBytes(t, testVerifyServerNonceHex),
 	}
 	extendArgsJson, err := json.Marshal(extendArgs)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 	var parsedExtendArgs VerifyExtendArgs
 	err = json.Unmarshal(extendArgsJson, &parsedExtendArgs)
-	assert.Equal(t, nil, err)
-	assert.Equal(t, *extendArgs, parsedExtendArgs)
+	AssertEqual(t, nil, err)
+	AssertEqual(t, *extendArgs, parsedExtendArgs)
 
 	assignResult := &VerifyAssignResult{
 		TrailId:     testVerifyHexId(t, testVerifyTrailIdHex),
@@ -497,11 +495,11 @@ func TestVerifyWireJsonRoundTrip(t *testing.T) {
 		AssignSig:   testVerifyHexBytes(t, testVerifyClientNonceHex),
 	}
 	assignResultJson, err := json.Marshal(assignResult)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 	var parsedAssignResult VerifyAssignResult
 	err = json.Unmarshal(assignResultJson, &parsedAssignResult)
-	assert.Equal(t, nil, err)
-	assert.Equal(t, *assignResult, parsedAssignResult)
+	AssertEqual(t, nil, err)
+	AssertEqual(t, *assignResult, parsedAssignResult)
 
 	finalResult := &VerifyFinalResult{
 		Status: VerifyStatusComplete,
@@ -522,10 +520,10 @@ func TestVerifyWireJsonRoundTrip(t *testing.T) {
 		},
 	}
 	finalResultJson, err := json.Marshal(finalResult)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 	var parsedFinalResult VerifyFinalResult
 	err = json.Unmarshal(finalResultJson, &parsedFinalResult)
-	assert.Equal(t, nil, err)
-	assert.Equal(t, VerifyStatusComplete, parsedFinalResult.Status)
-	assert.Equal(t, *finalResult.Proof, *parsedFinalResult.Proof)
+	AssertEqual(t, nil, err)
+	AssertEqual(t, VerifyStatusComplete, parsedFinalResult.Status)
+	AssertEqual(t, *finalResult.Proof, *parsedFinalResult.Proof)
 }

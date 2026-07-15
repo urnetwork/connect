@@ -5,8 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-playground/assert/v2"
-
 	"github.com/urnetwork/connect/protocol"
 )
 
@@ -48,8 +46,8 @@ func TestBlockActionApplyBlocker(t *testing.T) {
 	}
 	for i, c := range cases {
 		block, local := blockActionApply(c.r, c.bypass, c.blockerBlock, c.match)
-		assert.Equal(t, c.block, block)
-		assert.Equal(t, c.local, local)
+		AssertEqual(t, c.block, block)
+		AssertEqual(t, c.local, local)
 		if c.block != block || c.local != local {
 			t.Logf("case %d failed: %+v", i, c)
 		}
@@ -120,38 +118,38 @@ func TestMultiClientBlockerIp(t *testing.T) {
 
 	// blocked: dropped with stats and a Blocker-attributed action
 	success := multiClient.SendPacket(source, protocol.ProvideMode_Network, blockedPacket, 0)
-	assert.Equal(t, false, success)
+	AssertEqual(t, false, success)
 
 	blockActions := nextBlockActions()
-	assert.Equal(t, 1, len(blockActions))
-	assert.Equal(t, true, blockActions[0].Block)
-	assert.Equal(t, false, blockActions[0].Local)
-	assert.Equal(t, true, blockActions[0].Blocker)
-	assert.Equal(t, true, blockActions[0].BlockOverrideId == nil)
+	AssertEqual(t, 1, len(blockActions))
+	AssertEqual(t, true, blockActions[0].Block)
+	AssertEqual(t, false, blockActions[0].Local)
+	AssertEqual(t, true, blockActions[0].Blocker)
+	AssertEqual(t, true, blockActions[0].BlockOverrideId == nil)
 
 	packetStats := multiClient.PacketStats()
-	assert.Equal(t, int64(1), packetStats.BlockEgressPacketCount)
-	assert.Equal(t, ByteCount(len(blockedPacket)), packetStats.BlockEgressByteCount)
+	AssertEqual(t, int64(1), packetStats.BlockEgressPacketCount)
+	AssertEqual(t, ByteCount(len(blockedPacket)), packetStats.BlockEgressByteCount)
 
 	// a clean destination is not blocked (the remote send fails on the empty
 	// generator, but nothing lands in the block counters)
 	multiClient.SendPacket(source, protocol.ProvideMode_Network, cleanPacket, 0)
 	packetStats = multiClient.PacketStats()
-	assert.Equal(t, int64(1), packetStats.BlockEgressPacketCount)
+	AssertEqual(t, int64(1), packetStats.BlockEgressPacketCount)
 
 	// disabling the blocker takes effect immediately (the cached blocked
 	// decision revalidates against the enabled state)
 	blocker.SetEnabled(false)
 	multiClient.SendPacket(source, protocol.ProvideMode_Network, blockedPacket, 0)
 	packetStats = multiClient.PacketStats()
-	assert.Equal(t, int64(1), packetStats.BlockEgressPacketCount)
+	AssertEqual(t, int64(1), packetStats.BlockEgressPacketCount)
 
 	// and re-enabling blocks again
 	blocker.SetEnabled(true)
 	success = multiClient.SendPacket(source, protocol.ProvideMode_Network, blockedPacket, 0)
-	assert.Equal(t, false, success)
+	AssertEqual(t, false, success)
 	packetStats = multiClient.PacketStats()
-	assert.Equal(t, int64(2), packetStats.BlockEgressPacketCount)
+	AssertEqual(t, int64(2), packetStats.BlockEgressPacketCount)
 }
 
 // TestMultiClientBlockerServerName: a destination whose own observed server
@@ -198,28 +196,28 @@ func TestMultiClientBlockerServerName(t *testing.T) {
 	// blocked via its own server name (sub.ads.example.com suffix-matches
 	// the blocked base)
 	success := multiClient.SendPacket(source, protocol.ProvideMode_Network, blockedPacket, 0)
-	assert.Equal(t, false, success)
+	AssertEqual(t, false, success)
 
 	blockActions := nextBlockActions()
-	assert.Equal(t, 1, len(blockActions))
-	assert.Equal(t, true, blockActions[0].Block)
-	assert.Equal(t, true, blockActions[0].Blocker)
+	AssertEqual(t, 1, len(blockActions))
+	AssertEqual(t, true, blockActions[0].Block)
+	AssertEqual(t, true, blockActions[0].Blocker)
 
 	packetStats := multiClient.PacketStats()
-	assert.Equal(t, int64(1), packetStats.BlockEgressPacketCount)
+	AssertEqual(t, int64(1), packetStats.BlockEgressPacketCount)
 
 	// the clean destination shares a name (cdn.example.com) but none of ITS
 	// names are blocked — not blocked
 	multiClient.SendPacket(source, protocol.ProvideMode_Network, cleanPacket, 0)
 	packetStats = multiClient.PacketStats()
-	assert.Equal(t, int64(1), packetStats.BlockEgressPacketCount)
+	AssertEqual(t, int64(1), packetStats.BlockEgressPacketCount)
 
 	// drain the clean destination's (allow) action from the epoch: every
 	// routing decision is surfaced while a callback is registered
 	blockActions = nextBlockActions()
-	assert.Equal(t, 1, len(blockActions))
-	assert.Equal(t, false, blockActions[0].Block)
-	assert.Equal(t, false, blockActions[0].Blocker)
+	AssertEqual(t, 1, len(blockActions))
+	AssertEqual(t, false, blockActions[0].Block)
+	AssertEqual(t, false, blockActions[0].Blocker)
 
 	// a user un-block override on the blocked host wins over the blocker,
 	// and the allow-classified flow egresses REMOTELY (local stays false)
@@ -233,15 +231,15 @@ func TestMultiClientBlockerServerName(t *testing.T) {
 	multiClient.SendPacket(source, protocol.ProvideMode_Network, blockedPacket, 0)
 
 	blockActions = nextBlockActions()
-	assert.Equal(t, 1, len(blockActions))
-	assert.Equal(t, false, blockActions[0].Block)
-	assert.Equal(t, false, blockActions[0].Local)
-	assert.Equal(t, true, blockActions[0].Blocker)
-	assert.Equal(t, true, blockActions[0].BlockOverrideId != nil)
-	assert.Equal(t, unblockOverride.OverrideId, *blockActions[0].BlockOverrideId)
+	AssertEqual(t, 1, len(blockActions))
+	AssertEqual(t, false, blockActions[0].Block)
+	AssertEqual(t, false, blockActions[0].Local)
+	AssertEqual(t, true, blockActions[0].Blocker)
+	AssertEqual(t, true, blockActions[0].BlockOverrideId != nil)
+	AssertEqual(t, unblockOverride.OverrideId, *blockActions[0].BlockOverrideId)
 
 	// the un-blocked flow did not land in the block or local counters
 	packetStats = multiClient.PacketStats()
-	assert.Equal(t, int64(1), packetStats.BlockEgressPacketCount)
-	assert.Equal(t, int64(0), packetStats.LocalEgressPacketCount)
+	AssertEqual(t, int64(1), packetStats.BlockEgressPacketCount)
+	AssertEqual(t, int64(0), packetStats.LocalEgressPacketCount)
 }

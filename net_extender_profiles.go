@@ -2,8 +2,9 @@ package connect
 
 import (
 	mathrand "math/rand"
+	"slices"
 
-	"golang.org/x/exp/maps"
+	"maps"
 )
 
 // randomly enumerate up to n extender profiles
@@ -34,7 +35,7 @@ func EnumerateExtenderProfiles(n int, visited map[ExtenderProfile]bool) []Extend
 		for i := 0; len(out) < n && i < maxIterations; i += 1 {
 			persona := personas[mathrand.Intn(len(personas))]
 
-			ports := maps.Keys(persona.portConnectModes)
+			ports := slices.Collect(maps.Keys(persona.portConnectModes))
 			port := ports[mathrand.Intn(len(ports))]
 			connectModes := persona.portConnectModes[port]
 			connectMode := connectModes[mathrand.Intn(len(connectModes))]
@@ -62,7 +63,7 @@ func EnumerateExtenderProfiles(n int, visited map[ExtenderProfile]bool) []Extend
 		}
 	}
 
-	return maps.Keys(out)
+	return slices.Collect(maps.Keys(out))
 }
 
 var servicePorts = map[int][]ExtenderConnectMode{

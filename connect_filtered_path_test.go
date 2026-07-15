@@ -5,8 +5,6 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	"github.com/go-playground/assert/v2"
-
 	"github.com/urnetwork/connect/protocol"
 )
 
@@ -17,7 +15,7 @@ func TestParseFilteredTransferPath(t *testing.T) {
 
 	marshal := func(transferFrame *protocol.TransferFrame) []byte {
 		b, err := proto.Marshal(transferFrame)
-		assert.Equal(t, nil, err)
+		AssertEqual(t, nil, err)
 		return b
 	}
 
@@ -51,14 +49,14 @@ func TestParseFilteredTransferPath(t *testing.T) {
 		b := fullFrame(expectedPath)
 
 		path, exists, ok := parseFilteredTransferPath(b)
-		assert.Equal(t, true, ok)
-		assert.Equal(t, true, exists)
-		assert.Equal(t, expectedPath, path)
+		AssertEqual(t, true, ok)
+		AssertEqual(t, true, exists)
+		AssertEqual(t, expectedPath, path)
 
 		// the wrapper must agree with the full unmarshal path
 		path, err := FilteredTransferPath(b)
-		assert.Equal(t, nil, err)
-		assert.Equal(t, expectedPath, path)
+		AssertEqual(t, nil, err)
+		AssertEqual(t, expectedPath, path)
 	}
 
 	// ack frames have a different payload field
@@ -70,15 +68,15 @@ func TestParseFilteredTransferPath(t *testing.T) {
 		},
 	})
 	path, exists, ok := parseFilteredTransferPath(ackFrame)
-	assert.Equal(t, true, ok)
-	assert.Equal(t, true, exists)
-	assert.Equal(t, NewTransferPath(sourceId, destinationId, Id{}), path)
+	AssertEqual(t, true, ok)
+	AssertEqual(t, true, exists)
+	AssertEqual(t, NewTransferPath(sourceId, destinationId, Id{}), path)
 
 	// missing transfer path
 	noPath := marshal(&protocol.TransferFrame{})
 	_, exists, ok = parseFilteredTransferPath(noPath)
-	assert.Equal(t, true, ok)
-	assert.Equal(t, false, exists)
+	AssertEqual(t, true, ok)
+	AssertEqual(t, false, exists)
 	_, err := FilteredTransferPath(noPath)
 	if err == nil {
 		t.Fatal("expected an error for a missing transfer path")
@@ -107,7 +105,7 @@ func TestParseFilteredTransferPath(t *testing.T) {
 		},
 	})
 	_, _, ok = parseFilteredTransferPath(badId)
-	assert.Equal(t, false, ok)
+	AssertEqual(t, false, ok)
 	if _, err := FilteredTransferPath(badId); err == nil {
 		t.Fatal("expected an error for a bad id length")
 	}

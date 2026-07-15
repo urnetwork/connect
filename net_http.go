@@ -23,7 +23,7 @@ import (
 
 	"golang.org/x/net/nettest"
 
-	"golang.org/x/exp/maps"
+	"maps"
 
 	"github.com/gorilla/websocket"
 )
@@ -479,7 +479,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 			serialDialers := []*clientDialer{}
 			parallelDialers := []*clientDialer{}
 
-			dialers := maps.Keys(dialerWeights)
+			dialers := slices.Collect(maps.Keys(dialerWeights))
 			WeightedShuffle(dialers, dialerWeights)
 
 			// always try the top options first
@@ -957,7 +957,7 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 			}
 
 			if 0 < len(weights) {
-				ips := maps.Keys(weights)
+				ips := slices.Collect(maps.Keys(weights))
 				mathrand.Shuffle(len(ips), func(i int, j int) {
 					ips[i], ips[j] = ips[j], ips[i]
 				})
@@ -981,7 +981,7 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 			}
 		}
 	} else {
-		ips := maps.Keys(self.extenderIpSecrets)
+		ips := slices.Collect(maps.Keys(self.extenderIpSecrets))
 		for _, extenderProfile := range extenderProfiles {
 			ip := ips[mathrand.Intn(len(ips))]
 			extenderConfig := &ExtenderConfig{

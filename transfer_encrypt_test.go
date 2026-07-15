@@ -8,8 +8,6 @@ import (
 	"errors"
 	"testing"
 	"time"
-
-	"github.com/go-playground/assert/v2"
 )
 
 // newTestSessionForIdentityProof constructs a peerEncryptionSession
@@ -58,7 +56,7 @@ func newTestSessionForIdentityProof(t *testing.T) (
 	// exercise the identity-proof gate independently.
 	exporter := make([]byte, sequenceTlsIdentityProofLength)
 	_, err = rand.Read(exporter)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 	// Inject a bare handshake epoch with the TLS-derived state pre-set (no
 	// goroutines / real tls.Conn) so the identity-proof gate can be
 	// exercised in isolation. `startEpoch` is a no-op while an epoch is
@@ -70,7 +68,7 @@ func newTestSessionForIdentityProof(t *testing.T) (
 	}
 
 	_, peerPriv, err = ed25519.GenerateKey(rand.Reader)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 
 	cleanup = func() {
 		client.Cancel()
@@ -87,7 +85,7 @@ func TestPeerSessionCipherGatedOnIdentityVerified(t *testing.T) {
 	defer cleanup()
 
 	// Pre-identity-verification: cipher hidden (no established epoch yet).
-	assert.Equal(t, (*sequenceCipher)(nil), sess.Cipher())
+	AssertEqual(t, (*sequenceCipher)(nil), sess.Cipher())
 
 	// Simulate a successful identity proof: flip the flag and promote the
 	// epoch to established, exactly as `maybeVerifyPendingPeerIdentityProof`
@@ -114,14 +112,14 @@ func TestPeerSessionIdentityProofValid(t *testing.T) {
 
 	// Peer signs the session's exporter with their private key.
 	proof := ed25519.Sign(peerPriv, sess.epoch.tlsExporter)
-	assert.Equal(t, ed25519.SignatureSize, len(proof))
+	AssertEqual(t, ed25519.SignatureSize, len(proof))
 
 	// Set the peer key and deliver the proof.
 	sess.SetPeerClientPublicKey(peerPub)
 	sess.receivePeerIdentityProof(proof)
 
-	assert.Equal(t, true, sess.epoch.peerIdentityVerified)
-	assert.Equal(t, false, sess.epoch.identityFailed)
+	AssertEqual(t, true, sess.epoch.peerIdentityVerified)
+	AssertEqual(t, false, sess.epoch.identityFailed)
 	if sess.Cipher() == nil {
 		t.Fatal("Cipher should be exposed after valid identity proof")
 	}
@@ -139,15 +137,15 @@ func TestPeerSessionIdentityProofInvalid(t *testing.T) {
 	// Sign with a different private key — the proof must fail
 	// verification against `peerPub`.
 	_, wrongPriv, err := ed25519.GenerateKey(rand.Reader)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 	badProof := ed25519.Sign(wrongPriv, sess.epoch.tlsExporter)
 
 	sess.SetPeerClientPublicKey(peerPub)
 	sess.receivePeerIdentityProof(badProof)
 
-	assert.Equal(t, false, sess.epoch.peerIdentityVerified)
-	assert.Equal(t, true, sess.epoch.identityFailed)
-	assert.Equal(t, (*sequenceCipher)(nil), sess.Cipher())
+	AssertEqual(t, false, sess.epoch.peerIdentityVerified)
+	AssertEqual(t, true, sess.epoch.identityFailed)
+	AssertEqual(t, (*sequenceCipher)(nil), sess.Cipher())
 }
 
 // TestPeerSessionIdentityProofMalformed covers the defensive path:
@@ -159,8 +157,8 @@ func TestPeerSessionIdentityProofMalformed(t *testing.T) {
 
 	sess.receivePeerIdentityProof([]byte{0, 1, 2}) // way too short
 
-	assert.Equal(t, true, sess.epoch.identityFailed)
-	assert.Equal(t, (*sequenceCipher)(nil), sess.Cipher())
+	AssertEqual(t, true, sess.epoch.identityFailed)
+	AssertEqual(t, (*sequenceCipher)(nil), sess.Cipher())
 }
 
 // TestPeerSessionIdentityProofArrivesBeforeKey covers out-of-order
@@ -175,14 +173,14 @@ func TestPeerSessionIdentityProofArrivesBeforeKey(t *testing.T) {
 
 	// Proof first — must be buffered (no peer key yet).
 	sess.receivePeerIdentityProof(proof)
-	assert.Equal(t, false, sess.epoch.peerIdentityVerified)
+	AssertEqual(t, false, sess.epoch.peerIdentityVerified)
 	if 0 == len(sess.epoch.pendingPeerIdentityProof) {
 		t.Fatal("expected proof to be buffered while peer key unknown")
 	}
 
 	// Key arrives — verification runs and succeeds.
 	sess.SetPeerClientPublicKey(peerPub)
-	assert.Equal(t, true, sess.epoch.peerIdentityVerified)
+	AssertEqual(t, true, sess.epoch.peerIdentityVerified)
 	if 0 != len(sess.epoch.pendingPeerIdentityProof) {
 		t.Fatal("expected buffered proof to be cleared after verification")
 	}
@@ -208,7 +206,7 @@ func TestPeerSessionIdentityProofArrivesBeforeExporter(t *testing.T) {
 	// Set the peer key and the proof before the exporter exists.
 	sess.SetPeerClientPublicKey(peerPub)
 	sess.receivePeerIdentityProof(proof)
-	assert.Equal(t, false, sess.epoch.peerIdentityVerified)
+	AssertEqual(t, false, sess.epoch.peerIdentityVerified)
 	if 0 == len(sess.epoch.pendingPeerIdentityProof) {
 		t.Fatal("expected proof to be buffered while exporter unknown")
 	}
@@ -218,7 +216,7 @@ func TestPeerSessionIdentityProofArrivesBeforeExporter(t *testing.T) {
 	sess.epoch.tlsExporter = savedExporter
 	sess.maybeVerifyPendingPeerIdentityProof(sess.epoch)
 
-	assert.Equal(t, true, sess.epoch.peerIdentityVerified)
+	AssertEqual(t, true, sess.epoch.peerIdentityVerified)
 }
 
 // TestPeerSessionIdentityProofSecondIgnored verifies that a second
@@ -234,18 +232,18 @@ func TestPeerSessionIdentityProofSecondIgnored(t *testing.T) {
 
 	sess.SetPeerClientPublicKey(peerPub)
 	sess.receivePeerIdentityProof(proof)
-	assert.Equal(t, true, sess.epoch.peerIdentityVerified)
+	AssertEqual(t, true, sess.epoch.peerIdentityVerified)
 
 	// A second proof — even if cryptographically valid — must not
 	// change the session state. peerIdentityVerified stays true.
 	sess.receivePeerIdentityProof(proof)
-	assert.Equal(t, true, sess.epoch.peerIdentityVerified)
-	assert.Equal(t, false, sess.epoch.identityFailed)
+	AssertEqual(t, true, sess.epoch.peerIdentityVerified)
+	AssertEqual(t, false, sess.epoch.identityFailed)
 
 	// Also: a second SetPeerClientPublicKey with a different key
 	// must be rejected (first-write-wins, no mid-session rotation).
 	_, otherPriv, err := ed25519.GenerateKey(rand.Reader)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 	otherPub := otherPriv.Public().(ed25519.PublicKey)
 	sess.SetPeerClientPublicKey(otherPub)
 	// Peer key still the original.
@@ -263,15 +261,15 @@ func TestIsAwaitingClientFinished(t *testing.T) {
 
 	// Role is server (set by the helper). Handshake not done,
 	// serverFlightSent not yet — should be false.
-	assert.Equal(t, false, sess.IsAwaitingClientFinished())
+	AssertEqual(t, false, sess.IsAwaitingClientFinished())
 
 	// After serverFlightSent → true (handshake still open).
 	sess.markServerFlightSent(sess.epoch)
-	assert.Equal(t, true, sess.IsAwaitingClientFinished())
+	AssertEqual(t, true, sess.IsAwaitingClientFinished())
 
 	// Close handshakeDone → false (handshake final, success or fail).
 	close(sess.epoch.handshakeDone)
-	assert.Equal(t, false, sess.IsAwaitingClientFinished())
+	AssertEqual(t, false, sess.IsAwaitingClientFinished())
 }
 
 // TestIsAwaitingClientFinishedClientRole verifies that the
@@ -288,7 +286,7 @@ func TestIsAwaitingClientFinishedClientRole(t *testing.T) {
 	defer client.Cancel()
 
 	keyManager, err := NewClientKeyManager(ctx, client)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 	manager := NewEncryptionSessionManager(ctx, client, keyManager, settings.EncryptionSettings)
 
 	clientRoleSess := newPeerEncryptionSession(
@@ -304,7 +302,7 @@ func TestIsAwaitingClientFinishedClientRole(t *testing.T) {
 	// happen in client role, but worth proving the role gate is
 	// what's enforcing the predicate), still false.
 	clientRoleSess.markServerFlightSent(clientRoleSess.epoch)
-	assert.Equal(t, false, clientRoleSess.IsAwaitingClientFinished())
+	AssertEqual(t, false, clientRoleSess.IsAwaitingClientFinished())
 }
 
 // TestOptimisticallyDeliverHandshakeFilter verifies the structural
@@ -320,7 +318,7 @@ func TestOptimisticallyDeliverHandshakeFilter(t *testing.T) {
 	// Put the session into the awaiting-client-Finished state so
 	// the optimistic-apply gate is open.
 	sess.markServerFlightSent(sess.epoch)
-	assert.Equal(t, true, sess.IsAwaitingClientFinished())
+	AssertEqual(t, true, sess.IsAwaitingClientFinished())
 
 	// startEpoch would normally create the transport; we skip
 	// here and only check that the filter rejects type-22 bytes
@@ -575,7 +573,7 @@ func TestReleasedSessionRemovedFromManager(t *testing.T) {
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 	defer client.Cancel()
 	keyManager, err := NewClientKeyManager(ctx, client)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 	manager := NewEncryptionSessionManager(ctx, client, keyManager, settings.EncryptionSettings)
 
 	peerId := NewId()
@@ -638,7 +636,7 @@ func TestAcquireForSendRestartPolicy(t *testing.T) {
 		client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 		defer client.Cancel()
 		km, err := NewClientKeyManager(ctx, client)
-		assert.Equal(t, nil, err)
+		AssertEqual(t, nil, err)
 		manager := NewEncryptionSessionManager(ctx, client, km, settings.EncryptionSettings)
 
 		peerId := NewId()

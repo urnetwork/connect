@@ -16,7 +16,7 @@ import (
 	"slices"
 	"strings"
 
-	"golang.org/x/exp/maps"
+	"maps"
 
 	"google.golang.org/protobuf/proto"
 
@@ -1716,7 +1716,7 @@ func (self *SendBuffer) Ack(destination TransferPath, ack *protocol.Ack, timeout
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
 		if sendSequences, ok := self.sendSequencesByDestination[destination]; ok {
-			return maps.Keys(sendSequences)
+			return slices.Collect(maps.Keys(sendSequences))
 		} else {
 			return []*SendSequence{}
 		}
@@ -4423,7 +4423,7 @@ func (self *ReceiveSequence) setContract(nextReceiveContract *sequenceContract) 
 
 	if d := len(self.openReceiveContracts) - self.receiveBufferSettings.MaxOpenReceiveContract; 0 < d {
 		// remove the least recently added
-		orderedReceiveContracts := maps.Values(self.openReceiveContracts)
+		orderedReceiveContracts := slices.Collect(maps.Values(self.openReceiveContracts))
 		// ascending where earliest created are first
 		slices.SortFunc(orderedReceiveContracts, func(a *sequenceContract, b *sequenceContract) int {
 			return a.localId.Cmp(b.localId)

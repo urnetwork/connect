@@ -12,7 +12,7 @@ import (
 	"time"
 	// "runtime/debug"
 
-	"golang.org/x/exp/maps"
+	"maps"
 )
 
 // manage multiple routes to a destination, allowing weighted reads and writes to the routes
@@ -533,7 +533,7 @@ func (self *MultiRouteSelector) updateRouteWeights() {
 		transportStats[transport] = netStats
 	}
 
-	orderedTransports := maps.Keys(self.transportRoutes)
+	orderedTransports := slices.Collect(maps.Keys(self.transportRoutes))
 	// shuffle the same priority values
 	mathrand.Shuffle(len(orderedTransports), func(i int, j int) {
 		t := orderedTransports[i]

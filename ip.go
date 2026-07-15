@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/exp/maps"
+	"maps"
 
 	// "google.golang.org/protobuf/proto"
 
@@ -986,7 +986,7 @@ func (self *UdpBuffer[BufferId]) udpSend(
 		if 0 < self.udpBufferSettings.UserLimit {
 			// limit the total connections per source to avoid blowing up the ulimit
 			if sourceSequences := self.sourceSequences[source]; self.udpBufferSettings.UserLimit < len(sourceSequences) {
-				applyLruUserLimit(maps.Values(sourceSequences), self.udpBufferSettings.UserLimit, func(sequence *UdpSequence) bool {
+				applyLruUserLimit(slices.Collect(maps.Values(sourceSequences)), self.udpBufferSettings.UserLimit, func(sequence *UdpSequence) bool {
 					if self.log.V(1).Enabled() {
 						self.log.Infof(
 							"[lnr]udp limit source %s->%s\n",
@@ -1784,7 +1784,7 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 		if 0 < self.tcpBufferSettings.UserLimit {
 			// limit the total connections per source to avoid blowing up the ulimit
 			if sourceSequences := self.sourceSequences[source]; self.tcpBufferSettings.UserLimit < len(sourceSequences) {
-				applyLruUserLimit(maps.Values(sourceSequences), self.tcpBufferSettings.UserLimit, func(sequence *TcpSequence) bool {
+				applyLruUserLimit(slices.Collect(maps.Values(sourceSequences)), self.tcpBufferSettings.UserLimit, func(sequence *TcpSequence) bool {
 					if self.log.V(1).Enabled() {
 						self.log.Infof(
 							"[lnr]tcp limit source %s->%s\n",
