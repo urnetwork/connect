@@ -198,7 +198,7 @@ func DefaultContractManagerSettingsWithBufferSize(bufferSize int) *ContractManag
 	}
 	return &ContractManagerSettings{
 		SequenceBufferSize:                bufferSize,
-		InitialContractTransferByteCount:  kib(16),
+		InitialContractTransferByteCount:  kib(256),
 		StandardContractTransferByteCount: mib(128),
 		ContractTransferByteSeqScale:      4,
 
