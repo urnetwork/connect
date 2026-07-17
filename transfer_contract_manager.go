@@ -1117,6 +1117,8 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 		[]*protocol.Frame{frame},
 		func(resultFrames []*protocol.Frame, err error) {
 			if err == nil {
+				// OOB round-trip succeeded: backend is reachable, clear degradation counter
+				consecutiveBackendFails.Store(0)
 				for _, resultFrame := range resultFrames {
 					self.HandleControlFrame(contractKey, resultFrame)
 				}
@@ -1125,7 +1127,15 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 				case <-self.client.Done():
 					// no need to log warnings when the client closes
 				default:
-					self.client.log.Infof("[contract]oob err = %s\n", err)
+					lastBackendFailNano.Store(time.Now().UnixNano())
+					consecutiveBackendFails.Add(1)
+					if ok, suppressed := shouldLogOobErr(); ok {
+						if suppressed > 0 {
+							self.client.log.Infof("[contract]oob err = %s (%d suppressed)\n", err, suppressed)
+						} else {
+							self.client.log.Infof("[contract]oob err = %s\n", err)
+						}
+					}
 				}
 			}
 		},

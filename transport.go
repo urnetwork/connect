@@ -93,6 +93,87 @@ func (self *ClientAuth) ClientId() (Id, error) {
 	return byJwt.ClientId, nil
 }
 
+// Package-level atomics shared across all PlatformTransport instances,
+// rate-limiting auth error log lines to at most once per minute and tracking
+// how many were suppressed in the interval.
+var lastAuthErrLogNano atomic.Int64
+var suppressedAuthErrCount atomic.Int64
+
+// Package-level atomics for OOB error rate-limiting.
+var lastOobErrLogNano atomic.Int64
+var suppressedOobErrCount atomic.Int64
+
+// lastBackendFailNano is updated on every backend failure (auth or OOB), not
+// rate-limited. Used by isBackendDegraded() as the recency guard.
+var lastBackendFailNano atomic.Int64
+
+// consecutiveBackendFails counts backend failures (auth or OOB) since the last
+// success. Any successful connect or OOB result resets it to 0. A real platform
+// outage drives this up fast because every attempt fails with nothing to reset
+// it; isolated transient timeouts never accumulate because an interleaved
+// success clears the count. isBackendDegraded() requires this to cross a
+// threshold so one or two stray failures are not mistaken for an outage.
+var consecutiveBackendFails atomic.Int64
+
+// backendDegradedFailThreshold is the number of consecutive backend failures
+// (with no intervening success) required before the backend is considered
+// degraded. Set above the level of normal transient churn.
+const backendDegradedFailThreshold = 3
+
+// backendDegradedWindow is how recent the last failure must be for the counter
+// to be trusted. Comfortably larger than the 60s reconnect-backoff cap so a real
+// outage's retry attempts always read as recent, while a stale count left by an
+// old blip on an idle provider does not.
+const backendDegradedWindow = 2 * time.Minute
+
+// shouldLogAuthErr returns (true, suppressedCount) if a log line should be
+// emitted, resetting the suppressed counter. Returns (false, 0) if suppressed.
+func shouldLogAuthErr() (bool, int64) {
+	now := time.Now().UnixNano()
+	last := lastAuthErrLogNano.Load()
+	if now-last < int64(time.Minute) {
+		suppressedAuthErrCount.Add(1)
+		return false, 0
+	}
+	if !lastAuthErrLogNano.CompareAndSwap(last, now) {
+		suppressedAuthErrCount.Add(1)
+		return false, 0
+	}
+	suppressed := suppressedAuthErrCount.Swap(0)
+	return true, suppressed
+}
+
+// shouldLogOobErr returns (true, suppressedCount) if a [contract]oob err line
+// should be emitted, resetting the suppressed counter. Returns (false, 0) if
+// suppressed. Defined here so this PR is self-contained.
+func shouldLogOobErr() (bool, int64) {
+	now := time.Now().UnixNano()
+	last := lastOobErrLogNano.Load()
+	if now-last < int64(time.Minute) {
+		suppressedOobErrCount.Add(1)
+		return false, 0
+	}
+	if !lastOobErrLogNano.CompareAndSwap(last, now) {
+		suppressedOobErrCount.Add(1)
+		return false, 0
+	}
+	suppressed := suppressedOobErrCount.Swap(0)
+	return true, suppressed
+}
+
+// isBackendDegraded returns true when backend failures have accumulated past the
+// threshold with no intervening success and the last failure is recent. This
+// distinguishes a sustained, broad outage (every attempt failing) from the
+// isolated single-connection timeouts that are normal churn on a busy provider.
+// Contract creation and resend pacing consult this to avoid leaking bandwidth
+// against an unreachable platform.
+func isBackendDegraded() bool {
+	if consecutiveBackendFails.Load() < backendDegradedFailThreshold {
+		return false
+	}
+	return time.Now().UnixNano()-lastBackendFailNano.Load() < int64(backendDegradedWindow)
+}
+
 // (ctx, network, address)
 // type DialContextFunc func(ctx context.Context, network string, address string) (net.Conn, error)
 
@@ -566,7 +647,15 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			ws, err = connect()
 		}
 		if err != nil {
-			self.log.Infof("[t]auth error %s = %s\n", clientId, err)
+			lastBackendFailNano.Store(time.Now().UnixNano())
+			consecutiveBackendFails.Add(1)
+			if ok, suppressed := shouldLogAuthErr(); ok {
+				if suppressed > 0 {
+					self.log.Infof("[t]auth error %s = %s (%d suppressed)\n", clientId, err, suppressed)
+				} else {
+					self.log.Infof("[t]auth error %s = %s\n", clientId, err)
+				}
+			}
 			select {
 			case <-self.ctx.Done():
 				return
@@ -574,6 +663,10 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				continue
 			}
 		}
+
+		// auth succeeded: backend is reachable, clear degradation counter
+		lastBackendFailNano.Store(0)
+		consecutiveBackendFails.Store(0)
 
 		c := func() {
 			defer ws.Close()
@@ -1178,7 +1271,15 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			connStream, err = connect()
 		}
 		if err != nil {
-			self.log.Infof("[t]auth error %s = %s\n", clientId, err)
+			lastBackendFailNano.Store(time.Now().UnixNano())
+			consecutiveBackendFails.Add(1)
+			if ok, suppressed := shouldLogAuthErr(); ok {
+				if suppressed > 0 {
+					self.log.Infof("[t]auth error %s = %s (%d suppressed)\n", clientId, err, suppressed)
+				} else {
+					self.log.Infof("[t]auth error %s = %s\n", clientId, err)
+				}
+			}
 			select {
 			case <-self.ctx.Done():
 				return
@@ -1186,6 +1287,11 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				continue
 			}
 		}
+
+		// auth succeeded: backend is reachable, clear degradation counter
+		lastBackendFailNano.Store(0)
+		consecutiveBackendFails.Store(0)
+
 		conn := connStream.conn
 		stream := connStream.stream
 
