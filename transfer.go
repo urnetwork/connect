@@ -127,8 +127,12 @@ func DefaultSendBufferSettings() *SendBufferSettings {
 
 func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings {
 	return &SendBufferSettings{
-		CreateContractTimeout:       30 * time.Second,
-		CreateContractRetryInterval: 5 * time.Second,
+		CreateContractTimeout: 30 * time.Second,
+		// Retry a failed/absent contract promptly. A same-network peer connect can
+		// briefly return NoPermission while the target's provide registration is
+		// still committing; the send sequence blocks on this interval before
+		// retrying, so a long interval turns that race into a multi-second stall.
+		CreateContractRetryInterval: 1 * time.Second,
 		MinResendInterval:           2 * time.Second,
 		MaxResendInterval:           8 * time.Second,
 		// no backoff
@@ -1425,6 +1429,22 @@ func (self *Client) Ctx() context.Context {
 }
 
 // this does not need to be called if `Cancel` is called
+// Event-escape contract for teardown (Close / Cancel):
+//
+// The general rule holds — do NOT rely on any listener event firing after
+// Close/Cancel. Cancelling the ctx stops the epoch workers and the sequence
+// goroutines; any events they would emit during teardown are best-effort and
+// may be dropped (e.g. runContractStats does a single backstop emit on ctx-done,
+// but it can only surface closes already marked before the worker exits).
+//
+// The one exception that must be delivered deterministically is contract-stats
+// CLOSES (the Open=false ContractStatsEvent per open contract). These do NOT
+// escape from Close/Cancel on their own. To deliver them, the owner MUST call
+// CloseContractStats() BEFORE Close/Cancel and BEFORE removing stats listeners,
+// so the closes fire synchronously while listeners are still attached. This is
+// required so a torn-down client's (e.g. a removed multi-client provider's)
+// contracts don't linger open in the contract-details UI. See
+// ContractManager.CloseAllContractStats and the multi-client channel teardown.
 func (self *Client) Close() {
 	self.cancel()
 
@@ -1447,6 +1467,14 @@ func (self *Client) Cancel() {
 	self.sendBuffer.Cancel()
 	self.receiveBuffer.Cancel()
 	self.forwardBuffer.Cancel()
+}
+
+// CloseContractStats fires the close events for all of this client's open
+// contracts synchronously, so they reach attached stats listeners before the
+// client is cancelled and the listeners are removed. Call it just before
+// Cancel/Close at teardown. See ContractManager.CloseAllContractStats.
+func (self *Client) CloseContractStats() {
+	self.contractManager.CloseAllContractStats()
 }
 
 func (self *Client) Flush() {
@@ -2380,6 +2408,23 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 	// `sendNoContract` is a mutual configuration
 	// both sides must configure themselves to require no contract from each other
 	if self.client.ContractManager().SendNoContract(self.destination.DestinationId) {
+		// the destination newly requires no contract.
+		// drop the active contract so that subsequent items are not attributed
+		// to it: an item sent without a contract debit would over credit the
+		// contract accounting when its ack arrives.
+		// do not close the current contract unless it has no pending data;
+		// the contract is tracked in `openSendContracts` and will be closed on ack
+		if self.sendContract != nil {
+			if self.sendContract.unackedByteCount == 0 {
+				self.client.ContractManager().CloseContract(
+					self.sendContract.contractId,
+					self.sendContract.ackedByteCount,
+					self.sendContract.unackedByteCount,
+				)
+				delete(self.openSendContracts, self.sendContract.contractId)
+			}
+			self.sendContract = nil
+		}
 		return true
 	}
 	if self.sendContract != nil && self.sendContract.update(messageByteCount) {
@@ -4409,6 +4454,18 @@ func (self *ReceiveSequence) setContract(nextReceiveContract *sequenceContract) 
 		return nil
 	}
 
+	// a genuinely new (typically larger) contract supersedes the current one.
+	// Close the superseded contract's STATS now so it stops showing as an open
+	// contract, mirroring the send side, which closes a drained predecessor in
+	// `ackItem`. This is a stats-only close, NOT a wire-level CloseContract: the
+	// superseded contract stays in `openReceiveContracts` for the sender's
+	// resend/reorder window (see MaxOpenReceiveContract), and the overflow trim
+	// below does the real close once the buffer fills. Without this, up to
+	// MaxOpenReceiveContract exhausted receive contracts linger open forever
+	// under continuous traffic (the sequence never ends and the trim never
+	// triggers at <= the buffer size), accumulating in the UI.
+	superseded := self.receiveContract
+
 	self.openReceiveContracts[nextReceiveContract.contractId] = nextReceiveContract
 	self.receiveContract = nextReceiveContract
 	// the receive side does not know companion-ness (the wire contract does not
@@ -4420,6 +4477,10 @@ func (self *ReceiveSequence) setContract(nextReceiveContract *sequenceContract) 
 		nextReceiveContract.path,
 		nextReceiveContract.transferByteCount,
 	)
+
+	if superseded != nil {
+		self.client.ContractManager().closeContractStats(superseded.contractId)
+	}
 
 	if d := len(self.openReceiveContracts) - self.receiveBufferSettings.MaxOpenReceiveContract; 0 < d {
 		// remove the least recently added

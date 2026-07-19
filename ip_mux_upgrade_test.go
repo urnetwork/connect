@@ -214,6 +214,49 @@ func TestUpgradeMuxDnsNoReplyOnFailure(t *testing.T) {
 	}
 }
 
+// TestUpgradeMuxDnsHttpsTypeClaimed: SVCB/HTTPS (64/65) queries are claimed (routed to the
+// DoH forward path), not passed through to the upstream. Here there is no reachable tunnel
+// DoH, so the forward fails and nothing is delivered — the client would fall back to A/AAAA.
+// Genuinely other types (TXT) still pass through unclaimed. (The forward's success path —
+// delivery + hint recording — is covered by TestDohCacheForward and TestParseHttpsHints.)
+func TestUpgradeMuxDnsHttpsTypeClaimed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rec := &ipMuxRecorder{}
+	settings := DefaultUpgradeMuxSettings()
+	// an empty resolver (remote DoH disabled): the forward short-circuits with no reply and
+	// no tunnel traffic, so the upstream counter reflects only genuinely passed-through queries
+	settings.Dns.Resolver = &DnsResolverSettings{}
+	settings.Dns.Fallback = nil
+	mux, err := NewUpgradeMux(ctx, TransferPath{}, protocol.ProvideMode_Network, 0, rec.receive, settings, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mux.Close()
+	mux.SetUpstream(rec.upstream)
+
+	for _, qtype := range []dnsmessage.Type{dnsTypeSvcb, dnsTypeHttps} {
+		if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "svc.example.test.", qtype, 0x4242), 0) {
+			t.Fatalf("type %d query was not claimed", qtype)
+		}
+	}
+	// the claimed queries go to the DoH forward path (not passed through), and with remote DoH
+	// disabled the forward short-circuits: nothing upstream, nothing delivered downstream
+	time.Sleep(300 * time.Millisecond)
+	if sent, received := rec.counts(); sent != 0 || received != 0 {
+		t.Fatalf("claimed SVCB/HTTPS: sent=%d received=%d, want 0/0", sent, received)
+	}
+
+	// a TXT query is not claimed: it passes through to the upstream untouched
+	if mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "svc.example.test.", dnsmessage.TypeTXT, 0x4343), 0) {
+		// SendPacket returns the upstream's result for pass-through (true from the recorder)
+	}
+	if sent, _ := rec.counts(); sent != 1 {
+		t.Fatalf("TXT query should pass through to the upstream, sent=%d", sent)
+	}
+}
+
 // dnsQueryPacket crafts the IPv4/UDP DNS A-query packet for an FQDN (name must end in ".") as the
 // mux sees it on the send path (destined for :53).
 func dnsQueryPacket(t *testing.T, name string) []byte {
@@ -437,20 +480,25 @@ func TestUpgradeMuxHttpModes(t *testing.T) {
 // with the full-parse decision for IPv4/IPv6 TCP/UDP, and defers (decided=false) to the full
 // parse for IPv6 extension headers and short/unsupported headers.
 func TestPeekClaim(t *testing.T) {
+	// a full 20-byte TCP header (data offset = 5 words) so the TCP/443 branch can extract the
+	// segment; other protocols/ports never read past the ports.
 	mkv4 := func(proto byte, dport int) []byte {
-		p := make([]byte, 28) // 20-byte IPv4 header + 8 bytes of L4 (ports)
+		p := make([]byte, 40) // 20-byte IPv4 header + 20-byte TCP header
 		p[0] = 0x45           // ipv4, ihl=5
 		p[9] = proto
 		p[22] = byte(dport >> 8)
 		p[23] = byte(dport)
+		p[32] = 0x50 // TCP data offset = 5 words (20 bytes) at L4 offset 12
 		return p
 	}
 	mkv6 := func(nextHdr byte, dport int) []byte {
-		p := make([]byte, 48) // 40-byte IPv6 header + 8 bytes of L4
+		p := make([]byte, 60) // 40-byte IPv6 header + 20-byte TCP header
 		p[0] = 0x60           // ipv6
+		p[5] = 20             // payload length = 20 (the TCP header)
 		p[6] = nextHdr
 		p[42] = byte(dport >> 8)
 		p[43] = byte(dport)
+		p[52] = 0x50 // TCP data offset = 5 words (20 bytes) at L4 offset 12
 		return p
 	}
 	const tcp, udp, icmp, hopopt byte = 6, 17, 1, 0
@@ -460,59 +508,212 @@ func TestPeekClaim(t *testing.T) {
 		want   peekResult
 	}{
 		{"v4 tcp 80", mkv4(tcp, 80), peekHttp},
-		{"v4 tcp 443", mkv4(tcp, 443), peekOther},
+		{"v4 tcp 443", mkv4(tcp, 443), peekTls},
 		{"v4 udp 53", mkv4(udp, 53), peekDns},
 		{"v4 udp 4500", mkv4(udp, 4500), peekOther},
 		{"v4 icmp", mkv4(icmp, 0), peekOther},
 		{"v6 tcp 80", mkv6(tcp, 80), peekHttp},
-		{"v6 tcp 443", mkv6(tcp, 443), peekOther},
+		{"v6 tcp 443", mkv6(tcp, 443), peekTls},
 		{"v6 udp 53", mkv6(udp, 53), peekDns},
 		{"v6 extension header", mkv6(hopopt, 80), peekUndecided},
 		{"short", []byte{0x45, 0x00}, peekUndecided},
 		{"empty", nil, peekUndecided},
 	}
 	for _, c := range cases {
-		if got := peekClaim(c.packet); got != c.want {
+		var seg tlsSegment
+		got := peekClaim(c.packet, &seg)
+		if got != c.want {
 			t.Errorf("%s: peekClaim = %d, want %d", c.name, got, c.want)
+		}
+		// peekTls must hand back a populated segment (so the sniffer skips its own parse);
+		// every other result leaves seg untouched.
+		if c.want == peekTls {
+			if seg.flow.dstPort != 443 {
+				t.Errorf("%s: peekTls seg.dstPort = %d, want 443", c.name, seg.flow.dstPort)
+			}
+		} else if seg.flow != (sniFlowKey{}) || seg.payload != nil {
+			t.Errorf("%s: non-TLS result populated seg = %+v", c.name, seg)
 		}
 	}
 }
 
-// TestReverseEviction verifies the maintenance loop's IP→hostname affinity-record eviction.
+// TestReverseEviction verifies the reverse index's idle affinity-record eviction (which
+// the mux's maintenance loop drives).
 func TestReverseEviction(t *testing.T) {
-	mux := &UpgradeMux{reverse: map[netip.Addr]reverseEntry{}}
+	ri := newReverseIndex(func() int { return defaultReverseMaxEntries })
 	now := time.Now().UnixNano()
 	ttl := time.Minute
 	stale := netip.MustParseAddr("93.184.216.34")
 	fresh := netip.MustParseAddr("93.184.216.35")
-	mux.reverse[stale] = reverseEntry{serverNames: []string{"a.example"}, lastActivityNanos: now - int64(2*ttl)}
-	mux.reverse[fresh] = reverseEntry{serverNames: []string{"b.example"}, lastActivityNanos: now}
+	ri.entries[stale] = reverseEntry{serverNames: []string{"a.example"}, lastActivityNanos: now - int64(2*ttl)}
+	ri.entries[fresh] = reverseEntry{serverNames: []string{"b.example"}, lastActivityNanos: now}
 
-	mux.evictReverse(ttl)
-	if _, ok := mux.reverse[stale]; ok {
+	ri.evictIdle(ttl)
+	if _, ok := ri.entries[stale]; ok {
 		t.Fatal("idle affinity record should be evicted")
 	}
-	if _, ok := mux.reverse[fresh]; !ok {
+	if _, ok := ri.entries[fresh]; !ok {
 		t.Fatal("fresh affinity record should be kept")
 	}
-	mux.evictReverse(0)
-	if _, ok := mux.reverse[fresh]; !ok {
-		t.Fatal("evictReverse(0) should not evict")
+	ri.evictIdle(0)
+	if _, ok := ri.entries[fresh]; !ok {
+		t.Fatal("evictIdle(0) should not evict")
 	}
 }
 
 // TestReverseTouchKeepsActive verifies that a return packet refreshes an affinity record, so
 // an IP with live return traffic is not idle-evicted (the fix for the routing-affinity flip).
 func TestReverseTouchKeepsActive(t *testing.T) {
-	mux := &UpgradeMux{reverse: map[netip.Addr]reverseEntry{}}
+	ri := newReverseIndex(func() int { return defaultReverseMaxEntries })
 	ip := netip.MustParseAddr("93.184.216.34")
 	// an entry old enough to be evicted
-	mux.reverse[ip] = reverseEntry{serverNames: []string{"x.example"}, lastActivityNanos: time.Now().UnixNano() - int64(2*time.Minute)}
+	ri.entries[ip] = reverseEntry{serverNames: []string{"x.example"}, lastActivityNanos: time.Now().UnixNano() - int64(2*time.Minute)}
 	// a return packet from that IP refreshes its activity
-	mux.touchServerNames(net.ParseIP("93.184.216.34"))
-	mux.evictReverse(time.Minute)
-	if _, ok := mux.reverse[ip]; !ok {
+	ri.touch(net.ParseIP("93.184.216.34"))
+	ri.evictIdle(time.Minute)
+	if _, ok := ri.entries[ip]; !ok {
 		t.Fatal("an affinity record refreshed by return traffic should not be idle-evicted")
+	}
+}
+
+// TestReverseIndexShed verifies memory-pressure shed keeps the most-recently-active
+// half of the records rather than clearing everything (so live flows keep their names).
+func TestReverseIndexShed(t *testing.T) {
+	ri := newReverseIndex(func() int { return defaultReverseMaxEntries })
+	now := time.Now().UnixNano()
+	// 10 records with increasing activity; the newest 5 must survive a shed
+	for i := range 10 {
+		addr := netip.AddrFrom4([4]byte{198, 51, 100, byte(i)})
+		ri.entries[addr] = reverseEntry{serverNames: []string{"h.example"}, lastActivityNanos: now + int64(i)}
+	}
+	ri.shed()
+	if ri.count() != 5 {
+		t.Fatalf("shed kept %d records, want 5 (the most-recently-active half)", ri.count())
+	}
+	// the 5 kept must be the most-recently-active (indices 5..9)
+	for i := 5; i < 10; i++ {
+		addr := netip.AddrFrom4([4]byte{198, 51, 100, byte(i)})
+		if _, ok := ri.entries[addr]; !ok {
+			t.Fatalf("shed dropped a recently-active record (index %d)", i)
+		}
+	}
+}
+
+// TestReverseIndexAdoptFrom verifies a rebuilt index inherits a prior index's names
+// (keeping the more-recently-active on collision) without copying callbacks.
+func TestReverseIndexAdoptFrom(t *testing.T) {
+	now := time.Now().UnixNano()
+	prior := newReverseIndex(func() int { return defaultReverseMaxEntries })
+	a := netip.MustParseAddr("203.0.113.1")
+	b := netip.MustParseAddr("203.0.113.2")
+	prior.entries[a] = reverseEntry{serverNames: []string{"a.example"}, lastActivityNanos: now}
+	prior.entries[b] = reverseEntry{serverNames: []string{"b.example"}, lastActivityNanos: now}
+
+	next := newReverseIndex(func() int { return defaultReverseMaxEntries })
+	// next already has a NEWER record for b: it must win over the adopted one
+	next.entries[b] = reverseEntry{serverNames: []string{"b2.example"}, lastActivityNanos: now + 100}
+	// a learned callback on next must NOT be triggered by adopt (no re-notification)
+	fired := false
+	next.addLearnedCallback(func([]netip.Addr) { fired = true })
+
+	next.adoptFrom(prior)
+
+	if names := next.serverNames(a.String()); !slices.Equal(names, []string{"a.example"}) {
+		t.Fatalf("adopted a = %v, want [a.example]", names)
+	}
+	if names := next.serverNames(b.String()); !slices.Equal(names, []string{"b2.example"}) {
+		t.Fatalf("b = %v, want the newer local [b2.example] to win over adopt", names)
+	}
+	if fired {
+		t.Fatal("adoptFrom must not fire learned callbacks")
+	}
+	// adopting nil is a no-op
+	next.adoptFrom(nil)
+}
+
+// TestReverseIndexLearnedCallbacks verifies the reverse index fires its learned
+// callbacks with exactly the ips that newly gained a server name — the signal the
+// multi-client uses to invalidate block-action decisions so they report the name.
+func TestReverseIndexLearnedCallbacks(t *testing.T) {
+	ri := newReverseIndex(func() int { return defaultReverseMaxEntries })
+
+	var learned [][]netip.Addr
+	unsub := ri.addLearnedCallback(func(addrs []netip.Addr) {
+		// copy: don't retain the index's slice
+		learned = append(learned, append([]netip.Addr{}, addrs...))
+	})
+
+	a := netip.MustParseAddr("93.184.216.34")
+	b := netip.MustParseAddr("93.184.216.35")
+
+	// the first resolution learns the name for both ips
+	ri.record([]netip.Addr{a, b}, "example.com")
+	if len(learned) != 1 || !slices.Equal(learned[0], []netip.Addr{a, b}) {
+		t.Fatalf("first record should learn %v, got %v", []netip.Addr{a, b}, learned)
+	}
+
+	// re-resolving a name already known for those ips is not newly learned
+	ri.record([]netip.Addr{a, b}, "example.com")
+	if len(learned) != 1 {
+		t.Fatalf("re-recording a known name should not fire the learned callback, got %d fires", len(learned))
+	}
+
+	// a different name for an existing ip is newly learned for just that ip
+	ri.record([]netip.Addr{a}, "cdn.example.com")
+	if len(learned) != 2 || !slices.Equal(learned[1], []netip.Addr{a}) {
+		t.Fatalf("a new name for %v should fire with just that ip, got %v", a, learned)
+	}
+
+	// after unsub, no more callbacks fire
+	unsub()
+	ri.record([]netip.Addr{netip.MustParseAddr("93.184.216.36")}, "other.example.com")
+	if len(learned) != 2 {
+		t.Fatalf("no callback should fire after unsub, got %d fires", len(learned))
+	}
+}
+
+// TestUpgradeMuxServerNamesLearnedNotifier verifies a fully-constructed mux exposes
+// its reverse index through the two interfaces the multi-client consumes —
+// ServerNameLookup and ServerNamesLearnedNotifier — so a recorded resolution is
+// both retrievable by ip and announced to learned subscribers.
+func TestUpgradeMuxServerNamesLearnedNotifier(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rec := &ipMuxRecorder{}
+	mux, err := NewUpgradeMux(ctx, TransferPath{}, protocol.ProvideMode_Network, 0, rec.receive, DefaultUpgradeMuxSettings(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mux.Close()
+
+	// the mux is usable as both interfaces the multi-client wires up
+	var _ ServerNameLookup = mux
+	notifier, ok := any(mux).(ServerNamesLearnedNotifier)
+	if !ok {
+		t.Fatal("mux should implement ServerNamesLearnedNotifier")
+	}
+
+	learnedCh := make(chan []netip.Addr, 1)
+	unsub := notifier.AddServerNamesLearnedCallback(func(addrs []netip.Addr) {
+		learnedCh <- append([]netip.Addr{}, addrs...)
+	})
+	defer unsub()
+
+	ip := netip.MustParseAddr("203.0.113.9")
+	mux.reverse.record([]netip.Addr{ip}, "learned.example.test")
+
+	select {
+	case addrs := <-learnedCh:
+		if !slices.Equal(addrs, []netip.Addr{ip}) {
+			t.Fatalf("learned callback got %v, want %v", addrs, []netip.Addr{ip})
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for the learned callback")
+	}
+
+	if names := mux.ServerNames(ip.String()); !slices.Equal(names, []string{"learned.example.test"}) {
+		t.Fatalf("ServerNames = %v, want the recorded name", names)
 	}
 }
 
@@ -747,38 +948,36 @@ func TestUpgradeMuxDnsInflightCap(t *testing.T) {
 // evict the least-recently-active of a sample) and each record keeps at most the most
 // recent maxServerNamesPerIp names.
 func TestReverseBounds(t *testing.T) {
-	settings := DefaultUpgradeMuxSettings()
-	settings.Dns.ReverseMaxEntries = 8
-	mux := &UpgradeMux{reverse: map[netip.Addr]reverseEntry{}}
-	mux.settings.Store(settings)
+	ri := newReverseIndex(func() int { return 8 })
 
 	for i := range 20 {
 		addr := netip.AddrFrom4([4]byte{198, 51, 100, byte(i + 1)})
-		mux.recordServerNames([]netip.Addr{addr}, "host.example.test")
-		if 8 < len(mux.reverse) {
-			t.Fatalf("reverse map grew to %d entries, cap is 8", len(mux.reverse))
+		ri.record([]netip.Addr{addr}, "host.example.test")
+		if 8 < ri.count() {
+			t.Fatalf("reverse map grew to %d entries, cap is 8", ri.count())
 		}
 	}
-	if len(mux.reverse) != 8 {
-		t.Fatalf("reverse map has %d entries after 20 inserts, want the cap (8)", len(mux.reverse))
+	if ri.count() != 8 {
+		t.Fatalf("reverse map has %d entries after 20 inserts, want the cap (8)", ri.count())
 	}
 
 	// names per IP: the most recent maxServerNamesPerIp are kept, oldest dropped
 	addr := netip.MustParseAddr("198.51.100.200")
 	for i := range 6 {
-		mux.recordServerNames([]netip.Addr{addr}, fmt.Sprintf("n%d.example.test", i))
+		ri.record([]netip.Addr{addr}, fmt.Sprintf("n%d.example.test", i))
 	}
 	// a repeat of a kept name must not duplicate it
-	mux.recordServerNames([]netip.Addr{addr}, "n5.example.test")
-	e := mux.reverse[addr]
+	ri.record([]netip.Addr{addr}, "n5.example.test")
+	e := ri.entries[addr]
 	want := []string{"n2.example.test", "n3.example.test", "n4.example.test", "n5.example.test"}
 	if !slices.Equal(e.serverNames, want) {
 		t.Fatalf("serverNames = %v, want the most recent %d: %v", e.serverNames, maxServerNamesPerIp, want)
 	}
 }
 
-// TestUpgradeMuxShedMemory: the host memory-pressure hook drops the recoverable caches —
-// the affinity map and the resolver query cache.
+// TestUpgradeMuxShedMemory: the host memory-pressure hook drops the resolver query cache
+// fully and trims the affinity map to its most-recently-active half (so live flows keep
+// their names — a full drop would flip them to by-IP routing and blank the host feed).
 func TestUpgradeMuxShedMemory(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -790,26 +989,37 @@ func TestUpgradeMuxShedMemory(t *testing.T) {
 	}
 	defer mux.Close()
 
-	ip := netip.MustParseAddr("203.0.113.7")
-	mux.recordServerNames([]netip.Addr{ip}, "shed.example.test")
-	if names := mux.ServerNames(ip.String()); len(names) == 0 {
-		t.Fatal("affinity record missing before shed")
-	}
+	// a mix of idle and active affinity records
+	now := time.Now().UnixNano()
+	active := netip.MustParseAddr("203.0.113.7")
+	idle := netip.MustParseAddr("203.0.113.8")
+	func() {
+		mux.reverse.lock.Lock()
+		defer mux.reverse.lock.Unlock()
+		mux.reverse.entries[idle] = reverseEntry{serverNames: []string{"idle.example.test"}, lastActivityNanos: now - int64(time.Hour)}
+		mux.reverse.entries[active] = reverseEntry{serverNames: []string{"active.example.test"}, lastActivityNanos: now}
+	}()
+
 	dohCache := mux.mux.Tun().DohCache()
 	func() {
 		dohCache.stateLock.Lock()
 		defer dohCache.stateLock.Unlock()
 		dohCache.queryResultExpiration[NewDohKey("A", "seed.example.test")] = &DohResult{
 			Time:            time.Now(),
-			AddrExpirations: map[netip.Addr]time.Time{ip: time.Now().Add(time.Hour)},
+			AddrExpirations: map[netip.Addr]time.Time{active: time.Now().Add(time.Hour)},
 		}
 	}()
 
 	mux.ShedMemory()
 
-	if names := mux.ServerNames(ip.String()); 0 < len(names) {
-		t.Fatalf("affinity records survive shed: %v", names)
+	// the active affinity record survives; the idle one is shed
+	if names := mux.ServerNames(active.String()); len(names) == 0 {
+		t.Fatal("active affinity record should survive shed")
 	}
+	if names := mux.ServerNames(idle.String()); 0 < len(names) {
+		t.Fatalf("idle affinity record should be shed: %v", names)
+	}
+	// the resolver query cache is dropped fully
 	func() {
 		dohCache.stateLock.Lock()
 		defer dohCache.stateLock.Unlock()

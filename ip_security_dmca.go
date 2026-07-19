@@ -124,8 +124,11 @@ func DefaultDmcaSecurityPolicySettings() *DmcaSecurityPolicySettings {
 		EncryptedPopcountBand:         0.10,
 		EncryptedMaxPrintableFraction: 0.50,
 		EncryptedMinNormalizedEntropy: 0.85,
-		MaxFlows:                      65536,
-		FlowTtl:                       300 * time.Second,
+		// scaled by the memory budget: each tracked flow holds ~100-200
+		// bytes (state + map overhead), so the cap bounds the policy's
+		// worst case footprint per instance
+		MaxFlows: MemoryScaledCount(65536, 4096),
+		FlowTtl:  300 * time.Second,
 	}
 }
 

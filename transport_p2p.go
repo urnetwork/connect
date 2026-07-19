@@ -2,8 +2,10 @@ package connect
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
+	"os"
 	"slices"
 	"time"
 	// "fmt"
@@ -152,13 +154,27 @@ func (self *P2pTransport) run() {
 			handleCtx, handleCancel := context.WithCancel(self.ctx)
 			defer handleCancel()
 
+			// the peer's ready header must be consumed before the receive
+			// transport starts reading. otherwise the two concurrent readers
+			// race for the header, and the header reader can instead receive
+			// a later (larger) frame, which fails the read with a short buffer
+			// and tears down the conn.
+			headerRead := make(chan struct{})
+
 			go HandleError(func() {
 				defer handleCancel()
 
-				conn.SetReadDeadline(time.Now().Add(self.settings.ConnectTimeout))
+				conn.SetWriteDeadline(time.Now().Add(self.settings.ConnectTimeout))
 				_, err := conn.Write([]byte(ReadyHeader))
 				if err != nil {
+					self.client.log.V(1).Infof("[p2p]s(%s) ready header write err = %s\n", self.streamId, err)
 					return
+				}
+
+				select {
+				case <-handleCtx.Done():
+					return
+				case <-headerRead:
 				}
 
 				t, route := NewP2pReceiveTransport(handleCtx, handleCancel, conn, self.streamId, self.settings)
@@ -190,17 +206,27 @@ func (self *P2pTransport) run() {
 				default:
 				}
 
-				header := make([]byte, len(ReadyHeader))
+				// the detached data channel is message-oriented, and the sctp
+				// read fails with a short buffer when the read buffer is smaller
+				// than the message. a dcep ack can arrive before the peer's
+				// ready header, and the datachannel filters dcep internally only
+				// when the read buffer can hold the message. read one whole
+				// message with a max size buffer and require it to be exactly
+				// the ready header.
+				headerBuf := make([]byte, self.settings.MaxMessageByteCount)
 				conn.SetReadDeadline(time.Now().Add(self.settings.ConnectTimeout))
-				_, err := io.ReadFull(conn, header)
+				n, err := conn.Read(headerBuf)
 				if err != nil {
+					self.client.log.V(1).Infof("[p2p]s(%s) ready header read err = %s\n", self.streamId, err)
 					return
 				}
-				if !slices.Equal(header, []byte(ReadyHeader)) {
+				if !slices.Equal(headerBuf[:n], []byte(ReadyHeader)) {
+					self.client.log.V(1).Infof("[p2p]s(%s) ready header mismatch = %x\n", self.streamId, headerBuf[:n])
 					return
 				}
+				close(headerRead)
 
-				t, route := NewP2pSendTransport(handleCtx, handleCancel, conn, self.streamId, self.settings)
+				t, route := NewP2pSendTransport(handleCtx, handleCancel, conn, self.peerId, self.streamId, self.settings)
 
 				updateRoute := func(connected bool) {
 					if connected {
@@ -243,6 +269,7 @@ type P2pSendTransport struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	conn     net.Conn
+	peerId   Id
 	streamId Id
 	send     chan []byte
 
@@ -253,6 +280,7 @@ func NewP2pSendTransport(
 	ctx context.Context,
 	cancel context.CancelFunc,
 	conn net.Conn,
+	peerId Id,
 	streamId Id,
 	settings *P2pTransportSettings,
 ) (Transport, Route) {
@@ -262,6 +290,7 @@ func NewP2pSendTransport(
 		ctx:         ctx,
 		cancel:      cancel,
 		conn:        conn,
+		peerId:      peerId,
 		streamId:    streamId,
 		send:        send,
 		settings:    settings,
@@ -303,6 +332,7 @@ func (self *P2pSendTransport) run() {
 			// the SCTP message boundary frames each TransferFrame natively — no
 			// length prefix. Enforce the max message size up front.
 			if len(transferFrameBytes) > self.settings.MaxMessageByteCount {
+				DefaultLogger().V(1).Infof("[p2p]s(%s) send message too large = %d\n", self.streamId, len(transferFrameBytes))
 				MessagePoolReturn(transferFrameBytes)
 				return
 			}
@@ -313,6 +343,7 @@ func (self *P2pSendTransport) run() {
 				err = io.ErrShortWrite
 			}
 			if err != nil {
+				DefaultLogger().V(1).Infof("[p2p]s(%s) send write err = %s\n", self.streamId, err)
 				return
 			}
 		}
@@ -344,7 +375,14 @@ func (self *P2pSendTransport) RouteWeight(stats *RouteStats, remainingStats map[
 }
 
 func (self *P2pSendTransport) MatchesSend(destination TransferPath) bool {
-	return destination.StreamId == self.streamId
+	if destination.StreamId == self.streamId {
+		return true
+	}
+	// the stream terminates at the peer,
+	// so any destination addressed to the peer matches the stream transport.
+	// the peer id must be non-zero so that a missing peer never matches
+	// destination masks without a destination id (e.g. control or pure stream masks)
+	return self.peerId != (Id{}) && destination.DestinationId == self.peerId
 }
 
 func (self *P2pSendTransport) MatchesReceive(destination TransferPath) bool {
@@ -430,6 +468,14 @@ func (self *P2pReceiveTransport) run() {
 			}
 		}
 		if err != nil {
+			// an idle read timeout is not a dead conn: conn liveness is handled
+			// by the webrtc layer (ice keepalive and disconnect detection),
+			// which removes the routes via the connected callback.
+			// re-arm the read instead of tearing down an idle healthy conn.
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				continue
+			}
+			DefaultLogger().V(1).Infof("[p2p]s(%s) receive read err = %s\n", self.streamId, err)
 			return
 		}
 	}

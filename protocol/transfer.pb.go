@@ -85,7 +85,12 @@ func (SequenceRole) EnumDescriptor() ([]byte, []int) {
 	return file_transfer_proto_rawDescGZIP(), []int{0}
 }
 
-// CHANGE FROM PRIOR VERSION, modes should be considered individually as a mask and do not imply other modes
+// ProvideMode is a SET of independent relationship flags (a mask), NOT an ordered
+// scale. Each mode stands on its own and does not imply any other mode. The
+// numeric values carry no ordinal meaning, so they must never be compared with
+// <, >, <=, >= and must never be passed to max() or min(). Decide per-case by
+// testing for the specific mode(s) you mean (e.g. `provideMode == ProvideMode_Network`).
+// Any range, max, or min over a provide mode is a bug.
 type ProvideMode int32
 
 const (

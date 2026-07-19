@@ -66,6 +66,20 @@ type SecurityPolicy interface {
 	RefreshIngress(ipPath *IpPath)
 }
 
+// egressRelationship combines the packet source's provide mode with the local
+// client's own provide mode into the single relationship the security policy
+// enforces on egress. ProvideMode is a set of flags with no ordinal meaning (see
+// its definition in protocol) — this is a per-case decision, never max/min:
+// egress may reach non-public destinations (e.g. a LAN) only under a genuine
+// same-Network relationship on BOTH sides. Anything else, including an
+// unspecified None, is treated as Public so the public-destination rules apply.
+func egressRelationship(source, client protocol.ProvideMode) protocol.ProvideMode {
+	if source == protocol.ProvideMode_Network && client == protocol.ProvideMode_Network {
+		return protocol.ProvideMode_Network
+	}
+	return protocol.ProvideMode_Public
+}
+
 // securityPolicy inspects both directions of a flow from one object, so the egress DPI
 // detector's flow table is shared with the ingress activity refresh (see dmcaDetector.touch).
 type securityPolicy struct {

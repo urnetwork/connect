@@ -19,6 +19,12 @@ type ContractStatsEvent struct {
 	// always false on the receive side (the wire contract does not carry it).
 	// pair contracts to their companions with the peer client id on `Path`
 	Companion bool
+	// true when the contract is bound to an active stream (the platform
+	// marks the stored contract with the stream id, `Path.StreamId`).
+	// set on both the send and receive side — the receive side learns it
+	// only from the contract, so this is its signal that the flow rides a
+	// stream rather than a direct path
+	Stream bool
 	// source -> destination of the contract
 	Path              TransferPath
 	TransferByteCount ByteCount
@@ -118,47 +124,81 @@ func (self *ContractManager) runContractStats() {
 	for {
 		select {
 		case <-self.ctx.Done():
+			// backstop: emit any already-marked closes before exiting so they are
+			// not lost on shutdown. The deterministic teardown path is
+			// CloseAllContractStats (called before ctx cancel, while listeners are
+			// still attached); this only covers other exit paths.
+			self.emitContractStats()
 			return
 		case <-time.After(self.settings.ContractStatsEpoch):
 		}
+		self.emitContractStats()
+	}
+}
 
-		callbacks := self.contractStatsCallbacks.Get()
+// emitContractStats does one emit pass: for each stats entry that is new,
+// changed, or closed, emit a ContractStatsEvent to the current callbacks; closed
+// entries are dropped after emitting. Called on each epoch tick, once more on
+// worker exit (backstop), and synchronously by CloseAllContractStats.
+func (self *ContractManager) emitContractStats() {
+	callbacks := self.contractStatsCallbacks.Get()
 
-		var events []*ContractStatsEvent
-		func() {
-			self.contractStatsLock.Lock()
-			defer self.contractStatsLock.Unlock()
-			for key, entry := range self.contractStatsEntries {
-				usedByteCount := ByteCount(entry.usedByteCount.Load())
-				closed := entry.closed.Load()
-				if !entry.emitted || usedByteCount != entry.emittedUsedByteCount || closed {
-					if 0 < len(callbacks) {
-						events = append(events, &ContractStatsEvent{
-							ContractId:         entry.contractId,
-							Receive:            entry.receive,
-							Companion:          entry.companion,
-							Path:               entry.path,
-							TransferByteCount:  entry.transferByteCount,
-							UsedByteCount:      usedByteCount,
-							UsedByteCountDelta: usedByteCount - entry.emittedUsedByteCount,
-							Open:               !closed,
-						})
-					}
-					entry.emitted = true
-					entry.emittedUsedByteCount = usedByteCount
+	var events []*ContractStatsEvent
+	func() {
+		self.contractStatsLock.Lock()
+		defer self.contractStatsLock.Unlock()
+		for key, entry := range self.contractStatsEntries {
+			usedByteCount := ByteCount(entry.usedByteCount.Load())
+			closed := entry.closed.Load()
+			if !entry.emitted || usedByteCount != entry.emittedUsedByteCount || closed {
+				if 0 < len(callbacks) {
+					events = append(events, &ContractStatsEvent{
+						ContractId:         entry.contractId,
+						Receive:            entry.receive,
+						Companion:          entry.companion,
+						Stream:             entry.path.IsStream(),
+						Path:               entry.path,
+						TransferByteCount:  entry.transferByteCount,
+						UsedByteCount:      usedByteCount,
+						UsedByteCountDelta: usedByteCount - entry.emittedUsedByteCount,
+						Open:               !closed,
+					})
 				}
-				if closed {
-					delete(self.contractStatsEntries, key)
-				}
+				entry.emitted = true
+				entry.emittedUsedByteCount = usedByteCount
 			}
-		}()
-
-		if 0 < len(events) {
-			for _, callback := range callbacks {
-				HandleError(func() {
-					callback(events)
-				})
+			if closed {
+				delete(self.contractStatsEntries, key)
 			}
 		}
+	}()
+
+	if 0 < len(events) {
+		for _, callback := range callbacks {
+			HandleError(func() {
+				callback(events)
+			})
+		}
 	}
+}
+
+// CloseAllContractStats marks every open contract-stats entry closed and emits
+// the closes synchronously to the currently-attached listeners. Call this at
+// client teardown BEFORE the client ctx is cancelled and BEFORE stats listeners
+// are removed, so a removed peer's contract-close events escape. Otherwise the
+// epoch worker exits on ctx-done having emitted nothing (the sequence defers mark
+// contracts closed asynchronously, into a dead worker and a removed listener),
+// and the peer's contracts linger open in the contract-details UI.
+//
+// This closes only the stats (the UI/accounting view). The wire-level contract
+// close to the platform is still done by the sequence teardown defers.
+func (self *ContractManager) CloseAllContractStats() {
+	func() {
+		self.contractStatsLock.Lock()
+		defer self.contractStatsLock.Unlock()
+		for _, entry := range self.contractStatsEntries {
+			entry.closed.Store(true)
+		}
+	}()
+	self.emitContractStats()
 }

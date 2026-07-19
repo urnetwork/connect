@@ -120,34 +120,71 @@ func (self *ApiMultiClientGenerator) NextDestinations(count int, excludeDestinat
 	for _, excludeDestination := range excludeDestinations {
 		excludeDestinationsIds = append(excludeDestinationsIds, excludeDestination.Ids())
 	}
-	findProviders2 := &FindProviders2Args{
-		Specs:               self.specs,
-		ExcludeClientIds:    excludeClientIds,
-		ExcludeDestinations: excludeDestinationsIds,
-		Count:               count,
-		RankMode:            rankMode,
-	}
-
-	result, err := self.api.FindProviders2Sync(findProviders2)
-	if err != nil {
-		return nil, err
-	}
-
 	destinations := map[MultiHopId]DestinationStats{}
-	for _, provider := range result.Providers {
-		ids := []Id{}
-		if 0 < len(provider.IntermediaryIds) {
-			ids = append(ids, provider.IntermediaryIds...)
+
+	// A fixed-destination spec (an explicit client id, e.g. a known network peer)
+	// is its own destination — there is nothing to discover. Short-circuit
+	// find-providers2 for these so a peer connect is a direct send with no platform
+	// round trip (and does not hang if the server would not return the peer).
+	// Specs that need discovery (location / group / best-available) still go
+	// through the api below.
+	excludedClientIds := map[Id]bool{}
+	for _, id := range excludeClientIds {
+		excludedClientIds[id] = true
+	}
+	discoverySpecs := []*ProviderSpec{}
+	for _, spec := range self.specs {
+		if spec.ClientId == nil {
+			discoverySpecs = append(discoverySpecs, spec)
+			continue
 		}
-		ids = append(ids, provider.ClientId)
-		// use the tail if the length exceeds the allowed maximum
-		if MaxMultihopLength < len(ids) {
-			ids = ids[len(ids)-MaxMultihopLength:]
+		clientId := *spec.ClientId
+		if excludedClientIds[clientId] {
+			continue
 		}
-		if destination, err := NewMultiHopId(ids...); err == nil {
-			destinations[destination] = DestinationStats{
-				EstimatedBytesPerSecond: provider.EstimatedBytesPerSecond,
-				Tier:                    provider.Tier,
+		destination, err := NewMultiHopId(clientId)
+		if err != nil {
+			continue
+		}
+		if slices.Contains(excludeDestinations, destination) {
+			continue
+		}
+		destinations[destination] = DestinationStats{}
+	}
+
+	if 0 < len(discoverySpecs) {
+		findProviders2 := &FindProviders2Args{
+			Specs:               discoverySpecs,
+			ExcludeClientIds:    excludeClientIds,
+			ExcludeDestinations: excludeDestinationsIds,
+			Count:               count,
+			RankMode:            rankMode,
+		}
+
+		result, err := self.api.FindProviders2Sync(findProviders2)
+		if err != nil {
+			// prefer returning any fixed destinations over failing the whole call
+			if 0 < len(destinations) {
+				return destinations, nil
+			}
+			return nil, err
+		}
+
+		for _, provider := range result.Providers {
+			ids := []Id{}
+			if 0 < len(provider.IntermediaryIds) {
+				ids = append(ids, provider.IntermediaryIds...)
+			}
+			ids = append(ids, provider.ClientId)
+			// use the tail if the length exceeds the allowed maximum
+			if MaxMultihopLength < len(ids) {
+				ids = ids[len(ids)-MaxMultihopLength:]
+			}
+			if destination, err := NewMultiHopId(ids...); err == nil {
+				destinations[destination] = DestinationStats{
+					EstimatedBytesPerSecond: provider.EstimatedBytesPerSecond,
+					Tier:                    provider.Tier,
+				}
 			}
 		}
 	}

@@ -53,12 +53,18 @@ type BlockActionOverride struct {
 type BlockAction struct {
 	// time of the first decision in the epoch
 	Time time.Time
-	// all ips in the cluster
+	// cluster ips that did NOT match an override (disjoint from MatchedIps)
 	Ips []netip.Addr
-	// all server names observed for the cluster ips
+	// cluster server names that did NOT match an override (disjoint from MatchedHosts)
 	Hosts []string
-	Block bool
-	Local bool
+	// the exact ips and server names that matched an override rule (the UI renders
+	// these distinctly, e.g. green). Disjoint from Ips/Hosts so nothing is shown or
+	// counted twice; MatchedIps ∪ Ips is the full cluster ip set, MatchedHosts ∪
+	// Hosts the full observed-name set. Empty when no override matched.
+	MatchedIps   []netip.Addr
+	MatchedHosts []string
+	Block        bool
+	Local        bool
 	// set when the ad/tracker blocker matched the destination (the final
 	// decision may still be un-blocked by an override; see Block)
 	Blocker bool
@@ -193,10 +199,29 @@ type blockActionMatch struct {
 	blockOverrideId Id
 	routeOverride   *RouteOverride
 	routeOverrideId Id
+	// the exact server names and ips that actually triggered a match, so the UI can
+	// show which cluster members an override rule hit (disjoint from the rest). nil
+	// until something matches; keys are the original-case server name / the addr.
+	matchedHosts map[string]bool
+	matchedIps   map[netip.Addr]bool
 }
 
 func (self *blockActionMatch) any() bool {
 	return self.blockOverride != nil || self.routeOverride != nil
+}
+
+func (self *blockActionMatch) recordMatchedHost(serverName string) {
+	if self.matchedHosts == nil {
+		self.matchedHosts = map[string]bool{}
+	}
+	self.matchedHosts[serverName] = true
+}
+
+func (self *blockActionMatch) recordMatchedIp(addr netip.Addr) {
+	if self.matchedIps == nil {
+		self.matchedIps = map[netip.Addr]bool{}
+	}
+	self.matchedIps[addr] = true
 }
 
 // merge is order-independent: block=true wins over block=false,
@@ -266,23 +291,37 @@ func blockActionApply(r SecurityPolicyResult, localSecurityBypass bool, blockerB
 }
 
 func (self *blockActionMatcher) matchAddr(match *blockActionMatch, addr netip.Addr, serverNames []string) {
+	addrMatched := false
 	for _, override := range self.addrs[addr] {
 		match.merge(override)
+		addrMatched = true
 	}
 	for _, blockActionPrefix := range self.prefixes {
 		if blockActionPrefix.prefix.Contains(addr) {
 			match.merge(blockActionPrefix.override)
+			addrMatched = true
 		}
 	}
+	if addrMatched {
+		match.recordMatchedIp(addr)
+	}
 	for _, serverName := range serverNames {
-		serverName = strings.ToLower(serverName)
-		for _, override := range self.exactHosts[serverName] {
+		lower := strings.ToLower(serverName)
+		hostMatched := false
+		for _, override := range self.exactHosts[lower] {
 			match.merge(override)
+			hostMatched = true
 		}
 		for _, wildcardHost := range self.wildcardHosts {
-			if strings.HasSuffix(serverName, wildcardHost.dotSuffix) || serverName == wildcardHost.base {
+			if strings.HasSuffix(lower, wildcardHost.dotSuffix) || lower == wildcardHost.base {
 				match.merge(wildcardHost.override)
+				hostMatched = true
 			}
+		}
+		if hostMatched {
+			// record the original-case name so it lines up with clusterHosts for the
+			// disjoint partition in the collector
+			match.recordMatchedHost(serverName)
 		}
 	}
 }
@@ -387,6 +426,16 @@ func (self *blockActionCache) clear() {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	clear(self.decisions)
+}
+
+// delete drops the cached decision for one destination so its next flow rebuilds
+// it (re-resolving server names). Used when a server name is learned for the ip,
+// so block actions report the server name instead of the ip going forward. This
+// is the incremental (per-ip) counterpart to clear(), avoiding a full recompute.
+func (self *blockActionCache) delete(addr netip.Addr) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	delete(self.decisions, addr)
 }
 
 // defaultRemoteDohIgnoreAddrs is the built-in ignore baseline: the hard coded
@@ -506,6 +555,14 @@ func (self *blockActionIgnoreCache) clear() {
 	clear(self.entries)
 }
 
+// delete drops the cached ignore decision for one destination (per-ip
+// counterpart to clear()); see blockActionCache.delete.
+func (self *blockActionIgnoreCache) delete(addr netip.Addr) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	delete(self.entries, addr)
+}
+
 // aggregates decisions per destination per epoch
 type blockActionCollector struct {
 	maxCount int
@@ -534,11 +591,16 @@ type blockActionKey struct {
 }
 
 type blockActionAgg struct {
-	firstTime   time.Time
-	ips         []netip.Addr
-	hosts       []string
-	packetCount int
-	byteCount   ByteCount
+	firstTime time.Time
+	ips       []netip.Addr
+	hosts     []string
+	// the exact ips / server names that matched an override, unioned across the
+	// epoch's decisions for this key (a cluster can match on different members over
+	// the epoch). nil until an override matches.
+	matchedIps   map[netip.Addr]bool
+	matchedHosts map[string]bool
+	packetCount  int
+	byteCount    ByteCount
 }
 
 func newBlockActionCollector(maxCount int, log Logger) *blockActionCollector {
@@ -604,6 +666,30 @@ func (self *blockActionCollector) add(
 			hosts:     decision.clusterHosts,
 		}
 		self.agg[key] = agg
+	} else if len(agg.hosts) == 0 && 0 < len(decision.clusterHosts) {
+		// the aggregate was seeded by a decision made before the destination's
+		// server name was learned (e.g. the flow's first packets raced the DNS
+		// record, or a stale cached decision was since invalidated). Adopt the
+		// named decision's hosts so the flushed action reports the server name
+		// instead of the ip.
+		agg.hosts = decision.clusterHosts
+	}
+	// carry which cluster members an override actually hit, unioned across the
+	// epoch, so the flushed action can render them distinctly (and disjoint from
+	// the rest). Same key => same override decision, so the sets accumulate cleanly.
+	if match != nil {
+		for host := range match.matchedHosts {
+			if agg.matchedHosts == nil {
+				agg.matchedHosts = map[string]bool{}
+			}
+			agg.matchedHosts[host] = true
+		}
+		for ip := range match.matchedIps {
+			if agg.matchedIps == nil {
+				agg.matchedIps = map[netip.Addr]bool{}
+			}
+			agg.matchedIps[ip] = true
+		}
 	}
 	agg.packetCount += 1
 	agg.byteCount += byteCount
@@ -636,15 +722,21 @@ func (self *blockActionCollector) flush() {
 
 	blockActions := make([]*BlockAction, 0, len(agg))
 	for key, keyAgg := range agg {
+		// partition into matched (an override hit these) and the rest, disjoint:
+		// Hosts/Ips exclude everything in the matched sets, MatchedHosts/MatchedIps
+		// are the full matched sets (which may include a name learned after the agg
+		// was seeded, so we don't derive them by filtering the cluster list).
 		blockAction := &BlockAction{
-			Time:        keyAgg.firstTime,
-			Ips:         keyAgg.ips,
-			Hosts:       keyAgg.hosts,
-			Block:       key.block,
-			Local:       key.local,
-			Blocker:     key.blocker,
-			PacketCount: keyAgg.packetCount,
-			ByteCount:   keyAgg.byteCount,
+			Time:         keyAgg.firstTime,
+			Ips:          excludeMatchedIps(keyAgg.ips, keyAgg.matchedIps),
+			Hosts:        excludeMatchedHosts(keyAgg.hosts, keyAgg.matchedHosts),
+			MatchedIps:   sortedMatchedIps(keyAgg.matchedIps),
+			MatchedHosts: sortedMatchedHosts(keyAgg.matchedHosts),
+			Block:        key.block,
+			Local:        key.local,
+			Blocker:      key.blocker,
+			PacketCount:  keyAgg.packetCount,
+			ByteCount:    keyAgg.byteCount,
 		}
 		if key.blockOverrideId != (Id{}) {
 			blockOverrideId := key.blockOverrideId
@@ -665,4 +757,63 @@ func (self *blockActionCollector) flush() {
 			callback(blockActions)
 		})
 	}
+}
+
+// excludeMatchedIps returns the ips not in the matched set, preserving order, so
+// BlockAction.Ips stays disjoint from BlockAction.MatchedIps.
+func excludeMatchedIps(ips []netip.Addr, matched map[netip.Addr]bool) []netip.Addr {
+	if len(matched) == 0 {
+		return ips
+	}
+	out := make([]netip.Addr, 0, len(ips))
+	for _, ip := range ips {
+		if !matched[ip] {
+			out = append(out, ip)
+		}
+	}
+	return out
+}
+
+// excludeMatchedHosts returns the hosts not in the matched set, preserving order,
+// so BlockAction.Hosts stays disjoint from BlockAction.MatchedHosts.
+func excludeMatchedHosts(hosts []string, matched map[string]bool) []string {
+	if len(matched) == 0 {
+		return hosts
+	}
+	out := make([]string, 0, len(hosts))
+	for _, host := range hosts {
+		if !matched[host] {
+			out = append(out, host)
+		}
+	}
+	return out
+}
+
+// sortedMatchedIps is the matched ip set as a stable-ordered slice (nil if empty).
+func sortedMatchedIps(matched map[netip.Addr]bool) []netip.Addr {
+	if len(matched) == 0 {
+		return nil
+	}
+	out := make([]netip.Addr, 0, len(matched))
+	for ip := range matched {
+		out = append(out, ip)
+	}
+	sort.Slice(out, func(i int, j int) bool {
+		return out[i].Compare(out[j]) < 0
+	})
+	return out
+}
+
+// sortedMatchedHosts is the matched server-name set as a stable-ordered slice
+// (nil if empty).
+func sortedMatchedHosts(matched map[string]bool) []string {
+	if len(matched) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(matched))
+	for host := range matched {
+		out = append(out, host)
+	}
+	sort.Strings(out)
+	return out
 }

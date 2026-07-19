@@ -192,17 +192,24 @@ func TestUpgradeMuxDnsBlocked(t *testing.T) {
 	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "ok.example.org.", dnsmessage.TypeA, 0x0a05), 0) {
 		t.Fatal("unblocked A query not claimed")
 	}
-	// an unblocked non-A/AAAA type passes through to the upstream unclaimed
-	if mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "ok.example.org.", dnsmessage.Type(65), 0x0a06), 0) {
+	// an unblocked HTTPS/SVCB query is claimed and routed to the DoH forward path (not
+	// passed through). This test's resolver has remote DoH disabled, so the forward
+	// short-circuits and sends nothing — like the unblocked A above.
+	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "ok.example.org.", dnsmessage.Type(65), 0x0a06), 0) {
+		t.Fatal("unblocked HTTPS query not claimed")
+	}
+	// an unblocked non-A/AAAA/SVCB type (TXT) passes through to the upstream unclaimed
+	if mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "ok.example.org.", dnsmessage.TypeTXT, 0x0a0a), 0) {
 		// pass-through returns the upstream's result; the recorder upstream
 		// accepts, so SendPacket returns true — assert it reached upstream
 	}
 	time.Sleep(500 * time.Millisecond)
+	// only the 4 blocker-synthesized replies exist; the unblocked A/HTTPS produced none
 	if _, received := rec.counts(); received != 4 {
 		t.Fatalf("unexpected downstream replies: %d, want 4", received)
 	}
 	if sent, _ := rec.counts(); sent != 1 {
-		t.Fatalf("upstream pass-throughs: %d, want 1 (the unblocked type-65 query)", sent)
+		t.Fatalf("upstream pass-throughs: %d, want 1 (the unblocked TXT query)", sent)
 	}
 
 	// toggling off returns blocked names to the pipeline (no reply), and

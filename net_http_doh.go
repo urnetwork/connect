@@ -141,7 +141,7 @@ type DohSettings struct {
 	// addresses. the upgrade mux records these into its ip→hostname reverse
 	// index, so the server addresses are excluded from the override and
 	// association logic along with the server names
-	// (see `UpgradeMux.recordServerNames` and `SetBlockActionIgnoreHosts`)
+	// (see `reverseIndex.record` and `SetBlockActionIgnoreHosts`)
 	DohServerResolvedCallback func(domain string, addrs []netip.Addr)
 }
 
@@ -510,6 +510,21 @@ func (self *DohCache) QueryResult(ctx context.Context, recordType string, domain
 	return fl.addrs, fl.authoritative
 }
 
+// Forward resolves qType (SVCB/HTTPS) for domain over the remote DoH servers (egressing the
+// tunnel) and returns the raw RFC 8484 response wire, for record types the cache forwards opaquely
+// rather than parsing into addresses. Not cached (the client stub caches per the record TTL); ok is
+// false if no remote server produced a usable answer or remote DoH is disabled.
+func (self *DohCache) Forward(ctx context.Context, qType dnsmessage.Type, domain string) ([]byte, bool) {
+	if !self.settings.DnsResolverSettings.EnableRemoteDoh {
+		return nil, false
+	}
+	if self.dohServerNames[domain] {
+		// a doh server name must not resolve through doh (circular)
+		return nil, false
+	}
+	return self.remoteClient.forwardRaw(ctx, remoteDohUrls(self.settings, self.settings.IpVersion), qType, self.settings, domain)
+}
+
 // resolve runs the resolver chain (remote DoH -> local DoH -> remote DNS -> local DNS) for one
 // query, caches an authoritative result, and returns the addresses plus whether the answer was
 // authoritative. it is not single-flighted itself; QueryResult coalesces concurrent callers.
@@ -836,11 +851,6 @@ func (self *dohClient) queryResult(
 // GET ?dns=<base64url DNS message>). name must already be punycoded ascii.
 func (self *dohClient) queryWire(ctx context.Context, dohUrl string, recordType string, name string) *dohQueryResult {
 	result := newDohQueryResult()
-
-	dnsName, err := dnsmessage.NewName(name + ".")
-	if err != nil {
-		return result
-	}
 	var qType dnsmessage.Type
 	switch recordType {
 	case "A":
@@ -850,6 +860,23 @@ func (self *dohClient) queryWire(ctx context.Context, dohUrl string, recordType 
 	default:
 		return result
 	}
+	data, ok := self.queryWireRaw(ctx, dohUrl, qType, name)
+	if !ok {
+		return result
+	}
+	return parseDohWire(data, qType)
+}
+
+// queryWireRaw issues one RFC 8484 query for (qType, name) to dohUrl and returns the raw
+// response wire, without parsing it. Used to forward record types the cache handles
+// opaquely (SVCB/HTTPS) — preserving the exact record for the client — where queryWire
+// parses A/AAAA into addresses. Like queryWire, the caller holds an httpSem slot for the
+// lifetime of this request.
+func (self *dohClient) queryWireRaw(ctx context.Context, dohUrl string, qType dnsmessage.Type, name string) ([]byte, bool) {
+	dnsName, err := dnsmessage.NewName(name + ".")
+	if err != nil {
+		return nil, false
+	}
 	// id 0 is recommended for DoH (RFC 8484 §4.1); recursion desired
 	msg := dnsmessage.Message{
 		Header:    dnsmessage.Header{RecursionDesired: true},
@@ -857,32 +884,79 @@ func (self *dohClient) queryWire(ctx context.Context, dohUrl string, recordType 
 	}
 	wire, err := msg.Pack()
 	if err != nil {
-		return result
+		return nil, false
 	}
 	requestUrl := fmt.Sprintf("%s?dns=%s", dohUrl, base64.RawURLEncoding.EncodeToString(wire))
 
 	request, err := http.NewRequestWithContext(ctx, "GET", requestUrl, nil)
 	if err != nil {
-		return result
+		return nil, false
 	}
 	request.Header.Set("Accept", "application/dns-message")
 
-	// the caller holds an httpSem slot for the lifetime of this request (acquired before this
-	// goroutine was spawned), bounding concurrent in-flight HTTP requests across the cache —
-	// the memory governor for the iOS network extension
 	response, err := self.httpClient.Do(request)
 	if err != nil {
-		return result
+		return nil, false
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return result
+		return nil, false
 	}
 	data, err := io.ReadAll(io.LimitReader(response.Body, maxDohResponseBytes))
 	if err != nil {
-		return result
+		return nil, false
 	}
-	return parseDohWire(data, qType)
+	return data, true
+}
+
+// forwardRaw resolves qType for domain across dohUrls (best recent performers first) and returns
+// the first server's raw response wire whose RCODE is usable (NOERROR/NXDOMAIN — a SERVFAIL is
+// skipped to the next server). For opaque record types (SVCB/HTTPS) the cache forwards rather than
+// parses. Bounded by settings.RequestTimeout and the shared httpSem.
+func (self *dohClient) forwardRaw(ctx context.Context, dohUrls []string, qType dnsmessage.Type, settings *DohSettings, domain string) ([]byte, bool) {
+	if len(dohUrls) == 0 || settings.RequestTimeout <= 0 {
+		return nil, false
+	}
+	name, err := Punycode(domain)
+	if err != nil {
+		return nil, false
+	}
+	queryCtx, queryCancel := context.WithTimeout(ctx, settings.RequestTimeout)
+	defer queryCancel()
+
+	ordered := self.stats.order(dohUrls)
+	if 0 < settings.MaxServersPerQuery && settings.MaxServersPerQuery < len(ordered) {
+		ordered = ordered[:settings.MaxServersPerQuery]
+	}
+	for _, dohUrl := range ordered {
+		select {
+		case self.httpSem <- struct{}{}:
+		case <-queryCtx.Done():
+			return nil, false
+		}
+		data, ok := self.queryWireRaw(queryCtx, dohUrl, qType, name)
+		<-self.httpSem
+		if ok && dnsResponseUsable(data) {
+			return data, true
+		}
+	}
+	return nil, false
+}
+
+// dnsResponseUsable reports whether a raw DNS response is a well-formed answer worth forwarding:
+// a NOERROR (records or NODATA) or NXDOMAIN. A SERVFAIL/REFUSED/other is not (the caller tries the
+// next server).
+func dnsResponseUsable(response []byte) bool {
+	if len(response) < 12 {
+		return false
+	}
+	// header flags are bytes 2-3; RCODE is the low 4 bits of byte 3
+	switch response[3] & 0x0f {
+	case 0, 3: // NOERROR, NXDOMAIN
+		return true
+	default:
+		return false
+	}
 }
 
 // parseDohWire parses an RFC 8484 wire-format DNS response, extracting the A or AAAA answers

@@ -107,6 +107,9 @@ func (self *StreamManager) handleControlFrame(frame *protocol.Frame) error {
 					return err
 				}
 
+				if self.client.log.V(1).Enabled() {
+					self.client.log.Infof("[sm]%s open s(%s) %v->%v\n", self.client.ClientTag(), streamId, sourceId, destinationId)
+				}
 				if _, err := self.streamBuffer.OpenStream(sourceId, destinationId, streamId); err != nil {
 					return err
 				}
@@ -126,9 +129,15 @@ func (self *StreamManager) handleControlFrame(frame *protocol.Frame) error {
 					return err
 				}
 
+				if self.client.log.V(1).Enabled() {
+					self.client.log.Infof("[sm]%s close s(%s)\n", self.client.ClientTag(), streamId)
+				}
 				self.streamBuffer.CloseStream(streamId)
 
 			case *protocol.StreamReset:
+				if self.client.log.V(1).Enabled() {
+					self.client.log.Infof("[sm]%s reset streams = %d\n", self.client.ClientTag(), len(v.Streams))
+				}
 				self.streamBuffer.ResetStreams()
 				for _, m := range v.Streams {
 					err := streamOpen(m)

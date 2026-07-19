@@ -374,11 +374,17 @@ func DefaultWebRtcSettings() *WebRtcSettings {
 		// SendBufferSize: mib(1),
 
 		// sctp receive buffer per peer connection, so scaled by the memory budget
-		ReceiveBufferSize:   MemoryScaledByteCount(mib(4), mib(1)),
-		ReceiveMtu:          kib(4),
-		DisconnectedTimeout: 30 * time.Second,
-		FailedTimeout:       30 * time.Second,
-		KeepAliveTimeout:    1 * time.Second,
+		ReceiveBufferSize: MemoryScaledByteCount(mib(4), mib(1)),
+		ReceiveMtu:        kib(4),
+		// each peer connection holds the pion ice/dtls/sctp stack plus up to
+		// `ReceiveBufferSize` of queued data, so the count is bounded (scaled
+		// by the memory budget). At the cap new p2p setups are refused and
+		// those streams stay on the platform transport; the p2p transport
+		// retries with backoff, so capacity recovers as connections close.
+		MaxPeerConnectionCount: MemoryScaledCount(32, 8),
+		DisconnectedTimeout:    30 * time.Second,
+		FailedTimeout:          30 * time.Second,
+		KeepAliveTimeout:       1 * time.Second,
 
 		DataChannelLabel: "data",
 		IceServerUrls: []string{
@@ -400,11 +406,14 @@ type WebRtcSettings struct {
 	// `NewClientWithTag` propagates the client log here when nil.
 	Log Logger
 
-	ReceiveBufferSize   ByteCount
-	ReceiveMtu          ByteCount
-	DisconnectedTimeout time.Duration
-	FailedTimeout       time.Duration
-	KeepAliveTimeout    time.Duration
+	ReceiveBufferSize ByteCount
+	ReceiveMtu        ByteCount
+	// the maximum number of live peer connections across all peers and
+	// streams. 0 is no limit.
+	MaxPeerConnectionCount int
+	DisconnectedTimeout    time.Duration
+	FailedTimeout          time.Duration
+	KeepAliveTimeout       time.Duration
 
 	DataChannelLabel string
 
@@ -563,6 +572,15 @@ func (self *WebRtcManager) newP2pConn(ctx context.Context, path TransferPath, ac
 	key := peerConnKey{
 		PeerId:   path.DestinationId,
 		StreamId: path.StreamId,
+	}
+
+	// refuse new peer connections at the cap. A create for an existing key
+	// replaces that connection (the map does not grow), so it is allowed.
+	if maxCount := self.settings.MaxPeerConnectionCount; 0 < maxCount && maxCount <= len(self.peerConns) {
+		if _, ok := self.peerConns[key]; !ok {
+			err = fmt.Errorf("peer connection limit reached (%d)", maxCount)
+			return
+		}
 	}
 
 	conn, err = newPeerConn(ctx, key, path.SourceId, active, self.signalSender, self.settings)

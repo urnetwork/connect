@@ -83,9 +83,9 @@ func DefaultIpAssocSettings() *IpAssocSettings {
 	return &IpAssocSettings{
 		AssociationBlockDuration:   300 * time.Second,
 		AssociationBlockCount:      8,
-		PacketAssociationTime:      5 * time.Second,
+		PacketAssociationTime:      1 * time.Second,
 		ActivityGranule:            1 * time.Second,
-		MinMeanAssociation:         0.5,
+		MinMeanAssociation:         0.9,
 		ClusterEpoch:               1 * time.Second,
 		MaxEntityCount:             2048,
 		MaxAssociationCount:        16384,

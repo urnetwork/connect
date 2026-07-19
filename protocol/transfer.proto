@@ -159,7 +159,12 @@ message Auth {
 }
 
 
-// CHANGE FROM PRIOR VERSION, modes should be considered individually as a mask and do not imply other modes
+// ProvideMode is a SET of independent relationship flags (a mask), NOT an ordered
+// scale. Each mode stands on its own and does not imply any other mode. The
+// numeric values carry no ordinal meaning, so they must never be compared with
+// <, >, <=, >= and must never be passed to max() or min(). Decide per-case by
+// testing for the specific mode(s) you mean (e.g. `mode == Network`). Any range,
+// max, or min over a provide mode is a bug.
 enum ProvideMode {
     None = 0; // this is interpreted the same as a `null` provide mode
     Network = 1;

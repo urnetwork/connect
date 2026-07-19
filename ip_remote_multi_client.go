@@ -131,6 +131,10 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// ease up the timeout until perf issues are fully resolved
 		PingTimeout:  30 * time.Second,
 		CPingTimeout: 30 * time.Second,
+		// the rest between continuous pings. decoupled from `CPingTimeout` (the
+		// ack wait) so a dead idle client is detected within
+		// ~CPingRestTimeout+CPingTimeout instead of ~2x CPingTimeout
+		CPingRestTimeout: 10 * time.Second,
 		// a lower ack timeout helps cycle through bad providers faster
 		AckTimeout:                                30 * time.Second,
 		BlackholeTimeout:                          5 * time.Second,
@@ -168,6 +172,11 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 
 		StatsWindowMaxUnhealthyDuration:  15 * time.Second,
 		StatsWindowWarnUnhealthyDuration: 5 * time.Second,
+		// how long a rank-kept client (FixedWindowSize/KeepHealthiestCount) may
+		// remain continuously unhealthy before it is removed anyway. Keeping the
+		// healthiest is meant to ride out transient badness, not to pin a dead
+		// client (and its ui dot) in the window forever.
+		StatsWindowKeepUnhealthyDuration: 60 * time.Second,
 		// StatsWindowKeepHealthiestCount:   2,
 		// the effective byte count is per stats window `StatsWindowDuration`
 		// StatsWindowMinHealthyEffectiveSendByteCount:    kib(1),
@@ -217,6 +226,7 @@ type MultiClientSettings struct {
 	CPingMaxByteCountPerSecond                ByteCount
 	PingTimeout                               time.Duration
 	CPingTimeout                              time.Duration
+	CPingRestTimeout                          time.Duration
 	AckTimeout                                time.Duration
 	BlackholeTimeout                          time.Duration
 	BlackholeConnectTimeout                   time.Duration
@@ -256,6 +266,7 @@ type MultiClientSettings struct {
 
 	StatsWindowMaxUnhealthyDuration  time.Duration
 	StatsWindowWarnUnhealthyDuration time.Duration
+	StatsWindowKeepUnhealthyDuration time.Duration
 	// StatsWindowKeepHealthiestCount                 int
 	// StatsWindowMinHealthyEffectiveSendByteCount    ByteCount
 	// StatsWindowMinHealthyEffectiveReceiveByteCount ByteCount
@@ -273,6 +284,14 @@ type MultiClientSettings struct {
 	DestinationAffinity bool
 
 	DefaultPerformanceProfile *PerformanceProfile
+
+	// NeverAllowDirect is a hard limit that keeps direct mode (`AllowDirect`)
+	// off no matter what performance profile is set,
+	// superseding the same-network force (`withNetworkAllowDirect`).
+	// Cloud hosted clients set this because a direct connection would leak
+	// that the client is hosted and where it is hosted:
+	// the host addresses appear in the direct connection setup.
+	NeverAllowDirect bool
 
 	// used when reconnect scale is not set in a custom performance profile
 	DefaultReconnectScale float64
@@ -420,8 +439,11 @@ type RemoteUserNatMultiClient struct {
 	// swapped by `SetBlockActionIgnoreHosts`
 	blockActionIgnoreState atomic.Pointer[blockActionIgnoreState]
 	blockActionIgnoreCache *blockActionIgnoreCache
-	packetStatsCounters    *packetStatsCounters
-	packetStatsCallbacks   *CallbackList[PacketStatsFunction]
+	// unsubscribe from the current server-name-lookup's learned notifications
+	// (guarded by stateLock); see SetServerNameLookup
+	serverNamesLearnedUnsub func()
+	packetStatsCounters     *packetStatsCounters
+	packetStatsCallbacks    *CallbackList[PacketStatsFunction]
 }
 
 // ServerNameLookup resolves a destination IP to the server name(s) previously observed
@@ -430,6 +452,20 @@ type RemoteUserNatMultiClient struct {
 // share a client channel even when the SNI is not visible on the wire (point 4).
 type ServerNameLookup interface {
 	ServerNames(ip string) []string
+}
+
+// ServerNamesLearnedFunction is called with the ips for which a new server name
+// was just learned.
+type ServerNamesLearnedFunction func(addrs []netip.Addr)
+
+// ServerNamesLearnedNotifier is an optional capability of a ServerNameLookup: it
+// notifies when a new server name is learned for an ip (e.g. an out-of-band DNS
+// resolution after a flow already started). The multi-client uses it to
+// invalidate that ip's cached block-action decision so subsequent block actions
+// report the server name instead of the ip — we prefer the server name wherever
+// possible. A lookup that doesn't implement it simply reconciles on the ttl.
+type ServerNamesLearnedNotifier interface {
+	AddServerNamesLearnedCallback(callback ServerNamesLearnedFunction) func()
 }
 
 type multiClientConfig struct {
@@ -502,7 +538,7 @@ func NewRemoteUserNatMultiClient(
 		multiClient.ipAssoc = NewIpAssoc(cancelCtx, settings.IpAssocSettings)
 	}
 	multiClient.config.Store(&multiClientConfig{
-		performanceProfile:  settings.DefaultPerformanceProfile,
+		performanceProfile:  multiClient.neverAllowDirect(settings.DefaultPerformanceProfile),
 		localSecurityBypass: false,
 		serverNameLookup:    nil,
 		blocker:             nil,
@@ -539,6 +575,13 @@ func NewRemoteUserNatMultiClient(
 		)
 	}
 	// else only keep the quality window for fixed destination
+
+	// a trusted same-network peer connection always allows direct (p2p). Force it
+	// onto the fresh windows now so the first channels pick it up even before any
+	// performance profile is set; SetPerformanceProfile keeps it forced thereafter.
+	if provideMode == protocol.ProvideMode_Network {
+		multiClient.SetPerformanceProfile(settings.DefaultPerformanceProfile)
+	}
 
 	multiClient.localUserNatUnsub = localUserNat.AddReceivePacketCallback(multiClient.localReceivePacket)
 
@@ -635,7 +678,45 @@ func (self *RemoteUserNatMultiClient) AddContractStatsCallback(contractStatsCall
 }
 
 // the performance profile will take effect at the next `resize` iteration
+// withNetworkAllowDirect forces AllowDirect on for a trusted same-network peer
+// connection (provideMode Network), superseding whatever performance profile is
+// set, so the connection can upgrade to a direct p2p stream. It is a no-op for
+// any other provide mode.
+func (self *RemoteUserNatMultiClient) withNetworkAllowDirect(performanceProfile *PerformanceProfile) *PerformanceProfile {
+	if self.provideMode != protocol.ProvideMode_Network {
+		return performanceProfile
+	}
+	if performanceProfile == nil {
+		return &PerformanceProfile{
+			WindowType:  WindowTypeQuality,
+			WindowSize:  DefaultWindowSizeSettings(),
+			AllowDirect: true,
+		}
+	}
+	if performanceProfile.AllowDirect {
+		return performanceProfile
+	}
+	forced := *performanceProfile
+	forced.AllowDirect = true
+	return &forced
+}
+
+// neverAllowDirect applies the `NeverAllowDirect` hard limit to the profile.
+// It must be applied after `withNetworkAllowDirect` so that the hard limit wins.
+func (self *RemoteUserNatMultiClient) neverAllowDirect(performanceProfile *PerformanceProfile) *PerformanceProfile {
+	if !self.settings.NeverAllowDirect {
+		return performanceProfile
+	}
+	if performanceProfile == nil || !performanceProfile.AllowDirect {
+		return performanceProfile
+	}
+	limited := *performanceProfile
+	limited.AllowDirect = false
+	return &limited
+}
+
 func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *PerformanceProfile) {
+	performanceProfile = self.neverAllowDirect(self.withNetworkAllowDirect(performanceProfile))
 	if performanceProfile != nil {
 		err := performanceProfile.Validate()
 		if err != nil {
@@ -679,6 +760,7 @@ func (self *RemoteUserNatMultiClient) SetLocalSecurityBypass(localSecurityBypass
 // SetServerNameLookup installs (or clears, with nil) the ServerNameLookup used for
 // ServerName-based path affinity. Safe to call at runtime.
 func (self *RemoteUserNatMultiClient) SetServerNameLookup(serverNameLookup ServerNameLookup) {
+	var prevUnsub func()
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -689,11 +771,51 @@ func (self *RemoteUserNatMultiClient) SetServerNameLookup(serverNameLookup Serve
 			serverNameLookup:    serverNameLookup,
 			blocker:             prev.blocker,
 		})
+		// re-subscribe to server-name-learned notifications: a name learned for an
+		// ip invalidates that ip's cached block-action decisions so they re-resolve
+		// with the server name. A lookup that doesn't notify just reconciles on the
+		// ttl.
+		prevUnsub = self.serverNamesLearnedUnsub
+		self.serverNamesLearnedUnsub = nil
+		if notifier, ok := serverNameLookup.(ServerNamesLearnedNotifier); ok {
+			self.serverNamesLearnedUnsub = notifier.AddServerNamesLearnedCallback(self.invalidateServerNames)
+		}
 	}()
+	if prevUnsub != nil {
+		prevUnsub()
+	}
 	if self.ipAssoc != nil {
 		self.ipAssoc.SetServerNameLookup(serverNameLookup)
 	}
+	// full reset on install: the new lookup may report different names. (Ongoing
+	// single-name learns are handled incrementally by invalidateServerNames.)
 	self.blockActionCache.clear()
+	self.blockActionIgnoreCache.clear()
+}
+
+// invalidateServerNames drops the cached block-action decisions for the given
+// ips, so the next flow to each rebuilds its decision and re-resolves the server
+// name(s) — reporting the server name instead of the ip going forward. A cached
+// decision unions server names over the destination's entire cluster, so the
+// learned ip's cluster siblings are invalidated too: their cached decisions
+// would otherwise keep reporting without the newly learned name until the ttl.
+// Wired to the server-name lookup's learned notifications in SetServerNameLookup.
+func (self *RemoteUserNatMultiClient) invalidateServerNames(addrs []netip.Addr) {
+	for _, addr := range addrs {
+		// the caches key on the unmapped addr (ipAssocAddr)
+		key := addr.Unmap()
+		self.blockActionCache.delete(key)
+		self.blockActionIgnoreCache.delete(key)
+		if self.ipAssoc != nil {
+			for _, member := range self.ipAssoc.GetClusterAddrs(key) {
+				memberKey := member.Unmap()
+				if memberKey != key {
+					self.blockActionCache.delete(memberKey)
+					self.blockActionIgnoreCache.delete(memberKey)
+				}
+			}
+		}
+	}
 }
 
 // SetBlocker installs (or clears, with nil) the ad/tracker Blocker consulted
@@ -1230,14 +1352,14 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 	packet []byte,
 	timeout time.Duration,
 ) bool {
-	minRelationship := max(provideMode, self.provideMode)
+	relationship := egressRelationship(provideMode, self.provideMode)
 
 	ipPath, payload, err := ParseIpPathWithPayload(packet)
 	if err != nil {
 		self.log.Infof("[multi]send bad packet = %s\n", err)
 		return false
 	}
-	r, err := self.securityPolicy.InspectEgress(minRelationship, ipPath, payload)
+	r, err := self.securityPolicy.InspectEgress(relationship, ipPath, payload)
 	if err != nil {
 		self.log.Infof("[multi]send bad packet = %s\n", err)
 		return false
@@ -2056,6 +2178,20 @@ func (self *RemoteUserNatMultiClient) Shuffle() {
 
 func (self *RemoteUserNatMultiClient) Close() {
 	self.cancel()
+
+	// release the server-name-learned subscription so the lookup does not retain
+	// this (now-closing) multi-client
+	var serverNamesLearnedUnsub func()
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		serverNamesLearnedUnsub = self.serverNamesLearnedUnsub
+		self.serverNamesLearnedUnsub = nil
+	}()
+	if serverNamesLearnedUnsub != nil {
+		serverNamesLearnedUnsub()
+	}
+
 	for _, window := range self.windows {
 		window.Close()
 	}
@@ -2527,12 +2663,23 @@ func (self *multiClientWindow) resize() {
 
 		removeClient := func(client *multiClientChannel) {
 			client.Close()
+			removed := false
 			func() {
 				self.stateLock.Lock()
 				defer self.stateLock.Unlock()
-				delete(self.clients, client.ClientId())
+				// guard the slot: the client may have been replaced under the same
+				// client id by a concurrent expand (see the replace on ping success).
+				// in that case do not delete the new client's entry and do not emit
+				// Removed for the shared id — the monitor dot now belongs to the
+				// new client.
+				if self.clients[client.ClientId()] == client {
+					delete(self.clients, client.ClientId())
+					removed = true
+				}
 			}()
-			self.removeClients(client)
+			if removed {
+				self.removeClients(client)
+			}
 		}
 		keepClient := func(client *multiClientChannel, stats *clientWindowStats) {
 			clients = append(clients, client)
@@ -2614,6 +2761,15 @@ func (self *multiClientWindow) resize() {
 			// the top `StatsWindowKeepHealthiestCount` won't be marked as warning or removed
 			netHealthRank := netHealthRanks[client]
 			remove := max(windowSize.FixedWindowSize, windowSize.KeepHealthiestCount) <= netHealthRank
+			// a rank-kept client is still removed once it has been continuously
+			// unhealthy past the keep cap: keeping the healthiest rides out
+			// transient badness, but a client that never recovers must be
+			// replaced so the window re-expands with fresh candidates (and its
+			// grid dot is reclaimed) instead of pinning a dead client forever
+			if 0 < self.settings.StatsWindowKeepUnhealthyDuration &&
+				self.settings.StatsWindowKeepUnhealthyDuration <= stats.unhealthyDuration {
+				remove = true
+			}
 			if healthy {
 				// a client after its `removeTime` will be in a permananent warning state as long as it continues to route traffic
 				// this prevents new connections from using the client
@@ -2931,7 +3087,6 @@ func (self *multiClientWindow) expand(
 							if err == nil {
 								self.log.V(1).Infof("[multi]expand new client\n")
 
-								self.monitor.AddProviderEvent(args.ClientId, ProviderStateAdded)
 								var replacedClient *multiClientChannel
 								func() {
 									self.stateLock.Lock()
@@ -2941,9 +3096,25 @@ func (self *multiClientWindow) expand(
 									self.clients[clientId] = client
 								}()
 								if replacedClient != nil {
+									// the replaced client is stored under the same client id
+									// as the new client, so they share one monitor dot. Cancel
+									// it without emitting Removed — a Removed here would
+									// terminal-arm the dot of the NEW live client (Added
+									// below), and the ui would reap it while the client is
+									// still routing.
 									replacedClient.Cancel()
-									self.monitor.AddProviderEvent(replacedClient.ClientId(), ProviderStateRemoved)
 								}
+								self.monitor.AddProviderEvent(args.ClientId, ProviderStateAdded)
+								// reap promptly when the client dies (the continuous ping or
+								// blackhole detection cancels the channel): wake the resize
+								// loop instead of waiting for its next tick
+								go HandleError(func() {
+									select {
+									case <-self.ctx.Done():
+									case <-client.Done():
+										self.resizeMonitor.NotifyAll()
+									}
+								})
 								pingSuccess += 1
 								pingCancel()
 							} else {
@@ -3354,6 +3525,11 @@ func newMultiClientChannel(
 		case <-cancelCtx.Done():
 		case <-client.Done():
 		}
+		// fire the contract-close events for this client's still-open contracts
+		// while the stats listener below is still attached, BEFORE cancelling the
+		// client (which stops the epoch worker without emitting). Otherwise a
+		// removed peer's contracts linger open forever in the contract-details UI.
+		client.CloseContractStats()
 		client.Cancel()
 		contractStatusSub()
 		contractStatsSub()
@@ -3661,12 +3837,19 @@ func (self *multiClientChannel) ping() {
 			}
 		}
 
+		// rest between pings. `CPingRestTimeout` is decoupled from the ack wait
+		// so a dead idle client is detected promptly (rest + ack wait), with a
+		// fallback to `CPingTimeout` for settings that predate the split
+		restTimeout := self.settings.CPingRestTimeout
+		if restTimeout <= 0 {
+			restTimeout = self.settings.CPingTimeout
+		}
 		select {
 		case <-self.ctx.Done():
 			return
 		case <-self.client.Done():
 			return
-		case <-WakeupAfter(self.settings.CPingTimeout, self.settings.CPingTimeout):
+		case <-WakeupAfter(restTimeout, restTimeout):
 		}
 	}
 }

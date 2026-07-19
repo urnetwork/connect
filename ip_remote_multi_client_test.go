@@ -358,3 +358,65 @@ func TestMultiClientChannelWindowStats(t *testing.T) {
 	AssertEqual(t, true, 1 <= stats.bucketCount)
 	AssertEqual(t, true, stats.bucketCount <= maxBucketCount)
 }
+
+func TestMultiClientNeverAllowDirect(t *testing.T) {
+	// the `NeverAllowDirect` hard limit keeps direct mode off,
+	// superseding both the performance profile and the same-network force.
+	// cloud hosted clients set this because a direct connection would leak
+	// that the client is hosted and where it is hosted
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	newMultiClient := func(neverAllowDirect bool, defaultPerformanceProfile *PerformanceProfile) *RemoteUserNatMultiClient {
+		settings := DefaultMultiClientSettings()
+		settings.NeverAllowDirect = neverAllowDirect
+		settings.DefaultPerformanceProfile = defaultPerformanceProfile
+		return NewRemoteUserNatMultiClient(
+			ctx,
+			&testingEmptyMultiClientGenerator{},
+			func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
+			},
+			protocol.ProvideMode_Network,
+			settings,
+		)
+	}
+
+	allowDirectProfile := &PerformanceProfile{
+		WindowType:  WindowTypeQuality,
+		WindowSize:  DefaultWindowSizeSettings(),
+		AllowDirect: true,
+	}
+
+	// baseline: without the hard limit, the same-network force enables direct
+	// mode even with no profile set
+	multiClient := newMultiClient(false, nil)
+	pp := multiClient.config.Load().performanceProfile
+	AssertEqual(t, true, pp != nil)
+	AssertEqual(t, true, pp.AllowDirect)
+	multiClient.Close()
+
+	// the hard limit supersedes the same-network force
+	multiClient = newMultiClient(true, nil)
+	defer multiClient.Close()
+	pp = multiClient.config.Load().performanceProfile
+	AssertEqual(t, true, pp != nil)
+	AssertEqual(t, false, pp.AllowDirect)
+
+	// the hard limit supersedes a profile that allows direct,
+	// on both the set path and the constructor default path
+	multiClient.SetPerformanceProfile(allowDirectProfile)
+	pp = multiClient.config.Load().performanceProfile
+	AssertEqual(t, true, pp != nil)
+	AssertEqual(t, false, pp.AllowDirect)
+	// the rest of the profile is preserved
+	AssertEqual(t, WindowTypeQuality, pp.WindowType)
+	// the input profile is not mutated in place
+	AssertEqual(t, true, allowDirectProfile.AllowDirect)
+
+	multiClientWithDefault := newMultiClient(true, allowDirectProfile)
+	defer multiClientWithDefault.Close()
+	pp = multiClientWithDefault.config.Load().performanceProfile
+	AssertEqual(t, true, pp != nil)
+	AssertEqual(t, false, pp.AllowDirect)
+}
