@@ -33,6 +33,18 @@ type ContractStatsEvent struct {
 	UsedByteCountDelta ByteCount
 	// false when the contract closed. the final event for a contract
 	Open bool
+	// Sequence is the per-contract emit order, starting at 1 and assigned
+	// under the stats lock at snapshot time, so Sequence order == intended
+	// order even when deliveries interleave (callbacks run outside the lock,
+	// and events may reorder further across an rpc boundary). A consumer
+	// must discard an event whose Sequence is <= the last seen for that
+	// contract id — in particular a stale `Open=true` snapshot arriving
+	// after the final close. The counter is dropped once the contract's
+	// entries are fully closed and removed: contract ids are platform-minted
+	// and single-use, and if a removed id were ever re-registered, the
+	// restarted sequence would (correctly) be discarded by consumers as
+	// stale — the contract is already closed from their point of view.
+	Sequence uint64
 }
 
 type ContractStatsFunction func(contractStatsEvents []*ContractStatsEvent)
@@ -152,6 +164,11 @@ func (self *ContractManager) emitContractStats() {
 			closed := entry.closed.Load()
 			if !entry.emitted || usedByteCount != entry.emittedUsedByteCount || closed {
 				if 0 < len(callbacks) {
+					// the per-contract sequence is assigned under the lock at
+					// snapshot time, so Sequence order == snapshot order even
+					// when the callbacks (outside the lock) interleave
+					sequence := self.contractStatsSequences[entry.contractId] + 1
+					self.contractStatsSequences[entry.contractId] = sequence
 					events = append(events, &ContractStatsEvent{
 						ContractId:         entry.contractId,
 						Receive:            entry.receive,
@@ -162,6 +179,7 @@ func (self *ContractManager) emitContractStats() {
 						UsedByteCount:      usedByteCount,
 						UsedByteCountDelta: usedByteCount - entry.emittedUsedByteCount,
 						Open:               !closed,
+						Sequence:           sequence,
 					})
 				}
 				entry.emitted = true
@@ -169,6 +187,13 @@ func (self *ContractManager) emitContractStats() {
 			}
 			if closed {
 				delete(self.contractStatsEntries, key)
+				// drop the sequence counter once no entry remains for the
+				// contract id (see the `Sequence` doc for why a re-register
+				// after this point stays safe)
+				siblingKey := contractStatsKey{contractId: key.contractId, receive: !key.receive}
+				if _, ok := self.contractStatsEntries[siblingKey]; !ok {
+					delete(self.contractStatsSequences, key.contractId)
+				}
 			}
 		}
 	}()

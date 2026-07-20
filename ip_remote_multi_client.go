@@ -2596,7 +2596,15 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 						return
 					}
 
-					clientArgs, err := self.generator.NewClientArgs()
+					// a destination-aware generator can reuse a persisted
+					// identity for this destination (PROXYDRAIN1.md §3.5)
+					var clientArgs *MultiClientGeneratorClientArgs
+					var err error
+					if destinationGenerator, ok := self.generator.(MultiClientGeneratorWithDestination); ok {
+						clientArgs, err = destinationGenerator.NewClientArgsForDestination(destination)
+					} else {
+						clientArgs, err = self.generator.NewClientArgs()
+					}
 					if err != nil {
 						self.log.Infof("[multi]create client args error = %s\n", err)
 						select {

@@ -30,6 +30,8 @@ type ApiMultiClientGeneratorSettings struct {
 }
 
 type ApiMultiClientGenerator struct {
+	ctx context.Context
+
 	specs          []*ProviderSpec
 	clientStrategy *ClientStrategy
 
@@ -47,6 +49,10 @@ type ApiMultiClientGenerator struct {
 	settings                *ApiMultiClientGeneratorSettings
 
 	api *BringYourApi
+
+	// window identity persistence (PROXYDRAIN1.md §3.5); nil state behavior
+	// is identical to no persistence
+	identityState *windowIdentityState
 }
 
 func NewApiMultiClientGeneratorWithDefaults(
@@ -98,6 +104,7 @@ func NewApiMultiClientGenerator(
 	api.SetByJwt(byJwt)
 
 	return &ApiMultiClientGenerator{
+		ctx:                     ctx,
 		specs:                   specs,
 		clientStrategy:          clientStrategy,
 		excludeClientIds:        excludeClientIds,
@@ -111,7 +118,18 @@ func NewApiMultiClientGenerator(
 		clientSettingsGenerator: clientSettingsGenerator,
 		settings:                settings,
 		api:                     api,
+		identityState:           newWindowIdentityState(ctx, nil),
 	}
+}
+
+// SetIdentityStore enables window identity persistence (PROXYDRAIN1.md
+// §3.5): live (client identity, destination) pairs are mirrored to the
+// store, and a restarted process reuses the persisted identities against
+// their destinations instead of minting fresh ones — keeping the egress
+// providers' NAT flows (keyed by source client id) resumable. Set before
+// the multi client starts expanding the window.
+func (self *ApiMultiClientGenerator) SetIdentityStore(store MultiClientIdentityStore) {
+	self.identityState = newWindowIdentityState(self.ctx, store)
 }
 
 func (self *ApiMultiClientGenerator) NextDestinations(count int, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error) {
@@ -147,6 +165,19 @@ func (self *ApiMultiClientGenerator) NextDestinations(count int, excludeDestinat
 			continue
 		}
 		if slices.Contains(excludeDestinations, destination) {
+			continue
+		}
+		destinations[destination] = DestinationStats{}
+	}
+
+	// destinations with a restored identity pending reuse are dialed first
+	// (PROXYDRAIN1.md §3.5): the restarted window re-forms against the SAME
+	// providers so their NAT flows resume
+	for _, destination := range self.identityState.RestoredDestinations() {
+		if slices.Contains(excludeDestinations, destination) {
+			continue
+		}
+		if _, ok := destinations[destination]; ok {
 			continue
 		}
 		destinations[destination] = DestinationStats{}
@@ -234,7 +265,85 @@ func (self *ApiMultiClientGenerator) NewClientArgs() (*MultiClientGeneratorClien
 	}
 }
 
+// NewClientArgsForDestination implements `MultiClientGeneratorWithDestination`
+// (PROXYDRAIN1.md §3.5): reuse the restored identity persisted for this
+// destination when one exists — same client id, jwt, and instance id, so the
+// provider's NAT flows keyed by the client id resume — otherwise mint fresh
+// args. Either way the live (identity, destination) pair is recorded to the
+// store, so the NEXT restart can restore it.
+func (self *ApiMultiClientGenerator) NewClientArgsForDestination(destination MultiHopId) (*MultiClientGeneratorClientArgs, error) {
+	if identity := self.identityState.TakeRestored(destination); identity != nil {
+		self.identityState.Record(identity)
+		return &MultiClientGeneratorClientArgs{
+			ClientId: identity.ClientId,
+			ClientAuth: &ClientAuth{
+				ByJwt:      identity.ByJwt,
+				InstanceId: identity.InstanceId,
+				AppVersion: self.appVersion,
+			},
+		}, nil
+	}
+
+	args, err := self.NewClientArgs()
+	if err != nil {
+		return nil, err
+	}
+	self.identityState.Record(&WindowClientIdentity{
+		ClientId:    args.ClientId,
+		ByJwt:       args.ClientAuth.ByJwt,
+		InstanceId:  args.ClientAuth.InstanceId,
+		Destination: destination,
+	})
+	return args, nil
+}
+
 func (self *ApiMultiClientGenerator) RemoveClientArgs(args *MultiClientGeneratorClientArgs) {
+	// Distinguish a window eviction from a shutdown-caused teardown: every
+	// channel teardown calls remove, but when the generator's ctx is done
+	// the whole device/process is going away. What happens next depends on
+	// whether an identity store is configured:
+	// - store configured (the proxy case): the identities must SURVIVE —
+	//   both in the persisted snapshot and as live network clients — so a
+	//   replacement container can reuse them (PROXYDRAIN1.md §3.5). Skip
+	//   everything.
+	// - no store (plain sdk apps, the default): nothing will ever reuse
+	//   these window clients, so keep the historical best-effort delete —
+	//   otherwise the platform-client rows leak on every app shutdown and
+	//   linger until server-side idle reap.
+	// Window evictions happen while the ctx is live and remove for real.
+	select {
+	case <-self.ctx.Done():
+		if self.identityState.hasStore() {
+			return
+		}
+		// one shot on a Background context (the lifecycle ctx is closed, so
+		// posting on it can never leave the process), mirroring the contract
+		// manager's after-close cleanup; the server's idle client reap
+		// remains the backstop if the attempt fails
+		go HandleError(func() {
+			removeCtx, removeCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer removeCancel()
+			HttpPostWithStrategy(
+				removeCtx,
+				self.clientStrategy,
+				fmt.Sprintf("%s/network/remove-client", self.apiUrl),
+				&RemoveNetworkClientArgs{
+					ClientId: args.ClientId,
+				},
+				self.byJwt,
+				&RemoveNetworkClientResult{},
+				NewNoopApiCallback[*RemoveNetworkClientResult](),
+			)
+		})
+		return
+	default:
+	}
+
+	// the identity is being torn down for real (window eviction, expired
+	// args): drop it from the persisted snapshot so a restart does not
+	// restore a removed client
+	self.identityState.Remove(args.ClientId)
+
 	removeNetworkClient := &RemoveNetworkClientArgs{
 		ClientId: args.ClientId,
 	}

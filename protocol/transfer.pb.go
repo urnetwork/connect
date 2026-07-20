@@ -89,8 +89,8 @@ func (SequenceRole) EnumDescriptor() ([]byte, []int) {
 // scale. Each mode stands on its own and does not imply any other mode. The
 // numeric values carry no ordinal meaning, so they must never be compared with
 // <, >, <=, >= and must never be passed to max() or min(). Decide per-case by
-// testing for the specific mode(s) you mean (e.g. `provideMode == ProvideMode_Network`).
-// Any range, max, or min over a provide mode is a bug.
+// testing for the specific mode(s) you mean (e.g. `mode == Network`). Any range,
+// max, or min over a provide mode is a bug.
 type ProvideMode int32
 
 const (
@@ -2393,6 +2393,58 @@ func (x *EncryptedControl) GetCompanion() bool {
 	return false
 }
 
+// each hop asks its client to migrate the platform transport
+// (make-before-break) because the resident is draining
+// (CONNECTDRAIN2.md §3.3). The client establishes a replacement transport at
+// `migrate_time` while the current one keeps carrying traffic, then closes
+// the old transport once the replacement is up.
+type ResidentMigrate struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// unix milliseconds when the client should begin the migration.
+	// the server jitters this across the drain migrate window so the
+	// clients do not thundering-herd the siblings
+	MigrateTime   uint64 `protobuf:"varint,1,opt,name=migrate_time,json=migrateTime,proto3" json:"migrate_time,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ResidentMigrate) Reset() {
+	*x = ResidentMigrate{}
+	mi := &file_transfer_proto_msgTypes[29]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ResidentMigrate) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ResidentMigrate) ProtoMessage() {}
+
+func (x *ResidentMigrate) ProtoReflect() protoreflect.Message {
+	mi := &file_transfer_proto_msgTypes[29]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ResidentMigrate.ProtoReflect.Descriptor instead.
+func (*ResidentMigrate) Descriptor() ([]byte, []int) {
+	return file_transfer_proto_rawDescGZIP(), []int{29}
+}
+
+func (x *ResidentMigrate) GetMigrateTime() uint64 {
+	if x != nil {
+		return x.MigrateTime
+	}
+	return 0
+}
+
 var File_transfer_proto protoreflect.FileDescriptor
 
 const file_transfer_proto_rawDesc = "" +
@@ -2584,7 +2636,9 @@ const file_transfer_proto_rawDesc = "" +
 	"\fcontrol_type\x18\x01 \x01(\x0e2\x1f.bringyour.EncryptedControlTypeR\vcontrolType\x12\x18\n" +
 	"\apayload\x18\x02 \x01(\fR\apayload\x12:\n" +
 	"\fsession_role\x18\x03 \x01(\x0e2\x17.bringyour.SequenceRoleR\vsessionRole\x12\x1c\n" +
-	"\tcompanion\x18\x04 \x01(\bR\tcompanion*W\n" +
+	"\tcompanion\x18\x04 \x01(\bR\tcompanion\"4\n" +
+	"\x0fResidentMigrate\x12!\n" +
+	"\fmigrate_time\x18\x01 \x01(\x04R\vmigrateTime*W\n" +
 	"\fSequenceRole\x12\x17\n" +
 	"\x13SequenceRoleUnknown\x10\x00\x12\x16\n" +
 	"\x12SequenceRoleClient\x10\x01\x12\x16\n" +
@@ -2629,7 +2683,7 @@ func file_transfer_proto_rawDescGZIP() []byte {
 }
 
 var file_transfer_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
-var file_transfer_proto_msgTypes = make([]protoimpl.MessageInfo, 29)
+var file_transfer_proto_msgTypes = make([]protoimpl.MessageInfo, 30)
 var file_transfer_proto_goTypes = []any{
 	(SequenceRole)(0),             // 0: bringyour.SequenceRole
 	(ProvideMode)(0),              // 1: bringyour.ProvideMode
@@ -2665,21 +2719,22 @@ var file_transfer_proto_goTypes = []any{
 	(*EncryptedKey)(nil),          // 31: bringyour.EncryptedKey
 	(*ClientKey)(nil),             // 32: bringyour.ClientKey
 	(*EncryptedControl)(nil),      // 33: bringyour.EncryptedControl
-	(*Frame)(nil),                 // 34: bringyour.Frame
-	(MessageType)(0),              // 35: bringyour.MessageType
+	(*ResidentMigrate)(nil),       // 34: bringyour.ResidentMigrate
+	(*Frame)(nil),                 // 35: bringyour.Frame
+	(MessageType)(0),              // 36: bringyour.MessageType
 }
 var file_transfer_proto_depIdxs = []int32{
 	5,  // 0: bringyour.TransferFrame.transfer_path:type_name -> bringyour.TransferPath
-	34, // 1: bringyour.TransferFrame.frame:type_name -> bringyour.Frame
-	35, // 2: bringyour.TransferFrame.message_type:type_name -> bringyour.MessageType
+	35, // 1: bringyour.TransferFrame.frame:type_name -> bringyour.Frame
+	36, // 2: bringyour.TransferFrame.message_type:type_name -> bringyour.MessageType
 	8,  // 3: bringyour.TransferFrame.pack:type_name -> bringyour.Pack
 	10, // 4: bringyour.TransferFrame.ack:type_name -> bringyour.Ack
 	0,  // 5: bringyour.TransferFrame.session_role:type_name -> bringyour.SequenceRole
 	5,  // 6: bringyour.FilteredTransferFrame.transfer_path:type_name -> bringyour.TransferPath
-	34, // 7: bringyour.Pack.frames:type_name -> bringyour.Frame
-	34, // 8: bringyour.Pack.contract_frame:type_name -> bringyour.Frame
+	35, // 7: bringyour.Pack.frames:type_name -> bringyour.Frame
+	35, // 8: bringyour.Pack.contract_frame:type_name -> bringyour.Frame
 	11, // 9: bringyour.Pack.tag:type_name -> bringyour.Tag
-	34, // 10: bringyour.FilteredPack.contract_frame:type_name -> bringyour.Frame
+	35, // 10: bringyour.FilteredPack.contract_frame:type_name -> bringyour.Frame
 	11, // 11: bringyour.Ack.tag:type_name -> bringyour.Tag
 	14, // 12: bringyour.Provide.keys:type_name -> bringyour.ProvideKey
 	1,  // 13: bringyour.ProvideKey.mode:type_name -> bringyour.ProvideMode
@@ -2724,7 +2779,7 @@ func file_transfer_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_transfer_proto_rawDesc), len(file_transfer_proto_rawDesc)),
 			NumEnums:      5,
-			NumMessages:   29,
+			NumMessages:   30,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

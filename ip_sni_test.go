@@ -17,6 +17,25 @@ import (
 // carrying a single host_name SNI, so the SNI parser and sniffer can be exercised
 // without a real TLS stack.
 func buildClientHello(sni string) []byte {
+	return buildClientHelloWithExtraExtensions(sni, nil)
+}
+
+// buildClientHelloWithEch is buildClientHello plus an encrypted_client_hello
+// extension AFTER server_name (the harder ordering: a first-win server_name
+// scan would miss it), so `sni` plays the OUTER (client-facing) name.
+func buildClientHelloWithEch(outerSni string) []byte {
+	echPayload := []byte{0x01, 0x02, 0x03, 0x04} // opaque; only the type matters
+	echExt := []byte{
+		byte(tlsExtensionEncryptedClientHello >> 8), byte(tlsExtensionEncryptedClientHello & 0xff),
+		byte(len(echPayload) >> 8), byte(len(echPayload)),
+	}
+	echExt = append(echExt, echPayload...)
+	return buildClientHelloWithExtraExtensions(outerSni, echExt)
+}
+
+// buildClientHelloWithExtraExtensions builds the hello with `extraExtensions`
+// (raw wire extension bytes) appended after the server_name extension.
+func buildClientHelloWithExtraExtensions(sni string, extraExtensions []byte) []byte {
 	// server_name extension data: ServerNameList { host_name entry }
 	entry := []byte{tlsSniTypeHostName, byte(len(sni) >> 8), byte(len(sni))}
 	entry = append(entry, []byte(sni)...)
@@ -25,6 +44,7 @@ func buildClientHello(sni string) []byte {
 	// extension: type(2) + length(2) + data
 	ext := []byte{0x00, 0x00, byte(len(snExt) >> 8), byte(len(snExt))}
 	ext = append(ext, snExt...)
+	ext = append(ext, extraExtensions...)
 	// extensions block: 2-byte length + extensions
 	extensions := []byte{byte(len(ext) >> 8), byte(len(ext))}
 	extensions = append(extensions, ext...)
@@ -80,9 +100,16 @@ func tls443Packet(t *testing.T, srcIp string, dstIp string, srcPort int, payload
 }
 
 func TestSniFromClientHello(t *testing.T) {
-	name, ok := sniFromClientHello(buildClientHello("Pbs.com"))
-	if !ok || name != "pbs.com" {
-		t.Fatalf("sniFromClientHello = %q,%v, want pbs.com,true (lowercased)", name, ok)
+	name, ech, ok := sniFromClientHello(buildClientHello("Pbs.com"))
+	if !ok || name != "pbs.com" || ech {
+		t.Fatalf("sniFromClientHello = %q,ech=%v,%v, want pbs.com,false,true (lowercased)", name, ech, ok)
+	}
+
+	// an ECH-bearing hello is detected, and the cleartext (outer) name is
+	// still returned raw — the recording layer reduces it
+	name, ech, ok = sniFromClientHello(buildClientHelloWithEch("Ech-Front.Example-Cdn.co.uk"))
+	if !ok || name != "ech-front.example-cdn.co.uk" || !ech {
+		t.Fatalf("sniFromClientHello(ech) = %q,ech=%v,%v, want ech-front.example-cdn.co.uk,true,true", name, ech, ok)
 	}
 
 	// a ClientHello with no server_name extension yields no SNI
@@ -96,9 +123,49 @@ func TestSniFromClientHello(t *testing.T) {
 		noSni[:20],                     // truncated mid-structure
 		buildClientHello("bad name!"),  // invalid hostname char → rejected
 	} {
-		if name, ok := sniFromClientHello(bad); ok {
+		if name, _, ok := sniFromClientHello(bad); ok {
 			t.Fatalf("sniFromClientHello(%v-bytes) = %q,true, want ok=false", len(bad), name)
 		}
+	}
+}
+
+func TestRegistrableDomain(t *testing.T) {
+	for name, want := range map[string]string{
+		// simple eTLD
+		"ech-front.example-cdn.com": "example-cdn.com",
+		"example-cdn.com":           "example-cdn.com",
+		// multi-label eTLD from the public suffix list (not just "last two labels")
+		"ech-front.cdn.example-cdn.co.uk": "example-cdn.co.uk",
+		// a bare public suffix has no registrable form; unchanged
+		"co.uk": "co.uk",
+	} {
+		if got := registrableDomain(name); got != want {
+			t.Fatalf("registrableDomain(%q) = %q, want %q", name, got, want)
+		}
+	}
+}
+
+// TestSniSnifferEchRecordsRegistrableDomain: an ECH-protected hello records the
+// outer name reduced to its registrable (eTLD+1) trust domain — never the full
+// outer name as if it were the precise destination host. A non-ECH hello still
+// records the full name.
+func TestSniSnifferEchRecordsRegistrableDomain(t *testing.T) {
+	var captured []string
+	sniffer := newSniSniffer(func(dstAddr netip.Addr, serverName string) {
+		captured = append(captured, serverName)
+	})
+
+	// ECH hello with an outer name under a multi-label (co.uk) domain
+	sniffer.observe(tls443Packet(t, "10.0.0.5", "93.184.216.34", 40010, buildClientHelloWithEch("ech-front.cdn.example-cdn.co.uk")))
+	if !slices.Equal(captured, []string{"example-cdn.co.uk"}) {
+		t.Fatalf("captured = %v, want [example-cdn.co.uk] (outer name reduced to eTLD+1)", captured)
+	}
+
+	// non-ECH behavior is unchanged: the full name records
+	captured = nil
+	sniffer.observe(tls443Packet(t, "10.0.0.5", "93.184.216.34", 40011, buildClientHello("host.sub.example-cdn.co.uk")))
+	if !slices.Equal(captured, []string{"host.sub.example-cdn.co.uk"}) {
+		t.Fatalf("captured = %v, want the full non-ECH name", captured)
 	}
 }
 

@@ -126,9 +126,8 @@ func TestStreamManagerStreamLifecycle(t *testing.T) {
 		return !streamManager.IsStreamOpen(intermediaryStreamId)
 	}))
 
-	// reset closes all open streams and opens the listed set.
-	// relist the endpoint stream and add a new stream;
-	// the source stream is not listed and closes
+	// reset reconciles: relisted streams keep their sequences,
+	// unlisted streams close, and newly listed streams open
 	resetStreamId := NewId()
 	receiveControl(&protocol.StreamReset{
 		Streams: []*protocol.StreamOpen{
@@ -141,7 +140,63 @@ func TestStreamManagerStreamLifecycle(t *testing.T) {
 	AssertEqual(t, true, eventually(func() bool {
 		return !streamManager.IsStreamOpen(sourceStreamId)
 	}))
-	// the relisted stream reopens with a new sequence since reset cancels all
-	AssertEqual(t, true, sequence != getSequence(endpointStreamId))
+	// the relisted stream keeps its live sequence across the reset,
+	// so its p2p transports survive a resident migration
+	AssertEqual(t, true, sequence == getSequence(endpointStreamId))
+	AssertEqual(t, true, sequence.ctx.Err() == nil)
+
+	// an empty reset cancels everything (the legacy reset behavior)
+	receiveControl(&protocol.StreamReset{})
+	AssertEqual(t, true, eventually(func() bool {
+		return !streamManager.IsStreamOpen(endpointStreamId) && !streamManager.IsStreamOpen(resetStreamId)
+	}))
 	AssertEqual(t, true, sequence.ctx.Err() != nil)
+}
+
+// TestStreamManagerResetSkipsBadEntries: a reset whose stream list contains
+// un-openable entries (malformed ids) must still open every valid listed
+// stream. Previously the re-open loop aborted on the first failed open,
+// stranding the later listed streams until the next reset.
+func TestStreamManagerResetSkipsBadEntries(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), DefaultClientSettings())
+	defer client.Close()
+
+	streamManager := client.streamManager
+
+	destinationId := NewId()
+	streamIdA := NewId()
+	streamIdB := NewId()
+
+	valid := func(streamId Id) *protocol.StreamOpen {
+		return &protocol.StreamOpen{
+			StreamId:      streamId.Bytes(),
+			DestinationId: destinationId.Bytes(),
+		}
+	}
+
+	frame, err := ToFrame(&protocol.StreamReset{
+		Streams: []*protocol.StreamOpen{
+			// malformed: a truncated stream id fails IdFromBytes
+			{
+				StreamId:      []byte{0x01, 0x02, 0x03},
+				DestinationId: destinationId.Bytes(),
+			},
+			valid(streamIdA),
+			// malformed: a truncated source id fails IdFromBytes
+			{
+				StreamId: NewId().Bytes(),
+				SourceId: []byte{0x04},
+			},
+			valid(streamIdB),
+		},
+	}, DefaultProtocolVersion)
+	AssertEqual(t, err, nil)
+	streamManager.Receive(SourceId(ControlId), []*protocol.Frame{frame}, Peer{})
+
+	// both valid streams opened despite the malformed entries around them
+	AssertEqual(t, true, streamManager.IsStreamOpen(streamIdA))
+	AssertEqual(t, true, streamManager.IsStreamOpen(streamIdB))
 }

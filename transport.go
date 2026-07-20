@@ -194,6 +194,34 @@ type PlatformTransport struct {
 	// separated from its notification, and so re-electing the same mode does
 	// not wake the election loop's own watchers
 	mode *MonitorValue[TransportMode]
+
+	// the number of connections with routes currently registered on the route
+	// manager. 0 < count means the transport is carrying (or able to carry)
+	// traffic. Used by make-before-break migration to wait for a replacement
+	// transport to come up before closing the old one (CONNECTDRAIN2.md §3.3)
+	registeredCount  atomic.Int64
+	connectedMonitor *Monitor
+}
+
+// IsConnected reports whether the transport has a connection with routes
+// registered on the route manager
+func (self *PlatformTransport) IsConnected() bool {
+	return 0 < self.registeredCount.Load()
+}
+
+// ConnectedNotify returns a channel that closes on the next connect state
+// change. Capture the channel before checking `IsConnected`.
+func (self *PlatformTransport) ConnectedNotify() <-chan struct{} {
+	return self.connectedMonitor.NotifyChannel()
+}
+
+func (self *PlatformTransport) setRegistered(registered bool) {
+	if registered {
+		self.registeredCount.Add(1)
+	} else {
+		self.registeredCount.Add(-1)
+	}
+	self.connectedMonitor.NotifyAll()
 }
 
 func NewPlatformTransportWithDefaults(
@@ -268,6 +296,7 @@ func NewPlatformTransportWithTargetMode(
 		availableModes:       map[TransportMode]bool{},
 		targetMode:           targetMode,
 		mode:                 NewMonitorValue(TransportModeNone),
+		connectedMonitor:     NewMonitor(),
 	}
 	go HandleError(transport.run, cancel)
 	return transport
@@ -656,11 +685,13 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 			self.routeManager.UpdateTransport(sendTransport, []Route{exportedSend})
 			self.routeManager.UpdateTransport(receiveTransport, []Route{receive})
+			self.setRegistered(true)
 
 			// scoped to the writer goroutine; canceled when it exits so the
 			// outer defer can drain `send` without racing the writer.
 			writerCtx, writerCancel := context.WithCancel(context.Background())
 			defer func() {
+				self.setRegistered(false)
 				self.routeManager.RemoveTransport(sendTransport)
 				self.routeManager.RemoveTransport(receiveTransport)
 				handleCancel()
@@ -1233,11 +1264,13 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 
 			self.routeManager.UpdateTransport(sendTransport, []Route{send})
 			self.routeManager.UpdateTransport(receiveTransport, []Route{receive})
+			self.setRegistered(true)
 
 			// scoped to the writer goroutine; canceled when it exits so the
 			// outer defer can drain `send` without racing the writer.
 			h3WriterCtx, h3WriterCancel := context.WithCancel(context.Background())
 			defer func() {
+				self.setRegistered(false)
 				self.routeManager.RemoveTransport(sendTransport)
 				self.routeManager.RemoveTransport(receiveTransport)
 				handleCancel()

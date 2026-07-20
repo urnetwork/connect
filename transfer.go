@@ -131,10 +131,13 @@ func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings
 		// Retry a failed/absent contract promptly. A same-network peer connect can
 		// briefly return NoPermission while the target's provide registration is
 		// still committing; the send sequence blocks on this interval before
-		// retrying, so a long interval turns that race into a multi-second stall.
-		CreateContractRetryInterval: 1 * time.Second,
-		MinResendInterval:           2 * time.Second,
-		MaxResendInterval:           8 * time.Second,
+		// retrying, so a long first interval turns that race into a multi-second
+		// stall. Subsequent failures back off to the max to avoid multiplying
+		// contract-control/API load for a persistently unavailable destination.
+		CreateContractRetryInterval:    1 * time.Second,
+		CreateContractRetryMaxInterval: 5 * time.Second,
+		MinResendInterval:              2 * time.Second,
+		MaxResendInterval:              8 * time.Second,
 		// no backoff
 		// ResendBackoffScale: 0,
 		RttScale:         1.2,
@@ -1486,8 +1489,13 @@ func (self *Client) Flush() {
 }
 
 type SendBufferSettings struct {
-	CreateContractTimeout       time.Duration
+	CreateContractTimeout time.Duration
+	// CreateContractRetryInterval is the fast first retry interval.
 	CreateContractRetryInterval time.Duration
+	// CreateContractRetryMaxInterval caps exponential retry backoff. Zero
+	// preserves the historical constant-interval behavior for callers that
+	// construct settings without the new field.
+	CreateContractRetryMaxInterval time.Duration
 
 	// resend timeout is the initial time between successive send attempts. Does linear backoff
 	MinResendInterval time.Duration
@@ -2522,12 +2530,18 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 		}
 
 		endTime := time.Now().Add(self.sendBufferSettings.CreateContractTimeout)
+		retryInterval := self.sendBufferSettings.CreateContractRetryInterval
+		maxRetryInterval := self.sendBufferSettings.CreateContractRetryMaxInterval
+		if maxRetryInterval <= 0 {
+			maxRetryInterval = retryInterval
+		}
 
 		if self.sendContract != nil {
 			// there should be a queued up contract
-			if traceNextContract(min(self.sendBufferSettings.CreateContractTimeout, self.sendBufferSettings.CreateContractRetryInterval)) {
+			if traceNextContract(min(self.sendBufferSettings.CreateContractTimeout, retryInterval)) {
 				return true
 			}
+			retryInterval = nextCreateContractRetryInterval(retryInterval, maxRetryInterval)
 		}
 
 		for {
@@ -2557,9 +2571,10 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 				ByteCount(32+float32(messageByteCount+messageByteCount+self.sendBufferSettings.MinMessageByteCount)/self.sendBufferSettings.ContractFillFraction),
 			)
 
-			if traceNextContract(min(timeout, self.sendBufferSettings.CreateContractRetryInterval)) {
+			if traceNextContract(min(timeout, retryInterval)) {
 				return true
 			}
+			retryInterval = nextCreateContractRetryInterval(retryInterval, maxRetryInterval)
 		}
 	}
 
@@ -2580,6 +2595,19 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 		self.log.Infof("[s]contract wait %.1fs ok=%t c=%t %s->%s...%s s(%s)\n", d.Seconds(), ok, self.companionContract, self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId)
 	}
 	return ok
+}
+
+func nextCreateContractRetryInterval(current time.Duration, maximum time.Duration) time.Duration {
+	if maximum <= 0 || maximum <= current {
+		return current
+	}
+	if current <= 0 {
+		return maximum
+	}
+	if maximum/2 < current {
+		return maximum
+	}
+	return min(2*current, maximum)
 }
 
 func (self *SendSequence) setContract(nextSendContract *sequenceContract) {

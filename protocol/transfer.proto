@@ -531,3 +531,16 @@ message EncryptedControl {
     bool companion = 4;
 }
 
+
+
+// each hop asks its client to migrate the platform transport
+// (make-before-break) because the resident is draining
+// (CONNECTDRAIN2.md §3.3). The client establishes a replacement transport at
+// `migrate_time` while the current one keeps carrying traffic, then closes
+// the old transport once the replacement is up.
+message ResidentMigrate {
+    // unix milliseconds when the client should begin the migration.
+    // the server jitters this across the drain migrate window so the
+    // clients do not thundering-herd the siblings
+    uint64 migrate_time = 1;
+}

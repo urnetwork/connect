@@ -194,7 +194,7 @@ func TestUpgradeMuxDnsBlocked(t *testing.T) {
 	}
 	// an unblocked HTTPS/SVCB query is claimed and routed to the DoH forward path (not
 	// passed through). This test's resolver has remote DoH disabled, so the forward
-	// short-circuits and sends nothing — like the unblocked A above.
+	// fails fast with a prompt SERVFAIL (never silence on the claimed type).
 	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "ok.example.org.", dnsmessage.Type(65), 0x0a06), 0) {
 		t.Fatal("unblocked HTTPS query not claimed")
 	}
@@ -203,10 +203,21 @@ func TestUpgradeMuxDnsBlocked(t *testing.T) {
 		// pass-through returns the upstream's result; the recorder upstream
 		// accepts, so SendPacket returns true — assert it reached upstream
 	}
+	if !waitReceived(5) {
+		t.Fatal("no SERVFAIL for the unblocked HTTPS query with remote DoH off")
+	}
 	time.Sleep(500 * time.Millisecond)
-	// only the 4 blocker-synthesized replies exist; the unblocked A/HTTPS produced none
-	if _, received := rec.counts(); received != 4 {
-		t.Fatalf("unexpected downstream replies: %d, want 4", received)
+	// the 4 blocker-synthesized replies plus the HTTPS forward SERVFAIL; the
+	// unblocked A produced none
+	if _, received := rec.counts(); received != 5 {
+		t.Fatalf("unexpected downstream replies: %d, want 5", received)
+	}
+	header, question, answers = parseDnsBlockedReply(t, rec.receivedPackets()[4])
+	if header.ID != 0x0a06 || header.RCode != dnsmessage.RCodeServerFailure || len(answers) != 0 {
+		t.Fatalf("unblocked HTTPS forward-failure reply: id=%04x rcode=%v answers=%d, want 0a06/SERVFAIL/0", header.ID, header.RCode, len(answers))
+	}
+	if question.Type != dnsmessage.Type(65) {
+		t.Fatalf("unblocked HTTPS question echoed as %v", question.Type)
 	}
 	if sent, _ := rec.counts(); sent != 1 {
 		t.Fatalf("upstream pass-throughs: %d, want 1 (the unblocked TXT query)", sent)
@@ -219,14 +230,14 @@ func TestUpgradeMuxDnsBlocked(t *testing.T) {
 		t.Fatal("disabled-blocker A query not claimed")
 	}
 	time.Sleep(500 * time.Millisecond)
-	if _, received := rec.counts(); received != 4 {
+	if _, received := rec.counts(); received != 5 {
 		t.Fatalf("disabled blocker still replied: %d", received)
 	}
 	blocker.SetEnabled(true)
 	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "ads.example.com.", dnsmessage.TypeA, 0x0a08), 0) {
 		t.Fatal("re-enabled blocker A query not claimed")
 	}
-	if !waitReceived(5) {
+	if !waitReceived(6) {
 		t.Fatal("re-enabled blocker did not reply")
 	}
 
@@ -236,7 +247,7 @@ func TestUpgradeMuxDnsBlocked(t *testing.T) {
 		t.Fatal("nil-blocker A query not claimed")
 	}
 	time.Sleep(500 * time.Millisecond)
-	if _, received := rec.counts(); received != 5 {
+	if _, received := rec.counts(); received != 6 {
 		t.Fatalf("nil blocker still replied: %d", received)
 	}
 }

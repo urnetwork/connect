@@ -64,6 +64,24 @@ func TestRemoteUserNatProviderPacketStats(t *testing.T) {
 		t.Fatalf("unexpected ingress stats %+v", stats)
 	}
 
+	// the packet is a non-SYN with no tcp sequence, so the nat answers with
+	// an orphan RST (PROXYDRAIN1.md §3.5) — the provider's first remote
+	// egress. Wait for it (the nat send path is asynchronous) so the exact
+	// counts below are deterministic, and capture its size.
+	var rstByteCount ByteCount
+	rstDeadline := time.Now().Add(5 * time.Second)
+	for {
+		stats = provider.PacketStats()
+		if stats.RemoteEgressPacketCount == 1 {
+			rstByteCount = stats.RemoteEgressByteCount
+			break
+		}
+		if rstDeadline.Before(time.Now()) {
+			t.Fatalf("expected the orphan rst egress %+v", stats)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
 	// a tunneled BitTorrent handshake is dropped by the reversed policy DPI
 	// and counts as blocked
 	blockedPacket := craftSecurityPacket(IpProtocolTcp, srcIP, 42000, dstIP, 51413, false, bittorrentHandshakePacketPayload())
@@ -87,7 +105,7 @@ func TestRemoteUserNatProviderPacketStats(t *testing.T) {
 	provider.Receive(source, protocol.ProvideMode_Public, returnIpPath, returnPacket)
 
 	stats = provider.PacketStats()
-	if stats.RemoteEgressPacketCount != 1 || stats.RemoteEgressByteCount != ByteCount(len(returnPacket)) {
+	if stats.RemoteEgressPacketCount != 2 || stats.RemoteEgressByteCount != rstByteCount+ByteCount(len(returnPacket)) {
 		t.Fatalf("unexpected egress stats %+v", stats)
 	}
 
@@ -104,7 +122,7 @@ func TestRemoteUserNatProviderPacketStats(t *testing.T) {
 	if stats.BlockEgressPacketCount != 1 || stats.BlockEgressByteCount != ByteCount(len(strayPacket)) {
 		t.Fatalf("unexpected stray return stats %+v", stats)
 	}
-	if stats.BlockIngressPacketCount != 1 || stats.RemoteEgressPacketCount != 1 {
+	if stats.BlockIngressPacketCount != 1 || stats.RemoteEgressPacketCount != 2 {
 		t.Fatalf("the stray return must only count as block egress %+v", stats)
 	}
 

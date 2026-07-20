@@ -132,7 +132,12 @@ func TestProxyEgressBlocksLocalDestinations(t *testing.T) {
 // value drives companion-contract selection on the provider return path.
 func TestRecordSourceProvideMode(t *testing.T) {
 	newProvider := func() *RemoteUserNatProvider {
-		return &RemoteUserNatProvider{sourceProvideMode: map[Id]protocol.ProvideMode{}}
+		return &RemoteUserNatProvider{
+			// no source cap: these cases exercise the record/return logic,
+			// not eviction
+			settings:          &RemoteUserNatProviderSettings{MaxSourceCount: 0},
+			sourceProvideMode: map[Id]protocol.ProvideMode{},
+		}
 	}
 	fallback := protocol.ProvideMode_Stream
 
@@ -179,6 +184,27 @@ func TestRecordSourceProvideMode(t *testing.T) {
 		p.recordSourceProvideMode(id, protocol.ProvideMode_Stream)
 		if got := p.sourceReturnProvideMode(id, fallback); got != protocol.ProvideMode_Stream {
 			t.Errorf("public then stream = %v, want Stream", got)
+		}
+	})
+
+	t.Run("caps the tracked source count", func(t *testing.T) {
+		p := &RemoteUserNatProvider{
+			settings:          &RemoteUserNatProviderSettings{MaxSourceCount: 2},
+			sourceProvideMode: map[Id]protocol.ProvideMode{},
+		}
+		id1 := NewId()
+		id2 := NewId()
+		id3 := NewId()
+		p.recordSourceProvideMode(id1, protocol.ProvideMode_Public)
+		p.recordSourceProvideMode(id2, protocol.ProvideMode_Public)
+		// adding a third new source evicts one existing entry to stay at the cap
+		p.recordSourceProvideMode(id3, protocol.ProvideMode_Public)
+		if got := len(p.sourceProvideMode); got != 2 {
+			t.Errorf("tracked source count = %d, want 2 (capped)", got)
+		}
+		// the just-recorded source is retained; an evicted source falls back
+		if got := p.sourceReturnProvideMode(id3, fallback); got != protocol.ProvideMode_Public {
+			t.Errorf("newest source = %v, want Public", got)
 		}
 	})
 }

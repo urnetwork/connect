@@ -7,6 +7,7 @@ package connect
 
 import (
 	"context"
+	"encoding/binary"
 	"net"
 	"net/netip"
 	"slices"
@@ -516,6 +517,10 @@ type dnsFlight struct {
 	// workers is the outstanding pipeline goroutine count; the flight is removed when it
 	// reaches 0 without a reply (resolution failed: send nothing, the clients retry)
 	workers int
+	// cancel is shared by every worker in an A/AAAA race. The first
+	// authoritative answer cancels its losing sibling, and the flight remains
+	// in inflight until all workers have observed cancellation and exited.
+	cancel context.CancelFunc
 }
 
 // handleDns claims a single A/AAAA DNS query and attaches it to the resolution
@@ -525,8 +530,10 @@ type dnsFlight struct {
 // records the IP→hostname mapping. SVCB/HTTPS (64/65) queries are claimed and
 // forwarded opaquely over the tunnel DoH — the record (alpn/hints/ech) is preserved
 // for the client, and its ipv4hint/ipv6hint addresses are recorded into the reverse
-// index so those flows are named. Other query types are not claimed and pass through
-// to the upstream.
+// index so those flows are named; when the forward cannot answer (remote DoH off or
+// failed) the client gets a prompt SERVFAIL, and an over-UDP-size record gets a
+// truncated (TC) reply, so a resolver waiting on the HTTPS RR never hangs on the
+// claimed type. Other query types are not claimed and pass through to the upstream.
 //
 // The parsed question is a value (dnsmessage copies the name into a fixed array), and
 // the reversed path owns its address bytes, so nothing aliases the recycled packet
@@ -625,6 +632,12 @@ func (self *UpgradeMux) attachDnsResponder(key DohKey, responder dnsResponder) *
 	self.inflightLock.Lock()
 	defer self.inflightLock.Unlock()
 	if fl, ok := self.inflight[key]; ok {
+		// An answer has already snapshotted this flight's responders. Keep the
+		// flight counted until its losing workers exit, but do not attach a
+		// responder that could no longer receive that answer.
+		if fl.replied {
+			return nil
+		}
 		for _, r := range fl.responders {
 			if r.id == responder.id && r.reverse.DestinationPort == responder.reverse.DestinationPort && r.reverse.DestinationIp.Equal(responder.reverse.DestinationIp) {
 				// a retransmit of an attached query; it is answered when the pipeline replies
@@ -666,11 +679,12 @@ func (self *UpgradeMux) startDnsPipeline(key DohKey, fl *dnsFlight, recordType s
 	}
 	fallback := self.fallbackDohCache.Load()
 
-	queryContext := func() (context.Context, context.CancelFunc) {
-		if 0 < resolveTimeout {
-			return context.WithTimeout(self.ctx, resolveTimeout)
-		}
-		return self.ctx, func() {}
+	var queryCtx context.Context
+	var queryCancel context.CancelFunc
+	if 0 < resolveTimeout {
+		queryCtx, queryCancel = context.WithTimeout(self.ctx, resolveTimeout)
+	} else {
+		queryCtx, queryCancel = context.WithCancel(self.ctx)
 	}
 
 	// reply delivers the first successful resolution to every attached responder, exactly
@@ -683,6 +697,7 @@ func (self *UpgradeMux) startDnsPipeline(key DohKey, fl *dnsFlight, recordType s
 			return
 		}
 		var responders []dnsResponder
+		var cancel context.CancelFunc
 		func() {
 			self.inflightLock.Lock()
 			defer self.inflightLock.Unlock()
@@ -691,12 +706,16 @@ func (self *UpgradeMux) startDnsPipeline(key DohKey, fl *dnsFlight, recordType s
 			}
 			fl.replied = true
 			responders = fl.responders
-			if self.inflight[key] == fl {
-				delete(self.inflight, key)
-			}
+			cancel = fl.cancel
 		}()
 		if responders == nil {
 			return
+		}
+		// Cancel the losing resolver before doing response construction and
+		// delivery. The flight remains in the map until workerDone observes
+		// every worker exit, so MaxInflightQueries also bounds queued losers.
+		if cancel != nil {
+			cancel()
 		}
 		if 0 < len(addrs) {
 			self.reverse.record(addrs, domain)
@@ -714,11 +733,19 @@ func (self *UpgradeMux) startDnsPipeline(key DohKey, fl *dnsFlight, recordType s
 	// workerDone retires the flight once every worker has exited without an answer, so a
 	// failed question frees its slot for the clients' retries to start a fresh pipeline.
 	workerDone := func() {
+		var cancel context.CancelFunc
 		self.inflightLock.Lock()
-		defer self.inflightLock.Unlock()
 		fl.workers -= 1
-		if fl.workers == 0 && !fl.replied && self.inflight[key] == fl {
-			delete(self.inflight, key)
+		if fl.workers == 0 {
+			if self.inflight[key] == fl {
+				delete(self.inflight, key)
+			}
+			cancel = fl.cancel
+			fl.cancel = nil
+		}
+		self.inflightLock.Unlock()
+		if cancel != nil {
+			cancel()
 		}
 	}
 
@@ -730,6 +757,7 @@ func (self *UpgradeMux) startDnsPipeline(key DohKey, fl *dnsFlight, recordType s
 		self.inflightLock.Lock()
 		defer self.inflightLock.Unlock()
 		fl.workers = workers
+		fl.cancel = queryCancel
 	}()
 
 	// primary: resolve over the tunnel-DoH (preferred — egresses the tunnel, no DNS leak), retrying
@@ -739,8 +767,6 @@ func (self *UpgradeMux) startDnsPipeline(key DohKey, fl *dnsFlight, recordType s
 	tunnelOk := make(chan struct{})
 	go HandleError(func() {
 		defer workerDone()
-		queryCtx, queryCancel := queryContext()
-		defer queryCancel()
 		addrs, authoritative := self.resolveTunnelDoh(queryCtx, recordType, domain)
 		if 0 < len(addrs) || authoritative {
 			close(tunnelOk) // the tunnel won — signal the fallback to skip its local query (no leak)
@@ -756,15 +782,15 @@ func (self *UpgradeMux) startDnsPipeline(key DohKey, fl *dnsFlight, recordType s
 	if workers == 2 {
 		go HandleError(func() {
 			defer workerDone()
+			timer := time.NewTimer(localFallbackTimeout)
+			defer timer.Stop()
 			select {
-			case <-time.After(localFallbackTimeout):
+			case <-timer.C:
 			case <-tunnelOk:
 				return
-			case <-self.ctx.Done():
+			case <-queryCtx.Done():
 				return
 			}
-			queryCtx, queryCancel := queryContext()
-			defer queryCancel()
 			addrs, authoritative := fallback.QueryResult(queryCtx, recordType, domain)
 			reply(addrs, authoritative)
 		})
@@ -772,15 +798,19 @@ func (self *UpgradeMux) startDnsPipeline(key DohKey, fl *dnsFlight, recordType s
 }
 
 // maxForwardedHttpsResponse bounds the SVCB/HTTPS response delivered to the client over UDP/53.
-// A larger record's hints are still recorded, but it is not delivered (the client falls back to
-// A/AAAA for connectivity) — the mux does not add EDNS0/TCP fallback for the rare oversized record.
+// A larger record's hints are still recorded, but the record itself is not delivered — the
+// client instead gets a truncated (TC) reply, the accurate signal that the answer exceeds
+// UDP/53, so it can fail over to its own TCP/EDNS0 path (which passes through the mux
+// unclaimed) or fall back to A/AAAA without waiting out a timeout.
 const maxForwardedHttpsResponse = 1232
 
 // startHttpsForwardPipeline forwards one SVCB/HTTPS question over the tunnel DoH and fans the raw
 // record out to the flight's responders (each gets the record with its own DNS transaction id),
 // recording the record's ipv4hint/ipv6hint addresses into the reverse index so those flows are
-// named. On a forward failure it sends nothing — the client falls back to A/AAAA, which the mux
-// resolves and records.
+// named. The type is claimed unconditionally, so a forward that cannot answer (remote DoH
+// disabled, or the forward failed) must not black-hole the query: the client gets a prompt
+// SERVFAIL and falls back to A/AAAA immediately — resolvers serialize on the HTTPS RR answer,
+// and silence here would stall them until their own timeout.
 func (self *UpgradeMux) startHttpsForwardPipeline(key DohKey, fl *dnsFlight, qType dnsmessage.Type, domain string) {
 	var resolveTimeout time.Duration
 	if dns := self.settings.Load().Dns; dns != nil {
@@ -803,19 +833,20 @@ func (self *UpgradeMux) startHttpsForwardPipeline(key DohKey, fl *dnsFlight, qTy
 			defer cancel()
 		}
 		if response, ok := self.mux.Tun().DohCache().Forward(queryCtx, qType, domain); ok {
-			self.fanOutHttpsForward(fl, domain, response)
+			self.fanOutHttpsForward(key, fl, domain, response)
+		} else {
+			// fail fast instead of dropping: remote DoH is off or the forward
+			// failed, and no answer will ever come from this pipeline
+			self.deliverDnsStatus(self.takeHttpsForwardResponders(key, fl), dnsmessage.RCodeServerFailure, false)
 		}
-		// on a forward failure, deliver nothing — the client falls back to A/AAAA. The
-		// deferred cleanup above retires the flight either way.
 	})
 }
 
-// fanOutHttpsForward delivers a forwarded SVCB/HTTPS record to the flight's responders (each with
-// its own DNS transaction id stamped in) and records the record's ipv4hint/ipv6hint addresses into
-// the reverse index. Split from the forward round-trip so it is testable with a canned response
-// (the tunnel-DoH round-trip itself can't be driven in a connect unit test — see the skipped
-// TestUpgradeMuxDefaultDnsThroughTunnel).
-func (self *UpgradeMux) fanOutHttpsForward(fl *dnsFlight, domain string, response []byte) {
+// takeHttpsForwardResponders snapshots and retires an SVCB/HTTPS flight exactly once,
+// returning nil when the flight has already replied. Removing the flight in the same
+// critical section as the responder snapshot means a query racing completion either
+// joins before this snapshot and is answered, or creates a new flight afterward.
+func (self *UpgradeMux) takeHttpsForwardResponders(key DohKey, fl *dnsFlight) []dnsResponder {
 	var responders []dnsResponder
 	func() {
 		self.inflightLock.Lock()
@@ -825,7 +856,36 @@ func (self *UpgradeMux) fanOutHttpsForward(fl *dnsFlight, domain string, respons
 		}
 		fl.replied = true
 		responders = fl.responders
+		if self.inflight[key] == fl {
+			delete(self.inflight, key)
+		}
 	}()
+	return responders
+}
+
+// deliverDnsStatus answers each responder with a header+question-only response carrying
+// `rcode` and, when `truncated`, the TC bit — the fail-fast replies (SERVFAIL for a dead
+// forward, TC for an answer that exceeds UDP/53).
+func (self *UpgradeMux) deliverDnsStatus(responders []dnsResponder, rcode dnsmessage.RCode, truncated bool) {
+	for i := range responders {
+		r := &responders[i]
+		respPayload, err := buildDnsStatusResponse(r.id, r.question, rcode, truncated)
+		if err != nil {
+			continue
+		}
+		self.mux.deliverDownstream(r.source, r.provideMode, r.reverse, ipOosPacket(r.reverse, respPayload))
+	}
+}
+
+// fanOutHttpsForward delivers a forwarded SVCB/HTTPS record to the flight's responders (each with
+// its own DNS transaction id stamped in) and records the record's ipv4hint/ipv6hint addresses into
+// the reverse index. An oversized record is captured (hints recorded) but answered with a
+// truncated (TC) reply instead of the record; a malformed record is answered SERVFAIL. Split from
+// the forward round-trip so it is testable with a canned response (the tunnel-DoH round-trip
+// itself can't be driven in a connect unit test — see the skipped
+// TestUpgradeMuxDefaultDnsThroughTunnel).
+func (self *UpgradeMux) fanOutHttpsForward(key DohKey, fl *dnsFlight, domain string, response []byte) {
+	responders := self.takeHttpsForwardResponders(key, fl)
 	if responders == nil {
 		return
 	}
@@ -836,20 +896,87 @@ func (self *UpgradeMux) fanOutHttpsForward(fl *dnsFlight, domain string, respons
 		self.reverse.record(hints, domain)
 	}
 
-	// oversized records are captured (hints recorded above) but not delivered over UDP/53
-	if maxForwardedHttpsResponse < len(response) || len(response) < 2 {
+	if maxForwardedHttpsResponse < len(response) {
+		// oversized for UDP/53: truncation is the accurate signal — the client
+		// retries over its own TCP path (unclaimed pass-through) or falls back
+		// to A/AAAA, instead of timing out on silence
+		self.deliverDnsStatus(responders, dnsmessage.RCodeSuccess, true)
+		return
+	}
+	if len(response) < 2 {
+		// malformed beyond repair (no transaction id to patch): a failure
+		self.deliverDnsStatus(responders, dnsmessage.RCodeServerFailure, false)
 		return
 	}
 	for i := range responders {
 		r := &responders[i]
-		// the DoH response was built with id 0; stamp each client's own transaction id.
-		// the echoed question matches (coalesced responders share this key's exact domain).
-		resp := make([]byte, len(response))
-		copy(resp, response)
-		resp[0] = byte(r.id >> 8)
-		resp[1] = byte(r.id)
+		// The DoH lookup uses the normalized lowercase domain, but DNS 0x20
+		// clients validate that the response echoes their exact query casing.
+		// Patch both the transaction id and the (same-length) question name
+		// without changing answer offsets or compression pointers.
+		resp, ok := dnsResponseForResponder(response, r)
+		if !ok {
+			continue
+		}
 		self.mux.deliverDownstream(r.source, r.provideMode, r.reverse, ipOosPacket(r.reverse, resp))
 	}
+}
+
+// dnsResponseForResponder copies a one-question DNS response and restores the
+// responder's original question casing. The normalized DoH query and original
+// query differ only by ASCII case, so the wire name has identical length and
+// answer compression offsets remain valid. A compressed/mismatched question is
+// rejected rather than returning a response that can fail DNS 0x20 validation.
+func dnsResponseForResponder(response []byte, responder *dnsResponder) ([]byte, bool) {
+	if len(response) < 12 || binary.BigEndian.Uint16(response[4:6]) != 1 {
+		return nil, false
+	}
+	name := responder.question.Name.String()
+	if name == "" || name[len(name)-1] != '.' {
+		return nil, false
+	}
+
+	wireName := make([]byte, 0, len(name)+1)
+	for labelStart := 0; labelStart < len(name)-1; {
+		labelEnd := strings.IndexByte(name[labelStart:], '.')
+		if labelEnd < 0 || 63 < labelEnd {
+			return nil, false
+		}
+		labelEnd += labelStart
+		wireName = append(wireName, byte(labelEnd-labelStart))
+		wireName = append(wireName, name[labelStart:labelEnd]...)
+		labelStart = labelEnd + 1
+	}
+	wireName = append(wireName, 0)
+
+	questionEnd := 12 + len(wireName)
+	if len(response) < questionEnd+4 {
+		return nil, false
+	}
+	responseName := response[12:questionEnd]
+	for i := range wireName {
+		a := responseName[i]
+		b := wireName[i]
+		if 'A' <= a && a <= 'Z' {
+			a += 'a' - 'A'
+		}
+		if 'A' <= b && b <= 'Z' {
+			b += 'a' - 'A'
+		}
+		if a != b {
+			return nil, false
+		}
+	}
+	if dnsmessage.Type(binary.BigEndian.Uint16(response[questionEnd:questionEnd+2])) != responder.question.Type ||
+		dnsmessage.Class(binary.BigEndian.Uint16(response[questionEnd+2:questionEnd+4])) != responder.question.Class {
+		return nil, false
+	}
+
+	result := make([]byte, len(response))
+	copy(result, response)
+	binary.BigEndian.PutUint16(result[0:2], responder.id)
+	copy(result[12:questionEnd], wireName)
+	return result, true
 }
 
 // parseHttpsHints extracts the ipv4hint (SvcParamKey 4) and ipv6hint (key 6) addresses from the
@@ -935,6 +1062,27 @@ func (self *UpgradeMux) resolveTunnelDoh(ctx context.Context, recordType string,
 			return addrs, authoritative
 		}
 	}
+}
+
+// buildDnsStatusResponse builds a header+question-only response: `rcode` (SERVFAIL for a
+// forward that can never answer) and/or the TC bit (an answer that exceeds UDP/53). Used by
+// the SVCB/HTTPS forward path to fail fast — the claimed type must never be a black hole.
+func buildDnsStatusResponse(id uint16, question dnsmessage.Question, rcode dnsmessage.RCode, truncated bool) ([]byte, error) {
+	builder := dnsmessage.NewBuilder(nil, dnsmessage.Header{
+		ID:                 id,
+		Response:           true,
+		RecursionAvailable: true,
+		Truncated:          truncated,
+		RCode:              rcode,
+	})
+	builder.EnableCompression()
+	if err := builder.StartQuestions(); err != nil {
+		return nil, err
+	}
+	if err := builder.Question(question); err != nil {
+		return nil, err
+	}
+	return builder.Finish()
 }
 
 func buildDnsResponse(id uint16, question dnsmessage.Question, addrs []netip.Addr, ttl uint32) ([]byte, error) {

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -216,7 +217,8 @@ func TestUpgradeMuxDnsNoReplyOnFailure(t *testing.T) {
 
 // TestUpgradeMuxDnsHttpsTypeClaimed: SVCB/HTTPS (64/65) queries are claimed (routed to the
 // DoH forward path), not passed through to the upstream. Here there is no reachable tunnel
-// DoH, so the forward fails and nothing is delivered — the client would fall back to A/AAAA.
+// DoH, so the forward fails fast: each claimed query is answered with a prompt SERVFAIL
+// (never silence — resolvers serialize on the HTTPS RR) and the client falls back to A/AAAA.
 // Genuinely other types (TXT) still pass through unclaimed. (The forward's success path —
 // delivery + hint recording — is covered by TestDohCacheForward and TestParseHttpsHints.)
 func TestUpgradeMuxDnsHttpsTypeClaimed(t *testing.T) {
@@ -225,7 +227,7 @@ func TestUpgradeMuxDnsHttpsTypeClaimed(t *testing.T) {
 
 	rec := &ipMuxRecorder{}
 	settings := DefaultUpgradeMuxSettings()
-	// an empty resolver (remote DoH disabled): the forward short-circuits with no reply and
+	// an empty resolver (remote DoH disabled): the forward short-circuits with a SERVFAIL and
 	// no tunnel traffic, so the upstream counter reflects only genuinely passed-through queries
 	settings.Dns.Resolver = &DnsResolverSettings{}
 	settings.Dns.Fallback = nil
@@ -242,10 +244,28 @@ func TestUpgradeMuxDnsHttpsTypeClaimed(t *testing.T) {
 		}
 	}
 	// the claimed queries go to the DoH forward path (not passed through), and with remote DoH
-	// disabled the forward short-circuits: nothing upstream, nothing delivered downstream
-	time.Sleep(300 * time.Millisecond)
-	if sent, received := rec.counts(); sent != 0 || received != 0 {
-		t.Fatalf("claimed SVCB/HTTPS: sent=%d received=%d, want 0/0", sent, received)
+	// disabled each fails fast with a SERVFAIL downstream: nothing upstream, two replies
+	if !waitForCondition(5*time.Second, func() bool { _, received := rec.counts(); return 2 <= received }) {
+		_, received := rec.counts()
+		t.Fatalf("claimed SVCB/HTTPS with remote DoH off: received=%d, want 2 prompt SERVFAIL replies", received)
+	}
+	if sent, received := rec.counts(); sent != 0 || received != 2 {
+		t.Fatalf("claimed SVCB/HTTPS: sent=%d received=%d, want 0/2", sent, received)
+	}
+	for _, reply := range rec.receivedPackets() {
+		header, question, answers := parseDnsBlockedReply(t, reply)
+		if header.RCode != dnsmessage.RCodeServerFailure {
+			t.Fatalf("claimed forward-failure reply rcode = %v, want SERVFAIL", header.RCode)
+		}
+		if header.Truncated {
+			t.Fatal("forward-failure reply must not set TC (nothing was truncated)")
+		}
+		if question.Type != dnsTypeSvcb && question.Type != dnsTypeHttps {
+			t.Fatalf("reply question type = %v, want the claimed SVCB/HTTPS question", question.Type)
+		}
+		if 0 != len(answers) {
+			t.Fatalf("SERVFAIL reply carries %d answers, want 0", len(answers))
+		}
 	}
 
 	// a TXT query is not claimed: it passes through to the upstream untouched
@@ -254,6 +274,129 @@ func TestUpgradeMuxDnsHttpsTypeClaimed(t *testing.T) {
 	}
 	if sent, _ := rec.counts(); sent != 1 {
 		t.Fatalf("TXT query should pass through to the upstream, sent=%d", sent)
+	}
+}
+
+// TestUpgradeMuxDnsHttpsFailFastServfail fills the "type-65 client-visible behavior with
+// remote DoH off" gap: a type-65 (HTTPS RR) query with remote DoH disabled gets a PROMPT
+// SERVFAIL — the resolver falls back to A/AAAA immediately instead of hanging on the
+// claimed type until its own timeout.
+func TestUpgradeMuxDnsHttpsFailFastServfail(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rec := &ipMuxRecorder{}
+	settings := DefaultUpgradeMuxSettings()
+	settings.Dns.Resolver = &DnsResolverSettings{} // remote DoH disabled
+	settings.Dns.Fallback = nil
+	// a long resolve budget proves the reply is prompt, not a timeout artifact
+	settings.Dns.ResolveTimeout = 60 * time.Second
+	mux, err := NewUpgradeMux(ctx, TransferPath{}, protocol.ProvideMode_Network, 0, rec.receive, settings, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mux.Close()
+	mux.SetUpstream(rec.upstream)
+
+	start := time.Now()
+	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "svc65.example.test.", dnsTypeHttps, 0x6565), 0) {
+		t.Fatal("type-65 query was not claimed")
+	}
+	if !waitForCondition(5*time.Second, func() bool { _, received := rec.counts(); return 1 <= received }) {
+		t.Fatal("no reply for the type-65 query with remote DoH off; the claimed type black-holed")
+	}
+	if elapsed := time.Since(start); 2*time.Second < elapsed {
+		t.Fatalf("SERVFAIL took %s; want a prompt reply, not a resolve-budget timeout", elapsed)
+	}
+	replies := rec.receivedPackets()
+	header, question, _ := parseDnsBlockedReply(t, replies[0])
+	if header.RCode != dnsmessage.RCodeServerFailure {
+		t.Fatalf("reply rcode = %v, want SERVFAIL", header.RCode)
+	}
+	if header.ID != 0x6565 {
+		t.Fatalf("reply id = %04x, want the query id 6565", header.ID)
+	}
+	if question.Type != dnsTypeHttps {
+		t.Fatalf("reply question type = %v, want HTTPS (65)", question.Type)
+	}
+
+	// the flight retired: a retry is claimed again and answered again
+	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "svc65.example.test.", dnsTypeHttps, 0x6566), 0) {
+		t.Fatal("retried type-65 query was not claimed")
+	}
+	if !waitForCondition(5*time.Second, func() bool { _, received := rec.counts(); return 2 <= received }) {
+		t.Fatal("no reply for the retried type-65 query")
+	}
+}
+
+// TestUpgradeMuxDnsHttpsOversizedTruncated: an SVCB/HTTPS record larger than the UDP/53
+// delivery bound is answered with a truncated (TC) NOERROR reply — the accurate signal that
+// the answer exists but exceeds UDP — rather than silence. The oversized record's hints are
+// still recorded into the reverse index.
+func TestUpgradeMuxDnsHttpsOversizedTruncated(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rec := &ipMuxRecorder{}
+	settings := DefaultUpgradeMuxSettings()
+	settings.Dns.Resolver = &DnsResolverSettings{}
+	settings.Dns.Fallback = nil
+	mux, err := NewUpgradeMux(ctx, TransferPath{}, protocol.ProvideMode_Network, 0, rec.receive, settings, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mux.Close()
+	mux.SetUpstream(rec.upstream)
+
+	// attach a responder directly and drive the fan-out with a canned oversized
+	// response (the tunnel-DoH round trip itself is not drivable in a unit test)
+	queryPacket := dnsQueryPacketTyped(t, "big.example.test.", dnsTypeHttps, 0x7777)
+	ipPath, payload, err := ParseIpPathWithPayload(queryPacket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parser dnsmessage.Parser
+	qHeader, err := parser.Start(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	question, err := parser.Question()
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := NewDohKey("HTTPS", "big.example.test")
+	fl := mux.attachDnsResponder(key, dnsResponder{
+		id:          qHeader.ID,
+		question:    question,
+		source:      TransferPath{},
+		provideMode: protocol.ProvideMode_Network,
+		reverse:     ipPath.Reverse(),
+	})
+	if fl == nil {
+		t.Fatal("attachDnsResponder did not start a flight")
+	}
+	oversized := make([]byte, maxForwardedHttpsResponse+1)
+	mux.fanOutHttpsForward(key, fl, "big.example.test", oversized)
+
+	replies := rec.receivedPackets()
+	if len(replies) != 1 {
+		t.Fatalf("received %d replies, want 1 truncated reply", len(replies))
+	}
+	header, question, answers := parseDnsBlockedReply(t, replies[0])
+	if !header.Truncated {
+		t.Fatal("oversized reply must set the TC bit")
+	}
+	if header.RCode != dnsmessage.RCodeSuccess {
+		t.Fatalf("oversized reply rcode = %v, want NOERROR (truncation is the signal)", header.RCode)
+	}
+	if header.ID != 0x7777 {
+		t.Fatalf("reply id = %04x, want 7777", header.ID)
+	}
+	if question.Type != dnsTypeHttps {
+		t.Fatalf("reply question type = %v, want HTTPS (65)", question.Type)
+	}
+	if 0 != len(answers) {
+		t.Fatalf("truncated reply carries %d answers, want 0", len(answers))
 	}
 }
 
@@ -297,9 +440,17 @@ func dnsQueryPacketFrom(t *testing.T, name string, id uint16, sourcePort int) []
 // LocalFallbackTimeout handicap — against the local-egress fallback resolver, which answers so the
 // client (and the OS) gets a timely response rather than DNS hanging while the tunnel comes up.
 func TestUpgradeMuxDnsLocalFallback(t *testing.T) {
-	// the tunnel-DoH always fails (503)
+	// The tunnel DoH accepts the request but never answers. Once the local
+	// fallback wins, its request context must be canceled immediately instead
+	// of occupying a resolver/semaphore slot until ResolveTimeout.
+	tunnelStarted := make(chan struct{})
+	tunnelCanceled := make(chan struct{})
+	var tunnelStartedOnce sync.Once
+	var tunnelCanceledOnce sync.Once
 	tunnelServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusServiceUnavailable)
+		tunnelStartedOnce.Do(func() { close(tunnelStarted) })
+		<-r.Context().Done()
+		tunnelCanceledOnce.Do(func() { close(tunnelCanceled) })
 	}))
 	defer tunnelServer.Close()
 	tunnelPool := x509.NewCertPool()
@@ -321,6 +472,7 @@ func TestUpgradeMuxDnsLocalFallback(t *testing.T) {
 	}
 	settings.Dns.Fallback = fallbackResolver
 	settings.Dns.LocalFallbackTimeout = 200 * time.Millisecond
+	settings.Dns.ResolveTimeout = 5 * time.Second
 	mux, err := NewUpgradeMux(ctx, TransferPath{}, protocol.ProvideMode_Network, 0, rec.receive, settings, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -331,16 +483,24 @@ func TestUpgradeMuxDnsLocalFallback(t *testing.T) {
 	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacket(t, "fallback.example.test."), 0) {
 		t.Fatal("SendPacket returned false; the DNS query was not claimed")
 	}
-
-	// the tunnel-DoH fails, so the handicapped fallback should answer shortly after its 200ms delay
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, received := rec.counts(); 0 < received {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
+	select {
+	case <-tunnelStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("tunnel DoH request did not start")
 	}
-	t.Fatal("no fallback reply; the local fallback must answer when the tunnel-DoH fails")
+
+	// The handicapped fallback should answer shortly after its 200ms delay.
+	if !waitForCondition(5*time.Second, func() bool {
+		_, received := rec.counts()
+		return 0 < received
+	}) {
+		t.Fatal("no fallback reply; the local fallback must answer when the tunnel-DoH is slow")
+	}
+	select {
+	case <-tunnelCanceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("fallback answer did not cancel the losing tunnel resolver")
+	}
 }
 
 // TestUpgradeMuxResolveTimeoutReDerived: ResolveTimeout is the single DNS timeout — the tun's DoH

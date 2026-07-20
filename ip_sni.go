@@ -8,7 +8,11 @@ package connect
 // path can't (a client dialing from its own long-TTL DNS cache emits no query the mux
 // sees, so without this the block-action feed and ServerName path affinity fall back to
 // the bare ip). ClientHellos split across TCP segments are reassembled in a bounded
-// buffer. ECH-protected ClientHellos carry no cleartext SNI and stay ip-only.
+// buffer. An ECH-protected ClientHello still carries a cleartext OUTER server_name (the
+// client-facing server): ECH hides the exact destination hostname but not the trust
+// domain, so when the encrypted_client_hello extension is present the outer name is
+// reduced to its registrable (eTLD+1) domain before recording — the destination
+// controls that domain, but the outer name is NEVER recorded as the precise host.
 
 import (
 	"net/netip"
@@ -16,6 +20,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/publicsuffix"
 )
 
 const (
@@ -23,7 +29,11 @@ const (
 	tlsVersionMajor         = 0x03
 	tlsHandshakeClientHello = 0x01
 	tlsExtensionServerName  = 0x0000
-	tlsSniTypeHostName      = 0x00
+	// encrypted_client_hello (draft-ietf-tls-esni). Its presence means the
+	// cleartext server_name is the OUTER (client-facing) name, not the
+	// destination host.
+	tlsExtensionEncryptedClientHello = 0xfe0d
+	tlsSniTypeHostName               = 0x00
 
 	// sniMaxClientHelloBytes caps the bytes buffered per flow while reassembling a
 	// split ClientHello. A TLS record can be up to 16KB, but a real ClientHello —
@@ -166,7 +176,16 @@ func (self *sniSniffer) observeSegment(seg tlsSegment) {
 		if len(record) < parseLen {
 			parseLen = len(record)
 		}
-		name, _ = sniFromClientHello(record[:parseLen])
+		var ech bool
+		name, ech, _ = sniFromClientHello(record[:parseLen])
+		if ech && name != "" {
+			// ECH: the cleartext name is the OUTER (client-facing) server
+			// name. The exact destination host is encrypted; the outer name
+			// must still be under a domain the destination controls, so
+			// record only its registrable (eTLD+1) trust domain and never
+			// the outer name as if it were the precise destination host.
+			name = registrableDomain(name)
+		}
 		dstAddr = seg.flow.dstAddr
 	}()
 
@@ -310,17 +329,19 @@ func clientHelloRecordLen(payload []byte) (total int, ok bool) {
 }
 
 // sniFromClientHello walks a (complete) TLS ClientHello record and returns the SNI
-// host_name. ok is false when there is no server_name extension, the hostname is not a
-// plausible host, or the record is malformed/truncated. Every field length is bounds
-// checked against the remaining bytes — the input is attacker-controlled.
-func sniFromClientHello(record []byte) (string, bool) {
+// host_name plus whether the hello carries the encrypted_client_hello extension (in
+// which case the name is the OUTER server name — see the header comment). ok is false
+// when there is no server_name extension, the hostname is not a plausible host, or the
+// record is malformed/truncated. Every field length is bounds checked against the
+// remaining bytes — the input is attacker-controlled.
+func sniFromClientHello(record []byte) (name string, ech bool, ok bool) {
 	// 5-byte record header, then the handshake message
 	if len(record) < 9 || record[0] != tlsRecordTypeHandshake {
-		return "", false
+		return "", false, false
 	}
 	b := record[5:]
 	if b[0] != tlsHandshakeClientHello {
-		return "", false
+		return "", false, false
 	}
 	hsLen := int(b[1])<<16 | int(b[2])<<8 | int(b[3])
 	b = b[4:]
@@ -329,62 +350,90 @@ func sniFromClientHello(record []byte) (string, bool) {
 	}
 	// client_version (2) + random (32)
 	if len(b) < 34 {
-		return "", false
+		return "", false, false
 	}
 	b = b[34:]
 	// session_id: 1-byte length + id
 	if len(b) < 1 {
-		return "", false
+		return "", false, false
 	}
 	sessionIdLen := int(b[0])
 	b = b[1:]
 	if len(b) < sessionIdLen {
-		return "", false
+		return "", false, false
 	}
 	b = b[sessionIdLen:]
 	// cipher_suites: 2-byte length + suites
 	if len(b) < 2 {
-		return "", false
+		return "", false, false
 	}
 	cipherLen := int(b[0])<<8 | int(b[1])
 	b = b[2:]
 	if len(b) < cipherLen {
-		return "", false
+		return "", false, false
 	}
 	b = b[cipherLen:]
 	// compression_methods: 1-byte length + methods
 	if len(b) < 1 {
-		return "", false
+		return "", false, false
 	}
 	compressionLen := int(b[0])
 	b = b[1:]
 	if len(b) < compressionLen {
-		return "", false
+		return "", false, false
 	}
 	b = b[compressionLen:]
 	// extensions: 2-byte length + extensions (absent in SSLv3-style hellos)
 	if len(b) < 2 {
-		return "", false
+		return "", false, false
 	}
 	extensionsLen := int(b[0])<<8 | int(b[1])
 	b = b[2:]
 	if len(b) > extensionsLen {
 		b = b[:extensionsLen]
 	}
+	// walk EVERY extension: the encrypted_client_hello extension may come
+	// before or after server_name, and both must be seen
 	for len(b) >= 4 {
 		extType := int(b[0])<<8 | int(b[1])
 		extLen := int(b[2])<<8 | int(b[3])
 		b = b[4:]
 		if len(b) < extLen {
-			return "", false
+			// truncated extension list: keep a name already found (matching
+			// the previous first-win behavior), reject when the server_name
+			// extension was not yet reached
+			if ok {
+				break
+			}
+			return "", false, false
 		}
 		extData := b[:extLen]
 		b = b[extLen:]
-		if extType == tlsExtensionServerName {
-			return sniFromServerNameExtension(extData)
+		switch extType {
+		case tlsExtensionServerName:
+			if !ok {
+				name, ok = sniFromServerNameExtension(extData)
+			}
+		case tlsExtensionEncryptedClientHello:
+			ech = true
 		}
 	}
-	return "", false
+	if !ok {
+		return "", false, false
+	}
+	return name, ech, true
+}
+
+// registrableDomain reduces a hostname to its registrable (effective-TLD+1)
+// domain per the public suffix list, e.g. "ech-front.example-cdn.co.uk" ->
+// "example-cdn.co.uk". A name that is itself a public suffix (or otherwise
+// has no registrable form) is returned unchanged — it already identifies no
+// specific host.
+func registrableDomain(name string) string {
+	if domain, err := publicsuffix.EffectiveTLDPlusOne(name); err == nil {
+		return domain
+	}
+	return name
 }
 
 // sniFromServerNameExtension parses a server_name extension body and returns the first

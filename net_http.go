@@ -59,6 +59,11 @@ func DefaultClientStrategySettings() *ClientStrategySettings {
 
 		HelloRetryTimeout: 5 * time.Second,
 
+		GetRetryCount:       1,
+		GetRetryStatusCodes: []int{http.StatusBadGateway, http.StatusServiceUnavailable},
+		GetRetryMinTimeout:  100 * time.Millisecond,
+		GetRetryMaxTimeout:  1000 * time.Millisecond,
+
 		MinNextConnectDelay: 100 * time.Millisecond,
 		MaxNextConnectDelay: 1000 * time.Millisecond,
 
@@ -104,8 +109,28 @@ type ClientStrategySettings struct {
 
 	HelloRetryTimeout time.Duration
 
+	// retry a GET whose RESPONSE status is in `GetRetryStatusCodes` —
+	// transient gateway statuses meaning the lb momentarily had no healthy
+	// upstream (the edge of a deploy). The strategy already retries
+	// transport-level failures internally; this covers the surfaced-status
+	// case, which callers otherwise see immediately as an error. GETs only:
+	// the api's GET endpoints are idempotent (the parallel dialer racing
+	// already re-issues them), and a POST is never replayed by the client.
+	GetRetryCount       int
+	GetRetryStatusCodes []int
+	// the jittered pause before a retry, uniform in
+	// [GetRetryMinTimeout, GetRetryMaxTimeout)
+	GetRetryMinTimeout time.Duration
+	GetRetryMaxTimeout time.Duration
+
 	MinNextConnectDelay time.Duration
 	MaxNextConnectDelay time.Duration
+
+	// ExtraHeaders, when set, are applied (Set semantics, overriding same-named
+	// headers) to every request this strategy issues: http serial/parallel,
+	// the hello ping, and websocket dials. Intended for test/simulation
+	// environments, e.g. presenting a forwarded-for address to a local server.
+	ExtraHeaders http.Header
 
 	ConnectSettings
 }
@@ -713,7 +738,19 @@ func (self *ClientStrategy) serialEval(ctx context.Context, eval func(ctx contex
 
 }
 
+// applyExtraHeaders sets the strategy's ExtraHeaders on h (override semantics)
+func (self *ClientStrategy) applyExtraHeaders(h http.Header) {
+	for name, values := range self.settings.ExtraHeaders {
+		h.Del(name)
+		for _, value := range values {
+			h.Add(name, value)
+		}
+	}
+}
+
 func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, error) {
+	self.applyExtraHeaders(request.Header)
+
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
 		httpClient := dialer.HttpClient()
 		response, err := httpClient.Do(request.WithContext(handleCtx))
@@ -743,6 +780,9 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 	// 2. retest and expand dialers using get of the hello request.
 	//    This is a basic ping to the server, which is run in parallel.
 	// 3. continue from 1 until timeout
+
+	self.applyExtraHeaders(request.Header)
+	self.applyExtraHeaders(helloRequest.Header)
 
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
 		httpClient := dialer.HttpClient()
@@ -783,6 +823,16 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 }
 
 func (self *ClientStrategy) WsDialContext(ctx context.Context, url string, requestHeader http.Header) (*websocket.Conn, *http.Response, error) {
+	if 0 < len(self.settings.ExtraHeaders) {
+		// clone so a caller-held header is not mutated across reconnects
+		merged := requestHeader.Clone()
+		if merged == nil {
+			merged = http.Header{}
+		}
+		self.applyExtraHeaders(merged)
+		requestHeader = merged
+	}
+
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
 		wsDialer := dialer.WsDialer(self.settings)
 		wsConn, response, err := wsDialer.DialContext(handleCtx, url, requestHeader)
@@ -1053,6 +1103,11 @@ func (self *clientDialer) HttpClient() *http.Client {
 			ExpectContinueTimeout: self.settings.ConnectTimeout,
 			DisableKeepAlives:     false,
 		}
+		// a custom dial context applies to plain (non-tls) connections;
+		// tls connections use the dialTlsContext chain above
+		if dialContextSettings := self.settings.ConnectSettings.DialContextSettings; dialContextSettings != nil {
+			transport.DialContext = dialContextSettings.DialContext
+		}
 		self.httpClient = &http.Client{
 			Transport: transport,
 			Timeout:   self.settings.RequestTimeout,
@@ -1074,6 +1129,11 @@ func (self *clientDialer) WsDialer(settings *ClientStrategySettings) *websocket.
 			// WriteBufferSize: size,
 			// WriteBufferPool: pool,
 			EnableCompression: false,
+		}
+		// a custom dial context applies to plain ws:// connections;
+		// wss:// uses the dialTlsContext chain above
+		if dialContextSettings := settings.ConnectSettings.DialContextSettings; dialContextSettings != nil {
+			self.websocketDialer.NetDialContext = dialContextSettings.DialContext
 		}
 	}
 	return self.websocketDialer
@@ -1351,34 +1411,65 @@ func HttpGetWithStrategyRaw(
 	requestUrl string,
 	byJwt string,
 ) ([]byte, error) {
-	request, err := http.NewRequestWithContext(ctx, "GET", requestUrl, nil)
-	if err != nil {
-		return nil, err
+	settings := clientStrategy.settings
+
+	newRequest := func() (*http.Request, error) {
+		request, err := http.NewRequestWithContext(ctx, "GET", requestUrl, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		request.Header.Add("Content-Type", "text/json")
+
+		if byJwt != "" {
+			auth := fmt.Sprintf("Bearer %s", byJwt)
+			request.Header.Add("Authorization", auth)
+		}
+		return request, nil
 	}
 
-	request.Header.Add("Content-Type", "text/json")
+	var statusError *HttpStatusError
+	for attempt := 0; attempt <= max(0, settings.GetRetryCount); attempt += 1 {
+		if 0 < attempt {
+			// jittered pause before the retry
+			retryTimeout := settings.GetRetryMinTimeout
+			if settings.GetRetryMinTimeout < settings.GetRetryMaxTimeout {
+				retryTimeout += time.Duration(mathrand.Int63n(int64(settings.GetRetryMaxTimeout - settings.GetRetryMinTimeout)))
+			}
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(retryTimeout):
+			}
+		}
 
-	if byJwt != "" {
-		auth := fmt.Sprintf("Bearer %s", byJwt)
-		request.Header.Add("Authorization", auth)
-	}
+		request, err := newRequest()
+		if err != nil {
+			return nil, err
+		}
 
-	r, err := clientStrategy.HttpParallel(request)
-	if err != nil {
-		return nil, err
-	}
+		r, err := clientStrategy.HttpParallel(request)
+		if err != nil {
+			return nil, err
+		}
 
-	if http.StatusOK != r.response.StatusCode {
+		if http.StatusOK == r.response.StatusCode {
+			return r.bodyBytes, nil
+		}
+
 		// the response body is the error message. Typed so a caller can act on the
 		// status -- notably 402, whose body carries x402 payment terms.
-		return nil, &HttpStatusError{
+		statusError = &HttpStatusError{
 			StatusCode: r.response.StatusCode,
 			Status:     r.response.Status,
 			Body:       r.bodyBytes,
 		}
+		if !slices.Contains(settings.GetRetryStatusCodes, r.response.StatusCode) {
+			return nil, statusError
+		}
+		// a transient gateway status; pause and retry
 	}
-
-	return r.bodyBytes, nil
+	return nil, statusError
 }
 
 func HttpGetWithStrategy[R any](

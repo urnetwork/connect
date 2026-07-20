@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -54,19 +55,40 @@ func TestLocalUserNatSettingsMemoryScaled(t *testing.T) {
 	AssertEqual(t, tcpSettings.GlobalLimit, 64)
 	AssertEqual(t, DefaultDmcaSecurityPolicySettings().MaxFlows, 8192)
 
-	// no budget leaves the defaults unscaled (but still bounded)
+	// no budget identifies a server/generic caller: it keeps the unscaled
+	// buffers but does not silently inherit the constrained-device flow cap.
+	// Actual providers select the explicit provider profile.
 	SetMemoryBudget(0)
 	udpSettings = DefaultUdpBufferSettings()
 	AssertEqual(t, udpSettings.SequenceBufferSize, 256)
 	AssertEqual(t, udpSettings.MaxWindowSize, uint32(1048576))
-	AssertEqual(t, udpSettings.GlobalLimit, 2048)
+	AssertEqual(t, udpSettings.GlobalLimit, 0)
 	tcpSettings = DefaultTcpBufferSettings()
 	AssertEqual(t, tcpSettings.SequenceBufferSize, 1024)
 	AssertEqual(t, tcpSettings.ReadBufferByteCount, 65536)
 	AssertEqual(t, tcpSettings.MaxWindowSize, uint32(1048576))
-	AssertEqual(t, tcpSettings.GlobalLimit, 512)
+	AssertEqual(t, tcpSettings.GlobalLimit, 0)
 	AssertEqual(t, DefaultLocalUserNatSettings().SequenceBufferSize, 1024)
 	AssertEqual(t, DefaultDmcaSecurityPolicySettings().MaxFlows, 65536)
+	providerSettings := DefaultProviderLocalUserNatSettings()
+	AssertEqual(t, providerSettings.UdpBufferSettings.UserLimit, 0)
+	AssertEqual(t, providerSettings.UdpBufferSettings.GlobalLimit, 0)
+	AssertEqual(t, providerSettings.TcpBufferSettings.UserLimit, 0)
+	AssertEqual(t, providerSettings.TcpBufferSettings.GlobalLimit, 0)
+	// an unbudgeted provider keeps long-lived plain-udp NAT bindings alive:
+	// the provider-tuned idle, longer than the general 60s reap
+	AssertEqual(t, providerSettings.UdpBufferSettings.IdleTimeout, providerUdpIdleTimeout)
+	if providerSettings.UdpBufferSettings.IdleTimeout <= udpSettings.IdleTimeout {
+		t.Errorf("provider udp idle %s must exceed the general udp idle %s",
+			providerSettings.UdpBufferSettings.IdleTimeout, udpSettings.IdleTimeout)
+	}
+
+	// a budgeted provider keeps the scaled defaults, including the short idle
+	SetMemoryBudget(24 * 1024 * 1024)
+	budgetedProviderSettings := DefaultProviderLocalUserNatSettings()
+	AssertEqual(t, budgetedProviderSettings.UdpBufferSettings.IdleTimeout, 60*time.Second)
+	AssertEqual(t, budgetedProviderSettings.UdpBufferSettings.GlobalLimit, 768)
+	SetMemoryBudget(0)
 
 	// invariants at every budget tier:
 	// - the tcp channel depth must cover the max window in mtu packets, so a
@@ -136,8 +158,8 @@ func startUdpSink(t *testing.T) (port uint16, closeFn func()) {
 
 // TestUdpBufferFlowLimits exercises the per source (`UserLimit`) and
 // aggregate (`GlobalLimit`) udp flow caps: over-limit creates evict the
-// idle-most flow (lru), the newest flows survive, and the flow map settles at
-// most one over the cap (the eviction runs before the insert).
+// approximately idle-most sampled flow, the newest flows survive, and eager
+// removal keeps the flow map at the exact cap.
 func TestUdpBufferFlowLimits(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -183,8 +205,7 @@ func TestUdpBufferFlowLimits(t *testing.T) {
 	// two flows fill the per source limit
 	send(sourceA, 40001)
 	send(sourceA, 40002)
-	// the third creates (the check runs before insert), the fourth evicts the
-	// idle-most flow of the source (40001)
+	// the third and fourth evict the idle-most flow before their insert
 	send(sourceA, 40003)
 	send(sourceA, 40004)
 	pollUntil(t, 5*time.Second, "per source lru eviction", func() bool {
@@ -199,7 +220,7 @@ func TestUdpBufferFlowLimits(t *testing.T) {
 	send(sourceB, 41002)
 	pollUntil(t, 5*time.Second, "global lru eviction", func() bool {
 		ports := sourcePorts()
-		return len(ports) <= udpBufferSettings.GlobalLimit+1 && ports[41001] && ports[41002]
+		return len(ports) <= udpBufferSettings.GlobalLimit && ports[41001] && ports[41002]
 	})
 }
 
@@ -276,8 +297,212 @@ func TestTcpBufferFlowLimits(t *testing.T) {
 	sendSyn(sourceB, 41002)
 	pollUntil(t, 5*time.Second, "global lru eviction", func() bool {
 		ports := sourcePorts()
-		return len(ports) <= tcpBufferSettings.GlobalLimit+1 && ports[41001] && ports[41002]
+		return len(ports) <= tcpBufferSettings.GlobalLimit && ports[41001] && ports[41002]
 	})
+}
+
+// TestUdpBufferGlobalLimitConcurrent drives GlobalLimit under concurrent
+// new-flow creation at and over the cap (run with -race): the cap holds, the
+// eviction loop terminates, the `sequences`/`sourceSequences` indexes stay
+// exactly consistent, and dispatch is not stalled (a fresh flow still lands
+// after the burst). Verifies the applyLruMapLimit rework under concurrency.
+func TestUdpBufferGlobalLimitConcurrent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sinkPort, closeSink := startUdpSink(t)
+	defer closeSink()
+
+	udpBufferSettings := DefaultUdpBufferSettingsWithBufferSize(8)
+	udpBufferSettings.GlobalLimit = 6
+
+	buffer := NewUdp4Buffer(ctx, func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {}, udpBufferSettings)
+
+	send := func(source TransferPath, sourcePort uint16) {
+		packet := MessagePoolGet(32)
+		parsed := &parsedUdp{
+			sourceIp:        net.IPv4(10, 0, 0, 1).To4(),
+			destinationIp:   net.IPv4(127, 0, 0, 1).To4(),
+			sourcePort:      sourcePort,
+			destinationPort: sinkPort,
+			payload:         packet[:4],
+		}
+		// under concurrent eviction a create can lose the race and fail —
+		// that is allowed; the invariants below are what must hold
+		if success, err := buffer.send(source, protocol.ProvideMode_Network, parsed, -1, packet); err != nil || !success {
+			MessagePoolReturn(packet)
+		}
+	}
+
+	// 8 sources x 8 flows: far over the cap, all created concurrently
+	var wg sync.WaitGroup
+	for s := 0; s < 8; s++ {
+		wg.Add(1)
+		source := SourceId(NewId())
+		basePort := uint16(42000 + 100*s)
+		go func() {
+			defer wg.Done()
+			for f := uint16(0); f < 8; f++ {
+				send(source, basePort+f)
+			}
+		}()
+	}
+	wg.Wait()
+
+	assertConsistent := func() int {
+		t.Helper()
+		buffer.mutex.Lock()
+		defer buffer.mutex.Unlock()
+		if udpBufferSettings.GlobalLimit < len(buffer.sequences) {
+			t.Fatalf("global cap broken: %d sequences > limit %d", len(buffer.sequences), udpBufferSettings.GlobalLimit)
+		}
+		total := 0
+		for source, sourceSequences := range buffer.sourceSequences {
+			if len(sourceSequences) == 0 {
+				t.Fatalf("index drift: empty source map retained for %s", source)
+			}
+			for bufferId, sequence := range sourceSequences {
+				if buffer.sequences[bufferId] != sequence {
+					t.Fatal("index drift: source-indexed sequence not in the flow table")
+				}
+				if sequence.source != source {
+					t.Fatal("index drift: sequence filed under the wrong source")
+				}
+				total += 1
+			}
+		}
+		if total != len(buffer.sequences) {
+			t.Fatalf("index drift: %d source-indexed vs %d sequences", total, len(buffer.sequences))
+		}
+		return len(buffer.sequences)
+	}
+	if count := assertConsistent(); count == 0 {
+		t.Fatal("no flows survived the burst")
+	}
+
+	// dispatch is not stalled: a fresh flow still lands at the cap
+	lateSource := SourceId(NewId())
+	packet := MessagePoolGet(32)
+	parsed := &parsedUdp{
+		sourceIp:        net.IPv4(10, 0, 0, 2).To4(),
+		destinationIp:   net.IPv4(127, 0, 0, 1).To4(),
+		sourcePort:      45001,
+		destinationPort: sinkPort,
+		payload:         packet[:4],
+	}
+	if success, err := buffer.send(lateSource, protocol.ProvideMode_Network, parsed, -1, packet); err != nil || !success {
+		MessagePoolReturn(packet)
+		t.Fatalf("post-burst flow create stalled: success=%t err=%v", success, err)
+	}
+	assertConsistent()
+}
+
+// TestTcpBufferGlobalLimitConcurrent is the tcp shape of
+// TestUdpBufferGlobalLimitConcurrent: concurrent SYNs at/over GlobalLimit
+// (run with -race).
+func TestTcpBufferGlobalLimitConcurrent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+	go HandleError(func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+		}
+	})
+	listenerPort := uint16(listener.Addr().(*net.TCPAddr).Port)
+
+	tcpBufferSettings := DefaultTcpBufferSettingsWithBufferSize(8)
+	tcpBufferSettings.GlobalLimit = 6
+
+	buffer := NewTcp4Buffer(ctx, func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {}, tcpBufferSettings)
+
+	sendSyn := func(source TransferPath, sourcePort uint16) {
+		packet := MessagePoolGet(32)
+		parsed := &parsedTcp{
+			sourceIp:        net.IPv4(10, 0, 0, 1).To4(),
+			destinationIp:   net.IPv4(127, 0, 0, 1).To4(),
+			sourcePort:      sourcePort,
+			destinationPort: listenerPort,
+			syn:             true,
+			seq:             1000,
+			windowSize:      65535,
+		}
+		if success, err := buffer.send(source, protocol.ProvideMode_Network, parsed, -1, packet); err != nil || !success {
+			MessagePoolReturn(packet)
+		}
+	}
+
+	var wg sync.WaitGroup
+	for s := 0; s < 8; s++ {
+		wg.Add(1)
+		source := SourceId(NewId())
+		basePort := uint16(43000 + 100*s)
+		go func() {
+			defer wg.Done()
+			for f := uint16(0); f < 8; f++ {
+				sendSyn(source, basePort+f)
+			}
+		}()
+	}
+	wg.Wait()
+
+	assertConsistent := func() int {
+		t.Helper()
+		buffer.mutex.Lock()
+		defer buffer.mutex.Unlock()
+		if tcpBufferSettings.GlobalLimit < len(buffer.sequences) {
+			t.Fatalf("global cap broken: %d sequences > limit %d", len(buffer.sequences), tcpBufferSettings.GlobalLimit)
+		}
+		total := 0
+		for source, sourceSequences := range buffer.sourceSequences {
+			if len(sourceSequences) == 0 {
+				t.Fatalf("index drift: empty source map retained for %s", source)
+			}
+			for bufferId, sequence := range sourceSequences {
+				if buffer.sequences[bufferId] != sequence {
+					t.Fatal("index drift: source-indexed sequence not in the flow table")
+				}
+				if sequence.source != source {
+					t.Fatal("index drift: sequence filed under the wrong source")
+				}
+				total += 1
+			}
+		}
+		if total != len(buffer.sequences) {
+			t.Fatalf("index drift: %d source-indexed vs %d sequences", total, len(buffer.sequences))
+		}
+		return len(buffer.sequences)
+	}
+	if count := assertConsistent(); count == 0 {
+		t.Fatal("no flows survived the burst")
+	}
+
+	// dispatch is not stalled: a fresh SYN still lands at the cap
+	lateSource := SourceId(NewId())
+	packet := MessagePoolGet(32)
+	parsed := &parsedTcp{
+		sourceIp:        net.IPv4(10, 0, 0, 2).To4(),
+		destinationIp:   net.IPv4(127, 0, 0, 1).To4(),
+		sourcePort:      45002,
+		destinationPort: listenerPort,
+		syn:             true,
+		seq:             1000,
+		windowSize:      65535,
+	}
+	if success, err := buffer.send(lateSource, protocol.ProvideMode_Network, parsed, -1, packet); err != nil || !success {
+		MessagePoolReturn(packet)
+		t.Fatalf("post-burst SYN create stalled: success=%t err=%v", success, err)
+	}
+	assertConsistent()
 }
 
 // TestUdpBufferIdleReap pins the udp idle reap: an idle flow releases its

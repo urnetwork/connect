@@ -154,7 +154,7 @@ func TestP2pSendTransportMatchesPeerDestination(t *testing.T) {
 	transportCtx, transportCancel := context.WithCancel(ctx)
 	defer transportCancel()
 
-	transport, route := NewP2pSendTransport(
+	transport, route := NewP2pSendTransportForPeer(
 		transportCtx,
 		transportCancel,
 		localConn,
@@ -216,7 +216,7 @@ func TestP2pSendTransportTwoStreamsToSamePeer(t *testing.T) {
 	transportCtx, transportCancel := context.WithCancel(ctx)
 	defer transportCancel()
 
-	transport1, route1 := NewP2pSendTransport(
+	transport1, route1 := NewP2pSendTransportForPeer(
 		transportCtx,
 		transportCancel,
 		localConn1,
@@ -224,7 +224,7 @@ func TestP2pSendTransportTwoStreamsToSamePeer(t *testing.T) {
 		streamId1,
 		DefaultP2pTransportSettings(),
 	)
-	transport2, route2 := NewP2pSendTransport(
+	transport2, route2 := NewP2pSendTransportForPeer(
 		transportCtx,
 		transportCancel,
 		localConn2,
@@ -279,7 +279,6 @@ func TestP2pSendTransportZeroPeerIdMatchesOnlyStream(t *testing.T) {
 		transportCtx,
 		transportCancel,
 		localConn,
-		Id{},
 		streamId,
 		DefaultP2pTransportSettings(),
 	)
@@ -301,6 +300,77 @@ func TestP2pSendTransportZeroPeerIdMatchesOnlyStream(t *testing.T) {
 	})
 	defer routeManager.CloseMultiRouteWriter(otherStreamWriter)
 	AssertEqual(t, 0, len(otherStreamWriter.GetActiveRoutes()))
+}
+
+func TestP2pSendTransportDowngradeMatchesPeer(t *testing.T) {
+	// `Downgrade` mirrors `MatchesSend`: an audit/degrade signal addressed to
+	// the peer must shed the stream transport carrying direct-peer traffic,
+	// not only a signal tagged with the stream id. A zero peer id must never
+	// match a path without a destination id (control / pure stream masks).
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	peerId := NewId()
+	streamId := NewId()
+
+	newTransport := func(withPeer bool) (Transport, context.Context, net.Conn) {
+		localConn, remoteConn := net.Pipe()
+		t.Cleanup(func() {
+			localConn.Close()
+			remoteConn.Close()
+		})
+		transportCtx, transportCancel := context.WithCancel(ctx)
+		transportPeerId := Id{}
+		if withPeer {
+			transportPeerId = peerId
+		}
+		transport, _ := NewP2pSendTransportForPeer(
+			transportCtx,
+			transportCancel,
+			localConn,
+			transportPeerId,
+			streamId,
+			DefaultP2pTransportSettings(),
+		)
+		return transport, transportCtx, remoteConn
+	}
+
+	// an unrelated destination does not shed the transport
+	transport, transportCtx, _ := newTransport(true)
+	transport.Downgrade(DestinationId(NewId()))
+	select {
+	case <-transportCtx.Done():
+		t.Fatal("downgrade for an unrelated destination must not cancel the transport")
+	default:
+	}
+
+	// a signal carrying the peer destination (no stream id) sheds the transport
+	transport.Downgrade(DestinationId(peerId))
+	select {
+	case <-transportCtx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("downgrade for the peer destination must cancel the transport")
+	}
+
+	// a signal tagged with the stream id still sheds the transport
+	transport, transportCtx, _ = newTransport(true)
+	transport.Downgrade(TransferPath{StreamId: streamId})
+	select {
+	case <-transportCtx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("downgrade for the stream must cancel the transport")
+	}
+
+	// a zero peer id never matches a path without a destination id
+	transport, transportCtx, _ = newTransport(false)
+	transport.Downgrade(TransferPath{StreamId: NewId()})
+	transport.Downgrade(DestinationId(NewId()))
+	select {
+	case <-transportCtx.Done():
+		t.Fatal("a zero-peer transport must only downgrade on its own stream")
+	default:
+	}
 }
 
 func TestP2pSendTransportReconnectPeerDestination(t *testing.T) {
@@ -326,7 +396,7 @@ func TestP2pSendTransportReconnectPeerDestination(t *testing.T) {
 	transportCtx, transportCancel := context.WithCancel(ctx)
 	defer transportCancel()
 
-	transport, route := NewP2pSendTransport(
+	transport, route := NewP2pSendTransportForPeer(
 		transportCtx,
 		transportCancel,
 		localConn,
@@ -386,7 +456,7 @@ func TestP2pSendTransportPreferredOverGateway(t *testing.T) {
 	transportCtx, transportCancel := context.WithCancel(ctx)
 	defer transportCancel()
 
-	transport, route := NewP2pSendTransport(
+	transport, route := NewP2pSendTransportForPeer(
 		transportCtx,
 		transportCancel,
 		localConn,

@@ -314,6 +314,9 @@ type ContractManager struct {
 	contractStatsEntries   map[contractStatsKey]*contractStatsEntry
 	contractStatsCallbacks *CallbackList[ContractStatsFunction]
 	contractStatsStarted   bool
+	// per-contract event sequence numbers, assigned under `contractStatsLock`
+	// at snapshot time (see `emitContractStats`)
+	contractStatsSequences map[Id]uint64
 
 	controlSyncProvide    *ControlSync
 	controlSyncProvideOob *ControlSyncOob
@@ -356,6 +359,7 @@ func NewContractManager(
 		localStats:                 NewContractManagerStats(),
 		contractStatsEntries:       map[contractStatsKey]*contractStatsEntry{},
 		contractStatsCallbacks:     NewCallbackList[ContractStatsFunction](),
+		contractStatsSequences:     map[Id]uint64{},
 		controlSyncProvide:         NewControlSync(ctx, client, "provide"),
 		controlSyncProvideOob:      NewControlSyncOob(ctx, client, "provide-oob"),
 	}

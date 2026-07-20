@@ -80,6 +80,12 @@ const (
 	// into the receiving client's peer state. `Frame.message_bytes` is a
 	// marshaled `NetworkPeersUpdate`.
 	MessageType_TransferNetworkPeersUpdate MessageType = 27
+	// control message that asks the client to migrate its platform transport
+	// (make-before-break) because the resident is draining.
+	// `Frame.message_bytes` is a marshaled `ResidentMigrate`.
+	// Older clients ignore the unknown message type and fall back to the
+	// drain eviction plus excuse path (CONNECTDRAIN2.md).
+	MessageType_TransferResidentMigrate MessageType = 28
 )
 
 // Enum value maps for MessageType.
@@ -113,6 +119,7 @@ var (
 		25: "TransferClientKey",
 		26: "TransferNetworkPeersReset",
 		27: "TransferNetworkPeersUpdate",
+		28: "TransferResidentMigrate",
 	}
 	MessageType_value = map[string]int32{
 		"TransferPack":                 0,
@@ -143,6 +150,7 @@ var (
 		"TransferClientKey":            25,
 		"TransferNetworkPeersReset":    26,
 		"TransferNetworkPeersUpdate":   27,
+		"TransferResidentMigrate":      28,
 	}
 )
 
@@ -243,7 +251,7 @@ const file_frame_proto_rawDesc = "" +
 	"\x05Frame\x129\n" +
 	"\fmessage_type\x18\x01 \x01(\x0e2\x16.bringyour.MessageTypeR\vmessageType\x12#\n" +
 	"\rmessage_bytes\x18\x02 \x01(\fR\fmessageBytes\x12\x10\n" +
-	"\x03raw\x18\x03 \x01(\bR\x03raw*\xce\x05\n" +
+	"\x03raw\x18\x03 \x01(\bR\x03raw*\xeb\x05\n" +
 	"\vMessageType\x12\x10\n" +
 	"\fTransferPack\x10\x00\x12\x0f\n" +
 	"\vTransferAck\x10\x01\x12\x14\n" +
@@ -273,7 +281,8 @@ const file_frame_proto_rawDesc = "" +
 	"\x14TransferEncryptedKey\x10\x18\x12\x15\n" +
 	"\x11TransferClientKey\x10\x19\x12\x1d\n" +
 	"\x19TransferNetworkPeersReset\x10\x1a\x12\x1e\n" +
-	"\x1aTransferNetworkPeersUpdate\x10\x1bB'Z%github.com/urnetwork/connect/protocolb\x06proto3"
+	"\x1aTransferNetworkPeersUpdate\x10\x1b\x12\x1b\n" +
+	"\x17TransferResidentMigrate\x10\x1cB'Z%github.com/urnetwork/connect/protocolb\x06proto3"
 
 var (
 	file_frame_proto_rawDescOnce sync.Once

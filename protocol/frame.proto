@@ -60,6 +60,12 @@ enum MessageType {
     // into the receiving client's peer state. `Frame.message_bytes` is a
     // marshaled `NetworkPeersUpdate`.
     TransferNetworkPeersUpdate = 27;
+    // control message that asks the client to migrate its platform transport
+    // (make-before-break) because the resident is draining.
+    // `Frame.message_bytes` is a marshaled `ResidentMigrate`.
+    // Older clients ignore the unknown message type and fall back to the
+    // drain eviction plus excuse path (CONNECTDRAIN2.md).
+    TransferResidentMigrate = 28;
 }
 
 

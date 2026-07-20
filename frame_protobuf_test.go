@@ -626,3 +626,20 @@ func TestFrameCodecAllocs(t *testing.T) {
 		t.Fatalf("marshalSendPackTransferFrame allocates %v per call, want <=1", allocs)
 	}
 }
+
+// ResidentMigrate rides the standard control frame path
+// (CONNECTDRAIN2.md §3.3)
+func TestResidentMigrateFrameRoundTrip(t *testing.T) {
+	migrateTime := uint64(1752900000000)
+	frame, err := ToFrame(&protocol.ResidentMigrate{
+		MigrateTime: migrateTime,
+	}, DefaultProtocolVersion)
+	AssertEqual(t, err, nil)
+	AssertEqual(t, protocol.MessageType_TransferResidentMigrate, frame.MessageType)
+
+	message, err := FromFrame(frame)
+	AssertEqual(t, err, nil)
+	residentMigrate, ok := message.(*protocol.ResidentMigrate)
+	AssertEqual(t, true, ok)
+	AssertEqual(t, migrateTime, residentMigrate.MigrateTime)
+}

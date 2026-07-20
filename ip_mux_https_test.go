@@ -192,7 +192,7 @@ func TestUpgradeMuxHttpsForwardFanOut(t *testing.T) {
 	const domain = "cdn.example.test"
 	const hintIp = "104.16.9.9"
 
-	mkResponder := func(id uint16, srcPort int) dnsResponder {
+	mkResponder := func(id uint16, srcPort int, questionDomain string) dnsResponder {
 		path := &IpPath{
 			Version:         4,
 			Protocol:        IpProtocolUdp,
@@ -203,6 +203,7 @@ func TestUpgradeMuxHttpsForwardFanOut(t *testing.T) {
 		}
 		return dnsResponder{
 			id:          id,
+			question:    httpsQuestion(questionDomain),
 			source:      TransferPath{},
 			provideMode: protocol.ProvideMode_Network,
 			reverse:     path.Reverse(),
@@ -210,14 +211,22 @@ func TestUpgradeMuxHttpsForwardFanOut(t *testing.T) {
 	}
 	// two clients coalesced onto one flight for the same HTTPS question
 	key := NewDohKey("HTTPS", domain)
-	fl := mux.attachDnsResponder(key, mkResponder(0x1111, 40001))
+	fl := mux.attachDnsResponder(key, mkResponder(0x1111, 40001, "CdN.Example.Test"))
 	if fl == nil {
 		t.Fatal("expected a new flight for the first responder")
 	}
-	mux.attachDnsResponder(key, mkResponder(0x2222, 40002))
+	mux.attachDnsResponder(key, mkResponder(0x2222, 40002, "cDn.eXAMPLE.tEST"))
 
 	response := buildHttpsAnswer(t, 0, httpsQuestion(domain), []string{hintIp}, nil)
-	mux.fanOutHttpsForward(fl, domain, response)
+	mux.fanOutHttpsForward(key, fl, domain, response)
+
+	// The responder snapshot and flight removal are atomic: a query attaching
+	// after completion starts a new flight instead of joining a responder list
+	// that has already been delivered.
+	next := mux.attachDnsResponder(key, mkResponder(0x3333, 40003, "CDN.example.test"))
+	if next == nil || next == fl {
+		t.Fatal("post-completion query did not start a fresh HTTPS flight")
+	}
 
 	// both coalesced clients get the record, each stamped with its own transaction id
 	if !waitForCondition(2*time.Second, func() bool { _, r := rec.counts(); return r == 2 }) {
@@ -225,6 +234,7 @@ func TestUpgradeMuxHttpsForwardFanOut(t *testing.T) {
 		t.Fatalf("delivered %d replies, want 2 (one per coalesced responder)", r)
 	}
 	ids := map[uint16]bool{}
+	questions := map[uint16]string{}
 	for _, packet := range rec.receivedPackets() {
 		_, payload, err := ParseIpPathWithPayload(packet)
 		if err != nil {
@@ -236,6 +246,11 @@ func TestUpgradeMuxHttpsForwardFanOut(t *testing.T) {
 			t.Fatalf("dns parse: %v", err)
 		}
 		ids[h.ID] = true
+		q, err := p.Question()
+		if err != nil {
+			t.Fatalf("dns question parse: %v", err)
+		}
+		questions[h.ID] = q.Name.String()
 		// the delivered payload is the forwarded HTTPS record (its hint round-trips)
 		if hints := parseHttpsHints(payload); !slices.Contains(hints, netip.MustParseAddr(hintIp)) {
 			t.Fatalf("delivered reply missing the HTTPS hint: %v", hints)
@@ -243,6 +258,9 @@ func TestUpgradeMuxHttpsForwardFanOut(t *testing.T) {
 	}
 	if !ids[0x1111] || !ids[0x2222] {
 		t.Fatalf("delivered transaction ids = %v, want both 0x1111 and 0x2222", ids)
+	}
+	if questions[0x1111] != "CdN.Example.Test." || questions[0x2222] != "cDn.eXAMPLE.tEST." {
+		t.Fatalf("delivered question casing = %v", questions)
 	}
 
 	// the hint ip -> domain was recorded, so a flow to the hint reports the server name

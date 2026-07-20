@@ -219,6 +219,103 @@ func TestReceiveContractSupersedeClosesStats(t *testing.T) {
 	AssertEqual(t, 2, len(rs.openReceiveContracts))
 }
 
+// TestContractStatsSequenceOrdersCloseAfterOpen pins the ContractStatsEvent
+// Sequence contract: every event for a contract carries a per-contract
+// monotonic sequence assigned under the stats lock at snapshot time (starting
+// at 1), so a consumer that discards events with Sequence <= last-seen gets
+// the intended order even when deliveries interleave — in particular, a stale
+// `Open=true` snapshot racing `CloseAllContractStats` can never supersede the
+// final close, because the close always snapshots later and so carries a
+// higher Sequence. Also pins the counter lifecycle: the per-contract counter
+// is dropped once the contract's entries are fully closed and removed.
+func TestContractStatsSequenceOrdersCloseAfterOpen(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// a long epoch so ONLY the test's explicit emits run
+	settings := DefaultClientSettings()
+	settings.ContractManagerSettings.ContractStatsEpoch = 1 * time.Hour
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+	defer client.Cancel()
+	contractManager := client.ContractManager()
+
+	var lock sync.Mutex
+	eventsByContract := map[Id][]*ContractStatsEvent{}
+	unsub := contractManager.AddContractStatsCallback(func(events []*ContractStatsEvent) {
+		lock.Lock()
+		defer lock.Unlock()
+		for _, e := range events {
+			eventsByContract[e.ContractId] = append(eventsByContract[e.ContractId], e)
+		}
+	})
+	defer unsub()
+
+	path := TransferPath{SourceId: client.ClientId(), DestinationId: NewId()}
+	contractA := NewId()
+	contractB := NewId()
+	entryA := contractManager.registerContractStats(contractA, false, false, path, 1000)
+	entryB := contractManager.registerContractStats(contractB, true, false, path, 2000)
+
+	// two deterministic epoch passes: the initial open, then a usage change
+	contractManager.emitContractStats()
+	entryA.updateUsedByteCount(100)
+	entryB.updateUsedByteCount(50)
+	contractManager.emitContractStats()
+
+	// an epoch tick racing the final CloseAll: whichever snapshot happens
+	// later carries the higher sequence, so the close can never be superseded
+	entryA.updateUsedByteCount(200)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		contractManager.emitContractStats()
+	}()
+	go func() {
+		defer wg.Done()
+		contractManager.CloseAllContractStats()
+	}()
+	wg.Wait()
+
+	func() {
+		lock.Lock()
+		defer lock.Unlock()
+		for _, contractId := range []Id{contractA, contractB} {
+			events := eventsByContract[contractId]
+			if len(events) < 3 {
+				t.Fatalf("contract %s: got %d events, want at least open+usage+close", contractId, len(events))
+			}
+			seen := map[uint64]bool{}
+			var maxEvent *ContractStatsEvent
+			for _, e := range events {
+				if e.Sequence == 0 {
+					t.Fatalf("contract %s: sequence must start at 1", contractId)
+				}
+				if seen[e.Sequence] {
+					t.Fatalf("contract %s: duplicate sequence %d", contractId, e.Sequence)
+				}
+				seen[e.Sequence] = true
+				if maxEvent == nil || maxEvent.Sequence < e.Sequence {
+					maxEvent = e
+				}
+			}
+			// the superseding close carries a higher sequence than any
+			// prior open, so the consumer's discard rule lands on closed
+			if maxEvent.Open {
+				t.Fatalf("contract %s: the highest-sequence event must be the close, got open (seq %d)", contractId, maxEvent.Sequence)
+			}
+		}
+	}()
+
+	// fully closed: the entries and the per-contract counters are dropped
+	func() {
+		contractManager.contractStatsLock.Lock()
+		defer contractManager.contractStatsLock.Unlock()
+		AssertEqual(t, 0, len(contractManager.contractStatsEntries))
+		AssertEqual(t, 0, len(contractManager.contractStatsSequences))
+	}()
+}
+
 // TestContractManagerCloseAllContractStats pins the teardown fix: at client
 // teardown, closing all contract stats must mark every open entry closed and
 // emit the closes SYNCHRONOUSLY to attached listeners (so a removed peer's

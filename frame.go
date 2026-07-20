@@ -79,6 +79,8 @@ func ToFrame(message proto.Message, protocolVersion int) (*protocol.Frame, error
 		messageType = protocol.MessageType_TransferNetworkPeersReset
 	case *protocol.NetworkPeersUpdate:
 		messageType = protocol.MessageType_TransferNetworkPeersUpdate
+	case *protocol.ResidentMigrate:
+		messageType = protocol.MessageType_TransferResidentMigrate
 	default:
 		return nil, fmt.Errorf("Unknown message type: %T", v)
 	}
@@ -210,6 +212,8 @@ func FromFrame(frame *protocol.Frame) (proto.Message, error) {
 		message = &protocol.NetworkPeersReset{}
 	case protocol.MessageType_TransferNetworkPeersUpdate:
 		message = &protocol.NetworkPeersUpdate{}
+	case protocol.MessageType_TransferResidentMigrate:
+		message = &protocol.ResidentMigrate{}
 	default:
 		return nil, fmt.Errorf("Unknown message type: %s", frame.MessageType)
 	}

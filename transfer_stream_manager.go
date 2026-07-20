@@ -83,26 +83,31 @@ func (self *StreamManager) handleControlFrame(frame *protocol.Frame) error {
 	case protocol.MessageType_TransferStreamOpen, protocol.MessageType_TransferStreamClose, protocol.MessageType_TransferStreamReset:
 		if message, err := FromFrame(frame); err == nil {
 
-			streamOpen := func(v *protocol.StreamOpen) error {
-				var sourceId *Id
+			streamOpenIds := func(v *protocol.StreamOpen) (sourceId *Id, destinationId *Id, streamId Id, err error) {
 				if v.SourceId != nil {
-					sourceId_, err := IdFromBytes(v.SourceId)
+					var sourceId_ Id
+					sourceId_, err = IdFromBytes(v.SourceId)
 					if err != nil {
-						return err
+						return
 					}
 					sourceId = &sourceId_
 				}
 
-				var destinationId *Id
 				if v.DestinationId != nil {
-					destinationId_, err := IdFromBytes(v.DestinationId)
+					var destinationId_ Id
+					destinationId_, err = IdFromBytes(v.DestinationId)
 					if err != nil {
-						return err
+						return
 					}
 					destinationId = &destinationId_
 				}
 
-				streamId, err := IdFromBytes(v.StreamId)
+				streamId, err = IdFromBytes(v.StreamId)
+				return
+			}
+
+			streamOpen := func(v *protocol.StreamOpen) error {
+				sourceId, destinationId, streamId, err := streamOpenIds(v)
 				if err != nil {
 					return err
 				}
@@ -135,14 +140,33 @@ func (self *StreamManager) handleControlFrame(frame *protocol.Frame) error {
 				self.streamBuffer.CloseStream(streamId)
 
 			case *protocol.StreamReset:
+				// reconcile instead of tear down:
+				// keep the sequences of relisted streams so that their state
+				// (including p2p transports) survives a resident migration.
+				// streams not in the list are canceled,
+				// and listed streams not yet open are opened below
+				keep := map[streamSequenceId]bool{}
+				for _, m := range v.Streams {
+					sourceId, destinationId, streamId, err := streamOpenIds(m)
+					if err != nil {
+						continue
+					}
+					keep[newStreamSequenceId(sourceId, destinationId, streamId)] = true
+				}
 				if self.client.log.V(1).Enabled() {
 					self.client.log.Infof("[sm]%s reset streams = %d\n", self.client.ClientTag(), len(v.Streams))
 				}
-				self.streamBuffer.ResetStreams()
+				self.streamBuffer.ResetStreams(keep)
 				for _, m := range v.Streams {
-					err := streamOpen(m)
-					if err != nil {
-						return err
+					if err := streamOpen(m); err != nil {
+						// skip and continue: one malformed or un-openable
+						// entry must not strand the remaining listed
+						// streams (they would stay closed until the next
+						// reset)
+						if self.client.log.V(1).Enabled() {
+							self.client.log.Infof("[sm]%s reset open err = %s\n", self.client.ClientTag(), err)
+						}
+						continue
 					}
 				}
 			}
@@ -207,11 +231,16 @@ func NewStreamBuffer(ctx context.Context, streamManager *StreamManager, streamBu
 	}
 }
 
-func (self *StreamBuffer) ResetStreams() {
+// ResetStreams cancels all stream sequences except those in `keep`.
+// A reset that relists the current streams reconciles instead of tearing down,
+// so the kept sequences (and their p2p transports) survive a resident migration
+func (self *StreamBuffer) ResetStreams(keep map[streamSequenceId]bool) {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
-	for _, streamSequence := range self.streamSequences {
-		streamSequence.Cancel()
+	for streamSequenceId, streamSequence := range self.streamSequences {
+		if !keep[streamSequenceId] {
+			streamSequence.Cancel()
+		}
 	}
 }
 

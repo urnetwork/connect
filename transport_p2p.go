@@ -226,7 +226,7 @@ func (self *P2pTransport) run() {
 				}
 				close(headerRead)
 
-				t, route := NewP2pSendTransport(handleCtx, handleCancel, conn, self.peerId, self.streamId, self.settings)
+				t, route := NewP2pSendTransportForPeer(handleCtx, handleCancel, conn, self.peerId, self.streamId, self.settings)
 
 				updateRoute := func(connected bool) {
 					if connected {
@@ -277,6 +277,19 @@ type P2pSendTransport struct {
 }
 
 func NewP2pSendTransport(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	conn net.Conn,
+	streamId Id,
+	settings *P2pTransportSettings,
+) (Transport, Route) {
+	return NewP2pSendTransportForPeer(ctx, cancel, conn, Id{}, streamId, settings)
+}
+
+// NewP2pSendTransportForPeer creates a P2P route that can be selected by both
+// peer and stream. NewP2pSendTransport retains the pre-peer-id signature as a
+// deprecated stream-only compatibility entry point.
+func NewP2pSendTransportForPeer(
 	ctx context.Context,
 	cancel context.CancelFunc,
 	conn net.Conn,
@@ -391,6 +404,14 @@ func (self *P2pSendTransport) MatchesReceive(destination TransferPath) bool {
 
 func (self *P2pSendTransport) Downgrade(source TransferPath) {
 	if source.StreamId == self.streamId {
+		self.cancel()
+		return
+	}
+	// mirror `MatchesSend`: the stream terminates at the peer, so an
+	// audit/degrade signal for the peer must also shed this transport,
+	// not just signals for the stream. The peer id must be non-zero so
+	// that a missing peer never matches paths without a destination id.
+	if self.peerId != (Id{}) && source.DestinationId == self.peerId {
 		self.cancel()
 	}
 }
