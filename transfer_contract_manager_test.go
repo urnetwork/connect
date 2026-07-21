@@ -14,6 +14,75 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
+// TestTakeContractStreamStamped pins the oob loop behind platform stream
+// steering: the reply sequence requests contracts under a plain (no-stream)
+// contract key, and the platform may return a contract whose stored bytes
+// carry a stream id ("switch to the stream"). The stamped contract must
+// queue under the request's key and carry the stream id through
+// `newSequenceContract` into the sequence path — which is what steers the
+// writer onto the stream and marks the contract stats.
+func TestTakeContractStreamStamped(t *testing.T) {
+	ctx := context.Background()
+	clientId := NewId()
+	settings := DefaultClientSettings()
+	settings.ContractManagerSettings.LegacyCreateContract = true
+	client := NewClient(ctx, clientId, NewNoContractClientOob(), settings)
+	defer client.Cancel()
+	contractManager := client.ContractManager()
+
+	destinationId := NewId()
+	streamId := NewId()
+
+	contractManager.SetProvideModesWithReturnTraffic(map[protocol.ProvideMode]bool{
+		protocol.ProvideMode_Network: true,
+	})
+	relationship := protocol.ProvideMode_Network
+	provideSecretKey, ok := contractManager.GetProvideSecretKey(relationship)
+	AssertEqual(t, true, ok)
+
+	storedContract := &protocol.StoredContract{
+		ContractId:        NewId().Bytes(),
+		TransferByteCount: uint64(gib(1)),
+		SourceId:          clientId.Bytes(),
+		DestinationId:     destinationId.Bytes(),
+		StreamId:          streamId.Bytes(),
+	}
+	storedContractBytes, err := ProtoMarshal(storedContract)
+	AssertEqual(t, nil, err)
+	storedContractHmac := SignStoredContract(contractManager.settings, provideSecretKey, storedContractBytes)
+
+	result := &protocol.CreateContractResult{
+		Contract: &protocol.Contract{
+			StoredContractBytes: storedContractBytes,
+			StoredContractHmac:  storedContractHmac,
+			ProvideMode:         relationship,
+		},
+	}
+	frame, err := ToFrame(result, DefaultProtocolVersion)
+	AssertEqual(t, nil, err)
+
+	// the request key has no stream — the requester does not know the
+	// platform will steer it
+	contractKey := ContractKey{
+		Destination: DestinationId(destinationId),
+	}
+	err = contractManager.HandleControlFrame(contractKey, frame)
+	AssertEqual(t, nil, err)
+
+	contract := contractManager.TakeContract(ctx, contractKey, 5*time.Second)
+	AssertEqual(t, true, contract != nil)
+
+	sequenceContract, err := newSequenceContract(client.log, "s", contract, 1, 1.0)
+	AssertEqual(t, nil, err)
+	AssertEqual(t, true, sequenceContract.path.IsStream())
+	AssertEqual(t, streamId, sequenceContract.path.StreamId)
+	AssertEqual(
+		t,
+		TransferPath{DestinationId: destinationId, StreamId: streamId},
+		sequenceContract.path.DestinationMask(),
+	)
+}
+
 func TestTakeContract(t *testing.T) {
 	// in parallel, add contracts, take contracts, and optionally return contract
 	// make sure all created contracts get eventually taken
