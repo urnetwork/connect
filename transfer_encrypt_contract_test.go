@@ -354,6 +354,221 @@ func TestSendReceiveEncryptedWithContracts(t *testing.T) {
 	}
 }
 
+// TestSendReceiveEncryptedPeerWithoutEncryption pins the opportunistic
+// fallback: an initiator with `Encrypt=true` talking to a peer whose session
+// manager is inert (`Encrypt=false` — `DeliverEncryptedControl` drops
+// handshake controls, acquire/lookup return nil). The initiator's handshake
+// can never complete, so its per-peer sessions stay cipher-nil and traffic
+// flows in plaintext at this layer, in both directions — the sessions never
+// block or wedge the send/receive sequences. This is the compatibility
+// contract the per-peer encryption toggle relies on against providers that
+// don't support encryption; the both-sides-enabled contrast (cipher comes up,
+// traffic continues) is TestSendReceiveEncryptedWithContracts above.
+func TestSendReceiveEncryptedPeerWithoutEncryption(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	aClientId := NewId()
+	bClientId := NewId()
+
+	aSend := make(chan []byte)
+	bSend := make(chan []byte)
+
+	aConditioner, bReceive := newConditioner(ctx, aSend)
+	bConditioner, aReceive := newConditioner(ctx, bSend)
+	aConditioner.update(func() { aConditioner.randomDelay = 20 * time.Millisecond })
+	bConditioner.update(func() { bConditioner.randomDelay = 20 * time.Millisecond })
+
+	aSendTransport := newDataGatewayTransport()
+	aReceiveTransport := NewReceiveGatewayTransport()
+	bSendTransport := newDataGatewayTransport()
+	bReceiveTransport := NewReceiveGatewayTransport()
+
+	provideModes := map[protocol.ProvideMode]bool{protocol.ProvideMode_Network: true}
+
+	makeSettings := func(encrypt bool) *ClientSettings {
+		s := DefaultClientSettings()
+		s.SendBufferSettings.SequenceBufferSize = 0
+		s.SendBufferSettings.AckBufferSize = 0
+		s.SendBufferSettings.AckTimeout = 60 * time.Second
+		s.SendBufferSettings.IdleTimeout = 60 * time.Second
+		s.SendBufferSettings.MinResendInterval = 10 * time.Millisecond
+		s.ReceiveBufferSettings.SequenceBufferSize = 0
+		s.ReceiveBufferSettings.GapTimeout = 60 * time.Second
+		s.ReceiveBufferSettings.IdleTimeout = 60 * time.Second
+		s.ForwardBufferSettings.SequenceBufferSize = 0
+		s.ForwardBufferSettings.IdleTimeout = 1 * time.Second
+		s.ContractManagerSettings.LegacyCreateContract = false
+		s.EncryptionSettings.Encrypt = encrypt
+		s.EncryptionSettings.TlsTimeout = 30 * time.Second
+		s.EncryptionSettings.EncryptionControlUseCompanion = false
+		return s
+	}
+
+	var a, b *Client
+	aOob := &grantingClientOob{
+		sourceId: aClientId,
+		settings: DefaultContractManagerSettings(),
+		destSecretKey: func(destinationId Id) ([]byte, bool) {
+			return b.ContractManager().GetProvideSecretKey(protocol.ProvideMode_Network)
+		},
+		destClientPublicKey: func(destinationId Id) []byte {
+			return b.ClientKeyManager().PublicKey()
+		},
+	}
+	bOob := &grantingClientOob{
+		sourceId: bClientId,
+		settings: DefaultContractManagerSettings(),
+		destSecretKey: func(destinationId Id) ([]byte, bool) {
+			return a.ContractManager().GetProvideSecretKey(protocol.ProvideMode_Network)
+		},
+		destClientPublicKey: func(destinationId Id) []byte {
+			return a.ClientKeyManager().PublicKey()
+		},
+	}
+
+	// a initiates with encryption enabled; b is the peer without encryption.
+	a = NewClient(ctx, aClientId, aOob, makeSettings(true))
+	defer a.Cancel()
+	a.RouteManager().UpdateTransport(aSendTransport, []Route{aSend})
+	a.RouteManager().UpdateTransport(aReceiveTransport, []Route{aReceive})
+	blackholeControlId(ctx, a.RouteManager())
+	a.ContractManager().SetProvideModes(provideModes)
+
+	b = NewClient(ctx, bClientId, bOob, makeSettings(false))
+	defer b.Cancel()
+	b.RouteManager().UpdateTransport(bSendTransport, []Route{bSend})
+	b.RouteManager().UpdateTransport(bReceiveTransport, []Route{bReceive})
+	blackholeControlId(ctx, b.RouteManager())
+	b.ContractManager().SetProvideModes(provideModes)
+
+	// On b the receive sequences hold no session (inert manager), so a's
+	// handshake EncryptedControl frames bubble up to the receive callback as
+	// ordinary frames; filtering on SimpleMessage ignores them, as an
+	// application would ignore frame types it doesn't consume.
+	receivesA := make(chan string, 1024)
+	receivesB := make(chan string, 1024)
+	a.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, _ Peer) {
+		for _, frame := range frames {
+			if m, err := FromFrame(frame); err == nil {
+				if sm, ok := m.(*protocol.SimpleMessage); ok {
+					receivesA <- sm.Content
+				}
+			}
+		}
+	})
+	b.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, _ Peer) {
+		for _, frame := range frames {
+			if m, err := FromFrame(frame); err == nil {
+				if sm, ok := m.(*protocol.SimpleMessage); ok {
+					receivesB <- sm.Content
+				}
+			}
+		}
+	})
+
+	send := func(client *Client, dst Id, label string) {
+		m := &protocol.SimpleMessage{Content: label}
+		frame, err := ToFrame(m, DefaultProtocolVersion)
+		if err != nil {
+			panic(err)
+		}
+		client.Send(frame, DestinationId(dst), func(error) {})
+	}
+
+	stop := make(chan struct{})
+	defer close(stop)
+	var gotA, gotB int64
+	go func() {
+		for i := 0; ; i += 1 {
+			select {
+			case <-stop:
+				return
+			case <-ctx.Done():
+				return
+			default:
+			}
+			send(a, bClientId, fmt.Sprintf("a%d", i))
+			send(b, aClientId, fmt.Sprintf("b%d", i))
+			select {
+			case <-stop:
+				return
+			case <-time.After(200 * time.Millisecond):
+			}
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-receivesA:
+				atomic.AddInt64(&gotA, 1)
+			case <-receivesB:
+				atomic.AddInt64(&gotB, 1)
+			}
+		}
+	}()
+
+	// assertNoCipher sweeps every per-peer session a holds for b — the
+	// client-role initiator plus any receive-side sessions — and requires all
+	// of them cipher-nil: with b's manager inert the handshake has no
+	// responder, so no session may ever expose a cipher.
+	assertNoCipher := func(tag string) {
+		for _, sess := range a.EncryptionSessionManager().sessionsForPeer(bClientId) {
+			if cipher := sess.Cipher(); cipher != nil {
+				t.Fatalf("%s: a's session for b exposes a cipher — the handshake cannot establish against an Encrypt=false peer", tag)
+			}
+		}
+	}
+
+	// Phase 1: application traffic must be delivered in both directions —
+	// plaintext at this layer — while a's handshake attempt stays pending.
+	deadline := time.After(45 * time.Second)
+	for atomic.LoadInt64(&gotA) < 4 || atomic.LoadInt64(&gotB) < 4 {
+		assertNoCipher("phase 1")
+		select {
+		case <-deadline:
+			t.Fatalf("plaintext fallback did not deliver: a received %d, b received %d — traffic must flow when the peer has encryption disabled",
+				atomic.LoadInt64(&gotA), atomic.LoadInt64(&gotB))
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+
+	// a initiated, so its client-role session for b exists — proving the
+	// fallback path was exercised (a session with a live handshake attempt,
+	// not a skipped one) — and stays cipher-nil.
+	aClientSession := a.EncryptionSessionManager().Lookup(bClientId, sequenceTlsRoleClient, false)
+	if aClientSession == nil {
+		t.Fatal("expected a's client-role session for b to exist (a initiates the handshake)")
+	}
+	AssertEqual(t, (*sequenceCipher)(nil), aClientSession.Cipher())
+	assertNoCipher("after delivery")
+
+	// b's manager is inert: no session in any role/companion.
+	for _, role := range []sequenceTlsRole{sequenceTlsRoleClient, sequenceTlsRoleServer} {
+		for _, companion := range []bool{false, true} {
+			if b.EncryptionSessionManager().Lookup(aClientId, role, companion) != nil {
+				t.Fatalf("expected no session on the Encrypt=false peer (role=%v companion=%t)", role, companion)
+			}
+		}
+	}
+
+	// Phase 2: flow is sustained — the unestablished session must not wedge
+	// the sequences as more traffic moves through them.
+	baseA, baseB := atomic.LoadInt64(&gotA), atomic.LoadInt64(&gotB)
+	deadline2 := time.After(20 * time.Second)
+	for atomic.LoadInt64(&gotA) < baseA+3 || atomic.LoadInt64(&gotB) < baseB+3 {
+		select {
+		case <-deadline2:
+			t.Fatalf("messages stopped flowing: a received %d (want %d), b received %d (want %d)",
+				atomic.LoadInt64(&gotA), baseA+3, atomic.LoadInt64(&gotB), baseB+3)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	assertNoCipher("after sustained flow")
+}
+
 // TestEncryptedCompanionSessionsCreateSeparateContracts verifies that the
 // per-peer encryption session key includes the companion bit: when A and B each
 // send to the other in both companion and non-companion mode, the four

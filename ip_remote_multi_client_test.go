@@ -306,7 +306,7 @@ func TestMultiClientChannelWindowStats(t *testing.T) {
 	}
 	AssertEqual(t, nil, err)
 
-	clientChannel, err := newMultiClientChannel(ctx, channelArgs, generator, clientReceivePacket, DefaultSecurityPolicy(ctx), contractStatus, func(contractStatsEvents []*ContractStatsEvent) {}, nil, settings)
+	clientChannel, err := newMultiClientChannel(ctx, channelArgs, generator, clientReceivePacket, DefaultSecurityPolicy(ctx), contractStatus, func(contractStatsEvents []*ContractStatsEvent) {}, func() {}, nil, settings)
 	AssertEqual(t, nil, err)
 
 	cancelCtxs := []context.Context{}
@@ -359,51 +359,58 @@ func TestMultiClientChannelWindowStats(t *testing.T) {
 	AssertEqual(t, true, stats.bucketCount <= maxBucketCount)
 }
 
-func TestMultiClientNeverAllowDirect(t *testing.T) {
-	// the `NeverAllowDirect` hard limit keeps direct mode off,
-	// superseding both the performance profile and the same-network force.
-	// cloud hosted clients set this because a direct connection would leak
-	// that the client is hosted and where it is hosted
+func TestMultiClientOverrideAllowDirect(t *testing.T) {
+	// `OverrideAllowDirect` hard-overrides the profile's direct mode in
+	// either direction, superseding both the performance profile and the
+	// same-network force. false is the cloud-hosted hard limit (a direct
+	// connection would leak that the client is hosted and where it is
+	// hosted); true forces direct mode on regardless of the profile.
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	newMultiClient := func(neverAllowDirect bool, defaultPerformanceProfile *PerformanceProfile) *RemoteUserNatMultiClient {
+	newMultiClient := func(provideMode protocol.ProvideMode, overrideAllowDirect *bool, defaultPerformanceProfile *PerformanceProfile) *RemoteUserNatMultiClient {
 		settings := DefaultMultiClientSettings()
-		settings.NeverAllowDirect = neverAllowDirect
+		settings.OverrideAllowDirect = overrideAllowDirect
 		settings.DefaultPerformanceProfile = defaultPerformanceProfile
 		return NewRemoteUserNatMultiClient(
 			ctx,
 			&testingEmptyMultiClientGenerator{},
 			func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
 			},
-			protocol.ProvideMode_Network,
+			provideMode,
 			settings,
 		)
 	}
+	boolPtr := func(b bool) *bool { return &b }
 
 	allowDirectProfile := &PerformanceProfile{
 		WindowType:  WindowTypeQuality,
 		WindowSize:  DefaultWindowSizeSettings(),
 		AllowDirect: true,
 	}
+	noDirectProfile := &PerformanceProfile{
+		WindowType:  WindowTypeQuality,
+		WindowSize:  DefaultWindowSizeSettings(),
+		AllowDirect: false,
+	}
 
-	// baseline: without the hard limit, the same-network force enables direct
+	// baseline: without an override, the same-network force enables direct
 	// mode even with no profile set
-	multiClient := newMultiClient(false, nil)
+	multiClient := newMultiClient(protocol.ProvideMode_Network, nil, nil)
 	pp := multiClient.config.Load().performanceProfile
 	AssertEqual(t, true, pp != nil)
 	AssertEqual(t, true, pp.AllowDirect)
 	multiClient.Close()
 
-	// the hard limit supersedes the same-network force
-	multiClient = newMultiClient(true, nil)
+	// override false supersedes the same-network force
+	multiClient = newMultiClient(protocol.ProvideMode_Network, boolPtr(false), nil)
 	defer multiClient.Close()
 	pp = multiClient.config.Load().performanceProfile
 	AssertEqual(t, true, pp != nil)
 	AssertEqual(t, false, pp.AllowDirect)
 
-	// the hard limit supersedes a profile that allows direct,
+	// override false supersedes a profile that allows direct,
 	// on both the set path and the constructor default path
 	multiClient.SetPerformanceProfile(allowDirectProfile)
 	pp = multiClient.config.Load().performanceProfile
@@ -414,9 +421,33 @@ func TestMultiClientNeverAllowDirect(t *testing.T) {
 	// the input profile is not mutated in place
 	AssertEqual(t, true, allowDirectProfile.AllowDirect)
 
-	multiClientWithDefault := newMultiClient(true, allowDirectProfile)
+	multiClientWithDefault := newMultiClient(protocol.ProvideMode_Network, boolPtr(false), allowDirectProfile)
 	defer multiClientWithDefault.Close()
 	pp = multiClientWithDefault.config.Load().performanceProfile
+	AssertEqual(t, true, pp != nil)
+	AssertEqual(t, false, pp.AllowDirect)
+
+	// override true forces direct mode on over a profile that disables it,
+	// with no same-network force in play (provide mode Public), on both the
+	// constructor default path and the set path
+	multiClientForcedOn := newMultiClient(protocol.ProvideMode_Public, boolPtr(true), noDirectProfile)
+	defer multiClientForcedOn.Close()
+	pp = multiClientForcedOn.config.Load().performanceProfile
+	AssertEqual(t, true, pp != nil)
+	AssertEqual(t, true, pp.AllowDirect)
+	// the input profile is not mutated in place
+	AssertEqual(t, false, noDirectProfile.AllowDirect)
+
+	multiClientForcedOn.SetPerformanceProfile(noDirectProfile)
+	pp = multiClientForcedOn.config.Load().performanceProfile
+	AssertEqual(t, true, pp != nil)
+	AssertEqual(t, true, pp.AllowDirect)
+
+	// without an override and without the same-network force, the profile
+	// passes through
+	multiClientPlain := newMultiClient(protocol.ProvideMode_Public, nil, noDirectProfile)
+	defer multiClientPlain.Close()
+	pp = multiClientPlain.config.Load().performanceProfile
 	AssertEqual(t, true, pp != nil)
 	AssertEqual(t, false, pp.AllowDirect)
 }
