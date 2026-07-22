@@ -1,0 +1,4490 @@
+package connect
+
+import (
+	"context"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	// "reflect"
+	"errors"
+	"fmt"
+	"math"
+	mathrand "math/rand"
+	"net/netip"
+	"slices"
+	"strings"
+
+	"golang.org/x/net/publicsuffix"
+	"maps"
+
+	"google.golang.org/protobuf/proto"
+
+	"github.com/urnetwork/connect/v2026/protocol"
+)
+
+// multi client is a sender approach to mitigate bad destinations
+// it maintains a window of compatible clients chosen using specs
+// (e.g. from a desription of the intent of use)
+// - the clients are rate limited by the number of outstanding acks (nacks)
+// - the size of allowed outstanding nacks increases with each ack,
+// scaling up successful destinations to use the full transfer buffer
+// - the clients are chosen with probability weighted by their
+// net frame count statistics (acks - nacks)
+
+// the following functions handle moving clients in and out of the window:
+// - `resize`
+//   The goal of the resize is to meet a target window size based on the number
+//   of different source ip:port per destination ip:port.
+//   Two statistics are used: effective bytes per second ([ack used])
+//     and expected bytes per second ([capacity]-[ack used]-[unacked used]).
+//   Unhealthy clients are removed from the window based on low effective stats,
+//   unless the window is fixed size.
+//   Fundamentally this approach can't tell the difference between an
+//   unhealthy client and an idle client, so the norm is to continually change clients
+//   in the lull after a burst of usage.
+// - `detectBlackhole`
+//   When a client acks traffic but does not return traffic,
+//   it gets labeled a black hole. Black hole clients may be malicious
+//   or have network filtering. Black hole clients are removed.
+// - `ping`
+//   When a client is idle it must continually ack ping requests.
+//   Clients that fail to ack are removed.
+
+// TODO surface window stats to show to users
+
+type clientReceivePacketFunction func(client *multiClientChannel, source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte)
+
+type DestinationStats struct {
+	EstimatedBytesPerSecond ByteCount
+	Tier                    int
+}
+
+type WindowType int
+
+func (self WindowType) RankMode() string {
+	switch self {
+	case WindowTypeQuality:
+		return "quality"
+	case WindowTypeSpeed:
+		return "speed"
+	default:
+		return ""
+	}
+}
+
+const (
+	// WindowTypeAuto is the zero value: no fixed window type. A nil
+	// performance profile and a profile with `WindowTypeAuto` mean the same
+	// thing — traffic balances across the window types and each window uses
+	// its own default size settings (the profile `WindowSize` is ignored).
+	WindowTypeAuto    WindowType = 0
+	WindowTypeQuality WindowType = 1
+	WindowTypeSpeed   WindowType = 2
+)
+
+// for each `NewClientArgs`,
+//
+//	`RemoveClientWithArgs` will be called if a client was created for the args,
+//	else `RemoveClientArgs`
+type MultiClientGenerator interface {
+	// path -> estimated byte count per second
+	// the enumeration should typically
+	// 1. not repeat final destination ids from any path
+	// 2. not repeat intermediary elements from any path
+	NextDestinations(count int, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error)
+	// client id, client auth
+	NewClientArgs() (*MultiClientGeneratorClientArgs, error)
+	RemoveClientArgs(args *MultiClientGeneratorClientArgs)
+	RemoveClientWithArgs(client *Client, args *MultiClientGeneratorClientArgs)
+	NewClientSettings() *ClientSettings
+	NewClient(ctx context.Context, args *MultiClientGeneratorClientArgs, clientSettings *ClientSettings) (*Client, error)
+	FixedDestinationSize() (int, bool)
+}
+
+func DefaultMultiClientSettings() *MultiClientSettings {
+	return &MultiClientSettings{
+		SequenceBufferSize:  defaultTransferBufferSize,
+		SequenceIdleTimeout: 120 * time.Second,
+
+		WindowSizes: map[WindowType]WindowSizeSettings{
+			// TODO increase `WindowSizeMinP2pOnly` when p2p is deployed
+			WindowTypeQuality: WindowSizeSettings{
+				WindowSizeMin:     2,
+				WindowSizeMax:     6,
+				WindowSizeHardMax: 12,
+				// reconnects per source
+				WindowSizeReconnectScale: 1.2,
+				KeepHealthiestCount:      0,
+			},
+			WindowTypeSpeed: WindowSizeSettings{
+				WindowSizeMin:     1,
+				WindowSizeMax:     2,
+				WindowSizeHardMax: 4,
+				FixedWindowSize:   1,
+				// WindowSizeUseMax:     1,
+				// reconnects per source
+				WindowSizeReconnectScale: 1.0,
+				KeepHealthiestCount:      0,
+			},
+		},
+		SendRetryTimeout:           2000 * time.Millisecond,
+		PingWriteTimeout:           5 * time.Second,
+		CPingWriteTimeout:          15 * time.Second,
+		CPingMaxByteCountPerSecond: kib(32),
+		// the initial ping includes creating the transports and contract
+		// ease up the timeout until perf issues are fully resolved
+		PingTimeout:  30 * time.Second,
+		CPingTimeout: 30 * time.Second,
+		// the rest between continuous pings. decoupled from `CPingTimeout` (the
+		// ack wait) so a dead idle client is detected within
+		// ~CPingRestTimeout+CPingTimeout instead of ~2x CPingTimeout
+		CPingRestTimeout: 10 * time.Second,
+		// a lower ack timeout helps cycle through bad providers faster
+		AckTimeout:                                30 * time.Second,
+		BlackholeTimeout:                          5 * time.Second,
+		BlackholeConnectTimeout:                   30 * time.Second,
+		WindowResizeTimeout:                       15 * time.Second,
+		StatsWindowGraceperiod:                    30 * time.Second,
+		StatsWindowMaxEstimatedByteCountPerSecond: mib(16),
+		// StatsWindowMaxEffectiveByteCountPerSecondScale: 0.8,
+		StatsWindowEntropy:  0.0,
+		WindowExpandTimeout: 15 * time.Second,
+		// WindowExpandBlockTimeout: 5 * time.Second,
+		WindowExpandBlockCount: 4,
+		// wait this time before enumerating potential clients again
+		// WindowEnumerateEmptyTimeout: 5 * time.Second,
+		WindowEnumerateErrorTimeout: 1 * time.Second,
+		// WindowMaxScale:              4.0,
+		// WindowExpandMaxOvershotScale: 2.0,
+		// WindowRevisitTimeout:      2 * time.Minute,
+		WindowExpandArgsTimeout:   2 * time.Minute,
+		StatsWindowDuration:       30 * time.Second,
+		StatsWindowBucketDuration: 1 * time.Second,
+		StatsSampleWeightsCount:   8,
+		// percentile
+		StatsSourceCountSelection: 0.9,
+		// ClientAffinityTimeout:        0 * time.Second,
+
+		MultiRaceSetOnNoResponseTimeout:      5 * time.Second,
+		MultiRaceSetOnResponseTimeout:        2 * time.Second,
+		MultiRaceClientSentPacketMaxCount:    16,
+		MultiRaceClientPacketMaxCount:        8,
+		MultiRacePacketMaxCount:              32,
+		MultiRaceClientEarlyCompleteFraction: 0.25,
+		// TODO on platforms with more memory, increase this
+		MultiRaceClientCount: 0,
+
+		StatsWindowMaxUnhealthyDuration:  15 * time.Second,
+		StatsWindowWarnUnhealthyDuration: 5 * time.Second,
+		// how long a rank-kept client (FixedWindowSize/KeepHealthiestCount) may
+		// remain continuously unhealthy before it is removed anyway. Keeping the
+		// healthiest is meant to ride out transient badness, not to pin a dead
+		// client (and its ui dot) in the window forever.
+		StatsWindowKeepUnhealthyDuration: 60 * time.Second,
+		// StatsWindowKeepHealthiestCount:   2,
+		// the effective byte count is per stats window `StatsWindowDuration`
+		// StatsWindowMinHealthyEffectiveSendByteCount:    kib(1),
+		// StatsWindowMinHealthyEffectiveReceiveByteCount: kib(32),
+
+		MaxClientLifetime: 60 * time.Minute,
+
+		ProtocolVersion:     DefaultProtocolVersion,
+		DestinationAffinity: true,
+
+		DefaultReconnectScale: 1.0,
+		DefaultUlimit:         0,
+
+		TcpCollapsePrevention: true,
+		UdpCollapsePrevention: false,
+
+		SecurityPolicyGenerator: DefaultSecurityPolicyWithStats,
+
+		// the epoch for flushing block action and packet stats events to listeners
+		EventEpoch:                  1 * time.Second,
+		BlockActionDecisionTtl:      30 * time.Second,
+		BlockActionDecisionMaxCount: 4096,
+		BlockActionAggMaxCount:      1024,
+		IpAssocSettings:             DefaultIpAssocSettings(),
+
+		RemoteUserNatMultiClientMonitorSettings: *DefaultRemoteUserNatMultiClientMonitorSettings(),
+	}
+}
+
+type MultiClientSettings struct {
+	// Log, when set, is used by the multi client, its windows, channels, and
+	// internal local user nat. nil resolves to `DefaultLogger()`.
+	Log Logger
+
+	SequenceBufferSize  int
+	SequenceIdleTimeout time.Duration
+	WindowSizes         map[WindowType]WindowSizeSettings
+	// ClientNackInitialLimit int
+	// ClientNackMaxLimit int
+	// ClientNackScale float64
+	// ClientWriteTimeout time.Duration
+	// SendTimeout time.Duration
+	// WriteTimeout time.Duration
+	SendRetryTimeout                          time.Duration
+	PingWriteTimeout                          time.Duration
+	CPingWriteTimeout                         time.Duration
+	CPingMaxByteCountPerSecond                ByteCount
+	PingTimeout                               time.Duration
+	CPingTimeout                              time.Duration
+	CPingRestTimeout                          time.Duration
+	AckTimeout                                time.Duration
+	BlackholeTimeout                          time.Duration
+	BlackholeConnectTimeout                   time.Duration
+	WindowResizeTimeout                       time.Duration
+	StatsWindowGraceperiod                    time.Duration
+	StatsWindowMaxEstimatedByteCountPerSecond ByteCount
+	// StatsWindowMaxEffectiveByteCountPerSecondScale float32
+	StatsWindowEntropy  float32
+	WindowExpandTimeout time.Duration
+	// WindowExpandBlockTimeout     time.Duration
+	WindowExpandBlockCount int
+	// WindowEnumerateEmptyTimeout time.Duration
+	WindowEnumerateErrorTimeout time.Duration
+	// WindowMaxScale              float64
+	// WindowExpandMaxOvershotScale float64
+	// WindowRevisitTimeout      time.Duration
+	WindowExpandArgsTimeout   time.Duration
+	StatsWindowDuration       time.Duration
+	StatsWindowBucketDuration time.Duration
+	StatsSampleWeightsCount   int
+	// percentile
+	StatsSourceCountSelection float64
+	// lower affinity is more private
+	// however, there may be some applications that assume the same ip across multiple connections
+	// in those cases, we would need some small affinity
+	// ClientAffinityTimeout time.Duration
+
+	// time since first send to end the race, if no response
+	MultiRaceSetOnNoResponseTimeout time.Duration
+	// time after the first response to end the race
+	MultiRaceSetOnResponseTimeout        time.Duration
+	MultiRaceClientSentPacketMaxCount    int
+	MultiRaceClientPacketMaxCount        int
+	MultiRacePacketMaxCount              int
+	MultiRaceClientEarlyCompleteFraction float32
+	MultiRaceClientCount                 int
+
+	StatsWindowMaxUnhealthyDuration  time.Duration
+	StatsWindowWarnUnhealthyDuration time.Duration
+	StatsWindowKeepUnhealthyDuration time.Duration
+	// StatsWindowKeepHealthiestCount                 int
+	// StatsWindowMinHealthyEffectiveSendByteCount    ByteCount
+	// StatsWindowMinHealthyEffectiveReceiveByteCount ByteCount
+
+	// active clients longer than this lifetime will not be forced closed
+	// new connections will be routed to new clients
+	MaxClientLifetime time.Duration
+
+	ProtocolVersion int
+
+	// note destination affinity will affect retry with different source ports
+	// it relies on the performance of the initial race being good enough,
+	// and all-or-nothing bad clients where if one destination does not route via a client,
+	// all destinations should not route, so that the client can be detected as unhealthy
+	DestinationAffinity bool
+
+	DefaultPerformanceProfile *PerformanceProfile
+
+	// OverrideAllowDirect, when set, hard-overrides direct mode
+	// (`AllowDirect`) no matter what performance profile is set, in either
+	// direction, superseding the same-network force. Cloud hosted clients
+	// set false because a direct connection would leak that the client is
+	// hosted and where it is hosted: the host addresses appear in the
+	// direct connection setup. true forces direct mode on regardless of
+	// the profile. When unset, a trusted same-network peer connection
+	// (provide mode Network) forces direct mode on; otherwise the
+	// profile's own `AllowDirect` applies.
+	OverrideAllowDirect *bool
+
+	// used when reconnect scale is not set in a custom performance profile
+	DefaultReconnectScale float64
+	// used when ulimit is not set in a custom performance profile
+	DefaultUlimit int
+
+	TcpCollapsePrevention bool
+	UdpCollapsePrevention bool
+
+	SecurityPolicyGenerator func(context.Context, *SecurityPolicyStatsCollector) SecurityPolicy
+
+	// the epoch for flushing block action and packet stats events to listeners
+	EventEpoch time.Duration
+	// how long a cached block action decision stays valid while the overrides
+	// and cluster versions are unchanged (server names for a destination can drift)
+	BlockActionDecisionTtl      time.Duration
+	BlockActionDecisionMaxCount int
+	// max distinct block actions aggregated per epoch
+	BlockActionAggMaxCount int
+	// nil disables activity association (`IpAssoc`)
+	IpAssocSettings *IpAssocSettings
+
+	RemoteUserNatMultiClientMonitorSettings
+}
+
+type WindowSizeSettings struct {
+	WindowSizeMin int
+	// the minimumum number of items in the windows that must be connected via p2p only
+	WindowSizeMinP2pOnly int
+	// inclusive
+	WindowSizeMax     int
+	WindowSizeHardMax int
+	// leave 0 to automatically size between `WindowSizeMin` and `WindowSizeMax`
+	FixedWindowSize int
+	// WindowSizeUseMax     int
+	// clients per source (leave 0 for default)
+	WindowSizeReconnectScale float64
+	KeepHealthiestCount      int
+	// (leave 0 for default)
+	Ulimit int
+}
+
+func (self *WindowSizeSettings) Validate() error {
+	if self.WindowSizeMax < self.WindowSizeMin {
+		return fmt.Errorf(
+			"Window size [%d, %d] invalid. Max must be >= min",
+			self.WindowSizeMin,
+			self.WindowSizeMax,
+		)
+	}
+
+	if 0 < self.FixedWindowSize {
+		if self.FixedWindowSize < self.WindowSizeMin || self.WindowSizeMax < self.FixedWindowSize {
+			return fmt.Errorf(
+				"Window size [%d, %d] must include the fixed size =%d",
+				self.WindowSizeMin,
+				self.WindowSizeMax,
+				self.FixedWindowSize,
+			)
+		}
+	}
+
+	return nil
+}
+
+// not setting a performance profile, or setting one with `WindowTypeAuto`,
+// uses the default "auto" mode which balances traffic across multiple window
+// types with an internal set of profiles. In auto mode `WindowSize` is
+// ignored; the orthogonal settings (`AllowDirect`,
+// `PostQuantumEncryption`) still apply.
+type PerformanceProfile struct {
+	WindowType  WindowType
+	WindowSize  WindowSizeSettings
+	AllowDirect bool
+	// enable the per-peer e2e encryption sessions (post-quantum key
+	// exchange) on the window clients. Opportunistic: a provider that does
+	// not support the sessions falls back to plaintext at this layer.
+	PostQuantumEncryption bool
+}
+
+// FixedWindow returns the fixed window type and size when the profile fixes
+// one. ok is false when the profile is nil or auto — the equivalent cases
+// where each window uses its own default size settings and the profile
+// `WindowSize` is ignored.
+func (self *PerformanceProfile) FixedWindow() (windowType WindowType, windowSize WindowSizeSettings, ok bool) {
+	if self == nil || self.WindowType == WindowTypeAuto {
+		return WindowTypeAuto, WindowSizeSettings{}, false
+	}
+	return self.WindowType, self.WindowSize, true
+}
+
+func (self *PerformanceProfile) Validate() error {
+	err := self.WindowSize.Validate()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func DefaultWindowSizeSettings() WindowSizeSettings {
+	return WindowSizeSettings{
+		WindowSizeMin:            1,
+		WindowSizeMax:            1,
+		WindowSizeHardMax:        4,
+		WindowSizeReconnectScale: 1.0,
+		KeepHealthiestCount:      1,
+	}
+}
+
+type receivePacket struct {
+	Source      TransferPath
+	ProvideMode protocol.ProvideMode
+	IpPath      *IpPath
+	Packet      []byte
+	Pooled      bool
+}
+
+type RemoteUserNatMultiClient struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	generator MultiClientGenerator
+
+	receivePacketCallback ReceivePacketFunction
+
+	settings *MultiClientSettings
+	log      Logger
+
+	windows map[WindowType]*multiClientWindow
+	monitor MultiClientMonitor
+
+	securityPolicyStats *SecurityPolicyStatsCollector
+	securityPolicy      SecurityPolicy
+
+	// the provide mode of the source packets
+	// for locally generated packets this is `ProvideMode_Network`
+	provideMode protocol.ProvideMode
+
+	stateLock        sync.Mutex
+	ip4PathUpdates   map[Ip4Path]*multiClientChannelUpdate
+	ip6PathUpdates   map[Ip6Path]*multiClientChannelUpdate
+	affinityIp4Paths map[Ip4Path]map[Ip4Path]time.Time
+	affinityIp6Paths map[Ip6Path]map[Ip6Path]time.Time
+	clientUpdates    map[*multiClientChannel]map[*multiClientChannelUpdate]bool
+
+	// config is an immutable snapshot of the rarely-changed routing config
+	// (performance profile + local security bypass). it is rebuilt under
+	// stateLock by the setters and read lock-free by selectWindowTypes, the
+	// affinity selection, and the SendPacket drop path.
+	config atomic.Pointer[multiClientConfig]
+
+	localUserNat      *LocalUserNat
+	localUserNatUnsub func()
+
+	// nil when `IpAssocSettings` is not set
+	ipAssoc *IpAssoc
+	// immutable snapshot of the compiled overrides, swapped by `SetBlockActionOverrides`
+	blockActionState     atomic.Pointer[blockActionState]
+	blockActionCache     *blockActionCache
+	blockActionCollector *blockActionCollector
+	// immutable snapshot of the compiled ignore host values,
+	// swapped by `SetBlockActionIgnoreHosts`
+	blockActionIgnoreState atomic.Pointer[blockActionIgnoreState]
+	blockActionIgnoreCache *blockActionIgnoreCache
+	// unsubscribe from the current server-name-lookup's learned notifications
+	// (guarded by stateLock); see SetServerNameLookup
+	serverNamesLearnedUnsub func()
+	packetStatsCounters     *packetStatsCounters
+	packetStatsCallbacks    *CallbackList[PacketStatsFunction]
+}
+
+// ServerNameLookup resolves a destination IP to the server name(s) previously observed
+// for it — e.g. a DNS upgrade mux that recorded which hostnames resolved to the IP. The
+// multi-client uses it for ServerName-based path affinity, so flows to the same site
+// share a client channel even when the SNI is not visible on the wire (point 4).
+type ServerNameLookup interface {
+	ServerNames(ip string) []string
+}
+
+// ServerNamesLearnedFunction is called with the ips for which a new server name
+// was just learned.
+type ServerNamesLearnedFunction func(addrs []netip.Addr)
+
+// ServerNamesLearnedNotifier is an optional capability of a ServerNameLookup: it
+// notifies when a new server name is learned for an ip (e.g. an out-of-band DNS
+// resolution after a flow already started). The multi-client uses it to
+// invalidate that ip's cached block-action decision so subsequent block actions
+// report the server name instead of the ip — we prefer the server name wherever
+// possible. A lookup that doesn't implement it simply reconciles on the ttl.
+type ServerNamesLearnedNotifier interface {
+	AddServerNamesLearnedCallback(callback ServerNamesLearnedFunction) func()
+}
+
+type multiClientConfig struct {
+	performanceProfile  *PerformanceProfile
+	localSecurityBypass bool
+	serverNameLookup    ServerNameLookup
+	// the ad/tracker blocker consulted in the egress decision (nil = none)
+	blocker Blocker
+}
+
+func NewRemoteUserNatMultiClientWithDefaults(
+	ctx context.Context,
+	generator MultiClientGenerator,
+	receivePacketCallback ReceivePacketFunction,
+	provideMode protocol.ProvideMode,
+) *RemoteUserNatMultiClient {
+	return NewRemoteUserNatMultiClient(
+		ctx,
+		generator,
+		receivePacketCallback,
+		provideMode,
+		DefaultMultiClientSettings(),
+	)
+}
+
+func NewRemoteUserNatMultiClient(
+	ctx context.Context,
+	generator MultiClientGenerator,
+	receivePacketCallback ReceivePacketFunction,
+	provideMode protocol.ProvideMode,
+	settings *MultiClientSettings,
+) *RemoteUserNatMultiClient {
+	cancelCtx, cancel := context.WithCancel(ctx)
+
+	log := loggerOrDefault(settings.Log)
+
+	securityPolicyStats := DefaultSecurityPolicyStatsCollector()
+
+	localUserNatSettings := DefaultLocalUserNatSettings()
+	// no ulimit for local traffic
+	localUserNatSettings.UdpBufferSettings.UserLimit = 0
+	localUserNatSettings.TcpBufferSettings.UserLimit = 0
+	localUserNatSettings.Log = log
+	localUserNat := NewLocalUserNat(cancelCtx, "multi local", localUserNatSettings)
+
+	multiClient := &RemoteUserNatMultiClient{
+		ctx:                    cancelCtx,
+		cancel:                 cancel,
+		log:                    log,
+		generator:              generator,
+		receivePacketCallback:  receivePacketCallback,
+		settings:               settings,
+		windows:                map[WindowType]*multiClientWindow{},
+		securityPolicyStats:    securityPolicyStats,
+		securityPolicy:         settings.SecurityPolicyGenerator(cancelCtx, securityPolicyStats),
+		provideMode:            provideMode,
+		ip4PathUpdates:         map[Ip4Path]*multiClientChannelUpdate{},
+		ip6PathUpdates:         map[Ip6Path]*multiClientChannelUpdate{},
+		affinityIp4Paths:       map[Ip4Path]map[Ip4Path]time.Time{},
+		affinityIp6Paths:       map[Ip6Path]map[Ip6Path]time.Time{},
+		clientUpdates:          map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
+		localUserNat:           localUserNat,
+		blockActionCache:       newBlockActionCache(settings.BlockActionDecisionTtl, settings.BlockActionDecisionMaxCount),
+		blockActionCollector:   newBlockActionCollector(settings.BlockActionAggMaxCount, log),
+		blockActionIgnoreCache: newBlockActionIgnoreCache(settings.BlockActionDecisionTtl, settings.BlockActionDecisionMaxCount),
+		packetStatsCounters:    &packetStatsCounters{},
+		packetStatsCallbacks:   NewCallbackList[PacketStatsFunction](),
+	}
+	if settings.IpAssocSettings != nil {
+		multiClient.ipAssoc = NewIpAssoc(cancelCtx, settings.IpAssocSettings)
+	}
+	multiClient.config.Store(&multiClientConfig{
+		performanceProfile:  multiClient.overrideAllowDirect(settings.DefaultPerformanceProfile),
+		localSecurityBypass: false,
+		serverNameLookup:    nil,
+		blocker:             nil,
+	})
+	multiClient.blockActionState.Store(&blockActionState{
+		version: 0,
+		matcher: nil,
+	})
+	multiClient.blockActionIgnoreState.Store(&blockActionIgnoreState{
+		version: 0,
+		matcher: nil,
+	})
+
+	multiClient.windows[WindowTypeQuality] = newMultiClientWindow(
+		cancelCtx,
+		cancel,
+		generator,
+		multiClient.clientReceivePacket,
+		multiClient.securityPolicy,
+		multiClient.removeClient,
+		WindowTypeQuality,
+		settings,
+	)
+	if _, fixed := generator.FixedDestinationSize(); !fixed {
+		multiClient.windows[WindowTypeSpeed] = newMultiClientWindow(
+			cancelCtx,
+			cancel,
+			generator,
+			multiClient.clientReceivePacket,
+			multiClient.securityPolicy,
+			multiClient.removeClient,
+			WindowTypeSpeed,
+			settings,
+		)
+	}
+	// else only keep the quality window for fixed destination
+
+	// a trusted same-network peer connection always allows direct (p2p). Force it
+	// onto the fresh windows now so the first channels pick it up even before any
+	// performance profile is set; SetPerformanceProfile keeps it forced thereafter.
+	if provideMode == protocol.ProvideMode_Network {
+		multiClient.SetPerformanceProfile(settings.DefaultPerformanceProfile)
+	}
+
+	multiClient.localUserNatUnsub = localUserNat.AddReceivePacketCallback(multiClient.localReceivePacket)
+
+	monitors := []MultiClientMonitor{}
+	for _, window := range multiClient.windows {
+		monitors = append(monitors, window.monitor)
+	}
+	multiClient.monitor = NewMergedMultiClientMonitor(monitors)
+
+	go HandleError(multiClient.runEventEpoch, cancel)
+
+	return multiClient
+}
+
+// flushes block action and packet stats events to listeners on the event epoch
+func (self *RemoteUserNatMultiClient) runEventEpoch() {
+	defer self.cancel()
+
+	lastPacketStats := PacketStats{}
+	for {
+		select {
+		case <-self.ctx.Done():
+			return
+		case <-time.After(self.settings.EventEpoch):
+		}
+
+		self.blockActionCollector.flush()
+
+		if callbacks := self.packetStatsCallbacks.Get(); 0 < len(callbacks) {
+			packetStats := self.packetStatsCounters.snapshot()
+			if *packetStats != lastPacketStats {
+				lastPacketStats = *packetStats
+				for _, callback := range callbacks {
+					HandleError(func() {
+						callback(packetStats)
+					})
+				}
+			}
+		}
+	}
+}
+
+// the local user nat receive callback. return traffic for locally routed flows
+func (self *RemoteUserNatMultiClient) localReceivePacket(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	packet []byte,
+) {
+	self.packetStatsCounters.localIngressPacketCount.Add(1)
+	self.packetStatsCounters.localIngressByteCount.Add(int64(len(packet)))
+	if self.ipAssoc != nil && !self.blockActionIgnored(ipPath) {
+		// the local user nat delivers the flow's egress-oriented path
+		// (the remote endpoint is the destination)
+		self.ipAssoc.AddEgressPacket(ipPath)
+	}
+	self.receivePacketCallback(source, provideMode, ipPath, packet)
+}
+
+func (self *RemoteUserNatMultiClient) SecurityPolicyStats(reset bool) SecurityPolicyStats {
+	return self.securityPolicyStats.Stats(reset)
+}
+
+func (self *RemoteUserNatMultiClient) Monitor() MultiClientMonitor {
+	return self.monitor
+}
+
+func (self *RemoteUserNatMultiClient) AddContractStatusCallback(contractStatusCallback ContractStatusFunction) func() {
+	subs := []func(){}
+	for _, window := range self.windows {
+		sub := window.AddContractStatusCallback(contractStatusCallback)
+		subs = append(subs, sub)
+	}
+	return func() {
+		for _, sub := range subs {
+			sub()
+		}
+	}
+}
+
+// AddContractStatsCallback registers a listener for the epoch contract stats
+// events of all the window clients (see `ContractManager.AddContractStatsCallback`)
+func (self *RemoteUserNatMultiClient) AddContractStatsCallback(contractStatsCallback ContractStatsFunction) func() {
+	subs := []func(){}
+	for _, window := range self.windows {
+		sub := window.AddContractStatsCallback(contractStatsCallback)
+		subs = append(subs, sub)
+	}
+	return func() {
+		for _, sub := range subs {
+			sub()
+		}
+	}
+}
+
+// AddPeerIdentityChangeCallback registers a listener fired whenever any
+// window client's established + identity-verified peer set may have changed
+// (see `EncryptionSessionManager.AddPeerIdentityChangeCallback`). Consumers
+// re-read `PeerIdentities`.
+func (self *RemoteUserNatMultiClient) AddPeerIdentityChangeCallback(callback func()) func() {
+	subs := []func(){}
+	for _, window := range self.windows {
+		sub := window.AddPeerIdentityChangeCallback(callback)
+		subs = append(subs, sub)
+	}
+	return func() {
+		for _, sub := range subs {
+			sub()
+		}
+	}
+}
+
+// PeerIdentities returns the peers with an established, identity-verified
+// e2e session across all window clients, deduplicated by peer id.
+func (self *RemoteUserNatMultiClient) PeerIdentities() []*PeerIdentity {
+	byPeer := map[Id]*PeerIdentity{}
+	for _, window := range self.windows {
+		for _, clientChannel := range window.unorderedClients() {
+			for _, peerIdentity := range clientChannel.client.EncryptionSessionManager().PeerIdentities() {
+				if _, ok := byPeer[peerIdentity.PeerId]; !ok {
+					byPeer[peerIdentity.PeerId] = peerIdentity
+				}
+			}
+		}
+	}
+	out := make([]*PeerIdentity, 0, len(byPeer))
+	for _, peerIdentity := range byPeer {
+		out = append(out, peerIdentity)
+	}
+	return out
+}
+
+// overrideAllowDirect applies the allow-direct override chain to the
+// profile. A trusted same-network peer connection (provide mode Network)
+// always enables direct mode, superseding the profile, so the connection can
+// upgrade to a direct p2p stream. An explicit `settings.OverrideAllowDirect`
+// then supersedes everything — false is the cloud-hosted hard limit (a
+// direct connection would leak that the client is hosted and where), true
+// forces direct mode on regardless of the profile.
+func (self *RemoteUserNatMultiClient) overrideAllowDirect(performanceProfile *PerformanceProfile) *PerformanceProfile {
+	if self.provideMode == protocol.ProvideMode_Network {
+		performanceProfile = forceAllowDirect(performanceProfile, true)
+	}
+	if self.settings.OverrideAllowDirect != nil {
+		performanceProfile = forceAllowDirect(performanceProfile, *self.settings.OverrideAllowDirect)
+	}
+	return performanceProfile
+}
+
+// forceAllowDirect returns a profile with `AllowDirect` forced to the value,
+// fabricating a profile when forcing on with none set. The input profile is
+// never mutated in place.
+func forceAllowDirect(performanceProfile *PerformanceProfile, allowDirect bool) *PerformanceProfile {
+	if performanceProfile == nil {
+		if !allowDirect {
+			// direct mode is already off with no profile
+			return nil
+		}
+		return &PerformanceProfile{
+			WindowType:  WindowTypeQuality,
+			WindowSize:  DefaultWindowSizeSettings(),
+			AllowDirect: true,
+		}
+	}
+	if performanceProfile.AllowDirect == allowDirect {
+		return performanceProfile
+	}
+	overridden := *performanceProfile
+	overridden.AllowDirect = allowDirect
+	return &overridden
+}
+
+func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *PerformanceProfile) {
+	performanceProfile = self.overrideAllowDirect(performanceProfile)
+	if performanceProfile != nil {
+		err := performanceProfile.Validate()
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+
+		// rebuild the immutable config snapshot under the lock so concurrent
+		// setters do not lose each other's field
+		prev := self.config.Load()
+		self.config.Store(&multiClientConfig{
+			performanceProfile:  performanceProfile,
+			localSecurityBypass: prev.localSecurityBypass,
+			serverNameLookup:    prev.serverNameLookup,
+			blocker:             prev.blocker,
+		})
+	}()
+	for _, window := range self.windows {
+		window.SetPerformanceProfile(performanceProfile)
+		// reset the window
+		window.shuffle()
+	}
+}
+
+func (self *RemoteUserNatMultiClient) SetLocalSecurityBypass(localSecurityBypass bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	prev := self.config.Load()
+	self.config.Store(&multiClientConfig{
+		performanceProfile:  prev.performanceProfile,
+		localSecurityBypass: localSecurityBypass,
+		serverNameLookup:    prev.serverNameLookup,
+		blocker:             prev.blocker,
+	})
+}
+
+// SetServerNameLookup installs (or clears, with nil) the ServerNameLookup used for
+// ServerName-based path affinity. Safe to call at runtime.
+func (self *RemoteUserNatMultiClient) SetServerNameLookup(serverNameLookup ServerNameLookup) {
+	var prevUnsub func()
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		prev := self.config.Load()
+		self.config.Store(&multiClientConfig{
+			performanceProfile:  prev.performanceProfile,
+			localSecurityBypass: prev.localSecurityBypass,
+			serverNameLookup:    serverNameLookup,
+			blocker:             prev.blocker,
+		})
+		// re-subscribe to server-name-learned notifications: a name learned for an
+		// ip invalidates that ip's cached block-action decisions so they re-resolve
+		// with the server name. A lookup that doesn't notify just reconciles on the
+		// ttl.
+		prevUnsub = self.serverNamesLearnedUnsub
+		self.serverNamesLearnedUnsub = nil
+		if notifier, ok := serverNameLookup.(ServerNamesLearnedNotifier); ok {
+			self.serverNamesLearnedUnsub = notifier.AddServerNamesLearnedCallback(self.invalidateServerNames)
+		}
+	}()
+	if prevUnsub != nil {
+		prevUnsub()
+	}
+	if self.ipAssoc != nil {
+		self.ipAssoc.SetServerNameLookup(serverNameLookup)
+	}
+	// full reset on install: the new lookup may report different names. (Ongoing
+	// single-name learns are handled incrementally by invalidateServerNames.)
+	self.blockActionCache.clear()
+	self.blockActionIgnoreCache.clear()
+}
+
+// invalidateServerNames drops the cached block-action decisions for the given
+// ips, so the next flow to each rebuilds its decision and re-resolves the server
+// name(s) — reporting the server name instead of the ip going forward. A cached
+// decision unions server names over the destination's entire cluster, so the
+// learned ip's cluster siblings are invalidated too: their cached decisions
+// would otherwise keep reporting without the newly learned name until the ttl.
+// Wired to the server-name lookup's learned notifications in SetServerNameLookup.
+func (self *RemoteUserNatMultiClient) invalidateServerNames(addrs []netip.Addr) {
+	for _, addr := range addrs {
+		// the caches key on the unmapped addr (ipAssocAddr)
+		key := addr.Unmap()
+		self.blockActionCache.delete(key)
+		self.blockActionIgnoreCache.delete(key)
+		if self.ipAssoc != nil {
+			for _, member := range self.ipAssoc.GetClusterAddrs(key) {
+				memberKey := member.Unmap()
+				if memberKey != key {
+					self.blockActionCache.delete(memberKey)
+					self.blockActionIgnoreCache.delete(memberKey)
+				}
+			}
+		}
+	}
+}
+
+// SetBlocker installs (or clears, with nil) the ad/tracker Blocker consulted
+// in the egress decision: a destination is blocked when its ip falls in the
+// blocker's ranges or any of its own observed server names is a blocked
+// hostname. the check is destination scoped — deliberately not extended over
+// the IpAssoc cluster, which would over-block co-clustered infrastructure.
+// user overrides take precedence: an un-blocked blocker match egresses
+// remotely as normal. enabling/disabling happens on the blocker itself and
+// takes effect immediately (cached decisions revalidate against the enabled
+// state). safe to call at runtime.
+func (self *RemoteUserNatMultiClient) SetBlocker(blocker Blocker) {
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		prev := self.config.Load()
+		self.config.Store(&multiClientConfig{
+			performanceProfile:  prev.performanceProfile,
+			localSecurityBypass: prev.localSecurityBypass,
+			serverNameLookup:    prev.serverNameLookup,
+			blocker:             blocker,
+		})
+	}()
+	self.blockActionCache.clear()
+}
+
+func (self *RemoteUserNatMultiClient) LocalSecurityBypass() bool {
+	return self.config.Load().localSecurityBypass
+}
+
+// ordered by choice descending
+func (self *RemoteUserNatMultiClient) selectWindowTypes(sendPacket *parsedPacket) []WindowType {
+	// - web traffic is routed to quality providers
+	// - all other traffic is routed to speed providers
+
+	if _, fixed := self.generator.FixedDestinationSize(); fixed {
+		return []WindowType{WindowTypeQuality}
+	}
+
+	if windowType, _, ok := self.config.Load().performanceProfile.FixedWindow(); ok {
+		return []WindowType{windowType}
+	} else {
+		if sendPacket.ipPath.DestinationPort == 443 {
+			return []WindowType{WindowTypeQuality, WindowTypeSpeed}
+		}
+		return []WindowType{WindowTypeSpeed, WindowTypeQuality}
+	}
+}
+
+// called with stateLock
+func (self *RemoteUserNatMultiClient) affinityIpPathsWithLock(ipPath *IpPath) (affinityPaths []*IpPath) {
+	config := self.config.Load()
+
+	singleIp := false
+	if _, windowSize, ok := config.performanceProfile.FixedWindow(); ok {
+		singleIp = (windowSize.FixedWindowSize == 1)
+	}
+
+	if singleIp {
+		singlePath := &IpPath{
+			Version: ipPath.Version,
+		}
+		affinityPaths = append(affinityPaths, singlePath)
+	} else {
+		var serverNames []string
+		// resolve the destination IP to the server name(s) observed for it (e.g. by a
+		// DNS upgrade mux), giving ServerName path affinity without parsing the SNI off
+		// the wire. affinity is by the base domain — a.foo.com, b.c.foo.com and foo.com
+		// all collapse to foo.com — so a site's flows pin to one client channel.
+		if config.serverNameLookup != nil && ipPath.DestinationIp != nil {
+			serverNames = config.serverNameLookup.ServerNames(ipPath.DestinationIp.String())
+		}
+
+		if 0 < len(serverNames) {
+			seen := map[string]bool{}
+			for _, serverName := range serverNames {
+				affinityName := serverName
+				if rootDomain, err := publicsuffix.EffectiveTLDPlusOne(serverName); err == nil {
+					affinityName = rootDomain
+				}
+				if seen[affinityName] {
+					continue
+				}
+				seen[affinityName] = true
+				affinityPaths = append(affinityPaths, &IpPath{
+					ServerName: affinityName,
+				})
+			}
+		} else if ipPath.DestinationPort == 80 || ipPath.DestinationPort == 53 || ipPath.DestinationPort == 443 {
+			// for these ports, cycle the path per destination ip/port, regardless of protocol
+			destinationPath := &IpPath{
+				Version:         ipPath.Version,
+				DestinationIp:   ipPath.DestinationIp,
+				DestinationPort: ipPath.DestinationPort,
+			}
+			affinityPaths = append(affinityPaths, destinationPath)
+		} else if ipPath.DestinationPort < 1024 {
+			// for these ports, cycle the path per destination port, regardless of protocol or ip
+			destinationPortPath := &IpPath{
+				Version:         ipPath.Version,
+				DestinationPort: ipPath.DestinationPort,
+			}
+			affinityPaths = append(affinityPaths, destinationPortPath)
+		} else {
+			// for user space ports, use a single path, regardless of protocol, ip, or port
+			singlePath := &IpPath{
+				Version: ipPath.Version,
+			}
+			affinityPaths = append(affinityPaths, singlePath)
+		}
+	}
+
+	return
+}
+
+func (self *RemoteUserNatMultiClient) sendClientPath(ipPath *IpPath, callback func(*multiClientChannelUpdate, *multiClientChannel)) {
+	update, previousClient, currentClient := self.sendUpdate(ipPath)
+	callback(update, currentClient)
+
+	// fast path: if the flow's client did not change during the callback, no
+	// clientUpdates bookkeeping is needed, so skip the parent lock entirely
+	// (client is atomic). this is the steady-state egress path.
+	if previousClient == update.client.Load() {
+		return
+	}
+
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+
+		// re-read under the lock (the lock-free check above can race a
+		// concurrent client change)
+		client := update.client.Load()
+
+		if previousClient != client {
+			if previousClient != nil {
+				if updates, ok := self.clientUpdates[previousClient]; ok {
+					delete(updates, update)
+					if len(updates) == 0 {
+						delete(self.clientUpdates, previousClient)
+					}
+				}
+			}
+			if client != nil && !client.IsDone() {
+				updates, ok := self.clientUpdates[client]
+				if !ok {
+					updates = map[*multiClientChannelUpdate]bool{}
+					self.clientUpdates[client] = updates
+				}
+				updates[update] = true
+			}
+		}
+	}()
+}
+
+// waitForIdleUpdate blocks until the flow update has been idle for
+// SequenceIdleTimeout, or the update ctx is done. it runs only inside the
+// per-flow teardown goroutine; hoisted out of sendUpdate (rather than an inline
+// closure) so the per-packet steady-state path does not allocate it.
+func (self *RemoteUserNatMultiClient) waitForIdleUpdate(update *multiClientChannelUpdate) {
+	for {
+		select {
+		case <-update.ctx.Done():
+			return
+		default:
+		}
+
+		var idleTimeout time.Duration
+		func() {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+
+			idleTimeout = update.activityTime.Add(self.settings.SequenceIdleTimeout).Sub(time.Now())
+		}()
+		if idleTimeout <= 0 {
+			return
+		} else {
+			select {
+			case <-update.ctx.Done():
+				return
+			case <-time.After(idleTimeout):
+			}
+		}
+	}
+}
+
+// rstFlow sends a reset to both ends of a flow being torn down. like
+// waitForIdleUpdate it runs only in the teardown goroutine and is a method, not
+// an inline closure, to avoid a per-packet allocation in sendUpdate.
+func (self *RemoteUserNatMultiClient) rstFlow(ipPath *IpPath, client *multiClientChannel) {
+	if client != nil {
+		// rst to destination
+		if packet, ok := ipOosRst(ipPath); ok {
+			client.Send(&parsedPacket{
+				packet: packet,
+				ipPath: ipPath,
+			}, 0)
+		}
+	}
+	// rst to source
+	if packet, ok := ipOosRst(ipPath.Reverse()); ok {
+		self.receivePacketCallback(TransferPath{}, protocol.ProvideMode_Network, ipPath, packet)
+	}
+}
+
+// returns the flow's update, the client it was previously associated with (for
+// the caller's `clientUpdates` bookkeeping), and the current client to send to.
+// the current client is read here under the parent lock that is already held,
+// so the egress hot path does not reacquire the parent lock to read it.
+func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
+	*multiClientChannelUpdate,
+	*multiClientChannel,
+	*multiClientChannel,
+) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	switch ipPath.Version {
+	case 4:
+		ip4Path := ipPath.ToIp4Path()
+		var previousClient *multiClientChannel
+		update, ok := self.ip4PathUpdates[ip4Path]
+		if !ok || update.IsDone() {
+			update = newMultiClientChannelUpdate(self.ctx, ipPath)
+			go HandleError(func() {
+				defer update.cancel()
+
+				var client *multiClientChannel
+				for {
+					self.waitForIdleUpdate(update)
+
+					success := func() bool {
+						self.stateLock.Lock()
+						defer self.stateLock.Unlock()
+
+						updateDone := update.IsDone()
+						if !updateDone {
+							if t := update.activityTime.Add(self.settings.SequenceIdleTimeout).Sub(time.Now()); 0 < t {
+								// updated since wait for idle
+								return false
+							}
+						}
+
+						client = update.client.Load()
+						update.client.Store(nil)
+
+						delete(self.ip4PathUpdates, ip4Path)
+
+						for affinityIp4Path, _ := range update.affinityIp4Paths {
+							if paths, ok := self.affinityIp4Paths[affinityIp4Path]; ok {
+								delete(paths, ip4Path)
+								if len(paths) == 0 {
+									delete(self.affinityIp4Paths, affinityIp4Path)
+								}
+							}
+						}
+
+						if client != nil {
+							if updates, ok := self.clientUpdates[client]; ok {
+								delete(updates, update)
+								if len(updates) == 0 {
+									delete(self.clientUpdates, client)
+								}
+							}
+						}
+						return true
+					}()
+
+					if success {
+						break
+					}
+				}
+
+				select {
+				case <-self.ctx.Done():
+				case <-update.ctx.Done():
+				default:
+					self.rstFlow(ipPath, client)
+				}
+			}, update.cancel)
+			self.ip4PathUpdates[ip4Path] = update
+
+			var affinityIpPaths []*IpPath
+			if self.settings.DestinationAffinity {
+				affinityIpPaths = self.affinityIpPathsWithLock(ipPath)
+			}
+
+			for _, affinityIpPath := range affinityIpPaths {
+				affinityIp4Path := affinityIpPath.ToIp4Path()
+				update.affinityIp4Paths[affinityIp4Path] = true
+				paths, ok := self.affinityIp4Paths[affinityIp4Path]
+				if !ok {
+					paths = map[Ip4Path]time.Time{}
+					self.affinityIp4Paths[affinityIp4Path] = paths
+				}
+				paths[ip4Path] = time.Now()
+
+				if update.client.Load() == nil {
+					var mostRecentCreateTime time.Time
+					for copyIp4Path, createTime := range paths {
+						if copyUpdate, ok := self.ip4PathUpdates[copyIp4Path]; ok {
+							if c := copyUpdate.client.Load(); c != nil && !c.IsDone() && !c.isWarning() && createTime.After(mostRecentCreateTime) {
+								mostRecentCreateTime = createTime
+								update.client.Store(c)
+							}
+						}
+					}
+				}
+			}
+		} else {
+			previousClient = update.client.Load()
+		}
+
+		update.activityTime = time.Now()
+		return update, previousClient, update.client.Load()
+	case 6:
+		ip6Path := ipPath.ToIp6Path()
+		var previousClient *multiClientChannel
+		update, ok := self.ip6PathUpdates[ip6Path]
+		if !ok || update.IsDone() {
+			update = newMultiClientChannelUpdate(self.ctx, ipPath)
+			go HandleError(func() {
+				defer update.cancel()
+
+				var client *multiClientChannel
+				for {
+					self.waitForIdleUpdate(update)
+
+					success := func() bool {
+						self.stateLock.Lock()
+						defer self.stateLock.Unlock()
+
+						updateDone := update.IsDone()
+						if !updateDone {
+							if t := update.activityTime.Add(self.settings.SequenceIdleTimeout).Sub(time.Now()); 0 < t {
+								// updated since wait for idle
+								return false
+							}
+						}
+
+						client = update.client.Load()
+						update.client.Store(nil)
+
+						delete(self.ip6PathUpdates, ip6Path)
+
+						for affinityIp6Path, _ := range update.affinityIp6Paths {
+							if paths, ok := self.affinityIp6Paths[affinityIp6Path]; ok {
+								delete(paths, ip6Path)
+								if len(paths) == 0 {
+									delete(self.affinityIp6Paths, affinityIp6Path)
+								}
+							}
+						}
+
+						if client != nil {
+							if updates, ok := self.clientUpdates[client]; ok {
+								delete(updates, update)
+								if len(updates) == 0 {
+									delete(self.clientUpdates, client)
+								}
+							}
+						}
+						return true
+					}()
+
+					if success {
+						break
+					}
+				}
+
+				select {
+				case <-self.ctx.Done():
+				case <-update.ctx.Done():
+				default:
+					self.rstFlow(ipPath, client)
+				}
+			}, update.cancel)
+			self.ip6PathUpdates[ip6Path] = update
+
+			var affinityIpPaths []*IpPath
+			if self.settings.DestinationAffinity {
+				affinityIpPaths = self.affinityIpPathsWithLock(ipPath)
+			}
+
+			for _, affinityIpPath := range affinityIpPaths {
+				affinityIp6Path := affinityIpPath.ToIp6Path()
+				update.affinityIp6Paths[affinityIp6Path] = true
+				paths, ok := self.affinityIp6Paths[affinityIp6Path]
+				if !ok {
+					paths = map[Ip6Path]time.Time{}
+					self.affinityIp6Paths[affinityIp6Path] = paths
+				}
+				paths[ip6Path] = time.Now()
+
+				if update.client.Load() == nil {
+					var mostRecentCreateTime time.Time
+					for copyIp6Path, createTime := range paths {
+						if copyUpdate, ok := self.ip6PathUpdates[copyIp6Path]; ok {
+							if c := copyUpdate.client.Load(); c != nil && !c.IsDone() && !c.isWarning() && createTime.After(mostRecentCreateTime) {
+								mostRecentCreateTime = createTime
+								update.client.Store(c)
+							}
+						}
+					}
+				}
+			}
+		} else {
+			previousClient = update.client.Load()
+		}
+
+		update.activityTime = time.Now()
+		return update, previousClient, update.client.Load()
+	default:
+		panic(fmt.Errorf("Bad protocol version %d", ipPath.Version))
+	}
+}
+
+func (self *RemoteUserNatMultiClient) receiveClientPath(ipPath *IpPath, callback func(*multiClientChannelUpdate)) bool {
+	update := self.receiveUpdate(ipPath)
+	if update == nil {
+		return false
+	}
+	callback(update)
+	return true
+}
+
+func (self *RemoteUserNatMultiClient) receiveUpdate(ipPath *IpPath) *multiClientChannelUpdate {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	switch ipPath.Version {
+	case 4:
+		ip4Path := ipPath.ToIp4Path()
+		update := self.ip4PathUpdates[ip4Path]
+		if update != nil {
+			update.activityTime = time.Now()
+			return update
+		}
+	case 6:
+		ip6Path := ipPath.ToIp6Path()
+		update := self.ip6PathUpdates[ip6Path]
+		if update != nil {
+			update.activityTime = time.Now()
+			return update
+		}
+	default:
+		panic(fmt.Errorf("Bad protocol version %d", ipPath.Version))
+	}
+
+	return nil
+}
+
+/*
+func (self *RemoteUserNatMultiClient) updateClient(update *multiClientChannelUpdate, previousClient *multiClientChannel) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	client := update.client
+
+	if previousClient != client {
+		if previousClient != nil {
+			if updates, ok := self.clientUpdates[previousClient]; ok {
+				delete(updates, update)
+				if len(updates) == 0 {
+					delete(self.clientUpdates, previousClient)
+				}
+			}
+		}
+		if client != nil && !client.IsDone() {
+			updates, ok := self.clientUpdates[client]
+			if !ok {
+				updates = map[*multiClientChannelUpdate]bool{}
+				self.clientUpdates[client] = updates
+			}
+			updates[update] = true
+		}
+	}
+}
+*/
+
+// remove a client from all updates
+func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
+	rstPackets := []*receivePacket{}
+
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+
+		// note client must be marked as done, otherwise it may be re-added by updates in flight
+		if !client.IsDone() {
+			self.log.Errorf("[multi]removed client that is not marked as done. This might lead to memory leak.")
+		}
+
+		if updates, ok := self.clientUpdates[client]; ok {
+			delete(self.clientUpdates, client)
+			for update, _ := range updates {
+				if update.client.Load() == client {
+					update.client.Store(nil)
+
+					if packet, ok := ipOosRst(update.ipPath.Reverse()); ok {
+						rstPacket := &receivePacket{
+							Source:      TransferPath{},
+							ProvideMode: protocol.ProvideMode_Network,
+							IpPath:      update.ipPath,
+							Packet:      packet,
+						}
+						rstPackets = append(rstPackets, rstPacket)
+					}
+				} else {
+					self.log.Errorf("[multi]update associated with incorrect client")
+				}
+			}
+		}
+	}()
+
+	select {
+	case <-self.ctx.Done():
+	default:
+		for _, p := range rstPackets {
+			self.receivePacketCallback(p.Source, p.ProvideMode, p.IpPath, p.Packet)
+		}
+	}
+}
+
+// `SendPacketFunction`
+func (self *RemoteUserNatMultiClient) SendPacket(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	packet []byte,
+	timeout time.Duration,
+) bool {
+	relationship := egressRelationship(provideMode, self.provideMode)
+
+	ipPath, payload, err := ParseIpPathWithPayload(packet)
+	if err != nil {
+		self.log.Infof("[multi]send bad packet = %s\n", err)
+		return false
+	}
+	r, err := self.securityPolicy.InspectEgress(relationship, ipPath, payload)
+	if err != nil {
+		self.log.Infof("[multi]send bad packet = %s\n", err)
+		return false
+	}
+	// refresh the flow's activity on the send direction (keeps a download-heavy flow alive)
+	self.securityPolicy.RefreshEgress(ipPath)
+
+	// infrastructure destinations (the resolver endpoints) are excluded
+	// from the association and override logic
+	ignored := self.blockActionIgnored(ipPath)
+
+	if !ignored && self.ipAssoc != nil {
+		self.ipAssoc.AddEgressPacket(ipPath)
+	}
+
+	if r != SecurityPolicyResultAllow && r != SecurityPolicyResultDrop {
+		// incident (martian/malformed). always blocked, not overridable
+		if self.log.V(1).Enabled() {
+			self.log.Infof("[multi]drop packet ipv%d p%v -> %s:%d\n", ipPath.Version, ipPath.Protocol, ipPath.DestinationIp, ipPath.DestinationPort)
+		}
+	}
+
+	// the overrides take precedence over the default decisions (the security
+	// result and the ad/tracker blocker)
+	blockActionState := self.blockActionState.Load()
+	config := self.config.Load()
+	blockerActive := config.blocker != nil && config.blocker.Enabled()
+	var decision *blockActionDecision
+	if !ignored && (blockActionState.matcher != nil || self.blockActionCollector.hasCallbacks() || blockerActive) {
+		decision = self.blockActionDecision(blockActionState, config.blocker, blockerActive, ipPath)
+	}
+	var match *blockActionMatch
+	blockerBlock := false
+	if decision != nil {
+		match = decision.match
+		blockerBlock = decision.blockerBlock
+	}
+	block, local := blockActionApply(r, config.localSecurityBypass, blockerBlock, match)
+
+	byteCount := ByteCount(len(packet))
+	if decision != nil && self.blockActionCollector.hasCallbacks() {
+		self.blockActionCollector.add(decision, block, local, match, byteCount)
+	}
+
+	if block {
+		self.packetStatsCounters.blockEgressPacketCount.Add(1)
+		self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
+		return false
+	}
+	if local {
+		success := self.localUserNat.SendPacket(source, provideMode, packet, 0)
+		if success {
+			self.packetStatsCounters.localEgressPacketCount.Add(1)
+			self.packetStatsCounters.localEgressByteCount.Add(int64(byteCount))
+		}
+		return success
+	}
+	parsedPacket := &parsedPacket{
+		packet:  packet,
+		ipPath:  ipPath,
+		payload: payload,
+	}
+	success := self.sendPacket(source, provideMode, parsedPacket, timeout)
+	if success {
+		self.packetStatsCounters.remoteEgressPacketCount.Add(1)
+		self.packetStatsCounters.remoteEgressByteCount.Add(int64(byteCount))
+	}
+	return success
+}
+
+// the cached override match, blocker match, and server names for a
+// destination. the external lookups (server names, cluster) run outside the
+// cache lock
+func (self *RemoteUserNatMultiClient) blockActionDecision(state *blockActionState, blocker Blocker, blockerActive bool, ipPath *IpPath) *blockActionDecision {
+	addr, ok := ipAssocAddr(ipPath.DestinationIp)
+	if !ok {
+		return nil
+	}
+
+	var clusterVersion uint64
+	if self.ipAssoc != nil {
+		clusterVersion = self.ipAssoc.ClusterVersion()
+	}
+	now := time.Now()
+
+	if decision := self.blockActionCache.get(addr, state.version, clusterVersion, blockerActive, now); decision != nil {
+		return decision
+	}
+
+	// decisions are made on the cluster level.
+	// a destination with no cluster is a cluster of itself
+	clusterIps := []netip.Addr{addr}
+	if self.ipAssoc != nil {
+		if members := self.ipAssoc.GetClusterAddrs(addr); 0 < len(members) {
+			clusterIps = members
+		}
+	}
+	slices.SortFunc(clusterIps, func(a netip.Addr, b netip.Addr) int {
+		return a.Compare(b)
+	})
+
+	decision := &blockActionDecision{
+		overridesVersion: state.version,
+		clusterVersion:   clusterVersion,
+		blockerEnabled:   blockerActive,
+		expireTime:       now.Add(self.blockActionCache.ttl),
+		clusterKey:       clusterIps[0],
+		clusterIps:       clusterIps,
+	}
+	var match *blockActionMatch
+	if state.matcher != nil {
+		match = &blockActionMatch{}
+	}
+	destSeen := false
+	seenHosts := map[string]bool{}
+	for _, member := range clusterIps {
+		memberServerNames := self.serverNames(member)
+		for _, serverName := range memberServerNames {
+			if !seenHosts[serverName] {
+				seenHosts[serverName] = true
+				decision.clusterHosts = append(decision.clusterHosts, serverName)
+			}
+		}
+		if match != nil {
+			// the match extends over the destination's entire cluster
+			state.matcher.matchAddr(match, member, memberServerNames)
+		}
+		if blockerActive && member == addr {
+			// the blocker matches the destination itself: its ip and its own
+			// observed server names, never the cluster's (over-blocking
+			// co-clustered infrastructure would break sites)
+			destSeen = true
+			decision.blockerBlock = blockerCheck(blocker, addr, memberServerNames)
+		}
+	}
+	if blockerActive && !destSeen {
+		decision.blockerBlock = blockerCheck(blocker, addr, self.serverNames(addr))
+	}
+	if match != nil && match.any() {
+		decision.match = match
+	}
+	self.blockActionCache.put(addr, decision)
+	return decision
+}
+
+// blockerCheck is the destination-scoped blocker match: the destination ip
+// against the blocked ranges, and each of the destination's own observed
+// server names against the blocked host set.
+func blockerCheck(blocker Blocker, addr netip.Addr, serverNames []string) bool {
+	if blocker.BlockIp(addr) {
+		return true
+	}
+	for _, serverName := range serverNames {
+		if blocker.BlockHost(serverName) {
+			return true
+		}
+	}
+	return false
+}
+
+func (self *RemoteUserNatMultiClient) serverNames(addr netip.Addr) []string {
+	config := self.config.Load()
+	if config.serverNameLookup == nil {
+		return nil
+	}
+	return config.serverNameLookup.ServerNames(addr.String())
+}
+
+// SetBlockActionOverrides replaces the override rules.
+// overrides take precedence over the default security and local routing decisions.
+// safe to call at runtime
+func (self *RemoteUserNatMultiClient) SetBlockActionOverrides(overrides []*BlockActionOverride) {
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		prev := self.blockActionState.Load()
+		self.blockActionState.Store(&blockActionState{
+			version: prev.version + 1,
+			matcher: newBlockActionMatcher(overrides),
+		})
+	}()
+	self.blockActionCache.clear()
+}
+
+// SetBlockActionIgnoreHosts replaces the host values (hostnames and ips, in
+// the same forms as `BlockActionOverride.Hosts`) excluded from the override
+// and association logic. used for infrastructure destinations like the dns
+// resolver endpoints, which must never be captured by user override rules or
+// cluster with user traffic. the default security and routing decisions and
+// the packet stats still apply to ignored destinations, but no block actions
+// are surfaced for them. safe to call at runtime.
+// the hard coded remote doh resolver ips are always excluded in addition to
+// these host values (see `defaultRemoteDohIgnoreAddrs`).
+func (self *RemoteUserNatMultiClient) SetBlockActionIgnoreHosts(hostValues []string) {
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		prev := self.blockActionIgnoreState.Load()
+		var matcher *blockActionMatcher
+		if 0 < len(hostValues) {
+			matcher = newBlockActionMatcher([]*BlockActionOverride{{
+				Hosts:         hostValues,
+				BlockOverride: &BlockOverride{},
+			}})
+		}
+		self.blockActionIgnoreState.Store(&blockActionIgnoreState{
+			version: prev.version + 1,
+			matcher: matcher,
+		})
+	}()
+	self.blockActionIgnoreCache.clear()
+}
+
+// blockActionIgnored returns whether the destination is excluded from the
+// override and association logic. the result is cached per destination.
+// the hard coded remote doh resolver ips are always excluded (see
+// `defaultRemoteDohIgnoreAddrs`), independent of `SetBlockActionIgnoreHosts`.
+func (self *RemoteUserNatMultiClient) blockActionIgnored(ipPath *IpPath) bool {
+	addr, ok := ipAssocAddr(ipPath.DestinationIp)
+	if !ok {
+		return false
+	}
+	if defaultRemoteDohIgnoreAddrs()[addr] {
+		return true
+	}
+	state := self.blockActionIgnoreState.Load()
+	if state.matcher == nil {
+		return false
+	}
+	now := time.Now()
+	if entry := self.blockActionIgnoreCache.get(addr, state.version, now); entry != nil {
+		return entry.ignored
+	}
+	match := &blockActionMatch{}
+	state.matcher.matchAddr(match, addr, self.serverNames(addr))
+	entry := &blockActionIgnoreEntry{
+		ignored:    match.any(),
+		version:    state.version,
+		expireTime: now.Add(self.blockActionIgnoreCache.ttl),
+	}
+	self.blockActionIgnoreCache.put(addr, entry)
+	return entry.ignored
+}
+
+// AddBlockActionCallback registers a listener for the epoch block action events.
+// all egress routing decisions are surfaced, deduplicated per destination per epoch
+func (self *RemoteUserNatMultiClient) AddBlockActionCallback(blockActionCallback BlockActionFunction) func() {
+	return self.blockActionCollector.addCallback(blockActionCallback)
+}
+
+// PacketStats returns the cumulative packet counts by route
+func (self *RemoteUserNatMultiClient) PacketStats() *PacketStats {
+	return self.packetStatsCounters.snapshot()
+}
+
+// AddPacketStatsCallback registers a listener fired on the event epoch when the
+// packet stats change
+func (self *RemoteUserNatMultiClient) AddPacketStatsCallback(packetStatsCallback PacketStatsFunction) func() {
+	callbackId := self.packetStatsCallbacks.Add(packetStatsCallback)
+	return func() {
+		self.packetStatsCallbacks.Remove(callbackId)
+	}
+}
+
+func (self *RemoteUserNatMultiClient) canSendPacket(sendPacket *parsedPacket, update *multiClientChannelUpdate) (allow bool) {
+	ipPath := sendPacket.ipPath
+	switch ipPath.Protocol {
+	case IpProtocolTcp:
+		if self.settings.TcpCollapsePrevention {
+			// limit sender tcp collapse
+			// as soon as a packet is sent to a client, either the client will eith reliabily transfer the packet,
+			// or the client will be dropped
+			// retransmits don't need to be sent as soon as the packet is committed to a client
+			if ipPath.Syn || ipPath.Rst {
+				allow = true
+			} else if update.canUpdateSequence(sendPacket) {
+				// sequence state is guarded by the per-flow `stateLock`, not
+				// the parent `stateLock`
+				allow = true
+			}
+		} else {
+			allow = true
+		}
+	default:
+		allow = true
+	}
+	return
+}
+
+func (self *RemoteUserNatMultiClient) sendPacket(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	sendPacket *parsedPacket,
+	timeout time.Duration,
+) (success bool) {
+	ipPath := sendPacket.ipPath
+	self.sendClientPath(ipPath, func(update *multiClientChannelUpdate, currentClient *multiClientChannel) {
+		if !self.canSendPacket(sendPacket, update) {
+			return
+		}
+
+		enterTime := time.Now()
+
+		if ipPath.Syn || ipPath.Rst {
+			// sequence state is guarded by the per-flow `stateLock`
+			update.resetSequence(sendPacket)
+		}
+
+		// `currentClient` is the client snapshot read by `sendClientPath` under
+		// the parent lock it already held, so the steady-state send no longer
+		// takes the parent lock again just to read `update.client`.
+		for client := currentClient; client != nil; {
+			var err error
+			success, err = client.SendDetailed(sendPacket, timeout)
+			if success {
+				// sequence state is guarded by the per-flow `stateLock`
+				update.updateSequence(sendPacket)
+			} else if err != nil {
+				// reset the path
+
+				self.log.Infof("[multi]reset error = %s\n", err)
+
+				update.client.Store(nil)
+
+				rstPackets := []*receivePacket{}
+
+				if packet, ok := ipOosRst(update.ipPath.Reverse()); ok {
+					rstPacket := &receivePacket{
+						Source:      TransferPath{},
+						ProvideMode: protocol.ProvideMode_Network,
+						IpPath:      update.ipPath,
+						Packet:      packet,
+					}
+					rstPackets = append(rstPackets, rstPacket)
+				}
+
+				select {
+				case <-self.ctx.Done():
+				default:
+					for _, p := range rstPackets {
+						self.receivePacketCallback(p.Source, p.ProvideMode, p.IpPath, p.Packet)
+					}
+				}
+			}
+			// else the packet was dropped due to backpressure
+			// keep sending to the client until there is an error
+			return
+		}
+
+		// find a new client
+		// the race is between as many clients as can send in parallel
+
+		// if _, fixed := self.generator.FixedDestinationSize(); fixed {
+		// 	window := self.windows[WindowTypeQuality]
+		// 	orderedClients := window.OrderedClients()
+
+		// 	for _, client := range orderedClients {
+		// 		if client.Send(sendPacket, timeout) {
+		// 			success = true
+
+		// 			func() {
+		// 				self.stateLock.Lock()
+		// 				defer self.stateLock.Unlock()
+
+		// 				update.client = client
+		// 			}()
+		// 		}
+		// 	}
+
+		// 	return
+		// }
+
+		raceClients := func(orderedClients []*multiClientChannel, sendTimeout time.Duration) {
+			switch len(orderedClients) {
+			case 0:
+				return
+			case 1:
+				// send to one client, no race
+				client := orderedClients[0]
+				if client.Send(sendPacket, sendTimeout) {
+					success = true
+
+					// client is atomic; lock-free store
+					update.client.Store(client)
+				}
+				return
+
+			default:
+
+				defer func() {
+					if success {
+						MessagePoolReturn(sendPacket.packet)
+					}
+				}()
+
+				var successCount atomic.Int32
+
+				send := func(client *multiClientChannel) {
+					select {
+					case <-update.ctx.Done():
+						return
+					default:
+					}
+
+					if update.client.Load() != nil {
+						// another client already chosen, done
+						return
+					}
+
+					p := &parsedPacket{
+						packet: MessagePoolShareReadOnly(sendPacket.packet),
+						ipPath: update.ipPath,
+					}
+					sent := client.SendWithAck(p, sendTimeout, true)
+					if !sent {
+						// a failed attempt retains ownership here: undo this
+						// attempt's share or the packet never reaches zero
+						// references (the race takes one share per client)
+						MessagePoolReturn(p.packet)
+					}
+					if sent {
+						successCount.Add(1)
+
+						var initRace *multiClientChannelUpdateRace
+						var initRaceEarlyComplete <-chan struct{}
+						var abandonedClients []*multiClientChannel
+						func() {
+							// race state is guarded by the per-flow stateLock (a
+							// leaf); client is atomic
+							update.stateLock.Lock()
+							defer update.stateLock.Unlock()
+
+							if update.client.Load() != nil {
+								// another client already chosen, done
+								return
+							}
+
+							race := update.race
+							if race == nil {
+								update.initRaceWithLock()
+								race = update.race
+
+								initRace = race
+								initRaceEarlyComplete = race.completeMonitor.NotifyChannel()
+							}
+							state := race.clientStates[client]
+							if state == nil {
+								state = &multiClientChannelRaceClientState{
+									sendTime: time.Now(),
+								}
+								race.clientStates[client] = state
+							}
+							state.sentPacketCount += 1
+							race.sentPacketCount += 1
+							bufferExceeded := state != nil && self.settings.MultiRaceSetOnNoResponseTimeout <= time.Now().Sub(state.sendTime) || self.settings.MultiRaceClientSentPacketMaxCount < state.sentPacketCount
+							if race.packetCount == 0 && bufferExceeded {
+								// no client response in timeout, lock in this client
+								// this happens for example when the client only sends and does not receive (e.g. udp send)
+
+								for abandonedClient, _ := range race.clientStates {
+									if abandonedClient != client {
+										abandonedClients = append(abandonedClients, abandonedClient)
+									}
+								}
+
+								update.clearRaceWithLock()
+								update.client.Store(client)
+							}
+						}()
+
+						if initRace != nil {
+							self.scheduleCompleteRace(update.ipPath, initRace, initRaceEarlyComplete)
+						}
+
+						if 0 < len(abandonedClients) {
+							if rstPacket, ok := ipOosRst(update.ipPath); ok {
+								for _, abandonedClient := range abandonedClients {
+									abandonedClient.Send(&parsedPacket{
+										packet: rstPacket,
+										ipPath: update.ipPath,
+									}, 0)
+								}
+							}
+						}
+					} else {
+						MessagePoolReturn(p.packet)
+					}
+				}
+
+				var raceOrderedClients []*multiClientChannel
+				if 0 < self.settings.MultiRaceClientCount && self.settings.MultiRaceClientCount < len(orderedClients) {
+					raceOrderedClients = orderedClients[:self.settings.MultiRaceClientCount]
+				} else {
+					raceOrderedClients = orderedClients
+				}
+
+				// if 0 < timeout {
+				var wg sync.WaitGroup
+
+				for _, client := range raceOrderedClients {
+					wg.Add(1)
+					go HandleError(func() {
+						defer wg.Done()
+
+						send(client)
+					})
+				}
+
+				wg.Wait()
+				// } else {
+				// 	for _, client := range raceOrderedClients {
+				// 		send(client)
+				// 	}
+				// }
+
+				if 0 < successCount.Load() {
+					success = true
+				}
+				return
+			}
+		}
+
+		coalesceOrderedClients := func() []*multiClientChannel {
+			for _, windowType := range self.selectWindowTypes(sendPacket) {
+				if window, ok := self.windows[windowType]; ok {
+					orderedClients := window.OrderedClients()
+					if 0 < len(orderedClients) {
+						return orderedClients
+					}
+				}
+			}
+			return []*multiClientChannel{}
+		}
+
+		raceClients(coalesceOrderedClients(), 0)
+		if success {
+			return
+		}
+
+		for {
+			var retryTimeout time.Duration
+			if 0 <= timeout {
+				remainingTimeout := enterTime.Add(timeout).Sub(time.Now())
+
+				if remainingTimeout <= 0 {
+					// drop
+					return
+				}
+
+				retryTimeout = min(remainingTimeout, self.settings.SendRetryTimeout)
+			} else {
+				retryTimeout = self.settings.SendRetryTimeout
+			}
+
+			startTime := time.Now()
+			raceClients(coalesceOrderedClients(), retryTimeout)
+			if success {
+				return
+			}
+			endTime := time.Now()
+			retryTimeout -= endTime.Sub(startTime)
+
+			if 0 < retryTimeout {
+				select {
+				case <-update.ctx.Done():
+					return
+				case <-time.After(retryTimeout):
+				}
+			}
+		}
+	})
+	return
+}
+
+// clientReceivePacketFunction
+func (self *RemoteUserNatMultiClient) clientReceivePacket(
+	sourceClient *multiClientChannel,
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	packet []byte,
+) {
+	r, err := self.securityPolicy.InspectIngress(provideMode, ipPath, nil)
+	if err != nil {
+		return
+	}
+	// refresh on the return direction before ipPath is reversed for downstream delivery
+	self.securityPolicy.RefreshIngress(ipPath)
+	if r != SecurityPolicyResultAllow {
+		return
+	}
+
+	self.packetStatsCounters.remoteIngressPacketCount.Add(1)
+	self.packetStatsCounters.remoteIngressByteCount.Add(int64(len(packet)))
+	if self.ipAssoc != nil {
+		// before reverse, the remote endpoint is the source
+		self.ipAssoc.AddIngressPacket(ipPath)
+	}
+
+	ipPath = ipPath.Reverse()
+
+	var abandonedClients []*multiClientChannel
+	var receivePackets []*receivePacket
+	var returnPackets []*receivePacket
+	success := self.receiveClientPath(ipPath, func(update *multiClientChannelUpdate) {
+		// steady-state fast path: the flow is already committed to this client,
+		// so deliver without taking any lock (client is atomic). this is the
+		// common download path and no longer contends the parent stateLock.
+		if update.client.Load() == sourceClient {
+			p := &receivePacket{
+				Source:      source,
+				ProvideMode: provideMode,
+				IpPath:      ipPath,
+				Packet:      packet,
+			}
+			receivePackets = []*receivePacket{p}
+			return
+		}
+
+		// race / not-yet-committed paths are guarded by the per-flow stateLock
+		update.stateLock.Lock()
+		defer update.stateLock.Unlock()
+
+		client := update.client.Load()
+
+		if client == sourceClient {
+			// committed between the lock-free check and acquiring the lock
+			p := &receivePacket{
+				Source:      source,
+				ProvideMode: provideMode,
+				IpPath:      ipPath,
+				Packet:      packet,
+			}
+			receivePackets = []*receivePacket{p}
+		} else if client != nil {
+			// another client already chosen, drop
+		} else if race := update.race; race == nil {
+			// no race, no client, drop
+			self.log.Infof("[multi]receive no race and no client")
+		} else if state, ok := race.clientStates[sourceClient]; !ok {
+			// this client is not part of the race, drop
+			self.log.Infof("[multi]receive client not part of race")
+		} else if len(state.packets) < self.settings.MultiRaceClientPacketMaxCount && race.packetCount < self.settings.MultiRacePacketMaxCount {
+			packetCopy, pooled := MessagePoolCopyDetailed(packet)
+			receivePacket := &receivePacket{
+				Source:      source,
+				ProvideMode: provideMode,
+				IpPath:      ipPath,
+				Packet:      packetCopy,
+				Pooled:      pooled,
+			}
+			state.packets = append(state.packets, receivePacket)
+			if 1 == len(state.packets) {
+				state.receiveTime = time.Now()
+			}
+			race.packetCount += 1
+			if len(state.packets) == 1 {
+				race.clientsWithPacketCount += 1
+				if int(float32(len(race.clientStates))*self.settings.MultiRaceClientEarlyCompleteFraction) <= race.clientsWithPacketCount {
+					race.completeMonitor.NotifyAll()
+				}
+			}
+		} else {
+			// race buffer limits exceeded, end the race immediately
+			self.log.Infof("[multi]receive race buffer limit reached")
+
+			for abandonedClient, abandonedState := range race.clientStates {
+				if abandonedClient != sourceClient {
+					abandonedClients = append(abandonedClients, abandonedClient)
+					for _, p := range abandonedState.packets {
+						if p.Pooled {
+							p.Pooled = false
+							returnPackets = append(returnPackets, p)
+						}
+					}
+				}
+			}
+
+			update.clearRaceWithLock()
+			update.client.Store(sourceClient)
+			receivePacket := &receivePacket{
+				Source:      source,
+				ProvideMode: provideMode,
+				IpPath:      ipPath,
+				Packet:      packet,
+			}
+			receivePackets = append(state.packets, receivePacket)
+			for _, p := range receivePackets {
+				if p.Pooled {
+					p.Pooled = false
+					returnPackets = append(returnPackets, p)
+				}
+			}
+		}
+	})
+	if success {
+		if 0 < len(abandonedClients) {
+			if rstPacket, ok := ipOosRst(ipPath); ok {
+				for _, abandonedClient := range abandonedClients {
+					abandonedClient.Send(&parsedPacket{
+						packet: rstPacket,
+						ipPath: ipPath,
+					}, 0)
+				}
+			}
+		}
+		for _, p := range receivePackets {
+			self.receivePacketCallback(p.Source, p.ProvideMode, p.IpPath, p.Packet)
+		}
+		for _, p := range returnPackets {
+			MessagePoolReturn(p.Packet)
+		}
+	} else {
+		// incoming packets not in response to outgoing packets
+		self.receivePacketCallback(source, provideMode, ipPath, packet)
+	}
+}
+
+// spawns a goroutine that completes the race after a timeout. it acquires the
+// per-flow stateLock (not the parent lock) when it evaluates the race.
+func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
+	ipPath *IpPath,
+	race *multiClientChannelUpdateRace,
+	earlyComplete <-chan struct{},
+) {
+	go HandleError(func() {
+		// wait for the race to finish, then choose
+
+		select {
+		case <-race.ctx.Done():
+			return
+		case <-earlyComplete:
+		case <-time.After(self.settings.MultiRaceSetOnResponseTimeout):
+		}
+
+		var abandonedClients []*multiClientChannel
+		var receivePackets []*receivePacket
+		var returnPackets []*receivePacket
+		self.receiveClientPath(ipPath, func(update *multiClientChannelUpdate) {
+			// race state is guarded by the per-flow stateLock (a leaf); client
+			// is atomic
+			update.stateLock.Lock()
+			defer update.stateLock.Unlock()
+
+			if update.race == race {
+				defer update.clearRaceWithLock()
+
+				if update.client.Load() == nil {
+
+					// weighted shuffle clients by rtt
+					orderedClients := []*multiClientChannel{}
+					weights := map[*multiClientChannel]float32{}
+					for client, state := range race.clientStates {
+						if 0 < len(state.packets) {
+							orderedClients = append(orderedClients, client)
+							rtt := state.receiveTime.Sub(state.sendTime)
+							weights[client] = float32(rtt / time.Millisecond)
+						}
+					}
+					WeightedShuffleWithEntropy(orderedClients, weights, self.settings.StatsWindowEntropy)
+
+					if 0 < len(orderedClients) {
+						// the last is the lowest rtt
+						client := orderedClients[len(orderedClients)-1]
+
+						update.client.Store(client)
+						receivePackets = race.clientStates[client].packets
+						for _, p := range receivePackets {
+							if p.Pooled {
+								p.Pooled = false
+								returnPackets = append(returnPackets, p)
+							}
+						}
+					}
+				}
+				// else the client is already set
+				committedClient := update.client.Load()
+				for abandonedClient, abandonedState := range race.clientStates {
+					if abandonedClient != committedClient {
+						abandonedClients = append(abandonedClients, abandonedClient)
+						for _, p := range abandonedState.packets {
+							if p.Pooled {
+								p.Pooled = false
+								returnPackets = append(returnPackets, p)
+							}
+						}
+					}
+				}
+			}
+			// else the client is on a new race
+		})
+		if 0 < len(abandonedClients) {
+			if rstPacket, ok := ipOosRst(ipPath); ok {
+				for _, abandonedClient := range abandonedClients {
+					abandonedClient.Send(&parsedPacket{
+						packet: rstPacket,
+						ipPath: ipPath,
+					}, 0)
+				}
+			}
+		}
+		for _, p := range receivePackets {
+			self.receivePacketCallback(p.Source, p.ProvideMode, p.IpPath, p.Packet)
+		}
+		for _, p := range returnPackets {
+			MessagePoolReturn(p.Packet)
+		}
+	})
+}
+
+func (self *RemoteUserNatMultiClient) Shuffle() {
+	for _, window := range self.windows {
+		window.shuffle()
+	}
+}
+
+func (self *RemoteUserNatMultiClient) Close() {
+	self.cancel()
+
+	// release the server-name-learned subscription so the lookup does not retain
+	// this (now-closing) multi-client
+	var serverNamesLearnedUnsub func()
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		serverNamesLearnedUnsub = self.serverNamesLearnedUnsub
+		self.serverNamesLearnedUnsub = nil
+	}()
+	if serverNamesLearnedUnsub != nil {
+		serverNamesLearnedUnsub()
+	}
+
+	for _, window := range self.windows {
+		window.Close()
+	}
+
+	var removedUpdates []*multiClientChannelUpdate
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+
+		for _, update := range self.ip4PathUpdates {
+			removedUpdates = append(removedUpdates, update)
+		}
+		for _, update := range self.ip6PathUpdates {
+			removedUpdates = append(removedUpdates, update)
+		}
+		clear(self.ip4PathUpdates)
+		clear(self.ip6PathUpdates)
+		clear(self.affinityIp4Paths)
+		clear(self.affinityIp6Paths)
+	}()
+
+	// close updates outside the parent lock: update.Close() takes the per-flow
+	// stateLock (clearRaceWithLock), and keeping it off the parent lock means
+	// the per-flow stateLock never nests under the parent lock anywhere.
+	for _, update := range removedUpdates {
+		update.Close()
+	}
+
+	self.localUserNat.Close()
+	self.localUserNatUnsub()
+}
+
+type multiClientChannelUpdate struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	// client is the channel this flow is committed to. it is read on the
+	// per-packet hot path (egress send target, ingress steady-state match) and
+	// across flows by affinity selection, so it is an atomic for lock-free
+	// reads. writes happen under the parent stateLock (which serializes them
+	// against the path maps) or a context where the writer has exclusive access.
+	client atomic.Pointer[multiClientChannel]
+
+	// stateLock guards the per-flow mutable state below: the active race and the
+	// tcp collapse-prevention sequence counters. it is a leaf — its holders
+	// never take the parent `RemoteUserNatMultiClient.stateLock` — so
+	// independent flows never serialize on the parent lock for race or sequence
+	// work, and there is no ordering constraint with the parent lock.
+	stateLock sync.Mutex
+	// race is guarded by stateLock.
+	race *multiClientChannelUpdateRace
+
+	// activityTime is guarded by the parent stateLock (written during the path
+	// map lookup in send/receiveUpdate).
+	activityTime time.Time
+	ipPath       *IpPath
+
+	sequencePacketCount int    // guarded by stateLock
+	ackSequenceNumber   uint32 // guarded by stateLock
+	// sequenceNumber wraps at 2^32. ordering is determined via `int32(a - b)`
+	// signed-delta arithmetic (per RFC 1323 PAWS / RFC 7323), wraparound-tolerant
+	// across the 32-bit boundary.
+	sequenceNumber uint32 // guarded by stateLock
+
+	// affinityIp{4,6}Paths are guarded by the parent stateLock (creation only).
+	affinityIp4Paths map[Ip4Path]bool
+	affinityIp6Paths map[Ip6Path]bool
+}
+
+func newMultiClientChannelUpdate(ctx context.Context, ipPath *IpPath) *multiClientChannelUpdate {
+	cancelCtx, cancel := context.WithCancel(ctx)
+	return &multiClientChannelUpdate{
+		ctx:              cancelCtx,
+		cancel:           cancel,
+		ipPath:           ipPath,
+		affinityIp4Paths: map[Ip4Path]bool{},
+		affinityIp6Paths: map[Ip6Path]bool{},
+	}
+}
+
+func (self *multiClientChannelUpdate) resetSequence(sendPacket *parsedPacket) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	ipPath := sendPacket.ipPath
+
+	self.ackSequenceNumber = ipPath.AckSequenceNumber
+	self.sequenceNumber = ipPath.SequenceNumber
+	self.sequencePacketCount = 0
+}
+
+func (self *multiClientChannelUpdate) updateSequence(sendPacket *parsedPacket) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	ipPath := sendPacket.ipPath
+	update := false
+
+	nextAckSequenceNumber := ipPath.AckSequenceNumber
+	if self.ackSequenceNumber != nextAckSequenceNumber {
+		self.ackSequenceNumber = nextAckSequenceNumber
+		update = true
+	}
+
+	// modular uint32 add wraps correctly across the 4 GB boundary
+	nextSequenceNumber := ipPath.SequenceNumber + uint32(len(sendPacket.payload))
+	// signed-delta comparison is wraparound-tolerant: > 0 means nextSequenceNumber
+	// is later in TCP sequence space than self.sequenceNumber
+	if 0 < int32(nextSequenceNumber-self.sequenceNumber) {
+		self.sequenceNumber = nextSequenceNumber
+		update = true
+	}
+
+	if update {
+		self.sequencePacketCount += 1
+	}
+}
+
+func (self *multiClientChannelUpdate) canUpdateSequence(sendPacket *parsedPacket) bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	if self.sequencePacketCount == 0 {
+		return true
+	}
+
+	ipPath := sendPacket.ipPath
+
+	if self.ackSequenceNumber != ipPath.AckSequenceNumber {
+		return true
+	}
+
+	nextSequenceNumber := ipPath.SequenceNumber + uint32(len(sendPacket.payload))
+	// strict signed-delta > 0 mirrors updateSequence; treating equality as
+	// "can update" would let identical retransmits pass the gate even though
+	// updateSequence won't advance state, defeating TcpCollapsePrevention.
+	if 0 < int32(nextSequenceNumber-self.sequenceNumber) {
+		return true
+	}
+
+	return false
+}
+
+// must be called with `stateLock`
+func (self *multiClientChannelUpdate) initRaceWithLock() {
+	if self.race == nil {
+		self.race = newMultiClientChannelUpdateRace(self.ctx)
+	}
+}
+
+// must be called with `stateLock`
+func (self *multiClientChannelUpdate) clearRaceWithLock() {
+	if self.race != nil {
+		self.race.Close()
+		self.race = nil
+	}
+}
+
+func (self *multiClientChannelUpdate) IsDone() bool {
+	select {
+	case <-self.ctx.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+func (self *multiClientChannelUpdate) Close() {
+	self.cancel()
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.clearRaceWithLock()
+}
+
+type multiClientChannelUpdateRace struct {
+	ctx                    context.Context
+	cancel                 context.CancelFunc
+	clientStates           map[*multiClientChannel]*multiClientChannelRaceClientState
+	sentPacketCount        int
+	packetCount            int
+	clientsWithPacketCount int
+	completeMonitor        *Monitor
+}
+
+func newMultiClientChannelUpdateRace(ctx context.Context) *multiClientChannelUpdateRace {
+	cancelCtx, cancel := context.WithCancel(ctx)
+	return &multiClientChannelUpdateRace{
+		ctx:          cancelCtx,
+		cancel:       cancel,
+		clientStates: map[*multiClientChannel]*multiClientChannelRaceClientState{},
+		// sentPacketCount:        0,
+		// packetCount:            0,
+		// clientsWithPacketCount: 0,
+		completeMonitor: NewMonitor(),
+	}
+}
+
+func (self *multiClientChannelUpdateRace) Close() {
+	self.cancel()
+	// return any still-pooled packets that no other path has claimed.
+	// the Pooled flag is the single-owner marker: paths that consume a
+	// receivePacket (race-buffer-exceeded in clientReceivePacket, the
+	// scheduleCompleteRace winner/abandoned drains) set Pooled=false
+	// before appending to their own return list. anything still
+	// Pooled=true here was abandoned without a cleanup pass.
+	for _, state := range self.clientStates {
+		for _, p := range state.packets {
+			if p.Pooled {
+				p.Pooled = false
+				MessagePoolReturn(p.Packet)
+			}
+		}
+		state.packets = nil
+	}
+	clear(self.clientStates)
+}
+
+type multiClientChannelRaceClientState struct {
+	sendTime        time.Time
+	receiveTime     time.Time
+	packets         []*receivePacket
+	sentPacketCount int
+}
+
+type parsedPacket struct {
+	packet  []byte
+	ipPath  *IpPath
+	payload []byte
+}
+
+func newParsedPacket(packet []byte) (*parsedPacket, error) {
+	ipPath, err := ParseIpPath(packet)
+	if err != nil {
+		return nil, err
+	}
+	return &parsedPacket{
+		packet: packet,
+		ipPath: ipPath,
+	}, nil
+}
+
+type multiClientWindow struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	log    Logger
+
+	generator                   MultiClientGenerator
+	clientReceivePacketCallback clientReceivePacketFunction
+	ingressSecurityPolicy       SecurityPolicy
+	clientRemoveCallback        func(client *multiClientChannel)
+	windowType                  WindowType
+
+	settings *MultiClientSettings
+
+	clientChannelArgs chan *multiClientChannelArgs
+
+	monitor *RemoteUserNatMultiClientMonitor
+
+	contractStatusCallbacks *CallbackList[*contractStatusCallbackWorker]
+	contractStatsCallbacks  *CallbackList[ContractStatsFunction]
+	// relayed from every window client's encryption session manager
+	peerIdentityChangeCallbacks *CallbackList[func()]
+
+	stateLock          sync.Mutex
+	clients            map[Id]*multiClientChannel
+	performanceProfile *PerformanceProfile
+
+	generatorMonitor *Monitor
+	resizeMonitor    *Monitor
+}
+
+func newMultiClientWindow(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	generator MultiClientGenerator,
+	clientReceivePacketCallback clientReceivePacketFunction,
+	ingressSecurityPolicy SecurityPolicy,
+	clientRemoveCallback func(client *multiClientChannel),
+	windowType WindowType,
+	settings *MultiClientSettings,
+) *multiClientWindow {
+	window := &multiClientWindow{
+		ctx:                         ctx,
+		cancel:                      cancel,
+		log:                         loggerOrDefault(settings.Log),
+		generator:                   generator,
+		clientReceivePacketCallback: clientReceivePacketCallback,
+		ingressSecurityPolicy:       ingressSecurityPolicy,
+		clientRemoveCallback:        clientRemoveCallback,
+		windowType:                  windowType,
+		settings:                    settings,
+		clientChannelArgs:           make(chan *multiClientChannelArgs),
+		monitor:                     NewRemoteUserNatMultiClientMonitor(&settings.RemoteUserNatMultiClientMonitorSettings),
+		contractStatusCallbacks:     NewCallbackList[*contractStatusCallbackWorker](),
+		contractStatsCallbacks:      NewCallbackList[ContractStatsFunction](),
+		peerIdentityChangeCallbacks: NewCallbackList[func()](),
+		clients:                     map[Id]*multiClientChannel{},
+		generatorMonitor:            NewMonitor(),
+		resizeMonitor:               NewMonitor(),
+	}
+
+	go HandleError(window.randomEnumerateClientArgs, cancel)
+	go HandleError(window.resize, cancel)
+
+	return window
+}
+
+func (self *multiClientWindow) AddContractStatusCallback(contractStatusCallback ContractStatusFunction) func() {
+	worker := newContractStatusCallbackWorker(self.ctx, contractStatusCallback, self.settings.SequenceBufferSize)
+	callbackId := self.contractStatusCallbacks.Add(worker)
+	return func() {
+		self.contractStatusCallbacks.Remove(callbackId)
+		worker.Close()
+	}
+}
+
+func (self *multiClientWindow) contractStatus(contractStatus *ContractStatus) {
+	for _, contractStatusCallback := range self.contractStatusCallbacks.Get() {
+		contractStatusCallback.Dispatch(contractStatus)
+	}
+}
+
+func (self *multiClientWindow) AddContractStatsCallback(contractStatsCallback ContractStatsFunction) func() {
+	callbackId := self.contractStatsCallbacks.Add(contractStatsCallback)
+	return func() {
+		self.contractStatsCallbacks.Remove(callbackId)
+	}
+}
+
+// registered on every window client's contract manager.
+// the manager's epoch worker calls this off the packet paths
+func (self *multiClientWindow) contractStats(contractStatsEvents []*ContractStatsEvent) {
+	for _, contractStatsCallback := range self.contractStatsCallbacks.Get() {
+		HandleError(func() {
+			contractStatsCallback(contractStatsEvents)
+		})
+	}
+}
+
+func (self *multiClientWindow) AddPeerIdentityChangeCallback(callback func()) func() {
+	callbackId := self.peerIdentityChangeCallbacks.Add(callback)
+	return func() {
+		self.peerIdentityChangeCallbacks.Remove(callbackId)
+	}
+}
+
+// registered on every window client's encryption session manager
+// (and fired once more when a window client is removed)
+func (self *multiClientWindow) peerIdentityChanged() {
+	for _, callback := range self.peerIdentityChangeCallbacks.Get() {
+		HandleError(callback)
+	}
+}
+
+// the performance profile will take effect at the next `resize` iteration
+func (self *multiClientWindow) SetPerformanceProfile(performanceProfile *PerformanceProfile) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	self.performanceProfile = performanceProfile
+}
+
+func (self *multiClientWindow) randomEnumerateClientArgs() {
+	defer func() {
+		close(self.clientChannelArgs)
+
+		// drain the channel
+		func() {
+			for {
+				select {
+				case args, ok := <-self.clientChannelArgs:
+					if !ok {
+						return
+					}
+					self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
+				}
+			}
+		}()
+	}()
+
+	for {
+		generatorNotify := self.generatorMonitor.NotifyChannel()
+
+		// exclude healthy destinations that are already in the window
+		windowDestinations := func() map[MultiHopId]bool {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			windowDestinations := map[MultiHopId]bool{}
+			for _, client := range self.clients {
+				if !client.isWarning() {
+					windowDestinations[client.Destination()] = true
+				}
+			}
+			return windowDestinations
+		}
+
+		destinations, err := self.generator.NextDestinations(
+			self.settings.WindowExpandBlockCount,
+			slices.Collect(maps.Keys(windowDestinations())),
+			self.windowType.RankMode(),
+		)
+		if err != nil {
+			self.log.Infof("[multi]window enumerate error timeout = %s\n", err)
+			select {
+			case <-self.ctx.Done():
+				return
+			case <-time.After(self.settings.WindowEnumerateErrorTimeout):
+			}
+			continue
+		}
+
+		func() {
+			// destinations must be used by `expirationTime`
+			expirationTime := time.Now().Add(self.settings.WindowExpandArgsTimeout)
+			for destination, stats := range destinations {
+
+				for {
+					timeout := expirationTime.Sub(time.Now())
+					if timeout <= 0 {
+						return
+					}
+
+					// a destination-aware generator can reuse a persisted
+					// identity for this destination (PROXYDRAIN1.md §3.5)
+					var clientArgs *MultiClientGeneratorClientArgs
+					var err error
+					if destinationGenerator, ok := self.generator.(MultiClientGeneratorWithDestination); ok {
+						clientArgs, err = destinationGenerator.NewClientArgsForDestination(destination)
+					} else {
+						clientArgs, err = self.generator.NewClientArgs()
+					}
+					if err != nil {
+						self.log.Infof("[multi]create client args error = %s\n", err)
+						select {
+						case <-self.ctx.Done():
+							return
+						case <-time.After(self.settings.WindowEnumerateErrorTimeout):
+						}
+						continue
+					}
+
+					args := &multiClientChannelArgs{
+						Destination:                    destination,
+						DestinationStats:               stats,
+						MultiClientGeneratorClientArgs: *clientArgs,
+					}
+					select {
+					case <-self.ctx.Done():
+						self.generator.RemoveClientArgs(clientArgs)
+						return
+					case self.clientChannelArgs <- args:
+					case <-time.After(timeout):
+						// destination expired
+						self.log.Infof("[multi]create client args expired\n")
+						self.generator.RemoveClientArgs(clientArgs)
+						return
+					}
+					break
+				}
+			}
+		}()
+
+		select {
+		case <-self.ctx.Done():
+			return
+		case <-generatorNotify:
+		}
+	}
+}
+
+func (self *multiClientWindow) resize() {
+	for {
+		update := self.resizeMonitor.NotifyChannel()
+
+		var windowSize WindowSizeSettings
+		var fixedWindowType *WindowType
+		func() {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			if profileWindowType, profileWindowSize, ok := self.performanceProfile.FixedWindow(); ok {
+				fixedWindowType = &profileWindowType
+				windowSize = profileWindowSize
+			} else {
+				windowSize = self.settings.WindowSizes[self.windowType]
+			}
+		}()
+
+		startTime := time.Now()
+
+		warnedClients := []*multiClientChannel{}
+		clients := []*multiClientChannel{}
+		maxSourceCount := 0
+		weights := map[*multiClientChannel]float32{}
+		durations := map[*multiClientChannel]time.Duration{}
+
+		removeClient := func(client *multiClientChannel) {
+			client.Close()
+			removed := false
+			func() {
+				self.stateLock.Lock()
+				defer self.stateLock.Unlock()
+				// guard the slot: the client may have been replaced under the same
+				// client id by a concurrent expand (see the replace on ping success).
+				// in that case do not delete the new client's entry and do not emit
+				// Removed for the shared id — the monitor dot now belongs to the
+				// new client.
+				if self.clients[client.ClientId()] == client {
+					delete(self.clients, client.ClientId())
+					removed = true
+				}
+			}()
+			if removed {
+				self.removeClients(client)
+			}
+		}
+		keepClient := func(client *multiClientChannel, stats *clientWindowStats) {
+			clients = append(clients, client)
+			maxSourceCount = max(maxSourceCount, stats.sourceCount)
+			weights[client] = float32(stats.EffectiveByteCountPerSecond())
+			durations[client] = stats.clientDuration
+		}
+		warnClient := func(client *multiClientChannel, stats *clientWindowStats) {
+			warnedClients = append(warnedClients, client)
+			maxSourceCount = max(maxSourceCount, stats.sourceCount)
+			weights[client] = float32(stats.EffectiveByteCountPerSecond())
+			durations[client] = stats.clientDuration
+		}
+
+		clientStats := map[*multiClientChannel]*clientWindowStats{}
+		for _, client := range self.unorderedClients() {
+			if stats, err := client.WindowStats(); err == nil {
+				clientStats[client] = stats
+			} else {
+				self.log.Infof("[multi]remove error client [%s] = %s\n", client.ClientId(), err)
+				removeClient(client)
+			}
+		}
+
+		netHealthRanks := map[*multiClientChannel]int{}
+		func() {
+			orderedClients := slices.Collect(maps.Keys(clientStats))
+			slices.SortFunc(orderedClients, func(a *multiClientChannel, b *multiClientChannel) int {
+				// descending healthy duration, net healthy duration
+				statsA := clientStats[a]
+				statsB := clientStats[b]
+
+				if c := statsB.healthyDuration - statsA.healthyDuration; c < 0 {
+					return -1
+				} else if 0 < c {
+					return 1
+				}
+
+				if c := statsB.netHealthyDuration - statsA.netHealthyDuration; c < 0 {
+					return -1
+				} else if 0 < c {
+					return 1
+				}
+
+				return 0
+			})
+			for i, client := range orderedClients {
+				netHealthRanks[client] = i
+			}
+		}()
+
+		for client, stats := range clientStats {
+			// note for fixed destination size, the destination might still be aliased with multiple clients
+			// TODO it's still not clear why one client might stop working occasionally
+
+			healthy := stats.unhealthyDuration < self.settings.StatsWindowMaxUnhealthyDuration
+
+			printStats := func(status string) {
+				effectiveByteCountPerSecond := stats.EffectiveByteCountPerSecond()
+				expectedByteCountPerSecond := stats.ExpectedByteCountPerSecond()
+
+				if self.log.V(1).Enabled() {
+					self.log.Infof(
+						"[multi]%s [%s]: h=%d+%dms/u=%d+%dms effective=%db/s expected=%db/s send=%db sendNack=%db receive=%db\n",
+						status,
+						client.ClientId(),
+						stats.netHealthyDuration/time.Millisecond,
+						stats.healthyDuration/time.Millisecond,
+						stats.netUnhealthyDuration/time.Millisecond,
+						stats.unhealthyDuration/time.Millisecond,
+						effectiveByteCountPerSecond,
+						expectedByteCountPerSecond,
+						stats.sendAckByteCount,
+						stats.sendNackByteCount,
+						stats.receiveAckByteCount,
+					)
+				}
+			}
+			// the top `StatsWindowKeepHealthiestCount` won't be marked as warning or removed
+			netHealthRank := netHealthRanks[client]
+			remove := max(windowSize.FixedWindowSize, windowSize.KeepHealthiestCount) <= netHealthRank
+			// a rank-kept client is still removed once it has been continuously
+			// unhealthy past the keep cap: keeping the healthiest rides out
+			// transient badness, but a client that never recovers must be
+			// replaced so the window re-expands with fresh candidates (and its
+			// grid dot is reclaimed) instead of pinning a dead client forever
+			if 0 < self.settings.StatsWindowKeepUnhealthyDuration &&
+				self.settings.StatsWindowKeepUnhealthyDuration <= stats.unhealthyDuration {
+				remove = true
+			}
+			if healthy {
+				// a client after its `removeTime` will be in a permananent warning state as long as it continues to route traffic
+				// this prevents new connections from using the client
+				if stats.unhealthyDuration < self.settings.StatsWindowWarnUnhealthyDuration {
+					if !stats.removeTime.IsZero() && stats.removeTime.Before(startTime) {
+						printStats("client drain")
+						client.setWarning(remove)
+						warnClient(client, stats)
+					} else {
+						printStats("client ok")
+						windowSizeUlimit := self.settings.DefaultUlimit
+						if 0 < windowSize.Ulimit {
+							windowSizeUlimit = windowSize.Ulimit
+						}
+						ulimit := 0 < windowSizeUlimit && windowSizeUlimit <= stats.netSourceCount
+						if ulimit {
+							client.setWarning(true)
+							warnClient(client, stats)
+						} else {
+							client.setWarning(false)
+							keepClient(client, stats)
+						}
+					}
+				} else {
+					printStats("client health warning")
+					client.setWarning(remove)
+					warnClient(client, stats)
+				}
+			} else {
+				printStats(fmt.Sprintf("unhealthy client (#%d remove=%t)", netHealthRank, remove))
+
+				if remove {
+					client.setWarning(true)
+					removeClient(client)
+				} else {
+					client.setWarning(false)
+					warnClient(client, stats)
+				}
+			}
+		}
+
+		collapseLowestWeighted := func(targetWindowSize int) {
+
+			n := (len(warnedClients) + len(clients)) - targetWindowSize
+
+			collapse := func(cs []*multiClientChannel) {
+				if 0 < n && 0 < len(cs) {
+					m := min(len(cs), n)
+					if 0 < m {
+						slices.SortFunc(cs, func(a *multiClientChannel, b *multiClientChannel) int {
+							// descending weight
+							aWeight := weights[a]
+							bWeight := weights[b]
+							if aWeight < bWeight {
+								return 1
+							} else if bWeight < aWeight {
+								return -1
+							}
+							aDuration := durations[a]
+							bDuration := durations[b]
+							if aDuration < bDuration {
+								return 1
+							} else if bDuration < aDuration {
+								return -1
+							}
+							return 0
+						})
+
+						for _, client := range cs[len(cs)-m : len(cs)] {
+							if self.settings.StatsWindowGraceperiod <= durations[client] && weights[client] <= 0 {
+								removeClient(client)
+							}
+						}
+						n -= m
+					}
+				}
+			}
+			collapse(warnedClients)
+			collapse(clients)
+		}
+
+		p2pOnlyWindowSize := 0
+		for _, client := range clients {
+			if client.IsP2pOnly() {
+				p2pOnlyWindowSize += 1
+			}
+		}
+
+		var windowSizeMin int
+		var targetWindowSize int
+		if fixedDestinationSize, fixed := self.generator.FixedDestinationSize(); fixed {
+			targetWindowSize = fixedDestinationSize
+			windowSizeMin = targetWindowSize
+		} else if 0 < windowSize.FixedWindowSize {
+			if fixedWindowType == nil || self.windowType == *fixedWindowType {
+				targetWindowSize = windowSize.FixedWindowSize
+			} else {
+				// not the active window, disable resize
+				targetWindowSize = 0
+			}
+			windowSizeMin = targetWindowSize
+		} else {
+			// scale the number of reconnects
+			reconnectScale := self.settings.DefaultReconnectScale
+			if 0 < windowSize.WindowSizeReconnectScale {
+				reconnectScale = windowSize.WindowSizeReconnectScale
+			}
+			targetWindowSize = int(math.Ceil(float64(maxSourceCount) * reconnectScale))
+
+			if n := windowSize.WindowSizeMinP2pOnly - p2pOnlyWindowSize; 0 < n {
+				targetWindowSize += n
+			}
+
+			targetWindowSize = min(
+				windowSize.WindowSizeMax,
+				max(
+					windowSize.WindowSizeMin,
+					targetWindowSize,
+				),
+			)
+			windowSizeMin = windowSize.WindowSizeMin
+		}
+
+		addedCount := 0
+		if len(clients) < targetWindowSize {
+			// expand
+			n := targetWindowSize - len(clients)
+			self.monitor.AddWindowExpandEvent(
+				windowSizeMin <= len(clients),
+				targetWindowSize+len(warnedClients),
+			)
+			addedCount = self.expand(
+				windowSize,
+				len(clients),
+				p2pOnlyWindowSize,
+				targetWindowSize,
+				windowSizeMin,
+				targetWindowSize-len(clients),
+			)
+			if self.log.V(1).Enabled() {
+				self.log.Infof("[multi]window expand +%d %d->%d (+%d)\n", n, len(clients), targetWindowSize, addedCount)
+			}
+		}
+		if 0 < windowSize.WindowSizeHardMax && windowSize.WindowSizeHardMax < len(clients)+len(warnedClients)+addedCount {
+			self.monitor.AddWindowExpandEvent(
+				windowSizeMin <= len(clients)+addedCount,
+				windowSize.WindowSizeHardMax,
+			)
+			collapseLowestWeighted(max(0, windowSize.WindowSizeHardMax-addedCount))
+			if self.log.V(1).Enabled() {
+				self.log.Infof("[multi]window collapse -%d ->%d\n", (len(clients)+len(warnedClients)+addedCount)-windowSize.WindowSizeHardMax, windowSize.WindowSizeHardMax)
+			}
+		} else {
+			self.monitor.AddWindowExpandEvent(
+				windowSizeMin <= len(clients)+addedCount,
+				len(clients)+len(warnedClients)+addedCount,
+			)
+		}
+
+		timeout := self.settings.WindowResizeTimeout - time.Now().Sub(startTime)
+		if timeout <= 0 {
+			select {
+			case <-self.ctx.Done():
+				return
+			default:
+			}
+		} else {
+			select {
+			case <-self.ctx.Done():
+				return
+			case <-update:
+			case <-time.After(timeout):
+			}
+		}
+	}
+}
+
+func (self *multiClientWindow) expand(
+	windowSize WindowSizeSettings,
+	currentWindowSize int,
+	currentP2pOnlyWindowSize int,
+	targetWindowSize int,
+	windowSizeMin int,
+	n int,
+) (returnPingSuccess int) {
+	mutex := sync.Mutex{}
+	pendingPingDones := []context.Context{}
+	added := 0
+	addedP2pOnly := 0
+	pingSuccess := 0
+
+	defer func() {
+		mutex.Lock()
+		defer mutex.Unlock()
+
+		returnPingSuccess = pingSuccess
+	}()
+
+	endTime := time.Now().Add(self.settings.WindowExpandTimeout)
+
+	for i := 0; i < n; i += 1 {
+		timeout := endTime.Sub(time.Now())
+		if timeout < 0 {
+			self.log.V(1).Infof("[multi]expand window timeout\n")
+			return
+		}
+
+		self.generatorMonitor.NotifyAll()
+		select {
+		case <-self.ctx.Done():
+			return
+		// case <- update:
+		//     // continue
+		case args, ok := <-self.clientChannelArgs:
+			if !ok {
+				return
+			}
+			// func() {
+			// 	self.stateLock.Lock()
+			// 	defer self.stateLock.Unlock()
+			// 	_, ok = self.destinationClients[args.Destination]
+			// }()
+
+			// if ok {
+			// 	// already have a client in the window for this destination
+			// 	self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
+			// } else {
+			// randomly set to p2p only to meet the minimum requirement
+			if !args.MultiClientGeneratorClientArgs.P2pOnly {
+				var a int
+				var b int
+				func() {
+					mutex.Lock()
+					defer mutex.Unlock()
+
+					a = max(windowSize.WindowSizeMin-(currentWindowSize+added), 0)
+					b = max(windowSize.WindowSizeMinP2pOnly-(currentP2pOnlyWindowSize+addedP2pOnly), 0)
+				}()
+				var p2pOnlyP float32
+				if a+b == 0 {
+					p2pOnlyP = 0
+				} else {
+					p2pOnlyP = float32(b) / float32(a+b)
+				}
+				args.MultiClientGeneratorClientArgs.P2pOnly = mathrand.Float32() < p2pOnlyP
+			}
+
+			client, err := newMultiClientChannel(
+				self.ctx,
+				args,
+				self.generator,
+				self.clientReceivePacketCallback,
+				self.ingressSecurityPolicy,
+				self.contractStatus,
+				self.contractStats,
+				self.peerIdentityChanged,
+				self.performanceProfile,
+				self.settings,
+			)
+			if err != nil {
+				self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
+				self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed)
+			} else {
+
+				// send an initial ping on the client and let the ack timeout close it
+				pingDone, pingCancel := context.WithCancel(self.ctx)
+				pendingPingDones = append(pendingPingDones, pingDone)
+
+				// must be called with mutex
+				fail := func() {
+					select {
+					case <-pingDone.Done():
+						// already done
+						return
+					default:
+					}
+
+					pingCancel()
+					client.Cancel()
+					self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
+					self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed)
+				}
+
+				go HandleError(func() {
+					mutex.Lock()
+					defer mutex.Unlock()
+
+					select {
+					case <-pingDone.Done():
+						// already done
+						return
+					default:
+					}
+
+					added += 1
+					if client.IsP2pOnly() {
+						addedP2pOnly += 1
+					}
+
+					self.monitor.AddProviderEvent(args.ClientId, ProviderStateInEvaluation)
+
+					success, err := client.SendDetailedMessage(
+						&protocol.IpPing{},
+						self.settings.PingWriteTimeout,
+						func(err error) {
+							mutex.Lock()
+							defer mutex.Unlock()
+
+							select {
+							case <-pingDone.Done():
+								// already done
+								return
+							default:
+							}
+
+							if err == nil {
+								self.log.V(1).Infof("[multi]expand new client\n")
+
+								var replacedClient *multiClientChannel
+								func() {
+									self.stateLock.Lock()
+									defer self.stateLock.Unlock()
+									clientId := client.ClientId()
+									replacedClient = self.clients[clientId]
+									self.clients[clientId] = client
+								}()
+								if replacedClient != nil {
+									// the replaced client is stored under the same client id
+									// as the new client, so they share one monitor dot. Cancel
+									// it without emitting Removed — a Removed here would
+									// terminal-arm the dot of the NEW live client (Added
+									// below), and the ui would reap it while the client is
+									// still routing.
+									replacedClient.Cancel()
+								}
+								self.monitor.AddProviderEvent(args.ClientId, ProviderStateAdded)
+								// reap promptly when the client dies (the continuous ping or
+								// blackhole detection cancels the channel): wake the resize
+								// loop instead of waiting for its next tick
+								go HandleError(func() {
+									select {
+									case <-self.ctx.Done():
+									case <-client.Done():
+										self.resizeMonitor.NotifyAll()
+									}
+								})
+								pingSuccess += 1
+								pingCancel()
+							} else {
+								if self.log.V(1).Enabled() {
+									self.log.Infof("[multi]create ping error = %s\n", err)
+								}
+								fail()
+							}
+						},
+					)
+					if err != nil {
+						self.log.Infof("[multi]create client ping error = %s\n", err)
+						fail()
+					} else if !success {
+						fail()
+					} else {
+						// async wait for the ping
+						go HandleError(func() {
+							select {
+							case <-pingDone.Done():
+							case <-time.After(self.settings.PingTimeout):
+								self.log.V(2).Infof("[multi]expand window timeout waiting for ping\n")
+								func() {
+									mutex.Lock()
+									defer mutex.Unlock()
+									fail()
+								}()
+							}
+						}, client.Cancel)
+					}
+				})
+			}
+		case <-time.After(timeout):
+			self.log.V(2).Infof("[multi]expand window timeout waiting for args\n")
+		}
+	}
+
+	// wait for pending pings
+	for _, pingDone := range pendingPingDones {
+		timeout := endTime.Sub(time.Now())
+		if timeout <= 0 {
+			break
+		}
+
+		select {
+		case <-self.ctx.Done():
+			return
+		case <-pingDone.Done():
+		case <-time.After(timeout):
+		}
+	}
+
+	return
+}
+
+func (self *multiClientWindow) shuffle() {
+	for _, client := range self.unorderedClients() {
+		client.Cancel()
+	}
+	self.resizeMonitor.NotifyAll()
+}
+
+func (self *multiClientWindow) unorderedClients() []*multiClientChannel {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return slices.Collect(maps.Values(self.clients))
+}
+
+func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
+	var windowSize WindowSizeSettings
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if _, profileWindowSize, ok := self.performanceProfile.FixedWindow(); ok {
+			windowSize = profileWindowSize
+		} else {
+			windowSize = self.settings.WindowSizes[self.windowType]
+		}
+	}()
+
+	clients := []*multiClientChannel{}
+	lruTimes := map[*multiClientChannel]time.Time{}
+	weights := map[*multiClientChannel]float32{}
+
+	for _, client := range self.unorderedClients() {
+		if stats, err := client.WindowStats(); err == nil && !client.isWarning() {
+			clients = append(clients, client)
+			if !stats.lastEventTime.IsZero() {
+				lruTimes[client] = stats.lastEventTime
+			}
+			weights[client] = float32(1 + stats.ExpectedByteCountPerSecond())
+		}
+	}
+
+	if 0 == len(clients) {
+		return clients
+	}
+
+	if self.log.V(1).Enabled() {
+		self.statsSampleWeights(weights)
+	}
+
+	if 0 < windowSize.FixedWindowSize && windowSize.FixedWindowSize < len(clients) {
+		slices.SortFunc(clients, func(a *multiClientChannel, b *multiClientChannel) int {
+			lruTimeA := lruTimes[a]
+			lruTimeB := lruTimes[b]
+			// descending
+			if lruTimeA.Before(lruTimeB) {
+				return 1
+			} else if lruTimeB.Before(lruTimeA) {
+				return -1
+			}
+			weightA := weights[a]
+			weightB := weights[b]
+			// descending
+			if weightA < weightB {
+				return 1
+			} else if weightB < weightA {
+				return -1
+			}
+			return 0
+		})
+		clients = clients[:windowSize.FixedWindowSize]
+	}
+
+	WeightedShuffleWithEntropy(clients, weights, self.settings.StatsWindowEntropy)
+
+	// use only clients in the min tier
+	// this prevents the window from crossing rank until necessary
+	minTierClients := []*multiClientChannel{}
+	minTier := clients[0].Tier()
+	for _, client := range clients[1:] {
+		minTier = min(minTier, client.Tier())
+	}
+	for _, client := range clients {
+		if client.Tier() == minTier {
+			minTierClients = append(minTierClients, client)
+		} else {
+			if self.log.V(1).Enabled() {
+				self.log.Infof("[multi]exclude tier from window %d>%d\n", client.Tier(), minTier)
+			}
+		}
+	}
+
+	// use only the top n items from the window
+	// if 0 < windowSize.WindowSizeUseMax {
+	// 	minTierClients = minTierClients[:min(len(minTierClients), windowSize.WindowSizeUseMax)]
+	// }
+
+	return minTierClients
+}
+
+func (self *multiClientWindow) statsSampleWeights(weights map[*multiClientChannel]float32) {
+	// randonly sample log statistics for weights
+	if mathrand.Intn(self.settings.StatsSampleWeightsCount) == 0 {
+		// sample the weights
+		weightValues := slices.Collect(maps.Values(weights))
+		slices.SortFunc(weightValues, func(a float32, b float32) int {
+			// descending
+			if a < b {
+				return 1
+			} else if b < a {
+				return -1
+			} else {
+				return 0
+			}
+		})
+		net := float32(0)
+		for _, weight := range weightValues {
+			net += weight
+		}
+		if 0 < net {
+			var sb strings.Builder
+			netThresh := float32(0.99)
+			netp := float32(0)
+			netCount := 0
+			for i, weight := range weightValues {
+				p := 100 * weight / net
+				netp += p
+				netCount += 1
+				if 0 < i {
+					sb.WriteString(" ")
+				}
+				sb.WriteString(fmt.Sprintf("[%d]%.2f", i, p))
+				if netThresh*100 <= netp {
+					break
+				}
+			}
+
+			self.log.Infof("[multi]sample weights: %s (+%d more in window <%.0f%%)\n", sb.String(), len(weights)-netCount, 100*(1-netThresh))
+		} else {
+			self.log.Infof("[multi]sample weights: zero (%d in window)\n", len(weights))
+		}
+	}
+}
+
+func (self *multiClientWindow) Close() {
+	var removedClients []*multiClientChannel
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		for _, client := range self.clients {
+			// client.Close()
+			removedClients = append(removedClients, client)
+		}
+		clear(self.clients)
+	}()
+	for _, client := range removedClients {
+		client.Close()
+	}
+	// self.removeClients(removedClients)
+}
+
+func (self *multiClientWindow) removeClients(removedClients ...*multiClientChannel) {
+	for _, client := range removedClients {
+		self.monitor.AddProviderEvent(client.ClientId(), ProviderStateRemoved)
+	}
+	for _, client := range removedClients {
+		self.clientRemoveCallback(client)
+	}
+}
+
+type multiClientChannelArgs struct {
+	MultiClientGeneratorClientArgs
+
+	Destination MultiHopId
+	DestinationStats
+}
+
+type multiClientEventType int
+
+const (
+	multiClientEventTypeAck    multiClientEventType = 1
+	multiClientEventTypeNack   multiClientEventType = 2
+	multiClientEventTypeError  multiClientEventType = 3
+	multiClientEventTypeSource multiClientEventType = 4
+)
+
+type multiClientEventBucket struct {
+	createTime time.Time
+	eventTime  time.Time
+
+	sendAckCount        int
+	sendAckByteCount    ByteCount
+	sendNackCount       int
+	sendNackByteCount   ByteCount
+	sendSynCount        int
+	receiveAckCount     int
+	receiveAckByteCount ByteCount
+	receiveSynCount     int
+	sendAckTime         time.Time
+	sendNackTime        time.Time
+	sendSynTime         time.Time
+	errs                []error
+	ip4Paths            map[Ip4Path]bool
+	ip6Paths            map[Ip6Path]bool
+}
+
+func newMultiClientEventBucket() *multiClientEventBucket {
+	now := time.Now()
+	return &multiClientEventBucket{
+		createTime: now,
+		eventTime:  now,
+	}
+}
+
+type clientWindowStats struct {
+	log Logger
+
+	sourceCount                 int
+	netSourceCount              int
+	sendAckCount                int
+	sendAckByteCount            ByteCount
+	sendNackCount               int
+	sendNackByteCount           ByteCount
+	sendSynCount                int
+	receiveAckCount             int
+	receiveAckByteCount         ByteCount
+	receiveSynCount             int
+	ackByteCount                ByteCount
+	windowDuration              time.Duration
+	firstSendAckTime            time.Time
+	firstSendNackTime           time.Time
+	firstSendSynTime            time.Time
+	estimatedByteCountPerSecond ByteCount
+	// FIXME firstStatDuration
+	clientDuration       time.Duration
+	healthyDuration      time.Duration
+	unhealthyDuration    time.Duration
+	netHealthyDuration   time.Duration
+	netUnhealthyDuration time.Duration
+	healthy              bool
+	removeTime           time.Time
+	lastEventTime        time.Time
+
+	// internal
+	bucketCount int
+}
+
+func (self *clientWindowStats) EffectiveByteCountPerSecond() ByteCount {
+	millis := int64(self.windowDuration / time.Millisecond)
+	if millis <= 0 {
+		return ByteCount(0)
+	}
+	netByteCount := int64(self.sendAckByteCount + self.receiveAckByteCount)
+	return ByteCount((1000*netByteCount + millis/2) / millis)
+}
+
+func (self *clientWindowStats) EffectiveByteCount() (send ByteCount, receive ByteCount) {
+	millis := int64(self.windowDuration / time.Millisecond)
+	if millis <= 0 {
+		return
+	}
+	send = self.sendAckByteCount
+	receive = self.receiveAckByteCount
+	return
+}
+
+func (self *clientWindowStats) ExpectedByteCountPerSecond() ByteCount {
+	millis := int64(self.windowDuration / time.Millisecond)
+	if millis <= 0 {
+		return self.estimatedByteCountPerSecond
+	}
+	netByteCount := int64(self.sendAckByteCount + self.sendNackByteCount + self.receiveAckByteCount)
+	if self.log.V(2).Enabled() {
+		self.log.Infof("[multi]expected use estimated = %dbps (net = %db/%dms)\n", self.estimatedByteCountPerSecond, netByteCount, millis)
+	}
+	return max(
+		self.estimatedByteCountPerSecond-ByteCount((1000*netByteCount+millis/2)/millis),
+		0,
+	)
+}
+
+type multiClientChannel struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	log    Logger
+
+	args *multiClientChannelArgs
+
+	api *BringYourApi
+
+	clientReceivePacketCallback clientReceivePacketFunction
+	ingressSecurityPolicy       SecurityPolicy
+	performanceProfile          *PerformanceProfile
+	createTime                  time.Time
+
+	settings *MultiClientSettings
+
+	// sourceFilter map[TransferPath]bool
+
+	client *Client
+
+	stateLock    sync.Mutex
+	eventBuckets []*multiClientEventBucket
+	// destination -> source -> count
+	ip4DestinationSourceCount          map[Ip4Path]map[Ip4Path]int
+	ip6DestinationSourceCount          map[Ip6Path]map[Ip6Path]int
+	packetStats                        *clientWindowStats
+	endErr                             error
+	maxEffectiveByteCountPerSecond     ByteCount
+	maxEffectiveByteCountPerSecondTime time.Time
+	firstEventTime                     time.Time
+
+	healthy              bool
+	lastHealthyTime      time.Time
+	lastUnhealthyTime    time.Time
+	netHealthyDuration   time.Duration
+	netUnhealthyDuration time.Duration
+
+	// affinityCount int
+	// affinityTime  time.Time
+
+	clientReceiveUnsub func()
+
+	warning bool
+}
+
+func newMultiClientChannel(
+	ctx context.Context,
+	args *multiClientChannelArgs,
+	generator MultiClientGenerator,
+	clientReceivePacketCallback clientReceivePacketFunction,
+	ingressSecurityPolicy SecurityPolicy,
+	contractStatusCallback ContractStatusFunction,
+	contractStatsCallback ContractStatsFunction,
+	peerIdentityChangeCallback func(),
+	performanceProfile *PerformanceProfile,
+	settings *MultiClientSettings,
+) (*multiClientChannel, error) {
+	cancelCtx, cancel := context.WithCancel(ctx)
+
+	clientSettings := generator.NewClientSettings()
+	clientSettings.SendBufferSettings.AckTimeout = settings.AckTimeout
+	if performanceProfile != nil && performanceProfile.PostQuantumEncryption {
+		// pqe: opportunistic per-peer e2e sessions (post-quantum key
+		// exchange). A provider without session support falls back to
+		// plaintext at this layer.
+		if clientSettings.EncryptionSettings == nil {
+			clientSettings.EncryptionSettings = DefaultEncryptionSettings()
+		}
+		clientSettings.EncryptionSettings.Encrypt = true
+	}
+
+	client, err := generator.NewClient(
+		cancelCtx,
+		&args.MultiClientGeneratorClientArgs,
+		clientSettings,
+	)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	contractStatusSub := client.ContractManager().AddContractStatusCallback(contractStatusCallback)
+	contractStatsSub := client.ContractManager().AddContractStatsCallback(contractStatsCallback)
+	peerIdentitySub := client.EncryptionSessionManager().AddPeerIdentityChangeCallback(peerIdentityChangeCallback)
+	go HandleError(func() {
+		select {
+		case <-cancelCtx.Done():
+		case <-client.Done():
+		}
+		// fire the contract-close events for this client's still-open contracts
+		// while the stats listener below is still attached, BEFORE cancelling the
+		// client (which stops the epoch worker without emitting). Otherwise a
+		// removed peer's contracts linger open forever in the contract-details UI.
+		client.CloseContractStats()
+		client.Cancel()
+		contractStatusSub()
+		contractStatsSub()
+		peerIdentitySub()
+		// the removed client's established peers leave the aggregate set
+		peerIdentityChangeCallback()
+		generator.RemoveClientWithArgs(client, &args.MultiClientGeneratorClientArgs)
+	}, cancel)
+
+	// sourceFilter := map[TransferPath]bool{
+	//     Path{ClientId:args.DestinationId}: true,
+	// }
+
+	clientChannel := &multiClientChannel{
+		ctx:                         cancelCtx,
+		cancel:                      cancel,
+		log:                         loggerOrDefault(settings.Log),
+		args:                        args,
+		clientReceivePacketCallback: clientReceivePacketCallback,
+		ingressSecurityPolicy:       ingressSecurityPolicy,
+		performanceProfile:          performanceProfile,
+		createTime:                  time.Now(),
+		settings:                    settings,
+		// sourceFilter: sourceFilter,
+		client:                    client,
+		eventBuckets:              []*multiClientEventBucket{},
+		ip4DestinationSourceCount: map[Ip4Path]map[Ip4Path]int{},
+		ip6DestinationSourceCount: map[Ip6Path]map[Ip6Path]int{},
+		packetStats:               &clientWindowStats{log: loggerOrDefault(settings.Log)},
+		// affinityCount:             0,
+		// affinityTime:              time.Time{},
+	}
+	go HandleError(clientChannel.detectBlackhole, cancel)
+	go HandleError(clientChannel.ping, cancel)
+
+	clientReceiveUnsub := client.AddReceiveCallback(clientChannel.clientReceive)
+	clientChannel.clientReceiveUnsub = clientReceiveUnsub
+
+	return clientChannel, nil
+}
+
+func (self *multiClientChannel) ClientId() Id {
+	return self.client.ClientId()
+}
+
+func (self *multiClientChannel) IsP2pOnly() bool {
+	return self.args.MultiClientGeneratorClientArgs.P2pOnly
+}
+
+func (self *multiClientChannel) Tier() int {
+	return self.args.DestinationStats.Tier
+}
+
+func (self *multiClientChannel) EstimatedByteCountPerSecond() ByteCount {
+	return self.args.EstimatedBytesPerSecond
+}
+
+func (self *multiClientChannel) setWarning(warning bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.warning = warning
+}
+
+func (self *multiClientChannel) isWarning() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.warning
+}
+
+// func (self *multiClientChannel) UpdateAffinity() {
+// 	self.stateLock.Lock()
+// 	defer self.stateLock.Unlock()
+
+// 	self.affinityCount += 1
+// 	self.affinityTime = time.Now()
+// }
+
+// func (self *multiClientChannel) ClearAffinity() {
+// 	self.stateLock.Lock()
+// 	defer self.stateLock.Unlock()
+
+// 	self.affinityCount = 0
+// 	self.affinityTime = time.Time{}
+// }
+
+// func (self *multiClientChannel) MostRecentAffinity() (int, time.Time) {
+// 	self.stateLock.Lock()
+// 	defer self.stateLock.Unlock()
+
+// 	return self.affinityCount, self.affinityTime
+// }
+
+func (self *multiClientChannel) Send(parsedPacket *parsedPacket, timeout time.Duration) bool {
+	success, err := self.SendDetailed(parsedPacket, timeout)
+	return success && err == nil
+}
+
+func (self *multiClientChannel) SendDetailed(parsedPacket *parsedPacket, timeout time.Duration) (bool, error) {
+	var ack bool
+	switch parsedPacket.ipPath.Protocol {
+	case IpProtocolUdp:
+		if self.settings.UdpCollapsePrevention {
+			ack = false
+		} else {
+			ack = true
+		}
+	default:
+		ack = true
+	}
+	return self.SendDetailedWithAck(parsedPacket, timeout, ack)
+}
+
+func (self *multiClientChannel) SendWithAck(parsedPacket *parsedPacket, timeout time.Duration, ack bool) bool {
+	success, err := self.SendDetailedWithAck(parsedPacket, timeout, ack)
+	return success && err == nil
+}
+
+func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, timeout time.Duration, ack bool) (bool, error) {
+	if frame, err := ipPacketToProviderFrame(parsedPacket.packet, self.settings.ProtocolVersion); err != nil {
+		self.addError(err)
+		return false, err
+	} else {
+		packetByteCount := ByteCount(len(parsedPacket.packet))
+		self.addSend(packetByteCount, parsedPacket.ipPath)
+		ackCallback := func(err error) {
+			if err == nil {
+				self.addSendAck(packetByteCount)
+			} else {
+				self.addError(err)
+			}
+		}
+
+		var opts []any
+		if self.performanceProfile != nil && self.performanceProfile.AllowDirect {
+			opts = append(opts, ForceStream())
+		}
+		if !ack {
+			opts = append(opts, NoAck())
+		}
+		success, err := self.client.SendMultiHopWithTimeoutDetailed(
+			frame,
+			self.args.Destination,
+			ackCallback,
+			timeout,
+			opts...,
+		)
+		// ownership: `parsedPacket.packet` is consumed on success and stays with the
+		// caller on any failure. The wrapped (!raw) marshal buffer is internal and
+		// must be freed on any failure; for raw frames the frame bytes ARE the
+		// caller's packet, so they are never freed here on failure.
+		if err != nil {
+			if !frame.Raw {
+				MessagePoolReturn(frame.MessageBytes)
+			}
+			return success, err
+		}
+		if success {
+			if !frame.Raw {
+				MessagePoolReturn(parsedPacket.packet)
+			}
+		} else {
+			if !frame.Raw {
+				MessagePoolReturn(frame.MessageBytes)
+			}
+		}
+		return success, err
+	}
+}
+
+func (self *multiClientChannel) SendDetailedMessage(message proto.Message, timeout time.Duration, ackCallback func(error)) (bool, error) {
+	if frame, err := ToFrame(message, self.settings.ProtocolVersion); err != nil {
+		return false, err
+	} else {
+		var opts []any
+		if self.performanceProfile != nil && self.performanceProfile.AllowDirect {
+			opts = append(opts, ForceStream())
+		}
+		return self.client.SendMultiHopWithTimeoutDetailed(
+			frame,
+			self.args.Destination,
+			ackCallback,
+			timeout,
+			opts...,
+		)
+	}
+}
+
+func (self *multiClientChannel) Done() <-chan struct{} {
+	return self.ctx.Done()
+}
+
+func (self *multiClientChannel) Destination() MultiHopId {
+	return self.args.Destination
+}
+
+func (self *multiClientChannel) detectBlackhole() {
+	// within a timeout window, if there are sent data but none received,
+	// error out. This is similar to an ack timeout.
+	defer self.cancel()
+
+	for {
+		if windowStats, err := self.WindowStats(); err != nil {
+			return
+		} else {
+			blackhole := func() bool {
+				now := time.Now()
+				if !windowStats.firstSendNackTime.IsZero() && self.settings.BlackholeTimeout-now.Sub(windowStats.firstSendNackTime) <= 0 {
+					if windowStats.sendAckCount <= 0 {
+						return true
+					}
+					if windowStats.receiveAckCount <= 0 {
+						return true
+					}
+				}
+				if !windowStats.firstSendSynTime.IsZero() && self.settings.BlackholeConnectTimeout-now.Sub(windowStats.firstSendSynTime) <= 0 {
+					if windowStats.receiveSynCount <= 0 {
+						return true
+					}
+				}
+				return false
+			}()
+
+			if blackhole {
+				// the client has sent data but received nothing back
+				// this looks like a blackhole
+				if self.log.V(1).Enabled() {
+					self.log.Infof("[multi]routing %s blackhole: %d %dB <> %d %dB (%d <> %d)\n",
+						self.args.Destination,
+						windowStats.sendAckCount,
+						windowStats.sendAckByteCount,
+						windowStats.receiveAckCount,
+						windowStats.receiveAckByteCount,
+						windowStats.sendSynCount,
+						windowStats.receiveSynCount,
+					)
+				}
+				self.addError(fmt.Errorf("Blackhole (%d %dB)",
+					windowStats.sendAckCount,
+					windowStats.sendAckByteCount,
+				))
+				return
+			} else {
+				if self.log.V(1).Enabled() {
+					self.log.Infof(
+						"[multi]routing ok %s: %d %dB <> %d %dB (%d <> %d)\n",
+						self.args.Destination,
+						windowStats.sendAckCount,
+						windowStats.sendAckByteCount,
+						windowStats.receiveAckCount,
+						windowStats.receiveAckByteCount,
+						windowStats.sendSynCount,
+						windowStats.receiveSynCount,
+					)
+				}
+			}
+
+			select {
+			case <-self.ctx.Done():
+				return
+			case <-self.client.Done():
+				return
+			case <-time.After(self.settings.BlackholeTimeout / 4):
+			}
+		}
+	}
+}
+
+func (self *multiClientChannel) ping() {
+	defer self.cancel()
+
+	for {
+		if windowStats, err := self.WindowStats(); err != nil {
+			return
+		} else if self.settings.CPingMaxByteCountPerSecond == 0 || windowStats.EffectiveByteCountPerSecond() <= self.settings.CPingMaxByteCountPerSecond {
+			pingDone := make(chan error)
+			success, err := self.SendDetailedMessage(
+				&protocol.IpPing{},
+				self.settings.CPingWriteTimeout,
+				func(err error) {
+					defer close(pingDone)
+					select {
+					case <-self.ctx.Done():
+						return
+					case pingDone <- err:
+					}
+				},
+			)
+			if err != nil {
+				close(pingDone)
+				return
+			} else if !success {
+				close(pingDone)
+				return
+			} else {
+				select {
+				case <-self.ctx.Done():
+					return
+				case <-self.client.Done():
+					return
+				case err := <-pingDone:
+					if err != nil {
+						self.addError(err)
+						return
+					}
+				case <-time.After(self.settings.CPingTimeout):
+					return
+				}
+			}
+		}
+
+		// rest between pings. `CPingRestTimeout` is decoupled from the ack wait
+		// so a dead idle client is detected promptly (rest + ack wait), with a
+		// fallback to `CPingTimeout` for settings that predate the split
+		restTimeout := self.settings.CPingRestTimeout
+		if restTimeout <= 0 {
+			restTimeout = self.settings.CPingTimeout
+		}
+		select {
+		case <-self.ctx.Done():
+			return
+		case <-self.client.Done():
+			return
+		case <-WakeupAfter(restTimeout, restTimeout):
+		}
+	}
+}
+
+// addSend records the per-packet send stats (nack, optional syn, and source)
+// in a single locked section, so the hot send path takes the channel lock and
+// resolves the event bucket once per packet instead of two-three times.
+func (self *multiClientChannel) addSend(packetByteCount ByteCount, ipPath *IpPath) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	eventBucket := self.eventBucket()
+
+	self.packetStats.sendNackCount += 1
+	self.packetStats.sendNackByteCount += packetByteCount
+	if eventBucket.sendNackCount == 0 {
+		eventBucket.sendNackTime = time.Now()
+	}
+	eventBucket.sendNackCount += 1
+	eventBucket.sendNackByteCount += packetByteCount
+
+	if ipPath.Syn {
+		self.packetStats.sendSynCount += 1
+		if eventBucket.sendSynCount == 0 {
+			eventBucket.sendSynTime = time.Now()
+		}
+		eventBucket.sendSynCount += 1
+	}
+
+	self.addSourceToEventBucketWithLock(eventBucket, ipPath)
+}
+
+func (self *multiClientChannel) addSendNack(ackByteCount ByteCount) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	self.packetStats.sendNackCount += 1
+	self.packetStats.sendNackByteCount += ackByteCount
+
+	eventBucket := self.eventBucket()
+	if eventBucket.sendNackCount == 0 {
+		eventBucket.sendNackTime = time.Now()
+	}
+	eventBucket.sendNackCount += 1
+	eventBucket.sendNackByteCount += ackByteCount
+}
+
+func (self *multiClientChannel) addSendAck(ackByteCount ByteCount) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	self.packetStats.sendNackCount -= 1
+	self.packetStats.sendNackByteCount -= ackByteCount
+	self.packetStats.sendAckCount += 1
+	self.packetStats.sendAckByteCount += ackByteCount
+
+	eventBucket := self.eventBucket()
+	if eventBucket.sendAckCount == 0 {
+		eventBucket.sendAckTime = time.Now()
+	}
+	eventBucket.sendAckCount += 1
+	eventBucket.sendAckByteCount += ackByteCount
+}
+
+func (self *multiClientChannel) addSendSyn(synCount int) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	self.packetStats.sendSynCount += synCount
+
+	eventBucket := self.eventBucket()
+	if eventBucket.sendSynCount == 0 {
+		eventBucket.sendSynTime = time.Now()
+	}
+	eventBucket.sendSynCount += synCount
+}
+
+func (self *multiClientChannel) addReceiveAck(ackByteCount ByteCount) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	self.packetStats.receiveAckCount += 1
+	self.packetStats.receiveAckByteCount += ackByteCount
+
+	eventBucket := self.eventBucket()
+	eventBucket.receiveAckCount += 1
+	eventBucket.receiveAckByteCount += ackByteCount
+}
+
+func (self *multiClientChannel) addReceiveSyn(synCount int) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	self.packetStats.receiveSynCount += synCount
+
+	eventBucket := self.eventBucket()
+	eventBucket.receiveSynCount += synCount
+}
+
+func (self *multiClientChannel) addSource(ipPath *IpPath) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	self.addSourceToEventBucketWithLock(self.eventBucket(), ipPath)
+}
+
+// must be called with `stateLock`
+func (self *multiClientChannel) addSourceToEventBucketWithLock(eventBucket *multiClientEventBucket, ipPath *IpPath) {
+	// `ip{4,6}DestinationSourceCount[destination][source]` is a reference count
+	// of how many event buckets currently hold the path. `removeEventBucket`
+	// decrements it once per path in the bucket's set, so the increment here
+	// must also happen exactly once per (bucket, path) — i.e. only when the path
+	// is newly added to this bucket's set. doing it on every packet (the prior
+	// behavior) both over-counted (the count never returned to zero, so sources
+	// were never released — unbounded growth) and did redundant per-packet map
+	// writes under the lock. after the first packet of a flow in a bucket, this
+	// is a single map read and no writes.
+	switch ipPath.Version {
+	case 4:
+		ip4Path := ipPath.ToIp4Path()
+
+		if eventBucket.ip4Paths == nil {
+			eventBucket.ip4Paths = map[Ip4Path]bool{}
+		}
+		if eventBucket.ip4Paths[ip4Path] {
+			return
+		}
+		eventBucket.ip4Paths[ip4Path] = true
+
+		source := ip4Path.Source()
+		destination := ip4Path.Destination()
+
+		sourceCount, ok := self.ip4DestinationSourceCount[destination]
+		if !ok {
+			sourceCount = map[Ip4Path]int{}
+			self.ip4DestinationSourceCount[destination] = sourceCount
+		}
+		sourceCount[source] += 1
+	case 6:
+		ip6Path := ipPath.ToIp6Path()
+
+		if eventBucket.ip6Paths == nil {
+			eventBucket.ip6Paths = map[Ip6Path]bool{}
+		}
+		if eventBucket.ip6Paths[ip6Path] {
+			return
+		}
+		eventBucket.ip6Paths[ip6Path] = true
+
+		source := ip6Path.Source()
+		destination := ip6Path.Destination()
+
+		sourceCount, ok := self.ip6DestinationSourceCount[destination]
+		if !ok {
+			sourceCount = map[Ip6Path]int{}
+			self.ip6DestinationSourceCount[destination] = sourceCount
+		}
+		sourceCount[source] += 1
+	default:
+		panic(fmt.Errorf("Bad protocol version %d", ipPath.Version))
+	}
+}
+
+func (self *multiClientChannel) addError(err error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	if self.endErr == nil {
+		self.endErr = err
+	}
+
+	eventBucket := self.eventBucket()
+	eventBucket.errs = append(eventBucket.errs, err)
+}
+
+// must be called with `stateLock`
+func (self *multiClientChannel) eventBucket() *multiClientEventBucket {
+	now := time.Now()
+
+	var eventBucket *multiClientEventBucket
+	if n := len(self.eventBuckets); 0 < n {
+		eventBucket = self.eventBuckets[n-1]
+	}
+
+	if eventBucket == nil || eventBucket.createTime.Add(self.settings.StatsWindowBucketDuration).Before(now) {
+		eventBucket = newMultiClientEventBucket()
+		self.eventBuckets = append(self.eventBuckets, eventBucket)
+	}
+
+	eventBucket.eventTime = now
+
+	self.coalesceEventBuckets()
+
+	return eventBucket
+}
+
+// must be called with `stateLock`
+func (self *multiClientChannel) coalesceEventBuckets() {
+	// if there is no activity (no new buckets), keep historical buckets around
+	minBucketCount := 1 + int(self.settings.StatsWindowDuration/self.settings.StatsWindowBucketDuration)
+
+	windowStart := time.Now().Add(-self.settings.StatsWindowDuration)
+
+	removeEventBucket := func(eventBucket *multiClientEventBucket) {
+		self.packetStats.sendAckCount -= eventBucket.sendAckCount
+		self.packetStats.sendAckByteCount -= eventBucket.sendAckByteCount
+		self.packetStats.sendSynCount -= eventBucket.sendSynCount
+		self.packetStats.receiveAckCount -= eventBucket.receiveAckCount
+		self.packetStats.receiveAckByteCount -= eventBucket.receiveAckByteCount
+		self.packetStats.receiveSynCount -= eventBucket.receiveSynCount
+
+		for ip4Path, _ := range eventBucket.ip4Paths {
+			source := ip4Path.Source()
+			destination := ip4Path.Destination()
+
+			sourceCount, ok := self.ip4DestinationSourceCount[destination]
+			if ok {
+				count := sourceCount[source]
+				if count-1 <= 0 {
+					delete(sourceCount, source)
+				} else {
+					sourceCount[source] = count - 1
+				}
+				if len(sourceCount) == 0 {
+					delete(self.ip4DestinationSourceCount, destination)
+				}
+			}
+		}
+
+		for ip6Path, _ := range eventBucket.ip6Paths {
+			source := ip6Path.Source()
+			destination := ip6Path.Destination()
+
+			sourceCount, ok := self.ip6DestinationSourceCount[destination]
+			if ok {
+				count := sourceCount[source]
+				if count-1 <= 0 {
+					delete(sourceCount, source)
+				} else {
+					sourceCount[source] = count - 1
+				}
+				if len(sourceCount) == 0 {
+					delete(self.ip6DestinationSourceCount, destination)
+				}
+			}
+		}
+	}
+
+	// remove all events before the window start
+	i := 0
+	for i < len(self.eventBuckets) && self.eventBuckets[i].eventTime.Before(windowStart) {
+		removeEventBucket(self.eventBuckets[i])
+		self.eventBuckets[i] = nil
+		i += 1
+	}
+	for i < len(self.eventBuckets) && minBucketCount < len(self.eventBuckets) {
+		removeEventBucket(self.eventBuckets[i])
+		self.eventBuckets[i] = nil
+		i += 1
+	}
+	if 0 < i {
+		self.eventBuckets = self.eventBuckets[i:]
+	}
+}
+
+func (self *multiClientChannel) WindowStats() (*clientWindowStats, error) {
+	return self.windowStatsWithCoalesce(true)
+}
+
+func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientWindowStats, error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	if coalesce {
+		self.coalesceEventBuckets()
+	}
+
+	// omit the latest two event buckets since they may be partial
+	var eventBuckets []*multiClientEventBucket
+	if 2 <= len(self.eventBuckets) {
+		eventBuckets = self.eventBuckets[0 : len(self.eventBuckets)-2]
+	}
+
+	windowDuration := time.Duration(0)
+	if 0 < len(eventBuckets) {
+		endTime := eventBuckets[len(eventBuckets)-1].eventTime
+		windowDuration = endTime.Sub(eventBuckets[0].createTime)
+	}
+	var firstSendAckTime time.Time
+	for _, eventBucket := range eventBuckets {
+		if 0 < eventBucket.sendAckCount {
+			firstSendAckTime = eventBucket.sendAckTime
+			break
+		}
+	}
+	var firstSendNackTime time.Time
+	for _, eventBucket := range eventBuckets {
+		if 0 < eventBucket.sendNackCount {
+			firstSendNackTime = eventBucket.sendNackTime
+			break
+		}
+	}
+	var firstSendSynTime time.Time
+	for _, eventBucket := range eventBuckets {
+		if 0 < eventBucket.sendSynCount {
+			firstSendSynTime = eventBucket.sendSynTime
+			break
+		}
+	}
+
+	// public internet resource ports
+	isPublicPort := func(port int) bool {
+		switch port {
+		case 443:
+			return true
+		default:
+			return false
+		}
+	}
+
+	netSourceCounts := []int{}
+	for ip4Path, sourceCounts := range self.ip4DestinationSourceCount {
+		if isPublicPort(ip4Path.DestinationPort) {
+			netSourceCounts = append(netSourceCounts, len(sourceCounts))
+		}
+	}
+	for ip6Path, sourceCounts := range self.ip6DestinationSourceCount {
+		if isPublicPort(ip6Path.DestinationPort) {
+			netSourceCounts = append(netSourceCounts, len(sourceCounts))
+		}
+	}
+	slices.Sort(netSourceCounts)
+	maxSourceCount := 0
+	selectionIndex := int(math.Ceil(
+		self.settings.StatsSourceCountSelection * float64(len(netSourceCounts)-1),
+	))
+	if selectionIndex < len(netSourceCounts) {
+		maxSourceCount = netSourceCounts[selectionIndex]
+	}
+	netSourceCount := 0
+	for _, sourceCounts := range self.ip4DestinationSourceCount {
+		netSourceCount += len(sourceCounts)
+	}
+	for _, sourceCounts := range self.ip6DestinationSourceCount {
+		netSourceCount += len(sourceCounts)
+	}
+	if self.log.V(2).Enabled() {
+		for ip4Path, sourceCounts := range self.ip4DestinationSourceCount {
+			if isPublicPort(ip4Path.DestinationPort) {
+				if len(sourceCounts) == maxSourceCount {
+					self.log.Infof("[multi]max source count %d = %v\n", maxSourceCount, ip4Path)
+				}
+			}
+		}
+		for ip6Path, sourceCounts := range self.ip6DestinationSourceCount {
+			if isPublicPort(ip6Path.DestinationPort) {
+				if len(sourceCounts) == maxSourceCount {
+					self.log.Infof("[multi]max source count %d = %v\n", maxSourceCount, ip6Path)
+				}
+			}
+		}
+	}
+
+	stats := &clientWindowStats{
+		log:                 self.log,
+		sourceCount:         maxSourceCount,
+		netSourceCount:      netSourceCount,
+		sendAckCount:        self.packetStats.sendAckCount,
+		sendNackCount:       self.packetStats.sendNackCount,
+		sendAckByteCount:    self.packetStats.sendAckByteCount,
+		sendSynCount:        self.packetStats.sendSynCount,
+		sendNackByteCount:   self.packetStats.sendNackByteCount,
+		receiveAckCount:     self.packetStats.receiveAckCount,
+		receiveAckByteCount: self.packetStats.receiveAckByteCount,
+		receiveSynCount:     self.packetStats.receiveSynCount,
+		windowDuration:      windowDuration,
+		firstSendAckTime:    firstSendAckTime,
+		firstSendNackTime:   firstSendNackTime,
+		firstSendSynTime:    firstSendSynTime,
+		bucketCount:         len(eventBuckets),
+	}
+	if 0 < len(eventBuckets) || !self.firstEventTime.IsZero() {
+		// var eventTime time.Time
+		// if 0 < len(eventBuckets) {
+		// 	eventTime = eventBuckets[len(eventBuckets)-1].eventTime
+		// } else {
+		// 	eventTime = time.Now()
+		// }
+		eventTime := time.Now()
+
+		if 0 < len(eventBuckets) {
+			stats.lastEventTime = eventBuckets[len(eventBuckets)-1].eventTime
+		}
+
+		effectiveByteCountPerSecond := stats.EffectiveByteCountPerSecond()
+		// scaledEffectiveByteCountPerSecond := ByteCount(self.settings.StatsWindowMaxEffectiveByteCountPerSecondScale * float32(stats.EffectiveByteCountPerSecond()))
+		if self.maxEffectiveByteCountPerSecond < effectiveByteCountPerSecond {
+			self.maxEffectiveByteCountPerSecond = effectiveByteCountPerSecond
+			self.maxEffectiveByteCountPerSecondTime = eventTime
+		}
+
+		effectiveSendByteCount, effectiveReceiveByteCount := stats.EffectiveByteCount()
+		healthy := (0 < effectiveSendByteCount) == (0 < effectiveReceiveByteCount)
+		if healthy {
+			if self.lastUnhealthyTime.IsZero() {
+				self.lastUnhealthyTime = eventTime
+			}
+
+			if !self.healthy {
+				self.healthy = true
+				if !self.lastHealthyTime.IsZero() {
+					self.netUnhealthyDuration += self.lastUnhealthyTime.Sub(self.lastHealthyTime)
+				}
+			}
+
+			self.lastHealthyTime = eventTime
+
+			stats.healthyDuration = eventTime.Sub(self.lastUnhealthyTime)
+		} else {
+			if self.lastHealthyTime.IsZero() {
+				self.lastHealthyTime = eventTime
+			}
+
+			if self.healthy {
+				self.healthy = false
+				if !self.lastUnhealthyTime.IsZero() {
+					self.netHealthyDuration += self.lastHealthyTime.Sub(self.lastUnhealthyTime)
+				}
+			}
+
+			self.lastUnhealthyTime = eventTime
+
+			stats.unhealthyDuration = eventTime.Sub(self.lastHealthyTime)
+		}
+		stats.healthy = healthy
+		stats.netHealthyDuration = self.netHealthyDuration + stats.healthyDuration
+		stats.netUnhealthyDuration = self.netUnhealthyDuration + stats.unhealthyDuration
+		if self.firstEventTime.IsZero() {
+			self.firstEventTime = eventBuckets[0].createTime
+		}
+		stats.clientDuration = eventTime.Sub(self.firstEventTime)
+		stats.removeTime = self.firstEventTime.Add(self.settings.MaxClientLifetime)
+	}
+	// if !self.firstEventTime.IsZero() {
+	// 	stats.removeTime = self.firstEventTime.Add(self.settings.MaxClientLifetime)
+	// }
+	if self.settings.StatsWindowGraceperiod < stats.clientDuration {
+		stats.estimatedByteCountPerSecond = self.maxEffectiveByteCountPerSecond
+	} else {
+		stats.estimatedByteCountPerSecond = max(
+			min(self.EstimatedByteCountPerSecond(), self.settings.StatsWindowMaxEstimatedByteCountPerSecond),
+			self.maxEffectiveByteCountPerSecond,
+		)
+	}
+
+	err := self.endErr
+	if err == nil {
+		select {
+		case <-self.ctx.Done():
+			err = errors.New("Done.")
+		case <-self.client.Done():
+			err = errors.New("Done.")
+		default:
+		}
+	}
+
+	return stats, err
+}
+
+// `connect.ReceiveFunction`
+func (self *multiClientChannel) clientReceive(source TransferPath, frames []*protocol.Frame, peer Peer) {
+	select {
+	case <-self.ctx.Done():
+		return
+	default:
+	}
+
+	// only process frames from the destinations
+	// if allow := self.sourceFilter[source]; !allow {
+	//     self.log.V(2).Infof("[multi]receive drop %d %s<-\n", len(frames), self.args.DestinationId)
+	//     return
+	// }
+
+	for _, frame := range frames {
+		switch frame.MessageType {
+		case protocol.MessageType_IpIpPacketFromProvider:
+			if ipPacketFromProvider_, err := FromFrame(frame); err == nil {
+				ipPacketFromProvider := ipPacketFromProvider_.(*protocol.IpPacketFromProvider)
+
+				packet := ipPacketFromProvider.IpPacket.PacketBytes
+
+				ipPath, err := ParseIpPath(packet)
+				if err == nil {
+					self.addReceiveAck(ByteCount(len(packet)))
+					if ipPath.Syn {
+						self.addReceiveSyn(1)
+					}
+					self.clientReceivePacketCallback(self, source, peer.ProvideMode, ipPath, packet)
+				}
+				// else not an ip packet, drop
+			} else {
+				if self.log.V(2).Enabled() {
+					self.log.Infof("[multi]receive drop %s<- = %s\n", self.args.Destination, err)
+				}
+			}
+		default:
+			// unknown message, drop
+		}
+	}
+}
+
+func (self *multiClientChannel) Cancel() {
+	self.addError(errors.New("Done."))
+	self.cancel()
+	self.client.Cancel()
+	// unsubscribe even on Cancel so the underlying Client's callback list
+	// doesn't retain a dangling reference for channels that are shuffled out
+	// without ever going through Close. unsub is idempotent.
+	self.clientReceiveUnsub()
+}
+
+func (self *multiClientChannel) Close() {
+	self.addError(errors.New("Done."))
+	self.cancel()
+	self.client.Close()
+
+	self.clientReceiveUnsub()
+}
+
+func (self *multiClientChannel) IsDone() bool {
+	select {
+	case <-self.ctx.Done():
+		return true
+	default:
+		return false
+	}
+}
