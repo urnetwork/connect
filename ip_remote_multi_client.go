@@ -767,8 +767,7 @@ func forceAllowDirect(performanceProfile *PerformanceProfile, allowDirect bool) 
 			return nil
 		}
 		return &PerformanceProfile{
-			WindowType:  WindowTypeQuality,
-			WindowSize:  DefaultWindowSizeSettings(),
+			WindowType:  WindowTypeAuto,
 			AllowDirect: true,
 		}
 	}
