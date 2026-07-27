@@ -106,6 +106,9 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 	return &MultiClientSettings{
 		SequenceBufferSize:  defaultTransferBufferSize,
 		SequenceIdleTimeout: 120 * time.Second,
+		// tcp connections are routinely idle between requests and users still
+		// consider them open; traditional vpns hold nat state for 5-30 minutes
+		TcpSequenceIdleTimeout: 600 * time.Second,
 
 		WindowSizes: map[WindowType]WindowSizeSettings{
 			// TODO increase `WindowSizeMinP2pOnly` when p2p is deployed
@@ -225,6 +228,10 @@ type MultiClientSettings struct {
 
 	SequenceBufferSize  int
 	SequenceIdleTimeout time.Duration
+	// TcpSequenceIdleTimeout is the idle timeout for tcp flows specifically.
+	// 0 falls back to SequenceIdleTimeout, restoring the previous single-value
+	// behavior. See `sequenceIdleTimeout`.
+	TcpSequenceIdleTimeout time.Duration
 	WindowSizes         map[WindowType]WindowSizeSettings
 	// ClientNackInitialLimit int
 	// ClientNackMaxLimit int
@@ -1107,6 +1114,21 @@ func (self *RemoteUserNatMultiClient) sendClientPath(ipPath *IpPath, callback fu
 // SequenceIdleTimeout, or the update ctx is done. it runs only inside the
 // per-flow teardown goroutine; hoisted out of sendUpdate (rather than an inline
 // closure) so the per-packet steady-state path does not allocate it.
+// sequenceIdleTimeout is how long a flow may sit idle before it is torn down.
+//
+// A tcp connection is routinely idle between requests -- ssh sessions,
+// websockets, push channels -- and the application still considers it open.
+// Traditional vpns hold tcp nat state for 5-30 minutes, so a 2 minute bound
+// resets connections users have every reason to think are alive. Udp has no
+// equivalent notion of an open connection and its mappings are conventionally
+// short lived, so it keeps the tighter bound.
+func (self *RemoteUserNatMultiClient) sequenceIdleTimeout(ipPath *IpPath) time.Duration {
+	if ipPath != nil && ipPath.Protocol == IpProtocolTcp && 0 < self.settings.TcpSequenceIdleTimeout {
+		return self.settings.TcpSequenceIdleTimeout
+	}
+	return self.settings.SequenceIdleTimeout
+}
+
 func (self *RemoteUserNatMultiClient) waitForIdleUpdate(update *multiClientChannelUpdate) {
 	for {
 		select {
@@ -1120,7 +1142,7 @@ func (self *RemoteUserNatMultiClient) waitForIdleUpdate(update *multiClientChann
 			self.stateLock.Lock()
 			defer self.stateLock.Unlock()
 
-			idleTimeout = update.activityTime.Add(self.settings.SequenceIdleTimeout).Sub(time.Now())
+			idleTimeout = update.activityTime.Add(self.sequenceIdleTimeout(update.ipPath)).Sub(time.Now())
 		}()
 		if idleTimeout <= 0 {
 			return
@@ -1201,7 +1223,7 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 
 						updateDone := update.IsDone()
 						if !updateDone {
-							if t := update.activityTime.Add(self.settings.SequenceIdleTimeout).Sub(time.Now()); 0 < t {
+							if t := update.activityTime.Add(self.sequenceIdleTimeout(update.ipPath)).Sub(time.Now()); 0 < t {
 								// updated since wait for idle
 								return false
 							}
@@ -1298,7 +1320,7 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 
 						updateDone := update.IsDone()
 						if !updateDone {
-							if t := update.activityTime.Add(self.settings.SequenceIdleTimeout).Sub(time.Now()); 0 < t {
+							if t := update.activityTime.Add(self.sequenceIdleTimeout(update.ipPath)).Sub(time.Now()); 0 < t {
 								// updated since wait for idle
 								return false
 							}
