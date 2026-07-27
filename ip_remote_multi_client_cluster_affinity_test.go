@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"net"
 	"net/netip"
 	"testing"
 )
@@ -57,6 +58,24 @@ func TestClusterAffinityRepresentativeUnmaps(t *testing.T) {
 	rep, ok := clusterAffinityRepresentative([]netip.Addr{mapped})
 	AssertEqual(t, ok, true)
 	AssertEqual(t, rep.String(), v4.String())
+}
+
+// affinityIpPathsWithLock is exercised from bare clients across the suite, so
+// the cluster fallback must tolerate an unset settings rather than panic
+func TestClusterAffinityBareClientDoesNotPanic(t *testing.T) {
+	mc := &RemoteUserNatMultiClient{}
+	mc.config.Store(&multiClientConfig{})
+
+	paths := mc.affinityIpPathsWithLock(&IpPath{
+		Version:         4,
+		Protocol:        IpProtocolTcp,
+		DestinationIp:   net.ParseIP("93.184.216.34"),
+		DestinationPort: 443,
+	})
+
+	// falls back to plain per-ip affinity
+	AssertEqual(t, len(paths), 1)
+	AssertEqual(t, paths[0].DestinationIp.String(), "93.184.216.34")
 }
 
 func TestDefaultMultiClientSettingsEnablesClusterAffinityFallback(t *testing.T) {

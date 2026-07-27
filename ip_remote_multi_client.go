@@ -1026,7 +1026,10 @@ func (self *RemoteUserNatMultiClient) affinityIpPathsWithLock(ipPath *IpPath) (a
 			// separately. fall back to the ip association cluster, which already
 			// groups co-active ips, so the site pins to one client again.
 			destinationIp := ipPath.DestinationIp
-			if self.settings.ClusterAffinityFallback && self.ipAssoc != nil {
+			// this function is otherwise a pure function of the config and the
+			// path, and is exercised that way from bare clients, so an unset
+			// settings falls back to plain per-ip affinity rather than panicking
+			if self.settings != nil && self.settings.ClusterAffinityFallback && self.ipAssoc != nil {
 				if addr, ok := ipAssocAddr(ipPath.DestinationIp); ok {
 					// GetClusterAddrs is a lock-free atomic load, safe to call
 					// with the parent stateLock held
