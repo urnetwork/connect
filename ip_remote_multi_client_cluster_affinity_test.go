@@ -24,8 +24,11 @@ func TestClusterAffinityRepresentativeIsStable(t *testing.T) {
 	AssertEqual(t, ok, true)
 	AssertEqual(t, rep1.String(), rep3.String())
 
-	// the minimum orders deterministically
-	AssertEqual(t, rep1.String(), c.String())
+	// netip.Addr.Less orders byte-wise, not lexically by string form: the
+	// first octets are 93, 93 and 151, so the minimum is the lower of the two
+	// 93.184.216.x, and 151.101.1.140 is the largest despite sorting first as
+	// a string
+	AssertEqual(t, rep1.String(), b.String())
 }
 
 // an ip in no multi-member cluster leaves the caller on per-ip affinity
