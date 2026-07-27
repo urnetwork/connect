@@ -199,6 +199,10 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		UdpCollapsePrevention: false,
 
 		UdpTeardownSignal: true,
+		// well under the 30s AckTimeout that previously bounded a stalled
+		// flow, and past the ~200ms-1s range of a first tcp rto so a healthy
+		// flow's retransmits are still collapsed
+		TcpCollapseMaxHold: 1500 * time.Millisecond,
 
 		SecurityPolicyGenerator: DefaultSecurityPolicyWithStats,
 
@@ -310,6 +314,14 @@ type MultiClientSettings struct {
 
 	TcpCollapsePrevention bool
 	UdpCollapsePrevention bool
+
+	// TcpCollapseMaxHold bounds how long TcpCollapsePrevention may keep
+	// discarding a sender's retransmits while the committed packet makes no
+	// progress. After this long at the same sequence state, one retransmit is
+	// admitted per window. 0 disables the bound, restoring the previous
+	// behavior where retransmits were dropped until the client was declared
+	// dead (up to AckTimeout). Ignored when TcpCollapsePrevention is off.
+	TcpCollapseMaxHold time.Duration
 
 	// UdpTeardownSignal sends an icmp destination-unreachable to the source
 	// when a udp flow is torn down, the way tcp flows already get a rst. off
@@ -1723,6 +1735,13 @@ func (self *RemoteUserNatMultiClient) canSendPacket(sendPacket *parsedPacket, up
 				// sequence state is guarded by the per-flow `stateLock`, not
 				// the parent `stateLock`
 				allow = true
+			} else if 0 < self.settings.TcpCollapseMaxHold &&
+				update.releaseSequenceHold(self.settings.TcpCollapseMaxHold) {
+				// the flow has been pinned at the same sequence state past the
+				// hold, so the committed packet is not making progress. let a
+				// retransmit through rather than discarding the sender's only
+				// recovery mechanism until failure detection catches up
+				allow = true
 			}
 		} else {
 			allow = true
@@ -2333,8 +2352,12 @@ type multiClientChannelUpdate struct {
 	activityTime time.Time
 	ipPath       *IpPath
 
-	sequencePacketCount int    // guarded by stateLock
-	ackSequenceNumber   uint32 // guarded by stateLock
+	sequencePacketCount int // guarded by stateLock
+	// sequenceTime is when the sequence state last advanced. it bounds how long
+	// TcpCollapsePrevention may keep discarding a sender's retransmits while
+	// the committed packet makes no progress. guarded by stateLock.
+	sequenceTime      time.Time
+	ackSequenceNumber uint32 // guarded by stateLock
 	// sequenceNumber wraps at 2^32. ordering is determined via `int32(a - b)`
 	// signed-delta arithmetic (per RFC 1323 PAWS / RFC 7323), wraparound-tolerant
 	// across the 32-bit boundary.
@@ -2365,6 +2388,7 @@ func (self *multiClientChannelUpdate) resetSequence(sendPacket *parsedPacket) {
 	self.ackSequenceNumber = ipPath.AckSequenceNumber
 	self.sequenceNumber = ipPath.SequenceNumber
 	self.sequencePacketCount = 0
+	self.sequenceTime = time.Now()
 }
 
 func (self *multiClientChannelUpdate) updateSequence(sendPacket *parsedPacket) {
@@ -2391,7 +2415,38 @@ func (self *multiClientChannelUpdate) updateSequence(sendPacket *parsedPacket) {
 
 	if update {
 		self.sequencePacketCount += 1
+		self.sequenceTime = time.Now()
 	}
+}
+
+// releaseSequenceHold reports whether the flow has sat at the same sequence
+// state for at least maxHold, and when it has, restarts the window.
+//
+// TcpCollapsePrevention discards a sender's retransmits on the premise that the
+// packet already committed to a client will either be delivered reliably or the
+// client will be dropped. When a client stalls without yet being declared dead,
+// that premise fails: retransmits -- the sender's only recovery mechanism --
+// are discarded for as long as failure detection takes (up to AckTimeout, 30s),
+// and the flow is frozen the whole time.
+//
+// Restarting the window on release means at most one retransmit is admitted per
+// maxHold rather than the whole backlog, so collapse prevention still holds
+// during a normal stall while a genuinely stuck flow keeps a way to recover.
+func (self *multiClientChannelUpdate) releaseSequenceHold(maxHold time.Duration) bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	// nothing committed yet: canUpdateSequence already allows these
+	if self.sequencePacketCount == 0 || self.sequenceTime.IsZero() {
+		return false
+	}
+
+	now := time.Now()
+	if now.Sub(self.sequenceTime) < maxHold {
+		return false
+	}
+	self.sequenceTime = now
+	return true
 }
 
 func (self *multiClientChannelUpdate) canUpdateSequence(sendPacket *parsedPacket) bool {
