@@ -1,0 +1,39 @@
+name: Test — connect
+
+on:
+  push:
+    branches:
+      - beta/custom-server
+  pull_request:
+    branches:
+      - beta/custom-server
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: go test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out connect
+        uses: actions/checkout@v4
+
+      # go.mod resolves this with `replace github.com/urnetwork/glog => ../glog`,
+      # so it has to sit beside the checkout
+      - name: Check out glog dependency
+        run: git clone --depth 1 https://github.com/urnetwork/glog.git ../glog
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        # the data-path suites are timing sensitive; -count=1 defeats the test
+        # result cache so a green run always means the tests actually ran
+        run: go test -count=1 -timeout 20m ./...
