@@ -201,8 +201,9 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		TcpCollapsePrevention: true,
 		UdpCollapsePrevention: false,
 
-		UdpTeardownSignal:       true,
-		ClusterAffinityFallback: true,
+		UdpTeardownSignal:        true,
+		ClusterAffinityFallback:  true,
+		ServerNameAffinityBridge: true,
 		// well under the 30s AckTimeout that previously bounded a stalled
 		// flow, and past the ~200ms-1s range of a first tcp rto so a healthy
 		// flow's retransmits are still collapsed
@@ -330,6 +331,14 @@ type MultiClientSettings struct {
 	// behavior where retransmits were dropped until the client was declared
 	// dead (up to AckTimeout). Ignored when TcpCollapsePrevention is off.
 	TcpCollapseMaxHold time.Duration
+
+	// ServerNameAffinityBridge lets a new flow whose own affinity group has no
+	// donor inherit the client from the destination-scoped group an earlier
+	// nameless flow to the same destination joined. Those groups are read, never
+	// joined. off restores the previous behavior, where the first connection to
+	// a site the mux resolved late stays stranded on a different exit from the
+	// rest of the session. See `affinityFallbackIpPathsWithLock`.
+	ServerNameAffinityBridge bool
 
 	// ClusterAffinityFallback groups destination ips by their IpAssoc cluster
 	// when no server name is known for them, so a site whose flows the dns mux
@@ -983,6 +992,140 @@ func clusterAffinityRepresentative(members []netip.Addr) (netip.Addr, bool) {
 	return representative, found
 }
 
+// destinationAffinityIpPathWithLock builds the destination-scoped affinity key
+// for the web ports, or nil when the port has no such key.
+//
+// No server name means the dns mux never observed a query for this ip: the app
+// resolved over its own doh (chrome secure dns, android private dns), or the os
+// answered from its cache -- the long-ttl case ReverseTtl's comment calls out.
+// Per-ip affinity then splits one cdn-hosted site across the window, since its
+// many ips each key separately, so this falls back to the ip association
+// cluster, which already groups co-active ips.
+//
+// Shared by the registration path and the late-name bridge so the two can never
+// build the key differently -- if they diverged the bridge would silently stop
+// matching and nothing would fail.
+//
+// called with stateLock
+func (self *RemoteUserNatMultiClient) destinationAffinityIpPathWithLock(ipPath *IpPath) *IpPath {
+	switch ipPath.DestinationPort {
+	case 80, 53, 443:
+	default:
+		return nil
+	}
+
+	destinationIp := ipPath.DestinationIp
+	// this function is otherwise a pure function of the config and the path,
+	// and is exercised that way from bare clients, so an unset settings falls
+	// back to plain per-ip affinity rather than panicking
+	if self.settings != nil && self.settings.ClusterAffinityFallback && self.ipAssoc != nil {
+		if addr, ok := ipAssocAddr(ipPath.DestinationIp); ok {
+			// GetClusterAddrs is a lock-free atomic load, safe to call with the
+			// parent stateLock held
+			if rep, ok := clusterAffinityRepresentative(self.ipAssoc.GetClusterAddrs(addr)); ok {
+				destinationIp = rep.AsSlice()
+			}
+		}
+	}
+
+	return &IpPath{
+		Version:         ipPath.Version,
+		DestinationIp:   destinationIp,
+		DestinationPort: ipPath.DestinationPort,
+	}
+}
+
+// affinityFallbackIpPathsWithLock returns the destination-scoped groups a NEW
+// flow may inherit a client from when its own affinity group has no donor.
+// Consulted, never joined.
+//
+// The mux learns a server name from the tls ClientHello as well as from dns, and
+// the ClientHello is the fourth packet of a connection whose syn already created
+// the flow. So for any site the mux did not resolve itself, the ordering is
+// always: the first flow is created nameless and keys on the destination, the
+// name is learned an rtt later, and every later flow keys on the base domain
+// with an empty group -- stranding the first connection, usually the main page
+// load, on a different exit from the rest of the session.
+//
+// Reading the destination group lets those later flows converge onto the exit
+// the established flow already uses. Convergence is toward the established
+// exit, which is the only direction available: providers terminate tcp, so
+// moving a live flow would break it, which is the failure this whole change
+// exists to prevent.
+//
+// Ordering is most specific first -- the exact destination ip, then the cluster
+// representative when it differs. Ports outside the web set deliberately return
+// nil: their no-name keys are port-only or global, so bridging into them would
+// pin every named site to one exit.
+//
+// called with stateLock
+func (self *RemoteUserNatMultiClient) affinityFallbackIpPathsWithLock(ipPath *IpPath) []*IpPath {
+	if self.settings == nil || !self.settings.ServerNameAffinityBridge {
+		return nil
+	}
+	switch ipPath.DestinationPort {
+	case 80, 53, 443:
+	default:
+		return nil
+	}
+	if ipPath.DestinationIp == nil {
+		return nil
+	}
+
+	// a window fixed to one client has a single global affinity path already
+	if _, windowSize, ok := self.config.Load().performanceProfile.FixedWindow(); ok && windowSize.FixedWindowSize == 1 {
+		return nil
+	}
+
+	fallbackPaths := []*IpPath{
+		{
+			Version:         ipPath.Version,
+			DestinationIp:   ipPath.DestinationIp,
+			DestinationPort: ipPath.DestinationPort,
+		},
+	}
+	// the cluster representative is the broader guess, consulted only if the
+	// exact destination group has no usable donor
+	if destinationPath := self.destinationAffinityIpPathWithLock(ipPath); destinationPath != nil &&
+		!destinationPath.DestinationIp.Equal(ipPath.DestinationIp) {
+		fallbackPaths = append(fallbackPaths, destinationPath)
+	}
+	return fallbackPaths
+}
+
+// inheritAffinityClient4WithLock adopts the most recently joined healthy client
+// in an affinity group. Only ever called with `update.client` nil -- it must
+// never repoint a flow that already has a client, since providers terminate tcp
+// and a moved flow is a broken flow.
+//
+// called with stateLock
+func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *multiClientChannelUpdate, paths map[Ip4Path]time.Time) {
+	var mostRecentCreateTime time.Time
+	for copyIp4Path, createTime := range paths {
+		if copyUpdate, ok := self.ip4PathUpdates[copyIp4Path]; ok {
+			if c := copyUpdate.client.Load(); c != nil && !c.IsDone() && !c.isWarning() && createTime.After(mostRecentCreateTime) {
+				mostRecentCreateTime = createTime
+				update.client.Store(c)
+			}
+		}
+	}
+}
+
+// inheritAffinityClient6WithLock is the v6 twin of inheritAffinityClient4WithLock
+//
+// called with stateLock
+func (self *RemoteUserNatMultiClient) inheritAffinityClient6WithLock(update *multiClientChannelUpdate, paths map[Ip6Path]time.Time) {
+	var mostRecentCreateTime time.Time
+	for copyIp6Path, createTime := range paths {
+		if copyUpdate, ok := self.ip6PathUpdates[copyIp6Path]; ok {
+			if c := copyUpdate.client.Load(); c != nil && !c.IsDone() && !c.isWarning() && createTime.After(mostRecentCreateTime) {
+				mostRecentCreateTime = createTime
+				update.client.Store(c)
+			}
+		}
+	}
+}
+
 // called with stateLock
 func (self *RemoteUserNatMultiClient) affinityIpPathsWithLock(ipPath *IpPath) (affinityPaths []*IpPath) {
 	config := self.config.Load()
@@ -1022,34 +1165,8 @@ func (self *RemoteUserNatMultiClient) affinityIpPathsWithLock(ipPath *IpPath) (a
 					ServerName: affinityName,
 				})
 			}
-		} else if ipPath.DestinationPort == 80 || ipPath.DestinationPort == 53 || ipPath.DestinationPort == 443 {
-			// for these ports, cycle the path per destination ip/port, regardless of protocol.
-			//
-			// no server name means the dns mux never observed a query for this
-			// ip: the app resolved over its own doh (chrome secure dns, android
-			// private dns), or the os answered from its cache -- the long-ttl
-			// case ReverseTtl's comment calls out. per-ip affinity then splits
-			// one cdn-hosted site across the window, since its many ips each key
-			// separately. fall back to the ip association cluster, which already
-			// groups co-active ips, so the site pins to one client again.
-			destinationIp := ipPath.DestinationIp
-			// this function is otherwise a pure function of the config and the
-			// path, and is exercised that way from bare clients, so an unset
-			// settings falls back to plain per-ip affinity rather than panicking
-			if self.settings != nil && self.settings.ClusterAffinityFallback && self.ipAssoc != nil {
-				if addr, ok := ipAssocAddr(ipPath.DestinationIp); ok {
-					// GetClusterAddrs is a lock-free atomic load, safe to call
-					// with the parent stateLock held
-					if rep, ok := clusterAffinityRepresentative(self.ipAssoc.GetClusterAddrs(addr)); ok {
-						destinationIp = rep.AsSlice()
-					}
-				}
-			}
-			destinationPath := &IpPath{
-				Version:         ipPath.Version,
-				DestinationIp:   destinationIp,
-				DestinationPort: ipPath.DestinationPort,
-			}
+		} else if destinationPath := self.destinationAffinityIpPathWithLock(ipPath); destinationPath != nil {
+			// for these ports, cycle the path per destination ip/port, regardless of protocol
 			affinityPaths = append(affinityPaths, destinationPath)
 		} else if ipPath.DestinationPort < 1024 {
 			// for these ports, cycle the path per destination port, regardless of protocol or ip
@@ -1284,13 +1401,25 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 				paths[ip4Path] = time.Now()
 
 				if update.client.Load() == nil {
-					var mostRecentCreateTime time.Time
-					for copyIp4Path, createTime := range paths {
-						if copyUpdate, ok := self.ip4PathUpdates[copyIp4Path]; ok {
-							if c := copyUpdate.client.Load(); c != nil && !c.IsDone() && !c.isWarning() && createTime.After(mostRecentCreateTime) {
-								mostRecentCreateTime = createTime
-								update.client.Store(c)
-							}
+					self.inheritAffinityClient4WithLock(update, paths)
+				}
+			}
+
+			// the flow's own groups had no donor. an established flow to this
+			// destination may still exist under the key it was created with
+			// before the server name was learned -- read those groups without
+			// joining them, so this flow converges onto the exit already in use
+			if update.client.Load() == nil {
+				for _, fallbackIpPath := range self.affinityFallbackIpPathsWithLock(ipPath) {
+					fallbackIp4Path := fallbackIpPath.ToIp4Path()
+					if update.affinityIp4Paths[fallbackIp4Path] {
+						// already joined and scanned above
+						continue
+					}
+					if paths, ok := self.affinityIp4Paths[fallbackIp4Path]; ok {
+						self.inheritAffinityClient4WithLock(update, paths)
+						if update.client.Load() != nil {
+							break
 						}
 					}
 				}
@@ -1381,13 +1510,25 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 				paths[ip6Path] = time.Now()
 
 				if update.client.Load() == nil {
-					var mostRecentCreateTime time.Time
-					for copyIp6Path, createTime := range paths {
-						if copyUpdate, ok := self.ip6PathUpdates[copyIp6Path]; ok {
-							if c := copyUpdate.client.Load(); c != nil && !c.IsDone() && !c.isWarning() && createTime.After(mostRecentCreateTime) {
-								mostRecentCreateTime = createTime
-								update.client.Store(c)
-							}
+					self.inheritAffinityClient6WithLock(update, paths)
+				}
+			}
+
+			// the flow's own groups had no donor. an established flow to this
+			// destination may still exist under the key it was created with
+			// before the server name was learned -- read those groups without
+			// joining them, so this flow converges onto the exit already in use
+			if update.client.Load() == nil {
+				for _, fallbackIpPath := range self.affinityFallbackIpPathsWithLock(ipPath) {
+					fallbackIp6Path := fallbackIpPath.ToIp6Path()
+					if update.affinityIp6Paths[fallbackIp6Path] {
+						// already joined and scanned above
+						continue
+					}
+					if paths, ok := self.affinityIp6Paths[fallbackIp6Path]; ok {
+						self.inheritAffinityClient6WithLock(update, paths)
+						if update.client.Load() != nil {
+							break
 						}
 					}
 				}
