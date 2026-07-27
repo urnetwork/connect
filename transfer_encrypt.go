@@ -1213,6 +1213,9 @@ func (self *peerEncryptionSession) maybeVerifyPendingPeerIdentityProof(e *tlsHan
 		if self.client.log.V(1).Enabled() {
 			self.client.log.Infof("[tls]%s peer identity proof verified — cipher is now usable\n", self.logTag)
 		}
+		// the established + identity-verified peer set grew (or the
+		// established epoch swapped): the only promote path runs above
+		self.manager.peerIdentityChanged()
 	} else {
 		self.client.log.Errorf(
 			"[tls]%s peer identity proof FAILED (peer key %d bytes, exporter %d bytes, sig %d bytes) — session left unauthenticated\n",
@@ -2061,6 +2064,10 @@ type EncryptionSessionManager struct {
 
 	controlSyncEncryptedKey *ControlSync
 
+	// fired (outside locks) whenever the established + identity-verified
+	// peer set may have changed; consumers re-read `PeerIdentities`
+	peerIdentityChangeCallbacks *CallbackList[func()]
+
 	stateLock sync.Mutex
 	sessions  map[sessionKey]*peerEncryptionSession
 }
@@ -2075,6 +2082,8 @@ func NewEncryptionSessionManager(ctx context.Context, client *Client, clientKeyM
 		clientKeyManager: clientKeyManager,
 		settings:         settings,
 		sessions:         map[sessionKey]*peerEncryptionSession{},
+
+		peerIdentityChangeCallbacks: NewCallbackList[func()](),
 	}
 	if settings.Encrypt {
 		serverTlsConfig, selfCertPem, selfPrivateKeyPem, err := resolveReceiveTlsConfig(
@@ -2395,11 +2404,15 @@ func (self *EncryptionSessionManager) getOrCreateWithLock(peerId Id, role sequen
 	}
 	go func() {
 		defer func() {
-			self.stateLock.Lock()
-			defer self.stateLock.Unlock()
-			if self.sessions[key] == s {
-				delete(self.sessions, key)
-			}
+			func() {
+				self.stateLock.Lock()
+				defer self.stateLock.Unlock()
+				if self.sessions[key] == s {
+					delete(self.sessions, key)
+				}
+			}()
+			// a removed session may shrink the established + verified peer set
+			self.peerIdentityChanged()
 		}()
 		s.Run()
 	}()
@@ -2491,6 +2504,82 @@ func (self *EncryptionSessionManager) Close() {
 	}()
 	for _, session := range sessions {
 		session.close()
+	}
+}
+
+// PeerIdentity is a peer with an established, identity-verified e2e session:
+// the session cipher completed its handshake and the peer proved possession
+// of its long-lived identity key over the session channel.
+type PeerIdentity struct {
+	PeerId Id
+	// the peer's long-lived Ed25519 public identity key
+	PublicKey []byte
+}
+
+// verifiedPeerIdentity returns the peer identity key when this session has an
+// established cipher whose epoch completed the peer identity proof.
+func (self *peerEncryptionSession) verifiedPeerIdentity() (ed25519.PublicKey, bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.establishedEpoch == nil || !self.establishedEpoch.peerIdentityVerified {
+		return nil, false
+	}
+	if len(self.peerClientPublicKey) == 0 {
+		return nil, false
+	}
+	return append(ed25519.PublicKey(nil), self.peerClientPublicKey...), true
+}
+
+// PeerIdentities returns the peers with an established, identity-verified
+// session, deduplicated by peer id across roles and companion modes.
+func (self *EncryptionSessionManager) PeerIdentities() []*PeerIdentity {
+	if !self.settings.Encrypt {
+		return nil
+	}
+	sessions := func() []*peerEncryptionSession {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		out := make([]*peerEncryptionSession, 0, len(self.sessions))
+		for _, s := range self.sessions {
+			out = append(out, s)
+		}
+		return out
+	}()
+	byPeer := map[Id]*PeerIdentity{}
+	for _, session := range sessions {
+		if _, ok := byPeer[session.peerId]; ok {
+			continue
+		}
+		if publicKey, ok := session.verifiedPeerIdentity(); ok {
+			byPeer[session.peerId] = &PeerIdentity{
+				PeerId:    session.peerId,
+				PublicKey: publicKey,
+			}
+		}
+	}
+	out := make([]*PeerIdentity, 0, len(byPeer))
+	for _, peerIdentity := range byPeer {
+		out = append(out, peerIdentity)
+	}
+	return out
+}
+
+// AddPeerIdentityChangeCallback registers a callback fired whenever the
+// established + identity-verified peer set may have changed. Consumers
+// re-read `PeerIdentities`. Returns an unsubscribe function.
+func (self *EncryptionSessionManager) AddPeerIdentityChangeCallback(callback func()) func() {
+	callbackId := self.peerIdentityChangeCallbacks.Add(callback)
+	return func() {
+		self.peerIdentityChangeCallbacks.Remove(callbackId)
+	}
+}
+
+// called outside the manager and session locks
+func (self *EncryptionSessionManager) peerIdentityChanged() {
+	for _, callback := range self.peerIdentityChangeCallbacks.Get() {
+		HandleError(func() {
+			callback()
+		})
 	}
 }
 

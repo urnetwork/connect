@@ -621,18 +621,19 @@ func applyTestEncryptionSettings(clientSettings *ClientSettings, encMode encrypt
 		clientSettings.EncryptionSettings.Encrypt = true
 		clientSettings.EncryptionSettings.TlsTimeout = 60 * time.Second
 	case encryptionModeFallback:
-		// sender enables encryption with a tight timeout but the receiver
-		// has encryption disabled, so the handshake never completes; the
-		// session stays in the cipher-nil state and all traffic flows in
-		// plaintext.
+		// both sides enable encryption with a timeout too tight for the
+		// handshake to complete; the sessions stay in the cipher-nil state
+		// and all traffic flows in plaintext. (The peer-without-encryption
+		// fallback — Encrypt=false on one side, an inert session manager —
+		// is pinned by TestSendReceiveEncryptedPeerWithoutEncryption.)
 		clientSettings.EncryptionSettings.Encrypt = true
 		clientSettings.EncryptionSettings.TlsTimeout = 50 * time.Millisecond
 	}
 }
 
-// TestSendReceiveEncryptedFallback exercises the opt-out path. The sender's
-// TLS handshake is forced to time out (lossy conditioner) and the receiver
-// accepts plaintext fallback.
+// TestSendReceiveEncryptedFallback exercises the opt-out path. The TLS
+// handshake is forced to time out (tight TlsTimeout on both sides) and
+// traffic flows in the plaintext cipher-nil state.
 func TestSendReceiveEncryptedFallback(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping testing in short mode")
