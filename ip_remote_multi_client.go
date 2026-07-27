@@ -198,7 +198,8 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		TcpCollapsePrevention: true,
 		UdpCollapsePrevention: false,
 
-		UdpTeardownSignal: true,
+		UdpTeardownSignal:       true,
+		ClusterAffinityFallback: true,
 		// well under the 30s AckTimeout that previously bounded a stalled
 		// flow, and past the ~200ms-1s range of a first tcp rto so a healthy
 		// flow's retransmits are still collapsed
@@ -322,6 +323,13 @@ type MultiClientSettings struct {
 	// behavior where retransmits were dropped until the client was declared
 	// dead (up to AckTimeout). Ignored when TcpCollapsePrevention is off.
 	TcpCollapseMaxHold time.Duration
+
+	// ClusterAffinityFallback groups destination ips by their IpAssoc cluster
+	// when no server name is known for them, so a site whose flows the dns mux
+	// never saw resolved still pins to one client instead of splitting across
+	// the window per ip. off restores plain per-ip affinity. Only consulted on
+	// the no-server-name path; a known server name always wins.
+	ClusterAffinityFallback bool
 
 	// UdpTeardownSignal sends an icmp destination-unreachable to the source
 	// when a udp flow is torn down, the way tcp flows already get a rst. off
@@ -950,6 +958,24 @@ func (self *RemoteUserNatMultiClient) selectWindowTypes(sendPacket *parsedPacket
 	}
 }
 
+// clusterAffinityRepresentative picks one stable member of a cluster so every
+// ip in it resolves to the same affinity key. The minimum orders
+// deterministically, where map iteration would hand back a different member per
+// call and defeat the grouping entirely. Empty (an ip in no multi-member
+// cluster) yields false, leaving the caller on per-ip affinity.
+func clusterAffinityRepresentative(members []netip.Addr) (netip.Addr, bool) {
+	var representative netip.Addr
+	found := false
+	for _, member := range members {
+		member = member.Unmap()
+		if !found || member.Less(representative) {
+			representative = member
+			found = true
+		}
+	}
+	return representative, found
+}
+
 // called with stateLock
 func (self *RemoteUserNatMultiClient) affinityIpPathsWithLock(ipPath *IpPath) (affinityPaths []*IpPath) {
 	config := self.config.Load()
@@ -990,10 +1016,28 @@ func (self *RemoteUserNatMultiClient) affinityIpPathsWithLock(ipPath *IpPath) (a
 				})
 			}
 		} else if ipPath.DestinationPort == 80 || ipPath.DestinationPort == 53 || ipPath.DestinationPort == 443 {
-			// for these ports, cycle the path per destination ip/port, regardless of protocol
+			// for these ports, cycle the path per destination ip/port, regardless of protocol.
+			//
+			// no server name means the dns mux never observed a query for this
+			// ip: the app resolved over its own doh (chrome secure dns, android
+			// private dns), or the os answered from its cache -- the long-ttl
+			// case ReverseTtl's comment calls out. per-ip affinity then splits
+			// one cdn-hosted site across the window, since its many ips each key
+			// separately. fall back to the ip association cluster, which already
+			// groups co-active ips, so the site pins to one client again.
+			destinationIp := ipPath.DestinationIp
+			if self.settings.ClusterAffinityFallback && self.ipAssoc != nil {
+				if addr, ok := ipAssocAddr(ipPath.DestinationIp); ok {
+					// GetClusterAddrs is a lock-free atomic load, safe to call
+					// with the parent stateLock held
+					if rep, ok := clusterAffinityRepresentative(self.ipAssoc.GetClusterAddrs(addr)); ok {
+						destinationIp = rep.AsSlice()
+					}
+				}
+			}
 			destinationPath := &IpPath{
 				Version:         ipPath.Version,
-				DestinationIp:   ipPath.DestinationIp,
+				DestinationIp:   destinationIp,
 				DestinationPort: ipPath.DestinationPort,
 			}
 			affinityPaths = append(affinityPaths, destinationPath)
