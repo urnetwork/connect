@@ -26,12 +26,31 @@ func ipOosPacket(ipPath *IpPath, payload []byte) []byte {
 // out-of-sequence reset packet for the flow
 // if tcp, send rst
 // udp has no in-band reset; see `ipOosUnreachable`
+//
+// The reset carries sequence 0, which the exit accepts (it tears down on any
+// rst for a known bufferId, with no sequence check) but a real tcp stack does
+// not. Toward the source, use `ipOosRstSequence`.
 func ipOosRst(ipPath *IpPath) ([]byte, bool) {
+	return ipOosRstSequence(ipPath, 0)
+}
+
+// out-of-sequence reset carrying an explicit sequence number.
+//
+// RFC 5961 section 3.2, and `tcp_validate_incoming` in linux, accept a reset
+// only when SEG.SEQ is exactly RCV.NXT -- anything else earns a challenge ack
+// and the reset is ignored. Sequence 0 essentially never matches an established
+// connection, so a reset built by `ipOosRst` is silently discarded by the
+// source's stack, and the flow freezes rather than resetting.
+//
+// The value the source needs is the sequence it expects next from the
+// destination, which is the ack number it has been sending -- tracked per flow
+// as `multiClientChannelUpdate.ackSequenceNumber`.
+func ipOosRstSequence(ipPath *IpPath, sequenceNumber uint32) ([]byte, bool) {
 	switch ipPath.Protocol {
 	case IpProtocolTcp:
 		switch ipPath.Version {
 		case 4, 6:
-			return ipOosTcpPacket(ipPath, tcpFlagRst, nil), true
+			return ipOosTcpPacketSequence(ipPath, tcpFlagRst, sequenceNumber, nil), true
 		default:
 			return nil, false
 		}
@@ -185,12 +204,15 @@ func ipOosUdpPacket(ipPath *IpPath, payload []byte) []byte {
 }
 
 func ipOosTcpPacket(ipPath *IpPath, flags byte, payload []byte) []byte {
+	return ipOosTcpPacketSequence(ipPath, flags, 0, payload)
+}
+
+func ipOosTcpPacketSequence(ipPath *IpPath, flags byte, sequenceNumber uint32, payload []byte) []byte {
 	packet, tcp := ipTransportPacket(ipPath, ipProtocolNumberTcp, TcpHeaderSizeWithoutExtensions+len(payload))
 	binary.BigEndian.PutUint16(tcp[0:2], uint16(ipPath.SourcePort))
 	binary.BigEndian.PutUint16(tcp[2:4], uint16(ipPath.DestinationPort))
-	// seq and ack are not aligned with any flow state; zero like the
-	// historical builders
-	binary.BigEndian.PutUint32(tcp[4:8], 0)
+	// ack is not aligned with any flow state; zero like the historical builders
+	binary.BigEndian.PutUint32(tcp[4:8], sequenceNumber)
 	binary.BigEndian.PutUint32(tcp[8:12], 0)
 	// data offset, no options
 	tcp[12] = byte(TcpHeaderSizeWithoutExtensions/4) << 4

@@ -1165,8 +1165,8 @@ func (self *RemoteUserNatMultiClient) waitForIdleUpdate(update *multiClientChann
 // destination); the returned packet is already addressed back toward the
 // source. false means there is nothing to send, which is the pre-existing
 // behavior for udp and for every non-tcp, non-udp protocol.
-func (self *RemoteUserNatMultiClient) teardownSourcePacket(ipPath *IpPath) ([]byte, bool) {
-	if packet, ok := ipOosRst(ipPath.Reverse()); ok {
+func (self *RemoteUserNatMultiClient) teardownSourcePacket(ipPath *IpPath, sourceRstSequence uint32) ([]byte, bool) {
+	if packet, ok := ipOosRstSequence(ipPath.Reverse(), sourceRstSequence); ok {
 		return packet, true
 	}
 	if self.settings.UdpTeardownSignal {
@@ -1175,7 +1175,7 @@ func (self *RemoteUserNatMultiClient) teardownSourcePacket(ipPath *IpPath) ([]by
 	return nil, false
 }
 
-func (self *RemoteUserNatMultiClient) rstFlow(ipPath *IpPath, client *multiClientChannel) {
+func (self *RemoteUserNatMultiClient) rstFlow(ipPath *IpPath, client *multiClientChannel, sourceRstSequence uint32) {
 	if client != nil {
 		// rst to destination
 		if packet, ok := ipOosRst(ipPath); ok {
@@ -1186,7 +1186,7 @@ func (self *RemoteUserNatMultiClient) rstFlow(ipPath *IpPath, client *multiClien
 		}
 	}
 	// teardown to source
-	if packet, ok := self.teardownSourcePacket(ipPath); ok {
+	if packet, ok := self.teardownSourcePacket(ipPath, sourceRstSequence); ok {
 		self.receivePacketCallback(TransferPath{}, protocol.ProvideMode_Network, ipPath, packet)
 	}
 }
@@ -1263,7 +1263,7 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 				case <-self.ctx.Done():
 				case <-update.ctx.Done():
 				default:
-					self.rstFlow(ipPath, client)
+					self.rstFlow(ipPath, client, update.sourceRstSequence())
 				}
 			}, update.cancel)
 			self.ip4PathUpdates[ip4Path] = update
@@ -1360,7 +1360,7 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 				case <-self.ctx.Done():
 				case <-update.ctx.Done():
 				default:
-					self.rstFlow(ipPath, client)
+					self.rstFlow(ipPath, client, update.sourceRstSequence())
 				}
 			}, update.cancel)
 			self.ip6PathUpdates[ip6Path] = update
@@ -1485,7 +1485,7 @@ func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 				if update.client.Load() == client {
 					update.client.Store(nil)
 
-					if packet, ok := self.teardownSourcePacket(update.ipPath); ok {
+					if packet, ok := self.teardownSourcePacket(update.ipPath, update.sourceRstSequence()); ok {
 						rstPacket := &receivePacket{
 							Source:      TransferPath{},
 							ProvideMode: protocol.ProvideMode_Network,
@@ -1858,7 +1858,7 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 
 				rstPackets := []*receivePacket{}
 
-				if packet, ok := self.teardownSourcePacket(update.ipPath); ok {
+				if packet, ok := self.teardownSourcePacket(update.ipPath, update.sourceRstSequence()); ok {
 					rstPacket := &receivePacket{
 						Source:      TransferPath{},
 						ProvideMode: protocol.ProvideMode_Network,
@@ -2516,6 +2516,15 @@ func (self *multiClientChannelUpdate) releaseSequenceHold(maxHold time.Duration)
 	}
 	self.sequenceTime = now
 	return true
+}
+
+// sourceRstSequence is the sequence a reset toward the source must carry to be
+// accepted: the sequence the source expects next from the destination, which is
+// the ack number it has been sending. See `ipOosRstSequence`.
+func (self *multiClientChannelUpdate) sourceRstSequence() uint32 {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.ackSequenceNumber
 }
 
 func (self *multiClientChannelUpdate) canUpdateSequence(sendPacket *parsedPacket) bool {
