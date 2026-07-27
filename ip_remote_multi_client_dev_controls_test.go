@@ -1,0 +1,122 @@
+package connect
+
+import (
+	"testing"
+	"time"
+)
+
+// the overrides must actually change behavior, or the developer menu's A/B is
+// meaningless
+func TestReliabilitySettingsOverrideTakesEffect(t *testing.T) {
+	mc := &RemoteUserNatMultiClient{
+		settings: &MultiClientSettings{
+			UdpTeardownSignal:      true,
+			SequenceIdleTimeout:    120 * time.Second,
+			TcpSequenceIdleTimeout: 600 * time.Second,
+		},
+	}
+
+	// constructed state
+	_, ok := mc.teardownSourcePacket(udpTestPath(4), 0)
+	AssertEqual(t, ok, true)
+	AssertEqual(t, mc.sequenceIdleTimeout(idleTestPath(IpProtocolTcp)), 600*time.Second)
+
+	// override turns the udp signal off and collapses the tcp idle bound
+	mc.SetReliabilitySettings(&ReliabilitySettings{
+		UdpTeardownSignal:   false,
+		SequenceIdleTimeout: 30 * time.Second,
+	})
+	_, ok = mc.teardownSourcePacket(udpTestPath(4), 0)
+	AssertEqual(t, ok, false)
+	AssertEqual(t, mc.sequenceIdleTimeout(idleTestPath(IpProtocolTcp)), 30*time.Second)
+
+	// clearing restores what the client was constructed with, so a menu can
+	// always get back to the shipped behavior
+	mc.SetReliabilitySettings(nil)
+	_, ok = mc.teardownSourcePacket(udpTestPath(4), 0)
+	AssertEqual(t, ok, true)
+	AssertEqual(t, mc.sequenceIdleTimeout(idleTestPath(IpProtocolTcp)), 600*time.Second)
+}
+
+// reporting the live state back to the menu
+func TestReliabilitySettingsReadback(t *testing.T) {
+	mc := &RemoteUserNatMultiClient{
+		settings: &MultiClientSettings{ClusterAffinityFallback: true, TcpCollapseMaxHold: time.Second},
+	}
+
+	AssertEqual(t, mc.ReliabilitySettings().ClusterAffinityFallback, true)
+	AssertEqual(t, mc.ReliabilitySettings().TcpCollapseMaxHold, time.Second)
+
+	mc.SetReliabilitySettings(&ReliabilitySettings{ClusterAffinityFallback: false})
+	AssertEqual(t, mc.ReliabilitySettings().ClusterAffinityFallback, false)
+	AssertEqual(t, mc.ReliabilitySettings().TcpCollapseMaxHold, time.Duration(0))
+}
+
+// a bare client must not panic -- the same invariant the cluster fallback and
+// the idle timeout had to learn
+func TestReliabilitySettingsBareClient(t *testing.T) {
+	mc := &RemoteUserNatMultiClient{}
+
+	reliabilitySettings := mc.ReliabilitySettings()
+	AssertEqual(t, reliabilitySettings.UdpTeardownSignal, false)
+	AssertEqual(t, reliabilitySettings.TcpCollapseMaxHold, time.Duration(0))
+}
+
+// nil settings yields every reliability behavior off, i.e. the state before any
+// of this work
+func TestReliabilitySettingsFromNil(t *testing.T) {
+	reliabilitySettings := ReliabilitySettingsFrom(nil)
+	AssertEqual(t, reliabilitySettings.UdpTeardownSignal, false)
+	AssertEqual(t, reliabilitySettings.ClusterAffinityFallback, false)
+	AssertEqual(t, reliabilitySettings.ServerNameAffinityBridge, false)
+	AssertEqual(t, reliabilitySettings.TcpCollapseMaxHold, time.Duration(0))
+}
+
+// the shipped defaults must survive the round trip through the override type,
+// or clearing an override would silently ship different behavior
+func TestReliabilitySettingsFromDefaults(t *testing.T) {
+	settings := DefaultMultiClientSettings()
+	reliabilitySettings := ReliabilitySettingsFrom(settings)
+
+	AssertEqual(t, reliabilitySettings.UdpTeardownSignal, settings.UdpTeardownSignal)
+	AssertEqual(t, reliabilitySettings.TcpCollapseMaxHold, settings.TcpCollapseMaxHold)
+	AssertEqual(t, reliabilitySettings.ClusterAffinityFallback, settings.ClusterAffinityFallback)
+	AssertEqual(t, reliabilitySettings.ServerNameAffinityBridge, settings.ServerNameAffinityBridge)
+	AssertEqual(t, reliabilitySettings.SequenceIdleTimeout, settings.SequenceIdleTimeout)
+	AssertEqual(t, reliabilitySettings.TcpSequenceIdleTimeout, settings.TcpSequenceIdleTimeout)
+}
+
+// a stalled exit reports the packet as sent but never acknowledges it, and
+// must not error -- an error would reset the flow immediately, which is the
+// opposite of the state being reproduced
+func TestStalledChannelSwallowsWithoutError(t *testing.T) {
+	client := &multiClientChannel{}
+	client.setStalled(true)
+
+	success, err := client.SendDetailedWithAck(&parsedPacket{
+		packet: make([]byte, 40),
+		ipPath: udpTestPath(4),
+	}, 0, true)
+
+	AssertEqual(t, success, true)
+	AssertEqual(t, err == nil, true)
+}
+
+// dropping or stalling an exit that is not in the window reports failure rather
+// than silently doing nothing
+func TestDropAndStallUnknownExit(t *testing.T) {
+	mc := &RemoteUserNatMultiClient{windows: map[WindowType]*multiClientWindow{}}
+
+	unknown := Id{}
+	AssertEqual(t, mc.DropExit(unknown), false)
+	AssertEqual(t, mc.StallExit(unknown, true), false)
+}
+
+// with no windows there are no exits, and the readout must not panic
+func TestExitsEmpty(t *testing.T) {
+	mc := &RemoteUserNatMultiClient{
+		windows:       map[WindowType]*multiClientWindow{},
+		clientUpdates: map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
+	}
+	AssertEqual(t, len(mc.Exits()), 0)
+}

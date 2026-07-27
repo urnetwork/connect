@@ -497,6 +497,12 @@ type RemoteUserNatMultiClient struct {
 	// affinity selection, and the SendPacket drop path.
 	config atomic.Pointer[multiClientConfig]
 
+	// reliability holds runtime overrides for the reliability knobs, so the
+	// developer menu can A/B a live freeze without a rebuild. Unset means "use
+	// the values in settings", which is what every non-overridden client does.
+	// Read on the packet hot path, so an atomic rather than a lock.
+	reliability atomic.Pointer[ReliabilitySettings]
+
 	localUserNat      *LocalUserNat
 	localUserNatUnsub func()
 
@@ -974,6 +980,62 @@ func (self *RemoteUserNatMultiClient) selectWindowTypes(sendPacket *parsedPacket
 	}
 }
 
+// ReliabilitySettings is the runtime-overridable subset of MultiClientSettings:
+// the knobs that change how a flow reacts when its exit misbehaves. Each one
+// exists so the freeze it addresses can be turned off and back on against a
+// live connection, since which cause a given user is hitting is not something
+// the code can tell from the outside.
+type ReliabilitySettings struct {
+	// see the matching MultiClientSettings fields for what each one does
+	UdpTeardownSignal        bool
+	TcpCollapseMaxHold       time.Duration
+	ClusterAffinityFallback  bool
+	ServerNameAffinityBridge bool
+	SequenceIdleTimeout      time.Duration
+	TcpSequenceIdleTimeout   time.Duration
+}
+
+// ReliabilitySettingsFrom reads the effective values out of a settings struct.
+// nil yields the zero value, which is every reliability behavior off -- the
+// state before any of this work, and what the bare test fixtures get.
+func ReliabilitySettingsFrom(settings *MultiClientSettings) *ReliabilitySettings {
+	if settings == nil {
+		return &ReliabilitySettings{}
+	}
+	return &ReliabilitySettings{
+		UdpTeardownSignal:        settings.UdpTeardownSignal,
+		TcpCollapseMaxHold:       settings.TcpCollapseMaxHold,
+		ClusterAffinityFallback:  settings.ClusterAffinityFallback,
+		ServerNameAffinityBridge: settings.ServerNameAffinityBridge,
+		SequenceIdleTimeout:      settings.SequenceIdleTimeout,
+		TcpSequenceIdleTimeout:   settings.TcpSequenceIdleTimeout,
+	}
+}
+
+// reliabilitySettings is the effective reliability config: a runtime override
+// when one has been set, else whatever the client was constructed with. Safe on
+// a bare client, which several test fixtures rely on.
+func (self *RemoteUserNatMultiClient) reliabilitySettings() *ReliabilitySettings {
+	if overrides := self.reliability.Load(); overrides != nil {
+		return overrides
+	}
+	return ReliabilitySettingsFrom(self.settings)
+}
+
+// SetReliabilitySettings installs runtime overrides for the reliability knobs.
+// nil clears them, restoring the constructed settings. Takes effect on the next
+// packet -- no reconnect needed, which is the point: a freeze can be A/B'd
+// while it is happening.
+func (self *RemoteUserNatMultiClient) SetReliabilitySettings(reliabilitySettings *ReliabilitySettings) {
+	self.reliability.Store(reliabilitySettings)
+}
+
+// ReliabilitySettings returns the effective reliability config, for reporting
+// the live state back to a developer menu.
+func (self *RemoteUserNatMultiClient) ReliabilitySettings() *ReliabilitySettings {
+	return self.reliabilitySettings()
+}
+
 // clusterAffinityRepresentative picks one stable member of a cluster so every
 // ip in it resolves to the same affinity key. The minimum orders
 // deterministically, where map iteration would hand back a different member per
@@ -1018,7 +1080,7 @@ func (self *RemoteUserNatMultiClient) destinationAffinityIpPathWithLock(ipPath *
 	// this function is otherwise a pure function of the config and the path,
 	// and is exercised that way from bare clients, so an unset settings falls
 	// back to plain per-ip affinity rather than panicking
-	if self.settings != nil && self.settings.ClusterAffinityFallback && self.ipAssoc != nil {
+	if self.reliabilitySettings().ClusterAffinityFallback && self.ipAssoc != nil {
 		if addr, ok := ipAssocAddr(ipPath.DestinationIp); ok {
 			// GetClusterAddrs is a lock-free atomic load, safe to call with the
 			// parent stateLock held
@@ -1060,7 +1122,7 @@ func (self *RemoteUserNatMultiClient) destinationAffinityIpPathWithLock(ipPath *
 //
 // called with stateLock
 func (self *RemoteUserNatMultiClient) affinityFallbackIpPathsWithLock(ipPath *IpPath) []*IpPath {
-	if self.settings == nil || !self.settings.ServerNameAffinityBridge {
+	if !self.reliabilitySettings().ServerNameAffinityBridge {
 		return nil
 	}
 	switch ipPath.DestinationPort {
@@ -1240,10 +1302,11 @@ func (self *RemoteUserNatMultiClient) sendClientPath(ipPath *IpPath, callback fu
 // equivalent notion of an open connection and its mappings are conventionally
 // short lived, so it keeps the tighter bound.
 func (self *RemoteUserNatMultiClient) sequenceIdleTimeout(ipPath *IpPath) time.Duration {
-	if ipPath != nil && ipPath.Protocol == IpProtocolTcp && 0 < self.settings.TcpSequenceIdleTimeout {
-		return self.settings.TcpSequenceIdleTimeout
+	reliabilitySettings := self.reliabilitySettings()
+	if ipPath != nil && ipPath.Protocol == IpProtocolTcp && 0 < reliabilitySettings.TcpSequenceIdleTimeout {
+		return reliabilitySettings.TcpSequenceIdleTimeout
 	}
-	return self.settings.SequenceIdleTimeout
+	return reliabilitySettings.SequenceIdleTimeout
 }
 
 func (self *RemoteUserNatMultiClient) waitForIdleUpdate(update *multiClientChannelUpdate) {
@@ -1286,7 +1349,7 @@ func (self *RemoteUserNatMultiClient) teardownSourcePacket(ipPath *IpPath, sourc
 	if packet, ok := ipOosRstSequence(ipPath.Reverse(), sourceRstSequence); ok {
 		return packet, true
 	}
-	if self.settings.UdpTeardownSignal {
+	if self.reliabilitySettings().UdpTeardownSignal {
 		return ipOosUnreachable(ipPath)
 	}
 	return nil, false
@@ -1945,8 +2008,8 @@ func (self *RemoteUserNatMultiClient) canSendPacket(sendPacket *parsedPacket, up
 				// sequence state is guarded by the per-flow `stateLock`, not
 				// the parent `stateLock`
 				allow = true
-			} else if 0 < self.settings.TcpCollapseMaxHold &&
-				update.releaseSequenceHold(self.settings.TcpCollapseMaxHold) {
+			} else if tcpCollapseMaxHold := self.reliabilitySettings().TcpCollapseMaxHold; 0 < tcpCollapseMaxHold &&
+				update.releaseSequenceHold(tcpCollapseMaxHold) {
 				// the flow has been pinned at the same sequence state past the
 				// hold, so the committed packet is not making progress. let a
 				// retransmit through rather than discarding the sender's only
@@ -2481,6 +2544,91 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 			MessagePoolReturn(p.Packet)
 		}
 	})
+}
+
+// ExitInfo is one provider channel in the window, as reported to a developer
+// menu: enough to see which exits exist, which the flows are pinned to, and
+// which are on their way out.
+type ExitInfo struct {
+	ClientId   Id
+	WindowType WindowType
+	// Warning marks a client new flows already avoid -- either unhealthy or
+	// past MaxClientLifetime and draining
+	Warning bool
+	Done    bool
+	P2pOnly bool
+	// FlowCount is how many live flows are currently pinned to this exit
+	FlowCount int
+}
+
+// Exits reports the provider channels across every window, with the number of
+// flows pinned to each. This is the readout that makes the affinity behavior
+// observable: a site split across exits shows up here as flows spread over
+// several entries instead of collected on one.
+func (self *RemoteUserNatMultiClient) Exits() []*ExitInfo {
+	flowCounts := map[Id]int{}
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		for client, updates := range self.clientUpdates {
+			flowCounts[client.ClientId()] += len(updates)
+		}
+	}()
+
+	exits := []*ExitInfo{}
+	for windowType, window := range self.windows {
+		for _, client := range window.unorderedClients() {
+			clientId := client.ClientId()
+			exits = append(exits, &ExitInfo{
+				ClientId:   clientId,
+				WindowType: windowType,
+				Warning:    client.isWarning(),
+				Done:       client.IsDone(),
+				P2pOnly:    client.IsP2pOnly(),
+				FlowCount:  flowCounts[clientId],
+			})
+		}
+	}
+	return exits
+}
+
+// DropExit cancels a single provider channel, as if that one exit had died.
+//
+// Shuffle() replaces every exit at once, which is not what a real failure looks
+// like -- the interesting case, and the one all of the teardown work addresses,
+// is one exit vanishing while the others keep working and flows have to
+// discover it. Returns false if no such client is in the window.
+func (self *RemoteUserNatMultiClient) DropExit(clientId Id) bool {
+	for _, window := range self.windows {
+		for _, client := range window.unorderedClients() {
+			if client.ClientId() == clientId {
+				client.Cancel()
+				window.resizeMonitor.NotifyAll()
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// StallExit makes a provider channel stop acknowledging without being cancelled,
+// reproducing the state the collapse-prevention bound exists for: a client that
+// is neither healthy nor detectably dead, holding its flows' sequence state
+// while failure detection takes up to AckTimeout to notice.
+//
+// This is the only way to exercise that path deliberately -- a real stall
+// depends on a provider misbehaving at the right moment. Returns false if no
+// such client is in the window.
+func (self *RemoteUserNatMultiClient) StallExit(clientId Id, stalled bool) bool {
+	for _, window := range self.windows {
+		for _, client := range window.unorderedClients() {
+			if client.ClientId() == clientId {
+				client.setStalled(stalled)
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (self *RemoteUserNatMultiClient) Shuffle() {
@@ -3876,6 +4024,10 @@ type multiClientChannel struct {
 	clientReceiveUnsub func()
 
 	warning bool
+
+	// stalled is a test/diagnostic hook, set only by StallExit. Read on the
+	// send hot path, so an atomic rather than the state lock.
+	stalled atomic.Bool
 }
 
 func newMultiClientChannel(
@@ -3983,6 +4135,12 @@ func (self *multiClientChannel) EstimatedByteCountPerSecond() ByteCount {
 	return self.args.EstimatedBytesPerSecond
 }
 
+// setStalled makes the channel swallow packets without acknowledging or
+// erroring. See RemoteUserNatMultiClient.StallExit.
+func (self *multiClientChannel) setStalled(stalled bool) {
+	self.stalled.Store(stalled)
+}
+
 func (self *multiClientChannel) setWarning(warning bool) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -4044,6 +4202,12 @@ func (self *multiClientChannel) SendWithAck(parsedPacket *parsedPacket, timeout 
 }
 
 func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, timeout time.Duration, ack bool) (bool, error) {
+	// a stalled exit swallows the packet: reported sent, never acknowledged,
+	// and crucially no error -- an error would reset the flow immediately,
+	// which is the opposite of the state being reproduced. see StallExit.
+	if self.stalled.Load() {
+		return true, nil
+	}
 	if frame, err := ipPacketToProviderFrame(parsedPacket.packet, self.settings.ProtocolVersion); err != nil {
 		self.addError(err)
 		return false, err
