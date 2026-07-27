@@ -198,6 +198,8 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		TcpCollapsePrevention: true,
 		UdpCollapsePrevention: false,
 
+		UdpTeardownSignal: true,
+
 		SecurityPolicyGenerator: DefaultSecurityPolicyWithStats,
 
 		// the epoch for flushing block action and packet stats events to listeners
@@ -308,6 +310,13 @@ type MultiClientSettings struct {
 
 	TcpCollapsePrevention bool
 	UdpCollapsePrevention bool
+
+	// UdpTeardownSignal sends an icmp destination-unreachable to the source
+	// when a udp flow is torn down, the way tcp flows already get a rst. off
+	// restores the previous behavior, where a udp flow whose exit is removed
+	// goes silent and stalls until the application times out. see
+	// `ipOosUnreachable`.
+	UdpTeardownSignal bool
 
 	SecurityPolicyGenerator func(context.Context, *SecurityPolicyStatsCollector) SecurityPolicy
 
@@ -1069,6 +1078,22 @@ func (self *RemoteUserNatMultiClient) waitForIdleUpdate(update *multiClientChann
 // rstFlow sends a reset to both ends of a flow being torn down. like
 // waitForIdleUpdate it runs only in the teardown goroutine and is a method, not
 // an inline closure, to avoid a per-packet allocation in sendUpdate.
+// teardownSourcePacket builds the packet that tells the source its flow is
+// gone: a rst for tcp, and for udp an icmp unreachable when
+// `UdpTeardownSignal` is set. `ipPath` is the flow's own direction (source to
+// destination); the returned packet is already addressed back toward the
+// source. false means there is nothing to send, which is the pre-existing
+// behavior for udp and for every non-tcp, non-udp protocol.
+func (self *RemoteUserNatMultiClient) teardownSourcePacket(ipPath *IpPath) ([]byte, bool) {
+	if packet, ok := ipOosRst(ipPath.Reverse()); ok {
+		return packet, true
+	}
+	if self.settings.UdpTeardownSignal {
+		return ipOosUnreachable(ipPath)
+	}
+	return nil, false
+}
+
 func (self *RemoteUserNatMultiClient) rstFlow(ipPath *IpPath, client *multiClientChannel) {
 	if client != nil {
 		// rst to destination
@@ -1079,8 +1104,8 @@ func (self *RemoteUserNatMultiClient) rstFlow(ipPath *IpPath, client *multiClien
 			}, 0)
 		}
 	}
-	// rst to source
-	if packet, ok := ipOosRst(ipPath.Reverse()); ok {
+	// teardown to source
+	if packet, ok := self.teardownSourcePacket(ipPath); ok {
 		self.receivePacketCallback(TransferPath{}, protocol.ProvideMode_Network, ipPath, packet)
 	}
 }
@@ -1379,7 +1404,7 @@ func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 				if update.client.Load() == client {
 					update.client.Store(nil)
 
-					if packet, ok := ipOosRst(update.ipPath.Reverse()); ok {
+					if packet, ok := self.teardownSourcePacket(update.ipPath); ok {
 						rstPacket := &receivePacket{
 							Source:      TransferPath{},
 							ProvideMode: protocol.ProvideMode_Network,
@@ -1745,7 +1770,7 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 
 				rstPackets := []*receivePacket{}
 
-				if packet, ok := ipOosRst(update.ipPath.Reverse()); ok {
+				if packet, ok := self.teardownSourcePacket(update.ipPath); ok {
 					rstPacket := &receivePacket{
 						Source:      TransferPath{},
 						ProvideMode: protocol.ProvideMode_Network,

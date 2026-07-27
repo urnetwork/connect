@@ -25,7 +25,7 @@ func ipOosPacket(ipPath *IpPath, payload []byte) []byte {
 
 // out-of-sequence reset packet for the flow
 // if tcp, send rst
-// TODO if udp quic, look at what should happen
+// udp has no in-band reset; see `ipOosUnreachable`
 func ipOosRst(ipPath *IpPath) ([]byte, bool) {
 	switch ipPath.Protocol {
 	case IpProtocolTcp:
@@ -35,6 +35,82 @@ func ipOosRst(ipPath *IpPath) ([]byte, bool) {
 		default:
 			return nil, false
 		}
+	default:
+		return nil, false
+	}
+}
+
+const (
+	// type, code, checksum, unused
+	icmpUnreachableHeaderSize = 8
+
+	icmpv4TypeDestinationUnreachable = 3
+	// delivered to the application as EHOSTUNREACH
+	icmpv4CodeHostUnreachable = 1
+
+	icmpv6TypeDestinationUnreachable = 1
+	// the v6 equivalent of v4 host unreachable, also EHOSTUNREACH
+	icmpv6CodeAddressUnreachable = 3
+)
+
+// out-of-sequence destination-unreachable for a udp flow whose exit went away.
+//
+// tcp flows get `ipOosRst`, so the application learns immediately and
+// reconnects. udp has no equivalent in-band signal, so a udp flow whose exit is
+// removed goes silent and stalls until the application's own timeout: a dns
+// query that never returns, or a quic session (udp 443) that hangs instead of
+// falling back to tcp. an icmp destination-unreachable gives udp the same
+// prompt "this path is gone" notice tcp already gets.
+//
+// deliberately host/address unreachable (EHOSTUNREACH) rather than port
+// unreachable (ECONNREFUSED). the destination port is fine -- it is the path
+// through the exit that vanished. resolvers and quic stacks treat EHOSTUNREACH
+// as a transient path failure and retry, whereas ECONNREFUSED can make a
+// resolver mark that server dead; for the tunnel's own fixed dns address that
+// would be a worse failure than the freeze this fixes.
+//
+// `ipPath` is the flow's own direction (source to destination). the returned
+// packet is addressed back the other way, as if from the destination.
+func ipOosUnreachable(ipPath *IpPath) ([]byte, bool) {
+	if ipPath.Protocol != IpProtocolUdp {
+		return nil, false
+	}
+
+	// the datagram the error refers to: the ip header plus the 8 transport
+	// bytes rfc 792 requires. rfc 4443 permits more for v6, but the same 8
+	// are what the source matches against its socket.
+	embedded := ipOosUdpPacket(ipPath, nil)
+	reverse := ipPath.Reverse()
+
+	writeHeader := func(icmp []byte, icmpType byte, code byte) {
+		icmp[0] = icmpType
+		icmp[1] = code
+		// checksum, set by the caller
+		icmp[2] = 0
+		icmp[3] = 0
+		// unused
+		binary.BigEndian.PutUint32(icmp[4:8], 0)
+		copy(icmp[icmpUnreachableHeaderSize:], embedded)
+	}
+
+	switch ipPath.Version {
+	case 4:
+		packet, icmp := ipTransportPacket(reverse, ipProtocolNumberIcmpv4, icmpUnreachableHeaderSize+len(embedded))
+		writeHeader(icmp, icmpv4TypeDestinationUnreachable, icmpv4CodeHostUnreachable)
+		// icmpv4 checksums the message alone, with no pseudo header
+		binary.BigEndian.PutUint16(icmp[2:4], checksumFinish(checksumAdd(0, icmp)))
+		return packet, true
+	case 6:
+		packet, icmp := ipTransportPacket(reverse, ipProtocolNumberIcmpv6, icmpUnreachableHeaderSize+len(embedded))
+		writeHeader(icmp, icmpv6TypeDestinationUnreachable, icmpv6CodeAddressUnreachable)
+		// icmpv6 checksums with the ipv6 pseudo header, like tcp and udp
+		binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(
+			ipProtocolNumberIcmpv6,
+			reverse.SourceIp.To16(),
+			reverse.DestinationIp.To16(),
+			icmp,
+		))
+		return packet, true
 	default:
 		return nil, false
 	}

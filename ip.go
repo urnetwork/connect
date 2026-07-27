@@ -738,12 +738,17 @@ type UdpBufferSettings struct {
 }
 
 // iana ip protocol numbers, as carried in the ipv4 protocol and ipv6 next
-// header fields. only tcp and udp are handled; other protocols are dropped.
+// header fields. only tcp and udp are carried as flows; other protocols are
+// dropped. the icmp numbers are write-only -- they label the flow-teardown
+// unreachable messages built by `ipOosUnreachable`, which are injected toward
+// the source and never parsed back off the wire.
 type ipProtocolNumber uint8
 
 const (
-	ipProtocolNumberTcp = ipProtocolNumber(6)
-	ipProtocolNumberUdp = ipProtocolNumber(17)
+	ipProtocolNumberIcmpv4 = ipProtocolNumber(1)
+	ipProtocolNumberTcp    = ipProtocolNumber(6)
+	ipProtocolNumberUdp    = ipProtocolNumber(17)
+	ipProtocolNumberIcmpv6 = ipProtocolNumber(58)
 )
 
 // minimal parsed views of packets on the send path.
