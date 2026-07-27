@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	// "runtime/debug"
@@ -1846,6 +1847,11 @@ func (self *SendBuffer) Flush() {
 	}
 }
 
+// contractWaitLogThreshold is deliberately well under a second. Contract
+// acquisition blocks the send sequence, so a few hundred ms of it would
+// dominate every request while never appearing in a log.
+const contractWaitLogThreshold = 50 * time.Millisecond
+
 type SendSequence struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -1885,6 +1891,12 @@ type SendSequence struct {
 	resendQueue        *resendQueue
 	sendItems          []*sendItem
 	nextSequenceNumber uint64
+
+	// contract acquisition blocks this sequence, so track how much of its life
+	// goes into waiting for one. atomics so stats can be read without taking
+	// the sequence lock.
+	contractWaitNanos atomic.Int64
+	contractWaitCount atomic.Int64
 
 	idleCondition *IdleCondition
 
@@ -2591,8 +2603,17 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 	// surface slow contract acquisition at default verbosity. The send
 	// sequence blocks here, so a slow create (e.g. a companion request that
 	// cannot match an origin contract) stalls the entire sequence.
-	if d := time.Since(createStartTime); 1*time.Second <= d {
-		self.log.Infof("[s]contract wait %.1fs ok=%t c=%t %s->%s...%s s(%s)\n", d.Seconds(), ok, self.companionContract, self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId)
+	//
+	// The threshold was 1s, which hid the case that matters most. Device
+	// measurements put ~350ms of unexplained latency between a connection being
+	// established and its first byte arriving -- large enough to dominate every
+	// request, small enough to never log. Contract acquisition blocks in exactly
+	// that window, so it has to be observable well below a second to be ruled in
+	// or out.
+	contractWaitTime := time.Since(createStartTime)
+	self.addContractWaitTime(contractWaitTime)
+	if d := contractWaitTime; contractWaitLogThreshold <= d {
+		self.log.Infof("[s]contract wait %.0fms ok=%t c=%t %s->%s...%s s(%s)\n", float64(d.Microseconds())/1000.0, ok, self.companionContract, self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId)
 	}
 	return ok
 }
@@ -5435,3 +5456,19 @@ func MessageByteCount(frames []*protocol.Frame) ByteCount {
 // 	}
 // 	return messages
 // }
+
+// addContractWaitTime records time the send sequence spent blocked acquiring a
+// contract. Device measurements showed ~350ms unaccounted for between a
+// connection being established and its first byte arriving; this is the one
+// blocking step in that window, so it needs to be measurable rather than
+// inferred.
+func (self *SendSequence) addContractWaitTime(contractWaitTime time.Duration) {
+	self.contractWaitNanos.Add(int64(contractWaitTime))
+	self.contractWaitCount.Add(1)
+}
+
+// ContractWaitTime is the total time this sequence has spent blocked acquiring
+// contracts, and how many acquisitions that covers.
+func (self *SendSequence) ContractWaitTime() (time.Duration, int64) {
+	return time.Duration(self.contractWaitNanos.Load()), self.contractWaitCount.Load()
+}
