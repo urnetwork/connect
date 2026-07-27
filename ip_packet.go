@@ -45,12 +45,28 @@ const (
 	icmpUnreachableHeaderSize = 8
 
 	icmpv4TypeDestinationUnreachable = 3
-	// delivered to the application as EHOSTUNREACH
-	icmpv4CodeHostUnreachable = 1
+	// port unreachable, delivered as ECONNREFUSED.
+	//
+	// This was host unreachable (code 1) first, on the reasoning that the port
+	// is fine and only the path died. That is semantically truer and it does
+	// not work: linux maps ICMP_HOST_UNREACH to {EHOSTUNREACH, fatal=0} in
+	// icmp_err_convert, and __udp4_lib_err discards a non-fatal error on any
+	// socket without IP_RECVERR -- `if (!harderr || ...) goto out`. Chrome's
+	// quic sockets and the android resolver do not set IP_RECVERR, so the
+	// signal never reached the application on the one platform reporting the
+	// freeze. Port unreachable is {ECONNREFUSED, fatal=1} and is delivered.
+	//
+	// The original worry -- that ECONNREFUSED would make a resolver mark the
+	// tunnel's fixed dns address dead -- does not apply: IpMux.Receive
+	// short-circuits isLocalDestination traffic to the internal stack, so the
+	// mux-terminated resolver flows never reach this teardown path at all.
+	icmpv4CodePortUnreachable = 3
 
 	icmpv6TypeDestinationUnreachable = 1
-	// the v6 equivalent of v4 host unreachable, also EHOSTUNREACH
-	icmpv6CodeAddressUnreachable = 3
+	// the v6 equivalent, also ECONNREFUSED and also fatal. v6 has no fatal
+	// EHOSTUNREACH at all, so matching errno across families and being
+	// delivered on both is only possible here.
+	icmpv6CodePortUnreachable = 4
 )
 
 // out-of-sequence destination-unreachable for a udp flow whose exit went away.
@@ -62,17 +78,22 @@ const (
 // falling back to tcp. an icmp destination-unreachable gives udp the same
 // prompt "this path is gone" notice tcp already gets.
 //
-// deliberately host/address unreachable (EHOSTUNREACH) rather than port
-// unreachable (ECONNREFUSED). the destination port is fine -- it is the path
-// through the exit that vanished. resolvers and quic stacks treat EHOSTUNREACH
-// as a transient path failure and retry, whereas ECONNREFUSED can make a
-// resolver mark that server dead; for the tunnel's own fixed dns address that
-// would be a worse failure than the freeze this fixes.
+// the code is port unreachable, chosen for delivery over semantics -- see the
+// constants above. an undelivered signal is worth nothing, and on linux only
+// the fatal codes reach a socket that has not opted into IP_RECVERR.
 //
 // `ipPath` is the flow's own direction (source to destination). the returned
 // packet is addressed back the other way, as if from the destination.
 func ipOosUnreachable(ipPath *IpPath) ([]byte, bool) {
 	if ipPath.Protocol != IpProtocolUdp {
+		return nil, false
+	}
+
+	// check the version before building anything: ipOosUdpPacket panics on an
+	// unsupported version, and this must return false the way ipOosRst does
+	switch ipPath.Version {
+	case 4, 6:
+	default:
 		return nil, false
 	}
 
@@ -96,13 +117,13 @@ func ipOosUnreachable(ipPath *IpPath) ([]byte, bool) {
 	switch ipPath.Version {
 	case 4:
 		packet, icmp := ipTransportPacket(reverse, ipProtocolNumberIcmpv4, icmpUnreachableHeaderSize+len(embedded))
-		writeHeader(icmp, icmpv4TypeDestinationUnreachable, icmpv4CodeHostUnreachable)
+		writeHeader(icmp, icmpv4TypeDestinationUnreachable, icmpv4CodePortUnreachable)
 		// icmpv4 checksums the message alone, with no pseudo header
 		binary.BigEndian.PutUint16(icmp[2:4], checksumFinish(checksumAdd(0, icmp)))
 		return packet, true
 	case 6:
 		packet, icmp := ipTransportPacket(reverse, ipProtocolNumberIcmpv6, icmpUnreachableHeaderSize+len(embedded))
-		writeHeader(icmp, icmpv6TypeDestinationUnreachable, icmpv6CodeAddressUnreachable)
+		writeHeader(icmp, icmpv6TypeDestinationUnreachable, icmpv6CodePortUnreachable)
 		// icmpv6 checksums with the ipv6 pseudo header, like tcp and udp
 		binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(
 			ipProtocolNumberIcmpv6,

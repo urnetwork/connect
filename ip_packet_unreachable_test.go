@@ -45,9 +45,10 @@ func TestIpOosUnreachableUdpV4(t *testing.T) {
 
 	icmp := packet[Ipv4HeaderSizeWithoutExtensions:]
 	AssertEqual(t, icmp[0], byte(icmpv4TypeDestinationUnreachable))
-	// host unreachable (EHOSTUNREACH), not port unreachable (ECONNREFUSED) --
-	// see ipOosUnreachable for why that distinction matters for dns
-	AssertEqual(t, icmp[1], byte(icmpv4CodeHostUnreachable))
+	// port unreachable, which linux marks fatal in icmp_err_convert and so
+	// actually delivers to a socket without IP_RECVERR -- host unreachable is
+	// non-fatal and is silently discarded. see ipOosUnreachable.
+	AssertEqual(t, icmp[1], byte(icmpv4CodePortUnreachable))
 
 	// the embedded datagram is the original flow direction, so the source can
 	// match the error to its own socket
@@ -72,7 +73,7 @@ func TestIpOosUnreachableUdpV6(t *testing.T) {
 
 	icmp := packet[Ipv6HeaderSize:]
 	AssertEqual(t, icmp[0], byte(icmpv6TypeDestinationUnreachable))
-	AssertEqual(t, icmp[1], byte(icmpv6CodeAddressUnreachable))
+	AssertEqual(t, icmp[1], byte(icmpv6CodePortUnreachable))
 
 	// icmpv6 checksums with the pseudo header, unlike v4
 	reverse := ipPath.Reverse()
