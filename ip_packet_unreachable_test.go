@@ -107,15 +107,15 @@ func TestTeardownSourcePacketRespectsSetting(t *testing.T) {
 	on := &RemoteUserNatMultiClient{settings: &MultiClientSettings{UdpTeardownSignal: true}}
 	off := &RemoteUserNatMultiClient{settings: &MultiClientSettings{UdpTeardownSignal: false}}
 
-	_, ok := on.teardownSourcePacket(udpPath)
+	_, ok := on.teardownSourcePacket(udpPath, 0)
 	AssertEqual(t, ok, true)
 
-	_, ok = off.teardownSourcePacket(udpPath)
+	_, ok = off.teardownSourcePacket(udpPath, 0)
 	AssertEqual(t, ok, false)
 
 	// tcp is unaffected either way
 	for _, c := range []*RemoteUserNatMultiClient{on, off} {
-		_, ok = c.teardownSourcePacket(tcpPath)
+		_, ok = c.teardownSourcePacket(tcpPath, 0)
 		AssertEqual(t, ok, true)
 	}
 }
