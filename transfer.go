@@ -159,6 +159,7 @@ func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings
 		ResendQueueMaxByteCount: MemoryScaledByteCount(mib(2), kib(256)),
 		ResendQueueMinByteCount: kib(256),
 		ContractFillFraction:    0.8,
+		PrewarmOpeningContract:  true,
 		ProtocolVersion:         DefaultProtocolVersion,
 	}
 }
@@ -1534,6 +1535,20 @@ type SendBufferSettings struct {
 	// as this ->1, there is more risk that noack messages will get dropped due to out of sync contracts
 	ContractFillFraction float32
 
+	// PrewarmOpeningContract requests a sequence's first contract as the
+	// sequence starts, rather than waiting until a message needs one.
+	//
+	// Every later contract is already queued asynchronously the moment its
+	// predecessor is taken, which is why renewals mid-stream are fast. The first
+	// has nothing ahead of it to trigger that, so acquiring it blocks the first
+	// send for a full round trip to the platform -- measured at ~260ms on a
+	// device, paid by every new destination. Firing the request as the sequence
+	// starts overlaps that round trip with the work that produced the first
+	// message.
+	//
+	// off restores the previous behavior of requesting it on demand.
+	PrewarmOpeningContract bool
+
 	ProtocolVersion int
 }
 
@@ -2168,6 +2183,8 @@ func (self *SendSequence) Run() {
 			self.session.Release()
 		}
 	}()
+
+	self.prewarmOpeningContract()
 
 	ackWindow := newSequenceAckWindow()
 	go HandleError(func() {
@@ -5456,6 +5473,45 @@ func MessageByteCount(frames []*protocol.Frame) ByteCount {
 // 	}
 // 	return messages
 // }
+
+// prewarmOpeningContract requests this sequence's first contract as the
+// sequence starts, so the round trip to the platform overlaps producing the
+// first message instead of blocking it.
+//
+// Contracts after the first are already queued the moment their predecessor is
+// taken, which is why mid-stream renewals complete in under 50ms while the
+// opening one costs ~260ms. Every new destination is a new sequence, so web
+// browsing pays that opening cost constantly.
+//
+// The request is fire-and-forget: CreateContract hands the frame to the control
+// channel with a callback and returns, so this never blocks the caller. The
+// size is left to the contract manager's own ramp -- only a floor is passed.
+func (self *SendSequence) prewarmOpeningContract() {
+	if !self.sendBufferSettings.PrewarmOpeningContract {
+		return
+	}
+
+	// mirror the first thing updateContract checks. A destination configured to
+	// require no contract never takes one, so requesting it would open a queue
+	// that is only cleaned up by the janitor -- and it charges a control round
+	// trip for a contract that cannot be used.
+	if self.client.ContractManager().SendNoContract(self.destination.DestinationId) {
+		return
+	}
+
+	self.client.ContractManager().CreateContract(
+		ContractKey{
+			Destination:         self.destination,
+			IntermediaryIds:     self.intermediaryIds,
+			CompanionContract:   self.companionContract,
+			ForceStream:         self.forceStream,
+			EncryptionRole:      self.encryptionRole,
+			EncryptionCompanion: self.encryptionCompanion,
+		},
+		self.contractSeqIndex,
+		ByteCount(float32(self.sendBufferSettings.MinMessageByteCount)/self.sendBufferSettings.ContractFillFraction),
+	)
+}
 
 // addContractWaitTime records time the send sequence spent blocked acquiring a
 // contract. Device measurements showed ~350ms unaccounted for between a
