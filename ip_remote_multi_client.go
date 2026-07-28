@@ -533,6 +533,12 @@ type RemoteUserNatMultiClient struct {
 	serverNamesLearnedUnsub func()
 	packetStatsCounters     *packetStatsCounters
 	packetStatsCallbacks    *CallbackList[PacketStatsFunction]
+
+	// reliabilityMetrics measures what a provider failure actually costs the
+	// user -- how many flows die with an exit, and how long the destinations
+	// they served stay unreachable. The reliability knobs above are only
+	// A/B-testable against a number, and this is the number.
+	reliabilityMetrics *reliabilityMetrics
 }
 
 // ServerNameLookup resolves a destination IP to the server name(s) previously observed
@@ -622,6 +628,7 @@ func NewRemoteUserNatMultiClient(
 		blockActionIgnoreCache: newBlockActionIgnoreCache(settings.BlockActionDecisionTtl, settings.BlockActionDecisionMaxCount),
 		packetStatsCounters:    &packetStatsCounters{},
 		packetStatsCallbacks:   NewCallbackList[PacketStatsFunction](),
+		reliabilityMetrics:     newReliabilityMetrics(),
 	}
 	if settings.IpAssocSettings != nil {
 		multiClient.ipAssoc = NewIpAssoc(cancelCtx, settings.IpAssocSettings)
@@ -1406,6 +1413,7 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 		update, ok := self.ip4PathUpdates[ip4Path]
 		if !ok || update.IsDone() {
 			update = newMultiClientChannelUpdate(self.ctx, ipPath)
+			self.reliabilityMetrics.flowOpened()
 			go HandleError(func() {
 				defer update.cancel()
 
@@ -1515,6 +1523,7 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 		update, ok := self.ip6PathUpdates[ip6Path]
 		if !ok || update.IsDone() {
 			update = newMultiClientChannelUpdate(self.ctx, ipPath)
+			self.reliabilityMetrics.flowOpened()
 			go HandleError(func() {
 				defer update.cancel()
 
@@ -1689,6 +1698,10 @@ func (self *RemoteUserNatMultiClient) updateClient(update *multiClientChannelUpd
 // remove a client from all updates
 func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 	rstPackets := []*receivePacket{}
+	// every flow pinned to this client dies with it -- split-tcp means the
+	// exit holds the remote end of the connection, so there is nothing to
+	// migrate. the count is the blast radius of one provider failure.
+	lostDestinations := []recoveryKey{}
 
 	func() {
 		self.stateLock.Lock()
@@ -1705,6 +1718,13 @@ func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 				if update.client.Load() == client {
 					update.client.Store(nil)
 
+					// the update's ipPath is egress-oriented, so the remote
+					// endpoint the user is waiting on is the destination.
+					lostDestinations = append(lostDestinations, newRecoveryKey(
+						update.ipPath.DestinationIp,
+						update.ipPath.DestinationPort,
+					))
+
 					if packet, ok := self.teardownSourcePacket(update.ipPath, update.sourceRstSequence()); ok {
 						rstPacket := &receivePacket{
 							Source:      TransferPath{},
@@ -1720,6 +1740,11 @@ func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 			}
 		}
 	}()
+
+	// recorded outside stateLock -- the metrics take their own lock, and
+	// nesting them under the parent lock would put the recovery tracker on the
+	// path every flow lookup contends for.
+	self.reliabilityMetrics.exitLost(lostDestinations)
 
 	select {
 	case <-self.ctx.Done():
@@ -2346,6 +2371,12 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 
 	self.packetStatsCounters.remoteIngressPacketCount.Add(1)
 	self.packetStatsCounters.remoteIngressByteCount.Add(int64(len(packet)))
+
+	// traffic from a destination whose flows died with an exit closes out the
+	// recovery measurement. also before reverse, so the remote endpoint is
+	// still the source. a no-op unless that destination is actually pending.
+	self.reliabilityMetrics.destinationReachable(ipPath.SourceIp, ipPath.SourcePort)
+
 	if self.ipAssoc != nil {
 		// before reverse, the remote endpoint is the source
 		self.ipAssoc.AddIngressPacket(ipPath)
