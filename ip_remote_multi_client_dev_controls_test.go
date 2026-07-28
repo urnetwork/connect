@@ -89,8 +89,22 @@ func TestReliabilitySettingsFromDefaults(t *testing.T) {
 // a stalled exit reports the packet as sent but never acknowledges it, and
 // must not error -- an error would reset the flow immediately, which is the
 // opposite of the state being reproduced
+// It must also account for the packet as outstanding. Detection treats a
+// client with nothing in flight as idle rather than broken, so a stalled exit
+// that skips the accounting is invisible to sendStalled -- which is what
+// happened on device, where a stall went unnoticed for 34s while every flow on
+// that exit was dead.
 func TestStalledChannelSwallowsWithoutError(t *testing.T) {
-	client := &multiClientChannel{}
+	settings := DefaultMultiClientSettings()
+	// mirrors newMultiClientChannel: the stalled path now runs the real send
+	// accounting rather than returning before it, so the channel needs the
+	// state that accounting touches
+	client := &multiClientChannel{
+		settings:                  settings,
+		packetStats:               &clientWindowStats{log: loggerOrDefault(settings.Log)},
+		ip4DestinationSourceCount: map[Ip4Path]map[Ip4Path]int{},
+		ip6DestinationSourceCount: map[Ip6Path]map[Ip6Path]int{},
+	}
 	client.setStalled(true)
 
 	success, err := client.SendDetailedWithAck(&parsedPacket{
@@ -100,6 +114,16 @@ func TestStalledChannelSwallowsWithoutError(t *testing.T) {
 
 	AssertEqual(t, success, true)
 	AssertEqual(t, err == nil, true)
+
+	// the send is committed and will never be acknowledged, so the stall clock
+	// is running and a timeout shorter than the elapsed time must trip. the
+	// sleep is not incidental: the coarse clock on some platforms reports zero
+	// elapsed for an immediate check, which would pass a broken implementation
+	// as readily as a working one
+	time.Sleep(5 * time.Millisecond)
+	AssertEqual(t, client.sendStalled(1*time.Millisecond), true)
+	// 0 still disables the check entirely
+	AssertEqual(t, client.sendStalled(0), false)
 }
 
 // dropping or stalling an exit that is not in the window reports failure rather

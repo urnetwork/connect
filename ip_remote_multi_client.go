@@ -1746,10 +1746,47 @@ func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 	// path every flow lookup contends for.
 	self.reliabilityMetrics.exitLost(lostDestinations)
 
+	// a client removed while carrying nothing is routine window churn --
+	// collapsing the lowest-weighted client, rank-based removal -- and logging
+	// those buries the removals that actually cost a user something
+	teardownWorthLogging := 0 < len(rstPackets) || 0 < len(lostDestinations)
+
 	select {
 	case <-self.ctx.Done():
+		// the teardown is dropped when the client is shutting down. worth
+		// logging: it is the one case where flows die with no signal at all,
+		// and it is otherwise indistinguishable from a teardown that was sent
+		// and ignored.
+		if teardownWorthLogging {
+			self.log.Infof(
+				"[multi]teardown skipped, context done: %d packet(s) for %d flow(s) of client %s\n",
+				len(rstPackets), len(lostDestinations), client.ClientId(),
+			)
+		}
 	default:
+		// whether the peer is told is the difference between a flow that fails
+		// fast and one that hangs until the app's own timeout. on device a
+		// dropped exit left a download at 0bps rather than erroring, and there
+		// was no way to tell whether the teardown was never built, never sent,
+		// or sent and ignored. log the emission so those are distinguishable.
+		if teardownWorthLogging {
+			self.log.Infof(
+				"[multi]teardown sending %d packet(s) for %d flow(s) of client %s\n",
+				len(rstPackets), len(lostDestinations), client.ClientId(),
+			)
+		}
 		for _, p := range rstPackets {
+			if self.log.V(1).Enabled() {
+				// IpPath has no String(), so expand the fields -- %s on the
+				// struct prints an unreadable blob with the ports and flags
+				// mangled, which is useless for the one job this line has
+				self.log.Infof(
+					"[multi]teardown -> ipv%d p%v %s:%d->%s:%d\n",
+					p.IpPath.Version, p.IpPath.Protocol,
+					p.IpPath.SourceIp, p.IpPath.SourcePort,
+					p.IpPath.DestinationIp, p.IpPath.DestinationPort,
+				)
+			}
 			self.receivePacketCallback(p.Source, p.ProvideMode, p.IpPath, p.Packet)
 		}
 	}
@@ -2660,8 +2697,16 @@ func (self *RemoteUserNatMultiClient) DropExit(clientId Id) bool {
 
 // StallExit makes a provider channel stop acknowledging without being cancelled,
 // reproducing the state the collapse-prevention bound exists for: a client that
-// is neither healthy nor detectably dead, holding its flows' sequence state
-// while failure detection takes up to AckTimeout to notice.
+// is neither healthy nor detectably dead, holding its flows' sequence state.
+//
+// Note the stall is not held indefinitely. The swallowed packet is accounted
+// for as an outstanding send, so sendStalled trips after SendStallTimeout (3s
+// by default) and the resize pass removes and replaces the exit -- which is
+// the behavior being exercised. Expect the stalled exit to disappear from the
+// window a few seconds after the button, rather than sit there stalled.
+// Before that accounting was in place the exit was invisible to the very
+// detector this reproduces the input for, and a stall went unnoticed for 34s
+// on device.
 //
 // This is the only way to exercise that path deliberately -- a real stall
 // depends on a provider misbehaving at the right moment. Returns false if no
@@ -4363,18 +4408,30 @@ func (self *multiClientChannel) SendWithAck(parsedPacket *parsedPacket, timeout 
 }
 
 func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, timeout time.Duration, ack bool) (bool, error) {
-	// a stalled exit swallows the packet: reported sent, never acknowledged,
-	// and crucially no error -- an error would reset the flow immediately,
-	// which is the opposite of the state being reproduced. see StallExit.
-	if self.stalled.Load() {
-		return true, nil
-	}
 	if frame, err := ipPacketToProviderFrame(parsedPacket.packet, self.settings.ProtocolVersion); err != nil {
 		self.addError(err)
 		return false, err
 	} else {
 		packetByteCount := ByteCount(len(parsedPacket.packet))
 		self.addSend(packetByteCount, parsedPacket.ipPath)
+
+		// a stalled exit swallows the packet: reported sent, never acknowledged,
+		// and crucially no error -- an error would reset the flow immediately,
+		// which is the opposite of the state being reproduced. see StallExit.
+		//
+		// this must come *after* addSend. addSend is what starts the stall
+		// clock (pendingSendTime) and counts the send as outstanding, and
+		// sendStalled treats a client with nothing outstanding as idle rather
+		// than broken. returning before it made a stalled exit invisible to
+		// the detector built to catch stalled exits: on device, a stall went
+		// unnoticed for 34s while the flows on it were dead. a provider that
+		// really blackholes takes this path and is accounted for, so swallowing
+		// here is also the faithful simulation -- the packet is committed and
+		// simply never acknowledged.
+		if self.stalled.Load() {
+			return true, nil
+		}
+
 		ackCallback := func(err error) {
 			if err == nil {
 				self.addSendAck(packetByteCount)

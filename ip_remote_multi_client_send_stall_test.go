@@ -117,9 +117,12 @@ func TestStallExitHookTripsTheDetector(t *testing.T) {
 	AssertEqual(t, success, true)
 	AssertEqual(t, err == nil, true)
 
-	// the swallowed packet never reached addSend, so drive the accounting the
-	// way a real committed send would
-	client.addSend(1440, udpTestPath(4))
+	// no manual addSend here on purpose. this test used to compensate for the
+	// swallowed packet never reaching addSend, which made it pass whether or
+	// not the stall was actually detectable -- it asserted the detector worked
+	// on accounting the test itself had supplied. the swallow now happens after
+	// addSend, exactly as a real blackholing provider behaves, so the stall
+	// must be visible from the send above alone.
 	time.Sleep(stallTimeout + 30*time.Millisecond)
 
 	AssertEqual(t, client.sendStalled(stallTimeout), true)
