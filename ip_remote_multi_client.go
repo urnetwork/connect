@@ -143,6 +143,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// a lower ack timeout helps cycle through bad providers faster
 		AckTimeout:                                30 * time.Second,
 		BlackholeTimeout:                          5 * time.Second,
+		BlackholeReceiveTimeout:                   20 * time.Second,
 		BlackholeConnectTimeout:                   30 * time.Second,
 		WindowResizeTimeout:                       15 * time.Second,
 		StatsWindowGraceperiod:                    30 * time.Second,
@@ -225,15 +226,28 @@ type MultiClientSettings struct {
 	// ClientWriteTimeout time.Duration
 	// SendTimeout time.Duration
 	// WriteTimeout time.Duration
-	SendRetryTimeout                          time.Duration
-	PingWriteTimeout                          time.Duration
-	CPingWriteTimeout                         time.Duration
-	CPingMaxByteCountPerSecond                ByteCount
-	PingTimeout                               time.Duration
-	CPingTimeout                              time.Duration
-	CPingRestTimeout                          time.Duration
-	AckTimeout                                time.Duration
-	BlackholeTimeout                          time.Duration
+	SendRetryTimeout           time.Duration
+	PingWriteTimeout           time.Duration
+	CPingWriteTimeout          time.Duration
+	CPingMaxByteCountPerSecond ByteCount
+	PingTimeout                time.Duration
+	CPingTimeout               time.Duration
+	CPingRestTimeout           time.Duration
+	AckTimeout                 time.Duration
+	BlackholeTimeout           time.Duration
+	// BlackholeReceiveTimeout bounds the weaker of the two blackhole signals:
+	// the provider is acknowledging our sends, so it is demonstrably alive,
+	// but nothing has come back from the destination. That is ambiguous -- a
+	// flow waiting on a slow origin looks identical -- and removing an exit is
+	// destructive, killing every flow pinned to it rather than just the quiet
+	// one. So it gets a longer bar than BlackholeTimeout, which covers the
+	// unambiguous case of a provider that has stopped acknowledging anything.
+	//
+	// Bounded above by roughly StatsWindowDuration + StatsWindowBucketDuration:
+	// the age this compares against comes from surviving stat buckets, and
+	// coalesceEventBuckets drops buckets older than StatsWindowDuration. Past
+	// that ceiling it never fires, with no error and no log. 0 disables it.
+	BlackholeReceiveTimeout                   time.Duration
 	BlackholeConnectTimeout                   time.Duration
 	WindowResizeTimeout                       time.Duration
 	StatsWindowGraceperiod                    time.Duration
@@ -3833,11 +3847,20 @@ func (self *multiClientChannel) detectBlackhole() {
 		} else {
 			blackhole := func() bool {
 				now := time.Now()
-				if !windowStats.firstSendNackTime.IsZero() && self.settings.BlackholeTimeout-now.Sub(windowStats.firstSendNackTime) <= 0 {
-					if windowStats.sendAckCount <= 0 {
+				// two signals of very different strength, so they get
+				// different bars. see BlackholeReceiveTimeout
+				if !windowStats.firstSendNackTime.IsZero() {
+					sendNackAge := now.Sub(windowStats.firstSendNackTime)
+
+					// acknowledges nothing: the provider is not there
+					if self.settings.BlackholeTimeout <= sendNackAge && windowStats.sendAckCount <= 0 {
 						return true
 					}
-					if windowStats.receiveAckCount <= 0 {
+
+					// acknowledges our sends, but nothing back from the
+					// destination
+					receiveTimeout := self.settings.BlackholeReceiveTimeout
+					if 0 < receiveTimeout && receiveTimeout <= sendNackAge && windowStats.receiveAckCount <= 0 {
 						return true
 					}
 				}
