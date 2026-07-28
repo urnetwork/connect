@@ -204,6 +204,11 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		UdpTeardownSignal:        true,
 		ClusterAffinityFallback:  true,
 		ServerNameAffinityBridge: true,
+		// well inside AckTimeout (30s), which is what otherwise bounds recovery
+		// from a client that accepts packets and never delivers them, and well
+		// outside any normal ack round trip so ordinary latency is not mistaken
+		// for a stall
+		SendStallTimeout: 3 * time.Second,
 		// well under the 30s AckTimeout that previously bounded a stalled
 		// flow, and past the ~200ms-1s range of a first tcp rto so a healthy
 		// flow's retransmits are still collapsed
@@ -331,6 +336,13 @@ type MultiClientSettings struct {
 	// behavior where retransmits were dropped until the client was declared
 	// dead (up to AckTimeout). Ignored when TcpCollapsePrevention is off.
 	TcpCollapseMaxHold time.Duration
+
+	// SendStallTimeout is how long a client may hold outstanding sends without
+	// acknowledging any of them before it is treated as failed and removed from
+	// the window. A client in that state looks busy rather than broken, so
+	// without this it survives until AckTimeout (30s) while every flow pinned to
+	// it is frozen. 0 disables the check. See `sendStalled`.
+	SendStallTimeout time.Duration
 
 	// ServerNameAffinityBridge lets a new flow whose own affinity group has no
 	// donor inherit the client from the destination-scoped group an earlier
@@ -638,6 +650,7 @@ func NewRemoteUserNatMultiClient(
 		multiClient.removeClient,
 		WindowTypeQuality,
 		settings,
+		multiClient.reliabilitySettings,
 	)
 	if _, fixed := generator.FixedDestinationSize(); !fixed {
 		multiClient.windows[WindowTypeSpeed] = newMultiClientWindow(
@@ -649,6 +662,7 @@ func NewRemoteUserNatMultiClient(
 			multiClient.removeClient,
 			WindowTypeSpeed,
 			settings,
+			multiClient.reliabilitySettings,
 		)
 	}
 	// else only keep the quality window for fixed destination
@@ -989,6 +1003,7 @@ type ReliabilitySettings struct {
 	// see the matching MultiClientSettings fields for what each one does
 	UdpTeardownSignal        bool
 	TcpCollapseMaxHold       time.Duration
+	SendStallTimeout         time.Duration
 	ClusterAffinityFallback  bool
 	ServerNameAffinityBridge bool
 	SequenceIdleTimeout      time.Duration
@@ -1005,6 +1020,7 @@ func ReliabilitySettingsFrom(settings *MultiClientSettings) *ReliabilitySettings
 	return &ReliabilitySettings{
 		UdpTeardownSignal:        settings.UdpTeardownSignal,
 		TcpCollapseMaxHold:       settings.TcpCollapseMaxHold,
+		SendStallTimeout:         settings.SendStallTimeout,
 		ClusterAffinityFallback:  settings.ClusterAffinityFallback,
 		ServerNameAffinityBridge: settings.ServerNameAffinityBridge,
 		SequenceIdleTimeout:      settings.SequenceIdleTimeout,
@@ -2951,6 +2967,12 @@ type multiClientWindow struct {
 	windowType                  WindowType
 
 	settings *MultiClientSettings
+	// reliabilitySettingsFunc reads the parent's effective reliability config,
+	// which the developer menu can override at runtime. A callback rather than a
+	// back-reference so the window keeps its existing lifetime and the bare
+	// window fixtures in the suite stay constructible. nil falls back to
+	// `settings`.
+	reliabilitySettingsFunc func() *ReliabilitySettings
 
 	clientChannelArgs chan *multiClientChannelArgs
 
@@ -2978,6 +3000,7 @@ func newMultiClientWindow(
 	clientRemoveCallback func(client *multiClientChannel),
 	windowType WindowType,
 	settings *MultiClientSettings,
+	reliabilitySettingsFunc func() *ReliabilitySettings,
 ) *multiClientWindow {
 	window := &multiClientWindow{
 		ctx:                         ctx,
@@ -2989,6 +3012,7 @@ func newMultiClientWindow(
 		clientRemoveCallback:        clientRemoveCallback,
 		windowType:                  windowType,
 		settings:                    settings,
+		reliabilitySettingsFunc:     reliabilitySettingsFunc,
 		clientChannelArgs:           make(chan *multiClientChannelArgs),
 		monitor:                     NewRemoteUserNatMultiClientMonitor(&settings.RemoteUserNatMultiClientMonitorSettings),
 		contractStatusCallbacks:     NewCallbackList[*contractStatusCallbackWorker](),
@@ -3267,7 +3291,13 @@ func (self *multiClientWindow) resize() {
 			// note for fixed destination size, the destination might still be aliased with multiple clients
 			// TODO it's still not clear why one client might stop working occasionally
 
-			healthy := stats.unhealthyDuration < self.settings.StatsWindowMaxUnhealthyDuration
+			// a client holding unacked sends with no progress is failed, however
+			// healthy its history looks. it is not erroring and not idle, so
+			// nothing else here classifies it until AckTimeout, and every flow
+			// pinned to it is frozen until then
+			sendStalled := client.sendStalled(self.reliabilitySettings().SendStallTimeout)
+
+			healthy := !sendStalled && stats.unhealthyDuration < self.settings.StatsWindowMaxUnhealthyDuration
 
 			printStats := func(status string) {
 				effectiveByteCountPerSecond := stats.EffectiveByteCountPerSecond()
@@ -3300,6 +3330,13 @@ func (self *multiClientWindow) resize() {
 			// grid dot is reclaimed) instead of pinning a dead client forever
 			if 0 < self.settings.StatsWindowKeepUnhealthyDuration &&
 				self.settings.StatsWindowKeepUnhealthyDuration <= stats.unhealthyDuration {
+				remove = true
+			}
+			// a stalled client is removed regardless of rank. rank-keeping exists
+			// to ride out transient badness in the healthiest clients, but this
+			// one is provably delivering nothing, and keeping it holds its flows
+			// frozen -- removal is what lets them re-race onto a working client
+			if sendStalled {
 				remove = true
 			}
 			if healthy {
@@ -3703,6 +3740,16 @@ func (self *multiClientWindow) expand(
 	return
 }
 
+// reliabilitySettings is the effective reliability config for this window: the
+// parent's runtime override when one is installed, else what the window was
+// constructed with. Safe on a bare window, which the suite's fixtures rely on.
+func (self *multiClientWindow) reliabilitySettings() *ReliabilitySettings {
+	if self.reliabilitySettingsFunc != nil {
+		return self.reliabilitySettingsFunc()
+	}
+	return ReliabilitySettingsFrom(self.settings)
+}
+
 func (self *multiClientWindow) shuffle() {
 	for _, client := range self.unorderedClients() {
 		client.Cancel()
@@ -4025,6 +4072,11 @@ type multiClientChannel struct {
 
 	warning bool
 
+	// pendingSendTime is when the current run of unacked sends began, reset on
+	// every ack. With sendNackCount > 0 it is the age of the oldest unmade
+	// progress, which is what sendStalled tests. Guarded by stateLock.
+	pendingSendTime time.Time
+
 	// stalled is a test/diagnostic hook, set only by StallExit. Read on the
 	// send hot path, so an atomic rather than the state lock.
 	stalled atomic.Bool
@@ -4139,6 +4191,34 @@ func (self *multiClientChannel) EstimatedByteCountPerSecond() ByteCount {
 // erroring. See RemoteUserNatMultiClient.StallExit.
 func (self *multiClientChannel) setStalled(stalled bool) {
 	self.stalled.Store(stalled)
+}
+
+// sendStalled reports whether this client has outstanding sends that have made
+// no progress for at least stallTimeout: bytes committed, nothing acknowledged.
+//
+// This is the state a client is in when it accepts packets and never delivers
+// them. Failure detection otherwise waits for AckTimeout (30s), because the
+// client is neither erroring nor going quiet -- it looks busy. Every flow
+// pinned to it is frozen for that whole window, and releasing the sender's
+// retransmits does not help: they go to the same black hole. The flow can only
+// recover once this client is out of the window, so the useful signal is "in
+// flight, no acks", and it is available within seconds.
+//
+// 0 disables the check, restoring the previous AckTimeout-bounded behavior.
+func (self *multiClientChannel) sendStalled(stallTimeout time.Duration) bool {
+	if stallTimeout <= 0 {
+		return false
+	}
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	// nothing outstanding means nothing to be stalled on -- an idle client is
+	// not a broken one
+	if self.packetStats.sendNackCount <= 0 || self.pendingSendTime.IsZero() {
+		return false
+	}
+	return stallTimeout <= time.Since(self.pendingSendTime)
 }
 
 func (self *multiClientChannel) setWarning(warning bool) {
@@ -4426,6 +4506,10 @@ func (self *multiClientChannel) addSend(packetByteCount ByteCount, ipPath *IpPat
 
 	eventBucket := self.eventBucket()
 
+	if self.packetStats.sendNackCount == 0 {
+		// first outstanding send, so start the stall clock. see sendStalled
+		self.pendingSendTime = time.Now()
+	}
 	self.packetStats.sendNackCount += 1
 	self.packetStats.sendNackByteCount += packetByteCount
 	if eventBucket.sendNackCount == 0 {
@@ -4468,6 +4552,8 @@ func (self *multiClientChannel) addSendAck(ackByteCount ByteCount) {
 	self.packetStats.sendNackByteCount -= ackByteCount
 	self.packetStats.sendAckCount += 1
 	self.packetStats.sendAckByteCount += ackByteCount
+	// an ack is progress, so the stall clock restarts here
+	self.pendingSendTime = time.Now()
 
 	eventBucket := self.eventBucket()
 	if eventBucket.sendAckCount == 0 {
