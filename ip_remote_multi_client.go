@@ -3025,8 +3025,58 @@ func newMultiClientWindow(
 
 	go HandleError(window.randomEnumerateClientArgs, cancel)
 	go HandleError(window.resize, cancel)
+	go HandleError(window.watchSendStalls, cancel)
 
 	return window
+}
+
+// sendStallPollTimeout is how often the stall watchdog looks.
+//
+// A fraction of the stall timeout, so a stall is noticed within roughly its own
+// timeout rather than a multiple of it, with a floor so a very small timeout
+// cannot turn the watchdog into a busy loop. When stall detection is disabled
+// the watchdog idles at the resize cadence instead of exiting, so enabling it
+// at runtime from the developer menu is picked up without a reconnect.
+func sendStallPollTimeout(stallTimeout time.Duration, resizeTimeout time.Duration) time.Duration {
+	if stallTimeout <= 0 {
+		return resizeTimeout
+	}
+	return max(stallTimeout/3, 250*time.Millisecond)
+}
+
+// watchSendStalls wakes the resize pass as soon as a client stops delivering.
+//
+// The stall check itself lives in resize, which otherwise runs on
+// WindowResizeTimeout -- 15s. Detecting a stall at 3s is worth nothing if it is
+// only consulted every 15s, and device testing showed exactly that: a stalled
+// exit took 15-30s to recover rather than the intended 3. This polls on a
+// fraction of the stall timeout and notifies the monitor, so the pass that
+// removes the client runs promptly instead of on the next scheduled sweep.
+//
+// Only a notification -- the decision to remove stays in resize, so there is
+// one place that classifies a client.
+func (self *multiClientWindow) watchSendStalls() {
+	for {
+		stallTimeout := self.reliabilitySettings().SendStallTimeout
+
+		pollTimeout := sendStallPollTimeout(stallTimeout, self.settings.WindowResizeTimeout)
+
+		select {
+		case <-self.ctx.Done():
+			return
+		case <-time.After(pollTimeout):
+		}
+
+		if stallTimeout <= 0 {
+			continue
+		}
+		for _, client := range self.unorderedClients() {
+			if client.sendStalled(stallTimeout) {
+				self.resizeMonitor.NotifyAll()
+				break
+			}
+		}
+	}
 }
 
 func (self *multiClientWindow) AddContractStatusCallback(contractStatusCallback ContractStatusFunction) func() {
