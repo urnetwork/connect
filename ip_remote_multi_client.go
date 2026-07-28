@@ -147,6 +147,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		AckTimeout:                                30 * time.Second,
 		BlackholeTimeout:                          5 * time.Second,
 		BlackholeReceiveTimeout:                   20 * time.Second,
+		MaxFlowsPerExit:                           64,
 		BlackholeConnectTimeout:                   30 * time.Second,
 		WindowResizeTimeout:                       15 * time.Second,
 		StatsWindowGraceperiod:                    30 * time.Second,
@@ -276,8 +277,33 @@ type MultiClientSettings struct {
 	// keeps headroom so a later reduction of StatsWindowDuration does not
 	// quietly disable it; TestBlackholeReceiveTimeoutIsReachable fails loudly
 	// if that margin is lost.
-	BlackholeReceiveTimeout                   time.Duration
-	BlackholeConnectTimeout                   time.Duration
+	BlackholeReceiveTimeout time.Duration
+	BlackholeConnectTimeout time.Duration
+	// MaxFlowsPerExit bounds how many live flows may be pinned to one exit.
+	//
+	// Providers are split-tcp, so removing an exit destroys every flow on it.
+	// Measured on device: of 14 removals in 28 minutes, 10 cost nothing and
+	// one cost 157 connections at once -- a visible 15s stall. Blast radius,
+	// not removal rate, is what a user actually feels.
+	//
+	// The cost is destination affinity: a site whose flows would have shared
+	// an exit gets split across two once the first is full, so it sees more
+	// than one egress ip. A real trade-off rather than a free win, which is
+	// why it is tunable at runtime; 0 restores the previous unbounded
+	// behavior.
+	//
+	// The default is deliberately permissive. Over 40 minutes of real use, 25
+	// removals destroyed 821 flows in total, but four of them accounted for
+	// 756 of those -- sizes 1, 2, 26, 36, 53, 62, 157, 484. Exits accumulate
+	// rather than plateau, so the worst event grows with session length. A
+	// bound well above normal per-exit load still turns the tail from
+	// catastrophic into merely noticeable, without splitting the common case
+	// across exits.
+	//
+	// The cap must never make a flow unroutable -- it bounds blast radius, it
+	// is not admission control. When every candidate is full the flow is
+	// placed anyway.
+	MaxFlowsPerExit                           int
 	WindowResizeTimeout                       time.Duration
 	StatsWindowGraceperiod                    time.Duration
 	StatsWindowMaxEstimatedByteCountPerSecond ByteCount
@@ -1039,6 +1065,7 @@ type ReliabilitySettings struct {
 	SequenceIdleTimeout      time.Duration
 	TcpSequenceIdleTimeout   time.Duration
 	BlackholeReceiveTimeout  time.Duration
+	MaxFlowsPerExit          int
 }
 
 // ReliabilitySettingsFrom reads the effective values out of a settings struct.
@@ -1057,6 +1084,7 @@ func ReliabilitySettingsFrom(settings *MultiClientSettings) *ReliabilitySettings
 		SequenceIdleTimeout:      settings.SequenceIdleTimeout,
 		TcpSequenceIdleTimeout:   settings.TcpSequenceIdleTimeout,
 		BlackholeReceiveTimeout:  settings.BlackholeReceiveTimeout,
+		MaxFlowsPerExit:          settings.MaxFlowsPerExit,
 	}
 }
 
@@ -1203,6 +1231,52 @@ func (self *RemoteUserNatMultiClient) affinityFallbackIpPathsWithLock(ipPath *Ip
 	return fallbackPaths
 }
 
+// underFlowCap drops candidates that are already carrying their share of
+// flows, preserving the caller's ordering.
+//
+// If every candidate is full the original list is returned unchanged. The cap
+// bounds blast radius; it is not admission control, and refusing to place a
+// flow would turn a slower page into a broken one.
+func (self *RemoteUserNatMultiClient) underFlowCap(clients []*multiClientChannel) []*multiClientChannel {
+	if len(clients) == 0 || self.reliabilitySettings().MaxFlowsPerExit <= 0 {
+		return clients
+	}
+
+	under := make([]*multiClientChannel, 0, len(clients))
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		for _, client := range clients {
+			if !self.clientAtFlowCapWithLock(client) {
+				under = append(under, client)
+			}
+		}
+	}()
+
+	if len(under) == 0 {
+		return clients
+	}
+	return under
+}
+
+// clientAtFlowCapWithLock reports whether an exit is already carrying its
+// share of flows.
+//
+// Applied on both assignment paths -- affinity inheritance and the race -- and
+// that is the whole point. Affinity assigns update.client directly and never
+// reaches the race, so a cap enforced only at client selection would not fire
+// for the flows that actually concentrate: a feed opens many connections to
+// the same handful of domains, which is exactly what affinity pins together.
+//
+// called with stateLock
+func (self *RemoteUserNatMultiClient) clientAtFlowCapWithLock(client *multiClientChannel) bool {
+	maxFlows := self.reliabilitySettings().MaxFlowsPerExit
+	if maxFlows <= 0 {
+		return false
+	}
+	return maxFlows <= len(self.clientUpdates[client])
+}
+
 // inheritAffinityClient4WithLock adopts the most recently joined healthy client
 // in an affinity group. Only ever called with `update.client` nil -- it must
 // never repoint a flow that already has a client, since providers terminate tcp
@@ -1213,7 +1287,7 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *mul
 	var mostRecentCreateTime time.Time
 	for copyIp4Path, createTime := range paths {
 		if copyUpdate, ok := self.ip4PathUpdates[copyIp4Path]; ok {
-			if c := copyUpdate.client.Load(); c != nil && !c.IsDone() && !c.isWarning() && createTime.After(mostRecentCreateTime) {
+			if c := copyUpdate.client.Load(); c != nil && !c.IsDone() && !c.isWarning() && !self.clientAtFlowCapWithLock(c) && createTime.After(mostRecentCreateTime) {
 				mostRecentCreateTime = createTime
 				update.client.Store(c)
 			}
@@ -1228,7 +1302,7 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient6WithLock(update *mul
 	var mostRecentCreateTime time.Time
 	for copyIp6Path, createTime := range paths {
 		if copyUpdate, ok := self.ip6PathUpdates[copyIp6Path]; ok {
-			if c := copyUpdate.client.Load(); c != nil && !c.IsDone() && !c.isWarning() && createTime.After(mostRecentCreateTime) {
+			if c := copyUpdate.client.Load(); c != nil && !c.IsDone() && !c.isWarning() && !self.clientAtFlowCapWithLock(c) && createTime.After(mostRecentCreateTime) {
 				mostRecentCreateTime = createTime
 				update.client.Store(c)
 			}
@@ -2364,7 +2438,7 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 		coalesceOrderedClients := func() []*multiClientChannel {
 			for _, windowType := range self.selectWindowTypes(sendPacket) {
 				if window, ok := self.windows[windowType]; ok {
-					orderedClients := window.OrderedClients()
+					orderedClients := self.underFlowCap(window.OrderedClients())
 					if 0 < len(orderedClients) {
 						return orderedClients
 					}
