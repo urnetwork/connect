@@ -147,7 +147,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		AckTimeout:                                30 * time.Second,
 		BlackholeTimeout:                          5 * time.Second,
 		BlackholeReceiveTimeout:                   20 * time.Second,
-		MaxFlowsPerExit:                           64,
+		MaxFlowsPerExit:                           16,
 		BlackholeConnectTimeout:                   30 * time.Second,
 		WindowResizeTimeout:                       15 * time.Second,
 		StatsWindowGraceperiod:                    30 * time.Second,
@@ -292,13 +292,21 @@ type MultiClientSettings struct {
 	// why it is tunable at runtime; 0 restores the previous unbounded
 	// behavior.
 	//
-	// The default is deliberately permissive. Over 40 minutes of real use, 25
-	// removals destroyed 821 flows in total, but four of them accounted for
-	// 756 of those -- sizes 1, 2, 26, 36, 53, 62, 157, 484. Exits accumulate
-	// rather than plateau, so the worst event grows with session length. A
-	// bound well above normal per-exit load still turns the tail from
-	// catastrophic into merely noticeable, without splitting the common case
-	// across exits.
+	// The default comes from observed recovery times, not from the flow counts
+	// alone. Over two hours of real use, 21 teardowns carried
+	//
+	//	1 1 2 4 4 6 7 20 26 35 36 36 43 44 46 53 62 71 101 157 484
+	//
+	// flows, and the stalls reported against them were: 4-6 flows about 3-5s,
+	// 44 about 15s, 157 about 15s, 484 about 35s. Recovery grows with the
+	// count sublinearly, with a long plateau through the middle -- so the
+	// useful target is keeping events down near the small end, where a hiccup
+	// is a few seconds, rather than shaving the tail.
+	//
+	// A permissive bound misses this entirely. The median teardown here was 36
+	// flows, so a cap of 64 would not have touched a single one of the 15s
+	// stalls. 16 is chosen to land most events in the range that recovers in
+	// a few seconds, accepting more affinity splitting as the price.
 	//
 	// The cap must never make a flow unroutable -- it bounds blast radius, it
 	// is not admission control. When every candidate is full the flow is
