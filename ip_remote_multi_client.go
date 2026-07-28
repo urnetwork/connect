@@ -146,6 +146,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// a lower ack timeout helps cycle through bad providers faster
 		AckTimeout:                                30 * time.Second,
 		BlackholeTimeout:                          5 * time.Second,
+		BlackholeReceiveTimeout:                   20 * time.Second,
 		BlackholeConnectTimeout:                   30 * time.Second,
 		WindowResizeTimeout:                       15 * time.Second,
 		StatsWindowGraceperiod:                    30 * time.Second,
@@ -238,22 +239,44 @@ type MultiClientSettings struct {
 	// 0 falls back to SequenceIdleTimeout, restoring the previous single-value
 	// behavior. See `sequenceIdleTimeout`.
 	TcpSequenceIdleTimeout time.Duration
-	WindowSizes         map[WindowType]WindowSizeSettings
+	WindowSizes            map[WindowType]WindowSizeSettings
 	// ClientNackInitialLimit int
 	// ClientNackMaxLimit int
 	// ClientNackScale float64
 	// ClientWriteTimeout time.Duration
 	// SendTimeout time.Duration
 	// WriteTimeout time.Duration
-	SendRetryTimeout                          time.Duration
-	PingWriteTimeout                          time.Duration
-	CPingWriteTimeout                         time.Duration
-	CPingMaxByteCountPerSecond                ByteCount
-	PingTimeout                               time.Duration
-	CPingTimeout                              time.Duration
-	CPingRestTimeout                          time.Duration
-	AckTimeout                                time.Duration
-	BlackholeTimeout                          time.Duration
+	SendRetryTimeout           time.Duration
+	PingWriteTimeout           time.Duration
+	CPingWriteTimeout          time.Duration
+	CPingMaxByteCountPerSecond ByteCount
+	PingTimeout                time.Duration
+	CPingTimeout               time.Duration
+	CPingRestTimeout           time.Duration
+	AckTimeout                 time.Duration
+	BlackholeTimeout           time.Duration
+	// BlackholeReceiveTimeout bounds the weaker of the two blackhole signals:
+	// the provider is acknowledging our sends, so it is demonstrably alive,
+	// but nothing has come back from the destination. That is ambiguous -- a
+	// flow waiting on a slow origin looks identical to a provider whose
+	// upstream is broken -- and removing an exit is destructive, killing every
+	// flow pinned to it rather than just the quiet one. So it gets a longer
+	// bar than BlackholeTimeout, which covers the unambiguous case of a
+	// provider that has stopped acknowledging anything at all.
+	//
+	// On mainnet at 5s this fired 44 times out of 44 removals, roughly one
+	// every 18s under load, against providers that were acking as much as 602
+	// sends / 222KB. 0 disables the check.
+	//
+	// Bounded above by roughly StatsWindowDuration + StatsWindowBucketDuration
+	// (~31s at production constants): the age this is compared against comes
+	// from surviving stat buckets, and coalesceEventBuckets drops every bucket
+	// older than StatsWindowDuration. A value at or above that ceiling never
+	// fires and is silently equivalent to 0 -- no error, no log. The default
+	// keeps headroom so a later reduction of StatsWindowDuration does not
+	// quietly disable it; TestBlackholeReceiveTimeoutIsReachable fails loudly
+	// if that margin is lost.
+	BlackholeReceiveTimeout                   time.Duration
 	BlackholeConnectTimeout                   time.Duration
 	WindowResizeTimeout                       time.Duration
 	StatsWindowGraceperiod                    time.Duration
@@ -1015,6 +1038,7 @@ type ReliabilitySettings struct {
 	ServerNameAffinityBridge bool
 	SequenceIdleTimeout      time.Duration
 	TcpSequenceIdleTimeout   time.Duration
+	BlackholeReceiveTimeout  time.Duration
 }
 
 // ReliabilitySettingsFrom reads the effective values out of a settings struct.
@@ -1032,6 +1056,7 @@ func ReliabilitySettingsFrom(settings *MultiClientSettings) *ReliabilitySettings
 		ServerNameAffinityBridge: settings.ServerNameAffinityBridge,
 		SequenceIdleTimeout:      settings.SequenceIdleTimeout,
 		TcpSequenceIdleTimeout:   settings.TcpSequenceIdleTimeout,
+		BlackholeReceiveTimeout:  settings.BlackholeReceiveTimeout,
 	}
 }
 
@@ -3723,6 +3748,7 @@ func (self *multiClientWindow) expand(
 				self.peerIdentityChanged,
 				self.performanceProfile,
 				self.settings,
+				self.reliabilitySettings,
 			)
 			if err != nil {
 				self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
@@ -4169,6 +4195,10 @@ type multiClientChannel struct {
 	createTime                  time.Time
 
 	settings *MultiClientSettings
+	// reliabilitySettingsFunc reads the parent's effective reliability config,
+	// so the blackhole bound can be retuned on a live connection. nil on
+	// channels built directly by tests; see reliabilitySettings().
+	reliabilitySettingsFunc func() *ReliabilitySettings
 
 	// sourceFilter map[TransferPath]bool
 
@@ -4219,6 +4249,10 @@ func newMultiClientChannel(
 	peerIdentityChangeCallback func(),
 	performanceProfile *PerformanceProfile,
 	settings *MultiClientSettings,
+	// reliabilitySettingsFunc reads the parent's effective reliability config
+	// so the blackhole bound can be retuned on a live connection. nil falls
+	// back to settings, which the suite's bare-channel fixtures rely on.
+	reliabilitySettingsFunc func() *ReliabilitySettings,
 ) (*multiClientChannel, error) {
 	cancelCtx, cancel := context.WithCancel(ctx)
 
@@ -4285,6 +4319,7 @@ func newMultiClientChannel(
 		ip4DestinationSourceCount: map[Ip4Path]map[Ip4Path]int{},
 		ip6DestinationSourceCount: map[Ip6Path]map[Ip6Path]int{},
 		packetStats:               &clientWindowStats{log: loggerOrDefault(settings.Log)},
+		reliabilitySettingsFunc:   reliabilitySettingsFunc,
 		// affinityCount:             0,
 		// affinityTime:              time.Time{},
 	}
@@ -4311,6 +4346,17 @@ func (self *multiClientChannel) Tier() int {
 
 func (self *multiClientChannel) EstimatedByteCountPerSecond() ByteCount {
 	return self.args.EstimatedBytesPerSecond
+}
+
+// reliabilitySettings is the effective reliability config for this channel:
+// the parent's runtime override when one is installed, else what the channel
+// was constructed with. Safe on a channel built without the parent, which the
+// suite's fixtures rely on.
+func (self *multiClientChannel) reliabilitySettings() *ReliabilitySettings {
+	if self.reliabilitySettingsFunc != nil {
+		return self.reliabilitySettingsFunc()
+	}
+	return ReliabilitySettingsFrom(self.settings)
 }
 
 // setStalled makes the channel swallow packets without acknowledging or
@@ -4503,6 +4549,77 @@ func (self *multiClientChannel) Destination() MultiHopId {
 	return self.args.Destination
 }
 
+// blackholeReason names which signal removed a provider. The three used to
+// report an identical error string, so a field capture could not tell them
+// apart -- the discriminating counts live only on a V(1) line that is off in
+// the field. Naming them makes the next capture decisive.
+type blackholeReason string
+
+const (
+	blackholeNone blackholeReason = ""
+	// the provider acknowledges nothing: it is not there
+	blackholeNoSendAck blackholeReason = "no-send-ack"
+	// the provider acknowledges our sends but no destination data comes back
+	blackholeNoReceiveAck blackholeReason = "no-receive-ack"
+	// no connection was ever established back
+	blackholeNoReceiveSyn blackholeReason = "no-receive-syn"
+)
+
+// blackholeReasonFromStats decides whether a provider looks like a blackhole,
+// and by which signal.
+//
+// The signals differ in strength, so they get different bars:
+//
+//   - The provider acknowledges nothing. It is not there. Unambiguous, acted
+//     on at blackholeTimeout.
+//   - The provider acknowledges our sends but no destination data comes back.
+//     It is demonstrably alive, and may simply be carrying a flow waiting on a
+//     slow origin. Removing an exit destroys every flow pinned to it, not just
+//     the quiet one, so this needs receiveTimeout -- a longer bar.
+//
+// Sharing one 5s bound removed 44 providers out of 44 on mainnet, about one
+// every 18s under load, every one still acknowledging sends (up to 602 sends /
+// 222KB). receiveTimeout of 0 disables the weaker check, leaving only the
+// unambiguous one.
+//
+// IMPORTANT: receiveTimeout has a hard ceiling of roughly
+// StatsWindowDuration + StatsWindowBucketDuration (~31s at production
+// constants). firstSendNackTime is derived from surviving buckets, and
+// coalesceEventBuckets drops every bucket older than StatsWindowDuration, so
+// sendNackAge can never exceed that. A receiveTimeout above the ceiling is
+// silently equivalent to 0 -- it does not error, it just never fires. See
+// TestBlackholeReceiveTimeoutIsReachable.
+//
+// Split out from detectBlackhole so the decision can be tested against real
+// window stats rather than restated in a test, where it could drift from what
+// actually ships.
+func blackholeReasonFromStats(
+	now time.Time,
+	windowStats *clientWindowStats,
+	blackholeTimeout time.Duration,
+	receiveTimeout time.Duration,
+	connectTimeout time.Duration,
+) blackholeReason {
+	if !windowStats.firstSendNackTime.IsZero() {
+		sendNackAge := now.Sub(windowStats.firstSendNackTime)
+
+		if blackholeTimeout <= sendNackAge && windowStats.sendAckCount <= 0 {
+			return blackholeNoSendAck
+		}
+		if 0 < receiveTimeout && receiveTimeout <= sendNackAge && windowStats.receiveAckCount <= 0 {
+			return blackholeNoReceiveAck
+		}
+	}
+
+	if !windowStats.firstSendSynTime.IsZero() {
+		if connectTimeout <= now.Sub(windowStats.firstSendSynTime) && windowStats.receiveSynCount <= 0 {
+			return blackholeNoReceiveSyn
+		}
+	}
+
+	return blackholeNone
+}
+
 func (self *multiClientChannel) detectBlackhole() {
 	// within a timeout window, if there are sent data but none received,
 	// error out. This is similar to an ack timeout.
@@ -4512,23 +4629,14 @@ func (self *multiClientChannel) detectBlackhole() {
 		if windowStats, err := self.WindowStats(); err != nil {
 			return
 		} else {
-			blackhole := func() bool {
-				now := time.Now()
-				if !windowStats.firstSendNackTime.IsZero() && self.settings.BlackholeTimeout-now.Sub(windowStats.firstSendNackTime) <= 0 {
-					if windowStats.sendAckCount <= 0 {
-						return true
-					}
-					if windowStats.receiveAckCount <= 0 {
-						return true
-					}
-				}
-				if !windowStats.firstSendSynTime.IsZero() && self.settings.BlackholeConnectTimeout-now.Sub(windowStats.firstSendSynTime) <= 0 {
-					if windowStats.receiveSynCount <= 0 {
-						return true
-					}
-				}
-				return false
-			}()
+			reason := blackholeReasonFromStats(
+				time.Now(),
+				windowStats,
+				self.settings.BlackholeTimeout,
+				self.reliabilitySettings().BlackholeReceiveTimeout,
+				self.settings.BlackholeConnectTimeout,
+			)
+			blackhole := reason != blackholeNone
 
 			if blackhole {
 				// the client has sent data but received nothing back
@@ -4544,7 +4652,13 @@ func (self *multiClientChannel) detectBlackhole() {
 						windowStats.receiveSynCount,
 					)
 				}
-				self.addError(fmt.Errorf("Blackhole (%d %dB)",
+				// the reason is in the error because it is the only place it
+				// survives into a log by default. all three branches used to
+				// report an identical string, so a capture could not tell
+				// which one was firing -- the discriminating counts are only
+				// on the V(1) line above, which is off in the field.
+				self.addError(fmt.Errorf("Blackhole %s (%d %dB)",
+					reason,
 					windowStats.sendAckCount,
 					windowStats.sendAckByteCount,
 				))

@@ -38,6 +38,9 @@ func TestMultiClientChannelPqe(t *testing.T) {
 			func() {},
 			performanceProfile,
 			DefaultMultiClientSettings(),
+			// nil falls back to the static settings; this test does not
+			// exercise the runtime override
+			nil,
 		)
 		// the recording generator fails creation after settings are applied
 		AssertEqual(t, true, err != nil)
