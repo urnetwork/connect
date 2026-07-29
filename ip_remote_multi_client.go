@@ -1245,6 +1245,23 @@ func (self *RemoteUserNatMultiClient) affinityFallbackIpPathsWithLock(ipPath *Ip
 // If every candidate is full the original list is returned unchanged. The cap
 // bounds blast radius; it is not admission control, and refusing to place a
 // flow would turn a slower page into a broken one.
+//
+// NOTE this filter alone does not bound anything. It runs at *selection*, and
+// the cap is never re-checked at *assignment*: `sendUpdate` holds stateLock to
+// pick a client and releases it, while the matching
+// `clientUpdates[client][update] = true` happens in a separate acquisition in
+// `sendClientPath`. N concurrent flows in one affinity group all observe the
+// same count and all commit, taking an exit to count+N. On device an exit
+// reached 79 flows against a cap of 16 with this filter in place.
+//
+// Ordering the overflow least-loaded-first does NOT help and was tried: the
+// race truncation that would consume slice order is gated on
+// MultiRaceClientCount, which is 0, so every candidate is raced in parallel
+// and the winner is chosen by lowest RTT after a weighted shuffle over a map.
+// Input order is discarded before selection.
+//
+// The real fix is to make check-and-assign atomic at each of the three
+// assignment sites. Not attempted here.
 func (self *RemoteUserNatMultiClient) underFlowCap(clients []*multiClientChannel) []*multiClientChannel {
 	if len(clients) == 0 || self.reliabilitySettings().MaxFlowsPerExit <= 0 {
 		return clients

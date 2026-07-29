@@ -151,6 +151,17 @@ func (self *reliabilityMetrics) destinationReachable(ip []byte, port int) {
 	}
 	delete(self.pending, key)
 
+	// Past the window this is not a recovery, it is the user happening to
+	// visit the site again. Eviction is lazy -- it only runs when another exit
+	// dies -- so a stale entry can survive well beyond the age bound and, left
+	// unchecked here, is credited as an enormously slow recovery. On device
+	// that turned a 14s average into "avg 2m, worst 9m" and made the number
+	// measure browsing habits rather than the tunnel.
+	if recoveryTrackerMaxAge <= time.Since(lostTime) {
+		self.recoveryMissed.Add(1)
+		return
+	}
+
 	nanos := time.Since(lostTime).Nanoseconds()
 	if nanos < 0 {
 		nanos = 0

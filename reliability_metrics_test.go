@@ -162,6 +162,38 @@ func TestReliabilityMetricsMissedRecovery(t *testing.T) {
 	}
 }
 
+// Eviction is lazy -- it only runs when another exit dies -- so a pending
+// destination can outlive the age bound. If it then answers, it is the user
+// revisiting the site, not the tunnel recovering, and counting it inflates the
+// average without limit. On device this reported "avg 2m, worst 9m" for a
+// tunnel that was recovering in seconds.
+func TestReliabilityMetricsLateAnswerIsNotARecovery(t *testing.T) {
+	m := newReliabilityMetrics()
+
+	ip := net.ParseIP("93.184.216.34").To4()
+	m.exitLost([]recoveryKey{newRecoveryKey(ip, 443)})
+
+	// age it past the window without triggering eviction
+	m.pendingLock.Lock()
+	for key := range m.pending {
+		m.pending[key] = time.Now().Add(-2 * recoveryTrackerMaxAge)
+	}
+	m.pendingLock.Unlock()
+
+	m.destinationReachable(ip, 443)
+
+	s := m.snapshot()
+	if s.RecoveryCount != 0 {
+		t.Errorf("a late answer was counted as a recovery: count %d, mean %dns", s.RecoveryCount, s.RecoveryMeanNanos)
+	}
+	if s.RecoveryMissed != 1 {
+		t.Errorf("missed = %d, want 1: the destination never came back inside the window", s.RecoveryMissed)
+	}
+	if s.RecoveryPending != 0 {
+		t.Errorf("pending = %d, want 0: the entry must be retired either way", s.RecoveryPending)
+	}
+}
+
 // Losses arriving faster than they expire must not grow the tracker without
 // bound -- this is the path that runs when an exit carrying every flow dies.
 func TestReliabilityMetricsBoundsPending(t *testing.T) {
