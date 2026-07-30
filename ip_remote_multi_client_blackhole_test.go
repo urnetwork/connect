@@ -117,8 +117,87 @@ func TestBlackholeReceiveTimeoutZeroDisables(t *testing.T) {
 	}
 }
 
+// Unanswered syns alone must not remove an exit whose established traffic is
+// flowing. The syn-ack only exists after the provider's upstream dial
+// succeeds, so "syns out, none back" cannot distinguish a broken provider from
+// a destination that silently drops connections -- and on device this branch
+// removed an exit moving 48 packets / 8.7KB of return traffic because ~18 syns
+// to a handful of unresponsive destinations went unanswered, destroying 276
+// working connections. Removal is reserved for an exit that has established
+// nothing at all; a live exit's connect trouble is handled per-flow by the
+// dial-failure re-race and the dial-strike warning instead.
+func TestBlackholeSynBranchSparesEstablishedTraffic(t *testing.T) {
+	// the field case: syns unanswered past the bound, established flows moving
+	stats := &clientWindowStats{
+		log:                 DefaultLogger(),
+		firstSendSynTime:    time.Now().Add(-31 * time.Second),
+		sendSynCount:        18,
+		receiveSynCount:     0,
+		sendAckCount:        78,
+		sendAckByteCount:    11071,
+		receiveAckCount:     48,
+		receiveAckByteCount: 8712,
+	}
+
+	reason := blackholeReasonFromStats(time.Now(), stats, 5*time.Second, 20*time.Second, 30*time.Second)
+	if reason != blackholeNone {
+		t.Errorf("an exit with flowing established traffic was removed for unanswered syns: %s", reason)
+	}
+
+	// with nothing established the same syn silence still removes -- the fix
+	// must not blind the branch to an exit that never worked at all
+	stats.receiveAckCount = 0
+	stats.receiveAckByteCount = 0
+	reason = blackholeReasonFromStats(time.Now(), stats, 5*time.Second, 20*time.Second, 30*time.Second)
+	if reason != blackholeNoReceiveSyn {
+		t.Errorf("an exit that established nothing was kept: reason = %q, want %q", reason, blackholeNoReceiveSyn)
+	}
+}
+
+// The connect-wait clock behind the client-side dial-failure inference: it
+// arms on the first syn an exit carries for the flow, trips only after the
+// timeout on that same exit, and restarts when the flow moves -- otherwise the
+// first syn through a fresh exit would inherit the old exit's wait and strike
+// it immediately.
+func TestSynWaitExceededIsPerExit(t *testing.T) {
+	update := &multiClientChannelUpdate{}
+	exitA := &multiClientChannel{}
+	exitB := &multiClientChannel{}
+	// wide enough that a scheduler or GC stall between two adjacent calls
+	// cannot age the clock past the bound and fail the "does not trip"
+	// assertions spuriously on a loaded runner
+	timeout := 250 * time.Millisecond
+
+	// first syn arms the clock, nothing trips
+	if update.synWaitExceeded(exitA, timeout) {
+		t.Fatal("first syn tripped the clock")
+	}
+	// a retransmit inside the window does not trip
+	if update.synWaitExceeded(exitA, timeout) {
+		t.Fatal("retransmit inside the window tripped the clock")
+	}
+
+	time.Sleep(timeout + 50*time.Millisecond)
+
+	// moving to a new exit must restart the wait, not inherit the old one
+	if update.synWaitExceeded(exitB, timeout) {
+		t.Fatal("a fresh exit inherited the previous exit's wait")
+	}
+
+	time.Sleep(timeout + 50*time.Millisecond)
+
+	// the same exit past the timeout trips
+	if !update.synWaitExceeded(exitB, timeout) {
+		t.Fatal("an aged wait on the same exit did not trip")
+	}
+	// and tripping restarts the clock rather than firing on every retransmit
+	if update.synWaitExceeded(exitB, timeout) {
+		t.Fatal("the clock did not restart after tripping")
+	}
+}
+
 // The connect signal is independent of the send/receive bounds and keeps its
-// own reason, so a capture can tell the three apart. They previously all
+// own reason, so a capture can tell the branches apart. They previously all
 // reported an identical error string, which is why 44 field removals could not
 // be attributed to a branch.
 func TestBlackholeReasonsAreDistinct(t *testing.T) {

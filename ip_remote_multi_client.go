@@ -62,7 +62,9 @@ type clientReceivePacketFunction func(client *multiClientChannel, source Transfe
 // from the icmp embed by ipParseIcmpUnreachable. Mirrors
 // clientReceivePacketFunction, but the parent rebuilds the packet from the path
 // (the removeClient teardown convention) rather than carrying raw bytes.
-type dialFailureFunction func(sourceClient *multiClientChannel, egressIpPath *IpPath)
+// The bool reports whether the flow was actually unbound for a re-race, so a
+// caller holding its own client snapshot knows whether to discard it.
+type dialFailureFunction func(sourceClient *multiClientChannel, egressIpPath *IpPath) (reraced bool)
 
 type DestinationStats struct {
 	EstimatedBytesPerSecond ByteCount
@@ -2267,6 +2269,36 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 			update.resetSequence(sendPacket)
 		}
 
+		// Client-side dial-failure inference. A pure syn retransmitting on an
+		// exit that has answered nothing is the silent form of the failure the
+		// provider signal covers: the provider cannot reach the destination,
+		// or the destination drops the connection without a word, as anti-bot
+		// infrastructure commonly does to datacenter ip ranges. No signal
+		// ever arrives for those, so the
+		// wait is the only evidence. Feeding the same clientDialFailure path
+		// as the explicit signal gets the same guards, the same unbind, and
+		// the same dial-strike accounting that warns the exit off new flows --
+		// while its established traffic keeps running, which is the entire
+		// point: an exit is never torn down for a destination's silence.
+		// guard order matters on this path: every egress packet passes here,
+		// so the plain bools go first and the atomic load, settings read, and
+		// clock only run for a pure syn on an unestablished flow.
+		if ipPath.Syn && !ipPath.Ack && ipPath.Protocol == IpProtocolTcp &&
+			currentClient != nil && !update.receivedInbound.Load() &&
+			self.reliabilitySettings().DialFailureRerace &&
+			update.synWaitExceeded(currentClient, inferredDialFailureTimeout) {
+			// treat the flow as unbound locally only if it really was: the
+			// guards inside can decline after our check passed (a syn-ack can
+			// land in between), and racing while the flow is still committed
+			// aborts every attempt until the send times out. when it was
+			// unbound, this very retransmit races a fresh exit instead of
+			// following the old one into the same silence for another backoff
+			// round.
+			if self.clientDialFailure(currentClient, ipPath) {
+				currentClient = nil
+			}
+		}
+
 		// `currentClient` is the client snapshot read by `sendClientPath` under
 		// the parent lock it already held, so the steady-state send no longer
 		// takes the parent lock again just to read `update.client`.
@@ -2722,7 +2754,12 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 // forwards it to the app (removeClient's teardown convention) for a
 // visible-but-fast failure. Every intercepted signal, matched or not, is
 // counted; an unmatched one is dropped.
-func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClientChannel, egressIpPath *IpPath) {
+// It reports whether the flow was actually unbound, so a caller holding its
+// own client snapshot knows whether to discard it. The guards here can decline
+// after a caller's own check passed -- a syn-ack can land in between -- and
+// treating a still-bound flow as unbound leaves that caller racing against a
+// commitment that never clears.
+func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClientChannel, egressIpPath *IpPath) (reraced bool) {
 	// counted for every intercepted signal, matched or not: the gap between
 	// this and flowsReraced is failures that named no live flow.
 	self.reliabilityMetrics.dialFailureIntercepted()
@@ -2772,7 +2809,7 @@ func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClien
 
 	if !matched {
 		// no live flow for this signal: dropped here, already counted above.
-		return
+		return false
 	}
 
 	// strike accounting is per-channel and takes the channel's own stateLock;
@@ -2783,7 +2820,7 @@ func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClien
 		self.reliabilityMetrics.flowReraced()
 		// swallowed: the icmp is never forwarded. the app's retransmit drives
 		// recovery. this is the whole point -- ~1s instead of 3-63s.
-		return
+		return true
 	}
 
 	// rerace disabled: hand the icmp to the app so it fails fast instead of
@@ -2793,6 +2830,7 @@ func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClien
 	if packet, ok := ipOosUnreachable(egressIpPath); ok {
 		self.receivePacketCallback(TransferPath{}, protocol.ProvideMode_Network, egressIpPath, packet)
 	}
+	return false
 }
 
 // spawns a goroutine that completes the race after a timeout. it acquires the
@@ -3058,6 +3096,18 @@ type multiClientChannelUpdate struct {
 	// already carrying data. Written lock-free (atomic) from the ingress path.
 	receivedInbound atomic.Bool
 
+	// synWaitStart is when synWaitClient was first asked to open this flow's
+	// upstream connection -- the first pure syn sent while receivedInbound is
+	// still false. It backs the client-side dial-failure inference: a provider
+	// that silently cannot reach the destination (or a destination that
+	// silently drops the connection) produces no failure signal at all, so the
+	// wait itself is the only evidence. Keyed to synWaitClient so a re-raced
+	// flow judges each exit on its own silence; the pointer is only ever
+	// compared, never dereferenced, so a closed channel is harmless here.
+	// Both guarded by stateLock.
+	synWaitStart  time.Time
+	synWaitClient *multiClientChannel
+
 	// stateLock guards the per-flow mutable state below: the active race and the
 	// tcp collapse-prevention sequence counters. it is a leaf — its holders
 	// never take the parent `RemoteUserNatMultiClient.stateLock` — so
@@ -3097,6 +3147,41 @@ func newMultiClientChannelUpdate(ctx context.Context, ipPath *IpPath) *multiClie
 		affinityIp4Paths: map[Ip4Path]bool{},
 		affinityIp6Paths: map[Ip6Path]bool{},
 	}
+}
+
+// inferredDialFailureTimeout is how long a flow's initial connect may go
+// unanswered on one exit before the wait itself is treated as a dial failure.
+//
+// TCP retransmits its syn at roughly 1s, 2s, 4s -- so 3s means the second or
+// third retransmit re-races instead of following the same path into the same
+// silence. Genuine slow dials overwhelmingly complete inside 3s, and the cost
+// of a wrong inference is one syn racing a different exit, not a teardown: if
+// the destination is merely slow, the connect still completes wherever the
+// race lands it.
+const inferredDialFailureTimeout = 3 * time.Second
+
+// synWaitExceeded starts the connect-wait clock on the first syn a given exit
+// carries for this flow, and reports whether it has run past timeout on later
+// syns through that same exit. The clock is keyed to the exit: a flow that
+// re-races restarts the wait, so each exit is judged on its own silence rather
+// than inheriting the previous one's -- otherwise the first syn through a
+// fresh exit would strike it immediately. When it trips, the clock restarts
+// for the same reason.
+func (self *multiClientChannelUpdate) synWaitExceeded(client *multiClientChannel, timeout time.Duration) bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	now := time.Now()
+	if self.synWaitClient != client || self.synWaitStart.IsZero() {
+		self.synWaitClient = client
+		self.synWaitStart = now
+		return false
+	}
+	if timeout <= now.Sub(self.synWaitStart) {
+		self.synWaitStart = now
+		return true
+	}
+	return false
 }
 
 func (self *multiClientChannelUpdate) resetSequence(sendPacket *parsedPacket) {
@@ -3759,7 +3844,14 @@ func (self *multiClientWindow) resize() {
 						// working. This is the warning site ONLY: it must never
 						// reach the remove decision above, because those flows
 						// are the provider's only working asset.
-						if ulimit || client.dialStarved() {
+						//
+						// only when there is somewhere else to go. warning the
+						// sole exit of a fixed window blocks every new flow
+						// while helping none of them, and with the client-side
+						// inference feeding strikes, one silently-dead polled
+						// destination could oscillate a single-exit window
+						// between warned and not indefinitely.
+						if ulimit || (1 < len(clientStats) && client.dialStarved()) {
 							client.setWarning(true)
 							warnClient(client, stats)
 						} else {
@@ -4949,7 +5041,26 @@ func blackholeReasonFromStats(
 	}
 
 	if !windowStats.firstSendSynTime.IsZero() {
-		if connectTimeout <= now.Sub(windowStats.firstSendSynTime) && windowStats.receiveSynCount <= 0 {
+		// unanswered syns alone must not remove an exit whose established
+		// traffic is flowing. the syn-acks here are built by the provider only
+		// after its upstream dial succeeds, so "syns out, none back" conflates
+		// three cases the counter cannot tell apart: the provider cannot dial,
+		// the destination silently drops connections (datacenter ip ranges are
+		// widely dropped by anti-bot infrastructure), or the destination is
+		// merely slow. in two of those the exit is innocent -- and in all
+		// three, its established flows are its only working asset. on device
+		// this branch removed an exit moving 48 packets / 8.7KB of return
+		// traffic because ~18 syns (a handful of destinations, retransmitting)
+		// went unanswered, destroying 276 working connections.
+		//
+		// connect trouble on a live exit is instead handled per-flow: the
+		// unanswered flow re-races onto another exit (dial-failure signalling
+		// and the client-side inference that feeds the same path), and the
+		// dial-strike warning stops new flows choosing the exit. removal here
+		// is reserved for an exit that has established nothing at all.
+		if connectTimeout <= now.Sub(windowStats.firstSendSynTime) &&
+			windowStats.receiveSynCount <= 0 &&
+			windowStats.receiveAckCount <= 0 {
 			return blackholeNoReceiveSyn
 		}
 	}
