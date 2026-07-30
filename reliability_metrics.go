@@ -29,6 +29,17 @@ const (
 	recoveryTrackerMaxEntries = 4096
 )
 
+// blackholeAgeString renders how long a stat clock has been running, for the
+// blackhole verdict line. A zero time means the clock never started, which is
+// materially different from "started just now" -- it is the difference between
+// a provider that has unacked sends outstanding and one that has none.
+func blackholeAgeString(t time.Time) string {
+	if t.IsZero() {
+		return "none"
+	}
+	return time.Since(t).Round(time.Millisecond).String()
+}
+
 // recoveryKey identifies a remote endpoint across the death and rebirth of the
 // flows that talk to it. Port is included because a browser reconnecting to
 // the same host on a new source port is the recovery being measured, but a
@@ -68,6 +79,13 @@ type reliabilityMetrics struct {
 	// would look better than one that recovers them slowly.
 	recoveryMissed atomic.Uint64
 
+	// dialFailures counts provider dial-failure signals intercepted at the
+	// channel; flowsReraced counts the flows silently unbound so the
+	// application's own retransmit races them onto another exit. The gap
+	// between them is failures that matched no live flow (late or stale).
+	dialFailures atomic.Uint64
+	flowsReraced atomic.Uint64
+
 	pendingLock sync.Mutex
 	pending     map[recoveryKey]time.Time
 }
@@ -87,6 +105,20 @@ func (self *reliabilityMetrics) flowOpened() {
 		return
 	}
 	self.flowsOpened.Add(1)
+}
+
+func (self *reliabilityMetrics) dialFailureIntercepted() {
+	if self == nil {
+		return
+	}
+	self.dialFailures.Add(1)
+}
+
+func (self *reliabilityMetrics) flowReraced() {
+	if self == nil {
+		return
+	}
+	self.flowsReraced.Add(1)
 }
 
 // exitLost records one provider failure and the flows it destroyed, and arms
@@ -217,6 +249,8 @@ func (self *reliabilityMetrics) reset() {
 	self.recoveryNanos.Store(0)
 	self.recoveryMaxNanos.Store(0)
 	self.recoveryMissed.Store(0)
+	self.dialFailures.Store(0)
+	self.flowsReraced.Store(0)
 
 	self.pendingLock.Lock()
 	defer self.pendingLock.Unlock()
@@ -244,6 +278,13 @@ type ReliabilityMetricsSnapshot struct {
 	// RecoveryPending is how many destinations are still waiting to come back
 	// at the moment of the snapshot.
 	RecoveryPending int
+
+	// DialFailuresIntercepted counts provider could-not-connect signals;
+	// FlowsReraced counts the flows quietly moved to another exit in
+	// response. These are the events the user never sees -- each one would
+	// previously have been a 3-63s syn-backoff hang.
+	DialFailuresIntercepted uint64
+	FlowsReraced            uint64
 }
 
 func (self *reliabilityMetrics) snapshot() *ReliabilityMetricsSnapshot {
@@ -263,6 +304,9 @@ func (self *reliabilityMetrics) snapshot() *ReliabilityMetricsSnapshot {
 		RecoveryCount:          recoveryCount,
 		RecoveryMissed:         self.recoveryMissed.Load(),
 		RecoveryMaxNanos:       int64(self.recoveryMaxNanos.Load()),
+
+		DialFailuresIntercepted: self.dialFailures.Load(),
+		FlowsReraced:            self.flowsReraced.Load(),
 	}
 
 	if 0 < exitLossEvents {

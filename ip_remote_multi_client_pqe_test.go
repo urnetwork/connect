@@ -35,6 +35,7 @@ func TestMultiClientChannelPqe(t *testing.T) {
 			nil,
 			nil,
 			nil,
+			nil,
 			func() {},
 			performanceProfile,
 			DefaultMultiClientSettings(),

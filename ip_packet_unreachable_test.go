@@ -85,13 +85,29 @@ func TestIpOosUnreachableUdpV6(t *testing.T) {
 	), uint16(0))
 }
 
-// tcp keeps its rst; the unreachable path must not take it over
+// tcp teardown keeps its rst. The unreachable builder now also serves the
+// provider dial-failure signal for tcp flows, so this guard moved up a level:
+// it no longer asserts the builder cannot do tcp, it asserts a tcp teardown
+// still comes out as a tcp rst rather than an icmp -- which is what the old
+// builder-level assertion actually protected.
 func TestIpOosUnreachableTcpUnchanged(t *testing.T) {
 	ipPath := udpTestPath(4)
 	ipPath.Protocol = IpProtocolTcp
 
-	_, ok := ipOosUnreachable(ipPath)
-	AssertEqual(t, ok, false)
+	// the builder now produces the dial-failure signal for tcp
+	packet, ok := ipOosUnreachable(ipPath)
+	AssertEqual(t, ok, true)
+	_, icmpOk := ipParseIcmpUnreachable(packet)
+	AssertEqual(t, icmpOk, true)
+
+	// but teardown still prefers the rst for tcp flows
+	c := &RemoteUserNatMultiClient{settings: &MultiClientSettings{UdpTeardownSignal: true}}
+	teardown, ok := c.teardownSourcePacket(ipPath, 1234)
+	AssertEqual(t, ok, true)
+	teardownPath, err := ParseIpPath(teardown)
+	AssertEqual(t, err == nil, true)
+	AssertEqual(t, teardownPath.Protocol, IpProtocolTcp)
+	AssertEqual(t, teardownPath.Rst, true)
 
 	_, rstOk := ipOosRst(ipPath.Reverse())
 	AssertEqual(t, rstOk, true)

@@ -1,0 +1,341 @@
+package connect
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/urnetwork/connect/protocol"
+)
+
+// dialFailureTestParent builds a bare parent carrying one flow (egressIpPath)
+// bound to sourceClient in both the path map and clientUpdates -- the state a
+// dial-failure lookup reads. rerace sets DialFailureRerace. forwarded captures
+// any packet the handler hands back to the app, so the swallow-vs-forward
+// behavior can be asserted directly.
+func dialFailureTestParent(t *testing.T, rerace bool, egressIpPath *IpPath) (
+	parent *RemoteUserNatMultiClient,
+	sourceClient *multiClientChannel,
+	update *multiClientChannelUpdate,
+	forwarded *[]*receivePacket,
+) {
+	t.Helper()
+
+	settings := DefaultMultiClientSettings()
+	settings.DialFailureRerace = rerace
+
+	captured := &[]*receivePacket{}
+	parent = &RemoteUserNatMultiClient{
+		settings:           settings,
+		ip4PathUpdates:     map[Ip4Path]*multiClientChannelUpdate{},
+		ip6PathUpdates:     map[Ip6Path]*multiClientChannelUpdate{},
+		clientUpdates:      map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
+		reliabilityMetrics: newReliabilityMetrics(),
+		receivePacketCallback: func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
+			*captured = append(*captured, &receivePacket{
+				Source:      source,
+				ProvideMode: provideMode,
+				IpPath:      ipPath,
+				Packet:      packet,
+			})
+		},
+	}
+
+	sourceClient = &multiClientChannel{settings: settings}
+	update = &multiClientChannelUpdate{ipPath: egressIpPath}
+	update.client.Store(sourceClient)
+
+	switch egressIpPath.Version {
+	case 4:
+		parent.ip4PathUpdates[egressIpPath.ToIp4Path()] = update
+	case 6:
+		parent.ip6PathUpdates[egressIpPath.ToIp6Path()] = update
+	}
+	parent.clientUpdates[sourceClient] = map[*multiClientChannelUpdate]bool{update: true}
+
+	return parent, sourceClient, update, captured
+}
+
+// The core re-race: a dial failure on the flow's own client, before any inbound
+// data, unbinds the flow (so the app's retransmit races a new exit), swallows
+// the icmp, and records the metrics. Nothing reaches the app.
+func TestDialFailureMatchedUnbindsAndSwallows(t *testing.T) {
+	for _, version := range []int{4, 6} {
+		egress := icmpTcpTestPath(version)
+		parent, client, update, forwarded := dialFailureTestParent(t, true, egress)
+
+		parent.clientDialFailure(client, egress)
+
+		if update.client.Load() != nil {
+			t.Errorf("v%d: flow was not unbound; client is still %p", version, update.client.Load())
+		}
+		if _, ok := parent.clientUpdates[client]; ok {
+			t.Errorf("v%d: update was not removed from clientUpdates", version)
+		}
+		if n := len(*forwarded); n != 0 {
+			t.Errorf("v%d: re-race must swallow the icmp, but %d packet(s) reached the app", version, n)
+		}
+		if got := parent.reliabilityMetrics.flowsReraced.Load(); got != 1 {
+			t.Errorf("v%d: flowsReraced = %d, want 1", version, got)
+		}
+		if got := parent.reliabilityMetrics.dialFailures.Load(); got != 1 {
+			t.Errorf("v%d: dialFailuresIntercepted = %d, want 1", version, got)
+		}
+		// a matched failure is also a per-channel strike
+		if got := client.dialFailureCount(); got != 1 {
+			t.Errorf("v%d: channel dialFailureCount = %d, want 1", version, got)
+		}
+	}
+}
+
+// A signal naming a flow no longer in the maps is stale (late, or already
+// re-raced). It is counted but otherwise dropped -- nothing to unbind, nothing
+// forwarded.
+func TestDialFailureNoFlowIsUnmatched(t *testing.T) {
+	egress := icmpTcpTestPath(4)
+	parent, client, _, forwarded := dialFailureTestParent(t, true, egress)
+
+	// a different flow key than the one in the map
+	stray := icmpTcpTestPath(4)
+	stray.SourcePort = egress.SourcePort + 1
+
+	parent.clientDialFailure(client, stray)
+
+	if got := parent.reliabilityMetrics.dialFailures.Load(); got != 1 {
+		t.Errorf("dialFailuresIntercepted = %d, want 1 (counted even when unmatched)", got)
+	}
+	if got := parent.reliabilityMetrics.flowsReraced.Load(); got != 0 {
+		t.Errorf("flowsReraced = %d, want 0", got)
+	}
+	if n := len(*forwarded); n != 0 {
+		t.Errorf("%d packet(s) forwarded, want 0", n)
+	}
+}
+
+// A signal from a client that does not own the flow (the flow already re-raced
+// onto another exit) must not disturb the flow's current binding.
+func TestDialFailureDifferentClientIsUnmatched(t *testing.T) {
+	egress := icmpTcpTestPath(4)
+	parent, client, update, forwarded := dialFailureTestParent(t, true, egress)
+
+	other := &multiClientChannel{settings: DefaultMultiClientSettings()}
+	parent.clientDialFailure(other, egress)
+
+	if update.client.Load() != client {
+		t.Error("a signal from a non-owning client unbound the flow")
+	}
+	if got := parent.reliabilityMetrics.flowsReraced.Load(); got != 0 {
+		t.Errorf("flowsReraced = %d, want 0", got)
+	}
+	if got := parent.reliabilityMetrics.dialFailures.Load(); got != 1 {
+		t.Errorf("dialFailuresIntercepted = %d, want 1 (still counted)", got)
+	}
+	if n := len(*forwarded); n != 0 {
+		t.Errorf("%d packet(s) forwarded, want 0", n)
+	}
+}
+
+// The established-flow guard: once a flow has received inbound data it is
+// working, and a stale dial-failure signal must never tear it down. This is the
+// crash-safety the whole re-race depends on.
+func TestDialFailureEstablishedFlowGuard(t *testing.T) {
+	egress := icmpTcpTestPath(4)
+	parent, client, update, forwarded := dialFailureTestParent(t, true, egress)
+
+	// the flow already carried inbound data -- it is established
+	update.receivedInbound.Store(true)
+
+	parent.clientDialFailure(client, egress)
+
+	if update.client.Load() != client {
+		t.Error("an established flow (receivedInbound) was unbound by a dial-failure signal")
+	}
+	if got := parent.reliabilityMetrics.flowsReraced.Load(); got != 0 {
+		t.Errorf("flowsReraced = %d, want 0", got)
+	}
+	if got := parent.reliabilityMetrics.dialFailures.Load(); got != 1 {
+		t.Errorf("dialFailuresIntercepted = %d, want 1 (still counted)", got)
+	}
+	if n := len(*forwarded); n != 0 {
+		t.Errorf("%d packet(s) forwarded, want 0", n)
+	}
+}
+
+// With the knob off, a matched failure is not swallowed: the flow stays bound
+// and the raw icmp is delivered to the app (visible but fast failure), using
+// the egress ipPath -- the same convention removeClient uses for teardown.
+func TestDialFailureReraceOffForwards(t *testing.T) {
+	for _, version := range []int{4, 6} {
+		egress := icmpTcpTestPath(version)
+		parent, client, update, forwarded := dialFailureTestParent(t, false, egress)
+
+		parent.clientDialFailure(client, egress)
+
+		if update.client.Load() != client {
+			t.Errorf("v%d: rerace off must not unbind the flow", version)
+		}
+		if got := parent.reliabilityMetrics.flowsReraced.Load(); got != 0 {
+			t.Errorf("v%d: flowsReraced = %d, want 0 with rerace off", version, got)
+		}
+		if got := parent.reliabilityMetrics.dialFailures.Load(); got != 1 {
+			t.Errorf("v%d: dialFailuresIntercepted = %d, want 1", version, got)
+		}
+		if len(*forwarded) != 1 {
+			t.Fatalf("v%d: forwarded %d packet(s), want exactly 1 (the icmp)", version, len(*forwarded))
+		}
+		fwd := (*forwarded)[0]
+		// delivered with the egress-oriented ipPath, per the teardown convention
+		if fwd.IpPath != egress {
+			t.Errorf("v%d: forwarded with the wrong ipPath", version)
+		}
+		// and it is a real icmp unreachable naming exactly this flow
+		parsed, ok := ipParseIcmpUnreachable(fwd.Packet)
+		if !ok {
+			t.Fatalf("v%d: forwarded packet is not a parseable icmp unreachable", version)
+		}
+		switch version {
+		case 4:
+			if parsed.ToIp4Path() != egress.ToIp4Path() {
+				t.Errorf("v4: forwarded icmp names the wrong flow")
+			}
+		case 6:
+			if parsed.ToIp6Path() != egress.ToIp6Path() {
+				t.Errorf("v6: forwarded icmp names the wrong flow")
+			}
+		}
+	}
+}
+
+// The starvation window: three failures with no successes trips it; a single
+// connect success in the window clears it. This is the input to the resize-pass
+// warning, and it must not depend on wall-clock sleeps.
+func TestDialStarvedWindowing(t *testing.T) {
+	client := &multiClientChannel{settings: DefaultMultiClientSettings()}
+
+	if client.dialStarved() {
+		t.Fatal("a fresh channel reported starved with no failures")
+	}
+
+	client.addDialFailure()
+	client.addDialFailure()
+	if client.dialStarved() {
+		t.Fatal("2 failures (below the threshold) reported starved")
+	}
+
+	client.addDialFailure()
+	if !client.dialStarved() {
+		t.Fatal("3 failures with no successes did not report starved")
+	}
+	if got := client.dialFailureCount(); got != 3 {
+		t.Errorf("dialFailureCount = %d, want 3", got)
+	}
+
+	// a single proven connect in the window resets starvation
+	client.addConnectSuccess()
+	if client.dialStarved() {
+		t.Fatal("a connect success in the window did not reset starvation")
+	}
+}
+
+// Failures older than the window are pruned on access, so a provider that
+// misbehaved and recovered stops being warned rather than being condemned by
+// ancient strikes.
+func TestDialStarvedPrunesOldFailures(t *testing.T) {
+	client := &multiClientChannel{settings: DefaultMultiClientSettings()}
+
+	// three strikes, all older than the window (test setup injects the
+	// timestamps; the shipped methods do the pruning)
+	old := time.Now().Add(-2 * dialStrikeWindow)
+	client.dialFailureTimes = []time.Time{old, old, old}
+
+	if client.dialStarved() {
+		t.Error("failures older than the window still counted toward starvation")
+	}
+	if got := client.dialFailureCount(); got != 0 {
+		t.Errorf("dialFailureCount = %d, want 0 after pruning", got)
+	}
+}
+
+// dialStarved must actually be consulted at the resize warning site, or a
+// dial-starved provider keeps attracting new flows and the whole signal does
+// nothing. Unit isolation of the resize pass is impractical, so pin the call
+// site the way TestDetectBlackholeUsesTheReasonAndOverride pins detectBlackhole.
+func TestResizeWarnsOnDialStarved(t *testing.T) {
+	source, err := readSource("ip_remote_multi_client.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, ok := functionBody(source, "func (self *multiClientWindow) resize()")
+	if !ok {
+		t.Fatal("could not find resize")
+	}
+	if !strings.Contains(body, "client.dialStarved()") {
+		t.Error("resize does not consult dialStarved(): a dial-starved provider is never warned out of new-flow selection")
+	}
+	if !strings.Contains(body, "client.setWarning(true)") {
+		t.Error("resize warning site not found; the dialStarved wiring may have moved off it")
+	}
+}
+
+// The HARD REQUIREMENT, tested end to end at the channel: an intercepted icmp
+// dial-failure signal must NOT bump the receive counters, or a provider that
+// fails every dial would look like it is receiving data and detectBlackhole
+// would keep a dead exit alive. A normal packet is the positive control that
+// proves the counter can move.
+func TestChannelInterceptDoesNotBumpReceiveCounters(t *testing.T) {
+	egress := icmpTcpTestPath(4)
+
+	var gotClient *multiClientChannel
+	var gotPath *IpPath
+	channel := &multiClientChannel{
+		ctx:         context.Background(),
+		log:         DefaultLogger(),
+		args:        &multiClientChannelArgs{},
+		settings:    DefaultMultiClientSettings(),
+		packetStats: &clientWindowStats{log: DefaultLogger()},
+		clientReceivePacketCallback: func(client *multiClientChannel, source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
+		},
+		dialFailureCallback: func(sourceClient *multiClientChannel, egressIpPath *IpPath) {
+			gotClient = sourceClient
+			gotPath = egressIpPath
+		},
+	}
+
+	frameFor := func(packet []byte) *protocol.Frame {
+		return RequireToFrameWithDefaultProtocolVersion(&protocol.IpPacketFromProvider{
+			IpPacket: &protocol.IpPacket{PacketBytes: packet},
+		})
+	}
+	peer := Peer{ProvideMode: protocol.ProvideMode_Public}
+
+	// positive control: a normal tcp packet is received data and IS counted
+	normal, ok := ipOosRst(egress.Reverse())
+	if !ok {
+		t.Fatal("could not build a normal tcp packet")
+	}
+	channel.clientReceive(TransferPath{}, []*protocol.Frame{frameFor(normal)}, peer)
+	if channel.packetStats.receiveAckCount != 1 {
+		t.Fatalf("positive control: receiveAckCount = %d, want 1 (a normal packet must count)", channel.packetStats.receiveAckCount)
+	}
+
+	// the intercept: an icmp dial-failure signal must NOT be counted
+	icmp, ok := ipOosUnreachable(egress)
+	if !ok {
+		t.Fatal("could not build the icmp signal")
+	}
+	channel.clientReceive(TransferPath{}, []*protocol.Frame{frameFor(icmp)}, peer)
+
+	if channel.packetStats.receiveAckCount != 1 {
+		t.Errorf("receiveAckCount = %d, want 1: the intercepted icmp must not be counted as received data", channel.packetStats.receiveAckCount)
+	}
+	if channel.packetStats.receiveSynCount != 0 {
+		t.Errorf("receiveSynCount = %d, want 0: the intercepted icmp must not count as a syn", channel.packetStats.receiveSynCount)
+	}
+	if gotClient != channel {
+		t.Error("dialFailureCallback did not receive the intercepting channel")
+	}
+	if gotPath == nil || gotPath.ToIp4Path() != egress.ToIp4Path() {
+		t.Error("dialFailureCallback received the wrong egress path")
+	}
+}
