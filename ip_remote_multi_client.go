@@ -1301,10 +1301,76 @@ func (self *RemoteUserNatMultiClient) underFlowCap(clients []*multiClientChannel
 		}
 	}()
 
-	if len(under) == 0 {
+	// Narrowing to a single candidate is worse than letting the cap slip. The
+	// send path takes a no-race single-client branch when exactly one
+	// candidate is offered, so a cap that filters the field down to one
+	// silently disables the multi-exit race -- the reliability mechanism this
+	// whole design rests on -- for those flows, exactly when exits are busiest.
+	//
+	// This became reachable when the bookkeeping started counting race-won
+	// flows: before that the cap under-counted so heavily it rarely bound at
+	// all. The cap bounds blast radius; it must not cost racing to do it.
+	if len(under) < 2 {
 		return clients
 	}
 	return under
+}
+
+// bindClientFlow records that a flow is now committed to client, which is what
+// clientUpdates exists to track.
+//
+// The send path maintains this bookkeeping only when it notices the committed
+// client changed across its callback. A flow that wins its exit from an async
+// race never trips that: the first packet leaves with the client still nil, the
+// race stores the winner later from the receive path or the race completion,
+// and every subsequent send sees no change. Such a flow was therefore never
+// entered here at all. (The exit readout no longer relies on this map, so the
+// visible "14 exits, flows on one" symptom is fixed independently -- what this
+// buys is the three consumers below.)
+//
+// That map is not cosmetic. clientAtFlowCapWithLock counts it, so uncounted
+// flows are also uncapped, and removeClient iterates it to tear flows down, so
+// uncounted flows get no teardown and recover only via the slower send-error
+// path. Calling this at every assignment site makes all three correct.
+//
+// Must NOT be called while holding the update's stateLock: that lock is a leaf
+// and its holders never take the parent lock. Both race sites call this after
+// their locked section returns.
+func (self *RemoteUserNatMultiClient) bindClientFlow(update *multiClientChannelUpdate, client *multiClientChannel) {
+	if update == nil || client == nil {
+		return
+	}
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	// re-read under the parent lock: the flow may have moved or been torn down
+	// between the race storing its winner and this call
+	if update.client.Load() != client || client.IsDone() {
+		return
+	}
+
+	// drop it from any other client's set first -- a re-raced flow moves
+	// between exits, and a stale entry would inflate the old exit's count and
+	// hand it a teardown for a flow it no longer carries
+	for otherClient, updates := range self.clientUpdates {
+		if otherClient == client {
+			continue
+		}
+		if _, ok := updates[update]; ok {
+			delete(updates, update)
+			if len(updates) == 0 {
+				delete(self.clientUpdates, otherClient)
+			}
+		}
+	}
+
+	updates, ok := self.clientUpdates[client]
+	if !ok {
+		updates = map[*multiClientChannelUpdate]bool{}
+		self.clientUpdates[client] = updates
+	}
+	updates[update] = true
 }
 
 // clientAtFlowCapWithLock reports whether an exit is already carrying its
@@ -1430,33 +1496,36 @@ func (self *RemoteUserNatMultiClient) sendClientPath(ipPath *IpPath, callback fu
 		return
 	}
 
-	func() {
-		self.stateLock.Lock()
-		defer self.stateLock.Unlock()
+	// re-read (the lock-free check above can race a concurrent client change)
+	client := update.client.Load()
 
-		// re-read under the lock (the lock-free check above can race a
-		// concurrent client change)
-		client := update.client.Load()
+	if client != nil {
+		// bindClientFlow, not a local add: it clears the flow from every other
+		// client's set, which `previousClient` alone cannot do. previousClient
+		// is this path's own stale snapshot, and an async race can commit a
+		// different client between the snapshot and here -- the single-client
+		// send below then stores over it, leaving the flow recorded under the
+		// race's winner forever. Nothing ever cleans that: the reaper and
+		// removeClient only look under update.client.Load(). The stale entry
+		// inflates the abandoned exit's cap count, which makes it look full
+		// sooner, which makes the single-client path more likely -- a loop
+		// that only tightens.
+		self.bindClientFlow(update, client)
+		return
+	}
 
-		if previousClient != client {
-			if previousClient != nil {
-				if updates, ok := self.clientUpdates[previousClient]; ok {
-					delete(updates, update)
-					if len(updates) == 0 {
-						delete(self.clientUpdates, previousClient)
-					}
-				}
-			}
-			if client != nil && !client.IsDone() {
-				updates, ok := self.clientUpdates[client]
-				if !ok {
-					updates = map[*multiClientChannelUpdate]bool{}
-					self.clientUpdates[client] = updates
-				}
-				updates[update] = true
-			}
+	// the flow committed to nothing: drop any entry the previous client held
+	if previousClient == nil {
+		return
+	}
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if updates, ok := self.clientUpdates[previousClient]; ok {
+		delete(updates, update)
+		if len(updates) == 0 {
+			delete(self.clientUpdates, previousClient)
 		}
-	}()
+	}
 }
 
 // waitForIdleUpdate blocks until the flow update has been idle for
@@ -2606,6 +2675,11 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 	// channel after receiveClientPath returns, outside every lock, so the
 	// channel stateLock never nests under the parent or per-flow stateLock.
 	connectSucceeded := false
+	// boundUpdate is set when this path commits a flow to sourceClient, so the
+	// clientUpdates bookkeeping can be recorded after receiveClientPath
+	// returns. Same reason as connectSucceeded above: bindClientFlow takes the
+	// parent stateLock, and this closure runs under the per-flow leaf lock.
+	var boundUpdate *multiClientChannelUpdate
 	success := self.receiveClientPath(ipPath, func(update *multiClientChannelUpdate) {
 		// steady-state fast path: the flow is already committed to this client,
 		// so deliver without taking any lock (client is atomic). this is the
@@ -2691,6 +2765,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 
 			update.clearRaceWithLock()
 			update.client.Store(sourceClient)
+			boundUpdate = update
 			if update.receivedInbound.CompareAndSwap(false, true) {
 				connectSucceeded = true
 			}
@@ -2715,6 +2790,10 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 	if connectSucceeded {
 		sourceClient.addConnectSuccess()
 	}
+	// a race won from the receive path commits the flow without the send path
+	// ever noticing a change, so this is the only place the bookkeeping can be
+	// recorded for it. outside every lock held above, per bindClientFlow.
+	self.bindClientFlow(boundUpdate, sourceClient)
 	if success {
 		if 0 < len(abandonedClients) {
 			if rstPacket, ok := ipOosRst(ipPath); ok {
@@ -2853,6 +2932,11 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 		var abandonedClients []*multiClientChannel
 		var receivePackets []*receivePacket
 		var returnPackets []*receivePacket
+		// the race winner, recorded for the clientUpdates bookkeeping once the
+		// per-flow leaf lock below is released -- bindClientFlow takes the
+		// parent lock and must never nest under it
+		var boundUpdate *multiClientChannelUpdate
+		var boundClient *multiClientChannel
 		self.receiveClientPath(ipPath, func(update *multiClientChannelUpdate) {
 			// race state is guarded by the per-flow stateLock (a leaf); client
 			// is atomic
@@ -2881,6 +2965,7 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 						client := orderedClients[len(orderedClients)-1]
 
 						update.client.Store(client)
+						boundUpdate, boundClient = update, client
 						receivePackets = race.clientStates[client].packets
 						for _, p := range receivePackets {
 							if p.Pooled {
@@ -2906,6 +2991,9 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 			}
 			// else the client is on a new race
 		})
+		// the race completion commits the flow with no send-path transition to
+		// notice it, so this is the only place its bookkeeping can be recorded
+		self.bindClientFlow(boundUpdate, boundClient)
 		if 0 < len(abandonedClients) {
 			if rstPacket, ok := ipOosRst(ipPath); ok {
 				for _, abandonedClient := range abandonedClients {
@@ -2954,8 +3042,29 @@ func (self *RemoteUserNatMultiClient) Exits() []*ExitInfo {
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
-		for client, updates := range self.clientUpdates {
-			flowCounts[client.ClientId()] += len(updates)
+		// count from the flows themselves, not from the clientUpdates
+		// bookkeeping. The bookkeeping is only maintained on the send path
+		// when it notices the committed client changed, so a race-won flow --
+		// winner stored from the receive path or the race completion, then
+		// every later send seeing no change -- is frequently never entered.
+		// On device that read as "13 exits, flows on only 2" while traffic
+		// plainly moved through others: the two visible were affinity
+		// clusters (counted at assignment under this lock), the rest carried
+		// flows this map had never heard of. update.client is the ground
+		// truth: it is what the egress path actually sends on.
+		countClient := func(update *multiClientChannelUpdate) {
+			if update == nil || update.IsDone() {
+				return
+			}
+			if c := update.client.Load(); c != nil {
+				flowCounts[c.ClientId()] += 1
+			}
+		}
+		for _, update := range self.ip4PathUpdates {
+			countClient(update)
+		}
+		for _, update := range self.ip6PathUpdates {
+			countClient(update)
 		}
 	}()
 

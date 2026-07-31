@@ -78,23 +78,40 @@ func TestFlowCapEmptyCandidates(t *testing.T) {
 // The runtime override has to reach the cap, or the developer control silently
 // does nothing -- a failure mode this code has already shipped more than once.
 func TestFlowCapReadsTheRuntimeOverride(t *testing.T) {
-	parent, clients := flowCapTestParent(t, 0, 100, 1)
+	// four exits, two of them full: filtering leaves two, which is the
+	// minimum the race needs, so the override's effect is observable
+	parent, clients := flowCapTestParent(t, 0, 100, 100, 1, 2)
 
 	// unbounded by settings
-	if under := parent.underFlowCap(clients); len(under) != 2 {
-		t.Fatalf("baseline: got %d, want 2", len(under))
+	if under := parent.underFlowCap(clients); len(under) != 4 {
+		t.Fatalf("baseline: got %d, want 4", len(under))
 	}
 
 	// override installs a cap
 	parent.SetReliabilitySettings(&ReliabilitySettings{MaxFlowsPerExit: 8})
 	under := parent.underFlowCap(clients)
-	if len(under) != 1 || under[0] != clients[1] {
-		t.Errorf("override ignored: got %d candidates, want only the client under the cap", len(under))
+	if len(under) != 2 || under[0] != clients[2] || under[1] != clients[3] {
+		t.Errorf("override ignored: got %d candidates, want the two under the cap", len(under))
 	}
 
 	// clearing it restores unbounded
 	parent.SetReliabilitySettings(nil)
-	if under := parent.underFlowCap(clients); len(under) != 2 {
-		t.Errorf("clearing the override did not restore unbounded selection: got %d, want 2", len(under))
+	if under := parent.underFlowCap(clients); len(under) != 4 {
+		t.Errorf("clearing the override did not restore unbounded selection: got %d, want 4", len(under))
+	}
+}
+
+// Filtering must never narrow the field to a single candidate. The send path
+// takes a no-race single-client branch when offered exactly one, so a cap that
+// leaves one exit standing silently disables the multi-exit race -- the
+// mechanism the whole design rests on -- precisely when exits are busiest.
+// Letting the cap slip is the cheaper failure.
+func TestFlowCapNeverNarrowsToASingleCandidate(t *testing.T) {
+	// only one exit is under the cap
+	parent, clients := flowCapTestParent(t, 8, 100, 100, 1)
+
+	under := parent.underFlowCap(clients)
+	if len(under) != len(clients) {
+		t.Errorf("cap narrowed to %d candidate(s), which disables racing; want all %d", len(under), len(clients))
 	}
 }
