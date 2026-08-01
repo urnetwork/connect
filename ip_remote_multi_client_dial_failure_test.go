@@ -407,6 +407,50 @@ func TestDialFailureQuicFlowReraces(t *testing.T) {
 	}
 }
 
+// A handshake-shaped flow -- a few probes retransmitting into silence --
+// trips the wait once the timeout passes on the same exit.
+func TestSynWaitHandshakeTrips(t *testing.T) {
+	update := &multiClientChannelUpdate{}
+	client := &multiClientChannel{settings: DefaultMultiClientSettings()}
+
+	if update.synWaitExceeded(client, 0) {
+		t.Fatal("the first probe must only start the clock, never trip")
+	}
+	// a zero timeout is already exceeded by the second probe
+	if !update.synWaitExceeded(client, 0) {
+		t.Error("a retransmitting handshake past the timeout did not trip")
+	}
+}
+
+// A one-way stream is not a handshake: past dialProbeMaxSends sends with
+// nothing back, the inference must leave the flow alone -- re-racing a live
+// stream drops its in-flight responses for no diagnostic gain. This is the
+// TestMultiClientUdp6 regression: its udp/53 pump was churned whenever the
+// first echo ran past the wait under load.
+func TestSynWaitStreamIsExempt(t *testing.T) {
+	update := &multiClientChannelUpdate{}
+	client := &multiClientChannel{settings: DefaultMultiClientSettings()}
+
+	update.synWaitExceeded(client, 0) // starts the clock at count 1
+	for range dialProbeMaxSends - 1 {
+		update.synWaitExceeded(client, time.Hour) // burn the budget, no trip
+	}
+	// the budget is spent; even a long-exceeded timeout must not trip
+	if update.synWaitExceeded(client, 0) {
+		t.Error("a flow past the probe budget was re-raced: streams belong to the blackhole detector")
+	}
+
+	// a re-race onto another exit re-keys clock and budget, so the flow is
+	// judged fresh where it actually dials fresh
+	other := &multiClientChannel{settings: DefaultMultiClientSettings()}
+	if update.synWaitExceeded(other, 0) {
+		t.Fatal("first probe on a fresh exit must only start the clock")
+	}
+	if !update.synWaitExceeded(other, 0) {
+		t.Error("the re-keyed budget did not allow a fresh handshake to trip")
+	}
+}
+
 // The predicate is only worth anything if the egress path consults it -- pin
 // the call site.
 func TestSendPathInferenceUsesDialProbePacket(t *testing.T) {

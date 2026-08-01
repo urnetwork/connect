@@ -167,16 +167,46 @@ func TestRaceCandidatesCrossTierWhenMinTierSaturated(t *testing.T) {
 }
 
 // A cap bounds blast radius; it is not admission control. When every exit of
-// every rank is full the flow is still placed, on the min tier as offered.
-func TestRaceCandidatesNeverMakeAFlowUnroutable(t *testing.T) {
+// every rank is full the flow is still placed -- on the least-loaded exit,
+// because placing overflow by rank re-created the single-exit pileup: on
+// device, five exits pinned at 16 while the lone tier-1 exit absorbed 267.
+func TestRaceCandidatesOverflowGoesLeastLoaded(t *testing.T) {
 	parent, clients := flowCapTestParent(t, 8, 100, 50, 9)
 
 	candidates := parent.raceCandidatesFrom(
 		clientList(clients[0]),
 		clientList(clients...),
 	)
+	if len(candidates) != 1 || candidates[0] != clients[2] {
+		t.Errorf("got %d candidates, want exactly the least-loaded exit: everything is full and overflow must spread toward an even share", len(candidates))
+	}
+}
+
+// Ties at the minimum all stay in, preserving the race at the even-share
+// equilibrium where whole groups sit at the same count.
+func TestRaceCandidatesOverflowKeepsTiesRacing(t *testing.T) {
+	parent, clients := flowCapTestParent(t, 8, 30, 16, 16)
+
+	candidates := parent.raceCandidatesFrom(
+		clientList(clients[0]),
+		clientList(clients...),
+	)
+	if len(candidates) != 2 || candidates[0] != clients[1] || candidates[1] != clients[2] {
+		t.Errorf("got %d candidates, want the two tied least-loaded exits", len(candidates))
+	}
+}
+
+// The degenerate fallback: a cross-tier source with nothing in it must not
+// strand the flow -- the min tier as offered is still returned.
+func TestRaceCandidatesEmptyCrossTierFallsBackToMinTier(t *testing.T) {
+	parent, clients := flowCapTestParent(t, 8, 100)
+
+	candidates := parent.raceCandidatesFrom(
+		clientList(clients[0]),
+		clientList(),
+	)
 	if len(candidates) != 1 || candidates[0] != clients[0] {
-		t.Errorf("got %d candidates, want the min tier as offered: everything is full and the flow must still be placed", len(candidates))
+		t.Errorf("got %d candidates, want the min tier as offered when the crossed field is empty", len(candidates))
 	}
 }
 

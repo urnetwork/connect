@@ -1311,9 +1311,10 @@ func (self *RemoteUserNatMultiClient) underFlowCap(clients []*multiClientChannel
 // A min tier with every exit at the cap is the "necessary" the rank gate was
 // waiting for. So, in order: the min tier's exits with capacity; only when
 // the min tier has none, any tier's exits with capacity; and when everything
-// everywhere is full, the min tier as offered -- the cap bounds blast radius,
-// it is not admission control, and a flow with no exit under the cap is still
-// placed.
+// everywhere is full, the least-loaded exits of any tier -- the cap bounds
+// blast radius, it is not admission control, and a flow with no exit under
+// the cap is still placed, spread toward an even share rather than piled on
+// the best rank.
 //
 // A single under-cap candidate is returned alone, taking the send path's
 // no-race branch rather than widening the field: crossing rank while the top
@@ -1339,10 +1340,47 @@ func (self *RemoteUserNatMultiClient) raceCandidatesFrom(
 	if under := self.underFlowCap(minTierClients); 0 < len(under) {
 		return under
 	}
-	if crossed := self.underFlowCap(crossTier()); 0 < len(crossed) {
-		return crossed
+	crossed := crossTier()
+	if under := self.underFlowCap(crossed); 0 < len(under) {
+		return under
+	}
+	// every exit of every rank is at the cap: demand exceeds the pool's
+	// capacity, and something must exceed the cap. The overflow goes to
+	// whoever carries least, not to the min tier -- placing it by rank
+	// re-created the single-exit pileup the cap exists to prevent (on device:
+	// five exits pinned at 16 while the lone tier-1 exit absorbed 267 flows,
+	// a 267-flow teardown waiting to happen). An even share is the best
+	// remaining blast-radius bound once capacity is spent.
+	if least := self.leastLoadedClients(crossed); 0 < len(least) {
+		return least
 	}
 	return minTierClients
+}
+
+// leastLoadedClients keeps the clients carrying the fewest recorded flows --
+// the placement of last resort when every exit of every rank is at the flow
+// cap. Ties all stay in (the common case at the even-share equilibrium,
+// where whole groups sit at the same count), so the multi-exit race is
+// preserved exactly when it matters most. Caller ordering is preserved.
+func (self *RemoteUserNatMultiClient) leastLoadedClients(clients []*multiClientChannel) []*multiClientChannel {
+	if len(clients) < 2 {
+		return clients
+	}
+
+	least := []*multiClientChannel{}
+	minCount := -1
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	for _, client := range clients {
+		count := len(self.clientUpdates[client])
+		if minCount < 0 || count < minCount {
+			minCount = count
+			least = append(least[:0], client)
+		} else if count == minCount {
+			least = append(least, client)
+		}
+	}
+	return least
 }
 
 // bindClientFlow records that a flow is now committed to client, which is what
@@ -3254,6 +3292,11 @@ type multiClientChannelUpdate struct {
 	// Both guarded by stateLock.
 	synWaitStart  time.Time
 	synWaitClient *multiClientChannel
+	// synWaitSendCount counts probes sent to synWaitClient since the clock
+	// started. Past dialProbeMaxSends the flow is a one-way stream rather
+	// than a handshake and the inference leaves it alone. Guarded by
+	// stateLock alongside the clock it qualifies.
+	synWaitSendCount int
 
 	// stateLock guards the per-flow mutable state below: the active race and the
 	// tcp collapse-prevention sequence counters. it is a leaf — its holders
@@ -3307,6 +3350,17 @@ func newMultiClientChannelUpdate(ctx context.Context, ipPath *IpPath) *multiClie
 // race lands it.
 const inferredDialFailureTimeout = 3 * time.Second
 
+// dialProbeMaxSends bounds how many sends into silence still look like a
+// handshake. No sane transport sends more than its initial window before the
+// first response -- quic's initial cwnd is 10 packets, a tcp syn retransmits
+// at most ~7 times in a minute -- so a flow past this count with nothing back
+// is not dialing, it is a one-way stream (a udp pump, send-heavy telemetry on
+// a watched port), and re-racing it would drop its in-flight responses for no
+// diagnostic gain. Streams into silence are the blackhole detector's job.
+// Caught by TestMultiClientUdp6, whose long-lived udp/53 stream was churned
+// by the inference whenever the first echo ran past the wait under load.
+const dialProbeMaxSends = 16
+
 // dialProbePacket reports whether this egress packet is a connection attempt
 // whose continued silence is diagnostic of a dead path: a pure tcp syn, or a
 // packet of a request-response udp protocol -- quic on 443, dns on 53 --
@@ -3357,6 +3411,14 @@ func (self *multiClientChannelUpdate) synWaitExceeded(client *multiClientChannel
 	if self.synWaitClient != client || self.synWaitStart.IsZero() {
 		self.synWaitClient = client
 		self.synWaitStart = now
+		self.synWaitSendCount = 1
+		return false
+	}
+	self.synWaitSendCount += 1
+	// past an initial window of sends with nothing back this flow is a
+	// one-way stream, not a handshake -- see dialProbeMaxSends. It stays
+	// exempt on this exit; a re-race re-keys the clock and the count.
+	if dialProbeMaxSends < self.synWaitSendCount {
 		return false
 	}
 	if timeout <= now.Sub(self.synWaitStart) {
