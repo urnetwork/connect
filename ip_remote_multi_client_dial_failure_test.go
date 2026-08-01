@@ -340,3 +340,85 @@ func TestChannelInterceptDoesNotBumpReceiveCounters(t *testing.T) {
 		t.Error("dialFailureCallback received the wrong egress path")
 	}
 }
+
+// --- the dial-probe predicate: which egress packets the inference watches ---
+
+// A pure tcp syn is a probe; packets of established tcp flows are not. For
+// udp only the request-response handshake ports count (quic 443, dns 53): a
+// udp datagram carries no handshake marker, and send-only protocols
+// legitimately never hear back -- re-racing those on silence would bounce
+// them between exits forever and strike healthy exits for normal behavior.
+func TestDialProbePacket(t *testing.T) {
+	quic := udpTestPath(4) // destination port 443
+	dns := udpTestPath(4)
+	dns.DestinationPort = 53
+	telemetry := udpTestPath(4)
+	telemetry.DestinationPort = 5001
+
+	syn := icmpTcpTestPath(4) // Syn set, Ack clear
+	synAck := icmpTcpTestPath(4)
+	synAck.Ack = true
+	established := icmpTcpTestPath(4)
+	established.Syn = false
+	established.Ack = true
+
+	cases := []struct {
+		name string
+		path *IpPath
+		want bool
+	}{
+		{"tcp pure syn", syn, true},
+		{"tcp syn-ack", synAck, false},
+		{"tcp established", established, false},
+		{"udp quic 443", quic, true},
+		{"udp dns 53", dns, true},
+		{"udp send-only port", telemetry, false},
+	}
+	for _, c := range cases {
+		if got := dialProbePacket(c.path); got != c.want {
+			t.Errorf("%s: dialProbePacket = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// The quic form of the field failure: a udp/443 flow that never received a
+// byte, pinned to an exit that cannot complete upstream connects. The re-race
+// machinery is protocol-agnostic; this pins that a udp flow is unbound and
+// strikes the exit exactly as a tcp one does. On device three exits held 63
+// mostly-quic flows in silence for 29s because only the tcp minority had this
+// escape.
+func TestDialFailureQuicFlowReraces(t *testing.T) {
+	egress := udpTestPath(4)
+	parent, client, update, forwarded := dialFailureTestParent(t, true, egress)
+
+	parent.clientDialFailure(client, egress)
+
+	if update.client.Load() != nil {
+		t.Error("quic flow was not unbound")
+	}
+	if got := parent.reliabilityMetrics.flowsReraced.Load(); got != 1 {
+		t.Errorf("flowsReraced = %d, want 1", got)
+	}
+	if got := client.dialFailureCount(); got != 1 {
+		t.Errorf("channel dialFailureCount = %d, want 1: quic silence must strike the exit like tcp silence", got)
+	}
+	if n := len(*forwarded); n != 0 {
+		t.Errorf("%d packet(s) reached the app, want 0", n)
+	}
+}
+
+// The predicate is only worth anything if the egress path consults it -- pin
+// the call site.
+func TestSendPathInferenceUsesDialProbePacket(t *testing.T) {
+	source, err := readSource("ip_remote_multi_client.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, ok := functionBody(source, "func (self *RemoteUserNatMultiClient) sendPacket(")
+	if !ok {
+		t.Fatal("could not find sendPacket")
+	}
+	if !strings.Contains(body, "dialProbePacket(ipPath)") {
+		t.Error("sendPacket does not gate the dial-failure inference on dialProbePacket: udp handshakes have lost their early escape")
+	}
+}

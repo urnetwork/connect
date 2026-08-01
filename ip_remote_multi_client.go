@@ -2367,21 +2367,23 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 			update.resetSequence(sendPacket)
 		}
 
-		// Client-side dial-failure inference. A pure syn retransmitting on an
-		// exit that has answered nothing is the silent form of the failure the
-		// provider signal covers: the provider cannot reach the destination,
-		// or the destination drops the connection without a word, as anti-bot
-		// infrastructure commonly does to datacenter ip ranges. No signal
-		// ever arrives for those, so the
+		// Client-side dial-failure inference. A connection attempt
+		// retransmitting on an exit that has answered nothing is the silent
+		// form of the failure the provider signal covers: the provider cannot
+		// reach the destination, or the destination drops the connection
+		// without a word, as anti-bot infrastructure commonly does to
+		// datacenter ip ranges. No signal ever arrives for those, so the
 		// wait is the only evidence. Feeding the same clientDialFailure path
 		// as the explicit signal gets the same guards, the same unbind, and
 		// the same dial-strike accounting that warns the exit off new flows --
 		// while its established traffic keeps running, which is the entire
 		// point: an exit is never torn down for a destination's silence.
+		// Covers tcp syns and the request-response udp handshakes (quic,
+		// dns) -- see dialProbePacket for why the udp side is port-gated.
 		// guard order matters on this path: every egress packet passes here,
-		// so the plain bools go first and the atomic load, settings read, and
-		// clock only run for a pure syn on an unestablished flow.
-		if ipPath.Syn && !ipPath.Ack && ipPath.Protocol == IpProtocolTcp &&
+		// so the plain field checks go first and the atomic load, settings
+		// read, and clock only run for a probe on an unestablished flow.
+		if dialProbePacket(ipPath) &&
 			currentClient != nil && !update.receivedInbound.Load() &&
 			self.reliabilitySettings().DialFailureRerace &&
 			update.synWaitExceeded(currentClient, inferredDialFailureTimeout) {
@@ -3241,13 +3243,14 @@ type multiClientChannelUpdate struct {
 	receivedInbound atomic.Bool
 
 	// synWaitStart is when synWaitClient was first asked to open this flow's
-	// upstream connection -- the first pure syn sent while receivedInbound is
-	// still false. It backs the client-side dial-failure inference: a provider
-	// that silently cannot reach the destination (or a destination that
-	// silently drops the connection) produces no failure signal at all, so the
-	// wait itself is the only evidence. Keyed to synWaitClient so a re-raced
-	// flow judges each exit on its own silence; the pointer is only ever
-	// compared, never dereferenced, so a closed channel is harmless here.
+	// upstream connection -- the first dial probe (tcp syn, or quic/dns udp:
+	// see dialProbePacket) sent while receivedInbound is still false. It backs
+	// the client-side dial-failure inference: a provider that silently cannot
+	// reach the destination (or a destination that silently drops the
+	// connection) produces no failure signal at all, so the wait itself is
+	// the only evidence. Keyed to synWaitClient so a re-raced flow judges
+	// each exit on its own silence; the pointer is only ever compared, never
+	// dereferenced, so a closed channel is harmless here.
 	// Both guarded by stateLock.
 	synWaitStart  time.Time
 	synWaitClient *multiClientChannel
@@ -3304,11 +3307,46 @@ func newMultiClientChannelUpdate(ctx context.Context, ipPath *IpPath) *multiClie
 // race lands it.
 const inferredDialFailureTimeout = 3 * time.Second
 
-// synWaitExceeded starts the connect-wait clock on the first syn a given exit
+// dialProbePacket reports whether this egress packet is a connection attempt
+// whose continued silence is diagnostic of a dead path: a pure tcp syn, or a
+// packet of a request-response udp protocol -- quic on 443, dns on 53 --
+// on a flow that has never received a byte.
+//
+// The port gate is what keeps the inference honest for udp. Tcp declares its
+// intent in the syn flag, but a udp datagram carries no handshake marker, and
+// send-only protocols (telemetry, some game and logging traffic) legitimately
+// never hear back -- re-racing those on silence would bounce them between
+// exits forever and strike healthy exits for a silence that is normal. Quic
+// and dns always expect an answer, are the overwhelming mass of udp here
+// (56% of traffic is quic), and are exactly the flows observed pinned to a
+// dead exit for the full blackhole bound: on device, three exits held 63
+// flows in syn-and-quic silence for 29s -- 22-28 unanswered syns each, 0
+// bytes received -- because only their tcp minority could escape early.
+//
+// The caller layers the remaining guards: flow unestablished, wait exceeded
+// per exit, and the same clientDialFailure gate the provider's explicit
+// signal uses, so quic's established-flow protections are identical to tcp's.
+// A moved quic flow survives the exit change by design: quic keys the
+// connection on its connection id, not the 4-tuple.
+func dialProbePacket(ipPath *IpPath) bool {
+	switch ipPath.Protocol {
+	case IpProtocolTcp:
+		return ipPath.Syn && !ipPath.Ack
+	case IpProtocolUdp:
+		switch ipPath.DestinationPort {
+		case 443, 53:
+			return true
+		}
+	}
+	return false
+}
+
+// synWaitExceeded starts the connect-wait clock on the first dial probe (a
+// tcp syn or a udp handshake packet, see dialProbePacket) a given exit
 // carries for this flow, and reports whether it has run past timeout on later
-// syns through that same exit. The clock is keyed to the exit: a flow that
+// probes through that same exit. The clock is keyed to the exit: a flow that
 // re-races restarts the wait, so each exit is judged on its own silence rather
-// than inheriting the previous one's -- otherwise the first syn through a
+// than inheriting the previous one's -- otherwise the first probe through a
 // fresh exit would strike it immediately. When it trips, the clock restarts
 // for the same reason.
 func (self *multiClientChannelUpdate) synWaitExceeded(client *multiClientChannel, timeout time.Duration) bool {
