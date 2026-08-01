@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -55,15 +56,15 @@ func TestFlowCapExcludesFullExits(t *testing.T) {
 	}
 }
 
-// A cap bounds blast radius; it is not admission control. When everything is
-// full the flow still has to go somewhere -- refusing would turn a slower page
-// into a broken one.
-func TestFlowCapNeverMakesAFlowUnroutable(t *testing.T) {
+// When every candidate is full underFlowCap now reports that honestly with an
+// empty result -- the fallback decision belongs to raceCandidates, which knows
+// whether a wider field exists to try first.
+func TestFlowCapAllFullIsEmpty(t *testing.T) {
 	parent, clients := flowCapTestParent(t, 8, 100, 50, 9)
 
 	under := parent.underFlowCap(clients)
-	if len(under) != len(clients) {
-		t.Fatalf("got %d candidates, want all %d: every exit was full, so the flow must still be placed", len(under), len(clients))
+	if len(under) != 0 {
+		t.Fatalf("got %d candidates, want 0: every exit is at the cap, and the fallback is the caller's decision", len(under))
 	}
 }
 
@@ -101,17 +102,154 @@ func TestFlowCapReadsTheRuntimeOverride(t *testing.T) {
 	}
 }
 
-// Filtering must never narrow the field to a single candidate. The send path
-// takes a no-race single-client branch when offered exactly one, so a cap that
-// leaves one exit standing silently disables the multi-exit race -- the
-// mechanism the whole design rests on -- precisely when exits are busiest.
-// Letting the cap slip is the cheaper failure.
-func TestFlowCapNeverNarrowsToASingleCandidate(t *testing.T) {
-	// only one exit is under the cap
+// --- raceCandidates: the fallback order over the window's rank gate ---
+
+// clientList adapts a fixed slice to the lazy source raceCandidatesFrom takes.
+func clientList(clients ...*multiClientChannel) func() []*multiClientChannel {
+	return func() []*multiClientChannel { return clients }
+}
+
+// mustNotBeConsulted fails the test if the lazy source is ever pulled.
+func mustNotBeConsulted(t *testing.T, name string) func() []*multiClientChannel {
+	return func() []*multiClientChannel {
+		t.Fatalf("%s was consulted, and must not be on this path", name)
+		return nil
+	}
+}
+
+// While the min tier has capacity, rank is respected: the under-cap subset of
+// the min tier is the whole field, and the cross-tier list is never built.
+func TestRaceCandidatesStayOnMinTierWhileItHasCapacity(t *testing.T) {
+	parent, clients := flowCapTestParent(t, 8, 100, 1, 2)
+
+	candidates := parent.raceCandidatesFrom(
+		clientList(clients...),
+		mustNotBeConsulted(t, "the cross-tier list"),
+	)
+	if len(candidates) != 2 || candidates[0] != clients[1] || candidates[1] != clients[2] {
+		t.Errorf("got %d candidates, want the two min-tier exits under the cap", len(candidates))
+	}
+}
+
+// A single under-cap candidate is returned alone rather than widening the
+// field: crossing rank while the top rank still has capacity would let a
+// nearby lower-rank exit win on rtt and pull traffic off the rank the
+// platform chose. The no-race placement recovers via the re-race paths.
+func TestRaceCandidatesSingleUnderCapCandidateStandsAlone(t *testing.T) {
 	parent, clients := flowCapTestParent(t, 8, 100, 100, 1)
 
-	under := parent.underFlowCap(clients)
-	if len(under) != len(clients) {
-		t.Errorf("cap narrowed to %d candidate(s), which disables racing; want all %d", len(under), len(clients))
+	candidates := parent.raceCandidatesFrom(
+		clientList(clients...),
+		mustNotBeConsulted(t, "the cross-tier list"),
+	)
+	if len(candidates) != 1 || candidates[0] != clients[2] {
+		t.Errorf("got %d candidates, want exactly the one min-tier exit under the cap", len(candidates))
+	}
+}
+
+// The window offers only its best rank, so with one exit in the top rank the
+// cap used to be structurally defeated: the under-cap filter could never keep
+// a candidate, fell back to the full list, and the same saturated exit won
+// every race. On device: 86 flows on one exit, twelve idle spares. Saturation
+// of the min tier is when crossing rank becomes necessary.
+func TestRaceCandidatesCrossTierWhenMinTierSaturated(t *testing.T) {
+	// index 0 is the min-tier exit at the cap; 1 and 2 are spares on higher
+	// tiers with capacity
+	parent, clients := flowCapTestParent(t, 8, 100, 0, 3)
+
+	candidates := parent.raceCandidatesFrom(
+		clientList(clients[0]),
+		clientList(clients...),
+	)
+	if len(candidates) != 2 || candidates[0] != clients[1] || candidates[1] != clients[2] {
+		t.Errorf("got %d candidates, want the two under-cap spares from the crossed field", len(candidates))
+	}
+}
+
+// A cap bounds blast radius; it is not admission control. When every exit of
+// every rank is full the flow is still placed, on the min tier as offered.
+func TestRaceCandidatesNeverMakeAFlowUnroutable(t *testing.T) {
+	parent, clients := flowCapTestParent(t, 8, 100, 50, 9)
+
+	candidates := parent.raceCandidatesFrom(
+		clientList(clients[0]),
+		clientList(clients...),
+	)
+	if len(candidates) != 1 || candidates[0] != clients[0] {
+		t.Errorf("got %d candidates, want the min tier as offered: everything is full and the flow must still be placed", len(candidates))
+	}
+}
+
+// With the cap off the rank gate is left exactly as it was: min tier only,
+// cross-tier never consulted. 0 is the shipped default for upstream parity.
+func TestRaceCandidatesCapOffLeavesTheRankGateAlone(t *testing.T) {
+	parent, clients := flowCapTestParent(t, 0, 500, 1)
+
+	candidates := parent.raceCandidatesFrom(
+		clientList(clients[0]),
+		mustNotBeConsulted(t, "the cross-tier list"),
+	)
+	if len(candidates) != 1 || candidates[0] != clients[0] {
+		t.Errorf("got %d candidates, want the min tier untouched with the cap off", len(candidates))
+	}
+}
+
+// An empty window yields an empty field without consulting anything else.
+func TestRaceCandidatesEmptyWindow(t *testing.T) {
+	parent, _ := flowCapTestParent(t, 8)
+
+	candidates := parent.raceCandidatesFrom(
+		clientList(),
+		mustNotBeConsulted(t, "the cross-tier list"),
+	)
+	if len(candidates) != 0 {
+		t.Errorf("got %d candidates from an empty window", len(candidates))
+	}
+}
+
+// minTierClients is the rank gate itself: only the best (lowest) tier present
+// survives, in order.
+func TestMinTierClientsKeepsOnlyBestRank(t *testing.T) {
+	tiered := func(tier int) *multiClientChannel {
+		return &multiClientChannel{
+			args: &multiClientChannelArgs{DestinationStats: DestinationStats{Tier: tier}},
+		}
+	}
+	a, b, c, d := tiered(2), tiered(1), tiered(3), tiered(1)
+
+	kept := minTierClients([]*multiClientChannel{a, b, c, d})
+	if len(kept) != 2 || kept[0] != b || kept[1] != d {
+		t.Errorf("got %d clients, want the two tier-1 clients in order", len(kept))
+	}
+
+	if kept := minTierClients([]*multiClientChannel{}); len(kept) != 0 {
+		t.Errorf("got %d clients from an empty input", len(kept))
+	}
+}
+
+// The fallback order is only worth anything if the send path actually goes
+// through it -- a helper that is correct but uncalled is the failure mode this
+// codebase has shipped more than once. Read the call sites rather than
+// trusting they exist.
+func TestSendPathPlacesFlowsThroughRaceCandidates(t *testing.T) {
+	source, err := readSource("ip_remote_multi_client.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body, ok := functionBody(source, "func (self *RemoteUserNatMultiClient) sendPacket(")
+	if !ok {
+		t.Fatal("could not find sendPacket")
+	}
+	if !strings.Contains(body, "self.raceCandidates(window)") {
+		t.Error("sendPacket does not assemble its field through raceCandidates: the cap and the rank gate are disconnected again")
+	}
+
+	body, ok = functionBody(source, "func (self *RemoteUserNatMultiClient) raceCandidates(")
+	if !ok {
+		t.Fatal("could not find raceCandidates")
+	}
+	if !strings.Contains(body, "orderedClientsCrossTier") {
+		t.Error("raceCandidates does not offer the cross-tier list, so a saturated min tier still cannot spread")
 	}
 }

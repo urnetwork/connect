@@ -1263,11 +1263,10 @@ func (self *RemoteUserNatMultiClient) affinityFallbackIpPathsWithLock(ipPath *Ip
 }
 
 // underFlowCap drops candidates that are already carrying their share of
-// flows, preserving the caller's ordering.
-//
-// If every candidate is full the original list is returned unchanged. The cap
-// bounds blast radius; it is not admission control, and refusing to place a
-// flow would turn a slower page into a broken one.
+// flows, preserving the caller's ordering. May return an empty slice when
+// every candidate is full: the caller decides the fallback, because only the
+// caller knows whether a wider field (another tier) is available to try
+// first. See raceCandidates for the fallback order.
 //
 // NOTE this filter alone does not bound anything. It runs at *selection*, and
 // the cap is never re-checked at *assignment*: `sendUpdate` holds stateLock to
@@ -1276,12 +1275,6 @@ func (self *RemoteUserNatMultiClient) affinityFallbackIpPathsWithLock(ipPath *Ip
 // `sendClientPath`. N concurrent flows in one affinity group all observe the
 // same count and all commit, taking an exit to count+N. On device an exit
 // reached 79 flows against a cap of 16 with this filter in place.
-//
-// Ordering the overflow least-loaded-first does NOT help and was tried: the
-// race truncation that would consume slice order is gated on
-// MultiRaceClientCount, which is 0, so every candidate is raced in parallel
-// and the winner is chosen by lowest RTT after a weighted shuffle over a map.
-// Input order is discarded before selection.
 //
 // The real fix is to make check-and-assign atomic at each of the three
 // assignment sites. Not attempted here.
@@ -1300,20 +1293,56 @@ func (self *RemoteUserNatMultiClient) underFlowCap(clients []*multiClientChannel
 			}
 		}
 	}()
-
-	// Narrowing to a single candidate is worse than letting the cap slip. The
-	// send path takes a no-race single-client branch when exactly one
-	// candidate is offered, so a cap that filters the field down to one
-	// silently disables the multi-exit race -- the reliability mechanism this
-	// whole design rests on -- for those flows, exactly when exits are busiest.
-	//
-	// This became reachable when the bookkeeping started counting race-won
-	// flows: before that the cap under-counted so heavily it rarely bound at
-	// all. The cap bounds blast radius; it must not cost racing to do it.
-	if len(under) < 2 {
-		return clients
-	}
 	return under
+}
+
+// raceCandidates assembles the field a new flow is placed over.
+//
+// The window offers only its best rank (OrderedClients keeps the min tier) so
+// traffic does not cross rank until necessary. With one or two exits in the
+// top rank -- the normal state on a small provider pool, since the platform
+// tiers on measured latency and speed -- that gate used to defeat the flow
+// cap outright: the under-cap filter could never keep two candidates, fell
+// back to the unfiltered list, and the lowest-rtt winner re-picked the same
+// saturated exit for every flow. On device that read as 86 flows on one exit
+// with twelve idle spares, which is the exact blast radius MaxFlowsPerExit
+// exists to bound.
+//
+// A min tier with every exit at the cap is the "necessary" the rank gate was
+// waiting for. So, in order: the min tier's exits with capacity; only when
+// the min tier has none, any tier's exits with capacity; and when everything
+// everywhere is full, the min tier as offered -- the cap bounds blast radius,
+// it is not admission control, and a flow with no exit under the cap is still
+// placed.
+//
+// A single under-cap candidate is returned alone, taking the send path's
+// no-race branch rather than widening the field: crossing rank while the top
+// rank still has capacity would let a nearby lower-rank exit win on rtt and
+// split traffic off the rank the platform chose. A no-race placement still
+// recovers through the dial-failure and send-error re-race paths.
+func (self *RemoteUserNatMultiClient) raceCandidates(window *multiClientWindow) []*multiClientChannel {
+	return self.raceCandidatesFrom(window.OrderedClients, window.orderedClientsCrossTier)
+}
+
+// raceCandidatesFrom is raceCandidates over explicit list sources, the seam
+// the tests drive. Both are pulled lazily: the cross-tier walk only happens
+// when the min tier is saturated, and with the cap off the window's rank gate
+// is left exactly as it was.
+func (self *RemoteUserNatMultiClient) raceCandidatesFrom(
+	minTier func() []*multiClientChannel,
+	crossTier func() []*multiClientChannel,
+) []*multiClientChannel {
+	minTierClients := minTier()
+	if len(minTierClients) == 0 || self.reliabilitySettings().MaxFlowsPerExit <= 0 {
+		return minTierClients
+	}
+	if under := self.underFlowCap(minTierClients); 0 < len(under) {
+		return under
+	}
+	if crossed := self.underFlowCap(crossTier()); 0 < len(crossed) {
+		return crossed
+	}
+	return minTierClients
 }
 
 // bindClientFlow records that a flow is now committed to client, which is what
@@ -2585,7 +2614,7 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 		coalesceOrderedClients := func() []*multiClientChannel {
 			for _, windowType := range self.selectWindowTypes(sendPacket) {
 				if window, ok := self.windows[windowType]; ok {
-					orderedClients := self.underFlowCap(window.OrderedClients())
+					orderedClients := self.raceCandidates(window)
 					if 0 < len(orderedClients) {
 						return orderedClients
 					}
@@ -3031,6 +3060,11 @@ type ExitInfo struct {
 	// upstream (a resold proxy, an exhausted socket table) is refusing work
 	// while the provider itself stays reachable
 	DialFailureCount int
+	// Tier is the platform's rank for this provider (0 is best). The window
+	// races only the best rank present until it is at the flow cap, so this is
+	// the field that explains why an exit carries no flows: it is a spare on a
+	// higher tier, not a failure
+	Tier int
 }
 
 // Exits reports the provider channels across every window, with the number of
@@ -3080,6 +3114,7 @@ func (self *RemoteUserNatMultiClient) Exits() []*ExitInfo {
 				P2pOnly:          client.IsP2pOnly(),
 				FlowCount:        flowCounts[clientId],
 				DialFailureCount: client.dialFailureCount(),
+				Tier:             client.Tier(),
 			})
 		}
 	}
@@ -4371,7 +4406,21 @@ func (self *multiClientWindow) unorderedClients() []*multiClientChannel {
 	return slices.Collect(maps.Values(self.clients))
 }
 
+// OrderedClients is the window's offer to the race: its healthy clients,
+// weighted-shuffled, narrowed to the best rank present ("min tier") so
+// traffic does not cross rank until necessary.
 func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
+	return self.orderedClients(false)
+}
+
+// orderedClientsCrossTier is OrderedClients without the min-tier gate, for
+// the caller that has decided crossing rank IS now necessary -- every min-tier
+// exit sitting at the flow cap. See RemoteUserNatMultiClient.raceCandidates.
+func (self *multiClientWindow) orderedClientsCrossTier() []*multiClientChannel {
+	return self.orderedClients(true)
+}
+
+func (self *multiClientWindow) orderedClients(crossTier bool) []*multiClientChannel {
 	var windowSize WindowSizeSettings
 	func() {
 		self.stateLock.Lock()
@@ -4430,29 +4479,37 @@ func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 
 	WeightedShuffleWithEntropy(clients, weights, self.settings.StatsWindowEntropy)
 
-	// use only clients in the min tier
-	// this prevents the window from crossing rank until necessary
-	minTierClients := []*multiClientChannel{}
-	minTier := clients[0].Tier()
-	for _, client := range clients[1:] {
-		minTier = min(minTier, client.Tier())
-	}
-	for _, client := range clients {
-		if client.Tier() == minTier {
-			minTierClients = append(minTierClients, client)
-		} else {
-			if self.log.V(1).Enabled() {
-				self.log.Infof("[multi]exclude tier from window %d>%d\n", client.Tier(), minTier)
-			}
-		}
+	if crossTier {
+		return clients
 	}
 
 	// use only the top n items from the window
 	// if 0 < windowSize.WindowSizeUseMax {
-	// 	minTierClients = minTierClients[:min(len(minTierClients), windowSize.WindowSizeUseMax)]
+	// 	clients = clients[:min(len(clients), windowSize.WindowSizeUseMax)]
 	// }
 
-	return minTierClients
+	// use only clients in the min tier
+	// this prevents the window from crossing rank until necessary
+	return minTierClients(clients)
+}
+
+// minTierClients keeps only the clients of the best (lowest) rank present,
+// preserving order. Empty input yields empty output.
+func minTierClients(clients []*multiClientChannel) []*multiClientChannel {
+	if len(clients) == 0 {
+		return clients
+	}
+	minTier := clients[0].Tier()
+	for _, client := range clients[1:] {
+		minTier = min(minTier, client.Tier())
+	}
+	kept := []*multiClientChannel{}
+	for _, client := range clients {
+		if client.Tier() == minTier {
+			kept = append(kept, client)
+		}
+	}
+	return kept
 }
 
 func (self *multiClientWindow) statsSampleWeights(weights map[*multiClientChannel]float32) {
@@ -4811,6 +4868,11 @@ func (self *multiClientChannel) IsP2pOnly() bool {
 }
 
 func (self *multiClientChannel) Tier() int {
+	// bare fixture channels have no args; rank them best rather than panic on
+	// the selection path
+	if self.args == nil {
+		return 0
+	}
 	return self.args.DestinationStats.Tier
 }
 
