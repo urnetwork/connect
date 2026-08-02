@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/urnetwork/connect/protocol"
 )
@@ -207,4 +208,62 @@ func TestRecordSourceProvideMode(t *testing.T) {
 			t.Errorf("newest source = %v, want Public", got)
 		}
 	})
+}
+
+// Network-provider return data and active WebRTC signaling are
+// indistinguishable at the receiver's sequence-head key. They therefore must
+// share ForceStream as well as their destination: ForceStream keys the sender
+// sequence but is not represented on the wire. Before this regression fix the
+// two options created concurrent sequence ids, and whichever arrived second
+// caused the receiver to discard the first as an older sequence indefinitely.
+func TestProviderReturnTransferOptionPreventsForceStreamFork(t *testing.T) {
+	networkOption := providerReturnTransferOption(protocol.ProvideMode_Network)
+	network, ok := networkOption.(transferOptionsSetForceStream)
+	if !ok || !network.ForceStream {
+		t.Fatalf("Network return option = %#v, want ForceStream", networkOption)
+	}
+	publicOption := providerReturnTransferOption(protocol.ProvideMode_Public)
+	public, ok := publicOption.(transferOptionsSetCompanionContract)
+	if !ok || !public.CompanionContract {
+		t.Fatalf("Public return option = %#v, want CompanionContract", publicOption)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), DefaultClientSettings())
+	defer client.Cancel()
+
+	destination := DestinationId(NewId())
+	providerReturn := &protocol.Frame{
+		MessageType:  protocol.MessageType_IpIpPacketFromProvider,
+		MessageBytes: []byte("provider return"),
+	}
+	if !client.SendWithTimeout(providerReturn, destination, nil, time.Second, networkOption) {
+		t.Fatal("provider return enqueue failed")
+	}
+	activeSignal := &protocol.Frame{
+		MessageType:  protocol.MessageType_TransferExchangeSignals,
+		MessageBytes: []byte("active signal"),
+	}
+	if !client.SendWithTimeout(activeSignal, destination, nil, time.Second, ForceStream()) {
+		t.Fatal("active signal enqueue failed")
+	}
+
+	client.sendBuffer.mutex.Lock()
+	defer client.sendBuffer.mutex.Unlock()
+	var keys []sendSequenceId
+	for key := range client.sendBuffer.sendSequences {
+		if key.Destination == destination &&
+			key.EncryptionRole == sequenceTlsRoleClient &&
+			!key.EncryptionCompanion &&
+			!key.CompanionContract {
+			keys = append(keys, key)
+		}
+	}
+	if len(keys) != 1 {
+		t.Fatalf("provider return and active signal forked into %d sequences: %v", len(keys), keys)
+	}
+	if !keys[0].ForceStream {
+		t.Fatal("shared provider return/signal sequence must use ForceStream")
+	}
 }

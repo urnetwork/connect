@@ -40,6 +40,39 @@ const (
 	encryptionModeFallback
 )
 
+func TestSendItemPoolIsBoundedAndClearsAckLifetimeState(t *testing.T) {
+	if cap(sendItemPool) != sendItemPoolCapacity {
+		t.Fatalf("send-item pool capacity = %d, expected %d", cap(sendItemPool), sendItemPoolCapacity)
+	}
+	contractId := NewId()
+	item := &sendItem{
+		transferItem: transferItem{
+			messageId:        NewId(),
+			messageByteCount: 123,
+			sequenceNumber:   456,
+		},
+		contractId:         &contractId,
+		sendCount:          7,
+		transferFrameBytes: MessagePoolCopy([]byte("wire")),
+	}
+	item.acks.add(sendAckRecord{callback: func(error) {}})
+	item.messagePoolReturn()
+
+	if item.messageId != (Id{}) ||
+		item.messageByteCount != 0 ||
+		item.sequenceNumber != 0 ||
+		item.contractId != nil ||
+		item.sendCount != 0 ||
+		item.transferFrameBytes != nil ||
+		item.acks.count != 0 {
+		t.Fatal("send-item reuse retained wire, contract, sequence, or acknowledgement state")
+	}
+	ClearMessagePools()
+	if len(sendItemPool) != 0 {
+		t.Fatal("host memory-pressure clearing retained reusable send items")
+	}
+}
+
 func TestSendReceiveSenderReset(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping testing in short mode")
@@ -725,3 +758,283 @@ func TestMinimumMessageLenLimitFitsWorstCaseHandshake(t *testing.T) {
 }
 
 // FIXME TestAckTimeout
+
+func TestSendBufferRetiresWireIndistinguishableSequenceForks(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), DefaultClientSettings())
+	defer client.Cancel()
+
+	peerId := NewId()
+	destination := DestinationId(peerId)
+	send := func(content string, opts ...any) {
+		frame := &protocol.Frame{
+			MessageType:  protocol.MessageType_TransferExchangeSignals,
+			MessageBytes: []byte(content),
+		}
+		if !client.SendWithTimeout(frame, destination, nil, time.Second, opts...) {
+			t.Fatalf("send %q failed", content)
+		}
+	}
+	onlySequence := func(stage string) (sendSequenceId, *SendSequence) {
+		client.sendBuffer.mutex.Lock()
+		defer client.sendBuffer.mutex.Unlock()
+		var exactCount int
+		var wireCount int
+		var foundId sendSequenceId
+		var foundSequence *SendSequence
+		for id, sequence := range client.sendBuffer.sendSequences {
+			if id.Destination == destination {
+				exactCount += 1
+				foundId = id
+				foundSequence = sequence
+			}
+		}
+		for wireId, sequence := range client.sendBuffer.wireSendSequences {
+			if wireId.Destination == destination {
+				wireCount += 1
+				if sequence != foundSequence {
+					t.Fatalf("%s: wire map points to a different sequence", stage)
+				}
+			}
+		}
+		// NewClient may asynchronously publish a control/key frame to a
+		// different destination. Inspect only the peer under test while still
+		// requiring both indexes for that peer to agree exactly.
+		if exactCount != 1 || wireCount != 1 {
+			t.Fatalf(
+				"%s: peer sequence maps exact=%d wire=%d, want one each (global %d/%d)",
+				stage,
+				exactCount,
+				wireCount,
+				len(client.sendBuffer.sendSequences),
+				len(client.sendBuffer.wireSendSequences),
+			)
+		}
+		return foundId, foundSequence
+	}
+
+	send("plain")
+	plainId, plain := onlySequence("plain")
+	if plainId.ForceStream {
+		t.Fatal("first sequence unexpectedly forced a stream")
+	}
+
+	// ForceStream changes the local contract/route key but is absent from the
+	// receiver head key. The new sequence must synchronously retire the old
+	// one instead of leaving both live to supersede each other forever.
+	send("stream", ForceStream())
+	streamId, stream := onlySequence("force-stream")
+	if !streamId.ForceStream {
+		t.Fatal("replacement sequence did not use ForceStream")
+	}
+	select {
+	case <-plain.ctx.Done():
+	default:
+		t.Fatal("wire-indistinguishable ForceStream=false sequence remained live")
+	}
+
+	// Intermediaries are likewise a sender-side route choice and absent from
+	// the destination's receive-head identity.
+	via := RequireMultiHopId(NewId(), peerId)
+	frame := &protocol.Frame{
+		MessageType:  protocol.MessageType_TransferExchangeSignals,
+		MessageBytes: []byte("via intermediary"),
+	}
+	if !client.SendMultiHopWithTimeout(frame, via, nil, time.Second, ForceStream()) {
+		t.Fatal("multi-hop replacement enqueue failed")
+	}
+	viaId, _ := onlySequence("intermediary")
+	if viaId.IntermediaryIds.Len() != 1 {
+		t.Fatalf("replacement intermediaries = %v, want one", viaId.IntermediaryIds)
+	}
+	select {
+	case <-stream.ctx.Done():
+	default:
+		t.Fatal("wire-indistinguishable direct sequence remained live")
+	}
+}
+
+// TestSendReceiveEncryptedForceStreamData is the end-to-end regression test
+// for the network-peer + post-quantum data blackhole. Same-network peers
+// force AllowDirect on, so the multi-client sends application data with the
+// `ForceStream` transfer option, while encryption's EncryptedControl carrier
+// used the client's default TransferOptions (ForceStream=false). ForceStream
+// keys the send sequence but is invisible on the wire, so the carrier forked
+// a SECOND concurrent send sequence to the peer whose frames the receiver
+// could not distinguish from the data sequence — both mapped to the same
+// (source, role, companion) receive head slot, the newer sequence id evicted
+// the older, and the loser's packs were dropped un-acked forever. Ordering
+// is deterministic here: the data Pack constructs the fs=true sequence,
+// whose construction acquires the session and emits the ClientHello, so the
+// fs=false carrier (when it wrongly existed) always minted a NEWER sequence
+// id and permanently starved the data.
+//
+// The test mimics the platform by serving contracts under BOTH ForceStream
+// contract keys (the platform serves CreateContract for any key), sends data
+// with ForceStream(), and requires (a) every message to be delivered and
+// (b) exactly one client-role/non-companion send sequence to the peer — the
+// carrier riding the data sequence, not a fork.
+func TestSendReceiveEncryptedForceStreamData(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping testing in short mode")
+	}
+
+	timeout := 5 * time.Minute
+	n := 64
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	aClientId := NewId()
+	bClientId := NewId()
+
+	aSend := make(chan []byte)
+	bSend := make(chan []byte)
+
+	// no conditioning: the fork is structural, not loss-dependent
+	_, bReceive := newConditioner(ctx, aSend)
+	_, aReceive := newConditioner(ctx, bSend)
+
+	aSendTransport := NewSendGatewayTransport()
+	aReceiveTransport := NewReceiveGatewayTransport()
+	bSendTransport := NewSendGatewayTransport()
+	bReceiveTransport := NewReceiveGatewayTransport()
+
+	provideModes := map[protocol.ProvideMode]bool{
+		protocol.ProvideMode_Network: true,
+	}
+
+	newSettings := func() *ClientSettings {
+		clientSettings := DefaultClientSettings()
+		clientSettings.SendBufferSettings.SequenceBufferSize = 0
+		clientSettings.SendBufferSettings.AckBufferSize = 0
+		clientSettings.SendBufferSettings.AckTimeout = 300 * time.Second
+		clientSettings.SendBufferSettings.IdleTimeout = 300 * time.Second
+		clientSettings.ReceiveBufferSettings.SequenceBufferSize = 0
+		clientSettings.ReceiveBufferSettings.GapTimeout = 300 * time.Second
+		clientSettings.ReceiveBufferSettings.IdleTimeout = 300 * time.Second
+		clientSettings.ForwardBufferSettings.SequenceBufferSize = 0
+		clientSettings.ForwardBufferSettings.IdleTimeout = 300 * time.Second
+		clientSettings.ContractManagerSettings.LegacyCreateContract = true
+		applyTestEncryptionSettings(clientSettings, encryptionModeOn)
+		return clientSettings
+	}
+
+	a := NewClient(ctx, aClientId, NewNoContractClientOob(), newSettings())
+	defer a.Cancel()
+	a.RouteManager().UpdateTransport(aSendTransport, []Route{aSend})
+	a.RouteManager().UpdateTransport(aReceiveTransport, []Route{aReceive})
+	a.ContractManager().SetProvideModes(provideModes)
+
+	b := NewClient(ctx, bClientId, NewNoContractClientOob(), newSettings())
+	defer b.Cancel()
+	b.RouteManager().UpdateTransport(bSendTransport, []Route{bSend})
+	b.RouteManager().UpdateTransport(bReceiveTransport, []Route{bReceive})
+	b.ContractManager().SetProvideModes(provideModes)
+
+	acks := make(chan error)
+	receives := make(chan *protocol.SimpleMessage)
+
+	b.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, peer Peer) {
+		for _, frame := range frames {
+			m, err := FromFrame(frame)
+			if err != nil {
+				panic(err)
+			}
+			switch v := m.(type) {
+			case *protocol.SimpleMessage:
+				receives <- v
+			}
+		}
+	})
+
+	// the platform serves CreateContract for any contract key: feed the
+	// data path's ForceStream key and the default key the EncryptedControl
+	// carrier would use if it (wrongly) diverged from the data path
+	for _, forceStream := range []bool{true, false} {
+		for range 2 {
+			err := a.ContractManager().HandleControlFrame(
+				ContractKey{
+					Destination: DestinationId(bClientId),
+					ForceStream: forceStream,
+				},
+				requireContractResult(
+					protocol.ProvideMode_Network,
+					b.ContractManager().RequireProvideSecretKey(protocol.ProvideMode_Network),
+					aClientId,
+					bClientId,
+				),
+			)
+			AssertEqual(t, err, nil)
+		}
+	}
+
+	go func() {
+		for i := 0; i < n; i += 1 {
+			message := &protocol.SimpleMessage{
+				Content: fmt.Sprintf("hi %d", i),
+			}
+			frame, err := ToFrame(message, DefaultProtocolVersion)
+			if err != nil {
+				panic(err)
+			}
+			success := a.SendWithTimeout(frame, DestinationId(bClientId), func(err error) {
+				acks <- err
+			}, -1, ForceStream())
+			AssertEqual(t, success, true)
+		}
+	}()
+
+	receiveMessages := map[string]bool{}
+	ackCount := 0
+	receiveCount := 0
+	deadline := time.Now().Add(timeout)
+	for receiveCount < n || ackCount < n {
+		// fast starvation guard: the pipe is in-memory and unconditioned, so
+		// zero deliveries after a minute means the data sequence is being
+		// dropped at the receiver, not slow
+		progressTimeout := time.Minute
+		if 0 < receiveCount {
+			progressTimeout = time.Until(deadline)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case message := <-receives:
+			receiveMessages[message.Content] = true
+			receiveCount += 1
+		case err := <-acks:
+			AssertEqual(t, err, nil)
+			ackCount += 1
+		case <-time.After(progressTimeout):
+			t.Fatalf("Timeout: %d/%d received, %d/%d acked — the ForceStream data sequence is starved (EncryptedControl carrier fork)", receiveCount, n, ackCount, n)
+		}
+	}
+	for i := 0; i < n; i += 1 {
+		message := fmt.Sprintf("hi %d", i)
+		AssertEqual(t, receiveMessages[message], true)
+	}
+
+	// the carrier must ride the data path's sequence: exactly one
+	// client-role, non-companion send sequence to the peer
+	func() {
+		a.sendBuffer.mutex.Lock()
+		defer a.sendBuffer.mutex.Unlock()
+		clientRoleSequences := []sendSequenceId{}
+		for key := range a.sendBuffer.sendSequences {
+			if key.Destination.DestinationId == bClientId &&
+				key.EncryptionRole == sequenceTlsRoleClient &&
+				!key.EncryptionCompanion &&
+				!key.CompanionContract {
+				clientRoleSequences = append(clientRoleSequences, key)
+			}
+		}
+		if len(clientRoleSequences) != 1 {
+			t.Fatalf("expected exactly one client-role send sequence to the peer (the EncryptedControl carrier must ride the data sequence), got %d: %v", len(clientRoleSequences), clientRoleSequences)
+		}
+		if !clientRoleSequences[0].ForceStream {
+			t.Fatal("the surviving sequence must be the data path's ForceStream sequence")
+		}
+	}()
+}

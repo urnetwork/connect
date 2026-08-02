@@ -67,6 +67,92 @@ type SecurityPolicy interface {
 	RefreshIngress(ipPath *IpPath)
 }
 
+// borrowedEgressSecurityPolicy is the built-in, allocation-free counterpart to
+// the public pointer API. A dynamic interface call is conservatively allowed to
+// retain its pointer argument, so passing a stack IpPath through SecurityPolicy
+// forces one heap object per packet even though the documented contract is
+// call-scoped. Built-ins accept the path by value; custom policies continue to
+// use the compatible public fallback below.
+type borrowedEgressSecurityPolicy interface {
+	inspectAndRefreshEgressBorrowed(
+		provideMode protocol.ProvideMode,
+		ipPath IpPath,
+		payload []byte,
+	) (SecurityPolicyResult, error)
+}
+
+func inspectAndRefreshEgressBorrowed(
+	policy SecurityPolicy,
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	if borrowed, ok := policy.(borrowedEgressSecurityPolicy); ok {
+		return borrowed.inspectAndRefreshEgressBorrowed(provideMode, ipPath, payload)
+	}
+	return inspectAndRefreshEgressFallback(policy, provideMode, ipPath, payload)
+}
+
+// Keep the address-taking fallback in a separate non-inlined function. Escape
+// analysis is flow-insensitive within a function; placing &ipPath in the fast
+// dispatcher would allocate its copy even when the built-in value interface
+// succeeds.
+//
+//go:noinline
+func inspectAndRefreshEgressFallback(
+	policy SecurityPolicy,
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	// An external implementation may retain a pointer despite the interface
+	// contract. Let only this fallback copy escape, never the caller's stack
+	// path.
+	result, err := policy.InspectEgress(provideMode, &ipPath, payload)
+	if err == nil {
+		policy.RefreshEgress(&ipPath)
+	}
+	return result, err
+}
+
+// borrowedIngressSecurityPolicy is the return-path counterpart to
+// borrowedEgressSecurityPolicy. The public pointer API remains available for
+// custom policies, while built-ins can inspect a packet-backed stack value
+// without forcing one heap IpPath per received packet.
+type borrowedIngressSecurityPolicy interface {
+	inspectAndRefreshIngressBorrowed(
+		provideMode protocol.ProvideMode,
+		ipPath IpPath,
+		payload []byte,
+	) (SecurityPolicyResult, error)
+}
+
+func inspectAndRefreshIngressBorrowed(
+	policy SecurityPolicy,
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	if borrowed, ok := policy.(borrowedIngressSecurityPolicy); ok {
+		return borrowed.inspectAndRefreshIngressBorrowed(provideMode, ipPath, payload)
+	}
+	return inspectAndRefreshIngressFallback(policy, provideMode, ipPath, payload)
+}
+
+//go:noinline
+func inspectAndRefreshIngressFallback(
+	policy SecurityPolicy,
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	result, err := policy.InspectIngress(provideMode, &ipPath, payload)
+	if err == nil {
+		policy.RefreshIngress(&ipPath)
+	}
+	return result, err
+}
+
 // egressRelationship combines the packet source's provide mode with the local
 // client's own provide mode into the single relationship the security policy
 // enforces on egress. ProvideMode is a set of flags with no ordinal meaning (see
@@ -136,6 +222,18 @@ func (self *securityPolicy) InspectEgress(provideMode protocol.ProvideMode, ipPa
 	return result, err
 }
 
+func (self *securityPolicy) inspectAndRefreshEgressBorrowed(
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	result, err := self.InspectEgress(provideMode, &ipPath, payload)
+	if err == nil {
+		self.RefreshEgress(&ipPath)
+	}
+	return result, err
+}
+
 func (self *securityPolicy) inspectEgress(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error) {
 	if protocol.ProvideMode_Network == provideMode {
 		return SecurityPolicyResultAllow, nil
@@ -178,6 +276,18 @@ func (self *securityPolicy) InspectIngress(provideMode protocol.ProvideMode, ipP
 	result, err := self.inspectIngress(provideMode, ipPath)
 	if ipPath != nil {
 		self.stats.AddSource(ipPath, result, 1)
+	}
+	return result, err
+}
+
+func (self *securityPolicy) inspectAndRefreshIngressBorrowed(
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	result, err := self.InspectIngress(provideMode, &ipPath, payload)
+	if err == nil {
+		self.RefreshIngress(&ipPath)
 	}
 	return result, err
 }
@@ -239,7 +349,23 @@ func (self *disableSecurityPolicy) InspectEgress(provideMode protocol.ProvideMod
 	return SecurityPolicyResultAllow, nil
 }
 
+func (self *disableSecurityPolicy) inspectAndRefreshEgressBorrowed(
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	return SecurityPolicyResultAllow, nil
+}
+
 func (self *disableSecurityPolicy) InspectIngress(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error) {
+	return SecurityPolicyResultAllow, nil
+}
+
+func (self *disableSecurityPolicy) inspectAndRefreshIngressBorrowed(
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
 	return SecurityPolicyResultAllow, nil
 }
 
@@ -268,8 +394,28 @@ func (self *reverseSecurityPolicy) InspectEgress(provideMode protocol.ProvideMod
 	return self.policy.InspectIngress(provideMode, ipPath, payload)
 }
 
+func (self *reverseSecurityPolicy) inspectAndRefreshEgressBorrowed(
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	result, err := self.policy.InspectIngress(provideMode, &ipPath, payload)
+	if err == nil {
+		self.policy.RefreshIngress(&ipPath)
+	}
+	return result, err
+}
+
 func (self *reverseSecurityPolicy) InspectIngress(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error) {
 	return self.policy.InspectEgress(provideMode, ipPath, payload)
+}
+
+func (self *reverseSecurityPolicy) inspectAndRefreshIngressBorrowed(
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	return inspectAndRefreshEgressBorrowed(self.policy, provideMode, ipPath, payload)
 }
 
 func (self *reverseSecurityPolicy) RefreshEgress(ipPath *IpPath) {

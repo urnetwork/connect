@@ -1096,3 +1096,309 @@ that 0 ms fails the volume criterion.
   deterministic client-side handoff tests pass locally.
 - P2P/WebRTC connections still need direct `NetworkChanged` kick lifecycle
   work; platform-route failover remains the current backstop.
+
+## 16. Network-peer + post-quantum data blackhole — the ForceStream sequence
+## fork (diagnosed on-device and fixed, 2026-07-25)
+
+Field report: two same-network peer Android devices (client Pixel 8 Pro,
+provider SM-S928U client_id 019f9833-2d1e-cb39-0d45-526f8c30ab3b), with the
+app's post-quantum encryption enabled, could never establish a usable peer
+connection. Grid stuck CONNECTING/looping; per-peer TLS handshakes VERIFIED on
+both ends ("peer identity proof verified — cipher is now usable") yet every
+window client was removed ~10-15s later with `Blackhole (0 0B)` and replaced —
+a new client id every 15s, indefinitely. A second variant on the same pair:
+`completeHandshake failed: tls handshake timeout after 1m0s` with ~1.3-1.4KB
+frames (a hybrid X25519MLKEM768 ClientHello) retransmitted every ~6s into a
+16KiB initial contract until timeout.
+
+Method (adb, both devices local): deployed a play-variant build with glog
+`v=1, vmodule=transfer=2`. The verbose capture localized the drop in minutes:
+
+- Client wrote wrapped data fine (`write wrapped 1379 -> 1451 bytes`).
+- Provider received and unwrapped fine (zero `unwrap err`).
+- Provider `[r]drop older sequence 019f985a-a69b... < 019f985a-a6a6...` —
+  an endless stream, every window-client cycle. The provider's ingress
+  security-policy stats stayed EMPTY: not one provided packet ever reached
+  the IP layer.
+
+Root cause (uuidv7 timestamps decoded the two sequence ids to their creation
+instants, 11ms apart, matching the client log exactly):
+
+- Same-network peers force `AllowDirect` on
+  (`RemoteUserNatMultiClient.overrideAllowDirect`: ProvideMode_Network →
+  forceAllowDirect(true)), so the multi-client data path sends with the
+  `ForceStream()` transfer option (`ip_remote_multi_client.go` send + ping).
+- The post-quantum toggle (`PerformanceProfile.PostQuantumEncryption`) sets
+  `EncryptionSettings.Encrypt = true`, which adds per-peer TLS sessions whose
+  handshake flights ride `SendBuffer.SendEncryptedControl` — which mirrored
+  `DefaultTransferOpts` (ForceStream=false).
+- `ForceStream` is part of `sendSequenceId` (the send-sequence key) but is
+  INVISIBLE on the wire. The data Pack (fs=true) and the ClientHello Pack
+  (fs=false) therefore minted two live send sequences whose frames are
+  indistinguishable at the receiver — same source, no role stamp (both
+  client-role), no companion stamp — so both map to one receive head slot
+  `(source, server, c=false)`. Head supersession keeps the newest sequence id
+  and drops the other's packs forever, un-acked.
+- Whichever sequence loses is the symptom: data minted first → data evicted →
+  handshake green, zero data, `Blackhole (0 0B)` (the 15s loop); ClientHello
+  carrier minted first → CH evicted → 1m handshake timeout with CH
+  retransmits churning the 16KiB initial contract (the a71e↔6b1c wedge).
+  The provider-side return-handshake flakiness (3/10) was downstream: no
+  forward data → usually nothing to send back → no return sequence.
+- PQ off → no EncryptedControl → no second sequence → works. Non-peer
+  providers default AllowDirect off → no fork → PQ works there. The failure
+  is exactly the intersection: network peer (AllowDirect) ∧ PQ.
+
+Fix (connect): the EncryptedControl carrier must select the SAME send
+sequence as the application data for the peer.
+
+- `peerEncryptionSession.carrierForceStream` (atomic.Bool) — the ForceStream
+  option of the most recent acquiring send sequence.
+- `EncryptionSessionManager.AcquireForSend(peer, role, companion,
+  forceStream)` stores it BEFORE the client-role handshake restart, so even
+  the first ClientHello rides the data path's sequence.
+- `SendBuffer.SendEncryptedControl(..., forceStream)` applies it:
+  `opts.ForceStream = forceStream && !contractCompanion` (companion carriers
+  stay off streams — the platform rejects companion stream contracts).
+- The `[r]drop older sequence` / `[r]upgrade older sequence` V(2) logs now
+  include (source, role, companion): a PERSISTENT drop-older stream for one
+  source is the tripwire signature of any future sender-side key fork.
+- Regression test: `TestEncryptedControlCarrierMirrorsForceStream` (carrier
+  lands on the fs=true sequence, exactly one sequence to the peer, companion
+  carrier never requests a stream, last-acquirer-wins retune).
+
+Post-stream note: once the platform assigns a pair stream, stream-bound data
+frames carry the stream id in the path and key a separate receive slot — the
+collision only lives in the pre-stream window, which is exactly where every
+new window client (and therefore every peer connect with PQ) starts.
+
+Lesson: any option that keys the send sequence but does not appear on the
+wire (today: ForceStream, CompanionContract-without-encryption-companion) is
+a foot-gun — two live same-key-looking sequences at the receiver are
+indistinguishable and one gets silently starved. The receive-side drop-older
+path deliberately stays supersede-only; the invariant is enforced on the
+sender: everything to a peer that must interleave rides one sequence.
+
+Follow-ups for the team:
+- Consider a receive-side tripwire (count persistent drop-older per head slot,
+  Errorf once) — cheap detection for future forks.
+- The 16KiB initial contract is ~9 PQ ClientHello retransmits; with the fork
+  fixed the CH is acked on the first delivery, but a lost-peer wedge still
+  churns one contract per TlsTimeout window (accepted; see the TlsTimeout=60s
+  bound rationale in transfer_encrypt.go).
+
+§16 verification addendum (2026-07-25): fix deployed to both devices as
+2026.7.25 play arm64 builds at normal verbosity. The Pixel↔Samsung peer
+connection with post-quantum encryption now establishes on the first window
+client and stays CONNECTED (soaked 10+ minutes, zero Blackhole removals, zero
+drop-older events, provider ingress policy counting provided traffic, page
+loads passing ~906KB back through the peer in the verbose interim build).
+Regression tests: `TestEncryptedControlCarrierMirrorsForceStream` (unit,
+carrier/sequence-key contract) and `TestSendReceiveEncryptedForceStreamData`
+(e2e two-client, Encrypt=true + ForceStream data, both ForceStream contract
+keys served like the platform does; validated to FAIL against the pre-fix
+carrier and pass with the fix; includes a 60s zero-delivery starvation guard
+and a final single-client-role-sequence assertion). Full connect suite green
+(479s) and sdk suite green (the one TestDeviceLocalReconfigurationChurn
+failure reproduced only under concurrent xcodebuild CPU contention — passes
+clean in 8s on a quiet machine). AAR + xcframework rebuilt with the fix
+(NOTE: never run make build_apple and the gradle buildSdk concurrently — the
+shared sdk/build tree corrupts the xcframework swap, observed again today).
+
+## 17. Device-to-device (network peer) performance — the WAN-relay
+## bottleneck and p2p never connecting (in progress, 2026-07-25)
+
+Field report: device-to-device / network-peer connection performance is
+sub-optimal (slow). Two Android devices on the same premises (Pixel 8 Pro
+client 019f9835-6b1c…, SM-S928U provider 019f9833-2d1e…) with post-quantum
+encryption enabled.
+
+### Baseline (measured, instrumented v=1 play build, both devices local)
+
+- **Throughput: 0.54 MiB/s (4.49 Mbit/s)** — measured as tun1 rx-byte delta
+  over 10s of a sustained synthetic download through the peer.
+- **Path: 100% relayed through the platform over the WAN.** p2p/webrtc NEVER
+  connects (0 `stable` ICE handshakes on either device across the whole
+  session, for ANY peer). All peer traffic goes device → platform relay
+  (65.49.70.85, ~59 ms RTT from the mac; the phones can't ICMP it but the
+  data path rides it) → device.
+- **Direct UDP between the two devices WORKS both directions** (nc test:
+  192.168.1.217 ↔ 192.168.2.110, double-NAT but mutually routable, ~8 ms).
+  So p2p SHOULD be achievable — this is not a topology block.
+
+The 15× latency gap (direct ~8 ms vs relay ~118 ms round trip) and the relay's
+own capacity are the throughput ceiling. Getting onto the direct path is the
+single biggest lever for both latency and speed.
+
+### Why p2p never connects (diagnosis)
+
+- STUN was dead in the shipping build: `openrelay.metered.ca` and
+  `stun.stunprotocol.org` are defunct; every gather burned a multi-second i/o
+  timeout. FIXED — replaced with `stun.cloudflare.com` + Google STUN; on-device
+  STUN errors dropped from a storm to ~1.
+- Even with live STUN, 0 handshakes reach `stable`. Signal-flow analysis
+  (added `[signal]send`/`[signal]receive` V(1) traces): the Pixel window
+  client (019f9a03) sends 37 `WaitingForSdpOffer` to the Samsung and the
+  Samsung RECEIVES all 37 — but the Samsung (the active offerer for that
+  stream) sends 0 offers back to it. The Samsung's 192 offers all go to a
+  DIFFERENT set of peers (the Pixel's MAIN id 019f9835 + two stale ids from
+  the prior Auto-mode session), none of which has a passive waiter → 0
+  answers → 0 stable.
+- Prime suspect: the provider-side peer-connection cap
+  (`WebRtcSettings.MaxPeerConnectionCount` = `MemoryScaledCount(32, 8)`, as
+  low as 8 on a phone) plus the memory-budget admission in
+  `WebRtcManager.newP2pConn` REFUSE new setups when stale/wedged conns from
+  the earlier session hold the slots — and the refusal in `P2pTransport.run`
+  was SILENT (bare retry with no log). Instrumented now: `[p2p]…setup
+  refused = …`. A provider whose slots are held by never-completing conns
+  starves real streams onto the relay with no visible signal.
+
+### Instrumentation added this pass
+
+- `[signal]send ->` / `[signal]send failed` / `[signal]receive from` (V(1))
+  in `ClientSignalSender.SendSignal` + `clientSignalReceiver.handleControlFrame`
+  — the full p2p signal-delivery trace.
+- `[p2p]…setup refused = <err>` (info) in `P2pTransport.run` — surfaces the
+  previously silent cap/budget refusal.
+- `[r]drop/upgrade older sequence` elevated V(2)→V(1) (rare, cheap; the
+  sender-fork tripwire from §16).
+
+### Synthetic speed test (new, ip_synthetic_speed.go)
+
+To drive a repeatable packet rush isolated from origin/network variability,
+the provider NAT now terminates TCP flows to the RFC 2544 benchmark range
+198.18.0.0/15 at an in-memory HTTP/1.1 server (`EnableSyntheticSpeed`, on by
+default; the range is reserved and never publicly routable). `GET
+/download/<bytes>` streams patterned bytes, `POST` sinks an upload,
+`GET /ping` is a 1-byte flow-setup probe. The full tunnel path — tun, per-peer
+encryption, transfer sequences, transports, provider NAT — is exercised; only
+the upstream internet hop is replaced. Verified end-to-end through the peer
+(provider logs `[init]tcp connect synthetic 198.18.0.1:80`).
+
+### Root cause CONFIRMED and fixed (2026-07-25)
+
+The `[p2p]…setup refused` instrumentation nailed it: every p2p setup on the
+provider (and the client's window clients) is refused with
+
+  `peer connection memory budget exhausted (149796 < 524288)`
+
+The WebRTC peer-connection admission budget was the SAME object as the
+transfer receive-queue budget (`WebRtcSettings.MemoryBudget =
+receiveQueueBudget`, at all four wiring sites in device_local.go /
+device_local_provider.go). Each peer connection reserves `ReceiveBufferSize`
+= 512 KiB. On a 20 MiB device target the provider share is 4 MiB → receive
+queue budget ~1.14 MiB, and during a download the receive queue legitimately
+consumes it (available fell to ~146 KiB). So a 512 KiB reservation could
+NEVER be admitted while traffic flowed — the exact moment p2p is needed. A
+catch-22: no p2p → all traffic relays → receive queue stays busy → p2p stays
+refused. Even idle, one 512 KiB reservation barely fits and two never do.
+Result: **p2p never connects; 100% WAN relay; 0.54 MiB/s.**
+
+Fix (sdk):
+- **Dedicated p2p admission budget** (`deviceLocalWebRtcBudget`), separate
+  from the receive queue, sized `max(share/8, 4×buffer)` — client ~1.75 MiB,
+  provider 512 KiB. It gates admission only; the SCTP memory a formed
+  connection uses is unchanged, so no steady-state footprint is added beyond
+  connections that actually establish.
+- **Phone-sized SCTP receive buffer** `deviceLocalP2pReceiveBufferByteCount`
+  = 128 KiB (was 512 KiB). A same-premises ~8 ms LAN link has a BDP well
+  under 128 KiB even at hundreds of Mbit/s, so this costs no p2p throughput
+  while quartering the per-connection reservation — the dedicated budget now
+  admits ~4-14 concurrent peers.
+- Applied at all four wiring sites (client default + override + window-client
+  generator + provider), guarded to mobile (`0 < share`); desktop/server keep
+  the 512 KiB unbudgeted default.
+- STUN servers replaced (dead openrelay/stunprotocol → cloudflare + google).
+- Regression: `TestDeviceLocalSettingsMemoryTarget` now asserts the dedicated
+  budget (≠ receive queue) admits ≥2 peer connections.
+
+Measured verification: (pending device redeploy — see the addendum below)
+
+### Measured after the budget fix (2026-07-25)
+
+- **Throughput: 0.54 → 0.79 MiB/s (+46%)** on the relay path (reduced memory
+  pressure + phone-sized p2p buffers). Still relayed — see below.
+- The budget refusal changed from `(149796 < 524288)` to
+  `(0 < 131072)`: the reservation is now the phone-sized 128 KiB and several
+  fit the dedicated budget, but the admitted p2p connections still don't
+  complete the ICE handshake (0 `stable` on either device).
+
+### Remaining lead (NOT yet fixed): p2p ICE rendezvous in the resident/window
+### architecture
+
+With admission fixed, p2p still never reaches `stable`. Signal-level trace
+(pion vmodule=2) shows the deeper failure:
+
+- Both devices only ever reach `have-local-offer`; NEITHER reaches
+  `have-remote-offer`. Both the client and the provider act as ACTIVE
+  offerers for the peer connection — the offers land on the peer's ACTIVE
+  conn (which ignores SdpOffer by design) instead of a PASSIVE waiter.
+- 16 `[signal]miss` on the provider: signals arrive keyed
+  `{PeerId: source.SourceId, StreamId}` with no matching peerConn — the
+  passive waiter was torn down (window/resident churn) or never created for
+  that (source, stream).
+- The client's offers to the provider-side ephemeral residents (019f9a…)
+  send successfully (`[signal]send failed` = 0) but the residents log 0
+  `[signal]receive from <client-main>` — the offer does not reach the
+  intended passive peerConn.
+- Net: only 1 SdpOffer / 1 SdpAnswer were ever processed across the whole
+  session; the rendezvous is racy and mostly misses.
+
+This is a distinct bug from the budget starvation, rooted in how the
+multi-client window clients and their per-connection residents assign
+(peer, stream) identities and route ExchangeSignals — the ephemeral ids churn
+faster than an offer→answer→ICE→datachannel handshake completes, and the
+active/passive role for a given (peer, stream) does not consistently pair.
+Fixing it likely spans the server-side resident/stream setup (id stability +
+role assignment) and is scoped as follow-up. Until then, network-peer traffic
+between double-NATed devices rides the WAN relay.
+
+Instrumentation kept in-tree for the follow-up: `[signal]send/receive`,
+`[signal]miss` (V2), `[p2p]…setup refused`, and the RFC-2544 synthetic speed
+server (`EnableSyntheticSpeed`, on by default) for repeatable measurement.
+
+### Rendezvous fix landed + verified (2026-07-25); final blocker isolated
+
+Applied the candidate fix — the active p2p side now sends its SdpOffer with
+`ForceStream()` (transport_p2p_webrtc.go `sendSignal`), matching the stream
+contract the network-peer data rides. On-device result: the initiator now
+reaches `have-remote-offer` and `stable` (0 → 2), i.e. the SDP offer/answer
+completes where before every offer to the ephemeral provider client was
+undeliverable. The §16-class alignment holds: a send-sequence-keying option
+(ForceStream) invisible to the signaling layer must match the data path.
+
+But p2p STILL does not connect end-to-end, now for a DIFFERENT and final
+reason: **0 ICE candidates are gathered on Android.** pion logs "no usable
+interfaces found for mDNS" and emits no host/srflx candidates, so no
+candidate pair is ever checked (ICE never leaves gathering). Root cause: the
+Android app builds the VpnService with `setUnderlyingNetworks(null)` and
+passes NO socket-protect callback into the SDK, so pion's ICE UDP sockets are
+never `VpnService.protect`'d — inside the VPN app they cannot bind to / see
+the physical wlan0 and only the excluded tun is visible. The egress code even
+assumes "Android VpnService.protect solves this at the OS layer"
+(egress.go) — but nothing protects pion's Go-created sockets. **Android p2p
+has therefore never gathered candidates; all peer traffic has always fallen
+back to the WAN relay.** (Direct UDP between the two devices works from the
+shell, confirming the topology supports it — only the in-app ICE sockets are
+blocked.)
+
+Final blocker fix design (multi-repo, scoped as the next task; too large to
+land + validate safely in this pass because it touches the core tunnel):
+1. Android: a protect callback `fd -> vpnService.protect(fd)` (and expose the
+   underlying `Network`), passed into the SDK at device construction.
+2. SDK: plumb it to connect's `WebRtcSettings` (a socket-control hook).
+3. connect: an Android `transport.Net` (mirroring `egressNet`, currently
+   Windows-only) installed via `SettingEngine.SetNet`, that protects each ICE
+   socket fd on creation so it egresses wlan0 instead of the tun.
+Then the budget + STUN + rendezvous fixes already landed let p2p complete, and
+device-to-device drops from the ~118 ms WAN relay to the ~8 ms direct LAN path
+(the latency + throughput win).
+
+### Net delivered this pass (measured)
+- Relay-path throughput **0.54 → 0.79 MiB/s (+46%)** (budget + phone p2p buffer
+  sizing reducing memory pressure).
+- p2p unblocked through admission (budget), reflexive candidates (STUN), and
+  SDP rendezvous (ForceStream, 0 → 2 `stable` on-device) — the full chain up
+  to the Android socket-protect blocker, which is now precisely isolated with
+  a concrete fix design.
+- Synthetic RFC-2544 speed server for repeatable in-tunnel measurement.

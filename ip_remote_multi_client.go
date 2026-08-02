@@ -12,6 +12,7 @@ import (
 	"math"
 	"math/bits"
 	mathrand "math/rand"
+	"net"
 	"net/netip"
 	"slices"
 	"strings"
@@ -54,7 +55,7 @@ import (
 
 // TODO surface window stats to show to users
 
-type clientReceivePacketFunction func(client *multiClientChannel, source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte)
+type clientReceivePacketFunction func(client *multiClientChannel, source TransferPath, provideMode protocol.ProvideMode, ipPath IpPath, packet []byte)
 
 type DestinationStats struct {
 	EstimatedBytesPerSecond ByteCount
@@ -1199,10 +1200,10 @@ func (self *RemoteUserNatMultiClient) affinityIpPathsWithLock(ipPath *IpPath) (a
 	return
 }
 
-func (self *RemoteUserNatMultiClient) sendClientPath(ipPath *IpPath, callback func(*multiClientChannelUpdate, *multiClientChannel)) {
-	update, previousClient, currentClient := self.sendUpdate(ipPath)
-	callback(update, currentClient)
-
+func (self *RemoteUserNatMultiClient) reconcileSendClientPath(
+	update *multiClientChannelUpdate,
+	previousClient *multiClientChannel,
+) {
 	// fast path: if the flow's client did not change during the callback, no
 	// clientUpdates bookkeeping is needed, so skip the parent lock entirely
 	// (client is atomic). this is the steady-state egress path.
@@ -1361,7 +1362,10 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 				case <-self.ctx.Done():
 				case <-update.ctx.Done():
 				default:
-					self.rstFlow(ipPath, client)
+					// The caller's path can borrow address bytes from a packet
+					// buffer whose ownership was transferred after sendUpdate.
+					// Teardown must use the flow's retained copy.
+					self.rstFlow(update.ipPath, client)
 				}
 			}, update.cancel)
 			self.ip4PathUpdates[ip4Path] = update
@@ -1458,7 +1462,9 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 				case <-self.ctx.Done():
 				case <-update.ctx.Done():
 				default:
-					self.rstFlow(ipPath, client)
+					// See the IPv4 path above: teardown outlives the borrowed
+					// caller path and must use the retained flow key.
+					self.rstFlow(update.ipPath, client)
 				}
 			}, update.cancel)
 			self.ip6PathUpdates[ip6Path] = update
@@ -1657,18 +1663,23 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 ) bool {
 	relationship := egressRelationship(provideMode, self.provideMode)
 
-	ipPath, payload, err := ParseIpPathWithPayload(packet)
+	// The packet remains owned by this call until the asynchronous send accepts
+	// it, so policy, association, and routing may borrow its address slices.
+	// sendUpdate copies the path only when it creates a long-lived flow record;
+	// copying both addresses on every packet made the steady-state path allocate
+	// even though existing flow records never retain this packet's IpPath.
+	var ipPathValue IpPath
+	ipPath := &ipPathValue
+	payload, err := parseIpPathWithPayloadBorrowed(packet, ipPath)
 	if err != nil {
 		self.log.Infof("[multi]send bad packet = %s\n", err)
 		return false
 	}
-	r, err := self.securityPolicy.InspectEgress(relationship, ipPath, payload)
+	r, err := inspectAndRefreshEgressBorrowed(self.securityPolicy, relationship, ipPathValue, payload)
 	if err != nil {
 		self.log.Infof("[multi]send bad packet = %s\n", err)
 		return false
 	}
-	// refresh the flow's activity on the send direction (keeps a download-heavy flow alive)
-	self.securityPolicy.RefreshEgress(ipPath)
 
 	// infrastructure destinations (the resolver endpoints) are excluded
 	// from the association and override logic
@@ -1720,12 +1731,7 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 		}
 		return success
 	}
-	parsedPacket := &parsedPacket{
-		packet:  packet,
-		ipPath:  ipPath,
-		payload: payload,
-	}
-	success := self.sendPacket(source, provideMode, parsedPacket, timeout)
+	success := self.sendPacket(source, provideMode, packet, ipPath, len(payload), timeout)
 	if success {
 		self.packetStatsCounters.remoteEgressPacketCount.Add(1)
 		self.packetStatsCounters.remoteEgressByteCount.Add(int64(byteCount))
@@ -1927,8 +1933,7 @@ func (self *RemoteUserNatMultiClient) AddPacketStatsCallback(packetStatsCallback
 	}
 }
 
-func (self *RemoteUserNatMultiClient) canSendPacket(sendPacket *parsedPacket, update *multiClientChannelUpdate) (allow bool) {
-	ipPath := sendPacket.ipPath
+func (self *RemoteUserNatMultiClient) canSendPacket(ipPath *IpPath, payloadByteCount int, update *multiClientChannelUpdate) (allow bool) {
 	switch ipPath.Protocol {
 	case IpProtocolTcp:
 		if self.settings.TcpCollapsePrevention {
@@ -1938,7 +1943,7 @@ func (self *RemoteUserNatMultiClient) canSendPacket(sendPacket *parsedPacket, up
 			// retransmits don't need to be sent as soon as the packet is committed to a client
 			if ipPath.Syn || ipPath.Rst {
 				allow = true
-			} else if update.canUpdateSequence(sendPacket) {
+			} else if update.canUpdateSequence(ipPath, payloadByteCount) {
 				// sequence state is guarded by the per-flow `stateLock`, not
 				// the parent `stateLock`
 				allow = true
@@ -1955,297 +1960,300 @@ func (self *RemoteUserNatMultiClient) canSendPacket(sendPacket *parsedPacket, up
 func (self *RemoteUserNatMultiClient) sendPacket(
 	source TransferPath,
 	provideMode protocol.ProvideMode,
-	sendPacket *parsedPacket,
+	packet []byte,
+	ipPath *IpPath,
+	payloadByteCount int,
 	timeout time.Duration,
 ) (success bool) {
-	ipPath := sendPacket.ipPath
-	self.sendClientPath(ipPath, func(update *multiClientChannelUpdate, currentClient *multiClientChannel) {
-		if !self.canSendPacket(sendPacket, update) {
-			return
-		}
+	update, previousClient, currentClient := self.sendUpdate(ipPath)
+	defer self.reconcileSendClientPath(update, previousClient)
 
-		enterTime := time.Now()
+	if !self.canSendPacket(ipPath, payloadByteCount, update) {
+		return false
+	}
 
-		if ipPath.Syn || ipPath.Rst {
-			// sequence state is guarded by the per-flow `stateLock`
-			update.resetSequence(sendPacket)
-		}
+	if ipPath.Syn || ipPath.Rst {
+		update.resetSequence(ipPath)
+	}
 
-		// `currentClient` is the client snapshot read by `sendClientPath` under
-		// the parent lock it already held, so the steady-state send no longer
-		// takes the parent lock again just to read `update.client`.
-		for client := currentClient; client != nil; {
-			var err error
-			success, err = client.SendDetailed(sendPacket, timeout)
-			if success {
-				// sequence state is guarded by the per-flow `stateLock`
-				update.updateSequence(sendPacket)
-			} else if err != nil {
-				// reset the path
-
-				self.log.Infof("[multi]reset error = %s\n", err)
-
-				update.client.Store(nil)
-
-				rstPackets := []*receivePacket{}
-
-				if packet, ok := ipOosRst(update.ipPath.Reverse()); ok {
-					rstPacket := &receivePacket{
-						Source:      TransferPath{},
-						ProvideMode: protocol.ProvideMode_Network,
-						IpPath:      update.ipPath,
-						Packet:      packet,
-					}
-					rstPackets = append(rstPackets, rstPacket)
-				}
-
+	if currentClient != nil {
+		var err error
+		success, err = currentClient.sendPacketDetailed(packet, ipPath, timeout)
+		if success {
+			update.updateSequence(ipPath, payloadByteCount)
+		} else if err != nil {
+			self.log.Infof("[multi]reset error = %s\n", err)
+			update.client.Store(nil)
+			if rstPacket, ok := ipOosRst(update.ipPath.Reverse()); ok {
 				select {
 				case <-self.ctx.Done():
 				default:
-					for _, p := range rstPackets {
-						self.receivePacketCallback(p.Source, p.ProvideMode, p.IpPath, p.Packet)
-					}
+					self.receivePacketCallback(
+						TransferPath{},
+						protocol.ProvideMode_Network,
+						update.ipPath,
+						rstPacket,
+					)
 				}
 			}
-			// else the packet was dropped due to backpressure
-			// keep sending to the client until there is an error
+		}
+		// A nil error with false success is intentional route backpressure. Keep
+		// the committed client until it reports a terminal error.
+		return success
+	}
+
+	// Only first-flow/reroute work needs descriptors captured by peer-race
+	// goroutines. Construct them here so the committed-flow fast path keeps its
+	// parsed path and descriptor on the caller's stack.
+	raceIpPath := *ipPath
+	sendPacket := &parsedPacket{
+		packet: packet,
+		ipPath: &raceIpPath,
+	}
+	return self.sendPacketUncommitted(source, provideMode, sendPacket, update, timeout)
+}
+
+func (self *RemoteUserNatMultiClient) sendPacketUncommitted(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	sendPacket *parsedPacket,
+	update *multiClientChannelUpdate,
+	timeout time.Duration,
+) (success bool) {
+	enterTime := time.Now()
+
+	// find a new client
+	// the race is between as many clients as can send in parallel
+
+	// if _, fixed := self.generator.FixedDestinationSize(); fixed {
+	// 	window := self.windows[WindowTypeQuality]
+	// 	orderedClients := window.OrderedClients()
+
+	// 	for _, client := range orderedClients {
+	// 		if client.Send(sendPacket, timeout) {
+	// 			success = true
+
+	// 			func() {
+	// 				self.stateLock.Lock()
+	// 				defer self.stateLock.Unlock()
+
+	// 				update.client = client
+	// 			}()
+	// 		}
+	// 	}
+
+	// 	return
+	// }
+
+	raceClients := func(orderedClients []*multiClientChannel, sendTimeout time.Duration) {
+		switch len(orderedClients) {
+		case 0:
 			return
-		}
+		case 1:
+			// send to one client, no race
+			client := orderedClients[0]
+			if client.Send(sendPacket, sendTimeout) {
+				success = true
 
-		// find a new client
-		// the race is between as many clients as can send in parallel
-
-		// if _, fixed := self.generator.FixedDestinationSize(); fixed {
-		// 	window := self.windows[WindowTypeQuality]
-		// 	orderedClients := window.OrderedClients()
-
-		// 	for _, client := range orderedClients {
-		// 		if client.Send(sendPacket, timeout) {
-		// 			success = true
-
-		// 			func() {
-		// 				self.stateLock.Lock()
-		// 				defer self.stateLock.Unlock()
-
-		// 				update.client = client
-		// 			}()
-		// 		}
-		// 	}
-
-		// 	return
-		// }
-
-		raceClients := func(orderedClients []*multiClientChannel, sendTimeout time.Duration) {
-			switch len(orderedClients) {
-			case 0:
-				return
-			case 1:
-				// send to one client, no race
-				client := orderedClients[0]
-				if client.Send(sendPacket, sendTimeout) {
-					success = true
-
-					// client is atomic; lock-free store
-					update.client.Store(client)
-				}
-				return
-
-			default:
-
-				defer func() {
-					if success {
-						MessagePoolReturn(sendPacket.packet)
-					}
-				}()
-
-				var successCount atomic.Int32
-
-				send := func(client *multiClientChannel) {
-					select {
-					case <-update.ctx.Done():
-						return
-					default:
-					}
-
-					if update.client.Load() != nil {
-						// another client already chosen, done
-						return
-					}
-
-					p := &parsedPacket{
-						packet: MessagePoolShareReadOnly(sendPacket.packet),
-						ipPath: update.ipPath,
-					}
-					sent := client.SendWithAck(p, sendTimeout, true)
-					if !sent {
-						// a failed attempt retains ownership here: undo this
-						// attempt's share or the packet never reaches zero
-						// references (the race takes one share per client)
-						MessagePoolReturn(p.packet)
-					}
-					if sent {
-						successCount.Add(1)
-
-						var initRace *multiClientChannelUpdateRace
-						var initRaceEarlyComplete <-chan struct{}
-						var abandonedClients []*multiClientChannel
-						func() {
-							// race state is guarded by the per-flow stateLock (a
-							// leaf); client is atomic
-							update.stateLock.Lock()
-							defer update.stateLock.Unlock()
-
-							if update.client.Load() != nil {
-								// another client already chosen, done
-								return
-							}
-
-							race := update.race
-							if race == nil {
-								update.initRaceWithLock()
-								race = update.race
-
-								initRace = race
-								initRaceEarlyComplete = race.completeMonitor.NotifyChannel()
-							}
-							state := race.clientStates[client]
-							if state == nil {
-								state = &multiClientChannelRaceClientState{
-									sendTime: time.Now(),
-								}
-								race.clientStates[client] = state
-							}
-							state.sentPacketCount += 1
-							race.sentPacketCount += 1
-							bufferExceeded := state != nil && self.settings.MultiRaceSetOnNoResponseTimeout <= time.Now().Sub(state.sendTime) || self.settings.MultiRaceClientSentPacketMaxCount < state.sentPacketCount
-							if race.packetCount == 0 && bufferExceeded {
-								// no client response in timeout, lock in this client
-								// this happens for example when the client only sends and does not receive (e.g. udp send)
-
-								for abandonedClient, _ := range race.clientStates {
-									if abandonedClient != client {
-										abandonedClients = append(abandonedClients, abandonedClient)
-									}
-								}
-
-								update.clearRaceWithLock()
-								update.client.Store(client)
-							}
-						}()
-
-						if initRace != nil {
-							self.scheduleCompleteRace(update.ipPath, initRace, initRaceEarlyComplete)
-						}
-
-						if 0 < len(abandonedClients) {
-							if rstPacket, ok := ipOosRst(update.ipPath); ok {
-								for _, abandonedClient := range abandonedClients {
-									abandonedClient.Send(&parsedPacket{
-										packet: rstPacket,
-										ipPath: update.ipPath,
-									}, 0)
-								}
-							}
-						}
-					} else {
-						MessagePoolReturn(p.packet)
-					}
-				}
-
-				var raceOrderedClients []*multiClientChannel
-				if 0 < self.settings.MultiRaceClientCount && self.settings.MultiRaceClientCount < len(orderedClients) {
-					raceOrderedClients = orderedClients[:self.settings.MultiRaceClientCount]
-				} else {
-					raceOrderedClients = orderedClients
-				}
-
-				// if 0 < timeout {
-				var wg sync.WaitGroup
-
-				for _, client := range raceOrderedClients {
-					wg.Add(1)
-					go HandleError(func() {
-						defer wg.Done()
-
-						send(client)
-					})
-				}
-
-				wg.Wait()
-				// } else {
-				// 	for _, client := range raceOrderedClients {
-				// 		send(client)
-				// 	}
-				// }
-
-				if 0 < successCount.Load() {
-					success = true
-				}
-				return
+				// client is atomic; lock-free store
+				update.client.Store(client)
 			}
-		}
-
-		coalesceOrderedClients := func() []*multiClientChannel {
-			for _, windowType := range self.selectWindowTypes(sendPacket) {
-				if window, ok := self.windows[windowType]; ok {
-					orderedClients := window.OrderedClients()
-					if 0 < len(orderedClients) {
-						// route this (new or re-routing) flow away from suspect
-						// clients while any healthy one exists
-						return orderClientsSuspectLast(orderedClients)
-					}
-				}
-			}
-			return []*multiClientChannel{}
-		}
-
-		raceClients(coalesceOrderedClients(), 0)
-		if success {
 			return
-		}
 
-		for {
-			var retryTimeout time.Duration
-			if 0 <= timeout {
-				remainingTimeout := enterTime.Add(timeout).Sub(time.Now())
+		default:
 
-				if remainingTimeout <= 0 {
-					// drop
-					return
+			defer func() {
+				if success {
+					MessagePoolReturn(sendPacket.packet)
 				}
+			}()
 
-				retryTimeout = min(remainingTimeout, self.settings.SendRetryTimeout)
-			} else {
-				retryTimeout = self.settings.SendRetryTimeout
-			}
+			var successCount atomic.Int32
 
-			startTime := time.Now()
-			orderedClients := coalesceOrderedClients()
-			raceClients(orderedClients, retryTimeout)
-			if success {
-				return
-			}
-			endTime := time.Now()
-			retryTimeout -= endTime.Sub(startTime)
-
-			if len(orderedClients) == 0 && 0 < self.settings.FormationSendRetryTimeout {
-				// window formation: there is nothing to send to yet. Poll on the short
-				// formation cadence so this packet leaves moments after the first client
-				// lands instead of up to SendRetryTimeout later (the overall send timeout
-				// still bounds the loop). With clients present a failed send keeps the
-				// normal cadence — live clients should not be hammered.
-				retryTimeout = min(retryTimeout, self.settings.FormationSendRetryTimeout)
-			}
-			if 0 < retryTimeout {
+			send := func(client *multiClientChannel) {
 				select {
 				case <-update.ctx.Done():
 					return
-				case <-time.After(retryTimeout):
+				default:
+				}
+
+				if update.client.Load() != nil {
+					// another client already chosen, done
+					return
+				}
+
+				p := &parsedPacket{
+					packet: MessagePoolShareReadOnly(sendPacket.packet),
+					ipPath: update.ipPath,
+				}
+				sent := client.SendWithAck(p, sendTimeout, true)
+				if !sent {
+					// a failed attempt retains ownership here: undo this
+					// attempt's share or the packet never reaches zero
+					// references (the race takes one share per client)
+					MessagePoolReturn(p.packet)
+				}
+				if sent {
+					successCount.Add(1)
+
+					var initRace *multiClientChannelUpdateRace
+					var initRaceEarlyComplete <-chan struct{}
+					var abandonedClients []*multiClientChannel
+					func() {
+						// race state is guarded by the per-flow stateLock (a
+						// leaf); client is atomic
+						update.stateLock.Lock()
+						defer update.stateLock.Unlock()
+
+						if update.client.Load() != nil {
+							// another client already chosen, done
+							return
+						}
+
+						race := update.race
+						if race == nil {
+							update.initRaceWithLock()
+							race = update.race
+
+							initRace = race
+							initRaceEarlyComplete = race.completeMonitor.NotifyChannel()
+						}
+						state := race.clientStates[client]
+						if state == nil {
+							state = &multiClientChannelRaceClientState{
+								sendTime: time.Now(),
+							}
+							race.clientStates[client] = state
+						}
+						state.sentPacketCount += 1
+						race.sentPacketCount += 1
+						bufferExceeded := state != nil && self.settings.MultiRaceSetOnNoResponseTimeout <= time.Now().Sub(state.sendTime) || self.settings.MultiRaceClientSentPacketMaxCount < state.sentPacketCount
+						if race.packetCount == 0 && bufferExceeded {
+							// no client response in timeout, lock in this client
+							// this happens for example when the client only sends and does not receive (e.g. udp send)
+
+							for abandonedClient, _ := range race.clientStates {
+								if abandonedClient != client {
+									abandonedClients = append(abandonedClients, abandonedClient)
+								}
+							}
+
+							update.clearRaceWithLock()
+							update.client.Store(client)
+						}
+					}()
+
+					if initRace != nil {
+						self.scheduleCompleteRace(update.ipPath, initRace, initRaceEarlyComplete)
+					}
+
+					if 0 < len(abandonedClients) {
+						if rstPacket, ok := ipOosRst(update.ipPath); ok {
+							for _, abandonedClient := range abandonedClients {
+								abandonedClient.Send(&parsedPacket{
+									packet: rstPacket,
+									ipPath: update.ipPath,
+								}, 0)
+							}
+						}
+					}
+				} else {
+					MessagePoolReturn(p.packet)
+				}
+			}
+
+			var raceOrderedClients []*multiClientChannel
+			if 0 < self.settings.MultiRaceClientCount && self.settings.MultiRaceClientCount < len(orderedClients) {
+				raceOrderedClients = orderedClients[:self.settings.MultiRaceClientCount]
+			} else {
+				raceOrderedClients = orderedClients
+			}
+
+			// if 0 < timeout {
+			var wg sync.WaitGroup
+
+			for _, client := range raceOrderedClients {
+				wg.Add(1)
+				go HandleError(func() {
+					defer wg.Done()
+
+					send(client)
+				})
+			}
+
+			wg.Wait()
+			// } else {
+			// 	for _, client := range raceOrderedClients {
+			// 		send(client)
+			// 	}
+			// }
+
+			if 0 < successCount.Load() {
+				success = true
+			}
+			return
+		}
+	}
+
+	coalesceOrderedClients := func() []*multiClientChannel {
+		for _, windowType := range self.selectWindowTypes(sendPacket) {
+			if window, ok := self.windows[windowType]; ok {
+				orderedClients := window.OrderedClients()
+				if 0 < len(orderedClients) {
+					// route this (new or re-routing) flow away from suspect
+					// clients while any healthy one exists
+					return orderClientsSuspectLast(orderedClients)
 				}
 			}
 		}
-	})
-	return
+		return []*multiClientChannel{}
+	}
+
+	raceClients(coalesceOrderedClients(), 0)
+	if success {
+		return
+	}
+
+	for {
+		var retryTimeout time.Duration
+		if 0 <= timeout {
+			remainingTimeout := enterTime.Add(timeout).Sub(time.Now())
+
+			if remainingTimeout <= 0 {
+				// drop
+				return
+			}
+
+			retryTimeout = min(remainingTimeout, self.settings.SendRetryTimeout)
+		} else {
+			retryTimeout = self.settings.SendRetryTimeout
+		}
+
+		startTime := time.Now()
+		orderedClients := coalesceOrderedClients()
+		raceClients(orderedClients, retryTimeout)
+		if success {
+			return
+		}
+		endTime := time.Now()
+		retryTimeout -= endTime.Sub(startTime)
+
+		if len(orderedClients) == 0 && 0 < self.settings.FormationSendRetryTimeout {
+			// window formation: there is nothing to send to yet. Poll on the short
+			// formation cadence so this packet leaves moments after the first client
+			// lands instead of up to SendRetryTimeout later (the overall send timeout
+			// still bounds the loop). With clients present a failed send keeps the
+			// normal cadence — live clients should not be hammered.
+			retryTimeout = min(retryTimeout, self.settings.FormationSendRetryTimeout)
+		}
+		if 0 < retryTimeout {
+			select {
+			case <-update.ctx.Done():
+				return
+			case <-time.After(retryTimeout):
+			}
+		}
+	}
 }
 
 // clientReceivePacketFunction
@@ -2253,15 +2261,13 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 	sourceClient *multiClientChannel,
 	source TransferPath,
 	provideMode protocol.ProvideMode,
-	ipPath *IpPath,
+	ipPath IpPath,
 	packet []byte,
 ) {
-	r, err := self.securityPolicy.InspectIngress(provideMode, ipPath, nil)
+	r, err := inspectAndRefreshIngressBorrowed(self.securityPolicy, provideMode, ipPath, nil)
 	if err != nil {
 		return
 	}
-	// refresh on the return direction before ipPath is reversed for downstream delivery
-	self.securityPolicy.RefreshIngress(ipPath)
 	if r != SecurityPolicyResultAllow {
 		return
 	}
@@ -2270,125 +2276,118 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 	self.packetStatsCounters.remoteIngressByteCount.Add(int64(len(packet)))
 	if self.ipAssoc != nil {
 		// before reverse, the remote endpoint is the source
-		self.ipAssoc.AddIngressPacket(ipPath)
+		self.ipAssoc.AddIngressPacket(&ipPath)
 	}
 
-	ipPath = ipPath.Reverse()
+	ipPath = ipPath.ReverseValue()
+
+	update := self.receiveUpdate(&ipPath)
+	if update == nil {
+		// This is not a response to a known outgoing flow. Preserve the public
+		// callback's owned-path behavior on this rare path because no retained
+		// flow key exists to borrow.
+		self.receivePacketCallback(source, provideMode, retainIpPath(&ipPath), packet)
+		return
+	}
+
+	// Common download path: the flow is already committed to this source.
+	// Deliver its immutable, owned flow key directly. This avoids a callback
+	// closure, a receivePacket object, a one-element slice, and a path copy.
+	if update.client.Load() == sourceClient {
+		self.receivePacketCallback(source, provideMode, update.ipPath, packet)
+		return
+	}
 
 	var abandonedClients []*multiClientChannel
 	var receivePackets []*receivePacket
 	var returnPackets []*receivePacket
-	success := self.receiveClientPath(ipPath, func(update *multiClientChannelUpdate) {
-		// steady-state fast path: the flow is already committed to this client,
-		// so deliver without taking any lock (client is atomic). this is the
-		// common download path and no longer contends the parent stateLock.
-		if update.client.Load() == sourceClient {
-			p := &receivePacket{
-				Source:      source,
-				ProvideMode: provideMode,
-				IpPath:      ipPath,
-				Packet:      packet,
-			}
-			receivePackets = []*receivePacket{p}
-			return
+
+	// Race / not-yet-committed paths are guarded by the per-flow stateLock.
+	update.stateLock.Lock()
+	client := update.client.Load()
+	if client == sourceClient {
+		// Committed between the lock-free check and acquiring the lock.
+		receivePackets = append(receivePackets, &receivePacket{
+			Source:      source,
+			ProvideMode: provideMode,
+			IpPath:      update.ipPath,
+			Packet:      packet,
+		})
+	} else if client != nil {
+		// Another client already won; drop.
+	} else if race := update.race; race == nil {
+		self.log.Infof("[multi]receive no race and no client")
+	} else if state, ok := race.clientStates[sourceClient]; !ok {
+		self.log.Infof("[multi]receive client not part of race")
+	} else if len(state.packets) < self.settings.MultiRaceClientPacketMaxCount && race.packetCount < self.settings.MultiRacePacketMaxCount {
+		packetCopy, pooled := MessagePoolCopyDetailed(packet)
+		receivePacket := &receivePacket{
+			Source:      source,
+			ProvideMode: provideMode,
+			IpPath:      update.ipPath,
+			Packet:      packetCopy,
+			Pooled:      pooled,
 		}
-
-		// race / not-yet-committed paths are guarded by the per-flow stateLock
-		update.stateLock.Lock()
-		defer update.stateLock.Unlock()
-
-		client := update.client.Load()
-
-		if client == sourceClient {
-			// committed between the lock-free check and acquiring the lock
-			p := &receivePacket{
-				Source:      source,
-				ProvideMode: provideMode,
-				IpPath:      ipPath,
-				Packet:      packet,
+		state.packets = append(state.packets, receivePacket)
+		if 1 == len(state.packets) {
+			state.receiveTime = time.Now()
+		}
+		race.packetCount += 1
+		if len(state.packets) == 1 {
+			race.clientsWithPacketCount += 1
+			if int(float32(len(race.clientStates))*self.settings.MultiRaceClientEarlyCompleteFraction) <= race.clientsWithPacketCount {
+				race.completeMonitor.NotifyAll()
 			}
-			receivePackets = []*receivePacket{p}
-		} else if client != nil {
-			// another client already chosen, drop
-		} else if race := update.race; race == nil {
-			// no race, no client, drop
-			self.log.Infof("[multi]receive no race and no client")
-		} else if state, ok := race.clientStates[sourceClient]; !ok {
-			// this client is not part of the race, drop
-			self.log.Infof("[multi]receive client not part of race")
-		} else if len(state.packets) < self.settings.MultiRaceClientPacketMaxCount && race.packetCount < self.settings.MultiRacePacketMaxCount {
-			packetCopy, pooled := MessagePoolCopyDetailed(packet)
-			receivePacket := &receivePacket{
-				Source:      source,
-				ProvideMode: provideMode,
-				IpPath:      ipPath,
-				Packet:      packetCopy,
-				Pooled:      pooled,
-			}
-			state.packets = append(state.packets, receivePacket)
-			if 1 == len(state.packets) {
-				state.receiveTime = time.Now()
-			}
-			race.packetCount += 1
-			if len(state.packets) == 1 {
-				race.clientsWithPacketCount += 1
-				if int(float32(len(race.clientStates))*self.settings.MultiRaceClientEarlyCompleteFraction) <= race.clientsWithPacketCount {
-					race.completeMonitor.NotifyAll()
-				}
-			}
-		} else {
-			// race buffer limits exceeded, end the race immediately
-			self.log.Infof("[multi]receive race buffer limit reached")
+		}
+	} else {
+		// Race buffer limits exceeded, end the race immediately.
+		self.log.Infof("[multi]receive race buffer limit reached")
 
-			for abandonedClient, abandonedState := range race.clientStates {
-				if abandonedClient != sourceClient {
-					abandonedClients = append(abandonedClients, abandonedClient)
-					for _, p := range abandonedState.packets {
-						if p.Pooled {
-							p.Pooled = false
-							returnPackets = append(returnPackets, p)
-						}
+		for abandonedClient, abandonedState := range race.clientStates {
+			if abandonedClient != sourceClient {
+				abandonedClients = append(abandonedClients, abandonedClient)
+				for _, p := range abandonedState.packets {
+					if p.Pooled {
+						p.Pooled = false
+						returnPackets = append(returnPackets, p)
 					}
 				}
 			}
+		}
 
-			update.clearRaceWithLock()
-			update.client.Store(sourceClient)
-			receivePacket := &receivePacket{
-				Source:      source,
-				ProvideMode: provideMode,
-				IpPath:      ipPath,
-				Packet:      packet,
-			}
-			receivePackets = append(state.packets, receivePacket)
-			for _, p := range receivePackets {
-				if p.Pooled {
-					p.Pooled = false
-					returnPackets = append(returnPackets, p)
-				}
-			}
+		update.clearRaceWithLock()
+		update.client.Store(sourceClient)
+		receivePacket := &receivePacket{
+			Source:      source,
+			ProvideMode: provideMode,
+			IpPath:      update.ipPath,
+			Packet:      packet,
 		}
-	})
-	if success {
-		if 0 < len(abandonedClients) {
-			if rstPacket, ok := ipOosRst(ipPath); ok {
-				for _, abandonedClient := range abandonedClients {
-					abandonedClient.Send(&parsedPacket{
-						packet: rstPacket,
-						ipPath: ipPath,
-					}, 0)
-				}
-			}
-		}
+		receivePackets = append(state.packets, receivePacket)
 		for _, p := range receivePackets {
-			self.receivePacketCallback(p.Source, p.ProvideMode, p.IpPath, p.Packet)
+			if p.Pooled {
+				p.Pooled = false
+				returnPackets = append(returnPackets, p)
+			}
 		}
-		for _, p := range returnPackets {
-			MessagePoolReturn(p.Packet)
+	}
+	update.stateLock.Unlock()
+
+	if 0 < len(abandonedClients) {
+		if rstPacket, ok := ipOosRst(update.ipPath); ok {
+			for _, abandonedClient := range abandonedClients {
+				abandonedClient.Send(&parsedPacket{
+					packet: rstPacket,
+					ipPath: update.ipPath,
+				}, 0)
+			}
 		}
-	} else {
-		// incoming packets not in response to outgoing packets
-		self.receivePacketCallback(source, provideMode, ipPath, packet)
+	}
+	for _, p := range receivePackets {
+		self.receivePacketCallback(p.Source, p.ProvideMode, p.IpPath, p.Packet)
+	}
+	for _, p := range returnPackets {
+		MessagePoolReturn(p.Packet)
 	}
 }
 
@@ -2577,31 +2576,52 @@ type multiClientChannelUpdate struct {
 
 func newMultiClientChannelUpdate(ctx context.Context, ipPath *IpPath) *multiClientChannelUpdate {
 	cancelCtx, cancel := context.WithCancel(ctx)
+	// The caller's path may borrow address slices from a packet buffer that is
+	// transferred immediately after this call. Flow state outlives that buffer,
+	// so take the ownership copy exactly once when the flow record is created.
 	return &multiClientChannelUpdate{
 		ctx:              cancelCtx,
 		cancel:           cancel,
-		ipPath:           ipPath,
+		ipPath:           retainIpPath(ipPath),
 		affinityIp4Paths: map[Ip4Path]bool{},
 		affinityIp6Paths: map[Ip6Path]bool{},
 	}
 }
 
-func (self *multiClientChannelUpdate) resetSequence(sendPacket *parsedPacket) {
+// retainIpPath makes the immutable, flow-oriented path shared by asynchronous
+// flow state and receive callbacks. It deliberately retains only the tuple:
+// per-packet TCP sequence/flag fields are tracked separately and Reverse never
+// exposed them on the return callback path.
+func retainIpPath(ipPath *IpPath) *IpPath {
+	retained := &IpPath{
+		Version:         ipPath.Version,
+		Protocol:        ipPath.Protocol,
+		SourcePort:      ipPath.SourcePort,
+		DestinationPort: ipPath.DestinationPort,
+		ServerName:      ipPath.ServerName,
+	}
+	if addressByteCount := len(ipPath.SourceIp) + len(ipPath.DestinationIp); 0 < addressByteCount {
+		addresses := make(net.IP, addressByteCount)
+		sourceByteCount := copy(addresses, ipPath.SourceIp)
+		copy(addresses[sourceByteCount:], ipPath.DestinationIp)
+		retained.SourceIp = addresses[:sourceByteCount:sourceByteCount]
+		retained.DestinationIp = addresses[sourceByteCount:]
+	}
+	return retained
+}
+
+func (self *multiClientChannelUpdate) resetSequence(ipPath *IpPath) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-
-	ipPath := sendPacket.ipPath
 
 	self.ackSequenceNumber = ipPath.AckSequenceNumber
 	self.sequenceNumber = ipPath.SequenceNumber
 	self.sequencePacketCount = 0
 }
 
-func (self *multiClientChannelUpdate) updateSequence(sendPacket *parsedPacket) {
+func (self *multiClientChannelUpdate) updateSequence(ipPath *IpPath, payloadByteCount int) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-
-	ipPath := sendPacket.ipPath
 	update := false
 
 	nextAckSequenceNumber := ipPath.AckSequenceNumber
@@ -2611,7 +2631,7 @@ func (self *multiClientChannelUpdate) updateSequence(sendPacket *parsedPacket) {
 	}
 
 	// modular uint32 add wraps correctly across the 4 GB boundary
-	nextSequenceNumber := ipPath.SequenceNumber + uint32(len(sendPacket.payload))
+	nextSequenceNumber := ipPath.SequenceNumber + uint32(payloadByteCount)
 	// signed-delta comparison is wraparound-tolerant: > 0 means nextSequenceNumber
 	// is later in TCP sequence space than self.sequenceNumber
 	if 0 < int32(nextSequenceNumber-self.sequenceNumber) {
@@ -2624,7 +2644,7 @@ func (self *multiClientChannelUpdate) updateSequence(sendPacket *parsedPacket) {
 	}
 }
 
-func (self *multiClientChannelUpdate) canUpdateSequence(sendPacket *parsedPacket) bool {
+func (self *multiClientChannelUpdate) canUpdateSequence(ipPath *IpPath, payloadByteCount int) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -2632,13 +2652,11 @@ func (self *multiClientChannelUpdate) canUpdateSequence(sendPacket *parsedPacket
 		return true
 	}
 
-	ipPath := sendPacket.ipPath
-
 	if self.ackSequenceNumber != ipPath.AckSequenceNumber {
 		return true
 	}
 
-	nextSequenceNumber := ipPath.SequenceNumber + uint32(len(sendPacket.payload))
+	nextSequenceNumber := ipPath.SequenceNumber + uint32(payloadByteCount)
 	// strict signed-delta > 0 mirrors updateSequence; treating equality as
 	// "can update" would let identical retransmits pass the gate even though
 	// updateSequence won't advance state, defeating TcpCollapsePrevention.
@@ -2731,9 +2749,8 @@ type multiClientChannelRaceClientState struct {
 }
 
 type parsedPacket struct {
-	packet  []byte
-	ipPath  *IpPath
-	payload []byte
+	packet []byte
+	ipPath *IpPath
 }
 
 func newParsedPacket(packet []byte) (*parsedPacket, error) {
@@ -4116,8 +4133,12 @@ func (self *multiClientChannel) Send(parsedPacket *parsedPacket, timeout time.Du
 }
 
 func (self *multiClientChannel) SendDetailed(parsedPacket *parsedPacket, timeout time.Duration) (bool, error) {
+	return self.sendPacketDetailed(parsedPacket.packet, parsedPacket.ipPath, timeout)
+}
+
+func (self *multiClientChannel) sendPacketDetailed(packet []byte, ipPath *IpPath, timeout time.Duration) (bool, error) {
 	var ack bool
-	switch parsedPacket.ipPath.Protocol {
+	switch ipPath.Protocol {
 	case IpProtocolUdp:
 		if self.settings.UdpCollapsePrevention {
 			ack = false
@@ -4127,7 +4148,7 @@ func (self *multiClientChannel) SendDetailed(parsedPacket *parsedPacket, timeout
 	default:
 		ack = true
 	}
-	return self.SendDetailedWithAck(parsedPacket, timeout, ack)
+	return self.sendPacketDetailedWithAck(packet, ipPath, timeout, ack)
 }
 
 func (self *multiClientChannel) SendWithAck(parsedPacket *parsedPacket, timeout time.Duration, ack bool) bool {
@@ -4136,55 +4157,81 @@ func (self *multiClientChannel) SendWithAck(parsedPacket *parsedPacket, timeout 
 }
 
 func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, timeout time.Duration, ack bool) (bool, error) {
-	if frame, err := ipPacketToProviderFrame(parsedPacket.packet, self.settings.ProtocolVersion); err != nil {
-		self.addError(err)
-		return false, err
-	} else {
-		packetByteCount := ByteCount(len(parsedPacket.packet))
-		self.addSend(packetByteCount, parsedPacket.ipPath)
-		ackCallback := func(err error) {
-			if err == nil {
-				self.addSendAck(packetByteCount)
-			} else {
-				self.addError(err)
-			}
-		}
+	return self.sendPacketDetailedWithAck(parsedPacket.packet, parsedPacket.ipPath, timeout, ack)
+}
 
-		var opts []any
-		if self.performanceProfile != nil && self.performanceProfile.AllowDirect {
-			opts = append(opts, ForceStream())
+func (self *multiClientChannel) sendPacketDetailedWithAck(
+	packet []byte,
+	ipPath *IpPath,
+	timeout time.Duration,
+	ack bool,
+) (bool, error) {
+	rawFrame := 2 <= self.settings.ProtocolVersion
+	var frame *protocol.Frame
+	if !rawFrame {
+		var err error
+		frame, err = ipPacketToProviderFrame(packet, self.settings.ProtocolVersion)
+		if err != nil {
+			self.addError(err)
+			return false, err
 		}
-		if !ack {
-			opts = append(opts, NoAck())
+	}
+
+	packetByteCount := ByteCount(len(packet))
+	self.addSend(packetByteCount, ipPath)
+
+	var opts []any
+	if self.performanceProfile != nil && self.performanceProfile.AllowDirect {
+		opts = append(opts, ForceStream())
+	}
+	if !ack {
+		opts = append(opts, NoAck())
+	}
+	var success bool
+	var err error
+	if rawFrame {
+		success, err = self.client.sendRawMultiHopWithTimeoutDetailed(
+			protocol.MessageType_IpIpPacketToProvider,
+			packet,
+			self.args.Destination,
+			self,
+			packetByteCount,
+			timeout,
+			opts...,
+		)
+	} else {
+		// Legacy protocol frames use the public callback API. Modern raw frames
+		// carry self and packetByteCount as a sendAckRecord and allocate no
+		// closure on the steady-state packet path.
+		ackCallback := func(err error) {
+			self.sendAckResult(packetByteCount, err)
 		}
-		success, err := self.client.SendMultiHopWithTimeoutDetailed(
+		success, err = self.client.SendMultiHopWithTimeoutDetailed(
 			frame,
 			self.args.Destination,
 			ackCallback,
 			timeout,
 			opts...,
 		)
-		// ownership: `parsedPacket.packet` is consumed on success and stays with the
-		// caller on any failure. The wrapped (!raw) marshal buffer is internal and
-		// must be freed on any failure; for raw frames the frame bytes ARE the
-		// caller's packet, so they are never freed here on failure.
-		if err != nil {
-			if !frame.Raw {
-				MessagePoolReturn(frame.MessageBytes)
-			}
-			return success, err
-		}
-		if success {
-			if !frame.Raw {
-				MessagePoolReturn(parsedPacket.packet)
-			}
-		} else {
-			if !frame.Raw {
-				MessagePoolReturn(frame.MessageBytes)
-			}
+	}
+	// ownership: `packet` is consumed on success and stays with the
+	// caller on any failure. The wrapped (!raw) marshal buffer is internal and
+	// must be freed on any failure; for raw frames the frame bytes ARE the
+	// caller's packet, so they are never freed here on failure.
+	if err != nil {
+		if !rawFrame {
+			MessagePoolReturn(frame.MessageBytes)
 		}
 		return success, err
 	}
+	if success {
+		if !rawFrame {
+			MessagePoolReturn(packet)
+		}
+	} else if !rawFrame {
+		MessagePoolReturn(frame.MessageBytes)
+	}
+	return success, err
 }
 
 func (self *multiClientChannel) SendDetailedMessage(message proto.Message, timeout time.Duration, ackCallback func(error)) (bool, error) {
@@ -4641,6 +4688,14 @@ func (self *multiClientChannel) addSendAck(ackByteCount ByteCount) {
 	eventBucket.sendAckByteCount += ackByteCount
 }
 
+func (self *multiClientChannel) sendAckResult(packetByteCount ByteCount, err error) {
+	if err == nil {
+		self.addSendAck(packetByteCount)
+	} else {
+		self.addError(err)
+	}
+}
+
 func (self *multiClientChannel) addSendSyn(synCount int) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -5085,7 +5140,8 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 			)
 		case protocol.MessageType_IpIpPacketFromProvider:
 			if packet, err := ipPacketFromProviderBytes(frame); err == nil {
-				ipPath, err := ParseIpPath(packet)
+				var ipPath IpPath
+				_, err := parseIpPathWithPayloadBorrowed(packet, &ipPath)
 				if err == nil {
 					self.addReceiveAck(ByteCount(len(packet)))
 					if ipPath.Syn {

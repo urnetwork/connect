@@ -337,9 +337,14 @@ type MultiRouteSelector struct {
 
 	// A selector reader is one ordered packet stream. Serializing Read also
 	// lets it reuse one lazy timeout timer instead of allocating time.After
-	// state on every packet. Writers have independent selector instances.
-	readMutex sync.Mutex
-	readTimer *time.Timer
+	// state on every packet. A selector writer is likewise one ordered packet
+	// stream; serialization preserves that order and lets blocked writes reuse
+	// one bounded timer instead of allocating two runtime timer objects per
+	// backpressured transfer frame.
+	readMutex  sync.Mutex
+	readTimer  *time.Timer
+	writeMutex sync.Mutex
+	writeTimer *time.Timer
 }
 
 // routeSnapshot is an immutable view of the selector's active routes published
@@ -687,8 +692,50 @@ func (self *MultiRouteSelector) Write(ctx context.Context, transferFrameBytes []
 
 // MultiRouteWriter
 func (self *MultiRouteSelector) WriteDetailed(ctx context.Context, transferFrameBytes []byte, timeout time.Duration) (bool, error) {
-	// write to the first channel available, in random priority
 	enterTime := time.Now()
+
+	// Preserve the allocation-free, lock-free common path. SendSequence owns a
+	// writer selector and writes its ordered stream serially; the mutex below is
+	// only needed when a write must retain and reuse the selector timer.
+	initialSnapshot := self.activeRoutesSnapshot.Load()
+	initialRoutes := initialSnapshot.shuffled()
+	if self.log.V(2).Enabled() {
+		self.log.Infof("[mrw] %s->%s s(%s) routes = %d\n", self.clientTag, self.destination.DestinationId, self.destination.StreamId, len(initialRoutes))
+	}
+	for _, route := range initialRoutes {
+		select {
+		case route <- transferFrameBytes:
+			if self.log.V(2).Enabled() {
+				self.log.Infof("[mrw]nb %s->%s s(%s)\n", self.clientTag, self.destination.DestinationId, self.destination.StreamId)
+			}
+			self.updateSendStats(route, 1, ByteCount(len(transferFrameBytes)))
+			return true, nil
+		default:
+		}
+	}
+
+	self.writeMutex.Lock()
+	defer self.writeMutex.Unlock()
+	defer func() {
+		if self.writeTimer != nil {
+			self.writeTimer.Stop()
+		}
+	}()
+
+	// write to the first channel available, in random priority
+	// Arm the selector's timer only if the nonblocking route pass fails, then
+	// retain the same absolute deadline across transport-update retries. The
+	// timer object itself is lazy and bounded to one per writer selector.
+	timeoutChannel := func() (<-chan time.Time, bool) {
+		if timeout < 0 {
+			return nil, false
+		}
+		remainingTimeout := enterTime.Add(timeout).Sub(time.Now())
+		if remainingTimeout <= 0 {
+			return nil, true
+		}
+		return resetOrCreateTimer(&self.writeTimer, remainingTimeout), false
+	}
 	for {
 		// read the active routes and the transport-update channel from the
 		// lock-free snapshot instead of taking the selector and monitor locks
@@ -728,12 +775,9 @@ func (self *MultiRouteSelector) WriteDetailed(ctx context.Context, transferFrame
 				route1 = activeRoutes[1]
 			}
 			var timeoutChan <-chan time.Time
-			if 0 <= timeout {
-				remainingTimeout := enterTime.Add(timeout).Sub(time.Now())
-				if remainingTimeout <= 0 {
-					return false, nil
-				}
-				timeoutChan = time.After(remainingTimeout)
+			var expired bool
+			if timeoutChan, expired = timeoutChannel(); expired {
+				return false, nil
 			}
 			select {
 			case <-ctx.Done():
@@ -798,9 +842,8 @@ func (self *MultiRouteSelector) WriteDetailed(ctx context.Context, transferFrame
 		}
 
 		timeoutIndex := len(selectCases)
-		if 0 <= timeout {
-			remainingTimeout := enterTime.Add(timeout).Sub(time.Now())
-			if remainingTimeout <= 0 {
+		if timeoutChan, expired := timeoutChannel(); timeoutChan != nil || expired {
+			if expired {
 				// add a default case
 				selectCases = append(selectCases, reflect.SelectCase{
 					Dir: reflect.SelectDefault,
@@ -809,7 +852,7 @@ func (self *MultiRouteSelector) WriteDetailed(ctx context.Context, transferFrame
 				// add a timeout case
 				selectCases = append(selectCases, reflect.SelectCase{
 					Dir:  reflect.SelectRecv,
-					Chan: reflect.ValueOf(time.After(remainingTimeout)),
+					Chan: reflect.ValueOf(timeoutChan),
 				})
 			}
 		}

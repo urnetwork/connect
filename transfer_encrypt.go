@@ -21,6 +21,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
@@ -668,7 +669,22 @@ type peerEncryptionSession struct {
 	// EncryptionControlUseCompanion for a server reply (the responder has no
 	// regular contract back to the initiator in asymmetric setups).
 	carrierCompanion bool
-	logTag           string
+	// carrierForceStream mirrors the ForceStream transfer option of the most
+	// recent send sequence that acquired this session (`AcquireForSend`). The
+	// EncryptedControl carrier must select the SAME send sequence as the
+	// application data for this peer: ForceStream keys the send sequence but
+	// is invisible on the wire, so a carrier that diverges from the data path
+	// (e.g. the multi-client sends data with ForceStream when AllowDirect,
+	// while the carrier used the client defaults) forks a second concurrent
+	// sequence whose frames the receiver cannot tell apart from the data
+	// sequence — both map to the same (source, role, companion) receive head
+	// slot, the newer sequence id evicts the older, and the loser's packs
+	// (the data, or the ClientHello) are dropped un-acked forever. Stored
+	// before the acquire-side handshake restart so the first flight already
+	// rides the right sequence. Applied only to non-companion carriers (the
+	// platform rejects companion stream contracts).
+	carrierForceStream atomic.Bool
+	logTag             string
 
 	settings *EncryptionSettings
 
@@ -1072,7 +1088,9 @@ func (self *peerEncryptionSession) sendEncryptedControl(ec *protocol.EncryptedCo
 		// keeping the session it drives referenced for the handshake. The
 		// carrier rides `carrierCompanion`'s contract, decoupled from the
 		// identity `companion` that keys the session and tags the EC.
-		if !self.client.sendBuffer.SendEncryptedControl(self.ctx, self.peerId, self.role, ec, self.companion, self.carrierCompanion) {
+		// `carrierForceStream` keeps the carrier on the same send sequence as
+		// the acquiring data path (see the field doc).
+		if !self.client.sendBuffer.SendEncryptedControl(self.ctx, self.peerId, self.role, ec, self.companion, self.carrierCompanion, self.carrierForceStream.Load()) {
 			self.close()
 		}
 	}, self.cancel)
@@ -2411,11 +2429,17 @@ func (self *EncryptionSessionManager) Acquire(peerId Id, role sequenceTlsRole, c
 // that lost its responder session rebuilds it on the next burst. A server-role
 // send sequence never restarts; it only carries EncryptedControl and
 // server-session replies, otherwise following the peer's ClientHello.
-func (self *EncryptionSessionManager) AcquireForSend(peerId Id, role sequenceTlsRole, companion bool) *peerEncryptionSession {
+//
+// `forceStream` is the acquiring sequence's ForceStream transfer option,
+// recorded as the session's carrier option (see `carrierForceStream`) BEFORE
+// the handshake restart so even the first ClientHello rides the same send
+// sequence as the acquiring sequence's data.
+func (self *EncryptionSessionManager) AcquireForSend(peerId Id, role sequenceTlsRole, companion bool, forceStream bool) *peerEncryptionSession {
 	session := self.acquireSession(peerId, role, companion)
 	if session == nil {
 		return nil
 	}
+	session.carrierForceStream.Store(forceStream)
 	if role == sequenceTlsRoleClient {
 		session.restartHandshake()
 	}

@@ -1,8 +1,11 @@
 package connect
 
 import (
+	"context"
 	"net"
 	"testing"
+
+	"github.com/urnetwork/connect/protocol"
 )
 
 var ipPathAllocationSink *IpPath
@@ -41,5 +44,96 @@ func TestBorrowedIpPathAvoidsAddressAllocations(t *testing.T) {
 	if !borrowed.SourceIp.Equal(net.ParseIP("10.0.0.1")) ||
 		!borrowed.DestinationIp.Equal(net.ParseIP("203.0.113.7")) {
 		t.Fatalf("unexpected borrowed path: %s -> %s", borrowed.SourceIp, borrowed.DestinationIp)
+	}
+}
+
+func TestMultiClientFlowPathOwnsBorrowedPacketAddresses(t *testing.T) {
+	packet := testingUdp4Packet("10.0.0.1", "203.0.113.7", 443, []byte("payload"))
+	var borrowed IpPath
+	if _, err := parseIpPathWithPayloadBorrowed(packet, &borrowed); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	update := newMultiClientChannelUpdate(ctx, &borrowed)
+	defer func() {
+		update.Close()
+		cancel()
+	}()
+
+	for i := range packet {
+		packet[i] = 0
+	}
+	if !update.ipPath.SourceIp.Equal(net.ParseIP("10.0.0.1")) ||
+		!update.ipPath.DestinationIp.Equal(net.ParseIP("203.0.113.7")) {
+		t.Fatalf("retained flow path aliases packet storage: %s -> %s",
+			update.ipPath.SourceIp, update.ipPath.DestinationIp)
+	}
+}
+
+func TestMultiClientCommittedIngressUsesOwnedFlowPathWithoutAllocating(t *testing.T) {
+	outboundPacket := testingUdp4Packet("10.0.0.1", "203.0.113.7", 443, []byte("out"))
+	var outbound IpPath
+	if _, err := parseIpPathWithPayloadBorrowed(outboundPacket, &outbound); err != nil {
+		t.Fatal(err)
+	}
+
+	inboundPath := outbound.ReverseValue()
+	inboundPacket := ipOosPacket(&inboundPath, []byte("in"))
+	var inbound IpPath
+	if _, err := parseIpPathWithPayloadBorrowed(inboundPacket, &inbound); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	update := newMultiClientChannelUpdate(ctx, &outbound)
+	defer update.Close()
+	sourceClient := &multiClientChannel{}
+	update.client.Store(sourceClient)
+
+	var receivedPath *IpPath
+	multi := &RemoteUserNatMultiClient{
+		ctx:                 ctx,
+		log:                 NewNoopLogger(),
+		settings:            DefaultMultiClientSettings(),
+		securityPolicy:      DisableSecurityPolicy(),
+		packetStatsCounters: &packetStatsCounters{},
+		ip4PathUpdates: map[Ip4Path]*multiClientChannelUpdate{
+			outbound.ToIp4Path(): update,
+		},
+		receivePacketCallback: func(
+			source TransferPath,
+			provideMode protocol.ProvideMode,
+			ipPath *IpPath,
+			packet []byte,
+		) {
+			receivedPath = ipPath
+		},
+	}
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		multi.clientReceivePacket(
+			sourceClient,
+			TransferPath{},
+			protocol.ProvideMode_Network,
+			inbound,
+			inboundPacket,
+		)
+	})
+	if allocs != 0 {
+		t.Fatalf("committed ingress allocated %.0f times, want 0", allocs)
+	}
+	if receivedPath != update.ipPath {
+		t.Fatal("committed ingress did not reuse the retained flow path")
+	}
+
+	for i := range inboundPacket {
+		inboundPacket[i] = 0
+	}
+	if !receivedPath.SourceIp.Equal(net.ParseIP("10.0.0.1")) ||
+		!receivedPath.DestinationIp.Equal(net.ParseIP("203.0.113.7")) {
+		t.Fatalf("committed ingress callback path aliases packet storage: %s -> %s",
+			receivedPath.SourceIp, receivedPath.DestinationIp)
 	}
 }

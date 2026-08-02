@@ -44,7 +44,9 @@ const debugVerifyHeaders = false
 // `provideMode` is the relationship between the source and this device
 type SendPacketFunction func(provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool
 
-// receive into a raw socket
+// receive into a raw socket. ipPath and packet are read-only for the duration
+// of the callback. A callee that retains packet must call
+// MessagePoolShareReadOnly; a callee that needs a mutable path must clone it.
 type ReceivePacketFunction func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte)
 
 // receive a batch of packets from one flow (same source, provideMode, ipPath)
@@ -144,7 +146,10 @@ func DefaultTcpBufferSettingsWithBufferSize(bufferSize int) *TcpBufferSettings {
 		GlobalLimit:        globalLimit,
 		EnableOrphanRst:    true,
 		OrphanRstPerSecond: 256,
-		ConnectSettings:    *DefaultConnectSettings(),
+		// on by default: the benchmark range is reserved (RFC 2544) and the
+		// synthetic server only ever answers flows explicitly addressed to it
+		EnableSyntheticSpeed: true,
+		ConnectSettings:      *DefaultConnectSettings(),
 	}
 	return tcpBufferSettings
 }
@@ -1958,6 +1963,14 @@ type TcpBufferSettings struct {
 	// valve: orphan packets are attacker-influenceable). <= 0 is unlimited.
 	OrphanRstPerSecond int
 
+	// EnableSyntheticSpeed terminates TCP flows to the RFC 2544 benchmark
+	// range 198.18.0.0/15 at an in-memory synthetic speed server instead of
+	// dialing upstream (see ip_synthetic_speed.go). The range is never
+	// publicly routable, so no real destination is shadowed. Serves
+	// measurement of the tunnel path itself, isolated from origin and
+	// upstream network variability.
+	EnableSyntheticSpeed bool
+
 	ConnectSettings
 }
 
@@ -2637,11 +2650,22 @@ func (self *TcpSequence) Run() {
 
 	// connect to upstream before sending the syn+ack
 	self.log.V(2).Infof("[init]tcp connect\n")
-	socket, err := self.tcpBufferSettings.DialContext(
-		self.ctx,
-		"tcp",
-		self.IpPath().DestinationHostPort(),
-	)
+	var socket net.Conn
+	var err error
+	if self.tcpBufferSettings.EnableSyntheticSpeed && isSyntheticSpeedIp(self.IpPath().DestinationIp) {
+		// benchmark-range destination: terminate at the in-memory synthetic
+		// speed server (see ip_synthetic_speed.go)
+		if self.log.V(1).Enabled() {
+			self.log.Infof("[init]tcp connect synthetic %s\n", self.IpPath().DestinationHostPort())
+		}
+		socket = newSyntheticSpeedConn()
+	} else {
+		socket, err = self.tcpBufferSettings.DialContext(
+			self.ctx,
+			"tcp",
+			self.IpPath().DestinationHostPort(),
+		)
+	}
 	if err != nil {
 		if self.log.V(1).Enabled() {
 			self.log.Infof("[init]tcp connect error = %s\n", err)
@@ -3564,6 +3588,10 @@ type RemoteUserNatProvider struct {
 	// which skips the public security rules and forgoes the companion contract.
 	stateLock         sync.Mutex
 	sourceProvideMode map[Id]protocol.ProvideMode
+	// sourceP2pPriorityRefresh rate-limits Network-peer admission promotion
+	// on the provider packet path. Entries are bounded with
+	// sourceProvideMode and removed on the same arbitrary safe eviction.
+	sourceP2pPriorityRefresh map[Id]time.Time
 	// the packet stats epoch worker started (on the first callback)
 	packetStatsStarted bool
 }
@@ -3584,15 +3612,16 @@ func NewRemoteUserNatProvider(
 	// the client ctx) so Close stops it, rather than leaking it for the life of the client
 	cancelCtx, cancel := context.WithCancel(client.Ctx())
 	userNatProvider := &RemoteUserNatProvider{
-		ctx:                  cancelCtx,
-		client:               client,
-		cancel:               cancel,
-		localUserNat:         localUserNat,
-		securityPolicy:       settings.SecurityPolicyGenerator(cancelCtx, DefaultSecurityPolicyStatsCollector()),
-		settings:             settings,
-		packetStatsCounters:  &packetStatsCounters{},
-		packetStatsCallbacks: NewCallbackList[PacketStatsFunction](),
-		sourceProvideMode:    map[Id]protocol.ProvideMode{},
+		ctx:                      cancelCtx,
+		client:                   client,
+		cancel:                   cancel,
+		localUserNat:             localUserNat,
+		securityPolicy:           settings.SecurityPolicyGenerator(cancelCtx, DefaultSecurityPolicyStatsCollector()),
+		settings:                 settings,
+		packetStatsCounters:      &packetStatsCounters{},
+		packetStatsCallbacks:     NewCallbackList[PacketStatsFunction](),
+		sourceProvideMode:        map[Id]protocol.ProvideMode{},
+		sourceP2pPriorityRefresh: map[Id]time.Time{},
 	}
 
 	// Register both return paths. No-contract peers can take the NAT's drained
@@ -3684,6 +3713,7 @@ func (self *RemoteUserNatProvider) recordSourceProvideMode(sourceId Id, provideM
 		if maxCount := self.settings.MaxSourceCount; 0 < maxCount && maxCount <= len(self.sourceProvideMode) {
 			for evictSourceId := range self.sourceProvideMode {
 				delete(self.sourceProvideMode, evictSourceId)
+				delete(self.sourceP2pPriorityRefresh, evictSourceId)
 				break
 			}
 		}
@@ -3694,6 +3724,41 @@ func (self *RemoteUserNatProvider) recordSourceProvideMode(sourceId Id, provideM
 		self.sourceProvideMode[sourceId] = protocol.ProvideMode_Network
 	default:
 		self.sourceProvideMode[sourceId] = provideMode
+	}
+}
+
+const providerP2pPriorityRefreshInterval = 5 * time.Second
+
+// refreshP2pPriority promotes an explicitly selected same-network source out
+// of the provider's bounded public-peer admission lottery. The provider sees
+// the relationship on relayed data before P2P is established, so it can
+// reclaim one existing reservation without requiring new StreamOpen protocol
+// fields or increasing the fixed memory ceiling.
+func (self *RemoteUserNatProvider) refreshP2pPriority(sourceId Id, provideMode protocol.ProvideMode) {
+	if provideMode != protocol.ProvideMode_Network || sourceId == (Id{}) {
+		return
+	}
+	now := time.Now()
+	shouldRefresh := false
+	self.stateLock.Lock()
+	if self.sourceP2pPriorityRefresh == nil {
+		self.sourceP2pPriorityRefresh = map[Id]time.Time{}
+	}
+	if _, ok := self.sourceP2pPriorityRefresh[sourceId]; !ok {
+		if maxCount := self.settings.MaxSourceCount; 0 < maxCount && maxCount <= len(self.sourceP2pPriorityRefresh) {
+			for evictSourceId := range self.sourceP2pPriorityRefresh {
+				delete(self.sourceP2pPriorityRefresh, evictSourceId)
+				break
+			}
+		}
+	}
+	if next := self.sourceP2pPriorityRefresh[sourceId]; !now.Before(next) {
+		self.sourceP2pPriorityRefresh[sourceId] = now.Add(providerP2pPriorityRefreshInterval)
+		shouldRefresh = true
+	}
+	self.stateLock.Unlock()
+	if shouldRefresh {
+		self.client.webRtcManager.PrioritizePeer(sourceId)
 	}
 }
 
@@ -3708,6 +3773,22 @@ func (self *RemoteUserNatProvider) sourceReturnProvideMode(sourceId Id, fallback
 		return provideMode
 	}
 	return fallback
+}
+
+// providerReturnTransferOption keeps every provider-to-client frame on the
+// same sender sequence as the rest of that relationship. Network-peer data
+// and active WebRTC signaling use ForceStream. ForceStream is part of the
+// sender's sequence key but is not carried on the wire, so returning Network
+// traffic with the default option would fork a second live sequence that the
+// receiver cannot distinguish from the first. Whichever sequence id arrived
+// second would supersede the other and could leave its acknowledged traffic
+// permanently dropped as "older". Non-Network returns continue to ride the
+// companion contract that the remote source grants.
+func providerReturnTransferOption(provideMode protocol.ProvideMode) any {
+	if provideMode == protocol.ProvideMode_Network {
+		return ForceStream()
+	}
+	return CompanionContract()
 }
 
 // `ReceivePacketFunction`
@@ -3768,10 +3849,7 @@ func (self *RemoteUserNatProvider) ReceiveBatch(
 	}
 
 	returnProvideMode := self.sourceReturnProvideMode(source.SourceId, provideMode)
-	opts := []any{}
-	if returnProvideMode != protocol.ProvideMode_Network {
-		opts = append(opts, CompanionContract())
-	}
+	returnOption := providerReturnTransferOption(returnProvideMode)
 	destination := source.Reverse()
 
 	// build frames, flushing a chunk when the frame/byte bound is hit
@@ -3796,7 +3874,7 @@ func (self *RemoteUserNatProvider) ReceiveBatch(
 			destination,
 			func(err error) {},
 			self.settings.WriteTimeout,
-			opts...,
+			returnOption,
 		)
 		if sent {
 			self.packetStatsCounters.remoteEgressPacketCount.Add(int64(frameCount))
@@ -3873,17 +3951,6 @@ func (self *RemoteUserNatProvider) Receive(
 	}
 
 	packetShare := MessagePoolShareReadOnly(packet)
-	frame, err := ipPacketFromProviderFrame(packetShare, self.settings.ProtocolVersion)
-	if err != nil {
-		MessagePoolReturn(packetShare)
-		if self.client.log.V(2).Enabled() {
-			self.client.log.Infof("drop remote user nat provider s packet ->%s = %s\n", source.SourceId, err)
-		}
-		panic(err)
-	}
-	if !frame.Raw {
-		defer MessagePoolReturn(packetShare)
-	}
 
 	// echo the recorded return provide mode for the source. A same-network source
 	// sends under ProvideMode_Network; its return traffic is also network mode,
@@ -3891,27 +3958,50 @@ func (self *RemoteUserNatProvider) Receive(
 	// receives it as network mode and skips the public ingress rules. Other
 	// modes ride a companion contract (verified as Stream) as before.
 	returnProvideMode := self.sourceReturnProvideMode(source.SourceId, provideMode)
-	opts := []any{}
-	if returnProvideMode != protocol.ProvideMode_Network {
-		opts = append(opts, CompanionContract())
-	}
+	returnOption := providerReturnTransferOption(returnProvideMode)
 	// note udp is sent with ack because because otherwise the delivery reliability will mulitply with the egress
 	c := func() bool {
-		// ack := make(chan error)
-		sent := self.client.SendWithTimeout(
-			frame,
-			source.Reverse(),
-			func(err error) {},
-			self.settings.WriteTimeout,
-			opts...,
-		)
+		var sent bool
+		if 2 <= self.settings.ProtocolVersion {
+			sent, _ = self.client.sendRawWithTimeoutDetailed(
+				protocol.MessageType_IpIpPacketFromProvider,
+				packetShare,
+				source.Reverse(),
+				nil,
+				0,
+				self.settings.WriteTimeout,
+				returnOption,
+			)
+		} else {
+			frame, err := ipPacketFromProviderFrame(packetShare, self.settings.ProtocolVersion)
+			if err != nil {
+				MessagePoolReturn(packetShare)
+				if self.client.log.V(2).Enabled() {
+					self.client.log.Infof("drop remote user nat provider s packet ->%s = %s\n", source.SourceId, err)
+				}
+				panic(err)
+			}
+			// Legacy marshal bytes are owned by the send. The packet share is
+			// independent and is released after the synchronous enqueue.
+			sent = self.client.SendWithTimeout(
+				frame,
+				source.Reverse(),
+				func(err error) {},
+				self.settings.WriteTimeout,
+				returnOption,
+			)
+			MessagePoolReturn(packetShare)
+			if !sent {
+				MessagePoolReturn(frame.MessageBytes)
+			}
+		}
 		if sent {
 			self.packetStatsCounters.remoteEgressPacketCount.Add(1)
 			self.packetStatsCounters.remoteEgressByteCount.Add(int64(len(packet)))
-		} else {
+		} else if 2 <= self.settings.ProtocolVersion {
 			// the send did not take the frame: free it. For raw frames this undoes
 			// the packet share above; for wrapped frames it frees the marshal buffer.
-			MessagePoolReturn(frame.MessageBytes)
+			MessagePoolReturn(packetShare)
 		}
 		// if sent {
 		// 	self.client.log.Infof("[trace]provider return packet sent for %s\n", source.SourceId)
@@ -3935,6 +4025,12 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 	// clients should manage their own congestion protocols on top to avoid overflowing the sequence queues
 
 	provideMode := peer.ProvideMode
+	// One observation per delivered Pack is enough. The former call inside
+	// every packet case serialized a large coalesced return batch on this
+	// provider-global lock even though every frame has the same source and
+	// relationship.
+	self.recordSourceProvideMode(source.SourceId, provideMode)
+	self.refreshP2pPriority(source.SourceId, provideMode)
 
 	// collect the allowed packets and queue them into the local user nat as one batch
 	var packets [][]byte
@@ -3945,23 +4041,39 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 			if self.client.log.V(1).Enabled() {
 				self.client.log.Infof("[ip]provider ping <- %s(%d)\n", source, provideMode)
 			}
+			// Receive callback frames are borrowed and valid only until this
+			// callback returns. The send queue is asynchronous, so forwarding
+			// `frame` itself lets the decoded-frame pool reset/reuse it before
+			// SendSequence serializes it. Besides corrupting the echo, that can
+			// make contract accounting charge the original empty IpPing and
+			// later acknowledge whatever larger frame reused the object,
+			// terminating the whole send sequence with "Bad accounting".
+			//
+			// Keep the payload alive with a read-only share and give the send
+			// its own frame object. IpPing is rare, so the one small object is
+			// preferable to letting a callback-lifetime object escape.
+			echoBytes := MessagePoolShareReadOnly(frame.MessageBytes)
+			echoFrame := &protocol.Frame{
+				MessageType:  frame.MessageType,
+				MessageBytes: echoBytes,
+				Raw:          frame.Raw,
+			}
 			// echo the recorded return provide mode for the source, like the
 			// provider's other return traffic. A same-network source pings
 			// under ProvideMode_Network; its echo is also network mode (no
 			// companion contract). For other modes the source only provides
 			// ProvideMode_Stream, so a forward contract would be rejected
 			// (no permission); the echo rides a companion contract instead.
-			echoOpts := []any{}
-			if self.sourceReturnProvideMode(source.SourceId, provideMode) != protocol.ProvideMode_Network {
-				echoOpts = append(echoOpts, CompanionContract())
-			}
-			self.client.SendWithTimeout(
-				frame,
+			returnProvideMode := self.sourceReturnProvideMode(source.SourceId, provideMode)
+			if !self.client.SendWithTimeout(
+				echoFrame,
 				source.Reverse(),
 				func(err error) {},
 				0,
-				echoOpts...,
-			)
+				providerReturnTransferOption(returnProvideMode),
+			) {
+				MessagePoolReturn(echoBytes)
+			}
 		case protocol.MessageType_IpIpPacketToProvider:
 			packetBytes, err := ipPacketToProviderBytes(frame)
 			if err != nil {
@@ -3973,8 +4085,7 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 			if err == nil {
 				// the provider's ingress is the remote client's egress (outbound, received from the
 				// tunnel); the reversed provider policy applies the client-egress DPI here
-				r, err := self.securityPolicy.InspectIngress(provideMode, &ipPath, payload)
-				self.securityPolicy.RefreshIngress(&ipPath)
+				r, err := inspectAndRefreshIngressBorrowed(self.securityPolicy, provideMode, ipPath, payload)
 				if err == nil {
 					switch r {
 					case SecurityPolicyResultAllow:
@@ -3986,7 +4097,6 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 						}
 						packets = append(packets, packet)
 						packetsByteCount += ByteCount(len(packet))
-						self.recordSourceProvideMode(source.SourceId, provideMode)
 					default:
 						// drop or incident: blocked by the provider security policy
 						self.packetStatsCounters.blockIngressPacketCount.Add(1)
@@ -4126,11 +4236,10 @@ func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode pro
 	if err != nil {
 		return false
 	}
-	r, err := self.securityPolicy.InspectEgress(relationship, &ipPath, payload)
+	r, err := inspectAndRefreshEgressBorrowed(self.securityPolicy, relationship, ipPath, payload)
 	if err != nil {
 		return false
 	}
-	self.securityPolicy.RefreshEgress(&ipPath)
 
 	switch r {
 	case SecurityPolicyResultAllow:
@@ -4140,24 +4249,35 @@ func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode pro
 			return false
 		}
 
-		frame, err := ipPacketToProviderFrame(
-			MessagePoolShareReadOnly(packet),
-			DefaultProtocolVersion,
-		)
+		// The default v2 path embeds the raw frame in the pooled SendPack. It
+		// consumes packet only when the send accepts it and avoids both a frame
+		// allocation and the extra share that previously left the caller's
+		// original reference outstanding after a successful send.
+		if 2 <= DefaultProtocolVersion {
+			success, _ := self.client.sendRawMultiHopWithTimeoutDetailed(
+				protocol.MessageType_IpIpPacketToProvider,
+				packet,
+				destination,
+				nil,
+				0,
+				timeout,
+			)
+			return success
+		}
+
+		frame, err := ipPacketToProviderFrame(packet, DefaultProtocolVersion)
 		if err != nil {
 			panic(err)
 		}
-		if !frame.Raw {
-			defer MessagePoolReturn(packet)
-		}
 
 		// the sender will control transfer
-		opts := []any{}
 		// note udp is sent with ack because because otherwise the delivery reliability will mulitply with the egress
-		success := self.client.SendMultiHopWithTimeout(frame, destination, func(err error) {}, timeout, opts...)
-		if !success {
-			// the send did not take the frame: free it. For raw frames this undoes
-			// the packet share above; for wrapped frames it frees the marshal buffer.
+		success := self.client.SendMultiHopWithTimeout(frame, destination, func(err error) {}, timeout)
+		if success {
+			// Legacy serialization copied the packet into frame.MessageBytes;
+			// consume the caller's packet only after the queue accepts the copy.
+			MessagePoolReturn(packet)
+		} else {
 			MessagePoolReturn(frame.MessageBytes)
 		}
 		return success
@@ -4351,10 +4471,18 @@ func ParseIpPath(ipPacket []byte) (*IpPath, error) {
 
 func ParseIpPathWithPayload(ipPacket []byte) (*IpPath, []byte, error) {
 	var ipPath IpPath
-	payload, err := parseIpPathWithPayload(ipPacket, &ipPath, true)
+	payload, err := parseIpPathWithPayloadBorrowed(ipPacket, &ipPath)
 	if err != nil {
 		return nil, nil, err
 	}
+	// The public result owns its addresses. Keep this copy outside the borrowed
+	// parser so escape analysis does not conservatively apply this allocation
+	// branch to every synchronous borrowed parse.
+	ipBacking := make(net.IP, len(ipPath.SourceIp)+len(ipPath.DestinationIp))
+	sourceByteCount := copy(ipBacking, ipPath.SourceIp)
+	copy(ipBacking[sourceByteCount:], ipPath.DestinationIp)
+	ipPath.SourceIp = ipBacking[:sourceByteCount:sourceByteCount]
+	ipPath.DestinationIp = ipBacking[sourceByteCount:]
 	return &ipPath, payload, nil
 }
 
@@ -4363,10 +4491,6 @@ func ParseIpPathWithPayload(ipPacket []byte) (*IpPath, []byte, error) {
 // is valid. It is for synchronous packet-policy hot paths; anything retaining
 // an IpPath must use ParseIpPathWithPayload instead.
 func parseIpPathWithPayloadBorrowed(ipPacket []byte, ipPath *IpPath) ([]byte, error) {
-	return parseIpPathWithPayload(ipPacket, ipPath, false)
-}
-
-func parseIpPathWithPayload(ipPacket []byte, ipPath *IpPath, copyAddresses bool) ([]byte, error) {
 	if len(ipPacket) == 0 {
 		return nil, fmt.Errorf("Empty packet.")
 	}
@@ -4387,16 +4511,6 @@ func parseIpPathWithPayload(ipPacket []byte, ipPath *IpPath, copyAddresses bool)
 	}
 	if !ok {
 		return nil, fmt.Errorf("Malformed ip packet.")
-	}
-
-	if copyAddresses {
-		// Copy the IPs so the public IpPath can be retained independently of
-		// the shared packet buffer. Both copies share one backing allocation.
-		ipBacking := make(net.IP, len(sourceIp)+len(destinationIp))
-		sn := copy(ipBacking, sourceIp)
-		copy(ipBacking[sn:], destinationIp)
-		sourceIp = ipBacking[:sn:sn]
-		destinationIp = ipBacking[sn:]
 	}
 
 	switch ipProtocol {
@@ -4519,8 +4633,11 @@ func (self *IpPath) Destination() *IpPath {
 	}
 }
 
-func (self *IpPath) Reverse() *IpPath {
-	return &IpPath{
+// ReverseValue returns the flow tuple in the opposite direction without
+// allocating. Sequence/flag state is intentionally omitted, matching Reverse:
+// synthetic packets built from a reversed path are out of sequence.
+func (self *IpPath) ReverseValue() IpPath {
+	return IpPath{
 		Protocol:        self.Protocol,
 		Version:         self.Version,
 		SourceIp:        self.DestinationIp,
@@ -4528,6 +4645,11 @@ func (self *IpPath) Reverse() *IpPath {
 		DestinationIp:   self.SourceIp,
 		DestinationPort: self.SourcePort,
 	}
+}
+
+func (self *IpPath) Reverse() *IpPath {
+	reversed := self.ReverseValue()
+	return &reversed
 }
 
 // comparable

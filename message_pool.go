@@ -410,6 +410,10 @@ func ClearMessagePools() {
 	for _, pool := range orderedMessagePools() {
 		pool.Clear()
 	}
+	// ACK-lifetime metadata is also a bounded, recoverable packet-path pool.
+	// Drop it under the same host memory-pressure signal; it repopulates
+	// lazily and never affects in-flight items.
+	clearSendItemPool()
 }
 
 var seed = maphash.MakeSeed()

@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/urnetwork/connect/protocol"
 )
@@ -71,6 +72,33 @@ func BenchmarkRouteSelectorRead(b *testing.B) {
 	for i := 0; i < b.N; i += 1 {
 		if _, err := sel.Read(ctx, -1); err != nil {
 			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+}
+
+// Exercises the finite-deadline path with a permanently full route. The first
+// iteration lazily creates the selector timer; steady state must reuse it so
+// intentional route backpressure does not create timer garbage and GC pauses.
+func BenchmarkRouteSelectorWriteTimeout(b *testing.B) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sel := NewMultiRouteSelector(ctx, "bench", nil, SourceId(NewId()), true)
+	defer sel.Close()
+	route := make(chan []byte, 1)
+	route <- []byte{0}
+	sel.updateTransport(NewSendGatewayTransport(), []Route{route})
+
+	frame := make([]byte, 1400)
+	if success, err := sel.WriteDetailed(ctx, frame, time.Microsecond); success || err != nil {
+		b.Fatalf("warm timeout: success=%t err=%v", success, err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if success, err := sel.WriteDetailed(ctx, frame, time.Microsecond); success || err != nil {
+			b.Fatalf("timeout: success=%t err=%v", success, err)
 		}
 	}
 	b.StopTimer()
@@ -160,27 +188,25 @@ func BenchmarkMultiClientBidirectional(b *testing.B) {
 	// path).
 	providerClient.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, peer Peer) {
 		for _, frame := range frames {
-			v, err := FromFrame(frame)
+			packet, err := ipPacketToProviderBytes(frame)
 			if err != nil {
 				continue
 			}
-			ipToProvider, ok := v.(*protocol.IpPacketToProvider)
-			if !ok {
-				continue
-			}
-			ipPath, payload, err := ParseIpPathWithPayload(ipToProvider.IpPacket.PacketBytes)
+			var ipPath IpPath
+			payload, err := parseIpPathWithPayloadBorrowed(packet, &ipPath)
 			if err != nil {
 				continue
 			}
-			echo := ipOosPacket(ipPath.Reverse(), payload)
-			ipFromProvider := &protocol.IpPacketFromProvider{
-				IpPacket: &protocol.IpPacket{PacketBytes: echo},
-			}
-			echoFrame, err := ToFrame(ipFromProvider, DefaultProtocolVersion)
-			if err != nil {
-				continue
-			}
-			providerClient.SendWithTimeout(echoFrame, source.Reverse(), func(err error) {}, -1)
+			reversed := ipPath.ReverseValue()
+			echo := ipOosPacket(&reversed, payload)
+			providerClient.sendRawWithTimeoutDetailed(
+				protocol.MessageType_IpIpPacketFromProvider,
+				echo,
+				source.Reverse(),
+				nil,
+				0,
+				-1,
+			)
 		}
 	})
 

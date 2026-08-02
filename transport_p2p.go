@@ -3,6 +3,7 @@ package connect
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -28,14 +29,148 @@ import (
 // important - changing this will break compatibility with older clients
 const ReadyHeader = "rdy"
 
+// readP2pMessage reads one complete message from a message-oriented conn into
+// an owned pool buffer. Pion/SCTP itself reports the required size in n with
+// io.ErrShortBuffer, but the detached datachannel wrapper intentionally masks
+// that value and returns n=0. Grow geometrically in that case; compatibility
+// conns that preserve the size still jump directly to it. The queued SCTP
+// message is not consumed on io.ErrShortBuffer.
+func readP2pMessage(
+	conn net.Conn,
+	initialByteCount int,
+	shortBufferFloorByteCount int,
+	maxByteCount int,
+) ([]byte, error) {
+	maxByteCount = max(1, maxByteCount)
+	readByteCount := min(max(1, initialByteCount), maxByteCount)
+	shortBufferFloorByteCount = min(
+		max(readByteCount, shortBufferFloorByteCount),
+		maxByteCount,
+	)
+	for {
+		readBuf := MessagePoolGet(readByteCount)
+		n, err := conn.Read(readBuf)
+		if errors.Is(err, io.ErrShortBuffer) {
+			MessagePoolReturn(readBuf)
+			if maxByteCount < n || readByteCount >= maxByteCount {
+				return nil, fmt.Errorf(
+					"p2p message exceeds maximum %d (reported=%d)",
+					maxByteCount,
+					n,
+				)
+			}
+			nextReadByteCount := maxByteCount
+			if readByteCount <= maxByteCount/2 {
+				nextReadByteCount = readByteCount * 2
+			}
+			nextReadByteCount = max(nextReadByteCount, shortBufferFloorByteCount)
+			if readByteCount < n {
+				nextReadByteCount = min(maxByteCount, max(nextReadByteCount, n))
+			}
+			if nextReadByteCount <= readByteCount {
+				return nil, fmt.Errorf(
+					"p2p message cannot grow beyond %d (max=%d reported=%d)",
+					readByteCount,
+					maxByteCount,
+					n,
+				)
+			}
+			readByteCount = nextReadByteCount
+			continue
+		}
+		if n < 0 || len(readBuf) < n {
+			MessagePoolReturn(readBuf)
+			return nil, fmt.Errorf(
+				"p2p invalid receive byte count %d (buffer=%d)",
+				n,
+				len(readBuf),
+			)
+		}
+		if n == 0 {
+			MessagePoolReturn(readBuf)
+			if err != nil {
+				return nil, err
+			}
+			continue
+		}
+		return readBuf[:n], err
+	}
+}
+
+// readP2pReadyHeader waits for the setup marker on a reliable-unordered data
+// channel. Once one peer reads the other's marker it may install its send
+// route before the other peer has read this marker, so a later transfer frame
+// can legitimately be delivered first after packet reordering/loss. Retain at
+// most the receive-route capacity and drop any excess (the transfer protocol
+// retransmits unacked frames); this keeps setup memory bounded while avoiding
+// a false header mismatch/reconnect loop.
+func readP2pReadyHeader(
+	conn net.Conn,
+	settings *P2pTransportSettings,
+) (prefetched [][]byte, err error) {
+	defer func() {
+		if err != nil {
+			for _, message := range prefetched {
+				MessagePoolReturn(message)
+			}
+			prefetched = nil
+		}
+	}()
+
+	header := []byte(ReadyHeader)
+	maxMessageByteCount := max(1, settings.MaxMessageByteCount)
+	initialMessageByteCount := settings.InitialReadBufferByteCount
+	if initialMessageByteCount <= 0 {
+		initialMessageByteCount = min(4*1024, maxMessageByteCount)
+	}
+	maxPrefetched := max(0, settings.ChannelBufferSize)
+	retain := func(message []byte) {
+		if len(prefetched) < maxPrefetched {
+			prefetched = append(prefetched, message)
+		} else {
+			MessagePoolReturn(message)
+		}
+	}
+
+	for {
+		message, readErr := readP2pMessage(
+			conn,
+			len(header),
+			initialMessageByteCount,
+			maxMessageByteCount,
+		)
+		if slices.Equal(message, header) {
+			MessagePoolReturn(message)
+			return prefetched, nil
+		}
+		if readErr != nil {
+			MessagePoolReturn(message)
+			return nil, readErr
+		}
+		retain(message)
+	}
+}
+
 func DefaultP2pTransportSettings() *P2pTransportSettings {
 	return &P2pTransportSettings{
-		WriteTimeout:        15 * time.Second,
-		ReadTimeout:         15 * time.Second,
-		ConnectTimeout:      15 * time.Second,
-		ReconnectTimeout:    5 * time.Second,
-		ChannelBufferSize:   32,
-		MaxMessageByteCount: 64 * 1024,
+		WriteTimeout:          15 * time.Second,
+		ReadTimeout:           15 * time.Second,
+		ConnectTimeout:        15 * time.Second,
+		ReconnectTimeout:      5 * time.Second,
+		AdmissionRetryTimeout: 30 * time.Second,
+		// Four transfer batches absorb ordinary goroutine scheduling jitter.
+		// A real detached-data-channel measurement sustained the same
+		// 53-54 MiB/s at depths 1/4/8/32. Keeping 32 therefore added no
+		// throughput, but allowed up to 2 MiB of MaxMessageByteCount payloads
+		// to sit in each unbudgeted receive route. Four cuts that hard bound
+		// to 256 KiB and shortens queueing latency.
+		ChannelBufferSize: 4,
+		// Transfer batching is capped at 3 KiB, so almost every data-channel
+		// message fits in the 4 KiB pooled class. The receiver retries once
+		// with Pion's exact required length for a legacy/atypical larger
+		// message, then returns to this size.
+		InitialReadBufferByteCount: 4 * 1024,
+		MaxMessageByteCount:        64 * 1024,
 	}
 }
 
@@ -49,11 +184,19 @@ const (
 )
 
 type P2pTransportSettings struct {
-	WriteTimeout      time.Duration
-	ReadTimeout       time.Duration
-	ConnectTimeout    time.Duration
-	ReconnectTimeout  time.Duration
-	ChannelBufferSize int
+	WriteTimeout     time.Duration
+	ReadTimeout      time.Duration
+	ConnectTimeout   time.Duration
+	ReconnectTimeout time.Duration
+	// AdmissionRetryTimeout is only the liveness fallback for a saturated
+	// peer-connection count/memory budget. Normal retries are woken
+	// immediately by a release, avoiding the former sub-second polling storm.
+	AdmissionRetryTimeout time.Duration
+	ChannelBufferSize     int
+	// InitialReadBufferByteCount is the first pooled receive size.
+	// io.ErrShortBuffer retries with Pion's exact required length up to
+	// MaxMessageByteCount without consuming the queued SCTP message.
+	InitialReadBufferByteCount int
 	// MaxMessageByteCount is the largest single message the transport reads or
 	// writes. The detached WebRTC data channel is message-oriented: one pion
 	// Read returns exactly one whole SCTP user message, and pion/sctp returns
@@ -114,10 +257,19 @@ func NewP2pTransport(
 func (self *P2pTransport) run() {
 	defer self.cancel()
 
+	var setupError string
+	var admissionTimer *time.Timer
+	defer func() {
+		if admissionTimer != nil {
+			admissionTimer.Stop()
+		}
+	}()
+
 	for {
 		// TODO using net.Conn as a stand in for the actual interface
 
 		reconnect := NewReconnect(self.settings.ReconnectTimeout)
+		countNotify, budgetNotify := self.webRtcManager.AdmissionNotify()
 		var conn WebRtcConn
 		var err error
 		// note, one side of the P2P connection will be driving the setup process (active).
@@ -132,6 +284,32 @@ func (self *P2pTransport) run() {
 			return
 		}
 		if err != nil {
+			// Log a failure streak once. The former log-on-every-poll behavior
+			// produced thousands of lines per device, consumed CPU, and evicted
+			// the ICE trace needed to diagnose the failure.
+			if nextSetupError := err.Error(); nextSetupError != setupError {
+				setupError = nextSetupError
+				self.client.log.Infof("[p2p]s(%s) <>%s setup refused = %s\n", self.streamId, self.peerId, err)
+			}
+
+			var admissionErr *peerConnectionAdmissionError
+			if errors.As(err, &admissionErr) {
+				timeout := self.settings.AdmissionRetryTimeout
+				if timeout <= 0 {
+					timeout = 30 * time.Second
+				}
+				timerC := resetOrCreateTimer(&admissionTimer, timeout)
+				select {
+				case <-self.ctx.Done():
+					return
+				case <-countNotify:
+					admissionTimer.Stop()
+				case <-budgetNotify:
+					admissionTimer.Stop()
+				case <-timerC:
+				}
+				continue
+			}
 			select {
 			case <-self.ctx.Done():
 				return
@@ -139,11 +317,13 @@ func (self *P2pTransport) run() {
 			}
 			continue
 		}
+		if setupError != "" {
+			self.client.log.V(1).Infof("[p2p]s(%s) <>%s setup recovered\n", self.streamId, self.peerId)
+			setupError = ""
+		}
 
-		// capture the immediate-reconnect signal BEFORE c() runs so it
-		// observes any NotifyAll fired during c(); the underlying Monitor
-		// returns a fresh (non-firing) channel after NotifyAll, so a late
-		// capture would miss the signal.
+		// The signal is a persistent one-shot channel, so network changes or
+		// remote restart requests cannot be lost if they race setup.
 		immediateReconnect := conn.ImmediateReconnect()
 
 		// at this point, the connection should be able to ping the other side
@@ -154,12 +334,11 @@ func (self *P2pTransport) run() {
 			handleCtx, handleCancel := context.WithCancel(self.ctx)
 			defer handleCancel()
 
-			// the peer's ready header must be consumed before the receive
-			// transport starts reading. otherwise the two concurrent readers
-			// race for the header, and the header reader can instead receive
-			// a later (larger) frame, which fails the read with a short buffer
-			// and tears down the conn.
-			headerRead := make(chan struct{})
+			// The peer's ready header must be consumed by exactly one reader
+			// before the receive transport starts. Because the channel is
+			// reliable-unordered, that reader also boundedly prefetched any
+			// transfer frames delivered ahead of the marker.
+			headerRead := make(chan [][]byte)
 
 			go HandleError(func() {
 				defer handleCancel()
@@ -171,13 +350,21 @@ func (self *P2pTransport) run() {
 					return
 				}
 
+				var prefetched [][]byte
 				select {
 				case <-handleCtx.Done():
 					return
-				case <-headerRead:
+				case prefetched = <-headerRead:
 				}
 
-				t, route := NewP2pReceiveTransport(handleCtx, handleCancel, conn, self.streamId, self.settings)
+				t, route := newP2pReceiveTransport(
+					handleCtx,
+					handleCancel,
+					conn,
+					self.streamId,
+					self.settings,
+					prefetched,
+				)
 
 				updateRoute := func(connected bool) {
 					if connected {
@@ -187,9 +374,10 @@ func (self *P2pTransport) run() {
 					}
 				}
 				unsub := conn.AddConnectedCallback(updateRoute)
-				defer unsub()
-				updateRoute(conn.Connected())
-				defer updateRoute(false)
+				defer func() {
+					unsub()
+					updateRoute(false)
+				}()
 
 				select {
 				case <-handleCtx.Done():
@@ -206,25 +394,25 @@ func (self *P2pTransport) run() {
 				default:
 				}
 
-				// the detached data channel is message-oriented, and the sctp
-				// read fails with a short buffer when the read buffer is smaller
-				// than the message. a dcep ack can arrive before the peer's
-				// ready header, and the datachannel filters dcep internally only
-				// when the read buffer can hold the message. read one whole
-				// message with a max size buffer and require it to be exactly
-				// the ready header.
-				headerBuf := make([]byte, self.settings.MaxMessageByteCount)
+				// A peer can install its send route as soon as it reads our
+				// marker. On the reliable-unordered channel, its subsequent
+				// transfer frame may arrive before its own marker after loss.
+				// Recognize and boundedly carry those frames into the receive
+				// route instead of treating them as a setup failure.
 				conn.SetReadDeadline(time.Now().Add(self.settings.ConnectTimeout))
-				n, err := conn.Read(headerBuf)
+				prefetched, err := readP2pReadyHeader(conn, self.settings)
 				if err != nil {
 					self.client.log.V(1).Infof("[p2p]s(%s) ready header read err = %s\n", self.streamId, err)
 					return
 				}
-				if !slices.Equal(headerBuf[:n], []byte(ReadyHeader)) {
-					self.client.log.V(1).Infof("[p2p]s(%s) ready header mismatch = %x\n", self.streamId, headerBuf[:n])
+				select {
+				case <-handleCtx.Done():
+					for _, message := range prefetched {
+						MessagePoolReturn(message)
+					}
 					return
+				case headerRead <- prefetched:
 				}
-				close(headerRead)
 
 				t, route := NewP2pSendTransportForPeer(handleCtx, handleCancel, conn, self.peerId, self.streamId, self.settings)
 
@@ -236,9 +424,10 @@ func (self *P2pTransport) run() {
 					}
 				}
 				unsub := conn.AddConnectedCallback(updateRoute)
-				defer unsub()
-				updateRoute(conn.Connected())
-				defer updateRoute(false)
+				defer func() {
+					unsub()
+					updateRoute(false)
+				}()
 
 				select {
 				case <-handleCtx.Done():
@@ -435,7 +624,21 @@ func NewP2pReceiveTransport(
 	streamId Id,
 	settings *P2pTransportSettings,
 ) (Transport, Route) {
+	return newP2pReceiveTransport(ctx, cancel, conn, streamId, settings, nil)
+}
+
+func newP2pReceiveTransport(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	conn net.Conn,
+	streamId Id,
+	settings *P2pTransportSettings,
+	prefetched [][]byte,
+) (Transport, Route) {
 	receive := make(chan []byte, settings.ChannelBufferSize)
+	for _, message := range prefetched {
+		receive <- message
+	}
 	p2pReceiveTransport := &P2pReceiveTransport{
 		transportId: NewId(),
 		ctx:         ctx,
@@ -467,20 +670,33 @@ func (self *P2pReceiveTransport) run() {
 		}
 	}()
 
-	// The detached WebRTC data channel is message-oriented: one Read returns one
-	// whole SCTP user message (io.ErrShortBuffer if the buffer is too small for
-	// it). Read each whole message into a single reused buffer, then copy the
-	// exact bytes into a right-sized pooled buffer for the receive queue. This
-	// keeps one max-message-sized allocation for the life of the transport
-	// rather than taking — and, above a pool size class, un-pooling — a
-	// max-message-sized buffer from the message pool on every read.
-	readBuf := make([]byte, self.settings.MaxMessageByteCount)
+	// The detached WebRTC data channel is message-oriented. Read directly into
+	// the pooled buffer whose ownership is handed to the receive route. The
+	// normal transfer batch fits the first 4 KiB attempt. A larger
+	// compatibility message retries boundedly; detached Pion masks SCTP's
+	// required length, so readP2pMessage grows geometrically when n is zero.
+	maxReadByteCount := max(1, self.settings.MaxMessageByteCount)
+	initialReadByteCount := self.settings.InitialReadBufferByteCount
+	if initialReadByteCount <= 0 {
+		initialReadByteCount = min(4*1024, maxReadByteCount)
+	}
+	initialReadByteCount = min(initialReadByteCount, maxReadByteCount)
+	// The ready-header handshake leaves a finite deadline on the shared
+	// net.Conn. Clear it once before entering the steady-state reader.
+	// Connection liveness comes from ICE/PeerConnection failed-state
+	// cancellation; rearming an otherwise ignored 15-second read timeout only
+	// woke every idle peer forever.
+	self.conn.SetReadDeadline(time.Time{})
 
 	for {
-		self.conn.SetReadDeadline(time.Now().Add(self.settings.ReadTimeout))
-		n, err := self.conn.Read(readBuf)
-		if n > 0 {
-			transferFrameBytes := MessagePoolCopy(readBuf[:n])
+		transferFrameBytes, err := readP2pMessage(
+			self.conn,
+			initialReadByteCount,
+			initialReadByteCount,
+			maxReadByteCount,
+		)
+		if 0 < len(transferFrameBytes) {
+			// The route now owns this exact slice and returns it to the pool.
 			select {
 			case <-self.ctx.Done():
 				MessagePoolReturn(transferFrameBytes)
@@ -489,10 +705,8 @@ func (self *P2pReceiveTransport) run() {
 			}
 		}
 		if err != nil {
-			// an idle read timeout is not a dead conn: conn liveness is handled
-			// by the webrtc layer (ice keepalive and disconnect detection),
-			// which removes the routes via the connected callback.
-			// re-arm the read instead of tearing down an idle healthy conn.
+			// A non-WebRTC compatibility conn may still surface a deadline.
+			// Do not mistake an idle timeout for a dead route.
 			if errors.Is(err, os.ErrDeadlineExceeded) {
 				continue
 			}

@@ -8,6 +8,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/urnetwork/connect/protocol"
 )
 
 // newTestSessionForIdentityProof constructs a peerEncryptionSession
@@ -640,14 +642,14 @@ func TestAcquireForSendRestartPolicy(t *testing.T) {
 		manager := NewEncryptionSessionManager(ctx, client, km, settings.EncryptionSettings)
 
 		peerId := NewId()
-		s1 := manager.AcquireForSend(peerId, role, false)
+		s1 := manager.AcquireForSend(peerId, role, false, false)
 		if s1 == nil || s1.role != role {
 			t.Fatalf("expected a %v-role session", role)
 		}
 
 		// An in-flight handshake is never restarted by a later send.
 		inflight := injectTestEpoch(s1, false, nil)
-		s2 := manager.AcquireForSend(peerId, role, false)
+		s2 := manager.AcquireForSend(peerId, role, false, false)
 		if s2 != s1 {
 			t.Fatalf("%v: expected the same per-peer/role session", role)
 		}
@@ -659,7 +661,7 @@ func TestAcquireForSendRestartPolicy(t *testing.T) {
 		// rekey) while keeping the established epoch serving; the server
 		// role reuses.
 		established := injectEstablishedTestEpoch(s1)
-		s3 := manager.AcquireForSend(peerId, role, false)
+		s3 := manager.AcquireForSend(peerId, role, false, false)
 		if s3 != s1 {
 			t.Fatalf("%v: expected the same per-peer/role session", role)
 		}
@@ -673,5 +675,96 @@ func TestAcquireForSendRestartPolicy(t *testing.T) {
 		} else if s3.currentEpoch() != established {
 			t.Fatal("server AcquireForSend must never restart the handshake")
 		}
+	}
+}
+
+// TestEncryptedControlCarrierMirrorsForceStream is the regression test for
+// the network-peer + post-quantum data blackhole: the multi-client sends
+// application data with ForceStream (AllowDirect is forced on for
+// same-network peers), while the EncryptedControl carrier used the client's
+// default TransferOptions (ForceStream=false). ForceStream keys the send
+// sequence but is invisible on the wire, so the carrier forked a SECOND
+// concurrent send sequence whose frames the receiver could not distinguish
+// from the data sequence — both mapped to the same (source, role, companion)
+// receive head slot, the newer sequence id evicted the older, and the
+// loser's packs (the data, or the ClientHello) were dropped un-acked
+// forever. The carrier must ride the SAME send sequence as the data:
+// AcquireForSend records the acquiring sequence's ForceStream on the session
+// and SendEncryptedControl mirrors it (suppressed for companion carriers,
+// whose stream contracts the platform rejects).
+func TestEncryptedControlCarrierMirrorsForceStream(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultClientSettings()
+	settings.EncryptionSettings.Encrypt = true
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+	defer client.Cancel()
+
+	peerId := NewId()
+
+	// the data path's send sequence acquires the session with its
+	// ForceStream option; the session records it as the carrier option
+	s := client.EncryptionSessionManager().AcquireForSend(peerId, sequenceTlsRoleClient, false, true)
+	if s == nil {
+		t.Fatal("expected a client-role session")
+	}
+	if !s.carrierForceStream.Load() {
+		t.Fatal("AcquireForSend(forceStream=true) must record the carrier ForceStream")
+	}
+
+	// the carrier lands on the ForceStream sequence — the same sendSequenceId
+	// the data path uses — and no ForceStream=false twin is created
+	ec := &protocol.EncryptedControl{
+		ControlType: protocol.EncryptedControlType_EncryptedControlHandshake,
+		SessionRole: sequenceTlsRoleClient.toProtobuf(),
+		Payload:     []byte{22, 3, 3, 0, 1, 1},
+	}
+	if !client.sendBuffer.SendEncryptedControl(ctx, peerId, sequenceTlsRoleClient, ec, false, false, s.carrierForceStream.Load()) {
+		t.Fatal("SendEncryptedControl should enqueue")
+	}
+	sequenceKeys := func() []sendSequenceId {
+		client.sendBuffer.mutex.Lock()
+		defer client.sendBuffer.mutex.Unlock()
+		keys := []sendSequenceId{}
+		for key := range client.sendBuffer.sendSequences {
+			if key.Destination.DestinationId == peerId {
+				keys = append(keys, key)
+			}
+		}
+		return keys
+	}
+	keys := sequenceKeys()
+	if len(keys) != 1 {
+		t.Fatalf("expected exactly one send sequence to the peer, got %d (%v)", len(keys), keys)
+	}
+	if !keys[0].ForceStream {
+		t.Fatal("the carrier must ride the data path's ForceStream sequence")
+	}
+
+	// a companion carrier never rides a stream (the platform rejects
+	// companion stream contracts): ForceStream is suppressed
+	ecCompanion := &protocol.EncryptedControl{
+		ControlType: protocol.EncryptedControlType_EncryptedControlHandshake,
+		SessionRole: sequenceTlsRoleClient.toProtobuf(),
+		Companion:   true,
+		Payload:     []byte{22, 3, 3, 0, 1, 1},
+	}
+	if !client.sendBuffer.SendEncryptedControl(ctx, peerId, sequenceTlsRoleClient, ecCompanion, true, true, true) {
+		t.Fatal("companion SendEncryptedControl should enqueue")
+	}
+	for _, key := range sequenceKeys() {
+		if key.CompanionContract && key.ForceStream {
+			t.Fatal("a companion carrier must not request a stream contract")
+		}
+	}
+
+	// last-acquirer-wins: a later data sequence without ForceStream retunes
+	// the carrier
+	s2 := client.EncryptionSessionManager().AcquireForSend(peerId, sequenceTlsRoleClient, false, false)
+	if s2 != s {
+		t.Fatal("expected the same per-peer session")
+	}
+	if s.carrierForceStream.Load() {
+		t.Fatal("AcquireForSend(forceStream=false) must retune the carrier ForceStream")
 	}
 }

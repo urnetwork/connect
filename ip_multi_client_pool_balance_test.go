@@ -59,6 +59,97 @@ func TestMultiClientLifecyclePoolBalance(t *testing.T) {
 	}
 }
 
+// The simple single-destination client uses the same raw v2 envelope as the
+// multi-client. A successful send must consume exactly the caller's packet
+// reference; taking an extra read-only share here leaves one reference
+// outstanding on every packet even though all transfer queues drain cleanly.
+func TestRemoteUserNatClientRawSendPoolBalance(t *testing.T) {
+	poolOutstanding := func() int64 {
+		taken, returned, _ := MessagePoolCounts()
+		return int64(taken) - int64(returned)
+	}
+	settle := func() int64 {
+		prev := poolOutstanding()
+		stableCount := 0
+		deadline := time.Now().Add(15 * time.Second)
+		for time.Now().Before(deadline) {
+			time.Sleep(50 * time.Millisecond)
+			n := poolOutstanding()
+			if n == prev {
+				stableCount += 1
+				if 4 <= stableCount {
+					break
+				}
+			} else {
+				stableCount = 0
+				prev = n
+			}
+		}
+		return prev
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	settings := DefaultClientSettings()
+	settings.SendBufferSettings.SequenceBufferSize = 0
+	settings.SendBufferSettings.AckBufferSize = 0
+	settings.ReceiveBufferSettings.SequenceBufferSize = 0
+	settings.ForwardBufferSettings.SequenceBufferSize = 0
+	providerClient := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+
+	received := make(chan struct{}, 32)
+	providerClient.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, peer Peer) {
+		for _, frame := range frames {
+			if frame.MessageType == protocol.MessageType_IpIpPacketToProvider {
+				select {
+				case received <- struct{}{}:
+				default:
+				}
+			}
+		}
+	})
+	natClient, err := testingNewClient(
+		ctx,
+		providerClient,
+		func(TransferPath, protocol.ProvideMode, *IpPath, []byte) {},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	before := settle()
+	source := SourceId(NewId())
+	const packetCount = 16
+	for i := 0; i < packetCount; i += 1 {
+		packet := poolBalanceUdp4Packet(
+			net.ParseIP("10.0.0.1"),
+			40000+i,
+			net.ParseIP("203.0.113.7"),
+			33434,
+			[]byte("single-client pool balance"),
+		)
+		if !natClient.SendPacket(source, protocol.ProvideMode_Network, packet, time.Second) {
+			MessagePoolReturn(packet)
+			t.Fatal("single-destination send was not accepted")
+		}
+	}
+	for i := 0; i < packetCount; i += 1 {
+		select {
+		case <-received:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("provider received %d/%d packets", i, packetCount)
+		}
+	}
+
+	natClient.Close()
+	providerClient.Close()
+	cancel()
+	after := settle()
+	if before < after {
+		t.Fatalf("single-destination raw sends left pooled buffers outstanding: %d -> %d (+%d)",
+			before, after, after-before)
+	}
+}
+
 // runMultiClientPoolCycle is one destination-change cycle: an in-memory exit, a
 // multi-client over it, a burst of egress packets, then teardown of both.
 func runMultiClientPoolCycle(ctx context.Context, t *testing.T) {

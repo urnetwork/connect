@@ -63,6 +63,88 @@ func TestTransferMemoryBudgetConcurrent(t *testing.T) {
 	AssertEqual(t, reserved, released)
 }
 
+func TestTransferMemoryBudgetTryReserveExactConcurrentCeiling(t *testing.T) {
+	const reservationCount = 2
+	reservationSize := kib(8)
+	budget := NewTransferMemoryBudget(reservationCount * reservationSize)
+
+	start := make(chan struct{})
+	var admitted atomic.Int64
+	var wg sync.WaitGroup
+	for range 32 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if budget.TryReserve(reservationSize) {
+				admitted.Add(1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	AssertEqual(t, admitted.Load(), int64(reservationCount))
+	AssertEqual(t, budget.UsedByteCount(), reservationCount*reservationSize)
+	AssertEqual(t, budget.TryReserve(1), false)
+
+	notify := budget.CapacityNotify()
+	budget.Release(reservationSize)
+	select {
+	case <-notify:
+	case <-time.After(time.Second):
+		t.Fatal("release did not notify an admission waiter")
+	}
+	AssertEqual(t, budget.TryReserve(reservationSize), true)
+	budget.Release(reservationCount * reservationSize)
+	AssertEqual(t, budget.UsedByteCount(), ByteCount(0))
+
+	reserved, released := budget.Counts()
+	AssertEqual(t, reserved, released)
+}
+
+func TestTransferMemoryBudgetCapacityNotificationIsLazy(t *testing.T) {
+	budget := NewTransferMemoryBudget(kib(64))
+	if budget.notify != nil {
+		t.Fatal("budget eagerly allocated a capacity notification")
+	}
+
+	for range 10_000 {
+		budget.Reserve(1)
+		budget.Release(1)
+	}
+	if budget.notify != nil {
+		t.Fatal("release allocated a notification without a waiter")
+	}
+
+	notify := budget.CapacityNotify()
+	if notify == nil {
+		t.Fatal("capacity waiter did not receive a notification channel")
+	}
+	budget.Reserve(1)
+	budget.Release(1)
+	select {
+	case <-notify:
+	case <-time.After(time.Second):
+		t.Fatal("subscribed capacity waiter was not notified")
+	}
+	if budget.notify != nil {
+		t.Fatal("release eagerly allocated the next notification generation")
+	}
+	if next := budget.CapacityNotify(); next == notify {
+		t.Fatal("new waiter reused a closed notification generation")
+	}
+}
+
+func BenchmarkTransferMemoryBudgetReserveReleaseNoWaiter(b *testing.B) {
+	budget := NewTransferMemoryBudget(mib(1))
+	b.ReportAllocs()
+	for range b.N {
+		budget.Reserve(1)
+		budget.Release(1)
+	}
+}
+
 func TestTransferMemoryBudgetResize(t *testing.T) {
 	budget := NewTransferMemoryBudget(kib(64))
 	budget.Reserve(kib(48))

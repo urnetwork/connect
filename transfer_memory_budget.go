@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"sync"
 	"sync/atomic"
 )
 
@@ -25,6 +26,9 @@ type TransferMemoryBudget struct {
 	// a build/load/teardown cycle (the message pool counts pattern)
 	reservedByteCount atomic.Int64
 	releasedByteCount atomic.Int64
+
+	notifyLock sync.Mutex
+	notify     chan struct{}
 }
 
 func NewTransferMemoryBudget(totalByteCount ByteCount) *TransferMemoryBudget {
@@ -43,6 +47,7 @@ func (self *TransferMemoryBudget) TotalByteCount() ByteCount {
 // until enough releases drain it.
 func (self *TransferMemoryBudget) SetTotalByteCount(totalByteCount ByteCount) {
 	self.totalByteCount.Store(totalByteCount)
+	self.notifyCapacityChanged()
 }
 
 // Available is the unreserved remainder of the budget
@@ -61,6 +66,27 @@ func (self *TransferMemoryBudget) Reserve(byteCount ByteCount) {
 	self.reservedByteCount.Add(byteCount)
 }
 
+// TryReserve atomically reserves byteCount only when it fits within the
+// current total. Transfer queues deliberately use Reserve's bounded overdraft
+// semantics, but fixed-size lifetime owners (notably WebRTC peer connections)
+// need an exact admission ceiling shared across multiple managers.
+func (self *TransferMemoryBudget) TryReserve(byteCount ByteCount) bool {
+	if byteCount < 0 {
+		return false
+	}
+	for {
+		total := self.totalByteCount.Load()
+		used := self.usedByteCount.Load()
+		if total < byteCount || total-byteCount < used {
+			return false
+		}
+		if self.usedByteCount.CompareAndSwap(used, used+byteCount) {
+			self.reservedByteCount.Add(byteCount)
+			return true
+		}
+	}
+}
+
 // Release returns bytes to the budget
 func (self *TransferMemoryBudget) Release(byteCount ByteCount) {
 	used := self.usedByteCount.Add(-byteCount)
@@ -70,6 +96,32 @@ func (self *TransferMemoryBudget) Release(byteCount ByteCount) {
 		// log unconditionally so production sees it (tests see it as a
 		// negative used count breaking the balance assertions)
 		DefaultLogger().Errorf("[tmb]release below zero (%d)", used)
+	}
+	self.notifyCapacityChanged()
+}
+
+// CapacityNotify returns a channel closed the next time a release or resize
+// may make admission possible. Capture it before TryReserve to avoid a lost
+// wakeup.
+func (self *TransferMemoryBudget) CapacityNotify() <-chan struct{} {
+	self.notifyLock.Lock()
+	defer self.notifyLock.Unlock()
+	if self.notify == nil {
+		self.notify = make(chan struct{})
+	}
+	return self.notify
+}
+
+func (self *TransferMemoryBudget) notifyCapacityChanged() {
+	self.notifyLock.Lock()
+	defer self.notifyLock.Unlock()
+	if self.notify != nil {
+		close(self.notify)
+		// Allocate the next generation only when a waiter actually subscribes.
+		// Transfer queue budgets release on the packet path but normally have
+		// no capacity waiters; eagerly replacing this channel made every
+		// release allocate.
+		self.notify = nil
 	}
 }
 
