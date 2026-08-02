@@ -205,20 +205,21 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// (a losing first pick is covered by the second in the same round
 		// trip, and the retry loop re-races with a fresh field anyway).
 		//
-		// The reliability motivation is dial-strike noise: every duplicate
-		// origin dial that loses its race still counts as an upstream connect
-		// attempt at the losing exits, and with the client-side dial-failure
-		// inference feeding strikes, window-size duplicate dials per cold
-		// start manufactured starvation evidence against exits that were
-		// merely slower, not broken. Capping the field at 2 halves the worst
-		// case and removes the all-exits-probed-at-once shape entirely.
+		// 0 = race everything, and that is deliberate. A bound of 2 was tried
+		// (the dial-strike-noise rationale: window-size duplicate origin dials
+		// per cold start manufactured starvation evidence against exits that
+		// were merely slower) and reverted after one field session: on a pool
+		// whose providers stall intermittently, two picks are a coin flip, and
+		// a cold-start-heavy workload -- short-video feeds open new quic
+		// connections continuously -- read as constant spinners. The wide race
+		// is the tail-latency insurance exactly when the pool is rough. The
+		// strike-noise concern is carried instead by the per-destination
+		// gating on dialStarved, which requires strikes spanning distinct
+		// destinations and so already discounts race-loser noise.
 		//
-		// The truncation is enforced at raceClients in sendPacket, which
-		// slices the ordered candidate list to this count before spawning the
-		// per-client senders -- verified present; see the
-		// `raceOrderedClients = orderedClients[:self.settings.MultiRaceClientCount]`
-		// branch there. 0 restores race-everything, the A/B comparison point.
-		MultiRaceClientCount: 2,
+		// The truncation is enforced at raceClients in sendPacket
+		// (`raceOrderedClients = orderedClients[:self.settings.MultiRaceClientCount]`).
+		MultiRaceClientCount: 0,
 
 		StatsWindowMaxUnhealthyDuration:  15 * time.Second,
 		StatsWindowWarnUnhealthyDuration: 5 * time.Second,
@@ -1532,19 +1533,37 @@ func (self *RemoteUserNatMultiClient) underFlowCap(clients []*multiClientChannel
 // split traffic off the rank the platform chose. A no-race placement still
 // recovers through the dial-failure and send-error re-race paths.
 func (self *RemoteUserNatMultiClient) raceCandidates(window *multiClientWindow) []*multiClientChannel {
-	return self.raceCandidatesFrom(window.OrderedClients, window.orderedClientsCrossTier)
+	return self.raceCandidatesFrom(window.OrderedClients, window.orderedClientsCrossTier, window.lastResortClients)
 }
 
 // raceCandidatesFrom is raceCandidates over explicit list sources, the seam
-// the tests drive. Both are pulled lazily: the cross-tier walk only happens
-// when the min tier is saturated, and with the cap off the window's rank gate
-// is left exactly as it was.
+// the tests drive. All are pulled lazily: the cross-tier walk only happens
+// when the min tier is saturated, the last-resort walk only when the window's
+// whole offer is empty, and with the cap off the window's rank gate is left
+// exactly as it was.
 func (self *RemoteUserNatMultiClient) raceCandidatesFrom(
 	minTier func() []*multiClientChannel,
 	crossTier func() []*multiClientChannel,
+	lastResort func() []*multiClientChannel,
 ) []*multiClientChannel {
 	minTierClients := minTier()
-	if len(minTierClients) == 0 || self.reliabilitySettings().MaxFlowsPerExit <= 0 {
+	if len(minTierClients) == 0 {
+		// the window offered nothing: every exit is warned or quarantined at
+		// once -- the steady state of a pool whose providers stall
+		// intermittently under load, since a quarantined exit is excluded
+		// from the offer for exactly as long as its stall lasts. Refusing to
+		// place leaves the flow in the send retry loop with nothing to try,
+		// which the user experiences as a spinner that ends only when some
+		// exit happens to unbench. A benched exit is soft-suspect but alive:
+		// hand the whole benched field to the race and let the first
+		// responder win -- the race is itself the health probe that finds
+		// whichever stalled exit is currently moving bytes.
+		if benched := lastResort(); 0 < len(benched) {
+			return benched
+		}
+		return minTierClients
+	}
+	if self.reliabilitySettings().MaxFlowsPerExit <= 0 {
 		return minTierClients
 	}
 	if under := self.underFlowCap(minTierClients); 0 < len(under) {
@@ -2396,8 +2415,8 @@ func (self *RemoteUserNatMultiClient) rebindCandidates(dying *multiClientChannel
 
 	candidates := []*multiClientChannel{}
 	lastEventTimes := map[*multiClientChannel]time.Time{}
-	for _, window := range self.windows {
-		for _, c := range window.OrderedClients() {
+	gather := func(clients []*multiClientChannel) {
+		for _, c := range clients {
 			if c == dying {
 				continue
 			}
@@ -2414,6 +2433,21 @@ func (self *RemoteUserNatMultiClient) rebindCandidates(dying *multiClientChannel
 			}
 			candidates = append(candidates, c)
 			lastEventTimes[c] = stats.lastEventTime
+		}
+	}
+	for _, window := range self.windows {
+		gather(window.OrderedClients())
+	}
+	if len(candidates) == 0 {
+		// the windows' offer is empty -- every exit is warned or quarantined
+		// at once, which is the normal state of a pool whose providers stall
+		// intermittently under load. A benched exit is soft-suspect but
+		// alive; a rebind onto it beats the alternative, which is tearing
+		// down every one of the dying exit's established flows for want of a
+		// clean candidate. On device this exact gap read as "0 flows rebound
+		// to 0 replacements, 33 torn down" in the middle of a video.
+		for _, window := range self.windows {
+			gather(window.unorderedClients())
 		}
 	}
 	slices.SortStableFunc(candidates, func(a *multiClientChannel, b *multiClientChannel) int {
@@ -5721,6 +5755,25 @@ func (self *multiClientWindow) unorderedClients() []*multiClientChannel {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	return slices.Collect(maps.Values(self.clients))
+}
+
+// lastResortClients is the window's offer when its ordinary offer is empty:
+// every client that is still alive, warned and quarantined ones included. A
+// benched exit is soft-suspect, not dead -- on a pool whose providers stall
+// intermittently, the whole window benches at once routinely, and refusing
+// to place new flows then turns a rough pool into no service at all. The
+// list is deliberately unordered and unfiltered beyond liveness: the caller
+// races it, and the first responder is by construction whichever benched
+// exit is currently moving bytes.
+func (self *multiClientWindow) lastResortClients() []*multiClientChannel {
+	clients := []*multiClientChannel{}
+	for _, client := range self.unorderedClients() {
+		if client.IsDone() {
+			continue
+		}
+		clients = append(clients, client)
+	}
+	return clients
 }
 
 // OrderedClients is the window's offer to the race: its healthy clients,

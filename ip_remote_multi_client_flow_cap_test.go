@@ -125,6 +125,7 @@ func TestRaceCandidatesStayOnMinTierWhileItHasCapacity(t *testing.T) {
 	candidates := parent.raceCandidatesFrom(
 		clientList(clients...),
 		mustNotBeConsulted(t, "the cross-tier list"),
+		mustNotBeConsulted(t, "the last-resort list"),
 	)
 	if len(candidates) != 2 || candidates[0] != clients[1] || candidates[1] != clients[2] {
 		t.Errorf("got %d candidates, want the two min-tier exits under the cap", len(candidates))
@@ -141,6 +142,7 @@ func TestRaceCandidatesSingleUnderCapCandidateStandsAlone(t *testing.T) {
 	candidates := parent.raceCandidatesFrom(
 		clientList(clients...),
 		mustNotBeConsulted(t, "the cross-tier list"),
+		mustNotBeConsulted(t, "the last-resort list"),
 	)
 	if len(candidates) != 1 || candidates[0] != clients[2] {
 		t.Errorf("got %d candidates, want exactly the one min-tier exit under the cap", len(candidates))
@@ -160,6 +162,7 @@ func TestRaceCandidatesCrossTierWhenMinTierSaturated(t *testing.T) {
 	candidates := parent.raceCandidatesFrom(
 		clientList(clients[0]),
 		clientList(clients...),
+		mustNotBeConsulted(t, "the last-resort list"),
 	)
 	if len(candidates) != 2 || candidates[0] != clients[1] || candidates[1] != clients[2] {
 		t.Errorf("got %d candidates, want the two under-cap spares from the crossed field", len(candidates))
@@ -176,6 +179,7 @@ func TestRaceCandidatesOverflowGoesLeastLoaded(t *testing.T) {
 	candidates := parent.raceCandidatesFrom(
 		clientList(clients[0]),
 		clientList(clients...),
+		mustNotBeConsulted(t, "the last-resort list"),
 	)
 	if len(candidates) != 1 || candidates[0] != clients[2] {
 		t.Errorf("got %d candidates, want exactly the least-loaded exit: everything is full and overflow must spread toward an even share", len(candidates))
@@ -190,6 +194,7 @@ func TestRaceCandidatesOverflowKeepsTiesRacing(t *testing.T) {
 	candidates := parent.raceCandidatesFrom(
 		clientList(clients[0]),
 		clientList(clients...),
+		mustNotBeConsulted(t, "the last-resort list"),
 	)
 	if len(candidates) != 2 || candidates[0] != clients[1] || candidates[1] != clients[2] {
 		t.Errorf("got %d candidates, want the two tied least-loaded exits", len(candidates))
@@ -204,6 +209,7 @@ func TestRaceCandidatesEmptyCrossTierFallsBackToMinTier(t *testing.T) {
 	candidates := parent.raceCandidatesFrom(
 		clientList(clients[0]),
 		clientList(),
+		mustNotBeConsulted(t, "the last-resort list"),
 	)
 	if len(candidates) != 1 || candidates[0] != clients[0] {
 		t.Errorf("got %d candidates, want the min tier as offered when the crossed field is empty", len(candidates))
@@ -218,6 +224,7 @@ func TestRaceCandidatesCapOffLeavesTheRankGateAlone(t *testing.T) {
 	candidates := parent.raceCandidatesFrom(
 		clientList(clients[0]),
 		mustNotBeConsulted(t, "the cross-tier list"),
+		mustNotBeConsulted(t, "the last-resort list"),
 	)
 	if len(candidates) != 1 || candidates[0] != clients[0] {
 		t.Errorf("got %d candidates, want the min tier untouched with the cap off", len(candidates))
@@ -231,6 +238,7 @@ func TestRaceCandidatesEmptyWindow(t *testing.T) {
 	candidates := parent.raceCandidatesFrom(
 		clientList(),
 		mustNotBeConsulted(t, "the cross-tier list"),
+		clientList(),
 	)
 	if len(candidates) != 0 {
 		t.Errorf("got %d candidates from an empty window", len(candidates))
@@ -254,6 +262,40 @@ func TestMinTierClientsKeepsOnlyBestRank(t *testing.T) {
 
 	if kept := minTierClients([]*multiClientChannel{}); len(kept) != 0 {
 		t.Errorf("got %d clients from an empty input", len(kept))
+	}
+}
+
+// When the window's whole offer is empty -- every exit warned or quarantined
+// at once, the steady state of a pool whose providers stall intermittently --
+// the benched field is handed to the race rather than leaving the flow
+// unroutable in the send retry loop. On device the missing fallback read as
+// spinners on a short-video feed that lasted until some exit happened to
+// unbench.
+func TestRaceCandidatesEmptyOfferFallsBackToBenched(t *testing.T) {
+	parent, clients := flowCapTestParent(t, 8, 3, 5)
+
+	candidates := parent.raceCandidatesFrom(
+		clientList(),
+		mustNotBeConsulted(t, "the cross-tier list"),
+		clientList(clients...),
+	)
+	if len(candidates) != 2 || candidates[0] != clients[0] || candidates[1] != clients[1] {
+		t.Errorf("got %d candidates, want the whole benched field: an empty offer must fall back to warned exits", len(candidates))
+	}
+}
+
+// The benched fallback applies with the cap off too -- starvation protection
+// is not a cap feature.
+func TestRaceCandidatesEmptyOfferFallsBackWithCapOff(t *testing.T) {
+	parent, clients := flowCapTestParent(t, 0, 3)
+
+	candidates := parent.raceCandidatesFrom(
+		clientList(),
+		mustNotBeConsulted(t, "the cross-tier list"),
+		clientList(clients...),
+	)
+	if len(candidates) != 1 || candidates[0] != clients[0] {
+		t.Errorf("got %d candidates, want the benched field regardless of the cap setting", len(candidates))
 	}
 }
 
@@ -281,5 +323,19 @@ func TestSendPathPlacesFlowsThroughRaceCandidates(t *testing.T) {
 	}
 	if !strings.Contains(body, "orderedClientsCrossTier") {
 		t.Error("raceCandidates does not offer the cross-tier list, so a saturated min tier still cannot spread")
+	}
+	if !strings.Contains(body, "lastResortClients") {
+		t.Error("raceCandidates does not offer the last-resort list, so an all-benched window leaves flows unroutable")
+	}
+
+	// the rebind gather needs the same starvation fallback: candidates from
+	// the ordinary offer only, and a dying exit's flows are torn down for
+	// want of a clean candidate exactly when the pool benches at once
+	body, ok = functionBody(source, "func (self *RemoteUserNatMultiClient) rebindCandidates(")
+	if !ok {
+		t.Fatal("could not find rebindCandidates")
+	}
+	if !strings.Contains(body, "unorderedClients()") {
+		t.Error("rebindCandidates has no benched fallback: an all-warned pool tears down every rebindable flow")
 	}
 }

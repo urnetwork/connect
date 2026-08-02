@@ -451,13 +451,16 @@ func TestReliabilitySettingsPreferHealthyDefaults(t *testing.T) {
 	AssertEqual(t, bare.MinBlackholeDestinations, 0)
 }
 
-// The race field bound ships at 2, and the truncation that enforces it is
-// present at the raceClients site in sendPacket. Most flows are placed by
-// affinity and never race; bounding the cold-start race at two candidates
-// halves the duplicate-dial strike noise a full-window race manufactured.
+// The race field ships UNBOUNDED. A bound of 2 was tried and reverted after
+// one field session: on a pool whose providers stall intermittently, two
+// picks are a coin flip, and a cold-start-heavy workload (short-video feeds)
+// read as constant spinners. The wide race is the tail-latency insurance
+// exactly when the pool is rough; per-destination strike gating carries the
+// dial-noise concern instead. The truncation machinery stays present so the
+// bound remains one settings write away for pools where it fits.
 func TestReliabilitySettingsMultiRaceClientCountDefault(t *testing.T) {
 	settings := DefaultMultiClientSettings()
-	AssertEqual(t, settings.MultiRaceClientCount, 2)
+	AssertEqual(t, settings.MultiRaceClientCount, 0)
 
 	source, err := readSource("ip_remote_multi_client.go")
 	if err != nil {
