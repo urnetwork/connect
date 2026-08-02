@@ -140,6 +140,49 @@ func TestWindowIdentityState(t *testing.T) {
 	AssertEqual(t, storesBefore, storesAfter)
 }
 
+func TestWindowIdentityStaleRemovalCannotDeleteReplacementGeneration(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store := &fakeIdentityStore{}
+	state := newWindowIdentityState(ctx, store)
+	clientId := NewId()
+	oldIdentity := &WindowClientIdentity{
+		ClientId:    clientId,
+		ByJwt:       "old",
+		InstanceId:  NewId(),
+		Destination: RequireMultiHopId(NewId()),
+	}
+	replacement := &WindowClientIdentity{
+		ClientId:    clientId,
+		ByJwt:       "replacement",
+		InstanceId:  NewId(),
+		Destination: RequireMultiHopId(NewId()),
+	}
+	state.Record(oldIdentity)
+	state.Record(replacement)
+	waitForPersisted(t, store, "replacement generation", func(persisted []*WindowClientIdentity) bool {
+		return len(persisted) == 1 && persisted[0].InstanceId == replacement.InstanceId
+	})
+
+	if state.RemoveIfCurrent(clientId, oldIdentity.InstanceId) {
+		t.Fatal("stale identity generation was allowed to remove its replacement")
+	}
+	state.mutex.Lock()
+	current := state.live[clientId]
+	state.mutex.Unlock()
+	if current != replacement {
+		t.Fatal("stale identity cleanup changed the live replacement")
+	}
+
+	if !state.RemoveIfCurrent(clientId, replacement.InstanceId) {
+		t.Fatal("current identity generation could not remove itself")
+	}
+	waitForPersisted(t, store, "current generation removal", func(persisted []*WindowClientIdentity) bool {
+		return len(persisted) == 0
+	})
+}
+
 func TestWindowIdentityRestoreResultIsBounded(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

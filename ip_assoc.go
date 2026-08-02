@@ -576,6 +576,8 @@ type ipAssocScratch struct {
 	adjInit        []int32
 	adjNodes       []uint32
 	adjPs          []float64
+	splitInCluster []bool
+	splitSums      []float64
 
 	entityHighWater int
 }
@@ -691,6 +693,13 @@ func growUint64(s []uint64, n int) []uint64 {
 func growFloat64(s []float64, n int) []float64 {
 	if cap(s) < n {
 		return make([]float64, n)
+	}
+	return s[:n]
+}
+
+func growBool(s []bool, n int) []bool {
+	if cap(s) < n {
+		return make([]bool, n)
 	}
 	return s[:n]
 }
@@ -999,63 +1008,64 @@ func clusterIpAssocScratch(
 
 // splitIpAssocCluster removes the member with the lowest mean association until all
 // members have mean association >= minMeanAssociation, returning the surviving
-// cluster and the removed members. component sizes are bounded by
-// MaxComponentNodeCount, so the per-component maps stay small.
+// cluster and removed members in removal order. It partitions pool in place and
+// uses node-indexed reusable scratch so the bounded component split does not
+// allocate or add map work to every clustering epoch.
 func splitIpAssocCluster(
 	scratch *ipAssocScratch,
 	pool []uint32,
 	minMeanAssociation float64,
 ) (cluster []uint32, rest []uint32) {
-	cluster = append([]uint32{}, pool...)
-	inCluster := map[uint32]bool{}
-	for _, node := range cluster {
-		inCluster[node] = true
+	scratch.splitInCluster = growBool(scratch.splitInCluster, len(scratch.nodeCounts))
+	scratch.splitSums = growFloat64(scratch.splitSums, len(scratch.nodeCounts))
+	for _, node := range pool {
+		scratch.splitInCluster[node] = true
+		scratch.splitSums[node] = 0
 	}
 	// sum of associations to other members
-	sums := map[uint32]float64{}
-	for _, node := range cluster {
+	for _, node := range pool {
 		for ai := scratch.adjInit[node]; ai < scratch.adjInit[node+1]; ai += 1 {
-			if inCluster[scratch.adjNodes[ai]] {
-				sums[node] += scratch.adjPs[ai]
+			if scratch.splitInCluster[scratch.adjNodes[ai]] {
+				scratch.splitSums[node] += scratch.adjPs[ai]
 			}
 		}
 	}
 
-	for 2 <= len(cluster) {
-		minNode := uint32(0)
+	activeCount := len(pool)
+	for 2 <= activeCount {
+		minIndex := 0
 		minMean := 0.0
-		found := false
-		for _, node := range cluster {
-			mean := sums[node] / float64(len(cluster)-1)
-			if !found || mean < minMean {
-				minNode = node
+		for i, node := range pool[:activeCount] {
+			mean := scratch.splitSums[node] / float64(activeCount-1)
+			if i == 0 || mean < minMean {
+				minIndex = i
 				minMean = mean
-				found = true
 			}
 		}
 		if minMeanAssociation <= minMean {
 			// all members satisfy the threshold
-			return
+			slices.Reverse(pool[activeCount:])
+			for _, node := range pool[:activeCount] {
+				scratch.splitInCluster[node] = false
+			}
+			return pool[:activeCount], pool[activeCount:]
 		}
 		// split off the weakest member
-		delete(inCluster, minNode)
+		minNode := pool[minIndex]
+		scratch.splitInCluster[minNode] = false
 		for ai := scratch.adjInit[minNode]; ai < scratch.adjInit[minNode+1]; ai += 1 {
-			if inCluster[scratch.adjNodes[ai]] {
-				sums[scratch.adjNodes[ai]] -= scratch.adjPs[ai]
+			neighbor := scratch.adjNodes[ai]
+			if scratch.splitInCluster[neighbor] {
+				scratch.splitSums[neighbor] -= scratch.adjPs[ai]
 			}
 		}
-		next := make([]uint32, 0, len(cluster)-1)
-		for _, node := range cluster {
-			if node != minNode {
-				next = append(next, node)
-			}
-		}
-		cluster = next
-		rest = append(rest, minNode)
+		copy(pool[minIndex:activeCount-1], pool[minIndex+1:activeCount])
+		activeCount -= 1
+		pool[activeCount] = minNode
 	}
-	rest = append(rest, cluster...)
-	cluster = nil
-	return
+	scratch.splitInCluster[pool[0]] = false
+	slices.Reverse(pool)
+	return nil, pool
 }
 
 // ipAssocClustersEqual compares two cluster snapshots. cluster member slices are

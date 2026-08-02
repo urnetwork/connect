@@ -83,6 +83,168 @@ func TestTakeContractStreamStamped(t *testing.T) {
 	)
 }
 
+func TestInitialNetworkPeerContractCoversColdPageBurst(t *testing.T) {
+	settings := DefaultContractManagerSettings()
+	manager := &ContractManager{settings: settings}
+
+	byteCount := manager.contractByteCount(
+		ContractKey{Destination: DestinationId(NewId()), NetworkPeer: true},
+		0,
+		0,
+	)
+	AssertEqual(t, mib(1), byteCount)
+}
+
+func TestInitialPublicForceStreamContractKeepsSmallEscrow(t *testing.T) {
+	settings := DefaultContractManagerSettings()
+	manager := &ContractManager{settings: settings}
+
+	byteCount := manager.contractByteCount(ContractKey{ForceStream: true}, 0, 0)
+	AssertEqual(t, kib(16), byteCount)
+}
+
+func TestInitialRegularContractKeepsSmallEscrow(t *testing.T) {
+	settings := DefaultContractManagerSettings()
+	manager := &ContractManager{settings: settings}
+
+	byteCount := manager.contractByteCount(ContractKey{}, 0, 0)
+	AssertEqual(t, kib(16), byteCount)
+}
+
+func TestConnectedNetworkPeerUsesLargeInitialContract(t *testing.T) {
+	peerId := NewId()
+	peerManager := NewPeerManager(
+		context.Background(),
+		nil,
+		DefaultPeerManagerSettings(),
+	)
+	_, err := peerManager.updatePeers(&protocol.NetworkPeersUpdate{
+		Peers: []*protocol.NetworkPeer{{
+			ClientId: peerId.Bytes(),
+		}},
+	})
+	AssertEqual(t, err, nil)
+	manager := &ContractManager{
+		client:   &Client{peerManager: peerManager},
+		settings: DefaultContractManagerSettings(),
+	}
+
+	byteCount := manager.contractByteCount(
+		ContractKey{Destination: DestinationId(peerId), ForceStream: false},
+		0,
+		0,
+	)
+	AssertEqual(t, mib(1), byteCount)
+}
+
+func TestDisconnectedNetworkPeerKeepsSmallInitialContract(t *testing.T) {
+	peerId := NewId()
+	disconnectTime := uint64(time.Now().UnixMilli())
+	peerManager := NewPeerManager(
+		context.Background(),
+		nil,
+		DefaultPeerManagerSettings(),
+	)
+	_, err := peerManager.updatePeers(&protocol.NetworkPeersUpdate{
+		Peers: []*protocol.NetworkPeer{{
+			ClientId:       peerId.Bytes(),
+			DisconnectTime: &disconnectTime,
+		}},
+	})
+	AssertEqual(t, err, nil)
+	manager := &ContractManager{
+		client:   &Client{peerManager: peerManager},
+		settings: DefaultContractManagerSettings(),
+	}
+
+	byteCount := manager.contractByteCount(
+		ContractKey{Destination: DestinationId(peerId), ForceStream: true},
+		0,
+		0,
+	)
+	AssertEqual(t, kib(16), byteCount)
+}
+
+func TestInitialNetworkPeerContractHonorsLargerMessageMinimum(t *testing.T) {
+	settings := DefaultContractManagerSettings()
+	manager := &ContractManager{settings: settings}
+
+	byteCount := manager.contractByteCount(
+		ContractKey{Destination: DestinationId(NewId()), NetworkPeer: true},
+		0,
+		mib(2),
+	)
+	AssertEqual(t, mib(2), byteCount)
+}
+
+func TestInitialNetworkPeerContractDoesNotExceedStandardBound(t *testing.T) {
+	settings := DefaultContractManagerSettings()
+	settings.InitialNetworkPeerContractTransferByteCount = settings.StandardContractTransferByteCount * 2
+	manager := &ContractManager{settings: settings}
+
+	byteCount := manager.contractByteCount(
+		ContractKey{Destination: DestinationId(NewId()), NetworkPeer: true},
+		0,
+		0,
+	)
+	AssertEqual(t, settings.StandardContractTransferByteCount, byteCount)
+}
+
+func TestInitialNetworkPeerContractSupportsPartialSettings(t *testing.T) {
+	settings := &ContractManagerSettings{
+		InitialContractTransferByteCount:            kib(16),
+		InitialNetworkPeerContractTransferByteCount: mib(1),
+	}
+	manager := &ContractManager{settings: settings}
+
+	byteCount := manager.contractByteCount(
+		ContractKey{Destination: DestinationId(NewId()), NetworkPeer: true},
+		0,
+		0,
+	)
+	AssertEqual(t, mib(1), byteCount)
+}
+
+func TestContractByteCountDoesNotWrapNegativeSettings(t *testing.T) {
+	settings := &ContractManagerSettings{
+		InitialContractTransferByteCount:            -1,
+		InitialNetworkPeerContractTransferByteCount: -1,
+		StandardContractTransferByteCount:           -1,
+	}
+	manager := &ContractManager{settings: settings}
+
+	byteCount := manager.contractByteCount(
+		ContractKey{ForceStream: true},
+		0,
+		-1,
+	)
+	AssertEqual(t, ByteCount(0), byteCount)
+}
+
+func TestNetworkPeerContractRampReachesStandardBound(t *testing.T) {
+	settings := DefaultContractManagerSettings()
+	manager := &ContractManager{settings: settings}
+	contractKey := ContractKey{
+		Destination: DestinationId(NewId()),
+		NetworkPeer: true,
+	}
+
+	previousByteCount := ByteCount(0)
+	for contractSeqIndex := uint64(0); contractSeqIndex <= settings.ContractTransferByteSeqScale; contractSeqIndex += 1 {
+		byteCount := manager.contractByteCount(contractKey, contractSeqIndex, 0)
+		if byteCount < previousByteCount {
+			t.Fatalf(
+				"contract %d byte count decreased from %d to %d",
+				contractSeqIndex,
+				previousByteCount,
+				byteCount,
+			)
+		}
+		previousByteCount = byteCount
+	}
+	AssertEqual(t, settings.StandardContractTransferByteCount, previousByteCount)
+}
+
 func TestTakeContract(t *testing.T) {
 	// in parallel, add contracts, take contracts, and optionally return contract
 	// make sure all created contracts get eventually taken
@@ -375,6 +537,236 @@ func TestContractQueueExpire(t *testing.T) {
 	polled, expiredContracts = queue.Poll(time.Time{})
 	AssertEqual(t, freshContract, polled)
 	AssertEqual(t, 0, len(expiredContracts))
+}
+
+func newActiveContractPrefetchTestManager(
+	t *testing.T,
+	networkPeer bool,
+) (*ContractManager, ContractKey, *protocol.Contract) {
+	t.Helper()
+
+	destinationId := NewId()
+	contractKey := ContractKey{
+		Destination: DestinationId(destinationId),
+		NetworkPeer: networkPeer,
+	}
+	prefetchId := NewId()
+	storedContract := &protocol.StoredContract{
+		ContractId:        prefetchId.Bytes(),
+		TransferByteCount: uint64(mib(1)),
+		SourceId:          NewId().Bytes(),
+		DestinationId:     destinationId.Bytes(),
+	}
+	storedContractBytes, err := ProtoMarshal(storedContract)
+	AssertEqual(t, err, nil)
+	prefetch := &protocol.Contract{
+		StoredContractBytes: storedContractBytes,
+	}
+	queue := newContractQueue(NewNoopLogger(), false)
+	AssertEqual(t, queue.Add(prefetch, storedContract), nil)
+	queue.mutex.Lock()
+	queue.contracts[prefetchId].enqueueTime = time.Now().Add(-time.Hour)
+	queue.mutex.Unlock()
+
+	manager := &ContractManager{
+		ctx:                  context.Background(),
+		client:               &Client{log: NewNoopLogger()},
+		settings:             DefaultContractManagerSettings(),
+		destinationContracts: map[ContractKey]*contractQueue{contractKey: queue},
+		localStats:           NewContractManagerStats(),
+	}
+	openContractId := NewId()
+	manager.localStats.ContractOpenByteCounts[openContractId] = mib(1)
+	manager.localStats.ContractOpenKeys[openContractId] = contractKey
+	return manager, contractKey, prefetch
+}
+
+func TestContractQueueJanitorKeepsPrefetchForOpenContract(t *testing.T) {
+	manager, contractKey, _ := newActiveContractPrefetchTestManager(t, true)
+
+	expired := manager.expireQueuedContractsBefore(time.Now())
+	AssertEqual(t, 0, len(expired))
+
+	manager.mutex.Lock()
+	queue := manager.destinationContracts[contractKey]
+	manager.mutex.Unlock()
+	if queue == nil {
+		t.Fatal("janitor removed a live sequence's prefetch queue")
+	}
+	queue.mutex.Lock()
+	pendingCount := len(queue.contracts)
+	queue.mutex.Unlock()
+	AssertEqual(t, 1, pendingCount)
+}
+
+func TestContractQueueJanitorBoundsStaleNetworkPrefetches(t *testing.T) {
+	manager, contractKey, first := newActiveContractPrefetchTestManager(t, true)
+	manager.mutex.Lock()
+	queue := manager.destinationContracts[contractKey]
+	manager.mutex.Unlock()
+
+	secondId := NewId()
+	secondStored := &protocol.StoredContract{
+		ContractId:        secondId.Bytes(),
+		TransferByteCount: uint64(mib(1)),
+		SourceId:          NewId().Bytes(),
+		DestinationId:     contractKey.Destination.DestinationId.Bytes(),
+	}
+	secondBytes, err := ProtoMarshal(secondStored)
+	AssertEqual(t, err, nil)
+	second := &protocol.Contract{StoredContractBytes: secondBytes}
+	AssertEqual(t, queue.Add(second, secondStored), nil)
+	queue.mutex.Lock()
+	queue.contracts[secondId].enqueueTime = time.Now().Add(-30 * time.Minute)
+	queue.mutex.Unlock()
+
+	expired := manager.expireQueuedContractsBefore(time.Now())
+	AssertEqual(t, 1, len(expired))
+	AssertEqual(t, first, expired[0])
+
+	queue.mutex.Lock()
+	pendingCount := len(queue.contracts)
+	_, retainedNewest := queue.contracts[secondId]
+	queue.mutex.Unlock()
+	AssertEqual(t, 1, pendingCount)
+	AssertEqual(t, true, retainedNewest)
+}
+
+func TestContractQueueJanitorPrefersFreshNetworkPrefetch(t *testing.T) {
+	manager, contractKey, stale := newActiveContractPrefetchTestManager(t, true)
+	manager.mutex.Lock()
+	queue := manager.destinationContracts[contractKey]
+	manager.mutex.Unlock()
+
+	freshId := NewId()
+	freshStored := &protocol.StoredContract{
+		ContractId:        freshId.Bytes(),
+		TransferByteCount: uint64(mib(1)),
+		SourceId:          NewId().Bytes(),
+		DestinationId:     contractKey.Destination.DestinationId.Bytes(),
+	}
+	freshBytes, err := ProtoMarshal(freshStored)
+	AssertEqual(t, err, nil)
+	fresh := &protocol.Contract{StoredContractBytes: freshBytes}
+	AssertEqual(t, queue.Add(fresh, freshStored), nil)
+
+	expired := manager.expireQueuedContractsBefore(time.Now().Add(-time.Minute))
+	AssertEqual(t, 1, len(expired))
+	AssertEqual(t, stale, expired[0])
+
+	queue.mutex.Lock()
+	pendingCount := len(queue.contracts)
+	_, retainedFresh := queue.contracts[freshId]
+	queue.mutex.Unlock()
+	AssertEqual(t, 1, pendingCount)
+	AssertEqual(t, true, retainedFresh)
+}
+
+func TestContractQueueJanitorExpiresPrefetchAfterOpenContractCloses(t *testing.T) {
+	manager, contractKey, prefetch := newActiveContractPrefetchTestManager(t, true)
+	manager.mutex.Lock()
+	clear(manager.localStats.ContractOpenByteCounts)
+	clear(manager.localStats.ContractOpenKeys)
+	manager.mutex.Unlock()
+
+	expired := manager.expireQueuedContractsBefore(time.Now())
+	AssertEqual(t, 1, len(expired))
+	AssertEqual(t, prefetch, expired[0])
+
+	manager.mutex.Lock()
+	_, retained := manager.destinationContracts[contractKey]
+	manager.mutex.Unlock()
+	if retained {
+		t.Fatal("janitor retained an orphaned prefetch queue")
+	}
+}
+
+func TestContractQueueJanitorExpiresPublicPrefetchWithOpenContract(t *testing.T) {
+	manager, contractKey, prefetch := newActiveContractPrefetchTestManager(t, false)
+
+	expired := manager.expireQueuedContractsBefore(time.Now())
+	AssertEqual(t, 1, len(expired))
+	AssertEqual(t, prefetch, expired[0])
+
+	manager.mutex.Lock()
+	_, retained := manager.destinationContracts[contractKey]
+	manager.mutex.Unlock()
+	if retained {
+		t.Fatal("janitor retained an escrow-capable public prefetch")
+	}
+}
+
+func TestTakeContractKeepsPrefetchForOpenContractPastExpiry(t *testing.T) {
+	manager, contractKey, prefetch := newActiveContractPrefetchTestManager(t, true)
+	manager.settings.ContractQueueExpireTimeout = time.Millisecond
+
+	taken := manager.TakeContract(context.Background(), contractKey, 0)
+	AssertEqual(t, prefetch, taken)
+}
+
+func TestResetLocalStatsPreservesOpenContractOwnership(t *testing.T) {
+	manager, contractKey, _ := newActiveContractPrefetchTestManager(t, true)
+
+	manager.ResetLocalStats()
+
+	if !manager.hasOpenContractForKey(contractKey) {
+		t.Fatal("stats reset discarded live contract ownership")
+	}
+	stats := manager.LocalStats()
+	AssertEqual(t, 1, len(stats.ContractOpenKeys))
+	AssertEqual(t, 1, len(stats.ContractOpenByteCounts))
+}
+
+func TestContractQueueStaleCloseCannotDeleteReplacementGeneration(t *testing.T) {
+	manager := &ContractManager{
+		client: &Client{log: NewNoopLogger()},
+		settings: &ContractManagerSettings{
+			TrackUsedContracts: true,
+		},
+		destinationContracts: map[ContractKey]*contractQueue{},
+	}
+	key := ContractKey{Destination: DestinationId(NewId())}
+
+	// One ordinary owner remains blocked on the old queue while a sequence
+	// flush opens the same generation and force-removes it.
+	oldOwner := manager.openContractQueue(key)
+	flusher := manager.openContractQueue(key)
+	if flusher != oldOwner {
+		t.Fatal("same key did not share the initial queue generation")
+	}
+	manager.closeContractQueueWithForceRemove(key, flusher, true)
+	if !oldOwner.Drained() {
+		t.Fatal("force-removed queue did not wake its old waiters")
+	}
+
+	replacement := manager.openContractQueue(key)
+	if replacement == oldOwner {
+		t.Fatal("force removal did not create a new queue generation")
+	}
+
+	// The delayed owner must close its own drained queue, not look up the key
+	// and decrement/delete the replacement.
+	manager.closeContractQueue(key, oldOwner)
+	manager.mutex.Lock()
+	current := manager.destinationContracts[key]
+	manager.mutex.Unlock()
+	if current != replacement {
+		t.Fatal("stale queue close deleted the replacement generation")
+	}
+	replacement.mutex.Lock()
+	replacementOpenCount := replacement.openCount
+	replacement.mutex.Unlock()
+	if replacementOpenCount != 1 {
+		t.Fatalf("stale close changed replacement open count to %d, want 1", replacementOpenCount)
+	}
+
+	manager.closeContractQueue(key, replacement)
+	manager.mutex.Lock()
+	_, retained := manager.destinationContracts[key]
+	manager.mutex.Unlock()
+	if retained {
+		t.Fatal("current queue generation was not removed after its own close")
+	}
 }
 
 // TestContractQueueShutdownFlush verifies that when the contract manager

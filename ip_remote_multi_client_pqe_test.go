@@ -37,6 +37,7 @@ func TestMultiClientChannelPqe(t *testing.T) {
 			nil,
 			func() {},
 			performanceProfile,
+			false,
 			DefaultMultiClientSettings(),
 		)
 		// the recording generator fails creation after settings are applied

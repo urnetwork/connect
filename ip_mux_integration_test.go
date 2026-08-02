@@ -175,16 +175,6 @@ func TestUpgradeMuxMultiClientIntegration(t *testing.T) {
 // (remote DoH), distinct from the local-DoH tests, and the prime suspect for the iOS
 // "black hole" where claimed :53 queries never get answered.
 func TestUpgradeMuxDefaultDnsThroughTunnel(t *testing.T) {
-	// The remote-DoH path opens a real TLS-over-TCP connection through the multi-client.
-	// The connect-level test generator uses an in-memory transport that cannot carry a
-	// real multi-segment TCP handshake (see the "tcp packets must use real seq numbers"
-	// TODO on testMultiClientGenerator / TcpCollapsePrevention) — the DoH TLS handshake
-	// reaches the exit but its bidirectional relay stalls. The mux wiring itself is
-	// verified by TestUpgradeMuxMultiClientIntegration (UDP + local DoH + affinity); a
-	// faithful remote-DoH-through-tunnel + HTTPS-content e2e test belongs in
-	// server/proxy, which has the real platform transport and provider discovery.
-	t.Skip("needs the real platform transport (server/proxy); the in-memory test transport cannot carry TCP-through-tunnel")
-
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -227,6 +217,11 @@ func TestUpgradeMuxDefaultDnsThroughTunnel(t *testing.T) {
 		RemoteDohUrlsIpv4: []string{dohServer.URL},
 		TlsConfig:         localDns.TlsConfig,
 	}
+	// This test is specifically the tunnel path. A production local fallback
+	// can legitimately win when race instrumentation slows the in-memory
+	// transport, which would turn this into a test of the host resolver and
+	// make its answer depend on public DNS.
+	muxSettings.Dns.Fallback = nil
 	mux, err := NewUpgradeMux(ctx, source, protocol.ProvideMode_Network, 30*time.Second, clientReceive, muxSettings, nil)
 	if err != nil {
 		t.Fatal(err)

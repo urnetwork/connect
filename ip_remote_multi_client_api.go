@@ -426,10 +426,18 @@ func (self *ApiMultiClientGenerator) RemoveClientArgs(args *MultiClientGenerator
 	default:
 	}
 
-	// the identity is being torn down for real (window eviction, expired
-	// args): drop it from the persisted snapshot so a restart does not
-	// restore a removed client
-	self.identityState.Remove(args.ClientId)
+	// The identity is being torn down for real (window eviction, expired
+	// args), unless a newer channel has already replaced it under the same
+	// client id. InstanceId is the generation token: stale asynchronous
+	// cleanup must neither erase the replacement from the persisted snapshot
+	// nor send remove-client for the replacement's still-live server row.
+	instanceId := Id{}
+	if args.ClientAuth != nil {
+		instanceId = args.ClientAuth.InstanceId
+	}
+	if !self.identityState.RemoveIfCurrent(args.ClientId, instanceId) {
+		return
+	}
 
 	removeNetworkClient := &RemoveNetworkClientArgs{
 		ClientId: args.ClientId,

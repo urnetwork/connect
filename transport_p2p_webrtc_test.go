@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,12 +28,25 @@ import (
 )
 
 func TestWebRtc(t *testing.T) {
-	// the 1MiB transfer over local ice varies widely in time under -race
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	// Keep the transport smoke test hermetic. Public STUN resolution and
+	// internet reachability are orthogonal to the local SCTP data-path check
+	// and made a late-suite failure look like a data-path stall.
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
 	settingsA := DefaultWebRtcSettings()
 	settingsB := DefaultWebRtcSettings()
+	settingsA.Log = NewNoopLogger()
+	settingsB.Log = NewNoopLogger()
+	settingsA.IceServerUrls = nil
+	settingsB.IceServerUrls = nil
+	// Both peers run on this host. Keep loopback available: forcing only the
+	// external address turns the test into a macOS UDP-to-self hairpin test,
+	// which intermittently drops rapid close/rebind churn and says nothing
+	// about the real two-device ICE path. The filtered production interface
+	// view is validated independently below.
+	settingsA.UseEgressOnlyIceInterfaces = false
+	settingsB.UseEgressOnlyIceInterfaces = false
 
 	// each manager sends signals to each other
 	signalPipeA := newSignalPipe(nil)
@@ -40,70 +54,284 @@ func TestWebRtc(t *testing.T) {
 
 	webRtcManagerA := NewWebRtcManager(ctx, signalPipeA, settingsA)
 	webRtcManagerB := NewWebRtcManager(ctx, signalPipeB, settingsB)
+	defer webRtcManagerA.Close()
+	defer webRtcManagerB.Close()
 
-	signalPipeA.signalReceiver = webRtcManagerB
-	signalPipeB.signalReceiver = webRtcManagerA
+	signalPipeA.SetSignalReceiver(webRtcManagerB)
+	signalPipeB.SetSignalReceiver(webRtcManagerA)
 
 	peerIdA := NewId()
 	peerIdB := NewId()
 	streamId := NewId()
 
-	connA, err := webRtcManagerA.NewP2pConnActive(ctx, NewTransferPath(peerIdA, peerIdB, streamId))
-	AssertEqual(t, err, nil)
-	defer connA.Close()
-
 	connB, err := webRtcManagerB.NewP2pConnPassive(ctx, NewTransferPath(peerIdB, peerIdA, streamId))
 	AssertEqual(t, err, nil)
 	defer connB.Close()
 
+	// Register the passive endpoint before the active side emits its offer.
+	// The in-memory signal pipe deliberately does not queue signals for a
+	// receiver that has not registered the corresponding stream yet.
+	connA, err := webRtcManagerA.NewP2pConnActive(ctx, NewTransferPath(peerIdA, peerIdB, streamId))
+	AssertEqual(t, err, nil)
+	defer connA.Close()
+
+	connectedDeadline := time.Now().Add(10 * time.Second)
+	for !connA.Connected() || !connB.Connected() {
+		if time.Now().After(connectedDeadline) {
+			t.Fatalf(
+				"local peer setup stalled: active_connected=%t passive_connected=%t",
+				connA.Connected(),
+				connB.Connected(),
+			)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	dataDeadline := time.Now().Add(30 * time.Second)
+	AssertEqual(t, connA.SetDeadline(dataDeadline), nil)
+	AssertEqual(t, connB.SetDeadline(dataDeadline), nil)
+
 	b := make([]byte, 1024*1024)
 	mathrand.Read(b)
 
-	received := make(chan []byte)
+	type ioResult struct {
+		operation string
+		payload   []byte
+		err       error
+	}
+	results := make(chan ioResult, 4)
 
-	// the helpers must not panic on conn errors. reads and writes that race
-	// the test teardown see closed-conn errors, and a panic in a test
-	// goroutine kills the whole test binary. missing data is detected by
-	// the receive loop timeout below.
-	//
 	// send in transport-sized messages: the detached datachannel is
 	// message-oriented, and a single message must fit within the
 	// per-connection ReceiveBufferSize to be reassembled (production frames
 	// are bounded by the transport MaxMessageByteCount default)
 	const sendMessageByteCount = 64 * 1024
-	send := func(conn net.Conn) {
+	send := func(name string, conn net.Conn) {
 		for i := 0; i < len(b); i += sendMessageByteCount {
 			end := min(i+sendMessageByteCount, len(b))
-			if _, err := conn.Write(b[i:end]); err != nil {
+			n, writeErr := conn.Write(b[i:end])
+			if writeErr != nil {
+				results <- ioResult{operation: name, err: writeErr}
+				return
+			}
+			if n != end-i {
+				results <- ioResult{operation: name, err: io.ErrShortWrite}
 				return
 			}
 		}
+		results <- ioResult{operation: name}
 	}
-	receive := func(conn net.Conn) {
+	receive := func(name string, conn net.Conn) {
 		b2 := make([]byte, len(b))
-		if _, err := io.ReadFull(conn, b2); err != nil {
+		if _, readErr := io.ReadFull(conn, b2); readErr != nil {
+			results <- ioResult{operation: name, err: readErr}
 			return
 		}
-		select {
-		case <-ctx.Done():
-		case received <- b2:
-		}
+		results <- ioResult{operation: name, payload: b2}
 	}
 
-	go send(connA)
-	go receive(connA)
-	go send(connB)
-	go receive(connB)
+	go send("A write", connA)
+	go receive("A read", connA)
+	go send("B write", connB)
+	go receive("B read", connB)
 
-	for range 2 {
+	receiveCount := 0
+	for range 4 {
 		select {
 		case <-ctx.Done():
-			t.Fatal("timeout")
-		case b2 := <-received:
-			AssertEqual(t, b, b2)
+			t.Fatalf("local SCTP transfer stalled: %v", context.Cause(ctx))
+		case result := <-results:
+			if result.err != nil {
+				t.Fatalf("%s failed: %v", result.operation, result.err)
+			}
+			if result.payload != nil {
+				AssertEqual(t, b, result.payload)
+				receiveCount++
+			}
 		}
 	}
+	if receiveCount != 2 {
+		t.Fatalf("completed reads = %d, want 2", receiveCount)
+	}
+}
 
+func TestDefaultWebRtcCongestionTuningUsesMeasuredPredictableKnee(t *testing.T) {
+	settings := DefaultWebRtcSettings()
+	if got, want := settings.SctpCwndCAStep, uint32(8*1200); got != want {
+		t.Fatalf("SCTP congestion-avoidance step = %d, want measured knee %d", got, want)
+	}
+	if settings.SctpMinCwnd != 0 {
+		t.Fatalf("SCTP minimum cwnd = %d; a floor creates standing-queue latency", settings.SctpMinCwnd)
+	}
+	if settings.SctpFastRtxWnd != 0 {
+		t.Fatalf("SCTP fast-retransmit burst override = %d; expected stock bounded recovery", settings.SctpFastRtxWnd)
+	}
+}
+
+func TestAcknowledgedSctpByteCountTracksOnlyForwardQueueProgress(t *testing.T) {
+	tests := []struct {
+		name               string
+		outboundByteCount  uint64
+		bufferedAmount     int
+		acknowledgedAmount uint64
+	}{
+		{
+			name:               "new write remains buffered",
+			outboundByteCount:  1024,
+			bufferedAmount:     1024,
+			acknowledgedAmount: 0,
+		},
+		{
+			name:               "continuous writes offset partial acknowledgements",
+			outboundByteCount:  4096,
+			bufferedAmount:     3072,
+			acknowledgedAmount: 1024,
+		},
+		{
+			name:               "all accepted bytes acknowledged",
+			outboundByteCount:  4096,
+			bufferedAmount:     0,
+			acknowledgedAmount: 4096,
+		},
+		{
+			name:               "untracked association control bytes clamp at zero",
+			outboundByteCount:  128,
+			bufferedAmount:     256,
+			acknowledgedAmount: 0,
+		},
+	}
+	for _, test := range tests {
+		if got := acknowledgedSctpByteCount(
+			test.outboundByteCount,
+			test.bufferedAmount,
+		); got != test.acknowledgedAmount {
+			t.Errorf(
+				"%s: acknowledged bytes = %d, want %d",
+				test.name,
+				got,
+				test.acknowledgedAmount,
+			)
+		}
+	}
+}
+
+func TestObservedAcknowledgedSctpByteCountRecognizesDeadlineEdgeProgress(t *testing.T) {
+	acknowledged, progressed := observeAcknowledgedSctpByteCount(
+		0,
+		4096,
+		3072,
+	)
+	if acknowledged != 1024 {
+		t.Fatalf("acknowledged bytes = %d, want 1024", acknowledged)
+	}
+	if !progressed {
+		t.Fatal("fresh deadline-edge sample did not report forward progress")
+	}
+}
+
+func TestObservedAcknowledgedSctpByteCountDoesNotRegressAcrossRacingWrites(t *testing.T) {
+	acknowledged, progressed := observeAcknowledgedSctpByteCount(
+		1024,
+		4096,
+		3584,
+	)
+	if acknowledged != 1024 {
+		t.Fatalf("acknowledged bytes regressed to %d, want 1024", acknowledged)
+	}
+	if progressed {
+		t.Fatal("lower racing observation reported forward progress")
+	}
+}
+
+func TestPeerConnFailureCancellationMarksSharedAdmissionRetiringSynchronously(t *testing.T) {
+	const reservation = ByteCount(1024)
+	budget := NewTransferMemoryBudget(reservation)
+	ownerCtx, ownerCancel := context.WithCancel(context.Background())
+	owner := &peerConnectionAdmissionOwner{
+		ctx:    ownerCtx,
+		cancel: ownerCancel,
+	}
+	if !budget.tryReservePeerConnectionOwner(owner, reservation) {
+		t.Fatal("failed to reserve test admission owner")
+	}
+	defer owner.release()
+
+	connCtx, cancelCause := context.WithCancelCause(context.Background())
+	conn := &peerConn{
+		ctx:            connCtx,
+		cancelCause:    cancelCause,
+		admissionOwner: owner,
+	}
+	expectedCause := errors.New("transport failed")
+	conn.cancelBecause(expectedCause)
+
+	if cause := context.Cause(connCtx); !errors.Is(cause, expectedCause) {
+		t.Fatalf("cancellation cause = %v, want %v", cause, expectedCause)
+	}
+	liveCount, retiringCount := budget.peerConnectionOwnerCounts()
+	if liveCount != 0 || retiringCount != 1 {
+		t.Fatalf(
+			"admission owners after failure = live:%d retiring:%d, want live:0 retiring:1",
+			liveCount,
+			retiringCount,
+		)
+	}
+}
+
+func TestWebRtcPeerRunStartupFailureRetiresAdmissionSynchronously(t *testing.T) {
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.DataChannelLabel = strings.Repeat("x", 65536)
+
+	factory, _, err := newWebRtcPeerConnectionFactory(settings, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer factory.Close()
+
+	const reservation = ByteCount(1024)
+	budget := NewTransferMemoryBudget(reservation)
+	ownerCtx, ownerCancel := context.WithCancel(context.Background())
+	owner := &peerConnectionAdmissionOwner{
+		ctx:    ownerCtx,
+		cancel: ownerCancel,
+	}
+	if !budget.tryReservePeerConnectionOwner(owner, reservation) {
+		t.Fatal("failed to reserve test admission owner")
+	}
+	defer owner.release()
+
+	conn, err := newPeerConn(
+		ownerCtx,
+		peerConnKey{PeerId: NewId(), StreamId: NewId()},
+		NewId(),
+		true,
+		newSignalPipe(nil),
+		settings,
+		func() (*webrtc.PeerConnection, error) {
+			return factory.NewPeerConnection(false)
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.admissionOwner = owner
+	defer conn.teardown()
+
+	conn.Run()
+	if cause := context.Cause(conn.ctx); cause == nil ||
+		!strings.Contains(cause.Error(), "create data channel") {
+		t.Fatalf("startup failure cancellation cause = %v", cause)
+	}
+	liveCount, retiringCount := budget.peerConnectionOwnerCounts()
+	if liveCount != 0 || retiringCount != 1 {
+		t.Fatalf(
+			"admission owners after startup failure = live:%d retiring:%d, want live:0 retiring:1",
+			liveCount,
+			retiringCount,
+		)
+	}
 }
 
 // TestWebRtcMessageRoundTrip verifies the P2P transport's native message
@@ -419,7 +647,7 @@ func TestP2pReadyHeaderPrefetchesUnorderedDataWithinRouteBound(t *testing.T) {
 
 func TestP2pReceiveTransportGrowsBufferWithoutLosingMessage(t *testing.T) {
 	for _, reportSize := range []bool{true, false} {
-		t.Run(fmt.Sprintf("required-size=%t", reportSize), func(t *testing.T) {
+		func() {
 			message := make([]byte, 12*1024)
 			for i := range message {
 				message[i] = byte(i)
@@ -467,13 +695,13 @@ func TestP2pReceiveTransportGrowsBufferWithoutLosingMessage(t *testing.T) {
 
 			cancel()
 			AssertEqual(t, conn.Close(), nil)
-		})
+		}()
 	}
 }
 
 func TestP2pReceiveTransportRejectsOversizedShortBufferWithoutPanic(t *testing.T) {
 	for _, reportSize := range []bool{true, false} {
-		t.Run(fmt.Sprintf("required-size=%t", reportSize), func(t *testing.T) {
+		func() {
 			settings := DefaultP2pTransportSettings()
 			conn := newShortBufferMessageConn(make([]byte, settings.MaxMessageByteCount+1))
 			conn.reportSize = reportSize
@@ -495,7 +723,7 @@ func TestP2pReceiveTransportRejectsOversizedShortBufferWithoutPanic(t *testing.T
 			}
 			AssertEqual(t, readSizes, expected)
 			AssertEqual(t, conn.Close(), nil)
-		})
+		}()
 	}
 }
 
@@ -558,6 +786,136 @@ func TestWebRtcBlockingWriteBackpressureAndDeadline(t *testing.T) {
 	}
 }
 
+func TestWebRtcSctpNoProgressWatchdogPreservesReceiverBackpressure(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	settingsA := DefaultWebRtcSettings()
+	settingsB := DefaultWebRtcSettings()
+	for _, settings := range []*WebRtcSettings{settingsA, settingsB} {
+		settings.Log = NewNoopLogger()
+		settings.IceServerUrls = nil
+		settings.UseEgressOnlyIceInterfaces = false
+		settings.ReceiveBufferSize = kib(128)
+	}
+	settingsA.SctpNoProgressTimeout = 200 * time.Millisecond
+	settingsB.SctpNoProgressTimeout = 0
+
+	signalPipeA := newSignalPipe(nil)
+	signalPipeB := newSignalPipe(nil)
+	managerA := NewWebRtcManager(ctx, signalPipeA, settingsA)
+	managerB := NewWebRtcManager(ctx, signalPipeB, settingsB)
+	defer managerA.Close()
+	defer managerB.Close()
+	signalPipeA.SetSignalReceiver(managerB)
+	signalPipeB.SetSignalReceiver(managerA)
+
+	peerIdA := NewId()
+	peerIdB := NewId()
+	streamId := NewId()
+	passiveValue, err := managerB.NewP2pConnPassive(
+		ctx,
+		NewTransferPath(peerIdB, peerIdA, streamId),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeValue, err := managerA.NewP2pConnActive(
+		ctx,
+		NewTransferPath(peerIdA, peerIdB, streamId),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := activeValue.(*peerConn)
+	passive := passiveValue.(*peerConn)
+	defer active.Close()
+	defer passive.Close()
+
+	// Race instrumentation can stretch local ICE/DTLS scheduling several
+	// times beyond an ordinary build; setup is not the behavior under test.
+	connectedDeadline := time.Now().Add(15 * time.Second)
+	for !active.Connected() || !passive.Connected() {
+		if time.Now().After(connectedDeadline) {
+			t.Fatal("peer connections did not connect")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	const messageCount = 8
+	message := make([]byte, 64*1024)
+	writeDone := make(chan error, 1)
+	go func() {
+		if err := active.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+			writeDone <- err
+			return
+		}
+		for range messageCount {
+			if n, writeErr := active.Write(message); writeErr != nil {
+				writeDone <- writeErr
+				return
+			} else if n != len(message) {
+				writeDone <- io.ErrShortWrite
+				return
+			}
+		}
+		writeDone <- nil
+	}()
+
+	// Do not read from the passive endpoint. Its bounded receive queue must
+	// close the sender's advertised rwnd while accepted writes remain
+	// buffered. This is exactly how a deliberately stalled transfer receive
+	// or forward callback propagates backpressure through SCTP.
+	backpressureDeadline := time.Now().Add(5 * time.Second)
+	for {
+		sctp := active.pc.SCTP()
+		if sctp != nil && sctp.BufferedAmount() != 0 &&
+			sctp.Stats().ReceiverWindow == 0 {
+			break
+		}
+		select {
+		case writeErr := <-writeDone:
+			t.Fatalf("writer completed before receiver backpressure: %v", writeErr)
+		default:
+		}
+		if time.Now().After(backpressureDeadline) {
+			t.Fatal("receiver did not advertise a zero SCTP window")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	select {
+	case <-active.ctx.Done():
+		t.Fatal("watchdog canceled intentional receiver backpressure")
+	case writeErr := <-writeDone:
+		t.Fatalf("writer completed while receiver remained stalled: %v", writeErr)
+	case <-time.After(3 * settingsA.SctpNoProgressTimeout):
+	}
+
+	if err := passive.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	received := make([]byte, len(message))
+	for range messageCount {
+		if _, err := io.ReadFull(passive, received); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case writeErr := <-writeDone:
+		if writeErr != nil {
+			t.Fatal(writeErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("writer did not resume after receiver released backpressure")
+	}
+	select {
+	case <-active.ctx.Done():
+		t.Fatal("association was canceled after receiver backpressure resumed")
+	default:
+	}
+}
+
 func TestWebRtcSctpSnapMixedCompatibility(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -568,8 +926,8 @@ func TestWebRtcSctpSnapMixedCompatibility(t *testing.T) {
 	settingsB.Log = NewNoopLogger()
 	settingsA.IceServerUrls = nil
 	settingsB.IceServerUrls = nil
-	settingsA.UseEgressOnlyIceInterfaces = true
-	settingsB.UseEgressOnlyIceInterfaces = true
+	settingsA.UseEgressOnlyIceInterfaces = false
+	settingsB.UseEgressOnlyIceInterfaces = false
 	settingsA.EnableSctpSnap = true
 	settingsB.EnableSctpSnap = false
 
@@ -577,6 +935,8 @@ func TestWebRtcSctpSnapMixedCompatibility(t *testing.T) {
 	signalPipeB := newSignalPipe(nil)
 	managerA := NewWebRtcManager(ctx, signalPipeA, settingsA)
 	managerB := NewWebRtcManager(ctx, signalPipeB, settingsB)
+	defer managerA.Close()
+	defer managerB.Close()
 	signalPipeA.SetSignalReceiver(managerB)
 	signalPipeB.SetSignalReceiver(managerA)
 
@@ -606,7 +966,14 @@ func TestWebRtcSctpSnapMixedCompatibility(t *testing.T) {
 		}
 	}()
 	_, err = active.Write(payload)
-	AssertEqual(t, err, nil)
+	if err != nil {
+		t.Fatalf(
+			"SNAP mixed write failed: %v; active={%s} passive={%s}",
+			err,
+			testingWebRtcConnDiagnostics(active),
+			testingWebRtcConnDiagnostics(passive),
+		)
+	}
 	select {
 	case b := <-received:
 		AssertEqual(t, b, payload)
@@ -625,8 +992,8 @@ func TestWebRtcSctpZeroChecksumMixedCompatibility(t *testing.T) {
 	settingsB.Log = NewNoopLogger()
 	settingsA.IceServerUrls = nil
 	settingsB.IceServerUrls = nil
-	settingsA.UseEgressOnlyIceInterfaces = true
-	settingsB.UseEgressOnlyIceInterfaces = true
+	settingsA.UseEgressOnlyIceInterfaces = false
+	settingsB.UseEgressOnlyIceInterfaces = false
 	settingsA.EnableSctpZeroChecksum = true
 	settingsB.EnableSctpZeroChecksum = false
 
@@ -634,6 +1001,8 @@ func TestWebRtcSctpZeroChecksumMixedCompatibility(t *testing.T) {
 	signalPipeB := newSignalPipe(nil)
 	managerA := NewWebRtcManager(ctx, signalPipeA, settingsA)
 	managerB := NewWebRtcManager(ctx, signalPipeB, settingsB)
+	defer managerA.Close()
+	defer managerB.Close()
 	signalPipeA.SetSignalReceiver(managerB)
 	signalPipeB.SetSignalReceiver(managerA)
 
@@ -664,7 +1033,14 @@ func TestWebRtcSctpZeroChecksumMixedCompatibility(t *testing.T) {
 		}
 	}()
 	_, err = active.Write(payload)
-	AssertEqual(t, err, nil)
+	if err != nil {
+		t.Fatalf(
+			"zero-checksum mixed write failed: %v; active={%s} passive={%s}",
+			err,
+			testingWebRtcConnDiagnostics(active),
+			testingWebRtcConnDiagnostics(passive),
+		)
+	}
 	select {
 	case b := <-received:
 		AssertEqual(t, b, payload)
@@ -704,7 +1080,7 @@ func TestWebRtcSctpSnapReadyLatencyMeasurement(t *testing.T) {
 	}
 
 	for _, enableSnap := range []bool{false, true} {
-		t.Run(fmt.Sprintf("snap=%t", enableSnap), func(t *testing.T) {
+		func() {
 			const pairCount = 25
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
@@ -777,7 +1153,7 @@ func TestWebRtcSctpSnapReadyLatencyMeasurement(t *testing.T) {
 				latencies[0],
 				latencies[len(latencies)-1],
 			)
-		})
+		}()
 	}
 }
 
@@ -853,6 +1229,139 @@ func TestWebRtcSharedBudgetAdmissionIsExactAcrossManagers(t *testing.T) {
 	}
 	reserved, released := budget.Counts()
 	AssertEqual(t, reserved, released)
+	liveOwnerCount, retiringOwnerCount := budget.peerConnectionOwnerCounts()
+	AssertEqual(t, liveOwnerCount, 0)
+	AssertEqual(t, retiringOwnerCount, 0)
+}
+
+func TestWebRtcSharedBudgetPriorityReclaimsOwnerAcrossManagers(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const window = ByteCount(128 * 1024)
+	budget := NewTransferMemoryBudget(window)
+	newManager := func() *WebRtcManager {
+		settings := DefaultWebRtcSettings()
+		settings.Log = NewNoopLogger()
+		settings.IceServerUrls = nil
+		settings.ReceiveBufferSize = window
+		settings.MemoryBudget = budget
+		settings.MaxPeerConnectionCount = 0
+		return NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	}
+	firstManager := newManager()
+	secondManager := newManager()
+	defer firstManager.Close()
+	defer secondManager.Close()
+
+	firstPeerId := NewId()
+	firstManager.PrioritizePeer(firstPeerId)
+	first, err := firstManager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), firstPeerId, NewId()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstConn := first.(*peerConn)
+
+	// The second manager has no local map entry for the only reservation.
+	// Pool-wide ownership must retire it without raising the exact byte ceiling.
+	secondPeerId := NewId()
+	secondManager.PrioritizePeer(secondPeerId)
+	select {
+	case <-firstConn.ctx.Done():
+	case <-ctx.Done():
+		t.Fatal("selected peer could not reclaim a shared-budget owner in another manager")
+	}
+	for budget.UsedByteCount() != 0 {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("cross-manager victim retained %d bytes", budget.UsedByteCount())
+		case <-time.After(time.Millisecond):
+		}
+	}
+
+	second, err := secondManager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), secondPeerId, NewId()),
+	)
+	if err != nil {
+		t.Fatalf("selected peer was not admitted after cross-manager teardown: %v", err)
+	}
+	defer second.Close()
+	if got := budget.UsedByteCount(); got != window {
+		t.Fatalf("replacement reservation = %d, want %d", got, window)
+	}
+	liveOwnerCount, retiringOwnerCount := budget.peerConnectionOwnerCounts()
+	if liveOwnerCount != 1 || retiringOwnerCount != 0 {
+		t.Fatalf(
+			"shared owners live/retiring = %d/%d, want 1/0",
+			liveOwnerCount,
+			retiringOwnerCount,
+		)
+	}
+}
+
+func TestWebRtcSharedBudgetPendingRetirementPreventsCrossManagerDrain(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const window = ByteCount(128 * 1024)
+	budget := NewTransferMemoryBudget(2 * window)
+	newManager := func() *WebRtcManager {
+		settings := DefaultWebRtcSettings()
+		settings.Log = NewNoopLogger()
+		settings.IceServerUrls = nil
+		settings.ReceiveBufferSize = window
+		settings.MemoryBudget = budget
+		settings.MaxPeerConnectionCount = 0
+		return NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	}
+	firstManager := newManager()
+	secondManager := newManager()
+	waitingManager := newManager()
+	defer firstManager.Close()
+	defer secondManager.Close()
+	defer waitingManager.Close()
+
+	first, err := firstManager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), NewId(), NewId()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := secondManager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), NewId(), NewId()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	firstConn := first.(*peerConn)
+	secondConn := second.(*peerConn)
+
+	// Model the interval after a victim is claimed but before physical Pion
+	// teardown releases its receive window. Another manager must wait for that
+	// one release instead of canceling the remaining healthy owner.
+	firstConn.admissionOwner.markRetiring()
+	waitingManager.PrioritizePeer(NewId())
+	select {
+	case <-secondConn.ctx.Done():
+		t.Fatal("a pending shared teardown caused a second healthy owner to be drained")
+	default:
+	}
+	liveOwnerCount, retiringOwnerCount := budget.peerConnectionOwnerCounts()
+	if liveOwnerCount != 1 || retiringOwnerCount != 1 {
+		t.Fatalf(
+			"shared owners live/retiring = %d/%d, want 1/1",
+			liveOwnerCount,
+			retiringOwnerCount,
+		)
+	}
 }
 
 func TestWebRtcPrioritizedNetworkPeerPreemptsWithoutRaisingAdmissionBounds(t *testing.T) {
@@ -932,6 +1441,1671 @@ func TestWebRtcPrioritizedNetworkPeerPreemptsWithoutRaisingAdmissionBounds(t *te
 	}
 	if got := settings.MemoryBudget.UsedByteCount(); got != settings.ReceiveBufferSize {
 		t.Fatalf("priority reservation = %d, want unchanged hard bound %d", got, settings.ReceiveBufferSize)
+	}
+}
+
+// A trusted network peer admits against the dedicated network-peer window and
+// budget, while a public peer keeps the small public window — the two pools are
+// independent, so one never starves or is starved by the other (Fix 1).
+func TestWebRtcNetworkPeerUsesDedicatedWindowAndBudget(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.ReceiveBufferSize = kib(128)
+	settings.MemoryBudget = NewTransferMemoryBudget(8 * settings.ReceiveBufferSize)
+	settings.NetworkPeerReceiveBufferSize = mib(2)
+	settings.NetworkPeerMemoryBudget = NewTransferMemoryBudget(2 * settings.NetworkPeerReceiveBufferSize)
+	settings.MaxPeerConnectionCount = 0
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+
+	// A public (non-prioritized) peer reserves the small window from the public
+	// budget; the network-peer budget is untouched.
+	publicConn, err := manager.NewP2pConnActive(ctx, NewTransferPath(NewId(), NewId(), NewId()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer publicConn.Close()
+	if got := settings.MemoryBudget.UsedByteCount(); got != settings.ReceiveBufferSize {
+		t.Fatalf("public reservation = %d, want %d", got, settings.ReceiveBufferSize)
+	}
+	if got := settings.NetworkPeerMemoryBudget.UsedByteCount(); got != 0 {
+		t.Fatalf("network-peer budget touched by a public peer: used=%d", got)
+	}
+
+	// A trusted (prioritized / ProvideMode_Network) peer reserves the large
+	// window from the dedicated network-peer budget, leaving the public budget
+	// unchanged.
+	networkPeerId := NewId()
+	manager.PrioritizePeer(networkPeerId)
+	npConn, err := manager.NewP2pConnActive(ctx, NewTransferPath(NewId(), networkPeerId, NewId()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer npConn.Close()
+	if got := settings.NetworkPeerMemoryBudget.UsedByteCount(); got != settings.NetworkPeerReceiveBufferSize {
+		t.Fatalf("network-peer reservation = %d, want %d", got, settings.NetworkPeerReceiveBufferSize)
+	}
+	if got := settings.MemoryBudget.UsedByteCount(); got != settings.ReceiveBufferSize {
+		t.Fatalf("public budget changed by a network peer: used=%d, want %d", got, settings.ReceiveBufferSize)
+	}
+	if publicConn.(*peerConn).networkPeer {
+		t.Fatal("public peer was built with the network-peer Pion API")
+	}
+	if !npConn.(*peerConn).networkPeer {
+		t.Fatal("trusted peer was not built with the network-peer Pion API")
+	}
+}
+
+func TestWebRtcNetworkPeerAdvertisesDedicatedReceiveWindow(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	newSettings := func() *WebRtcSettings {
+		settings := DefaultWebRtcSettings()
+		settings.Log = NewNoopLogger()
+		settings.IceServerUrls = nil
+		settings.ReceiveBufferSize = kib(128)
+		settings.MemoryBudget = NewTransferMemoryBudget(8 * settings.ReceiveBufferSize)
+		settings.NetworkPeerReceiveBufferSize = mib(2)
+		settings.NetworkPeerMemoryBudget = NewTransferMemoryBudget(2 * settings.NetworkPeerReceiveBufferSize)
+		settings.MaxPeerConnectionCount = 0
+		return settings
+	}
+	settingsA := newSettings()
+	settingsB := newSettings()
+	signalPipeA := newSignalPipe(nil)
+	signalPipeB := newSignalPipe(nil)
+	managerA := NewWebRtcManager(ctx, signalPipeA, settingsA)
+	managerB := NewWebRtcManager(ctx, signalPipeB, settingsB)
+	defer managerA.Close()
+	defer managerB.Close()
+	signalPipeA.SetSignalReceiver(managerB)
+	signalPipeB.SetSignalReceiver(managerA)
+
+	remoteWindow := func(conn *peerConn) uint32 {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			if sctp := conn.pc.SCTP(); sctp != nil {
+				if rwnd := sctp.Stats().ReceiverWindow; rwnd != 0 {
+					return rwnd
+				}
+			}
+			if deadline.Before(time.Now()) {
+				t.Fatal("SCTP association did not advertise a receive window")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	newPair := func(peerIdA Id, peerIdB Id) (*peerConn, *peerConn) {
+		t.Helper()
+		streamId := NewId()
+		passiveValue, err := managerB.NewP2pConnPassive(
+			ctx,
+			NewTransferPath(peerIdB, peerIdA, streamId),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		activeValue, err := managerA.NewP2pConnActive(
+			ctx,
+			NewTransferPath(peerIdA, peerIdB, streamId),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return activeValue.(*peerConn), passiveValue.(*peerConn)
+	}
+	assertAdvertisedWindow := func(label string, got uint32, want ByteCount) {
+		t.Helper()
+		// The data-channel OPEN control message may consume a few bytes before
+		// the first stats sample. Require the configured window within one
+		// transport message, which still cleanly distinguishes 128 KiB/2 MiB.
+		wantWindow := uint32(want)
+		tolerance := uint32(sendPackBatchMaxMessageByteCount)
+		if wantWindow < got || got < wantWindow-tolerance {
+			t.Fatalf("%s receive window = %d, want %d..%d", label, got, wantWindow-tolerance, wantWindow)
+		}
+	}
+
+	networkPeerIdA := NewId()
+	networkPeerIdB := NewId()
+	managerA.PrioritizePeer(networkPeerIdB)
+	managerB.PrioritizePeer(networkPeerIdA)
+	networkA, networkB := newPair(networkPeerIdA, networkPeerIdB)
+	defer networkA.Close()
+	defer networkB.Close()
+	assertAdvertisedWindow(
+		"network peer remote",
+		remoteWindow(networkA),
+		settingsB.NetworkPeerReceiveBufferSize,
+	)
+	assertAdvertisedWindow(
+		"network peer reverse",
+		remoteWindow(networkB),
+		settingsA.NetworkPeerReceiveBufferSize,
+	)
+
+	publicA, publicB := newPair(NewId(), NewId())
+	defer publicA.Close()
+	defer publicB.Close()
+	assertAdvertisedWindow("public peer remote", remoteWindow(publicA), settingsB.ReceiveBufferSize)
+	assertAdvertisedWindow("public peer reverse", remoteWindow(publicB), settingsA.ReceiveBufferSize)
+}
+
+func TestWebRtcNetworkPeerAdmissionWaitsOnDedicatedBudget(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.ReceiveBufferSize = kib(128)
+	settings.MemoryBudget = NewTransferMemoryBudget(settings.ReceiveBufferSize)
+	settings.NetworkPeerReceiveBufferSize = mib(2)
+	settings.NetworkPeerMemoryBudget = NewTransferMemoryBudget(settings.NetworkPeerReceiveBufferSize)
+	settings.MaxPeerConnectionCount = 0
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+
+	firstPeerId := NewId()
+	manager.PrioritizePeer(firstPeerId)
+	first, err := manager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), firstPeerId, NewId()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waitingPeerId := NewId()
+	manager.PrioritizePeer(waitingPeerId)
+	_, budgetNotify := manager.AdmissionNotify(waitingPeerId)
+	if budgetNotify == nil {
+		t.Fatal("network peer did not subscribe to its dedicated budget")
+	}
+	if _, err := manager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), waitingPeerId, NewId()),
+	); err == nil {
+		t.Fatal("network peer over-admitted its full dedicated budget")
+	} else {
+		var admissionErr *peerConnectionAdmissionError
+		if !errors.As(err, &admissionErr) {
+			t.Fatalf("full dedicated budget error = %v", err)
+		}
+	}
+
+	// Releasing the network window must wake the exact budget channel captured
+	// before the failed admission. Previously AdmissionNotify always returned
+	// MemoryBudget, leaving this waiter asleep until its 30-second fallback.
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-budgetNotify:
+	case <-ctx.Done():
+		t.Fatal("dedicated network-peer budget release did not wake admission")
+	}
+}
+
+func TestWebRtcAdmissionNotificationWakesOnlyCapacityFit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.ReceiveBufferSize = kib(128)
+	settings.MemoryBudget = NewTransferMemoryBudget(settings.ReceiveBufferSize)
+	settings.MemoryBudget.Reserve(settings.ReceiveBufferSize)
+	settings.MaxPeerConnectionCount = 0
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	defer manager.Close()
+
+	firstWaiter := newTransferMemoryBudgetWaiter()
+	secondWaiter := newTransferMemoryBudgetWaiter()
+	defer firstWaiter.reset()
+	defer secondWaiter.reset()
+	_, firstNotify := manager.admissionNotify(NewId(), firstWaiter)
+	_, secondNotify := manager.admissionNotify(NewId(), secondWaiter)
+
+	settings.MemoryBudget.Release(settings.ReceiveBufferSize)
+	wokenCount := 0
+	select {
+	case <-firstNotify:
+		wokenCount += 1
+	default:
+	}
+	select {
+	case <-secondNotify:
+		wokenCount += 1
+	default:
+	}
+	AssertEqual(t, wokenCount, 1)
+	AssertEqual(t, settings.MemoryBudget.capacityWaiterCount.Load(), int64(1))
+}
+
+func TestWebRtcAdmissionNotificationUsesDedicatedThreshold(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.ReceiveBufferSize = kib(128)
+	settings.MemoryBudget = NewTransferMemoryBudget(mib(8))
+	settings.NetworkPeerReceiveBufferSize = mib(2)
+	settings.NetworkPeerMemoryBudget =
+		NewTransferMemoryBudget(settings.NetworkPeerReceiveBufferSize)
+	settings.MaxPeerConnectionCount = 0
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	defer manager.Close()
+
+	peerId := NewId()
+	manager.PrioritizePeer(peerId)
+	waiter := newTransferMemoryBudgetWaiter()
+	defer waiter.reset()
+	_, notify := manager.admissionNotify(peerId, waiter)
+	if notify == nil {
+		t.Fatal("network-peer admission did not receive a budget notification")
+	}
+	if waiter.budget != settings.NetworkPeerMemoryBudget {
+		t.Fatal("network-peer admission subscribed to the public budget")
+	}
+	AssertEqual(t, waiter.requiredByteCount, settings.NetworkPeerReceiveBufferSize)
+}
+
+func TestWebRtcNewestNetworkPeerReclaimsLeaseProtectedDedicatedBudget(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.ReceiveBufferSize = kib(128)
+	settings.MemoryBudget = NewTransferMemoryBudget(settings.ReceiveBufferSize)
+	settings.NetworkPeerReceiveBufferSize = kib(512)
+	settings.NetworkPeerMemoryBudget = NewTransferMemoryBudget(
+		2 * settings.NetworkPeerReceiveBufferSize,
+	)
+	settings.MaxPeerConnectionCount = 0
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+
+	oldestPeerId := NewId()
+	manager.PrioritizePeer(oldestPeerId)
+	oldestValue, err := manager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), oldestPeerId, NewId()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldest := oldestValue.(*peerConn)
+
+	recentPeerId := NewId()
+	manager.PrioritizePeer(recentPeerId)
+	recentValue, err := manager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), recentPeerId, NewId()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recent := recentValue.(*peerConn)
+	defer recent.Close()
+
+	manager.stateLock.Lock()
+	manager.networkPeers[oldestPeerId] = time.Now().Add(-time.Minute)
+	manager.networkPeers[recentPeerId] = time.Now()
+	manager.prioritizedPeers[oldestPeerId] = time.Now().Add(time.Minute)
+	manager.prioritizedPeers[recentPeerId] = time.Now().Add(time.Minute)
+	manager.stateLock.Unlock()
+
+	newestPeerId := NewId()
+	manager.PrioritizePeer(newestPeerId)
+	select {
+	case <-oldest.ctx.Done():
+	case <-ctx.Done():
+		t.Fatal("new authenticated Network peer did not reclaim the stale dedicated slot")
+	}
+	select {
+	case <-recent.ctx.Done():
+		t.Fatal("Network LRU reclaimed the recently observed association")
+	default:
+	}
+
+	var newest *peerConn
+	for newest == nil {
+		var newestValue WebRtcConn
+		newestValue, err = manager.NewP2pConnActive(
+			ctx,
+			NewTransferPath(NewId(), newestPeerId, NewId()),
+		)
+		if err == nil {
+			newest = newestValue.(*peerConn)
+			break
+		}
+		var admissionErr *peerConnectionAdmissionError
+		if !errors.As(err, &admissionErr) {
+			t.Fatalf("newest Network admission error = %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("newest Network peer never consumed the reclaimed slot")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	defer newest.Close()
+
+	if got := settings.NetworkPeerMemoryBudget.UsedByteCount(); got !=
+		2*settings.NetworkPeerReceiveBufferSize {
+		t.Fatalf(
+			"dedicated reservation = %d, want hard bound %d",
+			got,
+			2*settings.NetworkPeerReceiveBufferSize,
+		)
+	}
+}
+
+func TestWebRtcNewestNetworkStreamReclaimsOldestSamePeerAssociation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.ReceiveBufferSize = kib(128)
+	settings.MemoryBudget = NewTransferMemoryBudget(settings.ReceiveBufferSize)
+	settings.NetworkPeerReceiveBufferSize = kib(512)
+	settings.NetworkPeerMemoryBudget = NewTransferMemoryBudget(
+		2 * settings.NetworkPeerReceiveBufferSize,
+	)
+	settings.MaxPeerConnectionCount = 0
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+
+	peerId := NewId()
+	manager.PrioritizePeer(peerId)
+	firstValue, err := manager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), peerId, NewId()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := firstValue.(*peerConn)
+	secondValue, err := manager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), peerId, NewId()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := secondValue.(*peerConn)
+	defer second.Close()
+
+	thirdPath := NewTransferPath(NewId(), peerId, NewId())
+	_, err = manager.NewP2pConnActive(ctx, thirdPath)
+	var admissionErr *peerConnectionAdmissionError
+	if !errors.As(err, &admissionErr) {
+		t.Fatalf("third stream admission = %v, want bounded refusal", err)
+	}
+	select {
+	case <-first.ctx.Done():
+	case <-ctx.Done():
+		t.Fatal("third stream did not retire the oldest same-peer association")
+	}
+	select {
+	case <-second.ctx.Done():
+		t.Fatal("third stream retired the newer same-peer association")
+	default:
+	}
+
+	var third *peerConn
+	for third == nil {
+		var thirdValue WebRtcConn
+		thirdValue, err = manager.NewP2pConnActive(ctx, thirdPath)
+		if err == nil {
+			third = thirdValue.(*peerConn)
+			break
+		}
+		if !errors.As(err, &admissionErr) {
+			t.Fatalf("third stream retry error = %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("third stream never consumed the reclaimed slot")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	defer third.Close()
+	if got := settings.NetworkPeerMemoryBudget.UsedByteCount(); got !=
+		2*settings.NetworkPeerReceiveBufferSize {
+		t.Fatalf(
+			"same-peer reservation = %d, want hard bound %d",
+			got,
+			2*settings.NetworkPeerReceiveBufferSize,
+		)
+	}
+}
+
+func TestWebRtcDedicatedBudgetReclamationDoesNotEvictPublicAssociation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.ReceiveBufferSize = kib(128)
+	settings.MemoryBudget = NewTransferMemoryBudget(settings.ReceiveBufferSize)
+	settings.NetworkPeerReceiveBufferSize = kib(512)
+	settings.NetworkPeerMemoryBudget = NewTransferMemoryBudget(
+		settings.NetworkPeerReceiveBufferSize,
+	)
+	settings.MaxPeerConnectionCount = 0
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+
+	publicValue, err := manager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), NewId(), NewId()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	public := publicValue.(*peerConn)
+	defer public.Close()
+
+	oldNetworkPeerId := NewId()
+	manager.PrioritizePeer(oldNetworkPeerId)
+	oldNetworkValue, err := manager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), oldNetworkPeerId, NewId()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldNetwork := oldNetworkValue.(*peerConn)
+
+	// Only the dedicated pool is full. Reclaiming the older public
+	// association would not release a single byte from that pool and would
+	// unnecessarily disrupt unrelated traffic.
+	newNetworkPeerId := NewId()
+	manager.PrioritizePeer(newNetworkPeerId)
+	select {
+	case <-oldNetwork.ctx.Done():
+	case <-ctx.Done():
+		t.Fatal("full dedicated budget did not reclaim its dedicated association")
+	}
+	select {
+	case <-public.ctx.Done():
+		t.Fatal("dedicated budget reclamation evicted an unrelated public association")
+	default:
+	}
+	if got := settings.MemoryBudget.UsedByteCount(); got != settings.ReceiveBufferSize {
+		t.Fatalf("public reservation = %d, want %d", got, settings.ReceiveBufferSize)
+	}
+}
+
+func TestWebRtcSharedAdmissionBudgetReclaimsPublicAssociationForNetworkPeer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const window = ByteCount(128 * 1024)
+	sharedBudget := NewTransferMemoryBudget(window)
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.ReceiveBufferSize = window
+	settings.MemoryBudget = sharedBudget
+	settings.NetworkPeerReceiveBufferSize = window
+	settings.NetworkPeerMemoryBudget = sharedBudget
+	settings.MaxPeerConnectionCount = 0
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	defer manager.Close()
+
+	publicValue, err := manager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), NewId(), NewId()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	public := publicValue.(*peerConn)
+	defer public.Close()
+
+	// Selected SDK window clients deliberately share one hard budget between
+	// the public fallback and Network views. Labels differ, but canceling this
+	// public association really does release the bytes the selected peer
+	// needs, so reclamation must follow budget identity rather than the label.
+	networkPeerId := NewId()
+	manager.PrioritizePeer(networkPeerId)
+	select {
+	case <-public.ctx.Done():
+	case <-ctx.Done():
+		t.Fatal("shared budget did not reclaim its public owner for the selected peer")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for sharedBudget.UsedByteCount() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("shared reservation did not release: %d", sharedBudget.UsedByteCount())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	network, err := manager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), networkPeerId, NewId()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer network.Close()
+	if !network.(*peerConn).networkPeer {
+		t.Fatal("selected replacement did not use Network admission")
+	}
+	if got := sharedBudget.UsedByteCount(); got != window {
+		t.Fatalf("shared reservation = %d, want %d", got, window)
+	}
+}
+
+func TestWebRtcDedicatedAssociationRemainsReclaimableAfterTrustRecordEviction(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.ReceiveBufferSize = kib(128)
+	settings.MemoryBudget = NewTransferMemoryBudget(settings.ReceiveBufferSize)
+	settings.NetworkPeerReceiveBufferSize = kib(512)
+	settings.NetworkPeerMemoryBudget = NewTransferMemoryBudget(
+		settings.NetworkPeerReceiveBufferSize,
+	)
+	settings.MaxPeerConnectionCount = 0
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+
+	oldPeerId := NewId()
+	manager.PrioritizePeer(oldPeerId)
+	oldValue, err := manager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), oldPeerId, NewId()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := oldValue.(*peerConn)
+
+	// The remembered trust map is intentionally hard bounded. Model enough
+	// later identities to evict this peer while its already-admitted
+	// association is still live and lease protected.
+	manager.stateLock.Lock()
+	delete(manager.networkPeers, oldPeerId)
+	for range maxRememberedNetworkPeerCount {
+		manager.networkPeers[NewId()] = time.Now()
+	}
+	manager.prioritizedPeers[oldPeerId] = time.Now().Add(time.Minute)
+	manager.stateLock.Unlock()
+
+	newPeerId := NewId()
+	manager.PrioritizePeer(newPeerId)
+	select {
+	case <-old.ctx.Done():
+	case <-ctx.Done():
+		t.Fatal("bounded trust-record eviction made a live dedicated association unreclaimable")
+	}
+}
+
+func TestWebRtcPendingDedicatedPeerDoesNotBlockIndependentPublicAdmission(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.ReceiveBufferSize = kib(128)
+	settings.MemoryBudget = NewTransferMemoryBudget(settings.ReceiveBufferSize)
+	settings.NetworkPeerReceiveBufferSize = kib(512)
+	settings.NetworkPeerMemoryBudget = NewTransferMemoryBudget(
+		settings.NetworkPeerReceiveBufferSize,
+	)
+	settings.MaxPeerConnectionCount = 2
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+
+	// Model a shared dedicated budget whose only slot belongs to another
+	// manager. This manager cannot reclaim it, so its selected peer remains
+	// pending until the shared owner releases the reservation.
+	if !settings.NetworkPeerMemoryBudget.TryReserve(
+		settings.NetworkPeerReceiveBufferSize,
+	) {
+		t.Fatal("could not reserve the synthetic shared dedicated slot")
+	}
+	defer settings.NetworkPeerMemoryBudget.Release(
+		settings.NetworkPeerReceiveBufferSize,
+	)
+	networkPeerId := NewId()
+	manager.PrioritizePeer(networkPeerId)
+
+	publicValue, err := manager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), NewId(), NewId()),
+	)
+	if err != nil {
+		t.Fatalf("independent public admission was blocked by dedicated waiter: %v", err)
+	}
+	defer publicValue.Close()
+	if got := settings.MemoryBudget.UsedByteCount(); got != settings.ReceiveBufferSize {
+		t.Fatalf("public reservation = %d, want %d", got, settings.ReceiveBufferSize)
+	}
+	manager.stateLock.Lock()
+	_, pending := manager.pendingPrioritizedPeerSlot[networkPeerId]
+	manager.stateLock.Unlock()
+	if !pending {
+		t.Fatal("independent public admission consumed the selected peer's pending state")
+	}
+}
+
+func TestWebRtcPendingNetworkPeerReservesOnlyNeededSamePoolCapacity(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	firstOrdinaryPeerId := NewId()
+	secondOrdinaryPeerId := NewId()
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.ReceiveBufferSize = kib(128)
+	settings.MemoryBudget = NewTransferMemoryBudget(settings.ReceiveBufferSize)
+	settings.NetworkPeerReceiveBufferSize = kib(128)
+	settings.NetworkPeerMemoryBudget = NewTransferMemoryBudget(
+		2 * settings.NetworkPeerReceiveBufferSize,
+	)
+	settings.MaxPeerConnectionCount = 2
+	settings.InitialNetworkPeerIds = []Id{
+		firstOrdinaryPeerId,
+		secondOrdinaryPeerId,
+	}
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	defer manager.Close()
+
+	pendingPeerId := NewId()
+	manager.PrioritizePeer(pendingPeerId)
+
+	// One of two available slots can still carry an ordinary authenticated
+	// peer while the other is retained for the selected peer. The former
+	// boolean gate froze the entire dedicated pool for the 30-second priority
+	// lease after any signal that did not immediately produce a setup.
+	first, err := manager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), firstOrdinaryPeerId, NewId()),
+	)
+	if err != nil {
+		t.Fatalf("surplus same-pool capacity was blocked: %v", err)
+	}
+	defer first.Close()
+
+	second, err := manager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), secondOrdinaryPeerId, NewId()),
+	)
+	if err == nil {
+		second.Close()
+		t.Fatal("ordinary admission consumed the slot reserved for the selected peer")
+	}
+	var admissionErr *peerConnectionAdmissionError
+	if !errors.As(err, &admissionErr) {
+		t.Fatalf("reserved-slot refusal = %T %v", err, err)
+	}
+	manager.stateLock.Lock()
+	_, pending := manager.pendingPrioritizedPeerSlot[pendingPeerId]
+	manager.stateLock.Unlock()
+	if !pending {
+		t.Fatal("surplus admission removed the selected peer's reservation")
+	}
+}
+
+func TestWebRtcPendingNetworkPeerReservesCapacityInSharedPublicBudget(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const window = ByteCount(128 * 1024)
+	sharedBudget := NewTransferMemoryBudget(2 * window)
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.ReceiveBufferSize = window
+	settings.MemoryBudget = sharedBudget
+	settings.NetworkPeerReceiveBufferSize = window
+	settings.NetworkPeerMemoryBudget = sharedBudget
+	settings.MaxPeerConnectionCount = 3
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	defer manager.Close()
+
+	pendingPeerId := NewId()
+	manager.PrioritizePeer(pendingPeerId)
+	first, err := manager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), NewId(), NewId()),
+	)
+	if err != nil {
+		t.Fatalf("surplus shared capacity was blocked: %v", err)
+	}
+	defer first.Close()
+
+	second, err := manager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), NewId(), NewId()),
+	)
+	if err == nil {
+		second.Close()
+		t.Fatal("public admission consumed shared capacity reserved for selected Network peer")
+	}
+	var admissionErr *peerConnectionAdmissionError
+	if !errors.As(err, &admissionErr) {
+		t.Fatalf("shared-budget refusal = %T %v", err, err)
+	}
+	if got := sharedBudget.UsedByteCount(); got != window {
+		t.Fatalf("shared budget use = %d, want %d", got, window)
+	}
+}
+
+func TestWebRtcReleasedCanceledAssociationDoesNotConsumePriorityReservation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const window = ByteCount(128 * 1024)
+	sharedBudget := NewTransferMemoryBudget(window)
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.ReceiveBufferSize = window
+	settings.MemoryBudget = sharedBudget
+	settings.NetworkPeerReceiveBufferSize = window
+	settings.NetworkPeerMemoryBudget = sharedBudget
+	settings.MaxPeerConnectionCount = 4
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	defer manager.Close()
+
+	pendingPeerId := NewId()
+	manager.PrioritizePeer(pendingPeerId)
+
+	// Model the teardown handoff exactly: the association has been canceled and
+	// its bytes released (which wakes admission waiters), but its map entry has
+	// not yet been removed under the manager lock. That entry no longer owns
+	// budget capacity and must not satisfy the selected peer's reservation.
+	connCtx, connCancel := context.WithCancel(ctx)
+	connCancel()
+	key := peerConnKey{
+		PeerId:   pendingPeerId,
+		StreamId: NewId(),
+	}
+	manager.stateLock.Lock()
+	manager.peerConns[key] = &peerConn{
+		ctx:             connCtx,
+		cancel:          connCancel,
+		key:             key,
+		networkPeer:     true,
+		admissionBudget: sharedBudget,
+	}
+	blocked := manager.pendingPriorityBlocksAdmissionLocked(false, true)
+	delete(manager.peerConns, key)
+	manager.stateLock.Unlock()
+
+	if !blocked {
+		t.Fatal("ordinary admission stole bytes released for the pending selected peer")
+	}
+}
+
+func TestWebRtcPendingPriorityBudgetAccountingDoesNotOverflow(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	firstPendingPeerId := NewId()
+	secondPendingPeerId := NewId()
+	const networkWindow = ByteCount(1 << 62)
+	sharedBudget := NewTransferMemoryBudget(ByteCount(1<<63 - 1))
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.ReceiveBufferSize = 1
+	settings.MemoryBudget = sharedBudget
+	settings.NetworkPeerReceiveBufferSize = networkWindow
+	settings.NetworkPeerMemoryBudget = sharedBudget
+	settings.MaxPeerConnectionCount = 0
+	settings.InitialNetworkPeerIds = []Id{
+		firstPendingPeerId,
+		secondPendingPeerId,
+	}
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	defer manager.Close()
+
+	manager.stateLock.Lock()
+	until := time.Now().Add(time.Minute)
+	manager.pendingPrioritizedPeerSlot[firstPendingPeerId] = until
+	manager.pendingPrioritizedPeerSlot[secondPendingPeerId] = until
+	blocked := manager.pendingPriorityBlocksAdmissionLocked(false, true)
+	manager.stateLock.Unlock()
+
+	if !blocked {
+		t.Fatal("overflowing pending-window sum bypassed the shared budget ceiling")
+	}
+}
+
+func TestWebRtcFailedPriorityStreamRetainsReleasedBudgetReservation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const window = ByteCount(128 * 1024)
+	ordinaryPeerId := NewId()
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.ReceiveBufferSize = window
+	settings.MemoryBudget = NewTransferMemoryBudget(window)
+	settings.NetworkPeerReceiveBufferSize = window
+	settings.NetworkPeerMemoryBudget = NewTransferMemoryBudget(window)
+	settings.MaxPeerConnectionCount = 2
+	settings.InitialNetworkPeerIds = []Id{ordinaryPeerId}
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	defer manager.Close()
+
+	selectedPeerId := NewId()
+	manager.PrioritizePeer(selectedPeerId)
+	first, err := manager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), selectedPeerId, NewId()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstConn := first.(*peerConn)
+	defer first.Close()
+
+	// A refresh sees the first selected-peer stream and clears the original
+	// pending flag. Its second stream still needs a reservation from the same
+	// one-window pool, so the failed priority attempt must recreate that flag
+	// before canceling the old owner.
+	manager.PrioritizePeer(selectedPeerId)
+	secondPath := NewTransferPath(NewId(), selectedPeerId, NewId())
+	if second, secondErr := manager.NewP2pConnActive(ctx, secondPath); secondErr == nil {
+		second.Close()
+		t.Fatal("second selected stream overdrew the one-window budget")
+	} else {
+		var admissionErr *peerConnectionAdmissionError
+		if !errors.As(secondErr, &admissionErr) {
+			t.Fatalf("second selected stream error = %T %v", secondErr, secondErr)
+		}
+	}
+	select {
+	case <-firstConn.ctx.Done():
+	case <-ctx.Done():
+		t.Fatal("failed priority stream did not reclaim its existing budget owner")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for settings.NetworkPeerMemoryBudget.UsedByteCount() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("reclaimed selected reservation did not release")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if ordinary, ordinaryErr := manager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), ordinaryPeerId, NewId()),
+	); ordinaryErr == nil {
+		ordinary.Close()
+		t.Fatal("ordinary waiter stole the released selected-stream reservation")
+	}
+
+	second, err := manager.NewP2pConnActive(ctx, secondPath)
+	if err != nil {
+		t.Fatalf("selected stream could not consume its retained reservation: %v", err)
+	}
+	defer second.Close()
+	manager.stateLock.Lock()
+	_, pending := manager.pendingPrioritizedPeerSlot[selectedPeerId]
+	manager.stateLock.Unlock()
+	if pending {
+		t.Fatal("successful selected stream left its reservation pending")
+	}
+}
+
+func TestWebRtcPriorityRefreshPreservesAnotherStreamReservation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const window = ByteCount(128 * 1024)
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.ReceiveBufferSize = window
+	settings.MemoryBudget = NewTransferMemoryBudget(window)
+	settings.NetworkPeerReceiveBufferSize = window
+	settings.NetworkPeerMemoryBudget = NewTransferMemoryBudget(2 * window)
+	settings.MaxPeerConnectionCount = 2
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	defer manager.Close()
+
+	peerId := NewId()
+	manager.PrioritizePeer(peerId)
+	first, err := manager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), peerId, NewId()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+
+	// Model the pending state installed when a second stream loses an
+	// admission race. Provider traffic refreshes peer priority every five
+	// seconds; seeing the first live stream must not erase the second stream's
+	// reservation and return it to a wake-all lottery.
+	manager.stateLock.Lock()
+	pendingUntil := time.Now().Add(peerConnectionPriorityTimeout / 2)
+	manager.pendingPrioritizedPeerSlot[peerId] = pendingUntil
+	manager.stateLock.Unlock()
+	manager.PrioritizePeer(peerId)
+
+	manager.stateLock.Lock()
+	gotUntil, pending := manager.pendingPrioritizedPeerSlot[peerId]
+	manager.stateLock.Unlock()
+	if !pending {
+		t.Fatal("priority refresh cleared another stream's pending reservation")
+	}
+	if !gotUntil.Equal(pendingUntil) {
+		t.Fatalf(
+			"priority refresh extended stale stream reservation: got=%s want=%s",
+			gotUntil,
+			pendingUntil,
+		)
+	}
+}
+
+func TestWebRtcPendingPriorityAdmissionReportsLeaseRetry(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const window = ByteCount(128 * 1024)
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.ReceiveBufferSize = window
+	settings.MemoryBudget = NewTransferMemoryBudget(window)
+	settings.NetworkPeerReceiveBufferSize = 0
+	settings.NetworkPeerMemoryBudget = nil
+	settings.MaxPeerConnectionCount = 1
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	defer manager.Close()
+
+	pendingPeerId := NewId()
+	manager.PrioritizePeer(pendingPeerId)
+	const lease = 80 * time.Millisecond
+	manager.stateLock.Lock()
+	manager.pendingPrioritizedPeerSlot[pendingPeerId] = time.Now().Add(lease)
+	manager.stateLock.Unlock()
+
+	path := NewTransferPath(NewId(), NewId(), NewId())
+	_, err := manager.NewP2pConnActive(ctx, path)
+	var admissionErr *peerConnectionAdmissionError
+	if !errors.As(err, &admissionErr) {
+		t.Fatalf("pending admission = %T %v", err, err)
+	}
+	if admissionErr.retryAfter <= 0 || lease < admissionErr.retryAfter {
+		t.Fatalf(
+			"pending admission retry = %s, want within (0,%s]",
+			admissionErr.retryAfter,
+			lease,
+		)
+	}
+
+	time.Sleep(lease + 20*time.Millisecond)
+	conn, err := manager.NewP2pConnActive(ctx, path)
+	if err != nil {
+		t.Fatalf("expired priority lease still blocked admission: %v", err)
+	}
+	defer conn.Close()
+}
+
+func TestP2pAdmissionRetryUsesEarlierPriorityLease(t *testing.T) {
+	const configured = 30 * time.Second
+	const lease = 75 * time.Millisecond
+	got := p2pAdmissionRetryTimeout(
+		configured,
+		&peerConnectionAdmissionError{
+			message:    "priority lease",
+			retryAfter: lease,
+		},
+	)
+	if got != lease {
+		t.Fatalf("admission retry = %s, want priority lease %s", got, lease)
+	}
+}
+
+func TestP2pAdmissionWaitChannelsAreReasonLocal(t *testing.T) {
+	countNotify := make(chan struct{})
+	budgetNotify := make(chan struct{})
+	stateNotify := make(chan struct{})
+
+	countWait, budgetWait, stateWait := p2pAdmissionWaitChannels(
+		&peerConnectionAdmissionError{reason: peerConnectionAdmissionBudget},
+		countNotify,
+		budgetNotify,
+		stateNotify,
+	)
+	if countWait != nil || budgetWait != budgetNotify || stateWait != stateNotify {
+		t.Fatal("budget refusal did not isolate budget/state wakeups")
+	}
+
+	countWait, budgetWait, stateWait = p2pAdmissionWaitChannels(
+		&peerConnectionAdmissionError{reason: peerConnectionAdmissionCount},
+		countNotify,
+		budgetNotify,
+		stateNotify,
+	)
+	if countWait != countNotify || budgetWait != nil || stateWait != stateNotify {
+		t.Fatal("count refusal did not isolate count/state wakeups")
+	}
+
+	countWait, budgetWait, stateWait = p2pAdmissionWaitChannels(
+		&peerConnectionAdmissionError{reason: peerConnectionAdmissionPriority},
+		countNotify,
+		budgetNotify,
+		stateNotify,
+	)
+	if countWait != nil || budgetWait != nil || stateWait != stateNotify {
+		t.Fatal("priority refusal did not isolate state wakeups")
+	}
+}
+
+func TestWebRtcCountAdmissionReleaseWakesOneWaiter(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.MaxPeerConnectionCount = 8
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	defer manager.Close()
+
+	firstWaiter := newTransferMemoryBudgetWaiter()
+	secondWaiter := newTransferMemoryBudgetWaiter()
+	defer firstWaiter.reset()
+	defer secondWaiter.reset()
+	firstNotify, _ := manager.admissionNotify(NewId(), firstWaiter)
+	secondNotify, _ := manager.admissionNotify(NewId(), secondWaiter)
+	if firstNotify != secondNotify {
+		t.Fatal("count admission waiters do not share the bounded token channel")
+	}
+
+	manager.notifyCountCapacity()
+	wokenCount := 0
+	select {
+	case <-firstNotify:
+		wokenCount += 1
+	default:
+	}
+	select {
+	case <-secondNotify:
+		wokenCount += 1
+	default:
+	}
+	if wokenCount != 1 {
+		t.Fatalf("one count release woke %d waiters", wokenCount)
+	}
+}
+
+func TestWebRtcInternalAdmissionIgnoresUnrelatedBroadcast(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.MaxPeerConnectionCount = 8
+	settings.MemoryBudget = NewTransferMemoryBudget(1)
+	settings.MemoryBudget.Reserve(1)
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	defer manager.Close()
+
+	waiter := newTransferMemoryBudgetWaiter()
+	defer waiter.reset()
+	countNotify, budgetNotify := manager.admissionNotify(NewId(), waiter)
+	manager.capacityMonitor.NotifyAll()
+
+	select {
+	case <-countNotify:
+		t.Fatal("compatibility broadcast woke an internal count waiter")
+	default:
+	}
+	select {
+	case <-budgetNotify:
+		t.Fatal("compatibility broadcast woke an internal budget waiter")
+	default:
+	}
+}
+
+func TestWebRtcAdmissionClassificationChangeHasDedicatedWake(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	defer manager.Close()
+
+	stateNotify := manager.admissionStateMonitor.NotifyChannel()
+	manager.PrioritizePeer(NewId())
+	select {
+	case <-stateNotify:
+	case <-time.After(time.Second):
+		t.Fatal("network-peer classification change did not wake admission")
+	}
+}
+
+func TestP2pAdmissionLogKeyIgnoresChangingCapacityDiagnostics(t *testing.T) {
+	first := &peerConnectionAdmissionError{
+		message: "budget exhausted used=1048576 live=9 replacing=true",
+		reason:  peerConnectionAdmissionBudget,
+	}
+	second := &peerConnectionAdmissionError{
+		message: "budget exhausted used=917504 live=10 replacing=false",
+		reason:  peerConnectionAdmissionBudget,
+	}
+	if first.Error() == second.Error() {
+		t.Fatal("test diagnostics do not model changing capacity samples")
+	}
+	if firstKey, secondKey := p2pSetupErrorKey(first), p2pSetupErrorKey(second); firstKey != secondKey {
+		t.Fatalf("same admission streak keys changed: %q != %q", firstKey, secondKey)
+	}
+}
+
+func TestWebRtcAdmissionRefusalTelemetryIsSparseAndReasonLocal(t *testing.T) {
+	manager := &WebRtcManager{}
+	budgetEmits := 0
+	for i := 0; i < 16; i++ {
+		if _, emit := manager.observeAdmissionRefusal(peerConnectionAdmissionBudget); emit {
+			budgetEmits += 1
+		}
+	}
+	if budgetEmits != 5 {
+		t.Fatalf("budget summary count = %d, want 5 through refusal 16", budgetEmits)
+	}
+
+	countEmits := 0
+	for i := 0; i < 8; i++ {
+		if _, emit := manager.observeAdmissionRefusal(peerConnectionAdmissionCount); emit {
+			countEmits += 1
+		}
+	}
+	if countEmits != 4 {
+		t.Fatalf("count summary count = %d, want 4 through refusal 8", countEmits)
+	}
+	if count := manager.admissionBudgetRefusalCount.Load(); count != 16 {
+		t.Fatalf("budget refusal count = %d, want 16", count)
+	}
+	if count := manager.admissionCountRefusalCount.Load(); count != 8 {
+		t.Fatalf("count refusal count = %d, want 8", count)
+	}
+}
+
+func TestWebRtcAdmissionRefusalTelemetryIsSparseUnderConcurrency(t *testing.T) {
+	manager := &WebRtcManager{}
+	const refusalCount = 128
+	var emits atomic.Int64
+	var wait sync.WaitGroup
+	wait.Add(refusalCount)
+	for i := 0; i < refusalCount; i++ {
+		go func() {
+			defer wait.Done()
+			if _, emit := manager.observeAdmissionRefusal(peerConnectionAdmissionBudget); emit {
+				emits.Add(1)
+			}
+		}()
+	}
+	wait.Wait()
+
+	if count := manager.admissionBudgetRefusalCount.Load(); count != refusalCount {
+		t.Fatalf("budget refusal count = %d, want %d", count, refusalCount)
+	}
+	if count := emits.Load(); count != 8 {
+		t.Fatalf("summary count = %d, want 8 through refusal 128", count)
+	}
+}
+
+func TestP2pSetupFailureStreakEndsOnlyAtReadyBoundary(t *testing.T) {
+	failure := &peerConnectionAdmissionError{
+		message: "budget exhausted",
+		reason:  peerConnectionAdmissionBudget,
+	}
+	var streak p2pSetupFailureStreak
+	if !streak.Observe(failure) {
+		t.Fatal("first setup failure was suppressed")
+	}
+	// A PeerConnection allocation is deliberately not a state transition on
+	// this object. If its ready-header exchange later times out, the same
+	// failure remains one streak and must stay suppressed.
+	if streak.Observe(failure) {
+		t.Fatal("unchanged failure logged again before a ready-header recovery")
+	}
+	if !streak.Recover() {
+		t.Fatal("ready boundary did not end the failure streak")
+	}
+	if !streak.Observe(failure) {
+		t.Fatal("new post-recovery failure streak was suppressed")
+	}
+}
+
+func TestWebRtcLiveNetworkAssociationPreservesTrustAfterRecordEviction(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.ReceiveBufferSize = kib(128)
+	settings.MemoryBudget = NewTransferMemoryBudget(settings.ReceiveBufferSize)
+	settings.NetworkPeerReceiveBufferSize = kib(128)
+	settings.NetworkPeerMemoryBudget = NewTransferMemoryBudget(
+		2 * settings.NetworkPeerReceiveBufferSize,
+	)
+	settings.MaxPeerConnectionCount = 2
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	defer manager.Close()
+
+	peerId := NewId()
+	manager.PrioritizePeer(peerId)
+	first, err := manager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), peerId, NewId()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	if !first.(*peerConn).networkPeer {
+		t.Fatal("initial association did not use dedicated admission")
+	}
+
+	// Model the unavoidable overflow case where every bounded identity record
+	// has a live association. The immutable class of an authenticated live
+	// association must still prevent an adjacent stream from silently
+	// downgrading to the public window and budget.
+	manager.stateLock.Lock()
+	delete(manager.networkPeers, peerId)
+	delete(manager.prioritizedPeers, peerId)
+	manager.stateLock.Unlock()
+
+	second, err := manager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), peerId, NewId()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	if !second.(*peerConn).networkPeer {
+		t.Fatal("live authenticated association did not preserve dedicated admission")
+	}
+	if got := settings.NetworkPeerMemoryBudget.UsedByteCount(); got !=
+		2*settings.NetworkPeerReceiveBufferSize {
+		t.Fatalf(
+			"dedicated reservations = %d, want %d",
+			got,
+			2*settings.NetworkPeerReceiveBufferSize,
+		)
+	}
+	if got := settings.MemoryBudget.UsedByteCount(); got != 0 {
+		t.Fatalf("record eviction touched public budget: %d", got)
+	}
+}
+
+func TestWebRtcNetworkIdentityChurnEvictsInactiveBeforeLiveRecord(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.ReceiveBufferSize = kib(128)
+	settings.MemoryBudget = NewTransferMemoryBudget(settings.ReceiveBufferSize)
+	settings.NetworkPeerReceiveBufferSize = kib(128)
+	settings.NetworkPeerMemoryBudget = NewTransferMemoryBudget(
+		2 * settings.NetworkPeerReceiveBufferSize,
+	)
+	settings.MaxPeerConnectionCount = 0
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	defer manager.Close()
+
+	livePeerId := NewId()
+	manager.PrioritizePeer(livePeerId)
+	live, err := manager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), livePeerId, NewId()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer live.Close()
+
+	for range maxRememberedNetworkPeerCount + 1 {
+		manager.PrioritizePeer(NewId())
+	}
+	manager.stateLock.Lock()
+	_, remembered := manager.networkPeers[livePeerId]
+	rememberedCount := len(manager.networkPeers)
+	manager.stateLock.Unlock()
+	if !remembered {
+		t.Fatal("bounded identity churn evicted a live record before inactive records")
+	}
+	if rememberedCount != maxRememberedNetworkPeerCount {
+		t.Fatalf(
+			"remembered identity count = %d, want %d",
+			rememberedCount,
+			maxRememberedNetworkPeerCount,
+		)
+	}
+}
+
+func TestWebRtcNetworkPromotionWakesPublicAdmissionSubscription(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.ReceiveBufferSize = kib(128)
+	settings.MemoryBudget = NewTransferMemoryBudget(settings.ReceiveBufferSize)
+	settings.NetworkPeerReceiveBufferSize = mib(2)
+	settings.NetworkPeerMemoryBudget = NewTransferMemoryBudget(
+		settings.NetworkPeerReceiveBufferSize,
+	)
+	settings.MaxPeerConnectionCount = 0
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+
+	peerId := NewId()
+	countNotify, stalePublicBudgetNotify := manager.AdmissionNotify(peerId)
+	if countNotify == nil || stalePublicBudgetNotify == nil {
+		t.Fatal("public admission did not expose both notification sources")
+	}
+	if stalePublicBudgetNotify != settings.MemoryBudget.CapacityNotify() {
+		t.Fatal("untrusted peer did not initially subscribe to the public budget")
+	}
+
+	// This models the ordering in P2pTransport.run: notification capture can
+	// precede the authenticated ProvideMode_Network signal. Promotion must
+	// wake the manager channel because the already-captured public budget will
+	// never report capacity changes in the peer's real dedicated pool.
+	manager.PrioritizePeer(peerId)
+	select {
+	case <-countNotify:
+	case <-ctx.Done():
+		t.Fatal("Network promotion left the public admission subscription asleep")
+	}
+	select {
+	case <-stalePublicBudgetNotify:
+		t.Fatal("Network promotion spuriously changed public-budget capacity")
+	default:
+	}
+
+	_, dedicatedBudgetNotify := manager.AdmissionNotify(peerId)
+	if dedicatedBudgetNotify == nil {
+		t.Fatal("promoted peer did not expose a dedicated-budget notification")
+	}
+	if dedicatedBudgetNotify != settings.NetworkPeerMemoryBudget.CapacityNotify() {
+		t.Fatal("promoted peer did not re-arm against its dedicated budget")
+	}
+}
+
+func TestWebRtcNetworkPeerIdentitySurvivesPriorityExpiry(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.ReceiveBufferSize = kib(128)
+	settings.MemoryBudget = NewTransferMemoryBudget(settings.ReceiveBufferSize)
+	settings.NetworkPeerReceiveBufferSize = mib(2)
+	settings.NetworkPeerMemoryBudget = NewTransferMemoryBudget(settings.NetworkPeerReceiveBufferSize)
+	settings.MaxPeerConnectionCount = 0
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+
+	peerId := NewId()
+	manager.PrioritizePeer(peerId)
+	manager.stateLock.Lock()
+	manager.prioritizedPeers[peerId] = time.Now().Add(-time.Second)
+	manager.pendingPrioritizedPeerSlot[peerId] = time.Now().Add(-time.Second)
+	manager.stateLock.Unlock()
+
+	// Simulate an idle/network-change rebuild after the short admission lease
+	// expires. Trust is bounded manager state, not a capacity reservation, and
+	// must continue selecting the symmetric large receive window.
+	conn, err := manager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), peerId, NewId()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if !conn.(*peerConn).networkPeer {
+		t.Fatal("expired priority silently reverted a trusted peer to the public window")
+	}
+	if got := settings.NetworkPeerMemoryBudget.UsedByteCount(); got != settings.NetworkPeerReceiveBufferSize {
+		t.Fatalf("network reservation = %d, want %d", got, settings.NetworkPeerReceiveBufferSize)
+	}
+	if got := settings.MemoryBudget.UsedByteCount(); got != 0 {
+		t.Fatalf("idle rebuild used public budget: %d", got)
+	}
+}
+
+func TestWebRtcInitialNetworkPeerUsesReservedAdmissionBeforeAnySignal(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	peerId := NewId()
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.ReceiveBufferSize = kib(128)
+	settings.MemoryBudget = NewTransferMemoryBudget(settings.ReceiveBufferSize)
+	settings.NetworkPeerReceiveBufferSize = kib(512)
+	settings.NetworkPeerMemoryBudget =
+		NewTransferMemoryBudget(2 * settings.NetworkPeerReceiveBufferSize)
+	settings.InitialNetworkPeerIds = []Id{peerId}
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+
+	conn, err := manager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), peerId, NewId()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if !conn.(*peerConn).networkPeer {
+		t.Fatal("explicit destination opened its first association as an untrusted public peer")
+	}
+	if got := settings.NetworkPeerMemoryBudget.UsedByteCount(); got != settings.NetworkPeerReceiveBufferSize {
+		t.Fatalf("network reservation = %d, want %d", got, settings.NetworkPeerReceiveBufferSize)
+	}
+	if got := settings.MemoryBudget.UsedByteCount(); got != 0 {
+		t.Fatalf("initial network peer consumed public admission: %d", got)
+	}
+}
+
+func TestWebRtcLateNetworkPromotionRebuildsPublicWindowConnection(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.ReceiveBufferSize = kib(128)
+	settings.MemoryBudget = NewTransferMemoryBudget(settings.ReceiveBufferSize)
+	settings.NetworkPeerReceiveBufferSize = mib(2)
+	settings.NetworkPeerMemoryBudget = NewTransferMemoryBudget(settings.NetworkPeerReceiveBufferSize)
+	settings.MaxPeerConnectionCount = 1
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+
+	peerId := NewId()
+	streamId := NewId()
+	path := NewTransferPath(NewId(), peerId, streamId)
+	publicConnValue, err := manager.NewP2pConnActive(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicConn := publicConnValue.(*peerConn)
+	if publicConn.networkPeer {
+		t.Fatal("connection began as a network peer before authentication")
+	}
+
+	manager.PrioritizePeer(peerId)
+	select {
+	case <-publicConn.ImmediateReconnect():
+	case <-ctx.Done():
+		t.Fatal("late Network promotion did not request an immediate rebuild")
+	}
+	select {
+	case <-publicConn.ctx.Done():
+	case <-ctx.Done():
+		t.Fatal("late Network promotion did not retire the public-window association")
+	}
+
+	networkConnValue, err := manager.NewP2pConnActive(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer networkConnValue.Close()
+	networkConn := networkConnValue.(*peerConn)
+	if !networkConn.networkPeer {
+		t.Fatal("replacement did not select the network-peer Pion API")
+	}
+	manager.stateLock.Lock()
+	_, pending := manager.pendingPrioritizedPeerSlot[peerId]
+	manager.stateLock.Unlock()
+	if pending {
+		t.Fatal("admitted replacement left its priority slot pending")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for settings.MemoryBudget.UsedByteCount() != 0 {
+		if deadline.Before(time.Now()) {
+			t.Fatalf("public-window reservation was not released: %d", settings.MemoryBudget.UsedByteCount())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := settings.NetworkPeerMemoryBudget.UsedByteCount(); got != settings.NetworkPeerReceiveBufferSize {
+		t.Fatalf("network reservation = %d, want %d", got, settings.NetworkPeerReceiveBufferSize)
+	}
+}
+
+func TestAuthenticatedNetworkSignalUpgradesExistingPublicWindowConnection(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.ReceiveBufferSize = kib(128)
+	settings.MemoryBudget = NewTransferMemoryBudget(settings.ReceiveBufferSize)
+	settings.NetworkPeerReceiveBufferSize = mib(2)
+	settings.NetworkPeerMemoryBudget = NewTransferMemoryBudget(settings.NetworkPeerReceiveBufferSize)
+	settings.MaxPeerConnectionCount = 1
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+
+	peerId := NewId()
+	streamId := NewId()
+	path := NewTransferPath(NewId(), peerId, streamId)
+	publicValue, err := manager.NewP2pConnPassive(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicConn := publicValue.(*peerConn)
+	if publicConn.networkPeer {
+		t.Fatal("passive connection began trusted before its authenticated signal")
+	}
+
+	dispatcher := newTestingSignalDispatcher(ctx, cancel, manager, 1, 2)
+	defer dispatcher.Close()
+	frame := testingSignalFrame(t, streamId)
+	dispatcher.Receive(
+		SourceId(peerId),
+		[]*protocol.Frame{frame},
+		Peer{ProvideMode: protocol.ProvideMode_Network},
+	)
+	MessagePoolReturn(frame.MessageBytes)
+
+	select {
+	case <-publicConn.ImmediateReconnect():
+	case <-ctx.Done():
+		t.Fatal("authenticated Network signal did not request window upgrade")
+	}
+	select {
+	case <-publicConn.ctx.Done():
+	case <-ctx.Done():
+		t.Fatal("authenticated Network signal did not retire public-window connection")
+	}
+
+	replacementValue, err := manager.NewP2pConnPassive(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replacementValue.Close()
+	if !replacementValue.(*peerConn).networkPeer {
+		t.Fatal("post-signal replacement did not use dedicated network window")
+	}
+}
+
+func TestWebRtcIncompleteNetworkPeerAdmissionFallsBackToPublicPool(t *testing.T) {
+	tests := []struct {
+		name          string
+		networkWindow ByteCount
+		networkBudget *TransferMemoryBudget
+	}{
+		{
+			name:          "window_without_budget",
+			networkWindow: mib(2),
+		},
+		{
+			name:          "budget_without_window",
+			networkBudget: NewTransferMemoryBudget(mib(2)),
+		},
+	}
+	for _, test := range tests {
+		func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			settings := DefaultWebRtcSettings()
+			settings.Log = NewNoopLogger()
+			settings.IceServerUrls = nil
+			settings.ReceiveBufferSize = kib(128)
+			settings.MemoryBudget = NewTransferMemoryBudget(settings.ReceiveBufferSize)
+			settings.NetworkPeerReceiveBufferSize = test.networkWindow
+			settings.NetworkPeerMemoryBudget = test.networkBudget
+			settings.MaxPeerConnectionCount = 0
+			manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+
+			peerId := NewId()
+			manager.PrioritizePeer(peerId)
+			conn, err := manager.NewP2pConnActive(
+				ctx,
+				NewTransferPath(NewId(), peerId, NewId()),
+			)
+			if err != nil {
+				t.Fatalf("%s: %v", test.name, err)
+			}
+			defer conn.Close()
+			if conn.(*peerConn).networkPeer {
+				t.Fatalf("%s: incomplete dedicated admission configuration selected network API", test.name)
+			}
+			if got := settings.MemoryBudget.UsedByteCount(); got != settings.ReceiveBufferSize {
+				t.Fatalf("%s: public reservation = %d, want %d", test.name, got, settings.ReceiveBufferSize)
+			}
+			if test.networkBudget != nil && test.networkBudget.UsedByteCount() != 0 {
+				t.Fatalf("%s: incomplete configuration touched dedicated budget: %d", test.name, test.networkBudget.UsedByteCount())
+			}
+		}()
 	}
 }
 
@@ -1050,8 +3224,10 @@ func TestWebRtcPeerPriorityStateIsHardBounded(t *testing.T) {
 	settings.MemoryBudget = nil
 	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
 
+	var newestPeerId Id
 	for range 4 * maxPeerConnectionPriorityCount {
-		manager.PrioritizePeer(NewId())
+		newestPeerId = NewId()
+		manager.PrioritizePeer(newestPeerId)
 	}
 	manager.stateLock.Lock()
 	defer manager.stateLock.Unlock()
@@ -1060,6 +3236,52 @@ func TestWebRtcPeerPriorityStateIsHardBounded(t *testing.T) {
 	}
 	if got := len(manager.pendingPrioritizedPeerSlot); maxPeerConnectionPriorityCount < got {
 		t.Fatalf("pending priority peers retained = %d, max %d", got, maxPeerConnectionPriorityCount)
+	}
+	if got := len(manager.networkPeers); maxRememberedNetworkPeerCount < got {
+		t.Fatalf("remembered network peers = %d, max %d", got, maxRememberedNetworkPeerCount)
+	}
+	if _, ok := manager.networkPeers[newestPeerId]; !ok {
+		t.Fatal("bounded network-peer identity map evicted the newest promotion")
+	}
+}
+
+func TestWebRtcRepeatedNetworkSignalDoesNotRefreshAdmissionDemand(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.MaxPeerConnectionCount = 0
+	settings.MemoryBudget = nil
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	defer manager.Close()
+
+	peerId := NewId()
+	manager.ObserveNetworkPeerSignal(peerId)
+	expired := time.Now().Add(-time.Second)
+	manager.stateLock.Lock()
+	manager.prioritizedPeers[peerId] = expired
+	manager.pendingPrioritizedPeerSlot[peerId] = expired
+	rememberedTime := manager.networkPeers[peerId]
+	manager.stateLock.Unlock()
+
+	// A stale P2P stream can emit negotiation signals forever. They retain the
+	// authenticated admission class but are not fresh demand and must not
+	// renew either the eviction lease or its reserved pending slot.
+	manager.ObserveNetworkPeerSignal(peerId)
+
+	manager.stateLock.Lock()
+	priorityUntil := manager.prioritizedPeers[peerId]
+	pendingUntil := manager.pendingPrioritizedPeerSlot[peerId]
+	nextRememberedTime := manager.networkPeers[peerId]
+	manager.stateLock.Unlock()
+	if !priorityUntil.Equal(expired) {
+		t.Fatal("repeated network signal refreshed an expired admission lease")
+	}
+	if !pendingUntil.Equal(expired) {
+		t.Fatal("repeated network signal refreshed an expired pending reservation")
+	}
+	if !nextRememberedTime.Equal(rememberedTime) {
+		t.Fatal("repeated network signal refreshed stale peer recency")
 	}
 }
 
@@ -1075,8 +3297,11 @@ func TestWebRtcRepeatedConnectCloseReleasesAdmissionWithoutStall(t *testing.T) {
 	settingsB.Log = NewNoopLogger()
 	settingsA.IceServerUrls = nil
 	settingsB.IceServerUrls = nil
-	settingsA.UseEgressOnlyIceInterfaces = true
-	settingsB.UseEgressOnlyIceInterfaces = true
+	// This test exercises repeated admission/release, not interface
+	// filtering. Both peers are on one host, so retain loopback instead of
+	// depending on external-address UDP hairpin behavior during rapid churn.
+	settingsA.UseEgressOnlyIceInterfaces = false
+	settingsB.UseEgressOnlyIceInterfaces = false
 	settingsA.MaxPeerConnectionCount = 1
 	settingsB.MaxPeerConnectionCount = 1
 	settingsA.ReceiveBufferSize = reservationSize
@@ -1088,6 +3313,8 @@ func TestWebRtcRepeatedConnectCloseReleasesAdmissionWithoutStall(t *testing.T) {
 	signalPipeB := newSignalPipe(nil)
 	managerA := NewWebRtcManager(ctx, signalPipeA, settingsA)
 	managerB := NewWebRtcManager(ctx, signalPipeB, settingsB)
+	defer managerA.Close()
+	defer managerB.Close()
 	signalPipeA.SetSignalReceiver(managerB)
 	signalPipeB.SetSignalReceiver(managerA)
 
@@ -1110,7 +3337,12 @@ func TestWebRtcRepeatedConnectCloseReleasesAdmissionWithoutStall(t *testing.T) {
 		connectedDeadline := time.Now().Add(5 * time.Second)
 		for !active.Connected() || !passive.Connected() {
 			if time.Now().After(connectedDeadline) {
-				t.Fatalf("cycle %d did not connect", cycle)
+				t.Fatalf(
+					"cycle %d did not connect: active={%s} passive={%s}",
+					cycle,
+					testingWebRtcConnDiagnostics(active),
+					testingWebRtcConnDiagnostics(passive),
+				)
 			}
 			time.Sleep(time.Millisecond)
 		}
@@ -1145,6 +3377,97 @@ func TestWebRtcRepeatedConnectCloseReleasesAdmissionWithoutStall(t *testing.T) {
 		maxTeardown = max(maxTeardown, time.Since(start))
 	}
 	t.Logf("%d connect/close cycles: maximum admission-release latency=%s", cycles, maxTeardown)
+}
+
+func testingWebRtcConnDiagnostics(conn WebRtcConn) string {
+	peer, ok := conn.(*peerConn)
+	if !ok {
+		return fmt.Sprintf("type=%T connected=%t", conn, conn.Connected())
+	}
+	peer.signalLock.Lock()
+	remoteDescriptionSet := peer.remoteDescriptionSet
+	remoteCandidateCount := len(peer.remoteIceCandidateBuffer)
+	remoteCandidateBytes := peer.remoteIceCandidateBufferBytes
+	peer.signalLock.Unlock()
+	peer.stateLock.Lock()
+	connected := peer.connected
+	offerSet := peer.offer != nil
+	answerSet := peer.answer != nil
+	localCandidateCount := len(peer.iceCandidateBuffer)
+	localCandidatesReady := peer.iceCandidatesReady
+	dataChannelOpen := peer.conn != nil
+	peer.stateLock.Unlock()
+
+	localDescriptionCandidateCount := 0
+	if localDescription := peer.pc.LocalDescription(); localDescription != nil {
+		localDescriptionCandidateCount = strings.Count(localDescription.SDP, "\na=candidate:")
+	}
+	remoteDescriptionCandidateCount := 0
+	if remoteDescription := peer.pc.RemoteDescription(); remoteDescription != nil {
+		remoteDescriptionCandidateCount = strings.Count(remoteDescription.SDP, "\na=candidate:")
+	}
+	var localCandidateStats int
+	var remoteCandidateStats int
+	var candidatePairStats int
+	var candidatePairRequests uint64
+	var candidatePairResponses uint64
+	for _, stat := range peer.pc.GetStats() {
+		switch typed := stat.(type) {
+		case webrtc.ICECandidateStats:
+			if typed.Type == webrtc.StatsTypeLocalCandidate {
+				localCandidateStats++
+			} else if typed.Type == webrtc.StatsTypeRemoteCandidate {
+				remoteCandidateStats++
+			}
+		case webrtc.ICECandidatePairStats:
+			candidatePairStats++
+			candidatePairRequests += typed.RequestsSent
+			candidatePairResponses += typed.ResponsesReceived
+		}
+	}
+	return fmt.Sprintf(
+		"connected=%t ctx=%v pc=%s ice=%s gather=%s signal=%s offer=%t answer=%t remote_description=%t local_candidates=buffer:%d/ready:%t/sdp:%d/stats:%d remote_candidates=buffer:%d/%dB/sdp:%d/stats:%d pairs=%d requests=%d responses=%d data_channel=%t fds=%d goroutines=%d",
+		connected,
+		context.Cause(peer.ctx),
+		peer.pc.ConnectionState(),
+		peer.pc.ICEConnectionState(),
+		peer.pc.ICEGatheringState(),
+		peer.pc.SignalingState(),
+		offerSet,
+		answerSet,
+		remoteDescriptionSet,
+		localCandidateCount,
+		localCandidatesReady,
+		localDescriptionCandidateCount,
+		localCandidateStats,
+		remoteCandidateCount,
+		remoteCandidateBytes,
+		remoteDescriptionCandidateCount,
+		remoteCandidateStats,
+		candidatePairStats,
+		candidatePairRequests,
+		candidatePairResponses,
+		dataChannelOpen,
+		testingOpenFileDescriptorCount(),
+		runtime.NumGoroutine(),
+	)
+}
+
+func testingOpenFileDescriptorCount() int {
+	var directory string
+	switch runtime.GOOS {
+	case "darwin":
+		directory = "/dev/fd"
+	case "linux":
+		directory = "/proc/self/fd"
+	default:
+		return -1
+	}
+	entries, err := os.ReadDir(directory)
+	if err == nil {
+		return len(entries)
+	}
+	return testingOpenFileDescriptorFallback()
 }
 
 func TestClientSignalReceiverCoalescesAdjacentCandidatesOnly(t *testing.T) {
@@ -1640,18 +3963,26 @@ func TestWebRtcManagerPeerConnectionFactoryIsLazy(t *testing.T) {
 	)
 	AssertEqual(t, err, nil)
 	AssertEqual(t, manager.peerConnectionFactoryInitialized, true)
+	manager.peerConnectionFactoryLock.Lock()
+	if manager.peerConnectionCertificate == nil {
+		manager.peerConnectionFactoryLock.Unlock()
+		t.Fatal("initialized manager did not retain its DTLS certificate")
+	}
+	manager.peerConnectionFactoryLock.Unlock()
 	conn.Close()
 
 	cancel()
-	factoryClosed := func() bool {
+	factoryReleased := func() bool {
 		manager.peerConnectionFactoryLock.Lock()
 		defer manager.peerConnectionFactoryLock.Unlock()
-		return manager.peerConnectionFactoryClosed
+		return manager.peerConnectionFactoryClosed &&
+			manager.peerConnectionFactory == nil &&
+			manager.peerConnectionCertificate == nil
 	}
 	deadline := time.Now().Add(time.Second)
-	for !factoryClosed() {
+	for !factoryReleased() {
 		if time.Now().After(deadline) {
-			t.Fatal("manager factory did not close with its context")
+			t.Fatal("manager factory/certificate did not release with its context")
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -1668,12 +3999,15 @@ func TestWebRtcManagerFactoryFailureRetriesAfterBoundedCooldown(t *testing.T) {
 
 	factoryErr := errors.New("transient factory failure")
 	factoryCalls := 0
-	manager.newPeerConnectionFactory = func(settings *WebRtcSettings) (*webRtcPeerConnectionFactory, error) {
+	manager.newPeerConnectionFactory = func(
+		settings *WebRtcSettings,
+		certificate *webrtc.Certificate,
+	) (*webRtcPeerConnectionFactory, *webrtc.Certificate, error) {
 		factoryCalls++
 		if factoryCalls == 1 {
-			return nil, factoryErr
+			return nil, nil, factoryErr
 		}
-		return newWebRtcPeerConnectionFactory(settings)
+		return newWebRtcPeerConnectionFactory(settings, certificate)
 	}
 	newActive := func() (WebRtcConn, error) {
 		return manager.NewP2pConnActive(
@@ -1721,6 +4055,614 @@ func TestWebRtcManagerCanceledStreamDoesNotAllocatePeerConnection(t *testing.T) 
 	AssertEqual(t, budget.UsedByteCount(), ByteCount(0))
 }
 
+func TestWebRtcManagerCloseSynchronouslyReleasesOwnedResources(t *testing.T) {
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.UseEgressOnlyIceInterfaces = false
+	settings.MaxPeerConnectionCount = 1
+	settings.MemoryBudget = NewTransferMemoryBudget(settings.ReceiveBufferSize)
+
+	// Keep both parent and stream contexts live: explicit manager ownership,
+	// rather than incidental parent cancellation, must release the peer.
+	parentCtx := context.Background()
+	streamCtx, streamCancel := context.WithCancel(parentCtx)
+	defer streamCancel()
+	manager := NewWebRtcManager(parentCtx, &testing_noopSignalSender{}, settings)
+	_, err := manager.NewP2pConnActive(
+		streamCtx,
+		NewTransferPath(NewId(), NewId(), NewId()),
+	)
+	AssertEqual(t, err, nil)
+	if got := settings.MemoryBudget.UsedByteCount(); got != settings.ReceiveBufferSize {
+		t.Fatalf("reservation before close = %d, want %d", got, settings.ReceiveBufferSize)
+	}
+
+	closeReturned := make(chan struct{})
+	go func() {
+		manager.Close()
+		close(closeReturned)
+	}()
+	select {
+	case <-closeReturned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("manager Close did not join peer teardown")
+	}
+
+	if got := settings.MemoryBudget.UsedByteCount(); got != 0 {
+		t.Fatalf("reservation after close = %d, want 0", got)
+	}
+	manager.stateLock.Lock()
+	closed := manager.closed
+	peerCount := len(manager.peerConns)
+	manager.stateLock.Unlock()
+	if !closed || peerCount != 0 {
+		t.Fatalf("closed manager retained state: closed=%t peers=%d", closed, peerCount)
+	}
+	manager.peerConnectionFactoryLock.Lock()
+	factoryClosed := manager.peerConnectionFactoryClosed
+	manager.peerConnectionFactoryLock.Unlock()
+	if !factoryClosed {
+		t.Fatal("manager Close returned before its peer-connection factory closed")
+	}
+	if _, err := manager.NewP2pConnActive(
+		streamCtx,
+		NewTransferPath(NewId(), NewId(), NewId()),
+	); !errors.Is(err, context.Canceled) && !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("post-close peer admission error = %v, want closed", err)
+	}
+
+	// Idempotent Close must return immediately after the first synchronous
+	// teardown rather than starting another lifecycle.
+	manager.Close()
+}
+
+type blockingPeerSignalSender struct {
+	entered     chan struct{}
+	release     chan struct{}
+	releaseOnce sync.Once
+}
+
+type contextBackpressuredPeerSignalSender struct {
+	entered chan struct{}
+}
+
+func (self *contextBackpressuredPeerSignalSender) SendSignal(
+	_ TransferPath,
+	_ *protocol.Frame,
+	opts ...any,
+) {
+	var ctx context.Context
+	for _, opt := range opts {
+		if value, ok := opt.(transferCtx); ok {
+			ctx = value.Ctx
+		}
+	}
+	if ctx == nil {
+		panic("peer signal did not carry its generation context")
+	}
+	close(self.entered)
+	<-ctx.Done()
+}
+
+func TestWebRtcSignalBackpressureEndsWithPeerGeneration(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	sender := &contextBackpressuredPeerSignalSender{
+		entered: make(chan struct{}),
+	}
+	conn := &peerConn{
+		ctx:              ctx,
+		key:              peerConnKey{PeerId: NewId(), StreamId: NewId()},
+		sourceId:         NewId(),
+		active:           true,
+		signalSender:     sender,
+		signalGeneration: NewId(),
+	}
+
+	returned := make(chan struct{})
+	go func() {
+		conn.sendSignal(&protocol.ExchangeSignal{
+			SignalType: protocol.SignalType_WaitingForSdpOffer,
+		})
+		close(returned)
+	}()
+	select {
+	case <-sender.entered:
+	case <-time.After(time.Second):
+		t.Fatal("signal send did not enter intentional backpressure")
+	}
+	select {
+	case <-returned:
+		t.Fatal("live peer signal did not preserve send backpressure")
+	default:
+	}
+
+	cancel()
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("canceled peer generation did not release signal backpressure")
+	}
+}
+
+func newBlockingPeerSignalSender() *blockingPeerSignalSender {
+	return &blockingPeerSignalSender{
+		entered: make(chan struct{}, 4),
+		release: make(chan struct{}),
+	}
+}
+
+func (self *blockingPeerSignalSender) SendSignal(
+	TransferPath,
+	*protocol.Frame,
+	...any,
+) {
+	select {
+	case self.entered <- struct{}{}:
+	default:
+	}
+	<-self.release
+}
+
+func (self *blockingPeerSignalSender) Release() {
+	self.releaseOnce.Do(func() {
+		close(self.release)
+	})
+}
+
+func TestWebRtcCanceledPeerReleasesAdmissionWhileSignalSendIsBackpressured(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	sender := newBlockingPeerSignalSender()
+	defer sender.Release()
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.UseEgressOnlyIceInterfaces = false
+	settings.MaxPeerConnectionCount = 1
+	settings.MemoryBudget = NewTransferMemoryBudget(settings.ReceiveBufferSize)
+	manager := NewWebRtcManager(ctx, sender, settings)
+	defer manager.Close()
+
+	path := NewTransferPath(NewId(), NewId(), NewId())
+	conn, err := manager.NewP2pConnActive(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-sender.entered:
+	case <-ctx.Done():
+		t.Fatal("peer did not enter the intentionally backpressured signal send")
+	}
+
+	capacityNotify := settings.MemoryBudget.CapacityNotify()
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-capacityNotify:
+	case <-time.After(time.Second):
+		t.Fatal("canceled peer retained its receive-window reservation behind signal backpressure")
+	}
+	if got := settings.MemoryBudget.UsedByteCount(); got != 0 {
+		t.Fatalf("reservation after cancellation = %d, want 0", got)
+	}
+	manager.stateLock.Lock()
+	retiringCount := len(manager.retiringPeerConns)
+	manager.stateLock.Unlock()
+	if retiringCount != 0 {
+		t.Fatalf("completed teardown retained %d retiring generations", retiringCount)
+	}
+
+	replacement, err := manager.NewP2pConnActive(ctx, path)
+	if err != nil {
+		t.Fatalf("replacement was not admitted after resource teardown: %v", err)
+	}
+	defer replacement.Close()
+	if got := settings.MemoryBudget.UsedByteCount(); got != settings.ReceiveBufferSize {
+		t.Fatalf("replacement reservation = %d, want %d", got, settings.ReceiveBufferSize)
+	}
+}
+
+func TestWebRtcReplacementBudgetPreservesNewestGenerationWhilePriorTeardownIsPending(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const window = ByteCount(128 * 1024)
+	budget := NewTransferMemoryBudget(2 * window)
+	if !budget.TryReserve(2 * window) {
+		t.Fatal("failed to reserve modeled replacement generations")
+	}
+	defer budget.Release(2 * window)
+
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.ReceiveBufferSize = window
+	settings.MemoryBudget = budget
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	defer manager.Close()
+
+	peerId := NewId()
+	streamId := NewId()
+	key := peerConnKey{PeerId: peerId, StreamId: streamId}
+	retiringCtx, retiringCancel := context.WithCancel(ctx)
+	retiringCancel()
+	retiring := &peerConn{
+		ctx:                retiringCtx,
+		key:                key,
+		admissionBudget:    budget,
+		admissionByteCount: window,
+	}
+	currentCtx, currentCancel := context.WithCancel(ctx)
+	current := &peerConn{
+		ctx:                currentCtx,
+		cancel:             currentCancel,
+		key:                key,
+		admissionBudget:    budget,
+		admissionByteCount: window,
+	}
+	manager.stateLock.Lock()
+	manager.peerConns[key] = current
+	manager.retiringPeerConns[retiring] = struct{}{}
+	manager.stateLock.Unlock()
+
+	_, err := manager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), peerId, streamId),
+	)
+	var admissionErr *peerConnectionAdmissionError
+	if !errors.As(err, &admissionErr) ||
+		admissionErr.reason != peerConnectionAdmissionBudget {
+		t.Fatalf("replacement admission = %T %v, want budget refusal", err, err)
+	}
+	select {
+	case <-currentCtx.Done():
+		t.Fatal("pending old teardown canceled the newest keyed generation")
+	default:
+	}
+	manager.stateLock.Lock()
+	retiringCount := len(manager.retiringPeerConns)
+	manager.stateLock.Unlock()
+	if retiringCount != 1 {
+		t.Fatalf("retiring generations = %d, want only the old generation", retiringCount)
+	}
+}
+
+func TestWebRtcReplacementBudgetRetiresCurrentGenerationWithoutPriorRelease(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const window = ByteCount(128 * 1024)
+	budget := NewTransferMemoryBudget(window)
+	if !budget.TryReserve(window) {
+		t.Fatal("failed to reserve modeled current generation")
+	}
+	defer budget.Release(window)
+
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.ReceiveBufferSize = window
+	settings.MemoryBudget = budget
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	defer manager.Close()
+
+	peerId := NewId()
+	streamId := NewId()
+	key := peerConnKey{PeerId: peerId, StreamId: streamId}
+	currentCtx, currentCancel := context.WithCancel(ctx)
+	current := &peerConn{
+		ctx:                currentCtx,
+		cancel:             currentCancel,
+		key:                key,
+		admissionBudget:    budget,
+		admissionByteCount: window,
+	}
+	manager.stateLock.Lock()
+	manager.peerConns[key] = current
+	manager.stateLock.Unlock()
+
+	_, err := manager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), peerId, streamId),
+	)
+	var admissionErr *peerConnectionAdmissionError
+	if !errors.As(err, &admissionErr) ||
+		admissionErr.reason != peerConnectionAdmissionBudget {
+		t.Fatalf("replacement admission = %T %v, want budget refusal", err, err)
+	}
+	select {
+	case <-currentCtx.Done():
+	default:
+		t.Fatal("full replacement budget did not retire the current generation")
+	}
+	manager.stateLock.Lock()
+	_, retiringCurrent := manager.retiringPeerConns[current]
+	manager.stateLock.Unlock()
+	if !retiringCurrent {
+		t.Fatal("retired current generation was not tracked through teardown")
+	}
+}
+
+func TestWebRtcOffMapByteRetirementDoesNotClaimCountRelease(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.MaxPeerConnectionCount = 1
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	defer manager.Close()
+
+	currentKey := peerConnKey{PeerId: NewId(), StreamId: NewId()}
+	currentCtx, currentCancel := context.WithCancel(ctx)
+	current := &peerConn{
+		ctx:    currentCtx,
+		cancel: currentCancel,
+		key:    currentKey,
+	}
+	retiringCtx, retiringCancel := context.WithCancel(ctx)
+	retiringCancel()
+	retiring := &peerConn{ctx: retiringCtx, key: currentKey}
+	selectedPeerId := NewId()
+	manager.stateLock.Lock()
+	manager.peerConns[currentKey] = current
+	manager.retiringPeerConns[retiring] = struct{}{}
+	manager.prioritizedPeers[selectedPeerId] =
+		time.Now().Add(peerConnectionPriorityTimeout)
+	manager.stateLock.Unlock()
+
+	_, err := manager.NewP2pConnActive(
+		ctx,
+		NewTransferPath(NewId(), selectedPeerId, NewId()),
+	)
+	var admissionErr *peerConnectionAdmissionError
+	if !errors.As(err, &admissionErr) ||
+		admissionErr.reason != peerConnectionAdmissionCount {
+		t.Fatalf("selected admission = %T %v, want count refusal", err, err)
+	}
+	select {
+	case <-currentCtx.Done():
+	default:
+		t.Fatal("off-map byte teardown incorrectly suppressed count reclamation")
+	}
+}
+
+type blockingDetachedDataChannel struct {
+	entered   chan struct{}
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func newBlockingDetachedDataChannel() *blockingDetachedDataChannel {
+	return &blockingDetachedDataChannel{
+		entered: make(chan struct{}, 1),
+		closed:  make(chan struct{}),
+	}
+}
+
+func (self *blockingDetachedDataChannel) Read([]byte) (int, error) {
+	select {
+	case self.entered <- struct{}{}:
+	default:
+	}
+	<-self.closed
+	return 0, net.ErrClosed
+}
+
+func (self *blockingDetachedDataChannel) ReadDataChannel(b []byte) (int, bool, error) {
+	n, err := self.Read(b)
+	return n, false, err
+}
+
+func (self *blockingDetachedDataChannel) Write(b []byte) (int, error) {
+	return len(b), nil
+}
+
+func (self *blockingDetachedDataChannel) WriteDataChannel(b []byte, _ bool) (int, error) {
+	return self.Write(b)
+}
+
+func (self *blockingDetachedDataChannel) Close() error {
+	self.closeOnce.Do(func() {
+		close(self.closed)
+	})
+	return nil
+}
+
+func (self *blockingDetachedDataChannel) SetReadDeadline(time.Time) error {
+	return nil
+}
+
+func (self *blockingDetachedDataChannel) SetWriteDeadline(time.Time) error {
+	return nil
+}
+
+func TestWebRtcPeerTeardownClosesDetachedDataPlane(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	raw := newBlockingDetachedDataChannel()
+	conn := &peerConn{
+		ctx:              ctx,
+		cancel:           cancel,
+		log:              NewNoopLogger(),
+		conn:             raw,
+		connMonitor:      NewMonitor(),
+		connectedMonitor: NewMonitor(),
+		teardownDone:     make(chan struct{}),
+	}
+
+	readReturned := make(chan error, 1)
+	go func() {
+		_, err := conn.Read(make([]byte, 1))
+		readReturned <- err
+	}()
+	select {
+	case <-raw.entered:
+	case <-time.After(time.Second):
+		t.Fatal("detached data-plane read did not start")
+	}
+	cancel()
+	conn.teardown()
+
+	select {
+	case err := <-readReturned:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("blocked read error = %v, want closed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("peer teardown did not unblock detached data-plane read")
+	}
+	conn.stateLock.Lock()
+	retained := conn.conn
+	conn.stateLock.Unlock()
+	if retained != nil {
+		t.Fatal("peer teardown retained detached data channel")
+	}
+}
+
+func TestWebRtcPeerTeardownStopsTransportBeforePeerConnection(t *testing.T) {
+	transportStopped := make(chan struct{})
+	var stopOnce sync.Once
+	peerCloseReturned := make(chan struct{})
+
+	err := closeTransportBeforePeerConnection(
+		func() error {
+			stopOnce.Do(func() {
+				close(transportStopped)
+			})
+			return nil
+		},
+		func() error {
+			select {
+			case <-transportStopped:
+				close(peerCloseReturned)
+				return nil
+			case <-time.After(time.Second):
+				return errors.New("peer close remained blocked on its physical transport")
+			}
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-peerCloseReturned:
+	default:
+		t.Fatal("peer connection closed before its physical transport stopped")
+	}
+}
+
+func TestWebRtcPeerTeardownStillClosesPeerAfterTransportStopError(t *testing.T) {
+	stopError := errors.New("transport stop failure")
+	peerClosed := false
+	err := closeTransportBeforePeerConnection(
+		func() error {
+			return stopError
+		},
+		func() error {
+			peerClosed = true
+			return nil
+		},
+	)
+	if !errors.Is(err, stopError) {
+		t.Fatalf("teardown error = %v, want transport stop error", err)
+	}
+	if !peerClosed {
+		t.Fatal("transport stop error skipped peer connection cleanup")
+	}
+}
+
+func TestWebRtcPeerTeardownWatchdogReportsCurrentStage(t *testing.T) {
+	var stage atomic.Int32
+	stage.Store(int32(peerConnectionTeardownClosingPeer))
+	stalled := make(chan peerConnectionTeardownStage, 1)
+	timer := startPeerConnectionTeardownWatchdog(
+		time.Millisecond,
+		&stage,
+		func(current peerConnectionTeardownStage) {
+			stalled <- current
+		},
+	)
+	defer timer.Stop()
+
+	select {
+	case current := <-stalled:
+		if current != peerConnectionTeardownClosingPeer {
+			t.Fatalf("reported stage = %s, want closing-peer", current)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("teardown watchdog did not report a stalled stage")
+	}
+}
+
+func TestWebRtcPeerTeardownWatchdogStopPreventsReport(t *testing.T) {
+	var stage atomic.Int32
+	stage.Store(int32(peerConnectionTeardownStarting))
+	stalled := make(chan peerConnectionTeardownStage, 1)
+	timer := startPeerConnectionTeardownWatchdog(
+		25*time.Millisecond,
+		&stage,
+		func(current peerConnectionTeardownStage) {
+			stalled <- current
+		},
+	)
+	if !timer.Stop() {
+		t.Fatal("teardown watchdog fired before immediate stop")
+	}
+
+	select {
+	case current := <-stalled:
+		t.Fatalf("stopped teardown watchdog reported %s", current)
+	case <-time.After(4 * 25 * time.Millisecond):
+	}
+}
+
+func testClientShutdownCancelsAllOwnedManagerContexts(t *testing.T, closeMode string) {
+	t.Helper()
+	settings := DefaultClientSettings()
+	settings.Log = NewNoopLogger()
+	settings.ControlPingTimeout = 0
+	settings.WebRtcSettings.IceServerUrls = nil
+	client := NewClient(
+		context.Background(),
+		NewId(),
+		NewNoContractClientOob(),
+		settings,
+	)
+
+	if closeMode == "close" {
+		client.Close()
+	} else {
+		client.Cancel()
+	}
+
+	contexts := map[string]context.Context{
+		"route":    client.routeManager.ctx,
+		"contract": client.contractManager.ctx,
+		"webrtc":   client.webRtcManager.ctx,
+		"stream":   client.streamManager.ctx,
+		"peer":     client.peerManager.ctx,
+	}
+	for name, managerCtx := range contexts {
+		select {
+		case <-managerCtx.Done():
+		default:
+			t.Errorf("%s manager outlived Client.%s", name, closeMode)
+		}
+	}
+}
+
+func TestClientCloseCancelsAllOwnedManagerContexts(t *testing.T) {
+	testClientShutdownCancelsAllOwnedManagerContexts(t, "close")
+}
+
+func TestClientCancelCancelsAllOwnedManagerContexts(t *testing.T) {
+	testClientShutdownCancelsAllOwnedManagerContexts(t, "cancel")
+}
+
 func TestWebRtcConnectedCallbackDropsLateAndPostUnsubscribeDelivery(t *testing.T) {
 	var lock sync.Mutex
 	var states []bool
@@ -1743,60 +4685,239 @@ func TestWebRtcConnectedCallbackDropsLateAndPostUnsubscribeDelivery(t *testing.T
 	AssertEqual(t, states, []bool{false})
 }
 
-func TestWebRtcTerminalStateReleasesPeerInsteadOfStrandingSlot(t *testing.T) {
-	newConn := func() (*peerConn, context.CancelFunc) {
-		ctx, cancel := context.WithCancel(context.Background())
-		return &peerConn{
-			ctx:                ctx,
-			cancel:             cancel,
-			log:                NewNoopLogger(),
-			connectedMonitor:   NewMonitor(),
-			immediateReconnect: make(chan struct{}),
-		}, cancel
+func TestWebRtcConnectedCallbackUnsubscribeDoesNotWaitOnBlockedCallback(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	var callsLock sync.Mutex
+	calls := 0
+	callback := &connectedCallback{
+		callback: func(bool) {
+			callsLock.Lock()
+			calls++
+			callsLock.Unlock()
+			close(started)
+			<-release
+			close(finished)
+		},
+	}
+	go callback.deliver(1, true)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("connected callback did not start")
 	}
 
-	t.Run("ice failed", func(t *testing.T) {
-		conn, cancel := newConn()
-		defer cancel()
-		conn.handleICEConnectionState(webrtc.ICEConnectionStateFailed)
-		select {
-		case <-conn.ctx.Done():
-		default:
-			t.Fatal("terminal ICE state did not cancel the peer")
-		}
-		select {
-		case <-conn.ImmediateReconnect():
-			t.Fatal("generic ICE failure bypassed reconnect backoff")
-		default:
-		}
-	})
+	closed := make(chan struct{})
+	go func() {
+		callback.close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("unsubscribe waited on a blocked connected callback")
+	}
 
-	t.Run("dtls/sctp failed", func(t *testing.T) {
-		conn, cancel := newConn()
-		defer cancel()
-		conn.handlePeerConnectionState(webrtc.PeerConnectionStateFailed)
-		select {
-		case <-conn.ctx.Done():
-		default:
-			t.Fatal("terminal peer state did not cancel the peer")
-		}
-		select {
-		case <-conn.ImmediateReconnect():
-			t.Fatal("generic peer failure bypassed reconnect backoff")
-		default:
-		}
-	})
+	close(release)
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("connected callback did not finish")
+	}
+	callback.deliver(2, false)
+	callsLock.Lock()
+	defer callsLock.Unlock()
+	if calls != 1 {
+		t.Fatalf("post-unsubscribe generation invoked callback; calls=%d", calls)
+	}
+}
 
-	t.Run("local close is not a retry bypass", func(t *testing.T) {
-		conn, cancel := newConn()
-		cancel()
-		conn.handlePeerConnectionState(webrtc.PeerConnectionStateClosed)
-		select {
-		case <-conn.ImmediateReconnect():
-			t.Fatal("local close incorrectly bypassed reconnect backoff")
-		default:
+func TestWebRtcConnectedCallbackCanUnsubscribeItself(t *testing.T) {
+	done := make(chan struct{})
+	var callback *connectedCallback
+	callback = &connectedCallback{
+		callback: func(bool) {
+			callback.close()
+			close(done)
+		},
+	}
+	go callback.deliver(1, true)
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("connected callback deadlocked while unsubscribing itself")
+	}
+	callback.deliver(2, false)
+}
+
+func newTerminalStateTestPeerConn() (*peerConn, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &peerConn{
+		ctx:                ctx,
+		cancel:             cancel,
+		log:                NewNoopLogger(),
+		connectedMonitor:   NewMonitor(),
+		immediateReconnect: make(chan struct{}),
+	}, cancel
+}
+
+func TestWebRtcIceFailureReleasesPeerInsteadOfStrandingSlot(t *testing.T) {
+	conn, cancel := newTerminalStateTestPeerConn()
+	defer cancel()
+	conn.handleICEConnectionState(webrtc.ICEConnectionStateFailed)
+	select {
+	case <-conn.ctx.Done():
+	default:
+		t.Fatal("terminal ICE state did not cancel the peer")
+	}
+	select {
+	case <-conn.ImmediateReconnect():
+		t.Fatal("generic ICE failure bypassed reconnect backoff")
+	default:
+	}
+}
+
+func TestWebRtcPeerFailureReleasesPeerInsteadOfStrandingSlot(t *testing.T) {
+	conn, cancel := newTerminalStateTestPeerConn()
+	defer cancel()
+	conn.handlePeerConnectionState(webrtc.PeerConnectionStateFailed)
+	select {
+	case <-conn.ctx.Done():
+	default:
+		t.Fatal("terminal peer state did not cancel the peer")
+	}
+	select {
+	case <-conn.ImmediateReconnect():
+		t.Fatal("generic peer failure bypassed reconnect backoff")
+	default:
+	}
+}
+
+func TestWebRtcLocalCloseDoesNotBypassReconnectBackoff(t *testing.T) {
+	conn, cancel := newTerminalStateTestPeerConn()
+	cancel()
+	conn.handlePeerConnectionState(webrtc.PeerConnectionStateClosed)
+	select {
+	case <-conn.ImmediateReconnect():
+		t.Fatal("local close incorrectly bypassed reconnect backoff")
+	default:
+	}
+}
+
+func newAnsweredActiveTestPeerConn(remoteGeneration Id, remoteGenerationSet bool) (*peerConn, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &peerConn{
+		ctx:                       ctx,
+		cancel:                    cancel,
+		cancelCause:               func(err error) { cancel() },
+		log:                       NewNoopLogger(),
+		active:                    true,
+		answer:                    &protocol.ExchangeSignal{SignalType: protocol.SignalType_SdpAnswer},
+		remoteSignalGeneration:    remoteGeneration,
+		remoteSignalGenerationSet: remoteGenerationSet,
+		immediateReconnect:        make(chan struct{}),
+	}, cancel
+}
+
+func TestWebRtcLateSameGenerationWaitingForOfferIsIgnored(t *testing.T) {
+	waiting := &protocol.ExchangeSignal{SignalType: protocol.SignalType_WaitingForSdpOffer}
+	answeredGeneration := NewId()
+	conn, cancel := newAnsweredActiveTestPeerConn(answeredGeneration, true)
+	defer cancel()
+	AssertEqual(t, conn.receiveSignalFromPeer(waiting, answeredGeneration, true), nil)
+	select {
+	case <-conn.ctx.Done():
+		t.Fatalf("same-generation waiting canceled a healthy negotiation: %v", context.Cause(conn.ctx))
+	default:
+	}
+}
+
+func TestWebRtcNewWaitingForOfferGenerationRequestsReplacement(t *testing.T) {
+	waiting := &protocol.ExchangeSignal{SignalType: protocol.SignalType_WaitingForSdpOffer}
+	conn, cancel := newAnsweredActiveTestPeerConn(NewId(), true)
+	defer cancel()
+	AssertEqual(t, conn.receiveSignalFromPeer(waiting, NewId(), true), nil)
+	select {
+	case <-conn.ctx.Done():
+	default:
+		t.Fatal("new passive generation did not request active replacement")
+	}
+	select {
+	case <-conn.ImmediateReconnect():
+	default:
+		t.Fatal("new passive generation did not bypass reconnect backoff")
+	}
+}
+
+func TestWebRtcLegacyWaitingForOfferRetainsReplacement(t *testing.T) {
+	waiting := &protocol.ExchangeSignal{SignalType: protocol.SignalType_WaitingForSdpOffer}
+	conn, cancel := newAnsweredActiveTestPeerConn(Id{}, false)
+	defer cancel()
+	AssertEqual(t, conn.ReceiveSignalFromPeer(waiting), nil)
+	select {
+	case <-conn.ctx.Done():
+	default:
+		t.Fatal("legacy waiting did not retain replacement behavior")
+	}
+}
+
+func TestWebRtcResetOfferUsesGenerationInsteadOfRetransmitArrival(t *testing.T) {
+	acceptedGeneration := NewId()
+	newNegotiatedPassive := func() *peerConn {
+		return &peerConn{
+			active:                    false,
+			offer:                     &protocol.ExchangeSignal{SignalType: protocol.SignalType_SdpOffer},
+			remoteSignalGeneration:    acceptedGeneration,
+			remoteSignalGenerationSet: true,
 		}
-	})
+	}
+
+	if replace := newNegotiatedPassive().resetRemoteSignals(acceptedGeneration, true); replace {
+		t.Fatal("same-generation reset retransmit replaced a negotiated passive connection")
+	}
+	if replace := newNegotiatedPassive().resetRemoteSignals(NewId(), true); !replace {
+		t.Fatal("new active generation did not replace a negotiated passive connection")
+	}
+	if replace := newNegotiatedPassive().resetRemoteSignals(Id{}, false); !replace {
+		t.Fatal("legacy reset did not retain replacement compatibility")
+	}
+}
+
+func TestWebRtcResetWithoutOfferCannotTearDownPeer(t *testing.T) {
+	peerId := NewId()
+	streamId := NewId()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := &peerConn{
+		ctx:                ctx,
+		cancel:             cancel,
+		log:                NewNoopLogger(),
+		immediateReconnect: make(chan struct{}),
+	}
+	manager := &WebRtcManager{
+		log:       NewNoopLogger(),
+		peerConns: map[peerConnKey]*peerConn{{PeerId: peerId, StreamId: streamId}: conn},
+	}
+	err := manager.ReceiveExchangeSignals(
+		SourceId(peerId),
+		&protocol.ExchangeSignals{
+			StreamId:           streamId.Bytes(),
+			ResetSignals:       true,
+			SenderGenerationId: NewId().Bytes(),
+			Signals: []*protocol.ExchangeSignal{
+				{SignalType: protocol.SignalType_WaitingForSdpOffer},
+			},
+		},
+	)
+	if err == nil {
+		t.Fatal("reset_signals without an SDP offer was accepted")
+	}
+	select {
+	case <-ctx.Done():
+		t.Fatal("malformed reset tore down the existing peer")
+	default:
+	}
 }
 
 func TestWebRtcManagerNetworkChangeRetiresConnectionsAndFactory(t *testing.T) {
@@ -1820,6 +4941,10 @@ func TestWebRtcManagerNetworkChangeRetiresConnectionsAndFactory(t *testing.T) {
 		return manager.peerConnectionFactory
 	}()
 	AssertNotEqual(t, oldFactory, nil)
+	manager.peerConnectionFactoryLock.Lock()
+	oldCertificate := manager.peerConnectionCertificate
+	manager.peerConnectionFactoryLock.Unlock()
+	AssertNotEqual(t, oldCertificate, nil)
 
 	reconnect := conn.ImmediateReconnect()
 	manager.networkChanged()
@@ -1853,6 +4978,12 @@ func TestWebRtcManagerNetworkChangeRetiresConnectionsAndFactory(t *testing.T) {
 	AssertNotEqual(t, newFactory, nil)
 	if newFactory == oldFactory {
 		t.Fatal("network change reused ICE state bound to the old interfaces")
+	}
+	manager.peerConnectionFactoryLock.Lock()
+	newCertificate := manager.peerConnectionCertificate
+	manager.peerConnectionFactoryLock.Unlock()
+	if newCertificate != oldCertificate {
+		t.Fatal("network change regenerated the manager-scoped DTLS certificate")
 	}
 }
 
@@ -2048,6 +5179,34 @@ func TestWebRtcMalformedCandidateDoesNotSuppressBatchRemainder(t *testing.T) {
 	AssertEqual(t, len(conn.remoteIceCandidateBuffer), 1)
 }
 
+func TestWebRtcDropsCandidateFromRetiredSignalGeneration(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	currentGeneration := NewId()
+	conn := &peerConn{
+		ctx:                       ctx,
+		cancel:                    cancel,
+		log:                       NewNoopLogger(),
+		remoteDescriptionSet:      true,
+		remoteSignalGeneration:    currentGeneration,
+		remoteSignalGenerationSet: true,
+	}
+	candidateBytes, err := json.Marshal(webrtc.ICECandidateInit{
+		Candidate: "candidate:1 1 udp 1 192.0.2.1 9999 typ host",
+	})
+	AssertEqual(t, err, nil)
+	// pc is intentionally nil. A stale candidate must be rejected before
+	// AddICECandidate can touch the current Pion generation.
+	AssertEqual(t, conn.receiveSignalFromPeer(
+		&protocol.ExchangeSignal{
+			SignalType:   protocol.SignalType_IceCandidate,
+			IceCandidate: candidateBytes,
+		},
+		NewId(),
+		true,
+	), nil)
+}
+
 type recordingSignalSender struct {
 	lock    sync.Mutex
 	batches []*protocol.ExchangeSignals
@@ -2069,14 +5228,16 @@ func (self *recordingSignalSender) SendSignal(
 
 func TestWebRtcSendsGatheredCandidatesInOneFrame(t *testing.T) {
 	sender := &recordingSignalSender{}
+	signalGeneration := NewId()
 	conn := &peerConn{
 		key: peerConnKey{
 			PeerId:   NewId(),
 			StreamId: NewId(),
 		},
-		sourceId:     NewId(),
-		active:       true,
-		signalSender: sender,
+		sourceId:         NewId(),
+		active:           true,
+		signalSender:     sender,
+		signalGeneration: signalGeneration,
 	}
 	candidates := make([]*webrtc.ICECandidate, 0, 2)
 	for i := range 2 {
@@ -2096,6 +5257,7 @@ func TestWebRtcSendsGatheredCandidatesInOneFrame(t *testing.T) {
 	defer sender.lock.Unlock()
 	AssertEqual(t, len(sender.batches), 1)
 	AssertEqual(t, len(sender.batches[0].Signals), 2)
+	AssertEqual(t, sender.batches[0].SenderGenerationId, signalGeneration.Bytes())
 }
 
 func TestWebRtcCandidateSendFramesRemainBounded(t *testing.T) {
@@ -2141,10 +5303,37 @@ func TestWebRtcEgressOnlyInterfaceViewIsBounded(t *testing.T) {
 	if len(interfaces) == 0 || 2 < len(interfaces) {
 		t.Fatalf("egress-only interface count is not bounded: %d", len(interfaces))
 	}
+	nativeInterfaces, nativeErr := net.Interfaces()
+	nativeIdentity := map[string]bool{}
+	if nativeErr == nil {
+		for _, ifc := range nativeInterfaces {
+			nativeIdentity[fmt.Sprintf("%d/%s", ifc.Index, ifc.Name)] = true
+		}
+	}
+	totalAddresses := 0
+	seenFamilies := map[int]bool{}
 	for _, ifc := range interfaces {
+		if nativeErr == nil && !nativeIdentity[fmt.Sprintf("%d/%s", ifc.Index, ifc.Name)] {
+			t.Fatalf("egress-only interface has synthetic identity despite native enumeration: %d/%s", ifc.Index, ifc.Name)
+		}
 		addrs, addrErr := ifc.Addrs()
 		AssertEqual(t, addrErr, nil)
-		AssertEqual(t, len(addrs), 1)
+		for _, addr := range addrs {
+			ip, _, parseErr := net.ParseCIDR(addr.String())
+			AssertEqual(t, parseErr, nil)
+			family := 6
+			if ip.To4() != nil {
+				family = 4
+			}
+			if seenFamilies[family] {
+				t.Fatalf("egress-only interface view duplicated IPv%d: %v", family, interfaces)
+			}
+			seenFamilies[family] = true
+			totalAddresses++
+		}
+	}
+	if totalAddresses == 0 || 2 < totalAddresses {
+		t.Fatalf("egress-only address count is not bounded: %d", totalAddresses)
 	}
 }
 
@@ -2365,11 +5554,11 @@ func BenchmarkCreateWebRtcPeerConnection(b *testing.B) {
 
 	b.ReportAllocs()
 	for range b.N {
-		factory, err := newWebRtcPeerConnectionFactory(settings)
+		factory, _, err := newWebRtcPeerConnectionFactory(settings, nil)
 		if err != nil {
 			b.Fatal(err)
 		}
-		pc, err := factory.NewPeerConnection()
+		pc, err := factory.NewPeerConnection(false)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -2385,7 +5574,7 @@ func BenchmarkCreateWebRtcPeerConnection(b *testing.B) {
 func BenchmarkWebRtcPeerConnectionFactoryReuse(b *testing.B) {
 	settings := DefaultWebRtcSettings()
 	settings.Log = NewNoopLogger()
-	factory, err := newWebRtcPeerConnectionFactory(settings)
+	factory, _, err := newWebRtcPeerConnectionFactory(settings, nil)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -2393,7 +5582,7 @@ func BenchmarkWebRtcPeerConnectionFactoryReuse(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		pc, err := factory.NewPeerConnection()
+		pc, err := factory.NewPeerConnection(false)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -2404,6 +5593,56 @@ func BenchmarkWebRtcPeerConnectionFactoryReuse(b *testing.B) {
 	b.StopTimer()
 	if err := factory.Close(); err != nil {
 		b.Fatal(err)
+	}
+}
+
+func BenchmarkWebRtcPeerConnectionFactoryRebuildWithCertificate(b *testing.B) {
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	initialFactory, certificate, err := newWebRtcPeerConnectionFactory(settings, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := initialFactory.Close(); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		factory, nextCertificate, createErr := newWebRtcPeerConnectionFactory(settings, certificate)
+		if createErr != nil {
+			b.Fatal(createErr)
+		}
+		if nextCertificate != certificate {
+			b.Fatal("factory rebuild replaced certificate")
+		}
+		pc, createErr := factory.NewPeerConnection(false)
+		if createErr != nil {
+			b.Fatal(createErr)
+		}
+		if err := pc.Close(); err != nil {
+			b.Fatal(err)
+		}
+		if err := factory.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkPeerConnNoteOutboundSctpActivity(b *testing.B) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := &peerConn{
+		ctx:      ctx,
+		cancel:   cancel,
+		log:      NewNoopLogger(),
+		settings: &WebRtcSettings{},
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		conn.noteOutboundSctpActivity()
 	}
 }
 
@@ -2599,7 +5838,7 @@ func TestWebRtcP2pRouteThroughputMeasurement(t *testing.T) {
 	}
 	for _, channelBufferSize := range channelBufferSizes {
 		for _, messageByteCount := range messageByteCounts {
-			t.Run(fmt.Sprintf("queue=%d/message=%d", channelBufferSize, messageByteCount), func(t *testing.T) {
+			func() {
 				ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 				defer cancel()
 
@@ -2707,7 +5946,7 @@ func TestWebRtcP2pRouteThroughputMeasurement(t *testing.T) {
 					elapsed,
 					float64(messageCount*messageByteCount)/(1024*1024)/elapsed.Seconds(),
 				)
-			})
+			}()
 		}
 	}
 }

@@ -2,6 +2,8 @@ package connect
 
 import (
 	"context"
+	"crypto/tls"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,7 +13,51 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	quic "github.com/quic-go/quic-go"
 )
+
+// closeInterruptWriteConn models the state observed on iOS after a path had
+// gone stale: the WebSocket's next TCP write entered the kernel and remained
+// blocked until the connection itself was closed. Context cancellation alone
+// cannot interrupt net.Conn.Write.
+type closeInterruptWriteConn struct {
+	net.Conn
+
+	blockWrite atomic.Bool
+	writeOnce  sync.Once
+	closeOnce  sync.Once
+
+	writeStarted chan struct{}
+	closed       chan struct{}
+}
+
+func newCloseInterruptWriteConn(conn net.Conn) *closeInterruptWriteConn {
+	return &closeInterruptWriteConn{
+		Conn:         conn,
+		writeStarted: make(chan struct{}),
+		closed:       make(chan struct{}),
+	}
+}
+
+func (self *closeInterruptWriteConn) Write(buffer []byte) (int, error) {
+	if !self.blockWrite.Load() {
+		return self.Conn.Write(buffer)
+	}
+	self.writeOnce.Do(func() {
+		close(self.writeStarted)
+	})
+	<-self.closed
+	return 0, net.ErrClosed
+}
+
+func (self *closeInterruptWriteConn) Close() error {
+	var err error
+	self.closeOnce.Do(func() {
+		close(self.closed)
+		err = self.Conn.Close()
+	})
+	return err
+}
 
 // The platform transport had no test coverage at all: nothing constructed a
 // PlatformTransport, so runH1, the mode election loop and the inactive-drain
@@ -34,8 +80,9 @@ type testingPlatformServer struct {
 	server *httptest.Server
 	url    string
 
-	connectCount atomic.Int64
-	rejecting    atomic.Bool
+	connectCount  atomic.Int64
+	emptyMessages atomic.Int64
+	rejecting     atomic.Bool
 
 	stateLock sync.Mutex
 	conns     []*websocket.Conn
@@ -66,9 +113,13 @@ func newTestingPlatformServer(t *testing.T) *testingPlatformServer {
 		// (including its keepalive pings, which the client writes directly and
 		// never counts). send nothing back
 		for {
-			if _, _, err := ws.ReadMessage(); err != nil {
+			_, message, err := ws.ReadMessage()
+			if err != nil {
 				ws.Close()
 				return
+			}
+			if len(message) == 0 {
+				platform.emptyMessages.Add(1)
 			}
 		}
 	}))
@@ -229,6 +280,27 @@ func TestPlatformTransportActiveModeIsNotDrained(t *testing.T) {
 	}
 }
 
+// TestPlatformTransportSendsRepeatedIdleKeepalives verifies both the initial
+// reusable writer timer and its reset after firing.
+func TestPlatformTransportSendsRepeatedIdleKeepalives(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	platform := newTestingPlatformServer(t)
+	settings := testingPlatformTransportSettings()
+	settings.PingTimeout = 20 * time.Millisecond
+	transport := testingPlatformTransport(t, ctx, platform.url, settings)
+
+	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+		t.Fatal("the transport was never elected")
+	}
+	if !waitForCondition(2*time.Second, func() bool {
+		return 2 <= platform.emptyMessages.Load()
+	}) {
+		t.Fatalf("idle keepalive count = %d, want at least 2", platform.emptyMessages.Load())
+	}
+}
+
 // TestPlatformTransportModeFallsBackOnDisconnect: when the last available mode
 // drops, the active mode must return to TransportModeNone.
 //
@@ -316,5 +388,232 @@ func TestPlatformTransportReconnects(t *testing.T) {
 	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
 		mode, _ := transport.activeMode()
 		t.Fatalf("active mode = %q after reconnect, want h1", mode)
+	}
+}
+
+// TestPlatformTransportCloseInterruptsBlockedH1Write is the regression for a
+// teardown dependency inversion found in an on-device iOS trace. The logical
+// client was removed at 11:42:07, but its old TCP write did not return until its
+// deadline at 11:42:16. Teardown removed routes and then joined the writer while
+// the deferred socket Close—which was the only operation able to wake that
+// writer—could not run until after the join.
+func TestPlatformTransportCloseInterruptsBlockedH1Write(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	platform := newTestingPlatformServer(t)
+	wrappedConn := make(chan *closeInterruptWriteConn, 1)
+	strategySettings := DefaultClientStrategySettings()
+	strategySettings.EnableResilient = false
+	strategySettings.ParallelBlockSize = 1
+	strategySettings.MinNextConnectDelay = 0
+	strategySettings.MaxNextConnectDelay = 0
+	netDialer := &net.Dialer{}
+	strategySettings.DialContextSettings = &DialContextSettings{
+		DialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {
+			conn, err := netDialer.DialContext(ctx, network, address)
+			if err != nil {
+				return nil, err
+			}
+			blocking := newCloseInterruptWriteConn(conn)
+			select {
+			case wrappedConn <- blocking:
+			default:
+			}
+			return blocking, nil
+		},
+	}
+	strategy := NewClientStrategy(ctx, strategySettings)
+	routeManager := NewRouteManager(ctx, "test")
+	settings := testingPlatformTransportSettings()
+	settings.WriteTimeout = 30 * time.Second
+	transport := NewPlatformTransportWithTargetMode(
+		ctx,
+		strategy,
+		routeManager,
+		platform.url,
+		&ClientAuth{
+			ByJwt:      "testing",
+			InstanceId: NewId(),
+			AppVersion: "testing",
+		},
+		TransportModeH1,
+		settings,
+	)
+	t.Cleanup(transport.Close)
+
+	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+		t.Fatal("the transport was never elected")
+	}
+	var blocking *closeInterruptWriteConn
+	select {
+	case blocking = <-wrappedConn:
+	case <-time.After(time.Second):
+		t.Fatal("the websocket did not expose its underlying connection")
+	}
+	// Ensure even the pre-fix path can be released after an assertion, rather
+	// than leaving the test process parked until the deliberately long deadline.
+	defer blocking.Close()
+
+	blocking.blockWrite.Store(true)
+	writer := routeManager.OpenMultiRouteWriter(DestinationId(NewId()))
+	defer routeManager.CloseMultiRouteWriter(writer)
+	message := MessagePoolGet(32)
+	if err := writer.Write(ctx, message, time.Second); err != nil {
+		MessagePoolReturn(message)
+		t.Fatalf("route write failed: %v", err)
+	}
+	select {
+	case <-blocking.writeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("the transport writer did not enter the blocked socket write")
+	}
+
+	transport.Close()
+	select {
+	case <-blocking.closed:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("transport Close did not close the socket before joining its blocked writer")
+	}
+	if !waitForCondition(time.Second, func() bool {
+		return !transport.IsConnected()
+	}) {
+		t.Fatal("transport remained registered after Close interrupted the blocked writer")
+	}
+}
+
+// TestPlatformTransportCloseInterruptsBlockedH3Write covers the adjacent QUIC
+// teardown path. A peer that stops reading exhausts stream flow control and
+// parks Framer.Write inside quic.Stream.Write. Canceling handleCtx cannot wake
+// that write; the connection must be closed before the transport joins its
+// writer goroutine.
+func TestPlatformTransportCloseInterruptsBlockedH3Write(t *testing.T) {
+	certPem, keyPem, err := selfSign(
+		[]string{"127.0.0.1"},
+		"127.0.0.1",
+		24*time.Hour,
+		24*time.Hour,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := tls.X509KeyPair(certPem, keyPem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const nextProto = "urnetwork-platform-test"
+	listener, err := quic.ListenAddrEarly(
+		"127.0.0.1:0",
+		&tls.Config{
+			Certificates: []tls.Certificate{cert},
+			NextProtos:   []string{nextProto},
+		},
+		&quic.Config{
+			MaxIdleTimeout:                 30 * time.Second,
+			InitialStreamReceiveWindow:     32 * 1024,
+			MaxStreamReceiveWindow:         32 * 1024,
+			InitialConnectionReceiveWindow: 64 * 1024,
+			MaxConnectionReceiveWindow:     64 * 1024,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = listener.Close()
+	})
+
+	serverCtx, serverCancel := context.WithCancel(context.Background())
+	defer serverCancel()
+	serverConn := make(chan *quic.Conn, 1)
+	serverErr := make(chan error, 1)
+	framerSettings := DefaultFramerSettings(int(DefaultClientSettings().MinimumMessageLenLimit()))
+	go func() {
+		conn, acceptErr := listener.Accept(serverCtx)
+		if acceptErr != nil {
+			serverErr <- acceptErr
+			return
+		}
+		serverConn <- conn
+		stream, acceptErr := conn.AcceptStream(serverCtx)
+		if acceptErr != nil {
+			serverErr <- acceptErr
+			return
+		}
+		framer := NewFramer(framerSettings)
+		authBytes, readErr := framer.Read(stream)
+		if readErr != nil {
+			serverErr <- readErr
+			return
+		}
+		writeErr := framer.Write(stream, authBytes)
+		MessagePoolReturn(authBytes)
+		if writeErr != nil {
+			serverErr <- writeErr
+			return
+		}
+		// Deliberately never read another byte. The client's next large writes
+		// consume the fixed receive credit and then block.
+		<-conn.Context().Done()
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := testingPlatformTransportSettings()
+	settings.H3Port = listener.Addr().(*net.UDPAddr).Port
+	settings.WriteTimeout = 30 * time.Second
+	settings.QuicTlsConfig = &tls.Config{
+		InsecureSkipVerify: true, // test-only self-signed endpoint
+		NextProtos:         []string{nextProto},
+	}
+	settings.FramerSettings = framerSettings
+	routeManager := NewRouteManager(ctx, "test")
+	transport := NewPlatformTransportWithTargetMode(
+		ctx,
+		NewClientStrategyWithDefaults(ctx),
+		routeManager,
+		"https://127.0.0.1",
+		&ClientAuth{
+			ByJwt:      "testing",
+			InstanceId: NewId(),
+			AppVersion: "testing",
+		},
+		TransportModeH3,
+		settings,
+	)
+	t.Cleanup(transport.Close)
+
+	var accepted *quic.Conn
+	select {
+	case accepted = <-serverConn:
+	case acceptErr := <-serverErr:
+		t.Fatal(acceptErr)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the QUIC server did not accept the platform connection")
+	}
+	if !testingWaitForActiveMode(transport, TransportModeH3, 5*time.Second) {
+		t.Fatal("the H3 transport was never elected")
+	}
+
+	writer := routeManager.OpenMultiRouteWriter(DestinationId(NewId()))
+	defer routeManager.CloseMultiRouteWriter(writer)
+	blocked := false
+	for range 128 {
+		message := MessagePoolGet(3 * 1024)
+		if writeErr := writer.Write(ctx, message, 20*time.Millisecond); writeErr != nil {
+			MessagePoolReturn(message)
+			blocked = true
+			break
+		}
+	}
+	if !blocked {
+		t.Fatal("the unread QUIC stream never exhausted its bounded send route")
+	}
+
+	transport.Close()
+	select {
+	case <-accepted.Context().Done():
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("transport Close did not close QUIC before joining its flow-control-blocked writer")
 	}
 }

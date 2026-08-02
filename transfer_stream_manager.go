@@ -39,6 +39,10 @@ type StreamManager struct {
 	streamBuffer *StreamBuffer
 
 	streamManagerSettings *StreamManagerSettings
+	// A provider-owned client must retire every disallowed P2P stream
+	// direction. An ordinary destination client preserves all StreamOpen
+	// directions because they are transport state, not provider policy.
+	providerStreamPolicy bool
 }
 
 func NewStreamManager(ctx context.Context, client *Client, webRtcManager *WebRtcManager, streamManagerSettings *StreamManagerSettings) *StreamManager {
@@ -46,6 +50,7 @@ func NewStreamManager(ctx context.Context, client *Client, webRtcManager *WebRtc
 		ctx:                   ctx,
 		client:                client,
 		streamManagerSettings: streamManagerSettings,
+		providerStreamPolicy:  client.settings.ProviderStreamPolicy,
 	}
 
 	// webRtcManager := NewWebRtcManager(ctx, streamManagerSettings.WebRtcSettings)
@@ -66,6 +71,72 @@ func (self *StreamManager) Client() *Client {
 
 func (self *StreamManager) WebRtcManager() *WebRtcManager {
 	return self.webRtcManager
+}
+
+// allowStreamOpen rejects provider/relay work when this client no longer
+// advertises the corresponding provide mode. A source id means traffic enters
+// this client from a peer: source-only is a provider endpoint, while source +
+// destination is an intermediary relay. Only destination-only streams are
+// outbound client work and independent of this client's provide policy.
+func (self *StreamManager) allowStreamOpen(sourceId *Id, destinationId *Id) bool {
+	if !self.providerStreamPolicy {
+		// An ordinary destination/window client does not serve provider work.
+		// Its source-only, destination-only, and paired entries are transport
+		// directions for its own connection, including return/companion state
+		// restored by StreamReset. Provider contract verification remains the
+		// authorization boundary; do not infer provider policy from direction.
+		return true
+	}
+
+	// A public-capable provider accepts clients that never appeared in its
+	// same-network peer list. An explicit disconnect marker is different: it
+	// proves this particular identity's old stream is stale, even while Public
+	// providing remains enabled. Reject delayed relists until a peer reconnect
+	// update clears the marker.
+	if sourceId != nil && self.client.peerManager.isDisconnectedNetworkPeer(*sourceId) {
+		return false
+	}
+	if destinationId != nil && self.client.peerManager.isDisconnectedNetworkPeer(*destinationId) {
+		return false
+	}
+
+	allowAny, allowNetwork := self.client.contractManager.inboundProviderStreamPolicy()
+	if allowAny {
+		return true
+	}
+	if !allowNetwork || (sourceId == nil) == (destinationId == nil) {
+		// no adjacent peer, or two adjacent peers (public relay)
+		return false
+	}
+	peerId := destinationId
+	if sourceId != nil {
+		peerId = sourceId
+	}
+	return self.client.peerManager.isConnectedNetworkPeer(*peerId)
+}
+
+// reconcileInboundProviderStreams retires already-open provider streams after
+// a provide-mode/pause change. Merely unregistering the provide key stops new
+// contracts at the platform, but old StreamOpen state otherwise keeps its P2P
+// transports alive indefinitely, including admission and crypto retry loops.
+func (self *StreamManager) reconcileInboundProviderStreams(allowAny bool, allowNetwork bool) {
+	self.streamBuffer.CloseDisallowedInboundProviderStreams(
+		allowAny,
+		allowNetwork,
+		self.providerStreamPolicy,
+		self.client.peerManager.isConnectedNetworkPeer,
+	)
+}
+
+// closeDisconnectedPeerStreams retires streams owned by identities that the
+// platform explicitly disconnected. This is independent of Public provider
+// policy: allowing unknown public clients must not retain known-dead Network
+// clients and their P2P admission/crypto retry loops.
+func (self *StreamManager) closeDisconnectedPeerStreams(peerIds map[Id]bool) {
+	if !self.providerStreamPolicy || len(peerIds) == 0 {
+		return
+	}
+	self.streamBuffer.CloseDisconnectedPeerStreams(peerIds)
 }
 
 // ReceiveFunction
@@ -111,6 +182,18 @@ func (self *StreamManager) handleControlFrame(frame *protocol.Frame) error {
 				if err != nil {
 					return err
 				}
+				if !self.allowStreamOpen(sourceId, destinationId) {
+					if self.client.log.V(1).Enabled() {
+						self.client.log.Infof(
+							"[sm]%s reject disabled provider s(%s) source=%v destination=%v\n",
+							self.client.ClientTag(),
+							streamId,
+							sourceId,
+							destinationId,
+						)
+					}
+					return nil
+				}
 
 				if self.client.log.V(1).Enabled() {
 					self.client.log.Infof("[sm]%s open s(%s) %v->%v\n", self.client.ClientTag(), streamId, sourceId, destinationId)
@@ -149,6 +232,9 @@ func (self *StreamManager) handleControlFrame(frame *protocol.Frame) error {
 				for _, m := range v.Streams {
 					sourceId, destinationId, streamId, err := streamOpenIds(m)
 					if err != nil {
+						continue
+					}
+					if !self.allowStreamOpen(sourceId, destinationId) {
 						continue
 					}
 					keep[newStreamSequenceId(sourceId, destinationId, streamId)] = true
@@ -312,6 +398,57 @@ func (self *StreamBuffer) CloseStream(streamId Id) {
 
 	if streamSequence, ok := self.streamSequencesByStreamId[streamId]; ok {
 		streamSequence.Cancel()
+	}
+}
+
+// CloseDisallowedInboundProviderStreams cancels provider endpoint, return,
+// companion, and intermediary relay streams that the current strict provider
+// policy no longer permits. Network-only policy retains exactly one-adjacent-
+// endpoint streams for known same-network peers; it does not permit public
+// endpoints or relaying between two other peers. Ordinary destination/window
+// clients bypass this provider policy entirely.
+func (self *StreamBuffer) CloseDisallowedInboundProviderStreams(
+	allowAny bool,
+	allowNetwork bool,
+	providerStreamPolicy bool,
+	isNetworkPeer func(Id) bool,
+) {
+	if !providerStreamPolicy {
+		return
+	}
+
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+
+	for id, sequence := range self.streamSequences {
+		if allowAny {
+			continue
+		}
+		if allowNetwork && id.HasSource != id.HasDestination {
+			peerId := id.DestinationId
+			if id.HasSource {
+				peerId = id.SourceId
+			}
+			if isNetworkPeer(peerId) {
+				continue
+			}
+		}
+		sequence.Cancel()
+	}
+}
+
+// CloseDisconnectedPeerStreams cancels every sequence adjacent to a known
+// disconnected peer. The platform reconnect update clears the tombstone, and
+// a subsequent StreamOpen then constructs a fresh generation.
+func (self *StreamBuffer) CloseDisconnectedPeerStreams(peerIds map[Id]bool) {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+
+	for id, sequence := range self.streamSequences {
+		if (id.HasSource && peerIds[id.SourceId]) ||
+			(id.HasDestination && peerIds[id.DestinationId]) {
+			sequence.Cancel()
+		}
 	}
 }
 

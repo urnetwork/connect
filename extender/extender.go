@@ -884,7 +884,11 @@ func selfSign(hosts []string, organization string, validFrom time.Duration, vali
 	}
 
 	notBefore := time.Now().Add(-validFrom)
-	notAfter := notBefore.Add(validFor)
+	// ValidFrom is the tolerated clock-skew/history window before creation;
+	// ValidFor is the future lifetime after creation. Adding both durations
+	// to notBefore made the default 180d/180d certificate expire at the
+	// instant it was generated.
+	notAfter := time.Now().Add(validFor)
 
 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)

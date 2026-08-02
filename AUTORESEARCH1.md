@@ -1,6 +1,6 @@
-# AUTORESEARCH1 — optimization techniques applied 2026-07-23 → 2026-07-24
+# AUTORESEARCH1 — optimization techniques applied 2026-07-23 → 2026-07-27
 
-Executive digest of the auto-research campaigns run over the last two days
+Executive digest of the auto-research campaigns run over this five-day pass
 across `connect`, `sdk`, the apps (`apple`, `android`), and `server/proxy`.
 Method for every campaign: measure on an env-gated kernel → record settings +
 result → make one educated adjustment → re-measure → keep or revert, until no
@@ -1184,3 +1184,611 @@ remaining work is empirical validation, not another inferred timeout:
   tests must keep the number of live workers bounded.
 - Because Go's memory limit is soft and not an RSS/jetsam ceiling, final iOS
   acceptance still requires on-device physical-footprint/jetsam measurement.
+
+---
+
+## 15. App/provider and physical network-peer pass (2026-07-25 → 2026-07-27)
+
+This pass followed the “one bug is evidence of a repeated reasoning flaw”
+rule across app lifecycle, platform network observation, active tunnel
+reconfiguration, local RPC retries, and physical cold-page measurement. The
+detailed SCTP/ICE experiment log and rejected branches are in
+`OPTIMIZENETWORKPEER1.md`; this section records the applied cross-platform
+changes.
+
+### 15.1 Foreground owns UI work; the provider owns packet maintenance
+
+The original app/background flaw was ownership, not merely timer frequency.
+Long-lived app objects created UI view controllers and polling jobs, then kept
+them alive while no screen could consume their updates. Those controllers are
+observation only; keeping them active does not keep the independent provider
+or packet tunnel alive.
+
+Applied corrections:
+
+- **Apple:** navigation roots no longer open unused duplicate connect
+  controllers. Stores stop, unregister, and close their controller through the
+  owning `DeviceLocal` on scene/background transitions, then create a fresh
+  controller and snapshot when active again. Listener-backed cached state is
+  used where SwiftUI may evaluate a property repeatedly; a render cannot open
+  an SDK controller or synchronously issue RPC.
+- **Android:** `ForegroundDeviceControllerOwner` and `ForegroundWorkOwner`
+  make process foreground state plus current-device identity the complete
+  ownership key. Connect, locations, account, settings, feedback, wallet,
+  throughput, contract, peers, DNS, blocker, block-actions, post-quantum
+  identity, reliability, referral, and balance work now starts only while
+  `ProcessLifecycleOwner` is `STARTED`; background/device replacement closes
+  subscriptions and controllers, and foreground creates one fresh owner.
+  Transfer-chart collection uses `repeatOnLifecycle`.
+- **Browser (`mmm/ur.io`):** React route effects alone were insufficient
+  because a hidden tab remains mounted. The shared controller hooks now include
+  document activity in their ownership key. `visibilitychange` and
+  `pagehide/pageshow` close/reopen connect, contract, throughput, block,
+  locations, DNS, identity, and devices observation. Six Node lifecycle tests
+  cover visible/hidden state, page-cache transitions, and listener removal;
+  focused ESLint, syntax checking, and a production Vite build pass.
+- **Linux and Windows:** the adjacent audit found the equivalent rule already
+  present: UI callbacks are marshaled to the UI thread and gated by window
+  visibility; hidden tray windows resnapshot when shown. No code change was
+  required there.
+
+The platform app may therefore be frozen without pausing multi-client
+discovery, evaluation, peer replacement, native transport progress, or packet
+forwarding. Those live in the SDK/provider process. Conversely, UI polling is
+not used as an accidental keepalive.
+
+### 15.2 Android physical-path and live-TUN corrections
+
+On a cellular Pixel provider, `DeviceLocal.offline` stayed true despite a live
+LTE path. The physical `dumpsys connectivity` record exposed the root cause:
+current Android `NetworkRequest.Builder()` has restrictive default
+capabilities, including `NOT_METERED` on Android 15. Adding `INTERNET` did not
+remove that default, so cellular never matched. The old callback also stored
+one “connected network”; an `onLost` for either Wi-Fi or cellular could report
+offline while the other remained.
+
+The new physical request starts with `clearCapabilities()` and explicitly adds
+`INTERNET`, `NOT_RESTRICTED`, `TRUSTED`, and `NOT_VPN`. Both offline and
+provider observation use passive `registerNetworkCallback` callbacks and an
+all-network set. A physical topology/link-properties change calls
+`NetworkChanged()` immediately; initial properties establish a baseline
+without a duplicate reconnect. The Pixel then reported `offline=false` on LTE,
+and `dumpsys` showed the exact requested capabilities. Eleven tracker tests
+cover duplicate/out-of-order/multi-path events and link fingerprints; four
+Android tests cover metered/constrained eligibility and VPN exclusion.
+
+The same state-snapshot audit found the active VPN descriptor compared only
+app split and DNS, recorded those fields before establishment, and refused
+most rebuilds in always-on mode. The replacement path now:
+
+1. constructs one immutable `VpnPacketFlowConfiguration` containing offline,
+   connected, include/exclude sets, IPv4/IPv6 DNS, and tunnel-local address;
+2. compares the entire desired snapshot to the last successfully applied one;
+3. establishes the replacement descriptor before closing the old packet flow;
+4. commits the applied snapshot only after `Builder.establish()` succeeds; and
+5. leaves a failed change unapplied so a later listener retries it.
+
+Foreground-notification policy updates in place and no longer requires TUN
+churn. Seven configuration tests cover every material field, failed/unapplied
+state, and inactive descriptors. App-split tests also remove the VPN owner's
+package and unavailable packages before deciding allowlist/exclusion mode, so
+a stale self-only allowlist cannot silently tunnel no UIDs.
+
+### 15.3 DNS identity and real cold-page measurement
+
+`65.49.70.65` is now the SDK default `DnsUpgradeMaskAddress`, separately
+serialized through native/JS/RPC settings. It is a plain-DNS identity owned by
+URnetwork's `65.49.70.64/27` public range, not the selected upstream resolver.
+Android installs this setting (normally the tunnel-local address when
+available) as VPN DNS; UpgradeMux intercepts the packet and performs the
+configured DoH/plain resolution. This avoids platform Private-DNS
+classification of well-known `1.1.1.1`/`9.9.9.9` stand-ins and gives the OS no
+reason to send a packet to an unrelated public resolver if interception fails.
+Round-trip/default/invalid-family tests protect the distinct mask field.
+
+The page harnesses deliberately use new browser storage and cache-bypass
+navigation. They report navigation DNS, connect, TLS, TTFB, response end,
+DOMContentLoaded, complete load, resource count, origin count, DNS-bearing
+resources, aggregate DNS work, transfer bytes, and peak request concurrency.
+This is the actual difficult case: the first public page load with many
+parallel names and origins, not one warmed URL.
+
+The pre-fix Android physical baselines were:
+
+| Page | Main DNS | TTFB | DOM content | Complete load | Shape |
+|---|---:|---:|---:|---:|---|
+| Wikipedia | 468 ms | 1,490 ms | 1,985 ms | 1,988 ms | small/single-origin |
+| Guardian | 513 ms | 1,469 ms | 3,691 ms | 6,535 ms | 121 requests, 19 origins, peak 47 requests |
+| CNN | 1,051 ms | 1,975 ms | 4,483 ms | >60 s | 238 requests, 111 origins, 107 DNS lookups |
+
+CNN accumulated about 69.1 seconds of parallel resource DNS work; request TTFB
+was 1.19-second median, 4.32-second p95, and 16.58-second max. Those numbers
+explain why a single-request microbenchmark did not predict webpage
+performance. They remain the comparison baseline until the final same-device,
+same-path rerun is complete.
+
+### 15.4 Network-peer reliability and bounded cancellation
+
+The physical SCTP work retained an eight-MTU congestion-avoidance step and the
+stock one-half multiplicative decrease. It rejects larger steps, a raised
+minimum congestion window, β=0.7, larger fast-retransmit windows, and a lower
+global RTO because those alternatives traded independent-loss throughput for
+queue collapse, burst memory, tail latency, or retry work. The controlled
+2-MiB selected-peer receive-window path improved from 2.26 to 28–29 MiB/s, but
+the composed physical tunnel remains 4.8–5.9 MiB/s; independent
+microbenchmarks are not multiplied into an end-to-end claim.
+
+An idle SCTP association can retain healthy ICE consent while DTLS/data is
+blackholed. The retained solution is the lazy, activity-triggered 10-second
+native SCTP progress watchdog plus fresh-generation reset/re-offer described
+in `OPTIMIZENETWORKPEER1.md §5.6`. It creates no idle timer before the first
+write and samples at most 4 Hz only while SCTP bytes are outstanding.
+
+An adjacent teardown flaw sent signaling with the manager lifetime instead of
+the individual peer-generation lifetime. A retired generation could therefore
+continue a send and hold admission/resource state. Signaling now receives the
+peer context, and a cancellation-driven watcher closes the PeerConnection,
+association, and data channel and releases its admission slot independently of
+the synchronous data callback. Transfer send, receive, and forward callbacks
+remain intentional backpressure and are explicitly regression-tested as such.
+
+### 15.5 Apple VPN callbacks and local RPC CPU/pause bounds
+
+Physical iOS reinstall testing exposed a missing-callback hang in
+NetworkExtension preferences. Every load/save/remove callback is now wrapped
+by an exactly-once, generation-aware 30-second bound. Late and duplicate
+callbacks are ignored; a timed-out operation cannot be retried concurrently;
+profile enumeration/removal is capped at 32; start and stop have explicit
+health checks; and logout/quit cancels reconciliation.
+
+The first physical foreground retry exposed an adjacent lifecycle ownership
+gap: a process-active notification was not a reliable proxy for the SwiftUI
+scene becoming active. The iOS and macOS scene roots now forward
+`scenePhase == .active` through `DeviceManager`. Failed reconciliation queues a
+forced retry even if the prior generation is completing in the same main-queue
+turn; a healthy in-flight generation remains deduplicated. Twenty focused
+tests cover desired state, timeout, late/duplicate completion, bounded retry,
+health/reset failure, finite removal, and all foreground retry decisions. The
+complete Apple test target passes 24/24, including the macOS 13 / iOS
+16-compatible scene callback form.
+
+An iPhone Time Profiler trace while the extension was unavailable identified
+repeated local mTLS configuration as avoidable work. The app now parses its
+immutable client identity and pinned server certificate once per dialer and
+reuses a gorilla-cloned `tls.Config` per handshake:
+
+| Local RPC configuration step | Time | Bytes | Allocations |
+|---|---:|---:|---:|
+| Rebuild PEM/ASN.1/key every attempt | ~30.6 µs | ~15.1 KiB | 165 |
+| Cached config clone | ~0.10 µs | 480 B | 1 |
+
+That isolated step is about 305× faster with 96.8% fewer bytes and 99.4% fewer
+allocations. It is not presented as a 305× app speedup.
+
+Retry policy is now explicit by boundary:
+
+- remote-client/server reconnects retain full jitter to spread a herd;
+- local app↔extension and attacker/request-driven proxy retries use a strict
+  minimum pace;
+- local RPC uses fixed 500 ms instead of random `[0,1 s)`, preserving the same
+  average two attempts/second while bounding passive detection at 500 ms;
+- explicit sync/transport replacement bypasses that pace immediately; and
+- each listener `Accept` error constructs a fresh pace. The prior reused
+  deadline became permanently ready after its first interval and could
+  hot-spin on persistent listener failure.
+
+Identical dial/accept errors are logged once per failure streak and reset after
+success. The final unavailable-extension trace consumed 0.1719 CPU-seconds
+over 16.19 seconds (1.06% of one core). Its 4.4% change from the prior short
+trace is noise-sensitive; the durable gains are predictable cadence, bounded
+logging, removal of the accept hot-spin, and elimination of repeated key
+parsing.
+
+### 15.6 Validation and remaining physical gate
+
+Completed on the current source:
+
+- `connect`: complete tree passed in **478.385 s**;
+- `sdk`: complete tree passed in **382.503 s**; pacing, explicit-wake,
+  accept-error, log-streak, and TLS-cache tests also pass repeatedly and under
+  `-race`;
+- `proxy`: complete tree passed in **51.379 s**;
+- Apple: latest SDK rebuild plus the complete macOS unit target passed
+  **24/24**; the signed iPhone 16 Pro Max build also built and installed;
+- browser lifecycle: six tests, focused ESLint/syntax checks, and a production
+  Vite build passed; and
+- Android: tracker/configuration/owner unit suites and the physical capability
+  assertions passed; the latest app built and installed on both devices before
+  the physical capability check.
+
+Before the latest iOS reinstall, an iPhone selected the Pixel provider in about
+0.7 seconds; Pixel ingress TCP/443 and UDP/443 counters rose. Backgrounding the
+containing app for roughly three minutes stopped its UI polling completely
+while the packet tunnel remained connected, and foreground RPC/state returned
+in about 25 ms.
+
+The final requested iPhone→Android and Android→iPhone cold multi-origin,
+idle/resume, CPU, and footprint matrix still requires the one-time iOS “Add VPN
+Configurations” user approval. The app correctly reports a bounded timeout and
+allows a safe foreground retry; iOS does not permit code or test automation to
+bypass that authorization. No direct or pre-tunnel page result will be
+misreported as network-peer performance.
+
+The connected Apple endpoint is the iPhone 16 Pro Max (`iPhone17,2`) with UDID
+`00008140-001679DE0893C01C`; the Android endpoint is the Pixel 8 Pro
+`3B161FDJG001KT`. Both requested directions are retained as explicit physical
+release-gate rows rather than inferring one direction from the other.
+
+### 15.7 Final lifetime, admission, idle-resume, and provider pass
+
+The last audit treated every discovered failure as an ownership-domain or
+arithmetic-domain question and found additional adjacent classes that were not
+covered by the earlier fixes.
+
+**TLS establishment and idle-session lifetime**
+
+- `TlsTimeout` now bounds the complete TLS plus peer identity-proof
+  establishment, rather than only the TLS handshake. A peer that completes TLS
+  but never supplies a proof or contract key can no longer pin its epoch,
+  control enqueue, and session indefinitely.
+- Timeout and handshake failure cancel every epoch-owned worker. A later
+  acquire starts a clean epoch instead of adopting a permanently failed
+  in-flight marker.
+- Positive idle reaping is event driven. Retain, release, and establishment
+  transitions wake one coalescing channel; no timer exists while the session
+  is referenced or establishing, and one reusable timer targets the exact
+  release-relative deadline while it is idle. This removes the former
+  near-`2*IdleTimeout` retention and recurring timer allocation.
+- Both successful and failed establishment revisit zero-reference cleanup.
+  In particular, an `IdleTimeout == 0` session released during successful
+  establishment no longer remains registered forever.
+
+`TestSuccessfulZeroReferenceSessionIsReapedWithoutIdlePoll`,
+`TestPositiveIdleSessionReapsAtReleaseRelativeDeadline`, and the existing
+failure/timeout/released-session cases cover each final transition.
+
+**Admission is keyed by the resource actually owned**
+
+- The immutable `peerConn.admissionBudget` pointer and reserved byte count now
+  define the byte-resource domain for the association's entire lifetime.
+  Public/Network labels are not assumed to be disjoint: SDK selected-window
+  clients deliberately share one hard budget between their public fallback
+  and Network view.
+- Reclamation, release-pending detection, teardown, and pending reservation
+  calculations use that exact pointer. Global connection-count reclamation
+  remains global rather than being filtered by an unrelated byte label.
+- Pending selected peers reserve only the count and bytes they actually need.
+  Surplus same-pool capacity and truly independent pools continue admitting;
+  a single 30-second priority lease no longer freezes a whole pool.
+- A selected peer with multiple streams retains its reservation when one
+  stream owns a live association and a second fails admission. Failed
+  priority attempts install their own pending state, and a refresh neither
+  clears nor indefinitely extends another stream's original lease.
+- Priority expiry reports its exact remaining lease to the outer transport.
+  Since expiry itself emits no budget release notification, the retry timer
+  now wakes at that boundary instead of waiting another 30-second fallback.
+- The bounded authenticated-Network identity LRU evicts identities with no
+  live association first. If every record is live, an immutable live
+  Network-class association remains a trust witness after auxiliary LRU
+  eviction, preventing a later stream from silently downgrading its window.
+- The final adjacent teardown race is also closed. Budget release wakes
+  waiters immediately before the canceled map entry is removed. That canceled
+  entry is no longer counted as owning the released bytes, so an ordinary
+  waiter cannot steal capacity reserved for the selected peer in that narrow
+  handoff.
+- Pending byte reservations are subtracted one at a time from the available
+  budget rather than summed. `ByteCount` is signed 64-bit; two individually
+  valid, very large configured Network windows could overflow an aggregate
+  sum and make an overcommitted ordinary admission appear safe. Sequential
+  checked subtraction is overflow-free and retains the exact same
+  cardinality semantics at normal window sizes.
+
+The admission suite contains separate top-level tests for shared and dedicated
+budgets, surplus capacity, multi-stream priority, LRU churn, exact lease
+retry, the canceled-entry handoff, and adversarial near-`MaxInt64` pending
+windows. The handoff regression passed 100 ordinary repetitions and 20
+race-enabled repetitions. `TestWebRtcPendingPriorityBudgetAccountingDoesNotOverflow`
+also passed 100 ordinary and 20 race-enabled repetitions.
+
+**Every byte-capacity gate uses subtraction, including shared DNS memory**
+
+The pending-admission overflow exposed the same reasoning flaw in the adjacent
+generic `MemoryTarget`. That target intentionally admits one item larger than
+capacity when empty so progress is always possible. If that singleton used
+`MaxInt64`, the former `used + request <= capacity` check wrapped on the next
+one-byte request and admitted it. Admission now rejects negative requests and
+checks:
+
+```text
+used <= capacity && request <= capacity - used
+```
+
+The singleton-progress exception remains unchanged, but no later request can
+wrap around it. An unlimited target also refuses an acquisition that would
+overflow its signed accounting counter; unlimited removes the configured
+capacity ceiling, not the integer representation ceiling.
+`TestMemoryTargetSingletonMaxReservationCannotOverflowAdmission`,
+`TestMemoryTargetUnlimitedAccountingCannotOverflow`, and
+`TestMemoryTargetRejectsNegativeReservation` cover these edges.
+
+The same audit continued into the SDK's host-facing per-device memory target.
+DNS/client/provider shares and their 3:4 queue subdivisions multiplied the
+full signed 64-bit target before dividing. They now use quotient-plus-remainder
+fraction calculation, which produces the identical floor at normal targets
+without overflow. Sequence depth is clamped while still 64-bit before
+conversion to `int`, so a large target cannot wrap on a 32-bit app ABI.
+`TestDeviceLocalMemorySizingDoesNotOverflowHostTarget` exercises
+`MaxInt64`, the provider fold, both queue pairs, and the 256-slot cap. The new
+connect overflow cases passed 100 ordinary and 20 race-enabled repetitions;
+the SDK maximum-target case passed 100 ordinary and 20 race-enabled
+repetitions, plus the combined memory sizing/reallocation suite passed 20
+ordinary and 10 race-enabled repetitions.
+
+**Idle SCTP progress without breaking callback backpressure**
+
+The no-progress watchdog now derives acknowledged forward bytes from monotonic
+accepted writes minus Pion's aggregate pending-plus-in-flight user bytes.
+Arbitrary reverse traffic no longer resets the deadline, so an ICE/SCTP peer
+that continues sending heartbeats or unrelated reverse data cannot mask a
+permanently unacknowledged forward queue.
+
+At the deadline only, the native transport inspects the peer receiver window.
+A zero window preserves the association because a deliberately stalled
+transfer receive/forward callback is intentional backpressure. The slower
+metadata snapshot is not taken on the 250 ms hot sampling path, avoiding its
+allocation and lock cost. `TestWebRtcSctpNoProgressWatchdogPreservesReceiverBackpressure`
+and the strengthened idle-blackhole test passed repeated ordinary and race
+runs.
+
+There is one principled API limit: Pion exposes `ReceiverWindow` after
+subtracting bytes already in flight. A zero can therefore mean either a live
+receiver advertising no space or a path that died exactly as its window
+filled. Timing out that ambiguous state would time out an intentional callback,
+which is forbidden. A fully discriminating future watchdog needs an upstream
+last-advertised-window or SCTP-control-liveness signal; no speculative callback
+timeout was retained.
+
+**Physical Pixel CPU and log attribution**
+
+A profiling Play build was installed only on the Pixel
+(`versionCode=1003456453`). Its live VPN remained validated on LTE with
+`10.0.0.168/32` and DNS `/10.0.0.168`. Before the final setup-log changes, 159
+dynamic public-admission failures were emitted in two minutes. Two flaws
+amplified them:
+
+1. failure streaks were keyed by the complete diagnostic string, whose
+   `used/live/samePeer/replacing` counters changed on every wake; and
+2. allocating a `PeerConnection` was treated as setup recovery even when its
+   ready-header exchange later timed out.
+
+Admission logs are now keyed by stable failure class while retaining full
+diagnostics on the first event. Recovery occurs only after both local and peer
+ready headers have completed. On the fresh build, startup streams each emitted
+at most their first failure; after 04:50:14 there were no further admission
+lines during the warm observation interval.
+
+The profile exposed two adjacent rendering-ownership errors:
+
+1. The complete `TransferChart` remained composed far below the collapsed
+   `verticalScroll` viewport. Recent provider traffic kept its 20 Hz clock
+   running even though none of the chart was visible. Local viewport geometry
+   now gates the clock, in addition to lifecycle and actual animation state.
+   Five pure geometry tests cover fully visible, partially visible, above,
+   below, and empty viewports.
+2. `TapToConnectAnimation` read two independent `Animatable` values from
+   composition and changed a nested `Box` size every frame. One normalized
+   progress value is now read only inside `Canvas` drawing; the four circles
+   draw directly without per-frame composition, measure, or layout. Four pure
+   frame tests cover the start, midpoint, end, and out-of-range clamp.
+
+Matched physical samples were:
+
+| Pixel build/state | CPU over 30 s | PSS / RSS | Result |
+|---|---:|---:|---|
+| profiling baseline, foreground | 40.65% of one core | 252,742 / 414,572 KiB | RenderThread, Compose invalidation, transfer chart, and connect pulse dominated |
+| release, chart visibility gate | 22.93% | 230,762 / 388,696 KiB | **43.6% less CPU** than baseline |
+| release, chart gate + draw-only pulse | 21.60% | 220,388 / 378,368 KiB | **46.9% less CPU** than baseline; 953 frames, 4 janky (0.42%) |
+| final rebuilt AAR/APK, foreground | **19.63%** | **224,852 / 384,616 KiB** | **51.7% less CPU** than baseline; 927 frames, 1 janky (0.11%) |
+| final rebuilt AAR/APK, background/provider active | **3.17%** | **139,039 / 298,924 KiB** | validated VPN; provider remains low-single-digit CPU |
+
+The earlier background samples were 3.43%, 3.67%, 3.83%, and 3.27% of one
+core; the profiling build's warm PSS/RSS was 141,476/300,424 KiB. The final
+installed Play release is `versionCode=1003530210`; Android reported tunnel
+address `10.0.0.128/32`, DNS `/10.0.0.128`, and a validated VPN both foreground
+and background. The
+packaged release contains neither `profileable` nor `debuggable`.
+
+This demonstrates that the large foreground cost was app rendering, not
+provider packet maintenance, and that foreground ownership removes that cost
+when the app is not visible. It does not turn an isolated 3.17% sample into a
+universal provider budget; signed iOS physical footprint/jetsam and both
+cross-device directions remain release gates.
+
+Temporary arm64-only symbols and Android `profileable` metadata were removed
+after measurement. The Pixel profiling files and local cross-compile artifacts
+were also deleted; no profiling hook remains in release source.
+
+**Final validation**
+
+- `connect`: the deterministic core suite passed in **368.935 s**, with
+  `blocker`, `connectctl`, and `extender` also passing. Per the repository's
+  timing-isolation policy, the real-time QUIC/DNS loss tests ran separately:
+  `TestPtDnsEncodeDecode` passed three complete runs in **176.105 s**, and
+  `TestPtDnsPumpEncodeDecode` passed in **63.327 s**;
+- the packet-translation rerun exposed a test-harness bug: four retry attempts
+  were declared, but retryable `DialEarly`/`OpenStream` errors called
+  `FailNow` on the first loss timeout. They now return to socket reform; the
+  top-level `TestPacketTranslationAttemptsRetryRecoverableFailure` passed 100
+  repetitions;
+- `sdk`: complete package passed in **383.645 s**, including the formerly
+  failing load-budget cases and final overflow-safe target partitioning;
+- `go vet ./...` passed in both `connect` and `sdk`; WebAssembly compile-only
+  and Linux/ARM64 compile-only also pass;
+- the Android AAR rebuilt successfully for arm64, armv7, and x86_64. Android
+  `:app:testPlayDebugUnitTest` passed in **25 s**, and the final
+  `:app:assemblePlayRelease` passed lint/assembly in **45 s** before the
+  physical install;
+- the installed Pixel release remained validated with the app backgrounded,
+  with no new admission failure line in the captured warm interval; and
+- all newly added Go cases are top-level tests. No ordinary `t.Run` was
+  introduced.
+
+The bidirectional iPhone-to-Pixel cold multi-origin, idle/resume, CPU, and
+footprint matrix remains queued because the iPhone is locked and its owner is
+unavailable for taps. No interaction with the Samsung was performed.
+
+### 15.8 Close-before-join, callback-local sequence maps, and release-graph parity
+
+The final adjacent pass started from a nine-second interval in the retained
+iOS extension log. A logical window client was removed at 11:42:07, while its
+old platform TCP batch write returned only at 11:42:16. The H1 transport had
+removed routes and canceled its handle context, then waited for the writer
+before the deferred `WebSocket.Close`. A write already blocked in
+`net.Conn.Write` does not observe that context, so teardown waited for the
+write deadline even though closing the socket would have released it
+immediately.
+
+The corrected dependency order is:
+
+```text
+remove routes → cancel → close connection → join writer → drain bounded route
+```
+
+H1 closes the WebSocket before joining its writer. The adjacent H3/QUIC path
+closes the connection before joining a writer parked by stream flow control.
+The H1 test uses a real WebSocket and a connection wrapper that returns from
+`Write` only after `Close`; the H3 test uses a real local QUIC endpoint, fixes
+receive credit, stops reading, and fills the client's bounded route. Both
+passed ten race-enabled repetitions with a 500 ms regression bound; H3
+normally completed in roughly 45 ms. Relative to the old nine-second trace,
+the tested bound cuts that teardown tail by at least 18× and prevents the old
+transport, queues, client graph, and path state from overlapping the next
+generation for a full write timeout.
+
+The same wait-graph method found two accidental global lock convoys in the
+transfer buffers:
+
+1. `SendBuffer.runSendSequence` held the buffer-wide map lock while
+   `SendSequence.Close` drained queued packs. That drain invokes each
+   send-completion callback synchronously. One deliberately stalled callback
+   could therefore block unrelated destinations from sequence lookup and
+   creation.
+2. `ReceiveBuffer.Pack` held the buffer-wide map lock while it canceled an
+   older receive generation and waited for the worker to exit. The worker can
+   be parked in the deliberately synchronous receive callback, so same-source
+   ordering accidentally became an all-source sequence-map stall.
+
+Send cleanup now publishes removal of all exact/wire/destination indexes under
+the lock and invokes `Close` afterward. Receive replacement cancels under the
+lock, releases it while waiting, then reacquires and removes only the exact old
+generation if still present. Cleanup only removes the head when it still
+points to that generation and heals a stale head defensively. Forward
+sequence close received the same outside-lock hygiene.
+
+This does not weaken the callback contract. A send close still waits for its
+send-completion callback; a newer receive generation for the same source still
+waits for the old receive callback; and the serial packet reader does not
+dispatch around a parked receive callback. The change removes only the
+buffer-wide lock convoy so concurrent unrelated sequence bookkeeping cannot
+deadlock behind intentional data backpressure.
+`TestSendSequenceCloseCallbackBackpressureIsDestinationLocal` and
+`TestReceiveSequenceReplacementBackpressureIsSourceLocal` passed 20 ordinary
+and 20 race-enabled repetitions along with the adjacent wire-sequence and
+contract-rejection cases. All cases are top-level tests.
+
+The dependency audit then found that updating the main module graphs was not
+enough. `sdk/build`, `sdk/cgo`, and `sdk/js` each have an independent
+`go.mod`; they still selected WebRTC 4.2.17, ICE 4.3.0, and SCTP 1.11.0. The
+main Connect/SDK/server/proxy graphs, all three SDK artifact graphs, and the
+local validator consumer now select WebRTC 4.2.18, ICE 4.4.0, SCTP 1.11.1,
+interceptor 0.1.47, and RTP 1.10.5.
+
+SCTP 1.11.1 directly addresses adjacent failure modes from the physical trace:
+its write loop closes the transport after a one-sided write error so the read
+loop cannot remain parked, SACK cumulative/gap ranges are validated before
+acknowledgement state mutates, and queued DATA is carried correctly through
+partial acknowledgement, crossed shutdown, and graceful shutdown. The SDK
+now has a top-level `TestSdkArtifactModulePionVersionsMatchRoot` that compares
+every Pion module version in each artifact graph with the root. It passed 20
+ordinary and 20 race-enabled repetitions.
+
+The opt-in SCTP congestion sweep was repeated on the upgraded dependency
+graph. At 1% independent loss, the 8-MTU step produced 0.60 MiB/s and
+52.8/97.6 ms p50/p95 probe latency. Larger 10–24-MTU steps reached
+0.62–0.82 MiB/s in that exogenous-loss row, but the shallow 8-Mbps queue again
+showed roughly 0.7–1.0 s tails at the aggressive steps. A 32-KiB minimum
+window improved the loss row but deliberately sends after real congestion.
+Combined with the existing repeated matrices, this confirms rather than
+changes the retained production choice: 8-MTU additive increase, stock
+one-half decrease, and no forced minimum congestion window.
+
+Current validated improvements therefore remain deliberately
+non-multiplicative:
+
+- physical full-tunnel steady throughput: **4.8–5.9 MiB/s**, approximately
+  **1.0×** the old physical range;
+- controlled selected-peer receive-window path: **2.26 → 28–29 MiB/s**,
+  approximately **12.5×**;
+- diagnostic-vmodule removal: **37.6% fewer total process cycles** and 44.7%
+  fewer Go-library cycles at matched traffic;
+- final Android foreground rendering: **40.65% → 19.63% of one core**
+  (**51.7% lower**) and background/provider warm idle at **3.17%** of one
+  core; and
+- the newly isolated platform teardown: roughly **9 s → ≤500 ms** in the
+  blocked-write regression, without claiming it as a throughput multiplier.
+
+The current post-change `connect` tree passes in **479.471 s**; `blocker`,
+`connectctl`, and `extender` also pass. The complete SDK package passes in
+**382.483 s**. SDK build and C-binding modules, proxy, and the local validator
+suite pass; static analysis passes across Connect, SDK and its native artifact
+modules, server, proxy, and the validator. The final server integration,
+cross-platform compile, rebuilt Android artifact, and bidirectional physical
+iOS matrix are recorded when their gates complete. The iPhone is currently
+unplugged, so no latest-build physical iOS throughput claim is made.
+
+### 15.9 Network contract startup and rollover
+
+The longer physical page sequence found two adjacent mistakes in Network
+contract policy:
+
+- the first contract remained 16 KiB on provider returns because the selected
+  top-level peer ID and the provider's ephemeral window-client destination ID
+  are different identity domains; and
+- a prefetched successor was expired as an orphan after 120 s even while the
+  sequence's current contract remained open, creating a synchronous pause when
+  a slow sequence eventually reached the boundary.
+
+Network classification is now explicit authenticated transfer policy, derived
+from the selected multi-client relationship or `ProvideMode_Network`. It
+propagates through encryption-control first flights but does not participate
+in send-sequence or wire identity. Network peers receive a 1 MiB initial
+contract; public and Friends/Family flows retain the 16 KiB policy even when a
+public route uses `ForceStream`.
+
+An open Network contract now owns one bounded stale prefetch. A fresh successor
+causes every stale result to expire; close flushes the queue; and stats reset
+preserves the open ownership maps. This removes the rollover pause without
+unbounded queue growth or weakening escrow-sensitive expiry.
+
+On the signed `versionCode=1004819970` Android build, Samsung→Pixel opened
+Wikipedia, idled 130 s, then loaded Mozilla, GitHub, and Guardian. The first
+provider-return contract reached 837,513/838,860 usable bytes after about 290
+s and installed the successor about 1.1 ms later with no slow contract wait.
+Complete loads were 2.490, 12.185, 27.292, and 11.007 s. The preceding build's
+Guardian load timed out beyond 90 s and GitHub took 44.06 s.
+
+Pixel→Samsung independently crossed the 838,860-byte first contract in both
+request and return directions; successor installation was approximately
+1.4/1.6 ms. Wikipedia and Mozilla loaded in 2.152/7.545 s.
+
+The remaining 12.46 s GitHub p95 request tail occurred after rollover on the
+large successor under 108 parallel requests, while Guardian completed
+normally afterward. It is therefore a parallel-flow/transport scheduling
+lead, not a contract-acquisition lead.
+
+Top-level policy, generated-identity, carrier, ownership, expiry, reset, and
+bounded-prefetch regressions passed 100 normal and 20 race repetitions.
+Deterministic Connect passed in 362.173 s with its two randomized PT stress
+tests isolated; those passed in 63.46/65.33 s. Subpackages, vet, Android SDK
+bind, release unit tests, lint, assembly, installation, and both physical
+directions pass.

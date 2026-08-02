@@ -157,3 +157,68 @@ func TestRemoveClientArgsLiveEvictionDeletes(t *testing.T) {
 		return len(persisted) == 0
 	})
 }
+
+func TestRemoveClientArgsStaleGenerationCannotDeleteLiveReplacement(t *testing.T) {
+	strategyCtx, strategyCancel := context.WithCancel(context.Background())
+	defer strategyCancel()
+	generatorCtx, generatorCancel := context.WithCancel(context.Background())
+	defer generatorCancel()
+
+	generator, removeCount, closeServer := newRemoveClientTestGenerator(t, generatorCtx, strategyCtx)
+	defer closeServer()
+	store := &fakeIdentityStore{}
+	generator.SetIdentityStore(store)
+
+	clientId := NewId()
+	oldIdentity := &WindowClientIdentity{
+		ClientId:    clientId,
+		ByJwt:       "jwt-old",
+		InstanceId:  NewId(),
+		Destination: RequireMultiHopId(NewId()),
+	}
+	replacement := &WindowClientIdentity{
+		ClientId:    clientId,
+		ByJwt:       "jwt-replacement",
+		InstanceId:  NewId(),
+		Destination: RequireMultiHopId(NewId()),
+	}
+	generator.identityState.Record(oldIdentity)
+	generator.identityState.Record(replacement)
+	waitForPersisted(t, store, "replacement identity", func(persisted []*WindowClientIdentity) bool {
+		return len(persisted) == 1 && persisted[0].InstanceId == replacement.InstanceId
+	})
+
+	// The old channel's asynchronous cleanup arrives after replacement under
+	// the same client id. It must not erase persistence or issue the server
+	// removal, which is keyed only by client id and would kill the live row.
+	generator.RemoveClientArgs(&MultiClientGeneratorClientArgs{
+		ClientId: clientId,
+		ClientAuth: &ClientAuth{
+			InstanceId: oldIdentity.InstanceId,
+		},
+	})
+	time.Sleep(100 * time.Millisecond)
+	if count := removeCount.Load(); count != 0 {
+		t.Fatalf("stale generation emitted %d remove-client requests", count)
+	}
+	persisted := store.snapshot()
+	if len(persisted) != 1 || persisted[0].InstanceId != replacement.InstanceId {
+		t.Fatal("stale generation erased the persisted replacement")
+	}
+
+	// The current generation still owns cleanup and must perform both effects.
+	generator.RemoveClientArgs(&MultiClientGeneratorClientArgs{
+		ClientId: clientId,
+		ClientAuth: &ClientAuth{
+			InstanceId: replacement.InstanceId,
+		},
+	})
+	if !waitForCondition(5*time.Second, func() bool {
+		return removeCount.Load() == 1
+	}) {
+		t.Fatal("current generation did not remove its network client")
+	}
+	waitForPersisted(t, store, "current identity removed", func(persisted []*WindowClientIdentity) bool {
+		return len(persisted) == 0
+	})
+}

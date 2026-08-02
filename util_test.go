@@ -131,6 +131,43 @@ func TestEvent(t *testing.T) {
 	AssertEqual(t, true, success)
 }
 
+func TestResetOrCreateTimerSteadyStateDoesNotAllocate(t *testing.T) {
+	var timer *time.Timer
+	resetOrCreateTimer(&timer, time.Hour)
+	defer timer.Stop()
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		resetOrCreateTimer(&timer, time.Hour)
+		timer.Stop()
+	})
+
+	AssertEqual(t, 0.0, allocs)
+}
+
+// TestPacedReconnectWaitsForMinimum verifies the predictable reconnect variant
+// never turns its configured rate floor into full jitter.
+func TestPacedReconnectWaitsForMinimum(t *testing.T) {
+	minTimeout := 30 * time.Millisecond
+	startTime := time.Now()
+	<-NewPacedReconnect(minTimeout).After()
+	elapsed := time.Since(startTime)
+	if elapsed < minTimeout {
+		t.Fatalf("paced reconnect waited %s, want at least %s", elapsed, minTimeout)
+	}
+}
+
+// TestPacedReconnectCompletesAfterAttemptConsumesMinimum verifies a slow
+// attempt does not incur an additional delay.
+func TestPacedReconnectCompletesAfterAttemptConsumesMinimum(t *testing.T) {
+	reconnect := NewPacedReconnect(10 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
+	select {
+	case <-reconnect.After():
+	default:
+		t.Fatal("paced reconnect did not complete after its minimum elapsed")
+	}
+}
+
 func TestMinTime(t *testing.T) {
 	a := time.Now()
 	n := 10

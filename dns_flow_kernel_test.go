@@ -49,6 +49,7 @@ import (
 //	URNET_DNS_SEED_FIRST   score used to stale-seed server 0 (0 = none)
 //	URNET_DNS_PATH_WARM    1 = apply STAGGER_MS as the warm override over a
 //	                       750ms cold stagger (and enable hedge reservation)
+//	URNET_DNS_HEDGE_RESERVE HTTP slots reserved for timed hedges (default 4)
 func TestDnsFlowKernel(t *testing.T) {
 	if os.Getenv("URNET_DNSFLOW") == "" {
 		t.Skip("dns flow kernel: set URNET_DNSFLOW=1")
@@ -82,6 +83,7 @@ func TestDnsFlowKernel(t *testing.T) {
 	pipeMs := dnsFlowEnvInt("URNET_DNS_PIPE_MS", 0)
 	seedFirst := dnsFlowEnvInt("URNET_DNS_SEED_FIRST", 0)
 	pathWarm := dnsFlowEnvInt("URNET_DNS_PATH_WARM", 0)
+	hedgeReserve := dnsFlowEnvInt("URNET_DNS_HEDGE_RESERVE", 4)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -194,6 +196,7 @@ func TestDnsFlowKernel(t *testing.T) {
 	settings.MaxConcurrentHttpRequests = dnsFlowEnvInt("URNET_DNS_HTTPCAP", 0)
 	settings.MaxConcurrentResolutions = dnsFlowEnvInt("URNET_DNS_RESCAP", 0)
 	settings.DohServerRaceMaxInFlight = dnsFlowEnvInt("URNET_DNS_RACEMAX", settings.DohServerRaceMaxInFlight)
+	settings.DohServerHedgeReserve = hedgeReserve
 	if 0 < seedFirst && 0 < len(dohUrls) {
 		settings.ServerStatsSeed = map[string]float64{dohUrls[0]: float64(seedFirst)}
 	}
@@ -294,11 +297,11 @@ func TestDnsFlowKernel(t *testing.T) {
 	if effectiveResolutionCap <= 0 {
 		effectiveResolutionCap = 4 * dnsTargetHttpConcurrency(settings.MemoryTarget.Capacity(), 16)
 	}
-	fmt.Printf("[dnsflow] servers=%s dead=%s stagger_ms=%d maxsrv=%d target_kb=%d timeout_ms=%d warm=%d path_warm=%d queries=%d http_cap=%d resolution_cap=%d race_max=%d pipe_slots=%d pipe_ms=%d seed_first=%d | ok=%d p50_ms=%d p95_ms=%d p99_ms=%d max_ms=%d wall_ms=%d peak_conc=%d requests=%d pipe_peak=%d\n",
+	fmt.Printf("[dnsflow] servers=%s dead=%s stagger_ms=%d maxsrv=%d target_kb=%d timeout_ms=%d warm=%d path_warm=%d queries=%d http_cap=%d resolution_cap=%d race_max=%d hedge_reserve=%d pipe_slots=%d pipe_ms=%d seed_first=%d | ok=%d p50_ms=%d p95_ms=%d p99_ms=%d max_ms=%d wall_ms=%d peak_conc=%d requests=%d pipe_peak=%d\n",
 		dnsFlowEnv("URNET_DNS_SERVERS", "5,50"),
 		dnsFlowEnv("URNET_DNS_DEAD", ""),
 		staggerMs, maxServers, int(targetByteCount/1024), timeoutMs, warm, pathWarm, queryCount,
-		effectiveHttpCap, effectiveResolutionCap, settings.DohServerRaceMaxInFlight,
+		effectiveHttpCap, effectiveResolutionCap, settings.DohServerRaceMaxInFlight, hedgeReserve,
 		pipeSlots, pipeMs, seedFirst,
 		okCount,
 		pct(0.50).Milliseconds(),

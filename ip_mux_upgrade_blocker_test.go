@@ -198,29 +198,41 @@ func TestUpgradeMuxDnsBlocked(t *testing.T) {
 	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "ok.example.org.", dnsmessage.Type(65), 0x0a06), 0) {
 		t.Fatal("unblocked HTTPS query not claimed")
 	}
-	// an unblocked non-A/AAAA/SVCB type (TXT) passes through to the upstream unclaimed
-	if mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "ok.example.org.", dnsmessage.TypeTXT, 0x0a0a), 0) {
-		// pass-through returns the upstream's result; the recorder upstream
-		// accepts, so SendPacket returns true — assert it reached upstream
+	// Every other UDP/53 record type is also claimed and forwarded over DoH.
+	// With DoH disabled, TXT therefore gets the same prompt SERVFAIL rather
+	// than escaping as plaintext or being left unanswered.
+	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "ok.example.org.", dnsmessage.TypeTXT, 0x0a0a), 0) {
+		t.Fatal("unblocked TXT query not claimed")
 	}
-	if !waitReceived(5) {
-		t.Fatal("no SERVFAIL for the unblocked HTTPS query with remote DoH off")
+	if !waitReceived(6) {
+		t.Fatal("no SERVFAIL for the unblocked forwarded queries with remote DoH off")
 	}
 	time.Sleep(500 * time.Millisecond)
-	// the 4 blocker-synthesized replies plus the HTTPS forward SERVFAIL; the
-	// unblocked A produced none
-	if _, received := rec.counts(); received != 5 {
-		t.Fatalf("unexpected downstream replies: %d, want 5", received)
+	// The four blocker-synthesized replies plus one forward SERVFAIL each for
+	// HTTPS and TXT; the unblocked A produced none.
+	if _, received := rec.counts(); received != 6 {
+		t.Fatalf("unexpected downstream replies: %d, want 6", received)
 	}
-	header, question, answers = parseDnsBlockedReply(t, rec.receivedPackets()[4])
-	if header.ID != 0x0a06 || header.RCode != dnsmessage.RCodeServerFailure || len(answers) != 0 {
-		t.Fatalf("unblocked HTTPS forward-failure reply: id=%04x rcode=%v answers=%d, want 0a06/SERVFAIL/0", header.ID, header.RCode, len(answers))
+	expectedForwardFailures := map[uint16]dnsmessage.Type{
+		0x0a06: dnsmessage.Type(65),
+		0x0a0a: dnsmessage.TypeTXT,
 	}
-	if question.Type != dnsmessage.Type(65) {
-		t.Fatalf("unblocked HTTPS question echoed as %v", question.Type)
+	for _, packet := range rec.receivedPackets()[4:6] {
+		header, question, answers = parseDnsBlockedReply(t, packet)
+		expectedType, ok := expectedForwardFailures[header.ID]
+		if !ok || header.RCode != dnsmessage.RCodeServerFailure || len(answers) != 0 {
+			t.Fatalf("unblocked forward-failure reply: id=%04x rcode=%v answers=%d", header.ID, header.RCode, len(answers))
+		}
+		if question.Type != expectedType {
+			t.Fatalf("unblocked forward-failure question %04x echoed as %v, want %v", header.ID, question.Type, expectedType)
+		}
+		delete(expectedForwardFailures, header.ID)
 	}
-	if sent, _ := rec.counts(); sent != 1 {
-		t.Fatalf("upstream pass-throughs: %d, want 1 (the unblocked TXT query)", sent)
+	if len(expectedForwardFailures) != 0 {
+		t.Fatalf("missing forward-failure replies: %v", expectedForwardFailures)
+	}
+	if sent, _ := rec.counts(); sent != 0 {
+		t.Fatalf("upstream plaintext DNS pass-throughs: %d, want 0", sent)
 	}
 
 	// toggling off returns blocked names to the pipeline (no reply), and
@@ -230,14 +242,14 @@ func TestUpgradeMuxDnsBlocked(t *testing.T) {
 		t.Fatal("disabled-blocker A query not claimed")
 	}
 	time.Sleep(500 * time.Millisecond)
-	if _, received := rec.counts(); received != 5 {
+	if _, received := rec.counts(); received != 6 {
 		t.Fatalf("disabled blocker still replied: %d", received)
 	}
 	blocker.SetEnabled(true)
 	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "ads.example.com.", dnsmessage.TypeA, 0x0a08), 0) {
 		t.Fatal("re-enabled blocker A query not claimed")
 	}
-	if !waitReceived(6) {
+	if !waitReceived(7) {
 		t.Fatal("re-enabled blocker did not reply")
 	}
 
@@ -247,7 +259,7 @@ func TestUpgradeMuxDnsBlocked(t *testing.T) {
 		t.Fatal("nil-blocker A query not claimed")
 	}
 	time.Sleep(500 * time.Millisecond)
-	if _, received := rec.counts(); received != 6 {
+	if _, received := rec.counts(); received != 7 {
 		t.Fatalf("nil blocker still replied: %d", received)
 	}
 }

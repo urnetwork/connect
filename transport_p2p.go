@@ -225,6 +225,32 @@ type P2pTransport struct {
 	settings *P2pTransportSettings
 }
 
+type p2pRouteManager interface {
+	UpdateTransport(Transport, []Route)
+	RemoveTransport(Transport)
+}
+
+// updateP2pConnectionRoute prevents a connected callback that was already in
+// flight at cancellation from restoring a retired route after teardown's final
+// removal. Connected-callback unsubscribe is deliberately nonblocking, so the
+// post-update context check is the required make-progress counterpart.
+func updateP2pConnectionRoute(
+	ctx context.Context,
+	manager p2pRouteManager,
+	transport Transport,
+	route Route,
+	connected bool,
+) {
+	if connected && ctx.Err() == nil {
+		manager.UpdateTransport(transport, []Route{route})
+		if ctx.Err() != nil {
+			manager.RemoveTransport(transport)
+		}
+		return
+	}
+	manager.RemoveTransport(transport)
+}
+
 func NewP2pTransport(
 	ctx context.Context,
 	client *Client,
@@ -254,12 +280,100 @@ func NewP2pTransport(
 	return p2pTransport
 }
 
+func p2pAdmissionRetryTimeout(
+	configured time.Duration,
+	admissionErr *peerConnectionAdmissionError,
+) time.Duration {
+	timeout := configured
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	if admissionErr != nil &&
+		0 < admissionErr.retryAfter &&
+		admissionErr.retryAfter < timeout {
+		return admissionErr.retryAfter
+	}
+	return timeout
+}
+
+func p2pAdmissionWaitChannels(
+	admissionErr *peerConnectionAdmissionError,
+	countNotify <-chan struct{},
+	budgetNotify <-chan struct{},
+	stateNotify <-chan struct{},
+) (
+	countWait <-chan struct{},
+	budgetWait <-chan struct{},
+	stateWait <-chan struct{},
+) {
+	stateWait = stateNotify
+	if admissionErr == nil {
+		return countNotify, budgetNotify, stateWait
+	}
+	switch admissionErr.reason {
+	case peerConnectionAdmissionBudget:
+		// A peer-count release does not make byte capacity available. The
+		// threshold-aware budget waiter already wakes only as many setups as
+		// the released bytes can admit.
+		budgetWait = budgetNotify
+	case peerConnectionAdmissionCount:
+		// Count tokens are one-consumer notifications for actual map-slot
+		// releases; unrelated budget churn must not wake this waiter.
+		countWait = countNotify
+	case peerConnectionAdmissionPriority:
+		// Priority/classification transitions have their own rare broadcast;
+		// lease expiration is covered by retryAfter.
+	default:
+		countWait = countNotify
+		budgetWait = budgetNotify
+	}
+	return
+}
+
+func p2pSetupErrorKey(err error) string {
+	var admissionErr *peerConnectionAdmissionError
+	if errors.As(err, &admissionErr) && admissionErr.reason != "" {
+		// Admission diagnostics deliberately include live counters. Those
+		// counters fluctuate on every wake-all retry even when the underlying
+		// failure has not changed; keying the log streak by the full message
+		// turned expected saturation into periodic device log/CPU bursts.
+		return "admission:" + string(admissionErr.reason)
+	}
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+type p2pSetupFailureStreak struct {
+	key string
+}
+
+func (self *p2pSetupFailureStreak) Observe(err error) bool {
+	key := p2pSetupErrorKey(err)
+	if key == self.key {
+		return false
+	}
+	self.key = key
+	return true
+}
+
+func (self *p2pSetupFailureStreak) Recover() bool {
+	if self.key == "" {
+		return false
+	}
+	self.key = ""
+	return true
+}
+
 func (self *P2pTransport) run() {
 	defer self.cancel()
 
-	var setupError string
+	var setupFailure p2pSetupFailureStreak
 	var admissionTimer *time.Timer
+	budgetWaiter := newTransferMemoryBudgetWaiter()
 	defer func() {
+		budgetWaiter.reset()
 		if admissionTimer != nil {
 			admissionTimer.Stop()
 		}
@@ -269,7 +383,9 @@ func (self *P2pTransport) run() {
 		// TODO using net.Conn as a stand in for the actual interface
 
 		reconnect := NewReconnect(self.settings.ReconnectTimeout)
-		countNotify, budgetNotify := self.webRtcManager.AdmissionNotify()
+		stateNotify := self.webRtcManager.admissionStateMonitor.NotifyChannel()
+		countNotify, budgetNotify :=
+			self.webRtcManager.admissionNotify(self.peerId, budgetWaiter)
 		var conn WebRtcConn
 		var err error
 		// note, one side of the P2P connection will be driving the setup process (active).
@@ -284,32 +400,66 @@ func (self *P2pTransport) run() {
 			return
 		}
 		if err != nil {
-			// Log a failure streak once. The former log-on-every-poll behavior
-			// produced thousands of lines per device, consumed CPU, and evicted
-			// the ICE trace needed to diagnose the failure.
-			if nextSetupError := err.Error(); nextSetupError != setupError {
-				setupError = nextSetupError
-				self.client.log.Infof("[p2p]s(%s) <>%s setup refused = %s\n", self.streamId, self.peerId, err)
-			}
-
 			var admissionErr *peerConnectionAdmissionError
 			if errors.As(err, &admissionErr) {
-				timeout := self.settings.AdmissionRetryTimeout
-				if timeout <= 0 {
-					timeout = 30 * time.Second
+				// Admission capacity is shared by all streams, so logging the
+				// first failure of every transport still creates a cold-start
+				// stampede. Summarize each reason across the manager at powers
+				// of two while retaining the latest path and full diagnostics.
+				setupFailure.Observe(err)
+				if count, emit := self.webRtcManager.observeAdmissionRefusal(
+					admissionErr.reason,
+				); emit {
+					self.client.log.Infof(
+						"[p2p]setup admission refused reason=%s count=%d s(%s) <>%s = %s\n",
+						admissionErr.reason,
+						count,
+						self.streamId,
+						self.peerId,
+						err,
+					)
+				}
+				// A pending priority lease can expire without a count or byte
+				// release. Wake at that exact boundary instead of retaining an
+				// ordinary stream for another full fallback period.
+				timeout := p2pAdmissionRetryTimeout(
+					self.settings.AdmissionRetryTimeout,
+					admissionErr,
+				)
+				countWait, budgetWait, stateWait := p2pAdmissionWaitChannels(
+					admissionErr,
+					countNotify,
+					budgetNotify,
+					stateNotify,
+				)
+				if budgetWait == nil {
+					// Do not retain a place in the byte-capacity FIFO when
+					// this refusal cannot be resolved by byte capacity.
+					budgetWaiter.reset()
 				}
 				timerC := resetOrCreateTimer(&admissionTimer, timeout)
 				select {
 				case <-self.ctx.Done():
 					return
-				case <-countNotify:
+				case <-countWait:
 					admissionTimer.Stop()
-				case <-budgetNotify:
+				case <-budgetWait:
+					admissionTimer.Stop()
+				case <-stateWait:
 					admissionTimer.Stop()
 				case <-timerC:
 				}
+				budgetWaiter.reset()
 				continue
 			}
+			// Log a non-admission failure streak once. The former
+			// log-on-every-poll behavior produced thousands of lines per
+			// device, consumed CPU, and evicted the ICE trace needed to
+			// diagnose the failure.
+			if setupFailure.Observe(err) {
+				self.client.log.Infof("[p2p]s(%s) <>%s setup refused = %s\n", self.streamId, self.peerId, err)
+			}
+			budgetWaiter.reset()
 			select {
 			case <-self.ctx.Done():
 				return
@@ -317,11 +467,7 @@ func (self *P2pTransport) run() {
 			}
 			continue
 		}
-		if setupError != "" {
-			self.client.log.V(1).Infof("[p2p]s(%s) <>%s setup recovered\n", self.streamId, self.peerId)
-			setupError = ""
-		}
-
+		budgetWaiter.reset()
 		// The signal is a persistent one-shot channel, so network changes or
 		// remote restart requests cannot be lost if they race setup.
 		immediateReconnect := conn.ImmediateReconnect()
@@ -339,6 +485,7 @@ func (self *P2pTransport) run() {
 			// reliable-unordered, that reader also boundedly prefetched any
 			// transfer frames delivered ahead of the marker.
 			headerRead := make(chan [][]byte)
+			setupReady := make(chan struct{})
 
 			go HandleError(func() {
 				defer handleCancel()
@@ -367,11 +514,13 @@ func (self *P2pTransport) run() {
 				)
 
 				updateRoute := func(connected bool) {
-					if connected {
-						self.receiveRouteManager.UpdateTransport(t, []Route{route})
-					} else {
-						self.receiveRouteManager.RemoveTransport(t)
-					}
+					updateP2pConnectionRoute(
+						handleCtx,
+						self.receiveRouteManager,
+						t,
+						route,
+						connected,
+					)
 				}
 				unsub := conn.AddConnectedCallback(updateRoute)
 				defer func() {
@@ -413,15 +562,24 @@ func (self *P2pTransport) run() {
 					return
 				case headerRead <- prefetched:
 				}
+				// Our header was already written before the other goroutine
+				// waited on headerRead, and the peer's header is now consumed:
+				// only this boundary means setup actually recovered. Merely
+				// allocating a PeerConnection can still end in the same
+				// 15-second header timeout and must not reset a stable failure
+				// streak.
+				close(setupReady)
 
 				t, route := NewP2pSendTransportForPeer(handleCtx, handleCancel, conn, self.peerId, self.streamId, self.settings)
 
 				updateRoute := func(connected bool) {
-					if connected {
-						self.sendRouteManager.UpdateTransport(t, []Route{route})
-					} else {
-						self.sendRouteManager.RemoveTransport(t)
-					}
+					updateP2pConnectionRoute(
+						handleCtx,
+						self.sendRouteManager,
+						t,
+						route,
+						connected,
+					)
 				}
 				unsub := conn.AddConnectedCallback(updateRoute)
 				defer func() {
@@ -435,9 +593,24 @@ func (self *P2pTransport) run() {
 				}
 			}, handleCancel)
 
+			markSetupReady := func() {
+				if setupFailure.Recover() {
+					self.client.log.V(1).Infof("[p2p]s(%s) <>%s setup recovered\n", self.streamId, self.peerId)
+				}
+			}
 			select {
+			case <-setupReady:
+				markSetupReady()
+				<-handleCtx.Done()
 			case <-handleCtx.Done():
-				return
+				// setupReady can close immediately before a route worker
+				// cancels handleCtx. Preserve the real recovery transition
+				// regardless of which ready select arm the scheduler chooses.
+				select {
+				case <-setupReady:
+					markSetupReady()
+				default:
+				}
 			}
 		}
 

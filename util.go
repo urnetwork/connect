@@ -194,6 +194,7 @@ type coalescingCallbackWorker struct {
 	cancel   context.CancelFunc
 	callback func()
 	notify   chan struct{}
+	done     chan struct{}
 }
 
 func newCoalescingCallbackWorker(ctx context.Context, callback func()) *coalescingCallbackWorker {
@@ -203,8 +204,12 @@ func newCoalescingCallbackWorker(ctx context.Context, callback func()) *coalesci
 		cancel:   cancel,
 		callback: callback,
 		notify:   make(chan struct{}, 1),
+		done:     make(chan struct{}),
 	}
-	go HandleError(worker.run, cancel)
+	go HandleError(func() {
+		defer close(worker.done)
+		worker.run()
+	}, cancel)
 	return worker
 }
 
@@ -232,6 +237,14 @@ func (self *coalescingCallbackWorker) Dispatch() {
 
 func (self *coalescingCallbackWorker) Close() {
 	self.cancel()
+}
+
+// Wait blocks until the worker has returned. Close intentionally remains
+// non-blocking because a callback owner may remove itself from inside its
+// callback; lifecycle owners that must prove resource teardown can Close then
+// Wait from outside the callback.
+func (self *coalescingCallbackWorker) Wait() {
+	<-self.done
 }
 
 func NewCallbackList[T any]() *CallbackList[T] {
@@ -554,12 +567,28 @@ func WeightedSelectFuncWithEntropy[T any](values []T, n int, weight func(T) floa
 type Reconnect struct {
 	startTime  time.Time
 	minTimeout time.Duration
+	randomized bool
 }
 
+// NewReconnect bounds the delay from the start of an attempt to its retry by
+// minTimeout, with full jitter to spread simultaneous clients across that
+// interval. Use NewPacedReconnect when minTimeout must be a strict rate floor.
 func NewReconnect(minTimeout time.Duration) *Reconnect {
 	return &Reconnect{
 		startTime:  time.Now(),
 		minTimeout: minTimeout,
+		randomized: true,
+	}
+}
+
+// NewPacedReconnect waits until at least minTimeout has elapsed since the
+// attempt began. It is intended for local or attacker-driven retry loops where
+// predictable work rate matters more than distributing a remote-client herd.
+func NewPacedReconnect(minTimeout time.Duration) *Reconnect {
+	return &Reconnect{
+		startTime:  time.Now(),
+		minTimeout: minTimeout,
+		randomized: false,
 	}
 }
 
@@ -570,7 +599,9 @@ func (self *Reconnect) After() <-chan time.Time {
 		close(c)
 		return c
 	} else {
-		randomTimeout := time.Duration(mathrand.Int63n(int64(timeout)))
-		return time.After(randomTimeout)
+		if self.randomized {
+			timeout = time.Duration(mathrand.Int63n(int64(timeout)))
+		}
+		return time.After(timeout)
 	}
 }

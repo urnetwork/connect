@@ -257,6 +257,10 @@ message ExchangeSignals {
     bytes stream_id = 1;
     bool reset_signals = 2;
     repeated ExchangeSignal signals = 3;
+    // Per-PeerConnection sender generation. This disambiguates a delayed
+    // initial WaitingForSdpOffer from a newly restarted passive association.
+    // Older peers omit/ignore it and retain the legacy compatibility path.
+    bytes sender_generation_id = 4;
 }
 
 // signals are sent in real time to the destination of the peer pair

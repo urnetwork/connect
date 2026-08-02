@@ -500,6 +500,9 @@ func TestRegionalDnsResolverSettings(t *testing.T) {
 	if len(rs.RemoteDnsIpv4) == 0 || !slices.Equal(rs.RemoteDnsIpv4, RegionalDnsServerIps("cn")) {
 		t.Fatalf("regional servers mismatch: %v vs %v", rs.RemoteDnsIpv4, RegionalDnsServerIps("cn"))
 	}
+	if rs.DnsUpgradeMaskAddress != DefaultDnsUpgradeMaskAddress {
+		t.Fatalf("regional upgrade mask = %q, expected %q", rs.DnsUpgradeMaskAddress, DefaultDnsUpgradeMaskAddress)
+	}
 
 	// country codes are case-insensitive
 	if upper := RegionalDnsResolverSettings("CN"); upper == nil || !slices.Equal(upper.RemoteDnsIpv4, rs.RemoteDnsIpv4) {
@@ -516,6 +519,23 @@ func TestRegionalDnsResolverSettings(t *testing.T) {
 		if _, err := netip.ParseAddr(server.Ipv4); err != nil {
 			t.Errorf("regional server %s (%s) has a malformed address %q", server.Name, server.CountryCode, server.Ipv4)
 		}
+	}
+}
+
+func TestDefaultDnsUpgradeMaskAddress(t *testing.T) {
+	if DefaultDnsUpgradeMaskAddress != "65.49.70.65" {
+		t.Fatalf("default upgrade mask = %q", DefaultDnsUpgradeMaskAddress)
+	}
+	resolver := DefaultDnsResolverSettings()
+	if resolver.DnsUpgradeMaskAddress != DefaultDnsUpgradeMaskAddress {
+		t.Fatalf("default resolver upgrade mask = %q", resolver.DnsUpgradeMaskAddress)
+	}
+	muxSettings := DefaultUpgradeMuxSettings()
+	if muxSettings == nil || muxSettings.Dns == nil || muxSettings.Dns.Resolver == nil {
+		t.Fatalf("default mux resolver missing: %+v", muxSettings)
+	}
+	if muxSettings.Dns.Resolver.DnsUpgradeMaskAddress != DefaultDnsUpgradeMaskAddress {
+		t.Fatalf("default mux upgrade mask = %q", muxSettings.Dns.Resolver.DnsUpgradeMaskAddress)
 	}
 }
 

@@ -40,6 +40,103 @@ const (
 	encryptionModeFallback
 )
 
+type ackBoundaryReuseLogger struct {
+	reused <-chan struct{}
+}
+
+func (self ackBoundaryReuseLogger) Info(args ...any) {
+}
+
+func (self ackBoundaryReuseLogger) Infof(format string, args ...any) {
+	// receiveAck emits its first level-2 pass log after returning the
+	// acknowledged target to sendItemPool. Hold that exact boundary until a
+	// concurrent sequence has taken and overwritten the pooled object.
+	<-self.reused
+}
+
+func (self ackBoundaryReuseLogger) Warningf(format string, args ...any) {
+}
+
+func (self ackBoundaryReuseLogger) Errorf(format string, args ...any) {
+}
+
+func (self ackBoundaryReuseLogger) V(level int32) Verbose {
+	return ackBoundaryReuseVerbose{enabled: level == 2}
+}
+
+type ackBoundaryReuseVerbose struct {
+	enabled bool
+}
+
+func (self ackBoundaryReuseVerbose) Enabled() bool {
+	return self.enabled
+}
+
+func (self ackBoundaryReuseVerbose) Info(args ...any) {
+}
+
+func (self ackBoundaryReuseVerbose) Infof(format string, args ...any) {
+}
+
+func TestCumulativeAckBoundarySurvivesImmediateSendItemReuse(t *testing.T) {
+	clearSendItemPool()
+	t.Cleanup(clearSendItemPool)
+
+	reusedReady := make(chan struct{})
+	reusedItem := make(chan *sendItem, 1)
+	go func() {
+		item := <-sendItemPool
+		// Model another SendSequence taking the just-acknowledged object and
+		// assigning a much newer sequence number before the original
+		// cumulative loop advances.
+		*item = sendItem{
+			transferItem: transferItem{
+				messageId:      NewId(),
+				sequenceNumber: 100,
+			},
+		}
+		reusedItem <- item
+		close(reusedReady)
+	}()
+
+	client := &Client{
+		clientTag: "ack-boundary-test",
+		log:       ackBoundaryReuseLogger{reused: reusedReady},
+	}
+	target := &sendItem{
+		transferItem: transferItem{
+			messageId:      NewId(),
+			sequenceNumber: 1,
+		},
+	}
+	later := &sendItem{
+		transferItem: transferItem{
+			messageId:      NewId(),
+			sequenceNumber: 2,
+		},
+	}
+	sequence := &SendSequence{
+		client:      client,
+		log:         client.log,
+		resendQueue: newResendQueue(nil, 0),
+		sendItems:   []*sendItem{target, later},
+	}
+	sequence.resendQueue.Add(target)
+	sequence.resendQueue.Add(later)
+
+	sequence.receiveAck(target.messageId, false, sequenceTag{})
+
+	if len(sequence.sendItems) != 1 || sequence.sendItems[0] != later {
+		t.Fatalf("cumulative ack crossed its snapshotted boundary: remaining=%d", len(sequence.sendItems))
+	}
+	if _, ok := sequence.resendQueue.ContainsMessageId(later.messageId); !ok {
+		t.Fatal("later send item was incorrectly acknowledged after target reuse")
+	}
+
+	// Keep the concurrently reused object live until the assertion completes.
+	<-reusedItem
+}
+
 func TestSendItemPoolIsBoundedAndClearsAckLifetimeState(t *testing.T) {
 	if cap(sendItemPool) != sendItemPoolCapacity {
 		t.Fatalf("send-item pool capacity = %d, expected %d", cap(sendItemPool), sendItemPoolCapacity)

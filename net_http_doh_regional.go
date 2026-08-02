@@ -44,8 +44,9 @@ func RegionalDnsResolverSettings(countryCode string) *DnsResolverSettings {
 		return nil
 	}
 	return &DnsResolverSettings{
-		EnableRemoteDns: true,
-		RemoteDnsIpv4:   remoteDnsIpv4,
+		EnableRemoteDns:       true,
+		DnsUpgradeMaskAddress: DefaultDnsUpgradeMaskAddress,
+		RemoteDnsIpv4:         remoteDnsIpv4,
 	}
 }
 

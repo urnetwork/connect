@@ -32,7 +32,7 @@ import (
 	// "syscall"
 
 	mathrand "math/rand"
-	"sync"
+	"sync/atomic"
 	// "golang.org/x/crypto/cryptobyte"
 	// "golang.org/x/net/idna"
 	// "google.golang.org/protobuf/proto"
@@ -49,6 +49,16 @@ func NewResilientDialTlsContext(
 	fragment bool,
 	reorder bool,
 ) DialTlsContextFunction {
+	return newResilientDialTlsContext(connectSettings, fragment, reorder, nil)
+}
+
+func newResilientDialTlsContext(
+	connectSettings *ConnectSettings,
+	fragment bool,
+	reorder bool,
+	nextProtos []string,
+) DialTlsContextFunction {
+	baseTlsConfig := newClientTlsConfig(connectSettings.TlsConfig, nextProtos)
 	return func(
 		ctx context.Context,
 		network string,
@@ -75,7 +85,7 @@ func NewResilientDialTlsContext(
 		rconn := NewResilientTlsConn(conn, fragment, reorder)
 
 		// copy and extend
-		tlsConfig := connectSettings.TlsConfig.Clone()
+		tlsConfig := baseTlsConfig.Clone()
 		tlsConfig.ServerName = host
 		tlsConn := tls.Client(rconn, tlsConfig)
 
@@ -105,32 +115,28 @@ type ResilientTlsConn struct {
 	reorder  bool
 	buffer   []byte
 
-	stateLock sync.Mutex
-	enabled   bool
+	enabled atomic.Bool
 }
 
 // must be created before the tls connection starts
 func NewResilientTlsConn(conn net.Conn, fragment bool, reorder bool) *ResilientTlsConn {
-	return &ResilientTlsConn{
+	resilientTlsConn := &ResilientTlsConn{
 		conn:     conn,
 		fragment: fragment,
 		reorder:  reorder,
 		buffer:   []byte{},
-		enabled:  true,
 	}
+	resilientTlsConn.enabled.Store(true)
+	return resilientTlsConn
 }
 
 func (self *ResilientTlsConn) Off() {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
 	// can't turn back on after off because we don't know where to align the tls header
-	self.enabled = false
+	self.enabled.Store(false)
 }
 
 func (self *ResilientTlsConn) Enabled() bool {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
-	return self.enabled
+	return self.enabled.Load()
 }
 
 func (self *ResilientTlsConn) Write(b []byte) (int, error) {

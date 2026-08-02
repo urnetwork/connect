@@ -13,6 +13,36 @@ import (
 	_ "embed"
 )
 
+const clientTlsSessionCacheCapacity = 16
+
+var (
+	clientHttpNextProtos      = []string{"h2", "http/1.1"}
+	clientWebSocketNextProtos = []string{"http/1.1"}
+)
+
+// newClientTlsConfig isolates TLS session tickets to one dial path and, when
+// nextProtos is non-nil, advertises the application protocols that path's
+// caller can actually speak. A distinct bounded cache per dialer avoids
+// linking direct, resilient, and extender egress addresses while making an
+// unavoidable re-dial cheaper.
+func newClientTlsConfig(base *tls.Config, nextProtos []string) *tls.Config {
+	var config *tls.Config
+	if base == nil {
+		config = &tls.Config{}
+	} else {
+		config = base.Clone()
+	}
+	if nextProtos != nil {
+		config.NextProtos = append([]string(nil), nextProtos...)
+	}
+	// Always replace a caller-supplied cache. The strategy derives separate
+	// configs for ordinary HTTP, WebSocket, every resilient mode, and every
+	// extender; sharing the base config's cache would let a server correlate
+	// those otherwise-independent egress paths through a redeemed ticket.
+	config.ClientSessionCache = tls.NewLRUClientSessionCache(clientTlsSessionCacheCapacity)
+	return config
+}
+
 // the let's encrypt root CAs as defined at https://letsencrypt.org/certificates/
 // this includes:
 // - ISRG Root X1

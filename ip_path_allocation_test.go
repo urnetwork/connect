@@ -102,15 +102,15 @@ func TestMultiClientCommittedIngressUsesOwnedFlowPathWithoutAllocating(t *testin
 		ip4PathUpdates: map[Ip4Path]*multiClientChannelUpdate{
 			outbound.ToIp4Path(): update,
 		},
-		receivePacketCallback: func(
-			source TransferPath,
-			provideMode protocol.ProvideMode,
-			ipPath *IpPath,
-			packet []byte,
-		) {
-			receivedPath = ipPath
-		},
 	}
+	multi.receivePacketCallback.Store(&receivePacketCallbackHolder{callback: func(
+		source TransferPath,
+		provideMode protocol.ProvideMode,
+		ipPath *IpPath,
+		packet []byte,
+	) {
+		receivedPath = ipPath
+	}})
 
 	allocs := testing.AllocsPerRun(1000, func() {
 		multi.clientReceivePacket(

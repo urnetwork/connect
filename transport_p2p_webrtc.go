@@ -3,10 +3,12 @@ package connect
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/datachannel"
@@ -54,12 +56,13 @@ type clientSignalDispatcher struct {
 	shards    []*clientSignalReceiver
 }
 
-// signalPeerPrioritizer is implemented by WebRtcManager. The transfer receive
-// callback has already authenticated the relationship represented by Peer, so
-// a Network-mode signal is the earliest trustworthy indication that this peer
-// should reclaim bounded P2P admission from speculative public connections.
-type signalPeerPrioritizer interface {
-	PrioritizePeer(peerId Id)
+// signalNetworkPeerObserver is implemented by WebRtcManager. The transfer
+// receive callback has authenticated the Network relationship, but repeated
+// WebRTC signaling is negotiation machinery rather than fresh application
+// demand. Only the first signal grants an admission lease; later signals keep
+// trust/window classification without indefinitely refreshing stale peers.
+type signalNetworkPeerObserver interface {
+	ObserveNetworkPeerSignal(peerId Id)
 }
 
 func prioritizeNetworkSignalPeer(
@@ -73,8 +76,8 @@ func prioritizeNetworkSignalPeer(
 	}
 	for _, frame := range frames {
 		if frame != nil && frame.MessageType == protocol.MessageType_TransferExchangeSignals {
-			if prioritizer, ok := receiver.(signalPeerPrioritizer); ok {
-				prioritizer.PrioritizePeer(source.SourceId)
+			if observer, ok := receiver.(signalNetworkPeerObserver); ok {
+				observer.ObserveNetworkPeerSignal(source.SourceId)
 			}
 			return
 		}
@@ -583,13 +586,24 @@ func DefaultWebRtcSettings() *WebRtcSettings {
 		// MTU only after a complete cwnd is acknowledged. On a measured 50 ms
 		// path with independent wireless loss, recovery from the observed
 		// 20-50 KiB window took seconds and held throughput below 1 MiB/s.
-		// Four MTUs retains loss response and a zero minimum (unlike a forced
-		// floor), while making recovery competitive with modern transports.
-		SctpCwndCAStep: 4 * 1200,
+		// A steeper step retains loss response and a zero minimum (unlike a
+		// forced floor, which trades a standing queue / bufferbloat latency for
+		// throughput), while making recovery competitive with modern
+		// transports. Three deterministic repetitions
+		// (TestWebRtcSctpCwndCAStepKnee, see OPTIMIZENETWORKPEER1.md) select
+		// 8 MTU as the predictable knee: versus 4 MTU it raised median goodput
+		// 16% at 1% independent loss and 81% on a 50 Mbps shallow-queue path,
+		// without regressing 8 Mbps. 16 MTU gained another 21% only in the
+		// independent-loss row but collapsed to one MTU in one of three
+		// 50 Mbps runs and had a slower 8 Mbps run. All WebRTC p2p is a direct
+		// ICE path, never the cellular relay.
+		SctpCwndCAStep: 8 * 1200,
 		// ICE consent can remain healthy while the SCTP/data plane is
 		// half-open. Once a write leaves unacknowledged SCTP bytes, require a
-		// reverse SCTP packet within this bound or rebuild the association.
-		// The worker is lazy and has no idle timer/radio wakeups.
+		// forward acknowledgement within this bound or rebuild the
+		// association. A peer-advertised zero receive window pauses the bound:
+		// that is intentional receiver backpressure, not a dead path. The
+		// worker is lazy and has no idle timer/radio wakeups.
 		SctpNoProgressTimeout: 10 * time.Second,
 		// openrelay.metered.ca and stun.stunprotocol.org are defunct — every
 		// gather against them burned a multi-second i/o timeout per attempt
@@ -619,11 +633,30 @@ type WebRtcSettings struct {
 	// releases it at teardown, so p2p setups are admitted only while the
 	// client memory target has headroom (refused setups stay on the platform
 	// transport, as at the count cap). nil disables byte admission.
-	MemoryBudget        *TransferMemoryBudget
-	DisconnectedTimeout time.Duration
-	FailedTimeout       time.Duration
-	KeepAliveTimeout    time.Duration
-	StunGatherTimeout   time.Duration
+	MemoryBudget *TransferMemoryBudget
+	// NetworkPeerReceiveBufferSize, when > 0, is the SCTP receive window used
+	// for a trusted network peer (an explicitly selected / ProvideMode_Network
+	// peer, marked via PrioritizePeer) instead of ReceiveBufferSize. It lets the
+	// serving side match the client's larger selected-peer window so
+	// device-to-device is symmetric, without multiplying that footprint across
+	// the many public peers. Requires NetworkPeerMemoryBudget; without it, a
+	// network peer falls back to the public window (Fix 1).
+	NetworkPeerReceiveBufferSize ByteCount
+	// NetworkPeerMemoryBudget is the dedicated admission budget for network-peer
+	// connections (each reserves NetworkPeerReceiveBufferSize). Separate from
+	// MemoryBudget so a bounded number of large network-peer windows never
+	// starve — or is starved by — the many small public windows. nil disables
+	// the network-peer window (falls back to the public window/budget).
+	NetworkPeerMemoryBudget *TransferMemoryBudget
+	// InitialNetworkPeerIds marks explicitly selected, already-authenticated
+	// Network destinations before Client construction can start its first P2P
+	// offer. Signal-driven promotion remains the provider-side path. The
+	// manager copies this bounded seed; callers may reuse the settings slice.
+	InitialNetworkPeerIds []Id
+	DisconnectedTimeout   time.Duration
+	FailedTimeout         time.Duration
+	KeepAliveTimeout      time.Duration
+	StunGatherTimeout     time.Duration
 
 	DataChannelLabel   string
 	DataChannelOrdered bool
@@ -641,9 +674,10 @@ type WebRtcSettings struct {
 	SctpFastRtxWnd uint32
 	SctpCwndCAStep uint32
 	// SctpNoProgressTimeout bounds a half-open data plane after outbound
-	// activity. Zero disables the watchdog. It observes reverse SCTP packets,
-	// not application callbacks, so transfer send/receive/forward callbacks
-	// retain their intentional synchronous backpressure semantics.
+	// activity. Zero disables the watchdog. It observes forward
+	// acknowledgements and pauses while the peer advertises a zero receive
+	// window, so transfer send/receive/forward callbacks retain their
+	// intentional synchronous backpressure semantics.
 	SctpNoProgressTimeout time.Duration
 	// UseEgressOnlyIceInterfaces gathers host/server-reflexive candidates
 	// only from the current default-route IPv4/IPv6 addresses. Device VPN
@@ -744,16 +778,230 @@ func (self *pionLeveledLogger) Errorf(format string, args ...any) {
 	self.log.Errorf("[pion:"+self.scope+"]"+format, args...)
 }
 
+// peerConnectionAdmissionState is the ownership half of a shared byte budget.
+// TransferMemoryBudget already makes the byte ceiling exact across managers;
+// this bounded registry makes reclamation equally global. Without it, a fresh
+// window-client manager could see a full device pool but could neither identify
+// an obsolete owner in another manager nor see that another teardown was
+// already releasing capacity.
+type peerConnectionAdmissionState struct {
+	stateLock sync.Mutex
+	owners    map[*peerConnectionAdmissionOwner]struct{}
+}
+
+// peerConnectionAdmissionOwner exists from exact byte reservation until
+// physical peer teardown. All mutable fields are protected by the owning
+// peerConnectionAdmissionState stateLock.
+type peerConnectionAdmissionOwner struct {
+	budget        *TransferMemoryBudget
+	byteCount     ByteCount
+	peerId        Id
+	createdAt     time.Time
+	priorityUntil time.Time
+	ctx           context.Context
+	cancel        context.CancelFunc
+	retiring      bool
+}
+
+func (self *TransferMemoryBudget) getPeerConnectionAdmissionState(
+	create bool,
+) *peerConnectionAdmissionState {
+	if self == nil {
+		return nil
+	}
+	if state := self.peerConnectionAdmissionState.Load(); state != nil || !create {
+		return state
+	}
+	candidate := &peerConnectionAdmissionState{
+		owners: map[*peerConnectionAdmissionOwner]struct{}{},
+	}
+	if self.peerConnectionAdmissionState.CompareAndSwap(nil, candidate) {
+		return candidate
+	}
+	return self.peerConnectionAdmissionState.Load()
+}
+
+// tryReservePeerConnectionOwner atomically pairs exact budget admission with a
+// visible lifetime owner. Raw transfer-queue reservations can still coexist:
+// TryReserve remains the single byte-ceiling authority.
+func (self *TransferMemoryBudget) tryReservePeerConnectionOwner(
+	owner *peerConnectionAdmissionOwner,
+	byteCount ByteCount,
+) bool {
+	if self == nil || owner == nil || byteCount <= 0 {
+		return false
+	}
+	state := self.getPeerConnectionAdmissionState(true)
+	state.stateLock.Lock()
+	defer state.stateLock.Unlock()
+	if !self.TryReserve(byteCount) {
+		return false
+	}
+	owner.budget = self
+	owner.byteCount = byteCount
+	state.owners[owner] = struct{}{}
+	return true
+}
+
+func (self *peerConnectionAdmissionOwner) markRetiring() {
+	if self == nil || self.budget == nil {
+		return
+	}
+	state := self.budget.getPeerConnectionAdmissionState(false)
+	if state == nil {
+		return
+	}
+	state.stateLock.Lock()
+	if _, exists := state.owners[self]; exists {
+		self.retiring = true
+	}
+	state.stateLock.Unlock()
+}
+
+func (self *peerConnectionAdmissionOwner) cancelForReclamation() {
+	if self == nil {
+		return
+	}
+	self.markRetiring()
+	if self.cancel != nil {
+		self.cancel()
+	}
+}
+
+func (self *peerConnectionAdmissionOwner) setPriorityUntil(until time.Time) {
+	if self == nil || self.budget == nil {
+		return
+	}
+	state := self.budget.getPeerConnectionAdmissionState(false)
+	if state == nil {
+		return
+	}
+	state.stateLock.Lock()
+	if _, exists := state.owners[self]; exists {
+		self.priorityUntil = until
+	}
+	state.stateLock.Unlock()
+}
+
+func (self *peerConnectionAdmissionOwner) release() {
+	if self == nil || self.budget == nil {
+		return
+	}
+	state := self.budget.getPeerConnectionAdmissionState(false)
+	if state == nil {
+		return
+	}
+	state.stateLock.Lock()
+	if _, exists := state.owners[self]; !exists {
+		state.stateLock.Unlock()
+		return
+	}
+	delete(state.owners, self)
+	// Keep owner visibility and byte release one transaction. A waiter woken
+	// by Release can run immediately, but it cannot inspect a full budget with
+	// neither an owner nor a pending release while this lock is held.
+	self.budget.Release(self.byteCount)
+	state.stateLock.Unlock()
+	if self.cancel != nil {
+		self.cancel()
+	}
+}
+
+func (self *TransferMemoryBudget) peerConnectionOwnerCounts() (
+	liveCount int,
+	retiringCount int,
+) {
+	state := self.getPeerConnectionAdmissionState(false)
+	if state == nil {
+		return
+	}
+	state.stateLock.Lock()
+	defer state.stateLock.Unlock()
+	for owner := range state.owners {
+		if owner.retiring {
+			retiringCount++
+		} else {
+			liveCount++
+		}
+	}
+	return
+}
+
+func (self *TransferMemoryBudget) peerConnectionReleasePending() bool {
+	_, retiringCount := self.peerConnectionOwnerCounts()
+	return 0 < retiringCount
+}
+
+// claimOldestPeerConnectionOwner marks exactly one pool-wide owner for
+// reclamation. A pending retirement suppresses another claim so concurrent
+// managers cannot drain every healthy association while one teardown is
+// already creating sufficient headroom. The caller performs cancellation after
+// releasing its own manager lock.
+func (self *TransferMemoryBudget) claimOldestPeerConnectionOwner(
+	protectPriority bool,
+	now time.Time,
+) *peerConnectionAdmissionOwner {
+	state := self.getPeerConnectionAdmissionState(false)
+	if state == nil {
+		return nil
+	}
+	state.stateLock.Lock()
+	defer state.stateLock.Unlock()
+
+	for owner := range state.owners {
+		if owner.retiring {
+			return nil
+		}
+	}
+
+	var oldest *peerConnectionAdmissionOwner
+	oldestCanceled := false
+	for owner := range state.owners {
+		if protectPriority && now.Before(owner.priorityUntil) {
+			continue
+		}
+		canceled := owner.ctx != nil && owner.ctx.Err() != nil
+		if oldest == nil ||
+			(canceled && !oldestCanceled) ||
+			(canceled == oldestCanceled && owner.createdAt.Before(oldest.createdAt)) {
+			oldest = owner
+			oldestCanceled = canceled
+		}
+	}
+	if oldest != nil {
+		oldest.retiring = true
+	}
+	return oldest
+}
+
 type WebRtcManager struct {
 	ctx          context.Context
+	cancel       context.CancelFunc
 	log          Logger
 	signalSender SignalSender
 	settings     *WebRtcSettings
 
-	stateLock                  sync.Mutex
-	peerConns                  map[peerConnKey]*peerConn
+	stateLock        sync.Mutex
+	closed           bool
+	closeDone        chan struct{}
+	contextCloseStop func() bool
+	peerConnWorkers  sync.WaitGroup
+	peerConns        map[peerConnKey]*peerConn
+	// retiringPeerConns tracks canceled generations independently of
+	// peerConns. A make-before-break replacement removes the old generation
+	// from the keyed map before its teardown releases the receive-window
+	// reservation. Admission must still see that pending release; otherwise a
+	// third setup cancels the newest usable generation too and repeated
+	// retries can keep every generation retiring.
+	retiringPeerConns          map[*peerConn]struct{}
 	prioritizedPeers           map[Id]time.Time
 	pendingPrioritizedPeerSlot map[Id]time.Time
+	// networkPeers remembers authenticated ProvideMode_Network identities
+	// independently of their short admission-priority lease. Priority may
+	// expire while an idle connection is healthy, but a later path rebuild
+	// must still select the dedicated SCTP window/budget. The map is hard
+	// bounded and does not reserve capacity by itself.
+	networkPeers map[Id]time.Time
 
 	peerConnectionFactoryLock        sync.Mutex
 	peerConnectionFactory            *webRtcPeerConnectionFactory
@@ -761,9 +1009,31 @@ type WebRtcManager struct {
 	peerConnectionFactoryInitialized bool
 	peerConnectionFactoryRetryTime   time.Time
 	peerConnectionFactoryClosed      bool
-	newPeerConnectionFactory         func(*WebRtcSettings) (*webRtcPeerConnectionFactory, error)
+	// The DTLS certificate outlives path-bound ICE factory state. A network
+	// change rebuilds SettingEngine/API/socket state but reuses the manager
+	// identity, avoiding a P-256 key/certificate generation pause on reconnect.
+	peerConnectionCertificate *webrtc.Certificate
+	newPeerConnectionFactory  func(
+		*WebRtcSettings,
+		*webrtc.Certificate,
+	) (*webRtcPeerConnectionFactory, *webrtc.Certificate, error)
 
 	capacityMonitor *Monitor
+	// Internal waiters use reason-specific signals. A shared buffered count
+	// token wakes at most one setup per released map slot; admissionStateMonitor
+	// is reserved for rare classification/priority changes. The exported
+	// broadcast monitor remains for API compatibility.
+	countCapacityNotify   chan struct{}
+	admissionStateMonitor *Monitor
+
+	// Admission is manager-wide but attempts arrive through many independent
+	// P2P transports. Per-transport logging therefore still creates a startup
+	// stampede at a full count or byte budget. Separate fixed counters preserve
+	// reason-local totals while allowing power-of-two summaries across streams.
+	admissionPriorityRefusalCount atomic.Uint64
+	admissionCountRefusalCount    atomic.Uint64
+	admissionBudgetRefusalCount   atomic.Uint64
+	admissionOtherRefusalCount    atomic.Uint64
 
 	networkChangeLock   sync.Mutex
 	networkChangeWorker *coalescingCallbackWorker
@@ -773,24 +1043,97 @@ type WebRtcManager struct {
 const peerConnectionFactoryRetryTimeout = time.Second
 const peerConnectionPriorityTimeout = 30 * time.Second
 const maxPeerConnectionPriorityCount = 64
+const maxRememberedNetworkPeerCount = 64
 
 func NewWebRtcManager(ctx context.Context, signalSender SignalSender, settings *WebRtcSettings) *WebRtcManager {
+	managerCtx, cancel := context.WithCancel(ctx)
 	manager := &WebRtcManager{
-		ctx:                        ctx,
+		ctx:                        managerCtx,
+		cancel:                     cancel,
 		log:                        loggerOrDefault(settings.Log),
 		signalSender:               signalSender,
 		settings:                   settings,
+		closeDone:                  make(chan struct{}),
 		peerConns:                  map[peerConnKey]*peerConn{},
+		retiringPeerConns:          map[*peerConn]struct{}{},
 		prioritizedPeers:           map[Id]time.Time{},
 		pendingPrioritizedPeerSlot: map[Id]time.Time{},
+		networkPeers:               map[Id]time.Time{},
 		capacityMonitor:            NewMonitor(),
+		admissionStateMonitor:      NewMonitor(),
 		newPeerConnectionFactory:   newWebRtcPeerConnectionFactory,
 	}
-	context.AfterFunc(ctx, func() {
-		manager.closeNetworkChangeWorker()
-		manager.closePeerConnectionFactory()
-	})
+	if 0 < settings.MaxPeerConnectionCount {
+		// A token represents one released peerConns map slot. Limit retained
+		// stale tokens even if an embedder configures an unusually large cap;
+		// the retry timer remains the liveness fallback above this bound.
+		manager.countCapacityNotify = make(
+			chan struct{},
+			min(settings.MaxPeerConnectionCount, maxPeerConnectionPriorityCount),
+		)
+	}
+	now := time.Now()
+	for _, peerId := range settings.InitialNetworkPeerIds {
+		if peerId != (Id{}) {
+			manager.rememberNetworkPeerLocked(peerId, now)
+		}
+	}
+	stop := context.AfterFunc(managerCtx, manager.Close)
+	manager.stateLock.Lock()
+	if manager.closed {
+		manager.stateLock.Unlock()
+		stop()
+	} else {
+		manager.contextCloseStop = stop
+		manager.stateLock.Unlock()
+	}
 	return manager
+}
+
+// Close synchronously releases every peer admission reservation and all
+// manager-owned ICE state. Context cancellation alone schedules cleanup
+// asynchronously; explicit client close/connect churn must not let old Pion
+// sockets and goroutines overlap the next client generation.
+func (self *WebRtcManager) Close() {
+	self.stateLock.Lock()
+	if self.closed {
+		done := self.closeDone
+		self.stateLock.Unlock()
+		<-done
+		return
+	}
+	self.closed = true
+	stopContextClose := self.contextCloseStop
+	self.contextCloseStop = nil
+	for _, conn := range self.peerConns {
+		self.retirePeerConnLocked(conn)
+	}
+	self.stateLock.Unlock()
+
+	// Always release concurrent Close callers, even if an unexpected teardown
+	// panic is recovered by the outer lifecycle handler.
+	defer close(self.closeDone)
+	if stopContextClose != nil {
+		stopContextClose()
+	}
+	self.cancel()
+
+	// A path callback can otherwise invalidate/rebuild factory state after
+	// Close returns. Unsubscribe, cancel, and join it before the peer/factory
+	// teardown boundary.
+	self.closeNetworkChangeWorker()
+	self.peerConnWorkers.Wait()
+	self.closePeerConnectionFactory()
+
+	self.stateLock.Lock()
+	self.peerConns = nil
+	self.retiringPeerConns = nil
+	self.prioritizedPeers = nil
+	self.pendingPrioritizedPeerSlot = nil
+	self.networkPeers = nil
+	self.stateLock.Unlock()
+	self.capacityMonitor.NotifyAll()
+	self.admissionStateMonitor.NotifyAll()
 }
 
 func (self *WebRtcManager) prunePeerPrioritiesLocked(now time.Time) {
@@ -806,14 +1149,134 @@ func (self *WebRtcManager) prunePeerPrioritiesLocked(now time.Time) {
 	}
 }
 
+// rememberNetworkPeerLocked records an authenticated network-peer identity
+// without tying it to the short-lived admission-priority lease. The record is
+// bounded and carries no reservation, so idle peers cannot pin count or memory
+// capacity. When the bound is full, an identity with no live association is
+// evicted before one that still supplies the admission class for active
+// streams. Call with stateLock held.
+func (self *WebRtcManager) rememberNetworkPeerLocked(peerId Id, now time.Time) (newlyRemembered bool) {
+	if self.networkPeers == nil {
+		self.networkPeers = map[Id]time.Time{}
+	}
+	_, exists := self.networkPeers[peerId]
+	if !exists && maxRememberedNetworkPeerCount <= len(self.networkPeers) {
+		var oldestPeerId Id
+		var oldestSeen time.Time
+		oldestHasLiveConnection := true
+		for candidatePeerId, candidateSeen := range self.networkPeers {
+			candidateHasLiveConnection := self.hasLivePeerConnLocked(candidatePeerId)
+			if oldestSeen.IsZero() ||
+				(oldestHasLiveConnection && !candidateHasLiveConnection) ||
+				(oldestHasLiveConnection == candidateHasLiveConnection &&
+					candidateSeen.Before(oldestSeen)) {
+				oldestPeerId = candidatePeerId
+				oldestSeen = candidateSeen
+				oldestHasLiveConnection = candidateHasLiveConnection
+			}
+		}
+		delete(self.networkPeers, oldestPeerId)
+	}
+	self.networkPeers[peerId] = now
+	return !exists
+}
+
+func (self *WebRtcManager) hasLivePeerConnLocked(peerId Id) bool {
+	for key, conn := range self.peerConns {
+		if key.PeerId == peerId && conn.ctx.Err() == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func (self *WebRtcManager) hasPeerConnLocked(peerId Id) bool {
+	for key := range self.peerConns {
+		if key.PeerId == peerId {
+			return true
+		}
+	}
+	return false
+}
+
+func (self *WebRtcManager) hasPeerConnForAdmissionBudgetLocked(
+	peerId Id,
+	budget *TransferMemoryBudget,
+) bool {
+	for key, conn := range self.peerConns {
+		if key.PeerId == peerId &&
+			conn.ctx.Err() == nil &&
+			conn.admissionBudget == budget {
+			return true
+		}
+	}
+	return false
+}
+
+// usesNetworkPeerAdmissionLocked reports whether peerId should use the
+// dedicated receive window and budget. Call with stateLock held.
+func (self *WebRtcManager) usesNetworkPeerAdmissionLocked(peerId Id) bool {
+	_, trusted := self.networkPeers[peerId]
+	if !trusted {
+		// Bounded identity churn must not downgrade another stream from an
+		// already-authenticated live Network association to the public Pion
+		// API/budget. The immutable admission choice on that association is a
+		// lifetime-safe trust witness even if the auxiliary LRU is at its
+		// hard bound.
+		for key, conn := range self.peerConns {
+			if key.PeerId == peerId && conn.ctx.Err() == nil && conn.networkPeer {
+				trusted = true
+				break
+			}
+		}
+	}
+	if !trusted {
+		return false
+	}
+	return 0 < self.settings.NetworkPeerReceiveBufferSize &&
+		self.settings.NetworkPeerMemoryBudget != nil
+}
+
+// peerAdmissionLocked resolves the actual resource domain used by peerId.
+// The budget pointer, rather than the public/Network label, defines the domain:
+// selected window clients deliberately use one shared budget for both labels
+// so their hard ceiling is not silently doubled.
+func (self *WebRtcManager) peerAdmissionLocked(
+	peerId Id,
+) (
+	networkPeer bool,
+	budget *TransferMemoryBudget,
+	reserveByteCount ByteCount,
+) {
+	networkPeer = self.usesNetworkPeerAdmissionLocked(peerId)
+	budget = self.settings.MemoryBudget
+	reserveByteCount = self.settings.ReceiveBufferSize
+	if networkPeer {
+		budget = self.settings.NetworkPeerMemoryBudget
+		reserveByteCount = self.settings.NetworkPeerReceiveBufferSize
+	}
+	return
+}
+
 // oldestEvictablePeerConnLocked returns bounded capacity that a trusted,
 // explicitly selected network peer may reclaim. Priority expires unless the
 // provider continues to observe Network traffic, so an abandoned selection
 // cannot pin a slot forever.
 func (self *WebRtcManager) oldestEvictablePeerConnLocked(now time.Time) *peerConn {
+	return self.oldestPeerConnLocked(true, now)
+}
+
+// oldestPeerConnLocked returns global count capacity. Count admission is one
+// resource domain across public and Network peers, so the forced fallback must
+// not filter by the unrelated byte-budget class.
+func (self *WebRtcManager) oldestPeerConnLocked(
+	protectPriority bool,
+	now time.Time,
+) *peerConn {
 	var oldest *peerConn
 	for _, conn := range self.peerConns {
-		if conn.ctx.Err() != nil || now.Before(conn.priorityUntil) {
+		if conn.ctx.Err() != nil ||
+			(protectPriority && now.Before(conn.priorityUntil)) {
 			continue
 		}
 		if oldest == nil || conn.createdAt.Before(oldest.createdAt) {
@@ -821,6 +1284,208 @@ func (self *WebRtcManager) oldestEvictablePeerConnLocked(now time.Time) *peerCon
 		}
 	}
 	return oldest
+}
+
+// oldestPeerConnForAdmissionBudgetLocked returns the least recently observed
+// association backed by the requested budget. A byte-budget reclamation must
+// stay within that actual resource domain: labels are insufficient because a
+// selected window client deliberately shares one budget between its public
+// fallback and Network admission views. When protectPriority is true, live
+// short-lease associations are skipped; callers may retry without that
+// protection when every bounded slot is lease-protected.
+//
+// networkPeer is taken from the immutable connection admission choice, not the
+// bounded remembered-identity map. A live dedicated association remains a
+// valid reclamation target even if later identity churn evicts its trust record.
+func (self *WebRtcManager) oldestPeerConnForAdmissionBudgetLocked(
+	budget *TransferMemoryBudget,
+	protectPriority bool,
+	now time.Time,
+) *peerConn {
+	var oldest *peerConn
+	var oldestSeen time.Time
+	for _, conn := range self.peerConns {
+		if conn.ctx.Err() != nil || conn.admissionBudget != budget ||
+			(protectPriority && now.Before(conn.priorityUntil)) {
+			continue
+		}
+		seen := conn.createdAt
+		if conn.networkPeer {
+			if rememberedSeen, remembered := self.networkPeers[conn.key.PeerId]; remembered {
+				seen = rememberedSeen
+			}
+		}
+		if oldest == nil ||
+			seen.Before(oldestSeen) ||
+			(seen.Equal(oldestSeen) && conn.createdAt.Before(oldest.createdAt)) {
+			oldest = conn
+			oldestSeen = seen
+		}
+	}
+	return oldest
+}
+
+// peerConnReleasePendingLocked reports whether a prior reclamation is already
+// tearing down. Admission retries are wake-driven, but several can observe the
+// still-reserved bytes before teardown completes. Canceling another victim on
+// each retry would drain healthy capacity instead of replacing one slot.
+func (self *WebRtcManager) peerConnReleasePendingLocked() bool {
+	for _, conn := range self.peerConns {
+		if conn.ctx.Err() != nil {
+			return true
+		}
+	}
+	// An off-map replacement still owns bytes while it tears down, but its
+	// keyed count slot is already occupied by the replacement. It will not
+	// release count capacity, so it must not suppress count reclamation.
+	return false
+}
+
+// peerConnBudgetReleasePendingLocked is the byte-budget counterpart to
+// peerConnReleasePendingLocked. A canceled association in the other admission
+// pool cannot create capacity here and must not suppress the required
+// same-pool reclamation.
+func (self *WebRtcManager) peerConnBudgetReleasePendingLocked(
+	budget *TransferMemoryBudget,
+) bool {
+	if budget != nil && budget.peerConnectionReleasePending() {
+		return true
+	}
+	for _, conn := range self.peerConns {
+		if conn.ctx.Err() != nil && conn.admissionBudget == budget {
+			return true
+		}
+	}
+	for conn := range self.retiringPeerConns {
+		if conn.admissionBudget == budget {
+			return true
+		}
+	}
+	return false
+}
+
+// markPeerConnRetiringLocked records the generation before cancellation or
+// map replacement makes it invisible to keyed admission scans. The teardown
+// worker removes it only after releasing its count/byte ownership.
+func (self *WebRtcManager) markPeerConnRetiringLocked(conn *peerConn) {
+	if conn == nil {
+		return
+	}
+	conn.admissionOwner.markRetiring()
+	if self.retiringPeerConns == nil {
+		self.retiringPeerConns = map[*peerConn]struct{}{}
+	}
+	self.retiringPeerConns[conn] = struct{}{}
+}
+
+func (self *WebRtcManager) retirePeerConnLocked(conn *peerConn) {
+	if conn == nil {
+		return
+	}
+	self.markPeerConnRetiringLocked(conn)
+	conn.Cancel()
+}
+
+// pendingPriorityBlocksAdmissionLocked reports whether an ordinary admission
+// would consume capacity reserved by pending authenticated peers. It reserves
+// only the cardinality actually needed: surplus slots in the same pool and
+// independent slots in the other byte pool continue making progress. A
+// pending signal with no matching setup must not freeze an entire pool for the
+// priority lease.
+func (self *WebRtcManager) pendingPriorityBlocksAdmissionLocked(
+	networkPeer bool,
+	growsPeerConnectionCount bool,
+) bool {
+	if len(self.pendingPrioritizedPeerSlot) == 0 {
+		return false
+	}
+
+	pendingCountReservations := 0
+	candidateBudget := self.settings.MemoryBudget
+	candidateReserveByteCount := self.settings.ReceiveBufferSize
+	if networkPeer {
+		candidateBudget = self.settings.NetworkPeerMemoryBudget
+		candidateReserveByteCount = self.settings.NetworkPeerReceiveBufferSize
+	}
+	budgetBlocked := false
+	var availableAfterCandidate ByteCount
+	budgetReservationsMatter :=
+		candidateBudget != nil && 0 < candidateReserveByteCount
+	if budgetReservationsMatter {
+		availableAfterCandidate = candidateBudget.Available()
+		if availableAfterCandidate < candidateReserveByteCount {
+			budgetBlocked = true
+		} else {
+			availableAfterCandidate -= candidateReserveByteCount
+		}
+	}
+	for peerId := range self.pendingPrioritizedPeerSlot {
+		if !self.hasPeerConnLocked(peerId) {
+			pendingCountReservations++
+		}
+		_, pendingBudget, pendingReserveByteCount :=
+			self.peerAdmissionLocked(peerId)
+		if budgetReservationsMatter &&
+			pendingBudget == candidateBudget &&
+			pendingBudget != nil &&
+			0 < pendingReserveByteCount &&
+			!self.hasPeerConnForAdmissionBudgetLocked(peerId, pendingBudget) {
+			// Subtract each reservation as it is encountered instead of
+			// summing ByteCount. Besides making the cardinality explicit, this
+			// cannot overflow int64 when several callers configure very large
+			// but individually valid receive windows.
+			if availableAfterCandidate < pendingReserveByteCount {
+				budgetBlocked = true
+			} else {
+				availableAfterCandidate -= pendingReserveByteCount
+			}
+		}
+	}
+
+	if maxCount := self.settings.MaxPeerConnectionCount; 0 < maxCount {
+		prospectiveCount := len(self.peerConns) + pendingCountReservations
+		if growsPeerConnectionCount {
+			prospectiveCount++
+		}
+		if maxCount < prospectiveCount {
+			return true
+		}
+	}
+
+	if budgetBlocked {
+		// The candidate needs one new lifetime reservation even when replacing
+		// a map entry: newP2pConn never overdraws the hard budget while the old
+		// generation tears down. Each pending peer that does not already own a
+		// reservation in this pool needs one more.
+		return true
+	}
+	return false
+}
+
+func (self *WebRtcManager) markPendingPriorityLocked(
+	peerId Id,
+	priorityUntil time.Time,
+) {
+	if priorityUntil.IsZero() {
+		return
+	}
+	if self.pendingPrioritizedPeerSlot == nil {
+		self.pendingPrioritizedPeerSlot = map[Id]time.Time{}
+	}
+	self.pendingPrioritizedPeerSlot[peerId] = priorityUntil
+}
+
+func (self *WebRtcManager) pendingPriorityRetryAfterLocked(now time.Time) time.Duration {
+	var earliest time.Time
+	for _, until := range self.pendingPrioritizedPeerSlot {
+		if earliest.IsZero() || until.Before(earliest) {
+			earliest = until
+		}
+	}
+	if earliest.IsZero() {
+		return 0
+	}
+	return max(time.Millisecond, earliest.Sub(now))
 }
 
 // PrioritizePeer gives a trusted same-network peer prompt access to the
@@ -838,7 +1503,14 @@ func (self *WebRtcManager) PrioritizePeer(peerId Id) {
 	until := now.Add(peerConnectionPriorityTimeout)
 
 	var victim *peerConn
+	var sharedVictim *peerConnectionAdmissionOwner
+	var upgradeVictims []*peerConn
+	var notifyAdmission bool
 	self.stateLock.Lock()
+	if self.closed {
+		self.stateLock.Unlock()
+		return
+	}
 	if self.prioritizedPeers == nil {
 		self.prioritizedPeers = map[Id]time.Time{}
 	}
@@ -846,6 +1518,13 @@ func (self *WebRtcManager) PrioritizePeer(peerId Id) {
 		self.pendingPrioritizedPeerSlot = map[Id]time.Time{}
 	}
 	self.prunePeerPrioritiesLocked(now)
+	if self.rememberNetworkPeerLocked(peerId, now) {
+		// A waiter may have subscribed to the public budget immediately before
+		// the authenticated Network relationship arrived. Wake it so it can
+		// re-arm against the dedicated pool without waiting for the fallback
+		// timer.
+		notifyAdmission = true
+	}
 	if _, exists := self.prioritizedPeers[peerId]; !exists &&
 		maxPeerConnectionPriorityCount <= len(self.prioritizedPeers) {
 		var oldestPeerId Id
@@ -862,34 +1541,137 @@ func (self *WebRtcManager) PrioritizePeer(peerId Id) {
 	self.prioritizedPeers[peerId] = until
 
 	hasLivePeerConn := false
+	needsNetworkUpgrade := false
 	for key, conn := range self.peerConns {
 		if key.PeerId == peerId && conn.ctx.Err() == nil {
 			conn.priorityUntil = until
+			conn.admissionOwner.setPriorityUntil(until)
 			hasLivePeerConn = true
-		}
-	}
-	if hasLivePeerConn {
-		delete(self.pendingPrioritizedPeerSlot, peerId)
-	} else {
-		_, alreadyPending := self.pendingPrioritizedPeerSlot[peerId]
-		self.pendingPrioritizedPeerSlot[peerId] = until
-		if !alreadyPending {
-			countFull := 0 < self.settings.MaxPeerConnectionCount &&
-				self.settings.MaxPeerConnectionCount <= len(self.peerConns)
-			budgetFull := self.settings.MemoryBudget != nil &&
-				self.settings.MemoryBudget.Available() < self.settings.ReceiveBufferSize
-			if countFull || budgetFull {
-				victim = self.oldestEvictablePeerConnLocked(now)
+			if self.usesNetworkPeerAdmissionLocked(peerId) && !conn.networkPeer {
+				// The provider learns ProvideMode_Network after its passive
+				// stream may already have constructed a public-window
+				// association. Rebuild it immediately. ImmediateReconnect is a
+				// persistent signal, and the normal waiting-for-offer exchange
+				// replays negotiation state after this replacement.
+				conn.requestImmediateReconnect()
+				upgradeVictims = append(upgradeVictims, conn)
+				needsNetworkUpgrade = true
 			}
 		}
 	}
+	if hasLivePeerConn && !needsNetworkUpgrade {
+		// Do not create a reservation merely because an already-served peer's
+		// priority was refreshed. Equally, do not clear an existing one here:
+		// it can belong to a second stream whose admission failed after this
+		// first association was created. Only that stream's successful
+		// newP2pConn consumes the reservation; its original deadline bounds
+		// stale state if the stream disappears.
+	} else {
+		_, alreadyPending := self.pendingPrioritizedPeerSlot[peerId]
+		self.pendingPrioritizedPeerSlot[peerId] = until
+		notifyAdmission = notifyAdmission || !alreadyPending
+		if !alreadyPending {
+			countFull := 0 < self.settings.MaxPeerConnectionCount &&
+				self.settings.MaxPeerConnectionCount <= len(self.peerConns)
+			// This slot is for a prioritized (Network) peer, so test the pool it
+			// will actually admit against: the dedicated network-peer budget and
+			// window when provisioned, else the public budget.
+			_, budget, reserveByteCount :=
+				self.peerAdmissionLocked(peerId)
+			budgetFull := budget != nil && budget.Available() < reserveByteCount
+			if budgetFull && !self.peerConnBudgetReleasePendingLocked(budget) {
+				victim = self.oldestPeerConnForAdmissionBudgetLocked(budget, true, now)
+				if victim == nil {
+					victim = self.oldestPeerConnForAdmissionBudgetLocked(budget, false, now)
+				}
+				if victim == nil {
+					sharedVictim = budget.claimOldestPeerConnectionOwner(true, now)
+					if sharedVictim == nil {
+						sharedVictim = budget.claimOldestPeerConnectionOwner(false, now)
+					}
+				}
+			} else if countFull && !self.peerConnReleasePendingLocked() {
+				victim = self.oldestEvictablePeerConnLocked(now)
+				if victim == nil {
+					victim = self.oldestPeerConnLocked(false, now)
+				}
+			}
+		}
+	}
+	for _, upgradeVictim := range upgradeVictims {
+		self.markPeerConnRetiringLocked(upgradeVictim)
+	}
+	self.markPeerConnRetiringLocked(victim)
 	self.stateLock.Unlock()
 
+	if notifyAdmission {
+		self.capacityMonitor.NotifyAll()
+		self.admissionStateMonitor.NotifyAll()
+	}
+	for _, upgradeVictim := range upgradeVictims {
+		if self.log.V(1).Enabled() {
+			self.log.Infof("[p2p]network peer %s upgrades public-window connection %s\n", peerId, upgradeVictim.key)
+		}
+		upgradeVictim.Cancel()
+	}
 	if victim != nil {
 		if self.log.V(1).Enabled() {
 			self.log.Infof("[p2p]priority peer %s evicts non-priority peer %s\n", peerId, victim.key.PeerId)
 		}
 		victim.Cancel()
+	}
+	if sharedVictim != nil {
+		if self.log.V(1).Enabled() {
+			self.log.Infof(
+				"[p2p]priority peer %s reclaims shared-budget owner %s\n",
+				peerId,
+				sharedVictim.peerId,
+			)
+		}
+		sharedVictim.cancelForReclamation()
+	}
+}
+
+// ObserveNetworkPeerSignal grants the first authenticated signal the normal
+// prompt-admission lease, then treats repeated negotiation signals only as
+// trust evidence. Otherwise an orphaned StreamOpen can refresh its own lease
+// forever, continually evicting live peers using nothing but failed WebRTC
+// retries. Actual relayed Network data still calls PrioritizePeer and refreshes
+// demand while the selected route is in use.
+func (self *WebRtcManager) ObserveNetworkPeerSignal(peerId Id) {
+	if peerId == (Id{}) {
+		return
+	}
+
+	var upgradeVictims []*peerConn
+	self.stateLock.Lock()
+	if self.closed {
+		self.stateLock.Unlock()
+		return
+	}
+	_, remembered := self.networkPeers[peerId]
+	if remembered {
+		for key, conn := range self.peerConns {
+			if key.PeerId == peerId &&
+				conn.ctx.Err() == nil &&
+				self.usesNetworkPeerAdmissionLocked(peerId) &&
+				!conn.networkPeer {
+				conn.requestImmediateReconnect()
+				upgradeVictims = append(upgradeVictims, conn)
+			}
+		}
+		for _, upgradeVictim := range upgradeVictims {
+			self.markPeerConnRetiringLocked(upgradeVictim)
+		}
+	}
+	self.stateLock.Unlock()
+
+	if !remembered {
+		self.PrioritizePeer(peerId)
+		return
+	}
+	for _, upgradeVictim := range upgradeVictims {
+		upgradeVictim.Cancel()
 	}
 }
 
@@ -922,6 +1704,7 @@ func (self *WebRtcManager) closeNetworkChangeWorker() {
 	}
 	if worker != nil {
 		worker.Close()
+		worker.Wait()
 	}
 }
 
@@ -930,12 +1713,14 @@ func (self *WebRtcManager) closeNetworkChangeWorker() {
 // never receives a stream does not pay for an API, certificate, or native ICE
 // resources.
 type webRtcPeerConnectionFactory struct {
-	newPeerConnection func() (*webrtc.PeerConnection, error)
+	// newPeerConnection builds a peer connection using the network-peer SCTP
+	// receive window when networkPeer is true, else the public window.
+	newPeerConnection func(networkPeer bool) (*webrtc.PeerConnection, error)
 	close             func() error
 }
 
-func (self *webRtcPeerConnectionFactory) NewPeerConnection() (*webrtc.PeerConnection, error) {
-	return self.newPeerConnection()
+func (self *webRtcPeerConnectionFactory) NewPeerConnection(networkPeer bool) (*webrtc.PeerConnection, error) {
+	return self.newPeerConnection(networkPeer)
 }
 
 func (self *webRtcPeerConnectionFactory) Close() error {
@@ -945,7 +1730,7 @@ func (self *webRtcPeerConnectionFactory) Close() error {
 	return self.close()
 }
 
-func (self *WebRtcManager) newPeerConnection() (*webrtc.PeerConnection, error) {
+func (self *WebRtcManager) newPeerConnection(networkPeer bool) (*webrtc.PeerConnection, error) {
 	self.startNetworkChangeWorker()
 
 	self.peerConnectionFactoryLock.Lock()
@@ -957,8 +1742,9 @@ func (self *WebRtcManager) newPeerConnection() (*webrtc.PeerConnection, error) {
 	if !self.peerConnectionFactoryInitialized ||
 		(self.peerConnectionFactoryInitErr != nil &&
 			!time.Now().Before(self.peerConnectionFactoryRetryTime)) {
-		self.peerConnectionFactory, self.peerConnectionFactoryInitErr =
-			self.newPeerConnectionFactory(self.settings)
+		var certificate *webrtc.Certificate
+		self.peerConnectionFactory, certificate, self.peerConnectionFactoryInitErr =
+			self.newPeerConnectionFactory(self.settings, self.peerConnectionCertificate)
 		self.peerConnectionFactoryInitialized = true
 		if self.peerConnectionFactoryInitErr != nil {
 			// Certificate/random-source and native socket setup failures can
@@ -968,12 +1754,15 @@ func (self *WebRtcManager) newPeerConnection() (*webrtc.PeerConnection, error) {
 				time.Now().Add(peerConnectionFactoryRetryTimeout)
 		} else {
 			self.peerConnectionFactoryRetryTime = time.Time{}
+			if certificate != nil {
+				self.peerConnectionCertificate = certificate
+			}
 		}
 	}
 	if self.peerConnectionFactoryInitErr != nil {
 		return nil, self.peerConnectionFactoryInitErr
 	}
-	return self.peerConnectionFactory.NewPeerConnection()
+	return self.peerConnectionFactory.NewPeerConnection(networkPeer)
 }
 
 func (self *WebRtcManager) closePeerConnectionFactory() {
@@ -985,6 +1774,7 @@ func (self *WebRtcManager) closePeerConnectionFactory() {
 	self.peerConnectionFactoryClosed = true
 	factory := self.peerConnectionFactory
 	self.peerConnectionFactory = nil
+	self.peerConnectionCertificate = nil
 	self.peerConnectionFactoryLock.Unlock()
 
 	if err := factory.Close(); err != nil && self.log.V(1).Enabled() {
@@ -999,9 +1789,13 @@ func (self *WebRtcManager) closePeerConnectionFactory() {
 func (self *WebRtcManager) networkChanged() {
 	var factory *webRtcPeerConnectionFactory
 	self.stateLock.Lock()
+	if self.closed {
+		self.stateLock.Unlock()
+		return
+	}
 	for _, conn := range self.peerConns {
 		conn.requestImmediateReconnect()
-		conn.Cancel()
+		self.retirePeerConnLocked(conn)
 	}
 	self.peerConnectionFactoryLock.Lock()
 	if !self.peerConnectionFactoryClosed {
@@ -1022,24 +1816,81 @@ func (self *WebRtcManager) networkChanged() {
 // peerConnectionAdmissionError identifies a temporary capacity refusal. The
 // stream remains usable over the platform route while the P2P transport waits
 // for a count/budget release instead of polling and rebuilding state.
+type peerConnectionAdmissionReason string
+
+const (
+	peerConnectionAdmissionPriority peerConnectionAdmissionReason = "priority"
+	peerConnectionAdmissionCount    peerConnectionAdmissionReason = "count"
+	peerConnectionAdmissionBudget   peerConnectionAdmissionReason = "budget"
+)
+
 type peerConnectionAdmissionError struct {
-	message string
+	message    string
+	retryAfter time.Duration
+	reason     peerConnectionAdmissionReason
 }
 
 func (self *peerConnectionAdmissionError) Error() string {
 	return self.message
 }
 
-// AdmissionNotify returns notifications for the manager-local connection
-// count and the potentially device-shared byte budget. Capture both before
-// attempting admission so a release cannot be lost between the failed check
-// and the wait.
-func (self *WebRtcManager) AdmissionNotify() (countNotify <-chan struct{}, budgetNotify <-chan struct{}) {
+func (self *WebRtcManager) observeAdmissionRefusal(
+	reason peerConnectionAdmissionReason,
+) (uint64, bool) {
+	var counter *atomic.Uint64
+	switch reason {
+	case peerConnectionAdmissionPriority:
+		counter = &self.admissionPriorityRefusalCount
+	case peerConnectionAdmissionCount:
+		counter = &self.admissionCountRefusalCount
+	case peerConnectionAdmissionBudget:
+		counter = &self.admissionBudgetRefusalCount
+	default:
+		counter = &self.admissionOtherRefusalCount
+	}
+	count := counter.Add(1)
+	return count, count != 0 && count&(count-1) == 0
+}
+
+// AdmissionNotify returns notifications for manager state/count and the byte
+// budget that peerId will actually use. Capture both before attempting
+// admission so a release or Network promotion cannot be lost between the
+// failed check and the wait.
+func (self *WebRtcManager) AdmissionNotify(peerId Id) (countNotify <-chan struct{}, budgetNotify <-chan struct{}) {
 	countNotify = self.capacityMonitor.NotifyChannel()
-	if budget := self.settings.MemoryBudget; budget != nil {
+	self.stateLock.Lock()
+	_, budget, _ := self.peerAdmissionLocked(peerId)
+	self.stateLock.Unlock()
+	if budget != nil {
 		budgetNotify = budget.CapacityNotify()
 	}
 	return
+}
+
+// admissionNotify arms a reusable, threshold-aware budget waiter for the P2P
+// lifecycle. The exported AdmissionNotify retains its broadcast contract for
+// compatibility; the internal path prevents one freed receive window from
+// scheduling every speculative setup.
+func (self *WebRtcManager) admissionNotify(
+	peerId Id,
+	budgetWaiter *transferMemoryBudgetWaiter,
+) (countNotify <-chan struct{}, budgetNotify <-chan struct{}) {
+	countNotify = self.countCapacityNotify
+	self.stateLock.Lock()
+	_, budget, requiredByteCount := self.peerAdmissionLocked(peerId)
+	self.stateLock.Unlock()
+	budgetNotify = budgetWaiter.subscribe(budget, requiredByteCount)
+	return
+}
+
+func (self *WebRtcManager) notifyCountCapacity() {
+	if self.countCapacityNotify == nil {
+		return
+	}
+	select {
+	case self.countCapacityNotify <- struct{}{}:
+	default:
+	}
 }
 
 // SignalReceiver
@@ -1059,6 +1910,15 @@ func (self *WebRtcManager) ReceiveExchangeSignals(source TransferPath, v *protoc
 	if err != nil {
 		return err
 	}
+	var senderGenerationId Id
+	senderGenerationSet := false
+	if len(v.SenderGenerationId) != 0 {
+		senderGenerationId, err = IdFromBytes(v.SenderGenerationId)
+		if err != nil {
+			return err
+		}
+		senderGenerationSet = true
+	}
 	key := peerConnKey{
 		PeerId:   source.SourceId,
 		StreamId: streamId,
@@ -1075,7 +1935,19 @@ func (self *WebRtcManager) ReceiveExchangeSignals(source TransferPath, v *protoc
 	if conn == nil {
 		return nil
 	}
-	if v.ResetSignals && conn.resetRemoteSignals() {
+	resetOffer := false
+	if v.ResetSignals {
+		for _, signal := range v.Signals {
+			if signal != nil && signal.SignalType == protocol.SignalType_SdpOffer {
+				resetOffer = true
+				break
+			}
+		}
+		if !resetOffer {
+			return errors.New("reset_signals requires an SDP offer")
+		}
+	}
+	if resetOffer && conn.resetRemoteSignals(senderGenerationId, senderGenerationSet) {
 		// A fresh active PeerConnection is offering against a passive
 		// association that still looks connected. This is the asymmetric
 		// idle-blackhole case: the active side can observe its unacknowledged
@@ -1087,7 +1959,7 @@ func (self *WebRtcManager) ReceiveExchangeSignals(source TransferPath, v *protoc
 		// offer without another reset.
 		self.log.V(1).Infof("[peerconn]fresh offer replaces negotiated passive %s\n", conn.key)
 		conn.requestImmediateReconnect()
-		conn.cancel()
+		conn.cancelBecause(errors.New("fresh remote offer replaced negotiated passive association"))
 		return nil
 	}
 	var firstCandidateError error
@@ -1098,7 +1970,11 @@ func (self *WebRtcManager) ReceiveExchangeSignals(source TransferPath, v *protoc
 		if self.log.V(2).Enabled() {
 			self.log.Infof("[signal]%s\n", signal.SignalType)
 		}
-		if err := conn.ReceiveSignalFromPeer(signal); err != nil {
+		if err := conn.receiveSignalFromPeer(
+			signal,
+			senderGenerationId,
+			senderGenerationSet,
+		); err != nil {
 			if signal.SignalType == protocol.SignalType_IceCandidate {
 				// One malformed trickle candidate must not suppress every
 				// later candidate in the same bounded batch.
@@ -1128,8 +2004,18 @@ func (self *WebRtcManager) newP2pConn(ctx context.Context, path TransferPath, ac
 	if err = self.ctx.Err(); err != nil {
 		return
 	}
+	var sharedVictim *peerConnectionAdmissionOwner
 	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
+	defer func() {
+		self.stateLock.Unlock()
+		if sharedVictim != nil {
+			sharedVictim.cancelForReclamation()
+		}
+	}()
+	if self.closed {
+		err = os.ErrClosed
+		return
+	}
 	// Stream teardown can race while waiting for another setup to release the
 	// manager lock. Do not allocate Pion state or reserve capacity for work
 	// whose owner has already gone away.
@@ -1147,13 +2033,18 @@ func (self *WebRtcManager) newP2pConn(ctx context.Context, path TransferPath, ac
 	now := time.Now()
 	self.prunePeerPrioritiesLocked(now)
 	priorityUntil, priority := self.prioritizedPeers[key.PeerId]
+	networkPeer := self.usesNetworkPeerAdmissionLocked(key.PeerId)
+	_, replacing := self.peerConns[key]
 
 	// Once trusted Network traffic requests a slot, do not let one of the
-	// wake-all speculative waiters steal the release first. The pending entry
-	// is time-bounded and removed as soon as this peer is admitted.
-	if !priority && 0 < len(self.pendingPrioritizedPeerSlot) {
+	// wake-all speculative waiters steal capacity from the same admission
+	// pool or the last global count slot. Independent public/dedicated pools
+	// continue making progress when count capacity remains.
+	if !priority && self.pendingPriorityBlocksAdmissionLocked(networkPeer, !replacing) {
 		err = &peerConnectionAdmissionError{
-			message: "peer connection waiting for prioritized network peer",
+			message:    "peer connection waiting for prioritized network peer",
+			retryAfter: self.pendingPriorityRetryAfterLocked(now),
+			reason:     peerConnectionAdmissionPriority,
 		}
 		return
 	}
@@ -1162,83 +2053,216 @@ func (self *WebRtcManager) newP2pConn(ctx context.Context, path TransferPath, ac
 	// replaces that connection (the map does not grow), so it is allowed.
 	if maxCount := self.settings.MaxPeerConnectionCount; 0 < maxCount && maxCount <= len(self.peerConns) {
 		if _, ok := self.peerConns[key]; !ok {
-			if priority {
+			if priority && !self.peerConnReleasePendingLocked() {
 				if victim := self.oldestEvictablePeerConnLocked(now); victim != nil {
-					victim.Cancel()
+					self.retirePeerConnLocked(victim)
+				} else {
+					if victim := self.oldestPeerConnLocked(false, now); victim != nil {
+						self.retirePeerConnLocked(victim)
+					}
 				}
+			}
+			if priority {
+				// PrioritizePeer removes pending state when this peer already
+				// owns any live association. A second stream can still hit the
+				// global cap; retain its place after the failed attempt so an
+				// ordinary wake-all waiter cannot steal the released slot.
+				self.markPendingPriorityLocked(key.PeerId, priorityUntil)
 			}
 			err = &peerConnectionAdmissionError{
 				message: fmt.Sprintf("peer connection limit reached (%d)", maxCount),
+				reason:  peerConnectionAdmissionCount,
 			}
 			return
 		}
 	}
 
-	// byte admission against the shared client budget: a peer connection can
-	// queue up to `ReceiveBufferSize`, so each conn owns that reservation for
-	// its lifetime. A new setup is refused when the budget has no headroom
-	// (the stream stays on the platform transport, as at the count cap); a
-	// replacement also needs real headroom. If it cannot coexist briefly with
-	// the old connection, cancel the old one and retry on its release rather
-	// than overdrawing the supposedly fixed memory ceiling.
+	// A trusted network peer uses the larger network-peer SCTP receive window
+	// and its own bounded budget, so that footprint never multiplies across the
+	// many public peers (Fix 1). Authenticated Network identity is remembered
+	// separately from the short priority lease so idle/network-change rebuilds
+	// do not silently fall back to the small public window. The network-peer
+	// path is taken only when both the larger window and its dedicated budget
+	// are provisioned, so an unbudgeted caller safely falls back to public
+	// admission.
+	_, reserveBudget, receiveBufferByteCount :=
+		self.peerAdmissionLocked(key.PeerId)
+
+	// byte admission against the (public or network-peer) budget: a peer
+	// connection can queue up to its receive window, so each conn owns that
+	// reservation for its lifetime. A new setup is refused when the budget has
+	// no headroom (the stream stays on the platform transport, as at the count
+	// cap); a replacement also needs real headroom. If it cannot coexist
+	// briefly with the old connection, cancel the old one and retry on its
+	// release rather than overdrawing the supposedly fixed memory ceiling.
 	var reserveByteCount ByteCount
-	if budget := self.settings.MemoryBudget; budget != nil {
-		reserveByteCount = self.settings.ReceiveBufferSize
-		if !budget.TryReserve(reserveByteCount) {
+	admissionCtx := ctx
+	var admissionOwner *peerConnectionAdmissionOwner
+	if reserveBudget != nil {
+		reserveByteCount = receiveBufferByteCount
+		ownerCtx, ownerCancel := context.WithCancel(ctx)
+		candidateOwner := &peerConnectionAdmissionOwner{
+			peerId:        key.PeerId,
+			createdAt:     now,
+			priorityUntil: priorityUntil,
+			ctx:           ownerCtx,
+			cancel:        ownerCancel,
+		}
+		if !reserveBudget.tryReservePeerConnectionOwner(
+			candidateOwner,
+			reserveByteCount,
+		) {
+			ownerCancel()
+			replacing := self.peerConns[key] != nil
 			if replacedConn := self.peerConns[key]; replacedConn != nil {
-				replacedConn.Cancel()
-			} else if priority {
-				if victim := self.oldestEvictablePeerConnLocked(now); victim != nil {
-					victim.Cancel()
+				// A prior replacement may already be off-map and releasing
+				// this same budget. Preserve the newest keyed generation while
+				// that release is pending instead of turning every retry into
+				// another break-before-make teardown.
+				if !self.peerConnBudgetReleasePendingLocked(reserveBudget) {
+					self.retirePeerConnLocked(replacedConn)
+				}
+			} else if priority && !self.peerConnBudgetReleasePendingLocked(reserveBudget) {
+				if victim := self.oldestPeerConnForAdmissionBudgetLocked(
+					reserveBudget,
+					true,
+					now,
+				); victim != nil {
+					self.retirePeerConnLocked(victim)
+				} else {
+					if victim := self.oldestPeerConnForAdmissionBudgetLocked(
+						reserveBudget,
+						false,
+						now,
+					); victim != nil {
+						self.retirePeerConnLocked(victim)
+					} else {
+						sharedVictim =
+							reserveBudget.claimOldestPeerConnectionOwner(true, now)
+						if sharedVictim == nil {
+							sharedVictim =
+								reserveBudget.claimOldestPeerConnectionOwner(false, now)
+						}
+					}
 				}
 			}
+			samePeerConnectionCount := 0
+			for candidateKey := range self.peerConns {
+				if candidateKey.PeerId == key.PeerId {
+					samePeerConnectionCount += 1
+				}
+			}
+			if priority {
+				// The same multi-stream hole exists for byte admission. Once
+				// the canceled owner releases its reservation, this failed
+				// selected stream must remain ahead of speculative admissions.
+				self.markPendingPriorityLocked(key.PeerId, priorityUntil)
+			}
+			sharedLiveCount, sharedRetiringCount :=
+				reserveBudget.peerConnectionOwnerCounts()
 			err = &peerConnectionAdmissionError{
 				message: fmt.Sprintf(
-					"peer connection memory budget exhausted (used=%d total=%d need=%d)",
-					budget.UsedByteCount(),
-					budget.TotalByteCount(),
+					"peer connection memory budget exhausted (used=%d total=%d need=%d networkPeer=%v live=%d retiring=%d sharedLive=%d sharedRetiring=%d samePeer=%d replacing=%v)",
+					reserveBudget.UsedByteCount(),
+					reserveBudget.TotalByteCount(),
 					reserveByteCount,
+					networkPeer,
+					len(self.peerConns),
+					len(self.retiringPeerConns),
+					sharedLiveCount,
+					sharedRetiringCount,
+					samePeerConnectionCount,
+					replacing,
 				),
+				reason: peerConnectionAdmissionBudget,
 			}
 			return
 		}
+		admissionOwner = candidateOwner
+		admissionCtx = ownerCtx
 	}
 
 	conn, err = newPeerConn(
-		ctx,
+		admissionCtx,
 		key,
 		path.SourceId,
 		active,
 		self.signalSender,
 		self.settings,
-		self.newPeerConnection,
+		func() (*webrtc.PeerConnection, error) {
+			return self.newPeerConnection(networkPeer)
+		},
 	)
 	if err != nil {
-		if 0 < reserveByteCount {
-			self.settings.MemoryBudget.Release(reserveByteCount)
+		if admissionOwner != nil {
+			admissionOwner.release()
+			admissionOwner.cancelForReclamation()
+		} else if 0 < reserveByteCount {
+			reserveBudget.Release(reserveByteCount)
 		}
 		return
 	}
 	conn.priorityUntil = priorityUntil
+	conn.networkPeer = networkPeer
+	conn.admissionBudget = reserveBudget
+	conn.admissionByteCount = reserveByteCount
+	conn.admissionOwner = admissionOwner
+	// Resource teardown is cancellation-driven rather than Run-return-driven.
+	// A synchronous signal send is intentional backpressure and may still be
+	// blocked when a generation is replaced; it cannot be allowed to retain
+	// the old receive-window reservation and prevent the replacement itself.
+	self.peerConnWorkers.Add(1)
 	go HandleError(func() {
-		defer func() {
-			conn.Cancel()
+		defer self.peerConnWorkers.Done()
+		<-conn.ctx.Done()
+		self.stateLock.Lock()
+		self.markPeerConnRetiringLocked(conn)
+		self.stateLock.Unlock()
+		// A defensive panic boundary is required inside the lifecycle worker:
+		// the outer HandleError can recover a library teardown panic, but it
+		// cannot resume the function to release admission ownership.
+		HandleError(conn.teardown)
+		releasedCountCapacity := false
+		if conn.admissionOwner != nil {
+			// The pool-wide owner remains marked retiring while the local maps
+			// are cleared. A concurrent manager therefore still sees the
+			// pending release, while a waiter woken by the subsequent byte
+			// release can never observe stale local retirement state.
 			self.stateLock.Lock()
+			delete(self.retiringPeerConns, conn)
 			if conn == self.peerConns[key] {
 				delete(self.peerConns, key)
+				releasedCountCapacity = true
 			}
 			self.stateLock.Unlock()
-			if 0 < reserveByteCount {
-				self.settings.MemoryBudget.Release(reserveByteCount)
+			conn.admissionOwner.release()
+		} else {
+			if conn.admissionBudget != nil && 0 < conn.admissionByteCount {
+				// Compatibility for lightweight synthetic connections with no
+				// pool-wide owner: release before removing the canceled map
+				// entry so admission still sees a pending local teardown.
+				conn.admissionBudget.Release(conn.admissionByteCount)
 			}
-			self.capacityMonitor.NotifyAll()
-		}()
-		conn.Run()
+			self.stateLock.Lock()
+			delete(self.retiringPeerConns, conn)
+			if conn == self.peerConns[key] {
+				delete(self.peerConns, key)
+				releasedCountCapacity = true
+			}
+			self.stateLock.Unlock()
+		}
+		if releasedCountCapacity {
+			self.notifyCountCapacity()
+		}
+		self.capacityMonitor.NotifyAll()
+	})
+	go HandleError(conn.Run, func(err error) {
+		conn.cancelBecause(fmt.Errorf("peer connection run panic: %w", err))
 	})
 
 	replacedConn := self.peerConns[key]
 	if replacedConn != nil {
-		replacedConn.Cancel()
+		self.retirePeerConnLocked(replacedConn)
 	}
 	self.peerConns[key] = conn
 	delete(self.pendingPrioritizedPeerSlot, key.PeerId)
@@ -1254,16 +2278,73 @@ func (self peerConnKey) String() string {
 	return fmt.Sprintf("s(%s) <>%s", self.StreamId, self.PeerId)
 }
 
+type peerConnectionTeardownStage int32
+
+const (
+	peerConnectionTeardownStarting peerConnectionTeardownStage = iota
+	peerConnectionTeardownStoppingIce
+	peerConnectionTeardownClosingPeer
+	peerConnectionTeardownClosingDataChannel
+	peerConnectionTeardownClearingSignals
+	peerConnectionTeardownComplete
+)
+
+func (self peerConnectionTeardownStage) String() string {
+	switch self {
+	case peerConnectionTeardownStarting:
+		return "starting"
+	case peerConnectionTeardownStoppingIce:
+		return "stopping-ice"
+	case peerConnectionTeardownClosingPeer:
+		return "closing-peer"
+	case peerConnectionTeardownClosingDataChannel:
+		return "closing-data-channel"
+	case peerConnectionTeardownClearingSignals:
+		return "clearing-signals"
+	case peerConnectionTeardownComplete:
+		return "complete"
+	default:
+		return fmt.Sprintf("unknown-%d", self)
+	}
+}
+
+const peerConnectionSlowTeardownTimeout = 5 * time.Second
+
+func startPeerConnectionTeardownWatchdog(
+	timeout time.Duration,
+	stage *atomic.Int32,
+	onStall func(peerConnectionTeardownStage),
+) *time.Timer {
+	return time.AfterFunc(timeout, func() {
+		onStall(peerConnectionTeardownStage(stage.Load()))
+	})
+}
+
 // conforms to WebRtcConn
 type peerConn struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	log    Logger
+	ctx         context.Context
+	cancel      context.CancelFunc
+	cancelCause context.CancelCauseFunc
+	log         Logger
 
 	key       peerConnKey
 	sourceId  Id
 	active    bool
 	createdAt time.Time
+	// networkPeer is immutable after creation. It records which Pion API and
+	// admission pool back this association so a late authenticated Network
+	// promotion can replace a public-window connection exactly once.
+	networkPeer bool
+	// admissionBudget and admissionByteCount are immutable after manager
+	// admission. The pointer is the true resource-domain identity: SDK window
+	// clients intentionally share one budget between public fallback and
+	// Network views even though their labels differ.
+	admissionBudget    *TransferMemoryBudget
+	admissionByteCount ByteCount
+	// admissionOwner makes this fixed reservation visible to every manager
+	// sharing admissionBudget. nil is retained for lightweight tests and
+	// unbudgeted callers.
+	admissionOwner *peerConnectionAdmissionOwner
 	// priorityUntil is protected by WebRtcManager.stateLock. It lets an
 	// explicitly selected Network peer retain bounded P2P admission while
 	// traffic refreshes the priority, without permanently pinning a slot.
@@ -1280,6 +2361,7 @@ type peerConn struct {
 	connectedMonitor   *Monitor
 	connectedDispatch  sync.Once
 	outboundProgress   chan struct{}
+	outboundByteCount  atomic.Uint64
 	progressWatchOnce  sync.Once
 
 	// Closed once when the outer transport should reconnect without honoring
@@ -1288,6 +2370,12 @@ type peerConn struct {
 	// subscription.
 	immediateReconnect     chan struct{}
 	immediateReconnectOnce sync.Once
+	// teardown is driven by context cancellation, independently of Run.
+	// Run can be intentionally backpressured inside SignalSender; that must
+	// not retain Pion sockets, receive-window admission, or blocked data-plane
+	// I/O after this association has been replaced.
+	teardownOnce sync.Once
+	teardownDone chan struct{}
 
 	// Pion's offer/answer state machine is not safe to advance concurrently.
 	// Client signal sharding serializes a peer/stream in production, but this
@@ -1304,6 +2392,13 @@ type peerConn struct {
 	connectedGeneration uint64
 	offer               *protocol.ExchangeSignal
 	answer              *protocol.ExchangeSignal
+	// signalGeneration identifies this PeerConnection generation in every
+	// outbound signal batch. remoteSignalGeneration is learned from a valid
+	// offer/answer and lets WaitingForSdpOffer distinguish delayed startup
+	// signaling from a genuinely replaced passive association.
+	signalGeneration          Id
+	remoteSignalGeneration    Id
+	remoteSignalGenerationSet bool
 
 	// candidates emitted before sdp negotiation completes are buffered
 	// here so they aren't dropped. flushed once iceCandidatesReady is set.
@@ -1315,7 +2410,7 @@ type peerConn struct {
 	// description, so retain a strictly bounded set and apply it immediately
 	// after SDP succeeds instead of silently losing the path.
 	remoteDescriptionSet          bool
-	remoteIceCandidateBuffer      []webrtc.ICECandidateInit
+	remoteIceCandidateBuffer      []remoteIceCandidate
 	remoteIceCandidateBufferBytes int
 	remoteIceCandidateOverflowLog bool
 
@@ -1329,6 +2424,12 @@ const (
 	maxIceCandidatesPerSignalFrame     = 32
 	maxIceCandidateBytesPerSignalFrame = 32 * 1024
 )
+
+type remoteIceCandidate struct {
+	value               webrtc.ICECandidateInit
+	senderGenerationId  Id
+	senderGenerationSet bool
+}
 
 func newPeerConn(
 	ctx context.Context,
@@ -1344,18 +2445,23 @@ func newPeerConn(
 		return nil, err
 	}
 
-	cancelCtx, cancel := context.WithCancel(ctx)
+	cancelCtx, cancelCause := context.WithCancelCause(ctx)
+	cancel := func() {
+		cancelCause(context.Canceled)
+	}
 
 	conn := &peerConn{
-		ctx:          cancelCtx,
-		cancel:       cancel,
-		log:          loggerOrDefault(settings.Log),
-		key:          key,
-		sourceId:     sourceId,
-		active:       active,
-		createdAt:    time.Now(),
-		signalSender: signalSender,
-		settings:     settings,
+		ctx:              cancelCtx,
+		cancel:           cancel,
+		cancelCause:      cancelCause,
+		log:              loggerOrDefault(settings.Log),
+		key:              key,
+		sourceId:         sourceId,
+		active:           active,
+		createdAt:        time.Now(),
+		signalSender:     signalSender,
+		settings:         settings,
+		signalGeneration: NewId(),
 		// api:                api,
 		pc:                 pc,
 		connectedCallbacks: NewCallbackList[*connectedCallback](),
@@ -1363,33 +2469,12 @@ func newPeerConn(
 		connectedMonitor:   NewMonitor(),
 		outboundProgress:   make(chan struct{}, 1),
 		immediateReconnect: make(chan struct{}),
+		teardownDone:       make(chan struct{}),
 	}
 	return conn, nil
 }
 
 func (self *peerConn) Run() {
-	defer func() {
-		self.cancel()
-
-		self.pc.Close()
-		self.connMonitor.NotifyAll()
-		self.connectedMonitor.NotifyAll()
-
-		// drop any candidates that arrived before negotiation completed but
-		// after Run started its early-exit path; they would otherwise be
-		// retained until the peerConn is GC'd
-		func() {
-			self.stateLock.Lock()
-			defer self.stateLock.Unlock()
-			self.iceCandidateBuffer = nil
-		}()
-		func() {
-			self.signalLock.Lock()
-			defer self.signalLock.Unlock()
-			self.remoteIceCandidateBuffer = nil
-			self.remoteIceCandidateBufferBytes = 0
-		}()
-	}()
 	if self.ctx.Err() != nil {
 		return
 	}
@@ -1434,6 +2519,7 @@ func (self *peerConn) Run() {
 			webRtcDataChannelInit(self.settings),
 		)
 		if err != nil {
+			self.cancelBecause(fmt.Errorf("create data channel: %w", err))
 			return
 		}
 
@@ -1462,15 +2548,18 @@ func (self *peerConn) Run() {
 	if self.active {
 		offer, err := self.pc.CreateOffer(nil)
 		if err != nil {
+			self.cancelBecause(fmt.Errorf("create offer: %w", err))
 			return
 		}
 		err = self.pc.SetLocalDescription(offer)
 		if err != nil {
+			self.cancelBecause(fmt.Errorf("set local offer: %w", err))
 			return
 		}
 
 		offerBytes, err := json.Marshal(&offer)
 		if err != nil {
+			self.cancelBecause(fmt.Errorf("encode local offer: %w", err))
 			return
 		}
 
@@ -1485,15 +2574,139 @@ func (self *peerConn) Run() {
 		// generation from an ordinary duplicate/replay of our cached offer.
 		self.sendSignalsWithReset([]*protocol.ExchangeSignal{signal}, true)
 	} else {
-		signal := &protocol.ExchangeSignal{
-			SignalType: protocol.SignalType_WaitingForSdpOffer,
+		// Signal receive can legitimately win the scheduler race and process an
+		// offer before this Run goroutine starts. Avoid the now-redundant
+		// startup frame in that common case. A remaining check/send race is
+		// harmless because the generation marker lets the active peer identify
+		// it as belonging to the answer it already accepted.
+		self.signalLock.Lock()
+		shouldSendWaiting := self.offerSignal() == nil
+		self.signalLock.Unlock()
+		if shouldSendWaiting {
+			signal := &protocol.ExchangeSignal{
+				SignalType: protocol.SignalType_WaitingForSdpOffer,
+			}
+			self.sendSignal(signal)
 		}
-		self.sendSignal(signal)
 	}
 
 	select {
 	case <-self.ctx.Done():
 	}
+}
+
+// teardown releases resources owned by the peer generation. It deliberately
+// does not wait for Run: SignalSender is synchronous intentional backpressure,
+// so a canceled generation can still be returning from that callback. Closing
+// the Pion stack is safe in parallel; Run observes its canceled context and
+// exits without reusing the retired generation once the callback returns.
+func (self *peerConn) teardown() {
+	self.teardownOnce.Do(func() {
+		if self.teardownDone != nil {
+			defer close(self.teardownDone)
+		}
+		var teardownStage atomic.Int32
+		teardownStage.Store(int32(peerConnectionTeardownStarting))
+		slowTeardownTimer := startPeerConnectionTeardownWatchdog(
+			peerConnectionSlowTeardownTimeout,
+			&teardownStage,
+			func(stage peerConnectionTeardownStage) {
+				loggerOrDefault(self.log).Infof(
+					"[peerconn]teardown stalled for %s at %s %s\n",
+					peerConnectionSlowTeardownTimeout,
+					stage,
+					self.key,
+				)
+			},
+		)
+		defer slowTeardownTimer.Stop()
+		self.cancel()
+
+		// Break the physical path before PeerConnection.Close starts its normal
+		// SCTP-first shutdown. Pion's SCTP Abort waits for its read loop after
+		// setting a deadline on the DTLS-backed net.Conn. On physical Android
+		// that wait was observed stranded for hours after an idle peer vanished:
+		// peerConns was empty while both make-before-break receive-window
+		// reservations remained charged. Every later same-peer setup was then
+		// refused by the full fixed budget. Stopping ICE first closes the
+		// underlying packet path, which deterministically releases the
+		// DTLS/SCTP read stack before Close performs its idempotent component
+		// cleanup. This is an abrupt cancellation path, not graceful shutdown.
+		if self.pc != nil {
+			stopTransport := webRtcPeerConnectionTransportStop(self.pc)
+			if err := closeTransportBeforePeerConnection(
+				func() error {
+					teardownStage.Store(int32(peerConnectionTeardownStoppingIce))
+					if stopTransport == nil {
+						return nil
+					}
+					return stopTransport()
+				},
+				func() error {
+					teardownStage.Store(int32(peerConnectionTeardownClosingPeer))
+					return self.pc.Close()
+				},
+			); err != nil &&
+				self.log.V(1).Enabled() {
+				self.log.Infof("[peerconn]close err = %s\n", err)
+			}
+		}
+
+		teardownStage.Store(int32(peerConnectionTeardownClosingDataChannel))
+		var conn datachannel.ReadWriteCloserDeadliner
+		self.stateLock.Lock()
+		conn = self.conn
+		self.conn = nil
+		self.iceCandidateBuffer = nil
+		self.stateLock.Unlock()
+		if conn != nil {
+			_ = conn.SetReadDeadline(time.Now())
+			_ = conn.SetWriteDeadline(time.Now())
+			if err := conn.Close(); err != nil && self.log.V(1).Enabled() {
+				self.log.Infof("[peerconn]detached data channel close err = %s\n", err)
+			}
+		}
+
+		teardownStage.Store(int32(peerConnectionTeardownClearingSignals))
+		self.signalLock.Lock()
+		self.remoteIceCandidateBuffer = nil
+		self.remoteIceCandidateBufferBytes = 0
+		self.signalLock.Unlock()
+
+		self.connMonitor.NotifyAll()
+		self.connectedMonitor.NotifyAll()
+		teardownStage.Store(int32(peerConnectionTeardownComplete))
+	})
+}
+
+// closeTransportBeforePeerConnection is kept independent of Pion so the
+// ordering and error behavior of the physical-stall fix are deterministic in
+// tests. Both operations are attempted: a transport-stop error must not skip
+// PeerConnection cleanup.
+func closeTransportBeforePeerConnection(
+	stopTransport func() error,
+	closePeerConnection func() error,
+) error {
+	var errs []error
+	if stopTransport != nil {
+		if err := stopTransport(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if closePeerConnection != nil {
+		if err := closePeerConnection(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func closeWebRtcPeerConnection(pc *webrtc.PeerConnection) error {
+	if pc == nil {
+		return nil
+	}
+	stopTransport := webRtcPeerConnectionTransportStop(pc)
+	return closeTransportBeforePeerConnection(stopTransport, pc.Close)
 }
 
 func (self *peerConn) startConnectedDispatch() {
@@ -1539,7 +2752,7 @@ func (self *peerConn) handleICEConnectionState(state webrtc.ICEConnectionState) 
 		// disappears but its peer slot/reservation and outer setup loop can
 		// remain stranded forever.
 		if self.ctx.Err() == nil {
-			self.cancel()
+			self.cancelBecause(fmt.Errorf("ICE connection state %s", state))
 		}
 	}
 }
@@ -1551,24 +2764,36 @@ func (self *peerConn) handlePeerConnectionState(state webrtc.PeerConnectionState
 		// connected. Cancellation is idempotent with ICE and manager/network
 		// change teardown.
 		if self.ctx.Err() == nil {
-			self.cancel()
+			self.cancelBecause(fmt.Errorf("peer connection state %s", state))
 		}
 	}
 }
 
 func (self *peerConn) ReceiveSignalFromPeer(signal *protocol.ExchangeSignal) error {
+	return self.receiveSignalFromPeer(signal, Id{}, false)
+}
+
+func (self *peerConn) receiveSignalFromPeer(
+	signal *protocol.ExchangeSignal,
+	senderGenerationId Id,
+	senderGenerationSet bool,
+) error {
 	if signal == nil {
 		return nil
 	}
 
 	self.signalLock.Lock()
-	toSend, flushLocalCandidates, immediateReconnect, fatal, err := self.receiveSignalFromPeerLocked(signal)
+	toSend, flushLocalCandidates, immediateReconnect, fatal, err := self.receiveSignalFromPeerLocked(
+		signal,
+		senderGenerationId,
+		senderGenerationSet,
+	)
 	self.signalLock.Unlock()
 
 	if err != nil {
 		if fatal {
 			self.requestImmediateReconnect()
-			self.cancel()
+			self.cancelBecause(fmt.Errorf("fatal remote signal: %w", err))
 		}
 		return err
 	}
@@ -1584,7 +2809,7 @@ func (self *peerConn) ReceiveSignalFromPeer(signal *protocol.ExchangeSignal) err
 	if immediateReconnect {
 		self.log.V(1).Infof("[peerconn]waiting-for-offer after answer; requesting immediate reconnect\n")
 		self.requestImmediateReconnect()
-		self.cancel()
+		self.cancelBecause(errors.New("remote peer requested a fresh offer"))
 	}
 	return nil
 }
@@ -1594,7 +2819,10 @@ func (self *peerConn) ReceiveSignalFromPeer(signal *protocol.ExchangeSignal) err
 // must be replaced rather than mutated in place. Pion does not support
 // rewinding an established offer/answer/ICE/DTLS/SCTP stack to a pristine
 // generation.
-func (self *peerConn) resetRemoteSignals() bool {
+func (self *peerConn) resetRemoteSignals(
+	senderGenerationId Id,
+	senderGenerationSet bool,
+) bool {
 	self.signalLock.Lock()
 	defer self.signalLock.Unlock()
 
@@ -1602,6 +2830,15 @@ func (self *peerConn) resetRemoteSignals() bool {
 		return false
 	}
 	if self.offerSignal() != nil {
+		if senderGenerationSet &&
+			self.remoteSignalGenerationSet &&
+			senderGenerationId == self.remoteSignalGeneration {
+			// Transfer signaling is reliable and may retransmit the first
+			// reset-marked offer before its ACK. It is a duplicate of the
+			// accepted generation, not permission to destroy and recreate the
+			// passive association.
+			return false
+		}
 		return true
 	}
 	// A fresh passive connection can accept the reset's offer directly, but
@@ -1615,6 +2852,8 @@ func (self *peerConn) resetRemoteSignals() bool {
 
 func (self *peerConn) receiveSignalFromPeerLocked(
 	signal *protocol.ExchangeSignal,
+	senderGenerationId Id,
+	senderGenerationSet bool,
 ) (
 	toSend []*protocol.ExchangeSignal,
 	flushLocalCandidates bool,
@@ -1641,6 +2880,8 @@ func (self *peerConn) receiveSignalFromPeerLocked(
 			return
 		}
 		self.setOfferSignal(signal)
+		self.remoteSignalGeneration = senderGenerationId
+		self.remoteSignalGenerationSet = senderGenerationSet
 		self.remoteDescriptionSet = true
 		self.flushRemoteIceCandidatesLocked()
 
@@ -1685,6 +2926,8 @@ func (self *peerConn) receiveSignalFromPeerLocked(
 			return
 		}
 		self.setAnswerSignal(signal)
+		self.remoteSignalGeneration = senderGenerationId
+		self.remoteSignalGenerationSet = senderGenerationSet
 		self.remoteDescriptionSet = true
 		self.flushRemoteIceCandidatesLocked()
 		flushLocalCandidates = true
@@ -1695,7 +2938,20 @@ func (self *peerConn) receiveSignalFromPeerLocked(
 			return
 		}
 		if !self.remoteDescriptionSet {
-			self.bufferRemoteIceCandidateLocked(candidate)
+			self.bufferRemoteIceCandidateLocked(
+				candidate,
+				senderGenerationId,
+				senderGenerationSet,
+			)
+			return
+		}
+		if self.remoteSignalGenerationSet &&
+			senderGenerationSet &&
+			senderGenerationId != self.remoteSignalGeneration {
+			// A replacement peer can reuse the same stream key while delayed
+			// candidate batches from the retired generation are still in the
+			// transfer queue. Applying their ICE credentials/addresses to the
+			// new agent creates useless pairs and can prevent prompt setup.
 			return
 		}
 		self.addRemoteIceCandidateLocked(candidate)
@@ -1709,6 +2965,15 @@ func (self *peerConn) receiveSignalFromPeerLocked(
 			if signal := self.offerSignal(); signal != nil {
 				toSend = []*protocol.ExchangeSignal{signal}
 			}
+		} else if senderGenerationSet &&
+			self.remoteSignalGenerationSet &&
+			senderGenerationId == self.remoteSignalGeneration {
+			// The passive Run goroutine can be scheduled after its signal
+			// receiver has already processed our offer and sent an answer.
+			// Its delayed initial WaitingForSdpOffer is from the same remote
+			// generation, not a restart. Network delivery can reorder these
+			// messages too, so generation identity—not timing—is the safe
+			// discriminator.
 		} else {
 			// peer is asking for a fresh offer despite our prior answer.
 			// they likely restarted; signal the outer transport to reconnect
@@ -1731,7 +2996,11 @@ func iceCandidateInitByteCount(candidate webrtc.ICECandidateInit) int {
 }
 
 // signalLock must be held.
-func (self *peerConn) bufferRemoteIceCandidateLocked(candidate webrtc.ICECandidateInit) {
+func (self *peerConn) bufferRemoteIceCandidateLocked(
+	candidate webrtc.ICECandidateInit,
+	senderGenerationId Id,
+	senderGenerationSet bool,
+) {
 	byteCount := iceCandidateInitByteCount(candidate)
 	if maxBufferedRemoteIceCandidateCount <= len(self.remoteIceCandidateBuffer) ||
 		maxBufferedRemoteIceCandidateBytes < self.remoteIceCandidateBufferBytes+byteCount {
@@ -1745,7 +3014,11 @@ func (self *peerConn) bufferRemoteIceCandidateLocked(candidate webrtc.ICECandida
 		}
 		return
 	}
-	self.remoteIceCandidateBuffer = append(self.remoteIceCandidateBuffer, candidate)
+	self.remoteIceCandidateBuffer = append(self.remoteIceCandidateBuffer, remoteIceCandidate{
+		value:               candidate,
+		senderGenerationId:  senderGenerationId,
+		senderGenerationSet: senderGenerationSet,
+	})
 	self.remoteIceCandidateBufferBytes += byteCount
 }
 
@@ -1765,7 +3038,12 @@ func (self *peerConn) flushRemoteIceCandidatesLocked() {
 	self.remoteIceCandidateBuffer = nil
 	self.remoteIceCandidateBufferBytes = 0
 	for _, candidate := range candidates {
-		self.addRemoteIceCandidateLocked(candidate)
+		if self.remoteSignalGenerationSet &&
+			candidate.senderGenerationSet &&
+			candidate.senderGenerationId != self.remoteSignalGeneration {
+			continue
+		}
+		self.addRemoteIceCandidateLocked(candidate.value)
 	}
 }
 
@@ -1903,13 +3181,16 @@ type connectedCallback struct {
 	callback       func(bool)
 	lastGeneration uint64
 	delivered      bool
-	closed         bool
+	closed         atomic.Bool
 }
 
 func (self *connectedCallback) deliver(generation uint64, connected bool) {
+	if self.closed.Load() {
+		return
+	}
 	self.lock.Lock()
 	defer self.lock.Unlock()
-	if self.closed || (self.delivered && generation <= self.lastGeneration) {
+	if self.closed.Load() || (self.delivered && generation <= self.lastGeneration) {
 		return
 	}
 	self.delivered = true
@@ -1920,9 +3201,11 @@ func (self *connectedCallback) deliver(generation uint64, connected bool) {
 }
 
 func (self *connectedCallback) close() {
-	self.lock.Lock()
-	self.closed = true
-	self.lock.Unlock()
+	// Unsubscribe must not wait on arbitrary callback work. In particular a
+	// callback is allowed to unsubscribe itself, and teardown must still make
+	// progress if a route observer is parked. A delivery already in progress
+	// may finish; every later generation observes closed and is dropped.
+	self.closed.Store(true)
 }
 
 func (self *peerConn) setOfferSignal(offer *protocol.ExchangeSignal) bool {
@@ -1970,9 +3253,10 @@ func (self *peerConn) sendSignalsWithReset(signalValues []*protocol.ExchangeSign
 		return
 	}
 	signals := &protocol.ExchangeSignals{
-		StreamId:     self.key.StreamId.Bytes(),
-		ResetSignals: resetSignals,
-		Signals:      signalValues,
+		StreamId:           self.key.StreamId.Bytes(),
+		ResetSignals:       resetSignals,
+		Signals:            signalValues,
+		SenderGenerationId: self.signalGeneration.Bytes(),
 	}
 	// passive peers send signals in the return direction of the stream,
 	// so they ask for a companion contract (verified as
@@ -1997,6 +3281,13 @@ func (self *peerConn) sendSignalsWithReset(signalValues []*protocol.ExchangeSign
 	} else {
 		opts = append(opts, CompanionContract())
 	}
+	// A full transfer send queue is intentional backpressure while this peer
+	// generation is live. Bind that wait to the generation, not the entire
+	// client: replacement/cancellation must release an obsolete offer or ICE
+	// candidate instead of pinning its Run goroutine and admission forever.
+	if self.ctx != nil {
+		opts = append(opts, Ctx(self.ctx))
+	}
 	self.signalSender.SendSignal(
 		DestinationId(self.key.PeerId).AddSource(self.sourceId),
 		RequireToFrameWithDefaultProtocolVersion(signals),
@@ -2008,7 +3299,7 @@ func (self *peerConn) handleOpenDataChannel(dc *webrtc.DataChannel) {
 	if err := self.setOpenDataChannel(dc); err != nil {
 		self.log.V(1).Infof("[peerconn]data channel detach err = %s\n", err)
 		self.requestImmediateReconnect()
-		self.cancel()
+		self.cancelBecause(fmt.Errorf("data channel detach: %w", err))
 	}
 }
 
@@ -2100,6 +3391,38 @@ func (self *peerConn) noteOutboundSctpActivity() {
 	}
 }
 
+// acknowledgedSctpByteCount derives definite forward progress from accepted
+// user bytes and Pion's pending+in-flight byte count. Reverse packet traffic is
+// deliberately absent: heartbeats or unrelated inbound DATA can continue on a
+// half-open association without acknowledging the outbound queue.
+func acknowledgedSctpByteCount(outboundByteCount uint64, bufferedAmount int) uint64 {
+	if bufferedAmount <= 0 {
+		return outboundByteCount
+	}
+	bufferedByteCount := uint64(bufferedAmount)
+	if outboundByteCount <= bufferedByteCount {
+		return 0
+	}
+	return outboundByteCount - bufferedByteCount
+}
+
+func observeAcknowledgedSctpByteCount(
+	previousAcknowledgedByteCount uint64,
+	outboundByteCount uint64,
+	bufferedAmount int,
+) (acknowledgedByteCount uint64, progressed bool) {
+	acknowledgedByteCount = acknowledgedSctpByteCount(
+		outboundByteCount,
+		bufferedAmount,
+	)
+	if previousAcknowledgedByteCount < acknowledgedByteCount {
+		return acknowledgedByteCount, true
+	}
+	// Accepted writes and aggregate queue observations can race. Definite
+	// acknowledgement is monotonic, so never move the observation backward.
+	return previousAcknowledgedByteCount, false
+}
+
 // runSctpProgressWatchdog closes a half-open data plane that ICE consent
 // cannot see. Pion's reliable SCTP association retries indefinitely; if the
 // remote SCTP endpoint disappears while its ICE agent/socket still answers,
@@ -2109,9 +3432,12 @@ func (self *peerConn) noteOutboundSctpActivity() {
 // The worker starts only after the first successful application write. It has
 // no idle ticker: while the SCTP buffered amount is zero it waits on the
 // coalescing outbound-activity channel.
-// With data outstanding, any reverse SCTP packet (normally a SACK) refreshes
-// the deadline. This observes transport progress without putting a timeout
-// around intentional transfer callback backpressure.
+// With data outstanding, only a decrease in pending+in-flight user bytes
+// refreshes the deadline. Counting arbitrary reverse SCTP packets lets
+// heartbeats or unrelated inbound DATA mask a permanently unacknowledged send.
+// A zero peer receive window pauses the deadline because it is the transport
+// representation of intentional receiver callback backpressure. This observes
+// transport failure without putting a timeout around that backpressure.
 func (self *peerConn) runSctpProgressWatchdog() {
 	timeout := self.settings.SctpNoProgressTimeout
 	sampleInterval := min(250*time.Millisecond, timeout/4)
@@ -2132,21 +3458,70 @@ func (self *peerConn) runSctpProgressWatchdog() {
 		case <-self.outboundProgress:
 		}
 
-		bufferedAmount, lastReceived, ok := webRtcSctpProgress(self.pc)
+		bufferedAmount, ok := webRtcSctpBufferedAmount(self.pc)
 		if !ok {
 			continue
 		}
+		acknowledgedByteCount := acknowledgedSctpByteCount(
+			self.outboundByteCount.Load(),
+			bufferedAmount,
+		)
 		lastProgress := time.Now()
 		for 0 < bufferedAmount {
 			remaining := timeout - time.Since(lastProgress)
 			if remaining <= 0 {
-				self.log.Infof(
-					"[peerconn]SCTP no progress for %s with %d bytes buffered; reconnecting\n",
+				// The timer is deliberately based on the last observed ACK,
+				// but the buffered amount above came from the preceding
+				// sample. Take one current sample before declaring failure.
+				// Otherwise an ACK in the final sampling interval—or while
+				// this goroutine was descheduled—can be ignored and a healthy
+				// association torn down from stale queue state.
+				bufferedAmount, ok = webRtcSctpBufferedAmount(self.pc)
+				if !ok {
+					break
+				}
+				nextAcknowledgedByteCount, progressed :=
+					observeAcknowledgedSctpByteCount(
+						acknowledgedByteCount,
+						self.outboundByteCount.Load(),
+						bufferedAmount,
+					)
+				if progressed {
+					acknowledgedByteCount = nextAcknowledgedByteCount
+					lastProgress = time.Now()
+					continue
+				}
+				if bufferedAmount <= 0 {
+					break
+				}
+				receiverWindow, receiverWindowOk :=
+					webRtcSctpReceiverWindow(self.pc)
+				if receiverWindowOk && receiverWindow == 0 {
+					// The remote SCTP stack is alive and explicitly asking us
+					// to stop because its bounded receive queue is full.
+					// Treating this as a blackhole would turn an intentionally
+					// stalled transfer callback into connection churn and data
+					// replay. This slower stats query runs only at the timeout
+					// boundary, not on every progress sample.
+					lastProgress = time.Now()
+					continue
+				}
+				noProgressErr := fmt.Errorf(
+					"SCTP no progress for %s with %d bytes buffered and rwnd=%d",
 					timeout,
 					bufferedAmount,
+					receiverWindow,
+				)
+				self.log.Infof(
+					"[peerconn]%s %s; reconnecting\n",
+					noProgressErr,
+					self.key,
 				)
 				self.requestImmediateReconnect()
-				self.cancel()
+				// Use the common failure boundary so the exact cause survives
+				// cancellation and shared admission sees this owner retiring
+				// synchronously, before the teardown worker is scheduled.
+				self.cancelBecause(noProgressErr)
 				return
 			}
 
@@ -2158,13 +3533,18 @@ func (self *peerConn) runSctpProgressWatchdog() {
 			case <-sampleC:
 			}
 
-			var received uint64
-			bufferedAmount, received, ok = webRtcSctpProgress(self.pc)
+			bufferedAmount, ok = webRtcSctpBufferedAmount(self.pc)
 			if !ok {
 				break
 			}
-			if received != lastReceived {
-				lastReceived = received
+			nextAcknowledgedByteCount, progressed :=
+				observeAcknowledgedSctpByteCount(
+					acknowledgedByteCount,
+					self.outboundByteCount.Load(),
+					bufferedAmount,
+				)
+			if progressed {
+				acknowledgedByteCount = nextAcknowledgedByteCount
 				lastProgress = time.Now()
 			}
 		}
@@ -2186,6 +3566,7 @@ func (self *peerConn) Write(b []byte) (n int, err error) {
 	c.SetWriteDeadline(deadline)
 	n, err = c.Write(b)
 	if 0 < n {
+		self.outboundByteCount.Add(uint64(n))
 		self.noteOutboundSctpActivity()
 	}
 	return
@@ -2262,12 +3643,26 @@ func (self *peerConn) SetWriteDeadline(t time.Time) error {
 }
 
 func (self *peerConn) Close() error {
-	self.cancel()
+	self.cancelBecause(errors.New("local peer connection close"))
 	return nil
 }
 
 func (self *peerConn) Cancel() {
-	self.cancel()
+	self.cancelBecause(errors.New("manager peer connection cancel"))
+}
+
+func (self *peerConn) cancelBecause(err error) {
+	if err == nil {
+		err = context.Canceled
+	}
+	self.admissionOwner.markRetiring()
+	if self.cancelCause != nil {
+		self.cancelCause(err)
+	} else if self.cancel != nil {
+		// Compatibility for lightweight test/fake peerConn values that only
+		// install the historical CancelFunc.
+		self.cancel()
+	}
 }
 
 // conforms to `net.Addr`

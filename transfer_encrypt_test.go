@@ -63,10 +63,14 @@ func newTestSessionForIdentityProof(t *testing.T) (
 	// goroutines / real tls.Conn) so the identity-proof gate can be
 	// exercised in isolation. `startEpoch` is a no-op while an epoch is
 	// present, so the production paths under test reuse this one.
+	epochCtx, epochCancel := context.WithCancel(ctx)
 	sess.epoch = &tlsHandshakeEpoch{
-		handshakeDone:    make(chan struct{}),
-		tlsExporter:      exporter,
-		derivedTlsCipher: &sequenceCipher{}, // non-nil sentinel; never used for crypto in these tests
+		ctx:               epochCtx,
+		cancel:            epochCancel,
+		handshakeDone:     make(chan struct{}),
+		establishmentDone: make(chan struct{}),
+		tlsExporter:       exporter,
+		derivedTlsCipher:  &sequenceCipher{}, // non-nil sentinel; never used for crypto in these tests
 	}
 
 	_, peerPriv, err = ed25519.GenerateKey(rand.Reader)
@@ -483,11 +487,447 @@ func TestHandshakeEpochResetReplacesEpoch(t *testing.T) {
 	}
 }
 
-// TestSendAcquireReusesAnyExistingEpoch verifies the root-cause fix for
-// post-handshake EncryptedControl churn: a SendSequence (AcquireForSend)
-// reuses whatever epoch already exists — established, in-flight, or even
-// failed — and never resets a live session. Only an absent epoch is built.
-func TestSendAcquireReusesAnyExistingEpoch(t *testing.T) {
+func TestHandshakeFailureCancelsEpochWorkers(t *testing.T) {
+	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleClient)
+	defer cleanup()
+
+	e := injectTestEpoch(sess, false, nil)
+	e.establishmentDone = make(chan struct{})
+	sess.completeHandshake(e, errors.New("synthetic handshake failure"))
+
+	select {
+	case <-e.ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("failed handshake left its epoch workers running")
+	}
+	select {
+	case <-e.establishmentDone:
+	default:
+		t.Fatal("failed handshake did not finish the establishment lifetime")
+	}
+}
+
+func TestFailedClientEpochRestartsImmediatelyWhenInitialCooldownDisabled(t *testing.T) {
+	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleClient)
+	defer cleanup()
+	sess.settings.TlsInitialRetryInterval = 0
+
+	failed := injectTestEpoch(sess, true, errors.New("transient route failure"))
+	failed.establishmentDone = make(chan struct{})
+	close(failed.establishmentDone)
+	sess.restartHandshake()
+
+	replacement := sess.currentEpoch()
+	if replacement == nil || replacement == failed {
+		t.Fatal("client send acquisition reused a failed epoch instead of retrying")
+	}
+	select {
+	case <-failed.ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("failed epoch was not canceled when its replacement started")
+	}
+}
+
+func TestTlsInitialRetryIntervalIsExponentialAndBounded(t *testing.T) {
+	testCases := []struct {
+		initialRetryInterval time.Duration
+		maxRetryInterval     time.Duration
+		failureCount         int
+		expectedInterval     time.Duration
+	}{
+		{
+			initialRetryInterval: 0,
+			maxRetryInterval:     5 * time.Minute,
+			failureCount:         1,
+			expectedInterval:     0,
+		},
+		{
+			initialRetryInterval: time.Minute,
+			maxRetryInterval:     5 * time.Minute,
+			failureCount:         1,
+			expectedInterval:     time.Minute,
+		},
+		{
+			initialRetryInterval: time.Minute,
+			maxRetryInterval:     5 * time.Minute,
+			failureCount:         2,
+			expectedInterval:     2 * time.Minute,
+		},
+		{
+			initialRetryInterval: time.Minute,
+			maxRetryInterval:     5 * time.Minute,
+			failureCount:         3,
+			expectedInterval:     4 * time.Minute,
+		},
+		{
+			initialRetryInterval: time.Minute,
+			maxRetryInterval:     5 * time.Minute,
+			failureCount:         4,
+			expectedInterval:     5 * time.Minute,
+		},
+		{
+			initialRetryInterval: 2 * time.Minute,
+			maxRetryInterval:     time.Minute,
+			failureCount:         4,
+			expectedInterval:     2 * time.Minute,
+		},
+		{
+			initialRetryInterval: time.Duration(1<<62) + 1,
+			maxRetryInterval:     time.Duration(1<<63 - 1),
+			failureCount:         2,
+			expectedInterval:     time.Duration(1<<63 - 1),
+		},
+	}
+
+	for _, testCase := range testCases {
+		actualInterval := tlsInitialRetryInterval(
+			testCase.initialRetryInterval,
+			testCase.maxRetryInterval,
+			testCase.failureCount,
+		)
+		if actualInterval != testCase.expectedInterval {
+			t.Errorf(
+				"tlsInitialRetryInterval(%s, %s, %d) = %s, expected %s",
+				testCase.initialRetryInterval,
+				testCase.maxRetryInterval,
+				testCase.failureCount,
+				actualInterval,
+				testCase.expectedInterval,
+			)
+		}
+	}
+}
+
+func TestDefaultEncryptionSettingsBoundInitialRetry(t *testing.T) {
+	settings := DefaultEncryptionSettings()
+	if settings.TlsInitialRetryInterval <= 0 {
+		t.Fatal("default initial TLS retry cooldown is disabled")
+	}
+	if settings.TlsInitialRetryStagger <= 0 {
+		t.Fatal("default initial TLS retry staggering is disabled")
+	}
+	if settings.TlsInitialRetryMaxInterval <
+		settings.TlsInitialRetryInterval {
+		t.Fatalf(
+			"default maximum TLS retry interval %s is below initial %s",
+			settings.TlsInitialRetryMaxInterval,
+			settings.TlsInitialRetryInterval,
+		)
+	}
+}
+
+func TestTlsInitialRetryDelayIsDeterministicStaggeredAndBounded(t *testing.T) {
+	var firstPeerId Id
+	firstPeerId[len(firstPeerId)-1] = 1
+	var secondPeerId Id
+	secondPeerId[len(secondPeerId)-1] = 2
+
+	firstDelay := tlsInitialRetryDelay(
+		firstPeerId,
+		time.Minute,
+		5*time.Minute,
+		time.Minute,
+		1,
+	)
+	repeatedDelay := tlsInitialRetryDelay(
+		firstPeerId,
+		time.Minute,
+		5*time.Minute,
+		time.Minute,
+		1,
+	)
+	secondDelay := tlsInitialRetryDelay(
+		secondPeerId,
+		time.Minute,
+		5*time.Minute,
+		time.Minute,
+		1,
+	)
+
+	if firstDelay != repeatedDelay {
+		t.Fatalf(
+			"stable peer retry delay changed from %s to %s",
+			firstDelay,
+			repeatedDelay,
+		)
+	}
+	if firstDelay < time.Minute || 2*time.Minute <= firstDelay {
+		t.Fatalf("first retry delay %s is outside [1m, 2m)", firstDelay)
+	}
+	if secondDelay < time.Minute || 2*time.Minute <= secondDelay {
+		t.Fatalf("second retry delay %s is outside [1m, 2m)", secondDelay)
+	}
+	if firstDelay == secondDelay {
+		t.Fatalf("distinct peers received the same retry phase %s", firstDelay)
+	}
+
+	maxDelay := tlsInitialRetryDelay(
+		firstPeerId,
+		time.Minute,
+		5*time.Minute,
+		time.Minute,
+		63,
+	)
+	if maxDelay != 5*time.Minute {
+		t.Fatalf("maximum retry delay = %s, expected 5m", maxDelay)
+	}
+}
+
+func TestFailedClientEpochWaitsForInitialRetryCooldown(t *testing.T) {
+	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleClient)
+	defer cleanup()
+	sess.settings.TlsInitialRetryInterval = time.Hour
+	sess.settings.TlsInitialRetryMaxInterval = time.Hour
+
+	failed := injectTestEpoch(sess, false, nil)
+	failed.establishmentDone = make(chan struct{})
+	sess.completeHandshake(failed, errors.New("unreachable peer"))
+	sess.restartHandshake()
+
+	if sess.currentEpoch() != failed {
+		t.Fatal("failed initial epoch retried before its cooldown expired")
+	}
+}
+
+func TestFailedClientEpochRestartsAfterInitialRetryCooldown(t *testing.T) {
+	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleClient)
+	defer cleanup()
+	sess.settings.TlsInitialRetryInterval = time.Hour
+	sess.settings.TlsInitialRetryMaxInterval = time.Hour
+
+	failed := injectTestEpoch(sess, false, nil)
+	failed.establishmentDone = make(chan struct{})
+	sess.completeHandshake(failed, errors.New("unreachable peer"))
+	sess.stateLock.Lock()
+	sess.nextInitialHandshakeRetryTime = time.Now().Add(-time.Second)
+	sess.stateLock.Unlock()
+	sess.restartHandshake()
+
+	replacement := sess.currentEpoch()
+	if replacement == nil || replacement == failed {
+		t.Fatal("failed initial epoch did not retry after its cooldown expired")
+	}
+}
+
+func TestEstablishedClientEpochRecoveryBypassesInitialRetryCooldown(t *testing.T) {
+	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleClient)
+	defer cleanup()
+
+	established := injectEstablishedTestEpoch(sess)
+	sess.stateLock.Lock()
+	sess.initialHandshakeFailureCount = 3
+	sess.nextInitialHandshakeRetryTime = time.Now().Add(time.Hour)
+	sess.stateLock.Unlock()
+	sess.restartHandshake()
+
+	if sess.currentEpoch() == established {
+		t.Fatal("established session recovery was delayed by initial cooldown")
+	}
+	if sess.establishedEpoch != established {
+		t.Fatal("established cipher was not retained during recovery")
+	}
+}
+
+func TestEstablishedEpochClearsInitialRetryCooldown(t *testing.T) {
+	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleClient)
+	defer cleanup()
+
+	established := injectTestEpoch(sess, true, nil)
+	sess.stateLock.Lock()
+	sess.initialHandshakeFailureCount = 3
+	sess.nextInitialHandshakeRetryTime = time.Now().Add(time.Hour)
+	sess.markEstablishedWithLock(established)
+	failureCount := sess.initialHandshakeFailureCount
+	nextRetryTime := sess.nextInitialHandshakeRetryTime
+	sess.stateLock.Unlock()
+
+	if failureCount != 0 {
+		t.Fatalf("establishment retained failure count %d", failureCount)
+	}
+	if !nextRetryTime.IsZero() {
+		t.Fatalf("establishment retained retry deadline %s", nextRetryTime)
+	}
+}
+
+func TestEstablishmentFailureLoggingCoalescesUntilRecovery(t *testing.T) {
+	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleClient)
+	defer cleanup()
+
+	established := injectTestEpoch(sess, true, nil)
+	sess.stateLock.Lock()
+	firstFailure := sess.shouldLogEstablishmentFailureWithLock("timeout")
+	repeatedFailure := sess.shouldLogEstablishmentFailureWithLock("timeout")
+	differentFailure := sess.shouldLogEstablishmentFailureWithLock("identity")
+	sess.markEstablishedWithLock(established)
+	afterRecovery := sess.shouldLogEstablishmentFailureWithLock("timeout")
+	sess.stateLock.Unlock()
+
+	if !firstFailure {
+		t.Fatal("first establishment failure was suppressed")
+	}
+	if repeatedFailure {
+		t.Fatal("repeated establishment failure was not coalesced")
+	}
+	if !differentFailure {
+		t.Fatal("different establishment failure was suppressed")
+	}
+	if !afterRecovery {
+		t.Fatal("recovered establishment did not reset failure logging")
+	}
+}
+
+func TestIdentityProofTimeoutCancelsUnestablishedEpoch(t *testing.T) {
+	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleClient)
+	defer cleanup()
+	sess.settings.TlsTimeout = 20 * time.Millisecond
+
+	epochCtx, epochCancel := context.WithCancel(sess.ctx)
+	e := &tlsHandshakeEpoch{
+		ctx:               epochCtx,
+		cancel:            epochCancel,
+		handshakeDone:     make(chan struct{}),
+		establishmentDone: make(chan struct{}),
+	}
+	close(e.handshakeDone)
+	sess.stateLock.Lock()
+	sess.epoch = e
+	sess.stateLock.Unlock()
+
+	go sess.establishmentTimeoutWatcher(e)
+	select {
+	case <-e.establishmentDone:
+	case <-time.After(time.Second):
+		t.Fatal("missing peer identity proof was not bounded by TlsTimeout")
+	}
+	select {
+	case <-e.ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("identity-proof timeout left epoch workers running")
+	}
+	sess.stateLock.Lock()
+	identityFailed := e.identityFailed
+	sess.stateLock.Unlock()
+	if !identityFailed {
+		t.Fatal("identity-proof timeout did not leave the epoch unauthenticated")
+	}
+}
+
+func TestFailedZeroReferenceSessionIsReapedWithoutIdlePoll(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultClientSettings()
+	settings.EncryptionSettings.Encrypt = true
+	settings.EncryptionSettings.IdleTimeout = 0
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+	defer client.Cancel()
+	manager := client.EncryptionSessionManager()
+
+	peerId := NewId()
+	sess := manager.Acquire(peerId, sequenceTlsRoleClient, false)
+	e := injectTestEpoch(sess, false, nil)
+	e.establishmentDone = make(chan struct{})
+	sess.Release()
+	if manager.Lookup(peerId, sequenceTlsRoleClient, false) != sess {
+		t.Fatal("in-flight zero-reference session was reaped before establishment finished")
+	}
+
+	sess.completeHandshake(e, errors.New("synthetic timeout"))
+	if manager.Lookup(peerId, sequenceTlsRoleClient, false) != nil {
+		t.Fatal("failed zero-reference session remained pinned without an idle poll")
+	}
+}
+
+func TestSuccessfulZeroReferenceSessionIsReapedWithoutIdlePoll(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultClientSettings()
+	settings.EncryptionSettings.Encrypt = true
+	settings.EncryptionSettings.IdleTimeout = 0
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+	defer client.Cancel()
+	manager := client.EncryptionSessionManager()
+
+	peerId := NewId()
+	sess := manager.Acquire(peerId, sequenceTlsRoleServer, false)
+	epochCtx, epochCancel := context.WithCancel(sess.ctx)
+	defer epochCancel()
+	exporter := make([]byte, sequenceTlsIdentityProofLength)
+	if _, err := rand.Read(exporter); err != nil {
+		t.Fatal(err)
+	}
+	e := &tlsHandshakeEpoch{
+		ctx:               epochCtx,
+		cancel:            epochCancel,
+		handshakeDone:     make(chan struct{}),
+		establishmentDone: make(chan struct{}),
+		tlsExporter:       exporter,
+		derivedTlsCipher:  &sequenceCipher{},
+	}
+	close(e.handshakeDone)
+	sess.stateLock.Lock()
+	sess.epoch = e
+	sess.stateLock.Unlock()
+
+	peerPublicKey, peerPrivateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess.SetPeerClientPublicKey(peerPublicKey)
+	sess.Release()
+	if manager.Lookup(peerId, sequenceTlsRoleServer, false) != sess {
+		t.Fatal("in-flight zero-reference session was reaped before establishment finished")
+	}
+
+	sess.receivePeerIdentityProof(ed25519.Sign(peerPrivateKey, exporter))
+	if manager.Lookup(peerId, sequenceTlsRoleServer, false) != nil {
+		t.Fatal("successful zero-reference session remained pinned without an idle poll")
+	}
+}
+
+func TestPositiveIdleSessionReapsAtReleaseRelativeDeadline(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultClientSettings()
+	settings.EncryptionSettings.Encrypt = true
+	settings.EncryptionSettings.IdleTimeout = 400 * time.Millisecond
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+	defer client.Cancel()
+	manager := client.EncryptionSessionManager()
+
+	peerId := NewId()
+	sess := manager.Acquire(peerId, sequenceTlsRoleServer, false)
+	// Let the supervisor enter its referenced-state wait. With the former
+	// fixed-period poll, releasing halfway through that period made the next
+	// poll observe only half an idle timeout and sleep a second full period.
+	time.Sleep(settings.EncryptionSettings.IdleTimeout / 2)
+	releasedAt := time.Now()
+	sess.Release()
+
+	earlyDeadline := releasedAt.Add(settings.EncryptionSettings.IdleTimeout - 50*time.Millisecond)
+	for time.Now().Before(earlyDeadline) {
+		if manager.Lookup(peerId, sequenceTlsRoleServer, false) == nil {
+			t.Fatal("session reaped before its configured idle lifetime")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	lateDeadline := releasedAt.Add(settings.EncryptionSettings.IdleTimeout + 100*time.Millisecond)
+	for manager.Lookup(peerId, sequenceTlsRoleServer, false) != nil {
+		if time.Now().After(lateDeadline) {
+			t.Fatalf(
+				"session exceeded release-relative idle deadline: elapsed=%s timeout=%s",
+				time.Since(releasedAt),
+				settings.EncryptionSettings.IdleTimeout,
+			)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestInboundStartReusesAnyExistingEpoch verifies that the inbound-delivery
+// start path never resets state merely because another handshake frame or
+// proof was delivered. Client send acquisition has a distinct recovery rule:
+// it leaves an in-flight establishment alone but replaces a failed epoch.
+func TestInboundStartReusesAnyExistingEpoch(t *testing.T) {
 	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleServer)
 	defer cleanup()
 
@@ -498,8 +938,8 @@ func TestSendAcquireReusesAnyExistingEpoch(t *testing.T) {
 		t.Fatal("expected an established handshake to be reused")
 	}
 
-	// finished with error → still reuse (sends never re-handshake; a retry
-	// would re-churn EC — recovery comes from teardown + re-acquire)
+	// finished with error → inbound delivery still reuses until a definitive
+	// new ClientHello or client send acquisition starts the replacement
 	failed := injectTestEpoch(sess, true, errors.New("boom"))
 	sess.startEpoch()
 	if sess.currentEpoch() != failed {
@@ -642,14 +1082,14 @@ func TestAcquireForSendRestartPolicy(t *testing.T) {
 		manager := NewEncryptionSessionManager(ctx, client, km, settings.EncryptionSettings)
 
 		peerId := NewId()
-		s1 := manager.AcquireForSend(peerId, role, false, false)
+		s1 := manager.AcquireForSend(peerId, role, false, false, false)
 		if s1 == nil || s1.role != role {
 			t.Fatalf("expected a %v-role session", role)
 		}
 
 		// An in-flight handshake is never restarted by a later send.
 		inflight := injectTestEpoch(s1, false, nil)
-		s2 := manager.AcquireForSend(peerId, role, false, false)
+		s2 := manager.AcquireForSend(peerId, role, false, false, false)
 		if s2 != s1 {
 			t.Fatalf("%v: expected the same per-peer/role session", role)
 		}
@@ -661,7 +1101,7 @@ func TestAcquireForSendRestartPolicy(t *testing.T) {
 		// rekey) while keeping the established epoch serving; the server
 		// role reuses.
 		established := injectEstablishedTestEpoch(s1)
-		s3 := manager.AcquireForSend(peerId, role, false, false)
+		s3 := manager.AcquireForSend(peerId, role, false, false, false)
 		if s3 != s1 {
 			t.Fatalf("%v: expected the same per-peer/role session", role)
 		}
@@ -704,12 +1144,21 @@ func TestEncryptedControlCarrierMirrorsForceStream(t *testing.T) {
 
 	// the data path's send sequence acquires the session with its
 	// ForceStream option; the session records it as the carrier option
-	s := client.EncryptionSessionManager().AcquireForSend(peerId, sequenceTlsRoleClient, false, true)
+	s := client.EncryptionSessionManager().AcquireForSend(
+		peerId,
+		sequenceTlsRoleClient,
+		false,
+		true,
+		true,
+	)
 	if s == nil {
 		t.Fatal("expected a client-role session")
 	}
 	if !s.carrierForceStream.Load() {
 		t.Fatal("AcquireForSend(forceStream=true) must record the carrier ForceStream")
+	}
+	if !s.carrierNetworkPeer.Load() {
+		t.Fatal("AcquireForSend(networkPeer=true) must record Network contract policy")
 	}
 
 	// the carrier lands on the ForceStream sequence — the same sendSequenceId
@@ -719,7 +1168,16 @@ func TestEncryptedControlCarrierMirrorsForceStream(t *testing.T) {
 		SessionRole: sequenceTlsRoleClient.toProtobuf(),
 		Payload:     []byte{22, 3, 3, 0, 1, 1},
 	}
-	if !client.sendBuffer.SendEncryptedControl(ctx, peerId, sequenceTlsRoleClient, ec, false, false, s.carrierForceStream.Load()) {
+	if !client.sendBuffer.SendEncryptedControl(
+		ctx,
+		peerId,
+		sequenceTlsRoleClient,
+		ec,
+		false,
+		false,
+		s.carrierForceStream.Load(),
+		s.carrierNetworkPeer.Load(),
+	) {
 		t.Fatal("SendEncryptedControl should enqueue")
 	}
 	sequenceKeys := func() []sendSequenceId {
@@ -740,6 +1198,12 @@ func TestEncryptedControlCarrierMirrorsForceStream(t *testing.T) {
 	if !keys[0].ForceStream {
 		t.Fatal("the carrier must ride the data path's ForceStream sequence")
 	}
+	client.sendBuffer.mutex.Lock()
+	networkSequence := client.sendBuffer.sendSequences[keys[0]]
+	client.sendBuffer.mutex.Unlock()
+	if networkSequence == nil || !networkSequence.networkPeer {
+		t.Fatal("the carrier must mirror the data path's Network contract policy")
+	}
 
 	// a companion carrier never rides a stream (the platform rejects
 	// companion stream contracts): ForceStream is suppressed
@@ -749,22 +1213,48 @@ func TestEncryptedControlCarrierMirrorsForceStream(t *testing.T) {
 		Companion:   true,
 		Payload:     []byte{22, 3, 3, 0, 1, 1},
 	}
-	if !client.sendBuffer.SendEncryptedControl(ctx, peerId, sequenceTlsRoleClient, ecCompanion, true, true, true) {
+	if !client.sendBuffer.SendEncryptedControl(
+		ctx,
+		peerId,
+		sequenceTlsRoleClient,
+		ecCompanion,
+		true,
+		true,
+		true,
+		true,
+	) {
 		t.Fatal("companion SendEncryptedControl should enqueue")
 	}
 	for _, key := range sequenceKeys() {
 		if key.CompanionContract && key.ForceStream {
 			t.Fatal("a companion carrier must not request a stream contract")
 		}
+		if key.CompanionContract {
+			client.sendBuffer.mutex.Lock()
+			companionSequence := client.sendBuffer.sendSequences[key]
+			client.sendBuffer.mutex.Unlock()
+			if companionSequence != nil && companionSequence.networkPeer {
+				t.Fatal("a companion carrier must not request Network contract policy")
+			}
+		}
 	}
 
 	// last-acquirer-wins: a later data sequence without ForceStream retunes
 	// the carrier
-	s2 := client.EncryptionSessionManager().AcquireForSend(peerId, sequenceTlsRoleClient, false, false)
+	s2 := client.EncryptionSessionManager().AcquireForSend(
+		peerId,
+		sequenceTlsRoleClient,
+		false,
+		false,
+		false,
+	)
 	if s2 != s {
 		t.Fatal("expected the same per-peer session")
 	}
 	if s.carrierForceStream.Load() {
 		t.Fatal("AcquireForSend(forceStream=false) must retune the carrier ForceStream")
+	}
+	if s.carrierNetworkPeer.Load() {
+		t.Fatal("AcquireForSend(networkPeer=false) must retune Network contract policy")
 	}
 }

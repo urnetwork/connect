@@ -127,87 +127,92 @@ func TestProxyEgressBlocksLocalDestinations(t *testing.T) {
 	}
 }
 
-// recordSourceProvideMode chooses the return provide mode per-case (never a
-// numeric min): it prefers the same-Network relationship once a source has used
-// it, otherwise it remembers the source's latest non-Network mode. The recorded
-// value drives companion-contract selection on the provider return path.
-func TestRecordSourceProvideMode(t *testing.T) {
-	newProvider := func() *RemoteUserNatProvider {
-		return &RemoteUserNatProvider{
-			// no source cap: these cases exercise the record/return logic,
-			// not eviction
-			settings:          &RemoteUserNatProviderSettings{MaxSourceCount: 0},
-			sourceProvideMode: map[Id]protocol.ProvideMode{},
-		}
+// newSourceProvideModeTestProvider creates provider state without a source cap
+// so tests can isolate record and return behavior from eviction.
+func newSourceProvideModeTestProvider() *RemoteUserNatProvider {
+	return &RemoteUserNatProvider{
+		settings:          &RemoteUserNatProviderSettings{MaxSourceCount: 0},
+		sourceProvideMode: map[Id]protocol.ProvideMode{},
 	}
+}
+
+// TestSourceReturnProvideModeUsesFallbackForUntrackedSource verifies that an
+// unknown source does not inherit another source's relationship.
+func TestSourceReturnProvideModeUsesFallbackForUntrackedSource(t *testing.T) {
+	provider := newSourceProvideModeTestProvider()
 	fallback := protocol.ProvideMode_Stream
+	if got := provider.sourceReturnProvideMode(NewId(), fallback); got != fallback {
+		t.Errorf("untracked = %v, want fallback %v", got, fallback)
+	}
+}
 
-	t.Run("untracked source returns the fallback", func(t *testing.T) {
-		p := newProvider()
-		if got := p.sourceReturnProvideMode(NewId(), fallback); got != fallback {
-			t.Errorf("untracked = %v, want fallback %v", got, fallback)
-		}
-	})
+// TestRecordSourceProvideModeRecordsFirstMode verifies first-use state.
+func TestRecordSourceProvideModeRecordsFirstMode(t *testing.T) {
+	provider := newSourceProvideModeTestProvider()
+	sourceId := NewId()
+	provider.recordSourceProvideMode(sourceId, protocol.ProvideMode_Public)
+	if got := provider.sourceReturnProvideMode(sourceId, protocol.ProvideMode_Stream); got != protocol.ProvideMode_Public {
+		t.Errorf("first-seen = %v, want Public", got)
+	}
+}
 
-	t.Run("records the first mode seen", func(t *testing.T) {
-		p := newProvider()
-		id := NewId()
-		p.recordSourceProvideMode(id, protocol.ProvideMode_Public)
-		if got := p.sourceReturnProvideMode(id, fallback); got != protocol.ProvideMode_Public {
-			t.Errorf("first-seen = %v, want Public", got)
-		}
-	})
+// TestRecordSourceProvideModePrefersNetwork verifies that a source which has
+// used the same-network relationship keeps that stronger return relationship.
+func TestRecordSourceProvideModePrefersNetwork(t *testing.T) {
+	provider := newSourceProvideModeTestProvider()
+	sourceId := NewId()
+	provider.recordSourceProvideMode(sourceId, protocol.ProvideMode_Public)
+	provider.recordSourceProvideMode(sourceId, protocol.ProvideMode_Network)
+	if got := provider.sourceReturnProvideMode(sourceId, protocol.ProvideMode_Stream); got != protocol.ProvideMode_Network {
+		t.Errorf("public then network = %v, want Network", got)
+	}
+}
 
-	t.Run("prefers Network once the source has used it", func(t *testing.T) {
-		p := newProvider()
-		id := NewId()
-		p.recordSourceProvideMode(id, protocol.ProvideMode_Public)
-		p.recordSourceProvideMode(id, protocol.ProvideMode_Network)
-		if got := p.sourceReturnProvideMode(id, fallback); got != protocol.ProvideMode_Network {
-			t.Errorf("public then network = %v, want Network", got)
-		}
-	})
+// TestRecordSourceProvideModeKeepsNetwork verifies that a later public update
+// cannot weaken an established same-network return relationship.
+func TestRecordSourceProvideModeKeepsNetwork(t *testing.T) {
+	provider := newSourceProvideModeTestProvider()
+	sourceId := NewId()
+	provider.recordSourceProvideMode(sourceId, protocol.ProvideMode_Network)
+	provider.recordSourceProvideMode(sourceId, protocol.ProvideMode_Public)
+	if got := provider.sourceReturnProvideMode(sourceId, protocol.ProvideMode_Stream); got != protocol.ProvideMode_Network {
+		t.Errorf("network then public = %v, want Network", got)
+	}
+}
 
-	t.Run("keeps Network even after a later non-Network mode", func(t *testing.T) {
-		p := newProvider()
-		id := NewId()
-		p.recordSourceProvideMode(id, protocol.ProvideMode_Network)
-		p.recordSourceProvideMode(id, protocol.ProvideMode_Public)
-		if got := p.sourceReturnProvideMode(id, fallback); got != protocol.ProvideMode_Network {
-			t.Errorf("network then public = %v, want Network", got)
-		}
-	})
+// TestRecordSourceProvideModeUpdatesLatestNonNetworkMode verifies that ordinary
+// non-network updates follow the source's latest observed mode.
+func TestRecordSourceProvideModeUpdatesLatestNonNetworkMode(t *testing.T) {
+	provider := newSourceProvideModeTestProvider()
+	sourceId := NewId()
+	provider.recordSourceProvideMode(sourceId, protocol.ProvideMode_Public)
+	provider.recordSourceProvideMode(sourceId, protocol.ProvideMode_Stream)
+	if got := provider.sourceReturnProvideMode(sourceId, protocol.ProvideMode_Network); got != protocol.ProvideMode_Stream {
+		t.Errorf("public then stream = %v, want Stream", got)
+	}
+}
 
-	t.Run("updates to the latest non-Network mode", func(t *testing.T) {
-		p := newProvider()
-		id := NewId()
-		p.recordSourceProvideMode(id, protocol.ProvideMode_Public)
-		p.recordSourceProvideMode(id, protocol.ProvideMode_Stream)
-		if got := p.sourceReturnProvideMode(id, fallback); got != protocol.ProvideMode_Stream {
-			t.Errorf("public then stream = %v, want Stream", got)
-		}
-	})
-
-	t.Run("caps the tracked source count", func(t *testing.T) {
-		p := &RemoteUserNatProvider{
-			settings:          &RemoteUserNatProviderSettings{MaxSourceCount: 2},
-			sourceProvideMode: map[Id]protocol.ProvideMode{},
-		}
-		id1 := NewId()
-		id2 := NewId()
-		id3 := NewId()
-		p.recordSourceProvideMode(id1, protocol.ProvideMode_Public)
-		p.recordSourceProvideMode(id2, protocol.ProvideMode_Public)
-		// adding a third new source evicts one existing entry to stay at the cap
-		p.recordSourceProvideMode(id3, protocol.ProvideMode_Public)
-		if got := len(p.sourceProvideMode); got != 2 {
-			t.Errorf("tracked source count = %d, want 2 (capped)", got)
-		}
-		// the just-recorded source is retained; an evicted source falls back
-		if got := p.sourceReturnProvideMode(id3, fallback); got != protocol.ProvideMode_Public {
-			t.Errorf("newest source = %v, want Public", got)
-		}
-	})
+// TestRecordSourceProvideModeCapsTrackedSources verifies that relationship
+// bookkeeping has a predictable memory bound while retaining the newest source.
+func TestRecordSourceProvideModeCapsTrackedSources(t *testing.T) {
+	provider := &RemoteUserNatProvider{
+		settings:          &RemoteUserNatProviderSettings{MaxSourceCount: 2},
+		sourceProvideMode: map[Id]protocol.ProvideMode{},
+	}
+	sourceId1 := NewId()
+	sourceId2 := NewId()
+	sourceId3 := NewId()
+	provider.recordSourceProvideMode(sourceId1, protocol.ProvideMode_Public)
+	provider.recordSourceProvideMode(sourceId2, protocol.ProvideMode_Public)
+	// adding a third new source evicts one existing entry to stay at the cap
+	provider.recordSourceProvideMode(sourceId3, protocol.ProvideMode_Public)
+	if got := len(provider.sourceProvideMode); got != 2 {
+		t.Errorf("tracked source count = %d, want 2 (capped)", got)
+	}
+	// the just-recorded source is retained; an evicted source falls back
+	if got := provider.sourceReturnProvideMode(sourceId3, protocol.ProvideMode_Stream); got != protocol.ProvideMode_Public {
+		t.Errorf("newest source = %v, want Public", got)
+	}
 }
 
 // Network-provider return data and active WebRTC signaling are
@@ -217,14 +222,22 @@ func TestRecordSourceProvideMode(t *testing.T) {
 // two options created concurrent sequence ids, and whichever arrived second
 // caused the receiver to discard the first as an older sequence indefinitely.
 func TestProviderReturnTransferOptionPreventsForceStreamFork(t *testing.T) {
-	networkOption := providerReturnTransferOption(protocol.ProvideMode_Network)
-	network, ok := networkOption.(transferOptionsSetForceStream)
-	if !ok || !network.ForceStream {
+	networkOption := providerReturnTransferOptions(
+		DefaultTransferOpts(),
+		protocol.ProvideMode_Network,
+	)
+	if !networkOption.ForceStream ||
+		!networkOption.NetworkPeer ||
+		networkOption.CompanionContract {
 		t.Fatalf("Network return option = %#v, want ForceStream", networkOption)
 	}
-	publicOption := providerReturnTransferOption(protocol.ProvideMode_Public)
-	public, ok := publicOption.(transferOptionsSetCompanionContract)
-	if !ok || !public.CompanionContract {
+	publicOption := providerReturnTransferOptions(
+		DefaultTransferOpts(),
+		protocol.ProvideMode_Public,
+	)
+	if !publicOption.CompanionContract ||
+		publicOption.ForceStream ||
+		publicOption.NetworkPeer {
 		t.Fatalf("Public return option = %#v, want CompanionContract", publicOption)
 	}
 
@@ -266,4 +279,63 @@ func TestProviderReturnTransferOptionPreventsForceStreamFork(t *testing.T) {
 	if !keys[0].ForceStream {
 		t.Fatal("shared provider return/signal sequence must use ForceStream")
 	}
+	if !client.sendBuffer.sendSequences[keys[0]].networkPeer {
+		t.Fatal("Network provider return must retain Network contract policy")
+	}
+}
+
+// A provider replies to an ephemeral per-window source id, not necessarily the
+// top-level peer id remembered by PeerManager. The authenticated ProvideMode is
+// therefore the authoritative classification for the first return contract.
+func TestProviderReturnNetworkContractDoesNotDependOnDestinationIdentity(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), DefaultClientSettings())
+	defer client.Cancel()
+
+	generatedWindowClientId := NewId()
+	options := providerReturnTransferOptions(
+		client.settings.DefaultTransferOpts,
+		protocol.ProvideMode_Network,
+	)
+	frame := &protocol.Frame{
+		MessageType:  protocol.MessageType_IpIpPacketFromProvider,
+		MessageBytes: []byte("provider return"),
+	}
+	if !client.SendWithTimeout(
+		frame,
+		DestinationId(generatedWindowClientId),
+		nil,
+		time.Second,
+		options,
+	) {
+		t.Fatal("provider return enqueue failed")
+	}
+
+	client.sendBuffer.mutex.Lock()
+	var sequence *SendSequence
+	for key, candidate := range client.sendBuffer.sendSequences {
+		if key.Destination.DestinationId == generatedWindowClientId {
+			sequence = candidate
+			break
+		}
+	}
+	client.sendBuffer.mutex.Unlock()
+	if sequence == nil {
+		t.Fatal("provider return did not create a send sequence")
+	}
+	if !sequence.networkPeer {
+		t.Fatal("ephemeral Network destination lost its authenticated contract policy")
+	}
+
+	byteCount := client.ContractManager().contractByteCount(
+		ContractKey{
+			Destination: DestinationId(generatedWindowClientId),
+			ForceStream: true,
+			NetworkPeer: sequence.networkPeer,
+		},
+		0,
+		0,
+	)
+	AssertEqual(t, mib(1), byteCount)
 }

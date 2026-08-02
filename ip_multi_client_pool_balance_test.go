@@ -150,6 +150,111 @@ func TestRemoteUserNatClientRawSendPoolBalance(t *testing.T) {
 	}
 }
 
+// A rejected multi-client race candidate never takes ownership. The race
+// helper must undo only its read-only share and leave the caller's original
+// packet live for another candidate or retry.
+func TestMultiClientRejectedRaceAttemptRetainsOriginalPacket(t *testing.T) {
+	clientCtx, clientCancel := context.WithCancel(context.Background())
+	client := NewClient(clientCtx, NewId(), NewNoContractClientOob(), DefaultClientSettings())
+	clientCancel()
+
+	settings := DefaultMultiClientSettings()
+	channelCtx, channelCancel := context.WithCancel(context.Background())
+	defer channelCancel()
+	channel := &multiClientChannel{
+		ctx:                       channelCtx,
+		cancel:                    channelCancel,
+		log:                       NewNoopLogger(),
+		args:                      &multiClientChannelArgs{},
+		settings:                  settings,
+		client:                    client,
+		eventBuckets:              []*multiClientEventBucket{},
+		ip4DestinationSourceCount: map[Ip4Path]map[Ip4Path]int{},
+		ip6DestinationSourceCount: map[Ip6Path]map[Ip6Path]int{},
+		packetStats:               &clientWindowStats{log: NewNoopLogger()},
+	}
+
+	ipPath := &IpPath{
+		Version:         4,
+		Protocol:        IpProtocolUdp,
+		SourceIp:        net.ParseIP("10.0.0.1"),
+		SourcePort:      40000,
+		DestinationIp:   net.ParseIP("203.0.113.7"),
+		DestinationPort: 443,
+	}
+	packet := poolBalanceUdp4Packet(
+		ipPath.SourceIp,
+		ipPath.SourcePort,
+		ipPath.DestinationIp,
+		ipPath.DestinationPort,
+		[]byte("rejected race ownership"),
+	)
+
+	if sendMultiClientRaceAttempt(channel, packet, ipPath, 0) {
+		MessagePoolReturn(packet)
+		t.Fatal("canceled client accepted race packet")
+	}
+	if pooled, _ := MessagePoolCheck(packet); !pooled {
+		t.Fatal("rejected race attempt returned the caller's original packet")
+	}
+	if returned := MessagePoolReturn(packet); !returned {
+		t.Fatal("original packet was not the final live reference after rejected race attempt")
+	}
+}
+
+// A rejected race candidate and an accepted sibling overlap in production:
+// the multi-client releases the original race owner when any candidate wins,
+// then SendSequence releases the winner's share asynchronously. The rejected
+// candidate must not consume either of those two references.
+func TestMultiClientRejectedRaceAttemptRetainsSuccessfulSiblingPacket(t *testing.T) {
+	clientCtx, clientCancel := context.WithCancel(context.Background())
+	client := NewClient(clientCtx, NewId(), NewNoContractClientOob(), DefaultClientSettings())
+	clientCancel()
+
+	channelCtx, channelCancel := context.WithCancel(context.Background())
+	defer channelCancel()
+	channel := &multiClientChannel{
+		ctx:                       channelCtx,
+		cancel:                    channelCancel,
+		log:                       NewNoopLogger(),
+		args:                      &multiClientChannelArgs{},
+		settings:                  DefaultMultiClientSettings(),
+		client:                    client,
+		eventBuckets:              []*multiClientEventBucket{},
+		ip4DestinationSourceCount: map[Ip4Path]map[Ip4Path]int{},
+		ip6DestinationSourceCount: map[Ip6Path]map[Ip6Path]int{},
+		packetStats:               &clientWindowStats{log: NewNoopLogger()},
+	}
+	ipPath := &IpPath{
+		Version:         4,
+		Protocol:        IpProtocolUdp,
+		SourceIp:        net.ParseIP("10.0.0.1"),
+		SourcePort:      40000,
+		DestinationIp:   net.ParseIP("203.0.113.7"),
+		DestinationPort: 443,
+	}
+	packet := poolBalanceUdp4Packet(
+		ipPath.SourceIp,
+		ipPath.SourcePort,
+		ipPath.DestinationIp,
+		ipPath.DestinationPort,
+		[]byte("mixed race ownership"),
+	)
+	successfulSiblingPacket := MessagePoolShareReadOnly(packet)
+
+	if sendMultiClientRaceAttempt(channel, packet, ipPath, 0) {
+		MessagePoolReturn(successfulSiblingPacket)
+		MessagePoolReturn(packet)
+		t.Fatal("canceled client accepted race packet")
+	}
+	if returned := MessagePoolReturn(packet); returned {
+		t.Fatal("original race owner was the final reference while a successful sibling remained")
+	}
+	if returned := MessagePoolReturn(successfulSiblingPacket); !returned {
+		t.Fatal("successful sibling did not retain the final live packet reference")
+	}
+}
+
 // runMultiClientPoolCycle is one destination-change cycle: an in-memory exit, a
 // multi-client over it, a burst of egress packets, then teardown of both.
 func runMultiClientPoolCycle(ctx context.Context, t *testing.T) {

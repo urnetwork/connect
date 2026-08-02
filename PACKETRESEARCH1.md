@@ -1402,3 +1402,210 @@ device-to-device drops from the ~118 ms WAN relay to the ~8 ms direct LAN path
   to the Android socket-protect blocker, which is now precisely isolated with
   a concrete fix design.
 - Synthetic RFC-2544 speed server for repeatable in-tunnel measurement.
+
+## 18. Final transport-stall and SCTP release pass (2026-07-28)
+
+### 18.1 A canceled platform transport could retain a blocked write
+
+The retained iOS NetworkExtension trace showed a logical client disappearing
+at 11:42:07 while the old connection's TCP batch write did not return until
+11:42:16. Packet ownership was already removed from the route manager, but H1
+teardown performed this dependency order:
+
+```text
+remove route → cancel context → join writer → deferred socket close
+```
+
+Context cancellation cannot interrupt a `net.Conn.Write` already blocked in
+the kernel. Socket close was the writer's release operation, yet it was
+deferred until after the join waiting for that writer. The old generation and
+its bounded queues could consequently overlap a reconnect for the complete
+write deadline. H3 had the adjacent inversion when a peer stopped reading and
+QUIC stream credit parked `Stream.Write`.
+
+Both paths now close the connection before joining the writer:
+
+```text
+remove route → cancel context → close WebSocket/QUIC → join → final drain
+```
+
+`TestPlatformTransportCloseInterruptsBlockedH1Write` drives a real WebSocket
+over a wrapper whose `Write` can be released only by `Close`.
+`TestPlatformTransportCloseInterruptsBlockedH3Write` drives a real local QUIC
+connection with fixed 32-KiB stream credit, stops the server reader, fills the
+client's bounded route, and then closes the transport. Both passed ten
+race-enabled repetitions. The asserted upper bound is 500 ms, and H3 normally
+closed in about 45 ms locally. Comparing the physical trace with the test
+bound gives at least an 18× reduction in this teardown tail; it is a lifecycle
+bound, not an end-to-end throughput multiplier.
+
+### 18.2 Callback backpressure no longer owns global sequence maps
+
+The send, receive, and forward callbacks remain intentionally synchronous
+backpressure. The defect was the lock domain surrounding that contract:
+
+- `SendBuffer` held its global sequence-map mutex while closing a sequence.
+  Close drains queued `SendPack`s and invokes their completion callbacks. A
+  parked callback for one sequence therefore blocked unrelated destination
+  lookup/creation.
+- `ReceiveBuffer.Pack` held its global sequence-map mutex while canceling and
+  waiting for an older source generation. That worker may be parked in the
+  receive callback, so a same-source ordering wait blocked every other
+  concurrent source's map access.
+
+Send cleanup now removes exact, wire, and destination indexes atomically,
+unlocks, and closes/drains the sequence afterward. Receive replacement cancels
+under the lock, waits outside it, then conditionally removes only the exact old
+generation and retries. The head is deleted only when it still references
+that generation; a missing map entry heals a stale head rather than panicking.
+Forward cleanup also calls sequence close outside its map lock.
+
+The intended pressure remains:
+
+- send close does not finish until its completion callback returns;
+- a newer receive generation for the same source cannot pass the old callback;
+- the serial packet receive loop does not dispatch around a blocked data
+  callback; and
+- no callback timeout, drop, or asynchronous lifetime escape was introduced.
+
+The benefit is isolation of unrelated concurrent sequence bookkeeping, not
+removal of data backpressure. The two top-level regressions park the callback,
+prove the same operation remains blocked, prove an unrelated map operation
+finishes within 250 ms, release the callback, and verify ordered completion.
+They passed 20 normal and 20 race-enabled repetitions alongside the
+wire-indistinguishable send-sequence and receive-rejection tests.
+
+### 18.3 SCTP 1.11.1 closes adjacent idle/resume failure modes
+
+The release graph now uses Pion WebRTC 4.2.18, ICE 4.4.0, SCTP 1.11.1,
+interceptor 0.1.47, and RTP 1.10.5. The SCTP patch is relevant to the observed
+failure class:
+
+- a write-loop error closes the underlying transport, releasing a read loop
+  that could otherwise wait forever after a one-sided failure;
+- cumulative and gap SACK ranges are validated before the transmit
+  acknowledgement point or queues are mutated; and
+- pending DATA, partial acknowledgements, late/crossed shutdown, and graceful
+  shutdown advance through a consistent drain boundary.
+
+The main SDK was initially aligned while its independent `build`, `cgo`, and
+`js` modules still selected the old patches. Those artifact graphs and the
+local Connect/SDK/server/proxy/validator consumers are now aligned. A new SDK
+top-level regression compares all Pion versions in every artifact `go.mod`
+against the SDK root; it passed 20 normal and 20 race-enabled repetitions.
+
+### 18.4 Congestion sweep confirms the retained knee
+
+The opt-in CA-step harness was rerun for 203.7 s after the dependency update.
+Single-run measurements were:
+
+| CA setting | 1% loss MiB/s (p50/p95) | 50 Mbps shallow queue | 8 Mbps shallow queue |
+|---|---:|---:|---:|
+| 4 MTU | 0.54 (75/845 ms) | 3.03 | 0.82 |
+| 6 MTU | 0.58 (75/1100 ms) | 4.10 | 0.75, ~1 s tail |
+| **8 MTU** | **0.60 (52.8/97.6 ms)** | 2.47, one-MTU collapse | **0.80**, ~110 ms tail |
+| 10 MTU | 0.62 (25.6/99.8 ms) | 3.45 | 0.70, ~1 s tail |
+| 12 MTU | 0.66 (75.3/76.5 ms) | 4.00 | 0.71, ~1 s tail |
+| 16 MTU | 0.79 (75.7/1070 ms) | 4.45 | 0.73, ~1 s tail |
+| 24 MTU | 0.82 (54.1/76.1 ms) | 4.57 | 0.72, 390 ms p50/~1 s tail |
+| 8 MTU + 32 KiB floor | 0.79 (25.5/77.5 ms) | 3.26 | 0.82, ~110 ms tail |
+| 16 MTU + 32 KiB floor | 0.83 (53.8/76.7 ms) | 3.94 | 0.76, 380 ms p50/~1 s tail |
+
+This one-shot token/queue phase remains noisy—the 8-MTU 50-Mbps collapse is
+why production selection uses the repeated paired matrices in
+`OPTIMIZENETWORKPEER1.md §F.1`, not the best cell from one run. The new sweep
+confirms the first-principles tradeoff:
+
+- larger steps recover faster from exogenous independent loss;
+- the same aggression overshoots real shallow queues and increases RTO pauses;
+- a minimum congestion window improves the loss row by sending despite a real
+  congestion signal; and
+- 8 MTU retains the best measured cross-regime knee with stock one-half
+  decrease and no forced floor.
+
+No SCTP production constant changed. Physical end-to-end steady throughput
+therefore remains 4.8–5.9 MiB/s (about 1.0× the old physical range), while the
+controlled selected-peer receive-window result remains 2.26→28–29 MiB/s
+(about 12.5×). The new wins are bounded teardown, callback-stall locality, and
+upstream association reliability rather than another composable speed
+multiplier.
+
+### 18.5 Validation and remaining physical gate
+
+The complete post-change Connect tree passed in 479.471 s, with `blocker`,
+`connectctl`, and `extender` also green. The SDK passed in 382.483 s; its
+build/C-binding modules, proxy, and local validator suites pass. Static
+analysis passes across Connect, SDK and native artifact modules, server,
+proxy, and the validator. All added regressions are top-level tests and no
+ordinary `t.Run` was added.
+
+The remaining measurement is the latest-build bidirectional
+iPhone↔Pixel cold multi-origin, DNS/TTFB/load, idle/resume, CPU, and footprint
+matrix. The iPhone is currently unplugged. The last installed iOS build did
+not establish the extension after reinstall/permission state changed, so no
+latest-build physical throughput result is inferred from older successful
+captures.
+
+### 18.6 Network-contract rollover is now relationship-scoped and bounded
+
+A long real-page sequence found that the remaining apparent successor pause
+was not SCTP. Contract creation prefetches the next contract, but the global
+janitor expired any queued result after 120 s. A low-rate sequence could keep
+its current contract open longer than that, then block on a new control round
+trip at the eventual boundary.
+
+The initial sizing change also exposed an identity-domain mistake. Marking the
+selected top-level peer ID did not mark provider return traffic, whose
+destination is an ephemeral per-window client ID. The provider continued to
+receive only 13,107 usable bytes from a nominal 16 KiB contract.
+
+The retained implementation carries an authenticated, local-only
+`NetworkPeer` policy bit:
+
+```text
+selected multi-client default ─┐
+                               ├→ SendSequence → ContractKey
+ProvideMode_Network return ────┘
+                                  ├→ 1 MiB first contract
+encrypted-control carrier ────────┘   + live-successor retention
+```
+
+The bit is independent of `ForceStream`: public direct streams can force a
+stream without receiving no-escrow Network sizing. It is also absent from
+send-sequence/wire identity, preventing a local sizing policy from forking two
+receiver-indistinguishable sequences. Encryption-control first flights mirror
+the policy. Non-Network companion returns clear both Network policy and
+`ForceStream`.
+
+An open Network contract is now the ownership lease for its prefetch. The
+janitor keeps the newest stale successor while that exact key is open; if a
+fresh result exists it keeps no stale entry. Close/sequence teardown removes
+the lease and flushes the queue. `ResetLocalStats` retains the open maps
+because they are operational ownership state. Thus a live rollover is
+immediate without turning delayed create results into unbounded memory or
+unused-contract retention.
+
+Physical signed-build evidence (`versionCode=1004819970`):
+
+- Samsung→Pixel opened Wikipedia, idled 130 s, then loaded Mozilla, GitHub,
+  and Guardian. The first provider-return contract reached
+  837,513/838,860 usable bytes after about 290 s and installed its successor
+  about 1.1 ms later. No ≥1 s `contract wait` was logged.
+- The four complete loads were 2.490, 12.185, 27.292, and 11.007 s.
+  Guardian had timed out beyond 90 s in the preceding build; GitHub was
+  44.06 s.
+- Pixel→Samsung crossed 838,860 usable bytes in both request and return
+  directions. Successors appeared about 1.4/1.6 ms later, again without a
+  slow wait. Wikipedia and Mozilla loaded in 2.152/7.545 s.
+
+GitHub retained a 12.46 s p95 request TTFB under 108-way request parallelism
+after rollover on the large second contract. Guardian then loaded in 11.01 s.
+That remaining tail is parallel-flow/transport scheduling, not contract
+acquisition.
+
+Top-level sizing, generated-identity, carrier, ownership, public-expiry, reset,
+and bounded-retention tests passed 100 ordinary and 20 race repetitions.
+Deterministic Connect excluding its two randomized PT stress cases passed in
+362.173 s; those cases passed separately in 63.46/65.33 s. Subpackages, vet,
+Android release unit tests, lint, SDK bind, assembly, and the physical install
+pass.

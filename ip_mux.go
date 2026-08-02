@@ -19,10 +19,10 @@ package connect
 
 import (
 	"context"
-	"net"
 	"net/netip"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
@@ -62,6 +62,11 @@ type IpMux struct {
 	upstream  IpMuxSend
 
 	receivers *CallbackList[ReceivePacketFunction]
+
+	// rejectedPumpPacketCount rate-limits diagnostics for intentional upstream
+	// backpressure. The internal stack owns retransmission; the pump owns and
+	// returns each rejected pooled packet.
+	rejectedPumpPacketCount atomic.Uint64
 }
 
 func NewIpMux(
@@ -139,10 +144,13 @@ func (self *IpMux) SendPacket(source TransferPath, provideMode protocol.ProvideM
 	return upstream(source, provideMode, packet, timeout)
 }
 
-// Receive is installed as the upstream's receive callback. Packets addressed to the
-// mux's Tun address are delivered into the internal stack; the rest go downstream.
+// Receive is installed as the upstream's receive callback. The callback IpPath
+// is the canonical outbound flow identity even for return packets, so its
+// DestinationIp is the remote server—not this mux. Classify the authoritative
+// packet bytes instead: packets actually addressed to the mux's Tun enter the
+// internal stack; the rest go downstream.
 func (self *IpMux) Receive(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
-	if ipPath != nil && self.isLocalDestination(ipPath.DestinationIp) {
+	if self.isLocalPacketDestination(packet) {
 		self.tun.Write(packet)
 		return
 	}
@@ -176,8 +184,11 @@ func safeReceive(receiver ReceivePacketFunction, source TransferPath, provideMod
 	receiver(source, provideMode, ipPath, packet)
 }
 
-func (self *IpMux) isLocalDestination(dst net.IP) bool {
-	addr, ok := netIPAddr(dst)
+// isLocalPacketDestination reads only fixed IP-header fields and allocates no
+// flow object. Receive is on the entire inbound packet path, so a full parse
+// here would tax all ordinary traffic to classify the rare mux-local return.
+func (self *IpMux) isLocalPacketDestination(packet []byte) bool {
+	_, addr, ok := ipPacketSourceDestinationAddrs(packet)
 	if !ok {
 		return false
 	}
@@ -187,6 +198,34 @@ func (self *IpMux) isLocalDestination(dst net.IP) bool {
 		}
 	}
 	return false
+}
+
+// ipPacketSourceDestinationAddrs reads only fixed IP-header fields. It is
+// shared by return-path consumers that cannot infer wire direction from the
+// canonical outbound IpPath passed to ReceivePacketFunction.
+func ipPacketSourceDestinationAddrs(packet []byte) (netip.Addr, netip.Addr, bool) {
+	if len(packet) == 0 {
+		return netip.Addr{}, netip.Addr{}, false
+	}
+	switch packet[0] >> 4 {
+	case 4:
+		headerByteCount := int(packet[0]&0x0f) * 4
+		if headerByteCount < 20 || len(packet) < headerByteCount {
+			return netip.Addr{}, netip.Addr{}, false
+		}
+		return netip.AddrFrom4([4]byte(packet[12:16])),
+			netip.AddrFrom4([4]byte(packet[16:20])),
+			true
+	case 6:
+		if len(packet) < 40 {
+			return netip.Addr{}, netip.Addr{}, false
+		}
+		return netip.AddrFrom16([16]byte(packet[8:24])),
+			netip.AddrFrom16([16]byte(packet[24:40])),
+			true
+	default:
+		return netip.Addr{}, netip.Addr{}, false
+	}
 }
 
 // pump forwards packets the internal stack emits (the local servers' upstream
@@ -211,8 +250,18 @@ func (self *IpMux) pump() {
 			if self.onPump != nil && self.onPump(packet) {
 				return
 			}
-			if upstream := self.getUpstream(); upstream != nil {
-				upstream(self.source, self.provideMode, packet, self.sendTimeout)
+			upstream := self.getUpstream()
+			if upstream != nil && upstream(self.source, self.provideMode, packet, self.sendTimeout) {
+				// A successful send transfers packet ownership upstream.
+				return
+			}
+			// A failed send retains ownership here. This path is normal
+			// backpressure—the gVisor endpoint retransmits—but losing the pool
+			// return leaked one buffer per rejected SYN/data packet.
+			MessagePoolReturn(packet)
+			rejectedCount := self.rejectedPumpPacketCount.Add(1)
+			if rejectedCount == 1 || rejectedCount&(rejectedCount-1) == 0 {
+				self.log.Infof("[mux]internal upstream backpressure rejected %d packets\n", rejectedCount)
 			}
 		})
 	}

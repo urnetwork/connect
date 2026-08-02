@@ -43,6 +43,28 @@ const DefaultConnectUrl = "wss://connect.bringyour.com"
 var Out *log.Logger
 var Err *log.Logger
 
+// sinkReceive owns the display values retained after a receive callback
+// returns; it must not retain callback-scoped Frames or message bytes.
+type sinkReceive struct {
+	source       connect.TransferPath
+	frameSummary string
+	provideMode  protocol.ProvideMode
+}
+
+// snapshotSinkReceive formats borrowed receive frames before the callback
+// returns. The decoder may immediately clear and reuse the Frame objects.
+func snapshotSinkReceive(
+	source connect.TransferPath,
+	frames []*protocol.Frame,
+	peer connect.Peer,
+) *sinkReceive {
+	return &sinkReceive{
+		source:       source,
+		frameSummary: fmt.Sprint(frames),
+		provideMode:  peer.ProvideMode,
+	}
+}
+
 func init() {
 	Out = log.New(os.Stdout, "", 0)
 	Err = log.New(os.Stderr, "", log.Ldate|log.Ltime|log.Lshortfile)
@@ -686,27 +708,17 @@ func sink(opts docopt.Opts) {
 		// go platformTransport.Run(routeManager)
 	}
 
-	type Receive struct {
-		source      connect.TransferPath
-		frames      []*protocol.Frame
-		provideMode protocol.ProvideMode
-	}
-
-	receives := make(chan *Receive)
+	receives := make(chan *sinkReceive)
 
 	client.AddReceiveCallback(func(source connect.TransferPath, frames []*protocol.Frame, peer connect.Peer) {
-		receives <- &Receive{
-			source:      source,
-			frames:      frames,
-			provideMode: peer.ProvideMode,
-		}
+		receives <- snapshotSinkReceive(source, frames, peer)
 	})
 
 	// FIXME reassemble the chunks. Only a complete message counts as 1 against the message count
 	for i := 0; messageCount < 0 || i < messageCount; i += 1 {
 		select {
 		case receive := <-receives:
-			fmt.Printf("[%s %s] %s\n", receive.source, receive.provideMode, receive.frames)
+			fmt.Printf("[%s %s] %s\n", receive.source, receive.provideMode, receive.frameSummary)
 		}
 	}
 }

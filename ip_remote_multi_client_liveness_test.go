@@ -37,3 +37,28 @@ func TestMultiClientBusyStaleUsesProbeAckAsLiveness(t *testing.T) {
 		t.Fatal("channel without a recent send is not busy-stale")
 	}
 }
+
+func TestMultiClientBusyStaleUsesTransferAckAsLiveness(t *testing.T) {
+	const staleTimeout = 5 * time.Second
+	now := time.Now()
+	channel := &multiClientChannel{
+		settings: &MultiClientSettings{
+			CPingBusyStaleTimeout: staleTimeout,
+		},
+		packetStats: &clientWindowStats{
+			sendNackCount:            1,
+			firstOutstandingSendTime: now.Add(-2 * staleTimeout),
+			lastSendTime:             now,
+			lastSendAckTime:          now,
+		},
+	}
+
+	if channel.busyStale() {
+		t.Fatal("recent transfer acknowledgement did not prove one-way peer liveness")
+	}
+
+	channel.packetStats.lastSendAckTime = now.Add(-2 * staleTimeout)
+	if !channel.busyStale() {
+		t.Fatal("expired transfer acknowledgement masked a stalled outstanding send")
+	}
+}

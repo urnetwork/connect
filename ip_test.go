@@ -7,11 +7,9 @@ import (
 	"io"
 	"net"
 	"net/netip"
-	// "reflect"
 	"testing"
 	"time"
 
-	// "sync"
 	"fmt"
 
 	"github.com/google/gopacket"
@@ -614,9 +612,24 @@ func TestIpEgressTcp4(t *testing.T) {
 					go HandleError(func() {
 						readErr <- func() error {
 							echoPayload := make([]byte, payloadSize)
-							conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-							if _, err := io.ReadFull(conn, echoPayload); err != nil {
-								return fmt.Errorf("read size=%d: %w", payloadSize, err)
+							conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+							if n, err := io.ReadFull(conn, echoPayload); err != nil {
+								stats := tun.Stats()
+								return fmt.Errorf(
+									"read size=%d received=%d: %w (ip=%d/%d/%d malformed=%d tcp=%d/%d checksum=%d dropped=%d tx_no_buffer=%d)",
+									payloadSize,
+									n,
+									err,
+									stats.IP.PacketsReceived.Value(),
+									stats.IP.ValidPacketsReceived.Value(),
+									stats.IP.PacketsDelivered.Value(),
+									stats.IP.MalformedPacketsReceived.Value(),
+									stats.TCP.ValidSegmentsReceived.Value(),
+									stats.TCP.InvalidSegmentsReceived.Value(),
+									stats.TCP.ChecksumErrors.Value(),
+									stats.DroppedPackets.Value(),
+									stats.NICs.TxPacketsDroppedNoBufferSpace.Value(),
+								)
 							}
 							if !bytes.Equal(payload, echoPayload) {
 								return fmt.Errorf("echo mismatch size=%d", payloadSize)
@@ -625,7 +638,7 @@ func TestIpEgressTcp4(t *testing.T) {
 						}()
 					})
 
-					conn.SetWriteDeadline(time.Now().Add(60 * time.Second))
+					conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 					if _, err := conn.Write(payload); err != nil {
 						return fmt.Errorf("write size=%d: %w", payloadSize, err)
 					}

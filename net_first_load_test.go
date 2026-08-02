@@ -4,8 +4,26 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net/netip"
+	"runtime"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 )
+
+type blockingFirstLoadLogger struct {
+	Logger
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (self *blockingFirstLoadLogger) Infof(format string, args ...any) {
+	if strings.HasPrefix(format, "[firstload]dns ") {
+		self.once.Do(func() { close(self.started) })
+		<-self.release
+	}
+}
 
 // buildTestTcp4Packet hand-rolls a minimal ipv4+tcp packet for the peek tests.
 func buildTestTcp4Packet(src netip.Addr, srcPort uint16, dst netip.Addr, dstPort uint16, flags byte, payloadLen int) []byte {
@@ -69,6 +87,7 @@ func TestFirstLoadTimeline(t *testing.T) {
 	server := netip.MustParseAddr("93.184.216.34")
 
 	timeline := newFirstLoadTimeline(NewNoopLogger())
+	defer timeline.Close()
 
 	// dns pipeline
 	key := NewDohKey("A", "example.com")
@@ -115,12 +134,78 @@ func TestFirstLoadTimeline(t *testing.T) {
 	}
 }
 
+func TestFirstLoadBlockedLoggerCannotPausePacketPath(t *testing.T) {
+	log := &blockingFirstLoadLogger{
+		Logger:  NewNoopLogger(),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	timeline := newFirstLoadTimeline(log)
+
+	key := NewDohKey("A", "blocked-logger.example")
+	timeline.dnsStart(key)
+	dnsDone := make(chan struct{})
+	go func() {
+		timeline.dnsDone(key, true)
+		close(dnsDone)
+	}()
+
+	select {
+	case <-log.started:
+	case <-time.After(time.Second):
+		t.Fatal("bounded logger worker did not receive the DNS event")
+	}
+	select {
+	case <-dnsDone:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("DNS accounting waited on the blocked host logger")
+	}
+
+	// The logger is still parked. A packet observation must nevertheless
+	// acquire the timeline state and return promptly; the old synchronous
+	// logger held that lock and paused every observer behind it.
+	local := netip.MustParseAddr("10.0.0.2")
+	server := netip.MustParseAddr("93.184.216.34")
+	packetDone := make(chan struct{})
+	go func() {
+		timeline.observeSend(buildTestTcp4Packet(local, 40001, server, 443, 0x02, 0))
+		close(packetDone)
+	}()
+	select {
+	case <-packetDone:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("packet observation waited on the blocked host logger")
+	}
+	if len(timeline.Samples()) != 1 {
+		t.Fatal("DNS sample was not committed before asynchronous logging")
+	}
+
+	// Reconnect churn behind the same permanently blocked sink must not create
+	// one parked logger goroutine per timeline generation.
+	goroutinesBefore := runtime.NumGoroutine()
+	for i := 0; i < 2*firstLoadLogQueueSize; i++ {
+		next := newFirstLoadTimeline(log)
+		nextKey := NewDohKey("A", fmt.Sprintf("reconnect-%d.example", i))
+		next.dnsStart(nextKey)
+		next.dnsDone(nextKey, true)
+		next.Close()
+	}
+	runtime.Gosched()
+	if delta := runtime.NumGoroutine() - goroutinesBefore; 4 < delta {
+		t.Fatalf("blocked logger multiplied reconnect workers by %d goroutines", delta)
+	}
+
+	close(log.release)
+	timeline.Close()
+}
+
 // TestFirstLoadTimelineDeactivates pins the self-deactivation: once the flow
 // and dns budgets are spent and every flow is logged, the hooks reduce to the
 // atomic fast path (active false).
 func TestFirstLoadTimelineDeactivates(t *testing.T) {
 	local := netip.MustParseAddr("10.0.0.2")
 	timeline := newFirstLoadTimeline(NewNoopLogger())
+	defer timeline.Close()
 
 	for i := range firstLoadMaxDnsQueries {
 		key := NewDohKey("A", fmt.Sprintf("q%d.deactivate.test", i))
@@ -151,9 +236,34 @@ func TestFirstLoadTimelineDeactivates(t *testing.T) {
 	}
 }
 
+func TestFirstLoadCloseRejectsPostCloseAdmission(t *testing.T) {
+	timeline := newFirstLoadTimeline(NewNoopLogger())
+	timeline.Close()
+
+	key := NewDohKey("A", "after-close.example")
+	timeline.dnsStart(key)
+	timeline.dnsDone(key, true)
+	timeline.observeSend(buildTestTcp4Packet(
+		netip.MustParseAddr("10.0.0.2"),
+		40001,
+		netip.MustParseAddr("93.184.216.34"),
+		443,
+		0x02,
+		0,
+	))
+
+	if timeline.active.Load() {
+		t.Fatal("closed timeline became active again")
+	}
+	if samples := timeline.Samples(); len(samples) != 0 {
+		t.Fatalf("closed timeline admitted %d samples", len(samples))
+	}
+}
+
 // TestUpgradeMuxTunnelDohCold pins the cold-state machine driving the
 // adaptive local-fallback handicap: cold until first proven, warm after,
-// cold again after consecutive failures, warm again on the next success.
+// cold again after an idle lease or consecutive failures, and warm again on
+// the next success.
 func TestUpgradeMuxTunnelDohCold(t *testing.T) {
 	mux := &UpgradeMux{}
 	if !mux.tunnelDohCold() {
@@ -163,11 +273,18 @@ func TestUpgradeMuxTunnelDohCold(t *testing.T) {
 	if mux.tunnelDohCold() {
 		t.Fatalf("a proven mux must be warm")
 	}
-	mux.tunnelDohFailures.Add(1)
+	mux.tunnelDohLastSuccessNanos.Store(
+		time.Now().Add(-tunnelDohWarmLease - time.Millisecond).UnixNano(),
+	)
+	if !mux.tunnelDohCold() {
+		t.Fatalf("an idle mux must expire its stale warm state")
+	}
+	mux.markTunnelDohProven()
+	mux.recordTunnelDohFailureForGeneration(mux.tunnelDohGeneration.Load())
 	if mux.tunnelDohCold() {
 		t.Fatalf("one failure must not flip cold")
 	}
-	mux.tunnelDohFailures.Add(1)
+	mux.recordTunnelDohFailureForGeneration(mux.tunnelDohGeneration.Load())
 	if !mux.tunnelDohCold() {
 		t.Fatalf("%d consecutive failures must flip cold", tunnelDohColdFailureCount)
 	}

@@ -85,7 +85,8 @@ func NewExtenderHttpClient(
 	extenderConfig *ExtenderConfig,
 ) *http.Client {
 	transport := &http.Transport{
-		DialTLSContext: NewExtenderDialTlsContext(connectSettings, extenderConfig),
+		DialTLSContext:    newExtenderDialTlsContext(connectSettings, extenderConfig, clientHttpNextProtos),
+		ForceAttemptHTTP2: true,
 	}
 	return &http.Client{
 		Transport: transport,
@@ -105,6 +106,21 @@ func NewExtenderDialTlsContext(
 	connectSettings *ConnectSettings,
 	extenderConfig *ExtenderConfig,
 ) DialTlsContextFunction {
+	return newExtenderDialTlsContext(connectSettings, extenderConfig, nil)
+}
+
+func newExtenderDialTlsContext(
+	connectSettings *ConnectSettings,
+	extenderConfig *ExtenderConfig,
+	nextProtos []string,
+) DialTlsContextFunction {
+	extenderTlsConfig := newClientTlsConfig(&tls.Config{
+		ServerName:         extenderConfig.Profile.ServerName,
+		InsecureSkipVerify: true,
+		// require 1.3 to mask self-signed certs
+		MinVersion: tls.VersionTLS13,
+	}, nil)
+	innerBaseTlsConfig := newClientTlsConfig(connectSettings.TlsConfig, nextProtos)
 	return func(
 		ctx context.Context,
 		network string,
@@ -138,13 +154,6 @@ func NewExtenderDialTlsContext(
 		// set ttl 0 on every other handshake records
 
 		var serverConn net.Conn
-
-		extenderTlsConfig := &tls.Config{
-			ServerName:         extenderConfig.Profile.ServerName,
-			InsecureSkipVerify: true,
-			// require 1.3 to mask self-signed certs
-			MinVersion: tls.VersionTLS13,
-		}
 
 		switch extenderConfig.Profile.ConnectMode {
 		case ExtenderConnectModeTcpTls:
@@ -280,10 +289,11 @@ func NewExtenderDialTlsContext(
 
 		// return serverConn, nil
 
-		tlsServerConn := tls.Client(
-			serverConn,
-			connectSettings.TlsConfig,
-		)
+		innerTlsConfig := innerBaseTlsConfig.Clone()
+		if innerTlsConfig.ServerName == "" {
+			innerTlsConfig.ServerName = host
+		}
+		tlsServerConn := tls.Client(serverConn, innerTlsConfig)
 
 		// inner handshake; bound the timeout so a slow/malicious extender cannot
 		// hold the dial open indefinitely

@@ -34,6 +34,7 @@ func newSendNoContractHarness(t *testing.T, ctx context.Context) (client *Client
 		MultiHopId{},
 		false,
 		false,
+		false,
 		sequenceTlsRoleClient,
 		false,
 		DefaultSendBufferSettings(),

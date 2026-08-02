@@ -39,6 +39,10 @@ const (
 	// firstLoadFlowExpiration retires an individual flow that never
 	// completed (e.g. a synack that never came).
 	firstLoadFlowExpiration = 30 * time.Second
+	// At most one log event is emitted per accepted DNS/flow sample. A queue
+	// this size can therefore retain the entire measurement budget even when
+	// the host logger is parked, without ever blocking a packet-path caller.
+	firstLoadLogQueueSize = firstLoadMaxDnsQueries + firstLoadMaxFlows
 )
 
 // firstLoadFlowKey identifies a tracked egress tcp/443 flow from either
@@ -76,6 +80,65 @@ type FirstLoadSample struct {
 	FirstByteMillis int64
 }
 
+type firstLoadLogEvent struct {
+	kind            string
+	recordType      string
+	target          string
+	status          string
+	startSeconds    float64
+	dnsMillis       int64
+	synAckMillis    int64
+	firstByteMillis int64
+}
+
+func (self firstLoadLogEvent) emit(log Logger) {
+	switch self.kind {
+	case "dns":
+		log.Infof("[firstload]dns %s %s %dms %s (t+%.1fs)\n",
+			self.recordType, self.target, self.dnsMillis, self.status, self.startSeconds)
+	case "tcp":
+		log.Infof("[firstload]tcp %s synack %dms firstbyte %dms (t+%.1fs)\n",
+			self.target, self.synAckMillis, self.firstByteMillis, self.startSeconds)
+	}
+}
+
+type firstLoadLogRequest struct {
+	log   Logger
+	event firstLoadLogEvent
+}
+
+var firstLoadLogDispatcher = struct {
+	start sync.Once
+	queue chan firstLoadLogRequest
+}{
+	queue: make(chan firstLoadLogRequest, firstLoadLogQueueSize),
+}
+
+func startFirstLoadLogDispatcher() {
+	firstLoadLogDispatcher.start.Do(func() {
+		go func() {
+			for request := range firstLoadLogDispatcher.queue {
+				// A host logger is outside the packet pipeline's trust
+				// boundary. A panic or indefinitely stalled sink is isolated
+				// to this one process-wide worker; reconnect churn cannot
+				// multiply blocked goroutines.
+				HandleError(func() {
+					request.event.emit(request.log)
+				})
+			}
+		}()
+	})
+}
+
+func dispatchFirstLoadLog(log Logger, event firstLoadLogEvent) {
+	select {
+	case firstLoadLogDispatcher.queue <- firstLoadLogRequest{log: log, event: event}:
+	default:
+		// Samples remain available through the stats surface. Dropping a log
+		// is preferable to adding latency or memory when the host sink stalls.
+	}
+}
+
 // firstLoadTimeline measures the first flows after a connect. One per mux
 // (the mux is rebuilt per connect, so activation aligns with connect start).
 type firstLoadTimeline struct {
@@ -86,9 +149,10 @@ type firstLoadTimeline struct {
 	// on a single atomic load.
 	active atomic.Bool
 
-	lock     sync.Mutex
-	flows    map[firstLoadFlowKey]*firstLoadFlow
-	flowsLru []firstLoadFlowKey
+	lock        sync.Mutex
+	flows       map[firstLoadFlowKey]*firstLoadFlow
+	flowsLru    []firstLoadFlowKey
+	dnsDoneHook func()
 	// trackedFlowCount / dnsCount are the lifetime budgets spent
 	trackedFlowCount int
 	dnsCount         int
@@ -103,8 +167,24 @@ func newFirstLoadTimeline(log Logger) *firstLoadTimeline {
 		flows:     map[firstLoadFlowKey]*firstLoadFlow{},
 		dnsStarts: map[DohKey]time.Time{},
 	}
+	startFirstLoadLogDispatcher()
 	self.active.Store(true)
 	return self
+}
+
+// enqueueLogLocked never waits. The process-wide queue has one timeline's full
+// sample budget; concurrent/reconnecting timelines may drop logs behind a
+// blocked sink, while their samples remain available through Samples.
+func (self *firstLoadTimeline) enqueueLogLocked(event firstLoadLogEvent) {
+	dispatchFirstLoadLog(self.log, event)
+}
+
+// Close stops measurement admission. Logging is process-wide and bounded, so
+// teardown never waits on (or creates another worker behind) a blocked sink.
+func (self *firstLoadTimeline) Close() {
+	self.lock.Lock()
+	self.active.Store(false)
+	self.lock.Unlock()
 }
 
 // expiredLocked deactivates past the observation window and reports whether
@@ -140,6 +220,9 @@ func (self *firstLoadTimeline) dnsStart(key DohKey) {
 	now := time.Now()
 	self.lock.Lock()
 	defer self.lock.Unlock()
+	if !self.active.Load() {
+		return
+	}
 	if self.expiredLocked(now) {
 		return
 	}
@@ -161,9 +244,13 @@ func (self *firstLoadTimeline) dnsDone(key DohKey, ok bool) {
 	}
 	now := time.Now()
 	self.lock.Lock()
-	defer self.lock.Unlock()
+	if !self.active.Load() {
+		self.lock.Unlock()
+		return
+	}
 	startTime, tracked := self.dnsStarts[key]
 	if !tracked {
+		self.lock.Unlock()
 		return
 	}
 	delete(self.dnsStarts, key)
@@ -180,9 +267,20 @@ func (self *firstLoadTimeline) dnsDone(key DohKey, ok bool) {
 	if !ok {
 		status = "fail"
 	}
-	self.log.Infof("[firstload]dns %s %s %dms %s (t+%.1fs)\n",
-		key.RecordType, key.Domain, dnsMillis, status, startTime.Sub(self.startTime).Seconds())
+	self.enqueueLogLocked(firstLoadLogEvent{
+		kind:         "dns",
+		recordType:   key.RecordType,
+		target:       key.Domain,
+		status:       status,
+		startSeconds: startTime.Sub(self.startTime).Seconds(),
+		dnsMillis:    dnsMillis,
+	})
 	self.doneCheckLocked()
+	hook := self.dnsDoneHook
+	self.lock.Unlock()
+	if hook != nil {
+		hook()
+	}
 }
 
 // observeSend peeks an egress ip packet for a tcp/443 syn (flow start).
@@ -203,6 +301,9 @@ func (self *firstLoadTimeline) observeSend(packet []byte) {
 	key := firstLoadFlowKey{remoteAddr: remoteAddr, remotePort: remotePort, localPort: localPort}
 	self.lock.Lock()
 	defer self.lock.Unlock()
+	if !self.active.Load() {
+		return
+	}
 	if self.expiredLocked(now) {
 		return
 	}
@@ -232,6 +333,9 @@ func (self *firstLoadTimeline) observeReceive(packet []byte) {
 	key := firstLoadFlowKey{remoteAddr: remoteAddr, remotePort: remotePort, localPort: localPort}
 	self.lock.Lock()
 	defer self.lock.Unlock()
+	if !self.active.Load() {
+		return
+	}
 	if self.expiredLocked(now) {
 		return
 	}
@@ -245,7 +349,7 @@ func (self *firstLoadTimeline) observeReceive(packet []byte) {
 	}
 	if 0 < payloadLen && flow.firstByteTime.IsZero() {
 		flow.firstByteTime = now
-		self.logFlowLocked(key, flow)
+		self.recordFlowLocked(key, flow)
 		self.doneCheckLocked()
 	}
 }
@@ -262,13 +366,14 @@ func (self *firstLoadTimeline) expireFlowsLocked(now time.Time) {
 		if now.Sub(flow.synTime) < firstLoadFlowExpiration {
 			break // lru order: the rest are younger
 		}
-		self.logFlowLocked(key, flow)
+		self.recordFlowLocked(key, flow)
 	}
 }
 
-// logFlowLocked emits the flow's timeline line and records its sample.
+// recordFlowLocked records the sample and queues its log without calling the
+// host logger on the packet path.
 // Callers hold lock.
-func (self *firstLoadTimeline) logFlowLocked(key firstLoadFlowKey, flow *firstLoadFlow) {
+func (self *firstLoadTimeline) recordFlowLocked(key firstLoadFlowKey, flow *firstLoadFlow) {
 	flow.logged = true
 	synAckMillis := int64(-1)
 	if !flow.synAckTime.IsZero() {
@@ -287,8 +392,13 @@ func (self *firstLoadTimeline) logFlowLocked(key firstLoadFlowKey, flow *firstLo
 		SynAckMillis:    synAckMillis,
 		FirstByteMillis: firstByteMillis,
 	})
-	self.log.Infof("[firstload]tcp %s synack %dms firstbyte %dms (t+%.1fs)\n",
-		target, synAckMillis, firstByteMillis, flow.synTime.Sub(self.startTime).Seconds())
+	self.enqueueLogLocked(firstLoadLogEvent{
+		kind:            "tcp",
+		target:          target,
+		startSeconds:    flow.synTime.Sub(self.startTime).Seconds(),
+		synAckMillis:    synAckMillis,
+		firstByteMillis: firstByteMillis,
+	})
 }
 
 // Samples returns the measurements recorded so far (completed dns

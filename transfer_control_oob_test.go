@@ -2,6 +2,7 @@ package connect
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -18,6 +19,45 @@ type testOobControl struct {
 	stateLock sync.Mutex
 	attempts  int
 	failUntil int
+}
+
+type delayedOobAttempt struct {
+	callback OobResultFunction
+}
+
+type delayedOobControl struct {
+	attempts chan delayedOobAttempt
+}
+
+func (self *delayedOobControl) SendControl(frames []*protocol.Frame, callback OobResultFunction) {
+	for _, frame := range frames {
+		MessagePoolReturn(frame.MessageBytes)
+	}
+	self.attempts <- delayedOobAttempt{callback: callback}
+}
+
+type contextualDelayedOobAttempt struct {
+	ctx      context.Context
+	callback OobResultFunction
+}
+
+type contextualDelayedOobControl struct {
+	attempts chan contextualDelayedOobAttempt
+}
+
+func (self *contextualDelayedOobControl) SendControl(frames []*protocol.Frame, callback OobResultFunction) {
+	panic("context-aware path was not used")
+}
+
+func (self *contextualDelayedOobControl) SendControlWithCtx(
+	ctx context.Context,
+	frames []*protocol.Frame,
+	callback OobResultFunction,
+) {
+	for _, frame := range frames {
+		MessagePoolReturn(frame.MessageBytes)
+	}
+	self.attempts <- contextualDelayedOobAttempt{ctx: ctx, callback: callback}
 }
 
 func (self *testOobControl) setFailUntil(n int) {
@@ -215,6 +255,136 @@ func TestControlSyncOobLatestSupersedes(t *testing.T) {
 	case <-firstAcked:
 		t.Fatal("superseded send unexpectedly acked")
 	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestControlSyncOobLateInflightSuccessCannotAckSupersededGeneration(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	makeFrame := func(index uint32) *protocol.Frame {
+		frame, err := ToFrame(&protocol.SimpleMessage{MessageIndex: index}, DefaultProtocolVersion)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return frame
+	}
+	oob := &delayedOobControl{attempts: make(chan delayedOobAttempt, 2)}
+	client := newControlSyncOobTestClient(ctx, oob)
+	defer client.Cancel()
+	cs := NewControlSyncOob(ctx, client, "generation")
+	defer cs.Close()
+
+	firstAcked := make(chan struct{}, 1)
+	cs.Send(makeFrame(1), func(error) {
+		firstAcked <- struct{}{}
+	})
+	firstAttempt := <-oob.attempts
+
+	secondAcked := make(chan struct{}, 1)
+	cs.Send(makeFrame(2), func(error) {
+		secondAcked <- struct{}{}
+	})
+	secondAttempt := <-oob.attempts
+
+	// The first request was already handed to OOB when the second generation
+	// superseded it. Its late success must not be observable as a current ack.
+	firstAttempt.callback(nil, nil)
+	select {
+	case <-firstAcked:
+		t.Fatal("late success acknowledged the superseded OOB generation")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	secondAttempt.callback(nil, nil)
+	select {
+	case <-secondAcked:
+	case <-time.After(time.Second):
+		t.Fatal("current OOB generation did not acknowledge")
+	}
+}
+
+// Success must claim and retire its generation before invoking arbitrary user
+// code. Otherwise there is a check/act window: a newer Send can supersede the
+// request after its "current" check but before the old ack is published.
+func TestControlSyncOobSuccessClaimsGenerationBeforeAck(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	frame, err := ToFrame(&protocol.SimpleMessage{MessageIndex: 1}, DefaultProtocolVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oob := &delayedOobControl{attempts: make(chan delayedOobAttempt, 1)}
+	client := newControlSyncOobTestClient(ctx, oob)
+	defer client.Cancel()
+	cs := NewControlSyncOob(ctx, client, "atomic-success")
+	defer cs.Close()
+
+	acked := make(chan error, 1)
+	cs.Send(frame, func(error) {
+		cs.sendLock.Lock()
+		generationStillOwned := cs.currentCancel != nil
+		cs.sendLock.Unlock()
+		if generationStillOwned {
+			acked <- errors.New("ack ran before the successful generation was claimed")
+			return
+		}
+		acked <- nil
+	})
+	attempt := <-oob.attempts
+	attempt.callback(nil, nil)
+
+	select {
+	case err := <-acked:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("success callback did not run")
+	}
+}
+
+func TestControlSyncOobSupersessionCancelsProductionRequestContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	makeFrame := func(index uint32) *protocol.Frame {
+		frame, err := ToFrame(&protocol.SimpleMessage{MessageIndex: index}, DefaultProtocolVersion)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return frame
+	}
+	oob := &contextualDelayedOobControl{
+		attempts: make(chan contextualDelayedOobAttempt, 2),
+	}
+	client := newControlSyncOobTestClient(ctx, oob)
+	defer client.Cancel()
+	cs := NewControlSyncOob(ctx, client, "cancel-request")
+	defer cs.Close()
+
+	cs.Send(makeFrame(1), nil)
+	first := <-oob.attempts
+	cs.Send(makeFrame(2), nil)
+	second := <-oob.attempts
+
+	select {
+	case <-first.ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("superseding send did not cancel the old OOB request context")
+	}
+	select {
+	case <-second.ctx.Done():
+		t.Fatal("current OOB request was canceled with its predecessor")
+	default:
+	}
+
+	second.callback(nil, nil)
+	select {
+	case <-second.ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("successful current request did not retire its context")
 	}
 }
 

@@ -61,22 +61,85 @@ func (self *PeerManager) PeersMonitor() *Monitor {
 	return self.peersMonitor
 }
 
+// isConnectedNetworkPeer reports whether clientId is currently announced as a
+// top-level client in this client's network. StreamOpen does not carry the
+// contract's provide mode, so this is the only trustworthy pre-handshake
+// discriminator between an allowed Network-provider stream and a stale
+// Public/FriendsAndFamily stream after those provide modes are disabled.
+func (self *PeerManager) isConnectedNetworkPeer(clientId Id) bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	_, ok := self.connectedPeers[clientId]
+	return ok
+}
+
+// isDisconnectedNetworkPeer reports an explicit, unexpired platform
+// disconnect marker. Public providers may still accept arbitrary clients, but
+// a stream belonging to a client known to have disconnected is stale and must
+// not be resurrected by a delayed StreamOpen/StreamReset.
+func (self *PeerManager) isDisconnectedNetworkPeer(clientId Id) bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	disconnectTime, ok := self.disconnectTimes[clientId]
+	if !ok {
+		return false
+	}
+	return !disconnectTime.Before(
+		time.Now().Add(-self.peerManagerSettings.DisconnectedPeerWindow),
+	)
+}
+
+func (self *PeerManager) disconnectedNetworkPeerIds() map[Id]bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	windowStart := time.Now().Add(-self.peerManagerSettings.DisconnectedPeerWindow)
+	peerIds := map[Id]bool{}
+	for clientId, disconnectTime := range self.disconnectTimes {
+		if !disconnectTime.Before(windowStart) {
+			peerIds[clientId] = true
+		}
+	}
+	return peerIds
+}
+
 // ReceiveFunction
 func (self *PeerManager) Receive(source TransferPath, frames []*protocol.Frame, peer Peer) {
 	if source.IsControlSource() {
+		changed := false
 		for _, frame := range frames {
-			// ignore error
-			self.handleControlFrame(frame)
+			frameChanged, err := self.handleControlFrame(frame)
+			if err == nil && frameChanged {
+				changed = true
+			}
+		}
+		if changed {
+			self.peersMonitor.NotifyAll()
+			// Peer membership is part of strict Network-provider
+			// authorization. Reconcile once after the entire received batch
+			// so Reset+Update does not expose a transient empty peer set, and
+			// so a disconnect retires its already-open stream immediately
+			// instead of leaving P2P admission/retry work until another
+			// provide-mode change.
+			if self.client != nil {
+				allowAny, allowNetwork := self.client.contractManager.inboundProviderStreamPolicy()
+				self.client.streamManager.reconcileInboundProviderStreams(allowAny, allowNetwork)
+				self.client.streamManager.closeDisconnectedPeerStreams(
+					self.disconnectedNetworkPeerIds(),
+				)
+			}
 		}
 	}
 }
 
-func (self *PeerManager) handleControlFrame(frame *protocol.Frame) error {
+func (self *PeerManager) handleControlFrame(frame *protocol.Frame) (bool, error) {
 	switch frame.MessageType {
 	case protocol.MessageType_TransferNetworkPeersReset, protocol.MessageType_TransferNetworkPeersUpdate:
 		message, err := FromFrame(frame)
 		if err != nil {
-			return err
+			return false, err
 		}
 
 		changed := false
@@ -86,14 +149,12 @@ func (self *PeerManager) handleControlFrame(frame *protocol.Frame) error {
 		case *protocol.NetworkPeersUpdate:
 			changed, err = self.updatePeers(v)
 			if err != nil {
-				return err
+				return changed, err
 			}
 		}
-		if changed {
-			self.peersMonitor.NotifyAll()
-		}
+		return changed, nil
 	}
-	return nil
+	return false, nil
 }
 
 func (self *PeerManager) resetPeers() bool {

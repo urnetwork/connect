@@ -53,6 +53,86 @@ func TestClusterIpAssocThresholdSplit(t *testing.T) {
 	AssertEqual(t, false, ok)
 }
 
+func TestSplitIpAssocClusterPreservesRemovalOrder(t *testing.T) {
+	// Nodes 0 and 1 are strongly associated. Node 3 is weakest and is removed
+	// before node 2; the returned rest must retain that order for re-clustering.
+	scratch := &ipAssocScratch{
+		nodeCounts: []uint64{1, 1, 1, 1},
+		adjInit:    []int32{0, 3, 6, 9, 12},
+		adjNodes: []uint32{
+			1, 2, 3,
+			0, 2, 3,
+			0, 1, 3,
+			0, 1, 2,
+		},
+		adjPs: []float64{
+			1, 0.2, 0.1,
+			1, 0.2, 0.1,
+			0.2, 0.2, 0,
+			0.1, 0.1, 0,
+		},
+	}
+	pool := []uint32{0, 1, 2, 3}
+
+	cluster, rest := splitIpAssocCluster(scratch, pool, 0.8)
+
+	AssertEqual(t, []uint32{0, 1}, cluster)
+	AssertEqual(t, []uint32{3, 2}, rest)
+}
+
+func TestSplitIpAssocClusterNoSurvivorPreservesRemovalOrder(t *testing.T) {
+	scratch := &ipAssocScratch{
+		nodeCounts: []uint64{1, 1, 1},
+		adjInit:    []int32{0, 0, 0, 0},
+	}
+	pool := []uint32{0, 1, 2}
+
+	cluster, rest := splitIpAssocCluster(scratch, pool, 0.5)
+
+	AssertEqual(t, 0, len(cluster))
+	AssertEqual(t, []uint32{0, 1, 2}, rest)
+}
+
+func TestSplitIpAssocClusterSteadyStateDoesNotAllocate(t *testing.T) {
+	const nodeCount = 64
+	scratch := &ipAssocScratch{
+		nodeCounts: make([]uint64, nodeCount),
+		adjInit:    make([]int32, nodeCount+1),
+		adjNodes:   make([]uint32, nodeCount*(nodeCount-1)),
+		adjPs:      make([]float64, nodeCount*(nodeCount-1)),
+	}
+	originalPool := make([]uint32, nodeCount)
+	workPool := make([]uint32, nodeCount)
+	edge := 0
+	for node := range nodeCount {
+		scratch.nodeCounts[node] = 1
+		originalPool[node] = uint32(node)
+		scratch.adjInit[node] = int32(edge)
+		for neighbor := range nodeCount {
+			if neighbor == node {
+				continue
+			}
+			scratch.adjNodes[edge] = uint32(neighbor)
+			if 16 <= node && 16 <= neighbor {
+				scratch.adjPs[edge] = 1
+			} else {
+				scratch.adjPs[edge] = 0.1
+			}
+			edge += 1
+		}
+	}
+	scratch.adjInit[nodeCount] = int32(edge)
+	copy(workPool, originalPool)
+	splitIpAssocCluster(scratch, workPool, 0.8)
+
+	allocs := testing.AllocsPerRun(100, func() {
+		copy(workPool, originalPool)
+		splitIpAssocCluster(scratch, workPool, 0.8)
+	})
+
+	AssertEqual(t, 0.0, allocs)
+}
+
 func TestClusterIpAssocComponents(t *testing.T) {
 	a := testingIpAssocAddr("1.0.0.1")
 	b := testingIpAssocAddr("1.0.0.2")

@@ -46,6 +46,7 @@ func TestSendSequenceContractStreamSteering(t *testing.T) {
 		MultiHopId{},
 		false,
 		false,
+		false,
 		sequenceTlsRoleClient,
 		false,
 		sendBufferSettings,

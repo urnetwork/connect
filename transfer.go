@@ -136,6 +136,10 @@ type Peer struct {
 
 // ReceiveFunction is invoked inline by the receive path. A blocked callback
 // intentionally backpressures that path and preserves frame lifetime/order.
+// The frames, frame objects, and their message bytes are borrowed and valid
+// only until the callback returns. Decode, copy, or MessagePoolShareReadOnly
+// any data that must outlive the callback; never hand a borrowed Frame to an
+// asynchronous send, goroutine, or channel.
 type ReceiveFunction = func(source TransferPath, frames []*protocol.Frame, peer Peer)
 
 // a forward callback receives a transfer frame addressed to another destination.
@@ -444,6 +448,10 @@ type TransferOptions struct {
 	CompanionContract bool
 	// force contract streams, even when there are zero intermediaries
 	ForceStream bool
+	// NetworkPeer selects the bounded no-escrow Network contract policy. It is
+	// deliberately independent of ForceStream: public direct streams may use
+	// ForceStream but must retain ordinary escrow sizing and expiry.
+	NetworkPeer bool
 }
 
 func DefaultTransferOpts() TransferOptions {
@@ -451,6 +459,7 @@ func DefaultTransferOpts() TransferOptions {
 		Ack:               true,
 		CompanionContract: false,
 		ForceStream:       false,
+		NetworkPeer:       false,
 	}
 }
 
@@ -515,6 +524,14 @@ type ClientSettings struct {
 	PeerManagerSettings     *PeerManagerSettings
 	WebRtcSettings          *WebRtcSettings
 	EncryptionSettings      *EncryptionSettings
+
+	// ProviderStreamPolicy marks a top-level client whose P2P streams exist to
+	// serve/relay provider traffic. Its stream manager applies provide-mode
+	// reductions to every StreamOpen direction, including return/companion
+	// streams left over from an old public contract. Leave false for ordinary
+	// destination clients: their destination-only streams are outbound work
+	// and must survive their return-traffic provide registration.
+	ProviderStreamPolicy bool
 
 	// ClientKeySeed, when set, is the long-lived Ed25519 client identity key
 	// seed (`ed25519.NewKeyFromSeed`); must be `ed25519.SeedSize` (32) bytes.
@@ -655,11 +672,15 @@ func NewClientWithTag(
 	}
 	client.receiveCallback = client.receive
 
-	routeManager := NewRouteManagerWithLogger(ctx, clientTag, log)
-	contractManager := NewContractManager(ctx, client, settings.ContractManagerSettings)
-	webRtcManager := NewWebRtcManager(ctx, NewClientSignalSender(client), settings.WebRtcSettings)
-	streamManager := NewStreamManager(ctx, client, webRtcManager, settings.StreamManagerSettings)
-	peerManager := NewPeerManager(ctx, client, settings.PeerManagerSettings)
+	// Every manager is owned by this client generation, not by the caller's
+	// potentially process-long parent context. Using the parent here let
+	// route/contract/stream/peer and ICE work survive Client.Close, overlap a
+	// subsequent connect, and produce the macOS reconnect CPU/pause pattern.
+	routeManager := NewRouteManagerWithLogger(client.ctx, clientTag, log)
+	contractManager := NewContractManager(client.ctx, client, settings.ContractManagerSettings)
+	webRtcManager := NewWebRtcManager(client.ctx, NewClientSignalSender(client), settings.WebRtcSettings)
+	streamManager := NewStreamManager(client.ctx, client, webRtcManager, settings.StreamManagerSettings)
+	peerManager := NewPeerManager(client.ctx, client, settings.PeerManagerSettings)
 	// ClientKeyManager must precede EncryptionSessionManager — the latter holds
 	// a reference to sign the published TLS cert
 	// (`EncryptedKey.ClientKeySignedTlsCertificate`) and per-peer identity proofs.
@@ -672,9 +693,12 @@ func NewClientWithTag(
 
 	// client.contractManagerUnsub = client.AddReceiveCallback(contractManager.Receive)
 	client.webRtcManagerUnsub = ReceiveSignalsFromClient(client, webRtcManager)
-	client.streamManagerUnsub = client.AddReceiveCallback(streamManager.Receive)
 	client.peerManager = peerManager
+	// Peer state must be applied before StreamOpen/StreamReset from the same
+	// control batch. A Network-only provider uses that state to distinguish a
+	// valid same-network endpoint from stale public provider work.
 	client.peerManagerUnsub = client.AddReceiveCallback(peerManager.Receive)
+	client.streamManagerUnsub = client.AddReceiveCallback(streamManager.Receive)
 
 	client.initBuffers(routeManager, contractManager, webRtcManager, streamManager, clientKeyManager, encryptionSessionManager)
 
@@ -1893,6 +1917,9 @@ func (self *Client) Close() {
 	if self.encryptionSessionManager != nil {
 		self.encryptionSessionManager.Close()
 	}
+	if self.webRtcManager != nil {
+		self.webRtcManager.Close()
+	}
 
 	// self.contractManagerUnsub()
 	self.webRtcManagerUnsub()
@@ -1906,6 +1933,9 @@ func (self *Client) Cancel() {
 	self.sendBuffer.Cancel()
 	self.receiveBuffer.Cancel()
 	self.forwardBuffer.Cancel()
+	if self.webRtcManager != nil {
+		self.webRtcManager.Close()
+	}
 }
 
 // CloseContractStats fires the close events for all of this client's open
@@ -2107,6 +2137,7 @@ func (self *SendBuffer) createSendSequence(id sendSequenceId, sendPack *SendPack
 		sendPack.IntermediaryIds,
 		sendPack.TransferOptions.CompanionContract,
 		sendPack.TransferOptions.ForceStream,
+		sendPack.TransferOptions.NetworkPeer,
 		sendPack.EncryptionRole,
 		sendPack.EncryptionCompanion,
 		self.sendBufferSettings,
@@ -2119,30 +2150,47 @@ func (self *SendBuffer) createSendSequence(id sendSequenceId, sendPack *SendPack
 	return sendSequence
 }
 
+// closeSendSequence removes all buffer-wide indexes before draining the
+// sequence. Draining invokes intentionally synchronous acknowledgement
+// callbacks, so it must happen after the map lock is released.
+func (self *SendBuffer) closeSendSequence(
+	id sendSequenceId,
+	wireId sendSequenceWireId,
+	sendSequence *SendSequence,
+) {
+	self.mutex.Lock()
+	// clean up
+	if sendSequence == self.sendSequences[id] {
+		delete(self.sendSequences, id)
+	}
+	if sendSequence == self.wireSendSequences[wireId] {
+		delete(self.wireSendSequences, wireId)
+	}
+	if destinations, ok := self.sendSequenceDestinations[sendSequence]; ok {
+		for destination := range destinations {
+			if sendSequences, ok := self.sendSequencesByDestination[destination]; ok {
+				delete(sendSequences, sendSequence)
+				if len(sendSequences) == 0 {
+					delete(self.sendSequencesByDestination, destination)
+				}
+			}
+		}
+		delete(self.sendSequenceDestinations, sendSequence)
+	}
+	self.mutex.Unlock()
+
+	// Close drains queued packs and invokes their completion callbacks.
+	// Those callbacks are intentional backpressure and may block. Never
+	// invoke them while holding the buffer-wide sequence-map lock: one
+	// stalled destination must not prevent unrelated destinations from
+	// finding or creating their own send sequence.
+	sendSequence.Close()
+}
+
 func (self *SendBuffer) runSendSequence(id sendSequenceId, wireId sendSequenceWireId, sendSequence *SendSequence) {
 	HandleError(func() {
 		defer func() {
-			self.mutex.Lock()
-			defer self.mutex.Unlock()
-			sendSequence.Close()
-			// clean up
-			if sendSequence == self.sendSequences[id] {
-				delete(self.sendSequences, id)
-			}
-			if sendSequence == self.wireSendSequences[wireId] {
-				delete(self.wireSendSequences, wireId)
-			}
-			if destinations, ok := self.sendSequenceDestinations[sendSequence]; ok {
-				for destination := range destinations {
-					if sendSequences, ok := self.sendSequencesByDestination[destination]; ok {
-						delete(sendSequences, sendSequence)
-						if len(sendSequences) == 0 {
-							delete(self.sendSequencesByDestination, destination)
-						}
-					}
-				}
-				delete(self.sendSequenceDestinations, sendSequence)
-			}
+			self.closeSendSequence(id, wireId, sendSequence)
 		}()
 		sendSequence.Run()
 	})
@@ -2190,7 +2238,16 @@ func (self *SendBuffer) Pack(sendPack *SendPack, timeout time.Duration) (bool, e
 // pack uses the SendBuffer's ctx — the session ctx must not propagate into
 // `SendPack.Ctx`, since SendBuffer.Pack treats a canceled `SendPack.Ctx` as a
 // sequence problem and cancels the SendSequence.
-func (self *SendBuffer) SendEncryptedControl(ctx context.Context, peerId Id, role sequenceTlsRole, ec *protocol.EncryptedControl, encryptionCompanion bool, contractCompanion bool, forceStream bool) bool {
+func (self *SendBuffer) SendEncryptedControl(
+	ctx context.Context,
+	peerId Id,
+	role sequenceTlsRole,
+	ec *protocol.EncryptedControl,
+	encryptionCompanion bool,
+	contractCompanion bool,
+	forceStream bool,
+	networkPeer bool,
+) bool {
 	select {
 	case <-ctx.Done():
 		return false
@@ -2228,6 +2285,7 @@ func (self *SendBuffer) SendEncryptedControl(ctx context.Context, peerId Id, rol
 	// companion carriers stay off streams: the platform rejects companion
 	// stream contracts (see the V(2) diagnostic below)
 	opts.ForceStream = forceStream && !contractCompanion
+	opts.NetworkPeer = networkPeer && !contractCompanion
 	// V(2) diagnostic: in symmetric mode no encryption-control carrier should
 	// be a companion. Log the decision so a companion carrier (whose Stream-mode
 	// contract the platform rejects → handshake stalls) can be caught.
@@ -2386,6 +2444,11 @@ type SendSequence struct {
 	intermediaryIds   MultiHopId
 	companionContract bool
 	forceStream       bool
+	// networkPeer is immutable contract policy captured from the first Pack.
+	// It is intentionally absent from sendSequenceId/wire identity: changing a
+	// local sizing hint must never fork two receiver-indistinguishable
+	// sequences.
+	networkPeer bool
 	// encryptionRole is the per-peer session role this send sequence uses:
 	// client for normal application data (the default), server for
 	// EncryptedControl carriers and server-session replies.
@@ -2446,6 +2509,7 @@ func NewSendSequence(
 	intermediaryIds MultiHopId,
 	companionContract bool,
 	forceStream bool,
+	networkPeer bool,
 	encryptionRole sequenceTlsRole,
 	encryptionCompanion bool,
 	sendBufferSettings *SendBufferSettings) *SendSequence {
@@ -2471,6 +2535,7 @@ func NewSendSequence(
 		intermediaryIds:     intermediaryIds,
 		companionContract:   companionContract,
 		forceStream:         forceStream,
+		networkPeer:         networkPeer,
 		encryptionRole:      encryptionRole,
 		encryptionCompanion: encryptionCompanion,
 		sequenceId:          NewId(),
@@ -2498,7 +2563,13 @@ func NewSendSequence(
 		// re-initiates, rebuilding a peer's lost responder session); a
 		// server-role send sequence (EncryptedControl carrier / server
 		// reply) never restarts.
-		seq.session = client.encryptionSessionManager.AcquireForSend(destination.DestinationId, encryptionRole, encryptionCompanion, forceStream)
+		seq.session = client.encryptionSessionManager.AcquireForSend(
+			destination.DestinationId,
+			encryptionRole,
+			encryptionCompanion,
+			forceStream,
+			networkPeer,
+		)
 	}
 	return seq
 }
@@ -2693,6 +2764,7 @@ func (self *SendSequence) Run() {
 			IntermediaryIds:     self.intermediaryIds,
 			CompanionContract:   self.companionContract,
 			ForceStream:         self.forceStream,
+			NetworkPeer:         self.networkPeer,
 			EncryptionRole:      self.encryptionRole,
 			EncryptionCompanion: self.encryptionCompanion,
 		}
@@ -3126,6 +3198,7 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 				IntermediaryIds:     self.intermediaryIds,
 				CompanionContract:   self.companionContract,
 				ForceStream:         self.forceStream,
+				NetworkPeer:         self.networkPeer,
 				EncryptionRole:      self.encryptionRole,
 				EncryptionCompanion: self.encryptionCompanion,
 			}
@@ -3188,6 +3261,7 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 				IntermediaryIds:     self.intermediaryIds,
 				CompanionContract:   self.companionContract,
 				ForceStream:         self.forceStream,
+				NetworkPeer:         self.networkPeer,
 				EncryptionRole:      self.encryptionRole,
 				EncryptionCompanion: self.encryptionCompanion,
 			}
@@ -3643,8 +3717,13 @@ func (self *SendSequence) receiveAck(messageId Id, selective bool, tag sequenceT
 		return
 	}
 
+	// `ackItem` returns each acknowledged item to the process-wide send-item
+	// pool. The target item can therefore be zeroed and reused by another
+	// SendSequence while this cumulative-ack loop is still advancing. Snapshot
+	// the boundary before returning anything; never read `item` afterward.
+	ackSequenceNumber := item.sequenceNumber
 	if self.log.V(1).Enabled() {
-		self.log.Infof("[s]ack %d %s->%s...%s s(%s)\n", item.sequenceNumber, self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId)
+		self.log.Infof("[s]ack %d %s->%s...%s s(%s)\n", ackSequenceNumber, self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId)
 	}
 
 	// acks are cumulative
@@ -3652,9 +3731,10 @@ func (self *SendSequence) receiveAck(messageId Id, selective bool, tag sequenceT
 	i := 0
 	for ; i < len(self.sendItems); i += 1 {
 		implicitItem := self.sendItems[i]
-		if item.sequenceNumber < implicitItem.sequenceNumber {
+		implicitSequenceNumber := implicitItem.sequenceNumber
+		if ackSequenceNumber < implicitSequenceNumber {
 			if self.log.V(2).Enabled() {
-				self.log.Infof("[s]ack %d <> %d/%d (stop) %s->%s...%s s(%s)\n", item.sequenceNumber, implicitItem.sequenceNumber, self.nextSequenceNumber-1, self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId)
+				self.log.Infof("[s]ack %d <> %d/%d (stop) %s->%s...%s s(%s)\n", ackSequenceNumber, implicitSequenceNumber, self.nextSequenceNumber-1, self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId)
 			}
 			break
 		}
@@ -3676,13 +3756,13 @@ func (self *SendSequence) receiveAck(messageId Id, selective bool, tag sequenceT
 
 		if self.log.V(2).Enabled() {
 			c, d := self.resendQueue.QueueSize()
-			self.log.Infof("[s]ack %d <> %d/%d (pass %d->%d %dB->%dB) %s->%s...%s s(%s)\n", item.sequenceNumber, implicitItem.sequenceNumber, self.nextSequenceNumber-1, a, c, b, d, self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId)
+			self.log.Infof("[s]ack %d <> %d/%d (pass %d->%d %dB->%dB) %s->%s...%s s(%s)\n", ackSequenceNumber, implicitSequenceNumber, self.nextSequenceNumber-1, a, c, b, d, self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId)
 		}
 	}
 	self.sendItems = self.sendItems[i:]
 	if self.log.V(2).Enabled() {
 		a, b := self.resendQueue.QueueSize()
-		self.log.Infof("[s]ack %d/%d (stop %d %dB %d) %s->%s...%s s(%s)\n", item.sequenceNumber, self.nextSequenceNumber-1, a, b, len(self.sendItems), self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId)
+		self.log.Infof("[s]ack %d/%d (stop %d %dB %d) %s->%s...%s s(%s)\n", ackSequenceNumber, self.nextSequenceNumber-1, a, b, len(self.sendItems), self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId)
 	}
 }
 
@@ -4087,6 +4167,12 @@ type receiveSequenceHeadKey struct {
 	EncryptionCompanion bool
 }
 
+// rejectedReceiveSequenceCapacity bounds permanent receive-sequence
+// tombstones. One bad contract is deterministic for that sequence id; without
+// a tombstone, every sender retransmit recreated the sequence, reverified the
+// same contract, and emitted the same error chain at the cold resend cadence.
+const rejectedReceiveSequenceCapacity = 1024
+
 type ReceiveBuffer struct {
 	ctx    context.Context
 	client *Client
@@ -4099,18 +4185,127 @@ type ReceiveBuffer struct {
 	// source id -> receive sequence
 	receiveSequences       map[receiveSequenceId]*ReceiveSequence
 	headReceiveSequenceIds map[receiveSequenceHeadKey]receiveSequenceId
+	// rejectedReceiveSequenceIds stores the newest permanently rejected
+	// sequence per source/session key. The FIFO bounds memory across a
+	// process-long succession of hostile or stale peers.
+	rejectedReceiveSequenceIds   map[receiveSequenceHeadKey]Id
+	rejectedReceiveSequenceOrder []receiveSequenceHeadKey
 }
 
 func NewReceiveBuffer(ctx context.Context,
 	client *Client,
 	receiveBufferSettings *ReceiveBufferSettings) *ReceiveBuffer {
 	return &ReceiveBuffer{
-		ctx:                    ctx,
-		client:                 client,
-		log:                    client.log,
-		receiveBufferSettings:  receiveBufferSettings,
-		receiveSequences:       map[receiveSequenceId]*ReceiveSequence{},
-		headReceiveSequenceIds: map[receiveSequenceHeadKey]receiveSequenceId{},
+		ctx:                        ctx,
+		client:                     client,
+		log:                        client.log,
+		receiveBufferSettings:      receiveBufferSettings,
+		receiveSequences:           map[receiveSequenceId]*ReceiveSequence{},
+		headReceiveSequenceIds:     map[receiveSequenceHeadKey]receiveSequenceId{},
+		rejectedReceiveSequenceIds: map[receiveSequenceHeadKey]Id{},
+		rejectedReceiveSequenceOrder: make(
+			[]receiveSequenceHeadKey,
+			0,
+			rejectedReceiveSequenceCapacity,
+		),
+	}
+}
+
+// removeRejectedReceiveSequenceWithLock removes one tombstone and its bounded
+// FIFO entry. Caller holds mutex; rejection is rare, so the bounded linear
+// removal avoids another index map.
+func (self *ReceiveBuffer) removeRejectedReceiveSequenceWithLock(
+	headKey receiveSequenceHeadKey,
+) {
+	if _, ok := self.rejectedReceiveSequenceIds[headKey]; !ok {
+		return
+	}
+	delete(self.rejectedReceiveSequenceIds, headKey)
+	for i, key := range self.rejectedReceiveSequenceOrder {
+		if key != headKey {
+			continue
+		}
+		copy(
+			self.rejectedReceiveSequenceOrder[i:],
+			self.rejectedReceiveSequenceOrder[i+1:],
+		)
+		lastIndex := len(self.rejectedReceiveSequenceOrder) - 1
+		self.rejectedReceiveSequenceOrder[lastIndex] = receiveSequenceHeadKey{}
+		self.rejectedReceiveSequenceOrder =
+			self.rejectedReceiveSequenceOrder[:lastIndex]
+		return
+	}
+}
+
+// rejectReceiveSequenceWithLock records the newest deterministic contract
+// failure for one source/session key. Caller holds mutex.
+func (self *ReceiveBuffer) rejectReceiveSequenceWithLock(
+	headKey receiveSequenceHeadKey,
+	sequenceId Id,
+) {
+	if rejectedSequenceId, ok := self.rejectedReceiveSequenceIds[headKey]; ok {
+		if rejectedSequenceId.LessThan(sequenceId) {
+			self.rejectedReceiveSequenceIds[headKey] = sequenceId
+		}
+		return
+	}
+	if rejectedReceiveSequenceCapacity <= len(self.rejectedReceiveSequenceOrder) {
+		oldestHeadKey := self.rejectedReceiveSequenceOrder[0]
+		delete(self.rejectedReceiveSequenceIds, oldestHeadKey)
+		copy(
+			self.rejectedReceiveSequenceOrder,
+			self.rejectedReceiveSequenceOrder[1:],
+		)
+		lastIndex := len(self.rejectedReceiveSequenceOrder) - 1
+		self.rejectedReceiveSequenceOrder[lastIndex] = receiveSequenceHeadKey{}
+		self.rejectedReceiveSequenceOrder =
+			self.rejectedReceiveSequenceOrder[:lastIndex]
+	}
+	self.rejectedReceiveSequenceIds[headKey] = sequenceId
+	self.rejectedReceiveSequenceOrder =
+		append(self.rejectedReceiveSequenceOrder, headKey)
+}
+
+// rejectReceiveSequenceRetransmitWithLock reports whether an incoming sequence
+// is the rejected id (or an older one it superseded). A genuinely newer
+// sequence clears the tombstone and can present a fresh contract. Caller holds
+// mutex.
+func (self *ReceiveBuffer) rejectReceiveSequenceRetransmitWithLock(
+	headKey receiveSequenceHeadKey,
+	sequenceId Id,
+) bool {
+	rejectedSequenceId, ok := self.rejectedReceiveSequenceIds[headKey]
+	if !ok {
+		return false
+	}
+	if sequenceId == rejectedSequenceId ||
+		sequenceId.LessThan(rejectedSequenceId) {
+		return true
+	}
+	self.removeRejectedReceiveSequenceWithLock(headKey)
+	return false
+}
+
+// removeReceiveSequenceWithLock removes one completed worker without disturbing
+// a newer worker that already became the head. Caller holds mutex. Run has
+// returned (or WaitForExit has completed), so rejectRetransmits is stable.
+func (self *ReceiveBuffer) removeReceiveSequenceWithLock(
+	receiveSequenceId receiveSequenceId,
+	headKey receiveSequenceHeadKey,
+	receiveSequence *ReceiveSequence,
+) {
+	if receiveSequence != self.receiveSequences[receiveSequenceId] {
+		return
+	}
+	if receiveSequence.rejectRetransmits {
+		self.rejectReceiveSequenceWithLock(
+			headKey,
+			receiveSequenceId.SequenceId,
+		)
+	}
+	delete(self.receiveSequences, receiveSequenceId)
+	if self.headReceiveSequenceIds[headKey] == receiveSequenceId {
+		delete(self.headReceiveSequenceIds, headKey)
 	}
 }
 
@@ -4131,40 +4326,65 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 	}
 
 	initReceiveSequence := func(skip *ReceiveSequence) *ReceiveSequence {
-		self.mutex.Lock()
-		defer self.mutex.Unlock()
+		for {
+			self.mutex.Lock()
 
-		receiveSequence, ok := self.receiveSequences[receiveSequenceId]
-		if ok {
-			if skip == nil || skip != receiveSequence {
-				return receiveSequence
-			} else {
-				receiveSequence.Cancel()
-				// delete(self.receiveSequences, receiveSequenceId)
-				// delete(self.headSequenceIds, headKey)
-			}
-			if headReceiveSequenceId := self.headReceiveSequenceIds[headKey]; headReceiveSequenceId != receiveSequenceId {
-				panic(fmt.Errorf("[r]incorrect head sequence %s != %s\n", headReceiveSequenceId.SequenceId, receivePack.SequenceId))
-			}
-		} else if headReceiveSequenceId, ok := self.headReceiveSequenceIds[headKey]; ok {
-			if receivePack.SequenceId.LessThan(headReceiveSequenceId.SequenceId) {
-				// drop older sequences for source
-				// this case happens when a client closes a sequence, then opens a new one,
-				// before messages from the first are received.
-				// A PERSISTENT stream of these drops for one source is the
-				// signature of a sender-side sequence-key fork: two live send
-				// sequences whose frames are indistinguishable on the wire
-				// (same source, role, companion) — see `carrierForceStream`.
-				if self.log.V(1).Enabled() {
-					self.log.Infof("[r]drop older sequence %s < %s (%s %s c=%t)\n",
-						receivePack.SequenceId, headReceiveSequenceId.SequenceId,
-						receivePack.Source, receivePack.EncryptionRole, receivePack.EncryptionCompanion)
-				}
+			if self.rejectReceiveSequenceRetransmitWithLock(
+				headKey,
+				receiveSequenceId.SequenceId,
+			) {
+				self.mutex.Unlock()
 				receivePack.messagePoolReturn()
 				return nil
-			} else {
-				// newer sequence for source
+			}
+
+			receiveSequence, ok := self.receiveSequences[receiveSequenceId]
+			if ok {
+				if skip == nil || skip != receiveSequence {
+					self.mutex.Unlock()
+					return receiveSequence
+				}
+				if headReceiveSequenceId := self.headReceiveSequenceIds[headKey]; headReceiveSequenceId != receiveSequenceId {
+					self.mutex.Unlock()
+					panic(fmt.Errorf("[r]incorrect head sequence %s != %s\n", headReceiveSequenceId.SequenceId, receivePack.SequenceId))
+				}
+
+				// Pack observed this worker closing. Preserve in-order callback
+				// backpressure for this source, but wait outside the global map
+				// lock so unrelated sources can continue.
+				receiveSequence.Cancel()
+				self.mutex.Unlock()
+				receiveSequence.WaitForExit()
+				self.mutex.Lock()
+				self.removeReceiveSequenceWithLock(
+					receiveSequenceId,
+					headKey,
+					receiveSequence,
+				)
+				self.mutex.Unlock()
+				continue
+			}
+
+			if headReceiveSequenceId, headOk := self.headReceiveSequenceIds[headKey]; headOk {
+				if receivePack.SequenceId.LessThan(headReceiveSequenceId.SequenceId) {
+					// drop older sequences for source
+					// this case happens when a client closes a sequence, then opens a new one,
+					// before messages from the first are received.
+					// A PERSISTENT stream of these drops for one source is the
+					// signature of a sender-side sequence-key fork: two live send
+					// sequences whose frames are indistinguishable on the wire
+					// (same source, role, companion) — see `carrierForceStream`.
+					if self.log.V(1).Enabled() {
+						self.log.Infof("[r]drop older sequence %s < %s (%s %s c=%t)\n",
+							receivePack.SequenceId, headReceiveSequenceId.SequenceId,
+							receivePack.Source, receivePack.EncryptionRole, receivePack.EncryptionCompanion)
+					}
+					self.mutex.Unlock()
+					receivePack.messagePoolReturn()
+					return nil
+				}
 				if headReceiveSequenceId.SequenceId == receivePack.SequenceId {
+					self.mutex.Unlock()
 					panic(fmt.Errorf("[r]upgrade older sequence %s = %s\n", headReceiveSequenceId.SequenceId, receivePack.SequenceId))
 				}
 				if self.log.V(1).Enabled() {
@@ -4173,43 +4393,65 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 						receivePack.Source, receivePack.EncryptionRole, receivePack.EncryptionCompanion)
 				}
 				headReceiveSequence := self.receiveSequences[headReceiveSequenceId]
-				headReceiveSequence.Cancel()
-				// wait for exit to ensure receives are correctly ordered across sequence versions
-				headReceiveSequence.WaitForExit()
-				delete(self.receiveSequences, headReceiveSequenceId)
-			}
-		}
-
-		if self.log.V(2).Enabled() {
-			self.log.Infof("[r]new sequence %s\n", receivePack.SequenceId)
-		}
-
-		receiveSequence = NewReceiveSequence(
-			self.ctx,
-			self.client,
-			receivePack.Source,
-			receivePack.SequenceId,
-			receivePack.EncryptionRole,
-			receivePack.EncryptionCompanion,
-			self.receiveBufferSettings,
-		)
-		self.receiveSequences[receiveSequenceId] = receiveSequence
-		self.headReceiveSequenceIds[headKey] = receiveSequenceId
-		go HandleError(func() {
-			defer func() {
-				self.mutex.Lock()
-				defer self.mutex.Unlock()
-				receiveSequence.Close()
-				// clean up
-				if receiveSequence == self.receiveSequences[receiveSequenceId] {
-					delete(self.receiveSequences, receiveSequenceId)
-					// `headKey`/`receiveSequenceId` are values (no pointer to receivePack)
+				if headReceiveSequence == nil {
+					// Heal a stale index defensively. Normal lifecycle cleanup
+					// removes both entries atomically under this lock.
 					delete(self.headReceiveSequenceIds, headKey)
+					self.mutex.Unlock()
+					continue
 				}
-			}()
-			receiveSequence.Run()
-		})
-		return receiveSequence
+				headReceiveSequence.Cancel()
+				self.mutex.Unlock()
+
+				// A receive callback may deliberately block. It still orders
+				// replacement for this source, but must not hold the
+				// buffer-wide map lock and stall every other peer.
+				headReceiveSequence.WaitForExit()
+				self.mutex.Lock()
+				self.removeReceiveSequenceWithLock(
+					headReceiveSequenceId,
+					headKey,
+					headReceiveSequence,
+				)
+				self.mutex.Unlock()
+				continue
+			}
+
+			if self.log.V(2).Enabled() {
+				self.log.Infof("[r]new sequence %s\n", receivePack.SequenceId)
+			}
+
+			receiveSequence = NewReceiveSequence(
+				self.ctx,
+				self.client,
+				receivePack.Source,
+				receivePack.SequenceId,
+				receivePack.EncryptionRole,
+				receivePack.EncryptionCompanion,
+				self.receiveBufferSettings,
+			)
+			self.receiveSequences[receiveSequenceId] = receiveSequence
+			self.headReceiveSequenceIds[headKey] = receiveSequenceId
+			self.mutex.Unlock()
+
+			go HandleError(func() {
+				defer func() {
+					self.mutex.Lock()
+					self.removeReceiveSequenceWithLock(
+						receiveSequenceId,
+						headKey,
+						receiveSequence,
+					)
+					self.mutex.Unlock()
+
+					// Close can wait for a concurrent Pack to observe
+					// cancellation. Keep that wait outside the global map lock.
+					receiveSequence.Close()
+				}()
+				receiveSequence.Run()
+			})
+			return receiveSequence
+		}
 	}
 
 	var receiveSequence *ReceiveSequence
@@ -4341,6 +4583,11 @@ type ReceiveSequence struct {
 	// alive for the stream's lifetime; released when the sequence terminates.
 	// Nil when encryption is disabled or this is control-plane traffic.
 	session *peerEncryptionSession
+
+	// rejectRetransmits is set when this sequence presents a malformed,
+	// unverifiable, or otherwise unusable contract. The owning ReceiveBuffer
+	// reads it after Run returns and tombstones the deterministic failure.
+	rejectRetransmits bool
 }
 
 func NewReceiveSequence(
@@ -5144,6 +5391,7 @@ func (self *ReceiveSequence) registerContracts(item *receiveItem) error {
 	var contract protocol.Contract
 	err := ProtoUnmarshal(item.contractFrame.MessageBytes, &contract)
 	if err != nil {
+		self.rejectRetransmits = true
 		// bad message
 		// close sequence
 		self.peerAudit.Update(func(a *PeerAudit) {
@@ -5157,7 +5405,15 @@ func (self *ReceiveSequence) registerContracts(item *receiveItem) error {
 		contract.StoredContractHmac,
 		contract.StoredContractBytes,
 		contract.ProvideMode) {
+		self.rejectRetransmits = true
 		self.log.Errorf("[r]%s<-%s s(%s) exit contract verification failed (%s)\n", self.client.ClientTag(), self.source.SourceId, self.source.StreamId, contract.ProvideMode)
+		// A failed provider contract ends the stream, not just this receive
+		// sequence. Leaving StreamOpen alive keeps its P2P transport retrying
+		// admission/ICE forever even though every replacement sequence will
+		// fail the same provide-mode verification.
+		if self.client.streamManager != nil {
+			self.client.streamManager.streamBuffer.CloseStream(self.source.StreamId)
+		}
 		// bad contract
 		// close sequence
 		self.peerAudit.Update(func(a *PeerAudit) {
@@ -5174,6 +5430,7 @@ func (self *ReceiveSequence) registerContracts(item *receiveItem) error {
 		1.0,
 	)
 	if err != nil {
+		self.rejectRetransmits = true
 		// bad contract
 		// close sequence
 		self.peerAudit.Update(func(a *PeerAudit) {
@@ -5183,6 +5440,7 @@ func (self *ReceiveSequence) registerContracts(item *receiveItem) error {
 	}
 
 	if err := self.setContract(nextReceiveContract); err != nil {
+		self.rejectRetransmits = true
 		// the next contract has already been used
 		// bad contract
 		// close sequence
@@ -5776,12 +6034,15 @@ func (self *ForwardBuffer) Pack(forwardPack *ForwardPack, timeout time.Duration)
 		go HandleError(func() {
 			defer func() {
 				self.mutex.Lock()
-				defer self.mutex.Unlock()
-				forwardSequence.Close()
 				// clean up
 				if forwardSequence == self.forwardSequences[forwardPack.Destination] {
 					delete(self.forwardSequences, forwardPack.Destination)
 				}
+				self.mutex.Unlock()
+
+				// Close may wait for a concurrent Pack to observe cancellation;
+				// do not turn that per-destination wait into a buffer-wide lock.
+				forwardSequence.Close()
 			}()
 			forwardSequence.Run()
 		})

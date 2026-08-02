@@ -1,20 +1,53 @@
 package connect
 
 import (
-	mathrand "math/rand"
 	"testing"
 	"time"
 )
 
 func TestWakeupTime(t *testing.T) {
 	wakeupEpoch := 1 * time.Second
-
-	for range 32 {
-		now := time.Now()
-		w := wakeupEpoch * ((time.Duration(now.UnixNano())*time.Nanosecond + wakeupEpoch - 1) / wakeupEpoch)
-		AssertEqual(t, time.Duration(WakeupTime(now, wakeupEpoch).UnixMilli())*time.Millisecond, w)
-		select {
-		case <-time.After(time.Duration(mathrand.Intn(1000)) * time.Millisecond):
-		}
+	cases := []struct {
+		input    time.Duration
+		expected time.Duration
+	}{
+		{
+			input:    0,
+			expected: 0,
+		},
+		{
+			input:    1,
+			expected: wakeupEpoch,
+		},
+		{
+			input:    wakeupEpoch - 1,
+			expected: wakeupEpoch,
+		},
+		{
+			input:    wakeupEpoch,
+			expected: wakeupEpoch,
+		},
+		{
+			input:    wakeupEpoch + 1,
+			expected: 2 * wakeupEpoch,
+		},
 	}
+
+	for _, c := range cases {
+		inputTime := time.Unix(0, int64(c.input))
+		actual := time.Duration(WakeupTime(inputTime, wakeupEpoch).UnixNano())
+		AssertEqual(t, c.expected, actual)
+	}
+}
+
+func TestResetWakeupTimerDoesNotAllocate(t *testing.T) {
+	timer := time.NewTimer(time.Hour)
+	defer timer.Stop()
+	resetWakeupTimer(timer, time.Hour, time.Second)
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		resetWakeupTimer(timer, time.Hour, time.Second)
+	})
+
+	AssertEqual(t, 0.0, allocs)
 }

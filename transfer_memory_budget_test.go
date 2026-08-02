@@ -105,7 +105,7 @@ func TestTransferMemoryBudgetTryReserveExactConcurrentCeiling(t *testing.T) {
 
 func TestTransferMemoryBudgetCapacityNotificationIsLazy(t *testing.T) {
 	budget := NewTransferMemoryBudget(kib(64))
-	if budget.notify != nil {
+	if budget.notify.Load() != nil {
 		t.Fatal("budget eagerly allocated a capacity notification")
 	}
 
@@ -113,7 +113,7 @@ func TestTransferMemoryBudgetCapacityNotificationIsLazy(t *testing.T) {
 		budget.Reserve(1)
 		budget.Release(1)
 	}
-	if budget.notify != nil {
+	if budget.notify.Load() != nil {
 		t.Fatal("release allocated a notification without a waiter")
 	}
 
@@ -128,12 +128,208 @@ func TestTransferMemoryBudgetCapacityNotificationIsLazy(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("subscribed capacity waiter was not notified")
 	}
-	if budget.notify != nil {
+	if budget.notify.Load() != nil {
 		t.Fatal("release eagerly allocated the next notification generation")
 	}
 	if next := budget.CapacityNotify(); next == notify {
 		t.Fatal("new waiter reused a closed notification generation")
 	}
+}
+
+func TestTransferMemoryBudgetCapacityNotificationWakesConcurrentSubscribers(t *testing.T) {
+	const waiterCount = 64
+	budget := NewTransferMemoryBudget(1)
+	budget.Reserve(1)
+
+	start := make(chan struct{})
+	notifies := make(chan (<-chan struct{}), waiterCount)
+	var wg sync.WaitGroup
+	for range waiterCount {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			notifies <- budget.CapacityNotify()
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(notifies)
+
+	var shared <-chan struct{}
+	for notify := range notifies {
+		if shared == nil {
+			shared = notify
+		} else if notify != shared {
+			t.Fatal("concurrent subscribers observed different notification generations")
+		}
+	}
+	budget.Release(1)
+	select {
+	case <-shared:
+	case <-time.After(time.Second):
+		t.Fatal("release did not wake concurrent capacity subscribers")
+	}
+}
+
+func TestTransferMemoryBudgetCapacityNotificationHasNoReleaseRace(t *testing.T) {
+	budget := NewTransferMemoryBudget(1)
+	AssertEqual(t, true, budget.TryReserve(1))
+	deadline := time.After(10 * time.Second)
+
+	for range 10_000 {
+		notify := budget.CapacityNotify()
+		releaseDone := make(chan struct{})
+		go func() {
+			budget.Release(1)
+			close(releaseDone)
+		}()
+
+		if !budget.TryReserve(1) {
+			select {
+			case <-notify:
+			case <-deadline:
+				t.Fatal("release raced past its capacity subscriber")
+			}
+			if !budget.TryReserve(1) {
+				t.Fatal("capacity remained unavailable after release notification")
+			}
+		}
+		<-releaseDone
+	}
+	budget.Release(1)
+}
+
+func TestTransferMemoryBudgetAdmissionReleaseWakesOnlyCapacityFit(t *testing.T) {
+	const waiterCount = 64
+	budget := NewTransferMemoryBudget(1)
+	budget.Reserve(1)
+
+	waiters := make([]*transferMemoryBudgetWaiter, waiterCount)
+	notifies := make([]<-chan struct{}, waiterCount)
+	for i := range waiterCount {
+		waiters[i] = newTransferMemoryBudgetWaiter()
+		notifies[i] = waiters[i].subscribe(budget, 1)
+	}
+	defer func() {
+		for _, waiter := range waiters {
+			waiter.reset()
+		}
+	}()
+
+	budget.Release(1)
+	wokenCount := 0
+	for _, notify := range notifies {
+		select {
+		case <-notify:
+			wokenCount += 1
+		default:
+		}
+	}
+	AssertEqual(t, wokenCount, 1)
+	AssertEqual(t, budget.capacityWaiterCount.Load(), int64(waiterCount-1))
+
+	if !budget.TryReserve(1) {
+		t.Fatal("the single notified admission could not reserve released capacity")
+	}
+	budget.Release(1)
+	wokenCount = 0
+	for _, notify := range notifies {
+		select {
+		case <-notify:
+			wokenCount += 1
+		default:
+		}
+	}
+	AssertEqual(t, wokenCount, 1)
+	AssertEqual(t, budget.capacityWaiterCount.Load(), int64(waiterCount-2))
+}
+
+func TestTransferMemoryBudgetAdmissionReleaseSkipsIneligibleHead(t *testing.T) {
+	budget := NewTransferMemoryBudget(10)
+	budget.Reserve(10)
+	largeWaiter := newTransferMemoryBudgetWaiter()
+	smallWaiter := newTransferMemoryBudgetWaiter()
+	defer largeWaiter.reset()
+	defer smallWaiter.reset()
+
+	largeNotify := largeWaiter.subscribe(budget, 8)
+	smallNotify := smallWaiter.subscribe(budget, 3)
+	budget.Release(3)
+	select {
+	case <-largeNotify:
+		t.Fatal("partial capacity woke an ineligible large admission")
+	default:
+	}
+	select {
+	case <-smallNotify:
+	default:
+		t.Fatal("eligible admission behind a large waiter was not woken")
+	}
+
+	budget.Release(5)
+	select {
+	case <-largeNotify:
+	default:
+		t.Fatal("large admission was not woken when enough capacity accumulated")
+	}
+}
+
+func TestTransferMemoryBudgetAdmissionResizeWakesOnlyNewCapacityFit(t *testing.T) {
+	budget := NewTransferMemoryBudget(1)
+	budget.Reserve(1)
+	waiters := make([]*transferMemoryBudgetWaiter, 4)
+	notifies := make([]<-chan struct{}, len(waiters))
+	for i := range waiters {
+		waiters[i] = newTransferMemoryBudgetWaiter()
+		notifies[i] = waiters[i].subscribe(budget, 2)
+	}
+	defer func() {
+		for _, waiter := range waiters {
+			waiter.reset()
+		}
+	}()
+
+	budget.SetTotalByteCount(5)
+	wokenCount := 0
+	for _, notify := range notifies {
+		select {
+		case <-notify:
+			wokenCount += 1
+		default:
+		}
+	}
+	AssertEqual(t, wokenCount, 2)
+	AssertEqual(t, budget.capacityWaiterCount.Load(), int64(2))
+}
+
+func TestTransferMemoryBudgetCanceledAdmissionDoesNotConsumeWake(t *testing.T) {
+	budget := NewTransferMemoryBudget(1)
+	budget.Reserve(1)
+	canceledWaiter := newTransferMemoryBudgetWaiter()
+	liveWaiter := newTransferMemoryBudgetWaiter()
+	canceledWaiter.subscribe(budget, 1)
+	canceledWaiter.reset()
+	liveNotify := liveWaiter.subscribe(budget, 1)
+	defer liveWaiter.reset()
+
+	budget.Release(1)
+	select {
+	case <-liveNotify:
+	default:
+		t.Fatal("canceled admission prevented the live waiter from waking")
+	}
+}
+
+func TestTransferMemoryBudgetAdmissionSubscribeResetDoesNotAllocate(t *testing.T) {
+	budget := NewTransferMemoryBudget(1)
+	budget.Reserve(1)
+	waiter := newTransferMemoryBudgetWaiter()
+	allocCount := testing.AllocsPerRun(1_000, func() {
+		waiter.subscribe(budget, 1)
+		waiter.reset()
+	})
+	AssertEqual(t, allocCount, float64(0))
 }
 
 func BenchmarkTransferMemoryBudgetReserveReleaseNoWaiter(b *testing.B) {
@@ -142,6 +338,45 @@ func BenchmarkTransferMemoryBudgetReserveReleaseNoWaiter(b *testing.B) {
 	for range b.N {
 		budget.Reserve(1)
 		budget.Release(1)
+	}
+}
+
+func BenchmarkTransferMemoryBudgetConcurrentReserveReleaseNoWaiter(b *testing.B) {
+	budget := NewTransferMemoryBudget(mib(1))
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			budget.Reserve(1)
+			budget.Release(1)
+		}
+	})
+}
+
+func BenchmarkTransferMemoryBudgetAdmissionWakeOneOf64(b *testing.B) {
+	const waiterCount = 64
+	budget := NewTransferMemoryBudget(1)
+	budget.Reserve(1)
+	waiters := make([]*transferMemoryBudgetWaiter, waiterCount)
+	for i := range waiters {
+		waiters[i] = newTransferMemoryBudgetWaiter()
+		waiters[i].subscribe(budget, 1)
+	}
+	defer func() {
+		for _, waiter := range waiters {
+			waiter.reset()
+		}
+	}()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := range b.N {
+		waiter := waiters[i%waiterCount]
+		budget.Release(1)
+		<-waiter.notify
+		if !budget.TryReserve(1) {
+			b.Fatal("notified admission could not reserve")
+		}
+		waiter.subscribe(budget, 1)
 	}
 }
 

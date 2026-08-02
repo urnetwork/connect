@@ -26,6 +26,10 @@ type ControlSyncOob struct {
 
 	sendLock  sync.Mutex
 	syncCount uint64
+	// currentCancel owns the in-flight request/retry generation. A newer Send
+	// cancels it before starting, so production OOB HTTP work cannot outlive
+	// supersession and report a stale success.
+	currentCancel context.CancelFunc
 }
 
 func NewControlSyncOob(ctx context.Context, client *Client, scopeTag string) *ControlSyncOob {
@@ -59,20 +63,43 @@ func (self *ControlSyncOob) Send(frame *protocol.Frame, ackCallback AckFunction)
 	payload := append([]byte(nil), frame.MessageBytes...)
 	MessagePoolReturn(frame.MessageBytes)
 
+	handleCtx, handleCancel := context.WithCancel(self.ctx)
+
 	self.sendLock.Lock()
+	previousCancel := self.currentCancel
 	self.syncCount += 1
 	syncIndex := self.syncCount
+	self.currentCancel = handleCancel
 	self.sendLock.Unlock()
+	if previousCancel != nil {
+		previousCancel()
+	}
 
-	handleCtx, handleCancel := context.WithCancel(self.ctx)
+	isCurrent := func() bool {
+		self.sendLock.Lock()
+		defer self.sendLock.Unlock()
+		return syncIndex == self.syncCount && handleCtx.Err() == nil
+	}
+	claimCurrent := func() bool {
+		self.sendLock.Lock()
+		if syncIndex != self.syncCount || handleCtx.Err() != nil {
+			self.sendLock.Unlock()
+			return false
+		}
+		// Claim completion while the generation comparison is still protected.
+		// Splitting this into isCurrent() followed by the ack left a check/act
+		// window in which a newer Send could supersede us and the old request
+		// would nevertheless publish a stale success.
+		self.currentCancel = nil
+		self.sendLock.Unlock()
+		handleCancel()
+		return true
+	}
 
 	var send func()
 	send = func() {
 		// stop if a newer Send for this scope superseded this one, or done
-		self.sendLock.Lock()
-		superseded := syncIndex != self.syncCount
-		self.sendLock.Unlock()
-		if superseded {
+		if !isCurrent() {
 			handleCancel()
 			return
 		}
@@ -90,25 +117,40 @@ func (self *ControlSyncOob) Send(frame *protocol.Frame, ackCallback AckFunction)
 			MessageType:  messageType,
 			MessageBytes: MessagePoolCopy(payload),
 		}
-		self.client.ClientOob().SendControl(
-			[]*protocol.Frame{attemptFrame},
-			func(resultFrames []*protocol.Frame, err error) {
-				if err == nil {
-					// the oob returned: the platform has processed the message
-					safeAckCallback(nil)
+		callback := func(resultFrames []*protocol.Frame, err error) {
+			// Resolve completion and supersession under the same generation
+			// lock. An old in-flight request may return after a new Send; it
+			// must neither acknowledge the old state nor schedule another retry.
+			if err == nil {
+				if !claimCurrent() {
 					handleCancel()
 					return
 				}
-				if self.client.log.V(2).Enabled() {
-					self.client.log.Infof("[control-oob][%d]retry scope = %s err = %s\n", syncIndex, self.scopeTag, err)
-				}
-				select {
-				case <-handleCtx.Done():
-				case <-self.client.Done():
-				case <-time.After(self.retryTimeout):
-					go HandleError(send, handleCancel)
-				}
-			},
+				// the oob returned: the platform has processed the message
+				safeAckCallback(nil)
+				return
+			}
+			if !isCurrent() {
+				handleCancel()
+				return
+			}
+			if self.client.log.V(2).Enabled() {
+				self.client.log.Infof("[control-oob][%d]retry scope = %s err = %s\n", syncIndex, self.scopeTag, err)
+			}
+			select {
+			case <-handleCtx.Done():
+			case <-self.client.Done():
+			case <-time.After(self.retryTimeout):
+				go HandleError(send, handleCancel)
+			}
+		}
+		if oob, ok := self.client.ClientOob().(OutOfBandControlWithCtx); ok {
+			oob.SendControlWithCtx(handleCtx, []*protocol.Frame{attemptFrame}, callback)
+			return
+		}
+		self.client.ClientOob().SendControl(
+			[]*protocol.Frame{attemptFrame},
+			callback,
 		)
 	}
 
@@ -117,4 +159,11 @@ func (self *ControlSyncOob) Send(frame *protocol.Frame, ackCallback AckFunction)
 
 func (self *ControlSyncOob) Close() {
 	self.cancel()
+	self.sendLock.Lock()
+	currentCancel := self.currentCancel
+	self.currentCancel = nil
+	self.sendLock.Unlock()
+	if currentCancel != nil {
+		currentCancel()
+	}
 }

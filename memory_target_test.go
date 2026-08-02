@@ -2,6 +2,7 @@ package connect
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 )
@@ -64,6 +65,21 @@ func TestMemoryTargetAcquireCancellation(t *testing.T) {
 	target.Release(kib(1))
 }
 
+func TestMemoryTargetReleaseWithoutWaiterDoesNotAllocate(t *testing.T) {
+	target := NewMemoryTarget(1)
+	AssertEqual(t, true, target.TryReserve(1))
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		target.Release(1)
+		if !target.TryReserve(1) {
+			panic("released capacity was not reusable")
+		}
+	})
+
+	AssertEqual(t, 0.0, allocs)
+	target.Release(1)
+}
+
 func TestMemoryTargetUnlimitedAndSingletonOverdraft(t *testing.T) {
 	unlimited := NewMemoryTarget(0)
 	if !unlimited.TryReserve(mib(4)) {
@@ -83,5 +99,47 @@ func TestMemoryTargetUnlimitedAndSingletonOverdraft(t *testing.T) {
 		t.Fatal("singleton overdraft should block additional reservations")
 	}
 	target.Release(kib(2))
+	AssertEqual(t, target.Used(), ByteCount(0))
+}
+
+func TestMemoryTargetSingletonMaxReservationCannotOverflowAdmission(t *testing.T) {
+	target := NewMemoryTarget(1)
+	if !target.TryReserve(ByteCount(math.MaxInt64)) {
+		t.Fatal("empty target should admit one oversized item for progress")
+	}
+	if target.TryReserve(1) {
+		t.Fatal("wrapped used plus request bypassed the capacity ceiling")
+	}
+	AssertEqual(t, target.Used(), ByteCount(math.MaxInt64))
+	target.Release(ByteCount(math.MaxInt64))
+	AssertEqual(t, target.Used(), ByteCount(0))
+}
+
+func TestMemoryTargetRejectsNegativeReservation(t *testing.T) {
+	target := NewMemoryTarget(0)
+	if target.TryReserve(-1) {
+		t.Fatal("negative reservation should fail")
+	}
+	if target.Acquire(context.Background(), -1) {
+		t.Fatal("negative acquisition should fail")
+	}
+	AssertEqual(t, target.Used(), ByteCount(0))
+
+	var unlimited *MemoryTarget
+	if unlimited.TryReserve(-1) {
+		t.Fatal("nil unlimited target should still reject a negative reservation")
+	}
+}
+
+func TestMemoryTargetUnlimitedAccountingCannotOverflow(t *testing.T) {
+	target := NewMemoryTarget(0)
+	if !target.TryReserve(ByteCount(math.MaxInt64)) {
+		t.Fatal("unlimited target should admit representable usage")
+	}
+	if target.TryReserve(1) {
+		t.Fatal("unlimited target allowed its signed usage counter to wrap")
+	}
+	AssertEqual(t, target.Used(), ByteCount(math.MaxInt64))
+	target.Release(ByteCount(math.MaxInt64))
 	AssertEqual(t, target.Used(), ByteCount(0))
 }

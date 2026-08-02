@@ -38,6 +38,87 @@ func TestPtDnsPumpEncodeDecode(t *testing.T) {
 	ptEncodeDecodeTest(t, PacketTranslationModeDnsPump, PacketTranslationModeDecode53RequireDnsPump, 6555)
 }
 
+func TestPacketTranslationReadyDeadlineDoesNotAddAllocations(t *testing.T) {
+	measureWrite := func(withDeadline bool) float64 {
+		pt := &packetTranslation{
+			ctx:                  context.Background(),
+			log:                  DefaultLogger(),
+			out:                  make(chan *packet, 1),
+			writeDeadlineMonitor: NewMonitor(),
+		}
+		if withDeadline {
+			pt.writeDeadline = time.Now().Add(time.Hour)
+		}
+		packetData := make([]byte, 64)
+		addr := &net.UDPAddr{}
+		return testing.AllocsPerRun(1000, func() {
+			if _, err := pt.WriteTo(packetData, addr); err != nil {
+				panic(err)
+			}
+			queued := <-pt.out
+			MessagePoolReturn(queued.data)
+		})
+	}
+	measureRead := func(withDeadline bool) float64 {
+		pt := &packetTranslation{
+			ctx:                 context.Background(),
+			log:                 DefaultLogger(),
+			in:                  make(chan *packet, 1),
+			readDeadlineMonitor: NewMonitor(),
+		}
+		if withDeadline {
+			pt.readDeadline = time.Now().Add(time.Hour)
+		}
+		packetData := make([]byte, 64)
+		addr := &net.UDPAddr{}
+		return testing.AllocsPerRun(1000, func() {
+			pt.in <- &packet{
+				data: MessagePoolGet(64),
+				addr: addr,
+			}
+			if _, _, err := pt.ReadFrom(packetData); err != nil {
+				panic(err)
+			}
+		})
+	}
+
+	AssertEqual(t, measureWrite(false), measureWrite(true))
+	AssertEqual(t, measureRead(false), measureRead(true))
+}
+
+func TestPtDnsPumpZeroWriteRateDisablesPacing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sourceConn, err := net.ListenUDP("udp", &net.UDPAddr{
+		IP: net.ParseIP("127.0.0.1"),
+	})
+	AssertEqual(t, err, nil)
+	defer sourceConn.Close()
+	destinationConn, err := net.ListenUDP("udp", &net.UDPAddr{
+		IP: net.ParseIP("127.0.0.1"),
+	})
+	AssertEqual(t, err, nil)
+	defer destinationConn.Close()
+
+	settings := DefaultPacketTranslationSettings()
+	settings.DnsTlds = [][]byte{[]byte("example.com.")}
+	settings.DnsPumpTimeout = time.Hour
+	settings.WritePacketsPerSecond = 0
+	pt, err := NewPacketTranslation(ctx, PacketTranslationModeDnsPump, sourceConn, settings)
+	AssertEqual(t, err, nil)
+	defer pt.Close()
+
+	_ = destinationConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := pt.WriteTo(make([]byte, 64), destinationConn.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	packetData := make([]byte, 2048)
+	if _, _, err := destinationConn.ReadFrom(packetData); err != nil {
+		t.Fatalf("unpaced dns translation did not write: %v", err)
+	}
+}
+
 func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, serverPtMode PacketTranslationMode, basePort int) {
 	if testing.Short() {
 		return
@@ -72,193 +153,108 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 		packetLossN := i + 100
 
 		fmt.Printf("[%d]dns test (loss=%.1f%%)\n", i, 100.0/float32(packetLossN))
-		success := false
-		for range attempts {
-			success = func() bool {
-				attemptCtx, attemptCancel := context.WithTimeout(ctx, 20*time.Second)
-				defer attemptCancel()
+		success := runPacketTranslationAttempts(ctx, attempts, time.Second, func() bool {
+			attemptCtx, attemptCancel := context.WithTimeout(ctx, 20*time.Second)
+			defer attemptCancel()
 
-				handleCtx, handleCancel := context.WithCancel(attemptCtx)
-				defer handleCancel()
+			handleCtx, handleCancel := context.WithCancel(attemptCtx)
+			defer handleCancel()
 
-				n := 1024 * (8 + mathrand.Intn(8))
-				data := consecutive(n)
+			n := 1024 * (8 + mathrand.Intn(8))
+			data := consecutive(n)
 
-				tld := []byte("foo.com.")
+			tld := []byte("foo.com.")
 
-				serverAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: basePort + i}
+			serverAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: basePort + i}
 
-				ioTimeout := 5 * time.Second
-				ioDeadline := func() time.Time {
-					deadline := time.Now().Add(ioTimeout)
-					if ctxDeadline, ok := handleCtx.Deadline(); ok && ctxDeadline.Before(deadline) {
-						return ctxDeadline
-					}
-					return deadline
+			ioTimeout := 5 * time.Second
+			ioDeadline := func() time.Time {
+				deadline := time.Now().Add(ioTimeout)
+				if ctxDeadline, ok := handleCtx.Deadline(); ok && ctxDeadline.Before(deadline) {
+					return ctxDeadline
 				}
+				return deadline
+			}
 
-				quicConfig := &quic.Config{
-					HandshakeIdleTimeout:    ioTimeout,
-					MaxIdleTimeout:          ioTimeout,
-					KeepAlivePeriod:         5 * time.Second,
-					Allow0RTT:               true,
-					DisablePathMTUDiscovery: true,
+			quicConfig := &quic.Config{
+				HandshakeIdleTimeout:    ioTimeout,
+				MaxIdleTimeout:          ioTimeout,
+				KeepAlivePeriod:         5 * time.Second,
+				Allow0RTT:               true,
+				DisablePathMTUDiscovery: true,
+			}
+
+			serverCtx, serverCancel := context.WithCancel(handleCtx)
+			errCh := make(chan error, 4)
+			reportErr := func(err error) bool {
+				if err == nil {
+					return false
 				}
-
-				serverCtx, serverCancel := context.WithCancel(handleCtx)
-				errCh := make(chan error, 4)
-				reportErr := func(err error) bool {
-					if err == nil {
-						return false
-					}
-					select {
-					case errCh <- err:
-					default:
-					}
-					handleCancel()
-					return true
+				select {
+				case errCh <- err:
+				default:
 				}
-				// func() {
-				serverTlsConfig := &tls.Config{
-					GetConfigForClient: func(clientHello *tls.ClientHelloInfo) (*tls.Config, error) {
-						certPemBytes, keyPemBytes, err := selfSign(
-							[]string{clientHello.ServerName},
-							clientHello.ServerName,
-							180*24*time.Hour,
-							180*24*time.Hour,
-						)
-						if err != nil {
-							return nil, err
-						}
-						// X509KeyPair
-						cert, err := tls.X509KeyPair(certPemBytes, keyPemBytes)
-						return &tls.Config{
-							Certificates: []tls.Certificate{cert},
-						}, err
-					},
-				}
-
-				serverConn, err := net.ListenUDP("udp", serverAddr)
-				AssertEqual(t, err, nil)
-				defer serverConn.Close()
-
-				serverLossConn := newPacketLossPacketConn(packetLossN, serverConn)
-
-				serverPtSettings := DefaultPacketTranslationSettings()
-				serverPtSettings.DnsTlds = [][]byte{tld}
-				// settings.DnsAddr = serverAddr
-
-				serverPtConn, err := NewPacketTranslationWithPrefix(handleCtx, serverPtMode, serverLossConn, serverPtSettings, headerPrefix)
-				AssertEqual(t, err, nil)
-				defer serverPtConn.Close()
-
-				earlyListener, err := (&quic.Transport{
-					Conn: serverPtConn,
-					// createdConn: true,
-					// isSingleUse: true,
-				}).ListenEarly(serverTlsConfig, quicConfig)
-				// listenQuic(ctx, earlyListener)
-				AssertEqual(t, err, nil)
-				defer earlyListener.Close()
-
-				go func() {
-					defer serverCancel()
-					// defer ptConn.Close()
-					// defer earlyListener.Close()
-
-					earlyConn, err := earlyListener.Accept(handleCtx)
+				handleCancel()
+				return true
+			}
+			// func() {
+			serverTlsConfig := &tls.Config{
+				GetConfigForClient: func(clientHello *tls.ClientHelloInfo) (*tls.Config, error) {
+					certPemBytes, keyPemBytes, err := selfSign(
+						[]string{clientHello.ServerName},
+						clientHello.ServerName,
+						180*24*time.Hour,
+						180*24*time.Hour,
+					)
 					if err != nil {
-						reportErr(fmt.Errorf("server accept: %w", err))
-						return
+						return nil, err
 					}
-					stream, err := earlyConn.AcceptStream(handleCtx)
-					if err != nil {
-						reportErr(fmt.Errorf("server accept stream: %w", err))
-						return
-					}
+					// X509KeyPair
+					cert, err := tls.X509KeyPair(certPemBytes, keyPemBytes)
+					return &tls.Config{
+						Certificates: []tls.Certificate{cert},
+					}, err
+				},
+			}
 
-					writeCtx, writeCancel := context.WithCancel(handleCtx)
-					go func() {
-						defer writeCancel()
-						stream.SetWriteDeadline(ioDeadline())
-						m, err := stream.Write(data)
-						if err != nil {
-							reportErr(fmt.Errorf("server write: %w", err))
-							return
-						}
-						if m != len(data) {
-							reportErr(fmt.Errorf("server short write: %d != %d", m, len(data)))
-						}
-					}()
+			serverConn, err := net.ListenUDP("udp", serverAddr)
+			AssertEqual(t, err, nil)
+			defer serverConn.Close()
 
-					readData := make([]byte, 0, len(data))
-					buf := make([]byte, 2048)
+			serverLossConn := newPacketLossPacketConn(packetLossN, serverConn)
 
-					for len(readData) < len(data) {
-						select {
-						case <-handleCtx.Done():
-							reportErr(handleCtx.Err())
-							return
-						default:
-						}
-						stream.SetReadDeadline(ioDeadline())
-						m, err := stream.Read(buf[:min(len(buf), len(data)-len(readData))])
-						if err != nil {
-							reportErr(fmt.Errorf("server read: %w", err))
-							return
-						}
-						readData = append(readData, buf[:m]...)
+			serverPtSettings := DefaultPacketTranslationSettings()
+			serverPtSettings.DnsTlds = [][]byte{tld}
+			// settings.DnsAddr = serverAddr
 
-						// fmt.Printf("read[%d]\n", m)
-						fmt.Printf("+")
-					}
+			serverPtConn, err := NewPacketTranslationWithPrefix(handleCtx, serverPtMode, serverLossConn, serverPtSettings, headerPrefix)
+			AssertEqual(t, err, nil)
+			defer serverPtConn.Close()
 
-					if !bytes.Equal(data, readData) {
-						reportErr(fmt.Errorf("server read data mismatch"))
-						return
-					}
+			earlyListener, err := (&quic.Transport{
+				Conn: serverPtConn,
+				// createdConn: true,
+				// isSingleUse: true,
+			}).ListenEarly(serverTlsConfig, quicConfig)
+			// listenQuic(ctx, earlyListener)
+			AssertEqual(t, err, nil)
+			defer earlyListener.Close()
 
-					select {
-					case err := <-errCh:
-						reportErr(err)
-						return
-					case <-writeCtx.Done():
-					}
+			go func() {
+				defer serverCancel()
+				// defer ptConn.Close()
+				// defer earlyListener.Close()
 
-				}()
-
-				// }()
-
-				clientTlsConfig := &tls.Config{
-					ServerName:         string(tld),
-					InsecureSkipVerify: true,
+				earlyConn, err := earlyListener.Accept(handleCtx)
+				if err != nil {
+					reportErr(fmt.Errorf("server accept: %w", err))
+					return
 				}
-
-				clientConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
-				AssertEqual(t, err, nil)
-				defer clientConn.Close()
-
-				lossConn := newPacketLossPacketConn(packetLossN, clientConn)
-
-				ptSettings := DefaultPacketTranslationSettings()
-				ptSettings.DnsTlds = [][]byte{tld}
-				// ptSettings.DnsAddr = serverAddr
-				ptConn, err := NewPacketTranslationWithPrefix(handleCtx, clientPtMode, lossConn, ptSettings, headerPrefix)
-				AssertEqual(t, err, nil)
-				defer ptConn.Close()
-
-				quicTransport := &quic.Transport{
-					Conn: ptConn,
-					// createdConn: true,
-					// isSingleUse: true,
+				stream, err := earlyConn.AcceptStream(handleCtx)
+				if err != nil {
+					reportErr(fmt.Errorf("server accept stream: %w", err))
+					return
 				}
-
-				// enable 0rtt if possible
-				conn, err := quicTransport.DialEarly(handleCtx, serverAddr, clientTlsConfig, quicConfig)
-				AssertEqual(t, err, nil)
-
-				stream, err := conn.OpenStream()
-				AssertEqual(t, err, nil)
 
 				writeCtx, writeCancel := context.WithCancel(handleCtx)
 				go func() {
@@ -266,11 +262,11 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 					stream.SetWriteDeadline(ioDeadline())
 					m, err := stream.Write(data)
 					if err != nil {
-						reportErr(fmt.Errorf("client write: %w", err))
+						reportErr(fmt.Errorf("server write: %w", err))
 						return
 					}
 					if m != len(data) {
-						reportErr(fmt.Errorf("client short write: %d != %d", m, len(data)))
+						reportErr(fmt.Errorf("server short write: %d != %d", m, len(data)))
 					}
 				}()
 
@@ -279,74 +275,201 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 
 				for len(readData) < len(data) {
 					select {
-					case err := <-errCh:
-						fmt.Printf("connection issue: %s\n", err)
-						return false
 					case <-handleCtx.Done():
 						reportErr(handleCtx.Err())
-						return false
+						return
 					default:
 					}
 					stream.SetReadDeadline(ioDeadline())
 					m, err := stream.Read(buf[:min(len(buf), len(data)-len(readData))])
 					if err != nil {
-						reportErr(fmt.Errorf("client read: %w", err))
-						return false
+						reportErr(fmt.Errorf("server read: %w", err))
+						return
 					}
-					// AssertEqual(t, err, nil)
 					readData = append(readData, buf[:m]...)
 
 					// fmt.Printf("read[%d]\n", m)
-					fmt.Printf(".")
+					fmt.Printf("+")
 				}
 
 				if !bytes.Equal(data, readData) {
-					reportErr(fmt.Errorf("client read data mismatch"))
-					return false
+					reportErr(fmt.Errorf("server read data mismatch"))
+					return
 				}
 
 				select {
 				case err := <-errCh:
-					fmt.Printf("connection issue: %s\n", err)
-					return false
+					reportErr(err)
+					return
 				case <-writeCtx.Done():
-					// case <- time.After(60 * time.Second):
-					// 	t.FailNow()
 				}
 
+			}()
+
+			// }()
+
+			clientTlsConfig := &tls.Config{
+				ServerName:         string(tld),
+				InsecureSkipVerify: true,
+			}
+
+			clientConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+			AssertEqual(t, err, nil)
+			defer clientConn.Close()
+
+			lossConn := newPacketLossPacketConn(packetLossN, clientConn)
+
+			ptSettings := DefaultPacketTranslationSettings()
+			ptSettings.DnsTlds = [][]byte{tld}
+			// ptSettings.DnsAddr = serverAddr
+			ptConn, err := NewPacketTranslationWithPrefix(handleCtx, clientPtMode, lossConn, ptSettings, headerPrefix)
+			AssertEqual(t, err, nil)
+			defer ptConn.Close()
+
+			quicTransport := &quic.Transport{
+				Conn: ptConn,
+				// createdConn: true,
+				// isSingleUse: true,
+			}
+
+			// enable 0rtt if possible
+			conn, err := quicTransport.DialEarly(handleCtx, serverAddr, clientTlsConfig, quicConfig)
+			if err != nil {
+				reportErr(fmt.Errorf("client dial: %w", err))
+				return false
+			}
+
+			stream, err := conn.OpenStream()
+			if err != nil {
+				reportErr(fmt.Errorf("client open stream: %w", err))
+				return false
+			}
+
+			writeCtx, writeCancel := context.WithCancel(handleCtx)
+			go func() {
+				defer writeCancel()
+				stream.SetWriteDeadline(ioDeadline())
+				m, err := stream.Write(data)
+				if err != nil {
+					reportErr(fmt.Errorf("client write: %w", err))
+					return
+				}
+				if m != len(data) {
+					reportErr(fmt.Errorf("client short write: %d != %d", m, len(data)))
+				}
+			}()
+
+			readData := make([]byte, 0, len(data))
+			buf := make([]byte, 2048)
+
+			for len(readData) < len(data) {
 				select {
 				case err := <-errCh:
 					fmt.Printf("connection issue: %s\n", err)
 					return false
-				case <-serverCtx.Done():
-					// case <- time.After(60 * time.Second):
-					// 	t.FailNow()
-				}
-				select {
-				case err := <-errCh:
-					fmt.Printf("connection issue: %s\n", err)
+				case <-handleCtx.Done():
+					reportErr(handleCtx.Err())
 					return false
 				default:
 				}
+				stream.SetReadDeadline(ioDeadline())
+				m, err := stream.Read(buf[:min(len(buf), len(data)-len(readData))])
+				if err != nil {
+					reportErr(fmt.Errorf("client read: %w", err))
+					return false
+				}
+				// AssertEqual(t, err, nil)
+				readData = append(readData, buf[:m]...)
 
-				return true
-			}()
-			fmt.Printf("\n")
-			if success {
-				// timeout. reform the sockets and retry
-				break
+				// fmt.Printf("read[%d]\n", m)
+				fmt.Printf(".")
 			}
-			fmt.Printf("connection issue. retry.\n")
+
+			if !bytes.Equal(data, readData) {
+				reportErr(fmt.Errorf("client read data mismatch"))
+				return false
+			}
+
 			select {
-			case <-ctx.Done():
-			case <-time.After(1 * time.Second):
+			case err := <-errCh:
+				fmt.Printf("connection issue: %s\n", err)
+				return false
+			case <-writeCtx.Done():
+				// case <- time.After(60 * time.Second):
+				// 	t.FailNow()
 			}
-		}
+
+			select {
+			case err := <-errCh:
+				fmt.Printf("connection issue: %s\n", err)
+				return false
+			case <-serverCtx.Done():
+				// case <- time.After(60 * time.Second):
+				// 	t.FailNow()
+			}
+			select {
+			case err := <-errCh:
+				fmt.Printf("connection issue: %s\n", err)
+				return false
+			default:
+			}
+
+			return true
+		})
+		fmt.Printf("\n")
 		if !success {
 			t.FailNow()
 		}
 	}
 
+}
+
+// runPacketTranslationAttempts reforms the sockets after a retryable QUIC
+// failure. The packet-loss tests intentionally make DialEarly and OpenStream
+// fail occasionally; an assertion inside the attempt used to call FailNow
+// before this loop could exercise its remaining attempts.
+func runPacketTranslationAttempts(
+	ctx context.Context,
+	attempts int,
+	retryDelay time.Duration,
+	attempt func() bool,
+) bool {
+	for attemptIndex := 0; attemptIndex < attempts; attemptIndex++ {
+		if attempt() {
+			return true
+		}
+		if attemptIndex+1 == attempts {
+			return false
+		}
+		fmt.Printf("\nconnection issue. retry.\n")
+		timer := time.NewTimer(retryDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false
+		case <-timer.C:
+		}
+	}
+	return false
+}
+
+func TestPacketTranslationAttemptsRetryRecoverableFailure(t *testing.T) {
+	attemptCount := 0
+	success := runPacketTranslationAttempts(
+		context.Background(),
+		4,
+		0,
+		func() bool {
+			attemptCount++
+			return 2 <= attemptCount
+		},
+	)
+	if !success {
+		t.Fatal("recoverable first attempt prevented a later success")
+	}
+	if attemptCount != 2 {
+		t.Fatalf("attempt count = %d, want 2", attemptCount)
+	}
 }
 
 // drops one of n outgoing packets randomly

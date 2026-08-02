@@ -99,9 +99,10 @@ func TestLocalUserNatSettingsMemoryScaled(t *testing.T) {
 	for _, budget := range []ByteCount{0, mib(8), mib(16), mib(24), mib(32), mib(48), mib(64), mib(128)} {
 		SetMemoryBudget(budget)
 		tcpSettings := DefaultTcpBufferSettings()
-		if int64(tcpSettings.SequenceBufferSize)*int64(tcpSettings.Mtu) < int64(tcpSettings.MaxWindowSize) {
-			t.Errorf("budget %d: tcp depth %d x mtu %d does not cover the max window %d",
-				budget, tcpSettings.SequenceBufferSize, tcpSettings.Mtu, tcpSettings.MaxWindowSize)
+		payloadByteCount := tcpSettings.Mtu - Ipv6HeaderSize - TcpHeaderSizeWithoutExtensions
+		if int64(tcpSettings.SequenceBufferSize)*int64(payloadByteCount) < int64(tcpSettings.MaxWindowSize) {
+			t.Errorf("budget %d: tcp depth %d x payload %d does not cover the max window %d",
+				budget, tcpSettings.SequenceBufferSize, payloadByteCount, tcpSettings.MaxWindowSize)
 		}
 		if tcpSettings.MaxWindowSize < tcpSettings.MinWindowSize {
 			t.Errorf("budget %d: max window %d below min window %d",

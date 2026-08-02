@@ -1343,11 +1343,15 @@ func (x *NetworkPeersUpdate) GetPeers() []*NetworkPeer {
 type ExchangeSignals struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// ulid
-	StreamId      []byte            `protobuf:"bytes,1,opt,name=stream_id,json=streamId,proto3" json:"stream_id,omitempty"`
-	ResetSignals  bool              `protobuf:"varint,2,opt,name=reset_signals,json=resetSignals,proto3" json:"reset_signals,omitempty"`
-	Signals       []*ExchangeSignal `protobuf:"bytes,3,rep,name=signals,proto3" json:"signals,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	StreamId     []byte            `protobuf:"bytes,1,opt,name=stream_id,json=streamId,proto3" json:"stream_id,omitempty"`
+	ResetSignals bool              `protobuf:"varint,2,opt,name=reset_signals,json=resetSignals,proto3" json:"reset_signals,omitempty"`
+	Signals      []*ExchangeSignal `protobuf:"bytes,3,rep,name=signals,proto3" json:"signals,omitempty"`
+	// Per-PeerConnection sender generation. This disambiguates a delayed
+	// initial WaitingForSdpOffer from a newly restarted passive association.
+	// Older peers omit/ignore it and retain the legacy compatibility path.
+	SenderGenerationId []byte `protobuf:"bytes,4,opt,name=sender_generation_id,json=senderGenerationId,proto3" json:"sender_generation_id,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *ExchangeSignals) Reset() {
@@ -1397,6 +1401,13 @@ func (x *ExchangeSignals) GetResetSignals() bool {
 func (x *ExchangeSignals) GetSignals() []*ExchangeSignal {
 	if x != nil {
 		return x.Signals
+	}
+	return nil
+}
+
+func (x *ExchangeSignals) GetSenderGenerationId() []byte {
+	if x != nil {
+		return x.SenderGenerationId
 	}
 	return nil
 }
@@ -2543,11 +2554,12 @@ const file_transfer_proto_rawDesc = "" +
 	"\x10_disconnect_time\"\x13\n" +
 	"\x11NetworkPeersReset\"B\n" +
 	"\x12NetworkPeersUpdate\x12,\n" +
-	"\x05peers\x18\x01 \x03(\v2\x16.bringyour.NetworkPeerR\x05peers\"\x88\x01\n" +
+	"\x05peers\x18\x01 \x03(\v2\x16.bringyour.NetworkPeerR\x05peers\"\xba\x01\n" +
 	"\x0fExchangeSignals\x12\x1b\n" +
 	"\tstream_id\x18\x01 \x01(\fR\bstreamId\x12#\n" +
 	"\rreset_signals\x18\x02 \x01(\bR\fresetSignals\x123\n" +
-	"\asignals\x18\x03 \x03(\v2\x19.bringyour.ExchangeSignalR\asignals\"\xa3\x01\n" +
+	"\asignals\x18\x03 \x03(\v2\x19.bringyour.ExchangeSignalR\asignals\x120\n" +
+	"\x14sender_generation_id\x18\x04 \x01(\fR\x12senderGenerationId\"\xa3\x01\n" +
 	"\x0eExchangeSignal\x126\n" +
 	"\vsignal_type\x18\x03 \x01(\x0e2\x15.bringyour.SignalTypeR\n" +
 	"signalType\x12\x15\n" +

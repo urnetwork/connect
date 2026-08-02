@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -42,6 +44,83 @@ func TestUpgradeMuxPassthrough(t *testing.T) {
 	sent, received := rec.counts()
 	if sent != 1 || received != 1 {
 		t.Fatalf("pass-through mismatch: sent=%d received=%d, want 1/1", sent, received)
+	}
+}
+
+func TestUpgradeMuxDnsServerScoresExcludeLocalFallbackPath(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rec := &ipMuxRecorder{}
+	mux, err := NewUpgradeMux(ctx, TransferPath{}, protocol.ProvideMode_Network, 0, rec.receive, DefaultUpgradeMuxSettings(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mux.Close()
+
+	const tunnelWinner = "https://tunnel-winner.example/dns-query"
+	const localWinner = "https://local-winner.example/dns-query"
+	mux.mux.Tun().DohCache().remoteClient.stats.record(tunnelWinner, true)
+	fallback := mux.fallbackDohCache.Load()
+	if fallback == nil {
+		t.Fatal("default mux did not create a local fallback cache")
+	}
+	for range 16 {
+		fallback.localClient.stats.record(localWinner, true)
+	}
+
+	scores := mux.DnsServerScores()
+	if scores[tunnelWinner] <= 0 {
+		t.Fatalf("tunnel-path score missing: %v", scores)
+	}
+	if _, ok := scores[localWinner]; ok {
+		t.Fatalf("local fallback score contaminated persisted tunnel ranking: %v", scores)
+	}
+}
+
+func TestUpgradeMuxReceiveRefreshesWireSourceAffinity(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rec := &ipMuxRecorder{}
+	mux, err := NewUpgradeMux(ctx, TransferPath{}, protocol.ProvideMode_Network, 0, rec.receive, DefaultUpgradeMuxSettings(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mux.Close()
+
+	server := netip.MustParseAddr("1.1.1.1")
+	client := mux.mux.Tun().LocalAddresses()[0]
+	mux.reverse.record([]netip.Addr{server, client}, "example.test")
+	mux.reverse.lock.Lock()
+	serverEntry := mux.reverse.entries[server]
+	serverEntry.lastActivityNanos = 1
+	mux.reverse.entries[server] = serverEntry
+	clientEntry := mux.reverse.entries[client]
+	clientEntry.lastActivityNanos = 2
+	mux.reverse.entries[client] = clientEntry
+	mux.reverse.lock.Unlock()
+
+	canonicalOutbound := &IpPath{
+		Version:         4,
+		Protocol:        IpProtocolTcp,
+		SourceIp:        net.IP(client.AsSlice()),
+		SourcePort:      40000,
+		DestinationIp:   net.IP(server.AsSlice()),
+		DestinationPort: 443,
+	}
+	returnPacket := newIpMuxIpv4Packet(canonicalOutbound.DestinationIp, canonicalOutbound.SourceIp)
+	mux.Receive(TransferPath{}, protocol.ProvideMode_Network, canonicalOutbound, returnPacket)
+
+	mux.reverse.lock.Lock()
+	refreshedServer := mux.reverse.entries[server].lastActivityNanos
+	unchangedClient := mux.reverse.entries[client].lastActivityNanos
+	mux.reverse.lock.Unlock()
+	if refreshedServer <= 1 {
+		t.Fatal("return packet did not refresh its wire-source server affinity")
+	}
+	if unchangedClient != 2 {
+		t.Fatalf("canonical path source was refreshed instead of wire source: got %d, want 2", unchangedClient)
 	}
 }
 
@@ -170,6 +249,64 @@ func TestUpgradeMuxDnsDoh(t *testing.T) {
 	}
 }
 
+func TestUpgradeMuxDnsTcpFallback(t *testing.T) {
+	const resolved = "203.0.113.46"
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeDohWire(w, r, []netip.Addr{netip.MustParseAddr(resolved)}, 60, false)
+	}))
+	defer server.Close()
+
+	pool := x509.NewCertPool()
+	pool.AddCert(server.Certificate())
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	h := newDnsClientHarness(t, ctx, &DnsResolverSettings{
+		EnableLocalDoh:   true,
+		LocalDohUrlsIpv4: []string{server.URL},
+		TlsConfig:        &tls.Config{RootCAs: pool},
+	})
+	defer h.close()
+
+	conn, err := h.clientTun.DialContext(ctx, "tcp", "10.0.0.1:53")
+	if err != nil {
+		t.Fatalf("dial tcp dns: %v", err)
+	}
+	defer conn.Close()
+
+	for i, id := range []uint16{0x5151, 0x5252} {
+		packet := dnsQueryPacketTyped(t, "MiXeD.example.test.", dnsmessage.TypeA, id)
+		_, query, err := ParseIpPathWithPayload(packet)
+		if err != nil {
+			t.Fatal(err)
+		}
+		frame := make([]byte, 2+len(query))
+		binary.BigEndian.PutUint16(frame[:2], uint16(len(query)))
+		copy(frame[2:], query)
+		if _, err := conn.Write(frame); err != nil {
+			t.Fatalf("write tcp dns query %d: %v", i, err)
+		}
+
+		var responseLength [2]byte
+		if _, err := io.ReadFull(conn, responseLength[:]); err != nil {
+			t.Fatalf("read tcp dns length %d: %v", i, err)
+		}
+		response := make([]byte, int(binary.BigEndian.Uint16(responseLength[:])))
+		if _, err := io.ReadFull(conn, response); err != nil {
+			t.Fatalf("read tcp dns response %d: %v", i, err)
+		}
+		if got := binary.BigEndian.Uint16(response[:2]); got != id {
+			t.Fatalf("response %d id = %04x, want %04x", i, got, id)
+		}
+		result := parseDohWire(response, dnsmessage.TypeA)
+		if _, ok := result.AddrTtls[netip.MustParseAddr(resolved)]; !ok {
+			t.Fatalf("response %d addresses = %v, want %s", i, result.AddrTtls, resolved)
+		}
+	}
+	if names := h.mux.ServerNames(resolved); !slices.Contains(names, "mixed.example.test") {
+		t.Fatalf("ServerNames(%s) = %v, want mixed.example.test", resolved, names)
+	}
+}
+
 // TestUpgradeMuxDnsNoReplyOnFailure: on a DoH resolution failure (the resolver errors, not an
 // authoritative no-record answer) the mux sends NO downstream response at all — the client's
 // query then times out and is retried, rather than getting a SERVFAIL or empty answer that a
@@ -215,20 +352,19 @@ func TestUpgradeMuxDnsNoReplyOnFailure(t *testing.T) {
 	}
 }
 
-// TestUpgradeMuxDnsHttpsTypeClaimed: SVCB/HTTPS (64/65) queries are claimed (routed to the
-// DoH forward path), not passed through to the upstream. Here there is no reachable tunnel
-// DoH, so the forward fails fast: each claimed query is answered with a prompt SERVFAIL
-// (never silence — resolvers serialize on the HTTPS RR) and the client falls back to A/AAAA.
-// Genuinely other types (TXT) still pass through unclaimed. (The forward's success path —
-// delivery + hint recording — is covered by TestDohCacheForward and TestParseHttpsHints.)
-func TestUpgradeMuxDnsHttpsTypeClaimed(t *testing.T) {
+// TestUpgradeMuxDnsRawTypesClaimed verifies that every non-address record type
+// is claimed and sent to the opaque DoH path rather than leaking to the
+// advertised DNS identity. With remote DoH disabled, each fails fast with a
+// client-visible SERVFAIL. The success path is covered by TestDohCacheForward
+// and TestUpgradeMuxHttpsForwardFanOut.
+func TestUpgradeMuxDnsRawTypesClaimed(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	rec := &ipMuxRecorder{}
 	settings := DefaultUpgradeMuxSettings()
 	// an empty resolver (remote DoH disabled): the forward short-circuits with a SERVFAIL and
-	// no tunnel traffic, so the upstream counter reflects only genuinely passed-through queries
+	// no tunnel traffic, so the upstream counter must remain zero
 	settings.Dns.Resolver = &DnsResolverSettings{}
 	settings.Dns.Fallback = nil
 	mux, err := NewUpgradeMux(ctx, TransferPath{}, protocol.ProvideMode_Network, 0, rec.receive, settings, nil)
@@ -238,19 +374,27 @@ func TestUpgradeMuxDnsHttpsTypeClaimed(t *testing.T) {
 	defer mux.Close()
 	mux.SetUpstream(rec.upstream)
 
-	for _, qtype := range []dnsmessage.Type{dnsTypeSvcb, dnsTypeHttps} {
+	types := []dnsmessage.Type{
+		dnsTypeSvcb,
+		dnsTypeHttps,
+		dnsmessage.TypeTXT,
+		dnsmessage.TypeMX,
+		dnsmessage.TypeSRV,
+		dnsmessage.TypeNS,
+	}
+	for _, qtype := range types {
 		if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "svc.example.test.", qtype, 0x4242), 0) {
 			t.Fatalf("type %d query was not claimed", qtype)
 		}
 	}
 	// the claimed queries go to the DoH forward path (not passed through), and with remote DoH
-	// disabled each fails fast with a SERVFAIL downstream: nothing upstream, two replies
-	if !waitForCondition(5*time.Second, func() bool { _, received := rec.counts(); return 2 <= received }) {
+	// disabled each fails fast with a SERVFAIL downstream
+	if !waitForCondition(5*time.Second, func() bool { _, received := rec.counts(); return len(types) <= received }) {
 		_, received := rec.counts()
-		t.Fatalf("claimed SVCB/HTTPS with remote DoH off: received=%d, want 2 prompt SERVFAIL replies", received)
+		t.Fatalf("claimed raw types with remote DoH off: received=%d, want %d prompt SERVFAIL replies", received, len(types))
 	}
-	if sent, received := rec.counts(); sent != 0 || received != 2 {
-		t.Fatalf("claimed SVCB/HTTPS: sent=%d received=%d, want 0/2", sent, received)
+	if sent, received := rec.counts(); sent != 0 || received != len(types) {
+		t.Fatalf("claimed raw types: sent=%d received=%d, want 0/%d", sent, received, len(types))
 	}
 	for _, reply := range rec.receivedPackets() {
 		header, question, answers := parseDnsBlockedReply(t, reply)
@@ -260,21 +404,14 @@ func TestUpgradeMuxDnsHttpsTypeClaimed(t *testing.T) {
 		if header.Truncated {
 			t.Fatal("forward-failure reply must not set TC (nothing was truncated)")
 		}
-		if question.Type != dnsTypeSvcb && question.Type != dnsTypeHttps {
-			t.Fatalf("reply question type = %v, want the claimed SVCB/HTTPS question", question.Type)
+		if !slices.Contains(types, question.Type) {
+			t.Fatalf("reply question type = %v, want one of %v", question.Type, types)
 		}
 		if 0 != len(answers) {
 			t.Fatalf("SERVFAIL reply carries %d answers, want 0", len(answers))
 		}
 	}
 
-	// a TXT query is not claimed: it passes through to the upstream untouched
-	if mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "svc.example.test.", dnsmessage.TypeTXT, 0x4343), 0) {
-		// SendPacket returns the upstream's result for pass-through (true from the recorder)
-	}
-	if sent, _ := rec.counts(); sent != 1 {
-		t.Fatalf("TXT query should pass through to the upstream, sent=%d", sent)
-	}
 }
 
 // TestUpgradeMuxDnsHttpsFailFastServfail fills the "type-65 client-visible behavior with
@@ -375,8 +512,8 @@ func TestUpgradeMuxDnsHttpsOversizedTruncated(t *testing.T) {
 	if fl == nil {
 		t.Fatal("attachDnsResponder did not start a flight")
 	}
-	oversized := make([]byte, maxForwardedHttpsResponse+1)
-	mux.fanOutHttpsForward(key, fl, "big.example.test", oversized)
+	oversized := make([]byte, maxForwardedDnsResponse+1)
+	mux.fanOutRawForward(key, fl, "big.example.test", oversized)
 
 	replies := rec.receivedPackets()
 	if len(replies) != 1 {
@@ -434,6 +571,91 @@ func dnsQueryPacketFrom(t *testing.T, name string, id uint16, sourcePort int) []
 		DestinationIp:   net.ParseIP("10.0.0.1"),
 		DestinationPort: 53,
 	}, queryPayload)
+}
+
+func TestDefaultUpgradeMuxFallbackBudgets(t *testing.T) {
+	settings := DefaultUpgradeMuxSettings()
+	if settings.Dns.LocalFallbackTimeout != time.Second {
+		t.Fatalf("warm local fallback timeout = %s, want 1s stalled-provider bound", settings.Dns.LocalFallbackTimeout)
+	}
+	if settings.Dns.ColdLocalFallbackTimeout != 250*time.Millisecond {
+		t.Fatalf("cold local fallback timeout = %s, want 250ms startup bound", settings.Dns.ColdLocalFallbackTimeout)
+	}
+	if settings.Dns.LocalFallbackTimeout <= settings.Dns.ColdLocalFallbackTimeout {
+		t.Fatalf(
+			"warm/cold fallback timeouts = %s/%s, warm path must retain the larger tunnel preference",
+			settings.Dns.LocalFallbackTimeout,
+			settings.Dns.ColdLocalFallbackTimeout,
+		)
+	}
+}
+
+func TestFallbackDohCacheAdmitsOneBrowserWave(t *testing.T) {
+	const queryCount = muxFallbackDohHttpWaveSize
+
+	requestStarted := make(chan struct{}, queryCount)
+	releaseRequests := make(chan struct{})
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestStarted <- struct{}{}
+		select {
+		case <-releaseRequests:
+		case <-r.Context().Done():
+			return
+		}
+		writeDohWire(w, r, []netip.Addr{netip.MustParseAddr("203.0.113.91")}, 60, false)
+	}))
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	defer server.Close()
+
+	tlsPool := x509.NewCertPool()
+	tlsPool.AddCert(server.Certificate())
+	memoryTarget := NewMemoryTarget(mib(2))
+	cache := buildFallbackDohCache(&DnsResolverSettings{
+		EnableLocalDoh:   true,
+		LocalDohUrlsIpv4: []string{server.URL},
+		TlsConfig:        &tls.Config{RootCAs: tlsPool},
+	}, memoryTarget, nil)
+	defer cache.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	results := make([]bool, queryCount)
+	var queryWait sync.WaitGroup
+	for i := range queryCount {
+		queryWait.Add(1)
+		go func(i int) {
+			defer queryWait.Done()
+			addrs, authoritative := cache.QueryResult(ctx, "A", fmt.Sprintf("fallback-wave-%d.example.test", i))
+			results[i] = authoritative && len(addrs) == 1
+		}(i)
+	}
+
+	released := false
+	defer func() {
+		if !released {
+			close(releaseRequests)
+		}
+	}()
+	for i := 0; i < queryCount; i++ {
+		select {
+		case <-requestStarted:
+		case <-time.After(2 * time.Second):
+			t.Fatalf(
+				"fallback admitted %d/%d requests before blocking; one complete browser wave must fit",
+				i,
+				queryCount,
+			)
+		}
+	}
+	close(releaseRequests)
+	released = true
+	queryWait.Wait()
+	for i, ok := range results {
+		if !ok {
+			t.Fatalf("fallback query %d did not resolve after the admitted wave was released", i)
+		}
+	}
 }
 
 // TestUpgradeMuxDnsLocalFallback: when the tunnel-DoH can't resolve, a query is raced — after the
@@ -668,11 +890,13 @@ func TestPeekClaim(t *testing.T) {
 		want   peekResult
 	}{
 		{"v4 tcp 80", mkv4(tcp, 80), peekHttp},
+		{"v4 tcp 53", mkv4(tcp, 53), peekDns},
 		{"v4 tcp 443", mkv4(tcp, 443), peekTls},
 		{"v4 udp 53", mkv4(udp, 53), peekDns},
 		{"v4 udp 4500", mkv4(udp, 4500), peekOther},
 		{"v4 icmp", mkv4(icmp, 0), peekOther},
 		{"v6 tcp 80", mkv6(tcp, 80), peekHttp},
+		{"v6 tcp 53", mkv6(tcp, 53), peekDns},
 		{"v6 tcp 443", mkv6(tcp, 443), peekTls},
 		{"v6 udp 53", mkv6(udp, 53), peekDns},
 		{"v6 extension header", mkv6(hopopt, 80), peekUndecided},
@@ -729,7 +953,7 @@ func TestReverseTouchKeepsActive(t *testing.T) {
 	// an entry old enough to be evicted
 	ri.entries[ip] = reverseEntry{serverNames: []string{"x.example"}, lastActivityNanos: time.Now().UnixNano() - int64(2*time.Minute)}
 	// a return packet from that IP refreshes its activity
-	ri.touch(net.ParseIP("93.184.216.34"))
+	ri.touch(ip)
 	ri.evictIdle(time.Minute)
 	if _, ok := ri.entries[ip]; !ok {
 		t.Fatal("an affinity record refreshed by return traffic should not be idle-evicted")

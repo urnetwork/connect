@@ -109,14 +109,63 @@ func (self *iceInterfaceNet) InterfaceByName(name string) (*transport.Interface,
 // carrying a host address. Nil entries (no route for a family) are skipped.
 func localEgressInterfaces() []*transport.Interface {
 	var out []*transport.Interface
+	nativeInterfaces, nativeInterfacesErr := net.Interfaces()
 	add := func(name string, index int, ip net.IP, maskBits int) {
-		ifc := transport.NewInterface(net.Interface{
+		selected := net.Interface{
 			Index: index,
 			MTU:   1500,
 			Name:  name,
 			Flags: net.FlagUp | net.FlagRunning | net.FlagBroadcast | net.FlagMulticast,
-		})
-		ifc.AddAddress(&net.IPNet{IP: ip, Mask: net.CIDRMask(maskBits, maskBits)})
+		}
+		selectedMask := net.CIDRMask(maskBits, maskBits)
+		if nativeInterfacesErr == nil {
+			// Desktop/device platforms that can enumerate interfaces still use
+			// the route probe to select only the current egress address, but
+			// retain its real interface identity and prefix. Supplying made-up
+			// indices (the old en0=1/en1=2 fallback) made repeated ICE gathers
+			// intermittently strand one side in checking, particularly when a
+			// usable IPv6 address was present. Android's denied-netlink path
+			// continues to use the synthetic identity below.
+			for _, native := range nativeInterfaces {
+				addrs, err := native.Addrs()
+				if err != nil {
+					continue
+				}
+				found := false
+				for _, addr := range addrs {
+					var addrIp net.IP
+					var addrMask net.IPMask
+					switch typed := addr.(type) {
+					case *net.IPNet:
+						addrIp = typed.IP
+						addrMask = typed.Mask
+					case *net.IPAddr:
+						addrIp = typed.IP
+					}
+					if addrIp == nil || !addrIp.Equal(ip) {
+						continue
+					}
+					selected = native
+					if addrMask != nil {
+						selectedMask = addrMask
+					}
+					found = true
+					break
+				}
+				if found {
+					break
+				}
+			}
+		}
+		selectedAddr := &net.IPNet{IP: ip, Mask: selectedMask}
+		for _, existing := range out {
+			if existing.Index == selected.Index && existing.Name == selected.Name {
+				existing.AddAddress(selectedAddr)
+				return
+			}
+		}
+		ifc := transport.NewInterface(selected)
+		ifc.AddAddress(selectedAddr)
 		out = append(out, ifc)
 	}
 	if ip := dialLocalIP("udp4", "8.8.8.8:80"); ip != nil {

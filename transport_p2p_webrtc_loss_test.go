@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -40,6 +41,8 @@ type sctpPathMeasureResult struct {
 	byteCount       int
 	elapsed         time.Duration
 	midBulkLatency  time.Duration
+	bulkLatencyP95  time.Duration
+	bulkLatencyMax  time.Duration
 	postBulkLatency time.Duration
 	droppedPackets  uint64
 	minObservedCwnd uint32
@@ -81,7 +84,7 @@ func newVnetWebRtcPeerConnectionFactory(
 		webrtc.WithInterceptorRegistry(nil),
 	)
 	return &webRtcPeerConnectionFactory{
-		newPeerConnection: func() (*webrtc.PeerConnection, error) {
+		newPeerConnection: func(networkPeer bool) (*webrtc.PeerConnection, error) {
 			return api.NewPeerConnection(webrtc.Configuration{})
 		},
 	}
@@ -121,10 +124,17 @@ func TestWebRtcIdleResumeSctpBlackholeReconnects(t *testing.T) {
 		if !sctpBlackhole.Load() || len(payload) == 0 {
 			return true
 		}
-		// Drop the whole DTLS record layer, including CloseNotify alerts, but
-		// keep STUN consent packets. This models a stale UDP/NAT data path:
-		// the passive endpoint must not learn about the active endpoint's
-		// local close through an alert that the blackhole should have lost.
+		source, ok := chunk.SourceAddr().(*net.UDPAddr)
+		if !ok || !source.IP.Equal(net.ParseIP("10.2.0.1")) {
+			// Keep reverse SCTP traffic flowing. Arbitrary reverse packets
+			// must not mask the active side's unacknowledged outbound queue.
+			return true
+		}
+		// Drop the active-to-passive DTLS record layer, including CloseNotify
+		// alerts, but keep STUN consent packets. This models an asymmetric
+		// stale UDP/NAT data path: the passive endpoint must not learn about
+		// the active endpoint's local close through an alert that the
+		// blackhole should have lost.
 		return payload[0] < 20 || 23 < payload[0]
 	})
 	if err := router.Start(); err != nil {
@@ -148,16 +158,26 @@ func TestWebRtcIdleResumeSctpBlackholeReconnects(t *testing.T) {
 		settings.KeepAliveTimeout = 20 * time.Millisecond
 		settings.SctpNoProgressTimeout = 200 * time.Millisecond
 	}
+	// Reverse writes are deliberately unable to receive their SACKs through
+	// the one-way blackhole. Keep that side alive for the duration of this
+	// test so it can prove reverse DATA does not refresh the active deadline.
+	settingsB.SctpNoProgressTimeout = 0
 
 	signalPipeA := newSignalPipe(nil)
 	signalPipeB := newSignalPipe(nil)
 	managerA := NewWebRtcManager(ctx, signalPipeA, settingsA)
 	managerB := NewWebRtcManager(ctx, signalPipeB, settingsB)
-	managerA.newPeerConnectionFactory = func(*WebRtcSettings) (*webRtcPeerConnectionFactory, error) {
-		return newVnetWebRtcPeerConnectionFactory(t, netA, settingsA), nil
+	managerA.newPeerConnectionFactory = func(
+		*WebRtcSettings,
+		*webrtc.Certificate,
+	) (*webRtcPeerConnectionFactory, *webrtc.Certificate, error) {
+		return newVnetWebRtcPeerConnectionFactory(t, netA, settingsA), nil, nil
 	}
-	managerB.newPeerConnectionFactory = func(*WebRtcSettings) (*webRtcPeerConnectionFactory, error) {
-		return newVnetWebRtcPeerConnectionFactory(t, netB, settingsB), nil
+	managerB.newPeerConnectionFactory = func(
+		*WebRtcSettings,
+		*webrtc.Certificate,
+	) (*webRtcPeerConnectionFactory, *webrtc.Certificate, error) {
+		return newVnetWebRtcPeerConnectionFactory(t, netB, settingsB), nil, nil
 	}
 	signalPipeA.SetSignalReceiver(managerB)
 	signalPipeB.SetSignalReceiver(managerA)
@@ -184,10 +204,21 @@ func TestWebRtcIdleResumeSctpBlackholeReconnects(t *testing.T) {
 	defer active.Close()
 	defer passive.Close()
 
-	if err := active.SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
+	// Establish the association before applying the tight data-plane
+	// deadlines. A one-second deadline beginning at constructor return also
+	// measured goroutine scheduling and ICE/DTLS startup, which made this
+	// blackhole test intermittently fail before the blackhole was enabled.
+	connectedDeadline := time.Now().Add(5 * time.Second)
+	for !active.Connected() || !passive.Connected() {
+		if connectedDeadline.Before(time.Now()) {
+			t.Fatal("initial association did not connect")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := active.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if err := passive.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+	if err := passive.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	readDone := make(chan error, 1)
@@ -224,6 +255,32 @@ func TestWebRtcIdleResumeSctpBlackholeReconnects(t *testing.T) {
 	if buffered := active.pc.SCTP().BufferedAmount(); buffered == 0 {
 		t.Fatal("blackholed write did not leave SCTP data outstanding")
 	}
+	reverseWriteDone := make(chan struct{})
+	go func() {
+		defer close(reverseWriteDone)
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-active.ctx.Done():
+				return
+			case <-ticker.C:
+				if _, reverseErr := passive.Write([]byte{3}); reverseErr != nil {
+					return
+				}
+			}
+		}
+	}()
+	reverseReadDone := make(chan struct{})
+	go func() {
+		defer close(reverseReadDone)
+		var payload [1]byte
+		for {
+			if _, reverseErr := active.Read(payload[:]); reverseErr != nil {
+				return
+			}
+		}
+	}()
 	// ICE consent packets are deliberately still flowing. Establish that
 	// Pion remains connected midway through the SCTP no-progress interval,
 	// so this is not merely exercising its ordinary ICE failure path.
@@ -240,6 +297,20 @@ func TestWebRtcIdleResumeSctpBlackholeReconnects(t *testing.T) {
 	case <-active.ctx.Done():
 	case <-time.After(2 * settingsA.SctpNoProgressTimeout):
 		t.Fatal("SCTP blackhole did not cancel the peer connection")
+	}
+	if cause := context.Cause(active.ctx); cause == nil ||
+		!strings.Contains(cause.Error(), "SCTP no progress") {
+		t.Fatalf("SCTP blackhole cancellation cause = %v", cause)
+	}
+	select {
+	case <-reverseWriteDone:
+	case <-time.After(time.Second):
+		t.Fatal("reverse SCTP writer did not stop with the retired association")
+	}
+	select {
+	case <-reverseReadDone:
+	case <-time.After(time.Second):
+		t.Fatal("reverse SCTP reader did not stop with the retired association")
 	}
 	select {
 	case <-active.ImmediateReconnect():
@@ -264,6 +335,10 @@ func TestWebRtcIdleResumeSctpBlackholeReconnects(t *testing.T) {
 	case <-passive.ctx.Done():
 	case <-time.After(time.Second):
 		t.Fatal("fresh active generation did not retire the stale passive association")
+	}
+	if cause := context.Cause(passive.ctx); cause == nil ||
+		!strings.Contains(cause.Error(), "fresh remote offer replaced") {
+		t.Fatalf("passive replacement cancellation cause = %v", cause)
 	}
 	select {
 	case <-passive.ImmediateReconnect():
@@ -328,20 +403,18 @@ func TestWebRtcSctpReceiveWindowThroughputMeasurement(t *testing.T) {
 		2 * 1024 * 1024,
 		4 * 1024 * 1024,
 	} {
-		t.Run(fmt.Sprintf("window=%dKiB", receiveBufferByteCount/1024), func(t *testing.T) {
-			byteCount, elapsed := measureDataChannelThroughputWithDelay(
-				t,
-				25*time.Millisecond,
-				receiveBufferByteCount,
-			)
-			t.Logf(
-				"window=%d KiB rtt=50ms: %d bytes in %s = %.2f MiB/s",
-				receiveBufferByteCount/1024,
-				byteCount,
-				elapsed,
-				float64(byteCount)/(1024*1024)/elapsed.Seconds(),
-			)
-		})
+		byteCount, elapsed := measureDataChannelThroughputWithDelay(
+			t,
+			25*time.Millisecond,
+			receiveBufferByteCount,
+		)
+		t.Logf(
+			"window=%d KiB rtt=50ms: %d bytes in %s = %.2f MiB/s",
+			receiveBufferByteCount/1024,
+			byteCount,
+			elapsed,
+			float64(byteCount)/(1024*1024)/elapsed.Seconds(),
+		)
 	}
 }
 
@@ -380,31 +453,31 @@ func TestWebRtcSctpCongestionTuningMeasurement(t *testing.T) {
 	}
 	for _, dropEvery := range []uint64{0, 500, 200, 100} {
 		for _, tuning := range tunings {
-			t.Run(fmt.Sprintf("drop=%d/%s", dropEvery, tuning.name), func(t *testing.T) {
-				result := measureSctpPath(t, sctpPathMeasureConfig{
-					oneWayDelay:            25 * time.Millisecond,
-					receiveBufferByteCount: 2 * 1024 * 1024,
-					minCwnd:                tuning.minCwnd,
-					fastRtxWnd:             tuning.fastRtxWnd,
-					cwndCAStep:             tuning.cwndCAStep,
-					rtoMax:                 tuning.rtoMax,
-					dropEveryDataPacket:    dropEvery,
-					warmupByteCount:        1024 * 1024,
-					measuredByteCount:      8 * 1024 * 1024,
-				})
-				t.Logf(
-					"bytes=%d elapsed=%s throughput=%.2f MiB/s post=%s drops=%d cwnd=%d..%d final=%d srtt=%s",
-					result.byteCount,
-					result.elapsed,
-					float64(result.byteCount)/(1024*1024)/result.elapsed.Seconds(),
-					result.postBulkLatency,
-					result.droppedPackets,
-					result.minObservedCwnd,
-					result.maxObservedCwnd,
-					result.finalCwnd,
-					result.finalSrtt,
-				)
+			result := measureSctpPath(t, sctpPathMeasureConfig{
+				oneWayDelay:            25 * time.Millisecond,
+				receiveBufferByteCount: 2 * 1024 * 1024,
+				minCwnd:                tuning.minCwnd,
+				fastRtxWnd:             tuning.fastRtxWnd,
+				cwndCAStep:             tuning.cwndCAStep,
+				rtoMax:                 tuning.rtoMax,
+				dropEveryDataPacket:    dropEvery,
+				warmupByteCount:        1024 * 1024,
+				measuredByteCount:      8 * 1024 * 1024,
 			})
+			t.Logf(
+				"drop=%d/%s bytes=%d elapsed=%s throughput=%.2f MiB/s post=%s drops=%d cwnd=%d..%d final=%d srtt=%s",
+				dropEvery,
+				tuning.name,
+				result.byteCount,
+				result.elapsed,
+				float64(result.byteCount)/(1024*1024)/result.elapsed.Seconds(),
+				result.postBulkLatency,
+				result.droppedPackets,
+				result.minObservedCwnd,
+				result.maxObservedCwnd,
+				result.finalCwnd,
+				result.finalSrtt,
+			)
 		}
 	}
 }
@@ -434,32 +507,34 @@ func TestWebRtcSctpCongestionQueueMeasurement(t *testing.T) {
 	}
 	for _, rateMbps := range []int{5, 20, 50} {
 		for _, tuning := range tunings {
-			t.Run(fmt.Sprintf("rate=%dMbps/%s", rateMbps, tuning.name), func(t *testing.T) {
-				result := measureSctpPath(t, sctpPathMeasureConfig{
-					oneWayDelay:             25 * time.Millisecond,
-					receiveBufferByteCount:  2 * 1024 * 1024,
-					minCwnd:                 tuning.minCwnd,
-					cwndCAStep:              tuning.cwndCAStep,
-					rtoMax:                  tuning.rtoMax,
-					bottleneckBitsPerSecond: rateMbps * 1000 * 1000,
-					bottleneckBurstBytes:    4 * 1500,
-					bottleneckQueueBytes:    64 * 1024,
-					warmupByteCount:         1024 * 1024,
-					measuredByteCount:       8 * 1024 * 1024,
-				})
-				t.Logf(
-					"bytes=%d elapsed=%s throughput=%.2f MiB/s mid=%s post=%s cwnd=%d..%d final=%d srtt=%s",
-					result.byteCount,
-					result.elapsed,
-					float64(result.byteCount)/(1024*1024)/result.elapsed.Seconds(),
-					result.midBulkLatency,
-					result.postBulkLatency,
-					result.minObservedCwnd,
-					result.maxObservedCwnd,
-					result.finalCwnd,
-					result.finalSrtt,
-				)
+			result := measureSctpPath(t, sctpPathMeasureConfig{
+				oneWayDelay:             25 * time.Millisecond,
+				receiveBufferByteCount:  2 * 1024 * 1024,
+				minCwnd:                 tuning.minCwnd,
+				cwndCAStep:              tuning.cwndCAStep,
+				rtoMax:                  tuning.rtoMax,
+				bottleneckBitsPerSecond: rateMbps * 1000 * 1000,
+				bottleneckBurstBytes:    4 * 1500,
+				bottleneckQueueBytes:    64 * 1024,
+				warmupByteCount:         1024 * 1024,
+				measuredByteCount:       8 * 1024 * 1024,
 			})
+			t.Logf(
+				"rate=%dMbps/%s bytes=%d elapsed=%s throughput=%.2f MiB/s bulk-p50=%s p95=%s max=%s post=%s cwnd=%d..%d final=%d srtt=%s",
+				rateMbps,
+				tuning.name,
+				result.byteCount,
+				result.elapsed,
+				float64(result.byteCount)/(1024*1024)/result.elapsed.Seconds(),
+				result.midBulkLatency,
+				result.bulkLatencyP95,
+				result.bulkLatencyMax,
+				result.postBulkLatency,
+				result.minObservedCwnd,
+				result.maxObservedCwnd,
+				result.finalCwnd,
+				result.finalSrtt,
+			)
 		}
 	}
 }
@@ -487,26 +562,25 @@ func TestWebRtcSctpOutageRecoveryMeasurement(t *testing.T) {
 			{name: "rto-max-2s", rtoMax: 2 * time.Second},
 			{name: "rto-max-4s", rtoMax: 4 * time.Second},
 		} {
-			t.Run(fmt.Sprintf("outage=%s/%s", outage, tuning.name), func(t *testing.T) {
-				result := measureSctpPath(t, sctpPathMeasureConfig{
-					oneWayDelay:            25 * time.Millisecond,
-					receiveBufferByteCount: 2 * 1024 * 1024,
-					cwndCAStep:             4 * 1200,
-					rtoMax:                 tuning.rtoMax,
-					outageDuration:         outage,
-					warmupByteCount:        1024 * 1024,
-					measuredByteCount:      sendPackBatchMaxMessageByteCount,
-				})
-				t.Logf(
-					"outage=%s recovery=%s post=%s drops=%d final_cwnd=%d srtt=%s",
-					outage,
-					result.elapsed,
-					result.postBulkLatency,
-					result.droppedPackets,
-					result.finalCwnd,
-					result.finalSrtt,
-				)
+			result := measureSctpPath(t, sctpPathMeasureConfig{
+				oneWayDelay:            25 * time.Millisecond,
+				receiveBufferByteCount: 2 * 1024 * 1024,
+				cwndCAStep:             4 * 1200,
+				rtoMax:                 tuning.rtoMax,
+				outageDuration:         outage,
+				warmupByteCount:        1024 * 1024,
+				measuredByteCount:      sendPackBatchMaxMessageByteCount,
 			})
+			t.Logf(
+				"outage=%s/%s recovery=%s post=%s drops=%d final_cwnd=%d srtt=%s",
+				outage,
+				tuning.name,
+				result.elapsed,
+				result.postBulkLatency,
+				result.droppedPackets,
+				result.finalCwnd,
+				result.finalSrtt,
+			)
 		}
 	}
 }
@@ -524,6 +598,31 @@ func measureDataChannelThroughputWithDelay(
 		measuredByteCount:      8 * 1024 * 1024,
 	})
 	return result.byteCount, result.elapsed
+}
+
+func TestMeasureSctpPathCollectsBulkLatencyDistribution(t *testing.T) {
+	result := measureSctpPath(t, sctpPathMeasureConfig{
+		oneWayDelay:            time.Millisecond,
+		receiveBufferByteCount: 2 * 1024 * 1024,
+		warmupByteCount:        128 * 1024,
+		measuredByteCount:      512 * 1024,
+	})
+	if result.byteCount <= 0 || result.elapsed <= 0 {
+		t.Fatalf("invalid throughput sample: bytes=%d elapsed=%s", result.byteCount, result.elapsed)
+	}
+	if result.midBulkLatency <= 0 ||
+		result.bulkLatencyP95 < result.midBulkLatency ||
+		result.bulkLatencyMax < result.bulkLatencyP95 {
+		t.Fatalf(
+			"invalid bulk latency distribution: p50=%s p95=%s max=%s",
+			result.midBulkLatency,
+			result.bulkLatencyP95,
+			result.bulkLatencyMax,
+		)
+	}
+	if result.postBulkLatency <= 0 {
+		t.Fatalf("invalid post-bulk latency: %s", result.postBulkLatency)
+	}
 }
 
 func measureSctpPath(t *testing.T, config sctpPathMeasureConfig) sctpPathMeasureResult {
@@ -757,19 +856,33 @@ func measureSctpPath(t *testing.T, config sctpPathMeasureConfig) sctpPathMeasure
 	receiveDone := make(chan error, 1)
 	warmupDone := make(chan struct{})
 	bulkDone := make(chan struct{})
-	midProbeDone := make(chan time.Time, 1)
+	// 31 samples keep probe overhead negligible while making p95 distinct
+	// from max (with 15 samples the nearest-rank p95 is necessarily sample 15).
+	bulkProbeCount := min(31, max(1, measuredMessageCount))
+	type probeArrival struct {
+		index int
+		at    time.Time
+	}
+	probeArrivals := make(chan probeArrival, bulkProbeCount)
 	probeDone := make(chan error, 1)
 	go func() {
 		receiveBuffer := make([]byte, 64*1024)
 		regularMessageCount := 0
-		for regularMessageCount < totalMessageCount {
+		receivedProbeCount := 0
+		for regularMessageCount < totalMessageCount || receivedProbeCount < bulkProbeCount {
 			n, readErr := rawB.Read(receiveBuffer)
 			if readErr != nil {
 				receiveDone <- readErr
 				return
 			}
-			if n == 1 {
-				midProbeDone <- time.Now()
+			if n == 3 && receiveBuffer[0] == 0xa5 && receiveBuffer[2] == 0x5a {
+				probeIndex := int(receiveBuffer[1])
+				if probeIndex < 0 || bulkProbeCount <= probeIndex {
+					receiveDone <- fmt.Errorf("invalid in-bulk probe index %d", probeIndex)
+					return
+				}
+				probeArrivals <- probeArrival{index: probeIndex, at: time.Now()}
+				receivedProbeCount++
 				continue
 			}
 			if n != messageByteCount {
@@ -780,11 +893,13 @@ func measureSctpPath(t *testing.T, config sctpPathMeasureConfig) sctpPathMeasure
 			if regularMessageCount == warmupMessageCount {
 				close(warmupDone)
 			}
+			if regularMessageCount == totalMessageCount {
+				close(bulkDone)
+			}
 		}
-		close(bulkDone)
 		n, readErr := rawB.Read(receiveBuffer)
-		if readErr == nil && n != 2 {
-			readErr = fmt.Errorf("read post-bulk probe %d bytes, expected 2", n)
+		if readErr == nil && (n != 4 || receiveBuffer[0] != 0x5a) {
+			readErr = fmt.Errorf("read post-bulk probe %d bytes, expected marker/4", n)
 		}
 		probeDone <- readErr
 	}()
@@ -839,17 +954,24 @@ func measureSctpPath(t *testing.T, config sctpPathMeasureConfig) sctpPathMeasure
 	}()
 
 	start := time.Now()
-	firstMeasuredMessageCount := measuredMessageCount / 2
-	writeMessages(firstMeasuredMessageCount)
-	midProbeStart := time.Now()
-	n, err := rawA.Write([]byte{1})
-	if err != nil {
-		t.Fatal(err)
+	probeStarts := make([]time.Time, bulkProbeCount)
+	nextProbe := 0
+	for messageIndex := range measuredMessageCount {
+		writeMessages(1)
+		if nextProbe < bulkProbeCount &&
+			(messageIndex+1)*(bulkProbeCount+1) >= (nextProbe+1)*measuredMessageCount {
+			probe := []byte{0xa5, byte(nextProbe), 0x5a}
+			probeStarts[nextProbe] = time.Now()
+			n, writeErr := rawA.Write(probe)
+			if writeErr != nil {
+				t.Fatal(writeErr)
+			}
+			if n != len(probe) {
+				t.Fatalf("wrote in-bulk probe %d bytes, expected %d", n, len(probe))
+			}
+			nextProbe++
+		}
 	}
-	if n != 1 {
-		t.Fatalf("wrote mid-bulk probe %d bytes, expected 1", n)
-	}
-	writeMessages(measuredMessageCount - firstMeasuredMessageCount)
 	select {
 	case <-bulkDone:
 	case readErr := <-receiveDone:
@@ -858,21 +980,32 @@ func measureSctpPath(t *testing.T, config sctpPathMeasureConfig) sctpPathMeasure
 		t.Fatal("measurement timed out")
 	}
 	elapsed := time.Since(start)
-	var midBulkLatency time.Duration
-	select {
-	case midProbeTime := <-midProbeDone:
-		midBulkLatency = midProbeTime.Sub(midProbeStart)
-	default:
-		t.Fatal("mid-bulk probe was not delivered")
+	bulkLatencies := make([]time.Duration, 0, bulkProbeCount)
+	for range bulkProbeCount {
+		select {
+		case arrival := <-probeArrivals:
+			bulkLatencies = append(bulkLatencies, arrival.at.Sub(probeStarts[arrival.index]))
+		case readErr := <-receiveDone:
+			t.Fatal(readErr)
+		case <-time.After(10 * time.Second):
+			t.Fatal("in-bulk probe timed out")
+		}
 	}
+	sort.Slice(bulkLatencies, func(i, j int) bool {
+		return bulkLatencies[i] < bulkLatencies[j]
+	})
+	midBulkLatency := bulkLatencies[len(bulkLatencies)/2]
+	p95Index := (95*len(bulkLatencies)+99)/100 - 1
+	bulkLatencyP95 := bulkLatencies[p95Index]
+	bulkLatencyMax := bulkLatencies[len(bulkLatencies)-1]
 
 	probeStart := time.Now()
-	n, err = rawA.Write([]byte{2, 2})
+	n, err := rawA.Write([]byte{0x5a, 2, 2, 0xa5})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 2 {
-		t.Fatalf("wrote post-bulk probe %d bytes, expected 2", n)
+	if n != 4 {
+		t.Fatalf("wrote post-bulk probe %d bytes, expected 4", n)
 	}
 	select {
 	case probeErr := <-probeDone:
@@ -893,6 +1026,8 @@ func measureSctpPath(t *testing.T, config sctpPathMeasureConfig) sctpPathMeasure
 		byteCount:       actualMeasuredByteCount,
 		elapsed:         elapsed,
 		midBulkLatency:  midBulkLatency,
+		bulkLatencyP95:  bulkLatencyP95,
+		bulkLatencyMax:  bulkLatencyMax,
 		postBulkLatency: postBulkLatency,
 		droppedPackets:  droppedPacketCount.Load(),
 		minObservedCwnd: minObservedCwnd,
@@ -929,31 +1064,29 @@ func TestWebRtcDataChannelLossHeadOfLineMeasurement(t *testing.T) {
 
 	const trials = 10
 	for _, variant := range variants {
-		t.Run(variant.name, func(t *testing.T) {
-			latencies := make([]time.Duration, 0, trials)
-			for trial := range trials {
-				latency := measureDataChannelSecondMessageAfterOneDrop(
-					t,
-					trial,
-					&webrtc.DataChannelInit{
-						Ordered:        variant.ordered,
-						MaxRetransmits: variant.maxRetransmits,
-					},
-				)
-				latencies = append(latencies, latency)
-			}
-			sort.Slice(latencies, func(i, j int) bool {
-				return latencies[i] < latencies[j]
-			})
-			t.Logf(
-				"%s second-message latency after one dropped DTLS datagram: median=%s p95=%s min=%s max=%s",
-				variant.name,
-				latencies[len(latencies)/2],
-				latencies[(len(latencies)*95-1)/100],
-				latencies[0],
-				latencies[len(latencies)-1],
+		latencies := make([]time.Duration, 0, trials)
+		for trial := range trials {
+			latency := measureDataChannelSecondMessageAfterOneDrop(
+				t,
+				trial,
+				&webrtc.DataChannelInit{
+					Ordered:        variant.ordered,
+					MaxRetransmits: variant.maxRetransmits,
+				},
 			)
+			latencies = append(latencies, latency)
+		}
+		sort.Slice(latencies, func(i, j int) bool {
+			return latencies[i] < latencies[j]
 		})
+		t.Logf(
+			"%s second-message latency after one dropped DTLS datagram: median=%s p95=%s min=%s max=%s",
+			variant.name,
+			latencies[len(latencies)/2],
+			latencies[(len(latencies)*95-1)/100],
+			latencies[0],
+			latencies[len(latencies)-1],
+		)
 	}
 }
 

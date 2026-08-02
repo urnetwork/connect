@@ -44,9 +44,13 @@ const debugVerifyHeaders = false
 // `provideMode` is the relationship between the source and this device
 type SendPacketFunction func(provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool
 
-// receive into a raw socket. ipPath and packet are read-only for the duration
-// of the callback. A callee that retains packet must call
-// MessagePoolShareReadOnly; a callee that needs a mutable path must clone it.
+// receive into a raw socket. ipPath is the canonical outbound flow identity
+// (client→server), while packet retains its actual wire direction
+// (server→client on a normal return). A callee that needs the packet's source
+// or destination must inspect packet rather than infer its direction from
+// ipPath. Both are read-only for the duration of the callback. A callee that
+// retains packet must call MessagePoolShareReadOnly; a callee that needs a
+// mutable path must clone it.
 type ReceivePacketFunction func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte)
 
 // receive a batch of packets from one flow (same source, provideMode, ipPath)
@@ -198,6 +202,19 @@ const providerUdpIdleTimeout = 300 * time.Second
 const providerUdpFlowByteCount = 2 * 1024
 const providerTcpFlowByteCount = 8 * 1024
 
+// A cold public page can fan out across more than 100 origins while the
+// browser keeps prior http/2 and quic connections alive. The target-derived
+// 4 MiB mobile provider profile used to cap one source at 51 tcp and 153 udp
+// flows, so an ordinary page evicted live handshakes and fell onto the
+// browser's 17/33/65 second syn retry ladder. These are bounded functional
+// floors, not unlimited exceptions: the aggregate caps still contain the
+// complete table, and larger provider targets continue to scale from the
+// byte-cost model above.
+const providerMinUdpUserLimit = 256
+const providerMinUdpGlobalLimit = 512
+const providerMinTcpUserLimit = 256
+const providerMinTcpGlobalLimit = 512
+
 // DefaultProviderLocalUserNatSettings is the explicit provider/egress profile.
 // A process that installed a memory budget is a constrained device and gets
 // the scaled per-source/aggregate caps. An unbudgeted desktop/server provider
@@ -222,15 +239,37 @@ func DefaultProviderLocalUserNatSettingsWithMemoryTarget(targetByteCount ByteCou
 		// model above, keeping the historical user:global ratios and floors);
 		// the other half sizes the provider client's transfer budgets (see
 		// the sdk device wiring). Flows over a cap evict the
-		// least-recently-active flow, so the tables track the target exactly
-		// under load.
+		// least-recently-active flow, so the tables remain predictably
+		// bounded under load. The functional fanout floors above may exceed a
+		// very small target's byte-derived count.
 		natTarget := targetByteCount / 2
-		udpGlobalLimit := max(256, int(natTarget*3/5/providerUdpFlowByteCount))
-		tcpGlobalLimit := max(64, int(natTarget*2/5/providerTcpFlowByteCount))
-		settings.UdpBufferSettings.UserLimit = max(64, udpGlobalLimit/4)
+		udpGlobalLimit := max(providerMinUdpGlobalLimit, int(natTarget*3/5/providerUdpFlowByteCount))
+		tcpGlobalLimit := max(providerMinTcpGlobalLimit, int(natTarget*2/5/providerTcpFlowByteCount))
+		settings.UdpBufferSettings.UserLimit = max(providerMinUdpUserLimit, udpGlobalLimit/4)
 		settings.UdpBufferSettings.GlobalLimit = udpGlobalLimit
-		settings.TcpBufferSettings.UserLimit = max(32, tcpGlobalLimit/2)
+		settings.TcpBufferSettings.UserLimit = max(providerMinTcpUserLimit, tcpGlobalLimit/2)
 		settings.TcpBufferSettings.GlobalLimit = tcpGlobalLimit
+
+		// The generic process profile leaves headroom above one full tcp
+		// window. A provider can hold hundreds of simultaneous page flows, so
+		// multiplying that spare channel capacity by every flow wastes
+		// several MiB. Retain exactly enough slots for a max-window burst of
+		// full-size IPv6 tcp packets; the lossless source contract remains
+		// intact while active provider memory becomes proportional to the
+		// advertised window instead of the unrelated process-wide default.
+		tcpPayloadByteCount := max(
+			1,
+			settings.TcpBufferSettings.Mtu-Ipv6HeaderSize-TcpHeaderSizeWithoutExtensions,
+		)
+		windowPacketCount := int(
+			(settings.TcpBufferSettings.MaxWindowSize +
+				uint32(tcpPayloadByteCount) - 1) /
+				uint32(tcpPayloadByteCount),
+		)
+		settings.TcpBufferSettings.SequenceBufferSize = min(
+			settings.TcpBufferSettings.SequenceBufferSize,
+			max(1, windowPacketCount),
+		)
 		return settings
 	}
 	if MemoryBudget() <= 0 {
@@ -2116,7 +2155,18 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 				// accept.
 				return nil
 			}
-			return sequence
+			if !tcp.syn || sequence.ctx.Err() == nil && tcp.seq == sequence.initialSynSeq {
+				return sequence
+			}
+
+			// A source may reuse a four-tuple before the previous sequence's
+			// goroutine reaches deferred map cleanup. A fresh SYN sent to that
+			// old sequence is rejected by its established sequence-number
+			// check, leaving the replacement connection silent until timeout.
+			// Keep an exact live SYN retransmission on the current generation;
+			// a different initial sequence number, or a canceled generation,
+			// atomically replaces it.
+			self.removeSequenceWithLock(bufferId, sequence)
 		}
 
 		if !tcp.syn {
@@ -2213,6 +2263,7 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 			tcp.sourcePort,
 			destinationIpCopy,
 			tcp.destinationPort,
+			tcp.seq,
 			self.tcpBufferSettings,
 		)
 		sequence.receivePacketsCallback = self.receivePacketsCallback
@@ -2374,6 +2425,9 @@ type TcpSequence struct {
 	sendTimer *time.Timer
 
 	idleCondition *IdleCondition
+	// immutable generation identity used to distinguish a retransmitted SYN
+	// from four-tuple reuse while the previous flow is still being reaped
+	initialSynSeq uint32
 
 	ConnectionState
 }
@@ -2384,6 +2438,7 @@ func NewTcpSequence(ctx context.Context, receiveCallback ReceivePacketFunction,
 	ipVersion int,
 	sourceIp net.IP, sourcePort uint16,
 	destinationIp net.IP, destinationPort uint16,
+	initialSynSeq uint32,
 	tcpBufferSettings *TcpBufferSettings) *TcpSequence {
 	cancelCtx, cancel := context.WithCancel(ctx)
 
@@ -2395,6 +2450,7 @@ func NewTcpSequence(ctx context.Context, receiveCallback ReceivePacketFunction,
 		tcpBufferSettings: tcpBufferSettings,
 		sendItems:         make(chan *TcpSendItem, tcpBufferSettings.SequenceBufferSize),
 		idleCondition:     NewIdleCondition(),
+		initialSynSeq:     initialSynSeq,
 		ConnectionState: ConnectionState{
 			source:          source,
 			provideMode:     provideMode,
@@ -2485,6 +2541,59 @@ func (self *TcpSequence) send(sendItem *TcpSendItem, timeout time.Duration) (boo
 	}
 }
 
+// initializeSynWithLock establishes sequence and window state from the first
+// SYN. The sequence mutex must be held.
+func (self *TcpSequence) initializeSynWithLock(tcp *parsedTcp) {
+	// SYN and FIN consume one sequence number.
+	self.sendSeq = tcp.seq + 1
+	// The synthetic return sequence may start at the sender's sequence because
+	// there is no transport-security boundary between the two sides.
+	self.receiveSeq = tcp.seq
+	self.receiveSeqAck = tcp.seq
+
+	parseWindowScaleOpts := func() (bool, uint32) {
+		options := tcp.options
+		for optionIndex := 0; optionIndex < len(options); {
+			switch options[optionIndex] {
+			case 0:
+				return false, 0
+			case 1:
+				optionIndex += 1
+			default:
+				if len(options) < optionIndex+2 {
+					return false, 0
+				}
+				optionByteCount := int(options[optionIndex+1])
+				if optionByteCount < 2 || len(options) < optionIndex+optionByteCount {
+					return false, 0
+				}
+				if options[optionIndex] == 3 && optionByteCount == 3 {
+					return true, min(uint32(options[optionIndex+2]), 14)
+				}
+				optionIndex += optionByteCount
+			}
+		}
+		return false, 0
+	}
+
+	self.enableWindowScale, self.receiveWindowScale = parseWindowScaleOpts()
+	// RFC 7323 applies the negotiated scale only after the handshake. The
+	// Window field in a SYN is always the literal, unscaled value.
+	self.receiveWindowSize = uint32(tcp.windowSize)
+	self.receiveWindowEnd = self.receiveSeqAck + self.receiveWindowSize
+	self.receiveWindowEndSet = true
+	if self.enableWindowScale {
+		bits := math.Log2(float64(self.tcpBufferSettings.MaxWindowSize) / float64(math.MaxUint16))
+		if 0 <= bits {
+			self.windowScale = uint32(math.Ceil(bits))
+		} else {
+			self.windowScale = 0
+		}
+	} else {
+		self.windowScale = 0
+	}
+}
+
 func (self *TcpSequence) Run() {
 	defer func() {
 		self.cancel()
@@ -2567,57 +2676,7 @@ func (self *TcpSequence) Run() {
 					self.mutex.Lock()
 					defer self.mutex.Unlock()
 
-					// sendSeq is the next expected sequence number
-					// SYN and FIN consume one
-					self.sendSeq = sendItem.tcp.seq + 1
-					// start the send seq at send seq
-					// this is arbitrary, and since there is no transport security risk back to sender is fine
-					self.receiveSeq = sendItem.tcp.seq
-					self.receiveSeqAck = sendItem.tcp.seq
-
-					parseWindowScaleOpts := func() (bool, uint32) {
-						options := sendItem.tcp.options
-						for i := 0; i < len(options); {
-							switch options[i] {
-							case 0:
-								// end of options
-								return false, 0
-							case 1:
-								// nop
-								i += 1
-							default:
-								if len(options) < i+2 {
-									return false, 0
-								}
-								optionByteCount := int(options[i+1])
-								if optionByteCount < 2 || len(options) < i+optionByteCount {
-									return false, 0
-								}
-								if options[i] == 3 && optionByteCount == 3 {
-									// window scale
-									// see 2.3  Using the Window Scale Option
-									return true, min(uint32(options[i+2]), 14)
-								}
-								i += optionByteCount
-							}
-						}
-						return false, 0
-					}
-
-					self.enableWindowScale, self.receiveWindowScale = parseWindowScaleOpts()
-					self.receiveWindowSize = uint32(sendItem.tcp.windowSize) << self.receiveWindowScale
-					if self.enableWindowScale {
-						// compute the window scale to fit the window size in uint16
-						bits := math.Log2(float64(self.tcpBufferSettings.MaxWindowSize) / float64(math.MaxUint16))
-						if 0 <= bits {
-							self.windowScale = uint32(math.Ceil(bits))
-						} else {
-							self.windowScale = 0
-						}
-					} else {
-						// turn off window scale for send
-						self.windowScale = 0
-					}
+					self.initializeSynWithLock(&sendItem.tcp)
 					if self.log.V(2).Enabled() {
 						self.log.Infof("[init]window=%d/%d, receive=%d/%d\n", self.windowSize, self.windowScale, self.receiveWindowSize, self.receiveWindowScale)
 					}
@@ -2667,8 +2726,24 @@ func (self *TcpSequence) Run() {
 		)
 	}
 	if err != nil {
+		// The source has not seen our synthetic syn-ack yet. Abandoning the
+		// sequence silently makes it retransmit the syn on an exponential
+		// schedule (17/33/65 seconds in Chromium under repeated provider dial
+		// failure). Release the unsent syn-ack and reject the flow so the
+		// source can fail or retry immediately. A parent cancellation is
+		// teardown, not an upstream refusal, and must not generate new output.
+		MessagePoolReturn(packet)
 		if self.log.V(1).Enabled() {
 			self.log.Infof("[init]tcp connect error = %s\n", err)
+		}
+		if self.ctx.Err() == nil {
+			var resetPacket []byte
+			func() {
+				self.mutex.Lock()
+				defer self.mutex.Unlock()
+				resetPacket, _ = self.RstAck()
+			}()
+			receive(resetPacket)
 		}
 		return
 	}
@@ -2723,9 +2798,10 @@ func (self *TcpSequence) Run() {
 	// pipelines
 
 	type writePayload struct {
-		sendIter uint64
-		payload  []byte
-		ipPacket []byte
+		sendIter         uint64
+		ipPacket         []byte
+		payloadOffset    uint16
+		payloadByteCount uint16
 	}
 
 	writePayloads := make(chan writePayload, self.tcpBufferSettings.SequenceBufferSize)
@@ -2779,8 +2855,11 @@ func (self *TcpSequence) Run() {
 			bufferStorage = bufferStorage[:0]
 			byteCount := 0
 			for _, writePayload := range batch {
-				bufferStorage = append(bufferStorage, writePayload.payload)
-				byteCount += len(writePayload.payload)
+				payloadStart := int(writePayload.payloadOffset)
+				payloadEnd := payloadStart + int(writePayload.payloadByteCount)
+				payload := writePayload.ipPacket[payloadStart:payloadEnd]
+				bufferStorage = append(bufferStorage, payload)
+				byteCount += len(payload)
 			}
 			// `net.Buffers` uses a single vectored write when the socket supports it.
 			// `WriteTo` retries partial writes until fully written, a timeout, or an error.
@@ -2815,7 +2894,16 @@ func (self *TcpSequence) Run() {
 		}
 	}, self.cancel)
 
-	readPackets := make(chan []byte, self.tcpBufferSettings.SequenceBufferSize)
+	// Keep at most one callback batch of read-ahead per flow. The former
+	// SequenceBufferSize queue reserved a full send window again even though
+	// the socket reader already enforces that window. One batch preserves the
+	// measured socket-read/delivery overlap while a stalled callback still
+	// applies bounded backpressure to its own flow.
+	readQueueSize := min(
+		self.tcpBufferSettings.SequenceBufferSize,
+		max(1, self.tcpBufferSettings.WriteBatchSize),
+	)
+	readPackets := make(chan []byte, readQueueSize)
 	go HandleError(func() {
 		defer self.cancel()
 
@@ -3123,23 +3211,10 @@ func (self *TcpSequence) Run() {
 			self.mutex.Lock()
 			defer self.mutex.Unlock()
 
-			// signed-delta comparisons are wraparound-tolerant across the
-			// 4 GB uint32 boundary. since the transfer from local to remote
-			// is lossless and preserves order, any seq other than the
-			// exact expected sendSeq must be a retransmit.
-			if int32(sendItem.tcp.seq-self.sendSeq) != 0 || sendItem.tcp.syn {
-				// a retransmit; ignore
-				drop = true
-			} else if sendItem.tcp.ack {
-				// acks are reliably delivered (see above).
-				// note the window size can be adjusted at any time for the same
-				// receive seq number, e.g. ->0 then ->full on receiver full.
-				// use signed delta so wrapped ack numbers compare correctly.
-				if 0 <= int32(sendItem.tcp.ackNumber-self.receiveSeqAck) {
-					self.receiveWindowSize = uint32(sendItem.tcp.windowSize) << self.receiveWindowScale
-					self.receiveSeqAck = sendItem.tcp.ackNumber
-					receiveAckCond.Broadcast()
-				}
+			var receiveAckUpdated bool
+			drop, receiveAckUpdated = self.applySendItemWithLock(&sendItem.tcp)
+			if receiveAckUpdated {
+				receiveAckCond.Broadcast()
 			}
 		}()
 
@@ -3164,10 +3239,15 @@ func (self *TcpSequence) Run() {
 		payload := sendItem.tcp.payload
 		if 0 < len(payload) {
 			// seq += uint32(len(payload))
+			ipHeaderByteCount := Ipv6HeaderSize
+			if sendItem.ipPacket[0]>>4 == 4 {
+				ipHeaderByteCount = int(sendItem.ipPacket[0]&0xf) * 4
+			}
 			writePayload := writePayload{
-				payload:  payload,
-				sendIter: sendIter,
-				ipPacket: sendItem.ipPacket,
+				sendIter:         sendIter,
+				ipPacket:         sendItem.ipPacket,
+				payloadOffset:    uint16(ipHeaderByteCount + TcpHeaderSizeWithoutExtensions + len(sendItem.tcp.options)),
+				payloadByteCount: uint16(len(payload)),
 			}
 			// FIXME count the number of non-blocking versus blocking channel adds
 			// FIXME every window size, check the count:
@@ -3306,6 +3386,58 @@ send:
 	}
 }
 
+// applySendItemWithLock updates the return-path acknowledgment/window and
+// reports whether an established packet's sequence-bearing portion is in
+// order. The caller holds mutex.
+func (self *TcpSequence) applySendItemWithLock(tcp *parsedTcp) (drop bool, receiveAckUpdated bool) {
+	if tcp.ack &&
+		0 <= int32(tcp.ackNumber-self.receiveSeqAck) &&
+		0 <= int32(self.receiveSeq-tcp.ackNumber) {
+		// ACK generation and upload packetization may run concurrently in the
+		// source TCP stack. A pure ACK can therefore arrive with a sequence
+		// just ahead of or behind upload payload already delivered here. Its
+		// ACK field is independent and must still reopen the return window.
+		// Bound it by receiveSeq so a corrupt/future ACK cannot acknowledge
+		// bytes this sequence has not emitted.
+		if !self.receiveWindowEndSet {
+			self.receiveWindowEnd = self.receiveSeqAck + self.receiveWindowSize
+			self.receiveWindowEndSet = true
+		}
+
+		// A TCP receiver never shrinks the right edge it has already
+		// advertised. ACK generation and application reads can produce
+		// duplicate window updates concurrently, so their callback order is
+		// not a reliable chronology. Preserve the greatest advertised edge:
+		// this accepts zero-window closure (the ACK advances to the existing
+		// edge), accepts a later reopen (the edge grows), and ignores a stale
+		// smaller-window duplicate that arrives after the reopen.
+		receiveWindowEnd := tcp.ackNumber + (uint32(tcp.windowSize) << self.receiveWindowScale)
+		if 0 < int32(receiveWindowEnd-self.receiveWindowEnd) {
+			self.receiveWindowEnd = receiveWindowEnd
+		}
+
+		receiveSeqAck := tcp.ackNumber
+		receiveWindowSize := uint32(0)
+		if 0 < int32(self.receiveWindowEnd-receiveSeqAck) {
+			receiveWindowSize = self.receiveWindowEnd - receiveSeqAck
+		}
+		if self.receiveSeqAck != receiveSeqAck || self.receiveWindowSize != receiveWindowSize {
+			self.receiveSeqAck = receiveSeqAck
+			self.receiveWindowSize = receiveWindowSize
+			receiveAckUpdated = true
+		}
+	}
+
+	// Pure ACKs consume no sequence space and tolerate the full-duplex
+	// scheduling described above. Payload, FIN, and an unexpected established
+	// SYN remain strictly in order because the user-NAT does not reorder or
+	// retransmit that direction.
+	if tcp.syn || (0 < len(tcp.payload) || tcp.fin) && int32(tcp.seq-self.sendSeq) != 0 {
+		drop = true
+	}
+	return
+}
+
 func (self *TcpSequence) Cancel() {
 	self.cancel()
 }
@@ -3331,14 +3463,16 @@ type ConnectionState struct {
 
 	mutex sync.Mutex
 
-	sendSeq            uint32
-	receiveSeq         uint32
-	receiveSeqAck      uint32
-	receiveWindowSize  uint32
-	receiveWindowScale uint32
-	enableWindowScale  bool
-	windowSize         uint32
-	windowScale        uint32
+	sendSeq             uint32
+	receiveSeq          uint32
+	receiveSeqAck       uint32
+	receiveWindowSize   uint32
+	receiveWindowEnd    uint32
+	receiveWindowEndSet bool
+	receiveWindowScale  uint32
+	enableWindowScale   bool
+	windowSize          uint32
+	windowScale         uint32
 	// encodedWindowSize  uint16
 
 	// cached immutable ip path for this connection (see IpPath). primed at
@@ -3784,11 +3918,20 @@ func (self *RemoteUserNatProvider) sourceReturnProvideMode(sourceId Id, fallback
 // second would supersede the other and could leave its acknowledged traffic
 // permanently dropped as "older". Non-Network returns continue to ride the
 // companion contract that the remote source grants.
-func providerReturnTransferOption(provideMode protocol.ProvideMode) any {
+func providerReturnTransferOptions(
+	defaultOptions TransferOptions,
+	provideMode protocol.ProvideMode,
+) TransferOptions {
 	if provideMode == protocol.ProvideMode_Network {
-		return ForceStream()
+		defaultOptions.CompanionContract = false
+		defaultOptions.ForceStream = true
+		defaultOptions.NetworkPeer = true
+	} else {
+		defaultOptions.CompanionContract = true
+		defaultOptions.ForceStream = false
+		defaultOptions.NetworkPeer = false
 	}
-	return CompanionContract()
+	return defaultOptions
 }
 
 // `ReceivePacketFunction`
@@ -3849,7 +3992,10 @@ func (self *RemoteUserNatProvider) ReceiveBatch(
 	}
 
 	returnProvideMode := self.sourceReturnProvideMode(source.SourceId, provideMode)
-	returnOption := providerReturnTransferOption(returnProvideMode)
+	returnOption := providerReturnTransferOptions(
+		self.client.settings.DefaultTransferOpts,
+		returnProvideMode,
+	)
 	destination := source.Reverse()
 
 	// build frames, flushing a chunk when the frame/byte bound is hit
@@ -3958,7 +4104,10 @@ func (self *RemoteUserNatProvider) Receive(
 	// receives it as network mode and skips the public ingress rules. Other
 	// modes ride a companion contract (verified as Stream) as before.
 	returnProvideMode := self.sourceReturnProvideMode(source.SourceId, provideMode)
-	returnOption := providerReturnTransferOption(returnProvideMode)
+	returnOption := providerReturnTransferOptions(
+		self.client.settings.DefaultTransferOpts,
+		returnProvideMode,
+	)
 	// note udp is sent with ack because because otherwise the delivery reliability will mulitply with the egress
 	c := func() bool {
 		var sent bool
@@ -4070,7 +4219,10 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 				source.Reverse(),
 				func(err error) {},
 				0,
-				providerReturnTransferOption(returnProvideMode),
+				providerReturnTransferOptions(
+					self.client.settings.DefaultTransferOpts,
+					returnProvideMode,
+				),
 			) {
 				MessagePoolReturn(echoBytes)
 			}

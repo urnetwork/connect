@@ -133,7 +133,7 @@ func TestTcpOrphanRst(t *testing.T) {
 
 func TestTcpOrphanRstDetachesPooledIpPath(t *testing.T) {
 	for _, ipVersion := range []int{4, 6} {
-		t.Run(net.JoinHostPort("ip", string(rune('0'+ipVersion))), func(t *testing.T) {
+		func() {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 
@@ -221,12 +221,22 @@ func TestTcpOrphanRstDetachesPooledIpPath(t *testing.T) {
 				t.Fatal("orphan reset callback was not invoked")
 			}
 			if !bytes.Equal(callbackPath.SourceIp, sourceIp) {
-				t.Fatalf("source ip aliases returned pool memory: got %v want %v", callbackPath.SourceIp, sourceIp)
+				t.Fatalf(
+					"ip%d source ip aliases returned pool memory: got %v want %v",
+					ipVersion,
+					callbackPath.SourceIp,
+					sourceIp,
+				)
 			}
 			if !bytes.Equal(callbackPath.DestinationIp, destinationIp) {
-				t.Fatalf("destination ip aliases returned pool memory: got %v want %v", callbackPath.DestinationIp, destinationIp)
+				t.Fatalf(
+					"ip%d destination ip aliases returned pool memory: got %v want %v",
+					ipVersion,
+					callbackPath.DestinationIp,
+					destinationIp,
+				)
 			}
-		})
+		}()
 	}
 }
 

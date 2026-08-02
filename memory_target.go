@@ -40,14 +40,14 @@ type MemoryTarget struct {
 	stateLock sync.Mutex
 	capacity  ByteCount
 	used      ByteCount
-	// closed and replaced whenever headroom may have grown, waking acquirers
+	// allocated only while an acquirer is waiting; closed and cleared whenever
+	// headroom may have grown
 	notify chan struct{}
 }
 
 func NewMemoryTarget(capacity ByteCount) *MemoryTarget {
 	return &MemoryTarget{
 		capacity: capacity,
-		notify:   make(chan struct{}),
 	}
 }
 
@@ -55,19 +55,31 @@ func NewMemoryTarget(capacity ByteCount) *MemoryTarget {
 // A target with no used bytes always admits, so a single acquisition larger
 // than the capacity cannot deadlock (the transfer queue admission idiom).
 func (self *MemoryTarget) admitWithLock(byteCount ByteCount) bool {
+	if byteCount < 0 {
+		return false
+	}
 	if self.capacity <= 0 {
-		return true
+		// Unlimited means there is no configured capacity ceiling, but the
+		// signed accounting counter must still remain representable.
+		return self.used <= ByteCount(math.MaxInt64)-byteCount
 	}
 	if self.used == 0 {
 		return true
 	}
-	return self.used+byteCount <= self.capacity
+	// Compare against the remaining capacity instead of adding the request
+	// to used. A deliberately oversized singleton acquisition may set used
+	// to MaxInt64; used+1 would then wrap negative and incorrectly admit
+	// another acquisition.
+	return self.used <= self.capacity && byteCount <= self.capacity-self.used
 }
 
 // Acquire takes `byteCount` from the target, waiting for headroom.
 // Returns false if `ctx` ends before the acquisition; the caller must
 // Release exactly the acquired bytes iff Acquire returned true.
 func (self *MemoryTarget) Acquire(ctx context.Context, byteCount ByteCount) bool {
+	if byteCount < 0 {
+		return false
+	}
 	if self == nil {
 		return true
 	}
@@ -78,6 +90,9 @@ func (self *MemoryTarget) Acquire(ctx context.Context, byteCount ByteCount) bool
 			self.used += byteCount
 			self.stateLock.Unlock()
 			return true
+		}
+		if self.notify == nil {
+			self.notify = make(chan struct{})
 		}
 		notify = self.notify
 		self.stateLock.Unlock()
@@ -93,6 +108,9 @@ func (self *MemoryTarget) Acquire(ctx context.Context, byteCount ByteCount) bool
 // TryReserve takes `byteCount` from the target only if it fits the current
 // headroom, without waiting
 func (self *MemoryTarget) TryReserve(byteCount ByteCount) bool {
+	if byteCount < 0 {
+		return false
+	}
 	if self == nil {
 		return true
 	}
@@ -135,8 +153,10 @@ func (self *MemoryTarget) SetCapacity(capacity ByteCount) {
 }
 
 func (self *MemoryTarget) notifyWithLock() {
-	close(self.notify)
-	self.notify = make(chan struct{})
+	if self.notify != nil {
+		close(self.notify)
+		self.notify = nil
+	}
 }
 
 // Capacity is the target's byte capacity. 0 for a nil or unlimited target.

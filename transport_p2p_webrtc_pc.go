@@ -49,7 +49,10 @@ func logIceInterfaces(log Logger) {
 // media codecs nor RTP interceptors. A caller-provided certificate is also
 // intentionally shared across the manager's peer connections, avoiding a new
 // P-256 key and X.509 certificate for every retry.
-func newWebRtcPeerConnectionFactory(settings *WebRtcSettings) (*webRtcPeerConnectionFactory, error) {
+func newWebRtcPeerConnectionFactory(
+	settings *WebRtcSettings,
+	certificate *webrtc.Certificate,
+) (*webRtcPeerConnectionFactory, *webrtc.Certificate, error) {
 	s := webrtc.SettingEngine{}
 	s.LoggerFactory = &pionLoggerFactory{log: loggerOrDefault(settings.Log)}
 	logIceInterfaces(loggerOrDefault(settings.Log))
@@ -99,7 +102,8 @@ func newWebRtcPeerConnectionFactory(settings *WebRtcSettings) (*webRtcPeerConnec
 	// pending queue. Blocking mode is required for transfer backpressure and
 	// is what makes SetWriteDeadline effective.
 	s.EnableDataChannelBlockWrite(true)
-	s.SetSCTPMaxReceiveBufferSize( /*16 * 1024 * 1024*/ uint32(settings.ReceiveBufferSize))
+	// The SCTP receive buffer is set per-API below so a trusted network peer can
+	// use a larger window than public peers within one manager (Fix 1).
 	if 0 < settings.MaxMessageSize {
 		s.SetSCTPMaxMessageSize(uint32(settings.MaxMessageSize))
 	}
@@ -123,18 +127,15 @@ func newWebRtcPeerConnectionFactory(settings *WebRtcSettings) (*webRtcPeerConnec
 	if 0 < settings.StunGatherTimeout {
 		s.SetSTUNGatherTimeout(settings.StunGatherTimeout)
 	}
-	api := webrtc.NewAPI(
-		webrtc.WithSettingEngine(s),
-		webrtc.WithMediaEngine(&webrtc.MediaEngine{}),
-		webrtc.WithInterceptorRegistry(nil),
-	)
-	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, err
-	}
-	certificate, err := webrtc.GenerateCertificate(privateKey)
-	if err != nil {
-		return nil, err
+	if certificate == nil {
+		privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			return nil, nil, err
+		}
+		certificate, err = webrtc.GenerateCertificate(privateKey)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	configuration := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
@@ -144,17 +145,42 @@ func newWebRtcPeerConnectionFactory(settings *WebRtcSettings) (*webRtcPeerConnec
 		},
 		Certificates: []webrtc.Certificate{*certificate},
 	}
+	// Build one API per SCTP receive-buffer size, sharing the certificate.
+	// `WithSettingEngine` copies the engine, so mutating the buffer between
+	// NewAPI calls gives each API its own snapshot. Public peers get the
+	// (small, many-connection) window; a trusted network peer gets the larger
+	// window without multiplying that footprint across public peers (Fix 1,
+	// mirrors the client-side selected-peer window). See OPTIMIZENETWORKPEER1.md.
+	newApi := func(receiveBufferByteCount ByteCount) *webrtc.API {
+		s.SetSCTPMaxReceiveBufferSize(uint32(receiveBufferByteCount))
+		return webrtc.NewAPI(
+			webrtc.WithSettingEngine(s),
+			webrtc.WithMediaEngine(&webrtc.MediaEngine{}),
+			webrtc.WithInterceptorRegistry(nil),
+		)
+	}
+	publicApi := newApi(settings.ReceiveBufferSize)
+	networkPeerApi := publicApi
+	if 0 < settings.NetworkPeerReceiveBufferSize &&
+		settings.NetworkPeerReceiveBufferSize != settings.ReceiveBufferSize {
+		networkPeerApi = newApi(settings.NetworkPeerReceiveBufferSize)
+	}
 	return &webRtcPeerConnectionFactory{
-		newPeerConnection: func() (*webrtc.PeerConnection, error) {
+		newPeerConnection: func(networkPeer bool) (*webrtc.PeerConnection, error) {
+			api := publicApi
+			if networkPeer {
+				api = networkPeerApi
+			}
 			return api.NewPeerConnection(configuration)
 		},
-	}, nil
+	}, certificate, nil
 }
 
-// webRtcSctpProgress returns the native association signals used by the lazy
-// no-progress watchdog. BytesReceived counts all SCTP packets read from DTLS,
-// including SACKs; BufferedAmount covers pending plus in-flight user data.
-func webRtcSctpProgress(pc *webrtc.PeerConnection) (bufferedAmount int, bytesReceived uint64, ok bool) {
+// webRtcSctpBufferedAmount returns pending plus in-flight SCTP user data for
+// the lazy no-progress watchdog. Combined with the peerConn's monotonic
+// accepted-write byte count, this yields acknowledged forward bytes without
+// treating unrelated reverse packets as progress.
+func webRtcSctpBufferedAmount(pc *webrtc.PeerConnection) (bufferedAmount int, ok bool) {
 	if pc == nil {
 		return
 	}
@@ -162,8 +188,45 @@ func webRtcSctpProgress(pc *webrtc.PeerConnection) (bufferedAmount int, bytesRec
 	if sctp == nil {
 		return
 	}
-	stats := sctp.Stats()
-	return sctp.BufferedAmount(), stats.BytesReceived, true
+	return sctp.BufferedAmount(), true
+}
+
+// webRtcSctpReceiverWindow is the slower ambiguity check used only when the
+// no-progress deadline expires. SCTPTransport.Stats also snapshots metadata,
+// so calling it on every 250 ms progress sample would add allocations and lock
+// traffic to the hot send path. A zero window means the peer is deliberately
+// applying receiver backpressure and the association must remain intact.
+func webRtcSctpReceiverWindow(
+	pc *webrtc.PeerConnection,
+) (receiverWindow uint32, ok bool) {
+	if pc == nil {
+		return
+	}
+	sctp := pc.SCTP()
+	if sctp == nil || sctp.State() != webrtc.SCTPTransportStateConnected {
+		return
+	}
+	return sctp.Stats().ReceiverWindow, true
+}
+
+// webRtcPeerConnectionTransportStop returns the native ICE stop operation so
+// teardown can interrupt a physical read/write before PeerConnection.Close
+// joins the rest of Pion. The browser implementation has no public Stop API
+// and supplies a build-tagged no-op in transport_p2p_webrtc_pc_js.go.
+func webRtcPeerConnectionTransportStop(
+	pc *webrtc.PeerConnection,
+) func() error {
+	if pc == nil {
+		return nil
+	}
+	if sctpTransport := pc.SCTP(); sctpTransport != nil {
+		if dtlsTransport := sctpTransport.Transport(); dtlsTransport != nil {
+			if iceTransport := dtlsTransport.ICETransport(); iceTransport != nil {
+				return iceTransport.Stop
+			}
+		}
+	}
+	return nil
 }
 
 func detachWithDeadline(dc *webrtc.DataChannel) (datachannel.ReadWriteCloserDeadliner, error) {

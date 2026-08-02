@@ -64,6 +64,64 @@ func writeDohWire(w http.ResponseWriter, r *http.Request, records []netip.Addr, 
 	w.Write(resp)
 }
 
+func TestDohLaunchStaggerClosedStopCancels(t *testing.T) {
+	stop := make(chan struct{})
+	close(stop)
+	if waitDohLaunchStagger(context.Background(), stop, time.Hour) {
+		t.Fatal("closed stop channel must cancel the stagger wait")
+	}
+}
+
+func TestDohLaunchStaggerCanceledContextCancels(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if waitDohLaunchStagger(ctx, make(chan struct{}), time.Hour) {
+		t.Fatal("canceled context must cancel the stagger wait")
+	}
+}
+
+func TestDohLaunchStaggerTimerAdmitsHedge(t *testing.T) {
+	if !waitDohLaunchStagger(context.Background(), make(chan struct{}), time.Nanosecond) {
+		t.Fatal("timer expiry must admit the next hedge")
+	}
+}
+
+func TestDohLaunchStaggerCancellationAtTimerBoundary(t *testing.T) {
+	// Exercise the expiry/cancellation boundary concurrently. The historical
+	// Stop-then-drain pattern could select cancellation, observe Stop == false,
+	// and then wait forever for a value from Go 1.23+'s synchronous timer
+	// channel. Either timer or cancellation may win; every waiter must return.
+	const waiterCount = 1024
+	start := make(chan struct{})
+	completed := make(chan struct{}, waiterCount)
+	for i := range waiterCount {
+		go func(i int) {
+			<-start
+			if i%2 == 0 {
+				stop := make(chan struct{})
+				close(stop)
+				waitDohLaunchStagger(context.Background(), stop, time.Nanosecond)
+			} else {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				waitDohLaunchStagger(ctx, make(chan struct{}), time.Nanosecond)
+			}
+			completed <- struct{}{}
+		}(i)
+	}
+	close(start)
+
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for i := 0; i < waiterCount; i++ {
+		select {
+		case <-completed:
+		case <-deadline.C:
+			t.Fatalf("only %d/%d boundary waiters returned", i, waiterCount)
+		}
+	}
+}
+
 func TestDohQuery(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

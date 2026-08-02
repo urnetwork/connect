@@ -219,6 +219,31 @@ func (self *packetTranslation) encodeDns() {
 	var buf [1024]byte
 	var id uint16
 	var mostRecentAddr net.Addr
+	var dnsPumpTimer *time.Timer
+	var paceTimer *time.Timer
+	defer func() {
+		if dnsPumpTimer != nil {
+			dnsPumpTimer.Stop()
+		}
+		if paceTimer != nil {
+			paceTimer.Stop()
+		}
+	}()
+	waitPace := func(timeout time.Duration) bool {
+		maxJitterNanoseconds := int(2 * timeout / time.Nanosecond)
+		if maxJitterNanoseconds <= 0 {
+			return true
+		}
+		randTimeout := time.Duration(mathrand.Intn(maxJitterNanoseconds)) * time.Nanosecond
+		timerC := resetOrCreateTimer(&paceTimer, randTimeout)
+		select {
+		case <-timerC:
+			return true
+		case <-self.ctx.Done():
+			paceTimer.Stop()
+			return false
+		}
+	}
 	for {
 		if self.dnsClient {
 			writeOne := func(p *packet) error {
@@ -257,15 +282,8 @@ func (self *packetTranslation) encodeDns() {
 					if 0 < self.settings.WritePacketsPerSecond {
 						writeDuration := endTime.Sub(startTime)
 						timeout := time.Second/time.Duration(self.settings.WritePacketsPerSecond) - writeDuration
-						if 0 < timeout {
-							randTimeout := time.Duration(mathrand.Intn(
-								2*int(timeout/time.Nanosecond),
-							)) * time.Nanosecond
-							select {
-							case <-time.After(randTimeout):
-							case <-self.ctx.Done():
-								return nil
-							}
+						if 0 < timeout && !waitPace(timeout) {
+							return nil
 						}
 					}
 
@@ -285,10 +303,13 @@ func (self *packetTranslation) encodeDns() {
 			}
 
 			if self.ptMode == PacketTranslationModeDnsPump {
+				timerC := resetOrCreateTimer(&dnsPumpTimer, self.settings.DnsPumpTimeout)
 				select {
 				case <-self.ctx.Done():
+					dnsPumpTimer.Stop()
 					return
 				case p := <-self.out:
+					dnsPumpTimer.Stop()
 					// each write includes one pump header
 					mostRecentAddr = p.addr
 					if err := writeOne(p); err != nil {
@@ -299,7 +320,7 @@ func (self *packetTranslation) encodeDns() {
 						}
 						return
 					}
-				case <-time.After(self.settings.DnsPumpTimeout):
+				case <-timerC:
 					// pump one header the server can use to repsond to
 					if mostRecentAddr != nil {
 						startTime := time.Now()
@@ -332,16 +353,11 @@ func (self *packetTranslation) encodeDns() {
 							}
 							return
 						}
-						endTime := time.Now()
-						writeDuration := endTime.Sub(startTime)
-						timeout := time.Second/time.Duration(self.settings.WritePacketsPerSecond) - writeDuration
-						if 0 < timeout {
-							randTimeout := time.Duration(mathrand.Intn(
-								2*int(timeout/time.Nanosecond),
-							)) * time.Nanosecond
-							select {
-							case <-time.After(randTimeout):
-							case <-self.ctx.Done():
+						if 0 < self.settings.WritePacketsPerSecond {
+							endTime := time.Now()
+							writeDuration := endTime.Sub(startTime)
+							timeout := time.Second/time.Duration(self.settings.WritePacketsPerSecond) - writeDuration
+							if 0 < timeout && !waitPace(timeout) {
 								return
 							}
 						}
@@ -450,15 +466,8 @@ func (self *packetTranslation) encodeDns() {
 					if 0 < self.settings.WritePacketsPerSecond {
 						writeDuration := endTime.Sub(startTime)
 						timeout := time.Second/time.Duration(self.settings.WritePacketsPerSecond) - writeDuration
-						if 0 < timeout {
-							randTimeout := time.Duration(mathrand.Intn(
-								2*int(timeout/time.Nanosecond),
-							)) * time.Nanosecond
-							select {
-							case <-time.After(randTimeout):
-							case <-self.ctx.Done():
-								return nil
-							}
+						if 0 < timeout && !waitPace(timeout) {
+							return nil
 						}
 					}
 				}
@@ -758,6 +767,21 @@ func (self *packetTranslation) WriteTo(packetData []byte, addr net.Addr) (n int,
 			self.log.Infof("[pt]write packet timeout\n")
 			return
 		}
+		// Ready fast path: a deadline must be checked first, but a write that can
+		// complete now does not need to allocate a timer.
+		select {
+		case <-self.ctx.Done():
+			err = fmt.Errorf("Done.")
+			return
+		case self.out <- p:
+			queued = true
+			n = len(packetData)
+			self.log.V(2).Infof("[pt]write packet\n")
+			return
+		case <-deadlineChanged:
+			continue
+		default:
+		}
 		select {
 		case <-self.ctx.Done():
 			err = fmt.Errorf("Done.")
@@ -800,6 +824,22 @@ func (self *packetTranslation) ReadFrom(packetData []byte) (n int, addr net.Addr
 			err = fmt.Errorf("Timeout.")
 			self.log.Infof("[pt]read packet timeout\n")
 			return
+		}
+		// Ready fast path: preserve expired-deadline behavior while avoiding a
+		// timer allocation when a packet is already queued.
+		select {
+		case <-self.ctx.Done():
+			err = fmt.Errorf("Done.")
+			return
+		case p := <-self.in:
+			addr = p.addr
+			n = copy(packetData, p.data)
+			MessagePoolReturn(p.data)
+			self.log.V(2).Infof("[pt]read packet\n")
+			return
+		case <-deadlineChanged:
+			continue
+		default:
 		}
 		select {
 		case <-self.ctx.Done():

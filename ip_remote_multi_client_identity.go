@@ -300,16 +300,35 @@ func (self *windowIdentityState) Record(identity *WindowClientIdentity) {
 	self.storeSnapshotWithLock()
 }
 
-// Remove drops the live pair for a client id and mirrors the snapshot to
-// the store.
+// Remove drops the live pair for a client id and mirrors the snapshot to the
+// store. It is the unconditional bookkeeping form used by tests/callers that
+// do not hold a generation token; provider lifecycle teardown should use
+// RemoveIfCurrent.
 func (self *windowIdentityState) Remove(clientId Id) {
+	self.RemoveIfCurrent(clientId, Id{})
+}
+
+// RemoveIfCurrent removes clientId only when instanceId still owns that slot.
+// A channel can be replaced under the same client id while the retired
+// channel's asynchronous cleanup is still pending. In that case the instance
+// id is the generation token: returning false tells the caller it must not
+// erase the replacement's persisted identity or remove the live server client.
+//
+// A zero instance id is the unconditional compatibility form. A missing entry
+// returns true because there is no newer in-process generation to protect.
+func (self *windowIdentityState) RemoveIfCurrent(clientId Id, instanceId Id) bool {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
-	if _, ok := self.live[clientId]; !ok {
-		return
+	identity, ok := self.live[clientId]
+	if !ok {
+		return true
+	}
+	if instanceId != (Id{}) && identity.InstanceId != instanceId {
+		return false
 	}
 	delete(self.live, clientId)
 	self.storeSnapshotWithLock()
+	return true
 }
 
 func (self *windowIdentityState) snapshotWithLock() []*WindowClientIdentity {

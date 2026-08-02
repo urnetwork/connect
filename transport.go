@@ -58,6 +58,11 @@ const TransportVersion = 2
 // note we don't run this because it's most efficient to let the gc handle some infrequent orphaned messages
 const DebugCloseSend = false
 
+// The platform WebSocket writer combines only messages already waiting on its
+// bounded route. Four production-safe transfer frames fit in one 16 KiB TLS
+// record, reducing write syscalls without adding a batching delay.
+const platformWebSocketWriteBatchMaxMessages = 4
+
 type TransportControl = byte
 
 const (
@@ -738,6 +743,14 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				self.routeManager.RemoveTransport(sendTransport)
 				self.routeManager.RemoveTransport(receiveTransport)
 				handleCancel()
+				// Close the socket before waiting for the writer. A context
+				// cancellation does not interrupt a goroutine already blocked
+				// in net.Conn.Write. Waiting first inverted that dependency:
+				// window-client removal, app disconnect, and migration could
+				// remain stuck until WriteTimeout, retaining the old transport
+				// and all of its queues. The outer deferred Close remains as an
+				// idempotent backstop for exits before routes are registered.
+				ws.Close()
 				// once the writer has exited and no new writes can be routed,
 				// drain any pooled messages still sitting in send. a stale
 				// reflect.Select in MultiRouteSelector that captured our
@@ -782,9 +795,11 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				defer handleCancel()
 
 				speedTest := false
+				pingTimer := time.NewTimer(0)
+				defer pingTimer.Stop()
+				resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 
-				write := func(message []byte) error {
-					ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
+				writeMessage := func(message []byte) error {
 					err := ws.WriteMessage(websocket.BinaryMessage, message)
 					MessagePoolReturn(message)
 					if err != nil {
@@ -799,6 +814,64 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					writeCounter.Add(1)
 					return nil
 				}
+				write := func(message []byte) error {
+					ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
+					return writeMessage(message)
+				}
+				writeSendMessage := func(message []byte) error {
+					if len(message) <= 16 {
+						self.log.Infof("[ts]send message must be >16 bytes (%d)\n", len(message))
+						MessagePoolReturn(message)
+						return nil
+					}
+					return writeMessage(message)
+				}
+
+				writeBatchConn, _ :=
+					ws.UnderlyingConn().(*webSocketWriteBatchConn)
+				writeReadySendBatch := func(
+					firstMessage []byte,
+				) (sendOpen bool, err error) {
+					if writeBatchConn == nil {
+						ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
+						return true, writeSendMessage(firstMessage)
+					}
+
+					ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
+					writeBatchConn.beginWriteBatch()
+					if err = writeSendMessage(firstMessage); err != nil {
+						writeBatchConn.abortWriteBatch()
+						return true, err
+					}
+
+					sendOpen = true
+				drainReady:
+					for range platformWebSocketWriteBatchMaxMessages - 1 {
+						select {
+						case <-handleCtx.Done():
+							writeBatchConn.abortWriteBatch()
+							return false, nil
+						case message, ok := <-send:
+							if !ok {
+								sendOpen = false
+								break drainReady
+							}
+							if err = writeSendMessage(message); err != nil {
+								writeBatchConn.abortWriteBatch()
+								return true, err
+							}
+						default:
+							break drainReady
+						}
+					}
+					if err = writeBatchConn.flushWriteBatch(); err != nil {
+						// A WebSocket write timeout or partial TLS write cannot
+						// be recovered; the transfer sequence retains each
+						// item and retries it over the replacement route.
+						self.log.Infof("[ts]%s-> batch flush error = %s\n", clientId, err)
+					}
+					return
+				}
 
 				for {
 					if speedTest {
@@ -809,12 +882,13 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						select {
 						case <-handleCtx.Done():
 							return
-						case <-WakeupAfter(self.settings.PingTimeout, self.settings.PingTimeout):
+						case <-pingTimer.C:
 							ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
 							if err := ws.WriteMessage(websocket.BinaryMessage, make([]byte, 0)); err != nil {
 								// note that for websocket a dealine timeout cannot be recovered
 								return
 							}
+							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						case message, ok := <-controlSend:
 							if !ok {
 								return
@@ -828,6 +902,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							if write(message) != nil {
 								return
 							}
+							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						case message, ok := <-send:
 							if !ok {
 								return
@@ -838,6 +913,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							} else if write(message) != nil {
 								return
 							}
+							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						}
 					} else {
 						select {
@@ -851,18 +927,18 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							// 	panic("[t]shared should be set")
 							// }
 
-							if len(message) <= 16 {
-								self.log.Infof("[ts]send message must be >16 bytes (%d)\n", len(message))
-								MessagePoolReturn(message)
-							} else if write(message) != nil {
+							sendOpen, err := writeReadySendBatch(message)
+							if err != nil || !sendOpen {
 								return
 							}
-						case <-WakeupAfter(self.settings.PingTimeout, self.settings.PingTimeout):
+							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+						case <-pingTimer.C:
 							ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
 							if err := ws.WriteMessage(websocket.BinaryMessage, make([]byte, 0)); err != nil {
 								// note that for websocket a dealine timeout cannot be recovered
 								return
 							}
+							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						case message, ok := <-controlSend:
 							if !ok {
 								return
@@ -876,6 +952,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							if write(message) != nil {
 								return
 							}
+							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						}
 					}
 				}
@@ -889,6 +966,12 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 					drain(receive)
 					drain(controlSend)
+				}()
+				var receiveTimer *time.Timer
+				defer func() {
+					if receiveTimer != nil {
+						receiveTimer.Stop()
+					}
 				}()
 
 				speedTest := false
@@ -976,21 +1059,24 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							continue
 						}
 
+						timeoutChan := resetOrCreateTimer(&receiveTimer, self.settings.ReadTimeout)
 						select {
 						case <-handleCtx.Done():
+							receiveTimer.Stop()
 							MessagePoolReturn(message)
 							return
 						case receive <- message:
+							receiveTimer.Stop()
 							if self.log.V(2).Enabled() {
 								self.log.Infof("[tr]%s<-\n", clientId)
 							}
-						case <-time.After(self.settings.ReadTimeout):
+						case <-timeoutChan:
 							self.log.Infof("[tr]drop %s<-\n", clientId)
 							MessagePoolReturn(message)
 						}
 					default:
 						if self.log.V(2).Enabled() {
-							self.log.Infof("[tr]other=%s %s<-\n", messageType, clientId)
+							self.log.Infof("[tr]other=%v %s<-\n", messageType, clientId)
 						}
 					}
 
@@ -1334,6 +1420,11 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				self.routeManager.RemoveTransport(sendTransport)
 				self.routeManager.RemoveTransport(receiveTransport)
 				handleCancel()
+				// Like the websocket path, a QUIC stream write already in the
+				// kernel does not observe context cancellation. Break the
+				// connection before joining the writer so teardown is bounded
+				// by local scheduling rather than the write deadline.
+				conn.CloseWithError(0, "transport teardown")
 				// note `send` is not closed. drain any pooled bytes still
 				// queued after the writer exits and RemoveTransport has
 				// stopped new route writes. a stale reflect.Select may
@@ -1377,6 +1468,10 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				defer h3WriterCancel()
 				defer handleCancel()
 
+				pingTimer := time.NewTimer(0)
+				defer pingTimer.Stop()
+				resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+
 				for {
 					select {
 					case <-handleCtx.Done():
@@ -1399,12 +1494,14 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 						if self.log.V(2).Enabled() {
 							self.log.Infof("[ts]%s->\n", clientId)
 						}
-					case <-WakeupAfter(self.settings.PingTimeout, self.settings.PingTimeout):
+						resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+					case <-pingTimer.C:
 						stream.SetWriteDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.WriteTimeout))
 						if err := framer.Write(stream, make([]byte, 0)); err != nil {
 							// note that for websocket a dealine timeout cannot be recovered
 							return
 						}
+						resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 					}
 				}
 			}, handleCancel)
@@ -1413,6 +1510,12 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				defer func() {
 					handleCancel()
 					close(receive)
+				}()
+				var receiveTimer *time.Timer
+				defer func() {
+					if receiveTimer != nil {
+						receiveTimer.Stop()
+					}
 				}()
 
 				for {
@@ -1438,15 +1541,21 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 						continue
 					}
 
+					timeoutChan := resetOrCreateTimer(
+						&receiveTimer,
+						time.Duration(slowMultiple)*self.settings.ReadTimeout,
+					)
 					select {
 					case <-handleCtx.Done():
+						receiveTimer.Stop()
 						MessagePoolReturn(message)
 						return
 					case receive <- message:
+						receiveTimer.Stop()
 						if self.log.V(2).Enabled() {
 							self.log.Infof("[tr]%s<-\n", clientId)
 						}
-					case <-time.After(time.Duration(slowMultiple) * self.settings.ReadTimeout):
+					case <-timeoutChan:
 						self.log.Infof("[tr]drop %s<-\n", clientId)
 						MessagePoolReturn(message)
 					}

@@ -456,6 +456,17 @@ func isPublicUnicast(ip net.IP) bool {
 
 type SecurityPolicyStats = map[SecurityPolicyResult]map[SecurityDestination]uint64
 
+const (
+	// securityPolicyStatsMaxDestinationsPerResult includes one overflow
+	// destination. Security-policy statistics are diagnostics, not flow state:
+	// a long-lived provider must not retain every ephemeral port it has ever
+	// relayed or clone that growing set whenever statistics are inspected.
+	securityPolicyStatsMaxDestinationsPerResult = 1024
+	securityPolicyStatsUnknownResult            = SecurityPolicyResult(-1)
+)
+
+var securityPolicyStatsOverflowDestination = SecurityDestination{}
+
 type SecurityDestination struct {
 	Version  int
 	Protocol IpProtocol
@@ -528,6 +539,9 @@ func (self *SecurityDestination) Cmp(b SecurityDestination) int {
 }
 
 func (self *SecurityDestination) String() string {
+	if *self == securityPolicyStatsOverflowDestination {
+		return "other destinations"
+	}
 	return fmt.Sprintf("ipv%d %s %s",
 		self.Version,
 		self.Protocol.String(),
@@ -550,13 +564,24 @@ func DefaultSecurityPolicyStatsCollector() *SecurityPolicyStatsCollector {
 	}
 }
 
-func (self *SecurityPolicyStatsCollector) AddDestination(ipPath *IpPath, result SecurityPolicyResult, count uint64) {
-	var destination SecurityDestination
-	if self.includeIp {
-		destination = newSecurityDestination(ipPath)
-	} else {
-		// port only, no ip
-		destination = newSecurityDestinationPort(ipPath)
+// add records one diagnostic count while bounding every result's destination
+// cardinality. Built-in policies produce the three declared results; callers
+// passing another integer share one unknown-result bucket so arbitrary result
+// values cannot defeat the memory bound.
+func (self *SecurityPolicyStatsCollector) add(
+	destination SecurityDestination,
+	result SecurityPolicyResult,
+	count uint64,
+) {
+	if count == 0 {
+		return
+	}
+	switch result {
+	case SecurityPolicyResultDrop,
+		SecurityPolicyResultAllow,
+		SecurityPolicyResultIncident:
+	default:
+		result = securityPolicyStatsUnknownResult
 	}
 
 	self.stateLock.Lock()
@@ -567,7 +592,24 @@ func (self *SecurityPolicyStatsCollector) AddDestination(ipPath *IpPath, result 
 		destinationCounts = map[SecurityDestination]uint64{}
 		self.resultDestinationCounts[result] = destinationCounts
 	}
+	if _, ok := destinationCounts[destination]; !ok &&
+		securityPolicyStatsMaxDestinationsPerResult <= len(destinationCounts)+1 {
+		// Reserve the final slot for all later destinations. A real IpPath has
+		// version 4 or 6, so the zero destination cannot collide with one.
+		destination = securityPolicyStatsOverflowDestination
+	}
 	destinationCounts[destination] += count
+}
+
+func (self *SecurityPolicyStatsCollector) AddDestination(ipPath *IpPath, result SecurityPolicyResult, count uint64) {
+	var destination SecurityDestination
+	if self.includeIp {
+		destination = newSecurityDestination(ipPath)
+	} else {
+		// port only, no ip
+		destination = newSecurityDestinationPort(ipPath)
+	}
+	self.add(destination, result, count)
 }
 
 func (self *SecurityPolicyStatsCollector) AddSource(ipPath *IpPath, result SecurityPolicyResult, count uint64) {
@@ -578,16 +620,7 @@ func (self *SecurityPolicyStatsCollector) AddSource(ipPath *IpPath, result Secur
 		// port only, no ip
 		destination = newSecuritySourcePort(ipPath)
 	}
-
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
-
-	destinationCounts, ok := self.resultDestinationCounts[result]
-	if !ok {
-		destinationCounts = map[SecurityDestination]uint64{}
-		self.resultDestinationCounts[result] = destinationCounts
-	}
-	destinationCounts[destination] += count
+	self.add(destination, result, count)
 }
 
 func (self *SecurityPolicyStatsCollector) Stats(reset bool) SecurityPolicyStats {
