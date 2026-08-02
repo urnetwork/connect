@@ -95,6 +95,13 @@ func (self *cfaaDetector) inspect(ip net.IP, port int, protocol IpProtocol, vers
 		}
 	}
 
+	// icmp has no ports, so the port policy below does not apply; the
+	// blocked-ip reputation check above still does. echo-only parsing
+	// constrains what reaches here (see ICMP.md).
+	if protocol == IpProtocolIcmp {
+		return cfaaAllow
+	}
+
 	switch {
 	case 6881 <= port && port <= 6889, port == 6969, port == 1337, port == 9337, port == 2710:
 		// bittorrent and unofficial bittorrent-related ports

@@ -161,6 +161,10 @@ func (self *IpMux) Receive(source TransferPath, provideMode protocol.ProvideMode
 // also uses this to inject locally-generated replies (e.g. DNS responses) toward
 // the downstream.
 func (self *IpMux) deliverDownstream(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
+	if packet == nil {
+		// a synthesizer with no builder for the path (see ipOosPacket)
+		return
+	}
 	for _, receiver := range self.receivers.Get() {
 		safeReceive(receiver, source, provideMode, ipPath, packet)
 	}

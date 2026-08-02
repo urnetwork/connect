@@ -36,6 +36,11 @@ func TestLocalUserNatSettingsMemoryScaled(t *testing.T) {
 	AssertEqual(t, tcpSettings.MaxWindowSize, uint32(262144))
 	AssertEqual(t, tcpSettings.GlobalLimit, 192)
 
+	icmpSettings := DefaultIcmpBufferSettings()
+	AssertEqual(t, icmpSettings.SequenceBufferSize, 24)
+	AssertEqual(t, icmpSettings.IdleTimeout, 60*time.Second)
+	AssertEqual(t, icmpSettings.GlobalLimit, 192)
+
 	natSettings := DefaultLocalUserNatSettings()
 	AssertEqual(t, natSettings.SequenceBufferSize, 384)
 
@@ -53,6 +58,9 @@ func TestLocalUserNatSettingsMemoryScaled(t *testing.T) {
 	AssertEqual(t, tcpSettings.ReadBufferByteCount, 16384)
 	AssertEqual(t, tcpSettings.MaxWindowSize, uint32(131072))
 	AssertEqual(t, tcpSettings.GlobalLimit, 64)
+	icmpSettings = DefaultIcmpBufferSettings()
+	AssertEqual(t, icmpSettings.SequenceBufferSize, 16)
+	AssertEqual(t, icmpSettings.GlobalLimit, 64)
 	AssertEqual(t, DefaultDmcaSecurityPolicySettings().MaxFlows, 8192)
 
 	// no budget identifies a server/generic caller: it keeps the unscaled
@@ -68,6 +76,9 @@ func TestLocalUserNatSettingsMemoryScaled(t *testing.T) {
 	AssertEqual(t, tcpSettings.ReadBufferByteCount, 65536)
 	AssertEqual(t, tcpSettings.MaxWindowSize, uint32(1048576))
 	AssertEqual(t, tcpSettings.GlobalLimit, 0)
+	icmpSettings = DefaultIcmpBufferSettings()
+	AssertEqual(t, icmpSettings.SequenceBufferSize, 64)
+	AssertEqual(t, icmpSettings.GlobalLimit, 0)
 	AssertEqual(t, DefaultLocalUserNatSettings().SequenceBufferSize, 1024)
 	AssertEqual(t, DefaultDmcaSecurityPolicySettings().MaxFlows, 65536)
 	providerSettings := DefaultProviderLocalUserNatSettings()
@@ -756,4 +767,117 @@ func TestIpEgressTcp4MemoryBudget(t *testing.T) {
 			t.Fatal("timeout")
 		}
 	}
+}
+
+// TestIcmpBufferFlowLimits exercises the per source (`UserLimit`) and
+// aggregate (`GlobalLimit`) icmp flow caps — the enforcement side of the
+// icmp memory budget item (see ICMP.md): over-limit creates evict the
+// idle-most sampled flow and eager removal keeps the flow map at the cap.
+func TestIcmpBufferFlowLimits(t *testing.T) {
+	requireIcmpEgress(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	icmpBufferSettings := DefaultIcmpBufferSettingsWithBufferSize(8)
+	icmpBufferSettings.UserLimit = 2
+	icmpBufferSettings.GlobalLimit = 3
+
+	buffer := NewIcmp4Buffer(ctx, func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {}, icmpBufferSettings)
+
+	send := func(source TransferPath, identifier uint16) {
+		t.Helper()
+		packet := MessagePoolGet(32)
+		parsed := &parsedIcmp{
+			sourceIp:       net.IPv4(10, 0, 0, 1).To4(),
+			destinationIp:  net.IPv4(127, 0, 0, 1).To4(),
+			echoRequest:    true,
+			identifier:     identifier,
+			sequenceNumber: 1,
+			ttl:            64,
+			payload:        packet[:4],
+		}
+		if success, err := buffer.send(source, protocol.ProvideMode_Network, parsed, -1, packet); err != nil || !success {
+			MessagePoolReturn(packet)
+			t.Fatalf("icmp send %d: success=%t err=%v", identifier, success, err)
+		}
+		// keep the lru order deterministic
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	identifiers := func() map[uint16]bool {
+		buffer.mutex.Lock()
+		defer buffer.mutex.Unlock()
+		ids := map[uint16]bool{}
+		for _, sequence := range buffer.sequences {
+			ids[sequence.identifier] = true
+		}
+		return ids
+	}
+
+	sourceA := SourceId(NewId())
+	// two flows fill the per source limit
+	send(sourceA, 40001)
+	send(sourceA, 40002)
+	// the third and fourth evict the idle-most flow before their insert
+	send(sourceA, 40003)
+	send(sourceA, 40004)
+	pollUntil(t, 5*time.Second, "per source lru eviction", func() bool {
+		ids := identifiers()
+		return !ids[40001] && ids[40003] && ids[40004]
+	})
+
+	// a second source pushes the aggregate over the global limit: the
+	// idle-most flows across all sources evict, the newest flows survive
+	sourceB := SourceId(NewId())
+	send(sourceB, 41001)
+	send(sourceB, 41002)
+	pollUntil(t, 5*time.Second, "global lru eviction", func() bool {
+		ids := identifiers()
+		return len(ids) <= icmpBufferSettings.GlobalLimit && ids[41001] && ids[41002]
+	})
+}
+
+// TestIcmpBufferIdleReap: an idle echo flow reaps on `IdleTimeout`, so an
+// unused icmp path returns to zero flows (the budget item holds no memory
+// when unused)
+func TestIcmpBufferIdleReap(t *testing.T) {
+	requireIcmpEgress(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	icmpBufferSettings := DefaultIcmpBufferSettingsWithBufferSize(8)
+	icmpBufferSettings.IdleTimeout = 250 * time.Millisecond
+
+	buffer := NewIcmp4Buffer(ctx, func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {}, icmpBufferSettings)
+
+	source := SourceId(NewId())
+	for s := 0; s < 3; s++ {
+		packet := MessagePoolGet(32)
+		parsed := &parsedIcmp{
+			sourceIp:       net.IPv4(10, 0, 0, 1).To4(),
+			destinationIp:  net.IPv4(127, 0, 0, 1).To4(),
+			echoRequest:    true,
+			identifier:     uint16(42001 + s),
+			sequenceNumber: 1,
+			ttl:            64,
+			payload:        packet[:4],
+		}
+		if success, err := buffer.send(source, protocol.ProvideMode_Network, parsed, -1, packet); err != nil || !success {
+			MessagePoolReturn(packet)
+			t.Fatalf("icmp send %d: success=%t err=%v", s, success, err)
+		}
+	}
+
+	sequenceCount := func() int {
+		buffer.mutex.Lock()
+		defer buffer.mutex.Unlock()
+		return len(buffer.sequences)
+	}
+	AssertEqual(t, sequenceCount(), 3)
+
+	pollUntil(t, 10*time.Second, "idle flows reaped", func() bool {
+		return sequenceCount() == 0
+	})
 }

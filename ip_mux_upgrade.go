@@ -1258,6 +1258,8 @@ func peekClaim(packet []byte, seg *tlsSegment) peekResult {
 				return peekDns
 			}
 			return peekOther
+		case 1: // icmp: passthrough, never claimed
+			return peekOther
 		default:
 			return peekOther // not tcp/udp: never claimed
 		}
@@ -1291,6 +1293,8 @@ func peekClaim(packet []byte, seg *tlsSegment) peekResult {
 			if 53 == int(packet[42])<<8|int(packet[43]) {
 				return peekDns
 			}
+			return peekOther
+		case 58: // icmpv6: passthrough, never claimed
 			return peekOther
 		default:
 			return peekUndecided // extension header / other: needs the full parse

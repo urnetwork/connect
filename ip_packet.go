@@ -10,7 +10,9 @@ import (
 // allocations; callers own the returned packet and never return it to the
 // message pool.
 
-// out-of-sequence packet is not aligned with the flow sequence
+// out-of-sequence packet is not aligned with the flow sequence.
+// returns nil for a protocol with no builder (e.g. icmp); callers deliver
+// through paths that drop a nil packet.
 func ipOosPacket(ipPath *IpPath, payload []byte) []byte {
 	switch ipPath.Protocol {
 	case IpProtocolUdp:
@@ -19,7 +21,7 @@ func ipOosPacket(ipPath *IpPath, payload []byte) []byte {
 		// seq, ack, and flags are not aligned with any flow state
 		return ipOosTcpPacket(ipPath, 0, payload)
 	default:
-		panic(fmt.Errorf("Bad ip protocol: %d", ipPath.Protocol))
+		return nil
 	}
 }
 

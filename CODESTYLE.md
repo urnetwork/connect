@@ -59,6 +59,11 @@ actually use.
 
 - Prefer short inline comments (`// ...` inside a function), 1–2 lines per point unless more is truly needed.
 - Put a doc comment at the top of each file, type, and function/method declaration, summarizing the architecture and edge cases. These can be as long as needed, but aim to be concise. Push information that applies throughout a type or file up to the type or file header instead of repeating it — in particular, concurrent goroutine safety.
+- Do not repeat the field or function name in its comment — the name is already on the declaration, so repeating it is redundant. Keep comments short and terse but effective. (This intentionally diverges from Go's start-with-the-name doc convention.)
+
+## Bug fixes
+
+- When a bug is found, look for adjacent and similar issues before considering the fix complete. A bug represents a flaw in the reasoning that produced it, and the same flaw may be applied elsewhere — check the surrounding code, sibling call sites, and other copies of the same pattern.
 
 ## Concurrency and goroutine safety
 

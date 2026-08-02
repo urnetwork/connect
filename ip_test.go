@@ -1645,3 +1645,33 @@ func benchmarkIpEgressUdp4UpParallel(b *testing.B, sendShardCount int) {
 	}
 	b.StopTimer()
 }
+
+// pins the ipv4 fragment guard: fragments are not reassembled, so a packet
+// with mf set or a nonzero fragment offset must fail to parse rather than
+// misparse payload bytes as transport fields. df alone must still parse.
+func TestParseIpPathIpv4FragmentDrop(t *testing.T) {
+	cases := []struct {
+		name       string
+		flagsHigh  byte
+		offsetLow  byte
+		expectDrop bool
+	}{
+		{name: "no flags", flagsHigh: 0x00, offsetLow: 0x00, expectDrop: false},
+		{name: "df", flagsHigh: 0x40, offsetLow: 0x00, expectDrop: false},
+		{name: "mf first fragment", flagsHigh: 0x20, offsetLow: 0x00, expectDrop: true},
+		{name: "offset low bits", flagsHigh: 0x00, offsetLow: 0x01, expectDrop: true},
+		{name: "offset high bits", flagsHigh: 0x1f, offsetLow: 0x00, expectDrop: true},
+		{name: "df with offset", flagsHigh: 0x41, offsetLow: 0x00, expectDrop: true},
+	}
+	for _, c := range cases {
+		packet := testingUdp4Packet("10.0.0.1", "203.0.113.7", 4443, []byte("payload"))
+		// the parser does not validate the header checksum, so the flag and
+		// offset bytes can be set directly
+		packet[6] = c.flagsHigh
+		packet[7] = c.offsetLow
+		_, err := ParseIpPath(packet)
+		if c.expectDrop != (err != nil) {
+			t.Errorf("%s: expectDrop=%v err=%v", c.name, c.expectDrop, err)
+		}
+	}
+}

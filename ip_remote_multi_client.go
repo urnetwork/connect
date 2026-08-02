@@ -133,10 +133,15 @@ type MultiClientGeneratorTransportMigrator interface {
 	MigrateClientTransport(client *Client, args *MultiClientGeneratorClientArgs, migrateTime time.Time)
 }
 
+// the icmp send gate is not part of a normal handshake; it flips to a
+// default-on release once the provider fleet broadly parses icmp (see ICMP.md)
+var errIcmpDisabled = errors.New("icmp send is disabled")
+
 func DefaultMultiClientSettings() *MultiClientSettings {
 	return &MultiClientSettings{
 		SequenceBufferSize:  defaultTransferBufferSize,
 		SequenceIdleTimeout: 120 * time.Second,
+		EnableIcmp:          false,
 
 		WindowSizes: map[WindowType]WindowSizeSettings{
 			// TODO increase `WindowSizeMinP2pOnly` when p2p is deployed
@@ -296,6 +301,10 @@ type MultiClientSettings struct {
 	SequenceBufferSize  int
 	SequenceIdleTimeout time.Duration
 	WindowSizes         map[WindowType]WindowSizeSettings
+	// icmp echo egress. off by default until the provider fleet broadly
+	// parses icmp: a not-yet-upgraded provider silently blackholes icmp
+	// flows, and flow stickiness pins a ping run to its client (see ICMP.md)
+	EnableIcmp bool
 	// ClientNackInitialLimit int
 	// ClientNackMaxLimit int
 	// ClientNackScale float64
@@ -631,8 +640,9 @@ type RemoteUserNatMultiClient struct {
 	// potentially high-rate input. Keep separate lifetime counters and emit
 	// only power-of-two summaries so the drop path has fixed memory and
 	// bounded logging work while retaining first-error and total visibility.
-	sendParseDropCount  atomic.Uint64
-	sendPolicyDropCount atomic.Uint64
+	sendParseDropCount        atomic.Uint64
+	sendPolicyDropCount       atomic.Uint64
+	sendIcmpDisabledDropCount atomic.Uint64
 
 	settings *MultiClientSettings
 	log      Logger
@@ -807,7 +817,6 @@ func NewRemoteUserNatMultiClient(
 		cancel,
 		generator,
 		multiClient.clientReceivePacket,
-		multiClient.securityPolicy,
 		multiClient.removeClient,
 		WindowTypeQuality,
 		provideMode == protocol.ProvideMode_Network,
@@ -820,7 +829,6 @@ func NewRemoteUserNatMultiClient(
 			cancel,
 			generator,
 			multiClient.clientReceivePacket,
-			multiClient.securityPolicy,
 			multiClient.removeClient,
 			WindowTypeSpeed,
 			provideMode == protocol.ProvideMode_Network,
@@ -1293,6 +1301,15 @@ func (self *RemoteUserNatMultiClient) affinityIpPathsWithLock(ipPath *IpPath) (a
 					ServerName: affinityName,
 				})
 			}
+		} else if ipPath.Protocol == IpProtocolIcmp {
+			// cycle per destination ip: pings to one host share a client with
+			// each other, and with the host's other flows when the
+			// destination resolves via the server name branch above
+			destinationPath := &IpPath{
+				Version:       ipPath.Version,
+				DestinationIp: ipPath.DestinationIp,
+			}
+			affinityPaths = append(affinityPaths, destinationPath)
 		} else if ipPath.DestinationPort == 80 || ipPath.DestinationPort == 53 || ipPath.DestinationPort == 443 {
 			// for these ports, cycle the path per destination ip/port, regardless of protocol
 			destinationPath := &IpPath{
@@ -1844,6 +1861,13 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 	payload, err := parseIpPathWithPayloadBorrowed(packet, ipPath)
 	if err != nil {
 		self.logSparseSendDrop("parse", &self.sendParseDropCount, err)
+		return false
+	}
+	if ipPath.Protocol == IpProtocolIcmp && !self.settings.EnableIcmp {
+		// the client send gate (see ICMP.md): default off until the provider
+		// fleet broadly parses icmp, since a not-yet-upgraded provider
+		// silently blackholes icmp flows
+		self.logSparseSendDrop("icmp disabled", &self.sendIcmpDisabledDropCount, errIcmpDisabled)
 		return false
 	}
 	r, err := inspectAndRefreshEgressBorrowed(self.securityPolicy, relationship, ipPathValue, payload)
@@ -2956,17 +2980,6 @@ type parsedPacket struct {
 	ipPath *IpPath
 }
 
-func newParsedPacket(packet []byte) (*parsedPacket, error) {
-	ipPath, err := ParseIpPath(packet)
-	if err != nil {
-		return nil, err
-	}
-	return &parsedPacket{
-		packet: packet,
-		ipPath: ipPath,
-	}, nil
-}
-
 type multiClientWindow struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -2974,7 +2987,6 @@ type multiClientWindow struct {
 
 	generator                   MultiClientGenerator
 	clientReceivePacketCallback clientReceivePacketFunction
-	ingressSecurityPolicy       SecurityPolicy
 	clientRemoveCallback        func(client *multiClientChannel)
 	windowType                  WindowType
 	// networkPeerDestination is true only when the embedding app explicitly
@@ -3015,7 +3027,6 @@ func newMultiClientWindow(
 	cancel context.CancelFunc,
 	generator MultiClientGenerator,
 	clientReceivePacketCallback clientReceivePacketFunction,
-	ingressSecurityPolicy SecurityPolicy,
 	clientRemoveCallback func(client *multiClientChannel),
 	windowType WindowType,
 	networkPeerDestination bool,
@@ -3028,7 +3039,6 @@ func newMultiClientWindow(
 		log:                         loggerOrDefault(settings.Log),
 		generator:                   generator,
 		clientReceivePacketCallback: clientReceivePacketCallback,
-		ingressSecurityPolicy:       ingressSecurityPolicy,
 		clientRemoveCallback:        clientRemoveCallback,
 		windowType:                  windowType,
 		networkPeerDestination:      networkPeerDestination,
@@ -3675,7 +3685,6 @@ func (self *multiClientWindow) expand(
 				args,
 				self.generator,
 				self.clientReceivePacketCallback,
-				self.ingressSecurityPolicy,
 				self.contractStatus,
 				self.contractStats,
 				self.peerIdentityChanged,
@@ -4236,7 +4245,6 @@ type multiClientChannel struct {
 	api *BringYourApi
 
 	clientReceivePacketCallback clientReceivePacketFunction
-	ingressSecurityPolicy       SecurityPolicy
 	performanceProfile          *PerformanceProfile
 	createTime                  time.Time
 
@@ -4271,6 +4279,10 @@ type multiClientChannel struct {
 
 	clientReceiveUnsub func()
 
+	// lifetime count of return packets dropped at the parse gate, with
+	// power-of-two log summaries (see clientReceive)
+	receiveParseDropCount atomic.Uint64
+
 	warning bool
 
 	// suspect mirrors the busy-stale state (unacked sends with stale transfer
@@ -4291,7 +4303,6 @@ func newMultiClientChannel(
 	args *multiClientChannelArgs,
 	generator MultiClientGenerator,
 	clientReceivePacketCallback clientReceivePacketFunction,
-	ingressSecurityPolicy SecurityPolicy,
 	contractStatusCallback ContractStatusFunction,
 	contractStatsCallback ContractStatsFunction,
 	peerIdentityChangeCallback func(),
@@ -4392,7 +4403,6 @@ func newMultiClientChannel(
 		log:                         loggerOrDefault(settings.Log),
 		args:                        args,
 		clientReceivePacketCallback: clientReceivePacketCallback,
-		ingressSecurityPolicy:       ingressSecurityPolicy,
 		performanceProfile:          performanceProfile,
 		createTime:                  time.Now(),
 		settings:                    settings,
@@ -4481,7 +4491,9 @@ func (self *multiClientChannel) SendDetailed(parsedPacket *parsedPacket, timeout
 func (self *multiClientChannel) sendPacketDetailed(packet []byte, ipPath *IpPath, timeout time.Duration) (bool, error) {
 	var ack bool
 	switch ipPath.Protocol {
-	case IpProtocolUdp:
+	case IpProtocolUdp, IpProtocolIcmp:
+		// icmp echo is datagram-like and a measurement tool: unacked
+		// transfer lets tunnel loss show honestly as ping loss
 		if self.settings.UdpCollapsePrevention {
 			ack = false
 		} else {
@@ -5576,8 +5588,16 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 						self.addReceiveSyn(1)
 					}
 					self.clientReceivePacketCallback(self, source, peer.ProvideMode, ipPath, packet)
+				} else if count := self.receiveParseDropCount.Add(1); count&(count-1) == 0 {
+					// power-of-two summaries: untrusted, potentially
+					// high-rate return input (mirrors the send drop counters)
+					self.log.Infof(
+						"[multi]receive bad packet %s<- (parse; count=%d) = %s\n",
+						self.args.Destination,
+						count,
+						err,
+					)
 				}
-				// else not an ip packet, drop
 			} else {
 				if self.log.V(2).Enabled() {
 					self.log.Infof("[multi]receive drop %s<- = %s\n", self.args.Destination, err)

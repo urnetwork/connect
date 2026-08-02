@@ -178,8 +178,9 @@ func DefaultLocalUserNatSettings() *LocalUserNatSettings {
 		SequenceBufferSize: MemoryScaledCount(defaultIpBufferSize, 256),
 		SendShardCount:     1,
 		// BufferTimeout:      15 * time.Second,
-		UdpBufferSettings: DefaultUdpBufferSettings(),
-		TcpBufferSettings: DefaultTcpBufferSettings(),
+		UdpBufferSettings:  DefaultUdpBufferSettings(),
+		TcpBufferSettings:  DefaultTcpBufferSettings(),
+		IcmpBufferSettings: DefaultIcmpBufferSettings(),
 	}
 }
 
@@ -202,6 +203,21 @@ const providerUdpIdleTimeout = 300 * time.Second
 const providerUdpFlowByteCount = 2 * 1024
 const providerTcpFlowByteCount = 8 * 1024
 
+// the icmp item of the same model: the backend read and write buffers (one
+// mtu each on unix; the windows transactor's bounded outstanding reply
+// buffers are comparable), the send queue backing array, flow bookkeeping,
+// and the packet-class pool buffer a live flow keeps in circulation.
+// Calibrated to the marginal heap of a live flow (~7 KiB measured, see
+// TestIcmpFlowMemoryFootprint), rounded up. Like its udp and tcp siblings
+// this figure is heap attributable: goroutine stacks (~10 KiB for a flow's
+// two goroutines) and kernel socket buffers live outside it.
+const providerIcmpFlowByteCount = 8 * 1024
+
+// the icmp share of the nat target. icmp is an additive item above the
+// udp/tcp split (see the provider profile below), so the divisor bounds the
+// overcommit rather than carving the other tables.
+const providerIcmpTargetDivisor = 16
+
 // A cold public page can fan out across more than 100 origins while the
 // browser keeps prior http/2 and quic connections alive. The target-derived
 // 4 MiB mobile provider profile used to cap one source at 51 tcp and 153 udp
@@ -214,6 +230,12 @@ const providerMinUdpUserLimit = 256
 const providerMinUdpGlobalLimit = 512
 const providerMinTcpUserLimit = 256
 const providerMinTcpGlobalLimit = 512
+
+// icmp functional floors, in the style of the udp/tcp floors above: echo
+// flows are one per ping process, so even a tiny target keeps a working
+// ping table (see ICMP.md).
+const providerMinIcmpUserLimit = 64
+const providerMinIcmpGlobalLimit = 128
 
 // DefaultProviderLocalUserNatSettings is the explicit provider/egress profile.
 // A process that installed a memory budget is a constrained device and gets
@@ -249,6 +271,18 @@ func DefaultProviderLocalUserNatSettingsWithMemoryTarget(targetByteCount ByteCou
 		settings.UdpBufferSettings.GlobalLimit = udpGlobalLimit
 		settings.TcpBufferSettings.UserLimit = max(providerMinTcpUserLimit, tcpGlobalLimit/2)
 		settings.TcpBufferSettings.GlobalLimit = tcpGlobalLimit
+		// icmp is its own budget item, additive above the udp/tcp split: an
+		// idle icmp path must not shrink the udp/tcp tables, so its bound is
+		// not carved from their shares. The caps are ceilings — an unused
+		// table holds zero bytes — and while icmp flows exist the worst-case
+		// overcommit of the nat target is bounded by the divisor (like the
+		// functional floors above at small targets).
+		icmpGlobalLimit := max(
+			providerMinIcmpGlobalLimit,
+			int(natTarget/providerIcmpTargetDivisor/providerIcmpFlowByteCount),
+		)
+		settings.IcmpBufferSettings.UserLimit = max(providerMinIcmpUserLimit, icmpGlobalLimit/2)
+		settings.IcmpBufferSettings.GlobalLimit = icmpGlobalLimit
 
 		// The generic process profile leaves headroom above one full tcp
 		// window. A provider can hold hundreds of simultaneous page flows, so
@@ -282,6 +316,8 @@ func DefaultProviderLocalUserNatSettingsWithMemoryTarget(targetByteCount ByteCou
 	settings.UdpBufferSettings.GlobalLimit = MemoryScaledCount(2048, 256)
 	settings.TcpBufferSettings.UserLimit = MemoryScaledCount(256, 32)
 	settings.TcpBufferSettings.GlobalLimit = MemoryScaledCount(512, 64)
+	settings.IcmpBufferSettings.UserLimit = MemoryScaledCount(128, 16)
+	settings.IcmpBufferSettings.GlobalLimit = MemoryScaledCount(256, 32)
 	return settings
 }
 
@@ -295,6 +331,7 @@ func DefaultLocalUserNatSettingsWithBufferSize(bufferSize int) *LocalUserNatSett
 		SendShardCount:     1,
 		UdpBufferSettings:  DefaultUdpBufferSettingsWithBufferSize(bufferSize),
 		TcpBufferSettings:  DefaultTcpBufferSettingsWithBufferSize(bufferSize),
+		IcmpBufferSettings: DefaultIcmpBufferSettingsWithBufferSize(bufferSize),
 	}
 }
 
@@ -310,10 +347,13 @@ type LocalUserNatSettings struct {
 	// BufferTimeout      time.Duration
 	UdpBufferSettings *UdpBufferSettings
 	TcpBufferSettings *TcpBufferSettings
+	// nil resolves to the defaults, so settings constructed before icmp
+	// support keep working
+	IcmpBufferSettings *IcmpBufferSettings
 
-	// Log, when set, is used by the local user nat and its udp/tcp buffers
-	// and sequences (propagated to the buffer settings `Log` fields that are
-	// nil). nil resolves to `DefaultLogger()`.
+	// Log, when set, is used by the local user nat and its udp/tcp/icmp
+	// buffers and sequences (propagated to the buffer settings `Log` fields
+	// that are nil). nil resolves to `DefaultLogger()`.
 	Log Logger
 }
 
@@ -344,12 +384,19 @@ func NewLocalUserNat(ctx context.Context, clientTag string, settings *LocalUserN
 	cancelCtx, cancel := context.WithCancel(ctx)
 
 	log := loggerOrDefault(settings.Log)
-	// propagate so a nat-level logger covers the udp/tcp buffers and sequences
+	// propagate so a nat-level logger covers the udp/tcp/icmp buffers and
+	// sequences
 	if settings.UdpBufferSettings != nil && settings.UdpBufferSettings.Log == nil {
 		settings.UdpBufferSettings.Log = log
 	}
 	if settings.TcpBufferSettings != nil && settings.TcpBufferSettings.Log == nil {
 		settings.TcpBufferSettings.Log = log
+	}
+	if settings.IcmpBufferSettings == nil {
+		settings.IcmpBufferSettings = DefaultIcmpBufferSettings()
+	}
+	if settings.IcmpBufferSettings.Log == nil {
+		settings.IcmpBufferSettings.Log = log
 	}
 	localUserNat := &LocalUserNat{
 		ctx:                     cancelCtx,
@@ -608,14 +655,26 @@ func sendShard(ipPacket []byte, shardCount int) int {
 			if Ipv4HeaderSizeWithoutExtensions <= len(ipPacket) {
 				hashBytes(ipPacket[12:20])
 				headerByteCount := int(ipPacket[0]&0xf) * 4
-				if headerByteCount+4 <= len(ipPacket) {
+				if ipProtocolNumber(ipPacket[9]) == ipProtocolNumberIcmp4 {
+					// the first transport bytes are type/code/checksum, which
+					// vary per packet; the echo identifier is the flow identity
+					if headerByteCount+6 <= len(ipPacket) {
+						hashBytes(ipPacket[headerByteCount+4 : headerByteCount+6])
+					}
+				} else if headerByteCount+4 <= len(ipPacket) {
 					hashBytes(ipPacket[headerByteCount : headerByteCount+4])
 				}
 			}
 		case 6:
 			if Ipv6HeaderSize+4 <= len(ipPacket) {
 				hashBytes(ipPacket[8:40])
-				hashBytes(ipPacket[Ipv6HeaderSize : Ipv6HeaderSize+4])
+				if ipProtocolNumber(ipPacket[6]) == ipProtocolNumberIcmp6 {
+					if Ipv6HeaderSize+6 <= len(ipPacket) {
+						hashBytes(ipPacket[Ipv6HeaderSize+4 : Ipv6HeaderSize+6])
+					}
+				} else {
+					hashBytes(ipPacket[Ipv6HeaderSize : Ipv6HeaderSize+4])
+				}
 			}
 		}
 	}
@@ -629,6 +688,8 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 	udp6Buffer := NewUdp6Buffer(self.ctx, self.receive, self.settings.UdpBufferSettings)
 	tcp4Buffer := NewTcp4Buffer(self.ctx, self.receive, self.settings.TcpBufferSettings)
 	tcp6Buffer := NewTcp6Buffer(self.ctx, self.receive, self.settings.TcpBufferSettings)
+	icmp4Buffer := NewIcmp4Buffer(self.ctx, self.receive, self.settings.IcmpBufferSettings)
+	icmp6Buffer := NewIcmp6Buffer(self.ctx, self.receive, self.settings.IcmpBufferSettings)
 	// the per-flow read-loops route their drained batch through
 	// receivePackets, which coalesces it into one wire Pack when a batch
 	// consumer is registered (the provider return path) and otherwise
@@ -639,11 +700,14 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 	udp6Buffer.receivePacketsCallback = self.receivePackets
 	tcp4Buffer.receivePacketsCallback = self.receivePackets
 	tcp6Buffer.receivePacketsCallback = self.receivePackets
+	icmp4Buffer.receivePacketsCallback = self.receivePackets
+	icmp6Buffer.receivePacketsCallback = self.receivePackets
 
 	// parsed per-packet views. these are copied by value into the send items,
 	// so the locals can be reused across packets.
 	var udpPacket parsedUdp
 	var tcpPacket parsedTcp
+	var icmpPacket parsedIcmp
 
 	handleIpPacket := func(source TransferPath, provideMode protocol.ProvideMode, ipPacket []byte) {
 		if len(ipPacket) == 0 {
@@ -718,6 +782,43 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 					// full/timeout drop: the sequence never took ownership
 					MessagePoolReturn(ipPacket)
 				}
+			case ipProtocolNumberIcmp4:
+				if !parseIcmpPacket(4, sourceIp, destinationIp, transport, &icmpPacket) {
+					// unsupported type or malformed, drop
+					MessagePoolReturn(ipPacket)
+					return
+				}
+				if !icmpPacket.echoRequest {
+					// an outbound echo reply is always an orphan: unsolicited
+					// inbound pings cannot reach a source, and the egress
+					// backends cannot send one anyway (see ICMP.md)
+					MessagePoolReturn(ipPacket)
+					return
+				}
+				icmpPacket.ttl = ipPacket[8]
+				c := func() bool {
+					success, err := icmp4Buffer.send(
+						source,
+						provideMode,
+						&icmpPacket,
+						self.settings.IcmpBufferSettings.WriteTimeout,
+						ipPacket,
+					)
+					return success && err == nil
+				}
+				delivered := false
+				if self.log.V(2).Enabled() {
+					delivered = TraceWithReturn(
+						fmt.Sprintf("[lnr]send icmp4 %s<-%s s(%s)", self.clientTag, source.SourceId, source.StreamId),
+						c,
+					)
+				} else {
+					delivered = c()
+				}
+				if !delivered {
+					// full/timeout drop: the sequence never took ownership
+					MessagePoolReturn(ipPacket)
+				}
 			default:
 				// no support for this protocol, drop
 				MessagePoolReturn(ipPacket)
@@ -779,6 +880,43 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 				if self.log.V(2).Enabled() {
 					delivered = TraceWithReturn(
 						fmt.Sprintf("[lnr]send tcp6 %s<-%s s(%s)", self.clientTag, source.SourceId, source.StreamId),
+						c,
+					)
+				} else {
+					delivered = c()
+				}
+				if !delivered {
+					// full/timeout drop: the sequence never took ownership
+					MessagePoolReturn(ipPacket)
+				}
+			case ipProtocolNumberIcmp6:
+				if !parseIcmpPacket(6, sourceIp, destinationIp, transport, &icmpPacket) {
+					// unsupported type or malformed, drop
+					MessagePoolReturn(ipPacket)
+					return
+				}
+				if !icmpPacket.echoRequest {
+					// an outbound echo reply is always an orphan (see the v4
+					// case)
+					MessagePoolReturn(ipPacket)
+					return
+				}
+				// hop limit
+				icmpPacket.ttl = ipPacket[7]
+				c := func() bool {
+					success, err := icmp6Buffer.send(
+						source,
+						provideMode,
+						&icmpPacket,
+						self.settings.IcmpBufferSettings.WriteTimeout,
+						ipPacket,
+					)
+					return success && err == nil
+				}
+				delivered := false
+				if self.log.V(2).Enabled() {
+					delivered = TraceWithReturn(
+						fmt.Sprintf("[lnr]send icmp6 %s<-%s s(%s)", self.clientTag, source.SourceId, source.StreamId),
 						c,
 					)
 				} else {
@@ -907,12 +1045,15 @@ type UdpBufferSettings struct {
 }
 
 // iana ip protocol numbers, as carried in the ipv4 protocol and ipv6 next
-// header fields. only tcp and udp are handled; other protocols are dropped.
+// header fields. tcp, udp, and icmp echo are handled; other protocols are
+// dropped.
 type ipProtocolNumber uint8
 
 const (
-	ipProtocolNumberTcp = ipProtocolNumber(6)
-	ipProtocolNumberUdp = ipProtocolNumber(17)
+	ipProtocolNumberIcmp4 = ipProtocolNumber(1)
+	ipProtocolNumberTcp   = ipProtocolNumber(6)
+	ipProtocolNumberUdp   = ipProtocolNumber(17)
+	ipProtocolNumberIcmp6 = ipProtocolNumber(58)
 )
 
 // minimal parsed views of packets on the send path.
@@ -973,6 +1114,13 @@ func parseIpv4(ipPacket []byte) (ipProtocol ipProtocolNumber, sourceIp net.IP, d
 	headerByteCount := int(ipPacket[0]&0xf) * 4
 	totalByteCount := int(binary.BigEndian.Uint16(ipPacket[2:4]))
 	if headerByteCount < Ipv4HeaderSizeWithoutExtensions || totalByteCount < headerByteCount || len(ipPacket) < totalByteCount {
+		return
+	}
+	// fragments are not reassembled: a non-first fragment has no transport
+	// header and a first fragment has a truncated payload, so either would
+	// misparse payload bytes as transport fields. one 16 bit load covers mf
+	// plus the whole offset field (0x3fff); df and the reserved bit pass.
+	if binary.BigEndian.Uint16(ipPacket[6:8])&0x3fff != 0 {
 		return
 	}
 	ipProtocol = ipProtocolNumber(ipPacket[9])
@@ -4586,6 +4734,7 @@ const (
 	IpProtocolUnknown IpProtocol = 0
 	IpProtocolTcp     IpProtocol = 1
 	IpProtocolUdp     IpProtocol = 2
+	IpProtocolIcmp    IpProtocol = 3
 )
 
 func (self IpProtocol) String() string {
@@ -4594,6 +4743,8 @@ func (self IpProtocol) String() string {
 		return "tcp"
 	case IpProtocolUdp:
 		return "udp"
+	case IpProtocolIcmp:
+		return "icmp"
 	default:
 		return "unknown"
 	}
@@ -4702,9 +4853,55 @@ func parseIpPathWithPayloadBorrowed(ipPacket []byte, ipPath *IpPath) ([]byte, er
 		}
 		return tcp.payload, nil
 	default:
-		// no support for this protocol
+		// icmp and the unsupported protocols are parsed out of line: keeping
+		// this switch at its original two hot cases preserves the tcp and udp
+		// dispatch (adding cases here measurably slowed the udp parse)
+		return parseIcmpIpPathBorrowed(ipVersion, ipProtocol, sourceIp, destinationIp, transport, ipPath)
+	}
+}
+
+// parseIcmpIpPathBorrowed is the cold tail of parseIpPathWithPayloadBorrowed:
+// icmp echo, else the unsupported protocol error. Split out so the hot tcp/udp
+// dispatch above is unchanged by icmp support.
+//
+//go:noinline
+func parseIcmpIpPathBorrowed(
+	ipVersion uint8,
+	ipProtocol ipProtocolNumber,
+	sourceIp net.IP,
+	destinationIp net.IP,
+	transport []byte,
+	ipPath *IpPath,
+) ([]byte, error) {
+	switch ipProtocol {
+	case ipProtocolNumberIcmp4, ipProtocolNumberIcmp6:
+	default:
 		return nil, fmt.Errorf("No support for protocol %d", ipProtocol)
 	}
+	if (ipProtocol == ipProtocolNumberIcmp4) != (ipVersion == 4) {
+		// the icmp variant must match the ip version
+		return nil, fmt.Errorf("No support for protocol %d", ipProtocol)
+	}
+	var icmp parsedIcmp
+	if !parseIcmpPacket(int(ipVersion), sourceIp, destinationIp, transport, &icmp) {
+		return nil, fmt.Errorf("Unsupported or malformed icmp packet.")
+	}
+
+	// the echo identifier stands in for the port on the client side of the
+	// flow: the source side of a request, the destination side of a reply,
+	// so Reverse aligns the two directions (see ICMP.md)
+	*ipPath = IpPath{
+		Version:       int(ipVersion),
+		Protocol:      IpProtocolIcmp,
+		SourceIp:      sourceIp,
+		DestinationIp: destinationIp,
+	}
+	if icmp.echoRequest {
+		ipPath.SourcePort = int(icmp.identifier)
+	} else {
+		ipPath.DestinationPort = int(icmp.identifier)
+	}
+	return icmp.payload, nil
 }
 
 func (self *IpPath) SourceHostPort() string {

@@ -53,7 +53,6 @@ func newNetworkPeerAdmissionTestChannel(
 		},
 		generator,
 		func(*multiClientChannel, TransferPath, protocol.ProvideMode, IpPath, []byte) {},
-		DefaultSecurityPolicy(ctx),
 		func(*ContractStatus) {},
 		func([]*ContractStatsEvent) {},
 		func() {},

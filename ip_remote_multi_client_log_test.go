@@ -65,16 +65,17 @@ func TestMultiClientUnsupportedPacketLoggingIsSparse(t *testing.T) {
 		ctx: context.Background(),
 		log: log,
 	}
+	// gre: a genuinely unsupported protocol (icmp echo parses since ICMP.md)
 	packet := make([]byte, 20)
 	packet[0] = 0x45
 	packet[2] = 0
 	packet[3] = byte(len(packet))
 	packet[8] = 64
-	packet[9] = 1
+	packet[9] = 47
 
 	for i := 0; i < 16; i++ {
 		if multi.SendPacket(TransferPath{}, protocol.ProvideMode_Network, packet, 0) {
-			t.Fatal("unsupported ICMP packet was accepted")
+			t.Fatal("unsupported protocol packet was accepted")
 		}
 	}
 
@@ -86,7 +87,7 @@ func TestMultiClientUnsupportedPacketLoggingIsSparse(t *testing.T) {
 		t.Fatalf("log message count = %d, want 5 at counts 1, 2, 4, 8, and 16", len(messages))
 	}
 	if message := messages[len(messages)-1]; !strings.Contains(message, "parse; count=16") ||
-		!strings.Contains(message, "No support for protocol 1") {
+		!strings.Contains(message, "No support for protocol 47") {
 		t.Fatalf("last sparse summary = %q", message)
 	}
 }
