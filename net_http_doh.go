@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
@@ -35,6 +36,19 @@ const (
 	// maxDohResponseBytes caps a DoH response body read (a memory guard); a real DNS answer is tiny,
 	// so this only bounds a hostile or broken server.
 	maxDohResponseBytes = 64 * 1024
+	// dohStaleServeBound is how long past its expiration a resolved answer may still be served
+	// when a FRESH resolution fails (RFC 8767 serve-stale). The failure this exists for is exit
+	// failover: DNS is the one dependency every new connection shares, and the moment every
+	// resolver path is briefly unreachable (the tunnel re-racing onto a new exit) is exactly the
+	// moment a burst of resolutions arrives — answering SERVFAIL then makes DNS the reason the
+	// failover looks broken. Failover completes in seconds-to-a-minute, so 5 minutes covers it
+	// with margin while keeping the worst-case staleness far below the RFC's permitted days —
+	// an address that was correct 5 minutes ago is overwhelmingly still correct, and a wrong one
+	// costs one failed connect followed by a re-resolve. Stale answers are only served when the
+	// fresh resolve FAILS (resolver failure / non-authoritative empty), never over an
+	// authoritative answer (records or NXDOMAIN/NODATA), and retained entries stay subject to
+	// the CacheMaxEntries cap in pruneCacheLocked, so the bound adds no unmetered memory.
+	dohStaleServeBound = 5 * time.Minute
 )
 
 // dohServerWindows are the trailing time spans over which each server's successful resolutions are
@@ -239,6 +253,12 @@ type DohCache struct {
 
 	// bounds concurrent resolutions so a flood of distinct names can't fan out unbounded
 	resolveSem chan struct{}
+
+	// staleServeCount counts stale answers served under dohStaleServeBound (RFC 8767): each
+	// increment pairs with the per-serve log line in QueryResult. An atomic (not stateLock) so
+	// tests can read it without reaching into the lock, and so the zero value works on any
+	// DohCache.
+	staleServeCount atomic.Uint64
 }
 
 // dohFlight is one in-flight resolution shared by every caller waiting on the same query. the
@@ -409,7 +429,11 @@ func (self *DohCache) ShedMemory() {
 
 func (self *DohCache) pruneCacheLocked(now time.Time, reserve int) {
 	for key, result := range self.queryResultExpiration {
-		if !result.Valid(now, self.settings.MissExpiration) {
+		// an expired entry is retained while it is still stale-servable (RFC 8767, see
+		// dohStaleServeBound) so a resolution failure during that window can fall back to it.
+		// memory stays bounded regardless: the CacheMaxEntries cap below evicts oldest-first
+		// over ALL entries, fresh and stale alike.
+		if !result.Valid(now, self.settings.MissExpiration) && !result.staleUsable(now) {
 			delete(self.queryResultExpiration, key)
 		}
 	}
@@ -446,6 +470,15 @@ func (self *DohCache) Query(ctx context.Context, recordType string, domain strin
 // — a caller can map false+empty to SERVFAIL so a client retries instead of treating it as an
 // authoritative "no address". Concurrent identical queries are coalesced onto one resolution
 // (single-flight), and concurrent resolutions are bounded (MaxConcurrentResolutions).
+//
+// Serve-stale (RFC 8767): when a fresh resolution would return non-authoritative empty (the
+// SERVFAIL shape) and an expired-but-retained answer for the key exists inside
+// dohStaleServeBound, the stale answer is served instead — reported as authoritative, because
+// this method's callers use the flag only to decide answer-vs-SERVFAIL and the stale answer
+// exists precisely to avoid the SERVFAIL. An authoritative fresh answer (records or
+// NXDOMAIN/NODATA) is never overridden by stale data; it also overwrites the retained entry
+// through the normal resolve() caching. The stale entry never suppresses the resolution attempt
+// itself — every expired-entry query still resolves (or joins the in-flight resolution) first.
 func (self *DohCache) QueryResult(ctx context.Context, recordType string, domain string) ([]netip.Addr, bool) {
 	q := NewDohKey(recordType, domain)
 	now := time.Now()
@@ -454,6 +487,7 @@ func (self *DohCache) QueryResult(ctx context.Context, recordType string, domain
 	var leader bool
 	var hit bool
 	var hitAddrs []netip.Addr
+	var staleAddrs []netip.Addr
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -464,7 +498,13 @@ func (self *DohCache) QueryResult(ctx context.Context, recordType string, domain
 				hitAddrs = r.Addrs()
 				return
 			}
-			delete(self.queryResultExpiration, q)
+			if r.staleUsable(now) {
+				// expired but inside the serve-stale bound: keep the entry (a later query may
+				// need it too) and remember its answer as the fallback for a failed resolve
+				staleAddrs = r.Addrs()
+			} else {
+				delete(self.queryResultExpiration, q)
+			}
 		}
 		// single-flight: lead a new resolution for this key, or join the one already running
 		if existing, ok := self.inflight[q]; ok {
@@ -480,6 +520,17 @@ func (self *DohCache) QueryResult(ctx context.Context, recordType string, domain
 		return hitAddrs, true
 	}
 
+	// serveStale is the one place a stale answer leaves this method: it logs (one line per
+	// stale serve, naming the domain — the field signal that failover leaned on the cache) and
+	// counts, so neither can drift from the other.
+	serveStale := func() ([]netip.Addr, bool) {
+		self.staleServeCount.Add(1)
+		// loggerOrDefault: nil-safe against a literally-constructed cache (NewDohCache always
+		// sets log, but a panic in the DNS fallback path is never acceptable)
+		loggerOrDefault(self.log).Infof("[doh]serve stale %s %s (%d addrs)\n", q.RecordType, q.Domain, len(staleAddrs))
+		return staleAddrs, true
+	}
+
 	if !leader {
 		// a resolution for this key is already in flight; wait for it rather than firing a
 		// duplicate, bounded by this caller's own ctx
@@ -487,6 +538,9 @@ func (self *DohCache) QueryResult(ctx context.Context, recordType string, domain
 		case <-fl.done:
 			return fl.addrs, fl.authoritative
 		case <-ctx.Done():
+			if 0 < len(staleAddrs) {
+				return serveStale()
+			}
 			return nil, false
 		}
 	}
@@ -498,15 +552,27 @@ func (self *DohCache) QueryResult(ctx context.Context, recordType string, domain
 		self.stateLock.Unlock()
 		close(fl.done)
 	}()
-	// bound concurrent resolutions; shed (empty + non-authoritative -> SERVFAIL) if a slot is
-	// not free before this caller's ctx expires
+	// bound concurrent resolutions; shed if a slot is not free before this caller's ctx
+	// expires — with a retained stale answer that shed serves stale, otherwise it surfaces
+	// as empty + non-authoritative (SERVFAIL)
 	select {
 	case self.resolveSem <- struct{}{}:
 		defer func() { <-self.resolveSem }()
 	case <-ctx.Done():
+		if 0 < len(staleAddrs) {
+			fl.addrs, fl.authoritative = serveStale()
+			return fl.addrs, fl.authoritative
+		}
 		return nil, false
 	}
 	fl.addrs, fl.authoritative = self.resolve(ctx, q, now)
+	if !fl.authoritative && len(fl.addrs) == 0 && 0 < len(staleAddrs) {
+		// the exact SERVFAIL shape (resolve returns authoritative=false only with no
+		// addresses: every resolver path failed or answered non-authoritatively empty):
+		// serve the retained stale answer instead. An authoritative NXDOMAIN/NODATA came
+		// back authoritative=true and is deliberately NOT overridden.
+		fl.addrs, fl.authoritative = serveStale()
+	}
 	return fl.addrs, fl.authoritative
 }
 
@@ -1181,6 +1247,27 @@ func (self *DohResult) Valid(now time.Time, missExpiration time.Duration) bool {
 		}
 	}
 	return true
+}
+
+// staleUsable reports whether an entry that is no longer Valid may still be served as a stale
+// answer under dohStaleServeBound (RFC 8767): it holds addresses, and less than the bound has
+// passed since the answer's last moment of freshness (its latest address expiration — the
+// point the whole record set stopped being fresh, so the served data is never older than
+// bound past what its TTL promised). A miss entry (authoritative NXDOMAIN/NODATA) is never
+// stale-servable: converting a resolution failure into a stale "does not exist" would deny a
+// name the resolver never re-confirmed absent, the harmful direction — RFC 8767's use case is
+// keeping known-good addresses reachable, and an expired miss carries none.
+func (self *DohResult) staleUsable(now time.Time) bool {
+	if len(self.AddrExpirations) == 0 {
+		return false
+	}
+	var latest time.Time
+	for _, expireTime := range self.AddrExpirations {
+		if latest.Before(expireTime) {
+			latest = expireTime
+		}
+	}
+	return now.Before(latest.Add(dohStaleServeBound))
 }
 
 func (self *DohResult) Addrs() []netip.Addr {

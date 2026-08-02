@@ -506,6 +506,12 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		}
 	}
 
+	// hadConnection marks the iteration immediately after a connection ran and
+	// died: only that first re-dial takes the reconnect fast path
+	// (NextReconnectTime); a failed re-dial clears it, so retries fall back to
+	// the serialized NextConnectTime pacing.
+	hadConnection := false
+
 	for {
 		// stand down while a strictly better mode is active
 		func() {
@@ -579,9 +585,23 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			return ws, nil
 		}
 
-		if connectDelay := self.clientStrategy.NextConnectTime().Sub(time.Now()); 0 < connectDelay {
+		// a transport that was connected and just died takes the reconnect
+		// fast path (small independent jitter, capped concurrency) instead of
+		// the shared serializing staircase; see NextReconnectTime. The release
+		// frees the fast-path slot as soon as the dial attempt completes, on
+		// every exit path.
+		var connectTime time.Time
+		releaseReconnect := func() {}
+		if hadConnection {
+			connectTime, releaseReconnect = self.clientStrategy.NextReconnectTime()
+			hadConnection = false
+		} else {
+			connectTime = self.clientStrategy.NextConnectTime()
+		}
+		if connectDelay := connectTime.Sub(time.Now()); 0 < connectDelay {
 			select {
 			case <-self.ctx.Done():
+				releaseReconnect()
 				return
 			case <-time.After(connectDelay):
 			}
@@ -594,6 +614,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		} else {
 			ws, err = connect()
 		}
+		releaseReconnect()
 		if err != nil {
 			self.log.Infof("[t]auth error %s = %s\n", clientId, err)
 			select {
@@ -978,6 +999,8 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		} else {
 			c()
 		}
+		// the connection ran and died: the next dial is a reconnect
+		hadConnection = true
 
 		select {
 		case <-self.ctx.Done():
@@ -1014,6 +1037,12 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 		case <-time.After(initialTimeout):
 		}
 	}
+
+	// hadConnection marks the iteration immediately after a connection ran and
+	// died: only that first re-dial takes the reconnect fast path
+	// (NextReconnectTime); a failed re-dial clears it, so retries fall back to
+	// the serialized NextConnectTime pacing.
+	hadConnection := false
 
 	for {
 		// wait until we are back in the specific pt mode or auto mode
@@ -1193,9 +1222,23 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			}, nil
 		}
 
-		if connectDelay := self.clientStrategy.NextConnectTime().Sub(time.Now()); 0 < connectDelay {
+		// a transport that was connected and just died takes the reconnect
+		// fast path (small independent jitter, capped concurrency) instead of
+		// the shared serializing staircase; see NextReconnectTime. The release
+		// frees the fast-path slot as soon as the dial attempt completes, on
+		// every exit path.
+		var connectTime time.Time
+		releaseReconnect := func() {}
+		if hadConnection {
+			connectTime, releaseReconnect = self.clientStrategy.NextReconnectTime()
+			hadConnection = false
+		} else {
+			connectTime = self.clientStrategy.NextConnectTime()
+		}
+		if connectDelay := connectTime.Sub(time.Now()); 0 < connectDelay {
 			select {
 			case <-self.ctx.Done():
+				releaseReconnect()
 				return
 			case <-time.After(connectDelay):
 			}
@@ -1208,6 +1251,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 		} else {
 			connStream, err = connect()
 		}
+		releaseReconnect()
 		if err != nil {
 			self.log.Infof("[t]auth error %s = %s\n", clientId, err)
 			select {
@@ -1406,6 +1450,8 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 		} else {
 			c()
 		}
+		// the connection ran and died: the next dial is a reconnect
+		hadConnection = true
 
 		select {
 		case <-self.ctx.Done():

@@ -207,9 +207,10 @@ func TestDialFailureReraceOffForwards(t *testing.T) {
 	}
 }
 
-// The starvation window: three failures with no successes trips it; a single
-// connect success in the window clears it. This is the input to the resize-pass
-// warning, and it must not depend on wall-clock sleeps.
+// The starvation window: three failures spanning distinct destinations with
+// no successes trips it; a single connect success in the window clears it.
+// This is the input to the resize-pass warning, and it must not depend on
+// wall-clock sleeps.
 func TestDialStarvedWindowing(t *testing.T) {
 	client := &multiClientChannel{settings: DefaultMultiClientSettings()}
 
@@ -217,15 +218,15 @@ func TestDialStarvedWindowing(t *testing.T) {
 		t.Fatal("a fresh channel reported starved with no failures")
 	}
 
-	client.addDialFailure()
-	client.addDialFailure()
+	client.addDialFailure("93.184.216.34")
+	client.addDialFailure("142.250.74.100")
 	if client.dialStarved() {
 		t.Fatal("2 failures (below the threshold) reported starved")
 	}
 
-	client.addDialFailure()
+	client.addDialFailure("93.184.216.34")
 	if !client.dialStarved() {
-		t.Fatal("3 failures with no successes did not report starved")
+		t.Fatal("3 failures across 2 destinations with no successes did not report starved")
 	}
 	if got := client.dialFailureCount(); got != 3 {
 		t.Errorf("dialFailureCount = %d, want 3", got)
@@ -235,6 +236,34 @@ func TestDialStarvedWindowing(t *testing.T) {
 	client.addConnectSuccess()
 	if client.dialStarved() {
 		t.Fatal("a connect success in the window did not reset starvation")
+	}
+}
+
+// The distinct-destination requirement: any number of strikes from a single
+// destination is that destination's problem, not the exit's -- a polled-dead
+// site retransmitting its dials must not starve-warn (or rank-demote) a
+// healthy exit. The same strike count spanning two destinations convicts at
+// full speed.
+func TestDialStarvedRequiresDistinctDestinations(t *testing.T) {
+	client := &multiClientChannel{settings: DefaultMultiClientSettings()}
+
+	// three strikes, one destination: not starvation
+	client.addDialFailure("93.184.216.34")
+	client.addDialFailure("93.184.216.34")
+	client.addDialFailure("93.184.216.34")
+	if client.dialStarved() {
+		t.Fatal("3 strikes from a single destination reported starved: one dead site convicted the exit")
+	}
+	// the strikes still count and still surface in the readout
+	if got := client.dialFailureCount(); got != 3 {
+		t.Errorf("dialFailureCount = %d, want 3", got)
+	}
+
+	// a strike for a second destination makes the span, and the exit is
+	// starved immediately -- demotion stays fast for the real dud
+	client.addDialFailure("142.250.74.100")
+	if !client.dialStarved() {
+		t.Fatal("strikes spanning 2 destinations did not report starved")
 	}
 }
 

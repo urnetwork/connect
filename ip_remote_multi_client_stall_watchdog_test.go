@@ -1,6 +1,9 @@
 package connect
 
 import (
+	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -56,4 +59,153 @@ func TestWindowReliabilitySettingsUsesTheOverride(t *testing.T) {
 	}
 
 	AssertEqual(t, window.reliabilitySettings().SendStallTimeout, time.Duration(0))
+}
+
+// watchdogTestWindow wraps a stalled-capable bare channel in a bare window, the
+// same fixture idiom stallTestChannel establishes, so the conviction pass can
+// be driven directly.
+func watchdogTestWindow(clients ...*multiClientChannel) *multiClientWindow {
+	windowClients := map[Id]*multiClientChannel{}
+	for i, client := range clients {
+		// bare channels identify as the zero id; key uniquely for the fixture
+		id := Id{}
+		id[0] = byte(i + 1)
+		windowClients[id] = client
+	}
+	return &multiClientWindow{
+		settings: &MultiClientSettings{},
+		clients:  windowClients,
+	}
+}
+
+// the hard verdict executes at detection time: a stalled client is errored
+// with the distinctive reason and cancelled by the watchdog pass itself,
+// rather than waiting for the resize sweep to classify it (which measured
+// 3-18s detection-to-removal depending on where the sweep was)
+func TestWatchSendStallsConvictsAndCancels(t *testing.T) {
+	stallTimeout := 20 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := stallTestChannel()
+	client.ctx, client.cancel = context.WithCancel(ctx)
+
+	client.addSend(1440, udpTestPath(4))
+	time.Sleep(stallTimeout + 30*time.Millisecond)
+
+	window := watchdogTestWindow(client)
+
+	AssertEqual(t, window.convictSendStalls(stallTimeout), true)
+
+	// cancelled directly, the DropExit cancel-then-reap idiom
+	AssertEqual(t, client.IsDone(), true)
+
+	// the reason wins the endErr slot over Cancel's "Done." (addError keeps
+	// the first error), so the removal log names the actual cause
+	client.stateLock.Lock()
+	endErr := client.endErr
+	client.stateLock.Unlock()
+	AssertEqual(t, endErr != nil, true)
+	AssertEqual(t, strings.HasPrefix(endErr.Error(), "send stalled"), true)
+
+	// HARD evidence must not be budgeted: the storm breaker keys verdict
+	// removals on the "Blackhole " prefix, and the stall reason must never
+	// carry it
+	AssertEqual(t, blackholeVerdictErr(endErr), false)
+}
+
+// a healthy (non-stalled) client is untouched by the conviction pass
+func TestWatchSendStallsLeavesHealthyClients(t *testing.T) {
+	stallTimeout := 50 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := stallTestChannel()
+	client.ctx, client.cancel = context.WithCancel(ctx)
+
+	// outstanding send inside the window: merely slow, not stalled
+	client.addSend(1440, udpTestPath(4))
+
+	window := watchdogTestWindow(client)
+
+	AssertEqual(t, window.convictSendStalls(stallTimeout), false)
+	AssertEqual(t, client.IsDone(), false)
+
+	client.stateLock.Lock()
+	endErr := client.endErr
+	client.stateLock.Unlock()
+	AssertEqual(t, endErr == nil, true)
+}
+
+// the storm breaker's verdict classification: the two hard-evidence reasons
+// this package introduces must never classify as budgeted blackhole verdicts,
+// while a real verdict line still does
+func TestWatchSendStallsAndCpingReasonsAreNotVerdicts(t *testing.T) {
+	AssertEqual(t, blackholeVerdictErr(errors.New("send stalled: no ack progress for 3s")), false)
+	AssertEqual(t, blackholeVerdictErr(errors.New("cping timeout")), false)
+	// positive control: the verdict prefix is still classified
+	AssertEqual(t, blackholeVerdictErr(errors.New("Blackhole no send ack")), true)
+}
+
+// Source anchors: the conviction is only real if the watchdog pass errors AND
+// cancels the channel itself and the loop routes through it -- a helper that
+// is correct but uncalled is the failure mode this suite pins against.
+func TestWatchSendStallsSourceAnchors(t *testing.T) {
+	source, err := readSource("ip_remote_multi_client.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, ok := functionBody(source, "func (self *multiClientWindow) convictSendStalls(")
+	if !ok {
+		t.Fatal("could not find convictSendStalls")
+	}
+	if !strings.Contains(body, "client.addError(") {
+		t.Error("convictSendStalls does not addError: the removal would log as a bare Done.")
+	}
+	if !strings.Contains(body, "client.Cancel()") {
+		t.Error("convictSendStalls does not cancel directly: removal latency is back on the resize sweep")
+	}
+	if !strings.Contains(body, `"send stalled`) {
+		t.Error("convictSendStalls does not use the distinctive stall reason")
+	}
+	if strings.Contains(body, `"Blackhole `) {
+		t.Error("the stall reason must never carry the budgeted verdict prefix")
+	}
+
+	body, ok = functionBody(source, "func (self *multiClientWindow) watchSendStalls(")
+	if !ok {
+		t.Fatal("could not find watchSendStalls")
+	}
+	if !strings.Contains(body, "self.convictSendStalls(") {
+		t.Error("watchSendStalls does not run the conviction pass")
+	}
+	if !strings.Contains(body, "self.resizeMonitor.NotifyAll()") {
+		t.Error("watchSendStalls does not wake resize for the reap and backfill")
+	}
+}
+
+// The cping timeout must never convict. An earlier pass here added
+// addError("cping timeout") on the belief that the bare return was already
+// removing the channel with an unlabeled reason -- it was not (HandleError
+// runs its cancel handler only on panic), and the conviction it introduced
+// executed every fixture client at CPingTimeout in TestMultiClientUdp4 and
+// would have removed a production exit for one lost ack. This pins the
+// restored semantics: an unanswered ping ends the ping loop and nothing else.
+func TestCpingTimeoutSourceAnchors(t *testing.T) {
+	source, err := readSource("ip_remote_multi_client.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, ok := functionBody(source, "func (self *multiClientChannel) ping(")
+	if !ok {
+		t.Fatal("could not find ping")
+	}
+	if strings.Contains(body, `addError(errors.New("cping timeout"))`) {
+		t.Error("the cping timeout branch convicts: one lost ping ack would remove a live exit and every flow on it")
+	}
+	if !strings.Contains(body, "unanswered: ping loop ended") {
+		t.Error("the cping timeout is silent again: the log line is the observability the removed conviction was after")
+	}
 }

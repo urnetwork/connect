@@ -55,6 +55,29 @@ func newRecoveryKey(ip []byte, port int) recoveryKey {
 	return recoveryKey{ip: string(ip), port: port}
 }
 
+// pendingRecovery is one armed recovery measurement: a destination whose
+// flows died (or moved) with an exit, waiting for its first packet back.
+type pendingRecovery struct {
+	lostTime time.Time
+	// reboundLocalPort is the local source port of the proactively rebound
+	// flow that armed this entry, or -1 when the entry was armed by a plain
+	// teardown. When the destination answers, comparing the answering flow's
+	// local port against this classifies the recovery: the same port means
+	// the rebound socket itself is receiving again, i.e. the server accepted
+	// the quic path migration; a different port means the app abandoned the
+	// old connection and re-dialed. -1 entries close unclassified.
+	reboundLocalPort int
+}
+
+// reboundFlow identifies one proactively rebound flow for the recovery
+// tracker: the destination it serves plus the local source port it was using.
+// The port is what later classifies the recovery as a server-accepted
+// migration vs an app re-dial.
+type reboundFlow struct {
+	key       recoveryKey
+	localPort int
+}
+
 // reliabilityMetrics is written from the packet hot path, so every counter is
 // an atomic and the only lock guards the recovery tracker -- which is touched
 // once per exit loss and once per first-packet-from-a-pending-destination,
@@ -86,6 +109,19 @@ type reliabilityMetrics struct {
 	dialFailures atomic.Uint64
 	flowsReraced atomic.Uint64
 
+	// flowsRebound counts established quic flows re-pinned to a replacement
+	// exit inside a removal (the proactive rebind) instead of being torn
+	// down. rebindsAccepted / rebindsRedialed classify how those recoveries
+	// completed: the destination answering the same local source port means
+	// the server accepted the quic path migration; a new port means the app
+	// re-dialed around it. The pair is the field answer to how well servers
+	// actually accept path changes. Their sum can lag flowsRebound: a rebind
+	// whose destination never answers inside the tracking window classifies
+	// as neither.
+	flowsRebound    atomic.Uint64
+	rebindsAccepted atomic.Uint64
+	rebindsRedialed atomic.Uint64
+
 	// a blackhole verdict is only as good as the evidence it is built on, and
 	// two conditions make the evidence inadmissible: the local uplink went
 	// stale (nothing was deliverable, so silence convicts the network, not
@@ -100,12 +136,12 @@ type reliabilityMetrics struct {
 	removalsDeferred          atomic.Uint64
 
 	pendingLock sync.Mutex
-	pending     map[recoveryKey]time.Time
+	pending     map[recoveryKey]pendingRecovery
 }
 
 func newReliabilityMetrics() *reliabilityMetrics {
 	return &reliabilityMetrics{
-		pending: map[recoveryKey]time.Time{},
+		pending: map[recoveryKey]pendingRecovery{},
 	}
 }
 
@@ -185,7 +221,10 @@ func (self *reliabilityMetrics) exitLost(destinations []recoveryKey) {
 		// keep the earliest death for a destination. several flows to one host
 		// die together, and the user is waiting from the first of them.
 		if _, exists := self.pending[key]; !exists {
-			self.pending[key] = now
+			self.pending[key] = pendingRecovery{
+				lostTime:         now,
+				reboundLocalPort: -1,
+			}
 		}
 	}
 	// evict after inserting, not before: a single exit can be carrying more
@@ -194,11 +233,52 @@ func (self *reliabilityMetrics) exitLost(destinations []recoveryKey) {
 	self.evictPendingWithLock(now)
 }
 
+// exitLostRebound records the flows a dying exit handed to live replacements,
+// and arms each of their destinations for the same recovery measurement
+// exitLost arms -- with the local source port attached so the recovery can be
+// classified as a server-accepted migration vs an app re-dial. Deliberately
+// distinct from exitLost: a rebound flow is not lost, so it stays out of the
+// blast-radius counters, and the exit-loss event itself is already counted by
+// the exitLost call every removal makes.
+func (self *reliabilityMetrics) exitLostRebound(rebounds []reboundFlow) {
+	if self == nil {
+		return
+	}
+	self.flowsRebound.Add(uint64(len(rebounds)))
+	if len(rebounds) == 0 {
+		return
+	}
+
+	now := time.Now()
+
+	self.pendingLock.Lock()
+	defer self.pendingLock.Unlock()
+
+	for _, rebound := range rebounds {
+		// keep the earliest death for a destination, the same rule exitLost
+		// applies: when a torn-down flow to this destination already armed
+		// the entry, the user has been waiting since that teardown, and the
+		// entry keeps its unclassified identity. One entry per destination is
+		// the tracker's grain, so the migration split is sampled per
+		// destination rather than per flow -- several rebound flows to one
+		// host contribute the port of whichever armed first.
+		if _, exists := self.pending[rebound.key]; !exists {
+			self.pending[rebound.key] = pendingRecovery{
+				lostTime:         now,
+				reboundLocalPort: rebound.localPort,
+			}
+		}
+	}
+	self.evictPendingWithLock(now)
+}
+
 // destinationReachable reports the first packet back from a remote endpoint. It
 // closes out a pending recovery if one is armed, and is a no-op otherwise --
 // which is the overwhelmingly common case, so it takes the lock only after a
-// racy empty check.
-func (self *reliabilityMetrics) destinationReachable(ip []byte, port int) {
+// racy empty check. localPort is the local (app-side) port that packet arrived
+// for -- the ingress path reads it off the packet's destination before the
+// path is reversed -- and it is what classifies a rebound flow's recovery.
+func (self *reliabilityMetrics) destinationReachable(ip []byte, port int, localPort int) {
 	if self == nil || len(ip) == 0 {
 		return
 	}
@@ -211,7 +291,7 @@ func (self *reliabilityMetrics) destinationReachable(ip []byte, port int) {
 	}
 
 	key := newRecoveryKey(ip, port)
-	lostTime, ok := self.pending[key]
+	entry, ok := self.pending[key]
 	if !ok {
 		return
 	}
@@ -223,12 +303,25 @@ func (self *reliabilityMetrics) destinationReachable(ip []byte, port int) {
 	// unchecked here, is credited as an enormously slow recovery. On device
 	// that turned a 14s average into "avg 2m, worst 9m" and made the number
 	// measure browsing habits rather than the tunnel.
-	if recoveryTrackerMaxAge <= time.Since(lostTime) {
+	if recoveryTrackerMaxAge <= time.Since(entry.lostTime) {
 		self.recoveryMissed.Add(1)
 		return
 	}
 
-	nanos := time.Since(lostTime).Nanoseconds()
+	// classify a rebound flow's recovery: the destination answering the very
+	// local port the rebound flow was using means the rebound socket itself
+	// is receiving again -- the server accepted the quic path migration. A
+	// different port means the app abandoned the moved connection and
+	// re-dialed. Teardown-armed entries carry -1 and close unclassified.
+	if 0 <= entry.reboundLocalPort {
+		if entry.reboundLocalPort == localPort {
+			self.rebindsAccepted.Add(1)
+		} else {
+			self.rebindsRedialed.Add(1)
+		}
+	}
+
+	nanos := time.Since(entry.lostTime).Nanoseconds()
 	if nanos < 0 {
 		nanos = 0
 	}
@@ -245,8 +338,8 @@ func (self *reliabilityMetrics) destinationReachable(ip []byte, port int) {
 // evictPendingWithLock retires destinations that never came back. Callers hold
 // pendingLock.
 func (self *reliabilityMetrics) evictPendingWithLock(now time.Time) {
-	for key, lostTime := range self.pending {
-		if recoveryTrackerMaxAge <= now.Sub(lostTime) {
+	for key, entry := range self.pending {
+		if recoveryTrackerMaxAge <= now.Sub(entry.lostTime) {
 			delete(self.pending, key)
 			self.recoveryMissed.Add(1)
 		}
@@ -258,9 +351,9 @@ func (self *reliabilityMetrics) evictPendingWithLock(now time.Time) {
 		var oldestKey recoveryKey
 		var oldestTime time.Time
 		first := true
-		for key, lostTime := range self.pending {
-			if first || lostTime.Before(oldestTime) {
-				oldestKey, oldestTime, first = key, lostTime, false
+		for key, entry := range self.pending {
+			if first || entry.lostTime.Before(oldestTime) {
+				oldestKey, oldestTime, first = key, entry.lostTime, false
 			}
 		}
 		if first {
@@ -285,13 +378,16 @@ func (self *reliabilityMetrics) reset() {
 	self.recoveryMissed.Store(0)
 	self.dialFailures.Store(0)
 	self.flowsReraced.Store(0)
+	self.flowsRebound.Store(0)
+	self.rebindsAccepted.Store(0)
+	self.rebindsRedialed.Store(0)
 	self.verdictsHeldUplinkStale.Store(0)
 	self.verdictsHeldTransportDown.Store(0)
 	self.removalsDeferred.Store(0)
 
 	self.pendingLock.Lock()
 	defer self.pendingLock.Unlock()
-	self.pending = map[recoveryKey]time.Time{}
+	self.pending = map[recoveryKey]pendingRecovery{}
 }
 
 // ReliabilityMetricsSnapshot is a consistent-enough read of the counters for
@@ -323,6 +419,17 @@ type ReliabilityMetricsSnapshot struct {
 	DialFailuresIntercepted uint64
 	FlowsReraced            uint64
 
+	// FlowsRebound counts established quic flows proactively re-pinned to a
+	// replacement exit inside a removal instead of being torn down.
+	// RebindsAccepted counts those whose destination answered the same local
+	// source port -- the server accepted the quic path migration;
+	// RebindsRedialed counts destinations that answered a new port -- the
+	// app re-dialed. The sum can lag FlowsRebound: a rebind whose
+	// destination never answers inside the tracking window is neither.
+	FlowsRebound    uint64
+	RebindsAccepted uint64
+	RebindsRedialed uint64
+
 	// VerdictsHeldUplinkStale and VerdictsHeldTransportDown count blackhole
 	// verdicts suppressed because the evidence was inadmissible (the local
 	// uplink was stale, the transport was known down); RemovalsDeferred
@@ -352,6 +459,10 @@ func (self *reliabilityMetrics) snapshot() *ReliabilityMetricsSnapshot {
 
 		DialFailuresIntercepted: self.dialFailures.Load(),
 		FlowsReraced:            self.flowsReraced.Load(),
+
+		FlowsRebound:    self.flowsRebound.Load(),
+		RebindsAccepted: self.rebindsAccepted.Load(),
+		RebindsRedialed: self.rebindsRedialed.Load(),
 
 		VerdictsHeldUplinkStale:   self.verdictsHeldUplinkStale.Load(),
 		VerdictsHeldTransportDown: self.verdictsHeldTransportDown.Load(),

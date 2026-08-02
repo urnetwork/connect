@@ -68,7 +68,7 @@ func TestReliabilityMetricsRecovery(t *testing.T) {
 	}
 
 	time.Sleep(20 * time.Millisecond)
-	m.destinationReachable(ip, 443)
+	m.destinationReachable(ip, 443, testLocalPort)
 
 	s = m.snapshot()
 	if s.RecoveryCount != 1 {
@@ -95,9 +95,9 @@ func TestReliabilityMetricsIgnoresUnrelatedTraffic(t *testing.T) {
 	m.exitLost([]recoveryKey{newRecoveryKey(lost, 443)})
 
 	// different host
-	m.destinationReachable(other, 443)
+	m.destinationReachable(other, 443, testLocalPort)
 	// right host, different port -- a different service, not the flow that died
-	m.destinationReachable(lost, 80)
+	m.destinationReachable(lost, 80, testLocalPort)
 
 	s := m.snapshot()
 	if s.RecoveryCount != 0 {
@@ -121,7 +121,7 @@ func TestReliabilityMetricsKeepsEarliestLoss(t *testing.T) {
 	m.exitLost([]recoveryKey{key})
 
 	m.pendingLock.Lock()
-	elapsed := time.Since(m.pending[key])
+	elapsed := time.Since(m.pending[key].lostTime)
 	m.pendingLock.Unlock()
 
 	if elapsed < 20*time.Millisecond {
@@ -139,8 +139,9 @@ func TestReliabilityMetricsMissedRecovery(t *testing.T) {
 
 	// age the entry past the window rather than sleeping a minute
 	m.pendingLock.Lock()
-	for key := range m.pending {
-		m.pending[key] = time.Now().Add(-2 * recoveryTrackerMaxAge)
+	for key, entry := range m.pending {
+		entry.lostTime = time.Now().Add(-2 * recoveryTrackerMaxAge)
+		m.pending[key] = entry
 	}
 	m.pendingLock.Unlock()
 
@@ -156,7 +157,7 @@ func TestReliabilityMetricsMissedRecovery(t *testing.T) {
 	}
 
 	// the expired destination coming back late is not a recovery
-	m.destinationReachable(ip, 443)
+	m.destinationReachable(ip, 443, testLocalPort)
 	if got := m.snapshot().RecoveryCount; got != 0 {
 		t.Errorf("recovery count = %d after a late answer, want 0", got)
 	}
@@ -175,12 +176,13 @@ func TestReliabilityMetricsLateAnswerIsNotARecovery(t *testing.T) {
 
 	// age it past the window without triggering eviction
 	m.pendingLock.Lock()
-	for key := range m.pending {
-		m.pending[key] = time.Now().Add(-2 * recoveryTrackerMaxAge)
+	for key, entry := range m.pending {
+		entry.lostTime = time.Now().Add(-2 * recoveryTrackerMaxAge)
+		m.pending[key] = entry
 	}
 	m.pendingLock.Unlock()
 
-	m.destinationReachable(ip, 443)
+	m.destinationReachable(ip, 443, testLocalPort)
 
 	s := m.snapshot()
 	if s.RecoveryCount != 0 {
@@ -216,7 +218,7 @@ func TestReliabilityMetricsReset(t *testing.T) {
 	ip := net.ParseIP("93.184.216.34").To4()
 	m.flowOpened()
 	m.exitLost([]recoveryKey{newRecoveryKey(ip, 443)})
-	m.destinationReachable(ip, 443)
+	m.destinationReachable(ip, 443, testLocalPort)
 
 	m.reset()
 
@@ -247,7 +249,7 @@ func TestReliabilityMetricsConcurrent(t *testing.T) {
 				m.flowOpened()
 				m.exitLost(keys)
 				for _, key := range keys {
-					m.destinationReachable([]byte(key.ip), key.port)
+					m.destinationReachable([]byte(key.ip), key.port, testLocalPort)
 				}
 				m.snapshot()
 			}
@@ -305,7 +307,7 @@ func TestReliabilityMetricsNilReceiver(t *testing.T) {
 	ip := net.ParseIP("93.184.216.34").To4()
 	m.flowOpened()
 	m.exitLost([]recoveryKey{newRecoveryKey(ip, 443)})
-	m.destinationReachable(ip, 443)
+	m.destinationReachable(ip, 443, testLocalPort)
 	m.verdictHeldUplinkStale()
 	m.verdictHeldTransportDown()
 	m.removalDeferred()
@@ -320,6 +322,141 @@ func TestReliabilityMetricsNilReceiver(t *testing.T) {
 	}
 	if s.VerdictsHeldUplinkStale != 0 || s.VerdictsHeldTransportDown != 0 || s.RemovalsDeferred != 0 {
 		t.Errorf("nil receiver produced verdict-hold counts: %+v", s)
+	}
+}
+
+// testLocalPort is the local (app-side) source port the tests answer on.
+// Teardown-armed entries never consult it; the rebind classification tests
+// vary it deliberately.
+const testLocalPort = 54321
+
+// A rebound flow's destination answering the same local source port is the
+// server accepting the quic path migration; a different port is the app
+// re-dialing. Both close the recovery measurement itself as usual.
+func TestReliabilityMetricsRebindAcceptedVsRedialed(t *testing.T) {
+	m := newReliabilityMetrics()
+
+	accepted := net.ParseIP("93.184.216.34").To4()
+	redialed := net.ParseIP("93.184.216.35").To4()
+	m.exitLostRebound([]reboundFlow{
+		{key: newRecoveryKey(accepted, 443), localPort: 40001},
+		{key: newRecoveryKey(redialed, 443), localPort: 40002},
+	})
+
+	s := m.snapshot()
+	if s.FlowsRebound != 2 {
+		t.Fatalf("flows rebound = %d, want 2", s.FlowsRebound)
+	}
+	if s.RecoveryPending != 2 {
+		t.Fatalf("pending = %d, want 2: a rebound flow still owes a recovery measurement", s.RecoveryPending)
+	}
+
+	// the rebound socket itself receives again -- migration accepted
+	m.destinationReachable(accepted, 443, 40001)
+	// a different local port answers -- the app re-dialed
+	m.destinationReachable(redialed, 443, 40999)
+
+	s = m.snapshot()
+	if s.RebindsAccepted != 1 {
+		t.Errorf("rebinds accepted = %d, want 1", s.RebindsAccepted)
+	}
+	if s.RebindsRedialed != 1 {
+		t.Errorf("rebinds redialed = %d, want 1", s.RebindsRedialed)
+	}
+	if s.RecoveryCount != 2 {
+		t.Errorf("recovery count = %d, want 2: classification must not eat the recovery itself", s.RecoveryCount)
+	}
+	if s.FlowsLostToExit != 0 {
+		t.Errorf("flows lost = %d, want 0: a rebound flow is not lost", s.FlowsLostToExit)
+	}
+}
+
+// A teardown-armed entry closes unclassified no matter what port answers --
+// only entries armed by an actual rebind may move the migration counters.
+func TestReliabilityMetricsRebindTeardownEntryUnclassified(t *testing.T) {
+	m := newReliabilityMetrics()
+
+	ip := net.ParseIP("93.184.216.34").To4()
+	m.exitLost([]recoveryKey{newRecoveryKey(ip, 443)})
+	m.destinationReachable(ip, 443, 40001)
+
+	s := m.snapshot()
+	if s.RecoveryCount != 1 {
+		t.Fatalf("recovery count = %d, want 1", s.RecoveryCount)
+	}
+	if s.RebindsAccepted != 0 || s.RebindsRedialed != 0 {
+		t.Errorf("teardown entry was classified: accepted %d, redialed %d, want 0/0", s.RebindsAccepted, s.RebindsRedialed)
+	}
+}
+
+// The earliest-death rule holds across the two arming paths: an entry a
+// teardown already armed is not re-armed (or reclassified) by a later rebind
+// to the same destination.
+func TestReliabilityMetricsRebindKeepsEarlierTeardownEntry(t *testing.T) {
+	m := newReliabilityMetrics()
+
+	ip := net.ParseIP("93.184.216.34").To4()
+	key := newRecoveryKey(ip, 443)
+	m.exitLost([]recoveryKey{key})
+	m.exitLostRebound([]reboundFlow{{key: key, localPort: 40001}})
+
+	m.pendingLock.Lock()
+	entry := m.pending[key]
+	m.pendingLock.Unlock()
+	if entry.reboundLocalPort != -1 {
+		t.Errorf("rebind overwrote the earlier teardown entry: reboundLocalPort = %d, want -1", entry.reboundLocalPort)
+	}
+	if got := m.snapshot().FlowsRebound; got != 1 {
+		t.Errorf("flows rebound = %d, want 1: the rebind itself still counts", got)
+	}
+}
+
+// A rebound destination that never answers inside the window is a missed
+// recovery and classifies as neither accepted nor redialed -- the sum of the
+// two may lag FlowsRebound, and that gap is meaningful.
+func TestReliabilityMetricsRebindNeverAnsweredIsNeither(t *testing.T) {
+	m := newReliabilityMetrics()
+
+	ip := net.ParseIP("93.184.216.34").To4()
+	m.exitLostRebound([]reboundFlow{{key: newRecoveryKey(ip, 443), localPort: 40001}})
+
+	m.pendingLock.Lock()
+	for key, entry := range m.pending {
+		entry.lostTime = time.Now().Add(-2 * recoveryTrackerMaxAge)
+		m.pending[key] = entry
+	}
+	m.pendingLock.Unlock()
+
+	m.destinationReachable(ip, 443, 40001)
+
+	s := m.snapshot()
+	if s.RebindsAccepted != 0 || s.RebindsRedialed != 0 {
+		t.Errorf("late answer was classified: accepted %d, redialed %d, want 0/0", s.RebindsAccepted, s.RebindsRedialed)
+	}
+	if s.RecoveryMissed != 1 {
+		t.Errorf("missed = %d, want 1", s.RecoveryMissed)
+	}
+}
+
+// The rebind counters honor the same contract as every other counter: they
+// reset, and a nil receiver stays a silent no-op on the packet path.
+func TestReliabilityMetricsRebindResetAndNilReceiver(t *testing.T) {
+	m := newReliabilityMetrics()
+
+	ip := net.ParseIP("93.184.216.34").To4()
+	m.exitLostRebound([]reboundFlow{{key: newRecoveryKey(ip, 443), localPort: 40001}})
+	m.destinationReachable(ip, 443, 40001)
+
+	m.reset()
+	s := m.snapshot()
+	if s.FlowsRebound != 0 || s.RebindsAccepted != 0 || s.RebindsRedialed != 0 {
+		t.Errorf("rebind counters not cleared: %+v", s)
+	}
+
+	var nilMetrics *reliabilityMetrics
+	nilMetrics.exitLostRebound([]reboundFlow{{key: newRecoveryKey(ip, 443), localPort: 40001}})
+	if got := nilMetrics.snapshot().FlowsRebound; got != 0 {
+		t.Errorf("nil receiver produced counts: %d", got)
 	}
 }
 
