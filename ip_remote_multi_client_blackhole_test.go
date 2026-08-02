@@ -503,6 +503,71 @@ func TestBlackholeUplinkGateStaleEpochAndCap(t *testing.T) {
 	}
 }
 
+// TestNetworkChangeStampsUplinkEpoch: NotifyNetworkChanged is a legitimate
+// fresh start for the staleness clocks. It must close any open stale epoch and
+// rebase uplinkFreshSince to the change instant, and it must fire the
+// process-wide NetworkChanged broadcast (the transport kick). If the tunnel
+// stays silent afterwards, the gate re-engages as a NEW epoch — fresh hold-cap
+// window — rather than inheriting the old one.
+func TestNetworkChangeStampsUplinkEpoch(t *testing.T) {
+	mc := uplinkGateTestParent(2)
+	now := time.Now()
+
+	// open a stale epoch
+	mc.uplinkLastIngressNanos.Store(now.Add(-6 * time.Second).UnixNano())
+	if stale, _ := mc.uplinkGate(now); !stale {
+		t.Fatal("tunnel-wide silence past the gate did not read as stale")
+	}
+
+	// the broadcast half: the registered listeners (in production, the
+	// platform transports' Kick) must fire exactly once per change
+	kicks := 0
+	unsub := AddNetworkChangeListener(func() {
+		kicks += 1
+	})
+	defer unsub()
+
+	before := time.Now()
+	mc.NotifyNetworkChanged()
+
+	if kicks != 1 {
+		t.Fatalf("network change fired %d kicks, want 1", kicks)
+	}
+	var staleSince, freshSince time.Time
+	func() {
+		mc.uplinkStateLock.Lock()
+		defer mc.uplinkStateLock.Unlock()
+		staleSince = mc.uplinkStaleSince
+		freshSince = mc.uplinkFreshSince
+	}()
+	if !staleSince.IsZero() {
+		t.Errorf("the network change left the stale epoch open: staleSince = %v", staleSince)
+	}
+	if freshSince.Before(before) {
+		t.Errorf("freshSince = %v, want at or after the change instant %v", freshSince, before)
+	}
+
+	// still silent after the change: the gate re-engages as a new epoch, and
+	// the rebase point stays at the change stamp
+	later := time.Now().Add(time.Second)
+	stale, gateFreshSince := mc.uplinkGate(later)
+	if !stale {
+		t.Fatal("continued silence after the change did not re-engage the gate")
+	}
+	if !gateFreshSince.Equal(freshSince) {
+		t.Errorf("re-engaged epoch rebase point = %v, want the change stamp %v", gateFreshSince, freshSince)
+	}
+	var newStaleSince time.Time
+	func() {
+		mc.uplinkStateLock.Lock()
+		defer mc.uplinkStateLock.Unlock()
+		newStaleSince = mc.uplinkStaleSince
+	}()
+	if newStaleSince.Before(before) {
+		t.Errorf("the re-engaged epoch inherited the old start %v; its hold cap must clock from after the change", newStaleSince)
+	}
+}
+
 // With fewer than two channels talking, tunnel-wide silence is
 // indistinguishable from that one provider being dead, so the gate carries
 // zero exculpatory information and must not engage.
@@ -655,6 +720,311 @@ func TestBlackholeDetectConsultsGates(t *testing.T) {
 	}
 	if !strings.Contains(body, "verdictHeldUplinkStale(") || !strings.Contains(body, "verdictHeldTransportDown(") {
 		t.Error("detectBlackhole does not count held verdicts, so the gates cannot be measured")
+	}
+}
+
+// TestFormationPollTimeoutDefaults pins the fast-poll knob's contract: the
+// default is 200ms, the runtime override plumbing carries it, and — unlike the
+// other reliability knobs — zero means "fall back to SendRetryTimeout" (the
+// pre-change pacing), not "off".
+func TestFormationPollTimeoutDefaults(t *testing.T) {
+	settings := DefaultMultiClientSettings()
+	if settings.FormationPollTimeout != 200*time.Millisecond {
+		t.Errorf("FormationPollTimeout default = %v, want 200ms", settings.FormationPollTimeout)
+	}
+	if got := ReliabilitySettingsFrom(settings).FormationPollTimeout; got != settings.FormationPollTimeout {
+		t.Errorf("ReliabilitySettingsFrom dropped FormationPollTimeout: %v", got)
+	}
+	// the bare-fixture zero value must read as zero, which the send loop
+	// treats as SendRetryTimeout pacing
+	if got := ReliabilitySettingsFrom(nil).FormationPollTimeout; got != 0 {
+		t.Errorf("nil settings FormationPollTimeout = %v, want 0", got)
+	}
+}
+
+// TestFormationFastPollGuardsEmptyWindowOnly pins where the fast poll applies:
+// sendPacket's retry loop consults FormationPollTimeout only on the
+// zero-candidates branch (the window has no offer at all), never as a general
+// retry accelerant — candidates that exist, including the benched fallback,
+// keep the SendRetryTimeout pacing.
+func TestFormationFastPollGuardsEmptyWindowOnly(t *testing.T) {
+	source, err := readSource("ip_remote_multi_client.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body, ok := functionBody(source, "func (self *RemoteUserNatMultiClient) sendPacket(")
+	if !ok {
+		t.Fatal("could not find sendPacket")
+	}
+
+	emptyBranch := "if len(orderedClients) == 0 {"
+	branchStart := strings.Index(body, emptyBranch)
+	if branchStart < 0 {
+		t.Fatal("sendPacket's retry loop has no empty-candidates branch")
+	}
+	if !strings.Contains(body, "FormationPollTimeout") {
+		t.Fatal("sendPacket does not consult FormationPollTimeout")
+	}
+	// the consult must live inside the empty branch: after its start, before
+	// the race call that only runs with candidates
+	raceAfterBranch := strings.Index(body[branchStart:], "raceClients(orderedClients")
+	pollInBranch := strings.Index(body[branchStart:], "FormationPollTimeout")
+	if pollInBranch < 0 || (0 <= raceAfterBranch && raceAfterBranch < pollInBranch) {
+		t.Error("FormationPollTimeout is not confined to the empty-candidates branch")
+	}
+	// zero falls back to the pre-change pacing: the consult must be gated on
+	// a positive value
+	if !strings.Contains(body, "0 < formationPoll") {
+		t.Error("the empty-candidates branch does not gate on a positive FormationPollTimeout (zero must keep SendRetryTimeout pacing)")
+	}
+}
+
+// --- comparative connect blackhole ---
+//
+// Concept ported from upstream main e05ecee's
+// BlackholeConnectComparativeTimeout: the no-receive-syn branch's patience is
+// only warranted while the evidence is ambiguous, and two OTHER exits carrying
+// return traffic right now resolve the ambiguity.
+
+// comparativeSynStats is a window that has sent syns and received nothing --
+// the exact shape the no-receive-syn branch judges -- with the first syn synAge
+// old.
+func comparativeSynStats(synAge time.Duration) *clientWindowStats {
+	return &clientWindowStats{
+		log:              DefaultLogger(),
+		firstSendSynTime: time.Now().Add(-synAge),
+		sendSynCount:     18,
+	}
+}
+
+// The decision table for which bar the syn branch matures at, and -- just as
+// important -- when the sibling sweep is allowed to run at all. The count
+// reaches the parent stateLock, so a version of this that swept on every
+// verdict pass would put a channel walk on the 1.25s cadence for nothing.
+func TestComparativeConnectTimeoutDecision(t *testing.T) {
+	now := time.Now()
+	full := 30 * time.Second
+	comparative := 10 * time.Second
+
+	sweeps := 0
+	receiving := func(count int) func() int {
+		return func() int {
+			sweeps += 1
+			return count
+		}
+	}
+
+	// off: the zero value is the single-bar behavior
+	AssertEqual(t, comparativeConnectTimeout(now, comparativeSynStats(15*time.Second), full, 0, time.Time{}, receiving(4)), full)
+	// configured at or above the bar it exists to shorten: a no-op
+	AssertEqual(t, comparativeConnectTimeout(now, comparativeSynStats(15*time.Second), full, full, time.Time{}, receiving(4)), full)
+
+	sweeps = 0
+	// nothing has been sent: nothing to judge
+	AssertEqual(t, comparativeConnectTimeout(now, &clientWindowStats{log: DefaultLogger()}, full, comparative, time.Time{}, receiving(4)), full)
+	AssertEqual(t, comparativeConnectTimeout(now, nil, full, comparative, time.Time{}, receiving(4)), full)
+
+	// below the short bar there is nothing to cut short yet...
+	AssertEqual(t, comparativeConnectTimeout(now, comparativeSynStats(5*time.Second), full, comparative, time.Time{}, receiving(4)), full)
+	// ...and past the full bar the ordinary verdict is already firing
+	AssertEqual(t, comparativeConnectTimeout(now, comparativeSynStats(35*time.Second), full, comparative, time.Time{}, receiving(4)), full)
+	if sweeps != 0 {
+		t.Errorf("the sibling sweep ran %d times outside the interval where it can change the outcome", sweeps)
+	}
+
+	// inside the interval, but the pool is not demonstrably fine: one receiving
+	// sibling is one data point, not a statement about the pool
+	sweeps = 0
+	AssertEqual(t, comparativeConnectTimeout(now, comparativeSynStats(15*time.Second), full, comparative, time.Time{}, receiving(1)), full)
+	AssertEqual(t, sweeps, 1)
+
+	// two receiving siblings: the uplink delivers, the pool works, and this
+	// exit alone has established nothing
+	AssertEqual(t, comparativeConnectTimeout(now, comparativeSynStats(15*time.Second), full, comparative, time.Time{}, receiving(2)), comparative)
+
+	// an exit with any receive progress is not the case the cut exists for
+	withSyn := comparativeSynStats(15 * time.Second)
+	withSyn.receiveSynCount = 1
+	AssertEqual(t, comparativeConnectTimeout(now, withSyn, full, comparative, time.Time{}, receiving(4)), full)
+	withAck := comparativeSynStats(15 * time.Second)
+	withAck.receiveAckCount = 1
+	AssertEqual(t, comparativeConnectTimeout(now, withAck, full, comparative, time.Time{}, receiving(4)), full)
+
+	// a bare channel (nil count func) keeps the patient bar: absence of the
+	// machinery must never shorten a removal
+	AssertEqual(t, comparativeConnectTimeout(now, comparativeSynStats(15*time.Second), full, comparative, time.Time{}, nil), full)
+
+	// the clock rebase applies here too: a syn whose age predates the end of an
+	// inadmissible-evidence epoch counts from the epoch's end, so a held
+	// verdict does not mature the instant the hold lifts
+	AssertEqual(t, comparativeConnectTimeout(
+		now,
+		comparativeSynStats(15*time.Second),
+		full,
+		comparative,
+		now.Add(-2*time.Second),
+		receiving(4),
+	), full)
+}
+
+// End to end through the decision the channel actually ships: with two
+// receiving siblings the syn branch fires at 10s; without them the same window
+// is innocent until 30s.
+func TestComparativeConnectFiresAtTheShortBarWithSiblings(t *testing.T) {
+	now := time.Now()
+	full := 30 * time.Second
+	comparative := 10 * time.Second
+
+	fire := func(synAge time.Duration, siblings int) blackholeReason {
+		stats := comparativeSynStats(synAge)
+		connectTimeout := comparativeConnectTimeout(
+			now, stats, full, comparative, time.Time{},
+			func() int { return siblings },
+		)
+		reason, _ := blackholeReasonFromStats(now, stats, 5*time.Second, 0, connectTimeout, blackholeGates{})
+		return reason
+	}
+
+	// the pool is fine and this exit has established nothing: cut at 10s
+	AssertEqual(t, fire(11*time.Second, 2), blackholeNoReceiveSyn)
+	// still inside the short bar
+	AssertEqual(t, fire(9*time.Second, 2), blackholeNone)
+
+	// nothing else is receiving -- the silence could be the whole tunnel, so
+	// the patient bar stands
+	AssertEqual(t, fire(11*time.Second, 0), blackholeNone)
+	AssertEqual(t, fire(29*time.Second, 0), blackholeNone)
+	AssertEqual(t, fire(31*time.Second, 0), blackholeNoReceiveSyn)
+}
+
+// Every existing gate still applies: the cut moves WHEN the branch matures,
+// never whether the evidence is admissible.
+func TestComparativeConnectStillPassesTheGates(t *testing.T) {
+	now := time.Now()
+	stats := comparativeSynStats(11 * time.Second)
+	connectTimeout := comparativeConnectTimeout(
+		now, stats, 30*time.Second, 10*time.Second, time.Time{},
+		func() int { return 4 },
+	)
+	AssertEqual(t, connectTimeout, 10*time.Second)
+
+	// the transport gate holds everything
+	reason, held := blackholeReasonFromStats(now, stats, 5*time.Second, 0, connectTimeout, blackholeGates{transportDown: true})
+	AssertEqual(t, reason, blackholeNone)
+	AssertEqual(t, held, blackholeNoReceiveSyn)
+
+	// the uplink gate holds the receive branch, which this is
+	reason, held = blackholeReasonFromStats(now, stats, 5*time.Second, 0, connectTimeout, blackholeGates{uplinkStale: true})
+	AssertEqual(t, reason, blackholeNone)
+	AssertEqual(t, held, blackholeNoReceiveSyn)
+}
+
+// The receive-side sibling count: the mirror of sendingChannelCount, excluding
+// the channel being judged, windowed on the uplink gate's own freshness bar.
+func TestComparativeReceivingChannelCount(t *testing.T) {
+	mc := &RemoteUserNatMultiClient{
+		settings:      DefaultMultiClientSettings(),
+		clientUpdates: map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
+	}
+	add := func() *multiClientChannel {
+		client := stallTestChannel()
+		mc.clientUpdates[client] = map[*multiClientChannelUpdate]bool{
+			new(multiClientChannelUpdate): true,
+		}
+		return client
+	}
+
+	subject := add()
+	silent := add()
+	receiving1 := add()
+	receiving2 := add()
+
+	// nothing has received: no comparative evidence at all
+	AssertEqual(t, mc.receivingChannelCount(subject), 0)
+
+	receiving1.addReceiveAck(1440)
+	AssertEqual(t, mc.receivingChannelCount(subject), 1)
+
+	receiving2.addReceiveAck(1440)
+	AssertEqual(t, mc.receivingChannelCount(subject), 2)
+
+	// the subject's own receive progress is never its own alibi
+	subject.addReceiveAck(1440)
+	AssertEqual(t, mc.receivingChannelCount(subject), 2)
+
+	// stale receive progress does not count: the window is the uplink gate's
+	silent.stateLock.Lock()
+	silent.lastReceiveAckTime = time.Now().Add(-time.Minute)
+	silent.stateLock.Unlock()
+	AssertEqual(t, mc.receivingChannelCount(subject), 2)
+
+	// and a bare parent does not panic
+	bare := &RemoteUserNatMultiClient{}
+	AssertEqual(t, bare.receivingChannelCount(nil), 0)
+}
+
+// detectBlackhole must actually consult the cut, and must read the comparative
+// bound from the runtime override so the developer control has an effect.
+func TestComparativeConnectDetectSourceAnchors(t *testing.T) {
+	source, err := readSource("ip_remote_multi_client.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, ok := functionBody(source, "func (self *multiClientChannel) detectBlackhole()")
+	if !ok {
+		t.Fatal("could not find detectBlackhole")
+	}
+	if !strings.Contains(body, "comparativeConnectTimeout(") {
+		t.Error("detectBlackhole does not consult the comparative cut, so the setting is inert")
+	}
+	if !strings.Contains(body, "self.reliabilitySettings().BlackholeConnectComparativeTimeout") {
+		t.Error("detectBlackhole does not read the comparative bound from the runtime override")
+	}
+	if !strings.Contains(body, "self.receivingSiblings") {
+		t.Error("detectBlackhole does not pass the receive-side sibling count into the cut")
+	}
+
+	// the sweep must follow sendingChannelCount's discipline: snapshot under
+	// the parent lock, then take each channel's own lock alone
+	body, ok = functionBody(source, "func (self *RemoteUserNatMultiClient) receivingChannelCount(")
+	if !ok {
+		t.Fatal("could not find receivingChannelCount")
+	}
+	if !strings.Contains(body, "self.stateLock.Lock()") || !strings.Contains(body, "client.hasRecentReceive(") {
+		t.Error("receivingChannelCount does not snapshot-then-read-individually")
+	}
+	if strings.Count(body, "self.stateLock.Lock()") != 1 {
+		t.Error("receivingChannelCount takes the parent lock more than once per sweep")
+	}
+	// the per-channel read must be OUTSIDE the parent's locked section
+	snapshotEnd := strings.Index(body, "}()")
+	perChannel := strings.Index(body, "client.hasRecentReceive(")
+	if snapshotEnd < 0 || perChannel < snapshotEnd {
+		t.Error("the per-channel lock is taken under the parent stateLock: the channel lock must never nest under it")
+	}
+}
+
+// The shipped default and the override round trip.
+func TestComparativeConnectDefaults(t *testing.T) {
+	settings := DefaultMultiClientSettings()
+
+	if settings.BlackholeConnectComparativeTimeout != 10*time.Second {
+		t.Errorf("BlackholeConnectComparativeTimeout = %v, want 10s", settings.BlackholeConnectComparativeTimeout)
+	}
+	// above the full bar it would be silently inert
+	if settings.BlackholeConnectTimeout <= settings.BlackholeConnectComparativeTimeout {
+		t.Errorf(
+			"the comparative bar (%v) is not shorter than the full bar (%v), so the cut can never fire",
+			settings.BlackholeConnectComparativeTimeout, settings.BlackholeConnectTimeout,
+		)
+	}
+	if got := ReliabilitySettingsFrom(settings).BlackholeConnectComparativeTimeout; got != settings.BlackholeConnectComparativeTimeout {
+		t.Errorf("ReliabilitySettingsFrom dropped BlackholeConnectComparativeTimeout: %v", got)
+	}
+	// the zero value is the single-bar pre-change behavior
+	if got := ReliabilitySettingsFrom(nil).BlackholeConnectComparativeTimeout; got != 0 {
+		t.Errorf("nil settings BlackholeConnectComparativeTimeout = %v, want 0", got)
 	}
 }
 

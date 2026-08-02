@@ -95,7 +95,10 @@ func TestCollapseGateSourceAnchor(t *testing.T) {
 	if !strings.Contains(body, "self.collapseRemovalAllowed(") {
 		t.Error("resize's collapse does not consult collapseRemovalAllowed, so capacity collapse still destroys live flows")
 	}
-	if !strings.Contains(body, "collapse deferred") {
+	// the deferral log that makes a held collapse observable in the field. It
+	// moved to the [rel] grammar in P3 (event=collapse_defer); the property
+	// being anchored is unchanged -- a held collapse must produce a line.
+	if !strings.Contains(body, `"collapse_defer"`) {
 		t.Error("a deferred collapse is not logged, so a held collapse is invisible in field logs")
 	}
 
@@ -165,7 +168,9 @@ func TestExpandReplacementDeclineSourceAnchor(t *testing.T) {
 	if !strings.Contains(body, "self.replacementAllowed(") {
 		t.Error("expand does not consult replacementAllowed: a re-handed identity still cancels a live flow-carrying channel")
 	}
-	if !strings.Contains(body, "replacement declined") {
+	// the decline log moved to the [rel] grammar in P3 (event=expand_decline);
+	// the property being anchored is unchanged -- a decline must produce a line
+	if !strings.Contains(body, `"expand_decline"`) {
 		t.Error("a declined replacement is not logged, so the decline is invisible in field logs")
 	}
 	if !strings.Contains(body, "RemoveClientArgs(&args.MultiClientGeneratorClientArgs)") {

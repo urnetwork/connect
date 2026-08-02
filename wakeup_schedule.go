@@ -16,6 +16,15 @@ func WakeupAfter(d time.Duration, epoch time.Duration) <-chan time.Time {
 	return time.After(t.Sub(now))
 }
 
+// resetWakeupTimer resets a reusable timer onto the regular wakeup schedule.
+// It is for hot selects where another arm often wins; constructing WakeupAfter
+// there would abandon one newly allocated timer per message.
+// Ported from upstream main e05ecee (wholesale; our fork never modified this file).
+func resetWakeupTimer(timer *time.Timer, d time.Duration, epoch time.Duration) {
+	now := time.Now()
+	timer.Reset(WakeupTime(now.Add(d), epoch).Sub(now))
+}
+
 func WakeupTime(t time.Time, epoch time.Duration) time.Time {
 	r := (time.Duration(t.UnixNano()) * time.Nanosecond) % epoch
 	if r == 0 {

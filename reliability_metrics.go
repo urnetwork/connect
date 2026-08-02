@@ -149,6 +149,21 @@ type reliabilityMetrics struct {
 	probesAnswered     atomic.Uint64
 	providersQualified atomic.Uint64
 
+	// the busy-flow liveness probe (see busyLivenessProbe). busyProbesSent
+	// counts probes that reached the wire against a stalled exit;
+	// busyProbesAcquitted counts the ones answered inside the budget -- exits
+	// that would have been removed before this port existed and were not. The
+	// gap is convictions, which the ordinary exit-loss counters already record,
+	// so nothing here double-counts a removal.
+	//
+	// schedulerPausesDetected counts host suspends the detector caught. It is
+	// the only evidence a doze happened at all: from inside the process the
+	// suspend is invisible except as verdicts that would otherwise have fired
+	// on wake.
+	busyProbesSent          atomic.Uint64
+	busyProbesAcquitted     atomic.Uint64
+	schedulerPausesDetected atomic.Uint64
+
 	pendingLock sync.Mutex
 	pending     map[recoveryKey]pendingRecovery
 }
@@ -224,6 +239,27 @@ func (self *reliabilityMetrics) providerQualified() {
 		return
 	}
 	self.providersQualified.Add(1)
+}
+
+func (self *reliabilityMetrics) busyProbeSent() {
+	if self == nil {
+		return
+	}
+	self.busyProbesSent.Add(1)
+}
+
+func (self *reliabilityMetrics) busyProbeAcquitted() {
+	if self == nil {
+		return
+	}
+	self.busyProbesAcquitted.Add(1)
+}
+
+func (self *reliabilityMetrics) schedulerPauseDetected() {
+	if self == nil {
+		return
+	}
+	self.schedulerPausesDetected.Add(1)
 }
 
 // exitLost records one provider failure and the flows it destroyed, and arms
@@ -422,6 +458,9 @@ func (self *reliabilityMetrics) reset() {
 	self.probesSent.Store(0)
 	self.probesAnswered.Store(0)
 	self.providersQualified.Store(0)
+	self.busyProbesSent.Store(0)
+	self.busyProbesAcquitted.Store(0)
+	self.schedulerPausesDetected.Store(0)
 
 	self.pendingLock.Lock()
 	defer self.pendingLock.Unlock()
@@ -483,6 +522,14 @@ type ReliabilityMetricsSnapshot struct {
 	ProbesSent         uint64
 	ProbesAnswered     uint64
 	ProvidersQualified uint64
+
+	// BusyProbesSent and BusyProbesAcquitted are the busy-flow liveness probes
+	// fired at stalled exits and the ones answered inside the budget -- the
+	// removals the probe prevented. SchedulerPausesDetected counts host
+	// suspends (doze, freezer, thermal) the pause detector caught.
+	BusyProbesSent          uint64
+	BusyProbesAcquitted     uint64
+	SchedulerPausesDetected uint64
 }
 
 func (self *reliabilityMetrics) snapshot() *ReliabilityMetricsSnapshot {
@@ -517,6 +564,10 @@ func (self *reliabilityMetrics) snapshot() *ReliabilityMetricsSnapshot {
 		ProbesSent:         self.probesSent.Load(),
 		ProbesAnswered:     self.probesAnswered.Load(),
 		ProvidersQualified: self.providersQualified.Load(),
+
+		BusyProbesSent:          self.busyProbesSent.Load(),
+		BusyProbesAcquitted:     self.busyProbesAcquitted.Load(),
+		SchedulerPausesDetected: self.schedulerPausesDetected.Load(),
 	}
 
 	if 0 < exitLossEvents {
@@ -543,5 +594,9 @@ func (self *RemoteUserNatMultiClient) ReliabilityMetrics() *ReliabilityMetricsSn
 // since a recovery that began under the previous config would otherwise be
 // credited to the next one.
 func (self *RemoteUserNatMultiClient) ResetReliabilityMetrics() {
+	// logged for the same reason every other dev action is: the counters in a
+	// later heartbeat jumping backwards is otherwise an unexplained anomaly,
+	// and this line is the explanation
+	self.logAction("reset_metrics")
 	self.reliabilityMetrics.reset()
 }

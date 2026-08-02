@@ -537,11 +537,11 @@ func (self *RemoteUserNatMultiClient) runProber() {
 
 		// the one line per sweep at the default level; the per-provider
 		// PASS/FAIL lines come from probeExit itself
-		loggerOrDefault(self.log).Infof(
-			"[multi]probe sweep: %d of %d exits scheduled\n",
-			len(picks),
-			len(clients),
-		)
+		loggerOrDefault(self.log).Infof("%s\n", relEvent(
+			"probe_sweep",
+			"scheduled", len(picks),
+			"exits", len(clients),
+		))
 
 		for _, i := range picks {
 			client := clients[i]

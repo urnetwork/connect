@@ -75,13 +75,38 @@ func TestEffectiveTierDecisionTable(t *testing.T) {
 	unhealthy.lastUnhealthyTime = time.Now()
 	AssertEqual(t, unhealthy.effectiveTier(), 1)
 
+	// an outstanding busy-flow liveness probe (the suspect demerit): +1. The
+	// evidence is a QUESTION -- the channel's flow acks are stalled and the
+	// probe is mid-flight -- so it is one step, enough to steer a new flow to a
+	// clean peer of the same tier for the ~1.5s the probe runs, not the +2 the
+	// evidence-of-failure demerits carry.
+	suspect := effectiveTierTestChannel(0)
+	suspect.setBusyProbeOutstanding(true)
+	AssertEqual(t, suspect.effectiveTier(), 1)
+
+	// it clears on the probe ack, so an acquitted exit is instantly back at its
+	// static rank -- the probe answered, there is nothing left to suspect
+	acquitted := effectiveTierTestChannel(0)
+	acquitted.setBusyProbeOutstanding(true)
+	acquitted.addBusyProbeAck()
+	AssertEqual(t, acquitted.effectiveTier(), 0)
+
+	// and it stacks with the rest: starved + survived + suspect = +5
+	suspectAndWorse := effectiveTierTestChannel(0)
+	starveChannel(suspectAndWorse)
+	suspectAndWorse.setQuarantined(blackholeNoReceiveAck)
+	suspectAndWorse.clearQuarantine()
+	suspectAndWorse.setBusyProbeOutstanding(true)
+	AssertEqual(t, suspectAndWorse.effectiveTier(), 5)
+
 	// everything at once, on a nonzero static tier
 	worst := effectiveTierTestChannel(1)
 	starveChannel(worst)
 	worst.setQuarantined(blackholeNoReceiveAck)
 	worst.clearQuarantine()
 	worst.lastUnhealthyTime = time.Now()
-	AssertEqual(t, worst.effectiveTier(), 6)
+	worst.setBusyProbeOutstanding(true)
+	AssertEqual(t, worst.effectiveTier(), 7)
 
 	// the toggle off is the static-Tier A/B comparison point: the same
 	// demerits change nothing
@@ -91,6 +116,7 @@ func TestEffectiveTierDecisionTable(t *testing.T) {
 	off.setQuarantined(blackholeNoReceiveAck)
 	off.clearQuarantine()
 	off.lastUnhealthyTime = time.Now()
+	off.setBusyProbeOutstanding(true)
 	AssertEqual(t, off.effectiveTier(), 0)
 
 	// a channel built with nil settings (the oldest fixture idiom) reads the

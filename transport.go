@@ -201,6 +201,28 @@ type PlatformTransport struct {
 	// transport to come up before closing the old one (CONNECTDRAIN2.md §3.3)
 	registeredCount  atomic.Int64
 	connectedMonitor *Monitor
+
+	// kickMonitor closes the live connection (if any) so the run loop
+	// re-dials immediately — fired on a host network path change
+	// (NetworkChanged), where the current socket is likely bound to a dead
+	// path and would otherwise linger until a ping/write timeout notices.
+	// Ported from upstream main e05ecee, merged with our reconnect fast
+	// path: the kicked re-dial goes through NextReconnectTime (small
+	// independent jitter, capped concurrency) rather than the serialized
+	// NextConnectTime staircase, since a network change is a legitimate
+	// fresh start.
+	kickMonitor *Monitor
+	// unsubNetworkChange removes this transport from the process
+	// network-change listeners when the run loop exits.
+	unsubNetworkChange func()
+}
+
+// Kick closes the transport's live connection (if any) and skips any pending
+// reconnect backoff so the run loop re-dials immediately over the new path.
+// The transport itself stays up; an in-flight dial is unaffected. Safe to
+// call at any time.
+func (self *PlatformTransport) Kick() {
+	self.kickMonitor.NotifyAll()
 }
 
 // IsConnected reports whether the transport has a connection with routes
@@ -297,8 +319,17 @@ func NewPlatformTransportWithTargetMode(
 		targetMode:           targetMode,
 		mode:                 NewMonitorValue(TransportModeNone),
 		connectedMonitor:     NewMonitor(),
+		kickMonitor:          NewMonitor(),
 	}
-	go HandleError(transport.run, cancel)
+	// a host network path change kicks the live connection so the re-dial
+	// happens now instead of after a ping/write timeout notices the dead path.
+	// unsubscribe rides the run loop exit (ctx cancel), not just Close — most
+	// owners tear transports down by canceling the client ctx.
+	transport.unsubNetworkChange = AddNetworkChangeListener(transport.Kick)
+	go HandleError(func() {
+		defer transport.unsubNetworkChange()
+		transport.run()
+	}, cancel)
 	return transport
 }
 
@@ -603,6 +634,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			case <-self.ctx.Done():
 				releaseReconnect()
 				return
+			case <-self.kickMonitor.NotifyChannel():
+				// network changed while waiting to dial: any pacing computed
+				// for the old path is meaningless — dial now over the new one
 			case <-time.After(connectDelay):
 			}
 		}
@@ -620,6 +654,13 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			select {
 			case <-self.ctx.Done():
 				return
+			case <-self.kickMonitor.NotifyChannel():
+				// network changed: the failed dial was likely on the dead
+				// path — retry now over the new one instead of waiting out
+				// the backoff, and take the reconnect fast path (a network
+				// change is a legitimate fresh start, not staircase churn)
+				hadConnection = true
+				continue
 			case <-reconnect.After():
 				continue
 			}
@@ -633,6 +674,21 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 			handleCtx, handleCancel := context.WithCancel(self.ctx)
 			defer handleCancel()
+
+			// a network-change kick closes this connection so the loop
+			// re-dials over the new path immediately (see Kick). the ws.Close
+			// is what unblocks a reader/writer parked in a socket call that
+			// handleCancel alone cannot wake.
+			kick := self.kickMonitor.NotifyChannel()
+			go HandleError(func() {
+				select {
+				case <-handleCtx.Done():
+				case <-kick:
+					self.log.Infof("[t]kick: closing connection for re-dial\n")
+					handleCancel()
+					ws.Close()
+				}
+			})
 
 			var readCounter atomic.Uint64
 			var writeCounter atomic.Uint64
@@ -1005,6 +1061,11 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		select {
 		case <-self.ctx.Done():
 			return
+		case <-self.kickMonitor.NotifyChannel():
+			// a kick arriving after the connection already died skips the
+			// residual backoff — the fast-path re-dial starts now. (the kick
+			// that killed the connection closed the previous notify channel;
+			// this arm arms a fresh one, so one kick fires exactly once here.)
 		case <-reconnect.After():
 		}
 	}
@@ -1240,6 +1301,9 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			case <-self.ctx.Done():
 				releaseReconnect()
 				return
+			case <-self.kickMonitor.NotifyChannel():
+				// network changed while waiting to dial: any pacing computed
+				// for the old path is meaningless — dial now over the new one
 			case <-time.After(connectDelay):
 			}
 		}
@@ -1257,6 +1321,11 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			select {
 			case <-self.ctx.Done():
 				return
+			case <-self.kickMonitor.NotifyChannel():
+				// network changed: retry now over the new path and take the
+				// reconnect fast path (see the h1 loop above)
+				hadConnection = true
+				continue
 			case <-reconnect.After():
 				continue
 			}
@@ -1272,6 +1341,21 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 
 			handleCtx, handleCancel := context.WithCancel(self.ctx)
 			defer handleCancel()
+
+			// a network-change kick closes this connection so the loop
+			// re-dials over the new path immediately (see Kick). closing the
+			// QUIC connection is what unblocks a reader/writer parked in a
+			// stream call that handleCancel alone cannot wake.
+			kick := self.kickMonitor.NotifyChannel()
+			go HandleError(func() {
+				select {
+				case <-handleCtx.Done():
+				case <-kick:
+					self.log.Infof("[t]kick: closing connection for re-dial\n")
+					handleCancel()
+					conn.CloseWithError(0, "network change")
+				}
+			})
 
 			framer := NewFramer(self.settings.FramerSettings)
 
@@ -1456,6 +1540,10 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 		select {
 		case <-self.ctx.Done():
 			return
+		case <-self.kickMonitor.NotifyChannel():
+			// a kick arriving after the connection already died skips the
+			// residual backoff — the fast-path re-dial starts now (see the
+			// h1 loop above)
 		case <-reconnect.After():
 		}
 	}
@@ -1463,6 +1551,12 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 
 func (self *PlatformTransport) Close() {
 	self.cancel()
+	// unsubscribe eagerly (idempotent; the run loop's deferred unsubscribe
+	// also fires) so a NetworkChanged broadcast racing Close cannot kick a
+	// transport whose owner already considers it dead.
+	if self.unsubNetworkChange != nil {
+		self.unsubNetworkChange()
+	}
 }
 
 func connectHost(platformUrl string) (string, error) {

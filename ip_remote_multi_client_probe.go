@@ -663,14 +663,14 @@ waiting:
 	// one line per pass per provider at the default level, per the house rules;
 	// the per-packet events are silent. This is the line the acceptance drill
 	// reads, so it carries the counts that decide the verdict.
-	loggerOrDefault(self.log).Infof(
-		"[multi]probe %s [%s]: %d/%d answered in %s\n",
-		probeResultWord(result.Passed),
-		client.ClientId(),
-		result.Answered,
-		result.Sent,
-		result.Duration.Round(time.Millisecond),
-	)
+	loggerOrDefault(self.log).Infof("%s\n", relEvent(
+		"probe",
+		"exit", client.ClientId(),
+		"result", strings.ToLower(probeResultWord(result.Passed)),
+		"answered", result.Answered,
+		"sent", result.Sent,
+		"ms", result.Duration.Round(time.Millisecond),
+	))
 
 	return result
 }

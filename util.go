@@ -135,6 +135,32 @@ func ShedMemory() {
 	}
 }
 
+// networkChangeListeners are callbacks fired when the host reports a network path change
+// (wifi<->cell, interface change). Components that hold long-lived connections over the
+// OLD path subscribe to fail over immediately — a platform transport closes its live
+// connection and re-dials — instead of discovering the dead socket via ping timeouts
+// seconds later.
+// Ported from upstream main e05ecee (the util.go network-change registry).
+var networkChangeListeners = NewCallbackList[func()]()
+
+// AddNetworkChangeListener registers a callback invoked by NetworkChanged. It returns an
+// unregister closure; an owner must unregister when it closes.
+func AddNetworkChangeListener(listener func()) func() {
+	callbackId := networkChangeListeners.Add(listener)
+	return func() {
+		networkChangeListeners.Remove(callbackId)
+	}
+}
+
+// NetworkChanged invokes the registered network-change listeners. The host calls this on
+// its OS path-update signal (NWPathMonitor / ConnectivityManager); it is cheap and safe to
+// call on every update — listeners only tear down state bound to a possibly-dead path.
+func NetworkChanged() {
+	for _, listener := range networkChangeListeners.Get() {
+		HandleError(listener)
+	}
+}
+
 // makes a copy of the list on update
 type CallbackList[T any] struct {
 	mutex sync.Mutex
