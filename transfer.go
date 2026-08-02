@@ -5450,6 +5450,19 @@ func (self *ReceiveSequence) registerContracts(item *receiveItem) error {
 		return err
 	}
 
+	// This contract verified against this client's own Network provider
+	// secret key, so it authenticates the sender as a same-network endpoint.
+	// The platform's peer list can never name this id — it belongs to an
+	// ephemeral window client, and only top-level clients are registered as
+	// peers — so this is the sole authenticated witness that lets provider
+	// stream policy admit the peer's P2P stream. Reported here rather than
+	// from `receiveHead`, which labels no-contract receives Network without
+	// any such proof.
+	if contract.ProvideMode == protocol.ProvideMode_Network &&
+		self.client.streamManager != nil {
+		self.client.streamManager.NetworkPeerWindowClientAuthenticated(self.source.SourceId)
+	}
+
 	return nil
 }
 

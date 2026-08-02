@@ -1411,3 +1411,432 @@ packet-translation tests isolated; `TestPtDnsEncodeDecode` and
 `go vet ./...` pass. Android `goclientBuild`,
 `testPlayReleaseUnitTest`, lint, and `assemblePlayRelease` completed
 successfully before the physical install. No ordinary `t.Run` was added.
+
+---
+
+## 10. Cellular network-peer matrix: P2P never forms (2026-07-28)
+
+### 10.1 What was measured
+
+The first physical network-peer matrix run on **cellular** rather than the
+home Wi-Fi lab of §1. Both authorized devices were on T-Mobile IPv6-only
+cellular with 464XLAT (global IPv6 on `rmnet`, RFC 7335 `192.0.0.x` from the
+CLAT), on the same signed release. Samsung `R5CX21FY6ND` selected the Pixel
+`3B161FDJG001KT` under **Network peers**; the UI confirmed "Connected to 1
+provider".
+
+Chrome was cleared to a cold profile and each site loaded once. Load time is
+measured to tun quiescence (six consecutive 350 ms polls with no byte
+movement, subtracted from the elapsed time); bytes are `tun1` deltas.
+
+| Site | Complete load | tun rx | tun tx |
+|---|---:|---:|---:|
+| Wikipedia | 24.23 s | 788,841 B | 88,683 B |
+| Mozilla | 16.23 s | 1,610,883 B | 137,196 B |
+| GitHub | 53.93 s | 6,270,385 B | 393,863 B |
+| Guardian | 50.06 s | 4,460,936 B | 632,828 B |
+
+Sustained synthetic throughput over the same peer was **0.13 and 0.16 MiB/s**
+(two post-ramp 8 s samples of `http://198.18.0.1/download/400000000`). The
+implied page-load goodput agrees: GitHub moved 6.27 MB in 53.9 s ≈ 0.11
+MiB/s. That is roughly **40× below** the 4.8–5.9 MiB/s Wi-Fi band of §5.5 and
+5–20× slower than the §9.2 Wi-Fi page loads.
+
+The cause is not congestion tuning. **The P2P path never forms at all**, and
+every byte rides the platform relay.
+
+### 10.2 Direct evidence
+
+A point-in-time socket census on both devices showed **zero UDP sockets owned
+by the app UID** and only established TCP/443 connections to the platform
+relay. The v=1 trace then showed the complete sequence. On the client:
+
+```text
+[sm]019fabf4-7a90… open s(019fabf4-7b6e…) 019f9835-6b1c…-><nil>
+[ice-if]net.Interfaces err = route ip+net: netlinkrib: permission denied
+[ice-if]synthetic en0 addrs=[192.0.0.2/32]
+[ice-if]synthetic en1 addrs=[2607:fb91:e6e8:808a:…/128]
+[signal]send ->…
+… 15 s …
+[p2p]s(019fabf4-7b6e…) ready header write err = i/o timeout
+[pion:pc]peer connection state changed: closed
+```
+
+and on the provider, for that same stream id:
+
+```text
+22:39:16.236  [sm]019f9835-6b1c… reject disabled provider s(019fabf4-7b6e…)
+                  source=<nil> destination=019fabf4-7a90-938f-c03a-6e6a6291ca02
+22:39:16.531  [tls]019f9835-6b1c… opened session for peer 019fabf4-7a90… as server
+22:39:16.534  [ip]provider ping <- 019fabf4-7a90…
+```
+
+The provider refuses the peer's P2P stream and then serves that same peer's
+authenticated Network contracts **295 ms later**. The rejection is logged
+once and the client retried a doomed PeerConnection every 15 s for the rest
+of the session.
+
+The ICE work of §5.1 is confirmed healthy on cellular: the synthetic net
+supplies a real global IPv6 host candidate (`en1`). It is never used.
+
+### 10.3 Root cause: the Network-peer carve-out resolves an identity that can
+never appear
+
+`StreamManager.allowStreamOpen` authorizes an inbound provider stream. For a
+provider that is Network-only — or a public provider whose providing is
+paused — `allowAny` is false and the decision falls through to:
+
+```go
+return self.client.peerManager.isConnectedNetworkPeer(*peerId)
+```
+
+`peerId` is the adjacent id on the StreamOpen. For a real network-peer P2P
+stream that is the client's **ephemeral per-window client id**.
+`connectedPeers` is populated only from `NetworkPeersUpdate`, and the
+platform registers a peer only when it is top-level:
+
+- `server/connect/transport_announce.go` guards `AddNetworkPeer` on
+  `topLevel`;
+- `server/model/peer_model.go` defines `topLevel = sourceClientId == nil`;
+- every window client authenticates with `AuthNetworkClientArgs.SourceClientId`
+  set to the device's top-level id, so `source_client_id != NULL`.
+
+A window client is therefore **structurally absent** from every peer list,
+and `isConnectedNetworkPeer(<window client>)` is always false. This is the
+same identity-domain error §9.1 corrected for contract sizing — "on the
+provider, return packets target an ephemeral per-window client ID;
+`PeerManager` knows the top-level device ID" — recurring in the stream-open
+authorization gate.
+
+The device evidence pins both domains: the Samsung's stable top-level id is
+`019fa1cf-e3ab-…` (the id the Pixel signals when the Pixel is the client),
+while the rejected StreamOpen named `019fabf4-7a90-…`, minted at connect and
+sharing its ULID timestamp prefix with the stream id.
+
+`allowNetwork` is deliberately computed **outside** the `providePaused`
+guard, so the design intends same-network peers to keep working while public
+providing is paused. That carve-out is unreachable.
+
+Two independent conditions expose it, which is why the Wi-Fi lab never saw it:
+
+1. **Provide mode.** `ProvideModeNetwork` (the private provider) sets only
+   `ProvideMode_Network`, so `allowAny` is false by construction.
+2. **Provide pause on cellular.** `android/.../MainApplication.kt` latches
+   `providePaused = true` before registering its callback and clears it only
+   in `onAvailable`. The default `ProvideNetworkMode.WIFI` restricts the
+   request to `TRANSPORT_WIFI`/`TRANSPORT_ETHERNET`, so on a cellular-only
+   device no network ever matches, `onAvailable` never fires, and the pause
+   is permanent. Pausing public providing is correct there; losing the
+   same-network carve-out with it is not.
+
+On Wi-Fi with public providing enabled, `allowAny` short-circuits true and
+the broken discriminator is never reached — the defect is fully masked.
+
+### 10.4 Rejection is terminal
+
+Nothing reconsiders a rejected StreamOpen:
+
+- the reject path returns `nil` — no error, no queue, no retry;
+- `reconcileInboundProviderStreams` and `closeDisconnectedPeerStreams` only
+  ever iterate already-open sequences and call `Cancel`; neither can open
+  anything;
+- the platform re-emits a hop only on the added-transition or in a new
+  resident's `StreamReset` snapshot.
+
+So a single mistimed rejection costs P2P for the whole resident lifetime.
+This matters independently of the discriminator: the StreamOpen arrived
+295 ms **before** the first verified Network contract, so any fix that
+authorizes on the contract relationship must also reconsider the already-
+rejected stream.
+
+### 10.5 Fix options
+
+This is an authorization boundary; none of these may weaken it. Dropping the
+peer check or trusting `allowNetwork` alone would let any client holding a
+Stream-mode contract open provider streams on a Network-only provider, which
+is exactly what the check exists to prevent.
+
+- **(a) Carry the owning top-level id on `StreamOpen`.** The platform already
+  stores `network_client.source_client_id` and already derives `topLevel`
+  from it. Authorizing on an owner id keeps the decision on platform-attested
+  identity, needs no timing change, and also repairs the equally blind
+  `isDisconnectedNetworkPeer` checks. Costs a proto + server change and a
+  compatibility window.
+- **(b) Authorize on the verified `ProvideMode_Network` contract** for that
+  exact ephemeral id — the §9.1 pattern, and the same proof
+  `providerReturnTransferOptions` already treats as authoritative. Must
+  require `contractId != nil`: no-contract receives are handed
+  `ProvideMode_Network`, so a naive read would let an unauthenticated control
+  frame authorize a stream. Cannot decide at StreamOpen time on its own.
+- **(c) Reconsider rejected StreamOpens** from the existing peer-update hook
+  and on the first verified Network contract from that id, with strictly
+  bounded, TTL'd retention.
+
+**(b)+(c)** is the immediate fix with no wire change; **(a)** is the correct
+end state. Both are open.
+
+### 10.6 What landed in this pass
+
+No behavior change to the authorization gate. Two items landed:
+
+- **The terminal rejection is now visible at default verbosity.** It was
+  V(1)-only, which is why a session-fatal condition was invisible on release
+  builds. The first rejection per `StreamManager` now logs once via
+  `sync.Once` with an explicit "terminal … p2p will not form" note; later
+  rejections stay at V(1) so a churning peer cannot flood the log.
+- **Two characterization tests**
+  (`transfer_stream_manager_network_peer_window_test.go`) pin the defect:
+  one proves the discriminator accepts a top-level id and rejects that same
+  device's window client, the other proves a rejected StreamOpen is never
+  reconsidered after the peer becomes known. Both fail loudly, with a pointer
+  to this section, if the behavior is corrected — so the fix cannot land
+  without updating them.
+
+### 10.7 Validation
+
+Deterministic `connect` core passed in 352.542 s with `blocker`,
+`connectctl`, and `extender` green; `go vet ./...` passes in `connect` and
+`sdk`. The full `sdk` tree passed apart from `TestDeviceRemoteApi`, which
+times out against the live `api.bringyour.com` under suite load and passes in
+1.182 s in isolation. The dead-peer recovery kernel now passes in both modes
+(relay-up detect 11.891 s / recover90 13.034 s; route-full detect 11.689 s /
+recover90 12.808 s), resolving the §12-addendum failure recorded in
+`PACKETRESEARCH1.md`.
+
+Pion is already at the newest published patches (WebRTC 4.2.18, ICE 4.4.0,
+SCTP 1.11.1, DTLS 3.1.5); that upgrade lead is closed.
+
+### 10.8 Doc corrections
+
+- §F.2 and §5.2 state a 2 MiB selected-peer window with a 4 MiB ceiling. The
+  shipped value is **512 KiB with two reservations (1 MiB ceiling)**, pinned
+  by `sdk/device_local_memory_test.go`. The "exactly two reservations" half is
+  accurate.
+- §9.1's `NetworkPeer` policy is carried in Go (`TransferOptions.NetworkPeer`,
+  `ContractKey.NetworkPeer`), not in `transfer.proto`. The proto's
+  `NetworkPeer` message is unrelated peer-identity metadata.
+- §5.8's admission logging is per-reason and emitted at powers of two, not
+  strictly once per streak. Non-admission setup failures are once per streak.
+
+### 10.9 Second exposure: the two-reservation budget cannot cover its own
+### make-before-break
+
+After reinstalling the clean release and reselecting the peer, the client
+reached admission — ICE gathered real sockets this time — and was refused by
+its own dedicated budget:
+
+```text
+[p2p]setup admission refused reason=budget count=1 s(019fac01-1c74…) <>019f9835-6b1c…
+  = peer connection memory budget exhausted
+    (used=1048576 total=1048576 need=524288 networkPeer=true
+     live=1 retiring=0 sharedLive=1 sharedRetiring=1 samePeer=1 replacing=true)
+```
+
+The selected-peer budget is `deviceLocalNetworkPeerP2pConnectionCount = 2` ×
+`deviceLocalNetworkPeerP2pReceiveBufferByteCount = 512 KiB` = exactly 1 MiB,
+described in §F.2 as "one live association plus one make-before-break
+replacement". The shared budget here already held **one live and one
+retiring** association, so the replacement had no third slot and was refused.
+The retiring association's reservation is not accounted for in the sizing
+rationale, so the budget cannot fund the exact replacement it was sized for.
+
+Two candidate directions, neither validated yet:
+
+- release a retiring association's reservation at teardown initiation rather
+  than at completion, so `sharedRetiring` cannot occupy a replacement slot; or
+- size the count as live + replacement + retiring.
+
+The first keeps the ceiling; the second raises it by 512 KiB. Preferring the
+first is consistent with §5.8's rule that budget ownership requires a live
+association.
+
+**Update after the §11 fixes: this is now the binding constraint.** With
+stream admission repaired, P2P streams actually open, so the budget is
+genuinely exercised for the first time — and it saturates. A later run logged
+the refusal as a doubling streak (count=1, 2, 4, 8) across 90 seconds with
+`sharedLive=1 sharedRetiring=1` unchanged throughout, so one retiring owner
+held its reservation for at least that long while every replacement was
+refused. Tunnel throughput in that state fell back to the relay baseline
+(0.09–0.17 MiB/s).
+
+The release path explains the persistence: the teardown worker calls
+`conn.admissionOwner.release()` only *after* `HandleError(conn.teardown)`
+returns, so a teardown that blocks holds a reservation indefinitely. Raising
+the count to three only delays the same exhaustion if teardown can hang
+without bound. The real fix is therefore to release the reservation on
+cancellation, or to bound teardown, and it needs its own pass with evidence
+for why teardown blocks here.
+
+This is an admission-layer condition, independent of the §11.5 routing change:
+peer-connection admission and multi-client channel selection are separate
+subsystems, and the refusals name the admission budget only.
+
+**Negative result supporting the accumulation hypothesis (2026-07-29,
+post-reboot).** A 23-minute matrix on the same pair after both devices
+rebooted (fresh budgets, both on LAN wifi this time) logged **zero** budget
+refusals on either device while sustaining 5–8 MiB/s LAN-local P2P —
+including a 2.5-minute ~820 MiB burst and a 95 MiB timed transfer. The
+exhaustion is therefore not a steady-state property of high P2P load; it
+requires a retiring owner to accumulate (a blocked teardown holding its
+reservation), which a reboot clears. This also means the defect will recur on
+long-lived sessions that churn peer connections — and a host network change
+is exactly such a churn source: `WebRtcManager.networkChanged` retires every
+live peer conn and dials replacements immediately, so a wifi↔cell switch asks
+the budget for `live + retiring` at once. The release-on-cancellation fix
+remains the real repair.
+
+---
+
+## 11. Network-peer P2P restored on cellular (2026-07-29)
+
+§10 diagnosed why a selected network peer never formed a P2P path and left the
+authorization gate unchanged. This section records the implemented fix,
+option **(b)+(c)** from §10.5, and its physical validation.
+
+### 11.1 The authenticated witness for the missing identity (b)
+
+`allowStreamOpen` resolved the adjacent id against `PeerManager.connectedPeers`,
+which the platform populates only with top-level device clients. A window
+client can never be in that map, so the Network carve-out was unreachable.
+
+The provider already holds a stronger, authenticated statement about that exact
+ephemeral id: a contract that verifies against its own `ProvideMode_Network`
+provider secret key. That is the same proof `providerReturnTransferOptions`
+treats as authoritative for the no-escrow return path, and it names the window
+client directly.
+
+`ReceiveSequence.registerContracts` now reports the sender after the contract
+both parses and verifies, and only when `contract.ProvideMode` is
+`ProvideMode_Network`. `PeerManager` records it in a bounded
+`networkPeerWindowClients` map (`MaxNetworkPeerWindowClients`, default 128,
+least-recently-proven evicted). `isNetworkPeer` is the union of announced
+top-level peers and proven window clients, and is used by **both** stream
+admission and retirement — using it for admission alone would let the next
+peer reconcile immediately close the stream it had just allowed.
+
+The proof is deliberately taken from `registerContracts`, not `receiveHead`:
+`receiveHead` labels *no-contract* receives `ProvideMode_Network` without any
+verification, so reading the peer mode there would let an unauthenticated
+control frame authorize a stream. `TestStreamManagerRegisterContractsAuthenticatesOnlyNetworkMode`
+drives the real receive path with genuinely signed contracts and asserts that a
+verified Public contract does **not** authenticate its sender.
+
+The witness map is not time-expired and is not cleared by `NetworkPeersReset`.
+A reset is authoritative for top-level membership and says nothing about a
+separately proven window-client contract; expiring a live witness would retire
+a working P2P stream for an idle peer, reintroducing the defect. It is bounded
+by count and dies with its client.
+
+### 11.2 Refusals are reconsidered (c)
+
+The proof legitimately arrives after the StreamOpen — 295 ms in the §10 trace —
+so (b) alone still refuses. `StreamManager` now retains refused opens in a hard
+bounded map (`maxRejectedStreamOpens`, 32, oldest evicted) and re-runs policy
+from the two places the inputs change: the existing peer-membership hook, and
+the first verified Network contract from that id. A stream that becomes
+allowable is opened exactly as if it had been accepted when the platform sent
+it; one still refused stays retained. `StreamClose` forgets its entry, so a
+hop the platform retired cannot be resurrected by a later proof.
+
+### 11.3 Measured on the two authorized cellular devices
+
+Same devices, same topology, same method as §10.1 — Samsung `R5CX21FY6ND`
+client, Pixel `3B161FDJG001KT` provider, cold Chrome, each site once:
+
+| Site | §10 relay | With P2P | Change |
+|---|---:|---:|---:|
+| Wikipedia | 24.23 s | **5.37 s** | 4.5× faster |
+| Mozilla | 16.23 s | **12.34 s** | 1.3× faster |
+| GitHub | 53.93 s | **16.14 s** | 3.3× faster |
+| Guardian | 50.06 s | **36.49 s** | 1.4× faster |
+
+Time to first tunnel bytes fell from 1.05–1.07 s to a consistent 0.56–0.59 s.
+Sustained synthetic throughput rose from 0.13/0.16 MiB/s to **0.76/1.19 MiB/s**.
+
+The provider log shows the mechanism working, with the refusal and its
+reconsideration 391 ms apart:
+
+```text
+01:29:24.989 [sm]019f9835-6b1c… reject disabled provider s(019fac90-40b7…)
+                 source=<nil> destination=019fac90-3fe2…
+01:29:25.379 [sm]019f9835-6b1c… reconsider s(019fac90-40b7…)
+                 source=<nil> destination=019fac90-3fe2…
+```
+
+and the client reaches a direct pair over cellular IPv6:
+
+```text
+[peerconn]connected s(019fac90-40b7…) <>019f9835-6b1c…
+  local=2607:fb91:e6e8:808a:69d1:a425:9a85:8597
+  remote=2607:fb91:e6eb:8f29:ac39:bc58:6b15:37a5
+```
+
+Every refusal in the session was reconsidered (3 of 3), and the app held live
+ICE sockets throughout. This is the first direct device-to-device path measured
+on carrier IPv6 cellular; §5.1's ICE work was already correct there and had
+simply never been reachable.
+
+A separate confirmation on the final `v=0` release build, taken later on the
+same pairing, measured 0.51 and 0.57 MiB/s. Cellular capacity moves with
+signal and tower load between runs, so the honest range across both builds is
+roughly **3.5–9× the relay baseline**, not a single multiplier.
+
+These are single cold runs on a live cellular network, so treat the individual
+site numbers as indicative. The reproducible results are the restored direct
+path, the halved time to first byte, and a several-fold synthetic throughput
+gain.
+
+### 11.4 Connect screen reported a live peer as connecting
+
+The same session exposed an unrelated defect the user observed directly: with
+one selected network peer the connect screen showed "Connecting to providers"
+indefinitely, logging `[grid]1->2(false) points=1 CONNECTING`.
+
+A warning marks a client the window should stop steering new flows to because a
+better destination is expected to exist, and the min-satisfied predicate counted
+only unwarned clients. A fixed-destination window has exactly one candidate and
+no substitute, so warning that sole destination made `1 <= 0` false forever.
+The new pure `windowMinSatisfied` counts warned clients toward the minimum for
+a fixed-destination window only; an expanding window can genuinely replace a
+warned destination and is unchanged. After the fix the same pairing reports
+`[grid]1->1(true) points=1 CONNECTED`.
+
+### 11.5 The same single-candidate case in routing
+
+`OrderedClients` filters `!client.isWarning()` to build the candidate set for a
+new or re-routing flow, so the same warned sole destination also produced an
+*empty* candidate set. `sendPacketUncommitted` then polls on
+`FormationSendRetryTimeout` (200 ms) up to the overall send timeout, so new
+flows stalled while the peer was still carrying established ones.
+
+The reasoning is identical to §11.4. A warning means "steer new flows
+elsewhere, a better destination is expected to exist". An expanding window
+really does have one, because its replacement dials a different provider, so
+waiting is correct there and is unchanged. A fixed-destination window's
+replacement is another client to the same endpoint, so waiting buys nothing
+and costs the flow.
+
+`OrderedClients` now keeps warned clients as a last-resort set and uses them
+only when a fixed-destination window has no unwarned client at all. A healthy
+client always wins, and `FixedDestinationSize` allocates, so it is evaluated
+only on that path. A torn-down client needs no separate guard: `WindowStats`
+already errors once its own or its parent client's context is done, so it never
+reaches the candidate set.
+
+Three regressions cover the fallback, the untouched expanding-window behavior,
+and the preference for an unwarned client; the first was confirmed to fail with
+the fallback disabled.
+
+### 11.6 Validation
+
+Deterministic `connect` core passed in 343.045 s. The seven new
+`transfer_stream_manager_network_peer_window_test.go` regressions and the
+`windowMinSatisfied` table pass, including five race-enabled repetitions of the
+stream-manager suite. The two central regressions were confirmed to fail
+against the pre-fix predicate, so they are real regressions rather than
+restatements. `go vet ./...` passes. The complete `sdk` tree passed in 426.141 s with no
+failures, including the `TestDeviceRemoteApi` live-API case that had timed out
+under suite load in the §10.7 run. No ordinary `t.Run` was added.
+
+§10's two characterization tests were replaced by these regressions, as that
+section required.

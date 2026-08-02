@@ -331,8 +331,9 @@ type MultiClientSettings struct {
 	// value: the host toggles it via SetPerformanceDegraded as OS signals
 	// change. nil = never degraded.
 	DegradedMode *atomic.Bool
-	// DegradedLivenessScale multiplies the busy-stale window and its probe
-	// budgets while DegradedMode is set (values <= 1 mean no scaling).
+	// DegradedLivenessScale multiplies the busy-stale window, its probe
+	// budgets, and the idle continuous-ping rest while DegradedMode is set
+	// (values <= 1 mean no scaling).
 	DegradedLivenessScale float64
 	// SchedulerPauseTolerance is the excess timer delay treated as a host
 	// pause/scheduler stall rather than peer failure. <= 0 disables detection.
@@ -1135,9 +1136,10 @@ func (self *RemoteUserNatMultiClient) SetLocalSecurityBypass(localSecurityBypass
 
 // SetPerformanceDegraded reports the host's degraded-performance state (low
 // power mode, thermal throttling, a weak or constrained network) to the
-// window clients: while set, the busy-flow liveness probe timings scale by
-// DegradedLivenessScale so a slow-but-alive device is not misdiagnosed as a
-// dead peer. Cheap and safe to call whenever the OS signals change.
+// window clients: while set, the busy-flow liveness probe timings and the
+// idle continuous-ping rest scale by DegradedLivenessScale — a slow-but-alive
+// device is not misdiagnosed as a dead peer, and an idle tunnel wakes the
+// radio less often. Cheap and safe to call whenever the OS signals change.
 func (self *RemoteUserNatMultiClient) SetPerformanceDegraded(degraded bool) {
 	if degradedMode := self.settings.DegradedMode; degradedMode != nil {
 		degradedMode.Store(degraded)
@@ -3463,9 +3465,11 @@ func (self *multiClientWindow) resize() {
 			}
 		}
 
+		fixedDestinationSize, fixedDestination := self.generator.FixedDestinationSize()
+
 		var windowSizeMin int
 		var targetWindowSize int
-		if fixedDestinationSize, fixed := self.generator.FixedDestinationSize(); fixed {
+		if fixedDestination {
 			targetWindowSize = fixedDestinationSize
 			windowSizeMin = targetWindowSize
 		} else if 0 < windowSize.FixedWindowSize {
@@ -3498,12 +3502,21 @@ func (self *multiClientWindow) resize() {
 			windowSizeMin = windowSize.WindowSizeMin
 		}
 
+		minSatisfied := func(clientCount int) bool {
+			return windowMinSatisfied(
+				windowSizeMin,
+				clientCount,
+				len(warnedClients),
+				fixedDestination,
+			)
+		}
+
 		addedCount := 0
 		if len(clients) < targetWindowSize {
 			// expand
 			n := targetWindowSize - len(clients)
 			self.monitor.AddWindowExpandEvent(
-				windowSizeMin <= len(clients),
+				minSatisfied(len(clients)),
 				targetWindowSize+len(warnedClients),
 			)
 			addedCount = self.expand(
@@ -3520,7 +3533,7 @@ func (self *multiClientWindow) resize() {
 		}
 		if 0 < windowSize.WindowSizeHardMax && windowSize.WindowSizeHardMax < len(clients)+len(warnedClients)+addedCount {
 			self.monitor.AddWindowExpandEvent(
-				windowSizeMin <= len(clients)+addedCount,
+				minSatisfied(len(clients)+addedCount),
 				windowSize.WindowSizeHardMax,
 			)
 			collapseLowestWeighted(max(0, windowSize.WindowSizeHardMax-addedCount))
@@ -3529,7 +3542,7 @@ func (self *multiClientWindow) resize() {
 			}
 		} else {
 			self.monitor.AddWindowExpandEvent(
-				windowSizeMin <= len(clients)+addedCount,
+				minSatisfied(len(clients)+addedCount),
 				len(clients)+len(warnedClients)+addedCount,
 			)
 		}
@@ -3870,6 +3883,29 @@ func (self *multiClientWindow) otherClientRecentReceive(exclude *multiClientChan
 	return false
 }
 
+// windowMinSatisfied reports whether the window meets its minimum destination
+// count, which is what the UI renders as connected rather than connecting.
+//
+// A warning marks a client the window should stop steering NEW flows to,
+// because a better destination is expected to exist. A fixed-destination
+// window — a user-selected network peer — has exactly one candidate and no
+// substitute, so a warned sole destination that is still routing does not make
+// the window unsatisfied: it is the only destination the minimum could ever be
+// met by, and a replacement would be the same endpoint. Counting only unwarned
+// clients there reported a live selected peer as "Connecting to providers" for
+// its whole session.
+func windowMinSatisfied(
+	windowSizeMin int,
+	clientCount int,
+	warnedCount int,
+	fixedDestination bool,
+) bool {
+	if fixedDestination {
+		return windowSizeMin <= clientCount+warnedCount
+	}
+	return windowSizeMin <= clientCount
+}
+
 func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 	var windowSize WindowSizeSettings
 	func() {
@@ -3886,13 +3922,56 @@ func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 	lruTimes := map[*multiClientChannel]time.Time{}
 	weights := map[*multiClientChannel]float32{}
 
+	addClient := func(client *multiClientChannel, stats *clientWindowStats) {
+		clients = append(clients, client)
+		if !stats.lastEventTime.IsZero() {
+			lruTimes[client] = stats.lastEventTime
+		}
+		weights[client] = float32(1 + stats.ExpectedByteCountPerSecond())
+	}
+
+	type warnedCandidate struct {
+		client *multiClientChannel
+		stats  *clientWindowStats
+	}
+	var warnedCandidates []warnedCandidate
+
 	for _, client := range self.unorderedClients() {
-		if stats, err := client.WindowStats(); err == nil && !client.isWarning() {
-			clients = append(clients, client)
-			if !stats.lastEventTime.IsZero() {
-				lruTimes[client] = stats.lastEventTime
+		stats, err := client.WindowStats()
+		if err != nil {
+			continue
+		}
+		if client.isWarning() {
+			// Retained only as a last resort for a fixed destination below.
+			// A torn-down client is already excluded: WindowStats errors once
+			// its own or its parent client's context is done.
+			warnedCandidates = append(warnedCandidates, warnedCandidate{
+				client: client,
+				stats:  stats,
+			})
+			continue
+		}
+		addClient(client, stats)
+	}
+
+	if 0 == len(clients) && 0 < len(warnedCandidates) {
+		// A warning steers NEW flows away from a client because a better
+		// destination is expected to exist. An expanding window really does
+		// have one — a replacement dials a different provider — so waiting for
+		// it is correct there.
+		//
+		// A fixed-destination window has no such alternative: its replacement
+		// is another client to the same endpoint, so excluding every warned
+		// client leaves new flows with nowhere to go and stalls them on the
+		// send retry cadence until one forms. For a user-selected network peer
+		// that is strictly worse than using the warned peer that is still
+		// routing. Only reached when no unwarned client exists, so a healthy
+		// client always wins; `FixedDestinationSize` allocates, so it is
+		// evaluated only on this path.
+		if _, fixedDestination := self.generator.FixedDestinationSize(); fixedDestination {
+			for _, candidate := range warnedCandidates {
+				addClient(candidate.client, candidate.stats)
 			}
-			weights[client] = float32(1 + stats.ExpectedByteCountPerSecond())
 		}
 	}
 
@@ -4684,6 +4763,26 @@ func (self *multiClientChannel) busyStaleTimeout() time.Duration {
 	return timeout
 }
 
+// idlePingRestTimeout returns the effective rest between idle continuous
+// pings: CPingRestTimeout (CPingTimeout when unset), scaled by
+// DegradedLivenessScale while the host reports degraded performance. A host
+// in low power mode or on a constrained network wants fewer radio wakeups
+// from an idle tunnel; the slower idle dead-peer detection is the same
+// deliberate trade busyStaleTimeout makes — a false removal costs more than
+// late detection — and a busy flow still gets the fast busy-stale probe.
+func (self *multiClientChannel) idlePingRestTimeout() time.Duration {
+	restTimeout := self.settings.CPingRestTimeout
+	if restTimeout <= 0 {
+		restTimeout = self.settings.CPingTimeout
+	}
+	if degraded := self.settings.DegradedMode; degraded != nil && degraded.Load() {
+		if scale := self.settings.DegradedLivenessScale; 1 < scale {
+			restTimeout = time.Duration(float64(restTimeout) * scale)
+		}
+	}
+	return restTimeout
+}
+
 func (self *multiClientChannel) busyStale() bool {
 	busyStaleTimeout := self.busyStaleTimeout()
 	if busyStaleTimeout <= 0 {
@@ -4752,7 +4851,8 @@ func (self *multiClientChannel) ping() {
 	// the busy-flow probe polls staleness on a fine cadence decoupled from
 	// the idle-ping rest, so a mid-transfer death is caught within
 	// ~CPingBusyStaleTimeout + the probe ack wait regardless of the rest
-	// interval; the idle ping stays rate-limited to CPingRestTimeout.
+	// interval; the idle ping stays rate-limited to the degraded-aware rest
+	// (idlePingRestTimeout).
 	var lastIdlePingTime time.Time
 	// consecutive busy-stale probes that could not even be queued (the send
 	// path is wedged full of the same unacked data the probe is
@@ -4765,10 +4865,7 @@ func (self *multiClientChannel) ping() {
 		}
 		idle := self.settings.CPingMaxByteCountPerSecond == 0 || windowStats.EffectiveByteCountPerSecond() <= self.settings.CPingMaxByteCountPerSecond
 
-		restTimeout := self.settings.CPingRestTimeout
-		if restTimeout <= 0 {
-			restTimeout = self.settings.CPingTimeout
-		}
+		restTimeout := self.idlePingRestTimeout()
 
 		// probe when idle (the historical continuous ping, rate-limited to the
 		// rest interval) OR when busy but the return acks have gone stale (the

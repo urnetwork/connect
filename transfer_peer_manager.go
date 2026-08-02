@@ -12,13 +12,19 @@ import (
 func DefaultPeerManagerSettings() *PeerManagerSettings {
 	return &PeerManagerSettings{
 		// matches the platform's recently disconnected peer window
-		DisconnectedPeerWindow: 5 * time.Minute,
+		DisconnectedPeerWindow:      5 * time.Minute,
+		MaxNetworkPeerWindowClients: 128,
 	}
 }
 
 type PeerManagerSettings struct {
 	// how long a disconnect marker counts toward the disconnected peer count
 	DisconnectedPeerWindow time.Duration
+	// bounds the window client witnesses retained from verified contracts.
+	// A device opens a small number of concurrent window clients, so this
+	// covers several peers with headroom while keeping the map bounded
+	// against a remote peer that churns identities.
+	MaxNetworkPeerWindowClients int
 }
 
 // PeerManager tracks the network peers of this client:
@@ -39,16 +45,40 @@ type PeerManager struct {
 	stateLock       sync.Mutex
 	connectedPeers  map[Id]*NetworkPeer
 	disconnectTimes map[Id]time.Time
+	// networkPeerWindowClients records ephemeral per-window client ids proven
+	// to belong to this network by a verified `ProvideMode_Network` contract.
+	//
+	// The platform's peer list names only top-level device clients
+	// (`AddNetworkPeer` is guarded by `topLevel`, and
+	// `topLevel = sourceClientId == nil`), but a selected network peer reaches
+	// its provider through window clients, whose `source_client_id` is set.
+	// Those ids are therefore structurally absent from `connectedPeers`, so
+	// resolving a StreamOpen against that map alone can never admit a real
+	// network-peer P2P stream. A contract that verifies against this
+	// provider's own `ProvideMode_Network` secret key is the same
+	// authenticated relationship the no-escrow provider return path already
+	// treats as authoritative, so it is the correct witness for the missing
+	// identity.
+	//
+	// The value is the last proof time, used only to evict the least recently
+	// proven entry when the map is full. Entries are deliberately NOT
+	// time-expired and NOT cleared by `NetworkPeersReset`: a reset is
+	// authoritative for top-level membership, which says nothing about a
+	// separately proven window-client contract, and expiring a live witness
+	// would retire a working P2P stream for an idle peer — reintroducing the
+	// defect this map exists to fix. The map dies with its client.
+	networkPeerWindowClients map[Id]time.Time
 }
 
 func NewPeerManager(ctx context.Context, client *Client, peerManagerSettings *PeerManagerSettings) *PeerManager {
 	return &PeerManager{
-		ctx:                 ctx,
-		client:              client,
-		peerManagerSettings: peerManagerSettings,
-		peersMonitor:        NewMonitor(),
-		connectedPeers:      map[Id]*NetworkPeer{},
-		disconnectTimes:     map[Id]time.Time{},
+		ctx:                      ctx,
+		client:                   client,
+		peerManagerSettings:      peerManagerSettings,
+		peersMonitor:             NewMonitor(),
+		connectedPeers:           map[Id]*NetworkPeer{},
+		disconnectTimes:          map[Id]time.Time{},
+		networkPeerWindowClients: map[Id]time.Time{},
 	}
 }
 
@@ -72,6 +102,68 @@ func (self *PeerManager) isConnectedNetworkPeer(clientId Id) bool {
 
 	_, ok := self.connectedPeers[clientId]
 	return ok
+}
+
+// isNetworkPeer reports whether clientId is a same-network endpoint by either
+// authenticated identity: an announced top-level peer, or an ephemeral window
+// client proven by a verified `ProvideMode_Network` contract. Provider stream
+// admission and retirement must use this, not `isConnectedNetworkPeer`, or the
+// Network carve-out is unreachable for the window clients that carry every
+// real network-peer P2P stream.
+func (self *PeerManager) isNetworkPeer(clientId Id) bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	if _, ok := self.connectedPeers[clientId]; ok {
+		return true
+	}
+	_, ok := self.networkPeerWindowClients[clientId]
+	return ok
+}
+
+// addNetworkPeerWindowClient records a window client id proven same-network by
+// a contract that verified against this client's own `ProvideMode_Network`
+// secret key. It reports whether this is a newly proven id, so the caller can
+// reconsider a StreamOpen that was rejected before the proof existed.
+//
+// Callers must pass only an id whose contract both verified and carried
+// `ProvideMode_Network`. A no-contract receive is reported as
+// `ProvideMode_Network` by `receiveHead` without any such proof, so it must
+// never reach here.
+func (self *PeerManager) addNetworkPeerWindowClient(clientId Id) bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	now := time.Now()
+	if _, ok := self.networkPeerWindowClients[clientId]; ok {
+		self.networkPeerWindowClients[clientId] = now
+		return false
+	}
+	// The map is fed by remote contract traffic, so it is hard bounded.
+	// Evict the least recently proven entry, which is the one whose peer has
+	// gone longest without presenting a fresh Network contract.
+	maxCount := self.peerManagerSettings.MaxNetworkPeerWindowClients
+	if maxCount <= 0 {
+		maxCount = 1
+	}
+	for maxCount <= len(self.networkPeerWindowClients) {
+		var oldestId Id
+		var oldestTime time.Time
+		first := true
+		for id, t := range self.networkPeerWindowClients {
+			if first || t.Before(oldestTime) {
+				oldestId = id
+				oldestTime = t
+				first = false
+			}
+		}
+		if first {
+			break
+		}
+		delete(self.networkPeerWindowClients, oldestId)
+	}
+	self.networkPeerWindowClients[clientId] = now
+	return true
 }
 
 // isDisconnectedNetworkPeer reports an explicit, unexpired platform
