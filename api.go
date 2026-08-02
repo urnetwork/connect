@@ -268,8 +268,16 @@ func (self *BringYourApi) AuthNetworkClient(authNetworkClient *AuthNetworkClient
 }
 
 func (self *BringYourApi) AuthNetworkClientSync(authNetworkClient *AuthNetworkClientArgs) (*AuthNetworkClientResult, error) {
+	return self.AuthNetworkClientSyncWithCtx(self.ctx, authNetworkClient)
+}
+
+// AuthNetworkClientSyncWithCtx is the caller-bounded form used by multi-client
+// maintenance. The ordinary API context owns the generator lifetime; this
+// narrower context prevents one auth request from parking destination
+// enumeration indefinitely.
+func (self *BringYourApi) AuthNetworkClientSyncWithCtx(ctx context.Context, authNetworkClient *AuthNetworkClientArgs) (*AuthNetworkClientResult, error) {
 	return HttpPostWithStrategy(
-		self.ctx,
+		ctx,
 		self.clientStrategy,
 		fmt.Sprintf("%s/network/auth-client", self.apiUrl),
 		authNetworkClient,
@@ -363,8 +371,14 @@ func (self *BringYourApi) FindProviders2(findProviders2 *FindProviders2Args, cal
 }
 
 func (self *BringYourApi) FindProviders2Sync(findProviders2 *FindProviders2Args) (*FindProviders2Result, error) {
+	return self.FindProviders2SyncWithCtx(self.ctx, findProviders2)
+}
+
+// FindProviders2SyncWithCtx is the caller-bounded form used by multi-client
+// maintenance, so a discovery request cannot own the only enumerator forever.
+func (self *BringYourApi) FindProviders2SyncWithCtx(ctx context.Context, findProviders2 *FindProviders2Args) (*FindProviders2Result, error) {
 	return HttpPostWithStrategy(
-		self.ctx,
+		ctx,
 		self.clientStrategy,
 		fmt.Sprintf("%s/network/find-providers2", self.apiUrl),
 		findProviders2,

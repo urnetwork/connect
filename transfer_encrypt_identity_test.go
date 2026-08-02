@@ -14,8 +14,18 @@ import (
 // post quantum identity panel consumes: once a per-peer session establishes
 // and the peer identity proof verifies, `PeerIdentities` on each side reports
 // the peer with its long-lived public identity key, and the change callback
-// fires. Mirrors the TestSendReceiveEncryptedWithContracts harness.
+// fires. Mirrors the TestSendReceiveEncryptedWithContracts harness. Runs in
+// both handshake-control carrier modes: symmetric EncryptedControl and the
+// production-default companion-contract carrier.
 func TestPeerIdentitiesEstablishedAndVerified(t *testing.T) {
+	runPeerIdentitiesEstablishedAndVerified(t, false)
+}
+
+func TestPeerIdentitiesEstablishedAndVerifiedCompanionControl(t *testing.T) {
+	runPeerIdentitiesEstablishedAndVerified(t, true)
+}
+
+func runPeerIdentitiesEstablishedAndVerified(t *testing.T, encryptionControlUseCompanion bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -52,7 +62,7 @@ func TestPeerIdentitiesEstablishedAndVerified(t *testing.T) {
 		s.ContractManagerSettings.LegacyCreateContract = false
 		s.EncryptionSettings.Encrypt = true
 		s.EncryptionSettings.TlsTimeout = 30 * time.Second
-		s.EncryptionSettings.EncryptionControlUseCompanion = false
+		s.EncryptionSettings.EncryptionControlUseCompanion = encryptionControlUseCompanion
 		return s
 	}
 

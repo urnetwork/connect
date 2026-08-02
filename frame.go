@@ -131,6 +131,33 @@ func ipPacketFromProviderFrame(packet []byte, protocolVersion int) (*protocol.Fr
 	}, protocolVersion)
 }
 
+// ipPacketToProviderBytes returns the packet carried by an IP frame without
+// materializing the two legacy protobuf wrapper objects on the v2+ raw hot
+// path. The returned bytes have the same callback-scoped lifetime as frame.
+func ipPacketToProviderBytes(frame *protocol.Frame) ([]byte, error) {
+	if frame.Raw {
+		return frame.MessageBytes, nil
+	}
+	message, err := FromFrame(frame)
+	if err != nil {
+		return nil, err
+	}
+	return message.(*protocol.IpPacketToProvider).IpPacket.PacketBytes, nil
+}
+
+// ipPacketFromProviderBytes is the return-path counterpart to
+// ipPacketToProviderBytes.
+func ipPacketFromProviderBytes(frame *protocol.Frame) ([]byte, error) {
+	if frame.Raw {
+		return frame.MessageBytes, nil
+	}
+	message, err := FromFrame(frame)
+	if err != nil {
+		return nil, err
+	}
+	return message.(*protocol.IpPacketFromProvider).IpPacket.PacketBytes, nil
+}
+
 func RequireToFrameWithDefaultProtocolVersion(message proto.Message) *protocol.Frame {
 	return RequireToFrame(message, DefaultProtocolVersion)
 }

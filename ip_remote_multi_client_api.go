@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sync"
 	"time"
 
 	// "maps"
@@ -23,10 +24,40 @@ type MultiClientGeneratorClientArgs struct {
 }
 
 func DefaultApiMultiClientGeneratorSettings() *ApiMultiClientGeneratorSettings {
-	return &ApiMultiClientGeneratorSettings{}
+	return &ApiMultiClientGeneratorSettings{
+		MigrateConnectTimeout:   60 * time.Second,
+		MigrateMaxScheduleDelay: 5 * time.Minute,
+		IdentityLoadTimeout:     5 * time.Second,
+	}
 }
 
 type ApiMultiClientGeneratorSettings struct {
+	// MigrateConnectTimeout bounds the temporary second platform transport.
+	// If it cannot establish a route in this interval, it is closed and the
+	// old transport remains until the server's drain fallback evicts it.
+	MigrateConnectTimeout time.Duration
+	// MigrateMaxScheduleDelay bounds an absolute server-provided migration
+	// time, protecting the retained request/state from clock skew or a
+	// malformed far-future value.
+	MigrateMaxScheduleDelay time.Duration
+	// IdentityLoadTimeout bounds the optional persisted-window identity load.
+	// Continuity restoration is abandoned after this deadline so a slow remote
+	// store cannot hold both window enumerators ahead of provider discovery.
+	// Values <= 0 use the caller's generator deadline.
+	IdentityLoadTimeout time.Duration
+}
+
+type apiWindowPlatformTransport interface {
+	ConnectedNotify() <-chan struct{}
+	IsConnected() bool
+	Close()
+}
+
+type apiWindowClientTransport struct {
+	current   apiWindowPlatformTransport
+	settings  *PlatformTransportSettings
+	auth      ClientAuth
+	migrating bool
 }
 
 type ApiMultiClientGenerator struct {
@@ -53,6 +84,20 @@ type ApiMultiClientGenerator struct {
 	// window identity persistence (PROXYDRAIN1.md §3.5); nil state behavior
 	// is identical to no persistence
 	identityState *windowIdentityState
+
+	// A window client used to discard its PlatformTransport handle. Retaining
+	// one bounded entry per live client lets ResidentMigrate build a
+	// replacement before closing the old route. The map is bounded by the
+	// quality/speed window hard maxima; each state permits at most one
+	// temporary replacement.
+	transportLock sync.Mutex
+	transports    map[*Client]*apiWindowClientTransport
+	// injectable for deterministic make-before-break tests
+	newPlatformTransport func(
+		client *Client,
+		auth *ClientAuth,
+		settings *PlatformTransportSettings,
+	) apiWindowPlatformTransport
 }
 
 func NewApiMultiClientGeneratorWithDefaults(
@@ -119,6 +164,7 @@ func NewApiMultiClientGenerator(
 		settings:                settings,
 		api:                     api,
 		identityState:           newWindowIdentityState(ctx, nil),
+		transports:              map[*Client]*apiWindowClientTransport{},
 	}
 }
 
@@ -133,6 +179,13 @@ func (self *ApiMultiClientGenerator) SetIdentityStore(store MultiClientIdentityS
 }
 
 func (self *ApiMultiClientGenerator) NextDestinations(count int, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error) {
+	return self.NextDestinationsContext(self.ctx, count, excludeDestinations, rankMode)
+}
+
+// NextDestinationsContext implements MultiClientGeneratorContext. Discovery is
+// owned by the caller's maintenance deadline rather than only by the
+// generator's process-lifetime context.
+func (self *ApiMultiClientGenerator) NextDestinationsContext(ctx context.Context, count int, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error) {
 	excludeClientIds := slices.Clone(self.excludeClientIds)
 	excludeDestinationsIds := [][]Id{}
 	for _, excludeDestination := range excludeDestinations {
@@ -173,7 +226,24 @@ func (self *ApiMultiClientGenerator) NextDestinations(count int, excludeDestinat
 	// destinations with a restored identity pending reuse are dialed first
 	// (PROXYDRAIN1.md §3.5): the restarted window re-forms against the SAME
 	// providers so their NAT flows resume
-	for _, destination := range self.identityState.RestoredDestinations() {
+	identityLoadCtx := ctx
+	cancelIdentityLoad := func() {}
+	if 0 < self.settings.IdentityLoadTimeout {
+		identityLoadCtx, cancelIdentityLoad = context.WithTimeout(ctx, self.settings.IdentityLoadTimeout)
+	}
+	restoredDestinations, err := self.identityState.RestoredDestinationsContext(identityLoadCtx)
+	cancelIdentityLoad()
+	if err != nil {
+		// Persistence is a continuity optimization, never an availability
+		// dependency. If its narrower budget expires (or the optional store
+		// fails), continue this SAME discovery attempt with fresh identities.
+		// Only cancellation of the authoritative generator call stops work.
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		restoredDestinations = nil
+	}
+	for _, destination := range restoredDestinations {
 		if slices.Contains(excludeDestinations, destination) {
 			continue
 		}
@@ -192,7 +262,7 @@ func (self *ApiMultiClientGenerator) NextDestinations(count int, excludeDestinat
 			RankMode:            rankMode,
 		}
 
-		result, err := self.api.FindProviders2Sync(findProviders2)
+		result, err := self.api.FindProviders2SyncWithCtx(ctx, findProviders2)
 		if err != nil {
 			// prefer returning any fixed destinations over failing the whole call
 			if 0 < len(destinations) {
@@ -224,6 +294,13 @@ func (self *ApiMultiClientGenerator) NextDestinations(count int, excludeDestinat
 }
 
 func (self *ApiMultiClientGenerator) NewClientArgs() (*MultiClientGeneratorClientArgs, error) {
+	return self.NewClientArgsContext(self.ctx)
+}
+
+// NewClientArgsContext implements MultiClientGeneratorContext. Authentication
+// must not be able to park the sole candidate producer beyond its maintenance
+// budget.
+func (self *ApiMultiClientGenerator) NewClientArgsContext(ctx context.Context) (*MultiClientGeneratorClientArgs, error) {
 	auth := func() (string, error) {
 		// note the derived client id will be inferred by the api jwt
 		authNetworkClient := &AuthNetworkClientArgs{
@@ -232,7 +309,7 @@ func (self *ApiMultiClientGenerator) NewClientArgs() (*MultiClientGeneratorClien
 			DeviceSpec:     self.deviceSpec,
 		}
 
-		result, err := self.api.AuthNetworkClientSync(authNetworkClient)
+		result, err := self.api.AuthNetworkClientSyncWithCtx(ctx, authNetworkClient)
 		if err != nil {
 			return "", err
 		}
@@ -272,7 +349,17 @@ func (self *ApiMultiClientGenerator) NewClientArgs() (*MultiClientGeneratorClien
 // args. Either way the live (identity, destination) pair is recorded to the
 // store, so the NEXT restart can restore it.
 func (self *ApiMultiClientGenerator) NewClientArgsForDestination(destination MultiHopId) (*MultiClientGeneratorClientArgs, error) {
-	if identity := self.identityState.TakeRestored(destination); identity != nil {
+	return self.NewClientArgsForDestinationContext(self.ctx, destination)
+}
+
+// NewClientArgsForDestinationContext implements
+// MultiClientGeneratorWithDestinationContext.
+func (self *ApiMultiClientGenerator) NewClientArgsForDestinationContext(ctx context.Context, destination MultiHopId) (*MultiClientGeneratorClientArgs, error) {
+	identity, err := self.identityState.TakeRestoredContext(ctx, destination)
+	if err != nil {
+		return nil, err
+	}
+	if identity != nil {
 		self.identityState.Record(identity)
 		return &MultiClientGeneratorClientArgs{
 			ClientId: identity.ClientId,
@@ -284,7 +371,7 @@ func (self *ApiMultiClientGenerator) NewClientArgsForDestination(destination Mul
 		}, nil
 	}
 
-	args, err := self.NewClientArgs()
+	args, err := self.NewClientArgsContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -353,6 +440,16 @@ func (self *ApiMultiClientGenerator) RemoveClientArgs(args *MultiClientGenerator
 }
 
 func (self *ApiMultiClientGenerator) RemoveClientWithArgs(client *Client, args *MultiClientGeneratorClientArgs) {
+	var transport apiWindowPlatformTransport
+	self.transportLock.Lock()
+	if state := self.transports[client]; state != nil {
+		delete(self.transports, client)
+		transport = state.current
+	}
+	self.transportLock.Unlock()
+	if transport != nil {
+		transport.Close()
+	}
 	self.RemoveClientArgs(args)
 }
 
@@ -362,6 +459,19 @@ func (self *ApiMultiClientGenerator) NewClientSettings() *ClientSettings {
 
 func (self *ApiMultiClientGenerator) NewClient(
 	ctx context.Context,
+	args *MultiClientGeneratorClientArgs,
+	clientSettings *ClientSettings,
+) (*Client, error) {
+	return self.NewClientContext(ctx, ctx, args, clientSettings)
+}
+
+// NewClientContext implements MultiClientGeneratorContext. ctx owns the
+// successfully-created client; callCtx only bounds setup. Keeping them
+// separate avoids the subtle failure where a setup deadline later cancels an
+// otherwise healthy long-lived client.
+func (self *ApiMultiClientGenerator) NewClientContext(
+	ctx context.Context,
+	callCtx context.Context,
 	args *MultiClientGeneratorClientArgs,
 	clientSettings *ClientSettings,
 ) (*Client, error) {
@@ -378,14 +488,7 @@ func (self *ApiMultiClientGenerator) NewClient(
 			return
 		}
 	}
-	NewPlatformTransport(
-		client.Ctx(),
-		self.clientStrategy,
-		client.RouteManager(),
-		self.platformUrl,
-		args.ClientAuth,
-		settings,
-	)
+	transport := self.createPlatformTransport(client, args.ClientAuth, settings)
 	// Enable return traffic for this client and block until the platform has
 	// committed the provide secret. The companion (Stream) contract on the return
 	// path is verified against this secret, so using the client before it is
@@ -412,20 +515,159 @@ func (self *ApiMultiClientGenerator) NewClient(
 	if provideTimeout <= 0 {
 		provideTimeout = 30 * time.Second
 	}
+	provideTimer := time.NewTimer(provideTimeout)
+	defer provideTimer.Stop()
 	select {
 	case err := <-provideAck:
 		if err != nil {
+			transport.Close()
 			client.Cancel()
 			return nil, err
 		}
-	case <-time.After(provideTimeout):
+	case <-provideTimer.C:
+		transport.Close()
 		client.Cancel()
 		return nil, fmt.Errorf("provide secret registration timed out")
+	case <-callCtx.Done():
+		transport.Close()
+		client.Cancel()
+		return nil, callCtx.Err()
 	case <-ctx.Done():
+		transport.Close()
 		client.Cancel()
 		return nil, ctx.Err()
 	}
+	auth := *args.ClientAuth
+	self.transportLock.Lock()
+	if self.transports == nil {
+		self.transports = map[*Client]*apiWindowClientTransport{}
+	}
+	self.transports[client] = &apiWindowClientTransport{
+		current:  transport,
+		settings: settings,
+		auth:     auth,
+	}
+	self.transportLock.Unlock()
 	return client, nil
+}
+
+func (self *ApiMultiClientGenerator) createPlatformTransport(
+	client *Client,
+	auth *ClientAuth,
+	settings *PlatformTransportSettings,
+) apiWindowPlatformTransport {
+	if self.newPlatformTransport != nil {
+		return self.newPlatformTransport(client, auth, settings)
+	}
+	return NewPlatformTransport(
+		client.Ctx(),
+		self.clientStrategy,
+		client.RouteManager(),
+		self.platformUrl,
+		auth,
+		settings,
+	)
+}
+
+// MigrateClientTransport implements MultiClientGeneratorTransportMigrator.
+// The call is deliberately non-blocking: server jitter, connect waiting, and
+// handoff happen off the receive path. A duplicate frame while one migration
+// is pending is ignored, bounding overlap to one replacement per client.
+func (self *ApiMultiClientGenerator) MigrateClientTransport(
+	client *Client,
+	args *MultiClientGeneratorClientArgs,
+	migrateTime time.Time,
+) {
+	self.transportLock.Lock()
+	state := self.transports[client]
+	if state == nil || state.migrating {
+		self.transportLock.Unlock()
+		return
+	}
+	state.migrating = true
+	current := state.current
+	settings := state.settings
+	auth := state.auth
+	self.transportLock.Unlock()
+
+	go HandleError(func() {
+		defer func() {
+			self.transportLock.Lock()
+			if self.transports[client] == state {
+				state.migrating = false
+			}
+			self.transportLock.Unlock()
+		}()
+
+		maxScheduleDelay := self.settings.MigrateMaxScheduleDelay
+		if maxScheduleDelay <= 0 {
+			maxScheduleDelay = 5 * time.Minute
+		}
+		now := time.Now()
+		if latest := now.Add(maxScheduleDelay); latest.Before(migrateTime) {
+			migrateTime = latest
+		}
+		if wait := time.Until(migrateTime); 0 < wait {
+			timer := time.NewTimer(wait)
+			defer timer.Stop()
+			select {
+			case <-client.Ctx().Done():
+				return
+			case <-timer.C:
+			}
+		}
+
+		// Recheck ownership after the scheduled wait. The client might have
+		// been removed while its migration was merely pending.
+		self.transportLock.Lock()
+		stillCurrent := self.transports[client] == state && state.current == current
+		self.transportLock.Unlock()
+		if !stillCurrent {
+			return
+		}
+
+		next := self.createPlatformTransport(client, &auth, settings)
+		connectTimeout := self.settings.MigrateConnectTimeout
+		if connectTimeout <= 0 {
+			connectTimeout = 60 * time.Second
+		}
+		connectTimer := time.NewTimer(connectTimeout)
+		defer connectTimer.Stop()
+		for !next.IsConnected() {
+			notify := next.ConnectedNotify()
+			// Capture notify before the second state check so a connection
+			// transition cannot be missed between the two operations.
+			if next.IsConnected() {
+				break
+			}
+			select {
+			case <-client.Ctx().Done():
+				next.Close()
+				return
+			case <-notify:
+			case <-connectTimer.C:
+				// Keep the old transport: it is still a valid route, and the
+				// server's drain excuse/reconnect path remains the backstop.
+				next.Close()
+				return
+			}
+		}
+
+		swapped := false
+		self.transportLock.Lock()
+		if self.transports[client] == state && state.current == current {
+			state.current = next
+			swapped = true
+		}
+		self.transportLock.Unlock()
+		if !swapped {
+			next.Close()
+			return
+		}
+		// Only now break the old route. For the interval between next becoming
+		// connected and this close, RouteManager can carry traffic over both.
+		current.Close()
+	})
 }
 
 func (self *ApiMultiClientGenerator) FixedDestinationSize() (int, bool) {

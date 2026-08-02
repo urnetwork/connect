@@ -21,6 +21,19 @@ type Monitor struct {
 	notify chan struct{}
 }
 
+// resetOrCreateTimer lazily creates a timer and otherwise reuses it. Go 1.23+
+// guarantees Reset cannot expose a stale value from the previous setting, so
+// callers only need to serialize access to the timer and Stop it when a
+// non-timer select arm wins.
+func resetOrCreateTimer(timer **time.Timer, timeout time.Duration) <-chan time.Time {
+	if *timer == nil {
+		*timer = time.NewTimer(timeout)
+	} else {
+		(*timer).Reset(timeout)
+	}
+	return (*timer).C
+}
+
 func NewMonitor() *Monitor {
 	return &Monitor{
 		notify: make(chan struct{}),
@@ -135,6 +148,31 @@ func ShedMemory() {
 	}
 }
 
+// networkChangeListeners are callbacks fired when the host reports a network path change
+// (wifi<->cell, interface change). Components that hold long-lived connections over the
+// OLD path subscribe to fail over immediately — a platform transport closes its live
+// connection and re-dials — instead of discovering the dead socket via ping timeouts
+// seconds later.
+var networkChangeListeners = NewCallbackList[func()]()
+
+// AddNetworkChangeListener registers a callback invoked by NetworkChanged. It returns an
+// unregister closure; an owner must unregister when it closes.
+func AddNetworkChangeListener(listener func()) func() {
+	callbackId := networkChangeListeners.Add(listener)
+	return func() {
+		networkChangeListeners.Remove(callbackId)
+	}
+}
+
+// NetworkChanged invokes the registered network-change listeners. The host calls this on
+// its OS path-update signal (NWPathMonitor / ConnectivityManager); it is cheap and safe to
+// call on every update — listeners only tear down state bound to a possibly-dead path.
+func NetworkChanged() {
+	for _, listener := range networkChangeListeners.Get() {
+		HandleError(listener)
+	}
+}
+
 // makes a copy of the list on update
 type CallbackList[T any] struct {
 	mutex sync.Mutex
@@ -145,6 +183,55 @@ type CallbackList[T any] struct {
 	callbacks      []T
 	callbackIds    []int
 	nextCallbackId int
+}
+
+// coalescingCallbackWorker isolates a state-change observer from its producer.
+// At most one callback is in flight and one additional wake is pending. It is
+// intentionally not used for Client send/receive/forward callbacks, whose
+// blocking behavior is part of the transfer backpressure contract.
+type coalescingCallbackWorker struct {
+	ctx      context.Context
+	cancel   context.CancelFunc
+	callback func()
+	notify   chan struct{}
+}
+
+func newCoalescingCallbackWorker(ctx context.Context, callback func()) *coalescingCallbackWorker {
+	workerCtx, cancel := context.WithCancel(ctx)
+	worker := &coalescingCallbackWorker{
+		ctx:      workerCtx,
+		cancel:   cancel,
+		callback: callback,
+		notify:   make(chan struct{}, 1),
+	}
+	go HandleError(worker.run, cancel)
+	return worker
+}
+
+func (self *coalescingCallbackWorker) run() {
+	for {
+		select {
+		case <-self.ctx.Done():
+			return
+		case <-self.notify:
+		}
+		if self.ctx.Err() != nil {
+			return
+		}
+		HandleError(self.callback)
+	}
+}
+
+func (self *coalescingCallbackWorker) Dispatch() {
+	select {
+	case <-self.ctx.Done():
+	case self.notify <- struct{}{}:
+	default:
+	}
+}
+
+func (self *coalescingCallbackWorker) Close() {
+	self.cancel()
 }
 
 func NewCallbackList[T any]() *CallbackList[T] {

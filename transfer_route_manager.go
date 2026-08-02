@@ -334,6 +334,12 @@ type MultiRouteSelector struct {
 	// `NotifyChannel` — both on every packet. the route set changes rarely, so
 	// the snapshot moves that work off the hot path.
 	activeRoutesSnapshot atomic.Pointer[routeSnapshot]
+
+	// A selector reader is one ordered packet stream. Serializing Read also
+	// lets it reuse one lazy timeout timer instead of allocating time.After
+	// state on every packet. Writers have independent selector instances.
+	readMutex sync.Mutex
+	readTimer *time.Timer
 }
 
 // routeSnapshot is an immutable view of the selector's active routes published
@@ -838,6 +844,14 @@ func (self *MultiRouteSelector) WriteDetailed(ctx context.Context, transferFrame
 
 // MultiRouteReader
 func (self *MultiRouteSelector) Read(ctx context.Context, timeout time.Duration) ([]byte, error) {
+	self.readMutex.Lock()
+	defer self.readMutex.Unlock()
+	defer func() {
+		if self.readTimer != nil {
+			self.readTimer.Stop()
+		}
+	}()
+
 	// read from the first channel available, in random priority
 	enterTime := time.Now()
 	for {
@@ -894,7 +908,7 @@ func (self *MultiRouteSelector) Read(ctx context.Context, timeout time.Duration)
 				if remainingTimeout <= 0 {
 					return nil, nil
 				}
-				timeoutChan = time.After(remainingTimeout)
+				timeoutChan = resetOrCreateTimer(&self.readTimer, remainingTimeout)
 			}
 			select {
 			case <-ctx.Done():
@@ -975,9 +989,10 @@ func (self *MultiRouteSelector) Read(ctx context.Context, timeout time.Duration)
 				})
 			} else {
 				// add a timeout case
+				timeoutChan := resetOrCreateTimer(&self.readTimer, remainingTimeout)
 				selectCases = append(selectCases, reflect.SelectCase{
 					Dir:  reflect.SelectRecv,
-					Chan: reflect.ValueOf(time.After(remainingTimeout)),
+					Chan: reflect.ValueOf(timeoutChan),
 				})
 			}
 		}

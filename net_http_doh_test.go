@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -345,8 +346,19 @@ func TestDohServerStagger(t *testing.T) {
 
 	testIp := netip.MustParseAddr("93.184.216.34")
 	var totalRequests int32
+	// responseDelay makes the race assertion deterministic: with instant
+	// answers the first server can respond before the launcher fires the
+	// second, legitimately short-circuiting the fan-out
+	var responseDelayMs int32
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&totalRequests, 1)
+		if delay := atomic.LoadInt32(&responseDelayMs); 0 < delay {
+			select {
+			case <-time.After(time.Duration(delay) * time.Millisecond):
+			case <-r.Context().Done():
+				return
+			}
+		}
 		writeDohWire(w, r, []netip.Addr{testIp}, 60, false)
 	})
 	a := httptest.NewServer(handler)
@@ -357,6 +369,10 @@ func TestDohServerStagger(t *testing.T) {
 	settings := DefaultDohSettings()
 	settings.RequestTimeout = 5 * time.Second
 	settings.DohServerStagger = 500 * time.Millisecond
+	// test the stagger mechanism in isolation: disable the quiet-cache race
+	// (which intentionally bypasses the stagger when little is in flight —
+	// see DohServerRaceMaxInFlight)
+	settings.DohServerRaceMaxInFlight = 0
 	settings.DnsResolverSettings.EnableRemoteDoh = true
 	settings.DnsResolverSettings.EnableRemoteDns = false
 	settings.DnsResolverSettings.EnableLocalDns = false
@@ -368,6 +384,176 @@ func TestDohServerStagger(t *testing.T) {
 	// the first-ordered server answers immediately, well within the 500ms stagger, so the second
 	// server is never launched
 	AssertEqual(t, int32(1), atomic.LoadInt32(&totalRequests))
+
+	// with the quiet-cache race enabled (the default), an isolated query
+	// bypasses the stagger and fans out immediately (hedged request). the
+	// servers delay so both launches reliably precede either answer.
+	atomic.StoreInt32(&totalRequests, 0)
+	atomic.StoreInt32(&responseDelayMs, 100)
+	settings.DohServerRaceMaxInFlight = DefaultDohSettings().DohServerRaceMaxInFlight
+	raceCache := NewDohCache(settings)
+	addrs = raceCache.Query(ctx, "A", "race.example")
+	AssertEqual(t, slices.Contains(addrs, testIp), true)
+	AssertEqual(t, int32(2), atomic.LoadInt32(&totalRequests))
+}
+
+func TestDohServerStaggerTracksWarmPathState(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	testIp := netip.MustParseAddr("93.184.216.34")
+	var totalRequests atomic.Int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		totalRequests.Add(1)
+		select {
+		case <-time.After(200 * time.Millisecond):
+		case <-r.Context().Done():
+			return
+		}
+		writeDohWire(w, r, []netip.Addr{testIp}, 60, false)
+	})
+	a := httptest.NewServer(handler)
+	defer a.Close()
+	b := httptest.NewServer(handler)
+	defer b.Close()
+
+	var pathWarm atomic.Bool
+	settings := DefaultDohSettings()
+	settings.RequestTimeout = 2 * time.Second
+	settings.DohServerStagger = 300 * time.Millisecond
+	settings.DohServerWarmStagger = 50 * time.Millisecond
+	settings.DohServerRaceMaxInFlight = 0
+	settings.DohPathWarm = pathWarm.Load
+	settings.MaxServersPerQuery = 2
+	settings.MaxConcurrentHttpRequests = 4
+	settings.DohServerHedgeReserve = 1
+	settings.DnsResolverSettings.EnableRemoteDoh = true
+	settings.DnsResolverSettings.EnableRemoteDns = false
+	settings.DnsResolverSettings.EnableLocalDns = false
+	settings.DnsResolverSettings.RemoteDohUrlsIpv4 = []string{a.URL, b.URL}
+
+	cache := NewDohCache(settings)
+	defer cache.Close()
+
+	// Cold: the first 200ms answer beats the conservative 300ms stagger.
+	addrs := cache.Query(ctx, "A", "cold-stagger.example")
+	if !slices.Contains(addrs, testIp) {
+		t.Fatalf("cold query missing %s: %v", testIp, addrs)
+	}
+	if got := totalRequests.Load(); got != 1 {
+		t.Fatalf("cold path launched %d requests, want 1", got)
+	}
+
+	// Warm: the 50ms override launches the hedge before either 200ms answer.
+	pathWarm.Store(true)
+	totalRequests.Store(0)
+	addrs = cache.Query(ctx, "A", "warm-stagger.example")
+	if !slices.Contains(addrs, testIp) {
+		t.Fatalf("warm query missing %s: %v", testIp, addrs)
+	}
+	if got := totalRequests.Load(); got != 2 {
+		t.Fatalf("warm path launched %d requests, want 2", got)
+	}
+}
+
+func TestDohWarmPrimaryWaveReservesHedgeCapacity(t *testing.T) {
+	settings := DefaultDohSettings()
+	settings.MaxConcurrentHttpRequests = 32
+	settings.DohServerHedgeReserve = 4
+	settings.DohPathWarm = func() bool { return true }
+	cache := NewDohCache(settings)
+	defer cache.Close()
+
+	if got := cap(cache.remoteClient.httpSem); got != 32 {
+		t.Fatalf("http capacity=%d, want 32", got)
+	}
+	if got := cap(cache.remoteClient.primarySem); got != 28 {
+		t.Fatalf("warm primary capacity=%d, want 28", got)
+	}
+	if cache.remoteClient.primarySem != cache.localClient.primarySem {
+		t.Fatal("remote/local clients must share one primary-wave reserve")
+	}
+}
+
+func TestDohQuietRaceAdmissionIsPredictablyBounded(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const queryCount = 8
+	const raceMax = 2
+	// Every query launches its first server immediately; only raceMax queries
+	// may bypass the stagger and launch their second server too.
+	const expectedImmediateRequests = queryCount + raceMax
+
+	testIp := netip.MustParseAddr("93.184.216.34")
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	requestSeen := make(chan struct{}, 2*queryCount)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestSeen <- struct{}{}
+		select {
+		case <-release:
+			writeDohWire(w, r, []netip.Addr{testIp}, 60, false)
+		case <-r.Context().Done():
+		}
+	})
+	a := httptest.NewServer(handler)
+	defer a.Close()
+	b := httptest.NewServer(handler)
+	defer b.Close()
+
+	settings := DefaultDohSettings()
+	settings.RequestTimeout = 5 * time.Second
+	settings.DohServerStagger = 2 * time.Second
+	settings.DohServerRaceMaxInFlight = raceMax
+	settings.MaxServersPerQuery = 2
+	settings.MaxConcurrentHttpRequests = 2 * queryCount
+	settings.MaxConcurrentResolutions = queryCount
+	settings.DnsResolverSettings.EnableRemoteDoh = true
+	settings.DnsResolverSettings.EnableRemoteDns = false
+	settings.DnsResolverSettings.EnableLocalDns = false
+	settings.DnsResolverSettings.RemoteDohUrlsIpv4 = []string{a.URL, b.URL}
+
+	dohCache := NewDohCache(settings)
+	defer dohCache.Close()
+	start := make(chan struct{})
+	results := make(chan []netip.Addr, queryCount)
+	for i := range queryCount {
+		go func(i int) {
+			<-start
+			results <- dohCache.Query(ctx, "A", fmt.Sprintf("race-bound-%d.example", i))
+		}(i)
+	}
+	close(start)
+
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	for i := 0; i < expectedImmediateRequests; i++ {
+		select {
+		case <-requestSeen:
+		case <-timer.C:
+			t.Fatalf("saw only %d/%d immediate requests", i, expectedImmediateRequests)
+		}
+	}
+	// Well before the two-second stagger, no additional query may have raced.
+	select {
+	case <-requestSeen:
+		t.Fatalf("more than %d requests bypassed the stagger", expectedImmediateRequests)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	releaseOnce.Do(func() { close(release) })
+	for range queryCount {
+		select {
+		case addrs := <-results:
+			if !slices.Contains(addrs, testIp) {
+				t.Fatalf("query result missing %s: %v", testIp, addrs)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for query results")
+		}
+	}
 }
 
 // TestDohHttpConcurrencyLimit: MaxConcurrentHttpRequests hard-caps concurrent in-flight DoH

@@ -6,7 +6,7 @@ import (
 )
 
 func TestRttWindow(t *testing.T) {
-	rttWindow := NewRttWindow(nil, 4, 1*time.Second, 1.0, 0, time.Second)
+	rttWindow := NewRttWindow(nil, 4, 1*time.Second, 1.0, 0, 0, time.Second)
 
 	AssertEqual(t, rttWindow.ScaledRtt(), time.Duration(0))
 
@@ -52,4 +52,30 @@ func TestRttWindow(t *testing.T) {
 	rttWindow.closeTag(tag25, start2.Add(100*time.Millisecond))
 
 	AssertEqual(t, rttWindow.scaledRtt(start2.Add(100*time.Millisecond)), (500+500+500+100)/4*time.Millisecond)
+}
+
+// TestRttWindowColdVsSampledFloor pins the two-floor semantics: the
+// conservative cold floor applies while no samples exist, and the (smaller)
+// rtt floor applies once the path is measured.
+func TestRttWindowColdVsSampledFloor(t *testing.T) {
+	rttWindow := NewRttWindow(nil, 4, 10*time.Second, 2.0, 2*time.Second, 300*time.Millisecond, 8*time.Second)
+
+	// cold: no samples -> the conservative floor
+	AssertEqual(t, rttWindow.ScaledRtt(), 2*time.Second)
+
+	start := time.Now()
+	tag := rttWindow.openTag(start)
+	rttWindow.closeTag(tag, start.Add(50*time.Millisecond))
+
+	// sampled fast path: 50ms * 2.0 = 100ms, floored at the rtt floor
+	AssertEqual(t, rttWindow.scaledRtt(start.Add(50*time.Millisecond)), 300*time.Millisecond)
+
+	// sampled slower path: the scaled mean governs once above the floor
+	tag2 := rttWindow.openTag(start)
+	rttWindow.closeTag(tag2, start.Add(450*time.Millisecond))
+	// mean = (50+450)/2 = 250ms, * 2.0 = 500ms
+	AssertEqual(t, rttWindow.scaledRtt(start.Add(450*time.Millisecond)), 500*time.Millisecond)
+
+	// after the window ages out (quiet gap), back to the cold floor
+	AssertEqual(t, rttWindow.scaledRtt(start.Add(30*time.Second)), 2*time.Second)
 }

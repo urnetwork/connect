@@ -19,7 +19,7 @@ import (
 //
 // All methods are safe for concurrent use.
 type TransferMemoryBudget struct {
-	totalByteCount ByteCount
+	totalByteCount atomic.Int64
 	usedByteCount  atomic.Int64
 	// cumulative counters, so tests can assert reserve/release balance after
 	// a build/load/teardown cycle (the message pool counts pattern)
@@ -28,18 +28,26 @@ type TransferMemoryBudget struct {
 }
 
 func NewTransferMemoryBudget(totalByteCount ByteCount) *TransferMemoryBudget {
-	return &TransferMemoryBudget{
-		totalByteCount: totalByteCount,
-	}
+	budget := &TransferMemoryBudget{}
+	budget.totalByteCount.Store(totalByteCount)
+	return budget
 }
 
 func (self *TransferMemoryBudget) TotalByteCount() ByteCount {
-	return self.totalByteCount
+	return self.totalByteCount.Load()
+}
+
+// SetTotalByteCount retunes the budget capacity live (e.g. reallocating the
+// provider share to the client pair while providing is off). Shrinking does
+// not evict reserved bytes; the pool admits nothing new above the new total
+// until enough releases drain it.
+func (self *TransferMemoryBudget) SetTotalByteCount(totalByteCount ByteCount) {
+	self.totalByteCount.Store(totalByteCount)
 }
 
 // Available is the unreserved remainder of the budget
 func (self *TransferMemoryBudget) Available() ByteCount {
-	return max(0, self.totalByteCount-self.usedByteCount.Load())
+	return max(0, self.totalByteCount.Load()-self.usedByteCount.Load())
 }
 
 func (self *TransferMemoryBudget) UsedByteCount() ByteCount {

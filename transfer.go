@@ -61,6 +61,9 @@ const defaultTransferBufferSize = 32
 
 var DebugTransferCopyOnWrite = false
 
+// AckFunction is invoked inline by the owning send path. Blocking is
+// intentional backpressure: callers can stop completion from outrunning their
+// downstream state. Do not move it to a lossy/coalescing observer worker.
 type AckFunction = func(err error)
 
 // the identity of the source of received frames.
@@ -73,9 +76,12 @@ type Peer struct {
 	Principal   string
 }
 
+// ReceiveFunction is invoked inline by the receive path. A blocked callback
+// intentionally backpressures that path and preserves frame lifetime/order.
 type ReceiveFunction = func(source TransferPath, frames []*protocol.Frame, peer Peer)
 
 // a forward callback receives a transfer frame addressed to another destination.
+// It is also an inline, intentional backpressure boundary.
 // like a receive callback, `transferFrameBytes` is valid only for the duration of
 // the callback; the caller returns it after the callbacks run. A callback that
 // retains the bytes (e.g. hands them off to a send or a channel) must
@@ -136,11 +142,22 @@ func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings
 		// contract-control/API load for a persistently unavailable destination.
 		CreateContractRetryInterval:    1 * time.Second,
 		CreateContractRetryMaxInterval: 5 * time.Second,
-		MinResendInterval:              2 * time.Second,
-		MaxResendInterval:              8 * time.Second,
-		// no backoff
-		// ResendBackoffScale: 0,
-		RttScale:         1.2,
+		// the COLD resend floor: applies only while no rtt samples exist
+		// (nothing acked yet) — no evidence, so retry conservatively
+		MinResendInterval: 2 * time.Second,
+		// the resend floor once the path rtt is measured: a lost packet on a
+		// fast path retries in hundreds of ms instead of the cold floor —
+		// this bounds per-loss pauses AND how fast traffic shifts off a
+		// stalled route onto a sibling. The per-item exponential backoff
+		// (see the resend loop) caps the duplicate cost of an eager retry,
+		// and the receiver dedups by sequence number.
+		RttMinResendInterval: 300 * time.Millisecond,
+		MaxResendInterval:    8 * time.Second,
+		// scale over the MEAN window rtt: headroom for jitter/ack-compress
+		// (10ms) without variance tracking. 1.2 was tight enough that the
+		// floor always governed; 2.0 makes the rtt-scaled value meaningful
+		// on paths slower than the floor.
+		RttScale:         2.0,
 		RttWindowSize:    128,
 		RttWindowTimeout: 60 * time.Second,
 		AckTimeout:       60 * time.Second,
@@ -177,7 +194,9 @@ func DefaultReceiveBufferSettingsWithBufferSize(bufferSize int) *ReceiveBufferSe
 		// without coalescing, every received message emits an ack frame, which
 		// doubles the per-pair message volume on the relay path for one-way
 		// streams and feeds resend storms under load. The window is far below
-		// the `MinResendInterval` floor (2s), so it does not affect resends.
+		// the resend floors (RttMinResendInterval 300ms / cold 2s), so it does
+		// not affect resends; it does inflate measured rtt by up to 10ms,
+		// which the RttScale headroom absorbs.
 		AckCompressTimeout:  10 * time.Millisecond,
 		MinMessageByteCount: ByteCount(1),
 		// ResendAbuseThreshold: 4,
@@ -212,8 +231,21 @@ type SendPack struct {
 	TransferOptions
 
 	// frame and destination is repacked by the send buffer into a Pack,
-	// with destination and frame from the tframe, and other pack properties filled in by the buffer
-	Frame           *protocol.Frame
+	// with destination and frame from the tframe, and other pack properties filled in by the buffer.
+	// Frames, when set, carries a batch of frames coalesced into ONE wire Pack
+	// (one sequence number, one ack) — the send machinery already marshals a
+	// frame slice, so a batch collapses the per-frame route/transport handoffs
+	// to one for the whole batch. Frame is the single-frame form; exactly one
+	// of Frame / Frames is set. See `SendPack.frameList`.
+	// Ownership: the pack owns the Frames slice (referenced asynchronously
+	// until marshal) — the sender must not reuse its backing array, per the
+	// message pool send-ownership rule.
+	Frame  *protocol.Frame
+	Frames []*protocol.Frame
+	// singleFrame backs frameList for the common single-frame form so the
+	// multi-frame generalization does not add one slice allocation to every
+	// legacy send.
+	singleFrame     [1]*protocol.Frame
 	Destination     TransferPath
 	IntermediaryIds MultiHopId
 	// called (true) when the pack is ack'd, or (false) if not ack'd (closed before ack)
@@ -239,10 +271,19 @@ type SendPack struct {
 	EncryptionCompanion bool
 }
 
+// sendPackBatchMaxFrames / sendPackBatchMaxMessageByteCount bound
+// opportunistic sequence coalescing so the complete TransferFrame remains
+// below the platform and resident transport's 4 KiB message limit. Two mtu
+// packets plus the protobuf envelope fit; three do not. There is no batching
+// wait: the sequence only takes a second Pack when it is already queued.
+const sendPackBatchMaxFrames = 2
+const sendPackBatchMaxMessageByteCount = 3 * 1024
+
 type ReceivePack struct {
 	Source             TransferPath
 	SequenceId         Id
 	Pack               *protocol.Pack
+	decodedOwner       *decodedPackOwner
 	ReceiveCallback    ReceiveFunction
 	MessageByteCount   ByteCount
 	TransferFrameBytes []byte
@@ -263,6 +304,27 @@ type ReceivePack struct {
 	// wire companion hint, the decrypting session, or the EncryptedControl;
 	// defaults false. Keys the ReceiveSequence and its session.
 	EncryptionCompanion bool
+}
+
+func (self *ReceivePack) messagePoolReturn() {
+	if self == nil {
+		return
+	}
+	// Capture and clear the outer frame before releasing decodedOwner. In the
+	// owned hot path this ReceivePack is embedded in that owner, which can be
+	// taken and reset by another decoder as soon as release returns.
+	transferFrameBytes := self.TransferFrameBytes
+	self.TransferFrameBytes = nil
+	if self.decodedOwner != nil {
+		owner := self.decodedOwner
+		self.decodedOwner = nil
+		MessagePoolReturn(transferFrameBytes)
+		owner.release()
+		return
+	}
+	returnDecodedPackMessageBytes(self.Pack)
+	self.Pack = nil
+	MessagePoolReturn(transferFrameBytes)
 }
 
 type ForwardPack struct {
@@ -408,6 +470,9 @@ type Client struct {
 
 	receiveCallbacks *CallbackList[ReceiveFunction]
 	forwardCallbacks *CallbackList[ForwardFunction]
+	// Cached method value used by every ReceivePack. Constructing
+	// self.receive at the packet site allocates a closure per inbound pack.
+	receiveCallback ReceiveFunction
 
 	loopback chan *SendPack
 
@@ -483,6 +548,7 @@ func NewClientWithTag(
 		loopback:         make(chan *SendPack),
 		ready:            make(chan struct{}),
 	}
+	client.receiveCallback = client.receive
 
 	routeManager := NewRouteManagerWithLogger(ctx, clientTag, log)
 	contractManager := NewContractManager(ctx, client, settings.ContractManagerSettings)
@@ -778,6 +844,96 @@ func (self *Client) sendWithTimeout(
 	return success && err == nil
 }
 
+// frameList returns the pack's frames (the batch when set, else the single
+// frame, else empty for a contract-only pack)
+func (self *SendPack) frameList() []*protocol.Frame {
+	if self.Frames != nil {
+		return self.Frames
+	}
+	if self.Frame != nil {
+		self.singleFrame[0] = self.Frame
+		return self.singleFrame[:]
+	}
+	return nil
+}
+
+// returnFrames frees every frame's message bytes back to the pool
+func (self *SendPack) returnFrames() {
+	if self.Frames != nil {
+		for _, frame := range self.Frames {
+			MessagePoolReturn(frame.MessageBytes)
+		}
+	} else if self.Frame != nil {
+		MessagePoolReturn(self.Frame.MessageBytes)
+	}
+}
+
+// SendMultiWithTimeout sends a batch of frames as ONE wire Pack to
+// destination (one sequence number, one ack covering the batch). The frames
+// must share a destination and ack lifetime — the return egress path uses it
+// to coalesce a flow's socket-read batch, collapsing the per-frame
+// route/transport handoffs to one for the whole batch. ackCallback fires
+// once for the batch. Not a loopback path.
+//
+// Ownership follows the message pool send rule (see the message_pool.go
+// header): the send takes ownership of the frames' message bytes AND of the
+// `frames` slice itself, which the pack references asynchronously until the
+// sequence marshals it. The caller must not reuse the slice's backing array
+// after a successful send — build each batch in a fresh slice (or
+// share/copy to retain).
+func (self *Client) SendMultiWithTimeout(
+	frames []*protocol.Frame,
+	destination TransferPath,
+	ackCallback AckFunction,
+	timeout time.Duration,
+	opts ...any,
+) bool {
+	if len(frames) == 0 {
+		return true
+	}
+	if !destination.IsDestinationMask() {
+		panic(fmt.Errorf("Destination required for send: %s", destination))
+	}
+	if destination.IsStream() {
+		panic(fmt.Errorf("Destination must not be a stream: %s", destination))
+	}
+
+	select {
+	case <-self.ctx.Done():
+		return false
+	default:
+	}
+
+	ctx := self.ctx
+	transferOpts := self.settings.DefaultTransferOpts
+	for _, opt := range opts {
+		switch v := opt.(type) {
+		case TransferOptions:
+			transferOpts = v
+		case transferOptionsSetAck:
+			transferOpts.Ack = v.Ack
+		case transferOptionsSetForceStream:
+			transferOpts.ForceStream = v.ForceStream
+		case transferOptionsSetCompanionContract:
+			transferOpts.CompanionContract = v.CompanionContract
+		case transferCtx:
+			ctx = v.Ctx
+		}
+	}
+
+	sendPack := &SendPack{
+		TransferOptions:     transferOpts,
+		Frames:              frames,
+		Destination:         destination,
+		AckCallback:         ackCallback,
+		MessageByteCount:    MessageByteCount(frames),
+		Ctx:                 ctx,
+		EncryptionCompanion: transferOpts.CompanionContract,
+	}
+	success, err := self.sendBuffer.Pack(sendPack, timeout)
+	return success && err == nil
+}
+
 func (self *Client) sendWithTimeoutDetailed(
 	frame *protocol.Frame,
 	destination TransferPath,
@@ -1028,11 +1184,11 @@ func (self *Client) run() {
 				return
 			case sendPack := <-self.loopback:
 				func() {
-					defer MessagePoolReturn(sendPack.Frame.MessageBytes)
+					defer sendPack.returnFrames()
 					HandleError(func() {
 						self.receive(
 							SourceId(self.clientId),
-							[]*protocol.Frame{sendPack.Frame},
+							sendPack.frameList(),
 							Peer{ProvideMode: protocol.ProvideMode_Network},
 						)
 						safeAck(sendPack.AckCallback, nil)
@@ -1096,15 +1252,17 @@ func (self *Client) run() {
 		if path.DestinationId == self.clientId {
 			// the transports have typically not parsed the full `TransferFrame`
 			// on error, discard the message and report the peer
-			transferFrame := &protocol.TransferFrame{}
+			decodedFrame := inboundDecodedTransferFrames.take()
+			transferFrame := &decodedFrame.frame
 			// hand-rolled copy-safe decode (no reflection); skips the outer
 			// transfer_path (routing already parsed it via FilteredTransferPath)
 			// and the deprecated message_type. See frame_protobuf.go.
-			if !unmarshalTransferFrame(transferFrameBytes, transferFrame, false) {
+			if !unmarshalOwnedTransferFrame(transferFrameBytes, decodedFrame, false) {
 				// bad protobuf
 				updatePeerAudit(source, func(a *PeerAudit) {
 					a.badMessage(ByteCount(len(transferFrameBytes)))
 				})
+				inboundDecodedTransferFrames.put(decodedFrame)
 				MessagePoolReturn(transferFrameBytes)
 				continue
 			}
@@ -1149,22 +1307,26 @@ func (self *Client) run() {
 					if self.log.V(1).Enabled() {
 						self.log.Infof("[cr]unwrap err = %s\n", err)
 					}
+					inboundDecodedTransferFrames.put(decodedFrame)
 					MessagePoolReturn(transferFrameBytes)
 					continue
 				}
 				receiveRole = decryptRole
 				receiveCompanion = decryptCompanion
-				unwrappedTransferFrame := &protocol.TransferFrame{}
 				// inner frame: decode the path too — it is tamper-checked against
 				// the routing path below.
-				if !unmarshalTransferFrame(unwrappedTransferFrameBytes, unwrappedTransferFrame, true) {
+				innerDecodedFrame := inboundDecodedTransferFrames.take()
+				if !unmarshalOwnedTransferFrame(unwrappedTransferFrameBytes, innerDecodedFrame, true) {
 					updatePeerAudit(source, func(a *PeerAudit) {
 						a.badMessage(ByteCount(len(transferFrameBytes)))
 					})
+					inboundDecodedTransferFrames.put(decodedFrame)
+					inboundDecodedTransferFrames.put(innerDecodedFrame)
 					MessagePoolReturn(transferFrameBytes)
 					MessagePoolReturn(unwrappedTransferFrameBytes)
 					continue
 				}
+				unwrappedTransferFrame := &innerDecodedFrame.frame
 				// the inner TransferPath is AEAD-authenticated; the outer
 				// is only the routing hint. A mismatch implies tampering
 				// in flight or a routing/sender bug. Drop and audit.
@@ -1176,12 +1338,16 @@ func (self *Client) run() {
 					updatePeerAudit(source, func(a *PeerAudit) {
 						a.badMessage(ByteCount(len(transferFrameBytes)))
 					})
+					inboundDecodedTransferFrames.put(decodedFrame)
+					inboundDecodedTransferFrames.put(innerDecodedFrame)
 					MessagePoolReturn(transferFrameBytes)
 					MessagePoolReturn(unwrappedTransferFrameBytes)
 					continue
 				}
+				inboundDecodedTransferFrames.put(decodedFrame)
 				MessagePoolReturn(transferFrameBytes)
 				transferFrameBytes = unwrappedTransferFrameBytes
+				decodedFrame = innerDecodedFrame
 				transferFrame = unwrappedTransferFrame
 			}
 
@@ -1216,6 +1382,7 @@ func (self *Client) run() {
 						updatePeerAudit(source, func(a *PeerAudit) {
 							a.badMessage(ByteCount(len(transferFrameBytes)))
 						})
+						inboundDecodedTransferFrames.put(decodedFrame)
 						MessagePoolReturn(transferFrameBytes)
 						continue
 					}
@@ -1227,6 +1394,7 @@ func (self *Client) run() {
 						updatePeerAudit(source, func(a *PeerAudit) {
 							a.badMessage(ByteCount(len(transferFrameBytes)))
 						})
+						inboundDecodedTransferFrames.put(decodedFrame)
 						MessagePoolReturn(transferFrameBytes)
 						continue
 					}
@@ -1235,9 +1403,30 @@ func (self *Client) run() {
 					updatePeerAudit(source, func(a *PeerAudit) {
 						a.badMessage(ByteCount(len(transferFrameBytes)))
 					})
+					inboundDecodedTransferFrames.put(decodedFrame)
 					MessagePoolReturn(transferFrameBytes)
 					continue
 				}
+				// The v1 carrier bytes were pooled by the outer decoder only
+				// for this synchronous inner unmarshal. The resulting ack/pack
+				// owns its own proto-decoded fields.
+				returnDecodedFrameMessageBytes(frame)
+				transferFrame.Frame = nil
+			}
+
+			// TransferFrame carries exactly one data-plane body. Rejecting both
+			// absent closes a buffer leak on malformed input; rejecting both
+			// present avoids handing the same owned wire buffer to two consumers.
+			if (ack == nil) == (pack == nil) {
+				updatePeerAudit(source, func(a *PeerAudit) {
+					a.badMessage(ByteCount(len(transferFrameBytes)))
+				})
+				if decodedFrame.packOwner == nil {
+					returnDecodedPackMessageBytes(pack)
+				}
+				inboundDecodedTransferFrames.put(decodedFrame)
+				MessagePoolReturn(transferFrameBytes)
+				continue
 			}
 
 			if ack != nil {
@@ -1257,11 +1446,17 @@ func (self *Client) run() {
 				} else {
 					c()
 				}
+				inboundDecodedTransferFrames.put(decodedFrame)
+				continue
 			}
-			if pack != nil {
+			{
 				sequenceId, err := IdFromBytes(pack.SequenceId)
 				if err != nil {
 					// bad protobuf
+					if decodedFrame.packOwner == nil {
+						returnDecodedPackMessageBytes(pack)
+					}
+					inboundDecodedTransferFrames.put(decodedFrame)
 					MessagePoolReturn(transferFrameBytes)
 					continue
 				}
@@ -1327,20 +1522,29 @@ func (self *Client) run() {
 					}
 				}
 				messageByteCount := MessageByteCount(pack.Frames)
+				decodedOwner := decodedFrame.detachPackOwner()
 				c := func() bool {
-					success, err := self.receiveBuffer.Pack(&ReceivePack{
+					var receivePack *ReceivePack
+					if decodedOwner != nil {
+						receivePack = &decodedOwner.receivePack
+					} else {
+						receivePack = &ReceivePack{}
+					}
+					*receivePack = ReceivePack{
 						Source:              source,
 						SequenceId:          sequenceId,
 						Pack:                pack,
-						ReceiveCallback:     self.receive,
+						decodedOwner:        decodedOwner,
+						ReceiveCallback:     self.receiveCallback,
 						MessageByteCount:    messageByteCount,
 						TransferFrameBytes:  transferFrameBytes,
 						Unwrapped:           unwrapped,
 						EncryptionRole:      receiveRole,
 						EncryptionCompanion: receiveCompanion,
-					}, self.settings.BufferTimeout)
+					}
+					success, err := self.receiveBuffer.Pack(receivePack, self.settings.BufferTimeout)
 					if !success {
-						MessagePoolReturn(transferFrameBytes)
+						receivePack.messagePoolReturn()
 					}
 					return success && err == nil
 				}
@@ -1352,6 +1556,7 @@ func (self *Client) run() {
 				} else {
 					c()
 				}
+				inboundDecodedTransferFrames.put(decodedFrame)
 			}
 		} else {
 			c := func() {
@@ -1498,8 +1703,12 @@ type SendBufferSettings struct {
 	CreateContractRetryMaxInterval time.Duration
 
 	// resend timeout is the initial time between successive send attempts. Does linear backoff
-	MinResendInterval time.Duration
-	MaxResendInterval time.Duration
+	// MinResendInterval is the resend floor while no rtt samples exist (the
+	// cold floor); RttMinResendInterval is the floor once the path rtt is
+	// measured (0 = keep the cold floor for sampled paths too).
+	MinResendInterval    time.Duration
+	RttMinResendInterval time.Duration
+	MaxResendInterval    time.Duration
 	// ResendBackoffScale float32
 
 	RttScale         float32
@@ -1877,7 +2086,15 @@ type SendSequence struct {
 	// these contracts are waiting for acks to close
 	openSendContracts map[Id]*sequenceContract
 
-	packMutex sync.Mutex
+	// packMutex protects packs from Close and coordinates the idle-close
+	// checkpoint. Pack only needs a read lock: multiple callers must be able
+	// to wait on the bounded queue independently. With an exclusive lock, one
+	// application send using an infinite timeout could hold the mutex while
+	// the queue was full, preventing a finite-time liveness probe behind it
+	// from observing its own timeout. That hid a route-full condition
+	// indefinitely. Close takes the write lock after canceling the sequence,
+	// which wakes every blocked Pack before the channel is closed.
+	packMutex sync.RWMutex
 	packs     chan *SendPack
 	ackMutex  sync.Mutex
 	acks      chan *protocol.Ack
@@ -1921,6 +2138,7 @@ func NewSendSequence(
 		sendBufferSettings.RttWindowTimeout,
 		sendBufferSettings.RttScale,
 		sendBufferSettings.MinResendInterval,
+		sendBufferSettings.RttMinResendInterval,
 		sendBufferSettings.MaxResendInterval,
 	)
 
@@ -1988,8 +2206,8 @@ func (self *SendSequence) ResendQueueSizeAndMessageTypes() (int, ByteCount, Id, 
 
 // success, error
 func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool, error) {
-	self.packMutex.Lock()
-	defer self.packMutex.Unlock()
+	self.packMutex.RLock()
+	defer self.packMutex.RUnlock()
 
 	select {
 	case <-sendPack.Ctx.Done():
@@ -2171,11 +2389,11 @@ func (self *SendSequence) Run() {
 				}
 				if messageId, err := IdFromBytes(ack.MessageId); err == nil {
 					if sequenceNumber, ok := self.resendQueue.ContainsMessageId(messageId); ok {
-						ack := &sequenceAck{
+						ack := sequenceAck{
 							messageId:      messageId,
 							sequenceNumber: sequenceNumber,
 							selective:      ack.Selective,
-							tag:            ack.Tag,
+							tag:            sequenceTagFromProtocol(ack.Tag),
 						}
 						ackWindow.Update(ack)
 					}
@@ -2190,6 +2408,8 @@ func (self *SendSequence) Run() {
 	idleTimer := time.NewTimer(0)
 	defer idleTimer.Stop()
 
+	var pendingSendPack *SendPack
+	packsClosed := false
 	for {
 		// apply the acks
 		ackSnapshot := ackWindow.Snapshot(true)
@@ -2352,18 +2572,89 @@ func (self *SendSequence) Run() {
 					return false
 				}
 
+				sendPacks := [sendPackBatchMaxFrames]*SendPack{sendPack}
+				sendPackCount := 1
+				frameCount := len(sendPack.frameList())
+				messageByteCount := sendPack.MessageByteCount
+
+				// Opportunistically take one compatible Pack that is already
+				// queued. This adds no latency to a lone packet and amortizes
+				// one sequence number, marshal, route write, and transport
+				// wake across two packets under load. A consumed incompatible
+				// Pack is kept pending so order is preserved.
+				if frameCount < sendPackBatchMaxFrames {
+					select {
+					case nextSendPack, nextOk := <-self.packs:
+						if !nextOk {
+							packsClosed = true
+						} else {
+							nextFrameCount := len(nextSendPack.frameList())
+							nextMessageByteCount := messageByteCount + nextSendPack.MessageByteCount
+							contractSafe := self.client.ContractManager().SendNoContract(self.destination.DestinationId) ||
+								(self.sendContract != nil &&
+									self.sendContractAcked &&
+									0 < len(self.sendItems) &&
+									self.sendContract.canUpdate(nextMessageByteCount))
+							compatible := sendPack.Ack == nextSendPack.Ack &&
+								sendPack.ForceUnwrapped == nextSendPack.ForceUnwrapped &&
+								frameCount+nextFrameCount <= sendPackBatchMaxFrames &&
+								nextMessageByteCount <= sendPackBatchMaxMessageByteCount &&
+								contractSafe
+							if compatible {
+								sendPacks[sendPackCount] = nextSendPack
+								sendPackCount += 1
+								frameCount += nextFrameCount
+								messageByteCount = nextMessageByteCount
+							} else {
+								pendingSendPack = nextSendPack
+							}
+						}
+					default:
+					}
+				}
+
 				// note messages of `size < MinMessageByteCount` get counted as `MinMessageByteCount` against the contract
-				if self.updateContract(sendPack.MessageByteCount) {
-					self.send(sendPack.Frame, sendPack.AckCallback, sendPack.Ack, sendPack.ForceUnwrapped)
+				if self.updateContract(messageByteCount) {
+					if sendPackCount == 1 {
+						self.send(sendPack.frameList(), sendPack.AckCallback, sendPack.Ack, sendPack.ForceUnwrapped)
+					} else {
+						frames := make([]*protocol.Frame, 0, frameCount)
+						ackCallbacks := make([]AckFunction, 0, sendPackCount)
+						for i := range sendPackCount {
+							frames = append(frames, sendPacks[i].frameList()...)
+							ackCallbacks = append(ackCallbacks, sendPacks[i].AckCallback)
+						}
+						self.send(
+							frames,
+							func(err error) {
+								for _, ackCallback := range ackCallbacks {
+									safeAck(ackCallback, err)
+								}
+							},
+							sendPack.Ack,
+							sendPack.ForceUnwrapped,
+						)
+					}
 					// ignore the error since there will be a retry
-					return true
+					return !packsClosed
 				}
 				// no contract
 				// close the sequence
 				self.log.Errorf("[s]%s->%s...%s s(%s) exit could not create contract.\n", self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId)
-				safeAck(sendPack.AckCallback, errors.New("No contract"))
-				MessagePoolReturn(sendPack.Frame.MessageBytes)
+				for i := range sendPackCount {
+					safeAck(sendPacks[i].AckCallback, errors.New("No contract"))
+					sendPacks[i].returnFrames()
+				}
 				return false
+			}
+
+			if pendingSendPack != nil {
+				sendPack := pendingSendPack
+				pendingSendPack = nil
+				if !processPack(sendPack, true) {
+					return
+				}
+				continue
 			}
 
 			// fast path without arming a timer
@@ -2664,16 +2955,16 @@ func (self *SendSequence) setContractAcked(nextSendContract *sequenceContract, a
 }
 
 func (self *SendSequence) send(
-	frame *protocol.Frame,
+	frames []*protocol.Frame,
 	ackCallback AckFunction,
 	ack bool,
 	forceUnwrapped bool,
 ) {
-	self.sendWithSetContract(frame, ackCallback, ack, false, forceUnwrapped)
+	self.sendWithSetContract(frames, ackCallback, ack, false, forceUnwrapped)
 }
 
 func (self *SendSequence) sendWithSetContract(
-	frame *protocol.Frame,
+	sendFrames []*protocol.Frame,
 	ackCallback AckFunction,
 	ack bool,
 	setContract bool,
@@ -2715,10 +3006,7 @@ func (self *SendSequence) sendWithSetContract(
 		defer MessagePoolReturn(contractMessageBytes)
 	}
 
-	frames := []*protocol.Frame{}
-	if frame != nil {
-		frames = append(frames, frame)
-	}
+	frames := sendFrames
 	defer func() {
 		for _, frame := range frames {
 			MessagePoolReturn(frame.MessageBytes)
@@ -2945,7 +3233,7 @@ func (self *SendSequence) setTag(item *sendItem) ([]byte, error) {
 }
 */
 
-func (self *SendSequence) receiveAck(messageId Id, selective bool, tag *protocol.Tag) {
+func (self *SendSequence) receiveAck(messageId Id, selective bool, tag sequenceTag) {
 	item := self.resendQueue.GetByMessageId(messageId)
 	if item == nil {
 		if self.log.V(1).Enabled() {
@@ -2955,8 +3243,8 @@ func (self *SendSequence) receiveAck(messageId Id, selective bool, tag *protocol
 		return
 	}
 
-	if tag != nil {
-		self.rttWindow.CloseTag(tag)
+	if tag.set {
+		self.rttWindow.CloseSendTime(tag.sendTime)
 	}
 
 	if selective {
@@ -3100,16 +3388,14 @@ func (self *SendSequence) writeMaybeWrappedBytes(transferFrameBytes []byte, path
 	if err := self.verifyPeerCertAgainstContract(); err != nil {
 		return err
 	}
-	ciphertext, err := cipher.Seal(transferFrameBytes)
+	wrapped, err := cipher.SealOuterFrame(
+		path,
+		transferFrameBytes,
+		self.session.role.toProtobuf(),
+		self.session.companion,
+	)
 	if err != nil {
 		return fmt.Errorf("outer wrap seal: %w", err)
-	}
-	// Carry the wrapping session's role + companion as the destination's
-	// decrypt hint; the destination routes to its complement role / matching
-	// companion session.
-	wrapped, err := buildEncryptedOuterFrameBytes(path, ciphertext, self.session.role.toProtobuf(), self.session.companion)
-	if err != nil {
-		return fmt.Errorf("outer wrap marshal: %w", err)
 	}
 	// guard the V(2) diagnostic: this is the per-packet wrapped write path; see
 	// the plaintext branch above for why the disabled-level call still allocates.
@@ -3260,7 +3546,7 @@ func (self *SendSequence) Close() {
 					return
 				}
 				safeAck(sendPack.AckCallback, errors.New("Send sequence closed."))
-				MessagePoolReturn(sendPack.Frame.MessageBytes)
+				sendPack.returnFrames()
 			default:
 				return
 			}
@@ -3455,7 +3741,7 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 				if self.log.V(2).Enabled() {
 					self.log.Infof("[r]drop older sequence %s < %s\n", receivePack.SequenceId, headReceiveSequenceId.SequenceId)
 				}
-				MessagePoolReturn(receivePack.TransferFrameBytes)
+				receivePack.messagePoolReturn()
 				return nil
 			} else {
 				// newer sequence for source
@@ -3808,7 +4094,7 @@ func (self *ReceiveSequence) Run() {
 		multiRouteWriter := self.client.RouteManager().OpenMultiRouteWriter(self.source.Reverse())
 		defer self.client.RouteManager().CloseMultiRouteWriter(multiRouteWriter)
 
-		writeAck := func(sendAck *sequenceAck) {
+		writeAck := func(sendAck sequenceAck) {
 			path := self.source.Reverse().AddSource(self.client.ClientId())
 
 			var transferFrameBytes []byte
@@ -3816,11 +4102,12 @@ func (self *ReceiveSequence) Run() {
 				// hand-rolled marshal of the hot Ack TransferFrame; wire-identical
 				// to the proto structs in the legacy branch (see frame_protobuf_test.go).
 				saf := sendAckFrame{
-					path:       path,
-					messageId:  sendAck.messageId,
-					sequenceId: self.sequenceId,
-					selective:  sendAck.selective,
-					tag:        sendAck.tag,
+					path:        path,
+					messageId:   sendAck.messageId,
+					sequenceId:  self.sequenceId,
+					selective:   sendAck.selective,
+					tagSendTime: sendAck.tag.sendTime,
+					tagSet:      sendAck.tag.set,
 				}
 				transferFrameBytes = marshalSendAckTransferFrame(&saf)
 			} else {
@@ -3828,7 +4115,7 @@ func (self *ReceiveSequence) Run() {
 					MessageId:  sendAck.messageId.Bytes(),
 					SequenceId: self.sequenceId.Bytes(),
 					Selective:  sendAck.selective,
-					Tag:        sendAck.tag,
+					Tag:        sendAck.tag.protocol(),
 				}
 				ackBytes, _ := ProtoMarshal(ack)
 				defer MessagePoolReturn(ackBytes)
@@ -3867,16 +4154,14 @@ func (self *ReceiveSequence) Run() {
 					}
 					return writeErr
 				}
-				ciphertext, sealErr := cipher.Seal(transferFrameBytes)
+				wrapped, sealErr := cipher.SealOuterFrame(
+					path,
+					transferFrameBytes,
+					self.session.role.toProtobuf(),
+					self.session.companion,
+				)
 				if sealErr != nil {
 					return fmt.Errorf("ack outer wrap seal: %w", sealErr)
-				}
-				// Carry our receive session's role + companion as the peer's
-				// decrypt hint (it routes to the complement of our role / the
-				// matching companion on its side).
-				wrapped, marshalErr := buildEncryptedOuterFrameBytes(path, ciphertext, self.session.role.toProtobuf(), self.session.companion)
-				if marshalErr != nil {
-					return fmt.Errorf("ack outer wrap marshal: %w", marshalErr)
 				}
 				defer MessagePoolReturn(wrapped)
 				shared := MessagePoolShareReadOnly(wrapped)
@@ -3947,13 +4232,9 @@ func (self *ReceiveSequence) Run() {
 				writeAck(ackSnapshot.headAck)
 			}
 			for messageId, ack := range ackSnapshot.selectiveAcks {
-				writeAck(&sequenceAck{
-					messageId:      messageId,
-					sequenceNumber: ack.sequenceNumber,
-					selective:      true,
-					tag:            ack.tag,
-					unwrapped:      ack.unwrapped,
-				})
+				ack.messageId = messageId
+				ack.selective = true
+				writeAck(ack)
 			}
 		}
 	}, self.cancel)
@@ -4015,8 +4296,9 @@ func (self *ReceiveSequence) Run() {
 				} else {
 					// this item is a resend of a previous item
 					if item.ack {
-						self.sendAck(item.sequenceNumber, item.messageId, false, nil, item.unwrapped)
+						self.sendAck(item.sequenceNumber, item.messageId, false, sequenceTag{}, item.unwrapped)
 					}
+					item.messagePoolReturn()
 				}
 			}
 		}
@@ -4035,7 +4317,7 @@ func (self *ReceiveSequence) Run() {
 					self.peerAudit.Update(func(a *PeerAudit) {
 						a.badMessage(receivePack.MessageByteCount)
 					})
-					MessagePoolReturn(receivePack.TransferFrameBytes)
+					receivePack.messagePoolReturn()
 					return false
 				} else if !received {
 					if self.log.V(1).Enabled() {
@@ -4045,7 +4327,7 @@ func (self *ReceiveSequence) Run() {
 					self.peerAudit.Update(func(a *PeerAudit) {
 						a.discard(receivePack.MessageByteCount)
 					})
-					MessagePoolReturn(receivePack.TransferFrameBytes)
+					receivePack.messagePoolReturn()
 				}
 
 				// note messages of `size < MinMessageByteCount` get counted as `MinMessageByteCount` against the contract
@@ -4058,7 +4340,7 @@ func (self *ReceiveSequence) Run() {
 					self.peerAudit.Update(func(a *PeerAudit) {
 						a.badMessage(receivePack.MessageByteCount)
 					})
-					MessagePoolReturn(receivePack.TransferFrameBytes)
+					receivePack.messagePoolReturn()
 					return false
 				} else if !received {
 					if self.log.V(1).Enabled() {
@@ -4068,7 +4350,7 @@ func (self *ReceiveSequence) Run() {
 					self.peerAudit.Update(func(a *PeerAudit) {
 						a.discard(receivePack.MessageByteCount)
 					})
-					MessagePoolReturn(receivePack.TransferFrameBytes)
+					receivePack.messagePoolReturn()
 				}
 			}
 			return true
@@ -4119,8 +4401,8 @@ func (self *ReceiveSequence) Run() {
 	}
 }
 
-func (self *ReceiveSequence) sendAck(sequenceNumber uint64, messageId Id, selective bool, tag *protocol.Tag, unwrapped bool) {
-	ack := &sequenceAck{
+func (self *ReceiveSequence) sendAck(sequenceNumber uint64, messageId Id, selective bool, tag sequenceTag, unwrapped bool) {
+	ack := sequenceAck{
 		sequenceNumber: sequenceNumber,
 		messageId:      messageId,
 		selective:      selective,
@@ -4144,7 +4426,13 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 	}
 
 	// note the receive contract is the contract active when this is at the head of the queue
-	item := &receiveItem{
+	var item *receiveItem
+	if receivePack.decodedOwner != nil {
+		item = &receivePack.decodedOwner.receiveItem
+	} else {
+		item = &receiveItem{}
+	}
+	*item = receiveItem{
 		transferItem: transferItem{
 			messageId:        messageId,
 			sequenceNumber:   sequenceNumber,
@@ -4158,7 +4446,8 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 		receiveCallback:    receivePack.ReceiveCallback,
 		head:               receivePack.Pack.Head,
 		ack:                !receivePack.Pack.Nack,
-		tag:                receivePack.Pack.Tag,
+		tag:                sequenceTagFromProtocol(receivePack.Pack.Tag),
+		decodedOwner:       receivePack.decodedOwner,
 		transferFrameBytes: receivePack.TransferFrameBytes,
 		unwrapped:          receivePack.Unwrapped,
 	}
@@ -4217,7 +4506,7 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 			}
 			// this item is a resend of a previous item
 			if item.ack {
-				self.sendAck(sequenceNumber, messageId, false, nil, item.unwrapped)
+				self.sendAck(sequenceNumber, messageId, false, sequenceTag{}, item.unwrapped)
 			}
 			return false, nil
 		}
@@ -4280,7 +4569,13 @@ func (self *ReceiveSequence) receiveNack(receivePack *ReceivePack) (bool, error)
 		return false, nil
 	}
 
-	item := &receiveItem{
+	var item *receiveItem
+	if receivePack.decodedOwner != nil {
+		item = &receivePack.decodedOwner.receiveItem
+	} else {
+		item = &receiveItem{}
+	}
+	*item = receiveItem{
 		transferItem: transferItem{
 			messageId:        messageId,
 			sequenceNumber:   sequenceNumber,
@@ -4293,7 +4588,8 @@ func (self *ReceiveSequence) receiveNack(receivePack *ReceivePack) (bool, error)
 		receiveCallback:    receivePack.ReceiveCallback,
 		head:               receivePack.Pack.Head,
 		ack:                !receivePack.Pack.Nack,
-		tag:                receivePack.Pack.Tag,
+		tag:                sequenceTagFromProtocol(receivePack.Pack.Tag),
+		decodedOwner:       receivePack.decodedOwner,
 		transferFrameBytes: receivePack.TransferFrameBytes,
 	}
 
@@ -4568,7 +4864,7 @@ func (self *ReceiveSequence) Close() {
 				if !ok {
 					return
 				}
-				MessagePoolReturn(receivePack.TransferFrameBytes)
+				receivePack.messagePoolReturn()
 			default:
 				return
 			}
@@ -4596,7 +4892,8 @@ type receiveItem struct {
 	contractFrame      *protocol.Frame
 	receiveCallback    ReceiveFunction
 	ack                bool
-	tag                *protocol.Tag
+	tag                sequenceTag
+	decodedOwner       *decodedPackOwner
 	transferFrameBytes []byte
 	// unwrapped is true when the originating TransferFrame arrived on
 	// the wire as plaintext (no outer encrypted wrap). Propagated into
@@ -4605,21 +4902,25 @@ type receiveItem struct {
 }
 
 func (self *receiveItem) messagePoolReturn() {
-	MessagePoolReturn(self.transferFrameBytes)
-	// note frames and contractFrame are slices/shared bytes of the transfer frame bytes
-	// we expect these both to be false
-	// for _, frame := range self.frames {
-	// 	r := MessagePoolReturn(frame.MessageBytes)
-	// 	if r {
-	// 		self.log.Warningf("[ri]frame was not shared]\n")
-	// 	}
-	// }
-	// if self.contractFrame != nil {
-	// 	r := MessagePoolReturn(self.contractFrame.MessageBytes)
-	// 	if r {
-	// 		self.log.Warningf("[ri]contract frame was not shared]\n")
-	// 	}
-	// }
+	// Like ReceivePack, the owned hot-path item is embedded in decodedOwner.
+	// Return the independent outer frame before releasing the owner so this
+	// method never touches storage that may already have been reused.
+	transferFrameBytes := self.transferFrameBytes
+	self.transferFrameBytes = nil
+	if self.decodedOwner != nil {
+		owner := self.decodedOwner
+		self.decodedOwner = nil
+		MessagePoolReturn(transferFrameBytes)
+		owner.release()
+		return
+	}
+	for _, frame := range self.frames {
+		returnDecodedFrameMessageBytes(frame)
+	}
+	returnDecodedFrameMessageBytes(self.contractFrame)
+	self.frames = nil
+	self.contractFrame = nil
+	MessagePoolReturn(transferFrameBytes)
 }
 
 // ordered by sequenceNumber
@@ -4639,11 +4940,34 @@ func newReceiveQueue(budget *TransferMemoryBudget, minByteCount ByteCount) *rece
 	return queue
 }
 
+type sequenceTag struct {
+	sendTime uint64
+	set      bool
+}
+
+func sequenceTagFromProtocol(tag *protocol.Tag) sequenceTag {
+	if tag == nil {
+		return sequenceTag{}
+	}
+	// Retain only the wire value. A generated protobuf message contains
+	// protoimpl.MessageState (including synchronization state) and must not be
+	// copied through ACK-window values/snapshots. Tag currently has one field,
+	// so this is also the minimal, lifetime-independent representation.
+	return sequenceTag{sendTime: tag.SendTime, set: true}
+}
+
+func (tag *sequenceTag) protocol() *protocol.Tag {
+	if tag == nil || !tag.set {
+		return nil
+	}
+	return &protocol.Tag{SendTime: tag.sendTime}
+}
+
 type sequenceAck struct {
 	sequenceNumber uint64
 	messageId      Id
 	selective      bool
-	tag            *protocol.Tag
+	tag            sequenceTag
 	// unwrapped is true when any pack covered by this ack arrived on
 	// the wire as plaintext. The ack writer mirrors that state — a
 	// plaintext-acked window emits a plaintext ack — so peers whose
@@ -4654,33 +4978,36 @@ type sequenceAck struct {
 
 type sequenceAckWindowSnapshot struct {
 	ackNotify      <-chan struct{}
-	headAck        *sequenceAck
+	headAck        sequenceAck
 	ackUpdateCount int
-	selectiveAcks  map[Id]*sequenceAck
+	selectiveAcks  map[Id]sequenceAck
 }
 
 type sequenceAckWindow struct {
-	ackMonitor     *Monitor
+	// There is exactly one Snapshot consumer per receive sequence. A
+	// capacity-one signal coalesces any number of updates while that consumer
+	// is running and avoids allocating/closing a broadcast channel per packet.
+	ackNotify      chan struct{}
 	ackLock        sync.Mutex
-	headAck        *sequenceAck
+	headAck        sequenceAck
+	hasHeadAck     bool
 	ackUpdateCount int
-	selectiveAcks  map[Id]*sequenceAck
+	selectiveAcks  map[Id]sequenceAck
 }
 
 func newSequenceAckWindow() *sequenceAckWindow {
 	return &sequenceAckWindow{
-		ackMonitor:     NewMonitor(),
-		headAck:        nil,
+		ackNotify:      make(chan struct{}, 1),
 		ackUpdateCount: 0,
-		selectiveAcks:  map[Id]*sequenceAck{},
+		selectiveAcks:  map[Id]sequenceAck{},
 	}
 }
 
-func (self *sequenceAckWindow) Update(ack *sequenceAck) {
+func (self *sequenceAckWindow) Update(ack sequenceAck) {
 	self.ackLock.Lock()
 	defer self.ackLock.Unlock()
 
-	if self.headAck == nil || self.headAck.sequenceNumber < ack.sequenceNumber {
+	if !self.hasHeadAck || self.headAck.sequenceNumber < ack.sequenceNumber {
 		if ack.selective {
 			if prior, ok := self.selectiveAcks[ack.messageId]; ok && prior.unwrapped {
 				// coalesced selective ack for the same message: preserve
@@ -4695,7 +5022,7 @@ func (self *sequenceAckWindow) Update(ack *sequenceAck) {
 			// single plaintext pack anywhere under the head keeps the
 			// ack plaintext. Selective acks at or below the new head are
 			// already dropped by the Snapshot pass.
-			if self.headAck != nil && self.headAck.unwrapped {
+			if self.hasHeadAck && self.headAck.unwrapped {
 				ack.unwrapped = true
 			}
 			if !ack.unwrapped {
@@ -4708,26 +5035,26 @@ func (self *sequenceAckWindow) Update(ack *sequenceAck) {
 			}
 			self.ackUpdateCount += 1
 			self.headAck = ack
+			self.hasHeadAck = true
 			// no need to clean up `selectiveAcks` here
 			// selective acks with sequence number <= head are ignored in a final pass during update
 		}
 	} else {
 		// past the head
 		// resend the head — fold this late ack's plaintext bit into the
-		// head so the resend covers it. Copy-on-write: a prior Snapshot
-		// may have published the current `headAck` pointer to writeAck,
-		// which reads `unwrapped` without holding ackLock, so mutating
-		// the struct in place would race. Swap in a fresh copy with the
-		// bit set instead.
-		if ack.unwrapped && self.headAck != nil && !self.headAck.unwrapped {
-			updated := *self.headAck
-			updated.unwrapped = true
-			self.headAck = &updated
+		// head so the resend covers it. Snapshots copy the value, so the
+		// internal value can be updated under ackLock without a published
+		// pointer or copy-on-write allocation.
+		if ack.unwrapped && self.hasHeadAck && !self.headAck.unwrapped {
+			self.headAck.unwrapped = true
 		}
 		self.ackUpdateCount += 1
 	}
 
-	self.ackMonitor.NotifyAll()
+	select {
+	case self.ackNotify <- struct{}{}:
+	default:
+	}
 }
 
 // Snapshot is returned by value: it is consumed immediately by the caller and
@@ -4740,12 +5067,12 @@ func (self *sequenceAckWindow) Snapshot(reset bool) sequenceAckWindowSnapshot {
 
 	// build the selective-ack copy lazily so the common in-order case (a
 	// cumulative head ack with no selective acks) allocates no map.
-	var selectiveAcksAfterHead map[Id]*sequenceAck
+	var selectiveAcksAfterHead map[Id]sequenceAck
 	if 0 < self.ackUpdateCount {
 		for messageId, ack := range self.selectiveAcks {
 			if self.headAck.sequenceNumber < ack.sequenceNumber {
 				if selectiveAcksAfterHead == nil {
-					selectiveAcksAfterHead = map[Id]*sequenceAck{}
+					selectiveAcksAfterHead = map[Id]sequenceAck{}
 				}
 				selectiveAcksAfterHead[messageId] = ack
 			}
@@ -4755,7 +5082,7 @@ func (self *sequenceAckWindow) Snapshot(reset bool) sequenceAckWindowSnapshot {
 	}
 
 	snapshot := sequenceAckWindowSnapshot{
-		ackNotify:      self.ackMonitor.NotifyChannel(),
+		ackNotify:      self.ackNotify,
 		headAck:        self.headAck,
 		ackUpdateCount: self.ackUpdateCount,
 		selectiveAcks:  selectiveAcksAfterHead,
@@ -4766,6 +5093,13 @@ func (self *sequenceAckWindow) Snapshot(reset bool) sequenceAckWindowSnapshot {
 		// instead of allocating a fresh map; the caller holds only a copy.
 		self.ackUpdateCount = 0
 		clear(self.selectiveAcks)
+		// The signal corresponds to state included in this snapshot. Drain it
+		// while ackLock excludes Update so the next empty snapshot cannot wake
+		// on a stale token.
+		select {
+		case <-self.ackNotify:
+		default:
+		}
 	}
 
 	return snapshot
@@ -4900,7 +5234,7 @@ func newSequenceContract(log Logger, tag string, contract *protocol.Contract, mi
 func (self *sequenceContract) update(byteCount ByteCount) bool {
 	effectiveByteCount := max(self.minUpdateByteCount, byteCount)
 
-	if self.effectiveTransferByteCount < self.ackedByteCount+self.unackedByteCount+effectiveByteCount {
+	if !self.canUpdate(byteCount) {
 		// doesn't fit in contract
 		// if self.log.V(1).Enabled() {
 		self.log.Infof(
@@ -4933,6 +5267,15 @@ func (self *sequenceContract) update(byteCount ByteCount) bool {
 		)
 	}
 	return true
+}
+
+// canUpdate reports whether byteCount can be debited without mutating the
+// contract. The send sequence uses it before coalescing queued Packs: a batch
+// must not cross a contract boundary, because a newly attached contract frame
+// can push an otherwise-small batch over the transport message limit.
+func (self *sequenceContract) canUpdate(byteCount ByteCount) bool {
+	effectiveByteCount := max(self.minUpdateByteCount, byteCount)
+	return self.ackedByteCount+self.unackedByteCount+effectiveByteCount <= self.effectiveTransferByteCount
 }
 
 func (self *sequenceContract) ack(byteCount ByteCount) {

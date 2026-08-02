@@ -107,13 +107,13 @@ func runMultiClientPoolCycle(ctx context.Context, t *testing.T) {
 
 	multiSettings := DefaultMultiClientSettings()
 	multiSettings.SecurityPolicyGenerator = DisableSecurityPolicyWithStats
-	received := make(chan []byte, 64)
+	received := make(chan struct{}, 64)
 	multi := NewRemoteUserNatMultiClient(
 		cycleCtx,
 		testMultiClientGenerator(providerClient),
 		func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
 			select {
-			case received <- MessagePoolShareReadOnly(packet):
+			case received <- struct{}{}:
 			default:
 			}
 		},
@@ -136,20 +136,10 @@ func runMultiClientPoolCycle(ctx context.Context, t *testing.T) {
 	echoes := 0
 	for echoes < 1 {
 		select {
-		case packet := <-received:
-			MessagePoolReturn(packet)
+		case <-received:
 			echoes += 1
 		case <-echoDeadline.C:
 			t.Logf("cycle saw %d echoes (echo not required for balance)", echoes)
-			return
-		}
-	}
-	// drain anything else delivered
-	for {
-		select {
-		case packet := <-received:
-			MessagePoolReturn(packet)
-		default:
 			return
 		}
 	}

@@ -63,6 +63,30 @@ func TestTransferMemoryBudgetConcurrent(t *testing.T) {
 	AssertEqual(t, reserved, released)
 }
 
+func TestTransferMemoryBudgetResize(t *testing.T) {
+	budget := NewTransferMemoryBudget(kib(64))
+	budget.Reserve(kib(48))
+
+	// Shrink is non-evicting and exposes no new headroom until usage drains.
+	budget.SetTotalByteCount(kib(32))
+	AssertEqual(t, budget.TotalByteCount(), kib(32))
+	AssertEqual(t, budget.UsedByteCount(), kib(48))
+	AssertEqual(t, budget.Available(), ByteCount(0))
+
+	budget.Release(kib(32))
+	AssertEqual(t, budget.UsedByteCount(), kib(16))
+	AssertEqual(t, budget.Available(), kib(16))
+
+	// Growth takes effect immediately.
+	budget.SetTotalByteCount(kib(128))
+	AssertEqual(t, budget.Available(), kib(112))
+	budget.Release(kib(16))
+	AssertEqual(t, budget.UsedByteCount(), ByteCount(0))
+
+	reserved, released := budget.Counts()
+	AssertEqual(t, reserved, released)
+}
+
 // essential test 1b: the queue maintains borrowed = max(0, byteCount-floor)
 // across add, remove, and clear, and CanAdd honors the floor, the max, and
 // the budget headroom

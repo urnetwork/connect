@@ -365,7 +365,10 @@ func testClient[P comparable](
 		for _, frame := range frames {
 			if ipPacketToProvider_, err := FromFrame(frame); err == nil {
 				if ipPacketToProvider, ok := ipPacketToProvider_.(*protocol.IpPacketToProvider); ok {
-					packet := ipPacketToProvider.IpPacket.PacketBytes
+					// Receive callback buffers are only valid for the duration of the
+					// callback. This test retains and echoes the packet asynchronously,
+					// so keep an owned copy.
+					packet := append([]byte(nil), ipPacketToProvider.IpPacket.PacketBytes...)
 
 					receivePacket := &receivePacket{
 						source: source,

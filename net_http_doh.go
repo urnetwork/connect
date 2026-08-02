@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
@@ -32,9 +33,28 @@ const (
 	// dohServerWeightFloor keeps every server a small chance of being tried first (exploration), so
 	// a server that recovers can climb back even after a streak of failures.
 	dohServerWeightFloor = 0.05
-	// maxDohResponseBytes caps a DoH response body read (a memory guard); a real DNS answer is tiny,
-	// so this only bounds a hostile or broken server.
-	maxDohResponseBytes = 64 * 1024
+	// maxDohResponseBytes caps a DoH response body read (a memory guard); a real DNS answer is tiny
+	// (typically <1 KiB, a few KiB for dnssec-heavy or ech/https records), so this only bounds a
+	// hostile or broken server. It doubles as the per-request reservation unit against the dns
+	// memory target, so the target divided by this is the guaranteed-parallelism floor.
+	maxDohResponseBytes = 16 * 1024
+	// dohQueryReserveByteCount is the dns memory target reservation held for the lifetime of one
+	// in-flight DoH HTTP request (the response read cap; the request wire and goroutine are noise
+	// next to it)
+	dohQueryReserveByteCount = maxDohResponseBytes
+	// dnsLookupReserveByteCount is the dns memory target reservation for one plain-dns LookupIP
+	// (small udp/tcp exchanges via net.Resolver, no doh response body)
+	dnsLookupReserveByteCount = 4 * 1024
+	// dohTlsSessionCacheCapacity bounds a DoH client's TLS session ticket cache; a ticket or
+	// two per configured server is plenty (see httpClientWithDialer).
+	dohTlsSessionCacheCapacity = 16
+	// dohSeedMaxScore clamps a persisted per-server score on seed (see serverStats.seed): high
+	// enough to make the last session's fastest server the clear first pick, low enough that a
+	// few live successes on another server can overturn a stale ordering.
+	dohSeedMaxScore = 8.0
+	// dohWarmDomain is the benign, universally-answered name Warm queries to open a server
+	// connection (TCP+TLS+h2) ahead of the first real lookup. The answer is never cached.
+	dohWarmDomain = "example.com"
 )
 
 // dohServerWindows are the trailing time spans over which each server's successful resolutions are
@@ -58,9 +78,43 @@ func DefaultDohSettings() *DohSettings {
 		CacheMaxEntries:           MemoryScaledCount(4096, 512),
 		MaxConcurrentResolutions:  64,
 		MaxConcurrentHttpRequests: 16,
-		DohServerStagger:          750 * time.Millisecond,
-		DnsResolverSettings:       DefaultDnsResolverSettings(),
+		// hedged requests, conditioned on load: an ISOLATED query (in-flight
+		// below DohServerRaceMaxInFlight) races its fanned-out servers
+		// immediately (stagger 0) — completing at the min of the raced rtts,
+		// so a just-died first pick costs the surviving server's rtt
+		// (measured 812ms -> 67ms worst case). A BURST (page load, first
+		// load) keeps the stagger: racing a burst doubles the stream volume
+		// on the single shared h2 connection through the (cold) tunnel at
+		// exactly the wrong moment — measured as a real first-load
+		// regression on device. See PACKETRESEARCH1 §11.
+		DohServerStagger:         750 * time.Millisecond,
+		DohServerWarmStagger:     100 * time.Millisecond,
+		DohServerRaceMaxInFlight: 4,
+		DohServerHedgeReserve:    4,
+		DnsResolverSettings:      DefaultDnsResolverSettings(),
 	}
+}
+
+// dnsTargetHttpConcurrency returns the in-flight http request cap implied by
+// a dns memory target's byte capacity (the capacity divided by the
+// per-request reservation), or `fallback` when there is no target. With a
+// target, the count cap is a generous upper bound and the owner's byte
+// target is the real limiter (see DohSettings.MemoryTarget).
+func dnsTargetHttpConcurrency(targetByteCount ByteCount, fallback int) int {
+	if 0 < targetByteCount {
+		return max(fallback, int(targetByteCount/dohQueryReserveByteCount))
+	}
+	return fallback
+}
+
+// dnsTargetCacheEntries derives a resolver cache entry cap from a dns memory
+// target's byte capacity: one entry per 4 KiB of target (roughly a tenth of
+// the target in actual entry bytes), or `fallback` when there is no target
+func dnsTargetCacheEntries(targetByteCount ByteCount, fallback int) int {
+	if 0 < targetByteCount {
+		return max(fallback, int(targetByteCount/kib(4)))
+	}
+	return fallback
 }
 
 // the resolver tries the following sequence until there is a found record:
@@ -129,13 +183,47 @@ type DohSettings struct {
 	// interval, so a healthy primary answers before the redundant servers fire. 0 fans out to all
 	// servers at once.
 	DohServerStagger time.Duration
+	// DohServerWarmStagger is the shorter post-formation hedge delay. It is
+	// used only while DohPathWarm reports true, and never lengthens
+	// DohServerStagger. Zero disables the state-aware override.
+	DohServerWarmStagger time.Duration
 	// MaxServersPerQuery caps how many DoH servers a single query fans out to (in weighted
 	// order, so the best recent performers are the ones tried). On a dead path every launched
 	// request hangs until the deadline holding memory, so a memory-constrained host caps the
 	// fan-out and relies on the weighted rotation across queries to explore the other servers.
 	// 0 fans out to all servers.
-	MaxServersPerQuery  int
+	MaxServersPerQuery int
+	// DohServerRaceMaxInFlight conditions the hedge: when fewer than this
+	// many resolutions are active on the cache, a query races its servers
+	// immediately (effective stagger 0 — the interactive/tail-latency win).
+	// Admission uses one shared atomic counter, so at most this many
+	// concurrent resolutions bypass the stagger even when a burst starts at
+	// once. 0 disables the race (always stagger).
+	DohServerRaceMaxInFlight int
+	// DohServerHedgeReserve keeps this many MaxConcurrentHttpRequests slots
+	// unavailable to first-wave requests while DohPathWarm is true. Timed
+	// second-server hedges can therefore run even when a stale/dead primary
+	// has filled the ordinary wave. Zero disables the reserve.
+	DohServerHedgeReserve int
+	// DohPathWarm reports whether the shared tunnel path is proven/warm.
+	// nil means state-aware staggering and hedge reservation are disabled.
+	// UpgradeMux supplies an atomic, allocation-free callback.
+	DohPathWarm         func() bool
 	DnsResolverSettings *DnsResolverSettings
+	// MemoryTarget, when set, is the owner's live dns byte budget: every
+	// in-flight DoH request reserves the response read ceiling
+	// (`dohQueryReserveByteCount`) from it for the request's lifetime, and
+	// plain-dns lookups reserve a smaller unit — so the owner's in-flight
+	// resolution memory tracks the target, waiting (not failing) when it is
+	// exhausted. The owner shares one target across its caches (e.g. the
+	// mux's tunnel + fallback resolvers). nil disables the byte bound.
+	MemoryTarget *MemoryTarget
+	// ServerStatsSeed, when set, pre-loads the per-server success stats with the given
+	// scores (url -> score, clamped to dohSeedMaxScore) at construction, so the weighted
+	// fan-out order starts from the last session's experience — the first queries go to the
+	// server that was fastest then — instead of uniform-random. Live results take over as
+	// they accrue (seeds decay on the same trailing windows). See DohCache.ServerScores.
+	ServerStatsSeed map[string]float64
 	// DohServerResolvedCallback, when set, is called after a doh server name
 	// (the hostname of a remote doh url) resolves, with the resolved
 	// addresses. the upgrade mux records these into its ip→hostname reverse
@@ -178,22 +266,37 @@ type DnsResolverSettings struct {
 }
 
 func httpClientWithSettings(settings *DohSettings) *http.Client {
-	return httpClientWithDialer(settings, settings.DialContext)
+	return httpClientWithDialer(settings, settings.DialContext, tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity))
 }
 
 // httpClientWithDialer builds a DoH HTTP client over the given dialer. Remote DoH
 // uses the tun dialer (settings.DialContext); local DoH uses the host dialer.
-func httpClientWithDialer(settings *DohSettings, dialContext DialContextFunction) *http.Client {
+// sessionCache holds TLS session tickets so a re-dial resumes instead of paying a
+// full handshake; the owner passes a distinct cache per dial path (see NewDohCache).
+func httpClientWithDialer(settings *DohSettings, dialContext DialContextFunction, sessionCache tls.ClientSessionCache) *http.Client {
 	tr := &http.Transport{
 		DialContext:         dialContext,
 		TLSHandshakeTimeout: settings.TlsTimeout,
 		// keep the (typically single) DoH connection pooled across bursts so lookups don't
-		// re-pay a TCP+TLS handshake over the tunnel
-		IdleConnTimeout: 5 * time.Minute,
+		// re-pay a TCP+TLS handshake over the tunnel. Long: with session resumption the
+		// re-dial is cheap, but not re-dialing at all is cheaper still, and an idle h2
+		// connection is small (the keepalive pings below hold NAT state open).
+		IdleConnTimeout: 15 * time.Minute,
 	}
-	if settings.DnsResolverSettings != nil {
-		tr.TLSClientConfig = settings.DnsResolverSettings.TlsConfig
+	// TLS session resumption: cache the server's session tickets so a re-dial — after an
+	// idle close, a memory shed, or a mux rebuild sharing this cache — resumes via TLS 1.3
+	// PSK (one round trip) instead of a full handshake. Through a cold tunnel each saved
+	// round trip is user-visible first-load time.
+	var tlsConfig *tls.Config
+	if settings.DnsResolverSettings != nil && settings.DnsResolverSettings.TlsConfig != nil {
+		tlsConfig = settings.DnsResolverSettings.TlsConfig.Clone()
+	} else {
+		tlsConfig = &tls.Config{}
 	}
+	if tlsConfig.ClientSessionCache == nil {
+		tlsConfig.ClientSessionCache = sessionCache
+	}
+	tr.TLSClientConfig = tlsConfig
 	// most doh providers discontinued http1.1 late 2025; force h2 instead of the default
 	// h1->h2 autonegotiate, since that no longer works.
 	// see https://quad9.net/news/blog/doh-http-1-1-retirement/
@@ -332,15 +435,26 @@ func NewDohCache(settings *DohSettings) *DohCache {
 
 	maxResolutions := settings.MaxConcurrentResolutions
 	if maxResolutions <= 0 {
-		maxResolutions = 64
+		maxResolutions = 4 * dnsTargetHttpConcurrency(settings.MemoryTarget.Capacity(), 16)
 	}
 
-	httpClient := httpClientWithSettings(settings)
-	localHttpClient := httpClientWithDialer(settings, netDialer.DialContext)
+	// distinct TLS session caches per dial path: a ticket obtained via the host egress
+	// (localClient) must never be redeemed through the tunnel (remoteClient) — ticket reuse
+	// across paths would let the DoH server link the host address with the tunnel egress.
+	// Within a path, resumption saves a handshake round trip on every re-dial.
+	httpClient := httpClientWithDialer(settings, settings.DialContext, tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity))
+	localHttpClient := httpClientWithDialer(settings, netDialer.DialContext, tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity))
 	// one in-flight-request semaphore and one stats table shared across the remote + local clients,
 	// so the cap bounds the cache's total concurrent DoH requests
-	httpSem := make(chan struct{}, maxConcurrentHttpRequests(settings))
+	httpConcurrency := maxConcurrentHttpRequests(settings)
+	httpSem := make(chan struct{}, httpConcurrency)
+	primarySem := newDohPrimarySem(httpConcurrency, settings.DohServerHedgeReserve)
+	activeQueries := &atomic.Int64{}
 	stats := newServerStats()
+	// seed the fan-out order from the last session's per-server scores (if the owner
+	// persisted any), so the first queries pick the known-fastest server instead of
+	// spending the first minutes re-learning the ordering
+	stats.seed(settings.ServerStatsSeed)
 
 	// the hostname-form remote doh server names (see the field doc)
 	dohServerNames := map[string]bool{}
@@ -367,8 +481,8 @@ func NewDohCache(settings *DohSettings) *DohCache {
 	}
 
 	return &DohCache{
-		remoteClient:          &dohClient{httpClient: httpClient, httpSem: httpSem, stats: stats},
-		localClient:           &dohClient{httpClient: localHttpClient, httpSem: httpSem, stats: stats},
+		remoteClient:          &dohClient{httpClient: httpClient, httpSem: httpSem, primarySem: primarySem, activeQueries: activeQueries, stats: stats, memoryTarget: settings.MemoryTarget},
+		localClient:           &dohClient{httpClient: localHttpClient, httpSem: httpSem, primarySem: primarySem, activeQueries: activeQueries, stats: stats, memoryTarget: settings.MemoryTarget},
 		remoteResolver:        remoteResolver,
 		localResolver:         localResolver,
 		settings:              settings,
@@ -384,7 +498,15 @@ func maxConcurrentHttpRequests(settings *DohSettings) int {
 	if 0 < settings.MaxConcurrentHttpRequests {
 		return settings.MaxConcurrentHttpRequests
 	}
-	return 16
+	return dnsTargetHttpConcurrency(settings.MemoryTarget.Capacity(), 16)
+}
+
+func newDohPrimarySem(httpConcurrency int, hedgeReserve int) chan struct{} {
+	reserve := min(max(0, hedgeReserve), max(0, httpConcurrency-1))
+	if reserve == 0 {
+		return nil
+	}
+	return make(chan struct{}, httpConcurrency-reserve)
 }
 
 // Close releases the cache's pooled DoH connections (each an h2+TLS connection with its
@@ -394,6 +516,90 @@ func maxConcurrentHttpRequests(settings *DohSettings) int {
 func (self *DohCache) Close() {
 	self.remoteClient.httpClient.CloseIdleConnections()
 	self.localClient.httpClient.CloseIdleConnections()
+}
+
+// ServerScores returns the per-server success scores driving the fan-out order, for the owner
+// to persist and pass back as ServerStatsSeed on the next construction (the remote and local
+// clients share one stats table, so this is the cache's full view).
+func (self *DohCache) ServerScores() map[string]float64 {
+	return self.remoteClient.stats.scores()
+}
+
+// Warm opens the cache's DoH server connections ahead of the first real query: it issues one
+// minimal query (dohWarmDomain) to each of the top serverCount servers in the current weighted
+// order — with a seeded ordering (ServerStatsSeed), the servers the next real queries will
+// actually pick — paying the TCP+TLS+h2 handshake off the user's critical path. A remote-DoH
+// cache warms through the tun dialer: a dial parked on a still-establishing tunnel completes
+// the handshake the moment the tunnel can carry traffic, so calling this at connect start
+// self-times to the earliest useful moment. A local-DoH cache (the mux's host-egress fallback)
+// warms over the host dialer. Results are recorded into the server stats but never the answer
+// cache. Blocking (bounded by RequestTimeout) and reports whether any server answered; run it
+// in the background.
+func (self *DohCache) Warm(ctx context.Context, serverCount int) bool {
+	settings := self.settings
+	rs := settings.DnsResolverSettings
+	if rs == nil || settings.RequestTimeout <= 0 {
+		return false
+	}
+	var client *dohClient
+	var dohUrls []string
+	switch {
+	case rs.EnableRemoteDoh:
+		client = self.remoteClient
+		dohUrls = remoteDohUrls(settings, settings.IpVersion)
+	case rs.EnableLocalDoh:
+		client = self.localClient
+		dohUrls = localDohUrls(settings, settings.IpVersion)
+	default:
+		return false
+	}
+	ordered := client.stats.order(dohUrls)
+	if 0 < serverCount && serverCount < len(ordered) {
+		ordered = ordered[:serverCount]
+	}
+	if len(ordered) == 0 {
+		return false
+	}
+
+	queryCtx, queryCancel := context.WithTimeout(ctx, settings.RequestTimeout)
+	defer queryCancel()
+
+	var successCount atomic.Int32
+	var warmWg sync.WaitGroup
+warmLoop:
+	for _, dohUrl := range ordered {
+		// respect the shared in-flight cap and byte budget like any real request, so a warm
+		// can never crowd out a user query
+		if client.httpSem != nil {
+			select {
+			case client.httpSem <- struct{}{}:
+			case <-queryCtx.Done():
+				break warmLoop
+			}
+		}
+		if !settings.MemoryTarget.Acquire(queryCtx, dohQueryReserveByteCount) {
+			if client.httpSem != nil {
+				<-client.httpSem
+			}
+			break warmLoop
+		}
+		warmWg.Add(1)
+		go HandleError(func() {
+			defer warmWg.Done()
+			defer settings.MemoryTarget.Release(dohQueryReserveByteCount)
+			if client.httpSem != nil {
+				defer func() { <-client.httpSem }()
+			}
+			result := client.queryWire(queryCtx, dohUrl, "A", dohWarmDomain)
+			ok := 0 < len(result.AddrTtls) || result.Miss
+			client.stats.record(dohUrl, ok)
+			if ok {
+				successCount.Add(1)
+			}
+		})
+	}
+	warmWg.Wait()
+	return 0 < successCount.Load()
 }
 
 // ShedMemory drops the query result cache and releases the pooled connections, for the host's
@@ -562,9 +768,11 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]n
 		}
 	}
 
-	if len(addrExpirations) == 0 && (dohServerName || self.settings.DnsResolverSettings.EnableRemoteDns) {
+	if len(addrExpirations) == 0 && (dohServerName || self.settings.DnsResolverSettings.EnableRemoteDns) &&
+		self.settings.MemoryTarget.Acquire(ctx, dnsLookupReserveByteCount) {
 		// try the remote resolver
 		resolvedIps, err := self.remoteResolver.LookupIP(ctx, self.settings.ResolverIp(), q.Domain)
+		self.settings.MemoryTarget.Release(dnsLookupReserveByteCount)
 		if err == nil {
 			found := false
 			for _, ip := range resolvedIps {
@@ -583,9 +791,11 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]n
 		}
 	}
 
-	if len(addrExpirations) == 0 && self.settings.DnsResolverSettings.EnableLocalDns {
+	if len(addrExpirations) == 0 && self.settings.DnsResolverSettings.EnableLocalDns &&
+		self.settings.MemoryTarget.Acquire(ctx, dnsLookupReserveByteCount) {
 		// try the local resolver
 		resolvedIps, err := self.localResolver.LookupIP(ctx, self.settings.ResolverIp(), q.Domain)
+		self.settings.MemoryTarget.Release(dnsLookupReserveByteCount)
 		if err == nil {
 			found := false
 			for _, ip := range resolvedIps {
@@ -669,9 +879,12 @@ func DohQueryWithClient(
 	// a one-shot client: bound its in-flight requests, but keep no persistent per-server stats
 	// (nil stats -> uniform-random fan-out order)
 	c := &dohClient{
-		httpClient: httpClient,
-		httpSem:    make(chan struct{}, maxConcurrentHttpRequests(settings)),
-		stats:      nil,
+		httpClient:    httpClient,
+		httpSem:       make(chan struct{}, maxConcurrentHttpRequests(settings)),
+		primarySem:    newDohPrimarySem(maxConcurrentHttpRequests(settings), settings.DohServerHedgeReserve),
+		activeQueries: &atomic.Int64{},
+		stats:         nil,
+		memoryTarget:  settings.MemoryTarget,
 	}
 	return c.queryResult(ctx, remoteDohUrls(settings, ipVersion), recordType, settings, domains...).AddrTtls
 }
@@ -715,9 +928,14 @@ func newDohQueryResult() *dohQueryResult {
 // order toward recently-successful servers. stats may be nil (one-shot queries: uniform-random
 // order, no recording).
 type dohClient struct {
-	httpClient *http.Client
-	httpSem    chan struct{}
-	stats      *serverStats
+	httpClient    *http.Client
+	httpSem       chan struct{}
+	primarySem    chan struct{}
+	activeQueries *atomic.Int64
+	stats         *serverStats
+	// the owner's live dns byte budget (see DohSettings.MemoryTarget).
+	// nil disables the byte bound.
+	memoryTarget *MemoryTarget
 }
 
 // queryResult resolves recordType for the given domains across dohUrls (RFC 8484 wire), returning
@@ -753,6 +971,12 @@ func (self *dohClient) queryResult(
 		return newDohQueryResult()
 	}
 
+	activeQueryCount := int64(1)
+	if self.activeQueries != nil {
+		activeQueryCount = self.activeQueries.Add(1)
+		defer self.activeQueries.Add(-1)
+	}
+
 	queryCtx, queryCancel := context.WithTimeout(ctx, settings.RequestTimeout)
 	defer queryCancel()
 
@@ -766,12 +990,30 @@ func (self *dohClient) queryResult(
 	queryCount := len(ordered) * len(names)
 	receiveResults := make(chan *dohQueryResult, queryCount)
 
+	// launchCtx additionally ends when an early server wins (stop), so a
+	// launcher parked on the dns memory target does not outlive its query
+	launchCtx, launchCancel := context.WithCancel(queryCtx)
+	defer launchCancel()
+
 	stop := make(chan struct{})
 	var stopOnce sync.Once
-	stopLaunching := func() { stopOnce.Do(func() { close(stop) }) }
+	stopLaunching := func() { stopOnce.Do(func() { close(stop); launchCancel() }) }
 	defer stopLaunching()
 
+	pathWarm := settings.DohPathWarm != nil && settings.DohPathWarm()
 	stagger := settings.DohServerStagger
+	if pathWarm && 0 < settings.DohServerWarmStagger {
+		stagger = min(stagger, settings.DohServerWarmStagger)
+	}
+	// Hedge-on-quiet: the first few concurrent resolutions race their servers;
+	// later members of a burst keep the stagger. The shared atomic admission
+	// counter makes this bound exact. Reading len(httpSem) here was only a
+	// snapshot before launchers acquired their slots, so a synchronized burst
+	// could nondeterministically admit many more hedges than intended.
+	if 0 < stagger && 0 < settings.DohServerRaceMaxInFlight &&
+		activeQueryCount <= int64(settings.DohServerRaceMaxInFlight) {
+		stagger = 0
+	}
 
 	// launcher: start one server-wave per stagger interval (in weighted order) until an early
 	// server wins (stop), the deadline passes, or every server has been launched.
@@ -787,21 +1029,55 @@ func (self *dohClient) queryResult(
 				}
 			}
 			for _, name := range names {
-				// acquire the in-flight slot here so work waiting on the cap parks in
-				// this one launcher instead of one parked goroutine per (server, name);
-				// the request goroutine owns the slot and releases it when done
-				if self.httpSem != nil {
+				primaryAcquired := false
+				if pathWarm && i == 0 && self.primarySem != nil {
 					select {
-					case self.httpSem <- struct{}{}:
+					case self.primarySem <- struct{}{}:
+						primaryAcquired = true
 					case <-stop:
 						return
 					case <-queryCtx.Done():
 						return
 					}
 				}
+				// acquire the in-flight slot and byte reservation here so work
+				// waiting on the caps parks in this one launcher instead of one
+				// parked goroutine per (server, name); the request goroutine owns
+				// both and releases them when done
+				if self.httpSem != nil {
+					select {
+					case self.httpSem <- struct{}{}:
+					case <-stop:
+						if primaryAcquired {
+							<-self.primarySem
+						}
+						return
+					case <-queryCtx.Done():
+						if primaryAcquired {
+							<-self.primarySem
+						}
+						return
+					}
+				}
+				// the request pins up to a full response read; the owner's dns
+				// memory target bounds its total in-flight bytes across all of
+				// its resolver caches
+				if !self.memoryTarget.Acquire(launchCtx, dohQueryReserveByteCount) {
+					if self.httpSem != nil {
+						<-self.httpSem
+					}
+					if primaryAcquired {
+						<-self.primarySem
+					}
+					return
+				}
 				go HandleError(func() {
+					defer self.memoryTarget.Release(dohQueryReserveByteCount)
 					if self.httpSem != nil {
 						defer func() { <-self.httpSem }()
+					}
+					if primaryAcquired {
+						defer func() { <-self.primarySem }()
 					}
 					result := self.queryWire(queryCtx, dohUrl, recordType, name)
 					// a server that returns records or an authoritative no-record answer is healthy;
@@ -934,7 +1210,12 @@ func (self *dohClient) forwardRaw(ctx context.Context, dohUrls []string, qType d
 		case <-queryCtx.Done():
 			return nil, false
 		}
+		if !self.memoryTarget.Acquire(queryCtx, dohQueryReserveByteCount) {
+			<-self.httpSem
+			return nil, false
+		}
 		data, ok := self.queryWireRaw(queryCtx, dohUrl, qType, name)
+		self.memoryTarget.Release(dohQueryReserveByteCount)
 		<-self.httpSem
 		if ok && dnsResponseUsable(data) {
 			return data, true
@@ -1094,6 +1375,52 @@ func (self *serverStats) recordAt(url string, ok bool, now time.Time) {
 	for k, span := range dohServerWindows {
 		st.windows[k].add(span, now, 1)
 	}
+}
+
+// seed pre-loads each server's windows with a persisted score (clamped to dohSeedMaxScore),
+// spread evenly across the windows so the summed score matches and decays on the normal
+// trailing-window schedule. Used at construction to carry the fan-out ordering across a
+// restart; live results then dominate as they accrue.
+func (self *serverStats) seed(scores map[string]float64) {
+	if self == nil || len(scores) == 0 {
+		return
+	}
+	now := time.Now()
+	self.lock.Lock()
+	defer self.lock.Unlock()
+	for url, score := range scores {
+		if score <= 0 {
+			continue
+		}
+		score = min(score, dohSeedMaxScore)
+		st := self.byUrl[url]
+		if st == nil {
+			st = &serverStat{windows: make([]tokenBucket, len(dohServerWindows))}
+			self.byUrl[url] = st
+		}
+		for k, span := range dohServerWindows {
+			st.windows[k].add(span, now, score/float64(len(dohServerWindows)))
+		}
+	}
+}
+
+// scores returns each known server's current summed trailing-window success estimate (the
+// fan-out order weights), for the owner to persist and pass back as ServerStatsSeed on the
+// next construction. Zero-score servers are omitted.
+func (self *serverStats) scores() map[string]float64 {
+	if self == nil {
+		return nil
+	}
+	now := time.Now()
+	self.lock.Lock()
+	defer self.lock.Unlock()
+	scores := map[string]float64{}
+	for url := range self.byUrl {
+		if score := self.scoreLocked(url, now); 0 < score {
+			scores[url] = score
+		}
+	}
+	return scores
 }
 
 // scoreLocked sums a server's trailing-window success estimates; an untried server scores 0.

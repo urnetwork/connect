@@ -30,8 +30,17 @@ type RttWindow struct {
 	log           Logger
 	windowTimeout time.Duration
 	rttScale      float32
-	minScaledRtt  time.Duration
-	maxScaledRtt  time.Duration
+	// minScaledRtt is the COLD floor: used when the window holds no samples
+	// (nothing acked yet, or a long quiet gap aged everything out) — no
+	// evidence, so resend conservatively.
+	minScaledRtt time.Duration
+	// rttMinScaledRtt is the floor once samples exist: the measured path rtt
+	// (scaled) governs, bounded below by this, so a lost packet on a fast
+	// path retries in hundreds of milliseconds instead of the cold floor.
+	// The per-item exponential backoff (see the resend loop) bounds the
+	// duplicate cost of a too-eager first retry.
+	rttMinScaledRtt time.Duration
+	maxScaledRtt    time.Duration
 
 	stateLock       sync.Mutex
 	window          []*rttWindowItem
@@ -47,10 +56,16 @@ func NewRttWindow(
 	windowTimeout time.Duration,
 	rttScale float32,
 	minScaledRtt time.Duration,
+	rttMinScaledRtt time.Duration,
 	maxScaledRtt time.Duration,
 ) *RttWindow {
 	if windowSize == 0 {
 		panic(fmt.Errorf("Window size must non-zero: %d", windowSize))
+	}
+	if rttMinScaledRtt <= 0 {
+		// no rtt floor configured: sampled paths floor at the cold value
+		// (the historical flat-floor behavior)
+		rttMinScaledRtt = minScaledRtt
 	}
 	window := make([]*rttWindowItem, windowSize)
 
@@ -59,6 +74,7 @@ func NewRttWindow(
 		windowTimeout:   windowTimeout,
 		rttScale:        rttScale,
 		minScaledRtt:    minScaledRtt,
+		rttMinScaledRtt: rttMinScaledRtt,
 		maxScaledRtt:    maxScaledRtt,
 		window:          window,
 		windowTailIndex: 0,
@@ -93,11 +109,22 @@ func (self *RttWindow) openTag(sendTime time.Time) *protocol.Tag {
 }
 
 func (self *RttWindow) CloseTag(tag *protocol.Tag) {
-	self.closeTag(tag, time.Now())
+	self.closeSendTime(tag.SendTime, time.Now())
 }
 
 func (self *RttWindow) closeTag(tag *protocol.Tag, receiveTime time.Time) {
-	sendTime := time.UnixMilli(int64(tag.SendTime))
+	self.closeSendTime(tag.SendTime, receiveTime)
+}
+
+// CloseSendTime is the allocation-free ACK hot-path form. ACK windows retain
+// Tag's scalar wire value instead of copying a generated protobuf message
+// (whose internal MessageState must not be copied).
+func (self *RttWindow) CloseSendTime(sendTimeUnixMilli uint64) {
+	self.closeSendTime(sendTimeUnixMilli, time.Now())
+}
+
+func (self *RttWindow) closeSendTime(sendTimeUnixMilli uint64, receiveTime time.Time) {
+	sendTime := time.UnixMilli(int64(sendTimeUnixMilli))
 	if receiveTime.Before(sendTime) {
 		// ignore
 		return
@@ -124,7 +151,9 @@ func (self *RttWindow) closeTag(tag *protocol.Tag, receiveTime time.Time) {
 	}
 }
 
-// min(max of window * scale, overall max)
+// clamp(mean rtt of window * scale, floor, overall max), where the floor is
+// rttMinScaledRtt once samples exist and the conservative minScaledRtt when
+// the window is empty (cold start / long quiet gap).
 func (self *RttWindow) ScaledRtt() time.Duration {
 	return self.scaledRtt(time.Now())
 }
@@ -136,10 +165,15 @@ func (self *RttWindow) scaledRtt(sendTime time.Time) time.Duration {
 	self.coalesce(sendTime)
 
 	useRtt := self.rtts.MeanRtt()
+	floor := self.rttMinScaledRtt
+	if useRtt == 0 {
+		// no samples: no evidence to be aggressive on
+		floor = self.minScaledRtt
+	}
 	scaledRtt := min(
 		max(
 			time.Duration(float32(useRtt/time.Millisecond)*self.rttScale)*time.Millisecond,
-			self.minScaledRtt,
+			floor,
 		),
 		self.maxScaledRtt,
 	)

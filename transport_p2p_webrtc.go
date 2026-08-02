@@ -373,8 +373,12 @@ func DefaultWebRtcSettings() *WebRtcSettings {
 		// FIXME
 		// SendBufferSize: mib(1),
 
-		// sctp receive buffer per peer connection, so scaled by the memory budget
-		ReceiveBufferSize: MemoryScaledByteCount(mib(4), mib(1)),
+		// sctp receive buffer per peer connection, so scaled by the memory
+		// budget. sized so a handful of peer connections plus the transfer
+		// queues coexist within the client memory target — each new
+		// connection reserves this amount from the shared client budget
+		// (see MemoryBudget)
+		ReceiveBufferSize: MemoryScaledByteCount(kib(512), kib(256)),
 		ReceiveMtu:        kib(4),
 		// each peer connection holds the pion ice/dtls/sctp stack plus up to
 		// `ReceiveBufferSize` of queued data, so the count is bounded (scaled
@@ -411,9 +415,15 @@ type WebRtcSettings struct {
 	// the maximum number of live peer connections across all peers and
 	// streams. 0 is no limit.
 	MaxPeerConnectionCount int
-	DisconnectedTimeout    time.Duration
-	FailedTimeout          time.Duration
-	KeepAliveTimeout       time.Duration
+	// MemoryBudget, when set, is the shared client transfer budget: each new
+	// peer connection reserves `ReceiveBufferSize` from it at creation and
+	// releases it at teardown, so p2p setups are admitted only while the
+	// client memory target has headroom (refused setups stay on the platform
+	// transport, as at the count cap). nil disables byte admission.
+	MemoryBudget        *TransferMemoryBudget
+	DisconnectedTimeout time.Duration
+	FailedTimeout       time.Duration
+	KeepAliveTimeout    time.Duration
 
 	DataChannelLabel string
 
@@ -583,8 +593,28 @@ func (self *WebRtcManager) newP2pConn(ctx context.Context, path TransferPath, ac
 		}
 	}
 
+	// byte admission against the shared client budget: a peer connection can
+	// queue up to `ReceiveBufferSize`, so each conn owns that reservation for
+	// its lifetime. A new setup is refused when the budget has no headroom
+	// (the stream stays on the platform transport, as at the count cap); a
+	// replace is always admitted — the old conn's reservation releases when
+	// its run exits.
+	var reserveByteCount ByteCount
+	if budget := self.settings.MemoryBudget; budget != nil {
+		reserveByteCount = self.settings.ReceiveBufferSize
+		_, replace := self.peerConns[key]
+		if !replace && 0 < budget.UsedByteCount() && budget.Available() < reserveByteCount {
+			err = fmt.Errorf("peer connection memory budget exhausted (%d < %d)", budget.Available(), reserveByteCount)
+			return
+		}
+		budget.Reserve(reserveByteCount)
+	}
+
 	conn, err = newPeerConn(ctx, key, path.SourceId, active, self.signalSender, self.settings)
 	if err != nil {
+		if 0 < reserveByteCount {
+			self.settings.MemoryBudget.Release(reserveByteCount)
+		}
 		return
 	}
 	go HandleError(func() {
@@ -594,6 +624,9 @@ func (self *WebRtcManager) newP2pConn(ctx context.Context, path TransferPath, ac
 			conn.Cancel()
 			if conn == self.peerConns[key] {
 				delete(self.peerConns, key)
+			}
+			if 0 < reserveByteCount {
+				self.settings.MemoryBudget.Release(reserveByteCount)
 			}
 		}()
 		conn.Run()

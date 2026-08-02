@@ -259,6 +259,40 @@ func TestPlatformTransportModeFallsBackOnDisconnect(t *testing.T) {
 // TestPlatformTransportReconnects: after the platform drops a connection the
 // transport reconnects and is elected again, so a transient disconnect does not
 // strand the active mode.
+// TestPlatformTransportNetworkChangeKick pins the network-change path: a
+// NetworkChanged broadcast closes the live connection and the transport
+// re-dials immediately (the host's path-update signal, not a server drop).
+func TestPlatformTransportNetworkChangeKick(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	platform := newTestingPlatformServer(t)
+	transport := testingPlatformTransport(t, ctx, platform.url, testingPlatformTransportSettings())
+
+	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+		t.Fatal("the transport was never elected")
+	}
+	connectCount := platform.connectCount.Load()
+
+	// the host reports a network path change
+	NetworkChanged()
+
+	if !waitForCondition(15*time.Second, func() bool {
+		return connectCount < platform.connectCount.Load()
+	}) {
+		t.Fatal("the transport did not re-dial after a network change")
+	}
+	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+		mode, _ := transport.activeMode()
+		t.Fatalf("active mode = %q after network change, want h1", mode)
+	}
+
+	// closing the transport unsubscribes it: a later broadcast must not panic
+	// or kick a dead transport
+	transport.Close()
+	NetworkChanged()
+}
+
 func TestPlatformTransportReconnects(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

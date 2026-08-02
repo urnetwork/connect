@@ -140,6 +140,28 @@ func TestWindowIdentityState(t *testing.T) {
 	AssertEqual(t, storesBefore, storesAfter)
 }
 
+func TestWindowIdentityRestoreResultIsBounded(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	persisted := make([]*WindowClientIdentity, 0, maxRestoredWindowIdentityCount*2)
+	for range maxRestoredWindowIdentityCount * 2 {
+		persisted = append(persisted, &WindowClientIdentity{
+			ClientId:    NewId(),
+			ByJwt:       "jwt",
+			InstanceId:  NewId(),
+			Destination: RequireMultiHopId(NewId()),
+		})
+	}
+	state := newWindowIdentityState(ctx, &fakeIdentityStore{persisted: persisted})
+	destinations, err := state.RestoredDestinationsContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(destinations); got != maxRestoredWindowIdentityCount {
+		t.Fatalf("restored identities retained = %d, want cap %d", got, maxRestoredWindowIdentityCount)
+	}
+}
+
 func TestWindowIdentityStateNoStore(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -1,6 +1,8 @@
 package connect
 
 import (
+	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -52,6 +54,139 @@ type ContractStatsFunction func(contractStatsEvents []*ContractStatsEvent)
 type contractStatsKey struct {
 	contractId Id
 	receive    bool
+}
+
+// contractStatsCallbackWorker isolates stats observers from contract-manager
+// epochs and client cleanup. Stats are state observations, not transfer
+// send/receive/forward backpressure. While a listener is blocked, retain the
+// latest event per contract direction in a fixed ring; deltas are accumulated
+// across coalesced updates so the next delivered rate sample remains useful.
+type contractStatsCallbackWorker struct {
+	ctx      context.Context
+	cancel   context.CancelFunc
+	callback ContractStatsFunction
+
+	stateLock  sync.Mutex
+	pending    map[contractStatsKey]*ContractStatsEvent
+	order      []contractStatsKey
+	orderHead  int
+	orderCount int
+	maxCount   int
+	closed     bool
+	notify     chan struct{}
+}
+
+func newContractStatsCallbackWorker(
+	ctx context.Context,
+	callback ContractStatsFunction,
+	maxCount int,
+) *contractStatsCallbackWorker {
+	workerCtx, cancel := context.WithCancel(ctx)
+	maxCount = max(1, maxCount)
+	worker := &contractStatsCallbackWorker{
+		ctx:      workerCtx,
+		cancel:   cancel,
+		callback: callback,
+		pending:  map[contractStatsKey]*ContractStatsEvent{},
+		order:    make([]contractStatsKey, maxCount),
+		maxCount: maxCount,
+		notify:   make(chan struct{}, 1),
+	}
+	go HandleError(worker.run, cancel)
+	return worker
+}
+
+func (self *contractStatsCallbackWorker) Dispatch(events []*ContractStatsEvent) {
+	if len(events) == 0 {
+		return
+	}
+
+	self.stateLock.Lock()
+	if self.closed {
+		self.stateLock.Unlock()
+		return
+	}
+	for _, event := range events {
+		if event == nil {
+			continue
+		}
+		key := contractStatsKey{contractId: event.ContractId, receive: event.Receive}
+		cloned := *event
+		if previous, ok := self.pending[key]; ok {
+			// Absolute fields and Sequence come from the newest event; delta
+			// spans every update the slow observer did not see.
+			cloned.UsedByteCountDelta += previous.UsedByteCountDelta
+			self.pending[key] = &cloned
+			continue
+		}
+
+		if self.maxCount <= self.orderCount {
+			evictedKey := self.order[self.orderHead]
+			delete(self.pending, evictedKey)
+			self.order[self.orderHead] = key
+			self.orderHead = (self.orderHead + 1) % self.maxCount
+		} else {
+			tail := (self.orderHead + self.orderCount) % self.maxCount
+			self.order[tail] = key
+			self.orderCount += 1
+		}
+		self.pending[key] = &cloned
+	}
+	self.stateLock.Unlock()
+
+	select {
+	case <-self.ctx.Done():
+	case self.notify <- struct{}{}:
+	default:
+	}
+}
+
+func (self *contractStatsCallbackWorker) run() {
+	for {
+		select {
+		case <-self.ctx.Done():
+			return
+		case <-self.notify:
+		}
+
+		for {
+			self.stateLock.Lock()
+			if self.closed || self.orderCount == 0 {
+				self.stateLock.Unlock()
+				break
+			}
+			events := make([]*ContractStatsEvent, 0, self.orderCount)
+			for 0 < self.orderCount {
+				key := self.order[self.orderHead]
+				self.order[self.orderHead] = contractStatsKey{}
+				self.orderHead = (self.orderHead + 1) % self.maxCount
+				self.orderCount -= 1
+				if event := self.pending[key]; event != nil {
+					events = append(events, event)
+					delete(self.pending, key)
+				}
+			}
+			self.stateLock.Unlock()
+
+			HandleError(func() {
+				self.callback(events)
+			})
+		}
+	}
+}
+
+func (self *contractStatsCallbackWorker) Close() {
+	self.stateLock.Lock()
+	if self.closed {
+		self.stateLock.Unlock()
+		return
+	}
+	self.closed = true
+	clear(self.pending)
+	self.order = nil
+	self.orderCount = 0
+	self.stateLock.Unlock()
+	self.cancel()
 }
 
 type contractStatsEntry struct {

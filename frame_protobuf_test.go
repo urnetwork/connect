@@ -9,6 +9,8 @@ package connect
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	mathrandv2 "math/rand/v2"
 	"testing"
 
@@ -253,11 +255,15 @@ func TestFrameCodecRandomized(t *testing.T) {
 }
 
 func buildEquivalentAckFrame(m *sendAckFrame) *protocol.TransferFrame {
+	var tag *protocol.Tag
+	if m.tagSet {
+		tag = &protocol.Tag{SendTime: m.tagSendTime}
+	}
 	ack := &protocol.Ack{
 		MessageId:  m.messageId.Bytes(),
 		SequenceId: m.sequenceId.Bytes(),
 		Selective:  m.selective,
-		Tag:        m.tag,
+		Tag:        tag,
 	}
 	tf := &protocol.TransferFrame{
 		TransferPath: m.path.ToProtobuf(),
@@ -297,17 +303,18 @@ func TestAckCodecEdgeCases(t *testing.T) {
 			sequenceId: idA,
 		},
 		"selective with tag": {
-			path:       TransferPath{DestinationId: idA, SourceId: idB},
-			messageId:  idC,
-			sequenceId: idA,
-			selective:  true,
-			tag:        &protocol.Tag{SendTime: 1_700_000_000_000},
+			path:        TransferPath{DestinationId: idA, SourceId: idB},
+			messageId:   idC,
+			sequenceId:  idA,
+			selective:   true,
+			tagSendTime: 1_700_000_000_000,
+			tagSet:      true,
 		},
 		"tag zero send time": {
 			path:       TransferPath{DestinationId: idA, SourceId: idB, StreamId: idC},
 			messageId:  idC,
 			sequenceId: idA,
-			tag:        &protocol.Tag{SendTime: 0},
+			tagSet:     true,
 		},
 		"stream only path": {
 			path:       TransferPath{StreamId: idC},
@@ -343,12 +350,230 @@ func TestAckCodecRandomized(t *testing.T) {
 		m.selective = mathrandv2.IntN(2) == 0
 		switch mathrandv2.IntN(3) {
 		case 0:
-			m.tag = &protocol.Tag{SendTime: mathrandv2.Uint64()}
+			m.tagSendTime = mathrandv2.Uint64()
+			m.tagSet = true
 		case 1:
-			m.tag = &protocol.Tag{SendTime: 0}
+			m.tagSet = true
 		}
 		assertAckCodecMatches(t, m)
 	}
+}
+
+func newFrameCodecTestSequenceCipher(t testing.TB) *sequenceCipher {
+	t.Helper()
+	block, err := aes.NewCipher(make([]byte, sequenceTlsKeyLength))
+	if err != nil {
+		t.Fatalf("aes.NewCipher: %s", err)
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatalf("cipher.NewGCM: %s", err)
+	}
+	return &sequenceCipher{aead: aead}
+}
+
+func TestEncryptedOuterFrameCodec(t *testing.T) {
+	idA, idB, idC := NewId(), NewId(), NewId()
+	cases := []struct {
+		path       TransferPath
+		ciphertext []byte
+		role       protocol.SequenceRole
+		companion  bool
+	}{
+		{
+			path:       TransferPath{},
+			ciphertext: []byte{1},
+			role:       protocol.SequenceRole_SequenceRoleUnknown,
+		},
+		{
+			path:       TransferPath{DestinationId: idA, SourceId: idB},
+			ciphertext: bytes.Repeat([]byte{0xa5}, 1500),
+			role:       protocol.SequenceRole_SequenceRoleClient,
+		},
+		{
+			path:       TransferPath{DestinationId: idA, SourceId: idB, StreamId: idC},
+			ciphertext: bytes.Repeat([]byte{0x5a}, 3072),
+			role:       protocol.SequenceRole_SequenceRoleServer,
+			companion:  true,
+		},
+	}
+	for _, tc := range cases {
+		ref := &protocol.TransferFrame{
+			TransferPath:           tc.path.ToProtobuf(),
+			EncryptedTransferFrame: tc.ciphertext,
+			SessionCompanion:       &tc.companion,
+		}
+		if tc.role != protocol.SequenceRole_SequenceRoleUnknown {
+			role := tc.role
+			ref.SessionRole = &role
+		}
+		want, err := proto.Marshal(ref)
+		if err != nil {
+			t.Fatalf("proto.Marshal: %s", err)
+		}
+		got, err := buildEncryptedOuterFrameBytes(tc.path, tc.ciphertext, tc.role, tc.companion)
+		if err != nil {
+			t.Fatalf("buildEncryptedOuterFrameBytes: %s", err)
+		}
+		if !bytes.Equal(got, want) {
+			MessagePoolReturn(got)
+			t.Fatalf("hand-rolled encrypted outer bytes != proto bytes\n got (%d): %x\nwant (%d): %x", len(got), got, len(want), want)
+		}
+		MessagePoolReturn(got)
+	}
+}
+
+func TestSequenceCipherSealOuterFrame(t *testing.T) {
+	c := newFrameCodecTestSequenceCipher(t)
+	path := TransferPath{DestinationId: NewId(), SourceId: NewId(), StreamId: NewId()}
+	plaintext := bytes.Repeat([]byte{0x3c}, 3000)
+	wrapped, err := c.SealOuterFrame(
+		path,
+		plaintext,
+		protocol.SequenceRole_SequenceRoleServer,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("SealOuterFrame: %s", err)
+	}
+	defer MessagePoolReturn(wrapped)
+
+	var outer protocol.TransferFrame
+	if err := proto.Unmarshal(wrapped, &outer); err != nil {
+		t.Fatalf("proto.Unmarshal: %s", err)
+	}
+	if !proto.Equal(outer.TransferPath, path.ToProtobuf()) {
+		t.Fatalf("outer path = %v, want %v", outer.TransferPath, path.ToProtobuf())
+	}
+	if outer.GetSessionRole() != protocol.SequenceRole_SequenceRoleServer {
+		t.Fatalf("outer role = %v, want server", outer.GetSessionRole())
+	}
+	if !outer.GetSessionCompanion() {
+		t.Fatal("outer companion = false, want true")
+	}
+	opened, err := c.Open(outer.EncryptedTransferFrame)
+	if err != nil {
+		t.Fatalf("Open: %s", err)
+	}
+	defer MessagePoolReturn(opened)
+	if !bytes.Equal(opened, plaintext) {
+		t.Fatal("decrypted plaintext does not match input")
+	}
+}
+
+// A two-MTU batch is the largest sequence coalescing unit. Assert the fully
+// encoded and encrypted message — not just its packet payload — remains below
+// every production transport's minimum configured message envelope.
+func TestTwoPacketEncryptedPackFitsMinimumMessageLimit(t *testing.T) {
+	c := newFrameCodecTestSequenceCipher(t)
+	path := TransferPath{DestinationId: NewId(), SourceId: NewId(), StreamId: NewId()}
+	m := &sendPackFrame{
+		path:           path,
+		messageId:      NewId(),
+		sequenceId:     NewId(),
+		sequenceNumber: ^uint64(0),
+		head:           true,
+		frames: []*protocol.Frame{
+			{MessageType: protocol.MessageType_IpIpPacketFromProvider, MessageBytes: make([]byte, DefaultMtu), Raw: true},
+			{MessageType: protocol.MessageType_IpIpPacketFromProvider, MessageBytes: make([]byte, DefaultMtu), Raw: true},
+		},
+		tagSendTime:    ^uint64(0),
+		sessionRole:    protocol.SequenceRole_SequenceRoleServer,
+		sessionRoleSet: true,
+		companion:      true,
+	}
+	inner := marshalSendPackTransferFrame(m)
+	defer MessagePoolReturn(inner)
+	wrapped, err := c.SealOuterFrame(
+		path,
+		inner,
+		protocol.SequenceRole_SequenceRoleServer,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("SealOuterFrame: %s", err)
+	}
+	defer MessagePoolReturn(wrapped)
+	limit := int(DefaultClientSettings().MinimumMessageLenLimit())
+	if limit < len(wrapped) {
+		t.Fatalf("two-packet encrypted pack is %d bytes, exceeds minimum transport limit %d", len(wrapped), limit)
+	}
+}
+
+func BenchmarkSequenceCipherOuterWrap(b *testing.B) {
+	c := newFrameCodecTestSequenceCipher(b)
+	path := TransferPath{DestinationId: NewId(), SourceId: NewId(), StreamId: NewId()}
+	plaintext := bytes.Repeat([]byte{0x3c}, 3000)
+
+	b.Run("separate ciphertext", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(plaintext)))
+		for b.Loop() {
+			ciphertext, err := c.Seal(plaintext)
+			if err != nil {
+				b.Fatal(err)
+			}
+			wrapped, err := buildEncryptedOuterFrameBytes(
+				path,
+				ciphertext,
+				protocol.SequenceRole_SequenceRoleServer,
+				true,
+			)
+			if err != nil {
+				b.Fatal(err)
+			}
+			MessagePoolReturn(wrapped)
+		}
+	})
+	b.Run("fused pooled output", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(plaintext)))
+		for b.Loop() {
+			wrapped, err := c.SealOuterFrame(
+				path,
+				plaintext,
+				protocol.SequenceRole_SequenceRoleServer,
+				true,
+			)
+			if err != nil {
+				b.Fatal(err)
+			}
+			MessagePoolReturn(wrapped)
+		}
+	})
+}
+
+func BenchmarkSequenceCipherOpen(b *testing.B) {
+	c := newFrameCodecTestSequenceCipher(b)
+	plaintext := bytes.Repeat([]byte{0x3c}, 3000)
+	ciphertext, err := c.Seal(plaintext)
+	if err != nil {
+		b.Fatal(err)
+	}
+	nonce := ciphertext[:sequenceTlsAeadNonceSize]
+	sealed := ciphertext[sequenceTlsAeadNonceSize:]
+
+	b.Run("heap output", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(plaintext)))
+		for b.Loop() {
+			opened, err := c.aead.Open(nil, nonce, sealed, nil)
+			if err != nil || len(opened) != len(plaintext) {
+				b.Fatalf("Open len=%d err=%v", len(opened), err)
+			}
+		}
+	})
+	b.Run("pooled output", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(plaintext)))
+		for b.Loop() {
+			opened, err := c.Open(ciphertext)
+			if err != nil || len(opened) != len(plaintext) {
+				b.Fatalf("Open len=%d err=%v", len(opened), err)
+			}
+			MessagePoolReturn(opened)
+		}
+	})
 }
 
 // assertDecodeMatches marshals ref with the official library, decodes it with
@@ -361,6 +586,7 @@ func assertDecodeMatches(t *testing.T, ref *protocol.TransferFrame, decodePath b
 		t.Fatalf("proto.Marshal: %s", err)
 	}
 	var got protocol.TransferFrame
+	defer returnDecodedTransferFrameMessageBytes(&got)
 	if !unmarshalTransferFrame(b, &got, decodePath) {
 		t.Fatalf("unmarshalTransferFrame returned false for valid frame: %x", b)
 	}
@@ -556,6 +782,7 @@ func TestDecodeRoundTripFromMarshal(t *testing.T) {
 	b := marshalSendPackTransferFrame(m)
 	defer MessagePoolReturn(b)
 	var got protocol.TransferFrame
+	defer returnDecodedTransferFrameMessageBytes(&got)
 	if !unmarshalTransferFrame(b, &got, true) {
 		t.Fatal("decode of hand-rolled marshal failed")
 	}
@@ -563,6 +790,51 @@ func TestDecodeRoundTripFromMarshal(t *testing.T) {
 	want.MessageType = nil
 	if !proto.Equal(&got, want) {
 		t.Fatalf("round-trip mismatch\n got: %v\nwant: %v", &got, want)
+	}
+}
+
+func TestDecodedFrameMessageBytesUsePooledCallbackLifetime(t *testing.T) {
+	payload := bytes.Repeat([]byte{0x7d}, DefaultMtu)
+	m := &sendPackFrame{
+		path:        TransferPath{DestinationId: NewId(), SourceId: NewId()},
+		messageId:   NewId(),
+		sequenceId:  NewId(),
+		frames:      []*protocol.Frame{{MessageType: protocol.MessageType_IpIpPacketFromProvider, MessageBytes: payload, Raw: true}},
+		tagSendTime: 1,
+	}
+	encoded := marshalSendPackTransferFrame(m)
+	var decoded protocol.TransferFrame
+	if !unmarshalTransferFrame(encoded, &decoded, true) {
+		MessagePoolReturn(encoded)
+		t.Fatal("decode failed")
+	}
+	MessagePoolReturn(encoded)
+
+	if decoded.Pack == nil || len(decoded.Pack.Frames) != 1 {
+		returnDecodedTransferFrameMessageBytes(&decoded)
+		t.Fatalf("decoded pack = %v", decoded.Pack)
+	}
+	messageBytes := decoded.Pack.Frames[0].MessageBytes
+	pooled, shared := MessagePoolCheck(messageBytes)
+	if !pooled || shared {
+		returnDecodedTransferFrameMessageBytes(&decoded)
+		t.Fatalf("decoded message pooled=%t shared=%t, want true/false", pooled, shared)
+	}
+	retained := MessagePoolShareReadOnly(messageBytes)
+	returnDecodedTransferFrameMessageBytes(&decoded)
+	pooled, shared = MessagePoolCheck(retained)
+	if !pooled || !shared {
+		MessagePoolReturn(retained)
+		t.Fatalf("retained message pooled=%t shared=%t, want true/true", pooled, shared)
+	}
+	if !bytes.Equal(retained, payload) {
+		MessagePoolReturn(retained)
+		t.Fatal("retained payload changed after decoded owner returned")
+	}
+	MessagePoolReturn(retained)
+	pooled, shared = MessagePoolCheck(retained)
+	if pooled || shared {
+		t.Fatalf("fully returned message pooled=%t shared=%t, want false/false", pooled, shared)
 	}
 }
 
@@ -592,6 +864,7 @@ func TestDecodeTransferFrameMalformed(t *testing.T) {
 				t.Fatalf("accepted truncation at %d that proto rejects", i)
 			}
 		}
+		returnDecodedTransferFrameMessageBytes(&tf)
 	}
 	// pure garbage must not panic
 	for iter := 0; iter < 2000; iter++ {
@@ -602,6 +875,7 @@ func TestDecodeTransferFrameMalformed(t *testing.T) {
 		}
 		var tf protocol.TransferFrame
 		_ = unmarshalTransferFrame(g, &tf, true)
+		returnDecodedTransferFrameMessageBytes(&tf)
 	}
 }
 
@@ -625,6 +899,131 @@ func TestFrameCodecAllocs(t *testing.T) {
 	if 1 < allocs {
 		t.Fatalf("marshalSendPackTransferFrame allocates %v per call, want <=1", allocs)
 	}
+}
+
+func TestOwnedDecodeHasExplicitCallbackLifetime(t *testing.T) {
+	payload := bytes.Repeat([]byte{0x6b}, DefaultMtu)
+	m := &sendPackFrame{
+		path:        TransferPath{DestinationId: NewId(), SourceId: NewId()},
+		messageId:   NewId(),
+		sequenceId:  NewId(),
+		frames:      []*protocol.Frame{{MessageType: protocol.MessageType_IpIpPacketFromProvider, MessageBytes: payload, Raw: true}},
+		tagSendTime: 123456789,
+	}
+	encoded := marshalSendPackTransferFrame(m)
+	defer MessagePoolReturn(encoded)
+
+	var decoded decodedTransferFrame
+	if !unmarshalOwnedTransferFrame(encoded, &decoded, true) {
+		t.Fatal("owned decode failed")
+	}
+	if decoded.packOwner == nil || decoded.frame.Pack != &decoded.packOwner.pack {
+		decoded.release()
+		t.Fatal("decoded Pack does not point at its explicit owner")
+	}
+	if got := decoded.frame.Pack.Frames[0]; got != &decoded.packOwner.frames[0] {
+		decoded.release()
+		t.Fatal("common-case Frame did not use inline owner storage")
+	}
+	if &decoded.frame.Pack.MessageId[0] != &decoded.packOwner.messageId[0] ||
+		&decoded.frame.Pack.SequenceId[0] != &decoded.packOwner.sequenceId[0] {
+		decoded.release()
+		t.Fatal("decoded IDs do not use inline owner storage")
+	}
+
+	// receiveItem copies the RTT tag by value before returning the decoder
+	// owner. This pins the subtle asynchronous ACK-window lifetime boundary.
+	tag := sequenceTagFromProtocol(decoded.frame.Pack.Tag)
+	frameBytes := decoded.frame.Pack.Frames[0].MessageBytes
+	retained := MessagePoolShareReadOnly(frameBytes)
+	decoded.release()
+	if tag.protocol() == nil || tag.protocol().SendTime != m.tagSendTime {
+		MessagePoolReturn(retained)
+		t.Fatalf("copied tag changed after owner release: %+v", tag.protocol())
+	}
+	if !bytes.Equal(retained, payload) {
+		MessagePoolReturn(retained)
+		t.Fatal("shared callback payload changed after owner release")
+	}
+	MessagePoolReturn(retained)
+}
+
+func TestDecodedPackOwnerPoolRetentionIsBounded(t *testing.T) {
+	pool := newDecodedPackOwnerPool()
+	for i := 0; i < decodedPackOwnerPoolCapacity+97; i++ {
+		pool.put(&decodedPackOwner{})
+	}
+	retained := 0
+	for i := range pool.shards {
+		shard := &pool.shards[i]
+		shard.mu.Lock()
+		retained += len(shard.free)
+		if len(shard.free) > shard.limit {
+			shard.mu.Unlock()
+			t.Fatalf("shard %d retained %d > limit %d", i, len(shard.free), shard.limit)
+		}
+		shard.mu.Unlock()
+	}
+	if retained != decodedPackOwnerPoolCapacity {
+		t.Fatalf("retained %d owners, want exact cap %d", retained, decodedPackOwnerPoolCapacity)
+	}
+}
+
+func TestOwnedPackDecodeSteadyStateAllocs(t *testing.T) {
+	m := &sendPackFrame{
+		path:        TransferPath{DestinationId: NewId(), SourceId: NewId()},
+		messageId:   NewId(),
+		sequenceId:  NewId(),
+		frames:      []*protocol.Frame{{MessageType: protocol.MessageType_IpIpPacketFromProvider, MessageBytes: make([]byte, 1400), Raw: true}},
+		tagSendTime: 1,
+	}
+	encoded := marshalSendPackTransferFrame(m)
+	defer MessagePoolReturn(encoded)
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		decoded := inboundDecodedTransferFrames.take()
+		if !unmarshalOwnedTransferFrame(encoded, decoded, true) {
+			panic("owned decode failed")
+		}
+		inboundDecodedTransferFrames.put(decoded)
+	})
+	t.Logf("owned pack decode steady-state allocations: %.2f", allocs)
+	if allocs != 0 {
+		t.Fatalf("owned pack decode allocated %.2f times per packet, want 0", allocs)
+	}
+}
+
+func BenchmarkTransferFrameDecode(b *testing.B) {
+	m := &sendPackFrame{
+		path:        TransferPath{DestinationId: NewId(), SourceId: NewId()},
+		messageId:   NewId(),
+		sequenceId:  NewId(),
+		frames:      []*protocol.Frame{{MessageType: protocol.MessageType_IpIpPacketFromProvider, MessageBytes: make([]byte, 1400), Raw: true}},
+		tagSendTime: 1,
+	}
+	encoded := marshalSendPackTransferFrame(m)
+	defer MessagePoolReturn(encoded)
+
+	b.Run("copy-safe-protocol-objects", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			var decoded protocol.TransferFrame
+			if !unmarshalTransferFrame(encoded, &decoded, true) {
+				b.Fatal("decode failed")
+			}
+			returnDecodedTransferFrameMessageBytes(&decoded)
+		}
+	})
+	b.Run("bounded-owned-values", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			decoded := inboundDecodedTransferFrames.take()
+			if !unmarshalOwnedTransferFrame(encoded, decoded, true) {
+				b.Fatal("decode failed")
+			}
+			inboundDecodedTransferFrames.put(decoded)
+		}
+	})
 }
 
 // ResidentMigrate rides the standard control frame path

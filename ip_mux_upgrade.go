@@ -79,11 +79,33 @@ type DnsUpgradeSettings struct {
 	// result is preferred whenever it arrives first, so the fallback only wins while the tunnel is
 	// still establishing. 0 (or a nil Fallback) disables the fallback.
 	LocalFallbackTimeout time.Duration
+	// ColdLocalFallbackTimeout replaces LocalFallbackTimeout while the tunnel-DoH is COLD —
+	// before it has answered anything on this mux (a fresh connect), or after consecutive
+	// failures (a mid-session stall; see tunnelDohCold). A short cold handicap keeps the
+	// first page load responsive while the tunnel establishes, at the cost of widening the
+	// accepted startup DNS-leak window (queries race the local host egress that much
+	// sooner); the first tunnel success — usually the connect-time warm probe (WarmDns) —
+	// restores the full LocalFallbackTimeout handicap. 0 disables the cold phase (always
+	// use LocalFallbackTimeout).
+	ColdLocalFallbackTimeout time.Duration
+	// ServerStatsSeed, when set, seeds the per-server DoH success stats of the tunnel and
+	// fallback resolvers at construction, so the first fan-outs pick the server that was
+	// fastest last session instead of uniform-random (see DohSettings.ServerStatsSeed).
+	// The owner persists UpgradeMux.DnsServerScores across sessions to produce it.
+	ServerStatsSeed map[string]float64
 	// Fallback resolves over the local host egress (not the tunnel), used as the handicapped
 	// fallback above so DNS stays responsive while the tunnel-DoH is still coming up — preventing
 	// the OS from tearing down an apparently-unresponsive tunnel, at the cost of a brief DNS leak
 	// during startup. nil disables the fallback.
 	Fallback *DnsResolverSettings
+	// MemoryTarget, when set, is the owner's live dns byte budget, shared by
+	// the mux's tunnel and fallback resolver caches: every in-flight DoH
+	// request reserves the response read ceiling from it, so the owner's
+	// total in-flight resolution memory tracks the target (see
+	// DohSettings.MemoryTarget). The concurrency caps also derive from its
+	// capacity. The device stamps its per-instance target here. nil keeps
+	// the conservative fixed caps.
+	MemoryTarget *MemoryTarget
 }
 
 // UpgradeMuxSettings holds the DNS and HTTP upgrade policies. Each consumer (apps,
@@ -138,6 +160,11 @@ func DefaultUpgradeMuxSettings() *UpgradeMuxSettings {
 			// over the local host egress so DNS stays responsive while the tunnel comes up. Same DoH
 			// servers, but via the host (EnableLocalDoh) rather than the tunnel.
 			LocalFallbackTimeout: 5 * time.Second,
+			// while the tunnel-DoH is still unproven (fresh connect / stall), race the local
+			// fallback after only 250ms so the first page load doesn't wait multiple seconds
+			// per lookup — an accepted widening of the startup leak window, closed again by
+			// the first tunnel-DoH success (see ColdLocalFallbackTimeout)
+			ColdLocalFallbackTimeout: 250 * time.Millisecond,
 			Fallback: &DnsResolverSettings{
 				EnableLocalDoh:   true,
 				LocalDohUrlsIpv4: resolver.RemoteDohUrlsIpv4,
@@ -167,6 +194,15 @@ const (
 	// reverseEvictSampleSize is how many affinity records an over-cap insert samples to evict
 	// the least-recently-active from (approximate LRU, O(sample) instead of a full scan).
 	reverseEvictSampleSize = 32
+	// tunnelDohColdFailureCount is how many consecutive tunnel-DoH resolution failures flip
+	// the mux back to the cold fallback handicap (see DnsUpgradeSettings.ColdLocalFallbackTimeout):
+	// one lost race can be a hiccup; a run of losses means the tunnel is stalled.
+	tunnelDohColdFailureCount = 2
+	// dnsColdProbeInterval is the wait between tunnel-DoH warm probes while the mux is cold.
+	// The probe is what re-proves a recovered tunnel: cold-phase user queries are answered by
+	// the (much faster) local fallback and their canceled tunnel workers can lose every race,
+	// so without an unraced probe the mux could pin cold — leaking DNS — indefinitely.
+	dnsColdProbeInterval = 2 * time.Second
 )
 
 type UpgradeMux struct {
@@ -185,6 +221,20 @@ type UpgradeMux struct {
 	// fallbackDohCache resolves over the local host egress (not the tun); the handicapped local
 	// fallback used when the tunnel-DoH is slow to come up. nil when no Fallback is configured.
 	fallbackDohCache atomic.Pointer[DohCache]
+
+	// tunnelDohProven flips true on the first tunnel-DoH success (a real query or the
+	// connect-time warm probe) and tunnelDohFailures counts consecutive tunnel resolution
+	// failures since; together they decide the cold fallback handicap (see tunnelDohCold).
+	tunnelDohProven   atomic.Bool
+	tunnelDohFailures atomic.Int32
+	// dnsProberRunning guards the single cold-phase warm-probe goroutine (ensureColdProber).
+	dnsProberRunning atomic.Bool
+
+	// firstLoad measures the first flows after this mux's construction (one mux per
+	// connect): dns query→answer, tcp syn→synack, first payload byte. Self-deactivating —
+	// after the first-load window the per-packet cost is one atomic load (see
+	// firstLoadTimeline).
+	firstLoad *firstLoadTimeline
 
 	// source/provideMode stamp packets the mux injects downstream (DNS replies).
 	source      TransferPath
@@ -232,6 +282,24 @@ func fallbackResolverSettings(settings *UpgradeMuxSettings) *DnsResolverSettings
 	return nil
 }
 
+// dnsUpgradeMemoryTarget extracts the owner's dns byte budget from the mux
+// settings (nil = no byte bound).
+func dnsUpgradeMemoryTarget(settings *UpgradeMuxSettings) *MemoryTarget {
+	if settings != nil && settings.Dns != nil {
+		return settings.Dns.MemoryTarget
+	}
+	return nil
+}
+
+// dnsUpgradeServerStatsSeed extracts the persisted per-server score seed from the mux
+// settings (nil = no seed).
+func dnsUpgradeServerStatsSeed(settings *UpgradeMuxSettings) map[string]float64 {
+	if settings != nil && settings.Dns != nil {
+		return settings.Dns.ServerStatsSeed
+	}
+	return nil
+}
+
 // dohRequestTimeout is the per-DoH-request timeout derived from the mux's resolve budget: a single
 // ResolveTimeout bounds both the resolve retry loop and each underlying DoH request. 0 (no Dns, or
 // no bound) lets the tun fall back to its default.
@@ -246,19 +314,27 @@ func dohRequestTimeout(settings *UpgradeMuxSettings) time.Duration {
 // used as the handicapped local fallback when the tunnel-DoH is slow to come up. A nil rs (no
 // Fallback configured) disables it. The resolver dials the host net dialer (DefaultDohSettings
 // leaves DialContextSettings nil) and queries rs's local DoH servers (EnableLocalDoh).
-func buildFallbackDohCache(rs *DnsResolverSettings) *DohCache {
+func buildFallbackDohCache(rs *DnsResolverSettings, memoryTarget *MemoryTarget, serverStatsSeed map[string]float64) *DohCache {
 	if rs == nil {
 		return nil
 	}
 	dohSettings := DefaultDohSettings()
 	dohSettings.DnsResolverSettings = rs
+	// same seed as the tunnel resolver: the ordering is a property of the servers, and the
+	// fallback is what answers the very first (cold) queries — exactly where a good first
+	// pick matters most
+	dohSettings.ServerStatsSeed = serverStatsSeed
 	// the fallback only bridges tunnel startup; keep its in-flight footprint and cache small
 	// so it adds little to the (memory-constrained) extension on top of the primary
-	// tunnel-DoH cache.
-	dohSettings.MaxConcurrentHttpRequests = 4
-	dohSettings.MaxConcurrentResolutions = 8
+	// tunnel-DoH cache. with a dns memory target set the count caps open up — the fallback
+	// then draws from the same owner byte target as the primary (see DohSettings.MemoryTarget)
+	// — but stay wave-capped like the primary (the shared-pipe bound; see NewUpgradeMux).
+	dohSettings.MemoryTarget = memoryTarget
+	fallbackHttpConcurrency := min(12, dnsTargetHttpConcurrency(memoryTarget.Capacity(), 4))
+	dohSettings.MaxConcurrentHttpRequests = fallbackHttpConcurrency
+	dohSettings.MaxConcurrentResolutions = 2 * fallbackHttpConcurrency
 	dohSettings.MaxServersPerQuery = 2
-	dohSettings.CacheMaxEntries = 256
+	dohSettings.CacheMaxEntries = dnsTargetCacheEntries(memoryTarget.Capacity(), 1024) / 4
 	return NewDohCache(dohSettings)
 }
 
@@ -275,12 +351,14 @@ func NewUpgradeMux(
 	tunSettings := DefaultTunSettings()
 	tunSettings.Log = log
 	// the DoH connections run inside a memory-constrained host (notably the iOS network
-	// extension). Keep the gVisor TCP/UDP buffers small (16KB) — Max applies per connection,
-	// and DoH responses fit comfortably in 16KB.
-	tunSettings.TcpReceiveBuffer = TcpBufferRange{Min: 4 * 1024, Default: 16 * 1024, Max: 16 * 1024}
-	tunSettings.TcpSendBuffer = TcpBufferRange{Min: 4 * 1024, Default: 16 * 1024, Max: 16 * 1024}
-	tunSettings.UdpReceiveBufferByteCount = 16 * 1024
-	tunSettings.UdpSendBufferByteCount = 16 * 1024
+	// extension). The gVisor TCP buffers size the shared h2 pipe that ALL concurrent DoH
+	// streams multiplex over — 64KB (up from 16KB) carries a page-load wave of responses
+	// without head-of-line queueing on the connection, for ~100KB per (few) connections,
+	// covered by the dns share of the device memory target.
+	tunSettings.TcpReceiveBuffer = TcpBufferRange{Min: 4 * 1024, Default: 64 * 1024, Max: 64 * 1024}
+	tunSettings.TcpSendBuffer = TcpBufferRange{Min: 4 * 1024, Default: 64 * 1024, Max: 64 * 1024}
+	tunSettings.UdpReceiveBufferByteCount = 32 * 1024
+	tunSettings.UdpSendBufferByteCount = 32 * 1024
 	// this stack only carries DoH resolution traffic, so the endpoint queue can be much
 	// smaller than the data-plane default (1024), which bounds a stack-emit burst
 	tunSettings.ChannelSize = 128
@@ -305,11 +383,35 @@ func NewUpgradeMux(
 		self.reverse.record([]netip.Addr{dstAddr}, serverName)
 	})
 	// bound the resolver cache and fan-out below the server/proxy defaults (see
-	// DefaultDohSettings); the mux resolves a device's queries, not a data plane's
+	// DefaultDohSettings); the mux resolves a device's queries, not a data plane's.
+	// with a dns memory target set (the device's per-instance target) the count
+	// caps derive from it, BUT http concurrency is additionally capped at a wave
+	// size the shared h2 pipe can actually carry: all concurrent streams multiplex
+	// over one tls connection per server through the (possibly cold) tunnel, and
+	// an uncapped burst (a first page load) queues on that pipe instead of
+	// completing in waves — measured as real first-load slowness on device. The
+	// byte budget remains the memory governor. (see DohSettings.MemoryTarget)
+	var dnsMemoryTarget *MemoryTarget
+	var serverStatsSeed map[string]float64
+	if settings != nil && settings.Dns != nil {
+		dnsMemoryTarget = settings.Dns.MemoryTarget
+		serverStatsSeed = settings.Dns.ServerStatsSeed
+	}
 	dohSettings := DefaultDohSettings()
-	dohSettings.CacheMaxEntries = 1024
-	dohSettings.MaxConcurrentResolutions = 24
-	dohSettings.MaxConcurrentHttpRequests = 8
+	dohSettings.MemoryTarget = dnsMemoryTarget
+	// Keep the conservative 750 ms server stagger while the tunnel is
+	// forming or has gone stale. Once a real query/warm probe proves the
+	// shared path, the resolver uses the shorter warm stagger and reserves a
+	// few HTTP slots for those hedges (see DohSettings).
+	dohSettings.DohPathWarm = func() bool {
+		return !self.tunnelDohCold()
+	}
+	// carry the last session's per-server ordering into the first fan-outs
+	dohSettings.ServerStatsSeed = serverStatsSeed
+	dohSettings.CacheMaxEntries = dnsTargetCacheEntries(dnsMemoryTarget.Capacity(), 1024)
+	muxHttpConcurrency := min(32, dnsTargetHttpConcurrency(dnsMemoryTarget.Capacity(), 8))
+	dohSettings.MaxConcurrentResolutions = 3 * muxHttpConcurrency
+	dohSettings.MaxConcurrentHttpRequests = muxHttpConcurrency
 	dohSettings.MaxServersPerQuery = 2
 	// record doh server name resolutions into the ip→hostname reverse index,
 	// so the block action ignore matcher (which lists the server names)
@@ -327,7 +429,9 @@ func NewUpgradeMux(
 		cancel()
 		return nil, err
 	}
-	self.fallbackDohCache.Store(buildFallbackDohCache(fallbackResolverSettings(settings)))
+	self.fallbackDohCache.Store(buildFallbackDohCache(fallbackResolverSettings(settings), dnsMemoryTarget, serverStatsSeed))
+	// one mux per connect, so the first-load timeline's activation is the connect start
+	self.firstLoad = newFirstLoadTimeline(log)
 	self.mux = NewIpMux(cancelCtx, tun, source, provideMode, sendTimeout, self.onSend, nil, initialReceiver, log)
 	// drop recoverable caches when the host signals memory pressure
 	self.unregisterShed = AddMemoryShedder(self.ShedMemory)
@@ -343,6 +447,8 @@ func NewUpgradeMux(
 // peek can't classify, e.g. IPv6 extension headers) needs the allocating full parse. This
 // keeps the pass-through bulk off the parse/allocation path entirely.
 func (self *UpgradeMux) onSend(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool {
+	// first-load timeline: one atomic load once deactivated (see firstLoadTimeline)
+	self.firstLoad.observeSend(packet)
 	var tls tlsSegment
 	switch peekClaim(packet, &tls) {
 	case peekOther:
@@ -399,6 +505,113 @@ func (self *UpgradeMux) getBlocker() Blocker {
 		return *b
 	}
 	return nil
+}
+
+// tunnelDohCold reports whether the tunnel-DoH path is cold: it has never answered on this
+// mux (a fresh connect), or it has failed tunnelDohColdFailureCount consecutive resolutions
+// since its last success (a mid-session stall). While cold, dns pipelines use the short
+// ColdLocalFallbackTimeout handicap and the warm probe runs (see ensureColdProber).
+func (self *UpgradeMux) tunnelDohCold() bool {
+	return !self.tunnelDohProven.Load() || tunnelDohColdFailureCount <= self.tunnelDohFailures.Load()
+}
+
+// markTunnelDohProven records a tunnel-DoH success: the full fallback handicap applies from
+// the next pipeline on.
+func (self *UpgradeMux) markTunnelDohProven() {
+	self.tunnelDohProven.Store(true)
+	self.tunnelDohFailures.Store(0)
+}
+
+// ensureColdProber runs (at most) one background warm-probe loop while the mux is cold. The
+// probe is an unraced tunnel-DoH query (DohCache.Warm): cold-phase user queries are answered
+// by the much-faster local fallback and their tunnel workers are canceled when it wins, so
+// they can lose every race — without this probe a mux whose tunnel rtt exceeds the cold
+// handicap could pin cold (leaking DNS) indefinitely. The probe proves the tunnel the moment
+// it can actually answer, restoring the full handicap.
+func (self *UpgradeMux) ensureColdProber() {
+	if self.fallbackDohCache.Load() == nil {
+		// no local fallback: nothing leaks while cold and no handicap to restore,
+		// so the probe would only add background queries
+		return
+	}
+	if !self.dnsProberRunning.CompareAndSwap(false, true) {
+		return
+	}
+	go HandleError(func() {
+		defer self.dnsProberRunning.Store(false)
+		for self.tunnelDohCold() {
+			if self.mux.Tun().DohCache().Warm(self.ctx, 1) {
+				self.markTunnelDohProven()
+				return
+			}
+			select {
+			case <-self.ctx.Done():
+				return
+			case <-time.After(dnsColdProbeInterval):
+			}
+		}
+	})
+}
+
+// WarmDns opens the DoH server connections in the background, ahead of the first user query:
+// the tunnel resolver's connections (TCP+TLS+h2 through the tunnel — the dials park until the
+// window can carry traffic and complete at the earliest usable moment, so calling this right
+// after the mux is wired to the egress self-times to tunnel-up) and the local fallback's
+// (which answer the first cold-phase queries). A successful tunnel warm also proves the
+// tunnel-DoH path (see tunnelDohCold); a failed one starts the cold probe loop.
+func (self *UpgradeMux) WarmDns() {
+	go HandleError(func() {
+		if self.mux.Tun().DohCache().Warm(self.ctx, 2) {
+			self.markTunnelDohProven()
+		} else {
+			self.ensureColdProber()
+		}
+	})
+	if fallback := self.fallbackDohCache.Load(); fallback != nil {
+		go HandleError(func() {
+			fallback.Warm(self.ctx, 2)
+		})
+	}
+}
+
+// NetworkChanged reacts to a host network path change: the pooled DoH
+// connections ride sockets that may be bound to the dead path, so drop them
+// (the answer caches are kept — resolved records stay valid across a path
+// change) and re-warm in the background; the tunnel-DoH is treated as
+// unproven again so lookups race the short cold fallback until it re-proves
+// over the new path (see tunnelDohCold).
+func (self *UpgradeMux) NetworkChanged() {
+	self.tunnelDohProven.Store(false)
+	self.mux.Tun().DohCache().Close()
+	if fallback := self.fallbackDohCache.Load(); fallback != nil {
+		fallback.Close()
+	}
+	self.WarmDns()
+}
+
+// DnsServerScores returns the per-server DoH success scores (tunnel and fallback resolvers
+// merged by max — the default fallback queries the same server urls over the host egress),
+// for the owner to persist and pass back as DnsUpgradeSettings.ServerStatsSeed next session.
+func (self *UpgradeMux) DnsServerScores() map[string]float64 {
+	scores := self.mux.Tun().DohCache().ServerScores()
+	if scores == nil {
+		scores = map[string]float64{}
+	}
+	if fallback := self.fallbackDohCache.Load(); fallback != nil {
+		for url, score := range fallback.ServerScores() {
+			if existing, ok := scores[url]; !ok || existing < score {
+				scores[url] = score
+			}
+		}
+	}
+	return scores
+}
+
+// FirstLoadSamples returns the first-load timeline measurements recorded since this mux's
+// construction (see firstLoadTimeline): dns query→answer and tcp/443 syn→synack / first byte
+// for the first flows after connect.
+func (self *UpgradeMux) FirstLoadSamples() []*FirstLoadSample {
+	return self.firstLoad.Samples()
 }
 
 // peekResult classifies a send packet by the flow the mux may claim, so the common pass-through
@@ -672,12 +885,27 @@ func (self *UpgradeMux) startDnsPipeline(key DohKey, fl *dnsFlight, recordType s
 	var resolveTimeout time.Duration
 	var responseTtl uint32
 	var localFallbackTimeout time.Duration
+	var coldLocalFallbackTimeout time.Duration
 	if dns := self.settings.Load().Dns; dns != nil {
 		resolveTimeout = dns.ResolveTimeout
 		responseTtl = dns.ResponseTtl
 		localFallbackTimeout = dns.LocalFallbackTimeout
+		coldLocalFallbackTimeout = dns.ColdLocalFallbackTimeout
 	}
 	fallback := self.fallbackDohCache.Load()
+	// while the tunnel-DoH is cold (unproven, or stalled after consecutive failures),
+	// shorten the fallback handicap so lookups stay responsive through connect — the
+	// accepted startup-leak window. The unraced warm probe is what re-proves the tunnel
+	// and restores the full handicap (cold-phase query workers are canceled when the
+	// fallback wins, so they can lose every race). Only when the fallback is enabled at
+	// all (configured AND a base handicap set) — the cold phase must never re-enable a
+	// fallback the settings disabled.
+	if fallback != nil && 0 < localFallbackTimeout && 0 < coldLocalFallbackTimeout && self.tunnelDohCold() {
+		// min: the cold phase only ever shortens the handicap
+		localFallbackTimeout = min(localFallbackTimeout, coldLocalFallbackTimeout)
+		self.ensureColdProber()
+	}
+	self.firstLoad.dnsStart(key)
 
 	var queryCtx context.Context
 	var queryCancel context.CancelFunc
@@ -728,15 +956,18 @@ func (self *UpgradeMux) startDnsPipeline(key DohKey, fl *dnsFlight, recordType s
 			}
 			self.mux.deliverDownstream(r.source, r.provideMode, r.reverse, ipOosPacket(r.reverse, respPayload))
 		}
+		self.firstLoad.dnsDone(key, true)
 	}
 
 	// workerDone retires the flight once every worker has exited without an answer, so a
 	// failed question frees its slot for the clients' retries to start a fresh pipeline.
 	workerDone := func() {
 		var cancel context.CancelFunc
+		failed := false
 		self.inflightLock.Lock()
 		fl.workers -= 1
 		if fl.workers == 0 {
+			failed = !fl.replied
 			if self.inflight[key] == fl {
 				delete(self.inflight, key)
 			}
@@ -746,6 +977,9 @@ func (self *UpgradeMux) startDnsPipeline(key DohKey, fl *dnsFlight, recordType s
 		self.inflightLock.Unlock()
 		if cancel != nil {
 			cancel()
+		}
+		if failed {
+			self.firstLoad.dnsDone(key, false)
 		}
 	}
 
@@ -769,7 +1003,16 @@ func (self *UpgradeMux) startDnsPipeline(key DohKey, fl *dnsFlight, recordType s
 		defer workerDone()
 		addrs, authoritative := self.resolveTunnelDoh(queryCtx, recordType, domain)
 		if 0 < len(addrs) || authoritative {
+			// the tunnel path works: restore the full fallback handicap (see tunnelDohCold)
+			self.markTunnelDohProven()
 			close(tunnelOk) // the tunnel won — signal the fallback to skip its local query (no leak)
+		} else {
+			// a failure here includes losing the fallback race (reply cancels the shared
+			// ctx): one loss can be a hiccup, a run of losses means the tunnel is stalled
+			// — flip cold and start the unraced probe that will re-prove recovery
+			if tunnelDohColdFailureCount <= self.tunnelDohFailures.Add(1) {
+				self.ensureColdProber()
+			}
 		}
 		reply(addrs, authoritative)
 	})
@@ -1425,6 +1668,8 @@ func (self *UpgradeMux) SendPacket(source TransferPath, provideMode protocol.Pro
 // packet (only on a new flow), so without this an active download's record would expire at
 // the idle TTL and its routing would flip from base-domain to by-IP, breaking the flow.
 func (self *UpgradeMux) Receive(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
+	// first-load timeline: one atomic load once deactivated (see firstLoadTimeline)
+	self.firstLoad.observeReceive(packet)
 	if ipPath != nil {
 		self.reverse.touch(ipPath.SourceIp)
 	}
@@ -1444,7 +1689,7 @@ func (self *UpgradeMux) SetUpstream(upstream IpMuxSend) {
 func (self *UpgradeMux) SetSettings(settings *UpgradeMuxSettings) {
 	self.settings.Store(settings)
 	self.mux.Tun().SetDnsResolverSettings(dnsResolverSettings(settings), dohRequestTimeout(settings))
-	if replaced := self.fallbackDohCache.Swap(buildFallbackDohCache(fallbackResolverSettings(settings))); replaced != nil {
+	if replaced := self.fallbackDohCache.Swap(buildFallbackDohCache(fallbackResolverSettings(settings), dnsUpgradeMemoryTarget(settings), dnsUpgradeServerStatsSeed(settings))); replaced != nil {
 		// release the replaced cache's pooled connections now instead of holding them
 		// (and their keepalive pings) until the idle timeout
 		replaced.Close()

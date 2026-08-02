@@ -22,6 +22,8 @@ package connect
 
 import (
 	"errors"
+	"sync"
+	"sync/atomic"
 
 	"google.golang.org/protobuf/encoding/protowire"
 
@@ -302,11 +304,12 @@ func marshalSendPackTransferFrame(m *sendPackFrame) []byte {
 // carrying an Ack. The inner ack frame is not session-stamped (wrapping, when
 // it happens, adds the role/companion hint to the outer encrypted frame).
 type sendAckFrame struct {
-	path       TransferPath
-	messageId  Id
-	sequenceId Id
-	selective  bool
-	tag        *protocol.Tag // nil when absent
+	path        TransferPath
+	messageId   Id
+	sequenceId  Id
+	selective   bool
+	tagSendTime uint64
+	tagSet      bool
 }
 
 func (m *sendAckFrame) sizeAck() int {
@@ -317,8 +320,8 @@ func (m *sendAckFrame) sizeAck() int {
 	if m.selective {
 		n += protoSizeTag(3) + 1
 	}
-	if m.tag != nil {
-		tagBody := sizeTagBody(m.tag.SendTime)
+	if m.tagSet {
+		tagBody := sizeTagBody(m.tagSendTime)
 		n += protoSizeTag(4) + protoSizeVarint(uint64(tagBody)) + tagBody
 	}
 	return n
@@ -331,10 +334,10 @@ func (m *sendAckFrame) appendAck(b []byte) []byte {
 		b = protoAppendTag(b, 3, protoWireVarint)
 		b = append(b, 1)
 	}
-	if m.tag != nil {
+	if m.tagSet {
 		b = protoAppendTag(b, 4, protoWireBytes)
-		b = protoAppendVarint(b, uint64(sizeTagBody(m.tag.SendTime)))
-		b = appendTagBody(b, m.tag.SendTime)
+		b = protoAppendVarint(b, uint64(sizeTagBody(m.tagSendTime)))
+		b = appendTagBody(b, m.tagSendTime)
 	}
 	return b
 }
@@ -380,6 +383,80 @@ func marshalSendAckTransferFrame(m *sendAckFrame) []byte {
 	return out
 }
 
+// --- encrypted outer TransferFrame ---
+//
+// The encrypted carrier has only transfer_path=1,
+// encrypted_transfer_frame=6, optional session_role=7, and the optional
+// session_companion=8 presence bit. The sender deliberately sets
+// session_companion even when false, so it is always emitted here. Keeping the
+// sizing/header/footer helpers separate lets sequenceCipher seal directly into
+// the pooled protobuf output buffer: no temporary ciphertext allocation and no
+// ciphertext copy.
+
+func sizeEncryptedOuterTransferFrame(
+	path TransferPath,
+	ciphertextLen int,
+	sessionRole protocol.SequenceRole,
+) int {
+	pathSize := sizeTransferPath(path)
+	n := protoSizeTag(1) + protoSizeVarint(uint64(pathSize)) + pathSize
+	n += protoSizeTag(6) + protoSizeVarint(uint64(ciphertextLen)) + ciphertextLen
+	if sessionRole != protocol.SequenceRole_SequenceRoleUnknown {
+		n += protoSizeTag(7) + protoSizeVarint(uint64(sessionRole))
+	}
+	// session_companion is an optional bool and is always present, including
+	// when its value is false.
+	n += protoSizeTag(8) + 1
+	return n
+}
+
+func appendEncryptedOuterTransferFrameHeader(
+	b []byte,
+	path TransferPath,
+	ciphertextLen int,
+) []byte {
+	pathSize := sizeTransferPath(path)
+	b = protoAppendTag(b, 1, protoWireBytes)
+	b = protoAppendVarint(b, uint64(pathSize))
+	b = appendTransferPath(b, path)
+	b = protoAppendTag(b, 6, protoWireBytes)
+	b = protoAppendVarint(b, uint64(ciphertextLen))
+	return b
+}
+
+func appendEncryptedOuterTransferFrameFooter(
+	b []byte,
+	sessionRole protocol.SequenceRole,
+	sessionCompanion bool,
+) []byte {
+	if sessionRole != protocol.SequenceRole_SequenceRoleUnknown {
+		b = protoAppendTag(b, 7, protoWireVarint)
+		b = protoAppendVarint(b, uint64(sessionRole))
+	}
+	b = protoAppendTag(b, 8, protoWireVarint)
+	if sessionCompanion {
+		return append(b, 1)
+	}
+	return append(b, 0)
+}
+
+func marshalEncryptedOuterTransferFrame(
+	path TransferPath,
+	ciphertext []byte,
+	sessionRole protocol.SequenceRole,
+	sessionCompanion bool,
+) []byte {
+	size := sizeEncryptedOuterTransferFrame(path, len(ciphertext), sessionRole)
+	buf := MessagePoolGet(size)
+	out := appendEncryptedOuterTransferFrameHeader(buf[:0], path, len(ciphertext))
+	out = append(out, ciphertext...)
+	out = appendEncryptedOuterTransferFrameFooter(out, sessionRole, sessionCompanion)
+	if cap(out) != cap(buf) {
+		MessagePoolReturn(buf)
+	}
+	return out
+}
+
 // sizeTagBody / appendTagBody encode the body of a Tag submessage
 // (send_time=1, omitted when zero per implicit presence).
 func sizeTagBody(sendTime uint64) int {
@@ -401,11 +478,11 @@ func appendTagBody(b []byte, sendTime uint64) []byte {
 //
 // Hand-rolled decode of an inbound TransferFrame into the existing protocol
 // structs, using the official protowire primitives for parsing but allocating
-// messages directly (no reflection) and copying bytes fields exactly as the
-// proto library does — so downstream lifetime semantics are unchanged (this is
-// the copy-safe variant; it does not alias the receive buffer). Two deviations
-// from a faithful decode, both allocation trims that are safe because nothing
-// reads the dropped fields on the decode paths this is used for:
+// messages directly (no reflection) and copying queued/callback bytes fields
+// exactly as the proto library does. The one deliberate alias is
+// encrypted_transfer_frame: it is consumed synchronously by AEAD.Open before
+// the outer receive buffer is returned, never queued or exposed to callbacks.
+// Two fields are also intentionally dropped:
 //   - the deprecated TransferFrame.message_type (field 3) is always skipped.
 //   - the outer transfer_path is skipped unless decodePath; routing parses the
 //     path separately via FilteredTransferPath, and only the inner/unwrapped
@@ -419,21 +496,334 @@ func copyProtoBytes(v []byte) []byte {
 	return append([]byte(nil), v...)
 }
 
-func decodeTag(b []byte) (*protocol.Tag, bool) {
-	tag := &protocol.Tag{}
+// decodedPackOwner is the explicit lifetime container for the receive hot
+// path. The protocol.Pack and its common-case Frames point into this object:
+// IDs use inline 16-byte storage, the normal one/two-frame pack uses inline
+// Frame values and pointer storage, and Tag is inline as well. The owner is
+// carried from Client.run through ReceivePack/receiveItem and returned only
+// after the synchronous receive callback and ACK tag copy have completed.
+//
+// This is deliberately not a sync.Pool. A sync.Pool has no retained-size
+// bound and is cleared at GC-defined times. The small sharded free-list below
+// retains at most decodedPackOwnerPoolCapacity objects, giving reuse without
+// turning protocol traffic bursts into an unpredictable RSS cache.
+const (
+	decodedPackOwnerInlineFrames = sendPackBatchMaxFrames
+	decodedPackOwnerPoolShards   = 4
+	// Free objects, not in-flight objects. 256 covers the parallel receive
+	// width of the production-shaped provider kernel (166 owners created in
+	// the exact profile) while bounding retained protocol + pipeline state to
+	// roughly 232 KiB (928 bytes/owner on arm64). The previous 1024 x 536-byte
+	// protocol-only cache had a ~536 KiB worst retained bound and still
+	// allocated separate ReceivePack/receiveItem envelopes.
+	decodedPackOwnerPoolCapacity = 256
+)
+
+type decodedPackOwner struct {
+	pack protocol.Pack
+
+	messageId  Id
+	sequenceId Id
+	contractId Id
+
+	frames        [decodedPackOwnerInlineFrames]protocol.Frame
+	framePointers [decodedPackOwnerInlineFrames]*protocol.Frame
+	contractFrame protocol.Frame
+	tag           protocol.Tag
+
+	// The decoded protocol values and these two pipeline envelopes have one
+	// strict succession: decode -> ReceivePack admission -> receiveItem queue
+	// / callback -> release. Keeping them in the same owner removes two heap
+	// objects per inbound pack without adding another pool, lock, or lifetime.
+	receivePack ReceivePack
+	receiveItem receiveItem
+
+	inUse bool
+}
+
+type decodedPackOwnerPoolShard struct {
+	mu    sync.Mutex
+	free  []*decodedPackOwner
+	limit int
+}
+
+type decodedPackOwnerPool struct {
+	next   atomic.Uint64
+	shards [decodedPackOwnerPoolShards]decodedPackOwnerPoolShard
+}
+
+func newDecodedPackOwnerPool() *decodedPackOwnerPool {
+	pool := &decodedPackOwnerPool{}
+	for i := range decodedPackOwnerPoolShards {
+		limit := decodedPackOwnerPoolCapacity / decodedPackOwnerPoolShards
+		if i < decodedPackOwnerPoolCapacity%decodedPackOwnerPoolShards {
+			limit += 1
+		}
+		pool.shards[i].limit = limit
+		pool.shards[i].free = make([]*decodedPackOwner, 0, limit)
+	}
+	return pool
+}
+
+var inboundDecodedPackOwners = newDecodedPackOwnerPool()
+
+func (pool *decodedPackOwnerPool) take() *decodedPackOwner {
+	start := int((pool.next.Add(1) - 1) % decodedPackOwnerPoolShards)
+	for offset := range decodedPackOwnerPoolShards {
+		shard := &pool.shards[(start+offset)%decodedPackOwnerPoolShards]
+		shard.mu.Lock()
+		n := len(shard.free)
+		if 0 < n {
+			owner := shard.free[n-1]
+			shard.free[n-1] = nil
+			shard.free = shard.free[:n-1]
+			shard.mu.Unlock()
+			owner.resetForDecode()
+			return owner
+		}
+		shard.mu.Unlock()
+	}
+	owner := &decodedPackOwner{}
+	owner.resetForDecode()
+	return owner
+}
+
+func (pool *decodedPackOwnerPool) put(owner *decodedPackOwner) {
+	start := int((pool.next.Add(1) - 1) % decodedPackOwnerPoolShards)
+	for offset := range decodedPackOwnerPoolShards {
+		shard := &pool.shards[(start+offset)%decodedPackOwnerPoolShards]
+		shard.mu.Lock()
+		if len(shard.free) < shard.limit {
+			shard.free = append(shard.free, owner)
+			shard.mu.Unlock()
+			return
+		}
+		shard.mu.Unlock()
+	}
+	// The exact aggregate retention cap is full. Let this owner be collected.
+}
+
+func (owner *decodedPackOwner) resetForDecode() {
+	owner.pack = protocol.Pack{}
+	owner.messageId = Id{}
+	owner.sequenceId = Id{}
+	owner.contractId = Id{}
+	for i := range owner.frames {
+		owner.frames[i] = protocol.Frame{}
+		owner.framePointers[i] = nil
+	}
+	owner.contractFrame = protocol.Frame{}
+	owner.tag = protocol.Tag{}
+	owner.receivePack = ReceivePack{}
+	owner.receiveItem = receiveItem{}
+	owner.pack.Frames = owner.framePointers[:0]
+	owner.inUse = true
+}
+
+func (owner *decodedPackOwner) release() {
+	if owner == nil || !owner.inUse {
+		return
+	}
+	returnDecodedPackMessageBytes(&owner.pack)
+	owner.pack = protocol.Pack{}
+	for i := range owner.frames {
+		owner.frames[i] = protocol.Frame{}
+		owner.framePointers[i] = nil
+	}
+	owner.contractFrame = protocol.Frame{}
+	owner.tag = protocol.Tag{}
+	owner.receivePack = ReceivePack{}
+	owner.receiveItem = receiveItem{}
+	owner.inUse = false
+	inboundDecodedPackOwners.put(owner)
+}
+
+func setInlineProtoId(dst *[]byte, storage *Id, value []byte) bool {
+	if len(value) != len(storage) {
+		return false
+	}
+	copy(storage[:], value)
+	*dst = storage[:]
+	return true
+}
+
+func (owner *decodedPackOwner) nextFrame() *protocol.Frame {
+	index := len(owner.pack.Frames)
+	if index < len(owner.frames) {
+		frame := &owner.frames[index]
+		owner.framePointers[index] = frame
+		return frame
+	}
+	// A conforming current sender emits at most two data frames per Pack.
+	// Preserve wire compatibility for legacy/untrusted peers with more fields,
+	// but keep that exceptional memory proportional to the exceptional input.
+	return &protocol.Frame{}
+}
+
+// decodedTransferFrame keeps every non-queued receive-side protobuf wrapper
+// either on the caller's stack or in decodedPackOwner. The path/role fields are
+// only inspected synchronously; Pack ownership can be detached and handed to
+// the receive queue.
+type decodedTransferFrame struct {
+	frame protocol.TransferFrame
+
+	path        protocol.TransferPath
+	pathIds     [3]Id
+	carrier     protocol.Frame
+	packOwner   *decodedPackOwner
+	sessionRole protocol.SequenceRole
+	companion   bool
+}
+
+// decodedTransferFrame itself contains pointer-bearing protobuf views into its
+// inline path/role storage, so Go conservatively moves it to the heap. Reuse
+// those synchronous wrappers through a second, much smaller bounded cache.
+// At 384 bytes/object on arm64, the 256-object cap retains at most 96 KiB.
+const decodedTransferFramePoolCapacity = 256
+
+type decodedTransferFramePoolShard struct {
+	mu    sync.Mutex
+	free  []*decodedTransferFrame
+	limit int
+}
+
+type decodedTransferFramePool struct {
+	next   atomic.Uint64
+	shards [decodedPackOwnerPoolShards]decodedTransferFramePoolShard
+}
+
+func newDecodedTransferFramePool() *decodedTransferFramePool {
+	pool := &decodedTransferFramePool{}
+	for i := range decodedPackOwnerPoolShards {
+		limit := decodedTransferFramePoolCapacity / decodedPackOwnerPoolShards
+		if i < decodedTransferFramePoolCapacity%decodedPackOwnerPoolShards {
+			limit += 1
+		}
+		pool.shards[i].limit = limit
+		pool.shards[i].free = make([]*decodedTransferFrame, 0, limit)
+	}
+	return pool
+}
+
+var inboundDecodedTransferFrames = newDecodedTransferFramePool()
+
+func (pool *decodedTransferFramePool) take() *decodedTransferFrame {
+	start := int((pool.next.Add(1) - 1) % decodedPackOwnerPoolShards)
+	for offset := range decodedPackOwnerPoolShards {
+		shard := &pool.shards[(start+offset)%decodedPackOwnerPoolShards]
+		shard.mu.Lock()
+		n := len(shard.free)
+		if 0 < n {
+			decoded := shard.free[n-1]
+			shard.free[n-1] = nil
+			shard.free = shard.free[:n-1]
+			shard.mu.Unlock()
+			return decoded
+		}
+		shard.mu.Unlock()
+	}
+	return &decodedTransferFrame{}
+}
+
+func (pool *decodedTransferFramePool) put(decoded *decodedTransferFrame) {
+	if decoded == nil {
+		return
+	}
+	decoded.release()
+	*decoded = decodedTransferFrame{}
+
+	start := int((pool.next.Add(1) - 1) % decodedPackOwnerPoolShards)
+	for offset := range decodedPackOwnerPoolShards {
+		shard := &pool.shards[(start+offset)%decodedPackOwnerPoolShards]
+		shard.mu.Lock()
+		if len(shard.free) < shard.limit {
+			shard.free = append(shard.free, decoded)
+			shard.mu.Unlock()
+			return
+		}
+		shard.mu.Unlock()
+	}
+}
+
+func (decoded *decodedTransferFrame) release() {
+	if decoded == nil {
+		return
+	}
+	returnDecodedFrameMessageBytes(decoded.frame.Frame)
+	decoded.frame.Frame = nil
+	if decoded.packOwner != nil {
+		decoded.packOwner.release()
+		decoded.packOwner = nil
+		decoded.frame.Pack = nil
+	} else {
+		returnDecodedPackMessageBytes(decoded.frame.Pack)
+		decoded.frame.Pack = nil
+	}
+	decoded.frame.TransferPath = nil
+	decoded.frame.EncryptedTransferFrame = nil
+	decoded.frame.SessionRole = nil
+	decoded.frame.SessionCompanion = nil
+}
+
+func (decoded *decodedTransferFrame) detachPackOwner() *decodedPackOwner {
+	if decoded == nil {
+		return nil
+	}
+	owner := decoded.packOwner
+	decoded.packOwner = nil
+	decoded.frame.Pack = nil
+	return owner
+}
+
+// Decoded Frame.message_bytes use the bounded message pools rather than one
+// GC allocation per wire frame. Their lifetime is tied to the decoded
+// TransferFrame/receive item; these helpers centralize every release path.
+// MessagePoolReturn is a no-op for legacy proto.Unmarshal allocations, so the
+// helpers are also safe on mixed v1/v2 values.
+func returnDecodedFrameMessageBytes(f *protocol.Frame) {
+	if f != nil {
+		MessagePoolReturn(f.MessageBytes)
+		f.MessageBytes = nil
+	}
+}
+
+func returnDecodedPackMessageBytes(pack *protocol.Pack) {
+	if pack == nil {
+		return
+	}
+	for _, f := range pack.Frames {
+		returnDecodedFrameMessageBytes(f)
+	}
+	returnDecodedFrameMessageBytes(pack.ContractFrame)
+	pack.Frames = nil
+	pack.ContractFrame = nil
+}
+
+func returnDecodedTransferFrameMessageBytes(tf *protocol.TransferFrame) {
+	if tf == nil {
+		return
+	}
+	returnDecodedFrameMessageBytes(tf.Frame)
+	returnDecodedPackMessageBytes(tf.Pack)
+	tf.Frame = nil
+	tf.Pack = nil
+}
+
+func decodeTagInto(b []byte, tag *protocol.Tag) bool {
+	*tag = protocol.Tag{}
 	for 0 < len(b) {
 		num, typ, n := protowire.ConsumeTag(b)
 		if n < 0 {
-			return nil, false
+			return false
 		}
 		b = b[n:]
 		if num == 1 { // send_time
 			if typ != protowire.VarintType {
-				return nil, false
+				return false
 			}
 			v, vn := protowire.ConsumeVarint(b)
 			if vn < 0 {
-				return nil, false
+				return false
 			}
 			b = b[vn:]
 			tag.SendTime = v
@@ -441,102 +831,146 @@ func decodeTag(b []byte) (*protocol.Tag, bool) {
 		}
 		fn := protowire.ConsumeFieldValue(num, typ, b)
 		if fn < 0 {
-			return nil, false
+			return false
 		}
 		b = b[fn:]
+	}
+	return true
+}
+
+func decodeTag(b []byte) (*protocol.Tag, bool) {
+	tag := &protocol.Tag{}
+	if !decodeTagInto(b, tag) {
+		return nil, false
 	}
 	return tag, true
 }
 
-func decodeFrame(b []byte) (*protocol.Frame, bool) {
-	f := &protocol.Frame{}
+func decodeFrameInto(b []byte, f *protocol.Frame) (ok bool) {
+	*f = protocol.Frame{}
+	defer func() {
+		if !ok {
+			returnDecodedFrameMessageBytes(f)
+		}
+	}()
 	for 0 < len(b) {
 		num, typ, n := protowire.ConsumeTag(b)
 		if n < 0 {
-			return nil, false
+			return false
 		}
 		b = b[n:]
 		switch num {
 		case 1: // message_type
 			if typ != protowire.VarintType {
-				return nil, false
+				return false
 			}
 			v, vn := protowire.ConsumeVarint(b)
 			if vn < 0 {
-				return nil, false
+				return false
 			}
 			b = b[vn:]
 			f.MessageType = protocol.MessageType(v)
 		case 2: // message_bytes
 			if typ != protowire.BytesType {
-				return nil, false
+				return false
 			}
 			v, vn := protowire.ConsumeBytes(b)
 			if vn < 0 {
-				return nil, false
+				return false
 			}
 			b = b[vn:]
-			f.MessageBytes = copyProtoBytes(v)
+			// Last value wins for a repeated singular field, matching proto.
+			returnDecodedFrameMessageBytes(f)
+			if 0 < len(v) {
+				f.MessageBytes = MessagePoolCopy(v)
+			}
 		case 3: // raw
 			if typ != protowire.VarintType {
-				return nil, false
+				return false
 			}
 			v, vn := protowire.ConsumeVarint(b)
 			if vn < 0 {
-				return nil, false
+				return false
 			}
 			b = b[vn:]
 			f.Raw = protowire.DecodeBool(v)
 		default:
 			fn := protowire.ConsumeFieldValue(num, typ, b)
 			if fn < 0 {
-				return nil, false
+				return false
 			}
 			b = b[fn:]
 		}
 	}
+	return true
+}
+
+func decodeFrame(b []byte) (*protocol.Frame, bool) {
+	f := &protocol.Frame{}
+	if !decodeFrameInto(b, f) {
+		return nil, false
+	}
 	return f, true
 }
 
-func decodeTransferPathProto(b []byte) (*protocol.TransferPath, bool) {
-	path := &protocol.TransferPath{}
+func decodeTransferPathProtoInto(b []byte, path *protocol.TransferPath, idStorage *[3]Id) bool {
+	*path = protocol.TransferPath{}
 	for 0 < len(b) {
 		num, typ, n := protowire.ConsumeTag(b)
 		if n < 0 {
-			return nil, false
+			return false
 		}
 		b = b[n:]
 		switch num {
 		case 1, 2, 3:
 			if typ != protowire.BytesType {
-				return nil, false
+				return false
 			}
 			v, vn := protowire.ConsumeBytes(b)
 			if vn < 0 {
-				return nil, false
+				return false
 			}
 			b = b[vn:]
+			var dst *[]byte
 			switch num {
 			case 1:
-				path.DestinationId = copyProtoBytes(v)
+				dst = &path.DestinationId
 			case 2:
-				path.SourceId = copyProtoBytes(v)
+				dst = &path.SourceId
 			case 3:
-				path.StreamId = copyProtoBytes(v)
+				dst = &path.StreamId
+			}
+			if idStorage == nil {
+				*dst = copyProtoBytes(v)
+			} else if !setInlineProtoId(dst, &idStorage[num-1], v) {
+				return false
 			}
 		default:
 			fn := protowire.ConsumeFieldValue(num, typ, b)
 			if fn < 0 {
-				return nil, false
+				return false
 			}
 			b = b[fn:]
 		}
 	}
+	return true
+}
+
+func decodeTransferPathProto(b []byte) (*protocol.TransferPath, bool) {
+	path := &protocol.TransferPath{}
+	if !decodeTransferPathProtoInto(b, path, nil) {
+		return nil, false
+	}
 	return path, true
 }
 
-func decodePack(b []byte) (*protocol.Pack, bool) {
-	pack := &protocol.Pack{}
+func decodePack(b []byte) (pack *protocol.Pack, success bool) {
+	pack = &protocol.Pack{}
+	defer func() {
+		if !success {
+			returnDecodedPackMessageBytes(pack)
+		}
+	}()
 	for 0 < len(b) {
 		num, typ, n := protowire.ConsumeTag(b)
 		if n < 0 {
@@ -607,6 +1041,7 @@ func decodePack(b []byte) (*protocol.Pack, bool) {
 			if num == 5 {
 				pack.Frames = append(pack.Frames, f)
 			} else {
+				returnDecodedFrameMessageBytes(pack.ContractFrame)
 				pack.ContractFrame = f
 			}
 		case 8: // tag (Tag)
@@ -632,6 +1067,130 @@ func decodePack(b []byte) (*protocol.Pack, bool) {
 		}
 	}
 	return pack, true
+}
+
+func decodePackOwned(b []byte) (owner *decodedPackOwner, success bool) {
+	owner = inboundDecodedPackOwners.take()
+	pack := &owner.pack
+	defer func() {
+		if !success {
+			owner.release()
+			owner = nil
+		}
+	}()
+
+	for 0 < len(b) {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			return nil, false
+		}
+		b = b[n:]
+		switch num {
+		case 1, 2, 9: // message_id, sequence_id, contract_id (16-byte ids)
+			if typ != protowire.BytesType {
+				return nil, false
+			}
+			v, vn := protowire.ConsumeBytes(b)
+			if vn < 0 {
+				return nil, false
+			}
+			b = b[vn:]
+			var dst *[]byte
+			var storage *Id
+			switch num {
+			case 1:
+				dst, storage = &pack.MessageId, &owner.messageId
+			case 2:
+				dst, storage = &pack.SequenceId, &owner.sequenceId
+			case 9:
+				dst, storage = &pack.ContractId, &owner.contractId
+			}
+			// These fields are protocol IDs, not arbitrary bytes. Rejecting a
+			// wrong width here is equivalent to the caller's IdFromBytes check,
+			// and prevents malformed input from forcing an exceptional heap copy.
+			if !setInlineProtoId(dst, storage, v) {
+				return nil, false
+			}
+		case 3: // sequence_number
+			if typ != protowire.VarintType {
+				return nil, false
+			}
+			v, vn := protowire.ConsumeVarint(b)
+			if vn < 0 {
+				return nil, false
+			}
+			b = b[vn:]
+			pack.SequenceNumber = v
+		case 4: // head
+			if typ != protowire.VarintType {
+				return nil, false
+			}
+			v, vn := protowire.ConsumeVarint(b)
+			if vn < 0 {
+				return nil, false
+			}
+			b = b[vn:]
+			pack.Head = protowire.DecodeBool(v)
+		case 6: // nack
+			if typ != protowire.VarintType {
+				return nil, false
+			}
+			v, vn := protowire.ConsumeVarint(b)
+			if vn < 0 {
+				return nil, false
+			}
+			b = b[vn:]
+			pack.Nack = protowire.DecodeBool(v)
+		case 5: // frames (repeated)
+			if typ != protowire.BytesType {
+				return nil, false
+			}
+			v, vn := protowire.ConsumeBytes(b)
+			if vn < 0 {
+				return nil, false
+			}
+			b = b[vn:]
+			frame := owner.nextFrame()
+			if !decodeFrameInto(v, frame) {
+				return nil, false
+			}
+			pack.Frames = append(pack.Frames, frame)
+		case 7: // contract_frame
+			if typ != protowire.BytesType {
+				return nil, false
+			}
+			v, vn := protowire.ConsumeBytes(b)
+			if vn < 0 {
+				return nil, false
+			}
+			b = b[vn:]
+			returnDecodedFrameMessageBytes(pack.ContractFrame)
+			if !decodeFrameInto(v, &owner.contractFrame) {
+				return nil, false
+			}
+			pack.ContractFrame = &owner.contractFrame
+		case 8: // tag
+			if typ != protowire.BytesType {
+				return nil, false
+			}
+			v, vn := protowire.ConsumeBytes(b)
+			if vn < 0 {
+				return nil, false
+			}
+			b = b[vn:]
+			if !decodeTagInto(v, &owner.tag) {
+				return nil, false
+			}
+			pack.Tag = &owner.tag
+		default:
+			fn := protowire.ConsumeFieldValue(num, typ, b)
+			if fn < 0 {
+				return nil, false
+			}
+			b = b[fn:]
+		}
+	}
+	return owner, true
 }
 
 func decodeAck(b []byte) (*protocol.Ack, bool) {
@@ -696,7 +1255,26 @@ func decodeAck(b []byte) (*protocol.Ack, bool) {
 // message_type/transfer_path deviations). decodePath controls whether the
 // transfer_path is materialized (true for the inner/unwrapped frame, which is
 // tamper-checked against the routing path; false for the outer frame).
+//
+// Tests and compatibility callers use this allocating form. Client.run uses
+// unmarshalOwnedTransferFrame below so queued protocol values have an explicit
+// bounded owner and the synchronous wrapper fields stay inline.
 func unmarshalTransferFrame(b []byte, tf *protocol.TransferFrame, decodePath bool) bool {
+	return unmarshalTransferFrameInto(b, tf, decodePath, nil)
+}
+
+func unmarshalOwnedTransferFrame(b []byte, decoded *decodedTransferFrame, decodePath bool) bool {
+	decoded.release()
+	*decoded = decodedTransferFrame{}
+	return unmarshalTransferFrameInto(b, &decoded.frame, decodePath, decoded)
+}
+
+func unmarshalTransferFrameInto(
+	b []byte,
+	tf *protocol.TransferFrame,
+	decodePath bool,
+	decoded *decodedTransferFrame,
+) bool {
 	for 0 < len(b) {
 		num, typ, n := protowire.ConsumeTag(b)
 		if n < 0 {
@@ -714,11 +1292,18 @@ func unmarshalTransferFrame(b []byte, tf *protocol.TransferFrame, decodePath boo
 			}
 			b = b[vn:]
 			if decodePath {
-				p, ok := decodeTransferPathProto(v)
-				if !ok {
-					return false
+				if decoded == nil {
+					p, ok := decodeTransferPathProto(v)
+					if !ok {
+						return false
+					}
+					tf.TransferPath = p
+				} else {
+					if !decodeTransferPathProtoInto(v, &decoded.path, &decoded.pathIds) {
+						return false
+					}
+					tf.TransferPath = &decoded.path
 				}
-				tf.TransferPath = p
 			}
 			// else skip: the outer path is unused (routing uses FilteredTransferPath)
 		case 2: // frame (deprecated v1 carrier)
@@ -730,11 +1315,19 @@ func unmarshalTransferFrame(b []byte, tf *protocol.TransferFrame, decodePath boo
 				return false
 			}
 			b = b[vn:]
-			f, ok := decodeFrame(v)
-			if !ok {
-				return false
+			returnDecodedFrameMessageBytes(tf.Frame)
+			if decoded == nil {
+				f, ok := decodeFrame(v)
+				if !ok {
+					return false
+				}
+				tf.Frame = f
+			} else {
+				if !decodeFrameInto(v, &decoded.carrier) {
+					return false
+				}
+				tf.Frame = &decoded.carrier
 			}
-			tf.Frame = f
 		case 3: // message_type (deprecated) — skip, nothing reads it
 			if typ != protowire.VarintType {
 				return false
@@ -753,11 +1346,25 @@ func unmarshalTransferFrame(b []byte, tf *protocol.TransferFrame, decodePath boo
 				return false
 			}
 			b = b[vn:]
-			p, ok := decodePack(v)
-			if !ok {
-				return false
+			if decoded == nil {
+				p, ok := decodePack(v)
+				if !ok {
+					return false
+				}
+				returnDecodedPackMessageBytes(tf.Pack)
+				tf.Pack = p
+			} else {
+				if decoded.packOwner != nil {
+					decoded.packOwner.release()
+					decoded.packOwner = nil
+				}
+				owner, ok := decodePackOwned(v)
+				if !ok {
+					return false
+				}
+				decoded.packOwner = owner
+				tf.Pack = &owner.pack
 			}
-			tf.Pack = p
 		case 5: // ack
 			if typ != protowire.BytesType {
 				return false
@@ -781,7 +1388,11 @@ func unmarshalTransferFrame(b []byte, tf *protocol.TransferFrame, decodePath boo
 				return false
 			}
 			b = b[vn:]
-			tf.EncryptedTransferFrame = copyProtoBytes(v)
+			// The client decrypts this immediately, before returning the outer
+			// transfer buffer. Aliasing avoids a full ciphertext allocation and
+			// copy on every encrypted frame while preserving all queued/callback
+			// field lifetimes.
+			tf.EncryptedTransferFrame = v
 		case 7: // session_role (enum)
 			if typ != protowire.VarintType {
 				return false
@@ -791,8 +1402,13 @@ func unmarshalTransferFrame(b []byte, tf *protocol.TransferFrame, decodePath boo
 				return false
 			}
 			b = b[vn:]
-			sr := protocol.SequenceRole(v)
-			tf.SessionRole = &sr
+			if decoded == nil {
+				sr := protocol.SequenceRole(v)
+				tf.SessionRole = &sr
+			} else {
+				decoded.sessionRole = protocol.SequenceRole(v)
+				tf.SessionRole = &decoded.sessionRole
+			}
 		case 8: // session_companion (bool)
 			if typ != protowire.VarintType {
 				return false
@@ -802,8 +1418,13 @@ func unmarshalTransferFrame(b []byte, tf *protocol.TransferFrame, decodePath boo
 				return false
 			}
 			b = b[vn:]
-			c := protowire.DecodeBool(v)
-			tf.SessionCompanion = &c
+			if decoded == nil {
+				c := protowire.DecodeBool(v)
+				tf.SessionCompanion = &c
+			} else {
+				decoded.companion = protowire.DecodeBool(v)
+				tf.SessionCompanion = &decoded.companion
+			}
 		default:
 			fn := protowire.ConsumeFieldValue(num, typ, b)
 			if fn < 0 {

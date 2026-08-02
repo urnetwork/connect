@@ -65,19 +65,34 @@ type ContractStatus struct {
 type ContractStatusFunction = func(ContractStatus *ContractStatus)
 
 type contractStatusCallbackWorker struct {
-	ctx                     context.Context
-	cancel                  context.CancelFunc
-	callback                ContractStatusFunction
-	receiveContractStatuses chan *ContractStatus
+	ctx      context.Context
+	cancel   context.CancelFunc
+	callback ContractStatusFunction
+
+	// Status delivery is observability/control feedback, not the Client
+	// send/receive/forward backpressure contract. A suspended observer must not
+	// eventually fill a channel and park HandleControlFrame. Keep the latest
+	// status per contract key in a bounded ordered set instead.
+	stateLock  sync.Mutex
+	pending    map[ContractKey]*ContractStatus
+	order      []ContractKey
+	orderHead  int
+	orderCount int
+	maxCount   int
+	closed     bool
+	notify     chan struct{}
 }
 
 func newContractStatusCallbackWorker(ctx context.Context, callback ContractStatusFunction, bufferSize int) *contractStatusCallbackWorker {
 	callbackCtx, cancel := context.WithCancel(ctx)
 	worker := &contractStatusCallbackWorker{
-		ctx:                     callbackCtx,
-		cancel:                  cancel,
-		callback:                callback,
-		receiveContractStatuses: make(chan *ContractStatus, bufferSize),
+		ctx:      callbackCtx,
+		cancel:   cancel,
+		callback: callback,
+		pending:  map[ContractKey]*ContractStatus{},
+		order:    make([]ContractKey, max(1, bufferSize)),
+		maxCount: max(1, bufferSize),
+		notify:   make(chan struct{}, 1),
 	}
 	go HandleError(worker.run, cancel)
 	return worker
@@ -88,10 +103,22 @@ func (self *contractStatusCallbackWorker) run() {
 		select {
 		case <-self.ctx.Done():
 			return
-		case contractStatus := <-self.receiveContractStatuses:
-			if self.ctx.Err() != nil {
-				return
+		case <-self.notify:
+		}
+		for {
+			self.stateLock.Lock()
+			if self.closed || self.orderCount == 0 {
+				self.stateLock.Unlock()
+				break
 			}
+			key := self.order[self.orderHead]
+			self.order[self.orderHead] = ContractKey{}
+			self.orderHead = (self.orderHead + 1) % self.maxCount
+			self.orderCount -= 1
+			contractStatus := self.pending[key]
+			delete(self.pending, key)
+			self.stateLock.Unlock()
+
 			HandleError(func() {
 				self.callback(contractStatus)
 			})
@@ -100,13 +127,51 @@ func (self *contractStatusCallbackWorker) run() {
 }
 
 func (self *contractStatusCallbackWorker) Dispatch(contractStatus *ContractStatus) {
+	if contractStatus == nil {
+		return
+	}
+	cloned := *contractStatus
+
+	self.stateLock.Lock()
+	if self.closed {
+		self.stateLock.Unlock()
+		return
+	}
+	key := cloned.Key
+	if _, ok := self.pending[key]; !ok {
+		if self.maxCount <= self.orderCount {
+			evictedKey := self.order[self.orderHead]
+			delete(self.pending, evictedKey)
+			// Full ring: overwrite the oldest slot with the new tail, then
+			// advance head so the following oldest stays at the front.
+			self.order[self.orderHead] = key
+			self.orderHead = (self.orderHead + 1) % self.maxCount
+		} else {
+			tail := (self.orderHead + self.orderCount) % self.maxCount
+			self.order[tail] = key
+			self.orderCount += 1
+		}
+	}
+	self.pending[key] = &cloned
+	self.stateLock.Unlock()
+
 	select {
 	case <-self.ctx.Done():
-	case self.receiveContractStatuses <- contractStatus:
+	case self.notify <- struct{}{}:
+	default:
 	}
 }
 
 func (self *contractStatusCallbackWorker) Close() {
+	self.stateLock.Lock()
+	if self.closed {
+		self.stateLock.Unlock()
+		return
+	}
+	self.closed = true
+	clear(self.pending)
+	self.order = nil
+	self.stateLock.Unlock()
 	self.cancel()
 }
 

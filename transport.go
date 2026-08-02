@@ -201,6 +201,22 @@ type PlatformTransport struct {
 	// transport to come up before closing the old one (CONNECTDRAIN2.md §3.3)
 	registeredCount  atomic.Int64
 	connectedMonitor *Monitor
+
+	// kickMonitor closes the live connection (if any) so the run loop
+	// re-dials immediately — fired on a host network path change
+	// (NetworkChanged), where the current socket is likely bound to a dead
+	// path and would otherwise linger until a ping/write timeout notices.
+	kickMonitor *Monitor
+	// unsubNetworkChange removes this transport from the process
+	// network-change listeners on Close.
+	unsubNetworkChange func()
+}
+
+// Kick closes the transport's live connection (if any) so the run loop
+// re-dials immediately. The transport itself stays up; an in-flight dial is
+// unaffected. Safe to call at any time.
+func (self *PlatformTransport) Kick() {
+	self.kickMonitor.NotifyAll()
 }
 
 // IsConnected reports whether the transport has a connection with routes
@@ -297,8 +313,17 @@ func NewPlatformTransportWithTargetMode(
 		targetMode:           targetMode,
 		mode:                 NewMonitorValue(TransportModeNone),
 		connectedMonitor:     NewMonitor(),
+		kickMonitor:          NewMonitor(),
 	}
-	go HandleError(transport.run, cancel)
+	// a host network path change kicks the live connection so the re-dial
+	// happens now instead of after a ping/write timeout notices the dead path.
+	// unsubscribe rides the run loop exit (ctx cancel), not just Close — most
+	// owners tear transports down by canceling the client ctx.
+	transport.unsubNetworkChange = AddNetworkChangeListener(transport.Kick)
+	go HandleError(func() {
+		defer transport.unsubNetworkChange()
+		transport.run()
+	}, cancel)
 	return transport
 }
 
@@ -599,6 +624,11 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			select {
 			case <-self.ctx.Done():
 				return
+			case <-self.kickMonitor.NotifyChannel():
+				// network changed: the failed dial was likely on the dead
+				// path — retry now over the new one instead of waiting out
+				// the backoff
+				continue
 			case <-reconnect.After():
 				continue
 			}
@@ -612,6 +642,19 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 			handleCtx, handleCancel := context.WithCancel(self.ctx)
 			defer handleCancel()
+
+			// a network-change kick closes this connection so the loop
+			// re-dials over the new path immediately (see Kick)
+			kick := self.kickMonitor.NotifyChannel()
+			go HandleError(func() {
+				select {
+				case <-handleCtx.Done():
+				case <-kick:
+					self.log.Infof("[t]kick: closing connection for re-dial\n")
+					handleCancel()
+					ws.Close()
+				}
+			})
 
 			var readCounter atomic.Uint64
 			var writeCounter atomic.Uint64
@@ -1213,6 +1256,10 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			select {
 			case <-self.ctx.Done():
 				return
+			case <-self.kickMonitor.NotifyChannel():
+				// network changed: retry now over the new path (see the h1
+				// loop above)
+				continue
 			case <-reconnect.After():
 				continue
 			}
@@ -1228,6 +1275,19 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 
 			handleCtx, handleCancel := context.WithCancel(self.ctx)
 			defer handleCancel()
+
+			// a network-change kick closes this connection so the loop
+			// re-dials over the new path immediately (see Kick)
+			kick := self.kickMonitor.NotifyChannel()
+			go HandleError(func() {
+				select {
+				case <-handleCtx.Done():
+				case <-kick:
+					self.log.Infof("[t]kick: closing connection for re-dial\n")
+					handleCancel()
+					conn.CloseWithError(0, "network change")
+				}
+			})
 
 			framer := NewFramer(self.settings.FramerSettings)
 
@@ -1417,6 +1477,9 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 
 func (self *PlatformTransport) Close() {
 	self.cancel()
+	if self.unsubNetworkChange != nil {
+		self.unsubNetworkChange()
+	}
 }
 
 func connectHost(platformUrl string) (string, error) {

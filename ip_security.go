@@ -51,9 +51,10 @@ func (self SecurityPolicyResult) String() string {
 
 type SecurityPolicy interface {
 	Stats() *SecurityPolicyStatsCollector
+	// ipPath, its address slices, and payload are read-only and valid only for
+	// the duration of each call. Implementations that retain them must copy.
 	// InspectEgress decides the fate of a packet on the send (client->destination)
-	// direction. payload is the L4 payload (may be nil for header-only inspection); it is
-	// valid only for the duration of the call.
+	// direction. payload is the L4 payload (may be nil for header-only inspection).
 	InspectEgress(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error)
 	// InspectIngress decides the fate of a packet on the return (destination->client)
 	// direction.

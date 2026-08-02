@@ -43,6 +43,14 @@ type MultiClientIdentityStore interface {
 	LoadWindowClientIdentities() []*WindowClientIdentity
 }
 
+// MultiClientIdentityStoreContext is the cancellation-aware load capability.
+// Remote stores should implement it so abandoning optional restoration also
+// terminates the underlying Redis/database request. Legacy stores remain
+// supported and are isolated to one load worker per identity state.
+type MultiClientIdentityStoreContext interface {
+	LoadWindowClientIdentitiesContext(ctx context.Context) []*WindowClientIdentity
+}
+
 // MultiClientGeneratorWithDestination is an optional generator extension:
 // mint client args bound to a destination, so a persisted identity for that
 // destination can be reused. The window expand path prefers this over
@@ -50,6 +58,19 @@ type MultiClientIdentityStore interface {
 type MultiClientGeneratorWithDestination interface {
 	NewClientArgsForDestination(destination MultiHopId) (*MultiClientGeneratorClientArgs, error)
 }
+
+// MultiClientGeneratorWithDestinationContext is the maintenance-bounded form
+// of MultiClientGeneratorWithDestination. Implementations must return when ctx
+// is done. The API generator uses it so a stalled auth call cannot park the
+// window's only candidate producer.
+type MultiClientGeneratorWithDestinationContext interface {
+	NewClientArgsForDestinationContext(ctx context.Context, destination MultiHopId) (*MultiClientGeneratorClientArgs, error)
+}
+
+// A normal quality+speed window retains at most 16 clients with the default
+// hard maxima. Allow several generations of slack for an imperfect store
+// snapshot, but never retain an unbounded remote result.
+const maxRestoredWindowIdentityCount = 64
 
 // windowIdentityState is the generator-side bookkeeping for identity
 // persistence: restored identities pending reuse, and the live pairs backing
@@ -71,8 +92,19 @@ type windowIdentityState struct {
 	ctx   context.Context
 	store MultiClientIdentityStore
 
-	mutex    sync.Mutex
-	loadOnce bool
+	mutex sync.Mutex
+	// Loading is one asynchronous single-flight operation. The store may be a
+	// remote Redis adapter and can stall for minutes; it must never run under
+	// mutex or on either window's sole enumeration goroutine. Callers wait with
+	// their own deadline. The first deadline abandons continuity restoration
+	// (the late result is discarded) so fresh provider discovery can proceed.
+	loadStarted   bool
+	loadFinished  bool
+	loadAbandoned bool
+	loadErr       error
+	loadDone      chan struct{}
+	loadCtx       context.Context
+	cancelLoad    context.CancelFunc
 	// restored identities pending reuse, by destination. A destination can
 	// carry SEVERAL identities (the window may run more than one client to
 	// the same destination, e.g. a racy initial double-expand), so each
@@ -95,15 +127,26 @@ type windowIdentityState struct {
 }
 
 func newWindowIdentityState(ctx context.Context, store MultiClientIdentityStore) *windowIdentityState {
+	loadCtx, cancelLoad := context.WithCancel(ctx)
 	state := &windowIdentityState{
 		ctx:         ctx,
 		store:       store,
 		restored:    map[MultiHopId][]*WindowClientIdentity{},
 		live:        map[Id]*WindowClientIdentity{},
+		loadDone:    make(chan struct{}),
+		loadCtx:     loadCtx,
+		cancelLoad:  cancelLoad,
 		writeNotify: make(chan struct{}, 1),
 	}
 	if store != nil {
 		go HandleError(state.runStoreWriter)
+		// Start the optional continuity read as soon as the store is attached.
+		// In the common case it completes before the first enumeration, taking
+		// the remote-store round trip off the formation critical path. The
+		// external call still runs outside mutex in one failure-isolated worker.
+		state.mutex.Lock()
+		state.startLoadWithLock()
+		state.mutex.Unlock()
 	}
 	return state
 }
@@ -114,46 +157,130 @@ func (self *windowIdentityState) hasStore() bool {
 	return self.store != nil
 }
 
-// loadWithLock reads the persisted identities once.
-func (self *windowIdentityState) loadWithLock() {
-	if self.loadOnce {
+// startLoadWithLock starts the one store load without holding mutex across the
+// external call. The caller holds mutex.
+func (self *windowIdentityState) startLoadWithLock() {
+	if self.loadStarted {
 		return
 	}
-	self.loadOnce = true
+	self.loadStarted = true
 	if self.store == nil {
+		self.loadFinished = true
+		close(self.loadDone)
 		return
 	}
-	for _, identity := range self.store.LoadWindowClientIdentities() {
-		if identity == nil {
-			continue
+	go self.load()
+}
+
+func (self *windowIdentityState) load() {
+	var identities []*WindowClientIdentity
+	var loadErr error
+	HandleError(func() {
+		if store, ok := self.store.(MultiClientIdentityStoreContext); ok {
+			identities = store.LoadWindowClientIdentitiesContext(self.loadCtx)
+		} else {
+			identities = self.store.LoadWindowClientIdentities()
 		}
-		self.restored[identity.Destination] = append(self.restored[identity.Destination], identity)
+	}, func(err error) {
+		loadErr = err
+	})
+	self.cancelLoad()
+
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	if !self.loadAbandoned && loadErr == nil {
+		restoredCount := 0
+		for _, identity := range identities {
+			if identity == nil {
+				continue
+			}
+			if maxRestoredWindowIdentityCount <= restoredCount {
+				break
+			}
+			self.restored[identity.Destination] = append(self.restored[identity.Destination], identity)
+			restoredCount += 1
+		}
+	}
+	self.loadErr = loadErr
+	self.loadFinished = true
+	close(self.loadDone)
+}
+
+func (self *windowIdentityState) waitForLoad(ctx context.Context) error {
+	self.mutex.Lock()
+	self.startLoadWithLock()
+	if self.loadAbandoned {
+		self.mutex.Unlock()
+		return nil
+	}
+	if self.loadFinished {
+		err := self.loadErr
+		self.mutex.Unlock()
+		return err
+	}
+	loadDone := self.loadDone
+	self.mutex.Unlock()
+
+	select {
+	case <-loadDone:
+		self.mutex.Lock()
+		err := self.loadErr
+		self.mutex.Unlock()
+		return err
+	case <-ctx.Done():
+		self.mutex.Lock()
+		// Resolve a completion/deadline race in favor of a completed load.
+		if self.loadFinished {
+			err := self.loadErr
+			self.mutex.Unlock()
+			return err
+		}
+		self.loadAbandoned = true
+		self.mutex.Unlock()
+		// A context-aware remote store exits its underlying request. A legacy
+		// store may remain parked, but still owns only this one bounded worker.
+		self.cancelLoad()
+		return ctx.Err()
 	}
 }
 
 // RestoredDestinations returns the destinations with an identity pending
 // reuse, so the window expand can dial them first.
 func (self *windowIdentityState) RestoredDestinations() []MultiHopId {
+	destinations, _ := self.RestoredDestinationsContext(self.ctx)
+	return destinations
+}
+
+func (self *windowIdentityState) RestoredDestinationsContext(ctx context.Context) ([]MultiHopId, error) {
+	if err := self.waitForLoad(ctx); err != nil {
+		return nil, err
+	}
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
-	self.loadWithLock()
 
 	destinations := make([]MultiHopId, 0, len(self.restored))
 	for destination := range self.restored {
 		destinations = append(destinations, destination)
 	}
-	return destinations
+	return destinations, nil
 }
 
 // TakeRestored consumes one restored identity for a destination, if any.
 func (self *windowIdentityState) TakeRestored(destination MultiHopId) *WindowClientIdentity {
+	identity, _ := self.TakeRestoredContext(self.ctx, destination)
+	return identity
+}
+
+func (self *windowIdentityState) TakeRestoredContext(ctx context.Context, destination MultiHopId) (*WindowClientIdentity, error) {
+	if err := self.waitForLoad(ctx); err != nil {
+		return nil, err
+	}
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
-	self.loadWithLock()
 
 	identities, ok := self.restored[destination]
 	if !ok || len(identities) == 0 {
-		return nil
+		return nil, nil
 	}
 	identity := identities[0]
 	if len(identities) == 1 {
@@ -161,7 +288,7 @@ func (self *windowIdentityState) TakeRestored(destination MultiHopId) *WindowCli
 	} else {
 		self.restored[destination] = identities[1:]
 	}
-	return identity
+	return identity, nil
 }
 
 // Record adds a live (identity, destination) pair and mirrors the snapshot

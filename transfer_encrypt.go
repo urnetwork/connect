@@ -307,12 +307,53 @@ func (c *sequenceCipher) Seal(plaintext []byte) ([]byte, error) {
 }
 
 func (c *sequenceCipher) Open(ciphertext []byte) ([]byte, error) {
-	if len(ciphertext) < sequenceTlsAeadNonceSize {
+	if len(ciphertext) < sequenceTlsAeadNonceSize+c.aead.Overhead() {
 		return nil, errors.New("sequence cipher: ciphertext too short")
 	}
 	nonce := ciphertext[:sequenceTlsAeadNonceSize]
 	sealed := ciphertext[sequenceTlsAeadNonceSize:]
-	return c.aead.Open(nil, nonce, sealed, nil)
+	plaintextLen := len(sealed) - c.aead.Overhead()
+	buf := MessagePoolGet(plaintextLen)
+	out, err := c.aead.Open(buf[:0], nonce, sealed, nil)
+	if err != nil {
+		MessagePoolReturn(buf)
+		return nil, err
+	}
+	if cap(out) != cap(buf) {
+		MessagePoolReturn(buf)
+	}
+	return out, nil
+}
+
+// SealOuterFrame writes the complete encrypted outer TransferFrame directly
+// into one pooled buffer. AEAD.Seal appends to dst, so placing the random nonce
+// at the end of the protobuf header and sealing from there avoids both the
+// standalone ciphertext allocation and the subsequent ciphertext copy that
+// buildEncryptedOuterFrameBytes would otherwise require.
+func (c *sequenceCipher) SealOuterFrame(
+	path TransferPath,
+	plaintext []byte,
+	sessionRole protocol.SequenceRole,
+	sessionCompanion bool,
+) ([]byte, error) {
+	ciphertextLen := sequenceTlsAeadNonceSize + len(plaintext) + c.aead.Overhead()
+	size := sizeEncryptedOuterTransferFrame(path, ciphertextLen, sessionRole)
+	buf := MessagePoolGet(size)
+	out := appendEncryptedOuterTransferFrameHeader(buf[:0], path, ciphertextLen)
+
+	nonceStart := len(out)
+	out = out[:nonceStart+sequenceTlsAeadNonceSize]
+	nonce := out[nonceStart:]
+	if _, err := rand.Read(nonce); err != nil {
+		MessagePoolReturn(buf)
+		return nil, err
+	}
+	out = c.aead.Seal(out, nonce, plaintext, nil)
+	out = appendEncryptedOuterTransferFrameFooter(out, sessionRole, sessionCompanion)
+	if cap(out) != cap(buf) {
+		MessagePoolReturn(buf)
+	}
+	return out, nil
 }
 
 // buildEncryptedOuterFrameBytes wraps an AEAD ciphertext as the
@@ -325,16 +366,7 @@ func (c *sequenceCipher) Open(ciphertext []byte) ([]byte, error) {
 // (not complemented on the receiver) so the destination pins the exact
 // companion session instead of trialing both.
 func buildEncryptedOuterFrameBytes(path TransferPath, ciphertext []byte, sessionRole protocol.SequenceRole, sessionCompanion bool) ([]byte, error) {
-	transferFrame := &protocol.TransferFrame{
-		TransferPath:           path.ToProtobuf(),
-		EncryptedTransferFrame: ciphertext,
-	}
-	// Carry only a concrete role; leave the unknown hint off the wire.
-	if sessionRole != protocol.SequenceRole_SequenceRoleUnknown {
-		transferFrame.SessionRole = &sessionRole
-	}
-	transferFrame.SessionCompanion = &sessionCompanion
-	return ProtoMarshal(transferFrame)
+	return marshalEncryptedOuterTransferFrame(path, ciphertext, sessionRole, sessionCompanion), nil
 }
 
 // DefaultSequencePostQuantumCurves are the key-exchange groups the per-peer
@@ -529,8 +561,16 @@ type EncryptionSettings struct {
 
 func DefaultEncryptionSettings() *EncryptionSettings {
 	return &EncryptionSettings{
-		Encrypt:                       false,
-		TlsTimeout:                    -1, // negative disables the handshake timeout
+		Encrypt: false,
+		// bound the handshake: a wedged handshake (peer departed, flight
+		// undeliverable) must fail to plaintext instead of resending its
+		// flight forever — unbounded (negative disables the timeout) leaks
+		// a per-peer resend loop that churns a 16KB control contract every
+		// resend cycle indefinitely. On timeout the epoch fails (cipher-nil,
+		// plaintext per the opportunistic contract) and a later acquire
+		// restarts a fresh epoch, so a transient wedge retries cleanly
+		// instead of pinning the broken flight.
+		TlsTimeout:                    60 * time.Second,
 		EncryptionControlUseCompanion: true,
 		// 0 reaps a standalone session immediately at refs==0 (<0 keeps it
 		// forever, >0 idle-reaps after the timeout). DefaultClientSettings
@@ -1210,9 +1250,9 @@ func (self *peerEncryptionSession) maybeVerifyPendingPeerIdentityProof(e *tlsHan
 		}
 	}()
 	if ok {
-		if self.client.log.V(1).Enabled() {
-			self.client.log.Infof("[tls]%s peer identity proof verified — cipher is now usable\n", self.logTag)
-		}
+		// always-on: one line per established session, the on-device signal
+		// that the e2e identity chain completed for this peer
+		self.client.log.Infof("[tls]%s peer identity proof verified — cipher is now usable\n", self.logTag)
 		// the established + identity-verified peer set grew (or the
 		// established epoch swapped): the only promote path runs above
 		self.manager.peerIdentityChanged()

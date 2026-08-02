@@ -315,7 +315,7 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 		}
 	*/
 
-	return &ClientStrategy{
+	clientStrategy := &ClientStrategy{
 		ctx:                 ctx,
 		log:                 loggerOrDefault(settings.Log),
 		settings:            settings,
@@ -323,7 +323,27 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 		resolvedExtenderIps: resolvedExtenderIps,
 		extenderIpSecrets:   map[netip.Addr]string{},
 	}
+	// a host network path change drops the dialers' pooled http connections:
+	// they are bound to the old path, and the next api call (auth,
+	// find-providers) would otherwise stall on a dead socket until its
+	// timeout. Clients rebuild lazily on next use. Unsubscribe rides ctx.
+	unsubNetworkChange := AddNetworkChangeListener(clientStrategy.networkChanged)
+	go HandleError(func() {
+		<-ctx.Done()
+		unsubNetworkChange()
+	})
+	return clientStrategy
+}
 
+// networkChanged drops every dialer's pooled connections (idle sockets bound
+// to the old network path); in-flight requests finish on their own
+// connections, and the http clients rebuild lazily on next use.
+func (self *ClientStrategy) networkChanged() {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	for dialer := range self.dialers {
+		dialer.Close()
+	}
 }
 
 func (self *ClientStrategy) SetCustomExtenders(extenderIpSecrets map[netip.Addr]string) {

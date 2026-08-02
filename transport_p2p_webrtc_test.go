@@ -53,8 +53,19 @@ func TestWebRtc(t *testing.T) {
 	// the test teardown see closed-conn errors, and a panic in a test
 	// goroutine kills the whole test binary. missing data is detected by
 	// the receive loop timeout below.
+	//
+	// send in transport-sized messages: the detached datachannel is
+	// message-oriented, and a single message must fit within the
+	// per-connection ReceiveBufferSize to be reassembled (production frames
+	// are bounded by the transport MaxMessageByteCount default)
+	const sendMessageByteCount = 64 * 1024
 	send := func(conn net.Conn) {
-		conn.Write(b)
+		for i := 0; i < len(b); i += sendMessageByteCount {
+			end := min(i+sendMessageByteCount, len(b))
+			if _, err := conn.Write(b[i:end]); err != nil {
+				return
+			}
+		}
 	}
 	receive := func(conn net.Conn) {
 		b2 := make([]byte, len(b))
