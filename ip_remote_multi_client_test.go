@@ -306,7 +306,7 @@ func TestMultiClientChannelWindowStats(t *testing.T) {
 	}
 	AssertEqual(t, nil, err)
 
-	clientChannel, err := newMultiClientChannel(ctx, channelArgs, generator, clientReceivePacket, nil, DefaultSecurityPolicy(ctx), contractStatus, func(contractStatsEvents []*ContractStatsEvent) {}, func() {}, nil, settings, nil, nil, nil, nil, nil)
+	clientChannel, err := newMultiClientChannel(ctx, channelArgs, generator, clientReceivePacket, nil, DefaultSecurityPolicy(ctx), contractStatus, func(contractStatsEvents []*ContractStatsEvent) {}, func() {}, nil, settings, nil, nil, nil, nil, nil, nil, nil)
 	AssertEqual(t, nil, err)
 
 	cancelCtxs := []context.Context{}

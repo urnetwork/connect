@@ -88,6 +88,8 @@ func TestReliabilitySettingsFromDefaults(t *testing.T) {
 	AssertEqual(t, reliabilitySettings.SoftVerdictDemote, settings.SoftVerdictDemote)
 	AssertEqual(t, reliabilitySettings.RemovalBudgetCount, settings.RemovalBudgetCount)
 	AssertEqual(t, reliabilitySettings.RemovalBudgetWindow, settings.RemovalBudgetWindow)
+	AssertEqual(t, reliabilitySettings.ProviderProbe, settings.ProviderProbe)
+	AssertEqual(t, reliabilitySettings.ProbeTimeout, settings.ProbeTimeout)
 }
 
 // a stalled exit reports the packet as sent but never acknowledges it, and

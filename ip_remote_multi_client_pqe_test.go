@@ -41,7 +41,9 @@ func TestMultiClientChannelPqe(t *testing.T) {
 			DefaultMultiClientSettings(),
 			// nil falls back to the static settings; this test does not
 			// exercise the runtime override, the uplink gate, the metrics,
-			// the flow count, or the resize wake
+			// the flow count, the resize wake, or the qualification hooks
+			nil,
+			nil,
 			nil,
 			nil,
 			nil,

@@ -272,6 +272,19 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// 2 is the smallest value that makes the no-receive-ack verdict
 		// corroborated evidence rather than a single destination's silence
 		MinBlackholeDestinations: 2,
+		// on by default on this fork. With F-2 this is no longer inert: the
+		// constructor starts the prober loop (startup sweep, joiner probes,
+		// staleness re-probes -- see runProber), effectiveTier reads the
+		// qualification as a +1 demerit for unproven providers, and expand's
+		// admit selection prefers qualified candidates.
+		ProviderProbe: true,
+		// a tcp handshake through a provider to a live site completes well
+		// inside this on any network worth keeping; past it the answer is not
+		// coming, and a probe that waits longer only delays a sweep
+		ProbeTimeout: 4 * time.Second,
+		// mainnet-aggressive: evaluate twice the candidates a window expansion
+		// needs and keep the best. 1 is today's behavior, the A/B point.
+		EvaluationPoolMultiple: 2,
 
 		SecurityPolicyGenerator: DefaultSecurityPolicyWithStats,
 
@@ -548,6 +561,49 @@ type MultiClientSettings struct {
 	// acknowledged at all) and stays as fast as it was.
 	MinBlackholeDestinations int
 
+	// ProviderProbe enables client-side provider qualification: a crafted tcp
+	// syn (and one dns query) sent through an exit to real destinations, where
+	// an ANSWER proves the provider completes real upstream dials and a
+	// non-answer proves nothing at all. The asymmetry is the whole design --
+	// probes qualify, they never convict -- and it is enforced structurally:
+	// the probe send bypasses the window accounting entirely, probe flows never
+	// enter the flow bookkeeping, and a probe failure touches no strike, no
+	// verdict input and no metric. See ip_remote_multi_client_probe.go.
+	//
+	// false is the A/B comparison point and makes the mechanism inexistent
+	// (probeExit returns an empty result without sending anything). true is the
+	// default on this fork, and is inert on its own: something has to call
+	// probeExit, and the sweep that does lands in the next package.
+	ProviderProbe bool
+
+	// ProbeTimeout bounds one probe pass. 0 falls back to the built-in 4s. It
+	// bounds how long positive evidence is waited for; it is never a timer that
+	// produces a verdict, because a pass that ends with nothing back leaves
+	// every provider exactly where it was.
+	ProbeTimeout time.Duration
+
+	// EvaluationPoolMultiple is the aggressive-pooling knob: window expansion
+	// requests and ping-evaluates this multiple of the candidates it actually
+	// needs, then admits only the needed count -- preferring qualified
+	// providers (see poolAdmitOrder) -- and politely cancels the evaluated
+	// surplus, which carries no flows by construction (an unadmitted candidate
+	// never enters the window, so selection can never have placed a flow on
+	// it).
+	//
+	// The multiple applies to the CANDIDATE-REQUEST count only, never to the
+	// admit count: the window's size math -- the demand target, the standing
+	// reserve's +1, and the WindowSizeHardMax collapse -- all keep operating
+	// on the same admitted counts as before, so the window can never grow past
+	// its target because of this knob. It is also skipped for fixed-destination
+	// generators, whose destination set cannot produce surplus candidates
+	// (asking would only stall each expand pass against its args timeout, the
+	// same reason the standing reserve skips them).
+	//
+	// 1 (and, via the zero-value ReliabilitySettings, 0) is today's behavior:
+	// request exactly what is needed, admit every evaluation that passes. 2 is
+	// the mainnet-aggressive default on this fork.
+	EvaluationPoolMultiple int
+
 	// ServerNameAffinityBridge lets a new flow whose own affinity group has no
 	// donor inherit the client from the destination-scoped group an earlier
 	// nameless flow to the same destination joined. Those groups are read, never
@@ -737,6 +793,12 @@ type RemoteUserNatMultiClient struct {
 	affinityIp4Paths map[Ip4Path]map[Ip4Path]time.Time
 	affinityIp6Paths map[Ip6Path]map[Ip6Path]time.Time
 	clientUpdates    map[*multiClientChannel]map[*multiClientChannelUpdate]bool
+	// qualification is the provider-qualification table: what each provider's
+	// probes have proven, keyed by destination so it survives the channel
+	// incarnations that come and go for one provider. Guarded by stateLock
+	// (created lazily, so a fixture-assembled parent works), bounded by
+	// qualificationMaxEntries. See ip_remote_multi_client_probe.go.
+	qualification map[MultiHopId]*providerQualification
 
 	// config is an immutable snapshot of the rarely-changed routing config
 	// (performance profile + local security bypass). it is rebuilt under
@@ -887,6 +949,7 @@ func NewRemoteUserNatMultiClient(
 		affinityIp4Paths:       map[Ip4Path]map[Ip4Path]time.Time{},
 		affinityIp6Paths:       map[Ip6Path]map[Ip6Path]time.Time{},
 		clientUpdates:          map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
+		qualification:          map[MultiHopId]*providerQualification{},
 		localUserNat:           localUserNat,
 		blockActionCache:       newBlockActionCache(settings.BlockActionDecisionTtl, settings.BlockActionDecisionMaxCount),
 		blockActionCollector:   newBlockActionCollector(settings.BlockActionAggMaxCount, log),
@@ -927,6 +990,8 @@ func NewRemoteUserNatMultiClient(
 		multiClient.uplinkGate,
 		multiClient.reliabilityMetricsRef,
 		multiClient.clientFlowCount,
+		multiClient.providerQualified,
+		multiClient.recordProbePass,
 	)
 	if _, fixed := generator.FixedDestinationSize(); !fixed {
 		multiClient.windows[WindowTypeSpeed] = newMultiClientWindow(
@@ -943,6 +1008,8 @@ func NewRemoteUserNatMultiClient(
 			multiClient.uplinkGate,
 			multiClient.reliabilityMetricsRef,
 			multiClient.clientFlowCount,
+			multiClient.providerQualified,
+			multiClient.recordProbePass,
 		)
 	}
 	// else only keep the quality window for fixed destination
@@ -963,6 +1030,16 @@ func NewRemoteUserNatMultiClient(
 	multiClient.monitor = NewMergedMultiClientMonitor(monitors)
 
 	go HandleError(multiClient.runEventEpoch, cancel)
+
+	// the provider-qualification prober (F-2): startup sweep, joiner probes,
+	// staleness re-probes. Gated on the constructed setting -- a client built
+	// with ProviderProbe off never runs the goroutine at all -- while the
+	// runtime toggle is honored per scan inside. Not wired to `cancel`: the
+	// prober is an optional aide, and its failure must never tear down the
+	// tunnel (HandleError still logs the panic).
+	if settings.ProviderProbe {
+		go HandleError(multiClient.runProber)
+	}
 
 	return multiClient
 }
@@ -1299,6 +1376,9 @@ type ReliabilitySettings struct {
 	StandingReserve          bool
 	EffectiveTierSelection   bool
 	MinBlackholeDestinations int
+	ProviderProbe            bool
+	ProbeTimeout             time.Duration
+	EvaluationPoolMultiple   int
 }
 
 // ReliabilitySettingsFrom reads the effective values out of a settings struct.
@@ -1327,6 +1407,9 @@ func ReliabilitySettingsFrom(settings *MultiClientSettings) *ReliabilitySettings
 		StandingReserve:          settings.StandingReserve,
 		EffectiveTierSelection:   settings.EffectiveTierSelection,
 		MinBlackholeDestinations: settings.MinBlackholeDestinations,
+		ProviderProbe:            settings.ProviderProbe,
+		ProbeTimeout:             settings.ProbeTimeout,
+		EvaluationPoolMultiple:   settings.EvaluationPoolMultiple,
 	}
 }
 
@@ -3465,6 +3548,25 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 	// measures verdict silence against
 	self.stampUplinkIngress()
 
+	// The probe intercept. A packet addressed to a reserved probe port at the
+	// benchmarking source address belongs to the qualification mechanism, not
+	// to any application: it is consumed here and NEVER forwarded to
+	// receivePacketCallback, matched or not (see clientReceiveProbePacket for
+	// why the unmatched case must be consumed too). The gate is two integer
+	// comparisons and an address check on a range no tun is ever assigned, so
+	// the download hot path pays nothing measurable, and it sits before the
+	// recovery tracker and the ip association deliberately -- a probe is not a
+	// user flow recovering and must not be recorded as one.
+	//
+	// The receive-side accounting a probe DOES feed already happened upstream
+	// of here, at the channel (addReceiveAck / addReceiveSyn in clientReceive):
+	// an answer through this exit is real delivery, and the positive half of
+	// the probe asymmetry is exactly that it counts.
+	if probeIngressPath(ipPath) {
+		self.clientReceiveProbePacket(sourceClient, ipPath, packet)
+		return
+	}
+
 	// traffic from a destination whose flows died with an exit closes out the
 	// recovery measurement. also before reverse, so the remote endpoint is
 	// still the source -- and the local endpoint is still the destination,
@@ -3654,6 +3756,17 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 // treating a still-bound flow as unbound leaves that caller racing against a
 // commitment that never clears.
 func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClientChannel, egressIpPath *IpPath) (reraced bool) {
+	// The probe intercept comes first, ahead of every effect below including
+	// the counters and the uplink stamp. A dial failure naming a probe flow is
+	// the probe's answer -- "no" -- and a probe's failure must feed nothing:
+	// no strike, no re-race, no metric, no forwarded packet. Returning false
+	// here is honest twice over: nothing was re-raced, and the caller (the
+	// channel intercept, or the send-path inference) has nothing to reconsider.
+	// See probeDialFailure for the reasoning on each omission.
+	if self.probeDialFailure(sourceClient, egressIpPath) {
+		return false
+	}
+
 	// counted for every intercepted signal, matched or not: the gap between
 	// this and flowsReraced is failures that named no live flow.
 	self.reliabilityMetrics.dialFailureIntercepted()
@@ -3865,10 +3978,19 @@ type ExitInfo struct {
 	Tier int
 	// EffectiveTier is the rank selection actually uses: Tier plus live
 	// demerits (dial starvation, active or survived quarantine, unhealthy
-	// window). EffectiveTier > Tier is a demoted exit -- new flows avoid it
-	// even though the platform ranked it well. Equal when clean or when
-	// EffectiveTierSelection is off.
+	// window, unproven qualification). EffectiveTier > Tier is a demoted exit
+	// -- new flows avoid it even though the platform ranked it well. Equal
+	// when clean or when EffectiveTierSelection is off.
 	EffectiveTier int
+	// Proven reports a current qualification: a probe pass (or live receive
+	// traffic, which refreshes for free) proved this provider dials real
+	// destinations inside QualificationMaxAge. False is "not yet proven",
+	// never "bad" -- the probe design records no negative state to report.
+	Proven bool
+	// ProbeAge is how long ago the provider was last proven; -1 when never.
+	// Can exceed QualificationMaxAge (then Proven is false): a stale age is
+	// still information a dev screen can show.
+	ProbeAge time.Duration
 }
 
 // Exits reports the provider channels across every window, with the number of
@@ -3910,6 +4032,12 @@ func (self *RemoteUserNatMultiClient) Exits() []*ExitInfo {
 	for windowType, window := range self.windows {
 		for _, client := range window.unorderedClients() {
 			clientId := client.ClientId()
+			// the qualification readout takes the parent stateLock per exit
+			// (released again before the next); fine for a dev readout, and it
+			// must not be folded into the flowCounts section above because
+			// effectiveTier below also reaches the parent lock through the
+			// injected lookup -- nothing here may hold it across these calls
+			proven, probeAge := self.qualificationExitInfo(client.probeDestination())
 			exits = append(exits, &ExitInfo{
 				ClientId:         clientId,
 				WindowType:       windowType,
@@ -3920,6 +4048,8 @@ func (self *RemoteUserNatMultiClient) Exits() []*ExitInfo {
 				DialFailureCount: client.dialFailureCount(),
 				Tier:             client.Tier(),
 				EffectiveTier:    client.effectiveTier(),
+				Proven:           proven,
+				ProbeAge:         probeAge,
 			})
 		}
 	}
@@ -4091,6 +4221,17 @@ type multiClientChannelUpdate struct {
 	// affinityIp{4,6}Paths are guarded by the parent stateLock (creation only).
 	affinityIp4Paths map[Ip4Path]bool
 	affinityIp6Paths map[Ip6Path]bool
+
+	// probe marks this update as a provider-qualification probe rather than an
+	// application flow, and carries the probe's completion state. Non-nil only
+	// for updates built by registerProbeFlow; written once at construction,
+	// before the update is published to the path maps, and read-only after --
+	// so it needs no lock, and the isProbe() predicate over it is safe to ask
+	// from any of the paths that must treat a probe differently (the ingress
+	// consume branch, the dial-failure intercept). See
+	// ip_remote_multi_client_probe.go for the asymmetry it enforces: a probe's
+	// success is evidence, a probe's failure is nothing at all.
+	probe *probeFlow
 }
 
 func newMultiClientChannelUpdate(ctx context.Context, ipPath *IpPath) *multiClientChannelUpdate {
@@ -4523,6 +4664,17 @@ type multiClientWindow struct {
 	// called with no window or channel lock held. Every resize call site reads
 	// it from the classification loop, which holds nothing.
 	flowCountFunc func(*multiClientChannel) int
+	// providerQualifiedFunc reads the parent's qualification table by
+	// destination. The window itself consults it in expand's admit selection
+	// (prefer qualified candidates) and hands it to every channel it builds
+	// (the effectiveTier demerit). Same callback convention and same
+	// parent-stateLock contract as flowCountFunc; nil -- bare test windows --
+	// reads as nothing qualified, which makes admit selection plain arrival
+	// order and the channel demerit inert.
+	providerQualifiedFunc func(MultiHopId) bool
+	// qualificationRefreshFunc is handed to every channel for the receive-ack
+	// qualification refresh; see the channel field. nil on bare test windows.
+	qualificationRefreshFunc func(MultiHopId)
 
 	clientChannelArgs chan *multiClientChannelArgs
 
@@ -4561,6 +4713,8 @@ func newMultiClientWindow(
 	uplinkGateFunc func(now time.Time) (stale bool, freshSince time.Time),
 	reliabilityMetricsFunc func() *reliabilityMetrics,
 	flowCountFunc func(*multiClientChannel) int,
+	providerQualifiedFunc func(MultiHopId) bool,
+	qualificationRefreshFunc func(MultiHopId),
 ) *multiClientWindow {
 	window := &multiClientWindow{
 		ctx:                         ctx,
@@ -4577,6 +4731,8 @@ func newMultiClientWindow(
 		uplinkGateFunc:              uplinkGateFunc,
 		reliabilityMetricsFunc:      reliabilityMetricsFunc,
 		flowCountFunc:               flowCountFunc,
+		providerQualifiedFunc:       providerQualifiedFunc,
+		qualificationRefreshFunc:    qualificationRefreshFunc,
 		clientChannelArgs:           make(chan *multiClientChannelArgs),
 		monitor:                     NewRemoteUserNatMultiClientMonitor(&settings.RemoteUserNatMultiClientMonitorSettings),
 		contractStatusCallbacks:     NewCallbackList[*contractStatusCallbackWorker](),
@@ -5312,6 +5468,15 @@ func (self *multiClientWindow) resize() {
 	}
 }
 
+// expandEvaluatedCandidate is one expand candidate that passed its evaluation
+// ping and awaits admission (or polite cancellation): the pooling state
+// between "evaluated" and "in the window". By construction it carries no
+// flows -- selection only ever sees installed window clients.
+type expandEvaluatedCandidate struct {
+	client *multiClientChannel
+	args   *multiClientChannelArgs
+}
+
 func (self *multiClientWindow) expand(
 	windowSize WindowSizeSettings,
 	currentWindowSize int,
@@ -5333,9 +5498,174 @@ func (self *multiClientWindow) expand(
 		returnPingSuccess = pingSuccess
 	}()
 
+	// Aggressive pooling (EvaluationPoolMultiple): request and ping-evaluate a
+	// multiple of the candidates this pass actually needs, admit only the
+	// needed count -- preferring qualified providers -- and politely cancel
+	// the evaluated surplus.
+	//
+	// The multiple applies HERE, to the candidate-REQUEST count, and nowhere
+	// else. admitBudget stays n, the count the size math asked for, so the
+	// window can never grow past its target because of pooling: the demand
+	// target, the standing reserve's +1, and the WindowSizeHardMax collapse
+	// all keep seeing the same admitted counts they always did.
+	//
+	// Fixed-destination generators skip the multiple for the same reason they
+	// skip the standing reserve: their destination set cannot produce surplus
+	// candidates, and asking would only stall each pass against its args
+	// timeout.
+	admitBudget := n
+	evaluationPoolMultiple := max(1, self.reliabilitySettings().EvaluationPoolMultiple)
+	if _, fixedDestination := self.generator.FixedDestinationSize(); fixedDestination {
+		evaluationPoolMultiple = 1
+	}
+	requestCount := n * evaluationPoolMultiple
+
+	admitted := 0
+	pending := []*expandEvaluatedCandidate{}
+	expandEnded := false
+
+	// admitCandidate installs one evaluated candidate into the window, running
+	// the same-clientId replacement gate exactly as the pre-pooling install
+	// did. Returns whether it installed; a declined replacement consumes the
+	// candidate (cancelled, args returned, dot restored to the live old
+	// client) without consuming admit budget, so the budget slot falls to the
+	// next evaluated candidate.
+	//
+	// must be called with mutex (replacementAllowed reads the flow count,
+	// which takes the parent stateLock -- the same nesting the pre-pooling
+	// callback already had)
+	admitCandidate := func(candidate *expandEvaluatedCandidate) bool {
+		client := candidate.client
+		args := candidate.args
+		clientId := client.ClientId()
+
+		// same-clientId replacement gate: the generator can re-hand an
+		// identity already in the window (a destination-aware generator reuses
+		// a persisted identity per destination). Replacing used to
+		// unconditionally cancel the old channel, which destroyed its live
+		// flows for no failure at all. The existing channel is read under the
+		// window stateLock, but the decision (replacementAllowed) runs with
+		// the lock released: the flow count read inside takes the parent
+		// stateLock, which must never nest under a window or channel lock.
+		var existingClient *multiClientChannel
+		func() {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			existingClient = self.clients[clientId]
+		}()
+		if !self.replacementAllowed(existingClient) {
+			// decline: keep the old, flow-carrying channel and discard the new
+			// one. Deliberately NOT fail(): fail emits EvaluationFailed, a
+			// terminal monitor state that would delete the dot of the LIVE old
+			// client sharing this id. Re-emitting Added restores the dot to
+			// the truth: the id remains in the window, routing, via the old
+			// channel.
+			self.log.Infof("[multi]expand replacement declined [%s]: existing channel carries flows\n", clientId)
+			client.Cancel()
+			self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
+			self.monitor.AddProviderEvent(args.ClientId, ProviderStateAdded)
+			return false
+		}
+
+		self.log.V(1).Infof("[multi]expand new client\n")
+
+		var replacedClient *multiClientChannel
+		func() {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			// re-read under the lock: the slot is installed against whatever
+			// is there NOW, so a concurrent remove/replace between the gate
+			// above and here can never leak an uncancelled channel
+			replacedClient = self.clients[clientId]
+			self.clients[clientId] = client
+		}()
+		if replacedClient != nil {
+			// the replaced client is stored under the same client id as the
+			// new client, so they share one monitor dot. Cancel it without
+			// emitting Removed — a Removed here would terminal-arm the dot of
+			// the NEW live client (Added below), and the ui would reap it
+			// while the client is still routing.
+			replacedClient.Cancel()
+		}
+		self.monitor.AddProviderEvent(args.ClientId, ProviderStateAdded)
+		// reap promptly when the client dies (the continuous ping or blackhole
+		// detection cancels the channel): wake the resize loop instead of
+		// waiting for its next tick
+		go HandleError(func() {
+			select {
+			case <-self.ctx.Done():
+			case <-client.Done():
+				self.resizeMonitor.NotifyAll()
+			}
+		})
+		return true
+	}
+
+	// cancelCandidate politely discards an evaluated-but-unadmitted candidate:
+	// it passed its ping, but the pass needed fewer exits than it evaluated.
+	// The channel carries no flows by construction -- it was never installed
+	// in the window, so selection never saw it and nothing was ever pinned to
+	// it -- which is what makes the cancel free. NotAdded is the monitor's
+	// terminal state for exactly this outcome (evaluated, healthy, not
+	// chosen), distinct from EvaluationFailed.
+	//
+	// must be called with mutex
+	cancelCandidate := func(candidate *expandEvaluatedCandidate) {
+		candidate.client.Cancel()
+		self.generator.RemoveClientArgs(&candidate.args.MultiClientGeneratorClientArgs)
+		self.monitor.AddProviderEvent(candidate.args.ClientId, ProviderStateNotAdded)
+	}
+
+	// admitPending admits from the evaluated pool while budget remains. Every
+	// admission is routed through poolAdmitOrder -- the single chooser -- so
+	// "prefer qualified" is a property of one pure function rather than of
+	// call-site discipline. In the common case a ping success finds spare
+	// budget and an otherwise-empty pool and is admitted immediately, which
+	// keeps first-connect latency identical to the pre-pooling path; the
+	// preference decides whenever more than one candidate is pending at an
+	// admit moment, and the qualification lookup is best-effort by design (a
+	// cold start has nothing qualified yet -- the effectiveTier demerit does
+	// the ongoing steering after admission).
+	//
+	// must be called with mutex
+	admitPending := func() {
+		for admitted < admitBudget && 0 < len(pending) {
+			qualified := make([]bool, len(pending))
+			for i, candidate := range pending {
+				// the lookup takes the parent stateLock inside; nil (bare
+				// windows) reads as nothing qualified -> plain arrival order
+				qualified[i] = self.providerQualifiedFunc != nil &&
+					self.providerQualifiedFunc(candidate.args.Destination)
+			}
+			pick := poolAdmitOrder(qualified, 1)[0]
+			candidate := pending[pick]
+			pending = append(pending[:pick], pending[pick+1:]...)
+			if admitCandidate(candidate) {
+				admitted += 1
+				pingSuccess += 1
+			}
+		}
+	}
+
+	// the surplus MUST be released on every exit path -- including the expand
+	// timeout returns mid-loop -- so the cleanup is a defer, not a tail.
+	// Registered after the returnPingSuccess defer above (LIFO), so an
+	// admission completed here still counts in the returned total.
+	defer func() {
+		mutex.Lock()
+		defer mutex.Unlock()
+
+		expandEnded = true
+		admitPending()
+		for _, candidate := range pending {
+			cancelCandidate(candidate)
+		}
+		pending = nil
+	}()
+
 	endTime := time.Now().Add(self.settings.WindowExpandTimeout)
 
-	for i := 0; i < n; i += 1 {
+	for i := 0; i < requestCount; i += 1 {
 		timeout := endTime.Sub(time.Now())
 		if timeout < 0 {
 			self.log.V(1).Infof("[multi]expand window timeout\n")
@@ -5399,6 +5729,8 @@ func (self *multiClientWindow) expand(
 				self.reliabilityMetricsFunc,
 				self.flowCountFunc,
 				func() { self.resizeMonitor.NotifyAll() },
+				self.providerQualifiedFunc,
+				self.qualificationRefreshFunc,
 			)
 			if err != nil {
 				self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
@@ -5457,85 +5789,38 @@ func (self *multiClientWindow) expand(
 							}
 
 							if err == nil {
-								clientId := client.ClientId()
-
-								// same-clientId replacement gate: the
-								// generator can re-hand an identity already
-								// in the window (a destination-aware
-								// generator reuses a persisted identity per
-								// destination). Replacing used to
-								// unconditionally cancel the old channel,
-								// which destroyed its live flows for no
-								// failure at all. The existing channel is
-								// read under the window stateLock, but the
-								// decision (replacementAllowed) runs with the
-								// lock released: the flow count read inside
-								// takes the parent stateLock, which must
-								// never nest under a window or channel lock.
-								var existingClient *multiClientChannel
-								func() {
-									self.stateLock.Lock()
-									defer self.stateLock.Unlock()
-									existingClient = self.clients[clientId]
-								}()
-								if !self.replacementAllowed(existingClient) {
-									// decline: keep the old, flow-carrying
-									// channel and discard the new one. The
-									// args are simply dropped -- the expand
-									// loop has already moved on (this runs in
-									// the ping ack callback), and cancelling
-									// pingDone below is what releases the
-									// pending-ping wait, so nothing wedges.
-									// Deliberately NOT fail(): fail emits
-									// EvaluationFailed, a terminal monitor
-									// state that would delete the dot of the
-									// LIVE old client sharing this id.
-									// Re-emitting Added restores the dot to
-									// the truth: the id remains in the
-									// window, routing, via the old channel.
-									self.log.Infof("[multi]expand replacement declined [%s]: existing channel carries flows\n", clientId)
-									pingCancel()
-									client.Cancel()
-									self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
-									self.monitor.AddProviderEvent(args.ClientId, ProviderStateAdded)
-									return
+								// evaluated: the candidate answered its ping.
+								// Admission (with the same-clientId
+								// replacement gate) now runs through the
+								// pooling admit path -- see admitCandidate /
+								// admitPending above. Cancelling pingDone
+								// below is what releases the pending-ping
+								// wait, so nothing wedges on either branch.
+								candidate := &expandEvaluatedCandidate{
+									client: client,
+									args:   args,
 								}
-
-								self.log.V(1).Infof("[multi]expand new client\n")
-
-								var replacedClient *multiClientChannel
-								func() {
-									self.stateLock.Lock()
-									defer self.stateLock.Unlock()
-									// re-read under the lock: the slot is
-									// installed against whatever is there
-									// NOW, so a concurrent remove/replace
-									// between the gate above and here can
-									// never leak an uncancelled channel
-									replacedClient = self.clients[clientId]
-									self.clients[clientId] = client
-								}()
-								if replacedClient != nil {
-									// the replaced client is stored under the same client id
-									// as the new client, so they share one monitor dot. Cancel
-									// it without emitting Removed — a Removed here would
-									// terminal-arm the dot of the NEW live client (Added
-									// below), and the ui would reap it while the client is
-									// still routing.
-									replacedClient.Cancel()
-								}
-								self.monitor.AddProviderEvent(args.ClientId, ProviderStateAdded)
-								// reap promptly when the client dies (the continuous ping or
-								// blackhole detection cancels the channel): wake the resize
-								// loop instead of waiting for its next tick
-								go HandleError(func() {
-									select {
-									case <-self.ctx.Done():
-									case <-client.Done():
-										self.resizeMonitor.NotifyAll()
+								if expandEnded {
+									// a ping that resolved after the pass
+									// returned. Admission stays possible
+									// inside leftover budget -- exactly the
+									// late-install behavior this callback
+									// always had -- and past the budget the
+									// candidate is discarded politely, since
+									// the cleanup defer has already run and
+									// will not see it.
+									if admitted < admitBudget {
+										if admitCandidate(candidate) {
+											admitted += 1
+											pingSuccess += 1
+										}
+									} else {
+										cancelCandidate(candidate)
 									}
-								})
-								pingSuccess += 1
+								} else {
+									pending = append(pending, candidate)
+									admitPending()
+								}
 								pingCancel()
 							} else {
 								if self.log.V(1).Enabled() {
@@ -6141,6 +6426,29 @@ type multiClientChannel struct {
 	// an optimization, never a correctness requirement, because the periodic
 	// pass picks the quarantine up through isWarning anyway; see resizeWake().
 	resizeWakeFunc func()
+	// providerQualifiedFunc reads the parent's qualification table for this
+	// channel's destination (RemoteUserNatMultiClient.providerQualified).
+	// Consumed by effectiveTier as a +1 demerit for unproven/stale providers
+	// when ProviderProbe is on. nil on channels built directly by tests, which
+	// reads as NO demerit -- absence of the probe machinery must never demote
+	// anyone, matching every other nil-func convention here. The func takes
+	// the parent stateLock inside, so it must never be called with this
+	// channel's stateLock (or any leaf lock) held -- effectiveTier reads it
+	// before taking its own lock.
+	providerQualifiedFunc func(MultiHopId) bool
+	// qualificationRefreshFunc re-stamps the parent's qualification for this
+	// channel's destination (RemoteUserNatMultiClient.recordProbePass), called
+	// from the receive-ack path at most once per
+	// qualificationReceiveRefreshInterval -- real receive progress is better
+	// qualification evidence than any probe, and refreshing on it keeps loaded
+	// exits from ever going stale or wasting a re-probe. nil on channels built
+	// directly by tests. Same parent-stateLock contract as
+	// providerQualifiedFunc; see touchQualificationOnReceive.
+	qualificationRefreshFunc func(MultiHopId)
+	// qualificationRefreshedNanos is the last receive-refresh stamp (unix
+	// nanos), the atomic gate that keeps touchQualificationOnReceive near-free
+	// on the per-packet path.
+	qualificationRefreshedNanos atomic.Int64
 
 	// sourceFilter map[TransferPath]bool
 
@@ -6248,13 +6556,16 @@ func newMultiClientChannel(
 	// so the blackhole bound can be retuned on a live connection. nil falls
 	// back to settings, which the suite's bare-channel fixtures rely on.
 	reliabilitySettingsFunc func() *ReliabilitySettings,
-	// uplinkGateFunc, reliabilityMetricsFunc, flowCountFunc, and
-	// resizeWakeFunc follow the same convention: injected parent/window
-	// state, nil-safe so bare fixtures keep working
+	// uplinkGateFunc, reliabilityMetricsFunc, flowCountFunc, resizeWakeFunc,
+	// providerQualifiedFunc, and qualificationRefreshFunc follow the same
+	// convention: injected parent/window state, nil-safe so bare fixtures keep
+	// working
 	uplinkGateFunc func(now time.Time) (stale bool, freshSince time.Time),
 	reliabilityMetricsFunc func() *reliabilityMetrics,
 	flowCountFunc func(*multiClientChannel) int,
 	resizeWakeFunc func(),
+	providerQualifiedFunc func(MultiHopId) bool,
+	qualificationRefreshFunc func(MultiHopId),
 ) (*multiClientChannel, error) {
 	cancelCtx, cancel := context.WithCancel(ctx)
 
@@ -6330,6 +6641,8 @@ func newMultiClientChannel(
 		reliabilityMetricsFunc:    reliabilityMetricsFunc,
 		flowCountFunc:             flowCountFunc,
 		resizeWakeFunc:            resizeWakeFunc,
+		providerQualifiedFunc:     providerQualifiedFunc,
+		qualificationRefreshFunc:  qualificationRefreshFunc,
 		// affinityCount:             0,
 		// affinityTime:              time.Time{},
 	}
@@ -6386,11 +6699,23 @@ const quarantineMemoryDuration = 5 * time.Minute
 //     channel must fall behind every clean channel of the next tier. Expiry
 //     is the strike record's own decay -- dialStarved self-clears as the
 //     strikes age past the 60s dialStrikeWindow or a proven connect lands.
+//
 //   - quarantined, or survived-quarantine memory (+2): a soft blackhole
 //     verdict fired against it (or recently had); see the memory fields for
 //     the slow, evidence-gated expiry. One +2 covers both states -- the
 //     memory IS the episode's demerit outliving the episode, not a second
 //     offense.
+//
+//   - unproven qualification (+1): no probe pass (and no live receive
+//     traffic) has proven this provider inside QualificationMaxAge. This is
+//     the one POSITIVE-evidence demerit: it is the starting state of every
+//     provider, decays the moment a pass or real traffic proves the dial
+//     path, and can never be (re)imposed by any failure -- a failed probe
+//     leaves qualification exactly as it was. Only applied when
+//     ProviderProbe is on and the parent's lookup is wired
+//     (providerQualifiedFunc), so bare fixtures and the kill switch both
+//     read zero.
+//
 //   - unhealthy stats window (+1): the send/receive balance check
 //     (windowStatsWithCoalesce) currently classifies the window unhealthy.
 //     This reads the healthy flag the last stats coalesce computed -- one
@@ -6420,13 +6745,35 @@ const quarantineMemoryDuration = 5 * time.Minute
 // signature-stable because the toggle is honored here rather than passed in.
 func (self *multiClientChannel) effectiveTier() int {
 	tier := self.Tier()
-	if !self.reliabilitySettings().EffectiveTierSelection {
+	reliabilitySettings := self.reliabilitySettings()
+	if !reliabilitySettings.EffectiveTierSelection {
 		return tier
+	}
+
+	// The qualification demerit (+1): an unproven or stale-qualified provider
+	// ranks one step behind a proven peer of the same tier. POSITIVE-only, per
+	// the whole probe design: unqualified is the state every provider starts
+	// in, never a conviction -- which is also why it is +1 (reorders within
+	// reach of adjacent tiers) rather than the +2 the evidence-of-failure
+	// demerits carry. Gated on ProviderProbe so the A/B kill switch removes
+	// the mechanism's every effect, and on the injected lookup so bare
+	// fixtures (nil func) see no demerit at all.
+	//
+	// Read BEFORE this channel's stateLock: the lookup takes the parent
+	// stateLock inside, and the parent lock must never nest under a leaf --
+	// the same ordering contract flowCountFunc documents.
+	unproven := false
+	if reliabilitySettings.ProviderProbe && self.providerQualifiedFunc != nil {
+		unproven = !self.providerQualifiedFunc(self.probeDestination())
 	}
 
 	now := time.Now()
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+
+	if unproven {
+		tier += 1
+	}
 
 	if self.dialStarvedWithLock(now) {
 		tier += 2
@@ -7690,27 +8037,37 @@ func (self *multiClientChannel) addSendSyn(synCount int) {
 }
 
 func (self *multiClientChannel) addReceiveAck(ackByteCount ByteCount) {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
 
-	self.packetStats.receiveAckCount += 1
-	self.packetStats.receiveAckByteCount += ackByteCount
+		self.packetStats.receiveAckCount += 1
+		self.packetStats.receiveAckByteCount += ackByteCount
 
-	// receive progress is exactly the evidence the quarantining verdicts said
-	// was missing, so it acquits: lift the quarantine here, where the count
-	// advances. The cost on the hot path is one bool read under the
-	// already-held lock; the log fires once per lifted episode, never per
-	// packet. The lift goes through the shared clear so it records the
-	// survived-quarantine memory like every other lift -- acquitted of the
-	// episode, still demoted in rank until promotion is earned.
-	if self.quarantined {
-		self.clearQuarantineWithLock()
-		loggerOrDefault(self.log).Infof("[multi]quarantine lifted on receive progress\n")
-	}
+		// receive progress is exactly the evidence the quarantining verdicts said
+		// was missing, so it acquits: lift the quarantine here, where the count
+		// advances. The cost on the hot path is one bool read under the
+		// already-held lock; the log fires once per lifted episode, never per
+		// packet. The lift goes through the shared clear so it records the
+		// survived-quarantine memory like every other lift -- acquitted of the
+		// episode, still demoted in rank until promotion is earned.
+		if self.quarantined {
+			self.clearQuarantineWithLock()
+			loggerOrDefault(self.log).Infof("[multi]quarantine lifted on receive progress\n")
+		}
 
-	eventBucket := self.eventBucket()
-	eventBucket.receiveAckCount += 1
-	eventBucket.receiveAckByteCount += ackByteCount
+		eventBucket := self.eventBucket()
+		eventBucket.receiveAckCount += 1
+		eventBucket.receiveAckByteCount += ackByteCount
+	}()
+
+	// the qualification refresh: receive progress is delivery proof, the same
+	// fact a probe answer records, so it keeps this exit's qualification fresh
+	// for free. OUTSIDE the locked section above -- the refresh takes the
+	// parent stateLock inside, which must never nest under this channel's --
+	// and gated to at most once per qualificationReceiveRefreshInterval by an
+	// atomic stamp, so the per-packet cost is one atomic load and a compare.
+	self.touchQualificationOnReceive()
 }
 
 func (self *multiClientChannel) addReceiveSyn(synCount int) {
@@ -8092,13 +8449,26 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 		select {
 		case <-self.ctx.Done():
 			err = errors.New("Done.")
-		case <-self.client.Done():
+		case <-self.clientDone():
 			err = errors.New("Done.")
 		default:
 		}
 	}
 
 	return stats, err
+}
+
+// clientDone is the underlying transport client's done channel, nil-safe for
+// the bare fixture channels built literally by tests (the same convention
+// ClientId, Tier and Cancel follow). A nil channel blocks forever in a select,
+// which is the correct reading of "this channel has no transport that could be
+// done" -- and it lets the stats derivation that ships be asserted against
+// directly, instead of restated in a test where it could drift.
+func (self *multiClientChannel) clientDone() <-chan struct{} {
+	if self.client == nil {
+		return nil
+	}
+	return self.client.Done()
 }
 
 // `connect.ReceiveFunction`

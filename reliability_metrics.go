@@ -135,6 +135,20 @@ type reliabilityMetrics struct {
 	verdictsHeldTransportDown atomic.Uint64
 	removalsDeferred          atomic.Uint64
 
+	// provider qualification. probesSent and probesAnswered are the raw
+	// question-and-answer counts; providersQualified counts providers that
+	// crossed into the qualified state (transitions, not re-proofs).
+	//
+	// Note what is NOT here: any count of probe failures. That is deliberate --
+	// there is no failure metric because a probe failure is not an event about
+	// the provider, and a counter for it would be the first thing a future
+	// change reached for when it wanted to act on one. The gap between
+	// probesSent and probesAnswered is available to anyone who wants the drop
+	// rate for tuning; nothing attributes it.
+	probesSent         atomic.Uint64
+	probesAnswered     atomic.Uint64
+	providersQualified atomic.Uint64
+
 	pendingLock sync.Mutex
 	pending     map[recoveryKey]pendingRecovery
 }
@@ -189,6 +203,27 @@ func (self *reliabilityMetrics) removalDeferred() {
 		return
 	}
 	self.removalsDeferred.Add(1)
+}
+
+func (self *reliabilityMetrics) probeSent() {
+	if self == nil {
+		return
+	}
+	self.probesSent.Add(1)
+}
+
+func (self *reliabilityMetrics) probeAnswered() {
+	if self == nil {
+		return
+	}
+	self.probesAnswered.Add(1)
+}
+
+func (self *reliabilityMetrics) providerQualified() {
+	if self == nil {
+		return
+	}
+	self.providersQualified.Add(1)
 }
 
 // exitLost records one provider failure and the flows it destroyed, and arms
@@ -384,6 +419,9 @@ func (self *reliabilityMetrics) reset() {
 	self.verdictsHeldUplinkStale.Store(0)
 	self.verdictsHeldTransportDown.Store(0)
 	self.removalsDeferred.Store(0)
+	self.probesSent.Store(0)
+	self.probesAnswered.Store(0)
+	self.providersQualified.Store(0)
 
 	self.pendingLock.Lock()
 	defer self.pendingLock.Unlock()
@@ -437,6 +475,14 @@ type ReliabilityMetricsSnapshot struct {
 	VerdictsHeldUplinkStale   uint64
 	VerdictsHeldTransportDown uint64
 	RemovalsDeferred          uint64
+
+	// ProbesSent and ProbesAnswered are the provider-qualification probes this
+	// session asked and got back; ProvidersQualified is how many providers a
+	// pass proved (transitions into the qualified state). There is deliberately
+	// no failure counter -- see the fields on reliabilityMetrics.
+	ProbesSent         uint64
+	ProbesAnswered     uint64
+	ProvidersQualified uint64
 }
 
 func (self *reliabilityMetrics) snapshot() *ReliabilityMetricsSnapshot {
@@ -467,6 +513,10 @@ func (self *reliabilityMetrics) snapshot() *ReliabilityMetricsSnapshot {
 		VerdictsHeldUplinkStale:   self.verdictsHeldUplinkStale.Load(),
 		VerdictsHeldTransportDown: self.verdictsHeldTransportDown.Load(),
 		RemovalsDeferred:          self.removalsDeferred.Load(),
+
+		ProbesSent:         self.probesSent.Load(),
+		ProbesAnswered:     self.probesAnswered.Load(),
+		ProvidersQualified: self.providersQualified.Load(),
 	}
 
 	if 0 < exitLossEvents {
