@@ -190,13 +190,11 @@ var probeResolverIps = []string{
 	"185.222.222.222",
 }
 
-// probeSampleHostCount is how many health hosts one probe pass uses, alongside
-// one resolver. Five targets is the budget the design fixed: a few hundred
-// bytes per target, so a full startup sweep of a large pool stays well under
-// 100KB, while five independent destinations is enough that one dead site (or
-// one anti-bot drop of a datacenter range, which is routine) cannot decide the
-// pass by itself at a 60% bar.
-const probeSampleHostCount = 4
+// The pass width (how many health hosts one probe pass uses, alongside one
+// resolver) is the ProbeSampleHostCount setting, defaulting to the ENTIRE
+// table -- see probeSampleWidth. At a few hundred bytes per target a
+// full-table pass is a few tens of kilobytes, and the verdict is
+// fraction-based, so width changes coverage without moving the bar.
 
 // probePassFraction is the share of a pass's targets that must answer for the
 // provider to qualify. Deliberately below 1: probes go out from provider egress

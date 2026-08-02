@@ -144,12 +144,17 @@ func dnsSkipName(payload []byte, offset int) (int, bool) {
 
 // --- resolution through the probed channel ---
 
-// probeResolveNameCount bounds how many of a pass's sampled hostnames are
-// resolved (and therefore how many resolution queries one pass costs). 3 of
-// the 4 sampled hosts: enough independent tcp destinations that one anti-bot
-// drop cannot decide the pass, small enough that the resolution stage stays a
-// couple hundred bytes.
-const probeResolveNameCount = 3
+// probeSampleWidth is how many health hosts a pass asks about: the
+// ProbeSampleHostCount setting when positive, else the ENTIRE table. Every
+// sampled hostname is resolved -- a pass owes a dial question to each host it
+// sampled, and the resolution stage is one small udp datagram per name, all in
+// flight together, so width costs bytes, never wall time.
+func probeSampleWidth(reliabilitySettings *ReliabilitySettings) int {
+	if reliabilitySettings != nil && 0 < reliabilitySettings.ProbeSampleHostCount {
+		return reliabilitySettings.ProbeSampleHostCount
+	}
+	return len(probeHostNames)
+}
 
 // probeResolveNames resolves names by asking resolverIp over udp/53 THROUGH
 // the probed channel, one A query per name, all in flight together against one
@@ -316,9 +321,11 @@ func (self *RemoteUserNatMultiClient) probeProviderPass(client *multiClientChann
 
 	destination := client.probeDestination()
 	// the pass index advances the rotation so repeated passes cover the table;
-	// it is read from the same record the pass will update
+	// it is read from the same record the pass will update. With the default
+	// full-table width the rotation is a no-op (every pass covers everything);
+	// it only matters when ProbeSampleHostCount narrows the pass.
 	_, _, passIndex := self.qualificationSnapshot(destination)
-	hosts, resolver := sampleProbeTargets(probeSeedBase(destination)+uint64(passIndex), probeSampleHostCount)
+	hosts, resolver := sampleProbeTargets(probeSeedBase(destination)+uint64(passIndex), probeSampleWidth(reliabilitySettings))
 
 	targets := []probeTarget{}
 	names := []string{}
@@ -329,9 +336,6 @@ func (self *RemoteUserNatMultiClient) probeProviderPass(client *multiClientChann
 		} else {
 			names = append(names, host)
 		}
-	}
-	if probeResolveNameCount < len(names) {
-		names = names[:probeResolveNameCount]
 	}
 
 	resolverIp := net.ParseIP(resolver)

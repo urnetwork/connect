@@ -161,7 +161,9 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		AckTimeout:              30 * time.Second,
 		BlackholeTimeout:        5 * time.Second,
 		BlackholeReceiveTimeout: 20 * time.Second,
-		MaxFlowsPerExit:         16,
+		MaxFlowsPerExit: 16,
+		// a site keeps its exit as it grows; see the field comment
+		AffinityStickyPastCap: true,
 		DialFailureRerace:       true,
 		BlackholeConnectTimeout: 30 * time.Second,
 		// a third of the full connect bar: long enough that a slow-but-working
@@ -306,6 +308,8 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// inside this on any network worth keeping; past it the answer is not
 		// coming, and a probe that waits longer only delays a sweep
 		ProbeTimeout: 4 * time.Second,
+		// 0 = the entire table each pass; see the field comment
+		ProbeSampleHostCount: 0,
 		// mainnet-aggressive: evaluate twice the candidates a window expansion
 		// needs and keep the best. 1 is today's behavior, the A/B point.
 		EvaluationPoolMultiple: 2,
@@ -462,6 +466,23 @@ type MultiClientSettings struct {
 	// is not admission control. When every candidate is full the flow is
 	// placed anyway.
 	MaxFlowsPerExit int
+
+	// AffinityStickyPastCap exempts affinity-group inheritance from the flow
+	// cap: a new flow whose site already lives on an exit stays on that exit
+	// even when the exit is past MaxFlowsPerExit. The cap still gates every
+	// race and rebind placement, so an exit can only exceed it by the growth
+	// of the sites it already hosts -- never by collecting new ones.
+	//
+	// This exists because the cap veto was observed splitting a busy site's
+	// egress ip exactly when the site was busiest: flow 17 of a video session
+	// was refused its donor and raced onto a different exit, and services
+	// that bind sessions or signed media urls to the client ip (video cdns
+	// do) then rejected the strays. A site changing egress ip mid-session is
+	// strictly worse for the user than an exit running long -- one is a
+	// player error, the other is a number on the developer screen.
+	//
+	// false restores the veto, the A/B comparison point.
+	AffinityStickyPastCap bool
 	// DialFailureRerace, when a provider reports it could not open the
 	// upstream for a new flow (see ipOosUnreachable's dial-failure use),
 	// silently unbinds the flow and lets the application's own retransmit
@@ -706,6 +727,17 @@ type MultiClientSettings struct {
 	// produces a verdict, because a pass that ends with nothing back leaves
 	// every provider exactly where it was.
 	ProbeTimeout time.Duration
+
+	// ProbeSampleHostCount is how many health hosts one qualification pass asks
+	// about. 0 or negative means the ENTIRE table every pass -- the
+	// mainnet-aggressive default on this fork: a pass then answers "how much of
+	// the internet does this provider reach" instead of "does it reach four
+	// sites", at a cost of a few kilobytes of syns and resolution queries per
+	// pass (all in flight together against the one ProbeTimeout, so a wide pass
+	// costs no more wall time than a narrow one). A positive value narrows the
+	// pass back to a rotating block of that many hosts; the rotation then walks
+	// the whole table across passes (4 was the pre-change compact width).
+	ProbeSampleHostCount int
 
 	// EvaluationPoolMultiple is the aggressive-pooling knob: window expansion
 	// requests and ping-evaluates this multiple of the candidates it actually
@@ -1550,6 +1582,7 @@ type ReliabilitySettings struct {
 	TcpSequenceIdleTimeout   time.Duration
 	BlackholeReceiveTimeout  time.Duration
 	MaxFlowsPerExit          int
+	AffinityStickyPastCap    bool
 	DialFailureRerace        bool
 	UplinkStalenessGate      time.Duration
 	SoftVerdictDemote        bool
@@ -1560,6 +1593,7 @@ type ReliabilitySettings struct {
 	MinBlackholeDestinations int
 	ProviderProbe            bool
 	ProbeTimeout             time.Duration
+	ProbeSampleHostCount     int
 	EvaluationPoolMultiple   int
 	// FormationPollTimeout: 0 falls back to SendRetryTimeout (the pre-change
 	// behavior), unlike the other zero-value-off knobs here
@@ -1598,6 +1632,7 @@ func ReliabilitySettingsFrom(settings *MultiClientSettings) *ReliabilitySettings
 		TcpSequenceIdleTimeout:   settings.TcpSequenceIdleTimeout,
 		BlackholeReceiveTimeout:  settings.BlackholeReceiveTimeout,
 		MaxFlowsPerExit:          settings.MaxFlowsPerExit,
+		AffinityStickyPastCap:    settings.AffinityStickyPastCap,
 		DialFailureRerace:        settings.DialFailureRerace,
 		UplinkStalenessGate:      settings.UplinkStalenessGate,
 		SoftVerdictDemote:        settings.SoftVerdictDemote,
@@ -1608,6 +1643,7 @@ func ReliabilitySettingsFrom(settings *MultiClientSettings) *ReliabilitySettings
 		MinBlackholeDestinations: settings.MinBlackholeDestinations,
 		ProviderProbe:            settings.ProviderProbe,
 		ProbeTimeout:             settings.ProbeTimeout,
+		ProbeSampleHostCount:     settings.ProbeSampleHostCount,
 		EvaluationPoolMultiple:   settings.EvaluationPoolMultiple,
 		FormationPollTimeout:     settings.FormationPollTimeout,
 
@@ -2002,10 +2038,14 @@ func (self *RemoteUserNatMultiClient) clientAtFlowCapWithLock(client *multiClien
 //
 // called with stateLock
 func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *multiClientChannelUpdate, paths map[Ip4Path]time.Time) {
+	// with AffinityStickyPastCap a donor at the flow cap still donates: the
+	// group's egress ip is worth more than the cap, which continues to gate
+	// every placement that would put a NEW site on the exit
+	sticky := self.reliabilitySettings().AffinityStickyPastCap
 	var mostRecentCreateTime time.Time
 	for copyIp4Path, createTime := range paths {
 		if copyUpdate, ok := self.ip4PathUpdates[copyIp4Path]; ok {
-			if c := copyUpdate.client.Load(); c != nil && !c.IsDone() && !c.isWarning() && !self.clientAtFlowCapWithLock(c) && createTime.After(mostRecentCreateTime) {
+			if c := copyUpdate.client.Load(); c != nil && !c.IsDone() && !c.isWarning() && (sticky || !self.clientAtFlowCapWithLock(c)) && createTime.After(mostRecentCreateTime) {
 				mostRecentCreateTime = createTime
 				update.client.Store(c)
 			}
@@ -2017,15 +2057,75 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *mul
 //
 // called with stateLock
 func (self *RemoteUserNatMultiClient) inheritAffinityClient6WithLock(update *multiClientChannelUpdate, paths map[Ip6Path]time.Time) {
+	// see inheritAffinityClient4WithLock for the sticky rationale
+	sticky := self.reliabilitySettings().AffinityStickyPastCap
 	var mostRecentCreateTime time.Time
 	for copyIp6Path, createTime := range paths {
 		if copyUpdate, ok := self.ip6PathUpdates[copyIp6Path]; ok {
-			if c := copyUpdate.client.Load(); c != nil && !c.IsDone() && !c.isWarning() && !self.clientAtFlowCapWithLock(c) && createTime.After(mostRecentCreateTime) {
+			if c := copyUpdate.client.Load(); c != nil && !c.IsDone() && !c.isWarning() && (sticky || !self.clientAtFlowCapWithLock(c)) && createTime.After(mostRecentCreateTime) {
 				mostRecentCreateTime = createTime
 				update.client.Store(c)
 			}
 		}
 	}
+}
+
+// domainAffinityAliases collapses the cdn constellations one service operates
+// onto a single affinity name, because the service binds state ACROSS its
+// domains: a video player fetches its manifest from the site domain and its
+// media from the cdn domain, and the signed media urls carry the client ip
+// the manifest was fetched from. With the constellation split across exits
+// the media requests present the wrong egress ip and are rejected -- observed
+// as players stalling and rebuffering behind the tunnel while direct traffic
+// plays fine. One group, one exit, one egress ip is the fix, at the accepted
+// cost that a heavy service's whole constellation grows on a single exit
+// (which is exactly what AffinityStickyPastCap permits).
+//
+// Values must be canonical (never themselves keys); the anchor test walks the
+// table.
+var domainAffinityAliases = map[string]string{
+	// youtube: manifest on the site domain, media on googlevideo, thumbs on
+	// ytimg/ggpht -- the constellation whose split motivated this table
+	"googlevideo.com": "youtube.com",
+	"ytimg.com":       "youtube.com",
+	"ggpht.com":       "youtube.com",
+	"youtu.be":        "youtube.com",
+	// twitter/x
+	"twimg.com":   "x.com",
+	"twitter.com": "x.com",
+	// meta
+	"fbcdn.net":        "facebook.com",
+	"cdninstagram.com": "instagram.com",
+	// tiktok
+	"tiktokcdn.com":    "tiktok.com",
+	"tiktokcdn-us.com": "tiktok.com",
+	"tiktokv.com":      "tiktok.com",
+	// netflix
+	"nflxvideo.net": "netflix.com",
+	"nflximg.net":   "netflix.com",
+	"nflxso.net":    "netflix.com",
+	// twitch
+	"ttvnw.net": "twitch.tv",
+	"jtvnw.net": "twitch.tv",
+	// reddit
+	"redd.it":          "reddit.com",
+	"redditmedia.com":  "reddit.com",
+	"redditstatic.com": "reddit.com",
+}
+
+// affinityNameForServerName is the one place a server name becomes an affinity
+// group name: base domain (a.foo.com, b.c.foo.com and foo.com all collapse to
+// foo.com), then the constellation alias, so a site's flows -- and its cdn's
+// -- pin to one client channel.
+func affinityNameForServerName(serverName string) string {
+	affinityName := serverName
+	if rootDomain, err := publicsuffix.EffectiveTLDPlusOne(serverName); err == nil {
+		affinityName = rootDomain
+	}
+	if alias, ok := domainAffinityAliases[affinityName]; ok {
+		affinityName = alias
+	}
+	return affinityName
 }
 
 // called with stateLock
@@ -2055,10 +2155,7 @@ func (self *RemoteUserNatMultiClient) affinityIpPathsWithLock(ipPath *IpPath) (a
 		if 0 < len(serverNames) {
 			seen := map[string]bool{}
 			for _, serverName := range serverNames {
-				affinityName := serverName
-				if rootDomain, err := publicsuffix.EffectiveTLDPlusOne(serverName); err == nil {
-					affinityName = rootDomain
-				}
+				affinityName := affinityNameForServerName(serverName)
 				if seen[affinityName] {
 					continue
 				}

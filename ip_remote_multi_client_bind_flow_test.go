@@ -2,8 +2,10 @@ package connect
 
 import (
 	"context"
+	"net"
 	"strings"
 	"testing"
+	"time"
 )
 
 func bindFlowTestParent() *RemoteUserNatMultiClient {
@@ -180,5 +182,87 @@ func TestBindClientFlowMakesRacedFlowsVisibleToTheCap(t *testing.T) {
 
 	if !atCap {
 		t.Errorf("exit carrying 3 raced flows is not at a cap of 2: counted %d", len(parent.clientUpdates[client]))
+	}
+}
+
+// A donor at the flow cap must still donate to its own affinity group: the cap
+// bounds which exits collect NEW sites, never a site's growth on the exit it is
+// already pinned to. The veto this replaces split a busy site's egress ip
+// exactly when the site was busiest -- flow n+1 was refused its donor and raced
+// onto a different exit, and services that bind sessions or signed media urls
+// to the client ip then rejected the strays.
+func TestAffinityInheritanceIsStickyPastTheFlowCap(t *testing.T) {
+	parent := bindFlowTestParent()
+	parent.settings.MaxFlowsPerExit = 2
+	parent.ip4PathUpdates = map[Ip4Path]*multiClientChannelUpdate{}
+	donor := bindFlowTestChannel(parent)
+
+	// the donor exit is at its cap, all flows in one affinity group
+	donorPaths := map[Ip4Path]time.Time{}
+	for i := range 2 {
+		flowPath := &IpPath{
+			Version:         4,
+			Protocol:        IpProtocolTcp,
+			SourceIp:        net.IPv4(10, 0, 0, 1),
+			SourcePort:      40000 + i,
+			DestinationIp:   net.IPv4(203, 0, 113, 7),
+			DestinationPort: 443,
+		}
+		flowUpdate := &multiClientChannelUpdate{}
+		flowUpdate.client.Store(donor)
+		parent.bindClientFlow(flowUpdate, donor)
+		ip4 := flowPath.ToIp4Path()
+		parent.ip4PathUpdates[ip4] = flowUpdate
+		donorPaths[ip4] = time.Now()
+	}
+
+	parent.stateLock.Lock()
+	if !parent.clientAtFlowCapWithLock(donor) {
+		parent.stateLock.Unlock()
+		t.Fatal("fixture: the donor is not at cap")
+	}
+	newFlow := &multiClientChannelUpdate{}
+	parent.inheritAffinityClient4WithLock(newFlow, donorPaths)
+	parent.stateLock.Unlock()
+	if newFlow.client.Load() != donor {
+		t.Error("a donor at cap did not donate: the site's next flow changes egress ip")
+	}
+
+	// the pre-change veto is the A/B point
+	parent.settings.AffinityStickyPastCap = false
+	vetoed := &multiClientChannelUpdate{}
+	parent.stateLock.Lock()
+	parent.inheritAffinityClient4WithLock(vetoed, donorPaths)
+	parent.stateLock.Unlock()
+	if vetoed.client.Load() != nil {
+		t.Error("with the veto restored, a donor at cap still donated")
+	}
+}
+
+// A cdn constellation must collapse to ONE affinity group: the service binds
+// state across its domains (signed media urls carry the client ip the manifest
+// was fetched from), so the site domain and its cdn domains have to share an
+// exit or the media requests present the wrong egress ip.
+func TestAffinityNameCollapsesCdnConstellations(t *testing.T) {
+	// the full chain: subdomain -> base domain -> constellation alias
+	if got := affinityNameForServerName("r3---sn-ab5l6ne7.googlevideo.com"); got != "youtube.com" {
+		t.Errorf("googlevideo collapsed to %q, want youtube.com", got)
+	}
+	if got := affinityNameForServerName("i.ytimg.com"); got != "youtube.com" {
+		t.Errorf("ytimg collapsed to %q, want youtube.com", got)
+	}
+	// a site outside the table gets base-domain collapse and nothing else
+	if got := affinityNameForServerName("b.c.example.com"); got != "example.com" {
+		t.Errorf("example collapsed to %q, want example.com", got)
+	}
+	// values are canonical: an alias chain would put flows one hop apart in
+	// different groups, which is the exact split the table exists to prevent
+	for from, to := range domainAffinityAliases {
+		if from == to {
+			t.Errorf("alias %q maps to itself", from)
+		}
+		if _, ok := domainAffinityAliases[to]; ok {
+			t.Errorf("alias %q -> %q chains: %q is itself aliased", from, to, to)
+		}
 	}
 }

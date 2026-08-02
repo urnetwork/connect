@@ -161,17 +161,21 @@ func waitForProbeFlows(t *testing.T, parent *RemoteUserNatMultiClient, protocol 
 // the pass qualifies the provider.
 func TestProbeResolutionThroughChannel(t *testing.T) {
 	parent, client, forwarded := probeTestParent(t)
+	// narrowed from the full-table default so the fixture answers a handful of
+	// queries rather than the whole list; width semantics have their own test
+	parent.settings.ProbeSampleHostCount = 4
 
 	// the pass's sample is deterministic from the destination and pass index,
 	// so the test can predict what will be asked
 	destination := client.probeDestination()
-	hosts, resolver := sampleProbeTargets(probeSeedBase(destination), probeSampleHostCount)
+	hosts, resolver := sampleProbeTargets(probeSeedBase(destination), 4)
+	// every sampled hostname is resolved; there is no truncation
 	expectedNames := []string{}
 	expectedLiterals := 0
 	for _, host := range hosts {
 		if net.ParseIP(host) != nil {
 			expectedLiterals += 1
-		} else if len(expectedNames) < probeResolveNameCount {
+		} else {
 			expectedNames = append(expectedNames, host)
 		}
 	}

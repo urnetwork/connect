@@ -788,13 +788,16 @@ func assertProbeChecksums(t *testing.T, version int, packet []byte, ipProtocol i
 // (a provider whose upstream reaches some of the internet and not the rest is
 // invisible to a probe that always asks the same four questions).
 func TestProbeSamplerIsDeterministicAndRotates(t *testing.T) {
-	hosts1, resolver1 := sampleProbeTargets(7, probeSampleHostCount)
-	hosts2, resolver2 := sampleProbeTargets(7, probeSampleHostCount)
+	// a compact width: rotation only matters when ProbeSampleHostCount narrows
+	// the pass below the full-table default
+	const width = 4
+	hosts1, resolver1 := sampleProbeTargets(7, width)
+	hosts2, resolver2 := sampleProbeTargets(7, width)
 	if strings.Join(hosts1, ",") != strings.Join(hosts2, ",") || resolver1 != resolver2 {
 		t.Error("the sampler is not deterministic for a fixed seed")
 	}
-	if len(hosts1) != probeSampleHostCount {
-		t.Errorf("sampled %d hosts, want %d", len(hosts1), probeSampleHostCount)
+	if len(hosts1) != width {
+		t.Errorf("sampled %d hosts, want %d", len(hosts1), width)
 	}
 	if resolver1 == "" {
 		t.Error("no resolver sampled")
@@ -805,7 +808,7 @@ func TestProbeSamplerIsDeterministicAndRotates(t *testing.T) {
 	for _, host := range hosts1 {
 		seen[host] = true
 	}
-	next, _ := sampleProbeTargets(8, probeSampleHostCount)
+	next, _ := sampleProbeTargets(8, width)
 	for _, host := range next {
 		if seen[host] {
 			t.Errorf("consecutive passes repeat %q: rotation is not advancing a full block", host)
@@ -814,9 +817,9 @@ func TestProbeSamplerIsDeterministicAndRotates(t *testing.T) {
 
 	// and the rotation covers the whole table
 	covered := map[string]bool{}
-	passes := (len(probeHostNames) + probeSampleHostCount - 1) / probeSampleHostCount
+	passes := (len(probeHostNames) + width - 1) / width
 	for seed := 0; seed < passes; seed += 1 {
-		hosts, _ := sampleProbeTargets(uint64(seed), probeSampleHostCount)
+		hosts, _ := sampleProbeTargets(uint64(seed), width)
 		for _, host := range hosts {
 			covered[host] = true
 		}
@@ -828,7 +831,7 @@ func TestProbeSamplerIsDeterministicAndRotates(t *testing.T) {
 	// resolvers rotate too
 	resolvers := map[string]bool{}
 	for seed := 0; seed < len(probeResolverIps); seed += 1 {
-		_, resolver := sampleProbeTargets(uint64(seed), probeSampleHostCount)
+		_, resolver := sampleProbeTargets(uint64(seed), width)
 		resolvers[resolver] = true
 	}
 	if len(resolvers) != len(probeResolverIps) {
@@ -841,6 +844,27 @@ func TestProbeSamplerIsDeterministicAndRotates(t *testing.T) {
 	}
 	if hosts, _ := sampleProbeTargets(3, len(probeHostNames)+10); len(hosts) != len(probeHostNames) {
 		t.Errorf("an oversized request returned %d hosts, want the whole table", len(hosts))
+	}
+}
+
+// The default pass width is the ENTIRE table -- the setting narrows, never
+// widens, and unset/zero/negative all mean everything. This is the contract
+// the mainnet-aggressive default rides on.
+func TestProbeSampleWidthDefaultsToEntireTable(t *testing.T) {
+	if got := probeSampleWidth(nil); got != len(probeHostNames) {
+		t.Errorf("nil settings: width %d, want the whole table (%d)", got, len(probeHostNames))
+	}
+	if got := probeSampleWidth(&ReliabilitySettings{}); got != len(probeHostNames) {
+		t.Errorf("zero setting: width %d, want the whole table (%d)", got, len(probeHostNames))
+	}
+	if got := probeSampleWidth(&ReliabilitySettings{ProbeSampleHostCount: -1}); got != len(probeHostNames) {
+		t.Errorf("negative setting: width %d, want the whole table (%d)", got, len(probeHostNames))
+	}
+	if got := probeSampleWidth(&ReliabilitySettings{ProbeSampleHostCount: 4}); got != 4 {
+		t.Errorf("explicit setting: width %d, want 4", got)
+	}
+	if got := probeSampleWidth(ReliabilitySettingsFrom(DefaultMultiClientSettings())); got != len(probeHostNames) {
+		t.Errorf("shipped defaults: width %d, want the whole table (%d)", got, len(probeHostNames))
 	}
 }
 
