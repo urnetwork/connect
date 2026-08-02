@@ -155,12 +155,17 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// ~CPingRestTimeout+CPingTimeout instead of ~2x CPingTimeout
 		CPingRestTimeout: 10 * time.Second,
 		// a lower ack timeout helps cycle through bad providers faster
-		AckTimeout:                                30 * time.Second,
-		BlackholeTimeout:                          5 * time.Second,
-		BlackholeReceiveTimeout:                   20 * time.Second,
-		MaxFlowsPerExit:                           16,
-		DialFailureRerace:                         true,
-		BlackholeConnectTimeout:                   30 * time.Second,
+		AckTimeout:              30 * time.Second,
+		BlackholeTimeout:        5 * time.Second,
+		BlackholeReceiveTimeout: 20 * time.Second,
+		MaxFlowsPerExit:         16,
+		DialFailureRerace:       true,
+		BlackholeConnectTimeout: 30 * time.Second,
+		// long enough that an ordinary quiet moment (all flows idle between
+		// requests) does not read as an outage, short enough that the gate is
+		// engaged well before the shortest receive verdict (20s) can mature
+		// on evidence collected during the silence
+		UplinkStalenessGate:                       5 * time.Second,
 		WindowResizeTimeout:                       15 * time.Second,
 		StatsWindowGraceperiod:                    30 * time.Second,
 		StatsWindowMaxEstimatedByteCountPerSecond: mib(16),
@@ -216,6 +221,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		UdpCollapsePrevention: false,
 
 		UdpTeardownSignal:        true,
+		StandingReserve:          true,
 		ClusterAffinityFallback:  true,
 		ServerNameAffinityBridge: true,
 		// well inside AckTimeout (30s), which is what otherwise bounds recovery
@@ -227,6 +233,13 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// flow, and past the ~200ms-1s range of a first tcp rto so a healthy
 		// flow's retransmits are still collapsed
 		TcpCollapseMaxHold: 1500 * time.Millisecond,
+		SoftVerdictDemote:  true,
+		// two removals per half minute lets the ordinary single-provider
+		// failure execute immediately (and its replacement fail once too)
+		// while stopping the storm shape observed in the field: one
+		// migration-flavored event convicting exit after exit within seconds
+		RemovalBudgetCount:  2,
+		RemovalBudgetWindow: 30 * time.Second,
 
 		SecurityPolicyGenerator: DefaultSecurityPolicyWithStats,
 
@@ -291,6 +304,21 @@ type MultiClientSettings struct {
 	// if that margin is lost.
 	BlackholeReceiveTimeout time.Duration
 	BlackholeConnectTimeout time.Duration
+	// UplinkStalenessGate is how long the whole tunnel may go without a single
+	// provider-originated ingress packet before the receive-branch blackhole
+	// verdicts are held as inadmissible. Those verdicts convict a provider on
+	// silence, and silence is only evidence while the local uplink is known to
+	// deliver: during a wifi/cellular migration nothing from any provider can
+	// arrive, so every exit looks identically guilty. Measured on device, one
+	// network migration executed 7 exits in 79s, every verdict
+	// `no-receive-ack recv 0/0B` -- the providers were fine, the phone was
+	// between networks. The gate never touches the no-send-ack verdict (a
+	// provider that stops acknowledging while the uplink is fresh is convicted
+	// on its own signal), only applies while at least two channels are
+	// actively talking (see sendingChannelCount), and stops applying after
+	// uplinkStalenessMaxHold of continuous staleness so a genuinely dead
+	// window can still be recycled. 0 disables the gate entirely.
+	UplinkStalenessGate time.Duration
 	// MaxFlowsPerExit bounds how many live flows may be pinned to one exit.
 	//
 	// Providers are split-tcp, so removing an exit destroys every flow on it.
@@ -374,6 +402,10 @@ type MultiClientSettings struct {
 
 	// active clients longer than this lifetime will not be forced closed
 	// new connections will be routed to new clients
+	// each channel actually uses a per-channel effective lifetime of
+	// MaxClientLifetime x uniform(0.75, 1.0), drawn once at construction, so
+	// channels created together do not all rotate in the same resize pass;
+	// see jitterClientLifetime. 0 disables rotation entirely.
 	MaxClientLifetime time.Duration
 
 	ProtocolVersion int
@@ -420,6 +452,37 @@ type MultiClientSettings struct {
 	// it is frozen. 0 disables the check. See `sendStalled`.
 	SendStallTimeout time.Duration
 
+	// SoftVerdictDemote changes what a soft classification against a loaded
+	// exit does. The core invariant it enforces: an exit carrying live flows
+	// may only be closed on hard evidence -- transport dead, no-send-ack,
+	// an honest send stall, a dead continuous ping, or explicit user action.
+	// The soft signals (no-receive-ack, no-receive-syn, the stats-unhealthy
+	// resize removal) convict on silence, and silence from a loaded exit is
+	// ambiguous; executing on it destroys the exit's established flows, which
+	// are its only working asset. With this on, those signals demote instead:
+	// the exit is warned out of selection (no new flows), its established
+	// flows keep running, and removal is deferred until it is flowless or the
+	// same evidence has held continuously past
+	// StatsWindowKeepUnhealthyDuration. false restores the pre-change
+	// execute-immediately behavior, which is the A/B comparison point. See
+	// `verdictAction` and the quarantine state on `multiClientChannel`.
+	SoftVerdictDemote bool
+
+	// RemovalBudgetCount and RemovalBudgetWindow are the verdict-removal
+	// storm breaker: at most RemovalBudgetCount verdict-driven removals per
+	// window per RemovalBudgetWindow, and past the budget a removal is
+	// deferred (the client is warned and kept) instead of executed. A storm
+	// of verdicts is far more likely to be one shared cause -- a network
+	// migration convicting every exit on the same silence -- than that many
+	// independent provider failures, and the deferral costs seconds while a
+	// wrong mass execution costs every flow in the window. Exempt from the
+	// budget: user action (DropExit), context-done/transport-dead cleanup,
+	// lifetime drains, and capacity collapse -- the breaker only meters the
+	// removals that a verdict argued for. RemovalBudgetCount 0 turns the
+	// breaker off. See `verdictRemovalAllowed`.
+	RemovalBudgetCount  int
+	RemovalBudgetWindow time.Duration
+
 	// ServerNameAffinityBridge lets a new flow whose own affinity group has no
 	// donor inherit the client from the destination-scoped group an earlier
 	// nameless flow to the same destination joined. Those groups are read, never
@@ -441,6 +504,21 @@ type MultiClientSettings struct {
 	// goes silent and stalls until the application times out. see
 	// `ipOosUnreachable`.
 	UdpTeardownSignal bool
+
+	// StandingReserve sizes each window one spare exit beyond its computed
+	// target (bounded by WindowSizeHardMax), so a replacement for a failed or
+	// draining exit is already connected when it is needed. Measured on
+	// device, failover backfill took ~45s because replacement only started
+	// after a loss was noticed: a resize tick to see the hole, a generator
+	// round trip, a dial, and an evaluation ping all sat between the failure
+	// and the first packet over the replacement. With a standing spare the
+	// flows re-race onto an exit that already passed evaluation. The cost is
+	// one idle provider connection per window. Not applied to
+	// fixed-destination generators (their destination set cannot produce a
+	// spare) or to a window whose resize is disabled (target 0). false
+	// restores the previous exact-target sizing, the A/B comparison point.
+	// See `standingReserveTarget`.
+	StandingReserve bool
 
 	SecurityPolicyGenerator func(context.Context, *SecurityPolicyStatsCollector) SecurityPolicy
 
@@ -615,6 +693,26 @@ type RemoteUserNatMultiClient struct {
 	// they served stay unreachable. The reliability knobs above are only
 	// A/B-testable against a number, and this is the number.
 	reliabilityMetrics *reliabilityMetrics
+
+	// uplinkLastIngressNanos is the unix-nano time the local uplink last
+	// proved it delivers: the last provider-originated packet to arrive, or
+	// the last intercepted dial-failure icmp (not a receive-ack, but it did
+	// arrive). Stamped on the packet hot path, so an atomic, and coarsened to
+	// uplinkStampCoarseness so a download does not rewrite it per packet. See
+	// stampUplinkIngress and uplinkGate.
+	uplinkLastIngressNanos atomic.Int64
+
+	// the uplink staleness epoch, maintained lazily by uplinkGate as the
+	// channels' verdict passes call it. uplinkStaleSince is set while the
+	// tunnel is observed stale (zero while fresh); uplinkFreshSince is when
+	// the last stale epoch ended (zero if never stale), which is what the
+	// receive-verdict clocks rebase from. Guarded by uplinkStateLock, a leaf
+	// lock: uplinkGate takes it with no other lock held.
+	uplinkStateLock  sync.Mutex
+	uplinkStaleSince time.Time
+	uplinkFreshSince time.Time
+	// one log line per epoch when the hold cap expires, not one per pass
+	uplinkCapLogged bool
 }
 
 // ServerNameLookup resolves a destination IP to the server name(s) previously observed
@@ -735,6 +833,9 @@ func NewRemoteUserNatMultiClient(
 		WindowTypeQuality,
 		settings,
 		multiClient.reliabilitySettings,
+		multiClient.uplinkGate,
+		multiClient.reliabilityMetricsRef,
+		multiClient.clientFlowCount,
 	)
 	if _, fixed := generator.FixedDestinationSize(); !fixed {
 		multiClient.windows[WindowTypeSpeed] = newMultiClientWindow(
@@ -748,6 +849,9 @@ func NewRemoteUserNatMultiClient(
 			WindowTypeSpeed,
 			settings,
 			multiClient.reliabilitySettings,
+			multiClient.uplinkGate,
+			multiClient.reliabilityMetricsRef,
+			multiClient.clientFlowCount,
 		)
 	}
 	// else only keep the quality window for fixed destination
@@ -1096,6 +1200,11 @@ type ReliabilitySettings struct {
 	BlackholeReceiveTimeout  time.Duration
 	MaxFlowsPerExit          int
 	DialFailureRerace        bool
+	UplinkStalenessGate      time.Duration
+	SoftVerdictDemote        bool
+	RemovalBudgetCount       int
+	RemovalBudgetWindow      time.Duration
+	StandingReserve          bool
 }
 
 // ReliabilitySettingsFrom reads the effective values out of a settings struct.
@@ -1116,6 +1225,11 @@ func ReliabilitySettingsFrom(settings *MultiClientSettings) *ReliabilitySettings
 		BlackholeReceiveTimeout:  settings.BlackholeReceiveTimeout,
 		MaxFlowsPerExit:          settings.MaxFlowsPerExit,
 		DialFailureRerace:        settings.DialFailureRerace,
+		UplinkStalenessGate:      settings.UplinkStalenessGate,
+		SoftVerdictDemote:        settings.SoftVerdictDemote,
+		RemovalBudgetCount:       settings.RemovalBudgetCount,
+		RemovalBudgetWindow:      settings.RemovalBudgetWindow,
+		StandingReserve:          settings.StandingReserve,
 	}
 }
 
@@ -2703,6 +2817,167 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 	return
 }
 
+// The uplink gate.
+//
+// A blackhole verdict convicts a provider on silence, and silence is only
+// evidence while the local uplink is known to deliver. When the phone itself
+// is between networks -- a wifi/cellular migration, a captive portal, an
+// elevator -- nothing from any provider can arrive, so every exit looks
+// identically guilty and the verdict loop executes them one after another.
+// Measured on device: one wifi network migration executed 7 exits in 79s,
+// every verdict `no-receive-ack recv 0/0B`. The gate makes that evidence
+// inadmissible: while the whole tunnel has been silent past
+// UplinkStalenessGate, the receive-branch verdicts are held, and when
+// receiving resumes their clocks restart from the end of the silence so the
+// held verdicts do not all fire at once on unfreeze.
+
+const (
+	// uplinkStampCoarseness bounds how often the ingress stamp is rewritten.
+	// The gate compares against seconds, so per-packet nanosecond precision
+	// buys nothing and costs a contended cache line on the download hot path;
+	// a load-and-compare skips the store while the stamp is fresh. The
+	// unsynchronized read-then-write race is benign: losing a store leaves a
+	// stamp at most this much older than the truth.
+	uplinkStampCoarseness = 100 * time.Millisecond
+
+	// uplinkStalenessMaxHold caps how long continuous staleness may hold
+	// verdicts. The gate cannot tell a long network outage from a window
+	// whose every provider is dead -- both are tunnel-wide silence -- so past
+	// this bound it stops applying and the ordinary verdicts recycle the
+	// window. The epoch stays open: the clocks still rebase when receiving
+	// actually resumes, so the recycled channels' replacements start clean.
+	uplinkStalenessMaxHold = 60 * time.Second
+)
+
+// stampUplinkIngress records proof that the local uplink delivers. Called
+// wherever a provider-originated packet is known to have arrived; see the
+// uplinkStampCoarseness comment for why most calls store nothing.
+func (self *RemoteUserNatMultiClient) stampUplinkIngress() {
+	nowNanos := time.Now().UnixNano()
+	if lastNanos := self.uplinkLastIngressNanos.Load(); nowNanos-lastNanos < int64(uplinkStampCoarseness) {
+		return
+	}
+	self.uplinkLastIngressNanos.Store(nowNanos)
+}
+
+// sendingChannelCount reports how many channels across all windows currently
+// hold outstanding sends. The gate carries zero exculpatory information when
+// only one channel is talking -- tunnel-wide silence is then indistinguishable
+// from that one provider being dead -- so uplinkGate only engages at two or
+// more.
+//
+// Locking: the parent stateLock is taken briefly to snapshot the channels
+// with bound flows, released, and then each channel's own stateLock is taken
+// one at a time with nothing else held. The channel stateLock must never nest
+// under the parent stateLock (see clientDialFailure), and consequently this
+// must never be called while holding a channel or per-flow leaf lock.
+func (self *RemoteUserNatMultiClient) sendingChannelCount() int {
+	var clients []*multiClientChannel
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		clients = make([]*multiClientChannel, 0, len(self.clientUpdates))
+		for client := range self.clientUpdates {
+			clients = append(clients, client)
+		}
+	}()
+
+	sendingCount := 0
+	for _, client := range clients {
+		if client.hasOutstandingSends() {
+			sendingCount += 1
+		}
+	}
+	return sendingCount
+}
+
+// uplinkGate evaluates the tunnel-wide uplink gate for one verdict pass and
+// maintains the staleness epoch as a side effect. stale means the receive
+// verdicts must be held this pass; freshSince is when the last stale epoch
+// ended (zero if never stale) and is what the receive-verdict clocks rebase
+// from. Safe on a bare client; called from every channel's detectBlackhole
+// cadence with no locks held.
+func (self *RemoteUserNatMultiClient) uplinkGate(now time.Time) (stale bool, freshSince time.Time) {
+	gate := self.reliabilitySettings().UplinkStalenessGate
+	if gate <= 0 {
+		// gate off. the zero freshSince rebases nothing downstream.
+		return false, time.Time{}
+	}
+
+	lastIngressNanos := self.uplinkLastIngressNanos.Load()
+	// no stamp yet means no baseline: the uplink never proved it delivers, so
+	// there is nothing for it to have stopped doing. a dead-on-arrival window
+	// is left to the ordinary verdicts rather than held for the cap first.
+	timeStale := lastIngressNanos != 0 && gate < now.Sub(time.Unix(0, lastIngressNanos))
+
+	// the degenerate-case guard. checked only once the clock already says
+	// stale, so the channel sweep runs at most once per verdict pass.
+	if timeStale && self.sendingChannelCount() < 2 {
+		timeStale = false
+	}
+
+	self.uplinkStateLock.Lock()
+	defer self.uplinkStateLock.Unlock()
+
+	if timeStale {
+		if self.uplinkStaleSince.IsZero() {
+			self.uplinkStaleSince = now
+			self.uplinkCapLogged = false
+			// transitions only -- the passes in between are silent
+			loggerOrDefault(self.log).Infof("[multi]uplink stale: holding receive verdicts\n")
+		}
+		if uplinkStalenessMaxHold <= now.Sub(self.uplinkStaleSince) {
+			// past the cap the gate stops applying so a genuinely dead window
+			// can be recycled. the epoch deliberately stays open: freshSince
+			// must not advance to here, or the recycle the cap exists to
+			// allow would be rebased away.
+			if !self.uplinkCapLogged {
+				self.uplinkCapLogged = true
+				loggerOrDefault(self.log).Infof("[multi]uplink stale past %s: verdicts resume\n", uplinkStalenessMaxHold)
+			}
+			return false, self.uplinkFreshSince
+		}
+		return true, self.uplinkFreshSince
+	}
+
+	if !self.uplinkStaleSince.IsZero() {
+		// the stale epoch just ended. the receive-verdict clocks rebase from
+		// here, so verdicts held across the epoch restart instead of all
+		// firing at once on unfreeze.
+		self.uplinkStaleSince = time.Time{}
+		self.uplinkFreshSince = now
+		loggerOrDefault(self.log).Infof("[multi]uplink fresh: receive verdict clocks rebased\n")
+	}
+	return false, self.uplinkFreshSince
+}
+
+// reliabilityMetricsRef hands the shared counters to the window channels via
+// injection, mirroring how reliabilitySettings reaches them. Unexported on
+// purpose: the public ReliabilityMetrics() returns a snapshot, this returns
+// the live counters (possibly nil on a bare client, which every counter
+// method tolerates).
+func (self *RemoteUserNatMultiClient) reliabilityMetricsRef() *reliabilityMetrics {
+	return self.reliabilityMetrics
+}
+
+// clientFlowCount reports how many live flows are currently bound to a window
+// client, from the clientUpdates bookkeeping that bindClientFlow single-sources
+// (the same count the flow cap and the teardown read). This is the number that
+// decides whether closing an exit costs anything: a verdict against a flowless
+// exit is free to execute, one against a loaded exit destroys established
+// connections and must clear a higher bar.
+//
+// Locking: takes only the parent stateLock, which sits at the top of the lock
+// hierarchy here. It must therefore never be called while a channel stateLock
+// or a per-flow leaf lock is held (the same rule sendingChannelCount documents)
+// -- callers are the resize pass and detectBlackhole, both of which hold
+// nothing when they read it.
+func (self *RemoteUserNatMultiClient) clientFlowCount(client *multiClientChannel) int {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return len(self.clientUpdates[client])
+}
+
 // clientReceivePacketFunction
 func (self *RemoteUserNatMultiClient) clientReceivePacket(
 	sourceClient *multiClientChannel,
@@ -2723,6 +2998,11 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 
 	self.packetStatsCounters.remoteIngressPacketCount.Add(1)
 	self.packetStatsCounters.remoteIngressByteCount.Add(int64(len(packet)))
+
+	// every packet here is provider-originated by construction, so it is
+	// proof the local uplink delivers -- the freshness the uplink gate
+	// measures verdict silence against
+	self.stampUplinkIngress()
 
 	// traffic from a destination whose flows died with an exit closes out the
 	// recovery measurement. also before reverse, so the remote endpoint is
@@ -2911,6 +3191,13 @@ func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClien
 	// counted for every intercepted signal, matched or not: the gap between
 	// this and flowsReraced is failures that named no live flow.
 	self.reliabilityMetrics.dialFailureIntercepted()
+
+	// an intercepted icmp is deliberately not a receive-ack -- it must not
+	// make a provider look like it is delivering data -- but it did arrive,
+	// which is proof the local uplink delivers. without this stamp a burst of
+	// dial failures during real provider trouble could read as uplink
+	// staleness and hold the very verdicts that should fire.
+	self.stampUplinkIngress()
 
 	rerace := self.reliabilitySettings().DialFailureRerace
 
@@ -3630,6 +3917,95 @@ func newParsedPacket(packet []byte) (*parsedPacket, error) {
 	}, nil
 }
 
+const (
+	// clientLifetimeJitterMinFraction is the low end of the per-channel
+	// lifetime jitter: each channel's effective lifetime is MaxClientLifetime
+	// scaled by a uniform draw from [this, 1.0), taken once at construction.
+	// Without it, every channel created at connect time reaches its
+	// removeTime in the same resize pass, so rotation is a synchronized
+	// hourly event -- every exit drains at once, every flow re-races in the
+	// same window, and the reconnect burst lands on the platform as one
+	// spike. 0.75 spreads a 60m lifetime over a 15m band, which is dozens of
+	// resize ticks, while never shortening a lifetime below three quarters of
+	// what was configured. A constant rather than a setting: the exact
+	// fraction is not worth a knob, only "spread, never synchronized" is the
+	// requirement.
+	clientLifetimeJitterMinFraction = 0.75
+
+	// collapseDeadlineLifetimes sets the capacity-collapse hard deadline at
+	// this many MaxClientLifetimes past a client's first event. The collapse
+	// gate keeps a flow-carrying client alive through capacity collapse --
+	// flowless is the normal removal path -- but without an upper bound one
+	// immortal flow (a weeks-long idle ssh session that never goes flowless)
+	// would pin its exit in the window forever, and a window over hard max
+	// could never converge. 2x is deliberately generous: it is a whole extra
+	// lifetime beyond the point where the drain warning stopped new flows
+	// from landing on the client, so anything still bound to it has had an
+	// entire rotation period to finish on its own. Measured against the raw
+	// MaxClientLifetime, not the jittered per-channel lifetime, so the
+	// deadline is a stable bound that is always at least twice any effective
+	// lifetime.
+	collapseDeadlineLifetimes = 2
+
+	// standingReserveSpares is how many spare exits StandingReserve holds
+	// beyond the computed target window size. One is the measured need: the
+	// ~45s failover backfill gap is closed by any already-evaluated spare,
+	// and each additional spare is another idle provider connection paying
+	// for a second simultaneous failure, which the resize tick already
+	// covers within ~15s.
+	standingReserveSpares = 1
+)
+
+// jitterClientLifetime returns the effective lifetime for one channel:
+// maxClientLifetime scaled by uniform [clientLifetimeJitterMinFraction, 1.0),
+// drawn once at construction and fixed for the channel's life. Drawing per
+// channel (not per read) is what desynchronizes rotation: channels created in
+// the same expand burst land their removeTimes across the jitter band instead
+// of in one resize pass. A non-positive lifetime is returned unchanged --
+// 0 (or negative) MaxClientLifetime means rotation is disabled, and jitter
+// must not invent a lifetime where none was configured.
+func jitterClientLifetime(maxClientLifetime time.Duration) time.Duration {
+	if maxClientLifetime <= 0 {
+		return maxClientLifetime
+	}
+	fraction := clientLifetimeJitterMinFraction + mathrand.Float64()*(1.0-clientLifetimeJitterMinFraction)
+	return time.Duration(float64(maxClientLifetime) * fraction)
+}
+
+// standingReserveTarget applies the standing reserve to a window's computed
+// target size: +standingReserveSpares beyond the target, bounded by
+// windowSizeHardMax (0 hard max is unbounded, as everywhere else). The spare
+// exists so that when an exit fails or drains, its replacement has already
+// been dialed and evaluated -- the measured motivation is a ~45s failover
+// backfill that only started after a loss was noticed. Deliberately allowed
+// to exceed WindowSizeMax: the max bounds demand-driven growth, while the
+// spare is capacity insurance on top of whatever target that math produced.
+//
+// The reserve is skipped when:
+//   - standingReserve is off (the A/B comparison point, and what a zero
+//     ReliabilitySettings -- every bare fixture -- reads),
+//   - the generator has a fixed destination set (fixedDestination): there is
+//     nothing beyond the set to hold in reserve, and asking for it would
+//     leave every expand pass waiting out its timeout on args that cannot
+//     arrive,
+//   - the computed target is 0, which is how resize disables a non-active
+//     fixed-profile window -- a spare there would silently re-enable it.
+func standingReserveTarget(
+	targetWindowSize int,
+	windowSizeHardMax int,
+	standingReserve bool,
+	fixedDestination bool,
+) int {
+	if !standingReserve || fixedDestination || targetWindowSize <= 0 {
+		return targetWindowSize
+	}
+	reserveTargetWindowSize := targetWindowSize + standingReserveSpares
+	if 0 < windowSizeHardMax {
+		reserveTargetWindowSize = min(reserveTargetWindowSize, windowSizeHardMax)
+	}
+	return reserveTargetWindowSize
+}
+
 type multiClientWindow struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -3649,6 +4025,26 @@ type multiClientWindow struct {
 	// window fixtures in the suite stay constructible. nil falls back to
 	// `settings`.
 	reliabilitySettingsFunc func() *ReliabilitySettings
+	// uplinkGateFunc reads the parent's tunnel-wide uplink gate for the
+	// channels' verdict passes; see RemoteUserNatMultiClient.uplinkGate. Same
+	// callback convention as reliabilitySettingsFunc; nil (bare fixtures)
+	// reads as gate off.
+	uplinkGateFunc func(now time.Time) (stale bool, freshSince time.Time)
+	// reliabilityMetricsFunc hands the parent's shared counters to the
+	// channels. nil (bare fixtures) loses the counts, never the traffic --
+	// every counter method tolerates a nil receiver.
+	reliabilityMetricsFunc func() *reliabilityMetrics
+	// flowCountFunc reads how many live flows the parent currently has bound
+	// to a window client (the clientUpdates bookkeeping, read under the parent
+	// stateLock). Same callback convention as reliabilitySettingsFunc. nil --
+	// bare test windows -- reads as 0 for every client, which means the
+	// capacity/removal gates treat every client as flowless: exactly the
+	// pre-change execute-immediately behavior those fixtures assert.
+	//
+	// Locking: the func takes the parent stateLock inside, so it must only be
+	// called with no window or channel lock held. Every resize call site reads
+	// it from the classification loop, which holds nothing.
+	flowCountFunc func(*multiClientChannel) int
 
 	clientChannelArgs chan *multiClientChannelArgs
 
@@ -3662,6 +4058,12 @@ type multiClientWindow struct {
 	stateLock          sync.Mutex
 	clients            map[Id]*multiClientChannel
 	performanceProfile *PerformanceProfile
+	// verdictRemovalTimes is the storm breaker's record of recent
+	// verdict-driven removals, pruned to RemovalBudgetWindow on each check.
+	// Guarded by stateLock. Only removals a verdict argued for are recorded
+	// -- user action, cleanup of already-dead clients, lifetime drains, and
+	// capacity collapse never touch it. See verdictRemovalAllowed.
+	verdictRemovalTimes []time.Time
 
 	generatorMonitor *Monitor
 	resizeMonitor    *Monitor
@@ -3678,6 +4080,9 @@ func newMultiClientWindow(
 	windowType WindowType,
 	settings *MultiClientSettings,
 	reliabilitySettingsFunc func() *ReliabilitySettings,
+	uplinkGateFunc func(now time.Time) (stale bool, freshSince time.Time),
+	reliabilityMetricsFunc func() *reliabilityMetrics,
+	flowCountFunc func(*multiClientChannel) int,
 ) *multiClientWindow {
 	window := &multiClientWindow{
 		ctx:                         ctx,
@@ -3691,6 +4096,9 @@ func newMultiClientWindow(
 		windowType:                  windowType,
 		settings:                    settings,
 		reliabilitySettingsFunc:     reliabilitySettingsFunc,
+		uplinkGateFunc:              uplinkGateFunc,
+		reliabilityMetricsFunc:      reliabilityMetricsFunc,
+		flowCountFunc:               flowCountFunc,
 		clientChannelArgs:           make(chan *multiClientChannelArgs),
 		monitor:                     NewRemoteUserNatMultiClientMonitor(&settings.RemoteUserNatMultiClientMonitorSettings),
 		contractStatusCallbacks:     NewCallbackList[*contractStatusCallbackWorker](),
@@ -3982,6 +4390,19 @@ func (self *multiClientWindow) resize() {
 		for _, client := range self.unorderedClients() {
 			if stats, err := client.WindowStats(); err == nil {
 				clientStats[client] = stats
+			} else if blackholeVerdictErr(err) && !self.verdictRemovalAllowed(startTime) {
+				// the storm breaker: this error is a blackhole verdict, and
+				// the budget of verdict-driven removals for this window is
+				// already spent. Defer -- warn the client out of selection and
+				// keep it, so its slot is replaced (it drops out of the size
+				// math below) but its teardown does not join the storm. It is
+				// re-judged on the next pass, when budget has aged back in.
+				// Cancellations and cping failures never reach this branch
+				// (blackholeVerdictErr keys on the verdict prefix), so user
+				// action and dead-transport cleanup stay immediate.
+				client.setWarning(true)
+				self.metrics().removalDeferred()
+				self.log.Infof("[multi]removal deferred, verdict budget spent [%s] = %s\n", client.ClientId(), err)
 			} else {
 				self.log.Infof("[multi]remove error client [%s] = %s\n", client.ClientId(), err)
 				removeClient(client)
@@ -4055,9 +4476,13 @@ func (self *multiClientWindow) resize() {
 			// unhealthy past the keep cap: keeping the healthiest rides out
 			// transient badness, but a client that never recovers must be
 			// replaced so the window re-expands with fresh candidates (and its
-			// grid dot is reclaimed) instead of pinning a dead client forever
-			if 0 < self.settings.StatsWindowKeepUnhealthyDuration &&
-				self.settings.StatsWindowKeepUnhealthyDuration <= stats.unhealthyDuration {
+			// grid dot is reclaimed) instead of pinning a dead client forever.
+			// sustainedUnhealthy is also the escape hatch for the loaded-exit
+			// demote below: evidence held continuously this long is no longer
+			// a transient classification, so it may remove regardless of flows
+			sustainedUnhealthy := 0 < self.settings.StatsWindowKeepUnhealthyDuration &&
+				self.settings.StatsWindowKeepUnhealthyDuration <= stats.unhealthyDuration
+			if sustainedUnhealthy {
 				remove = true
 			}
 			// a stalled client is removed regardless of rank. rank-keeping exists
@@ -4073,7 +4498,29 @@ func (self *multiClientWindow) resize() {
 				if stats.unhealthyDuration < self.settings.StatsWindowWarnUnhealthyDuration {
 					if !stats.removeTime.IsZero() && stats.removeTime.Before(startTime) {
 						printStats("client drain")
-						client.setWarning(remove)
+						// a past-lifetime client always warns, regardless of
+						// the remove-rank math above. `remove` is a health
+						// protection -- the top max(FixedWindowSize,
+						// KeepHealthiestCount) ranks are shielded from
+						// warn/remove so transient badness in the best
+						// clients is ridden out -- and for a
+						// FixedWindowSize=1 (speed) window the rank-0 client
+						// computes remove=false, so warning with the
+						// rank-derived value here left the best speed exit
+						// selectable forever:
+						// rotation was silently a no-op for exactly the exit
+						// it matters most for. Draining is rotation policy,
+						// not a health verdict, so the rank shield does not
+						// apply. The warning only stops NEW flows from
+						// choosing this client (established flows keep
+						// running until they finish or the collapse deadline
+						// passes), and warnClient counts it in
+						// warnedClients, which is what makes the size math
+						// below see the hole and expand the replacement the
+						// drain hands over to. The health branches below
+						// keep using `remove` untouched -- only the lifetime
+						// drain is exempt from the rank shield.
+						client.setWarning(true)
 						warnClient(client, stats)
 					} else {
 						printStats("client ok")
@@ -4098,6 +4545,19 @@ func (self *multiClientWindow) resize() {
 						if ulimit || (1 < len(clientStats) && client.dialStarved()) {
 							client.setWarning(true)
 							warnClient(client, stats)
+						} else if client.isQuarantined() {
+							// a quarantined exit (detectBlackhole demoted a
+							// soft verdict against it; see setQuarantined) is
+							// already out of selection through isWarning(),
+							// and the quarantine flag survives the
+							// setWarning(false) here by design -- that is the
+							// whole reason it is not the shared warning bool.
+							// Count it as warned rather than kept so the size
+							// math below sees the hole and expands a
+							// replacement for the flows it can no longer
+							// accept, which is the other half of the demote.
+							client.setWarning(false)
+							warnClient(client, stats)
 						} else {
 							client.setWarning(false)
 							keepClient(client, stats)
@@ -4112,8 +4572,45 @@ func (self *multiClientWindow) resize() {
 				printStats(fmt.Sprintf("unhealthy client (#%d remove=%t)", netHealthRank, remove))
 
 				if remove {
-					client.setWarning(true)
-					removeClient(client)
+					// "stats-unhealthy" is a soft classification -- it cannot
+					// tell a broken client from an idle one (see the resize doc
+					// comment at the top of this file). Executing on it against
+					// an exit carrying live flows destroys established
+					// connections on ambiguous evidence, so with SoftVerdictDemote
+					// on such an exit is demoted instead: warned out of new-flow
+					// selection and kept, its flows running, until it is either
+					// flowless or has been continuously unhealthy past the
+					// sustained bound (sustainedUnhealthy above). The two hard
+					// signals keep removing as today: sendStalled is proof the
+					// client is delivering nothing at all, and sustainedUnhealthy
+					// is the same evidence held for a full minute. The demote
+					// deliberately leaves the rank math above untouched -- what
+					// changes is only what a remove verdict against a loaded
+					// exit does.
+					if self.reliabilitySettings().SoftVerdictDemote &&
+						!sendStalled && !sustainedUnhealthy &&
+						0 < self.flowCount(client) {
+						client.setWarning(true)
+						warnClient(client, stats)
+						self.log.Infof(
+							"[multi]unhealthy removal demoted to warning [%s]: carrying flows, evidence not sustained\n",
+							client.ClientId(),
+						)
+					} else if !self.verdictRemovalAllowed(startTime) {
+						// the storm breaker (see verdictRemovalAllowed): the
+						// verdict-removal budget is spent, so defer -- warn and
+						// keep, re-judge next pass
+						client.setWarning(true)
+						warnClient(client, stats)
+						self.metrics().removalDeferred()
+						self.log.Infof(
+							"[multi]unhealthy removal deferred, verdict budget spent [%s]\n",
+							client.ClientId(),
+						)
+					} else {
+						client.setWarning(true)
+						removeClient(client)
+					}
 				} else {
 					client.setWarning(false)
 					warnClient(client, stats)
@@ -4150,7 +4647,25 @@ func (self *multiClientWindow) resize() {
 
 						for _, client := range cs[len(cs)-m : len(cs)] {
 							if self.settings.StatsWindowGraceperiod <= durations[client] && weights[client] <= 0 {
-								removeClient(client)
+								// capacity collapse must not destroy live
+								// flows: a zero 30s effective weight cannot
+								// tell an idle-but-open session (an ssh
+								// window between keystrokes) from a dead
+								// client, so the weight alone is not license
+								// to remove. The gate (see
+								// collapseRemovalAllowed) admits the removal
+								// when the client is flowless -- the normal
+								// path -- or past the hard collapse deadline,
+								// the escape that keeps one immortal flow
+								// from pinning an exit forever. Called here
+								// with no lock held, matching removeClient's
+								// own idiom: the flow count read takes the
+								// parent stateLock inside.
+								if self.collapseRemovalAllowed(client, durations[client]) {
+									removeClient(client)
+								} else {
+									self.log.Infof("[multi]collapse deferred [%s]: carrying flows\n", client.ClientId())
+								}
 							}
 						}
 						n -= m
@@ -4170,7 +4685,8 @@ func (self *multiClientWindow) resize() {
 
 		var windowSizeMin int
 		var targetWindowSize int
-		if fixedDestinationSize, fixed := self.generator.FixedDestinationSize(); fixed {
+		fixedDestinationSize, fixedDestination := self.generator.FixedDestinationSize()
+		if fixedDestination {
 			targetWindowSize = fixedDestinationSize
 			windowSizeMin = targetWindowSize
 		} else if 0 < windowSize.FixedWindowSize {
@@ -4202,6 +4718,25 @@ func (self *multiClientWindow) resize() {
 			)
 			windowSizeMin = windowSize.WindowSizeMin
 		}
+
+		// the standing reserve: hold one spare exit beyond the computed
+		// target, bounded by WindowSizeHardMax, so a failed or draining
+		// exit's replacement is already dialed and evaluated before it is
+		// needed. Measured motivation: failover backfill took ~45s because
+		// replacement only started after a loss -- a resize tick to notice
+		// the hole plus a generator round trip, dial, and evaluation ping all
+		// sat between the failure and the first packet over the replacement.
+		// A distinct step from the demand math above on purpose: the target
+		// answers "how many exits does the traffic need", the reserve answers
+		// "how many failures can be absorbed without a connect in the
+		// recovery path". windowSizeMin is deliberately untouched -- the
+		// spare must never make the window read as unsatisfied.
+		targetWindowSize = standingReserveTarget(
+			targetWindowSize,
+			windowSize.WindowSizeHardMax,
+			self.reliabilitySettings().StandingReserve,
+			fixedDestination,
+		)
 
 		addedCount := 0
 		if len(clients) < targetWindowSize {
@@ -4340,6 +4875,10 @@ func (self *multiClientWindow) expand(
 				self.performanceProfile,
 				self.settings,
 				self.reliabilitySettings,
+				self.uplinkGateFunc,
+				self.reliabilityMetricsFunc,
+				self.flowCountFunc,
+				func() { self.resizeMonitor.NotifyAll() },
 			)
 			if err != nil {
 				self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
@@ -4398,13 +4937,61 @@ func (self *multiClientWindow) expand(
 							}
 
 							if err == nil {
+								clientId := client.ClientId()
+
+								// same-clientId replacement gate: the
+								// generator can re-hand an identity already
+								// in the window (a destination-aware
+								// generator reuses a persisted identity per
+								// destination). Replacing used to
+								// unconditionally cancel the old channel,
+								// which destroyed its live flows for no
+								// failure at all. The existing channel is
+								// read under the window stateLock, but the
+								// decision (replacementAllowed) runs with the
+								// lock released: the flow count read inside
+								// takes the parent stateLock, which must
+								// never nest under a window or channel lock.
+								var existingClient *multiClientChannel
+								func() {
+									self.stateLock.Lock()
+									defer self.stateLock.Unlock()
+									existingClient = self.clients[clientId]
+								}()
+								if !self.replacementAllowed(existingClient) {
+									// decline: keep the old, flow-carrying
+									// channel and discard the new one. The
+									// args are simply dropped -- the expand
+									// loop has already moved on (this runs in
+									// the ping ack callback), and cancelling
+									// pingDone below is what releases the
+									// pending-ping wait, so nothing wedges.
+									// Deliberately NOT fail(): fail emits
+									// EvaluationFailed, a terminal monitor
+									// state that would delete the dot of the
+									// LIVE old client sharing this id.
+									// Re-emitting Added restores the dot to
+									// the truth: the id remains in the
+									// window, routing, via the old channel.
+									self.log.Infof("[multi]expand replacement declined [%s]: existing channel carries flows\n", clientId)
+									pingCancel()
+									client.Cancel()
+									self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
+									self.monitor.AddProviderEvent(args.ClientId, ProviderStateAdded)
+									return
+								}
+
 								self.log.V(1).Infof("[multi]expand new client\n")
 
 								var replacedClient *multiClientChannel
 								func() {
 									self.stateLock.Lock()
 									defer self.stateLock.Unlock()
-									clientId := client.ClientId()
+									// re-read under the lock: the slot is
+									// installed against whatever is there
+									// NOW, so a concurrent remove/replace
+									// between the gate above and here can
+									// never leak an uncancelled channel
 									replacedClient = self.clients[clientId]
 									self.clients[clientId] = client
 								}()
@@ -4491,6 +5078,147 @@ func (self *multiClientWindow) reliabilitySettings() *ReliabilitySettings {
 		return self.reliabilitySettingsFunc()
 	}
 	return ReliabilitySettingsFrom(self.settings)
+}
+
+// flowCount reads the parent's live flow count for a window client. nil func
+// (a bare test window) reads as 0 -- every client looks flowless, so the
+// capacity gates below behave exactly as they did before this count existed,
+// which is what the bare fixtures assert. Must not be called with the window
+// stateLock or any channel lock held; see the flowCountFunc field.
+func (self *multiClientWindow) flowCount(client *multiClientChannel) int {
+	if self.flowCountFunc == nil {
+		return 0
+	}
+	return self.flowCountFunc(client)
+}
+
+// collapseRemovalAllowed is the capacity-collapse gate: it admits removing a
+// zero-weight client when the client is flowless, or -- the escape hatch --
+// when the client is past the hard collapse deadline of
+// collapseDeadlineLifetimes x MaxClientLifetime measured from its first event
+// time. clientDuration is the caller's stats.clientDuration, which
+// windowStatsWithCoalesce computes as now minus firstEventTime -- the same
+// anchor removeTime derives from -- so "deadline <= clientDuration" is
+// exactly "now is past firstEventTime + 2 lifetimes" without re-reading
+// channel state here.
+//
+// Flowless is the normal path: a drained client removes exactly as it did
+// before this gate existed, and a nil flowCountFunc (a bare test window)
+// reads every client as flowless, keeping pre-change behavior for the bare
+// fixtures. The deadline is only the escape: by then the client has been
+// drain-warned for at least a whole extra lifetime, so anything still bound
+// to it is effectively immortal and may no longer pin the exit against the
+// hard max.
+//
+// With MaxClientLifetime 0 (rotation disabled) there is no deadline: the
+// operator opted out of forced rotation, so a flow-carrying client is simply
+// never collapsible. Must be called with no window or channel lock held --
+// the flow count read takes the parent stateLock inside (see flowCount).
+func (self *multiClientWindow) collapseRemovalAllowed(client *multiClientChannel, clientDuration time.Duration) bool {
+	if self.flowCount(client) == 0 {
+		return true
+	}
+	maxClientLifetime := self.settings.MaxClientLifetime
+	if 0 < maxClientLifetime && time.Duration(collapseDeadlineLifetimes)*maxClientLifetime <= clientDuration {
+		return true
+	}
+	return false
+}
+
+// replacementAllowed is expand's same-clientId gate: when the generator
+// re-hands an identity already in the window, the freshly pinged channel may
+// only replace (cancel) the existing one when the existing channel is done or
+// flowless. Cancelling a live flow-carrying channel just because the
+// generator re-issued its identity destroys established connections for no
+// failure at all -- the old channel was routing fine. When this returns
+// false the caller declines the replacement: the new channel and its args
+// are discarded and the old channel keeps its flows.
+//
+// nil (no channel under the id) and done are the ordinary replace cases: the
+// slot is empty or the occupant is already dead, so installing the new
+// channel is pure gain. A nil flowCountFunc (bare fixtures, and the window
+// before the parent injects the count) reads as flowless, which is the
+// pre-change always-replace behavior. Must be called with no window or
+// channel lock held -- the flow count read takes the parent stateLock inside
+// (see flowCount).
+func (self *multiClientWindow) replacementAllowed(existingClient *multiClientChannel) bool {
+	if existingClient == nil {
+		return true
+	}
+	if existingClient.IsDone() {
+		return true
+	}
+	return self.flowCount(existingClient) == 0
+}
+
+// metrics reaches the parent's shared reliability counters, mirroring the
+// channel-side accessor. nil func or nil counters (a bare window) is fine:
+// every counter method tolerates a nil receiver.
+func (self *multiClientWindow) metrics() *reliabilityMetrics {
+	if self.reliabilityMetricsFunc != nil {
+		return self.reliabilityMetricsFunc()
+	}
+	return nil
+}
+
+// blackholeVerdictErr reports whether a channel's end error is a blackhole
+// verdict, which is what makes its removal subject to the storm breaker's
+// budget. Keyed on the "Blackhole " prefix that every verdict line
+// detectBlackhole writes shares (including the quarantine-expired variant) --
+// the reason strings were made distinctive exactly so a later reader could
+// key on them. Everything else that lands a client in the WindowStats error
+// branch is exempt by construction: user action and shutdown cleanup write
+// "Done." (Cancel/Close), and a dead continuous ping surfaces its transport
+// error verbatim. Those are hard evidence or explicit intent, and metering
+// them would delay cleanup that costs nothing to run.
+func blackholeVerdictErr(err error) bool {
+	return err != nil && strings.HasPrefix(err.Error(), "Blackhole ")
+}
+
+// verdictRemovalAllowed is the storm breaker: it admits a verdict-driven
+// removal only while fewer than RemovalBudgetCount such removals happened in
+// the last RemovalBudgetWindow, and records the removal when it admits one.
+//
+// The reasoning: verdicts convict independently, but their evidence is not
+// independent -- one local cause (a network migration, an uplink dying) makes
+// every exit silent at once, and the field capture that motivated this showed
+// exactly that shape, 7 exits executed in 79s on identical no-receive
+// verdicts. Two removals in half a minute is a provider failing and its
+// replacement failing too; a third is a pattern, and the budget says the
+// pattern is more likely us than them. A deferred removal costs seconds (the
+// client is warned out of selection and re-judged next pass); a wrong mass
+// removal costs every flow in the window.
+//
+// RemovalBudgetCount 0 (or a non-positive window, which could never
+// accumulate a budget) turns the breaker off. Takes the window stateLock;
+// callers hold no lock, per the resize idiom of classifying under no lock and
+// acting through the closures.
+func (self *multiClientWindow) verdictRemovalAllowed(now time.Time) bool {
+	reliabilitySettings := self.reliabilitySettings()
+	budgetCount := reliabilitySettings.RemovalBudgetCount
+	budgetWindow := reliabilitySettings.RemovalBudgetWindow
+	if budgetCount <= 0 || budgetWindow <= 0 {
+		return true
+	}
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	horizon := now.Add(-budgetWindow)
+	// timestamps are appended in order, so pruning is a prefix scan
+	i := 0
+	for i < len(self.verdictRemovalTimes) && self.verdictRemovalTimes[i].Before(horizon) {
+		i += 1
+	}
+	if 0 < i {
+		self.verdictRemovalTimes = self.verdictRemovalTimes[i:]
+	}
+
+	if budgetCount <= len(self.verdictRemovalTimes) {
+		return false
+	}
+	self.verdictRemovalTimes = append(self.verdictRemovalTimes, now)
+	return true
 }
 
 func (self *multiClientWindow) shuffle() {
@@ -4809,10 +5537,41 @@ type multiClientChannel struct {
 	createTime                  time.Time
 
 	settings *MultiClientSettings
+	// effectiveLifetime is this channel's jittered rotation lifetime:
+	// settings.MaxClientLifetime x uniform(0.75, 1.0), drawn once by the
+	// constructor (see jitterClientLifetime) and immutable afterwards, so it
+	// needs no lock. Every place a removeTime is derived from the lifetime
+	// must read this field, not settings.MaxClientLifetime -- reading the
+	// setting directly would silently re-synchronize rotation. Zero on
+	// channels built directly by tests (and whenever MaxClientLifetime is 0),
+	// which reproduces the pre-jitter behavior for a zero lifetime exactly.
+	effectiveLifetime time.Duration
 	// reliabilitySettingsFunc reads the parent's effective reliability config,
 	// so the blackhole bound can be retuned on a live connection. nil on
 	// channels built directly by tests; see reliabilitySettings().
 	reliabilitySettingsFunc func() *ReliabilitySettings
+	// uplinkGateFunc reads the parent's tunnel-wide uplink gate; see
+	// RemoteUserNatMultiClient.uplinkGate. nil on channels built directly by
+	// tests, which reads as gate off; see uplinkGate().
+	uplinkGateFunc func(now time.Time) (stale bool, freshSince time.Time)
+	// reliabilityMetricsFunc reaches the parent's shared counters. nil on
+	// channels built directly by tests, which loses the counts, never the
+	// behavior; see metrics().
+	reliabilityMetricsFunc func() *reliabilityMetrics
+	// flowCountFunc reads the parent's live flow count for this channel (the
+	// parent's clientFlowCount, same func the window carries). nil on channels
+	// built directly by tests, which reads as 0 flows -- and a flowless
+	// verdict executes, so bare fixtures keep the pre-change
+	// execute-immediately behavior they assert; see flowCount(). The func
+	// takes the parent stateLock inside, so it must never be called with this
+	// channel's stateLock (or any leaf lock) held.
+	flowCountFunc func(*multiClientChannel) int
+	// resizeWakeFunc wakes the owning window's resize pass, so a demoted
+	// (quarantined) exit gets its replacement expanded now rather than on the
+	// next 15s tick. nil on channels built directly by tests -- the wake is
+	// an optimization, never a correctness requirement, because the periodic
+	// pass picks the quarantine up through isWarning anyway; see resizeWake().
+	resizeWakeFunc func()
 
 	// sourceFilter map[TransferPath]bool
 
@@ -4841,6 +5600,22 @@ type multiClientChannel struct {
 	clientReceiveUnsub func()
 
 	warning bool
+
+	// the quarantine state: a soft blackhole verdict fired against this
+	// channel while it carried live flows, so instead of executing it the
+	// channel was demoted -- warned out of selection with its established
+	// flows left running -- until the flows drain, the evidence expires the
+	// quarantine, or receive progress clears it. Deliberately NOT folded into
+	// the shared `warning` bool: the resize pass recomputes that bool every
+	// pass and its healthy path writes setWarning(false), which would
+	// silently clear a quarantine the verdict pass just set. Guarded by
+	// stateLock like the rest of the channel state. quarantineStart is when
+	// the current reason began holding continuously; setQuarantined restarts
+	// it when the reason changes, so the expiry bound always measures one
+	// unbroken run of the same evidence.
+	quarantined      bool
+	quarantineReason blackholeReason
+	quarantineStart  time.Time
 
 	// pendingSendTime is when the current run of unacked sends began, reset on
 	// every ack. With sendNackCount > 0 it is the age of the oldest unmade
@@ -4879,6 +5654,13 @@ func newMultiClientChannel(
 	// so the blackhole bound can be retuned on a live connection. nil falls
 	// back to settings, which the suite's bare-channel fixtures rely on.
 	reliabilitySettingsFunc func() *ReliabilitySettings,
+	// uplinkGateFunc, reliabilityMetricsFunc, flowCountFunc, and
+	// resizeWakeFunc follow the same convention: injected parent/window
+	// state, nil-safe so bare fixtures keep working
+	uplinkGateFunc func(now time.Time) (stale bool, freshSince time.Time),
+	reliabilityMetricsFunc func() *reliabilityMetrics,
+	flowCountFunc func(*multiClientChannel) int,
+	resizeWakeFunc func(),
 ) (*multiClientChannel, error) {
 	cancelCtx, cancel := context.WithCancel(ctx)
 
@@ -4940,6 +5722,9 @@ func newMultiClientChannel(
 		performanceProfile:          performanceProfile,
 		createTime:                  time.Now(),
 		settings:                    settings,
+		// the rotation lifetime is jittered per channel so channels created
+		// in the same connect burst do not all drain in the same resize pass
+		effectiveLifetime: jitterClientLifetime(settings.MaxClientLifetime),
 		// sourceFilter: sourceFilter,
 		client:                    client,
 		eventBuckets:              []*multiClientEventBucket{},
@@ -4947,6 +5732,10 @@ func newMultiClientChannel(
 		ip6DestinationSourceCount: map[Ip6Path]map[Ip6Path]int{},
 		packetStats:               &clientWindowStats{log: loggerOrDefault(settings.Log)},
 		reliabilitySettingsFunc:   reliabilitySettingsFunc,
+		uplinkGateFunc:            uplinkGateFunc,
+		reliabilityMetricsFunc:    reliabilityMetricsFunc,
+		flowCountFunc:             flowCountFunc,
+		resizeWakeFunc:            resizeWakeFunc,
 		// affinityCount:             0,
 		// affinityTime:              time.Time{},
 	}
@@ -4991,6 +5780,123 @@ func (self *multiClientChannel) reliabilitySettings() *ReliabilitySettings {
 	return ReliabilitySettingsFrom(self.settings)
 }
 
+// uplinkGate reads the parent's tunnel-wide uplink gate for a verdict pass.
+// nil func (a channel built without the parent) reads as gate off, matching
+// the reliabilitySettingsFunc convention.
+func (self *multiClientChannel) uplinkGate(now time.Time) (stale bool, freshSince time.Time) {
+	if self.uplinkGateFunc != nil {
+		return self.uplinkGateFunc(now)
+	}
+	return false, time.Time{}
+}
+
+// metrics reaches the parent's shared reliability counters. nil func or nil
+// counters (a channel built without the parent) is fine: every counter method
+// tolerates a nil receiver, so the counts are lost but nothing else changes.
+func (self *multiClientChannel) metrics() *reliabilityMetrics {
+	if self.reliabilityMetricsFunc != nil {
+		return self.reliabilityMetricsFunc()
+	}
+	return nil
+}
+
+// flowCount reads the parent's live flow count for this channel. nil func (a
+// channel built without the parent) reads as 0, and 0 flows means a verdict
+// executes -- so bare fixtures keep the pre-change execute path their
+// assertions were written against. Must be called with no channel or leaf
+// lock held: the injected func takes the parent stateLock inside.
+func (self *multiClientChannel) flowCount() int {
+	if self.flowCountFunc == nil {
+		return 0
+	}
+	return self.flowCountFunc(self)
+}
+
+// resizeWake nudges the owning window's resize pass, nil-safe for bare
+// fixtures. Only ever an optimization -- the periodic pass reaches the same
+// state through isWarning.
+func (self *multiClientChannel) resizeWake() {
+	if self.resizeWakeFunc != nil {
+		self.resizeWakeFunc()
+	}
+}
+
+// setQuarantined demotes this channel: a soft verdict fired while it carried
+// live flows, so it leaves selection (via isWarning) with its established
+// flows intact instead of being executed. Returns whether this call
+// started (or, on a reason change, restarted) the episode, so the caller can
+// log and wake the resize exactly once rather than on every verdict pass that
+// re-confirms it. Re-asserting the same reason keeps the original start time
+// -- quarantineStart must measure one continuous run of the same evidence,
+// because that run's age is what eventually justifies executing after all.
+func (self *multiClientChannel) setQuarantined(reason blackholeReason) bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	if self.quarantined && self.quarantineReason == reason {
+		return false
+	}
+	self.quarantined = true
+	self.quarantineReason = reason
+	self.quarantineStart = time.Now()
+	return true
+}
+
+// clearQuarantine lifts the demotion. Called on receive-ack progress (see
+// addReceiveAck, which inlines the same clear under its already-held lock)
+// and available to tests and future explicit paths.
+func (self *multiClientChannel) clearQuarantine() {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	self.quarantined = false
+	self.quarantineReason = blackholeNone
+	self.quarantineStart = time.Time{}
+}
+
+func (self *multiClientChannel) isQuarantined() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.quarantined
+}
+
+// quarantineState reads the current episode's reason and start time
+// (blackholeNone and zero when not quarantined), for the verdict pass to
+// judge whether the same evidence has held continuously past the expiry
+// bound.
+func (self *multiClientChannel) quarantineState() (blackholeReason, time.Time) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	if !self.quarantined {
+		return blackholeNone, time.Time{}
+	}
+	return self.quarantineReason, self.quarantineStart
+}
+
+// hasOutstandingSends reports whether this channel currently holds sends that
+// were committed and not yet acknowledged -- the "talking" the uplink gate's
+// degenerate-case guard counts across the windows. Takes only this channel's
+// own stateLock.
+func (self *multiClientChannel) hasOutstandingSends() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return 0 < self.packetStats.sendNackCount
+}
+
+// hasActiveTransport reports whether the transport set under this channel's
+// client is non-empty. An empty set means the channel's own carrier is down:
+// nothing it sends can leave the device and nothing can arrive, so its
+// silence proves nothing about the provider. A bare fixture channel has no
+// client, which reads as up -- absence of a client is not evidence of a down
+// carrier, and the pre-gate behavior is what those fixtures assert.
+func (self *multiClientChannel) hasActiveTransport() bool {
+	if self.client == nil {
+		return true
+	}
+	return self.client.RouteManager().HasActiveTransport()
+}
+
 // setStalled makes the channel swallow packets without acknowledging or
 // erroring. See RemoteUserNatMultiClient.StallExit.
 func (self *multiClientChannel) setStalled(stalled bool) {
@@ -5009,10 +5915,26 @@ func (self *multiClientChannel) setStalled(stalled bool) {
 // flight, no acks", and it is available within seconds.
 //
 // 0 disables the check, restoring the previous AckTimeout-bounded behavior.
+//
+// A channel whose transport set is empty is never stalled: with no carrier
+// registered the outstanding sends cannot make progress, so their age is
+// evidence against the carrier, not the exit. Holding the verdict alone would
+// not be enough -- a clock that kept aging through the outage convicts on the
+// first poll after the transport re-registers, before the send sequences have
+// even re-sent -- so while the carrier is down the clock is restarted on each
+// observation, the stall-clock equivalent of the receive-verdict rebase in
+// detectBlackhole. On re-registration the outstanding sends are re-sent by
+// their sequences; either acks arrive (addSendAck restarts the clock, the
+// normal path) or a genuinely dead exit earns a fresh, fully-aged verdict.
 func (self *multiClientChannel) sendStalled(stallTimeout time.Duration) bool {
 	if stallTimeout <= 0 {
 		return false
 	}
+
+	// read the transport before taking stateLock: RouteManager has its own
+	// mutex, and taking it under the channel lock would add a lock order this
+	// file otherwise does not have
+	transportDown := !self.hasActiveTransport()
 
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -5020,6 +5942,12 @@ func (self *multiClientChannel) sendStalled(stallTimeout time.Duration) bool {
 	// nothing outstanding means nothing to be stalled on -- an idle client is
 	// not a broken one
 	if self.packetStats.sendNackCount <= 0 || self.pendingSendTime.IsZero() {
+		return false
+	}
+	if transportDown {
+		// see the doc comment: no progress is possible, so no verdict, and
+		// the clock must not age while the carrier is out
+		self.pendingSendTime = time.Now()
 		return false
 	}
 	return stallTimeout <= time.Since(self.pendingSendTime)
@@ -5031,10 +5959,15 @@ func (self *multiClientChannel) setWarning(warning bool) {
 	self.warning = warning
 }
 
+// isWarning reports whether new flows should avoid this channel: the resize
+// pass's recomputed warning, OR an active quarantine. The OR is what makes
+// quarantine exclusion automatic for both consumers of this method -- the
+// parent's affinity/selection reads and the window's ordered-clients offer --
+// without either needing to know quarantine exists.
 func (self *multiClientChannel) isWarning() bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	return self.warning
+	return self.warning || self.quarantined
 }
 
 // dialStrikeWindow is how long a dial failure or a connect success counts
@@ -5204,7 +6137,20 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 		// caller on any failure. The wrapped (!raw) marshal buffer is internal and
 		// must be freed on any failure; for raw frames the frame bytes ARE the
 		// caller's packet, so they are never freed here on failure.
+		//
+		// both failure returns below mean the transport refused the send before
+		// accepting it into a sequence -- an error, or backpressure (success ==
+		// false) -- so the ackCallback above is unreachable for it: every
+		// acceptance path in SendSequence.Pack (and the loopback fast path)
+		// returns success, and the callback is only ever invoked for packs that
+		// entered a sequence. the accounting armed by addSend must therefore be
+		// unwound here, or the refusal is booked as an outstanding send that
+		// can never be acked, aging pendingSendTime toward a sendStalled
+		// verdict on an innocent exit. no double-undo is possible: an accepted
+		// send never takes these returns, and a refused send never reaches the
+		// ack callback.
 		if err != nil {
+			self.addSendAbandoned(packetByteCount)
 			if !frame.Raw {
 				MessagePoolReturn(frame.MessageBytes)
 			}
@@ -5215,6 +6161,7 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 				MessagePoolReturn(parsedPacket.packet)
 			}
 		} else {
+			self.addSendAbandoned(packetByteCount)
 			if !frame.Raw {
 				MessagePoolReturn(frame.MessageBytes)
 			}
@@ -5290,24 +6237,81 @@ const (
 // silently equivalent to 0 -- it does not error, it just never fires. See
 // TestBlackholeReceiveTimeoutIsReachable.
 //
+// blackholeGates carries the exculpatory evidence that can make a verdict
+// inadmissible for one evaluation pass. The zero value is "no gating", which
+// is the pre-gate behavior and what bare fixtures exercise.
+type blackholeGates struct {
+	// transportDown: this channel's own transport set is empty. Its silence
+	// proves nothing -- nothing it sends can leave the device -- so every
+	// verdict is held, including no-send-ack.
+	transportDown bool
+	// uplinkStale: tunnel-wide ingress silence past the uplink gate. The
+	// phone's own uplink is the prime suspect, so the receive verdicts --
+	// which convict purely on silence -- are held. The no-send-ack verdict is
+	// deliberately not: send acks ride the same tunnel transport whose
+	// liveness transportDown tracks, and a provider that stops acknowledging
+	// while that transport is up is convicted on its own signal.
+	uplinkStale bool
+	// receiveFreshSince is when the last inadmissible-evidence epoch ended:
+	// the end of the last uplink-stale epoch, or this channel's last
+	// transport re-registration, whichever is later. The receive-branch ages
+	// count from max(firstSend*Time, receiveFreshSince), so verdicts held
+	// across an epoch restart their clocks instead of all firing at once on
+	// unfreeze -- the 7-exits-in-79s incident was exactly the no-rebase
+	// failure mode, one held verdict maturing after another during one
+	// continuous silence. Zero means never gated and changes nothing.
+	receiveFreshSince time.Time
+}
+
 // Split out from detectBlackhole so the decision can be tested against real
 // window stats rather than restated in a test, where it could drift from what
 // actually ships.
+//
+// Returns the verdict to act on, and separately the verdict that would have
+// fired this pass but was held by a gate (blackholeNone for either when there
+// is none). Held verdicts are reported rather than swallowed so the caller
+// can count them -- a gate that silently ate verdicts would be untunable.
 func blackholeReasonFromStats(
 	now time.Time,
 	windowStats *clientWindowStats,
 	blackholeTimeout time.Duration,
 	receiveTimeout time.Duration,
 	connectTimeout time.Duration,
-) blackholeReason {
+	gates blackholeGates,
+) (reason blackholeReason, held blackholeReason) {
+	// verdict applies the gates to a reason that is otherwise firing.
+	// receiveBranch marks the verdicts that convict purely on silence; only
+	// those are subject to the uplink gate. the transport gate covers
+	// everything -- see blackholeGates.
+	verdict := func(firing blackholeReason, receiveBranch bool) (blackholeReason, blackholeReason) {
+		if gates.transportDown {
+			return blackholeNone, firing
+		}
+		if receiveBranch && gates.uplinkStale {
+			return blackholeNone, firing
+		}
+		return firing, blackholeNone
+	}
+
+	// receiveClockStart rebases a receive-branch clock onto the end of the
+	// last gated epoch; see blackholeGates.receiveFreshSince. the no-send-ack
+	// age below deliberately does not pass through this.
+	receiveClockStart := func(clockStart time.Time) time.Time {
+		if !gates.receiveFreshSince.IsZero() && clockStart.Before(gates.receiveFreshSince) {
+			return gates.receiveFreshSince
+		}
+		return clockStart
+	}
+
 	if !windowStats.firstSendNackTime.IsZero() {
 		sendNackAge := now.Sub(windowStats.firstSendNackTime)
 
 		if blackholeTimeout <= sendNackAge && windowStats.sendAckCount <= 0 {
-			return blackholeNoSendAck
+			return verdict(blackholeNoSendAck, false)
 		}
-		if 0 < receiveTimeout && receiveTimeout <= sendNackAge && windowStats.receiveAckCount <= 0 {
-			return blackholeNoReceiveAck
+		receiveNackAge := now.Sub(receiveClockStart(windowStats.firstSendNackTime))
+		if 0 < receiveTimeout && receiveTimeout <= receiveNackAge && windowStats.receiveAckCount <= 0 {
+			return verdict(blackholeNoReceiveAck, true)
 		}
 	}
 
@@ -5329,14 +6333,88 @@ func blackholeReasonFromStats(
 		// and the client-side inference that feeds the same path), and the
 		// dial-strike warning stops new flows choosing the exit. removal here
 		// is reserved for an exit that has established nothing at all.
-		if connectTimeout <= now.Sub(windowStats.firstSendSynTime) &&
+		if connectTimeout <= now.Sub(receiveClockStart(windowStats.firstSendSynTime)) &&
 			windowStats.receiveSynCount <= 0 &&
 			windowStats.receiveAckCount <= 0 {
-			return blackholeNoReceiveSyn
+			return verdict(blackholeNoReceiveSyn, true)
 		}
 	}
 
-	return blackholeNone
+	return blackholeNone, blackholeNone
+}
+
+// verdictActionKind is what detectBlackhole does with a verdict that survived
+// the evidence gates. Split from the gate decision (blackholeReasonFromStats)
+// on purpose: the gates judge whether the evidence is admissible at all, this
+// judges what an admissible verdict is allowed to cost -- and both are pure
+// so the field behavior is testable without restating it.
+type verdictActionKind int
+
+const (
+	// no verdict is firing this pass
+	verdictActionNone verdictActionKind = 0
+	// remove the exit now, exactly as before this work: hard evidence
+	// (no-send-ack), soft-demote disabled, or a soft verdict against a
+	// flowless exit, where execution costs nothing
+	verdictActionExecute verdictActionKind = 1
+	// a soft verdict against a loaded exit: quarantine it -- out of selection
+	// via isWarning, established flows kept running, removal deferred
+	verdictActionQuarantine verdictActionKind = 2
+	// the same soft evidence has held continuously since the quarantine began,
+	// past the sustained bound, with zero receive progress (any receive ack
+	// clears the quarantine, so an old quarantineStart proves the silence was
+	// unbroken): remove, tagged distinctly so field logs can tell an expired
+	// quarantine from an immediate execution
+	verdictActionExecuteExpired verdictActionKind = 3
+)
+
+// verdictAction decides between executing, quarantining, and expiring a
+// blackhole verdict. The core invariant it encodes: an exit carrying live
+// flows may only be closed on hard evidence. Of the verdicts that reach here,
+// only no-send-ack is hard -- the provider acknowledges nothing while its
+// transport is provably up. The receive-branch verdicts (no-receive-ack,
+// no-receive-syn) convict on silence, which a loaded exit can be innocent of,
+// so against flows they demote; no-receive-syn takes the same path because
+// even though its blast radius is nominally unestablished flows, an
+// established flow can sit window-idle long enough for its history to age out
+// of the stats -- the flow-count gate is free safety there.
+//
+// quarantinedSince must be the start of the current quarantine episode only
+// when its reason matches this verdict (zero otherwise): the expiry bound
+// measures one continuous run of the same evidence, not the sum of different
+// suspicions. quarantineExpiry 0 disables the expiry escape entirely,
+// deferring removal until the exit is flowless.
+func verdictAction(
+	reason blackholeReason,
+	softDemote bool,
+	flowCount int,
+	quarantinedSince time.Time,
+	now time.Time,
+	quarantineExpiry time.Duration,
+) verdictActionKind {
+	if reason == blackholeNone {
+		return verdictActionNone
+	}
+	// no-send-ack is the one hard verdict here and is untouched by the
+	// demote: it must stay as fast as it was, because it covers the provider
+	// that is simply gone
+	if reason == blackholeNoSendAck {
+		return verdictActionExecute
+	}
+	if !softDemote {
+		// the pre-change behavior, kept reachable for A/B: soft verdicts
+		// execute immediately
+		return verdictActionExecute
+	}
+	if flowCount <= 0 {
+		// a flowless exit has no blast radius, so the soft verdict may
+		// execute exactly as before
+		return verdictActionExecute
+	}
+	if !quarantinedSince.IsZero() && 0 < quarantineExpiry && quarantineExpiry <= now.Sub(quarantinedSince) {
+		return verdictActionExecuteExpired
+	}
+	return verdictActionQuarantine
 }
 
 func (self *multiClientChannel) detectBlackhole() {
@@ -5344,18 +6422,84 @@ func (self *multiClientChannel) detectBlackhole() {
 	// error out. This is similar to an ack timeout.
 	defer self.cancel()
 
+	// the transport-liveness epoch for this channel. detectBlackhole is the
+	// only goroutine that reads the transport for verdicts, so the epoch
+	// lives in loop locals rather than on the struct -- there is nothing to
+	// lock. transportDownSince is set while the transport set is empty;
+	// transportFreshSince is when the last down epoch ended (zero if never
+	// down) and rebases this channel's receive-verdict clocks exactly like
+	// the tunnel-wide uplink freshSince does.
+	var transportDownSince time.Time
+	var transportFreshSince time.Time
+
+	// a held verdict is counted once per hold episode, not once per
+	// evaluation pass: the counters answer "how many verdicts did the gates
+	// suppress", and one suppressed verdict re-evaluated every 1.25s for a
+	// minute is still one suppressed verdict.
+	heldCounted := false
+
 	for {
 		if windowStats, err := self.WindowStats(); err != nil {
 			return
 		} else {
-			reason := blackholeReasonFromStats(
-				time.Now(),
+			now := time.Now()
+
+			// evidence gates, computed fresh each pass with no lock held:
+			// WindowStats released the channel stateLock before returning,
+			// and uplinkGate takes the parent stateLock inside -- the parent
+			// helper must never be called with a channel or leaf lock held.
+			uplinkStale, uplinkFreshSince := self.uplinkGate(now)
+
+			transportDown := !self.hasActiveTransport()
+			if transportDown {
+				if transportDownSince.IsZero() {
+					transportDownSince = now
+					// transitions only, never per-pass
+					self.log.Infof("[multi]routing %s transport down: verdicts held\n", self.args.Destination)
+				}
+			} else if !transportDownSince.IsZero() {
+				transportDownSince = time.Time{}
+				transportFreshSince = now
+				self.log.Infof("[multi]routing %s transport restored: verdict clocks rebased\n", self.args.Destination)
+			}
+
+			// this channel's receive clocks restart at whichever exculpatory
+			// epoch ended last: tunnel-wide uplink freshness, or this
+			// channel's own transport re-registration
+			receiveFreshSince := uplinkFreshSince
+			if receiveFreshSince.Before(transportFreshSince) {
+				receiveFreshSince = transportFreshSince
+			}
+
+			reason, held := blackholeReasonFromStats(
+				now,
 				windowStats,
 				self.settings.BlackholeTimeout,
 				self.reliabilitySettings().BlackholeReceiveTimeout,
 				self.settings.BlackholeConnectTimeout,
+				blackholeGates{
+					transportDown:     transportDown,
+					uplinkStale:       uplinkStale,
+					receiveFreshSince: receiveFreshSince,
+				},
 			)
 			blackhole := reason != blackholeNone
+
+			if held != blackholeNone {
+				if !heldCounted {
+					heldCounted = true
+					// attribution follows the gate: the transport gate is the
+					// channel-specific, stronger evidence, so a pass where
+					// both are engaged books against it
+					if transportDown {
+						self.metrics().verdictHeldTransportDown()
+					} else {
+						self.metrics().verdictHeldUplinkStale()
+					}
+				}
+			} else {
+				heldCounted = false
+			}
 
 			if blackhole {
 				// the client has sent data but received nothing back
@@ -5371,33 +6515,90 @@ func (self *multiClientChannel) detectBlackhole() {
 						windowStats.receiveSynCount,
 					)
 				}
-				// Everything needed to judge the verdict goes in the error,
-				// because this is the only line that survives into a field log.
-				// The V(1) diagnostic above carries the same counts but glog
-				// verbosity is pinned to 0 in sdk.go with no runtime control,
-				// so in practice it never prints.
-				//
-				// This matters for telling a real blackhole from a false
-				// positive. On a small network of known-good providers a
-				// blackhole verdict is far more likely to be our accounting
-				// than a broken exit, and the counts say which: sends
-				// acknowledged with nothing received can simply be a quiet
-				// destination, while an unacked-send age far past the bound
-				// with no acks at all is a provider that really went away.
-				// Once per removal, so the cost is nothing.
-				self.addError(fmt.Errorf(
-					"Blackhole %s (send %d/%dB recv %d/%dB syn %d/%d nackAge %s synAge %s)",
+
+				// what this admissible verdict is allowed to cost. every read
+				// here runs with no lock held: WindowStats released the
+				// channel stateLock before returning, quarantineState takes
+				// and releases it, and flowCount reaches into the parent
+				// stateLock -- which must never happen under a channel lock.
+				// quarantinedSince only carries when the current episode is
+				// for this same reason, so the expiry bound measures one
+				// unbroken run of the same evidence.
+				flowCount := self.flowCount()
+				quarantinedSince := time.Time{}
+				if quarantineReason, quarantineStart := self.quarantineState(); quarantineReason == reason {
+					quarantinedSince = quarantineStart
+				}
+				action := verdictAction(
 					reason,
-					windowStats.sendAckCount,
-					windowStats.sendAckByteCount,
-					windowStats.receiveAckCount,
-					windowStats.receiveAckByteCount,
-					windowStats.sendSynCount,
-					windowStats.receiveSynCount,
-					blackholeAgeString(windowStats.firstSendNackTime),
-					blackholeAgeString(windowStats.firstSendSynTime),
-				))
-				return
+					self.reliabilitySettings().SoftVerdictDemote,
+					flowCount,
+					quarantinedSince,
+					now,
+					self.settings.StatsWindowKeepUnhealthyDuration,
+				)
+
+				if action == verdictActionQuarantine {
+					// demote instead of execute: the exit leaves selection
+					// (isWarning) with its established flows intact, and the
+					// window is woken so a replacement expands now. No
+					// addError here and no return -- endErr is
+					// first-write-wins and there is no un-conviction, so
+					// nothing may be written until the decision really is to
+					// execute. The loop keeps running and re-judges every
+					// pass: receive progress lifts the quarantine, a drained
+					// flow count or the expiry bound executes it.
+					if self.setQuarantined(reason) {
+						self.log.Infof(
+							"[multi]routing %s quarantine %s: %d flow(s) held, removal deferred\n",
+							self.args.Destination,
+							reason,
+							flowCount,
+						)
+						self.resizeWake()
+					}
+				} else {
+					// Everything needed to judge the verdict goes in the error,
+					// because this is the only line that survives into a field log.
+					// The V(1) diagnostic above carries the same counts but glog
+					// verbosity is pinned to 0 in sdk.go with no runtime control,
+					// so in practice it never prints.
+					//
+					// This matters for telling a real blackhole from a false
+					// positive. On a small network of known-good providers a
+					// blackhole verdict is far more likely to be our accounting
+					// than a broken exit, and the counts say which: sends
+					// acknowledged with nothing received can simply be a quiet
+					// destination, while an unacked-send age far past the bound
+					// with no acks at all is a provider that really went away.
+					// Once per removal, so the cost is nothing.
+					//
+					// "quarantine expired" marks the execution of a verdict
+					// that was first demoted and then held for the whole
+					// sustained bound with zero receive progress -- a field
+					// capture must be able to tell that slow-path conviction
+					// from an immediate one. The "Blackhole " prefix is shared
+					// by both forms on purpose: the window's storm breaker
+					// keys verdict-driven removals on it.
+					expired := ""
+					if action == verdictActionExecuteExpired {
+						expired = " quarantine expired"
+					}
+					self.addError(fmt.Errorf(
+						"Blackhole %s%s (send %d/%dB recv %d/%dB syn %d/%d nackAge %s synAge %s)",
+						reason,
+						expired,
+						windowStats.sendAckCount,
+						windowStats.sendAckByteCount,
+						windowStats.receiveAckCount,
+						windowStats.receiveAckByteCount,
+						windowStats.sendSynCount,
+						windowStats.receiveSynCount,
+						blackholeAgeString(windowStats.firstSendNackTime),
+						blackholeAgeString(windowStats.firstSendSynTime),
+					))
+					return
+				}
 			} else {
 				if self.log.V(1).Enabled() {
 					self.log.Infof(
@@ -5516,6 +6717,59 @@ func (self *multiClientChannel) addSend(packetByteCount ByteCount, ipPath *IpPat
 	self.addSourceToEventBucketWithLock(eventBucket, ipPath)
 }
 
+// addSendAbandoned is the symmetric undo of addSend for a send the transport
+// refused: a hard error from the send call, or a false success (backpressure
+// -- the pack never entered a send sequence before the timeout). Both returns
+// happen strictly before the pack is accepted into a sequence, so the ack
+// callback that would normally retire this accounting can never fire. Without
+// the undo, the refused send stays booked as outstanding forever: the nack
+// count stays up and pendingSendTime keeps aging, so a burst of backpressure
+// is enough for sendStalled to convict an exit that then goes innocently
+// idle.
+//
+// The aggregate undo is exact. The refused send is by construction still
+// counted in packetStats -- only its own ack could have removed it, and no
+// ack exists for it -- so the decrement mirrors what addSend recorded, with
+// no ack credit. When the outstanding count reaches zero the stall clock is
+// cleared outright: sendStalled already treats a zero count as idle, but
+// addSend keys its restart off the count alone, and a stale nonzero
+// pendingSendTime is a lie waiting for a reader that forgets to check the
+// count first.
+//
+// The bucket undo cannot always be exact. addSend recorded into whichever
+// bucket was current at send time, and by the time the transport reports the
+// refusal that bucket may have rotated out or been coalesced away; holding a
+// reference to it across the transport call would keep dead buckets alive
+// for a case that should be rare. The choice: decrement the newest existing
+// bucket, clamped at zero. Under rotation this can under-count a younger
+// bucket's real nacks by at most the abandoned send, which errs toward "the
+// exit is fine" -- the honest direction for an undo whose purpose is to stop
+// manufacturing guilt. No new bucket is created and eventTime is not
+// advanced: a retraction is not activity, and extending the bucket's life or
+// the stats window on it would fabricate both.
+//
+// The syn count addSend may also have recorded is deliberately left alone:
+// it is windowed, so it ages out with its bucket, and unwinding it here could
+// just as easily erase a different live syn's record from the newest bucket.
+func (self *multiClientChannel) addSendAbandoned(packetByteCount ByteCount) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	self.packetStats.sendNackCount -= 1
+	self.packetStats.sendNackByteCount -= packetByteCount
+	if self.packetStats.sendNackCount <= 0 {
+		self.pendingSendTime = time.Time{}
+	}
+
+	if n := len(self.eventBuckets); 0 < n {
+		eventBucket := self.eventBuckets[n-1]
+		if 0 < eventBucket.sendNackCount {
+			eventBucket.sendNackCount -= 1
+		}
+		eventBucket.sendNackByteCount = max(eventBucket.sendNackByteCount-packetByteCount, 0)
+	}
+}
+
 func (self *multiClientChannel) addSendNack(ackByteCount ByteCount) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -5569,6 +6823,18 @@ func (self *multiClientChannel) addReceiveAck(ackByteCount ByteCount) {
 
 	self.packetStats.receiveAckCount += 1
 	self.packetStats.receiveAckByteCount += ackByteCount
+
+	// receive progress is exactly the evidence the quarantining verdicts said
+	// was missing, so it acquits: lift the quarantine here, where the count
+	// advances. The cost on the hot path is one bool read under the
+	// already-held lock; the log fires once per lifted episode, never per
+	// packet.
+	if self.quarantined {
+		self.quarantined = false
+		self.quarantineReason = blackholeNone
+		self.quarantineStart = time.Time{}
+		loggerOrDefault(self.log).Infof("[multi]quarantine lifted on receive progress\n")
+	}
 
 	eventBucket := self.eventBucket()
 	eventBucket.receiveAckCount += 1
@@ -5927,11 +7193,15 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 			self.firstEventTime = eventBuckets[0].createTime
 		}
 		stats.clientDuration = eventTime.Sub(self.firstEventTime)
-		stats.removeTime = self.firstEventTime.Add(self.settings.MaxClientLifetime)
+		// the jittered per-channel lifetime, never the raw configured
+		// lifetime: reading the setting here would re-synchronize every
+		// channel's removeTime onto the same resize pass, which is exactly
+		// what the jitter exists to prevent (and the anchor test pins this
+		// function to the jittered field). A zero effectiveLifetime (rotation
+		// disabled, or a bare test channel) behaves exactly as a zero
+		// configured lifetime did before the jitter existed.
+		stats.removeTime = self.firstEventTime.Add(self.effectiveLifetime)
 	}
-	// if !self.firstEventTime.IsZero() {
-	// 	stats.removeTime = self.firstEventTime.Add(self.settings.MaxClientLifetime)
-	// }
 	if self.settings.StatsWindowGraceperiod < stats.clientDuration {
 		stats.estimatedByteCountPerSecond = self.maxEffectiveByteCountPerSecond
 	} else {

@@ -264,6 +264,37 @@ func TestReliabilityMetricsConcurrent(t *testing.T) {
 	}
 }
 
+// The verdict-hold counters are defined here and incremented by the gating
+// logic that lands separately; what this package owes them is the same
+// contract as every other counter -- they count, they snapshot, they reset.
+func TestReliabilityMetricsVerdictHoldCounters(t *testing.T) {
+	m := newReliabilityMetrics()
+
+	m.verdictHeldUplinkStale()
+	m.verdictHeldUplinkStale()
+	m.verdictHeldTransportDown()
+	m.removalDeferred()
+	m.removalDeferred()
+	m.removalDeferred()
+
+	s := m.snapshot()
+	if s.VerdictsHeldUplinkStale != 2 {
+		t.Errorf("verdicts held (uplink stale) = %d, want 2", s.VerdictsHeldUplinkStale)
+	}
+	if s.VerdictsHeldTransportDown != 1 {
+		t.Errorf("verdicts held (transport down) = %d, want 1", s.VerdictsHeldTransportDown)
+	}
+	if s.RemovalsDeferred != 3 {
+		t.Errorf("removals deferred = %d, want 3", s.RemovalsDeferred)
+	}
+
+	m.reset()
+	s = m.snapshot()
+	if s.VerdictsHeldUplinkStale != 0 || s.VerdictsHeldTransportDown != 0 || s.RemovalsDeferred != 0 {
+		t.Errorf("verdict-hold counters not cleared: %+v", s)
+	}
+}
+
 // Measurement sits on the packet path, so a client assembled without metrics
 // has to keep forwarding traffic. Tests build RemoteUserNatMultiClient as a
 // struct literal, which leaves the field nil -- and a panic there would take
@@ -275,6 +306,9 @@ func TestReliabilityMetricsNilReceiver(t *testing.T) {
 	m.flowOpened()
 	m.exitLost([]recoveryKey{newRecoveryKey(ip, 443)})
 	m.destinationReachable(ip, 443)
+	m.verdictHeldUplinkStale()
+	m.verdictHeldTransportDown()
+	m.removalDeferred()
 	m.reset()
 
 	s := m.snapshot()
@@ -283,6 +317,9 @@ func TestReliabilityMetricsNilReceiver(t *testing.T) {
 	}
 	if s.FlowsOpened != 0 || s.ExitLossEvents != 0 {
 		t.Errorf("nil receiver produced counts: %+v", s)
+	}
+	if s.VerdictsHeldUplinkStale != 0 || s.VerdictsHeldTransportDown != 0 || s.RemovalsDeferred != 0 {
+		t.Errorf("nil receiver produced verdict-hold counts: %+v", s)
 	}
 }
 

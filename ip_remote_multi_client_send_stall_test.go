@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -134,4 +135,143 @@ func TestDefaultMultiClientSettingsSetsSendStallTimeout(t *testing.T) {
 	AssertEqual(t, 0 < settings.SendStallTimeout, true)
 	// must fire well inside the AckTimeout it exists to preempt
 	AssertEqual(t, settings.SendStallTimeout < settings.AckTimeout, true)
+}
+
+// a send the transport refuses -- a hard error, or backpressure -- never
+// reaches its ack callback, so nothing ever retires the accounting addSend
+// armed for it. left in place, the refusal is booked as an outstanding send
+// forever: the nack count stays up and pendingSendTime keeps aging, and a
+// backpressure burst is enough for sendStalled to convict an exit that then
+// sits innocently idle. the transport call cannot be faked on a bare channel
+// (there is no client under it), so the failure path is simulated by driving
+// the same accounting calls SendDetailedWithAck makes on it.
+func TestSendStalledAbandonedSendDisarms(t *testing.T) {
+	stallTimeout := 20 * time.Millisecond
+	client := stallTestChannel()
+
+	client.addSend(1440, udpTestPath(4))
+	client.addSendAbandoned(1440)
+
+	// past the window: a clock left armed by the refusal would convict here
+	time.Sleep(stallTimeout + 30*time.Millisecond)
+	AssertEqual(t, client.sendStalled(stallTimeout), false)
+
+	// the undo is exact against the aggregate, and with nothing outstanding
+	// the stall clock is cleared outright
+	client.stateLock.Lock()
+	defer client.stateLock.Unlock()
+	AssertEqual(t, client.packetStats.sendNackCount, 0)
+	AssertEqual(t, client.packetStats.sendNackByteCount, ByteCount(0))
+	AssertEqual(t, client.pendingSendTime.IsZero(), true)
+}
+
+// abandoning one of several outstanding sends is not progress -- only an ack
+// proves delivery and restarts the clock. the survivors keep aging on the
+// original clock, and only retiring the last outstanding send stops it.
+func TestSendStalledAbandonPartialKeepsClock(t *testing.T) {
+	stallTimeout := 20 * time.Millisecond
+	client := stallTestChannel()
+
+	client.addSend(1440, udpTestPath(4))
+	client.addSend(1440, udpTestPath(4))
+	client.addSendAbandoned(1440)
+
+	time.Sleep(stallTimeout + 30*time.Millisecond)
+	// one send is still genuinely outstanding and unacked past the window
+	AssertEqual(t, client.sendStalled(stallTimeout), true)
+
+	client.addSendAbandoned(1440)
+	AssertEqual(t, client.sendStalled(stallTimeout), false)
+}
+
+// the bucket a send recorded into can rotate before the transport reports the
+// refusal. the undo then lands on the newest bucket, clamped at zero -- never
+// below -- while the aggregate stays exact
+func TestSendStalledAbandonAfterBucketRotation(t *testing.T) {
+	client := stallTestChannel()
+
+	// the refused send records into the current bucket...
+	client.addSend(1440, udpTestPath(4))
+
+	// ...which then rotates: age it past the bucket duration so the next
+	// event opens a fresh one, exactly as the real clock would
+	client.stateLock.Lock()
+	for _, eventBucket := range client.eventBuckets {
+		eventBucket.createTime = eventBucket.createTime.Add(-2 * client.settings.StatsWindowBucketDuration)
+	}
+	client.stateLock.Unlock()
+
+	client.addSend(100, udpTestPath(4))
+	client.addSendAbandoned(1440)
+
+	client.stateLock.Lock()
+	defer client.stateLock.Unlock()
+
+	// the aggregate is exact whatever happened to the buckets: one send (the
+	// small one) is still genuinely outstanding, and its clock still runs
+	AssertEqual(t, client.packetStats.sendNackCount, 1)
+	AssertEqual(t, client.packetStats.sendNackByteCount, ByteCount(100))
+	AssertEqual(t, client.pendingSendTime.IsZero(), false)
+
+	// the newest bucket recorded less than the abandoned send, so the
+	// decrement clamps rather than going negative
+	newestBucket := client.eventBuckets[len(client.eventBuckets)-1]
+	AssertEqual(t, newestBucket.sendNackCount, 0)
+	AssertEqual(t, newestBucket.sendNackByteCount, ByteCount(0))
+}
+
+// a channel whose transport set is empty holds outstanding sends because its
+// carrier is down, not because the exit swallowed them. the stall verdict
+// must hold while the carrier is out, and the clock must not carry the
+// outage's age across re-registration -- a clock that kept aging would
+// convict on the first poll after restore, before the send sequences have
+// even re-sent.
+func TestSendStalledTransportDownHolds(t *testing.T) {
+	stallTimeout := 20 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// a real client for its route manager. nothing registers a transport, so
+	// the channel's carrier is down.
+	client := stallTestChannel()
+	client.client = NewClientWithDefaults(ctx, NewId(), NewNoContractClientOob())
+	defer client.client.Cancel()
+
+	client.addSend(1440, udpTestPath(4))
+	time.Sleep(stallTimeout + 30*time.Millisecond)
+
+	// aged well past the bound, but the carrier is down: held
+	AssertEqual(t, client.sendStalled(stallTimeout), false)
+
+	// the carrier re-registers. the clock was restarted while down, so the
+	// verdict needs a fresh full window of no progress rather than firing on
+	// the age accumulated during the outage
+	transport := NewSendGatewayTransport()
+	client.client.RouteManager().UpdateTransport(transport, []Route{make(chan []byte)})
+	AssertEqual(t, client.sendStalled(stallTimeout), false)
+
+	// with the carrier up, a fresh full window of silence convicts as before
+	time.Sleep(stallTimeout + 30*time.Millisecond)
+	AssertEqual(t, client.sendStalled(stallTimeout), true)
+}
+
+// coalescing can drop every bucket -- the first removal pass has no floor --
+// and the undo must still correct the aggregate rather than panic on the
+// missing bucket
+func TestSendStalledAbandonWithNoBuckets(t *testing.T) {
+	client := stallTestChannel()
+	client.addSend(1440, udpTestPath(4))
+
+	client.stateLock.Lock()
+	client.eventBuckets = nil
+	client.stateLock.Unlock()
+
+	client.addSendAbandoned(1440)
+
+	client.stateLock.Lock()
+	defer client.stateLock.Unlock()
+	AssertEqual(t, client.packetStats.sendNackCount, 0)
+	AssertEqual(t, client.packetStats.sendNackByteCount, ByteCount(0))
+	AssertEqual(t, client.pendingSendTime.IsZero(), true)
 }

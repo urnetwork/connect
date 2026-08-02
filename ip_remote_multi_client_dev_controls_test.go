@@ -84,6 +84,10 @@ func TestReliabilitySettingsFromDefaults(t *testing.T) {
 	AssertEqual(t, reliabilitySettings.ServerNameAffinityBridge, settings.ServerNameAffinityBridge)
 	AssertEqual(t, reliabilitySettings.SequenceIdleTimeout, settings.SequenceIdleTimeout)
 	AssertEqual(t, reliabilitySettings.TcpSequenceIdleTimeout, settings.TcpSequenceIdleTimeout)
+	AssertEqual(t, reliabilitySettings.UplinkStalenessGate, settings.UplinkStalenessGate)
+	AssertEqual(t, reliabilitySettings.SoftVerdictDemote, settings.SoftVerdictDemote)
+	AssertEqual(t, reliabilitySettings.RemovalBudgetCount, settings.RemovalBudgetCount)
+	AssertEqual(t, reliabilitySettings.RemovalBudgetWindow, settings.RemovalBudgetWindow)
 }
 
 // a stalled exit reports the packet as sent but never acknowledges it, and

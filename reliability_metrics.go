@@ -86,6 +86,19 @@ type reliabilityMetrics struct {
 	dialFailures atomic.Uint64
 	flowsReraced atomic.Uint64
 
+	// a blackhole verdict is only as good as the evidence it is built on, and
+	// two conditions make the evidence inadmissible: the local uplink went
+	// stale (nothing was deliverable, so silence convicts the network, not
+	// the provider), and the transport under the channel is known down.
+	// verdictsHeldUplinkStale and verdictsHeldTransportDown count verdicts
+	// suppressed for each reason; removalsDeferred counts provider removals
+	// postponed while a hold was in effect. This package only defines them --
+	// the verdict-gating work that increments them lands separately, and
+	// defining the counters first means that work ships already measured.
+	verdictsHeldUplinkStale   atomic.Uint64
+	verdictsHeldTransportDown atomic.Uint64
+	removalsDeferred          atomic.Uint64
+
 	pendingLock sync.Mutex
 	pending     map[recoveryKey]time.Time
 }
@@ -119,6 +132,27 @@ func (self *reliabilityMetrics) flowReraced() {
 		return
 	}
 	self.flowsReraced.Add(1)
+}
+
+func (self *reliabilityMetrics) verdictHeldUplinkStale() {
+	if self == nil {
+		return
+	}
+	self.verdictsHeldUplinkStale.Add(1)
+}
+
+func (self *reliabilityMetrics) verdictHeldTransportDown() {
+	if self == nil {
+		return
+	}
+	self.verdictsHeldTransportDown.Add(1)
+}
+
+func (self *reliabilityMetrics) removalDeferred() {
+	if self == nil {
+		return
+	}
+	self.removalsDeferred.Add(1)
 }
 
 // exitLost records one provider failure and the flows it destroyed, and arms
@@ -251,6 +285,9 @@ func (self *reliabilityMetrics) reset() {
 	self.recoveryMissed.Store(0)
 	self.dialFailures.Store(0)
 	self.flowsReraced.Store(0)
+	self.verdictsHeldUplinkStale.Store(0)
+	self.verdictsHeldTransportDown.Store(0)
+	self.removalsDeferred.Store(0)
 
 	self.pendingLock.Lock()
 	defer self.pendingLock.Unlock()
@@ -285,6 +322,14 @@ type ReliabilityMetricsSnapshot struct {
 	// previously have been a 3-63s syn-backoff hang.
 	DialFailuresIntercepted uint64
 	FlowsReraced            uint64
+
+	// VerdictsHeldUplinkStale and VerdictsHeldTransportDown count blackhole
+	// verdicts suppressed because the evidence was inadmissible (the local
+	// uplink was stale, the transport was known down); RemovalsDeferred
+	// counts provider removals postponed while such a hold was in effect.
+	VerdictsHeldUplinkStale   uint64
+	VerdictsHeldTransportDown uint64
+	RemovalsDeferred          uint64
 }
 
 func (self *reliabilityMetrics) snapshot() *ReliabilityMetricsSnapshot {
@@ -307,6 +352,10 @@ func (self *reliabilityMetrics) snapshot() *ReliabilityMetricsSnapshot {
 
 		DialFailuresIntercepted: self.dialFailures.Load(),
 		FlowsReraced:            self.flowsReraced.Load(),
+
+		VerdictsHeldUplinkStale:   self.verdictsHeldUplinkStale.Load(),
+		VerdictsHeldTransportDown: self.verdictsHeldTransportDown.Load(),
+		RemovalsDeferred:          self.removalsDeferred.Load(),
 	}
 
 	if 0 < exitLossEvents {
