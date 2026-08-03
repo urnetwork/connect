@@ -535,6 +535,34 @@ func TestAppPinJoinsAppGroup(t *testing.T) {
 	if strings.Contains(body, "append([]*IpPath{{ServerName: appAffinityName") {
 		t.Error("the app group is prepended to the domain groups instead of replacing them: a pinned flow contaminates every domain group it joins")
 	}
+
+	// ORDER: the app donor must be consulted BEFORE the destination bridge,
+	// and the bridge must be skipped for app-pinned flows entirely. The
+	// bridge places by destination ip, which on a shared cdn address is a
+	// stranger's exit -- letting it win both scattered the pinned app and
+	// rewrote the app's canonical exit to the stranger's.
+	donorAt := strings.Index(body, "self.appPinDonorWithLock(")
+	bridgeAt := strings.Index(body, "affinityFallbackIpPathsWithLock(")
+	if donorAt < 0 || bridgeAt < 0 {
+		t.Fatal("could not find both the app donor and the destination bridge in sendUpdate")
+	}
+	if bridgeAt < donorAt {
+		t.Error("the destination bridge runs before the app pin donor: a pinned app is placed on whatever exit already served the destination ip")
+	}
+	if got := strings.Count(body, `pin.appId == ""`); got < 2 {
+		t.Errorf("the destination bridge is gated on an empty app pin in %d ip version(s), want 2", got)
+	}
+
+	// and the race path records the placement, which is the ONLY path that
+	// places an app's first flow of each ip version -- without it the
+	// cross-version convergence never fires for the case it was built for
+	bindBody, ok := functionBody(source, "func (self *RemoteUserNatMultiClient) bindClientFlow(")
+	if !ok {
+		t.Fatal("could not find bindClientFlow")
+	}
+	if !strings.Contains(bindBody, "recordAppPinWithLock(update.pinAppId") {
+		t.Error("bindClientFlow does not record app-pinned placements: a dual-stack pinned app takes one exit per ip version")
+	}
 }
 
 // The pinned follow window is bounded. Unbounded following is

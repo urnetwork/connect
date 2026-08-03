@@ -1183,17 +1183,28 @@ const flowOwnerCacheMaxCount = 8192
 // cached answer, including any in flight, so a changed pin-rule set takes
 // effect on the next new flow.
 func (self *RemoteUserNatMultiClient) SetFlowOwnerLookup(lookup FlowOwnerLookupFunc) {
-	self.flowOwnerLock.Lock()
-	defer self.flowOwnerLock.Unlock()
+	// the two locks are taken in SEPARATE sections, never nested:
+	// flowOwnerLock is documented as a leaf, and nesting the parent lock
+	// under it here would be the only place in this file that inverts the
+	// hierarchy. Neither section depends on the other's result.
+	func() {
+		self.flowOwnerLock.Lock()
+		defer self.flowOwnerLock.Unlock()
 
-	if lookup == nil {
-		self.flowOwnerFunc.Store(nil)
-	} else {
-		self.flowOwnerFunc.Store(&lookup)
-	}
-	self.flowOwnerGeneration.Add(1)
-	self.flowOwner4 = map[Ip4Path]flowOwnerEntry{}
-	self.flowOwner6 = map[Ip6Path]flowOwnerEntry{}
+		if lookup == nil {
+			self.flowOwnerFunc.Store(nil)
+		} else {
+			self.flowOwnerFunc.Store(&lookup)
+		}
+		self.flowOwnerGeneration.Add(1)
+		self.flowOwner4 = map[Ip4Path]flowOwnerEntry{}
+		self.flowOwner6 = map[Ip6Path]flowOwnerEntry{}
+	}()
+
+	// the recorded app placements describe the pin set being replaced
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.clearAppPinsWithLock()
 }
 
 // flowOwnerAppId answers "which pinned app owns this flow" -- from the cache
@@ -1297,7 +1308,12 @@ func pinnedFollowWindow(window time.Duration) time.Duration {
 // when the app has no placement or the placement is no longer donatable.
 //
 // called with stateLock
-func (self *RemoteUserNatMultiClient) appPinDonorWithLock(appId string, follow bool, window time.Duration) *multiClientChannel {
+func (self *RemoteUserNatMultiClient) appPinDonorWithLock(
+	appId string,
+	follow bool,
+	window time.Duration,
+	sticky bool,
+) *multiClientChannel {
 	if appId == "" || self.appPinClients == nil {
 		return nil
 	}
@@ -1309,6 +1325,11 @@ func (self *RemoteUserNatMultiClient) appPinDonorWithLock(appId string, follow b
 		delete(self.appPinClients, appId)
 		return nil
 	}
+	// the same cap rule the in-version inherit applies: with sticky affinity
+	// off, a full exit stops taking the app's growth here too
+	if !sticky && self.clientAtFlowCapWithLock(client) {
+		return nil
+	}
 	switch client.affinityDonorEligible(follow, window) {
 	case donorEligible, donorQuarantineFollowed:
 		return client
@@ -1317,17 +1338,31 @@ func (self *RemoteUserNatMultiClient) appPinDonorWithLock(appId string, follow b
 }
 
 // recordAppPinWithLock remembers where an app's flows are placed, so the
-// other ip version converges on the same exit.
+// other ip version converges on the same exit. Called from every placement
+// path -- the in-version group, the cross-version donor, and (through
+// bindClientFlow) the async race, which is the one that places an app's
+// FIRST flow of each ip version and therefore the one that makes dual-stack
+// convergence work at all.
 //
 // called with stateLock
 func (self *RemoteUserNatMultiClient) recordAppPinWithLock(appId string, client *multiClientChannel) {
-	if appId == "" || client == nil {
+	if appId == "" || client == nil || client.IsDone() {
 		return
 	}
 	if self.appPinClients == nil {
 		self.appPinClients = map[string]*multiClientChannel{}
 	}
 	self.appPinClients[appId] = client
+}
+
+// clearAppPinsWithLock drops every recorded app placement. Called when the
+// pin rules change: the records describe a pin set that no longer exists,
+// and holding them would both mis-converge a re-pinned app and keep a strong
+// reference to a dead channel for the process lifetime.
+//
+// called with stateLock
+func (self *RemoteUserNatMultiClient) clearAppPinsWithLock() {
+	self.appPinClients = nil
 }
 
 func NewRemoteUserNatMultiClientWithDefaults(
@@ -2265,6 +2300,14 @@ func (self *RemoteUserNatMultiClient) bindClientFlow(update *multiClientChannelU
 		self.clientUpdates[client] = updates
 	}
 	updates[update] = true
+
+	// an app-pinned flow that got here was placed by the RACE, not by
+	// affinity -- which is the case for the app's first flow of each ip
+	// version, and therefore the placement the cross-version convergence
+	// most needs to know about. Recording only at creation missed it
+	// entirely, so a dual-stack app still took two exits (review finding,
+	// 2026-08-03).
+	self.recordAppPinWithLock(update.pinAppId, client)
 }
 
 // clientAtFlowCapWithLock reports whether an exit is already carrying its
@@ -2722,6 +2765,7 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 			// additionally exempts the flow's inheritance from the bench
 			// follow window (see inheritAffinityClient4WithLock).
 			update.pinned = pin.pinned()
+			update.pinAppId = pin.appId
 			if pin.appId != "" {
 				affinityIpPaths = []*IpPath{{ServerName: appAffinityName(pin.appId)}}
 			}
@@ -2744,11 +2788,34 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 				}
 			}
 
+			// the app pin's cross-version convergence, consulted BEFORE the
+			// destination bridge below: the ip4 and ip6 affinity groups are
+			// separate maps, so a dual-stack pinned app would otherwise take
+			// one exit per version -- two egress ips, the failure pinning
+			// exists to prevent. Ordering is load-bearing: the bridge places
+			// by destination ip, which on a shared cdn address is a
+			// STRANGER's exit, and letting it outrank the pin both scattered
+			// the app and (through the record below) rewrote the app's
+			// canonical exit to the stranger's (review finding, 2026-08-03).
+			if pin.appId != "" && update.client.Load() == nil {
+				reliabilitySettings := self.reliabilitySettings()
+				if donor := self.appPinDonorWithLock(
+					pin.appId,
+					true,
+					pinnedFollowWindow(reliabilitySettings.GroupFollowWindow),
+					reliabilitySettings.AffinityStickyPastCap,
+				); donor != nil {
+					update.client.Store(donor)
+				}
+			}
+
 			// the flow's own groups had no donor. an established flow to this
 			// destination may still exist under the key it was created with
 			// before the server name was learned -- read those groups without
-			// joining them, so this flow converges onto the exit already in use
-			if update.client.Load() == nil {
+			// joining them, so this flow converges onto the exit already in
+			// use. NOT for an app-pinned flow: its placement is the app's,
+			// and a destination bridge would hand it a stranger's exit.
+			if update.client.Load() == nil && pin.appId == "" {
 				for _, fallbackIpPath := range self.affinityFallbackIpPathsWithLock(ipPath) {
 					fallbackIp4Path := fallbackIpPath.ToIp4Path()
 					if update.affinityIp4Paths[fallbackIp4Path] {
@@ -2765,25 +2832,10 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 					}
 				}
 			}
-			// the app pin's cross-version convergence: the ip4 and ip6
-			// affinity groups are separate maps, so a dual-stack pinned app
-			// would otherwise take one exit per version -- two egress ips,
-			// the failure pinning exists to prevent. Consulted only after
-			// this version's own group came up empty, and recorded so the
-			// other version follows.
-			if pin.appId != "" {
-				if update.client.Load() == nil {
-					reliabilitySettings := self.reliabilitySettings()
-					if donor := self.appPinDonorWithLock(
-						pin.appId,
-						true,
-						pinnedFollowWindow(reliabilitySettings.GroupFollowWindow),
-					); donor != nil {
-						update.client.Store(donor)
-					}
-				}
-				self.recordAppPinWithLock(pin.appId, update.client.Load())
-			}
+			// record only a placement the app itself produced (its group or
+			// its cross-version donor). A flow still unplaced here goes to
+			// the race, which records through bindClientFlow when it commits.
+			self.recordAppPinWithLock(pin.appId, update.client.Load())
 			// one ledger event per flow, from the aggregate of every inherit
 			// attempt above
 			self.bookGroupLedger(update.client.Load() != nil, followWinner, sawScatter)
@@ -2864,6 +2916,7 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 			}
 			// see the v4 twin for the pin rationale
 			update.pinned = pin.pinned()
+			update.pinAppId = pin.appId
 			if pin.appId != "" {
 				affinityIpPaths = []*IpPath{{ServerName: appAffinityName(pin.appId)}}
 			}
@@ -2886,11 +2939,26 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 				}
 			}
 
+			// see the v4 twin: the app pin converges across ip versions, and
+			// outranks the destination bridge below
+			if pin.appId != "" && update.client.Load() == nil {
+				reliabilitySettings := self.reliabilitySettings()
+				if donor := self.appPinDonorWithLock(
+					pin.appId,
+					true,
+					pinnedFollowWindow(reliabilitySettings.GroupFollowWindow),
+					reliabilitySettings.AffinityStickyPastCap,
+				); donor != nil {
+					update.client.Store(donor)
+				}
+			}
+
 			// the flow's own groups had no donor. an established flow to this
 			// destination may still exist under the key it was created with
 			// before the server name was learned -- read those groups without
-			// joining them, so this flow converges onto the exit already in use
-			if update.client.Load() == nil {
+			// joining them, so this flow converges onto the exit already in
+			// use. NOT for an app-pinned flow; see the v4 twin.
+			if update.client.Load() == nil && pin.appId == "" {
 				for _, fallbackIpPath := range self.affinityFallbackIpPathsWithLock(ipPath) {
 					fallbackIp6Path := fallbackIpPath.ToIp6Path()
 					if update.affinityIp6Paths[fallbackIp6Path] {
@@ -2907,20 +2975,7 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 					}
 				}
 			}
-			// see the v4 twin: the app pin converges across ip versions
-			if pin.appId != "" {
-				if update.client.Load() == nil {
-					reliabilitySettings := self.reliabilitySettings()
-					if donor := self.appPinDonorWithLock(
-						pin.appId,
-						true,
-						pinnedFollowWindow(reliabilitySettings.GroupFollowWindow),
-					); donor != nil {
-						update.client.Store(donor)
-					}
-				}
-				self.recordAppPinWithLock(pin.appId, update.client.Load())
-			}
+			self.recordAppPinWithLock(pin.appId, update.client.Load())
 			// one ledger event per flow, from the aggregate of every inherit
 			// attempt above
 			self.bookGroupLedger(update.client.Load() != nil, followWinner, sawScatter)
@@ -3466,6 +3521,10 @@ func (self *RemoteUserNatMultiClient) rebindFlowsWithLock(
 			usedReplacements[replacement] = true
 			replacementCount += 1
 		}
+		// a rebound pinned flow moves the app's canonical exit with it,
+		// so the other ip version converges on the replacement rather than
+		// chasing the dying exit
+		self.recordAppPinWithLock(update.pinAppId, replacement)
 		// the update's ipPath is egress-oriented: destination is the remote
 		// endpoint the tracker keys on, source port is the local port whose
 		// answer classifies the recovery
@@ -5362,11 +5421,17 @@ type multiClientChannelUpdate struct {
 	client atomic.Pointer[multiClientChannel]
 
 	// pinned marks a flow a pin rule claimed (host pin or app pin): its
-	// affinity inheritance follows a benched donor without the follow-window
-	// limit -- stability over everything short of removal. Written once at
-	// creation under the parent stateLock, read by the inherit path under
-	// the same lock.
+	// affinity inheritance follows a benched donor for a multiple of the
+	// ordinary follow window. Written once at creation under the parent
+	// stateLock, read by the inherit path under the same lock.
 	pinned bool
+	// pinAppId is the pinned app that owns this flow (empty for unpinned
+	// flows and host pins). Carried on the update so EVERY placement path --
+	// including the async race, which commits through bindClientFlow long
+	// after creation -- can record where the app landed, which is what makes
+	// the cross-version convergence work for an app's FIRST flow of each ip
+	// version (review finding, 2026-08-03).
+	pinAppId string
 
 	// receivedInbound is set true the first time an inbound (non-icmp) packet
 	// resolves this flow to its committed client (the receiveClientPath path).
