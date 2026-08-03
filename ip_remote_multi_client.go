@@ -6855,6 +6855,25 @@ func (self *multiClientWindow) resize() {
 							// accept, which is the other half of the demote.
 							client.setWarning(false, warnNone)
 							warnClient(client, stats)
+							// and hand its MOVABLE flows off now, once per
+							// episode. A quarantine is receive-silence by
+							// construction, so every flow on this exit is
+							// already getting nothing -- and holding them
+							// here until the sustained-evidence bar matures
+							// is the freeze the user actually experiences:
+							// on 2026-08-03 a pinned app's 46 flows sat on a
+							// benched exit for 55s before it was executed.
+							// Established quic moves in about a packet
+							// interval; tcp cannot move (split-tcp) and stays
+							// to finish or die with the exit, exactly as
+							// before. If the bench was a false positive the
+							// exit is acquitted and keeps taking new flows --
+							// a rebound quic flow is not harmed by having
+							// moved. Gated with the drain migration on
+							// QuicRebindOnExitLoss.
+							if self.clientMigrateFunc != nil && client.markQuarantineMigrateOnce() {
+								self.clientMigrateFunc(client)
+							}
 						} else {
 							client.setWarning(false, warnNone)
 							keepClient(client, stats)
@@ -8208,6 +8227,13 @@ type multiClientChannel struct {
 	// unsendable run resets -- those are what end an episode.
 	stallHoldCounted bool
 
+	// quarantineMigrated latches the bench-time migration to once per
+	// quarantine EPISODE (unlike drainMigrated, which is once per channel):
+	// an exit can be benched, acquitted, and benched again, and each new
+	// episode's flows deserve the same hand-off. Cleared wherever the
+	// episode ends, beside the rest of the quarantine state.
+	quarantineMigrated bool
+
 	// drainMigrated latches G-3's drain-time migration to once per channel:
 	// a drain lasts many resize passes, and the movable flows only need
 	// moving the first time. Never cleared -- a channel drains once, and a
@@ -8633,6 +8659,20 @@ func (self *multiClientChannel) clearQuarantineWithLock() {
 	self.quarantined = false
 	self.quarantineReason = blackholeNone
 	self.quarantineStart = time.Time{}
+	// the episode is over, so the next one gets its own hand-off
+	self.quarantineMigrated = false
+}
+
+// markQuarantineMigrateOnce latches the bench-time migration: true exactly
+// once per quarantine episode.
+func (self *multiClientChannel) markQuarantineMigrateOnce() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if !self.quarantined || self.quarantineMigrated {
+		return false
+	}
+	self.quarantineMigrated = true
+	return true
 }
 
 func (self *multiClientChannel) isQuarantined() bool {

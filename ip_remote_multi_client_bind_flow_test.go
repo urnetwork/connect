@@ -584,6 +584,63 @@ func TestPinnedFollowWindowIsBounded(t *testing.T) {
 	}
 }
 
+// The bench-time hand-off latch: once per quarantine EPISODE, and a new
+// episode after an acquittal gets its own. Field motivation (2026-08-03): a
+// pinned app's 46 flows sat on a benched exit for 55s -- the whole
+// sustained-evidence window -- before it was executed, and that hold IS the
+// freeze the user experiences.
+func TestQuarantineMigrateLatchIsPerEpisode(t *testing.T) {
+	parent := bindFlowTestParent()
+	client := bindFlowTestChannel(parent)
+
+	// not benched: nothing to hand off
+	if client.markQuarantineMigrateOnce() {
+		t.Error("an unbenched exit reported a migration to run")
+	}
+
+	client.setQuarantined(blackholeNoReceiveAck)
+	if !client.markQuarantineMigrateOnce() {
+		t.Error("the first bench pass did not run the hand-off")
+	}
+	if client.markQuarantineMigrateOnce() {
+		t.Error("the hand-off ran twice in one episode")
+	}
+
+	// acquitted, then benched again: a new episode, a new hand-off
+	client.clearQuarantine()
+	client.setQuarantined(blackholeNoReceiveSyn)
+	if !client.markQuarantineMigrateOnce() {
+		t.Error("a second quarantine episode did not get its own hand-off")
+	}
+}
+
+// And the resize pass has to actually run it -- a correct-but-uncalled helper
+// is the failure mode this suite pins against.
+func TestResizeQuarantineBranchMigrates(t *testing.T) {
+	source, err := readSource("ip_remote_multi_client.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, ok := functionBody(source, "func (self *multiClientWindow) resize()")
+	if !ok {
+		t.Fatal("could not find resize")
+	}
+	at := strings.Index(body, "} else if client.isQuarantined() {")
+	if at < 0 {
+		t.Fatal("could not find the quarantine branch in resize")
+	}
+	branch := body[at:]
+	if end := strings.Index(branch, "} else {"); 0 <= end {
+		branch = branch[:end]
+	}
+	if !strings.Contains(branch, "markQuarantineMigrateOnce()") {
+		t.Error("the quarantine branch does not latch a hand-off: a benched exit holds its movable flows for the whole sustained-evidence window")
+	}
+	if !strings.Contains(branch, "self.clientMigrateFunc(client)") {
+		t.Error("the quarantine branch does not call the migration seam")
+	}
+}
+
 // G-3's drain-time migration: established quic moves to a live replacement
 // with its bookkeeping, tcp STAYS ALIVE on the draining exit (split-tcp: the
 // exit holds the remote end, moving it would break it), and nothing is ever
