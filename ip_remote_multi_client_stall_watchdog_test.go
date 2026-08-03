@@ -78,6 +78,18 @@ func watchdogTestWindow(clients ...*multiClientChannel) *multiClientWindow {
 	}
 }
 
+// receivingSibling is a healthy window-mate with fresh receive progress: the
+// corroboration a stall conviction now requires, because return traffic
+// arriving anywhere proves the tunnel carries packets and makes a stalled
+// exit's silence evidence about the exit rather than about the phone.
+func receivingSibling() *multiClientChannel {
+	sibling := stallTestChannel()
+	sibling.stateLock.Lock()
+	sibling.lastReceiveAckTime = time.Now()
+	sibling.stateLock.Unlock()
+	return sibling
+}
+
 // the hard verdict executes at detection time: a stalled client is errored
 // with the distinctive reason and cancelled by the watchdog pass itself,
 // rather than waiting for the resize sweep to classify it (which measured
@@ -94,7 +106,7 @@ func TestWatchSendStallsConvictsAndCancels(t *testing.T) {
 	client.addSend(1440, udpTestPath(4))
 	time.Sleep(stallTimeout + 30*time.Millisecond)
 
-	window := watchdogTestWindow(client)
+	window := watchdogTestWindow(client, receivingSibling())
 
 	AssertEqual(t, window.convictSendStalls(stallTimeout), true)
 
@@ -113,6 +125,45 @@ func TestWatchSendStallsConvictsAndCancels(t *testing.T) {
 	// removals on the "Blackhole " prefix, and the stall reason must never
 	// carry it
 	AssertEqual(t, blackholeVerdictErr(endErr), false)
+}
+
+// The uplink-corroboration hold: with no sibling receiving, a stall verdict
+// says as much about the phone as about the exit, so it must be held -- and
+// the stall clock must NOT be refreshed, so the same evidence convicts on the
+// first pass after a sibling proves the uplink. This is the gate that stops
+// one cellular blip shorter than the uplink gate's bar from executing every
+// loaded exit at once (three in three minutes in the field, 2026-08-03).
+func TestWatchSendStallsHeldWithoutReceivingSibling(t *testing.T) {
+	stallTimeout := 20 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := stallTestChannel()
+	client.ctx, client.cancel = context.WithCancel(ctx)
+
+	client.addSend(1440, udpTestPath(4))
+	time.Sleep(stallTimeout + 30*time.Millisecond)
+
+	// a window-mate exists but has NO recent receive: silence everywhere is
+	// the phone's silence
+	quietSibling := stallTestChannel()
+	window := watchdogTestWindow(client, quietSibling)
+
+	AssertEqual(t, window.convictSendStalls(stallTimeout), false)
+	AssertEqual(t, client.IsDone(), false)
+	client.stateLock.Lock()
+	endErr := client.endErr
+	client.stateLock.Unlock()
+	AssertEqual(t, endErr == nil, true)
+
+	// the evidence carried: the moment the sibling receives, the very next
+	// pass convicts without waiting out a fresh bar
+	quietSibling.stateLock.Lock()
+	quietSibling.lastReceiveAckTime = time.Now()
+	quietSibling.stateLock.Unlock()
+	AssertEqual(t, window.convictSendStalls(stallTimeout), true)
+	AssertEqual(t, client.IsDone(), true)
 }
 
 // a healthy (non-stalled) client is untouched by the conviction pass

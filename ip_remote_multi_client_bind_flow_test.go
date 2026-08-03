@@ -304,63 +304,66 @@ func TestDestinationExitsJoinsFlowsToCurrentExits(t *testing.T) {
 }
 
 // The G-1 verdict table: a resize warning always refuses (those exits shed
-// new flows on purpose); quarantine refuses only without group-follow or
-// without fresh receive evidence. Suspicion alone must not split a site's
-// egress ip -- but a receive-silent bench gets no fresh flows.
+// new flows on purpose); quarantine refuses only without group-follow or once
+// the episode has outlived the follow window. The gate is episode age, NOT
+// receive recency -- the benching verdicts require a silent stats window and
+// any receive lifts the bench, so a quarantined channel structurally never
+// has recent receive evidence and a recency gate could never open.
 func TestAffinityDonorEligibleVerdicts(t *testing.T) {
 	parent := bindFlowTestParent()
 	client := bindFlowTestChannel(parent)
-	freshness := 10 * time.Second
+	window := 45 * time.Second
 
-	if got := client.affinityDonorEligible(true, freshness); got != donorEligible {
+	if got := client.affinityDonorEligible(true, window); got != donorEligible {
 		t.Errorf("clean channel: verdict %v, want donorEligible", got)
 	}
 
 	client.setWarning(true, warnUnhealthy)
-	if got := client.affinityDonorEligible(true, freshness); got != donorRefused {
+	if got := client.affinityDonorEligible(true, window); got != donorRefused {
 		t.Errorf("warned channel: verdict %v, want donorRefused even with follow on", got)
 	}
 	client.setWarning(false, warnNone)
 
+	// a FRESH quarantine episode follows: the exact state production creates
+	// (setQuarantined stamps quarantineStart = now), no hand-set receive
+	// evidence required -- this is what makes the mechanism reachable
 	client.setQuarantined(blackholeNoReceiveAck)
-	if got := client.affinityDonorEligible(false, freshness); got != donorQuarantineScattered {
+	if got := client.affinityDonorEligible(true, window); got != donorQuarantineFollowed {
+		t.Errorf("fresh quarantine: verdict %v, want donorQuarantineFollowed", got)
+	}
+	if got := client.affinityDonorEligible(false, window); got != donorQuarantineScattered {
 		t.Errorf("quarantined, follow off: verdict %v, want donorQuarantineScattered", got)
 	}
 	if got := client.affinityDonorEligible(true, 0); got != donorQuarantineScattered {
-		t.Errorf("quarantined, zero freshness: verdict %v, want donorQuarantineScattered", got)
-	}
-	if got := client.affinityDonorEligible(true, freshness); got != donorQuarantineScattered {
-		t.Errorf("quarantined, never received: verdict %v, want donorQuarantineScattered", got)
+		t.Errorf("quarantined, zero window: verdict %v, want donorQuarantineScattered", got)
 	}
 
+	// an episode older than the window has stopped being a false-positive
+	// bet and is trending toward the drain-to-conviction execution: it must
+	// stop collecting its sites' flows
 	client.stateLock.Lock()
-	client.lastReceiveAckTime = time.Now()
+	client.quarantineStart = time.Now().Add(-2 * window)
 	client.stateLock.Unlock()
-	if got := client.affinityDonorEligible(true, freshness); got != donorQuarantineFollowed {
-		t.Errorf("quarantined, receive fresh: verdict %v, want donorQuarantineFollowed", got)
-	}
-
-	client.stateLock.Lock()
-	client.lastReceiveAckTime = time.Now().Add(-2 * freshness)
-	client.stateLock.Unlock()
-	if got := client.affinityDonorEligible(true, freshness); got != donorQuarantineScattered {
-		t.Errorf("quarantined, receive stale: verdict %v, want donorQuarantineScattered", got)
+	if got := client.affinityDonorEligible(true, window); got != donorQuarantineScattered {
+		t.Errorf("aged quarantine: verdict %v, want donorQuarantineScattered", got)
 	}
 
 	// warning wins over quarantine: an unhealthy benched exit never donates
+	client.clearQuarantine()
+	client.setQuarantined(blackholeNoReceiveAck)
 	client.setWarning(true, warnUnhealthy)
-	client.stateLock.Lock()
-	client.lastReceiveAckTime = time.Now()
-	client.stateLock.Unlock()
-	if got := client.affinityDonorEligible(true, freshness); got != donorRefused {
+	if got := client.affinityDonorEligible(true, window); got != donorRefused {
 		t.Errorf("warned AND quarantined: verdict %v, want donorRefused", got)
 	}
 }
 
-// The inherit path end to end: a quarantined donor with fresh receive
-// evidence keeps its own site under the shipped defaults, and the ledger
-// counts the follow; with follow off the same flow is scattered and counted
-// as such.
+// The inherit path end to end: a freshly benched donor keeps its own site
+// under the shipped defaults -- the exact state production creates, with no
+// hand-set evidence -- and the flow-level ledger counts one follow; with
+// follow off the same flow is scattered and counted as such. The ledger is
+// booked by the CALLER's aggregate (bookGroupLedger), never per inherit call:
+// a flow whose first group scattered but whose second group donated was
+// placed with its group, not scattered.
 func TestQuarantinedDonorKeepsItsSite(t *testing.T) {
 	parent := bindFlowTestParent()
 	parent.ip4PathUpdates = map[Ip4Path]*multiClientChannelUpdate{}
@@ -381,18 +384,21 @@ func TestQuarantinedDonorKeepsItsSite(t *testing.T) {
 	parent.ip4PathUpdates[ip4] = flowUpdate
 	donorPaths := map[Ip4Path]time.Time{ip4: time.Now()}
 
+	// production state, nothing hand-set: a fresh episode is inside the
+	// follow window by construction
 	donor.setQuarantined(blackholeNoReceiveAck)
-	donor.stateLock.Lock()
-	donor.lastReceiveAckTime = time.Now()
-	donor.stateLock.Unlock()
 
 	newFlow := &multiClientChannelUpdate{}
 	parent.stateLock.Lock()
-	parent.inheritAffinityClient4WithLock(newFlow, donorPaths)
+	verdict, scattered := parent.inheritAffinityClient4WithLock(newFlow, donorPaths)
 	parent.stateLock.Unlock()
 	if newFlow.client.Load() != donor {
-		t.Error("a benched receive-fresh donor did not keep its site")
+		t.Error("a freshly benched donor did not keep its site")
 	}
+	if verdict != donorQuarantineFollowed {
+		t.Errorf("verdict %v, want donorQuarantineFollowed", verdict)
+	}
+	parent.bookGroupLedger(newFlow.client.Load() != nil, verdict == donorQuarantineFollowed, scattered)
 	if got := parent.reliabilityMetrics.groupsFollowed.Load(); got != 1 {
 		t.Errorf("follows counted %d, want 1", got)
 	}
@@ -401,13 +407,23 @@ func TestQuarantinedDonorKeepsItsSite(t *testing.T) {
 	parent.settings.QuarantineGroupFollow = false
 	scatteredFlow := &multiClientChannelUpdate{}
 	parent.stateLock.Lock()
-	parent.inheritAffinityClient4WithLock(scatteredFlow, donorPaths)
+	verdict, scattered = parent.inheritAffinityClient4WithLock(scatteredFlow, donorPaths)
 	parent.stateLock.Unlock()
 	if scatteredFlow.client.Load() != nil {
 		t.Error("with follow off, a benched donor still donated")
 	}
+	parent.bookGroupLedger(scatteredFlow.client.Load() != nil, verdict == donorQuarantineFollowed, scattered)
 	if got := parent.reliabilityMetrics.groupsScattered.Load(); got != 1 {
 		t.Errorf("scatters counted %d, want 1", got)
+	}
+
+	// and the overcount case the per-call counting shipped with: a scattered
+	// group followed by a successful donation books NOTHING -- the flow was
+	// placed with its group
+	parent.reliabilityMetrics.reset()
+	parent.bookGroupLedger(true, false, true)
+	if got := parent.reliabilityMetrics.groupsScattered.Load(); got != 0 {
+		t.Errorf("a placed flow booked %d scatters, want 0", got)
 	}
 }
 

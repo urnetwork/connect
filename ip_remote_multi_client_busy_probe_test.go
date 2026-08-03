@@ -113,7 +113,7 @@ func TestBusyProbeConvictsOnTimeout(t *testing.T) {
 	})
 	stallPast(client, stallTimeout)
 
-	window := busyProbeTestWindow(40*time.Millisecond, client)
+	window := busyProbeTestWindow(40*time.Millisecond, client, receivingSibling())
 
 	AssertEqual(t, window.convictSendStalls(stallTimeout), true)
 	AssertEqual(t, client.IsDone(), true)
@@ -141,12 +141,15 @@ func TestBusyProbeConvictsOnTwoUnsendable(t *testing.T) {
 	sends := atomic.Int32{}
 	client := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
 		sends.Add(1)
+		// (fixture note: the window below carries a receiving sibling, so
+		// the sibling-corroboration gate is open and the unsendable-count
+		// logic is what decides)
 		// backpressure: reported unsuccessful, never queued, no ack possible
 		return false, nil
 	})
 	stallPast(client, stallTimeout)
 
-	window := busyProbeTestWindow(40*time.Millisecond, client)
+	window := busyProbeTestWindow(40*time.Millisecond, client, receivingSibling())
 
 	// first failure: no verdict, the episode continues
 	AssertEqual(t, window.convictSendStalls(stallTimeout), false)
@@ -240,7 +243,7 @@ func TestBusyProbeDisabledConvictsImmediately(t *testing.T) {
 	stallPast(client, stallTimeout)
 
 	// watchdogTestWindow carries zero-value settings: BusyProbe off
-	window := watchdogTestWindow(client)
+	window := watchdogTestWindow(client, receivingSibling())
 
 	AssertEqual(t, window.convictSendStalls(stallTimeout), true)
 	AssertEqual(t, client.IsDone(), true)
@@ -265,7 +268,7 @@ func TestBusyProbeUnavailableConvictsAsBefore(t *testing.T) {
 	client.ctx, client.cancel = context.WithCancel(ctx)
 	stallPast(client, stallTimeout)
 
-	window := busyProbeTestWindow(40*time.Millisecond, client)
+	window := busyProbeTestWindow(40*time.Millisecond, client, receivingSibling())
 
 	AssertEqual(t, window.convictSendStalls(stallTimeout), true)
 	client.stateLock.Lock()
@@ -328,7 +331,7 @@ func TestBusyProbeSchedulerPauseOffConvictsAtTheBudget(t *testing.T) {
 	client.settings.SchedulerPauseTolerance = 0
 	stallPast(client, stallTimeout)
 
-	window := busyProbeTestWindow(budget, client)
+	window := busyProbeTestWindow(budget, client, receivingSibling())
 
 	AssertEqual(t, window.convictSendStalls(stallTimeout), true)
 	AssertEqual(t, client.IsDone(), true)
@@ -346,7 +349,7 @@ func TestBusyProbeAckErrorConvicts(t *testing.T) {
 	})
 	stallPast(client, stallTimeout)
 
-	window := busyProbeTestWindow(500*time.Millisecond, client)
+	window := busyProbeTestWindow(500*time.Millisecond, client, receivingSibling())
 
 	AssertEqual(t, window.convictSendStalls(stallTimeout), true)
 	client.stateLock.Lock()

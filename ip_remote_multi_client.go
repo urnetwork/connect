@@ -164,10 +164,10 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		MaxFlowsPerExit: 16,
 		// a site keeps its exit as it grows; see the field comment
 		AffinityStickyPastCap: true,
-		// a benched site keeps its exit while the exit still receives;
+		// a benched site keeps its exit through the early bench;
 		// see the field comments
 		QuarantineGroupFollow:       true,
-		GroupFollowReceiveFreshness: 10 * time.Second,
+		GroupFollowWindow: 45 * time.Second,
 		DialFailureRerace:       true,
 		BlackholeConnectTimeout: 30 * time.Second,
 		// a third of the full connect bar: long enough that a slow-but-working
@@ -506,13 +506,20 @@ type MultiClientSettings struct {
 	// false restores the scatter, the A/B comparison point.
 	QuarantineGroupFollow bool
 
-	// GroupFollowReceiveFreshness is the safety gate on the follow: a group
-	// follows its donor into quarantine only while the exit has received
-	// return traffic this recently -- the congested-not-dead signature. A
-	// receive-silent benched exit stops collecting its groups' new flows
-	// immediately, so a genuinely dead exit gets no fresh hostages. 0
+	// GroupFollowWindow is the safety gate on the follow: a group follows its
+	// donor only through the FIRST GroupFollowWindow of a quarantine episode.
+	// It cannot be a receive-recency gate -- the benching verdicts require
+	// ~30s of receive silence to fire and any receive lifts the bench
+	// atomically, so a quarantined exit NEVER has recent receive evidence and
+	// a recency gate is structurally unreachable (review finding, 2026-08-03).
+	// Episode age is the honest signal: early in a bench the verdict is least
+	// proven (every field bench that acquitted did so inside ~50s), while a
+	// bench that sustains past this window is trending toward the ~60s
+	// drain-to-conviction execution and must stop collecting flows before it.
+	// A followed flow into a genuinely dead exit is still not stranded: its
+	// unanswered dial re-races in ~3s via the dial-failure inference. 0
 	// disables the follow as surely as QuarantineGroupFollow false.
-	GroupFollowReceiveFreshness time.Duration
+	GroupFollowWindow time.Duration
 	// DialFailureRerace, when a provider reports it could not open the
 	// upstream for a new flow (see ipOosUnreachable's dial-failure use),
 	// silently unbinds the flow and lets the application's own retransmit
@@ -1628,7 +1635,7 @@ type ReliabilitySettings struct {
 	AffinityStickyPastCap    bool
 	// the G-1 group-follow pair; see the MultiClientSettings fields
 	QuarantineGroupFollow       bool
-	GroupFollowReceiveFreshness time.Duration
+	GroupFollowWindow time.Duration
 	DialFailureRerace           bool
 	UplinkStalenessGate      time.Duration
 	SoftVerdictDemote        bool
@@ -1681,7 +1688,7 @@ func ReliabilitySettingsFrom(settings *MultiClientSettings) *ReliabilitySettings
 		MaxFlowsPerExit:             settings.MaxFlowsPerExit,
 		AffinityStickyPastCap:       settings.AffinityStickyPastCap,
 		QuarantineGroupFollow:       settings.QuarantineGroupFollow,
-		GroupFollowReceiveFreshness: settings.GroupFollowReceiveFreshness,
+		GroupFollowWindow:           settings.GroupFollowWindow,
 		DialFailureRerace:        settings.DialFailureRerace,
 		UplinkStalenessGate:      settings.UplinkStalenessGate,
 		SoftVerdictDemote:        settings.SoftVerdictDemote,
@@ -2086,24 +2093,32 @@ func (self *RemoteUserNatMultiClient) clientAtFlowCapWithLock(client *multiClien
 // never repoint a flow that already has a client, since providers terminate tcp
 // and a moved flow is a broken flow.
 //
+// Returns the winning donor's verdict (donorRefused when nothing was adopted)
+// and whether any candidate was refused ONLY for quarantine. The G-1 ledger is
+// NOT written here: one flow placement makes several of these calls (one per
+// affinity group, then the fallback groups), so per-call counting overcounts
+// -- a flow whose first group scattered but whose second group donated was
+// placed WITH its group, not scattered (review finding, 2026-08-03). The
+// caller aggregates across all its calls and books one event per flow.
+//
 // called with stateLock
-func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *multiClientChannelUpdate, paths map[Ip4Path]time.Time) {
+func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *multiClientChannelUpdate, paths map[Ip4Path]time.Time) (donorVerdict, bool) {
 	// with AffinityStickyPastCap a donor at the flow cap still donates: the
 	// group's egress ip is worth more than the cap, which continues to gate
 	// every placement that would put a NEW site on the exit
 	reliabilitySettings := self.reliabilitySettings()
 	sticky := reliabilitySettings.AffinityStickyPastCap
 	follow := reliabilitySettings.QuarantineGroupFollow
-	freshness := reliabilitySettings.GroupFollowReceiveFreshness
+	window := reliabilitySettings.GroupFollowWindow
 	var mostRecentCreateTime time.Time
 	winnerVerdict, scattered := donorRefused, false
 	for copyIp4Path, createTime := range paths {
 		if copyUpdate, ok := self.ip4PathUpdates[copyIp4Path]; ok {
 			if c := copyUpdate.client.Load(); c != nil && !c.IsDone() && (sticky || !self.clientAtFlowCapWithLock(c)) && createTime.After(mostRecentCreateTime) {
-				switch verdict := c.affinityDonorEligible(follow, freshness); verdict {
+				switch verdict := c.affinityDonorEligible(follow, window); verdict {
 				case donorEligible, donorQuarantineFollowed:
 					// donorQuarantineFollowed is the G-1 follow: a benched
-					// donor with fresh receive evidence keeps its own site
+					// donor inside the follow window keeps its own site
 					mostRecentCreateTime = createTime
 					update.client.Store(c)
 					winnerVerdict = verdict
@@ -2113,31 +2128,25 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *mul
 			}
 		}
 	}
-	// counted once per inherited flow, not per candidate path: a follow only
-	// if the WINNING donor was a followed quarantine, a scatter only if
-	// quarantine refusals left the flow with no donor at all
-	if winnerVerdict == donorQuarantineFollowed {
-		self.reliabilityMetrics.groupFollowed()
-	} else if scattered && update.client.Load() == nil {
-		self.reliabilityMetrics.groupScattered()
-	}
+	return winnerVerdict, scattered
 }
 
 // inheritAffinityClient6WithLock is the v6 twin of inheritAffinityClient4WithLock
 //
 // called with stateLock
-func (self *RemoteUserNatMultiClient) inheritAffinityClient6WithLock(update *multiClientChannelUpdate, paths map[Ip6Path]time.Time) {
-	// see inheritAffinityClient4WithLock for the sticky and follow rationale
+func (self *RemoteUserNatMultiClient) inheritAffinityClient6WithLock(update *multiClientChannelUpdate, paths map[Ip6Path]time.Time) (donorVerdict, bool) {
+	// see inheritAffinityClient4WithLock for the sticky, follow, and
+	// caller-side-counting rationale
 	reliabilitySettings := self.reliabilitySettings()
 	sticky := reliabilitySettings.AffinityStickyPastCap
 	follow := reliabilitySettings.QuarantineGroupFollow
-	freshness := reliabilitySettings.GroupFollowReceiveFreshness
+	window := reliabilitySettings.GroupFollowWindow
 	var mostRecentCreateTime time.Time
 	winnerVerdict, scattered := donorRefused, false
 	for copyIp6Path, createTime := range paths {
 		if copyUpdate, ok := self.ip6PathUpdates[copyIp6Path]; ok {
 			if c := copyUpdate.client.Load(); c != nil && !c.IsDone() && (sticky || !self.clientAtFlowCapWithLock(c)) && createTime.After(mostRecentCreateTime) {
-				switch verdict := c.affinityDonorEligible(follow, freshness); verdict {
+				switch verdict := c.affinityDonorEligible(follow, window); verdict {
 				case donorEligible, donorQuarantineFollowed:
 					mostRecentCreateTime = createTime
 					update.client.Store(c)
@@ -2148,9 +2157,17 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient6WithLock(update *mul
 			}
 		}
 	}
-	if winnerVerdict == donorQuarantineFollowed {
+	return winnerVerdict, scattered
+}
+
+// bookGroupLedger books ONE G-1 ledger event for one flow placement, from the
+// aggregate of every inherit call the placement made: a follow only if the
+// flow ended up with a donor that was a followed quarantine, a scatter only if
+// quarantine refusals contributed and the flow found no donor at all.
+func (self *RemoteUserNatMultiClient) bookGroupLedger(placed bool, followWinner bool, sawScatter bool) {
+	if followWinner && placed {
 		self.reliabilityMetrics.groupFollowed()
-	} else if scattered && update.client.Load() == nil {
+	} else if sawScatter && !placed {
 		self.reliabilityMetrics.groupScattered()
 	}
 }
@@ -2479,6 +2496,7 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 				affinityIpPaths = self.affinityIpPathsWithLock(ipPath)
 			}
 
+			followWinner, sawScatter := false, false
 			for _, affinityIpPath := range affinityIpPaths {
 				affinityIp4Path := affinityIpPath.ToIp4Path()
 				update.affinityIp4Paths[affinityIp4Path] = true
@@ -2490,7 +2508,9 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 				paths[ip4Path] = time.Now()
 
 				if update.client.Load() == nil {
-					self.inheritAffinityClient4WithLock(update, paths)
+					verdict, scattered := self.inheritAffinityClient4WithLock(update, paths)
+					followWinner = followWinner || verdict == donorQuarantineFollowed
+					sawScatter = sawScatter || scattered
 				}
 			}
 
@@ -2506,13 +2526,18 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 						continue
 					}
 					if paths, ok := self.affinityIp4Paths[fallbackIp4Path]; ok {
-						self.inheritAffinityClient4WithLock(update, paths)
+						verdict, scattered := self.inheritAffinityClient4WithLock(update, paths)
+						followWinner = followWinner || verdict == donorQuarantineFollowed
+						sawScatter = sawScatter || scattered
 						if update.client.Load() != nil {
 							break
 						}
 					}
 				}
 			}
+			// one ledger event per flow, from the aggregate of every inherit
+			// attempt above
+			self.bookGroupLedger(update.client.Load() != nil, followWinner, sawScatter)
 		} else {
 			previousClient = update.client.Load()
 		}
@@ -2589,6 +2614,7 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 				affinityIpPaths = self.affinityIpPathsWithLock(ipPath)
 			}
 
+			followWinner, sawScatter := false, false
 			for _, affinityIpPath := range affinityIpPaths {
 				affinityIp6Path := affinityIpPath.ToIp6Path()
 				update.affinityIp6Paths[affinityIp6Path] = true
@@ -2600,7 +2626,9 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 				paths[ip6Path] = time.Now()
 
 				if update.client.Load() == nil {
-					self.inheritAffinityClient6WithLock(update, paths)
+					verdict, scattered := self.inheritAffinityClient6WithLock(update, paths)
+					followWinner = followWinner || verdict == donorQuarantineFollowed
+					sawScatter = sawScatter || scattered
 				}
 			}
 
@@ -2616,13 +2644,18 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 						continue
 					}
 					if paths, ok := self.affinityIp6Paths[fallbackIp6Path]; ok {
-						self.inheritAffinityClient6WithLock(update, paths)
+						verdict, scattered := self.inheritAffinityClient6WithLock(update, paths)
+						followWinner = followWinner || verdict == donorQuarantineFollowed
+						sawScatter = sawScatter || scattered
 						if update.client.Load() != nil {
 							break
 						}
 					}
 				}
 			}
+			// one ledger event per flow, from the aggregate of every inherit
+			// attempt above
+			self.bookGroupLedger(update.client.Load() != nil, followWinner, sawScatter)
 		} else {
 			previousClient = update.client.Load()
 		}
@@ -5634,6 +5667,40 @@ func (self *multiClientWindow) convictSendStalls(stallTimeout time.Duration) boo
 		probeWait.Wait()
 	}
 
+	// the sibling-corroboration gate. The probe rides the same possibly-dead
+	// uplink it is investigating, so its timeout can never distinguish "this
+	// exit is dead" from "the phone is": one cellular blip shorter than the
+	// uplink gate's 5s executed three loaded exits in three minutes in the
+	// field (2026-08-03), because 3s stall + 1.5s probe outruns that gate --
+	// the same shape the receive verdicts were stormed by before THEY were
+	// gated. A stall conviction is admissible only while some OTHER window
+	// client shows receive progress inside the judged interval: return
+	// traffic arriving anywhere proves the tunnel carries packets, which
+	// makes this exit's total silence evidence about the exit. When nothing
+	// anywhere is receiving, every verdict is held un-refreshed -- the next
+	// pass re-judges, and a real stall convicts on the first pass after the
+	// uplink proves out. A window with no sibling to consult (fixed single
+	// exit) never convicts here; the ordinary blackhole and cping paths
+	// still cover it.
+	receiveWindow := stallTimeout + busyProbeBudget(stallTimeout, reliabilitySettings.BusyProbeBudget)
+	receivingElsewhere := func(exclude *multiClientChannel) bool {
+		for _, client := range self.unorderedClients() {
+			if client == exclude {
+				continue
+			}
+			// data receive, or a sibling's own liveness-probe ack: both are
+			// return packets that crossed the uplink. The probe-ack half is
+			// what lets a window with several simultaneously stalled exits
+			// resolve -- one acquittal proves the uplink for judging the
+			// rest, where data-receive alone would hold everything until an
+			// unrelated site happened to answer.
+			if client.hasRecentReceive(receiveWindow) || client.hasRecentBusyProbeAck(receiveWindow) {
+				return true
+			}
+		}
+		return false
+	}
+
 	convicted := false
 	for i, client := range stalled {
 		verdict := verdicts[i]
@@ -5656,6 +5723,36 @@ func (self *multiClientWindow) convictSendStalls(stallTimeout time.Duration) boo
 				"detail", verdict.detail,
 				"bar", stallTimeout,
 			))
+			continue
+		}
+		if !receivingElsewhere(client) {
+			// held, not acquitted: the stall clock is deliberately NOT
+			// refreshed, so the evidence carries into the next pass and a
+			// real stall still convicts the moment a sibling proves the
+			// uplink. Two things ARE reset here:
+			//   - the unsendable-probe run: probes fired while the verdict
+			//     was inadmissible are evidence about the phone, and letting
+			//     them accumulate would convict on "unsendable 2x" one pass
+			//     after the gate opens -- executing the exact exits the hold
+			//     protects (review finding, 2026-08-03). A genuinely dead
+			//     exit still convicts via probe timeout on the first open
+			//     pass.
+			//   - nothing else.
+			// The hold is booked and logged once per stall episode (the
+			// latch), matching the per-episode semantics the uplink-hold
+			// counter has in detectBlackhole -- per-pass counting there would
+			// book ~24 holds/exit/minute and make the counter unreadable.
+			client.resetBusyProbeSendFailures()
+			if client.markStallHoldOnce() {
+				client.metrics().verdictHeldUplinkStale()
+				loggerOrDefault(self.log).Infof("%s\n", relEvent(
+					"busy_probe",
+					"exit", client.ClientId(),
+					"outcome", "held",
+					"detail", "no receiving sibling: uplink unproven",
+					"bar", stallTimeout,
+				))
+			}
 			continue
 		}
 		reason := fmt.Sprintf("no ack progress for %s", stallTimeout)
@@ -6186,7 +6283,10 @@ func (self *multiClientWindow) resize() {
 						// inference feeding strikes, one silently-dead polled
 						// destination could oscillate a single-exit window
 						// between warned and not indefinitely.
-						if ulimit || (1 < len(clientStats) && client.dialStarved()) {
+						if ulimit {
+							client.setWarning(true, warnCapacity)
+							warnClient(client, stats)
+						} else if 1 < len(clientStats) && client.dialStarved() {
 							client.setWarning(true, warnStarved)
 							warnClient(client, stats)
 						} else if client.isQuarantined() {
@@ -7549,6 +7649,11 @@ type multiClientChannel struct {
 	busyProbeAckTime      time.Time
 	busyProbeOutstanding  bool
 	busyProbeSendFailures int
+	// stallHoldCounted latches the sibling-corroboration hold to one counter
+	// increment and one log line per stall episode. Cleared on every
+	// sendStalled reset path and on the probe ack, the same places the
+	// unsendable run resets -- those are what end an episode.
+	stallHoldCounted bool
 
 	// lastReceiveAckTime is when return traffic last arrived on this channel,
 	// stamped by addReceiveAck under the lock it already takes. Read by
@@ -8067,6 +8172,7 @@ func (self *multiClientChannel) sendStalled(stallTimeout time.Duration) bool {
 	// not a broken one
 	if self.packetStats.sendNackCount <= 0 || self.pendingSendTime.IsZero() {
 		self.busyProbeSendFailures = 0
+		self.stallHoldCounted = false
 		return false
 	}
 	if transportDown {
@@ -8078,6 +8184,7 @@ func (self *multiClientChannel) sendStalled(stallTimeout time.Duration) bool {
 		// separate guard downstream.
 		self.pendingSendTime = time.Now()
 		self.busyProbeSendFailures = 0
+		self.stallHoldCounted = false
 		return false
 	}
 
@@ -8087,12 +8194,39 @@ func (self *multiClientChannel) sendStalled(stallTimeout time.Duration) bool {
 	}
 	if time.Since(stallStart) < stallTimeout {
 		// the stale episode is over (or has not matured), so the consecutive
-		// unsendable-probe count starts fresh; without this, one transient
+		// unsendable-probe count starts fresh (without this, one transient
 		// queue-full result could survive a healthy interval and make the next
-		// episode convict on its first unsendable probe
+		// episode convict on its first unsendable probe), and so does the
+		// per-episode hold latch
 		self.busyProbeSendFailures = 0
+		self.stallHoldCounted = false
 		return false
 	}
+	return true
+}
+
+// resetBusyProbeSendFailures clears the consecutive-unsendable-probe run.
+// Called by the held branch of convictSendStalls: probes fired while the
+// sibling-corroboration gate held the verdict are evidence about the phone,
+// not the exit, and letting them accumulate would convict on "unsendable 2x"
+// one pass after the gate opens.
+func (self *multiClientChannel) resetBusyProbeSendFailures() {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.busyProbeSendFailures = 0
+}
+
+// markStallHoldOnce latches the per-episode hold: true exactly once per stall
+// episode, so the uplink-hold counter and log line keep per-episode semantics
+// (matching detectBlackhole's heldCounted) instead of booking one per pass.
+// The latch clears wherever the episode ends -- every sendStalled reset path.
+func (self *multiClientChannel) markStallHoldOnce() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.stallHoldCounted {
+		return false
+	}
+	self.stallHoldCounted = true
 	return true
 }
 
@@ -8161,6 +8295,7 @@ func (self *multiClientChannel) addBusyProbeAck() {
 	self.busyProbeAckTime = time.Now()
 	self.busyProbeOutstanding = false
 	self.busyProbeSendFailures = 0
+	self.stallHoldCounted = false
 }
 
 // setBusyProbeOutstanding arms/disarms the suspect demerit (see effectiveTier).
@@ -8175,6 +8310,18 @@ func (self *multiClientChannel) busyProbeOutstandingNow() bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	return self.busyProbeOutstanding
+}
+
+// hasRecentBusyProbeAck reports whether this channel answered a liveness
+// probe inside window -- a return packet that crossed the uplink, which is
+// what the stall-conviction sibling gate counts as proof the tunnel works.
+func (self *multiClientChannel) hasRecentBusyProbeAck(window time.Duration) bool {
+	if window <= 0 {
+		return false
+	}
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return !self.busyProbeAckTime.IsZero() && time.Since(self.busyProbeAckTime) < window
 }
 
 // addBusyProbeSendFailure counts one probe that could not be queued and reports
@@ -8383,6 +8530,11 @@ const (
 	warnDraining
 	// warnStarved: the provider's own upstream is failing dials.
 	warnStarved
+	// warnCapacity: the window's source-count ulimit -- the exit is full by
+	// policy, not failing. Distinct from starved because a full exit and a
+	// dial-failing one are different facts to the developer screen (review
+	// finding, 2026-08-03: the ulimit branch displayed as "starved").
+	warnCapacity
 	// warnUnhealthy: a stats or blackhole verdict was demoted or deferred
 	// against it, or the rank-derived health warning fired.
 	warnUnhealthy
@@ -8394,6 +8546,8 @@ func (self warnCause) String() string {
 		return "draining"
 	case warnStarved:
 		return "starved"
+	case warnCapacity:
+		return "capacity"
 	case warnUnhealthy:
 		return "unhealthy"
 	default:
@@ -8458,24 +8612,29 @@ const (
 
 // affinityDonorEligible decides whether this channel may donate to a new flow
 // of an affinity group it already hosts. A resize warning always refuses --
-// draining, starved, and unhealthy exits shed new flows on purpose (draining
-// changes under G-3's coordinated migration, not here). Quarantine refuses
-// UNLESS group-follow is on and the exit has received return traffic within
-// freshness: suspicion alone must not split a site's egress ip, but a
-// receive-silent bench gets no fresh flows. Takes only this channel's own
-// stateLock, the same discipline as isWarning -- the inherit path calls this
-// under the parent lock.
-func (self *multiClientChannel) affinityDonorEligible(followQuarantine bool, freshness time.Duration) donorVerdict {
+// draining, starved, capacity, and unhealthy exits shed new flows on purpose
+// (draining changes under G-3's coordinated migration, not here). Quarantine
+// refuses UNLESS group-follow is on and the episode is younger than window:
+// suspicion alone must not split a site's egress ip while the verdict is
+// least proven, but a bench that sustains toward the drain-to-conviction
+// execution stops collecting flows first. The gate is deliberately NOT
+// receive recency -- the benching verdicts require a silent stats window and
+// any receive lifts the bench, so a quarantined channel structurally never
+// has recent receive evidence and a recency gate can never open (review
+// finding, 2026-08-03). Takes only this channel's own stateLock, the same
+// discipline as isWarning -- the inherit path calls this under the parent
+// lock.
+func (self *multiClientChannel) affinityDonorEligible(followQuarantine bool, window time.Duration) donorVerdict {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	if self.warning {
 		return donorRefused
 	}
 	if self.quarantined {
-		if !followQuarantine || freshness <= 0 {
+		if !followQuarantine || window <= 0 {
 			return donorQuarantineScattered
 		}
-		if self.lastReceiveAckTime.IsZero() || freshness <= time.Since(self.lastReceiveAckTime) {
+		if self.quarantineStart.IsZero() || window <= time.Since(self.quarantineStart) {
 			return donorQuarantineScattered
 		}
 		return donorQuarantineFollowed
