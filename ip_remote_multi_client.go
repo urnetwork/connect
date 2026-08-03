@@ -4632,6 +4632,17 @@ func (self *RemoteUserNatMultiClient) Exits() []*ExitInfo {
 			})
 		}
 	}
+	// deterministic order: the walk above ranges two maps (windows, then each
+	// window's client set), so without this every readout shuffles the rows --
+	// on the developer screen the exits visibly jumped positions each refresh.
+	// Window type then client id: stable while membership is stable, and a
+	// membership change moves only the rows it must.
+	slices.SortFunc(exits, func(a, b *ExitInfo) int {
+		if a.WindowType != b.WindowType {
+			return int(a.WindowType) - int(b.WindowType)
+		}
+		return a.ClientId.Cmp(b.ClientId)
+	})
 	return exits
 }
 
