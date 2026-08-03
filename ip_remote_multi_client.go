@@ -1041,6 +1041,14 @@ type RemoteUserNatMultiClient struct {
 	// immutable snapshot of the compiled overrides, swapped by `SetBlockActionOverrides`
 	blockActionState     atomic.Pointer[blockActionState]
 	blockActionCache     *blockActionCache
+
+	// the G-4b flow-owner seam: the platform's resolver for "which pinned
+	// app owns this flow", with its per-flow-key answer cache. Zero values
+	// are fully inert (nil func = no app pinning), so no constructor wiring
+	// is required and bare fixtures are unaffected.
+	flowOwnerFunc      atomic.Pointer[FlowOwnerLookupFunc]
+	flowOwnerCache     sync.Map
+	flowOwnerCacheSize atomic.Int64
 	blockActionCollector *blockActionCollector
 	// immutable snapshot of the compiled ignore host values,
 	// swapped by `SetBlockActionIgnoreHosts`
@@ -1134,6 +1142,86 @@ type multiClientConfig struct {
 	// the ad/tracker blocker consulted in the egress decision (nil = none)
 	blocker Blocker
 }
+
+// FlowOwnerLookupFunc resolves the PINNED app that owns a flow, or "" for
+// none -- "none" covers both "no app pin rules exist" and "the owning app is
+// not pinned", which the caller cannot and need not distinguish. Called once
+// per new flow on the egress path and cached per flow key, so an
+// implementation may cross into platform code (on android, one
+// ConnectivityManager.getConnectionOwnerUid binder call).
+type FlowOwnerLookupFunc func(ipPath *IpPath) string
+
+// flowOwnerEntry is one cached lookup answer.
+type flowOwnerEntry struct {
+	appId  string
+	expire time.Time
+}
+
+const (
+	// flowOwnerCacheTtl bounds how long a flow-key's owner answer is reused.
+	// Source ports recycle, so a stale entry can mis-pin a NEW flow that
+	// reuses a recently-dead flow's key -- five minutes keeps the platform
+	// call off the steady-state path while bounding that window well below
+	// the kernel's port-reuse pace under real load.
+	flowOwnerCacheTtl = 5 * time.Minute
+	// flowOwnerCacheMaxCount is a crude wholesale-reset bound (the count
+	// includes refreshes, so it is approximate on purpose): the cache must
+	// never become the memory story of a long session.
+	flowOwnerCacheMaxCount = 8192
+)
+
+// SetFlowOwnerLookup installs (or, with nil, removes) the platform's
+// flow-owner resolver. Safe at runtime; the cache is dropped so a changed
+// pin-rule set takes effect on the next packet of every flow key.
+func (self *RemoteUserNatMultiClient) SetFlowOwnerLookup(lookup FlowOwnerLookupFunc) {
+	if lookup == nil {
+		self.flowOwnerFunc.Store(nil)
+	} else {
+		self.flowOwnerFunc.Store(&lookup)
+	}
+	self.flowOwnerCache.Range(func(k, _ any) bool {
+		self.flowOwnerCache.Delete(k)
+		return true
+	})
+	self.flowOwnerCacheSize.Store(0)
+}
+
+// flowOwnerAppId answers "which pinned app owns this flow", from the cache
+// when fresh, else from the platform lookup. Runs on the egress path OUTSIDE
+// every lock, which is what makes the platform crossing affordable.
+func (self *RemoteUserNatMultiClient) flowOwnerAppId(ipPath *IpPath, lookup FlowOwnerLookupFunc) string {
+	var key any
+	switch ipPath.Version {
+	case 4:
+		key = ipPath.ToIp4Path()
+	case 6:
+		key = ipPath.ToIp6Path()
+	default:
+		return ""
+	}
+	now := time.Now()
+	if v, ok := self.flowOwnerCache.Load(key); ok {
+		entry := v.(flowOwnerEntry)
+		if now.Before(entry.expire) {
+			return entry.appId
+		}
+	}
+	appId := lookup(ipPath)
+	if flowOwnerCacheMaxCount < self.flowOwnerCacheSize.Add(1) {
+		self.flowOwnerCache.Range(func(k, _ any) bool {
+			self.flowOwnerCache.Delete(k)
+			return true
+		})
+		self.flowOwnerCacheSize.Store(1)
+	}
+	self.flowOwnerCache.Store(key, flowOwnerEntry{appId: appId, expire: now.Add(flowOwnerCacheTtl)})
+	return appId
+}
+
+// pinnedFollowWindow is the follow window a pinned flow's inheritance uses:
+// effectively the whole bench, every bench. Not literally infinite so a
+// clock-skew pathology cannot make the comparison overflow-weird.
+const pinnedFollowWindow = 24 * time.Hour
 
 func NewRemoteUserNatMultiClientWithDefaults(
 	ctx context.Context,
@@ -2112,6 +2200,14 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *mul
 	sticky := reliabilitySettings.AffinityStickyPastCap
 	follow := reliabilitySettings.QuarantineGroupFollow
 	window := reliabilitySettings.GroupFollowWindow
+	if update.pinned {
+		// a pinned flow chose stability over everything short of removal:
+		// its group follows a benched donor for the whole episode, not just
+		// the follow window. Warned donors still refuse -- a pin is not a
+		// license to board a retiring or unhealthy exit.
+		follow = true
+		window = pinnedFollowWindow
+	}
 	var mostRecentCreateTime time.Time
 	winnerVerdict, scattered := donorRefused, false
 	for copyIp4Path, createTime := range paths {
@@ -2137,12 +2233,16 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *mul
 //
 // called with stateLock
 func (self *RemoteUserNatMultiClient) inheritAffinityClient6WithLock(update *multiClientChannelUpdate, paths map[Ip6Path]time.Time) (donorVerdict, bool) {
-	// see inheritAffinityClient4WithLock for the sticky, follow, and
+	// see inheritAffinityClient4WithLock for the sticky, follow, pin, and
 	// caller-side-counting rationale
 	reliabilitySettings := self.reliabilitySettings()
 	sticky := reliabilitySettings.AffinityStickyPastCap
 	follow := reliabilitySettings.QuarantineGroupFollow
 	window := reliabilitySettings.GroupFollowWindow
+	if update.pinned {
+		follow = true
+		window = pinnedFollowWindow
+	}
 	var mostRecentCreateTime time.Time
 	winnerVerdict, scattered := donorRefused, false
 	for copyIp6Path, createTime := range paths {
@@ -2215,6 +2315,10 @@ var domainAffinityAliases = map[string]string{
 	"redd.it":          "reddit.com",
 	"redditmedia.com":  "reddit.com",
 	"redditstatic.com": "reddit.com",
+	// doordash: the app's api session and its image cdn -- split egress ips
+	// were observed as images failing to load in the app
+	"cdn4dd.com":      "doordash.com",
+	"doordash.com.au": "doordash.com",
 }
 
 // affinityNameForServerName is the one place a server name becomes an affinity
@@ -2290,8 +2394,8 @@ func (self *RemoteUserNatMultiClient) affinityIpPathsWithLock(ipPath *IpPath) (a
 	return
 }
 
-func (self *RemoteUserNatMultiClient) sendClientPath(ipPath *IpPath, callback func(*multiClientChannelUpdate, *multiClientChannel)) {
-	update, previousClient, currentClient := self.sendUpdate(ipPath)
+func (self *RemoteUserNatMultiClient) sendClientPath(ipPath *IpPath, pin flowPin, callback func(*multiClientChannelUpdate, *multiClientChannel)) {
+	update, previousClient, currentClient := self.sendUpdate(ipPath, pin)
 	callback(update, currentClient)
 
 	// fast path: if the flow's client did not change during the callback, no
@@ -2419,7 +2523,7 @@ func (self *RemoteUserNatMultiClient) rstFlow(ipPath *IpPath, client *multiClien
 // the caller's `clientUpdates` bookkeeping), and the current client to send to.
 // the current client is read here under the parent lock that is already held,
 // so the egress hot path does not reacquire the parent lock to read it.
-func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
+func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 	*multiClientChannelUpdate,
 	*multiClientChannel,
 	*multiClientChannel,
@@ -2496,6 +2600,18 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 			var affinityIpPaths []*IpPath
 			if self.settings.DestinationAffinity {
 				affinityIpPaths = self.affinityIpPathsWithLock(ipPath)
+			}
+			// the G-4b pin. A pinned app's flows ALL join one app-scoped
+			// affinity group in addition to their domain groups, so the
+			// app's api session and every one of its cdn destinations
+			// converge on one exit -- one egress ip for the whole app,
+			// with no domain knowledge required. The group name's "app:"
+			// prefix cannot collide with an eTLD+1. update.pinned
+			// additionally exempts the flow's inheritance from the bench
+			// follow window (see inheritAffinityClient4WithLock).
+			update.pinned = pin.pinned()
+			if pin.appId != "" {
+				affinityIpPaths = append([]*IpPath{{ServerName: "app:" + pin.appId}}, affinityIpPaths...)
 			}
 
 			followWinner, sawScatter := false, false
@@ -2614,6 +2730,11 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath) (
 			var affinityIpPaths []*IpPath
 			if self.settings.DestinationAffinity {
 				affinityIpPaths = self.affinityIpPathsWithLock(ipPath)
+			}
+			// see the v4 twin for the pin rationale
+			update.pinned = pin.pinned()
+			if pin.appId != "" {
+				affinityIpPaths = append([]*IpPath{{ServerName: "app:" + pin.appId}}, affinityIpPaths...)
 			}
 
 			followWinner, sawScatter := false, false
@@ -3386,10 +3507,21 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 		}
 		return success
 	}
+	// the G-4b pin, resolved here in the lock-free zone: a host pin from the
+	// override match this packet already computed, an app pin from the
+	// platform's flow-owner lookup (one cached call per flow key)
+	pin := flowPin{
+		site: match != nil && match.routeOverride != nil && match.routeOverride.Pin,
+	}
+	if lookupPtr := self.flowOwnerFunc.Load(); lookupPtr != nil {
+		pin.appId = self.flowOwnerAppId(ipPath, *lookupPtr)
+	}
+
 	parsedPacket := &parsedPacket{
 		packet:  packet,
 		ipPath:  ipPath,
 		payload: payload,
+		pin:     pin,
 	}
 	success := self.sendPacket(source, provideMode, parsedPacket, timeout)
 	if success {
@@ -3632,7 +3764,7 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 	timeout time.Duration,
 ) (success bool) {
 	ipPath := sendPacket.ipPath
-	self.sendClientPath(ipPath, func(update *multiClientChannelUpdate, currentClient *multiClientChannel) {
+	self.sendClientPath(ipPath, sendPacket.pin, func(update *multiClientChannelUpdate, currentClient *multiClientChannel) {
 		if !self.canSendPacket(sendPacket, update) {
 			return
 		}
@@ -5084,6 +5216,13 @@ type multiClientChannelUpdate struct {
 	// against the path maps) or a context where the writer has exclusive access.
 	client atomic.Pointer[multiClientChannel]
 
+	// pinned marks a flow a pin rule claimed (host pin or app pin): its
+	// affinity inheritance follows a benched donor without the follow-window
+	// limit -- stability over everything short of removal. Written once at
+	// creation under the parent stateLock, read by the inherit path under
+	// the same lock.
+	pinned bool
+
 	// receivedInbound is set true the first time an inbound (non-icmp) packet
 	// resolves this flow to its committed client (the receiveClientPath path).
 	// It marks the flow established, which gates the dial-failure re-race: a
@@ -5439,6 +5578,24 @@ type parsedPacket struct {
 	packet  []byte
 	ipPath  *IpPath
 	payload []byte
+	// pin, when set, is the G-4b flow pin computed on the egress path (the
+	// lock-free zone) and carried to the flow-open under the parent lock:
+	// signature changes stop at this struct, and every other construction
+	// site (probes, tests) gets the zero value = unpinned.
+	pin flowPin
+}
+
+// flowPin is what a pin rule resolved to for one flow: the owning pinned
+// app's id (empty when none), and whether a host rule pinned the destination.
+// Either one marks the flow pinned; the app id additionally names the app
+// affinity group every flow of that app joins.
+type flowPin struct {
+	appId string
+	site  bool
+}
+
+func (self flowPin) pinned() bool {
+	return self.site || self.appId != ""
 }
 
 func newParsedPacket(packet []byte) (*parsedPacket, error) {

@@ -31,6 +31,14 @@ type BlockOverride struct {
 
 type RouteOverride struct {
 	Local bool
+	// Pin holds the matching traffic to one stable egress: for host rules the
+	// matched cluster, for app rules every flow the app owns, joins a single
+	// affinity group whose flows follow their exit through benches without
+	// the follow-window limit. Pin never changes block/local routing -- a
+	// pinned flow egresses remotely as normal; only WHERE it egresses is
+	// held. Zero-value off, so stored rules from before this field are
+	// unchanged (the store is json).
+	Pin bool
 }
 
 type BlockActionOverride struct {
@@ -234,7 +242,13 @@ func (self *blockActionMatch) merge(override *BlockActionOverride) {
 		}
 	}
 	if override.RouteOverride != nil {
-		if self.routeOverride == nil || !self.routeOverride.Local && override.RouteOverride.Local {
+		// preference order: Local wins (local traffic never reaches a
+		// provider, so a pin on the same cluster is moot), then Pin, then
+		// any. Order-independent like the block half.
+		replace := self.routeOverride == nil ||
+			(!self.routeOverride.Local && override.RouteOverride.Local) ||
+			(!self.routeOverride.Local && !self.routeOverride.Pin && override.RouteOverride.Pin)
+		if replace {
 			self.routeOverride = override.RouteOverride
 			self.routeOverrideId = override.OverrideId
 		}

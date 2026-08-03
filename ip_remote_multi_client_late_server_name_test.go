@@ -54,7 +54,7 @@ func TestLateServerNameEstablishedFlowKeepsItsExit(t *testing.T) {
 	// flow 1 is created before any name is known, and commits to clientA the
 	// way the race would have
 	flow1 := lateNamePath(40000)
-	update1, _, _ := mc.sendUpdate(flow1)
+	update1, _, _ := mc.sendUpdate(flow1, flowPin{})
 	update1.client.Store(clientA)
 	flow1Key := flow1.ToIp4Path()
 
@@ -62,7 +62,7 @@ func TestLateServerNameEstablishedFlowKeepsItsExit(t *testing.T) {
 	lookup.learn("93.184.216.34", "foo.com")
 
 	// flow 2 keys on the base domain, whose group is empty
-	update2, _, current2 := mc.sendUpdate(lateNamePath(40001))
+	update2, _, current2 := mc.sendUpdate(lateNamePath(40001), flowPin{})
 
 	// it converges onto the established exit instead of racing for a new one
 	AssertEqual(t, current2 == clientA, true)
@@ -87,7 +87,7 @@ func TestAffinityBridgeDoesNotJoinTheDestinationGroup(t *testing.T) {
 	mc := lateNameClient(ctx, lookup, true)
 
 	flow1 := lateNamePath(40000)
-	update1, _, _ := mc.sendUpdate(flow1)
+	update1, _, _ := mc.sendUpdate(flow1, flowPin{})
 	update1.client.Store(&multiClientChannel{ctx: ctx})
 
 	destinationKey := (&IpPath{
@@ -98,7 +98,7 @@ func TestAffinityBridgeDoesNotJoinTheDestinationGroup(t *testing.T) {
 	AssertEqual(t, len(mc.affinityIp4Paths[destinationKey]), 1)
 
 	lookup.learn("93.184.216.34", "foo.com")
-	mc.sendUpdate(lateNamePath(40001))
+	mc.sendUpdate(lateNamePath(40001), flowPin{})
 
 	// still just flow 1 -- the bridge consulted this group without joining it
 	AssertEqual(t, len(mc.affinityIp4Paths[destinationKey]), 1)
@@ -112,11 +112,11 @@ func TestAffinityBridgeDisabled(t *testing.T) {
 	lookup := newTestingLearningServerNameLookup()
 	mc := lateNameClient(ctx, lookup, false)
 
-	update1, _, _ := mc.sendUpdate(lateNamePath(40000))
+	update1, _, _ := mc.sendUpdate(lateNamePath(40000), flowPin{})
 	update1.client.Store(&multiClientChannel{ctx: ctx})
 
 	lookup.learn("93.184.216.34", "foo.com")
-	_, _, current2 := mc.sendUpdate(lateNamePath(40001))
+	_, _, current2 := mc.sendUpdate(lateNamePath(40001), flowPin{})
 
 	AssertEqual(t, current2 == nil, true)
 }
@@ -132,11 +132,11 @@ func TestAffinityBridgeSkipsDoneDonors(t *testing.T) {
 	doneCtx, doneCancel := context.WithCancel(context.Background())
 	doneCancel()
 
-	update1, _, _ := mc.sendUpdate(lateNamePath(40000))
+	update1, _, _ := mc.sendUpdate(lateNamePath(40000), flowPin{})
 	update1.client.Store(&multiClientChannel{ctx: doneCtx})
 
 	lookup.learn("93.184.216.34", "foo.com")
-	_, _, current2 := mc.sendUpdate(lateNamePath(40001))
+	_, _, current2 := mc.sendUpdate(lateNamePath(40001), flowPin{})
 
 	AssertEqual(t, current2 == nil, true)
 }

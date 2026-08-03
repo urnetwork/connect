@@ -427,6 +427,84 @@ func TestQuarantinedDonorKeepsItsSite(t *testing.T) {
 	}
 }
 
+// A pinned flow (host pin or app pin) follows its benched donor past the
+// follow window: stability over everything short of removal. An unpinned
+// flow of the same group scatters at the same moment -- the window still
+// governs everyone else.
+func TestPinnedFlowFollowsBenchWithoutWindow(t *testing.T) {
+	parent := bindFlowTestParent()
+	parent.ip4PathUpdates = map[Ip4Path]*multiClientChannelUpdate{}
+	donor := bindFlowTestChannel(parent)
+
+	flowPath := &IpPath{
+		Version:         4,
+		Protocol:        IpProtocolTcp,
+		SourceIp:        net.IPv4(10, 0, 0, 5),
+		SourcePort:      44000,
+		DestinationIp:   net.IPv4(203, 0, 113, 40),
+		DestinationPort: 443,
+	}
+	flowUpdate := &multiClientChannelUpdate{}
+	flowUpdate.client.Store(donor)
+	ip4 := flowPath.ToIp4Path()
+	parent.ip4PathUpdates[ip4] = flowUpdate
+	donorPaths := map[Ip4Path]time.Time{ip4: time.Now()}
+
+	// a bench well past the 45s follow window
+	donor.setQuarantined(blackholeNoReceiveAck)
+	donor.stateLock.Lock()
+	donor.quarantineStart = time.Now().Add(-2 * parent.settings.GroupFollowWindow)
+	donor.stateLock.Unlock()
+
+	unpinned := &multiClientChannelUpdate{}
+	parent.stateLock.Lock()
+	verdict, _ := parent.inheritAffinityClient4WithLock(unpinned, donorPaths)
+	parent.stateLock.Unlock()
+	if unpinned.client.Load() != nil || verdict == donorQuarantineFollowed {
+		t.Error("an unpinned flow followed an aged bench: the window no longer governs")
+	}
+
+	pinnedFlow := &multiClientChannelUpdate{pinned: true}
+	parent.stateLock.Lock()
+	verdict, _ = parent.inheritAffinityClient4WithLock(pinnedFlow, donorPaths)
+	parent.stateLock.Unlock()
+	if pinnedFlow.client.Load() != donor || verdict != donorQuarantineFollowed {
+		t.Error("a pinned flow scattered off an aged bench: the pin does not hold")
+	}
+
+	// but a WARNED donor refuses a pinned flow too: a pin is not a license
+	// to board a retiring or unhealthy exit
+	donor.setWarning(true, warnUnhealthy)
+	refused := &multiClientChannelUpdate{pinned: true}
+	parent.stateLock.Lock()
+	verdict, _ = parent.inheritAffinityClient4WithLock(refused, donorPaths)
+	parent.stateLock.Unlock()
+	if refused.client.Load() != nil {
+		t.Error("a pinned flow boarded a warned donor")
+	}
+}
+
+// The app pin's group formation is the mechanism that puts an app's api
+// session and all of its cdn destinations on one exit: both sendUpdate
+// versions must join the app-scoped group, and the group name's prefix must
+// keep it out of the eTLD+1 namespace.
+func TestAppPinJoinsAppGroup(t *testing.T) {
+	source, err := readSource("ip_remote_multi_client.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, ok := functionBody(source, "func (self *RemoteUserNatMultiClient) sendUpdate(")
+	if !ok {
+		t.Fatal("could not find sendUpdate")
+	}
+	if got := strings.Count(body, `ServerName: "app:" + pin.appId`); got < 2 {
+		t.Errorf("the app group is joined in %d ip version(s), want 2: an app pin that only holds v4 splits the app on v6", got)
+	}
+	if !strings.Contains(body, "update.pinned = pin.pinned()") {
+		t.Error("sendUpdate does not mark pinned flows; the inherit path cannot honor the pin")
+	}
+}
+
 // G-3's drain-time migration: established quic moves to a live replacement
 // with its bookkeeping, tcp STAYS ALIVE on the draining exit (split-tcp: the
 // exit holds the remote end, moving it would break it), and nothing is ever
