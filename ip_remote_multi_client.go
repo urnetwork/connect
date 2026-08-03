@@ -2966,10 +2966,15 @@ func (self *RemoteUserNatMultiClient) migrateClientFlows(client *multiClientChan
 		}
 
 		rebindable := []*multiClientChannelUpdate{}
+		// pointing counts entries whose flow genuinely still rides this exit;
+		// stale entries (already re-raced away, or mid-re-race nil) belong to
+		// nobody's remaining count and are cleaned up by the send path
+		pointing := 0
 		for update := range updates {
 			if update.client.Load() != client {
 				continue
 			}
+			pointing += 1
 			// removeClient's partition: established quic moves; everything
 			// else stays -- here, stays ALIVE on the draining exit
 			if 0 < len(candidates) &&
@@ -2979,39 +2984,45 @@ func (self *RemoteUserNatMultiClient) migrateClientFlows(client *multiClientChan
 				rebindable = append(rebindable, update)
 			}
 		}
-		remaining = len(updates) - len(rebindable)
 		if len(rebindable) == 0 || len(candidates) == 0 {
-			remaining = len(updates)
+			remaining = pointing
 			return
 		}
 
-		var unplaced []*multiClientChannelUpdate
-		reboundFlows, replacements, unplaced = self.rebindFlowsWithLock(client, rebindable, candidates)
+		reboundFlows, replacements, _ = self.rebindFlowsWithLock(client, rebindable, candidates)
 		// unlike the removal, unplaced flows are NOT torn down: they stay
 		// registered on the alive exit and keep working
-		remaining += len(unplaced)
 
 		// the moved flows leave the draining exit's book, so the cap, the
 		// flowless check, and the eventual close's teardown all see the
 		// truth. rebindFlowsWithLock stored the replacement into each moved
 		// update's client, so "moved" is exactly "no longer points here" --
 		// the same catch-up bindClientFlow performs on the send path,
-		// inlined because bindClientFlow takes this lock.
+		// inlined because bindClientFlow takes this lock. After the sweep,
+		// the book holds exactly the flows still riding this exit, which is
+		// the honest remaining count (the pre-sweep subtraction counted
+		// stale entries as stayers; review finding, 2026-08-03).
 		for update := range updates {
 			if update.client.Load() != client {
 				delete(updates, update)
 			}
 		}
+		remaining = len(updates)
 		if len(updates) == 0 {
 			delete(self.clientUpdates, client)
 		}
 	}()
 	rebound = len(reboundFlows)
 
-	// recorded outside stateLock, same as the removal path: the tracker
-	// classifies each move by whether the destination keeps answering the
-	// same local port (migration accepted) or a new one (the app re-dialed)
-	self.reliabilityMetrics.exitLostRebound(reboundFlows)
+	// The recovery tracker is deliberately NOT armed here, unlike the
+	// removal path. Its entries close on the next provider-originated
+	// ingress for the destination -- and after a migration the OLD exit is
+	// still alive and still delivering until the server validates the new
+	// path, so every entry would close milliseconds later as a fake ~0s
+	// "recovery" and a fake rebindsAccepted, systematically corrupting the
+	// two headline metrics this program is judged by (review finding,
+	// 2026-08-03 -- the shipped-metric-measures-the-wrong-thing class). The
+	// [rel] migrate line below is this mechanism's field signal.
 
 	if 0 < rebound {
 		loggerOrDefault(self.log).Infof("%s\n", relEvent(

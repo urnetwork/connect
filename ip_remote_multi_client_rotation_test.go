@@ -312,8 +312,18 @@ func TestDrainBranchWarnsUnconditionally(t *testing.T) {
 	// retirement stays a deadline teardown
 	drainAt := strings.Index(body, `printStats("client drain")`)
 	rest := body[drainAt:]
-	if !strings.Contains(rest[:strings.Index(rest, "} else")], "markDrainMigrateOnce()") {
-		t.Error("the drain branch does not run the once-latched migration: retirement tears down movable flows at the deadline instead of handing them off")
+	drainBranch := rest[:strings.Index(rest, "} else")]
+	if !strings.Contains(drainBranch, "markDrainMigrateOnce()") {
+		t.Error("the drain branch does not latch the migration: retirement would migrate every resize pass, or never")
+	}
+	if !strings.Contains(drainBranch, "self.clientMigrateFunc(client)") {
+		t.Error("the drain branch does not call the migration seam: retirement tears down movable flows at the deadline instead of handing them off")
+	}
+	// and the seam is actually WIRED by the parent for both windows -- a
+	// correct-but-unwired seam is the failure mode this suite pins against,
+	// and deleting the two wiring lines would otherwise fail no test
+	if got := strings.Count(source, "clientMigrateFunc = multiClient.migrateClientFlows"); got < 2 {
+		t.Errorf("the migration seam is wired %d time(s), want 2 (quality and speed windows): an unwired seam makes every drain a deadline teardown again", got)
 	}
 	if got := nextWarningCall(`printStats("client health warning")`); got != "setWarning(remove, warnUnhealthy)" {
 		t.Errorf("the health-warning branch warns with %q, want the rank-derived setWarning(remove, warnUnhealthy)", got)
