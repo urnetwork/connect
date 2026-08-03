@@ -472,6 +472,24 @@ func TestPinnedFlowFollowsBenchWithoutWindow(t *testing.T) {
 		t.Error("a pinned flow scattered off an aged bench: the pin does not hold")
 	}
 
+	// but the pin's window is BOUNDED: past it, even a pinned flow scatters,
+	// so a failing exit can finally drain, execute, and be replaced
+	donor.stateLock.Lock()
+	donor.quarantineStart = time.Now().Add(-2 * pinnedFollowWindow(parent.settings.GroupFollowWindow))
+	donor.stateLock.Unlock()
+	longBenched := &multiClientChannelUpdate{pinned: true}
+	parent.stateLock.Lock()
+	verdict, _ = parent.inheritAffinityClient4WithLock(longBenched, donorPaths)
+	parent.stateLock.Unlock()
+	if longBenched.client.Load() != nil {
+		t.Error("a pinned flow followed a bench past even the pinned window: the exit can never drain")
+	}
+
+	// restore the fresh-enough bench for the warned-donor check below
+	donor.stateLock.Lock()
+	donor.quarantineStart = time.Now()
+	donor.stateLock.Unlock()
+
 	// but a WARNED donor refuses a pinned flow too: a pin is not a license
 	// to board a retiring or unhealthy exit
 	donor.setWarning(true, warnUnhealthy)
@@ -486,8 +504,10 @@ func TestPinnedFlowFollowsBenchWithoutWindow(t *testing.T) {
 
 // The app pin's group formation is the mechanism that puts an app's api
 // session and all of its cdn destinations on one exit: both sendUpdate
-// versions must join the app-scoped group, and the group name's prefix must
-// keep it out of the eTLD+1 namespace.
+// versions must place the flow in the app-scoped group, and both must
+// consult the cross-version donor -- the affinity maps are per-ip-version,
+// so without that a dual-stack app takes one exit per version, which is the
+// two egress ips pinning exists to prevent.
 func TestAppPinJoinsAppGroup(t *testing.T) {
 	source, err := readSource("ip_remote_multi_client.go")
 	if err != nil {
@@ -497,11 +517,42 @@ func TestAppPinJoinsAppGroup(t *testing.T) {
 	if !ok {
 		t.Fatal("could not find sendUpdate")
 	}
-	if got := strings.Count(body, `ServerName: "app:" + pin.appId`); got < 2 {
-		t.Errorf("the app group is joined in %d ip version(s), want 2: an app pin that only holds v4 splits the app on v6", got)
+	if got := strings.Count(body, `ServerName: appAffinityName(pin.appId)`); got < 2 {
+		t.Errorf("the app group is joined in %d ip version(s), want 2", got)
+	}
+	if got := strings.Count(body, "self.appPinDonorWithLock("); got < 2 {
+		t.Errorf("the cross-version app donor is consulted in %d ip version(s), want 2: a dual-stack pinned app splits across two exits", got)
+	}
+	if got := strings.Count(body, "self.recordAppPinWithLock("); got < 2 {
+		t.Errorf("the app placement is recorded in %d ip version(s), want 2", got)
 	}
 	if !strings.Contains(body, "update.pinned = pin.pinned()") {
 		t.Error("sendUpdate does not mark pinned flows; the inherit path cannot honor the pin")
+	}
+	// the app group REPLACES the domain groups: a pinned flow that also
+	// joined youtube.com would donate its app-chosen exit to unrelated
+	// youtube traffic
+	if strings.Contains(body, "append([]*IpPath{{ServerName: appAffinityName") {
+		t.Error("the app group is prepended to the domain groups instead of replacing them: a pinned flow contaminates every domain group it joins")
+	}
+}
+
+// The pinned follow window is bounded. Unbounded following is
+// self-defeating: a soft verdict only executes against a FLOWLESS exit and a
+// quarantine only lifts on one, so an endless stream of pinned flows keeps a
+// failing exit both un-executed and un-released.
+func TestPinnedFollowWindowIsBounded(t *testing.T) {
+	base := 45 * time.Second
+	got := pinnedFollowWindow(base)
+	if got <= base {
+		t.Errorf("pinned window %v does not exceed the ordinary window %v", got, base)
+	}
+	if 10*time.Minute < got {
+		t.Errorf("pinned window %v is long enough to keep a failing exit alive indefinitely", got)
+	}
+	// follow disabled stays disabled
+	if got := pinnedFollowWindow(0); got != 0 {
+		t.Errorf("a disabled follow scaled to %v, want 0", got)
 	}
 }
 

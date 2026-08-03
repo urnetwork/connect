@@ -1045,10 +1045,22 @@ type RemoteUserNatMultiClient struct {
 	// the G-4b flow-owner seam: the platform's resolver for "which pinned
 	// app owns this flow", with its per-flow-key answer cache. Zero values
 	// are fully inert (nil func = no app pinning), so no constructor wiring
-	// is required and bare fixtures are unaffected.
-	flowOwnerFunc      atomic.Pointer[FlowOwnerLookupFunc]
-	flowOwnerCache     sync.Map
-	flowOwnerCacheSize atomic.Int64
+	// is required and bare fixtures are unaffected. flowOwnerLock guards the
+	// two maps only -- it is NEVER held across the resolver call, and it is
+	// a leaf: nothing else is taken under it.
+	flowOwnerFunc       atomic.Pointer[FlowOwnerLookupFunc]
+	flowOwnerGeneration atomic.Uint64
+	flowOwnerLock       sync.Mutex
+	flowOwner4          map[Ip4Path]flowOwnerEntry
+	flowOwner6          map[Ip6Path]flowOwnerEntry
+	// appPinClients is the cross-version half of an app pin: the exit an
+	// app's flows are currently placed on, keyed by app id. The affinity
+	// groups are per-ip-version by construction (separate path maps), so a
+	// dual-stack app would otherwise land one exit for v4 and another for
+	// v6 -- two egress ips, the exact failure pinning exists to prevent.
+	// Consulted when the version's own app group has no donor. Guarded by
+	// the parent stateLock.
+	appPinClients map[string]*multiClientChannel
 	blockActionCollector *blockActionCollector
 	// immutable snapshot of the compiled ignore host values,
 	// swapped by `SetBlockActionIgnoreHosts`
@@ -1151,77 +1163,172 @@ type multiClientConfig struct {
 // ConnectivityManager.getConnectionOwnerUid binder call).
 type FlowOwnerLookupFunc func(ipPath *IpPath) string
 
-// flowOwnerEntry is one cached lookup answer.
+// flowOwnerEntry is one cached lookup answer, tagged with the lookup
+// generation that produced it so an answer landing after a rule change (the
+// resolver runs unlocked) cannot resurrect a removed pin.
 type flowOwnerEntry struct {
-	appId  string
-	expire time.Time
+	appId      string
+	generation uint64
 }
 
-const (
-	// flowOwnerCacheTtl bounds how long a flow-key's owner answer is reused.
-	// Source ports recycle, so a stale entry can mis-pin a NEW flow that
-	// reuses a recently-dead flow's key -- five minutes keeps the platform
-	// call off the steady-state path while bounding that window well below
-	// the kernel's port-reuse pace under real load.
-	flowOwnerCacheTtl = 5 * time.Minute
-	// flowOwnerCacheMaxCount is a crude wholesale-reset bound (the count
-	// includes refreshes, so it is approximate on purpose): the cache must
-	// never become the memory story of a long session.
-	flowOwnerCacheMaxCount = 8192
-)
+// flowOwnerCacheMaxCount bounds the cache. Entries are never refreshed (see
+// flowOwnerAppId), so this counts distinct flow keys seen since the last
+// reset, and the reset is wholesale -- the cache must never become the
+// memory story of a long session, and a precise LRU would cost more than the
+// lookup it protects.
+const flowOwnerCacheMaxCount = 8192
 
 // SetFlowOwnerLookup installs (or, with nil, removes) the platform's
-// flow-owner resolver. Safe at runtime; the cache is dropped so a changed
-// pin-rule set takes effect on the next packet of every flow key.
+// flow-owner resolver. Safe at runtime: the generation bump invalidates every
+// cached answer, including any in flight, so a changed pin-rule set takes
+// effect on the next new flow.
 func (self *RemoteUserNatMultiClient) SetFlowOwnerLookup(lookup FlowOwnerLookupFunc) {
+	self.flowOwnerLock.Lock()
+	defer self.flowOwnerLock.Unlock()
+
 	if lookup == nil {
 		self.flowOwnerFunc.Store(nil)
 	} else {
 		self.flowOwnerFunc.Store(&lookup)
 	}
-	self.flowOwnerCache.Range(func(k, _ any) bool {
-		self.flowOwnerCache.Delete(k)
-		return true
-	})
-	self.flowOwnerCacheSize.Store(0)
+	self.flowOwnerGeneration.Add(1)
+	self.flowOwner4 = map[Ip4Path]flowOwnerEntry{}
+	self.flowOwner6 = map[Ip6Path]flowOwnerEntry{}
 }
 
-// flowOwnerAppId answers "which pinned app owns this flow", from the cache
-// when fresh, else from the platform lookup. Runs on the egress path OUTSIDE
-// every lock, which is what makes the platform crossing affordable.
+// flowOwnerAppId answers "which pinned app owns this flow" -- from the cache
+// when the key has been seen, else from the platform lookup.
+//
+// Runs on the egress path OUTSIDE every lock (the resolver crosses into
+// platform code; on android that is a binder round trip), and the answer is
+// consumed only at flow CREATION. Two consequences shape this:
+//
+//   - a cached answer is never refreshed. The answer's only consumer is the
+//     flow that does not exist yet, so re-asking for a long-lived flow would
+//     burn a platform call per key per ttl and discard every result. Entries
+//     live until the wholesale reset.
+//   - the lookup is only reached when a resolver is installed, which the
+//     platform does only while at least one app is pinned. A user who pins
+//     nothing pays nothing.
+//
+// Typed maps rather than sync.Map: the keys are comparable structs, and
+// boxing one into `any` would allocate on the per-packet path this file
+// otherwise keeps allocation-free.
 func (self *RemoteUserNatMultiClient) flowOwnerAppId(ipPath *IpPath, lookup FlowOwnerLookupFunc) string {
-	var key any
+	generation := self.flowOwnerGeneration.Load()
+
+	var ip4Key Ip4Path
+	var ip6Key Ip6Path
 	switch ipPath.Version {
 	case 4:
-		key = ipPath.ToIp4Path()
+		ip4Key = ipPath.ToIp4Path()
 	case 6:
-		key = ipPath.ToIp6Path()
+		ip6Key = ipPath.ToIp6Path()
 	default:
 		return ""
 	}
-	now := time.Now()
-	if v, ok := self.flowOwnerCache.Load(key); ok {
-		entry := v.(flowOwnerEntry)
-		if now.Before(entry.expire) {
-			return entry.appId
+
+	if appId, ok := func() (string, bool) {
+		self.flowOwnerLock.Lock()
+		defer self.flowOwnerLock.Unlock()
+		var entry flowOwnerEntry
+		var ok bool
+		if ipPath.Version == 4 {
+			entry, ok = self.flowOwner4[ip4Key]
+		} else {
+			entry, ok = self.flowOwner6[ip6Key]
 		}
+		return entry.appId, ok && entry.generation == generation
+	}(); ok {
+		return appId
 	}
+
+	// unlocked: the resolver may block (binder), and holding a lock across it
+	// would put every other flow behind it
 	appId := lookup(ipPath)
-	if flowOwnerCacheMaxCount < self.flowOwnerCacheSize.Add(1) {
-		self.flowOwnerCache.Range(func(k, _ any) bool {
-			self.flowOwnerCache.Delete(k)
-			return true
-		})
-		self.flowOwnerCacheSize.Store(1)
+
+	self.flowOwnerLock.Lock()
+	defer self.flowOwnerLock.Unlock()
+	if generation != self.flowOwnerGeneration.Load() {
+		// the rules changed while this answer was in flight: it describes a
+		// pin set that no longer exists, so it is dropped rather than cached
+		return ""
 	}
-	self.flowOwnerCache.Store(key, flowOwnerEntry{appId: appId, expire: now.Add(flowOwnerCacheTtl)})
+	if flowOwnerCacheMaxCount <= len(self.flowOwner4)+len(self.flowOwner6) {
+		self.flowOwner4 = map[Ip4Path]flowOwnerEntry{}
+		self.flowOwner6 = map[Ip6Path]flowOwnerEntry{}
+	}
+	entry := flowOwnerEntry{appId: appId, generation: generation}
+	if ipPath.Version == 4 {
+		self.flowOwner4[ip4Key] = entry
+	} else {
+		self.flowOwner6[ip6Key] = entry
+	}
 	return appId
 }
 
-// pinnedFollowWindow is the follow window a pinned flow's inheritance uses:
-// effectively the whole bench, every bench. Not literally infinite so a
-// clock-skew pathology cannot make the comparison overflow-weird.
-const pinnedFollowWindow = 24 * time.Hour
+// pinnedFollowWindowMultiple scales the ordinary GroupFollowWindow for a
+// pinned flow: a pin asks for stability through a bench episode, not through
+// an exit's whole decline. Unbounded following would be self-defeating --
+// verdictAction only executes a soft verdict against a FLOWLESS exit and
+// quarantineVacated only releases one, so an endless stream of pinned flows
+// keeps a benched exit both un-executed and un-released (review finding,
+// 2026-08-03). 3x outlives the false-positive benches the follow exists for
+// while still letting a genuinely failing exit drain.
+const pinnedFollowWindowMultiple = 3
+
+// appAffinityName is the affinity group name for a pinned app. The "app:"
+// prefix cannot collide with an eTLD+1 -- ':' is not legal in a domain.
+func appAffinityName(appId string) string {
+	return "app:" + appId
+}
+
+// pinnedFollowWindow scales the configured window for pinned flows; a
+// non-positive configured window still means "follow disabled".
+func pinnedFollowWindow(window time.Duration) time.Duration {
+	if window <= 0 {
+		return 0
+	}
+	return pinnedFollowWindowMultiple * window
+}
+
+// appPinDonorWithLock is the cross-version half of an app pin: the exit the
+// app's flows are currently on, whichever ip version placed them. Returns nil
+// when the app has no placement or the placement is no longer donatable.
+//
+// called with stateLock
+func (self *RemoteUserNatMultiClient) appPinDonorWithLock(appId string, follow bool, window time.Duration) *multiClientChannel {
+	if appId == "" || self.appPinClients == nil {
+		return nil
+	}
+	client := self.appPinClients[appId]
+	if client == nil {
+		return nil
+	}
+	if client.IsDone() {
+		delete(self.appPinClients, appId)
+		return nil
+	}
+	switch client.affinityDonorEligible(follow, window) {
+	case donorEligible, donorQuarantineFollowed:
+		return client
+	}
+	return nil
+}
+
+// recordAppPinWithLock remembers where an app's flows are placed, so the
+// other ip version converges on the same exit.
+//
+// called with stateLock
+func (self *RemoteUserNatMultiClient) recordAppPinWithLock(appId string, client *multiClientChannel) {
+	if appId == "" || client == nil {
+		return
+	}
+	if self.appPinClients == nil {
+		self.appPinClients = map[string]*multiClientChannel{}
+	}
+	self.appPinClients[appId] = client
+}
 
 func NewRemoteUserNatMultiClientWithDefaults(
 	ctx context.Context,
@@ -2201,12 +2308,13 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *mul
 	follow := reliabilitySettings.QuarantineGroupFollow
 	window := reliabilitySettings.GroupFollowWindow
 	if update.pinned {
-		// a pinned flow chose stability over everything short of removal:
-		// its group follows a benched donor for the whole episode, not just
-		// the follow window. Warned donors still refuse -- a pin is not a
-		// license to board a retiring or unhealthy exit.
+		// a pinned flow chose stability: its group follows a benched donor
+		// for a multiple of the ordinary window (see pinnedFollowWindow --
+		// bounded on purpose, so a pinned app cannot keep a failing exit
+		// both un-executed and un-released). Warned donors still refuse -- a
+		// pin is not a license to board a retiring or unhealthy exit.
 		follow = true
-		window = pinnedFollowWindow
+		window = pinnedFollowWindow(window)
 	}
 	var mostRecentCreateTime time.Time
 	winnerVerdict, scattered := donorRefused, false
@@ -2241,7 +2349,7 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient6WithLock(update *mul
 	window := reliabilitySettings.GroupFollowWindow
 	if update.pinned {
 		follow = true
-		window = pinnedFollowWindow
+		window = pinnedFollowWindow(window)
 	}
 	var mostRecentCreateTime time.Time
 	winnerVerdict, scattered := donorRefused, false
@@ -2601,17 +2709,21 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 			if self.settings.DestinationAffinity {
 				affinityIpPaths = self.affinityIpPathsWithLock(ipPath)
 			}
-			// the G-4b pin. A pinned app's flows ALL join one app-scoped
-			// affinity group in addition to their domain groups, so the
-			// app's api session and every one of its cdn destinations
-			// converge on one exit -- one egress ip for the whole app,
-			// with no domain knowledge required. The group name's "app:"
+			// the G-4b pin. A pinned app's flows join ONE app-scoped
+			// affinity group INSTEAD of their domain groups, so the app's
+			// api session and every one of its cdn destinations converge on
+			// one exit -- one egress ip for the whole app, with no domain
+			// knowledge required. Replacing rather than adding is
+			// load-bearing: a pinned flow that also joined youtube.com
+			// would donate its app-chosen exit to unrelated youtube flows,
+			// dragging traffic that has nothing to do with the pin onto the
+			// pinned app's exit (review finding, 2026-08-03). The "app:"
 			// prefix cannot collide with an eTLD+1. update.pinned
 			// additionally exempts the flow's inheritance from the bench
 			// follow window (see inheritAffinityClient4WithLock).
 			update.pinned = pin.pinned()
 			if pin.appId != "" {
-				affinityIpPaths = append([]*IpPath{{ServerName: "app:" + pin.appId}}, affinityIpPaths...)
+				affinityIpPaths = []*IpPath{{ServerName: appAffinityName(pin.appId)}}
 			}
 
 			followWinner, sawScatter := false, false
@@ -2652,6 +2764,25 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 						}
 					}
 				}
+			}
+			// the app pin's cross-version convergence: the ip4 and ip6
+			// affinity groups are separate maps, so a dual-stack pinned app
+			// would otherwise take one exit per version -- two egress ips,
+			// the failure pinning exists to prevent. Consulted only after
+			// this version's own group came up empty, and recorded so the
+			// other version follows.
+			if pin.appId != "" {
+				if update.client.Load() == nil {
+					reliabilitySettings := self.reliabilitySettings()
+					if donor := self.appPinDonorWithLock(
+						pin.appId,
+						true,
+						pinnedFollowWindow(reliabilitySettings.GroupFollowWindow),
+					); donor != nil {
+						update.client.Store(donor)
+					}
+				}
+				self.recordAppPinWithLock(pin.appId, update.client.Load())
 			}
 			// one ledger event per flow, from the aggregate of every inherit
 			// attempt above
@@ -2734,7 +2865,7 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 			// see the v4 twin for the pin rationale
 			update.pinned = pin.pinned()
 			if pin.appId != "" {
-				affinityIpPaths = append([]*IpPath{{ServerName: "app:" + pin.appId}}, affinityIpPaths...)
+				affinityIpPaths = []*IpPath{{ServerName: appAffinityName(pin.appId)}}
 			}
 
 			followWinner, sawScatter := false, false
@@ -2775,6 +2906,20 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 						}
 					}
 				}
+			}
+			// see the v4 twin: the app pin converges across ip versions
+			if pin.appId != "" {
+				if update.client.Load() == nil {
+					reliabilitySettings := self.reliabilitySettings()
+					if donor := self.appPinDonorWithLock(
+						pin.appId,
+						true,
+						pinnedFollowWindow(reliabilitySettings.GroupFollowWindow),
+					); donor != nil {
+						update.client.Store(donor)
+					}
+				}
+				self.recordAppPinWithLock(pin.appId, update.client.Load())
 			}
 			// one ledger event per flow, from the aggregate of every inherit
 			// attempt above
