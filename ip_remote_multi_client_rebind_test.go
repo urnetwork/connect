@@ -193,10 +193,13 @@ func TestRebindEstablishedQuicFlowMovesToCandidate(t *testing.T) {
 	}
 }
 
-// A candidate at the flow cap is not a replacement, and with no usable
-// candidate the flow falls back to exactly the old behavior: nil-stored and
-// torn down with its signal -- never silently unpinned.
-func TestRebindRespectsFlowCapFallsBackToTeardown(t *testing.T) {
+// The cap is consulted FIRST but is not a licence to destroy: a flow with no
+// under-cap candidate is placed over the cap on the last-resort pass rather
+// than torn down. Sticky affinity deliberately grows a heavy site past the
+// cap, so the biggest groups are exactly the ones no candidate has headroom
+// for -- and tearing those down is the failure the whole affinity line
+// exists to prevent (review finding, 2026-08-03).
+func TestRebindOverCapRatherThanTeardown(t *testing.T) {
 	settings := DefaultMultiClientSettings()
 	settings.MaxFlowsPerExit = 1
 	fullCandidate := rebindTestCandidate(settings)
@@ -210,38 +213,37 @@ func TestRebindRespectsFlowCapFallsBackToTeardown(t *testing.T) {
 
 	parent.removeClient(dying)
 
-	if flow.client.Load() != nil {
-		t.Fatal("flow was rebound onto a candidate at the flow cap")
+	if flow.client.Load() != fullCandidate {
+		t.Fatal("a flow with no under-cap candidate was torn down instead of placed over the cap")
 	}
-	if got := rebindFlowCount(parent, fullCandidate); got != 1 {
-		t.Errorf("cap-full candidate flow count = %d, want 1 (unchanged)", got)
+	if got := rebindFlowCount(parent, fullCandidate); got != 2 {
+		t.Errorf("candidate flow count = %d, want 2 (over the cap of 1)", got)
 	}
-	if n := len(*forwarded); n != 1 {
-		t.Errorf("forwarded %d packet(s), want 1: the fallback teardown must still signal", n)
+	if n := len(*forwarded); n != 0 {
+		t.Errorf("forwarded %d packet(s), want 0: nothing was torn down", n)
 	}
-	if got := parent.reliabilityMetrics.flowsRebound.Load(); got != 0 {
-		t.Errorf("flowsRebound = %d, want 0", got)
+	if got := parent.reliabilityMetrics.flowsRebound.Load(); got != 1 {
+		t.Errorf("flowsRebound = %d, want 1", got)
 	}
 }
 
-// Done and warning candidates are re-validated away at assignment time even
+// Done and dying candidates are re-validated away at assignment time even
 // though the gathered list offered them -- the list is pre-lock and may be
-// stale. The dying client itself is likewise never its own replacement.
-func TestRebindSkipsDoneWarningAndDyingCandidates(t *testing.T) {
+// stale, and neither can carry a flow. This holds on the last-resort pass
+// too: "better than a teardown" admits SOFT states (warned, quarantined,
+// over-cap), never a dead channel.
+func TestRebindNeverUsesDoneOrDyingCandidates(t *testing.T) {
 	settings := DefaultMultiClientSettings()
 
 	doneCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 	doneCandidate := &multiClientChannel{ctx: doneCtx, settings: settings}
 
-	warningCandidate := rebindTestCandidate(settings)
-	warningCandidate.setWarning(true, warnUnhealthy)
-
 	parent, dying, forwarded, _ := rebindTestParent(t, true, nil)
-	// the dying client offered as its own replacement, plus a done and a
-	// warned candidate: none usable
+	// the dying client offered as its own replacement, plus a done one:
+	// neither is usable at any tier
 	parent.rebindCandidatesFunc = func(d *multiClientChannel) []*multiClientChannel {
-		return []*multiClientChannel{dying, doneCandidate, warningCandidate}
+		return []*multiClientChannel{dying, doneCandidate}
 	}
 
 	flow := rebindTestFlow(parent, dying, rebindUdp443Path(30, 42001), true)
@@ -249,13 +251,45 @@ func TestRebindSkipsDoneWarningAndDyingCandidates(t *testing.T) {
 	parent.removeClient(dying)
 
 	if flow.client.Load() != nil {
-		t.Fatal("flow was rebound onto an unusable candidate")
+		t.Fatal("flow was rebound onto a done or dying candidate")
 	}
 	if n := len(*forwarded); n != 1 {
 		t.Errorf("forwarded %d packet(s), want 1 (fallback teardown)", n)
 	}
 	if got := parent.reliabilityMetrics.flowsRebound.Load(); got != 0 {
 		t.Errorf("flowsRebound = %d, want 0", got)
+	}
+}
+
+// A WARNED (benched) candidate is soft-suspect but alive, and the strict
+// pass rightly prefers anything else -- but when it is all there is, the
+// flow rides it instead of dying. This is what makes rebindCandidates'
+// benched fallback reachable at all: that fallback only ever yields warned
+// exits, so a strict !isWarning() test rejected every one of them and the
+// fallback could never place a single flow.
+func TestRebindUsesWarnedCandidateAsLastResort(t *testing.T) {
+	settings := DefaultMultiClientSettings()
+
+	warningCandidate := rebindTestCandidate(settings)
+	warningCandidate.setWarning(true, warnUnhealthy)
+
+	parent, dying, forwarded, _ := rebindTestParent(t, true, nil)
+	parent.rebindCandidatesFunc = func(d *multiClientChannel) []*multiClientChannel {
+		return []*multiClientChannel{warningCandidate}
+	}
+
+	flow := rebindTestFlow(parent, dying, rebindUdp443Path(31, 42101), true)
+
+	parent.removeClient(dying)
+
+	if flow.client.Load() != warningCandidate {
+		t.Fatal("a flow was torn down while a live benched exit was available")
+	}
+	if n := len(*forwarded); n != 0 {
+		t.Errorf("forwarded %d packet(s), want 0: nothing was torn down", n)
+	}
+	if got := parent.reliabilityMetrics.flowsRebound.Load(); got != 1 {
+		t.Errorf("flowsRebound = %d, want 1", got)
 	}
 }
 

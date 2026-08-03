@@ -51,6 +51,7 @@ func TestMultiClientChannelPqe(t *testing.T) {
 			nil,
 			nil,
 			nil,
+			nil,
 		)
 		// the recording generator fails creation after settings are applied
 		AssertEqual(t, true, err != nil)

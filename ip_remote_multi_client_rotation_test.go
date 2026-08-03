@@ -316,7 +316,7 @@ func TestDrainBranchWarnsUnconditionally(t *testing.T) {
 	if !strings.Contains(drainBranch, "markDrainMigrateOnce()") {
 		t.Error("the drain branch does not latch the migration: retirement would migrate every resize pass, or never")
 	}
-	if !strings.Contains(drainBranch, "self.clientMigrateFunc(client)") {
+	if !strings.Contains(drainBranch, "self.clientMigrateFunc(client, \"drain\")") {
 		t.Error("the drain branch does not call the migration seam: retirement tears down movable flows at the deadline instead of handing them off")
 	}
 	// and the seam is actually WIRED by the parent for both windows -- a

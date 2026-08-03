@@ -3302,7 +3302,7 @@ func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 // Returns flows moved, replacement exits used, and flows that remain --
 // deliberately (tcp) or for lack of headroom, indistinguishable here and
 // equally fine, since they keep working.
-func (self *RemoteUserNatMultiClient) migrateClientFlows(client *multiClientChannel) (rebound int, replacements int, remaining int) {
+func (self *RemoteUserNatMultiClient) migrateClientFlows(client *multiClientChannel, cause string) (rebound int, replacements int, remaining int) {
 	if client == nil {
 		return
 	}
@@ -3314,6 +3314,7 @@ func (self *RemoteUserNatMultiClient) migrateClientFlows(client *multiClientChan
 	}
 
 	var reboundFlows []reboundFlow
+	movable := 0
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -3347,6 +3348,7 @@ func (self *RemoteUserNatMultiClient) migrateClientFlows(client *multiClientChan
 			return
 		}
 
+		movable = len(rebindable)
 		reboundFlows, replacements, _ = self.rebindFlowsWithLock(client, rebindable, candidates)
 		// unlike the removal, unplaced flows are NOT torn down: they stay
 		// registered on the alive exit and keep working
@@ -3382,15 +3384,24 @@ func (self *RemoteUserNatMultiClient) migrateClientFlows(client *multiClientChan
 	// 2026-08-03 -- the shipped-metric-measures-the-wrong-thing class). The
 	// [rel] migrate line below is this mechanism's field signal.
 
-	if 0 < rebound {
-		loggerOrDefault(self.log).Infof("%s\n", relEvent(
-			"migrate",
-			"exit", client.ClientId(),
-			"rebound", rebound,
-			"replacements", replacements,
-			"remaining", remaining,
-		))
-	}
+	// UNCONDITIONAL, and it names its cause. rebound=0 is the interesting
+	// case, not the boring one: it means the hand-off ran and moved nothing
+	// (all-tcp flows, no under-cap candidate, or QuicRebindOnExitLoss off),
+	// which is exactly the state behind "the exit was benched and my app
+	// still hung". Logging only successes made the mechanism unfalsifiable
+	// -- the shape of failure this project has shipped repeatedly (review
+	// finding, 2026-08-03).
+	loggerOrDefault(self.log).Infof("%s\n", relEvent(
+		"migrate",
+		"exit", client.ClientId(),
+		"cause", cause,
+		"rebound", rebound,
+		"replacements", replacements,
+		"remaining", remaining,
+		// why nothing moved, when nothing moved
+		"movable", movable,
+		"candidates", len(candidates),
+	))
 	return
 }
 
@@ -3404,7 +3415,7 @@ func (self *RemoteUserNatMultiClient) MigrateExit(clientId Id) int {
 	for _, window := range self.windows {
 		for _, client := range window.unorderedClients() {
 			if client.ClientId() == clientId {
-				rebound, _, _ := self.migrateClientFlows(client)
+				rebound, _, _ := self.migrateClientFlows(client, "action")
 				return rebound
 			}
 		}
@@ -3528,24 +3539,57 @@ func (self *RemoteUserNatMultiClient) rebindFlowsWithLock(
 
 	maxFlows := self.reliabilitySettings().MaxFlowsPerExit
 
-	// usable re-validates a candidate at assignment time: the gathered list
-	// is pre-lock and may be stale. the dying client can appear in its own
-	// candidate list only through an injected provider, but the guard costs
-	// nothing and the mistake would re-pin flows onto the exit being removed.
+	// A benched exit is better than no exit, and an over-cap exit is better
+	// than a teardown -- the same ladder raceCandidatesFrom already walks for
+	// placement, applied here.
+	//
+	// Both relaxations exist because the strict predicates below are
+	// self-defeating in exactly the states that produce mass teardowns
+	// (review finding, 2026-08-03):
+	//
+	//   - warned: rebindCandidates falls back to unorderedClients when every
+	//     window's ordered offer is empty -- but the offer is empty PRECISELY
+	//     because every live exit is warned, so every candidate the fallback
+	//     can add is warned, and a `!isWarning()` test rejects all of them.
+	//     The fallback could never place a single flow.
+	//   - capped: sticky affinity deliberately lets a heavy constellation
+	//     grow past MaxFlowsPerExit on one exit, so the LARGEST groups are
+	//     the ones no candidate has headroom for -- they were split across
+	//     exits (several egress ips for one site, which is the failure the
+	//     affinity work exists to prevent) or torn down entirely.
+	//
+	// The cap keeps its meaning for the ordinary case: it is consulted
+	// first, and only a group that cannot be placed under it falls through.
+	lastResort := false
 	usable := func(c *multiClientChannel) bool {
-		return c != dying && !c.IsDone() && !c.isWarning() && !self.clientAtFlowCapWithLock(c)
+		if c == dying || c.IsDone() {
+			return false
+		}
+		if lastResort {
+			// still never a DRAINING or unhealthy-warned exit's own
+			// death-in-progress: IsDone above covers that. Quarantine and
+			// warning are soft, and a soft-suspect live exit beats a
+			// guaranteed teardown.
+			return true
+		}
+		return !c.isWarning() && !self.clientAtFlowCapWithLock(c)
 	}
 	// headroom is how many more flows a candidate may take; negative means
-	// the cap is off. recomputed per read because assignments below grow
-	// clientUpdates as they go, which keeps the cap honest across groups.
+	// unbounded (the cap is off, or this is the last-resort pass where the
+	// alternative to over-filling is destroying the flows). recomputed per
+	// read because assignments below grow clientUpdates as they go, which
+	// keeps the cap honest across groups.
 	headroom := func(c *multiClientChannel) int {
-		if maxFlows <= 0 {
+		if maxFlows <= 0 || lastResort {
 			return -1
 		}
 		return maxFlows - len(self.clientUpdates[c])
 	}
 
 	usedReplacements := map[*multiClientChannel]bool{}
+	// which pinned apps have already had their canonical exit recorded by
+	// this rebind; see the record in assign
+	rebindRecordedPins := map[string]bool{}
 	assign := func(update *multiClientChannelUpdate, replacement *multiClientChannel) {
 		update.client.Store(replacement)
 		updates, ok := self.clientUpdates[replacement]
@@ -3558,10 +3602,19 @@ func (self *RemoteUserNatMultiClient) rebindFlowsWithLock(
 			usedReplacements[replacement] = true
 			replacementCount += 1
 		}
-		// a rebound pinned flow moves the app's canonical exit with it,
-		// so the other ip version converges on the replacement rather than
-		// chasing the dying exit
-		self.recordAppPinWithLock(update.pinAppId, replacement)
+		// a rebound pinned flow moves the app's canonical exit with it, so
+		// the other ip version converges on the replacement rather than
+		// chasing the dying exit. FIRST writer wins per app within one
+		// rebind: candidates are consumed in preference order, so a group
+		// split across several replacements would otherwise leave the app
+		// recorded on the LAST, least-preferred fragment (the one that took
+		// the smallest share) and pull every later flow of the app onto it
+		// -- splitting the app further, which is what the pin exists to
+		// prevent (review finding, 2026-08-03).
+		if update.pinAppId != "" && !rebindRecordedPins[update.pinAppId] {
+			rebindRecordedPins[update.pinAppId] = true
+			self.recordAppPinWithLock(update.pinAppId, replacement)
+		}
 		// the update's ipPath is egress-oriented: destination is the remote
 		// endpoint the tracker keys on, source port is the local port whose
 		// answer classifies the recovery
@@ -3671,6 +3724,38 @@ func (self *RemoteUserNatMultiClient) rebindFlowsWithLock(
 			continue
 		}
 		assign(update, best)
+	}
+
+	// the last-resort pass. Everything above ran under the strict
+	// predicates; whatever is still unplaced was about to be torn down (in
+	// removeClient) or abandoned on a dying exit. Re-run those flows with
+	// warned and over-cap candidates admitted, least-loaded first, because a
+	// soft-suspect or busy exit beats a destroyed connection. Affinity
+	// cohesion is deliberately not attempted here -- by this point the
+	// choice is placement or nothing.
+	if 0 < len(unplaced) {
+		lastResort = true
+		stillUnplaced := []*multiClientChannelUpdate{}
+		for _, update := range unplaced {
+			var best *multiClientChannel
+			bestCount := 0
+			for _, c := range candidates {
+				if !usable(c) {
+					continue
+				}
+				if count := len(self.clientUpdates[c]); best == nil || count < bestCount {
+					best = c
+					bestCount = count
+				}
+			}
+			if best == nil {
+				stillUnplaced = append(stillUnplaced, update)
+				continue
+			}
+			assign(update, best)
+		}
+		unplaced = stillUnplaced
+		lastResort = false
 	}
 
 	return
@@ -4059,11 +4144,26 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 				// sequence state is guarded by the per-flow `stateLock`
 				update.updateSequence(sendPacket)
 			} else if err != nil {
-				// reset the path
+				// reset the path.
+				//
+				// COMPARE-AND-SWAP, not a bare Store: `client` here is a
+				// snapshot taken under the parent lock inside sendUpdate,
+				// and that lock was released before this send ran. A
+				// migration or rebind can commit the flow to a REPLACEMENT
+				// in that window -- which is the ordinary case now that a
+				// bench migrates flows, since a wedged exit is exactly what
+				// benches -- and a bare Store(nil) would then undo a
+				// successful move, leave the flow booked under the
+				// replacement with a nil client (invisible to the idle
+				// reaper, which keys on update.client), and hand the app an
+				// RST for a flow that is alive somewhere else. The swap
+				// failing means someone already moved this flow: there is
+				// nothing to reset and nothing to tell the app.
+				if !update.client.CompareAndSwap(client, nil) {
+					return
+				}
 
 				self.log.Infof("[multi]reset error = %s\n", err)
-
-				update.client.Store(nil)
 
 				rstPackets := []*receivePacket{}
 
@@ -6008,7 +6108,7 @@ type multiClientWindow struct {
 	// behave exactly as it did before migration existed. The func takes the
 	// parent stateLock inside, so the same contract as flowCountFunc applies:
 	// call it with no window or channel lock held.
-	clientMigrateFunc func(*multiClientChannel) (rebound int, replacements int, remaining int)
+	clientMigrateFunc func(client *multiClientChannel, cause string) (rebound int, replacements int, remaining int)
 
 	clientChannelArgs chan *multiClientChannelArgs
 
@@ -6814,7 +6914,7 @@ func (self *multiClientWindow) resize() {
 						// classification loop, the same contract the
 						// removeClient call below relies on.
 						if self.clientMigrateFunc != nil && client.markDrainMigrateOnce() {
-							self.clientMigrateFunc(client)
+							self.clientMigrateFunc(client, "drain")
 						}
 					} else {
 						printStats("client ok")
@@ -6872,7 +6972,7 @@ func (self *multiClientWindow) resize() {
 							// moved. Gated with the drain migration on
 							// QuicRebindOnExitLoss.
 							if self.clientMigrateFunc != nil && client.markQuarantineMigrateOnce() {
-								self.clientMigrateFunc(client)
+								self.clientMigrateFunc(client, "bench")
 							}
 						} else {
 							client.setWarning(false, warnNone)
@@ -7383,6 +7483,14 @@ func (self *multiClientWindow) expand(
 				self.reliabilityMetricsFunc,
 				self.flowCountFunc,
 				func() { self.resizeMonitor.NotifyAll() },
+				// the bench hand-off routes through the window's own
+				// migrate seam, so a window with no parent wiring (bare
+				// fixtures) simply never migrates
+				func(client *multiClientChannel) {
+					if self.clientMigrateFunc != nil {
+						self.clientMigrateFunc(client, "bench")
+					}
+				},
 				self.providerQualifiedFunc,
 				self.receivingSiblingsFunc,
 				self.qualificationRefreshFunc,
@@ -8081,6 +8189,13 @@ type multiClientChannel struct {
 	// an optimization, never a correctness requirement, because the periodic
 	// pass picks the quarantine up through isWarning anyway; see resizeWake().
 	resizeWakeFunc func()
+	// migrateFlowsFunc is the bench-time hand-off seam: the parent's
+	// migrateClientFlows, invoked from the verdict itself when a soft
+	// verdict benches this exit. nil on channels built directly by tests --
+	// the hand-off is an optimization, never a correctness requirement.
+	// Takes the parent stateLock inside, so it must never be called with
+	// this channel's stateLock held (migrateFlows releases it first).
+	migrateFlowsFunc func(*multiClientChannel)
 	// providerQualifiedFunc reads the parent's qualification table for this
 	// channel's destination (RemoteUserNatMultiClient.providerQualified).
 	// Consumed by effectiveTier as a +1 demerit for unproven/stale providers
@@ -8297,6 +8412,7 @@ func newMultiClientChannel(
 	reliabilityMetricsFunc func() *reliabilityMetrics,
 	flowCountFunc func(*multiClientChannel) int,
 	resizeWakeFunc func(),
+	migrateFlowsFunc func(*multiClientChannel),
 	providerQualifiedFunc func(MultiHopId) bool,
 	receivingSiblingsFunc func(exclude *multiClientChannel) int,
 	qualificationRefreshFunc func(MultiHopId),
@@ -8375,6 +8491,7 @@ func newMultiClientChannel(
 		reliabilityMetricsFunc:    reliabilityMetricsFunc,
 		flowCountFunc:             flowCountFunc,
 		resizeWakeFunc:            resizeWakeFunc,
+		migrateFlowsFunc:          migrateFlowsFunc,
 		providerQualifiedFunc:     providerQualifiedFunc,
 		receivingSiblingsFunc:     receivingSiblingsFunc,
 		qualificationRefreshFunc:  qualificationRefreshFunc,
@@ -8673,6 +8790,29 @@ func (self *multiClientChannel) markQuarantineMigrateOnce() bool {
 	}
 	self.quarantineMigrated = true
 	return true
+}
+
+// emptiedByMigration reports whether this exit's flows left because the
+// bench hand-off moved them. Consumed by verdictAction so flowlessness we
+// caused cannot become the evidence that convicts.
+func (self *multiClientChannel) emptiedByMigration() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.quarantined && self.quarantineMigrated
+}
+
+// migrateFlows runs the bench-time hand-off through the injected seam,
+// latched to once per quarantine episode. nil func (bare fixtures, and any
+// channel built without a parent) is a no-op, matching every other injected
+// seam here.
+func (self *multiClientChannel) migrateFlows() {
+	if self.migrateFlowsFunc == nil {
+		return
+	}
+	if !self.markQuarantineMigrateOnce() {
+		return
+	}
+	self.migrateFlowsFunc(self)
 }
 
 func (self *multiClientChannel) isQuarantined() bool {
@@ -9858,6 +9998,9 @@ func verdictAction(
 	quarantinedSince time.Time,
 	now time.Time,
 	quarantineExpiry time.Duration,
+	// emptiedByMigration: this exit's flows left because WE moved them at
+	// bench time, not because the exit drained naturally
+	emptiedByMigration bool,
 ) verdictActionKind {
 	if reason == blackholeNone {
 		return verdictActionNone
@@ -9873,10 +10016,26 @@ func verdictAction(
 		// execute immediately
 		return verdictActionExecute
 	}
-	if flowCount <= 0 {
+	if flowCount <= 0 && !emptiedByMigration {
 		// a flowless exit has no blast radius, so the soft verdict may
 		// execute exactly as before
 		return verdictActionExecute
+	}
+	if flowCount <= 0 && emptiedByMigration {
+		// OUR OWN hand-off emptied it, and flowlessness must not become the
+		// evidence: the bench moved the flows, the flows were the only
+		// traffic that could produce a receive ack, and a receive ack is the
+		// only thing that acquits. Executing here would make every all-quic
+		// bench a conviction inside one poll interval and remove the exit's
+		// path to acquittal at the same time (review finding, 2026-08-03).
+		// The episode still matures on the expiry bound below, and a genuine
+		// recovery still releases it through quarantineVacated -- the
+		// difference is that the exit gets to serve its sentence instead of
+		// being convicted for having been rescued.
+		if !quarantinedSince.IsZero() && 0 < quarantineExpiry && quarantineExpiry <= now.Sub(quarantinedSince) {
+			return verdictActionExecuteExpired
+		}
+		return verdictActionQuarantine
 	}
 	if !quarantinedSince.IsZero() && 0 < quarantineExpiry && quarantineExpiry <= now.Sub(quarantinedSince) {
 		return verdictActionExecuteExpired
@@ -10068,6 +10227,7 @@ func (self *multiClientChannel) detectBlackhole() {
 					quarantinedSince,
 					now,
 					self.settings.StatsWindowKeepUnhealthyDuration,
+					self.emptiedByMigration(),
 				)
 
 				if action == verdictActionQuarantine {
@@ -10088,6 +10248,20 @@ func (self *multiClientChannel) detectBlackhole() {
 							"flows", flowCount,
 						))
 						self.resizeWake()
+						// hand the movable flows off HERE, at the verdict,
+						// rather than only from the resize classification
+						// tree. That call site sits inside `healthy &&
+						// unhealthyDuration < 5s` and behind the dialStarved
+						// branch, so it loses silently whenever the resize
+						// goroutine is blocked in expand() -- which the
+						// field logs show is the state during the incident
+						// this was built to fix (its demote lines are the
+						// UNHEALTHY branch, so the quarantine branch was
+						// never reached and no hand-off could have run).
+						// Driven by the verdict, it cannot be preempted by a
+						// classification. The per-episode latch is shared
+						// with the resize site, which stays as a backstop.
+						self.migrateFlows()
 					}
 				} else {
 					// Everything needed to judge the verdict goes in the error,

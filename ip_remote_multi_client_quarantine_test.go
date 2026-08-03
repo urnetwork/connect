@@ -305,7 +305,7 @@ func TestVerdictActionTable(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		got := verdictAction(c.reason, c.softDemote, c.flowCount, c.quarantinedSince, now, c.expiry)
+		got := verdictAction(c.reason, c.softDemote, c.flowCount, c.quarantinedSince, now, c.expiry, false)
 		if got != c.want {
 			t.Errorf("%s: verdictAction = %d, want %d", c.name, got, c.want)
 		}

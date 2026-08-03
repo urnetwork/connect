@@ -614,30 +614,84 @@ func TestQuarantineMigrateLatchIsPerEpisode(t *testing.T) {
 	}
 }
 
-// And the resize pass has to actually run it -- a correct-but-uncalled helper
-// is the failure mode this suite pins against.
-func TestResizeQuarantineBranchMigrates(t *testing.T) {
+// The hand-off must be driven by the VERDICT, not by the resize
+// classification tree.
+//
+// The resize call site sits inside `if healthy` and `unhealthyDuration <
+// StatsWindowWarnUnhealthyDuration` (5s), and behind the dialStarved branch,
+// so it silently loses whenever the resize goroutine is blocked in expand()
+// (WindowExpandTimeout, 15s) -- the state the field logs show during the
+// incident this exists to fix, whose demote lines came from the UNHEALTHY
+// branch, proving the quarantine branch was never reached. Anchoring only
+// the resize site would pin a mechanism that does not run.
+func TestQuarantineMigrationIsDrivenByTheVerdict(t *testing.T) {
 	source, err := readSource("ip_remote_multi_client.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, ok := functionBody(source, "func (self *multiClientWindow) resize()")
+
+	// primary: the verdict site, immediately after the quarantine is set
+	body, ok := functionBody(source, "func (self *multiClientChannel) detectBlackhole()")
+	if !ok {
+		t.Fatal("could not find detectBlackhole")
+	}
+	at := strings.Index(body, "if self.setQuarantined(reason) {")
+	if at < 0 {
+		t.Fatal("could not find the setQuarantined block in detectBlackhole")
+	}
+	block := body[at:]
+	if end := strings.Index(block, "\n\t\t\t\t}"); 0 <= end {
+		block = block[:end]
+	}
+	if !strings.Contains(block, "self.migrateFlows()") {
+		t.Error("the verdict does not run the hand-off: a benched exit's movable flows wait out the whole sustained-evidence window, which IS the freeze")
+	}
+
+	// backstop: the resize branch still carries it, sharing the same latch
+	resizeBody, ok := functionBody(source, "func (self *multiClientWindow) resize()")
 	if !ok {
 		t.Fatal("could not find resize")
 	}
-	at := strings.Index(body, "} else if client.isQuarantined() {")
-	if at < 0 {
+	rat := strings.Index(resizeBody, "} else if client.isQuarantined() {")
+	if rat < 0 {
 		t.Fatal("could not find the quarantine branch in resize")
 	}
-	branch := body[at:]
+	branch := resizeBody[rat:]
 	if end := strings.Index(branch, "} else {"); 0 <= end {
 		branch = branch[:end]
 	}
-	if !strings.Contains(branch, "markQuarantineMigrateOnce()") {
-		t.Error("the quarantine branch does not latch a hand-off: a benched exit holds its movable flows for the whole sustained-evidence window")
+	if !strings.Contains(branch, "markQuarantineMigrateOnce()") ||
+		!strings.Contains(branch, "self.clientMigrateFunc(client,") {
+		t.Error("the resize backstop no longer runs the latched hand-off")
 	}
-	if !strings.Contains(branch, "self.clientMigrateFunc(client)") {
-		t.Error("the quarantine branch does not call the migration seam")
+}
+
+// Flowlessness WE caused must not become the evidence that convicts. The
+// hand-off empties a benched exit; the flows it moved were the only traffic
+// that could produce a receive ack, and a receive ack is the only thing that
+// acquits. Executing on flowCount==0 would make every all-quic bench a
+// conviction inside one poll interval AND remove the exit's path to
+// acquittal at the same moment.
+func TestVerdictDoesNotExecuteAnExitOurMigrationEmptied(t *testing.T) {
+	now := time.Now()
+	expiry := 60 * time.Second
+
+	// flowless because it drained on its own: execute, as always
+	if got := verdictAction(blackholeNoReceiveAck, true, 0, now.Add(-10*time.Second), now, expiry, false); got != verdictActionExecute {
+		t.Errorf("naturally flowless: verdictAction = %d, want execute", got)
+	}
+	// flowless because we moved them: serve the sentence instead
+	if got := verdictAction(blackholeNoReceiveAck, true, 0, now.Add(-10*time.Second), now, expiry, true); got != verdictActionQuarantine {
+		t.Errorf("emptied by migration: verdictAction = %d, want quarantine", got)
+	}
+	// ...but the expiry bound still matures, so a genuinely dead exit is
+	// never immortal
+	if got := verdictAction(blackholeNoReceiveAck, true, 0, now.Add(-61*time.Second), now, expiry, true); got != verdictActionExecuteExpired {
+		t.Errorf("emptied by migration, expired: verdictAction = %d, want executeExpired", got)
+	}
+	// and the hard verdict is untouched by any of this
+	if got := verdictAction(blackholeNoSendAck, true, 0, now, now, expiry, true); got != verdictActionExecute {
+		t.Errorf("no-send-ack: verdictAction = %d, want execute", got)
 	}
 }
 
@@ -685,7 +739,7 @@ func TestMigrateClientFlowsMovesQuicKeepsTcp(t *testing.T) {
 	quicUnestablished := flow(43001, IpProtocolUdp, 443, false)
 	tcp := flow(43002, IpProtocolTcp, 443, true)
 
-	rebound, replacements, remaining := parent.migrateClientFlows(draining)
+	rebound, replacements, remaining := parent.migrateClientFlows(draining, "bench")
 
 	if rebound != 1 || replacements != 1 {
 		t.Errorf("rebound=%d replacements=%d, want 1/1", rebound, replacements)
