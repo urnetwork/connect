@@ -427,6 +427,80 @@ func TestQuarantinedDonorKeepsItsSite(t *testing.T) {
 	}
 }
 
+// G-3's drain-time migration: established quic moves to a live replacement
+// with its bookkeeping, tcp STAYS ALIVE on the draining exit (split-tcp: the
+// exit holds the remote end, moving it would break it), and nothing is ever
+// torn down or unpinned -- the whole point of migrating at drain time instead
+// of at the deadline.
+func TestMigrateClientFlowsMovesQuicKeepsTcp(t *testing.T) {
+	parent := bindFlowTestParent()
+	parent.ip4PathUpdates = map[Ip4Path]*multiClientChannelUpdate{}
+	parent.reliabilityMetrics = newReliabilityMetrics()
+	draining := bindFlowTestChannel(parent)
+	draining.args = &multiClientChannelArgs{
+		MultiClientGeneratorClientArgs: MultiClientGeneratorClientArgs{ClientId: NewId()},
+	}
+	target := bindFlowTestChannel(parent)
+	target.args = &multiClientChannelArgs{
+		MultiClientGeneratorClientArgs: MultiClientGeneratorClientArgs{ClientId: NewId()},
+	}
+	parent.rebindCandidatesFunc = func(dying *multiClientChannel) []*multiClientChannel {
+		return []*multiClientChannel{target}
+	}
+
+	flow := func(sourcePort int, protocol IpProtocol, destPort int, established bool) *multiClientChannelUpdate {
+		flowPath := &IpPath{
+			Version:         4,
+			Protocol:        protocol,
+			SourceIp:        net.IPv4(10, 0, 0, 4),
+			SourcePort:      sourcePort,
+			DestinationIp:   net.IPv4(203, 0, 113, 30),
+			DestinationPort: destPort,
+		}
+		update := newMultiClientChannelUpdate(context.Background(), flowPath)
+		update.client.Store(draining)
+		if established {
+			update.receivedInbound.Store(true)
+		}
+		parent.ip4PathUpdates[flowPath.ToIp4Path()] = update
+		parent.bindClientFlow(update, draining)
+		return update
+	}
+
+	quicEstablished := flow(43000, IpProtocolUdp, 443, true)
+	quicUnestablished := flow(43001, IpProtocolUdp, 443, false)
+	tcp := flow(43002, IpProtocolTcp, 443, true)
+
+	rebound, replacements, remaining := parent.migrateClientFlows(draining)
+
+	if rebound != 1 || replacements != 1 {
+		t.Errorf("rebound=%d replacements=%d, want 1/1", rebound, replacements)
+	}
+	if remaining != 2 {
+		t.Errorf("remaining=%d, want 2 (the tcp flow and the unestablished quic)", remaining)
+	}
+	if quicEstablished.client.Load() != target {
+		t.Error("the established quic flow did not move to the replacement")
+	}
+	// the stayers are untouched: still pinned, still booked, never nil'd
+	if tcp.client.Load() != draining {
+		t.Error("the tcp flow left the draining exit; split-tcp cannot move")
+	}
+	if quicUnestablished.client.Load() != draining {
+		t.Error("the unestablished quic flow moved without a proven connection")
+	}
+	if !parent.clientUpdates[draining][tcp] || !parent.clientUpdates[draining][quicUnestablished] {
+		t.Error("a staying flow lost its bookkeeping on the draining exit")
+	}
+	// and the mover's book followed it
+	if parent.clientUpdates[draining][quicEstablished] {
+		t.Error("the moved flow is still booked on the draining exit")
+	}
+	if !parent.clientUpdates[target][quicEstablished] {
+		t.Error("the moved flow is not booked on its replacement")
+	}
+}
+
 // A cdn constellation must collapse to ONE affinity group: the service binds
 // state across its domains (signed media urls carry the client ip the manifest
 // was fetched from), so the site domain and its cdn domains have to share an

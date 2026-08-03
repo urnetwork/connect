@@ -1231,6 +1231,7 @@ func NewRemoteUserNatMultiClient(
 		multiClient.receivingChannelCount,
 		multiClient.recordProbePass,
 	)
+	multiClient.windows[WindowTypeQuality].clientMigrateFunc = multiClient.migrateClientFlows
 	if _, fixed := generator.FixedDestinationSize(); !fixed {
 		multiClient.windows[WindowTypeSpeed] = newMultiClientWindow(
 			cancelCtx,
@@ -1250,6 +1251,7 @@ func NewRemoteUserNatMultiClient(
 			multiClient.receivingChannelCount,
 			multiClient.recordProbePass,
 		)
+		multiClient.windows[WindowTypeSpeed].clientMigrateFunc = multiClient.migrateClientFlows
 	}
 	// else only keep the quality window for fixed destination
 
@@ -2925,6 +2927,120 @@ func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 			self.receivePacketCallback(p.Source, p.ProvideMode, p.IpPath, p.Packet)
 		}
 	}
+}
+
+// migrateClientFlows is G-3's drain-time move: the proactive half of the
+// rebind removeClient performs at death, run while the exit is STILL ALIVE,
+// so a planned retirement is a coordinated hand-off instead of a deadline
+// teardown. Established quic flows are re-pinned to live replacements now --
+// the same partition, candidate order, and affinity-group cohesion as the
+// removal-time rebind -- and everything else (tcp, unestablished, flows with
+// no under-cap replacement) STAYS on the draining exit and finishes
+// naturally. Nothing is ever torn down here; that is the entire point. New
+// flows already avoid the exit through its drain warning, so after this pass
+// the exit only shrinks, and the eventual close (flowless, or the lifetime
+// hard deadline) finds little or nothing to kill.
+//
+// Returns flows moved, replacement exits used, and flows that remain --
+// deliberately (tcp) or for lack of headroom, indistinguishable here and
+// equally fine, since they keep working.
+func (self *RemoteUserNatMultiClient) migrateClientFlows(client *multiClientChannel) (rebound int, replacements int, remaining int) {
+	if client == nil {
+		return
+	}
+	// the same gate as the removal-time rebind: with the mechanism off, a
+	// drain behaves exactly as it did before this existed
+	var candidates []*multiClientChannel
+	if self.reliabilitySettings().QuicRebindOnExitLoss {
+		candidates = self.rebindCandidates(client)
+	}
+
+	var reboundFlows []reboundFlow
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+
+		updates, ok := self.clientUpdates[client]
+		if !ok {
+			return
+		}
+
+		rebindable := []*multiClientChannelUpdate{}
+		for update := range updates {
+			if update.client.Load() != client {
+				continue
+			}
+			// removeClient's partition: established quic moves; everything
+			// else stays -- here, stays ALIVE on the draining exit
+			if 0 < len(candidates) &&
+				update.ipPath.Protocol == IpProtocolUdp &&
+				update.ipPath.DestinationPort == 443 &&
+				update.receivedInbound.Load() {
+				rebindable = append(rebindable, update)
+			}
+		}
+		remaining = len(updates) - len(rebindable)
+		if len(rebindable) == 0 || len(candidates) == 0 {
+			remaining = len(updates)
+			return
+		}
+
+		var unplaced []*multiClientChannelUpdate
+		reboundFlows, replacements, unplaced = self.rebindFlowsWithLock(client, rebindable, candidates)
+		// unlike the removal, unplaced flows are NOT torn down: they stay
+		// registered on the alive exit and keep working
+		remaining += len(unplaced)
+
+		// the moved flows leave the draining exit's book, so the cap, the
+		// flowless check, and the eventual close's teardown all see the
+		// truth. rebindFlowsWithLock stored the replacement into each moved
+		// update's client, so "moved" is exactly "no longer points here" --
+		// the same catch-up bindClientFlow performs on the send path,
+		// inlined because bindClientFlow takes this lock.
+		for update := range updates {
+			if update.client.Load() != client {
+				delete(updates, update)
+			}
+		}
+		if len(updates) == 0 {
+			delete(self.clientUpdates, client)
+		}
+	}()
+	rebound = len(reboundFlows)
+
+	// recorded outside stateLock, same as the removal path: the tracker
+	// classifies each move by whether the destination keeps answering the
+	// same local port (migration accepted) or a new one (the app re-dialed)
+	self.reliabilityMetrics.exitLostRebound(reboundFlows)
+
+	if 0 < rebound {
+		loggerOrDefault(self.log).Infof("%s\n", relEvent(
+			"migrate",
+			"exit", client.ClientId(),
+			"rebound", rebound,
+			"replacements", replacements,
+			"remaining", remaining,
+		))
+	}
+	return
+}
+
+// MigrateExit runs the drain-time flow migration against one exit on demand:
+// the developer-menu drill for G-3, and useful ahead of a deliberate drop.
+// Unlike DropExit nothing is killed -- established quic moves, the rest
+// keeps working where it is. Returns the number of flows moved, -1 when no
+// such exit is in the window.
+func (self *RemoteUserNatMultiClient) MigrateExit(clientId Id) int {
+	self.logAction("migrate_exit", "exit", clientId)
+	for _, window := range self.windows {
+		for _, client := range window.unorderedClients() {
+			if client.ClientId() == clientId {
+				rebound, _, _ := self.migrateClientFlows(client)
+				return rebound
+			}
+		}
+	}
+	return -1
 }
 
 // rebindCandidates gathers the live exits a dying exit's established quic
@@ -5469,6 +5585,15 @@ type multiClientWindow struct {
 	// qualificationRefreshFunc is handed to every channel for the receive-ack
 	// qualification refresh; see the channel field. nil on bare test windows.
 	qualificationRefreshFunc func(MultiHopId)
+	// clientMigrateFunc is G-3's drain-time seam: the parent's
+	// migrateClientFlows, called once when the resize pass starts draining an
+	// exit so its movable flows leave while everything else finishes
+	// naturally. Set by the parent after construction rather than through the
+	// (already long) constructor; nil -- bare test windows -- makes a drain
+	// behave exactly as it did before migration existed. The func takes the
+	// parent stateLock inside, so the same contract as flowCountFunc applies:
+	// call it with no window or channel lock held.
+	clientMigrateFunc func(*multiClientChannel) (rebound int, replacements int, remaining int)
 
 	clientChannelArgs chan *multiClientChannelArgs
 
@@ -6263,6 +6388,19 @@ func (self *multiClientWindow) resize() {
 						// drain is exempt from the rank shield.
 						client.setWarning(true, warnDraining)
 						warnClient(client, stats)
+						// G-3: retirement is a hand-off, not a deadline. The
+						// drain's movable (established quic) flows are
+						// re-pinned to live replacements NOW -- with their
+						// affinity groups kept together by the rebind
+						// machinery -- while tcp and everything unplaceable
+						// keeps working here until it finishes. Once per
+						// drain: the latch, not the pass cadence, decides.
+						// Held locks: none at this point in the
+						// classification loop, the same contract the
+						// removeClient call below relies on.
+						if self.clientMigrateFunc != nil && client.markDrainMigrateOnce() {
+							self.clientMigrateFunc(client)
+						}
 					} else {
 						printStats("client ok")
 						windowSizeUlimit := self.settings.DefaultUlimit
@@ -7655,6 +7793,14 @@ type multiClientChannel struct {
 	// unsendable run resets -- those are what end an episode.
 	stallHoldCounted bool
 
+	// drainMigrated latches G-3's drain-time migration to once per channel:
+	// a drain lasts many resize passes, and the movable flows only need
+	// moving the first time. Never cleared -- a channel drains once, and a
+	// second migration pass would find nothing movable anyway; the latch
+	// exists so the resize pass does not pay the candidate gather every 15s
+	// for the rest of the drain.
+	drainMigrated bool
+
 	// lastReceiveAckTime is when return traffic last arrived on this channel,
 	// stamped by addReceiveAck under the lock it already takes. Read by
 	// hasRecentReceive for the parent's receive-side sibling count (the
@@ -8227,6 +8373,18 @@ func (self *multiClientChannel) markStallHoldOnce() bool {
 		return false
 	}
 	self.stallHoldCounted = true
+	return true
+}
+
+// markDrainMigrateOnce latches G-3's drain-time migration: true exactly once
+// per channel, on the first drain pass.
+func (self *multiClientChannel) markDrainMigrateOnce() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.drainMigrated {
+		return false
+	}
+	self.drainMigrated = true
 	return true
 }
 

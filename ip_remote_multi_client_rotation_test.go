@@ -307,6 +307,14 @@ func TestDrainBranchWarnsUnconditionally(t *testing.T) {
 	if got := nextWarningCall(`printStats("client drain")`); got != "setWarning(true, warnDraining)" {
 		t.Errorf("the drain branch warns with %q, want setWarning(true, warnDraining): a rank-kept speed exit never drains, and the cause must say retirement, not evidence", got)
 	}
+	// and the drain branch hands its movable flows off exactly once (G-3):
+	// the migration must be latched AND routed through the parent seam, or
+	// retirement stays a deadline teardown
+	drainAt := strings.Index(body, `printStats("client drain")`)
+	rest := body[drainAt:]
+	if !strings.Contains(rest[:strings.Index(rest, "} else")], "markDrainMigrateOnce()") {
+		t.Error("the drain branch does not run the once-latched migration: retirement tears down movable flows at the deadline instead of handing them off")
+	}
 	if got := nextWarningCall(`printStats("client health warning")`); got != "setWarning(remove, warnUnhealthy)" {
 		t.Errorf("the health-warning branch warns with %q, want the rank-derived setWarning(remove, warnUnhealthy)", got)
 	}
