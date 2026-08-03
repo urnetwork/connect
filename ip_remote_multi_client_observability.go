@@ -493,6 +493,8 @@ type heartbeatState struct {
 	probesSent      uint64
 	probesAnswered  uint64
 	removals        uint64
+	groupsFollowed  uint64
+	groupsScattered uint64
 }
 
 // heartbeatStateFrom folds the existing readouts into the beat's state. Pure,
@@ -541,6 +543,8 @@ func heartbeatStateFrom(exits []*ExitInfo, metrics *ReliabilityMetricsSnapshot) 
 		state.probesSent = metrics.ProbesSent
 		state.probesAnswered = metrics.ProbesAnswered
 		state.removals = metrics.ExitLossEvents
+		state.groupsFollowed = metrics.GroupsFollowed
+		state.groupsScattered = metrics.GroupsScattered
 	}
 	return state
 }
@@ -565,6 +569,10 @@ func relHeartbeatLine(state heartbeatState, uptime time.Duration) string {
 		"deferred", state.deferred,
 		"rebinds", pair(state.rebindsAccepted, state.rebindsRedialed),
 		"probes", pair(state.probesSent, state.probesAnswered),
+		// the G-1 ledger: follows a benched donor kept / scatters quarantine
+		// still caused. A rising second number is the signal group-follow is
+		// not doing its job (off, or the benched exits are receive-silent).
+		"follow", pair(state.groupsFollowed, state.groupsScattered),
 		"removals", state.removals,
 		"uptime", int64(uptime/time.Second),
 	)

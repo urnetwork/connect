@@ -343,6 +343,8 @@ func TestHeartbeatContentFromFixture(t *testing.T) {
 		ProbesSent:                40,
 		ProbesAnswered:            38,
 		ExitLossEvents:            5,
+		GroupsFollowed:            6,
+		GroupsScattered:           1,
 	}
 
 	state := heartbeatStateFrom(heartbeatTestExits(), metrics)
@@ -358,7 +360,7 @@ func TestHeartbeatContentFromFixture(t *testing.T) {
 
 	line := relHeartbeatLine(state, 125*time.Second)
 	want := "[rel] event=heartbeat exits=3 proven=2 quarantined=1 warned=2 flows=6 " +
-		"tiers=0/3 held=7/2 deferred=1 rebinds=9/3 probes=40/38 removals=5 uptime=125"
+		"tiers=0/3 held=7/2 deferred=1 rebinds=9/3 probes=40/38 follow=6/1 removals=5 uptime=125"
 	AssertEqual(t, line, want)
 }
 

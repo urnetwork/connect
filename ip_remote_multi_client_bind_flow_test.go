@@ -3,6 +3,7 @@ package connect
 import (
 	"context"
 	"net"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -236,6 +237,177 @@ func TestAffinityInheritanceIsStickyPastTheFlowCap(t *testing.T) {
 	parent.stateLock.Unlock()
 	if vetoed.client.Load() != nil {
 		t.Error("with the veto restored, a donor at cap still donated")
+	}
+}
+
+// The destination-exit join the Local statistics screen renders: each live
+// flow's destination ip is attributed to the exit CURRENTLY carrying it, so a
+// re-raced flow reads as its new exit and a site split across exits shows as
+// one ip with two rows.
+func TestDestinationExitsJoinsFlowsToCurrentExits(t *testing.T) {
+	parent := bindFlowTestParent()
+	parent.ip4PathUpdates = map[Ip4Path]*multiClientChannelUpdate{}
+	exitA := bindFlowTestChannel(parent)
+	exitA.args = &multiClientChannelArgs{
+		MultiClientGeneratorClientArgs: MultiClientGeneratorClientArgs{ClientId: NewId()},
+	}
+	exitB := bindFlowTestChannel(parent)
+	exitB.args = &multiClientChannelArgs{
+		MultiClientGeneratorClientArgs: MultiClientGeneratorClientArgs{ClientId: NewId()},
+	}
+
+	flow := func(sourcePort int, destIp net.IP, client *multiClientChannel) {
+		flowPath := &IpPath{
+			Version:         4,
+			Protocol:        IpProtocolTcp,
+			SourceIp:        net.IPv4(10, 0, 0, 3),
+			SourcePort:      sourcePort,
+			DestinationIp:   destIp,
+			DestinationPort: 443,
+		}
+		// a real update (live ctx), as production registers them
+		update := newMultiClientChannelUpdate(context.Background(), flowPath)
+		update.client.Store(client)
+		parent.ip4PathUpdates[flowPath.ToIp4Path()] = update
+	}
+
+	site := net.IPv4(203, 0, 113, 20)
+	other := net.IPv4(203, 0, 113, 21)
+	flow(42000, site, exitA)
+	flow(42001, site, exitA)
+	// the split case: one of the site's flows re-raced onto exitB
+	flow(42002, site, exitB)
+	flow(42003, other, exitB)
+
+	rows := parent.DestinationExits()
+	if len(rows) != 3 {
+		t.Fatalf("got %d rows, want 3", len(rows))
+	}
+	find := func(ip net.IP, clientId Id) int {
+		addr, _ := netip.AddrFromSlice(ip.To4())
+		for _, row := range rows {
+			if row.DestinationIp == addr && row.ClientId == clientId {
+				return row.FlowCount
+			}
+		}
+		return -1
+	}
+	if got := find(site, exitA.ClientId()); got != 2 {
+		t.Errorf("site on exitA counted %d flows, want 2", got)
+	}
+	if got := find(site, exitB.ClientId()); got != 1 {
+		t.Errorf("site on exitB counted %d flows, want 1", got)
+	}
+	if got := find(other, exitB.ClientId()); got != 1 {
+		t.Errorf("other on exitB counted %d flows, want 1", got)
+	}
+}
+
+// The G-1 verdict table: a resize warning always refuses (those exits shed
+// new flows on purpose); quarantine refuses only without group-follow or
+// without fresh receive evidence. Suspicion alone must not split a site's
+// egress ip -- but a receive-silent bench gets no fresh flows.
+func TestAffinityDonorEligibleVerdicts(t *testing.T) {
+	parent := bindFlowTestParent()
+	client := bindFlowTestChannel(parent)
+	freshness := 10 * time.Second
+
+	if got := client.affinityDonorEligible(true, freshness); got != donorEligible {
+		t.Errorf("clean channel: verdict %v, want donorEligible", got)
+	}
+
+	client.setWarning(true, warnUnhealthy)
+	if got := client.affinityDonorEligible(true, freshness); got != donorRefused {
+		t.Errorf("warned channel: verdict %v, want donorRefused even with follow on", got)
+	}
+	client.setWarning(false, warnNone)
+
+	client.setQuarantined(blackholeNoReceiveAck)
+	if got := client.affinityDonorEligible(false, freshness); got != donorQuarantineScattered {
+		t.Errorf("quarantined, follow off: verdict %v, want donorQuarantineScattered", got)
+	}
+	if got := client.affinityDonorEligible(true, 0); got != donorQuarantineScattered {
+		t.Errorf("quarantined, zero freshness: verdict %v, want donorQuarantineScattered", got)
+	}
+	if got := client.affinityDonorEligible(true, freshness); got != donorQuarantineScattered {
+		t.Errorf("quarantined, never received: verdict %v, want donorQuarantineScattered", got)
+	}
+
+	client.stateLock.Lock()
+	client.lastReceiveAckTime = time.Now()
+	client.stateLock.Unlock()
+	if got := client.affinityDonorEligible(true, freshness); got != donorQuarantineFollowed {
+		t.Errorf("quarantined, receive fresh: verdict %v, want donorQuarantineFollowed", got)
+	}
+
+	client.stateLock.Lock()
+	client.lastReceiveAckTime = time.Now().Add(-2 * freshness)
+	client.stateLock.Unlock()
+	if got := client.affinityDonorEligible(true, freshness); got != donorQuarantineScattered {
+		t.Errorf("quarantined, receive stale: verdict %v, want donorQuarantineScattered", got)
+	}
+
+	// warning wins over quarantine: an unhealthy benched exit never donates
+	client.setWarning(true, warnUnhealthy)
+	client.stateLock.Lock()
+	client.lastReceiveAckTime = time.Now()
+	client.stateLock.Unlock()
+	if got := client.affinityDonorEligible(true, freshness); got != donorRefused {
+		t.Errorf("warned AND quarantined: verdict %v, want donorRefused", got)
+	}
+}
+
+// The inherit path end to end: a quarantined donor with fresh receive
+// evidence keeps its own site under the shipped defaults, and the ledger
+// counts the follow; with follow off the same flow is scattered and counted
+// as such.
+func TestQuarantinedDonorKeepsItsSite(t *testing.T) {
+	parent := bindFlowTestParent()
+	parent.ip4PathUpdates = map[Ip4Path]*multiClientChannelUpdate{}
+	parent.reliabilityMetrics = newReliabilityMetrics()
+	donor := bindFlowTestChannel(parent)
+
+	flowPath := &IpPath{
+		Version:         4,
+		Protocol:        IpProtocolTcp,
+		SourceIp:        net.IPv4(10, 0, 0, 2),
+		SourcePort:      41000,
+		DestinationIp:   net.IPv4(203, 0, 113, 9),
+		DestinationPort: 443,
+	}
+	flowUpdate := &multiClientChannelUpdate{}
+	flowUpdate.client.Store(donor)
+	ip4 := flowPath.ToIp4Path()
+	parent.ip4PathUpdates[ip4] = flowUpdate
+	donorPaths := map[Ip4Path]time.Time{ip4: time.Now()}
+
+	donor.setQuarantined(blackholeNoReceiveAck)
+	donor.stateLock.Lock()
+	donor.lastReceiveAckTime = time.Now()
+	donor.stateLock.Unlock()
+
+	newFlow := &multiClientChannelUpdate{}
+	parent.stateLock.Lock()
+	parent.inheritAffinityClient4WithLock(newFlow, donorPaths)
+	parent.stateLock.Unlock()
+	if newFlow.client.Load() != donor {
+		t.Error("a benched receive-fresh donor did not keep its site")
+	}
+	if got := parent.reliabilityMetrics.groupsFollowed.Load(); got != 1 {
+		t.Errorf("follows counted %d, want 1", got)
+	}
+
+	// the A/B point: follow off scatters, and the ledger says so
+	parent.settings.QuarantineGroupFollow = false
+	scatteredFlow := &multiClientChannelUpdate{}
+	parent.stateLock.Lock()
+	parent.inheritAffinityClient4WithLock(scatteredFlow, donorPaths)
+	parent.stateLock.Unlock()
+	if scatteredFlow.client.Load() != nil {
+		t.Error("with follow off, a benched donor still donated")
+	}
+	if got := parent.reliabilityMetrics.groupsScattered.Load(); got != 1 {
+		t.Errorf("scatters counted %d, want 1", got)
 	}
 }
 

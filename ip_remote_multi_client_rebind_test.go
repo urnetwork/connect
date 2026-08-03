@@ -235,7 +235,7 @@ func TestRebindSkipsDoneWarningAndDyingCandidates(t *testing.T) {
 	doneCandidate := &multiClientChannel{ctx: doneCtx, settings: settings}
 
 	warningCandidate := rebindTestCandidate(settings)
-	warningCandidate.setWarning(true)
+	warningCandidate.setWarning(true, warnUnhealthy)
 
 	parent, dying, forwarded, _ := rebindTestParent(t, true, nil)
 	// the dying client offered as its own replacement, plus a done and a

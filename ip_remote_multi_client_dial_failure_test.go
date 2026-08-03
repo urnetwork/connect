@@ -302,8 +302,8 @@ func TestResizeWarnsOnDialStarved(t *testing.T) {
 	if !strings.Contains(body, "client.dialStarved()") {
 		t.Error("resize does not consult dialStarved(): a dial-starved provider is never warned out of new-flow selection")
 	}
-	if !strings.Contains(body, "client.setWarning(true)") {
-		t.Error("resize warning site not found; the dialStarved wiring may have moved off it")
+	if !strings.Contains(body, "client.setWarning(true, warnStarved)") {
+		t.Error("resize dial-starved warning site not found (or its cause is no longer warnStarved); the dialStarved wiring may have moved off it")
 	}
 }
 

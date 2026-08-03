@@ -59,7 +59,7 @@ func TestQuarantineIsWarningOr(t *testing.T) {
 	client.clearQuarantine()
 	AssertEqual(t, client.isWarning(), false)
 
-	client.setWarning(true)
+	client.setWarning(true, warnUnhealthy)
 	AssertEqual(t, client.isWarning(), true)
 }
 
@@ -73,17 +73,37 @@ func TestQuarantineSurvivesResizeWarningClear(t *testing.T) {
 	client.setQuarantined(blackholeNoReceiveAck)
 
 	// the resize healthy path's write
-	client.setWarning(false)
+	client.setWarning(false, warnNone)
 
 	AssertEqual(t, client.isQuarantined(), true)
 	AssertEqual(t, client.isWarning(), true)
 
 	// and the reverse: lifting a quarantine must not erase an independent
 	// resize warning
-	client.setWarning(true)
+	client.setWarning(true, warnUnhealthy)
 	client.clearQuarantine()
 	AssertEqual(t, client.isQuarantined(), false)
 	AssertEqual(t, client.isWarning(), true)
+}
+
+// The cause names WHY a channel is warned, and clearing the warning clears
+// it: a stale cause must never describe a healthy channel, and a quarantine
+// alone (no resize warning) reports no cause -- Quarantined is its name.
+func TestWarningCauseClearsWithWarning(t *testing.T) {
+	client := stallTestChannel()
+	AssertEqual(t, client.warningCause(), warnNone)
+
+	client.setWarning(true, warnDraining)
+	AssertEqual(t, client.warningCause(), warnDraining)
+
+	// the cause argument of a clear is ignored, and the stored cause resets
+	client.setWarning(false, warnUnhealthy)
+	AssertEqual(t, client.warningCause(), warnNone)
+
+	// quarantine does not invent a warning cause
+	client.setQuarantined(blackholeNoReceiveAck)
+	AssertEqual(t, client.warningCause(), warnNone)
+	client.clearQuarantine()
 }
 
 // Receive progress is exactly the evidence the quarantining verdicts said was
@@ -138,10 +158,12 @@ func TestQuarantineExclusionConsumersUseIsWarning(t *testing.T) {
 		t.Error("orderedClients does not consult isWarning, so a quarantined exit stays raceable")
 	}
 
-	// the parent's affinity inheritance (both ip versions share the check via
-	// the same guard expression)
-	if strings.Count(source, "!c.isWarning()") < 2 {
-		t.Error("the affinity selection no longer guards on isWarning for both ip versions, so a quarantined exit can be inherited by new flows")
+	// the parent's affinity inheritance judges donors through the G-1 verdict
+	// (which refuses every resize warning and admits a quarantined donor only
+	// under group-follow with fresh receive evidence -- see
+	// affinityDonorEligible and its verdict-table test), for both ip versions
+	if strings.Count(source, "c.affinityDonorEligible(") < 2 {
+		t.Error("the affinity selection no longer judges donors through affinityDonorEligible for both ip versions, so either a warned exit can be inherited or a benched site is scattered unconditionally")
 	}
 }
 

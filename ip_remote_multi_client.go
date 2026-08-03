@@ -164,6 +164,10 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		MaxFlowsPerExit: 16,
 		// a site keeps its exit as it grows; see the field comment
 		AffinityStickyPastCap: true,
+		// a benched site keeps its exit while the exit still receives;
+		// see the field comments
+		QuarantineGroupFollow:       true,
+		GroupFollowReceiveFreshness: 10 * time.Second,
 		DialFailureRerace:       true,
 		BlackholeConnectTimeout: 30 * time.Second,
 		// a third of the full connect bar: long enough that a slow-but-working
@@ -298,6 +302,9 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// 2 is the smallest value that makes the no-receive-ack verdict
 		// corroborated evidence rather than a single destination's silence
 		MinBlackholeDestinations: 2,
+		// and the busier the exit, the broader the silence must be; see the
+		// field comment
+		BlackholeLoadCorroboration: 8,
 		// on by default on this fork. With F-2 this is no longer inert: the
 		// constructor starts the prober loop (startup sweep, joiner probes,
 		// staleness re-probes -- see runProber), effectiveTier reads the
@@ -483,6 +490,29 @@ type MultiClientSettings struct {
 	//
 	// false restores the veto, the A/B comparison point.
 	AffinityStickyPastCap bool
+
+	// QuarantineGroupFollow lets a QUARANTINED exit keep inheriting new flows
+	// from affinity groups already living on it. A benched site's established
+	// flows are already on the suspect exit -- placing the site's next flow
+	// elsewhere breaks the site's egress-ip consistency without reducing the
+	// group's exposure at all. New groups, races, and rebinds still avoid the
+	// exit; only its own sites follow. If the exit is genuinely dead the
+	// whole group fails together and the existing escalation (sustained
+	// evidence -> hard removal -> rebind/re-race) recovers everything at
+	// once. Field motivation: five quarantines in six minutes on 2026-08-03,
+	// every one acquitted on receive progress -- each one scattered its
+	// sites' new flows for nothing.
+	//
+	// false restores the scatter, the A/B comparison point.
+	QuarantineGroupFollow bool
+
+	// GroupFollowReceiveFreshness is the safety gate on the follow: a group
+	// follows its donor into quarantine only while the exit has received
+	// return traffic this recently -- the congested-not-dead signature. A
+	// receive-silent benched exit stops collecting its groups' new flows
+	// immediately, so a genuinely dead exit gets no fresh hostages. 0
+	// disables the follow as surely as QuarantineGroupFollow false.
+	GroupFollowReceiveFreshness time.Duration
 	// DialFailureRerace, when a provider reports it could not open the
 	// upstream for a new flow (see ipOosUnreachable's dial-failure use),
 	// silently unbinds the flow and lets the application's own retransmit
@@ -706,6 +736,19 @@ type MultiClientSettings struct {
 	// no-send-ack verdict is about the provider itself (nothing is
 	// acknowledged at all) and stays as fast as it was.
 	MinBlackholeDestinations int
+
+	// BlackholeLoadCorroboration widens that corroboration with load: the
+	// effective distinct-destination requirement is
+	// max(MinBlackholeDestinations, flowCount/BlackholeLoadCorroboration).
+	// A loaded exit has more in-flight questions and more ways to look
+	// briefly silent -- the 2026-08-03 session benched five exits carrying
+	// 22-24 flows each on soft receive evidence and acquitted every one --
+	// so the busier the exit, the broader the silence must be before the
+	// soft verdict is admissible. At the default 8, an exit with 24 flows
+	// needs 3 silent destinations instead of 2; hard evidence paths are
+	// untouched. 0 disables the scaling (the flat pre-change behavior), the
+	// A/B comparison point.
+	BlackholeLoadCorroboration int
 
 	// ProviderProbe enables client-side provider qualification: a crafted tcp
 	// syn (and one dns query) sent through an exit to real destinations, where
@@ -1583,15 +1626,19 @@ type ReliabilitySettings struct {
 	BlackholeReceiveTimeout  time.Duration
 	MaxFlowsPerExit          int
 	AffinityStickyPastCap    bool
-	DialFailureRerace        bool
+	// the G-1 group-follow pair; see the MultiClientSettings fields
+	QuarantineGroupFollow       bool
+	GroupFollowReceiveFreshness time.Duration
+	DialFailureRerace           bool
 	UplinkStalenessGate      time.Duration
 	SoftVerdictDemote        bool
 	RemovalBudgetCount       int
 	RemovalBudgetWindow      time.Duration
-	StandingReserve          bool
-	EffectiveTierSelection   bool
-	MinBlackholeDestinations int
-	ProviderProbe            bool
+	StandingReserve            bool
+	EffectiveTierSelection     bool
+	MinBlackholeDestinations   int
+	BlackholeLoadCorroboration int
+	ProviderProbe              bool
 	ProbeTimeout             time.Duration
 	ProbeSampleHostCount     int
 	EvaluationPoolMultiple   int
@@ -1630,9 +1677,11 @@ func ReliabilitySettingsFrom(settings *MultiClientSettings) *ReliabilitySettings
 		ServerNameAffinityBridge: settings.ServerNameAffinityBridge,
 		SequenceIdleTimeout:      settings.SequenceIdleTimeout,
 		TcpSequenceIdleTimeout:   settings.TcpSequenceIdleTimeout,
-		BlackholeReceiveTimeout:  settings.BlackholeReceiveTimeout,
-		MaxFlowsPerExit:          settings.MaxFlowsPerExit,
-		AffinityStickyPastCap:    settings.AffinityStickyPastCap,
+		BlackholeReceiveTimeout:     settings.BlackholeReceiveTimeout,
+		MaxFlowsPerExit:             settings.MaxFlowsPerExit,
+		AffinityStickyPastCap:       settings.AffinityStickyPastCap,
+		QuarantineGroupFollow:       settings.QuarantineGroupFollow,
+		GroupFollowReceiveFreshness: settings.GroupFollowReceiveFreshness,
 		DialFailureRerace:        settings.DialFailureRerace,
 		UplinkStalenessGate:      settings.UplinkStalenessGate,
 		SoftVerdictDemote:        settings.SoftVerdictDemote,
@@ -1640,8 +1689,9 @@ func ReliabilitySettingsFrom(settings *MultiClientSettings) *ReliabilitySettings
 		RemovalBudgetWindow:      settings.RemovalBudgetWindow,
 		StandingReserve:          settings.StandingReserve,
 		EffectiveTierSelection:   settings.EffectiveTierSelection,
-		MinBlackholeDestinations: settings.MinBlackholeDestinations,
-		ProviderProbe:            settings.ProviderProbe,
+		MinBlackholeDestinations:   settings.MinBlackholeDestinations,
+		BlackholeLoadCorroboration: settings.BlackholeLoadCorroboration,
+		ProviderProbe:              settings.ProviderProbe,
 		ProbeTimeout:             settings.ProbeTimeout,
 		ProbeSampleHostCount:     settings.ProbeSampleHostCount,
 		EvaluationPoolMultiple:   settings.EvaluationPoolMultiple,
@@ -2041,15 +2091,35 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *mul
 	// with AffinityStickyPastCap a donor at the flow cap still donates: the
 	// group's egress ip is worth more than the cap, which continues to gate
 	// every placement that would put a NEW site on the exit
-	sticky := self.reliabilitySettings().AffinityStickyPastCap
+	reliabilitySettings := self.reliabilitySettings()
+	sticky := reliabilitySettings.AffinityStickyPastCap
+	follow := reliabilitySettings.QuarantineGroupFollow
+	freshness := reliabilitySettings.GroupFollowReceiveFreshness
 	var mostRecentCreateTime time.Time
+	winnerVerdict, scattered := donorRefused, false
 	for copyIp4Path, createTime := range paths {
 		if copyUpdate, ok := self.ip4PathUpdates[copyIp4Path]; ok {
-			if c := copyUpdate.client.Load(); c != nil && !c.IsDone() && !c.isWarning() && (sticky || !self.clientAtFlowCapWithLock(c)) && createTime.After(mostRecentCreateTime) {
-				mostRecentCreateTime = createTime
-				update.client.Store(c)
+			if c := copyUpdate.client.Load(); c != nil && !c.IsDone() && (sticky || !self.clientAtFlowCapWithLock(c)) && createTime.After(mostRecentCreateTime) {
+				switch verdict := c.affinityDonorEligible(follow, freshness); verdict {
+				case donorEligible, donorQuarantineFollowed:
+					// donorQuarantineFollowed is the G-1 follow: a benched
+					// donor with fresh receive evidence keeps its own site
+					mostRecentCreateTime = createTime
+					update.client.Store(c)
+					winnerVerdict = verdict
+				case donorQuarantineScattered:
+					scattered = true
+				}
 			}
 		}
+	}
+	// counted once per inherited flow, not per candidate path: a follow only
+	// if the WINNING donor was a followed quarantine, a scatter only if
+	// quarantine refusals left the flow with no donor at all
+	if winnerVerdict == donorQuarantineFollowed {
+		self.reliabilityMetrics.groupFollowed()
+	} else if scattered && update.client.Load() == nil {
+		self.reliabilityMetrics.groupScattered()
 	}
 }
 
@@ -2057,16 +2127,31 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *mul
 //
 // called with stateLock
 func (self *RemoteUserNatMultiClient) inheritAffinityClient6WithLock(update *multiClientChannelUpdate, paths map[Ip6Path]time.Time) {
-	// see inheritAffinityClient4WithLock for the sticky rationale
-	sticky := self.reliabilitySettings().AffinityStickyPastCap
+	// see inheritAffinityClient4WithLock for the sticky and follow rationale
+	reliabilitySettings := self.reliabilitySettings()
+	sticky := reliabilitySettings.AffinityStickyPastCap
+	follow := reliabilitySettings.QuarantineGroupFollow
+	freshness := reliabilitySettings.GroupFollowReceiveFreshness
 	var mostRecentCreateTime time.Time
+	winnerVerdict, scattered := donorRefused, false
 	for copyIp6Path, createTime := range paths {
 		if copyUpdate, ok := self.ip6PathUpdates[copyIp6Path]; ok {
-			if c := copyUpdate.client.Load(); c != nil && !c.IsDone() && !c.isWarning() && (sticky || !self.clientAtFlowCapWithLock(c)) && createTime.After(mostRecentCreateTime) {
-				mostRecentCreateTime = createTime
-				update.client.Store(c)
+			if c := copyUpdate.client.Load(); c != nil && !c.IsDone() && (sticky || !self.clientAtFlowCapWithLock(c)) && createTime.After(mostRecentCreateTime) {
+				switch verdict := c.affinityDonorEligible(follow, freshness); verdict {
+				case donorEligible, donorQuarantineFollowed:
+					mostRecentCreateTime = createTime
+					update.client.Store(c)
+					winnerVerdict = verdict
+				case donorQuarantineScattered:
+					scattered = true
+				}
 			}
 		}
+	}
+	if winnerVerdict == donorQuarantineFollowed {
+		self.reliabilityMetrics.groupFollowed()
+	} else if scattered && update.client.Load() == nil {
+		self.reliabilityMetrics.groupScattered()
 	}
 }
 
@@ -4537,8 +4622,14 @@ type ExitInfo struct {
 	// different facts to a reconstruction -- and because the heartbeat counts
 	// them separately.
 	Quarantined bool
-	Done        bool
-	P2pOnly     bool
+	// WarningCause names WHY the resize pass warned this exit: "draining"
+	// (past lifetime, healthy, retiring), "starved" (its upstream failing
+	// dials), "unhealthy" (a verdict demoted or deferred against it), or ""
+	// when the warning is off (a quarantine alone reports "" here -- the
+	// Quarantined field is its name).
+	WarningCause string
+	Done         bool
+	P2pOnly      bool
 	// FlowCount is how many live flows are currently pinned to this exit
 	FlowCount int
 	// DialFailureCount is how many upstream dials this exit has reported
@@ -4621,6 +4712,7 @@ func (self *RemoteUserNatMultiClient) Exits() []*ExitInfo {
 				// parent lock is released above -- the same discipline the rest
 				// of this walk follows
 				Quarantined:      client.isQuarantined(),
+				WarningCause:     client.warningCause().String(),
 				Done:             client.IsDone(),
 				P2pOnly:          client.IsP2pOnly(),
 				FlowCount:        flowCounts[clientId],
@@ -4644,6 +4736,71 @@ func (self *RemoteUserNatMultiClient) Exits() []*ExitInfo {
 		return a.ClientId.Cmp(b.ClientId)
 	})
 	return exits
+}
+
+// DestinationExit is one (destination ip, exit) pairing in the live flow
+// table: FlowCount flows to DestinationIp currently ride the exit ClientId.
+type DestinationExit struct {
+	DestinationIp netip.Addr
+	ClientId      Id
+	FlowCount     int
+}
+
+// DestinationExits reports which exit currently carries each destination ip,
+// aggregated over the live flows. This is the join the Local statistics
+// screen renders: the block-action window already names the sites (observed
+// hosts + cluster ips), and this readout says which egress each of those ips
+// is riding RIGHT NOW -- a pull-model answer on purpose, so a re-raced or
+// rebound flow reads as its current exit, not the one it was opened on. One
+// walk of the flow maps under the parent lock, the same cost class as the
+// Exits() flow count. Order is deterministic (ip, then client id) for the
+// same reason the exit readout sorts: consumers render it.
+func (self *RemoteUserNatMultiClient) DestinationExits() []*DestinationExit {
+	type key struct {
+		ip       netip.Addr
+		clientId Id
+	}
+	counts := map[key]int{}
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		count := func(destinationIp []byte, update *multiClientChannelUpdate) {
+			if update == nil || update.IsDone() {
+				return
+			}
+			c := update.client.Load()
+			if c == nil {
+				return
+			}
+			addr, ok := netip.AddrFromSlice(destinationIp)
+			if !ok {
+				return
+			}
+			counts[key{ip: addr.Unmap(), clientId: c.ClientId()}] += 1
+		}
+		for ip4Path, update := range self.ip4PathUpdates {
+			count(ip4Path.DestinationIp[:], update)
+		}
+		for ip6Path, update := range self.ip6PathUpdates {
+			count(ip6Path.DestinationIp[:], update)
+		}
+	}()
+
+	destinationExits := make([]*DestinationExit, 0, len(counts))
+	for k, flowCount := range counts {
+		destinationExits = append(destinationExits, &DestinationExit{
+			DestinationIp: k.ip,
+			ClientId:      k.clientId,
+			FlowCount:     flowCount,
+		})
+	}
+	slices.SortFunc(destinationExits, func(a, b *DestinationExit) int {
+		if c := a.DestinationIp.Compare(b.DestinationIp); c != 0 {
+			return c
+		}
+		return a.ClientId.Cmp(b.ClientId)
+	})
+	return destinationExits
 }
 
 // DropExit cancels a single provider channel, as if that one exit had died.
@@ -5861,7 +6018,7 @@ func (self *multiClientWindow) resize() {
 				// Cancellations and cping failures never reach this branch
 				// (blackholeVerdictErr keys on the verdict prefix), so user
 				// action and dead-transport cleanup stay immediate.
-				client.setWarning(true)
+				client.setWarning(true, warnUnhealthy)
 				self.metrics().removalDeferred()
 				// the full verdict error rides along as `detail`: a deferred
 				// removal may never be executed (the exit recovers, or stays
@@ -6007,7 +6164,7 @@ func (self *multiClientWindow) resize() {
 						// drain hands over to. The health branches below
 						// keep using `remove` untouched -- only the lifetime
 						// drain is exempt from the rank shield.
-						client.setWarning(true)
+						client.setWarning(true, warnDraining)
 						warnClient(client, stats)
 					} else {
 						printStats("client ok")
@@ -6030,7 +6187,7 @@ func (self *multiClientWindow) resize() {
 						// destination could oscillate a single-exit window
 						// between warned and not indefinitely.
 						if ulimit || (1 < len(clientStats) && client.dialStarved()) {
-							client.setWarning(true)
+							client.setWarning(true, warnStarved)
 							warnClient(client, stats)
 						} else if client.isQuarantined() {
 							// a quarantined exit (detectBlackhole demoted a
@@ -6043,16 +6200,16 @@ func (self *multiClientWindow) resize() {
 							// math below sees the hole and expands a
 							// replacement for the flows it can no longer
 							// accept, which is the other half of the demote.
-							client.setWarning(false)
+							client.setWarning(false, warnNone)
 							warnClient(client, stats)
 						} else {
-							client.setWarning(false)
+							client.setWarning(false, warnNone)
 							keepClient(client, stats)
 						}
 					}
 				} else {
 					printStats("client health warning")
-					client.setWarning(remove)
+					client.setWarning(remove, warnUnhealthy)
 					warnClient(client, stats)
 				}
 			} else {
@@ -6077,7 +6234,7 @@ func (self *multiClientWindow) resize() {
 					if self.reliabilitySettings().SoftVerdictDemote &&
 						!sendStalled && !sustainedUnhealthy &&
 						0 < self.flowCount(client) {
-						client.setWarning(true)
+						client.setWarning(true, warnUnhealthy)
 						warnClient(client, stats)
 						self.log.Infof(
 							"[multi]unhealthy removal demoted to warning [%s]: carrying flows, evidence not sustained\n",
@@ -6087,7 +6244,7 @@ func (self *multiClientWindow) resize() {
 						// the storm breaker (see verdictRemovalAllowed): the
 						// verdict-removal budget is spent, so defer -- warn and
 						// keep, re-judge next pass
-						client.setWarning(true)
+						client.setWarning(true, warnUnhealthy)
 						warnClient(client, stats)
 						self.metrics().removalDeferred()
 						self.log.Infof("%s\n", relEvent(
@@ -6098,11 +6255,11 @@ func (self *multiClientWindow) resize() {
 							"flows", self.flowCount(client),
 						))
 					} else {
-						client.setWarning(true)
+						client.setWarning(true, warnUnhealthy)
 						removeClient(client)
 					}
 				} else {
-					client.setWarning(false)
+					client.setWarning(false, warnNone)
 					warnClient(client, stats)
 				}
 			}
@@ -7319,7 +7476,15 @@ type multiClientChannel struct {
 
 	clientReceiveUnsub func()
 
-	warning bool
+	// warning + warnCause: the resize pass's exclusion from new-flow
+	// selection, and WHY. The bool is the compatibility surface every
+	// existing consumer reads (isWarning ORs it with quarantined); the cause
+	// is for consumers that must treat retirement differently from evidence
+	// -- a draining exit is healthy and its groups deserve a coordinated
+	// move, an unhealthy or starved one is suspect and its groups scatter on
+	// purpose. Written together under stateLock by setWarning.
+	warning   bool
+	warnCause warnCause
 
 	// the quarantine state: a soft blackhole verdict fired against this
 	// channel while it carried live flows, so instead of executing it the
@@ -7534,9 +7699,14 @@ func newMultiClientChannel(
 }
 
 func (self *multiClientChannel) ClientId() Id {
-	// bare fixture channels have no underlying client; identify as the zero
-	// id rather than panic on a log line -- same reasoning as Tier below
+	// bare fixture channels have no underlying client; identify by the args
+	// id (which is the same id the real construction hands the client), or
+	// as the zero id for the barest fixtures, rather than panic on a log
+	// line -- same reasoning as Tier below
 	if self.client == nil {
+		if self.args != nil {
+			return self.args.ClientId
+		}
 		return Id{}
 	}
 	return self.client.ClientId()
@@ -8203,10 +8373,56 @@ func (self *multiClientChannel) receivingSiblings() int {
 	return 0
 }
 
-func (self *multiClientChannel) setWarning(warning bool) {
+// warnCause is WHY a channel is warned -- see the warning/warnCause fields.
+type warnCause int
+
+const (
+	warnNone warnCause = iota
+	// warnDraining: past its lifetime, healthy, retiring. Rotation policy,
+	// not a health verdict.
+	warnDraining
+	// warnStarved: the provider's own upstream is failing dials.
+	warnStarved
+	// warnUnhealthy: a stats or blackhole verdict was demoted or deferred
+	// against it, or the rank-derived health warning fired.
+	warnUnhealthy
+)
+
+func (self warnCause) String() string {
+	switch self {
+	case warnDraining:
+		return "draining"
+	case warnStarved:
+		return "starved"
+	case warnUnhealthy:
+		return "unhealthy"
+	default:
+		return ""
+	}
+}
+
+// setWarning sets or clears the resize pass's warning together with its
+// cause. The cause is stored only while warned -- clearing the warning
+// clears it, so a stale cause can never describe a healthy channel.
+func (self *multiClientChannel) setWarning(warning bool, cause warnCause) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	self.warning = warning
+	if warning {
+		self.warnCause = cause
+	} else {
+		self.warnCause = warnNone
+	}
+}
+
+// warningCause reads the current cause; warnNone when not warned.
+func (self *multiClientChannel) warningCause() warnCause {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if !self.warning {
+		return warnNone
+	}
+	return self.warnCause
 }
 
 // isWarning reports whether new flows should avoid this channel: the resize
@@ -8218,6 +8434,53 @@ func (self *multiClientChannel) isWarning() bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	return self.warning || self.quarantined
+}
+
+// donorVerdict is affinityDonorEligible's answer, kept three-valued so the
+// caller can count the interesting refusal (a group scattered by its donor's
+// quarantine) separately from the ordinary ones.
+type donorVerdict int
+
+const (
+	// donorEligible: inherit
+	donorEligible donorVerdict = iota
+	// donorRefused: warned (any cause) -- the pre-G-1 behavior for every
+	// exclusion, and still the behavior for resize warnings
+	donorRefused
+	// donorQuarantineScattered: refused ONLY because of quarantine -- with
+	// group-follow on this would have been (or was, before staleness) a
+	// follow, so the refusal is the scatter G-1 exists to count and prevent
+	donorQuarantineScattered
+	// donorQuarantineFollowed: quarantined, and inherited anyway under
+	// group-follow with fresh receive evidence
+	donorQuarantineFollowed
+)
+
+// affinityDonorEligible decides whether this channel may donate to a new flow
+// of an affinity group it already hosts. A resize warning always refuses --
+// draining, starved, and unhealthy exits shed new flows on purpose (draining
+// changes under G-3's coordinated migration, not here). Quarantine refuses
+// UNLESS group-follow is on and the exit has received return traffic within
+// freshness: suspicion alone must not split a site's egress ip, but a
+// receive-silent bench gets no fresh flows. Takes only this channel's own
+// stateLock, the same discipline as isWarning -- the inherit path calls this
+// under the parent lock.
+func (self *multiClientChannel) affinityDonorEligible(followQuarantine bool, freshness time.Duration) donorVerdict {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.warning {
+		return donorRefused
+	}
+	if self.quarantined {
+		if !followQuarantine || freshness <= 0 {
+			return donorQuarantineScattered
+		}
+		if self.lastReceiveAckTime.IsZero() || freshness <= time.Since(self.lastReceiveAckTime) {
+			return donorQuarantineScattered
+		}
+		return donorQuarantineFollowed
+	}
+	return donorEligible
 }
 
 // dialStrikeWindow is how long a dial failure or a connect success counts
@@ -8673,6 +8936,24 @@ func comparativeConnectTimeout(
 	return comparativeTimeout
 }
 
+// loadScaledMinDestinations is the G-6 corroboration scaling: the effective
+// distinct-destination requirement for the soft no-receive-ack verdict is
+// max(configuredMin, flowCount/perFlows). A loaded exit has more in-flight
+// questions and more ways to look briefly silent, so the busier it is, the
+// broader the silence must be before suspicion is admissible -- the
+// 2026-08-03 field session benched five 22-24-flow exits on soft evidence
+// and acquitted every one. perFlows <= 0 disables the scaling (the flat
+// pre-change behavior). Pure, so the table is testable.
+func loadScaledMinDestinations(configuredMin int, flowCount int, perFlows int) int {
+	if perFlows <= 0 {
+		return configuredMin
+	}
+	if scaled := flowCount / perFlows; configuredMin < scaled {
+		return scaled
+	}
+	return configuredMin
+}
+
 // Split out from detectBlackhole so the decision can be tested against real
 // window stats rather than restated in a test, where it could drift from what
 // actually ships.
@@ -8937,6 +9218,11 @@ func (self *multiClientChannel) detectBlackhole() {
 				self.receivingSiblings,
 			)
 
+			// read once per pass: the corroboration gate below scales with it,
+			// and the verdict handling further down reuses the same reading so
+			// one pass judges one consistent count
+			flowCount := self.flowCount()
+
 			reason, held := blackholeReasonFromStats(
 				now,
 				windowStats,
@@ -8944,10 +9230,17 @@ func (self *multiClientChannel) detectBlackhole() {
 				self.reliabilitySettings().BlackholeReceiveTimeout,
 				connectTimeout,
 				blackholeGates{
-					transportDown:             transportDown,
-					uplinkStale:               uplinkStale,
-					receiveFreshSince:         receiveFreshSince,
-					minReceiveAckDestinations: self.reliabilitySettings().MinBlackholeDestinations,
+					transportDown:     transportDown,
+					uplinkStale:       uplinkStale,
+					receiveFreshSince: receiveFreshSince,
+					// the G-6 load scaling: the busier the exit, the broader
+					// the silence must be before the soft verdict is
+					// admissible
+					minReceiveAckDestinations: loadScaledMinDestinations(
+						self.reliabilitySettings().MinBlackholeDestinations,
+						flowCount,
+						self.reliabilitySettings().BlackholeLoadCorroboration,
+					),
 				},
 			)
 			blackhole := reason != blackholeNone
@@ -8990,8 +9283,8 @@ func (self *multiClientChannel) detectBlackhole() {
 				// stateLock -- which must never happen under a channel lock.
 				// quarantinedSince only carries when the current episode is
 				// for this same reason, so the expiry bound measures one
-				// unbroken run of the same evidence.
-				flowCount := self.flowCount()
+				// unbroken run of the same evidence. flowCount was read once
+				// at the top of this pass, before the corroboration gate.
 				quarantinedSince := time.Time{}
 				if quarantineReason, quarantineStart := self.quarantineState(); quarantineReason == reason {
 					quarantinedSince = quarantineStart

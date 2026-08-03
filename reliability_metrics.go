@@ -164,6 +164,16 @@ type reliabilityMetrics struct {
 	busyProbesAcquitted     atomic.Uint64
 	schedulerPausesDetected atomic.Uint64
 
+	// the G-1 group-follow ledger. groupsFollowed counts inheritances a
+	// quarantined donor was allowed to keep (group-follow on, receive
+	// fresh); groupsScattered counts inheritances refused ONLY because of
+	// quarantine -- each one is a site whose egress ip split on suspicion,
+	// which is exactly the event the follow exists to eliminate. Refusals
+	// for resize warnings are not counted here; those exits shed new flows
+	// on purpose.
+	groupsFollowed  atomic.Uint64
+	groupsScattered atomic.Uint64
+
 	pendingLock sync.Mutex
 	pending     map[recoveryKey]pendingRecovery
 }
@@ -225,6 +235,20 @@ func (self *reliabilityMetrics) probeSent() {
 		return
 	}
 	self.probesSent.Add(1)
+}
+
+func (self *reliabilityMetrics) groupFollowed() {
+	if self == nil {
+		return
+	}
+	self.groupsFollowed.Add(1)
+}
+
+func (self *reliabilityMetrics) groupScattered() {
+	if self == nil {
+		return
+	}
+	self.groupsScattered.Add(1)
 }
 
 func (self *reliabilityMetrics) probeAnswered() {
@@ -461,6 +485,8 @@ func (self *reliabilityMetrics) reset() {
 	self.busyProbesSent.Store(0)
 	self.busyProbesAcquitted.Store(0)
 	self.schedulerPausesDetected.Store(0)
+	self.groupsFollowed.Store(0)
+	self.groupsScattered.Store(0)
 
 	self.pendingLock.Lock()
 	defer self.pendingLock.Unlock()
@@ -530,6 +556,13 @@ type ReliabilityMetricsSnapshot struct {
 	BusyProbesSent          uint64
 	BusyProbesAcquitted     uint64
 	SchedulerPausesDetected uint64
+
+	// GroupsFollowed counts new flows a quarantined donor kept under
+	// group-follow; GroupsScattered counts the ones quarantine still turned
+	// away (follow off, or the donor receive-stale) -- each a site whose
+	// egress ip split on suspicion.
+	GroupsFollowed  uint64
+	GroupsScattered uint64
 }
 
 func (self *reliabilityMetrics) snapshot() *ReliabilityMetricsSnapshot {
@@ -568,6 +601,9 @@ func (self *reliabilityMetrics) snapshot() *ReliabilityMetricsSnapshot {
 		BusyProbesSent:          self.busyProbesSent.Load(),
 		BusyProbesAcquitted:     self.busyProbesAcquitted.Load(),
 		SchedulerPausesDetected: self.schedulerPausesDetected.Load(),
+
+		GroupsFollowed:  self.groupsFollowed.Load(),
+		GroupsScattered: self.groupsScattered.Load(),
 	}
 
 	if 0 < exitLossEvents {

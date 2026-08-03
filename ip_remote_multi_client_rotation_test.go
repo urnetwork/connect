@@ -304,11 +304,11 @@ func TestDrainBranchWarnsUnconditionally(t *testing.T) {
 		return rest[warnAt : warnAt+end+1]
 	}
 
-	if got := nextWarningCall(`printStats("client drain")`); got != "setWarning(true)" {
-		t.Errorf("the drain branch warns with %q, want setWarning(true): a rank-kept speed exit never drains", got)
+	if got := nextWarningCall(`printStats("client drain")`); got != "setWarning(true, warnDraining)" {
+		t.Errorf("the drain branch warns with %q, want setWarning(true, warnDraining): a rank-kept speed exit never drains, and the cause must say retirement, not evidence", got)
 	}
-	if got := nextWarningCall(`printStats("client health warning")`); got != "setWarning(remove)" {
-		t.Errorf("the health-warning branch warns with %q, want the rank-derived setWarning(remove)", got)
+	if got := nextWarningCall(`printStats("client health warning")`); got != "setWarning(remove, warnUnhealthy)" {
+		t.Errorf("the health-warning branch warns with %q, want the rank-derived setWarning(remove, warnUnhealthy)", got)
 	}
 }
 

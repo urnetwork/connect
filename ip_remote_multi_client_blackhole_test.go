@@ -1028,6 +1028,52 @@ func TestComparativeConnectDefaults(t *testing.T) {
 	}
 }
 
+// The G-6 corroboration table: the soft no-receive-ack verdict needs more
+// distinct silent destinations the busier the exit is, and the scaling can
+// only ever raise the bar, never lower it below the configured minimum.
+func TestLoadScaledMinDestinations(t *testing.T) {
+	for _, row := range []struct {
+		configured, flows, perFlows, want int
+	}{
+		// flat behavior: scaling off
+		{2, 24, 0, 2},
+		{2, 24, -1, 2},
+		// under the threshold the configured minimum holds
+		{2, 0, 8, 2},
+		{2, 15, 8, 2},
+		// the 2026-08-03 shape: a 24-flow exit needs 3, not 2
+		{2, 24, 8, 3},
+		{2, 80, 8, 10},
+		// the scaling never lowers the configured bar
+		{4, 8, 8, 4},
+		// a zero configured minimum still scales up under load
+		{0, 24, 8, 3},
+	} {
+		got := loadScaledMinDestinations(row.configured, row.flows, row.perFlows)
+		if got != row.want {
+			t.Errorf("loadScaledMinDestinations(%d, %d, %d) = %d, want %d",
+				row.configured, row.flows, row.perFlows, got, row.want)
+		}
+	}
+}
+
+// And the gate must actually be fed the scaled value: the detectBlackhole
+// call site has to route MinBlackholeDestinations through the scaler, or the
+// table above tests a function nothing reaches.
+func TestBlackholeGateUsesLoadScaledDestinations(t *testing.T) {
+	source, err := readSource("ip_remote_multi_client.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, ok := functionBody(source, "func (self *multiClientChannel) detectBlackhole()")
+	if !ok {
+		t.Fatal("could not find detectBlackhole")
+	}
+	if !strings.Contains(body, "loadScaledMinDestinations(") {
+		t.Error("detectBlackhole does not call loadScaledMinDestinations: the corroboration gate ignores load")
+	}
+}
+
 func readSource(name string) (string, error) {
 	b, err := os.ReadFile(name)
 	if err != nil {
