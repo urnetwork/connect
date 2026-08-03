@@ -1183,6 +1183,16 @@ const flowOwnerCacheMaxCount = 8192
 // cached answer, including any in flight, so a changed pin-rule set takes
 // effect on the next new flow.
 func (self *RemoteUserNatMultiClient) SetFlowOwnerLookup(lookup FlowOwnerLookupFunc) {
+	// the wiring's proof of life. Per-app pinning crosses three languages
+	// and a platform api before it can do anything, and without this line a
+	// field capture cannot distinguish "no apps pinned" from "the lookup
+	// never reached the go side" -- the standing rule of this work is that a
+	// mechanism with no observable signal does not exist.
+	loggerOrDefault(self.log).Infof("%s\n", relEvent(
+		"pin_lookup",
+		"installed", lookup != nil,
+	))
+
 	// the two locks are taken in SEPARATE sections, never nested:
 	// flowOwnerLock is documented as a leaf, and nesting the parent lock
 	// under it here would be the only place in this file that inverts the
@@ -1363,6 +1373,33 @@ func (self *RemoteUserNatMultiClient) recordAppPinWithLock(appId string, client 
 // called with stateLock
 func (self *RemoteUserNatMultiClient) clearAppPinsWithLock() {
 	self.appPinClients = nil
+}
+
+// AppPin is one pinned app's current placement, for the readout.
+type AppPin struct {
+	AppId    string
+	ClientId Id
+}
+
+// AppPins reports where each pinned app's flows are currently placed -- the
+// field answer to "did the pin engage, and is the app on one exit". Empty
+// while nothing is pinned or before a pinned app has opened a flow. Also
+// folded into the heartbeat as the pins= count.
+func (self *RemoteUserNatMultiClient) AppPins() []*AppPin {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	appPins := make([]*AppPin, 0, len(self.appPinClients))
+	for appId, client := range self.appPinClients {
+		if client == nil {
+			continue
+		}
+		appPins = append(appPins, &AppPin{AppId: appId, ClientId: client.ClientId()})
+	}
+	slices.SortFunc(appPins, func(a, b *AppPin) int {
+		return strings.Compare(a.AppId, b.AppId)
+	})
+	return appPins
 }
 
 func NewRemoteUserNatMultiClientWithDefaults(

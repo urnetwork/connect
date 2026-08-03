@@ -331,6 +331,17 @@ func heartbeatTestExits() []*ExitInfo {
 	}
 }
 
+// two pinned apps sharing one exit: the healthy shape, and the one the beat
+// has to be able to distinguish from "pinning never engaged"
+func heartbeatTestAppPins() []*AppPin {
+	clientId := Id{}
+	clientId[0] = 7
+	return []*AppPin{
+		{AppId: "com.dd.doordash", ClientId: clientId},
+		{AppId: "com.google.android.youtube", ClientId: clientId},
+	}
+}
+
 // The beat has to be right, or a reconstruction reads the wrong session shape
 // and chases the wrong fix.
 func TestHeartbeatContentFromFixture(t *testing.T) {
@@ -347,7 +358,7 @@ func TestHeartbeatContentFromFixture(t *testing.T) {
 		GroupsScattered:           1,
 	}
 
-	state := heartbeatStateFrom(heartbeatTestExits(), metrics)
+	state := heartbeatStateFrom(heartbeatTestExits(), metrics, heartbeatTestAppPins())
 	AssertEqual(t, state.exits, 3)
 	AssertEqual(t, state.proven, 2)
 	AssertEqual(t, state.quarantined, 1)
@@ -358,16 +369,39 @@ func TestHeartbeatContentFromFixture(t *testing.T) {
 	AssertEqual(t, state.tierMin, 0)
 	AssertEqual(t, state.tierMax, 3)
 
+	// two pinned apps, both on one exit -- the shape that says pinning
+	// engaged AND is holding
+	AssertEqual(t, state.pinnedApps, 2)
+	AssertEqual(t, state.pinnedExits, 1)
+
 	line := relHeartbeatLine(state, 125*time.Second)
 	want := "[rel] event=heartbeat exits=3 proven=2 quarantined=1 warned=2 flows=6 " +
-		"tiers=0/3 held=7/2 deferred=1 rebinds=9/3 probes=40/38 follow=6/1 removals=5 uptime=125"
+		"tiers=0/3 held=7/2 deferred=1 rebinds=9/3 probes=40/38 follow=6/1 pins=2/1 removals=5 uptime=125"
 	AssertEqual(t, line, want)
+}
+
+// The distinction the beat exists to make: pinned apps placed on DIFFERENT
+// exits is a split, and must not read the same as the healthy shape.
+func TestHeartbeatPinsCountDistinctExits(t *testing.T) {
+	clientA, clientB := Id{}, Id{}
+	clientA[0], clientB[0] = 1, 2
+	split := heartbeatStateFrom(nil, nil, []*AppPin{
+		{AppId: "com.a", ClientId: clientA},
+		{AppId: "com.b", ClientId: clientB},
+	})
+	AssertEqual(t, split.pinnedApps, 2)
+	AssertEqual(t, split.pinnedExits, 2)
+
+	// and nothing pinned reads as zero, never as an error
+	none := heartbeatStateFrom(nil, nil, nil)
+	AssertEqual(t, none.pinnedApps, 0)
+	AssertEqual(t, none.pinnedExits, 0)
 }
 
 // An empty pool and a nil metrics snapshot are both ordinary states (a window
 // still forming, a bare client), not crashes.
 func TestHeartbeatEmptyState(t *testing.T) {
-	state := heartbeatStateFrom(nil, nil)
+	state := heartbeatStateFrom(nil, nil, nil)
 	AssertEqual(t, state, heartbeatState{})
 	line := relHeartbeatLine(state, 0)
 	if !strings.Contains(line, "exits=0") || !strings.Contains(line, "tiers=0/0") {
@@ -382,8 +416,8 @@ func TestHeartbeatSignatureSuppression(t *testing.T) {
 	metrics := &ReliabilityMetricsSnapshot{ProbesSent: 1}
 	exits := heartbeatTestExits()
 
-	first := heartbeatStateFrom(exits, metrics)
-	second := heartbeatStateFrom(exits, metrics)
+	first := heartbeatStateFrom(exits, metrics, nil)
+	second := heartbeatStateFrom(exits, metrics, nil)
 	if first != second {
 		t.Error("two identical readouts produce different signatures, so an idle session would log every beat")
 	}

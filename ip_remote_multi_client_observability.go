@@ -495,6 +495,14 @@ type heartbeatState struct {
 	removals        uint64
 	groupsFollowed  uint64
 	groupsScattered uint64
+	// pinnedApps is how many pinned apps currently have a placement, and
+	// pinnedExits how many distinct exits hold them. pinned/exits equal and
+	// both non-zero is the healthy shape (each app on one exit); a jump in
+	// pinnedExits past pinnedApps cannot happen by construction, but a
+	// pinnedApps of 0 while the owner has pin rules is the signal the
+	// mechanism never engaged.
+	pinnedApps  int
+	pinnedExits int
 }
 
 // heartbeatStateFrom folds the existing readouts into the beat's state. Pure,
@@ -508,8 +516,17 @@ type heartbeatState struct {
 // asks. Tiers are EFFECTIVE tiers (the rank selection actually uses), so a
 // heartbeat showing tiers=0/3 on a good pool says three exits are carrying
 // demerits.
-func heartbeatStateFrom(exits []*ExitInfo, metrics *ReliabilityMetricsSnapshot) heartbeatState {
+func heartbeatStateFrom(exits []*ExitInfo, metrics *ReliabilityMetricsSnapshot, appPins []*AppPin) heartbeatState {
 	state := heartbeatState{}
+	pinnedExits := map[Id]bool{}
+	for _, appPin := range appPins {
+		if appPin == nil {
+			continue
+		}
+		state.pinnedApps += 1
+		pinnedExits[appPin.ClientId] = true
+	}
+	state.pinnedExits = len(pinnedExits)
 	first := true
 	for _, exit := range exits {
 		if exit == nil {
@@ -573,6 +590,10 @@ func relHeartbeatLine(state heartbeatState, uptime time.Duration) string {
 		// still caused. A rising second number is the signal group-follow is
 		// not doing its job (off, or the benched exits are receive-silent).
 		"follow", pair(state.groupsFollowed, state.groupsScattered),
+		// pinned apps placed / distinct exits holding them. Equal and
+		// non-zero is healthy; 0 while pin rules exist means the mechanism
+		// never engaged.
+		"pins", pair(state.pinnedApps, state.pinnedExits),
 		"removals", state.removals,
 		"uptime", int64(uptime/time.Second),
 	)
@@ -637,7 +658,7 @@ func (self *RemoteUserNatMultiClient) runHeartbeat() {
 		// both readouts take their own locks internally and are called with
 		// nothing held, which is the contract Exits() and the metrics snapshot
 		// document
-		state := heartbeatStateFrom(self.Exits(), self.ReliabilityMetrics())
+		state := heartbeatStateFrom(self.Exits(), self.ReliabilityMetrics(), self.AppPins())
 		if beaten && state == last {
 			// nothing moved since the last beat; an idle session stays quiet
 			continue
