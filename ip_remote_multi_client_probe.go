@@ -677,6 +677,18 @@ waiting:
 		self.recordProbeFail(destination)
 	}
 
+	// the silence streak (ProbeSilenceWarnStreak): total silence -- no stage-B
+	// answer AND no dns resolution across the whole pass -- counts one strike;
+	// any answer at all is proof of life and clears it, PASSED or not. This is
+	// the only writer besides the receive-side acquittal in probeSilentStreak,
+	// and it is deliberately downstream of the pass/fail recording above: the
+	// streak is a placement input, never a qualification one.
+	if result.Answered == 0 && result.Resolved == 0 {
+		client.recordProbeSilence()
+	} else {
+		client.recordProbeLife()
+	}
+
 	// one line per pass per provider at the default level, per the house rules;
 	// the per-packet events are silent. This is the line the acceptance drill
 	// reads, so it carries the counts that decide the verdict.
@@ -720,6 +732,9 @@ waiting:
 		"flows", client.flowCount(),
 		// 1 on a failing pass means the tunnel as a whole was silent
 		"uplinkstale", uplinkStale,
+		// consecutive all-silent passes; at ProbeSilenceWarnStreak the resize
+		// pass warns the exit out of new-flow placement (event=warn to=silent)
+		"streak", client.probeSilentStreak(),
 	))
 
 	return result

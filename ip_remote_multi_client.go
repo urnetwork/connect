@@ -317,6 +317,12 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		ProbeTimeout: 4 * time.Second,
 		// 0 = the entire table each pass; see the field comment
 		ProbeSampleHostCount: 0,
+		// two consecutive all-silent passes before the placement warning: one
+		// could be unlucky timing against a dozing device's wake cycle, two
+		// spans ~10 minutes of retest cadence -- and the streak self-clears on
+		// any evidence of life, so the cost of warning a provider that was
+		// merely asleep is a few minutes out of new-flow selection
+		ProbeSilenceWarnStreak: 2,
 		// mainnet-aggressive: evaluate twice the candidates a window expansion
 		// needs and keep the best. 1 is today's behavior, the A/B point.
 		EvaluationPoolMultiple: 2,
@@ -788,6 +794,27 @@ type MultiClientSettings struct {
 	// pass back to a rotating block of that many hosts; the rotation then walks
 	// the whole table across passes (4 was the pre-change compact width).
 	ProbeSampleHostCount int
+
+	// ProbeSilenceWarnStreak is the placement compensation for provider-device
+	// churn: after this many consecutive probe passes answered with TOTAL
+	// silence -- zero stage-B answers and zero dns resolutions, so zero
+	// evidence of life across ~all of the target table -- the exit is warned
+	// out of new-flow selection (and the size math backfills a replacement),
+	// exactly like a dial-starved exit. This is a PLACEMENT input only:
+	// probes remain non-punitive for removal, which stays traffic-based, and
+	// any evidence of life -- one probe answer, one dns resolution, one
+	// received byte newer than the silence -- clears the streak and the
+	// warning on the next pass.
+	//
+	// The field capture that motivates it (2026-08-04): providers on consumer
+	// devices go completely silent mid-session (0 of 127 answers, repeated
+	// for 25+ minutes) and sat in the window classified healthy -- idle stats
+	// look fine -- until real app traffic bound to them and suffered the
+	// ~10-30s of dead syns that convicts. This warns the corpse out of
+	// placement between the first silent retests and that conviction.
+	//
+	// 0 is off (the pre-change behavior and the A/B comparison point).
+	ProbeSilenceWarnStreak int
 
 	// EvaluationPoolMultiple is the aggressive-pooling knob: window expansion
 	// requests and ping-evaluates this multiple of the candidates it actually
@@ -1917,6 +1944,7 @@ type ReliabilitySettings struct {
 	ProviderProbe              bool
 	ProbeTimeout             time.Duration
 	ProbeSampleHostCount     int
+	ProbeSilenceWarnStreak   int
 	EvaluationPoolMultiple   int
 	// FormationPollTimeout: 0 falls back to SendRetryTimeout (the pre-change
 	// behavior), unlike the other zero-value-off knobs here
@@ -1970,6 +1998,7 @@ func ReliabilitySettingsFrom(settings *MultiClientSettings) *ReliabilitySettings
 		ProviderProbe:              settings.ProviderProbe,
 		ProbeTimeout:             settings.ProbeTimeout,
 		ProbeSampleHostCount:     settings.ProbeSampleHostCount,
+		ProbeSilenceWarnStreak:   settings.ProbeSilenceWarnStreak,
 		EvaluationPoolMultiple:   settings.EvaluationPoolMultiple,
 		FormationPollTimeout:     settings.FormationPollTimeout,
 
@@ -6979,6 +7008,28 @@ func (self *multiClientWindow) resize() {
 							if self.clientMigrateFunc != nil && client.markQuarantineMigrateOnce() {
 								self.clientMigrateFunc(client, "bench")
 							}
+						} else if silenceStreak := self.reliabilitySettings().ProbeSilenceWarnStreak; 0 < silenceStreak &&
+							silenceStreak <= client.probeSilentStreak() &&
+							1 < len(clientStats) {
+							// the provider-churn compensation
+							// (ProbeSilenceWarnStreak): repeated all-silent
+							// probe passes mean the device has very likely left
+							// the network, but a flowless corpse's idle stats
+							// reach this branch looking healthy, and before this
+							// warning it stayed SELECTABLE until real app
+							// traffic bound to it and ate the ~10-30s of dead
+							// syns that convicts (field capture 2026-08-04).
+							// Warn it out of new-flow placement and let the size
+							// math backfill a replacement; removal stays
+							// traffic-based, so a device that was merely asleep
+							// is acquitted by its next answered probe or
+							// received byte rather than executed. Gated like
+							// starvation on having somewhere else to go: warning
+							// the sole exit blocks every new flow while helping
+							// none of them.
+							previousCause, causeChanged := client.setWarning(true, warnSilent)
+							self.logWarnTransition(client, previousCause, causeChanged, stats)
+							warnClient(client, stats)
 						} else {
 							previousCause, causeChanged := client.setWarning(false, warnNone)
 							self.logWarnTransition(client, previousCause, causeChanged, stats)
@@ -8378,6 +8429,16 @@ type multiClientChannel struct {
 	// send hot path, so an atomic rather than the state lock.
 	stalled atomic.Bool
 
+	// silentProbeStreak counts consecutive probe passes this channel answered
+	// with TOTAL silence: zero stage-B answers and zero dns resolutions, so
+	// zero evidence of life across the whole pass. silentProbeTime is when the
+	// latest such pass completed (unix nanos); any receive newer than it is
+	// proof of life and acquits the streak (see probeSilentStreak). Atomics
+	// because the writers are probe passes and the reader is the resize pass,
+	// and neither should contend on stateLock for a counter.
+	silentProbeStreak atomic.Int32
+	silentProbeTime   atomic.Int64
+
 	// dialFailureTimes and connectSuccessTimes are this channel's sliding-window
 	// strike record: a timestamp appended on each intercepted dial failure, and
 	// on each flow that first receives inbound data (a proven upstream connect).
@@ -9095,6 +9156,47 @@ func (self *multiClientChannel) probeReceiveAge() int64 {
 	return int64(time.Since(self.lastReceiveAckTime) / time.Second)
 }
 
+// recordProbeSilence counts one totally-silent probe pass: questions were
+// asked (stage-B probes sent, usually a resolution stage too) and nothing at
+// all came back. Called only by probeExit, which never runs two passes at
+// once against the same channel.
+func (self *multiClientChannel) recordProbeSilence() {
+	self.silentProbeTime.Store(time.Now().UnixNano())
+	self.silentProbeStreak.Add(1)
+}
+
+// recordProbeLife resets the silence streak: the pass carried at least one
+// answer back -- a stage-B answer or a dns resolution -- which is proof the
+// provider is on the network regardless of whether the pass PASSED. The
+// reset is unconditional; a concurrent silent pass losing its increment to
+// this store costs one retest interval of warning delay, nothing more.
+func (self *multiClientChannel) recordProbeLife() {
+	self.silentProbeStreak.Store(0)
+}
+
+// probeSilentStreak reads the current silence streak, first acquitting it if
+// any receive landed after the latest silent pass: real return traffic is
+// better evidence of life than a probe answer, and without this check an
+// exit that revived between retests would stay warned until the prober got
+// back around to it. The acquittal CAS deliberately loses to a concurrent
+// recordProbeSilence -- newer silence outranks the older receive it raced.
+func (self *multiClientChannel) probeSilentStreak() int {
+	streak := self.silentProbeStreak.Load()
+	if streak == 0 {
+		return 0
+	}
+	self.stateLock.Lock()
+	lastReceive := self.lastReceiveAckTime
+	self.stateLock.Unlock()
+	if !lastReceive.IsZero() && self.silentProbeTime.Load() < lastReceive.UnixNano() {
+		if self.silentProbeStreak.CompareAndSwap(streak, 0) {
+			return 0
+		}
+		streak = self.silentProbeStreak.Load()
+	}
+	return int(streak)
+}
+
 // hasRecentBusyProbeAck reports whether this channel answered a liveness
 // probe inside window -- a return packet that crossed the uplink, which is
 // what the stall-conviction sibling gate counts as proof the tunnel works.
@@ -9321,6 +9423,11 @@ const (
 	// warnUnhealthy: a stats or blackhole verdict was demoted or deferred
 	// against it, or the rank-derived health warning fired.
 	warnUnhealthy
+	// warnSilent: ProbeSilenceWarnStreak consecutive probe passes answered
+	// with total silence -- the provider device has very likely left the
+	// network (dozed, switched networks, app killed). Placement only; removal
+	// stays traffic-based.
+	warnSilent
 )
 
 func (self warnCause) String() string {
@@ -9333,6 +9440,8 @@ func (self warnCause) String() string {
 		return "capacity"
 	case warnUnhealthy:
 		return "unhealthy"
+	case warnSilent:
+		return "silent"
 	default:
 		return ""
 	}
