@@ -37,8 +37,8 @@ import (
 
 const ConnectCtlVersion = "0.0.1"
 
-const DefaultApiUrl = "http://74.50.11.113:8080"
-const DefaultConnectUrl = "ws://74.50.11.113:5080"
+const DefaultApiUrl = "https://api.bringyour.com"
+const DefaultConnectUrl = "wss://connect.bringyour.com"
 
 var Out *log.Logger
 var Err *log.Logger

@@ -6,7 +6,42 @@ import (
 	"testing"
 	"time"
 
+	"github.com/urnetwork/connect/protocol"
+
 )
+
+func TestMultiClientChannelAcceptsMigrationOnlyFromControl(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	migrator := &recordingWindowTransportMigrator{calls: make(chan time.Time, 2)}
+	channel := &multiClientChannel{
+		ctx:               ctx,
+		args:              &multiClientChannelArgs{},
+		transportMigrator: migrator,
+	}
+	want := time.Now().Add(time.Second).Truncate(time.Millisecond)
+	frame := RequireToFrameWithDefaultProtocolVersion(&protocol.ResidentMigrate{
+		MigrateTime: uint64(want.UnixMilli()),
+	})
+
+	channel.clientReceive(SourceId(NewId()), []*protocol.Frame{frame}, Peer{})
+	select {
+	case <-migrator.calls:
+		t.Fatal("ordinary data source triggered transport migration")
+	default:
+	}
+
+	channel.clientReceive(SourceId(ControlId), []*protocol.Frame{frame}, Peer{})
+	select {
+	case got := <-migrator.calls:
+		if !got.Equal(want) {
+			t.Fatalf("migration time = %s, want %s", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("control-source migration was not forwarded")
+	}
+}
 
 type recordingWindowTransportMigrator struct {
 	calls chan time.Time

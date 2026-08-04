@@ -1820,6 +1820,41 @@ func forceAllowDirect(performanceProfile *PerformanceProfile, allowDirect bool) 
 	return &overridden
 }
 
+// performanceProfilesEqual reports whether two profiles produce the same
+// window behavior: nil and an auto profile are equivalent when their
+// orthogonal flags are false, and auto ignores WindowSize. This distinction
+// matters because presentation code commonly reconstructs an equivalent
+// value when it resumes; treating the fresh pointer as a settings change
+// unnecessarily retires every healthy window client.
+func performanceProfilesEqual(a *PerformanceProfile, b *PerformanceProfile) bool {
+	allowDirect := func(profile *PerformanceProfile) bool {
+		return profile != nil && profile.AllowDirect
+	}
+	postQuantumEncryption := func(profile *PerformanceProfile) bool {
+		return profile != nil && profile.PostQuantumEncryption
+	}
+	if allowDirect(a) != allowDirect(b) ||
+		postQuantumEncryption(a) != postQuantumEncryption(b) {
+		return false
+	}
+
+	windowType := func(profile *PerformanceProfile) WindowType {
+		if profile == nil {
+			return WindowTypeAuto
+		}
+		return profile.WindowType
+	}
+	aWindowType := windowType(a)
+	bWindowType := windowType(b)
+	if aWindowType != bWindowType {
+		return false
+	}
+	if aWindowType == WindowTypeAuto {
+		return true
+	}
+	return a.WindowSize == b.WindowSize
+}
+
 func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *PerformanceProfile) {
 	performanceProfile = self.overrideAllowDirect(performanceProfile)
 	if performanceProfile != nil {
@@ -1827,6 +1862,13 @@ func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *
 		if err != nil {
 			panic(err)
 		}
+	}
+
+	// an equivalent profile is a no-op: shuffle() below retires every window
+	// client, and presentation code commonly re-applies an equal profile on
+	// resume -- that must not tear the window down
+	if performanceProfilesEqual(self.config.Load().performanceProfile, performanceProfile) {
+		return
 	}
 
 	func() {
@@ -3884,6 +3926,17 @@ func (self *RemoteUserNatMultiClient) rebindFlowsWithLock(
 	}
 
 	return
+}
+
+// MultiClientGeneratorTransportMigrator is an optional generator capability
+// for make-before-break drain migration. Window clients own platform
+// transports through their generator, so the generator is the only layer
+// with enough information to construct a replacement using the same auth and
+// route manager. Implementations must return promptly and deduplicate
+// overlapping requests; the existing window/client lifecycle remains the
+// fallback for generators that do not implement it.
+type MultiClientGeneratorTransportMigrator interface {
+	MigrateClientTransport(client *Client, args *MultiClientGeneratorClientArgs, migrateTime time.Time)
 }
 
 // the icmp send gate is not part of a normal handshake; it flips to a
@@ -7589,7 +7642,7 @@ func (self *multiClientWindow) resize() {
 			// expand
 			n := targetWindowSize - len(clients)
 			self.monitor.AddWindowExpandEvent(
-				windowSizeMin <= len(clients),
+				windowMinSatisfied(windowSizeMin, len(clients), len(warnedClients), fixedDestination),
 				targetWindowSize+len(warnedClients),
 			)
 			addedCount = self.expand(
@@ -7606,7 +7659,7 @@ func (self *multiClientWindow) resize() {
 		}
 		if 0 < windowSize.WindowSizeHardMax && windowSize.WindowSizeHardMax < len(clients)+len(warnedClients)+addedCount {
 			self.monitor.AddWindowExpandEvent(
-				windowSizeMin <= len(clients)+addedCount,
+				windowMinSatisfied(windowSizeMin, len(clients)+addedCount, len(warnedClients), fixedDestination),
 				windowSize.WindowSizeHardMax,
 			)
 			collapseLowestWeighted(max(0, windowSize.WindowSizeHardMax-addedCount))
@@ -7615,7 +7668,7 @@ func (self *multiClientWindow) resize() {
 			}
 		} else {
 			self.monitor.AddWindowExpandEvent(
-				windowSizeMin <= len(clients)+addedCount,
+				windowMinSatisfied(windowSizeMin, len(clients)+addedCount, len(warnedClients), fixedDestination),
 				len(clients)+len(warnedClients)+addedCount,
 			)
 		}
@@ -8251,6 +8304,23 @@ func (self *multiClientWindow) lastResortClients() []*multiClientChannel {
 // OrderedClients is the window's offer to the race: its healthy clients,
 // weighted-shuffled, narrowed to the best rank present ("min tier") so
 // traffic does not cross rank until necessary.
+// windowMinSatisfied is the monitor's "connected" gate. A fixed destination
+// counts warned clients toward the minimum: its only replacement is another
+// client to the same endpoint, so a warned sole selected peer must not
+// report "connecting" for its whole session while it is still routing (the
+// same judgment as the OrderedClients fixed-destination fallback).
+func windowMinSatisfied(
+	windowSizeMin int,
+	clientCount int,
+	warnedCount int,
+	fixedDestination bool,
+) bool {
+	if fixedDestination {
+		return windowSizeMin <= clientCount+warnedCount
+	}
+	return windowSizeMin <= clientCount
+}
+
 func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 	return self.orderedClients(false)
 }
@@ -8612,6 +8682,9 @@ type multiClientChannel struct {
 	clientReceivePacketCallback clientReceivePacketFunction
 	dialFailureCallback         dialFailureFunction
 	ingressSecurityPolicy       SecurityPolicy
+	// optional owner of this client's platform transport. Captured once at
+	// construction so ordinary receive frames do not pay a type assertion.
+	transportMigrator MultiClientGeneratorTransportMigrator
 	performanceProfile          *PerformanceProfile
 	createTime                  time.Time
 
@@ -8957,8 +9030,12 @@ func newMultiClientChannel(
 	// }
 
 	clientChannel := &multiClientChannel{
-		ctx:                         cancelCtx,
-		cancel:                      cancel,
+		ctx:    cancelCtx,
+		cancel: cancel,
+		transportMigrator: func() MultiClientGeneratorTransportMigrator {
+			migrator, _ := generator.(MultiClientGeneratorTransportMigrator)
+			return migrator
+		}(),
 		log:                         loggerOrDefault(settings.Log),
 		args:                        args,
 		clientReceivePacketCallback: clientReceivePacketCallback,
@@ -11688,6 +11765,26 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 
 	for _, frame := range frames {
 		switch frame.MessageType {
+		case protocol.MessageType_TransferResidentMigrate:
+			// Drain migration is a platform control instruction. A provider
+			// must not be able to make us churn transports by injecting the
+			// same protobuf on an ordinary data path.
+			if self.transportMigrator == nil || !source.IsControlSource() {
+				continue
+			}
+			message, err := FromFrame(frame)
+			if err != nil {
+				continue
+			}
+			residentMigrate, ok := message.(*protocol.ResidentMigrate)
+			if !ok {
+				continue
+			}
+			self.transportMigrator.MigrateClientTransport(
+				self.client,
+				&self.args.MultiClientGeneratorClientArgs,
+				time.UnixMilli(int64(residentMigrate.MigrateTime)),
+			)
 		case protocol.MessageType_IpIpPacketFromProvider:
 			if ipPacketFromProvider_, err := FromFrame(frame); err == nil {
 				ipPacketFromProvider := ipPacketFromProvider_.(*protocol.IpPacketFromProvider)
