@@ -267,8 +267,21 @@ func DefaultContractManagerSettingsWithBufferSize(bufferSize int) *ContractManag
 		panic(err)
 	}
 	return &ContractManagerSettings{
-		SequenceBufferSize:                          bufferSize,
-		InitialContractTransferByteCount:            kib(16),
+		SequenceBufferSize: bufferSize,
+		// The first contract of every sequence used to be kib(16), of which
+		// ~80% is usable -- about nine packets. Acquiring a contract blocks
+		// the send sequence, so a new destination paid two blocking
+		// negotiations before it reached the second contract: one to open,
+		// one nine packets later. Web traffic is many short flows to many
+		// destinations, and every new destination restarts at sequence 0, so
+		// it never outgrows that; a provider log showed ~40 opening
+		// acquisitions in 13 minutes across ten destinations at 80ms-2.4s
+		// each, which is what a several-second stall on a new domain looks
+		// like. mib(1) covers essentially any single web response in the
+		// opening contract. It is a larger pre-settlement exposure to an
+		// unproven peer -- a deliberate tradeoff of escrow risk for the
+		// first-connection stall, bounded by the unchanged mib(128) ceiling.
+		InitialContractTransferByteCount:            mib(1),
 		InitialNetworkPeerContractTransferByteCount: mib(1),
 		StandardContractTransferByteCount:           mib(128),
 		ContractTransferByteSeqScale:                4,
