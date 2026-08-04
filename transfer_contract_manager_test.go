@@ -95,20 +95,24 @@ func TestInitialNetworkPeerContractCoversColdPageBurst(t *testing.T) {
 	AssertEqual(t, mib(1), byteCount)
 }
 
-func TestInitialPublicForceStreamContractKeepsSmallEscrow(t *testing.T) {
+// the opening contract is the configured initial size for every sequence
+// class -- see the InitialContractTransferByteCount rationale: the opening
+// size trades pre-settlement escrow exposure against the blocking
+// negotiation every new destination pays at sequence 0
+func TestInitialPublicForceStreamContractOpensAtInitialSize(t *testing.T) {
 	settings := DefaultContractManagerSettings()
 	manager := &ContractManager{settings: settings}
 
 	byteCount := manager.contractByteCount(ContractKey{ForceStream: true}, 0, 0)
-	AssertEqual(t, kib(16), byteCount)
+	AssertEqual(t, settings.InitialContractTransferByteCount, byteCount)
 }
 
-func TestInitialRegularContractKeepsSmallEscrow(t *testing.T) {
+func TestInitialRegularContractOpensAtInitialSize(t *testing.T) {
 	settings := DefaultContractManagerSettings()
 	manager := &ContractManager{settings: settings}
 
 	byteCount := manager.contractByteCount(ContractKey{}, 0, 0)
-	AssertEqual(t, kib(16), byteCount)
+	AssertEqual(t, settings.InitialContractTransferByteCount, byteCount)
 }
 
 func TestConnectedNetworkPeerUsesLargeInitialContract(t *testing.T) {
@@ -137,7 +141,7 @@ func TestConnectedNetworkPeerUsesLargeInitialContract(t *testing.T) {
 	AssertEqual(t, mib(1), byteCount)
 }
 
-func TestDisconnectedNetworkPeerKeepsSmallInitialContract(t *testing.T) {
+func TestDisconnectedNetworkPeerKeepsInitialContract(t *testing.T) {
 	peerId := NewId()
 	disconnectTime := uint64(time.Now().UnixMilli())
 	peerManager := NewPeerManager(
@@ -162,7 +166,7 @@ func TestDisconnectedNetworkPeerKeepsSmallInitialContract(t *testing.T) {
 		0,
 		0,
 	)
-	AssertEqual(t, kib(16), byteCount)
+	AssertEqual(t, DefaultContractManagerSettings().InitialContractTransferByteCount, byteCount)
 }
 
 func TestInitialNetworkPeerContractHonorsLargerMessageMinimum(t *testing.T) {

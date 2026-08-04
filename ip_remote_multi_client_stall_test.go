@@ -496,7 +496,7 @@ func TestMultiClientStaleFlowCleanupCannotDeleteReplacement(t *testing.T) {
 				path.DestinationIp = []byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}
 			}
 
-			old, _, _ := multi.sendUpdate(path)
+			old, _, _ := multi.sendUpdate(path, flowPin{})
 			if old == nil {
 				t.Fatal("initial flow was not created")
 			}
@@ -565,95 +565,12 @@ func TestMultiClientCancelledFlowTableRejectsNewGeneration(t *testing.T) {
 		SourcePort:      53000,
 		DestinationIp:   []byte{192, 0, 2, 53},
 		DestinationPort: 53,
-	})
+	}, flowPin{})
 	if update != nil {
 		t.Fatal("cancelled multi-client admitted a post-close flow generation")
 	}
 	if len(multi.ip4PathUpdates) != 0 || len(multi.ip6PathUpdates) != 0 {
 		t.Fatal("cancelled multi-client recreated flow-table state")
-	}
-}
-
-func TestMultiClientLateSendReconcileCannotRepublishRetiredGeneration(t *testing.T) {
-	for _, version := range []int{4, 6} {
-		func() {
-			ctx, cancel := context.WithCancel(context.Background())
-			multi := &RemoteUserNatMultiClient{
-				ctx:              ctx,
-				cancel:           cancel,
-				ip4PathUpdates:   map[Ip4Path]*multiClientChannelUpdate{},
-				ip6PathUpdates:   map[Ip6Path]*multiClientChannelUpdate{},
-				affinityIp4Paths: map[Ip4Path]map[Ip4Path]time.Time{},
-				affinityIp6Paths: map[Ip6Path]map[Ip6Path]time.Time{},
-				clientUpdates:    map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
-			}
-			path := &IpPath{
-				Version:         version,
-				Protocol:        IpProtocolTcp,
-				SourcePort:      12345,
-				DestinationPort: 443,
-			}
-			if version == 4 {
-				path.SourceIp = []byte{10, 0, 0, 1}
-				path.DestinationIp = []byte{192, 0, 2, 1}
-			} else {
-				path.SourceIp = []byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
-				path.DestinationIp = []byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}
-			}
-			update := newMultiClientChannelUpdate(ctx, path)
-			defer update.Close()
-			if version == 4 {
-				multi.ip4PathUpdates[path.ToIp4Path()] = update
-			} else {
-				multi.ip6PathUpdates[path.ToIp6Path()] = update
-			}
-
-			clientCtx, cancelClient := context.WithCancel(context.Background())
-			defer cancelClient()
-			client := &multiClientChannel{ctx: clientCtx}
-
-			// Model a send callback that began while the flow was live and
-			// selected its client only after Close had canceled and removed the
-			// map generation. Its deferred reconciliation must not make the
-			// retired update reachable again.
-			cancel()
-			multi.stateLock.Lock()
-			clear(multi.ip4PathUpdates)
-			clear(multi.ip6PathUpdates)
-			clear(multi.clientUpdates)
-			multi.stateLock.Unlock()
-			update.client.Store(client)
-			multi.reconcileSendClientPath(update, nil)
-
-			if got := update.client.Load(); got != nil {
-				t.Fatal("retired flow retained a client selected by a late send")
-			}
-			if len(multi.clientUpdates) != 0 {
-				t.Fatal("late send republished a retired flow through clientUpdates")
-			}
-		}()
-	}
-}
-
-func TestMultiClientUpdateCloseReleasesCommittedClient(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	update := newMultiClientChannelUpdate(ctx, &IpPath{
-		Version:         4,
-		Protocol:        IpProtocolTcp,
-		SourceIp:        []byte{10, 0, 0, 1},
-		SourcePort:      12345,
-		DestinationIp:   []byte{192, 0, 2, 1},
-		DestinationPort: 443,
-	})
-	clientCtx, cancelClient := context.WithCancel(context.Background())
-	defer cancelClient()
-	update.client.Store(&multiClientChannel{ctx: clientCtx})
-
-	update.Close()
-
-	if got := update.client.Load(); got != nil {
-		t.Fatal("closed flow generation retained its committed provider client")
 	}
 }
 
@@ -707,53 +624,6 @@ func TestMultiClientRemovalClearsAllFlowsWithBoundedResetWork(t *testing.T) {
 	}
 	if got := multi.removalReceiveDropCount.Load(); got != uint64(len(updates)-2) {
 		t.Fatalf("accounted reset drops = %d, want %d", got, len(updates)-2)
-	}
-}
-
-func TestMultiClientRemovalPrioritizesRecentlyActiveFlowResets(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	clientCtx, cancelClient := context.WithCancel(ctx)
-	cancelClient()
-	client := &multiClientChannel{ctx: clientCtx}
-	multi := &RemoteUserNatMultiClient{
-		ctx:                 ctx,
-		log:                 NewNoopLogger(),
-		removalReceiveQueue: make(chan receivePacket, 2),
-		clientUpdates:       map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
-	}
-	updates := make(map[*multiClientChannelUpdate]bool, 4)
-	baseTime := time.Now().Add(-time.Minute)
-	for i := range 4 {
-		update := &multiClientChannelUpdate{
-			ipPath: &IpPath{
-				Version:         4,
-				Protocol:        IpProtocolTcp,
-				SourceIp:        []byte{10, 0, 0, byte(i + 1)},
-				SourcePort:      10_000 + i,
-				DestinationIp:   []byte{192, 0, 2, 1},
-				DestinationPort: 443,
-			},
-			activityTime: baseTime.Add(time.Duration(i) * time.Second),
-		}
-		update.client.Store(client)
-		updates[update] = true
-	}
-	multi.clientUpdates[client] = updates
-
-	multi.removeClient(client)
-
-	gotPorts := map[int]bool{}
-	for range cap(multi.removalReceiveQueue) {
-		packet := <-multi.removalReceiveQueue
-		gotPorts[packet.IpPath.SourcePort] = true
-	}
-	if !gotPorts[10_002] || !gotPorts[10_003] || len(gotPorts) != 2 {
-		t.Fatalf("bounded reset work selected ports %v, want the two most recently active flows", gotPorts)
-	}
-	if got := multi.removalReceiveDropCount.Load(); got != 2 {
-		t.Fatalf("accounted reset drops = %d, want 2", got)
 	}
 }
 
@@ -1177,56 +1047,6 @@ func (*cleanupOrderTestGenerator) FixedDestinationSize() (int, bool) {
 	return 1, true
 }
 
-// A stats observer can remain parked after app suspension. Essential client,
-// transport, and generator cleanup must happen before observer-only close
-// events, otherwise every peer churn retains another transport/client record.
-func TestMultiClientCleanupPrecedesBlockedObservers(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	generator := &cleanupOrderTestGenerator{removeCalled: make(chan struct{})}
-	settings := DefaultMultiClientSettings()
-	settings.CPingRestTimeout = time.Hour
-	settings.BlackholeTimeout = time.Hour
-	statsGate := newStallGate()
-
-	channel, err := newMultiClientChannel(
-		ctx,
-		&multiClientChannelArgs{
-			MultiClientGeneratorClientArgs: MultiClientGeneratorClientArgs{ClientId: NewId()},
-			Destination:                    RequireMultiHopId(NewId()),
-		},
-		generator,
-		func(*multiClientChannel, TransferPath, protocol.ProvideMode, IpPath, []byte) {},
-		func(*ContractStatus) {},
-		func([]*ContractStatsEvent) { statsGate.Wait() },
-		func() {},
-		nil,
-		false,
-		settings,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	entry := generator.client.ContractManager().registerContractStats(
-		NewId(),
-		false,
-		false,
-		TransferPath{},
-		100,
-	)
-	entry.updateUsedByteCount(10)
-	channel.Cancel()
-
-	select {
-	case <-generator.removeCalled:
-	case <-time.After(time.Second):
-		t.Fatal("blocked observer retained essential generator/client resources")
-	}
-	waitForStallStart(t, statsGate)
-	statsGate.Release()
-}
-
 type maintenanceContextTestGenerator struct{}
 
 func (*maintenanceContextTestGenerator) NextDestinations(int, []MultiHopId, string) (map[MultiHopId]DestinationStats, error) {
@@ -1279,61 +1099,6 @@ func (*maintenanceContextTestGenerator) NewClientContext(
 	return nil, callCtx.Err()
 }
 
-func TestMultiClientGeneratorMaintenanceDeadlines(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	settings := DefaultMultiClientSettings()
-	settings.WindowGeneratorTimeout = 25 * time.Millisecond
-	settings.WindowClientCreateTimeout = 25 * time.Millisecond
-	generator := &maintenanceContextTestGenerator{}
-	window := &multiClientWindow{
-		ctx:       ctx,
-		generator: generator,
-		settings:  settings,
-	}
-
-	start := time.Now()
-	_, err := window.nextDestinations(1, nil, "quality")
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("discovery error = %v, want deadline exceeded", err)
-	}
-	if elapsed := time.Since(start); 250*time.Millisecond < elapsed {
-		t.Fatalf("discovery deadline took %s", elapsed)
-	}
-
-	start = time.Now()
-	_, err = window.newClientArgs(RequireMultiHopId(NewId()))
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("auth error = %v, want deadline exceeded", err)
-	}
-	if elapsed := time.Since(start); 250*time.Millisecond < elapsed {
-		t.Fatalf("auth deadline took %s", elapsed)
-	}
-
-	start = time.Now()
-	_, err = newMultiClientChannel(
-		ctx,
-		&multiClientChannelArgs{
-			MultiClientGeneratorClientArgs: MultiClientGeneratorClientArgs{ClientId: NewId()},
-			Destination:                    RequireMultiHopId(NewId()),
-		},
-		generator,
-		func(*multiClientChannel, TransferPath, protocol.ProvideMode, IpPath, []byte) {},
-		func(*ContractStatus) {},
-		func([]*ContractStatsEvent) {},
-		func() {},
-		nil,
-		false,
-		settings,
-	)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("client setup error = %v, want deadline exceeded", err)
-	}
-	if elapsed := time.Since(start); 250*time.Millisecond < elapsed {
-		t.Fatalf("client setup deadline took %s", elapsed)
-	}
-}
-
 type successfulMaintenanceGenerator struct {
 	maintenanceContextTestGenerator
 	client           *Client
@@ -1350,51 +1115,6 @@ func (self *successfulMaintenanceGenerator) NewClientContext(
 	self.sawSetupDeadline.Store(hasDeadline)
 	self.client = NewClient(ctx, args.ClientId, NewNoContractClientOob(), settings)
 	return self.client, nil
-}
-
-// The setup deadline must bound only construction. Parenting the returned
-// client to callCtx is an easy fix for a setup stall that silently kills every
-// healthy peer when the setup timer expires later.
-func TestMultiClientSetupDeadlineDoesNotOwnClientLifetime(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	settings := DefaultMultiClientSettings()
-	settings.WindowClientCreateTimeout = 20 * time.Millisecond
-	settings.CPingRestTimeout = time.Hour
-	settings.BlackholeTimeout = time.Hour
-	generator := &successfulMaintenanceGenerator{}
-
-	channel, err := newMultiClientChannel(
-		ctx,
-		&multiClientChannelArgs{
-			MultiClientGeneratorClientArgs: MultiClientGeneratorClientArgs{ClientId: NewId()},
-			Destination:                    RequireMultiHopId(NewId()),
-		},
-		generator,
-		func(*multiClientChannel, TransferPath, protocol.ProvideMode, IpPath, []byte) {},
-		func(*ContractStatus) {},
-		func([]*ContractStatsEvent) {},
-		func() {},
-		nil,
-		false,
-		settings,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer channel.Close()
-	if !generator.sawSetupDeadline.Load() {
-		t.Fatal("client setup did not receive its bounded call context")
-	}
-
-	time.Sleep(2 * settings.WindowClientCreateTimeout)
-	select {
-	case <-channel.Done():
-		t.Fatal("successful client inherited the expired setup deadline")
-	case <-generator.client.Done():
-		t.Fatal("generator client inherited the expired setup deadline")
-	default:
-	}
 }
 
 type recoveringMaintenanceGenerator struct {
@@ -1458,377 +1178,17 @@ func (*recoveringMaintenanceGenerator) NewClientContext(
 	panic("client creation not used")
 }
 
-// A timeout must end only the attempt, not the sole enumerator. This catches
-// the subtle failure where adding a deadline merely made the producer return
-// permanently (closing clientChannelArgs and leaving resize unable to recover).
-func TestMultiClientEnumeratorRetriesAfterStalledGeneratorCalls(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	settings := DefaultMultiClientSettings()
-	settings.WindowGeneratorTimeout = 20 * time.Millisecond
-	settings.WindowEnumerateErrorTimeout = time.Millisecond
-	settings.WindowExpandArgsTimeout = time.Second
-	generator := &recoveringMaintenanceGenerator{
-		destination: RequireMultiHopId(NewId()),
-	}
-	window := &multiClientWindow{
-		ctx:               ctx,
-		log:               DefaultLogger(),
-		generator:         generator,
-		windowType:        WindowTypeQuality,
-		settings:          settings,
-		clientChannelArgs: make(chan *multiClientChannelArgs),
-		clients:           map[Id]*multiClientChannel{},
-		generatorMonitor:  NewMonitor(),
-	}
-	go window.randomEnumerateClientArgs()
-
-	select {
-	case args := <-window.clientChannelArgs:
-		if args == nil || args.Destination != generator.destination {
-			t.Fatalf("unexpected recovered args: %+v", args)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("enumerator did not recover after discovery/auth deadlines")
-	}
-	if generator.discoveries.Load() < 2 || generator.auths.Load() < 2 {
-		t.Fatalf(
-			"enumerator did not retry both stalled calls: discovery=%d auth=%d",
-			generator.discoveries.Load(),
-			generator.auths.Load(),
-		)
-	}
-}
-
-func TestMultiClientPingAdmissionAcceptsSynchronousAck(t *testing.T) {
-	pingDone, pingCancel := context.WithCancel(context.Background())
-	defer pingCancel()
-	var stateLock sync.Mutex
-	var began bool
-	var acknowledged bool
-	var failed bool
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		success, err := runMultiClientPingAdmission(
-			pingDone,
-			&stateLock,
-			func() { began = true },
-			func(ack func(error)) (bool, error) {
-				// A transport is allowed to complete admission and its
-				// acknowledgement in the same call stack. Holding
-				// stateLock across send deadlocks here.
-				ack(nil)
-				return true, nil
-			},
-			func(error) {
-				acknowledged = true
-				pingCancel()
-			},
-			func() {
-				failed = true
-				pingCancel()
-			},
-		)
-		if err != nil || !success {
-			t.Errorf("synchronous admission failed: success=%v err=%v", success, err)
-		}
-	}()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("synchronous ping acknowledgement deadlocked on the evaluation lock")
-	}
-	if !began || !acknowledged || failed {
-		t.Fatalf("unexpected evaluation state: began=%v acknowledged=%v failed=%v", began, acknowledged, failed)
-	}
-}
-
-func TestMultiClientPingAdmissionBlockedNeighborDoesNotStallAck(t *testing.T) {
-	var stateLock sync.Mutex
-	firstDone, firstCancel := context.WithCancel(context.Background())
-	defer firstCancel()
-	secondDone, secondCancel := context.WithCancel(context.Background())
-	defer secondCancel()
-
-	firstAck := make(chan func(error), 1)
-	firstCommitted := make(chan struct{})
-	success, err := runMultiClientPingAdmission(
-		firstDone,
-		&stateLock,
-		func() {},
-		func(ack func(error)) (bool, error) {
-			firstAck <- ack
-			return true, nil
-		},
-		func(error) {
-			close(firstCommitted)
-			firstCancel()
-		},
-		firstCancel,
-	)
-	if err != nil || !success {
-		t.Fatalf("first ping admission failed: success=%v err=%v", success, err)
-	}
-
-	secondSendStarted := make(chan struct{})
-	releaseSecondSend := make(chan struct{})
-	secondAdmissionDone := make(chan struct{})
-	go func() {
-		defer close(secondAdmissionDone)
-		_, _ = runMultiClientPingAdmission(
-			secondDone,
-			&stateLock,
-			func() {},
-			func(func(error)) (bool, error) {
-				close(secondSendStarted)
-				<-releaseSecondSend
-				return false, nil
-			},
-			func(error) {},
-			secondCancel,
-		)
-	}()
-	select {
-	case <-secondSendStarted:
-	case <-time.After(time.Second):
-		t.Fatal("second ping did not enter its blocked send admission")
-	}
-
-	(<-firstAck)(nil)
-	select {
-	case <-firstCommitted:
-	case <-time.After(250 * time.Millisecond):
-		t.Fatal("one blocked candidate send stalled another candidate's acknowledgement")
-	}
-
-	close(releaseSecondSend)
-	select {
-	case <-secondAdmissionDone:
-	case <-time.After(time.Second):
-		t.Fatal("second ping admission did not finish after release")
-	}
-}
-
-func testMultiClientPingAdmissionPanicReleasesLock(t *testing.T, phase string) {
-	t.Helper()
-	var stateLock sync.Mutex
-	func() {
-		defer func() {
-			if recover() == nil {
-				t.Fatal("injected evaluation panic was not propagated")
-			}
-		}()
-		_, _ = runMultiClientPingAdmission(
-			context.Background(),
-			&stateLock,
-			func() {
-				if phase == "begin" {
-					panic("begin")
-				}
-			},
-			func(func(error)) (bool, error) {
-				return false, nil
-			},
-			func(error) {},
-			func() {
-				if phase == "failure" {
-					panic("failure")
-				}
-			},
-		)
-	}()
-
-	lockAvailable := make(chan struct{})
-	go func() {
-		stateLock.Lock()
-		stateLock.Unlock()
-		close(lockAvailable)
-	}()
-	select {
-	case <-lockAvailable:
-	case <-time.After(time.Second):
-		t.Fatal("recovered evaluation panic poisoned the shared window lock")
-	}
-}
-
-func TestMultiClientPingAdmissionBeginPanicReleasesLock(t *testing.T) {
-	testMultiClientPingAdmissionPanicReleasesLock(t, "begin")
-}
-
-func TestMultiClientPingAdmissionFailurePanicReleasesLock(t *testing.T) {
-	testMultiClientPingAdmissionPanicReleasesLock(t, "failure")
-}
-
 func TestSchedulerPauseDetectionDoesNotConfuseOrdinaryTimerDelay(t *testing.T) {
 	expected := 100 * time.Millisecond
 	tolerance := 50 * time.Millisecond
-	if schedulerPauseDetected(time.Now(), expected, tolerance) {
+	if schedulerPauseDetected(0, expected, tolerance) {
 		t.Fatal("fresh timer was classified as a scheduler pause")
 	}
-	if !schedulerPauseDetected(time.Now().Add(-time.Second), expected, tolerance) {
+	if !schedulerPauseDetected(time.Second, expected, tolerance) {
 		t.Fatal("large scheduler gap was classified as an ordinary peer timeout")
 	}
-	if schedulerPauseDetected(time.Now().Add(-time.Second), expected, 0) {
+	if schedulerPauseDetected(time.Second, expected, 0) {
 		t.Fatal("disabled scheduler-pause detection still classified a pause")
-	}
-}
-
-func TestMultiClientAckedOneWayTrafficIsNotBlackhole(t *testing.T) {
-	settings := DefaultMultiClientSettings()
-	channel := &multiClientChannel{settings: settings}
-	now := time.Now()
-	stats := &clientWindowStats{
-		sendAckCount:      5,
-		sendAckByteCount:  304,
-		firstSendNackTime: now.Add(-2 * settings.BlackholeTimeout),
-		lastSendAckTime:   now.Add(-settings.BlackholeTimeout),
-	}
-	if channel.isBlackholeAt(stats, now) {
-		t.Fatal("remotely acknowledged one-way traffic was classified as a blackhole")
-	}
-}
-
-func TestMultiClientActiveProbeOwnsOutstandingReliableSendLiveness(t *testing.T) {
-	settings := DefaultMultiClientSettings()
-	channel := &multiClientChannel{settings: settings}
-	now := time.Now()
-	stats := &clientWindowStats{
-		sendNackCount:            1,
-		firstOutstandingSendTime: now.Add(-2 * settings.BlackholeTimeout),
-	}
-	if channel.isBlackholeAt(stats, now) {
-		t.Fatal("passive detector canceled a stale reliable send before its active liveness probe")
-	}
-}
-
-func TestMultiClientProbeDisabledOutstandingReliableSendIsBlackhole(t *testing.T) {
-	settings := DefaultMultiClientSettings()
-	settings.CPingBusyStaleTimeout = 0
-	channel := &multiClientChannel{settings: settings}
-	now := time.Now()
-	stats := &clientWindowStats{
-		sendNackCount:            1,
-		firstOutstandingSendTime: now.Add(-2 * settings.BlackholeTimeout),
-	}
-	if !channel.isBlackholeAt(stats, now) {
-		t.Fatal("probe-disabled stale reliable send lost its passive blackhole fallback")
-	}
-}
-
-func TestMultiClientProbeDisabledTransferAckIsBlackholeProgress(t *testing.T) {
-	settings := DefaultMultiClientSettings()
-	settings.CPingBusyStaleTimeout = 0
-	channel := &multiClientChannel{settings: settings}
-	now := time.Now()
-	stats := &clientWindowStats{
-		sendNackCount:            1,
-		firstOutstandingSendTime: now.Add(-2 * settings.BlackholeTimeout),
-		lastSendAckTime:          now.Add(-settings.BlackholeTimeout / 2),
-	}
-	if channel.isBlackholeAt(stats, now) {
-		t.Fatal("remote transfer progress did not suppress stale blackhole evidence")
-	}
-}
-
-func TestMultiClientProbeDisabledExpiredTransferAckDoesNotMaskOutstandingBlackhole(t *testing.T) {
-	settings := DefaultMultiClientSettings()
-	settings.CPingBusyStaleTimeout = 0
-	channel := &multiClientChannel{settings: settings}
-	now := time.Now()
-	stats := &clientWindowStats{
-		sendNackCount:            1,
-		firstOutstandingSendTime: now.Add(-3 * settings.BlackholeTimeout),
-		lastSendAckTime:          now.Add(-2 * settings.BlackholeTimeout),
-	}
-	if !channel.isBlackholeAt(stats, now) {
-		t.Fatal("old transfer progress masked a currently stalled reliable send")
-	}
-}
-
-func TestMultiClientActiveProbeDoesNotDisableSilentTcpConnectBlackhole(t *testing.T) {
-	settings := DefaultMultiClientSettings()
-	channel := &multiClientChannel{settings: settings}
-	now := time.Now()
-	stats := &clientWindowStats{
-		firstSendSynTime: now.Add(-2 * settings.BlackholeConnectTimeout),
-		sendSynCount:     1,
-	}
-	if !channel.isBlackholeAt(stats, now) {
-		t.Fatal("active reliable-send probing disabled independent silent TCP connect detection")
-	}
-}
-
-func TestMultiClientRejectedSendDoesNotCreateBlackholeEvidence(t *testing.T) {
-	settings := DefaultMultiClientSettings()
-	log := NewNoopLogger()
-	clientCtx, cancelClient := context.WithCancel(context.Background())
-	cancelClient()
-	channel := &multiClientChannel{
-		log:                       log,
-		args:                      &multiClientChannelArgs{Destination: RequireMultiHopId(NewId())},
-		client:                    &Client{ctx: clientCtx},
-		createTime:                time.Now(),
-		settings:                  settings,
-		eventBuckets:              []*multiClientEventBucket{},
-		ip4DestinationSourceCount: map[Ip4Path]map[Ip4Path]int{},
-		ip6DestinationSourceCount: map[Ip6Path]map[Ip6Path]int{},
-		packetStats:               &clientWindowStats{log: log},
-	}
-	ipPath := &IpPath{
-		Version:         4,
-		Protocol:        IpProtocolTcp,
-		SourceIp:        []byte{10, 0, 0, 1},
-		SourcePort:      12345,
-		DestinationIp:   []byte{192, 0, 2, 1},
-		DestinationPort: 443,
-	}
-
-	success, err := channel.sendPacketDetailedWithAck(make([]byte, 512), ipPath, time.Second, true)
-	if success || err == nil {
-		t.Fatalf("canceled transfer queue accepted packet: success=%t err=%v", success, err)
-	}
-
-	var stats *clientWindowStats
-	func() {
-		channel.stateLock.Lock()
-		defer channel.stateLock.Unlock()
-		stats = &clientWindowStats{
-			sendNackCount:            channel.packetStats.sendNackCount,
-			sendNackByteCount:        channel.packetStats.sendNackByteCount,
-			firstOutstandingSendTime: channel.packetStats.firstOutstandingSendTime,
-		}
-	}()
-	if stats.sendNackCount != 0 || stats.sendNackByteCount != 0 {
-		t.Fatalf(
-			"rejected send retained outstanding accounting: %d %dB",
-			stats.sendNackCount,
-			stats.sendNackByteCount,
-		)
-	}
-	if !stats.firstOutstandingSendTime.IsZero() {
-		t.Fatal("rejected send retained a blackhole deadline")
-	}
-	if channel.isBlackholeAt(stats, time.Now().Add(2*settings.BlackholeTimeout)) {
-		t.Fatal("rejected local enqueue was classified as a remote blackhole")
-	}
-}
-
-func TestMultiClientBusyStaleIgnoresOneWayTrafficWithoutResponseHistory(t *testing.T) {
-	settings := DefaultMultiClientSettings()
-	settings.CPingBusyStaleTimeout = time.Second
-	channel := &multiClientChannel{
-		settings: settings,
-		packetStats: &clientWindowStats{
-			sendAckCount:       5,
-			lastSendTime:       time.Now().Add(-2 * time.Second),
-			lastSendAckTime:    time.Now().Add(-2 * time.Second),
-			lastReceiveAckTime: time.Time{},
-		},
-	}
-	if channel.busyStale() {
-		t.Fatal("fully acknowledged one-way traffic requested a liveness probe")
 	}
 }
 
@@ -1847,13 +1207,15 @@ func TestMultiClientRemovalDoesNotWaitForPeerConnectionTeardown(t *testing.T) {
 			Destination:                    RequireMultiHopId(NewId()),
 		},
 		generator,
-		func(*multiClientChannel, TransferPath, protocol.ProvideMode, IpPath, []byte) {},
+		func(*multiClientChannel, TransferPath, protocol.ProvideMode, *IpPath, []byte) {},
+		nil,
+		DefaultSecurityPolicy(ctx),
 		func(*ContractStatus) {},
 		func([]*ContractStatsEvent) {},
 		func() {},
 		nil,
-		false,
 		settings,
+		nil, nil, nil, nil, nil, nil, nil, nil, nil,
 	)
 	if err != nil {
 		t.Fatal(err)

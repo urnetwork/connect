@@ -66,29 +66,23 @@ func TestTcpUpstreamDialFailureRejectsSource(t *testing.T) {
 
 	select {
 	case received := <-receives:
-		ipProtocol, sourceIp, destinationIp, transport, ok := parseIpv4(received)
+		// the answer is classified (see classifyDialFailure): a refused
+		// destination gets an honest RST+ACK, and everything else -- this
+		// generic error included -- gets the capacity-class icmp
+		// destination-unreachable whose embed names the failed flow, which
+		// newer clients intercept as the provider dial-failure signal and
+		// older ones drop at parse. Either way the source is answered, never
+		// left in syn-retransmit silence.
+		egressIpPath, ok := ipParseIcmpUnreachable(received)
 		if !ok {
-			t.Fatal("dial rejection did not parse as ipv4")
+			t.Fatal("dial rejection did not parse as the icmp dial-failure signal")
 		}
-		if ipProtocol != ipProtocolNumberTcp {
-			t.Fatalf("dial rejection protocol=%d, want tcp", ipProtocol)
+		if egressIpPath.SourcePort != 40001 || egressIpPath.DestinationPort != 443 {
+			t.Fatalf("dial-failure embed ports=%d->%d, want 40001->443",
+				egressIpPath.SourcePort, egressIpPath.DestinationPort)
 		}
-		if !sourceIp.Equal(net.IPv4(203, 0, 113, 7).To4()) ||
-			!destinationIp.Equal(net.IPv4(10, 0, 0, 1).To4()) {
-			t.Fatalf("dial rejection path=%s->%s", sourceIp, destinationIp)
-		}
-		rst := &parsedTcp{}
-		if !parseTcpPacket(sourceIp, destinationIp, transport, rst) {
-			t.Fatal("dial rejection did not parse as tcp")
-		}
-		if !rst.rst || !rst.ack || rst.syn {
-			t.Fatalf("dial rejection flags=%s, want RST ACK", rst.flagsString())
-		}
-		if rst.sourcePort != 443 || rst.destinationPort != 40001 {
-			t.Fatalf("dial rejection ports=%d->%d", rst.sourcePort, rst.destinationPort)
-		}
-		if rst.ackNumber != 1001 {
-			t.Fatalf("dial rejection ack=%d, want 1001", rst.ackNumber)
+		if !egressIpPath.DestinationIp.Equal(net.IPv4(203, 0, 113, 7).To4()) {
+			t.Fatalf("dial-failure embed destination=%s, want 203.0.113.7", egressIpPath.DestinationIp)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("upstream dial failure was silent")

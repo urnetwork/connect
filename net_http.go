@@ -152,6 +152,11 @@ type ClientStrategy struct {
 	extenderIpSecrets map[netip.Addr]string
 
 	nextConnectTime time.Time
+	// reconnectFastPathCount is the number of reconnect fast-path slots
+	// currently held (see NextReconnectTime). Guarded by mutex. The zero value
+	// means all slots free, so a bare test-constructed strategy works
+	// unchanged.
+	reconnectFastPathCount int
 }
 
 func NewClientStrategyWithDefaults(ctx context.Context) *ClientStrategy {
@@ -386,6 +391,73 @@ func (self *ClientStrategy) NextConnectTime() time.Time {
 	}
 	self.nextConnectTime = nextConnectTime
 	return nextConnectTime
+}
+
+const (
+	// reconnectFastPathLimit caps how many callers may hold the reconnect
+	// fast path (NextReconnectTime) at once. A device runs a handful of
+	// platform transports (h1 + the h3/pt variants), so 4 covers the common
+	// migration re-dial burst while guaranteeing the platform LB never sees
+	// more than 4 unpaced dials from one strategy -- callers past the cap fall
+	// back to the serialized NextConnectTime staircase.
+	reconnectFastPathLimit = 4
+	// reconnectFastPathMaxDelay is the independent per-caller jitter for a
+	// fast-path reconnect: uniform in [0, 250ms). Enough spread that
+	// concurrent reconnects do not hit the LB in the same instant, small
+	// enough that it never becomes the dominant term of a reconnect.
+	reconnectFastPathMaxDelay = 250 * time.Millisecond
+)
+
+// NextReconnectTime is the scoped fast path of NextConnectTime for a caller
+// whose transport was connected and just lost its connection.
+//
+// NextConnectTime advances ONE shared timestamp 100ms-1s per caller, which is
+// the right shape for cold connects: a burst of brand-new connections
+// staircases instead of stampeding the platform. After a network migration the
+// same staircase is wrong -- every transport held a working connection seconds
+// ago and every one of them must re-dial now, so ~8 necessary re-dials queue
+// behind each other and the last waits multiple seconds for a connection the
+// network could carry immediately. A reconnect burst is also not a stampede:
+// its size is bounded by how many connections were up, and each caller dials
+// once.
+//
+// So a caller that self-identifies as reconnecting draws a small INDEPENDENT
+// jitter (0-250ms) that neither reads nor advances the shared timestamp. The
+// fast path is capped at reconnectFastPathLimit concurrent holders (a
+// semaphore on the strategy) so the platform LB still never sees an unbounded
+// herd; a caller past the cap falls back to the serialized path. The returned
+// release func frees the slot and MUST be called once the dial attempt
+// completes (success or failure); it is idempotent and never nil. Callers use
+// this only for the FIRST dial after a lost connection -- retries after a
+// failed reconnect go back through NextConnectTime, restoring the old pacing
+// exactly when the platform itself is what is failing.
+func (self *ClientStrategy) NextReconnectTime() (time.Time, func()) {
+	acquired := false
+	func() {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		if self.reconnectFastPathCount < reconnectFastPathLimit {
+			self.reconnectFastPathCount += 1
+			acquired = true
+		}
+	}()
+	if !acquired {
+		// over the cap: this burst is not small after all; serialize like any
+		// other connect. NextConnectTime takes the mutex itself, so it must be
+		// called with the lock released (done above).
+		return self.NextConnectTime(), func() {}
+	}
+
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			self.mutex.Lock()
+			defer self.mutex.Unlock()
+			self.reconnectFastPathCount -= 1
+		})
+	}
+	jitter := time.Duration(mathrand.Int63n(int64(reconnectFastPathMaxDelay)))
+	return time.Now().Add(jitter), release
 }
 
 func (self *ClientStrategy) dialerWeights() map[*clientDialer]float32 {

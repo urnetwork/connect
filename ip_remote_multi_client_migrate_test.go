@@ -7,19 +7,8 @@ import (
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
+
 )
-
-type recordingWindowTransportMigrator struct {
-	calls chan time.Time
-}
-
-func (self *recordingWindowTransportMigrator) MigrateClientTransport(
-	client *Client,
-	args *MultiClientGeneratorClientArgs,
-	migrateTime time.Time,
-) {
-	self.calls <- migrateTime
-}
 
 func TestMultiClientChannelAcceptsMigrationOnlyFromControl(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -52,6 +41,18 @@ func TestMultiClientChannelAcceptsMigrationOnlyFromControl(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("control-source migration was not forwarded")
 	}
+}
+
+type recordingWindowTransportMigrator struct {
+	calls chan time.Time
+}
+
+func (self *recordingWindowTransportMigrator) MigrateClientTransport(
+	client *Client,
+	args *MultiClientGeneratorClientArgs,
+	migrateTime time.Time,
+) {
+	self.calls <- migrateTime
 }
 
 type fakeWindowPlatformTransport struct {

@@ -278,7 +278,7 @@ func TestMultiClientChannelWindowStats(t *testing.T) {
 		},
 	}
 
-	clientReceivePacket := func(client *multiClientChannel, source TransferPath, provideMode protocol.ProvideMode, ipPath IpPath, packet []byte) {
+	clientReceivePacket := func(client *multiClientChannel, source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
 		// Do nothing
 	}
 
@@ -306,7 +306,7 @@ func TestMultiClientChannelWindowStats(t *testing.T) {
 	}
 	AssertEqual(t, nil, err)
 
-	clientChannel, err := newMultiClientChannel(ctx, channelArgs, generator, clientReceivePacket, contractStatus, func(contractStatsEvents []*ContractStatsEvent) {}, func() {}, nil, false, settings)
+	clientChannel, err := newMultiClientChannel(ctx, channelArgs, generator, clientReceivePacket, nil, DefaultSecurityPolicy(ctx), contractStatus, func(contractStatsEvents []*ContractStatsEvent) {}, func() {}, nil, settings, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	AssertEqual(t, nil, err)
 
 	cancelCtxs := []context.Context{}
@@ -452,9 +452,6 @@ func TestMultiClientOverrideAllowDirect(t *testing.T) {
 	AssertEqual(t, false, pp.AllowDirect)
 }
 
-// TestMultiClientEquivalentPerformanceProfileIsNoOp protects the transport
-// lifetime boundary: rebuilding an equal app-side value must not publish a
-// new config or shuffle healthy window clients.
 func TestMultiClientEquivalentPerformanceProfileIsNoOp(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -115,6 +115,28 @@ func TestMultiRoute(t *testing.T) {
 	}
 }
 
+// HasActiveTransport is the transport cross-check the blackhole and stall
+// verdicts consult: an empty transport set means the client has no carrier,
+// so its silence proves nothing about the remote end. The set must read empty
+// before any registration, non-empty while a transport holds routes, and
+// empty again after removal -- a stale true would let verdicts convict a
+// provider whose channel cannot even reach the network.
+func TestRouteManagerHasActiveTransport(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	routeManager := NewRouteManager(ctx, "test")
+	AssertEqual(t, routeManager.HasActiveTransport(), false)
+
+	transport := NewSendGatewayTransport()
+	routeManager.UpdateTransport(transport, []Route{make(chan []byte)})
+	AssertEqual(t, routeManager.HasActiveTransport(), true)
+
+	// removal registers nil routes, which must empty the set
+	routeManager.RemoveTransport(transport)
+	AssertEqual(t, routeManager.HasActiveTransport(), false)
+}
+
 func TestP2pSendTransportMatchesPeerDestination(t *testing.T) {
 	// when a stream is created, the stream send transport must carry
 	// any traffic addressed to the peer,

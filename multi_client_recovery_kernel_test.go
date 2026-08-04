@@ -14,9 +14,30 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
-// TestMultiClientRecoveryKernel is the measurement kernel for the
-// multi-client dead-peer recovery auto-research loop. Env-gated so normal
-// suites skip it; each invocation measures one configuration.
+// TestRecoveryKernel is the measurement kernel for the multi-client dead-peer
+// recovery bake-off. Env-gated (URNET_RECOVERY=1) so normal suites skip it;
+// each invocation measures one configuration and emits one machine-readable
+// [recovery] line.
+//
+// Adapted from upstream main e05ecee's multi_client_recovery_kernel_test.go
+// (TestMultiClientRecoveryKernel) to OUR APIs. The goal is the instrument —
+// a neutral, in-process detect/gap/recover measurement — not fidelity to
+// their multi-client internals. Deltas from the upstream original:
+//   - URNET_REC_BUSYSTALE_MS (their CPingBusyStaleTimeout) is dropped: the
+//     busy-probe knob does not exist in this tree yet (P2 introduces our
+//     busy-probe with different settings). URNET_REC_DEGRADED (their
+//     settings.DegradedMode) is dropped for the same reason.
+//   - URNET_REC_SENDSTALL_MS is added: our headline detector is the
+//     SendStallTimeout bar, so the sweep can drive it. Unset keeps the
+//     tree default.
+//   - the provider NAT uses DefaultProviderLocalUserNatSettings (no
+//     WithMemoryTarget variant here).
+//   - sent packets are NOT MessagePoolReturn'ed: our ipOosUdpPacket
+//     allocates ordinary GC'd buffers and our SendPacket takes ownership on
+//     the race path (mirrors the ip_test.go e2e send loop).
+//   - the recovery-failure diagnostic dump reads our channel surface
+//     (WindowStats counters + IsDone) instead of their packetStats fields
+//     and busyStale probe state.
 //
 // Topology (fully in-process): a RemoteUserNatMultiClient over N provider
 // backends (each a Client + provider LocalUserNat + RemoteUserNatProvider
@@ -26,18 +47,12 @@ import (
 // idle gate); mid-transfer the pinned provider is killed abruptly
 // (client cancel — routes stay up, acks stop: the relay-blackhole case).
 //
-// Emits one machine-readable [recovery] line:
+// Emitted metrics:
 //   - detect_ms: kill -> monitor ProviderStateRemoved (detection + removal)
 //   - gap_ms: last echo before the gap -> first echo after
 //   - recover90_ms: kill -> first 1s window at >=90% of the pre-kill rate
 //   - refill_ms: kill -> monitor ProviderStateAdded (replacement joined)
-//
-// The failure-detection timeline is governed by MultiClientSettings
-// (AckTimeout, StatsWindowDuration, BlackholeTimeout, CPing*), all
-// overridable via env so the loop can sweep them, including
-// URNET_REC_PING_ALWAYS=1 which lifts the cping idle-only gate
-// (CPingMaxByteCountPerSecond) to emulate an always-on liveness probe.
-func TestMultiClientRecoveryKernel(t *testing.T) {
+func TestRecoveryKernel(t *testing.T) {
 	if os.Getenv("URNET_RECOVERY") == "" {
 		t.Skip("recovery kernel: set URNET_RECOVERY=1")
 	}
@@ -86,7 +101,7 @@ func TestMultiClientRecoveryKernel(t *testing.T) {
 		clientSettings := DefaultClientSettings()
 		clientSettings.Log = NewNoopLogger()
 		client := NewClient(providerCtx, clientId, NewNoContractClientOob(), clientSettings)
-		natSettings := DefaultProviderLocalUserNatSettingsWithMemoryTarget(4 * 1024 * 1024)
+		natSettings := DefaultProviderLocalUserNatSettings()
 		natSettings.Log = NewNoopLogger()
 		nat := NewLocalUserNat(providerCtx, clientId.String(), natSettings)
 		provider := NewRemoteUserNatProvider(client, nat, DefaultRemoteUserNatProviderSettings())
@@ -174,14 +189,11 @@ func TestMultiClientRecoveryKernel(t *testing.T) {
 	settings.StatsWindowBucketDuration = time.Duration(recoveryEnvInt("URNET_REC_BUCKET_MS", 1000)) * time.Millisecond
 	settings.BlackholeTimeout = time.Duration(recoveryEnvInt("URNET_REC_BLACKHOLE_MS", 5000)) * time.Millisecond
 	settings.WindowResizeTimeout = time.Duration(recoveryEnvInt("URNET_REC_RESIZE_MS", 15000)) * time.Millisecond
-	settings.CPingBusyStaleTimeout = time.Duration(recoveryEnvInt("URNET_REC_BUSYSTALE_MS", 5000)) * time.Millisecond
 	settings.CPingRestTimeout = time.Duration(recoveryEnvInt("URNET_REC_CPING_REST_MS", 10000)) * time.Millisecond
 	settings.CPingTimeout = time.Duration(recoveryEnvInt("URNET_REC_CPING_TIMEOUT_MS", 30000)) * time.Millisecond
-	if recoveryEnvInt("URNET_REC_DEGRADED", 0) == 1 {
-		// the host-degraded mode (low power / weak network): probe windows
-		// scale by DegradedLivenessScale — detection stretches accordingly,
-		// trading latency for false-positive resistance on slow devices
-		settings.DegradedMode.Store(true)
+	if sendStallMs := recoveryEnvInt("URNET_REC_SENDSTALL_MS", -1); 0 <= sendStallMs {
+		// our fork's headline detector; unset keeps the tree default
+		settings.SendStallTimeout = time.Duration(sendStallMs) * time.Millisecond
 	}
 	if recoveryEnvInt("URNET_REC_PING_ALWAYS", 0) == 1 {
 		// lift the idle-only gate: the continuous ping runs even on busy
@@ -238,9 +250,10 @@ func TestMultiClientRecoveryKernel(t *testing.T) {
 		binary.BigEndian.PutUint64(payload, sendSeq)
 		packet := ipOosUdpPacket(flowIpPath, payload)
 		// blocking send (-1): the window forms lazily on first traffic; a
-		// non-blocking send would drop before any client is pinned
+		// non-blocking send would drop before any client is pinned. the
+		// packet buffer is ordinary GC'd memory here and SendPacket takes
+		// ownership on the race path — no pool return (see the e2e loop)
 		multiClient.SendPacket(source, protocol.ProvideMode_Network, packet, -1)
-		MessagePoolReturn(packet)
 	}
 
 	sendDone := make(chan struct{})
@@ -346,9 +359,10 @@ func TestMultiClientRecoveryKernel(t *testing.T) {
 	addedAt := addedTime
 	monitorMutex.Unlock()
 	if recover90.IsZero() {
-		// Emit the killed destination's live channel state when recovery fails
-		// or regresses, identifying whether probe eligibility, probe timeout,
-		// removal, or flow reassignment is stuck.
+		// Emit the killed destination's live channel state when recovery
+		// fails, identifying whether detection, removal, or flow reassignment
+		// is stuck. Adapted to our channel surface: WindowStats counters +
+		// IsDone (their packetStats fields and busyStale do not exist here).
 		for windowType, window := range multiClient.windows {
 			for _, channel := range window.unorderedClients() {
 				generator.mutex.Lock()
@@ -357,24 +371,17 @@ func TestMultiClientRecoveryKernel(t *testing.T) {
 				if providerId != killed.clientId {
 					continue
 				}
-				channel.stateLock.Lock()
-				lastSendAgo := time.Since(channel.packetStats.lastSendTime).Milliseconds()
-				lastReceiveAgo := time.Since(channel.packetStats.lastReceiveAckTime).Milliseconds()
-				lastProbeAgo := int64(-1)
-				if !channel.packetStats.lastBusyProbeAckTime.IsZero() {
-					lastProbeAgo = time.Since(channel.packetStats.lastBusyProbeAckTime).Milliseconds()
+				stats, statsErr := channel.WindowStats()
+				if stats != nil {
+					fmt.Printf("[recovery-state] window=%d client=%s send_acks=%d send_nacks=%d receive_acks=%d last_event_ms=%d healthy=%t err=%v done=%t\n",
+						windowType, channel.ClientId(),
+						stats.sendAckCount, stats.sendNackCount, stats.receiveAckCount,
+						time.Since(stats.lastEventTime).Milliseconds(), stats.healthy,
+						statsErr, channel.IsDone())
+				} else {
+					fmt.Printf("[recovery-state] window=%d client=%s stats=nil err=%v done=%t\n",
+						windowType, channel.ClientId(), statsErr, channel.IsDone())
 				}
-				endErr := channel.endErr
-				channel.stateLock.Unlock()
-				done := false
-				select {
-				case <-channel.Done():
-					done = true
-				default:
-				}
-				fmt.Printf("[recovery-state] window=%d client=%s last_send_ms=%d last_receive_ms=%d last_probe_ms=%d busy_stale=%t end_err=%v done=%t\n",
-					windowType, channel.ClientId(), lastSendAgo, lastReceiveAgo, lastProbeAgo,
-					channel.busyStale(), endErr, done)
 			}
 		}
 		multiClient.stateLock.Lock()
@@ -405,7 +412,7 @@ func TestMultiClientRecoveryKernel(t *testing.T) {
 	if !gapStart.IsZero() && !gapEnd.IsZero() {
 		gapMs = gapEnd.Sub(gapStart).Milliseconds()
 	}
-	fmt.Printf("[recovery] providers=%d pps=%d ack_ms=%d statswin_ms=%d blackhole_ms=%d resize_ms=%d ping_always=%d cping_rest_ms=%d cping_timeout_ms=%d | pre_rate=%.1f detect_ms=%d refill_ms=%d gap_ms=%d recover90_ms=%d\n",
+	fmt.Printf("[recovery] providers=%d pps=%d ack_ms=%d statswin_ms=%d blackhole_ms=%d resize_ms=%d ping_always=%d cping_rest_ms=%d cping_timeout_ms=%d sendstall_ms=%d | pre_rate=%.1f detect_ms=%d refill_ms=%d gap_ms=%d recover90_ms=%d\n",
 		providerCount, pps,
 		recoveryEnvInt("URNET_REC_ACK_MS", 30000),
 		recoveryEnvInt("URNET_REC_STATSWIN_MS", 30000),
@@ -414,6 +421,7 @@ func TestMultiClientRecoveryKernel(t *testing.T) {
 		recoveryEnvInt("URNET_REC_PING_ALWAYS", 0),
 		recoveryEnvInt("URNET_REC_CPING_REST_MS", 10000),
 		recoveryEnvInt("URNET_REC_CPING_TIMEOUT_MS", 30000),
+		int64(settings.SendStallTimeout/time.Millisecond),
 		preKillRate,
 		ms(removedAt),
 		ms(addedAt),
@@ -513,9 +521,10 @@ func (self *recoveryGenerator) NewClient(clientCtx context.Context, args *MultiC
 
 	// A genuinely deep route approximates a live relay that keeps absorbing
 	// writes after the peer dies, isolating the ack/probe path from the
-	// route-full WriteTimeout mode. At 200 pps the former default of 64 filled
-	// in ~320 ms and accidentally measured the latter. Set a small explicit
-	// URNET_REC_ROUTEBUF (for example 64) to exercise route-full recovery.
+	// route-full WriteTimeout mode. At 200 pps a small buffer fills in
+	// hundreds of ms and accidentally measures the latter. Set a small
+	// explicit URNET_REC_ROUTEBUF (for example 64) to exercise route-full
+	// recovery.
 	routeBuf := recoveryEnvInt("URNET_REC_ROUTEBUF", 16384)
 	routeToProvider := make(chan []byte, routeBuf)
 	routeToClient := make(chan []byte, routeBuf)
