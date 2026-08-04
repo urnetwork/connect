@@ -133,6 +133,20 @@ type probeResult struct {
 	// probe sent. A pass that asked nothing never qualifies anyone.
 	Passed   bool
 	Duration time.Duration
+	// Resolved is how many of the pass's hostnames the provider carried a
+	// usable dns answer back for, supplied by the caller that ran the
+	// resolution stage (probeProviderPass). It is the provider-liveness
+	// half of the verdict: a provider that resolves names is demonstrably
+	// carrying traffic out and back, so answered==0 alongside Resolved>0 is
+	// a statement about the TARGETS (or about egress-ip policy at those
+	// targets), while Resolved==0 with nothing else alive usually means
+	// nothing carried the query at all.
+	//
+	// It is an input rather than something probeExit computes, because
+	// probeExit only ever sees already-resolved targets. A field that is
+	// declared, documented and logged but never assigned is worse than no
+	// field: it reports a constant that reads as evidence.
+	Resolved int
 }
 
 // probeSourceIp4 and probeSourceIp6 are the local addresses probe flows claim.
@@ -556,8 +570,11 @@ func (self *RemoteUserNatMultiClient) probeExit(
 	client *multiClientChannel,
 	targets []probeTarget,
 	timeout time.Duration,
+	// resolved: how many hostnames the provider carried a dns answer back
+	// for in this pass's resolution stage; 0 from callers that did none
+	resolved int,
 ) probeResult {
-	result := probeResult{}
+	result := probeResult{Resolved: resolved}
 	if self == nil || client == nil || len(targets) == 0 {
 		return result
 	}
@@ -663,6 +680,28 @@ waiting:
 	// one line per pass per provider at the default level, per the house rules;
 	// the per-packet events are silent. This is the line the acceptance drill
 	// reads, so it carries the counts that decide the verdict.
+	// The line has to separate "this provider is not there" from "these
+	// targets did not answer", because providers here are consumer DEVICES:
+	// one that is asleep, backgrounded, or off the network fails every probe
+	// while being a perfectly good provider when awake, and that is not the
+	// same fact as a provider whose upstream cannot reach the target list.
+	//
+	// recvage is the provider-side discriminator: a provider carrying live
+	// traffic that answers no probes is a TARGET-side or egress-policy
+	// story; one whose last receive is minutes old is very likely gone.
+	//
+	// uplinkstale is the PHONE-side one, and it is the discriminator that
+	// matters for this owner's actual case: the vpn runs on a mobile device
+	// that sleeps and changes networks, and while the phone's own uplink is
+	// silent EVERY provider fails EVERY probe at once. That is one fact
+	// about the phone, not fifteen facts about providers, and without this
+	// field the capture cannot tell those apart.
+	//
+	// All three reads are cheap and lock-safe here: probeExit holds nothing
+	// at this point (registration and cleanup take the parent lock in their
+	// own scopes above), probeReceiveAge takes only the channel's own lock,
+	// and uplinkGate/flowCount take the parent lock internally.
+	uplinkStale, _ := self.uplinkGate(time.Now())
 	loggerOrDefault(self.log).Infof("%s\n", relEvent(
 		"probe",
 		"exit", client.ClientId(),
@@ -670,6 +709,17 @@ waiting:
 		"answered", result.Answered,
 		"sent", result.Sent,
 		"ms", result.Duration.Round(time.Millisecond),
+		// -1 for never, so "no return traffic ever" and "none recently"
+		// are distinct facts
+		"recvage", client.probeReceiveAge(),
+		// hostnames the provider carried a dns answer back for this pass: a
+		// live provider whose upstream works resolves names even when the
+		// health hosts refuse the probe source
+		"dns", result.Resolved,
+		"transport", client.hasActiveTransport(),
+		"flows", client.flowCount(),
+		// 1 on a failing pass means the tunnel as a whole was silent
+		"uplinkstale", uplinkStale,
 	))
 
 	return result

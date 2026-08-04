@@ -6755,7 +6755,8 @@ func (self *multiClientWindow) resize() {
 				// Cancellations and cping failures never reach this branch
 				// (blackholeVerdictErr keys on the verdict prefix), so user
 				// action and dead-transport cleanup stay immediate.
-				client.setWarning(true, warnUnhealthy)
+				previousCause, causeChanged := client.setWarning(true, warnUnhealthy)
+				self.logWarnTransition(client, previousCause, causeChanged, nil)
 				self.metrics().removalDeferred()
 				// the full verdict error rides along as `detail`: a deferred
 				// removal may never be executed (the exit recovers, or stays
@@ -6901,7 +6902,8 @@ func (self *multiClientWindow) resize() {
 						// drain hands over to. The health branches below
 						// keep using `remove` untouched -- only the lifetime
 						// drain is exempt from the rank shield.
-						client.setWarning(true, warnDraining)
+						previousCause, causeChanged := client.setWarning(true, warnDraining)
+						self.logWarnTransition(client, previousCause, causeChanged, stats)
 						warnClient(client, stats)
 						// G-3: retirement is a hand-off, not a deadline. The
 						// drain's movable (established quic) flows are
@@ -6937,10 +6939,12 @@ func (self *multiClientWindow) resize() {
 						// destination could oscillate a single-exit window
 						// between warned and not indefinitely.
 						if ulimit {
-							client.setWarning(true, warnCapacity)
+							previousCause, causeChanged := client.setWarning(true, warnCapacity)
+							self.logWarnTransition(client, previousCause, causeChanged, stats)
 							warnClient(client, stats)
 						} else if 1 < len(clientStats) && client.dialStarved() {
-							client.setWarning(true, warnStarved)
+							previousCause, causeChanged := client.setWarning(true, warnStarved)
+							self.logWarnTransition(client, previousCause, causeChanged, stats)
 							warnClient(client, stats)
 						} else if client.isQuarantined() {
 							// a quarantined exit (detectBlackhole demoted a
@@ -6953,7 +6957,8 @@ func (self *multiClientWindow) resize() {
 							// math below sees the hole and expands a
 							// replacement for the flows it can no longer
 							// accept, which is the other half of the demote.
-							client.setWarning(false, warnNone)
+							previousCause, causeChanged := client.setWarning(false, warnNone)
+							self.logWarnTransition(client, previousCause, causeChanged, stats)
 							warnClient(client, stats)
 							// and hand its MOVABLE flows off now, once per
 							// episode. A quarantine is receive-silence by
@@ -6975,13 +6980,15 @@ func (self *multiClientWindow) resize() {
 								self.clientMigrateFunc(client, "bench")
 							}
 						} else {
-							client.setWarning(false, warnNone)
+							previousCause, causeChanged := client.setWarning(false, warnNone)
+							self.logWarnTransition(client, previousCause, causeChanged, stats)
 							keepClient(client, stats)
 						}
 					}
 				} else {
 					printStats("client health warning")
-					client.setWarning(remove, warnUnhealthy)
+					previousCause, causeChanged := client.setWarning(remove, warnUnhealthy)
+					self.logWarnTransition(client, previousCause, causeChanged, stats)
 					warnClient(client, stats)
 				}
 			} else {
@@ -7006,7 +7013,8 @@ func (self *multiClientWindow) resize() {
 					if self.reliabilitySettings().SoftVerdictDemote &&
 						!sendStalled && !sustainedUnhealthy &&
 						0 < self.flowCount(client) {
-						client.setWarning(true, warnUnhealthy)
+						previousCause, causeChanged := client.setWarning(true, warnUnhealthy)
+						self.logWarnTransition(client, previousCause, causeChanged, stats)
 						warnClient(client, stats)
 						self.log.Infof(
 							"[multi]unhealthy removal demoted to warning [%s]: carrying flows, evidence not sustained\n",
@@ -7016,7 +7024,8 @@ func (self *multiClientWindow) resize() {
 						// the storm breaker (see verdictRemovalAllowed): the
 						// verdict-removal budget is spent, so defer -- warn and
 						// keep, re-judge next pass
-						client.setWarning(true, warnUnhealthy)
+						previousCause, causeChanged := client.setWarning(true, warnUnhealthy)
+						self.logWarnTransition(client, previousCause, causeChanged, stats)
 						warnClient(client, stats)
 						self.metrics().removalDeferred()
 						self.log.Infof("%s\n", relEvent(
@@ -7027,11 +7036,13 @@ func (self *multiClientWindow) resize() {
 							"flows", self.flowCount(client),
 						))
 					} else {
-						client.setWarning(true, warnUnhealthy)
+						previousCause, causeChanged := client.setWarning(true, warnUnhealthy)
+						self.logWarnTransition(client, previousCause, causeChanged, stats)
 						removeClient(client)
 					}
 				} else {
-					client.setWarning(false, warnNone)
+					previousCause, causeChanged := client.setWarning(false, warnNone)
+					self.logWarnTransition(client, previousCause, causeChanged, stats)
 					warnClient(client, stats)
 				}
 			}
@@ -9065,6 +9076,25 @@ func (self *multiClientChannel) busyProbeOutstandingNow() bool {
 	return self.busyProbeOutstanding
 }
 
+// probeReceiveAge reports how many whole seconds since return traffic last
+// arrived on this channel, -1 for never. The probe verdict line carries it so
+// a field capture can tell a provider that is GONE from one that is
+// demonstrably alive and simply cannot get the probe targets to answer.
+//
+// Only the RECEIVE clock: there is no send-ack timestamp on this channel
+// (packetStats counts send acks but does not stamp them), and inventing a
+// second age from a field that does not exist is how a diagnostic ends up
+// reporting a number nobody produced.
+func (self *multiClientChannel) probeReceiveAge() int64 {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	if self.lastReceiveAckTime.IsZero() {
+		return -1
+	}
+	return int64(time.Since(self.lastReceiveAckTime) / time.Second)
+}
+
 // hasRecentBusyProbeAck reports whether this channel answered a liveness
 // probe inside window -- a return packet that crossed the uplink, which is
 // what the stall-conviction sibling gate counts as proof the tunnel works.
@@ -9311,15 +9341,72 @@ func (self warnCause) String() string {
 // setWarning sets or clears the resize pass's warning together with its
 // cause. The cause is stored only while warned -- clearing the warning
 // clears it, so a stale cause can never describe a healthy channel.
-func (self *multiClientChannel) setWarning(warning bool, cause warnCause) {
+//
+// Returns the PREVIOUS cause and whether this call changed it, so the caller
+// can log the transition. The resize pass rewrites this every pass for every
+// client, so only transitions may be logged: the state itself would be a few
+// hundred identical lines a minute.
+func (self *multiClientChannel) setWarning(warning bool, cause warnCause) (warnCause, bool) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+
+	previous := self.warnCause
+	if !self.warning {
+		previous = warnNone
+	}
+
 	self.warning = warning
 	if warning {
 		self.warnCause = cause
 	} else {
 		self.warnCause = warnNone
 	}
+
+	current := self.warnCause
+	if !self.warning {
+		current = warnNone
+	}
+	return previous, previous != current
+}
+
+// logWarnTransition emits one line when a client's warning cause changes,
+// including to and from none. This is the answer to "why did new flows stop
+// choosing this exit", which before it existed lived only behind V(1) --
+// compiled off in the field -- so a capture showing 6 of 15 exits warned
+// could not say whether they were retiring, out of capacity, failing dials,
+// or suspected. Bounded by construction: transitions only, and the resize
+// pass reaches a steady state within a pass or two.
+func (self *multiClientWindow) logWarnTransition(
+	client *multiClientChannel,
+	previous warnCause,
+	changed bool,
+	stats *clientWindowStats,
+) {
+	if !changed {
+		return
+	}
+	from, to := previous.String(), client.warningCause().String()
+	if from == "" {
+		from = "none"
+	}
+	if to == "" {
+		to = "none"
+	}
+	sourceCount := 0
+	if stats != nil {
+		sourceCount = stats.sourceCount
+	}
+	loggerOrDefault(self.log).Infof("%s\n", relEvent(
+		"warn",
+		"exit", client.ClientId(),
+		"from", from,
+		"to", to,
+		"flows", self.flowCount(client),
+		// the two inputs behind the two causes a reader most often wants to
+		// separate: capacity is about source count, starvation about dials
+		"sources", sourceCount,
+		"dialfails", client.dialFailureCount(),
+	))
 }
 
 // warningCause reads the current cause; warnNone when not warned.

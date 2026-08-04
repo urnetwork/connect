@@ -146,7 +146,7 @@ func TestProbeSynAckCompletesAndIsNotForwarded(t *testing.T) {
 
 	resultCh := make(chan probeResult, 1)
 	go func() {
-		resultCh <- parent.probeExit(client, []probeTarget{probeTestTarget()}, 5*time.Second)
+		resultCh <- parent.probeExit(client, []probeTarget{probeTestTarget()}, 5*time.Second, 0)
 	}()
 
 	update := waitForProbeFlow(t, parent)
@@ -204,7 +204,7 @@ func TestProbeRstIsNotAnAnswer(t *testing.T) {
 
 	resultCh := make(chan probeResult, 1)
 	go func() {
-		resultCh <- parent.probeExit(client, []probeTarget{probeTestTarget()}, 30*time.Second)
+		resultCh <- parent.probeExit(client, []probeTarget{probeTestTarget()}, 30*time.Second, 0)
 	}()
 
 	update := waitForProbeFlow(t, parent)
@@ -253,7 +253,7 @@ func TestProbeDnsAnswerPasses(t *testing.T) {
 	target := probeResolverTarget(net.ParseIP("8.8.8.8"), "www.example.com")
 	resultCh := make(chan probeResult, 1)
 	go func() {
-		resultCh <- parent.probeExit(client, []probeTarget{target}, 30*time.Second)
+		resultCh <- parent.probeExit(client, []probeTarget{target}, 30*time.Second, 0)
 	}()
 
 	update := waitForProbeFlow(t, parent)
@@ -293,7 +293,7 @@ func TestProbeDnsAnswerPasses(t *testing.T) {
 func TestProbeLeavesNoFlowState(t *testing.T) {
 	parent, client, forwarded := probeTestParent(t)
 
-	result := parent.probeExit(client, probeTestTargets(3), 50*time.Millisecond)
+	result := parent.probeExit(client, probeTestTargets(3), 50*time.Millisecond, 0)
 	if result.Sent != 3 {
 		t.Fatalf("Sent = %d, want 3", result.Sent)
 	}
@@ -327,7 +327,7 @@ func TestProbeLateAnswerIsConsumedNotForwarded(t *testing.T) {
 	// run and finish a pass, then replay an answer for its (now unregistered)
 	// flow key
 	target := probeTestTarget()
-	parent.probeExit(client, []probeTarget{target}, 20*time.Millisecond)
+	parent.probeExit(client, []probeTarget{target}, 20*time.Millisecond, 0)
 
 	egress := &IpPath{
 		Version:         4,
@@ -362,7 +362,7 @@ func TestProbeFailureConvictsNothing(t *testing.T) {
 	parent, client, forwarded := probeTestParent(t)
 
 	targets := probeTestTargets(5)
-	result := parent.probeExit(client, targets, 50*time.Millisecond)
+	result := parent.probeExit(client, targets, 50*time.Millisecond, 0)
 
 	if result.Sent != 5 {
 		t.Fatalf("Sent = %d, want 5 (the fixture accepts every send)", result.Sent)
@@ -478,7 +478,7 @@ func TestProbeDialFailureRecordsFailureWithoutStrike(t *testing.T) {
 		go func() {
 			// a long timeout: the dial failure, not the clock, must be what
 			// ends this pass
-			resultCh <- parent.probeExit(client, []probeTarget{probeTestTarget()}, 30*time.Second)
+			resultCh <- parent.probeExit(client, []probeTarget{probeTestTarget()}, 30*time.Second, 0)
 		}()
 
 		update := waitForProbeFlow(t, parent)
@@ -1009,7 +1009,7 @@ func TestProbeDisabledSendsNothing(t *testing.T) {
 	parent, client, forwarded := probeTestParent(t)
 	parent.settings.ProviderProbe = false
 
-	result := parent.probeExit(client, probeTestTargets(3), time.Second)
+	result := parent.probeExit(client, probeTestTargets(3), time.Second, 0)
 
 	if result.Sent != 0 || result.Answered != 0 || result.Passed {
 		t.Errorf("a disabled probe produced %d/%d answered, passed=%v", result.Answered, result.Sent, result.Passed)

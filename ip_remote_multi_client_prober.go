@@ -338,6 +338,11 @@ func (self *RemoteUserNatMultiClient) probeProviderPass(client *multiClientChann
 		}
 	}
 
+	// how many names the provider carried a usable dns answer back for --
+	// the provider-liveness half of the verdict line, so a pass that
+	// resolves names but gets no syn answered reads as a target-side story
+	// rather than an absent provider
+	resolvedCount := 0
 	resolverIp := net.ParseIP(resolver)
 	if resolverIp != nil && 0 < len(names) {
 		resolved, _ := self.probeResolveNames(client, resolverIp, names, timeout)
@@ -348,6 +353,7 @@ func (self *RemoteUserNatMultiClient) probeProviderPass(client *multiClientChann
 			if ips := resolved[name]; 0 < len(ips) {
 				targets = append(targets, probeHostTarget(name, ips[0]))
 				resolvedAny = true
+				resolvedCount += 1
 			}
 		}
 		if !resolvedAny {
@@ -371,7 +377,66 @@ func (self *RemoteUserNatMultiClient) probeProviderPass(client *multiClientChann
 		targets = probeFallbackLiteralTargets()
 	}
 
-	return self.probeExit(client, targets, timeout)
+	return self.probeExit(client, targets, timeout, resolvedCount)
+}
+
+// proberSweepTally collects one sweep's per-provider outcomes so the sweep
+// can report itself as a whole. Correlated failure is the signal it exists
+// for: every provider is reached through the phone's own uplink, so a device
+// that slept or changed networks fails every probe at once -- a fact about
+// the phone that is indistinguishable, provider by provider, from a bad pool.
+//
+// `silent` counts passes that asked nothing (no target could be built, or the
+// transport refused every packet), a third outcome the pass/fail split would
+// otherwise hide inside `failed`.
+type proberSweepTally struct {
+	lock      sync.Mutex
+	scheduled int
+	done      int
+	passed    int
+	failed    int
+	silent    int
+	// reported latches the one line. `done == scheduled` alone would fire
+	// again on any extra landing, and one sweep reporting twice would read
+	// as two sweeps in a capture -- exactly the kind of miscount that makes
+	// a correlation signal untrustworthy.
+	reported bool
+}
+
+// proberSweepLine is one finished sweep's counts.
+type proberSweepLine struct {
+	scheduled int
+	passed    int
+	failed    int
+	silent    int
+}
+
+// record folds one pass's result in and reports the line when the sweep is
+// complete. Returns ok exactly once per sweep, on the last pass to finish --
+// so a sweep whose passes are still in flight never logs a partial verdict.
+func (self *proberSweepTally) record(result probeResult) (proberSweepLine, bool) {
+	self.lock.Lock()
+	defer self.lock.Unlock()
+
+	self.done += 1
+	switch {
+	case result.Sent <= 0:
+		self.silent += 1
+	case result.Passed:
+		self.passed += 1
+	default:
+		self.failed += 1
+	}
+	if self.done < self.scheduled || self.reported {
+		return proberSweepLine{}, false
+	}
+	self.reported = true
+	return proberSweepLine{
+		scheduled: self.scheduled,
+		passed:    self.passed,
+		failed:    self.failed,
+		silent:    self.silent,
+	}, true
 }
 
 // --- the prober loop ---
@@ -547,6 +612,16 @@ func (self *RemoteUserNatMultiClient) runProber() {
 			"exits", len(clients),
 		))
 
+		// the sweep RESULT is a separate line, emitted when the last pass
+		// lands, and it is the one that answers "are these providers bad, or
+		// was my phone away". A per-provider line cannot show CORRELATION,
+		// and correlation is the whole discriminator: this vpn runs on a
+		// device that sleeps and changes networks, so a sweep where every
+		// provider failed at once while the tunnel was silent is ONE fact
+		// about the phone -- indistinguishable, one line at a time, from a
+		// pool of bad providers.
+		sweepTally := &proberSweepTally{scheduled: len(picks)}
+
 		for _, i := range picks {
 			client := clients[i]
 			func() {
@@ -574,7 +649,21 @@ func (self *RemoteUserNatMultiClient) runProber() {
 				if client.IsDone() {
 					return
 				}
-				self.probeProviderPass(client)
+				result := self.probeProviderPass(client)
+				if line, ok := sweepTally.record(result); ok {
+					uplinkStale, _ := self.uplinkGate(time.Now())
+					loggerOrDefault(self.log).Infof("%s\n", relEvent(
+						"probe_sweep_result",
+						"passed", line.passed,
+						"failed", line.failed,
+						"silent", line.silent,
+						"scheduled", line.scheduled,
+						// the phone-side context for the WHOLE sweep: a sweep
+						// that failed entirely while the tunnel was silent is
+						// the device, not the pool
+						"uplinkstale", uplinkStale,
+					))
+				}
 			})
 		}
 	}

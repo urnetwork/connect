@@ -737,3 +737,50 @@ func TestReliabilityMetricsProbeSnapshot(t *testing.T) {
 	AssertEqual(t, snapshot.ProbesAnswered, uint64(0))
 	AssertEqual(t, snapshot.ProvidersQualified, uint64(0))
 }
+
+// The sweep tally exists to expose CORRELATION: every provider is probed
+// through the phone's own uplink, so a device that slept fails the whole
+// sweep at once, and that is one fact about the phone rather than N facts
+// about providers. The line must therefore land exactly once, on the last
+// pass, with an honest three-way split.
+func TestProberSweepTallyReportsOnceWithThreeOutcomes(t *testing.T) {
+	tally := &proberSweepTally{scheduled: 3}
+
+	// a pass that asked nothing is neither a pass nor a failure
+	if _, ok := tally.record(probeResult{Sent: 0}); ok {
+		t.Error("the tally reported before the sweep finished")
+	}
+	if _, ok := tally.record(probeResult{Sent: 3, Answered: 3, Passed: true}); ok {
+		t.Error("the tally reported before the sweep finished")
+	}
+
+	line, ok := tally.record(probeResult{Sent: 3, Answered: 0})
+	if !ok {
+		t.Fatal("the tally did not report on the last pass")
+	}
+	if line.scheduled != 3 || line.passed != 1 || line.failed != 1 || line.silent != 1 {
+		t.Errorf("line = %+v, want scheduled 3 / passed 1 / failed 1 / silent 1", line)
+	}
+
+	// and never twice: a second landing must not emit another verdict for a
+	// sweep that already reported
+	if _, ok := tally.record(probeResult{Sent: 1, Passed: true}); ok {
+		t.Error("the tally reported a second time for one sweep")
+	}
+}
+
+// The all-failed-at-once shape the owner's hypothesis predicts.
+func TestProberSweepTallyAllFailed(t *testing.T) {
+	tally := &proberSweepTally{scheduled: 6}
+	var line proberSweepLine
+	var ok bool
+	for range 6 {
+		line, ok = tally.record(probeResult{Sent: 4, Answered: 0})
+	}
+	if !ok {
+		t.Fatal("no report after every pass landed")
+	}
+	if line.failed != 6 || line.passed != 0 {
+		t.Errorf("line = %+v, want all six failed", line)
+	}
+}
