@@ -40,13 +40,16 @@ func TestWebRtc(t *testing.T) {
 	settingsB.Log = NewNoopLogger()
 	settingsA.IceServerUrls = nil
 	settingsB.IceServerUrls = nil
-	// Both peers run on this host. Keep loopback available: forcing only the
-	// external address turns the test into a macOS UDP-to-self hairpin test,
-	// which intermittently drops rapid close/rebind churn and says nothing
-	// about the real two-device ICE path. The filtered production interface
-	// view is validated independently below.
-	settingsA.UseEgressOnlyIceInterfaces = false
-	settingsB.UseEgressOnlyIceInterfaces = false
+	// Both peers run on this host, so restrict ICE to loopback. The
+	// unrestricted view floods the pair list on a multihomed host (utun,
+	// bridge, AWDL, VM interfaces) and STUN check pacing then pushes the
+	// local connect past the deadline; egress-only instead turns the test
+	// into a macOS UDP-to-self hairpin test, which intermittently drops
+	// rapid close/rebind churn. Neither says anything about the real
+	// two-device ICE path. The filtered production interface view is
+	// validated independently below.
+	settingsA.UseLoopbackOnlyIceInterfaces = true
+	settingsB.UseLoopbackOnlyIceInterfaces = true
 
 	// each manager sends signals to each other
 	signalPipeA := newSignalPipe(nil)
@@ -737,6 +740,9 @@ func TestWebRtcBlockingWriteBackpressureAndDeadline(t *testing.T) {
 	settingsB.Log = NewNoopLogger()
 	settingsA.IceServerUrls = nil
 	settingsB.IceServerUrls = nil
+	// hermetic same-host connect: loopback-only ICE (see TestWebRtc)
+	settingsA.UseLoopbackOnlyIceInterfaces = true
+	settingsB.UseLoopbackOnlyIceInterfaces = true
 	settingsA.ReceiveBufferSize = kib(128)
 	settingsB.ReceiveBufferSize = kib(128)
 
@@ -795,7 +801,8 @@ func TestWebRtcSctpNoProgressWatchdogPreservesReceiverBackpressure(t *testing.T)
 	for _, settings := range []*WebRtcSettings{settingsA, settingsB} {
 		settings.Log = NewNoopLogger()
 		settings.IceServerUrls = nil
-		settings.UseEgressOnlyIceInterfaces = false
+		// hermetic same-host connect: loopback-only ICE (see TestWebRtc)
+		settings.UseLoopbackOnlyIceInterfaces = true
 		settings.ReceiveBufferSize = kib(128)
 	}
 	settingsA.SctpNoProgressTimeout = 200 * time.Millisecond
@@ -926,8 +933,9 @@ func TestWebRtcSctpSnapMixedCompatibility(t *testing.T) {
 	settingsB.Log = NewNoopLogger()
 	settingsA.IceServerUrls = nil
 	settingsB.IceServerUrls = nil
-	settingsA.UseEgressOnlyIceInterfaces = false
-	settingsB.UseEgressOnlyIceInterfaces = false
+	// hermetic same-host connect: loopback-only ICE (see TestWebRtc)
+	settingsA.UseLoopbackOnlyIceInterfaces = true
+	settingsB.UseLoopbackOnlyIceInterfaces = true
 	settingsA.EnableSctpSnap = true
 	settingsB.EnableSctpSnap = false
 
@@ -992,8 +1000,9 @@ func TestWebRtcSctpZeroChecksumMixedCompatibility(t *testing.T) {
 	settingsB.Log = NewNoopLogger()
 	settingsA.IceServerUrls = nil
 	settingsB.IceServerUrls = nil
-	settingsA.UseEgressOnlyIceInterfaces = false
-	settingsB.UseEgressOnlyIceInterfaces = false
+	// hermetic same-host connect: loopback-only ICE (see TestWebRtc)
+	settingsA.UseLoopbackOnlyIceInterfaces = true
+	settingsB.UseLoopbackOnlyIceInterfaces = true
 	settingsA.EnableSctpZeroChecksum = true
 	settingsB.EnableSctpZeroChecksum = false
 
@@ -1507,6 +1516,8 @@ func TestWebRtcNetworkPeerAdvertisesDedicatedReceiveWindow(t *testing.T) {
 		settings := DefaultWebRtcSettings()
 		settings.Log = NewNoopLogger()
 		settings.IceServerUrls = nil
+		// hermetic same-host connect: loopback-only ICE (see TestWebRtc)
+		settings.UseLoopbackOnlyIceInterfaces = true
 		settings.ReceiveBufferSize = kib(128)
 		settings.MemoryBudget = NewTransferMemoryBudget(8 * settings.ReceiveBufferSize)
 		settings.NetworkPeerReceiveBufferSize = mib(2)
@@ -3298,10 +3309,11 @@ func TestWebRtcRepeatedConnectCloseReleasesAdmissionWithoutStall(t *testing.T) {
 	settingsA.IceServerUrls = nil
 	settingsB.IceServerUrls = nil
 	// This test exercises repeated admission/release, not interface
-	// filtering. Both peers are on one host, so retain loopback instead of
-	// depending on external-address UDP hairpin behavior during rapid churn.
-	settingsA.UseEgressOnlyIceInterfaces = false
-	settingsB.UseEgressOnlyIceInterfaces = false
+	// filtering. Both peers are on one host, so restrict ICE to loopback:
+	// per-cycle connects stay fast on a multihomed host, and rapid churn
+	// does not depend on external-address UDP hairpin behavior.
+	settingsA.UseLoopbackOnlyIceInterfaces = true
+	settingsB.UseLoopbackOnlyIceInterfaces = true
 	settingsA.MaxPeerConnectionCount = 1
 	settingsB.MaxPeerConnectionCount = 1
 	settingsA.ReceiveBufferSize = reservationSize
@@ -5038,6 +5050,11 @@ func TestWebRtcInvalidSdpAndEarlyCandidateDoNotPoisonRetransmit(t *testing.T) {
 	settingsB.Log = NewNoopLogger()
 	settingsA.IceServerUrls = nil
 	settingsB.IceServerUrls = nil
+	// The recovery deadline below requires the post-retransmit connect to
+	// finish promptly; both peers are on this host, so restrict ICE to
+	// loopback rather than sweeping a multihomed host's interface view.
+	settingsA.UseLoopbackOnlyIceInterfaces = true
+	settingsB.UseLoopbackOnlyIceInterfaces = true
 
 	signalPipeA := newSignalPipe(nil)
 	signalPipeB := newSignalPipe(nil)

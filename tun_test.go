@@ -592,8 +592,10 @@ func bridgeTunBatch(ctx context.Context, dst *Tun, src *Tun) {
 // enqueue) collapses this number.
 func TestTunTCPThroughput(t *testing.T) {
 	// generous overall cap: the transfer is measured several times (below), and
-	// each run is independently bounded by the per-conn 55s deadlines.
-	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	// each run's stalls are independently bounded by per-chunk 55s deadlines.
+	// The cap only backstops a true hang; slow-but-progressing runs on a
+	// loaded -race host stay inside it.
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 	defer cancel()
 
 	// size the ring buffers well above the default (32) so the bridge can keep
@@ -617,14 +619,15 @@ func TestTunTCPThroughput(t *testing.T) {
 	rightIP := net.IP(right.localAddresses[0].AsSlice())
 
 	// full speed moves ~300 MiB/s; under -race the gvisor stack runs ~250x slower
-	// (~1 MiB/s), so 128 MiB cannot complete within the 55s per-conn deadline below.
-	// Scale the transfer down under -race so it still streams enough bytes to catch a
-	// stall / head-of-line-block regression while finishing inside the deadline; drop
-	// the floor to a value that only a genuine stall (~0) falls under.
+	// (~1 MiB/s). Scale the transfer down under -race so it still streams enough
+	// bytes to catch a stall / head-of-line-block regression while keeping the
+	// test duration bounded; drop the floor to a value that only a genuine stall
+	// (~0) falls under. The per-chunk deadlines below bound a stall, not the
+	// transfer wall clock, so a loaded host slows an attempt without failing it.
 	totalBytes := int64(128) << 20 // 128 MiB
 	minThroughputMiBs := 1.0       // conservative floor; a stall is ~0
 	if raceEnabled {
-		totalBytes = int64(16) << 20 // 16 MiB (~13s under -race, well within 55s)
+		totalBytes = int64(16) << 20 // 16 MiB (~13s under -race unloaded)
 		minThroughputMiBs = 0.1
 	}
 	// measure several times and take the max, to ride out host scheduling noise
@@ -669,14 +672,23 @@ func TestTunTCPThroughput(t *testing.T) {
 				return
 			}
 			defer conn.Close()
-			_ = conn.SetReadDeadline(time.Now().Add(55 * time.Second))
-			// drain exactly totalBytes, so neither side needs a half-close
-			n, err := io.CopyN(io.Discard, conn, totalBytes)
-			if err != nil {
-				recvErr <- err
-				return
+			// drain exactly totalBytes, so neither side needs a half-close.
+			// The deadline is refreshed per bounded step so it bounds a
+			// stall in the stack, not the whole transfer: under -race plus
+			// host load the full stream legitimately outlasts any single
+			// fixed deadline while still making progress.
+			received := int64(0)
+			for received < totalBytes {
+				_ = conn.SetReadDeadline(time.Now().Add(55 * time.Second))
+				step := min(totalBytes-received, int64(1024*1024))
+				n, err := io.CopyN(io.Discard, conn, step)
+				received += n
+				if err != nil {
+					recvErr <- err
+					return
+				}
 			}
-			recvDone <- n
+			recvDone <- received
 		}()
 
 		conn, err := left.DialContext(ctx, "tcp", ln.Addr().String())
@@ -684,7 +696,6 @@ func TestTunTCPThroughput(t *testing.T) {
 			return 0, fmt.Errorf("dial through tun: %w", err)
 		}
 		defer conn.Close()
-		_ = conn.SetWriteDeadline(time.Now().Add(55 * time.Second))
 
 		payload := make([]byte, 128*1024) // 128 KiB write chunks
 
@@ -695,6 +706,9 @@ func TestTunTCPThroughput(t *testing.T) {
 			if remaining := totalBytes - written; remaining < int64(len(chunk)) {
 				chunk = payload[:remaining]
 			}
+			// per-chunk deadline: bounds a stalled pipe without capping the
+			// whole transfer's wall clock (see the receiver note above)
+			_ = conn.SetWriteDeadline(time.Now().Add(55 * time.Second))
 			n, err := conn.Write(chunk)
 			if err != nil {
 				return 0, fmt.Errorf("write through tun after %d bytes: %w", written, err)

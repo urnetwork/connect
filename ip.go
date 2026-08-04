@@ -133,8 +133,16 @@ func DefaultTcpBufferSettingsWithBufferSize(bufferSize int) *TcpBufferSettings {
 	}
 	tcpBufferSettings := &TcpBufferSettings{
 		// ConnectTimeout:     60 * time.Second,
-		ReadTimeout:        300 * time.Second,
-		WriteTimeout:       15 * time.Second,
+		ReadTimeout: 300 * time.Second,
+		// WriteTimeout bounds ZERO-progress time on the upstream socket (the
+		// write pipeline re-arms it on partial progress). A closed window on
+		// the tunnel side legitimately parks the whole pipeline — the device's
+		// acks can starve for tens of seconds behind a saturated tunnel — and
+		// a kill here tears down an alive flow with an RST. A dead upstream
+		// peer normally surfaces as RST/EPIPE rather than eternal silence, and
+		// the idle reaper (IdleTimeout/ReadTimeout) still bounds a truly
+		// wedged flow, so patience is cheap.
+		WriteTimeout:       60 * time.Second,
 		AckCompressTimeout: 50 * time.Millisecond,
 		IdleTimeout:        300 * time.Second,
 		SequenceBufferSize: bufferSize,
@@ -352,8 +360,9 @@ type LocalUserNatSettings struct {
 	IcmpBufferSettings *IcmpBufferSettings
 
 	// Log, when set, is used by the local user nat and its udp/tcp/icmp
-	// buffers and sequences (propagated to the buffer settings `Log` fields
-	// that are nil). nil resolves to `DefaultLogger()`.
+	// buffers and sequences (used for a buffer whose settings `Log` is nil,
+	// via a private copy — the caller's settings are never mutated).
+	// nil resolves to `DefaultLogger()`.
 	Log Logger
 }
 
@@ -385,18 +394,31 @@ func NewLocalUserNat(ctx context.Context, clientTag string, settings *LocalUserN
 
 	log := loggerOrDefault(settings.Log)
 	// propagate so a nat-level logger covers the udp/tcp/icmp buffers and
-	// sequences
-	if settings.UdpBufferSettings != nil && settings.UdpBufferSettings.Log == nil {
-		settings.UdpBufferSettings.Log = log
-	}
-	if settings.TcpBufferSettings != nil && settings.TcpBufferSettings.Log == nil {
-		settings.TcpBufferSettings.Log = log
-	}
-	if settings.IcmpBufferSettings == nil {
-		settings.IcmpBufferSettings = DefaultIcmpBufferSettings()
-	}
-	if settings.IcmpBufferSettings.Log == nil {
-		settings.IcmpBufferSettings.Log = log
+	// sequences. Copy instead of writing through the caller's settings: the
+	// caller may share them with other components or concurrent
+	// constructions (see the platform transport framer settings for the
+	// same rule).
+	{
+		copied := *settings
+		if copied.UdpBufferSettings != nil && copied.UdpBufferSettings.Log == nil {
+			udpCopied := *copied.UdpBufferSettings
+			udpCopied.Log = log
+			copied.UdpBufferSettings = &udpCopied
+		}
+		if copied.TcpBufferSettings != nil && copied.TcpBufferSettings.Log == nil {
+			tcpCopied := *copied.TcpBufferSettings
+			tcpCopied.Log = log
+			copied.TcpBufferSettings = &tcpCopied
+		}
+		if copied.IcmpBufferSettings == nil {
+			copied.IcmpBufferSettings = DefaultIcmpBufferSettings()
+		}
+		if copied.IcmpBufferSettings.Log == nil {
+			icmpCopied := *copied.IcmpBufferSettings
+			icmpCopied.Log = log
+			copied.IcmpBufferSettings = &icmpCopied
+		}
+		settings = &copied
 	}
 	localUserNat := &LocalUserNat{
 		ctx:                     cancelCtx,
@@ -3013,9 +3035,32 @@ func (self *TcpSequence) Run() {
 			// `WriteTo` retries partial writes until fully written, a timeout, or an error.
 			buffers := net.Buffers(bufferStorage)
 
-			writeEndTime := time.Now().Add(self.tcpBufferSettings.WriteTimeout)
-			socket.SetWriteDeadline(writeEndTime)
-			n, err := buffers.WriteTo(socket)
+			// The write deadline bounds no-progress time, not total batch time.
+			// A backpressured-but-draining socket (the peer applying flow
+			// control) re-arms the deadline with each partial write; a peer
+			// that accepts nothing for a full WriteTimeout still fails the
+			// flow. A single fixed batch deadline here used to kill alive
+			// flows under sustained bulk transfer: the return path's acks can
+			// stall behind saturated tunnel queues long enough that the
+			// upstream socket drains slower than one batch, and the partial
+			// writev at the deadline tore the sequence down (observed as
+			// mid-stream RSTs in the full-stack tcp perf test).
+			n := int64(0)
+			var err error
+			for {
+				socket.SetWriteDeadline(time.Now().Add(self.tcpBufferSettings.WriteTimeout))
+				var wn int64
+				wn, err = buffers.WriteTo(socket)
+				n += wn
+				if err == nil {
+					break
+				}
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() && 0 < wn {
+					// progress within this deadline window; keep writing
+					continue
+				}
+				break
+			}
 
 			if err == nil {
 				if self.log.V(2).Enabled() {

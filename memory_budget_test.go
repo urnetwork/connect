@@ -15,8 +15,10 @@ func TestMemoryBudgetUnsetDefaults(t *testing.T) {
 	AssertEqual(t, DefaultDohSettings().CacheMaxEntries, 4096)
 	tunSettings := DefaultTunSettings()
 	AssertEqual(t, tunSettings.UdpReceiveBufferByteCount, int(mib(1)))
-	AssertEqual(t, tunSettings.TcpReceiveBuffer.Default, int(kib(256)))
-	AssertEqual(t, tunSettings.TcpReceiveBuffer.Max, int(mib(1)))
+	// 2026-08: raised so a single stream's auto-tuned window can cover the
+	// tunnel's bandwidth-delay product (see DefaultTunSettingsWithBufferSize)
+	AssertEqual(t, tunSettings.TcpReceiveBuffer.Default, int(mib(1)))
+	AssertEqual(t, tunSettings.TcpReceiveBuffer.Max, int(mib(4)))
 }
 
 func TestMemoryBudgetScaledSettings(t *testing.T) {
@@ -30,8 +32,8 @@ func TestMemoryBudgetScaledSettings(t *testing.T) {
 	AssertEqual(t, DefaultDohSettings().CacheMaxEntries, 2048)
 	tunSettings := DefaultTunSettings()
 	AssertEqual(t, tunSettings.UdpReceiveBufferByteCount, int(kib(512)))
-	AssertEqual(t, tunSettings.TcpReceiveBuffer.Default, int(kib(128)))
-	AssertEqual(t, tunSettings.TcpReceiveBuffer.Max, int(kib(512)))
+	AssertEqual(t, tunSettings.TcpReceiveBuffer.Default, int(kib(512)))
+	AssertEqual(t, tunSettings.TcpReceiveBuffer.Max, int(mib(2)))
 }
 
 func TestMemoryBudgetFloors(t *testing.T) {
@@ -43,7 +45,7 @@ func TestMemoryBudgetFloors(t *testing.T) {
 	AssertEqual(t, DefaultReceiveBufferSettings().ReceiveQueueMaxByteCount, kib(320))
 	AssertEqual(t, DefaultWebRtcSettings().ReceiveBufferSize, kib(256))
 	AssertEqual(t, DefaultDohSettings().CacheMaxEntries, 512)
-	AssertEqual(t, DefaultTunSettings().TcpReceiveBuffer.Max, int(kib(256)))
+	AssertEqual(t, DefaultTunSettings().TcpReceiveBuffer.Max, int(kib(512)))
 
 	// budgets above the reference never scale up
 	SetMemoryBudget(mib(1024))

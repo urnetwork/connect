@@ -219,9 +219,14 @@ func newNormalDialTlsContext(
 
 // extender udp 53 to platform extender
 func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *ClientStrategy {
-	// propagate so a strategy-level logger covers dial logging
+	// propagate so a strategy-level logger covers dial logging. Copy instead
+	// of writing through the caller's settings: the caller may share them
+	// with concurrent constructions or other readers (see the platform
+	// transport framer settings for the same rule).
 	if settings.ConnectSettings.Log == nil {
-		settings.ConnectSettings.Log = settings.Log
+		copied := *settings
+		copied.ConnectSettings.Log = settings.Log
+		settings = &copied
 	}
 
 	// create dialers to match settings

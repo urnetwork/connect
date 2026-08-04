@@ -103,7 +103,8 @@ func (self *ClientAuth) ClientId() (Id, error) {
 
 type PlatformTransportSettings struct {
 	// Log, when set, is used by the platform transport and its framer
-	// (propagated to `FramerSettings.Log` when nil).
+	// (used for the framer when `FramerSettings.Log` is nil, via a private
+	// copy — the caller's `FramerSettings` is never mutated).
 	// nil resolves to `DefaultLogger()`.
 	Log Logger
 
@@ -186,6 +187,12 @@ type PlatformTransport struct {
 	auth        *ClientAuth
 
 	settings *PlatformTransportSettings
+	// the effective framer settings: `settings.FramerSettings`, or a private
+	// copy of it when the transport log is propagated into a nil
+	// `FramerSettings.Log`. The caller's settings are never mutated — they
+	// may be shared with concurrent framer users (see
+	// NewPlatformTransportWithTargetMode).
+	framerSettings *FramerSettings
 
 	stateLock sync.Mutex
 	// notified when availableModes changes. availableModes is a map, so it
@@ -292,9 +299,14 @@ func NewPlatformTransportWithTargetMode(
 ) *PlatformTransport {
 	cancelCtx, cancel := context.WithCancel(ctx)
 	log := loggerOrDefault(settings.Log)
-	// propagate so a transport-level logger covers the framer
-	if settings.FramerSettings != nil && settings.FramerSettings.Log == nil {
-		settings.FramerSettings.Log = log
+	// propagate so a transport-level logger covers the framer. Copy instead
+	// of writing through the caller's settings: the caller may share the
+	// framer settings with concurrently running framers (racing this write).
+	framerSettings := settings.FramerSettings
+	if framerSettings != nil && framerSettings.Log == nil {
+		copied := *framerSettings
+		copied.Log = log
+		framerSettings = &copied
 	}
 	transport := &PlatformTransport{
 		ctx:    cancelCtx,
@@ -313,6 +325,7 @@ func NewPlatformTransportWithTargetMode(
 		platformUrl:          platformUrl,
 		auth:                 auth,
 		settings:             settings,
+		framerSettings:       framerSettings,
 		availableModeMonitor: NewMonitor(),
 		availableModes:       map[TransportMode]bool{},
 		targetMode:           targetMode,
@@ -1297,7 +1310,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				return nil, err
 			}
 
-			framer := NewFramer(self.settings.FramerSettings)
+			framer := NewFramer(self.framerSettings)
 
 			stream.SetWriteDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.AuthTimeout))
 			if err := framer.Write(stream, authBytes); err != nil {
@@ -1375,7 +1388,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				}
 			})
 
-			framer := NewFramer(self.settings.FramerSettings)
+			framer := NewFramer(self.framerSettings)
 
 			var readCounter atomic.Uint64
 			var writeCounter atomic.Uint64

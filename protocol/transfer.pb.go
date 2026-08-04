@@ -572,9 +572,21 @@ type Pack struct {
 	// contract_id lock
 	// this is required for nack messages. There is no need to set this for ack messages.
 	// ulid
-	ContractId    []byte `protobuf:"bytes,9,opt,name=contract_id,json=contractId,proto3,oneof" json:"contract_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	ContractId []byte `protobuf:"bytes,9,opt,name=contract_id,json=contractId,proto3,oneof" json:"contract_id,omitempty"`
+	// Sender-sequence lane discriminators (changes 2026-08). A sender keys its
+	// send sequence by local route options that were historically invisible on
+	// the wire, so the receiver held ONE head slot per (source, role,
+	// companion) and the sender had to retire a live sequence on every option
+	// flip — lossy under alternation (e.g. dual encryption-session
+	// establishment alternating force-stream carriers). Stamping the lane
+	// lets the receiver key its head slot per lane so both sequences coexist.
+	// proto3 defaults (false/false) are exactly the legacy lane, so peers
+	// that predate these fields interoperate unchanged for default-lane
+	// traffic.
+	ForceStream       bool `protobuf:"varint,10,opt,name=force_stream,json=forceStream,proto3" json:"force_stream,omitempty"`
+	CompanionContract bool `protobuf:"varint,11,opt,name=companion_contract,json=companionContract,proto3" json:"companion_contract,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *Pack) Reset() {
@@ -668,6 +680,20 @@ func (x *Pack) GetContractId() []byte {
 		return x.ContractId
 	}
 	return nil
+}
+
+func (x *Pack) GetForceStream() bool {
+	if x != nil {
+		return x.ForceStream
+	}
+	return false
+}
+
+func (x *Pack) GetCompanionContract() bool {
+	if x != nil {
+		return x.CompanionContract
+	}
+	return false
 }
 
 // used for deep message inspection
@@ -2341,7 +2367,21 @@ type EncryptedControl struct {
 	// session. Distinct from which contract the carrier itself rides (a
 	// responder replies under `EncryptionControlUseCompanion`, independent of
 	// this bit).
-	Companion     bool `protobuf:"varint,4,opt,name=companion,proto3" json:"companion,omitempty"`
+	Companion bool `protobuf:"varint,4,opt,name=companion,proto3" json:"companion,omitempty"`
+	// Epoch (handshake generation) this control belongs to, as a ulid
+	// (changes 2026-08). The TLS-client role mints it per epoch; the
+	// TLS-server role adopts it from the inbound handshake and echoes it.
+	//
+	// Without it, epochs have no wire identity: under churn one side
+	// re-handshakes (new epoch, new TLS exporter) while the other holds the
+	// old one, and the late identity proof — bound to the NEW exporter —
+	// fails signature verification against the OLD, which is indistinguishable
+	// from manipulation and terminally tombstones the session while the
+	// established peer keeps encrypting into it (a full data stall).
+	// Carrying the epoch lets the receiver route a control to the right
+	// generation, and reset toward a newer one, instead of misjudging it.
+	// Unset (legacy peers) keeps the pre-epoch behavior for that control.
+	EpochId       []byte `protobuf:"bytes,5,opt,name=epoch_id,json=epochId,proto3,oneof" json:"epoch_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2402,6 +2442,13 @@ func (x *EncryptedControl) GetCompanion() bool {
 		return x.Companion
 	}
 	return false
+}
+
+func (x *EncryptedControl) GetEpochId() []byte {
+	if x != nil {
+		return x.EpochId
+	}
+	return nil
 }
 
 // each hop asks its client to migrate the platform transport
@@ -2487,7 +2534,7 @@ const file_transfer_proto_rawDesc = "" +
 	"\r_session_roleB\x14\n" +
 	"\x12_session_companion\"U\n" +
 	"\x15FilteredTransferFrame\x12<\n" +
-	"\rtransfer_path\x18\x01 \x01(\v2\x17.bringyour.TransferPathR\ftransferPath\"\xf7\x02\n" +
+	"\rtransfer_path\x18\x01 \x01(\v2\x17.bringyour.TransferPathR\ftransferPath\"\xc9\x03\n" +
 	"\x04Pack\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\x01 \x01(\fR\tmessageId\x12\x1f\n" +
@@ -2500,7 +2547,10 @@ const file_transfer_proto_rawDesc = "" +
 	"\x0econtract_frame\x18\a \x01(\v2\x10.bringyour.FrameH\x00R\rcontractFrame\x88\x01\x01\x12%\n" +
 	"\x03tag\x18\b \x01(\v2\x0e.bringyour.TagH\x01R\x03tag\x88\x01\x01\x12$\n" +
 	"\vcontract_id\x18\t \x01(\fH\x02R\n" +
-	"contractId\x88\x01\x01B\x11\n" +
+	"contractId\x88\x01\x01\x12!\n" +
+	"\fforce_stream\x18\n" +
+	" \x01(\bR\vforceStream\x12-\n" +
+	"\x12companion_contract\x18\v \x01(\bR\x11companionContractB\x11\n" +
 	"\x0f_contract_frameB\x06\n" +
 	"\x04_tagB\x0e\n" +
 	"\f_contract_id\"_\n" +
@@ -2643,12 +2693,14 @@ const file_transfer_proto_rawDesc = "" +
 	"!client_key_signed_tls_certificate\x18\x02 \x01(\fR\x1dclientKeySignedTlsCertificate\"*\n" +
 	"\tClientKey\x12\x1d\n" +
 	"\n" +
-	"public_key\x18\x01 \x01(\fR\tpublicKey\"\xca\x01\n" +
+	"public_key\x18\x01 \x01(\fR\tpublicKey\"\xf7\x01\n" +
 	"\x10EncryptedControl\x12B\n" +
 	"\fcontrol_type\x18\x01 \x01(\x0e2\x1f.bringyour.EncryptedControlTypeR\vcontrolType\x12\x18\n" +
 	"\apayload\x18\x02 \x01(\fR\apayload\x12:\n" +
 	"\fsession_role\x18\x03 \x01(\x0e2\x17.bringyour.SequenceRoleR\vsessionRole\x12\x1c\n" +
-	"\tcompanion\x18\x04 \x01(\bR\tcompanion\"4\n" +
+	"\tcompanion\x18\x04 \x01(\bR\tcompanion\x12\x1e\n" +
+	"\bepoch_id\x18\x05 \x01(\fH\x00R\aepochId\x88\x01\x01B\v\n" +
+	"\t_epoch_id\"4\n" +
 	"\x0fResidentMigrate\x12!\n" +
 	"\fmigrate_time\x18\x01 \x01(\x04R\vmigrateTime*W\n" +
 	"\fSequenceRole\x12\x17\n" +
@@ -2785,6 +2837,7 @@ func file_transfer_proto_init() {
 	file_transfer_proto_msgTypes[18].OneofWrappers = []any{}
 	file_transfer_proto_msgTypes[19].OneofWrappers = []any{}
 	file_transfer_proto_msgTypes[21].OneofWrappers = []any{}
+	file_transfer_proto_msgTypes[28].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

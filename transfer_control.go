@@ -92,7 +92,14 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 
 	var controlSync func(*protocol.Frame)
 	controlSync = func(updatedFrame *protocol.Frame) {
-		defer handleCancel()
+		// handleCtx must OUTLIVE a successful enqueue: the queued frame carries
+		// Ctx(handleCtx), and the ack-error path re-enters controlSync guarded
+		// by the same ctx. A defer here canceled the ctx the moment the enqueue
+		// succeeded, which (a) doomed the queued frame at the next sequence
+		// teardown and (b) made every retry exit immediately as done — an
+		// enqueued-then-nacked control message (e.g. a contract close raced by
+		// transport churn) was permanently lost. Cancel instead on terminal
+		// exits and in the ack-success callback.
 
 		defer func() {
 			self.sendLock.Lock()
@@ -142,6 +149,8 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 						if err == nil {
 							safeAckCallback(nil)
 							MessagePoolReturn(updatedFrame.MessageBytes)
+							// the sync is complete: release the watcher and ctx
+							handleCancel()
 						} else {
 							go HandleError(func() {
 								controlSync(updatedFrame)
@@ -160,9 +169,13 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 			}()
 			if done {
 				MessagePoolReturn(updatedFrame.MessageBytes)
+				handleCancel()
 				return
 			}
 			if success {
+				// the queued frame and its retry path own handleCtx now: the
+				// ack callback cancels on success, or re-enters controlSync on
+				// error
 				return
 			}
 			if err != nil {
@@ -173,6 +186,7 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 					return
 				case <-self.client.Done():
 					MessagePoolReturn(frame.MessageBytes)
+					handleCancel()
 					return
 				default:
 				}
@@ -199,6 +213,8 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 			if err == nil {
 				safeAckCallback(nil)
 				MessagePoolReturn(frame.MessageBytes)
+				// the sync is complete: release the watcher and ctx
+				handleCancel()
 			} else {
 				go HandleError(func() {
 					controlSync(frame)

@@ -56,10 +56,19 @@ func newWebRtcPeerConnectionFactory(
 	s := webrtc.SettingEngine{}
 	s.LoggerFactory = &pionLoggerFactory{log: loggerOrDefault(settings.Log)}
 	logIceInterfaces(loggerOrDefault(settings.Log))
-	// bind ICE sockets to the physical egress interface so p2p does not loop
-	// into the tunnel this process provides (R1); a no-op off Windows and when
-	// no egress index is set.
-	if index4, index6 := EgressInterfaceIndex(); index4 != 0 || index6 != 0 {
+	if settings.UseLoopbackOnlyIceInterfaces {
+		// hermetic same-host mode (tests): gather only loopback candidates so
+		// the local connect cost is a couple of pairs, independent of the
+		// host's interface population (see WebRtcSettings)
+		s.SetIncludeLoopbackCandidate(true)
+		s.SetInterfaceFilter(func(interfaceName string) bool {
+			ifc, err := net.InterfaceByName(interfaceName)
+			return err == nil && ifc.Flags&net.FlagLoopback != 0
+		})
+	} else if index4, index6 := EgressInterfaceIndex(); index4 != 0 || index6 != 0 {
+		// bind ICE sockets to the physical egress interface so p2p does not
+		// loop into the tunnel this process provides (R1); a no-op off
+		// Windows and when no egress index is set.
 		if egressNet, err := newEgressNet(); err == nil {
 			s.SetNet(egressNet)
 		}

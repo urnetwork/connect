@@ -71,12 +71,23 @@ func HandleError(do func(), handlers ...any) (r any) {
 				err = fmt.Errorf("%s", r)
 			}
 			for _, handler := range handlers {
-				switch v := handler.(type) {
-				case func():
-					v()
-				case func(error):
-					v(err)
-				}
+				// a rescue handler that panics (e.g. a double-registered
+				// wg.Done) must not escalate the recovery into a process
+				// crash; contain it and log loudly, then run the remaining
+				// handlers
+				func() {
+					defer func() {
+						if handlerR := recover(); handlerR != nil {
+							DefaultLogger().Warningf("Rescue handler panic (contained): %s\n", ErrorJson(handlerR, debug.Stack()))
+						}
+					}()
+					switch v := handler.(type) {
+					case func():
+						v()
+					case func(error):
+						v(err)
+					}
+				}()
 			}
 		}
 	}()

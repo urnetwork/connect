@@ -652,9 +652,16 @@ func NewClientWithTag(
 	cancelCtx, cancel := context.WithCancel(ctx)
 	log := loggerOrDefault(settings.Log)
 	// nested components without a client reference resolve their own settings
-	// `Log`. Propagate so a client-level logger covers the entire client tree.
+	// `Log`. Propagate so a client-level logger covers the entire client
+	// tree. Copy instead of writing through the caller's settings: the
+	// caller may share them with concurrent client constructions (see the
+	// platform transport framer settings for the same rule).
 	if settings.WebRtcSettings != nil && settings.WebRtcSettings.Log == nil {
-		settings.WebRtcSettings.Log = log
+		copied := *settings
+		webRtcCopied := *copied.WebRtcSettings
+		webRtcCopied.Log = log
+		copied.WebRtcSettings = &webRtcCopied
+		settings = &copied
 	}
 	client := &Client{
 		ctx:              cancelCtx,
@@ -2025,15 +2032,19 @@ type sendSequenceId struct {
 
 // sendSequenceWireId is the part of a sender sequence that the destination can
 // distinguish in ReceiveBuffer's head key. The local ClientId becomes the
-// receiver's Source and is constant for this SendBuffer. ForceStream,
-// IntermediaryIds, and contract steering are intentionally absent from the
-// wire, so two live send sequences that differ only in those fields would
-// fight for one receive head and permanently drop whichever sequence id is
-// older.
+// receiver's Source and is constant for this SendBuffer. ForceStream and
+// CompanionContract are stamped on every Pack (fields 10/11) so the receiver
+// keys its head slot per lane and same-class sequences on different lanes
+// coexist. IntermediaryIds remains absent from the wire (multi-hop sequences
+// already differ in the stream TransferPath), so two live send sequences that
+// differ only in intermediaries would still fight for one receive head — the
+// wire-indistinguishable retire below covers that residual axis.
 type sendSequenceWireId struct {
 	Destination         TransferPath
 	EncryptionRole      sequenceTlsRole
 	EncryptionCompanion bool
+	ForceStream         bool
+	CompanionContract   bool
 }
 
 func (self sendSequenceId) wireId() sendSequenceWireId {
@@ -2041,6 +2052,8 @@ func (self sendSequenceId) wireId() sendSequenceWireId {
 		Destination:         self.Destination,
 		EncryptionRole:      self.EncryptionRole,
 		EncryptionCompanion: self.EncryptionCompanion,
+		ForceStream:         self.ForceStream,
+		CompanionContract:   self.CompanionContract,
 	}
 }
 
@@ -2113,18 +2126,20 @@ func (self *SendBuffer) createSendSequence(id sendSequenceId, sendPack *SendPack
 		// The receiver has only one head slot for this wire identity. Retire a
 		// sequence whose local-only route options differ before creating the
 		// replacement; letting both run makes each new sequence id supersede
-		// the other and strands acknowledged traffic as "older".
+		// the other and strands acknowledged traffic as "older". With the
+		// force-stream/companion-contract lanes on the wire this now fires
+		// only for the residual intermediaries axis.
 		replaced.Cancel()
 		replacedId := replaced.id()
 		if self.sendSequences[replacedId] == replaced {
 			delete(self.sendSequences, replacedId)
 			if self.log.V(1).Enabled() {
 				self.log.Infof(
-					"[sb]retire wire-indistinguishable sequence %s -> %s (force-stream %t -> %t)\n",
+					"[sb]retire wire-indistinguishable sequence %s -> %s (intermediaries %s -> %s)\n",
 					replaced.sequenceId,
 					id.Destination,
-					replacedId.ForceStream,
-					id.ForceStream,
+					replacedId.IntermediaryIds,
+					id.IntermediaryIds,
 				)
 			}
 		}
@@ -2854,6 +2869,24 @@ func (self *SendSequence) Run() {
 				}
 
 				if sendTime.Before(item.resendTime) {
+					// A selective ack pauses an item's resend for
+					// SelectiveAckTimeout. When such a pause is the EARLIEST
+					// pending resend, every in-flight item is paused, and a
+					// lost cumulative ack has nothing left to heal it: the
+					// receiver (which may have delivered everything) re-acks
+					// only on duplicates, and none are coming — mutual silence
+					// for the full pause. Keep one probe on the ordinary max
+					// resend cadence; its duplicate re-elicits the receiver's
+					// ack state.
+					if item.selectiveAcked {
+						probeTime := sendTime.Add(self.sendBufferSettings.MaxResendInterval)
+						if probeTime.Before(item.resendTime) {
+							self.resendQueue.RemoveByMessageId(item.messageId)
+							item.resendTime = probeTime
+							self.resendQueue.Add(item)
+							continue
+						}
+					}
 					itemResendTimeout := item.resendTime.Sub(sendTime)
 					if itemResendTimeout < timeout {
 						timeout = itemResendTimeout
@@ -3499,6 +3532,11 @@ func (self *SendSequence) sendWithSetContractRecords(
 		if self.encryptionCompanion {
 			spf.companion = true
 		}
+		// sequence lane (Pack fields 10/11): makes the sender's local route
+		// options receiver-visible so same-class sequences on different lanes
+		// coexist instead of superseding each other (see receiveSequenceHeadKey)
+		spf.forceStream = self.forceStream
+		spf.companionContract = self.companionContract
 		transferFrameBytes = marshalSendPackTransferFrame(&spf)
 	} else {
 		// legacy (<v2) path: build and marshal via the proto structs.
@@ -3507,14 +3545,16 @@ func (self *SendSequence) sendWithSetContractRecords(
 		// does not also force the v2 coalescer's fixed frame array onto the heap.
 		legacyFrames := slices.Clone(sendFrames)
 		pack := &protocol.Pack{
-			MessageId:      messageId.Bytes(),
-			SequenceId:     self.sequenceId.Bytes(),
-			SequenceNumber: sequenceNumber,
-			Head:           head,
-			Frames:         legacyFrames,
-			ContractFrame:  contractFrame,
-			Nack:           !ack,
-			Tag:            self.rttWindow.OpenTag(),
+			MessageId:         messageId.Bytes(),
+			SequenceId:        self.sequenceId.Bytes(),
+			SequenceNumber:    sequenceNumber,
+			Head:              head,
+			Frames:            legacyFrames,
+			ContractFrame:     contractFrame,
+			Nack:              !ack,
+			Tag:               self.rttWindow.OpenTag(),
+			ForceStream:       self.forceStream,
+			CompanionContract: self.companionContract,
 		}
 		if !ack && contractId != nil {
 			pack.ContractId = contractId.Bytes()
@@ -3713,6 +3753,7 @@ func (self *SendSequence) receiveAck(messageId Id, selective bool, tag sequenceT
 		// refresh sendTime so the ack-timeout deadline includes the selective-ack window
 		item.sendTime = time.Now()
 		item.resendTime = item.sendTime.Add(self.sendBufferSettings.SelectiveAckTimeout)
+		item.selectiveAcked = true
 		self.resendQueue.Add(item)
 		return
 	}
@@ -4027,6 +4068,11 @@ type sendItem struct {
 	sendCount          int
 	transferFrameBytes []byte
 	acks               sendAckSet
+	// selectiveAcked marks an item whose resend is paused by a selective ack
+	// (see receiveAck). The resend loop keeps one probe scheduled when such a
+	// pause is the earliest pending resend, so a lost cumulative ack cannot
+	// silence the sequence for the whole pause.
+	selectiveAcked bool
 	// forceUnwrapped pins this item to plaintext on every (re)send, so the
 	// outer wrap is skipped even if the per-peer cipher becomes available
 	// between the initial send and a retransmit.
@@ -4157,14 +4203,19 @@ type receiveSequenceId struct {
 }
 
 // receiveSequenceHeadKey identifies the head (newest) receive sequence for a
-// given (source, companion, role). Supersession — drop-older / upgrade-newer
-// by SequenceId — happens within a single (source, companion, role): the
-// peer's client and server streams, and its companion and regular streams,
-// reform independently, so they must not supersede each other.
+// given (source, companion, role, lane). Supersession — drop-older /
+// upgrade-newer by SequenceId — happens within a single key: the peer's
+// client and server streams, its companion and regular streams, and its
+// sequence lanes (force-stream / companion-contract, Pack fields 10/11)
+// reform independently, so they must not supersede each other. Packs from
+// peers that predate the lane fields decode to the false/false lane, which
+// is exactly the legacy merged behavior.
 type receiveSequenceHeadKey struct {
 	Source              TransferPath
 	EncryptionRole      sequenceTlsRole
 	EncryptionCompanion bool
+	ForceStream         bool
+	CompanionContract   bool
 }
 
 // rejectedReceiveSequenceCapacity bounds permanent receive-sequence
@@ -4316,13 +4367,19 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 		EncryptionRole:      receivePack.EncryptionRole,
 		EncryptionCompanion: receivePack.EncryptionCompanion,
 	}
-	// Head/supersession is tracked per (source, companion, role): the peer's
-	// client and server streams, and its companion and regular streams, reform
-	// independently and must not supersede each other.
+	// Head/supersession is tracked per (source, companion, role, lane): the
+	// peer's client and server streams, its companion and regular streams,
+	// and its sequence lanes reform independently and must not supersede each
+	// other. A pack without lane fields (a pre-lane peer, or a caller that
+	// carries no Pack) maps to the false/false legacy lane.
 	headKey := receiveSequenceHeadKey{
 		Source:              receiveSequenceId.Source,
 		EncryptionRole:      receiveSequenceId.EncryptionRole,
 		EncryptionCompanion: receiveSequenceId.EncryptionCompanion,
+	}
+	if receivePack.Pack != nil {
+		headKey.ForceStream = receivePack.Pack.ForceStream
+		headKey.CompanionContract = receivePack.Pack.CompanionContract
 	}
 
 	initReceiveSequence := func(skip *ReceiveSequence) *ReceiveSequence {
@@ -4588,7 +4645,22 @@ type ReceiveSequence struct {
 	// unverifiable, or otherwise unusable contract. The owning ReceiveBuffer
 	// reads it after Run returns and tombstones the deterministic failure.
 	rejectRetransmits bool
+
+	// deliverItems/deliverFrames buffer consecutive in-order head items so
+	// their app frames dispatch in ONE receive callback per drain burst
+	// instead of one per pack (see receiveHead / flushDeliver). Batch depth
+	// mirrors the packs channel occupancy: a lone item flushes on the very
+	// next loop pass (no added latency), a saturated stream flushes at
+	// receiveDeliverBatchMaxFrames. Items are retained here until flush,
+	// which sends their acks and returns their pool buffers.
+	deliverItems  []*receiveItem
+	deliverFrames []*protocol.Frame
+	deliverPeer   Peer
 }
+
+// receiveDeliverBatchMaxFrames bounds the frames buffered for one combined
+// receive callback (memory and worst-case delivery latency under saturation).
+const receiveDeliverBatchMaxFrames = 64
 
 func NewReceiveSequence(
 	ctx context.Context,
@@ -4712,6 +4784,11 @@ func (self *ReceiveSequence) Run() {
 	}()
 	defer func() {
 		self.cancel()
+
+		// deliver-then-die: an exit path (error, idle, cancel) must not strand
+		// buffered head items — deliver their frames, send their acks, and
+		// return their pool buffers
+		self.flushDeliver()
 
 		// close previous contracts and checkpoint the current contract
 		for _, receiveContract := range self.openReceiveContracts {
@@ -5044,6 +5121,10 @@ func (self *ReceiveSequence) Run() {
 		default:
 		}
 
+		// the packs channel is drained: dispatch the buffered head items in
+		// one combined receive callback before waiting
+		self.flushDeliver()
+
 		checkpointId := self.idleCondition.Checkpoint()
 		idleTimer.Reset(timeout)
 		select {
@@ -5332,17 +5413,65 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 	if self.session != nil {
 		appFrames = self.deliverEncryptedControlFrames(item.frames)
 	}
-	if 0 < len(appFrames) {
-		item.receiveCallback(
+
+	// buffer for a combined dispatch: a Peer identity change (contract
+	// rotation) is a batch boundary because one callback carries one peer
+	peerEqual := func(a Peer, b Peer) bool {
+		return a.ProvideMode == b.ProvideMode &&
+			a.Principal == b.Principal &&
+			slices.Equal(a.Roles, b.Roles)
+	}
+	if 0 < len(self.deliverItems) && !peerEqual(peer, self.deliverPeer) {
+		self.flushDeliver()
+	}
+	self.deliverPeer = peer
+	self.deliverItems = append(self.deliverItems, item)
+	self.deliverFrames = append(self.deliverFrames, appFrames...)
+	if receiveDeliverBatchMaxFrames <= len(self.deliverFrames) {
+		self.flushDeliver()
+	}
+}
+
+// flushDeliver dispatches the buffered head items' app frames in one receive
+// callback, then sends their acks (deliver-before-ack, as the per-item path
+// did) and returns their pool buffers. The batch is taken out of the sequence
+// fields BEFORE the callback runs: a callback panic (e.g. a resident tearing
+// down mid-control-processing) then loses the un-acked batch — the sender
+// resends and a healthy sequence reprocesses — instead of the exit-path flush
+// re-delivering a half-processed batch or acking frames whose processing
+// failed.
+func (self *ReceiveSequence) flushDeliver() {
+	if len(self.deliverItems) == 0 {
+		return
+	}
+	items := slices.Clone(self.deliverItems)
+	frames := slices.Clone(self.deliverFrames)
+	peer := self.deliverPeer
+	clear(self.deliverItems)
+	self.deliverItems = self.deliverItems[:0]
+	clear(self.deliverFrames)
+	self.deliverFrames = self.deliverFrames[:0]
+
+	// pool buffers return exactly once even when the callback panics
+	defer func() {
+		for _, item := range items {
+			item.messagePoolReturn()
+		}
+	}()
+
+	if 0 < len(frames) {
+		// all items of one sequence share the client's receive callback
+		items[0].receiveCallback(
 			self.source,
-			appFrames,
+			frames,
 			peer,
 		)
 	}
-	if item.ack {
-		self.sendAck(item.sequenceNumber, item.messageId, false, item.tag, item.unwrapped)
+	for _, item := range items {
+		if item.ack {
+			self.sendAck(item.sequenceNumber, item.messageId, false, item.tag, item.unwrapped)
+		}
 	}
-	item.messagePoolReturn()
 }
 
 // deliverEncryptedControlFrames splits an incoming Pack's frames: any

@@ -631,6 +631,11 @@ type RemoteUserNatMultiClient struct {
 	// backpressure; later deliveries observe nil and stop retaining/calling
 	// the retired owner (typically an UpgradeMux).
 	receivePacketCallback atomic.Pointer[receivePacketCallbackHolder]
+	// receivePacketsCallback, when set, takes the committed-flow fast path's
+	// packets as one batch per client receive dispatch (see
+	// clientReceivePackets). Rare paths (uncommitted flows, migrations)
+	// continue through the per-packet callback.
+	receivePacketsCallback atomic.Pointer[receivePacketsCallbackHolder]
 	// Best-effort removal-generated packets are delivered by one isolated
 	// worker. A permanently blocked downstream therefore cannot wedge resize;
 	// the fixed queue caps retained packets and memory.
@@ -692,6 +697,13 @@ type RemoteUserNatMultiClient struct {
 
 type receivePacketCallbackHolder struct {
 	callback ReceivePacketFunction
+}
+
+// receivePacketsCallbackHolder holds the app's batch receive callback (the
+// shared ReceivePacketsFunction type from ip.go). The multi client's batches
+// may span flows, so the callback's advisory ipPath is nil.
+type receivePacketsCallbackHolder struct {
+	callback ReceivePacketsFunction
 }
 
 // ServerNameLookup resolves a destination IP to the server name(s) previously observed
@@ -817,6 +829,7 @@ func NewRemoteUserNatMultiClient(
 		cancel,
 		generator,
 		multiClient.clientReceivePacket,
+		multiClient.clientReceivePackets,
 		multiClient.removeClient,
 		WindowTypeQuality,
 		provideMode == protocol.ProvideMode_Network,
@@ -829,6 +842,7 @@ func NewRemoteUserNatMultiClient(
 			cancel,
 			generator,
 			multiClient.clientReceivePacket,
+			multiClient.clientReceivePackets,
 			multiClient.removeClient,
 			WindowTypeSpeed,
 			provideMode == protocol.ProvideMode_Network,
@@ -885,6 +899,83 @@ func (self *RemoteUserNatMultiClient) deliverReceivePacket(
 	if holder := self.receivePacketCallback.Load(); holder != nil {
 		holder.callback(source, provideMode, ipPath, packet)
 	}
+}
+
+// SetReceivePacketsCallback registers a batch receive callback. When set, the
+// committed-flow fast path delivers each client receive dispatch's packets as
+// one batch through it (amortizing the app's per-packet inject cost, e.g.
+// tun.WriteBatch); the per-packet callback still receives the rare paths.
+func (self *RemoteUserNatMultiClient) SetReceivePacketsCallback(receivePacketsCallback ReceivePacketsFunction) {
+	if receivePacketsCallback == nil {
+		self.receivePacketsCallback.Store(nil)
+		return
+	}
+	self.receivePacketsCallback.Store(&receivePacketsCallbackHolder{callback: receivePacketsCallback})
+}
+
+// clientReceivePackets is the batch form of clientReceivePacket: one call per
+// client receive dispatch with every parsed return packet. Packets on the
+// committed-flow fast path (the common download case) collect into one batch
+// delivery; everything else falls back to the per-packet path unchanged.
+func (self *RemoteUserNatMultiClient) clientReceivePackets(
+	sourceClient *multiClientChannel,
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	ipPaths []IpPath,
+	packets [][]byte,
+) {
+	holder := self.receivePacketsCallback.Load()
+	if holder == nil {
+		for i := range packets {
+			self.clientReceivePacket(sourceClient, source, provideMode, ipPaths[i], packets[i])
+		}
+		return
+	}
+
+	// batchPackets is bounded by the dispatch batch (receiveDeliverBatchMaxFrames)
+	var batchPackets [][]byte
+	flush := func() {
+		if len(batchPackets) == 0 {
+			return
+		}
+		// the batch may span flows: the advisory per-flow ipPath is nil
+		holder.callback(source, provideMode, nil, batchPackets)
+		batchPackets = batchPackets[:0]
+	}
+
+	for i := range packets {
+		ipPath := ipPaths[i]
+		packet := packets[i]
+
+		// mirror clientReceivePacket's pre-delivery accounting exactly
+		r, err := inspectAndRefreshIngressBorrowed(self.securityPolicy, provideMode, ipPath, nil)
+		if err != nil || r != SecurityPolicyResultAllow {
+			continue
+		}
+		self.packetStatsCounters.remoteIngressPacketCount.Add(1)
+		self.packetStatsCounters.remoteIngressByteCount.Add(int64(len(packet)))
+		if self.ipAssoc != nil {
+			self.ipAssoc.AddIngressPacket(&ipPath)
+		}
+		ipPath = ipPath.ReverseValue()
+
+		update := self.receiveUpdate(&ipPath)
+		if update != nil && update.client.Load() == sourceClient {
+			// committed-flow fast path: batch
+			batchPackets = append(batchPackets, packet)
+			continue
+		}
+		// rare path (unknown flow / not committed / migration race): keep
+		// delivery ORDER relative to the batch by flushing first, then reuse
+		// the per-packet path from its post-accounting point
+		flush()
+		if update == nil {
+			self.deliverReceivePacket(source, provideMode, retainIpPath(&ipPath), packet)
+			continue
+		}
+		self.clientReceivePacketCommit(sourceClient, source, provideMode, update, packet)
+	}
+	flush()
 }
 
 func (self *RemoteUserNatMultiClient) enqueueRemovalReceive(packet *receivePacket) {
@@ -2521,6 +2612,18 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 		return
 	}
 
+	self.clientReceivePacketCommit(sourceClient, source, provideMode, update, packet)
+}
+
+// clientReceivePacketCommit is the race / not-yet-committed tail of the
+// receive path, shared by the per-packet and batch dispatches.
+func (self *RemoteUserNatMultiClient) clientReceivePacketCommit(
+	sourceClient *multiClientChannel,
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	update *multiClientChannelUpdate,
+	packet []byte,
+) {
 	var abandonedClients []*multiClientChannel
 	var receivePackets []*receivePacket
 	var returnPackets []*receivePacket
@@ -2985,10 +3088,11 @@ type multiClientWindow struct {
 	cancel context.CancelFunc
 	log    Logger
 
-	generator                   MultiClientGenerator
-	clientReceivePacketCallback clientReceivePacketFunction
-	clientRemoveCallback        func(client *multiClientChannel)
-	windowType                  WindowType
+	generator                    MultiClientGenerator
+	clientReceivePacketCallback  clientReceivePacketFunction
+	clientReceivePacketsCallback clientReceivePacketsFunction
+	clientRemoveCallback         func(client *multiClientChannel)
+	windowType                   WindowType
 	// networkPeerDestination is true only when the embedding app explicitly
 	// selected a trusted same-network peer and the entire multi-client uses the
 	// Network relationship.
@@ -3027,6 +3131,7 @@ func newMultiClientWindow(
 	cancel context.CancelFunc,
 	generator MultiClientGenerator,
 	clientReceivePacketCallback clientReceivePacketFunction,
+	clientReceivePacketsCallback clientReceivePacketsFunction,
 	clientRemoveCallback func(client *multiClientChannel),
 	windowType WindowType,
 	networkPeerDestination bool,
@@ -3034,24 +3139,25 @@ func newMultiClientWindow(
 	performanceProfile *PerformanceProfile,
 ) *multiClientWindow {
 	window := &multiClientWindow{
-		ctx:                         ctx,
-		cancel:                      cancel,
-		log:                         loggerOrDefault(settings.Log),
-		generator:                   generator,
-		clientReceivePacketCallback: clientReceivePacketCallback,
-		clientRemoveCallback:        clientRemoveCallback,
-		windowType:                  windowType,
-		networkPeerDestination:      networkPeerDestination,
-		settings:                    settings,
-		clientChannelArgs:           make(chan *multiClientChannelArgs),
-		monitor:                     NewRemoteUserNatMultiClientMonitor(&settings.RemoteUserNatMultiClientMonitorSettings),
-		contractStatusCallbacks:     NewCallbackList[*contractStatusCallbackWorker](),
-		contractStatsCallbacks:      NewCallbackList[*contractStatsCallbackWorker](),
-		peerIdentityChangeCallbacks: NewCallbackList[*coalescingCallbackWorker](),
-		clients:                     map[Id]*multiClientChannel{},
-		createTime:                  time.Now(),
-		generatorMonitor:            NewMonitor(),
-		resizeMonitor:               NewMonitor(),
+		ctx:                          ctx,
+		cancel:                       cancel,
+		log:                          loggerOrDefault(settings.Log),
+		generator:                    generator,
+		clientReceivePacketCallback:  clientReceivePacketCallback,
+		clientReceivePacketsCallback: clientReceivePacketsCallback,
+		clientRemoveCallback:         clientRemoveCallback,
+		windowType:                   windowType,
+		networkPeerDestination:       networkPeerDestination,
+		settings:                     settings,
+		clientChannelArgs:            make(chan *multiClientChannelArgs),
+		monitor:                      NewRemoteUserNatMultiClientMonitor(&settings.RemoteUserNatMultiClientMonitorSettings),
+		contractStatusCallbacks:      NewCallbackList[*contractStatusCallbackWorker](),
+		contractStatsCallbacks:       NewCallbackList[*contractStatsCallbackWorker](),
+		peerIdentityChangeCallbacks:  NewCallbackList[*coalescingCallbackWorker](),
+		clients:                      map[Id]*multiClientChannel{},
+		createTime:                   time.Now(),
+		generatorMonitor:             NewMonitor(),
+		resizeMonitor:                NewMonitor(),
 	}
 	window.performanceProfile.Store(performanceProfile)
 
@@ -3228,6 +3334,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 						Destination:                    destination,
 						DestinationStats:               stats,
 						MultiClientGeneratorClientArgs: *clientArgs,
+						ReceivePackets:                 self.clientReceivePacketsCallback,
 					}
 					select {
 					case <-self.ctx.Done():
@@ -4117,7 +4224,18 @@ type multiClientChannelArgs struct {
 
 	Destination MultiHopId
 	DestinationStats
+
+	// ReceivePackets, when set, takes each client receive dispatch's parsed
+	// return packets as ONE call instead of one per packet (see
+	// clientReceive), so the owner can amortize per-packet delivery costs.
+	// nil falls back to the per-packet callback for every packet.
+	ReceivePackets clientReceivePacketsFunction
 }
+
+// clientReceivePacketsFunction is the batch form of
+// clientReceivePacketFunction: all parsed return packets of one dispatch, in
+// delivery order, borrowed for the call.
+type clientReceivePacketsFunction func(client *multiClientChannel, source TransferPath, provideMode protocol.ProvideMode, ipPaths []IpPath, packets [][]byte)
 
 type multiClientEventType int
 
@@ -5556,6 +5674,14 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 	//     return
 	// }
 
+	// with a batch callback, parsed packets collect and dispatch as ONE call
+	// after the frame loop (the frames slice is one in-order dispatch burst;
+	// see ReceiveSequence.flushDeliver), amortizing the per-packet delivery
+	// pipeline. Packets are borrowed for the dispatch, same as frames.
+	var batchIpPaths []IpPath
+	var batchPackets [][]byte
+	batch := self.args.ReceivePackets != nil
+
 	for _, frame := range frames {
 		switch frame.MessageType {
 		case protocol.MessageType_TransferResidentMigrate:
@@ -5587,7 +5713,12 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 					if ipPath.Syn {
 						self.addReceiveSyn(1)
 					}
-					self.clientReceivePacketCallback(self, source, peer.ProvideMode, ipPath, packet)
+					if batch {
+						batchIpPaths = append(batchIpPaths, ipPath)
+						batchPackets = append(batchPackets, packet)
+					} else {
+						self.clientReceivePacketCallback(self, source, peer.ProvideMode, ipPath, packet)
+					}
 				} else if count := self.receiveParseDropCount.Add(1); count&(count-1) == 0 {
 					// power-of-two summaries: untrusted, potentially
 					// high-rate return input (mirrors the send drop counters)
@@ -5606,6 +5737,10 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 		default:
 			// unknown message, drop
 		}
+	}
+
+	if batch && 0 < len(batchPackets) {
+		self.args.ReceivePackets(self, source, peer.ProvideMode, batchIpPaths, batchPackets)
 	}
 }
 

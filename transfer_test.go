@@ -917,22 +917,38 @@ func TestSendBufferRetiresWireIndistinguishableSequenceForks(t *testing.T) {
 		t.Fatal("first sequence unexpectedly forced a stream")
 	}
 
-	// ForceStream changes the local contract/route key but is absent from the
-	// receiver head key. The new sequence must synchronously retire the old
-	// one instead of leaving both live to supersede each other forever.
+	// ForceStream is stamped on every Pack (the sequence lane), so the
+	// receiver keys its head slot per lane: a ForceStream sequence COEXISTS
+	// with the plain one instead of retiring it.
 	send("stream", ForceStream())
-	streamId, stream := onlySequence("force-stream")
-	if !streamId.ForceStream {
-		t.Fatal("replacement sequence did not use ForceStream")
-	}
+	func() {
+		client.sendBuffer.mutex.Lock()
+		defer client.sendBuffer.mutex.Unlock()
+		exactCount := 0
+		wireCount := 0
+		for id := range client.sendBuffer.sendSequences {
+			if id.Destination == destination {
+				exactCount += 1
+			}
+		}
+		for wireId := range client.sendBuffer.wireSendSequences {
+			if wireId.Destination == destination {
+				wireCount += 1
+			}
+		}
+		if exactCount != 2 || wireCount != 2 {
+			t.Fatalf("lane coexistence: exact=%d wire=%d, want two each", exactCount, wireCount)
+		}
+	}()
 	select {
 	case <-plain.ctx.Done():
+		t.Fatal("ForceStream=false lane sequence was retired; lanes must coexist")
 	default:
-		t.Fatal("wire-indistinguishable ForceStream=false sequence remained live")
 	}
 
-	// Intermediaries are likewise a sender-side route choice and absent from
-	// the destination's receive-head identity.
+	// Intermediaries remain a sender-side route choice absent from the
+	// destination's receive-head identity, so an intermediaries fork still
+	// synchronously retires the same-lane predecessor.
 	via := RequireMultiHopId(NewId(), peerId)
 	frame := &protocol.Frame{
 		MessageType:  protocol.MessageType_TransferExchangeSignals,
@@ -941,14 +957,28 @@ func TestSendBufferRetiresWireIndistinguishableSequenceForks(t *testing.T) {
 	if !client.SendMultiHopWithTimeout(frame, via, nil, time.Second, ForceStream()) {
 		t.Fatal("multi-hop replacement enqueue failed")
 	}
-	viaId, _ := onlySequence("intermediary")
-	if viaId.IntermediaryIds.Len() != 1 {
-		t.Fatalf("replacement intermediaries = %v, want one", viaId.IntermediaryIds)
-	}
+	func() {
+		client.sendBuffer.mutex.Lock()
+		defer client.sendBuffer.mutex.Unlock()
+		viaCount := 0
+		for id := range client.sendBuffer.sendSequences {
+			if id.Destination == destination && id.ForceStream {
+				viaCount += 1
+				if id.IntermediaryIds.Len() != 1 {
+					t.Fatalf("force-stream lane intermediaries = %v, want one", id.IntermediaryIds)
+				}
+			}
+		}
+		if viaCount != 1 {
+			t.Fatalf("force-stream lane sequences = %d, want the intermediary replacement only", viaCount)
+		}
+	}()
+	// the direct force-stream sequence was retired by the intermediaries fork
+	// (same lane on the wire); the plain lane is untouched
 	select {
-	case <-stream.ctx.Done():
+	case <-plain.ctx.Done():
+		t.Fatal("plain lane sequence was retired by another lane's intermediaries fork")
 	default:
-		t.Fatal("wire-indistinguishable direct sequence remained live")
 	}
 }
 

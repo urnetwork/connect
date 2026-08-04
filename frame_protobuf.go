@@ -157,6 +157,10 @@ type sendPackFrame struct {
 	sessionRoleSet bool
 	// companion is emitted (TransferFrame field 8) only when true.
 	companion bool
+	// sequence lane discriminators (Pack fields 10/11), emitted only when
+	// true (proto3 implicit presence; false is the legacy default lane)
+	forceStream       bool
+	companionContract bool
 }
 
 // sizePack returns the encoded size of the Pack submessage body.
@@ -190,6 +194,12 @@ func (m *sendPackFrame) sizePack() int {
 	n += protoSizeTag(8) + protoSizeVarint(uint64(tagBody)) + tagBody
 	if m.contractId != nil {
 		n += protoSizeTag(9) + protoSizeVarint(16) + 16
+	}
+	if m.forceStream {
+		n += protoSizeTag(10) + 1
+	}
+	if m.companionContract {
+		n += protoSizeTag(11) + 1
 	}
 	return n
 }
@@ -232,6 +242,14 @@ func (m *sendPackFrame) appendPack(b []byte) []byte {
 	}
 	if m.contractId != nil {
 		b = appendIdField(b, 9, *m.contractId)
+	}
+	if m.forceStream {
+		b = protoAppendTag(b, 10, protoWireVarint)
+		b = append(b, 1)
+	}
+	if m.companionContract {
+		b = protoAppendTag(b, 11, protoWireVarint)
+		b = append(b, 1)
 	}
 	return b
 }
@@ -1025,6 +1043,20 @@ func decodePack(b []byte) (pack *protocol.Pack, success bool) {
 			}
 			b = b[vn:]
 			pack.Nack = protowire.DecodeBool(v)
+		case 10, 11: // force_stream, companion_contract (sequence lane)
+			if typ != protowire.VarintType {
+				return nil, false
+			}
+			v, vn := protowire.ConsumeVarint(b)
+			if vn < 0 {
+				return nil, false
+			}
+			b = b[vn:]
+			if num == 10 {
+				pack.ForceStream = protowire.DecodeBool(v)
+			} else {
+				pack.CompanionContract = protowire.DecodeBool(v)
+			}
 		case 5, 7: // frames (repeated), contract_frame (Frame)
 			if typ != protowire.BytesType {
 				return nil, false
@@ -1141,6 +1173,20 @@ func decodePackOwned(b []byte) (owner *decodedPackOwner, success bool) {
 			}
 			b = b[vn:]
 			pack.Nack = protowire.DecodeBool(v)
+		case 10, 11: // force_stream, companion_contract (sequence lane)
+			if typ != protowire.VarintType {
+				return nil, false
+			}
+			v, vn := protowire.ConsumeVarint(b)
+			if vn < 0 {
+				return nil, false
+			}
+			b = b[vn:]
+			if num == 10 {
+				pack.ForceStream = protowire.DecodeBool(v)
+			} else {
+				pack.CompanionContract = protowire.DecodeBool(v)
+			}
 		case 5: // frames (repeated)
 			if typ != protowire.BytesType {
 				return nil, false

@@ -685,6 +685,15 @@ type WebRtcSettings struct {
 	// AWDL, and VM interfaces; generic server callers leave it false for
 	// deliberate multihoming.
 	UseEgressOnlyIceInterfaces bool
+	// UseLoopbackOnlyIceInterfaces gathers host candidates only from
+	// loopback interfaces, and takes precedence over
+	// UseEgressOnlyIceInterfaces. Hermetic same-process tests enable this so
+	// a local connect does not sweep the host's full local×remote candidate
+	// cross-product: a multihomed development host (utun, bridge, AWDL, and
+	// VM interfaces) otherwise floods ICE with unroutable pairs and pushes a
+	// loopback-capable connect past the test deadline at STUN check pacing.
+	// Production callers leave it false.
+	UseLoopbackOnlyIceInterfaces bool
 
 	// add stun:xxx urls here
 	IceServerUrls []string

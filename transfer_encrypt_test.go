@@ -968,7 +968,7 @@ func TestDeliverClientHelloResetsCompletedServerHandshakeClientHelloAfterComplet
 	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleServer)
 	defer cleanup()
 	e1 := injectTestEpoch(sess, true, nil)
-	sess.deliverHandshake(clientHello)
+	sess.deliverHandshake(clientHello, Id{})
 	if sess.currentEpoch() == e1 {
 		t.Fatal("expected a new ClientHello to reset the completed server handshake")
 	}
@@ -987,7 +987,7 @@ func TestDeliverClientHelloResetsCompletedServerHandshakeStaleNonClientHelloAfte
 	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleServer)
 	defer cleanup()
 	e1 := injectTestEpoch(sess, true, nil)
-	sess.deliverHandshake(appData)
+	sess.deliverHandshake(appData, Id{})
 	if sess.currentEpoch() != e1 {
 		t.Fatal("expected stale post-completion bytes to be dropped without reset")
 	}

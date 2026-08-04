@@ -23,14 +23,16 @@ import (
 // sendWithSetContract (v2 path) would build for the given sendPackFrame.
 func buildEquivalentTransferFrame(m *sendPackFrame) *protocol.TransferFrame {
 	pack := &protocol.Pack{
-		MessageId:      m.messageId.Bytes(),
-		SequenceId:     m.sequenceId.Bytes(),
-		SequenceNumber: m.sequenceNumber,
-		Head:           m.head,
-		Frames:         m.frames,
-		ContractFrame:  m.contractFrame,
-		Nack:           m.nack,
-		Tag:            &protocol.Tag{SendTime: m.tagSendTime},
+		MessageId:         m.messageId.Bytes(),
+		SequenceId:        m.sequenceId.Bytes(),
+		SequenceNumber:    m.sequenceNumber,
+		Head:              m.head,
+		Frames:            m.frames,
+		ContractFrame:     m.contractFrame,
+		Nack:              m.nack,
+		Tag:               &protocol.Tag{SendTime: m.tagSendTime},
+		ForceStream:       m.forceStream,
+		CompanionContract: m.companionContract,
 	}
 	if m.contractId != nil {
 		pack.ContractId = m.contractId.Bytes()
@@ -224,6 +226,8 @@ func TestFrameCodecRandomized(t *testing.T) {
 		}
 		m.head = mathrandv2.IntN(2) == 0
 		m.nack = mathrandv2.IntN(2) == 0
+		m.forceStream = mathrandv2.IntN(2) == 0
+		m.companionContract = mathrandv2.IntN(2) == 0
 		if mathrandv2.IntN(4) != 0 {
 			frameCount := mathrandv2.IntN(3)
 			for i := 0; i < frameCount; i++ {
