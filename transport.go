@@ -218,15 +218,21 @@ type PlatformTransport struct {
 	// re-dials immediately — fired on a host network path change
 	// (NetworkChanged), where the current socket is likely bound to a dead
 	// path and would otherwise linger until a ping/write timeout notices.
+	// Ported from upstream main e05ecee, merged with our reconnect fast
+	// path: the kicked re-dial goes through NextReconnectTime (small
+	// independent jitter, capped concurrency) rather than the serialized
+	// NextConnectTime staircase, since a network change is a legitimate
+	// fresh start.
 	kickMonitor *Monitor
 	// unsubNetworkChange removes this transport from the process
-	// network-change listeners on Close.
+	// network-change listeners when the run loop exits.
 	unsubNetworkChange func()
 }
 
-// Kick closes the transport's live connection (if any) so the run loop
-// re-dials immediately. The transport itself stays up; an in-flight dial is
-// unaffected. Safe to call at any time.
+// Kick closes the transport's live connection (if any) and skips any pending
+// reconnect backoff so the run loop re-dials immediately over the new path.
+// The transport itself stays up; an in-flight dial is unaffected. Safe to
+// call at any time.
 func (self *PlatformTransport) Kick() {
 	self.kickMonitor.NotifyAll()
 }
@@ -549,6 +555,12 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		}
 	}
 
+	// hadConnection marks the iteration immediately after a connection ran and
+	// died: only that first re-dial takes the reconnect fast path
+	// (NextReconnectTime); a failed re-dial clears it, so retries fall back to
+	// the serialized NextConnectTime pacing.
+	hadConnection := false
+
 	for {
 		// stand down while a strictly better mode is active
 		func() {
@@ -622,10 +634,27 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			return ws, nil
 		}
 
-		if connectDelay := self.clientStrategy.NextConnectTime().Sub(time.Now()); 0 < connectDelay {
+		// a transport that was connected and just died takes the reconnect
+		// fast path (small independent jitter, capped concurrency) instead of
+		// the shared serializing staircase; see NextReconnectTime. The release
+		// frees the fast-path slot as soon as the dial attempt completes, on
+		// every exit path.
+		var connectTime time.Time
+		releaseReconnect := func() {}
+		if hadConnection {
+			connectTime, releaseReconnect = self.clientStrategy.NextReconnectTime()
+			hadConnection = false
+		} else {
+			connectTime = self.clientStrategy.NextConnectTime()
+		}
+		if connectDelay := connectTime.Sub(time.Now()); 0 < connectDelay {
 			select {
 			case <-self.ctx.Done():
+				releaseReconnect()
 				return
+			case <-self.kickMonitor.NotifyChannel():
+				// network changed while waiting to dial: any pacing computed
+				// for the old path is meaningless — dial now over the new one
 			case <-time.After(connectDelay):
 			}
 		}
@@ -637,6 +666,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		} else {
 			ws, err = connect()
 		}
+		releaseReconnect()
 		if err != nil {
 			self.log.Infof("[t]auth error %s = %s\n", clientId, err)
 			select {
@@ -645,7 +675,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			case <-self.kickMonitor.NotifyChannel():
 				// network changed: the failed dial was likely on the dead
 				// path — retry now over the new one instead of waiting out
-				// the backoff
+				// the backoff, and take the reconnect fast path (a network
+				// change is a legitimate fresh start, not staircase churn)
+				hadConnection = true
 				continue
 			case <-reconnect.After():
 				continue
@@ -662,7 +694,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			defer handleCancel()
 
 			// a network-change kick closes this connection so the loop
-			// re-dials over the new path immediately (see Kick)
+			// re-dials over the new path immediately (see Kick). the ws.Close
+			// is what unblocks a reader/writer parked in a socket call that
+			// handleCancel alone cannot wake.
 			kick := self.kickMonitor.NotifyChannel()
 			go HandleError(func() {
 				select {
@@ -1120,10 +1154,17 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		} else {
 			c()
 		}
+		// the connection ran and died: the next dial is a reconnect
+		hadConnection = true
 
 		select {
 		case <-self.ctx.Done():
 			return
+		case <-self.kickMonitor.NotifyChannel():
+			// a kick arriving after the connection already died skips the
+			// residual backoff — the fast-path re-dial starts now. (the kick
+			// that killed the connection closed the previous notify channel;
+			// this arm arms a fresh one, so one kick fires exactly once here.)
 		case <-reconnect.After():
 		}
 	}
@@ -1156,6 +1197,12 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 		case <-time.After(initialTimeout):
 		}
 	}
+
+	// hadConnection marks the iteration immediately after a connection ran and
+	// died: only that first re-dial takes the reconnect fast path
+	// (NextReconnectTime); a failed re-dial clears it, so retries fall back to
+	// the serialized NextConnectTime pacing.
+	hadConnection := false
 
 	for {
 		// wait until we are back in the specific pt mode or auto mode
@@ -1335,10 +1382,27 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			}, nil
 		}
 
-		if connectDelay := self.clientStrategy.NextConnectTime().Sub(time.Now()); 0 < connectDelay {
+		// a transport that was connected and just died takes the reconnect
+		// fast path (small independent jitter, capped concurrency) instead of
+		// the shared serializing staircase; see NextReconnectTime. The release
+		// frees the fast-path slot as soon as the dial attempt completes, on
+		// every exit path.
+		var connectTime time.Time
+		releaseReconnect := func() {}
+		if hadConnection {
+			connectTime, releaseReconnect = self.clientStrategy.NextReconnectTime()
+			hadConnection = false
+		} else {
+			connectTime = self.clientStrategy.NextConnectTime()
+		}
+		if connectDelay := connectTime.Sub(time.Now()); 0 < connectDelay {
 			select {
 			case <-self.ctx.Done():
+				releaseReconnect()
 				return
+			case <-self.kickMonitor.NotifyChannel():
+				// network changed while waiting to dial: any pacing computed
+				// for the old path is meaningless — dial now over the new one
 			case <-time.After(connectDelay):
 			}
 		}
@@ -1350,14 +1414,16 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 		} else {
 			connStream, err = connect()
 		}
+		releaseReconnect()
 		if err != nil {
 			self.log.Infof("[t]auth error %s = %s\n", clientId, err)
 			select {
 			case <-self.ctx.Done():
 				return
 			case <-self.kickMonitor.NotifyChannel():
-				// network changed: retry now over the new path (see the h1
-				// loop above)
+				// network changed: retry now over the new path and take the
+				// reconnect fast path (see the h1 loop above)
+				hadConnection = true
 				continue
 			case <-reconnect.After():
 				continue
@@ -1376,7 +1442,9 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			defer handleCancel()
 
 			// a network-change kick closes this connection so the loop
-			// re-dials over the new path immediately (see Kick)
+			// re-dials over the new path immediately (see Kick). closing the
+			// QUIC connection is what unblocks a reader/writer parked in a
+			// stream call that handleCancel alone cannot wake.
 			kick := self.kickMonitor.NotifyChannel()
 			go HandleError(func() {
 				select {
@@ -1588,10 +1656,16 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 		} else {
 			c()
 		}
+		// the connection ran and died: the next dial is a reconnect
+		hadConnection = true
 
 		select {
 		case <-self.ctx.Done():
 			return
+		case <-self.kickMonitor.NotifyChannel():
+			// a kick arriving after the connection already died skips the
+			// residual backoff — the fast-path re-dial starts now (see the
+			// h1 loop above)
 		case <-reconnect.After():
 		}
 	}
@@ -1599,6 +1673,9 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 
 func (self *PlatformTransport) Close() {
 	self.cancel()
+	// unsubscribe eagerly (idempotent; the run loop's deferred unsubscribe
+	// also fires) so a NetworkChanged broadcast racing Close cannot kick a
+	// transport whose owner already considers it dead.
 	if self.unsubNetworkChange != nil {
 		self.unsubNetworkChange()
 	}

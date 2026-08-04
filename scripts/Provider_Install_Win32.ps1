@@ -1,7 +1,8 @@
 #!/usr/bin/env pwsh
 # Credits: Ar Rakin, Ryan Mello
 # urnet-tools -- URnetwork manager script (also acts as an installation script)
-# GitHub: <https://github.com/urnetwork/connect>
+# GitHub: <https://github.com/Ryanmello07/connect>
+# Beta fork: installs the custom client build from Ryanmello07/connect.
 
 param(
     [String]$Version = "latest",
@@ -124,7 +125,7 @@ function Set-Path {
 
 Print-Settings
 
-$GithubURLBase = "https://api.github.com/repos/urnetwork/connect"
+$GithubURLBase = "https://api.github.com/repos/Ryanmello07/connect"
 
 if ($Version -eq "latest") {
     $GithubURL = "$GithubURLBase/releases/latest"
@@ -207,7 +208,7 @@ if ($ToolsScriptPath) {
     Copy-Item $ToolsScriptPath $InstalledToolsPath
 }
 else {
-    Invoke-RestMethod "https://raw.githubusercontent.com/urnetwork/connect/refs/heads/main/scripts/urnet-tools.ps1" -OutFile $InstalledToolsPath
+    Invoke-RestMethod "https://raw.githubusercontent.com/Ryanmello07/connect/refs/heads/main/scripts/urnet-tools.ps1" -OutFile $InstalledToolsPath
 }
 
 $InstalledUpdaterPath = Join-Path $Destination -ChildPath "urnetwork-updater.ps1"
@@ -222,7 +223,7 @@ if ($UpdaterScriptPath) {
     Copy-Item $UpdaterScriptPath $InstalledUpdaterPath
 }
 else {
-    Invoke-RestMethod "https://raw.githubusercontent.com/urnetwork/connect/refs/heads/main/scripts/urnetwork-updater.ps1" -OutFile $InstalledUpdaterPath
+    Invoke-RestMethod "https://raw.githubusercontent.com/Ryanmello07/connect/refs/heads/main/scripts/urnetwork-updater.ps1" -OutFile $InstalledUpdaterPath
 }
 
 Set-Content $VersionFile $ReleaseVersion

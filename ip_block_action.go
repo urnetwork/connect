@@ -31,6 +31,26 @@ type BlockOverride struct {
 
 type RouteOverride struct {
 	Local bool
+	// Pin holds the matching traffic to one stable egress.
+	//
+	// An APP rule is the strong form: every flow the app owns joins a single
+	// app-scoped affinity group INSTEAD of its per-domain groups, so the
+	// app's api session and all of its cdns converge on one exit, across
+	// both ip versions.
+	//
+	// A HOST rule is the weak form: the matched flows keep their ordinary
+	// domain groups (which already pin a site to one exit) and gain only the
+	// longer bench-follow below. It exists for completeness; the app rule is
+	// what fixes an app whose content fails to load.
+	//
+	// Either way a pinned flow's affinity inheritance follows a quarantined
+	// donor for a MULTIPLE of the ordinary follow window (not indefinitely --
+	// see pinnedFollowWindow), and a warned donor still refuses.
+	//
+	// Pin never changes block/local routing -- a pinned flow egresses
+	// remotely as normal; only WHERE it egresses is held. Zero-value off, so
+	// stored rules from before this field are unchanged (the store is json).
+	Pin bool
 }
 
 type BlockActionOverride struct {
@@ -234,7 +254,13 @@ func (self *blockActionMatch) merge(override *BlockActionOverride) {
 		}
 	}
 	if override.RouteOverride != nil {
-		if self.routeOverride == nil || !self.routeOverride.Local && override.RouteOverride.Local {
+		// preference order: Local wins (local traffic never reaches a
+		// provider, so a pin on the same cluster is moot), then Pin, then
+		// any. Order-independent like the block half.
+		replace := self.routeOverride == nil ||
+			(!self.routeOverride.Local && override.RouteOverride.Local) ||
+			(!self.routeOverride.Local && !self.routeOverride.Pin && override.RouteOverride.Pin)
+		if replace {
 			self.routeOverride = override.RouteOverride
 			self.routeOverrideId = override.OverrideId
 		}

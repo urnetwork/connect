@@ -1,7 +1,8 @@
 #!/usr/bin/env pwsh
 # Credits: Ar Rakin, Ryan Mello
-# urnet-tools -- URnetwork manager script (also acts as an installation script)
-# GitHub: <https://github.com/urnetwork/connect>
+# urnet-tools -- URnetwork manager script
+# GitHub: <https://github.com/Ryanmello07/connect>
+# Beta fork: manages the custom client build from Ryanmello07/connect.
 
 <#
 .SYNOPSIS
@@ -79,7 +80,7 @@ if (-not $IsLinux) {
     $BinarySuffix = ".exe"
 }
 
-$GithubURLBase = "https://api.github.com/repos/urnetwork/connect"
+$GithubURLBase = "https://api.github.com/repos/Ryanmello07/connect"
 
 function Get-Path {
     return [Environment]::GetEnvironmentVariable("PATH", [System.EnvironmentVariableTarget]::User)
@@ -325,7 +326,7 @@ switch ($Command) {
         Write-Host "Executing installer script of version $Tag"
 
         $TempScriptPath = Join-Path $env:TEMP -ChildPath "urnetwork-installer.ps1"
-        Invoke-RestMethod "https://raw.githubusercontent.com/urnetwork/connect/refs/heads/main/scripts/Provider_Install_Win32.ps1" -OutFile $TempScriptPath
+        Invoke-RestMethod "https://raw.githubusercontent.com/Ryanmello07/connect/refs/heads/main/scripts/Provider_Install_Win32.ps1" -OutFile $TempScriptPath
 
         if (!$?) {
             Write-Error "Failed to download the installer script"
@@ -370,7 +371,7 @@ switch ($Command) {
         Write-Host "Executing installer script of version $InstallerTag"
 
         $TempScriptPath = Join-Path $env:TEMP -ChildPath "urnetwork-installer.ps1"
-        Invoke-RestMethod "https://raw.githubusercontent.com/urnetwork/connect/refs/heads/main/scripts/Provider_Install_Win32.ps1" -OutFile $TempScriptPath
+        Invoke-RestMethod "https://raw.githubusercontent.com/Ryanmello07/connect/refs/heads/main/scripts/Provider_Install_Win32.ps1" -OutFile $TempScriptPath
 
         if (!$?) {
             Write-Error "Failed to download the installer script"

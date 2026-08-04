@@ -152,6 +152,22 @@ func (self *RouteManager) RemoveTransport(transport Transport) {
 	self.UpdateTransport(transport, nil)
 }
 
+// HasActiveTransport reports whether any transport is currently registered
+// with routes. The transport set is the ground truth for whether this client
+// has a carrier at all: transports register on (re)connect via
+// UpdateTransport and are removed when their connection dies, so an empty set
+// means nothing this client sends can leave the device and nothing can
+// arrive. Consumers use that to rule the client's silence inadmissible as
+// evidence against the remote end -- see detectBlackhole and sendStalled in
+// the multi client. Both match states are read because UpdateTransport writes
+// them together but a send-only or receive-only transport is still a carrier.
+func (self *RouteManager) HasActiveTransport() bool {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+
+	return 0 < len(self.writerMatchState.transportRoutes) || 0 < len(self.readerMatchState.transportRoutes)
+}
+
 func (self *RouteManager) getTransportStats(transport Transport) (writerStats *RouteStats, readerStats *RouteStats) {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()

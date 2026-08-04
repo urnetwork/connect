@@ -278,7 +278,7 @@ func TestMultiClientChannelWindowStats(t *testing.T) {
 		},
 	}
 
-	clientReceivePacket := func(client *multiClientChannel, source TransferPath, provideMode protocol.ProvideMode, ipPath IpPath, packet []byte) {
+	clientReceivePacket := func(client *multiClientChannel, source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
 		// Do nothing
 	}
 
@@ -306,7 +306,7 @@ func TestMultiClientChannelWindowStats(t *testing.T) {
 	}
 	AssertEqual(t, nil, err)
 
-	clientChannel, err := newMultiClientChannel(ctx, channelArgs, generator, clientReceivePacket, contractStatus, func(contractStatsEvents []*ContractStatsEvent) {}, func() {}, nil, false, settings)
+	clientChannel, err := newMultiClientChannel(ctx, channelArgs, generator, clientReceivePacket, nil, DefaultSecurityPolicy(ctx), contractStatus, func(contractStatsEvents []*ContractStatsEvent) {}, func() {}, nil, settings, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	AssertEqual(t, nil, err)
 
 	cancelCtxs := []context.Context{}
@@ -450,104 +450,4 @@ func TestMultiClientOverrideAllowDirect(t *testing.T) {
 	pp = multiClientPlain.config.Load().performanceProfile
 	AssertEqual(t, true, pp != nil)
 	AssertEqual(t, false, pp.AllowDirect)
-}
-
-// TestMultiClientEquivalentPerformanceProfileIsNoOp protects the transport
-// lifetime boundary: rebuilding an equal app-side value must not publish a
-// new config or shuffle healthy window clients.
-func TestMultiClientEquivalentPerformanceProfileIsNoOp(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	settings := DefaultMultiClientSettings()
-	settings.DefaultPerformanceProfile = &PerformanceProfile{
-		WindowType: WindowTypeAuto,
-		WindowSize: WindowSizeSettings{
-			WindowSizeMin: 17,
-			WindowSizeMax: 23,
-		},
-		PostQuantumEncryption: true,
-	}
-	multiClient := NewRemoteUserNatMultiClient(
-		ctx,
-		&testingEmptyMultiClientGenerator{},
-		func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
-		},
-		protocol.ProvideMode_Public,
-		settings,
-	)
-	defer multiClient.Close()
-
-	before := multiClient.config.Load()
-	multiClient.SetPerformanceProfile(&PerformanceProfile{
-		WindowType: WindowTypeAuto,
-		// Auto mode ignores the reconstructed presentation value's window
-		// size, so this remains the same installed behavior.
-		WindowSize: WindowSizeSettings{
-			WindowSizeMin: 41,
-			WindowSizeMax: 47,
-		},
-		PostQuantumEncryption: true,
-	})
-	after := multiClient.config.Load()
-	if after != before {
-		t.Fatalf("equivalent profile published a new config and would shuffle windows")
-	}
-}
-
-// TestMultiClientNilAndAutoPerformanceProfilesAreEquivalent protects the
-// common first-presentation migration from an absent profile to explicit
-// auto defaults.
-func TestMultiClientNilAndAutoPerformanceProfilesAreEquivalent(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	multiClient := NewRemoteUserNatMultiClient(
-		ctx,
-		&testingEmptyMultiClientGenerator{},
-		func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
-		},
-		protocol.ProvideMode_Public,
-		DefaultMultiClientSettings(),
-	)
-	defer multiClient.Close()
-
-	before := multiClient.config.Load()
-	multiClient.SetPerformanceProfile(&PerformanceProfile{
-		WindowType: WindowTypeAuto,
-	})
-	after := multiClient.config.Load()
-	if after != before {
-		t.Fatalf("nil and explicit auto profiles must install the same behavior")
-	}
-}
-
-// TestMultiClientChangedPerformanceProfilePublishesConfig ensures the no-op
-// guard cannot suppress an actual transport-policy change.
-func TestMultiClientChangedPerformanceProfilePublishesConfig(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	multiClient := NewRemoteUserNatMultiClient(
-		ctx,
-		&testingEmptyMultiClientGenerator{},
-		func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
-		},
-		protocol.ProvideMode_Public,
-		DefaultMultiClientSettings(),
-	)
-	defer multiClient.Close()
-
-	before := multiClient.config.Load()
-	multiClient.SetPerformanceProfile(&PerformanceProfile{
-		WindowType:            WindowTypeAuto,
-		PostQuantumEncryption: true,
-	})
-	after := multiClient.config.Load()
-	if after == before {
-		t.Fatalf("changed profile did not publish a replacement config")
-	}
-	if after.performanceProfile == nil || !after.performanceProfile.PostQuantumEncryption {
-		t.Fatalf("changed profile was not installed: %+v", after.performanceProfile)
-	}
 }

@@ -328,6 +328,97 @@ func TestPlatformTransportModeFallsBackOnDisconnect(t *testing.T) {
 	}
 }
 
+// TestNetworkChangeKicksPlatformTransport pins the network-change path: a
+// NetworkChanged broadcast closes the live connection and the transport
+// re-dials immediately (the host's path-update signal, not a server drop).
+// Adapted from upstream main e05ecee's TestPlatformTransportNetworkChangeKick.
+func TestNetworkChangeKicksPlatformTransport(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	platform := newTestingPlatformServer(t)
+	transport := testingPlatformTransport(t, ctx, platform.url, testingPlatformTransportSettings())
+
+	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+		t.Fatal("the transport was never elected")
+	}
+	connectCount := platform.connectCount.Load()
+
+	// the host reports a network path change
+	NetworkChanged()
+
+	if !waitForCondition(15*time.Second, func() bool {
+		return connectCount < platform.connectCount.Load()
+	}) {
+		t.Fatal("the transport did not re-dial after a network change")
+	}
+	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+		mode, _ := transport.activeMode()
+		t.Fatalf("active mode = %q after network change, want h1", mode)
+	}
+
+	// closing the transport unsubscribes it: a later broadcast must not panic
+	// or kick a dead transport
+	transport.Close()
+	NetworkChanged()
+}
+
+// TestKickSkipsDialFailureBackoff: a kick that arrives while the transport is
+// waiting out a failed-dial backoff re-dials immediately instead of waiting,
+// and the re-dial takes the reconnect fast path (hadConnection semantics).
+func TestKickSkipsDialFailureBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	platform := newTestingPlatformServer(t)
+	settings := testingPlatformTransportSettings()
+	// make the backoff long enough that only a kick can plausibly beat it
+	settings.ReconnectTimeout = 60 * time.Second
+	transport := testingPlatformTransport(t, ctx, platform.url, settings)
+	defer transport.Close()
+
+	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+		t.Fatal("the transport was never elected")
+	}
+
+	// reject dials so the run loop lands in the dial-failure backoff, then
+	// drop the live connection to force the re-dial that will fail
+	platform.rejecting.Store(true)
+	platform.closeConns()
+	if !waitForCondition(15*time.Second, func() bool {
+		return !transport.IsConnected()
+	}) {
+		t.Fatal("the transport never observed the drop")
+	}
+	// let the failing re-dial complete and park in the 60s backoff
+	time.Sleep(500 * time.Millisecond)
+
+	platform.rejecting.Store(false)
+	connectCount := platform.connectCount.Load()
+	// kick periodically rather than once: a kick that lands while the failing
+	// dial is still in flight is deliberately dropped (the backoff select arms
+	// a fresh notify channel), and re-kicking is exactly what a host emitting
+	// repeated path updates does. every wait here is still far below the 60s
+	// backoff the kick must beat.
+	kicked := false
+	for deadline := time.Now().Add(15 * time.Second); time.Now().Before(deadline); {
+		transport.Kick()
+		if waitForCondition(250*time.Millisecond, func() bool {
+			return connectCount < platform.connectCount.Load()
+		}) {
+			kicked = true
+			break
+		}
+	}
+	if !kicked {
+		t.Fatal("the kick did not break the transport out of its dial backoff")
+	}
+	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+		mode, _ := transport.activeMode()
+		t.Fatalf("active mode = %q after kicked re-dial, want h1", mode)
+	}
+}
+
 // TestPlatformTransportReconnects: after the platform drops a connection the
 // transport reconnects and is elected again, so a transient disconnect does not
 // strand the active mode.

@@ -9,12 +9,12 @@ import (
 	"math"
 	mathrand "math/rand"
 	"net"
-	// "syscall"
 	// "runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	// "google.golang.org/protobuf/proto"
@@ -1068,7 +1068,9 @@ type UdpBufferSettings struct {
 
 // iana ip protocol numbers, as carried in the ipv4 protocol and ipv6 next
 // header fields. tcp, udp, and icmp echo are handled; other protocols are
-// dropped.
+// dropped. the icmp numbers also label the flow-teardown unreachable
+// messages built by `ipOosUnreachable`, which are injected toward the
+// source.
 type ipProtocolNumber uint8
 
 const (
@@ -1837,6 +1839,13 @@ func (self *UdpSequence) Run() {
 	if err != nil {
 		if self.log.V(1).Enabled() {
 			self.log.Infof("[init]udp connect error = %s\n", err)
+		}
+		// answer the source instead of going silent: udp "dial" cannot yield a
+		// meaningful refusal at connect time, so always send the capacity-class
+		// unreachable through the same receive callback, then return -- no
+		// socket exists.
+		if _, signal := classifyDialFailure(self.IpPath(), err); signal != nil {
+			self.receivePacket(MessagePoolCopy(signal))
 		}
 		return
 	}
@@ -2906,14 +2915,29 @@ func (self *TcpSequence) Run() {
 		if self.log.V(1).Enabled() {
 			self.log.Infof("[init]tcp connect error = %s\n", err)
 		}
+		// answer the source instead of going silent: a refused destination gets
+		// an honest RST+ACK, everything else a capacity-class unreachable. both
+		// ride the same receive callback the SynAck uses (from-destination
+		// orientation); then return as before -- no socket exists. the ctx
+		// guard implements the comment above: classifyDialFailure cannot tell
+		// a canceled parent from a capacity failure, and teardown must not
+		// generate new output.
 		if self.ctx.Err() == nil {
-			var resetPacket []byte
-			func() {
-				self.mutex.Lock()
-				defer self.mutex.Unlock()
-				resetPacket, _ = self.RstAck()
-			}()
-			receive(resetPacket)
+			switch action, signal := classifyDialFailure(self.IpPath(), err); action {
+			case dialFailureRst:
+				var rstPacket []byte
+				var rstErr error
+				func() {
+					self.mutex.Lock()
+					defer self.mutex.Unlock()
+					rstPacket, rstErr = self.RstAck()
+				}()
+				if rstErr == nil {
+					receive(rstPacket)
+				}
+			case dialFailureUnreachable:
+				receive(MessagePoolCopy(signal))
+			}
 		}
 		return
 	}
@@ -5007,6 +5031,64 @@ func (self *IpPath) ToIp6Path() Ip6Path {
 		DestinationPort: self.DestinationPort,
 		ServerName:      self.ServerName,
 	}
+}
+
+// dialFailureAction classifies a failed upstream DialContext into the signal
+// the provider sends back to the source in place of the SynAck. Without a
+// signal the source sits in syn-retransmit backoff (3s..63s) and the blackhole
+// timeout eventually removes the provider along with its working flows -- the
+// bug this replaces.
+type dialFailureAction int
+
+const (
+	// dialFailureNone: send nothing (nil path / unsupported ip version).
+	dialFailureNone dialFailureAction = iota
+	// dialFailureRst: the destination itself refused the connection. The caller
+	// answers with ConnectionState.RstAck() -- honest tcp semantics, forwarded
+	// to the app.
+	dialFailureRst
+	// dialFailureUnreachable: capacity-class failure. The caller delivers the
+	// icmp destination-unreachable packet returned alongside this action.
+	dialFailureUnreachable
+)
+
+// classifyDialFailure maps an upstream DialContext error to the signal the
+// provider should return in place of a SynAck. It is pure -- no live socket, no
+// ConnectionState -- so the errno logic is unit-testable.
+//
+// For dialFailureUnreachable the built icmp packet is returned as well (a fresh
+// non-pool buffer from ipOosUnreachable; the caller copies it into the pool
+// before delivery). For dialFailureRst and dialFailureNone the packet is nil --
+// a RST needs the ConnectionState's sequence state, so the caller builds it.
+//
+// tcp + ECONNREFUSED means the destination refused: RST+ACK. Anything else on
+// tcp (timeouts, EMFILE/ENFILE, EADDRNOTAVAIL, unreachable, unrecognized) is
+// capacity-class and gets an unreachable; defaulting unrecognized errors to the
+// capacity class is deliberate -- new clients intercept the signal and old ones
+// drop it at ParseIpPath, so a misclassification is cheap. errors.Is folds the
+// Windows WSAECONNREFUSED onto syscall.ECONNREFUSED, but the providers this runs
+// on are almost all linux, so linux errno semantics are what matter. udp "dial"
+// cannot produce a meaningful ECONNREFUSED at connect time, so udp is always
+// capacity-class.
+func classifyDialFailure(ipPath *IpPath, err error) (dialFailureAction, []byte) {
+	if ipPath == nil {
+		return dialFailureNone, nil
+	}
+	switch ipPath.Protocol {
+	case IpProtocolTcp:
+		if errors.Is(err, syscall.ECONNREFUSED) {
+			return dialFailureRst, nil
+		}
+		// otherwise fall through to the unreachable build below
+	case IpProtocolUdp:
+		// always capacity-class; fall through
+	default:
+		return dialFailureNone, nil
+	}
+	if packet, ok := ipOosUnreachable(ipPath); ok {
+		return dialFailureUnreachable, packet
+	}
+	return dialFailureNone, nil
 }
 
 func (self *IpPath) Source() *IpPath {

@@ -50,15 +50,18 @@ func newNetworkPeerAdmissionTestChannel(
 		&multiClientChannelArgs{
 			MultiClientGeneratorClientArgs: MultiClientGeneratorClientArgs{ClientId: NewId()},
 			Destination:                    RequireMultiHopId(peerId),
+			NetworkPeerDestination:         networkPeerDestination,
 		},
 		generator,
-		func(*multiClientChannel, TransferPath, protocol.ProvideMode, IpPath, []byte) {},
+		func(*multiClientChannel, TransferPath, protocol.ProvideMode, *IpPath, []byte) {},
+		nil,
+		DefaultSecurityPolicy(ctx),
 		func(*ContractStatus) {},
 		func([]*ContractStatsEvent) {},
 		func() {},
 		nil,
-		networkPeerDestination,
 		multiSettings,
+		nil, nil, nil, nil, nil, nil, nil, nil, nil,
 	)
 	if err != nil {
 		cancel()

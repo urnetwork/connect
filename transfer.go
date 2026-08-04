@@ -8,6 +8,7 @@ import (
 	"math"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	// "runtime/debug"
@@ -237,6 +238,7 @@ func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings
 		ResendQueueMaxByteCount: MemoryScaledByteCount(mib(2), kib(256)),
 		ResendQueueMinByteCount: kib(256),
 		ContractFillFraction:    0.8,
+		PrewarmOpeningContract:  true,
 		ProtocolVersion:         DefaultProtocolVersion,
 	}
 }
@@ -2010,6 +2012,20 @@ type SendBufferSettings struct {
 	// as this ->1, there is more risk that noack messages will get dropped due to out of sync contracts
 	ContractFillFraction float32
 
+	// PrewarmOpeningContract requests a sequence's first contract as the
+	// sequence starts, rather than waiting until a message needs one.
+	//
+	// Every later contract is already queued asynchronously the moment its
+	// predecessor is taken, which is why renewals mid-stream are fast. The first
+	// has nothing ahead of it to trigger that, so acquiring it blocks the first
+	// send for a full round trip to the platform -- measured at ~260ms on a
+	// device, paid by every new destination. Firing the request as the sequence
+	// starts overlaps that round trip with the work that produced the first
+	// message.
+	//
+	// off restores the previous behavior of requesting it on demand.
+	PrewarmOpeningContract bool
+
 	ProtocolVersion int
 }
 
@@ -2447,6 +2463,11 @@ func (self *SendBuffer) Flush() {
 	}
 }
 
+// contractWaitLogThreshold is deliberately well under a second. Contract
+// acquisition blocks the send sequence, so a few hundred ms of it would
+// dominate every request while never appearing in a log.
+const contractWaitLogThreshold = 50 * time.Millisecond
+
 type SendSequence struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -2499,6 +2520,12 @@ type SendSequence struct {
 	resendQueue        *resendQueue
 	sendItems          []*sendItem
 	nextSequenceNumber uint64
+
+	// contract acquisition blocks this sequence, so track how much of its life
+	// goes into waiting for one. atomics so stats can be read without taking
+	// the sequence lock.
+	contractWaitNanos atomic.Int64
+	contractWaitCount atomic.Int64
 
 	idleCondition *IdleCondition
 
@@ -2795,6 +2822,8 @@ func (self *SendSequence) Run() {
 			self.session.Release()
 		}
 	}()
+
+	self.prewarmOpeningContract()
 
 	ackWindow := newSequenceAckWindow()
 	go HandleError(func() {
@@ -3324,8 +3353,17 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 	// surface slow contract acquisition at default verbosity. The send
 	// sequence blocks here, so a slow create (e.g. a companion request that
 	// cannot match an origin contract) stalls the entire sequence.
-	if d := time.Since(createStartTime); 1*time.Second <= d {
-		self.log.Infof("[s]contract wait %.1fs ok=%t c=%t %s->%s...%s s(%s)\n", d.Seconds(), ok, self.companionContract, self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId)
+	//
+	// The threshold was 1s, which hid the case that matters most. Device
+	// measurements put ~350ms of unexplained latency between a connection being
+	// established and its first byte arriving -- large enough to dominate every
+	// request, small enough to never log. Contract acquisition blocks in exactly
+	// that window, so it has to be observable well below a second to be ruled in
+	// or out.
+	contractWaitTime := time.Since(createStartTime)
+	self.addContractWaitTime(contractWaitTime)
+	if d := contractWaitTime; contractWaitLogThreshold <= d {
+		self.log.Infof("[s]contract wait %.0fms ok=%t c=%t %s->%s...%s s(%s)\n", float64(d.Microseconds())/1000.0, ok, self.companionContract, self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId)
 	}
 	return ok
 }
@@ -6613,3 +6651,58 @@ func MessageByteCount(frames []*protocol.Frame) ByteCount {
 // 	}
 // 	return messages
 // }
+
+// prewarmOpeningContract requests this sequence's first contract as the
+// sequence starts, so the round trip to the platform overlaps producing the
+// first message instead of blocking it.
+//
+// Contracts after the first are already queued the moment their predecessor is
+// taken, which is why mid-stream renewals complete in under 50ms while the
+// opening one costs ~260ms. Every new destination is a new sequence, so web
+// browsing pays that opening cost constantly.
+//
+// The request is fire-and-forget: CreateContract hands the frame to the control
+// channel with a callback and returns, so this never blocks the caller. The
+// size is left to the contract manager's own ramp -- only a floor is passed.
+func (self *SendSequence) prewarmOpeningContract() {
+	if !self.sendBufferSettings.PrewarmOpeningContract {
+		return
+	}
+
+	// mirror the first thing updateContract checks. A destination configured to
+	// require no contract never takes one, so requesting it would open a queue
+	// that is only cleaned up by the janitor -- and it charges a control round
+	// trip for a contract that cannot be used.
+	if self.client.ContractManager().SendNoContract(self.destination.DestinationId) {
+		return
+	}
+
+	self.client.ContractManager().CreateContract(
+		ContractKey{
+			Destination:         self.destination,
+			IntermediaryIds:     self.intermediaryIds,
+			CompanionContract:   self.companionContract,
+			ForceStream:         self.forceStream,
+			EncryptionRole:      self.encryptionRole,
+			EncryptionCompanion: self.encryptionCompanion,
+		},
+		self.contractSeqIndex,
+		ByteCount(float32(self.sendBufferSettings.MinMessageByteCount)/self.sendBufferSettings.ContractFillFraction),
+	)
+}
+
+// addContractWaitTime records time the send sequence spent blocked acquiring a
+// contract. Device measurements showed ~350ms unaccounted for between a
+// connection being established and its first byte arriving; this is the one
+// blocking step in that window, so it needs to be measurable rather than
+// inferred.
+func (self *SendSequence) addContractWaitTime(contractWaitTime time.Duration) {
+	self.contractWaitNanos.Add(int64(contractWaitTime))
+	self.contractWaitCount.Add(1)
+}
+
+// ContractWaitTime is the total time this sequence has spent blocked acquiring
+// contracts, and how many acquisitions that covers.
+func (self *SendSequence) ContractWaitTime() (time.Duration, int64) {
+	return time.Duration(self.contractWaitNanos.Load()), self.contractWaitCount.Load()
+}
