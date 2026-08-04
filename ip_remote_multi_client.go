@@ -263,6 +263,8 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		TcpCollapsePrevention: true,
 		UdpCollapsePrevention: false,
 		EnableIcmp:            false,
+		DegradedMode:            &atomic.Bool{},
+		DegradedLivenessScale:   3.0,
 		RemovalReceiveQueueSize: 256,
 
 		UdpTeardownSignal:        true,
@@ -629,6 +631,17 @@ type MultiClientSettings struct {
 	// parses icmp: a not-yet-upgraded provider silently blackholes icmp
 	// flows, and flow stickiness pins a ping run to its client (see ICMP.md)
 	EnableIcmp bool
+	// DegradedMode, when its value is true, reports that the HOST is in a
+	// degraded-performance state (low power mode, thermal throttling, a weak
+	// or constrained network). While set, the idle continuous-ping rest
+	// scales by DegradedLivenessScale so an idle tunnel wakes the radio less
+	// often. The conviction-path timings deliberately do NOT scale here: the
+	// stall gate already requires sibling corroboration or a probe ack, which
+	// self-calibrates to a slow host.
+	DegradedMode *atomic.Bool
+	// DegradedLivenessScale multiplies the idle continuous-ping rest while
+	// DegradedMode is set.
+	DegradedLivenessScale float64
 	// RemovalReceiveQueueSize bounds best-effort packets synthesized while a
 	// client is being removed (flow teardown resets). Delivery rides an
 	// isolated worker so a suspended packet-flow/TUN consumer must not stop
@@ -2197,9 +2210,12 @@ func (self *RemoteUserNatMultiClient) affinityFallbackIpPathsWithLock(ipPath *Ip
 		return nil
 	}
 
-	// a window fixed to one client has a single global affinity path already
-	if _, windowSize, ok := self.config.Load().performanceProfile.FixedWindow(); ok && windowSize.FixedWindowSize == 1 {
-		return nil
+	// a window fixed to one client has a single global affinity path already.
+	// nil-tolerant: bare test fixtures assemble the struct without a config
+	if config := self.config.Load(); config != nil {
+		if _, windowSize, ok := config.performanceProfile.FixedWindow(); ok && windowSize.FixedWindowSize == 1 {
+			return nil
+		}
 	}
 
 	fallbackPaths := []*IpPath{
@@ -2668,6 +2684,10 @@ func (self *RemoteUserNatMultiClient) affinityIpPathsWithLock(ipPath *IpPath) (a
 
 func (self *RemoteUserNatMultiClient) sendClientPath(ipPath *IpPath, pin flowPin, callback func(*multiClientChannelUpdate, *multiClientChannel)) {
 	update, previousClient, currentClient := self.sendUpdate(ipPath, pin)
+	if update == nil {
+		// closed multi-client (see sendUpdate); the packet is dropped
+		return
+	}
 	callback(update, currentClient)
 
 	// fast path: if the flow's client did not change during the callback, no
@@ -2805,6 +2825,13 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 	*multiClientChannel,
 	*multiClientChannel,
 ) {
+	// a closed multi-client accepts no new flow generations: Close has
+	// already cleared the tables, and an entry created after that clear
+	// would leak its teardown goroutine and its map slot forever
+	if self.ctx.Err() != nil {
+		return nil, nil, nil
+	}
+
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -2838,13 +2865,19 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 						client = update.client.Load()
 						update.client.Store(nil)
 
-						delete(self.ip4PathUpdates, ip4Path)
+						// delete only our own generation: a replacement may
+						// have been installed at this key while the teardown
+						// was waking, and its entry -- and its affinity
+						// registration under the same key -- must survive
+						if current, ok := self.ip4PathUpdates[ip4Path]; ok && current == update {
+							delete(self.ip4PathUpdates, ip4Path)
 
-						for affinityIp4Path, _ := range update.affinityIp4Paths {
-							if paths, ok := self.affinityIp4Paths[affinityIp4Path]; ok {
-								delete(paths, ip4Path)
-								if len(paths) == 0 {
-									delete(self.affinityIp4Paths, affinityIp4Path)
+							for affinityIp4Path, _ := range update.affinityIp4Paths {
+								if paths, ok := self.affinityIp4Paths[affinityIp4Path]; ok {
+									delete(paths, ip4Path)
+									if len(paths) == 0 {
+										delete(self.affinityIp4Paths, affinityIp4Path)
+									}
 								}
 							}
 						}
@@ -3000,13 +3033,16 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 						client = update.client.Load()
 						update.client.Store(nil)
 
-						delete(self.ip6PathUpdates, ip6Path)
+						// delete only our own generation (see the v4 twin)
+						if current, ok := self.ip6PathUpdates[ip6Path]; ok && current == update {
+							delete(self.ip6PathUpdates, ip6Path)
 
-						for affinityIp6Path, _ := range update.affinityIp6Paths {
-							if paths, ok := self.affinityIp6Paths[affinityIp6Path]; ok {
-								delete(paths, ip6Path)
-								if len(paths) == 0 {
-									delete(self.affinityIp6Paths, affinityIp6Path)
+							for affinityIp6Path, _ := range update.affinityIp6Paths {
+								if paths, ok := self.affinityIp6Paths[affinityIp6Path]; ok {
+									delete(paths, ip6Path)
+									if len(paths) == 0 {
+										delete(self.affinityIp6Paths, affinityIp6Path)
+									}
 								}
 							}
 						}
@@ -4991,6 +5027,17 @@ type receivePacketCallbackHolder struct {
 	callback ReceivePacketFunction
 }
 
+// SetPerformanceDegraded reports the host's degraded-performance state (low
+// power mode, thermal throttling, a weak or constrained network): while set,
+// the idle continuous-ping rest scales by DegradedLivenessScale so an idle
+// tunnel wakes the radio less often. Cheap and safe to call whenever the OS
+// signals change.
+func (self *RemoteUserNatMultiClient) SetPerformanceDegraded(degraded bool) {
+	if degradedMode := self.settings.DegradedMode; degradedMode != nil {
+		degradedMode.Store(degraded)
+	}
+}
+
 // SetReceivePacketCallback swaps (or with nil retires) the app's per-packet
 // receive callback.
 func (self *RemoteUserNatMultiClient) SetReceivePacketCallback(receivePacketCallback ReceivePacketFunction) {
@@ -5815,6 +5862,14 @@ func (self *RemoteUserNatMultiClient) Shuffle() {
 
 func (self *RemoteUserNatMultiClient) Close() {
 	self.cancel()
+
+	// detach retired owner references: later deliveries observe nil and stop
+	// retaining/calling the retired owner (typically an UpgradeMux), and the
+	// routing snapshot drops the app's lookup so Close releases everything it
+	// borrowed
+	self.SetReceivePacketCallback(nil)
+	self.SetReceivePacketsCallback(nil)
+	self.SetServerNameLookup(nil)
 
 	// release the server-name-learned subscription so the lookup does not retain
 	// this (now-closing) multi-client
@@ -8234,7 +8289,29 @@ func (self *multiClientWindow) orderedClients(crossTier bool) []*multiClientChan
 	}
 
 	if 0 == len(clients) {
-		return clients
+		// a fixed-destination window has no replacement to prefer: its only
+		// "alternative" is another client to the same endpoint, so excluding
+		// every warned client leaves new flows with no candidate at all --
+		// stalled on the send retry cadence while the peer still routes.
+		// Offer the warned field as-is instead, the same judgment as the
+		// race-level benched fallback ("a benched exit is better than no
+		// exit").
+		if self.generator != nil {
+			if _, fixed := self.generator.FixedDestinationSize(); fixed {
+				for _, client := range self.unorderedClients() {
+					if stats, err := client.WindowStats(); err == nil {
+						clients = append(clients, client)
+						if !stats.lastEventTime.IsZero() {
+							lruTimes[client] = stats.lastEventTime
+						}
+						weights[client] = float32(1 + stats.ExpectedByteCountPerSecond())
+					}
+				}
+			}
+		}
+		if 0 == len(clients) {
+			return clients
+		}
 	}
 
 	if self.log.V(1).Enabled() {
@@ -8862,13 +8939,17 @@ func newMultiClientChannel(
 		// client (which stops the epoch worker without emitting). Otherwise a
 		// removed peer's contracts linger open forever in the contract-details UI.
 		client.CloseContractStats()
+		// deregister the platform identity BEFORE the synchronous local
+		// teardown: Pion close can be slow, and making RemoveClientWithArgs
+		// wait behind it leaves the remote provider's StreamOpen/P2P state
+		// alive while the local side has already decided the client is gone
+		generator.RemoveClientWithArgs(client, &args.MultiClientGeneratorClientArgs)
 		client.Cancel()
 		contractStatusSub()
 		contractStatsSub()
 		peerIdentitySub()
 		// the removed client's established peers leave the aggregate set
 		peerIdentityChangeCallback()
-		generator.RemoveClientWithArgs(client, &args.MultiClientGeneratorClientArgs)
 	}, cancel)
 
 	// sourceFilter := map[TransferPath]bool{
@@ -10977,6 +11058,13 @@ func (self *multiClientChannel) ping() {
 		if restTimeout <= 0 {
 			restTimeout = self.settings.CPingTimeout
 		}
+		// a degraded host rests longer between idle pings (radio wakeups),
+		// which delays only idle-death detection, never a conviction
+		if degradedMode := self.settings.DegradedMode; degradedMode != nil && degradedMode.Load() {
+			if scale := self.settings.DegradedLivenessScale; 1 < scale {
+				restTimeout = time.Duration(float64(restTimeout) * scale)
+			}
+		}
 		select {
 		case <-self.ctx.Done():
 			return
@@ -11674,8 +11762,9 @@ func (self *multiClientChannel) Cancel() {
 func (self *multiClientChannel) Close() {
 	self.addError(errors.New("Done."))
 	self.cancel()
-	self.client.Close()
-
+	// the local client teardown (which can wait on a slow Pion close) is
+	// handled by the channel's own teardown goroutine, after the platform
+	// deregistration -- Close must not wait behind it
 	self.clientReceiveUnsub()
 }
 

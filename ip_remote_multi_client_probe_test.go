@@ -577,23 +577,29 @@ func TestProbeExclusionCallSites(t *testing.T) {
 		t.Error("sendProbe no longer sends through the transport")
 	}
 
-	// 2. the ingress path consumes probe packets before it can forward them
-	receiveBody, ok := functionBody(source, "func (self *RemoteUserNatMultiClient) clientReceivePacket(")
-	if !ok {
-		t.Fatal("could not find clientReceivePacket")
-	}
-	gate := strings.Index(receiveBody, "probeIngressPath(ipPath)")
-	if gate < 0 {
-		t.Fatal("clientReceivePacket has no probe intercept: probe answers can reach the tun")
-	}
-	if consume := strings.Index(receiveBody, "self.clientReceiveProbePacket("); consume < 0 || consume < gate {
-		t.Error("the probe intercept does not consume the packet")
-	}
-	if forward := strings.Index(receiveBody, "self.receivePacketCallback("); forward < 0 || forward < gate {
-		t.Error("the probe intercept must sit before every forward to the application")
-	}
-	if resolve := strings.Index(receiveBody, "self.receiveClientPath("); resolve < 0 || resolve < gate {
-		t.Error("the probe intercept must sit before the ordinary flow resolution")
+	// 2. the ingress paths -- per-packet AND batch -- consume probe packets
+	// before anything can forward them. The resolution/delivery tail lives in
+	// clientReceivePacketResolve, which is only reachable after each entry's
+	// gate; the batch fast path additionally delivers directly, so its gate
+	// must precede the batching too (index order pins both).
+	for _, entry := range []string{
+		"func (self *RemoteUserNatMultiClient) clientReceivePacket(",
+		"func (self *RemoteUserNatMultiClient) clientReceivePackets(",
+	} {
+		receiveBody, ok := functionBody(source, entry)
+		if !ok {
+			t.Fatalf("could not find %s", entry)
+		}
+		gate := strings.Index(receiveBody, "probeIngressPath(ipPath)")
+		if gate < 0 {
+			t.Fatalf("%s has no probe intercept: probe answers can reach the tun", entry)
+		}
+		if consume := strings.Index(receiveBody, "self.clientReceiveProbePacket("); consume < 0 || consume < gate {
+			t.Errorf("%s: the probe intercept does not consume the packet", entry)
+		}
+		if resolve := strings.Index(receiveBody, "self.clientReceivePacketResolve("); resolve < 0 || resolve < gate {
+			t.Errorf("%s: the probe intercept must sit before the flow resolution", entry)
+		}
 	}
 
 	// 3. the dial-failure path handles probes first, ahead of every effect

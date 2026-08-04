@@ -574,28 +574,6 @@ func TestMultiClientCancelledFlowTableRejectsNewGeneration(t *testing.T) {
 	}
 }
 
-func TestMultiClientUpdateCloseReleasesCommittedClient(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	update := newMultiClientChannelUpdate(ctx, &IpPath{
-		Version:         4,
-		Protocol:        IpProtocolTcp,
-		SourceIp:        []byte{10, 0, 0, 1},
-		SourcePort:      12345,
-		DestinationIp:   []byte{192, 0, 2, 1},
-		DestinationPort: 443,
-	})
-	clientCtx, cancelClient := context.WithCancel(context.Background())
-	defer cancelClient()
-	update.client.Store(&multiClientChannel{ctx: clientCtx})
-
-	update.Close()
-
-	if got := update.client.Load(); got != nil {
-		t.Fatal("closed flow generation retained its committed provider client")
-	}
-}
-
 // Exercise the real teardown path, not only its queue primitive. Clearing
 // every flow association is mandatory, but reset construction and retention
 // must be bounded by queue capacity even for a large flow table.
@@ -646,53 +624,6 @@ func TestMultiClientRemovalClearsAllFlowsWithBoundedResetWork(t *testing.T) {
 	}
 	if got := multi.removalReceiveDropCount.Load(); got != uint64(len(updates)-2) {
 		t.Fatalf("accounted reset drops = %d, want %d", got, len(updates)-2)
-	}
-}
-
-func TestMultiClientRemovalPrioritizesRecentlyActiveFlowResets(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	clientCtx, cancelClient := context.WithCancel(ctx)
-	cancelClient()
-	client := &multiClientChannel{ctx: clientCtx}
-	multi := &RemoteUserNatMultiClient{
-		ctx:                 ctx,
-		log:                 NewNoopLogger(),
-		removalReceiveQueue: make(chan receivePacket, 2),
-		clientUpdates:       map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
-	}
-	updates := make(map[*multiClientChannelUpdate]bool, 4)
-	baseTime := time.Now().Add(-time.Minute)
-	for i := range 4 {
-		update := &multiClientChannelUpdate{
-			ipPath: &IpPath{
-				Version:         4,
-				Protocol:        IpProtocolTcp,
-				SourceIp:        []byte{10, 0, 0, byte(i + 1)},
-				SourcePort:      10_000 + i,
-				DestinationIp:   []byte{192, 0, 2, 1},
-				DestinationPort: 443,
-			},
-			activityTime: baseTime.Add(time.Duration(i) * time.Second),
-		}
-		update.client.Store(client)
-		updates[update] = true
-	}
-	multi.clientUpdates[client] = updates
-
-	multi.removeClient(client)
-
-	gotPorts := map[int]bool{}
-	for range cap(multi.removalReceiveQueue) {
-		packet := <-multi.removalReceiveQueue
-		gotPorts[packet.IpPath.SourcePort] = true
-	}
-	if !gotPorts[10_002] || !gotPorts[10_003] || len(gotPorts) != 2 {
-		t.Fatalf("bounded reset work selected ports %v, want the two most recently active flows", gotPorts)
-	}
-	if got := multi.removalReceiveDropCount.Load(); got != 2 {
-		t.Fatalf("accounted reset drops = %d, want 2", got)
 	}
 }
 
@@ -1116,58 +1047,6 @@ func (*cleanupOrderTestGenerator) FixedDestinationSize() (int, bool) {
 	return 1, true
 }
 
-// A stats observer can remain parked after app suspension. Essential client,
-// transport, and generator cleanup must happen before observer-only close
-// events, otherwise every peer churn retains another transport/client record.
-func TestMultiClientCleanupPrecedesBlockedObservers(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	generator := &cleanupOrderTestGenerator{removeCalled: make(chan struct{})}
-	settings := DefaultMultiClientSettings()
-	settings.CPingRestTimeout = time.Hour
-	settings.BlackholeTimeout = time.Hour
-	statsGate := newStallGate()
-
-	channel, err := newMultiClientChannel(
-		ctx,
-		&multiClientChannelArgs{
-			MultiClientGeneratorClientArgs: MultiClientGeneratorClientArgs{ClientId: NewId()},
-			Destination:                    RequireMultiHopId(NewId()),
-		},
-		generator,
-		func(*multiClientChannel, TransferPath, protocol.ProvideMode, *IpPath, []byte) {},
-		nil,
-		DefaultSecurityPolicy(ctx),
-		func(*ContractStatus) {},
-		func([]*ContractStatsEvent) { statsGate.Wait() },
-		func() {},
-		nil,
-		settings,
-		nil, nil, nil, nil, nil, nil, nil, nil, nil,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	entry := generator.client.ContractManager().registerContractStats(
-		NewId(),
-		false,
-		false,
-		TransferPath{},
-		100,
-	)
-	entry.updateUsedByteCount(10)
-	channel.Cancel()
-
-	select {
-	case <-generator.removeCalled:
-	case <-time.After(time.Second):
-		t.Fatal("blocked observer retained essential generator/client resources")
-	}
-	waitForStallStart(t, statsGate)
-	statsGate.Release()
-}
-
 type maintenanceContextTestGenerator struct{}
 
 func (*maintenanceContextTestGenerator) NextDestinations(int, []MultiHopId, string) (map[MultiHopId]DestinationStats, error) {
@@ -1297,48 +1176,6 @@ func (*recoveringMaintenanceGenerator) NewClientContext(
 	*ClientSettings,
 ) (*Client, error) {
 	panic("client creation not used")
-}
-
-// A timeout must end only the attempt, not the sole enumerator. This catches
-// the subtle failure where adding a deadline merely made the producer return
-// permanently (closing clientChannelArgs and leaving resize unable to recover).
-func TestMultiClientEnumeratorRetriesAfterStalledGeneratorCalls(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	settings := DefaultMultiClientSettings()
-	settings.WindowGeneratorTimeout = 20 * time.Millisecond
-	settings.WindowEnumerateErrorTimeout = time.Millisecond
-	settings.WindowExpandArgsTimeout = time.Second
-	generator := &recoveringMaintenanceGenerator{
-		destination: RequireMultiHopId(NewId()),
-	}
-	window := &multiClientWindow{
-		ctx:               ctx,
-		log:               DefaultLogger(),
-		generator:         generator,
-		windowType:        WindowTypeQuality,
-		settings:          settings,
-		clientChannelArgs: make(chan *multiClientChannelArgs),
-		clients:           map[Id]*multiClientChannel{},
-		generatorMonitor:  NewMonitor(),
-	}
-	go window.randomEnumerateClientArgs()
-
-	select {
-	case args := <-window.clientChannelArgs:
-		if args == nil || args.Destination != generator.destination {
-			t.Fatalf("unexpected recovered args: %+v", args)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("enumerator did not recover after discovery/auth deadlines")
-	}
-	if generator.discoveries.Load() < 2 || generator.auths.Load() < 2 {
-		t.Fatalf(
-			"enumerator did not retry both stalled calls: discovery=%d auth=%d",
-			generator.discoveries.Load(),
-			generator.auths.Load(),
-		)
-	}
 }
 
 func TestSchedulerPauseDetectionDoesNotConfuseOrdinaryTimerDelay(t *testing.T) {

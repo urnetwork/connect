@@ -4,18 +4,6 @@ import (
 	"testing"
 )
 
-// the opening contract has to cover a typical web response, or every new
-// destination pays a second blocking negotiation a few packets in
-func TestInitialContractCoversATypicalResponse(t *testing.T) {
-	settings := DefaultContractManagerSettings()
-
-	// ~80% of the contract is usable, so compare against the usable budget
-	usable := ByteCount(float64(settings.InitialContractTransferByteCount) * 0.8)
-
-	// a 500KiB response is unremarkable for a page subresource
-	AssertEqual(t, kib(500) <= usable, true)
-}
-
 // the ramp still reaches the standard size, and the opening contract stays
 // well below it -- the point is a bounded opening, not no opening bound
 func TestContractSizeRamp(t *testing.T) {

@@ -267,27 +267,8 @@ func DefaultContractManagerSettingsWithBufferSize(bufferSize int) *ContractManag
 		panic(err)
 	}
 	return &ContractManagerSettings{
-		SequenceBufferSize: bufferSize,
-		// The first contract of every sequence used to be kib(16), of which
-		// ~80% is usable -- about nine packets. Acquiring a contract blocks the
-		// send sequence (see the contract wait logging in transfer.go), so a
-		// new destination paid two blocking negotiations before it reached the
-		// second contract's 32MiB: one to open, one nine packets later.
-		//
-		// Web traffic is many short flows to many destinations, and every new
-		// destination restarts at sequence 0, so it never outgrows that. A
-		// provider log showed ~40 acquisitions in 13 minutes across ten
-		// destinations, typically 80-200ms each and occasionally 1.6-2.4s --
-		// which is what a several-second stall on a new domain looks like.
-		//
-		// mib(1) covers essentially any single web response in the opening
-		// contract while still bounding what an unproven peer can transfer
-		// before the first settlement. It is a 64x increase in that exposure:
-		// the ceiling was already mib(128) two contracts later, but the point
-		// of a small opening contract is to settle early with a peer that has
-		// no history, so this is a real (if modest) risk tradeoff and not a
-		// free win.
-		InitialContractTransferByteCount:            mib(1),
+		SequenceBufferSize:                          bufferSize,
+		InitialContractTransferByteCount:            kib(16),
 		InitialNetworkPeerContractTransferByteCount: mib(1),
 		StandardContractTransferByteCount:           mib(128),
 		ContractTransferByteSeqScale:                4,

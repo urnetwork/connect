@@ -140,7 +140,7 @@ func TestRaceAssignmentSitesBindTheFlow(t *testing.T) {
 	}
 
 	for _, site := range []struct{ fn, desc string }{
-		{"func (self *RemoteUserNatMultiClient) clientReceivePacket(", "receive-path race lock-in"},
+		{"func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(", "receive-path race lock-in"},
 		{"func (self *RemoteUserNatMultiClient) scheduleCompleteRace(", "race completion"},
 	} {
 		body, ok := functionBody(source, site.fn)
