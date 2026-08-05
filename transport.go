@@ -128,6 +128,11 @@ var lastBackendFailNano atomic.Int64
 //
 // This is process-wide rather than per-Client on purpose: "is the control API
 // reachable from this host" is a property of the host, not of any one client.
+// The known limit of that framing: a process talking to MULTIPLE platform urls
+// (separate network spaces) shares one signal across them, so a dead custom
+// endpoint can gate a healthy one. Accepted for now -- the fleet and app cases
+// run one platform per process -- and keying this state by platform url is the
+// upgrade path if that changes.
 // A host running many clients gets a stronger signal from sharing the counter,
 // because a success on any client clears it — so a single misbehaving client
 // cannot trip the threshold on its own, and only a fault broad enough to fail
@@ -155,6 +160,16 @@ const backendDegradedWindow = 2 * time.Minute
 // API unreachable, no client can authorize a contract, so contract creation,
 // contract retry pacing, and window expansion are all spending bandwidth on
 // data that has nowhere to go.
+//
+// During an outage where the transport stays connected (the control API down,
+// the websocket alive), auth never re-runs and the gated CreateContract is the
+// only other success source -- so nothing can SUCCEED to clear the state.
+// Recovery then rides the recency window instead: after backendDegradedWindow
+// without failures this reads false, the sequences that tick before three
+// fresh failures land probe the backend, and either one succeeds (clearing the
+// state) or the gate re-trips. The steady state of a long OOB-only outage is
+// therefore a bounded probe burst every ~backendDegradedWindow, not a latched
+// stop -- which is also what makes recovery need no timer of its own.
 func isBackendDegraded() bool {
 	if consecutiveBackendFails.Load() < backendDegradedFailThreshold {
 		return false
@@ -193,8 +208,8 @@ func noteBackendFailure() {
 	lastBackendFailNano.Store(now)
 }
 
-// noteBackendSuccess clears the degradation state after a backend round-trip
-// noteBackendSuccess clears the recorded backend failure state after a successful operation.
+// noteBackendSuccess clears the recorded backend failure state after a
+// successful auth or OOB round-trip.
 // It takes backendFailMu for the same reason noteBackendFailure does: clearing
 // the count and the timestamp is one logical transition. Unsynchronized, a
 // concurrent failure could land its increment and timestamp between the two
@@ -779,7 +794,16 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		}
 		releaseReconnect()
 		if err != nil {
-			noteBackendFailure()
+			// a canceled dial is local teardown -- this transport or its owner
+			// shutting down mid-connect -- not a backend signal. Without this
+			// carve-out, closing a multi-client window cancels many transports
+			// at once and the burst of canceled dials trips the degraded
+			// threshold with fresh timestamps, so the NEXT session starts
+			// gated. The contract OOB path makes the same carve-out on
+			// client.Done.
+			if self.ctx.Err() == nil {
+				noteBackendFailure()
+			}
 			if ok, suppressed := shouldLogAuthErr(); ok {
 				if suppressed > 0 {
 					self.log.Infof("[t]auth error %s = %s (%d suppressed)\n", clientId, err, suppressed)
@@ -1548,7 +1572,16 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 		}
 		releaseReconnect()
 		if err != nil {
-			noteBackendFailure()
+			// a canceled dial is local teardown -- this transport or its owner
+			// shutting down mid-connect -- not a backend signal. Without this
+			// carve-out, closing a multi-client window cancels many transports
+			// at once and the burst of canceled dials trips the degraded
+			// threshold with fresh timestamps, so the NEXT session starts
+			// gated. The contract OOB path makes the same carve-out on
+			// client.Done.
+			if self.ctx.Err() == nil {
+				noteBackendFailure()
+			}
 			if ok, suppressed := shouldLogAuthErr(); ok {
 				if suppressed > 0 {
 					self.log.Infof("[t]auth error %s = %s (%d suppressed)\n", clientId, err, suppressed)

@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -221,5 +222,37 @@ func TestBackendDegraded_ConcurrentFailuresReachThreshold(t *testing.T) {
 	}
 	if !isBackendDegraded() {
 		t.Fatal("not degraded after 32 concurrent failures")
+	}
+}
+
+// The auth sites must make the same local-teardown carve-out the contract OOB
+// path makes on client.Done: a canceled dial is this process shutting a
+// transport down, not the backend failing. Closing a multi-client window
+// cancels many transports at once, and without the guard that burst of
+// canceled dials trips the threshold with fresh timestamps -- so the NEXT
+// session starts gated. runH1/runH3 are connect loops that need a live server
+// to drive, so this pins the call-site shape the way the resize-pass anchors
+// do, for both transports at once.
+func TestAuthCancellationIsNotBackendFailure(t *testing.T) {
+	source, err := readSource("transport.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fn := range []string{
+		"func (self *PlatformTransport) runH1(",
+		"func (self *PlatformTransport) runH3(",
+	} {
+		body, ok := functionBody(source, fn)
+		if !ok {
+			t.Fatalf("could not find %s", fn)
+		}
+		note := strings.Index(body, "noteBackendFailure()")
+		if note < 0 {
+			t.Fatalf("%s no longer records auth failures; the degraded signal lost its transport half", fn)
+		}
+		guarded := strings.Index(body, "if self.ctx.Err() == nil {")
+		if guarded < 0 || note < guarded {
+			t.Fatalf("%s records auth failures without the local-teardown carve-out: a canceled dial would count as a backend failure", fn)
+		}
 	}
 }
