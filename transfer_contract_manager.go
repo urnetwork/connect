@@ -25,6 +25,15 @@ import (
 
 // manage contracts which are embedded into each transfer sequence
 
+// oobErrThrottle rate-limits `[contract]oob err`. During a control-API outage
+// every sequence's contract request fails, so this line is emitted once per
+// sequence per retry across the whole client. See logThrottle in
+// log_throttle.go.
+var oobErrThrottle = newLogThrottle(time.Minute)
+
+// shouldLogOobErr reports whether an out-of-band error should be logged and the number of errors suppressed since the previous allowed log.
+func shouldLogOobErr() (bool, int64) { return oobErrThrottle.Allow(time.Now()) }
+
 type ContractKey struct {
 	Destination       TransferPath
 	IntermediaryIds   MultiHopId
@@ -1298,6 +1307,8 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 		[]*protocol.Frame{frame},
 		func(resultFrames []*protocol.Frame, err error) {
 			if err == nil {
+				// the OOB round-trip completed: the backend is reachable
+				noteBackendSuccess()
 				for _, resultFrame := range resultFrames {
 					self.HandleControlFrame(contractKey, resultFrame)
 				}
@@ -1306,7 +1317,16 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 				case <-self.client.Done():
 					// no need to log warnings when the client closes
 				default:
-					self.client.log.Infof("[contract]oob err = %s\n", err)
+					noteBackendFailure()
+					if ok, suppressed := shouldLogOobErr(); ok {
+						if suppressed > 0 {
+							self.client.log.Infof("[contract]oob err = %s (%d suppressed)\n", err, suppressed)
+						} else {
+							self.client.log.Infof("[contract]oob err = %s\n", err)
+						}
+					} else if v := self.client.log.V(1); v.Enabled() {
+						v.Infof("[contract]oob err = %s\n", err)
+					}
 				}
 			}
 		},
