@@ -816,19 +816,31 @@ func TestComparativeConnectTimeoutDecision(t *testing.T) {
 	}
 
 	// off: the zero value is the single-bar behavior
-	AssertEqual(t, comparativeConnectTimeout(now, comparativeSynStats(15*time.Second), full, 0, time.Time{}, receiving(4)), full)
+	AssertEqual(t, comparativeConnectTimeout(now, comparativeSynStats(15*time.Second), full, 0, time.Time{}, receiving(4),
+		nil,
+	), full)
 	// configured at or above the bar it exists to shorten: a no-op
-	AssertEqual(t, comparativeConnectTimeout(now, comparativeSynStats(15*time.Second), full, full, time.Time{}, receiving(4)), full)
+	AssertEqual(t, comparativeConnectTimeout(now, comparativeSynStats(15*time.Second), full, full, time.Time{}, receiving(4),
+		nil,
+	), full)
 
 	sweeps = 0
 	// nothing has been sent: nothing to judge
-	AssertEqual(t, comparativeConnectTimeout(now, &clientWindowStats{log: DefaultLogger()}, full, comparative, time.Time{}, receiving(4)), full)
-	AssertEqual(t, comparativeConnectTimeout(now, nil, full, comparative, time.Time{}, receiving(4)), full)
+	AssertEqual(t, comparativeConnectTimeout(now, &clientWindowStats{log: DefaultLogger()}, full, comparative, time.Time{}, receiving(4),
+		nil,
+	), full)
+	AssertEqual(t, comparativeConnectTimeout(now, nil, full, comparative, time.Time{}, receiving(4),
+		nil,
+	), full)
 
 	// below the short bar there is nothing to cut short yet...
-	AssertEqual(t, comparativeConnectTimeout(now, comparativeSynStats(5*time.Second), full, comparative, time.Time{}, receiving(4)), full)
+	AssertEqual(t, comparativeConnectTimeout(now, comparativeSynStats(5*time.Second), full, comparative, time.Time{}, receiving(4),
+		nil,
+	), full)
 	// ...and past the full bar the ordinary verdict is already firing
-	AssertEqual(t, comparativeConnectTimeout(now, comparativeSynStats(35*time.Second), full, comparative, time.Time{}, receiving(4)), full)
+	AssertEqual(t, comparativeConnectTimeout(now, comparativeSynStats(35*time.Second), full, comparative, time.Time{}, receiving(4),
+		nil,
+	), full)
 	if sweeps != 0 {
 		t.Errorf("the sibling sweep ran %d times outside the interval where it can change the outcome", sweeps)
 	}
@@ -836,24 +848,34 @@ func TestComparativeConnectTimeoutDecision(t *testing.T) {
 	// inside the interval, but the pool is not demonstrably fine: one receiving
 	// sibling is one data point, not a statement about the pool
 	sweeps = 0
-	AssertEqual(t, comparativeConnectTimeout(now, comparativeSynStats(15*time.Second), full, comparative, time.Time{}, receiving(1)), full)
+	AssertEqual(t, comparativeConnectTimeout(now, comparativeSynStats(15*time.Second), full, comparative, time.Time{}, receiving(1),
+		nil,
+	), full)
 	AssertEqual(t, sweeps, 1)
 
 	// two receiving siblings: the uplink delivers, the pool works, and this
 	// exit alone has established nothing
-	AssertEqual(t, comparativeConnectTimeout(now, comparativeSynStats(15*time.Second), full, comparative, time.Time{}, receiving(2)), comparative)
+	AssertEqual(t, comparativeConnectTimeout(now, comparativeSynStats(15*time.Second), full, comparative, time.Time{}, receiving(2),
+		nil,
+	), comparative)
 
 	// an exit with any receive progress is not the case the cut exists for
 	withSyn := comparativeSynStats(15 * time.Second)
 	withSyn.receiveSynCount = 1
-	AssertEqual(t, comparativeConnectTimeout(now, withSyn, full, comparative, time.Time{}, receiving(4)), full)
+	AssertEqual(t, comparativeConnectTimeout(now, withSyn, full, comparative, time.Time{}, receiving(4),
+		nil,
+	), full)
 	withAck := comparativeSynStats(15 * time.Second)
 	withAck.receiveAckCount = 1
-	AssertEqual(t, comparativeConnectTimeout(now, withAck, full, comparative, time.Time{}, receiving(4)), full)
+	AssertEqual(t, comparativeConnectTimeout(now, withAck, full, comparative, time.Time{}, receiving(4),
+		nil,
+	), full)
 
 	// a bare channel (nil count func) keeps the patient bar: absence of the
 	// machinery must never shorten a removal
-	AssertEqual(t, comparativeConnectTimeout(now, comparativeSynStats(15*time.Second), full, comparative, time.Time{}, nil), full)
+	AssertEqual(t, comparativeConnectTimeout(now, comparativeSynStats(15*time.Second), full, comparative, time.Time{}, nil,
+		nil,
+	), full)
 
 	// the clock rebase applies here too: a syn whose age predates the end of an
 	// inadmissible-evidence epoch counts from the epoch's end, so a held
@@ -865,6 +887,7 @@ func TestComparativeConnectTimeoutDecision(t *testing.T) {
 		comparative,
 		now.Add(-2*time.Second),
 		receiving(4),
+		nil,
 	), full)
 }
 
@@ -881,6 +904,7 @@ func TestComparativeConnectFiresAtTheShortBarWithSiblings(t *testing.T) {
 		connectTimeout := comparativeConnectTimeout(
 			now, stats, full, comparative, time.Time{},
 			func() int { return siblings },
+			nil,
 		)
 		reason, _ := blackholeReasonFromStats(now, stats, 5*time.Second, 0, connectTimeout, blackholeGates{})
 		return reason
@@ -906,6 +930,7 @@ func TestComparativeConnectStillPassesTheGates(t *testing.T) {
 	connectTimeout := comparativeConnectTimeout(
 		now, stats, 30*time.Second, 10*time.Second, time.Time{},
 		func() int { return 4 },
+		nil,
 	)
 	AssertEqual(t, connectTimeout, 10*time.Second)
 

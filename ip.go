@@ -2587,6 +2587,39 @@ is not implemented.
 This is a safe assumption when moving packets from local raw socket
 to the UNAT via `transfer`, which is lossless and in-order.
 */
+// writeWithProgressDeadline writes to an upstream socket, bounding
+// ZERO-PROGRESS time rather than total time: the deadline re-arms whenever a
+// write advances, so a peer applying ordinary flow control (accepting data
+// steadily but slowly) is not failed, while a peer that accepts nothing for a
+// full timeout still is.
+//
+// A single deadline for the whole batch killed alive flows under sustained
+// bulk transfer: the return path's acks stall behind saturated tunnel queues
+// long enough that the upstream socket drains slower than one batch, and the
+// partial write at the deadline tore the sequence down (observed as mid-stream
+// resets in the full-stack tcp test).
+func writeWithProgressDeadline(
+	socket net.Conn,
+	buffers net.Buffers,
+	timeout time.Duration,
+) (int64, error) {
+	n := int64(0)
+	for {
+		socket.SetWriteDeadline(time.Now().Add(timeout))
+		wn, err := buffers.WriteTo(socket)
+		n += wn
+		if err == nil {
+			return n, nil
+		}
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() && 0 < wn {
+			// progress inside this deadline window: the peer is alive and
+			// draining, so give the remainder a fresh window
+			continue
+		}
+		return n, err
+	}
+}
+
 type TcpSequence struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -3059,32 +3092,11 @@ func (self *TcpSequence) Run() {
 			// `WriteTo` retries partial writes until fully written, a timeout, or an error.
 			buffers := net.Buffers(bufferStorage)
 
-			// The write deadline bounds no-progress time, not total batch time.
-			// A backpressured-but-draining socket (the peer applying flow
-			// control) re-arms the deadline with each partial write; a peer
-			// that accepts nothing for a full WriteTimeout still fails the
-			// flow. A single fixed batch deadline here used to kill alive
-			// flows under sustained bulk transfer: the return path's acks can
-			// stall behind saturated tunnel queues long enough that the
-			// upstream socket drains slower than one batch, and the partial
-			// writev at the deadline tore the sequence down (observed as
-			// mid-stream RSTs in the full-stack tcp perf test).
-			n := int64(0)
-			var err error
-			for {
-				socket.SetWriteDeadline(time.Now().Add(self.tcpBufferSettings.WriteTimeout))
-				var wn int64
-				wn, err = buffers.WriteTo(socket)
-				n += wn
-				if err == nil {
-					break
-				}
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() && 0 < wn {
-					// progress within this deadline window; keep writing
-					continue
-				}
-				break
-			}
+			n, err := writeWithProgressDeadline(
+				socket,
+				buffers,
+				self.tcpBufferSettings.WriteTimeout,
+			)
 
 			if err == nil {
 				if self.log.V(2).Enabled() {

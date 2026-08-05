@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
-
 )
 
 func TestMultiClientChannelAcceptsMigrationOnlyFromControl(t *testing.T) {

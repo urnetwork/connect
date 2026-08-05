@@ -65,6 +65,27 @@ actually use.
 
 - When a bug is found, look for adjacent and similar issues before considering the fix complete. A bug represents a flaw in the reasoning that produced it, and the same flaw may be applied elsewhere — check the surrounding code, sibling call sites, and other copies of the same pattern.
 
+## Routing keys
+
+A routing key is a value that decides *which* instance of something a message belongs to: the sequence lane (`Pack.force_stream` / `Pack.companion_contract`), the session role and identity companion (`TransferFrame.session_role` / `session_companion`), the handshake generation (`EncryptedControl.epoch_id`). Adding one is never a single-site change.
+
+- **Every delivery path must carry the key.** A message usually reaches its consumer by more than one route — the in-order drain and an optimistic fast path, a per-item call and a batch call, a live path and a replay/resend path. One path that omits the key silently reintroduces the entire class of bug the key was added to fix, and it surfaces only in the narrow race where that path wins. Adding a key is therefore: define it, stamp it at every producer, and grep for **every** consumer entry point before calling the change done.
+- **Sender-local state that selects a route must be visible to the receiver**, or the receiver cannot distinguish two live things and will collapse them into one — dropping whichever it decides is "older". If a key must stay off the wire, the sender is responsible for never running two things that differ only by it.
+- **Prefer routing a mismatch over judging it.** A message from another instance is evidence about that instance, not about this one. Judging it here produces a wrong verdict on state it does not describe (a proof for another generation fails signature verification and looks like an attack), and the wrong verdict is usually sticky. Route it, ignore it, or converge onto it.
+- **Order the key when the instances are ordered.** `Id` is a ULID, so generations compare directly: older is a straggler to drop, newer is a signal to converge. Without an ordering the receiver can only tell "different", which is not enough to decide who should move.
+- **A key with a single-slot consumer needs the key checked before the slot is taken.** Pending/first-wins state (one buffered proof per epoch, one head per sequence) is a resource a stale message can consume; validate the key first, or a straggler denies the slot to the message that belongs there.
+
+## Receive callbacks must not block
+
+Send and receive sit on opposite sides of the backpressure contract. **Senders block**: a packet/frame send is allowed to wait (buffer full, contract wait, write timeout) because blocking the producer is how backpressure propagates toward the source. **Receivers buffer and drop**: a packet/frame receive callback must never block, because by the time data reaches the receive side there is no producer left to slow down — there is only the delivery pipeline, and stalling it stalls everyone behind the stall.
+
+- **A receive callback that hands off must use a 0 timeout on the handoff.** Enqueue non-blocking; if the queue is full, drop (and count the drop). Never propagate a downstream wait back into the delivery path.
+- **Do not call a blocking send from inside a receive callback.** A send blocks by design, which makes it exactly the thing a receive callback must not contain. Hand the data to a queue owned by a sender goroutine instead, with a 0-timeout enqueue as above.
+- **Dropping is correct.** The transmission control running on top of the transport (TCP in the tunnel, the transfer protocol's ack/resend) exists to discover the achievable rate; a dropped packet is the signal it feeds on. Buffering "to be safe" hides the signal and converts loss into latency; blocking converts it into a stall.
+- The failure shape when this rule is broken is **head-of-line blocking across unrelated flows**: receive delivery is fanned out from shared pumps (a dispatch shard serves many flows; a client receive loop serves every sequence from a source), so one blocked callback parks every flow sharing the pump. One dead destination whose return send blocks for its full write timeout can starve delivery for all live destinations for that entire window — observed as flows that look dead on arrival while their peer is provably alive.
+
+The device-side tun write is the deliberate exception, documented at its call site: the provider NAT does not retransmit toward the device, so that handoff is synchronous and its inline write is the path's flow control. An exception must be argued like that one — in a comment, from the specific loss model — not assumed.
+
 ## Concurrency and goroutine safety
 
 - By default, package-level functions are assumed safe for concurrent use, and a type's methods are assumed NOT safe unless the type documents otherwise.

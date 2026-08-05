@@ -334,6 +334,28 @@ type ProviderSpec struct {
 	BestAvailable   bool `json:"best_available,omitempty"`
 }
 
+// LocationCoordinates is a wgs84 point. Zero is a valid coordinate — absence
+// is expressed by a nil *LocationCoordinates, never by (0, 0).
+type LocationCoordinates struct {
+	Lat float64 `json:"lat"`
+	Lon float64 `json:"lon"`
+}
+
+// ProviderLocation is the location of a provider client as reported by
+// find-providers2. Immutable after construction: it is shared by value-copied
+// `DestinationStats` and monitor `ProviderEvent`s without locking.
+type ProviderLocation struct {
+	Country           string               `json:"country,omitempty"`
+	CountryCode       string               `json:"country_code,omitempty"`
+	Region            string               `json:"region,omitempty"`
+	City              string               `json:"city,omitempty"`
+	CountryLocationId *Id                  `json:"country_location_id,omitempty"`
+	RegionLocationId  *Id                  `json:"region_location_id,omitempty"`
+	CityLocationId    *Id                  `json:"city_location_id,omitempty"`
+	RegionCoordinates *LocationCoordinates `json:"region_coordinates,omitempty"`
+	CityCoordinates   *LocationCoordinates `json:"city_coordinates,omitempty"`
+}
+
 type FindProviders2Callback ApiCallback[*FindProviders2Result]
 
 type FindProviders2Args struct {
@@ -354,6 +376,9 @@ type FindProvidersProvider struct {
 	HasEstimatedBytesPerSecond bool      `json:"has_estimated_bytes_per_second"`
 	Tier                       int       `json:"tier"`
 	IntermediaryIds            []Id      `json:"intermediary_ids,omitempty"`
+	// Location is the provider's location. nil when the server does not know
+	// it (or an older server).
+	Location *ProviderLocation `json:"location,omitempty"`
 }
 
 func (self *BringYourApi) FindProviders2(findProviders2 *FindProviders2Args, callback FindProviders2Callback) {

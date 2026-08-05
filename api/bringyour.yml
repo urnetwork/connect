@@ -2945,6 +2945,48 @@ components:
         force_minimum:
           type: boolean
 
+    LocationCoordinates:
+      description: |
+        A wgs84 point. Zero is a valid coordinate — absence is expressed by
+        omitting the containing object, never by (0, 0).
+      type: object
+      properties:
+        lat:
+          type: number
+        lon:
+          type: number
+
+    ProviderLocation:
+      description: |
+        The location of a provider client, resolved from its active
+        connection. Coordinate objects are omitted when unknown; region
+        coordinates are the region centroid and city coordinates are the
+        city centroid.
+      type: object
+      properties:
+        country:
+          type: string
+        country_code:
+          description: lowercase iso 3166-1 alpha-2
+          type: string
+        region:
+          type: string
+        city:
+          type: string
+        country_location_id:
+          description: udid
+          type: string
+        region_location_id:
+          description: udid
+          type: string
+        city_location_id:
+          description: udid
+          type: string
+        region_coordinates:
+          $ref: "#/components/schemas/LocationCoordinates"
+        city_coordinates:
+          $ref: "#/components/schemas/LocationCoordinates"
+
     FindProviders2Result:
       type: object
       properties:
@@ -2967,6 +3009,9 @@ components:
                 items:
                   description: udid
                   type: string
+              location:
+                # omitted when the provider's location is unknown
+                $ref: "#/components/schemas/ProviderLocation"
 
     CreateProviderSpecArgs:
       type: object

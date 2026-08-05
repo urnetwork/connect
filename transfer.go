@@ -1787,8 +1787,24 @@ func (self *Client) run() {
 							// path (DeliverEncryptedControl) still handles a proof
 							// that races ahead of the local handshake by creating
 							// the epoch to buffer it.
+							//
+							// The epoch (generation) MUST be carried here, exactly
+							// as the in-order path carries it: a proof belongs to
+							// the epoch that signed it. Delivering one without its
+							// generation lets a stale proof occupy this epoch's
+							// single pending-proof slot — the real proof is then
+							// refused as "already buffered", and the stale one is
+							// finally verified against this epoch's exporter,
+							// fails, and terminally tombstones a session the peer
+							// is still encrypting into (a permanent stall).
 							if session.currentEpoch() != nil {
-								session.receivePeerIdentityProof(ec.Payload)
+								var proofEpochId Id
+								if raw := ec.GetEpochId(); 0 < len(raw) {
+									if parsed, err := IdFromBytes(raw); err == nil {
+										proofEpochId = parsed
+									}
+								}
+								session.receivePeerIdentityProofForEpoch(ec.Payload, proofEpochId)
 							}
 						}
 					}

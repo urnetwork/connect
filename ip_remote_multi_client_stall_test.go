@@ -3,6 +3,7 @@ package connect
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -129,7 +130,7 @@ func TestMultiClientMonitorBlockedCallbackCannotBlockMaintenance(t *testing.T) {
 	id3 := NewId()
 	id4 := NewId()
 	id5 := NewId()
-	monitor.AddProviderEvent(id1, ProviderStateInEvaluation)
+	monitor.AddProviderEvent(id1, ProviderStateInEvaluation, id1, nil)
 	select {
 	case <-started:
 	case <-time.After(time.Second):
@@ -141,11 +142,11 @@ func TestMultiClientMonitorBlockedCallbackCannotBlockMaintenance(t *testing.T) {
 	publishDone := make(chan struct{})
 	go func() {
 		defer close(publishDone)
-		monitor.AddProviderEvent(id2, ProviderStateAdded)
-		monitor.AddProviderEvent(id3, ProviderStateEvaluationFailed)
-		monitor.AddProviderEvent(id4, ProviderStateNotAdded)
-		monitor.AddProviderEvent(id1, ProviderStateRemoved)
-		monitor.AddProviderEvent(id5, ProviderStateInEvaluation)
+		monitor.AddProviderEvent(id2, ProviderStateAdded, id2, nil)
+		monitor.AddProviderEvent(id3, ProviderStateEvaluationFailed, id3, nil)
+		monitor.AddProviderEvent(id4, ProviderStateNotAdded, id4, nil)
+		monitor.AddProviderEvent(id1, ProviderStateRemoved, id1, nil)
+		monitor.AddProviderEvent(id5, ProviderStateInEvaluation, id5, nil)
 	}()
 	select {
 	case <-publishDone:
@@ -205,7 +206,7 @@ func TestMultiClientMonitorCallbackPanicIsListenerLocal(t *testing.T) {
 	})
 	defer unsub()
 
-	monitor.AddProviderEvent(NewId(), ProviderStateAdded)
+	monitor.AddProviderEvent(NewId(), ProviderStateAdded, NewId(), nil)
 	waitForTestCondition(t, time.Second, func() bool {
 		return calls.Load() == 1
 	}, "first callback did not run")
@@ -215,7 +216,7 @@ func TestMultiClientMonitorCallbackPanicIsListenerLocal(t *testing.T) {
 		t.Fatal("listener panic was isolated but not reported")
 	}
 
-	monitor.AddProviderEvent(NewId(), ProviderStateAdded)
+	monitor.AddProviderEvent(NewId(), ProviderStateAdded, NewId(), nil)
 	waitForTestCondition(t, time.Second, func() bool {
 		return 2 <= calls.Load()
 	}, "callback worker died after listener panic")
@@ -246,9 +247,9 @@ func TestMergedMultiClientMonitorResetIncludesEveryWindow(t *testing.T) {
 
 	firstId := NewId()
 	secondId := NewId()
-	first.AddProviderEvent(firstId, ProviderStateAdded)
+	first.AddProviderEvent(firstId, ProviderStateAdded, firstId, nil)
 	waitForStallStart(t, gate)
-	second.AddProviderEvent(secondId, ProviderStateAdded)
+	second.AddProviderEvent(secondId, ProviderStateAdded, secondId, nil)
 	// Inject the bounded reset that an underlying listener produces on
 	// overflow. Call its merge adapter directly so the test does not depend
 	// on scheduler timing between two asynchronous callback workers.
@@ -274,6 +275,315 @@ func TestMergedMultiClientMonitorResetIncludesEveryWindow(t *testing.T) {
 		if event == nil || event.State != ProviderStateAdded {
 			t.Fatalf("merged reset lost live provider %s", id)
 		}
+	}
+}
+
+// Removing a provider must also exclude it from discovery. The resize loop
+// wakes the moment a client dies, so a removal that only cancelled the client
+// would be undone by the next discovery call handing back the same provider.
+func TestApiGeneratorExcludesRemovedProvider(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	seeded := NewId()
+	removed := NewId()
+	generator := &ApiMultiClientGenerator{
+		ctx:              ctx,
+		excludeClientIds: []Id{seeded},
+	}
+
+	if got := generator.ExcludeClientIds(); len(got) != 1 || got[0] != seeded {
+		t.Fatalf("initial exclusions = %v, want the seeded id", got)
+	}
+
+	generator.ExcludeClientId(removed)
+	if got := generator.ExcludeClientIds(); len(got) != 2 || !slices.Contains(got, removed) {
+		t.Fatalf("exclusions after remove = %v, want the removed id added", got)
+	}
+
+	// repeat removals must not grow the set (the same provider can be swiped
+	// again after being re-added by an in-flight discovery)
+	generator.ExcludeClientId(removed)
+	if got := generator.ExcludeClientIds(); len(got) != 2 {
+		t.Fatalf("exclusions = %v, want no duplicate", got)
+	}
+
+	// the snapshot handed to discovery must be a copy: the enumerator mutates
+	// its own slice while the app can be appending
+	snapshot := generator.ExcludeClientIds()
+	snapshot[0] = NewId()
+	if got := generator.ExcludeClientIds(); got[0] != seeded {
+		t.Fatal("discovery snapshot aliases the generator's exclusion set")
+	}
+
+	// ExcludeClientId is called from the app thread while discovery reads
+	var wait sync.WaitGroup
+	for range 8 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			generator.ExcludeClientId(NewId())
+		}()
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			generator.ExcludeClientIds()
+		}()
+	}
+	wait.Wait()
+	if got := len(generator.ExcludeClientIds()); got != 10 {
+		t.Fatalf("concurrent exclusions = %d, want 10", got)
+	}
+}
+
+// removeProviderTestGenerator records whether the exclusion was applied, and
+// controls whether the connection is fixed-destination only.
+type removeProviderTestGenerator struct {
+	testingEmptyMultiClientGenerator
+	fixed    bool
+	excluded []Id
+}
+
+func (self *removeProviderTestGenerator) FixedDestinationSize() (int, bool) {
+	if self.fixed {
+		return 1, true
+	}
+	return 0, false
+}
+
+// MultiClientGeneratorExcluder
+func (self *removeProviderTestGenerator) ExcludeClientId(clientId Id) {
+	self.excluded = append(self.excluded, clientId)
+}
+
+// A window client is identified to the user by its EGRESS (destination tail)
+// client id, not the local window client id, so removal must match on the
+// tail — and must leave every other provider connected.
+func TestWindowRemoveProviderCancelsOnlyTheMatchingDestination(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	settings := DefaultMultiClientSettings()
+	newClient := func(destination MultiHopId) *multiClientChannel {
+		clientCtx, clientCancel := context.WithCancel(ctx)
+		return &multiClientChannel{
+			ctx:    clientCtx,
+			cancel: clientCancel,
+			// Cancel records the end error into a stats event bucket, which
+			// reads the window settings
+			settings: settings,
+			args: &multiClientChannelArgs{
+				MultiClientGeneratorClientArgs: MultiClientGeneratorClientArgs{ClientId: NewId()},
+				Destination:                    destination,
+			},
+			clientReceiveUnsub: func() {},
+		}
+	}
+
+	removedEgressId := NewId()
+	keptEgressId := NewId()
+	// a multihop destination: the tail is the provider, the head is an
+	// intermediary and must not be matched
+	intermediaryId := NewId()
+	multihop, err := NewMultiHopId(intermediaryId, removedEgressId)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	removedClient := newClient(RequireMultiHopId(removedEgressId))
+	multihopClient := newClient(multihop)
+	keptClient := newClient(RequireMultiHopId(keptEgressId))
+
+	window := &multiClientWindow{
+		ctx:           ctx,
+		log:           NewNoopLogger(),
+		clients:       map[Id]*multiClientChannel{},
+		resizeMonitor: NewMonitor(),
+	}
+	for _, client := range []*multiClientChannel{removedClient, multihopClient, keptClient} {
+		window.clients[client.args.ClientId] = client
+	}
+
+	if !window.removeProvider(removedEgressId) {
+		t.Fatal("removeProvider did not report removing the provider")
+	}
+
+	select {
+	case <-removedClient.ctx.Done():
+	default:
+		t.Fatal("the matching client was not canceled")
+	}
+	// same provider reached through an intermediary: still that provider
+	select {
+	case <-multihopClient.ctx.Done():
+	default:
+		t.Fatal("a multihop route to the removed provider was not canceled")
+	}
+	select {
+	case <-keptClient.ctx.Done():
+		t.Fatal("an unrelated provider was canceled")
+	default:
+	}
+
+	// an id no window client routes to is not an error, just no removal
+	if window.removeProvider(NewId()) {
+		t.Fatal("removeProvider reported removing an unknown provider")
+	}
+	// the intermediary is not the provider
+	if window.removeProvider(intermediaryId) {
+		t.Fatal("removeProvider matched an intermediary instead of the destination tail")
+	}
+}
+
+// Removing a provider must exclude it from discovery, or the resize loop
+// (woken by the client's death) re-discovers it within seconds.
+func TestRemoveProviderExcludesFromDiscovery(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	generator := &removeProviderTestGenerator{}
+	multi := &RemoteUserNatMultiClient{
+		ctx:       ctx,
+		log:       NewNoopLogger(),
+		generator: generator,
+	}
+
+	egressClientId := NewId()
+	// no windows: the return value reports only whether a client was dropped,
+	// while the exclusion is applied regardless
+	if multi.RemoveProvider(egressClientId) {
+		t.Fatal("RemoveProvider reported a removal with no window clients")
+	}
+	if len(generator.excluded) != 1 || generator.excluded[0] != egressClientId {
+		t.Fatalf("excluded = %v, want the removed provider", generator.excluded)
+	}
+}
+
+// A fixed-destination connection (an explicitly chosen network peer) has
+// nothing to replace the provider with, so excluding it would leave the tunnel
+// with no destination at all. There the provider is dropped and redialed.
+func TestRemoveProviderDoesNotExcludeFixedDestinations(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	generator := &removeProviderTestGenerator{fixed: true}
+	multi := &RemoteUserNatMultiClient{
+		ctx:       ctx,
+		log:       NewNoopLogger(),
+		generator: generator,
+	}
+
+	multi.RemoveProvider(NewId())
+
+	if 0 < len(generator.excluded) {
+		t.Fatalf("a fixed destination was excluded (%v); it would leave no destination", generator.excluded)
+	}
+}
+
+// End of the wiring that matters: an excluded id must actually reach
+// discovery. A fixed spec is resolved without any network call, so this
+// asserts the exclusion is applied on the real NextDestinations path.
+func TestExcludedProviderIsDroppedFromDiscovery(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	keptId := NewId()
+	removedId := NewId()
+	generator := &ApiMultiClientGenerator{
+		ctx:      ctx,
+		specs:    []*ProviderSpec{{ClientId: &keptId}, {ClientId: &removedId}},
+		settings: DefaultApiMultiClientGeneratorSettings(),
+		// no persistence: a nil store skips continuity restoration
+		identityState: newWindowIdentityState(ctx, nil),
+	}
+
+	destinations, err := generator.NextDestinationsContext(ctx, 2, nil, "quality")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := destinations[RequireMultiHopId(removedId)]; !ok {
+		t.Fatal("the provider was not discoverable before removal")
+	}
+
+	generator.ExcludeClientId(removedId)
+
+	destinations, err = generator.NextDestinationsContext(ctx, 2, nil, "quality")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := destinations[RequireMultiHopId(removedId)]; ok {
+		t.Fatal("a removed provider was handed back by discovery")
+	}
+	if _, ok := destinations[RequireMultiHopId(keptId)]; !ok {
+		t.Fatal("removing one provider suppressed the others")
+	}
+}
+
+// The provider-locations surface derives connected-since and location from the
+// retained events. Added events must carry the construction-time stamp, the
+// egress (destination tail) client id, and the shared location pointer through
+// Events() and callback delivery; terminal events must still delete.
+func TestMultiClientMonitorProviderEventCarriesDetails(t *testing.T) {
+	monitor := NewRemoteUserNatMultiClientMonitorWithDefaults()
+
+	windowClientId := NewId()
+	egressClientId := NewId()
+	location := &ProviderLocation{
+		Country:           "United States",
+		CountryCode:       "us",
+		Region:            "California",
+		City:              "San Francisco",
+		RegionCoordinates: &LocationCoordinates{Lat: 37.2, Lon: -119.3},
+		CityCoordinates:   &LocationCoordinates{Lat: 37.7749, Lon: -122.4194},
+	}
+
+	delivered := make(chan map[Id]*ProviderEvent, 4)
+	unsub := monitor.AddMonitorEventCallback(func(
+		_ *WindowExpandEvent,
+		providerEvents map[Id]*ProviderEvent,
+		_ bool,
+	) {
+		delivered <- providerEvents
+	})
+	defer unsub()
+
+	before := time.Now()
+	monitor.AddProviderEvent(windowClientId, ProviderStateAdded, egressClientId, location)
+	after := time.Now()
+
+	_, events := monitor.Events()
+	event := events[windowClientId]
+	if event == nil {
+		t.Fatal("added provider missing from retained events")
+	}
+	if event.State != ProviderStateAdded {
+		t.Fatalf("state = %s, want Added", event.State)
+	}
+	if event.EgressClientId != egressClientId {
+		t.Fatal("egress client id was not carried")
+	}
+	if event.Location != location {
+		t.Fatal("location pointer was not shared through retained events")
+	}
+	if event.EventTime.Before(before) || event.EventTime.After(after) {
+		t.Fatalf("event time %s outside construction window [%s, %s]", event.EventTime, before, after)
+	}
+
+	select {
+	case diff := <-delivered:
+		if diffEvent := diff[windowClientId]; diffEvent == nil ||
+			diffEvent.EgressClientId != egressClientId ||
+			diffEvent.Location != location ||
+			diffEvent.EventTime.IsZero() {
+			t.Fatalf("callback diff lost provider details: %+v", diff[windowClientId])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("callback diff was not delivered")
+	}
+
+	monitor.AddProviderEvent(windowClientId, ProviderStateRemoved, egressClientId, location)
+	if _, events := monitor.Events(); events[windowClientId] != nil {
+		t.Fatal("terminal event did not delete the retained provider")
 	}
 }
 

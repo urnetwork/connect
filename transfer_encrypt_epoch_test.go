@@ -14,9 +14,14 @@ package connect
 //   - the responder adopts the initiator's generation and echoes it
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
+
+	"google.golang.org/protobuf/proto"
+
+	"github.com/urnetwork/connect/protocol"
 )
 
 func injectTestEpochWithId(sess *peerEncryptionSession, completed bool, handshakeErr error, epochId Id) *tlsHandshakeEpoch {
@@ -194,5 +199,187 @@ func TestClientRoleMintsEpochId(t *testing.T) {
 	}
 	if !first.LessThan(second) {
 		t.Fatalf("expected monotonic generations: %s then %s", first, second)
+	}
+}
+
+// TestStaleEpochProofDoesNotConsumePendingSlot locks the invariant whose
+// violation caused the new-instance stall: an epoch holds ONE pending
+// identity-proof slot, and a proof from a foreign generation must never
+// occupy it. If it does, the real proof is refused as "already buffered" and
+// the stale one is later verified against this epoch's exporter, fails, and
+// terminally tombstones a session the peer is still encrypting into.
+//
+// The regression arrived through the OPTIMISTIC delivery path (Client.receive
+// applies EncryptedControl before the in-order drain), which delivered proofs
+// without their generation. Both paths must carry it.
+func TestStaleEpochProofDoesNotConsumePendingSlot(t *testing.T) {
+	older, newer := olderAndNewerIds(t)
+
+	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleClient)
+	defer cleanup()
+	e := injectTestEpochWithId(sess, true, nil, newer)
+	// an exporter exists, so a same-generation proof would be verifiable
+	sess.stateLock.Lock()
+	e.tlsExporter = make([]byte, 32)
+	sess.stateLock.Unlock()
+
+	// a proof from the superseded generation
+	sess.receivePeerIdentityProofForEpoch(make([]byte, 64), older)
+
+	sess.stateLock.Lock()
+	pending := len(e.pendingPeerIdentityProof)
+	failed := e.identityFailed
+	sess.stateLock.Unlock()
+	if pending != 0 {
+		t.Fatal("a stale-generation proof must not occupy the pending slot")
+	}
+	if failed {
+		t.Fatal("a stale-generation proof must not mark the epoch identity-failed")
+	}
+
+	// the slot stays available for this generation's proof
+	sess.receivePeerIdentityProofForEpoch(make([]byte, 64), newer)
+	sess.stateLock.Lock()
+	pending = len(e.pendingPeerIdentityProof)
+	sess.stateLock.Unlock()
+	if pending == 0 {
+		t.Fatal("the current generation's proof must be accepted into the pending slot")
+	}
+}
+
+// TestOptimisticIdentityProofCarriesEpoch drives the OPTIMISTIC EncryptedControl
+// path in `Client.receive` — the fast path that applies a control before the
+// in-order ReceiveSequence drain — and asserts it honors the generation.
+//
+// This is the regression test for the delivery path that the epoch fix
+// originally missed. The in-order path checked the generation, the optimistic
+// path did not, and a stale proof arriving on the fast path took the epoch's
+// single pending-proof slot: the real proof was then refused as "already
+// buffered", the stale one was finally verified against this epoch's exporter,
+// failed, and terminally tombstoned a session the peer was still encrypting
+// into (see the WithNewInstance stall).
+//
+// It must fail if `Client.receive` stops passing the epoch: with no generation
+// the stale proof is buffered, and `pendingPeerIdentityProof` becomes non-empty.
+func TestOptimisticIdentityProofCarriesEpoch(t *testing.T) {
+	older, newer := olderAndNewerIds(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	settings := DefaultClientSettings()
+	settings.EncryptionSettings.Encrypt = true
+	settings.EncryptionSettings.TlsTimeout = 5 * time.Second
+
+	peerId := NewId()
+	receiver := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+	defer receiver.Cancel()
+
+	toReceiver := make(chan []byte, 8)
+	receiver.RouteManager().UpdateTransport(NewReceiveGatewayTransport(), []Route{toReceiver})
+	receiver.ContractManager().AddNoContractPeer(peerId)
+
+	// the local session the peer's client-role control routes into: the peer
+	// sends as client, so it drives our server session
+	sess := receiver.EncryptionSessionManager().getOrCreate(peerId, sequenceTlsRoleServer, false)
+	if sess == nil {
+		t.Fatal("expected a per-peer session")
+	}
+	// hold a live generation with an exporter, so a same-generation proof
+	// would be buffered for verification
+	e := injectTestEpochWithId(sess, true, nil, newer)
+	sess.stateLock.Lock()
+	e.tlsExporter = make([]byte, 32)
+	sess.stateLock.Unlock()
+
+	// buildProofFrame renders a peer identity-proof control for `epochId` on
+	// the wire exactly as the peer would send it: a plaintext pack carrying
+	// one EncryptedControl.
+	buildProofFrame := func(epochId Id) []byte {
+		ec := &protocol.EncryptedControl{
+			ControlType: protocol.EncryptedControlType_EncryptedControlIdentityProof,
+			Payload:     make([]byte, 64),
+			SessionRole: protocol.SequenceRole_SequenceRoleClient,
+			Companion:   false,
+			EpochId:     epochId.Bytes(),
+		}
+		ecBytes, err := proto.Marshal(ec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		packBytes, err := proto.Marshal(&protocol.Pack{
+			MessageId:      NewId().Bytes(),
+			SequenceId:     NewId().Bytes(),
+			SequenceNumber: 0,
+			Head:           true,
+			Nack:           true,
+			Frames: []*protocol.Frame{{
+				MessageType:  protocol.MessageType_TransferEncryptedControl,
+				MessageBytes: ecBytes,
+			}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		messageType := protocol.MessageType_TransferPack
+		transferFrameBytes, err := proto.Marshal(&protocol.TransferFrame{
+			TransferPath: TransferPath{
+				SourceId:      peerId,
+				DestinationId: receiver.ClientId(),
+			}.ToProtobuf(),
+			MessageType: &messageType,
+			Frame: &protocol.Frame{
+				MessageType:  protocol.MessageType_TransferPack,
+				MessageBytes: packBytes,
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return transferFrameBytes
+	}
+
+	deliver := func(transferFrameBytes []byte) {
+		select {
+		case toReceiver <- transferFrameBytes:
+		case <-time.After(5 * time.Second):
+			t.Fatal("route write timed out")
+		}
+	}
+
+	pendingProof := func() (int, bool) {
+		sess.stateLock.Lock()
+		defer sess.stateLock.Unlock()
+		return len(e.pendingPeerIdentityProof), e.identityFailed
+	}
+
+	// 1. the superseded generation's proof must never reach this epoch. With
+	//    the generation dropped on this path it is buffered instead, taking the
+	//    slot the real proof needs.
+	deliver(buildProofFrame(older))
+	staleDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(staleDeadline) {
+		if pending, failed := pendingProof(); 0 < pending || failed {
+			t.Fatalf(
+				"stale-generation proof reached the epoch through the optimistic path (pending=%d failed=%t): the path is not carrying the generation",
+				pending, failed,
+			)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	// 2. positive control: this generation's proof MUST arrive, proving the
+	//    frame shape and the optimistic path are live — without this a broken
+	//    delivery would make step 1 pass vacuously.
+	deliver(buildProofFrame(newer))
+	liveDeadline := time.Now().Add(10 * time.Second)
+	for {
+		if pending, _ := pendingProof(); 0 < pending {
+			break
+		}
+		if !time.Now().Before(liveDeadline) {
+			t.Fatal("current-generation proof never reached the epoch: the optimistic path is not delivering, so this test proves nothing")
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 }

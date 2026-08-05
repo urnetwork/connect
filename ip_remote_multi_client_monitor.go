@@ -2,7 +2,7 @@ package connect
 
 import (
 	"sync"
-	// "time"
+	"time"
 
 	"maps"
 )
@@ -55,9 +55,20 @@ func (self ProviderState) IsActive() bool {
 }
 
 type ProviderEvent struct {
-	// EventTime time.Time
+	// EventTime is when this state was entered. For `ProviderStateAdded` this
+	// is the moment the provider became routing-eligible — the connected-since
+	// time surfaced to users.
+	EventTime time.Time
+	// ClientId is the local window client id minted for this window slot.
 	ClientId Id
 	State    ProviderState
+	// EgressClientId is the provider (egress) client id — the destination
+	// tail. This is the id that identifies the provider to the user;
+	// `ClientId` does not.
+	EgressClientId Id
+	// Location is the egress provider's location. nil when unknown. Immutable
+	// — events are shallow-cloned and the pointee is shared.
+	Location *ProviderLocation
 }
 
 func DefaultRemoteUserNatMultiClientMonitorSettings() *RemoteUserNatMultiClientMonitorSettings {
@@ -384,7 +395,7 @@ func (self *RemoteUserNatMultiClientMonitor) AddWindowExpandEvent(minSatisfied b
 }
 
 // provider events are serialized per `clientId`
-func (self *RemoteUserNatMultiClientMonitor) AddProviderEvent(clientId Id, state ProviderState) {
+func (self *RemoteUserNatMultiClientMonitor) AddProviderEvent(clientId Id, state ProviderState, egressClientId Id, location *ProviderLocation) {
 	var windowExpandEvent WindowExpandEvent
 	clientIdProviderEvents := map[Id]*ProviderEvent{}
 
@@ -393,9 +404,11 @@ func (self *RemoteUserNatMultiClientMonitor) AddProviderEvent(clientId Id, state
 		defer self.stateLock.Unlock()
 
 		providerEvent := &ProviderEvent{
-			// EventTime: time.Now(),
-			ClientId: clientId,
-			State:    state,
+			EventTime:      time.Now(),
+			ClientId:       clientId,
+			State:          state,
+			EgressClientId: egressClientId,
+			Location:       location,
 		}
 
 		// self.providerEvents = append(self.providerEvents, providerEvent)
