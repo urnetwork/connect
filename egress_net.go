@@ -17,14 +17,26 @@ import (
 // Windows.
 type egressNet struct {
 	transport.Net
+	log Logger
 }
 
-func newEgressNet() (transport.Net, error) {
+func newEgressNet(log Logger) (transport.Net, error) {
 	base, err := stdnet.NewNet()
 	if err != nil {
 		return nil, err
 	}
-	return &egressNet{Net: base}, nil
+	return &egressNet{Net: base, log: loggerOrDefault(log)}, nil
+}
+
+// A socket we could not pin still works -- it just works through the wrong
+// interface, which for an ICE candidate means offering the tun's address to a
+// peer and gathering a path that loops back into this process. Not worth
+// failing the peer connection over, very much worth saying.
+func (self *egressNet) logBindFailure(err error) {
+	if err == nil {
+		return
+	}
+	self.log.Infof("[egress]ice socket not pinned to the physical interface, p2p may loop into the tunnel: %s\n", err)
 }
 
 func (self *egressNet) ListenUDP(network string, locAddr *net.UDPAddr) (transport.UDPConn, error) {
@@ -33,7 +45,7 @@ func (self *egressNet) ListenUDP(network string, locAddr *net.UDPAddr) (transpor
 		return nil, err
 	}
 	if sc, ok := conn.(syscall.Conn); ok {
-		_ = applyEgress(sc)
+		self.logBindFailure(applyEgress(sc))
 	}
 	return conn, nil
 }
@@ -44,7 +56,7 @@ func (self *egressNet) ListenPacket(network string, address string) (net.PacketC
 		return nil, err
 	}
 	if sc, ok := conn.(syscall.Conn); ok {
-		_ = applyEgress(sc)
+		self.logBindFailure(applyEgress(sc))
 	}
 	return conn, nil
 }

@@ -1427,7 +1427,13 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			// bind to the physical egress interface so the platform QUIC
 			// connection never loops into the tunnel this process provides
 			// (R1); a no-op off Windows and when no egress index is set.
-			_ = applyEgress(udpConn)
+			// not fatal -- the connection is still worth attempting -- but it
+			// must not be silent: an unpinned socket here follows the route
+			// table into our own tun and blackholes, which is indistinguishable
+			// from a dead network unless someone says so.
+			if err := applyEgress(udpConn); err != nil {
+				self.log.Infof("[tr]egress bind failed, the platform connection may loop into the tunnel: %s\n", err)
+			}
 			// single close path: once packetConn is bound (either directly
 			// to udpConn or wrapping it via packetTranslation), it owns the
 			// close. before that, we close udpConn directly. avoids the
