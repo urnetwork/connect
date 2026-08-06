@@ -492,6 +492,7 @@ type heartbeatState struct {
 	rebindsRedialed uint64
 	probesSent      uint64
 	probesAnswered  uint64
+	heldSharedFate  uint64
 	removals        uint64
 	groupsFollowed  uint64
 	groupsScattered uint64
@@ -559,6 +560,7 @@ func heartbeatStateFrom(exits []*ExitInfo, metrics *ReliabilityMetricsSnapshot, 
 		state.rebindsRedialed = metrics.RebindsRedialed
 		state.probesSent = metrics.ProbesSent
 		state.probesAnswered = metrics.ProbesAnswered
+		state.heldSharedFate = metrics.VerdictsHeldSharedFate
 		state.removals = metrics.ExitLossEvents
 		state.groupsFollowed = metrics.GroupsFollowed
 		state.groupsScattered = metrics.GroupsScattered
@@ -583,6 +585,10 @@ func relHeartbeatLine(state heartbeatState, uptime time.Duration) string {
 		"flows", state.flows,
 		"tiers", pair(state.tierMin, state.tierMax),
 		"held", pair(state.heldUplink, state.heldTransport),
+		// destructive verdicts held because enough exits went silent inside
+		// one shared-fate window that the shared path is the likely cause; a
+		// rising count during a wave is the detector doing its job
+		"fate", state.heldSharedFate,
 		"deferred", state.deferred,
 		"rebinds", pair(state.rebindsAccepted, state.rebindsRedialed),
 		"probes", pair(state.probesSent, state.probesAnswered),

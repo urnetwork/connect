@@ -341,6 +341,10 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// any evidence of life, so the cost of warning a provider that was
 		// merely asleep is a few minutes out of new-flow selection
 		ProbeSilenceWarnStreak: 2,
+		// three exits going silent inside ten seconds is not three provider
+		// deaths; see the field comment
+		SharedFateMinExits: 3,
+		SharedFateWindow:   10 * time.Second,
 		// mainnet-aggressive: evaluate twice the candidates a window expansion
 		// needs and keep the best. 1 is today's behavior, the A/B point.
 		EvaluationPoolMultiple: 2,
@@ -854,6 +858,21 @@ type MultiClientSettings struct {
 	//
 	// 0 is off (the pre-change behavior and the A/B comparison point).
 	ProbeSilenceWarnStreak int
+
+	// SharedFateMinExits and SharedFateWindow are the shared-fate verdict
+	// gate: when at least SharedFateMinExits DISTINCT exits develop
+	// silence/stall evidence inside one SharedFateWindow, the common cause is
+	// overwhelmingly the shared path (the phone's access network wobbling,
+	// bufferbloat, a handoff), not that many independent providers died in
+	// the same seconds -- so DESTRUCTIVE verdicts hold while the correlation
+	// stands. Benching (non-destructive) continues, receive progress still
+	// acquits, and a genuinely dead exit still executes the first pass after
+	// the correlation clears. The field captures that motivate it: mainnet
+	// congestion waves benching 6 exits at once (2026-08-04), and a stable
+	// pool where every stall conviction clustered with siblings' silence
+	// (2026-08-05). SharedFateMinExits 0 or SharedFateWindow 0 is off.
+	SharedFateMinExits int
+	SharedFateWindow   time.Duration
 
 	// EvaluationPoolMultiple is the aggressive-pooling knob: window expansion
 	// requests and ping-evaluates this multiple of the candidates it actually
@@ -2058,6 +2077,8 @@ type ReliabilitySettings struct {
 	ProbeTimeout               time.Duration
 	ProbeSampleHostCount       int
 	ProbeSilenceWarnStreak     int
+	SharedFateMinExits         int
+	SharedFateWindow           time.Duration
 	EvaluationPoolMultiple     int
 	// FormationPollTimeout: 0 falls back to SendRetryTimeout (the pre-change
 	// behavior), unlike the other zero-value-off knobs here
@@ -2112,6 +2133,8 @@ func ReliabilitySettingsFrom(settings *MultiClientSettings) *ReliabilitySettings
 		ProbeTimeout:               settings.ProbeTimeout,
 		ProbeSampleHostCount:       settings.ProbeSampleHostCount,
 		ProbeSilenceWarnStreak:     settings.ProbeSilenceWarnStreak,
+		SharedFateMinExits:         settings.SharedFateMinExits,
+		SharedFateWindow:           settings.SharedFateWindow,
 		EvaluationPoolMultiple:     settings.EvaluationPoolMultiple,
 		FormationPollTimeout:       settings.FormationPollTimeout,
 
@@ -3662,7 +3685,23 @@ func (self *RemoteUserNatMultiClient) rebindCandidates(dying *multiClientChannel
 			gather(window.unorderedClients())
 		}
 	}
+	// a candidate that has never delivered a byte sorts LAST, whatever its
+	// event recency: a fresh dial to a qualified destination reads as proven
+	// (qualification is destination-keyed) while its own transport is
+	// unproven, and the field capture that motivates this (2026-08-05)
+	// showed a dead-on-arrival replacement inherit 24 flows and execute 90s
+	// later -- one teardown amplified into two. Proven candidates take the
+	// flows while they have headroom; the unproven tier still exists so an
+	// all-fresh pool can place flows at all.
 	slices.SortStableFunc(candidates, func(a *multiClientChannel, b *multiClientChannel) int {
+		provenA := a.hasEverReceived()
+		provenB := b.hasEverReceived()
+		if provenA != provenB {
+			if provenA {
+				return -1
+			}
+			return 1
+		}
 		// descending: most recently active first
 		timeA := lastEventTimes[a]
 		timeB := lastEventTimes[b]
@@ -6819,6 +6858,21 @@ func (self *multiClientWindow) convictSendStalls(stallTimeout time.Duration) boo
 		return false
 	}
 
+	// every stalled exit is CURRENT evidence for the shared-fate window,
+	// recorded for ALL of them before ANY is judged -- recording inside the
+	// judgment loop would let the first-judged exit convict before its
+	// co-sufferers were visible
+	reliabilitySettings = self.reliabilitySettings()
+	sharedFateOn := reliabilitySettings != nil &&
+		0 < reliabilitySettings.SharedFateMinExits &&
+		0 < reliabilitySettings.SharedFateWindow
+	if sharedFateOn {
+		now := time.Now()
+		for _, client := range stalled {
+			client.metrics().recordSharedFate(client.ClientId(), now)
+		}
+	}
+
 	convicted := false
 	for i, client := range stalled {
 		verdict := verdicts[i]
@@ -6841,6 +6895,30 @@ func (self *multiClientWindow) convictSendStalls(stallTimeout time.Duration) boo
 				"detail", verdict.detail,
 				"bar", stallTimeout,
 			))
+			continue
+		}
+		if client.isQuarantined() {
+			// held: the bench already owns this exit's lifecycle. New flows
+			// are stopped, the movable flows were handed off at bench time,
+			// and the quarantine acquits on receive progress or executes on
+			// sustained silence -- a second judge executing mid-bench
+			// destroys exactly the flows the bench is protecting. The field
+			// capture that motivates this (2026-08-05, stable providers):
+			// every stall conviction in the window landed 6-41s after a
+			// bench, ahead of the acquittal that receive-silence benches on
+			// that pool overwhelmingly earn. The stall clock is deliberately
+			// NOT refreshed, so a real stall still convicts on carried
+			// evidence the first pass after the bench lifts.
+			client.resetBusyProbeSendFailures()
+			if client.markStallHoldOnce() {
+				loggerOrDefault(self.log).Infof("%s\n", relEvent(
+					"busy_probe",
+					"exit", client.ClientId(),
+					"outcome", "held",
+					"detail", "benched: quarantine owns the verdict",
+					"bar", stallTimeout,
+				))
+			}
 			continue
 		}
 		if !receivingElsewhere(client) {
@@ -6872,6 +6950,29 @@ func (self *multiClientWindow) convictSendStalls(stallTimeout time.Duration) boo
 				))
 			}
 			continue
+		}
+		if sharedFateOn {
+			peers := client.metrics().sharedFatePeers(client.ClientId(), time.Now(), reliabilitySettings.SharedFateWindow)
+			if reliabilitySettings.SharedFateMinExits <= peers+1 {
+				// held: this many exits stalling in the same seconds is one
+				// fact about the shared path, not peers+1 facts about
+				// providers. The stall clock is NOT refreshed -- the first
+				// pass after the correlation clears convicts a real stall on
+				// carried evidence.
+				client.resetBusyProbeSendFailures()
+				if client.markStallHoldOnce() {
+					client.metrics().verdictHeldSharedFate()
+					loggerOrDefault(self.log).Infof("%s\n", relEvent(
+						"busy_probe",
+						"exit", client.ClientId(),
+						"outcome", "held",
+						"detail", "shared fate",
+						"peers", peers,
+						"bar", stallTimeout,
+					))
+				}
+				continue
+			}
 		}
 		reason := fmt.Sprintf("no ack progress for %s", stallTimeout)
 		if verdict.detail != "" {
@@ -9724,6 +9825,17 @@ func (self *multiClientChannel) busyProbeOutstandingNow() bool {
 // (packetStats counts send acks but does not stamp them), and inventing a
 // second age from a field that does not exist is how a diagnostic ends up
 // reporting a number nobody produced.
+// hasEverReceived reports whether this channel has ever delivered return
+// traffic. Provider qualification is DESTINATION-keyed and survives channel
+// incarnations, so a fresh dial to a qualified destination reads as proven
+// while its own transport has delivered nothing -- this is the channel-level
+// proof-of-delivery those consumers gate on.
+func (self *multiClientChannel) hasEverReceived() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return !self.lastReceiveAckTime.IsZero()
+}
+
 func (self *multiClientChannel) probeReceiveAge() int64 {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -10174,6 +10286,19 @@ func (self *multiClientChannel) affinityDonorEligible(followQuarantine bool, win
 	}
 	if self.quarantined {
 		if !followQuarantine || window <= 0 {
+			return donorQuarantineScattered
+		}
+		if self.lastReceiveAckTime.IsZero() {
+			// following a BENCHED donor is a bet that the bench is a false
+			// positive -- reasonable for an exit that has been delivering
+			// and went briefly silent, and indefensible for one that has
+			// never delivered anything at all. The 2026-08-05 capture is the
+			// latter: a dead-on-arrival replacement (send 0/0B recv 0/0B)
+			// grew from 20 to 32 flows by group-follow while already
+			// benched, then executed and took them all down. An exit that
+			// has never received scatters instead; a fresh exit that has not
+			// been benched is unaffected, since normal inheritance never
+			// reaches this branch.
 			return donorQuarantineScattered
 		}
 		if self.quarantineStart.IsZero() || window <= time.Since(self.quarantineStart) {
@@ -10963,6 +11088,7 @@ func (self *multiClientChannel) detectBlackhole() {
 	// suppress", and one suppressed verdict re-evaluated every 1.25s for a
 	// minute is still one suppressed verdict.
 	heldCounted := false
+	sharedFateCounted := false
 
 	for {
 		if windowStats, err := self.WindowStats(); err != nil {
@@ -11043,6 +11169,16 @@ func (self *multiClientChannel) detectBlackhole() {
 				},
 			)
 			blackhole := reason != blackholeNone
+
+			// admissible receive-silence is CURRENT evidence for the
+			// shared-fate window, recorded before any gate so concurrent
+			// sufferers see each other
+			sharedFateMinExits := self.reliabilitySettings().SharedFateMinExits
+			sharedFateWindow := self.reliabilitySettings().SharedFateWindow
+			sharedFateOn := 0 < sharedFateMinExits && 0 < sharedFateWindow
+			if blackhole && sharedFateOn {
+				self.metrics().recordSharedFate(self.ClientId(), now)
+			}
 
 			if held != blackholeNone {
 				if !heldCounted {
@@ -11154,31 +11290,61 @@ func (self *multiClientChannel) detectBlackhole() {
 					// from an immediate one. The "Blackhole " prefix is shared
 					// by both forms on purpose: the window's storm breaker
 					// keys verdict-driven removals on it.
-					expired := ""
-					if action == verdictActionExecuteExpired {
-						expired = " quarantine expired"
+					sharedFateHeld := false
+					if sharedFateOn {
+						peers := self.metrics().sharedFatePeers(self.ClientId(), now, sharedFateWindow)
+						if sharedFateMinExits <= peers+1 {
+							// held: this many exits silent in the same seconds
+							// is one fact about the shared path. No addError --
+							// endErr is first-write-wins and there is no
+							// un-conviction. The loop keeps judging (falling
+							// through to the pass wait, never skipping it):
+							// receive progress acquits, and a genuinely dead
+							// exit executes the first pass after the
+							// correlation clears, on its own carried evidence.
+							sharedFateHeld = true
+							if !sharedFateCounted {
+								sharedFateCounted = true
+								self.metrics().verdictHeldSharedFate()
+								self.log.Infof("%s\n", relEvent(
+									"verdict_hold",
+									"exit", self.ClientId(),
+									"reason", string(reason),
+									"cause", "shared_fate",
+									"peers", peers,
+									"flows", flowCount,
+								))
+							}
+						}
 					}
-					// dsts is the distinct-send-destination count behind the
-					// MinBlackholeDestinations gate: a field capture must be
-					// able to tell "many destinations silent" (a real
-					// blackhole) from "one destination silent" (a dead
-					// website that squeaked past a lowered gate) on the one
-					// line that survives into a field log.
-					self.addError(fmt.Errorf(
-						"Blackhole %s%s (send %d/%dB recv %d/%dB syn %d/%d nackAge %s synAge %s dsts=%d)",
-						reason,
-						expired,
-						windowStats.sendAckCount,
-						windowStats.sendAckByteCount,
-						windowStats.receiveAckCount,
-						windowStats.receiveAckByteCount,
-						windowStats.sendSynCount,
-						windowStats.receiveSynCount,
-						blackholeAgeString(windowStats.firstSendNackTime),
-						blackholeAgeString(windowStats.firstSendSynTime),
-						windowStats.sendDestinationCount,
-					))
-					return
+					if !sharedFateHeld {
+						sharedFateCounted = false
+						expired := ""
+						if action == verdictActionExecuteExpired {
+							expired = " quarantine expired"
+						}
+						// dsts is the distinct-send-destination count behind the
+						// MinBlackholeDestinations gate: a field capture must be
+						// able to tell "many destinations silent" (a real
+						// blackhole) from "one destination silent" (a dead
+						// website that squeaked past a lowered gate) on the one
+						// line that survives into a field log.
+						self.addError(fmt.Errorf(
+							"Blackhole %s%s (send %d/%dB recv %d/%dB syn %d/%d nackAge %s synAge %s dsts=%d)",
+							reason,
+							expired,
+							windowStats.sendAckCount,
+							windowStats.sendAckByteCount,
+							windowStats.receiveAckCount,
+							windowStats.receiveAckByteCount,
+							windowStats.sendSynCount,
+							windowStats.receiveSynCount,
+							blackholeAgeString(windowStats.firstSendNackTime),
+							blackholeAgeString(windowStats.firstSendSynTime),
+							windowStats.sendDestinationCount,
+						))
+						return
+					}
 				}
 			} else {
 				// the bench-leak escape (see quarantineVacated): no verdict is

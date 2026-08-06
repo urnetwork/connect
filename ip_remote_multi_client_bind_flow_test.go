@@ -325,8 +325,14 @@ func TestAffinityDonorEligibleVerdicts(t *testing.T) {
 	client.setWarning(false, warnNone)
 
 	// a FRESH quarantine episode follows: the exact state production creates
-	// (setQuarantined stamps quarantineStart = now), no hand-set receive
-	// evidence required -- this is what makes the mechanism reachable
+	// (setQuarantined stamps quarantineStart = now). The past receive is
+	// production state too, not evidence hand-set to reach the mechanism: an
+	// exit earns flows by delivering, so a benched one has always received
+	// at SOME point -- what it lacks is a RECENT receive, and requiring that
+	// is what made this branch unreachable before (review, 2026-08-03).
+	client.stateLock.Lock()
+	client.lastReceiveAckTime = time.Now().Add(-time.Hour)
+	client.stateLock.Unlock()
 	client.setQuarantined(blackholeNoReceiveAck)
 	if got := client.affinityDonorEligible(true, window); got != donorQuarantineFollowed {
 		t.Errorf("fresh quarantine: verdict %v, want donorQuarantineFollowed", got)
@@ -347,6 +353,23 @@ func TestAffinityDonorEligibleVerdicts(t *testing.T) {
 	if got := client.affinityDonorEligible(true, window); got != donorQuarantineScattered {
 		t.Errorf("aged quarantine: verdict %v, want donorQuarantineScattered", got)
 	}
+
+	// a benched donor that has NEVER delivered a byte scatters: following it
+	// is a bet that the bench is a false positive, which is indefensible for
+	// a transport that has proven nothing. The 2026-08-05 capture: a
+	// dead-on-arrival replacement (send 0/0B recv 0/0B) grew 20 -> 32 flows
+	// by follow while benched, then executed and took them all down.
+	client.clearQuarantine()
+	client.stateLock.Lock()
+	client.lastReceiveAckTime = time.Time{}
+	client.stateLock.Unlock()
+	client.setQuarantined(blackholeNoReceiveAck)
+	if got := client.affinityDonorEligible(true, window); got != donorQuarantineScattered {
+		t.Errorf("never-received benched donor: verdict %v, want donorQuarantineScattered", got)
+	}
+	client.stateLock.Lock()
+	client.lastReceiveAckTime = time.Now().Add(-time.Hour)
+	client.stateLock.Unlock()
 
 	// warning wins over quarantine: an unhealthy benched exit never donates
 	client.clearQuarantine()
@@ -386,6 +409,7 @@ func TestQuarantinedDonorKeepsItsSite(t *testing.T) {
 
 	// production state, nothing hand-set: a fresh episode is inside the
 	// follow window by construction
+	stampDonorReceived(donor)
 	donor.setQuarantined(blackholeNoReceiveAck)
 
 	newFlow := &multiClientChannelUpdate{}
@@ -451,6 +475,7 @@ func TestPinnedFlowFollowsBenchWithoutWindow(t *testing.T) {
 	donorPaths := map[Ip4Path]time.Time{ip4: time.Now()}
 
 	// a bench well past the 45s follow window
+	stampDonorReceived(donor)
 	donor.setQuarantined(blackholeNoReceiveAck)
 	donor.stateLock.Lock()
 	donor.quarantineStart = time.Now().Add(-2 * parent.settings.GroupFollowWindow)
@@ -795,4 +820,13 @@ func TestAffinityNameCollapsesCdnConstellations(t *testing.T) {
 			t.Errorf("alias %q -> %q chains: %q is itself aliased", from, to, to)
 		}
 	}
+}
+
+// stampDonorReceived puts a donor in the state production always has by the
+// time it can be benched: it has delivered before (that is how it earned its
+// flows), just not recently. See affinityDonorEligible.
+func stampDonorReceived(client *multiClientChannel) {
+	client.stateLock.Lock()
+	defer client.stateLock.Unlock()
+	client.lastReceiveAckTime = time.Now().Add(-time.Hour)
 }

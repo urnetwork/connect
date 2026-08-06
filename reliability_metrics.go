@@ -132,6 +132,11 @@ type reliabilityMetrics struct {
 	// the verdict-gating work that increments them lands separately, and
 	// defining the counters first means that work ships already measured.
 	verdictsHeldUplinkStale   atomic.Uint64
+	// verdictsHeldSharedFate counts destructive verdicts held because enough
+	// DISTINCT exits developed silence/stall evidence inside one short window
+	// that the common cause is overwhelmingly the shared path (the phone's
+	// access network), not that many independent providers died at once.
+	verdictsHeldSharedFate atomic.Uint64
 	verdictsHeldTransportDown atomic.Uint64
 	removalsDeferred          atomic.Uint64
 
@@ -147,6 +152,13 @@ type reliabilityMetrics struct {
 	// rate for tuning; nothing attributes it.
 	probesSent         atomic.Uint64
 	probesAnswered     atomic.Uint64
+
+	// the shared-fate evidence ring: which exits have CURRENT silence/stall
+	// evidence, deduplicated by exit and pruned to the configured window on
+	// access. Written on verdict passes (a few suspicious exits at a time),
+	// never on a packet path.
+	sharedFateLock      sync.Mutex
+	sharedFateEvidences map[Id]time.Time
 	providersQualified atomic.Uint64
 
 	// the busy-flow liveness probe (see busyLivenessProbe). busyProbesSent
@@ -207,6 +219,49 @@ func (self *reliabilityMetrics) flowReraced() {
 		return
 	}
 	self.flowsReraced.Add(1)
+}
+
+// recordSharedFate stamps CURRENT silence/stall evidence against an exit.
+// Re-recording refreshes the stamp: the question the window answers is "how
+// many exits look silent right now", not "how many ever did".
+func (self *reliabilityMetrics) recordSharedFate(exitId Id, now time.Time) {
+	if self == nil {
+		return
+	}
+	self.sharedFateLock.Lock()
+	defer self.sharedFateLock.Unlock()
+	if self.sharedFateEvidences == nil {
+		self.sharedFateEvidences = map[Id]time.Time{}
+	}
+	self.sharedFateEvidences[exitId] = now
+}
+
+// sharedFatePeers counts DISTINCT exits other than exitId with evidence
+// inside the window, pruning stale entries as it goes.
+func (self *reliabilityMetrics) sharedFatePeers(exitId Id, now time.Time, window time.Duration) int {
+	if self == nil || window <= 0 {
+		return 0
+	}
+	self.sharedFateLock.Lock()
+	defer self.sharedFateLock.Unlock()
+	peers := 0
+	for id, at := range self.sharedFateEvidences {
+		if window <= now.Sub(at) {
+			delete(self.sharedFateEvidences, id)
+			continue
+		}
+		if id != exitId {
+			peers += 1
+		}
+	}
+	return peers
+}
+
+func (self *reliabilityMetrics) verdictHeldSharedFate() {
+	if self == nil {
+		return
+	}
+	self.verdictsHeldSharedFate.Add(1)
 }
 
 func (self *reliabilityMetrics) verdictHeldUplinkStale() {
@@ -477,6 +532,7 @@ func (self *reliabilityMetrics) reset() {
 	self.rebindsAccepted.Store(0)
 	self.rebindsRedialed.Store(0)
 	self.verdictsHeldUplinkStale.Store(0)
+	self.verdictsHeldSharedFate.Store(0)
 	self.verdictsHeldTransportDown.Store(0)
 	self.removalsDeferred.Store(0)
 	self.probesSent.Store(0)
@@ -538,6 +594,7 @@ type ReliabilityMetricsSnapshot struct {
 	// uplink was stale, the transport was known down); RemovalsDeferred
 	// counts provider removals postponed while such a hold was in effect.
 	VerdictsHeldUplinkStale   uint64
+	VerdictsHeldSharedFate    uint64
 	VerdictsHeldTransportDown uint64
 	RemovalsDeferred          uint64
 
@@ -591,6 +648,7 @@ func (self *reliabilityMetrics) snapshot() *ReliabilityMetricsSnapshot {
 		RebindsRedialed: self.rebindsRedialed.Load(),
 
 		VerdictsHeldUplinkStale:   self.verdictsHeldUplinkStale.Load(),
+		VerdictsHeldSharedFate:    self.verdictsHeldSharedFate.Load(),
 		VerdictsHeldTransportDown: self.verdictsHeldTransportDown.Load(),
 		RemovalsDeferred:          self.removalsDeferred.Load(),
 

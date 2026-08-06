@@ -376,7 +376,7 @@ func TestHeartbeatContentFromFixture(t *testing.T) {
 
 	line := relHeartbeatLine(state, 125*time.Second)
 	want := "[rel] event=heartbeat exits=3 proven=2 quarantined=1 warned=2 flows=6 " +
-		"tiers=0/3 held=7/2 deferred=1 rebinds=9/3 probes=40/38 follow=6/1 pins=2/1 removals=5 uptime=125"
+		"tiers=0/3 held=7/2 fate=0 deferred=1 rebinds=9/3 probes=40/38 follow=6/1 pins=2/1 removals=5 uptime=125"
 	AssertEqual(t, line, want)
 }
 
@@ -445,6 +445,7 @@ func TestHeartbeatSignatureSuppression(t *testing.T) {
 		"probesSent":  func(s *heartbeatState) { s.probesSent += 1 },
 		"answered":    func(s *heartbeatState) { s.probesAnswered += 1 },
 		"removals":    func(s *heartbeatState) { s.removals += 1 },
+		"fate":        func(s *heartbeatState) { s.heldSharedFate += 1 },
 	} {
 		changed := first
 		mutate(&changed)
