@@ -48,8 +48,8 @@ func (self *immediateWriteConn) SetWriteDeadline(deadline time.Time) error {
 func TestResilientTlsConnOffWritesDirectly(t *testing.T) {
 	underlying := &immediateWriteConn{}
 	conn := NewResilientTlsConn(underlying, true, true)
-	conn.Off()
-	conn.Off()
+	_ = conn.Off()
+	_ = conn.Off()
 
 	message := []byte("application data")
 	n, err := conn.Write(message)
@@ -64,7 +64,7 @@ func TestResilientTlsConnOffWritesDirectly(t *testing.T) {
 func BenchmarkResilientTlsConnDisabledWrite(b *testing.B) {
 	underlying := &immediateWriteConn{}
 	conn := NewResilientTlsConn(underlying, true, true)
-	conn.Off()
+	_ = conn.Off()
 	message := make([]byte, 3*1024)
 
 	b.ReportAllocs()

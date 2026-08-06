@@ -188,7 +188,9 @@ func newExtenderDialTlsContext(
 					return nil, err
 				}
 				// once the stream is established, no longer need the resilient features
-				rconn.Off()
+				if err := rconn.Off(); err != nil {
+					return nil, err
+				}
 
 				serverConn = tlsServerConn
 			} else {
