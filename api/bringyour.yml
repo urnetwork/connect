@@ -398,11 +398,12 @@ paths:
               schema:
                 $ref: "#/components/schemas/AuthCodeLoginResult"
 
-  /auth/upgrade-guest:
+  /auth/add-auth:
     post:
       description: |
-        Authenticates a guest user, migrates to a normal account
-      operationId: Upgrade Guest
+        Add an authentication method (email/phone + password, SSO, or wallet)
+        to the calling user. Subject to the account action rate limit.
+      operationId: Auth Add Auth
       security:
         - BearerAuth: []
       requestBody:
@@ -410,19 +411,20 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/UpgradeGuestArgs"
+              $ref: "#/components/schemas/AddAuthArgs"
       responses:
         "200":
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/UpgradeGuestResult"
+                $ref: "#/components/schemas/AddAuthResult"
 
-  /auth/upgrade-guest-existing:
+  /auth/remove-auth:
     post:
       description: |
-        Authenticate a guest user and migrate into an existing account.
-      operationId: Upgrade Guest Existing
+        Remove an authentication method from the calling user. The last
+        remaining method cannot be removed.
+      operationId: Auth Remove Auth
       security:
         - BearerAuth: []
       requestBody:
@@ -430,13 +432,43 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/UpgradeGuestExistingArgs"
+              $ref: "#/components/schemas/RemoveAuthArgs"
       responses:
         "200":
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/UpgradeGuestExistingResult"
+                $ref: "#/components/schemas/RemoveAuthResult"
+
+  /auth/generate-seedphrase:
+    post:
+      description: |
+        Generate a recovery seedphrase for the calling user. Fails if a
+        seedphrase auth already exists; see /auth/regenerate-seedphrase.
+      operationId: Auth Generate Seedphrase
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenerateSeedphraseResult"
+
+  /auth/regenerate-seedphrase:
+    post:
+      description: |
+        Replace the calling user's recovery seedphrase with a new one,
+        invalidating the previous seedphrase.
+      operationId: Auth Regenerate Seedphrase
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegenerateSeedphraseResult"
 
   /network/auth-client:
     post:
@@ -1363,6 +1395,48 @@ paths:
               schema:
                 $ref: "#/components/schemas/MyIPInfoResult"
 
+  /account/change-name:
+    post:
+      description: |
+        Change the network name of the calling network. The previous name
+        enters a reclaim cooldown. Subject to the account action rate limit.
+      operationId: Account Change Name
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChangeNetworkNameArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChangeNetworkNameResult"
+
+  /account/claim-name:
+    post:
+      description: |
+        Claim an unused network name for the calling network. Shares the
+        change-name budget and rate limit.
+      operationId: Account Claim Name
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChangeNetworkNameArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChangeNetworkNameResult"
+
   /account/api-key:
     post:
       description: |
@@ -2237,8 +2311,6 @@ components:
         terms:
           description: user consent to accept terms of service
           type: boolean
-        guest_mode:
-          type: boolean
         verify_use_numeric:
           type: boolean
         wallet_auth:
@@ -2285,49 +2357,6 @@ components:
     NetworkDeleteResult:
       type: object
       properties:
-        error:
-          type: object
-          properties:
-            message:
-              type: string
-
-    UpgradeGuestArgs:
-      type: object
-      properties:
-        user_auth:
-          description: email or phone number
-          type: string
-        auth_jwt:
-          type: string
-        auth_jwt_type:
-          type: string
-          enum:
-            - apple
-            - google
-        password:
-          type: string
-        network_name:
-          type: string
-        wallet_auth:
-          $ref: "#/components/schemas/WalletAuthArgs"
-
-    UpgradeGuestResult:
-      type: object
-      properties:
-        network:
-          type: object
-          properties:
-            by_jwt:
-              type: string
-        user_auth:
-          description: email or phone number
-          type: string
-        verification_required:
-          type: object
-          properties:
-            user_auth:
-              description: email or phone number
-              type: string
         error:
           type: object
           properties:
@@ -3868,6 +3897,81 @@ components:
         unpaid_bytes_provided:
           type: integer
 
+    AddAuthArgs:
+      type: object
+      properties:
+        user_auth:
+          description: email or phone number
+          type: string
+        auth_jwt:
+          type: string
+        auth_jwt_type:
+          type: string
+          enum:
+            - apple
+            - google
+        password:
+          type: string
+        wallet_auth:
+          $ref: "#/components/schemas/WalletAuthArgs"
+    AddAuthResult:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+    RemoveAuthArgs:
+      type: object
+      properties:
+        auth_type:
+          type: string
+    RemoveAuthResult:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+    GenerateSeedphraseResult:
+      type: object
+      properties:
+        seedphrase:
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+    RegenerateSeedphraseResult:
+      type: object
+      properties:
+        seedphrase:
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+    ChangeNetworkNameArgs:
+      type: object
+      properties:
+        network_name:
+          type: string
+        new_name:
+          type: string
+    ChangeNetworkNameResult:
+      type: object
+      properties:
+        network_name:
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
     WalletAuthArgs:
       type: object
       properties:
@@ -4824,44 +4928,6 @@ components:
       properties:
         success:
           type: boolean
-        error:
-          type: object
-          properties:
-            message:
-              type: string
-
-    UpgradeGuestExistingArgs:
-      type: object
-      properties:
-        user_auth:
-          description: email or phone number
-          type: string
-        password:
-          type: string
-        auth_jwt:
-          type: string
-        auth_jwt_type:
-          type: string
-          enum:
-            - apple
-            - google
-        wallet_auth:
-          $ref: "#/components/schemas/WalletAuthArgs"
-
-    UpgradeGuestExistingResult:
-      type: object
-      properties:
-        network:
-          type: object
-          properties:
-            by_jwt:
-              type: string
-        verification_required:
-          type: object
-          properties:
-            user_auth:
-              description: email or phone number
-              type: string
         error:
           type: object
           properties:
