@@ -58,6 +58,13 @@ func NewApiOutOfBandControlWithApi(api *BringYourApi) *ApiOutOfBandControl {
 	}
 }
 
+// SetByJwt updates the bearer token used by future out-of-band control
+// requests. Long-lived clients call this when their renewable client JWT is
+// rotated; BringYourApi provides the synchronization for concurrent sends.
+func (self *ApiOutOfBandControl) SetByJwt(byJwt string) {
+	self.api.SetByJwt(byJwt)
+}
+
 func (self *ApiOutOfBandControl) SendControl(
 	frames []*protocol.Frame,
 	callback OobResultFunction,
