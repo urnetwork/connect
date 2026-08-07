@@ -119,6 +119,7 @@ The device-side tun write is the deliberate exception, documented at its call si
 ## Formatting and structure
 
 - Format with `gofmt`.
+- Write binary size constants as products of well-known decimal values, such as `1024 * 1024` or `16 * 1024 * 1024`, rather than shifts such as `1 << 20` or `16 << 20`.
 - Inline single-use helper logic as a local closure at its call site (`f := func(...){ ... }; f()`) rather than pulling it out into a separate named function.
 
 ## Tests
