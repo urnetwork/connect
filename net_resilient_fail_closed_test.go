@@ -1,4 +1,4 @@
-//go:build unix
+//go:build unix || windows
 
 package connect
 
@@ -124,14 +124,20 @@ func setSocketTtl(t *testing.T, conn *net.TCPConn, ttl int) {
 	if err != nil {
 		t.Fatalf("file: %v", err)
 	}
-	SetSocketTtl(SocketHandle(f.Fd()), ttl)
+	// checked: the tests that call this assert against ttl as the native
+	// value, so a silently refused set would make them assert against a
+	// number the socket never held.
+	if err := SetSocketTtl(SocketHandle(f.Fd()), ttl); err != nil {
+		f.Close()
+		t.Fatalf("set ttl %d: %v", ttl, err)
+	}
 	f.Close()
 	t.Cleanup(func() {
 		f, err := conn.File()
 		if err != nil {
 			return // conn already closed; nothing to restore
 		}
-		SetSocketTtl(SocketHandle(f.Fd()), 64)
+		_ = SetSocketTtl(SocketHandle(f.Fd()), 64)
 		f.Close()
 	})
 }
@@ -202,7 +208,9 @@ func TestResilientTlsConnFragmentFailureDisablesAndRestoresTtl(t *testing.T) {
 		t.Fatalf("file: %v", err)
 	}
 	defer probe.Close()
-	SetSocketTtl(SocketHandle(probe.Fd()), 42)
+	if err := SetSocketTtl(SocketHandle(probe.Fd()), 42); err != nil {
+		t.Fatalf("set ttl: %v", err)
+	}
 
 	// Expire the write deadline so the first fragment write fails
 	// deterministically after the fd and native TTL are acquired.
@@ -288,7 +296,9 @@ func TestResilientTlsConnReorderOnlyFragmentsOnFailure(t *testing.T) {
 		t.Fatalf("file: %v", err)
 	}
 	defer probe.Close()
-	SetSocketTtl(SocketHandle(probe.Fd()), 42)
+	if err := SetSocketTtl(SocketHandle(probe.Fd()), 42); err != nil {
+		t.Fatalf("set ttl: %v", err)
+	}
 
 	client.SetWriteDeadline(time.Now().Add(-time.Second))
 	rconn := NewResilientTlsConn(client, false, true)
