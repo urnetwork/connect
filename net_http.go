@@ -374,8 +374,33 @@ func (self *ClientStrategy) CustomExtenders() map[netip.Addr]string {
 	return maps.Clone(self.extenderIpSecrets)
 }
 
-// new connections should use next connect time to avoid flooding the network at once
-func (self *ClientStrategy) NextConnectTime() time.Time {
+// nextConnectMaxLead caps how far the shared next-connect timestamp may run
+// ahead of wall clock. Every cold dial advances the one shared timestamp by
+// 100ms-1s, and before the cancel release below existed, a dialer whose pacing
+// wait was cancelled never gave its step back — so rapid connect/disconnect
+// cycles compounded the lead without bound. In the 2026-08-09 field capture,
+// 12 window teardowns of ~10 exits each pushed the staircase 60+ seconds ahead
+// of wall clock: every new exit was born 'transport down' (its dial slot was a
+// minute in the future), cohorts of ~10 transport-downs expired at the 15s
+// evaluation deadline, 0 connections were ever proven, and the replacements
+// re-queued at the back of the same staircase — unbounded starvation where
+// only the first connect cycle ever worked. The cancel release is the primary
+// fix; this clamp is the backstop that bounds the damage of any reservation
+// that still leaks: a new dialer never waits more than nextConnectMaxLead.
+const nextConnectMaxLead = 10 * time.Second
+
+// new connections should use next connect time to avoid flooding the network
+// at once.
+//
+// The returned release gives this caller's reservation back to the staircase.
+// It exists for exactly one situation: the caller's pacing wait was cancelled
+// (its context ended) before it ever dialed, so the pacing step it reserved
+// paces nobody — without the release the step stays consumed and every later
+// caller queues behind a dial that will never happen (see nextConnectMaxLead
+// for the field failure this produced). A caller that goes on to dial must NOT
+// call release — a consumed step is correct pacing for a dial that happened.
+// The release is idempotent and never nil, mirroring NextReconnectTime.
+func (self *ClientStrategy) NextConnectTime() (time.Time, func()) {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 
@@ -389,8 +414,26 @@ func (self *ClientStrategy) NextConnectTime() time.Time {
 	if nextConnectTime.Before(now) {
 		nextConnectTime = now
 	}
+	if maxLead := now.Add(nextConnectMaxLead); maxLead.Before(nextConnectTime) {
+		nextConnectTime = maxLead
+	}
 	self.nextConnectTime = nextConnectTime
-	return nextConnectTime
+
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			self.mutex.Lock()
+			defer self.mutex.Unlock()
+			// give back this caller's step. Later callers may have stacked
+			// behind it; subtracting shifts them all one step earlier, which
+			// is exactly the vacated slot closing up. When the returned time
+			// was clamped (to now, or to the lead bound) this can under- or
+			// over-release by at most one step; the read path re-clamps, so
+			// the shared timestamp stays safe in both directions.
+			self.nextConnectTime = self.nextConnectTime.Add(-connectDelay)
+		})
+	}
+	return nextConnectTime, release
 }
 
 const (
@@ -444,8 +487,14 @@ func (self *ClientStrategy) NextReconnectTime() (time.Time, func()) {
 	if !acquired {
 		// over the cap: this burst is not small after all; serialize like any
 		// other connect. NextConnectTime takes the mutex itself, so it must be
-		// called with the lock released (done above).
-		return self.NextConnectTime(), func() {}
+		// called with the lock released (done above). The staircase release is
+		// deliberately dropped: this method's release contract is "dial
+		// attempt completed", and handing back a pacing step after a dial that
+		// actually happened would defeat the pacing. A cancelled wait on this
+		// rare over-cap path therefore leaks its step, bounded by
+		// nextConnectMaxLead.
+		next, _ := self.NextConnectTime()
+		return next, func() {}
 	}
 
 	var releaseOnce sync.Once

@@ -767,16 +767,21 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		// every exit path.
 		var connectTime time.Time
 		releaseReconnect := func() {}
+		cancelConnect := func() {}
 		if hadConnection {
 			connectTime, releaseReconnect = self.clientStrategy.NextReconnectTime()
 			hadConnection = false
 		} else {
-			connectTime = self.clientStrategy.NextConnectTime()
+			// cancelConnect gives the staircase reservation back if this wait
+			// is cancelled before the dial happens; it must NOT be called once
+			// the dial proceeds — see NextConnectTime
+			connectTime, cancelConnect = self.clientStrategy.NextConnectTime()
 		}
 		if connectDelay := connectTime.Sub(time.Now()); 0 < connectDelay {
 			select {
 			case <-self.ctx.Done():
 				releaseReconnect()
+				cancelConnect()
 				return
 			case <-self.kickMonitor.NotifyChannel():
 				// network changed while waiting to dial: any pacing computed
@@ -1551,16 +1556,21 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 		// every exit path.
 		var connectTime time.Time
 		releaseReconnect := func() {}
+		cancelConnect := func() {}
 		if hadConnection {
 			connectTime, releaseReconnect = self.clientStrategy.NextReconnectTime()
 			hadConnection = false
 		} else {
-			connectTime = self.clientStrategy.NextConnectTime()
+			// cancelConnect gives the staircase reservation back if this wait
+			// is cancelled before the dial happens; it must NOT be called once
+			// the dial proceeds — see NextConnectTime
+			connectTime, cancelConnect = self.clientStrategy.NextConnectTime()
 		}
 		if connectDelay := connectTime.Sub(time.Now()); 0 < connectDelay {
 			select {
 			case <-self.ctx.Done():
 				releaseReconnect()
+				cancelConnect()
 				return
 			case <-self.kickMonitor.NotifyChannel():
 				// network changed while waiting to dial: any pacing computed

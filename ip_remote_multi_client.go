@@ -7096,6 +7096,7 @@ func windowGeneratorCall[T any](
 	if timeout <= 0 {
 		return call()
 	}
+	startTime := time.Now()
 	// cap 1: the producer's single send never blocks, so an abandoned call's
 	// goroutine exits as soon as the call itself returns
 	out := make(chan generatorCallResult[T], 1)
@@ -7107,10 +7108,12 @@ func windowGeneratorCall[T any](
 		// result so the waiter (or the late drain below) is never parked
 		out <- generatorCallResult[T]{err: err}
 	})
+	canceled := false
 	select {
 	case result := <-out:
 		return result.value, result.err
 	case <-ctx.Done():
+		canceled = true
 	case <-time.After(timeout):
 	}
 	// abandoned: drain the eventual result off-path
@@ -7121,7 +7124,14 @@ func windowGeneratorCall[T any](
 		}
 	})
 	var zero T
-	return zero, fmt.Errorf("generator call abandoned after %s", timeout)
+	if canceled {
+		// ctx cancel is local teardown, not a hung generator, and it fires
+		// however little time has passed — stamping this path with the
+		// configured timeout produced logs claiming a 20s abandonment for a
+		// wait that lasted milliseconds
+		return zero, fmt.Errorf("generator call canceled")
+	}
+	return zero, fmt.Errorf("generator call abandoned after %s", time.Since(startTime))
 }
 
 // removeLateClientArgs is the lateResult route for abandoned NewClientArgs /
