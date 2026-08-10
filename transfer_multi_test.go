@@ -14,12 +14,12 @@ func TestSendMultiWithTimeoutDeliversOneBatchAndOneAck(t *testing.T) {
 	defer cancel()
 
 	settings := DefaultClientSettings()
-	settings.EncryptionSettings.Encrypt = false
+	settings.EncryptionSettings.Mode = EncryptionModeOff
 	sender := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 	defer sender.Cancel()
 
 	receiverSettings := DefaultClientSettings()
-	receiverSettings.EncryptionSettings.Encrypt = false
+	receiverSettings.EncryptionSettings.Mode = EncryptionModeOff
 	receiver := NewClient(ctx, NewId(), NewNoContractClientOob(), receiverSettings)
 	defer receiver.Cancel()
 

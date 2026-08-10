@@ -15,7 +15,7 @@ import (
 func TestClientKeyManagerGenerateFresh(t *testing.T) {
 	ctx := context.Background()
 	settings := DefaultClientSettings()
-	settings.EncryptionSettings.Encrypt = false
+	settings.EncryptionSettings.Mode = EncryptionModeOff
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 	defer client.Cancel()
 
@@ -40,7 +40,7 @@ func TestClientKeyManagerGenerateFresh(t *testing.T) {
 func TestClientKeyManagerLoadSeed(t *testing.T) {
 	ctx := context.Background()
 	settings := DefaultClientSettings()
-	settings.EncryptionSettings.Encrypt = false
+	settings.EncryptionSettings.Mode = EncryptionModeOff
 
 	seed := make([]byte, ed25519.SeedSize)
 	_, err := rand.Read(seed)
@@ -66,7 +66,7 @@ func TestClientKeyManagerLoadSeed(t *testing.T) {
 func TestClientKeyManagerLoadSeedWrongSize(t *testing.T) {
 	ctx := context.Background()
 	settings := DefaultClientSettings()
-	settings.EncryptionSettings.Encrypt = false
+	settings.EncryptionSettings.Mode = EncryptionModeOff
 	settings.ClientKeySeed = []byte{0, 1, 2, 3} // wrong size
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 	defer client.Cancel()
@@ -84,7 +84,7 @@ func TestClientKeyManagerLoadSeedWrongSize(t *testing.T) {
 func TestClientKeyManagerSignVerifyRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	settings := DefaultClientSettings()
-	settings.EncryptionSettings.Encrypt = false
+	settings.EncryptionSettings.Mode = EncryptionModeOff
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 	defer client.Cancel()
 
@@ -122,7 +122,7 @@ func TestClientKeyManagerSignVerifyRoundTrip(t *testing.T) {
 func TestClientKeyManagerCertChainSignature(t *testing.T) {
 	ctx := context.Background()
 	settings := DefaultClientSettings()
-	settings.EncryptionSettings.Encrypt = false
+	settings.EncryptionSettings.Mode = EncryptionModeOff
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 	defer client.Cancel()
 

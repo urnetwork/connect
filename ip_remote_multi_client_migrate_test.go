@@ -60,6 +60,10 @@ type fakeWindowPlatformTransport struct {
 	notify    chan struct{}
 	closed    chan struct{}
 	closeOnce sync.Once
+	// onClose, when set, runs synchronously inside Close before `closed` is
+	// signaled — a seam to observe migrator state at the exact instant of
+	// close (see TestApiWindowTransportMigrationDisarmsBeforeClosingReplacement).
+	onClose func()
 }
 
 func newFakeWindowPlatformTransport(connected bool) *fakeWindowPlatformTransport {
@@ -84,6 +88,9 @@ func (self *fakeWindowPlatformTransport) IsConnected() bool {
 
 func (self *fakeWindowPlatformTransport) Close() {
 	self.closeOnce.Do(func() {
+		if self.onClose != nil {
+			self.onClose()
+		}
 		close(self.closed)
 	})
 }
@@ -216,5 +223,59 @@ func TestApiWindowTransportMigrationKeepsOldOnTimeout(t *testing.T) {
 	}
 	if migrating {
 		t.Fatal("migration remained armed after timeout")
+	}
+}
+
+// TestApiWindowTransportMigrationDisarmsBeforeClosingReplacement pins the
+// ordering that made TestApiWindowTransportMigrationKeepsOldOnTimeout a
+// load-sensitive flake: on the connect-timeout path the migrator must release
+// its migration claim (state.migrating = false) BEFORE it closes the failed
+// replacement, so the replacement's close is the definitive "migration
+// released" signal. The disarm otherwise ran in a defer AFTER the close,
+// leaving a window — observable under full-suite load — where the replacement
+// was closed but a follow-up migration was still refused as "already
+// migrating".
+//
+// Deterministic by construction: the fake transport's onClose hook samples
+// state.migrating at the exact instant of close. Disarm-before-close => false
+// at that instant; the deferred-only ordering => true.
+func TestApiWindowTransportMigrationDisarmsBeforeClosingReplacement(t *testing.T) {
+	client, _ := newApiMigrationTestClient(t)
+	old := newFakeWindowPlatformTransport(true)
+	next := newFakeWindowPlatformTransport(false)
+	settings := DefaultApiMultiClientGeneratorSettings()
+	settings.MigrateConnectTimeout = 25 * time.Millisecond
+	state := &apiWindowClientTransport{
+		current:  old,
+		settings: DefaultPlatformTransportSettings(),
+		auth:     ClientAuth{InstanceId: NewId()},
+	}
+	generator := &ApiMultiClientGenerator{
+		settings:   settings,
+		transports: map[*Client]*apiWindowClientTransport{client: state},
+		newPlatformTransport: func(
+			client *Client,
+			auth *ClientAuth,
+			settings *PlatformTransportSettings,
+		) apiWindowPlatformTransport {
+			return next
+		},
+	}
+
+	var migratingAtClose bool
+	next.onClose = func() {
+		generator.transportLock.Lock()
+		migratingAtClose = state.migrating
+		generator.transportLock.Unlock()
+	}
+
+	generator.MigrateClientTransport(client, nil, time.Now())
+	select {
+	case <-next.closed:
+	case <-time.After(time.Second):
+		t.Fatal("failed replacement was not closed at timeout")
+	}
+	if migratingAtClose {
+		t.Fatal("migration was still armed at the instant the replacement was closed: disarm must happen-before the close so the close is the definitive released signal")
 	}
 }

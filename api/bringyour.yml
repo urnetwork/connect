@@ -2034,31 +2034,13 @@ components:
           type: integer
         all_transfer_summary_rate:
           type: integer
-        all_packets_data:
-          type: object
-          description: yyyy-mm-dd to count
-          additionalProperties:
-            x-additionalPropertiesName: yyyy-mm-dd
-            type: integer
-        all_packets_summary:
-          type: integer
-        all_packets_summary_rate:
-          type: integer
         providers_data:
           type: object
           description: yyyy-mm-dd to count
           additionalProperties:
             x-additionalPropertiesName: yyyy-mm-dd
             type: integer
-        providers_superspeed_data:
-          type: object
-          description: yyyy-mm-dd to count
-          additionalProperties:
-            x-additionalPropertiesName: yyyy-mm-dd
-            type: integer
         providers_summary:
-          type: integer
-        providers_summary_superspeed:
           type: integer
         countries_data:
           type: object
@@ -2083,32 +2065,6 @@ components:
             x-additionalPropertiesName: yyyy-mm-dd
             type: integer
         cities_summary:
-          type: integer
-        extender_transfer_data:
-          type: object
-          description: yyyy-mm-dd to count
-          additionalProperties:
-            x-additionalPropertiesName: yyyy-mm-dd
-            type: integer
-        extender_transfer_summary:
-          type: integer
-        extender_transfer_summary_rate:
-          type: integer
-        extenders_data:
-          type: object
-          description: yyyy-mm-dd to count
-          additionalProperties:
-            x-additionalPropertiesName: yyyy-mm-dd
-            type: integer
-        extenders_superspeed_data:
-          type: object
-          description: yyyy-mm-dd to count
-          additionalProperties:
-            x-additionalPropertiesName: yyyy-mm-dd
-            type: integer
-        extenders_summary:
-          type: integer
-        extenders_summary_superspeed:
           type: integer
         networks_data:
           type: object

@@ -349,6 +349,19 @@ func TestWebRtcMessageRoundTrip(t *testing.T) {
 
 	settingsA := DefaultWebRtcSettings()
 	settingsB := DefaultWebRtcSettings()
+	settingsA.Log = NewNoopLogger()
+	settingsB.Log = NewNoopLogger()
+	// Hermetic same-host mode, like every other establishing test in this
+	// file (see the TestWebRtc comment): the default settings gather the
+	// multihomed interface cross-product and query live STUN servers, so
+	// establishment time depends on the host's interface population and WAN.
+	// That non-determinism failed this test at its full 45s deadline
+	// ("write 0: file already closed" — the conn never established) in a
+	// full-suite -race run.
+	settingsA.IceServerUrls = nil
+	settingsB.IceServerUrls = nil
+	settingsA.UseLoopbackOnlyIceInterfaces = true
+	settingsB.UseLoopbackOnlyIceInterfaces = true
 
 	signalPipeA := newSignalPipe(nil)
 	signalPipeB := newSignalPipe(nil)

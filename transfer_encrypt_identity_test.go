@@ -60,7 +60,7 @@ func runPeerIdentitiesEstablishedAndVerified(t *testing.T, encryptionControlUseC
 		s.ForwardBufferSettings.SequenceBufferSize = 0
 		s.ForwardBufferSettings.IdleTimeout = 1 * time.Second
 		s.ContractManagerSettings.LegacyCreateContract = false
-		s.EncryptionSettings.Encrypt = true
+		s.EncryptionSettings.Mode = EncryptionModeOpportunistic
 		s.EncryptionSettings.TlsTimeout = 30 * time.Second
 		s.EncryptionSettings.EncryptionControlUseCompanion = encryptionControlUseCompanion
 		return s

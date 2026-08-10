@@ -95,8 +95,27 @@ func NewClientSignalSender(client *Client) *ClientSignalSender {
 	}
 }
 
+// signalSendNonBlocking marks a signal send that originates on a receive
+// path (a peer's inbound signal producing a response). Per the receive
+// contract (CODESTYLE: receive callbacks must not block), such sends use
+// timeout 0 — enqueue if there is room, drop otherwise — instead of the
+// sender-context default of blocking for backpressure. A dropped response is
+// recovered by the signaling retry machinery (offer replay on
+// WaitingForSdpOffer, candidate re-flush, transport reconnect), while a
+// blocked receive path can wedge signal delivery for every peer.
+type signalSendNonBlocking struct{}
+
 func (self *ClientSignalSender) SendSignal(path TransferPath, signal *protocol.Frame, opts ...any) {
-	success := self.client.SendWithTimeout(signal, path.DestinationMask(), nil, -1, opts...)
+	timeout := time.Duration(-1)
+	sendOpts := make([]any, 0, len(opts))
+	for _, opt := range opts {
+		if _, ok := opt.(signalSendNonBlocking); ok {
+			timeout = 0
+			continue
+		}
+		sendOpts = append(sendOpts, opt)
+	}
+	success := self.client.SendWithTimeout(signal, path.DestinationMask(), nil, timeout, sendOpts...)
 	// a dropped signal wedges the p2p setup until the transport retry —
 	// always loud. The V(1) positive is the send-side half of the signal
 	// delivery trace (receive side: [signal]receive).
@@ -2790,6 +2809,21 @@ func (self *peerConn) receiveSignalFromPeer(
 	if signal == nil {
 		return nil
 	}
+	select {
+	case <-self.ctx.Done():
+		// A closed conn must treat late signals as a cheap no-op: the peer's
+		// candidates/answers for a dead association are meaningless (the
+		// outer transport recreates the conn, and fresh signals target the
+		// replacement), and feeding them forward reaches a closed pion
+		// agent — observed as a per-signal "the agent is closed" error loop
+		// filling the stall window of a wedged attempt. The manager
+		// deregisters a closed conn, but teardown is asynchronous: this
+		// guard covers the closed-but-still-registered window. Returning nil
+		// (not an error) keeps one dead conn from failing a batch that may
+		// also carry signals the caller handles for other purposes.
+		return nil
+	default:
+	}
 
 	self.signalLock.Lock()
 	toSend, flushLocalCandidates, immediateReconnect, fatal, err := self.receiveSignalFromPeerLocked(
@@ -2810,10 +2844,10 @@ func (self *peerConn) receiveSignalFromPeer(
 	// signalLock permits a synchronous answer/candidate response without a
 	// lock cycle while preserving transfer-client backpressure.
 	if len(toSend) != 0 {
-		self.sendSignals(toSend)
+		self.sendSignalsNonBlocking(toSend)
 	}
 	if flushLocalCandidates {
-		self.flushIceCandidates()
+		self.flushIceCandidatesNonBlocking()
 	}
 	if immediateReconnect {
 		self.log.V(1).Infof("[peerconn]waiting-for-offer after answer; requesting immediate reconnect\n")
@@ -3061,11 +3095,15 @@ func (self *peerConn) sendIceCandidate(candidate *webrtc.ICECandidate) {
 }
 
 func (self *peerConn) sendIceCandidates(candidates []*webrtc.ICECandidate) {
+	self.sendIceCandidatesWithOpts(candidates, false)
+}
+
+func (self *peerConn) sendIceCandidatesWithOpts(candidates []*webrtc.ICECandidate, nonBlocking bool) {
 	signals := make([]*protocol.ExchangeSignal, 0, min(len(candidates), maxIceCandidatesPerSignalFrame))
 	signalBytes := 0
 	flush := func() {
 		if len(signals) != 0 {
-			self.sendSignals(signals)
+			self.sendSignalsWithOpts(signals, false, nonBlocking)
 			signals = make([]*protocol.ExchangeSignal, 0, min(len(candidates), maxIceCandidatesPerSignalFrame))
 			signalBytes = 0
 		}
@@ -3097,6 +3135,16 @@ func (self *peerConn) sendIceCandidates(candidates []*webrtc.ICECandidate) {
 }
 
 func (self *peerConn) flushIceCandidates() {
+	self.flushIceCandidatesWithOpts(false)
+}
+
+// flushIceCandidatesNonBlocking is the receive-path variant: the flush send
+// uses timeout 0 (see signalSendNonBlocking).
+func (self *peerConn) flushIceCandidatesNonBlocking() {
+	self.flushIceCandidatesWithOpts(true)
+}
+
+func (self *peerConn) flushIceCandidatesWithOpts(nonBlocking bool) {
 	var toSend []*webrtc.ICECandidate
 	func() {
 		self.stateLock.Lock()
@@ -3109,7 +3157,7 @@ func (self *peerConn) flushIceCandidates() {
 	// share one destination. Send one protobuf frame instead of one transfer
 	// callback/frame per interface, cutting allocations and queue pressure
 	// without adding a timer or delaying late trickle candidates.
-	self.sendIceCandidates(toSend)
+	self.sendIceCandidatesWithOpts(toSend, nonBlocking)
 }
 
 // ImmediateReconnect returns a persistent one-shot channel that closes when
@@ -3254,10 +3302,20 @@ func (self *peerConn) sendSignal(signal *protocol.ExchangeSignal) {
 }
 
 func (self *peerConn) sendSignals(signalValues []*protocol.ExchangeSignal) {
-	self.sendSignalsWithReset(signalValues, false)
+	self.sendSignalsWithOpts(signalValues, false, false)
+}
+
+// sendSignalsNonBlocking is the receive-path variant: the send uses timeout 0
+// (see signalSendNonBlocking).
+func (self *peerConn) sendSignalsNonBlocking(signalValues []*protocol.ExchangeSignal) {
+	self.sendSignalsWithOpts(signalValues, false, true)
 }
 
 func (self *peerConn) sendSignalsWithReset(signalValues []*protocol.ExchangeSignal, resetSignals bool) {
+	self.sendSignalsWithOpts(signalValues, resetSignals, false)
+}
+
+func (self *peerConn) sendSignalsWithOpts(signalValues []*protocol.ExchangeSignal, resetSignals bool, nonBlocking bool) {
 	if len(signalValues) == 0 {
 		return
 	}
@@ -3296,6 +3354,9 @@ func (self *peerConn) sendSignalsWithReset(signalValues []*protocol.ExchangeSign
 	// candidate instead of pinning its Run goroutine and admission forever.
 	if self.ctx != nil {
 		opts = append(opts, Ctx(self.ctx))
+	}
+	if nonBlocking {
+		opts = append(opts, signalSendNonBlocking{})
 	}
 	self.signalSender.SendSignal(
 		DestinationId(self.key.PeerId).AddSource(self.sourceId),

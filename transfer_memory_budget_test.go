@@ -493,7 +493,7 @@ func newBudgetTestSender(ctx context.Context, sendBudget *TransferMemoryBudget, 
 	clientSettings.SendBufferSettings.MaxResendInterval = 300 * time.Second
 	// plaintext, so the one-way (withheld ack) wirings never depend on a
 	// handshake round trip
-	clientSettings.EncryptionSettings.Encrypt = false
+	clientSettings.EncryptionSettings.Mode = EncryptionModeOff
 	return NewClient(ctx, NewId(), NewNoContractClientOob(), clientSettings)
 }
 
@@ -501,7 +501,7 @@ func newBudgetTestSender(ctx context.Context, sendBudget *TransferMemoryBudget, 
 // return path so the receiver's acks drain the sender's resend queue.
 func attachBudgetTestPeer(ctx context.Context, sender *Client, withAcks bool, receiveCallback ReceiveFunction) *budgetTestPeer {
 	receiverSettings := DefaultClientSettings()
-	receiverSettings.EncryptionSettings.Encrypt = false
+	receiverSettings.EncryptionSettings.Mode = EncryptionModeOff
 	receiverClient := NewClient(ctx, NewId(), NewNoContractClientOob(), receiverSettings)
 
 	forwardRoute := make(chan []byte)

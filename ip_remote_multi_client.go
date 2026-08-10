@@ -159,10 +159,11 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		SendRetryTimeout: 2000 * time.Millisecond,
 		// while the window has no clients at all, poll for the first one
 		// quickly so the first packets leave moments after it lands
-		FormationPollTimeout:       200 * time.Millisecond,
-		PingWriteTimeout:           5 * time.Second,
-		CPingWriteTimeout:          15 * time.Second,
-		CPingMaxByteCountPerSecond: kib(32),
+		FormationPollTimeout:          200 * time.Millisecond,
+		EncryptionCapabilityPrefilter: true,
+		PingWriteTimeout:              5 * time.Second,
+		CPingWriteTimeout:             15 * time.Second,
+		CPingMaxByteCountPerSecond:    kib(32),
 		// the initial ping includes creating the transports and contract
 		// ease up the timeout until perf issues are fully resolved
 		PingTimeout:  30 * time.Second,
@@ -397,15 +398,24 @@ type MultiClientSettings struct {
 	// client was already usable. 0 falls back to SendRetryTimeout, the
 	// pre-change behavior. Ported as a concept from upstream main e05ecee's
 	// formation fast-poll.
-	FormationPollTimeout       time.Duration
-	PingWriteTimeout           time.Duration
-	CPingWriteTimeout          time.Duration
-	CPingMaxByteCountPerSecond ByteCount
-	PingTimeout                time.Duration
-	CPingTimeout               time.Duration
-	CPingRestTimeout           time.Duration
-	AckTimeout                 time.Duration
-	BlackholeTimeout           time.Duration
+	FormationPollTimeout time.Duration
+	// EncryptionCapabilityPrefilter, when true (default), fails a window
+	// candidate immediately when the local client requires encryption
+	// (`EncryptionModeRequired`) and the platform's out-of-band key API
+	// reports the candidate has never published a client identity key — such
+	// a peer can never complete the identity-verified handshake, so the ping
+	// would only wait out `PingTimeout` against it. Fetch errors leave the
+	// candidate to the ordinary ping evaluation: the prefilter only
+	// accelerates certain failure, it never admits a candidate.
+	EncryptionCapabilityPrefilter bool
+	PingWriteTimeout              time.Duration
+	CPingWriteTimeout             time.Duration
+	CPingMaxByteCountPerSecond    ByteCount
+	PingTimeout                   time.Duration
+	CPingTimeout                  time.Duration
+	CPingRestTimeout              time.Duration
+	AckTimeout                    time.Duration
+	BlackholeTimeout              time.Duration
 	// BlackholeReceiveTimeout bounds the weaker of the two blackhole signals:
 	// the provider is acknowledging our sends, so it is demonstrably alive,
 	// but nothing has come back from the destination. That is ambiguous -- a
@@ -8135,6 +8145,35 @@ func (self *multiClientWindow) expand(
 					self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed, args.Destination.Tail(), args.Location)
 				}
 
+				// EncryptionCapabilityPrefilter: under EncryptionModeRequired
+				// a candidate that has never published a client identity key
+				// can never complete the identity-verified handshake — fail it
+				// as soon as the platform says so instead of letting the ping
+				// wait out PingTimeout against it (the ping itself is
+				// entry-gated on the cipher under Required, so against such a
+				// peer it can only time out). Runs concurrently with the ping,
+				// parented on pingDone so a resolved ping moots the fetch.
+				if self.settings.EncryptionCapabilityPrefilter {
+					if fetch, mode := client.EncryptionCapabilityFetcher(); fetch != nil && mode == EncryptionModeRequired {
+						go HandleError(func() {
+							fetchCtx, fetchCancel := context.WithTimeout(pingDone, self.settings.PingTimeout)
+							defer fetchCancel()
+							publicKey, fetchErr := fetch(fetchCtx)
+							if rejectCandidateMissingEncryptionKey(mode, publicKey, fetchErr) {
+								if self.log.V(1).Enabled() {
+									self.log.Infof(
+										"[multi]expand prefilter: %s has no published identity key — cannot seal under required encryption, failing candidate\n",
+										args.Destination.Tail(),
+									)
+								}
+								mutex.Lock()
+								defer mutex.Unlock()
+								fail()
+							}
+						}, client.Cancel)
+					}
+				}
+
 				go HandleError(func() {
 					mutex.Lock()
 					defer mutex.Unlock()
@@ -9147,13 +9186,17 @@ func newMultiClientChannel(
 	// initial ping; the platform's NetworkPeers batch may arrive later.
 	clientSettings.DefaultTransferOpts.NetworkPeer = args.NetworkPeerDestination
 	if performanceProfile != nil && performanceProfile.PostQuantumEncryption {
-		// pqe: opportunistic per-peer e2e sessions (post-quantum key
-		// exchange). A provider without session support falls back to
-		// plaintext at this layer.
+		// pqe: the user asked for post-quantum e2e, so this consumer runs
+		// fail-closed (EncryptionModeRequired) — application traffic to a
+		// destination that cannot establish a session is held and retried, never
+		// sent in the clear. A provider that lacks session support therefore
+		// carries no application data for this client rather than downgrading it
+		// to plaintext the operator could read. (The provider side runs
+		// Opportunistic so it keeps serving non-pqe consumers.)
 		if clientSettings.EncryptionSettings == nil {
 			clientSettings.EncryptionSettings = DefaultEncryptionSettings()
 		}
-		clientSettings.EncryptionSettings.Encrypt = true
+		clientSettings.EncryptionSettings.Mode = EncryptionModeRequired
 	}
 
 	client, err := generator.NewClient(
@@ -9274,6 +9317,42 @@ func (self *multiClientChannel) ClientId() Id {
 
 func (self *multiClientChannel) IsP2pOnly() bool {
 	return self.args.MultiClientGeneratorClientArgs.P2pOnly
+}
+
+// rejectCandidateMissingEncryptionKey decides the
+// EncryptionCapabilityPrefilter outcome for one out-of-band key fetch: reject
+// only on the definitive "peer has published no key" answer under
+// `EncryptionModeRequired`. Fetch errors (platform unreachable) and
+// non-Required modes never reject — the prefilter only accelerates a failure
+// the ping evaluation would reach anyway, it never admits a candidate.
+func rejectCandidateMissingEncryptionKey(mode EncryptionMode, publicKey []byte, fetchErr error) bool {
+	return mode == EncryptionModeRequired && fetchErr == nil && len(publicKey) == 0
+}
+
+// EncryptionCapabilityFetcher returns a one-shot fetcher for the channel
+// destination's published client identity key, plus the channel client's
+// encryption mode, for the window's EncryptionCapabilityPrefilter. The
+// fetcher is minted from the client's configured out-of-band key fetcher
+// factory (`EncryptionSettings.NewPeerClientPublicKeyFetcher`); nil when no
+// factory is configured, the channel has no destination, or the channel is a
+// bare fixture without an underlying client.
+func (self *multiClientChannel) EncryptionCapabilityFetcher() (func(ctx context.Context) ([]byte, error), EncryptionMode) {
+	if self.client == nil || self.args == nil {
+		return nil, EncryptionModeOff
+	}
+	settings := self.client.EncryptionSessionManager().Settings()
+	if settings == nil {
+		return nil, EncryptionModeOff
+	}
+	mode := settings.Mode
+	if settings.NewPeerClientPublicKeyFetcher == nil {
+		return nil, mode
+	}
+	destinationId := self.args.Destination.Tail()
+	if destinationId == (Id{}) {
+		return nil, mode
+	}
+	return settings.NewPeerClientPublicKeyFetcher(destinationId), mode
 }
 
 func (self *multiClientChannel) Tier() int {

@@ -390,7 +390,7 @@ func TestIdentityProofResendsDuringEstablishment(t *testing.T) {
 		s.ForwardBufferSettings.SequenceBufferSize = 0
 		s.ForwardBufferSettings.IdleTimeout = 1 * time.Second
 		s.ContractManagerSettings.LegacyCreateContract = false
-		s.EncryptionSettings.Encrypt = true
+		s.EncryptionSettings.Mode = EncryptionModeOpportunistic
 		s.EncryptionSettings.TlsTimeout = 30 * time.Second
 		s.EncryptionSettings.EncryptionControlUseCompanion = false
 		// a fast cadence against a much longer assertion window, so the test

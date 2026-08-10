@@ -746,9 +746,9 @@ func (self *conditioner) run(in chan []byte, out chan []byte) {
 func applyTestEncryptionSettings(clientSettings *ClientSettings, encMode encryptionMode) {
 	switch encMode {
 	case encryptionModeOff:
-		clientSettings.EncryptionSettings.Encrypt = false
+		clientSettings.EncryptionSettings.Mode = EncryptionModeOff
 	case encryptionModeOn, encryptionModeOnAllowFallback:
-		clientSettings.EncryptionSettings.Encrypt = true
+		clientSettings.EncryptionSettings.Mode = EncryptionModeOpportunistic
 		clientSettings.EncryptionSettings.TlsTimeout = 60 * time.Second
 	case encryptionModeFallback:
 		// both sides enable encryption with a timeout too tight for the
@@ -756,7 +756,7 @@ func applyTestEncryptionSettings(clientSettings *ClientSettings, encMode encrypt
 		// and all traffic flows in plaintext. (The peer-without-encryption
 		// fallback — Encrypt=false on one side, an inert session manager —
 		// is pinned by TestSendReceiveEncryptedPeerWithoutEncryption.)
-		clientSettings.EncryptionSettings.Encrypt = true
+		clientSettings.EncryptionSettings.Mode = EncryptionModeOpportunistic
 		clientSettings.EncryptionSettings.TlsTimeout = 50 * time.Millisecond
 	}
 }

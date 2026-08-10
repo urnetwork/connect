@@ -28,10 +28,23 @@ func newTestSessionForIdentityProof(t *testing.T) (
 	peerPriv ed25519.PrivateKey,
 	cleanup func(),
 ) {
+	return newTestSessionForIdentityProofWithMode(t, EncryptionModeOpportunistic)
+}
+
+// newTestSessionForIdentityProofWithMode is newTestSessionForIdentityProof
+// with the encryption mode selectable, for tests that pin mode-dependent
+// behavior (e.g. the EncryptionModeRequired rekey cipher continuity).
+func newTestSessionForIdentityProofWithMode(t *testing.T, mode EncryptionMode) (
+	sess *peerEncryptionSession,
+	localKeyManager *ClientKeyManager,
+	peerId Id,
+	peerPriv ed25519.PrivateKey,
+	cleanup func(),
+) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	settings := DefaultClientSettings()
-	settings.EncryptionSettings.Encrypt = true
+	settings.EncryptionSettings.Mode = mode
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 
 	var err error
@@ -105,6 +118,254 @@ func TestPeerSessionCipherGatedOnIdentityVerified(t *testing.T) {
 	if sess.Cipher() == nil {
 		t.Fatal("Cipher should be non-nil once the epoch is established")
 	}
+}
+
+// TestCipherContinuityDuringRekey pins the rekey rule in `Cipher()` for BOTH
+// modes: while a replacement handshake is in flight, the established epoch's
+// cipher keeps serving — a rekey never reopens a plaintext window. (The
+// receiver retains the outgoing epoch in `decryptCiphers` through the swap.)
+// The historical Opportunistic behavior — nil during rekey, falling back to
+// plaintext so the contract-open ride-along opened in the clear — is
+// deliberately gone: the contract-open is now pinned ForceUnwrapped at queue
+// time instead, and this test fails if the plaintext fallback ever returns.
+func TestCipherContinuityDuringRekey(t *testing.T) {
+	for _, mode := range []EncryptionMode{
+		EncryptionModeOpportunistic,
+		EncryptionModeRequired,
+	} {
+		func() {
+			sess, _, _, _, cleanup := newTestSessionForIdentityProofWithMode(t, mode)
+			defer cleanup()
+
+			// Establish the injected epoch, as a completed identity proof would.
+			sess.stateLock.Lock()
+			sess.epoch.peerIdentityVerified = true
+			sess.markEstablishedWithLock(sess.epoch)
+			sess.stateLock.Unlock()
+			AssertEqual(t, true, sess.Cipher() != nil)
+
+			// Inject a fresh in-flight epoch: a rekey in progress
+			// (epoch != establishedEpoch, establishment not done).
+			epochCtx, epochCancel := context.WithCancel(context.Background())
+			defer epochCancel()
+			sess.stateLock.Lock()
+			sess.epoch = &tlsHandshakeEpoch{
+				ctx:               epochCtx,
+				cancel:            epochCancel,
+				handshakeDone:     make(chan struct{}),
+				establishmentDone: make(chan struct{}),
+			}
+			sess.stateLock.Unlock()
+
+			if sess.Cipher() == nil {
+				t.Fatalf("mode %v: cipher must keep serving during an in-flight rekey", mode)
+			}
+		}()
+	}
+}
+
+// TestRequiredSendRefusalTypedErrorAndEvent pins the EncryptionModeRequired
+// send-refusal surface, deterministically (no peer, no transports —
+// establishment is impossible, so gate outcomes do not race a handshake):
+//
+//   - a non-blocking send (timeout 0) and a bounded send both refuse with
+//     ErrEncryptionRequiredNotEstablished (distinguishable via errors.Is from
+//     transport backpressure's plain `false, nil`),
+//   - EncryptionEventRequiredSendBlocked fires exactly once for the peer
+//     (per-session dedup),
+//   - the same non-blocking send under Opportunistic enqueues (plaintext) —
+//     pinning that the refusal is Required-only.
+func TestRequiredSendRefusalTypedErrorAndEvent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	settings := DefaultClientSettings()
+	settings.EncryptionSettings.Mode = EncryptionModeRequired
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+	defer client.Cancel()
+
+	events := make(chan *EncryptionEvent, 16)
+	unsub := client.EncryptionSessionManager().AddEncryptionEventCallback(func(event *EncryptionEvent) {
+		events <- event
+	})
+	defer unsub()
+
+	peerId := NewId()
+	frame, err := ToFrame(&protocol.SimpleMessage{Content: "held"}, DefaultProtocolVersion)
+	AssertEqual(t, nil, err)
+
+	// non-blocking refusal with the typed error
+	success, sendErr := client.SendWithTimeoutDetailed(frame, DestinationId(peerId), func(error) {}, 0)
+	AssertEqual(t, false, success)
+	AssertEqual(t, true, errors.Is(sendErr, ErrEncryptionRequiredNotEstablished))
+
+	// bounded refusal: the budget expires without establishment
+	success, sendErr = client.SendWithTimeoutDetailed(frame, DestinationId(peerId), func(error) {}, 100*time.Millisecond)
+	AssertEqual(t, false, success)
+	AssertEqual(t, true, errors.Is(sendErr, ErrEncryptionRequiredNotEstablished))
+
+	// exactly one blocked event despite two refusals (per-session dedup);
+	// both notifications were emitted synchronously by the refusals above
+	blocked := 0
+	for {
+		drained := false
+		select {
+		case event := <-events:
+			if event.Type == EncryptionEventRequiredSendBlocked {
+				AssertEqual(t, peerId, event.PeerId)
+				blocked += 1
+			}
+		default:
+			drained = true
+		}
+		if drained {
+			break
+		}
+	}
+	AssertEqual(t, 1, blocked)
+
+	// Opportunistic control: the identical non-blocking send enqueues
+	oppSettings := DefaultClientSettings()
+	oppSettings.EncryptionSettings.Mode = EncryptionModeOpportunistic
+	oppClient := NewClient(ctx, NewId(), NewNoContractClientOob(), oppSettings)
+	defer oppClient.Cancel()
+	oppFrame, err := ToFrame(&protocol.SimpleMessage{Content: "plain"}, DefaultProtocolVersion)
+	AssertEqual(t, nil, err)
+	success, sendErr = oppClient.SendWithTimeoutDetailed(oppFrame, DestinationId(peerId), func(error) {}, 0)
+	AssertEqual(t, true, success)
+	AssertEqual(t, nil, sendErr)
+}
+
+// TestEncryptionEventsAndStates pins the observability surface with injected
+// epochs (no real TLS, fully deterministic): the Sealed / IdentityFailed /
+// EstablishFailed events fire on their transitions — synchronously, so every
+// assertion drains an already-delivered buffered channel — and
+// `PeerEncryptionStates` aggregates Establishing/Sealed/KeyExchange/
+// FailureReason per peer.
+func TestEncryptionEventsAndStates(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	settings := DefaultClientSettings()
+	settings.EncryptionSettings.Mode = EncryptionModeOpportunistic
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+	defer client.Cancel()
+
+	localKeyManager, err := NewClientKeyManager(ctx, client)
+	AssertEqual(t, nil, err)
+	manager := NewEncryptionSessionManager(ctx, client, localKeyManager, settings.EncryptionSettings)
+
+	events := make(chan *EncryptionEvent, 64)
+	unsub := manager.AddEncryptionEventCallback(func(event *EncryptionEvent) {
+		events <- event
+	})
+	defer unsub()
+
+	drainEvents := func() []*EncryptionEvent {
+		var out []*EncryptionEvent
+		for {
+			select {
+			case event := <-events:
+				out = append(out, event)
+			default:
+				return out
+			}
+		}
+	}
+	countType := func(all []*EncryptionEvent, eventType EncryptionEventType, peerId Id) int {
+		n := 0
+		for _, event := range all {
+			if event.Type == eventType && event.PeerId == peerId {
+				n += 1
+			}
+		}
+		return n
+	}
+	stateForPeer := func(peerId Id) *PeerEncryptionState {
+		for _, state := range manager.PeerEncryptionStates() {
+			if state.PeerId == peerId {
+				return state
+			}
+		}
+		return nil
+	}
+	injectEpoch := func(sess *peerEncryptionSession) {
+		exporter := make([]byte, sequenceTlsIdentityProofLength)
+		_, err := rand.Read(exporter)
+		AssertEqual(t, nil, err)
+		epochCtx, epochCancel := context.WithCancel(ctx)
+		sess.stateLock.Lock()
+		sess.epoch = &tlsHandshakeEpoch{
+			ctx:               epochCtx,
+			cancel:            epochCancel,
+			handshakeDone:     make(chan struct{}),
+			establishmentDone: make(chan struct{}),
+			tlsExporter:       exporter,
+			derivedTlsCipher:  &sequenceCipher{}, // non-nil sentinel; never used for crypto here
+			negotiatedCurveId: tls.X25519MLKEM768,
+		}
+		sess.stateLock.Unlock()
+	}
+
+	// --- Sealed: valid identity proof on a registered session
+	sealPeerId := NewId()
+	sealSess := manager.Acquire(sealPeerId, sequenceTlsRoleServer, false)
+	if sealSess == nil {
+		t.Fatal("expected a session")
+	}
+	defer sealSess.Release()
+	injectEpoch(sealSess)
+
+	state := stateForPeer(sealPeerId)
+	if state == nil {
+		t.Fatal("expected a state for the registered session")
+	}
+	AssertEqual(t, false, state.Sealed)
+	AssertEqual(t, true, state.Establishing)
+
+	_, sealPeerPriv, err := ed25519.GenerateKey(rand.Reader)
+	AssertEqual(t, nil, err)
+	sealSess.SetPeerClientPublicKey(sealPeerPriv.Public().(ed25519.PublicKey))
+	sealSess.receivePeerIdentityProof(ed25519.Sign(sealPeerPriv, sealSess.epoch.tlsExporter))
+
+	all := drainEvents()
+	AssertEqual(t, 1, countType(all, EncryptionEventSealed, sealPeerId))
+	state = stateForPeer(sealPeerId)
+	AssertEqual(t, true, state.Sealed)
+	AssertEqual(t, false, state.Establishing)
+	AssertEqual(t, tls.X25519MLKEM768, state.KeyExchange)
+	AssertEqual(t, "", state.FailureReason)
+
+	// --- IdentityFailed: proof signed by the wrong key
+	failPeerId := NewId()
+	failSess := manager.Acquire(failPeerId, sequenceTlsRoleServer, false)
+	defer failSess.Release()
+	injectEpoch(failSess)
+	rightPub, _, err := ed25519.GenerateKey(rand.Reader)
+	AssertEqual(t, nil, err)
+	_, wrongPriv, err := ed25519.GenerateKey(rand.Reader)
+	AssertEqual(t, nil, err)
+	failSess.SetPeerClientPublicKey(rightPub)
+	failSess.receivePeerIdentityProof(ed25519.Sign(wrongPriv, failSess.epoch.tlsExporter))
+
+	all = drainEvents()
+	AssertEqual(t, 1, countType(all, EncryptionEventIdentityFailed, failPeerId))
+	state = stateForPeer(failPeerId)
+	AssertEqual(t, false, state.Sealed)
+	AssertEqual(t, "peer identity proof verification failed", state.FailureReason)
+
+	// --- EstablishFailed: handshake completes with an error
+	estPeerId := NewId()
+	estSess := manager.Acquire(estPeerId, sequenceTlsRoleServer, false)
+	defer estSess.Release()
+	injectEpoch(estSess)
+	estSess.completeHandshake(estSess.epoch, errors.New("boom"))
+
+	all = drainEvents()
+	AssertEqual(t, 1, countType(all, EncryptionEventEstablishFailed, estPeerId))
+	state = stateForPeer(estPeerId)
+	AssertEqual(t, false, state.Sealed)
+	AssertEqual(t, "boom", state.FailureReason)
 }
 
 // TestPeerSessionIdentityProofValid covers the happy path: peer key
@@ -287,7 +548,7 @@ func TestIsAwaitingClientFinishedClientRole(t *testing.T) {
 	defer cancel()
 
 	settings := DefaultClientSettings()
-	settings.EncryptionSettings.Encrypt = true
+	settings.EncryptionSettings.Mode = EncryptionModeOpportunistic
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 	defer client.Cancel()
 
@@ -410,7 +671,7 @@ func TestPeerSessionIdentityVerifiedOnProof(t *testing.T) {
 func newTestEncryptionSession(t *testing.T, role sequenceTlsRole) (*peerEncryptionSession, func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 	settings := DefaultClientSettings()
-	settings.EncryptionSettings.Encrypt = true
+	settings.EncryptionSettings.Mode = EncryptionModeOpportunistic
 	settings.EncryptionSettings.TlsTimeout = 2 * time.Second
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 	keyManager, err := NewClientKeyManager(ctx, client)
@@ -816,7 +1077,7 @@ func TestFailedZeroReferenceSessionIsReapedWithoutIdlePoll(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	settings := DefaultClientSettings()
-	settings.EncryptionSettings.Encrypt = true
+	settings.EncryptionSettings.Mode = EncryptionModeOpportunistic
 	settings.EncryptionSettings.IdleTimeout = 0
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 	defer client.Cancel()
@@ -841,7 +1102,7 @@ func TestSuccessfulZeroReferenceSessionIsReapedWithoutIdlePoll(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	settings := DefaultClientSettings()
-	settings.EncryptionSettings.Encrypt = true
+	settings.EncryptionSettings.Mode = EncryptionModeOpportunistic
 	settings.EncryptionSettings.IdleTimeout = 0
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 	defer client.Cancel()
@@ -888,7 +1149,7 @@ func TestPositiveIdleSessionReapsAtReleaseRelativeDeadline(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	settings := DefaultClientSettings()
-	settings.EncryptionSettings.Encrypt = true
+	settings.EncryptionSettings.Mode = EncryptionModeOpportunistic
 	settings.EncryptionSettings.IdleTimeout = 400 * time.Millisecond
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 	defer client.Cancel()
@@ -1006,7 +1267,7 @@ func TestReleasedSessionRemovedFromManager(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	settings := DefaultClientSettings()
-	settings.EncryptionSettings.Encrypt = true
+	settings.EncryptionSettings.Mode = EncryptionModeOpportunistic
 	settings.EncryptionSettings.TlsTimeout = 2 * time.Second
 	// Short idle timeout so the reap is observable quickly. The session is kept
 	// registered for this long after its last reference drops, then the Run
@@ -1073,7 +1334,7 @@ func TestAcquireForSendRestartPolicy(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		settings := DefaultClientSettings()
-		settings.EncryptionSettings.Encrypt = true
+		settings.EncryptionSettings.Mode = EncryptionModeOpportunistic
 		settings.EncryptionSettings.TlsTimeout = 2 * time.Second
 		client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 		defer client.Cancel()
@@ -1136,7 +1397,7 @@ func TestEncryptedControlCarrierMirrorsForceStream(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	settings := DefaultClientSettings()
-	settings.EncryptionSettings.Encrypt = true
+	settings.EncryptionSettings.Mode = EncryptionModeOpportunistic
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 	defer client.Cancel()
 

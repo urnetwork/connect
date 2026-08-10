@@ -679,6 +679,20 @@ func (self *ApiMultiClientGenerator) MigrateClientTransport(
 			case <-connectTimer.C:
 				// Keep the old transport: it is still a valid route, and the
 				// server's drain excuse/reconnect path remains the backstop.
+				// Disarm BEFORE closing the replacement so the close is the
+				// definitive "migration released" signal: the deferred disarm
+				// runs after this return, so an observer gating on the
+				// replacement's close (or a follow-up MigrateClientTransport)
+				// would otherwise see migrating still armed in the window
+				// between the close and the return. The defer re-clears
+				// idempotently.
+				func() {
+					self.transportLock.Lock()
+					defer self.transportLock.Unlock()
+					if self.transports[client] == state {
+						state.migrating = false
+					}
+				}()
 				next.Close()
 				return
 			}

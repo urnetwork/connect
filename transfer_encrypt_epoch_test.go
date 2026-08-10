@@ -268,7 +268,7 @@ func TestOptimisticIdentityProofCarriesEpoch(t *testing.T) {
 	defer cancel()
 
 	settings := DefaultClientSettings()
-	settings.EncryptionSettings.Encrypt = true
+	settings.EncryptionSettings.Mode = EncryptionModeOpportunistic
 	settings.EncryptionSettings.TlsTimeout = 5 * time.Second
 
 	peerId := NewId()

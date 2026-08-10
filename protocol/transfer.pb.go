@@ -278,6 +278,30 @@ const (
 	// long-lived identity, defeating an active MITM whose substituted
 	// TLS cert would produce a different exporter on each leg.
 	EncryptedControlType_EncryptedControlIdentityProof EncryptedControlType = 2
+	// Undecryptable-wrap feedback (changes 2026-08): the receiver of a wrapped
+	// frame that no local session/epoch can open sends this (no payload,
+	// rate-limited) back to the sealer. `session_role` is the NACKING
+	// session's role per the envelope convention, so the sealer routes it to
+	// its complement (client) session; `epoch_id` is the epoch the nacking
+	// side can currently read, unset when it has none (e.g. a process restart
+	// that lost the responder session).
+	//
+	// The sealer acts ONLY when the nacked epoch differs from its own
+	// established epoch — a nack echoing its current epoch means the peer can
+	// read it (the failed unwrap was corruption in flight), and is ignored.
+	// On genuine desync the sealer DEMOTES the dead epochs (the peer provably
+	// cannot read them) and re-handshakes; each mode's own contract then
+	// recovers the flow: Opportunistic resends re-wrap as plaintext (its
+	// fail-open baseline; a forged nack can force this rate-limited window,
+	// which is within opportunistic's threat model), Required holds
+	// application data at the entry gate until the fresh epoch seals (a
+	// forged nack costs a rate-limited re-handshake, never plaintext).
+	// Without this signal the sealer keeps wrapping under the dead epoch and
+	// an active flow stalls for the full AckTimeout against a peer that lost
+	// session state — and rekey continuity means even the lifecycle recovery
+	// re-wedges (the receiver cannot sequence past frames it cannot read).
+	// Unset/unknown on legacy peers: dropped, keeping timeout recovery.
+	EncryptedControlType_EncryptedControlUnknownWrapNack EncryptedControlType = 3
 )
 
 // Enum value maps for EncryptedControlType.
@@ -286,11 +310,13 @@ var (
 		0: "EncryptedControlNone",
 		1: "EncryptedControlHandshake",
 		2: "EncryptedControlIdentityProof",
+		3: "EncryptedControlUnknownWrapNack",
 	}
 	EncryptedControlType_value = map[string]int32{
-		"EncryptedControlNone":          0,
-		"EncryptedControlHandshake":     1,
-		"EncryptedControlIdentityProof": 2,
+		"EncryptedControlNone":            0,
+		"EncryptedControlHandshake":       1,
+		"EncryptedControlIdentityProof":   2,
+		"EncryptedControlUnknownWrapNack": 3,
 	}
 )
 
@@ -2728,11 +2754,12 @@ const file_transfer_proto_rawDesc = "" +
 	"\x13InsufficientBalance\x10\x01\x12\t\n" +
 	"\x05Setup\x10\x02\x12\t\n" +
 	"\x05Trust\x10\x03\x12\v\n" +
-	"\aInvalid\x10\x04*r\n" +
+	"\aInvalid\x10\x04*\x97\x01\n" +
 	"\x14EncryptedControlType\x12\x18\n" +
 	"\x14EncryptedControlNone\x10\x00\x12\x1d\n" +
 	"\x19EncryptedControlHandshake\x10\x01\x12!\n" +
-	"\x1dEncryptedControlIdentityProof\x10\x02B'Z%github.com/urnetwork/connect/protocolb\x06proto3"
+	"\x1dEncryptedControlIdentityProof\x10\x02\x12#\n" +
+	"\x1fEncryptedControlUnknownWrapNack\x10\x03B'Z%github.com/urnetwork/connect/protocolb\x06proto3"
 
 var (
 	file_transfer_proto_rawDescOnce sync.Once

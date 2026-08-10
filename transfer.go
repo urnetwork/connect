@@ -234,10 +234,11 @@ func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings
 		AckTimeout:       60 * time.Second,
 		IdleTimeout:      300 * time.Second,
 		// pause on resend for selectively acked messaged
-		SelectiveAckTimeout: 60 * time.Second,
-		SequenceBufferSize:  bufferSize,
-		AckBufferSize:       bufferSize,
-		MinMessageByteCount: ByteCount(1),
+		SelectiveAckTimeout:      60 * time.Second,
+		SequenceBufferSize:       bufferSize,
+		AckBufferSize:            bufferSize,
+		MinMessageByteCount:      ByteCount(1),
+		ContractWaitLogThreshold: 50 * time.Millisecond,
 		// this includes transport reconnections
 		WriteTimeout: 15 * time.Second,
 		// per send sequence (per peer), so scaled by the memory budget.
@@ -1579,6 +1580,20 @@ func (self *Client) run() {
 					if self.log.V(1).Enabled() {
 						self.log.Infof("[cr]unwrap err = %s\n", err)
 					}
+					// event-driven desync recovery: tell the sealer no local
+					// session could open this wrap so it re-handshakes now
+					// instead of resending into the void until its sequence
+					// lifecycle recovers (rate-limited; requires the role
+					// hint to pin the session — anonymous wraps keep the
+					// timeout path). See EncryptedControlUnknownWrapNack.
+					if senderRole, ok := sequenceTlsRoleFromProtobuf(transferFrame.GetSessionRole()); ok {
+						nackCompanion := false
+						if transferFrame.SessionCompanion != nil {
+							nackCompanion = *transferFrame.SessionCompanion
+						}
+						self.encryptionSessionManager.NotifyUndecryptableWrap(
+							path.SourceId, senderRole, nackCompanion)
+					}
 					inboundDecodedTransferFrames.put(decodedFrame)
 					MessagePoolReturn(transferFrameBytes)
 					continue
@@ -2020,6 +2035,12 @@ type SendBufferSettings struct {
 
 	MinMessageByteCount ByteCount
 
+	// ContractWaitLogThreshold is the contract-acquisition wait above which
+	// the wait is logged. Deliberately well under a second: contract
+	// acquisition blocks the send sequence, so a few hundred ms of it would
+	// dominate every request while never appearing in a log.
+	ContractWaitLogThreshold time.Duration
+
 	WriteTimeout time.Duration
 
 	ResendQueueMaxByteCount ByteCount
@@ -2278,6 +2299,12 @@ func (self *SendBuffer) Pack(sendPack *SendPack, timeout time.Duration) (bool, e
 		if success, err = sendSequence.Pack(sendPack, timeout); err == nil {
 			return success, nil
 		}
+		if errors.Is(err, ErrEncryptionRequiredNotEstablished) {
+			// Not a sequence problem: the Required entry gate refused the
+			// send. Retrying on a recreated sequence would wait the same
+			// budget again against the same unestablished session.
+			return false, err
+		}
 		// sequence closed
 	}
 	return success, err
@@ -2487,11 +2514,6 @@ func (self *SendBuffer) Flush() {
 	}
 }
 
-// contractWaitLogThreshold is deliberately well under a second. Contract
-// acquisition blocks the send sequence, so a few hundred ms of it would
-// dominate every request while never appearing in a log.
-const contractWaitLogThreshold = 50 * time.Millisecond
-
 type SendSequence struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -2692,6 +2714,82 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 		return false, errors.New("Done.")
 	}
 	defer self.idleCondition.UpdateClose()
+
+	// Fail-closed entry gate (EncryptionModeRequired): an application pack does
+	// not enter the sequence until the per-peer cipher is established. The gate
+	// must run here — before a sequence number is assigned — because the
+	// client-role handshake rides this same sequence
+	// (`SendBuffer.SendEncryptedControl`): holding or dropping an
+	// already-sequenced plaintext frame leaves a gap in the strictly-ordered
+	// receive side, and the ClientHello queued behind the gap is never
+	// delivered (the optimistic receive path deliberately skips initial
+	// ClientHellos), deadlocking the very handshake that would clear the gate.
+	// At entry, handshake controls (ForceUnwrapped) pass freely and claim the
+	// first sequence numbers; application data waits within the caller's
+	// timeout budget and is refused — unsent, never plaintext — if
+	// establishment outlasts the budget. Holding the idle condition open while
+	// waiting keeps the sequence (and the session it references) alive through
+	// the establishment it is waiting on.
+	if !sendPack.ForceUnwrapped && self.session != nil && self.session.RequireEncryption() {
+		enterTime := time.Now()
+		blockedNotified := false
+		for self.session.Cipher() == nil {
+			if timeout == 0 {
+				// non-blocking contract: refuse rather than wait. The typed
+				// error lets callers distinguish "encryption not established"
+				// from transport backpressure (`false, nil`).
+				self.session.NotifyRequiredSendBlocked(
+					"application send refused: session not established",
+				)
+				return false, ErrEncryptionRequiredNotEstablished
+			}
+			if 0 < timeout && timeout <= time.Since(enterTime) {
+				self.session.NotifyRequiredSendBlocked(fmt.Sprintf(
+					"application send refused: session not established within %s",
+					timeout,
+				))
+				return false, ErrEncryptionRequiredNotEstablished
+			}
+			// A wait that outlives the establishment bound is surfaced even
+			// though the caller keeps waiting (e.g. an infinite-timeout Send):
+			// past TlsTimeout the establishment attempts are failing and
+			// retrying on cooldowns, which an operator watching events should
+			// see without waiting for the caller to give up.
+			if tlsTimeout := self.session.TlsTimeoutSetting(); !blockedNotified &&
+				0 < tlsTimeout && tlsTimeout <= time.Since(enterTime) {
+				blockedNotified = true
+				self.session.NotifyRequiredSendBlocked(fmt.Sprintf(
+					"application send waiting past establishment bound %s",
+					tlsTimeout,
+				))
+			}
+			// A waiting send must also drive re-establishment: the parked Pack
+			// holds the idle condition open, so the sequence never idles out
+			// and `AcquireForSend` (the only other restart trigger) never runs
+			// again. Without this nudge a failed first epoch would leave the
+			// send parked forever with nothing retrying the handshake. The
+			// restart is internally guarded — a no-op while an establishment
+			// is in flight or the initial-retry cooldown holds — and only the
+			// client role may initiate (the server role follows the peer's
+			// ClientHello).
+			if self.encryptionRole == sequenceTlsRoleClient {
+				self.session.restartHandshake()
+			}
+			select {
+			case <-sendPack.Ctx.Done():
+				return false, errors.New("Done.")
+			case <-self.ctx.Done():
+				return false, errors.New("Done.")
+			case <-time.After(self.session.RequiredCipherPollInterval()):
+				// re-check the cipher; establishment is bounded by TlsTimeout
+			}
+		}
+		if 0 < timeout {
+			// spend the remaining budget on the enqueue; a fully consumed
+			// budget degrades to the non-blocking fast path below
+			timeout = max(time.Duration(0), timeout-time.Since(enterTime))
+		}
+	}
 
 	// fast path without arming a timer
 	select {
@@ -3258,10 +3356,22 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 			if nextSendContract.update(0) && nextSendContract.update(messageByteCount) {
 				self.setContract(nextSendContract)
 
-				// append the contract to the sequence
+				// Append the contract to the sequence. The contract-open
+				// ride-along carries only the contract frame — no application
+				// payload — so pre-cipher it is pinned plaintext
+				// (ForceUnwrapped, sticky across resends like the handshake
+				// controls): under EncryptionModeRequired the fail-closed
+				// write path would otherwise refuse it, and a refused open
+				// gaps the sequence ahead of the handshake controls and
+				// wedges establishment. The pin also keeps a pre-cipher open
+				// legible on resend after the local cipher comes up while the
+				// peer's has not (the EC-frame rationale). Once the cipher is
+				// up the open pack is queued unpinned and wraps normally,
+				// re-sealed per write like any other frame.
+				forceUnwrapped := self.session != nil && self.session.Cipher() == nil
 				self.sendWithSetContract(nil, func(error) {
 					self.setContractAcked(nextSendContract, true)
-				}, true, true, false)
+				}, true, true, forceUnwrapped)
 
 				// FIXME
 				self.log.Infof("[s]%s->%s...%s s(%s) contract set %s\n", self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId, nextSendContract.contractId)
@@ -3411,7 +3521,7 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 	// or out.
 	contractWaitTime := time.Since(createStartTime)
 	self.addContractWaitTime(contractWaitTime)
-	if d := contractWaitTime; contractWaitLogThreshold <= d {
+	if d := contractWaitTime; self.sendBufferSettings.ContractWaitLogThreshold <= d {
 		self.log.Infof("[s]contract wait %.0fms ok=%t c=%t %s->%s...%s s(%s)\n", float64(d.Microseconds())/1000.0, ok, self.companionContract, self.client.ClientTag(), self.intermediaryIds, self.destination.DestinationId, self.destination.StreamId)
 	}
 	return ok
@@ -3937,6 +4047,20 @@ func (self *SendSequence) writeMaybeWrappedBytes(transferFrameBytes []byte, path
 	var cipher *sequenceCipher
 	if self.session != nil && !forceUnwrapped {
 		cipher = self.session.Cipher()
+	}
+	if cipher == nil && self.session != nil && !forceUnwrapped && self.session.RequireEncryption() {
+		// Fail-closed backstop (EncryptionModeRequired): an application frame
+		// reached the writer without a cipher. The entry gate
+		// (`SendSequence.Pack`) admits application packs only once the cipher
+		// is established, and an established session keeps serving a cipher
+		// through rekeys (`Cipher()`), so this fires only on a narrow race
+		// (e.g. the session torn down between enqueue and write). Refuse the
+		// write — the item stays queued for resend and the sequence winds down
+		// via its own timeouts — rather than ever emitting plaintext.
+		return fmt.Errorf(
+			"encryption required but no cipher for peer %s (fail-closed; not sent)",
+			self.destination.DestinationId,
+		)
 	}
 	if cipher == nil {
 		// guard the V(2) diagnostic: this is the per-packet plaintext write path,
@@ -5443,6 +5567,10 @@ func (self *ReceiveSequence) receiveNack(receivePack *ReceivePack) (bool, error)
 		tag:                sequenceTagFromProtocol(receivePack.Pack.Tag),
 		decodedOwner:       receivePack.decodedOwner,
 		transferFrameBytes: receivePack.TransferFrameBytes,
+		// nack items send no ack, so `unwrapped` was historically unused here;
+		// the EncryptionModeRequired receive gate in `receiveHead` now reads it
+		// to refuse plaintext application frames on this path too
+		unwrapped: receivePack.Unwrapped,
 	}
 
 	if err := self.registerContracts(item); err != nil {
@@ -5507,6 +5635,31 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 	appFrames := item.frames
 	if self.session != nil {
 		appFrames = self.deliverEncryptedControlFrames(item.frames)
+		if item.unwrapped && 0 < len(appFrames) && self.session.RequireEncryption() {
+			// Fail-closed receive gate (EncryptionModeRequired): a plaintext
+			// application frame from a peer for which a session is expected is
+			// never delivered to the application — closing the downgrade where
+			// a peer or on-path attacker strips the wrap and the receiver
+			// accepts the plaintext. The item still advances the sequence and
+			// is acked (ack-and-discard): withholding the ack would gap the
+			// strictly-ordered sequence and starve handshake controls queued
+			// behind the gap, wedging both sides. The handshake controls
+			// themselves were already routed to the session above; the peer
+			// audit records the policy violation.
+			if self.log.V(1).Enabled() {
+				self.log.Infof(
+					"[r]%s<-%s s(%s) discarded %d plaintext application frame(s) (encryption required)\n",
+					self.client.ClientTag(), self.source.SourceId, self.source.StreamId, len(appFrames),
+				)
+			}
+			self.peerAudit.Update(func(a *PeerAudit) {
+				a.badMessage(item.messageByteCount)
+			})
+			self.session.NotifyRequiredReceiveDiscarded(
+				"plaintext application frames discarded",
+			)
+			appFrames = nil
+		}
 	}
 
 	// buffer for a combined dispatch: a Peer identity change (contract

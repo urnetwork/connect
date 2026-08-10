@@ -175,6 +175,12 @@ routes, so that **intermediaries and the platform cannot read payloads**.
   `session.Cipher() != nil`, *everything* to that peer is wrapped; if `nil`,
   everything is plaintext. There is **no per-message encryption flag**. An unset
   cipher means "handshake not complete yet" and mirrors as plaintext.
+  - *Evolution (2026-08):* the plaintext mirror is now the
+    `EncryptionModeOpportunistic` behavior. `EncryptionModeRequired` fail-closes
+    instead: application packs wait at sequence entry for the cipher and
+    inbound plaintext application frames are ack-and-discarded — see
+    DESIGNNOTES2.md §8 for the as-built gates and the head-of-line invariant
+    they must respect.
 - **Lesson:** An earlier design wrapped bytes deep inside
   `sendWithSetContract`/`setHead`, forcing `setHead` to decrypt → flip the head
   bit → re-encrypt. Reversed: the send path keeps only unwrapped bytes; `setHead`
@@ -534,6 +540,13 @@ platform never holds.
   and retained so in-flight frames under the old key still **decrypt** during the
   swap. `decryptCiphers()` returns `[established, prior]`. This matters because
   the ML-KEM-768 handshake is CPU-heavy and re-handshakes are not instant.
+  - *Evolution (2026-08):* on the **send** side, `Cipher()` during an
+    in-flight re-handshake now keeps returning the established epoch's cipher
+    in **both** modes — the historical plaintext fallback (which existed so
+    the contract-open ride-along always opened in the clear) is gone; the
+    contract-open is instead pinned ForceUnwrapped at queue time when the
+    cipher is down. The receiver's dual-cipher window keeps old-epoch frames
+    readable through the swap. See DESIGNNOTES2.md §8.2/§8.5.
 - **Post-handshake EC sources eliminated (so the outbox only emits during a real
   handshake):**
   - TLS 1.3 `NewSessionTicket` → disabled via `SessionTicketsDisabled: true`.
@@ -593,14 +606,25 @@ platform never holds.
 
 ### 3.11 Encryption settings (verified defaults)
 
-- `Encrypt bool` — master enable; **default `false`** (kept off for now). When
-  false the session manager is inert; all I/O unwrapped.
-- `TlsTimeout time.Duration` — TLS handshake timeout; **default `-1` = disabled**.
-  Negative needs no special handling: the watcher arms only when
-  `0 < TlsTimeout`. On timeout the session stays cipher-nil and traffic flows
-  plaintext (sessions never block sequences). The watcher is a goroutine selecting
+- `Mode EncryptionMode` — policy tri-state; **default `EncryptionModeOff`**
+  (session manager inert, all I/O unwrapped). `Opportunistic` is the historical
+  `Encrypt = true` (seal when established, else plaintext); `Required`
+  fail-closes (DESIGNNOTES2.md §8). The former `Encrypt bool` was replaced by
+  this enum (2026-08); the PQ performance profile maps to `Required` on the
+  consumer while the sdk provider side stays `Opportunistic`.
+- `TlsTimeout time.Duration` — TLS handshake timeout; **default `60s`** (an
+  earlier iteration shipped `-1` = disabled; bounded establishment was adopted
+  so a departed peer or undeliverable flight fails instead of retaining epoch
+  workers). Negative disables: the watcher arms only when `0 < TlsTimeout`. On
+  timeout the session stays cipher-nil — under Opportunistic traffic flows
+  plaintext; under Required application traffic stays held (sessions still
+  never block the *sequence machinery* — under Required it is the pack entry
+  that waits, not the run loops). The watcher is a goroutine selecting
   on ctx / `handshakeDone` / `time.After(TlsTimeout)` — the *only* timer in
   non-test code, written with `time.After` to honor the no-`NewTimer` rule (§6.4).
+- `RequiredCipherPollInterval time.Duration` — **default `20ms`**; how often a
+  send blocked by the Required entry gate re-checks `Cipher()`. Unset falls
+  back to the default rather than spinning.
   - *Naming history:* the field was `HandshakeTimeout`, briefly
     `TlsConnectTimeout`, finalized as `TlsTimeout` to match
     `ConnectSettings.TlsTimeout`. The rename was scoped to **only** this field;
