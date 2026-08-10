@@ -13,9 +13,26 @@ import (
 
 // a recorder for sent (upstream) and received (downstream) packets
 type ipMuxRecorder struct {
-	mu       sync.Mutex
-	sent     [][]byte
-	received [][]byte
+	mu                 sync.Mutex
+	sent               [][]byte
+	received           [][]byte
+	receivedBatchCount int
+}
+
+// The recorder copies borrowed packets and records the number of boundary
+// calls independently of the packet total.
+func (self *ipMuxRecorder) receivePackets(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	packets [][]byte,
+) {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+	self.receivedBatchCount += 1
+	for _, packet := range packets {
+		self.received = append(self.received, append([]byte{}, packet...))
+	}
 }
 
 func (self *ipMuxRecorder) upstream(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool {
@@ -139,6 +156,52 @@ func TestIpMuxReceiveRoutesLocalPacketWithoutPathMetadata(t *testing.T) {
 	mux.Receive(TransferPath{}, protocol.ProvideMode_Network, nil, packet)
 	if _, received := rec.counts(); received != 0 {
 		t.Fatalf("mux-local packet without metadata reached downstream: received=%d, want 0", received)
+	}
+}
+
+// A downstream burst must cross the mux once while retaining ordinary packet
+// order and suppressing duplicate singular delivery.
+func TestIpMuxReceivePacketsBatchesDownstream(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tun, err := CreateTunWithDefaults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := &ipMuxRecorder{}
+	mux := NewIpMux(
+		ctx,
+		tun,
+		TransferPath{},
+		protocol.ProvideMode_Network,
+		0,
+		nil,
+		nil,
+		recorder.receive,
+		nil,
+	)
+	defer mux.Close()
+	unsub := mux.AddPacketsReceiver(recorder.receivePackets)
+	defer unsub()
+	packets := [][]byte{
+		newIpMuxIpv4Packet(net.ParseIP("1.1.1.1"), net.ParseIP("10.0.0.2")),
+		newIpMuxIpv4Packet(net.ParseIP("1.0.0.1"), net.ParseIP("10.0.0.2")),
+	}
+	mux.ReceivePackets(
+		TransferPath{},
+		protocol.ProvideMode_Network,
+		nil,
+		packets,
+	)
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if recorder.receivedBatchCount != 1 || len(recorder.received) != len(packets) {
+		t.Fatalf(
+			"downstream batch calls=%d packets=%d, want 1/%d",
+			recorder.receivedBatchCount,
+			len(recorder.received),
+			len(packets),
+		)
 	}
 }
 

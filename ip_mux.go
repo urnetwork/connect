@@ -61,7 +61,8 @@ type IpMux struct {
 	stateLock sync.Mutex
 	upstream  IpMuxSend
 
-	receivers *CallbackList[ReceivePacketFunction]
+	receivers      *CallbackList[ReceivePacketFunction]
+	batchReceivers *CallbackList[ReceivePacketsFunction]
 
 	// rejectedPumpPacketCount rate-limits diagnostics for intentional upstream
 	// backpressure. The internal stack owns retransmission; the pump owns and
@@ -82,6 +83,7 @@ func NewIpMux(
 ) *IpMux {
 	cancelCtx, cancel := context.WithCancel(ctx)
 	receivers := NewCallbackList[ReceivePacketFunction]()
+	batchReceivers := NewCallbackList[ReceivePacketsFunction]()
 	if initialReceiver != nil {
 		receivers.Add(initialReceiver)
 	}
@@ -97,6 +99,7 @@ func NewIpMux(
 		provideMode:    provideMode,
 		sendTimeout:    sendTimeout,
 		receivers:      receivers,
+		batchReceivers: batchReceivers,
 	}
 	go HandleError(self.pump)
 	return self
@@ -122,6 +125,15 @@ func (self *IpMux) AddReceiver(receiver ReceivePacketFunction) func() {
 	callbackId := self.receivers.Add(receiver)
 	return func() {
 		self.receivers.Remove(callbackId)
+	}
+}
+
+// Batch receivers take the common all-downstream batch exclusively. Singular
+// receivers remain installed for synthesized and mixed local/downstream paths.
+func (self *IpMux) AddPacketsReceiver(receiver ReceivePacketsFunction) func() {
+	callbackId := self.batchReceivers.Add(receiver)
+	return func() {
+		self.batchReceivers.Remove(callbackId)
 	}
 }
 
@@ -157,6 +169,41 @@ func (self *IpMux) Receive(source TransferPath, provideMode protocol.ProvideMode
 	self.deliverDownstream(source, provideMode, ipPath, packet)
 }
 
+// A homogeneous batch crosses the mux boundary once. Mixed batches retain the
+// singular routing behavior because mux-local and downstream packets have
+// different consumers and are uncommon outside control traffic.
+func (self *IpMux) ReceivePackets(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	packets [][]byte,
+) {
+	if len(packets) == 0 {
+		return
+	}
+	localPacketCount := 0
+	for _, packet := range packets {
+		if self.isLocalPacketDestination(packet) {
+			localPacketCount += 1
+		}
+	}
+	if localPacketCount == len(packets) {
+		_, _ = self.tun.WriteBatch(packets)
+		return
+	}
+	if localPacketCount == 0 && self.deliverDownstreamPackets(
+		source,
+		provideMode,
+		ipPath,
+		packets,
+	) {
+		return
+	}
+	for _, packet := range packets {
+		self.Receive(source, provideMode, ipPath, packet)
+	}
+}
+
 // deliverDownstream dispatches a packet to the registered receivers. A concrete mux
 // also uses this to inject locally-generated replies (e.g. DNS responses) toward
 // the downstream.
@@ -168,6 +215,29 @@ func (self *IpMux) deliverDownstream(source TransferPath, provideMode protocol.P
 	for _, receiver := range self.receivers.Get() {
 		safeReceive(receiver, source, provideMode, ipPath, packet)
 	}
+}
+
+// A batch callback borrows every packet and replaces singular delivery. Nil
+// packets use the singular path so its existing synthesizer filtering holds.
+func (self *IpMux) deliverDownstreamPackets(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	packets [][]byte,
+) bool {
+	for _, packet := range packets {
+		if packet == nil {
+			return false
+		}
+	}
+	batchReceivers := self.batchReceivers.Get()
+	if len(batchReceivers) == 0 {
+		return false
+	}
+	for _, receiver := range batchReceivers {
+		safeReceivePackets(receiver, source, provideMode, ipPath, packets)
+	}
+	return true
 }
 
 // safeReceive calls one receiver with the panic isolation that wrapping it in
@@ -186,6 +256,28 @@ func safeReceive(receiver ReceivePacketFunction, source TransferPath, provideMod
 		}
 	}()
 	receiver(source, provideMode, ipPath, packet)
+}
+
+// Batch callback panics are isolated without adding an allocation to the
+// ordinary receive path.
+func safeReceivePackets(
+	receiver ReceivePacketsFunction,
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	packets [][]byte,
+) {
+	defer func() {
+		if r := recover(); r != nil {
+			if !IsDoneError(r) {
+				DefaultLogger().Warningf(
+					"Unexpected error: %s\n",
+					ErrorJson(r, debug.Stack()),
+				)
+			}
+		}
+	}()
+	receiver(source, provideMode, ipPath, packets)
 }
 
 // isLocalPacketDestination reads only fixed IP-header fields and allocates no

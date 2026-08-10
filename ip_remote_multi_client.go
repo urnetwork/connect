@@ -11979,20 +11979,38 @@ func (self *multiClientChannel) Send(parsedPacket *parsedPacket, timeout time.Du
 }
 
 func (self *multiClientChannel) SendDetailed(parsedPacket *parsedPacket, timeout time.Duration) (bool, error) {
-	var ack bool
-	switch parsedPacket.ipPath.Protocol {
-	case IpProtocolUdp, IpProtocolIcmp:
-		// icmp echo is datagram-like and a measurement tool: unacked
-		// transfer lets tunnel loss show honestly as ping loss
-		if self.settings.UdpCollapsePrevention {
-			ack = false
-		} else {
-			ack = true
-		}
-	default:
-		ack = true
-	}
+	allowDirect := self.performanceProfile != nil &&
+		self.performanceProfile.AllowDirect
+	ack := ipPacketTransferAckRequired(
+		parsedPacket.ipPath,
+		allowDirect,
+		self.settings.UdpCollapsePrevention,
+	)
 	return self.SendDetailedWithAck(parsedPacket, timeout, ack)
+}
+
+// A stream-capable IP path relies on the inner transport for recovery. Its
+// outer carrier is either the negotiated datagram lane or a reliable legacy
+// fallback, so retaining Transfer retry would duplicate recovery in both
+// cases. Non-direct traffic keeps its established behavior; UDP/ICMP only use
+// unacknowledged Transfer when collapse prevention already selected it.
+func ipPacketTransferAckRequired(
+	ipPath *IpPath,
+	allowDirect bool,
+	udpCollapsePrevention bool,
+) bool {
+	if allowDirect {
+		return false
+	}
+	if ipPath == nil {
+		return true
+	}
+	switch ipPath.Protocol {
+	case IpProtocolUdp, IpProtocolIcmp:
+		return !udpCollapsePrevention
+	default:
+		return true
+	}
 }
 
 // sendMultiClientRaceAttempt shares the packet read-only into a race

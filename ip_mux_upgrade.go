@@ -2402,6 +2402,29 @@ func (self *UpgradeMux) Receive(source TransferPath, provideMode protocol.Provid
 	self.mux.Receive(source, provideMode, ipPath, packet)
 }
 
+// Batch receive preserves first-load and reverse-affinity observation for
+// every packet, then retains the batch through the generic mux boundary.
+func (self *UpgradeMux) ReceivePackets(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	packets [][]byte,
+) {
+	for _, packet := range packets {
+		self.firstLoad.observeReceive(packet)
+		if packetSource, _, ok := ipPacketSourceDestinationAddrs(packet); ok {
+			self.reverse.touch(packetSource)
+		}
+	}
+	self.mux.ReceivePackets(source, provideMode, ipPath, packets)
+}
+
+// A batch receiver is used by device adapters while the singular receiver
+// remains available for synthesized and mixed traffic.
+func (self *UpgradeMux) AddPacketsReceiver(receiver ReceivePacketsFunction) func() {
+	return self.mux.AddPacketsReceiver(receiver)
+}
+
 // SetUpstream wires the wrapped upstream send (the remote UserNat).
 func (self *UpgradeMux) SetUpstream(upstream IpMuxSend) {
 	self.mux.SetUpstream(upstream)

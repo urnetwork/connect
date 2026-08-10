@@ -128,11 +128,10 @@ func (self *Framer) Write(w io.Writer, message []byte) error {
 		binary.BigEndian.PutUint16(messageWithHeader[0:2], uint16(messageLen))
 		binary.BigEndian.PutUint16(messageWithHeader[2:4], uint16(0))
 		copy(messageWithHeader[4:4+messageLen], message)
-		if nw, writeErr := w.Write(messageWithHeader[0 : messageLen+4]); nw < messageLen+4 {
-			if writeErr == nil {
-				writeErr = io.ErrShortWrite
-			}
+		if nw, writeErr := w.Write(messageWithHeader[0 : messageLen+4]); writeErr != nil {
 			return writeErr
+		} else if nw < messageLen+4 {
+			return io.ErrShortWrite
 		}
 		return nil
 	}
@@ -142,17 +141,76 @@ func (self *Framer) Write(w io.Writer, message []byte) error {
 	binary.BigEndian.PutUint16(h[0:2], uint16(messageLen))
 	binary.BigEndian.PutUint16(h[2:4], uint16(splitIndex))
 	copy(h[4:4+splitIndex], message[0:splitIndex])
-	if nw, writeErr := w.Write(h[0 : 4+splitIndex]); nw < 4+splitIndex {
-		if writeErr == nil {
-			writeErr = io.ErrShortWrite
-		}
+	if nw, writeErr := w.Write(h[0 : 4+splitIndex]); writeErr != nil {
 		return writeErr
+	} else if nw < 4+splitIndex {
+		return io.ErrShortWrite
 	}
-	if nw, writeErr := w.Write(message[splitIndex:messageLen]); nw < len(message)-splitIndex {
-		if writeErr == nil {
-			writeErr = io.ErrShortWrite
-		}
+	if nw, writeErr := w.Write(message[splitIndex:messageLen]); writeErr != nil {
 		return writeErr
+	} else if nw < len(message)-splitIndex {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+// WriteBatch emits several ordinary frames in one stream write. The wire is
+// identical to repeated Write calls with split index zero; only the syscall
+// and QUIC-stream handoff are coalesced. Message ownership remains with the
+// caller on every result.
+func (self *Framer) WriteBatch(w io.Writer, messages [][]byte) error {
+	if len(messages) == 0 {
+		return nil
+	}
+	if len(messages) == 1 {
+		return self.Write(w, messages[0])
+	}
+	totalByteCount := 0
+	for _, message := range messages {
+		messageByteCount := len(message)
+		if self.maxFrameLen < messageByteCount+4 {
+			self.log.Infof(
+				"[framer][reject]write batch messageLen=%d > MaxMessageLen=%d (maxFrameLen=%d)\n",
+				messageByteCount,
+				self.settings.MaxMessageLen,
+				self.maxFrameLen,
+			)
+			return fmt.Errorf(
+				"Max message len exceeded (%d<%d)",
+				self.settings.MaxMessageLen,
+				messageByteCount,
+			)
+		}
+		if math.MaxUint16 < messageByteCount {
+			return fmt.Errorf(
+				"Max possible message len exceeded (%d<%d)",
+				math.MaxUint16,
+				messageByteCount,
+			)
+		}
+		if math.MaxInt-totalByteCount < messageByteCount+4 {
+			return fmt.Errorf("Framer batch byte count overflow.")
+		}
+		totalByteCount += messageByteCount + 4
+	}
+
+	batchBytes := MessagePoolGet(totalByteCount)
+	defer MessagePoolReturn(batchBytes)
+	offset := 0
+	for _, message := range messages {
+		messageByteCount := len(message)
+		binary.BigEndian.PutUint16(
+			batchBytes[offset:offset+2],
+			uint16(messageByteCount),
+		)
+		binary.BigEndian.PutUint16(batchBytes[offset+2:offset+4], 0)
+		copy(batchBytes[offset+4:offset+4+messageByteCount], message)
+		offset += messageByteCount + 4
+	}
+	if writtenByteCount, err := w.Write(batchBytes); err != nil {
+		return err
+	} else if writtenByteCount < len(batchBytes) {
+		return io.ErrShortWrite
 	}
 	return nil
 }

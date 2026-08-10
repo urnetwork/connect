@@ -63,6 +63,11 @@ const DebugCloseSend = false
 // record, reducing write syscalls without adding a batching delay.
 const platformWebSocketWriteBatchMaxMessages = 4
 
+const (
+	platformH3WriteBatchMaxMessageCount = 16
+	platformH3WriteBatchMaxByteCount    = 64 * 1024
+)
+
 type TransportControl = byte
 
 const (
@@ -353,6 +358,31 @@ type PlatformTransport struct {
 	// unsubNetworkChange removes this transport from the process
 	// network-change listeners when the run loop exits.
 	unsubNetworkChange func()
+}
+
+// newPlatformQuicConfig keeps H3's memory and path-MTU behavior explicit and
+// testable. DPLPMTUD remains enabled so a validated path can grow beyond the
+// conservative initial packet and adapt after migration without fragmentation.
+func newPlatformQuicConfig(
+	settings *PlatformTransportSettings,
+	slowMultiple int,
+) *quic.Config {
+	return &quic.Config{
+		HandshakeIdleTimeout: time.Duration(slowMultiple) *
+			(settings.QuicConnectTimeout + settings.QuicHandshakeTimeout),
+		MaxIdleTimeout:    settings.PingTimeout * 4,
+		KeepAlivePeriod:   0,
+		Allow0RTT:         true,
+		InitialPacketSize: 1400,
+		// Pin the receive windows and stream counts. The platform transport
+		// uses one bidirectional stream; the stream counts bound abuse.
+		InitialStreamReceiveWindow:     uint64(kib(256)),
+		MaxStreamReceiveWindow:         uint64(MemoryScaledByteCount(mib(3), kib(384))),
+		InitialConnectionReceiveWindow: uint64(kib(512)),
+		MaxConnectionReceiveWindow:     uint64(MemoryScaledByteCount(mib(4), kib(512))),
+		MaxIncomingStreams:             8,
+		MaxIncomingUniStreams:          8,
+	}
 }
 
 // Kick closes the transport's live connection (if any) and skips any pending
@@ -961,7 +991,6 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				time.Sleep(time.Millisecond)
 				drain(send)
 			}()
-
 			go HandleError(func() {
 				defer handleCancel()
 
@@ -1396,25 +1425,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 
 			success := false
 
-			quicConfig := &quic.Config{
-				HandshakeIdleTimeout:    time.Duration(slowMultiple) * (self.settings.QuicConnectTimeout + self.settings.QuicHandshakeTimeout),
-				MaxIdleTimeout:          self.settings.PingTimeout * 4,
-				KeepAlivePeriod:         0,
-				Allow0RTT:               true,
-				DisablePathMTUDiscovery: true,
-				InitialPacketSize:       1400,
-				// pin the receive windows and stream counts. the library
-				// defaults allow ~15mib per connection plus ~6mib per stream;
-				// the max windows are per connection, so scaled by the memory
-				// budget. the platform transport uses one bidirectional
-				// stream, so the stream counts only bound abuse.
-				InitialStreamReceiveWindow:     uint64(kib(256)),
-				MaxStreamReceiveWindow:         uint64(MemoryScaledByteCount(mib(3), kib(384))),
-				InitialConnectionReceiveWindow: uint64(kib(512)),
-				MaxConnectionReceiveWindow:     uint64(MemoryScaledByteCount(mib(4), kib(512))),
-				MaxIncomingStreams:             8,
-				MaxIncomingUniStreams:          8,
-			}
+			quicConfig := newPlatformQuicConfig(self.settings, slowMultiple)
 			var tlsConfig *tls.Config
 			if self.settings.QuicTlsConfig != nil {
 				// copy
@@ -1717,6 +1728,49 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				time.Sleep(time.Millisecond)
 				drain(send)
 			}()
+			writeReadySendBatch := func(
+				firstMessage []byte,
+			) (sendOpen bool, pendingMessage []byte, err error) {
+				var messageStorage [platformH3WriteBatchMaxMessageCount][]byte
+				messages := messageStorage[:1]
+				messages[0] = firstMessage
+				batchByteCount := len(firstMessage) + 4
+				sendOpen = true
+			drainReady:
+				for len(messages) < cap(messages) {
+					select {
+					case <-handleCtx.Done():
+						sendOpen = false
+						break drainReady
+					case message, ok := <-send:
+						if !ok {
+							sendOpen = false
+							break drainReady
+						}
+						framedByteCount := len(message) + 4
+						if platformH3WriteBatchMaxByteCount < batchByteCount+framedByteCount {
+							pendingMessage = message
+							break drainReady
+						}
+						messages = append(messages, message)
+						batchByteCount += framedByteCount
+					default:
+						break drainReady
+					}
+				}
+
+				stream.SetWriteDeadline(
+					time.Now().Add(time.Duration(slowMultiple) * self.settings.WriteTimeout),
+				)
+				err = framer.WriteBatch(stream, messages)
+				for _, message := range messages {
+					MessagePoolReturn(message)
+				}
+				if err == nil {
+					writeCounter.Add(uint64(len(messages)))
+				}
+				return
+			}
 
 			go HandleError(func() {
 				defer handleCancel()
@@ -1754,20 +1808,39 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				defer pingTimer.Stop()
 				resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 
+				var pendingMessage []byte
+				defer func() {
+					if pendingMessage != nil {
+						MessagePoolReturn(pendingMessage)
+					}
+				}()
 				for {
-					select {
-					case <-handleCtx.Done():
-						return
-					case message, ok := <-send:
-						if !ok {
+					message := pendingMessage
+					pendingMessage = nil
+					if message == nil {
+						select {
+						case <-handleCtx.Done():
 							return
+						case nextMessage, ok := <-send:
+							if !ok {
+								return
+							}
+							message = nextMessage
+						case <-pingTimer.C:
+							stream.SetWriteDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.WriteTimeout))
+							if err := framer.Write(stream, make([]byte, 0)); err != nil {
+								return
+							}
+							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+							continue
 						}
+					}
+					{
 						// if !MessagePoolCheckShared(message) {
 						// 	panic("[t]shared should be set")
 						// }
-						stream.SetWriteDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.WriteTimeout))
-						err := framer.Write(stream, message)
-						MessagePoolReturn(message)
+						sendOpen, nextMessage, err := writeReadySendBatch(message)
+						pendingMessage = nextMessage
 						if err != nil {
 							// note that for websocket a dealine timeout cannot be recovered
 							if ok, suppressed := shouldLogWriteErr(); ok {
@@ -1781,15 +1854,11 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 							}
 							return
 						}
+						if !sendOpen {
+							return
+						}
 						if self.log.V(2).Enabled() {
 							self.log.Infof("[ts]%s->\n", clientId)
-						}
-						resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
-					case <-pingTimer.C:
-						stream.SetWriteDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.WriteTimeout))
-						if err := framer.Write(stream, make([]byte, 0)); err != nil {
-							// note that for websocket a dealine timeout cannot be recovered
-							return
 						}
 						resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 					}

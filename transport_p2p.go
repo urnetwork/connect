@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"slices"
+	"sync"
 	"time"
 	// "fmt"
 )
@@ -171,6 +172,7 @@ func DefaultP2pTransportSettings() *P2pTransportSettings {
 		// message, then returns to this size.
 		InitialReadBufferByteCount: 4 * 1024,
 		MaxMessageByteCount:        64 * 1024,
+		DataPlaneMode:              P2pDataPlaneModeAuto,
 	}
 }
 
@@ -205,6 +207,12 @@ type P2pTransportSettings struct {
 	// message boundary itself — no length prefix — and the receive buffer must
 	// be >= the largest TransferFrame that can arrive.
 	MaxMessageByteCount int
+	// DataPlaneMode selects automatic capability fallback or one forced lane.
+	// Forced modes exist for deterministic compatibility and performance tests.
+	DataPlaneMode P2pDataPlaneMode
+	// DataPlaneStats observes the actual negotiated lane. It may be nil when
+	// callers do not need instrumentation.
+	DataPlaneStats *P2pDataPlaneStats
 }
 
 type P2pTransport struct {
@@ -711,15 +719,58 @@ func (self *P2pSendTransport) run() {
 				MessagePoolReturn(transferFrameBytes)
 				return
 			}
+			messageByteCount := len(transferFrameBytes)
+			fastConn, supportsFastPath := self.conn.(webRtcFastPathConn)
+			if self.settings.DataPlaneMode != P2pDataPlaneModeLegacyOnly {
+				if supportsFastPath &&
+					self.settings.DataPlaneMode == P2pDataPlaneModeFastOnly &&
+					!fastConn.FastPathReady() {
+					fastConn.WaitFastPathReady(self.ctx, self.settings.ConnectTimeout)
+				}
+				if supportsFastPath && fastConn.FastPathReady() {
+					fragmentCount, err := fastConn.WriteFastPathMessage(transferFrameBytes)
+					if err == nil {
+						if stats := self.settings.DataPlaneStats; stats != nil {
+							stats.fastSendMessageCount.Add(1)
+							stats.fastSendByteCount.Add(uint64(messageByteCount))
+							stats.fastSendFragmentCount.Add(uint64(fragmentCount))
+						}
+						MessagePoolReturn(transferFrameBytes)
+						continue
+					}
+					if stats := self.settings.DataPlaneStats; stats != nil {
+						stats.fastFallbackCount.Add(1)
+					}
+					if self.settings.DataPlaneMode == P2pDataPlaneModeFastOnly {
+						MessagePoolReturn(transferFrameBytes)
+						DefaultLogger().V(1).Infof("[p2p]s(%s) fast send err = %s\n", self.streamId, err)
+						return
+					}
+				} else {
+					if stats := self.settings.DataPlaneStats; stats != nil {
+						stats.fastFallbackCount.Add(1)
+					}
+					if self.settings.DataPlaneMode == P2pDataPlaneModeFastOnly {
+						MessagePoolReturn(transferFrameBytes)
+						DefaultLogger().V(1).Infof("[p2p]s(%s) fast path was not negotiated\n", self.streamId)
+						return
+					}
+				}
+			}
+
 			self.conn.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
 			nw, err := self.conn.Write(transferFrameBytes)
 			MessagePoolReturn(transferFrameBytes)
-			if nw < len(transferFrameBytes) && err == nil {
+			if nw < messageByteCount && err == nil {
 				err = io.ErrShortWrite
 			}
 			if err != nil {
 				DefaultLogger().V(1).Infof("[p2p]s(%s) send write err = %s\n", self.streamId, err)
 				return
+			}
+			if stats := self.settings.DataPlaneStats; stats != nil {
+				stats.legacySendMessageCount.Add(1)
+				stats.legacySendByteCount.Add(uint64(messageByteCount))
 			}
 		}
 	}
@@ -826,10 +877,20 @@ func newP2pReceiveTransport(
 }
 
 func (self *P2pReceiveTransport) run() {
-	defer self.cancel()
+	var fastWorker sync.WaitGroup
+	if fastConn, ok := self.conn.(webRtcFastPathConn); ok &&
+		self.settings.DataPlaneMode != P2pDataPlaneModeLegacyOnly {
+		fastWorker.Add(1)
+		go HandleError(func() {
+			defer fastWorker.Done()
+			self.runFast(fastConn)
+		}, self.cancel)
+	}
 	// drain any pooled bytes we wrote that the route manager hasn't consumed
 	// yet at shutdown.
 	defer func() {
+		self.cancel()
+		fastWorker.Wait()
 		for {
 			select {
 			case b, ok := <-self.receive:
@@ -869,12 +930,23 @@ func (self *P2pReceiveTransport) run() {
 			maxReadByteCount,
 		)
 		if 0 < len(transferFrameBytes) {
+			if self.settings.DataPlaneMode == P2pDataPlaneModeFastOnly {
+				MessagePoolReturn(transferFrameBytes)
+				if stats := self.settings.DataPlaneStats; stats != nil {
+					stats.fastDropCount.Add(1)
+				}
+				continue
+			}
 			// The route now owns this exact slice and returns it to the pool.
 			select {
 			case <-self.ctx.Done():
 				MessagePoolReturn(transferFrameBytes)
 				return
 			case self.receive <- transferFrameBytes:
+				if stats := self.settings.DataPlaneStats; stats != nil {
+					stats.legacyReceiveMessageCount.Add(1)
+					stats.legacyReceiveByteCount.Add(uint64(len(transferFrameBytes)))
+				}
 			}
 		}
 		if err != nil {
@@ -885,6 +957,34 @@ func (self *P2pReceiveTransport) run() {
 			}
 			DefaultLogger().V(1).Infof("[p2p]s(%s) receive read err = %s\n", self.streamId, err)
 			return
+		}
+	}
+}
+
+// runFast transfers complete datagram-lane messages into the shared receive
+// route. This worker may apply route backpressure; the independent SRTP reader
+// retains a bounded queue and drops only after that queue is also exhausted.
+func (self *P2pReceiveTransport) runFast(conn webRtcFastPathConn) {
+	messages := conn.FastPathMessages()
+	for {
+		select {
+		case <-self.ctx.Done():
+			return
+		case received, ok := <-messages:
+			if !ok {
+				return
+			}
+			select {
+			case <-self.ctx.Done():
+				MessagePoolReturn(received.message)
+				return
+			case self.receive <- received.message:
+				if stats := self.settings.DataPlaneStats; stats != nil {
+					stats.fastReceiveMessageCount.Add(1)
+					stats.fastReceiveByteCount.Add(uint64(len(received.message)))
+					stats.fastReceiveFragmentCount.Add(uint64(received.fragmentCount))
+				}
+			}
 		}
 	}
 }

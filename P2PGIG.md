@@ -1,13 +1,26 @@
 # P2PGIG — a path to gigabit P2P throughput
 
-- Status: engineering research and design recommendation, not a throughput claim
-- Research snapshot: 2026-08-09
+- Status: production fast path implemented; local end-to-end validation complete
+- Research and implementation snapshot: 2026-08-10
 - Target: sustained 1 Gbit/s of useful inner IP payload on a clean, capable direct path
 
 ## Executive conclusion
 
-Connect will not reach gigabit P2P throughput by tuning the current reliable
-WebRTC DataChannel/SCTP path. The dominant limit is architectural:
+The new native P2P fast path exceeded the one-gigabit target in a local real
+route topology. This is an implementation result, not a claim that every
+device or WAN path will sustain gigabit. Physical-device, cross-host, lossy,
+and long-RTT validation remains a release gate.
+
+The implementation keeps the existing WebRTC peer connection but adds a
+capability-negotiated custom RTP/SRTP data lane. It sends complete encrypted
+Transfer messages through bounded fragmentation and reassembly without SCTP.
+The reliable unordered DataChannel remains the compatibility lane and is
+selected automatically when the peer does not advertise or finish warming the
+fast lane. The control plane, contract establishment, signaling, and fallback
+remain reliable.
+
+This choice fixes the measured architectural limit rather than continuing to
+tune the reliable DataChannel/SCTP path:
 
 1. Connect carries TCP, QUIC, and other IP traffic inside a reliable SCTP
    association.
@@ -16,39 +29,150 @@ WebRTC DataChannel/SCTP path. The dominant limit is architectural:
    retransmits loss.
 3. Connect's Transfer layer also sequences, acknowledges, and may retransmit
    the same data.
-4. The app, Transfer, crypto, SCTP, UDP, and TUN boundaries do not preserve
-   batches end to end.
+4. The app, Transfer, crypto, UDP, and TUN boundaries previously discarded
+   useful batches.
 
-The local same-host WebRTC route currently reaches about 32–35 MiB/s with the
-production 3 KiB Transfer message size. A CPU profile attributes 47.89% of all
+The old local same-host WebRTC route reached about 32–35 MiB/s with the
+production 3 KiB Transfer message size. A CPU profile attributed 47.89% of all
 samples to the raw syscall boundary and about 38% to the SCTP → DTLS → ICE →
 UDP write chain. Increasing the route queue from 1 to 32 did not improve
-throughput. This is direct evidence that the immediate ceiling is not too
-little queueing.
-
-The recommended design is a capability-negotiated **P2P datagram data plane**
-for native peers:
+throughput. The production implementation therefore uses a negotiated
+**P2P datagram data plane** for native peers:
 
 - retain the existing reliable WebRTC/Transfer path for signaling, identity,
   contracts, key establishment, accounting checkpoints, control messages, and
   fallback;
-- send each inner IP packet as one independently authenticated datagram, with
-  no Connect or SCTP data retransmission;
+- carry encrypted Transfer messages as independently authenticated SRTP
+  fragments, with no SCTP data retransmission;
 - preserve Connect policy, IP-security checks, replay protection, and contract
   accounting;
 - batch packets across the complete TUN → policy → route → crypto → UDP path;
 - use platform UDP and TUN batching where the OS exposes it;
 - keep legacy WebRTC DataChannel behavior for browsers and old clients.
 
-This is the same fundamental performance model used by WireGuard and Tailscale:
-one encrypted IP datagram remains one UDP datagram, while the implementation
-batches the system calls used to move many datagrams. It does **not** mean
-copying Tailscale's control plane or treating WireGuard as a drop-in protocol.
+Direct-stream IP data now leaves loss recovery to the inner transport. A
+reliable DataChannel fallback still provides carrier reliability for an older
+peer. Contract-opening traffic is acknowledged before unacknowledged data is
+admitted. The exchange route deliberately remains a reliable Transfer route;
+it receives the shared batching improvements but does not pretend to be a
+datagram path.
+
+The batch pipeline must not be P2P-specific. Direct P2P and the
+exchange/platform route share the app TUN, SDK, IP parsing, security policy,
+provider selection, Transfer, and route-manager boundaries. A generic packet
+batch should travel through those shared stages, then branch at the selected
+transport: compact datagrams for a negotiated P2P fast path, or a batched
+platform carrier for the exchange path. Local routing should use the same API.
+Optimizing only the UDP tail would leave the common singleton handoffs in
+place and would make the TUN optimization unavailable to exchange traffic.
+
+The production carrier does not yet use the compact one-inner-packet/one-UDP-
+datagram wire prototype described later. It reuses ICE, DTLS, SRTP, endpoint
+migration, and capability negotiation already owned by the Pion association.
+This reduced rollout risk and still removed SCTP's ceiling. The compact raw
+authenticated UDP codec remains a measured option for more headroom, not a
+second selected production path.
+
+Implemented route-neutral work includes:
+
+- ready-only H3 framing batches on both the Connect client and
+  `server/connect`, while preserving the existing H1 and exchange gathers;
+- Linux `sendmmsg` for ready SRTP bursts and a bounded asynchronous socket
+  writer on other native systems;
+- batch receive through `IpMux`, `UpgradeMux`, `DeviceLocal`, and proxy TUN;
+- a packed uint16-length-prefixed SDK ABI that crosses Go/native once per
+  burst on Apple and Windows;
+- bounded TUN drains in the SDK I/O loop used by Android and Linux;
+- Apple packet-array and Windows Wintun-ring drains capped at 64 packets;
+- DPLPMTUD enabled for client and server H3, starting conservatively at 1,400
+  bytes.
+
+The production fast carrier is stream-length agnostic. Every P2P association
+implements the same transport contract, so a stream composes any supported
+number of adjacent hops. A real three-hop WebRTC test verifies this production
+composition; the compact codec tests all currently supported one-to-nine-hop
+shapes.
 
 Desktop and Linux gigabit is a credible target after this work, provided the
 unencrypted underlay sustains materially more than 1 Gbit/s. Gigabit on mobile
 is conditional on the radio, device, OS packet API, CPU, and thermal state; it
 must not be inferred from a desktop result.
+
+### Implementation result
+
+The comparable `server/connect` harness creates real clients, handlers,
+residents, exchange forwarding, contracts, route selection, and Pion peer
+connections. Each run sends 16,384 uniquely indexed 1,380-byte payloads and
+fails on a missing, duplicate, out-of-range, fallback, or carrier-drop event.
+Five runs on an Apple M1 Max with Go 1.26.5 produced:
+
+| Forced route | Median useful payload | Worst of five |
+|---|---:|---:|
+| Exchange H1 | 169.31 MB/s | 154.44 MB/s |
+| Exchange H3 | 82.44 MB/s | 79.41 MB/s |
+| P2P legacy DataChannel | 47.17 MB/s | 45.15 MB/s |
+| P2P SRTP fast path | 150.73 MB/s | 144.79 MB/s |
+
+The P2P fast-path median is 1.206 Gbit/s of useful payload and its worst run is
+1.158 Gbit/s. Its median gain over the production legacy P2P route is 3.20x.
+Across the fast measurements, the source recorded 42,242 complete messages,
+118,026,417 message bytes, and 124,418 SRTP fragments, with zero fallback and
+zero observed carrier drops.
+
+The production-carrier microbenchmark at the same 1,380-byte useful size
+measured a 194.78 MB/s five-run median and one allocation per operation. The
+legacy WebRTC route measured 33.30 MB/s and about 180 allocations per
+operation, a 5.85x median gain.
+
+The existing full-stack directional TCP test adds the userspace TUN, gVisor
+NAT, provider path, and local OS TCP endpoints. After increasing the bounded
+fast receive burst window from 64 messages (about 1.5 ms at target rate) to
+1,024 messages (about 24 ms), five consecutive complete test invocations had
+no stalled or discarded sample. Best-of-three useful goodput in those
+invocations ranged from 115.58 to 119.61 MiB/s upload and 118.39 to 123.05
+MiB/s download. This test exercises automatic routing rather than forcing and
+asserting a carrier, so it is supporting whole-stack evidence; the forced
+four-route test above is the authoritative carrier comparison.
+
+### Exchange before-and-after measurement
+
+The exchange optimization was also measured against the production revisions
+from immediately before this work: Connect `b4a2bc9`, SDK `b4fa6e6`, and server
+`5090308e`. Detached worktrees kept those production sources unchanged. The
+same exchange-only harness and the minimum test plumbing needed to force an H3
+listener were used in both trees.
+
+Each side ran three alternating test invocations per carrier. Every invocation
+performed a 256-packet warmup followed by five measured runs of 16,384 unique
+1,380-byte payloads. Thus each result below is the pooled median of 15 exact
+delivery runs on the same Apple M1 Max and Go 1.26.5, without the race detector.
+Every run rejected loss, duplication, invalid indexes, and incomplete delivery.
+
+| Forced exchange route | Before median | After median | Gain | Before/after worst of 15 |
+|---|---:|---:|---:|---:|
+| H1 WebSocket/TCP | 178.53 MB/s | 179.56 MB/s | 1.006x (+0.6%; no measurable change) | 159.69 / 157.58 MB/s |
+| H3 QUIC stream | 45.92 MB/s | 84.56 MB/s | **1.84x (+84.1%)** | 43.09 / 80.08 MB/s |
+
+The three paired H1 invocation medians ranged from -2.7% to +1.4%, confirming
+that its +0.6% pooled result is scheduler noise rather than a claimed gain. The
+three paired H3 median gains were 1.81x, 1.83x, and 1.95x. Median H3 allocation
+calls fell from 71.63 to 34.82 per packet (-51.4%). Median allocated bytes rose
+from 3,912 to 6,391 per packet (+63.4%) because batching trades many small QUIC
+handoffs for larger contiguous framing buffers; that byte-volume tradeoff is
+remaining allocation headroom, not a leak.
+
+This comparison measures the real Connect clients, H1/H3 carrier, handler,
+residents, contracts, and exchange forwarding. It deliberately starts with
+Connect frames, so it quantifies the exchange-carrier/server gain but does not
+attribute an additional number to the shared app TUN, SDK, or provider batches.
+The original four-route table remains the comparable simultaneous route
+snapshot; its slightly different absolute exchange values reflect normal host
+load and route ordering.
+
+These are same-host software-path results. They establish that Connect's
+selected implementation no longer has the old SCTP ceiling and has local
+gigabit headroom. They do not establish radio, physical NIC, NAT, Internet,
+thermal, or multi-host performance.
 
 ---
 
@@ -73,48 +197,95 @@ target.
 
 ## Current native P2P data path
 
-The native path is:
+The native path now branches only at the negotiated carrier:
 
     app TUN
-      → SDK packet callback
+      → SDK packet batch
       → IP parsing, policy, routing, and contract selection
       → Transfer Frame / Pack envelope and optional outer AEAD
-      → reliable unordered WebRTC DataChannel
-      → SCTP fragmentation, SACK, congestion control, and retransmission
-      → DTLS
-      → ICE
-      → UDP socket
+      → P2P Auto selection
+          → fast: custom RTP fragmentation → SRTP → DTLS/ICE → UDP
+          → legacy: reliable unordered DataChannel → SCTP → DTLS/ICE → UDP
       → peer, followed by the reverse path
 
 Provider traffic then crosses the userspace TUN and gVisor network/NAT path.
 The same-network direct route still uses Transfer contracts and security
 policy; P2P is not a bypass around those controls.
 
-The important current settings are:
+The important production settings and invariants are:
 
 | Area | Current behavior | Consequence |
 |---|---|---|
-| DataChannel | Unordered, but reliable because MaxRetransmits is unset | Removes ordered delivery head-of-line blocking, but retains SCTP ACKs, retransmission, flow control, and congestion control |
-| SCTP outgoing MTU | Pion starts at 1,191 bytes | A 1,440-byte inner packet plus its envelope requires at least two SCTP packets |
-| SCTP selected-peer receive window | 2 MiB | Better than the public 256/512 KiB window, but below the bandwidth-delay product of a gigabit path at ordinary WAN RTT |
-| SCTP congestion control | Shared Reno-style association window with a measured 8-MTU avoidance step | Multiple DataChannels still share one association window |
-| Transfer message | At most two frames and 3 KiB in the normal hot path | Reduces some envelope work, but normally produces three SCTP/UDP writes |
-| Transport queue | Four messages | Measured queue depths from 1 through 32 did not materially change throughput |
-| Transfer reliability | ACK enabled by default; UDP/ICMP ACKs remain enabled unless collapse prevention is selected | Adds a second recovery and accounting loop around reliable SCTP |
-| TUN MTU | 1,440 bytes | Reasonable for the current encapsulation, but must be recalculated for a new IPv4/IPv6 datagram header |
+| Selection | `Auto` by default, with `LegacyOnly` and `FastOnly` production controls | New peers select fast after mutual readiness; old peers continue on the DataChannel |
+| Capability | Custom codec in normal SDP plus a bounded warmup marker | No version guess and no application payload is sent before both RTP receive workers are active |
+| Fast fragment | At most 1,400 bytes of carrier payload with a 16-byte header | Fits the current SRTP/UDP path conservatively and avoids IP fragmentation on an ordinary 1,500-byte path |
+| Reassembly | 64 bounded in-progress slots, 64 fragments maximum, two-second expiry | Memory and malformed/incomplete message lifetime are bounded |
+| Complete-message queue | 1,024 messages by default | Absorbs about 24 ms at local gigabit rate; overflow drops instead of blocking the SRTP socket reader |
+| Native UDP writes | Bounded 256-packet queue, ready-only drains of at most 64 | Linux uses `sendmmsg`; other systems overlap ordered socket writes without an idle batching delay |
+| Direct IP recovery | No Transfer ACK/retry after stream selection | Inner TCP/QUIC recovers loss; UDP/ICMP observe real datagram loss; contract setup remains acknowledged |
+| Legacy lane | Existing reliable unordered DataChannel | Preserves browsers, old binaries, control behavior, and rolling-upgrade compatibility |
+| TUN MTU | 1,440 bytes | Production SRTP fragments an encrypted Transfer message when needed; the unselected compact raw-UDP prototype uses a lower 1,380-byte inner bound |
 
 Relevant implementation points are
 [transport_p2p_webrtc.go](transport_p2p_webrtc.go),
 [transport_p2p_webrtc_pc.go](transport_p2p_webrtc_pc.go),
+[transport_p2p_fast.go](transport_p2p_fast.go),
+[transport_p2p_fast_native.go](transport_p2p_fast_native.go),
+[transport_p2p_udp_batch.go](transport_p2p_udp_batch.go),
 [transport_p2p.go](transport_p2p.go), [transfer.go](transfer.go),
 [ip.go](ip.go), and the SDK app bridge in
 [device_local_ioloop.go](../sdk/device_local_ioloop.go).
+
+## Current exchange/platform data path
+
+The exchange path shares the front and back of the P2P path but uses a
+different carrier in the middle:
+
+    app TUN
+      → SDK packet callback
+      → IP parsing, policy, provider/route selection, and Transfer
+      → RouteManager
+      → PlatformTransport
+          → H1: WebSocket over TLS/TCP
+          → H3: one reliable QUIC stream
+      → server/connect handler and resident
+      → server/connect exchange forwarding
+      → destination PlatformTransport
+      → Transfer, policy, and app TUN
+
+This route has the same inner TCP/QUIC-inside-reliable-carrier problem. H1 adds
+TCP recovery and head-of-line blocking; H3 uses a reliable QUIC stream; and
+Transfer can add another ACK/retry layer to both. It does not have Pion's SCTP
+fragmentation or SCTP receive-window limits, so those two findings remain
+P2P-specific.
+
+The exchange route now preserves batching across more of the shared path:
+
+- client H1 drains up to four ready messages and coalesces at most 16 KiB into
+  one underlying write in [transport.go](transport.go);
+- client and server H3 drain up to 16 ready messages or 64 KiB into one
+  wire-identical framing write, without waiting for a batch timer;
+- [server/connect/resident.go](../server/connect/resident.go) drains up to 256
+  messages or 256 KiB and uses `net.Buffers`/`writev` on exchange writes;
+- exchange reads use a buffered reader, but parsed messages still cross the
+  resident and route channels one at a time;
+- Connect carries committed-flow receive batches through the mux and
+  DeviceLocal into TUN `WriteBatch`/GRO. Native app adapters use either the SDK
+  I/O loop or one packed ABI callback per burst.
+
+The exchange remains reliable H1/H3 stream transport. The current work removes
+singleton overhead and improves the shared TUN boundary; removing nested
+recovery from exchange traffic would still require a separately negotiated
+datagram route implemented on both Connect and `server/connect`.
 
 ## Findings
 
 ### P2PG-001 — reliable tunneling duplicates recovery
 
 **Priority: highest**
+
+**Implementation status: resolved for direct P2P IP data; exchange remains a
+reliable compatibility route.**
 
 Most useful tunnel traffic is already congestion-controlled and reliable at
 the inner layer. TCP and QUIC detect loss, adjust their rate, and retransmit.
@@ -123,6 +294,14 @@ Putting that traffic inside reliable SCTP creates nested recovery loops:
 - the inner transport waits for and reacts to loss;
 - SCTP also waits, reduces its association window, and retransmits;
 - Connect Transfer may independently retry an unacknowledged Pack.
+
+The exchange route has the same class of duplication with a different outer
+carrier: WebSocket/TCP on H1 or a reliable QUIC stream on H3, followed by the
+reliable server exchange links. A fast P2P lane removes the P2P instance of the
+problem. Removing it from the platform route would require a separately
+negotiated datagram lane on the client transport and matching routing support
+in `server/connect`; changing only the client cannot make the exchange route
+unreliable end to end.
 
 The outer recovery can hide loss from the inner controller for a while, add
 latency, and then expose a burst. One lost outer datagram also consumes SCTP
@@ -136,13 +315,17 @@ allows proportional-response IP tunnels to rely on inner congestion control,
 provided they include aggregate safety mechanisms for traffic that is not
 responsive.
 
-**Conclusion:** ordinary inner IP packets must not be retransmitted by the P2P
-data plane. The reliable path should carry control and cumulative accounting,
-not the bulk data itself.
+**Conclusion:** the native fast lane removes SCTP and direct-stream IP disables
+Transfer retry after acknowledged contract setup. The existing DataChannel is
+the old-peer fallback. Keep the exchange route reliable unless a future client
+and `server/connect` datagram design is implemented and validated end to end.
 
 ### P2PG-002 — small SCTP packets make the path syscall-bound
 
 **Priority: highest**
+
+**Implementation status: resolved for capable native peers by bypassing SCTP;
+retained by design on the legacy lane.**
 
 Pion SCTP v1.11.1 uses an initial outgoing MTU of 1,191 bytes. After SCTP
 headers and padding, an I-DATA packet carries about 1,156 bytes of application
@@ -176,16 +359,19 @@ Pion source:
 - [SCTP MTU and payload sizing](https://github.com/pion/sctp/blob/v1.11.1/association.go#L66-L92)
 - [one net.Conn.Write per raw SCTP packet](https://github.com/pion/sctp/blob/v1.11.1/association.go#L1189-L1204)
 
-**Conclusion:** fewer small SCTP messages and deeper Go channels can make the
-legacy path somewhat faster, but they cannot provide the syscall shape needed
-for gigabit.
+**Conclusion:** the production SRTP carrier and bounded native UDP writer
+remove SCTP from bulk native traffic. The measured fast/legacy median moved
+from 47.17 MB/s to 150.73 MB/s in the comparable real-route harness.
 
 ### P2PG-003 — packet batches are lost between layers
 
 **Priority: highest**
 
-Gigabit at ordinary MTUs is a packet-rate problem. The current layers usually
-hand off one packet or one Transfer message at a time:
+**Implementation status: substantially resolved across Connect, SDK, Apple,
+Windows, Android/Linux I/O loop, proxy, H3 client, and `server/connect`.**
+
+Gigabit at ordinary MTUs is a packet-rate problem. Before this work, the layers
+usually handed off one packet or one Transfer message at a time:
 
 - the SDK I/O loop invokes one packet write callback per TUN read;
 - the Apple extension receives an array from NEPacketTunnelFlow, then calls
@@ -193,23 +379,28 @@ hand off one packet or one Transfer message at a time:
 - Apple writes a singleton packet array for each Go receive callback;
 - Transfer writes each completed TransferFrame separately;
 - Pion writes each SCTP packet separately;
-- non-Linux UDP paths generally have no system-call batching.
+- non-Linux UDP paths generally have no system-call batching;
+- H3 platform transport writes one framed message at a time;
+- exchange reads and resident routing hand off one decoded message at a time,
+  even though exchange writes already gather messages for `writev`.
 
 Android is better than a JNI-per-packet design because Go owns the detached VPN
 file descriptor after setup. Android's VPN TUN interface still exposes one
 packet per read/write, so a Go-side drain or micro-batch is needed above that
 boundary.
 
-Connect already has useful pieces, including TUN batch/GRO support. They do not
-form one continuous batch pipeline.
-
-**Conclusion:** add explicit SendBatch and ReceiveBatch contracts across the
-complete hot path. A batch must remain a collection of independent datagrams;
-it must not become one oversized UDP datagram.
+The implemented pipeline retains independent packet ownership and bounded
+burst sizes. It does not concatenate independent packets into one failure
+unit. Remaining singleton stages include some Transfer/route bookkeeping and
+exchange read/dispatch. They are measured future headroom, not part of the old
+SCTP ceiling.
 
 ### P2PG-004 — the SCTP window cannot cover a gigabit WAN path
 
 **Priority: high for the legacy path; avoided by the new datagram path**
+
+**Implementation status: avoided by the fast lane; unchanged and bounded for
+legacy compatibility.**
 
 The selected peer's 2 MiB receive window has these theoretical ceilings before
 any other loss:
@@ -238,23 +429,34 @@ not make a large static SCTP window the gigabit design.
 
 **Priority: high**
 
+**Implementation status: duplicate data ACK/retry resolved for direct IP;
+Transfer metadata and contract accounting remain for policy compatibility.**
+
 Each hot-path TransferFrame can carry sequence, path, identity, contract, tag,
 and encryption metadata. The receiver creates ACK/accounting work and the
 sender retains retry state. These features are correct for a store-and-forward
 Transfer protocol, but are unnecessarily repeated for every packet in an
-established direct session.
+established direct session. The same per-packet Transfer work is present before
+the exchange route branches into H1 or H3, so larger envelope-safe batches and
+cumulative accounting also benefit platform traffic and the legacy fallback.
 
 The contract cannot simply be removed: current accounting advances with
 delivered or acknowledged bytes. The fast path needs an equivalent monotonic
 record without turning an accounting receipt into a data recovery protocol.
 
-**Conclusion:** bind the contract and route once to an authenticated fast-path
-session. Count accepted inner payload at the receiver and send cumulative
-authenticated byte checkpoints over the reliable control channel.
+**Conclusion:** direct stream data now uses unacknowledged Transfer records,
+while sequence contract setup is still acknowledged. The production result
+exceeded the target without removing the metadata needed by current policy and
+accounting. Binding contracts once per carrier generation and cumulative
+receipts remain a possible compact-v2 optimization, not a prerequisite for the
+selected rollout.
 
 ### P2PG-006 — the composed provider path has a second ceiling
 
 **Priority: high after the transport prototype**
+
+**Implementation status: resolved for the local target; physical and
+cross-host validation remains.**
 
 The isolated gVisor TUN TCP test sustained 290.5–308.5 MiB/s in nine local
 results, comfortably above gigabit. The optimized Transfer core measured
@@ -268,15 +470,27 @@ microbenchmark improvements must not be multiplied. They show:
 - composition, handoffs, and per-packet work lose a large fraction of the
   isolated capacity;
 - after replacing SCTP, the full provider path must be profiled again rather
-  than assumed solved.
+  than assumed solved;
+- exchange/platform traffic traverses the same app, NAT, policy, Transfer, and
+  provider composition, then adds client platform and server exchange stages;
+  it needs its own full-path profile rather than borrowing the P2P result.
 
 Detailed prior measurements are in
 [PACKETRESEARCH1.md](PACKETRESEARCH1.md) and
 [OPTIMIZENETWORKPEER1.md](OPTIMIZENETWORKPEER1.md).
 
+The new directional full-stack test completed five consecutive invocations
+without a stalled sample after the receive burst-window correction. Its best
+per-invocation results straddled the 119.2 MiB/s decimal-gigabit threshold.
+That closes the known local software ceiling but cannot substitute for
+physical underlay measurements.
+
 ### P2PG-007 — encryption is not the primary bottleneck
 
 **Priority: do not optimize first**
+
+**Implementation status: confirmed; authentication remains enabled on every
+selected fast fragment.**
 
 The current pooled AES-GCM benchmarks on the same Apple M1 Max measured:
 
@@ -294,6 +508,11 @@ addressing the measured syscall ceiling.
 
 **Priority: medium**
 
+**Implementation status: partially resolved. ICE migration/fallback is
+retained, P2P fragments conservatively, and H3 DPLPMTUD is enabled. Continuous
+delivery-quality scoring and an independent raw-UDP PMTU loop remain future
+work.**
+
 ICE selects a working pair, but a gigabit implementation also needs to know
 whether that pair remains the best path. Local/private endpoints, public
 endpoints, interface changes, IPv4/IPv6, NAT behavior, loss, RTT, path MTU,
@@ -304,15 +523,81 @@ can exceed a 1,500-byte outer path over IPv6. Sending an oversized encrypted
 UDP datagram and relying on IP fragmentation amplifies loss: one missing
 fragment loses the entire inner packet.
 
+The app usually exposes one TUN MTU for all routes. Lowering it only in the P2P
+encoder would turn valid 1,440-byte packets into route-dependent drops. The
+shared boundary must either advertise the conservative minimum of all active
+routes or synthesize correct Packet Too Big/MSS behavior before a packet enters
+a route whose effective MTU is smaller. Platform and local routes must remain
+correct when the active P2P path changes that minimum.
+
 **Conclusion:** use conservative initial MTUs, Datagram Packetization Layer
 Path MTU Discovery, validated migration, quality hysteresis, ICMP Packet Too
 Big synthesis or MSS adjustment, and a reliable fallback.
+
+### Applicability by route
+
+| Finding or optimization | Direct P2P | Exchange/platform | Implementation boundary |
+|---|---|---|---|
+| Avoid nested reliable recovery | Yes; the selected RTP/SRTP carrier bypasses SCTP | Yes in principle; requires a client datagram carrier and `server/connect` datagram routing | Connect plus `server/connect` for exchange |
+| Remove SCTP fragmentation and window limits | Yes | No; H1/H3 have different limits | Connect P2P transport |
+| Preserve batches from app TUN through policy and route selection | Yes | Yes | App, SDK, Connect |
+| Batch Transfer and route-manager handoffs | Legacy/control only after P2P fast-path selection | Yes, primary shared improvement | Connect |
+| Batch client carrier writes/reads | Linux `sendmmsg`; bounded ready drains elsewhere | H1/H3 framing and drains | Connect |
+| Batch resident/exchange forwarding | Control traffic only for direct P2P | Yes | `server/connect` |
+| Reuse parse/policy/flow metadata within a bounded batch | Yes | Yes | SDK/Connect, with identical security decisions |
+| TUN `WriteBatch` and GRO/TSO | Yes | Yes | SDK/apps/Connect |
+| Cumulative authenticated accounting receipts | Optional compact-v2 headroom | Required for any future exchange datagram lane | Connect protocol and `server/connect` routing |
+| Path MTU, bounded queues, drop telemetry, migration | Conservative fragmentation and ICE today; more scoring remains | H3 DPLPMTUD today; required for any future exchange datagram lane | Connect and `server/connect` |
+
+The route-neutral items should be implemented once and consumed by all routes.
+Transport-specific adapters must not force the shared batch type to contain
+P2P receiver indices, UDP addresses, WebSocket frames, or exchange resident
+state.
 
 ---
 
 ## Reproducible measurements
 
-### Real detached WebRTC route
+### Comparable production route harness
+
+From `server`, with the normal local Postgres and Redis test services:
+
+~~~sh
+CONNECT_STREAM_ROUTE_PERFORMANCE_MEASURE=1 \
+WARP_ENV=local WARP_SERVICE=test WARP_DOMAIN=bringyour.com \
+WARP_BLOCK=test WARP_VERSION=0.0.0 \
+BRINGYOUR_POSTGRES_HOSTNAME=local-pg.bringyour.com \
+BRINGYOUR_REDIS_HOSTNAME=local-redis.bringyour.com \
+go test ./connect -run '^TestStreamRoutePerformanceComparison$' \
+  -count=1 -timeout=15m -v
+~~~
+
+Set `CONNECT_STREAM_ROUTE_PERFORMANCE_ROUTE` to `exchange-h1`,
+`exchange-h3`, `p2p-legacy`, or `p2p-fast` to isolate one route. The always-on
+`TestStreamRouteDataPlaneSelection` uses the same real topology with a small
+payload and deterministically asserts all four carrier selections.
+
+The full TUN/provider directional gate is:
+
+~~~sh
+WARP_ENV=local WARP_SERVICE=test WARP_DOMAIN=bringyour.com \
+WARP_BLOCK=test WARP_VERSION=0.0.0 \
+BRINGYOUR_POSTGRES_HOSTNAME=local-pg.bringyour.com \
+BRINGYOUR_REDIS_HOSTNAME=local-redis.bringyour.com \
+go test ./connect \
+  -run '^TestConnectMultiClientTcpDirectionalPerformance$' \
+  -count=5 -timeout=15m -v
+~~~
+
+From `connect`, compare the selected production P2P carriers with:
+
+~~~sh
+go test -run '^$' \
+  -bench '^(BenchmarkStreamLegacyWebRtcRoute|BenchmarkStreamFastWebRtcRoute)$' \
+  -benchtime=1s -count=5 .
+~~~
+
+### Legacy detached WebRTC baseline
 
 Run:
 
@@ -480,9 +765,37 @@ headline number.
 
 ---
 
-## Recommended P2P v2 architecture
+## Implemented architecture and compact-v2 direction
 
-### 1. Keep the current connection as the control plane
+This section preserves the original architectural reasoning and distinguishes
+the selected implementation from optional next work. The shared batch
+pipeline and reliable-control/unreliable-data split are implemented. The
+selected carrier reuses RTP/SRTP on the existing ICE/DTLS association. The
+dedicated compact authenticated UDP format, custom exporter keys, and
+cumulative receipts remain an unselected v2 option because the lower-risk SRTP
+carrier already exceeded the target.
+
+The P2P fast path is one transport adapter under a route-neutral packet
+pipeline. The shared API carries a bounded slice of independent packet
+owners plus parsed flow metadata. Source policy and `connect/ip_security`
+remain mandatory before route selection; destination policy remains mandatory
+after authentication. A batch may contain packets that choose different
+providers or carriers, so route selection groups accepted packets into
+sub-batches by destination/session without changing their order within a flow.
+
+The same outbound batch enters one of three adapters:
+
+- negotiated P2P fast path: endpoint/hop seal and UDP batch write;
+- exchange/platform path: envelope-safe Transfer batch and H1/H3 carrier
+  batch;
+- local path: LocalUserNat batch, which already exists internally.
+
+Inbound adapters produce the same packet batch contract before common policy,
+flow association, statistics, and app/TUN delivery. This keeps platform arrays
+and TUN batches useful even when a flow falls back from P2P to the exchange.
+Fallback changes the transport adapter, not the TUN API.
+
+### 1. Keep the current connection as the control plane — implemented
 
 The existing path already provides:
 
@@ -492,22 +805,21 @@ The existing path already provides:
 - contracts and escrow state;
 - signaling, liveness, and legacy interoperability.
 
-Keep it reliable. Add a capability exchange that enables the datagram data
-plane only when both native peers support the same version and security
-features. Browsers and older clients continue using DataChannel/Transfer
-unchanged.
+It remains reliable. Normal WebRTC SDP negotiates the custom codec, and a
+bounded warmup proves both receive workers before `Auto` selects the lane.
+Browsers and older clients continue using DataChannel/Transfer unchanged.
 
-Do not assume Pion's internal ICE socket can simply be wrapped. The production
-fast path must expose the actual UDP socket and its out-of-band control data so
-Linux GSO/GRO, ECN, path MTU signals, socket overflow counters, and batch I/O
-remain available.
+The production path wraps Pion's selected network while preserving its
+concrete UDP methods. Linux uses `sendmmsg`; deeper GSO/GRO, ECN, and socket
+overflow work remains optional headroom.
 
-### 2. Establish a dedicated native datagram component
+### 2. Establish a dedicated native datagram component — prototype only
 
-Use ICE candidate gathering and nomination to establish a dedicated UDP
-component for native-to-native packet data. The exact integration can reuse
-current candidate knowledge or add a separately negotiated component, but the
-result must not pass bulk packets through SCTP.
+The selected implementation establishes a custom RTP sender and receiver on
+the existing peer connection. Bulk packets do not pass through SCTP. A
+separate raw UDP component is no longer required to hit the target, but the
+compact prototype below remains available if one-message fragmentation or
+SRTP overhead becomes the next measured ceiling.
 
 Each wire datagram should contain exactly one inner IP packet:
 
@@ -526,12 +838,12 @@ Peer IDs, route IDs, contract IDs, and long protobuf structures belong in the
 authenticated session setup, not every packet. Header fields are AEAD
 additional authenticated data.
 
-### 3. Derive new directional keys
+### 3. Derive new directional keys — supplied by DTLS/SRTP today
 
-Derive independent send and receive keys from the existing completed,
-identity-bound TLS exporter. Use a new domain-separation label and context that
-includes both peer identities, session or contract identity, direction, and
-key generation.
+The selected carrier uses Pion's DTLS-derived directional SRTP keys,
+authentication, replay handling, and rollover. The compact prototype derives
+independent endpoint and hop keys from exporter material with explicit domain
+separation; those keys are not used by production traffic.
 
 Do not reuse the current sequenceCipher wire format unchanged. It uses a fresh
 random nonce per TransferFrame and no explicit replay window or authenticated
@@ -555,9 +867,11 @@ for receiver indices, counters, replay windows, rekey overlap, and endpoint
 roaming. Connect should preserve its existing identity, contract, and hybrid
 post-quantum key establishment instead of replacing those systems.
 
-### 4. Separate accounting from retransmission
+### 4. Separate accounting from retransmission — direct-data portion implemented
 
-For each authenticated fast-path session:
+Direct-stream IP uses unacknowledged Transfer after contract establishment, so
+data recovery no longer drives accounting ACKs. A future compact session could
+reduce metadata further with cumulative receipts:
 
 1. bind one contract, peer pair, direction, and session epoch during setup;
 2. count only authenticated, replay-accepted inner payload bytes at the
@@ -576,49 +890,82 @@ This preserves the current meaning of delivered/acknowledged contract bytes
 without placing a reliable protocol around the data. It also reduces per-packet
 protobuf, ID, tag, ACK, retry-queue, and timer work.
 
-### 5. Batch across every hot boundary
+### 5. Batch across every hot boundary and every route — implemented where measured
 
-Define a bounded packet batch type with explicit buffer ownership. Preserve
-packet boundaries and carry only the metadata each stage needs.
+The implemented boundaries define bounded packet batches with explicit buffer
+ownership. They preserve packet boundaries and carry only the metadata each
+stage needs. The eventual fully parallel shape remains:
 
 Outbound:
 
     TUN batch
       → parallel parse and policy
-      → route/session lookup
-      → parallel AEAD seal
-      → per-peer counter/order queue
-      → UDP batch send
+      → route/session lookup and stable per-flow grouping
+      → P2P: parallel AEAD seal → ordered UDP batch send
+        or exchange: Transfer batch → H1/H3 carrier batch
+        or local: LocalUserNat batch
 
 Inbound:
 
-    UDP batch receive
-      → session lookup and replay precheck
-      → parallel AEAD open
+    transport batch receive
+      → P2P: session lookup/replay precheck → parallel AEAD open
+        or exchange: framed-message batch → Transfer batch decode
       → replay commit, policy, and accounting
       → TUN batch write
 
 Rules:
 
 - queues are bounded by both packet count and byte count;
-- receive callbacks never block; overload drops and increments a metric;
+- observer callbacks never block; the documented synchronous TUN write is the
+  flow-control boundary; overload at a datagram queue drops and increments a
+  metric;
 - encryption can run across CPU workers, while nonce allocation and final
   per-peer send order remain deterministic;
 - route, contract, and security decisions may be cached only with explicit
   invalidation on policy/session change;
 - packet buffers have one documented owner at every handoff;
-- batch fallback is functionally identical to the fast path.
+- a route change may split a batch but cannot reorder one flow;
+- one malformed, unauthorized, or backpressured packet is dropped and counted
+  without discarding unrelated packets in the same batch;
+- batch fallback is functionally identical to the singular path.
+
+Implemented shared Connect and SDK work:
+
+- adds batch methods beside the existing singular DeviceLocal, mux, and TUN
+  methods;
+- parse each packet once, carry immutable flow metadata, and run the same
+  `connect/ip_security` decision that the singular path runs;
+- wires `RemoteUserNatMultiClient.SetReceivePacketsCallback` through DeviceLocal
+  to a production batch app callback while retaining the singular callback for
+  compatibility and rare packets;
+- let Transfer form larger envelope-safe Packs for exchange/fallback traffic,
+  subject to negotiated client and resident message limits;
+- drains ready H1/H3 writes into bounded message batches rather than relying
+  on a late socket coalescer to recover earlier per-message costs.
+
+Implemented and remaining `server/connect` work for the exchange route:
+
+- retains the current bounded `writev` gather and batches H3 framing; a
+  batch-aware resident channel remains future headroom;
+- reading and dispatching several framed messages through one resident-channel
+  batch remains future headroom;
+- preserve per-message framing, ownership, routing, rate limits, and failure
+  isolation inside every batch;
+- benchmark one-host and cross-host exchange topologies, because co-located
+  loopback can hide the CPU and syscall budget of each production process;
+- if an H3 datagram lane is added, route datagrams through the exchange without
+  converting them back into a reliable TCP/QUIC stream between residents.
 
 Platform work:
 
-| Platform | Required work |
+| Platform | Implemented status and remaining headroom |
 |---|---|
-| Linux | Actual UDPConn; sendmmsg/recvmmsg; UDP GSO/GRO; TUN TSO/GRO where supported; BDP-aware socket buffers; SO_RXQ_OVFL; runtime offload fallback |
-| Apple | Preserve NEPacketTunnelFlow read arrays in one SDK call; return batches to one writePackets call; avoid singleton crossing in both directions |
-| Android | Keep Go ownership of the VPN fd; drain/micro-batch packets above one-packet TUN reads; batch subsequent policy/crypto/UDP work |
-| Windows | Drain the Wintun ring into bounded batches and return batches through the ring API |
+| Linux | Implemented SDK TUN drain and `sendmmsg`; future `recvmmsg`, UDP GSO/GRO, TUN offload, `SO_RXQ_OVFL`, and runtime offload fallback |
+| Apple | Implemented one packed SDK call per `NEPacketTunnelFlow` array and one `writePackets` call per inbound burst |
+| Android | Implemented bounded drain above the Go-owned VPN fd; later stages consume the shared Connect batching |
+| Windows | Implemented bounded Wintun-ring drain and one packed SDK callback/call per burst |
 
-### 6. Add path MTU discovery and quality scoring
+### 6. Add path MTU discovery and quality scoring — partial
 
 Start conservatively, likely near 1,400 inner bytes on ordinary 1,500-byte
 paths, then validate the exact new header against both outer IPv4 and IPv6.
@@ -631,7 +978,7 @@ and relay/direct state. Switch only after the new endpoint is authenticated
 and materially better for long enough to overcome hysteresis. Keep the
 reliable WebRTC path available while a new datagram path is unproven.
 
-### 7. Retain congestion safety without outer retransmission
+### 7. Retain congestion safety without outer retransmission — bounded queues implemented
 
 An IP tunnel may carry UDP applications that do not respond to congestion.
 The datagram path therefore needs:
@@ -653,9 +1000,10 @@ recovery without treating all inner UDP as automatically safe.
 | Choice | Advantages | Limits | Recommendation |
 |---|---|---|---|
 | Tune current reliable SCTP | Small, compatible changes | Shared Reno window, fragmentation, SACK/retry work, and syscall shape remain | Maintain only as fallback |
-| Unordered SCTP with zero retransmissions | Capability-negotiated stepping stone; tests failure semantics quickly | Still SCTP-fragmented, association-congestion-controlled, and one write per packet | Build as an experiment, not the final design |
-| QUIC DATAGRAM | Mature Go implementation; authentication, migration, PMTUD, and Linux GSO support; explicitly designed for VPN-style unreliable payloads | QUIC DATAGRAM remains congestion-controlled; can create nested control; a generic PacketConn wrapper can hide GSO, ECN, and OOB data | Benchmark as the safest rapid prototype |
-| Connect authenticated raw UDP | Exact semantics; no outer recovery; easiest to batch like WireGuard; can derive keys from existing PQ-capable identity session | Connect must implement replay, rekey, PMTU, pacing/circuit breaker, migration validation, and protocol review | Recommended production direction after prototype and review |
+| Custom RTP/SRTP on current peer connection | Reuses ICE, DTLS, authentication, replay, migration, SDP capability fallback, and existing sockets; measured above target | Transfer messages larger than 1,400 bytes fragment; not the minimum possible header | Selected production fast path |
+| Unordered SCTP with zero retransmissions | Capability-negotiated stepping stone | Still SCTP-fragmented, association-congestion-controlled, and one write per packet | Not selected |
+| QUIC DATAGRAM | Mature authentication, migration, PMTUD, and Linux GSO support | Requires a second association and remains QUIC-congestion-controlled | Reconsider only if a future measurement justifies it |
+| Connect authenticated raw UDP | Minimum overhead and exact semantics; compact codec already measured | Requires independent replay, rekey, PMTU, pacing, migration validation, and protocol review | Future headroom, not selected |
 | WireGuard-Go data plane | Proven batching, queues, replay, counters, roaming, and high throughput | Not a drop-in match for Connect contracts, multi-consumer provider addressing, current identity/PQ session, or control plane | Reuse design and possibly isolated machinery, not the full system by assumption |
 
 [RFC 9221](https://www.rfc-editor.org/rfc/rfc9221.html) explicitly identifies
@@ -674,77 +1022,248 @@ SCTP association, whose congestion control is shared:
 
 ---
 
-## Phased implementation plan
+## Optional compact authenticated UDP wire prototype
 
-### Phase 0 — freeze a trustworthy baseline
+The Connect repository now contains a compact fast-path data-plane prototype:
 
-- Add one command that records raw underlay iperf3 TCP and UDP capacity,
-  current WebRTC route goodput, full-tunnel goodput, CPU, syscalls, drops,
-  latency, and accounting delta.
-- Record both directions and five fresh-process repetitions.
-- Label same-host, virtual-network, and physical-device measurements
-  separately.
-- Do not report a gigabit tunnel result when the raw underlay is below
-  1.2 Gbit/s.
+- [stream_fast_path.go](stream_fast_path.go) implements the wire codec, key
+  derivation, replay window, per-hop accounting, buffer ownership, and batch
+  operations;
+- [stream_fast_path_test.go](stream_fast_path_test.go) deterministically tests
+  every supported stream length, end-to-end opacity, adjacent-hop
+  authentication, replay and reordering, generation routing, accounting,
+  independent batch drops, size bounds, and steady-state allocations;
+- [stream_fast_path_benchmark_test.go](stream_fast_path_benchmark_test.go)
+  compares the prototype with the real WebRTC route and exercises UDP through
+  one, two, and nine hops in both serial and independently staged forms.
 
-### Phase 1 — test semantics on the existing association
+This is a wire and local data-plane prototype. It is not selected by the
+production stream, does not carry production traffic, and is not needed for
+the measured gigabit result. It remains useful as a lower-overhead comparison
+and as tested groundwork if SRTP fragmentation becomes a future ceiling.
 
-- Capability-negotiate a second unordered DataChannel with MaxRetransmits set
-  to zero for inner IP traffic.
-- Keep reliable control on the existing channel.
-- Disable Transfer data ACK/retry for that experimental lane.
-- Add cumulative contract receipts.
-- Test loss, duplication, reordering, closure, rollover, and old-client
-  fallback.
+### Composition across a stream
 
-This phase validates accounting and failure behavior. It is not expected to
-reach gigabit because SCTP fragmentation, congestion control, and writes
-remain.
+The source encrypts an inner packet once with the endpoint key, then seals that
+opaque envelope for its first adjacent hop. Each intermediary does exactly two
+operations, regardless of its position:
 
-### Phase 2 — build two datagram prototypes
+1. authenticate and open the incoming hop envelope;
+2. account for the authenticated packet and seal the unchanged endpoint
+   envelope to the next hop.
 
-- Prototype QUIC DATAGRAM over a socket path that retains actual UDP/OOB
-  capabilities.
-- Prototype the compact exporter-derived raw authenticated UDP format.
-- Use the same packet-batch API and accounting receipt model in both.
-- Compare transport-only throughput and behavior before integrating the
-  complete provider.
+The destination opens its adjacent-hop envelope and then the endpoint envelope.
+An intermediary can therefore authenticate its neighbor and enforce its local
+contract without receiving the endpoint key or seeing the inner IP packet. A
+stream is represented as a source, a slice of identical forwarders, and a
+destination. There is no direct-only or fixed-hop branch. The tests cover all
+current lengths from one through nine P2P hops.
 
-Select the production transport using measured clean-path throughput, loss
-behavior, implementation complexity, mobile support, and security review.
+The wire overhead is constant across stream length:
 
-### Phase 3 — make batching end to end
+    endpoint envelope: 8-byte counter + inner packet + 16-byte tag
+    hop envelope:      4-byte magic/version + 4-byte receiver index
+                       + 8-byte counter + endpoint envelope + 16-byte tag
 
-- Add batch interfaces and buffer ownership tests in Connect and SDK.
-- Implement Linux UDP and TUN batching/offload first because it provides the
-  clearest gigabit validation platform.
-- Preserve Apple packet arrays.
-- Add Android and Windows bounded drain batches.
-- Feed decrypted inbound batches into Tun.WriteBatch and outbound TUN batches
-  directly to the crypto workers.
+This adds 56 bytes to the inner packet. The prototype limits the inner packet
+to 1,380 bytes, making the largest UDP payload 1,436 bytes and the outer IPv6
+packet 1,484 bytes. Production selection must lower the current 1,440-byte TUN
+MTU before sending traffic on this lane, then replace the fixed conservative
+limit with validated path-MTU behavior.
 
-### Phase 4 — optimize the composed provider
+Keys are derived with HKDF-SHA-256 from identity-bound exporter material. The
+derivation includes the stream id, generation id, contract id, adjacent source
+and destination ids, layer, and direction. The receiver index is only an
+unauthenticated local lookup key; the selected generation authenticates the
+complete header before committing replay or accounting state. A 1,024-packet
+sliding window accepts bounded reordering and rejects zero, duplicates, and old
+packets. Authentication completes before the window advances, so a forged
+future counter cannot evict valid packets.
 
-- Profile the full native app → P2P → provider gVisor/NAT → Internet path.
-- Remove remaining singleton handoffs, redundant parsing, and cache misses.
-- Preserve all connect/ip_security decisions and contract enforcement.
-- Consider an optional Linux kernel-forwarding provider only if the
-  userspace path remains below target and after a separate privilege/security
-  review.
+### Prototype measurements
 
-### Phase 5 — path quality and rollout
+These results are five-run medians on the same Apple M1 Max used for the
+baseline research, using Go 1.26.5 and 1,380 useful inner bytes per packet:
 
-- Add DPLPMTUD, endpoint-quality scoring, authenticated migration, and relay
-  fallback.
-- Roll out behind capabilities and environment flags.
-- Compare accounting between old and new paths during a shadow/canary period.
-- Keep immediate disable and legacy fallback controls.
+| Benchmark | Median useful throughput | Steady-state allocations |
+|---|---:|---:|
+| Fast-path endpoint plus one hop, codec only | 668.35 MB/s | 0 |
+| Fast-path endpoint plus nine hops, codec only | 139.40 MB/s | 0 |
+| Fast-path one-hop UDP loopback, serial batch of 64 | 147.80 MB/s | 0 |
+| Fast-path one-hop UDP loopback, independently staged batch of 64 | 175.40 MB/s | 0 |
+| Production legacy WebRTC/SCTP route | 33.30 MB/s | about 180 per operation |
+| Selected production RTP/SRTP route | 194.78 MB/s | 1 per operation |
+
+The compact serial UDP result has a 1.18 Gbit/s median and the staged result a
+1.40 Gbit/s median. The selected SRTP carrier is faster in this same-host
+microbenchmark because it reuses optimized Pion state and does not perform the
+prototype's extra endpoint-plus-hop AEAD composition. Both remove the old
+DataChannel/SCTP ceiling.
+
+The codec-only nine-hop result charges every hop's cryptography to one process.
+In a deployed stream that work is distributed across the clients. Conversely,
+the multi-socket UDP benchmarks place all simulated clients and all loopback
+kernel work on one machine, so their long-stream aggregate is a stress test,
+not a model of per-client capacity. None of these numbers includes a TUN,
+provider policy, WAN loss, pacing, path-MTU discovery, or contract receipt
+traffic. They prove that the proposed wire shape removes the measured SCTP
+ceiling; they do not yet prove a gigabit product tunnel.
+
+Reproduce the focused comparison with:
+
+```sh
+go test -run '^$' \
+  -bench '^(BenchmarkStreamFastPathUDPOneHopBatch64|BenchmarkStreamFastPathUDPPipelineOneHopBatch64|BenchmarkStreamLegacyWebRtcRoute|BenchmarkStreamFastWebRtcRoute)$' \
+  -benchtime=1s -count=5 .
+```
+
+### Repository boundary
+
+The P2P fast path itself can be implemented entirely in Connect. Connect owns
+`StreamSequence`, each adjacent P2P transport, route management, ICE, packet
+crypto, replay state, and the protocol package needed for capability and
+receipt messages. For a direct P2P stream, the server can continue forwarding
+the reliable control messages and does not need to inspect data datagrams.
+
+The complete route-neutral gigabit path cannot be finished only in Connect.
+The SDK and app repositories own the platform TUN boundaries. Preserving Apple
+packet arrays, adding Android and Windows drain batches, and passing batches
+into and out of Connect require changes at those boundaries. The exchange
+route also lives partly in [server/connect](../server/connect): resident
+forwarding, exchange framing, server-side batching, and any future platform
+datagram route must be implemented and measured there. A client-only fast lane
+that becomes reliable again inside the exchange does not solve nested recovery.
+
+The intended ownership is therefore:
+
+| Area | Repository |
+|---|---|
+| Shared packet-batch contract, policy, route grouping, Transfer batching | `connect` |
+| DeviceLocal and platform app/TUN batch bridge | `sdk`, Apple, Android, Windows, Linux apps |
+| Direct P2P datagram transport and stream-hop composition | `connect` |
+| H1/H3 platform carrier batching | `connect` |
+| Resident/exchange batching and future platform datagram routing | `server/connect` |
+
+Selecting this compact prototype later would still require agreed generation
+and receiver-index lifecycle, exporter handoff, a raw UDP/ICE sidecar,
+cumulative receipt serialization, pacing and congestion safeguards, PMTU,
+authenticated endpoint migration, and protocol review. The selected SRTP path
+already implements capability negotiation, bounded queues, drop counters,
+ICE migration, and legacy fallback without introducing that second lifecycle.
+
+---
+
+## Implementation ledger
+
+### Phase 0 — trustworthy baseline: complete for local topology
+
+- The four-route `server/connect` harness forces H1, H3, legacy P2P, and fast
+  P2P through one measurement implementation.
+- P2P carrier counters reject fallback or mixed-lane results. Unique packet
+  indexes reject loss, duplication, and favorable miscounting.
+- The opt-in comparison runs five repetitions and enforces a minimum 1.5x
+  fast/legacy median gain.
+- Raw underlay, cross-host, and physical-device runs remain deployment gates.
+
+### Phase 1 — semantics on the existing association: complete with SRTP
+
+- SDP capability negotiation, mutual readiness, `Auto`, `LegacyOnly`, and
+  `FastOnly` are production settings.
+- Direct IP data disables duplicate Transfer retry; contract setup and control
+  remain reliable.
+- Tests cover capable peers, one-sided old-peer fallback, forced lanes,
+  malformed fragments, reordering, duplicates, expiry, bounded overflow, and
+  caller-settings immutability.
+- A zero-retransmit SCTP lane was not selected because it retained the measured
+  SCTP syscall and fragmentation limits.
+
+### Phase 2 — datagram prototypes and selection: complete
+
+- The compact authenticated UDP codec covers replay, key separation,
+  ownership, batches, accounting counters, and one-to-nine-hop composition.
+- The production RTP/SRTP carrier covers real ICE, DTLS, SRTP, negotiation,
+  fragmentation, bounded reassembly, and three-hop composition.
+- RTP/SRTP was selected because it exceeded the target while reusing the
+  mature connection lifecycle and preserving automatic old-peer fallback.
+
+### Phase 3 — route-neutral batching: complete for requested app boundaries
+
+- Connect mux, DeviceLocal, SDK packed ABI, proxy, Apple, Windows, Android,
+  Linux, H3 client, and H3 server changes are implemented and tested.
+- Linux `sendmmsg` and platform-independent bounded ready drains are active.
+- Singular APIs remain for compatibility and synthesized/mixed traffic.
+- `recvmmsg`, UDP GSO/GRO, parallel crypto, and resident-channel batches remain
+  optional measured headroom.
+
+### Phase 4 — composed route optimization: locally complete
+
+- Forced P2P and exchange route results are recorded above.
+- The full TUN/gVisor/provider directional test is stable across five complete
+  invocations after correcting the too-small fast receive burst window.
+- All existing `connect/ip_security` and contract enforcement stays on the
+  shared packet path.
+- Cross-host exchange, physical NIC, and Internet-provider profiling remains.
+
+### Phase 5 — quality and rollout: capability controls complete, field gates remain
+
+- Capability-based automatic rollout, forced disable/require controls, ICE
+  migration, bounded warmup, and legacy fallback are implemented.
+- H3 DPLPMTUD is enabled and the SRTP fragment size is conservative.
+- Continuous delivery-quality scoring, physical path-MTU validation, loss/RTT
+  matrices, thermal tests, and canary telemetry remain release work.
 
 ---
 
 ## Deterministic validation matrix
 
-### Network conditions
+### End-to-end integration performance tests
+
+`server/connect` is the correct home for the composed route tests because it
+can stand up real handlers, residents, exchange links, platform transports,
+stream setup, and P2P negotiation in one controlled topology. The existing
+suite provides useful pieces:
+
+- `connect_perf_test.go` measures the real cross-exchange client path;
+- `connect_multiclient_perf_test.go` and
+  `connect_multiclient_tcp_directional_perf_test.go` include the TUN, NAT,
+  provider, exchange, and app-injection boundaries;
+- `connect_stream_p2p_test.go` proves that a negotiated stream continues over
+  real P2P after the platform transports close.
+
+`stream_route_performance_test.go` now supplies four forced cases using the
+same inner traffic generator and measurement code:
+
+| Case | Implemented topology and assertion |
+|---|---|
+| Legacy P2P | Real stream setup and WebRTC/SCTP data; assert the legacy lane is selected |
+| Fast P2P | Real stream setup and RTP/SRTP data; assert fast send/receive, zero legacy payload, zero fallback, and zero carrier drop |
+| Exchange H1 | Real client H1 transports plus resident/exchange forwarding; assert no P2P route carried data |
+| Exchange H3 | Real client H3 transports plus resident/exchange forwarding; force H3 rather than automatic mode selection |
+
+Every measured route warms up, then performs five exact-delivery runs. The P2P
+comparison fails below a 1.5x median gain. The production three-hop test in
+Connect separately proves that the same negotiated fast carrier composes at
+each adjacent hop. The full-stack directional TCP test separately includes the
+TUN, gVisor NAT, and provider boundaries and is repeated five times for
+flakiness. Keeping route forcing and physical TUN composition as distinct tests
+makes carrier attribution deterministic without calling a codec loopback an
+end-to-end result.
+
+The tests use production controls rather than test-only packet relays:
+
+- `LegacyOnly`, `FastOnly`, and `Auto` P2P selection;
+- forced H1 and H3 platform selection;
+- observable message, byte, fragment, fallback, and drop counters on P2P;
+- a legacy-versus-fast comparison in one result with identical payload,
+  topology, MTU, contracts, and underlay.
+
+`FastOnly` is wired into the production P2P transport. The compact UDP codec
+benchmark remains clearly separate and cannot satisfy the route gate.
+
+### Remaining field-validation conditions
+
+The local deterministic suite does not emulate this entire matrix. Run these
+before making a product-wide gigabit or loss-behavior claim:
 
 | Dimension | Values |
 |---|---|
@@ -764,7 +1283,14 @@ Run on:
 - physical current-generation iPhone and Pixel;
 - same-LAN, NAT-to-NAT, IPv4, IPv6, network-change, and relay-fallback paths.
 
-### Measurements
+Run the server topology in both forms:
+
+- one process/host for deterministic correctness and profiles;
+- separate client, resident, and exchange processes or hosts for throughput,
+  so loopback scheduling does not charge every hop to one machine or hide an
+  internal exchange bottleneck.
+
+### Remaining field measurements
 
 - useful inner payload and outer wire throughput;
 - packets and syscalls per second;
@@ -778,7 +1304,7 @@ Run on:
 - device thermal state and battery cost;
 - sender bytes versus authenticated receiver accounting receipts.
 
-### Exit gates
+### Release gates
 
 1. Every isolated hot stage sustains at least 200 MiB/s on the Linux reference
    machine.
@@ -795,6 +1321,11 @@ Run on:
 7. Invalid authentication, replay-window, policy, IP-security, MTU, and
    anti-amplification cases have deterministic tests.
 8. Old peers and browsers fall back without user-visible failure.
+9. Forced P2P and forced exchange tests reproduce the selected carriers, and a
+   separate full-stack test covers app/TUN/provider composition; no codec-only
+   result can satisfy this gate.
+10. Shared batching improves or preserves both P2P and exchange performance;
+    a P2P gain may not regress forced H1/H3 goodput, latency, drops, or memory.
 
 ## Work that should not lead the project
 
@@ -831,34 +1362,38 @@ The current code already contains important, measured corrections:
 - gVisor TUN batch/GRO support;
 - teardown, route recovery, and contract-accounting correctness work.
 
-P2P v2 should replace the limiting bulk-data semantics without regressing
-these setup, security, lifecycle, memory, and fallback properties.
+The selected P2P fast lane replaces the limiting bulk-data semantics without
+regressing these setup, security, lifecycle, memory, and fallback properties.
 
 ## Final assessment
 
 Confidence is:
 
-- **High** that an unreliable authenticated datagram plane and end-to-end
-  batching are necessary for gigabit.
+- **High** that removing SCTP from capable native bulk traffic and preserving
+  batches was the correct fix: the comparable local route improved 3.20x and
+  exceeded one decimal gigabit.
 - **High** that queue-depth increases, additional DataChannels, and removing
   encryption will not solve the measured ceiling.
-- **Medium** that the current userspace Connect/provider architecture can reach
-  gigabit on desktop/Linux after the datagram and batch work; isolated TUN and
-  crypto measurements provide the required headroom, but the composed provider
-  must prove it.
+- **High** that the current userspace route has local desktop headroom: the
+  forced fast route reached 150.73 MB/s median and the composed directional TCP
+  path reached the threshold in its best complete samples.
+- **Medium** that ordinary desktop/Linux physical deployments will sustain the
+  target until cross-host NIC, NAT, RTT, loss, and underlay tests confirm it.
 - **Conditional** for mobile gigabit because platform packet APIs, radios,
   thermals, and device CPUs vary substantially.
 
-The shortest credible route is therefore:
+The remaining credible route to a product-wide claim is:
 
-1. preserve WebRTC/Transfer as the reliable control and compatibility plane;
-2. prove cumulative contract receipts using a zero-retransmit experimental
-   lane;
-3. benchmark QUIC DATAGRAM and a compact exporter-derived authenticated UDP
-   prototype;
-4. select the transport from measurements and security review;
-5. batch every layer, starting with Linux;
-6. validate the complete provider path under a deterministic network matrix.
+1. retain `Auto` capability fallback and the reliable control plane;
+2. validate Linux, Windows, macOS, Android, and iOS on physical same-LAN paths;
+3. run the RTT, loss, MTU, migration, and relay matrix above;
+4. measure cross-host exchange and provider paths independently;
+5. add GSO/GRO, continuous quality scoring, or the compact codec only when a
+   new profile identifies one of them as the next ceiling;
+6. canary the fast lane with fallback/drop/accounting telemetry before broad
+   rollout.
 
-That path addresses the measured bottleneck and retains the properties that
-make Connect more than a generic packet tunnel.
+The implementation addresses the measured bottleneck and retains the
+properties that make Connect more than a generic packet tunnel. The remaining
+work is deployment validation and measured hardening, not another wholesale
+data-plane redesign.

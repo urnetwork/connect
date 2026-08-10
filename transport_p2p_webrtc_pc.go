@@ -6,12 +6,15 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
 
 	"github.com/pion/datachannel"
 	"github.com/pion/ice/v4"
+	"github.com/pion/transport/v4"
+	"github.com/pion/transport/v4/stdnet"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -57,6 +60,7 @@ func newWebRtcPeerConnectionFactory(
 	log := loggerOrDefault(settings.Log)
 	s.LoggerFactory = &pionLoggerFactory{log: log}
 	logIceInterfaces(log)
+	var selectedNet transport.Net
 	if settings.UseLoopbackOnlyIceInterfaces {
 		// hermetic same-host mode (tests): gather only loopback candidates so
 		// the local connect cost is a couple of pairs, independent of the
@@ -71,7 +75,7 @@ func newWebRtcPeerConnectionFactory(
 		// loop into the tunnel this process provides (R1); a no-op off
 		// Windows and when no egress index is set.
 		if egressNet, err := newEgressNet(log); err == nil {
-			s.SetNet(egressNet)
+			selectedNet = egressNet
 		} else {
 			// this branch is taken, so the iceNet fallback below is NOT: pion
 			// keeps its default net, which gathers from net.Interfaces() --
@@ -92,7 +96,26 @@ func newWebRtcPeerConnectionFactory(
 		// cross-product for every peer connection. One current IPv4/IPv6 pair
 		// is both the usable path and a bounded setup cost.
 		// See OPTIMIZENETWORKPEER1.md §5.1.
-		s.SetNet(iceNet)
+		selectedNet = iceNet
+	}
+	if settings.EnableDatagramFastPath &&
+		0 < settings.DatagramFastPathWriteQueueSize &&
+		0 < settings.DatagramFastPathWriteBatchSize {
+		if selectedNet == nil {
+			standardNet, err := stdnet.NewNet()
+			if err != nil {
+				return nil, nil, fmt.Errorf("create WebRTC socket network: %w", err)
+			}
+			selectedNet = standardNet
+		}
+		selectedNet = newP2pUdpBatchNet(
+			selectedNet,
+			settings.DatagramFastPathWriteQueueSize,
+			settings.DatagramFastPathWriteBatchSize,
+		)
+	}
+	if selectedNet != nil {
+		s.SetNet(selectedNet)
 	}
 	s.DetachDataChannels()
 	if settings.EnableSctpSnap {
@@ -162,7 +185,12 @@ func newWebRtcPeerConnectionFactory(
 		},
 		Certificates: []webrtc.Certificate{*certificate},
 	}
-	// Build one API per SCTP receive-buffer size, sharing the certificate.
+	mediaEngine, err := newWebRtcMediaEngine(settings)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create WebRTC media engine: %w", err)
+	}
+	// Build one API per SCTP receive-buffer size, sharing the certificate and
+	// immutable codec registry.
 	// `WithSettingEngine` copies the engine, so mutating the buffer between
 	// NewAPI calls gives each API its own snapshot. Public peers get the
 	// (small, many-connection) window; a trusted network peer gets the larger
@@ -172,7 +200,7 @@ func newWebRtcPeerConnectionFactory(
 		s.SetSCTPMaxReceiveBufferSize(uint32(receiveBufferByteCount))
 		return webrtc.NewAPI(
 			webrtc.WithSettingEngine(s),
-			webrtc.WithMediaEngine(&webrtc.MediaEngine{}),
+			webrtc.WithMediaEngine(mediaEngine),
 			webrtc.WithInterceptorRegistry(nil),
 		)
 	}

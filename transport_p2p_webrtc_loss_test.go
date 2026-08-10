@@ -57,6 +57,10 @@ func newVnetWebRtcPeerConnectionFactory(
 	settings *WebRtcSettings,
 ) *webRtcPeerConnectionFactory {
 	t.Helper()
+	mediaEngine, err := newWebRtcMediaEngine(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
 	settingEngine := webrtc.SettingEngine{}
 	settingEngine.SetNet(network)
 	settingEngine.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
@@ -80,7 +84,7 @@ func newVnetWebRtcPeerConnectionFactory(
 	}
 	api := webrtc.NewAPI(
 		webrtc.WithSettingEngine(settingEngine),
-		webrtc.WithMediaEngine(&webrtc.MediaEngine{}),
+		webrtc.WithMediaEngine(mediaEngine),
 		webrtc.WithInterceptorRegistry(nil),
 	)
 	return &webRtcPeerConnectionFactory{

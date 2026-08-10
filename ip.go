@@ -4163,6 +4163,23 @@ func providerReturnTransferOptions(
 	return defaultOptions
 }
 
+// IP data already assigned to a stream uses the inner transport's recovery.
+// Network peers select the stream lane with ForceStream before their first
+// stream-tagged Pack; public direct peers expose the established stream id on
+// the inbound path. Contract setup remains acknowledged inside SendSequence,
+// and a legacy platform or DataChannel fallback remains reliable.
+func providerReturnIpTransferOptions(
+	defaultOptions TransferOptions,
+	provideMode protocol.ProvideMode,
+	source TransferPath,
+) TransferOptions {
+	options := providerReturnTransferOptions(defaultOptions, provideMode)
+	if options.ForceStream || source.StreamId != (Id{}) {
+		options.Ack = false
+	}
+	return options
+}
+
 // `ReceivePacketFunction`
 // providerReturnBatchMaxFrames / providerReturnBatchMaxBytes bound one
 // coalesced return Pack so the complete transfer frame stays below the
@@ -4221,9 +4238,10 @@ func (self *RemoteUserNatProvider) ReceiveBatch(
 	}
 
 	returnProvideMode := self.sourceReturnProvideMode(source.SourceId, provideMode)
-	returnOption := providerReturnTransferOptions(
+	returnOption := providerReturnIpTransferOptions(
 		self.client.settings.DefaultTransferOpts,
 		returnProvideMode,
+		source,
 	)
 	destination := source.Reverse()
 
@@ -4333,11 +4351,13 @@ func (self *RemoteUserNatProvider) Receive(
 	// receives it as network mode and skips the public ingress rules. Other
 	// modes ride a companion contract (verified as Stream) as before.
 	returnProvideMode := self.sourceReturnProvideMode(source.SourceId, provideMode)
-	returnOption := providerReturnTransferOptions(
+	returnOption := providerReturnIpTransferOptions(
 		self.client.settings.DefaultTransferOpts,
 		returnProvideMode,
+		source,
 	)
-	// note udp is sent with ack because because otherwise the delivery reliability will mulitply with the egress
+	// Direct stream IP leaves recovery to the inner transport. A platform-only
+	// return keeps the configured Transfer acknowledgement behavior.
 	c := func() bool {
 		var sent bool
 		if 2 <= self.settings.ProtocolVersion {

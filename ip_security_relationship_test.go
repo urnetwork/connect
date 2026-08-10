@@ -284,6 +284,39 @@ func TestProviderReturnTransferOptionPreventsForceStreamFork(t *testing.T) {
 	}
 }
 
+// Stream IP data must not retain Transfer retry around the datagram carrier.
+// Control traffic continues to use providerReturnTransferOptions and remains
+// acknowledged, so this test targets only the IP-specific option helper.
+func TestProviderReturnIpTransferOptionsAvoidsDuplicateRecovery(t *testing.T) {
+	defaultOptions := DefaultTransferOpts()
+	networkOptions := providerReturnIpTransferOptions(
+		defaultOptions,
+		protocol.ProvideMode_Network,
+		TransferPath{},
+	)
+	if networkOptions.Ack || !networkOptions.ForceStream {
+		t.Fatalf("network IP options = %#v, want unacknowledged stream", networkOptions)
+	}
+
+	publicStreamOptions := providerReturnIpTransferOptions(
+		defaultOptions,
+		protocol.ProvideMode_Public,
+		TransferPath{StreamId: NewId()},
+	)
+	if publicStreamOptions.Ack || !publicStreamOptions.CompanionContract {
+		t.Fatalf("public stream IP options = %#v, want unacknowledged companion", publicStreamOptions)
+	}
+
+	publicPlatformOptions := providerReturnIpTransferOptions(
+		defaultOptions,
+		protocol.ProvideMode_Public,
+		TransferPath{},
+	)
+	if !publicPlatformOptions.Ack {
+		t.Fatalf("public platform IP options = %#v, want acknowledged", publicPlatformOptions)
+	}
+}
+
 // A provider replies to an ephemeral per-window source id, not necessarily the
 // top-level peer id remembered by PeerManager. The authenticated ProvideMode is
 // therefore the authoritative classification for the first return contract.

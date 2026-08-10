@@ -601,6 +601,19 @@ func DefaultWebRtcSettings() *WebRtcSettings {
 		// and send normal checksums. This removes one checksum on each DATA/
 		// SACK path when both directions support it.
 		EnableSctpZeroChecksum: true,
+		// Native peers negotiate a custom RTP codec carried by the existing
+		// ICE/DTLS/SRTP association. Transfer frames sent on that lane avoid
+		// SCTP's duplicate reliability and head-of-line behavior; an older peer
+		// simply omits the codec and continues on the data channel.
+		EnableDatagramFastPath: true,
+		// At one gigabit, a 64-message queue covers only about 1.5 ms of
+		// ordinary two-packet Transfer messages. That made a normal scheduler
+		// turn or short GC pause look like network loss on the device receive
+		// side. Keep roughly 24 ms of burst absorption; the queue stores pooled
+		// messages only while the route worker is actually behind.
+		DatagramFastPathReceiveBufferSize: 1024,
+		DatagramFastPathWriteQueueSize:    256,
+		DatagramFastPathWriteBatchSize:    64,
 		// Pion's Reno-style congestion avoidance otherwise adds one ~1.2 KiB
 		// MTU only after a complete cwnd is acknowledged. On a measured 50 ms
 		// path with independent wireless loss, recovery from the observed
@@ -686,6 +699,25 @@ type WebRtcSettings struct {
 	SignalReceiveWorkerCount int
 	EnableSctpSnap           bool
 	EnableSctpZeroChecksum   bool
+	// EnableDatagramFastPath advertises the native SRTP datagram lane. It is
+	// capability-negotiated and does not remove the legacy data channel.
+	EnableDatagramFastPath bool
+	// DatagramFastPathReceiveBufferSize bounds complete reassembled messages
+	// waiting for the route worker. Full queues drop datagrams; the inner
+	// transport recovers direct-IP loss without a second Transfer retry loop.
+	DatagramFastPathReceiveBufferSize int
+	// DatagramFastPathWriteQueueSize bounds the native WebRTC socket's copied
+	// userspace send buffer. A full queue blocks the carrier writer, preserving
+	// backpressure instead of dropping before the kernel socket.
+	DatagramFastPathWriteQueueSize int
+	// DatagramFastPathWriteBatchSize bounds a ready-only socket drain. Linux
+	// sends each drain with sendmmsg; other systems overlap sequential kernel
+	// sends with Transfer and crypto work without adding an idle delay.
+	DatagramFastPathWriteBatchSize int
+	// DataPlaneStats receives carrier-level drops before a complete Transfer
+	// message reaches P2pReceiveTransport. NewClient aligns this pointer with
+	// the stream transport settings; direct WebRTC users may leave it nil.
+	DataPlaneStats *P2pDataPlaneStats
 	// SCTP congestion controls are byte counts. Zero retains Pion's RFC-style
 	// default. CwndCAStep changes only additive recovery; MinCwnd is a hard
 	// floor and FastRtxWnd is the loss-retransmit burst cap.
@@ -2380,6 +2412,7 @@ type peerConn struct {
 
 	signalSender SignalSender
 	settings     *WebRtcSettings
+	fastPath     *webRtcFastPath
 
 	// api *webrtc.API
 	pc *webrtc.PeerConnection
@@ -2517,6 +2550,10 @@ func (self *peerConn) Run() {
 	self.pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		self.handlePeerConnectionState(state)
 	})
+	if err := self.configureFastPath(); err != nil {
+		self.cancelBecause(fmt.Errorf("configure datagram fast path: %w", err))
+		return
+	}
 
 	// register ice candidate handler before SetLocalDescription so candidates
 	// emitted during gathering aren't dropped. candidates are buffered until
@@ -3194,6 +3231,9 @@ func (self *peerConn) setConnected(connected bool) {
 	}()
 
 	if changed {
+		if connected {
+			self.startFastPathWarmup()
+		}
 		if connected && self.log.V(1).Enabled() {
 			// One low-frequency line identifies whether the formed route is
 			// direct and which address family won ICE. This is essential when

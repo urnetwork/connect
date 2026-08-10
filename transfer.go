@@ -667,12 +667,37 @@ func NewClientWithTag(
 	// tree. Copy instead of writing through the caller's settings: the
 	// caller may share them with concurrent client constructions (see the
 	// platform transport framer settings for the same rule).
-	if settings.WebRtcSettings != nil && settings.WebRtcSettings.Log == nil {
-		copied := *settings
-		webRtcCopied := *copied.WebRtcSettings
-		webRtcCopied.Log = log
-		copied.WebRtcSettings = &webRtcCopied
-		settings = &copied
+	if settings.WebRtcSettings != nil {
+		var p2pSettings *P2pTransportSettings
+		if settings.StreamManagerSettings != nil &&
+			settings.StreamManagerSettings.StreamBufferSettings != nil {
+			p2pSettings = settings.StreamManagerSettings.
+				StreamBufferSettings.
+				P2pTransportSettings
+		}
+		legacyOnly := p2pSettings != nil &&
+			p2pSettings.DataPlaneMode == P2pDataPlaneModeLegacyOnly
+		var dataPlaneStats *P2pDataPlaneStats
+		if p2pSettings != nil {
+			dataPlaneStats = p2pSettings.DataPlaneStats
+		}
+		if settings.WebRtcSettings.Log == nil ||
+			(legacyOnly && settings.WebRtcSettings.EnableDatagramFastPath) ||
+			settings.WebRtcSettings.DataPlaneStats != dataPlaneStats {
+			copied := *settings
+			webRtcCopied := *copied.WebRtcSettings
+			if webRtcCopied.Log == nil {
+				webRtcCopied.Log = log
+			}
+			if legacyOnly {
+				// A legacy-only peer must not advertise a lane it will refuse to
+				// receive. Otherwise an Auto peer selects fast asymmetrically.
+				webRtcCopied.EnableDatagramFastPath = false
+			}
+			webRtcCopied.DataPlaneStats = dataPlaneStats
+			copied.WebRtcSettings = &webRtcCopied
+			settings = &copied
+		}
 	}
 	client := &Client{
 		ctx:              cancelCtx,
