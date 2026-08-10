@@ -42,57 +42,61 @@ func TestClassifyDialFailure(t *testing.T) {
 	for _, protocol := range []IpProtocol{IpProtocolTcp, IpProtocolUdp} {
 		for _, version := range []int{4, 6} {
 			for _, c := range cases {
-				t.Run(fmt.Sprintf("%s/v%d/%s", protocol, version, c.name), func(t *testing.T) {
-					ipPath := dialFailureTestPath(protocol, version)
+				label := fmt.Sprintf("%s/v%d/%s", protocol, version, c.name)
 
-					want := c.wantTcp
-					if protocol == IpProtocolUdp {
-						// udp "dial" never yields a meaningful refusal at connect
-						// time, so every error -- ECONNREFUSED included -- is
-						// capacity-class.
-						want = dialFailureUnreachable
-					}
+				ipPath := dialFailureTestPath(protocol, version)
 
-					action, packet := classifyDialFailure(ipPath, c.err)
-					if action != want {
-						t.Fatalf("action = %d, want %d", action, want)
-					}
+				want := c.wantTcp
+				if protocol == IpProtocolUdp {
+					// udp "dial" never yields a meaningful refusal at connect
+					// time, so every error -- ECONNREFUSED included -- is
+					// capacity-class.
+					want = dialFailureUnreachable
+				}
 
-					switch action {
-					case dialFailureUnreachable:
-						if packet == nil {
-							t.Fatal("unreachable action returned no packet")
-						}
-						// the built signal must round-trip back to the original
-						// egress tuple, or the client intercept cannot match the
-						// flow it refers to.
-						parsed, ok := ipParseIcmpUnreachable(packet)
-						if !ok {
-							t.Fatal("built unreachable did not parse back")
-						}
-						if parsed.Protocol != protocol {
-							t.Errorf("round-trip protocol = %v, want %v", parsed.Protocol, protocol)
-						}
-						var sameKey bool
-						switch version {
-						case 4:
-							sameKey = parsed.ToIp4Path() == ipPath.ToIp4Path()
-						case 6:
-							sameKey = parsed.ToIp6Path() == ipPath.ToIp6Path()
-						}
-						if !sameKey {
-							t.Errorf("round-trip flow-map key mismatch: got %s->%s want %s->%s",
-								parsed.SourceHostPort(), parsed.DestinationHostPort(),
-								ipPath.SourceHostPort(), ipPath.DestinationHostPort())
-						}
-					case dialFailureRst:
-						if packet != nil {
-							t.Errorf("rst action must not carry a packet, got %d bytes", len(packet))
-						}
-					default:
-						t.Fatalf("unexpected action %d", action)
+				action, packet := classifyDialFailure(ipPath, c.err)
+				if action != want {
+					t.Errorf("%s: action = %d, want %d", label, action, want)
+					continue
+				}
+
+				switch action {
+				case dialFailureUnreachable:
+					if packet == nil {
+						t.Errorf("%s: unreachable action returned no packet", label)
+						continue
 					}
-				})
+					// the built signal must round-trip back to the original
+					// egress tuple, or the client intercept cannot match the
+					// flow it refers to.
+					parsed, ok := ipParseIcmpUnreachable(packet)
+					if !ok {
+						t.Errorf("%s: built unreachable did not parse back", label)
+						continue
+					}
+					if parsed.Protocol != protocol {
+						t.Errorf("%s: round-trip protocol = %v, want %v", label, parsed.Protocol, protocol)
+					}
+					var sameKey bool
+					switch version {
+					case 4:
+						sameKey = parsed.ToIp4Path() == ipPath.ToIp4Path()
+					case 6:
+						sameKey = parsed.ToIp6Path() == ipPath.ToIp6Path()
+					}
+					if !sameKey {
+						t.Errorf("%s: round-trip flow-map key mismatch: got %s->%s want %s->%s",
+							label,
+							parsed.SourceHostPort(), parsed.DestinationHostPort(),
+							ipPath.SourceHostPort(), ipPath.DestinationHostPort())
+					}
+				case dialFailureRst:
+					if packet != nil {
+						t.Errorf("%s: rst action must not carry a packet, got %d bytes", label, len(packet))
+					}
+				default:
+					t.Errorf("%s: unexpected action %d", label, action)
+				}
 			}
 		}
 	}

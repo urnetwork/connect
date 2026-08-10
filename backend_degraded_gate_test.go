@@ -90,12 +90,10 @@ func TestNextCreateContractRetryInterval(t *testing.T) {
 		{"zero current jumps to the max", 0, 5 * time.Second, 5 * time.Second},
 	}
 	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := nextCreateContractRetryInterval(tc.current, tc.maximum); got != tc.want {
-				t.Fatalf("nextCreateContractRetryInterval(%s, %s) = %s, want %s",
-					tc.current, tc.maximum, got, tc.want)
-			}
-		})
+		if got := nextCreateContractRetryInterval(tc.current, tc.maximum); got != tc.want {
+			t.Errorf("%s: nextCreateContractRetryInterval(%s, %s) = %s, want %s",
+				tc.name, tc.current, tc.maximum, got, tc.want)
+		}
 	}
 }
 
