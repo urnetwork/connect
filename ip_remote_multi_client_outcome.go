@@ -435,17 +435,23 @@ func (self *multiClientWindow) watchOutcome() {
 // yellow, the dots reset, no failure is surfaced yet.
 func (self *multiClientWindow) rebuildWindow(elapsed time.Duration) {
 	reason := self.stallReason()
-	loggerOrDefault(self.log).Infof("%s\n", relEvent(
-		"window_rebuild",
-		"window", self.windowName(),
-		"reason", reason,
-		"after", elapsed,
-	))
 
 	var cancelEpoch context.CancelFunc
+	aborted := false
 	func() {
 		self.outcomeLock.Lock()
 		defer self.outcomeLock.Unlock()
+		// REVALIDATE under the lock: the watchdog read `added` in its own
+		// critical section and decided out here, so a provider can land in
+		// the gap. Cancelling the epoch then would kill the client that just
+		// proved the window works — and, because that Add permanently disarms
+		// the watchdog, a still-hostile network would be back to unbounded
+		// yellow with the failed latch unreachable. The Add already stood the
+		// watchdog down; this rescue has nothing left to rescue.
+		if self.everAdded {
+			aborted = true
+			return
+		}
 		cancelEpoch = self.evalEpochCancel
 		epochCtx, epochCancel := context.WithCancel(self.ctx)
 		self.evalEpochCtx = epochCtx
@@ -453,6 +459,15 @@ func (self *multiClientWindow) rebuildWindow(elapsed time.Duration) {
 		self.outcomeRebuilt = true
 		self.outcomeArmTime = time.Now()
 	}()
+	if aborted {
+		return
+	}
+	loggerOrDefault(self.log).Infof("%s\n", relEvent(
+		"window_rebuild",
+		"window", self.windowName(),
+		"reason", reason,
+		"after", elapsed,
+	))
 	if cancelEpoch != nil {
 		cancelEpoch()
 	}
@@ -478,11 +493,24 @@ func (self *multiClientWindow) rebuildWindow(elapsed time.Duration) {
 // clears the latch (noteClientAdded).
 func (self *multiClientWindow) failOutcome(elapsed time.Duration) {
 	reason := self.stallReason()
+	aborted := false
 	func() {
 		self.outcomeLock.Lock()
 		defer self.outcomeLock.Unlock()
+		// same revalidation as rebuildWindow: a provider that landed after
+		// the watchdog's decision has already cleared/disarmed this latch,
+		// and setting it now would declare failed a window that just
+		// installed a provider — with nothing left to clear the lie, because
+		// noteClientAdded (the only other clearer) already ran.
+		if self.everAdded {
+			aborted = true
+			return
+		}
 		self.outcomeFailed = true
 	}()
+	if aborted {
+		return
+	}
 	loggerOrDefault(self.log).Infof("%s\n", relEvent(
 		"window_failed",
 		"window", self.windowName(),

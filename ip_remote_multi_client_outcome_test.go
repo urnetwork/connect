@@ -285,6 +285,43 @@ func TestWindowOutcomeRebuild(t *testing.T) {
 	AssertEqual(t, strings.Contains(lines[0], "window=quality"), true)
 }
 
+// the decision-to-action race: the watchdog reads `added` in its own critical
+// section and acts outside it, so a provider can land in the gap. The rebuild
+// and the fail must both revalidate under the lock and stand down — a rebuild
+// that went ahead would cancel the epoch (killing the just-installed client)
+// with the watchdog already permanently disarmed, and a fail that went ahead
+// would latch a lie nothing is left to clear.
+func TestWindowOutcomeRebuildAbortsAfterAdd(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	log := newRecordingLogger()
+	window := outcomeTestWindow(ctx, log)
+
+	window.armOutcome()
+	epoch := window.evalEpochContext()
+
+	// a provider lands between the watchdog's decision and the rebuild
+	window.noteClientAdded(nil)
+	window.rebuildWindow(45 * time.Second)
+
+	// the epoch survives — the just-installed client is not cancelled
+	select {
+	case <-epoch.Done():
+		t.Fatal("the aborted rebuild cancelled the evaluation epoch anyway")
+	default:
+	}
+	window.outcomeLock.Lock()
+	rebuilt := window.outcomeRebuilt
+	window.outcomeLock.Unlock()
+	AssertEqual(t, rebuilt, false)
+	AssertEqual(t, len(log.linesWith("event=window_rebuild")), 0)
+
+	// ...and the fail stands down the same way
+	window.failOutcome(90 * time.Second)
+	AssertEqual(t, window.monitor.WindowExpandEvent().Failed, false)
+	AssertEqual(t, len(log.linesWith("event=window_failed")), 0)
+}
+
 // the failed latch: published to the monitor with the reason, logged once, and
 // cleared by a provider landing
 func TestWindowOutcomeFailAndRecover(t *testing.T) {
