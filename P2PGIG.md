@@ -1,15 +1,16 @@
 # P2PGIG — a path to gigabit P2P throughput
 
-- Status: production fast path implemented; local end-to-end validation complete
-- Research and implementation snapshot: 2026-08-10
+- Status: production fast path implemented; deterministic harness hardening implemented; final exact-tree validation and schema-3 rerun pending
+- Research and implementation snapshot: 2026-08-11
 - Target: sustained 1 Gbit/s of useful inner IP payload on a clean, capable direct path
 
 ## Executive conclusion
 
-The new native P2P fast path exceeded the one-gigabit target in a local real
-route topology. This is an implementation result, not a claim that every
-device or WAN path will sustain gigabit. Physical-device, cross-host, lossy,
-and long-RTT validation remains a release gate.
+The new native P2P fast path exceeded the one-gigabit target in a local
+real-route carrier benchmark. This is an implementation result, not a final
+full-TUN result or a claim that every device or WAN path will sustain gigabit.
+Physical-device and cross-host validation, the lossy and long-RTT field matrix,
+and an exact-tree full-TUN performance rerun remain release gates.
 
 The implementation keeps the existing WebRTC peer connection but adds a
 capability-negotiated custom RTP/SRTP data lane. It sends complete encrypted
@@ -46,25 +47,42 @@ throughput. The production implementation therefore uses a negotiated
   fragments, with no SCTP data retransmission;
 - preserve Connect policy, IP-security checks, replay protection, and contract
   accounting;
-- batch packets across the complete TUN → policy → route → crypto → UDP path;
+- preserve batches at the implemented TUN/ABI, committed-receive,
+  provider-return, and carrier-write boundaries while retaining singular
+  policy, routing, and Transfer steps where no batch API exists yet;
 - use platform UDP and TUN batching where the OS exposes it;
 - keep legacy WebRTC DataChannel behavior for browsers and old clients.
 
-Direct-stream IP data now leaves loss recovery to the inner transport. A
-reliable DataChannel fallback still provides carrier reliability for an older
-peer. Contract-opening traffic is acknowledged before unacknowledged data is
-admitted. The exchange route deliberately remains a reliable Transfer route;
-it receives the shared batching improvements but does not pretend to be a
-datagram path.
+Direct-stream packet recovery now follows the component that still owns the
+bytes. Device-originated TCP and QUIC leave recovery to the inner transport,
+and UDP/ICMP retain datagram loss semantics. Provider-return TCP remains
+Transfer-acknowledged because the user-NAT proxy has consumed the upstream
+socket bytes before it synthesizes a return segment; the inner source cannot
+make that proxy reproduce a lost segment. A reliable DataChannel fallback
+still provides carrier reliability for an older peer. Contract-opening traffic
+is acknowledged before unacknowledged data is admitted. The exchange route
+deliberately remains a reliable Transfer route; it receives the shared batching
+improvements but does not pretend to be a datagram path.
 
-The batch pipeline must not be P2P-specific. Direct P2P and the
+Correctness is path-independent. A reply preserves the received `TransferKey`,
+derives its destination from the authenticated receive path, and lets the
+destination-keyed multiroute writer choose any live route. The wire
+`TransferKey` contains neither a source ID nor `StreamId`; the authenticated
+callback path supplies the reply destination. A stream transport becomes
+eligible for payload only after end-to-end readiness succeeds and is withdrawn
+when readiness is lost. A caller may prefer a route for measured performance,
+but correctness must not depend on that preference.
+
+The target batch pipeline must not be P2P-specific. Direct P2P and the
 exchange/platform route share the app TUN, SDK, IP parsing, security policy,
 provider selection, Transfer, and route-manager boundaries. A generic packet
-batch should travel through those shared stages, then branch at the selected
-transport: compact datagrams for a negotiated P2P fast path, or a batched
-platform carrier for the exchange path. Local routing should use the same API.
-Optimizing only the UDP tail would leave the common singleton handoffs in
-place and would make the TUN optimization unavailable to exchange traffic.
+batch should eventually travel through those shared stages, then branch at the
+selected transport: compact datagrams for a negotiated P2P fast path, or a
+batched platform carrier for the exchange path. Local routing should use the
+same API. This implementation preserves batches at the measured boundaries,
+but policy, route selection, and much of Transfer still process individual
+packets. Those remaining singleton handoffs are common headroom for P2P and
+exchange traffic.
 
 The production carrier does not yet use the compact one-inner-packet/one-UDP-
 datagram wire prototype described later. It reuses ICE, DTLS, SRTP, endpoint
@@ -89,9 +107,11 @@ Implemented route-neutral work includes:
 
 The production fast carrier is stream-length agnostic. Every P2P association
 implements the same transport contract, so a stream composes any supported
-number of adjacent hops. A real three-hop WebRTC test verifies this production
-composition; the compact codec tests all currently supported one-to-nine-hop
-shapes.
+number of adjacent hops. Recorded pre-final full-TUN tests verified exact
+bidirectional TCP delivery over one, three, five, and nine WebRTC hops, required
+fast traffic on every adjacent carrier, and rejected fallback, carrier drops,
+and non-adjacent shortcuts. The current exact tree still needs the same run.
+The compact codec independently covers the same one-to-nine-hop range.
 
 Desktop and Linux gigabit is a credible target after this work, provided the
 unencrypted underlay sustains materially more than 1 Gbit/s. Gigabit on mobile
@@ -119,6 +139,11 @@ Across the fast measurements, the source recorded 42,242 complete messages,
 118,026,417 message bytes, and 124,418 SRTP fragments, with zero fallback and
 zero observed carrier drops.
 
+The exact source patch and raw output for this historical four-route run were
+not retained. The command below reproduces the method, but it cannot recreate
+the measured binary from repository revisions alone. Treat the values as
+historical implementation evidence until the exact-tree rerun replaces them.
+
 The production-carrier microbenchmark at the same 1,380-byte useful size
 measured a 194.78 MB/s five-run median and one allocation per operation. The
 legacy WebRTC route measured 33.30 MB/s and about 180 allocations per
@@ -133,6 +158,91 @@ invocations ranged from 115.58 to 119.61 MiB/s upload and 118.39 to 123.05
 MiB/s download. This test exercises automatic routing rather than forcing and
 asserting a carrier, so it is supporting whole-stack evidence; the forced
 four-route test above is the authoritative carrier comparison.
+
+Those directional figures predate the final recovery-owner correction that
+restored Transfer ACK/retry for provider-return TCP. They remain historical
+evidence for the batching and carrier work, not a post-fix baseline.
+
+The latest recorded full-TUN campaign is the schema-1 and schema-2 baseline in
+[server/connect/perfvar/MEASUREMENTS.md](../server/connect/perfvar/MEASUREMENTS.md).
+Its clean 8 MiB runs measured fast-P2P medians of 850.190 Mbit/s download and
+282.826 Mbit/s upload. The download consumed about 99.4% of its measured
+userspace calibration, so it is a same-host lower bound rather than proof of a
+route ceiling. The campaign also recorded only 52 completions in 100 attempts
+across the 500 ms, 1 s, and H1-extender matrices. Of the 48 failures, 47 timed
+out waiting for the first probe response after the destination accepted the
+inner TCP connection, with no modeled loss, MTU, queue, outage, receiver, or
+P2P-network drop.
+
+Those schema-1 and schema-2 results also predate the recovery-owner correction
+and later route-lifecycle work. Schema 3 is intended to become the post-fix
+directional baseline, but no schema-3 campaign has been recorded yet. The last
+results must remain visible as historical evidence until an exact-tree schema-3
+run confirms which limits remain.
+
+### Measurement trust architecture
+
+The current schema-3 harness implementation removes several ways a same-host
+result could look faster or cleaner than the production path really was:
+
+- forced P2P keeps the platform control and receive transport alive while a
+  destination-keyed controller suppresses only the provider and authenticated
+  stream payload aliases; a disconnect remains fail-closed until explicit
+  restoration, so fallback cannot silently satisfy a direct-route sample;
+- exact application and provider flow markers join every source callback and
+  live flow entry before the boundary can advance;
+- send-Pack lifecycle trackers join successful and failed publication before
+  any directional scheduler or P2P receive-credit pool is reset;
+- a source-to-Pack-to-carrier fixed point retries if any generation changes
+  during the multi-object pass, including traffic that crosses between two
+  nonadjacent route resets;
+- a post-workload fixed point joins source, Pack, and carrier activity, freezes
+  the carrier-end boundary, and retries if any carrier object or generation
+  changes during collection;
+- every physical direction owns exact interval epochs for packet and byte
+  counts, queue high-water, maximum packet size, and drop cause; P2P adds one
+  conservative 1,024-credit receive-admission pool per direction to prevent
+  Pion's hidden per-socket read-channel overflow;
+- one-hop P2P validation attributes the requested fast or legacy lane, physical
+  direction, fallback count, and both endpoints inside the measured interval;
+- provider-return markers use the authenticated client identity, independently
+  derived UDP tuple, exact payload and wire-byte totals, and terminal state, so
+  an incidental packet cannot satisfy the workload boundary;
+- generated-client replacement rebases destination suppression before the new
+  client pointer is published, retains every replaced owner, and synchronously
+  joins each replacement and external transport with `CloseAndWait`;
+- schema-3 records identify the server and Connect source with both Git
+  revisions and complete dirty-worktree content hashes, along with the resolved
+  scenario, trace seeds, schedule version, and route-local warmup size.
+
+Routes use one deterministic, route-excluded seed family and a rotated route
+order. Route-specific setup consumes different prefixes of each scheduler, so
+paired routes are reproducible but do not receive packet-for-packet identical
+impairment decisions.
+
+These mechanisms make the four route records comparable inside this userspace
+tier. They do not convert a single-host result into physical-device or
+cross-host evidence. The pending schema-3 campaign must still be recorded after
+the final deterministic suite passes.
+
+Safe route retirement adds one atomic acquire and one atomic release for a
+successful admission to the current route snapshot. A concurrent retirement
+can reject an old snapshot and make admission retry. This prevents teardown
+from returning while an old route can still enqueue. P2P teardown also closes
+and joins its connected-callback admission before the final route removal, then
+waits for `RemoveTransport` to join admitted writer snapshots before the send
+child performs its last pooled-message drain. Deterministic regressions pause
+both an admitted callback and a writer snapshot at those boundaries. In one
+five-run local sample, the immutable-snapshot control loop had a 25.08 ns
+median and the acquire/release loop had a 30.27 ns median: 5.19 ns, or 20.7%,
+at that isolated boundary, with zero allocations. A complete
+`RouteSelectorWrite` had a 183.8 ns median and zero allocations.
+
+Both sub-benchmarks include the same snapshot load and channel send/receive;
+their delta isolates the lifecycle work better than either absolute value.
+The raw output and exact source fingerprint for the quoted sample were not
+retained, and nanosecond-scale results vary with host load. The command below
+reproduces the method, not those exact values.
 
 ### Exchange before-and-after measurement
 
@@ -168,6 +278,12 @@ attribute an additional number to the shared app TUN, SDK, or provider batches.
 The original four-route table remains the comparable simultaneous route
 snapshot; its slightly different absolute exchange values reflect normal host
 load and route ordering.
+
+Only the three before-work revisions were retained for this detached
+comparison. The after-work patch fingerprint and raw benchmark logs were not.
+The table therefore preserves a historical paired measurement but is not an
+exactly reconstructable source-to-source benchmark. A replacement comparison
+must record both source states and the raw output.
 
 These are same-host software-path results. They establish that Connect's
 selected implementation no longer has the old SCTP ceiling and has local
@@ -222,7 +338,7 @@ The important production settings and invariants are:
 | Reassembly | 64 bounded in-progress slots, 64 fragments maximum, two-second expiry | Memory and malformed/incomplete message lifetime are bounded |
 | Complete-message queue | 1,024 messages by default | Absorbs about 24 ms at local gigabit rate; overflow drops instead of blocking the SRTP socket reader |
 | Native UDP writes | Bounded 256-packet queue, ready-only drains of at most 64 | Linux uses `sendmmsg`; other systems overlap ordered socket writes without an idle batching delay |
-| Direct IP recovery | No Transfer ACK/retry after stream selection | Inner TCP/QUIC recovers loss; UDP/ICMP observe real datagram loss; contract setup remains acknowledged |
+| Direct IP recovery | Transfer retry is removed when the inner sender still owns recovery; provider-return TCP stays acknowledged | Device-originated TCP/QUIC recover loss, UDP/ICMP observe datagram loss, and a TCP proxy never discards the only recoverable copy |
 | Legacy lane | Existing reliable unordered DataChannel | Preserves browsers, old binaries, control behavior, and rolling-upgrade compatibility |
 | TUN MTU | 1,440 bytes | Production SRTP fragments an encrypted Transfer message when needed; the unselected compact raw-UDP prototype uses a lower 1,380-byte inner bound |
 
@@ -284,8 +400,8 @@ datagram route implemented on both Connect and `server/connect`.
 
 **Priority: highest**
 
-**Implementation status: resolved for direct P2P IP data; exchange remains a
-reliable compatibility route.**
+**Implementation status: resolved for direct P2P by assigning one recovery
+owner per direction; exchange remains a reliable compatibility route.**
 
 Most useful tunnel traffic is already congestion-controlled and reliable at
 the inner layer. TCP and QUIC detect loss, adjust their rate, and retransmit.
@@ -315,10 +431,13 @@ allows proportional-response IP tunnels to rely on inner congestion control,
 provided they include aggregate safety mechanisms for traffic that is not
 responsive.
 
-**Conclusion:** the native fast lane removes SCTP and direct-stream IP disables
-Transfer retry after acknowledged contract setup. The existing DataChannel is
-the old-peer fallback. Keep the exchange route reliable unless a future client
-and `server/connect` datagram design is implemented and validated end to end.
+**Conclusion:** the native fast lane removes SCTP. Direct-stream IP disables
+Transfer retry after acknowledged contract setup only while the inner sender
+still owns the bytes needed for recovery. Provider-return TCP retains Transfer
+ACK/retry because the user-NAT proxy cannot reproduce bytes already consumed
+from its upstream socket. The existing DataChannel is the old-peer fallback.
+Keep the exchange route reliable unless a future client and `server/connect`
+datagram design is implemented and validated end to end.
 
 ### P2PG-002 — small SCTP packets make the path syscall-bound
 
@@ -402,25 +521,30 @@ SCTP ceiling.
 **Implementation status: avoided by the fast lane; unchanged and bounded for
 legacy compatibility.**
 
-The selected peer's 2 MiB receive window has these theoretical ceilings before
-any other loss:
+The default memory-targeted SDK configuration uses a 512 KiB receive window for
+a user-selected network peer and 128 KiB for an automatic public peer. A zero
+memory target keeps the Connect or explicit caller setting, and a selected peer
+uses at least 512 KiB. Connect's ordinary default is 512 KiB and scales to
+256 KiB under its reduced-memory setting. A 512 KiB legacy window has these
+theoretical ceilings before any other loss:
 
-| RTT | 2 MiB window ceiling |
+| RTT | 512 KiB window ceiling |
 |---:|---:|
-| 50 ms | 40 MiB/s, about 336 Mbit/s |
-| 100 ms | 20 MiB/s, about 168 Mbit/s |
+| 50 ms | 10 MiB/s, about 84 Mbit/s |
+| 100 ms | 5 MiB/s, about 42 Mbit/s |
 
 The receive-side bandwidth-delay product for 1 Gbit/s is about 5.96 MiB at
 50 ms and 11.92 MiB at 100 ms. A reliable SCTP path would need at least about
 8 MiB and 16 MiB respectively, plus sender congestion-window growth, to avoid
 flow-control limitation.
 
-The current 2 MiB selected window was a successful targeted correction:
-controlled 50 ms throughput improved from 2.26 MiB/s to 28–29 MiB/s. Physical
-Android measurements were still congestion-window limited, not receive-window
-limited. Raising the window again is therefore necessary only if SCTP remains;
-it is neither sufficient nor free, especially when every peer association
-reserves mobile memory.
+A historical 2 MiB selected-window experiment was a successful targeted
+diagnostic: controlled 50 ms throughput improved from 2.26 MiB/s to
+28–29 MiB/s. That is evidence about the former test configuration, not the
+current production window. Physical Android measurements were still
+congestion-window limited, not receive-window limited. Raising a production
+window again would matter only if SCTP remains; it is neither sufficient nor
+free, especially when every peer association reserves mobile memory.
 
 **Conclusion:** retain bounded selected-peer tuning for compatibility, but do
 not make a large static SCTP window the gigabit design.
@@ -429,34 +553,38 @@ not make a large static SCTP window the gigabit design.
 
 **Priority: high**
 
-**Implementation status: duplicate data ACK/retry resolved for direct IP;
-Transfer metadata and contract accounting remain for policy compatibility.**
+**Implementation status: duplicate data ACK/retry removed where the inner
+sender owns recovery; provider-return TCP deliberately retains it. Transfer
+metadata and contract accounting remain for policy compatibility.**
 
 Each hot-path TransferFrame can carry sequence, path, identity, contract, tag,
-and encryption metadata. The receiver creates ACK/accounting work and the
-sender retains retry state. These features are correct for a store-and-forward
-Transfer protocol, but are unnecessarily repeated for every packet in an
-established direct session. The same per-packet Transfer work is present before
-the exchange route branches into H1 or H3, so larger envelope-safe batches and
-cumulative accounting also benefit platform traffic and the legacy fallback.
+and encryption metadata. An acknowledged record also creates ACK/accounting
+work at the receiver and retry state at the sender. That recovery work is
+unnecessary on a direct lane while the inner sender still owns the bytes. It is
+necessary for provider-return TCP because the proxy has consumed its upstream
+bytes. The same per-packet Transfer metadata is present before the exchange
+route branches into H1 or H3, so larger envelope-safe batches and cumulative
+accounting also benefit platform traffic and the legacy fallback.
 
 The contract cannot simply be removed: current accounting advances with
 delivered or acknowledged bytes. The fast path needs an equivalent monotonic
 record without turning an accounting receipt into a data recovery protocol.
 
-**Conclusion:** direct stream data now uses unacknowledged Transfer records,
-while sequence contract setup is still acknowledged. The production result
-exceeded the target without removing the metadata needed by current policy and
-accounting. Binding contracts once per carrier generation and cumulative
-receipts remain a possible compact-v2 optimization, not a prerequisite for the
-selected rollout.
+**Conclusion:** direct stream data uses unacknowledged Transfer records when
+the inner sender owns recovery. Provider-return TCP retains Transfer
+acknowledgements because the proxy no longer owns the upstream bytes needed to
+rebuild a lost segment. Sequence contract setup also remains acknowledged. The
+historical carrier result exceeded the target without removing the metadata
+needed by current policy and accounting. Binding contracts once per carrier
+generation and cumulative receipts remain a possible compact-v2 optimization,
+not a prerequisite for the selected rollout.
 
 ### P2PG-006 — the composed provider path has a second ceiling
 
 **Priority: high after the transport prototype**
 
-**Implementation status: resolved for the local target; physical and
-cross-host validation remains.**
+**Implementation status: the pre-correction local path reached the target;
+post-fix schema-3 performance, physical, and cross-host validation remain.**
 
 The isolated gVisor TUN TCP test sustained 290.5–308.5 MiB/s in nine local
 results, comfortably above gigabit. The optimized Transfer core measured
@@ -482,8 +610,10 @@ Detailed prior measurements are in
 The new directional full-stack test completed five consecutive invocations
 without a stalled sample after the receive burst-window correction. Its best
 per-invocation results straddled the 119.2 MiB/s decimal-gigabit threshold.
-That closes the known local software ceiling but cannot substitute for
-physical underlay measurements.
+These figures predate the provider-return recovery-owner correction and do not
+establish its final throughput cost. They close the former local software
+ceiling as historical evidence but cannot substitute for the pending schema-3
+run or physical underlay measurements.
 
 ### P2PG-007 — encryption is not the primary bottleneck
 
@@ -509,14 +639,21 @@ addressing the measured syscall ceiling.
 **Priority: medium**
 
 **Implementation status: partially resolved. ICE migration/fallback is
-retained, P2P fragments conservatively, and H3 DPLPMTUD is enabled. Continuous
-delivery-quality scoring and an independent raw-UDP PMTU loop remain future
-work.**
+retained, fixed P2P fragmentation fits an ordinary 1,500-byte path, and H3
+DPLPMTUD is enabled. Fast P2P still fails the recorded 1,280-byte outer-MTU
+blackhole. Continuous delivery-quality scoring and path-aware P2P MTU handling
+remain future work.**
 
 ICE selects a working pair, but a gigabit implementation also needs to know
 whether that pair remains the best path. Local/private endpoints, public
 endpoints, interface changes, IPv4/IPv6, NAT behavior, loss, RTT, path MTU,
 and relay fallback can all change after setup.
+
+The latest full-TUN MTU diagnostic sent 1,440-byte inner packets through a
+silent 1,280-byte outer path. Fast P2P emitted packets as large as 1,444 bytes,
+the simulator dropped 20 oversized packets, and inner TCP reset. Exchange H3
+completed its corresponding 1,280-byte test. This is historical pre-final
+evidence, but no later result has shown the fast-P2P limitation resolved.
 
 The current inner MTU of 1,440 bytes may fit a compact new header over IPv4 but
 can exceed a 1,500-byte outer path over IPv6. Sending an oversized encrypted
@@ -530,24 +667,25 @@ routes or synthesize correct Packet Too Big/MSS behavior before a packet enters
 a route whose effective MTU is smaller. Platform and local routes must remain
 correct when the active P2P path changes that minimum.
 
-**Conclusion:** use conservative initial MTUs, Datagram Packetization Layer
-Path MTU Discovery, validated migration, quality hysteresis, ICMP Packet Too
-Big synthesis or MSS adjustment, and a reliable fallback.
+**Conclusion:** keep the fixed size only as a 1,500-byte-path default. Add
+Datagram Packetization Layer Path MTU Discovery or negotiated smaller
+fragments, validated migration, quality hysteresis, ICMP Packet Too Big
+synthesis or MSS adjustment, and a reliable fallback.
 
 ### Applicability by route
 
 | Finding or optimization | Direct P2P | Exchange/platform | Implementation boundary |
 |---|---|---|---|
-| Avoid nested reliable recovery | Yes; the selected RTP/SRTP carrier bypasses SCTP | Yes in principle; requires a client datagram carrier and `server/connect` datagram routing | Connect plus `server/connect` for exchange |
+| Avoid nested reliable recovery | Yes where the inner sender owns recovery; provider-return TCP keeps Transfer as its sole recovery owner | Yes in principle; requires a client datagram carrier and `server/connect` datagram routing | Connect plus `server/connect` for exchange |
 | Remove SCTP fragmentation and window limits | Yes | No; H1/H3 have different limits | Connect P2P transport |
-| Preserve batches from app TUN through policy and route selection | Yes | Yes | App, SDK, Connect |
-| Batch Transfer and route-manager handoffs | Legacy/control only after P2P fast-path selection | Yes, primary shared improvement | Connect |
+| Target: preserve batches from app TUN through policy and route selection | Yes | Yes | App, SDK, Connect |
+| Batch Transfer and route-manager handoffs | Legacy, control, and acknowledged provider-return TCP benefit most; other fast data still crosses route selection without retry work | Yes, primary shared improvement | Connect |
 | Batch client carrier writes/reads | Linux `sendmmsg`; bounded ready drains elsewhere | H1/H3 framing and drains | Connect |
 | Batch resident/exchange forwarding | Control traffic only for direct P2P | Yes | `server/connect` |
-| Reuse parse/policy/flow metadata within a bounded batch | Yes | Yes | SDK/Connect, with identical security decisions |
+| Target: reuse parse/policy/flow metadata within a bounded batch | Yes | Yes | SDK/Connect, with identical security decisions |
 | TUN `WriteBatch` and GRO/TSO | Yes | Yes | SDK/apps/Connect |
 | Cumulative authenticated accounting receipts | Optional compact-v2 headroom | Required for any future exchange datagram lane | Connect protocol and `server/connect` routing |
-| Path MTU, bounded queues, drop telemetry, migration | Conservative fragmentation and ICE today; more scoring remains | H3 DPLPMTUD today; required for any future exchange datagram lane | Connect and `server/connect` |
+| Path MTU, bounded queues, drop telemetry, migration | Fixed fragmentation fits a 1,500-byte path; the recorded 1,280-byte outer path fails; more scoring and path-aware sizing remain | H3 DPLPMTUD today; required for any future exchange datagram lane | Connect and `server/connect` |
 
 The route-neutral items should be implemented once and consumed by all routes.
 Transport-specific adapters must not force the shared batch type to contain
@@ -587,6 +725,56 @@ BRINGYOUR_REDIS_HOSTNAME=local-redis.bringyour.com \
 go test ./connect \
   -run '^TestConnectMultiClientTcpDirectionalPerformance$' \
   -count=5 -timeout=15m -v
+~~~
+
+The extended-topology correctness gate is:
+
+~~~sh
+WARP_ENV=local WARP_SERVICE=test WARP_DOMAIN=bringyour.com \
+WARP_BLOCK=test WARP_VERSION=0.0.0 \
+BRINGYOUR_POSTGRES_HOSTNAME=local-pg.bringyour.com \
+BRINGYOUR_REDIS_HOSTNAME=local-redis.bringyour.com \
+go test ./connect/perfvar \
+  -run '^(TestFullTunP2pFast(One|Three|Five|Nine)HopTopologyCorrectness|TestFullTunSplitExchangeH(1|3)ExtendedTopologyCorrectness)$' \
+  -count=1 -timeout=40m -v
+~~~
+
+On a pre-final 2026-08-11 working tree, the one-, three-, five-, and nine-hop
+P2P cases passed in 14.54, 11.29, 18.13, and 19.29 seconds. Split exchange H1
+and H3 passed in 10.09 and 11.20 seconds. These are wall-clock correctness-test
+durations, not throughput measurements. The P2P cases transfer exact 64 KiB TCP
+content in both directions on the clean profile. The split cases use clean
+endpoint access links and a 25 ms internal link. No gigabit or high-RTT claim
+follows from these timings.
+
+The recorded runs predate later recovery-owner and route-lifecycle edits. They
+show that the topology harness found the intended behavior, but they do not
+validate the current exact tree. Rerun all six cases and record the source
+fingerprint before promoting them to final evidence.
+
+Development runs also passed
+`TestProviderReturnIpTransferOptionsMatchRecoveryOwner` 50 times normally and
+20 times under the race detector. That regression ensures provider-return TCP
+keeps Transfer ACK/retry even when a caller's default options disable ACKs. From
+`connect`, reproduce both forms with:
+
+~~~sh
+go test -run '^TestProviderReturnIpTransferOptionsMatchRecoveryOwner$' \
+  -count=50 .
+go test -race \
+  -run '^TestProviderReturnIpTransferOptionsMatchRecoveryOwner$' \
+  -count=20 .
+~~~
+
+These recorded repetitions also need an exact-tree rerun because their raw
+output and source fingerprint were not retained.
+
+From `connect`, reproduce the route-admission cost with:
+
+~~~sh
+go test -run '^$' \
+  -bench '^(BenchmarkRouteSelectorWrite|BenchmarkRouteSnapshotWriterAdmission)$' \
+  -benchtime=1s -count=5 .
 ~~~
 
 From `connect`, compare the selected production P2P carriers with:
@@ -768,32 +956,36 @@ headline number.
 ## Implemented architecture and compact-v2 direction
 
 This section preserves the original architectural reasoning and distinguishes
-the selected implementation from optional next work. The shared batch
-pipeline and reliable-control/unreliable-data split are implemented. The
-selected carrier reuses RTP/SRTP on the existing ICE/DTLS association. The
-dedicated compact authenticated UDP format, custom exporter keys, and
-cumulative receipts remain an unselected v2 option because the lower-risk SRTP
-carrier already exceeded the target.
+the selected implementation from optional next work. Boundary batching and the
+recovery-owner split are implemented; a generic end-to-end batch pipeline is
+not. Control and contract setup remain reliable. Device-originated TCP/QUIC and
+UDP/ICMP use datagram semantics on the fast carrier, while provider-return TCP
+keeps Transfer recovery. The selected carrier reuses RTP/SRTP on the existing
+ICE/DTLS association. The dedicated compact authenticated UDP format, custom
+exporter keys, and cumulative receipts remain an unselected v2 option because
+the lower-risk SRTP carrier already exceeded the carrier target.
 
-The P2P fast path is one transport adapter under a route-neutral packet
-pipeline. The shared API carries a bounded slice of independent packet
-owners plus parsed flow metadata. Source policy and `connect/ip_security`
-remain mandatory before route selection; destination policy remains mandatory
-after authentication. A batch may contain packets that choose different
-providers or carriers, so route selection groups accepted packets into
-sub-batches by destination/session without changing their order within a flow.
+The P2P fast path is one transport adapter under the target route-neutral
+packet pipeline. Implemented boundary APIs carry bounded slices of independent
+packet owners and preserve packet ownership, but the intervening policy,
+routing, and Transfer stages remain substantially singular. Source policy and
+`connect/ip_security` remain mandatory before route selection; destination
+policy remains mandatory after authentication. A future generic batch may
+contain packets that choose different providers or carriers, so route selection
+must group accepted packets into sub-batches by destination/session without
+changing their order within a flow.
 
-The same outbound batch enters one of three adapters:
+A future common outbound batch would enter one of three adapters:
 
 - negotiated P2P fast path: endpoint/hop seal and UDP batch write;
 - exchange/platform path: envelope-safe Transfer batch and H1/H3 carrier
   batch;
 - local path: LocalUserNat batch, which already exists internally.
 
-Inbound adapters produce the same packet batch contract before common policy,
-flow association, statistics, and app/TUN delivery. This keeps platform arrays
-and TUN batches useful even when a flow falls back from P2P to the exchange.
-Fallback changes the transport adapter, not the TUN API.
+Inbound adapters would produce the same packet batch contract before common
+policy, flow association, statistics, and app/TUN delivery. This would keep
+platform arrays and TUN batches useful even when a flow falls back from P2P to
+the exchange. Fallback would change the transport adapter, not the TUN API.
 
 ### 1. Keep the current connection as the control plane — implemented
 
@@ -869,9 +1061,12 @@ post-quantum key establishment instead of replacing those systems.
 
 ### 4. Separate accounting from retransmission — direct-data portion implemented
 
-Direct-stream IP uses unacknowledged Transfer after contract establishment, so
-data recovery no longer drives accounting ACKs. A future compact session could
-reduce metadata further with cumulative receipts:
+Direct-stream IP uses unacknowledged Transfer after contract establishment
+when its inner sender retains recovery ownership. Provider-return TCP is the
+intentional exception: the proxy's upstream socket has already acknowledged
+and released those bytes, so Transfer must retain them until the destination
+acknowledges delivery. A future compact session could reduce metadata further
+with cumulative receipts:
 
 1. bind one contract, peer pair, direction, and session epoch during setup;
 2. count only authenticated, replay-accepted inner payload bytes at the
@@ -883,14 +1078,17 @@ reduce metadata further with cumulative receipts:
 
 Duplicate, replayed, unauthenticated, rejected-policy, and malformed packets
 must not increment the receipt. The sender must never interpret a receipt as an
-instruction to retransmit missing data. Inner TCP/QUIC remains responsible for
-recovery.
+instruction to retransmit missing data on a datagram-semantic lane. Inner
+TCP/QUIC remains responsible where it still owns the bytes; the provider TCP
+proxy continues to use acknowledged Transfer records.
 
-This preserves the current meaning of delivered/acknowledged contract bytes
-without placing a reliable protocol around the data. It also reduces per-packet
-protobuf, ID, tag, ACK, retry-queue, and timer work.
+On a datagram-semantic lane, this preserves the current meaning of
+delivered/acknowledged contract bytes without placing a reliable protocol
+around the data. It also reduces per-packet protobuf, ID, tag, ACK, retry-queue,
+and timer work. Provider-return TCP remains outside this receipt-only design
+unless another component first takes ownership of recoverable bytes.
 
-### 5. Batch across every hot boundary and every route — implemented where measured
+### 5. Batch across hot boundaries and every route — partially implemented
 
 The implemented boundaries define bounded packet batches with explicit buffer
 ownership. They preserve packet boundaries and carry only the metadata each
@@ -933,13 +1131,15 @@ Implemented shared Connect and SDK work:
 
 - adds batch methods beside the existing singular DeviceLocal, mux, and TUN
   methods;
-- parse each packet once, carry immutable flow metadata, and run the same
-  `connect/ip_security` decision that the singular path runs;
+- preserves independent packet ownership while existing singular downstream
+  stages continue to parse and apply the same `connect/ip_security` decisions
+  per packet;
 - wires `RemoteUserNatMultiClient.SetReceivePacketsCallback` through DeviceLocal
   to a production batch app callback while retaining the singular callback for
   compatibility and rare packets;
-- let Transfer form larger envelope-safe Packs for exchange/fallback traffic,
-  subject to negotiated client and resident message limits;
+- let no-contract provider-return traffic form larger envelope-safe Transfer
+  Packs, subject to negotiated client and resident message limits; contract
+  traffic retains per-packet admission and limited opportunistic coalescing;
 - drains ready H1/H3 writes into bounded message batches rather than relying
   on a late socket coalescer to recover earlier per-message costs.
 
@@ -962,7 +1162,7 @@ Platform work:
 |---|---|
 | Linux | Implemented SDK TUN drain and `sendmmsg`; future `recvmmsg`, UDP GSO/GRO, TUN offload, `SO_RXQ_OVFL`, and runtime offload fallback |
 | Apple | Implemented one packed SDK call per `NEPacketTunnelFlow` array and one `writePackets` call per inbound burst |
-| Android | Implemented bounded drain above the Go-owned VPN fd; later stages consume the shared Connect batching |
+| Android | Implemented bounded drain above the Go-owned VPN fd; subsequent policy and routing sends remain singular |
 | Windows | Implemented bounded Wintun-ring drain and one packed SDK callback/call per burst |
 
 ### 6. Add path MTU discovery and quality scoring — partial
@@ -978,7 +1178,7 @@ and relay/direct state. Switch only after the new endpoint is authenticated
 and materially better for long enough to overcome hysteresis. Keep the
 reliable WebRTC path available while a new datagram path is unproven.
 
-### 7. Retain congestion safety without outer retransmission — bounded queues implemented
+### 7. Retain congestion safety on datagram-semantic lanes — bounded queues implemented
 
 An IP tunnel may carry UDP applications that do not respond to congestion.
 The datagram path therefore needs:
@@ -988,10 +1188,12 @@ The datagram path therefore needs:
 - aggregate path loss/RTT monitoring and a circuit breaker;
 - explicit rate policy for persistently nonresponsive traffic;
 - receiver overflow and socket-drop telemetry;
-- no data retransmission at the tunnel layer.
+- no tunnel retransmission while the inner sender owns recovery.
 
 This follows the proportional-tunnel guidance in RFC 8085. It avoids nested
-recovery without treating all inner UDP as automatically safe.
+recovery without treating all inner UDP as automatically safe. Provider-return
+TCP remains the intentional exception because Transfer is its sole remaining
+recovery owner.
 
 ---
 
@@ -1155,7 +1357,7 @@ ICE migration, and legacy fallback without introducing that second lifecycle.
 
 ## Implementation ledger
 
-### Phase 0 — trustworthy baseline: complete for local topology
+### Phase 0 — trustworthy baseline method complete; final sample pending
 
 - The four-route `server/connect` harness forces H1, H3, legacy P2P, and fast
   P2P through one measurement implementation.
@@ -1163,14 +1365,16 @@ ICE migration, and legacy fallback without introducing that second lifecycle.
   indexes reject loss, duplication, and favorable miscounting.
 - The opt-in comparison runs five repetitions and enforces a minimum 1.5x
   fast/legacy median gain.
+- The recorded values are historical because their exact source patches and raw
+  logs were not retained. An exact-tree rerun remains.
 - Raw underlay, cross-host, and physical-device runs remain deployment gates.
 
 ### Phase 1 — semantics on the existing association: complete with SRTP
 
 - SDP capability negotiation, mutual readiness, `Auto`, `LegacyOnly`, and
   `FastOnly` are production settings.
-- Direct IP data disables duplicate Transfer retry; contract setup and control
-  remain reliable.
+- Direct IP data disables duplicate Transfer retry when the inner sender owns
+  recovery. Provider-return TCP, contract setup, and control remain reliable.
 - Tests cover capable peers, one-sided old-peer fallback, forced lanes,
   malformed fragments, reordering, duplicates, expiry, bounded overflow, and
   caller-settings immutability.
@@ -1182,24 +1386,31 @@ ICE migration, and legacy fallback without introducing that second lifecycle.
 - The compact authenticated UDP codec covers replay, key separation,
   ownership, batches, accounting counters, and one-to-nine-hop composition.
 - The production RTP/SRTP carrier covers real ICE, DTLS, SRTP, negotiation,
-  fragmentation, bounded reassembly, and three-hop composition.
+  fragmentation, bounded reassembly, and full-TUN one-, three-, five-, and
+  nine-hop composition on the recorded pre-final tree. The exact-tree topology
+  rerun remains.
 - RTP/SRTP was selected because it exceeded the target while reusing the
   mature connection lifecycle and preserving automatic old-peer fallback.
 
-### Phase 3 — route-neutral batching: complete for requested app boundaries
+### Phase 3 — route-neutral boundary batching: complete; generic pipeline partial
 
 - Connect mux, DeviceLocal, SDK packed ABI, proxy, Apple, Windows, Android,
   Linux, H3 client, and H3 server changes are implemented and tested.
 - Linux `sendmmsg` and platform-independent bounded ready drains are active.
-- Singular APIs remain for compatibility and synthesized/mixed traffic.
+- Singular APIs remain for compatibility, synthesized or mixed traffic, and
+  policy/routing/Transfer stages that do not yet expose a generic batch API.
 - `recvmmsg`, UDP GSO/GRO, parallel crypto, and resident-channel batches remain
   optional measured headroom.
 
-### Phase 4 — composed route optimization: locally complete
+### Phase 4 — composed route optimization: exact-tree performance pending
 
-- Forced P2P and exchange route results are recorded above.
-- The full TUN/gVisor/provider directional test is stable across five complete
-  invocations after correcting the too-small fast receive burst window.
+- Historical forced P2P and exchange route results are recorded above.
+- Before the recovery-owner correction, the full TUN/gVisor/provider
+  directional test was stable across five complete invocations after correcting
+  the too-small fast receive burst window.
+- The schema-1 and schema-2 PERFVAR baseline records the last full-TUN clean,
+  high-RTT, extender, and MTU evidence. The exact-tree schema-3 measurement
+  remains.
 - All existing `connect/ip_security` and contract enforcement stays on the
   shared packet path.
 - Cross-host exchange, physical NIC, and Internet-provider profiling remains.
@@ -1208,8 +1419,13 @@ ICE migration, and legacy fallback without introducing that second lifecycle.
 
 - Capability-based automatic rollout, forced disable/require controls, ICE
   migration, bounded warmup, and legacy fallback are implemented.
-- H3 DPLPMTUD is enabled and the SRTP fragment size is conservative.
-- Continuous delivery-quality scoring, physical path-MTU validation, loss/RTT
+- H3 DPLPMTUD is enabled. The fixed SRTP fragment size fits an ordinary
+  1,500-byte path but not the recorded 1,280-byte outer path.
+- The historical userspace 500 ms and 1 s matrices exposed route-readiness
+  failures. Deterministic correctness gates now cover both latencies, including
+  representative warmed 32 MiB transfers, but their exact-tree execution and
+  schema-3 measurement confirmation remain pending. Continuous
+  delivery-quality scoring, path-aware P2P MTU handling, field loss/RTT
   matrices, thermal tests, and canary telemetry remain release work.
 
 ---
@@ -1227,8 +1443,10 @@ suite provides useful pieces:
 - `connect_multiclient_perf_test.go` and
   `connect_multiclient_tcp_directional_perf_test.go` include the TUN, NAT,
   provider, exchange, and app-injection boundaries;
-- `connect_stream_p2p_test.go` proves that a negotiated stream continues over
-  real P2P after the platform transports close.
+- `connect_stream_p2p_test.go` proves that a standalone negotiated stream
+  continues over real P2P after its platform transports close. PERFVAR's full
+  TUN fixture instead retains platform control/receive and suppresses only the
+  selected destination's payload aliases.
 
 `stream_route_performance_test.go` now supplies four forced cases using the
 same inner traffic generator and measurement code:
@@ -1241,13 +1459,16 @@ same inner traffic generator and measurement code:
 | Exchange H3 | Real client H3 transports plus resident/exchange forwarding; force H3 rather than automatic mode selection |
 
 Every measured route warms up, then performs five exact-delivery runs. The P2P
-comparison fails below a 1.5x median gain. The production three-hop test in
-Connect separately proves that the same negotiated fast carrier composes at
-each adjacent hop. The full-stack directional TCP test separately includes the
-TUN, gVisor NAT, and provider boundaries and is repeated five times for
-flakiness. Keeping route forcing and physical TUN composition as distinct tests
-makes carrier attribution deterministic without calling a codec loopback an
-end-to-end result.
+comparison fails below a 1.5x median gain. Recorded pre-final full-TUN tests
+showed that the same negotiated fast carrier composed over one, three, five,
+and nine adjacent hops. They verified exact bidirectional TCP content, positive
+fast traffic on every physical hop, and zero fallback, carrier drops, or
+non-adjacent shortcuts. The current exact tree still needs the same run. The
+historical full-stack directional TCP test separately included the TUN, gVisor
+NAT, and provider boundaries and was repeated five times for flakiness before
+the recovery-owner correction. Keeping route forcing and physical TUN
+composition as distinct tests makes carrier attribution deterministic without
+calling a codec loopback an end-to-end result.
 
 The tests use production controls rather than test-only packet relays:
 
@@ -1267,11 +1488,13 @@ before making a product-wide gigabit or loss-behavior claim:
 
 | Dimension | Values |
 |---|---|
-| RTT | 0, 10, 25, 50, 100 ms |
+| ordinary RTT | 0, 10, 25, 50, 100 ms |
+| single-region access RTT | 500 and 1,000 ms |
 | independent loss | 0%, 0.01%, 0.1%, 1% |
 | path rate | 100, 300, 1,000, 2,500 Mbit/s |
 | queue | shallow and deep |
-| inner MTU | 1,280, 1,400, and validated 1,500-path maximum |
+| inner TUN MTU | 1,280, 1,400, and 1,440 bytes |
+| outer path MTU | 1,280, 1,400, and 1,500 bytes over IPv4 and IPv6 |
 | traffic | one, four, and sixteen TCP flows; QUIC; rate-limited UDP |
 | direction | consumer → provider and provider → consumer |
 | repetition | five fresh runs, report median and p95 |
@@ -1350,7 +1573,9 @@ Run the server topology in both forms:
 The current code already contains important, measured corrections:
 
 - egress-only ICE interface enumeration and Android path handling;
-- selected-peer admission and a bounded 2 MiB receive window;
+- selected-peer admission with a default 512 KiB SDK selected-peer window,
+  128 KiB SDK public-peer window, and 512/256 KiB Connect default/reduced-memory
+  window; a zero memory target keeps the Connect or explicit caller settings;
 - live STUN endpoints and bounded gathering;
 - reliable unordered DataChannel delivery;
 - SCTP SNAP and negotiated zero checksum;
@@ -1362,21 +1587,24 @@ The current code already contains important, measured corrections:
 - gVisor TUN batch/GRO support;
 - teardown, route recovery, and contract-accounting correctness work.
 
-The selected P2P fast lane replaces the limiting bulk-data semantics without
-regressing these setup, security, lifecycle, memory, and fallback properties.
+The selected P2P fast lane keeps these setup, security, lifecycle, memory, and
+fallback properties in the design while replacing the limiting bulk-data
+semantics. Recorded tests cover the invariants; the exact-tree suite still
+needs to confirm them together.
 
 ## Final assessment
 
 Confidence is:
 
 - **High** that removing SCTP from capable native bulk traffic and preserving
-  batches was the correct fix: the comparable local route improved 3.20x and
-  exceeded one decimal gigabit.
+  batches was the correct architectural fix: the historical comparable carrier
+  route improved 3.20x and exceeded one decimal gigabit.
 - **High** that queue-depth increases, additional DataChannels, and removing
   encryption will not solve the measured ceiling.
-- **High** that the current userspace route has local desktop headroom: the
-  forced fast route reached 150.73 MB/s median and the composed directional TCP
-  path reached the threshold in its best complete samples.
+- **Medium** that the final composed userspace route has local desktop headroom.
+  Historical carrier and directional samples reached the target, but the latest
+  comprehensive full-TUN baseline measured 850.190 Mbit/s download and 282.826
+  Mbit/s upload, and the post-fix schema-3 run remains pending.
 - **Medium** that ordinary desktop/Linux physical deployments will sustain the
   target until cross-host NIC, NAT, RTT, loss, and underlay tests confirm it.
 - **Conditional** for mobile gigabit because platform packet APIs, radios,
@@ -1384,16 +1612,21 @@ Confidence is:
 
 The remaining credible route to a product-wide claim is:
 
-1. retain `Auto` capability fallback and the reliable control plane;
-2. validate Linux, Windows, macOS, Android, and iOS on physical same-LAN paths;
-3. run the RTT, loss, MTU, migration, and relay matrix above;
-4. measure cross-host exchange and provider paths independently;
-5. add GSO/GRO, continuous quality scoring, or the compact codec only when a
+1. rerun clean topology, recovery ownership, and schema-3 full-TUN performance
+   on one recorded exact tree;
+2. run and confirm the deterministic 500 ms/1 s readiness gates, and resolve or
+   retain the recorded 1,280-byte outer-MTU failure from the resulting evidence;
+3. retain `Auto` capability fallback and the reliable control plane;
+4. validate Linux, Windows, macOS, Android, and iOS on physical same-LAN paths;
+5. run the RTT, loss, MTU, migration, and relay matrix above;
+6. measure cross-host exchange and provider paths independently;
+7. add GSO/GRO, continuous quality scoring, or the compact codec only when a
    new profile identifies one of them as the next ceiling;
-6. canary the fast lane with fallback/drop/accounting telemetry before broad
+8. canary the fast lane with fallback/drop/accounting telemetry before broad
    rollout.
 
-The implementation addresses the measured bottleneck and retains the
-properties that make Connect more than a generic packet tunnel. The remaining
-work is deployment validation and measured hardening, not another wholesale
-data-plane redesign.
+The implementation addresses the measured carrier bottleneck and retains the
+properties that make Connect more than a generic packet tunnel. Exact-tree
+full-TUN performance, high-RTT readiness, outer-MTU handling, deployment
+validation, and measured hardening remain. The evidence does not call for
+another wholesale data-plane redesign.

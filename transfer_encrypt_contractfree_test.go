@@ -157,7 +157,7 @@ func TestRequiredContractFreeEstablishesViaOobKeyFetcher(t *testing.T) {
 
 	if ok := a.SendWithTimeout(
 		requiredGateFrame(t, "sealed-contract-free"),
-		DestinationId(bClientId),
+		bClientId,
 		func(error) {},
 		30*time.Second,
 	); !ok {
@@ -192,7 +192,7 @@ func TestRequiredContractFreeWithoutKeySourceFailsClosed(t *testing.T) {
 
 	if ok := a.SendWithTimeout(
 		requiredGateFrame(t, "never"),
-		DestinationId(bClientId),
+		bClientId,
 		func(error) {},
 		3*time.Second,
 	); ok {
@@ -212,7 +212,7 @@ func TestRequiredContractFreeWithoutKeySourceFailsClosed(t *testing.T) {
 
 	if ok := a2.SendWithTimeout(
 		requiredGateFrame(t, "plaintext-fallback"),
-		DestinationId(b2ClientId),
+		b2ClientId,
 		func(error) {},
 		30*time.Second,
 	); !ok {

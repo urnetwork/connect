@@ -13,7 +13,6 @@ import (
 
 	"github.com/pion/datachannel"
 	"github.com/pion/ice/v4"
-	"github.com/pion/transport/v4"
 	"github.com/pion/transport/v4/stdnet"
 	"github.com/pion/webrtc/v4"
 )
@@ -60,8 +59,10 @@ func newWebRtcPeerConnectionFactory(
 	log := loggerOrDefault(settings.Log)
 	s.LoggerFactory = &pionLoggerFactory{log: log}
 	logIceInterfaces(log)
-	var selectedNet transport.Net
-	if settings.UseLoopbackOnlyIceInterfaces {
+	selectedNet := settings.Network
+	if selectedNet != nil {
+		// An injected network owns candidate enumeration and socket routing.
+	} else if settings.UseLoopbackOnlyIceInterfaces {
 		// hermetic same-host mode (tests): gather only loopback candidates so
 		// the local connect cost is a couple of pairs, independent of the
 		// host's interface population (see WebRtcSettings)

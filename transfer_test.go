@@ -381,7 +381,7 @@ func runSendReceiveSenderReset(t *testing.T, encMode encryptionMode) {
 			if err != nil {
 				panic(err)
 			}
-			success := a.Send(frame, DestinationId(bClientId), func(err error) {
+			success := a.Send(frame, bClientId, func(err error) {
 				acks <- err
 			})
 			AssertEqual(t, success, true)
@@ -488,7 +488,7 @@ func runSendReceiveSenderReset(t *testing.T, encMode encryptionMode) {
 			if err != nil {
 				panic(err)
 			}
-			success := a2.Send(frame, DestinationId(bClientId), func(err error) {
+			success := a2.Send(frame, bClientId, func(err error) {
 				acks <- err
 			})
 			AssertEqual(t, success, true)
@@ -856,14 +856,14 @@ func TestMinimumMessageLenLimitFitsWorstCaseHandshake(t *testing.T) {
 
 // FIXME TestAckTimeout
 
-func TestSendBufferRetiresWireIndistinguishableSequenceForks(t *testing.T) {
+func TestSendBufferSharesWireIdentityAcrossLocalRoutes(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), DefaultClientSettings())
 	defer client.Cancel()
 
 	peerId := NewId()
-	destination := DestinationId(peerId)
+	destination := peerId
 	send := func(content string, opts ...any) {
 		frame := &protocol.Frame{
 			MessageType:  protocol.MessageType_TransferExchangeSignals,
@@ -921,14 +921,18 @@ func TestSendBufferRetiresWireIndistinguishableSequenceForks(t *testing.T) {
 	// receiver keys its head slot per lane: a ForceStream sequence COEXISTS
 	// with the plain one instead of retiring it.
 	send("stream", ForceStream())
+	var stream *SendSequence
 	func() {
 		client.sendBuffer.mutex.Lock()
 		defer client.sendBuffer.mutex.Unlock()
 		exactCount := 0
 		wireCount := 0
-		for id := range client.sendBuffer.sendSequences {
+		for id, sequence := range client.sendBuffer.sendSequences {
 			if id.Destination == destination {
 				exactCount += 1
+				if id.ForceStream {
+					stream = sequence
+				}
 			}
 		}
 		for wireId := range client.sendBuffer.wireSendSequences {
@@ -946,35 +950,38 @@ func TestSendBufferRetiresWireIndistinguishableSequenceForks(t *testing.T) {
 	default:
 	}
 
-	// Intermediaries remain a sender-side route choice absent from the
-	// destination's receive-head identity, so an intermediaries fork still
-	// synchronously retires the same-lane predecessor.
+	// Intermediaries are contract-acquisition metadata, not logical sequence
+	// identity. A later multihop send therefore joins the existing stream lane.
 	via := RequireMultiHopId(NewId(), peerId)
 	frame := &protocol.Frame{
 		MessageType:  protocol.MessageType_TransferExchangeSignals,
 		MessageBytes: []byte("via intermediary"),
 	}
 	if !client.SendMultiHopWithTimeout(frame, via, nil, time.Second, ForceStream()) {
-		t.Fatal("multi-hop replacement enqueue failed")
+		t.Fatal("multi-hop enqueue failed")
 	}
 	func() {
 		client.sendBuffer.mutex.Lock()
 		defer client.sendBuffer.mutex.Unlock()
 		viaCount := 0
-		for id := range client.sendBuffer.sendSequences {
+		for id, sequence := range client.sendBuffer.sendSequences {
 			if id.Destination == destination && id.ForceStream {
 				viaCount += 1
-				if id.IntermediaryIds.Len() != 1 {
-					t.Fatalf("force-stream lane intermediaries = %v, want one", id.IntermediaryIds)
+				if sequence != stream {
+					t.Fatal("multihop send replaced the existing stream sequence")
 				}
 			}
 		}
 		if viaCount != 1 {
-			t.Fatalf("force-stream lane sequences = %d, want the intermediary replacement only", viaCount)
+			t.Fatalf("force-stream lane sequences = %d, want one shared sequence", viaCount)
 		}
 	}()
-	// the direct force-stream sequence was retired by the intermediaries fork
-	// (same lane on the wire); the plain lane is untouched
+	select {
+	case <-stream.ctx.Done():
+		t.Fatal("multihop send canceled the existing stream sequence")
+	default:
+	}
+	// The plain lane is distinct and remains untouched.
 	select {
 	case <-plain.ctx.Done():
 		t.Fatal("plain lane sequence was retired by another lane's intermediaries fork")
@@ -1106,7 +1113,7 @@ func TestSendReceiveEncryptedForceStreamData(t *testing.T) {
 			if err != nil {
 				panic(err)
 			}
-			success := a.SendWithTimeout(frame, DestinationId(bClientId), func(err error) {
+			success := a.SendWithTimeout(frame, bClientId, func(err error) {
 				acks <- err
 			}, -1, ForceStream())
 			AssertEqual(t, success, true)
@@ -1150,7 +1157,7 @@ func TestSendReceiveEncryptedForceStreamData(t *testing.T) {
 		defer a.sendBuffer.mutex.Unlock()
 		clientRoleSequences := []sendSequenceId{}
 		for key := range a.sendBuffer.sendSequences {
-			if key.Destination.DestinationId == bClientId &&
+			if key.Destination == bClientId &&
 				key.EncryptionRole == sequenceTlsRoleClient &&
 				!key.EncryptionCompanion &&
 				!key.CompanionContract {

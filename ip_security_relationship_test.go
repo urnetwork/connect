@@ -215,16 +215,21 @@ func TestRecordSourceProvideModeCapsTrackedSources(t *testing.T) {
 	}
 }
 
-// Network-provider return data and active WebRTC signaling are
-// indistinguishable at the receiver's sequence-head key. They therefore must
-// share ForceStream as well as their destination: ForceStream keys the sender
-// sequence but is not represented on the wire. Before this regression fix the
-// two options created concurrent sequence ids, and whichever arrived second
-// caused the receiver to discard the first as an older sequence indefinitely.
+// Network-provider return data reproduces the force-stream lane carried by
+// the request. Active signaling on that lane must share the same sender
+// sequence, and the Pack lane discriminator keeps it separate at the receiver.
 func TestProviderReturnTransferOptionPreventsForceStreamFork(t *testing.T) {
+	transferKey := providerReplyTransferKey(
+		TransferKey{
+			ForceStream:    true,
+			EncryptionRole: protocol.SequenceRole_SequenceRoleClient,
+		},
+		protocol.ProvideMode_Network,
+	)
 	networkOption := providerReturnTransferOptions(
 		DefaultTransferOpts(),
 		protocol.ProvideMode_Network,
+		transferKey,
 	)
 	if !networkOption.ForceStream ||
 		!networkOption.NetworkPeer ||
@@ -234,6 +239,7 @@ func TestProviderReturnTransferOptionPreventsForceStreamFork(t *testing.T) {
 	publicOption := providerReturnTransferOptions(
 		DefaultTransferOpts(),
 		protocol.ProvideMode_Public,
+		providerReplyTransferKey(TransferKey{}, protocol.ProvideMode_Public),
 	)
 	if !publicOption.CompanionContract ||
 		publicOption.ForceStream ||
@@ -246,19 +252,19 @@ func TestProviderReturnTransferOptionPreventsForceStreamFork(t *testing.T) {
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), DefaultClientSettings())
 	defer client.Cancel()
 
-	destination := DestinationId(NewId())
+	destinationId := NewId()
 	providerReturn := &protocol.Frame{
 		MessageType:  protocol.MessageType_IpIpPacketFromProvider,
 		MessageBytes: []byte("provider return"),
 	}
-	if !client.SendWithTimeout(providerReturn, destination, nil, time.Second, networkOption) {
+	if !client.SendWithTimeout(providerReturn, destinationId, nil, time.Second, networkOption, transferKey) {
 		t.Fatal("provider return enqueue failed")
 	}
 	activeSignal := &protocol.Frame{
 		MessageType:  protocol.MessageType_TransferExchangeSignals,
 		MessageBytes: []byte("active signal"),
 	}
-	if !client.SendWithTimeout(activeSignal, destination, nil, time.Second, ForceStream()) {
+	if !client.SendWithTimeout(activeSignal, destinationId, nil, time.Second, ForceStream()) {
 		t.Fatal("active signal enqueue failed")
 	}
 
@@ -266,7 +272,7 @@ func TestProviderReturnTransferOptionPreventsForceStreamFork(t *testing.T) {
 	defer client.sendBuffer.mutex.Unlock()
 	var keys []sendSequenceId
 	for key := range client.sendBuffer.sendSequences {
-		if key.Destination == destination &&
+		if key.Destination == destinationId &&
 			key.EncryptionRole == sequenceTlsRoleClient &&
 			!key.EncryptionCompanion &&
 			!key.CompanionContract {
@@ -284,36 +290,107 @@ func TestProviderReturnTransferOptionPreventsForceStreamFork(t *testing.T) {
 	}
 }
 
-// Stream IP data must not retain Transfer retry around the datagram carrier.
-// Control traffic continues to use providerReturnTransferOptions and remains
-// acknowledged, so this test targets only the IP-specific option helper.
-func TestProviderReturnIpTransferOptionsAvoidsDuplicateRecovery(t *testing.T) {
+// Provider-return TCP must retain the bytes the proxy's upstream socket can no
+// longer reproduce. UDP and ICMP preserve datagram loss semantics.
+func TestProviderReturnIpTransferOptionsMatchRecoveryOwner(t *testing.T) {
 	defaultOptions := DefaultTransferOpts()
-	networkOptions := providerReturnIpTransferOptions(
-		defaultOptions,
-		protocol.ProvideMode_Network,
-		TransferPath{},
-	)
-	if networkOptions.Ack || !networkOptions.ForceStream {
-		t.Fatalf("network IP options = %#v, want unacknowledged stream", networkOptions)
+	tcpDefaultOptions := defaultOptions
+	// Recovery ownership is a correctness invariant, not a caller default.
+	tcpDefaultOptions.Ack = false
+	tests := []struct {
+		name            string
+		options         TransferOptions
+		provideMode     protocol.ProvideMode
+		transferKey     TransferKey
+		ipProtocol      IpProtocol
+		wantAck         bool
+		wantForceStream bool
+		wantCompanion   bool
+	}{
+		{
+			name:            "direct TCP socket data",
+			options:         tcpDefaultOptions,
+			provideMode:     protocol.ProvideMode_Network,
+			transferKey:     TransferKey{ForceStream: true},
+			ipProtocol:      IpProtocolTcp,
+			wantAck:         true,
+			wantForceStream: true,
+		},
+		{
+			name:            "direct pure TCP ACK",
+			options:         defaultOptions,
+			provideMode:     protocol.ProvideMode_Network,
+			transferKey:     TransferKey{ForceStream: true},
+			ipProtocol:      IpProtocolTcp,
+			wantAck:         true,
+			wantForceStream: true,
+		},
+		{
+			name:            "direct TCP SYN ACK",
+			options:         tcpDefaultOptions,
+			provideMode:     protocol.ProvideMode_Network,
+			transferKey:     TransferKey{ForceStream: true},
+			ipProtocol:      IpProtocolTcp,
+			wantAck:         true,
+			wantForceStream: true,
+		},
+		{
+			name:            "direct TCP FIN",
+			options:         tcpDefaultOptions,
+			provideMode:     protocol.ProvideMode_Network,
+			transferKey:     TransferKey{ForceStream: true},
+			ipProtocol:      IpProtocolTcp,
+			wantAck:         true,
+			wantForceStream: true,
+		},
+		{
+			name:            "direct TCP RST",
+			options:         tcpDefaultOptions,
+			provideMode:     protocol.ProvideMode_Network,
+			transferKey:     TransferKey{ForceStream: true},
+			ipProtocol:      IpProtocolTcp,
+			wantAck:         true,
+			wantForceStream: true,
+		},
+		{
+			name:            "direct UDP",
+			options:         defaultOptions,
+			provideMode:     protocol.ProvideMode_Public,
+			transferKey:     TransferKey{ForceStream: true, CompanionContract: true},
+			ipProtocol:      IpProtocolUdp,
+			wantForceStream: true,
+			wantCompanion:   true,
+		},
+		{
+			name:          "platform pure TCP ACK",
+			options:       defaultOptions,
+			provideMode:   protocol.ProvideMode_Public,
+			transferKey:   TransferKey{CompanionContract: true},
+			ipProtocol:    IpProtocolTcp,
+			wantAck:       true,
+			wantCompanion: true,
+		},
 	}
-
-	publicStreamOptions := providerReturnIpTransferOptions(
-		defaultOptions,
-		protocol.ProvideMode_Public,
-		TransferPath{StreamId: NewId()},
-	)
-	if publicStreamOptions.Ack || !publicStreamOptions.CompanionContract {
-		t.Fatalf("public stream IP options = %#v, want unacknowledged companion", publicStreamOptions)
-	}
-
-	publicPlatformOptions := providerReturnIpTransferOptions(
-		defaultOptions,
-		protocol.ProvideMode_Public,
-		TransferPath{},
-	)
-	if !publicPlatformOptions.Ack {
-		t.Fatalf("public platform IP options = %#v, want acknowledged", publicPlatformOptions)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			options := providerReturnIpTransferOptions(
+				test.options,
+				test.provideMode,
+				test.transferKey,
+				test.ipProtocol,
+			)
+			if options.Ack != test.wantAck ||
+				options.ForceStream != test.wantForceStream ||
+				options.CompanionContract != test.wantCompanion {
+				t.Fatalf(
+					"options = %#v, want Ack=%t ForceStream=%t CompanionContract=%t",
+					options,
+					test.wantAck,
+					test.wantForceStream,
+					test.wantCompanion,
+				)
+			}
+		})
 	}
 }
 
@@ -327,9 +404,17 @@ func TestProviderReturnNetworkContractDoesNotDependOnDestinationIdentity(t *test
 	defer client.Cancel()
 
 	generatedWindowClientId := NewId()
+	transferKey := providerReplyTransferKey(
+		TransferKey{
+			ForceStream:    true,
+			EncryptionRole: protocol.SequenceRole_SequenceRoleClient,
+		},
+		protocol.ProvideMode_Network,
+	)
 	options := providerReturnTransferOptions(
 		client.settings.DefaultTransferOpts,
 		protocol.ProvideMode_Network,
+		transferKey,
 	)
 	frame := &protocol.Frame{
 		MessageType:  protocol.MessageType_IpIpPacketFromProvider,
@@ -337,10 +422,11 @@ func TestProviderReturnNetworkContractDoesNotDependOnDestinationIdentity(t *test
 	}
 	if !client.SendWithTimeout(
 		frame,
-		DestinationId(generatedWindowClientId),
+		generatedWindowClientId,
 		nil,
 		time.Second,
 		options,
+		transferKey,
 	) {
 		t.Fatal("provider return enqueue failed")
 	}
@@ -348,7 +434,7 @@ func TestProviderReturnNetworkContractDoesNotDependOnDestinationIdentity(t *test
 	client.sendBuffer.mutex.Lock()
 	var sequence *SendSequence
 	for key, candidate := range client.sendBuffer.sendSequences {
-		if key.Destination.DestinationId == generatedWindowClientId {
+		if key.Destination == generatedWindowClientId {
 			sequence = candidate
 			break
 		}

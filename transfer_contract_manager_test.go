@@ -773,6 +773,85 @@ func TestContractQueueStaleCloseCannotDeleteReplacementGeneration(t *testing.T) 
 	}
 }
 
+// A key opener blocked behind retirement must never inherit the drained queue
+// generation. Test seams pause retirement while it owns the manager lock and
+// prove the competing opener reached that exact boundary.
+func TestFlushContractQueueDrainAndDetachAreAtomic(t *testing.T) {
+	manager := &ContractManager{
+		client: &Client{log: NewNoopLogger()},
+		settings: &ContractManagerSettings{
+			TrackUsedContracts: true,
+		},
+		destinationContracts: map[ContractKey]*contractQueue{},
+	}
+	key := ContractKey{Destination: DestinationId(NewId())}
+	oldQueue := manager.openContractQueue(key)
+	flushOwnsManager := make(chan struct{})
+	releaseFlush := make(chan struct{})
+	oldQueue.testingBeforeFlushWithLock = func() {
+		close(flushOwnsManager)
+		<-releaseFlush
+	}
+
+	flushDone := make(chan struct{})
+	go func() {
+		manager.FlushContractQueue(key, true)
+		close(flushDone)
+	}()
+
+	waitForStreamLifecycleSignal(
+		t,
+		flushOwnsManager,
+		"flush did not reach the queue retirement boundary",
+	)
+	if manager.mutex.TryLock() {
+		manager.mutex.Unlock()
+		close(releaseFlush)
+		t.Fatal("flush reached its drain boundary without owning the manager lock")
+	}
+	openerAttempted := make(chan struct{})
+	manager.testingBeforeOpenContractQueueLock = func(openKey ContractKey) {
+		if openKey != key {
+			t.Errorf("competing opener key=%+v, want %+v", openKey, key)
+		}
+		close(openerAttempted)
+	}
+	freshQueueResult := make(chan *contractQueue, 1)
+	go func() {
+		freshQueueResult <- manager.openContractQueue(key)
+	}()
+	waitForStreamLifecycleSignal(
+		t,
+		openerAttempted,
+		"competing opener did not reach the retirement boundary",
+	)
+
+	close(releaseFlush)
+	var freshQueue *contractQueue
+	select {
+	case freshQueue = <-freshQueueResult:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fresh queue opener did not resume after retirement")
+	}
+	select {
+	case <-flushDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("queue flush did not finish")
+	}
+	if freshQueue == oldQueue {
+		t.Fatal("new opener inherited the drained queue generation")
+	}
+	if !oldQueue.Drained() {
+		t.Fatal("retired queue was not drained")
+	}
+	if freshQueue.Drained() {
+		t.Fatal("replacement queue started drained")
+	}
+
+	manager.closeContractQueue(key, oldQueue)
+	manager.closeContractQueue(key, freshQueue)
+}
+
 // TestContractQueueShutdownFlush verifies that when the contract manager
 // closes (client context canceled), still-queued pending contracts are
 // flushed and closed rather than abandoned. The expire timeout is set long so

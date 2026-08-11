@@ -141,6 +141,19 @@ type Icmp4Buffer struct {
 
 func NewIcmp4Buffer(ctx context.Context, receiveCallback ReceivePacketFunction,
 	icmpBufferSettings *IcmpBufferSettings) *Icmp4Buffer {
+	return newIcmp4BufferWithTransferKey(
+		ctx,
+		receiveTransferPacketAdapter(receiveCallback),
+		icmpBufferSettings,
+	)
+}
+
+// Builds the provider form without dropping the transfer lane.
+func newIcmp4BufferWithTransferKey(
+	ctx context.Context,
+	receiveCallback receiveTransferPacketFunction,
+	icmpBufferSettings *IcmpBufferSettings,
+) *Icmp4Buffer {
 	return &Icmp4Buffer{
 		IcmpBuffer: *newIcmpBuffer[BufferId4](ctx, receiveCallback, icmpBufferSettings),
 	}
@@ -148,6 +161,26 @@ func NewIcmp4Buffer(ctx context.Context, receiveCallback ReceivePacketFunction,
 
 func (self *Icmp4Buffer) send(source TransferPath, provideMode protocol.ProvideMode,
 	icmp *parsedIcmp, timeout time.Duration, ipPacket []byte) (bool, error) {
+	return self.sendTransferKey(
+		source,
+		TransferKey{},
+		provideMode,
+		icmp,
+		timeout,
+		ipPacket,
+	)
+}
+
+// Retains the reply lane separately from the ICMP flow identity.
+func (self *Icmp4Buffer) sendTransferKey(
+	source TransferPath,
+	transferKey TransferKey,
+	provideMode protocol.ProvideMode,
+	icmp *parsedIcmp,
+	timeout time.Duration,
+	ipPacket []byte,
+) (bool, error) {
+	source = source.LocalMask()
 	bufferId := NewBufferId4(
 		source,
 		icmp.sourceIp, int(icmp.identifier),
@@ -157,6 +190,7 @@ func (self *Icmp4Buffer) send(source TransferPath, provideMode protocol.ProvideM
 	return self.icmpSend(
 		bufferId,
 		source,
+		transferKey,
 		provideMode,
 		4,
 		icmp,
@@ -171,6 +205,19 @@ type Icmp6Buffer struct {
 
 func NewIcmp6Buffer(ctx context.Context, receiveCallback ReceivePacketFunction,
 	icmpBufferSettings *IcmpBufferSettings) *Icmp6Buffer {
+	return newIcmp6BufferWithTransferKey(
+		ctx,
+		receiveTransferPacketAdapter(receiveCallback),
+		icmpBufferSettings,
+	)
+}
+
+// Builds the IPv6 provider form without dropping the transfer lane.
+func newIcmp6BufferWithTransferKey(
+	ctx context.Context,
+	receiveCallback receiveTransferPacketFunction,
+	icmpBufferSettings *IcmpBufferSettings,
+) *Icmp6Buffer {
 	return &Icmp6Buffer{
 		IcmpBuffer: *newIcmpBuffer[BufferId6](ctx, receiveCallback, icmpBufferSettings),
 	}
@@ -178,6 +225,26 @@ func NewIcmp6Buffer(ctx context.Context, receiveCallback ReceivePacketFunction,
 
 func (self *Icmp6Buffer) send(source TransferPath, provideMode protocol.ProvideMode,
 	icmp *parsedIcmp, timeout time.Duration, ipPacket []byte) (bool, error) {
+	return self.sendTransferKey(
+		source,
+		TransferKey{},
+		provideMode,
+		icmp,
+		timeout,
+		ipPacket,
+	)
+}
+
+// Retains the reply lane separately from the IPv6 flow identity.
+func (self *Icmp6Buffer) sendTransferKey(
+	source TransferPath,
+	transferKey TransferKey,
+	provideMode protocol.ProvideMode,
+	icmp *parsedIcmp,
+	timeout time.Duration,
+	ipPacket []byte,
+) (bool, error) {
+	source = source.LocalMask()
 	bufferId := NewBufferId6(
 		source,
 		icmp.sourceIp, int(icmp.identifier),
@@ -187,6 +254,7 @@ func (self *Icmp6Buffer) send(source TransferPath, provideMode protocol.ProvideM
 	return self.icmpSend(
 		bufferId,
 		source,
+		transferKey,
 		provideMode,
 		6,
 		icmp,
@@ -198,11 +266,11 @@ func (self *Icmp6Buffer) send(source TransferPath, provideMode protocol.ProvideM
 // the flow table for one address family, mirroring `UdpBuffer`: per-source and
 // aggregate lru caps, and an identity-checked cleanup when a sequence exits.
 type IcmpBuffer[BufferId comparable] struct {
-	ctx                    context.Context
-	log                    Logger
-	receiveCallback        ReceivePacketFunction
-	receivePacketsCallback receivePacketsBatchFunction
-	icmpBufferSettings     *IcmpBufferSettings
+	ctx                            context.Context
+	log                            Logger
+	receiveCallback                receiveTransferPacketFunction
+	receiveTransferPacketsCallback receiveTransferPacketsBatchFunction
+	icmpBufferSettings             *IcmpBufferSettings
 
 	mutex sync.Mutex
 
@@ -212,7 +280,7 @@ type IcmpBuffer[BufferId comparable] struct {
 
 func newIcmpBuffer[BufferId comparable](
 	ctx context.Context,
-	receiveCallback ReceivePacketFunction,
+	receiveCallback receiveTransferPacketFunction,
 	icmpBufferSettings *IcmpBufferSettings,
 ) *IcmpBuffer[BufferId] {
 	return &IcmpBuffer[BufferId]{
@@ -228,12 +296,14 @@ func newIcmpBuffer[BufferId comparable](
 func (self *IcmpBuffer[BufferId]) icmpSend(
 	bufferId BufferId,
 	source TransferPath,
+	transferKey TransferKey,
 	provideMode protocol.ProvideMode,
 	ipVersion int,
 	icmp *parsedIcmp,
 	timeout time.Duration,
 	ipPacket []byte,
 ) (bool, error) {
+	source = source.LocalMask()
 	initSequence := func(skip *IcmpSequence) *IcmpSequence {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
@@ -293,10 +363,11 @@ func (self *IcmpBuffer[BufferId]) icmpSend(
 		destinationIpCopy := make(net.IP, len(icmp.destinationIp))
 		copy(destinationIpCopy, icmp.destinationIp)
 
-		sequence = NewIcmpSequence(
+		sequence = newIcmpSequenceWithTransferKey(
 			self.ctx,
 			self.receiveCallback,
 			source,
+			transferKey,
 			provideMode,
 			ipVersion,
 			sourceIpCopy,
@@ -304,7 +375,7 @@ func (self *IcmpBuffer[BufferId]) icmpSend(
 			destinationIpCopy,
 			self.icmpBufferSettings,
 		)
-		sequence.receivePacketsCallback = self.receivePacketsCallback
+		sequence.receiveTransferPacketsCallback = self.receiveTransferPacketsCallback
 		self.sequences[bufferId] = sequence
 		sourceSequences := self.sourceSequences[source]
 		if sourceSequences == nil {
@@ -333,6 +404,8 @@ func (self *IcmpBuffer[BufferId]) icmpSend(
 	}
 
 	sendItem := &IcmpSendItem{
+		source:      source,
+		transferKey: transferKey,
 		provideMode: provideMode,
 		icmp:        *icmp,
 		ipPacket:    ipPacket,
@@ -363,6 +436,7 @@ func (self *IcmpBuffer[BufferId]) removeSequenceWithLock(bufferId BufferId, sequ
 
 type IcmpSendItem struct {
 	source      TransferPath
+	transferKey TransferKey
 	provideMode protocol.ProvideMode
 	icmp        parsedIcmp
 	ipPacket    []byte
@@ -373,12 +447,12 @@ type IcmpSendItem struct {
 // identifier restored. transfer to this sequence is lossless and in order;
 // the backend is datagram best-effort like the network itself.
 type IcmpSequence struct {
-	ctx                    context.Context
-	cancel                 context.CancelFunc
-	log                    Logger
-	receiveCallback        ReceivePacketFunction
-	receivePacketsCallback receivePacketsBatchFunction
-	icmpBufferSettings     *IcmpBufferSettings
+	ctx                            context.Context
+	cancel                         context.CancelFunc
+	log                            Logger
+	receiveCallback                receiveTransferPacketFunction
+	receiveTransferPacketsCallback receiveTransferPacketsBatchFunction
+	icmpBufferSettings             *IcmpBufferSettings
 
 	sendMutex sync.Mutex
 	sendItems chan *IcmpSendItem
@@ -389,6 +463,7 @@ type IcmpSequence struct {
 	idleCondition *IdleCondition
 
 	source        TransferPath
+	transferState transferState
 	provideMode   protocol.ProvideMode
 	ipVersion     int
 	sourceIp      net.IP
@@ -412,6 +487,34 @@ func NewIcmpSequence(ctx context.Context, receiveCallback ReceivePacketFunction,
 	identifier uint16,
 	destinationIp net.IP,
 	icmpBufferSettings *IcmpBufferSettings) *IcmpSequence {
+	return newIcmpSequenceWithTransferKey(
+		ctx,
+		receiveTransferPacketAdapter(receiveCallback),
+		source,
+		TransferKey{},
+		provideMode,
+		ipVersion,
+		sourceIp,
+		identifier,
+		destinationIp,
+		icmpBufferSettings,
+	)
+}
+
+// Builds the provider form without dropping the transfer lane.
+func newIcmpSequenceWithTransferKey(
+	ctx context.Context,
+	receiveCallback receiveTransferPacketFunction,
+	source TransferPath,
+	transferKey TransferKey,
+	provideMode protocol.ProvideMode,
+	ipVersion int,
+	sourceIp net.IP,
+	identifier uint16,
+	destinationIp net.IP,
+	icmpBufferSettings *IcmpBufferSettings,
+) *IcmpSequence {
+	source = source.LocalMask()
 	cancelCtx, cancel := context.WithCancel(ctx)
 	return &IcmpSequence{
 		ctx:                cancelCtx,
@@ -422,6 +525,7 @@ func NewIcmpSequence(ctx context.Context, receiveCallback ReceivePacketFunction,
 		sendItems:          make(chan *IcmpSendItem, icmpBufferSettings.SequenceBufferSize),
 		idleCondition:      NewIdleCondition(),
 		source:             source,
+		transferState:      newTransferState(source, transferKey),
 		provideMode:        provideMode,
 		ipVersion:          ipVersion,
 		sourceIp:           sourceIp,
@@ -462,6 +566,7 @@ func (self *IcmpSequence) send(sendItem *IcmpSendItem, timeout time.Duration) (b
 		return false, nil
 	}
 	defer self.idleCondition.UpdateClose()
+	self.transferState.update(sendItem.source, sendItem.transferKey)
 
 	select {
 	case <-self.ctx.Done():
@@ -511,12 +616,27 @@ func (self *IcmpSequence) send(sendItem *IcmpSendItem, timeout time.Duration) (b
 // is registered (the provider return path), else per packet
 func (self *IcmpSequence) receivePacket(packet []byte) {
 	self.singlePacket[0] = packet
-	if self.receivePacketsCallback != nil &&
-		self.receivePacketsCallback(self.source, self.provideMode, self.IpPath(), self.singlePacket[:]) {
+	source, transferKey := self.transferState.get()
+	if self.receiveTransferPacketsCallback != nil &&
+		self.receiveTransferPacketsCallback(
+			source,
+			transferKey,
+			self.provideMode,
+			receiveRecoveryModeNonblocking,
+			self.IpPath(),
+			self.singlePacket[:],
+		) {
 		MessagePoolReturn(packet)
 		return
 	}
-	self.receiveCallback(self.source, self.provideMode, self.IpPath(), packet)
+	self.receiveCallback(
+		source,
+		transferKey,
+		self.provideMode,
+		receiveRecoveryModeNonblocking,
+		self.IpPath(),
+		packet,
+	)
 	MessagePoolReturn(packet)
 }
 

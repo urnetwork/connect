@@ -195,12 +195,12 @@ func TestRequiredSendRefusalTypedErrorAndEvent(t *testing.T) {
 	AssertEqual(t, nil, err)
 
 	// non-blocking refusal with the typed error
-	success, sendErr := client.SendWithTimeoutDetailed(frame, DestinationId(peerId), func(error) {}, 0)
+	success, sendErr := client.SendWithTimeoutDetailed(frame, peerId, func(error) {}, 0)
 	AssertEqual(t, false, success)
 	AssertEqual(t, true, errors.Is(sendErr, ErrEncryptionRequiredNotEstablished))
 
 	// bounded refusal: the budget expires without establishment
-	success, sendErr = client.SendWithTimeoutDetailed(frame, DestinationId(peerId), func(error) {}, 100*time.Millisecond)
+	success, sendErr = client.SendWithTimeoutDetailed(frame, peerId, func(error) {}, 100*time.Millisecond)
 	AssertEqual(t, false, success)
 	AssertEqual(t, true, errors.Is(sendErr, ErrEncryptionRequiredNotEstablished))
 
@@ -231,7 +231,7 @@ func TestRequiredSendRefusalTypedErrorAndEvent(t *testing.T) {
 	defer oppClient.Cancel()
 	oppFrame, err := ToFrame(&protocol.SimpleMessage{Content: "plain"}, DefaultProtocolVersion)
 	AssertEqual(t, nil, err)
-	success, sendErr = oppClient.SendWithTimeoutDetailed(oppFrame, DestinationId(peerId), func(error) {}, 0)
+	success, sendErr = oppClient.SendWithTimeoutDetailed(oppFrame, peerId, func(error) {}, 0)
 	AssertEqual(t, true, success)
 	AssertEqual(t, nil, sendErr)
 }
@@ -1446,7 +1446,7 @@ func TestEncryptedControlCarrierMirrorsForceStream(t *testing.T) {
 		defer client.sendBuffer.mutex.Unlock()
 		keys := []sendSequenceId{}
 		for key := range client.sendBuffer.sendSequences {
-			if key.Destination.DestinationId == peerId {
+			if key.Destination == peerId {
 				keys = append(keys, key)
 			}
 		}

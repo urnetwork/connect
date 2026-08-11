@@ -1,6 +1,8 @@
+// Panic-containment tests verify both rescue isolation and lifecycle cleanup.
 package connect
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"testing"
@@ -67,5 +69,37 @@ func TestHandleErrorNoPanicNoHandlers(t *testing.T) {
 	)
 	if ran {
 		t.Fatal("rescue handler ran without a panic")
+	}
+}
+
+// A context cancellation function retains its named dynamic type when passed
+// through any, so recovery must recognize that type rather than only func().
+func TestHandleErrorRunsNamedContextCancelFunc(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	HandleError(
+		func() {
+			panic(errors.New("boom"))
+		},
+		cancel,
+	)
+	select {
+	case <-ctx.Done():
+	default:
+		t.Fatal("recovery did not invoke the named context cancellation function")
+	}
+}
+
+// A cancellation-with-cause function receives the recovered error despite its
+// named dynamic function type.
+func TestHandleErrorRunsNamedContextCancelCauseFunc(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	HandleError(
+		func() {
+			panic(errors.New("named cancel cause"))
+		},
+		cancel,
+	)
+	if cause := context.Cause(ctx); cause == nil || cause.Error() != "named cancel cause" {
+		t.Fatalf("recovery cancellation cause=%v, want named cancel cause", cause)
 	}
 }

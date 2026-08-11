@@ -104,6 +104,10 @@ type ClientStrategySettings struct {
 	ExtenderMinimumWeight float32
 	// drop dialers that have not had a successful connect in this timeout
 	ExtenderDropTimeout time.Duration
+	// ExtenderConfigs installs exact extender endpoints before discovery.
+	// Measurement fixtures use it for hermetic production extender paths. Nil
+	// retains normal discovery and selection. The strategy copies each entry.
+	ExtenderConfigs []*ExtenderConfig
 
 	DohSettings *DohSettings
 
@@ -167,9 +171,9 @@ func newNormalDialTlsContext(
 	settings *ClientStrategySettings,
 	nextProtos []string,
 ) DialTlsContextFunction {
-	netDialer := settings.NetDialer()
 	tlsConfig := newClientTlsConfig(settings.TlsConfig, nextProtos)
-	if settings.ProxySettings == nil {
+	if settings.ProxySettings == nil && settings.DialContextSettings == nil {
+		netDialer := settings.NetDialer()
 		tlsDialer := &tls.Dialer{
 			NetDialer: netDialer,
 			Config:    tlsConfig,
@@ -178,18 +182,14 @@ func newNormalDialTlsContext(
 	}
 
 	return func(ctx context.Context, network string, addr string) (net.Conn, error) {
-		proxyDialContext := settings.ProxySettings.NewDialContext(
-			ctx,
-			netDialer,
-		)
-
-		// The rest of this function is adapted from tls.Dialer to use a
-		// context-aware proxy dialer.
-		conn, err := proxyDialContext(ctx, network, addr)
+		// DialContext preserves injected userspace networks in tests and proxy
+		// routing in production before wrapping the resulting connection in TLS.
+		conn, err := settings.DialContext(ctx, network, addr)
 		if err != nil {
 			return nil, err
 		}
 
+		netDialer := settings.NetDialer()
 		if netDialer.Timeout != 0 {
 			var cancel context.CancelFunc
 			ctx, cancel = context.WithTimeout(ctx, netDialer.Timeout)
@@ -289,6 +289,23 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 			dialers[dialer3] = true
 		}
 	}
+	for _, extenderConfig := range settings.ExtenderConfigs {
+		if extenderConfig == nil {
+			continue
+		}
+		copiedConfig := *extenderConfig
+		dialer := &clientDialer{
+			description:        "configured extender",
+			persistent:         true,
+			minimumWeight:      settings.ExtenderMinimumWeight,
+			priority:           100,
+			dialTlsContext:     newExtenderDialTlsContext(&settings.ConnectSettings, &copiedConfig, clientWebSocketNextProtos),
+			httpDialTlsContext: newExtenderDialTlsContext(&settings.ConnectSettings, &copiedConfig, clientHttpNextProtos),
+			extenderConfig:     &copiedConfig,
+			settings:           settings,
+		}
+		dialers[dialer] = true
+	}
 	// FIXME
 	/*
 		if settings.EnablePt {
@@ -360,7 +377,7 @@ func (self *ClientStrategy) SetCustomExtenders(extenderIpSecrets map[netip.Addr]
 
 	self.extenderIpSecrets = maps.Clone(extenderIpSecrets)
 	for dialer, _ := range self.dialers {
-		if dialer.IsExtender() {
+		if dialer.IsExtender() && !dialer.persistent {
 			dialer.Close()
 			delete(self.dialers, dialer)
 		}
@@ -1014,7 +1031,7 @@ func (self *ClientStrategy) collapseExtenderDialers() {
 	defer self.mutex.Unlock()
 
 	for dialer, _ := range self.dialers {
-		if dialer.IsExtender() && dialer.IsLastSuccess() {
+		if dialer.IsExtender() && !dialer.persistent && dialer.IsLastSuccess() {
 			if self.settings.ExtenderDropTimeout <= time.Now().Sub(dialer.lastErrorTime) {
 				dialer.Close()
 				delete(self.dialers, dialer)
@@ -1209,7 +1226,9 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 
 // non-extender dialers are never dropped
 type clientDialer struct {
-	description   string
+	description string
+	// persistent dialers were supplied explicitly and are not discovery cache.
+	persistent    bool
 	minimumWeight float32
 	// 0 is max
 	priority int

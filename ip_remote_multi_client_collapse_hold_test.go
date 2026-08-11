@@ -36,6 +36,17 @@ func collapseTestClient(maxHold time.Duration) (*RemoteUserNatMultiClient, *mult
 	return client, update
 }
 
+// Uses a selected compatibility client whose IP packets require Transfer ACKs.
+func collapseTestCanSend(
+	client *RemoteUserNatMultiClient,
+	update *multiClientChannelUpdate,
+	packet *parsedPacket,
+) bool {
+	return client.canSendPacket(packet, update, &multiClientChannel{
+		settings: client.settings,
+	})
+}
+
 // a retransmit inside the hold is still collapsed, and the same retransmit
 // after the hold is admitted so a stalled flow can recover without waiting out
 // the 30s AckTimeout
@@ -45,20 +56,20 @@ func TestTcpCollapseHoldReleasesRetransmit(t *testing.T) {
 
 	// commit a data packet: this advances the sequence state
 	first := collapseTestPacket(1000, 5000, 100, false, false)
-	AssertEqual(t, client.canSendPacket(first, update), true)
+	AssertEqual(t, collapseTestCanSend(client, update, first), true)
 	update.updateSequence(first)
 
 	// an identical retransmit is collapsed while inside the hold
 	retransmit := collapseTestPacket(1000, 5000, 100, false, false)
-	AssertEqual(t, client.canSendPacket(retransmit, update), false)
+	AssertEqual(t, collapseTestCanSend(client, update, retransmit), false)
 
 	time.Sleep(maxHold + 20*time.Millisecond)
 
 	// past the hold, the retransmit is let through
-	AssertEqual(t, client.canSendPacket(retransmit, update), true)
+	AssertEqual(t, collapseTestCanSend(client, update, retransmit), true)
 
 	// and the window restarts, so the backlog is not released all at once
-	AssertEqual(t, client.canSendPacket(retransmit, update), false)
+	AssertEqual(t, collapseTestCanSend(client, update, retransmit), false)
 }
 
 // zero must reproduce the previous behavior exactly: retransmits collapsed
@@ -67,15 +78,15 @@ func TestTcpCollapseHoldDisabled(t *testing.T) {
 	client, update := collapseTestClient(0)
 
 	first := collapseTestPacket(1000, 5000, 100, false, false)
-	AssertEqual(t, client.canSendPacket(first, update), true)
+	AssertEqual(t, collapseTestCanSend(client, update, first), true)
 	update.updateSequence(first)
 
 	retransmit := collapseTestPacket(1000, 5000, 100, false, false)
-	AssertEqual(t, client.canSendPacket(retransmit, update), false)
+	AssertEqual(t, collapseTestCanSend(client, update, retransmit), false)
 
 	time.Sleep(60 * time.Millisecond)
 
-	AssertEqual(t, client.canSendPacket(retransmit, update), false)
+	AssertEqual(t, collapseTestCanSend(client, update, retransmit), false)
 }
 
 // the hold must not interfere with packets that legitimately advance the flow,
@@ -84,20 +95,20 @@ func TestTcpCollapseHoldAllowsProgress(t *testing.T) {
 	client, update := collapseTestClient(50 * time.Millisecond)
 
 	first := collapseTestPacket(1000, 5000, 100, false, false)
-	AssertEqual(t, client.canSendPacket(first, update), true)
+	AssertEqual(t, collapseTestCanSend(client, update, first), true)
 	update.updateSequence(first)
 
 	// new data later in sequence space
 	next := collapseTestPacket(1100, 5000, 100, false, false)
-	AssertEqual(t, client.canSendPacket(next, update), true)
+	AssertEqual(t, collapseTestCanSend(client, update, next), true)
 
 	// a pure ack that advances the ack number
 	ack := collapseTestPacket(1100, 6000, 0, false, false)
-	AssertEqual(t, client.canSendPacket(ack, update), true)
+	AssertEqual(t, collapseTestCanSend(client, update, ack), true)
 
 	// syn and rst are never collapsed
-	AssertEqual(t, client.canSendPacket(collapseTestPacket(1000, 5000, 100, true, false), update), true)
-	AssertEqual(t, client.canSendPacket(collapseTestPacket(1000, 5000, 100, false, true), update), true)
+	AssertEqual(t, collapseTestCanSend(client, update, collapseTestPacket(1000, 5000, 100, true, false)), true)
+	AssertEqual(t, collapseTestCanSend(client, update, collapseTestPacket(1000, 5000, 100, false, true)), true)
 }
 
 // with collapse prevention off entirely, the hold is irrelevant and everything
@@ -112,10 +123,10 @@ func TestTcpCollapseHoldIgnoredWhenPreventionOff(t *testing.T) {
 	update := newMultiClientChannelUpdate(context.Background(), collapseTestPacket(0, 0, 0, false, false).ipPath)
 
 	first := collapseTestPacket(1000, 5000, 100, false, false)
-	AssertEqual(t, client.canSendPacket(first, update), true)
+	AssertEqual(t, collapseTestCanSend(client, update, first), true)
 	update.updateSequence(first)
 
-	AssertEqual(t, client.canSendPacket(collapseTestPacket(1000, 5000, 100, false, false), update), true)
+	AssertEqual(t, collapseTestCanSend(client, update, collapseTestPacket(1000, 5000, 100, false, false)), true)
 }
 
 // udp is unaffected by the tcp collapse path
@@ -124,8 +135,45 @@ func TestTcpCollapseHoldUdpUnaffected(t *testing.T) {
 
 	udp := collapseTestPacket(1000, 5000, 100, false, false)
 	udp.ipPath.Protocol = IpProtocolUdp
-	AssertEqual(t, client.canSendPacket(udp, update), true)
-	AssertEqual(t, client.canSendPacket(udp, update), true)
+	AssertEqual(t, collapseTestCanSend(client, update, udp), true)
+	AssertEqual(t, collapseTestCanSend(client, update, udp), true)
+}
+
+// Collapse prevention may suppress retransmits only while a live selected
+// client owns Transfer recovery. A direct client deliberately leaves recovery
+// to inner TCP; an unbound flow retains the established collapse behavior.
+func TestTcpCollapseRequiresReliableSelectedClient(t *testing.T) {
+	client, update := collapseTestClient(time.Hour)
+	first := collapseTestPacket(1000, 5000, 100, false, false)
+	acknowledgedClient := &multiClientChannel{
+		settings:           client.settings,
+		performanceProfile: &PerformanceProfile{},
+	}
+	directClient := &multiClientChannel{
+		settings: client.settings,
+		performanceProfile: &PerformanceProfile{
+			AllowDirect: true,
+		},
+	}
+
+	if !client.canSendPacket(first, update, acknowledgedClient) {
+		t.Fatal("initial acknowledged packet was not admitted")
+	}
+	update.updateSequence(first)
+	retransmit := collapseTestPacket(1000, 5000, 100, false, false)
+
+	if client.canSendPacket(retransmit, update, acknowledgedClient) {
+		t.Fatal("acknowledged Transfer retransmit bypassed collapse prevention")
+	}
+	if !client.canSendPacket(retransmit, update, directClient) {
+		t.Fatal("direct unacknowledged Transfer suppressed inner TCP retransmit")
+	}
+	if !client.canSendPacket(retransmit, update, directClient) {
+		t.Fatal("second direct inner TCP retransmit was collapsed")
+	}
+	if client.canSendPacket(retransmit, update, nil) {
+		t.Fatal("unbound flow changed the established collapse policy")
+	}
 }
 
 func TestDefaultMultiClientSettingsSetsTcpCollapseMaxHold(t *testing.T) {

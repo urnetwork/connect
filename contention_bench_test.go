@@ -48,6 +48,38 @@ func BenchmarkRouteSelectorWrite(b *testing.B) {
 	b.StopTimer()
 }
 
+// Compares the atomic writer-lifecycle admission with the previous immutable
+// snapshot load and direct route send. Both cases retain identical channel
+// transfer work, so their delta isolates the teardown-safety cost.
+func BenchmarkRouteSnapshotWriterAdmission(b *testing.B) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	selector := NewMultiRouteSelector(ctx, "bench", nil, SourceId(NewId()), true)
+	defer selector.Close()
+	route := make(chan []byte, 1)
+	selector.updateTransport(NewSendGatewayTransport(), []Route{route})
+	frame := make([]byte, 1400)
+
+	b.Run("immutable_snapshot_control", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			snapshot := selector.activeRoutesSnapshot.Load()
+			snapshot.routes[0] <- frame
+			<-route
+		}
+	})
+	b.Run("atomic_writer_admission", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			snapshot := selector.acquireWriterSnapshot()
+			snapshot.routes[0] <- frame
+			snapshot.releaseWriter()
+			<-route
+		}
+	})
+}
+
 // isolates the route-selector read hot path (one active route).
 func BenchmarkRouteSelectorRead(b *testing.B) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -202,7 +234,7 @@ func BenchmarkMultiClientBidirectional(b *testing.B) {
 			providerClient.sendRawWithTimeoutDetailed(
 				protocol.MessageType_IpIpPacketFromProvider,
 				echo,
-				source.Reverse(),
+				source.SourceId,
 				nil,
 				0,
 				-1,

@@ -47,6 +47,8 @@ const (
 // counts refer to complete TransferFrame messages; fragment counts refer to
 // independently authenticated SRTP datagrams.
 type P2pDataPlaneStatsSnapshot struct {
+	ActiveSendRouteCount      int64
+	ActiveReceiveRouteCount   int64
 	FastSendMessageCount      uint64
 	FastSendByteCount         uint64
 	FastSendFragmentCount     uint64
@@ -64,6 +66,8 @@ type P2pDataPlaneStatsSnapshot struct {
 // P2pDataPlaneStats holds lock-free counters shared by all P2P streams owned
 // by one client settings tree.
 type P2pDataPlaneStats struct {
+	activeSendRouteCount      atomic.Int64
+	activeReceiveRouteCount   atomic.Int64
 	fastSendMessageCount      atomic.Uint64
 	fastSendByteCount         atomic.Uint64
 	fastSendFragmentCount     atomic.Uint64
@@ -78,13 +82,16 @@ type P2pDataPlaneStats struct {
 	fastDropCount             atomic.Uint64
 }
 
-// Snapshot reads a consistent-enough monotonic view without stopping packet
-// processing. Individual fields can advance while the snapshot is assembled.
+// Snapshot reads a consistent-enough lock-free view without stopping packet
+// processing. Active route gauges can move in either direction; traffic
+// counters are monotonic.
 func (self *P2pDataPlaneStats) Snapshot() P2pDataPlaneStatsSnapshot {
 	if self == nil {
 		return P2pDataPlaneStatsSnapshot{}
 	}
 	return P2pDataPlaneStatsSnapshot{
+		ActiveSendRouteCount:      self.activeSendRouteCount.Load(),
+		ActiveReceiveRouteCount:   self.activeReceiveRouteCount.Load(),
 		FastSendMessageCount:      self.fastSendMessageCount.Load(),
 		FastSendByteCount:         self.fastSendByteCount.Load(),
 		FastSendFragmentCount:     self.fastSendFragmentCount.Load(),
@@ -196,6 +203,10 @@ type p2pFastPathReassemblySlot struct {
 type p2pFastPathReassembler struct {
 	maximumMessageByteCount int
 	slots                   [p2pFastPathReassemblySlotCount]p2pFastPathReassemblySlot
+
+	// Tests retain the exact allocated buffer before ownership can move to the
+	// complete-message queue. Nil is a production no-op.
+	afterMessageAllocatedForTest func([]byte)
 }
 
 // newP2pFastPathReassembler creates a generation-local reassembler.
@@ -231,6 +242,9 @@ func (self *p2pFastPathReassembler) accept(packet []byte, now time.Time) ([]byte
 			message:        MessagePoolGet(header.messageLength),
 			fragmentCount:  header.fragmentCount,
 			expirationTime: now.Add(p2pFastPathReassemblyTimeout),
+		}
+		if self.afterMessageAllocatedForTest != nil {
+			self.afterMessageAllocatedForTest(slot.message)
 		}
 	}
 	if len(slot.message) != header.messageLength ||

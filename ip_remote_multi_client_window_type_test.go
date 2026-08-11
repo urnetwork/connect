@@ -148,6 +148,16 @@ func TestMultiClientNetworkAllowDirectAuto(t *testing.T) {
 	AssertEqual(t, true, pp != nil)
 	AssertEqual(t, true, pp.AllowDirect)
 	AssertEqual(t, WindowTypeAuto, pp.WindowType)
+	func() {
+		qualityWindow := multiClient.windows[WindowTypeQuality]
+		qualityWindow.stateLock.Lock()
+		defer qualityWindow.stateLock.Unlock()
+
+		pp = qualityWindow.performanceProfile
+		AssertEqual(t, true, pp != nil)
+		AssertEqual(t, true, pp.AllowDirect)
+		AssertEqual(t, WindowTypeAuto, pp.WindowType)
+	}()
 	_, _, ok := pp.FixedWindow()
 	AssertEqual(t, false, ok)
 
@@ -183,6 +193,16 @@ func TestMultiClientNetworkAllowDirectNilProfileStaysAuto(t *testing.T) {
 	AssertEqual(t, true, pp != nil)
 	AssertEqual(t, true, pp.AllowDirect)
 	AssertEqual(t, WindowTypeAuto, pp.WindowType)
+	func() {
+		qualityWindow := multiClient.windows[WindowTypeQuality]
+		qualityWindow.stateLock.Lock()
+		defer qualityWindow.stateLock.Unlock()
+
+		pp = qualityWindow.performanceProfile
+		AssertEqual(t, true, pp != nil)
+		AssertEqual(t, true, pp.AllowDirect)
+		AssertEqual(t, WindowTypeAuto, pp.WindowType)
+	}()
 	_, _, ok := pp.FixedWindow()
 	AssertEqual(t, false, ok)
 }

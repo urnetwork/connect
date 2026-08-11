@@ -94,6 +94,7 @@ type webRtcFastPath struct {
 	track                   *webRtcFastPathTrack
 	messages                chan p2pFastPathReceivedMessage
 	receiveOnce             sync.Once
+	receiveDone             chan struct{}
 	warmupOnce              sync.Once
 	readyOnce               sync.Once
 	ready                   chan struct{}
@@ -101,6 +102,34 @@ type webRtcFastPath struct {
 	sendMutex               sync.Mutex
 	nextMessageId           uint32
 	nextSequenceNumber      uint16
+
+	// Tests retain an exact reassembly-buffer witness before queue handoff.
+	// Nil is a production no-op.
+	afterReceiveMessageAllocatedForTest func([]byte)
+}
+
+// p2pFastPathPacketReader is the cancellation-aware packet boundary owned by
+// one native SRTP receive worker.
+type p2pFastPathPacketReader interface {
+	Read(packet []byte) (int, error)
+	SetReadDeadline(deadline time.Time) error
+}
+
+// webRtcFastPathTrackReader adapts Pion's attribute-bearing track read to the
+// packet-only boundary used by the fast-path worker.
+type webRtcFastPathTrackReader struct {
+	track *webrtc.TrackRemote
+}
+
+// Read returns one decrypted RTP packet and discards interceptor attributes.
+func (self *webRtcFastPathTrackReader) Read(packet []byte) (int, error) {
+	packetByteCount, _, err := self.track.Read(packet)
+	return packetByteCount, err
+}
+
+// SetReadDeadline interrupts an outstanding Pion track read at teardown.
+func (self *webRtcFastPathTrackReader) SetReadDeadline(deadline time.Time) error {
+	return self.track.SetReadDeadline(deadline)
 }
 
 // newWebRtcMediaEngine creates the immutable codec registry used by one Pion
@@ -155,29 +184,42 @@ func (self *peerConn) configureFastPath() error {
 			chan p2pFastPathReceivedMessage,
 			max(1, self.settings.DatagramFastPathReceiveBufferSize),
 		),
-		ready: make(chan struct{}),
+		receiveDone: make(chan struct{}),
+		ready:       make(chan struct{}),
 	}
-	self.fastPath = fastPath
+	self.fastPath.Store(fastPath)
+	if self.settings.afterFastPathPublishForTest != nil {
+		self.settings.afterFastPathPublishForTest()
+	}
 	self.pc.OnTrack(func(
 		remoteTrack *webrtc.TrackRemote,
 		receiver *webrtc.RTPReceiver,
 	) {
-		_ = receiver
-		if !strings.EqualFold(remoteTrack.Codec().MimeType, p2pFastPathMimeType) {
-			return
-		}
-		fastPath.receiveOnce.Do(func() {
-			go HandleError(func() {
-				fastPath.readTrack(remoteTrack)
-			})
-		})
+		self.runPionCallback("fast path track callback", func() {
+			if self.settings.beforeFastPathOnTrackBodyForTest != nil {
+				self.settings.beforeFastPathOnTrackBodyForTest()
+			}
+			_ = receiver
+			if !strings.EqualFold(remoteTrack.Codec().MimeType, p2pFastPathMimeType) {
+				return
+			}
+			fastPath.startReceive(&webRtcFastPathTrackReader{track: remoteTrack})
+		}, self.cancel)
 	})
 	sender, err := self.pc.AddTrack(fastPath.track)
 	if err != nil {
-		self.fastPath = nil
+		if self.fastPath.CompareAndSwap(fastPath, nil) {
+			fastPath.closeAndWait()
+		}
 		return err
 	}
-	go HandleError(func() {
+	if self.fastPath.Load() != fastPath {
+		if err := context.Cause(self.ctx); err != nil {
+			return err
+		}
+		return context.Canceled
+	}
+	self.startWorker("fast path RTCP drain", func() {
 		buffer := make([]byte, 1500)
 		for {
 			if _, _, readErr := sender.Read(buffer); readErr != nil {
@@ -188,12 +230,45 @@ func (self *peerConn) configureFastPath() error {
 	return nil
 }
 
+// Retires the published native carrier exactly once across setup and teardown.
+func (self *peerConn) closeFastPath() {
+	if fastPath := self.fastPath.Swap(nil); fastPath != nil {
+		fastPath.closeAndWait()
+	}
+}
+
+// startReceive starts exactly one receive worker unless teardown already won
+// the generation's lifecycle boundary.
+func (self *webRtcFastPath) startReceive(reader p2pFastPathPacketReader) {
+	self.receiveOnce.Do(func() {
+		go HandleError(func() {
+			defer close(self.receiveDone)
+			defer close(self.messages)
+			self.readTrack(reader)
+		})
+	})
+}
+
+// closeAndWait prevents late receive admission, joins the native reader, and
+// returns complete messages left in its bounded handoff queue.
+func (self *webRtcFastPath) closeAndWait() {
+	self.receiveOnce.Do(func() {
+		close(self.messages)
+		close(self.receiveDone)
+	})
+	<-self.receiveDone
+	for received := range self.messages {
+		MessagePoolReturn(received.message)
+	}
+}
+
 // FastPathReady reports a mutually negotiated and currently bound custom
 // codec. It does not infer readiness from SDP presence alone.
 func (self *peerConn) FastPathReady() bool {
-	return self.fastPath != nil &&
-		self.fastPath.track.bound.Load() &&
-		self.fastPath.receiveReady.Load()
+	fastPath := self.fastPath.Load()
+	return fastPath != nil &&
+		fastPath.track.bound.Load() &&
+		fastPath.receiveReady.Load()
 }
 
 // WaitFastPathReady waits only for a forced carrier selection. Auto mode
@@ -207,7 +282,8 @@ func (self *peerConn) WaitFastPathReady(
 	if self.FastPathReady() {
 		return true
 	}
-	if self.fastPath == nil || timeout <= 0 {
+	fastPath := self.fastPath.Load()
+	if fastPath == nil || timeout <= 0 {
 		return false
 	}
 	timer := time.NewTimer(timeout)
@@ -217,7 +293,7 @@ func (self *peerConn) WaitFastPathReady(
 		return false
 	case <-self.ctx.Done():
 		return false
-	case <-self.fastPath.ready:
+	case <-fastPath.ready:
 		return self.FastPathReady()
 	case <-timer.C:
 		return false
@@ -226,10 +302,11 @@ func (self *peerConn) WaitFastPathReady(
 
 // FastPathMessages returns the ownership-transferring receive queue.
 func (self *peerConn) FastPathMessages() <-chan p2pFastPathReceivedMessage {
-	if self.fastPath == nil {
+	fastPath := self.fastPath.Load()
+	if fastPath == nil {
 		return nil
 	}
-	return self.fastPath.messages
+	return fastPath.messages
 }
 
 // WriteFastPathMessage fragments one complete transfer message into
@@ -237,10 +314,11 @@ func (self *peerConn) FastPathMessages() <-chan p2pFastPathReceivedMessage {
 // transfer over the legacy channel after an error; Transfer message identity
 // makes that duplicate harmless.
 func (self *peerConn) WriteFastPathMessage(message []byte) (int, error) {
-	if self.fastPath == nil || !self.fastPath.track.bound.Load() {
+	fastPath := self.fastPath.Load()
+	if fastPath == nil || !fastPath.track.bound.Load() {
 		return 0, errP2pFastPathNotReady
 	}
-	return self.fastPath.writeMessage(message)
+	return fastPath.writeMessage(message)
 }
 
 // writeMessage assigns ordered fragment counters and writes every fragment
@@ -304,44 +382,42 @@ func (self *webRtcFastPath) writeMessage(message []byte) (int, error) {
 
 // startFastPathWarmup starts the generation-local native readiness exchange.
 func (self *peerConn) startFastPathWarmup() {
-	if self.fastPath != nil {
-		self.fastPath.startWarmup()
+	if fastPath := self.fastPath.Load(); fastPath != nil {
+		fastPath.warmupOnce.Do(func() {
+			self.startWorker("fast path warmup", fastPath.runWarmup)
+		})
 	}
 }
 
-// startWarmup sends a tiny carrier marker until a remote marker proves that
+// runWarmup sends a tiny carrier marker until a remote marker proves that
 // both RTP receive workers are active. Pion fires OnTrack from the first RTP
 // packet; repeating only during this setup window prevents that trigger packet
 // from becoming a cold-path application loss.
-func (self *webRtcFastPath) startWarmup() {
-	self.warmupOnce.Do(func() {
-		go HandleError(func() {
-			ticker := time.NewTicker(p2pFastPathWarmupInterval)
-			defer ticker.Stop()
-			timer := time.NewTimer(p2pFastPathWarmupTimeout)
-			defer timer.Stop()
-			for {
-				if self.track.bound.Load() {
-					if err := self.writeWarmup(); err != nil {
-						if self.log.V(1).Enabled() {
-							self.log.Infof("[p2p-fast]warmup err = %s\n", err)
-						}
-						return
-					}
-					if self.receiveReady.Load() {
-						return
-					}
+func (self *webRtcFastPath) runWarmup() {
+	ticker := time.NewTicker(p2pFastPathWarmupInterval)
+	defer ticker.Stop()
+	timer := time.NewTimer(p2pFastPathWarmupTimeout)
+	defer timer.Stop()
+	for {
+		if self.track.bound.Load() {
+			if err := self.writeWarmup(); err != nil {
+				if self.log.V(1).Enabled() {
+					self.log.Infof("[p2p-fast]warmup err = %s\n", err)
 				}
-				select {
-				case <-self.ctx.Done():
-					return
-				case <-ticker.C:
-				case <-timer.C:
-					return
-				}
+				return
 			}
-		})
-	})
+			if self.receiveReady.Load() {
+				return
+			}
+		}
+		select {
+		case <-self.ctx.Done():
+			return
+		case <-ticker.C:
+		case <-timer.C:
+			return
+		}
+	}
 }
 
 // writeWarmup emits one marker under the same sequence-number lock as data.
@@ -360,13 +436,29 @@ func (self *webRtcFastPath) writeWarmup() error {
 
 // readTrack drains decrypted SRTP packets, validates the RTP header, and
 // passes only complete bounded messages to the P2P route worker.
-func (self *webRtcFastPath) readTrack(track *webrtc.TrackRemote) {
+func (self *webRtcFastPath) readTrack(reader p2pFastPathPacketReader) {
 	reassembler := newP2pFastPathReassembler(self.maximumMessageByteCount)
+	reassembler.afterMessageAllocatedForTest = self.afterReceiveMessageAllocatedForTest
 	defer reassembler.close()
-	defer close(self.messages)
+	readDeadlineDone := make(chan struct{})
+	var readDeadlineDoneOnce sync.Once
+	stopReadDeadline := context.AfterFunc(self.ctx, func() {
+		defer readDeadlineDoneOnce.Do(func() {
+			close(readDeadlineDone)
+		})
+		_ = reader.SetReadDeadline(time.Now())
+	})
+	defer func() {
+		if stopReadDeadline() {
+			readDeadlineDoneOnce.Do(func() {
+				close(readDeadlineDone)
+			})
+		}
+		<-readDeadlineDone
+	}()
 	for {
 		packetBuffer := MessagePoolGet(2048)
-		packetByteCount, _, err := track.Read(packetBuffer)
+		packetByteCount, err := reader.Read(packetBuffer)
 		if err != nil {
 			MessagePoolReturn(packetBuffer)
 			if !errors.Is(err, io.EOF) && self.ctx.Err() == nil && self.log.V(1).Enabled() {

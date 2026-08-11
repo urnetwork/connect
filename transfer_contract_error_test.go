@@ -137,7 +137,7 @@ func TestSendSequenceSurvivesTransientContractErrors(t *testing.T) {
 	sent := make(chan struct{}, 1)
 	success := client.SendWithTimeout(
 		frame,
-		DestinationId(NewId()),
+		NewId(),
 		func(err error) {},
 		-1,
 	)

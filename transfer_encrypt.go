@@ -718,6 +718,8 @@ type EncryptionSettings struct {
 	// receive-sequence idle), since the session is ref-held by both a send and
 	// a receive sequence and must outlive the longer of the two.
 	IdleTimeout time.Duration
+	// Nil test barrier pauses the actual certificate publisher after readiness.
+	beforeEncryptedKeyPublishForTest func()
 }
 
 func DefaultEncryptionSettings() *EncryptionSettings {
@@ -931,8 +933,9 @@ type tlsHandshakeEpoch struct {
 // ReceiveSequence that talks to the same peer/stream. The session lives
 // inside `EncryptionSessionManager`.
 type peerEncryptionSession struct {
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx     context.Context
+	cancel  context.CancelFunc
+	workers *lifecycleAdmission
 
 	manager *EncryptionSessionManager
 	client  *Client
@@ -1057,6 +1060,12 @@ type peerEncryptionSession struct {
 	// for every retry adds disk/logd work without adding evidence.
 	// Protected by stateLock.
 	establishmentFailureLogKey string
+	// Nil test barrier pauses an owned child after cleanup and before joined
+	// completion.
+	beforeWorkerDoneForTest func(string)
+	// Nil test barriers expose supervisor entry and its child-worker join.
+	afterRunStartedForTest  func()
+	beforeWorkerWaitForTest func()
 	// peerClientPublicKey is the peer's long-lived Ed25519 public identity key,
 	// set via `SetPeerClientPublicKey` (from the SendSequence after a contract
 	// for the peer arrives). nil until a contract has been seen; until then any
@@ -1099,6 +1108,7 @@ func newPeerEncryptionSession(
 	s := &peerEncryptionSession{
 		ctx:              ctx,
 		cancel:           cancel,
+		workers:          newLifecycleAdmission(),
 		manager:          manager,
 		client:           client,
 		peerId:           peerId,
@@ -1121,6 +1131,26 @@ func newPeerEncryptionSession(
 	return s
 }
 
+// startWorker admits one session-owned handshake, control, or key-fetch
+// worker before launch.
+func (self *peerEncryptionSession) startWorker(
+	name string,
+	run func(),
+	handlers ...any,
+) bool {
+	if !self.workers.start() {
+		return false
+	}
+	go func() {
+		defer self.workers.finish()
+		HandleError(run, handlers...)
+		if self.beforeWorkerDoneForTest != nil {
+			self.beforeWorkerDoneForTest(name)
+		}
+	}()
+	return true
+}
+
 // Run is the session's supervisor goroutine, spawned by the manager when the
 // session is created. The handshake epoch is started on demand by the acquire
 // / inbound-delivery paths (`startEpoch`, `reset`), not here, so re-handshakes
@@ -1129,7 +1159,18 @@ func newPeerEncryptionSession(
 // epoch's transport and returns; the manager then removes the session —
 // mirroring the SendBuffer / SendSequence pattern.
 func (self *peerEncryptionSession) Run() {
-	defer self.closeTls()
+	defer func() {
+		self.cancel()
+		self.closeTls()
+		self.workers.close()
+		if self.beforeWorkerWaitForTest != nil {
+			self.beforeWorkerWaitForTest()
+		}
+		<-self.workers.Done()
+	}()
+	if self.afterRunStartedForTest != nil {
+		self.afterRunStartedForTest()
+	}
 
 	idleTimeout := time.Duration(0)
 	if self.settings != nil {
@@ -1340,6 +1381,9 @@ func (self *peerEncryptionSession) reset() {
 // running so its cipher keeps serving wrap/decrypt until the new epoch
 // establishes (gap-free rekey). Caller holds stateLock.
 func (self *peerEncryptionSession) buildAndStartEpochWithLock() {
+	if self.ctx.Err() != nil {
+		return
+	}
 	if self.epoch != nil && self.epoch != self.establishedEpoch {
 		self.epoch.cancel()
 	}
@@ -1390,15 +1434,19 @@ func (self *peerEncryptionSession) buildAndStartEpochWithLock() {
 	self.epoch = e
 
 	// drain TLS outbox → outbound EncryptedControl
-	go HandleError(func() { self.outboxLoop(e) }, e.cancel)
+	self.startWorker("TLS outbox", func() { self.outboxLoop(e) }, e.cancel)
 	// drive the TLS handshake
-	go HandleError(func() { self.runHandshake(e) }, e.cancel)
+	self.startWorker("TLS handshake", func() { self.runHandshake(e) }, e.cancel)
 	// Bound the complete TLS + identity-proof establishment. A TLS-only
 	// timeout leaves a successfully handshaken epoch waiting forever when the
 	// peer proof or contract key never arrives, which in turn pins the
 	// session's goroutines and prevents zero-reference idle reaping.
 	if 0 < self.settings.TlsTimeout {
-		go HandleError(func() { self.establishmentTimeoutWatcher(e) }, e.cancel)
+		self.startWorker(
+			"TLS establishment timeout",
+			func() { self.establishmentTimeoutWatcher(e) },
+			e.cancel,
+		)
 	}
 }
 
@@ -1549,7 +1597,7 @@ func isClientHelloRecord(b []byte) bool {
 // peerCertificatesOfEpoch returns the peer cert chain observed during the
 // epoch's completed TLS handshake, or nil if the handshake has not
 // completed (or the epoch is nil).
-func peerCertificatesOfEpoch(log Logger, e *tlsHandshakeEpoch) []*x509.Certificate {
+func (self *peerEncryptionSession) peerCertificatesOfEpoch(e *tlsHandshakeEpoch) []*x509.Certificate {
 	if e == nil || e.tlsConn == nil {
 		return nil
 	}
@@ -1557,16 +1605,16 @@ func peerCertificatesOfEpoch(log Logger, e *tlsHandshakeEpoch) []*x509.Certifica
 	// and blocks until any in-progress handshake completes. The watchdog (armed
 	// only under V(2), so it costs nothing otherwise) flags whether this call is
 	// parking a caller (e.g. a SendSequence Run loop).
-	if log.V(2).Enabled() {
+	if self.client.log.V(2).Enabled() {
 		pcDone := make(chan struct{})
 		defer close(pcDone)
-		go func() {
+		self.startWorker("peer certificate watchdog", func() {
 			select {
 			case <-pcDone:
 			case <-time.After(2 * time.Second):
-				log.Infof("[tls][peercert-block]ConnectionState() blocked >2s (handshake in progress)\n%s", debug.Stack())
+				self.client.log.Infof("[tls][peercert-block]ConnectionState() blocked >2s (handshake in progress)\n%s", debug.Stack())
 			}
-		}()
+		})
 	}
 	state := e.tlsConn.ConnectionState()
 	if !state.HandshakeComplete {
@@ -1588,7 +1636,7 @@ func (self *peerEncryptionSession) sendEncryptedControl(
 	if e == nil || self.client == nil || self.client.sendBuffer == nil {
 		return
 	}
-	go HandleError(func() {
+	self.startWorker("encrypted control send", func() {
 		if e.ctx == nil || !self.isCurrentEpoch(e) || e.ctx.Err() != nil {
 			return
 		}
@@ -1729,14 +1777,14 @@ func (self *peerEncryptionSession) completeHandshake(e *tlsHandshakeEpoch, err e
 			)
 		}
 		if self.role == sequenceTlsRoleClient {
-			logTlsHandshakePeerCert(self.client.log, self.logTag, peerCertificatesOfEpoch(self.client.log, e))
+			logTlsHandshakePeerCert(self.client.log, self.logTag, self.peerCertificatesOfEpoch(e))
 		}
 		// Send our identity proof and try to verify any peer proof
 		// that arrived early. Both happen on completed-handshake
 		// success; on failure neither path is meaningful.
 		self.sendIdentityProofOnce(e)
 		self.maybeVerifyPendingPeerIdentityProof(e)
-		go HandleError(func() {
+		self.startWorker("identity proof resend", func() {
 			self.resendIdentityProofForEstablishment(e)
 		}, e.cancel)
 	} else if logFailure {
@@ -2038,7 +2086,7 @@ func (self *peerEncryptionSession) SetPeerClientPublicKey(pub ed25519.PublicKey)
 		// retained on the session.
 		if self.peerClientPublicKeyFetcher != nil {
 			contractPub := append(ed25519.PublicKey(nil), pub...)
-			go HandleError(func() {
+			self.startWorker("peer key cross-check", func() {
 				self.crossCheckPeerClientPublicKey(contractPub)
 			})
 		}
@@ -2706,7 +2754,7 @@ func (self *peerEncryptionSession) closeTls() {
 // the current epoch's TLS handshake. Returns nil if the handshake has not
 // completed.
 func (self *peerEncryptionSession) PeerCertificates() []*x509.Certificate {
-	return peerCertificatesOfEpoch(self.client.log, self.currentEpoch())
+	return self.peerCertificatesOfEpoch(self.currentEpoch())
 }
 
 // establishedPeerCertificates returns the peer certificate chain from the
@@ -2730,7 +2778,7 @@ func (self *peerEncryptionSession) establishedPeerCertificates() []*x509.Certifi
 	self.stateLock.Lock()
 	e := self.establishedEpoch
 	self.stateLock.Unlock()
-	return peerCertificatesOfEpoch(self.client.log, e)
+	return self.peerCertificatesOfEpoch(e)
 }
 
 // CertVerificationState returns the cached certificate verification result.
@@ -3014,6 +3062,7 @@ func (self *peerEncryptionSession) close() {
 // timers, so they are the session's lifecycle).
 type EncryptionSessionManager struct {
 	ctx              context.Context
+	cancel           context.CancelFunc
 	client           *Client
 	clientKeyManager *ClientKeyManager
 	settings         *EncryptionSettings
@@ -3047,19 +3096,30 @@ type EncryptionSessionManager struct {
 	encryptionEventCallbacks    *CallbackList[func(*EncryptionEvent)]
 
 	stateLock sync.Mutex
+	closed    bool
 	sessions  map[sessionKey]*peerEncryptionSession
+	workers   *lifecycleAdmission
+	// Nil test barrier pauses a publisher or session supervisor after cleanup
+	// and before joined completion.
+	beforeWorkerDoneForTest func(string)
+	// Nil test barriers expose session admission and manager join entry.
+	beforeSessionAdmissionLockForTest func()
+	beforeCloseWaitForTest            func()
 }
 
 func NewEncryptionSessionManager(ctx context.Context, client *Client, clientKeyManager *ClientKeyManager, settings *EncryptionSettings) *EncryptionSessionManager {
 	if settings == nil {
 		settings = DefaultEncryptionSettings()
 	}
+	managerCtx, cancel := context.WithCancel(ctx)
 	m := &EncryptionSessionManager{
-		ctx:              ctx,
+		ctx:              managerCtx,
+		cancel:           cancel,
 		client:           client,
 		clientKeyManager: clientKeyManager,
 		settings:         settings,
 		sessions:         map[sessionKey]*peerEncryptionSession{},
+		workers:          newLifecycleAdmission(),
 
 		peerIdentityChangeCallbacks: NewCallbackList[func()](),
 		encryptionEventCallbacks:    NewCallbackList[func(*EncryptionEvent)](),
@@ -3091,7 +3151,7 @@ func NewEncryptionSessionManager(ctx context.Context, client *Client, clientKeyM
 				m.serverTlsConfig.Certificates...,
 			)
 		}
-		m.controlSyncEncryptedKey = NewControlSync(ctx, client, "encrypted-key")
+		m.controlSyncEncryptedKey = NewControlSync(managerCtx, client, "encrypted-key")
 		// Publish the cert so every contract whose destination is this client
 		// carries it. ControlSync retries until the platform acks. The publisher
 		// waits on `client.ReadyNotify()` before its first send: this constructor
@@ -3099,10 +3159,25 @@ func NewEncryptionSessionManager(ctx context.Context, client *Client, clientKeyM
 		// `sendBuffer`, so sending immediately would race (or precede) the buffer
 		// construction.
 		if 0 < len(m.selfCertPem) {
-			go HandleError(m.publishEncryptedKey)
+			m.startWorker("encrypted key publish", m.publishEncryptedKey)
 		}
 	}
 	return m
+}
+
+// startWorker admits one manager publisher or session supervisor.
+func (self *EncryptionSessionManager) startWorker(name string, run func()) bool {
+	if !self.workers.start() {
+		return false
+	}
+	go func() {
+		defer self.workers.finish()
+		HandleError(run)
+		if self.beforeWorkerDoneForTest != nil {
+			self.beforeWorkerDoneForTest(name)
+		}
+	}()
+	return true
 }
 
 // publishEncryptedKey sends an `EncryptedKey` control message to the
@@ -3122,6 +3197,9 @@ func (self *EncryptionSessionManager) publishEncryptedKey() {
 	case <-self.client.ReadyNotify():
 	case <-self.ctx.Done():
 		return
+	}
+	if self.settings.beforeEncryptedKeyPublishForTest != nil {
+		self.settings.beforeEncryptedKeyPublishForTest()
 	}
 
 	selfCertPem := self.SelfCertPem()
@@ -3272,6 +3350,10 @@ func (self *EncryptionSessionManager) SetProvideTlsKeyMaterial(certPem []byte, k
 	}
 
 	self.stateLock.Lock()
+	if self.closed {
+		self.stateLock.Unlock()
+		return errors.New("encryption session manager closed")
+	}
 	self.serverTlsConfig = serverTlsConfig
 	self.clientTlsConfig = clientTlsConfig
 	self.selfCertPem = selfCertPem
@@ -3279,7 +3361,7 @@ func (self *EncryptionSessionManager) SetProvideTlsKeyMaterial(certPem []byte, k
 	self.stateLock.Unlock()
 
 	if 0 < len(selfCertPem) {
-		go HandleError(self.publishEncryptedKey)
+		self.startWorker("encrypted key publish", self.publishEncryptedKey)
 	}
 	return nil
 }
@@ -3336,9 +3418,15 @@ func (self *EncryptionSessionManager) acquireSession(peerId Id, role sequenceTls
 	if (peerId == Id{}) {
 		return nil
 	}
+	if self.beforeSessionAdmissionLockForTest != nil {
+		self.beforeSessionAdmissionLockForTest()
+	}
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	session := self.getOrCreateWithLock(peerId, role, companion)
+	if session == nil {
+		return nil
+	}
 	session.retain()
 	return session
 }
@@ -3388,6 +3476,9 @@ func (self *EncryptionSessionManager) AcquireForSend(
 // getOrCreate returns the (peerId, companion, role) session, creating and
 // supervising it if absent. Takes the manager's stateLock internally.
 func (self *EncryptionSessionManager) getOrCreate(peerId Id, role sequenceTlsRole, companion bool) *peerEncryptionSession {
+	if self.beforeSessionAdmissionLockForTest != nil {
+		self.beforeSessionAdmissionLockForTest()
+	}
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	return self.getOrCreateWithLock(peerId, role, companion)
@@ -3396,16 +3487,24 @@ func (self *EncryptionSessionManager) getOrCreate(peerId Id, role sequenceTlsRol
 // getOrCreateWithLock returns the (peerId, companion, role) session, creating
 // and supervising it if absent. Caller holds stateLock.
 func (self *EncryptionSessionManager) getOrCreateWithLock(peerId Id, role sequenceTlsRole, companion bool) *peerEncryptionSession {
+	if self.closed {
+		return nil
+	}
 	key := sessionKey{peerId: peerId, companion: companion, role: role}
 	if s, ok := self.sessions[key]; ok {
 		return s
 	}
 	s := newPeerEncryptionSession(self.ctx, self, self.client, peerId, role, self.settings, self.sessionTlsConfigWithLock(role), companion)
+	if !self.workers.start() {
+		s.close()
+		return nil
+	}
 	self.sessions[key] = s
 	if self.client.log.V(1).Enabled() {
 		self.client.log.Infof("[tls]%s opened session for peer %s as %s c=%t\n", self.client.ClientTag(), peerId, role, companion)
 	}
 	go func() {
+		defer self.workers.finish()
 		defer func() {
 			func() {
 				self.stateLock.Lock()
@@ -3418,6 +3517,9 @@ func (self *EncryptionSessionManager) getOrCreateWithLock(peerId Id, role sequen
 			self.peerIdentityChanged()
 		}()
 		s.Run()
+		if self.beforeWorkerDoneForTest != nil {
+			self.beforeWorkerDoneForTest("encryption session")
+		}
 	}()
 	return s
 }
@@ -3494,20 +3596,52 @@ func (self *EncryptionSessionManager) DeliverEncryptedControl(peerId Id, role se
 	session.DeliverEncryptedControl(ec)
 }
 
-// Close tears down all sessions. Called when the Client is shutting down.
+// Close prevents later publishers and sessions, then requests teardown without
+// waiting. Called when the Client is shutting down.
 func (self *EncryptionSessionManager) Close() {
-	sessions := func() []*peerEncryptionSession {
-		self.stateLock.Lock()
-		defer self.stateLock.Unlock()
-		out := make([]*peerEncryptionSession, 0, len(self.sessions))
-		for _, s := range self.sessions {
-			out = append(out, s)
-		}
-		return out
-	}()
+	self.stateLock.Lock()
+	if self.closed {
+		self.stateLock.Unlock()
+		return
+	}
+	self.closed = true
+	sessions := make([]*peerEncryptionSession, 0, len(self.sessions))
+	for _, session := range self.sessions {
+		sessions = append(sessions, session)
+	}
+	self.stateLock.Unlock()
+
+	self.cancel()
+	self.workers.close()
+	if self.controlSyncEncryptedKey != nil {
+		self.controlSyncEncryptedKey.Close()
+	}
 	for _, session := range sessions {
 		session.close()
 	}
+}
+
+// closeAndWait joins publishers, session supervisors, and every session-owned
+// handshake/control/key-fetch worker, or returns when ctx expires.
+func (self *EncryptionSessionManager) closeAndWait(ctx context.Context) error {
+	self.Close()
+	if self.beforeCloseWaitForTest != nil {
+		self.beforeCloseWaitForTest()
+	}
+	var result error
+	if self.controlSyncEncryptedKey != nil {
+		if err := self.controlSyncEncryptedKey.closeAndWait(ctx); err != nil {
+			result = errors.Join(result, err)
+		}
+	}
+	if err := waitForLifecycleDone(
+		ctx,
+		self.workers.Done(),
+		"encryption session manager workers",
+	); err != nil {
+		result = errors.Join(result, err)
+	}
+	return result
 }
 
 // PeerIdentity is a peer with an established, identity-verified e2e session:
@@ -4015,7 +4149,7 @@ func (self *peerEncryptionSession) sendUnknownWrapNack() {
 	if self.client == nil || self.client.sendBuffer == nil {
 		return
 	}
-	go HandleError(func() {
+	self.startWorker("unknown-wrap nack", func() {
 		// unlike the epoch-bound handshake carrier, a failed nack send never
 		// closes the session — see the function doc
 		self.client.sendBuffer.SendEncryptedControl(
@@ -4159,7 +4293,7 @@ func (self *peerEncryptionSession) maybeFetchPeerClientPublicKeyForIdentity() {
 	if !start {
 		return
 	}
-	go HandleError(func() {
+	self.startWorker("identity key fetch", func() {
 		defer func() {
 			self.stateLock.Lock()
 			defer self.stateLock.Unlock()

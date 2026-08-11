@@ -150,8 +150,10 @@ func TestSendReceiveParallelLanes(t *testing.T) {
 	b.ContractManager().SetProvideModes(provideModes)
 
 	type laneReceive struct {
-		lane  string
-		index int
+		lane        string
+		index       int
+		source      TransferPath
+		transferKey TransferKey
 	}
 	receives := make(chan laneReceive, 3*n)
 	b.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, peer Peer) {
@@ -167,7 +169,12 @@ func TestSendReceiveParallelLanes(t *testing.T) {
 				if err != nil {
 					panic(err)
 				}
-				receives <- laneReceive{lane: parts[0], index: index}
+				receives <- laneReceive{
+					lane:        parts[0],
+					index:       index,
+					source:      source,
+					transferKey: peer.TransferKey,
+				}
 			}
 		}
 	})
@@ -205,7 +212,7 @@ func TestSendReceiveParallelLanes(t *testing.T) {
 				if err != nil {
 					panic(err)
 				}
-				success := a.SendWithTimeout(frame, DestinationId(bClientId), func(err error) {
+				success := a.SendWithTimeout(frame, bClientId, func(err error) {
 					acks <- err
 				}, -1, l.opts...)
 				AssertEqual(t, success, true)
@@ -228,6 +235,21 @@ func TestSendReceiveParallelLanes(t *testing.T) {
 			return
 		case r := <-receives:
 			AssertEqual(t, r.index, nextIndex[r.lane])
+			var expectedLane *lane
+			for _, candidate := range lanes {
+				if candidate.name == r.lane {
+					expectedLane = candidate
+					break
+				}
+			}
+			if expectedLane == nil {
+				t.Fatalf("unknown receive lane %q", r.lane)
+			}
+			AssertEqual(t, SourceId(aClientId), r.source)
+			AssertEqual(t, expectedLane.fs, r.transferKey.ForceStream)
+			AssertEqual(t, expectedLane.cc, r.transferKey.CompanionContract)
+			AssertEqual(t, protocol.SequenceRole_SequenceRoleServer, r.transferKey.EncryptionRole)
+			AssertEqual(t, expectedLane.cc, r.transferKey.EncryptionCompanion)
 			nextIndex[r.lane] = r.index + 1
 			receiveCount += 1
 		case err := <-acks:
@@ -250,7 +272,7 @@ func TestSendReceiveParallelLanes(t *testing.T) {
 		defer a.sendBuffer.mutex.Unlock()
 		laneCount := map[[2]bool]int{}
 		for id := range a.sendBuffer.sendSequences {
-			if id.Destination == DestinationId(bClientId) && id.EncryptionRole == sequenceTlsRoleClient {
+			if id.Destination == bClientId && id.EncryptionRole == sequenceTlsRoleClient {
 				laneCount[[2]bool{id.ForceStream, id.CompanionContract}] += 1
 			}
 		}
@@ -259,7 +281,7 @@ func TestSendReceiveParallelLanes(t *testing.T) {
 		}
 		wireCount := 0
 		for wireId := range a.sendBuffer.wireSendSequences {
-			if wireId.Destination == DestinationId(bClientId) && wireId.EncryptionRole == sequenceTlsRoleClient {
+			if wireId.Destination == bClientId && wireId.EncryptionRole == sequenceTlsRoleClient {
 				wireCount += 1
 			}
 		}

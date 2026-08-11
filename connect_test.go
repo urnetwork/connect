@@ -2,6 +2,7 @@ package connect
 
 import (
 	// "os"
+	"bytes"
 	"flag"
 	"testing"
 )
@@ -157,6 +158,55 @@ func TestMultiHopId(t *testing.T) {
 	m4 := RequireMultiHopId(ids[0], ids[1])
 	AssertEqual(t, tail, ids[2])
 	AssertEqual(t, m3, m4)
+}
+
+// The public limit counts intermediaries; the final destination occupies one
+// additional slot without changing shorter-path serialization.
+func TestMultiHopIdSupportsMaximumIntermediariesAndDestination(t *testing.T) {
+	ids := make([]Id, MaxMultihopLength+1)
+	for idIndex := range ids {
+		ids[idIndex] = NewId()
+	}
+	multiHopId, err := NewMultiHopId(ids...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if multiHopId.Len() != len(ids) || multiHopId.Tail() != ids[len(ids)-1] {
+		t.Fatalf("maximum path len=%d tail=%s", multiHopId.Len(), multiHopId.Tail())
+	}
+	encoded := multiHopId.Bytes()
+	decoded, err := MultiHopIdFromBytes(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded != multiHopId {
+		t.Fatal("maximum path changed during byte serialization")
+	}
+	if _, err := NewMultiHopId(append(ids, NewId())...); err == nil {
+		t.Fatal("path beyond the maximum was accepted")
+	}
+}
+
+// Existing eight-id paths retain the same ordered byte representation after
+// adding the ninth slot.
+func TestMultiHopIdExistingMaximumSerializationIsUnchanged(t *testing.T) {
+	ids := make([]Id, MaxMultihopLength)
+	for idIndex := range ids {
+		ids[idIndex] = NewId()
+	}
+	multiHopId, err := NewMultiHopId(ids...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := multiHopId.Bytes()
+	if len(encoded) != len(ids) {
+		t.Fatalf("encoded id count=%d want=%d", len(encoded), len(ids))
+	}
+	for idIndex, idBytes := range encoded {
+		if !bytes.Equal(idBytes, ids[idIndex].Bytes()) {
+			t.Fatalf("encoded id %d changed", idIndex)
+		}
+	}
 }
 
 func TestByteCount(t *testing.T) {

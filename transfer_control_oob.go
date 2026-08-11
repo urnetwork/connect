@@ -25,11 +25,17 @@ type ControlSyncOob struct {
 	retryTimeout time.Duration
 
 	sendLock  sync.Mutex
+	closed    bool
 	syncCount uint64
 	// currentCancel owns the in-flight request/retry generation. A newer Send
 	// cancels it before starting, so production OOB HTTP work cannot outlive
 	// supersession and report a stale success.
 	currentCancel context.CancelFunc
+	workers       *lifecycleAdmission
+	// Nil test barriers expose owned-launcher completion and join entry.
+	beforeWorkerDoneForTest func()
+	beforeCloseWaitForTest  func()
+	beforeSendLockForTest   func()
 }
 
 func NewControlSyncOob(ctx context.Context, client *Client, scopeTag string) *ControlSyncOob {
@@ -41,7 +47,23 @@ func NewControlSyncOob(ctx context.Context, client *Client, scopeTag string) *Co
 		client:       client,
 		scopeTag:     scopeTag,
 		retryTimeout: 1 * time.Second,
+		workers:      newLifecycleAdmission(),
 	}
+}
+
+// startWorker admits one owned request launcher or retry delay.
+func (self *ControlSyncOob) startWorker(run func()) bool {
+	if !self.workers.start() {
+		return false
+	}
+	go func() {
+		defer self.workers.finish()
+		HandleError(run, self.cancel)
+		if self.beforeWorkerDoneForTest != nil {
+			self.beforeWorkerDoneForTest()
+		}
+	}()
+	return true
 }
 
 // Send delivers `frame` via the client out-of-band control, retrying on error
@@ -65,7 +87,15 @@ func (self *ControlSyncOob) Send(frame *protocol.Frame, ackCallback AckFunction)
 
 	handleCtx, handleCancel := context.WithCancel(self.ctx)
 
+	if self.beforeSendLockForTest != nil {
+		self.beforeSendLockForTest()
+	}
 	self.sendLock.Lock()
+	if self.closed {
+		self.sendLock.Unlock()
+		handleCancel()
+		return
+	}
 	previousCancel := self.currentCancel
 	self.syncCount += 1
 	syncIndex := self.syncCount
@@ -141,7 +171,9 @@ func (self *ControlSyncOob) Send(frame *protocol.Frame, ackCallback AckFunction)
 			case <-handleCtx.Done():
 			case <-self.client.Done():
 			case <-time.After(self.retryTimeout):
-				go HandleError(send, handleCancel)
+				if !self.startWorker(send) {
+					handleCancel()
+				}
 			}
 		}
 		if oob, ok := self.client.ClientOob().(OutOfBandControlWithCtx); ok {
@@ -154,16 +186,32 @@ func (self *ControlSyncOob) Send(frame *protocol.Frame, ackCallback AckFunction)
 		)
 	}
 
-	go HandleError(send, handleCancel)
+	if !self.startWorker(send) {
+		handleCancel()
+	}
 }
 
+// Close prevents later retry launchers and cancels the current request.
 func (self *ControlSyncOob) Close() {
 	self.cancel()
 	self.sendLock.Lock()
+	self.closed = true
 	currentCancel := self.currentCancel
 	self.currentCancel = nil
 	self.sendLock.Unlock()
 	if currentCancel != nil {
 		currentCancel()
 	}
+	self.workers.close()
+}
+
+// closeAndWait joins owned request launchers. An out-of-band implementation
+// owns a request and callback after SendControl returns; that external work is
+// outside this lifecycle boundary.
+func (self *ControlSyncOob) closeAndWait(ctx context.Context) error {
+	self.Close()
+	if self.beforeCloseWaitForTest != nil {
+		self.beforeCloseWaitForTest()
+	}
+	return waitForLifecycleDone(ctx, self.workers.Done(), "out-of-band control sync workers")
 }

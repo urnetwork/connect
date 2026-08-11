@@ -61,7 +61,7 @@ func TestUpgradeMuxMultiClientIntegration(t *testing.T) {
 			if err != nil {
 				continue
 			}
-			providerClient.SendWithTimeout(echoFrame, src.Reverse(), func(err error) {}, -1)
+			providerClient.SendWithTimeout(echoFrame, src.SourceId, func(err error) {}, -1)
 		}
 	})
 

@@ -10,7 +10,12 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
+// The maximum number of intermediary clients in one stream. A MultiHopId also
+// includes its final destination, so its maximum stored length is one larger.
 const MaxMultihopLength = 8
+
+// Internal storage adds the final destination to the intermediary limit.
+const maximumMultiHopIdLength = MaxMultihopLength + 1
 
 // v1: original
 // v2: 2025-05-28 to optimize memory usage. Breaks compatibility with v1
@@ -212,13 +217,13 @@ func (self TransferPath) ToProtobuf() *protocol.TransferPath {
 
 // comparable
 type MultiHopId struct {
-	ids [MaxMultihopLength]Id
+	ids [maximumMultiHopIdLength]Id
 	len int
 }
 
 func NewMultiHopId(ids ...Id) (MultiHopId, error) {
-	if MaxMultihopLength < len(ids) {
-		return MultiHopId{}, fmt.Errorf("Multihop length exceeds maximum: %d < %d", MaxMultihopLength, len(ids))
+	if maximumMultiHopIdLength < len(ids) {
+		return MultiHopId{}, fmt.Errorf("Multihop length exceeds maximum: %d < %d", maximumMultiHopIdLength, len(ids))
 	}
 	multiHopId := MultiHopId{
 		len: len(ids),

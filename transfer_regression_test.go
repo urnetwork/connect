@@ -260,7 +260,7 @@ func TestSelectiveAckPauseKeepsAProbeScheduled(t *testing.T) {
 		MessageType:  protocol.MessageType_TransferExchangeSignals,
 		MessageBytes: []byte("probe"),
 	}
-	if !client.SendWithTimeout(frame, DestinationId(peerId), nil, 5*time.Second) {
+	if !client.SendWithTimeout(frame, peerId, nil, 5*time.Second) {
 		t.Fatal("send failed")
 	}
 
@@ -443,7 +443,7 @@ func TestIdentityProofResendsDuringEstablishment(t *testing.T) {
 		send := func(client *Client, dst Id, label string) {
 			m := &protocol.SimpleMessage{Content: label}
 			if frame, err := ToFrame(m, DefaultProtocolVersion); err == nil {
-				client.Send(frame, DestinationId(dst), func(error) {})
+				client.Send(frame, dst, func(error) {})
 			}
 		}
 		for i := 0; ; i += 1 {

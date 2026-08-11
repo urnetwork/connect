@@ -582,7 +582,9 @@ func TestMemoryScaledCaps(t *testing.T) {
 type testing_noopSignalSender struct {
 }
 
-func (self *testing_noopSignalSender) SendSignal(path TransferPath, signal *protocol.Frame, opts ...any) {
+// SendSignal consumes and discards one owned signaling frame.
+func (self *testing_noopSignalSender) SendSignal(_ Id, signal *protocol.Frame, _ ...any) {
+	MessagePoolReturn(signal.MessageBytes)
 }
 
 // TestWebRtcManagerPeerConnCap exercises the peer connection cap: creates at

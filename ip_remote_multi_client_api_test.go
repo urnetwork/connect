@@ -8,14 +8,78 @@ package connect
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// Discovery retains the destination and the nearest eight intermediaries when
+// a server returns a longer path; shorter legacy paths are unaffected.
+func TestNextDestinationsRetainsMaximumIntermediariesAndDestination(t *testing.T) {
+	intermediaryIds := make([]Id, MaxMultihopLength+3)
+	for idIndex := range intermediaryIds {
+		intermediaryIds[idIndex] = NewId()
+	}
+	providerId := NewId()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/network/find-providers2" {
+			t.Errorf("discovery path=%q", request.URL.Path)
+		}
+		if err := json.NewEncoder(w).Encode(&FindProviders2Result{
+			Providers: []*FindProvidersProvider{{
+				ClientId:        providerId,
+				IntermediaryIds: intermediaryIds,
+			}},
+		}); err != nil {
+			t.Errorf("encode discovery response: %v", err)
+		}
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultClientStrategySettings()
+	settings.EnableNormal = true
+	settings.EnableResilient = false
+	settings.RequestTimeout = 5 * time.Second
+	strategy := NewClientStrategy(ctx, settings)
+	generator := NewApiMultiClientGenerator(
+		ctx,
+		[]*ProviderSpec{{BestAvailable: true}},
+		strategy,
+		nil,
+		server.URL,
+		"test-jwt",
+		server.URL,
+		"test-description",
+		"test-spec",
+		"0.0.0-test",
+		nil,
+		DefaultClientSettings,
+		DefaultApiMultiClientGeneratorSettings(),
+	)
+	destinations, err := generator.NextDestinationsContext(ctx, 1, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(destinations) != 1 {
+		t.Fatalf("destination count=%d want=1", len(destinations))
+	}
+	wantIds := append(
+		slices.Clone(intermediaryIds[len(intermediaryIds)-MaxMultihopLength:]),
+		providerId,
+	)
+	for destination := range destinations {
+		if !slices.Equal(destination.Ids(), wantIds) {
+			t.Fatalf("destination ids=%v want=%v", destination.Ids(), wantIds)
+		}
+	}
+}
 
 // newRemoveClientTestGenerator builds a generator against a counting api
 // server. The client strategy lives on its own ctx (like the app-scoped

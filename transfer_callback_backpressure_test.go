@@ -1,3 +1,5 @@
+// Callback backpressure regressions keep per-sequence waits from holding
+// buffer-wide state locks shared by unrelated peers.
 package connect
 
 import (
@@ -22,11 +24,11 @@ func TestSendSequenceCloseCallbackBackpressureIsDestinationLocal(t *testing.T) {
 		ctx:                        ctx,
 		sendSequences:              map[sendSequenceId]*SendSequence{},
 		wireSendSequences:          map[sendSequenceWireId]*SendSequence{},
-		sendSequencesByDestination: map[TransferPath]map[*SendSequence]bool{},
-		sendSequenceDestinations:   map[*SendSequence]map[TransferPath]bool{},
+		sendSequencesByDestination: map[Id]map[*SendSequence]bool{},
+		sendSequenceDestinations:   map[*SendSequence]map[Id]bool{},
 	}
 	sequenceCtx, sequenceCancel := context.WithCancel(ctx)
-	destination := DestinationId(NewId())
+	destination := NewId()
 	sequence := &SendSequence{
 		ctx:         sequenceCtx,
 		cancel:      sequenceCancel,
@@ -84,7 +86,7 @@ func TestSendSequenceCloseCallbackBackpressureIsDestinationLocal(t *testing.T) {
 	go func() {
 		defer close(lookupDone)
 		if found := sendBuffer.lookupSendSequence(
-			sendSequenceId{Destination: DestinationId(NewId())},
+			sendSequenceId{Destination: NewId()},
 			nil,
 		); found != nil {
 			t.Error("unrelated destination unexpectedly found a send sequence")

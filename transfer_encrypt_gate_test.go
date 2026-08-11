@@ -167,7 +167,7 @@ func TestRequiredGateNonBlockingSendRefusesPreCipher(t *testing.T) {
 	go func() {
 		parked <- a.SendWithTimeout(
 			requiredGateFrame(t, "parked"),
-			DestinationId(bClientId),
+			bClientId,
 			func(error) {},
 			-1,
 		)
@@ -181,7 +181,7 @@ func TestRequiredGateNonBlockingSendRefusesPreCipher(t *testing.T) {
 	startTime := time.Now()
 	ok := a.SendWithTimeout(
 		requiredGateFrame(t, "nonblocking"),
-		DestinationId(bClientId),
+		bClientId,
 		func(error) {},
 		0,
 	)
@@ -218,7 +218,7 @@ func TestRequiredGateBoundedBudgetRefusesUnsent(t *testing.T) {
 	startTime := time.Now()
 	ok := a.SendWithTimeout(
 		requiredGateFrame(t, "budgeted"),
-		DestinationId(bClientId),
+		bClientId,
 		func(error) {},
 		budget,
 	)
@@ -269,7 +269,7 @@ func TestRequiredGateParkedSendSurvivesIdleAndDelivers(t *testing.T) {
 	go func() {
 		sent <- a.SendWithTimeout(
 			requiredGateFrame(t, "late-establishment"),
-			DestinationId(bClientId),
+			bClientId,
 			func(error) {},
 			30*time.Second,
 		)

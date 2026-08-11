@@ -68,7 +68,7 @@ func TestSendMultiWithTimeoutDeliversOneBatchAndOneAck(t *testing.T) {
 	var ackCount atomic.Int32
 	if !sender.SendMultiWithTimeout(
 		frames,
-		DestinationId(receiver.ClientId()),
+		receiver.ClientId(),
 		func(err error) {
 			ackCount.Add(1)
 			ack <- err

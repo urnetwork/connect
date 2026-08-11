@@ -2025,8 +2025,9 @@ func NewRemoteUserNatMultiClient(
 	if settings.IpAssocSettings != nil {
 		multiClient.ipAssoc = NewIpAssoc(cancelCtx, settings.IpAssocSettings)
 	}
+	effectivePerformanceProfile := multiClient.overrideAllowDirect(settings.DefaultPerformanceProfile)
 	multiClient.config.Store(&multiClientConfig{
-		performanceProfile:  multiClient.overrideAllowDirect(settings.DefaultPerformanceProfile),
+		performanceProfile:  effectivePerformanceProfile,
 		localSecurityBypass: false,
 		serverNameLookup:    nil,
 		blocker:             nil,
@@ -2058,6 +2059,7 @@ func NewRemoteUserNatMultiClient(
 		multiClient.securityPolicy,
 		multiClient.removeClient,
 		WindowTypeQuality,
+		effectivePerformanceProfile,
 		settings,
 		multiClient.reliabilitySettings,
 		multiClient.uplinkGate,
@@ -2080,6 +2082,7 @@ func NewRemoteUserNatMultiClient(
 			multiClient.securityPolicy,
 			multiClient.removeClient,
 			WindowTypeSpeed,
+			effectivePerformanceProfile,
 			settings,
 			multiClient.reliabilitySettings,
 			multiClient.uplinkGate,
@@ -2092,13 +2095,6 @@ func NewRemoteUserNatMultiClient(
 		multiClient.windows[WindowTypeSpeed].clientMigrateFunc = multiClient.migrateClientFlows
 	}
 	// else only keep the quality window for fixed destination
-
-	// a trusted same-network peer connection always allows direct (p2p). Force it
-	// onto the fresh windows now so the first channels pick it up even before any
-	// performance profile is set; SetPerformanceProfile keeps it forced thereafter.
-	if provideMode == protocol.ProvideMode_Network {
-		multiClient.SetPerformanceProfile(settings.DefaultPerformanceProfile)
-	}
 
 	multiClient.localUserNatUnsub = localUserNat.AddReceivePacketCallback(multiClient.localReceivePacket)
 
@@ -5338,11 +5334,22 @@ func (self *RemoteUserNatMultiClient) AddPacketStatsCallback(packetStatsCallback
 	}
 }
 
-func (self *RemoteUserNatMultiClient) canSendPacket(sendPacket *parsedPacket, update *multiClientChannelUpdate) (allow bool) {
+func (self *RemoteUserNatMultiClient) canSendPacket(
+	sendPacket *parsedPacket,
+	update *multiClientChannelUpdate,
+	currentClient *multiClientChannel,
+) (allow bool) {
 	ipPath := sendPacket.ipPath
 	switch ipPath.Protocol {
 	case IpProtocolTcp:
-		if self.settings.TcpCollapsePrevention {
+		// Collapse prevention is valid only when the selected client's exact
+		// send policy gives Transfer recovery ownership. Direct-capable clients
+		// deliberately send IP packets without Transfer ACKs so inner TCP owns
+		// retransmission; recording a NoAck packet as committed would suppress
+		// the only copies that can recover a carrier blackout.
+		transferAckRequired := currentClient == nil ||
+			currentClient.ipPacketTransferAckRequired(ipPath)
+		if self.settings.TcpCollapsePrevention && transferAckRequired {
 			// limit sender tcp collapse
 			// as soon as a packet is sent to a client, either the client will eith reliabily transfer the packet,
 			// or the client will be dropped
@@ -5378,7 +5385,7 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 ) (success bool) {
 	ipPath := sendPacket.ipPath
 	self.sendClientPath(ipPath, sendPacket.pin, func(update *multiClientChannelUpdate, currentClient *multiClientChannel) {
-		if !self.canSendPacket(sendPacket, update) {
+		if !self.canSendPacket(sendPacket, update, currentClient) {
 			return
 		}
 
@@ -7751,6 +7758,7 @@ func newMultiClientWindow(
 	ingressSecurityPolicy SecurityPolicy,
 	clientRemoveCallback func(client *multiClientChannel),
 	windowType WindowType,
+	initialPerformanceProfile *PerformanceProfile,
 	settings *MultiClientSettings,
 	reliabilitySettingsFunc func() *ReliabilitySettings,
 	uplinkGateFunc func(now time.Time) (stale bool, freshSince time.Time),
@@ -7772,6 +7780,7 @@ func newMultiClientWindow(
 		ingressSecurityPolicy:        ingressSecurityPolicy,
 		clientRemoveCallback:         clientRemoveCallback,
 		windowType:                   windowType,
+		performanceProfile:           initialPerformanceProfile,
 		settings:                     settings,
 		reliabilitySettingsFunc:      reliabilitySettingsFunc,
 		uplinkGateFunc:               uplinkGateFunc,
@@ -11979,14 +11988,23 @@ func (self *multiClientChannel) Send(parsedPacket *parsedPacket, timeout time.Du
 }
 
 func (self *multiClientChannel) SendDetailed(parsedPacket *parsedPacket, timeout time.Duration) (bool, error) {
+	return self.SendDetailedWithAck(
+		parsedPacket,
+		timeout,
+		self.ipPacketTransferAckRequired(parsedPacket.ipPath),
+	)
+}
+
+// Returns the Transfer recovery policy used for this client's IP packets.
+// Routing gates that rely on reliable commit must consult this same decision.
+func (self *multiClientChannel) ipPacketTransferAckRequired(ipPath *IpPath) bool {
 	allowDirect := self.performanceProfile != nil &&
 		self.performanceProfile.AllowDirect
-	ack := ipPacketTransferAckRequired(
-		parsedPacket.ipPath,
+	return ipPacketTransferAckRequired(
+		ipPath,
 		allowDirect,
 		self.settings.UdpCollapsePrevention,
 	)
-	return self.SendDetailedWithAck(parsedPacket, timeout, ack)
 }
 
 // A stream-capable IP path relies on the inner transport for recovery. Its

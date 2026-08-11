@@ -1,20 +1,16 @@
+// Panic containment helpers convert recovered failures into explicit lifecycle
+// cleanup without allowing a broken rescue handler to crash the process.
 package connect
 
 import (
-	// "context"
-	// "sync"
-	"time"
-	// "slices"
-	// "os"
-	// "os/signal"
-	// "syscall"
+	"context"
 	"encoding/json"
 	"fmt"
 	"reflect"
 	"runtime"
 	"runtime/debug"
 	"strings"
-	// mathrand "math/rand"
+	"time"
 )
 
 func IsDoneError(r any) bool {
@@ -58,6 +54,7 @@ func safeAck(ackCallback AckFunction, err error) {
 	ackCallback(err)
 }
 
+// Recovers one panic, logs it, and invokes every compatible rescue handler.
 func HandleError(do func(), handlers ...any) (r any) {
 	defer func() {
 		if r = recover(); r != nil {
@@ -85,6 +82,10 @@ func HandleError(do func(), handlers ...any) (r any) {
 					case func():
 						v()
 					case func(error):
+						v(err)
+					case context.CancelFunc:
+						v()
+					case context.CancelCauseFunc:
 						v(err)
 					}
 				}()

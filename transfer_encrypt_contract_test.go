@@ -278,7 +278,7 @@ func TestSendReceiveEncryptedWithContracts(t *testing.T) {
 		if err != nil {
 			panic(err)
 		}
-		client.Send(frame, DestinationId(dst), func(error) {})
+		client.Send(frame, dst, func(error) {})
 	}
 
 	// Drive both directions in parallel: A and B each initiate to the other at
@@ -478,7 +478,7 @@ func TestSendReceiveEncryptedPeerWithoutEncryption(t *testing.T) {
 		if err != nil {
 			panic(err)
 		}
-		client.Send(frame, DestinationId(dst), func(error) {})
+		client.Send(frame, dst, func(error) {})
 	}
 
 	stop := make(chan struct{})
@@ -699,7 +699,7 @@ func TestRequiredEncryptionEstablishesAndDelivers(t *testing.T) {
 		if err != nil {
 			panic(err)
 		}
-		client.Send(frame, DestinationId(dst), func(error) {})
+		client.Send(frame, dst, func(error) {})
 	}
 
 	stop := make(chan struct{})
@@ -928,7 +928,7 @@ func TestRequiredEncryptionFailsClosedAgainstPlaintextPeer(t *testing.T) {
 		if err != nil {
 			panic(err)
 		}
-		client.Send(frame, DestinationId(dst), func(error) {})
+		client.Send(frame, dst, func(error) {})
 	}
 
 	// Separate send loops: a's Send blocks at the Required entry gate (the
@@ -1019,7 +1019,7 @@ func TestRequiredEncryptionFailsClosedAgainstPlaintextPeer(t *testing.T) {
 	// gap-producing drop would instead pin the queue at its cap forever.)
 	drainDeadline := time.After(20 * time.Second)
 	for {
-		count, byteCount, _ := b.ResendQueueSize(DestinationId(aClientId), MultiHopId{}, false, false)
+		count, byteCount, _ := b.ResendQueueSize(aClientId, MultiHopId{}, false, false)
 		if count == 0 && byteCount == 0 {
 			break
 		}
@@ -1189,9 +1189,9 @@ func TestEncryptedCompanionSessionsCreateSeparateContracts(t *testing.T) {
 			panic(err)
 		}
 		if companion {
-			client.SendWithTimeout(frame, DestinationId(dst), func(error) {}, 1*time.Second, CompanionContract())
+			client.SendWithTimeout(frame, dst, func(error) {}, 1*time.Second, CompanionContract())
 		} else {
-			client.SendWithTimeout(frame, DestinationId(dst), func(error) {}, 1*time.Second)
+			client.SendWithTimeout(frame, dst, func(error) {}, 1*time.Second)
 		}
 	}
 

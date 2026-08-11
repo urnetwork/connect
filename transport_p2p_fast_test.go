@@ -7,12 +7,55 @@ package connect
 import (
 	"bytes"
 	"context"
+	"os"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/pion/rtp"
 	"github.com/urnetwork/connect/protocol"
 )
+
+// p2pFastPathBlockingPacketReader supplies fixed RTP packets, then blocks
+// until the production cancellation deadline interrupts the read.
+type p2pFastPathBlockingPacketReader struct {
+	packets      chan []byte
+	readStarted  chan struct{}
+	readDeadline chan struct{}
+	deadlineOnce sync.Once
+}
+
+// newP2pFastPathBlockingPacketReader creates a reader with all packets ready.
+func newP2pFastPathBlockingPacketReader(packets ...[]byte) *p2pFastPathBlockingPacketReader {
+	packetQueue := make(chan []byte, len(packets))
+	for _, packet := range packets {
+		packetQueue <- packet
+	}
+	return &p2pFastPathBlockingPacketReader{
+		packets:      packetQueue,
+		readStarted:  make(chan struct{}, len(packets)+1),
+		readDeadline: make(chan struct{}),
+	}
+}
+
+// Read copies one prepared packet or returns the teardown deadline error.
+func (self *p2pFastPathBlockingPacketReader) Read(packet []byte) (int, error) {
+	self.readStarted <- struct{}{}
+	select {
+	case preparedPacket := <-self.packets:
+		return copy(packet, preparedPacket), nil
+	case <-self.readDeadline:
+		return 0, os.ErrDeadlineExceeded
+	}
+}
+
+// SetReadDeadline releases the blocked read exactly once.
+func (self *p2pFastPathBlockingPacketReader) SetReadDeadline(time.Time) error {
+	self.deadlineOnce.Do(func() {
+		close(self.readDeadline)
+	})
+	return nil
+}
 
 // p2pFastPathTestPair owns a hermetic native WebRTC association and its
 // matching stream identity.
@@ -31,12 +74,18 @@ type p2pFastPathTestSignalReceiver struct {
 	errors   chan error
 }
 
+// testingSignalReceiver exposes the manager behind this diagnostic wrapper.
+func (self *p2pFastPathTestSignalReceiver) testingSignalReceiver() SignalReceiver {
+	return self.receiver
+}
+
 // ReceiveSignal delegates one frame and retains the first bounded diagnostic.
 func (self *p2pFastPathTestSignalReceiver) ReceiveSignal(
 	source TransferPath,
+	transferKey TransferKey,
 	frame *protocol.Frame,
 ) error {
-	err := self.receiver.ReceiveSignal(source, frame)
+	err := self.receiver.ReceiveSignal(source, transferKey, frame)
 	if err != nil {
 		select {
 		case self.errors <- err:
@@ -335,6 +384,155 @@ func encodeP2pFastPathTestFragments(
 	return fragments
 }
 
+// encodeP2pFastPathTestRtpPackets wraps carrier fragments in the RTP envelope
+// consumed by the native receive worker.
+func encodeP2pFastPathTestRtpPackets(
+	t *testing.T,
+	messageId uint32,
+	message []byte,
+) [][]byte {
+	t.Helper()
+	fragments := encodeP2pFastPathTestFragments(t, messageId, message)
+	packets := make([][]byte, len(fragments))
+	for fragmentIndex, fragment := range fragments {
+		packet := &rtp.Packet{
+			Header: rtp.Header{
+				Version:        2,
+				SequenceNumber: uint16(fragmentIndex + 1),
+				Timestamp:      messageId,
+			},
+			Payload: fragment,
+		}
+		packetBytes, err := packet.Marshal()
+		if err != nil {
+			t.Fatalf("marshal RTP fragment %d: %s", fragmentIndex, err)
+		}
+		packets[fragmentIndex] = packetBytes
+	}
+	return packets
+}
+
+// newP2pFastPathReceiveOwnershipFixture creates only the native receive-side
+// lifecycle needed by the ownership regressions.
+func newP2pFastPathReceiveOwnershipFixture(
+	ctx context.Context,
+) *webRtcFastPath {
+	return &webRtcFastPath{
+		ctx:                     ctx,
+		maximumMessageByteCount: 64 * 1024,
+		messages:                make(chan p2pFastPathReceivedMessage, 4),
+		receiveDone:             make(chan struct{}),
+		ready:                   make(chan struct{}),
+	}
+}
+
+// Waits for and takes the retained reference to one exact reassembly buffer.
+func waitP2pFastPathTestWitness(t *testing.T, witnesses <-chan []byte) []byte {
+	t.Helper()
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	select {
+	case witness := <-witnesses:
+		return witness
+	case <-timer.C:
+		t.Fatal("native fast-path reassembler did not allocate its message")
+		return nil
+	}
+}
+
+// waitP2pFastPathTestReads waits until every prepared packet was consumed and
+// the worker entered its next interruptible read.
+func waitP2pFastPathTestReads(
+	t *testing.T,
+	reader *p2pFastPathBlockingPacketReader,
+	readCount int,
+) {
+	t.Helper()
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	for range readCount {
+		select {
+		case <-reader.readStarted:
+		case <-timer.C:
+			t.Fatal("native fast-path reader did not reach the blocking read")
+		}
+	}
+}
+
+// closeP2pFastPathTestReceiver requires cancellation to interrupt and join the
+// native receive worker within a deterministic bound.
+func closeP2pFastPathTestReceiver(
+	t *testing.T,
+	fastPath *webRtcFastPath,
+	cancel context.CancelFunc,
+) {
+	t.Helper()
+	cancel()
+	closed := make(chan struct{})
+	go func() {
+		fastPath.closeAndWait()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("native fast-path receive worker did not stop after cancellation")
+	}
+}
+
+// TestWebRtcFastPathCloseReturnsIncompleteReassembly verifies that canceling
+// a peer interrupts TrackRemote.Read and releases a partial pooled message.
+func TestWebRtcFastPathCloseReturnsIncompleteReassembly(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	fastPath := newP2pFastPathReceiveOwnershipFixture(ctx)
+	witnesses := make(chan []byte, 1)
+	fastPath.afterReceiveMessageAllocatedForTest = func(message []byte) {
+		witnesses <- MessagePoolShareReadOnly(message)
+	}
+	packets := encodeP2pFastPathTestRtpPackets(
+		t,
+		501,
+		bytes.Repeat([]byte{0x51}, 2*1024),
+	)
+	reader := newP2pFastPathBlockingPacketReader(packets[0])
+	fastPath.startReceive(reader)
+	waitP2pFastPathTestReads(t, reader, 2)
+	witness := waitP2pFastPathTestWitness(t, witnesses)
+
+	closeP2pFastPathTestReceiver(t, fastPath, cancel)
+	if !MessagePoolReturn(witness) {
+		t.Fatal("incomplete native reassembly owner was not returned at close")
+	}
+}
+
+// TestWebRtcFastPathCloseReturnsQueuedMessage verifies that teardown drains a
+// complete pooled message when its route consumer exits first.
+func TestWebRtcFastPathCloseReturnsQueuedMessage(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	fastPath := newP2pFastPathReceiveOwnershipFixture(ctx)
+	witnesses := make(chan []byte, 1)
+	fastPath.afterReceiveMessageAllocatedForTest = func(message []byte) {
+		witnesses <- MessagePoolShareReadOnly(message)
+	}
+	packets := encodeP2pFastPathTestRtpPackets(
+		t,
+		502,
+		bytes.Repeat([]byte{0x52}, 2*1024),
+	)
+	reader := newP2pFastPathBlockingPacketReader(packets...)
+	fastPath.startReceive(reader)
+	waitP2pFastPathTestReads(t, reader, len(packets)+1)
+	witness := waitP2pFastPathTestWitness(t, witnesses)
+	if len(fastPath.messages) != 1 {
+		t.Fatalf("complete native message queue length = %d, want 1", len(fastPath.messages))
+	}
+
+	closeP2pFastPathTestReceiver(t, fastPath, cancel)
+	if !MessagePoolReturn(witness) {
+		t.Fatal("queued native message owner was not returned at close")
+	}
+}
+
 // TestP2pFastPathReassemblyHandlesReorderingAndDuplicates verifies that a
 // duplicated fragment does not advance completeness or corrupt later data.
 func TestP2pFastPathReassemblyHandlesReorderingAndDuplicates(t *testing.T) {
@@ -394,10 +592,8 @@ func TestP2pFastPathReassemblyBoundsMalformedMessages(t *testing.T) {
 			},
 		},
 		{
-			name: "truncated payload",
-			mutate: func(packet []byte) {
-				packet[len(packet)-1] = packet[len(packet)-1]
-			},
+			name:   "truncated payload",
+			mutate: func([]byte) {},
 		},
 	}
 	for _, test := range tests {
@@ -524,7 +720,11 @@ func TestWebRtcFastPathCountsReceiveQueueDrop(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	messageCount := cap(passivePeer.fastPath.messages) + 1
+	passiveFastPath := passivePeer.fastPath.Load()
+	if passiveFastPath == nil {
+		t.Fatal("passive peer did not publish its fast path")
+	}
+	messageCount := cap(passiveFastPath.messages) + 1
 	for messageIndex := range messageCount {
 		message := []byte{0x71, byte(messageIndex)}
 		if _, err := activeFast.WriteFastPathMessage(message); err != nil {
@@ -540,7 +740,7 @@ func TestWebRtcFastPathCountsReceiveQueueDrop(t *testing.T) {
 	if dropCount := stats.Snapshot().FastDropCount; dropCount != 1 {
 		t.Fatalf("fast receive drop count=%d want=1", dropCount)
 	}
-	for range cap(passivePeer.fastPath.messages) {
+	for range cap(passiveFastPath.messages) {
 		select {
 		case received := <-passiveFast.FastPathMessages():
 			MessagePoolReturn(received.message)

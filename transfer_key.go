@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -57,6 +58,7 @@ import (
 //     private key.
 type ClientKeyManager struct {
 	ctx    context.Context
+	cancel context.CancelFunc
 	client *Client
 
 	privateKey ed25519.PrivateKey
@@ -65,6 +67,11 @@ type ClientKeyManager struct {
 	controlSync *ControlSync
 
 	stateLock sync.RWMutex
+	closed    bool
+	workers   *lifecycleAdmission
+	// Nil test barriers expose SetSeed admission and manager join entry.
+	beforePublisherAdmissionLockForTest func()
+	beforeCloseWaitForTest              func()
 }
 
 // NewClientKeyManager constructs the manager and seeds (or generates)
@@ -74,6 +81,7 @@ type ClientKeyManager struct {
 // fresh seed is generated. Callers can read the running seed back via
 // `Seed()` to persist it across restarts.
 func NewClientKeyManager(ctx context.Context, client *Client) (*ClientKeyManager, error) {
+	managerCtx, cancel := context.WithCancel(ctx)
 	var pub ed25519.PublicKey
 	var priv ed25519.PrivateKey
 	seed := client.settings.ClientKeySeed
@@ -99,19 +107,37 @@ func NewClientKeyManager(ctx context.Context, client *Client) (*ClientKeyManager
 		}
 	}
 	m := &ClientKeyManager{
-		ctx:         ctx,
+		ctx:         managerCtx,
+		cancel:      cancel,
 		client:      client,
 		privateKey:  priv,
 		publicKey:   pub,
-		controlSync: NewControlSync(ctx, client, "client-key"),
+		controlSync: NewControlSync(managerCtx, client, "client-key"),
+		workers:     newLifecycleAdmission(),
 	}
 	// Publish the public identity key once the client is fully wired.
 	// `publishClientKey` waits on `client.ReadyNotify()` internally;
 	// the goroutine launch here mirrors the pattern in
 	// `NewContractManager` (`providePing`) and
 	// `NewEncryptionSessionManager` (`publishEncryptedKey`).
-	go HandleError(m.publishClientKey)
+	if !m.startPublisherWithLock() {
+		cancel()
+		return nil, fmt.Errorf("client key manager closed during construction")
+	}
 	return m, nil
+}
+
+// startPublisherWithLock admits one publication generation. The constructor
+// has exclusive ownership; later callers hold stateLock.
+func (self *ClientKeyManager) startPublisherWithLock() bool {
+	if !self.workers.start() {
+		return false
+	}
+	go func() {
+		defer self.workers.finish()
+		HandleError(self.publishClientKey)
+	}()
+	return true
 }
 
 // Seed returns the 32-byte Ed25519 private-key seed for the local
@@ -159,13 +185,59 @@ func (self *ClientKeyManager) SetSeed(seed []byte) error {
 	privateKey := ed25519.NewKeyFromSeed(bytes.Clone(seed))
 	publicKey := privateKey.Public().(ed25519.PublicKey)
 
+	if self.beforePublisherAdmissionLockForTest != nil {
+		self.beforePublisherAdmissionLockForTest()
+	}
 	self.stateLock.Lock()
+	if self.closed {
+		self.stateLock.Unlock()
+		return fmt.Errorf("client key manager closed")
+	}
+	if !self.startPublisherWithLock() {
+		self.stateLock.Unlock()
+		return fmt.Errorf("client key manager closed")
+	}
 	self.privateKey = privateKey
 	self.publicKey = publicKey
 	self.stateLock.Unlock()
-
-	go HandleError(self.publishClientKey)
 	return nil
+}
+
+// Close prevents later key rotations and requests publication teardown
+// without joining transfer-buffer ownership.
+func (self *ClientKeyManager) Close() {
+	self.stateLock.Lock()
+	if self.closed {
+		self.stateLock.Unlock()
+		return
+	}
+	self.closed = true
+	self.stateLock.Unlock()
+
+	self.cancel()
+	self.workers.close()
+	self.controlSync.Close()
+}
+
+// closeAndWait joins every admitted publisher and its control retry workers,
+// or returns when ctx expires.
+func (self *ClientKeyManager) closeAndWait(ctx context.Context) error {
+	self.Close()
+	if self.beforeCloseWaitForTest != nil {
+		self.beforeCloseWaitForTest()
+	}
+	var result error
+	if err := waitForLifecycleDone(
+		ctx,
+		self.workers.Done(),
+		"client key publishers",
+	); err != nil {
+		result = errors.Join(result, err)
+	}
+	if err := self.controlSync.closeAndWait(ctx); err != nil {
+		result = errors.Join(result, err)
+	}
+	return result
 }
 
 // SignCertChain signs the canonical encoding of a PEM cert chain
@@ -232,6 +304,9 @@ func (self *ClientKeyManager) publishClientKey() {
 	case <-self.client.ReadyNotify():
 	case <-self.ctx.Done():
 		return
+	}
+	if self.client.settings.beforeClientKeyPublishForTest != nil {
+		self.client.settings.beforeClientKeyPublishForTest()
 	}
 	frame, err := ToFrame(&protocol.ClientKey{
 		PublicKey: []byte(self.PublicKey()),

@@ -3,6 +3,7 @@ package connect
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -277,5 +278,69 @@ func TestApiWindowTransportMigrationDisarmsBeforeClosingReplacement(t *testing.T
 	}
 	if migratingAtClose {
 		t.Fatal("migration was still armed at the instant the replacement was closed: disarm must happen-before the close so the close is the definitive released signal")
+	}
+}
+
+// Generator teardown must join a migration that has entered replacement
+// construction and reject every creator that arrives after the close edge.
+func TestApiWindowTransportCreationCloseJoinsHeldMigrationCreator(t *testing.T) {
+	client, _ := newApiMigrationTestClient(t)
+	old := newFakeWindowPlatformTransport(true)
+	next := newFakeWindowPlatformTransport(true)
+	creationEntered := make(chan struct{})
+	releaseCreation := make(chan struct{})
+	lateCreation := make(chan struct{}, 1)
+	var creationCount atomic.Int32
+	state := &apiWindowClientTransport{
+		current:  old,
+		settings: DefaultPlatformTransportSettings(),
+		auth:     ClientAuth{InstanceId: NewId()},
+	}
+	generator := &ApiMultiClientGenerator{
+		settings:   DefaultApiMultiClientGeneratorSettings(),
+		transports: map[*Client]*apiWindowClientTransport{client: state},
+		newPlatformTransport: func(
+			client *Client,
+			auth *ClientAuth,
+			settings *PlatformTransportSettings,
+		) apiWindowPlatformTransport {
+			if creationCount.Add(1) == 1 {
+				close(creationEntered)
+				<-releaseCreation
+				return next
+			}
+			lateCreation <- struct{}{}
+			return newFakeWindowPlatformTransport(true)
+		},
+	}
+
+	generator.MigrateClientTransport(client, nil, time.Now())
+	<-creationEntered
+	closeWaitEntered := make(chan struct{})
+	generator.transportCreation.beforeWaitForTest = func() {
+		close(closeWaitEntered)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	closeResult := make(chan error, 1)
+	go func() {
+		closeResult <- generator.CloseTransportCreationAndWait(ctx)
+	}()
+	<-closeWaitEntered
+	select {
+	case err := <-closeResult:
+		t.Fatalf("transport-creation close skipped held migration: %v", err)
+	default:
+	}
+	close(releaseCreation)
+	if err := <-closeResult; err != nil {
+		t.Fatal(err)
+	}
+
+	generator.MigrateClientTransport(client, nil, time.Now())
+	select {
+	case <-lateCreation:
+		t.Fatal("migration created a transport after generator close")
+	default:
 	}
 }

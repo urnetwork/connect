@@ -631,7 +631,7 @@ func TestP2pReadyHeaderPrefetchesUnorderedDataWithinRouteBound(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	_, route := newP2pReceiveTransport(ctx, cancel, conn, NewId(), settings, prefetched)
+	_, route := newP2pReceiveTransport(ctx, cancel, conn, NewId(), settings, prefetched, nil)
 	defer cancel()
 	for i, expected := range [][]byte{earlyA, earlyB, steady} {
 		select {
@@ -3506,7 +3506,6 @@ func TestClientSignalReceiverCoalescesAdjacentCandidatesOnly(t *testing.T) {
 		cancel:       cancel,
 		queueLimit:   8,
 		queueMonitor: NewMonitor(),
-		spaceMonitor: NewMonitor(),
 	}
 
 	candidateFrame := func(candidate string) *protocol.Frame {
@@ -3555,7 +3554,7 @@ func TestClientSignalReceiverCoalescesAdjacentCandidatesOnly(t *testing.T) {
 	}()
 
 	for _, frame := range frames {
-		received, err := newReceivedSignalFrame(source, frame)
+		received, err := newReceivedSignalFrame(source, TransferKey{}, frame)
 		AssertEqual(t, err, nil)
 		AssertEqual(t, receiver.enqueue(received), true)
 	}
@@ -3599,7 +3598,6 @@ func TestClientSignalReceiverCoalescesAdjacentCandidates(t *testing.T) {
 		cancel:       cancel,
 		queueLimit:   8,
 		queueMonitor: NewMonitor(),
-		spaceMonitor: NewMonitor(),
 	}
 
 	candidateFrame := func(candidate string) *protocol.Frame {
@@ -3630,7 +3628,7 @@ func TestClientSignalReceiverCoalescesAdjacentCandidates(t *testing.T) {
 	}()
 
 	for _, frame := range frames {
-		received, err := newReceivedSignalFrame(source, frame)
+		received, err := newReceivedSignalFrame(source, TransferKey{}, frame)
 		AssertEqual(t, err, nil)
 		AssertEqual(t, receiver.enqueue(received), true)
 	}
@@ -3655,11 +3653,11 @@ func TestClientSignalReceiverCandidateCoalescingRemainsBounded(t *testing.T) {
 	source := SourceId(NewId())
 	streamId := NewId()
 	receiver := &clientSignalReceiver{
+		client:       &Client{log: NewNoopLogger()},
 		ctx:          ctx,
 		cancel:       cancel,
 		queueLimit:   1,
 		queueMonitor: NewMonitor(),
-		spaceMonitor: NewMonitor(),
 	}
 	makeReceived := func(signals []*protocol.ExchangeSignal) *receivedSignalFrame {
 		messageBytes, err := ProtoMarshal(&protocol.ExchangeSignals{
@@ -3667,7 +3665,7 @@ func TestClientSignalReceiverCandidateCoalescingRemainsBounded(t *testing.T) {
 			Signals:  signals,
 		})
 		AssertEqual(t, err, nil)
-		received, err := newReceivedSignalFrame(source, &protocol.Frame{
+		received, err := newReceivedSignalFrame(source, TransferKey{}, &protocol.Frame{
 			MessageType:  protocol.MessageType_TransferExchangeSignals,
 			MessageBytes: messageBytes,
 		})
@@ -3690,28 +3688,77 @@ func TestClientSignalReceiverCandidateCoalescingRemainsBounded(t *testing.T) {
 		SignalType:   protocol.SignalType_IceCandidate,
 		IceCandidate: []byte("candidate-overflow"),
 	}})
-	enqueued := make(chan bool, 1)
-	go func() {
-		enqueued <- receiver.enqueue(second)
-	}()
-	select {
-	case <-enqueued:
-		t.Fatal("candidate coalescing bypassed the bounded full-shard backpressure")
-	case <-time.After(50 * time.Millisecond):
+	if receiver.enqueue(second) {
+		t.Fatal("candidate coalescing bypassed the bounded full-shard drop")
 	}
+	second.Close()
+	AssertEqual(t, receiver.droppedSignalCount.Load(), uint64(1))
 
 	dequeued := receiver.dequeue()
 	AssertEqual(t, dequeued, first)
 	dequeued.Close()
-	select {
-	case ok := <-enqueued:
-		AssertEqual(t, ok, true)
-	case <-time.After(time.Second):
-		t.Fatal("candidate enqueue did not resume after bounded capacity returned")
+}
+
+// TestClientSignalReceiverDoesNotCoalesceDifferentTransferKeys verifies that
+// receiver-visible lanes remain distinct queue entries.
+func TestClientSignalReceiverDoesNotCoalesceDifferentTransferKeys(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	source := SourceId(NewId())
+	streamId := NewId()
+	receiver := &clientSignalReceiver{
+		client:       &Client{log: NewNoopLogger()},
+		ctx:          ctx,
+		cancel:       cancel,
+		queueLimit:   2,
+		queueMonitor: NewMonitor(),
 	}
-	dequeued = receiver.dequeue()
-	AssertEqual(t, dequeued, second)
-	dequeued.Close()
+	defer receiver.Close()
+
+	newCandidate := func(transferKey TransferKey, candidate string) *receivedSignalFrame {
+		messageBytes, err := ProtoMarshal(&protocol.ExchangeSignals{
+			StreamId: streamId.Bytes(),
+			Signals: []*protocol.ExchangeSignal{{
+				SignalType:   protocol.SignalType_IceCandidate,
+				IceCandidate: []byte(candidate),
+			}},
+		})
+		AssertEqual(t, err, nil)
+		received, err := newReceivedSignalFrame(
+			source,
+			transferKey,
+			&protocol.Frame{
+				MessageType:  protocol.MessageType_TransferExchangeSignals,
+				MessageBytes: messageBytes,
+			},
+		)
+		MessagePoolReturn(messageBytes)
+		AssertEqual(t, err, nil)
+		return received
+	}
+
+	firstKey := TransferKey{
+		ForceStream:         true,
+		EncryptionRole:      protocol.SequenceRole_SequenceRoleServer,
+		EncryptionCompanion: true,
+	}
+	secondKey := firstKey
+	secondKey.EncryptionCompanion = false
+	AssertEqual(t, receiver.enqueue(newCandidate(firstKey, "first")), true)
+	AssertEqual(t, receiver.enqueue(newCandidate(secondKey, "second")), true)
+	AssertEqual(t, receiver.receiveFrameCount, 2)
+
+	first := receiver.dequeue()
+	AssertEqual(t, first.transferKey, firstKey)
+	AssertEqual(t, len(first.exchangeSignals.Signals), 1)
+	AssertEqual(t, string(first.exchangeSignals.Signals[0].IceCandidate), "first")
+	first.Close()
+	second := receiver.dequeue()
+	AssertEqual(t, second.transferKey, secondKey)
+	AssertEqual(t, len(second.exchangeSignals.Signals), 1)
+	AssertEqual(t, string(second.exchangeSignals.Signals[0].IceCandidate), "second")
+	second.Close()
 }
 
 func TestClientSignalReceiverQueueBackingStorageRemainsBounded(t *testing.T) {
@@ -3724,7 +3771,6 @@ func TestClientSignalReceiverQueueBackingStorageRemainsBounded(t *testing.T) {
 		cancel:       cancel,
 		queueLimit:   queueLimit,
 		queueMonitor: NewMonitor(),
-		spaceMonitor: NewMonitor(),
 	}
 	defer receiver.Close()
 
@@ -3774,7 +3820,7 @@ func TestClientSignalReceiverDecodedValueOwnsFrameBytes(t *testing.T) {
 	})
 	AssertEqual(t, err, nil)
 
-	received, err := newReceivedSignalFrame(SourceId(NewId()), &protocol.Frame{
+	received, err := newReceivedSignalFrame(SourceId(NewId()), TransferKey{}, &protocol.Frame{
 		MessageType:  protocol.MessageType_TransferExchangeSignals,
 		MessageBytes: messageBytes,
 	})
@@ -3800,11 +3846,28 @@ type testingBlockingSignalReceiver struct {
 	other       chan struct{}
 }
 
-func (self *testingBlockingSignalReceiver) ReceiveSignal(TransferPath, *protocol.Frame) error {
+// testingSignalDropLogger retains full-shard warnings for attribution checks.
+type testingSignalDropLogger struct {
+	Logger
+	warnings chan string
+}
+
+// Warningf records one warning without blocking the tested receive callback.
+func (self *testingSignalDropLogger) Warningf(format string, args ...any) {
+	self.warnings <- fmt.Sprintf(format, args...)
+}
+
+// ReceiveSignal accepts the framed compatibility path without blocking.
+func (self *testingBlockingSignalReceiver) ReceiveSignal(TransferPath, TransferKey, *protocol.Frame) error {
 	return nil
 }
 
-func (self *testingBlockingSignalReceiver) ReceiveExchangeSignals(source TransferPath, _ *protocol.ExchangeSignals) error {
+// ReceiveExchangeSignals blocks only the configured source for shard tests.
+func (self *testingBlockingSignalReceiver) ReceiveExchangeSignals(
+	source TransferPath,
+	_ TransferKey,
+	_ *protocol.ExchangeSignals,
+) error {
 	if source.SourceId == self.blockSource {
 		select {
 		case self.entered <- struct{}{}:
@@ -3820,6 +3883,7 @@ func (self *testingBlockingSignalReceiver) ReceiveExchangeSignals(source Transfe
 	return nil
 }
 
+// newTestingSignalDispatcher starts a bounded dispatcher with explicit shards.
 func newTestingSignalDispatcher(
 	ctx context.Context,
 	cancel context.CancelFunc,
@@ -3843,7 +3907,7 @@ func newTestingSignalDispatcher(
 			cancel:       cancel,
 			queueLimit:   queueLimit,
 			queueMonitor: NewMonitor(),
-			spaceMonitor: NewMonitor(),
+			dropWarnings: make(chan signalDropWarning, 1),
 		}
 		dispatcher.shards = append(dispatcher.shards, shard)
 		shard.start()
@@ -3851,6 +3915,7 @@ func newTestingSignalDispatcher(
 	return dispatcher
 }
 
+// testingSignalFrame owns one waiting-for-offer signal for the supplied stream.
 func testingSignalFrame(t *testing.T, streamId Id) *protocol.Frame {
 	messageBytes, err := ProtoMarshal(&protocol.ExchangeSignals{
 		StreamId: streamId.Bytes(),
@@ -3904,7 +3969,7 @@ func TestClientSignalDispatcherStalledPeerDoesNotBlockOtherShard(t *testing.T) {
 	defer dispatcher.Close()
 
 	frameA := testingSignalFrame(t, streamA)
-	dispatcher.handleControlFrame(sourceA, frameA)
+	dispatcher.handleControlFrame(sourceA, TransferKey{}, frameA)
 	MessagePoolReturn(frameA.MessageBytes)
 	select {
 	case <-receiver.entered:
@@ -3913,7 +3978,7 @@ func TestClientSignalDispatcherStalledPeerDoesNotBlockOtherShard(t *testing.T) {
 	}
 
 	frameB := testingSignalFrame(t, streamB)
-	dispatcher.handleControlFrame(sourceB, frameB)
+	dispatcher.handleControlFrame(sourceB, TransferKey{}, frameB)
 	MessagePoolReturn(frameB.MessageBytes)
 	select {
 	case <-receiver.other:
@@ -3923,7 +3988,9 @@ func TestClientSignalDispatcherStalledPeerDoesNotBlockOtherShard(t *testing.T) {
 	close(receiver.release)
 }
 
-func TestClientSignalDispatcherFullShardBackpressuresReceiveCallback(t *testing.T) {
+// TestClientSignalDispatcherFullShardDropsWithoutBlockingReceiveCallback
+// verifies an observable drop without parking the shared callback.
+func TestClientSignalDispatcherFullShardDropsWithoutBlockingReceiveCallback(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	source := SourceId(NewId())
@@ -3936,9 +4003,14 @@ func TestClientSignalDispatcherFullShardBackpressuresReceiveCallback(t *testing.
 	}
 	dispatcher := newTestingSignalDispatcher(ctx, cancel, receiver, 1, 1)
 	defer dispatcher.Close()
+	dropLog := &testingSignalDropLogger{
+		Logger:   NewNoopLogger(),
+		warnings: make(chan string, 1),
+	}
+	dispatcher.client.log = dropLog
 
 	first := testingSignalFrame(t, streamId)
-	dispatcher.handleControlFrame(source, first)
+	dispatcher.handleControlFrame(source, TransferKey{}, first)
 	MessagePoolReturn(first.MessageBytes)
 	select {
 	case <-receiver.entered:
@@ -3947,27 +4019,316 @@ func TestClientSignalDispatcherFullShardBackpressuresReceiveCallback(t *testing.
 	}
 
 	second := testingSignalFrame(t, streamId)
-	dispatcher.handleControlFrame(source, second)
+	dispatcher.handleControlFrame(source, TransferKey{}, second)
 	MessagePoolReturn(second.MessageBytes)
 
 	thirdReturned := make(chan struct{})
 	third := testingSignalFrame(t, streamId)
 	go func() {
-		dispatcher.handleControlFrame(source, third)
+		dispatcher.handleControlFrame(source, TransferKey{}, third)
 		MessagePoolReturn(third.MessageBytes)
 		close(thirdReturned)
 	}()
 	select {
 	case <-thirdReturned:
-		t.Fatal("full signal shard did not preserve receive callback backpressure")
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(time.Second):
+		t.Fatal("full signal shard blocked the shared receive callback")
+	}
+	AssertEqual(t, dispatcher.shards[0].droppedSignalCount.Load(), uint64(1))
+	dispatcher.shards[0].queueLock.Lock()
+	queuedCount := dispatcher.shards[0].receiveFrameCount
+	dispatcher.shards[0].queueLock.Unlock()
+	AssertEqual(t, queuedCount, 1)
+	select {
+	case warning := <-dropLog.warnings:
+		if !strings.Contains(warning, source.SourceId.String()) ||
+			!strings.Contains(warning, streamId.String()) ||
+			!strings.Contains(warning, "dropped=1") {
+			t.Fatalf("signal drop warning is not attributable: %q", warning)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("full signal shard did not emit a warning")
+	}
+	close(receiver.release)
+}
+
+// testingRecordedSignalSend is one synchronously decoded outbound signal.
+type testingRecordedSignalSend struct {
+	destinationId Id
+	signals       *protocol.ExchangeSignals
+	opts          []any
+}
+
+// testingTransferKeySignalSender records owned signal sends for reply checks.
+type testingTransferKeySignalSender struct {
+	sends chan testingRecordedSignalSend
+}
+
+// SendSignal consumes the frame and records its destination, value, and options.
+func (self *testingTransferKeySignalSender) SendSignal(
+	destinationId Id,
+	frame *protocol.Frame,
+	opts ...any,
+) {
+	defer MessagePoolReturn(frame.MessageBytes)
+	signals := &protocol.ExchangeSignals{}
+	if err := ProtoUnmarshal(frame.MessageBytes, signals); err != nil {
+		panic(err)
+	}
+	self.sends <- testingRecordedSignalSend{
+		destinationId: destinationId,
+		signals:       signals,
+		opts:          slices.Clone(opts),
+	}
+}
+
+// TestClientSignalDispatcherPreservesTransferKeyForReply verifies that async
+// dispatch preserves a non-default lane key through its generated reply.
+func TestClientSignalDispatcherPreservesTransferKeyForReply(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	peerId := NewId()
+	streamId := NewId()
+	sender := &testingTransferKeySignalSender{
+		sends: make(chan testingRecordedSignalSend, 1),
+	}
+	conn := &peerConn{
+		ctx:              ctx,
+		log:              NewNoopLogger(),
+		key:              peerConnKey{PeerId: peerId, StreamId: streamId},
+		active:           true,
+		signalSender:     sender,
+		signalGeneration: NewId(),
+		offer: &protocol.ExchangeSignal{
+			SignalType: protocol.SignalType_SdpOffer,
+			Sdp:        []byte("cached offer"),
+		},
+	}
+	manager := &WebRtcManager{
+		log:       NewNoopLogger(),
+		peerConns: map[peerConnKey]*peerConn{conn.key: conn},
+	}
+	dispatcher := newTestingSignalDispatcher(ctx, cancel, manager, 1, 4)
+	defer dispatcher.Close()
+
+	transferKey := TransferKey{
+		CompanionContract:   true,
+		EncryptionRole:      protocol.SequenceRole_SequenceRoleServer,
+		EncryptionCompanion: true,
+	}
+	frame := testingSignalFrame(t, streamId)
+	dispatcher.Receive(
+		SourceId(peerId),
+		[]*protocol.Frame{frame},
+		Peer{TransferKey: transferKey},
+	)
+	MessagePoolReturn(frame.MessageBytes)
+
+	var sent testingRecordedSignalSend
+	select {
+	case sent = <-sender.sends:
+	case <-time.After(time.Second):
+		t.Fatal("inbound signal did not produce the cached-offer reply")
+	}
+	AssertEqual(t, sent.destinationId, peerId)
+	AssertEqual(t, len(sent.signals.Signals), 1)
+	AssertEqual(t, sent.signals.Signals[0].SignalType, protocol.SignalType_SdpOffer)
+
+	transferKeyIndex := -1
+	forceStreamIndex := -1
+	companionContractIndex := -1
+	nonBlocking := false
+	for index, opt := range sent.opts {
+		switch value := opt.(type) {
+		case TransferKey:
+			AssertEqual(t, value, transferKey)
+			transferKeyIndex = index
+		case transferOptionsSetForceStream:
+			forceStreamIndex = index
+		case transferOptionsSetCompanionContract:
+			companionContractIndex = index
+		case signalSendNonBlocking:
+			nonBlocking = true
+		}
+	}
+	if transferKeyIndex < 0 {
+		t.Fatal("signal reply did not carry the receiver-visible TransferKey")
+	}
+	if forceStreamIndex <= transferKeyIndex {
+		t.Fatalf(
+			"reply route policy was not derived after the TransferKey: key=%d force_stream=%d",
+			transferKeyIndex,
+			forceStreamIndex,
+		)
+	}
+	if companionContractIndex <= transferKeyIndex {
+		t.Fatalf(
+			"reply companion policy was not derived after the TransferKey: key=%d companion=%d",
+			transferKeyIndex,
+			companionContractIndex,
+		)
+	}
+	if !nonBlocking {
+		t.Fatal("receive-path signal reply did not carry the non-blocking marker")
 	}
 
-	close(receiver.release)
+	client := &Client{
+		ctx:      ctx,
+		settings: DefaultClientSettings(),
+	}
+	resolved := client.resolveSendOptions(sent.opts)
+	AssertEqual(t, resolved.transferOptions.ForceStream, true)
+	AssertEqual(t, resolved.transferOptions.CompanionContract, false)
+	AssertEqual(t, resolved.encryptionRole, sequenceTlsRoleServer)
+	AssertEqual(t, resolved.encryptionCompanion, true)
+}
+
+// TestPeerConnPassiveSignalReplyDerivesRouteAfterTransferKey verifies that a
+// passive reply changes contract policy without changing its encryption lane.
+func TestPeerConnPassiveSignalReplyDerivesRouteAfterTransferKey(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sender := &testingTransferKeySignalSender{
+		sends: make(chan testingRecordedSignalSend, 1),
+	}
+	conn := &peerConn{
+		ctx: ctx,
+		key: peerConnKey{
+			PeerId:   NewId(),
+			StreamId: NewId(),
+		},
+		signalSender:     sender,
+		signalGeneration: NewId(),
+	}
+	transferKey := TransferKey{
+		ForceStream:         true,
+		EncryptionRole:      protocol.SequenceRole_SequenceRoleServer,
+		EncryptionCompanion: true,
+	}
+	conn.setSignalReplyTransferKey(transferKey)
+	conn.sendSignalsNonBlocking([]*protocol.ExchangeSignal{{
+		SignalType: protocol.SignalType_SdpAnswer,
+	}})
+
+	var sent testingRecordedSignalSend
 	select {
-	case <-thirdReturned:
+	case sent = <-sender.sends:
 	case <-time.After(time.Second):
-		t.Fatal("receive callback did not resume when shard capacity returned")
+		t.Fatal("passive signal reply was not sent")
+	}
+	AssertEqual(t, sent.destinationId, conn.key.PeerId)
+	client := &Client{
+		ctx:      ctx,
+		settings: DefaultClientSettings(),
+	}
+	resolved := client.resolveSendOptions(sent.opts)
+	AssertEqual(t, resolved.transferOptions.ForceStream, false)
+	AssertEqual(t, resolved.transferOptions.CompanionContract, true)
+	AssertEqual(t, resolved.encryptionRole, sequenceTlsRoleServer)
+	AssertEqual(t, resolved.encryptionCompanion, true)
+}
+
+// A delayed Pion callback after another signal changes the immediate reply
+// lane must retain the lane of the SDP negotiation that caused its gathering.
+func TestPeerConnDeferredIceCandidateKeepsNegotiationTransferKey(t *testing.T) {
+	sender := &testingTransferKeySignalSender{
+		sends: make(chan testingRecordedSignalSend, 1),
+	}
+	conn := &peerConn{
+		key: peerConnKey{
+			PeerId:   NewId(),
+			StreamId: NewId(),
+		},
+		active:           true,
+		signalSender:     sender,
+		signalGeneration: NewId(),
+	}
+	negotiationTransferKey := TransferKey{
+		ForceStream:         true,
+		EncryptionRole:      protocol.SequenceRole_SequenceRoleServer,
+		EncryptionCompanion: true,
+	}
+	laterTransferKey := negotiationTransferKey
+	laterTransferKey.EncryptionCompanion = false
+	conn.setSignalReplyTransferKey(negotiationTransferKey)
+	// SDP readiness fixes the association before Pion runs its deferred
+	// candidate callback.
+	conn.flushIceCandidates()
+
+	callbackScheduled := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	callbackDone := make(chan struct{})
+	candidate := &webrtc.ICECandidate{
+		Foundation: "deferred",
+		Priority:   1,
+		Address:    "192.0.2.1",
+		Protocol:   webrtc.ICEProtocolUDP,
+		Port:       10000,
+		Typ:        webrtc.ICECandidateTypeHost,
+		Component:  1,
+	}
+	go func() {
+		close(callbackScheduled)
+		<-releaseCallback
+		conn.sendIceCandidate(candidate)
+		close(callbackDone)
+	}()
+	<-callbackScheduled
+	conn.setSignalReplyTransferKey(laterTransferKey)
+	close(releaseCallback)
+
+	var sent testingRecordedSignalSend
+	select {
+	case sent = <-sender.sends:
+	case <-time.After(time.Second):
+		t.Fatal("deferred ICE candidate was not sent")
+	}
+	select {
+	case <-callbackDone:
+	case <-time.After(time.Second):
+		t.Fatal("deferred ICE callback did not return")
+	}
+	var sentTransferKey TransferKey
+	transferKeyFound := false
+	for _, opt := range sent.opts {
+		if transferKey, ok := opt.(TransferKey); ok {
+			sentTransferKey = transferKey
+			transferKeyFound = true
+		}
+	}
+	if !transferKeyFound {
+		t.Fatal("deferred ICE candidate omitted its negotiation TransferKey")
+	}
+	AssertEqual(t, sentTransferKey, negotiationTransferKey)
+	if sentTransferKey == laterTransferKey {
+		t.Fatal("deferred ICE candidate was retargeted to a later signal lane")
+	}
+}
+
+// TestClientSignalSenderFailedSendReturnsMessageBytes verifies that a rejected
+// send returns its pooled signal bytes exactly once.
+func TestClientSignalSenderFailedSendReturnsMessageBytes(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	client := &Client{
+		ctx: ctx,
+		log: NewNoopLogger(),
+	}
+	sender := NewClientSignalSender(client)
+	messageBytes := MessagePoolCopy([]byte("rejected signal"))
+	if pooled, _ := MessagePoolCheck(messageBytes); !pooled {
+		t.Fatal("test signal did not use pooled storage")
+	}
+	witness := MessagePoolShareReadOnly(messageBytes)
+	frame := &protocol.Frame{
+		MessageType:  protocol.MessageType_TransferExchangeSignals,
+		MessageBytes: messageBytes,
+	}
+	sender.SendSignal(NewId(), frame)
+	AssertEqual(t, frame.MessageBytes, []byte(nil))
+	if !MessagePoolReturn(witness) {
+		t.Fatal("rejected signal retained its exact pooled message ownership")
 	}
 }
 
@@ -3977,6 +4338,7 @@ func TestWebRtcManagerPeerConnectionFactoryIsLazy(t *testing.T) {
 	settings.Log = NewNoopLogger()
 	settings.IceServerUrls = nil
 	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	defer manager.Close()
 	if manager.networkChangeWorker != nil {
 		t.Fatal("idle manager eagerly started a network-change worker")
 	}
@@ -3997,19 +4359,18 @@ func TestWebRtcManagerPeerConnectionFactoryIsLazy(t *testing.T) {
 	conn.Close()
 
 	cancel()
-	factoryReleased := func() bool {
-		manager.peerConnectionFactoryLock.Lock()
-		defer manager.peerConnectionFactoryLock.Unlock()
-		return manager.peerConnectionFactoryClosed &&
-			manager.peerConnectionFactory == nil &&
-			manager.peerConnectionCertificate == nil
+	select {
+	case <-manager.closeDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("manager close did not finish after context cancellation")
 	}
-	deadline := time.Now().Add(time.Second)
-	for !factoryReleased() {
-		if time.Now().After(deadline) {
-			t.Fatal("manager factory/certificate did not release with its context")
-		}
-		time.Sleep(time.Millisecond)
+	manager.peerConnectionFactoryLock.Lock()
+	factoryClosed := manager.peerConnectionFactoryClosed
+	factory := manager.peerConnectionFactory
+	certificate := manager.peerConnectionCertificate
+	manager.peerConnectionFactoryLock.Unlock()
+	if !factoryClosed || factory != nil || certificate != nil {
+		t.Fatal("manager close retained its factory or certificate")
 	}
 }
 
@@ -4080,7 +4441,7 @@ func TestWebRtcManagerCanceledStreamDoesNotAllocatePeerConnection(t *testing.T) 
 	AssertEqual(t, budget.UsedByteCount(), ByteCount(0))
 }
 
-func TestWebRtcManagerCloseSynchronouslyReleasesOwnedResources(t *testing.T) {
+func TestWebRtcManagerCloseAndWaitReleasesOwnedResources(t *testing.T) {
 	settings := DefaultWebRtcSettings()
 	settings.Log = NewNoopLogger()
 	settings.IceServerUrls = nil
@@ -4103,15 +4464,17 @@ func TestWebRtcManagerCloseSynchronouslyReleasesOwnedResources(t *testing.T) {
 		t.Fatalf("reservation before close = %d, want %d", got, settings.ReceiveBufferSize)
 	}
 
-	closeReturned := make(chan struct{})
+	closeReturned := make(chan error, 1)
 	go func() {
-		manager.Close()
-		close(closeReturned)
+		closeReturned <- manager.closeAndWait(context.Background())
 	}()
 	select {
-	case <-closeReturned:
+	case closeErr := <-closeReturned:
+		if closeErr != nil {
+			t.Fatalf("manager CloseAndWait = %v", closeErr)
+		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("manager Close did not join peer teardown")
+		t.Fatal("manager CloseAndWait did not join peer teardown")
 	}
 
 	if got := settings.MemoryBudget.UsedByteCount(); got != 0 {
@@ -4128,7 +4491,7 @@ func TestWebRtcManagerCloseSynchronouslyReleasesOwnedResources(t *testing.T) {
 	factoryClosed := manager.peerConnectionFactoryClosed
 	manager.peerConnectionFactoryLock.Unlock()
 	if !factoryClosed {
-		t.Fatal("manager Close returned before its peer-connection factory closed")
+		t.Fatal("manager CloseAndWait returned before its peer-connection factory closed")
 	}
 	if _, err := manager.NewP2pConnActive(
 		streamCtx,
@@ -4152,11 +4515,13 @@ type contextBackpressuredPeerSignalSender struct {
 	entered chan struct{}
 }
 
+// SendSignal holds its owned frame until the peer generation context ends.
 func (self *contextBackpressuredPeerSignalSender) SendSignal(
-	_ TransferPath,
-	_ *protocol.Frame,
+	_ Id,
+	signal *protocol.Frame,
 	opts ...any,
 ) {
+	defer MessagePoolReturn(signal.MessageBytes)
 	var ctx context.Context
 	for _, opt := range opts {
 		if value, ok := opt.(transferCtx); ok {
@@ -4217,11 +4582,13 @@ func newBlockingPeerSignalSender() *blockingPeerSignalSender {
 	}
 }
 
+// SendSignal holds its owned frame until the test releases the sender.
 func (self *blockingPeerSignalSender) SendSignal(
-	TransferPath,
-	*protocol.Frame,
-	...any,
+	_ Id,
+	signal *protocol.Frame,
+	_ ...any,
 ) {
+	defer MessagePoolReturn(signal.MessageBytes)
 	select {
 	case self.entered <- struct{}{}:
 	default:
@@ -4926,6 +5293,7 @@ func TestWebRtcResetWithoutOfferCannotTearDownPeer(t *testing.T) {
 	}
 	err := manager.ReceiveExchangeSignals(
 		SourceId(peerId),
+		TransferKey{},
 		&protocol.ExchangeSignals{
 			StreamId:           streamId.Bytes(),
 			ResetSignals:       true,
@@ -5013,24 +5381,57 @@ func TestWebRtcManagerNetworkChangeRetiresConnectionsAndFactory(t *testing.T) {
 }
 
 func TestWebRtcNetworkChangeDispatchDoesNotBlockHostCallback(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	fastPathPublished := make(chan struct{})
+	releaseFastPath := make(chan struct{})
+	var releaseFastPathOnce sync.Once
+	releaseFastPathConfiguration := func() {
+		releaseFastPathOnce.Do(func() {
+			close(releaseFastPath)
+		})
+	}
 	settings := DefaultWebRtcSettings()
 	settings.Log = NewNoopLogger()
 	settings.IceServerUrls = nil
+	settings.afterFastPathPublishForTest = func() {
+		close(fastPathPublished)
+		<-releaseFastPath
+	}
 	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	defer manager.Close()
+	defer releaseFastPathConfiguration()
 	conn, err := manager.NewP2pConnActive(
 		ctx,
 		NewTransferPath(NewId(), NewId(), NewId()),
 	)
 	AssertEqual(t, err, nil)
 	defer conn.Close()
+	peer := conn.(*peerConn)
+	select {
+	case <-fastPathPublished:
+	case <-ctx.Done():
+		t.Fatal("peer setup did not publish the native fast path")
+	}
 
 	// Simulate teardown already holding manager state. The OS path callback
 	// must enqueue/coalesce and return instead of blocking its UI/extension
 	// thread behind that work.
+	workerEntered := make(chan struct{})
+	var workerEnteredOnce sync.Once
+	manager.beforeNetworkChangeStateLockForTest = func() {
+		workerEnteredOnce.Do(func() {
+			close(workerEntered)
+		})
+	}
 	manager.stateLock.Lock()
+	stateLocked := true
+	defer func() {
+		if stateLocked {
+			manager.stateLock.Unlock()
+		}
+	}()
 	dispatched := make(chan struct{})
 	go func() {
 		for range 32 {
@@ -5039,52 +5440,51 @@ func TestWebRtcNetworkChangeDispatchDoesNotBlockHostCallback(t *testing.T) {
 		close(dispatched)
 	}()
 	select {
+	case <-workerEntered:
+	case <-ctx.Done():
+		t.Fatal("network-change worker did not reach the manager state barrier")
+	}
+	select {
 	case <-dispatched:
-	case <-time.After(100 * time.Millisecond):
-		manager.stateLock.Unlock()
-		t.Fatal("network-change dispatch blocked behind peer teardown")
+	case <-ctx.Done():
+		t.Fatal("network-change dispatch did not return while its worker waited for manager state")
 	}
 	manager.stateLock.Unlock()
+	stateLocked = false
 
 	select {
 	case <-conn.ImmediateReconnect():
-	case <-time.After(time.Second):
+	case <-ctx.Done():
 		t.Fatal("coalesced network-change worker did not retire the connection")
 	}
+	select {
+	case <-peer.teardownDone:
+	case <-ctx.Done():
+		t.Fatal("network-change teardown did not retire the startup fast path")
+	}
+	if peer.fastPath.Load() != nil {
+		t.Fatal("network-change teardown retained the published startup fast path")
+	}
+	releaseFastPathConfiguration()
 }
 
 func TestWebRtcInvalidSdpAndEarlyCandidateDoNotPoisonRetransmit(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	settingsA := DefaultWebRtcSettings()
-	settingsB := DefaultWebRtcSettings()
-	settingsA.Log = NewNoopLogger()
-	settingsB.Log = NewNoopLogger()
-	settingsA.IceServerUrls = nil
-	settingsB.IceServerUrls = nil
-	// The recovery deadline below requires the post-retransmit connect to
-	// finish promptly; both peers are on this host, so restrict ICE to
-	// loopback rather than sweeping a multihomed host's interface view.
-	settingsA.UseLoopbackOnlyIceInterfaces = true
-	settingsB.UseLoopbackOnlyIceInterfaces = true
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.UseLoopbackOnlyIceInterfaces = true
+	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	defer manager.Close()
 
-	signalPipeA := newSignalPipe(nil)
-	signalPipeB := newSignalPipe(nil)
-	managerA := NewWebRtcManager(ctx, signalPipeA, settingsA)
-	managerB := NewWebRtcManager(ctx, signalPipeB, settingsB)
-	signalPipeA.SetSignalReceiver(managerB)
-	signalPipeB.SetSignalReceiver(managerA)
-
-	peerIdA := NewId()
-	peerIdB := NewId()
 	streamId := NewId()
-	passiveWebRtcConn, err := managerB.NewP2pConnPassive(
+	passiveWebRtcConn, err := manager.NewP2pConnPassive(
 		ctx,
-		NewTransferPath(peerIdB, peerIdA, streamId),
+		NewTransferPath(NewId(), NewId(), streamId),
 	)
 	AssertEqual(t, err, nil)
-	defer passiveWebRtcConn.Close()
 	passive := passiveWebRtcConn.(*peerConn)
 
 	invalidSdp, err := json.Marshal(&webrtc.SessionDescription{
@@ -5108,24 +5508,38 @@ func TestWebRtcInvalidSdpAndEarlyCandidateDoNotPoisonRetransmit(t *testing.T) {
 		SignalType:   protocol.SignalType_IceCandidate,
 		IceCandidate: earlyCandidate,
 	}), nil)
-	AssertEqual(t, len(passive.remoteIceCandidateBuffer), 1)
+	passive.signalLock.Lock()
+	bufferedCandidateCount := len(passive.remoteIceCandidateBuffer)
+	passive.signalLock.Unlock()
+	AssertEqual(t, bufferedCandidateCount, 1)
 
-	active, err := managerA.NewP2pConnActive(
-		ctx,
-		NewTransferPath(peerIdA, peerIdB, streamId),
-	)
+	offerPeer, err := webrtc.NewPeerConnection(webrtc.Configuration{})
 	AssertEqual(t, err, nil)
-	defer active.Close()
-
-	deadline := time.Now().Add(5 * time.Second)
-	for !active.Connected() || !passive.Connected() {
-		if time.Now().After(deadline) {
-			t.Fatal("valid retransmit did not recover after invalid SDP/early ICE")
-		}
-		time.Sleep(10 * time.Millisecond)
+	defer offerPeer.Close()
+	if _, err := offerPeer.CreateDataChannel("retransmit", nil); err != nil {
+		t.Fatal(err)
 	}
-	AssertEqual(t, len(passive.remoteIceCandidateBuffer), 0)
-	AssertEqual(t, passive.remoteIceCandidateBufferBytes, 0)
+	validOffer, err := offerPeer.CreateOffer(nil)
+	AssertEqual(t, err, nil)
+	AssertEqual(t, offerPeer.SetLocalDescription(validOffer), nil)
+	validOfferBytes, err := json.Marshal(&validOffer)
+	AssertEqual(t, err, nil)
+	validOfferSignal := &protocol.ExchangeSignal{
+		SignalType: protocol.SignalType_SdpOffer,
+		Sdp:        validOfferBytes,
+	}
+	AssertEqual(t, passive.ReceiveSignalFromPeer(validOfferSignal), nil)
+	if passive.offerSignal() != validOfferSignal || passive.answerSignal() == nil {
+		t.Fatal("valid retransmit did not establish offer/answer state")
+	}
+	passive.signalLock.Lock()
+	remoteDescriptionSet := passive.remoteDescriptionSet
+	remoteIceCandidateCount := len(passive.remoteIceCandidateBuffer)
+	remoteIceCandidateBytes := passive.remoteIceCandidateBufferBytes
+	passive.signalLock.Unlock()
+	AssertEqual(t, remoteDescriptionSet, true)
+	AssertEqual(t, remoteIceCandidateCount, 0)
+	AssertEqual(t, remoteIceCandidateBytes, 0)
 }
 
 func TestWebRtcEarlyCandidateBufferIsBounded(t *testing.T) {
@@ -5189,6 +5603,7 @@ func TestWebRtcMalformedCandidateDoesNotSuppressBatchRemainder(t *testing.T) {
 	AssertEqual(t, err, nil)
 	err = manager.ReceiveExchangeSignals(
 		SourceId(peerId),
+		TransferKey{},
 		&protocol.ExchangeSignals{
 			StreamId: streamId.Bytes(),
 			Signals: []*protocol.ExchangeSignal{
@@ -5242,11 +5657,13 @@ type recordingSignalSender struct {
 	batches []*protocol.ExchangeSignals
 }
 
+// SendSignal decodes and records one owned signaling frame.
 func (self *recordingSignalSender) SendSignal(
-	_ TransferPath,
+	_ Id,
 	frame *protocol.Frame,
 	_ ...any,
 ) {
+	defer MessagePoolReturn(frame.MessageBytes)
 	exchangeSignals := &protocol.ExchangeSignals{}
 	if err := ProtoUnmarshal(frame.MessageBytes, exchangeSignals); err != nil {
 		panic(err)
@@ -5373,6 +5790,60 @@ type signalPipe struct {
 	verbose        bool
 }
 
+// testingSignalReceiverWrapper exposes the manager behind a diagnostic receiver.
+type testingSignalReceiverWrapper interface {
+	testingSignalReceiver() SignalReceiver
+}
+
+// testingSignalSource reconstructs the callback source expected by a test manager.
+func testingSignalSource(
+	receiver SignalReceiver,
+	destinationId Id,
+	frame *protocol.Frame,
+) TransferPath {
+	exchangeSignals := &protocol.ExchangeSignals{}
+	if err := ProtoUnmarshal(frame.MessageBytes, exchangeSignals); err != nil {
+		panic(err)
+	}
+	streamId, err := IdFromBytes(exchangeSignals.StreamId)
+	if err != nil {
+		panic(err)
+	}
+	for {
+		wrapper, ok := receiver.(testingSignalReceiverWrapper)
+		if !ok {
+			break
+		}
+		receiver = wrapper.testingSignalReceiver()
+	}
+	manager, ok := receiver.(*WebRtcManager)
+	if !ok {
+		panic("in-memory signal receiver is not a WebRtcManager")
+	}
+	manager.stateLock.Lock()
+	defer manager.stateLock.Unlock()
+	for key, conn := range manager.peerConns {
+		if key.StreamId == streamId && conn.sourceId == destinationId {
+			return TransferPath{
+				SourceId: key.PeerId,
+				StreamId: streamId,
+			}
+		}
+	}
+	panic("in-memory signal destination has no registered peer connection")
+}
+
+// testingSignalTransferKey extracts the receiver-visible lane from send options.
+func testingSignalTransferKey(opts []any) TransferKey {
+	var transferKey TransferKey
+	for _, opt := range opts {
+		if value, ok := opt.(TransferKey); ok {
+			transferKey = value
+		}
+	}
+	return transferKey
+}
+
 func newSignalPipe(signalReceiver SignalReceiver) *signalPipe {
 	return &signalPipe{
 		signalReceiver: signalReceiver,
@@ -5391,22 +5862,26 @@ func (self *signalPipe) SignalReceiver() SignalReceiver {
 	return self.signalReceiver
 }
 
-func (self *signalPipe) SendSignal(path TransferPath, signal *protocol.Frame, opts ...any) {
+// SendSignal synchronously delivers and consumes one owned signaling frame.
+func (self *signalPipe) SendSignal(destinationId Id, signal *protocol.Frame, opts ...any) {
+	defer MessagePoolReturn(signal.MessageBytes)
 	signalReceiver := self.SignalReceiver()
 	if signalReceiver != nil {
+		source := testingSignalSource(signalReceiver, destinationId, signal)
 		if self.verbose {
-			fmt.Printf("[signal][%s]%s\n", signal.MessageType, path)
+			fmt.Printf("[signal][%s]%s->%s\n", signal.MessageType, source, destinationId)
 		}
-		signalReceiver.ReceiveSignal(path.SourceMask(), signal)
+		signalReceiver.ReceiveSignal(source, testingSignalTransferKey(opts), signal)
 	} else if self.verbose {
-		fmt.Printf("[signal][%s]drop %s\n", signal.MessageType, path)
+		fmt.Printf("[signal][%s]drop ->%s\n", signal.MessageType, destinationId)
 	}
 }
 
 type delayedSignalFrame struct {
-	path  TransferPath
-	frame *protocol.Frame
-	due   time.Time
+	source      TransferPath
+	transferKey TransferKey
+	frame       *protocol.Frame
+	due         time.Time
 }
 
 // delayedSignalPipe models a propagation delay without serializing a burst:
@@ -5440,7 +5915,9 @@ func (self *delayedSignalPipe) SetSignalReceiver(receiver SignalReceiver) {
 	self.receiver = receiver
 }
 
-func (self *delayedSignalPipe) SendSignal(path TransferPath, frame *protocol.Frame, _ ...any) {
+// SendSignal copies one owned frame into the delayed delivery queue and consumes it.
+func (self *delayedSignalPipe) SendSignal(destinationId Id, frame *protocol.Frame, opts ...any) {
+	defer MessagePoolReturn(frame.MessageBytes)
 	owned := &protocol.Frame{
 		MessageType:  frame.MessageType,
 		Raw:          frame.Raw,
@@ -5449,9 +5926,10 @@ func (self *delayedSignalPipe) SendSignal(path TransferPath, frame *protocol.Fra
 	select {
 	case <-self.ctx.Done():
 	case self.queue <- delayedSignalFrame{
-		path:  path.SourceMask(),
-		frame: owned,
-		due:   time.Now().Add(self.delay),
+		source:      testingSignalSource(self.receiver, destinationId, frame),
+		transferKey: testingSignalTransferKey(opts),
+		frame:       owned,
+		due:         time.Now().Add(self.delay),
 	}:
 	}
 }
@@ -5490,10 +5968,15 @@ func (self *delayedSignalPipe) run() {
 		}
 		for _, signal := range pending[:dueCount] {
 			if self.receiver != nil {
-				_ = self.receiver.ReceiveSignal(signal.path, signal.frame)
+				_ = self.receiver.ReceiveSignal(
+					signal.source,
+					signal.transferKey,
+					signal.frame,
+				)
 			}
 		}
 		copy(pending, pending[dueCount:])
+		clear(pending[len(pending)-dueCount:])
 		pending = pending[:len(pending)-dueCount]
 	}
 }

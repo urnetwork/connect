@@ -583,7 +583,7 @@ func send(opts docopt.Opts) {
 			}
 			client.Send(
 				frame,
-				connect.DestinationId(destinationId),
+				destinationId,
 				func(err error) {
 					acks <- err
 				},

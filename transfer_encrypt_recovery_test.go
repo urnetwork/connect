@@ -71,7 +71,7 @@ func TestEncryptedPeerSessionLossRecovery(t *testing.T) {
 	// the handshake (opportunistic seals from establishment on)
 	if ok := a.SendWithTimeout(
 		requiredGateFrame(t, "before"),
-		DestinationId(bClientId),
+		bClientId,
 		func(error) {},
 		30*time.Second,
 	); !ok {
@@ -102,7 +102,7 @@ func TestEncryptedPeerSessionLossRecovery(t *testing.T) {
 	for !recovered && time.Now().Before(recoveryDeadline) {
 		a.SendWithTimeout(
 			requiredGateFrame(t, fmt.Sprintf("after-%d", sendIndex)),
-			DestinationId(bClientId),
+			bClientId,
 			func(error) {},
 			0,
 		)
@@ -151,7 +151,7 @@ func TestNackEchoingCurrentEpochIsIgnored(t *testing.T) {
 
 	if ok := a.SendWithTimeout(
 		requiredGateFrame(t, "establish"),
-		DestinationId(bClientId),
+		bClientId,
 		func(error) {},
 		30*time.Second,
 	); !ok {
@@ -199,7 +199,7 @@ func TestForgedNackCausesNoOutage(t *testing.T) {
 
 	if ok := a.SendWithTimeout(
 		requiredGateFrame(t, "establish"),
-		DestinationId(bClientId),
+		bClientId,
 		func(error) {},
 		30*time.Second,
 	); !ok {
@@ -222,7 +222,7 @@ func TestForgedNackCausesNoOutage(t *testing.T) {
 	// peer and the entry gate holds sends sealed-only in the interim
 	if ok := a.SendWithTimeout(
 		requiredGateFrame(t, "after-forged-nack"),
-		DestinationId(bClientId),
+		bClientId,
 		func(error) {},
 		20*time.Second,
 	); !ok {
@@ -272,7 +272,7 @@ func TestNackStormDuringRecoveryConverges(t *testing.T) {
 
 	if ok := a.SendWithTimeout(
 		requiredGateFrame(t, "before"),
-		DestinationId(bClientId),
+		bClientId,
 		func(error) {},
 		30*time.Second,
 	); !ok {
@@ -318,7 +318,7 @@ func TestNackStormDuringRecoveryConverges(t *testing.T) {
 	for !recovered && time.Now().Before(recoveryDeadline) {
 		a.SendWithTimeout(
 			requiredGateFrame(t, fmt.Sprintf("storm-%d", sendIndex)),
-			DestinationId(bClientId),
+			bClientId,
 			func(error) {},
 			0,
 		)
@@ -374,7 +374,7 @@ func TestNackDemoteChurnIsBounded(t *testing.T) {
 
 	if ok := a.SendWithTimeout(
 		requiredGateFrame(t, "establish"),
-		DestinationId(bClientId),
+		bClientId,
 		func(error) {},
 		30*time.Second,
 	); !ok {
@@ -444,7 +444,7 @@ func TestUnknownWrapNackEmissionIsRateLimited(t *testing.T) {
 
 	if ok := a.SendWithTimeout(
 		requiredGateFrame(t, "establish"),
-		DestinationId(bClientId),
+		bClientId,
 		func(error) {},
 		30*time.Second,
 	); !ok {
@@ -506,7 +506,7 @@ func TestNackWithStaleRealEpochDoesNotDemote(t *testing.T) {
 
 	if ok := a.SendWithTimeout(
 		requiredGateFrame(t, "establish"),
-		DestinationId(bClientId),
+		bClientId,
 		func(error) {},
 		30*time.Second,
 	); !ok {
@@ -545,7 +545,7 @@ func TestNackWithStaleRealEpochDoesNotDemote(t *testing.T) {
 	// and traffic keeps flowing on the undisturbed epoch
 	if ok := a.SendWithTimeout(
 		requiredGateFrame(t, "after-stale-nack"),
-		DestinationId(bClientId),
+		bClientId,
 		func(error) {},
 		20*time.Second,
 	); !ok {

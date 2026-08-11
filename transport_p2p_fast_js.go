@@ -13,6 +13,11 @@ func (self *peerConn) configureFastPath() error {
 	return nil
 }
 
+// Browser peers never publish a native carrier.
+func (self *peerConn) closeFastPath() {
+	self.fastPath.Store(nil)
+}
+
 // startFastPathWarmup is a no-op in browser builds.
 func (self *peerConn) startFastPathWarmup() {
 }

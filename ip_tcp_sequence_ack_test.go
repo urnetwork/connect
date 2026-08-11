@@ -17,15 +17,12 @@ func newTcpAckOrderingTestSequence() *TcpSequence {
 
 func TestTcpSequenceAcceptsPureAckAheadOfDeliveredUpload(t *testing.T) {
 	sequence := newTcpAckOrderingTestSequence()
-	drop, updated := sequence.applySendItemWithLock(&parsedTcp{
+	updated := sequence.applySendAckWithLock(&parsedTcp{
 		seq:        300,
 		ack:        true,
 		ackNumber:  1500,
 		windowSize: 4096,
 	})
-	if drop {
-		t.Fatal("pure ACK ahead of delivered upload was discarded")
-	}
 	if !updated || sequence.receiveSeqAck != 1500 || sequence.receiveWindowSize != 4096 {
 		t.Fatalf(
 			"ahead ACK did not advance return window: updated=%t ack=%d window=%d",
@@ -38,15 +35,12 @@ func TestTcpSequenceAcceptsPureAckAheadOfDeliveredUpload(t *testing.T) {
 
 func TestTcpSequenceAcceptsPureAckBehindDeliveredUpload(t *testing.T) {
 	sequence := newTcpAckOrderingTestSequence()
-	drop, updated := sequence.applySendItemWithLock(&parsedTcp{
+	updated := sequence.applySendAckWithLock(&parsedTcp{
 		seq:        100,
 		ack:        true,
 		ackNumber:  1500,
 		windowSize: 4096,
 	})
-	if drop {
-		t.Fatal("pure ACK behind delivered upload was discarded")
-	}
 	if !updated || sequence.receiveSeqAck != 1500 || sequence.receiveWindowSize != 4096 {
 		t.Fatalf(
 			"delayed ACK did not advance return window: updated=%t ack=%d window=%d",
@@ -59,15 +53,12 @@ func TestTcpSequenceAcceptsPureAckBehindDeliveredUpload(t *testing.T) {
 
 func TestTcpSequenceRejectsAckBeyondEmittedReturnData(t *testing.T) {
 	sequence := newTcpAckOrderingTestSequence()
-	drop, updated := sequence.applySendItemWithLock(&parsedTcp{
+	updated := sequence.applySendAckWithLock(&parsedTcp{
 		seq:        200,
 		ack:        true,
 		ackNumber:  2001,
 		windowSize: 4096,
 	})
-	if drop {
-		t.Fatal("future pure ACK should be ignored without dropping its packet")
-	}
 	if updated || sequence.receiveSeqAck != 1000 || sequence.receiveWindowSize != 1024 {
 		t.Fatalf(
 			"future ACK changed return window: updated=%t ack=%d window=%d",
@@ -78,18 +69,15 @@ func TestTcpSequenceRejectsAckBeyondEmittedReturnData(t *testing.T) {
 	}
 }
 
-func TestTcpSequenceDropsOutOfOrderPayloadButAppliesValidAck(t *testing.T) {
+func TestTcpSequenceAppliesValidAckIndependentOfPayloadOrder(t *testing.T) {
 	sequence := newTcpAckOrderingTestSequence()
-	drop, updated := sequence.applySendItemWithLock(&parsedTcp{
+	updated := sequence.applySendAckWithLock(&parsedTcp{
 		seq:        201,
 		ack:        true,
 		ackNumber:  1500,
 		windowSize: 4096,
 		payload:    []byte{1},
 	})
-	if !drop {
-		t.Fatal("out-of-order payload was accepted")
-	}
 	if !updated || sequence.receiveSeqAck != 1500 || sequence.receiveWindowSize != 4096 {
 		t.Fatal("valid ACK field on out-of-order payload did not advance return window")
 	}
@@ -99,15 +87,12 @@ func TestTcpSequenceZeroWindowAdvancesToExistingRightEdge(t *testing.T) {
 	sequence := newTcpAckOrderingTestSequence()
 	sequence.receiveWindowSize = 500
 	sequence.receiveWindowEnd = 1500
-	drop, updated := sequence.applySendItemWithLock(&parsedTcp{
+	updated := sequence.applySendAckWithLock(&parsedTcp{
 		seq:        200,
 		ack:        true,
 		ackNumber:  1500,
 		windowSize: 0,
 	})
-	if drop {
-		t.Fatal("zero-window ACK was discarded")
-	}
 	if !updated || sequence.receiveSeqAck != 1500 || sequence.receiveWindowSize != 0 {
 		t.Fatalf(
 			"zero-window ACK state: updated=%t ack=%d window=%d",
@@ -123,15 +108,12 @@ func TestTcpSequenceReopensWindowAtSameAck(t *testing.T) {
 	sequence.receiveSeqAck = 1500
 	sequence.receiveWindowSize = 0
 	sequence.receiveWindowEnd = 1500
-	drop, updated := sequence.applySendItemWithLock(&parsedTcp{
+	updated := sequence.applySendAckWithLock(&parsedTcp{
 		seq:        200,
 		ack:        true,
 		ackNumber:  1500,
 		windowSize: 4096,
 	})
-	if drop {
-		t.Fatal("window-reopen ACK was discarded")
-	}
 	if !updated || sequence.receiveWindowSize != 4096 || sequence.receiveWindowEnd != 5596 {
 		t.Fatalf(
 			"window-reopen state: updated=%t window=%d end=%d",
@@ -147,15 +129,12 @@ func TestTcpSequenceStaleDuplicateCannotShrinkReopenedWindow(t *testing.T) {
 	sequence.receiveSeqAck = 1500
 	sequence.receiveWindowSize = 4096
 	sequence.receiveWindowEnd = 5596
-	drop, updated := sequence.applySendItemWithLock(&parsedTcp{
+	updated := sequence.applySendAckWithLock(&parsedTcp{
 		seq:        100,
 		ack:        true,
 		ackNumber:  1500,
 		windowSize: 0,
 	})
-	if drop {
-		t.Fatal("stale pure ACK should be ignored without dropping its packet")
-	}
 	if updated || sequence.receiveWindowSize != 4096 || sequence.receiveWindowEnd != 5596 {
 		t.Fatalf(
 			"stale window update changed reopened edge: updated=%t window=%d end=%d",
@@ -169,7 +148,7 @@ func TestTcpSequenceStaleDuplicateCannotShrinkReopenedWindow(t *testing.T) {
 func TestTcpSequenceSynWindowIsLiteralBeforeScalingBegins(t *testing.T) {
 	sequence := newTcpAckOrderingTestSequence()
 	sequence.tcpBufferSettings = &TcpBufferSettings{
-		MaxWindowSize: 1 << 20,
+		MaxWindowSize: 1024 * 1024,
 	}
 	tcp := &parsedTcp{
 		seq:        9000,
@@ -197,7 +176,7 @@ func TestTcpSequenceSynWindowIsLiteralBeforeScalingBegins(t *testing.T) {
 func TestTcpSequenceSynWindowScaleIsClampedToProtocolMaximum(t *testing.T) {
 	sequence := newTcpAckOrderingTestSequence()
 	sequence.tcpBufferSettings = &TcpBufferSettings{
-		MaxWindowSize: 1 << 20,
+		MaxWindowSize: 1024 * 1024,
 	}
 	tcp := &parsedTcp{
 		seq:        100,

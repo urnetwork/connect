@@ -52,8 +52,9 @@ func TestP2pLateConnectedCallbackCannotRestoreCanceledRoute(t *testing.T) {
 	}
 	transport := &p2pRouteTestTransport{id: NewId()}
 	done := make(chan struct{})
+	var installed atomic.Bool
 	go func() {
-		updateP2pConnectionRoute(ctx, manager, transport, make(Route), true)
+		installed.Store(updateP2pConnectionRoute(ctx, manager, transport, make(Route), true))
 		close(done)
 	}()
 
@@ -77,5 +78,53 @@ func TestP2pLateConnectedCallbackCannotRestoreCanceledRoute(t *testing.T) {
 	}
 	if manager.removeCount.Load() != 1 {
 		t.Fatalf("compensating route removals=%d, want 1", manager.removeCount.Load())
+	}
+	if installed.Load() {
+		t.Fatal("late connected callback reported a canceled route as installed")
+	}
+}
+
+// Duplicate connection edges leave each active route gauge exact and return
+// it to zero after removal.
+func TestP2pActiveRouteStatsTrackIdempotentTransitions(t *testing.T) {
+	stats := &P2pDataPlaneStats{}
+	states := []P2pRouteState{}
+	transport := &P2pTransport{
+		peerId:   NewId(),
+		streamId: NewId(),
+		settings: &P2pTransportSettings{
+			DataPlaneStats: stats,
+			RouteStateObserver: func(state P2pRouteState) {
+				states = append(states, state)
+			},
+		},
+	}
+	var sendConnected atomic.Bool
+	var receiveConnected atomic.Bool
+	transport.observeRouteState(&sendConnected, true, true)
+	transport.observeRouteState(&sendConnected, true, true)
+	transport.observeRouteState(&receiveConnected, false, true)
+	transport.observeRouteState(&receiveConnected, false, true)
+	snapshot := stats.Snapshot()
+	if snapshot.ActiveSendRouteCount != 1 || snapshot.ActiveReceiveRouteCount != 1 {
+		t.Fatalf("active route counts after connect=%+v, want send=1 receive=1", snapshot)
+	}
+	transport.observeRouteState(&sendConnected, true, false)
+	transport.observeRouteState(&sendConnected, true, false)
+	transport.observeRouteState(&receiveConnected, false, false)
+	transport.observeRouteState(&receiveConnected, false, false)
+	snapshot = stats.Snapshot()
+	if snapshot.ActiveSendRouteCount != 0 || snapshot.ActiveReceiveRouteCount != 0 {
+		t.Fatalf("active route counts after disconnect=%+v, want send=0 receive=0", snapshot)
+	}
+	if len(states) != 4 {
+		t.Fatalf("route state observations=%d, want four real edges: %+v", len(states), states)
+	}
+	if states[0].PeerId != transport.peerId || states[0].StreamId != transport.streamId ||
+		!states[0].Send || !states[0].Connected ||
+		states[1].Send || !states[1].Connected ||
+		!states[2].Send || states[2].Connected ||
+		states[3].Send || states[3].Connected {
+		t.Fatalf("route state observations=%+v", states)
 	}
 }

@@ -84,7 +84,11 @@ func TestClosedPeerConnDropsLateSignals(t *testing.T) {
 	// the sanity probe briefly — the pin is that a LIVE conn buffers at all
 	sanityDeadline := time.Now().Add(5 * time.Second)
 	for {
-		err = manager.ReceiveExchangeSignals(source, lifecycleCandidateSignals(t, streamId, 1))
+		err = manager.ReceiveExchangeSignals(
+			source,
+			TransferKey{},
+			lifecycleCandidateSignals(t, streamId, 1),
+		)
 		AssertEqual(t, err, nil)
 		buffered := func() int {
 			pconn.signalLock.Lock()
@@ -134,7 +138,11 @@ func TestClosedPeerConnDropsLateSignals(t *testing.T) {
 	// late signals: dropped without error, without buffering, in bounded time
 	startTime := time.Now()
 	for i := 0; i < 100; i += 1 {
-		err = manager.ReceiveExchangeSignals(source, lifecycleCandidateSignals(t, streamId, 10))
+		err = manager.ReceiveExchangeSignals(
+			source,
+			TransferKey{},
+			lifecycleCandidateSignals(t, streamId, 10),
+		)
 		if err != nil {
 			t.Fatalf("late signals to a closed conn must be a no-op, not an error (batch %d): %v", i, err)
 		}
@@ -165,7 +173,9 @@ type blockingSignalSender struct {
 	blockedCount     int32
 }
 
-func (self *blockingSignalSender) SendSignal(path TransferPath, signal *protocol.Frame, opts ...any) {
+// SendSignal consumes one frame after modeling blocking or nonblocking delivery.
+func (self *blockingSignalSender) SendSignal(_ Id, signal *protocol.Frame, opts ...any) {
+	defer MessagePoolReturn(signal.MessageBytes)
 	for _, opt := range opts {
 		if _, ok := opt.(signalSendNonBlocking); ok {
 			atomic.AddInt32(&self.nonBlockingCount, 1)
@@ -222,7 +232,7 @@ func TestReceivePathSignalSendsDoNotBlock(t *testing.T) {
 	source.StreamId = streamId
 	done := make(chan error, 1)
 	go func() {
-		done <- manager.ReceiveExchangeSignals(source, &protocol.ExchangeSignals{
+		done <- manager.ReceiveExchangeSignals(source, TransferKey{}, &protocol.ExchangeSignals{
 			StreamId: streamId.Bytes(),
 			Signals: []*protocol.ExchangeSignal{{
 				SignalType: protocol.SignalType_WaitingForSdpOffer,

@@ -9,6 +9,7 @@ import (
 	"os"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 	// "fmt"
 )
@@ -159,6 +160,8 @@ func DefaultP2pTransportSettings() *P2pTransportSettings {
 		ConnectTimeout:        15 * time.Second,
 		ReconnectTimeout:      5 * time.Second,
 		AdmissionRetryTimeout: 30 * time.Second,
+		EndToEndProbeInterval: time.Second,
+		EndToEndProbeTimeout:  15 * time.Second,
 		// Four transfer batches absorb ordinary goroutine scheduling jitter.
 		// A real detached-data-channel measurement sustained the same
 		// 53-54 MiB/s at depths 1/4/8/32. Keeping 32 therefore added no
@@ -185,6 +188,43 @@ const (
 	PeerTypeDestination PeerType = "destination"
 )
 
+// A route observation identifies one installed local direction of a P2P
+// stream. Observers must not block.
+type P2pRouteState struct {
+	PeerId          Id
+	StreamId        Id
+	PeerType        PeerType
+	RouteManagerTag string
+	Send            bool
+	Connected       bool
+}
+
+// A health event identifies one endpoint probe transition. A fixed bounded
+// dispatcher isolates observers from transport workers and drops saturation.
+type P2pStreamProbeEvent struct {
+	Type       string
+	StreamId   Id
+	Nonce      Id
+	RouteEpoch uint64
+}
+
+const (
+	P2pStreamProbeEventRouteReady           = "route-ready"
+	P2pStreamProbeEventRouteCleared         = "route-cleared"
+	P2pStreamProbeEventRequestQueued        = "request-queued"
+	P2pStreamProbeEventRequestDropped       = "request-dropped"
+	P2pStreamProbeEventRequestReceived      = "request-received"
+	P2pStreamProbeEventResponseQueued       = "response-queued"
+	P2pStreamProbeEventResponseDropped      = "response-dropped"
+	P2pStreamProbeEventResponseReceived     = "response-received"
+	P2pStreamProbeEventResponseQueueFull    = "response-queue-full"
+	P2pStreamProbeEventResponseMatched      = "response-matched"
+	P2pStreamProbeEventResponseStale        = "response-stale"
+	P2pStreamProbeEventReadinessGranted     = "readiness-granted"
+	P2pStreamProbeEventReadinessWithdrawn   = "readiness-withdrawn"
+	P2pStreamProbeEventCompatibilityBackoff = "compatibility-backoff"
+)
+
 type P2pTransportSettings struct {
 	WriteTimeout     time.Duration
 	ReadTimeout      time.Duration
@@ -194,7 +234,13 @@ type P2pTransportSettings struct {
 	// peer-connection count/memory budget. Normal retries are woken
 	// immediately by a release, avoiding the former sub-second polling storm.
 	AdmissionRetryTimeout time.Duration
-	ChannelBufferSize     int
+	// EndToEndProbeInterval controls transport-local stream challenges between
+	// endpoints. Intermediaries relay these without application delivery.
+	EndToEndProbeInterval time.Duration
+	// EndToEndProbeTimeout withdraws a shared stream alias when challenge
+	// responses stop crossing the complete path.
+	EndToEndProbeTimeout time.Duration
+	ChannelBufferSize    int
 	// InitialReadBufferByteCount is the first pooled receive size.
 	// io.ErrShortBuffer retries with Pion's exact required length up to
 	// MaxMessageByteCount without consuming the queued SCTP message.
@@ -213,11 +259,32 @@ type P2pTransportSettings struct {
 	// DataPlaneStats observes the actual negotiated lane. It may be nil when
 	// callers do not need instrumentation.
 	DataPlaneStats *P2pDataPlaneStats
+	// RouteStateObserver is a nil-by-default integration seam for deterministic
+	// route attribution. It must not block.
+	RouteStateObserver func(P2pRouteState)
+	// EndToEndProbeObserver is a nil-by-default diagnostic seam for endpoint
+	// stream readiness. A fixed worker shard invokes it out of band; events are
+	// dropped when that bounded shard queue is saturated.
+	EndToEndProbeObserver func(P2pStreamProbeEvent)
+	// Nil test barrier pauses one association after route cleanup but before its
+	// done publication.
+	beforeRunDoneForTest func(Id, PeerType)
+	// Nil test hooks expose child generations created by the parent transport.
+	afterSendTransportForTest    func(*P2pSendTransport)
+	afterReceiveTransportForTest func(*P2pReceiveTransport)
+	// Nil test hooks expose connected-callback admission and route mutation.
+	beforeRouteUpdateForTest       func(send bool)
+	afterRouteUpdateForTest        func(send bool)
+	beforeRouteCallbackJoinForTest func(send bool)
+	// Nil test barrier pauses a low-level receive worker before it replaces the
+	// inherited handshake deadline with its steady-state deadline.
+	beforeReceiveSteadyStateDeadlineClearForTest func()
 }
 
 type P2pTransport struct {
 	ctx    context.Context
 	cancel context.CancelFunc
+	done   chan struct{}
 
 	client *Client
 
@@ -229,6 +296,9 @@ type P2pTransport struct {
 	peerId   Id
 	streamId Id
 	peerType PeerType
+	// endpointProbe is enabled only where the multihop stream terminates.
+	// Intermediaries must relay the reserved envelope unchanged.
+	endpointProbe bool
 
 	settings *P2pTransportSettings
 }
@@ -236,6 +306,13 @@ type P2pTransport struct {
 type p2pRouteManager interface {
 	UpdateTransport(Transport, []Route)
 	RemoveTransport(Transport)
+}
+
+// p2pConnectionRouteTestHooks exposes the two sides of a connected route
+// mutation. Production calls leave both fields nil.
+type p2pConnectionRouteTestHooks struct {
+	beforeConnectedUpdate func()
+	afterConnectedUpdate  func()
 }
 
 // updateP2pConnectionRoute prevents a connected callback that was already in
@@ -248,17 +325,99 @@ func updateP2pConnectionRoute(
 	transport Transport,
 	route Route,
 	connected bool,
-) {
+	testHooks ...p2pConnectionRouteTestHooks,
+) bool {
 	if connected && ctx.Err() == nil {
+		var hooks p2pConnectionRouteTestHooks
+		if 0 < len(testHooks) {
+			hooks = testHooks[0]
+		}
+		if hooks.beforeConnectedUpdate != nil {
+			hooks.beforeConnectedUpdate()
+		}
 		manager.UpdateTransport(transport, []Route{route})
+		if hooks.afterConnectedUpdate != nil {
+			hooks.afterConnectedUpdate()
+		}
 		if ctx.Err() != nil {
 			manager.RemoveTransport(transport)
+			return false
 		}
-		return
+		return true
 	}
 	manager.RemoveTransport(transport)
+	return false
 }
 
+// Route gauges change only when a connection callback crosses the installed
+// boundary, so duplicate callbacks cannot overcount an adjacency.
+func updateP2pActiveRouteCount(
+	stats *P2pDataPlaneStats,
+	connectedState *atomic.Bool,
+	send bool,
+	connected bool,
+) bool {
+	var activeRouteCount *atomic.Int64
+	if stats != nil {
+		if send {
+			activeRouteCount = &stats.activeSendRouteCount
+		} else {
+			activeRouteCount = &stats.activeReceiveRouteCount
+		}
+	}
+	if connected {
+		if connectedState.CompareAndSwap(false, true) {
+			if activeRouteCount != nil {
+				activeRouteCount.Add(1)
+			}
+			return true
+		}
+		return false
+	}
+	if connectedState.CompareAndSwap(true, false) {
+		if activeRouteCount != nil {
+			activeRouteCount.Add(-1)
+		}
+		return true
+	}
+	return false
+}
+
+// The optional route observer sees only real state edges, never duplicate
+// connection callbacks.
+func (self *P2pTransport) observeRouteState(
+	connectedState *atomic.Bool,
+	send bool,
+	connected bool,
+) {
+	changed := updateP2pActiveRouteCount(
+		self.settings.DataPlaneStats,
+		connectedState,
+		send,
+		connected,
+	)
+	if changed && self.settings.RouteStateObserver != nil {
+		routeManager := self.receiveRouteManager
+		if send {
+			routeManager = self.sendRouteManager
+		}
+		routeManagerTag := ""
+		if routeManager != nil {
+			routeManagerTag = routeManager.clientTag
+		}
+		self.settings.RouteStateObserver(P2pRouteState{
+			PeerId:          self.peerId,
+			StreamId:        self.streamId,
+			PeerType:        self.peerType,
+			RouteManagerTag: routeManagerTag,
+			Send:            send,
+			Connected:       connected,
+		})
+	}
+}
+
+// Starts one peer association. Stream endpoints use the internal variant to
+// terminate end-to-end health envelopes; ordinary/direct callers do not.
 func NewP2pTransport(
 	ctx context.Context,
 	client *Client,
@@ -271,10 +430,39 @@ func NewP2pTransport(
 	peerType PeerType,
 	settings *P2pTransportSettings,
 ) *P2pTransport {
+	return newP2pTransport(
+		ctx,
+		client,
+		webRtcManager,
+		sendRouteManager,
+		receiveRouteManager,
+		peerId,
+		streamId,
+		peerType,
+		settings,
+		false,
+	)
+}
+
+// Builds one association and optionally terminates the raw end-to-end health
+// envelope. Only StreamSequence endpoints enable the final argument.
+func newP2pTransport(
+	ctx context.Context,
+	client *Client,
+	webRtcManager *WebRtcManager,
+	sendRouteManager *RouteManager,
+	receiveRouteManager *RouteManager,
+	peerId Id,
+	streamId Id,
+	peerType PeerType,
+	settings *P2pTransportSettings,
+	endpointProbe bool,
+) *P2pTransport {
 	cancelCtx, cancel := context.WithCancel(ctx)
 	p2pTransport := &P2pTransport{
 		ctx:                 cancelCtx,
 		cancel:              cancel,
+		done:                make(chan struct{}),
 		client:              client,
 		webRtcManager:       webRtcManager,
 		sendRouteManager:    sendRouteManager,
@@ -282,6 +470,7 @@ func NewP2pTransport(
 		peerId:              peerId,
 		streamId:            streamId,
 		peerType:            peerType,
+		endpointProbe:       endpointProbe,
 		settings:            settings,
 	}
 	go HandleError(p2pTransport.run, cancel)
@@ -376,6 +565,10 @@ func (self *p2pSetupFailureStreak) Recover() bool {
 
 func (self *P2pTransport) run() {
 	defer self.cancel()
+	defer close(self.done)
+	if self.settings.beforeRunDoneForTest != nil {
+		defer self.settings.beforeRunDoneForTest(self.streamId, self.peerType)
+	}
 
 	var setupFailure p2pSetupFailureStreak
 	var admissionTimer *time.Timer
@@ -487,6 +680,16 @@ func (self *P2pTransport) run() {
 
 			handleCtx, handleCancel := context.WithCancel(self.ctx)
 			defer handleCancel()
+			var streamProbe *p2pStreamProbe
+			if self.endpointProbe {
+				streamProbe = newP2pStreamProbe(
+					handleCtx,
+					self.sendRouteManager,
+					self.streamId,
+					self.settings,
+				)
+				defer streamProbe.close()
+			}
 
 			// The peer's ready header must be consumed by exactly one reader
 			// before the receive transport starts. Because the channel is
@@ -494,8 +697,14 @@ func (self *P2pTransport) run() {
 			// transfer frames delivered ahead of the marker.
 			headerRead := make(chan [][]byte)
 			setupReady := make(chan struct{})
+			var routeWorkers sync.WaitGroup
+			var p2pSendTransport *P2pSendTransport
+			var p2pReceiveTransport *P2pReceiveTransport
+			sendRouteRetired := make(chan struct{})
+			routeWorkers.Add(2)
 
 			go HandleError(func() {
+				defer routeWorkers.Done()
 				defer handleCancel()
 
 				conn.SetWriteDeadline(time.Now().Add(self.settings.ConnectTimeout))
@@ -512,6 +721,10 @@ func (self *P2pTransport) run() {
 				case prefetched = <-headerRead:
 				}
 
+				var messageHandler func([]byte) bool
+				if streamProbe != nil {
+					messageHandler = streamProbe.handle
+				}
 				t, route := newP2pReceiveTransport(
 					handleCtx,
 					handleCancel,
@@ -519,21 +732,57 @@ func (self *P2pTransport) run() {
 					self.streamId,
 					self.settings,
 					prefetched,
+					messageHandler,
 				)
+				p2pReceiveTransport = t.(*P2pReceiveTransport)
+				if self.settings.afterReceiveTransportForTest != nil {
+					self.settings.afterReceiveTransportForTest(p2pReceiveTransport)
+				}
 
-				updateRoute := func(connected bool) {
-					updateP2pConnectionRoute(
+				var routeConnected atomic.Bool
+				routeCallbacks := newLifecycleAdmission()
+				applyRoute := func(connected bool) {
+					routeInstalled := updateP2pConnectionRoute(
 						handleCtx,
 						self.receiveRouteManager,
 						t,
 						route,
 						connected,
+						p2pConnectionRouteTestHooks{
+							beforeConnectedUpdate: func() {
+								if self.settings.beforeRouteUpdateForTest != nil {
+									self.settings.beforeRouteUpdateForTest(false)
+								}
+							},
+							afterConnectedUpdate: func() {
+								if self.settings.afterRouteUpdateForTest != nil {
+									self.settings.afterRouteUpdateForTest(false)
+								}
+							},
+						},
 					)
+					self.observeRouteState(
+						&routeConnected,
+						false,
+						routeInstalled,
+					)
+				}
+				updateRoute := func(connected bool) {
+					if !routeCallbacks.start() {
+						return
+					}
+					defer routeCallbacks.finish()
+					applyRoute(connected)
 				}
 				unsub := conn.AddConnectedCallback(updateRoute)
 				defer func() {
 					unsub()
-					updateRoute(false)
+					routeCallbacks.close()
+					if self.settings.beforeRouteCallbackJoinForTest != nil {
+						self.settings.beforeRouteCallbackJoinForTest(false)
+					}
+					<-routeCallbacks.Done()
+					applyRoute(false)
 				}()
 
 				select {
@@ -543,6 +792,7 @@ func (self *P2pTransport) run() {
 			}, handleCancel)
 
 			go HandleError(func() {
+				defer routeWorkers.Done()
 				defer handleCancel()
 
 				select {
@@ -578,21 +828,71 @@ func (self *P2pTransport) run() {
 				// streak.
 				close(setupReady)
 
-				t, route := NewP2pSendTransportForPeer(handleCtx, handleCancel, conn, self.peerId, self.streamId, self.settings)
-
-				updateRoute := func(connected bool) {
-					updateP2pConnectionRoute(
+				t, route := newP2pSendTransportForPeer(
+					handleCtx,
+					handleCancel,
+					conn,
+					self.peerId,
+					self.streamId,
+					self.settings,
+					self.endpointProbe,
+					sendRouteRetired,
+				)
+				p2pSendTransport = t.(*P2pSendTransport)
+				if self.settings.afterSendTransportForTest != nil {
+					self.settings.afterSendTransportForTest(p2pSendTransport)
+				}
+				var routeConnected atomic.Bool
+				routeCallbacks := newLifecycleAdmission()
+				applyRoute := func(connected bool) {
+					if streamProbe != nil && !connected {
+						streamProbe.clearSendRoute(t, route)
+					}
+					routeInstalled := updateP2pConnectionRoute(
 						handleCtx,
 						self.sendRouteManager,
 						t,
 						route,
 						connected,
+						p2pConnectionRouteTestHooks{
+							beforeConnectedUpdate: func() {
+								if self.settings.beforeRouteUpdateForTest != nil {
+									self.settings.beforeRouteUpdateForTest(true)
+								}
+							},
+							afterConnectedUpdate: func() {
+								if self.settings.afterRouteUpdateForTest != nil {
+									self.settings.afterRouteUpdateForTest(true)
+								}
+							},
+						},
 					)
+					if streamProbe != nil && routeInstalled {
+						streamProbe.setSendRoute(t, route)
+					}
+					self.observeRouteState(
+						&routeConnected,
+						true,
+						routeInstalled,
+					)
+				}
+				updateRoute := func(connected bool) {
+					if !routeCallbacks.start() {
+						return
+					}
+					defer routeCallbacks.finish()
+					applyRoute(connected)
 				}
 				unsub := conn.AddConnectedCallback(updateRoute)
 				defer func() {
 					unsub()
-					updateRoute(false)
+					routeCallbacks.close()
+					if self.settings.beforeRouteCallbackJoinForTest != nil {
+						self.settings.beforeRouteCallbackJoinForTest(true)
+					}
+					<-routeCallbacks.Done()
+					applyRoute(false)
+					close(sendRouteRetired)
 				}()
 
 				select {
@@ -620,6 +920,15 @@ func (self *P2pTransport) run() {
 				default:
 				}
 			}
+			handleCancel()
+			_ = conn.Close()
+			routeWorkers.Wait()
+			if p2pSendTransport != nil {
+				<-p2pSendTransport.done
+			}
+			if p2pReceiveTransport != nil {
+				<-p2pReceiveTransport.done
+			}
 		}
 
 		c()
@@ -633,19 +942,84 @@ func (self *P2pTransport) run() {
 	}
 }
 
+// Close cancels this caller-owned association without joining its children.
+func (self *P2pTransport) Close() {
+	self.cancel()
+}
+
+// Done closes after endpoint readiness, installed routes, and physical send
+// and receive child generations have all been removed.
+func (self *P2pTransport) Done() <-chan struct{} {
+	return self.done
+}
+
+// CloseAndWait cancels this caller-owned association and joins its complete
+// route tree, or returns when ctx expires. It may be retried with a fresh ctx.
+func (self *P2pTransport) CloseAndWait(ctx context.Context) error {
+	self.Close()
+	return waitForLifecycleDone(ctx, self.done, "P2P transport")
+}
+
+// Cancels the association and waits until its endpoint readiness lease and
+// installed routes have been removed.
+func (self *P2pTransport) close() {
+	self.Close()
+	<-self.done
+}
+
+// P2pRouteLifecycle is the caller-owned lifetime exposed by the deprecated
+// low-level P2P route constructors. Callers must first stop route producers
+// and remove the returned route from every RouteManager, then call
+// CloseAndWait before reclaiming the route or connection. Close never closes
+// the caller-owned connection.
+type P2pRouteLifecycle interface {
+	Transport
+	Close()
+	Done() <-chan struct{}
+	CloseAndWait(context.Context) error
+}
+
+var (
+	_ P2pRouteLifecycle = (*P2pSendTransport)(nil)
+	_ P2pRouteLifecycle = (*P2pReceiveTransport)(nil)
+)
+
 type P2pSendTransport struct {
 	transportId Id
 
-	ctx      context.Context
-	cancel   context.CancelFunc
-	conn     net.Conn
-	peerId   Id
-	streamId Id
-	send     chan []byte
+	ctx       context.Context
+	cancel    context.CancelFunc
+	conn      net.Conn
+	peerId    Id
+	streamId  Id
+	send      chan []byte
+	done      chan struct{}
+	closeOnce sync.Once
+
+	endToEndReadinessRequired bool
+	endToEndReady             atomic.Bool
+	// probeSendAdmission joins direct endpoint-probe producers before the send
+	// worker performs its final pooled-route drain.
+	probeSendAdmission p2pProbeSendAdmission
+	// Parent-owned routes close this only after RemoveTransport has joined all
+	// admitted writer snapshots. Standalone transports leave it nil.
+	routeRetired <-chan struct{}
+	// Test seams are nil in production and expose the final probe admission
+	// close/drain boundary without changing transport timing.
+	testingAfterProbeSendAdmissionClosed func()
+	testingBeforeRouteRetirementWait     func()
+	testingAfterRouteRetirementWait      func()
+	testingAfterProbeSendDrain           func()
 
 	settings *P2pTransportSettings
 }
 
+// NewP2pSendTransport creates one caller-owned send route.
+//
+// Deprecated: prefer NewP2pTransport, which owns both directions and their
+// RouteManager lifetime. Compatibility callers must assert the returned
+// Transport to P2pRouteLifecycle and call CloseAndWait after quiescing and
+// removing all route producers.
 func NewP2pSendTransport(
 	ctx context.Context,
 	cancel context.CancelFunc,
@@ -656,9 +1030,13 @@ func NewP2pSendTransport(
 	return NewP2pSendTransportForPeer(ctx, cancel, conn, Id{}, streamId, settings)
 }
 
-// NewP2pSendTransportForPeer creates a P2P route that can be selected by both
-// peer and stream. NewP2pSendTransport retains the pre-peer-id signature as a
-// deprecated stream-only compatibility entry point.
+// NewP2pSendTransportForPeer creates one caller-owned P2P route that can be
+// selected by both peer and stream.
+//
+// Deprecated: prefer NewP2pTransport, which owns both directions and their
+// RouteManager lifetime. Compatibility callers must assert the returned
+// Transport to P2pRouteLifecycle and call CloseAndWait after quiescing and
+// removing all route producers.
 func NewP2pSendTransportForPeer(
 	ctx context.Context,
 	cancel context.CancelFunc,
@@ -667,37 +1045,105 @@ func NewP2pSendTransportForPeer(
 	streamId Id,
 	settings *P2pTransportSettings,
 ) (Transport, Route) {
+	return newP2pSendTransportForPeer(
+		ctx,
+		cancel,
+		conn,
+		peerId,
+		streamId,
+		settings,
+		false,
+		nil,
+	)
+}
+
+// Builds one send generation. Endpoint stream transports begin ineligible;
+// intermediary and direct compatibility transports begin ready.
+func newP2pSendTransportForPeer(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	conn net.Conn,
+	peerId Id,
+	streamId Id,
+	settings *P2pTransportSettings,
+	endToEndReadinessRequired bool,
+	routeRetired <-chan struct{},
+) (Transport, Route) {
 	send := make(chan []byte, settings.ChannelBufferSize)
 	p2pSendTransport := &P2pSendTransport{
-		transportId: NewId(),
-		ctx:         ctx,
-		cancel:      cancel,
-		conn:        conn,
-		peerId:      peerId,
-		streamId:    streamId,
-		send:        send,
-		settings:    settings,
+		transportId:               NewId(),
+		ctx:                       ctx,
+		cancel:                    cancel,
+		conn:                      conn,
+		peerId:                    peerId,
+		streamId:                  streamId,
+		send:                      send,
+		done:                      make(chan struct{}),
+		endToEndReadinessRequired: endToEndReadinessRequired,
+		routeRetired:              routeRetired,
+		settings:                  settings,
+	}
+	p2pSendTransport.probeSendAdmission.open = true
+	if !endToEndReadinessRequired {
+		p2pSendTransport.endToEndReady.Store(true)
 	}
 	go HandleError(p2pSendTransport.run, cancel)
 	return p2pSendTransport, send
 }
 
+// Close cancels this send route without closing its caller-owned connection.
+func (self *P2pSendTransport) Close() {
+	self.closeOnce.Do(self.cancel)
+}
+
+// Done closes after all admitted probe producers and queued pooled messages
+// have been joined and released.
+func (self *P2pSendTransport) Done() <-chan struct{} {
+	return self.done
+}
+
+// CloseAndWait cancels this send route and joins its owned worker. The caller
+// must quiesce and remove external RouteManager producers first. A timed-out
+// join may be retried with a fresh context.
+func (self *P2pSendTransport) CloseAndWait(ctx context.Context) error {
+	self.Close()
+	return waitForLifecycleDone(ctx, self.done, "P2P send transport")
+}
+
 func (self *P2pSendTransport) run() {
-	defer self.cancel()
-	// drain any pooled bytes the route manager already enqueued; the route
-	// manager removes the transport asynchronously, so a brief window remains
-	// where it may have written and the writer never consumed.
+	defer close(self.done)
 	defer func() {
+		self.probeSendAdmission.close()
+		if self.testingAfterProbeSendAdmissionClosed != nil {
+			self.testingAfterProbeSendAdmissionClosed()
+		}
+		self.cancel()
+		self.probeSendAdmission.wait()
+		if self.routeRetired != nil {
+			if self.testingBeforeRouteRetirementWait != nil {
+				self.testingBeforeRouteRetirementWait()
+			}
+			<-self.routeRetired
+			if self.testingAfterRouteRetirementWait != nil {
+				self.testingAfterRouteRetirementWait()
+			}
+		}
+		// Drain any pooled bytes the route manager or an admitted endpoint probe
+		// already enqueued before teardown closed both admission paths.
+	drainProbeRoute:
 		for {
 			select {
 			case b, ok := <-self.send:
 				if !ok {
-					return
+					break drainProbeRoute
 				}
 				MessagePoolReturn(b)
 			default:
-				return
+				break drainProbeRoute
 			}
+		}
+		if self.testingAfterProbeSendDrain != nil {
+			self.testingAfterProbeSendDrain()
 		}
 	}()
 
@@ -720,6 +1166,7 @@ func (self *P2pSendTransport) run() {
 				return
 			}
 			messageByteCount := len(transferFrameBytes)
+			probeMessage := isP2pStreamProbe(transferFrameBytes)
 			fastConn, supportsFastPath := self.conn.(webRtcFastPathConn)
 			if self.settings.DataPlaneMode != P2pDataPlaneModeLegacyOnly {
 				if supportsFastPath &&
@@ -730,7 +1177,7 @@ func (self *P2pSendTransport) run() {
 				if supportsFastPath && fastConn.FastPathReady() {
 					fragmentCount, err := fastConn.WriteFastPathMessage(transferFrameBytes)
 					if err == nil {
-						if stats := self.settings.DataPlaneStats; stats != nil {
+						if stats := self.settings.DataPlaneStats; stats != nil && !probeMessage {
 							stats.fastSendMessageCount.Add(1)
 							stats.fastSendByteCount.Add(uint64(messageByteCount))
 							stats.fastSendFragmentCount.Add(uint64(fragmentCount))
@@ -738,7 +1185,7 @@ func (self *P2pSendTransport) run() {
 						MessagePoolReturn(transferFrameBytes)
 						continue
 					}
-					if stats := self.settings.DataPlaneStats; stats != nil {
+					if stats := self.settings.DataPlaneStats; stats != nil && !probeMessage {
 						stats.fastFallbackCount.Add(1)
 					}
 					if self.settings.DataPlaneMode == P2pDataPlaneModeFastOnly {
@@ -747,7 +1194,7 @@ func (self *P2pSendTransport) run() {
 						return
 					}
 				} else {
-					if stats := self.settings.DataPlaneStats; stats != nil {
+					if stats := self.settings.DataPlaneStats; stats != nil && !probeMessage {
 						stats.fastFallbackCount.Add(1)
 					}
 					if self.settings.DataPlaneMode == P2pDataPlaneModeFastOnly {
@@ -768,7 +1215,7 @@ func (self *P2pSendTransport) run() {
 				DefaultLogger().V(1).Infof("[p2p]s(%s) send write err = %s\n", self.streamId, err)
 				return
 			}
-			if stats := self.settings.DataPlaneStats; stats != nil {
+			if stats := self.settings.DataPlaneStats; stats != nil && !probeMessage {
 				stats.legacySendMessageCount.Add(1)
 				stats.legacySendByteCount.Add(uint64(messageByteCount))
 			}
@@ -801,6 +1248,9 @@ func (self *P2pSendTransport) RouteWeight(stats *RouteStats, remainingStats map[
 }
 
 func (self *P2pSendTransport) MatchesSend(destination TransferPath) bool {
+	if self.endToEndReadinessRequired && !self.endToEndReady.Load() {
+		return false
+	}
 	if destination.StreamId == self.streamId {
 		return true
 	}
@@ -809,6 +1259,12 @@ func (self *P2pSendTransport) MatchesSend(destination TransferPath) bool {
 	// the peer id must be non-zero so that a missing peer never matches
 	// destination masks without a destination id (e.g. control or pure stream masks)
 	return self.peerId != (Id{}) && destination.DestinationId == self.peerId
+}
+
+// Changes endpoint eligibility after an exact-stream challenge round trip.
+// The caller rematches this transport in its RouteManager on a true return.
+func (self *P2pSendTransport) setEndToEndReady(ready bool) bool {
+	return self.endToEndReady.Swap(ready) != ready
 }
 
 func (self *P2pSendTransport) MatchesReceive(destination TransferPath) bool {
@@ -832,15 +1288,27 @@ func (self *P2pSendTransport) Downgrade(source TransferPath) {
 type P2pReceiveTransport struct {
 	transportId Id
 
-	ctx      context.Context
-	cancel   context.CancelFunc
-	conn     net.Conn
-	streamId Id
-	receive  chan []byte
+	ctx       context.Context
+	cancel    context.CancelFunc
+	conn      net.Conn
+	streamId  Id
+	receive   chan []byte
+	done      chan struct{}
+	closeOnce sync.Once
+	// messageHandler consumes endpoint-only raw stream control before Client.
+	messageHandler func([]byte) bool
 
 	settings *P2pTransportSettings
+	// Nil test barrier pauses after pooled receive drain and before done.
+	testingBeforeDoneForTest func()
 }
 
+// NewP2pReceiveTransport creates one caller-owned receive route.
+//
+// Deprecated: prefer NewP2pTransport, which owns both directions and their
+// RouteManager lifetime. Compatibility callers must assert the returned
+// Transport to P2pRouteLifecycle and call CloseAndWait after quiescing and
+// removing all route consumers.
 func NewP2pReceiveTransport(
 	ctx context.Context,
 	cancel context.CancelFunc,
@@ -848,7 +1316,7 @@ func NewP2pReceiveTransport(
 	streamId Id,
 	settings *P2pTransportSettings,
 ) (Transport, Route) {
-	return newP2pReceiveTransport(ctx, cancel, conn, streamId, settings, nil)
+	return newP2pReceiveTransport(ctx, cancel, conn, streamId, settings, nil, nil)
 }
 
 func newP2pReceiveTransport(
@@ -858,25 +1326,56 @@ func newP2pReceiveTransport(
 	streamId Id,
 	settings *P2pTransportSettings,
 	prefetched [][]byte,
+	messageHandler func([]byte) bool,
 ) (Transport, Route) {
 	receive := make(chan []byte, settings.ChannelBufferSize)
-	for _, message := range prefetched {
-		receive <- message
-	}
 	p2pReceiveTransport := &P2pReceiveTransport{
-		transportId: NewId(),
-		ctx:         ctx,
-		cancel:      cancel,
-		conn:        conn,
-		streamId:    streamId,
-		receive:     receive,
-		settings:    settings,
+		transportId:    NewId(),
+		ctx:            ctx,
+		cancel:         cancel,
+		conn:           conn,
+		streamId:       streamId,
+		receive:        receive,
+		done:           make(chan struct{}),
+		messageHandler: messageHandler,
+		settings:       settings,
+	}
+	for _, message := range prefetched {
+		if messageHandler != nil && messageHandler(message) {
+			MessagePoolReturn(message)
+			continue
+		}
+		receive <- message
 	}
 	go HandleError(p2pReceiveTransport.run, cancel)
 	return p2pReceiveTransport, receive
 }
 
+// Close cancels this receive route and interrupts its read without closing the
+// caller-owned connection. Setting an expired deadline is safe for the paired
+// direction and makes a blocked compatibility net.Conn return promptly.
+func (self *P2pReceiveTransport) Close() {
+	self.closeOnce.Do(func() {
+		self.cancel()
+		_ = self.conn.SetReadDeadline(time.Now())
+	})
+}
+
+// Done closes after both receive lanes and all queued pooled messages have
+// been joined and released.
+func (self *P2pReceiveTransport) Done() <-chan struct{} {
+	return self.done
+}
+
+// CloseAndWait cancels this receive route and joins its owned workers. A
+// timed-out join may be retried with a fresh context.
+func (self *P2pReceiveTransport) CloseAndWait(ctx context.Context) error {
+	self.Close()
+	return waitForLifecycleDone(ctx, self.done, "P2P receive transport")
+}
+
 func (self *P2pReceiveTransport) run() {
+	defer close(self.done)
 	var fastWorker sync.WaitGroup
 	if fastConn, ok := self.conn.(webRtcFastPathConn); ok &&
 		self.settings.DataPlaneMode != P2pDataPlaneModeLegacyOnly {
@@ -891,6 +1390,11 @@ func (self *P2pReceiveTransport) run() {
 	defer func() {
 		self.cancel()
 		fastWorker.Wait()
+		defer func() {
+			if self.testingBeforeDoneForTest != nil {
+				self.testingBeforeDoneForTest()
+			}
+		}()
 		for {
 			select {
 			case b, ok := <-self.receive:
@@ -920,9 +1424,19 @@ func (self *P2pReceiveTransport) run() {
 	// Connection liveness comes from ICE/PeerConnection failed-state
 	// cancellation; rearming an otherwise ignored 15-second read timeout only
 	// woke every idle peer forever.
+	if self.settings.beforeReceiveSteadyStateDeadlineClearForTest != nil {
+		self.settings.beforeReceiveSteadyStateDeadlineClearForTest()
+	}
 	self.conn.SetReadDeadline(time.Time{})
 
 	for {
+		// Close expires the read deadline after canceling. Cancellation may win
+		// immediately before the steady-state clear above, so this one exact
+		// pre-read guard prevents that clear from losing the interrupt and
+		// entering an unbounded read. It also gates every subsequent read.
+		if self.ctx.Err() != nil {
+			return
+		}
 		transferFrameBytes, err := readP2pMessage(
 			self.conn,
 			initialReadByteCount,
@@ -930,9 +1444,14 @@ func (self *P2pReceiveTransport) run() {
 			maxReadByteCount,
 		)
 		if 0 < len(transferFrameBytes) {
+			probeMessage := isP2pStreamProbe(transferFrameBytes)
+			if self.messageHandler != nil && self.messageHandler(transferFrameBytes) {
+				MessagePoolReturn(transferFrameBytes)
+				continue
+			}
 			if self.settings.DataPlaneMode == P2pDataPlaneModeFastOnly {
 				MessagePoolReturn(transferFrameBytes)
-				if stats := self.settings.DataPlaneStats; stats != nil {
+				if stats := self.settings.DataPlaneStats; stats != nil && !probeMessage {
 					stats.fastDropCount.Add(1)
 				}
 				continue
@@ -943,7 +1462,7 @@ func (self *P2pReceiveTransport) run() {
 				MessagePoolReturn(transferFrameBytes)
 				return
 			case self.receive <- transferFrameBytes:
-				if stats := self.settings.DataPlaneStats; stats != nil {
+				if stats := self.settings.DataPlaneStats; stats != nil && !probeMessage {
 					stats.legacyReceiveMessageCount.Add(1)
 					stats.legacyReceiveByteCount.Add(uint64(len(transferFrameBytes)))
 				}
@@ -974,12 +1493,17 @@ func (self *P2pReceiveTransport) runFast(conn webRtcFastPathConn) {
 			if !ok {
 				return
 			}
+			probeMessage := isP2pStreamProbe(received.message)
+			if self.messageHandler != nil && self.messageHandler(received.message) {
+				MessagePoolReturn(received.message)
+				continue
+			}
 			select {
 			case <-self.ctx.Done():
 				MessagePoolReturn(received.message)
 				return
 			case self.receive <- received.message:
-				if stats := self.settings.DataPlaneStats; stats != nil {
+				if stats := self.settings.DataPlaneStats; stats != nil && !probeMessage {
 					stats.fastReceiveMessageCount.Add(1)
 					stats.fastReceiveByteCount.Add(uint64(len(received.message)))
 					stats.fastReceiveFragmentCount.Add(uint64(received.fragmentCount))

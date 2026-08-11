@@ -31,6 +31,7 @@ import (
 	// "flag"
 	"log"
 	"math/big"
+	"sync"
 
 	// "crypto/md5"
 	"encoding/binary"
@@ -79,11 +80,30 @@ type ExtenderSettings struct {
 	WriteTimeout time.Duration
 	ValidFrom    time.Duration
 	ValidFor     time.Duration
+	// Listen, when set, binds the outer TLS listener. Userspace integration
+	// tests use it to place the production extender on a simulated TUN. Nil
+	// retains net.Listen. The extender owns and closes returned listeners.
+	Listen func(network string, address string) (net.Listener, error)
+	// DialContext, when set, creates the forwarded inner connection. Userspace
+	// integration tests use it for the extender-to-connect segment. Nil
+	// retains forwardDialer. The extender owns and closes returned connections.
+	DialContext connect.DialContextFunction
+	// ErrorHandler, when set, receives connection-stage failures. Measurement
+	// tests use it to make an otherwise client-visible timeout attributable.
+	// It runs synchronously and must not block. Nil retains the silent
+	// production behavior.
+	ErrorHandler func(stage string, err error)
 }
 
 type ExtenderServer struct {
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	stateLock   sync.Mutex
+	closing     bool
+	listeners   map[*extenderOwnedListener]bool
+	connections map[*extenderOwnedConnection]bool
+	workers     sync.WaitGroup
 
 	requireSignature bool
 	allowedSecrets   []string
@@ -94,6 +114,16 @@ type ExtenderServer struct {
 	forwardDialer *net.Dialer
 
 	settings *ExtenderSettings
+}
+
+// An extenderOwnedListener identifies one listener in the shutdown set.
+type extenderOwnedListener struct {
+	listener net.Listener
+}
+
+// An extenderOwnedConnection identifies one connection in the shutdown set.
+type extenderOwnedConnection struct {
+	connection net.Conn
 }
 
 func NewExtenderServerWithDefaults(
@@ -126,6 +156,8 @@ func NewExtenderServer(
 	return &ExtenderServer{
 		ctx:            cancelCtx,
 		cancel:         cancel,
+		listeners:      map[*extenderOwnedListener]bool{},
+		connections:    map[*extenderOwnedConnection]bool{},
 		allowedSecrets: allowedSecrets,
 		allowedHosts:   allowedHosts,
 		ports:          ports,
@@ -135,9 +167,82 @@ func NewExtenderServer(
 
 }
 
-func (self *ExtenderServer) ListenAndServe() error {
+// Begins one owned server operation unless shutdown has already started.
+func (self *ExtenderServer) beginWorker() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.closing {
+		return false
+	}
+	self.workers.Add(1)
+	return true
+}
 
-	listeners := map[int]net.Listener{}
+// Completes one owned server operation.
+func (self *ExtenderServer) endWorker() {
+	self.workers.Done()
+}
+
+// Adds a listener to the resources interrupted by Close.
+func (self *ExtenderServer) addListener(listener net.Listener) (*extenderOwnedListener, bool) {
+	ownedListener := &extenderOwnedListener{listener: listener}
+	self.stateLock.Lock()
+	if self.closing {
+		self.stateLock.Unlock()
+		listener.Close()
+		return nil, false
+	}
+	self.listeners[ownedListener] = true
+	self.stateLock.Unlock()
+	return ownedListener, true
+}
+
+// Removes a listener after its serving operation has released it.
+func (self *ExtenderServer) removeListener(ownedListener *extenderOwnedListener) {
+	self.stateLock.Lock()
+	delete(self.listeners, ownedListener)
+	self.stateLock.Unlock()
+}
+
+// Runs a connection handler whose socket is interrupted and joined at Close.
+func (self *ExtenderServer) startConnection(connection net.Conn) {
+	ownedConnection := &extenderOwnedConnection{connection: connection}
+	self.stateLock.Lock()
+	if self.closing {
+		self.stateLock.Unlock()
+		connection.Close()
+		return
+	}
+	self.connections[ownedConnection] = true
+	self.workers.Add(1)
+	self.stateLock.Unlock()
+
+	go func() {
+		defer func() {
+			self.stateLock.Lock()
+			delete(self.connections, ownedConnection)
+			self.stateLock.Unlock()
+			self.workers.Done()
+		}()
+		self.HandleExtenderConnection(self.ctx, connection)
+	}()
+}
+
+// ListenAndServe owns every accepted listener and connection until shutdown.
+func (self *ExtenderServer) ListenAndServe() error {
+	if !self.beginWorker() {
+		return self.ctx.Err()
+	}
+	defer self.endWorker()
+	defer self.Close()
+
+	listeners := map[int]*extenderOwnedListener{}
+	defer func() {
+		for _, ownedListener := range listeners {
+			ownedListener.listener.Close()
+			self.removeListener(ownedListener)
+		}
+	}()
 	// quicListeners := map[int]*quic.Listener{}
 
 	for port, connectModes := range self.ports {
@@ -145,32 +250,53 @@ func (self *ExtenderServer) ListenAndServe() error {
 			continue
 		}
 
-		fmt.Printf("listen tcp %d\n", port)
-		listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		log.Printf("[extender] listen tcp %d", port)
+		listen := net.Listen
+		if self.settings.Listen != nil {
+			listen = self.settings.Listen
+		}
+		listener, err := listen("tcp", fmt.Sprintf(":%d", port))
 		if err != nil {
-			fmt.Printf("%s\n", err)
+			// Ownership transfers for every non-nil callback result, even when
+			// the callback rejects that result with an error.
+			if listener != nil {
+				listener.Close()
+			}
+			log.Printf("[extender] listen error: %s", err)
 			return err
 		}
-		listeners[port] = listener
-		go connect.HandleError(func() {
-			defer self.cancel()
+		if listener == nil {
+			return fmt.Errorf("extender listener factory returned nil")
+		}
+		ownedListener, ok := self.addListener(listener)
+		if !ok {
+			return self.ctx.Err()
+		}
+		listeners[port] = ownedListener
+		if !self.beginWorker() {
+			return self.ctx.Err()
+		}
+		go func() {
+			defer self.endWorker()
+			connect.HandleError(func() {
+				defer self.Close()
 
-			for {
-				select {
-				case <-self.ctx.Done():
-					return
-				default:
-				}
+				for {
+					select {
+					case <-self.ctx.Done():
+						return
+					default:
+					}
 
-				conn, err := listener.Accept()
-				if err != nil {
-					fmt.Printf("%s\n", err)
-					return
+					conn, err := listener.Accept()
+					if err != nil {
+						log.Printf("[extender] accept error: %s", err)
+						return
+					}
+					self.startConnection(conn)
 				}
-				// fmt.Printf("Extender pre\n")
-				go self.HandleExtenderConnection(self.ctx, conn)
-			}
-		}, self.cancel)
+			}, self.cancel)
+		}()
 	}
 
 	/*
@@ -292,9 +418,6 @@ func (self *ExtenderServer) ListenAndServe() error {
 	select {
 	case <-self.ctx.Done():
 	}
-	for _, listener := range listeners {
-		listener.Close()
-	}
 	// for _, listener := range quicListeners {
 	// 	listener.Close()
 	// }
@@ -303,7 +426,35 @@ func (self *ExtenderServer) ListenAndServe() error {
 }
 
 func (self *ExtenderServer) Close() {
+	self.stateLock.Lock()
+	if self.closing {
+		self.stateLock.Unlock()
+		return
+	}
+	self.closing = true
 	self.cancel()
+	listeners := make([]net.Listener, 0, len(self.listeners))
+	for ownedListener := range self.listeners {
+		listeners = append(listeners, ownedListener.listener)
+	}
+	connections := make([]net.Conn, 0, len(self.connections))
+	for ownedConnection := range self.connections {
+		connections = append(connections, ownedConnection.connection)
+	}
+	self.stateLock.Unlock()
+
+	for _, listener := range listeners {
+		listener.Close()
+	}
+	for _, connection := range connections {
+		connection.Close()
+	}
+}
+
+// CloseAndWait interrupts and joins every listener and connection worker.
+func (self *ExtenderServer) CloseAndWait() {
+	self.Close()
+	self.workers.Wait()
 }
 
 func (self *ExtenderServer) IsAllowedSecret(header *protocol.ExtenderHeader) bool {
@@ -338,6 +489,13 @@ func (self *ExtenderServer) IsAllowedHost(host string) bool {
 		}
 	}
 	return false
+}
+
+// Connection errors are observable only when a caller installs the test seam.
+func (self *ExtenderServer) reportError(stage string, err error) {
+	if self.settings.ErrorHandler != nil {
+		self.settings.ErrorHandler(stage, err)
+	}
 }
 
 func (self *ExtenderServer) HandleExtenderConnection(ctx context.Context, conn net.Conn) {
@@ -461,6 +619,7 @@ func (self *ExtenderServer) HandleExtenderConnection(ctx context.Context, conn n
 
 	err := clientConn.HandshakeContext(handleCtx)
 	if err != nil {
+		self.reportError("outer TLS handshake", err)
 		return
 	}
 
@@ -476,12 +635,14 @@ func (self *ExtenderServer) HandleExtenderConnection(ctx context.Context, conn n
 		n, err := clientConn.Read(headerBytes[i:4])
 		i += n
 		if err != nil {
+			self.reportError("header length", err)
 			return
 		}
 	}
 	headerByteCount := int(binary.BigEndian.Uint32(headerBytes[0:4]))
 	if 1024 < headerByteCount {
 		// bad data
+		self.reportError("header length", fmt.Errorf("header has %d bytes", headerByteCount))
 		return
 	}
 	// fmt.Printf("Extender 6: %d\n", headerByteCount)
@@ -490,6 +651,7 @@ func (self *ExtenderServer) HandleExtenderConnection(ctx context.Context, conn n
 		n, err := clientConn.Read(headerBytes[i:headerByteCount])
 		i += n
 		if err != nil {
+			self.reportError("header body", err)
 			return
 		}
 	}
@@ -498,29 +660,49 @@ func (self *ExtenderServer) HandleExtenderConnection(ctx context.Context, conn n
 	header := &protocol.ExtenderHeader{}
 	err = proto.Unmarshal(headerBytes[0:headerByteCount], header)
 	if err != nil {
+		self.reportError("header decode", err)
 		return
 	}
 
 	if !self.IsAllowedSecret(header) {
 		// fmt.Printf("Extender secret failed: %s\n", header.Secret)
+		self.reportError("header authorization", fmt.Errorf("secret signature is not allowed"))
 		return
 	}
 
 	if !self.IsAllowedHost(header.DestinationHost) {
 		// fmt.Printf("Extender destination failed: %s\n", header.DestinationHost)
+		self.reportError("destination authorization", fmt.Errorf("host %q is not allowed", header.DestinationHost))
 		return
 	}
 
-	forwardConn, err := self.forwardDialer.Dial("tcp", net.JoinHostPort(
+	dialContext := self.forwardDialer.DialContext
+	if self.settings.DialContext != nil {
+		dialContext = self.settings.DialContext
+	}
+	forwardConn, err := dialContext(handleCtx, "tcp", net.JoinHostPort(
 		header.DestinationHost,
 		fmt.Sprintf("%d", header.DestinationPort),
 	))
 	if err != nil {
+		// Ownership transfers for every non-nil callback result, even when
+		// the callback also returns an error.
+		if forwardConn != nil {
+			forwardConn.Close()
+		}
+		self.reportError("forward dial", err)
+		return
+	}
+	if forwardConn == nil {
+		self.reportError("forward dial", fmt.Errorf("forward dial returned nil connection"))
 		return
 	}
 	defer forwardConn.Close()
 
+	var relayWorkers sync.WaitGroup
+	relayWorkers.Add(2)
 	go connect.HandleError(func() {
+		defer relayWorkers.Done()
 		// read packet from clientConn, write to forwardConn
 		defer handleCancel()
 
@@ -555,6 +737,7 @@ func (self *ExtenderServer) HandleExtenderConnection(ctx context.Context, conn n
 	}, handleCancel)
 
 	go connect.HandleError(func() {
+		defer relayWorkers.Done()
 		// read packet from forwardConn, write to clientConn
 		defer handleCancel()
 
@@ -591,6 +774,9 @@ func (self *ExtenderServer) HandleExtenderConnection(ctx context.Context, conn n
 	select {
 	case <-handleCtx.Done():
 	}
+	clientConn.Close()
+	forwardConn.Close()
+	relayWorkers.Wait()
 }
 
 /*

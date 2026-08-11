@@ -30,7 +30,7 @@ func newSendNoContractHarness(t *testing.T, ctx context.Context) (client *Client
 		ctx,
 		client,
 		nil,
-		DestinationId(destinationId),
+		destinationId,
 		MultiHopId{},
 		false,
 		false,

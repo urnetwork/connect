@@ -573,11 +573,294 @@ func TestPlatformTransportCloseInterruptsBlockedH1Write(t *testing.T) {
 	}
 }
 
+// CloseAndWait must not confuse logical route removal with completed transport
+// teardown. Exact barriers hold first the removed-route seam and then receive
+// cleanup; completion may publish only after socket close wakes the writer and
+// every owned connection worker returns.
+func TestPlatformTransportCloseAndWaitJoinsRouteWriterAndReceiveCleanup(t *testing.T) {
+	testCtx, testCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer testCancel()
+
+	platform := newTestingPlatformServer(t)
+	wrappedConn := make(chan *closeInterruptWriteConn, 1)
+	strategySettings := DefaultClientStrategySettings()
+	strategySettings.EnableResilient = false
+	strategySettings.ParallelBlockSize = 1
+	strategySettings.MinNextConnectDelay = 0
+	strategySettings.MaxNextConnectDelay = 0
+	netDialer := &net.Dialer{}
+	strategySettings.DialContextSettings = &DialContextSettings{
+		DialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {
+			connection, err := netDialer.DialContext(ctx, network, address)
+			if err != nil {
+				return nil, err
+			}
+			blocking := newCloseInterruptWriteConn(connection)
+			select {
+			case wrappedConn <- blocking:
+			default:
+			}
+			return blocking, nil
+		},
+	}
+	strategy := NewClientStrategy(testCtx, strategySettings)
+	routeManager := NewRouteManager(testCtx, "close-and-wait")
+	settings := testingPlatformTransportSettings()
+	settings.WriteTimeout = 30 * time.Second
+	teardownArmed := atomic.Bool{}
+	teardownEntered := make(chan struct{})
+	releaseTeardown := make(chan struct{})
+	receiveCleanupEntered := make(chan struct{})
+	releaseReceiveCleanup := make(chan struct{})
+	var teardownOnce sync.Once
+	var receiveCleanupOnce sync.Once
+	settings.afterRoutesRemovedForTest = func() {
+		if teardownArmed.Load() {
+			teardownOnce.Do(func() {
+				close(teardownEntered)
+				<-releaseTeardown
+			})
+		}
+	}
+	settings.beforeReceiveWorkerCleanupForTest = func() {
+		if teardownArmed.Load() {
+			receiveCleanupOnce.Do(func() {
+				close(receiveCleanupEntered)
+				<-releaseReceiveCleanup
+			})
+		}
+	}
+	transport := NewPlatformTransportWithTargetMode(
+		testCtx,
+		strategy,
+		routeManager,
+		platform.url,
+		&ClientAuth{
+			ByJwt:      "testing",
+			InstanceId: NewId(),
+			AppVersion: "testing",
+		},
+		TransportModeH1,
+		settings,
+	)
+	var releaseTeardownOnce sync.Once
+	releaseRouteCleanup := func() {
+		releaseTeardownOnce.Do(func() {
+			close(releaseTeardown)
+		})
+	}
+	var releaseReceiveOnce sync.Once
+	releaseReceiverCleanup := func() {
+		releaseReceiveOnce.Do(func() {
+			close(releaseReceiveCleanup)
+		})
+	}
+	t.Cleanup(func() {
+		releaseRouteCleanup()
+		releaseReceiverCleanup()
+		transport.Close()
+	})
+
+	for !transport.IsConnected() {
+		notify := transport.ConnectedNotify()
+		if transport.IsConnected() {
+			break
+		}
+		select {
+		case <-testCtx.Done():
+			t.Fatalf("wait for close-and-wait platform route: %v", testCtx.Err())
+		case <-notify:
+		}
+	}
+	var blocking *closeInterruptWriteConn
+	select {
+	case <-testCtx.Done():
+		t.Fatalf("wait for close-and-wait socket: %v", testCtx.Err())
+	case blocking = <-wrappedConn:
+	}
+	blocking.blockWrite.Store(true)
+	writer := routeManager.OpenMultiRouteWriter(DestinationId(NewId()))
+	defer routeManager.CloseMultiRouteWriter(writer)
+	message := MessagePoolGet(32)
+	if err := writer.Write(testCtx, message, time.Second); err != nil {
+		MessagePoolReturn(message)
+		t.Fatalf("write close-and-wait message: %v", err)
+	}
+	select {
+	case <-testCtx.Done():
+		t.Fatalf("wait for blocked close-and-wait writer: %v", testCtx.Err())
+	case <-blocking.writeStarted:
+	}
+
+	teardownArmed.Store(true)
+	closeResult := make(chan error, 1)
+	go func() {
+		closeResult <- transport.CloseAndWait(testCtx)
+	}()
+	select {
+	case <-testCtx.Done():
+		t.Fatalf("wait for logical route removal: %v", testCtx.Err())
+	case <-teardownEntered:
+	}
+	if transport.IsConnected() {
+		t.Fatal("logical platform route remained registered at teardown barrier")
+	}
+	if activeRoutes := writer.GetActiveRoutes(); len(activeRoutes) != 0 {
+		t.Fatalf("logical platform routes=%d at teardown barrier, want zero", len(activeRoutes))
+	}
+	select {
+	case <-blocking.closed:
+		t.Fatal("platform socket closed before the post-route teardown barrier")
+	default:
+	}
+	select {
+	case err := <-closeResult:
+		t.Fatalf("CloseAndWait returned before writer cleanup: %v", err)
+	default:
+	}
+	select {
+	case <-transport.Done():
+		t.Fatal("transport completion published before writer cleanup")
+	default:
+	}
+
+	releaseRouteCleanup()
+	select {
+	case <-testCtx.Done():
+		t.Fatalf("wait for receive-worker cleanup: %v", testCtx.Err())
+	case <-receiveCleanupEntered:
+	}
+	select {
+	case <-blocking.closed:
+	default:
+		t.Fatal("receive cleanup began before the blocked socket was closed")
+	}
+	select {
+	case err := <-closeResult:
+		t.Fatalf("CloseAndWait returned before receive cleanup: %v", err)
+	default:
+	}
+	select {
+	case <-transport.Done():
+		t.Fatal("transport completion published before receive cleanup")
+	default:
+	}
+
+	releaseReceiverCleanup()
+	select {
+	case <-testCtx.Done():
+		t.Fatalf("join close-and-wait transport: %v", testCtx.Err())
+	case err := <-closeResult:
+		if err != nil {
+			t.Fatalf("close and wait: %v", err)
+		}
+	}
+	select {
+	case <-transport.Done():
+	default:
+		t.Fatal("CloseAndWait returned before Done closed")
+	}
+	select {
+	case <-blocking.closed:
+	default:
+		t.Fatal("CloseAndWait returned before closing the blocked socket")
+	}
+}
+
+// A canceled connection attempt remains owned until its dial stack returns.
+// The exact dial barrier prevents completion from treating context delivery as
+// equivalent to joining the mode runner that is still unwinding it.
+func TestPlatformTransportCloseAndWaitJoinsPendingDial(t *testing.T) {
+	testCtx, testCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer testCancel()
+
+	dialEntered := make(chan struct{})
+	dialCanceled := make(chan struct{})
+	releaseDial := make(chan struct{})
+	var dialEnteredOnce sync.Once
+	var dialCanceledOnce sync.Once
+	strategySettings := DefaultClientStrategySettings()
+	strategySettings.EnableResilient = false
+	strategySettings.ParallelBlockSize = 1
+	strategySettings.MinNextConnectDelay = 0
+	strategySettings.MaxNextConnectDelay = 0
+	strategySettings.DialContextSettings = &DialContextSettings{
+		DialContext: func(ctx context.Context, _ string, _ string) (net.Conn, error) {
+			dialEnteredOnce.Do(func() {
+				close(dialEntered)
+			})
+			<-ctx.Done()
+			dialCanceledOnce.Do(func() {
+				close(dialCanceled)
+			})
+			<-releaseDial
+			return nil, ctx.Err()
+		},
+	}
+	transport := NewPlatformTransportWithTargetMode(
+		testCtx,
+		NewClientStrategy(testCtx, strategySettings),
+		NewRouteManager(testCtx, "pending-dial"),
+		"ws://127.0.0.1:1",
+		&ClientAuth{
+			ByJwt:      "testing",
+			InstanceId: NewId(),
+			AppVersion: "testing",
+		},
+		TransportModeH1,
+		testingPlatformTransportSettings(),
+	)
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			close(releaseDial)
+		})
+	}
+	t.Cleanup(func() {
+		release()
+		transport.Close()
+	})
+
+	select {
+	case <-testCtx.Done():
+		t.Fatalf("wait for pending platform dial: %v", testCtx.Err())
+	case <-dialEntered:
+	}
+	closeResult := make(chan error, 1)
+	go func() {
+		closeResult <- transport.CloseAndWait(testCtx)
+	}()
+	select {
+	case <-testCtx.Done():
+		t.Fatalf("wait for pending dial cancellation: %v", testCtx.Err())
+	case <-dialCanceled:
+	}
+	select {
+	case err := <-closeResult:
+		t.Fatalf("CloseAndWait returned before the canceled dial unwound: %v", err)
+	default:
+	}
+	select {
+	case <-transport.Done():
+		t.Fatal("transport completion published before the canceled dial unwound")
+	default:
+	}
+
+	release()
+	select {
+	case <-testCtx.Done():
+		t.Fatalf("join released pending dial: %v", testCtx.Err())
+	case err := <-closeResult:
+		if err != nil {
+			t.Fatalf("close and join pending dial: %v", err)
+		}
+	}
+}
+
 // TestPlatformTransportCloseInterruptsBlockedH3Write covers the adjacent QUIC
 // teardown path. A peer that stops reading exhausts stream flow control and
 // parks Framer.Write inside quic.Stream.Write. Canceling handleCtx cannot wake
-// that write; the connection must be closed before the transport joins its
-// writer goroutine.
+// that write; connection close must precede a join of both socket workers.
 func TestPlatformTransportCloseInterruptsBlockedH3Write(t *testing.T) {
 	certPem, keyPem, err := selfSign(
 		[]string{"127.0.0.1"},
@@ -658,6 +941,18 @@ func TestPlatformTransportCloseInterruptsBlockedH3Write(t *testing.T) {
 		NextProtos:         []string{nextProto},
 	}
 	settings.FramerSettings = framerSettings
+	receiveCleanupArmed := atomic.Bool{}
+	receiveCleanupEntered := make(chan struct{})
+	releaseReceiveCleanup := make(chan struct{})
+	var receiveCleanupOnce sync.Once
+	settings.beforeReceiveWorkerCleanupForTest = func() {
+		if receiveCleanupArmed.Load() {
+			receiveCleanupOnce.Do(func() {
+				close(receiveCleanupEntered)
+				<-releaseReceiveCleanup
+			})
+		}
+	}
 	routeManager := NewRouteManager(ctx, "test")
 	transport := NewPlatformTransportWithTargetMode(
 		ctx,
@@ -672,7 +967,16 @@ func TestPlatformTransportCloseInterruptsBlockedH3Write(t *testing.T) {
 		TransportModeH3,
 		settings,
 	)
-	t.Cleanup(transport.Close)
+	var releaseOnce sync.Once
+	releaseReceiverCleanup := func() {
+		releaseOnce.Do(func() {
+			close(releaseReceiveCleanup)
+		})
+	}
+	t.Cleanup(func() {
+		releaseReceiverCleanup()
+		transport.Close()
+	})
 
 	var accepted *quic.Conn
 	select {
@@ -701,10 +1005,40 @@ func TestPlatformTransportCloseInterruptsBlockedH3Write(t *testing.T) {
 		t.Fatal("the unread QUIC stream never exhausted its bounded send route")
 	}
 
-	transport.Close()
+	receiveCleanupArmed.Store(true)
+	closeCtx, closeCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer closeCancel()
+	closeResult := make(chan error, 1)
+	go func() {
+		closeResult <- transport.CloseAndWait(closeCtx)
+	}()
+	select {
+	case <-receiveCleanupEntered:
+	case <-closeCtx.Done():
+		t.Fatalf("H3 receive worker did not reach cleanup: %v", closeCtx.Err())
+	}
+	select {
+	case err := <-closeResult:
+		t.Fatalf("CloseAndWait returned before H3 receive cleanup: %v", err)
+	default:
+	}
+	select {
+	case <-transport.Done():
+		t.Fatal("H3 transport completion published before receive cleanup")
+	default:
+	}
+	releaseReceiverCleanup()
+	select {
+	case err := <-closeResult:
+		if err != nil {
+			t.Fatalf("close and join flow-control-blocked H3 transport: %v", err)
+		}
+	case <-closeCtx.Done():
+		t.Fatalf("join flow-control-blocked H3 transport: %v", closeCtx.Err())
+	}
 	select {
 	case <-accepted.Context().Done():
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("transport Close did not close QUIC before joining its flow-control-blocked writer")
+	case <-closeCtx.Done():
+		t.Fatalf("peer did not observe flow-control-blocked H3 close: %v", closeCtx.Err())
 	}
 }

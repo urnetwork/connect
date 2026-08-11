@@ -22,6 +22,10 @@ type ControlSync struct {
 	scopeTag string
 
 	monitor *Monitor
+	workers *lifecycleAdmission
+	// Nil test barriers expose owned-worker completion and join entry.
+	beforeWorkerDoneForTest func()
+	beforeCloseWaitForTest  func()
 
 	sendLock  sync.Mutex
 	syncCount uint64
@@ -36,8 +40,24 @@ func NewControlSync(ctx context.Context, client *Client, scopeTag string) *Contr
 		client:    client,
 		scopeTag:  scopeTag,
 		monitor:   NewMonitor(),
+		workers:   newLifecycleAdmission(),
 		syncCount: 0,
 	}
+}
+
+// startWorker admits and starts one retry or supersession worker.
+func (self *ControlSync) startWorker(run func()) bool {
+	if !self.workers.start() {
+		return false
+	}
+	go func() {
+		defer self.workers.finish()
+		HandleError(run, self.cancel)
+		if self.beforeWorkerDoneForTest != nil {
+			self.beforeWorkerDoneForTest()
+		}
+	}()
+	return true
 }
 
 func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protocol.Frame, ackCallback AckFunction) {
@@ -62,7 +82,7 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 	syncIndex := self.syncCount
 
 	notify := self.monitor.NotifyAll()
-	go HandleError(func() {
+	if !self.startWorker(func() {
 		defer handleCancel()
 
 		for {
@@ -88,7 +108,11 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 				return
 			}
 		}
-	}, handleCancel)
+	}) {
+		MessagePoolReturn(frame.MessageBytes)
+		handleCancel()
+		return
+	}
 
 	var controlSync func(*protocol.Frame)
 	controlSync = func(updatedFrame *protocol.Frame) {
@@ -144,7 +168,7 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 				}
 				success, err = self.client.SendWithTimeoutDetailed(
 					updatedFrameCopy,
-					DestinationId(ControlId),
+					ControlId,
 					func(err error) {
 						if err == nil {
 							safeAckCallback(nil)
@@ -152,9 +176,12 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 							// the sync is complete: release the watcher and ctx
 							handleCancel()
 						} else {
-							go HandleError(func() {
+							if !self.startWorker(func() {
 								controlSync(updatedFrame)
-							}, handleCancel)
+							}) {
+								MessagePoolReturn(updatedFrame.MessageBytes)
+								handleCancel()
+							}
 						}
 					},
 					-1,
@@ -208,7 +235,7 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 	}
 	success := self.client.SendWithTimeout(
 		frameCopy,
-		DestinationId(ControlId),
+		ControlId,
 		func(err error) {
 			if err == nil {
 				safeAckCallback(nil)
@@ -216,9 +243,12 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 				// the sync is complete: release the watcher and ctx
 				handleCancel()
 			} else {
-				go HandleError(func() {
+				if !self.startWorker(func() {
 					controlSync(frame)
-				}, handleCancel)
+				}) {
+					MessagePoolReturn(frame.MessageBytes)
+					handleCancel()
+				}
 			}
 		},
 		0,
@@ -232,11 +262,25 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 	// the copy: undo its share (see the retry loop above for the same rule)
 	MessagePoolReturn(frameCopy.MessageBytes)
 
-	go HandleError(func() {
+	if !self.startWorker(func() {
 		controlSync(frame)
-	}, handleCancel)
+	}) {
+		MessagePoolReturn(frame.MessageBytes)
+		handleCancel()
+	}
 }
 
+// Close prevents later retry workers and cancels every active generation.
 func (self *ControlSync) Close() {
 	self.cancel()
+	self.workers.close()
+}
+
+// closeAndWait joins every retry worker admitted before Close.
+func (self *ControlSync) closeAndWait(ctx context.Context) error {
+	self.Close()
+	if self.beforeCloseWaitForTest != nil {
+		self.beforeCloseWaitForTest()
+	}
+	return waitForLifecycleDone(ctx, self.workers.Done(), "control sync workers")
 }

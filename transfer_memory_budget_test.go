@@ -568,7 +568,7 @@ func fillBudgetTestQueue(sender *Client, destinationId Id, payloadByteCount int,
 	for i := 0; i < maxMessages; i += 1 {
 		success := sender.SendWithTimeout(
 			budgetTestFrame(payloadByteCount),
-			DestinationId(destinationId),
+			destinationId,
 			func(err error) {},
 			500*time.Millisecond,
 		)
@@ -765,7 +765,7 @@ func TestTransferBudgetLiveness(t *testing.T) {
 			for j := 0; j < messagesPerPeer; j += 1 {
 				success := sender.SendWithTimeout(
 					budgetTestFrame(payloadByteCount),
-					DestinationId(peers[i].receiverClient.ClientId()),
+					peers[i].receiverClient.ClientId(),
 					func(err error) {
 						if err == nil {
 							ackCount.Add(1)

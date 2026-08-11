@@ -1,3 +1,5 @@
+// WebRTC peer transports keep signaling, admission, and data-plane lifecycle
+// bounded while a client changes between exchange and direct routes.
 package connect
 
 import (
@@ -13,6 +15,7 @@ import (
 
 	"github.com/pion/datachannel"
 	"github.com/pion/logging"
+	"github.com/pion/transport/v4"
 	"github.com/pion/webrtc/v4"
 
 	"github.com/urnetwork/connect/protocol"
@@ -30,12 +33,14 @@ type WebRtcConn interface {
 	ImmediateReconnect() <-chan struct{}
 }
 
+// SignalSender consumes signal.MessageBytes whether delivery succeeds or fails.
 type SignalSender interface {
-	SendSignal(path TransferPath, signal *protocol.Frame, opts ...any)
+	SendSignal(destinationId Id, signal *protocol.Frame, opts ...any)
 }
 
+// SignalReceiver borrows signal.MessageBytes for the duration of the call.
 type SignalReceiver interface {
-	ReceiveSignal(source TransferPath, signal *protocol.Frame) error
+	ReceiveSignal(source TransferPath, transferKey TransferKey, signal *protocol.Frame) error
 }
 
 // exchangeSignalReceiver is the owned-value fast path for signal dispatch.
@@ -44,16 +49,30 @@ type SignalReceiver interface {
 // before returning. Implementations of only SignalReceiver retain the framed
 // compatibility path.
 type exchangeSignalReceiver interface {
-	ReceiveExchangeSignals(source TransferPath, signals *protocol.ExchangeSignals) error
+	ReceiveExchangeSignals(
+		source TransferPath,
+		transferKey TransferKey,
+		signals *protocol.ExchangeSignals,
+	) error
 }
 
+// Partitions callback-scoped signals by peer and stream while preserving each
+// stream's delivery order. Its methods are safe for concurrent use.
 type clientSignalDispatcher struct {
-	client    *Client
-	receiver  SignalReceiver
-	ctx       context.Context
-	cancel    context.CancelFunc
-	closeOnce sync.Once
-	shards    []*clientSignalReceiver
+	client               *Client
+	receiver             SignalReceiver
+	ctx                  context.Context
+	cancel               context.CancelFunc
+	closeOnce            sync.Once
+	shards               []*clientSignalReceiver
+	contextCloseLock     sync.Mutex
+	contextCloseStop     func() bool
+	contextCloseDone     chan struct{}
+	contextCloseDoneOnce sync.Once
+	// Nil test barrier exposes dispatcher join entry.
+	beforeCloseWaitForTest func()
+	// Nil test barrier pauses the context callback before Close.
+	beforeContextCloseForTest func()
 }
 
 // signalNetworkPeerObserver is implemented by WebRtcManager. The transfer
@@ -84,11 +103,12 @@ func prioritizeNetworkSignalPeer(
 	}
 }
 
-// conforms to `SignalSender`
+// Adapts Client transfer delivery to the signaling ownership contract.
 type ClientSignalSender struct {
 	client *Client
 }
 
+// Creates a sender whose lifetime is owned by the supplied client.
 func NewClientSignalSender(client *Client) *ClientSignalSender {
 	return &ClientSignalSender{
 		client: client,
@@ -105,7 +125,9 @@ func NewClientSignalSender(client *Client) *ClientSignalSender {
 // blocked receive path can wedge signal delivery for every peer.
 type signalSendNonBlocking struct{}
 
-func (self *ClientSignalSender) SendSignal(path TransferPath, signal *protocol.Frame, opts ...any) {
+// Uses normal sender backpressure unless a receive-originated reply explicitly
+// requests a nonblocking handoff. The supplied frame is consumed in all cases.
+func (self *ClientSignalSender) SendSignal(destinationId Id, signal *protocol.Frame, opts ...any) {
 	timeout := time.Duration(-1)
 	sendOpts := make([]any, 0, len(opts))
 	for _, opt := range opts {
@@ -115,35 +137,54 @@ func (self *ClientSignalSender) SendSignal(path TransferPath, signal *protocol.F
 		}
 		sendOpts = append(sendOpts, opt)
 	}
-	success := self.client.SendWithTimeout(signal, path.DestinationMask(), nil, timeout, sendOpts...)
+	success := self.client.SendWithTimeout(signal, destinationId, nil, timeout, sendOpts...)
 	// a dropped signal wedges the p2p setup until the transport retry —
 	// always loud. The V(1) positive is the send-side half of the signal
 	// delivery trace (receive side: [signal]receive).
 	if !success {
-		self.client.log.Infof("[signal]send failed ->%s\n", path.DestinationMask())
+		MessagePoolReturn(signal.MessageBytes)
+		signal.MessageBytes = nil
+		self.client.log.Infof("[signal]send failed ->%s\n", destinationId)
 	} else if self.client.log.V(1).Enabled() {
-		self.client.log.Infof("[signal]send ->%s\n", path.DestinationMask())
+		self.client.log.Infof("[signal]send ->%s\n", destinationId)
 	}
 }
 
+// Owns one bounded dispatch shard. Enqueue never blocks, while its worker
+// preserves serial delivery for every peer and stream mapped to the shard.
 type clientSignalReceiver struct {
-	client            *Client
-	receiver          SignalReceiver
-	ctx               context.Context
-	cancel            context.CancelFunc
-	queueLock         sync.Mutex
-	closed            bool
-	queueLimit        int
-	receiveFrames     []*receivedSignalFrame
-	receiveFrameHead  int
-	receiveFrameCount int
-	queueMonitor      *Monitor
-	spaceMonitor      *Monitor
-	runOnce           sync.Once
+	client             *Client
+	receiver           SignalReceiver
+	ctx                context.Context
+	cancel             context.CancelFunc
+	queueLock          sync.Mutex
+	closed             bool
+	queueLimit         int
+	receiveFrames      []*receivedSignalFrame
+	receiveFrameHead   int
+	receiveFrameCount  int
+	queueMonitor       *Monitor
+	droppedSignalCount atomic.Uint64
+	dropWarnings       chan signalDropWarning
+	runOnce            sync.Once
+	workers            *lifecycleAdmission
+
+	// Tests receive the final-return result for each exact compatibility frame.
+	// A nil channel makes this integration point a production no-op.
+	frameClosedForTest chan<- bool
 }
 
+// signalDropWarning identifies one bounded-shard drop without retaining a frame.
+type signalDropWarning struct {
+	sourceId           Id
+	streamId           Id
+	droppedSignalCount uint64
+}
+
+// Owns a decoded signal value or a pooled copy after the Client callback ends.
 type receivedSignalFrame struct {
 	source          TransferPath
+	transferKey     TransferKey
 	frame           *protocol.Frame
 	exchangeSignals *protocol.ExchangeSignals
 	candidateBatch  bool
@@ -151,14 +192,31 @@ type receivedSignalFrame struct {
 	candidateBytes  int
 	keyValid        bool
 	key             receivedSignalFrameKey
+
+	// Tests use a buffered channel to observe this exact frame's final pooled
+	// return without reading process-global pool counters.
+	closedForTest chan<- bool
 }
 
+// Identifies the peer and stream whose signaling order must be preserved.
 type receivedSignalFrameKey struct {
 	source   TransferPath
 	streamId Id
 }
 
+// Installs a bounded asynchronous signaling bridge and returns its unsubscribe
+// function. Sharding permits independent negotiations to advance concurrently.
 func ReceiveSignalsFromClient(client *Client, receiver SignalReceiver) func() {
+	_, unsub := receiveSignalsFromClient(client, receiver)
+	return unsub
+}
+
+// Builds the signaling bridge and also returns its concrete lifecycle owner to
+// Client, while preserving the exported compatibility function above.
+func receiveSignalsFromClient(
+	client *Client,
+	receiver SignalReceiver,
+) (*clientSignalDispatcher, func()) {
 	cancelCtx, cancel := context.WithCancel(client.Ctx())
 	bufferSize := defaultTransferBufferSize
 	if client.settings != nil && client.settings.ReceiveBufferSettings != nil {
@@ -172,11 +230,12 @@ func ReceiveSignalsFromClient(client *Client, receiver SignalReceiver) func() {
 	}
 	workerCount = min(bufferSize, max(1, workerCount))
 	dispatcher := &clientSignalDispatcher{
-		client:   client,
-		receiver: receiver,
-		ctx:      cancelCtx,
-		cancel:   cancel,
-		shards:   make([]*clientSignalReceiver, 0, workerCount),
+		client:           client,
+		receiver:         receiver,
+		ctx:              cancelCtx,
+		cancel:           cancel,
+		shards:           make([]*clientSignalReceiver, 0, workerCount),
+		contextCloseDone: make(chan struct{}),
 	}
 	for workerIndex := range workerCount {
 		queueLimit := bufferSize / workerCount
@@ -190,13 +249,25 @@ func ReceiveSignalsFromClient(client *Client, receiver SignalReceiver) func() {
 			cancel:       cancel,
 			queueLimit:   queueLimit,
 			queueMonitor: NewMonitor(),
-			spaceMonitor: NewMonitor(),
+			dropWarnings: make(chan signalDropWarning, 1),
+			workers:      newLifecycleAdmission(),
 		}
 		dispatcher.shards = append(dispatcher.shards, shard)
 	}
-	context.AfterFunc(cancelCtx, dispatcher.Close)
+	stopContextClose := context.AfterFunc(cancelCtx, func() {
+		if dispatcher.beforeContextCloseForTest != nil {
+			dispatcher.beforeContextCloseForTest()
+		}
+		dispatcher.Close()
+		dispatcher.contextCloseDoneOnce.Do(func() {
+			close(dispatcher.contextCloseDone)
+		})
+	})
+	dispatcher.contextCloseLock.Lock()
+	dispatcher.contextCloseStop = stopContextClose
+	dispatcher.contextCloseLock.Unlock()
 	unsub := client.AddReceiveCallback(dispatcher.Receive)
-	return func() {
+	return dispatcher, func() {
 		unsub()
 		dispatcher.Close()
 	}
@@ -204,17 +275,21 @@ func ReceiveSignalsFromClient(client *Client, receiver SignalReceiver) func() {
 
 // ReceiveFunction. Frames for one peer/stream hash to one worker and stay
 // ordered; independent peers can negotiate in parallel. The sum of shard
-// capacities remains the original receive queue limit, and enqueue still
-// blocks when the selected bounded shard is full, preserving the Client
-// receive callback's intentional backpressure.
+// capacities remains the original receive queue limit. A full shard drops and
+// counts the signal instead of blocking the shared Client receive callback.
 func (self *clientSignalDispatcher) Receive(source TransferPath, frames []*protocol.Frame, peer Peer) {
 	prioritizeNetworkSignalPeer(self.receiver, source, frames, peer)
 	for _, frame := range frames {
-		self.handleControlFrame(source, frame)
+		self.handleControlFrame(source, peer.TransferKey, frame)
 	}
 }
 
-func (self *clientSignalDispatcher) handleControlFrame(source TransferPath, frame *protocol.Frame) {
+// handleControlFrame hands one borrowed signal to its stable bounded shard.
+func (self *clientSignalDispatcher) handleControlFrame(
+	source TransferPath,
+	transferKey TransferKey,
+	frame *protocol.Frame,
+) {
 	switch frame.MessageType {
 	case protocol.MessageType_TransferExchangeSignals:
 		select {
@@ -226,7 +301,7 @@ func (self *clientSignalDispatcher) handleControlFrame(source TransferPath, fram
 		if self.client.log.V(1).Enabled() {
 			self.client.log.Infof("[signal]receive from %s\n", source)
 		}
-		received, err := newReceivedSignalFrame(source, frame)
+		received, err := newReceivedSignalFrame(source, transferKey, frame)
 		if err != nil {
 			self.client.log.Infof("[signal]receive frame err=%s\n", err)
 			return
@@ -240,8 +315,18 @@ func (self *clientSignalDispatcher) handleControlFrame(source TransferPath, fram
 	}
 }
 
+// Stops every shard and releases all queued frame ownership.
 func (self *clientSignalDispatcher) Close() {
 	self.closeOnce.Do(func() {
+		self.contextCloseLock.Lock()
+		stopContextClose := self.contextCloseStop
+		self.contextCloseStop = nil
+		self.contextCloseLock.Unlock()
+		if stopContextClose != nil && stopContextClose() {
+			self.contextCloseDoneOnce.Do(func() {
+				close(self.contextCloseDone)
+			})
+		}
 		self.cancel()
 		for _, shard := range self.shards {
 			shard.Close()
@@ -249,15 +334,46 @@ func (self *clientSignalDispatcher) Close() {
 	})
 }
 
+// closeAndWait joins delivery and diagnostic workers after queued signal
+// ownership has been released, or returns when ctx expires.
+func (self *clientSignalDispatcher) closeAndWait(ctx context.Context) error {
+	self.Close()
+	if self.beforeCloseWaitForTest != nil {
+		self.beforeCloseWaitForTest()
+	}
+	var result error
+	for shardIndex, shard := range self.shards {
+		if err := shard.closeAndWait(ctx); err != nil {
+			result = errors.Join(
+				result,
+				fmt.Errorf("signal shard %d: %w", shardIndex, err),
+			)
+		}
+	}
+	if err := waitForLifecycleDone(
+		ctx,
+		self.contextCloseDone,
+		"signal context cleanup",
+	); err != nil {
+		result = errors.Join(result, err)
+	}
+	return result
+}
+
 // ReceiveFunction
 func (self *clientSignalReceiver) Receive(source TransferPath, frames []*protocol.Frame, peer Peer) {
 	prioritizeNetworkSignalPeer(self.receiver, source, frames, peer)
 	for _, frame := range frames {
-		self.handleControlFrame(source, frame)
+		self.handleControlFrame(source, peer.TransferKey, frame)
 	}
 }
 
-func (self *clientSignalReceiver) handleControlFrame(source TransferPath, frame *protocol.Frame) {
+// handleControlFrame hands one borrowed signal to this receiver's bounded queue.
+func (self *clientSignalReceiver) handleControlFrame(
+	source TransferPath,
+	transferKey TransferKey,
+	frame *protocol.Frame,
+) {
 	switch frame.MessageType {
 	case protocol.MessageType_TransferExchangeSignals:
 		select {
@@ -272,7 +388,7 @@ func (self *clientSignalReceiver) handleControlFrame(source TransferPath, frame 
 			self.client.log.Infof("[signal]receive from %s\n", source)
 		}
 
-		received, err := newReceivedSignalFrame(source, frame)
+		received, err := newReceivedSignalFrame(source, transferKey, frame)
 		if err != nil {
 			self.client.log.Infof("[signal]receive frame err=%s\n", err)
 			return
@@ -284,33 +400,92 @@ func (self *clientSignalReceiver) handleControlFrame(source TransferPath, frame 
 	}
 }
 
+// Starts this shard's delivery and diagnostic workers at most once.
 func (self *clientSignalReceiver) start() {
 	self.runOnce.Do(func() {
-		go HandleError(self.run, self.cancel)
+		self.queueLock.Lock()
+		if self.workers == nil {
+			self.workers = newLifecycleAdmission()
+		}
+		workers := self.workers
+		closed := self.closed
+		self.queueLock.Unlock()
+		if closed {
+			workers.close()
+		}
+		cancel := func() {
+			self.cancel()
+		}
+		startWorker := func(run func()) {
+			if !workers.start() {
+				return
+			}
+			go func() {
+				defer workers.finish()
+				HandleError(run, cancel)
+			}()
+		}
+		startWorker(self.run)
+		startWorker(self.runDropWarnings)
 	})
 }
 
+// Detaches the bounded queue atomically, then releases its frames outside the
+// queue lock so teardown cannot stall an enqueue critical section.
 func (self *clientSignalReceiver) Close() {
+	var receiveFrames []*receivedSignalFrame
+	var receiveFrameHead int
+	var receiveFrameCount int
 	self.queueLock.Lock()
+	if self.workers == nil {
+		self.workers = newLifecycleAdmission()
+	}
+	workers := self.workers
 	if !self.closed {
 		self.closed = true
-		for i := range self.receiveFrameCount {
-			index := (self.receiveFrameHead + i) % len(self.receiveFrames)
-			received := self.receiveFrames[index]
-			if received != nil {
-				received.Close()
-			}
-		}
+		receiveFrames = self.receiveFrames
+		receiveFrameHead = self.receiveFrameHead
+		receiveFrameCount = self.receiveFrameCount
 		self.receiveFrames = nil
 		self.receiveFrameHead = 0
 		self.receiveFrameCount = 0
+		self.queueMonitor.NotifyAll()
 	}
 	self.queueLock.Unlock()
+	for i := range receiveFrameCount {
+		index := (receiveFrameHead + i) % len(receiveFrames)
+		if received := receiveFrames[index]; received != nil {
+			received.Close()
+		}
+	}
 	self.cancel()
-	self.queueMonitor.NotifyAll()
-	self.spaceMonitor.NotifyAll()
+	workers.close()
 }
 
+// closeAndWait joins this shard's delivery and diagnostic workers.
+func (self *clientSignalReceiver) closeAndWait(ctx context.Context) error {
+	self.Close()
+	return waitForLifecycleDone(ctx, self.workers.Done(), "signal receiver workers")
+}
+
+// runDropWarnings emits bounded diagnostics outside the shared receive callback.
+func (self *clientSignalReceiver) runDropWarnings() {
+	for {
+		select {
+		case <-self.ctx.Done():
+			return
+		case warning := <-self.dropWarnings:
+			self.client.log.Warningf(
+				"[signal]receive drop full source=%s stream=%s dropped=%d\n",
+				warning.sourceId,
+				warning.streamId,
+				warning.droppedSignalCount,
+			)
+		}
+	}
+}
+
+// Drains owned signals serially until cancellation or queue closure.
 func (self *clientSignalReceiver) run() {
 	for {
 		received := self.dequeue()
@@ -320,7 +495,11 @@ func (self *clientSignalReceiver) run() {
 		func() {
 			defer received.Close()
 			if receiver, ok := self.receiver.(exchangeSignalReceiver); ok && received.exchangeSignals != nil {
-				if err := receiver.ReceiveExchangeSignals(received.source, received.exchangeSignals); err != nil {
+				if err := receiver.ReceiveExchangeSignals(
+					received.source,
+					received.transferKey,
+					received.exchangeSignals,
+				); err != nil {
 					self.client.log.Infof("[signal]receive err=%s\n", err)
 				}
 				return
@@ -329,18 +508,28 @@ func (self *clientSignalReceiver) run() {
 				self.client.log.Infof("[signal]receive frame err=%s\n", err)
 				return
 			}
-			if err := self.receiver.ReceiveSignal(received.source, received.frame); err != nil {
+			if err := self.receiver.ReceiveSignal(
+				received.source,
+				received.transferKey,
+				received.frame,
+			); err != nil {
 				self.client.log.Infof("[signal]receive err=%s\n", err)
 			}
 		}()
 	}
 }
 
-func newReceivedSignalFrame(source TransferPath, frame *protocol.Frame) (*receivedSignalFrame, error) {
+// newReceivedSignalFrame creates an owned value for asynchronous dispatch.
+func newReceivedSignalFrame(
+	source TransferPath,
+	transferKey TransferKey,
+	frame *protocol.Frame,
+) (*receivedSignalFrame, error) {
 	exchangeSignals := &protocol.ExchangeSignals{}
 	if err := ProtoUnmarshal(frame.MessageBytes, exchangeSignals); err != nil {
 		return &receivedSignalFrame{
-			source: source,
+			source:      source,
+			transferKey: transferKey,
 			frame: &protocol.Frame{
 				MessageType:  frame.MessageType,
 				Raw:          frame.Raw,
@@ -363,7 +552,8 @@ func newReceivedSignalFrame(source TransferPath, frame *protocol.Frame) (*receiv
 		}
 	}
 	received := &receivedSignalFrame{
-		source: source,
+		source:      source,
+		transferKey: transferKey,
 		frame: &protocol.Frame{
 			MessageType: frame.MessageType,
 			Raw:         frame.Raw,
@@ -382,6 +572,7 @@ func newReceivedSignalFrame(source TransferPath, frame *protocol.Frame) (*receiv
 	return received, nil
 }
 
+// Maps one valid peer/stream ordering key to a stable dispatch shard.
 func receivedSignalShardIndex(received *receivedSignalFrame, shardCount int) int {
 	if shardCount <= 1 || received == nil || !received.keyValid {
 		return 0
@@ -399,16 +590,24 @@ func receivedSignalShardIndex(received *receivedSignalFrame, shardCount int) int
 	return int(hash % uint32(shardCount))
 }
 
+// Releases any pooled frame bytes and invalidates the owned decoded value.
 func (self *receivedSignalFrame) Close() {
 	if self.frame != nil {
 		if self.frame.MessageBytes != nil {
-			MessagePoolReturn(self.frame.MessageBytes)
+			returned := MessagePoolReturn(self.frame.MessageBytes)
+			if self.closedForTest != nil {
+				select {
+				case self.closedForTest <- returned:
+				default:
+				}
+			}
 		}
 		self.frame = nil
 	}
 	self.exchangeSignals = nil
 }
 
+// Lazily recreates the compatibility frame only for receivers that need bytes.
 func (self *receivedSignalFrame) prepareFrame() error {
 	if self.frame == nil || self.frame.MessageBytes != nil || self.exchangeSignals == nil {
 		return nil
@@ -421,10 +620,12 @@ func (self *receivedSignalFrame) prepareFrame() error {
 	return nil
 }
 
+// Reports whether the decoded value contains only coalescible ICE candidates.
 func (self *receivedSignalFrame) isCandidateBatch() bool {
 	return isCandidateBatch(self.exchangeSignals)
 }
 
+// Accepts only non-reset batches containing at least one ICE candidate.
 func isCandidateBatch(exchangeSignals *protocol.ExchangeSignals) bool {
 	if exchangeSignals == nil || exchangeSignals.ResetSignals || len(exchangeSignals.Signals) == 0 {
 		return false
@@ -437,15 +638,17 @@ func isCandidateBatch(exchangeSignals *protocol.ExchangeSignals) bool {
 	return true
 }
 
+// Coalesces an adjacent candidate batch without exceeding the receiver's
+// bounded candidate count or byte budget.
 func (self *receivedSignalFrame) appendCandidateBatch(received *receivedSignalFrame) bool {
-	if !self.candidateBatch || !received.candidateBatch || self.key != received.key {
+	if !self.candidateBatch || !received.candidateBatch || self.key != received.key ||
+		self.transferKey != received.transferKey {
 		return false
 	}
 	// Coalescing is an allocation optimization, not permission to bypass the
 	// bounded queue. Once a batch reaches the same count/byte ceiling as the
 	// pre-SDP candidate buffer, leave the next frame as a queue entry; a full
-	// shard then blocks the Client receive callback as intentional
-	// backpressure.
+	// shard drops the next signal without stalling unrelated receive work.
 	if maxBufferedRemoteIceCandidateCount < self.candidateCount+received.candidateCount ||
 		maxBufferedRemoteIceCandidateBytes < self.candidateBytes+received.candidateBytes {
 		return false
@@ -456,54 +659,59 @@ func (self *receivedSignalFrame) appendCandidateBatch(received *receivedSignalFr
 	return true
 }
 
+// Takes ownership when it can append or coalesce the frame. A full or closed
+// shard rejects the frame immediately so the receive callback never blocks.
 func (self *clientSignalReceiver) enqueue(received *receivedSignalFrame) bool {
-	for {
-		var spaceNotify chan struct{}
-		self.queueLock.Lock()
-		if self.closed || self.ctx.Err() != nil {
-			self.queueLock.Unlock()
-			return false
-		}
-		if received.candidateBatch {
-			if batch := self.tailLocked(); batch != nil && batch.candidateBatch && batch.key == received.key {
-				if batch.appendCandidateBatch(received) {
-					self.queueLock.Unlock()
-					received.Close()
-					return true
-				}
-			}
-		}
-		if self.queueLenLocked() < self.queueLimit {
-			if self.receiveFrames == nil {
-				// A fixed-capacity ring makes the queue's backing storage obey
-				// the same bound as its live item count. The former
-				// append-plus-head scheme retained an ever-growing nil prefix
-				// whenever sustained traffic kept the queue from becoming
-				// completely empty.
-				self.receiveFrames = make([]*receivedSignalFrame, self.queueLimit)
-			}
-			tail := (self.receiveFrameHead + self.receiveFrameCount) % len(self.receiveFrames)
-			self.receiveFrames[tail] = received
-			self.receiveFrameCount++
-			self.queueLock.Unlock()
-			self.queueMonitor.NotifyAll()
-			return true
-		}
-		spaceNotify = self.spaceMonitor.NotifyChannel()
+	received.closedForTest = self.frameClosedForTest
+	self.queueLock.Lock()
+	if self.closed || self.ctx.Err() != nil {
 		self.queueLock.Unlock()
-
-		select {
-		case <-self.ctx.Done():
-			return false
-		case <-spaceNotify:
+		return false
+	}
+	if received.candidateBatch {
+		if batch := self.tailLocked(); batch != nil && batch.candidateBatch && batch.key == received.key {
+			if batch.appendCandidateBatch(received) {
+				self.queueLock.Unlock()
+				received.Close()
+				return true
+			}
 		}
 	}
+	if self.queueLimit <= self.queueLenLocked() {
+		droppedSignalCount := self.droppedSignalCount.Add(1)
+		self.queueLock.Unlock()
+		select {
+		case self.dropWarnings <- signalDropWarning{
+			sourceId:           received.source.SourceId,
+			streamId:           received.key.streamId,
+			droppedSignalCount: droppedSignalCount,
+		}:
+		default:
+		}
+		return false
+	}
+	if self.receiveFrames == nil {
+		// A fixed-capacity ring makes the queue's backing storage obey
+		// the same bound as its live item count. The former
+		// append-plus-head scheme retained an ever-growing nil prefix
+		// whenever sustained traffic kept the queue from becoming
+		// completely empty.
+		self.receiveFrames = make([]*receivedSignalFrame, self.queueLimit)
+	}
+	tail := (self.receiveFrameHead + self.receiveFrameCount) % len(self.receiveFrames)
+	self.receiveFrames[tail] = received
+	self.receiveFrameCount++
+	self.queueMonitor.NotifyAll()
+	self.queueLock.Unlock()
+	return true
 }
 
+// Reports the live ring size while queueLock is held.
 func (self *clientSignalReceiver) queueLenLocked() int {
 	return self.receiveFrameCount
 }
 
+// Returns the newest queued frame without removing it while queueLock is held.
 func (self *clientSignalReceiver) tailLocked() *receivedSignalFrame {
 	if self.receiveFrameCount == 0 {
 		return nil
@@ -512,6 +720,8 @@ func (self *clientSignalReceiver) tailLocked() *receivedSignalFrame {
 	return self.receiveFrames[index]
 }
 
+// Waits for and transfers ownership of the oldest frame, or returns nil after
+// cancellation or closure.
 func (self *clientSignalReceiver) dequeue() *receivedSignalFrame {
 	for {
 		var queueNotify chan struct{}
@@ -526,7 +736,6 @@ func (self *clientSignalReceiver) dequeue() *receivedSignalFrame {
 				self.receiveFrameHead = (self.receiveFrameHead + 1) % len(self.receiveFrames)
 			}
 			self.queueLock.Unlock()
-			self.spaceMonitor.NotifyAll()
 			return received
 		}
 		if self.closed || self.ctx.Err() != nil {
@@ -745,6 +954,21 @@ type WebRtcSettings struct {
 	// loopback-capable connect past the test deadline at STUN check pacing.
 	// Production callers leave it false.
 	UseLoopbackOnlyIceInterfaces bool
+
+	// Network, when set, supplies native Pion's socket network. Tests use it
+	// to put ICE, DTLS, SCTP, and SRTP below a userspace impairment model.
+	// Nil retains normal interface selection. The caller owns the network;
+	// peer teardown closes its sockets but not this shared object. Browser
+	// WebRTC ignores it.
+	Network transport.Net
+	// Nil in production; tests can pause native fast-path publication before
+	// the remaining peer setup continues.
+	afterFastPathPublishForTest func()
+	// Nil in production; tests observe an admitted concrete Pion callback.
+	beforePionCallbackForTest func(string)
+	// Nil in production; tests hold the native fast-path OnTrack body after
+	// Pion dispatch, independently of the lifecycle wrapper.
+	beforeFastPathOnTrackBodyForTest func()
 
 	// add stun:xxx urls here
 	IceServerUrls []string
@@ -1041,12 +1265,15 @@ type WebRtcManager struct {
 	signalSender SignalSender
 	settings     *WebRtcSettings
 
-	stateLock        sync.Mutex
-	closed           bool
-	closeDone        chan struct{}
-	contextCloseStop func() bool
-	peerConnWorkers  sync.WaitGroup
-	peerConns        map[peerConnKey]*peerConn
+	stateLock         sync.Mutex
+	closed            bool
+	closeDone         chan struct{}
+	contextCloseStop  func() bool
+	contextCloseDone  chan struct{}
+	contextCloseOnce  sync.Once
+	peerConnWorkers   sync.WaitGroup
+	peerConnLifecycle *lifecycleAdmission
+	peerConns         map[peerConnKey]*peerConn
 	// retiringPeerConns tracks canceled generations independently of
 	// peerConns. A make-before-break replacement removes the old generation
 	// from the keyed map before its teardown releases the receive-window
@@ -1098,6 +1325,23 @@ type WebRtcManager struct {
 	networkChangeLock   sync.Mutex
 	networkChangeWorker *coalescingCallbackWorker
 	networkChangeUnsub  func()
+	// Nil in production; tests observe the asynchronous worker immediately
+	// before it attempts to acquire manager state.
+	beforeNetworkChangeStateLockForTest func()
+	// Nil in production; lifecycle tests observe successful peer-map
+	// registration after newP2pConn has released manager state.
+	testingAfterPeerConnRegistered func(TransferPath, bool)
+	// Nil test barrier pauses a peer admission before manager state is locked.
+	beforePeerConnAdmissionStateLockForTest func()
+	// Nil test factory bypasses Pion construction for parent/child lifecycle
+	// integration tests.
+	newP2pConnForTest func(context.Context, TransferPath, bool) (WebRtcConn, error)
+	// Nil test barrier pauses final done publication after all owned cleanup.
+	beforeCloseDoneForTest func()
+	// Nil test barrier pauses the manager-context close callback before Close.
+	beforeContextCloseForTest func()
+	// Nil test barrier exposes context-aware joined-wait entry.
+	beforeCloseWaitForTest func()
 }
 
 const peerConnectionFactoryRetryTimeout = time.Second
@@ -1114,6 +1358,8 @@ func NewWebRtcManager(ctx context.Context, signalSender SignalSender, settings *
 		signalSender:               signalSender,
 		settings:                   settings,
 		closeDone:                  make(chan struct{}),
+		contextCloseDone:           make(chan struct{}),
+		peerConnLifecycle:          newLifecycleAdmission(),
 		peerConns:                  map[peerConnKey]*peerConn{},
 		retiringPeerConns:          map[*peerConn]struct{}{},
 		prioritizedPeers:           map[Id]time.Time{},
@@ -1138,11 +1384,23 @@ func NewWebRtcManager(ctx context.Context, signalSender SignalSender, settings *
 			manager.rememberNetworkPeerLocked(peerId, now)
 		}
 	}
-	stop := context.AfterFunc(managerCtx, manager.Close)
+	stop := context.AfterFunc(managerCtx, func() {
+		if manager.beforeContextCloseForTest != nil {
+			manager.beforeContextCloseForTest()
+		}
+		manager.Close()
+		manager.contextCloseOnce.Do(func() {
+			close(manager.contextCloseDone)
+		})
+	})
 	manager.stateLock.Lock()
 	if manager.closed {
 		manager.stateLock.Unlock()
-		stop()
+		if stop() {
+			manager.contextCloseOnce.Do(func() {
+				close(manager.contextCloseDone)
+			})
+		}
 	} else {
 		manager.contextCloseStop = stop
 		manager.stateLock.Unlock()
@@ -1150,16 +1408,12 @@ func NewWebRtcManager(ctx context.Context, signalSender SignalSender, settings *
 	return manager
 }
 
-// Close synchronously releases every peer admission reservation and all
-// manager-owned ICE state. Context cancellation alone schedules cleanup
-// asynchronously; explicit client close/connect churn must not let old Pion
-// sockets and goroutines overlap the next client generation.
+// Close prevents later peer admission and requests teardown without joining
+// Pion, signaling callbacks, or peer workers.
 func (self *WebRtcManager) Close() {
 	self.stateLock.Lock()
 	if self.closed {
-		done := self.closeDone
 		self.stateLock.Unlock()
-		<-done
 		return
 	}
 	self.closed = true
@@ -1170,30 +1424,48 @@ func (self *WebRtcManager) Close() {
 	}
 	self.stateLock.Unlock()
 
-	// Always release concurrent Close callers, even if an unexpected teardown
-	// panic is recovered by the outer lifecycle handler.
-	defer close(self.closeDone)
-	if stopContextClose != nil {
-		stopContextClose()
+	if stopContextClose != nil && stopContextClose() {
+		self.contextCloseOnce.Do(func() {
+			close(self.contextCloseDone)
+		})
 	}
 	self.cancel()
+	self.peerConnLifecycle.close()
+	networkChangeWorker := self.stopNetworkChangeWorker()
 
-	// A path callback can otherwise invalidate/rebuild factory state after
-	// Close returns. Unsubscribe, cancel, and join it before the peer/factory
-	// teardown boundary.
-	self.closeNetworkChangeWorker()
-	self.peerConnWorkers.Wait()
-	self.closePeerConnectionFactory()
+	go func() {
+		defer close(self.closeDone)
+		<-self.contextCloseDone
+		if networkChangeWorker != nil {
+			networkChangeWorker.Wait()
+		}
+		self.peerConnWorkers.Wait()
+		<-self.peerConnLifecycle.Done()
+		self.closePeerConnectionFactory()
 
-	self.stateLock.Lock()
-	self.peerConns = nil
-	self.retiringPeerConns = nil
-	self.prioritizedPeers = nil
-	self.pendingPrioritizedPeerSlot = nil
-	self.networkPeers = nil
-	self.stateLock.Unlock()
-	self.capacityMonitor.NotifyAll()
-	self.admissionStateMonitor.NotifyAll()
+		self.stateLock.Lock()
+		self.peerConns = nil
+		self.retiringPeerConns = nil
+		self.prioritizedPeers = nil
+		self.pendingPrioritizedPeerSlot = nil
+		self.networkPeers = nil
+		self.stateLock.Unlock()
+		self.capacityMonitor.NotifyAll()
+		self.admissionStateMonitor.NotifyAll()
+		if self.beforeCloseDoneForTest != nil {
+			self.beforeCloseDoneForTest()
+		}
+	}()
+}
+
+// closeAndWait joins all peer generations and manager-owned ICE state, or
+// returns when ctx expires.
+func (self *WebRtcManager) closeAndWait(ctx context.Context) error {
+	self.Close()
+	if self.beforeCloseWaitForTest != nil {
+		self.beforeCloseWaitForTest()
+	}
+	return waitForLifecycleDone(ctx, self.closeDone, "WebRTC manager")
 }
 
 func (self *WebRtcManager) prunePeerPrioritiesLocked(now time.Time) {
@@ -1752,7 +2024,9 @@ func (self *WebRtcManager) startNetworkChangeWorker() {
 	self.networkChangeUnsub = AddNetworkChangeListener(worker.Dispatch)
 }
 
-func (self *WebRtcManager) closeNetworkChangeWorker() {
+// stopNetworkChangeWorker detaches and cancels path observation without
+// waiting for a possibly blocked callback.
+func (self *WebRtcManager) stopNetworkChangeWorker() *coalescingCallbackWorker {
 	self.networkChangeLock.Lock()
 	worker := self.networkChangeWorker
 	unsub := self.networkChangeUnsub
@@ -1764,6 +2038,15 @@ func (self *WebRtcManager) closeNetworkChangeWorker() {
 	}
 	if worker != nil {
 		worker.Close()
+	}
+	return worker
+}
+
+// closeNetworkChangeWorker preserves the synchronous helper used by focused
+// manager tests and non-client owners.
+func (self *WebRtcManager) closeNetworkChangeWorker() {
+	worker := self.stopNetworkChangeWorker()
+	if worker != nil {
 		worker.Wait()
 	}
 }
@@ -1848,6 +2131,9 @@ func (self *WebRtcManager) closePeerConnectionFactory() {
 // the next admission lazily rebuilds the factory against current interfaces.
 func (self *WebRtcManager) networkChanged() {
 	var factory *webRtcPeerConnectionFactory
+	if self.beforeNetworkChangeStateLockForTest != nil {
+		self.beforeNetworkChangeStateLockForTest()
+	}
 	self.stateLock.Lock()
 	if self.closed {
 		self.stateLock.Unlock()
@@ -1953,19 +2239,28 @@ func (self *WebRtcManager) notifyCountCapacity() {
 	}
 }
 
-// SignalReceiver
-func (self *WebRtcManager) ReceiveSignal(source TransferPath, frame *protocol.Frame) error {
+// ReceiveSignal decodes and applies one borrowed signaling frame.
+func (self *WebRtcManager) ReceiveSignal(
+	source TransferPath,
+	transferKey TransferKey,
+	frame *protocol.Frame,
+) error {
 	message, err := FromFrame(frame)
 	if err != nil {
 		return err
 	}
 	if v, ok := message.(*protocol.ExchangeSignals); ok {
-		return self.ReceiveExchangeSignals(source, v)
+		return self.ReceiveExchangeSignals(source, transferKey, v)
 	}
 	return nil
 }
 
-func (self *WebRtcManager) ReceiveExchangeSignals(source TransferPath, v *protocol.ExchangeSignals) error {
+// ReceiveExchangeSignals applies one owned decoded signaling batch.
+func (self *WebRtcManager) ReceiveExchangeSignals(
+	source TransferPath,
+	transferKey TransferKey,
+	v *protocol.ExchangeSignals,
+) error {
 	streamId, err := IdFromBytes(v.StreamId)
 	if err != nil {
 		return err
@@ -1995,6 +2290,20 @@ func (self *WebRtcManager) ReceiveExchangeSignals(source TransferPath, v *protoc
 	if conn == nil {
 		return nil
 	}
+	// Signal delivery mutates the same Pion/state generation as asynchronous
+	// Pion callbacks. Admit the complete batch before any reply-key or SDP/ICE
+	// publication so teardown joins an in-flight batch and rejects a late one.
+	connWorkers := conn.lifecycleWorkers()
+	if !connWorkers.start() {
+		return nil
+	}
+	defer connWorkers.finish()
+	if conn.beforeReceiveSignalBatchForTest != nil {
+		conn.beforeReceiveSignalBatchForTest()
+	}
+	if conn.ctx != nil && conn.ctx.Err() != nil {
+		return nil
+	}
 	resetOffer := false
 	if v.ResetSignals {
 		for _, signal := range v.Signals {
@@ -2007,6 +2316,7 @@ func (self *WebRtcManager) ReceiveExchangeSignals(source TransferPath, v *protoc
 			return errors.New("reset_signals requires an SDP offer")
 		}
 	}
+	conn.setSignalReplyTransferKey(transferKey)
 	if resetOffer && conn.resetRemoteSignals(senderGenerationId, senderGenerationSet) {
 		// A fresh active PeerConnection is offering against a passive
 		// association that still looks connected. This is the asymmetric
@@ -2030,10 +2340,12 @@ func (self *WebRtcManager) ReceiveExchangeSignals(source TransferPath, v *protoc
 		if self.log.V(2).Enabled() {
 			self.log.Infof("[signal]%s\n", signal.SignalType)
 		}
-		if err := conn.receiveSignalFromPeer(
+		if err := conn.receiveSignalFromPeerWithTransferKey(
 			signal,
 			senderGenerationId,
 			senderGenerationSet,
+			transferKey,
+			true,
 		); err != nil {
 			if signal.SignalType == protocol.SignalType_IceCandidate {
 				// One malformed trickle candidate must not suppress every
@@ -2050,11 +2362,25 @@ func (self *WebRtcManager) ReceiveExchangeSignals(source TransferPath, v *protoc
 }
 
 func (self *WebRtcManager) NewP2pConnActive(ctx context.Context, path TransferPath) (WebRtcConn, error) {
-	return self.newP2pConn(ctx, path, true)
+	if self.newP2pConnForTest != nil {
+		return self.newP2pConnForTest(ctx, path, true)
+	}
+	conn, err := self.newP2pConn(ctx, path, true)
+	if err == nil && self.testingAfterPeerConnRegistered != nil {
+		self.testingAfterPeerConnRegistered(path, true)
+	}
+	return conn, err
 }
 
 func (self *WebRtcManager) NewP2pConnPassive(ctx context.Context, path TransferPath) (WebRtcConn, error) {
-	return self.newP2pConn(ctx, path, false)
+	if self.newP2pConnForTest != nil {
+		return self.newP2pConnForTest(ctx, path, false)
+	}
+	conn, err := self.newP2pConn(ctx, path, false)
+	if err == nil && self.testingAfterPeerConnRegistered != nil {
+		self.testingAfterPeerConnRegistered(path, false)
+	}
+	return conn, err
 }
 
 func (self *WebRtcManager) newP2pConn(ctx context.Context, path TransferPath, active bool) (conn *peerConn, err error) {
@@ -2063,6 +2389,9 @@ func (self *WebRtcManager) newP2pConn(ctx context.Context, path TransferPath, ac
 	}
 	if err = self.ctx.Err(); err != nil {
 		return
+	}
+	if self.beforePeerConnAdmissionStateLockForTest != nil {
+		self.beforePeerConnAdmissionStateLockForTest()
 	}
 	var sharedVictim *peerConnectionAdmissionOwner
 	self.stateLock.Lock()
@@ -2267,14 +2596,24 @@ func (self *WebRtcManager) newP2pConn(ctx context.Context, path TransferPath, ac
 	conn.admissionBudget = reserveBudget
 	conn.admissionByteCount = reserveByteCount
 	conn.admissionOwner = admissionOwner
+	if !self.peerConnLifecycle.start() {
+		panic("open WebRTC manager rejected peer lifecycle admission")
+	}
 	// Resource teardown is cancellation-driven rather than Run-return-driven.
 	// A synchronous signal send is intentional backpressure and may still be
 	// blocked when a generation is replaced; it cannot be allowed to retain
 	// the old receive-window reservation and prevent the replacement itself.
+	if !conn.startWorker("peer connection run", conn.Run, func(err error) {
+		conn.cancelBecause(fmt.Errorf("peer connection run panic: %w", err))
+	}) {
+		panic("new peer connection rejected Run worker")
+	}
 	self.peerConnWorkers.Add(1)
 	go HandleError(func() {
 		defer self.peerConnWorkers.Done()
+		defer self.peerConnLifecycle.finish()
 		<-conn.ctx.Done()
+		conn.workers.close()
 		self.stateLock.Lock()
 		self.markPeerConnRetiringLocked(conn)
 		self.stateLock.Unlock()
@@ -2315,9 +2654,7 @@ func (self *WebRtcManager) newP2pConn(ctx context.Context, path TransferPath, ac
 			self.notifyCountCapacity()
 		}
 		self.capacityMonitor.NotifyAll()
-	})
-	go HandleError(conn.Run, func(err error) {
-		conn.cancelBecause(fmt.Errorf("peer connection run panic: %w", err))
+		<-conn.workers.Done()
 	})
 
 	replacedConn := self.peerConns[key]
@@ -2344,6 +2681,7 @@ const (
 	peerConnectionTeardownStarting peerConnectionTeardownStage = iota
 	peerConnectionTeardownStoppingIce
 	peerConnectionTeardownClosingPeer
+	peerConnectionTeardownClosingFastPath
 	peerConnectionTeardownClosingDataChannel
 	peerConnectionTeardownClearingSignals
 	peerConnectionTeardownComplete
@@ -2357,6 +2695,8 @@ func (self peerConnectionTeardownStage) String() string {
 		return "stopping-ice"
 	case peerConnectionTeardownClosingPeer:
 		return "closing-peer"
+	case peerConnectionTeardownClosingFastPath:
+		return "closing-fast-path"
 	case peerConnectionTeardownClosingDataChannel:
 		return "closing-data-channel"
 	case peerConnectionTeardownClearingSignals:
@@ -2374,10 +2714,41 @@ func startPeerConnectionTeardownWatchdog(
 	timeout time.Duration,
 	stage *atomic.Int32,
 	onStall func(peerConnectionTeardownStage),
-) *time.Timer {
-	return time.AfterFunc(timeout, func() {
+) *peerConnectionTeardownWatchdog {
+	watchdog := &peerConnectionTeardownWatchdog{
+		done: make(chan struct{}),
+	}
+	watchdog.timer = time.AfterFunc(timeout, func() {
+		defer watchdog.doneOnce.Do(func() {
+			close(watchdog.done)
+		})
 		onStall(peerConnectionTeardownStage(stage.Load()))
 	})
+	return watchdog
+}
+
+// peerConnectionTeardownWatchdog owns its timer callback until StopAndWait.
+type peerConnectionTeardownWatchdog struct {
+	timer    *time.Timer
+	done     chan struct{}
+	doneOnce sync.Once
+}
+
+// Stop prevents a callback that has not begun and reports whether it won.
+func (self *peerConnectionTeardownWatchdog) Stop() bool {
+	stopped := self.timer.Stop()
+	if stopped {
+		self.doneOnce.Do(func() {
+			close(self.done)
+		})
+	}
+	return stopped
+}
+
+// StopAndWait prevents or joins the exact diagnostic callback generation.
+func (self *peerConnectionTeardownWatchdog) StopAndWait() {
+	self.Stop()
+	<-self.done
 }
 
 // conforms to WebRtcConn
@@ -2412,7 +2783,7 @@ type peerConn struct {
 
 	signalSender SignalSender
 	settings     *WebRtcSettings
-	fastPath     *webRtcFastPath
+	fastPath     atomic.Pointer[webRtcFastPath]
 
 	// api *webrtc.API
 	pc *webrtc.PeerConnection
@@ -2424,6 +2795,18 @@ type peerConn struct {
 	outboundProgress   chan struct{}
 	outboundByteCount  atomic.Uint64
 	progressWatchOnce  sync.Once
+	workers            *lifecycleAdmission
+	// Nil test barrier pauses an owned worker before joined completion.
+	beforeWorkerDoneForTest func(string)
+	// Nil test barriers expose admitted Pion callbacks before terminal state
+	// publication, where teardown must win without leaving stale resources.
+	beforeIceCandidateStateLockForTest    func()
+	beforeConnectedStateLockForTest       func()
+	beforeOpenDataChannelStateLockForTest func()
+	beforeReceiveSignalLockForTest        func()
+	beforeReceiveSignalBatchForTest       func()
+	// Nil test barrier confirms Run installed its Pion callback registrations.
+	afterPionCallbacksRegisteredForTest func()
 
 	// Closed once when the outer transport should reconnect without honoring
 	// the usual backoff delay. A persistent one-shot channel cannot lose a
@@ -2460,6 +2843,15 @@ type peerConn struct {
 	signalGeneration          Id
 	remoteSignalGeneration    Id
 	remoteSignalGenerationSet bool
+	// Inbound signaling supplies the local lane/session used by replies. Active
+	// setup has no key until the peer answers, so the presence bit is separate.
+	signalReplyTransferKey    TransferKey
+	signalReplyTransferKeySet bool
+	// ICE callbacks are deferred by Pion. Pin their reply key to the SDP
+	// negotiation that started gathering so a later signal on another logical
+	// lane cannot retarget already-scheduled candidates.
+	iceCandidateReplyTransferKey    TransferKey
+	iceCandidateReplyTransferKeySet bool
 
 	// candidates emitted before sdp negotiation completes are buffered
 	// here so they aren't dropped. flushed once iceCandidatesReady is set.
@@ -2531,8 +2923,58 @@ func newPeerConn(
 		outboundProgress:   make(chan struct{}, 1),
 		immediateReconnect: make(chan struct{}),
 		teardownDone:       make(chan struct{}),
+		workers:            newLifecycleAdmission(),
 	}
 	return conn, nil
+}
+
+// startWorker admits one Run, callback-dispatch, or progress-watchdog worker
+// before launch.
+func (self *peerConn) startWorker(name string, run func(), handlers ...any) bool {
+	workers := self.lifecycleWorkers()
+	if !workers.start() {
+		return false
+	}
+	go func() {
+		defer workers.finish()
+		HandleError(run, handlers...)
+		if self.beforeWorkerDoneForTest != nil {
+			self.beforeWorkerDoneForTest(name)
+		}
+	}()
+	return true
+}
+
+// runPionCallback owns one synchronously dispatched Pion callback body under
+// the same generation gate as peer workers. Teardown closes this gate before
+// PeerConnection.Close, so callbacks already in flight are joined and later
+// callbacks cannot mutate or signal through a retired generation.
+func (self *peerConn) runPionCallback(name string, run func(), handlers ...any) bool {
+	workers := self.lifecycleWorkers()
+	if !workers.start() {
+		return false
+	}
+	defer workers.finish()
+	if self.settings != nil && self.settings.beforePionCallbackForTest != nil {
+		self.settings.beforePionCallbackForTest(name)
+	}
+	HandleError(run, handlers...)
+	if self.beforeWorkerDoneForTest != nil {
+		self.beforeWorkerDoneForTest(name)
+	}
+	return true
+}
+
+// lifecycleWorkers returns the generation gate. Production constructors set
+// it eagerly; lazy initialization preserves lightweight synthetic peerConn
+// values used by compatibility tests.
+func (self *peerConn) lifecycleWorkers() *lifecycleAdmission {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.workers == nil {
+		self.workers = newLifecycleAdmission()
+	}
+	return self.workers
 }
 
 func (self *peerConn) Run() {
@@ -2545,10 +2987,14 @@ func (self *peerConn) Run() {
 	// allocate another waiting goroutine.
 
 	self.pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-		self.handleICEConnectionState(state)
+		self.runPionCallback("ICE connection state callback", func() {
+			self.handleICEConnectionState(state)
+		}, self.cancel)
 	})
 	self.pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		self.handlePeerConnectionState(state)
+		self.runPionCallback("peer connection state callback", func() {
+			self.handlePeerConnectionState(state)
+		}, self.cancel)
 	})
 	if err := self.configureFastPath(); err != nil {
 		self.cancelBecause(fmt.Errorf("configure datagram fast path: %w", err))
@@ -2560,22 +3006,9 @@ func (self *peerConn) Run() {
 	// the negotiation is far enough along to send them (after the peer has
 	// our sdp). flushIceCandidates flips the ready flag and drains the buffer.
 	self.pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
-		if candidate == nil {
-			return
-		}
-		var send bool
-		func() {
-			self.stateLock.Lock()
-			defer self.stateLock.Unlock()
-			if self.iceCandidatesReady {
-				send = true
-			} else {
-				self.iceCandidateBuffer = append(self.iceCandidateBuffer, candidate)
-			}
-		}()
-		if send {
-			self.sendIceCandidate(candidate)
-		}
+		self.runPionCallback("ICE candidate callback", func() {
+			self.handleLocalIceCandidate(candidate)
+		}, self.cancel)
 	})
 
 	if self.active {
@@ -2589,25 +3022,34 @@ func (self *peerConn) Run() {
 		}
 
 		dc.OnOpen(func() {
-			self.handleOpenDataChannel(dc)
+			self.runPionCallback("data channel open callback", func() {
+				self.handleOpenDataChannel(dc)
+			}, self.cancel)
 		})
 	} else {
 		self.pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-			if dc.Label() != self.settings.DataChannelLabel {
-				self.log.V(1).Infof("[peerconn]ignoring unexpected data channel label %q\n", dc.Label())
-				// Installing a custom handler replaces Pion's default handler,
-				// which closes undeclared channels. Preserve that resource
-				// bound explicitly so a peer cannot retain arbitrary SCTP
-				// streams by opening labels this transport never consumes.
-				if err := dc.Close(); err != nil && self.log.V(1).Enabled() {
-					self.log.Infof("[peerconn]unexpected data channel close err = %s\n", err)
+			self.runPionCallback("data channel callback", func() {
+				if dc.Label() != self.settings.DataChannelLabel {
+					self.log.V(1).Infof("[peerconn]ignoring unexpected data channel label %q\n", dc.Label())
+					// Installing a custom handler replaces Pion's default handler,
+					// which closes undeclared channels. Preserve that resource
+					// bound explicitly so a peer cannot retain arbitrary SCTP
+					// streams by opening labels this transport never consumes.
+					if err := dc.Close(); err != nil && self.log.V(1).Enabled() {
+						self.log.Infof("[peerconn]unexpected data channel close err = %s\n", err)
+					}
+					return
 				}
-				return
-			}
-			dc.OnOpen(func() {
-				self.handleOpenDataChannel(dc)
-			})
+				dc.OnOpen(func() {
+					self.runPionCallback("data channel open callback", func() {
+						self.handleOpenDataChannel(dc)
+					}, self.cancel)
+				})
+			}, self.cancel)
 		})
+	}
+	if self.afterPionCallbacksRegisteredForTest != nil {
+		self.afterPionCallbacksRegisteredForTest()
 	}
 
 	if self.active {
@@ -2684,7 +3126,7 @@ func (self *peerConn) teardown() {
 				)
 			},
 		)
-		defer slowTeardownTimer.Stop()
+		defer slowTeardownTimer.StopAndWait()
 		self.cancel()
 
 		// Break the physical path before PeerConnection.Close starts its normal
@@ -2717,12 +3159,19 @@ func (self *peerConn) teardown() {
 			}
 		}
 
+		teardownStage.Store(int32(peerConnectionTeardownClosingFastPath))
+		self.closeFastPath()
+
 		teardownStage.Store(int32(peerConnectionTeardownClosingDataChannel))
 		var conn datachannel.ReadWriteCloserDeadliner
 		self.stateLock.Lock()
 		conn = self.conn
 		self.conn = nil
 		self.iceCandidateBuffer = nil
+		if self.connected {
+			self.connected = false
+			self.connectedGeneration++
+		}
 		self.stateLock.Unlock()
 		if conn != nil {
 			_ = conn.SetReadDeadline(time.Now())
@@ -2779,7 +3228,7 @@ func (self *peerConn) startConnectedDispatch() {
 		// A single dispatch goroutine serializes callback invocation and emits
 		// the latest state/generation, so flap-collapsing remains in order and
 		// user callbacks never run on Pion's state-change goroutine.
-		go HandleError(func() {
+		self.startWorker("connected dispatch", func() {
 			for {
 				notify := self.connectedMonitor.NotifyChannel()
 				var current bool
@@ -2838,10 +3287,30 @@ func (self *peerConn) ReceiveSignalFromPeer(signal *protocol.ExchangeSignal) err
 	return self.receiveSignalFromPeer(signal, Id{}, false)
 }
 
+// Applies one signal using the latest reply lane for direct callers that do
+// not carry callback metadata.
 func (self *peerConn) receiveSignalFromPeer(
 	signal *protocol.ExchangeSignal,
 	senderGenerationId Id,
 	senderGenerationSet bool,
+) error {
+	transferKey, transferKeySet := self.signalReplyKey()
+	return self.receiveSignalFromPeerWithTransferKey(
+		signal,
+		senderGenerationId,
+		senderGenerationSet,
+		transferKey,
+		transferKeySet,
+	)
+}
+
+// Applies one signal with the immutable callback lane that received it.
+func (self *peerConn) receiveSignalFromPeerWithTransferKey(
+	signal *protocol.ExchangeSignal,
+	senderGenerationId Id,
+	senderGenerationSet bool,
+	transferKey TransferKey,
+	transferKeySet bool,
 ) error {
 	if signal == nil {
 		return nil
@@ -2862,11 +3331,20 @@ func (self *peerConn) receiveSignalFromPeer(
 	default:
 	}
 
+	if self.beforeReceiveSignalLockForTest != nil {
+		self.beforeReceiveSignalLockForTest()
+	}
 	self.signalLock.Lock()
+	if self.ctx != nil && self.ctx.Err() != nil {
+		self.signalLock.Unlock()
+		return nil
+	}
 	toSend, flushLocalCandidates, immediateReconnect, fatal, err := self.receiveSignalFromPeerLocked(
 		signal,
 		senderGenerationId,
 		senderGenerationSet,
+		transferKey,
+		transferKeySet,
 	)
 	self.signalLock.Unlock()
 
@@ -2881,7 +3359,13 @@ func (self *peerConn) receiveSignalFromPeer(
 	// signalLock permits a synchronous answer/candidate response without a
 	// lock cycle while preserving transfer-client backpressure.
 	if len(toSend) != 0 {
-		self.sendSignalsNonBlocking(toSend)
+		self.sendSignalsWithTransferKey(
+			toSend,
+			false,
+			true,
+			transferKey,
+			transferKeySet,
+		)
 	}
 	if flushLocalCandidates {
 		self.flushIceCandidatesNonBlocking()
@@ -2905,6 +3389,9 @@ func (self *peerConn) resetRemoteSignals(
 ) bool {
 	self.signalLock.Lock()
 	defer self.signalLock.Unlock()
+	if self.ctx != nil && self.ctx.Err() != nil {
+		return false
+	}
 
 	if self.active {
 		return false
@@ -2930,10 +3417,13 @@ func (self *peerConn) resetRemoteSignals(
 	return false
 }
 
+// Advances Pion signaling while signalLock serializes one peer generation.
 func (self *peerConn) receiveSignalFromPeerLocked(
 	signal *protocol.ExchangeSignal,
 	senderGenerationId Id,
 	senderGenerationSet bool,
+	transferKey TransferKey,
+	transferKeySet bool,
 ) (
 	toSend []*protocol.ExchangeSignal,
 	flushLocalCandidates bool,
@@ -2959,6 +3449,7 @@ func (self *peerConn) receiveSignalFromPeerLocked(
 		if err = self.pc.SetRemoteDescription(offer); err != nil {
 			return
 		}
+		self.setIceCandidateReplyKey(transferKey, transferKeySet)
 		self.setOfferSignal(signal)
 		self.remoteSignalGeneration = senderGenerationId
 		self.remoteSignalGenerationSet = senderGenerationSet
@@ -3005,6 +3496,7 @@ func (self *peerConn) receiveSignalFromPeerLocked(
 		if err = self.pc.SetRemoteDescription(answer); err != nil {
 			return
 		}
+		self.setIceCandidateReplyKey(transferKey, transferKeySet)
 		self.setAnswerSignal(signal)
 		self.remoteSignalGeneration = senderGenerationId
 		self.remoteSignalGenerationSet = senderGenerationSet
@@ -3127,20 +3619,40 @@ func (self *peerConn) flushRemoteIceCandidatesLocked() {
 	}
 }
 
+// Sends one gathered candidate with the negotiation's reply-key snapshot.
 func (self *peerConn) sendIceCandidate(candidate *webrtc.ICECandidate) {
 	self.sendIceCandidates([]*webrtc.ICECandidate{candidate})
 }
 
+// Serializes gathered candidates with one reply-key snapshot per batch.
 func (self *peerConn) sendIceCandidates(candidates []*webrtc.ICECandidate) {
 	self.sendIceCandidatesWithOpts(candidates, false)
 }
 
+// Serializes gathered candidates with the currently pinned negotiation lane.
 func (self *peerConn) sendIceCandidatesWithOpts(candidates []*webrtc.ICECandidate, nonBlocking bool) {
+	transferKey, transferKeySet := self.iceCandidateReplyKey()
+	self.sendIceCandidatesWithTransferKey(candidates, transferKey, transferKeySet, nonBlocking)
+}
+
+// Serializes gathered candidates with an immutable negotiation lane.
+func (self *peerConn) sendIceCandidatesWithTransferKey(
+	candidates []*webrtc.ICECandidate,
+	transferKey TransferKey,
+	transferKeySet bool,
+	nonBlocking bool,
+) {
 	signals := make([]*protocol.ExchangeSignal, 0, min(len(candidates), maxIceCandidatesPerSignalFrame))
 	signalBytes := 0
 	flush := func() {
 		if len(signals) != 0 {
-			self.sendSignalsWithOpts(signals, false, nonBlocking)
+			self.sendSignalsWithTransferKey(
+				signals,
+				false,
+				nonBlocking,
+				transferKey,
+				transferKeySet,
+			)
 			signals = make([]*protocol.ExchangeSignal, 0, min(len(candidates), maxIceCandidatesPerSignalFrame))
 			signalBytes = 0
 		}
@@ -3171,6 +3683,7 @@ func (self *peerConn) sendIceCandidatesWithOpts(candidates []*webrtc.ICECandidat
 	flush()
 }
 
+// Marks buffered local candidates ready and sends them with one lane snapshot.
 func (self *peerConn) flushIceCandidates() {
 	self.flushIceCandidatesWithOpts(false)
 }
@@ -3181,20 +3694,73 @@ func (self *peerConn) flushIceCandidatesNonBlocking() {
 	self.flushIceCandidatesWithOpts(true)
 }
 
+// Publishes buffered candidates with the SDP generation's immutable lane.
 func (self *peerConn) flushIceCandidatesWithOpts(nonBlocking bool) {
 	var toSend []*webrtc.ICECandidate
+	var transferKey TransferKey
+	var transferKeySet bool
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		self.iceCandidatesReady = true
 		toSend = self.iceCandidateBuffer
 		self.iceCandidateBuffer = nil
+		if !self.iceCandidateReplyTransferKeySet && self.signalReplyTransferKeySet {
+			self.iceCandidateReplyTransferKey = self.signalReplyTransferKey
+			self.iceCandidateReplyTransferKeySet = true
+		}
+		transferKey = self.iceCandidateReplyTransferKey
+		transferKeySet = self.iceCandidateReplyTransferKeySet
+		if !transferKeySet {
+			transferKey = self.signalReplyTransferKey
+			transferKeySet = self.signalReplyTransferKeySet
+		}
 	}()
 	// Candidates gathered before SDP readiness are already adjacent and
 	// share one destination. Send one protobuf frame instead of one transfer
 	// callback/frame per interface, cutting allocations and queue pressure
 	// without adding a timer or delaying late trickle candidates.
-	self.sendIceCandidatesWithOpts(toSend, nonBlocking)
+	self.sendIceCandidatesWithTransferKey(toSend, transferKey, transferKeySet, nonBlocking)
+}
+
+// Buffers a local candidate until SDP is ready or sends it using the pinned
+// negotiation lane. Pion may invoke this callback after later signals arrive.
+func (self *peerConn) handleLocalIceCandidate(candidate *webrtc.ICECandidate) {
+	if candidate == nil {
+		return
+	}
+	if self.beforeIceCandidateStateLockForTest != nil {
+		self.beforeIceCandidateStateLockForTest()
+	}
+	var send bool
+	var transferKey TransferKey
+	var transferKeySet bool
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if self.ctx != nil && self.ctx.Err() != nil {
+			return
+		}
+		if self.iceCandidatesReady {
+			send = true
+			transferKey = self.iceCandidateReplyTransferKey
+			transferKeySet = self.iceCandidateReplyTransferKeySet
+			if !transferKeySet {
+				transferKey = self.signalReplyTransferKey
+				transferKeySet = self.signalReplyTransferKeySet
+			}
+		} else {
+			self.iceCandidateBuffer = append(self.iceCandidateBuffer, candidate)
+		}
+	}()
+	if send {
+		self.sendIceCandidatesWithTransferKey(
+			[]*webrtc.ICECandidate{candidate},
+			transferKey,
+			transferKeySet,
+			false,
+		)
+	}
 }
 
 // ImmediateReconnect returns a persistent one-shot channel that closes when
@@ -3218,10 +3784,16 @@ func (self *peerConn) Connected() bool {
 
 func (self *peerConn) setConnected(connected bool) {
 	changed := false
+	if self.beforeConnectedStateLockForTest != nil {
+		self.beforeConnectedStateLockForTest()
+	}
 
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
+		if connected && self.ctx != nil && self.ctx.Err() != nil {
+			return
+		}
 
 		if self.connected != connected {
 			self.connected = connected
@@ -3337,10 +3909,49 @@ func (self *peerConn) answerSignal() *protocol.ExchangeSignal {
 	return self.answer
 }
 
+// setSignalReplyTransferKey records the receiver-visible lane/session before
+// processing a signal that may synchronously produce a response.
+func (self *peerConn) setSignalReplyTransferKey(transferKey TransferKey) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.ctx != nil && self.ctx.Err() != nil {
+		return
+	}
+	self.signalReplyTransferKey = transferKey
+	self.signalReplyTransferKeySet = true
+}
+
+// signalReplyKey returns one stable snapshot without holding state across a send.
+func (self *peerConn) signalReplyKey() (TransferKey, bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.signalReplyTransferKey, self.signalReplyTransferKeySet
+}
+
+// Pins the reply lane to the SDP negotiation that produces local candidates.
+func (self *peerConn) setIceCandidateReplyKey(transferKey TransferKey, transferKeySet bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.iceCandidateReplyTransferKey = transferKey
+	self.iceCandidateReplyTransferKeySet = transferKeySet
+}
+
+// Returns the pinned candidate lane, falling back only before SDP has bound it.
+func (self *peerConn) iceCandidateReplyKey() (TransferKey, bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.iceCandidateReplyTransferKeySet {
+		return self.iceCandidateReplyTransferKey, true
+	}
+	return self.signalReplyTransferKey, self.signalReplyTransferKeySet
+}
+
+// Sends one signal using a stable reply-key snapshot.
 func (self *peerConn) sendSignal(signal *protocol.ExchangeSignal) {
 	self.sendSignals([]*protocol.ExchangeSignal{signal})
 }
 
+// Sends one batch using a stable reply-key snapshot.
 func (self *peerConn) sendSignals(signalValues []*protocol.ExchangeSignal) {
 	self.sendSignalsWithOpts(signalValues, false, false)
 }
@@ -3351,11 +3962,31 @@ func (self *peerConn) sendSignalsNonBlocking(signalValues []*protocol.ExchangeSi
 	self.sendSignalsWithOpts(signalValues, false, true)
 }
 
+// Sends one batch with a fresh-generation marker when requested.
 func (self *peerConn) sendSignalsWithReset(signalValues []*protocol.ExchangeSignal, resetSignals bool) {
 	self.sendSignalsWithOpts(signalValues, resetSignals, false)
 }
 
+// Snapshots the current immediate-reply lane before building a signal frame.
 func (self *peerConn) sendSignalsWithOpts(signalValues []*protocol.ExchangeSignal, resetSignals bool, nonBlocking bool) {
+	transferKey, transferKeySet := self.signalReplyKey()
+	self.sendSignalsWithTransferKey(
+		signalValues,
+		resetSignals,
+		nonBlocking,
+		transferKey,
+		transferKeySet,
+	)
+}
+
+// Builds and sends one signal frame using an immutable logical reply lane.
+func (self *peerConn) sendSignalsWithTransferKey(
+	signalValues []*protocol.ExchangeSignal,
+	resetSignals bool,
+	nonBlocking bool,
+	transferKey TransferKey,
+	transferKeySet bool,
+) {
 	if len(signalValues) == 0 {
 		return
 	}
@@ -3383,10 +4014,21 @@ func (self *peerConn) sendSignalsWithOpts(signalValues []*protocol.ExchangeSigna
 	// signaling layer must match the data path or the signal forks onto an
 	// undeliverable sequence. See PACKETRESEARCH1 §17.
 	var opts []any
+	if transferKeySet {
+		opts = append(opts, transferKey)
+	}
 	if self.active {
-		opts = append(opts, ForceStream())
+		opts = append(
+			opts,
+			transferOptionsSetForceStream{ForceStream: true},
+			transferOptionsSetCompanionContract{CompanionContract: false},
+		)
 	} else {
-		opts = append(opts, CompanionContract())
+		opts = append(
+			opts,
+			transferOptionsSetForceStream{ForceStream: false},
+			transferOptionsSetCompanionContract{CompanionContract: true},
+		)
 	}
 	// A full transfer send queue is intentional backpressure while this peer
 	// generation is live. Bind that wait to the generation, not the entire
@@ -3399,7 +4041,7 @@ func (self *peerConn) sendSignalsWithOpts(signalValues []*protocol.ExchangeSigna
 		opts = append(opts, signalSendNonBlocking{})
 	}
 	self.signalSender.SendSignal(
-		DestinationId(self.key.PeerId).AddSource(self.sourceId),
+		self.key.PeerId,
 		RequireToFrameWithDefaultProtocolVersion(signals),
 		opts...,
 	)
@@ -3418,25 +4060,35 @@ func (self *peerConn) setOpenDataChannel(dc *webrtc.DataChannel) error {
 	if err != nil {
 		return err
 	}
+	self.installOpenDataChannel(conn)
+	return nil
+}
 
-	var prev datachannel.ReadWriteCloserDeadliner
+// installOpenDataChannel publishes one already-detached connection only while
+// its peer generation remains live. A callback admitted before cancellation
+// may reach this boundary after teardown cleared the old connection; reject
+// and close that late resource instead of repopulating retired state.
+func (self *peerConn) installOpenDataChannel(conn datachannel.ReadWriteCloserDeadliner) bool {
+	if self.beforeOpenDataChannelStateLockForTest != nil {
+		self.beforeOpenDataChannelStateLockForTest()
+	}
+
+	accepted := false
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
-
-		prev = self.conn
-		if prev == nil {
+		if (self.ctx == nil || self.ctx.Err() == nil) && self.conn == nil {
 			self.conn = conn
+			accepted = true
 			self.connMonitor.NotifyAll()
 		}
 	}()
-	if prev != nil {
-		// One peer connection carries one transport. A duplicate channel must
-		// not replace and close the live backpressured net.Conn.
-		conn.Close()
+	if !accepted {
+		// One peer connection carries one transport. A duplicate or a late
+		// callback must not replace the live/retired generation's connection.
+		_ = conn.Close()
 	}
-
-	return nil
+	return accepted
 }
 
 func (self *peerConn) dataChannelConn(deadline time.Time) (datachannel.ReadWriteCloserDeadliner, error) {
@@ -3493,7 +4145,7 @@ func (self *peerConn) noteOutboundSctpActivity() {
 		return
 	}
 	self.progressWatchOnce.Do(func() {
-		go HandleError(self.runSctpProgressWatchdog, self.cancel)
+		self.startWorker("SCTP progress watchdog", self.runSctpProgressWatchdog, self.cancel)
 	})
 	select {
 	case self.outboundProgress <- struct{}{}:

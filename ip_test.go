@@ -352,7 +352,7 @@ func testClient[P comparable](
 				panic(err)
 			}
 
-			success := providerClient.SendWithTimeout(frame, source.Reverse(), func(err error) {}, -1)
+			success := providerClient.SendWithTimeout(frame, source.SourceId, func(err error) {}, -1)
 			AssertEqual(t, true, success)
 
 			// cMutex.Lock()

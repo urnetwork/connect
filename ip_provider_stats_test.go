@@ -28,8 +28,16 @@ func TestRemoteUserNatProviderPacketStats(t *testing.T) {
 	// bound the return-path send so a failed enqueue cannot stall the test
 	providerSettings.WriteTimeout = 1 * time.Second
 	providerSettings.EventEpoch = 50 * time.Millisecond
+	returnSendObservations := make(chan RemoteUserNatProviderReturnSendObservation, 4)
+	providerSettings.ReturnSendObserver = func(observation RemoteUserNatProviderReturnSendObservation) {
+		returnSendObservations <- observation
+	}
 	provider := NewRemoteUserNatProvider(providerClient, localUserNat, providerSettings)
 	defer provider.Close()
+	returnSendResults := make(chan providerReturnSendResult, 2)
+	provider.afterReturnSendForTest = func(result providerReturnSendResult) {
+		returnSendResults <- result
+	}
 
 	packetStatsChannel := make(chan *PacketStats, 16)
 	unsubPacketStats := provider.AddPacketStatsCallback(func(packetStats *PacketStats) {
@@ -66,20 +74,27 @@ func TestRemoteUserNatProviderPacketStats(t *testing.T) {
 
 	// the packet is a non-SYN with no tcp sequence, so the nat answers with
 	// an orphan RST (PROXYDRAIN1.md §3.5) — the provider's first remote
-	// egress. Wait for it (the nat send path is asynchronous) so the exact
-	// counts below are deterministic, and capture its size.
-	var rstByteCount ByteCount
-	rstDeadline := time.Now().Add(5 * time.Second)
-	for {
-		stats = provider.PacketStats()
-		if stats.RemoteEgressPacketCount == 1 {
-			rstByteCount = stats.RemoteEgressByteCount
-			break
-		}
-		if rstDeadline.Before(time.Now()) {
-			t.Fatalf("expected the orphan rst egress %+v", stats)
-		}
-		time.Sleep(10 * time.Millisecond)
+	// egress. The sender completion hook follows its accounting update, so the
+	// exact result replaces timing-based counter polling.
+	rstResult := waitProviderReturnSendCompletion(t, returnSendResults)
+	if !rstResult.sent || rstResult.packetCount != 1 || rstResult.packetByteCount <= 0 {
+		t.Fatalf("unexpected orphan rst return result %+v", rstResult)
+	}
+	rstStarted := <-returnSendObservations
+	rstObservation := <-returnSendObservations
+	if rstStarted.Phase != RemoteUserNatProviderReturnSendPhaseStarted ||
+		rstObservation.Phase != RemoteUserNatProviderReturnSendPhaseCompleted ||
+		rstStarted.Token == 0 || rstObservation.Token != rstStarted.Token {
+		t.Fatalf("orphan rst observation pair started=%+v completed=%+v", rstStarted, rstObservation)
+	}
+	if !rstObservation.Sent || rstObservation.PacketCount != rstResult.packetCount ||
+		rstObservation.PacketByteCount != rstResult.packetByteCount {
+		t.Fatalf("exported orphan rst observation=%+v result=%+v", rstObservation, rstResult)
+	}
+	rstByteCount := rstResult.packetByteCount
+	stats = provider.PacketStats()
+	if stats.RemoteEgressPacketCount != 1 || stats.RemoteEgressByteCount != rstByteCount {
+		t.Fatalf("unexpected orphan rst egress stats %+v", stats)
 	}
 
 	// a tunneled BitTorrent handshake is dropped by the reversed policy DPI
@@ -103,9 +118,27 @@ func TestRemoteUserNatProviderPacketStats(t *testing.T) {
 		t.Fatalf("parse ip path: %v", err)
 	}
 	provider.Receive(source, protocol.ProvideMode_Public, returnIpPath, returnPacket)
-
+	waitProviderReturnSendResult(
+		t,
+		returnSendResults,
+		true,
+		1,
+		ByteCount(len(returnPacket)),
+	)
+	returnStarted := <-returnSendObservations
+	returnObservation := <-returnSendObservations
+	if returnStarted.Phase != RemoteUserNatProviderReturnSendPhaseStarted ||
+		returnObservation.Phase != RemoteUserNatProviderReturnSendPhaseCompleted ||
+		returnStarted.Token == 0 || returnObservation.Token != returnStarted.Token {
+		t.Fatalf("return observation pair started=%+v completed=%+v", returnStarted, returnObservation)
+	}
+	if !returnObservation.Sent || returnObservation.PacketCount != 1 ||
+		returnObservation.PacketByteCount != ByteCount(len(returnPacket)) {
+		t.Fatalf("exported return observation=%+v", returnObservation)
+	}
 	stats = provider.PacketStats()
-	if stats.RemoteEgressPacketCount != 2 || stats.RemoteEgressByteCount != rstByteCount+ByteCount(len(returnPacket)) {
+	if stats.RemoteEgressPacketCount != 2 ||
+		stats.RemoteEgressByteCount != rstByteCount+ByteCount(len(returnPacket)) {
 		t.Fatalf("unexpected egress stats %+v", stats)
 	}
 

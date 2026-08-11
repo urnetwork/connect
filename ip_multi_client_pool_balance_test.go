@@ -294,7 +294,7 @@ func runMultiClientPoolCycle(ctx context.Context, t *testing.T) {
 				MessagePoolReturn(packet)
 				continue
 			}
-			sent := providerClient.SendWithTimeout(frame, src.Reverse(), func(err error) {}, -1)
+			sent := providerClient.SendWithTimeout(frame, src.SourceId, func(err error) {}, -1)
 			if !sent {
 				MessagePoolReturn(frame.MessageBytes)
 			}
