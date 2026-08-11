@@ -133,3 +133,51 @@ func TestExitScoreSanitizesHostileInputs(t *testing.T) {
 		}
 	}
 }
+
+func TestExitScoreGuardsStallEvents(t *testing.T) {
+	w := classWeights(ClassLatency)
+
+	// Baseline: healthy exit with 0 stalls.
+	healthy := exitScore(ExitMetrics{RttMillis: 50, GoodputBytesPerSec: 1e6, Jitter: 20, StallEvents: 0}, w)
+
+	// Assertion 1: Negative StallEvents must not score higher than 0.
+	// Corrupt counter claiming -50 stalls must not become a reward.
+	negativeStalls := exitScore(ExitMetrics{RttMillis: 50, GoodputBytesPerSec: 1e6, Jitter: 20, StallEvents: -50}, w)
+	if negativeStalls > healthy {
+		t.Errorf("negative stalls: score=%f should not be > healthy=%f", negativeStalls, healthy)
+	}
+
+	// Assertion 2: Negative StallEvents must not win at 10% hysteresis.
+	if challengerWins(healthy, negativeStalls, 10) {
+		t.Errorf("negative stalls should not win challengerWins against healthy at 10%%, score=%f vs incumbent=%f",
+			negativeStalls, healthy)
+	}
+
+	// Assertion 3: Ordering preserved across normal stall counts (0 < 1 < 5).
+	stall1 := exitScore(ExitMetrics{RttMillis: 50, GoodputBytesPerSec: 1e6, Jitter: 20, StallEvents: 1}, w)
+	stall5 := exitScore(ExitMetrics{RttMillis: 50, GoodputBytesPerSec: 1e6, Jitter: 20, StallEvents: 5}, w)
+
+	if !(healthy > stall1) {
+		t.Errorf("ordering: 0 stalls=%f should be > 1 stall=%f", healthy, stall1)
+	}
+	if !(stall1 > stall5) {
+		t.Errorf("ordering: 1 stall=%f should be > 5 stalls=%f", stall1, stall5)
+	}
+
+	// Assertion 4: Extreme stall count produces bounded, finite score.
+	// Cap is at 3.0 penalty, so stalls above 30 should all give the same score.
+	stall30 := exitScore(ExitMetrics{RttMillis: 50, GoodputBytesPerSec: 1e6, Jitter: 20, StallEvents: 30}, w)
+	stall100 := exitScore(ExitMetrics{RttMillis: 50, GoodputBytesPerSec: 1e6, Jitter: 20, StallEvents: 100}, w)
+
+	if math.IsNaN(stall30) || math.IsInf(stall30, 0) {
+		t.Errorf("stall30 returned non-finite: %f", stall30)
+	}
+	if math.IsNaN(stall100) || math.IsInf(stall100, 0) {
+		t.Errorf("stall100 returned non-finite: %f", stall100)
+	}
+	// Both should be identical (capped).
+	if stall30 != stall100 {
+		t.Errorf("both stall30=%f and stall100=%f should be capped identically, not %f",
+			stall30, stall100, stall100-stall30)
+	}
+}

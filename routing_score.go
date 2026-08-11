@@ -73,7 +73,20 @@ func exitScore(m ExitMetrics, w ScoreWeights) float64 {
 	}
 	goodputGood := goodput / (goodput + 1e6) // 1MB/s → 0.5
 
-	stallPenalty := float64(m.StallEvents) * 0.1
+	// Clamp StallEvents: negative values (corrupt/underflowed counter) must never
+	// become a reward. Cap the penalty to prevent unboundedly negative scores:
+	// max positive contribution is ~3.0 (perfect RTT + Goodput + Jitter), so
+	// capping stallPenalty at 3.0 prevents hostile telemetry from pushing score
+	// below -3.0. This caps StallEvents at 30; normal ranges (<10) remain
+	// monotonically ordered.
+	stallCount := m.StallEvents
+	if stallCount < 0 {
+		stallCount = 0
+	}
+	stallPenalty := float64(stallCount) * 0.1
+	if stallPenalty > 3.0 {
+		stallPenalty = 3.0
+	}
 	return w.Rtt*rttGood + w.Goodput*goodputGood + w.Jitter*jitterGood - w.Stall*stallPenalty
 }
 
