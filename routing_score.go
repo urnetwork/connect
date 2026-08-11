@@ -99,3 +99,36 @@ func exitScore(m ExitMetrics, w ScoreWeights) float64 {
 func challengerWins(incumbent, challenger, hysteresisPct float64) bool {
 	return challenger > incumbent+math.Abs(incumbent)*hysteresisPct/100.0
 }
+
+// demotionState implements N-of-M rank demotion: an exit is only demoted after
+// needBad consecutive bad intervals, so a single noisy sample never re-ranks the
+// window. A good sample resets the streak. needBad<=1 is the legacy behavior
+// (act on every sample). Convictions are unaffected — they are evidence-based
+// and handled by the verdict layer, not by this score demotion.
+type demotionState struct {
+	bad int
+}
+
+func (d *demotionState) observe(good bool, needBad int) bool {
+	if good {
+		d.bad = 0
+		return false
+	}
+	d.bad++
+	return d.bad >= max(1, needBad)
+}
+
+// lessLoadedTieBreak returns true when challenger b should be preferred over
+// incumbent a. When neither strictly wins under hysteresis (a near-tie), the
+// less-loaded of the two wins — the power-of-two-choices anti-herding rule that
+// spreads flows instead of piling them on one favorite. Outside the margin the
+// higher score wins outright.
+func lessLoadedTieBreak(aScore, bScore float64, aFlows, bFlows int, hysteresisPct float64) bool {
+	if challengerWins(aScore, bScore, hysteresisPct) {
+		return true
+	}
+	if challengerWins(bScore, aScore, hysteresisPct) {
+		return false
+	}
+	return bFlows < aFlows
+}

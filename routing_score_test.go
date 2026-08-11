@@ -181,3 +181,46 @@ func TestExitScoreGuardsStallEvents(t *testing.T) {
 			stall30, stall100, stall100-stall30)
 	}
 }
+
+func TestDemotionNeedsNofM(t *testing.T) {
+	d := &demotionState{}
+	if d.observe(false, 3) || d.observe(false, 3) {
+		t.Fatal("demoted before 3 consecutive bad")
+	}
+	if !d.observe(false, 3) {
+		t.Fatal("should demote on 3rd consecutive bad")
+	}
+	d2 := &demotionState{}
+	d2.observe(false, 3)
+	d2.observe(true, 3) // recovery resets
+	if d2.observe(false, 3) {
+		t.Fatal("a good sample must reset the streak")
+	}
+}
+
+func TestLessLoadedTieBreak(t *testing.T) {
+	// within 10% margin → prefer less-loaded (b has fewer flows)
+	if !lessLoadedTieBreak(100, 105, 30, 5, 10) {
+		t.Fatal("near-tie should prefer the less-loaded exit b")
+	}
+	// b clearly worse → keep a even though a is more loaded
+	if lessLoadedTieBreak(100, 60, 30, 5, 10) {
+		t.Fatal("clear score gap must beat load tie-break")
+	}
+}
+
+func TestLessLoadedTieBreakNegativeScores(t *testing.T) {
+	// Both exits are degraded (negative scores), but still in a near-tie:
+	// a=-10, b=-8 within 10% margin of -10 -> prefer less-loaded (b has 5 flows)
+	if !lessLoadedTieBreak(-10, -8, 30, 5, 10) {
+		t.Fatal("near-tie with negative scores should prefer the less-loaded exit b")
+	}
+	// b clearly wins even with negative scores: a=-10, b=-2 is a clear gap
+	if !lessLoadedTieBreak(-10, -2, 30, 5, 10) {
+		t.Fatal("clear improvement in negative scores should have b win even with more load")
+	}
+	// a clearly wins even though both negative: a=-2, b=-10 is a clear gap
+	if lessLoadedTieBreak(-2, -10, 30, 5, 10) {
+		t.Fatal("clear win for negative a should not be displaced by b's load")
+	}
+}
