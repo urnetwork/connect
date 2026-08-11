@@ -1244,6 +1244,11 @@ func (self *clientDialer) HttpClient() *http.Client {
 		if dialTlsContext == nil {
 			dialTlsContext = self.dialTlsContext
 		}
+		// control-dial evidence: while an egress interface is forced (the
+		// windows service/app providing a tunnel), each api dial logs its
+		// local bind address so tester logs prove the escape path. See
+		// egress_dial.go; a no-op everywhere else.
+		dialTlsContext = wrapControlDial("api", self.settings.ConnectSettings.Log, true, dialTlsContext)
 		transport := &http.Transport{
 			DialTLSContext:        dialTlsContext,
 			IdleConnTimeout:       self.settings.ConnectSettings.IdleConnTimeout,
@@ -1280,12 +1285,15 @@ func (self *clientDialer) WsDialer(settings *ClientStrategySettings) *websocket.
 	if self.websocketDialer == nil {
 		var netDialTlsContext DialTlsContextFunction
 		if self.dialTlsContext != nil {
+			// control-dial evidence for the platform transport dials, same as
+			// HttpClient's api tag. See egress_dial.go.
+			dialTlsContext := wrapControlDial("platform", settings.ConnectSettings.Log, true, self.dialTlsContext)
 			netDialTlsContext = func(
 				ctx context.Context,
 				network string,
 				address string,
 			) (net.Conn, error) {
-				conn, err := self.dialTlsContext(ctx, network, address)
+				conn, err := dialTlsContext(ctx, network, address)
 				if err != nil {
 					return nil, err
 				}
@@ -1718,7 +1726,22 @@ func HttpPostStreamWithStrategyRaw(
 		req.Header.Set("Authorization", "Bearer "+byJwt)
 	}
 
-	client := &http.Client{}
+	// NOT http.DefaultClient: on the machine that provides a tunnel, the
+	// default transport's unbound sockets and OS name resolution both follow
+	// the tun default route into this process's own tunnel (R1). Dial through
+	// the connect settings so the socket is egress-bound and the hostname
+	// resolves in-process. See egress.go / egress_dial.go; identical behavior
+	// everywhere else.
+	settings := DefaultConnectSettings()
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext:         wrapControlDial("api", settings.Log, true, settings.DialContext),
+			TLSClientConfig:     settings.TlsConfig,
+			TLSHandshakeTimeout: settings.TlsTimeout,
+			ForceAttemptHTTP2:   true,
+		},
+	}
+	defer client.CloseIdleConnections()
 	res, err := client.Do(req)
 	if err != nil {
 		return nil, err

@@ -1436,7 +1436,9 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			// must not be silent: an unpinned socket here follows the route
 			// table into our own tun and blackholes, which is indistinguishable
 			// from a dead network unless someone says so.
+			egressPinned := egressBound()
 			if err := applyEgress(udpConn); err != nil {
+				egressPinned = false
 				self.log.Infof("[tr]egress bind failed, the platform connection may loop into the tunnel: %s\n", err)
 			}
 			// single close path: once packetConn is bound (either directly
@@ -1463,7 +1465,11 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			switch ptMode {
 			case TransportModeH3Dns:
 				tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
-				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", serverName, self.settings.DnsPort))
+				// resolveEgressUDPAddr, not net.ResolveUDPAddr: the socket is
+				// egress-pinned above, but the NAME must not resolve through
+				// the OS resolver, whose query follows the route table into
+				// the tunnel this process provides. See egress_dial.go.
+				udpAddr, err = resolveEgressUDPAddr(self.ctx, fmt.Sprintf("%s:%d", serverName, self.settings.DnsPort))
 				if err != nil {
 					return nil, err
 				}
@@ -1479,7 +1485,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				if err != nil {
 					return nil, err
 				}
-				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", pumpServerName, self.settings.DnsPort))
+				udpAddr, err = resolveEgressUDPAddr(self.ctx, fmt.Sprintf("%s:%d", pumpServerName, self.settings.DnsPort))
 				if err != nil {
 					return nil, err
 				}
@@ -1490,14 +1496,14 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 					return nil, err
 				}
 			default:
-				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", serverName, self.settings.H3Port))
+				udpAddr, err = resolveEgressUDPAddr(self.ctx, fmt.Sprintf("%s:%d", serverName, self.settings.H3Port))
 				if err != nil {
 					return nil, err
 				}
 				packetConn = udpConn
 			}
 
-			self.log.Infof("[c]h3 connect to %v (%s)\n", udpAddr, serverName)
+			self.log.Infof("[c]h3 connect to %v (%s) local=%v bound=%t\n", udpAddr, serverName, udpConn.LocalAddr(), egressPinned)
 
 			tlsConfig.ServerName = serverName
 			quicTransport := &quic.Transport{

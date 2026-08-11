@@ -130,11 +130,16 @@ func (self *ConnectSettings) NetDialer() *net.Dialer {
 	// egressDialer forces the physical egress interface on Windows so the
 	// service's own connections never loop into the tunnel it provides (R1);
 	// a no-op on other platforms and when no egress index is set.
+	// egressAwareResolver is the other half of the same exclusion: a bound
+	// socket is useless if the NAME the dial needs resolves through the OS
+	// resolver, whose wire query (issued by svchost's DNS Client, not this
+	// process) follows the tun default route to the tunnel's own resolver and
+	// deadlocks behind the tunnel being built. See egress_dial.go.
 	return egressDialer(&net.Dialer{
 		Timeout:         self.ConnectTimeout,
 		KeepAlive:       self.KeepAliveTimeout,
 		KeepAliveConfig: self.KeepAliveConfig,
-		Resolver:        self.Resolver,
+		Resolver:        egressAwareResolver(self.Resolver),
 	})
 }
 

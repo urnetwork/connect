@@ -499,6 +499,10 @@ func authoritativeDnsMiss(err error) bool {
 
 func NewDohCache(settings *DohSettings) *DohCache {
 	lifecycle := newDohCacheLifecycle()
+	// whether this cache's remote path rides the egress-bound host dialer
+	// (DefaultDohSettings) or an owner-supplied dial context (the mux's
+	// in-tunnel path) — carried into the control-dial evidence lines
+	remoteBound := settings.DialContextSettings == nil
 	remoteResolver := &net.Resolver{
 		PreferGo: true,
 		Dial: lifecycle.dialContext(func(ctx context.Context, network string, addr string) (net.Conn, error) {
@@ -512,7 +516,9 @@ func NewDohCache(settings *DohSettings) *DohCache {
 			}
 			localAddr := localAddrs[mathrand.Intn(len(localAddrs))]
 			addr = net.JoinHostPort(localAddr, port)
-			return settings.DialContext(ctx, network, addr)
+			conn, err := settings.DialContext(ctx, network, addr)
+			logControlDialResult(settings.Log, "dns", remoteBound, network, addr, conn, err)
+			return conn, err
 		}),
 	}
 
@@ -530,7 +536,9 @@ func NewDohCache(settings *DohSettings) *DohCache {
 			}
 			localAddr := localAddrs[mathrand.Intn(len(localAddrs))]
 			addr = net.JoinHostPort(localAddr, port)
-			return netDialer.DialContext(ctx, network, addr)
+			conn, err := netDialer.DialContext(ctx, network, addr)
+			logControlDialResult(settings.Log, "dns", true, network, addr, conn, err)
+			return conn, err
 		}),
 	}
 
@@ -543,8 +551,8 @@ func NewDohCache(settings *DohSettings) *DohCache {
 	// (localClient) must never be redeemed through the tunnel (remoteClient) — ticket reuse
 	// across paths would let the DoH server link the host address with the tunnel egress.
 	// Within a path, resumption saves a handshake round trip on every re-dial.
-	httpClient := httpClientWithDialer(settings, lifecycle.dialContext(settings.DialContext), tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity))
-	localHttpClient := httpClientWithDialer(settings, lifecycle.dialContext(netDialer.DialContext), tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity))
+	httpClient := httpClientWithDialer(settings, lifecycle.dialContext(wrapControlDial("doh", settings.Log, remoteBound, settings.DialContext)), tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity))
+	localHttpClient := httpClientWithDialer(settings, lifecycle.dialContext(wrapControlDial("doh", settings.Log, true, netDialer.DialContext)), tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity))
 	// one in-flight-request semaphore and one stats table shared across the remote + local clients,
 	// so the cap bounds the cache's total concurrent DoH requests
 	httpConcurrency := maxConcurrentHttpRequests(settings)
@@ -1101,7 +1109,7 @@ func DohQuery(ctx context.Context, ipVersion int, recordType string, settings *D
 	lifecycle := newDohCacheLifecycle()
 	httpClient := httpClientWithDialer(
 		settings,
-		lifecycle.dialContext(settings.DialContext),
+		lifecycle.dialContext(wrapControlDial("doh", settings.Log, settings.DialContextSettings == nil, settings.DialContext)),
 		tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity),
 	)
 	result := dohQueryWithClient(
