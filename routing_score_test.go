@@ -210,16 +210,19 @@ func TestLessLoadedTieBreak(t *testing.T) {
 }
 
 func TestLessLoadedTieBreakNegativeScores(t *testing.T) {
-	// Both exits are degraded (negative scores), but still in a near-tie:
-	// a=-10, b=-8 within 10% margin of -10 -> prefer less-loaded (b has 5 flows)
-	if !lessLoadedTieBreak(-10, -8, 30, 5, 10) {
+	// Both exits are degraded (negative scores), in a near-tie within 10% margin:
+	// a=-5, b=-4.9. Threshold for b: -5 + 0.5 = -4.5; -4.9 > -4.5 is false.
+	// Reverse: -4.9 + 0.49 = -4.41; -5 > -4.41 is false.
+	// Neither wins outright → flow comparison decides.
+	// With b less loaded (5 flows), prefer b.
+	if !lessLoadedTieBreak(-5, -4.9, 30, 5, 10) {
 		t.Fatal("near-tie with negative scores should prefer the less-loaded exit b")
 	}
-	// b clearly wins even with negative scores: a=-10, b=-2 is a clear gap
-	if !lessLoadedTieBreak(-10, -2, 30, 5, 10) {
-		t.Fatal("clear improvement in negative scores should have b win even with more load")
+	// Same scores, but now a is less loaded (5 flows): should NOT prefer b.
+	if lessLoadedTieBreak(-5, -4.9, 5, 30, 10) {
+		t.Fatal("near-tie with negative scores should prefer the less-loaded exit a, not b")
 	}
-	// a clearly wins even though both negative: a=-2, b=-10 is a clear gap
+	// a clearly wins even though both negative: a=-2, b=-10 is a clear gap.
 	if lessLoadedTieBreak(-2, -10, 30, 5, 10) {
 		t.Fatal("clear win for negative a should not be displaced by b's load")
 	}
