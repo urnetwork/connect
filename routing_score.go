@@ -1,5 +1,7 @@
 package connect
 
+import "math"
+
 // ExitMetrics is the per-(class,exit) signal snapshot the scorer reads. Every
 // field is already collected elsewhere in this file's machinery; the scorer is
 // pure and holds no locks.
@@ -37,21 +39,39 @@ func classWeights(c TrafficClass) ScoreWeights {
 	}
 }
 
-// exitScore is a bounded composite in [0,1]-ish space; higher is better. RTT and
-// jitter are inverted (lower is better) via a soft reciprocal so a 0 metric does
-// not divide; stall events subtract. Constants are deliberate and unit-tested,
-// not tuned here.
+// exitScore returns a composite health score for an exit with the given metrics
+// and traffic class weights. The score is bounded and sanitized: inputs are
+// clamped to prevent NaN/Inf output, negative values are safe (mapped to 0),
+// and non-finite inputs are replaced with a safe finite default. Higher scores
+// indicate better exits. The function is pure: no locks, I/O, or time calls.
 func exitScore(m ExitMetrics, w ScoreWeights) float64 {
-	rttGood := 1.0 / (1.0 + m.RttMillis/50.0)                          // 50ms → 0.5
-	jitterGood := 1.0 / (1.0 + m.Jitter/20.0)                          // 20ms → 0.5
-	goodputGood := m.GoodputBytesPerSec / (m.GoodputBytesPerSec + 1e6) // 1MB/s → 0.5
+	// Sanitize inputs to ensure output is always finite.
+	rtt := m.RttMillis
+	if rtt < 0 || math.IsNaN(rtt) || math.IsInf(rtt, 0) {
+		rtt = 0
+	}
+	jitter := m.Jitter
+	if jitter < 0 || math.IsNaN(jitter) || math.IsInf(jitter, 0) {
+		jitter = 0
+	}
+	goodput := m.GoodputBytesPerSec
+	if goodput < 0 || math.IsNaN(goodput) || math.IsInf(goodput, 0) {
+		goodput = 0
+	}
+
+	rttGood := 1.0 / (1.0 + rtt/50.0)        // 50ms → 0.5
+	jitterGood := 1.0 / (1.0 + jitter/20.0)  // 20ms → 0.5
+	goodputGood := goodput / (goodput + 1e6) // 1MB/s → 0.5
 	stallPenalty := float64(m.StallEvents) * 0.1
 	return w.Rtt*rttGood + w.Goodput*goodputGood + w.Jitter*jitterGood - w.Stall*stallPenalty
 }
 
-// challengerWins applies incumbent hysteresis: a challenger only displaces the
-// incumbent if it beats it by more than hysteresisPct percent. hysteresisPct==0
-// reduces to a plain greater-than, which is the pre-change behavior.
+// challengerWins applies incumbent hysteresis using an absolute-value margin:
+// a challenger only displaces the incumbent if it beats it by more than
+// hysteresisPct percent of the absolute incumbent value. This ensures the
+// threshold moves toward "better" regardless of score sign (positive, negative,
+// or zero incumbent). When hysteresisPct==0, reduces to plain greater-than for
+// all score signs, which is the legacy behavior and required by existing callers.
 func challengerWins(incumbent, challenger, hysteresisPct float64) bool {
-	return challenger > incumbent*(1.0+hysteresisPct/100.0)
+	return challenger > incumbent+math.Abs(incumbent)*hysteresisPct/100.0
 }
