@@ -350,6 +350,17 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// needs and keep the best. 1 is today's behavior, the A/B point.
 		EvaluationPoolMultiple: 2,
 
+		// the outcome deadline (window honesty): zero Added this long after
+		// the window first tries to expand triggers ONE silent window rebuild
+		// (the programmatic form of the manual disconnect+reconnect that
+		// reliably recovered the field hangs), and zero Added this long after
+		// the rebuild latches the terminal failed state with the stall reason.
+		// Long enough that a slow-but-working first connect (the 9.3s green
+		// baseline, with margin for a rough pool) is never cut short; short
+		// enough that nobody watches yellow dots for minutes. 0 disables.
+		WindowOutcomeDeadline:        45 * time.Second,
+		WindowOutcomeRebuildDeadline: 45 * time.Second,
+
 		// one state line per minute. Frequent enough that any window of a
 		// capture reconstructs the session shape, rare enough that a full day of
 		// logs costs a few hundred lines -- and only when something is actually
@@ -905,6 +916,20 @@ type MultiClientSettings struct {
 	// request exactly what is needed, admit every evaluation that passes. 2 is
 	// the mainnet-aggressive default on this fork.
 	EvaluationPoolMultiple int
+
+	// WindowOutcomeDeadline is the outcome deadline (window honesty, see
+	// ip_remote_multi_client_outcome.go): a window that has Added ZERO
+	// providers this long after it first tried to expand gets one automatic
+	// silent rebuild — the programmatic form of the manual
+	// disconnect+reconnect that reliably recovered the 2026-08-11 field hangs.
+	// 0 disables both the rebuild and the failed latch below.
+	WindowOutcomeDeadline time.Duration
+	// WindowOutcomeRebuildDeadline is the second half: zero Added this long
+	// after the automatic rebuild latches the terminal failed state (surfaced
+	// to the app with the stall reason, rendered as a failure + Retry). The
+	// machinery keeps running underneath, and a provider that lands later
+	// clears the latch. 0 disables the failed latch only.
+	WindowOutcomeRebuildDeadline time.Duration
 
 	// ServerNameAffinityBridge lets a new flow whose own affinity group has no
 	// donor inherit the client from the destination-scoped group an earlier
@@ -2093,6 +2118,11 @@ type ReliabilitySettings struct {
 	// FormationPollTimeout: 0 falls back to SendRetryTimeout (the pre-change
 	// behavior), unlike the other zero-value-off knobs here
 	FormationPollTimeout time.Duration
+	// the outcome-deadline pair (window honesty); zero-value-off like the
+	// rest, so an override built from an older struct turns the deadline off
+	// rather than changing its semantics
+	WindowOutcomeDeadline        time.Duration
+	WindowOutcomeRebuildDeadline time.Duration
 	// the P2 upstream-port knobs. Every one of them is zero-value-off, so a
 	// developer menu that writes an override built from an older struct turns
 	// the ports off rather than changing their semantics.
@@ -2147,6 +2177,9 @@ func ReliabilitySettingsFrom(settings *MultiClientSettings) *ReliabilitySettings
 		SharedFateWindow:           settings.SharedFateWindow,
 		EvaluationPoolMultiple:     settings.EvaluationPoolMultiple,
 		FormationPollTimeout:       settings.FormationPollTimeout,
+
+		WindowOutcomeDeadline:        settings.WindowOutcomeDeadline,
+		WindowOutcomeRebuildDeadline: settings.WindowOutcomeRebuildDeadline,
 
 		BusyProbe:                          settings.BusyProbe,
 		BusyProbeBudget:                    settings.BusyProbeBudget,
@@ -6654,6 +6687,35 @@ type multiClientWindow struct {
 
 	generatorMonitor *Monitor
 	resizeMonitor    *Monitor
+
+	// --- window honesty (see ip_remote_multi_client_outcome.go) ---
+
+	// failures counts recent classified evaluation failures for the stall
+	// reason. Its own lock inside; safe from any goroutine.
+	failures *windowFailureRecorder
+	// outcomeLock guards the outcome state machine below. A dedicated small
+	// lock — never held while logging, dispatching, or touching stateLock.
+	outcomeLock sync.Mutex
+	// outcomeArmTime is when the window first tried to expand (zero = never);
+	// reset by the automatic rebuild so the second deadline measures from it.
+	outcomeArmTime time.Time
+	// outcomeRebuilt: the ONE automatic rebuild has been spent.
+	outcomeRebuilt bool
+	// outcomeFailed: the terminal failed state, cleared by noteClientAdded.
+	outcomeFailed bool
+	// everAdded: a provider has been installed; permanently disarms the
+	// outcome watchdog for this window.
+	everAdded bool
+	// evalEpochCtx is the context evaluation channels are built under; the
+	// rebuild cancels and replaces it. See evalEpochContext.
+	evalEpochCtx    context.Context
+	evalEpochCancel context.CancelFunc
+
+	// throttles for the unconditional evaluation-failure lines, one per line
+	// shape, on the "(N suppressed)" pattern the egress-dial evidence uses
+	createFailThrottle    *logThrottle
+	pingFailThrottle      *logThrottle
+	enumerateZeroThrottle *logThrottle
 }
 
 func newMultiClientWindow(
@@ -6704,11 +6766,20 @@ func newMultiClientWindow(
 		clients:                      map[Id]*multiClientChannel{},
 		generatorMonitor:             NewMonitor(),
 		resizeMonitor:                NewMonitor(),
+		failures:                     &windowFailureRecorder{},
+		createFailThrottle:           newLogThrottle(evaluationFailureLogInterval),
+		pingFailThrottle:             newLogThrottle(evaluationFailureLogInterval),
+		enumerateZeroThrottle:        newLogThrottle(evaluationFailureLogInterval),
 	}
+	window.evalEpochCtx, window.evalEpochCancel = context.WithCancel(ctx)
 
 	go HandleError(window.randomEnumerateClientArgs, cancel)
 	go HandleError(window.resize, cancel)
 	go HandleError(window.watchSendStalls, cancel)
+	// deliberately NOT wired to `cancel`, like the heartbeat and the prober: a
+	// watchdog that exists to describe and rescue the window must never be
+	// able to tear down the tunnel
+	go HandleError(window.watchOutcome)
 
 	return window
 }
@@ -7199,12 +7270,26 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 		)
 		if err != nil {
 			self.log.Infof("[multi]window enumerate error timeout = %s\n", err)
+			// a hung/erroring platform api is the platform-unreachable class
+			// unless the message names auth or rate limiting
+			self.recordEvaluationFailure(windowFailurePlatform, err)
 			select {
 			case <-self.ctx.Done():
 				return
 			case <-time.After(self.settings.WindowEnumerateErrorTimeout):
 			}
 			continue
+		}
+
+		// unconditional (V0): the platform answered with ZERO candidates. Only
+		// a failure while the window is empty — a full window legitimately
+		// enumerates nothing because its destinations are all excluded.
+		if len(destinations) == 0 && len(self.unorderedClients()) == 0 {
+			if ok, suppressed := self.enumerateZeroThrottle.Allow(time.Now()); ok {
+				self.log.Infof("[multi]window enumerate returned zero providers%s\n",
+					suppressedSuffix(suppressed))
+			}
+			self.recordEvaluationFailure(windowFailureProvider, nil)
 		}
 
 		func() {
@@ -7245,6 +7330,10 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 					}
 					if err != nil {
 						self.log.Infof("[multi]create client args error = %s\n", err)
+						// platform api again: the client mint is a platform
+						// round trip, so its timeout is platform-unreachable
+						// (auth/rate refine via the message)
+						self.recordEvaluationFailure(windowFailurePlatform, err)
 						select {
 						case <-self.ctx.Done():
 							return
@@ -7796,6 +7885,12 @@ func (self *multiClientWindow) resize() {
 			fixedDestination,
 		)
 
+		// the outcome clock arms the first time this window actually tries to
+		// form (see watchOutcome); a disabled window (target 0) never arms
+		if 0 < targetWindowSize {
+			self.armOutcome()
+		}
+
 		addedCount := 0
 		if len(clients) < targetWindowSize {
 			// expand
@@ -7974,6 +8069,9 @@ func (self *multiClientWindow) expand(
 			replacedClient.Cancel()
 		}
 		self.monitor.AddProviderEvent(args.ClientId, ProviderStateAdded, args.Destination.Tail(), args.Location)
+		// the outcome watchdog stands down: this window has proven it can
+		// install a provider (and a latched failed state is cleared)
+		self.noteClientAdded(client)
 		// reap promptly when the client dies (the continuous ping or blackhole
 		// detection cancels the channel): wake the resize loop instead of
 		// waiting for its next tick
@@ -8102,8 +8200,11 @@ func (self *multiClientWindow) expand(
 			// constructor signature stays put (nil falls back per-packet)
 			args.ReceivePackets = self.clientReceivePacketsCallback
 			args.NetworkPeerDestination = self.networkPeerDestination
+			// the evaluation epoch, not the window ctx: identical between
+			// rebuilds, and what lets the outcome rebuild fail every
+			// in-flight candidate fast (see evalEpochContext)
 			client, err := newMultiClientChannel(
-				self.ctx,
+				self.evalEpochContext(),
 				args,
 				self.generator,
 				self.clientReceivePacketCallback,
@@ -8132,6 +8233,14 @@ func (self *multiClientWindow) expand(
 				self.qualificationRefreshFunc,
 			)
 			if err != nil {
+				// unconditional (V0): this transition was invisible in the
+				// field — EvaluationFailed is terminal, the dot is deleted
+				// from the monitor map, and nothing said why
+				if ok, suppressed := self.createFailThrottle.Allow(time.Now()); ok {
+					self.log.Infof("[multi]create channel error [%s] = %s%s\n",
+						args.ClientId, err, suppressedSuffix(suppressed))
+				}
+				self.recordEvaluationFailure(windowFailureProvider, err)
 				self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
 				self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed, args.Destination.Tail(), args.Location)
 			} else {
@@ -8251,15 +8360,21 @@ func (self *multiClientWindow) expand(
 								}
 								pingCancel()
 							} else {
-								if self.log.V(1).Enabled() {
-									self.log.Infof("[multi]create ping error = %s\n", err)
+								// unconditional (V0), was V(1): a ping-ack
+								// error is an evaluation-failure transition,
+								// and those were invisible in the field
+								if ok, suppressed := self.pingFailThrottle.Allow(time.Now()); ok {
+									self.log.Infof("[multi]evaluation ping error [%s] = %s%s\n",
+										args.ClientId, err, suppressedSuffix(suppressed))
 								}
+								self.recordEvaluationFailure(windowFailureProvider, err)
 								fail()
 							}
 						},
 					)
 					if err != nil {
 						self.log.Infof("[multi]create client ping error = %s\n", err)
+						self.recordEvaluationFailure(windowFailureProvider, err)
 						fail()
 					} else if !success {
 						fail()
@@ -8269,7 +8384,14 @@ func (self *multiClientWindow) expand(
 							select {
 							case <-pingDone.Done():
 							case <-time.After(self.settings.PingTimeout):
-								self.log.V(2).Infof("[multi]expand window timeout waiting for ping\n")
+								// unconditional (V0), was V(2): the unanswered
+								// evaluation ping is THE dominant transition of
+								// the field hang, and it logged nothing
+								if ok, suppressed := self.pingFailThrottle.Allow(time.Now()); ok {
+									self.log.Infof("[multi]evaluation ping timeout [%s]%s\n",
+										args.ClientId, suppressedSuffix(suppressed))
+								}
+								self.recordEvaluationFailure(windowFailureProvider, nil)
 								func() {
 									mutex.Lock()
 									defer mutex.Unlock()
