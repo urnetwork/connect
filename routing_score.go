@@ -40,28 +40,39 @@ func classWeights(c TrafficClass) ScoreWeights {
 }
 
 // exitScore returns a composite health score for an exit with the given metrics
-// and traffic class weights. The score is bounded and sanitized: inputs are
-// clamped to prevent NaN/Inf output, negative values are safe (mapped to 0),
-// and non-finite inputs are replaced with a safe finite default. Higher scores
-// indicate better exits. The function is pure: no locks, I/O, or time calls.
+// and traffic class weights. The score is bounded and sanitized to ensure
+// hostile telemetry (negative, NaN, +Inf values) scores as WORST, not best.
+// Higher scores indicate better exits. The function is pure: no locks, I/O,
+// or time calls.
+//
+// Telemetry from untrusted third-party providers can report garbage values.
+// A scoring function that fails toward "route traffic here" is worse than one
+// that fails toward "avoid this." Thus: positive infinity RTT (unreachable),
+// NaN RTT (unknown), or negative RTT (corrupt) all deserve the worst possible
+// sub-score (0.0), not the best (1.0 from clamping to 0ms).
 func exitScore(m ExitMetrics, w ScoreWeights) float64 {
-	// Sanitize inputs to ensure output is always finite.
-	rtt := m.RttMillis
-	if rtt < 0 || math.IsNaN(rtt) || math.IsInf(rtt, 0) {
-		rtt = 0
+	// Calculate sub-scores; guard RTT and Jitter against hostile inputs.
+	var rttGood float64
+	if m.RttMillis < 0 || math.IsNaN(m.RttMillis) || math.IsInf(m.RttMillis, 0) {
+		rttGood = 0 // worst score for corrupt/missing data
+	} else {
+		rttGood = 1.0 / (1.0 + m.RttMillis/50.0) // 50ms → 0.5
 	}
-	jitter := m.Jitter
-	if jitter < 0 || math.IsNaN(jitter) || math.IsInf(jitter, 0) {
-		jitter = 0
+
+	var jitterGood float64
+	if m.Jitter < 0 || math.IsNaN(m.Jitter) || math.IsInf(m.Jitter, 0) {
+		jitterGood = 0 // worst score for corrupt/missing data
+	} else {
+		jitterGood = 1.0 / (1.0 + m.Jitter/20.0) // 20ms → 0.5
 	}
+
+	// Goodput's clamp-to-0 behavior is correct (yields worst score), so no guard needed.
 	goodput := m.GoodputBytesPerSec
 	if goodput < 0 || math.IsNaN(goodput) || math.IsInf(goodput, 0) {
 		goodput = 0
 	}
-
-	rttGood := 1.0 / (1.0 + rtt/50.0)        // 50ms → 0.5
-	jitterGood := 1.0 / (1.0 + jitter/20.0)  // 20ms → 0.5
 	goodputGood := goodput / (goodput + 1e6) // 1MB/s → 0.5
+
 	stallPenalty := float64(m.StallEvents) * 0.1
 	return w.Rtt*rttGood + w.Goodput*goodputGood + w.Jitter*jitterGood - w.Stall*stallPenalty
 }

@@ -71,16 +71,62 @@ func TestExitScoreBulkPrefersGoodput(t *testing.T) {
 
 func TestExitScoreSanitizesHostileInputs(t *testing.T) {
 	w := classWeights(ClassLatency)
-	// Hostile inputs that could produce NaN or Inf if not sanitized.
-	hostileMetrics := []ExitMetrics{
-		{RttMillis: -100, GoodputBytesPerSec: 1e6, Jitter: 0, StallEvents: 0},        // negative RTT
-		{RttMillis: 50, GoodputBytesPerSec: math.Inf(1), Jitter: 0, StallEvents: 0},  // +Inf goodput
-		{RttMillis: 50, GoodputBytesPerSec: 1e6, Jitter: math.NaN(), StallEvents: 0}, // NaN jitter
-		{RttMillis: math.Inf(1), GoodputBytesPerSec: 1e6, Jitter: 0, StallEvents: 0}, // +Inf RTT
-		{RttMillis: math.NaN(), GoodputBytesPerSec: 1e6, Jitter: 0, StallEvents: 0},  // NaN RTT
+
+	// Baseline: a healthy exit with perfect latency and jitter.
+	healthy := exitScore(ExitMetrics{RttMillis: 50, GoodputBytesPerSec: 1e6, Jitter: 20, StallEvents: 0}, w)
+
+	// Assertion 1: Hostile RTT must score WORSE than healthy (not better).
+	hostileRttCases := []struct {
+		name string
+		rtt  float64
+	}{
+		{"negative RTT", -100},
+		{"+Inf RTT", math.Inf(1)},
+		{"NaN RTT", math.NaN()},
+	}
+	for _, tc := range hostileRttCases {
+		hostile := exitScore(ExitMetrics{RttMillis: tc.rtt, GoodputBytesPerSec: 1e6, Jitter: 20, StallEvents: 0}, w)
+		if !(hostile < healthy) {
+			t.Errorf("hostile %s: score=%f should be < healthy=%f", tc.name, hostile, healthy)
+		}
+		// Assertion 2: Hostile RTT must not win at 10% hysteresis.
+		if challengerWins(healthy, hostile, 10) {
+			t.Errorf("hostile %s should not win challengerWins against healthy at 10%%, score=%f vs incumbent=%f",
+				tc.name, hostile, healthy)
+		}
 	}
 
-	for i, m := range hostileMetrics {
+	// Assertion 3: Hostile Jitter must score WORSE than healthy.
+	hostileJitterCases := []struct {
+		name   string
+		jitter float64
+	}{
+		{"negative Jitter", -50},
+		{"+Inf Jitter", math.Inf(1)},
+		{"NaN Jitter", math.NaN()},
+	}
+	for _, tc := range hostileJitterCases {
+		hostile := exitScore(ExitMetrics{RttMillis: 50, GoodputBytesPerSec: 1e6, Jitter: tc.jitter, StallEvents: 0}, w)
+		if !(hostile < healthy) {
+			t.Errorf("hostile %s: score=%f should be < healthy=%f", tc.name, hostile, healthy)
+		}
+		// Assertion 4: Hostile Jitter must not win at 10% hysteresis.
+		if challengerWins(healthy, hostile, 10) {
+			t.Errorf("hostile %s should not win challengerWins against healthy at 10%%, score=%f vs incumbent=%f",
+				tc.name, hostile, healthy)
+		}
+	}
+
+	// Assertion 5: Finiteness check (no NaN/Inf output).
+	allHostileMetrics := []ExitMetrics{
+		{RttMillis: -100, GoodputBytesPerSec: 1e6, Jitter: 0, StallEvents: 0},
+		{RttMillis: 50, GoodputBytesPerSec: math.Inf(1), Jitter: 0, StallEvents: 0},
+		{RttMillis: 50, GoodputBytesPerSec: 1e6, Jitter: math.NaN(), StallEvents: 0},
+		{RttMillis: math.Inf(1), GoodputBytesPerSec: 1e6, Jitter: 0, StallEvents: 0},
+		{RttMillis: math.NaN(), GoodputBytesPerSec: 1e6, Jitter: 0, StallEvents: 0},
+	}
+
+	for i, m := range allHostileMetrics {
 		score := exitScore(m, w)
 		if math.IsNaN(score) || math.IsInf(score, 0) {
 			t.Errorf("exitScore case %d returned non-finite: %f", i, score)
