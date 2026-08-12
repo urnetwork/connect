@@ -11631,9 +11631,12 @@ func (self *multiClientChannel) detectBlackhole() {
 				// it was passed directly before this task. benchDuration's
 				// own `if !dampening { return base }` guard is kept as
 				// defence in depth, not relied on here for the lock-skip.
+				// dampening is always true inside this branch (that is the
+				// condition), so it is passed to benchDuration as a literal
+				// rather than re-read.
 				quarantineExpiry := self.settings.StatsWindowKeepUnhealthyDuration
-				if dampening := self.reliabilitySettings().QuarantineDampening; dampening {
-					quarantineExpiry = benchDuration(self.quarantineReconvictionCount(), quarantineExpiry, dampening)
+				if self.reliabilitySettings().QuarantineDampening {
+					quarantineExpiry = benchDuration(self.quarantineReconvictionCount(), quarantineExpiry, true)
 				}
 				action := verdictAction(
 					reason,

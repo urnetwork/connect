@@ -237,29 +237,38 @@ func TestReentryPenaltyAppliesJustAfterALift(t *testing.T) {
 
 // TestQuarantineExpiryShortCircuitsReconvictionLookup is fix-round-1's
 // required proof: quarantineReconvictionCount() takes stateLock, and
-// benchDuration is called as a plain function -- Go evaluates every
-// argument expression before the call, so passing
-// self.quarantineReconvictionCount() directly as an argument (the original
-// shape) took the lock on every blackhole-branch pass even when
-// QuarantineDampening was false and benchDuration immediately discarded the
-// value. The fix moves the knob check before the lookup entirely, so the
-// lock is never taken on the off path.
+// benchDuration is called as a plain function -- Go evaluates every argument
+// expression before the call, so passing self.quarantineReconvictionCount()
+// directly as an argument (the original shape) took the lock on every
+// blackhole-branch pass even when QuarantineDampening was false and
+// benchDuration immediately discarded the value. The fix moves the knob
+// check before the lookup entirely, so the lock is never taken on the off
+// path.
 //
 // This is a STRUCTURAL test, not a call-counting one: quarantineReconvictionCount
 // has no seam to count real lock acquisitions without adding call-counting
 // instrumentation to production code purely to make this testable, which is
-// explicitly out of scope for this fix. Instead it asserts the source
-// structure the short-circuit depends on:
-//  1. the off-path default is assigned from self.settings.StatsWindowKeepUnhealthyDuration
-//     BEFORE the dampening guard, so an unguarded read never sees anything else;
-//  2. quarantineReconvictionCount() is called exactly once in detectBlackhole;
-//  3. that one call sits exactly one indent level inside an `if dampening { ... }`
-//     guard (not before it, not unconditionally) -- so it is unreachable by
-//     construction whenever dampening is false.
+// out of scope. It protects exactly one property -- the reconviction lookup
+// is unreachable when the knob is off -- via three checks:
+//  1. quarantineReconvictionCount() is called exactly once in detectBlackhole;
+//  2. that one call sits somewhere inside an enclosing `if` whose condition
+//     mentions QuarantineDampening, with nothing closing that block before
+//     reaching the call;
+//  3. the off-path default is assigned from
+//     self.settings.StatsWindowKeepUnhealthyDuration strictly before that
+//     guard, so an unguarded read never sees anything else.
+//
+// It deliberately does NOT assert the guard's exact text, that the guard is
+// the line immediately before the call, or an exact indentation delta --
+// fix-round-1's first version of this test pinned all three, and detectBlackhole
+// is a demonstrated hotspot (tasks 7, 8, 9 and this fix have all touched it
+// in quick succession); a benign rename, an `if x := f(); x` simplified to
+// `if f()`, or a wrapped block would have failed a perfectly correct change.
+// Do not "tighten" this back to exact-text/adjacency/indent-delta matching.
 //
 // This test was verified against the pre-fix shape (self.quarantineReconvictionCount()
 // passed directly as benchDuration's first argument, unconditionally) and
-// fails there as expected -- see the task-9 report's fix-round-1 section for
+// fails there as expected -- see the task-9 report's fix-round-2 section for
 // the captured failing output.
 func TestQuarantineExpiryShortCircuitsReconvictionLookup(t *testing.T) {
 	source, err := readSource("ip_remote_multi_client.go")
@@ -270,24 +279,15 @@ func TestQuarantineExpiryShortCircuitsReconvictionLookup(t *testing.T) {
 	if !ok {
 		t.Fatal("could not find detectBlackhole")
 	}
-
-	defaultIdx := strings.Index(body, "quarantineExpiry := self.settings.StatsWindowKeepUnhealthyDuration")
-	if defaultIdx < 0 {
-		t.Fatal("the off-path default (quarantineExpiry := self.settings.StatsWindowKeepUnhealthyDuration) is missing")
-	}
-	guardIdx := strings.Index(body, "if dampening := self.reliabilitySettings().QuarantineDampening; dampening {")
-	if guardIdx < 0 {
-		t.Fatal("the dampening short-circuit guard is missing or its shape changed")
-	}
-	if guardIdx < defaultIdx {
-		t.Fatal("the dampening guard must come AFTER the off-path default is assigned, or the default is not really the off-path value")
+	lines := strings.Split(body, "\n")
+	indentOf := func(s string) int {
+		return len(s) - len(strings.TrimLeft(s, "\t"))
 	}
 
 	if n := strings.Count(body, "self.quarantineReconvictionCount()"); n != 1 {
 		t.Fatalf("expected exactly one call to quarantineReconvictionCount in detectBlackhole, found %d", n)
 	}
 
-	lines := strings.Split(body, "\n")
 	callLine := -1
 	for i, line := range lines {
 		if strings.Contains(line, "self.quarantineReconvictionCount()") {
@@ -295,19 +295,49 @@ func TestQuarantineExpiryShortCircuitsReconvictionLookup(t *testing.T) {
 			break
 		}
 	}
-	if callLine <= 0 {
+	if callLine < 0 {
 		t.Fatal("could not locate the quarantineReconvictionCount call line")
 	}
 
-	guardLine := lines[callLine-1]
-	if !strings.Contains(guardLine, "QuarantineDampening") || !strings.Contains(guardLine, "dampening") ||
-		!strings.HasSuffix(strings.TrimRight(guardLine, " \t"), "{") {
-		t.Fatalf("quarantineReconvictionCount is not directly nested under an `if dampening` guard: preceding line is %q", guardLine)
+	// walk backward from the call, tracking the innermost enclosing scope by
+	// indent: the first non-blank line at a strictly shallower indent than
+	// the current threshold is that scope's opening line. If it is not the
+	// dampening guard, treat it as the new threshold and keep walking
+	// outward -- this naturally requires nothing at or below a candidate
+	// guard's indent to intervene before the call, without hardcoding
+	// adjacency or an exact delta.
+	guardLine := -1
+	threshold := indentOf(lines[callLine])
+	for i := callLine - 1; 0 <= i; i-- {
+		trimmed := strings.TrimSpace(lines[i])
+		if trimmed == "" {
+			continue
+		}
+		ind := indentOf(lines[i])
+		if threshold <= ind {
+			continue
+		}
+		if strings.Contains(trimmed, "if") && strings.Contains(trimmed, "QuarantineDampening") && strings.HasSuffix(trimmed, "{") {
+			guardLine = i
+			break
+		}
+		threshold = ind
+	}
+	if guardLine < 0 {
+		t.Fatal("quarantineReconvictionCount is not nested inside any enclosing `if ... QuarantineDampening ... {` guard")
 	}
 
-	guardIndent := len(guardLine) - len(strings.TrimLeft(guardLine, "\t"))
-	callIndent := len(lines[callLine]) - len(strings.TrimLeft(lines[callLine], "\t"))
-	if callIndent != guardIndent+1 {
-		t.Fatalf("quarantineReconvictionCount call is not exactly one indent level inside the dampening guard: guard indent=%d call indent=%d", guardIndent, callIndent)
+	defaultLine := -1
+	for i, line := range lines {
+		if strings.Contains(line, "quarantineExpiry := self.settings.StatsWindowKeepUnhealthyDuration") {
+			defaultLine = i
+			break
+		}
+	}
+	if defaultLine < 0 {
+		t.Fatal("the off-path default (quarantineExpiry := self.settings.StatsWindowKeepUnhealthyDuration) is missing")
+	}
+	if guardLine <= defaultLine {
+		t.Fatal("the dampening guard must come AFTER the off-path default is assigned, or the default is not really the off-path value")
 	}
 }
