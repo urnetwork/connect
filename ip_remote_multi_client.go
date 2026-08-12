@@ -9241,9 +9241,22 @@ type multiClientChannel struct {
 	// clearQuarantineWithLock). Feeds benchDuration so a channel that keeps
 	// re-earning a bench holds it longer each time (RFC 2439-style flap
 	// damping) instead of the constant hold every episode got before this
-	// task. Deliberately session-scoped and never persisted or decayed --
-	// same lifetime as quarantineMigrated and the rest of the episode
-	// bookkeeping beside it, not new durable state. Guarded by stateLock.
+	// task. Deliberately session-scoped and never persisted -- same lifetime
+	// as quarantineMigrated and the rest of the episode bookkeeping beside
+	// it, not new durable state. Guarded by stateLock.
+	//
+	// KNOWN LIMITATION, tracked separately, not yet fixed: this counter never
+	// DECAYS within a session -- a provider that flaps early and then runs
+	// clean for hours still escalates straight to the 240s cap on its next
+	// bench rather than re-starting at 60s. The blast radius is bounded and
+	// self-healing even so: the worst case is a stale-bad exit taking up to
+	// 240s instead of 60s to be force-evicted by the expiry escape, and
+	// release-on-receive-progress (addReceiveAck's clear, unrelated to this
+	// counter) remains a fully independent per-poll acquittal path this
+	// cannot delay -- a genuinely recovered exit is never held past the
+	// evidence that acquits it. Clean-interval decay analogous to
+	// quarantineMemoryDuration should land before QuarantineDampening is
+	// ever turned on for real traffic.
 	quarantineReconvictions int
 
 	// pendingSendTime is when the current run of unacked sends began, reset on
@@ -11609,16 +11622,19 @@ func (self *multiClientChannel) detectBlackhole() {
 				if quarantineReason, quarantineStart := self.quarantineState(); quarantineReason == reason {
 					quarantinedSince = quarantineStart
 				}
-				// the bench hold time: benchDuration(reconvictions, base,
-				// dampening off) returns base unchanged, so with
-				// QuarantineDampening at its zero value this is byte-for-byte
+				// the bench hold time: short-circuited on the knob BEFORE
+				// quarantineReconvictionCount() (which takes stateLock) is
+				// ever called, so a default build with QuarantineDampening
+				// off does not acquire a new lock on this live path -- the
+				// off-path value stays byte-for-byte
 				// self.settings.StatsWindowKeepUnhealthyDuration, exactly as
-				// it was passed directly before this task.
-				quarantineExpiry := benchDuration(
-					self.quarantineReconvictionCount(),
-					self.settings.StatsWindowKeepUnhealthyDuration,
-					self.reliabilitySettings().QuarantineDampening,
-				)
+				// it was passed directly before this task. benchDuration's
+				// own `if !dampening { return base }` guard is kept as
+				// defence in depth, not relied on here for the lock-skip.
+				quarantineExpiry := self.settings.StatsWindowKeepUnhealthyDuration
+				if dampening := self.reliabilitySettings().QuarantineDampening; dampening {
+					quarantineExpiry = benchDuration(self.quarantineReconvictionCount(), quarantineExpiry, dampening)
+				}
 				action := verdictAction(
 					reason,
 					self.reliabilitySettings().SoftVerdictDemote,
