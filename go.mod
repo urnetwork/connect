@@ -5,7 +5,7 @@ go 1.26.3
 require (
 	github.com/docopt/docopt-go v0.0.0-20180111231733-ee0de3bc6815
 	github.com/golang-jwt/jwt/v5 v5.3.1
-	github.com/google/gopacket v1.1.19
+	github.com/gopacket/gopacket v1.7.1
 	github.com/gorilla/websocket v1.5.3
 	github.com/pion/datachannel v1.6.2
 	github.com/pion/ice/v4 v4.4.1
