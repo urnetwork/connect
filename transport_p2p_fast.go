@@ -14,9 +14,10 @@ import (
 
 const (
 	p2pFastPathFragmentHeaderByteCount = 16
-	// RTP(12) + this carrier header(16) + SRTP authentication + IPv6/UDP
-	// remains below a 1,500-byte path for a 1,400-byte fragment payload.
-	p2pFastPathFragmentPayloadByteCount = 1400
+	// A full fragment must fit IPv6's 1,280-byte minimum link MTU. The wire
+	// envelope is IPv6(40) + UDP(8) + RTP(12) + SRTP GCM tag(16) + this
+	// carrier header(16), leaving 1,188 bytes for the transfer payload.
+	p2pFastPathFragmentPayloadByteCount = 1188
 	p2pFastPathMaximumFragmentCount     = 64
 	p2pFastPathReassemblySlotCount      = 64
 	p2pFastPathReassemblyTimeout        = 2 * time.Second
@@ -24,7 +25,11 @@ const (
 	p2pFastPathWarmupTimeout            = 5 * time.Second
 	p2pFastPathRtpClockRate             = 90000
 	p2pFastPathRtpPayloadType           = 127
-	p2pFastPathMimeType                 = "video/urnetwork-fast-path"
+	// The unchanged codec name lets mixed-version peers establish WebRTC and
+	// use SCTP. The versioned warmup below prevents them from selecting fast
+	// carriers with incompatible fragment geometry.
+	p2pFastPathMimeType = "video/urnetwork-fast-path"
+	p2pFastPathVersion  = 2
 )
 
 var (
@@ -140,7 +145,7 @@ func writeP2pFastPathFragmentHeader(
 	packet[0] = 'U'
 	packet[1] = 'R'
 	packet[2] = 'D'
-	packet[3] = 1
+	packet[3] = p2pFastPathVersion
 	binary.BigEndian.PutUint32(packet[4:8], header.messageId)
 	binary.BigEndian.PutUint32(packet[8:12], uint32(header.messageLength))
 	binary.BigEndian.PutUint16(packet[12:14], uint16(header.fragmentIndex))
@@ -154,7 +159,7 @@ func parseP2pFastPathFragmentHeader(packet []byte) (p2pFastPathFragmentHeader, e
 		packet[0] != 'U' ||
 		packet[1] != 'R' ||
 		packet[2] != 'D' ||
-		packet[3] != 1 {
+		packet[3] != p2pFastPathVersion {
 		return p2pFastPathFragmentHeader{}, errP2pFastPathPacket
 	}
 	messageLength := binary.BigEndian.Uint32(packet[8:12])

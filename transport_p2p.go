@@ -32,11 +32,13 @@ import (
 const ReadyHeader = "rdy"
 
 // readP2pMessage reads one complete message from a message-oriented conn into
-// an owned pool buffer. Pion/SCTP itself reports the required size in n with
-// io.ErrShortBuffer, but the detached datachannel wrapper intentionally masks
-// that value and returns n=0. Grow geometrically in that case; compatibility
-// conns that preserve the size still jump directly to it. The queued SCTP
-// message is not consumed on io.ErrShortBuffer.
+// an owned pool buffer. The buffer remains checked out for the full blocking
+// Read, so the connection lifecycle must interrupt and join that read. Pion/
+// SCTP itself reports the required size in n with io.ErrShortBuffer, but the
+// detached datachannel wrapper intentionally masks that value and returns n=0.
+// Grow geometrically in that case; compatibility conns that preserve the size
+// still jump directly to it. The queued SCTP message is not consumed on
+// io.ErrShortBuffer.
 func readP2pMessage(
 	conn net.Conn,
 	initialByteCount int,
@@ -160,7 +162,11 @@ func DefaultP2pTransportSettings() *P2pTransportSettings {
 		ConnectTimeout:        15 * time.Second,
 		ReconnectTimeout:      5 * time.Second,
 		AdmissionRetryTimeout: 30 * time.Second,
-		EndToEndProbeInterval: time.Second,
+		// Five seconds leaves a physical quiet window after a complete probe
+		// on the supported one-second regional path. A one-second cadence lets
+		// the two endpoints' independent request/response trains interleave
+		// continuously at that round-trip time.
+		EndToEndProbeInterval: 5 * time.Second,
 		EndToEndProbeTimeout:  15 * time.Second,
 		// Four transfer batches absorb ordinary goroutine scheduling jitter.
 		// A real detached-data-channel measurement sustained the same

@@ -59,9 +59,10 @@ const TransportVersion = 2
 const DebugCloseSend = false
 
 // The platform WebSocket writer combines only messages already waiting on its
-// bounded route. Four production-safe transfer frames fit in one 16 KiB TLS
-// record, reducing write syscalls without adding a batching delay.
-const platformWebSocketWriteBatchMaxMessages = 4
+// bounded route. Eight ordinary transfer frames remain below the wrapper's
+// 16 KiB retained-byte bound, reducing write syscalls without adding a
+// batching delay. Oversized frames flush through the same bounded wrapper.
+const platformWebSocketWriteBatchMaxMessages = 8
 
 const (
 	platformH3WriteBatchMaxMessageCount = 16
@@ -289,6 +290,9 @@ type PlatformTransportSettings struct {
 	// Nil outside package tests. A barrier here can hold a receive worker before
 	// it releases channel and pooled-message ownership.
 	beforeReceiveWorkerCleanupForTest func()
+	// Nil outside package tests. The observer borrows one H3 receive message
+	// after the channel accepts its ownership.
+	afterH3ReceiveEnqueueForTest func([]byte)
 }
 
 func DefaultPlatformTransportSettings() *PlatformTransportSettings {
@@ -1118,7 +1122,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				}
 
 				writeBatchConn, _ :=
-					ws.UnderlyingConn().(*webSocketWriteBatchConn)
+					ws.UnderlyingConn().(*WebSocketWriteBatchConn)
 				writeReadySendBatch := func(
 					firstMessage []byte,
 				) (sendOpen bool, err error) {
@@ -1128,9 +1132,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					}
 
 					ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
-					writeBatchConn.beginWriteBatch()
+					writeBatchConn.BeginWriteBatch()
 					if err = writeSendMessage(firstMessage); err != nil {
-						writeBatchConn.abortWriteBatch()
+						writeBatchConn.AbortWriteBatch()
 						return true, err
 					}
 
@@ -1139,7 +1143,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					for range platformWebSocketWriteBatchMaxMessages - 1 {
 						select {
 						case <-handleCtx.Done():
-							writeBatchConn.abortWriteBatch()
+							writeBatchConn.AbortWriteBatch()
 							return false, nil
 						case message, ok := <-send:
 							if !ok {
@@ -1147,14 +1151,14 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 								break drainReady
 							}
 							if err = writeSendMessage(message); err != nil {
-								writeBatchConn.abortWriteBatch()
+								writeBatchConn.AbortWriteBatch()
 								return true, err
 							}
 						default:
 							break drainReady
 						}
 					}
-					if err = writeBatchConn.flushWriteBatch(); err != nil {
+					if err = writeBatchConn.FlushWriteBatch(); err != nil {
 						// A WebSocket write timeout or partial TLS write cannot
 						// be recovered; the transfer sequence retains each
 						// item and retries it over the replacement route.
@@ -1827,8 +1831,9 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				conn.CloseWithError(0, "transport teardown")
 				connectionWaitGroup.Wait()
 				// Route removal and the worker join leave no producer that can
-				// enqueue after this deterministic pooled-message drain.
+				// enqueue after these deterministic pooled-message drains.
 				drain(send)
+				drain(receive)
 			}()
 			writeReadySendBatch := func(
 				firstMessage []byte,
@@ -2015,6 +2020,9 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 						return
 					case receive <- message:
 						receiveTimer.Stop()
+						if self.settings.afterH3ReceiveEnqueueForTest != nil {
+							self.settings.afterH3ReceiveEnqueueForTest(message)
+						}
 						if self.log.V(2).Enabled() {
 							self.log.Infof("[tr]%s<-\n", clientId)
 						}

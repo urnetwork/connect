@@ -1,3 +1,5 @@
+// WebSocket write batching coalesces complete, already-ready frames above the
+// TLS boundary without changing their WebSocket framing or adding idle delay.
 package connect
 
 import (
@@ -8,7 +10,7 @@ import (
 
 const webSocketWriteBatchMaxByteCount = 16 * 1024
 
-// webSocketWriteBatchConn preserves the WebSocket byte stream while allowing
+// WebSocketWriteBatchConn preserves the WebSocket byte stream while allowing
 // one transport writer to combine several already-queued messages into one
 // TLS Write. It starts in pass-through mode so the HTTP upgrade handshake
 // cannot be retained; PlatformTransport explicitly brackets each ready batch.
@@ -16,19 +18,22 @@ const webSocketWriteBatchMaxByteCount = 16 * 1024
 // Batch methods and Write are used by the WebSocket's single writer goroutine.
 // Read, deadlines, and Close retain net.Conn's normal concurrent contract by
 // delegating directly to the underlying connection.
-type webSocketWriteBatchConn struct {
+type WebSocketWriteBatchConn struct {
 	conn        net.Conn
 	writeBuffer []byte
 	batching    bool
 }
 
-func newWebSocketWriteBatchConn(conn net.Conn) *webSocketWriteBatchConn {
-	return &webSocketWriteBatchConn{
+// Creates a pass-through connection whose explicit batches are bounded by the
+// package's fixed 16 KiB coalescing buffer.
+func NewWebSocketWriteBatchConn(conn net.Conn) *WebSocketWriteBatchConn {
+	return &WebSocketWriteBatchConn{
 		conn: conn,
 	}
 }
 
-func (self *webSocketWriteBatchConn) beginWriteBatch() {
+// Starts one explicit ready-only batch on the connection's single writer.
+func (self *WebSocketWriteBatchConn) BeginWriteBatch() {
 	if self.batching {
 		panic("websocket write batch already active")
 	}
@@ -40,12 +45,14 @@ func (self *webSocketWriteBatchConn) beginWriteBatch() {
 	self.batching = true
 }
 
-func (self *webSocketWriteBatchConn) abortWriteBatch() {
+// Discards bytes that have not reached the delegated connection.
+func (self *WebSocketWriteBatchConn) AbortWriteBatch() {
 	self.batching = false
 	self.writeBuffer = self.writeBuffer[:0]
 }
 
-func (self *webSocketWriteBatchConn) flushWriteBuffer() error {
+// Writes the currently retained bytes while keeping the batch active.
+func (self *WebSocketWriteBatchConn) flushWriteBuffer() error {
 	if len(self.writeBuffer) == 0 {
 		return nil
 	}
@@ -58,7 +65,8 @@ func (self *webSocketWriteBatchConn) flushWriteBuffer() error {
 	return err
 }
 
-func (self *webSocketWriteBatchConn) flushWriteBatch() error {
+// Ends the active batch and writes every retained complete frame byte.
+func (self *WebSocketWriteBatchConn) FlushWriteBatch() error {
 	if !self.batching {
 		return nil
 	}
@@ -66,11 +74,13 @@ func (self *webSocketWriteBatchConn) flushWriteBatch() error {
 	return self.flushWriteBuffer()
 }
 
-func (self *webSocketWriteBatchConn) Read(buffer []byte) (int, error) {
+// Delegates reads without sharing the single-writer batching state.
+func (self *WebSocketWriteBatchConn) Read(buffer []byte) (int, error) {
 	return self.conn.Read(buffer)
 }
 
-func (self *webSocketWriteBatchConn) Write(buffer []byte) (int, error) {
+// Passes through outside a batch and otherwise retains a bounded byte prefix.
+func (self *WebSocketWriteBatchConn) Write(buffer []byte) (int, error) {
 	if !self.batching {
 		return self.conn.Write(buffer)
 	}
@@ -86,26 +96,32 @@ func (self *webSocketWriteBatchConn) Write(buffer []byte) (int, error) {
 	return len(buffer), nil
 }
 
-func (self *webSocketWriteBatchConn) Close() error {
+// Closes the delegated connection and interrupts its blocked I/O.
+func (self *WebSocketWriteBatchConn) Close() error {
 	return self.conn.Close()
 }
 
-func (self *webSocketWriteBatchConn) LocalAddr() net.Addr {
+// Returns the delegated local address.
+func (self *WebSocketWriteBatchConn) LocalAddr() net.Addr {
 	return self.conn.LocalAddr()
 }
 
-func (self *webSocketWriteBatchConn) RemoteAddr() net.Addr {
+// Returns the delegated remote address.
+func (self *WebSocketWriteBatchConn) RemoteAddr() net.Addr {
 	return self.conn.RemoteAddr()
 }
 
-func (self *webSocketWriteBatchConn) SetDeadline(deadline time.Time) error {
+// Sets the delegated read and write deadlines.
+func (self *WebSocketWriteBatchConn) SetDeadline(deadline time.Time) error {
 	return self.conn.SetDeadline(deadline)
 }
 
-func (self *webSocketWriteBatchConn) SetReadDeadline(deadline time.Time) error {
+// Sets the delegated read deadline.
+func (self *WebSocketWriteBatchConn) SetReadDeadline(deadline time.Time) error {
 	return self.conn.SetReadDeadline(deadline)
 }
 
-func (self *webSocketWriteBatchConn) SetWriteDeadline(deadline time.Time) error {
+// Sets the delegated write deadline.
+func (self *WebSocketWriteBatchConn) SetWriteDeadline(deadline time.Time) error {
 	return self.conn.SetWriteDeadline(deadline)
 }

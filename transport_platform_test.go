@@ -1042,3 +1042,135 @@ func TestPlatformTransportCloseInterruptsBlockedH3Write(t *testing.T) {
 		t.Fatalf("peer did not observe flow-control-blocked H3 close: %v", closeCtx.Err())
 	}
 }
+
+// An H3 Framer.Read transfers its pooled message to the receive channel. Route
+// removal makes that channel unreachable to later MultiRouteReader snapshots,
+// so transport completion must return any message still queued there.
+func TestPlatformTransportH3CloseDrainsQueuedReceiveOwnership(t *testing.T) {
+	certPem, keyPem, err := selfSign(
+		[]string{"127.0.0.1"},
+		"127.0.0.1",
+		24*time.Hour,
+		24*time.Hour,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := tls.X509KeyPair(certPem, keyPem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const nextProto = "urnetwork-platform-pool-test"
+	listener, err := quic.ListenAddrEarly(
+		"127.0.0.1:0",
+		&tls.Config{
+			Certificates: []tls.Certificate{cert},
+			NextProtos:   []string{nextProto},
+		},
+		&quic.Config{MaxIdleTimeout: 30 * time.Second},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = listener.Close()
+	})
+
+	serverCtx, serverCancel := context.WithCancel(t.Context())
+	defer serverCancel()
+	serverErrors := make(chan error, 1)
+	serverDone := make(chan struct{})
+	framerSettings := DefaultFramerSettings(int(DefaultClientSettings().MinimumMessageLenLimit()))
+	go func() {
+		defer close(serverDone)
+		connection, acceptErr := listener.Accept(serverCtx)
+		if acceptErr != nil {
+			serverErrors <- acceptErr
+			return
+		}
+		stream, acceptErr := connection.AcceptStream(serverCtx)
+		if acceptErr != nil {
+			serverErrors <- acceptErr
+			return
+		}
+		framer := NewFramer(framerSettings)
+		authBytes, readErr := framer.Read(stream)
+		if readErr != nil {
+			serverErrors <- readErr
+			return
+		}
+		writeErr := framer.Write(stream, authBytes)
+		MessagePoolReturn(authBytes)
+		if writeErr != nil {
+			serverErrors <- writeErr
+			return
+		}
+		if writeErr = framer.Write(stream, make([]byte, 128)); writeErr != nil {
+			serverErrors <- writeErr
+			return
+		}
+		<-connection.Context().Done()
+	}()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	settings := testingPlatformTransportSettings()
+	settings.H3Port = listener.Addr().(*net.UDPAddr).Port
+	settings.QuicTlsConfig = &tls.Config{
+		InsecureSkipVerify: true, // test-only self-signed endpoint
+		NextProtos:         []string{nextProto},
+	}
+	settings.FramerSettings = framerSettings
+	settings.TransportBufferSize = 1
+	receiveWitnesses := make(chan []byte, 1)
+	settings.afterH3ReceiveEnqueueForTest = func(message []byte) {
+		witness := MessagePoolShareReadOnly(message)
+		select {
+		case receiveWitnesses <- witness:
+		default:
+			MessagePoolReturn(witness)
+		}
+	}
+	transport := NewPlatformTransportWithTargetMode(
+		ctx,
+		NewClientStrategyWithDefaults(ctx),
+		NewRouteManager(ctx, "h3-receive-pool"),
+		"https://127.0.0.1",
+		&ClientAuth{
+			ByJwt:      "testing",
+			InstanceId: NewId(),
+			AppVersion: "testing",
+		},
+		TransportModeH3,
+		settings,
+	)
+	t.Cleanup(transport.Close)
+
+	var witness []byte
+	select {
+	case witness = <-receiveWitnesses:
+	case serverErr := <-serverErrors:
+		t.Fatal(serverErr)
+	case <-ctx.Done():
+		t.Fatalf("wait for H3 receive enqueue: %v", ctx.Err())
+	}
+	closeCtx, closeCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer closeCancel()
+	if err := transport.CloseAndWait(closeCtx); err != nil {
+		MessagePoolReturn(witness)
+		t.Fatalf("close and join H3 receive owner: %v", err)
+	}
+	if !MessagePoolReturn(witness) {
+		// Reclaim the old queued owner too, so a failure does not contaminate
+		// later process-wide pool checks.
+		MessagePoolReturn(witness)
+		t.Fatal("H3 transport completion retained its queued Framer.Read owner")
+	}
+	select {
+	case <-serverDone:
+	case serverErr := <-serverErrors:
+		t.Fatal(serverErr)
+	case <-closeCtx.Done():
+		t.Fatalf("join H3 pool test server: %v", closeCtx.Err())
+	}
+}

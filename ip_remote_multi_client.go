@@ -5544,17 +5544,12 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 						return
 					}
 
-					p := &parsedPacket{
-						packet: MessagePoolShareReadOnly(sendPacket.packet),
-						ipPath: update.ipPath,
-					}
-					sent := client.SendWithAck(p, sendTimeout, true)
-					if !sent {
-						// a failed attempt retains ownership here: undo this
-						// attempt's share or the packet never reaches zero
-						// references (the race takes one share per client)
-						MessagePoolReturn(p.packet)
-					}
+					sent := sendMultiClientRaceAttempt(
+						client,
+						sendPacket.packet,
+						update.ipPath,
+						sendTimeout,
+					)
 					if sent {
 						successCount.Add(1)
 
@@ -5619,8 +5614,6 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 								}
 							}
 						}
-					} else {
-						MessagePoolReturn(p.packet)
 					}
 				}
 
@@ -7707,6 +7700,11 @@ type multiClientWindow struct {
 	stateLock          sync.Mutex
 	clients            map[Id]*multiClientChannel
 	performanceProfile *PerformanceProfile
+	// Nil test seams expose one initial-evaluation callback across the exact
+	// expand-pass terminal boundary. Production leaves all three unset.
+	beforeExpandPingResultForTest func()
+	afterExpandPingResultForTest  func()
+	finishExpandPassForTest       <-chan struct{}
 	// verdictRemovalTimes is the storm breaker's record of recent
 	// verdict-driven removals, pruned to RemovalBudgetWindow on each check.
 	// Guarded by stateLock. Only removals a verdict argued for are recorded
@@ -9015,7 +9013,9 @@ func (self *multiClientWindow) expand(
 	// else. admitBudget stays n, the count the size math asked for, so the
 	// window can never grow past its target because of pooling: the demand
 	// target, the standing reserve's +1, and the WindowSizeHardMax collapse
-	// all keep seeing the same admitted counts they always did.
+	// all keep seeing the same admitted counts they always did. The terminal
+	// cleanup below cancels unresolved pings before the pass returns, so this
+	// private budget cannot overlap the next resize pass.
 	//
 	// Fixed-destination generators skip the multiple for the same reason they
 	// skip the standing reserve: their destination set cannot produce surplus
@@ -9030,6 +9030,7 @@ func (self *multiClientWindow) expand(
 
 	admitted := 0
 	pending := []*expandEvaluatedCandidate{}
+	pendingPingFailures := []func(){}
 	expandEnded := false
 
 	// admitCandidate installs one evaluated candidate into the window, running
@@ -9176,6 +9177,15 @@ func (self *multiClientWindow) expand(
 			cancelCandidate(candidate)
 		}
 		pending = nil
+		// The pass deadline is an ownership boundary, not merely a return to
+		// resize. A ping callback left alive here used to retain this pass's
+		// private admit budget; overlapping timed-out passes could therefore
+		// each install one candidate and grow a fixed-size-one window to six.
+		// Failing every unresolved evaluation cancels its Client and returns its
+		// generator args before a later resize pass can begin.
+		for _, fail := range pendingPingFailures {
+			fail()
+		}
 	}()
 
 	endTime := time.Now().Add(self.settings.WindowExpandTimeout)
@@ -9190,6 +9200,8 @@ func (self *multiClientWindow) expand(
 		self.generatorMonitor.NotifyAll()
 		select {
 		case <-self.ctx.Done():
+			return
+		case <-self.finishExpandPassForTest:
 			return
 		// case <- update:
 		//     // continue
@@ -9294,6 +9306,7 @@ func (self *multiClientWindow) expand(
 					self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
 					self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed, args.Destination.Tail(), args.Location)
 				}
+				pendingPingFailures = append(pendingPingFailures, fail)
 
 				// EncryptionCapabilityPrefilter: under EncryptionModeRequired
 				// a candidate that has never published a client identity key
@@ -9346,6 +9359,12 @@ func (self *multiClientWindow) expand(
 						&protocol.IpPing{},
 						self.settings.PingWriteTimeout,
 						func(err error) {
+							if self.beforeExpandPingResultForTest != nil {
+								self.beforeExpandPingResultForTest()
+							}
+							if self.afterExpandPingResultForTest != nil {
+								defer self.afterExpandPingResultForTest()
+							}
 							mutex.Lock()
 							defer mutex.Unlock()
 
@@ -9369,22 +9388,11 @@ func (self *multiClientWindow) expand(
 									args:   args,
 								}
 								if expandEnded {
-									// a ping that resolved after the pass
-									// returned. Admission stays possible
-									// inside leftover budget -- exactly the
-									// late-install behavior this callback
-									// always had -- and past the budget the
-									// candidate is discarded politely, since
-									// the cleanup defer has already run and
-									// will not see it.
-									if admitted < admitBudget {
-										if admitCandidate(candidate) {
-											admitted += 1
-											pingSuccess += 1
-										}
-									} else {
-										cancelCandidate(candidate)
-									}
+									// A returned pass owns no admission budget. This
+									// branch is reachable only when its callback crossed
+									// the terminal mutex boundary before cleanup canceled
+									// the unresolved ping.
+									cancelCandidate(candidate)
 								} else {
 									pending = append(pending, candidate)
 									admitPending()
@@ -9447,6 +9455,8 @@ func (self *multiClientWindow) expand(
 
 		select {
 		case <-self.ctx.Done():
+			return
+		case <-self.finishExpandPassForTest:
 			return
 		case <-pingDone.Done():
 		case <-time.After(timeout):

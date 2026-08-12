@@ -1316,7 +1316,7 @@ func (self *clientDialer) WsDialer(settings *ClientStrategySettings) *websocket.
 				if err != nil {
 					return nil, err
 				}
-				return newWebSocketWriteBatchConn(conn), nil
+				return NewWebSocketWriteBatchConn(conn), nil
 			}
 		}
 		// pool, size := MessagePool(2048)
@@ -1340,7 +1340,7 @@ func (self *clientDialer) WsDialer(settings *ClientStrategySettings) *websocket.
 				if err != nil {
 					return nil, err
 				}
-				return newWebSocketWriteBatchConn(conn), nil
+				return NewWebSocketWriteBatchConn(conn), nil
 			}
 		}
 	}

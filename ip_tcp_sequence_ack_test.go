@@ -1,6 +1,12 @@
+// Deterministic TCP acknowledgement tests cover sequence arithmetic and
+// pool ownership at cancellation boundaries.
 package connect
 
-import "testing"
+import (
+	"sync"
+	"testing"
+	"time"
+)
 
 func newTcpAckOrderingTestSequence() *TcpSequence {
 	return &TcpSequence{
@@ -13,6 +19,107 @@ func newTcpAckOrderingTestSequence() *TcpSequence {
 			receiveWindowEndSet: true,
 		},
 	}
+}
+
+// Proves cancellation after pure-acknowledgement construction returns the
+// packet instead of abandoning its sole pool ownership before callback delivery.
+func TestTcpSequenceCancelAfterPureAckBuildReturnsPacket(t *testing.T) {
+	ackBuilt := make(chan struct{})
+	ackWorkerStopped := make(chan struct{})
+	releaseAck := make(chan struct{})
+	var observeOnce sync.Once
+	var observedPacket []byte
+	harness := newTcpReorderTestHarnessWithSetup(t, 1000, 8, 0, func(sequence *TcpSequence) {
+		sequence.afterPureAckBuildForTest = func(packet []byte) {
+			observeOnce.Do(func() {
+				observedPacket = MessagePoolShareReadOnly(packet)
+				close(ackBuilt)
+				<-releaseAck
+			})
+		}
+		sequence.afterPureAckWorkerStopForTest = func() {
+			close(ackWorkerStopped)
+		}
+	})
+
+	harness.sendPayload(harness.nextSeq, "x", false)
+	select {
+	case <-ackBuilt:
+	case <-time.After(2 * time.Second):
+		close(releaseAck)
+		t.Fatal("pure ACK was not built")
+	}
+
+	// Cancellation is already visible when the held worker resumes, forcing
+	// the exact pre-delivery ownership branch without scheduler timing.
+	harness.sequence.Cancel()
+	close(releaseAck)
+	select {
+	case <-ackWorkerStopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pure-ACK worker did not stop")
+	}
+	harness.close()
+	if MessagePoolReturn(observedPacket) {
+		return
+	}
+
+	// Reclaim the production reference on old behavior so the regression does
+	// not contaminate later pool-balance tests in the same process.
+	MessagePoolReturn(observedPacket)
+	t.Fatal("canceled pure ACK retained production pool ownership")
+}
+
+// Proves Run publishes completion only after its held pure-acknowledgement
+// worker has reached terminal cleanup.
+func TestTcpSequenceRunDoesNotReturnWhilePureAckWorkerHeld(t *testing.T) {
+	ackBuilt := make(chan struct{})
+	ackWorkerStopped := make(chan struct{})
+	childWorkersWaitStarted := make(chan struct{})
+	releaseAck := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseAck) })
+	}
+	defer release()
+
+	harness := newTcpReorderTestHarnessWithSetup(t, 1000, 8, 0, func(sequence *TcpSequence) {
+		sequence.afterPureAckBuildForTest = func([]byte) {
+			close(ackBuilt)
+			<-releaseAck
+		}
+		sequence.afterPureAckWorkerStopForTest = func() {
+			close(ackWorkerStopped)
+		}
+		sequence.beforeChildWorkersWaitForTest = func() {
+			close(childWorkersWaitStarted)
+		}
+	})
+	harness.sendPayload(harness.nextSeq, "x", false)
+	select {
+	case <-ackBuilt:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pure ACK was not built")
+	}
+
+	harness.sequence.Cancel()
+	select {
+	case <-childWorkersWaitStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("TcpSequence.Run did not reach its child-worker join")
+	}
+	release()
+	select {
+	case <-ackWorkerStopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pure-ACK worker did not stop")
+	}
+	select {
+	case <-harness.runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("TcpSequence.Run did not complete after its child worker stopped")
+	}
+	harness.close()
 }
 
 func TestTcpSequenceAcceptsPureAckAheadOfDeliveredUpload(t *testing.T) {

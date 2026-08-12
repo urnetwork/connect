@@ -140,6 +140,28 @@ func newP2pFastPathTestPairForStreamWithStats(
 	activeStats *P2pDataPlaneStats,
 	passiveStats *P2pDataPlaneStats,
 ) *p2pFastPathTestPair {
+	return newP2pFastPathTestPairForStreamWithSettings(
+		t,
+		enableActive,
+		enablePassive,
+		streamId,
+		activeStats,
+		passiveStats,
+		nil,
+	)
+}
+
+// Optional settings changes let actual-network and rolling-version tests use
+// the production pair lifecycle without changing its ordinary defaults.
+func newP2pFastPathTestPairForStreamWithSettings(
+	t *testing.T,
+	enableActive bool,
+	enablePassive bool,
+	streamId Id,
+	activeStats *P2pDataPlaneStats,
+	passiveStats *P2pDataPlaneStats,
+	configure func(*WebRtcSettings, *WebRtcSettings),
+) *p2pFastPathTestPair {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	settingsA := DefaultWebRtcSettings()
@@ -154,6 +176,9 @@ func newP2pFastPathTestPairForStreamWithStats(
 	settingsB.EnableDatagramFastPath = enablePassive
 	settingsA.DataPlaneStats = activeStats
 	settingsB.DataPlaneStats = passiveStats
+	if configure != nil {
+		configure(settingsA, settingsB)
+	}
 
 	signalPipeA := newSignalPipe(nil)
 	signalPipeB := newSignalPipe(nil)
@@ -576,7 +601,7 @@ func TestP2pFastPathReassemblyBoundsMalformedMessages(t *testing.T) {
 		{
 			name: "version",
 			mutate: func(packet []byte) {
-				packet[3] = 2
+				packet[3] = 1
 			},
 		},
 		{
@@ -943,6 +968,110 @@ func TestP2pTransportAutoFallsBackToLegacyPeer(t *testing.T) {
 		stats.LegacyReceiveMessageCount != 1 ||
 		stats.FastFallbackCount != 1 {
 		t.Fatalf("mixed compatibility stats = %+v", stats)
+	}
+}
+
+// A previous fragment geometry uses the same codec but a different warmup
+// version. Neither side marks that carrier ready, so Auto keeps the data
+// channel and makes a rolling upgrade compatible.
+func TestP2pTransportAutoFallsBackAcrossFastPathWireVersions(t *testing.T) {
+	activeWarmupReceived := make(chan byte, 1)
+	passiveWarmupReceived := make(chan byte, 1)
+	pair := newP2pFastPathTestPairForStreamWithSettings(
+		t,
+		true,
+		true,
+		NewId(),
+		nil,
+		nil,
+		func(active *WebRtcSettings, passive *WebRtcSettings) {
+			passive.datagramFastPathWarmupVersionForTest = 1
+			active.afterFastPathWarmupReceiveForTest = func(version byte) {
+				select {
+				case activeWarmupReceived <- version:
+				default:
+				}
+			}
+			passive.afterFastPathWarmupReceiveForTest = func(version byte) {
+				select {
+				case passiveWarmupReceived <- version:
+				default:
+				}
+			}
+		},
+	)
+	waitWarmup := func(name string, received <-chan byte, expected byte) {
+		t.Helper()
+		timer := time.NewTimer(time.Second)
+		defer timer.Stop()
+		select {
+		case version := <-received:
+			if version != expected {
+				t.Fatalf("%s received warmup version=%d want=%d", name, version, expected)
+			}
+		case <-timer.C:
+			t.Fatalf("%s did not receive the remote warmup", name)
+		}
+	}
+	waitWarmup("active", activeWarmupReceived, 1)
+	waitWarmup("passive", passiveWarmupReceived, p2pFastPathVersion)
+	activeFast := pair.active.(webRtcFastPathConn)
+	passiveFast := pair.passive.(webRtcFastPathConn)
+	if activeFast.FastPathReady() || passiveFast.FastPathReady() {
+		t.Fatal("mixed wire versions selected an incompatible fast carrier")
+	}
+	transportCtx, transportCancel := context.WithCancel(pair.ctx)
+	defer transportCancel()
+	settings := DefaultP2pTransportSettings()
+	settings.DataPlaneMode = P2pDataPlaneModeAuto
+	settings.DataPlaneStats = &P2pDataPlaneStats{}
+	sendTransport, sendRoute := NewP2pSendTransport(
+		transportCtx,
+		transportCancel,
+		pair.active,
+		pair.streamId,
+		settings,
+	)
+	receiveTransport, receiveRoute := NewP2pReceiveTransport(
+		transportCtx,
+		transportCancel,
+		pair.passive,
+		pair.streamId,
+		settings,
+	)
+	_ = sendTransport
+	_ = receiveTransport
+	message := bytes.Repeat([]byte{0x9e}, 2*1024)
+	pooledMessage := MessagePoolCopy(message)
+	select {
+	case <-transportCtx.Done():
+		MessagePoolReturn(pooledMessage)
+		t.Fatal("versioned transport stopped before send")
+	case sendRoute <- pooledMessage:
+	}
+	select {
+	case <-transportCtx.Done():
+		t.Fatal("versioned transport stopped before receive")
+	case received := <-receiveRoute:
+		if !bytes.Equal(received, message) {
+			MessagePoolReturn(received)
+			t.Fatal("versioned legacy fallback changed the message")
+		}
+		MessagePoolReturn(received)
+	}
+	deadline := time.Now().Add(time.Second)
+	for settings.DataPlaneStats.Snapshot().LegacyReceiveMessageCount != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("versioned legacy receive counter did not advance")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	stats := settings.DataPlaneStats.Snapshot()
+	if stats.FastSendMessageCount != 0 ||
+		stats.LegacySendMessageCount != 1 ||
+		stats.LegacyReceiveMessageCount != 1 ||
+		stats.FastFallbackCount != 1 {
+		t.Fatalf("versioned compatibility stats = %+v", stats)
 	}
 }
 

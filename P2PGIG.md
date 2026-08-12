@@ -333,8 +333,8 @@ The important production settings and invariants are:
 | Area | Current behavior | Consequence |
 |---|---|---|
 | Selection | `Auto` by default, with `LegacyOnly` and `FastOnly` production controls | New peers select fast after mutual readiness; old peers continue on the DataChannel |
-| Capability | Custom codec in normal SDP plus a bounded warmup marker | No version guess and no application payload is sent before both RTP receive workers are active |
-| Fast fragment | At most 1,400 bytes of carrier payload with a 16-byte header | Fits the current SRTP/UDP path conservatively and avoids IP fragmentation on an ordinary 1,500-byte path |
+| Capability | Custom codec in normal SDP plus a bounded, versioned warmup marker | No application payload is sent before both RTP receive workers agree on the wire version; mixed v1/v2 peers stay on SCTP |
+| Fast fragment | At most 1,188 bytes of carrier payload with a 16-byte header | A full IPv6/UDP/SRTP/RTP packet fits the 1,280-byte minimum MTU exactly |
 | Reassembly | 64 bounded in-progress slots, 64 fragments maximum, two-second expiry | Memory and malformed/incomplete message lifetime are bounded |
 | Complete-message queue | 1,024 messages by default | Absorbs about 24 ms at local gigabit rate; overflow drops instead of blocking the SRTP socket reader |
 | Native UDP writes | Bounded 256-packet queue, ready-only drains of at most 64 | Linux uses `sendmmsg`; other systems overlap ordered socket writes without an idle batching delay |
@@ -379,6 +379,8 @@ The exchange route now preserves batching across more of the shared path:
 
 - client H1 drains up to four ready messages and coalesces at most 16 KiB into
   one underlying write in [transport.go](transport.go);
+- server H1 uses the same four-message, 16 KiB ready-only coalescer above TLS;
+  the upgrade and authentication writes remain pass-through;
 - client and server H3 drain up to 16 ready messages or 64 KiB into one
   wire-identical framing write, without waiting for a batch timer;
 - [server/connect/resident.go](../server/connect/resident.go) drains up to 256
@@ -393,6 +395,64 @@ The exchange remains reliable H1/H3 stream transport. The current work removes
 singleton overhead and improves the shared TUN boundary; removing nested
 recovery from exchange traffic would still require a separately negotiated
 datagram route implemented on both Connect and `server/connect`.
+
+### TCP socket scheduling and ready-only batching
+
+The client transport, server transport, outbound exchange transport, and
+outbound exchange forward path were audited as four separate socket-I/O
+boundaries. They should not gain another reader/writer channel:
+
+- client and server WebSocket readers already hand complete messages to
+  bounded route channels, and Gorilla's buffered reader consumes bytes already
+  fetched by one socket read;
+- exchange readers already use a 64 KiB buffered reader and a separate bounded
+  dispatch channel;
+- exchange socket writers already ready-drain at most 256 messages or 256 KiB
+  and use `net.Buffers`/`writev` on production TCP connections; and
+- another read-ahead queue would weaken backpressure and add pooled ownership
+  without reducing the underlying read syscall count.
+
+The missing useful boundary was the server H1 writer. It previously performed
+one WebSocket/TLS write per user message. It now drains at most four messages
+that are already ready, sets one deadline, preserves four independent
+WebSocket frames, and flushes one bounded buffer above TLS. It never waits for
+another message. Control traffic remains a separate write, and the speed-test
+loop admits at most one user batch between chunks so a continuous backlog
+cannot starve the next control chunk.
+
+Five one-second loopback samples on the Apple M1 Max measured the isolated H1
+socket boundary as follows. Values are medians; throughput is useful framed
+payload, not full-TUN goodput.
+
+| Boundary | CPUs | Singleton | Ready coalesced | Gain |
+|---|---:|---:|---:|---:|
+| Client H1/TLS | 1 | 361.40 MB/s | 560.34 MB/s | +55.0% |
+| Client H1/TLS | 10 | 216.61 MB/s | 548.90 MB/s | +153.4% |
+| Server H1 cleartext | 1 | 578.17 MB/s | 1,283.79 MB/s | +122.0% |
+| Server H1 cleartext | 10 | 273.13 MB/s | 869.67 MB/s | +218.4% |
+| Server H1/TLS | 1 | 405.15 MB/s | 580.17 MB/s | +43.2% |
+| Server H1/TLS | 10 | 228.87 MB/s | 604.72 MB/s | +164.2% |
+
+The saturated paths reduced TCP writes from one per frame to about one per
+four frames without adding per-frame allocations. In separate sparse samples,
+every mode remained exactly one frame, one deadline, one TCP write, and one TLS
+record per delivery. Median server TLS delivery changed from 15.545 to 15.656
+microseconds at one CPU and from 20.122 to 20.300 microseconds at ten CPUs; the
+sample ranges overlap. Client sparse ranges also overlap. Ready-only batching
+therefore provides the saturated gain without a batching timer or a meaningful
+sparse latency penalty.
+
+The outbound resident-to-exchange bridge was measured separately because it
+publishes one message at a time into a connection whose socket writer already
+gathers. An exact barrier test produces one 64-message socket flush when the
+connection queue is prefilled, and `[1, 63]` through both the resident
+transport and resident forward bridges. A real loopback TCP comparison of
+those two shapes measured 32.090 versus 36.380 microseconds per 64-message
+burst, a 13.4% difference inside this isolated stage. The absolute difference
+is 4.290 microseconds, FIFO and pooled ownership remain exact, and the other 63
+messages already share one `writev`. A new batch-channel ownership protocol is
+not justified by this result alone. Revisit it if production profiles show
+burst-onset exchange writes consuming material CPU or syscalls.
 
 ## Findings
 
@@ -639,26 +699,36 @@ addressing the measured syscall ceiling.
 **Priority: medium**
 
 **Implementation status: partially resolved. ICE migration/fallback is
-retained, fixed P2P fragmentation fits an ordinary 1,500-byte path, and H3
-DPLPMTUD is enabled. Fast P2P still fails the recorded 1,280-byte outer-MTU
-blackhole. Continuous delivery-quality scoring and path-aware P2P MTU handling
-remain future work.**
+retained, fixed P2P fragmentation now fits IPv6's 1,280-byte minimum MTU, and
+H3 DPLPMTUD is enabled. Continuous delivery-quality scoring and path-aware
+growth above that conservative minimum remain future work.**
 
 ICE selects a working pair, but a gigabit implementation also needs to know
 whether that pair remains the best path. Local/private endpoints, public
 endpoints, interface changes, IPv4/IPv6, NAT behavior, loss, RTT, path MTU,
 and relay fallback can all change after setup.
 
-The latest full-TUN MTU diagnostic sent 1,440-byte inner packets through a
-silent 1,280-byte outer path. Fast P2P emitted packets as large as 1,444 bytes,
-the simulator dropped 20 oversized packets, and inner TCP reset. Exchange H3
-completed its corresponding 1,280-byte test. This is historical pre-final
-evidence, but no later result has shown the fast-P2P limitation resolved.
+The historical full-TUN MTU diagnostic sent 1,440-byte inner packets through a
+silent 1,280-byte outer path. Fast P2P emitted oversized packets, the simulator
+dropped them, and inner TCP reset. The serial campaign later reproduced the
+same defect at a 1,400-byte outer MTU: a 1,400-byte fast fragment became a
+1,472-byte IPv4 datagram after the 16-byte carrier header, 12-byte RTP header,
+16-byte SRTP tag, UDP, and IPv4 headers.
 
-The current inner MTU of 1,440 bytes may fit a compact new header over IPv4 but
-can exceed a 1,500-byte outer path over IPv6. Sending an oversized encrypted
-UDP datagram and relying on IP fragmentation amplifies loss: one missing
-fragment loses the entire inner packet.
+The corrected carrier uses 1,188-byte payload fragments. A focused real-Pion
+wire test measures an exact 1,280-byte worst-case IPv6 packet and completes
+message delivery with zero oversize drops. Focused full-TUN tests also complete
+exact 128 KiB inner TCP at both 1,400-byte and 1,280-byte outer MTUs with zero
+P2P MTU drops. The fragment header and bidirectional warmup are version 2;
+mixed v1/v2 peers retain the stable codec, reject each other's readiness
+marker, and deterministically use SCTP during rolling deployment.
+
+For any future compact raw-UDP carrier, the current inner MTU of 1,440 bytes
+may fit a compact new header over IPv4 but can exceed a 1,500-byte outer path
+over IPv6. Sending an oversized encrypted UDP datagram and relying on IP
+fragmentation amplifies loss: one missing fragment loses the entire inner
+packet. The selected SRTP carrier avoids that problem by fragmenting Transfer
+messages at the safe 1,188-byte payload bound.
 
 The app usually exposes one TUN MTU for all routes. Lowering it only in the P2P
 encoder would turn valid 1,440-byte packets into route-dependent drops. The
@@ -667,10 +737,11 @@ routes or synthesize correct Packet Too Big/MSS behavior before a packet enters
 a route whose effective MTU is smaller. Platform and local routes must remain
 correct when the active P2P path changes that minimum.
 
-**Conclusion:** keep the fixed size only as a 1,500-byte-path default. Add
-Datagram Packetization Layer Path MTU Discovery or negotiated smaller
-fragments, validated migration, quality hysteresis, ICMP Packet Too Big
-synthesis or MSS adjustment, and a reliable fallback.
+**Conclusion:** keep the fixed 1,188-byte payload as the minimum-path-safe
+default. Add Datagram Packetization Layer Path MTU Discovery or negotiated
+larger fragments, validated migration, and quality hysteresis to reclaim
+headroom on larger paths. Retain correct Packet Too Big/MSS behavior for any
+future route whose effective MTU is smaller and retain the reliable fallback.
 
 ### Applicability by route
 
@@ -685,7 +756,7 @@ synthesis or MSS adjustment, and a reliable fallback.
 | Target: reuse parse/policy/flow metadata within a bounded batch | Yes | Yes | SDK/Connect, with identical security decisions |
 | TUN `WriteBatch` and GRO/TSO | Yes | Yes | SDK/apps/Connect |
 | Cumulative authenticated accounting receipts | Optional compact-v2 headroom | Required for any future exchange datagram lane | Connect protocol and `server/connect` routing |
-| Path MTU, bounded queues, drop telemetry, migration | Fixed fragmentation fits a 1,500-byte path; the recorded 1,280-byte outer path fails; more scoring and path-aware sizing remain | H3 DPLPMTUD today; required for any future exchange datagram lane | Connect and `server/connect` |
+| Path MTU, bounded queues, drop telemetry, migration | Fixed fragmentation fits IPv6's 1,280-byte minimum; more scoring and path-aware growth remain | H3 DPLPMTUD today; required for any future exchange datagram lane | Connect and `server/connect` |
 
 The route-neutral items should be implemented once and consumed by all routes.
 Transport-specific adapters must not force the shared batch type to contain
@@ -1145,8 +1216,12 @@ Implemented shared Connect and SDK work:
 
 Implemented and remaining `server/connect` work for the exchange route:
 
-- retains the current bounded `writev` gather and batches H3 framing; a
-  batch-aware resident channel remains future headroom;
+- retains the current bounded `writev` gather, batches H3 framing, and applies
+  four-frame ready-only coalescing to server H1;
+- a batch-aware resident channel remains optional future headroom: the measured
+  `[1, 63]` bridge shape cost 4.290 microseconds per 64-message loopback burst,
+  which does not justify changing the ownership protocol without production
+  profile evidence;
 - reading and dispatching several framed messages through one resident-channel
   batch remains future headroom;
 - preserve per-message framing, ownership, routing, rate limits, and failure
@@ -1167,11 +1242,11 @@ Platform work:
 
 ### 6. Add path MTU discovery and quality scoring — partial
 
-Start conservatively, likely near 1,400 inner bytes on ordinary 1,500-byte
-paths, then validate the exact new header against both outer IPv4 and IPv6.
-Use Datagram Packetization Layer PMTUD instead of IP fragmentation. Oversized
-inner packets should produce correct Packet Too Big behavior or TCP MSS
-adjustment.
+The selected carrier now starts with a 1,188-byte transfer payload, which the
+actual-wire regression measures as exactly 1,280 bytes after worst-case IPv6,
+UDP, RTP, SRTP, and carrier overhead. Use Datagram Packetization Layer PMTUD
+to grow above that floor instead of IP fragmentation. Oversized inner packets
+should produce correct Packet Too Big behavior or TCP MSS adjustment.
 
 Measure candidate RTT, recent loss/drop signal, delivery rate, path MTU, scope,
 and relay/direct state. Switch only after the new endpoint is authenticated
@@ -1202,7 +1277,7 @@ recovery owner.
 | Choice | Advantages | Limits | Recommendation |
 |---|---|---|---|
 | Tune current reliable SCTP | Small, compatible changes | Shared Reno window, fragmentation, SACK/retry work, and syscall shape remain | Maintain only as fallback |
-| Custom RTP/SRTP on current peer connection | Reuses ICE, DTLS, authentication, replay, migration, SDP capability fallback, and existing sockets; measured above target | Transfer messages larger than 1,400 bytes fragment; not the minimum possible header | Selected production fast path |
+| Custom RTP/SRTP on current peer connection | Reuses ICE, DTLS, authentication, replay, migration, SDP capability fallback, and existing sockets; measured above target | Transfer messages larger than 1,188 bytes fragment; not the minimum possible header | Selected production fast path |
 | Unordered SCTP with zero retransmissions | Capability-negotiated stepping stone | Still SCTP-fragmented, association-congestion-controlled, and one write per packet | Not selected |
 | QUIC DATAGRAM | Mature authentication, migration, PMTUD, and Linux GSO support | Requires a second association and remains QUIC-congestion-controlled | Reconsider only if a future measurement justifies it |
 | Connect authenticated raw UDP | Minimum overhead and exact semantics; compact codec already measured | Requires independent replay, rekey, PMTU, pacing, migration validation, and protocol review | Future headroom, not selected |
@@ -1419,8 +1494,9 @@ ICE migration, and legacy fallback without introducing that second lifecycle.
 
 - Capability-based automatic rollout, forced disable/require controls, ICE
   migration, bounded warmup, and legacy fallback are implemented.
-- H3 DPLPMTUD is enabled. The fixed SRTP fragment size fits an ordinary
-  1,500-byte path but not the recorded 1,280-byte outer path.
+- H3 DPLPMTUD is enabled. The fixed SRTP fragment payload is now 1,188 bytes,
+  fitting IPv6's 1,280-byte minimum outer MTU; focused full-TUN 1,400/1,280
+  tests pass with zero P2P MTU drops.
 - The historical userspace 500 ms and 1 s matrices exposed route-readiness
   failures. Deterministic correctness gates now cover both latencies, including
   representative warmed 32 MiB transfers, but their exact-tree execution and
@@ -1614,8 +1690,8 @@ The remaining credible route to a product-wide claim is:
 
 1. rerun clean topology, recovery ownership, and schema-3 full-TUN performance
    on one recorded exact tree;
-2. run and confirm the deterministic 500 ms/1 s readiness gates, and resolve or
-   retain the recorded 1,280-byte outer-MTU failure from the resulting evidence;
+2. run and confirm the deterministic 500 ms/1 s readiness gates, retaining the
+   fixed 1,400/1,280-byte outer-MTU correctness gates in the resulting evidence;
 3. retain `Auto` capability fallback and the reliable control plane;
 4. validate Linux, Windows, macOS, Android, and iOS on physical same-LAN paths;
 5. run the RTT, loss, MTU, migration, and relay matrix above;
@@ -1627,6 +1703,6 @@ The remaining credible route to a product-wide claim is:
 
 The implementation addresses the measured carrier bottleneck and retains the
 properties that make Connect more than a generic packet tunnel. Exact-tree
-full-TUN performance, high-RTT readiness, outer-MTU handling, deployment
-validation, and measured hardening remain. The evidence does not call for
+full-TUN performance, high-RTT readiness, deployment validation, and measured
+hardening remain. The minimum outer-MTU defect is resolved. The evidence does not call for
 another wholesale data-plane redesign.

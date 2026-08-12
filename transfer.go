@@ -118,6 +118,7 @@ type sendPackLifecycleRecord struct {
 	destinationId Id
 	token         uint64
 	ackRequired   bool
+	messageType   protocol.MessageType
 }
 
 // safeSendPackLifecycleObserve prevents optional measurement code from
@@ -155,6 +156,7 @@ func (self sendPackLifecycleRecord) observe(phase SendPackLifecyclePhase, err er
 		DestinationId: self.destinationId,
 		Token:         self.token,
 		AckRequired:   self.ackRequired,
+		MessageType:   self.messageType,
 		Err:           err,
 	})
 }
@@ -500,9 +502,10 @@ type SendPack struct {
 	noAckToken    uint64
 	// Optional all-Pack lifecycle observation follows this original Pack
 	// through coalescing and terminal Ack/error disposition.
-	lifecycleObserver func(SendPackLifecycleObservation)
-	lifecycleClientId Id
-	lifecycleToken    uint64
+	lifecycleObserver    func(SendPackLifecycleObservation)
+	lifecycleClientId    Id
+	lifecycleToken       uint64
+	lifecycleMessageType protocol.MessageType
 }
 
 func (self *SendPack) ackRecord() sendAckRecord {
@@ -522,6 +525,7 @@ func (self *SendPack) lifecycleRecord() sendPackLifecycleRecord {
 		destinationId: self.Destination,
 		token:         self.lifecycleToken,
 		ackRequired:   self.Ack,
+		messageType:   self.lifecycleMessageType,
 	}
 }
 
@@ -1582,15 +1586,23 @@ func (self *Client) startSendPackLifecycle(sendPack *SendPack) {
 		return
 	}
 	token := self.sendPackLifecycleToken.Add(1)
+	messageType := protocol.MessageType(0)
+	if sendPack.Frame != nil {
+		messageType = sendPack.Frame.MessageType
+	} else if 0 < len(sendPack.Frames) && sendPack.Frames[0] != nil {
+		messageType = sendPack.Frames[0].MessageType
+	}
 	sendPack.lifecycleObserver = lifecycleObserver
 	sendPack.lifecycleClientId = self.clientId
 	sendPack.lifecycleToken = token
+	sendPack.lifecycleMessageType = messageType
 	safeSendPackLifecycleObserve(lifecycleObserver, SendPackLifecycleObservation{
 		Phase:         SendPackLifecyclePhaseStarted,
 		ClientId:      self.clientId,
 		DestinationId: sendPack.Destination,
 		Token:         token,
 		AckRequired:   sendPack.Ack,
+		MessageType:   messageType,
 	})
 }
 
@@ -2569,13 +2581,16 @@ const (
 // an error when the Pack never reached a writer. Terminal follows removal from
 // reliable resend ownership and reports peer Ack or the final sequence error.
 // AckRequired is the caller's requested policy; an opening contract may still
-// temporarily put a requested NoAck Pack on the reliable wire lane.
+// temporarily put a requested NoAck Pack on the reliable wire lane. MessageType
+// is the original Frame type, or the first Frame type for an explicitly batched
+// Pack, and remains unchanged through every phase.
 type SendPackLifecycleObservation struct {
 	Phase         SendPackLifecyclePhase
 	ClientId      Id
 	DestinationId Id
 	Token         uint64
 	AckRequired   bool
+	MessageType   protocol.MessageType
 	Err           error
 }
 
@@ -5222,6 +5237,10 @@ type ReceiveBufferSettings struct {
 	beforeRunReceiveSequenceForTest    func(receiveSequenceId)
 	beforeCloseWaitForTest             func(receiveSequenceId)
 	afterRunReceiveSequenceForTest     func(receiveSequenceId)
+	beforeAckCompressWaitForTest       func(receiveSequenceId)
+	beforeAckWorkerStopForTest         func(receiveSequenceId)
+	afterAckWriterOpenForTest          func(receiveSequenceId, MultiRouteWriter)
+	afterAckWritesCanceledForTest      func(receiveSequenceId)
 }
 
 type receiveSequenceId struct {
@@ -5955,6 +5974,12 @@ func (self *ReceiveSequence) Run() {
 	ackWorkerDone := make(chan struct{})
 	ackWorkerStop := make(chan struct{})
 	ackWorkerStarted := false
+	// Sequence cancellation stops Pack processing, but cleanup still has to
+	// flush delivered items into the ACK window before it explicitly stops the
+	// ACK worker. A sibling context keeps ordinary ACK writes alive until that
+	// final drain begins; cleanup then cancels route waits before joining them.
+	ackWriteCtx, cancelAckWrites := context.WithCancel(context.WithoutCancel(self.ctx))
+	defer cancelAckWrites()
 	defer func() {
 		if r := recover(); r != nil {
 			self.log.Errorf("[r]%s<-%s s(%s) abnormal exit =  %s\n", self.client.ClientTag(), self.source.SourceId, self.source.StreamId, r)
@@ -5972,11 +5997,20 @@ func (self *ReceiveSequence) Run() {
 			}()
 			self.flushDeliver()
 		}()
-		// The ACK worker owns its route writer. Join it before publishing exit
-		// so Close cannot return while that writer still uses the RouteManager.
-		// Its stop path drains the final ACK window before closing.
+		// The ACK worker owns its route writer. Its stop path snapshots the final
+		// ACK window before closing. Cancel route waits before joining: Write
+		// still tries every immediately writable route before consulting the
+		// context, preserving final ACK delivery without letting a backpressured
+		// or absent route deadlock teardown (including an infinite WriteTimeout).
 		if ackWorkerStarted {
+			if self.receiveBufferSettings.beforeAckWorkerStopForTest != nil {
+				self.receiveBufferSettings.beforeAckWorkerStopForTest(self.id())
+			}
 			close(ackWorkerStop)
+			cancelAckWrites()
+			if self.receiveBufferSettings.afterAckWritesCanceledForTest != nil {
+				self.receiveBufferSettings.afterAckWritesCanceledForTest(self.id())
+			}
 			<-ackWorkerDone
 		}
 		self.closeContractWriterAlias()
@@ -6046,6 +6080,12 @@ func (self *ReceiveSequence) Run() {
 			ackDestination,
 		)
 		defer self.client.RouteManager().CloseMultiRouteWriter(ackMultiRouteWriter)
+		if self.receiveBufferSettings.afterAckWriterOpenForTest != nil {
+			self.receiveBufferSettings.afterAckWriterOpenForTest(
+				self.id(),
+				ackMultiRouteWriter,
+			)
+		}
 
 		writeAck := func(sendAck sequenceAck) {
 			path := sendTransferPath(self.client.ClientId(), ackDestination)
@@ -6097,7 +6137,7 @@ func (self *ReceiveSequence) Run() {
 				if cipher == nil {
 					shared := MessagePoolShareReadOnly(transferFrameBytes)
 					writeErr := ackMultiRouteWriter.Write(
-						self.ctx,
+						ackWriteCtx,
 						shared,
 						self.receiveBufferSettings.WriteTimeout,
 					)
@@ -6119,7 +6159,7 @@ func (self *ReceiveSequence) Run() {
 				defer MessagePoolReturn(wrapped)
 				shared := MessagePoolShareReadOnly(wrapped)
 				writeErr := ackMultiRouteWriter.Write(
-					self.ctx,
+					ackWriteCtx,
 					shared,
 					self.receiveBufferSettings.WriteTimeout,
 				)
@@ -6174,11 +6214,20 @@ func (self *ReceiveSequence) Run() {
 		drainAndStop := func() {
 			writeSnapshot(self.ackWindow.Snapshot(true))
 		}
+		// ctxDone is disabled after its first edge. Cancellation may drain the
+		// ACKs already visible at that instant, but only ackWorkerStop may end
+		// this worker: Run cleanup can publish more ACKs while flushing its final
+		// delivered batch.
+		ctxDone := self.ctx.Done()
+		drainCanceledSequence := func() {
+			ctxDone = nil
+			writeSnapshot(self.ackWindow.Snapshot(true))
+		}
 
 		for {
 			select {
-			case <-self.ctx.Done():
-				return
+			case <-ctxDone:
+				drainCanceledSequence()
 			case <-ackWorkerStop:
 				drainAndStop()
 				return
@@ -6189,8 +6238,8 @@ func (self *ReceiveSequence) Run() {
 			if ackSnapshot.ackUpdateCount == 0 && len(ackSnapshot.selectiveAcks) == 0 {
 				// wait for one ack
 				select {
-				case <-self.ctx.Done():
-					return
+				case <-ctxDone:
+					drainCanceledSequence()
 				case <-ackWorkerStop:
 					drainAndStop()
 					return
@@ -6200,9 +6249,12 @@ func (self *ReceiveSequence) Run() {
 
 			if 0 < self.receiveBufferSettings.AckCompressTimeout {
 				ackCompressTimer.Reset(self.receiveBufferSettings.AckCompressTimeout)
+				if self.receiveBufferSettings.beforeAckCompressWaitForTest != nil {
+					self.receiveBufferSettings.beforeAckCompressWaitForTest(self.id())
+				}
 				select {
-				case <-self.ctx.Done():
-					return
+				case <-ctxDone:
+					drainCanceledSequence()
 				case <-ackWorkerStop:
 					drainAndStop()
 					return
@@ -6706,11 +6758,11 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 // flushDeliver dispatches the buffered head items' app frames in one receive
 // callback, then sends their acks (deliver-before-ack, as the per-item path
 // did) and returns their pool buffers. The batch is taken out of the sequence
-// fields BEFORE the callback runs: a callback panic (e.g. a resident tearing
-// down mid-control-processing) then loses the un-acked batch — the sender
-// resends and a healthy sequence reprocesses — instead of the exit-path flush
-// re-delivering a half-processed batch or acking frames whose processing
-// failed.
+// fields BEFORE the callback runs. Client.receive isolates each registered
+// application callback panic; this guard covers a failure in that internal
+// dispatcher itself. Such a failure loses the un-acked batch so the sender can
+// resend it, instead of letting the exit-path flush re-deliver a partially
+// dispatched batch or ack frames whose dispatch failed.
 func (self *ReceiveSequence) flushDeliver() {
 	if len(self.deliverItems) == 0 {
 		return

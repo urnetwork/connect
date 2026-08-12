@@ -969,6 +969,11 @@ type WebRtcSettings struct {
 	// Nil in production; tests hold the native fast-path OnTrack body after
 	// Pion dispatch, independently of the lifecycle wrapper.
 	beforeFastPathOnTrackBodyForTest func()
+	// Zero in production; tests use the previous warmup version to prove that
+	// a rolling upgrade selects the compatible SCTP path.
+	datagramFastPathWarmupVersionForTest byte
+	// Nil in production; tests observe reception of one exact warmup version.
+	afterFastPathWarmupReceiveForTest func(byte)
 
 	// add stun:xxx urls here
 	IceServerUrls []string

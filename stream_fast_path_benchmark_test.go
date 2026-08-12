@@ -470,6 +470,16 @@ func BenchmarkStreamFastPathUDPOneHopSinglePacket(b *testing.B) {
 	benchmarkStreamFastPathUDPEndToEnd(b, 1, 1)
 }
 
+// This measures the H1-sized four-packet drain at the P2P UDP boundary.
+func BenchmarkStreamFastPathUDPOneHopBatch4(b *testing.B) {
+	benchmarkStreamFastPathUDPEndToEnd(b, 1, 4)
+}
+
+// This measures the proposed eight-packet drain at the P2P UDP boundary.
+func BenchmarkStreamFastPathUDPOneHopBatch8(b *testing.B) {
+	benchmarkStreamFastPathUDPEndToEnd(b, 1, 8)
+}
+
 // This is the primary clean-path comparison with the production 64-packet
 // drain size. On Linux the socket layer uses sendmmsg and recvmmsg.
 func BenchmarkStreamFastPathUDPOneHopBatch64(b *testing.B) {
@@ -482,6 +492,11 @@ func BenchmarkStreamFastPathUDPTwoHopsBatch64(b *testing.B) {
 	benchmarkStreamFastPathUDPEndToEnd(b, 2, 64)
 }
 
+// This applies the proposed eight-packet drain through one intermediary.
+func BenchmarkStreamFastPathUDPTwoHopsBatch8(b *testing.B) {
+	benchmarkStreamFastPathUDPEndToEnd(b, 2, 8)
+}
+
 // This measures the existing maximum of eight intermediaries and nine hops.
 func BenchmarkStreamFastPathUDPNineHopsBatch64(b *testing.B) {
 	benchmarkStreamFastPathUDPEndToEnd(b, MaxMultihopLength+1, 64)
@@ -492,9 +507,27 @@ func BenchmarkStreamFastPathUDPPipelineOneHopBatch64(b *testing.B) {
 	benchmarkStreamFastPathUDPPipeline(b, 1, 64)
 }
 
+// This measures a four-packet ready drain with independently scheduled P2P
+// endpoint stages.
+func BenchmarkStreamFastPathUDPPipelineOneHopBatch4(b *testing.B) {
+	benchmarkStreamFastPathUDPPipeline(b, 1, 4)
+}
+
+// This measures an eight-packet ready drain with independently scheduled P2P
+// endpoint stages.
+func BenchmarkStreamFastPathUDPPipelineOneHopBatch8(b *testing.B) {
+	benchmarkStreamFastPathUDPPipeline(b, 1, 8)
+}
+
 // This adds one independently running intermediary.
 func BenchmarkStreamFastPathUDPPipelineTwoHopsBatch64(b *testing.B) {
 	benchmarkStreamFastPathUDPPipeline(b, 2, 64)
+}
+
+// This applies the eight-packet pipeline through one independently scheduled
+// intermediary.
+func BenchmarkStreamFastPathUDPPipelineTwoHopsBatch8(b *testing.B) {
+	benchmarkStreamFastPathUDPPipeline(b, 2, 8)
 }
 
 // This fills the supported eight-intermediary stream on independent stages.
@@ -506,18 +539,50 @@ func BenchmarkStreamFastPathUDPPipelineNineHopsBatch64(b *testing.B) {
 // exercises the real detached DataChannel and P2P route queues, including
 // SCTP, DTLS, ICE, and UDP on loopback.
 func BenchmarkStreamLegacyWebRtcRoute(b *testing.B) {
-	benchmarkStreamWebRtcRoute(b, P2pDataPlaneModeLegacyOnly)
+	benchmarkStreamWebRtcRoute(
+		b,
+		P2pDataPlaneModeLegacyOnly,
+		DefaultP2pTransportSettings().ChannelBufferSize,
+	)
 }
 
 // This exercises the production SRTP fast carrier through the same P2P route
 // queues and loopback ICE association as the forced legacy comparison.
 func BenchmarkStreamFastWebRtcRoute(b *testing.B) {
-	benchmarkStreamWebRtcRoute(b, P2pDataPlaneModeFastOnly)
+	benchmarkStreamWebRtcRoute(
+		b,
+		P2pDataPlaneModeFastOnly,
+		DefaultP2pTransportSettings().ChannelBufferSize,
+	)
+}
+
+// Measures the current legacy DataChannel route queue depth.
+func BenchmarkStreamLegacyWebRtcRouteChannel4(b *testing.B) {
+	benchmarkStreamWebRtcRoute(b, P2pDataPlaneModeLegacyOnly, 4)
+}
+
+// Measures an eight-message legacy DataChannel route queue.
+func BenchmarkStreamLegacyWebRtcRouteChannel8(b *testing.B) {
+	benchmarkStreamWebRtcRoute(b, P2pDataPlaneModeLegacyOnly, 8)
+}
+
+// Measures the current fast-carrier route queue depth.
+func BenchmarkStreamFastWebRtcRouteChannel4(b *testing.B) {
+	benchmarkStreamWebRtcRoute(b, P2pDataPlaneModeFastOnly, 4)
+}
+
+// Measures an eight-message fast-carrier route queue.
+func BenchmarkStreamFastWebRtcRouteChannel8(b *testing.B) {
+	benchmarkStreamWebRtcRoute(b, P2pDataPlaneModeFastOnly, 8)
 }
 
 // benchmarkStreamWebRtcRoute runs one forced production P2P carrier without
 // changing the payload, route queue, peer setup, or receive verification.
-func benchmarkStreamWebRtcRoute(b *testing.B, dataPlaneMode P2pDataPlaneMode) {
+func benchmarkStreamWebRtcRoute(
+	b *testing.B,
+	dataPlaneMode P2pDataPlaneMode,
+	channelBufferSize int,
+) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
@@ -571,6 +636,7 @@ func benchmarkStreamWebRtcRoute(b *testing.B, dataPlaneMode P2pDataPlaneMode) {
 
 	transportSettings := DefaultP2pTransportSettings()
 	transportSettings.DataPlaneMode = dataPlaneMode
+	transportSettings.ChannelBufferSize = channelBufferSize
 	transportCtx, transportCancel := context.WithCancel(ctx)
 	defer transportCancel()
 	sendTransport, sendRoute := NewP2pSendTransport(

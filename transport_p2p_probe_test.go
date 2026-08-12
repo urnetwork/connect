@@ -16,6 +16,27 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
+// The production cadence leaves a measurable idle window after a complete
+// challenge on the maximum supported regional round trip.
+func TestDefaultP2pStreamProbeCadenceExceedsRegionalRoundTrip(t *testing.T) {
+	settings := DefaultP2pTransportSettings()
+	maximumRegionalRoundTrip := time.Second
+	if settings.EndToEndProbeInterval <= maximumRegionalRoundTrip {
+		t.Fatalf(
+			"probe interval=%s, want greater than regional round trip %s",
+			settings.EndToEndProbeInterval,
+			maximumRegionalRoundTrip,
+		)
+	}
+	if settings.EndToEndProbeTimeout < 3*settings.EndToEndProbeInterval {
+		t.Fatalf(
+			"probe timeout=%s interval=%s, want at least three intervals",
+			settings.EndToEndProbeTimeout,
+			settings.EndToEndProbeInterval,
+		)
+	}
+}
+
 // One userspace topology owns both endpoint probes and a symmetric chain of
 // opaque relays. Link state is shared by its two directions.
 type p2pProbeTestTopology struct {
@@ -1044,9 +1065,9 @@ func TestP2pStreamProbeEstablishedMiddleLossWithdrawsAndRepromotes(t *testing.T)
 	}
 }
 
-// Successful responses renew readiness but cannot start another challenge
-// until an explicit interval edge advances the lifecycle.
-func TestP2pStreamProbeSuccessfulResponsesRemainIntervalPaced(t *testing.T) {
+// Matching responses, including duplicates from an interval-boundary retry,
+// restart the quiet interval before the next nonce is sent.
+func TestP2pStreamProbeSuccessfulResponsesRearmQuietInterval(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	settings := DefaultP2pTransportSettings()
@@ -1067,7 +1088,7 @@ func TestP2pStreamProbeSuccessfulResponsesRemainIntervalPaced(t *testing.T) {
 	defer routeManager.CloseMultiRouteWriter(writer)
 	probe := newStoppedP2pStreamProbe(ctx, routeManager, streamId, settings)
 	timerTicks := make(chan time.Time, 1)
-	timerResets := make(chan time.Duration, 2)
+	timerResets := make(chan time.Duration, 4)
 	probe.testingProbeTimer = timerTicks
 	probe.testingAfterProbeTimerReset = func(interval time.Duration) {
 		timerResets <- interval
@@ -1109,8 +1130,34 @@ func TestP2pStreamProbeSuccessfulResponsesRemainIntervalPaced(t *testing.T) {
 	}
 	select {
 	case interval := <-timerResets:
-		t.Fatalf("response bypassed timer with interval %s", interval)
+		if interval != settings.EndToEndProbeInterval {
+			t.Fatalf("response quiet interval=%s", interval)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("response did not rearm the quiet interval")
+	}
+	select {
+	case unexpectedRequest := <-route:
+		MessagePoolReturn(unexpectedRequest)
+		t.Fatal("response immediately started another challenge")
 	default:
+	}
+
+	duplicateResponse := encodeP2pStreamProbe(p2pStreamProbeResponseType, streamId, nonce)
+	if !probe.handle(duplicateResponse) {
+		MessagePoolReturn(duplicateResponse)
+		t.Fatal("duplicate challenge response was not recognized")
+	}
+	if !MessagePoolReturn(duplicateResponse) {
+		t.Fatal("duplicate response caller lost its pooled buffer")
+	}
+	select {
+	case interval := <-timerResets:
+		if interval != settings.EndToEndProbeInterval {
+			t.Fatalf("duplicate response quiet interval=%s", interval)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("duplicate response did not extend the quiet interval")
 	}
 
 	timerTicks <- time.Time{}
@@ -1123,8 +1170,110 @@ func TestP2pStreamProbeSuccessfulResponsesRemainIntervalPaced(t *testing.T) {
 		t.Fatal("interval edge did not arm the next challenge")
 	}
 	request = receiveP2pProbeRouteMessage(t, route, "renewed challenge was not queued")
+	recognized, messageType, _, renewedNonce := decodeP2pStreamProbe(request)
+	if !recognized || messageType != p2pStreamProbeRequestType {
+		MessagePoolReturn(request)
+		t.Fatal("renewed challenge was not a request")
+	}
+	if renewedNonce == nonce {
+		MessagePoolReturn(request)
+		t.Fatal("renewed challenge reused the completed nonce")
+	}
 	if !MessagePoolReturn(request) {
 		t.Fatal("renewed challenge ownership was not returned")
+	}
+}
+
+// A matching response queued while the interval branch is already selected
+// wins before that branch can emit a duplicate challenge.
+func TestP2pStreamProbeIntervalEdgePrefersQueuedResponse(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultP2pTransportSettings()
+	settings.EndToEndProbeInterval = 5 * time.Millisecond
+	settings.EndToEndProbeTimeout = 50 * time.Millisecond
+	routeManager := NewRouteManager(ctx, "probe-interval-response-race")
+	streamId := NewId()
+	destinationId := NewId()
+	route := make(Route, 2)
+	transport := newP2pProbeTestSendTransport(destinationId, streamId, route, settings)
+	routeManager.UpdateTransport(transport, []Route{route})
+	removeAlias := routeManager.AddWriterDestinationAlias(
+		DestinationId(destinationId),
+		StreamId(streamId),
+	)
+	defer removeAlias()
+	writer := routeManager.OpenMultiRouteWriter(DestinationId(destinationId))
+	defer routeManager.CloseMultiRouteWriter(writer)
+	probe := newStoppedP2pStreamProbe(ctx, routeManager, streamId, settings)
+	timerTicks := make(chan time.Time, 1)
+	timerResets := make(chan time.Duration, 2)
+	timerEdgeReached := make(chan struct{})
+	releaseTimerEdge := make(chan struct{})
+	probe.testingProbeTimer = timerTicks
+	probe.testingAfterProbeTimerReset = func(interval time.Duration) {
+		timerResets <- interval
+	}
+	probe.testingAfterProbeTimerEdge = func() {
+		close(timerEdgeReached)
+		<-releaseTimerEdge
+	}
+	probe.setSendRoute(transport, route)
+	go HandleError(probe.run, probe.cancel)
+	defer func() {
+		probe.close()
+		probe.clearSendRoute(transport, route)
+	}()
+
+	select {
+	case interval := <-timerResets:
+		if interval != settings.EndToEndProbeInterval {
+			t.Fatalf("initial challenge interval=%s", interval)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("initial challenge timer was not armed")
+	}
+	request := receiveP2pProbeRouteMessage(t, route, "initial challenge was not queued")
+	recognized, messageType, _, nonce := decodeP2pStreamProbe(request)
+	if !recognized || messageType != p2pStreamProbeRequestType {
+		MessagePoolReturn(request)
+		t.Fatal("initial challenge was not a request")
+	}
+	if !MessagePoolReturn(request) {
+		t.Fatal("initial challenge ownership was not returned")
+	}
+
+	timerTicks <- time.Time{}
+	select {
+	case <-timerEdgeReached:
+	case <-time.After(time.Second):
+		t.Fatal("interval branch did not reach the response barrier")
+	}
+	response := encodeP2pStreamProbe(p2pStreamProbeResponseType, streamId, nonce)
+	if !probe.handle(response) {
+		MessagePoolReturn(response)
+		t.Fatal("challenge response was not recognized")
+	}
+	if !MessagePoolReturn(response) {
+		t.Fatal("response caller lost its pooled buffer")
+	}
+	close(releaseTimerEdge)
+	select {
+	case interval := <-timerResets:
+		if interval != settings.EndToEndProbeInterval {
+			t.Fatalf("response quiet interval=%s", interval)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued response did not rearm the quiet interval")
+	}
+	if got, ok := waitForP2pProbeRouteCount(writer, 1, time.Second); !ok {
+		t.Fatalf("responsive route count=%d, want 1", got)
+	}
+	select {
+	case duplicateRequest := <-route:
+		MessagePoolReturn(duplicateRequest)
+		t.Fatal("interval edge emitted a duplicate challenge before its queued response")
+	default:
 	}
 }
 

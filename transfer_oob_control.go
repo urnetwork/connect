@@ -36,7 +36,12 @@ type OutOfBandControlWithCtx interface {
 }
 
 type ApiOutOfBandControl struct {
-	api *BringYourApi
+	api      *BringYourApi
+	ownsApi  bool
+	requests *lifecycleAdmission
+
+	// Nil test barrier exposes the exact join boundary after admission closes.
+	beforeCloseWaitForTest func()
 }
 
 func NewApiOutOfBandControl(
@@ -48,13 +53,16 @@ func NewApiOutOfBandControl(
 	api := NewBringYourApi(ctx, clientStrategy, apiUrl)
 	api.SetByJwt(byJwt)
 	return &ApiOutOfBandControl{
-		api: api,
+		api:      api,
+		ownsApi:  true,
+		requests: newLifecycleAdmission(),
 	}
 }
 
 func NewApiOutOfBandControlWithApi(api *BringYourApi) *ApiOutOfBandControl {
 	return &ApiOutOfBandControl{
-		api: api,
+		api:      api,
+		requests: newLifecycleAdmission(),
 	}
 }
 
@@ -100,27 +108,40 @@ func (self *ApiOutOfBandControl) sendControl(
 			})
 		}
 	}
+	returnFrames := func() {
+		for _, frame := range frames {
+			MessagePoolReturn(frame.MessageBytes)
+		}
+	}
+	if !self.requests.start() {
+		returnFrames()
+		safeCallback(nil, context.Canceled)
+		return
+	}
 
 	pack := &protocol.Pack{
 		Frames: frames,
 	}
-	defer func() {
-		for _, frame := range frames {
-			MessagePoolReturn(frame.MessageBytes)
-		}
-	}()
 	packBytes, err := ProtoMarshal(pack)
 	if err != nil {
+		defer self.requests.finish()
+		returnFrames()
 		safeCallback(nil, err)
 		return
 	}
-	defer MessagePoolReturn(packBytes)
+	encodedPack := EncodeBase64(base64.StdEncoding, packBytes)
+	MessagePoolReturn(packBytes)
+	returnFrames()
 
 	connectControl(
 		&ConnectControlArgs{
-			Pack: EncodeBase64(base64.StdEncoding, packBytes),
+			Pack: encodedPack,
 		},
 		NewApiCallback(func(result *ConnectControlResult, err error) {
+			// Request completion is published after every callback-local pooled
+			// buffer has returned. CloseAndWait may therefore use completion as
+			// an exact ownership barrier.
+			defer self.requests.finish()
 			if err != nil {
 				safeCallback(nil, err)
 				return
@@ -143,6 +164,29 @@ func (self *ApiOutOfBandControl) sendControl(
 			safeCallback(responsePack.Frames, nil)
 		}),
 	)
+}
+
+// Close prevents later request admission. A control constructed with its own
+// API also cancels API-bound requests; a wrapper around a caller-owned API
+// leaves that shared API open. Caller-context cleanup requests remain bounded
+// by their client-strategy timeout and are joined by CloseAndWait.
+func (self *ApiOutOfBandControl) Close() {
+	self.requests.close()
+	if self.ownsApi {
+		self.api.Close()
+	}
+}
+
+// CloseAndWait closes request admission and joins every request and callback
+// admitted before that boundary. An OOB callback must not call CloseAndWait
+// because it would wait for its own return. It may call Close and ask an
+// external owner goroutine to perform the wait.
+func (self *ApiOutOfBandControl) CloseAndWait(ctx context.Context) error {
+	self.Close()
+	if self.beforeCloseWaitForTest != nil {
+		self.beforeCloseWaitForTest()
+	}
+	return waitForLifecycleDone(ctx, self.requests.Done(), "api out-of-band requests")
 }
 
 type NoContractClientOob struct {

@@ -634,13 +634,19 @@ func TestWebRtcManagerSignalBatchGateJoinsAndRejectsLateBatch(t *testing.T) {
 // receive transport test.
 type lifecycleReadBarrierConn struct {
 	net.Conn
-	readEntered chan struct{}
-	readOnce    sync.Once
+	readEntered      chan struct{}
+	readMessageBytes chan []byte
+	readOnce         sync.Once
 }
 
 // Read announces entry before delegating to the blocking pipe.
 func (self *lifecycleReadBarrierConn) Read(message []byte) (int, error) {
-	self.readOnce.Do(func() { close(self.readEntered) })
+	self.readOnce.Do(func() {
+		if self.readMessageBytes != nil {
+			self.readMessageBytes <- message
+		}
+		close(self.readEntered)
+	})
 	return self.Conn.Read(message)
 }
 
@@ -730,8 +736,9 @@ func TestP2pReceiveTransportDoneFollowsFinalPoolDrain(t *testing.T) {
 	transportCtx, cancelTransport := context.WithCancel(context.Background())
 	localPipe, remotePipe := net.Pipe()
 	conn := &lifecycleReadBarrierConn{
-		Conn:        localPipe,
-		readEntered: make(chan struct{}),
+		Conn:             localPipe,
+		readEntered:      make(chan struct{}),
+		readMessageBytes: make(chan []byte, 1),
 	}
 	defer localPipe.Close()
 	defer remotePipe.Close()
@@ -751,6 +758,15 @@ func TestP2pReceiveTransportDoneFollowsFinalPoolDrain(t *testing.T) {
 		<-releaseDrain
 	}
 	waitCloseWaitBarrier(t, ctx, conn.readEntered, "P2P receive read")
+	var blockedReadCapture *lifecyclePoolCapture
+	select {
+	case message := <-conn.readMessageBytes:
+		blockedReadCapture = newLifecyclePoolCapture(message)
+	case <-ctx.Done():
+		t.Fatalf("capture P2P blocked-read owner: %v", ctx.Err())
+	}
+	defer blockedReadCapture.cleanup()
+	blockedReadCapture.requireOwnerLive(t, "P2P blocked-read buffer")
 	capture := newLifecyclePoolCapture(MessagePoolGet(512))
 	defer capture.cleanup()
 	route <- capture.owner
@@ -758,6 +774,7 @@ func TestP2pReceiveTransportDoneFollowsFinalPoolDrain(t *testing.T) {
 	joinResult := make(chan error, 1)
 	go func() { joinResult <- lifecycle.CloseAndWait(ctx) }()
 	waitCloseWaitBarrier(t, ctx, drainReached, "receive final pool drain")
+	blockedReadCapture.requireOwnerReturned(t, "P2P blocked-read buffer")
 	capture.requireOwnerReturned(t, "receive final-drain frame")
 	select {
 	case <-lifecycle.Done():
@@ -1376,12 +1393,14 @@ func TestPeerConnFastPathRtcpUsesOwnedWorker(t *testing.T) {
 // lifecycleParentWebRtcConn is a deterministic message-oriented connection:
 // the first read returns the peer ready marker and later reads block on Close.
 type lifecycleParentWebRtcConn struct {
-	closed       chan struct{}
-	closeOnce    sync.Once
-	readCount    atomic.Uint32
-	callbackLock sync.Mutex
-	callbacks    map[uint64]func(bool)
-	nextCallback uint64
+	closed            chan struct{}
+	closeOnce         sync.Once
+	readCount         atomic.Uint32
+	steadyReadOnce    sync.Once
+	steadyReadMessage chan []byte
+	callbackLock      sync.Mutex
+	callbacks         map[uint64]func(bool)
+	nextCallback      uint64
 }
 
 // Read returns the setup marker once, then waits for teardown.
@@ -1389,6 +1408,11 @@ func (self *lifecycleParentWebRtcConn) Read(message []byte) (int, error) {
 	if self.readCount.Add(1) == 1 {
 		return copy(message, []byte(ReadyHeader)), nil
 	}
+	self.steadyReadOnce.Do(func() {
+		if self.steadyReadMessage != nil {
+			self.steadyReadMessage <- message
+		}
+	})
 	<-self.closed
 	return 0, io.EOF
 }
@@ -1480,7 +1504,10 @@ func TestP2pTransportParentJoinsChildDone(t *testing.T) {
 	defer cancelWait()
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), closeWaitClientSettings())
 	manager := lifecycleTestManager(ctx, t)
-	fakeConn := &lifecycleParentWebRtcConn{closed: make(chan struct{})}
+	fakeConn := &lifecycleParentWebRtcConn{
+		closed:            make(chan struct{}),
+		steadyReadMessage: make(chan []byte, 1),
+	}
 	manager.newP2pConnForTest = func(context.Context, TransferPath, bool) (WebRtcConn, error) {
 		return fakeConn, nil
 	}
@@ -1518,12 +1545,22 @@ func TestP2pTransportParentJoinsChildDone(t *testing.T) {
 	for index := 0; index < 2; index++ {
 		waitCloseWaitBarrier(t, ctx, childCreated, "P2P route child creation")
 	}
+	var blockedReadCapture *lifecyclePoolCapture
+	select {
+	case message := <-fakeConn.steadyReadMessage:
+		blockedReadCapture = newLifecyclePoolCapture(message)
+	case <-ctx.Done():
+		t.Fatalf("capture parent P2P blocked-read owner: %v", ctx.Err())
+	}
+	defer blockedReadCapture.cleanup()
+	blockedReadCapture.requireOwnerLive(t, "parent P2P blocked-read buffer")
 	transport.Close()
 	joinResult := make(chan error, 1)
 	go func() { joinResult <- transport.CloseAndWait(ctx) }()
 	for index := 0; index < 2; index++ {
 		waitCloseWaitBarrier(t, ctx, childCleanup, "P2P route child cleanup")
 	}
+	blockedReadCapture.requireOwnerReturned(t, "parent P2P blocked-read buffer")
 	requireCloseWaitBlocked(t, joinResult, "exported P2P child join")
 	close(releaseChildren)
 	waitCloseWaitResult(t, ctx, joinResult, "exported P2P parent child join")

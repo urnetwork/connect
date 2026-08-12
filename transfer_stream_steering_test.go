@@ -1219,9 +1219,11 @@ func TestReceiveSequenceExitDrainsFinalAck(t *testing.T) {
 	}()
 }
 
-// Pins cleanup under an application callback panic. The panic is rethrown only
+// Pins cleanup under an internal receive-dispatch panic. Registered application
+// callback panics are isolated one level up by Client.receive; this direct
+// callback models failure of the dispatcher itself. The panic is rethrown only
 // after the ACK worker, route writer, context, and exit notification finish.
-func TestReceiveSequenceCallbackPanicStillTearsDownAckWorker(t *testing.T) {
+func TestReceiveSequenceDispatcherPanicStillTearsDownAckWorker(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 

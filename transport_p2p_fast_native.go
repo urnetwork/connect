@@ -7,7 +7,6 @@
 package connect
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -87,21 +86,23 @@ func (self *webRtcFastPathTrack) Kind() webrtc.RTPCodecType {
 // negotiated receiver. The send mutex assigns message and RTP counters in
 // order; the receive callback starts exactly one bounded reassembly worker.
 type webRtcFastPath struct {
-	ctx                     context.Context
-	log                     Logger
-	maximumMessageByteCount int
-	dataPlaneStats          *P2pDataPlaneStats
-	track                   *webRtcFastPathTrack
-	messages                chan p2pFastPathReceivedMessage
-	receiveOnce             sync.Once
-	receiveDone             chan struct{}
-	warmupOnce              sync.Once
-	readyOnce               sync.Once
-	ready                   chan struct{}
-	receiveReady            atomic.Bool
-	sendMutex               sync.Mutex
-	nextMessageId           uint32
-	nextSequenceNumber      uint16
+	ctx                       context.Context
+	log                       Logger
+	maximumMessageByteCount   int
+	dataPlaneStats            *P2pDataPlaneStats
+	track                     *webRtcFastPathTrack
+	messages                  chan p2pFastPathReceivedMessage
+	receiveOnce               sync.Once
+	receiveDone               chan struct{}
+	warmupOnce                sync.Once
+	readyOnce                 sync.Once
+	ready                     chan struct{}
+	receiveReady              atomic.Bool
+	sendMutex                 sync.Mutex
+	nextMessageId             uint32
+	nextSequenceNumber        uint16
+	warmupVersion             byte
+	afterWarmupReceiveForTest func(byte)
 
 	// Tests retain an exact reassembly-buffer witness before queue handoff.
 	// Nil is a production no-op.
@@ -152,6 +153,15 @@ func newWebRtcMediaEngine(settings *WebRtcSettings) (*webrtc.MediaEngine, error)
 	return mediaEngine, err
 }
 
+// p2pFastPathWarmupVersionForSettings returns the production wire version
+// unless a test is constructing the other side of a rolling-upgrade boundary.
+func p2pFastPathWarmupVersionForSettings(settings *WebRtcSettings) byte {
+	if settings.datagramFastPathWarmupVersionForTest != 0 {
+		return settings.datagramFastPathWarmupVersionForTest
+	}
+	return p2pFastPathVersion
+}
+
 // configureFastPath adds a sendrecv media section before offer/answer
 // creation. A peer that does not advertise the codec simply leaves the local
 // track unbound, and Auto mode retains the reliable DataChannel fallback.
@@ -186,6 +196,11 @@ func (self *peerConn) configureFastPath() error {
 		),
 		receiveDone: make(chan struct{}),
 		ready:       make(chan struct{}),
+		warmupVersion: p2pFastPathWarmupVersionForSettings(
+			self.settings,
+		),
+		afterWarmupReceiveForTest: self.settings.
+			afterFastPathWarmupReceiveForTest,
 	}
 	self.fastPath.Store(fastPath)
 	if self.settings.afterFastPathPublishForTest != nil {
@@ -430,7 +445,7 @@ func (self *webRtcFastPath) writeWarmup() error {
 			Version:        2,
 			SequenceNumber: self.nextSequenceNumber,
 		},
-		Payload: []byte{'U', 'R', 'W', 1},
+		Payload: []byte{'U', 'R', 'W', self.warmupVersion},
 	})
 }
 
@@ -476,11 +491,19 @@ func (self *webRtcFastPath) readTrack(reader p2pFastPathPacketReader) {
 			continue
 		}
 		payload := packetBuffer[headerByteCount:packetByteCount]
-		if bytes.Equal(payload, []byte{'U', 'R', 'W', 1}) {
-			self.receiveReady.Store(true)
-			self.readyOnce.Do(func() {
-				close(self.ready)
-			})
+		if len(payload) == 4 &&
+			payload[0] == 'U' &&
+			payload[1] == 'R' &&
+			payload[2] == 'W' {
+			if self.afterWarmupReceiveForTest != nil {
+				self.afterWarmupReceiveForTest(payload[3])
+			}
+			if payload[3] == self.warmupVersion {
+				self.receiveReady.Store(true)
+				self.readyOnce.Do(func() {
+					close(self.ready)
+				})
+			}
 			MessagePoolReturn(packetBuffer)
 			continue
 		}

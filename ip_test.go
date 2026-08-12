@@ -518,8 +518,19 @@ func testClient[P comparable](
 // connects the packet side of `tun` to `localUserNat`.
 // returns a function that removes the receive callback.
 func bridgeTunToLocalUserNat(tun *Tun, localUserNat *LocalUserNat, source TransferPath) func() {
+	return bridgeTunToLocalUserNatWithBatchSize(tun, localUserNat, source, 64)
+}
+
+// Connects the same bridge while making the TUN read-ahead cap explicit for
+// batch-depth benchmarks.
+func bridgeTunToLocalUserNatWithBatchSize(
+	tun *Tun,
+	localUserNat *LocalUserNat,
+	source TransferPath,
+	maximumPacketCount int,
+) func() {
 	go HandleError(func() {
-		packets := make([][]byte, 64)
+		packets := make([][]byte, max(1, maximumPacketCount))
 		for {
 			n, err := tun.ReadBatch(packets)
 			if err != nil {
@@ -874,6 +885,17 @@ func newBenchmarkEgressBridgeWithShardCount(b *testing.B, ctx context.Context, s
 // directly into the receiver tap/tun interface. the large mtu benchmark
 // variants are diagnostics only.
 func newBenchmarkEgressBridgeWithMtu(b *testing.B, ctx context.Context, mtu int) (*Tun, func()) {
+	return newBenchmarkEgressBridgeWithMtuAndBatchSize(b, ctx, mtu, 64)
+}
+
+// Builds the same bridge while varying only the TUN and per-flow ready-drain
+// caps. Queue capacities and flow windows retain their production defaults.
+func newBenchmarkEgressBridgeWithMtuAndBatchSize(
+	b *testing.B,
+	ctx context.Context,
+	mtu int,
+	maximumPacketCount int,
+) (*Tun, func()) {
 	tunSettings := DefaultTunSettingsWithBufferSize(2048)
 	tunSettings.Mtu = mtu
 	tun, err := CreateTun(ctx, tunSettings)
@@ -883,8 +905,15 @@ func newBenchmarkEgressBridgeWithMtu(b *testing.B, ctx context.Context, mtu int)
 	localUserNatSettings := DefaultLocalUserNatSettings()
 	localUserNatSettings.TcpBufferSettings.Mtu = mtu
 	localUserNatSettings.UdpBufferSettings.Mtu = mtu
+	localUserNatSettings.TcpBufferSettings.WriteBatchSize = maximumPacketCount
+	localUserNatSettings.UdpBufferSettings.WriteBatchSize = maximumPacketCount
 	localUserNat := NewLocalUserNat(ctx, "benchEgress", localUserNatSettings)
-	removeReceiveCallback := bridgeTunToLocalUserNat(tun, localUserNat, SourceId(NewId()))
+	removeReceiveCallback := bridgeTunToLocalUserNatWithBatchSize(
+		tun,
+		localUserNat,
+		SourceId(NewId()),
+		maximumPacketCount,
+	)
 	closeBridge := func() {
 		removeReceiveCallback()
 		localUserNat.Close()
@@ -897,16 +926,26 @@ func newBenchmarkEgressBridgeWithMtu(b *testing.B, ctx context.Context, mtu int)
 // this exercises the tcp send path: sequence buffering, the write pipeline,
 // window adjustment, and pure acks back to the source.
 func BenchmarkIpEgressTcp4Up(b *testing.B) {
-	benchmarkIpEgressTcp4Up(b, DefaultMtu)
+	benchmarkIpEgressTcp4Up(b, DefaultMtu, 64)
+}
+
+// Measures the shared TUN/NAT upload path with an eight-packet ready drain.
+func BenchmarkIpEgressTcp4UpBatch8(b *testing.B) {
+	benchmarkIpEgressTcp4Up(b, DefaultMtu, 8)
+}
+
+// Measures the shared TUN/NAT upload path with its current ready drain.
+func BenchmarkIpEgressTcp4UpBatch64(b *testing.B) {
+	benchmarkIpEgressTcp4Up(b, DefaultMtu, 64)
 }
 
 // `BenchmarkIpEgressTcp4Up` at the maximum mtu.
 // the gap to the default mtu run is the per-packet overhead of the pipeline.
 func BenchmarkIpEgressTcp4UpMtu64k(b *testing.B) {
-	benchmarkIpEgressTcp4Up(b, 65535)
+	benchmarkIpEgressTcp4Up(b, 65535, 64)
 }
 
-func benchmarkIpEgressTcp4Up(b *testing.B, mtu int) {
+func benchmarkIpEgressTcp4Up(b *testing.B, mtu int, maximumPacketCount int) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -937,7 +976,12 @@ func benchmarkIpEgressTcp4Up(b *testing.B, mtu int) {
 		}
 	})
 
-	tun, closeBridge := newBenchmarkEgressBridgeWithMtu(b, ctx, mtu)
+	tun, closeBridge := newBenchmarkEgressBridgeWithMtuAndBatchSize(
+		b,
+		ctx,
+		mtu,
+		maximumPacketCount,
+	)
 	defer closeBridge()
 
 	conn, err := tun.DialContext(ctx, "tcp", sinkListener.Addr().String())
@@ -973,16 +1017,26 @@ func benchmarkIpEgressTcp4Up(b *testing.B, mtu int) {
 // this exercises the tcp receive path: socket reads, data packet
 // serialization, and window waits against the source acks.
 func BenchmarkIpEgressTcp4Down(b *testing.B) {
-	benchmarkIpEgressTcp4Down(b, DefaultMtu)
+	benchmarkIpEgressTcp4Down(b, DefaultMtu, 64)
+}
+
+// Measures the shared TUN/NAT download path with an eight-packet ready drain.
+func BenchmarkIpEgressTcp4DownBatch8(b *testing.B) {
+	benchmarkIpEgressTcp4Down(b, DefaultMtu, 8)
+}
+
+// Measures the shared TUN/NAT download path with its current ready drain.
+func BenchmarkIpEgressTcp4DownBatch64(b *testing.B) {
+	benchmarkIpEgressTcp4Down(b, DefaultMtu, 64)
 }
 
 // `BenchmarkIpEgressTcp4Down` at the maximum mtu.
 // the gap to the default mtu run is the per-packet overhead of the pipeline.
 func BenchmarkIpEgressTcp4DownMtu64k(b *testing.B) {
-	benchmarkIpEgressTcp4Down(b, 65535)
+	benchmarkIpEgressTcp4Down(b, 65535, 64)
 }
 
-func benchmarkIpEgressTcp4Down(b *testing.B, mtu int) {
+func benchmarkIpEgressTcp4Down(b *testing.B, mtu int, maximumPacketCount int) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -1019,7 +1073,12 @@ func benchmarkIpEgressTcp4Down(b *testing.B, mtu int) {
 		}
 	})
 
-	tun, closeBridge := newBenchmarkEgressBridgeWithMtu(b, ctx, mtu)
+	tun, closeBridge := newBenchmarkEgressBridgeWithMtuAndBatchSize(
+		b,
+		ctx,
+		mtu,
+		maximumPacketCount,
+	)
 	defer closeBridge()
 
 	conn, err := tun.DialContext(ctx, "tcp", sourceListener.Addr().String())
@@ -1124,6 +1183,20 @@ func BenchmarkIpEgressUdp4RoundTrip(b *testing.B) {
 // source keeps at most `windowSize` datagrams unacked. the window stays below
 // all of the buffer sizes so the flow is lossless by construction.
 func BenchmarkIpEgressUdp4Up(b *testing.B) {
+	benchmarkIpEgressUdp4Up(b, 64)
+}
+
+// Measures the shared TUN/NAT UDP upload path with an eight-packet drain.
+func BenchmarkIpEgressUdp4UpBatch8(b *testing.B) {
+	benchmarkIpEgressUdp4Up(b, 8)
+}
+
+// Measures the shared TUN/NAT UDP upload path with its current drain.
+func BenchmarkIpEgressUdp4UpBatch64(b *testing.B) {
+	benchmarkIpEgressUdp4Up(b, 64)
+}
+
+func benchmarkIpEgressUdp4Up(b *testing.B, maximumPacketCount int) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -1159,7 +1232,12 @@ func BenchmarkIpEgressUdp4Up(b *testing.B) {
 		}
 	})
 
-	tun, closeBridge := newBenchmarkEgressBridge(b, ctx)
+	tun, closeBridge := newBenchmarkEgressBridgeWithMtuAndBatchSize(
+		b,
+		ctx,
+		DefaultMtu,
+		maximumPacketCount,
+	)
 	defer closeBridge()
 
 	conn, err := tun.DialContext(ctx, "udp", sinkConn.LocalAddr().String())
@@ -1217,6 +1295,20 @@ func BenchmarkIpEgressUdp4Up(b *testing.B) {
 // server keeps at most `windowSize` datagrams unacked. the window stays below
 // all of the buffer sizes so the flow is lossless by construction.
 func BenchmarkIpEgressUdp4Down(b *testing.B) {
+	benchmarkIpEgressUdp4Down(b, 64)
+}
+
+// Measures the shared TUN/NAT UDP download path with an eight-packet drain.
+func BenchmarkIpEgressUdp4DownBatch8(b *testing.B) {
+	benchmarkIpEgressUdp4Down(b, 8)
+}
+
+// Measures the shared TUN/NAT UDP download path with its current drain.
+func BenchmarkIpEgressUdp4DownBatch64(b *testing.B) {
+	benchmarkIpEgressUdp4Down(b, 64)
+}
+
+func benchmarkIpEgressUdp4Down(b *testing.B, maximumPacketCount int) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -1266,7 +1358,12 @@ func BenchmarkIpEgressUdp4Down(b *testing.B) {
 		}
 	})
 
-	tun, closeBridge := newBenchmarkEgressBridge(b, ctx)
+	tun, closeBridge := newBenchmarkEgressBridgeWithMtuAndBatchSize(
+		b,
+		ctx,
+		DefaultMtu,
+		maximumPacketCount,
+	)
 	defer closeBridge()
 
 	conn, err := tun.DialContext(ctx, "udp", sourceConn.LocalAddr().String())

@@ -247,6 +247,9 @@ func testSendPackLifecycleCoalescing(t *testing.T, ackRequired bool) {
 			ackRequired,
 			false,
 		)
+		if started.MessageType != protocol.MessageType_TestSimpleMessage {
+			t.Fatalf("coalesced Pack Started type=%s", started.MessageType)
+		}
 	}
 
 	release()
@@ -273,6 +276,13 @@ func testSendPackLifecycleCoalescing(t *testing.T, ackRequired bool) {
 			ackRequired,
 			false,
 		)
+		if firstWrite.MessageType != started.MessageType {
+			t.Fatalf(
+				"coalesced Pack first-write type=%s, want=%s",
+				firstWrite.MessageType,
+				started.MessageType,
+			)
+		}
 	}
 	if ackRequired {
 		// With no receive path, a terminal phase is impossible before this exact
@@ -294,6 +304,13 @@ func testSendPackLifecycleCoalescing(t *testing.T, ackRequired bool) {
 			ackRequired,
 			false,
 		)
+		if terminal.MessageType != started.MessageType {
+			t.Fatalf(
+				"coalesced Pack terminal type=%s, want=%s",
+				terminal.MessageType,
+				started.MessageType,
+			)
+		}
 	}
 	requireNoSendPackLifecycleObservations(t, events, "coalesced Packs")
 }
@@ -354,6 +371,9 @@ func TestSendPackLifecycleObserverCoversRawAckTarget(t *testing.T) {
 		true,
 		false,
 	)
+	if started.MessageType != protocol.MessageType_IpIpPacketFromProvider {
+		t.Fatalf("raw Pack Started type=%s", started.MessageType)
+	}
 	var transferFrameBytes []byte
 	select {
 	case transferFrameBytes = <-route:
@@ -520,6 +540,153 @@ func TestSendPackLifecycleObserverCompletesRejectedPack(t *testing.T) {
 		t.Fatalf("rejected Pack invoked %d Ack callbacks", callbackCount)
 	}
 	requireNoSendPackLifecycleObservations(t, events, "rejected Pack")
+}
+
+// A peer-generation context bounds admission, not reliable wire ownership.
+// Once a signal has a sequence number, canceling that context cannot fabricate
+// peer receipt or remove an ordered item. A later cumulative Ack on the same
+// lane terminalizes both items without creating a receiver sequence gap.
+func TestSendPackLifecyclePeerContextDoesNotRevokeAdmittedReliablePack(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	destinationId := NewId()
+	observer, events := sendPackLifecycleTestObserver(destinationId)
+	settings := DefaultClientSettings()
+	settings.EncryptionSettings.Mode = EncryptionModeOff
+	settings.SendBufferSettings.SendPackLifecycleObserver = observer
+	settings.SendBufferSettings.AckTimeout = time.Hour
+	settings.SendBufferSettings.IdleTimeout = time.Hour
+	settings.SendBufferSettings.MinResendInterval = time.Hour
+	settings.SendBufferSettings.RttMinResendInterval = time.Hour
+	settings.SendBufferSettings.MaxResendInterval = time.Hour
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+	defer client.Cancel()
+	client.ContractManager().AddNoContractPeer(destinationId)
+	route := make(chan []byte, 2)
+	client.RouteManager().UpdateTransport(
+		NewSendClientTransport(DestinationId(destinationId)),
+		[]Route{route},
+	)
+
+	peerCtx, cancelPeer := context.WithCancel(ctx)
+	signalFrame := RequireToFrameWithDefaultProtocolVersion(&protocol.ExchangeSignals{})
+	if !client.SendWithTimeout(
+		signalFrame,
+		destinationId,
+		nil,
+		time.Second,
+		ForceStream(),
+		Ctx(peerCtx),
+	) {
+		MessagePoolReturn(signalFrame.MessageBytes)
+		t.Fatal("reliable peer signal was not admitted")
+	}
+	signalStarted := waitSendPackLifecycleObservation(t, ctx, events)
+	var signalTransferFrameBytes []byte
+	select {
+	case signalTransferFrameBytes = <-route:
+	case <-ctx.Done():
+		t.Fatalf("wait for reliable peer signal write: %v", ctx.Err())
+	}
+	defer MessagePoolReturn(signalTransferFrameBytes)
+	signalPack := decodeSendPackLifecycleWirePack(t, signalTransferFrameBytes)
+	signalFirstWrite := waitSendPackLifecycleObservation(t, ctx, events)
+	if signalStarted.MessageType != protocol.MessageType_TransferExchangeSignals ||
+		signalFirstWrite.MessageType != protocol.MessageType_TransferExchangeSignals {
+		t.Fatalf(
+			"signal lifecycle types started=%s first-write=%s",
+			signalStarted.MessageType,
+			signalFirstWrite.MessageType,
+		)
+	}
+
+	cancelPeer()
+	queueCount, _, signalSequenceId := client.ResendQueueSize(
+		destinationId,
+		MultiHopId{},
+		false,
+		true,
+	)
+	if queueCount != 1 {
+		t.Fatalf("peer cancellation changed reliable resend ownership to %d items", queueCount)
+	}
+	if eventCount := len(events); eventCount != 0 {
+		t.Fatalf("peer cancellation published %d terminal lifecycle events", eventCount)
+	}
+
+	dataFrame := &protocol.Frame{
+		MessageType:  protocol.MessageType_IpIpPacketToProvider,
+		MessageBytes: MessagePoolCopy([]byte{1, 2, 3, 4}),
+	}
+	if !client.SendWithTimeout(
+		dataFrame,
+		destinationId,
+		nil,
+		time.Second,
+		ForceStream(),
+	) {
+		MessagePoolReturn(dataFrame.MessageBytes)
+		t.Fatal("later same-lane data Pack was not admitted")
+	}
+	dataStarted := waitSendPackLifecycleObservation(t, ctx, events)
+	var dataTransferFrameBytes []byte
+	select {
+	case dataTransferFrameBytes = <-route:
+	case <-ctx.Done():
+		t.Fatalf("wait for later same-lane data write: %v", ctx.Err())
+	}
+	defer MessagePoolReturn(dataTransferFrameBytes)
+	dataPack := decodeSendPackLifecycleWirePack(t, dataTransferFrameBytes)
+	dataFirstWrite := waitSendPackLifecycleObservation(t, ctx, events)
+	if dataStarted.MessageType != protocol.MessageType_IpIpPacketToProvider ||
+		dataFirstWrite.MessageType != protocol.MessageType_IpIpPacketToProvider {
+		t.Fatalf(
+			"data lifecycle types started=%s first-write=%s",
+			dataStarted.MessageType,
+			dataFirstWrite.MessageType,
+		)
+	}
+	dataSequenceId := RequireIdFromBytes(dataPack.SequenceId)
+	signalPackSequenceId := RequireIdFromBytes(signalPack.SequenceId)
+	if signalSequenceId != dataSequenceId ||
+		signalPackSequenceId != dataSequenceId {
+		t.Fatalf(
+			"same-lane Packs used different sequences signal=%s data=%x",
+			signalSequenceId,
+			dataPack.SequenceId,
+		)
+	}
+	queueCount, _, _ = client.ResendQueueSize(destinationId, MultiHopId{}, false, true)
+	if queueCount != 2 {
+		t.Fatalf("same-lane cumulative-Ack queue count=%d, want 2", queueCount)
+	}
+
+	acknowledgeSendPackLifecycleWirePack(t, client, destinationId, dataPack)
+	for _, started := range []SendPackLifecycleObservation{signalStarted, dataStarted} {
+		terminal := waitSendPackLifecycleObservation(t, ctx, events)
+		requireSendPackLifecycleObservation(
+			t,
+			terminal,
+			client.ClientId(),
+			destinationId,
+			started.Token,
+			SendPackLifecyclePhaseTerminal,
+			true,
+			false,
+		)
+		if terminal.MessageType != started.MessageType {
+			t.Fatalf(
+				"same-lane terminal type=%s, want=%s",
+				terminal.MessageType,
+				started.MessageType,
+			)
+		}
+	}
+	queueCount, _, _ = client.ResendQueueSize(destinationId, MultiHopId{}, false, true)
+	if queueCount != 0 {
+		t.Fatalf("cumulative Ack retained %d same-lane resend items", queueCount)
+	}
+	requireNoSendPackLifecycleObservations(t, events, "peer-context reliable lane")
 }
 
 // A Pack admitted before sequence startup remains sequence-owned. Closing the

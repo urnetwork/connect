@@ -154,7 +154,7 @@ func TestClientDialerWebSocketForcesHttp11Alpn(t *testing.T) {
 	}
 	defer connection.Close()
 
-	batchConnection, ok := connection.UnderlyingConn().(*webSocketWriteBatchConn)
+	batchConnection, ok := connection.UnderlyingConn().(*WebSocketWriteBatchConn)
 	if !ok {
 		t.Fatalf("unexpected WebSocket transport type %T", connection.UnderlyingConn())
 	}
@@ -232,12 +232,12 @@ func TestClientDialerWebSocketBatchPreservesMessageBoundaries(t *testing.T) {
 	}
 	defer connection.Close()
 
-	batchConnection, ok := connection.UnderlyingConn().(*webSocketWriteBatchConn)
+	batchConnection, ok := connection.UnderlyingConn().(*WebSocketWriteBatchConn)
 	if !ok {
 		t.Fatalf("unexpected WebSocket transport type %T", connection.UnderlyingConn())
 	}
 	expected := make([][]byte, 0, messageCount)
-	batchConnection.beginWriteBatch()
+	batchConnection.BeginWriteBatch()
 	for i := range messageCount {
 		message := []byte{byte(i), byte(i + 1), byte(i + 2)}
 		expected = append(expected, message)
@@ -245,7 +245,7 @@ func TestClientDialerWebSocketBatchPreservesMessageBoundaries(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := batchConnection.flushWriteBatch(); err != nil {
+	if err := batchConnection.FlushWriteBatch(); err != nil {
 		t.Fatal(err)
 	}
 

@@ -3020,6 +3020,15 @@ type TcpSequence struct {
 	// Tests observe exact reorder decisions without using negative socket-read
 	// timeouts. The callback must not block; nil is a production no-op.
 	afterReorderDispositionForTest func(tcpReorderDisposition)
+	// Tests may hold a pool-owned pure acknowledgement after construction to force
+	// cancellation at its ownership boundary. Nil is a production no-op.
+	afterPureAckBuildForTest func([]byte)
+	// Tests join the pure-acknowledgement worker before inspecting ownership. Nil is a
+	// production no-op.
+	afterPureAckWorkerStopForTest func()
+	// Tests observe the exact Run boundary immediately before all child workers
+	// are joined. Nil is a production no-op.
+	beforeChildWorkersWaitForTest func()
 
 	ConnectionState
 }
@@ -3258,6 +3267,13 @@ func (self *TcpSequence) receiveBatch(packets [][]byte, recoveryMode receiveReco
 }
 
 func (self *TcpSequence) Run() {
+	var childWorkers sync.WaitGroup
+	defer func() {
+		if self.beforeChildWorkersWaitForTest != nil {
+			self.beforeChildWorkersWaitForTest()
+		}
+		childWorkers.Wait()
+	}()
 	defer func() {
 		self.cancel()
 
@@ -3282,6 +3298,13 @@ func (self *TcpSequence) Run() {
 			}
 		}()
 	}()
+	runChildWorker := func(run func()) {
+		childWorkers.Add(1)
+		go HandleError(func() {
+			defer childWorkers.Done()
+			run()
+		}, self.cancel)
+	}
 
 	// One timer serves the initial SYN wait and the steady-state idle wait.
 	// The send loop wakes per segment, so time.After here previously allocated
@@ -3459,7 +3482,7 @@ func (self *TcpSequence) Run() {
 	}
 
 	writePayloads := make(chan writePayload, self.tcpBufferSettings.SequenceBufferSize)
-	go HandleError(func() {
+	runChildWorker(func() {
 		// best effort return of queued payloads after cancel
 		defer func() {
 			for {
@@ -3548,7 +3571,7 @@ func (self *TcpSequence) Run() {
 				return
 			}
 		}
-	}, self.cancel)
+	})
 
 	// Keep at most one callback batch of read-ahead per flow. The former
 	// SequenceBufferSize queue reserved a full send window again even though
@@ -3560,7 +3583,7 @@ func (self *TcpSequence) Run() {
 		max(1, self.tcpBufferSettings.WriteBatchSize),
 	)
 	readPackets := make(chan []byte, readQueueSize)
-	go HandleError(func() {
+	runChildWorker(func() {
 		defer self.cancel()
 
 		defer func() {
@@ -3605,9 +3628,9 @@ func (self *TcpSequence) Run() {
 				self.receiveBatch(batch, receiveRecoveryModeTcpSocket)
 			}
 		}
-	}, self.cancel)
+	})
 
-	go HandleError(func() {
+	runChildWorker(func() {
 		fin := false
 		defer func() {
 			// close without cancel so that the receive pipeline drains all
@@ -3764,10 +3787,15 @@ func (self *TcpSequence) Run() {
 				}
 			}
 		}
-	}, self.cancel)
+	})
 
-	go HandleError(func() {
+	runChildWorker(func() {
 		defer self.cancel()
+		defer func() {
+			if self.afterPureAckWorkerStopForTest != nil {
+				self.afterPureAckWorkerStopForTest()
+			}
+		}()
 
 		// reusable ack-compress timer (avoids a per-iteration time.After alloc
 		// on the hot ack coalescing path)
@@ -3811,9 +3839,13 @@ func (self *TcpSequence) Run() {
 			if packet == nil {
 				return
 			}
+			if self.afterPureAckBuildForTest != nil {
+				self.afterPureAckBuildForTest(packet)
+			}
 
 			select {
 			case <-self.ctx.Done():
+				MessagePoolReturn(packet)
 				return
 			default:
 			}
@@ -3834,7 +3866,7 @@ func (self *TcpSequence) Run() {
 				}
 			}
 		}
-	}, self.cancel)
+	})
 
 	// A route promotion can make a packet sent on the new path overtake one
 	// already in flight on the old path. Retain that bounded crossover window

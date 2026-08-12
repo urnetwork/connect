@@ -180,6 +180,7 @@ type p2pStreamProbe struct {
 	testingNow                        func() time.Time
 	testingProbeTimer                 <-chan time.Time
 	testingAfterProbeTimerReset       func(time.Duration)
+	testingAfterProbeTimerEdge        func()
 
 	responses chan Id
 	done      chan struct{}
@@ -532,8 +533,10 @@ func (self *p2pStreamProbe) withdrawGeneration(
 }
 
 // Challenges until one response returns, then maintains a renewable route
-// lease. A missed middle hop expires the lease; local teardown cancels this
-// worker and releases it synchronously through close.
+// lease. Each matching response starts a fresh quiet interval and keeps the
+// nonce stable so duplicate responses drain before the next challenge. A
+// missed middle hop expires the lease; local teardown cancels this worker and
+// releases it synchronously through close.
 func (self *p2pStreamProbe) run() {
 	defer close(self.done)
 	var ready bool
@@ -547,8 +550,19 @@ func (self *p2pStreamProbe) run() {
 	}()
 	probeTimer := time.NewTimer(0)
 	defer probeTimer.Stop()
+	probeTimerChannel := probeTimer.C
+	if self.testingProbeTimer != nil {
+		probeTimerChannel = self.testingProbeTimer
+	}
+	resetProbeTimer := func(interval time.Duration) {
+		probeTimer.Reset(interval)
+		if self.testingAfterProbeTimerReset != nil {
+			self.testingAfterProbeTimerReset(interval)
+		}
+	}
 
 	nonce := NewId()
+	challengeMatched := false
 	var challengeRouteEpoch uint64
 	capabilityStartTime := self.now()
 	lastResponseTime := time.Time{}
@@ -578,24 +592,22 @@ func (self *p2pStreamProbe) run() {
 		if challengeRouteEpoch != routeEpoch {
 			challengeRouteEpoch = routeEpoch
 			nonce = NewId()
+			challengeMatched = false
 			capabilityStartTime = self.now()
 			lastResponseTime = time.Time{}
 			probeInterval = self.interval
 		}
 
+		if challengeMatched {
+			nonce = NewId()
+			challengeMatched = false
+		}
 		request := encodeP2pStreamProbe(
 			p2pStreamProbeRequestType,
 			self.streamId,
 			nonce,
 		)
-		probeTimer.Reset(probeInterval)
-		if self.testingAfterProbeTimerReset != nil {
-			self.testingAfterProbeTimerReset(probeInterval)
-		}
-		probeTimerChannel := probeTimer.C
-		if self.testingProbeTimer != nil {
-			probeTimerChannel = self.testingProbeTimer
-		}
+		resetProbeTimer(probeInterval)
 		self.sendProbeMessage(
 			generation,
 			p2pStreamProbeRequestType,
@@ -605,6 +617,29 @@ func (self *p2pStreamProbe) run() {
 			P2pStreamProbeEventRequestDropped,
 		)
 
+		handleResponse := func(responseNonce Id) {
+			if responseNonce == nonce {
+				matchedNonce := nonce
+				self.observe(P2pStreamProbeEventResponseMatched, matchedNonce, routeEpoch)
+				lastResponseTime = self.now()
+				probeInterval = self.interval
+				challengeMatched = true
+				resetProbeTimer(probeInterval)
+				if !ready && self.setReady(sendTransport, sendRoute, routeEpoch, true) {
+					ready = true
+					readyTransport = sendTransport
+					readyRoute = sendRoute
+					readyRouteEpoch = routeEpoch
+					self.observe(
+						P2pStreamProbeEventReadinessGranted,
+						matchedNonce,
+						routeEpoch,
+					)
+				}
+			} else {
+				self.observe(P2pStreamProbeEventResponseStale, responseNonce, routeEpoch)
+			}
+		}
 		waitForInterval := true
 		for waitForInterval {
 			select {
@@ -613,28 +648,21 @@ func (self *p2pStreamProbe) run() {
 			case <-routeUpdate:
 				waitForInterval = false
 			case responseNonce := <-self.responses:
-				if responseNonce == nonce {
-					matchedNonce := nonce
-					self.observe(P2pStreamProbeEventResponseMatched, matchedNonce, routeEpoch)
-					lastResponseTime = self.now()
-					probeInterval = self.interval
-					nonce = NewId()
-					if !ready && self.setReady(sendTransport, sendRoute, routeEpoch, true) {
-						ready = true
-						readyTransport = sendTransport
-						readyRoute = sendRoute
-						readyRouteEpoch = routeEpoch
-						self.observe(
-							P2pStreamProbeEventReadinessGranted,
-							matchedNonce,
-							routeEpoch,
-						)
-					}
-				} else {
-					self.observe(P2pStreamProbeEventResponseStale, responseNonce, routeEpoch)
-				}
+				handleResponse(responseNonce)
 			case <-probeTimerChannel:
-				waitForInterval = false
+				if self.testingAfterProbeTimerEdge != nil {
+					self.testingAfterProbeTimerEdge()
+				}
+				// A response and its interval edge can become runnable together
+				// when the round-trip time equals the probe interval. Prefer the
+				// response so its duplicate challenge drains instead of creating
+				// a permanent request/response train.
+				select {
+				case responseNonce := <-self.responses:
+					handleResponse(responseNonce)
+				default:
+					waitForInterval = false
+				}
 			}
 		}
 

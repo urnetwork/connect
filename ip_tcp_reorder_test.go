@@ -36,6 +36,24 @@ func newTcpReorderTestHarness(
 	sequenceBufferSize int,
 	reorderByteCount int,
 ) *tcpReorderTestHarness {
+	return newTcpReorderTestHarnessWithSetup(
+		t,
+		initialSynSeq,
+		sequenceBufferSize,
+		reorderByteCount,
+		nil,
+	)
+}
+
+// Establishes one deterministic user-NAT connection after applying any test
+// hooks before the sequence worker starts.
+func newTcpReorderTestHarnessWithSetup(
+	t *testing.T,
+	initialSynSeq uint32,
+	sequenceBufferSize int,
+	reorderByteCount int,
+	setupSequence func(*TcpSequence),
+) *tcpReorderTestHarness {
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -114,6 +132,9 @@ func newTcpReorderTestHarness(
 		case harness.reorderDecisions <- disposition:
 		default:
 		}
+	}
+	if setupSequence != nil {
+		setupSequence(harness.sequence)
 	}
 	go func() {
 		defer close(harness.runDone)
