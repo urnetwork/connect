@@ -1178,6 +1178,15 @@ type RemoteUserNatMultiClient struct {
 	flowOwnerLock       sync.Mutex
 	flowOwner4          map[Ip4Path]flowOwnerEntry
 	flowOwner6          map[Ip6Path]flowOwnerEntry
+	// the smart-routing classifier seam (Phase 1): the platform's traffic
+	// classifier, installed by SetFlowClassifier. Mirrors flowOwnerFunc
+	// exactly -- atomic pointer, nil clears, one-branch nil cost paid via
+	// classifyOrUnknown (routing_class.go). Zero value is fully inert: no
+	// constructor wiring is required and bare fixtures are unaffected.
+	// Consulted ONLY from the guarded scored-placement path (see
+	// scoredPlacementEnabled); with that gate off, or with no classifier
+	// installed, nothing in this file's new routing code runs.
+	flowClassifier atomic.Pointer[FlowClassifier]
 	// appPinClients is the cross-version half of an app pin: the exit an
 	// app's flows are currently placed on, keyed by app id. The affinity
 	// groups are per-ip-version by construction (separate path maps), so a
@@ -1340,6 +1349,26 @@ func (self *RemoteUserNatMultiClient) SetFlowOwnerLookup(lookup FlowOwnerLookupF
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	self.clearAppPinsWithLock()
+}
+
+// SetFlowClassifier installs (or, with nil, removes) the smart-routing
+// traffic classifier. Mirrors SetFlowOwnerLookup: a bare atomic store, safe
+// at runtime and on a bare client. Installing a classifier does not, by
+// itself, change placement -- scoredPlacementEnabled must also be true (see
+// the guarded branch in sendPacket's placement helper), so this is inert
+// until both are true, matching every other nil-func convention in this
+// file.
+func (self *RemoteUserNatMultiClient) SetFlowClassifier(c FlowClassifier) {
+	loggerOrDefault(self.log).Infof("%s\n", relEvent(
+		"flow_classifier",
+		"installed", c != nil,
+	))
+
+	if c == nil {
+		self.flowClassifier.Store(nil)
+	} else {
+		self.flowClassifier.Store(&c)
+	}
 }
 
 // flowOwnerAppId answers "which pinned app owns this flow" -- from the cache
@@ -2190,6 +2219,15 @@ func (self *RemoteUserNatMultiClient) reliabilitySettings() *ReliabilitySettings
 	return ReliabilitySettingsFrom(self.settings)
 }
 
+// scoredPlacementEnabled is the single gate the placement path checks. When
+// false (the zero value, and every current build's default) selection is
+// exactly today's; nothing in this file's new routing code runs. See the
+// guarded branch in sendPacket's placement helper (coalesceOrderedClients)
+// and scoredPlacementReorder.
+func scoredPlacementEnabled(r *ReliabilitySettings) bool {
+	return r != nil && r.ScoredPlacement
+}
+
 // SetReliabilitySettings installs runtime overrides for the reliability knobs.
 // nil clears them, restoring the constructed settings. Takes effect on the next
 // packet -- no reconnect needed, which is the point: a freeze can be A/B'd
@@ -2481,6 +2519,101 @@ func (self *RemoteUserNatMultiClient) leastLoadedClients(clients []*multiClientC
 		}
 	}
 	return least
+}
+
+// scoredPlacementReorder is the Phase 1 scored-placement path, called ONLY
+// when scoredPlacementEnabled is true (see the guarded branch in sendPacket's
+// coalesceOrderedClients). It NEVER changes which exits are eligible --
+// candidates has already been through raceCandidates' verdict/quarantine/
+// tier/flow-cap gates -- it only ever re-orders that already-healthy field,
+// promoting the scorer's pick to the front. The learner never overrides the
+// safety layer: membership is untouched, only order.
+//
+// classifyOrUnknown is nil-safe, so an unset flowClassifier (every build
+// today -- no classifier implementation exists yet; it lands in a later
+// phase) always classifies ClassUnknown, which returns candidates completely
+// untouched: there is nothing to score against. This is what makes turning
+// ScoredPlacement on, by itself, a no-op today -- behavior only ever
+// *refines*, never regresses, once a real classifier is installed.
+func (self *RemoteUserNatMultiClient) scoredPlacementReorder(candidates []*multiClientChannel, ipPath *IpPath, appId string) []*multiClientChannel {
+	if len(candidates) < 2 {
+		// nothing to reorder
+		return candidates
+	}
+
+	var classifier FlowClassifier
+	if p := self.flowClassifier.Load(); p != nil {
+		classifier = *p
+	}
+	class := classifyOrUnknown(classifier, ipPath, appId).Class
+	if class == ClassUnknown {
+		// no classifier installed, or it declined to name a class: nothing to
+		// score against, so the field stands in the legacy order raceCandidates
+		// already computed.
+		return candidates
+	}
+
+	// flow counts are parent-lock state (the same bookkeeping
+	// leastLoadedClients reads above), gathered in one locked pass and then
+	// scored with no lock held. WindowStats (the per-exit goodput source used
+	// elsewhere in this file, e.g. the resize pass) has the side effect of
+	// advancing the channel's healthy/unhealthy duration bookkeeping, tuned
+	// for that pass's ~15s cadence -- calling it here, at new-flow frequency,
+	// would perturb that state at a much higher rate for no benefit yet. So
+	// RttMillis, GoodputBytesPerSec, and Jitter are left at their zero value
+	// (see exitMetricsSnapshot); real per-exit telemetry for those is future
+	// work, once a side-effect-free accessor exists.
+	flowCounts := make(map[*multiClientChannel]int, len(candidates))
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		for _, c := range candidates {
+			flowCounts[c] = len(self.clientUpdates[c])
+		}
+	}()
+
+	weights := classWeights(class)
+	hysteresisPct := self.reliabilitySettings().PlacementHysteresisPct
+
+	bestIndex := 0
+	bestFlows := flowCounts[candidates[0]]
+	bestScore := exitScore(exitMetricsSnapshot(bestFlows), weights)
+	for i := 1; i < len(candidates); i++ {
+		flows := flowCounts[candidates[i]]
+		score := exitScore(exitMetricsSnapshot(flows), weights)
+		if lessLoadedTieBreak(bestScore, score, bestFlows, flows, hysteresisPct) {
+			bestIndex, bestScore, bestFlows = i, score, flows
+		}
+	}
+	if bestIndex == 0 {
+		return candidates
+	}
+
+	reordered := make([]*multiClientChannel, 0, len(candidates))
+	reordered = append(reordered, candidates[bestIndex])
+	for i, c := range candidates {
+		if i != bestIndex {
+			reordered = append(reordered, c)
+		}
+	}
+	return reordered
+}
+
+// exitMetricsSnapshot builds the scorer's read of one candidate from what is
+// safely available on the placement path today: Flows, the same live
+// flow-cap bookkeeping leastLoadedClients already reads. RttMillis,
+// GoodputBytesPerSec, and Jitter have no per-exit accessor that is safe to
+// call at new-flow frequency without perturbing the resize pass's health
+// bookkeeping (see scoredPlacementReorder) and StallEvents has no per-exit
+// counter in this file at all yet (stall state here is a boolean, not a
+// count). All four are left at their zero value, which contributes the SAME
+// constant to every candidate's score (see exitScore's hostile-input guards,
+// which already treat a zero RTT/Jitter/StallEvents as a valid, sanitized
+// input) -- so today scoredPlacementReorder reduces to the less-loaded
+// tie-break among classified candidates. Wiring real per-exit telemetry is
+// later-phase work; see the Task 8 report for the reasoning.
+func exitMetricsSnapshot(flows int) ExitMetrics {
+	return ExitMetrics{Flows: flows}
 }
 
 // bindClientFlow records that a flow is now committed to client, which is what
@@ -4657,6 +4790,15 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 			for _, windowType := range self.selectWindowTypes(sendPacket) {
 				if window, ok := self.windows[windowType]; ok {
 					orderedClients := self.raceCandidates(window)
+					if scoredPlacementEnabled(self.reliabilitySettings()) {
+						// guarded scored-placement path (Phase 1): re-orders the
+						// already health-filtered field above, never widens or
+						// narrows it. See scoredPlacementReorder.
+						orderedClients = self.scoredPlacementReorder(orderedClients, ipPath, sendPacket.pin.appId)
+					}
+					// legacy selection unchanged: with the gate off (every
+					// current build's default), orderedClients is exactly what
+					// raceCandidates returned, untouched.
 					if 0 < len(orderedClients) {
 						return orderedClients
 					}
