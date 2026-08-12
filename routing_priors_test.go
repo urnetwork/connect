@@ -77,14 +77,25 @@ func TestProviderPriorsLoadCopiesIn(t *testing.T) {
 	}
 }
 
-func TestProviderPriorsConvictThenObserveSeedsValue(t *testing.T) {
+func TestProviderPriorsConvictThenObserveBlends(t *testing.T) {
 	p := NewProviderPriors()
-	// Convict before first Observe — presence-keyed seeding must seed ScoreEwma
+	// Convict before first Observe: creates entry with ScoreEwma=0.5, Convictions=1
 	p.Convict("x", 1000)
+	// Verify the conviction is recorded and Bias is penalized < 0.5
+	biasAfterConvict := p.Bias("x")
+	if biasAfterConvict != 0.35 {
+		t.Fatalf("Bias after single convict on never-observed provider must be 0.35, got %f", biasAfterConvict)
+	}
+	// First Observe after Convict should BLEND (entry exists), not reseed
+	// 0.2*0.9 + 0.8*0.5 = 0.18 + 0.4 = 0.58
 	p.Observe("x", 0.9, 1001)
 	snap := p.Snapshot()
-	if snap["x"].ScoreEwma != 0.9 {
-		t.Fatalf("Convict-then-Observe should seed to score 0.9, got %f", snap["x"].ScoreEwma)
+	want := 0.58
+	if snap["x"].ScoreEwma < want-0.0001 || snap["x"].ScoreEwma > want+0.0001 {
+		t.Fatalf("Convict-then-Observe should blend 0.58, not reseed; got %f", snap["x"].ScoreEwma)
+	}
+	if snap["x"].Convictions != 1 {
+		t.Fatalf("Convictions must remain 1 after Observe; got %d", snap["x"].Convictions)
 	}
 }
 

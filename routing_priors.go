@@ -41,8 +41,10 @@ func (p *ProviderPriors) Convict(providerId string, nowUnix int64) {
 	defer p.mu.Unlock()
 	pr, ok := p.m[providerId]
 	if !ok {
-		// Only convict providers we have already observed; presence-keyed like Observe.
-		return
+		// Convict on absent id: create entry with neutral base so conviction penalty applies.
+		// Conviction must never be dropped—even pre-observe convictions (e.g., vetting failures)
+		// must degrade the provider from neutral 0.5 to below-neutral 0.35 (0.5 - 0.15*1).
+		pr.ScoreEwma = 0.5
 	}
 	pr.Convictions++
 	pr.LastSeenUnix = nowUnix
