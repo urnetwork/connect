@@ -227,3 +227,42 @@ func TestLessLoadedTieBreakNegativeScores(t *testing.T) {
 		t.Fatal("clear win for negative a should not be displaced by b's load")
 	}
 }
+
+// TestDefaultMultiClientSettingsKnobsAreZeroValueOff pins the actual
+// regression risk: a default build must behave exactly like today. If a
+// future well-meaning edit ever sets one of these in
+// DefaultMultiClientSettings, this test catches it before it ships and
+// silently opts every default build into the new placement/reward behavior.
+func TestDefaultMultiClientSettingsKnobsAreZeroValueOff(t *testing.T) {
+	s := DefaultMultiClientSettings()
+	if s.ScoredPlacement {
+		t.Fatal("DefaultMultiClientSettings must leave ScoredPlacement off (false)")
+	}
+	if s.PlacementHysteresisPct != 0 {
+		t.Fatal("DefaultMultiClientSettings must leave PlacementHysteresisPct at 0")
+	}
+	if s.PlacementDemoteConsecutive != 0 {
+		t.Fatal("DefaultMultiClientSettings must leave PlacementDemoteConsecutive at 0")
+	}
+	if s.RewardInstrumentation {
+		t.Fatal("DefaultMultiClientSettings must leave RewardInstrumentation off (false)")
+	}
+}
+
+// TestNewReliabilityKnobsZeroValueOff asserts the four smart-routing knobs
+// follow the same zero-value-off contract as every other ReliabilitySettings
+// field: a nil override (or one built from an older struct) must leave them
+// all off, and ReliabilitySettingsFrom must faithfully copy the knob through
+// when it is set.
+func TestNewReliabilityKnobsZeroValueOff(t *testing.T) {
+	z := ReliabilitySettingsFrom(nil) // nil → zero value
+	if z.ScoredPlacement || z.PlacementHysteresisPct != 0 ||
+		z.PlacementDemoteConsecutive != 0 || z.RewardInstrumentation {
+		t.Fatal("new knobs must be zero-value-off (legacy behavior)")
+	}
+	s := DefaultMultiClientSettings()
+	got := ReliabilitySettingsFrom(s)
+	if got.ScoredPlacement != s.ScoredPlacement {
+		t.Fatal("ReliabilitySettingsFrom must copy ScoredPlacement")
+	}
+}

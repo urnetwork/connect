@@ -973,6 +973,15 @@ type MultiClientSettings struct {
 	// since the previous one, so an idle session costs nothing.
 	HeartbeatInterval time.Duration
 
+	// Smart routing (Phase 1), all zero-value-off so an override from an older
+	// struct keeps today's placement. ScoredPlacement is the master gate;
+	// PlacementHysteresisPct==0 is plain greater-than; PlacementDemoteConsecutive<=1
+	// acts on every sample; RewardInstrumentation==false emits no reward lines.
+	ScoredPlacement            bool
+	PlacementHysteresisPct     float64
+	PlacementDemoteConsecutive int
+	RewardInstrumentation      bool
+
 	SecurityPolicyGenerator func(context.Context, *SecurityPolicyStatsCollector) SecurityPolicy
 
 	// the epoch for flushing block action and packet stats events to listeners
@@ -2107,6 +2116,15 @@ type ReliabilitySettings struct {
 	// capture is sometimes taken with the beat turned up to spot a transition,
 	// and sometimes with it off to keep an hour of buffer for something else.
 	HeartbeatInterval time.Duration
+
+	// Smart routing (Phase 1), all zero-value-off so an override from an older
+	// struct keeps today's placement. ScoredPlacement is the master gate;
+	// PlacementHysteresisPct==0 is plain greater-than; PlacementDemoteConsecutive<=1
+	// acts on every sample; RewardInstrumentation==false emits no reward lines.
+	ScoredPlacement            bool
+	PlacementHysteresisPct     float64
+	PlacementDemoteConsecutive int
+	RewardInstrumentation      bool
 }
 
 // ReliabilitySettingsFrom reads the effective values out of a settings struct.
@@ -2154,6 +2172,11 @@ func ReliabilitySettingsFrom(settings *MultiClientSettings) *ReliabilitySettings
 		SchedulerPauseRecoveryTimeout:      settings.SchedulerPauseRecoveryTimeout,
 		BlackholeConnectComparativeTimeout: settings.BlackholeConnectComparativeTimeout,
 		HeartbeatInterval:                  settings.HeartbeatInterval,
+
+		ScoredPlacement:            settings.ScoredPlacement,
+		PlacementHysteresisPct:     settings.PlacementHysteresisPct,
+		PlacementDemoteConsecutive: settings.PlacementDemoteConsecutive,
+		RewardInstrumentation:      settings.RewardInstrumentation,
 	}
 }
 
