@@ -982,6 +982,16 @@ type MultiClientSettings struct {
 	PlacementDemoteConsecutive int
 	RewardInstrumentation      bool
 
+	// Quarantine flap damping (Phase 1), zero-value-off like the rest of this
+	// block. QuarantineDampening false leaves benchDuration returning the
+	// constant StatsWindowKeepUnhealthyDuration it always has -- today's
+	// behavior. QuarantineReentryRamp==0 disables the released-exit score
+	// ramp entirely, so a lifted quarantine returns to full scored-placement
+	// standing immediately, exactly as before this task. See benchDuration
+	// and reentryScorePenalty.
+	QuarantineDampening   bool
+	QuarantineReentryRamp time.Duration
+
 	SecurityPolicyGenerator func(context.Context, *SecurityPolicyStatsCollector) SecurityPolicy
 
 	// the epoch for flushing block action and packet stats events to listeners
@@ -2154,6 +2164,11 @@ type ReliabilitySettings struct {
 	PlacementHysteresisPct     float64
 	PlacementDemoteConsecutive int
 	RewardInstrumentation      bool
+
+	// the quarantine flap-damping pair; see the matching MultiClientSettings
+	// fields for what each one does
+	QuarantineDampening   bool
+	QuarantineReentryRamp time.Duration
 }
 
 // ReliabilitySettingsFrom reads the effective values out of a settings struct.
@@ -2206,6 +2221,9 @@ func ReliabilitySettingsFrom(settings *MultiClientSettings) *ReliabilitySettings
 		PlacementHysteresisPct:     settings.PlacementHysteresisPct,
 		PlacementDemoteConsecutive: settings.PlacementDemoteConsecutive,
 		RewardInstrumentation:      settings.RewardInstrumentation,
+
+		QuarantineDampening:   settings.QuarantineDampening,
+		QuarantineReentryRamp: settings.QuarantineReentryRamp,
 	}
 }
 
@@ -2574,13 +2592,18 @@ func (self *RemoteUserNatMultiClient) scoredPlacementReorder(candidates []*multi
 
 	weights := classWeights(class)
 	hysteresisPct := self.reliabilitySettings().PlacementHysteresisPct
+	// the re-entry ramp: 0 (QuarantineReentryRamp's zero value) makes every
+	// reentryPenalty call below return 0 unconditionally, so this loop's
+	// scores are byte-for-byte exitScore(...) with no penalty applied --
+	// exactly as before this task.
+	reentryRamp := self.reliabilitySettings().QuarantineReentryRamp
 
 	bestIndex := 0
 	bestFlows := flowCounts[candidates[0]]
-	bestScore := exitScore(exitMetricsSnapshot(bestFlows), weights)
+	bestScore := exitScore(exitMetricsSnapshot(bestFlows), weights) - candidates[0].reentryPenalty(reentryRamp)
 	for i := 1; i < len(candidates); i++ {
 		flows := flowCounts[candidates[i]]
-		score := exitScore(exitMetricsSnapshot(flows), weights)
+		score := exitScore(exitMetricsSnapshot(flows), weights) - candidates[i].reentryPenalty(reentryRamp)
 		if lessLoadedTieBreak(bestScore, score, bestFlows, flows, hysteresisPct) {
 			bestIndex, bestScore, bestFlows = i, score, flows
 		}
@@ -9213,6 +9236,16 @@ type multiClientChannel struct {
 	quarantineLiftTime        time.Time
 	quarantineLiftConnectSeen bool
 
+	// quarantineReconvictions counts this channel's completed bench-then-lift
+	// cycles: 0 through its first-ever bench, incremented on every lift (see
+	// clearQuarantineWithLock). Feeds benchDuration so a channel that keeps
+	// re-earning a bench holds it longer each time (RFC 2439-style flap
+	// damping) instead of the constant hold every episode got before this
+	// task. Deliberately session-scoped and never persisted or decayed --
+	// same lifetime as quarantineMigrated and the rest of the episode
+	// bookkeeping beside it, not new durable state. Guarded by stateLock.
+	quarantineReconvictions int
+
 	// pendingSendTime is when the current run of unacked sends began, reset on
 	// every ack. With sendNackCount > 0 it is the age of the oldest unmade
 	// progress, which is what sendStalled tests. Guarded by stateLock.
@@ -9767,6 +9800,11 @@ func (self *multiClientChannel) clearQuarantineWithLock() {
 		self.survivedQuarantine = true
 		self.quarantineLiftTime = time.Now()
 		self.quarantineLiftConnectSeen = false
+		// this episode is now a completed cycle, so the NEXT bench (if any)
+		// escalates one step; see quarantineReconvictions and benchDuration.
+		// A no-op lift (already clear, the branch above did not run) must not
+		// count -- there was no episode to have completed.
+		self.quarantineReconvictions++
 	}
 	self.quarantined = false
 	self.quarantineReason = blackholeNone
@@ -9828,6 +9866,45 @@ func (self *multiClientChannel) quarantineState() (blackholeReason, time.Time) {
 		return blackholeNone, time.Time{}
 	}
 	return self.quarantineReason, self.quarantineStart
+}
+
+// quarantineReconvictionCount reads the completed bench-then-lift cycle
+// count benchDuration escalates on; see the field comment.
+func (self *multiClientChannel) quarantineReconvictionCount() int {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.quarantineReconvictions
+}
+
+// quarantineReentryElapsed reports how long it has been since this channel's
+// most recent quarantine lift, and whether a lift has ever been recorded at
+// all -- ok is false for a channel that has never been quarantined, which
+// must read as "no ramp applies" rather than as a zero (== just-released)
+// elapsed. Reuses quarantineLiftTime, the same stamp the survived-quarantine
+// effectiveTier memory already reads, so the re-entry ramp adds no new
+// persistent state of its own.
+func (self *multiClientChannel) quarantineReentryElapsed(now time.Time) (time.Duration, bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.quarantineLiftTime.IsZero() {
+		return 0, false
+	}
+	return now.Sub(self.quarantineLiftTime), true
+}
+
+// reentryPenalty is the scored-placement convenience wrapper around
+// reentryScorePenalty: 0 when ramp is disabled (QuarantineReentryRamp's
+// zero-value-off) or this channel has never been quarantined, else the
+// current point on the decay curve since its last lift.
+func (self *multiClientChannel) reentryPenalty(ramp time.Duration) float64 {
+	if ramp <= 0 {
+		return 0
+	}
+	elapsed, ok := self.quarantineReentryElapsed(time.Now())
+	if !ok {
+		return 0
+	}
+	return reentryScorePenalty(elapsed, ramp)
 }
 
 // hasOutstandingSends reports whether this channel currently holds sends that
@@ -11206,6 +11283,70 @@ const (
 	verdictActionExecuteExpired verdictActionKind = 3
 )
 
+// benchDuration is the RFC 2439-style flap-damping schedule for how long a
+// quarantine holds before the expiry escape (verdictActionExecuteExpired,
+// below) may act on it. dampening off returns base unconditionally -- the
+// constant StatsWindowKeepUnhealthyDuration hold every episode got before
+// this task, and what QuarantineDampening's zero value preserves exactly.
+// dampening on escalates 60s -> 120s -> 240s by reconvictions (this
+// channel's count of prior completed bench-then-lift cycles, see
+// quarantineReconvictionCount), capped at the third step: real field
+// evidence showed the SAME exits bench/lift 4-5 times in 10-20 minutes with
+// zero effect from bench migration (movable=0 on all 20 attempts) -- the
+// escalation exists to make repeat churn cost more without holding a
+// genuinely-recovered exit's bench open indefinitely. base is accepted but
+// ignored when dampening is on: the schedule is fixed by the literature, not
+// tunable per-deployment through the pre-existing knob. Pure: no clock
+// reads, no locks.
+func benchDuration(reconvictions int, base time.Duration, dampening bool) time.Duration {
+	if !dampening {
+		return base
+	}
+	steps := []time.Duration{60 * time.Second, 120 * time.Second, 240 * time.Second}
+	i := reconvictions
+	if i < 0 {
+		i = 0
+	}
+	if i >= len(steps) {
+		i = len(steps) - 1
+	}
+	return steps[i]
+}
+
+// reentryPenaltyWeight is the ceiling of the re-entry ramp's score
+// subtraction, at the instant a quarantine lifts (elapsed==0). exitScore's
+// own stall term alone can already cost up to 3.0 (see exitScore's
+// stallPenalty cap), so 1.0 is a meaningful push against a freshly released
+// exit without being able to outweigh a genuinely large health gap on its
+// own -- a just-lifted exit can still win if it is clearly the best
+// candidate, it just does not win a close tie-break on the strength of a
+// lift that happened a second ago.
+const reentryPenaltyWeight = 1.0
+
+// reentryScorePenalty is the asymmetric-re-entry half of the flap-damping
+// pair: a released exit does not return to full scored-placement standing
+// the instant its quarantine lifts (fast to leave selection, slow to return
+// to it in full), it returns at reduced weight that decays LINEARLY to zero
+// once `ramp` has elapsed since the lift. ramp<=0 disables the ramp entirely
+// (returns 0 for any input), which is QuarantineReentryRamp's zero-value-off
+// contract -- the legacy, pre-this-task behavior, where a lifted quarantine
+// carries no score penalty at all. elapsed<0 is clamped to 0 (full penalty)
+// rather than read as "already decayed" -- a caller passing a negative
+// elapsed has a clock problem, not evidence of a longer-than-possible clean
+// interval. This is a temporary SCORE adjustment only: it never touches
+// quarantined/warning state, membership, or which exits are convicted --
+// see reentryPenalty, its only caller, and scoredPlacementReorder, its
+// only consumer. Pure: no clock reads, no locks.
+func reentryScorePenalty(elapsed time.Duration, ramp time.Duration) float64 {
+	if ramp <= 0 || elapsed >= ramp {
+		return 0
+	}
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	return reentryPenaltyWeight * float64(ramp-elapsed) / float64(ramp)
+}
+
 // verdictAction decides between executing, quarantining, and expiring a
 // blackhole verdict. The core invariant it encodes: an exit carrying live
 // flows may only be closed on hard evidence. Of the verdicts that reach here,
@@ -11468,13 +11609,23 @@ func (self *multiClientChannel) detectBlackhole() {
 				if quarantineReason, quarantineStart := self.quarantineState(); quarantineReason == reason {
 					quarantinedSince = quarantineStart
 				}
+				// the bench hold time: benchDuration(reconvictions, base,
+				// dampening off) returns base unchanged, so with
+				// QuarantineDampening at its zero value this is byte-for-byte
+				// self.settings.StatsWindowKeepUnhealthyDuration, exactly as
+				// it was passed directly before this task.
+				quarantineExpiry := benchDuration(
+					self.quarantineReconvictionCount(),
+					self.settings.StatsWindowKeepUnhealthyDuration,
+					self.reliabilitySettings().QuarantineDampening,
+				)
 				action := verdictAction(
 					reason,
 					self.reliabilitySettings().SoftVerdictDemote,
 					flowCount,
 					quarantinedSince,
 					now,
-					self.settings.StatsWindowKeepUnhealthyDuration,
+					quarantineExpiry,
 					self.emptiedByMigration(),
 				)
 
