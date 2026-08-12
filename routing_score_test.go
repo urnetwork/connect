@@ -252,17 +252,48 @@ func TestDefaultMultiClientSettingsKnobsAreZeroValueOff(t *testing.T) {
 // TestNewReliabilityKnobsZeroValueOff asserts the four smart-routing knobs
 // follow the same zero-value-off contract as every other ReliabilitySettings
 // field: a nil override (or one built from an older struct) must leave them
-// all off, and ReliabilitySettingsFrom must faithfully copy the knob through
-// when it is set.
+// all off, and ReliabilitySettingsFrom must faithfully copy every knob
+// through when it is set.
+//
+// The copy-fidelity half deliberately does NOT source its input from
+// DefaultMultiClientSettings(): the zero-value-off requirement means the
+// defaults leave all four knobs at false/0, so a comparison built on the
+// defaults (got.X != s.X) is false != false regardless of whether
+// ReliabilitySettingsFrom copies the field at all -- deleting the copy line
+// entirely would still pass. Instead an explicit, fully-populated
+// MultiClientSettings is round-tripped, with distinct non-zero values per
+// field (not the same 1 four times) so a copy line wired to the wrong
+// source field is caught too, not just a missing one.
 func TestNewReliabilityKnobsZeroValueOff(t *testing.T) {
 	z := ReliabilitySettingsFrom(nil) // nil → zero value
 	if z.ScoredPlacement || z.PlacementHysteresisPct != 0 ||
 		z.PlacementDemoteConsecutive != 0 || z.RewardInstrumentation {
 		t.Fatal("new knobs must be zero-value-off (legacy behavior)")
 	}
-	s := DefaultMultiClientSettings()
-	got := ReliabilitySettingsFrom(s)
-	if got.ScoredPlacement != s.ScoredPlacement {
+
+	d := DefaultMultiClientSettings()
+	if d.ScoredPlacement || d.PlacementHysteresisPct != 0 ||
+		d.PlacementDemoteConsecutive != 0 || d.RewardInstrumentation {
+		t.Fatal("DefaultMultiClientSettings must leave the new knobs zero-value-off")
+	}
+
+	src := &MultiClientSettings{
+		ScoredPlacement:            true,
+		PlacementHysteresisPct:     12.5,
+		PlacementDemoteConsecutive: 3,
+		RewardInstrumentation:      true,
+	}
+	got := ReliabilitySettingsFrom(src)
+	if got.ScoredPlacement != true {
 		t.Fatal("ReliabilitySettingsFrom must copy ScoredPlacement")
+	}
+	if got.PlacementHysteresisPct != 12.5 {
+		t.Fatalf("ReliabilitySettingsFrom must copy PlacementHysteresisPct: got %v, want 12.5", got.PlacementHysteresisPct)
+	}
+	if got.PlacementDemoteConsecutive != 3 {
+		t.Fatalf("ReliabilitySettingsFrom must copy PlacementDemoteConsecutive: got %v, want 3", got.PlacementDemoteConsecutive)
+	}
+	if got.RewardInstrumentation != true {
+		t.Fatal("ReliabilitySettingsFrom must copy RewardInstrumentation")
 	}
 }
