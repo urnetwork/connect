@@ -26,8 +26,8 @@ const priorsEwmaAlpha = 0.2
 func (p *ProviderPriors) Observe(providerId string, score float64, nowUnix int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	pr := p.m[providerId]
-	if pr.LastSeenUnix == 0 {
+	pr, ok := p.m[providerId]
+	if !ok {
 		pr.ScoreEwma = score
 	} else {
 		pr.ScoreEwma = priorsEwmaAlpha*score + (1-priorsEwmaAlpha)*pr.ScoreEwma
@@ -39,16 +39,20 @@ func (p *ProviderPriors) Observe(providerId string, score float64, nowUnix int64
 func (p *ProviderPriors) Convict(providerId string, nowUnix int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	pr := p.m[providerId]
+	pr, ok := p.m[providerId]
+	if !ok {
+		// Only convict providers we have already observed; presence-keyed like Observe.
+		return
+	}
 	pr.Convictions++
 	pr.LastSeenUnix = nowUnix
 	p.m[providerId] = pr
 }
 
 // Bias returns a recruitment bias in [0,1]; unknown providers are neutral 0.5.
-// A conviction history subtracts; the score EWMA is the base. Staleness decay is
-// applied by the caller passing a recent nowUnix into DecayedBias if needed; the
-// base Bias is time-independent for testability.
+// A conviction history subtracts; the score EWMA is the base. The Bias method is
+// deliberately time-independent for testability; staleness and TTL are enforced by
+// the persistence layer in a later task.
 func (p *ProviderPriors) Bias(providerId string) float64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()

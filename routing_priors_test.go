@@ -76,3 +76,44 @@ func TestProviderPriorsLoadCopiesIn(t *testing.T) {
 		t.Fatalf("Load() did not copy in; unrelated key from mutated map appeared in internal state")
 	}
 }
+
+func TestProviderPriorsConvictThenObserveSeedsValue(t *testing.T) {
+	p := NewProviderPriors()
+	// Convict before first Observe — presence-keyed seeding must seed ScoreEwma
+	p.Convict("x", 1000)
+	p.Observe("x", 0.9, 1001)
+	snap := p.Snapshot()
+	if snap["x"].ScoreEwma != 0.9 {
+		t.Fatalf("Convict-then-Observe should seed to score 0.9, got %f", snap["x"].ScoreEwma)
+	}
+}
+
+func TestProviderPriorsBiasClampedToZero(t *testing.T) {
+	p := NewProviderPriors()
+	// Seed a provider with high score, then add enough convictions to go negative
+	p.Observe("x", 0.9, 1000)
+	// 7 convictions: 0.9 - 0.15*7 = 0.9 - 1.05 = -0.15 (negative)
+	for i := 0; i < 7; i++ {
+		p.Convict("x", 1000)
+	}
+	bias := p.Bias("x")
+	if bias != 0.0 {
+		t.Fatalf("Bias with negative raw value must clamp to 0.0, got %f", bias)
+	}
+}
+
+func TestProviderPriorsPresenceKeyedSeeding(t *testing.T) {
+	p := NewProviderPriors()
+	// Observe multiple times with nowUnix=0 (fixture time, or "time unknown").
+	// With presence-keyed seeding, all observations after the first should blend.
+	// With timestamp-based seeding (pr.LastSeenUnix == 0), every observation would re-seed,
+	// defeating EWMA smoothing and allowing a single malicious sample to persist.
+	p.Observe("x", 0.9, 0) // Seeds to 0.9, LastSeenUnix=0
+	p.Observe("x", 0.1, 0) // Should blend to 0.2*0.1 + 0.8*0.9 = 0.74
+	// If using timestamp seeding, this would have re-seeded to 0.1 instead.
+	snap := p.Snapshot()
+	want := 0.74
+	if snap["x"].ScoreEwma < want-0.0001 || snap["x"].ScoreEwma > want+0.0001 {
+		t.Fatalf("Observe with nowUnix=0 must blend, not re-seed: got %f, want %f", snap["x"].ScoreEwma, want)
+	}
+}
