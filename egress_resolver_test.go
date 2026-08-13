@@ -46,6 +46,11 @@ func TestUsableEgressDnsServer(t *testing.T) {
 		{"v4 with no v4 bind", "1.1.1.1", 0, 23, false},
 		{"public v6", "2620:fe::fe", 0, 23, true},
 		{"v6 with no v6 bind", "2620:fe::fe", 16, 0, false},
+		// v4 link-local: DHCP failure, or a virtual/host-only adapter (VMware
+		// VMnet*, Hyper-V). Never a working resolver, and dialing one costs a
+		// full timeout per candidate before a usable server is reached.
+		{"v4 link-local", "169.254.1.1", 16, 0, false},
+		{"v4 link-local, vmware-style", "169.254.83.1", 16, 0, false},
 		{"site-local auto-config junk", "fec0:0:0:ffff::1", 0, 23, false},
 		{"v6 loopback", "::1", 0, 23, false},
 	}
