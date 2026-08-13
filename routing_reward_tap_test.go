@@ -229,7 +229,7 @@ func TestRewardInstrumentationOffRecordsAndPersistsNothing(t *testing.T) {
 	if n := store.saveCount(); n != 0 {
 		t.Fatalf("RewardInstrumentation=0 must persist nothing, got %d Save call(s)", n)
 	}
-	if lines := logger.linesWith("event=reward"); len(lines) != 0 {
+	if lines := logger.linesWith("event=reward "); len(lines) != 0 {
 		t.Fatalf("RewardInstrumentation=0 must emit no reward lines, got %v", lines)
 	}
 }
@@ -259,7 +259,7 @@ func TestFoldRewardAndPersistEmitsRewardLineAndPersistsOnce(t *testing.T) {
 
 	parent.foldRewardAndPersist()
 
-	lines := logger.linesWith("event=reward")
+	lines := logger.linesWith("event=reward ")
 	if len(lines) != 1 {
 		t.Fatalf("want exactly 1 reward line, got %d: %v", len(lines), lines)
 	}
@@ -279,7 +279,7 @@ func TestFoldRewardAndPersistEmitsRewardLineAndPersistsOnce(t *testing.T) {
 
 	logger.reset()
 	parent.foldRewardAndPersist()
-	if lines := logger.linesWith("event=reward"); len(lines) != 0 {
+	if lines := logger.linesWith("event=reward "); len(lines) != 0 {
 		t.Fatalf("a second fold with no new samples must emit nothing, got %v", lines)
 	}
 	if n := store.saveCount(); n != 1 {
@@ -389,8 +389,8 @@ func TestRecordFlowRewardCapDropIsReportedOnFold(t *testing.T) {
 	if parent.reward == nil || len(parent.reward.m) != rewardAccumulatorMaxKeys {
 		t.Fatalf("want the accumulator capped at %d keys before the fold, got %+v", rewardAccumulatorMaxKeys, parent.reward)
 	}
-	if parent.reward.dropped != overflow {
-		t.Fatalf("want dropped=%d on the live tap before the fold, got %d", overflow, parent.reward.dropped)
+	if parent.reward.droppedSamples != overflow {
+		t.Fatalf("want droppedSamples=%d on the live tap before the fold, got %d", overflow, parent.reward.droppedSamples)
 	}
 
 	parent.foldRewardAndPersist()
@@ -399,7 +399,7 @@ func TestRecordFlowRewardCapDropIsReportedOnFold(t *testing.T) {
 	if len(dropLines) != 1 {
 		t.Fatalf("want exactly 1 event=reward_dropped line from the real fold, got %d: %v", len(dropLines), logger.lines())
 	}
-	for _, want := range []string{"[rel] event=reward_dropped", fmt.Sprintf("dropped=%d", overflow), fmt.Sprintf("cap=%d", rewardAccumulatorMaxKeys)} {
+	for _, want := range []string{"[rel] event=reward_dropped", fmt.Sprintf("droppedsamples=%d", overflow), fmt.Sprintf("cap=%d", rewardAccumulatorMaxKeys)} {
 		if !strings.Contains(dropLines[0], want) {
 			t.Fatalf("reward_dropped line %q missing %q", dropLines[0], want)
 		}

@@ -119,7 +119,7 @@ func runScoredRoutingChain(t *testing.T, settings *MultiClientSettings) chainPro
 		challenger:    challenger,
 		ordered:       ordered,
 		orderedFront:  winner,
-		rewardLines:   logger.linesWith("event=reward"),
+		rewardLines:   logger.linesWith("event=reward "),
 	}
 	if parent.providerPriors != nil {
 		if winnerProviderId, ok := providerIdentity(winner); ok {
