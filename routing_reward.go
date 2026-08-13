@@ -23,10 +23,27 @@ func newRewardAccumulator() *rewardAccumulator {
 	return &rewardAccumulator{m: map[rewardKey]*rewardStat{}}
 }
 
+// rewardAccumulatorMaxKeys bounds the accumulator's memory independent of
+// whether the interval fold (foldRewardAndPersist, on runHeartbeat's own
+// wake cadence) is actually draining it. HeartbeatInterval==0 at
+// construction never starts that goroutine at all (see runHeartbeat's own
+// construction-time gate) -- not reachable from any shipped default (60s)
+// or any non-test call site -- but with nothing folding it, an unbounded
+// map would otherwise be a genuine leak across a very long session with
+// many distinct (class, exit) pairs. Once at the cap, a brand-new key is
+// dropped rather than added; an already-tracked key keeps accumulating (it
+// is already paying rent, and this is a leak guard, not a fairness policy).
+// 256 mirrors maxRestoredWindowIdentityCount's own "several generations of
+// slack over a normal window" sizing.
+const rewardAccumulatorMaxKeys = 256
+
 func (r *rewardAccumulator) add(class TrafficClass, exitId string, goodputBytes float64, stallFree bool) {
 	k := rewardKey{Class: class, ExitId: exitId}
 	s := r.m[k]
 	if s == nil {
+		if rewardAccumulatorMaxKeys <= len(r.m) {
+			return
+		}
 		s = &rewardStat{}
 		r.m[k] = s
 	}

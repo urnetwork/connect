@@ -46,13 +46,31 @@ func (f *fakePriorsStore) lastSave() map[string]ProviderPrior {
 	return f.saved[len(f.saved)-1]
 }
 
-// rewardTestGoodClient builds a fixture channel with real, positive goodput
-// (the exact bucket/packetStats recipe TestExitMetricsSnapshotGoodputFromWindowStats
-// uses) and no reconvictions, so exitMetricsSnapshot reads a genuinely good,
-// stall-free outcome rather than a fabricated one.
-func rewardTestGoodClient(id Id) *multiClientChannel {
+// rewardTestChannel builds a fixture channel bound to providerId as its
+// destination tail -- the STABLE provider identity recordFlowReward keys
+// reward samples and priors on (Destination().Tail(), the same identity
+// removeProvider/RemoveProvider already key on as egressClientId) -- with
+// its own independent channelId as the channel's ephemeral, per-window-slot
+// ClientId. A test picks whether the two coincide (the common
+// single-channel case, via rewardTestGoodClient/rewardTestBadClient below)
+// or deliberately differ (a reconnect: same provider, new channel -- see
+// TestRecordFlowRewardKeyedByProviderIdentityNotChannelIdentity, which is
+// exactly the scenario ClientId-keying got wrong: the api generator mints a
+// fresh ClientId on every window (re)connect, per
+// ip_remote_multi_client_identity.go's own doc).
+func rewardTestChannel(providerId Id, channelId Id) *multiClientChannel {
 	client := stallTestChannel()
-	setClientId(client, id)
+	setClientId(client, channelId)
+	client.args.Destination = RequireMultiHopId(providerId)
+	return client
+}
+
+// rewardTestApplyGoodTelemetry gives a fixture channel real, positive
+// goodput (the exact bucket/packetStats recipe
+// TestExitMetricsSnapshotGoodputFromWindowStats uses) and no reconvictions,
+// so exitMetricsSnapshot reads a genuinely good, stall-free outcome rather
+// than a fabricated one.
+func rewardTestApplyGoodTelemetry(client *multiClientChannel) {
 	now := time.Now()
 	client.stateLock.Lock()
 	client.eventBuckets = []*multiClientEventBucket{
@@ -64,15 +82,23 @@ func rewardTestGoodClient(id Id) *multiClientChannel {
 	client.packetStats.sendAckByteCount = 500000
 	client.packetStats.receiveAckByteCount = 500000
 	client.stateLock.Unlock()
+}
+
+// rewardTestGoodClient builds a fixture channel (channelId == providerId,
+// the common single-channel case) with real, positive goodput and no
+// reconvictions.
+func rewardTestGoodClient(providerId Id) *multiClientChannel {
+	client := rewardTestChannel(providerId, providerId)
+	rewardTestApplyGoodTelemetry(client)
 	return client
 }
 
-// rewardTestBadClient builds a fixture channel with no window activity
-// (goodput 0) and one completed bench-then-lift cycle, so StallEvents=1 --
-// the same technique routing_demotion_test.go's demotionTestReconvict uses.
-func rewardTestBadClient(id Id) *multiClientChannel {
-	client := stallTestChannel()
-	setClientId(client, id)
+// rewardTestBadClient builds a fixture channel (channelId == providerId)
+// with no window activity (goodput 0) and one completed bench-then-lift
+// cycle, so StallEvents=1 -- the same technique routing_demotion_test.go's
+// demotionTestReconvict uses.
+func rewardTestBadClient(providerId Id) *multiClientChannel {
+	client := rewardTestChannel(providerId, providerId)
 	client.setQuarantined(blackholeNoReceiveAck)
 	client.clearQuarantine()
 	return client
@@ -114,6 +140,57 @@ func TestRecordFlowRewardGoodOutcomeRaisesPriorBadOutcomeLowers(t *testing.T) {
 	}
 	if !(goodBias > badBias) {
 		t.Fatalf("good outcome must score higher than bad: good=%v bad=%v", goodBias, badBias)
+	}
+}
+
+// TestRecordFlowRewardKeyedByProviderIdentityNotChannelIdentity is the
+// Critical defect the review caught: two DIFFERENT channels -- two
+// different, ephemeral, locally-minted ClientIds, exactly what a reconnect,
+// a demotion replacement, or a blackhole rebind mints fresh every time (per
+// ip_remote_multi_client_identity.go's own doc: "the api generator mints an
+// ephemeral platform client id ... for every window entry") -- that dial the
+// SAME provider (the SAME Destination().Tail()) must accumulate into the
+// SAME prior. Keying on ClientId instead makes the second channel's fold
+// create a brand-new, unrelated entry, silently orphaning the first
+// channel's history on every ordinary within-session reconnect, not just
+// across a process restart.
+func TestRecordFlowRewardKeyedByProviderIdentityNotChannelIdentity(t *testing.T) {
+	parent := &RemoteUserNatMultiClient{settings: DefaultMultiClientSettings()}
+	parent.settings.RewardInstrumentation = true
+	parent.SetFlowClassifier(fixedClassifier{class: ClassBulk})
+	ipPath := &IpPath{Version: 4, Protocol: IpProtocolTcp}
+
+	providerId := NewId()
+
+	// the first channel: some window slot, some ClientId, dialing providerId.
+	firstChannel := rewardTestGoodClient(providerId)
+	parent.recordFlowReward(ipPath, "", firstChannel, 0)
+	parent.foldRewardAndPersist()
+
+	if parent.providerPriors == nil {
+		t.Fatal("recording a good outcome must have created providerPriors")
+	}
+	if snap := parent.providerPriors.Snapshot(); len(snap) != 1 {
+		t.Fatalf("want exactly 1 provider prior after the first channel, got %d: %v", len(snap), snap)
+	}
+
+	// a RECONNECT to the SAME provider: a brand-new channel with a
+	// brand-new ClientId, but the SAME destination.
+	secondChannel := rewardTestChannel(providerId, NewId())
+	rewardTestApplyGoodTelemetry(secondChannel)
+	if firstChannel.ClientId() == secondChannel.ClientId() {
+		t.Fatal("test fixture bug: the two channels must carry different ClientIds to prove the fix")
+	}
+
+	parent.recordFlowReward(ipPath, "", secondChannel, 0)
+	parent.foldRewardAndPersist()
+
+	snap := parent.providerPriors.Snapshot()
+	if len(snap) != 1 {
+		t.Fatalf("a reconnect to the SAME provider must fold into the SAME prior, not create a second one -- got %d entries: %v", len(snap), snap)
+	}
+	if _, ok := snap[providerId.String()]; !ok {
+		t.Fatalf("the provider's prior must be keyed by its stable identity (Destination().Tail()), not the channel's ephemeral ClientId; got keys %v", snap)
 	}
 }
 

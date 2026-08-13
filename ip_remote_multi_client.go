@@ -1516,6 +1516,35 @@ func (self *RemoteUserNatMultiClient) SetPriorsStore(store PriorsStore) {
 	self.providerPriors.Load(loaded)
 }
 
+// providerIdentity returns the exit's STABLE provider identity -- the
+// destination tail, exactly what removeProvider/RemoveProvider already key
+// on under the name egressClientId -- NEVER the channel's own ClientId.
+//
+// ClientId is an ephemeral, locally-minted per-window-slot id: the api
+// generator mints a fresh one (with a fresh instance id) on essentially
+// every channel (re)connect (see ip_remote_multi_client_identity.go's own
+// doc), and the default generator installs no identity store to make it
+// stable even across a within-process reconnect. Keying persisted priors on
+// it would silently orphan a provider's whole history on the next demotion,
+// blackhole replacement, or migration BACK to the very same provider -- not
+// merely across a process restart, which is the failure routing_priors.go's
+// own doc warns about ("one provider IDENTITY, never an exit instance").
+//
+// false when the channel carries no destination yet (a bare fixture, or a
+// channel torn down before it ever dialed) -- recording under a zero
+// identity would silently pool every such flow's reward into one bogus
+// entry, which is worse than dropping the sample.
+func providerIdentity(client *multiClientChannel) (Id, bool) {
+	if client == nil || client.args == nil {
+		return Id{}, false
+	}
+	destination := client.args.Destination
+	if destination.Len() == 0 {
+		return Id{}, false
+	}
+	return destination.Tail(), true
+}
+
 // recordFlowReward is the reward tap's per-flow half: called once a flow has
 // actually finished (sendUpdate's per-flow idle-timeout teardown goroutine,
 // both ip versions -- see the flow-close path there), with no lock held. It
@@ -1528,13 +1557,19 @@ func (self *RemoteUserNatMultiClient) SetPriorsStore(store PriorsStore) {
 // RewardInstrumentation's zero value is fully inert: off, this records
 // nothing and allocates nothing -- the accumulator is created lazily, only
 // once a sample is actually about to be recorded, so a build that never
-// turns the knob on never pays for it. class is derived exactly the way
-// scoredPlacementReorder derives it (classifyOrUnknown over the same
+// turns the knob on never pays for it. This is also the ONLY place that
+// reads RewardInstrumentation for the tap (the sendUpdate call sites below
+// no longer pre-check it -- one read, not three). class is derived exactly
+// the way scoredPlacementReorder derives it (classifyOrUnknown over the same
 // flowClassifier seam), so a flow's reward is filed under the same class its
 // placement decision used. flows is the caller's own flow-count read (the
 // same contract exitMetricsSnapshot documents), never re-read here.
 func (self *RemoteUserNatMultiClient) recordFlowReward(ipPath *IpPath, appId string, client *multiClientChannel, flows int) {
-	if client == nil || !self.reliabilitySettings().RewardInstrumentation {
+	if !self.reliabilitySettings().RewardInstrumentation {
+		return
+	}
+	providerId, ok := providerIdentity(client)
+	if !ok {
 		return
 	}
 
@@ -1552,7 +1587,7 @@ func (self *RemoteUserNatMultiClient) recordFlowReward(ipPath *IpPath, appId str
 	if self.reward == nil {
 		self.reward = newRewardAccumulator()
 	}
-	self.reward.add(class, client.ClientId().String(), metrics.GoodputBytesPerSec, stallFree)
+	self.reward.add(class, providerId.String(), metrics.GoodputBytesPerSec, stallFree)
 }
 
 // foldRewardAndPersist is the reward tap's interval-triggered half: it folds
@@ -3726,9 +3761,12 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 				// the reward tap's per-flow half (Task 5): this flow has just
 				// finished, so this is the flow-close path RewardInstrumentation
 				// consults. No lock is held here -- the locked section above
-				// already returned -- and recordFlowReward's own gate makes this
-				// a no-op (no allocation, no I/O) whenever the knob is off.
-				if self.reliabilitySettings().RewardInstrumentation && client != nil {
+				// already returned. client != nil is checked here only because
+				// client.flowCount() is not nil-safe; recordFlowReward itself is
+				// the single authoritative RewardInstrumentation gate (checked
+				// once, inside it, not pre-checked here too) and a no-op (no
+				// allocation, no I/O) whenever the knob is off.
+				if client != nil {
 					self.recordFlowReward(ipPath, update.pinAppId, client, client.flowCount())
 				}
 
@@ -3898,7 +3936,7 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 				}
 
 				// the reward tap's per-flow half (see the v4 twin)
-				if self.reliabilitySettings().RewardInstrumentation && client != nil {
+				if client != nil {
 					self.recordFlowReward(ipPath, update.pinAppId, client, client.flowCount())
 				}
 
