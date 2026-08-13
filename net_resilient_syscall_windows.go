@@ -13,6 +13,10 @@ func GetSocketTtl(fd SocketHandle) int {
 	return nativeTtl
 }
 
-func SetSocketTtl(fd SocketHandle, ttl int) {
-	syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_TTL, ttl)
+// SetSocketTtl sets the outgoing TTL on the socket. The error is returned
+// rather than discarded so callers can tell a rejected TTL from an applied
+// one. Windows accepts IP_TTL=0 where Linux rejects it, so the discarded
+// error also hid a real behaviour difference between the two platforms.
+func SetSocketTtl(fd SocketHandle, ttl int) error {
+	return syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_TTL, ttl)
 }
