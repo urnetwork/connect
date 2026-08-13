@@ -20,7 +20,11 @@ func flowCapTestParent(t *testing.T, maxFlowsPerExit int, flowCounts ...int) (*R
 
 	clients := []*multiClientChannel{}
 	for _, count := range flowCounts {
-		client := &multiClientChannel{settings: settings}
+		// packetStats is never nil on a real channel (newMultiClientChannel
+		// always sets it); the routing-scorer tests reuse this fixture and
+		// now reach it through exitMetricsSnapshot's windowStatsWithCoalesce
+		// read, so this fixture must carry a real (if empty) one too.
+		client := &multiClientChannel{settings: settings, packetStats: &clientWindowStats{}}
 		updates := map[*multiClientChannelUpdate]bool{}
 		for range count {
 			updates[&multiClientChannelUpdate{}] = true

@@ -106,7 +106,18 @@ func usableEgressDnsServer(addr netip.Addr, index4 uint32, index6 uint32) bool {
 	if maskAddr, err := netip.ParseAddr(DefaultDnsUpgradeMaskAddress); err == nil && addr == maskAddr {
 		return false
 	}
+	// IPv4 link-local (169.254/16) is what Windows assigns when DHCP fails, and
+	// what virtual/host-only adapters (VMware VMnet*, Hyper-V, VirtualBox)
+	// routinely carry. Such an address can never answer a query, but a bound
+	// socket still spends the full dial timeout finding that out -- once per
+	// candidate, before a usable server is reached. That is the shape of a
+	// multi-second control-plane stall that presents as a dead network. The v6
+	// branch below already excludes its equivalent (site-local); this is the
+	// missing v4 half of the same rule.
 	if addr.Is4() {
+		if addr.IsLinkLocalUnicast() {
+			return false
+		}
 		return index4 != 0
 	}
 	if index6 == 0 {

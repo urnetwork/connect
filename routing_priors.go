@@ -23,6 +23,14 @@ func NewProviderPriors() *ProviderPriors {
 
 const priorsEwmaAlpha = 0.2
 
+// priorsNeutralBias is what Bias answers for a provider it has never seen: the
+// exact middle of its [0,1] range. Callers that cannot resolve a provider at
+// all should report this same value rather than 0, so "nothing learned" ranks
+// between good and bad instead of below both — see affinityDonorBias, and
+// contrast exitScore's zero-rtt trap, where a bare 0 is the BEST sub-score and
+// an unmeasured exit would otherwise beat every measured one.
+const priorsNeutralBias = 0.5
+
 func (p *ProviderPriors) Observe(providerId string, score float64, nowUnix int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

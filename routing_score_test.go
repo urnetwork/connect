@@ -228,39 +228,50 @@ func TestLessLoadedTieBreakNegativeScores(t *testing.T) {
 	}
 }
 
-// TestDefaultMultiClientSettingsKnobsAreZeroValueOff pins the actual
-// regression risk: a default build must behave exactly like today. If a
-// future well-meaning edit ever sets one of these in
-// DefaultMultiClientSettings, this test catches it before it ships and
-// silently opts every default build into the new placement/reward behavior.
-func TestDefaultMultiClientSettingsKnobsAreZeroValueOff(t *testing.T) {
+// TestDefaultMultiClientSettingsKnobsAreOnByDefault pins the actual
+// regression risk post-Task-8: DefaultMultiClientSettings must keep these
+// four knobs on. Task 8 (feat(routing): enable class-aware scored placement
+// by default) deliberately turned them on -- it is the one task in the
+// smart-routing phase permitted to change a default -- so a future
+// well-meaning "restore the zero-value-off convention" edit would silently
+// revert every default build to the pre-Phase-2 placement/reward behavior.
+// This test (renamed from
+// TestDefaultMultiClientSettingsKnobsAreZeroValueOff, which asserted the
+// pre-Task-8 contract) catches that regression. See also
+// routing_defaults_test.go, which pins all six Task 8 knobs together
+// including the session banner rendering.
+func TestDefaultMultiClientSettingsKnobsAreOnByDefault(t *testing.T) {
 	s := DefaultMultiClientSettings()
-	if s.ScoredPlacement {
-		t.Fatal("DefaultMultiClientSettings must leave ScoredPlacement off (false)")
+	if !s.ScoredPlacement {
+		t.Fatal("DefaultMultiClientSettings must leave ScoredPlacement on (true)")
 	}
-	if s.PlacementHysteresisPct != 0 {
-		t.Fatal("DefaultMultiClientSettings must leave PlacementHysteresisPct at 0")
+	if s.PlacementHysteresisPct != 10 {
+		t.Fatalf("DefaultMultiClientSettings must set PlacementHysteresisPct to 10, got %v", s.PlacementHysteresisPct)
 	}
-	if s.PlacementDemoteConsecutive != 0 {
-		t.Fatal("DefaultMultiClientSettings must leave PlacementDemoteConsecutive at 0")
+	if s.PlacementDemoteConsecutive != 3 {
+		t.Fatalf("DefaultMultiClientSettings must set PlacementDemoteConsecutive to 3, got %v", s.PlacementDemoteConsecutive)
 	}
-	if s.RewardInstrumentation {
-		t.Fatal("DefaultMultiClientSettings must leave RewardInstrumentation off (false)")
+	if !s.RewardInstrumentation {
+		t.Fatal("DefaultMultiClientSettings must leave RewardInstrumentation on (true)")
 	}
 }
 
 // TestNewReliabilityKnobsZeroValueOff asserts the four smart-routing knobs
 // follow the same zero-value-off contract as every other ReliabilitySettings
-// field: a nil override (or one built from an older struct) must leave them
-// all off, and ReliabilitySettingsFrom must faithfully copy every knob
-// through when it is set.
+// field for a nil override (or one built from an older struct): that must
+// still leave them all off, and ReliabilitySettingsFrom must faithfully copy
+// every knob through when it is set. This is the backward-compatibility
+// contract -- an old caller that never heard of these fields must see
+// exactly the pre-Phase-2 behavior -- which is orthogonal to
+// DefaultMultiClientSettings' own default, which Task 8 turns on (see
+// TestDefaultMultiClientSettingsKnobsAreOnByDefault above).
 //
 // The copy-fidelity half deliberately does NOT source its input from
-// DefaultMultiClientSettings(): the zero-value-off requirement means the
-// defaults leave all four knobs at false/0, so a comparison built on the
-// defaults (got.X != s.X) is false != false regardless of whether
-// ReliabilitySettingsFrom copies the field at all -- deleting the copy line
-// entirely would still pass. Instead an explicit, fully-populated
+// DefaultMultiClientSettings(): Task 8 means the defaults no longer leave
+// all four knobs at false/0, so a comparison built on the defaults (got.X !=
+// s.X) would be true != true regardless of whether ReliabilitySettingsFrom
+// copies the field at all -- deleting the copy line entirely could still
+// pass by coincidence. Instead an explicit, fully-populated
 // MultiClientSettings is round-tripped, with distinct non-zero values per
 // field (not the same 1 four times) so a copy line wired to the wrong
 // source field is caught too, not just a missing one.
@@ -269,12 +280,6 @@ func TestNewReliabilityKnobsZeroValueOff(t *testing.T) {
 	if z.ScoredPlacement || z.PlacementHysteresisPct != 0 ||
 		z.PlacementDemoteConsecutive != 0 || z.RewardInstrumentation {
 		t.Fatal("new knobs must be zero-value-off (legacy behavior)")
-	}
-
-	d := DefaultMultiClientSettings()
-	if d.ScoredPlacement || d.PlacementHysteresisPct != 0 ||
-		d.PlacementDemoteConsecutive != 0 || d.RewardInstrumentation {
-		t.Fatal("DefaultMultiClientSettings must leave the new knobs zero-value-off")
 	}
 
 	src := &MultiClientSettings{

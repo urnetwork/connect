@@ -377,6 +377,22 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		IpAssocSettings:             DefaultIpAssocSettings(),
 
 		RemoteUserNatMultiClientMonitorSettings: *DefaultRemoteUserNatMultiClientMonitorSettings(),
+
+		// Smart routing (Phase 2), turned on by default -- see the
+		// ReliabilitySettings field comments above for what each knob does.
+		// This is the one place in the smart-routing phase permitted to
+		// change a default: the classifier, telemetry, and reward tap this
+		// phase built are otherwise inert (scoredplacement=1 with no
+		// classifier installed is a no-op), so the owner could never observe
+		// them working without a hand-flipped developer-menu override.
+		// QuarantineReentryRamp is deliberately left at its zero value here
+		// -- its decay story is separate and not part of this change.
+		LightClassifier:            true,
+		ScoredPlacement:            true,
+		RewardInstrumentation:      true,
+		PlacementHysteresisPct:     10,
+		PlacementDemoteConsecutive: 3,
+		QuarantineDampening:        true,
 	}
 }
 
@@ -539,6 +555,53 @@ type MultiClientSettings struct {
 	//
 	// false restores the veto, the A/B comparison point.
 	AffinityStickyPastCap bool
+
+	// ScoredAffinityDonor makes the learner load-bearing on the placement
+	// path that actually carries most flows.
+	//
+	// READ THIS WITH scoredPlacementReorder's header. That function scores
+	// the RACE field, and the race is the LAST of four placement steps in
+	// sendUpdate -- reached only when the flow's own affinity groups, its
+	// app pin, and the destination bridge have all declined to donate. Most
+	// flows never get there. The step that does carry them,
+	// inheritAffinityClient{4,6}WithLock, picked its donor by
+	// `createTime.After(mostRecentCreateTime)`: pure recency, with no
+	// quality signal of any kind. So the learner could observe everything
+	// and steer nothing -- ProviderPriors.Bias had zero production callers
+	// before this knob.
+	//
+	// On, the donor scan ranks eligible donors by Bias (the persisted
+	// per-provider reward EWMA, less a conviction penalty) and falls back to
+	// the recency rule on a tie. This is the FIRST production consumer of
+	// the priors the reward tap has been accumulating.
+	//
+	// Why this is the safe place to put the learner, and raising
+	// MultiRaceClientCount is not:
+	//
+	//   - This tiebreak only decides anything when a group ALREADY spans
+	//     more than one exit, i.e. the group is already scattered. It
+	//     chooses which exit a scattered group reconverges onto. It cannot
+	//     break the one-egress-ip-per-site invariant, because the invariant
+	//     is already broken in every case that reaches the comparison.
+	//   - It removes no starvation guard. MaxFlowsPerExit (16, on by
+	//     default) gates this path through clientAtFlowCapWithLock, so a
+	//     well-scoring exit still stops collecting new sites at the cap.
+	//     The wide race is the starvation guard on the RACE path, which is
+	//     why narrowing that race to make the scorer matter would have
+	//     traded a guard away. This trades nothing.
+	//   - It costs no lock and no I/O at placement time. Bias is a map read
+	//     plus arithmetic under ProviderPriors' own mutex; nothing here
+	//     calls windowStatsWithCoalesce, whose "already called on this path"
+	//     safety argument holds for the race and NOT for affinity.
+	//
+	// One behavior difference beyond ordering, on only: the legacy loop
+	// checked recency BEFORE eligibility, so a donor older than the current
+	// best never had affinityDonorEligible called on it and could not report
+	// donorQuarantineScattered. Ranking requires evaluating every candidate,
+	// so scattered is now observed on quarantined donors the legacy scan
+	// skipped. That makes the G-1 scatter ledger MORE complete, never less;
+	// with the knob off the legacy short-circuit is preserved exactly.
+	ScoredAffinityDonor bool
 
 	// QuarantineGroupFollow lets a QUARANTINED exit keep inheriting new flows
 	// from affinity groups already living on it. A benched site's established
@@ -1006,6 +1069,17 @@ type MultiClientSettings struct {
 	PlacementHysteresisPct     float64
 	PlacementDemoteConsecutive int
 	RewardInstrumentation      bool
+	// LightClassifier installs the pure-Go light-tier FlowClassifier
+	// (routing_classifier_light.go) at session construction, resolving
+	// server names through the existing ServerNameLookup seam
+	// (SetServerNameLookup / the mux's IP->hostname reverse index) -- see
+	// maybeInstallLightClassifier. false (the zero value) leaves
+	// flowClassifier nil exactly as before this knob existed:
+	// classifyOrUnknown then always names ClassUnknown, so
+	// scoredPlacementReorder stays a no-op even with ScoredPlacement on. On
+	// its own (ScoredPlacement still off) this changes nothing observable
+	// except the session banner and the sampled classify line.
+	LightClassifier bool
 
 	// Quarantine flap damping (Phase 1), zero-value-off like the rest of this
 	// block. QuarantineDampening false leaves benchDuration returning the
@@ -1180,6 +1254,14 @@ type RemoteUserNatMultiClient struct {
 	// (created lazily, so a fixture-assembled parent works), bounded by
 	// qualificationMaxEntries. See ip_remote_multi_client_probe.go.
 	qualification map[MultiHopId]*providerQualification
+	// demotionStates is scoredPlacementReorder's owned N-of-M demotion
+	// bookkeeping (routing_score.go's demotionState), keyed per (exit,
+	// class) by demotionKey. Guarded by stateLock, created lazily like
+	// qualification above. Unlike qualification, an entry does NOT survive a
+	// channel's teardown -- removeClient evicts every entry for a departing
+	// ClientId, so this cannot grow unbounded across a long session's churn.
+	// See demotionObserve and demotionKey's own doc for the keying rationale.
+	demotionStates map[demotionKey]*demotionState
 
 	// config is an immutable snapshot of the rarely-changed routing config
 	// (performance profile + local security bypass). it is rebuilt under
@@ -1192,6 +1274,21 @@ type RemoteUserNatMultiClient struct {
 	// the values in settings", which is what every non-overridden client does.
 	// Read on the packet hot path, so an atomic rather than a lock.
 	reliability atomic.Pointer[ReliabilitySettings]
+	// reliabilitySettingsLock serializes SetReliabilitySettings callers against
+	// each other -- NOT against readers, and NEVER taken on the placement path
+	// (reliabilitySettings() stays a bare atomic load, exactly as before). It
+	// exists solely because LightClassifier's edge-trigger reads `before`,
+	// stores, and reads `after` as three separate steps around the single
+	// atomic `reliability` swap: two concurrent SetReliabilitySettings callers
+	// can otherwise each compute their edge decision from their OWN
+	// before/after pair, so the caller whose store lands SECOND in
+	// `reliability` is not guaranteed to be the caller whose flowClassifier
+	// install/clear runs last -- the settings and the classifier can disagree
+	// about which caller "won". A leaf lock: only ever held across a settings
+	// store, a classifier install/clear (SetFlowClassifier, itself lock-free),
+	// and a handful of log lines, all inside SetReliabilitySettings; a
+	// developer-menu action is rare enough that serializing it costs nothing.
+	reliabilitySettingsLock sync.Mutex
 
 	localUserNat      *LocalUserNat
 	localUserNatUnsub func()
@@ -1222,6 +1319,33 @@ type RemoteUserNatMultiClient struct {
 	// scoredPlacementEnabled); with that gate off, or with no classifier
 	// installed, nothing in this file's new routing code runs.
 	flowClassifier atomic.Pointer[FlowClassifier]
+	// rewardLock is the leaf lock guarding reward and providerPriors below --
+	// never the parent stateLock, on the same reasoning as
+	// reliabilitySettingsLock: the reward tap runs on the flow-close path
+	// (recordFlowReward) at flow-completion frequency, and giving it its own
+	// lock keeps that path off the parent lock entirely rather than adding
+	// contention to the hottest lock in the file. Only ever held across a map
+	// insert, an EWMA update, or a Snapshot copy -- never across I/O or
+	// another lock acquisition.
+	rewardLock sync.Mutex
+	// reward is the Phase 0 per-(class,exit) accumulator (routing_reward.go),
+	// created lazily on the first recorded sample. RewardInstrumentation's
+	// zero value must be fully inert -- see recordFlowReward's gate -- so
+	// this stays nil, not merely empty, until a sample is actually recorded.
+	reward *rewardAccumulator
+	// providerPriors is the in-memory EWMA/conviction store
+	// (routing_priors.go) that recordFlowReward's interval fold
+	// (foldRewardAndPersist) writes into and scoredPlacementReorder's bias
+	// consult (a later task) would read from. Created lazily, same
+	// zero-value-off discipline as reward above.
+	providerPriors *ProviderPriors
+	// priorsStore is the persistence seam for providerPriors: the
+	// platform-supplied dot-file-backed implementation, installed via
+	// SetPriorsStore. Mirrors flowClassifier exactly -- atomic pointer, nil
+	// clears, nil-safe throughout. nil (a bare client, or one never wired to
+	// a platform store) means in-memory-only priors, matching PriorsStore's
+	// own doc.
+	priorsStore atomic.Pointer[PriorsStore]
 	// appPinClients is the cross-version half of an app pin: the exit an
 	// app's flows are currently placed on, keyed by app id. The affinity
 	// groups are per-ip-version by construction (separate path maps), so a
@@ -1398,12 +1522,260 @@ func (self *RemoteUserNatMultiClient) SetFlowClassifier(c FlowClassifier) {
 		"flow_classifier",
 		"installed", c != nil,
 	))
+	self.setFlowClassifierUnlogged(c)
+}
 
+// setFlowClassifierUnlogged performs the raw flowClassifier swap without
+// SetFlowClassifier's own log line. It exists for SetReliabilitySettings,
+// which must perform this swap INSIDE reliabilitySettingsLock (see that
+// function) so the classifier install/clear lands atomically-as-a-unit with
+// the settings store, but must NOT hold that lock across a logging call --
+// logging is I/O-adjacent and this lock's whole contract is that nothing
+// blocking runs under it. SetReliabilitySettings logs the same
+// "flow_classifier" event itself, after releasing the lock.
+func (self *RemoteUserNatMultiClient) setFlowClassifierUnlogged(c FlowClassifier) {
 	if c == nil {
 		self.flowClassifier.Store(nil)
 	} else {
 		self.flowClassifier.Store(&c)
 	}
+}
+
+// SetPriorsStore installs (or, with nil, removes) the provider-priors
+// persistence seam (the sdk's dot-file-backed implementation in production).
+// Mirrors SetFlowClassifier: a bare atomic store, safe at runtime and on a
+// bare client.
+//
+// Installing a non-nil store immediately calls Load() and seeds
+// providerPriors from whatever was last persisted, so a restart resumes with
+// history instead of starting every provider neutral. This is the one place
+// in the reward path that may do real I/O (a dot-file read) -- deliberately
+// an explicit, one-time setup call, like SetServerNameLookup, and never
+// reachable from the flow-close or placement path. An empty or absent
+// Load() leaves providerPriors exactly as it was (nil until the first real
+// sample), so calling this before any reward has ever been recorded costs no
+// allocation.
+func (self *RemoteUserNatMultiClient) SetPriorsStore(store PriorsStore) {
+	loggerOrDefault(self.log).Infof("%s\n", relEvent(
+		"priors_store",
+		"installed", store != nil,
+	))
+
+	if store == nil {
+		self.priorsStore.Store(nil)
+		return
+	}
+	self.priorsStore.Store(&store)
+
+	loaded := store.Load()
+	if len(loaded) == 0 {
+		return
+	}
+	self.rewardLock.Lock()
+	defer self.rewardLock.Unlock()
+	if self.providerPriors == nil {
+		self.providerPriors = NewProviderPriors()
+	}
+	self.providerPriors.Load(loaded)
+}
+
+// providerIdentity returns the exit's STABLE provider identity -- the
+// destination tail, exactly what removeProvider/RemoveProvider already key
+// on under the name egressClientId -- NEVER the channel's own ClientId.
+//
+// ClientId is an ephemeral, locally-minted per-window-slot id: the api
+// generator mints a fresh one (with a fresh instance id) on essentially
+// every channel (re)connect (see ip_remote_multi_client_identity.go's own
+// doc), and the default generator installs no identity store to make it
+// stable even across a within-process reconnect. Keying persisted priors on
+// it would silently orphan a provider's whole history on the next demotion,
+// blackhole replacement, or migration BACK to the very same provider -- not
+// merely across a process restart, which is the failure routing_priors.go's
+// own doc warns about ("one provider IDENTITY, never an exit instance").
+//
+// false when the channel carries no destination yet (a bare fixture, or a
+// channel torn down before it ever dialed) -- recording under a zero
+// identity would silently pool every such flow's reward into one bogus
+// entry, which is worse than dropping the sample.
+func providerIdentity(client *multiClientChannel) (Id, bool) {
+	if client == nil || client.args == nil {
+		return Id{}, false
+	}
+	destination := client.args.Destination
+	if destination.Len() == 0 {
+		return Id{}, false
+	}
+	return destination.Tail(), true
+}
+
+// recordFlowReward is the reward tap's per-flow half: called once a flow has
+// actually finished (sendUpdate's per-flow idle-timeout teardown goroutine,
+// both ip versions -- see the flow-close path there), with no lock held. It
+// stays as cheap as a placement decision -- a classify lookup, a metrics
+// snapshot taken through the non-coalescing accessor (see exitMetricsSnapshot;
+// it is NOT side-effect-free, only a weaker duplicate of a call already made
+// on this path) via its own
+// contract, and a map insert under a leaf lock -- never I/O, never a
+// blocking call, matching the same discipline scoredPlacementReorder's
+// demotionObserve call already established.
+//
+// RewardInstrumentation's zero value is fully inert: off, this records
+// nothing and allocates nothing -- the accumulator is created lazily, only
+// once a sample is actually about to be recorded, so a build that never
+// turns the knob on never pays for it. This is also the ONLY place that
+// reads RewardInstrumentation for the tap (the sendUpdate call sites below
+// no longer pre-check it -- one read, not three). class is derived exactly
+// the way scoredPlacementReorder derives it (classifyOrUnknown over the same
+// flowClassifier seam), so a flow's reward is filed under the same class its
+// placement decision used. flows is the caller's own flow-count read (the
+// same contract exitMetricsSnapshot documents), never re-read here.
+func (self *RemoteUserNatMultiClient) recordFlowReward(ipPath *IpPath, appId string, client *multiClientChannel, flows int) {
+	if !self.reliabilitySettings().RewardInstrumentation {
+		return
+	}
+	providerId, ok := providerIdentity(client)
+	if !ok {
+		return
+	}
+
+	var classifier FlowClassifier
+	if p := self.flowClassifier.Load(); p != nil {
+		classifier = *p
+	}
+	class := classifyOrUnknown(classifier, ipPath, appId).Class
+
+	metrics := exitMetricsSnapshot(client, flows)
+	stallFree := metrics.StallEvents == 0
+
+	self.rewardLock.Lock()
+	defer self.rewardLock.Unlock()
+	if self.reward == nil {
+		self.reward = newRewardAccumulator()
+	}
+	self.reward.add(class, providerId.String(), metrics.GoodputBytesPerSec, stallFree)
+}
+
+// foldRewardAndPersist is the reward tap's interval-triggered half: it folds
+// whatever recordFlowReward has accumulated since the last tick into
+// providerPriors, logs the same interval as [rel] event=reward lines, and --
+// only if a store is installed -- persists the coarse ProviderPrior snapshot.
+// Called from runHeartbeat's own wake cadence rather than a new goroutine, so
+// persistence runs on a timer, never at flow-close frequency: draining the
+// accumulator every beat is what keeps a busy session from writing the
+// dot-file on every flow teardown.
+//
+// An empty interval (nothing recorded since the last tick, the common case
+// with RewardInstrumentation off, or an idle session with it on) costs one
+// lock acquisition and nothing else -- no log line, no Snapshot copy, no
+// Save call -- the same "idle session contributes nothing" discipline the
+// heartbeat line itself uses.
+//
+// No lock is held across the log calls or the Save call: the fold, the
+// drain, and the Snapshot copy all happen inside one short rewardLock
+// section, and the store's Save (the only I/O here) runs after that section
+// returns.
+func (self *RemoteUserNatMultiClient) foldRewardAndPersist() {
+	if !self.reliabilitySettings().RewardInstrumentation {
+		return
+	}
+
+	var lines []string
+	var snapshot map[string]ProviderPrior
+	haveSnapshot := false
+
+	func() {
+		self.rewardLock.Lock()
+		defer self.rewardLock.Unlock()
+
+		if self.reward == nil || len(self.reward.m) == 0 {
+			return
+		}
+		if self.providerPriors == nil {
+			self.providerPriors = NewProviderPriors()
+		}
+		self.reward.foldInto(self.providerPriors, time.Now().Unix())
+		lines = self.reward.drainLines()
+		snapshot = self.providerPriors.Snapshot()
+		haveSnapshot = true
+	}()
+
+	for _, line := range lines {
+		loggerOrDefault(self.log).Infof("%s\n", line)
+	}
+
+	if !haveSnapshot {
+		return
+	}
+	storePtr := self.priorsStore.Load()
+	if storePtr == nil {
+		return
+	}
+	if err := (*storePtr).Save(snapshot); err != nil {
+		loggerOrDefault(self.log).Infof("%s\n", relEvent(
+			"priors_persist",
+			"ok", false,
+			"err", err,
+		))
+	}
+}
+
+// serverNameResolver adapts the multi-client's live ServerNameLookup (see
+// SetServerNameLookup and the config's serverNameLookup field) to the
+// LightClassifier's ServerNameResolver shape, for the server-name tier of
+// the light classifier.
+//
+// It reads self.config on every call rather than closing over a snapshot
+// taken at install time. That matters because of construction order: at
+// session construction the config's ServerNameLookup is nil (see
+// NewRemoteUserNatMultiClient) -- the real lookup, an *UpgradeMux, is wired
+// afterward by SetServerNameLookup. A resolver that captured the lookup once
+// at install time would stay forever blind to it; reading self.config here
+// means the classifier immediately sees a lookup installed or swapped in
+// later, with no reinstall required.
+//
+// Table lookup only, no I/O: config.Load() is an atomic read and
+// ServerNameLookup.ServerNames (the UpgradeMux's reverseIndex.serverNames)
+// is a map lookup under its own leaf lock. Safe to call inline on the
+// placement path at new-flow frequency, per LightClassifier's contract.
+func (self *RemoteUserNatMultiClient) serverNameResolver(ip netip.Addr) (string, bool) {
+	config := self.config.Load()
+	if config == nil || config.serverNameLookup == nil {
+		return "", false
+	}
+	names := config.serverNameLookup.ServerNames(ip.String())
+	if len(names) == 0 {
+		return "", false
+	}
+	// the reverse index keeps the names it has seen for an ip in no
+	// particular scoring order; the first is as good a signal as any -- the
+	// classifier only needs one name to match a suffix table entry.
+	return names[0], true
+}
+
+// maybeInstallLightClassifier installs the pure-Go light-tier classifier
+// (routing_classifier_light.go, Task 1) when settings.LightClassifier is on,
+// through the existing SetFlowClassifier seam. false (the zero value) is a
+// no-op: flowClassifier stays nil, exactly as before this knob existed.
+//
+// Extracted from NewRemoteUserNatMultiClient as its own method so the
+// install site is directly unit-testable (construct a bare client, flip the
+// knob, call this, assert on flowClassifier) without needing a full session
+// -- windows, goroutines, a live generator -- that the constructor also
+// stands up.
+//
+// This is only the CONSTRUCTION-time install: it runs once, from
+// NewRemoteUserNatMultiClient, for a session that starts with the knob
+// already on. A later runtime toggle -- SetReliabilitySettings flipping
+// LightClassifier at 0->1 or 1->0 on a live session -- does NOT come back
+// through here; SetReliabilitySettings installs or clears the classifier
+// itself (via setFlowClassifierUnlogged, under reliabilitySettingsLock) so
+// the toggle is real rather than merely changing what the banner reports.
+// See SetReliabilitySettings for that path and why it needs its own lock.
+func (self *RemoteUserNatMultiClient) maybeInstallLightClassifier() {
+	if self.settings == nil || !self.settings.LightClassifier {
+		return
+	}
+	self.SetFlowClassifier(NewLightClassifier(self.serverNameResolver))
 }
 
 // flowOwnerAppId answers "which pinned app owns this flow" -- from the cache
@@ -1667,6 +2039,11 @@ func NewRemoteUserNatMultiClient(
 		version: 0,
 		matcher: nil,
 	})
+
+	// the smart-routing classifier install site (Phase 2 Task 2): a no-op
+	// when settings.LightClassifier is off, the zero value and every current
+	// build's default.
+	multiClient.maybeInstallLightClassifier()
 
 	multiClient.SetReceivePacketCallback(receivePacketCallback)
 
@@ -2144,6 +2521,7 @@ type ReliabilitySettings struct {
 	BlackholeReceiveTimeout  time.Duration
 	MaxFlowsPerExit          int
 	AffinityStickyPastCap    bool
+	ScoredAffinityDonor      bool
 	// the G-1 group-follow pair; see the MultiClientSettings fields
 	QuarantineGroupFollow      bool
 	GroupFollowWindow          time.Duration
@@ -2194,6 +2572,13 @@ type ReliabilitySettings struct {
 	PlacementHysteresisPct     float64
 	PlacementDemoteConsecutive int
 	RewardInstrumentation      bool
+	// LightClassifier; see the matching MultiClientSettings field for what it
+	// does. Unlike the rest of this block, a runtime override DOES take
+	// effect immediately: SetReliabilitySettings installs or clears the
+	// classifier itself on a 0->1 / 1->0 edge, so toggling this through a
+	// developer menu changes placement on the next flow, not just the
+	// banner's report. See SetReliabilitySettings.
+	LightClassifier bool
 
 	// the quarantine flap-damping pair; see the matching MultiClientSettings
 	// fields for what each one does
@@ -2220,6 +2605,7 @@ func ReliabilitySettingsFrom(settings *MultiClientSettings) *ReliabilitySettings
 		BlackholeReceiveTimeout:    settings.BlackholeReceiveTimeout,
 		MaxFlowsPerExit:            settings.MaxFlowsPerExit,
 		AffinityStickyPastCap:      settings.AffinityStickyPastCap,
+		ScoredAffinityDonor:        settings.ScoredAffinityDonor,
 		QuarantineGroupFollow:      settings.QuarantineGroupFollow,
 		GroupFollowWindow:          settings.GroupFollowWindow,
 		DialFailureRerace:          settings.DialFailureRerace,
@@ -2254,6 +2640,7 @@ func ReliabilitySettingsFrom(settings *MultiClientSettings) *ReliabilitySettings
 		PlacementHysteresisPct:     settings.PlacementHysteresisPct,
 		PlacementDemoteConsecutive: settings.PlacementDemoteConsecutive,
 		RewardInstrumentation:      settings.RewardInstrumentation,
+		LightClassifier:            settings.LightClassifier,
 
 		QuarantineDampening:   settings.QuarantineDampening,
 		QuarantineReentryRamp: settings.QuarantineReentryRamp,
@@ -2292,14 +2679,67 @@ func scoredPlacementEnabled(r *ReliabilitySettings) bool {
 // configurations (before and after the store), so clearing an override logs the
 // restoration rather than a misleading "everything went to zero".
 //
-// Lock discipline: nothing is held. The store is a single atomic swap, and the
-// rendering runs after it.
+// LightClassifier is the one knob among these that this function must do more
+// than report on. Every other field here is read fresh from
+// reliabilitySettings() at the point it is consulted (e.g.
+// scoredPlacementEnabled, benchDuration), so swapping the override is the
+// whole story for them. LightClassifier instead gates whether an *object* --
+// the classifier -- sits behind the separate SetFlowClassifier/flowClassifier
+// seam, and nothing about storing a new ReliabilitySettings touches that seam
+// on its own. Left alone, a runtime toggle would log
+// "field=lightclassifier from=0 to=1" and the banner would agree, while
+// flowClassifier stayed nil and placement never changed -- a confirming log
+// line for a mechanism that never engaged. So an edge (before != after) on
+// this one field additionally installs or clears the classifier, which is
+// what makes the toggle real rather than decorative. The initial install at
+// construction (maybeInstallLightClassifier, called once from
+// NewRemoteUserNatMultiClient) is unaffected by this and stays as the first
+// install for a session that starts with the knob already on.
+//
+// Lock discipline: reliabilitySettingsLock, a dedicated leaf mutex, is held
+// ONLY across the before/store/after/classifier-swap sequence below -- two
+// atomic operations and nothing else, never a log call, never another lock,
+// never anything that can block. It is NEVER taken on the placement path
+// (nothing else in this file takes it; reliabilitySettings() itself stays a
+// bare atomic load, so ordinary reads of the effective settings are
+// unaffected). It exists because the edge decision spans two separate atomic
+// operations (the `reliability` swap and the `flowClassifier` swap) that must
+// land as one unit: without it, two concurrent callers can each compute
+// before/after from their own interleaved snapshot, so the caller whose
+// settings store lands last in `reliability` is not guaranteed to be the
+// caller whose classifier install/clear runs last either -- the settings and
+// the classifier can end up disagreeing about which caller "won" (see
+// TestSetReliabilitySettingsConcurrentTogglesConverge). Serializing this
+// rare, developer-menu-triggered call against itself costs nothing.
+//
+// The classifier's own "flow_classifier" log line is deliberately emitted
+// AFTER the lock is released (via setFlowClassifierUnlogged inside the lock,
+// then a manual log line below), rather than by calling SetFlowClassifier
+// directly from the locked section -- SetFlowClassifier logs before it
+// stores, and this function's lock must never wrap a logging call.
 func (self *RemoteUserNatMultiClient) SetReliabilitySettings(reliabilitySettings *ReliabilitySettings) {
+	self.reliabilitySettingsLock.Lock()
 	before := self.reliabilitySettings()
 	self.reliability.Store(reliabilitySettings)
 	after := self.reliabilitySettings()
 
+	classifierChanged := before.LightClassifier != after.LightClassifier
+	if classifierChanged {
+		if after.LightClassifier {
+			self.setFlowClassifierUnlogged(NewLightClassifier(self.serverNameResolver))
+		} else {
+			self.setFlowClassifierUnlogged(nil)
+		}
+	}
+	self.reliabilitySettingsLock.Unlock()
+
 	log := loggerOrDefault(self.log)
+	if classifierChanged {
+		log.Infof("%s\n", relEvent(
+			"flow_classifier",
+			"installed", after.LightClassifier,
+		))
+	}
 	for _, line := range relSettingsDiffLines(before, after) {
 		log.Infof("%s\n", line)
 	}
@@ -2572,6 +3012,83 @@ func (self *RemoteUserNatMultiClient) leastLoadedClients(clients []*multiClientC
 	return least
 }
 
+// classifyLogInterval bounds the `[rel] event=classify` emission rate (see
+// classifyLogThrottle). scoredPlacementReorder runs at new-flow frequency, so
+// an un-throttled line would flood the log the moment a page load opens a
+// burst of connections at once -- the exact "flow-storm" case the sampling
+// requirement exists for. Short enough that a field capture still narrates
+// what the classifier is doing within a few seconds of a session starting;
+// long enough that a storm of hundreds of new flows costs one line, not
+// hundreds. Package-level (not per-client) on the same pattern as
+// dropErrThrottle/oobErrThrottle/authErrThrottle: this process runs at most
+// one multi-client session, and a shared throttle is lock-free and needs no
+// per-instance init, so bare test fixtures (a literal &RemoteUserNatMultiClient{})
+// never see a nil-throttle panic.
+const classifyLogInterval = 5 * time.Second
+
+var classifyLogThrottle = newLogThrottle(classifyLogInterval)
+
+// demotionKey identifies one (exit, class) demotion streak -- an exit's own
+// TrafficClass-scoped N-of-M bad-interval count (demotionState,
+// routing_score.go).
+//
+// Keyed by the exit's stable ClientId, NOT the *multiClientChannel pointer.
+// The reason is not "an exit reconnecting should keep its old streak" --
+// removeClient (below) evicts every entry for a ClientId the moment its
+// channel goes away, so a genuine reconnect (same ClientId, new channel
+// object) starts with a clean streak exactly as a pointer-keyed map would
+// give it too. The reason is what happens when eviction is EVER missed (a
+// bug, a narrow race): once a *multiClientChannel is unreachable, Go's
+// allocator is free to reuse its freed memory for a later, wholly unrelated
+// object. A pointer-keyed map has no way to tell "the same exit came back"
+// apart from "an unrelated exit's channel happened to land at the address a
+// stale entry was still keyed by" -- a real, if rare, Go footgun for any map
+// that outlives the pointers it was built from. ClientId is a logical value
+// that cannot collide between two different exits, so a missed eviction can
+// only ever leak memory (the entry sits unread forever), never hand a new
+// exit an old one's bad reputation.
+type demotionKey struct {
+	clientId Id
+	class    TrafficClass
+}
+
+// demotionObserve records one good/bad observation for (clientId, class) and
+// reports whether PlacementDemoteConsecutive consecutive bad observations
+// have now accumulated -- demotionState.observe's N-of-M rule, applied to
+// the map/state entry this method owns. The map and the per-key state are
+// both created lazily under stateLock, the same nil-safe convention as
+// qualification above: a bare test fixture (a literal
+// &RemoteUserNatMultiClient{}) leaves demotionStates nil until first use.
+// demotionState.observe is a couple of int comparisons -- no lock, I/O, or
+// blocking of its own -- so holding stateLock across the call (rather than
+// releasing it first) adds no risk and rules out a data race on the shared
+// *demotionState's bad counter when two flows for the same exit and class
+// are placed concurrently.
+func (self *RemoteUserNatMultiClient) demotionObserve(clientId Id, class TrafficClass, good bool, needBad int) bool {
+	key := demotionKey{clientId: clientId, class: class}
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	if self.demotionStates == nil {
+		self.demotionStates = map[demotionKey]*demotionState{}
+	}
+	d, ok := self.demotionStates[key]
+	if !ok {
+		d = &demotionState{}
+		self.demotionStates[key] = d
+	}
+	return d.observe(good, needBad)
+}
+
+// demotionLogInterval bounds the `[rel] event=demote` emission rate. Once an
+// exit crosses its bad-interval threshold, demotionState.observe reports
+// "demoted" on every subsequent bad interval, not just the transition -- at
+// new-flow call frequency an un-throttled line here would flood the log
+// exactly like an un-throttled classify line would, so this reuses that same
+// sampling discipline rather than inventing a new one.
+var demotionLogThrottle = newLogThrottle(classifyLogInterval)
+
 // scoredPlacementReorder is the Phase 1 scored-placement path, called ONLY
 // when scoredPlacementEnabled is true (see the guarded branch in sendPacket's
 // coalesceOrderedClients). It NEVER changes which exits are eligible --
@@ -2580,12 +3097,39 @@ func (self *RemoteUserNatMultiClient) leastLoadedClients(clients []*multiClientC
 // promoting the scorer's pick to the front. The learner never overrides the
 // safety layer: membership is untouched, only order.
 //
-// classifyOrUnknown is nil-safe, so an unset flowClassifier (every build
-// today -- no classifier implementation exists yet; it lands in a later
-// phase) always classifies ClassUnknown, which returns candidates completely
+// READ THIS BEFORE ASSUMING THIS FUNCTION STEERS TRAFFIC. It does not, in the
+// shipped configuration. MultiRaceClientCount is 0 (see its default), so
+// raceOrderedClients is the WHOLE candidate list: every exit is dialed in
+// parallel and completeRace binds whichever responds with the lowest
+// MEASURED rtt, ignoring list order entirely. Most flows never race at all
+// (destination affinity short-circuits first). So promoting an exit to index
+// 0 changes goroutine launch order and the degenerate no-response lock-in,
+// and nothing else.
+//
+// An earlier revision of this comment said the way to make the scorer
+// load-bearing was to raise MultiRaceClientCount above 0. DO NOT DO THAT
+// without reading the rest of this paragraph: the wide race is the only
+// thing preventing rich-get-richer starvation ON THIS PATH, because a
+// measured exit outscores an unmeasured one badly enough to defeat
+// lessLoadedTieBreak. Narrowing the race to give the scorer influence buys
+// that influence by spending a guard, over the minority of flows that race
+// at all.
+//
+// The learner is instead made load-bearing where the flows actually are:
+// ScoredAffinityDonor, on inheritAffinityClient{4,6}WithLock -- the FIRST of
+// sendUpdate's four placement steps, and the one that places most flows.
+// That knob costs no guard (MaxFlowsPerExit still gates the affinity path)
+// and cannot break site egress-ip consistency (its comparison only decides
+// anything for a group already spread across several exits). See its field
+// comment for the full argument.
+//
+// classifyOrUnknown is nil-safe, so an unset flowClassifier (every build by
+// default -- LightClassifier, Task 2's install knob, is zero-value-off)
+// always classifies ClassUnknown, which returns candidates completely
 // untouched: there is nothing to score against. This is what makes turning
-// ScoredPlacement on, by itself, a no-op today -- behavior only ever
-// *refines*, never regresses, once a real classifier is installed.
+// ScoredPlacement on, by itself, a no-op with no classifier installed --
+// behavior only ever *refines*, never regresses, once a real classifier is
+// installed.
 func (self *RemoteUserNatMultiClient) scoredPlacementReorder(candidates []*multiClientChannel, ipPath *IpPath, appId string) []*multiClientChannel {
 	if len(candidates) < 2 {
 		// nothing to reorder
@@ -2596,7 +3140,32 @@ func (self *RemoteUserNatMultiClient) scoredPlacementReorder(candidates []*multi
 	if p := self.flowClassifier.Load(); p != nil {
 		classifier = *p
 	}
-	class := classifyOrUnknown(classifier, ipPath, appId).Class
+	flowClass := classifyOrUnknown(classifier, ipPath, appId)
+	class := flowClass.Class
+
+	// [rel] event=classify, SAMPLED via classifyLogThrottle rather than
+	// per-flow: this runs at new-flow frequency on the placement path, and a
+	// per-flow line would flood the log at flow-storm rates (a page load
+	// opening dozens of connections at once). One line per
+	// classifyLogInterval is enough to prove the classifier is alive in a
+	// field capture without paying flood cost; the throttle's own suppressed
+	// counter is folded in so the capture also shows how much was elided.
+	// Emitted for every call (including ClassUnknown) so a capture can also
+	// show the classifier declining to name a class, not just its hits.
+	if ok, suppressed := classifyLogThrottle.Allow(time.Now()); ok {
+		port := 0
+		if ipPath != nil {
+			port = ipPath.DestinationPort
+		}
+		loggerOrDefault(self.log).Infof("%s\n", relEvent(
+			"classify",
+			"class", class,
+			"app", flowClass.AppId,
+			"port", port,
+			"suppressed", suppressed,
+		))
+	}
+
 	if class == ClassUnknown {
 		// no classifier installed, or it declined to name a class: nothing to
 		// score against, so the field stands in the legacy order raceCandidates
@@ -2606,14 +3175,13 @@ func (self *RemoteUserNatMultiClient) scoredPlacementReorder(candidates []*multi
 
 	// flow counts are parent-lock state (the same bookkeeping
 	// leastLoadedClients reads above), gathered in one locked pass and then
-	// scored with no lock held. WindowStats (the per-exit goodput source used
-	// elsewhere in this file, e.g. the resize pass) has the side effect of
-	// advancing the channel's healthy/unhealthy duration bookkeeping, tuned
-	// for that pass's ~15s cadence -- calling it here, at new-flow frequency,
-	// would perturb that state at a much higher rate for no benefit yet. So
-	// RttMillis, GoodputBytesPerSec, and Jitter are left at their zero value
-	// (see exitMetricsSnapshot); real per-exit telemetry for those is future
-	// work, once a side-effect-free accessor exists.
+	// scored with no lock held. The rest of exitMetricsSnapshot's inputs
+	// (windowStatsWithCoalesce(false), quarantineReconvictionCount,
+	// rttEwmaSnapshot) each take only their OWN channel's stateLock, in their
+	// own short critical section -- never the parent lock, never held across
+	// another call -- so gathering them per-candidate below is the same
+	// no-lock-across-a-call discipline as this flow-count pass, just without
+	// the need to pre-gather into a map first.
 	flowCounts := make(map[*multiClientChannel]int, len(candidates))
 	func() {
 		self.stateLock.Lock()
@@ -2630,17 +3198,61 @@ func (self *RemoteUserNatMultiClient) scoredPlacementReorder(candidates []*multi
 	// scores are byte-for-byte exitScore(...) with no penalty applied --
 	// exactly as before this task.
 	reentryRamp := self.reliabilitySettings().QuarantineReentryRamp
+	// PlacementDemoteConsecutive's zero value must be inert -- today's
+	// behavior (before this task, and with the knob left unset) is no
+	// demotion at all. demotionState.observe treats needBad<=1 as
+	// act-on-every-sample, NOT as off, so needBad<=0 is guarded at the call
+	// site below rather than passed through into observe.
+	needBad := self.reliabilitySettings().PlacementDemoteConsecutive
+
+	incumbentScore := exitScore(exitMetricsSnapshot(candidates[0], flowCounts[candidates[0]]), weights) - candidates[0].reentryPenalty(reentryRamp)
 
 	bestIndex := 0
 	bestFlows := flowCounts[candidates[0]]
-	bestScore := exitScore(exitMetricsSnapshot(bestFlows), weights) - candidates[0].reentryPenalty(reentryRamp)
+	bestScore := incumbentScore
+	// plainBest tracks the highest raw score with NO hysteresis or load
+	// tie-break applied. demotionState ownership (below) needs to know
+	// whether a challenger has genuinely outscored the incumbent this round,
+	// independent of whether hysteresis was sticky enough to keep bestIndex
+	// at 0 -- that stickiness is exactly what N-of-M demotion exists to
+	// eventually override.
+	plainBestIndex := 0
+	plainBestScore := incumbentScore
 	for i := 1; i < len(candidates); i++ {
 		flows := flowCounts[candidates[i]]
-		score := exitScore(exitMetricsSnapshot(flows), weights) - candidates[i].reentryPenalty(reentryRamp)
+		score := exitScore(exitMetricsSnapshot(candidates[i], flows), weights) - candidates[i].reentryPenalty(reentryRamp)
 		if lessLoadedTieBreak(bestScore, score, bestFlows, flows, hysteresisPct) {
 			bestIndex, bestScore, bestFlows = i, score, flows
 		}
+		if score > plainBestScore {
+			plainBestIndex, plainBestScore = i, score
+		}
 	}
+
+	// demotionState ownership: an incumbent hysteresis is still protecting
+	// (bestIndex still 0) but that a challenger has genuinely, if mildly,
+	// outscored for needBad consecutive rounds gets re-ranked anyway -- a
+	// single noisy round never does this (demotionState's N-of-M smoothing
+	// absorbs it), but persistent quiet underperformance is not noise. This
+	// only ever moves bestIndex to plainBestIndex, one candidate already in
+	// this call's field -- never adds or removes a candidate, so membership
+	// stays exactly what raceCandidates decided.
+	if needBad > 0 {
+		bad := plainBestScore > incumbentScore
+		demoted := self.demotionObserve(candidates[0].ClientId(), class, !bad, needBad)
+		if demoted && bestIndex == 0 {
+			if ok, suppressed := demotionLogThrottle.Allow(time.Now()); ok {
+				loggerOrDefault(self.log).Infof("%s\n", relEvent(
+					"demote",
+					"exit", candidates[0].ClientId(),
+					"class", class,
+					"suppressed", suppressed,
+				))
+			}
+			bestIndex = plainBestIndex
+		}
+	}
+
 	if bestIndex == 0 {
 		return candidates
 	}
@@ -2655,21 +3267,69 @@ func (self *RemoteUserNatMultiClient) scoredPlacementReorder(candidates []*multi
 	return reordered
 }
 
-// exitMetricsSnapshot builds the scorer's read of one candidate from what is
-// safely available on the placement path today: Flows, the same live
-// flow-cap bookkeeping leastLoadedClients already reads. RttMillis,
-// GoodputBytesPerSec, and Jitter have no per-exit accessor that is safe to
-// call at new-flow frequency without perturbing the resize pass's health
-// bookkeeping (see scoredPlacementReorder) and StallEvents has no per-exit
-// counter in this file at all yet (stall state here is a boolean, not a
-// count). All four are left at their zero value, which contributes the SAME
-// constant to every candidate's score (see exitScore's hostile-input guards,
-// which already treat a zero RTT/Jitter/StallEvents as a valid, sanitized
-// input) -- so today scoredPlacementReorder reduces to the less-loaded
-// tie-break among classified candidates. Wiring real per-exit telemetry is
-// later-phase work; see the Task 8 report for the reasoning.
-func exitMetricsSnapshot(flows int) ExitMetrics {
-	return ExitMetrics{Flows: flows}
+// exitMetricsSnapshot builds the scorer's read of one candidate, entirely
+// from non-coalescing accessors -- no lock held across a call, no I/O, no
+// blocking, safe at new-flow frequency:
+//
+//   - Flows is the caller's own flow-count read (leastLoadedClients' same
+//     bookkeeping), passed in rather than re-read here.
+//   - GoodputBytesPerSec comes from windowStatsWithCoalesce(false), the
+//     NON-coalescing twin of WindowStats(). It is NOT side-effect-free: it
+//     still writes maxEffectiveByteCountPerSecond, healthy, lastHealthy/
+//     UnhealthyTime and the healthy/unhealthy durations. It is safe here only
+//     because orderedClients() already calls the COALESCING WindowStats() on
+//     every client on this same path at this same frequency, so this is a
+//     strictly weaker duplicate rather than new perturbation. WindowStats()
+//     itself must
+//     NEVER be called from this path: it coalesces event buckets and
+//     perturbs the resize pass's ~15s cadence bookkeeping.
+//   - StallEvents is quarantineReconvictionCount(): this channel's completed
+//     bench-then-lift cycle count. A hard send-stall conviction removes the
+//     channel outright (convictSendStalls), so a convicted exit is never a
+//     candidate here at all -- reconvictions are the chronic-misbehavior
+//     signal that survives while still in the window.
+//   - RttMillis/Jitter come from rttEwmaSnapshot, this channel's own
+//     send-to-ack EWMA (see addSendRttSample). Nothing else in this file
+//     timed a round trip before this task (see the field comment beside
+//     rttEwmaMillis).
+//
+// THE ZERO-RTT TRAP: exitScore sanitizes a bare 0 RTT/Jitter into the BEST
+// possible sub-score (routing_score.go), the same treatment it gives a
+// genuinely excellent measurement. A zero is therefore not a neutral
+// "unknown" -- it is a maximal bonus, and an unmeasured exit would outrank
+// every measured one. So an exit with no completed round trip yet (rttOk
+// false: every bare test fixture, and a real channel before its first ack)
+// reports RttMillis/Jitter as math.NaN(), NOT 0 -- exitScore's existing
+// hostile-input guard already sanitizes NaN to the WORST sub-score (0.0),
+// exactly the intended "unmeasured must not beat measured" reading, reusing
+// tested code instead of adding a second convention. jitterOk is gated one
+// sample stricter than rttOk (a single round trip has no deviation to
+// report yet), so a channel with exactly one sample reports a real RttMillis
+// but NaN Jitter -- consistent with the same rule.
+func exitMetricsSnapshot(client *multiClientChannel, flows int) ExitMetrics {
+	m := ExitMetrics{
+		Flows:     flows,
+		RttMillis: math.NaN(),
+		Jitter:    math.NaN(),
+	}
+	if client == nil {
+		return m
+	}
+
+	if stats, _ := client.windowStatsWithCoalesce(false); stats != nil {
+		m.GoodputBytesPerSec = float64(stats.EffectiveByteCountPerSecond())
+	}
+
+	m.StallEvents = client.quarantineReconvictionCount()
+
+	if rttMillis, jitterMillis, rttOk, jitterOk := client.rttEwmaSnapshot(); rttOk {
+		m.RttMillis = rttMillis
+		if jitterOk {
+			m.Jitter = jitterMillis
+		}
+	}
+
+	return m
 }
 
 // bindClientFlow records that a flow is now committed to client, which is what
@@ -2755,8 +3415,66 @@ func (self *RemoteUserNatMultiClient) clientAtFlowCapWithLock(client *multiClien
 	return maxFlows <= len(self.clientUpdates[client])
 }
 
-// inheritAffinityClient4WithLock adopts the most recently joined healthy client
-// in an affinity group. Only ever called with `update.client` nil -- it must
+// affinityDonorBias is the learner's read at the affinity placement point:
+// this exit's provider identity, looked up in the priors the reward tap has
+// been accumulating (and that PriorsStore persists across restarts).
+//
+// Answers priorsNeutralBias whenever there is nothing learned to say -- no
+// priors created yet, or a channel with no resolvable provider identity -- so
+// an unrankable donor neither wins nor loses against a known-neutral one.
+// Deliberately NOT the zero-rtt trap's shape: 0.5 is the middle of Bias's
+// range, not an extreme, so "unknown" cannot outrank a good measured provider
+// the way a bare 0 rtt outranks a real measurement in exitScore.
+//
+// Locking: called with stateLock held. rewardLock is a leaf (see its field
+// comment) and is taken here only to read the lazily-created providerPriors
+// POINTER. Bias synchronizes on ProviderPriors' OWN mutex and is called with
+// rewardLock already released, so this adds one uncontended leaf acquisition
+// to the placement path and never nests two hot locks. Nothing here calls
+// windowStatsWithCoalesce: that accessor is safe on the race path only
+// because orderedClients has already called its coalescing twin at the same
+// frequency, and affinity placement never calls orderedClients at all.
+//
+// called with stateLock
+func (self *RemoteUserNatMultiClient) affinityDonorBias(client *multiClientChannel) float64 {
+	providerId, ok := providerIdentity(client)
+	if !ok {
+		return priorsNeutralBias
+	}
+	self.rewardLock.Lock()
+	priors := self.providerPriors
+	self.rewardLock.Unlock()
+	if priors == nil {
+		return priorsNeutralBias
+	}
+	return priors.Bias(providerId.String())
+}
+
+// betterAffinityDonor ranks two eligible donors under ScoredAffinityDonor:
+// higher bias wins, then the legacy recency rule, then provider id ascending
+// so an otherwise exact tie resolves identically on every pass instead of
+// following Go's randomized map iteration order. Donors equal on all three are
+// interchangeable and the scan keeps whichever it saw first.
+func betterAffinityDonor(
+	bias float64,
+	createTime time.Time,
+	providerId string,
+	bestBias float64,
+	bestCreateTime time.Time,
+	bestProviderId string,
+) bool {
+	if bias != bestBias {
+		return bias > bestBias
+	}
+	if !createTime.Equal(bestCreateTime) {
+		return createTime.After(bestCreateTime)
+	}
+	return providerId < bestProviderId
+}
+
+// inheritAffinityClient4WithLock adopts a healthy client in an affinity group:
+// the most recently joined one, or -- under ScoredAffinityDonor -- the one the
+// learner rates highest, falling back to recency on a tie. Only ever called with `update.client` nil -- it must
 // never repoint a flow that already has a client, since providers terminate tcp
 // and a moved flow is a broken flow.
 //
@@ -2786,22 +3504,51 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *mul
 		follow = true
 		window = pinnedFollowWindow(window)
 	}
+	scored := reliabilitySettings.ScoredAffinityDonor
 	var mostRecentCreateTime time.Time
+	var bestBias float64
+	var bestProviderId string
 	winnerVerdict, scattered := donorRefused, false
 	for copyIp4Path, createTime := range paths {
-		if copyUpdate, ok := self.ip4PathUpdates[copyIp4Path]; ok {
-			if c := copyUpdate.client.Load(); c != nil && !c.IsDone() && (sticky || !self.clientAtFlowCapWithLock(c)) && createTime.After(mostRecentCreateTime) {
-				switch verdict := c.affinityDonorEligible(follow, window); verdict {
-				case donorEligible, donorQuarantineFollowed:
-					// donorQuarantineFollowed is the G-1 follow: a benched
-					// donor inside the follow window keeps its own site
-					mostRecentCreateTime = createTime
-					update.client.Store(c)
-					winnerVerdict = verdict
-				case donorQuarantineScattered:
-					scattered = true
+		copyUpdate, ok := self.ip4PathUpdates[copyIp4Path]
+		if !ok {
+			continue
+		}
+		c := copyUpdate.client.Load()
+		if c == nil || c.IsDone() || (!sticky && self.clientAtFlowCapWithLock(c)) {
+			continue
+		}
+		// off: the legacy short-circuit, preserved exactly -- a donor no more
+		// recent than the current best is never even asked for its verdict.
+		// On, every candidate must be evaluated to be ranked, which is the one
+		// documented behavior difference (see ScoredAffinityDonor): quarantined
+		// donors the legacy scan skipped now report their scatter.
+		if !scored && !createTime.After(mostRecentCreateTime) {
+			continue
+		}
+		switch verdict := c.affinityDonorEligible(follow, window); verdict {
+		case donorEligible, donorQuarantineFollowed:
+			// donorQuarantineFollowed is the G-1 follow: a benched
+			// donor inside the follow window keeps its own site
+			bias, providerId := 0.0, ""
+			if scored {
+				bias = self.affinityDonorBias(c)
+				if id, idOk := providerIdentity(c); idOk {
+					providerId = id.String()
+				}
+				if winnerVerdict != donorRefused && !betterAffinityDonor(
+					bias, createTime, providerId,
+					bestBias, mostRecentCreateTime, bestProviderId,
+				) {
+					continue
 				}
 			}
+			bestBias, bestProviderId = bias, providerId
+			mostRecentCreateTime = createTime
+			update.client.Store(c)
+			winnerVerdict = verdict
+		case donorQuarantineScattered:
+			scattered = true
 		}
 	}
 	return winnerVerdict, scattered
@@ -2821,20 +3568,44 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient6WithLock(update *mul
 		follow = true
 		window = pinnedFollowWindow(window)
 	}
+	scored := reliabilitySettings.ScoredAffinityDonor
 	var mostRecentCreateTime time.Time
+	var bestBias float64
+	var bestProviderId string
 	winnerVerdict, scattered := donorRefused, false
 	for copyIp6Path, createTime := range paths {
-		if copyUpdate, ok := self.ip6PathUpdates[copyIp6Path]; ok {
-			if c := copyUpdate.client.Load(); c != nil && !c.IsDone() && (sticky || !self.clientAtFlowCapWithLock(c)) && createTime.After(mostRecentCreateTime) {
-				switch verdict := c.affinityDonorEligible(follow, window); verdict {
-				case donorEligible, donorQuarantineFollowed:
-					mostRecentCreateTime = createTime
-					update.client.Store(c)
-					winnerVerdict = verdict
-				case donorQuarantineScattered:
-					scattered = true
+		copyUpdate, ok := self.ip6PathUpdates[copyIp6Path]
+		if !ok {
+			continue
+		}
+		c := copyUpdate.client.Load()
+		if c == nil || c.IsDone() || (!sticky && self.clientAtFlowCapWithLock(c)) {
+			continue
+		}
+		if !scored && !createTime.After(mostRecentCreateTime) {
+			continue
+		}
+		switch verdict := c.affinityDonorEligible(follow, window); verdict {
+		case donorEligible, donorQuarantineFollowed:
+			bias, providerId := 0.0, ""
+			if scored {
+				bias = self.affinityDonorBias(c)
+				if id, idOk := providerIdentity(c); idOk {
+					providerId = id.String()
+				}
+				if winnerVerdict != donorRefused && !betterAffinityDonor(
+					bias, createTime, providerId,
+					bestBias, mostRecentCreateTime, bestProviderId,
+				) {
+					continue
 				}
 			}
+			bestBias, bestProviderId = bias, providerId
+			mostRecentCreateTime = createTime
+			update.client.Store(c)
+			winnerVerdict = verdict
+		case donorQuarantineScattered:
+			scattered = true
 		}
 	}
 	return winnerVerdict, scattered
@@ -3197,6 +3968,18 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 					}
 				}
 
+				// the reward tap's per-flow half (Task 5): this flow has just
+				// finished, so this is the flow-close path RewardInstrumentation
+				// consults. No lock is held here -- the locked section above
+				// already returned. client != nil is checked here only because
+				// client.flowCount() is not nil-safe; recordFlowReward itself is
+				// the single authoritative RewardInstrumentation gate (checked
+				// once, inside it, not pre-checked here too) and a no-op (no
+				// allocation, no I/O) whenever the knob is off.
+				if client != nil {
+					self.recordFlowReward(ipPath, update.pinAppId, client, client.flowCount())
+				}
+
 				select {
 				case <-self.ctx.Done():
 				case <-update.ctx.Done():
@@ -3360,6 +4143,11 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 					if success {
 						break
 					}
+				}
+
+				// the reward tap's per-flow half (see the v4 twin)
+				if client != nil {
+					self.recordFlowReward(ipPath, update.pinAppId, client, client.flowCount())
 				}
 
 				select {
@@ -3566,6 +4354,26 @@ func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 		// note client must be marked as done, otherwise it may be re-added by updates in flight
 		if !client.IsDone() {
 			self.log.Errorf("[multi]removed client that is not marked as done. This might lead to memory leak.")
+		}
+
+		// evict this exit's demotion streaks (every class) now that its
+		// channel is gone -- see demotionKey's doc for why this, and not a
+		// size-bound LRU like qualification's, is the right lifecycle for
+		// this particular map: an unbounded map keyed by exit identity would
+		// otherwise leak across a long session's churn.
+		//
+		// THIS MUST STAY ABOVE the clientUpdates lookup below. That lookup
+		// returns early when the exit never had a flow bound to it, and
+		// demotionObserve creates an entry for whichever exit is at the head
+		// of the candidate list whether or not it ever wins a race -- so an
+		// exit that is repeatedly ranked first and never chosen is exactly
+		// the case that leaks. Evicting after the early return covered only
+		// the exits that could never leak.
+		clientId := client.ClientId()
+		for key := range self.demotionStates {
+			if key.clientId == clientId {
+				delete(self.demotionStates, key)
+			}
 		}
 
 		updates, ok := self.clientUpdates[client]
@@ -6066,6 +6874,32 @@ func (self *RemoteUserNatMultiClient) Exits() []*ExitInfo {
 		return a.ClientId.Cmp(b.ClientId)
 	})
 	return exits
+}
+
+// exitTelemetrySnapshot gathers this session's live per-exit ExitMetrics for
+// the heartbeat line, using exactly the same non-coalescing accessors
+// exitMetricsSnapshot uses for scoring (windowStatsWithCoalesce(false),
+// quarantineReconvictionCount, rttEwmaSnapshot) -- so what the heartbeat
+// reports is what the scorer actually saw, not a second, drifting readout.
+// Same walk shape as Exits() (every window, every client, no lock held
+// across a channel's own accessors), and the same nil-safe reading of a
+// window with nothing in it. Flows is left at 0: the heartbeat already
+// reports total flow count from Exits()' own walk, and this readout only
+// exists for the goodput/rtt aggregate beside it.
+func (self *RemoteUserNatMultiClient) exitTelemetrySnapshot() []ExitMetrics {
+	if self == nil {
+		return nil
+	}
+	var telemetry []ExitMetrics
+	for _, window := range self.windows {
+		if window == nil {
+			continue
+		}
+		for _, client := range window.unorderedClients() {
+			telemetry = append(telemetry, exitMetricsSnapshot(client, 0))
+		}
+	}
+	return telemetry
 }
 
 // DestinationExit is one (destination ip, exit) pairing in the live flow
@@ -9034,7 +9868,23 @@ func (self *multiClientWindow) Close() {
 	for _, client := range removedClients {
 		client.Close()
 	}
-	// self.removeClients(removedClients)
+	// DELIBERATELY NOT self.removeClients(removedClients) -- but the reason is
+	// worth stating, because the bare commented-out call above invited exactly
+	// the wrong fix.
+	//
+	// removeClients does TWO things: it emits ProviderStateRemoved to the
+	// monitor, and it invokes clientRemoveCallback (multiClient.removeClient),
+	// which migrates the dying exit's flows onto replacement exits. The second
+	// is meaningless here -- this is session teardown, every replacement was
+	// just closed in the loop above -- so calling removeClients wholesale would
+	// have every exit try to rebind its flows onto corpses.
+	//
+	// The cost of skipping it is that providers leave no removal record at
+	// session close. That is a real observability gap (issue #51), and the fix
+	// is to emit the monitor event WITHOUT the migration callback -- not to
+	// uncomment this line. Note #51's reported symptom is a MID-SESSION
+	// self-close, which is a different path than this one; this is a second,
+	// confirmed instance of the same class, not necessarily its cause.
 }
 
 func (self *multiClientWindow) removeClients(removedClients ...*multiClientChannel) {
@@ -9377,18 +10227,30 @@ type multiClientChannel struct {
 	// as quarantineMigrated and the rest of the episode bookkeeping beside
 	// it, not new durable state. Guarded by stateLock.
 	//
-	// KNOWN LIMITATION, tracked separately, not yet fixed: this counter never
-	// DECAYS within a session -- a provider that flaps early and then runs
-	// clean for hours still escalates straight to the 240s cap on its next
-	// bench rather than re-starting at 60s. The blast radius is bounded and
-	// self-healing even so: the worst case is a stale-bad exit taking up to
-	// 240s instead of 60s to be force-evicted by the expiry escape, and
-	// release-on-receive-progress (addReceiveAck's clear, unrelated to this
-	// counter) remains a fully independent per-poll acquittal path this
-	// cannot delay -- a genuinely recovered exit is never held past the
-	// evidence that acquits it. Clean-interval decay analogous to
-	// quarantineMemoryDuration should land before QuarantineDampening is
-	// ever turned on for real traffic.
+	// With QuarantineDampening on, this field is a decaying (leaky-bucket
+	// style) count kept up to date at TWO points, both sharing the same pure
+	// quarantineReconvictionDecay math and the same quarantineLiftTime
+	// anchor (so a fresh conviction resets the decay clock for free -- no
+	// separate field to keep in sync):
+	//   - on WRITE (clearQuarantineWithLock): decay-then-increment. The OLD
+	//     quarantineLiftTime is read and folded into this field via
+	//     quarantineReconvictionDecay BEFORE it is overwritten and this
+	//     lift's +1 is added -- so a count that decayed to a read of 0
+	//     during a long quiet interval is stored back as 1 at the next
+	//     conviction, not the historical peak + 1. This is what makes the
+	//     decay durable across the count's next climb rather than a view
+	//     that evaporates the instant this channel reconvicts.
+	//   - on READ (quarantineReconvictionCount): the same decay is applied
+	//     again, non-destructively, against elapsed time since that same
+	//     quarantineLiftTime -- this is what lets a STILL-OPEN episode's
+	//     benchDuration/StallEvents reading shrink as it sits quiet, before
+	//     its own eventual lift ever runs the write-side fold.
+	// QuarantineDampening off keeps both sites exactly what they were before
+	// decay existed: the write site is exactly self.quarantineReconvictions++,
+	// and the read site returns this field verbatim with no clock read at
+	// all -- so a default build's benchDuration, and the StallEvents
+	// telemetry this field also feeds (see exitMetricsSnapshot), stay
+	// byte-for-byte what they were before decay existed.
 	quarantineReconvictions int
 
 	// pendingSendTime is when the current run of unacked sends began, reset on
@@ -9455,6 +10317,30 @@ type multiClientChannel struct {
 	// fault rather than an outage (see comparativeConnectTimeout's
 	// recentOwnSendAck arm). Guarded by stateLock, like lastReceiveAckTime.
 	lastSendAckTime time.Time
+
+	// rttEwmaMillis/rttJitterMillis/rttSamples are the placement scorer's only
+	// source of per-exit round-trip time (see exitMetricsSnapshot). Nothing
+	// on the transfer layer timed a send-ack round trip before this:
+	// SendDetailedMessage just relays an opaque ackCallback, and the busy
+	// probe's own wait (busyLivenessProbe) only measures elapsed time to
+	// detect a suspended scheduler and throws the duration away. So this
+	// channel times it itself -- SendDetailedWithAck's ackCallback captures
+	// the send instant in its closure and folds time.Since(that) in here on a
+	// successful ack, via addSendRttSample.
+	//
+	// rttEwmaMillis smooths with the classic 1/8 TCP SRTT weight (RFC 6298);
+	// rttJitterMillis is the matching RTTVAR-style mean absolute deviation,
+	// seeded (not smoothed) from the first gap since a single sample has no
+	// deviation to report. rttSamples is the fold count: 0 means "never
+	// completed a timed send-ack round trip", which rttEwmaSnapshot reports
+	// as rttOk=false rather than as a fabricated 0ms. This matters because
+	// exitScore sanitizes a bare 0 RTT into the BEST possible sub-score (see
+	// routing_score.go) -- a channel with no measurement must read as
+	// unmeasured, never as a perfect one. Guarded by stateLock like every
+	// other field in this block.
+	rttEwmaMillis   float64
+	rttJitterMillis float64
+	rttSamples      int
 
 	// stalled is a test/diagnostic hook, set only by StallExit. Read on the
 	// send hot path, so an atomic rather than the state lock.
@@ -9844,6 +10730,14 @@ func (self *multiClientChannel) effectiveTier() int {
 }
 
 func (self *multiClientChannel) EstimatedByteCountPerSecond() ByteCount {
+	// nil-safe like the other self.args readers in this file (see
+	// clientReceive's `self.args != nil` guard): a channel built without args
+	// -- every routing-scorer test fixture that only cares about flow counts
+	// -- has nothing estimated yet, which is the same fact this returns for a
+	// channel with args but no traffic.
+	if self.args == nil {
+		return ByteCount(0)
+	}
 	return self.args.EstimatedBytesPerSecond
 }
 
@@ -9943,13 +10837,38 @@ func (self *multiClientChannel) clearQuarantine() {
 func (self *multiClientChannel) clearQuarantineWithLock() {
 	if self.quarantined {
 		self.survivedQuarantine = true
-		self.quarantineLiftTime = time.Now()
-		self.quarantineLiftConnectSeen = false
+		now := time.Now()
 		// this episode is now a completed cycle, so the NEXT bench (if any)
 		// escalates one step; see quarantineReconvictions and benchDuration.
 		// A no-op lift (already clear, the branch above did not run) must not
 		// count -- there was no episode to have completed.
-		self.quarantineReconvictions++
+		//
+		// QuarantineDampening on: decay-then-increment, not increment then
+		// decay-on-read. quarantineReconvictionCount()'s read-side decay is a
+		// pure lens over this field and quarantineLiftTime -- it can shrink
+		// what a still-open episode reads, but it never writes anything
+		// back, so on its own a count that decayed to a read of 0 during a
+		// long quiet interval would resume climbing from the historical raw
+		// peak the instant this channel reconvicts (raw+1, not 0+1) --
+		// resurrecting exactly the convictions the decay exists to forgive.
+		// Folding the SAME decay math into the stored value here, using the
+		// OLD quarantineLiftTime read below before this line overwrites it,
+		// makes the forgiveness durable across the count's next climb
+		// instead of a view that evaporates on the next event. No second
+		// timestamp field: the existing anchor need only be read once, right
+		// before it moves.
+		//
+		// QuarantineDampening off: exactly self.quarantineReconvictions++,
+		// byte-for-byte -- the dampening check keeps the stored counter from
+		// ever depending on the clock, matching quarantineReconvictionCount's
+		// own off-path guarantee.
+		if self.reliabilitySettings().QuarantineDampening {
+			self.quarantineReconvictions = quarantineReconvictionDecay(self.quarantineReconvictions, now.Sub(self.quarantineLiftTime)) + 1
+		} else {
+			self.quarantineReconvictions++
+		}
+		self.quarantineLiftTime = now
+		self.quarantineLiftConnectSeen = false
 	}
 	self.quarantined = false
 	self.quarantineReason = blackholeNone
@@ -10013,12 +10932,66 @@ func (self *multiClientChannel) quarantineState() (blackholeReason, time.Time) {
 	return self.quarantineReason, self.quarantineStart
 }
 
+// quarantineReconvictionDecayInterval is the clean interval one reconviction
+// step decays over: quarantineReconvictionCount() removes one step from the
+// raw count for every whole interval elapsed since quarantineLiftTime, the
+// stamp of the LAST completed bench-then-lift cycle (the same instant
+// quarantineReconvictions itself advances on -- see clearQuarantineWithLock
+// -- so a fresh conviction resets this clock for free). Set equal to
+// quarantineMemoryDuration: the existing answer this file already gives for
+// "how long counts as a clean interval" for the sibling survived-quarantine
+// memory, reused rather than inventing a second opinion on the same
+// question -- though the two remain independent constants should they ever
+// need to diverge.
+const quarantineReconvictionDecayInterval = quarantineMemoryDuration
+
+// quarantineReconvictionDecay returns reconvictions with one step removed
+// for every whole quarantineReconvictionDecayInterval elapsed is worth,
+// floored at 0. A non-positive reconvictions or a non-positive elapsed (a
+// clock problem, not evidence of a longer clean interval -- the same
+// convention reentryScorePenalty's elapsed<0 clamp uses) both read as "no
+// decay to apply" rather than propagating toward a negative result: a
+// negative count feeding benchDuration or exitScore's StallEvents term is
+// exactly the defect class this branch has already shipped twice (negative
+// StallEvents scoring as a bonus, a zero RTT scoring best), so this must
+// never produce one. Pure: no clock reads, no locks -- mirrors benchDuration
+// and reentryScorePenalty.
+func quarantineReconvictionDecay(reconvictions int, elapsed time.Duration) int {
+	if reconvictions <= 0 {
+		return 0
+	}
+	if elapsed <= 0 {
+		return reconvictions
+	}
+	decayed := reconvictions - int(elapsed/quarantineReconvictionDecayInterval)
+	if decayed < 0 {
+		return 0
+	}
+	return decayed
+}
+
 // quarantineReconvictionCount reads the completed bench-then-lift cycle
-// count benchDuration escalates on; see the field comment.
+// count benchDuration escalates on; see the field comment. With
+// QuarantineDampening on, the raw count is decayed by elapsed quiet time
+// since the last completed cycle (quarantineReconvictionDecay, above) before
+// being returned, so a channel that reconvicted long ago and has been clean
+// since reads a low count again rather than the historical peak. With the
+// knob at its zero value (off) this returns the raw field verbatim and does
+// not even read the clock -- so a default build's reading, and everything
+// downstream of it (benchDuration, and exitMetricsSnapshot's StallEvents),
+// stays byte-for-byte what it was before this decay existed.
 func (self *multiClientChannel) quarantineReconvictionCount() int {
+	// reliabilitySettings() is a bare atomic load (see its own comment),
+	// never blocking, so reading it before the lock adds no new lock
+	// ordering and keeps the locked section to the two fields below.
+	dampening := self.reliabilitySettings().QuarantineDampening
+
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	return self.quarantineReconvictions
+	if !dampening || self.quarantineLiftTime.IsZero() {
+		return self.quarantineReconvictions
+	}
+	return quarantineReconvictionDecay(self.quarantineReconvictions, time.Now().Sub(self.quarantineLiftTime))
 }
 
 // quarantineReentryElapsed reports how long it has been since this channel's
@@ -10551,6 +11524,71 @@ func (self *multiClientChannel) hasRecentSendAck(window time.Duration) bool {
 	return !self.lastSendAckTime.IsZero() && time.Since(self.lastSendAckTime) < window
 }
 
+// rttEwmaAlpha weights each new round-trip sample against the running
+// average. 1/8 is the classic TCP SRTT smoothing constant (RFC 6298) --
+// fast enough to track a real path change within a handful of samples,
+// slow enough that one spiky packet cannot swing the estimate into
+// implausible territory.
+const rttEwmaAlpha = 0.125
+
+// addSendRttSample folds one measured send-to-ack round trip into this
+// channel's smoothed RTT/jitter estimate. Called only from
+// SendDetailedWithAck's ackCallback, on a successful ack, with the elapsed
+// time since that specific packet's own send call -- never from a shared
+// clock like pendingSendTime, which measures the OLDEST outstanding send and
+// would misattribute the round trip under concurrent in-flight packets.
+//
+// A non-positive duration is not a real measurement (clock skew, or a test
+// driving the callback with a synthetic time) and is dropped rather than
+// folded in: exitScore reads a 0 RTT as the BEST possible sub-score, so
+// recording one here would be the same trap exitMetricsSnapshot's ok gating
+// exists to avoid, just moved one layer down.
+func (self *multiClientChannel) addSendRttSample(rtt time.Duration) {
+	if rtt <= 0 {
+		return
+	}
+	millis := float64(rtt) / float64(time.Millisecond)
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	if self.rttSamples == 0 {
+		self.rttEwmaMillis = millis
+	} else {
+		diff := millis - self.rttEwmaMillis
+		self.rttEwmaMillis += rttEwmaAlpha * diff
+		absDiff := math.Abs(diff)
+		if self.rttSamples == 1 {
+			// the first-ever deviation: seeded, not smoothed, the same
+			// convention RFC 6298 uses to initialize RTTVAR
+			self.rttJitterMillis = absDiff
+		} else {
+			self.rttJitterMillis += rttEwmaAlpha * (absDiff - self.rttJitterMillis)
+		}
+	}
+	self.rttSamples += 1
+}
+
+// rttEwmaSnapshot reads the current smoothed RTT/jitter estimate.
+// rttOk is false for a channel that has never completed a timed send-ack
+// round trip (every bare test fixture, and every real channel before its
+// first ack) -- callers MUST treat that as "no data", never as a 0ms
+// measurement (see exitMetricsSnapshot). jitterOk additionally requires a
+// SECOND sample: one round trip alone has no deviation to report, and
+// reporting 0 there would trip the same zero-is-best trap RTT itself is
+// guarded against.
+func (self *multiClientChannel) rttEwmaSnapshot() (rttMillis float64, jitterMillis float64, rttOk bool, jitterOk bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.rttSamples == 0 {
+		return 0, 0, false, false
+	}
+	if self.rttSamples == 1 {
+		return self.rttEwmaMillis, 0, true, false
+	}
+	return self.rttEwmaMillis, self.rttJitterMillis, true, true
+}
+
 // hasRecentReceive reports whether return traffic arrived on this channel
 // inside window -- the per-sibling half of the comparative connect cut's
 // evidence (see RemoteUserNatMultiClient.receivingChannelCount). Takes only
@@ -10989,6 +12027,11 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 	} else {
 		packetByteCount := ByteCount(len(parsedPacket.packet))
 		self.addSend(packetByteCount, parsedPacket.ipPath)
+		// sendTime anchors THIS packet's own round trip -- captured here rather
+		// than read back from pendingSendTime, which tracks the OLDEST
+		// outstanding send and would misattribute the RTT under concurrent
+		// in-flight packets. See addSendRttSample.
+		sendTime := time.Now()
 
 		// a stalled exit swallows the packet: reported sent, never acknowledged,
 		// and crucially no error -- an error would reset the flow immediately,
@@ -11010,6 +12053,7 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 		ackCallback := func(err error) {
 			if err == nil {
 				self.addSendAck(packetByteCount)
+				self.addSendRttSample(time.Since(sendTime))
 			} else {
 				self.addError(err)
 			}
@@ -12474,25 +13518,31 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 	for _, sourceCounts := range self.ip6DestinationSourceCount {
 		netSourceCount += len(sourceCounts)
 	}
-	if self.log.V(2).Enabled() {
+	// loggerOrDefault, not raw self.log: this accessor is now also called
+	// from the scored-placement path (exitMetricsSnapshot), which runs
+	// against bare test fixtures that carry no logger the same way several
+	// of this file's other placement-path helpers already tolerate a nil
+	// self.log would panic on a nil interface's method set.
+	log := loggerOrDefault(self.log)
+	if log.V(2).Enabled() {
 		for ip4Path, sourceCounts := range self.ip4DestinationSourceCount {
 			if isPublicPort(ip4Path.DestinationPort) {
 				if len(sourceCounts) == maxSourceCount {
-					self.log.Infof("[multi]max source count %d = %v\n", maxSourceCount, ip4Path)
+					log.Infof("[multi]max source count %d = %v\n", maxSourceCount, ip4Path)
 				}
 			}
 		}
 		for ip6Path, sourceCounts := range self.ip6DestinationSourceCount {
 			if isPublicPort(ip6Path.DestinationPort) {
 				if len(sourceCounts) == maxSourceCount {
-					self.log.Infof("[multi]max source count %d = %v\n", maxSourceCount, ip6Path)
+					log.Infof("[multi]max source count %d = %v\n", maxSourceCount, ip6Path)
 				}
 			}
 		}
 	}
 
 	stats := &clientWindowStats{
-		log:            self.log,
+		log:            log,
 		sourceCount:    maxSourceCount,
 		netSourceCount: netSourceCount,
 		// distinct destination paths with sends in the window: the maps are
@@ -12594,8 +13644,15 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 
 	err := self.endErr
 	if err == nil {
+		// a bare fixture may carry no context -- same pattern
+		// busyLivenessProbe uses. A nil channel never fires in a select, which
+		// is the right reading of "nothing has cancelled this".
+		var ctxDone <-chan struct{}
+		if self.ctx != nil {
+			ctxDone = self.ctx.Done()
+		}
 		select {
-		case <-self.ctx.Done():
+		case <-ctxDone:
 			err = errors.New("Done.")
 		case <-self.clientDone():
 			err = errors.New("Done.")

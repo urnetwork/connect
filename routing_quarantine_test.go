@@ -46,33 +46,45 @@ func TestBenchDurationNegativeReconvictionsClamped(t *testing.T) {
 	}
 }
 
-// TestDefaultMultiClientSettingsQuarantineKnobsZeroValueOff pins the actual
-// regression risk: a default build must behave exactly like today. If a
-// future well-meaning edit ever sets one of these in
-// DefaultMultiClientSettings, this test catches it before it ships and
-// silently opts every default build into flap damping or the re-entry ramp.
-func TestDefaultMultiClientSettingsQuarantineKnobsZeroValueOff(t *testing.T) {
+// TestDefaultMultiClientSettingsQuarantineKnobsMatchTask8Contract pins the
+// actual regression risk post-Task-8: DefaultMultiClientSettings must keep
+// QuarantineDampening on, while QuarantineReentryRamp -- deliberately NOT in
+// Task 8's list, its decay story is separate -- stays at 0. Renamed from
+// TestDefaultMultiClientSettingsQuarantineKnobsZeroValueOff, which asserted
+// the pre-Task-8 contract (both off); Task 8
+// (feat(routing): enable class-aware scored placement by default) is the one
+// task in the smart-routing phase permitted to change a default, and a
+// future well-meaning "restore the zero-value-off convention" edit would
+// silently revert every default build's flap damping. See also
+// routing_defaults_test.go for the full six-knob pin including the session
+// banner.
+func TestDefaultMultiClientSettingsQuarantineKnobsMatchTask8Contract(t *testing.T) {
 	s := DefaultMultiClientSettings()
-	if s.QuarantineDampening {
-		t.Fatal("DefaultMultiClientSettings must leave QuarantineDampening off (false)")
+	if !s.QuarantineDampening {
+		t.Fatal("DefaultMultiClientSettings must leave QuarantineDampening on (true)")
 	}
 	if s.QuarantineReentryRamp != 0 {
-		t.Fatal("DefaultMultiClientSettings must leave QuarantineReentryRamp at 0")
+		t.Fatal("DefaultMultiClientSettings must leave QuarantineReentryRamp at 0 (not in Task 8's scope)")
 	}
 }
 
 // TestNewQuarantineKnobsZeroValueOff asserts QuarantineDampening and
 // QuarantineReentryRamp follow the same zero-value-off contract as every
-// other ReliabilitySettings field: a nil override (or one built from an
-// older struct) must leave them off, and ReliabilitySettingsFrom must
-// faithfully copy each through when it is set.
+// other ReliabilitySettings field for a nil override (or one built from an
+// older struct): that must still leave them off, and ReliabilitySettingsFrom
+// must faithfully copy each through when it is set. This is the
+// backward-compatibility contract -- an old caller that never heard of these
+// fields must see exactly the pre-Phase-2 behavior -- which is orthogonal to
+// DefaultMultiClientSettings' own default, which Task 8 turns
+// QuarantineDampening on for (see
+// TestDefaultMultiClientSettingsQuarantineKnobsMatchTask8Contract above).
 //
 // The copy-fidelity half deliberately does NOT source its input from
-// DefaultMultiClientSettings(): the zero-value-off requirement means the
-// defaults leave both knobs at false/0, so a comparison built on the
-// defaults (got.X != s.X) is false != false regardless of whether
-// ReliabilitySettingsFrom copies the field at all -- deleting the copy line
-// entirely would still pass. Instead an explicit, fully-populated
+// DefaultMultiClientSettings(): Task 8 means the defaults no longer leave
+// both knobs at false/0, so a comparison built on the defaults (got.X !=
+// s.X) would be true != true regardless of whether ReliabilitySettingsFrom
+// copies the field at all -- deleting the copy line entirely could still
+// pass by coincidence. Instead an explicit, fully-populated
 // MultiClientSettings is round-tripped, with distinct non-zero values (true
 // / 45s, not the same value twice) so a copy line wired to the wrong source
 // field is caught too, not just a missing one.
@@ -80,11 +92,6 @@ func TestNewQuarantineKnobsZeroValueOff(t *testing.T) {
 	z := ReliabilitySettingsFrom(nil) // nil -> zero value
 	if z.QuarantineDampening || z.QuarantineReentryRamp != 0 {
 		t.Fatal("new quarantine knobs must be zero-value-off (legacy behavior)")
-	}
-
-	d := DefaultMultiClientSettings()
-	if d.QuarantineDampening || d.QuarantineReentryRamp != 0 {
-		t.Fatal("DefaultMultiClientSettings must leave the new quarantine knobs zero-value-off")
 	}
 
 	src := &MultiClientSettings{
@@ -152,6 +159,161 @@ func TestQuarantineReconvictionsSurviveReceiveProgressRelease(t *testing.T) {
 	AssertEqual(t, client.isQuarantined(), false)
 	if got := client.quarantineReconvictionCount(); got != 1 {
 		t.Fatalf("a receive-progress release must still advance reconvictions, got %d", got)
+	}
+}
+
+// TestQuarantineReconvictionDecaySteps is the pure decay math Task 6 adds:
+// one step removed per whole quarantineReconvictionDecayInterval of elapsed
+// time, floored at 0, with both a negative count and a negative elapsed
+// (clock trouble, not evidence of a longer clean interval -- the same
+// convention reentryScorePenalty's elapsed<0 clamp already uses) reading as
+// "no decay to apply" rather than propagating a negative result. A negative
+// reconviction count feeding benchDuration or exitScore's StallEvents term
+// is exactly the defect class this branch has already shipped twice
+// (negative StallEvents scoring as a bonus, a zero RTT scoring best), so
+// this must never produce one.
+func TestQuarantineReconvictionDecaySteps(t *testing.T) {
+	interval := quarantineReconvictionDecayInterval
+
+	if got := quarantineReconvictionDecay(5, 0); got != 5 {
+		t.Fatalf("zero elapsed must not decay: got %d, want 5", got)
+	}
+	if got := quarantineReconvictionDecay(5, interval-time.Second); got != 5 {
+		t.Fatalf("just under one elapsed interval must not decay yet: got %d, want 5", got)
+	}
+	if got := quarantineReconvictionDecay(5, interval); got != 4 {
+		t.Fatalf("exactly one elapsed interval must remove exactly one step: got %d, want 4", got)
+	}
+	if got := quarantineReconvictionDecay(5, 2*interval); got != 3 {
+		t.Fatalf("two elapsed intervals must remove exactly two steps: got %d, want 3", got)
+	}
+	if got := quarantineReconvictionDecay(5, 100*interval); got != 0 {
+		t.Fatalf("many elapsed intervals must floor at 0, not go negative: got %d, want 0", got)
+	}
+	if got := quarantineReconvictionDecay(0, 100*interval); got != 0 {
+		t.Fatalf("a count already at 0 must stay 0: got %d, want 0", got)
+	}
+	if got := quarantineReconvictionDecay(-3, interval); got != 0 {
+		t.Fatalf("a negative count must clamp to 0, not go more negative: got %d, want 0", got)
+	}
+	if got := quarantineReconvictionDecay(5, -time.Second); got != 5 {
+		t.Fatalf("negative elapsed must clamp to no-decay, got %d, want 5", got)
+	}
+}
+
+// TestQuarantineReconvictionCountDecaysOverQuietTime is Task 6's channel-level
+// proof: with QuarantineDampening on, quarantineReconvictionCount() decays
+// the count by whole quarantineReconvictionDecayInterval steps measured from
+// quarantineLiftTime (the last completed lift), floors at 0 once enough
+// quiet time has passed, and a fresh conviction is visible immediately
+// afterward rather than reading as still-decayed. Deliberately picks
+// intervals where the decayed and un-decayed readings differ (1 and 0
+// against a raw count of 2) so this cannot pass against the un-fixed
+// always-climbing counter.
+func TestQuarantineReconvictionCountDecaysOverQuietTime(t *testing.T) {
+	client := stallTestChannel()
+	client.settings.QuarantineDampening = true
+
+	// two completed bench-then-lift cycles -> raw reconvictions = 2
+	client.setQuarantined(blackholeNoReceiveAck)
+	client.clearQuarantine()
+	client.setQuarantined(blackholeNoReceiveSyn)
+	client.clearQuarantine()
+	if got := client.quarantineReconvictionCount(); got != 2 {
+		t.Fatalf("expected 2 reconvictions right after the second lift, got %d", got)
+	}
+
+	// age the last lift back by just over one decay interval: exactly one
+	// step must be removed
+	client.stateLock.Lock()
+	client.quarantineLiftTime = time.Now().Add(-quarantineReconvictionDecayInterval - time.Second)
+	client.stateLock.Unlock()
+	if got := client.quarantineReconvictionCount(); got != 1 {
+		t.Fatalf("one elapsed decay interval must remove exactly one step, got %d, want 1", got)
+	}
+
+	// age it back far enough for well past both steps: must floor at 0, not
+	// go negative
+	client.stateLock.Lock()
+	client.quarantineLiftTime = time.Now().Add(-5*quarantineReconvictionDecayInterval - time.Second)
+	client.stateLock.Unlock()
+	if got := client.quarantineReconvictionCount(); got != 0 {
+		t.Fatalf("enough quiet time must decay reconvictions to exactly 0, got %d, want 0", got)
+	}
+
+	// a fresh conviction resets the decay clock: the new lift's elapsed time
+	// is ~0, so the count must be visible right away, not read as decayed
+	client.setQuarantined(blackholeNoReceiveAck)
+	client.clearQuarantine()
+	if got := client.quarantineReconvictionCount(); got == 0 {
+		t.Fatal("a fresh conviction must reset the decay clock, not read as still-decayed")
+	}
+}
+
+// TestQuarantineReconvictionDecayIsDurableAcrossAReconviction is fix-round-1's
+// required proof: a count that decayed to a read of 0 during a long quiet
+// interval must be STORED back that way at the very next conviction
+// (decay-then-increment inside clearQuarantineWithLock), not resume climbing
+// from the historical raw peak. A pure read-time-only lens cannot do this: it
+// reads back the OLD raw value at the instant quarantineLiftTime is
+// overwritten, so a channel with 3 completed cycles that goes quiet long
+// enough to read 0, then reconvicts once, would read back 4 (3+1, the
+// historical raw plus one) instead of 1 -- resurrecting exactly the
+// convictions the decay exists to forgive, in precisely the "misbehaved
+// hours ago, quiet since, then right now" scenario Task 6 exists for.
+func TestQuarantineReconvictionDecayIsDurableAcrossAReconviction(t *testing.T) {
+	client := stallTestChannel()
+	client.settings.QuarantineDampening = true
+
+	// three completed bench-then-lift cycles -> raw reconvictions = 3
+	client.setQuarantined(blackholeNoReceiveAck)
+	client.clearQuarantine()
+	client.setQuarantined(blackholeNoReceiveSyn)
+	client.clearQuarantine()
+	client.setQuarantined(blackholeNoReceiveAck)
+	client.clearQuarantine()
+	if got := client.quarantineReconvictionCount(); got != 3 {
+		t.Fatalf("expected 3 reconvictions after three lifts, got %d", got)
+	}
+
+	// age the last lift back far enough that the read-side decay reads 0
+	client.stateLock.Lock()
+	client.quarantineLiftTime = time.Now().Add(-10 * quarantineReconvictionDecayInterval)
+	client.stateLock.Unlock()
+	if got := client.quarantineReconvictionCount(); got != 0 {
+		t.Fatalf("setup: expected the count to read 0 after a long quiet interval, got %d", got)
+	}
+
+	// one more conviction, right now (no further quiet time to fake): the
+	// decay must already be folded into the STORED value, so this reads back
+	// 1, not the historical raw (3) + 1
+	client.setQuarantined(blackholeNoReceiveSyn)
+	client.clearQuarantine()
+	if got := client.quarantineReconvictionCount(); got != 1 {
+		t.Fatalf("a reconviction after a full decay must store back 1 (decay-then-increment), got %d, want 1", got)
+	}
+}
+
+// TestQuarantineReconvictionCountInertWhenDampeningOff pins the zero-value-off
+// contract: with QuarantineDampening at its zero value (false), an aged
+// quarantineLiftTime must not decay the count at all -- quarantineReconvictionCount()
+// must keep returning the raw, ever-climbing reading a default build has
+// always returned, with no clock read and no decay computation performed.
+func TestQuarantineReconvictionCountInertWhenDampeningOff(t *testing.T) {
+	client := stallTestChannel()
+	// QuarantineDampening left at its zero value (false)
+
+	client.setQuarantined(blackholeNoReceiveAck)
+	client.clearQuarantine()
+	client.setQuarantined(blackholeNoReceiveSyn)
+	client.clearQuarantine()
+
+	client.stateLock.Lock()
+	client.quarantineLiftTime = time.Now().Add(-10 * quarantineReconvictionDecayInterval)
+	client.stateLock.Unlock()
+
+	if got := client.quarantineReconvictionCount(); got != 2 {
+		t.Fatalf("QuarantineDampening off must never decay the count, got %d, want 2", got)
 	}
 }
 
