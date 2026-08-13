@@ -102,6 +102,10 @@ func TestLightClassifierInstalledChangesPlacementOrder(t *testing.T) {
 	// be promoted to the front, which is exactly what this asserts does NOT
 	// happen.
 	legacyParent, legacyClients := flowCapTestParent(t, 0, 50, 1)
+	// pin the knob: LightClassifier is ON by default since 2732116, so this half
+	// must set it explicitly rather than inherit the default, or it stops
+	// testing the legacy no-classifier path at all.
+	legacyParent.settings.LightClassifier = false
 	legacyParent.maybeInstallLightClassifier()
 	if legacyParent.flowClassifier.Load() != nil {
 		t.Fatal("LightClassifier off must leave flowClassifier nil")
