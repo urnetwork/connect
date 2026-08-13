@@ -54,12 +54,16 @@ var _ FlowClassifier = (*LightClassifier)(nil)
 // Classify implements FlowClassifier. It never performs I/O and never
 // blocks: every tier is a map/slice lookup over a static table.
 func (self *LightClassifier) Classify(ipPath *IpPath, appId string) FlowClass {
-	if ipPath == nil {
-		return FlowClass{Class: ClassUnknown, AppId: appId}
-	}
-
+	// appId is the highest-precedence tier and never dereferences ipPath, so
+	// it must run even when ipPath is nil. The nil guard sits in front of
+	// the tiers below that actually read ipPath's fields, not in front of
+	// this one.
 	if class, ok := classifyByApp(appId); ok {
 		return FlowClass{Class: class, AppId: appId, Confidence: appMatchConfidence}
+	}
+
+	if ipPath == nil {
+		return FlowClass{Class: ClassUnknown, AppId: appId}
 	}
 
 	if self.names != nil {
