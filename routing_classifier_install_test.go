@@ -164,13 +164,15 @@ func TestSetReliabilitySettingsTogglesLightClassifierLive(t *testing.T) {
 	ipPath := testLightIpPath(IpProtocolTcp, "93.184.216.1", 443)
 
 	parent, clients := flowCapTestParent(t, 0, 50, 1)
+	// pin the knob off: LightClassifier is ON by default since 2732116, and this
+	// test needs a real off->on EDGE for SetReliabilitySettings to install on.
+	parent.settings.LightClassifier = false
 	parent.config.Store(&multiClientConfig{
 		serverNameLookup: stubServerNameLookup{names: []string{"netflix.com"}},
 	})
 
-	// before any toggle: constructed with LightClassifier off (flowCapTestParent
-	// uses DefaultMultiClientSettings, which is zero-value-off), so no
-	// classifier and the legacy order stands.
+	// before any toggle: LightClassifier pinned off just above (it defaults ON
+	// since 2732116), so no classifier and the legacy order stands.
 	if parent.flowClassifier.Load() != nil {
 		t.Fatal("no classifier should be installed before any runtime toggle")
 	}
