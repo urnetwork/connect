@@ -9955,18 +9955,18 @@ type multiClientChannel struct {
 	// as quarantineMigrated and the rest of the episode bookkeeping beside
 	// it, not new durable state. Guarded by stateLock.
 	//
-	// KNOWN LIMITATION, tracked separately, not yet fixed: this counter never
-	// DECAYS within a session -- a provider that flaps early and then runs
-	// clean for hours still escalates straight to the 240s cap on its next
-	// bench rather than re-starting at 60s. The blast radius is bounded and
-	// self-healing even so: the worst case is a stale-bad exit taking up to
-	// 240s instead of 60s to be force-evicted by the expiry escape, and
-	// release-on-receive-progress (addReceiveAck's clear, unrelated to this
-	// counter) remains a fully independent per-poll acquittal path this
-	// cannot delay -- a genuinely recovered exit is never held past the
-	// evidence that acquits it. Clean-interval decay analogous to
-	// quarantineMemoryDuration should land before QuarantineDampening is
-	// ever turned on for real traffic.
+	// This raw field is the historical high-water mark and is NEVER
+	// decremented in storage -- decay is applied lazily at read time by
+	// quarantineReconvictionCount(), which removes one step per whole
+	// quarantineReconvictionDecayInterval elapsed since quarantineLiftTime
+	// (the same stamp this field advances beside above, so a fresh
+	// conviction resets the decay clock for free -- no separate field to
+	// keep in sync). See quarantineReconvictionDecay for the pure math.
+	// QuarantineDampening off short-circuits the whole computation --
+	// quarantineReconvictionCount() returns this field verbatim, no clock
+	// read at all -- so a default build's benchDuration, and the
+	// StallEvents telemetry this field also feeds (see exitMetricsSnapshot),
+	// stay byte-for-byte what they were before decay existed.
 	quarantineReconvictions int
 
 	// pendingSendTime is when the current run of unacked sends began, reset on
@@ -10623,12 +10623,66 @@ func (self *multiClientChannel) quarantineState() (blackholeReason, time.Time) {
 	return self.quarantineReason, self.quarantineStart
 }
 
+// quarantineReconvictionDecayInterval is the clean interval one reconviction
+// step decays over: quarantineReconvictionCount() removes one step from the
+// raw count for every whole interval elapsed since quarantineLiftTime, the
+// stamp of the LAST completed bench-then-lift cycle (the same instant
+// quarantineReconvictions itself advances on -- see clearQuarantineWithLock
+// -- so a fresh conviction resets this clock for free). Set equal to
+// quarantineMemoryDuration: the existing answer this file already gives for
+// "how long counts as a clean interval" for the sibling survived-quarantine
+// memory, reused rather than inventing a second opinion on the same
+// question -- though the two remain independent constants should they ever
+// need to diverge.
+const quarantineReconvictionDecayInterval = quarantineMemoryDuration
+
+// quarantineReconvictionDecay returns reconvictions with one step removed
+// for every whole quarantineReconvictionDecayInterval elapsed is worth,
+// floored at 0. A non-positive reconvictions or a non-positive elapsed (a
+// clock problem, not evidence of a longer clean interval -- the same
+// convention reentryScorePenalty's elapsed<0 clamp uses) both read as "no
+// decay to apply" rather than propagating toward a negative result: a
+// negative count feeding benchDuration or exitScore's StallEvents term is
+// exactly the defect class this branch has already shipped twice (negative
+// StallEvents scoring as a bonus, a zero RTT scoring best), so this must
+// never produce one. Pure: no clock reads, no locks -- mirrors benchDuration
+// and reentryScorePenalty.
+func quarantineReconvictionDecay(reconvictions int, elapsed time.Duration) int {
+	if reconvictions <= 0 {
+		return 0
+	}
+	if elapsed <= 0 {
+		return reconvictions
+	}
+	decayed := reconvictions - int(elapsed/quarantineReconvictionDecayInterval)
+	if decayed < 0 {
+		return 0
+	}
+	return decayed
+}
+
 // quarantineReconvictionCount reads the completed bench-then-lift cycle
-// count benchDuration escalates on; see the field comment.
+// count benchDuration escalates on; see the field comment. With
+// QuarantineDampening on, the raw count is decayed by elapsed quiet time
+// since the last completed cycle (quarantineReconvictionDecay, above) before
+// being returned, so a channel that reconvicted long ago and has been clean
+// since reads a low count again rather than the historical peak. With the
+// knob at its zero value (off) this returns the raw field verbatim and does
+// not even read the clock -- so a default build's reading, and everything
+// downstream of it (benchDuration, and exitMetricsSnapshot's StallEvents),
+// stays byte-for-byte what it was before this decay existed.
 func (self *multiClientChannel) quarantineReconvictionCount() int {
+	// reliabilitySettings() is a bare atomic load (see its own comment),
+	// never blocking, so reading it before the lock adds no new lock
+	// ordering and keeps the locked section to the two fields below.
+	dampening := self.reliabilitySettings().QuarantineDampening
+
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	return self.quarantineReconvictions
+	if !dampening || self.quarantineLiftTime.IsZero() {
+		return self.quarantineReconvictions
+	}
+	return quarantineReconvictionDecay(self.quarantineReconvictions, time.Now().Sub(self.quarantineLiftTime))
 }
 
 // quarantineReentryElapsed reports how long it has been since this channel's

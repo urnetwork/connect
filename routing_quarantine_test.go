@@ -155,6 +155,117 @@ func TestQuarantineReconvictionsSurviveReceiveProgressRelease(t *testing.T) {
 	}
 }
 
+// TestQuarantineReconvictionDecaySteps is the pure decay math Task 6 adds:
+// one step removed per whole quarantineReconvictionDecayInterval of elapsed
+// time, floored at 0, with both a negative count and a negative elapsed
+// (clock trouble, not evidence of a longer clean interval -- the same
+// convention reentryScorePenalty's elapsed<0 clamp already uses) reading as
+// "no decay to apply" rather than propagating a negative result. A negative
+// reconviction count feeding benchDuration or exitScore's StallEvents term
+// is exactly the defect class this branch has already shipped twice
+// (negative StallEvents scoring as a bonus, a zero RTT scoring best), so
+// this must never produce one.
+func TestQuarantineReconvictionDecaySteps(t *testing.T) {
+	interval := quarantineReconvictionDecayInterval
+
+	if got := quarantineReconvictionDecay(5, 0); got != 5 {
+		t.Fatalf("zero elapsed must not decay: got %d, want 5", got)
+	}
+	if got := quarantineReconvictionDecay(5, interval-time.Second); got != 5 {
+		t.Fatalf("just under one elapsed interval must not decay yet: got %d, want 5", got)
+	}
+	if got := quarantineReconvictionDecay(5, interval); got != 4 {
+		t.Fatalf("exactly one elapsed interval must remove exactly one step: got %d, want 4", got)
+	}
+	if got := quarantineReconvictionDecay(5, 2*interval); got != 3 {
+		t.Fatalf("two elapsed intervals must remove exactly two steps: got %d, want 3", got)
+	}
+	if got := quarantineReconvictionDecay(5, 100*interval); got != 0 {
+		t.Fatalf("many elapsed intervals must floor at 0, not go negative: got %d, want 0", got)
+	}
+	if got := quarantineReconvictionDecay(0, 100*interval); got != 0 {
+		t.Fatalf("a count already at 0 must stay 0: got %d, want 0", got)
+	}
+	if got := quarantineReconvictionDecay(-3, interval); got != 0 {
+		t.Fatalf("a negative count must clamp to 0, not go more negative: got %d, want 0", got)
+	}
+	if got := quarantineReconvictionDecay(5, -time.Second); got != 5 {
+		t.Fatalf("negative elapsed must clamp to no-decay, got %d, want 5", got)
+	}
+}
+
+// TestQuarantineReconvictionCountDecaysOverQuietTime is Task 6's channel-level
+// proof: with QuarantineDampening on, quarantineReconvictionCount() decays
+// the count by whole quarantineReconvictionDecayInterval steps measured from
+// quarantineLiftTime (the last completed lift), floors at 0 once enough
+// quiet time has passed, and a fresh conviction is visible immediately
+// afterward rather than reading as still-decayed. Deliberately picks
+// intervals where the decayed and un-decayed readings differ (1 and 0
+// against a raw count of 2) so this cannot pass against the un-fixed
+// always-climbing counter.
+func TestQuarantineReconvictionCountDecaysOverQuietTime(t *testing.T) {
+	client := stallTestChannel()
+	client.settings.QuarantineDampening = true
+
+	// two completed bench-then-lift cycles -> raw reconvictions = 2
+	client.setQuarantined(blackholeNoReceiveAck)
+	client.clearQuarantine()
+	client.setQuarantined(blackholeNoReceiveSyn)
+	client.clearQuarantine()
+	if got := client.quarantineReconvictionCount(); got != 2 {
+		t.Fatalf("expected 2 reconvictions right after the second lift, got %d", got)
+	}
+
+	// age the last lift back by just over one decay interval: exactly one
+	// step must be removed
+	client.stateLock.Lock()
+	client.quarantineLiftTime = time.Now().Add(-quarantineReconvictionDecayInterval - time.Second)
+	client.stateLock.Unlock()
+	if got := client.quarantineReconvictionCount(); got != 1 {
+		t.Fatalf("one elapsed decay interval must remove exactly one step, got %d, want 1", got)
+	}
+
+	// age it back far enough for well past both steps: must floor at 0, not
+	// go negative
+	client.stateLock.Lock()
+	client.quarantineLiftTime = time.Now().Add(-5*quarantineReconvictionDecayInterval - time.Second)
+	client.stateLock.Unlock()
+	if got := client.quarantineReconvictionCount(); got != 0 {
+		t.Fatalf("enough quiet time must decay reconvictions to exactly 0, got %d, want 0", got)
+	}
+
+	// a fresh conviction resets the decay clock: the new lift's elapsed time
+	// is ~0, so the count must be visible right away, not read as decayed
+	client.setQuarantined(blackholeNoReceiveAck)
+	client.clearQuarantine()
+	if got := client.quarantineReconvictionCount(); got == 0 {
+		t.Fatal("a fresh conviction must reset the decay clock, not read as still-decayed")
+	}
+}
+
+// TestQuarantineReconvictionCountInertWhenDampeningOff pins the zero-value-off
+// contract: with QuarantineDampening at its zero value (false), an aged
+// quarantineLiftTime must not decay the count at all -- quarantineReconvictionCount()
+// must keep returning the raw, ever-climbing reading a default build has
+// always returned, with no clock read and no decay computation performed.
+func TestQuarantineReconvictionCountInertWhenDampeningOff(t *testing.T) {
+	client := stallTestChannel()
+	// QuarantineDampening left at its zero value (false)
+
+	client.setQuarantined(blackholeNoReceiveAck)
+	client.clearQuarantine()
+	client.setQuarantined(blackholeNoReceiveSyn)
+	client.clearQuarantine()
+
+	client.stateLock.Lock()
+	client.quarantineLiftTime = time.Now().Add(-10 * quarantineReconvictionDecayInterval)
+	client.stateLock.Unlock()
+
+	if got := client.quarantineReconvictionCount(); got != 2 {
+		t.Fatalf("QuarantineDampening off must never decay the count, got %d, want 2", got)
+	}
+}
+
 // TestReentryScorePenaltyDecaysToZero is the pure decay curve: full weight
 // at the instant of release (elapsed==0), zero once ramp has fully elapsed,
 // and strictly decreasing in between. ramp<=0 is the zero-value-off legacy
