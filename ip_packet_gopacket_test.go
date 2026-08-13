@@ -3,6 +3,7 @@ package connect
 import (
 	"bytes"
 	"encoding/binary"
+	"math"
 	"net"
 	"testing"
 
@@ -67,7 +68,7 @@ func TestSynAckMatchesGopacketReference(t *testing.T) {
 			Ack:     state.sendSeq,
 			ACK:     true,
 			SYN:     true,
-			Window:  state.encodedWindowSize(),
+			Window:  uint16(min(state.windowSize, uint32(math.MaxUint16))),
 			Options: opts,
 		}
 		tcp.SetNetworkLayerForChecksum(ip)

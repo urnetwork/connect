@@ -5,6 +5,7 @@ package connect
 import (
 	"io"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -15,13 +16,21 @@ const webSocketWriteBatchMaxByteCount = 16 * 1024
 // TLS Write. It starts in pass-through mode so the HTTP upgrade handshake
 // cannot be retained; PlatformTransport explicitly brackets each ready batch.
 //
-// Batch methods and Write are used by the WebSocket's single writer goroutine.
-// Read, deadlines, and Close retain net.Conn's normal concurrent contract by
-// delegating directly to the underlying connection.
+// One data writer brackets batches. A WebSocket reader may concurrently emit a
+// control frame, so stateLock also serializes every Write and delegated socket
+// write. A control frame that arrives inside a ready-only batch joins that
+// byte-stream batch in arrival order. Read, deadlines, and Close retain
+// net.Conn's concurrent contract and can interrupt a blocked delegated write.
 type WebSocketWriteBatchConn struct {
 	conn        net.Conn
+	stateLock   sync.Mutex
 	writeBuffer []byte
 	batching    bool
+
+	// Tests place batch activation and a concurrent control write at one exact
+	// boundary. Nil in production.
+	beforeBeginWriteBatchForTest func()
+	beforeWriteForTest           func()
 }
 
 // Creates a pass-through connection whose explicit batches are bounded by the
@@ -34,6 +43,12 @@ func NewWebSocketWriteBatchConn(conn net.Conn) *WebSocketWriteBatchConn {
 
 // Starts one explicit ready-only batch on the connection's single writer.
 func (self *WebSocketWriteBatchConn) BeginWriteBatch() {
+	if self.beforeBeginWriteBatchForTest != nil {
+		self.beforeBeginWriteBatchForTest()
+	}
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
 	if self.batching {
 		panic("websocket write batch already active")
 	}
@@ -47,12 +62,16 @@ func (self *WebSocketWriteBatchConn) BeginWriteBatch() {
 
 // Discards bytes that have not reached the delegated connection.
 func (self *WebSocketWriteBatchConn) AbortWriteBatch() {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
 	self.batching = false
 	self.writeBuffer = self.writeBuffer[:0]
 }
 
-// Writes the currently retained bytes while keeping the batch active.
-func (self *WebSocketWriteBatchConn) flushWriteBuffer() error {
+// Writes retained bytes while the state lock keeps concurrent control writes
+// from interleaving with the delegated stream write.
+func (self *WebSocketWriteBatchConn) flushWriteBufferWithLock() error {
 	if len(self.writeBuffer) == 0 {
 		return nil
 	}
@@ -67,11 +86,14 @@ func (self *WebSocketWriteBatchConn) flushWriteBuffer() error {
 
 // Ends the active batch and writes every retained complete frame byte.
 func (self *WebSocketWriteBatchConn) FlushWriteBatch() error {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
 	if !self.batching {
 		return nil
 	}
 	self.batching = false
-	return self.flushWriteBuffer()
+	return self.flushWriteBufferWithLock()
 }
 
 // Delegates reads without sharing the single-writer batching state.
@@ -81,11 +103,17 @@ func (self *WebSocketWriteBatchConn) Read(buffer []byte) (int, error) {
 
 // Passes through outside a batch and otherwise retains a bounded byte prefix.
 func (self *WebSocketWriteBatchConn) Write(buffer []byte) (int, error) {
+	if self.beforeWriteForTest != nil {
+		self.beforeWriteForTest()
+	}
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
 	if !self.batching {
 		return self.conn.Write(buffer)
 	}
 	if webSocketWriteBatchMaxByteCount < len(self.writeBuffer)+len(buffer) {
-		if err := self.flushWriteBuffer(); err != nil {
+		if err := self.flushWriteBufferWithLock(); err != nil {
 			return 0, err
 		}
 	}

@@ -1835,6 +1835,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				drain(send)
 				drain(receive)
 			}()
+			writeBatchStorage := make([]byte, platformH3WriteBatchMaxByteCount)
 			writeReadySendBatch := func(
 				firstMessage []byte,
 			) (sendOpen bool, pendingMessage []byte, err error) {
@@ -1869,7 +1870,11 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				stream.SetWriteDeadline(
 					time.Now().Add(time.Duration(slowMultiple) * self.settings.WriteTimeout),
 				)
-				err = framer.WriteBatch(stream, messages)
+				err = framer.WriteBatchWithStorage(
+					stream,
+					messages,
+					writeBatchStorage,
+				)
 				for _, message := range messages {
 					MessagePoolReturn(message)
 				}

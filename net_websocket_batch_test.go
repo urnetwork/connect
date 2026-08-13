@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -97,6 +98,57 @@ func TestWebSocketWriteBatchCoalescesWithoutChangingBytes(t *testing.T) {
 	AssertEqual(t, len(underlying.writes), 1)
 	if !bytes.Equal(underlying.writes[0], bytes.Join(messages, nil)) {
 		t.Fatal("coalesced write changed byte order or content")
+	}
+}
+
+// A WebSocket reader may send a control frame while the data writer starts a
+// ready batch. Both accesses meet at one barrier so the race detector sees the
+// old unsynchronized batching field on every run.
+func TestWebSocketWriteBatchSerializesConcurrentControlWrite(t *testing.T) {
+	underlying := &recordingWriteConn{}
+	conn := NewWebSocketWriteBatchConn(underlying)
+	beginReady := make(chan struct{})
+	writeReady := make(chan struct{})
+	release := make(chan struct{})
+	conn.beforeBeginWriteBatchForTest = func() {
+		close(beginReady)
+		<-release
+	}
+	conn.beforeWriteForTest = func() {
+		close(writeReady)
+		<-release
+	}
+
+	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() {
+		defer workers.Done()
+		conn.BeginWriteBatch()
+	}()
+	control := []byte("websocket control frame")
+	var writtenByteCount int
+	var writeErr error
+	go func() {
+		defer workers.Done()
+		writtenByteCount, writeErr = conn.Write(control)
+	}()
+	<-beginReady
+	<-writeReady
+	close(release)
+	workers.Wait()
+	if writeErr != nil {
+		t.Fatal(writeErr)
+	}
+	if writtenByteCount != len(control) {
+		t.Fatalf("control write byte count=%d, want=%d", writtenByteCount, len(control))
+	}
+	if err := conn.FlushWriteBatch(); err != nil {
+		t.Fatal(err)
+	}
+
+	joinedBytes := bytes.Join(underlying.writes, nil)
+	if !bytes.Equal(joinedBytes, control) {
+		t.Fatalf("control write changed at concurrent batch boundary: %q", joinedBytes)
 	}
 }
 

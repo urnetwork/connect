@@ -24,6 +24,7 @@ type tcpReorderTestHarness struct {
 	nextSeq          uint32
 	synAckReceived   chan struct{}
 	ackNumbers       chan uint32
+	acks             chan parsedTcp
 	reorderDecisions chan tcpReorderDisposition
 	runDone          chan struct{}
 	closeOnce        sync.Once
@@ -54,6 +55,25 @@ func newTcpReorderTestHarnessWithSetup(
 	reorderByteCount int,
 	setupSequence func(*TcpSequence),
 ) *tcpReorderTestHarness {
+	return newTcpReorderTestHarnessWithSynOptions(
+		t,
+		initialSynSeq,
+		sequenceBufferSize,
+		reorderByteCount,
+		setupSequence,
+		nil,
+	)
+}
+
+// Establishes the same harness with explicit source SYN options.
+func newTcpReorderTestHarnessWithSynOptions(
+	t *testing.T,
+	initialSynSeq uint32,
+	sequenceBufferSize int,
+	reorderByteCount int,
+	setupSequence func(*TcpSequence),
+	synOptions []byte,
+) *tcpReorderTestHarness {
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -82,6 +102,7 @@ func newTcpReorderTestHarnessWithSetup(
 		nextSeq:          initialSynSeq + 1,
 		synAckReceived:   make(chan struct{}, 1),
 		ackNumbers:       make(chan uint32, 64),
+		acks:             make(chan parsedTcp, 64),
 		reorderDecisions: make(chan tcpReorderDisposition, 64),
 		runDone:          make(chan struct{}),
 	}
@@ -111,6 +132,10 @@ func newTcpReorderTestHarnessWithSetup(
 				return
 			}
 			if tcp.ack {
+				select {
+				case harness.acks <- *tcp:
+				default:
+				}
 				select {
 				case harness.ackNumbers <- tcp.ackNumber:
 				default:
@@ -144,6 +169,7 @@ func newTcpReorderTestHarnessWithSetup(
 	synItem := harness.newSendItem(initialSynSeq, nil, false)
 	synItem.tcp.syn = true
 	synItem.tcp.ack = false
+	synItem.tcp.options = synOptions
 	harness.sendItem(synItem)
 	select {
 	case <-harness.synAckReceived:

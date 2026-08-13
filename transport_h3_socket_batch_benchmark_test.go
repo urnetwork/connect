@@ -138,6 +138,7 @@ func newPlatformH3BatchBenchmarkStream(
 func runPlatformH3BatchBenchmark(
 	benchmark *testing.B,
 	maximumMessageCount int,
+	retainedStorage bool,
 ) {
 	clientStream, serverStream := newPlatformH3BatchBenchmarkStream(benchmark)
 	framer := NewFramer(DefaultFramerSettings(platformH3BatchBenchmarkMessageByteCount))
@@ -176,6 +177,7 @@ func runPlatformH3BatchBenchmark(
 	benchmark.ResetTimer()
 	writeCount := 0
 	var writeErr error
+	writeBatchStorage := make([]byte, platformH3WriteBatchMaxByteCount)
 	for range benchmark.N {
 		for firstMessageIndex := 0; firstMessageIndex < len(messages); firstMessageIndex += maximumMessageCount {
 			lastMessageIndex := min(
@@ -184,10 +186,18 @@ func runPlatformH3BatchBenchmark(
 			)
 			clientStream.SetWriteDeadline(time.Now().Add(time.Minute))
 			writeCount += 1
-			writeErr = framer.WriteBatch(
-				clientStream,
-				messages[firstMessageIndex:lastMessageIndex],
-			)
+			if retainedStorage {
+				writeErr = framer.WriteBatchWithStorage(
+					clientStream,
+					messages[firstMessageIndex:lastMessageIndex],
+					writeBatchStorage,
+				)
+			} else {
+				writeErr = framer.WriteBatch(
+					clientStream,
+					messages[firstMessageIndex:lastMessageIndex],
+				)
+			}
 			if writeErr != nil {
 				break
 			}
@@ -216,10 +226,15 @@ func runPlatformH3BatchBenchmark(
 
 // Measures the proposed eight-message H3 ready-drain depth.
 func BenchmarkPlatformH3SocketBatch8Loopback(benchmark *testing.B) {
-	runPlatformH3BatchBenchmark(benchmark, 8)
+	runPlatformH3BatchBenchmark(benchmark, 8, false)
 }
 
 // Measures the current sixteen-message H3 ready-drain depth.
 func BenchmarkPlatformH3SocketBatch16Loopback(benchmark *testing.B) {
-	runPlatformH3BatchBenchmark(benchmark, 16)
+	runPlatformH3BatchBenchmark(benchmark, 16, false)
+}
+
+// Measures production depth with one buffer retained by the H3 writer.
+func BenchmarkPlatformH3SocketBatch16RetainedStorageLoopback(benchmark *testing.B) {
+	runPlatformH3BatchBenchmark(benchmark, 16, true)
 }

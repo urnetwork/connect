@@ -165,6 +165,48 @@ func (self *Framer) WriteBatch(w io.Writer, messages [][]byte) error {
 	if len(messages) == 1 {
 		return self.Write(w, messages[0])
 	}
+	totalByteCount, err := self.writeBatchByteCount(messages)
+	if err != nil {
+		return err
+	}
+
+	batchBytes := MessagePoolGet(totalByteCount)
+	defer MessagePoolReturn(batchBytes)
+	return writeFramerBatch(w, messages, batchBytes)
+}
+
+// WriteBatchWithStorage emits the same wire batch using caller-owned scratch
+// storage. The caller must provide exclusive storage for the duration of the
+// call and may reuse it after return. Message ownership always stays with the
+// caller. An undersized buffer is rejected before any stream byte is written.
+func (self *Framer) WriteBatchWithStorage(
+	w io.Writer,
+	messages [][]byte,
+	storage []byte,
+) error {
+	if len(messages) == 0 {
+		return nil
+	}
+	if len(messages) == 1 {
+		return self.Write(w, messages[0])
+	}
+	totalByteCount, err := self.writeBatchByteCount(messages)
+	if err != nil {
+		return err
+	}
+	if len(storage) < totalByteCount {
+		return fmt.Errorf(
+			"Framer batch storage too small (%d<%d)",
+			len(storage),
+			totalByteCount,
+		)
+	}
+	return writeFramerBatch(w, messages, storage[:totalByteCount])
+}
+
+// writeBatchByteCount validates every message before the writer can observe a
+// prefix and returns the exact framed byte count.
+func (self *Framer) writeBatchByteCount(messages [][]byte) (int, error) {
 	totalByteCount := 0
 	for _, message := range messages {
 		messageByteCount := len(message)
@@ -175,27 +217,30 @@ func (self *Framer) WriteBatch(w io.Writer, messages [][]byte) error {
 				self.settings.MaxMessageLen,
 				self.maxFrameLen,
 			)
-			return fmt.Errorf(
+			return 0, fmt.Errorf(
 				"Max message len exceeded (%d<%d)",
 				self.settings.MaxMessageLen,
 				messageByteCount,
 			)
 		}
 		if math.MaxUint16 < messageByteCount {
-			return fmt.Errorf(
+			return 0, fmt.Errorf(
 				"Max possible message len exceeded (%d<%d)",
 				math.MaxUint16,
 				messageByteCount,
 			)
 		}
 		if math.MaxInt-totalByteCount < messageByteCount+4 {
-			return fmt.Errorf("Framer batch byte count overflow.")
+			return 0, fmt.Errorf("Framer batch byte count overflow.")
 		}
 		totalByteCount += messageByteCount + 4
 	}
+	return totalByteCount, nil
+}
 
-	batchBytes := MessagePoolGet(totalByteCount)
-	defer MessagePoolReturn(batchBytes)
+// writeFramerBatch fills exact-sized caller storage and performs one stream
+// write after all validation has completed.
+func writeFramerBatch(w io.Writer, messages [][]byte, batchBytes []byte) error {
 	offset := 0
 	for _, message := range messages {
 		messageByteCount := len(message)

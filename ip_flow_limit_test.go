@@ -32,8 +32,9 @@ func TestLocalUserNatSettingsMemoryScaled(t *testing.T) {
 	AssertEqual(t, tcpSettings.SequenceBufferSize, 384)
 	AssertEqual(t, tcpSettings.ReadBufferByteCount, 24576)
 	AssertEqual(t, tcpSettings.MinWindowSize, uint32(65536))
-	// 384 KiB scaled, snapped down to a power of 2 multiple of the min window
-	AssertEqual(t, tcpSettings.MaxWindowSize, uint32(262144))
+	AssertEqual(t, tcpSettings.InitialWindowSize, uint32(262144))
+	// 6 MiB scaled, snapped down to a power of 2 multiple of the min window.
+	AssertEqual(t, tcpSettings.MaxWindowSize, uint32(4194304))
 	AssertEqual(t, tcpSettings.GlobalLimit, 192)
 
 	icmpSettings := DefaultIcmpBufferSettings()
@@ -56,7 +57,8 @@ func TestLocalUserNatSettingsMemoryScaled(t *testing.T) {
 	tcpSettings = DefaultTcpBufferSettings()
 	AssertEqual(t, tcpSettings.SequenceBufferSize, 192)
 	AssertEqual(t, tcpSettings.ReadBufferByteCount, 16384)
-	AssertEqual(t, tcpSettings.MaxWindowSize, uint32(131072))
+	AssertEqual(t, tcpSettings.InitialWindowSize, uint32(131072))
+	AssertEqual(t, tcpSettings.MaxWindowSize, uint32(2097152))
 	AssertEqual(t, tcpSettings.GlobalLimit, 64)
 	icmpSettings = DefaultIcmpBufferSettings()
 	AssertEqual(t, icmpSettings.SequenceBufferSize, 16)
@@ -74,7 +76,8 @@ func TestLocalUserNatSettingsMemoryScaled(t *testing.T) {
 	tcpSettings = DefaultTcpBufferSettings()
 	AssertEqual(t, tcpSettings.SequenceBufferSize, 1024)
 	AssertEqual(t, tcpSettings.ReadBufferByteCount, 65536)
-	AssertEqual(t, tcpSettings.MaxWindowSize, uint32(1048576))
+	AssertEqual(t, tcpSettings.InitialWindowSize, uint32(1048576))
+	AssertEqual(t, tcpSettings.MaxWindowSize, uint32(16777216))
 	AssertEqual(t, tcpSettings.GlobalLimit, 0)
 	icmpSettings = DefaultIcmpBufferSettings()
 	AssertEqual(t, icmpSettings.SequenceBufferSize, 64)
@@ -101,19 +104,22 @@ func TestLocalUserNatSettingsMemoryScaled(t *testing.T) {
 	AssertEqual(t, budgetedProviderSettings.UdpBufferSettings.GlobalLimit, 768)
 	SetMemoryBudget(0)
 
-	// invariants at every budget tier:
-	// - the tcp channel depth must cover the max window in mtu packets, so a
-	//   full window burst is never dropped (the nat implements no retransmit
-	//   toward the socket)
-	// - the max window stays a power of 2 multiple of the min window (the
-	//   window doubling ladder must land exactly on the max)
+	// Invariants at every budget tier:
+	// - the TCP channel remains memory-scaled rather than expanding to the
+	//   high-BDP maximum window for every live flow; and
+	// - the maximum window stays a power-of-two multiple of the minimum window,
+	//   so the window-doubling ladder lands exactly on the maximum.
 	for _, budget := range []ByteCount{0, mib(8), mib(16), mib(24), mib(32), mib(48), mib(64), mib(128)} {
 		SetMemoryBudget(budget)
 		tcpSettings := DefaultTcpBufferSettings()
-		payloadByteCount := tcpSettings.Mtu - Ipv6HeaderSize - TcpHeaderSizeWithoutExtensions
-		if int64(tcpSettings.SequenceBufferSize)*int64(payloadByteCount) < int64(tcpSettings.MaxWindowSize) {
-			t.Errorf("budget %d: tcp depth %d x payload %d does not cover the max window %d",
-				budget, tcpSettings.SequenceBufferSize, payloadByteCount, tcpSettings.MaxWindowSize)
+		wantSequenceBufferSize := MemoryScaledCount(defaultTcpFlowBufferSize, 192)
+		if tcpSettings.SequenceBufferSize != wantSequenceBufferSize {
+			t.Errorf(
+				"budget %d: tcp depth=%d, want memory-scaled depth=%d",
+				budget,
+				tcpSettings.SequenceBufferSize,
+				wantSequenceBufferSize,
+			)
 		}
 		if tcpSettings.MaxWindowSize < tcpSettings.MinWindowSize {
 			t.Errorf("budget %d: max window %d below min window %d",

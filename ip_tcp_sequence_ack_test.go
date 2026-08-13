@@ -3,9 +3,15 @@
 package connect
 
 import (
+	"context"
+	"encoding/binary"
+	"math"
+	"net"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/urnetwork/connect/protocol"
 )
 
 func newTcpAckOrderingTestSequence() *TcpSequence {
@@ -299,5 +305,213 @@ func TestTcpSequenceSynWindowScaleIsClampedToProtocolMaximum(t *testing.T) {
 	}
 	if sequence.receiveWindowSize != 4096 {
 		t.Fatalf("clamped scale changed literal SYN window to %d", sequence.receiveWindowSize)
+	}
+}
+
+// The SYN window is not scaled even when its option negotiates scaling for
+// later packets. This catches the provider warmup failure where a large
+// high-BDP maximum reduced the opening advertised window to only a few KiB.
+func TestTcpSequenceSynAckUsesLiteralOpeningWindow(t *testing.T) {
+	settings := DefaultTcpBufferSettingsWithBufferSize(8)
+	sequence := newTcpSequenceWithTransferKey(
+		context.Background(),
+		func(
+			source TransferPath,
+			transferKey TransferKey,
+			provideMode protocol.ProvideMode,
+			recoveryMode receiveRecoveryMode,
+			ipPath *IpPath,
+			packet []byte,
+		) {
+		},
+		TransferPath{},
+		TransferKey{},
+		protocol.ProvideMode_Public,
+		4,
+		net.IP{72, 0, 0, 1},
+		40000,
+		net.IP{72, 2, 3, 4},
+		443,
+		0,
+		settings,
+	)
+	defer sequence.Close()
+
+	sequence.mutex.Lock()
+	sequence.initializeSynWithLock(&parsedTcp{
+		seq:        9000,
+		windowSize: math.MaxUint16,
+		options:    []byte{3, 3, 8},
+	})
+	sequence.mutex.Unlock()
+
+	packet, err := sequence.SynAck(settings.Mtu)
+	if err != nil {
+		t.Fatalf("build SYN-ACK: %v", err)
+	}
+	defer MessagePoolReturn(packet)
+
+	tcpOffset := Ipv4HeaderSizeWithoutExtensions
+	windowSize := binary.BigEndian.Uint16(packet[tcpOffset+14 : tcpOffset+16])
+	if windowSize != math.MaxUint16 {
+		t.Fatalf("SYN-ACK window=%d, want literal %d", windowSize, math.MaxUint16)
+	}
+	if sequence.windowSize != settings.InitialWindowSize {
+		t.Fatalf(
+			"post-handshake warmup window=%d, want configured initial=%d",
+			sequence.windowSize,
+			settings.InitialWindowSize,
+		)
+	}
+	if sequence.encodedWindowSize() != uint16(settings.InitialWindowSize>>sequence.windowScale) {
+		t.Fatalf(
+			"scaled post-handshake window=%d, want %d",
+			sequence.encodedWindowSize(),
+			settings.InitialWindowSize>>sequence.windowScale,
+		)
+	}
+}
+
+// A retransmitted SYN is RTT-ambiguous without timestamps. The provider must
+// negotiate the source timestamp and echo the newest value on every later
+// segment so the source can sample a high-latency handshake instead of keeping
+// its one-second initial retransmission timeout.
+func TestTcpSequenceNegotiatesAndEchoesTimestamps(t *testing.T) {
+	settings := DefaultTcpBufferSettingsWithBufferSize(8)
+	sequence := newTcpSequenceWithTransferKey(
+		context.Background(),
+		func(
+			source TransferPath,
+			transferKey TransferKey,
+			provideMode protocol.ProvideMode,
+			recoveryMode receiveRecoveryMode,
+			ipPath *IpPath,
+			packet []byte,
+		) {
+		},
+		TransferPath{},
+		TransferKey{},
+		protocol.ProvideMode_Public,
+		4,
+		net.IP{72, 0, 0, 1},
+		40000,
+		net.IP{72, 2, 3, 4},
+		443,
+		0,
+		settings,
+	)
+	defer sequence.Close()
+	sequence.timestampValueForTest = func() uint32 { return 7000 }
+
+	synTimestampValue := uint32(5000)
+	synOptions := []byte{
+		2, 4, 0x05, 0xb4,
+		1, 3, 3, 8,
+		1, 1, 8, 10,
+		0, 0, 0, 0,
+		0, 0, 0, 0,
+	}
+	binary.BigEndian.PutUint32(synOptions[12:16], synTimestampValue)
+	syn := &parsedTcp{
+		seq:        9000,
+		windowSize: math.MaxUint16,
+		options:    synOptions,
+	}
+	sequence.mutex.Lock()
+	sequence.initializeSynWithLock(syn)
+	sequence.mutex.Unlock()
+
+	parseGeneratedTcp := func(packet []byte) *parsedTcp {
+		ipProtocol, sourceIp, destinationIp, transport, ok := parseIpv4(packet)
+		if !ok || ipProtocol != ipProtocolNumberTcp {
+			t.Fatalf("generated packet is not valid IPv4 TCP")
+		}
+		tcp := &parsedTcp{}
+		if !parseTcpPacket(sourceIp, destinationIp, transport, tcp) {
+			t.Fatalf("generated packet has an invalid TCP header")
+		}
+		return tcp
+	}
+
+	synAck, err := sequence.SynAck(settings.Mtu)
+	if err != nil {
+		t.Fatalf("build SYN-ACK: %v", err)
+	}
+	parsedSynAck := parseGeneratedTcp(synAck)
+	if !parsedSynAck.enableTimestamp || parsedSynAck.timestampValue != 7000 || parsedSynAck.timestampEcho != synTimestampValue {
+		t.Fatalf(
+			"SYN-ACK timestamp enabled=%t value=%d echo=%d, want true, 7000, %d",
+			parsedSynAck.enableTimestamp,
+			parsedSynAck.timestampValue,
+			parsedSynAck.timestampEcho,
+			synTimestampValue,
+		)
+	}
+	MessagePoolReturn(synAck)
+
+	latestTimestampValue := uint32(6000)
+	ackOptions := []byte{1, 1, 8, 10, 0, 0, 0, 0, 0, 0, 0, 0}
+	binary.BigEndian.PutUint32(ackOptions[4:8], latestTimestampValue)
+	ack := &parsedTcp{seq: sequence.sendSeq, options: ackOptions}
+	parseTcpOptions(ack)
+	sequence.mutex.Lock()
+	sequence.updateTimestampRecentWithLock(ack)
+	pureAck, err := sequence.PureAck()
+	sequence.mutex.Unlock()
+	if err != nil {
+		t.Fatalf("build pure ACK: %v", err)
+	}
+	parsedPureAck := parseGeneratedTcp(pureAck)
+	if !parsedPureAck.enableTimestamp || parsedPureAck.timestampEcho != latestTimestampValue {
+		t.Fatalf(
+			"pure ACK timestamp enabled=%t echo=%d, want true and %d",
+			parsedPureAck.enableTimestamp,
+			parsedPureAck.timestampEcho,
+			latestTimestampValue,
+		)
+	}
+	MessagePoolReturn(pureAck)
+
+	futureOptions := append([]byte(nil), ackOptions...)
+	binary.BigEndian.PutUint32(futureOptions[4:8], latestTimestampValue+1000)
+	future := &parsedTcp{seq: sequence.sendSeq + 1, options: futureOptions}
+	parseTcpOptions(future)
+	sequence.mutex.Lock()
+	sequence.updateTimestampRecentWithLock(future)
+	retainedTimestampValue := sequence.timestampRecent
+	sequence.mutex.Unlock()
+	if retainedTimestampValue != latestTimestampValue {
+		t.Fatalf(
+			"future segment moved timestamp echo to %d, want retained %d",
+			retainedTimestampValue,
+			latestTimestampValue,
+		)
+	}
+
+	payload := make([]byte, settings.Mtu)
+	sequence.mutex.Lock()
+	packets, err := sequence.DataPackets(payload, len(payload), settings.Mtu)
+	sequence.mutex.Unlock()
+	if err != nil {
+		t.Fatalf("build data packets: %v", err)
+	}
+	if len(packets) != 2 {
+		t.Fatalf("timestamp-aware packet count=%d, want 2", len(packets))
+	}
+	for packetIndex, packet := range packets {
+		if settings.Mtu < len(packet) {
+			t.Fatalf("packet %d is %d bytes, exceeds MTU %d", packetIndex, len(packet), settings.Mtu)
+		}
+		parsedPacket := parseGeneratedTcp(packet)
+		if !parsedPacket.enableTimestamp || parsedPacket.timestampEcho != latestTimestampValue {
+			t.Fatalf(
+				"packet %d timestamp enabled=%t echo=%d, want true and %d",
+				packetIndex,
+				parsedPacket.enableTimestamp,
+				parsedPacket.timestampEcho,
+				latestTimestampValue,
+			)
+		}
+		MessagePoolReturn(packet)
 	}
 }

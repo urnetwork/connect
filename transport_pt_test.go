@@ -1,3 +1,5 @@
+// These tests exercise QUIC over packet translation, including retry and
+// cancellation ownership across lossy DNS-shaped carriers.
 package connect
 
 import (
@@ -8,6 +10,7 @@ import (
 	mathrand "math/rand"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"crypto/ecdsa"
@@ -117,6 +120,100 @@ func TestPtDnsPumpZeroWriteRateDisablesPacing(t *testing.T) {
 	if _, _, err := destinationConn.ReadFrom(packetData); err != nil {
 		t.Fatalf("unpaced dns translation did not write: %v", err)
 	}
+}
+
+// The attempt owns its QUIC connection until either context cancellation or
+// ordinary cleanup closes it. sync.Once makes cleanup join a cancellation
+// close already in progress instead of returning while its socket workers live.
+func closePacketTranslationTestQuicConnection(
+	ctx context.Context,
+	connection interface {
+		CloseWithError(quic.ApplicationErrorCode, string) error
+	},
+	beforeCleanupWaitForTest func(),
+) func() {
+	var closeOnce sync.Once
+	closeConnection := func() {
+		closeOnce.Do(func() {
+			_ = connection.CloseWithError(0, "packet translation attempt complete")
+		})
+	}
+	stopClose := context.AfterFunc(ctx, closeConnection)
+	return func() {
+		stopClose()
+		if beforeCleanupWaitForTest != nil {
+			beforeCleanupWaitForTest()
+		}
+		closeConnection()
+	}
+}
+
+// A canceled attempt can enter connection Close while its owner is unwinding.
+// Cleanup must join that exact close before it publishes attempt completion.
+func TestPacketTranslationAttemptCleanupJoinsContextConnectionClose(t *testing.T) {
+	type blockingConnection struct {
+		closeStarted  chan struct{}
+		closeRelease  chan struct{}
+		closeComplete chan struct{}
+	}
+	connection := &blockingConnection{
+		closeStarted:  make(chan struct{}),
+		closeRelease:  make(chan struct{}),
+		closeComplete: make(chan struct{}),
+	}
+	closeWithError := func(quic.ApplicationErrorCode, string) error {
+		close(connection.closeStarted)
+		<-connection.closeRelease
+		close(connection.closeComplete)
+		return nil
+	}
+	wrappedConnection := &packetTranslationTestCloseConnection{
+		closeWithError: closeWithError,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cleanupEntered := make(chan struct{})
+	cleanup := closePacketTranslationTestQuicConnection(
+		ctx,
+		wrappedConnection,
+		func() {
+			close(cleanupEntered)
+		},
+	)
+	cancel()
+	<-connection.closeStarted
+
+	cleanupComplete := make(chan struct{})
+	go func() {
+		cleanup()
+		close(cleanupComplete)
+	}()
+	<-cleanupEntered
+	select {
+	case <-cleanupComplete:
+		t.Fatal("attempt cleanup returned before its context close completed")
+	default:
+	}
+	close(connection.closeRelease)
+	<-cleanupComplete
+	select {
+	case <-connection.closeComplete:
+	default:
+		t.Fatal("attempt cleanup returned before connection close publication")
+	}
+}
+
+// Adapts a barrier function to the QUIC connection close shape without
+// implementing unrelated connection behavior.
+type packetTranslationTestCloseConnection struct {
+	closeWithError func(quic.ApplicationErrorCode, string) error
+}
+
+func (self *packetTranslationTestCloseConnection) CloseWithError(
+	code quic.ApplicationErrorCode,
+	reason string,
+) error {
+	return self.closeWithError(code, reason)
 }
 
 func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, serverPtMode PacketTranslationMode, basePort int) {
@@ -250,6 +347,12 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 					reportErr(fmt.Errorf("server accept: %w", err))
 					return
 				}
+				closeEarlyConnection := closePacketTranslationTestQuicConnection(
+					handleCtx,
+					earlyConn,
+					nil,
+				)
+				defer closeEarlyConnection()
 				stream, err := earlyConn.AcceptStream(handleCtx)
 				if err != nil {
 					reportErr(fmt.Errorf("server accept stream: %w", err))
@@ -338,6 +441,12 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 				reportErr(fmt.Errorf("client dial: %w", err))
 				return false
 			}
+			closeConnection := closePacketTranslationTestQuicConnection(
+				handleCtx,
+				conn,
+				nil,
+			)
+			defer closeConnection()
 
 			stream, err := conn.OpenStream()
 			if err != nil {
