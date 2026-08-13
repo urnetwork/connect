@@ -1256,6 +1256,33 @@ type RemoteUserNatMultiClient struct {
 	// scoredPlacementEnabled); with that gate off, or with no classifier
 	// installed, nothing in this file's new routing code runs.
 	flowClassifier atomic.Pointer[FlowClassifier]
+	// rewardLock is the leaf lock guarding reward and providerPriors below --
+	// never the parent stateLock, on the same reasoning as
+	// reliabilitySettingsLock: the reward tap runs on the flow-close path
+	// (recordFlowReward) at flow-completion frequency, and giving it its own
+	// lock keeps that path off the parent lock entirely rather than adding
+	// contention to the hottest lock in the file. Only ever held across a map
+	// insert, an EWMA update, or a Snapshot copy -- never across I/O or
+	// another lock acquisition.
+	rewardLock sync.Mutex
+	// reward is the Phase 0 per-(class,exit) accumulator (routing_reward.go),
+	// created lazily on the first recorded sample. RewardInstrumentation's
+	// zero value must be fully inert -- see recordFlowReward's gate -- so
+	// this stays nil, not merely empty, until a sample is actually recorded.
+	reward *rewardAccumulator
+	// providerPriors is the in-memory EWMA/conviction store
+	// (routing_priors.go) that recordFlowReward's interval fold
+	// (foldRewardAndPersist) writes into and scoredPlacementReorder's bias
+	// consult (a later task) would read from. Created lazily, same
+	// zero-value-off discipline as reward above.
+	providerPriors *ProviderPriors
+	// priorsStore is the persistence seam for providerPriors: the
+	// platform-supplied dot-file-backed implementation, installed via
+	// SetPriorsStore. Mirrors flowClassifier exactly -- atomic pointer, nil
+	// clears, nil-safe throughout. nil (a bare client, or one never wired to
+	// a platform store) means in-memory-only priors, matching PriorsStore's
+	// own doc.
+	priorsStore atomic.Pointer[PriorsStore]
 	// appPinClients is the cross-version half of an app pin: the exit an
 	// app's flows are currently placed on, keyed by app id. The affinity
 	// groups are per-ip-version by construction (separate path maps), so a
@@ -1448,6 +1475,147 @@ func (self *RemoteUserNatMultiClient) setFlowClassifierUnlogged(c FlowClassifier
 		self.flowClassifier.Store(nil)
 	} else {
 		self.flowClassifier.Store(&c)
+	}
+}
+
+// SetPriorsStore installs (or, with nil, removes) the provider-priors
+// persistence seam (the sdk's dot-file-backed implementation in production).
+// Mirrors SetFlowClassifier: a bare atomic store, safe at runtime and on a
+// bare client.
+//
+// Installing a non-nil store immediately calls Load() and seeds
+// providerPriors from whatever was last persisted, so a restart resumes with
+// history instead of starting every provider neutral. This is the one place
+// in the reward path that may do real I/O (a dot-file read) -- deliberately
+// an explicit, one-time setup call, like SetServerNameLookup, and never
+// reachable from the flow-close or placement path. An empty or absent
+// Load() leaves providerPriors exactly as it was (nil until the first real
+// sample), so calling this before any reward has ever been recorded costs no
+// allocation.
+func (self *RemoteUserNatMultiClient) SetPriorsStore(store PriorsStore) {
+	loggerOrDefault(self.log).Infof("%s\n", relEvent(
+		"priors_store",
+		"installed", store != nil,
+	))
+
+	if store == nil {
+		self.priorsStore.Store(nil)
+		return
+	}
+	self.priorsStore.Store(&store)
+
+	loaded := store.Load()
+	if len(loaded) == 0 {
+		return
+	}
+	self.rewardLock.Lock()
+	defer self.rewardLock.Unlock()
+	if self.providerPriors == nil {
+		self.providerPriors = NewProviderPriors()
+	}
+	self.providerPriors.Load(loaded)
+}
+
+// recordFlowReward is the reward tap's per-flow half: called once a flow has
+// actually finished (sendUpdate's per-flow idle-timeout teardown goroutine,
+// both ip versions -- see the flow-close path there), with no lock held. It
+// stays as cheap as a placement decision -- a classify lookup, a metrics
+// snapshot already proven side-effect-free by exitMetricsSnapshot's own
+// contract, and a map insert under a leaf lock -- never I/O, never a
+// blocking call, matching the same discipline scoredPlacementReorder's
+// demotionObserve call already established.
+//
+// RewardInstrumentation's zero value is fully inert: off, this records
+// nothing and allocates nothing -- the accumulator is created lazily, only
+// once a sample is actually about to be recorded, so a build that never
+// turns the knob on never pays for it. class is derived exactly the way
+// scoredPlacementReorder derives it (classifyOrUnknown over the same
+// flowClassifier seam), so a flow's reward is filed under the same class its
+// placement decision used. flows is the caller's own flow-count read (the
+// same contract exitMetricsSnapshot documents), never re-read here.
+func (self *RemoteUserNatMultiClient) recordFlowReward(ipPath *IpPath, appId string, client *multiClientChannel, flows int) {
+	if client == nil || !self.reliabilitySettings().RewardInstrumentation {
+		return
+	}
+
+	var classifier FlowClassifier
+	if p := self.flowClassifier.Load(); p != nil {
+		classifier = *p
+	}
+	class := classifyOrUnknown(classifier, ipPath, appId).Class
+
+	metrics := exitMetricsSnapshot(client, flows)
+	stallFree := metrics.StallEvents == 0
+
+	self.rewardLock.Lock()
+	defer self.rewardLock.Unlock()
+	if self.reward == nil {
+		self.reward = newRewardAccumulator()
+	}
+	self.reward.add(class, client.ClientId().String(), metrics.GoodputBytesPerSec, stallFree)
+}
+
+// foldRewardAndPersist is the reward tap's interval-triggered half: it folds
+// whatever recordFlowReward has accumulated since the last tick into
+// providerPriors, logs the same interval as [rel] event=reward lines, and --
+// only if a store is installed -- persists the coarse ProviderPrior snapshot.
+// Called from runHeartbeat's own wake cadence rather than a new goroutine, so
+// persistence runs on a timer, never at flow-close frequency: draining the
+// accumulator every beat is what keeps a busy session from writing the
+// dot-file on every flow teardown.
+//
+// An empty interval (nothing recorded since the last tick, the common case
+// with RewardInstrumentation off, or an idle session with it on) costs one
+// lock acquisition and nothing else -- no log line, no Snapshot copy, no
+// Save call -- the same "idle session contributes nothing" discipline the
+// heartbeat line itself uses.
+//
+// No lock is held across the log calls or the Save call: the fold, the
+// drain, and the Snapshot copy all happen inside one short rewardLock
+// section, and the store's Save (the only I/O here) runs after that section
+// returns.
+func (self *RemoteUserNatMultiClient) foldRewardAndPersist() {
+	if !self.reliabilitySettings().RewardInstrumentation {
+		return
+	}
+
+	var lines []string
+	var snapshot map[string]ProviderPrior
+	haveSnapshot := false
+
+	func() {
+		self.rewardLock.Lock()
+		defer self.rewardLock.Unlock()
+
+		if self.reward == nil || len(self.reward.m) == 0 {
+			return
+		}
+		if self.providerPriors == nil {
+			self.providerPriors = NewProviderPriors()
+		}
+		self.reward.foldInto(self.providerPriors, time.Now().Unix())
+		lines = self.reward.drainLines()
+		snapshot = self.providerPriors.Snapshot()
+		haveSnapshot = true
+	}()
+
+	for _, line := range lines {
+		loggerOrDefault(self.log).Infof("%s\n", line)
+	}
+
+	if !haveSnapshot {
+		return
+	}
+	storePtr := self.priorsStore.Load()
+	if storePtr == nil {
+		return
+	}
+	if err := (*storePtr).Save(snapshot); err != nil {
+		loggerOrDefault(self.log).Infof("%s\n", relEvent(
+			"priors_persist",
+			"ok", false,
+			"err", err,
+		))
 	}
 }
 
@@ -3555,6 +3723,15 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 					}
 				}
 
+				// the reward tap's per-flow half (Task 5): this flow has just
+				// finished, so this is the flow-close path RewardInstrumentation
+				// consults. No lock is held here -- the locked section above
+				// already returned -- and recordFlowReward's own gate makes this
+				// a no-op (no allocation, no I/O) whenever the knob is off.
+				if self.reliabilitySettings().RewardInstrumentation && client != nil {
+					self.recordFlowReward(ipPath, update.pinAppId, client, client.flowCount())
+				}
+
 				select {
 				case <-self.ctx.Done():
 				case <-update.ctx.Done():
@@ -3718,6 +3895,11 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 					if success {
 						break
 					}
+				}
+
+				// the reward tap's per-flow half (see the v4 twin)
+				if self.reliabilitySettings().RewardInstrumentation && client != nil {
+					self.recordFlowReward(ipPath, update.pinAppId, client, client.flowCount())
 				}
 
 				select {

@@ -705,6 +705,17 @@ func (self *RemoteUserNatMultiClient) runHeartbeat() {
 		case <-time.After(wait):
 		}
 
+		// the reward-instrumentation fold+persist tick (Task 5): reuses this
+		// goroutine's own wake cadence instead of a dedicated one, which is
+		// what keeps priors persistence off the flow-close path -- see
+		// foldRewardAndPersist's own doc. Deliberately BEFORE the runtime
+		// heartbeat on/off check below, so toggling HeartbeatInterval off at
+		// runtime silences the narration line without also stopping reward
+		// samples from being folded and persisted. foldRewardAndPersist has
+		// its own RewardInstrumentation gate, so this costs one lock
+		// acquisition and nothing else when that knob is off.
+		self.foldRewardAndPersist()
+
 		// re-read after the wait: the heartbeat can be switched off at runtime,
 		// and the loop stays alive so switching it back on costs no reconnect
 		if self.reliabilitySettings().HeartbeatInterval <= 0 {
