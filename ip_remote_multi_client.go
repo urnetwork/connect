@@ -3104,11 +3104,24 @@ var demotionLogThrottle = newLogThrottle(classifyLogInterval)
 // MEASURED rtt, ignoring list order entirely. Most flows never race at all
 // (destination affinity short-circuits first). So promoting an exit to index
 // 0 changes goroutine launch order and the degenerate no-response lock-in,
-// and nothing else. The scorer becomes load-bearing only if
-// MultiRaceClientCount is raised above 0 -- and note that the wide race is
-// also currently the only thing preventing rich-get-richer starvation,
-// because a measured exit outscores an unmeasured one badly enough to defeat
-// lessLoadedTieBreak. Raising it is a design change, not a knob flip.
+// and nothing else.
+//
+// An earlier revision of this comment said the way to make the scorer
+// load-bearing was to raise MultiRaceClientCount above 0. DO NOT DO THAT
+// without reading the rest of this paragraph: the wide race is the only
+// thing preventing rich-get-richer starvation ON THIS PATH, because a
+// measured exit outscores an unmeasured one badly enough to defeat
+// lessLoadedTieBreak. Narrowing the race to give the scorer influence buys
+// that influence by spending a guard, over the minority of flows that race
+// at all.
+//
+// The learner is instead made load-bearing where the flows actually are:
+// ScoredAffinityDonor, on inheritAffinityClient{4,6}WithLock -- the FIRST of
+// sendUpdate's four placement steps, and the one that places most flows.
+// That knob costs no guard (MaxFlowsPerExit still gates the affinity path)
+// and cannot break site egress-ip consistency (its comparison only decides
+// anything for a group already spread across several exits). See its field
+// comment for the full argument.
 //
 // classifyOrUnknown is nil-safe, so an unset flowClassifier (every build by
 // default -- LightClassifier, Task 2's install knob, is zero-value-off)
