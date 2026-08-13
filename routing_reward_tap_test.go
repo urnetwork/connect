@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -352,6 +353,56 @@ func TestSetPriorsStoreNilClears(t *testing.T) {
 	parent.SetPriorsStore(nil)
 	if parent.priorsStore.Load() != nil {
 		t.Fatal("nil must clear the store")
+	}
+}
+
+// --- routing_reward.go: the cap drop counter, through the real tap ---
+
+// TestRecordFlowRewardCapDropIsReportedOnFold is the production-wiring twin
+// of TestRewardAccumulatorCapDropsAreCountedAndReported: it drives the cap
+// past its limit through the REAL per-flow tap (recordFlowReward) and the
+// REAL interval fold (foldRewardAndPersist), rather than poking the bare
+// accumulator directly, so it also proves the drop counter reaches the
+// actual [rel] log a field capture would see -- not just that the
+// accumulator's own bookkeeping is correct in isolation.
+func TestRecordFlowRewardCapDropIsReportedOnFold(t *testing.T) {
+	parent := &RemoteUserNatMultiClient{settings: DefaultMultiClientSettings()}
+	parent.settings.RewardInstrumentation = true
+	parent.SetFlowClassifier(fixedClassifier{class: ClassBulk})
+	ipPath := &IpPath{Version: 4, Protocol: IpProtocolTcp}
+
+	logger := newRecordingLogger()
+	parent.log = logger
+
+	// one class, rewardAccumulatorMaxKeys+3 distinct providers: every call
+	// is a genuinely new (class, exitId) key, so exactly 3 must be dropped.
+	const overflow = 3
+	for i := 0; i < rewardAccumulatorMaxKeys+overflow; i++ {
+		client := rewardTestGoodClient(NewId())
+		parent.recordFlowReward(ipPath, "", client, 0)
+	}
+	if parent.reward == nil || len(parent.reward.m) != rewardAccumulatorMaxKeys {
+		t.Fatalf("want the accumulator capped at %d keys before the fold, got %+v", rewardAccumulatorMaxKeys, parent.reward)
+	}
+	if parent.reward.dropped != overflow {
+		t.Fatalf("want dropped=%d on the live tap before the fold, got %d", overflow, parent.reward.dropped)
+	}
+
+	parent.foldRewardAndPersist()
+
+	dropLines := logger.linesWith("event=reward_dropped")
+	if len(dropLines) != 1 {
+		t.Fatalf("want exactly 1 event=reward_dropped line from the real fold, got %d: %v", len(dropLines), logger.lines())
+	}
+	for _, want := range []string{"[rel] event=reward_dropped", fmt.Sprintf("dropped=%d", overflow), fmt.Sprintf("cap=%d", rewardAccumulatorMaxKeys)} {
+		if !strings.Contains(dropLines[0], want) {
+			t.Fatalf("reward_dropped line %q missing %q", dropLines[0], want)
+		}
+	}
+	// the ordinary per-key reward lines must still be there too -- the cap
+	// bites 3 providers, not the other 256 that fit.
+	if got := len(logger.linesWith("event=reward ")); got != rewardAccumulatorMaxKeys {
+		t.Fatalf("want %d event=reward lines for the 256 providers that fit, got %d", rewardAccumulatorMaxKeys, got)
 	}
 }
 

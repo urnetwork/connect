@@ -17,6 +17,14 @@ type rewardStat struct {
 
 type rewardAccumulator struct {
 	m map[rewardKey]*rewardStat
+	// dropped counts (class, exitId) keys rejected by add's cap check since
+	// the last drainLines reset -- see rewardAccumulatorMaxKeys's own doc.
+	// This project has already been bitten twice by a silent cap (the
+	// quarantine reconviction count was the first); a bound that drops
+	// coverage without saying so is the same defect again. drainLines
+	// surfaces this as its own [rel] line only when it is nonzero, so an
+	// idle or unsaturated session costs nothing extra to read.
+	dropped int
 }
 
 func newRewardAccumulator() *rewardAccumulator {
@@ -33,8 +41,13 @@ func newRewardAccumulator() *rewardAccumulator {
 // many distinct (class, exit) pairs. Once at the cap, a brand-new key is
 // dropped rather than added; an already-tracked key keeps accumulating (it
 // is already paying rent, and this is a leak guard, not a fairness policy).
-// 256 mirrors maxRestoredWindowIdentityCount's own "several generations of
-// slack over a normal window" sizing.
+// A drop is never silent: rewardAccumulator.dropped counts it, and
+// drainLines surfaces the count on an event=reward_dropped line the next
+// time it is nonzero. 256 mirrors maxRestoredWindowIdentityCount's own
+// "several generations of slack over a normal window" sizing. Note the cap
+// is really "256 / number-of-classes providers" in the worst case (all
+// traffic filed under one TrafficClass), since keys are (class, exitId)
+// pairs, not exitId alone.
 const rewardAccumulatorMaxKeys = 256
 
 func (r *rewardAccumulator) add(class TrafficClass, exitId string, goodputBytes float64, stallFree bool) {
@@ -42,6 +55,7 @@ func (r *rewardAccumulator) add(class TrafficClass, exitId string, goodputBytes 
 	s := r.m[k]
 	if s == nil {
 		if rewardAccumulatorMaxKeys <= len(r.m) {
+			r.dropped++
 			return
 		}
 		s = &rewardStat{}
@@ -54,8 +68,19 @@ func (r *rewardAccumulator) add(class TrafficClass, exitId string, goodputBytes 
 	}
 }
 
-// drainLines emits one grammar line per key and resets. Interval-triggered by
-// the caller (the heartbeat tick), never per-packet.
+// drainLines emits one grammar line per key, plus (only when nonzero) one
+// more line reporting how many distinct (class, exitId) keys this interval
+// dropped for being past rewardAccumulatorMaxKeys, then resets both the
+// stats map and the drop counter. Interval-triggered by the caller (the
+// heartbeat tick), never per-packet.
+//
+// The drop line is deliberately NOT folded into event=reward as a per-key
+// field: a drop is a fact about the accumulator as a whole (a key that never
+// got an entry at all), not about any one key's stats, so it would be either
+// duplicated onto every line or attached arbitrarily to one of them. A
+// dedicated event, emitted only when there is something to report, keeps
+// `grep 'event=reward'` free of a field that is almost always absent while
+// still making an actual drop impossible to miss.
 //
 // Built on relEvent (ip_remote_multi_client_observability.go) like every
 // other structured line in this codebase, rather than a hand-rolled format
@@ -67,23 +92,31 @@ func (r *rewardAccumulator) add(class TrafficClass, exitId string, goodputBytes 
 // actually keys the map and what foldInto persists; only the log line is
 // shortened.
 func (r *rewardAccumulator) drainLines() []string {
-	if len(r.m) == 0 {
-		return nil
+	var lines []string
+	if 0 < len(r.m) {
+		lines = make([]string, 0, len(r.m)+1)
+		for k, s := range r.m {
+			avg := s.goodputSum / float64(s.samples)
+			frac := float64(s.stallFreeN) / float64(s.samples)
+			lines = append(lines, relEvent(
+				"reward",
+				"class", k.Class,
+				"exit", rewardExitDisplay(k.ExitId),
+				"samples", s.samples,
+				"goodput", avg,
+				"stallfree", frac,
+			))
+		}
 	}
-	lines := make([]string, 0, len(r.m))
-	for k, s := range r.m {
-		avg := s.goodputSum / float64(s.samples)
-		frac := float64(s.stallFreeN) / float64(s.samples)
+	if 0 < r.dropped {
 		lines = append(lines, relEvent(
-			"reward",
-			"class", k.Class,
-			"exit", rewardExitDisplay(k.ExitId),
-			"samples", s.samples,
-			"goodput", avg,
-			"stallfree", frac,
+			"reward_dropped",
+			"dropped", r.dropped,
+			"cap", rewardAccumulatorMaxKeys,
 		))
 	}
 	r.m = map[rewardKey]*rewardStat{}
+	r.dropped = 0
 	return lines
 }
 
