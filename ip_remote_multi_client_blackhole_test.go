@@ -743,7 +743,7 @@ func TestFormationPollTimeoutDefaults(t *testing.T) {
 }
 
 // TestFormationFastPollGuardsEmptyWindowOnly pins where the fast poll applies:
-// sendPacket's retry loop consults FormationPollTimeout only on the
+// sendParsedPacketGroup's retry loop consults FormationPollTimeout only on the
 // zero-candidates branch (the window has no offer at all), never as a general
 // retry accelerant — candidates that exist, including the benched fallback,
 // keep the SendRetryTimeout pacing.
@@ -753,18 +753,18 @@ func TestFormationFastPollGuardsEmptyWindowOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	body, ok := functionBody(source, "func (self *RemoteUserNatMultiClient) sendPacket(")
+	body, ok := functionBody(source, "func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(")
 	if !ok {
-		t.Fatal("could not find sendPacket")
+		t.Fatal("could not find sendParsedPacketGroup")
 	}
 
 	emptyBranch := "if len(orderedClients) == 0 {"
 	branchStart := strings.Index(body, emptyBranch)
 	if branchStart < 0 {
-		t.Fatal("sendPacket's retry loop has no empty-candidates branch")
+		t.Fatal("sendParsedPacketGroup's retry loop has no empty-candidates branch")
 	}
 	if !strings.Contains(body, "FormationPollTimeout") {
-		t.Fatal("sendPacket does not consult FormationPollTimeout")
+		t.Fatal("sendParsedPacketGroup does not consult FormationPollTimeout")
 	}
 	// the consult must live inside the empty branch: after its start, before
 	// the race call that only runs with candidates

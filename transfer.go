@@ -88,13 +88,18 @@ type sendAckRecord struct {
 	target    sendAckTarget
 	value     ByteCount
 	lifecycle sendPackLifecycleRecord
+	group     *sendGroupCompletion
 }
 
 func (self sendAckRecord) empty() bool {
-	return self.callback == nil && self.target == nil && self.lifecycle.empty()
+	return self.callback == nil && self.target == nil && self.lifecycle.empty() && self.group == nil
 }
 
 func (self sendAckRecord) invoke(err error) {
+	if self.group != nil {
+		self.group.terminal(err)
+		return
+	}
 	defer self.lifecycle.terminal(err)
 	if self.target == nil {
 		safeAck(self.callback, err)
@@ -108,6 +113,14 @@ func (self sendAckRecord) invoke(err error) {
 		}
 	}()
 	self.target.sendAckResult(self.value, err)
+}
+
+func (self sendAckRecord) firstRouteWrite(err error) {
+	if self.group != nil {
+		self.group.firstRouteWrite(err)
+		return
+	}
+	self.lifecycle.firstRouteWrite(err)
 }
 
 // One original SendPack retains one immutable identity across coalescing,
@@ -185,15 +198,20 @@ type noAckSendRecord struct {
 	clientId      Id
 	destinationId Id
 	token         uint64
+	group         *sendGroupCompletion
 }
 
 // An empty record adds no callback or token work to the normal send path.
 func (self noAckSendRecord) empty() bool {
-	return self.observer == nil
+	return self.observer == nil && self.group == nil
 }
 
 // Completion invokes the nonblocking observer with the immutable identity.
 func (self noAckSendRecord) complete(err error) {
+	if self.group != nil {
+		self.group.noAckComplete(err)
+		return
+	}
 	if self.observer == nil {
 		return
 	}
@@ -204,6 +222,119 @@ func (self noAckSendRecord) complete(err error) {
 		Token:         self.token,
 		Err:           err,
 	})
+}
+
+// sendGroupCompletion joins the independently acknowledged wire chunks of one
+// logical group back into the admission's single callback and observation
+// identity. Each phase waits for every chunk disposition; no chunk can publish
+// an early success while a later materialization or writer fails.
+type sendGroupCompletion struct {
+	mutex sync.Mutex
+
+	chunkCount int
+
+	firstRouteCount int
+	firstRouteErr   error
+	firstRouteDone  bool
+	firstRouteReady chan struct{}
+
+	noAckCount int
+	noAckErr   error
+	noAckDone  bool
+
+	terminalCount int
+	terminalErr   error
+	terminalDone  bool
+
+	ack   sendAckRecord
+	noAck noAckSendRecord
+}
+
+func newSendGroupCompletion(sendPack *SendPack, chunkCount int) *sendGroupCompletion {
+	return &sendGroupCompletion{
+		chunkCount:      chunkCount,
+		ack:             sendPack.ackRecord(),
+		noAck:           sendPack.noAckRecord(),
+		firstRouteReady: make(chan struct{}),
+	}
+}
+
+func (self *sendGroupCompletion) chunkAckRecord() sendAckRecord {
+	return sendAckRecord{group: self}
+}
+
+func (self *sendGroupCompletion) chunkNoAckRecord() noAckSendRecord {
+	if self.noAck.empty() {
+		return noAckSendRecord{}
+	}
+	return noAckSendRecord{group: self}
+}
+
+func (self *sendGroupCompletion) firstRouteWrite(err error) {
+	self.mutex.Lock()
+	if self.firstRouteDone {
+		self.mutex.Unlock()
+		return
+	}
+	self.firstRouteCount += 1
+	self.firstRouteErr = errors.Join(self.firstRouteErr, err)
+	if self.firstRouteCount < self.chunkCount {
+		self.mutex.Unlock()
+		return
+	}
+	self.firstRouteDone = true
+	result := self.firstRouteErr
+	lifecycle := self.ack.lifecycle
+	// The lifecycle callback is synchronous intentional backpressure. Retain
+	// the completion lock until it returns so terminal cannot overtake this
+	// phase; the callback has no handle back into this private aggregator.
+	lifecycle.firstRouteWrite(result)
+	close(self.firstRouteReady)
+	self.mutex.Unlock()
+}
+
+func (self *sendGroupCompletion) noAckComplete(err error) {
+	self.mutex.Lock()
+	if self.noAckDone {
+		self.mutex.Unlock()
+		return
+	}
+	self.noAckCount += 1
+	self.noAckErr = errors.Join(self.noAckErr, err)
+	if self.noAckCount < self.chunkCount {
+		self.mutex.Unlock()
+		return
+	}
+	self.noAckDone = true
+	result := self.noAckErr
+	record := self.noAck
+	self.mutex.Unlock()
+
+	record.complete(result)
+}
+
+func (self *sendGroupCompletion) terminal(err error) {
+	self.mutex.Lock()
+	if self.terminalDone {
+		self.mutex.Unlock()
+		return
+	}
+	self.terminalCount += 1
+	self.terminalErr = errors.Join(self.terminalErr, err)
+	if self.terminalCount < self.chunkCount {
+		self.mutex.Unlock()
+		return
+	}
+	self.terminalDone = true
+	result := self.terminalErr
+	record := self.ack
+	firstRouteReady := self.firstRouteReady
+	self.mutex.Unlock()
+
+	// Lifecycle phases for one logical admission remain ordered even when a
+	// reliable Ack races the last chunk's first-route observer.
+	<-firstRouteReady
+	record.invoke(result)
 }
 
 // The set is bounded by the packet coalescer's hard two-Pack limit.
@@ -260,7 +391,7 @@ func (self *sendAckSet) invoke(err error) {
 // Pack record while retaining their distinct identities.
 func (self *sendAckSet) firstRouteWrite(err error) {
 	for index := range int(self.count) {
-		self.records[index].lifecycle.firstRouteWrite(err)
+		self.records[index].firstRouteWrite(err)
 	}
 }
 
@@ -443,16 +574,22 @@ type SendPack struct {
 
 	// frame and destination is repacked by the send buffer into a Pack,
 	// with destination and frame from the tframe, and other pack properties filled in by the buffer.
-	// Frames, when set, carries a batch of frames coalesced into ONE wire Pack
-	// (one sequence number, one ack) — the send machinery already marshals a
-	// frame slice, so a batch collapses the per-frame route/transport handoffs
-	// to one for the whole batch. Frame is the single-frame form; exactly one
-	// of Frame / Frames is set. See `SendPack.frameList`.
+	// Frames normally carries a batch coalesced into ONE wire Pack (one sequence
+	// number, one Ack). A logicalGroup is the explicit exception: it owns the
+	// whole slice at one admission, then its SendSequence advances ordered
+	// transport-bounded chunks without another routing decision. Frame is the
+	// single-frame form; exactly one of Frame / Frames is set. See frameList.
 	// Ownership: the pack owns the Frames slice (referenced asynchronously
 	// until marshal) — the sender must not reuse its backing array, per the
 	// message pool send-ownership rule.
 	Frame  *protocol.Frame
 	Frames []*protocol.Frame
+	// logicalGroup marks Frames as one admission/completion unit. The owning
+	// SendSequence may split it into ordered wire Packs at the transport-safe
+	// frame/byte bounds without returning to Client routing or admission.
+	logicalGroup    bool
+	groupFrameIndex int
+	groupCompletion *sendGroupCompletion
 	// singleFrame backs frameList for the common single-frame form so the
 	// multi-frame generalization does not add one slice allocation to every
 	// legacy send.
@@ -1271,6 +1408,65 @@ func (self *SendPack) returnFrames() {
 	}
 }
 
+// nextSendGroupChunkEnd returns the exclusive end of the next ordered wire
+// chunk. This phase deliberately reuses the existing two-frame / 3 KiB message
+// payload heuristic. That is not exact final 4 KiB TransferFrame sizing; exact
+// protobuf, contract, and encryption-envelope accounting is separate work. One
+// oversized frame still advances alone: admission already owns it, and refusing
+// to advance would strand the group's remaining owners.
+func nextSendGroupChunkEnd(frames []*protocol.Frame, start int) int {
+	end := start
+	messageByteCount := ByteCount(0)
+	for end < len(frames) {
+		nextMessageByteCount := messageByteCount + ByteCount(len(frames[end].MessageBytes))
+		if start < end && (sendPackBatchMaxFrames <= end-start ||
+			sendPackBatchMaxMessageByteCount < nextMessageByteCount) {
+			break
+		}
+		messageByteCount = nextMessageByteCount
+		end += 1
+		if sendPackBatchMaxFrames <= end-start {
+			break
+		}
+	}
+	return end
+}
+
+func sendGroupChunkCount(frames []*protocol.Frame) int {
+	chunkCount := 0
+	for start := 0; start < len(frames); {
+		start = nextSendGroupChunkEnd(frames, start)
+		chunkCount += 1
+	}
+	return chunkCount
+}
+
+// disposeUnsentGroup completes and releases only chunks that have not reached
+// serialization. Already materialized chunks retain their independent send
+// item ownership and converge on the same group completion during teardown.
+func (self *SendPack) disposeUnsentGroup(err error) {
+	if !self.logicalGroup || self.groupCompletion == nil {
+		self.completeLifecycleFirstRouteWrite(err)
+		self.completeNoAck(err)
+		self.invokeAck(err)
+		self.returnFrames()
+		self.releaseRaw()
+		return
+	}
+
+	for self.groupFrameIndex < len(self.Frames) {
+		end := nextSendGroupChunkEnd(self.Frames, self.groupFrameIndex)
+		for _, frame := range self.Frames[self.groupFrameIndex:end] {
+			MessagePoolReturn(frame.MessageBytes)
+		}
+		self.groupFrameIndex = end
+		self.groupCompletion.firstRouteWrite(err)
+		self.groupCompletion.noAckComplete(err)
+		self.groupCompletion.terminal(err)
+	}
+	self.releaseRaw()
+}
+
 // SendMultiWithTimeout sends a batch of frames as ONE wire Pack to
 // destination (one sequence number, one ack covering the batch). The frames
 // must share a destination and ack lifetime — the return egress path uses it
@@ -1315,6 +1511,47 @@ func (self *Client) SendMultiWithTimeout(
 	}
 	success, err := self.enqueueSendPack(sendPack, timeout)
 	return success && err == nil
+}
+
+// sendMultiHopGroupWithTimeoutDetailed admits one logical frame group through
+// a nonempty intermediary path. Wire-size chunking remains inside the selected
+// SendSequence, so chunks preserve ordering and cannot rerun caller routing.
+func (self *Client) sendMultiHopGroupWithTimeoutDetailed(
+	frames []*protocol.Frame,
+	destination MultiHopId,
+	ackCallback AckFunction,
+	timeout time.Duration,
+	opts ...any,
+) (bool, error) {
+	if destination.Len() == 0 {
+		return false, errors.New("Must have at least one destination id.")
+	}
+	intermediaryIds, destinationId := destination.SplitTail()
+	if len(frames) == 0 {
+		return true, nil
+	}
+
+	select {
+	case <-self.ctx.Done():
+		return false, errors.New("Done")
+	default:
+	}
+
+	resolved := self.resolveSendOptions(opts)
+
+	sendPack := &SendPack{
+		TransferOptions:     resolved.transferOptions,
+		Frames:              frames,
+		logicalGroup:        true,
+		Destination:         destinationId,
+		IntermediaryIds:     intermediaryIds,
+		AckCallback:         ackCallback,
+		MessageByteCount:    MessageByteCount(frames),
+		Ctx:                 resolved.ctx,
+		EncryptionRole:      resolved.encryptionRole,
+		EncryptionCompanion: resolved.encryptionCompanion,
+	}
+	return self.enqueueSendPack(sendPack, timeout)
 }
 
 func (self *Client) sendWithTimeoutDetailed(
@@ -2539,6 +2776,10 @@ type SendBufferSettings struct {
 	beforeCloseWaitForTest          func(sendSequenceId)
 	beforeResendCapacityWaitForTest func(sendSequenceId)
 	afterRunSendSequenceForTest     func(sendSequenceId)
+	// Runs synchronously after one reliable send item reaches terminal Ack
+	// disposition and before the Ack worker advances to another item.
+	afterAckSendItemForTest               func(sendSequenceId, uint64)
+	afterCreateSendGroupCompletionForTest func(sendSequenceId, int)
 	// Nil test barrier pauses one encrypted-control owner before Pack.
 	beforeEncryptedControlPackForTest func([]byte)
 	forceAckTimeoutForTest            func(sendSequenceId) bool
@@ -2683,39 +2924,43 @@ type SendBuffer struct {
 
 	// Nil test barriers expose exact sequence lifecycle boundaries without
 	// changing production behavior or relying on scheduler timing in regressions.
-	beforeCreateSendSequenceForTest   func(sendSequenceId)
-	beforeRunSendSequenceForTest      func(sendSequenceId)
-	beforeCloseWaitForTest            func(sendSequenceId)
-	beforeResendCapacityWaitForTest   func(sendSequenceId)
-	afterRunSendSequenceForTest       func(sendSequenceId)
-	beforeEncryptedControlPackForTest func([]byte)
-	forceAckTimeoutForTest            func(sendSequenceId) bool
-	forceContractFailureForTest       func(sendSequenceId) bool
-	forceResendForTest                func(sendSequenceId) bool
+	beforeCreateSendSequenceForTest       func(sendSequenceId)
+	beforeRunSendSequenceForTest          func(sendSequenceId)
+	beforeCloseWaitForTest                func(sendSequenceId)
+	beforeResendCapacityWaitForTest       func(sendSequenceId)
+	afterRunSendSequenceForTest           func(sendSequenceId)
+	afterAckSendItemForTest               func(sendSequenceId, uint64)
+	afterCreateSendGroupCompletionForTest func(sendSequenceId, int)
+	beforeEncryptedControlPackForTest     func([]byte)
+	forceAckTimeoutForTest                func(sendSequenceId) bool
+	forceContractFailureForTest           func(sendSequenceId) bool
+	forceResendForTest                    func(sendSequenceId) bool
 }
 
 func NewSendBuffer(ctx context.Context,
 	client *Client,
 	sendBufferSettings *SendBufferSettings) *SendBuffer {
 	return &SendBuffer{
-		ctx:                               ctx,
-		client:                            client,
-		log:                               client.log,
-		sendBufferSettings:                sendBufferSettings,
-		sendSequences:                     map[sendSequenceId]*SendSequence{},
-		wireSendSequences:                 map[sendSequenceWireId]*SendSequence{},
-		sendSequencesByDestination:        map[Id]map[*SendSequence]bool{},
-		sendSequenceDestinations:          map[*SendSequence]map[Id]bool{},
-		activeSendSequences:               map[*SendSequence]bool{},
-		beforeCreateSendSequenceForTest:   sendBufferSettings.beforeCreateSendSequenceForTest,
-		beforeRunSendSequenceForTest:      sendBufferSettings.beforeRunSendSequenceForTest,
-		beforeCloseWaitForTest:            sendBufferSettings.beforeCloseWaitForTest,
-		beforeResendCapacityWaitForTest:   sendBufferSettings.beforeResendCapacityWaitForTest,
-		afterRunSendSequenceForTest:       sendBufferSettings.afterRunSendSequenceForTest,
-		beforeEncryptedControlPackForTest: sendBufferSettings.beforeEncryptedControlPackForTest,
-		forceAckTimeoutForTest:            sendBufferSettings.forceAckTimeoutForTest,
-		forceContractFailureForTest:       sendBufferSettings.forceContractFailureForTest,
-		forceResendForTest:                sendBufferSettings.forceResendForTest,
+		ctx:                                   ctx,
+		client:                                client,
+		log:                                   client.log,
+		sendBufferSettings:                    sendBufferSettings,
+		sendSequences:                         map[sendSequenceId]*SendSequence{},
+		wireSendSequences:                     map[sendSequenceWireId]*SendSequence{},
+		sendSequencesByDestination:            map[Id]map[*SendSequence]bool{},
+		sendSequenceDestinations:              map[*SendSequence]map[Id]bool{},
+		activeSendSequences:                   map[*SendSequence]bool{},
+		beforeCreateSendSequenceForTest:       sendBufferSettings.beforeCreateSendSequenceForTest,
+		beforeRunSendSequenceForTest:          sendBufferSettings.beforeRunSendSequenceForTest,
+		beforeCloseWaitForTest:                sendBufferSettings.beforeCloseWaitForTest,
+		beforeResendCapacityWaitForTest:       sendBufferSettings.beforeResendCapacityWaitForTest,
+		afterRunSendSequenceForTest:           sendBufferSettings.afterRunSendSequenceForTest,
+		afterAckSendItemForTest:               sendBufferSettings.afterAckSendItemForTest,
+		afterCreateSendGroupCompletionForTest: sendBufferSettings.afterCreateSendGroupCompletionForTest,
+		beforeEncryptedControlPackForTest:     sendBufferSettings.beforeEncryptedControlPackForTest,
+		forceAckTimeoutForTest:                sendBufferSettings.forceAckTimeoutForTest,
+		forceContractFailureForTest:           sendBufferSettings.forceContractFailureForTest,
+		forceResendForTest:                    sendBufferSettings.forceResendForTest,
 	}
 }
 
@@ -3583,6 +3828,74 @@ func (self *SendSequence) Ack(ack *protocol.Ack, timeout time.Duration) (bool, e
 	}
 }
 
+// processLogicalGroupChunk materializes at most one transport-safe wire Pack.
+// Returning one chunk per Run iteration preserves resend-budget backpressure;
+// the retained SendPack cursor remains the sole owner of every later frame.
+func (self *SendSequence) processLogicalGroupChunk(sendPack *SendPack) (bool, bool) {
+	start := sendPack.groupFrameIndex
+	end := nextSendGroupChunkEnd(sendPack.Frames, start)
+	frames := sendPack.Frames[start:end]
+	messageByteCount := MessageByteCount(frames)
+	if sendPack.groupCompletion == nil && end == len(sendPack.Frames) {
+		if !self.updateContract(messageByteCount) {
+			err := errors.New("No contract")
+			self.log.Errorf(
+				"[s]%s->%s...%s s(%s) exit could not create contract.\n",
+				self.client.ClientTag(),
+				self.contractIntermediaryIds(),
+				self.destination,
+				self.contractMultiRouteWriterAlias.StreamId,
+			)
+			sendPack.disposeUnsentGroup(err)
+			return true, false
+		}
+		self.sendRecord(
+			frames,
+			sendPack.ackRecord(),
+			sendPack.noAckRecord(),
+			sendPack.Ack,
+			sendPack.ForceUnwrapped,
+		)
+		sendPack.groupFrameIndex = end
+		sendPack.releaseRaw()
+		return true, true
+	}
+	if sendPack.groupCompletion == nil {
+		chunkCount := sendGroupChunkCount(sendPack.Frames)
+		sendPack.groupCompletion = newSendGroupCompletion(sendPack, chunkCount)
+		if self.sendBuffer != nil &&
+			self.sendBuffer.afterCreateSendGroupCompletionForTest != nil {
+			self.sendBuffer.afterCreateSendGroupCompletionForTest(self.id(), chunkCount)
+		}
+	}
+	if !self.updateContract(messageByteCount) {
+		err := errors.New("No contract")
+		self.log.Errorf(
+			"[s]%s->%s...%s s(%s) exit could not create contract.\n",
+			self.client.ClientTag(),
+			self.contractIntermediaryIds(),
+			self.destination,
+			self.contractMultiRouteWriterAlias.StreamId,
+		)
+		sendPack.disposeUnsentGroup(err)
+		return true, false
+	}
+
+	self.sendRecord(
+		frames,
+		sendPack.groupCompletion.chunkAckRecord(),
+		sendPack.groupCompletion.chunkNoAckRecord(),
+		sendPack.Ack,
+		sendPack.ForceUnwrapped,
+	)
+	sendPack.groupFrameIndex = end
+	if end < len(sendPack.Frames) {
+		return false, true
+	}
+	sendPack.releaseRaw()
+	return true, true
+}
+
 func (self *SendSequence) Run() {
 	ackWorkerDone := make(chan struct{})
 	ackWorkerStarted := false
@@ -3689,11 +4002,7 @@ func (self *SendSequence) Run() {
 			return
 		}
 		err := errors.New("Send sequence closed.")
-		pendingSendPack.completeLifecycleFirstRouteWrite(err)
-		pendingSendPack.completeNoAck(err)
-		pendingSendPack.invokeAck(err)
-		pendingSendPack.returnFrames()
-		pendingSendPack.releaseRaw()
+		pendingSendPack.disposeUnsentGroup(err)
 		pendingSendPack = nil
 	}()
 	packsClosed := false
@@ -3886,6 +4195,13 @@ func (self *SendSequence) Run() {
 			processPack := func(sendPack *SendPack, ok bool) bool {
 				if !ok {
 					return false
+				}
+				if sendPack.logicalGroup {
+					complete, success := self.processLogicalGroupChunk(sendPack)
+					if !complete {
+						pendingSendPack = sendPack
+					}
+					return success && !packsClosed
 				}
 
 				sendPacks := [sendPackBatchMaxFrames]*SendPack{sendPack}
@@ -4794,6 +5110,9 @@ func (self *SendSequence) receiveAck(messageId Id, selective bool, tag sequenceT
 		}
 
 		self.ackItem(implicitItem)
+		if self.sendBuffer != nil && self.sendBuffer.afterAckSendItemForTest != nil {
+			self.sendBuffer.afterAckSendItemForTest(self.id(), implicitSequenceNumber)
+		}
 		self.sendItems[i] = nil
 
 		if self.log.V(2).Enabled() {
@@ -5086,11 +5405,7 @@ func (self *SendSequence) Close() {
 					return
 				}
 				err := errors.New("Send sequence closed.")
-				sendPack.completeLifecycleFirstRouteWrite(err)
-				sendPack.completeNoAck(err)
-				sendPack.invokeAck(err)
-				sendPack.returnFrames()
-				sendPack.releaseRaw()
+				sendPack.disposeUnsentGroup(err)
 			default:
 				return
 			}

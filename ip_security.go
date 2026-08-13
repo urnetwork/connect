@@ -81,6 +81,19 @@ type borrowedEgressSecurityPolicy interface {
 	) (SecurityPolicyResult, error)
 }
 
+// borrowedEgressGroupSecurityPolicy makes one policy decision for an ordered,
+// homogeneous directional-flow group. Implementations may inspect every
+// payload internally, but endpoint policy, statistics, and activity refresh
+// happen once for the group. The paths, their address slices, and the payloads
+// are borrowed for the duration of the call.
+type borrowedEgressGroupSecurityPolicy interface {
+	inspectAndRefreshEgressGroupBorrowed(
+		provideMode protocol.ProvideMode,
+		ipPaths []IpPath,
+		payloads [][]byte,
+	) (SecurityPolicyResult, error)
+}
+
 func inspectAndRefreshEgressBorrowed(
 	policy SecurityPolicy,
 	provideMode protocol.ProvideMode,
@@ -91,6 +104,88 @@ func inspectAndRefreshEgressBorrowed(
 		return borrowed.inspectAndRefreshEgressBorrowed(provideMode, ipPath, payload)
 	}
 	return inspectAndRefreshEgressFallback(policy, provideMode, ipPath, payload)
+}
+
+// Makes one conservative decision for a homogeneous packet group. Custom
+// policies retain their existing per-packet inspection API, so the fallback
+// calls it in order and folds the results before refreshing the flow once.
+func inspectAndRefreshEgressGroupBorrowed(
+	policy SecurityPolicy,
+	provideMode protocol.ProvideMode,
+	ipPaths []IpPath,
+	payloads [][]byte,
+) (SecurityPolicyResult, error) {
+	if len(ipPaths) == 0 || len(ipPaths) != len(payloads) {
+		return SecurityPolicyResultIncident, fmt.Errorf(
+			"invalid security policy group cardinality paths=%d payloads=%d",
+			len(ipPaths),
+			len(payloads),
+		)
+	}
+	if borrowed, ok := policy.(borrowedEgressGroupSecurityPolicy); ok {
+		return borrowed.inspectAndRefreshEgressGroupBorrowed(
+			provideMode,
+			ipPaths,
+			payloads,
+		)
+	}
+	return inspectAndRefreshEgressGroupFallback(
+		policy,
+		provideMode,
+		ipPaths,
+		payloads,
+	)
+}
+
+// Keep custom pointer calls outside the built-in dispatcher so their path
+// copies may escape without forcing the built-in group metadata to escape.
+//
+//go:noinline
+func inspectAndRefreshEgressGroupFallback(
+	policy SecurityPolicy,
+	provideMode protocol.ProvideMode,
+	ipPaths []IpPath,
+	payloads [][]byte,
+) (SecurityPolicyResult, error) {
+	groupResult := SecurityPolicyResultAllow
+	for packetIndex := range ipPaths {
+		ipPath := ipPaths[packetIndex]
+		result, err := policy.InspectEgress(
+			provideMode,
+			&ipPath,
+			payloads[packetIndex],
+		)
+		if err != nil {
+			return result, err
+		}
+		groupResult = conservativeSecurityPolicyResult(groupResult, result)
+	}
+	refreshPath := ipPaths[0]
+	policy.RefreshEgress(&refreshPath)
+	return groupResult, nil
+}
+
+// Incidents are never overridable, and a drop in any group member prevents
+// the group from reaching a provider. Unknown results are incident-class.
+func conservativeSecurityPolicyResult(
+	groupResult SecurityPolicyResult,
+	memberResult SecurityPolicyResult,
+) SecurityPolicyResult {
+	if groupResult != SecurityPolicyResultAllow &&
+		groupResult != SecurityPolicyResultDrop {
+		return SecurityPolicyResultIncident
+	}
+	switch memberResult {
+	case SecurityPolicyResultAllow:
+		return groupResult
+	case SecurityPolicyResultDrop:
+		if groupResult == SecurityPolicyResultAllow {
+			return SecurityPolicyResultDrop
+		}
+		return groupResult
+	default:
+		return SecurityPolicyResultIncident
+	}
 }
 
 // Keep the address-taking fallback in a separate non-inlined function. Escape
@@ -234,6 +329,43 @@ func (self *securityPolicy) inspectAndRefreshEgressBorrowed(
 	return result, err
 }
 
+func (self *securityPolicy) inspectAndRefreshEgressGroupBorrowed(
+	provideMode protocol.ProvideMode,
+	ipPaths []IpPath,
+	payloads [][]byte,
+) (SecurityPolicyResult, error) {
+	ipPath := &ipPaths[0]
+	result := SecurityPolicyResultAllow
+	if provideMode != protocol.ProvideMode_Network {
+		if !isPublicUnicast(ipPath.DestinationIp) {
+			result = SecurityPolicyResultIncident
+		} else {
+			switch self.cfaa.inspect(
+				ipPath.DestinationIp,
+				ipPath.DestinationPort,
+				ipPath.Protocol,
+				ipPath.Version,
+			) {
+			case cfaaDrop:
+				result = SecurityPolicyResultDrop
+			case cfaaAllow:
+				result = SecurityPolicyResultAllow
+			default:
+				for packetIndex := range payloads {
+					memberResult := self.dmca.result(self.dmca.classify(
+						&ipPaths[packetIndex],
+						payloads[packetIndex],
+					))
+					result = conservativeSecurityPolicyResult(result, memberResult)
+				}
+			}
+		}
+	}
+	self.stats.AddDestination(ipPath, result, uint64(len(ipPaths)))
+	self.dmca.touchEgress(ipPath)
+	return result, nil
+}
+
 func (self *securityPolicy) inspectEgress(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error) {
 	if protocol.ProvideMode_Network == provideMode {
 		return SecurityPolicyResultAllow, nil
@@ -353,6 +485,14 @@ func (self *disableSecurityPolicy) inspectAndRefreshEgressBorrowed(
 	provideMode protocol.ProvideMode,
 	ipPath IpPath,
 	payload []byte,
+) (SecurityPolicyResult, error) {
+	return SecurityPolicyResultAllow, nil
+}
+
+func (self *disableSecurityPolicy) inspectAndRefreshEgressGroupBorrowed(
+	provideMode protocol.ProvideMode,
+	ipPaths []IpPath,
+	payloads [][]byte,
 ) (SecurityPolicyResult, error) {
 	return SecurityPolicyResultAllow, nil
 }

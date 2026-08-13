@@ -31,9 +31,28 @@ import (
 // IpMuxSend matches the UserNat send signature.
 type IpMuxSend = func(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool
 
+// ipPacketGroupSend conditionally transfers one exact directional flow group.
+// Success transfers every packet; failure leaves every packet with the caller.
+type ipPacketGroupSend = func(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	group *ipPacketGroup,
+	timeout time.Duration,
+) bool
+
 // ipMuxOnSend lets a concrete mux claim and terminate a send-path packet. It
 // returns true if it handled the packet, or false to forward it upstream.
 type ipMuxOnSend = func(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool
+
+// ipMuxOnSendGroup classifies one exact directional flow as a unit. It may
+// inspect every member for content state, but returns one disposition for the
+// complete group.
+type ipMuxOnSendGroup = func(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	group *ipPacketGroup,
+	timeout time.Duration,
+) bool
 
 // ipMuxOnPump lets a concrete mux intercept a packet the internal stack emits
 // before it is forwarded upstream — e.g. to un-NAT a locally-terminated connection's
@@ -49,8 +68,9 @@ type IpMux struct {
 	tun            *Tun
 	localAddresses []netip.Addr
 
-	onSend ipMuxOnSend
-	onPump ipMuxOnPump
+	onSend      ipMuxOnSend
+	onSendGroup ipMuxOnSendGroup
+	onPump      ipMuxOnPump
 
 	// source/provideMode/sendTimeout stamp the Tun's upstream-originated packets
 	// (the local servers' own upstream connections).
@@ -58,8 +78,9 @@ type IpMux struct {
 	provideMode protocol.ProvideMode
 	sendTimeout time.Duration
 
-	stateLock sync.Mutex
-	upstream  IpMuxSend
+	stateLock         sync.Mutex
+	upstream          IpMuxSend
+	upstreamGroupSend ipPacketGroupSend
 
 	receivers      *CallbackList[ReceivePacketFunction]
 	batchReceivers *CallbackList[ReceivePacketsFunction]
@@ -114,10 +135,38 @@ func (self *IpMux) SetUpstream(upstream IpMuxSend) {
 	self.upstream = upstream
 }
 
+// Installs the exact-flow classifier used by the batch path. Construction is
+// complete before native traffic can call this method, so the callback itself
+// remains immutable while packets are flowing.
+func (self *IpMux) setOnSendGroup(onSendGroup ipMuxOnSendGroup) {
+	self.onSendGroup = onSendGroup
+}
+
+// Wires the homogeneous batch path beside the singular compatibility path.
+func (self *IpMux) setUpstreamGroupSend(upstreamGroupSend ipPacketGroupSend) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.upstreamGroupSend = upstreamGroupSend
+}
+
 func (self *IpMux) getUpstream() IpMuxSend {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	return self.upstream
+}
+
+// Returns the current homogeneous batch path.
+func (self *IpMux) getUpstreamGroupSend() ipPacketGroupSend {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.upstreamGroupSend
+}
+
+// Returns one internally consistent view of both upstream entry points.
+func (self *IpMux) getUpstreams() (IpMuxSend, ipPacketGroupSend) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.upstream, self.upstreamGroupSend
 }
 
 // AddReceiver registers a downstream receiver; returns an unregister closure.
@@ -147,6 +196,7 @@ func (self *IpMux) Tun() *Tun {
 // by the concrete mux; otherwise it is forwarded to the upstream.
 func (self *IpMux) SendPacket(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool {
 	if self.onSend != nil && self.onSend(source, provideMode, packet, timeout) {
+		MessagePoolReturn(packet)
 		return true
 	}
 	upstream := self.getUpstream()
@@ -154,6 +204,66 @@ func (self *IpMux) SendPacket(source TransferPath, provideMode protocol.ProvideM
 		return false
 	}
 	return upstream(source, provideMode, packet, timeout)
+}
+
+// Consumes a packet burst after grouping it by exact directional flow. Each
+// group is classified once at the routing boundary while content-aware
+// observers still inspect its packets in order.
+func (self *IpMux) SendPacketBatch(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	packets [][]byte,
+	timeout time.Duration,
+) int {
+	groups, rejectedPackets := groupIpPackets(packets)
+	for _, packet := range rejectedPackets {
+		MessagePoolReturn(packet)
+	}
+	sentPacketCount := 0
+	upstream, upstreamGroupSend := self.getUpstreams()
+	for _, group := range groups {
+		claimed := false
+		if self.onSendGroup != nil {
+			claimed = self.onSendGroup(source, provideMode, group, timeout)
+		} else if self.onSend != nil {
+			for _, packet := range group.packets {
+				if self.onSend(source, provideMode, packet, timeout) {
+					claimed = true
+				}
+			}
+		}
+		if claimed {
+			for _, packet := range group.packets {
+				MessagePoolReturn(packet)
+			}
+			sentPacketCount += len(group.packets)
+			continue
+		}
+		if upstreamGroupSend != nil {
+			if upstreamGroupSend(source, provideMode, group, timeout) {
+				sentPacketCount += len(group.packets)
+			} else {
+				for _, packet := range group.packets {
+					MessagePoolReturn(packet)
+				}
+			}
+			continue
+		}
+		if upstream == nil {
+			for _, packet := range group.packets {
+				MessagePoolReturn(packet)
+			}
+			continue
+		}
+		for _, packet := range group.packets {
+			if upstream(source, provideMode, packet, timeout) {
+				sentPacketCount += 1
+			} else {
+				MessagePoolReturn(packet)
+			}
+		}
+	}
+	return sentPacketCount
 }
 
 // Receive is installed as the upstream's receive callback. The callback IpPath

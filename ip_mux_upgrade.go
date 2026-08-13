@@ -538,6 +538,7 @@ func NewUpgradeMux(
 	// one mux per connect, so the first-load timeline's activation is the connect start
 	self.firstLoad = newFirstLoadTimeline(log)
 	self.mux = NewIpMux(cancelCtx, tun, source, provideMode, sendTimeout, self.onSend, self.onPump, initialReceiver, log)
+	self.mux.setOnSendGroup(self.onSendGroup)
 	self.tunnelDohWarmFunction = func(ctx context.Context, serverCount int) bool {
 		return self.mux.Tun().DohCache().Warm(ctx, serverCount)
 	}
@@ -912,6 +913,64 @@ func (self *UpgradeMux) onSend(source TransferPath, provideMode protocol.Provide
 		return self.httpBlocked() // reached via peekUndecided (e.g. IPv6 extension headers)
 	}
 	return false
+}
+
+// Classifies one exact directional flow once while preserving content state
+// that inherently advances for each ordered packet. A claimed group is
+// consumed in full; malformed content inside an intercepted flow fails closed
+// instead of decomposing the group into independently routed packets.
+func (self *UpgradeMux) onSendGroup(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	group *ipPacketGroup,
+	timeout time.Duration,
+) bool {
+	if group == nil || group.ipPath == nil || len(group.packets) == 0 {
+		return true
+	}
+	for _, packet := range group.packets {
+		self.firstLoad.observeSend(packet)
+	}
+
+	ipPath := group.ipPath
+	switch {
+	case ipPath.Protocol == IpProtocolTcp && ipPath.DestinationPort == 443:
+		for _, packet := range group.packets {
+			var segment tlsSegment
+			if peekClaim(packet, &segment) == peekTls {
+				self.sni.observeSegment(segment)
+			}
+		}
+		return false
+	case ipPath.Protocol == IpProtocolTcp && ipPath.DestinationPort == 80:
+		return self.httpBlocked()
+	case ipPath.Protocol == IpProtocolUdp && ipPath.DestinationPort == 53:
+		settings := self.settings.Load()
+		if settings == nil || settings.Dns == nil || settings.Dns.Resolver == nil {
+			return false
+		}
+		for _, packet := range group.packets {
+			packetPath, payload, err := ParseIpPathWithPayload(packet)
+			if err == nil {
+				self.handleDns(source, provideMode, packetPath, payload)
+			}
+		}
+		return true
+	case ipPath.Protocol == IpProtocolTcp && ipPath.DestinationPort == 53:
+		settings := self.settings.Load()
+		if settings == nil || settings.Dns == nil || settings.Dns.Resolver == nil {
+			return false
+		}
+		for _, packet := range group.packets {
+			packetPath, err := ParseIpPath(packet)
+			if err == nil {
+				self.handleDnsTcpPacket(packetPath, packet)
+			}
+		}
+		return true
+	default:
+		return false
+	}
 }
 
 // httpBlocked reports whether claimed plaintext HTTP (TCP/80) should be dropped (block mode);
@@ -2386,6 +2445,18 @@ func (self *UpgradeMux) SendPacket(source TransferPath, provideMode protocol.Pro
 	return self.mux.SendPacket(source, provideMode, packet, timeout)
 }
 
+// Consumes a native packet burst after grouping it by exact directional flow.
+// Each group is classified once at the routing boundary while content-aware
+// observers still inspect its packets in order.
+func (self *UpgradeMux) SendPacketBatch(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	packets [][]byte,
+	timeout time.Duration,
+) int {
+	return self.mux.SendPacketBatch(source, provideMode, packets, timeout)
+}
+
 // Receive is installed as the wrapped upstream's receive callback. The
 // callback IpPath is the canonical outbound path, not the return packet's
 // direction. Read the actual packet source (the server IP) to refresh that
@@ -2428,6 +2499,19 @@ func (self *UpgradeMux) AddPacketsReceiver(receiver ReceivePacketsFunction) func
 // SetUpstream wires the wrapped upstream send (the remote UserNat).
 func (self *UpgradeMux) SetUpstream(upstream IpMuxSend) {
 	self.mux.SetUpstream(upstream)
+}
+
+// Wires an exact-flow group path when the upstream supports it.
+func (self *UpgradeMux) SetUpstreamBatchClient(upstream *RemoteUserNatMultiClient) {
+	self.mux.SetUpstream(upstream.SendPacket)
+	self.mux.setUpstreamGroupSend(func(
+		source TransferPath,
+		provideMode protocol.ProvideMode,
+		group *ipPacketGroup,
+		timeout time.Duration,
+	) bool {
+		return upstream.sendPacketGroup(source, provideMode, group, timeout)
+	})
 }
 
 // SetSettings updates the mux's DNS and HTTP policy at runtime. The tun's DohCache is

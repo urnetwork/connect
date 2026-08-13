@@ -151,6 +151,133 @@ type UserNatClient interface {
 	SetLocalSecurityBypass(localSecurityBypass bool)
 }
 
+// UserNatBatchClient optionally admits an owned packet list. The method
+// consumes every packet and returns the number accepted for delivery.
+type UserNatBatchClient interface {
+	UserNatClient
+	SendPacketBatch(
+		source TransferPath,
+		provideMode protocol.ProvideMode,
+		packets [][]byte,
+		timeout time.Duration,
+	) int
+}
+
+// ipPacketFlowKey is one exact directional IP five-tuple. IpVersion keeps an
+// IPv4 address distinct from the same bytes represented in IPv6.
+type ipPacketFlowKey struct {
+	sourceIp        [16]byte
+	destinationIp   [16]byte
+	protocol        IpProtocol
+	sourcePort      uint16
+	destinationPort uint16
+	ipVersion       uint8
+}
+
+// ipPacketGroup owns its packet-slice header and a canonical path whose
+// addresses do not alias packet storage. The packet buffers remain with the
+// caller until that caller transfers or returns them.
+type ipPacketGroup struct {
+	ipPath    *IpPath
+	packets   [][]byte
+	ipPaths   []IpPath
+	payloads  [][]byte
+	byteCount ByteCount
+}
+
+// Returns a comparable flow key and a path with owned canonical addresses.
+func ownIpPacketFlow(ipPath *IpPath) (ipPacketFlowKey, *IpPath, bool) {
+	if ipPath == nil ||
+		ipPath.SourcePort < 0 || 65535 < ipPath.SourcePort ||
+		ipPath.DestinationPort < 0 || 65535 < ipPath.DestinationPort {
+		return ipPacketFlowKey{}, nil, false
+	}
+
+	var sourceIp net.IP
+	var destinationIp net.IP
+	var ipByteCount int
+	switch ipPath.Version {
+	case 4:
+		sourceIp = ipPath.SourceIp.To4()
+		destinationIp = ipPath.DestinationIp.To4()
+		ipByteCount = net.IPv4len
+	case 6:
+		sourceIp = ipPath.SourceIp.To16()
+		destinationIp = ipPath.DestinationIp.To16()
+		ipByteCount = net.IPv6len
+	default:
+		return ipPacketFlowKey{}, nil, false
+	}
+	if sourceIp == nil || destinationIp == nil {
+		return ipPacketFlowKey{}, nil, false
+	}
+
+	key := ipPacketFlowKey{
+		protocol:        ipPath.Protocol,
+		sourcePort:      uint16(ipPath.SourcePort),
+		destinationPort: uint16(ipPath.DestinationPort),
+		ipVersion:       uint8(ipPath.Version),
+	}
+	copy(key.sourceIp[:], sourceIp)
+	copy(key.destinationIp[:], destinationIp)
+
+	ownedIpPath := *ipPath
+	ipBacking := make(net.IP, 2*ipByteCount)
+	copy(ipBacking[:ipByteCount], sourceIp)
+	copy(ipBacking[ipByteCount:], destinationIp)
+	ownedIpPath.SourceIp = ipBacking[:ipByteCount:ipByteCount]
+	ownedIpPath.DestinationIp = ipBacking[ipByteCount:]
+	return key, &ownedIpPath, true
+}
+
+// Adds a parsed packet while retaining the first-seen group and in-flow
+// order. The packet remains owned by the caller.
+func appendIpPacketGroup(
+	groups *[]*ipPacketGroup,
+	groupsByKey map[ipPacketFlowKey]*ipPacketGroup,
+	ipPath *IpPath,
+	payload []byte,
+	packet []byte,
+) bool {
+	key, ownedIpPath, ok := ownIpPacketFlow(ipPath)
+	if !ok {
+		return false
+	}
+	group := groupsByKey[key]
+	if group == nil {
+		group = &ipPacketGroup{
+			ipPath:   ownedIpPath,
+			packets:  [][]byte{packet},
+			ipPaths:  []IpPath{*ipPath},
+			payloads: [][]byte{payload},
+		}
+		groupsByKey[key] = group
+		*groups = append(*groups, group)
+	} else {
+		group.packets = append(group.packets, packet)
+		group.ipPaths = append(group.ipPaths, *ipPath)
+		group.payloads = append(group.payloads, payload)
+	}
+	group.byteCount += ByteCount(len(packet))
+	return true
+}
+
+// Groups parseable packets by exact directional five-tuple. Groups retain
+// first-seen order, packets retain in-flow order, and rejected packets remain
+// caller-owned.
+func groupIpPackets(packets [][]byte) (groups []*ipPacketGroup, rejected [][]byte) {
+	groupsByKey := map[ipPacketFlowKey]*ipPacketGroup{}
+	for _, packet := range packets {
+		var ipPath IpPath
+		payload, err := parseIpPathWithPayloadBorrowed(packet, &ipPath)
+		if err != nil ||
+			!appendIpPacketGroup(&groups, groupsByKey, &ipPath, payload, packet) {
+			rejected = append(rejected, packet)
+		}
+	}
+	return
+}
+
 // the per flow channel depths dominate the nat's per flow memory (three
 // channels per flow at ~8-88 bytes per slot of backing array), so the
 // defaults are scaled by the memory budget. udp tolerates drops, so its
@@ -541,6 +668,26 @@ func (self *LocalUserNat) SendPacketsWithTimeout(source TransferPath, provideMod
 		packets,
 		timeout,
 	)
+}
+
+// SendPacketBatch transfers every packet on successful all-or-nothing local
+// admission. A rejection returns every packet to the pool.
+func (self *LocalUserNat) SendPacketBatch(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	packets [][]byte,
+	timeout time.Duration,
+) int {
+	if len(packets) == 0 {
+		return 0
+	}
+	if self.SendPacketsWithTimeout(source, provideMode, packets, timeout) {
+		return len(packets)
+	}
+	for _, packet := range packets {
+		MessagePoolReturn(packet)
+	}
+	return 0
 }
 
 // Queues provider ingress without discarding its receiver-visible reply lane.
@@ -5754,9 +5901,11 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 	self.recordSourceProvideMode(source.SourceId, provideMode)
 	self.refreshP2pPriority(source.SourceId, provideMode)
 
-	// collect the allowed packets and queue them into the local user nat as one batch
-	var packets [][]byte
-	var packetsByteCount ByteCount
+	// Collect allowed packets into exact directional flows before crossing the
+	// LocalUserNat queue. This keeps every queued batch homogeneous without
+	// changing first-seen group or in-flow order.
+	var packetGroups []*ipPacketGroup
+	packetGroupsByKey := map[ipPacketFlowKey]*ipPacketGroup{}
 	for _, frame := range frames {
 		switch frame.MessageType {
 		case protocol.MessageType_IpIpPing:
@@ -5825,8 +5974,15 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 						} else {
 							packet = MessagePoolCopy(packetBytes)
 						}
-						packets = append(packets, packet)
-						packetsByteCount += ByteCount(len(packet))
+						if !appendIpPacketGroup(
+							&packetGroups,
+							packetGroupsByKey,
+							&ipPath,
+							payload,
+							packet,
+						) {
+							MessagePoolReturn(packet)
+						}
 					default:
 						// drop or incident: blocked by the provider security policy
 						self.packetStatsCounters.blockIngressPacketCount.Add(1)
@@ -5840,21 +5996,21 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 		}
 	}
 
-	if 0 < len(packets) {
+	for _, packetGroup := range packetGroups {
 		c := func() bool {
 			success := self.localUserNat.sendTransferPacketsWithTimeout(
 				source,
 				transferKey,
 				provideMode,
-				packets,
+				packetGroup.packets,
 				0,
 			)
 			if success {
-				self.packetStatsCounters.remoteIngressPacketCount.Add(int64(len(packets)))
-				self.packetStatsCounters.remoteIngressByteCount.Add(int64(packetsByteCount))
+				self.packetStatsCounters.remoteIngressPacketCount.Add(int64(len(packetGroup.packets)))
+				self.packetStatsCounters.remoteIngressByteCount.Add(int64(packetGroup.byteCount))
 			} else {
-				self.congestionDrops.addIngressNat(len(packets), packetsByteCount)
-				for _, packet := range packets {
+				self.congestionDrops.addIngressNat(len(packetGroup.packets), packetGroup.byteCount)
+				for _, packet := range packetGroup.packets {
 					MessagePoolReturn(packet)
 				}
 			}
@@ -5862,7 +6018,7 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 		}
 		if self.client.log.V(2).Enabled() {
 			TraceWithReturn(
-				fmt.Sprintf("[unpr]%d %s<-%s", len(packets), self.client.ClientTag(), source.SourceId),
+				fmt.Sprintf("[unpr]%d %s<-%s", len(packetGroup.packets), self.client.ClientTag(), source.SourceId),
 				c,
 			)
 		} else {
@@ -6049,6 +6205,25 @@ func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode pro
 	default:
 		return false
 	}
+}
+
+// SendPacketBatch consumes every packet and reports the exact number accepted
+// by the basic remote client's existing per-packet multi-hop send path.
+func (self *RemoteUserNatClient) SendPacketBatch(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	packets [][]byte,
+	timeout time.Duration,
+) int {
+	acceptedCount := 0
+	for _, packet := range packets {
+		if self.SendPacket(source, provideMode, packet, timeout) {
+			acceptedCount += 1
+		} else {
+			MessagePoolReturn(packet)
+		}
+	}
+	return acceptedCount
 }
 
 // `connect.ReceiveFunction`

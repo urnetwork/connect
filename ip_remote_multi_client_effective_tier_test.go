@@ -492,11 +492,11 @@ func TestReliabilitySettingsMultiRaceClientCountDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, ok := functionBody(source, "func (self *RemoteUserNatMultiClient) sendPacket(")
+	body, ok := functionBody(source, "func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(")
 	if !ok {
-		t.Fatal("could not find sendPacket")
+		t.Fatal("could not find sendParsedPacketGroup")
 	}
 	if !strings.Contains(body, "orderedClients[:self.settings.MultiRaceClientCount]") {
-		t.Error("sendPacket no longer truncates the race field to MultiRaceClientCount, so the default bounds nothing")
+		t.Error("sendParsedPacketGroup no longer truncates the race field to MultiRaceClientCount, so the default bounds nothing")
 	}
 }

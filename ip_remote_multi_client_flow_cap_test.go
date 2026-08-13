@@ -313,12 +313,12 @@ func TestSendPathPlacesFlowsThroughRaceCandidates(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	body, ok := functionBody(source, "func (self *RemoteUserNatMultiClient) sendPacket(")
+	body, ok := functionBody(source, "func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(")
 	if !ok {
-		t.Fatal("could not find sendPacket")
+		t.Fatal("could not find sendParsedPacketGroup")
 	}
 	if !strings.Contains(body, "self.raceCandidates(window)") {
-		t.Error("sendPacket does not assemble its field through raceCandidates: the cap and the rank gate are disconnected again")
+		t.Error("sendParsedPacketGroup does not assemble its field through raceCandidates: the cap and the rank gate are disconnected again")
 	}
 
 	body, ok = functionBody(source, "func (self *RemoteUserNatMultiClient) raceCandidates(")

@@ -1346,6 +1346,10 @@ type RemoteUserNatMultiClient struct {
 	// a platform store) means in-memory-only priors, matching PriorsStore's
 	// own doc.
 	priorsStore atomic.Pointer[PriorsStore]
+	// Nil test seams make whole-group candidate admission deterministic without
+	// changing production selection or adding synchronization to the send path.
+	groupRaceCandidatesForTest func(*parsedPacketGroup) []*multiClientChannel
+	sendClientPathForTest      func(*IpPath, flowPin, func(*multiClientChannelUpdate, *multiClientChannel))
 	// appPinClients is the cross-version half of an app pin: the exit an
 	// app's flows are currently placed on, keyed by app id. The affinity
 	// groups are per-ip-version by construction (separate path maps), so a
@@ -3749,6 +3753,10 @@ func (self *RemoteUserNatMultiClient) affinityIpPathsWithLock(ipPath *IpPath) (a
 }
 
 func (self *RemoteUserNatMultiClient) sendClientPath(ipPath *IpPath, pin flowPin, callback func(*multiClientChannelUpdate, *multiClientChannel)) {
+	if self.sendClientPathForTest != nil {
+		self.sendClientPathForTest(ipPath, pin, callback)
+		return
+	}
 	update, previousClient, currentClient := self.sendUpdate(ipPath, pin)
 	if update == nil {
 		// closed multi-client (see sendUpdate); the packet is dropped
@@ -5140,6 +5148,154 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 	return success
 }
 
+// Consumes a packet burst after grouping it by exact directional flow. One
+// group is accepted or rejected as a unit; malformed packets are returned.
+func (self *RemoteUserNatMultiClient) SendPacketBatch(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	packets [][]byte,
+	timeout time.Duration,
+) int {
+	groups, rejectedPackets := groupIpPackets(packets)
+	for _, packet := range rejectedPackets {
+		MessagePoolReturn(packet)
+	}
+
+	sentPacketCount := 0
+	for _, group := range groups {
+		if self.sendPacketGroup(source, provideMode, group, timeout) {
+			sentPacketCount += len(group.packets)
+			continue
+		}
+		for _, packet := range group.packets {
+			MessagePoolReturn(packet)
+		}
+	}
+	return sentPacketCount
+}
+
+// Conditionally transfers one homogeneous flow group. Success transfers every
+// packet; failure leaves every packet with the caller.
+func (self *RemoteUserNatMultiClient) sendPacketGroup(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	group *ipPacketGroup,
+	timeout time.Duration,
+) bool {
+	if group == nil || group.ipPath == nil || len(group.packets) == 0 ||
+		len(group.ipPaths) != len(group.packets) ||
+		len(group.payloads) != len(group.packets) {
+		return false
+	}
+
+	ipPath := group.ipPath
+	if ipPath.Protocol == IpProtocolIcmp && !self.settings.EnableIcmp {
+		self.logSparseSendDrop("icmp disabled", &self.sendIcmpDisabledDropCount, errIcmpDisabled)
+		return false
+	}
+
+	ignored := self.blockActionIgnored(ipPath)
+	if !ignored && self.ipAssoc != nil {
+		self.ipAssoc.AddEgressPacket(ipPath)
+	}
+
+	blockActionState := self.blockActionState.Load()
+	config := self.config.Load()
+	blockerActive := config.blocker != nil && config.blocker.Enabled()
+	var decision *blockActionDecision
+	if !ignored && (blockActionState.matcher != nil || self.blockActionCollector.hasCallbacks() || blockerActive) {
+		decision = self.blockActionDecision(blockActionState, config.blocker, blockerActive, ipPath)
+	}
+	var match *blockActionMatch
+	blockerBlock := false
+	if decision != nil {
+		match = decision.match
+		blockerBlock = decision.blockerBlock
+	}
+
+	parsedPackets := make([]parsedPacket, len(group.packets))
+	memberIpPaths := make([]IpPath, len(group.packets))
+	for packetIndex, packet := range group.packets {
+		memberIpPaths[packetIndex] = group.ipPaths[packetIndex]
+		memberIpPath := &memberIpPaths[packetIndex]
+		// groupIpPackets already proved a homogeneous exact tuple. Retained path
+		// values use its canonical owned addresses rather than packet aliases.
+		memberIpPath.SourceIp = ipPath.SourceIp
+		memberIpPath.DestinationIp = ipPath.DestinationIp
+		payload := group.payloads[packetIndex]
+		parsedPackets[packetIndex] = parsedPacket{
+			packet:  packet,
+			ipPath:  memberIpPath,
+			payload: payload,
+		}
+	}
+	result, err := inspectAndRefreshEgressGroupBorrowed(
+		self.securityPolicy,
+		egressRelationship(provideMode, self.provideMode),
+		memberIpPaths,
+		group.payloads,
+	)
+	if err != nil {
+		self.logSparseSendDrop("policy", &self.sendPolicyDropCount, err)
+		return false
+	}
+	block, local := blockActionApply(
+		result,
+		config.localSecurityBypass,
+		blockerBlock,
+		match,
+	)
+
+	if decision != nil && self.blockActionCollector.hasCallbacks() {
+		for _, packet := range group.packets {
+			self.blockActionCollector.add(
+				decision,
+				block,
+				local,
+				match,
+				ByteCount(len(packet)),
+			)
+		}
+	}
+	if block {
+		self.packetStatsCounters.blockEgressPacketCount.Add(int64(len(group.packets)))
+		self.packetStatsCounters.blockEgressByteCount.Add(int64(group.byteCount))
+		return false
+	}
+	if local {
+		if self.localUserNat == nil || !self.localUserNat.SendPackets(
+			source,
+			provideMode,
+			group.packets,
+			timeout,
+		) {
+			return false
+		}
+		self.packetStatsCounters.localEgressPacketCount.Add(int64(len(group.packets)))
+		self.packetStatsCounters.localEgressByteCount.Add(int64(group.byteCount))
+		return true
+	}
+
+	pin := flowPin{
+		site: match != nil && match.routeOverride != nil && match.routeOverride.Pin,
+	}
+	if lookupPtr := self.flowOwnerFunc.Load(); lookupPtr != nil {
+		pin.appId = self.flowOwnerAppId(ipPath, *lookupPtr)
+	}
+	parsedGroup := &parsedPacketGroup{
+		packets:   parsedPackets,
+		ipPath:    ipPath,
+		pin:       pin,
+		byteCount: group.byteCount,
+	}
+	if !self.sendParsedPacketGroup(source, provideMode, parsedGroup, timeout) {
+		return false
+	}
+	self.packetStatsCounters.remoteEgressPacketCount.Add(int64(len(group.packets)))
+	self.packetStatsCounters.remoteEgressByteCount.Add(int64(group.byteCount))
+	return true
+}
+
 // the cached override match, blocker match, and server names for a
 // destination. the external lookups (server names, cluster) run outside the
 // cache lock
@@ -5377,24 +5533,59 @@ func (self *RemoteUserNatMultiClient) canSendPacket(
 	return
 }
 
+// Applies collapse prevention once to a group. If any member can advance the
+// flow, the whole ordered group stays intact; a fully redundant group drops.
+func (self *RemoteUserNatMultiClient) canSendPacketGroup(
+	sendPacketGroup *parsedPacketGroup,
+	update *multiClientChannelUpdate,
+	currentClient *multiClientChannel,
+) bool {
+	for packetIndex := range sendPacketGroup.packets {
+		if self.canSendPacket(&sendPacketGroup.packets[packetIndex], update, currentClient) {
+			return true
+		}
+	}
+	return false
+}
+
 func (self *RemoteUserNatMultiClient) sendPacket(
 	source TransferPath,
 	provideMode protocol.ProvideMode,
 	sendPacket *parsedPacket,
 	timeout time.Duration,
 ) (success bool) {
-	ipPath := sendPacket.ipPath
-	self.sendClientPath(ipPath, sendPacket.pin, func(update *multiClientChannelUpdate, currentClient *multiClientChannel) {
-		if !self.canSendPacket(sendPacket, update, currentClient) {
+	return self.sendParsedPacketGroup(
+		source,
+		provideMode,
+		&parsedPacketGroup{
+			packets:   []parsedPacket{*sendPacket},
+			ipPath:    sendPacket.ipPath,
+			pin:       sendPacket.pin,
+			byteCount: ByteCount(len(sendPacket.packet)),
+		},
+		timeout,
+	)
+}
+
+// Routes and admits one already-parsed exact-flow group as a unit.
+func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	sendPacketGroup *parsedPacketGroup,
+	timeout time.Duration,
+) (success bool) {
+	firstPacket := &sendPacketGroup.packets[0]
+	ipPath := sendPacketGroup.ipPath
+	self.sendClientPath(ipPath, sendPacketGroup.pin, func(update *multiClientChannelUpdate, currentClient *multiClientChannel) {
+		if !self.canSendPacketGroup(sendPacketGroup, update, currentClient) {
 			return
 		}
+		// Preserve the singular path's pre-admission control semantics. In
+		// particular, a newly bound or racing SYN/RST must clear stale collapse
+		// state even though no current client exists to run the success commit.
+		update.resetSequenceGroup(sendPacketGroup)
 
 		enterTime := time.Now()
-
-		if ipPath.Syn || ipPath.Rst {
-			// sequence state is guarded by the per-flow `stateLock`
-			update.resetSequence(sendPacket)
-		}
 
 		// Client-side dial-failure inference. A connection attempt
 		// retransmitting on an exit that has answered nothing is the silent
@@ -5433,10 +5624,10 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 		// takes the parent lock again just to read `update.client`.
 		for client := currentClient; client != nil; {
 			var err error
-			success, err = client.SendDetailed(sendPacket, timeout)
+			success, err = client.SendGroupDetailed(sendPacketGroup, timeout)
 			if success {
 				// sequence state is guarded by the per-flow `stateLock`
-				update.updateSequence(sendPacket)
+				update.commitSequenceGroup(sendPacketGroup)
 			} else if err != nil {
 				// reset the path.
 				//
@@ -5514,7 +5705,7 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 			case 1:
 				// send to one client, no race
 				client := orderedClients[0]
-				if client.Send(sendPacket, sendTimeout) {
+				if client.SendGroup(sendPacketGroup, sendTimeout) {
 					success = true
 
 					// client is atomic; lock-free store
@@ -5523,13 +5714,6 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 				return
 
 			default:
-
-				defer func() {
-					if success {
-						MessagePoolReturn(sendPacket.packet)
-					}
-				}()
-
 				var successCount atomic.Int32
 
 				send := func(client *multiClientChannel) {
@@ -5544,10 +5728,9 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 						return
 					}
 
-					sent := sendMultiClientRaceAttempt(
+					sent := sendMultiClientGroupRaceAttempt(
 						client,
-						sendPacket.packet,
-						update.ipPath,
+						sendPacketGroup,
 						sendTimeout,
 					)
 					if sent {
@@ -5645,20 +5828,26 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 
 				if 0 < successCount.Load() {
 					success = true
+					for packetIndex := range sendPacketGroup.packets {
+						MessagePoolReturn(sendPacketGroup.packets[packetIndex].packet)
+					}
 				}
 				return
 			}
 		}
 
 		coalesceOrderedClients := func() []*multiClientChannel {
-			for _, windowType := range self.selectWindowTypes(sendPacket) {
+			if self.groupRaceCandidatesForTest != nil {
+				return self.groupRaceCandidatesForTest(sendPacketGroup)
+			}
+			for _, windowType := range self.selectWindowTypes(firstPacket) {
 				if window, ok := self.windows[windowType]; ok {
 					orderedClients := self.raceCandidates(window)
 					if scoredPlacementEnabled(self.reliabilitySettings()) {
 						// guarded scored-placement path (Phase 1): re-orders the
 						// already health-filtered field above, never widens or
 						// narrows it. See scoredPlacementReorder.
-						orderedClients = self.scoredPlacementReorder(orderedClients, ipPath, sendPacket.pin.appId)
+						orderedClients = self.scoredPlacementReorder(orderedClients, ipPath, sendPacketGroup.pin.appId)
 					}
 					// legacy selection unchanged: with the gate off (every
 					// current build's default), orderedClients is exactly what
@@ -7312,7 +7501,23 @@ func (self *multiClientChannelUpdate) synWaitExceeded(client *multiClientChannel
 func (self *multiClientChannelUpdate) resetSequence(sendPacket *parsedPacket) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	self.resetSequenceWithLock(sendPacket)
+}
 
+// Resets every control boundary in source order under one existing flow lock.
+func (self *multiClientChannelUpdate) resetSequenceGroup(sendPacketGroup *parsedPacketGroup) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	for packetIndex := range sendPacketGroup.packets {
+		sendPacket := &sendPacketGroup.packets[packetIndex]
+		if sendPacket.ipPath.Syn || sendPacket.ipPath.Rst {
+			self.resetSequenceWithLock(sendPacket)
+		}
+	}
+}
+
+// Must be called with stateLock.
+func (self *multiClientChannelUpdate) resetSequenceWithLock(sendPacket *parsedPacket) {
 	ipPath := sendPacket.ipPath
 
 	self.ackSequenceNumber = ipPath.AckSequenceNumber
@@ -7324,6 +7529,25 @@ func (self *multiClientChannelUpdate) resetSequence(sendPacket *parsedPacket) {
 func (self *multiClientChannelUpdate) updateSequence(sendPacket *parsedPacket) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	self.updateSequenceWithLock(sendPacket)
+}
+
+// Applies a successful group in order under one existing flow lock. A control
+// packet resets state at its exact position, matching sequential sends.
+func (self *multiClientChannelUpdate) commitSequenceGroup(sendPacketGroup *parsedPacketGroup) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	for packetIndex := range sendPacketGroup.packets {
+		sendPacket := &sendPacketGroup.packets[packetIndex]
+		if sendPacket.ipPath.Syn || sendPacket.ipPath.Rst {
+			self.resetSequenceWithLock(sendPacket)
+		}
+		self.updateSequenceWithLock(sendPacket)
+	}
+}
+
+// Must be called with stateLock.
+func (self *multiClientChannelUpdate) updateSequenceWithLock(sendPacket *parsedPacket) {
 
 	ipPath := sendPacket.ipPath
 	update := false
@@ -7503,6 +7727,15 @@ type parsedPacket struct {
 	// signature changes stop at this struct, and every other construction
 	// site (probes, tests) gets the zero value = unpinned.
 	pin flowPin
+}
+
+// One exact directional flow carried through policy, provider selection, and
+// Transfer admission without decomposing back into independently routed sends.
+type parsedPacketGroup struct {
+	packets   []parsedPacket
+	ipPath    *IpPath
+	pin       flowPin
+	byteCount ByteCount
 }
 
 // flowPin is what a pin rule resolved to for one flow: the owning pinned
@@ -10155,6 +10388,9 @@ type multiClientChannel struct {
 	// SendDetailedMessage(&protocol.IpPing{}) plumbing the cping loop uses --
 	// pinned by TestBusyProbeUsesTheControlPingPlumbing.
 	busyProbeSendFunc func(timeout time.Duration, ackCallback func(error)) (bool, error)
+	// Nil outside focused tests. The callback assumes the same conditional
+	// ownership as Transfer: success consumes every group packet.
+	sendGroupForTest func(*parsedPacketGroup, time.Duration, bool) (bool, error)
 	// qualificationRefreshFunc re-stamps the parent's qualification for this
 	// channel's destination (RemoteUserNatMultiClient.recordProbePass), called
 	// from the receive-ack path at most once per
@@ -12061,9 +12297,142 @@ func sendMultiClientRaceAttempt(
 	return false
 }
 
+// Shares every group member into one candidate attempt. Admission transfers
+// all shares; refusal returns all shares while originals stay with the race.
+func sendMultiClientGroupRaceAttempt(
+	client *multiClientChannel,
+	sendPacketGroup *parsedPacketGroup,
+	timeout time.Duration,
+) bool {
+	sharedGroup := &parsedPacketGroup{
+		packets:   make([]parsedPacket, len(sendPacketGroup.packets)),
+		ipPath:    sendPacketGroup.ipPath,
+		pin:       sendPacketGroup.pin,
+		byteCount: sendPacketGroup.byteCount,
+	}
+	for packetIndex := range sendPacketGroup.packets {
+		sharedGroup.packets[packetIndex] = sendPacketGroup.packets[packetIndex]
+		sharedGroup.packets[packetIndex].packet = MessagePoolShareReadOnly(
+			sendPacketGroup.packets[packetIndex].packet,
+		)
+	}
+	if client.SendGroupWithAck(sharedGroup, timeout, true) {
+		return true
+	}
+	for packetIndex := range sharedGroup.packets {
+		MessagePoolReturn(sharedGroup.packets[packetIndex].packet)
+	}
+	return false
+}
+
 func (self *multiClientChannel) SendWithAck(parsedPacket *parsedPacket, timeout time.Duration, ack bool) bool {
 	success, err := self.SendDetailedWithAck(parsedPacket, timeout, ack)
 	return success && err == nil
+}
+
+// Admits one exact-flow group using the channel's normal recovery policy.
+func (self *multiClientChannel) SendGroup(sendPacketGroup *parsedPacketGroup, timeout time.Duration) bool {
+	success, err := self.SendGroupDetailed(sendPacketGroup, timeout)
+	return success && err == nil
+}
+
+// Returns the group admission error beside the bounded-send result.
+func (self *multiClientChannel) SendGroupDetailed(
+	sendPacketGroup *parsedPacketGroup,
+	timeout time.Duration,
+) (bool, error) {
+	return self.SendGroupDetailedWithAck(
+		sendPacketGroup,
+		timeout,
+		self.ipPacketTransferAckRequired(sendPacketGroup.ipPath),
+	)
+}
+
+// Admits a whole group with one Transfer callback and exact ownership.
+func (self *multiClientChannel) SendGroupWithAck(
+	sendPacketGroup *parsedPacketGroup,
+	timeout time.Duration,
+	ack bool,
+) bool {
+	success, err := self.SendGroupDetailedWithAck(sendPacketGroup, timeout, ack)
+	return success && err == nil
+}
+
+// Builds every frame before the one atomic logical-group admission. Failure
+// leaves all caller packet owners untouched.
+func (self *multiClientChannel) SendGroupDetailedWithAck(
+	sendPacketGroup *parsedPacketGroup,
+	timeout time.Duration,
+	ack bool,
+) (bool, error) {
+	if self.sendGroupForTest != nil {
+		return self.sendGroupForTest(sendPacketGroup, timeout, ack)
+	}
+	frames := make([]*protocol.Frame, len(sendPacketGroup.packets))
+	for packetIndex := range sendPacketGroup.packets {
+		frame, err := ipPacketToProviderFrame(
+			sendPacketGroup.packets[packetIndex].packet,
+			self.settings.ProtocolVersion,
+		)
+		if err != nil {
+			for _, builtFrame := range frames[:packetIndex] {
+				if !builtFrame.Raw {
+					MessagePoolReturn(builtFrame.MessageBytes)
+				}
+			}
+			self.addError(err)
+			return false, err
+		}
+		frames[packetIndex] = frame
+	}
+
+	self.addSendGroup(sendPacketGroup)
+	if self.stalled.Load() {
+		for packetIndex, frame := range frames {
+			if !frame.Raw {
+				MessagePoolReturn(frame.MessageBytes)
+			}
+			MessagePoolReturn(sendPacketGroup.packets[packetIndex].packet)
+		}
+		return true, nil
+	}
+
+	ackCallback := func(err error) {
+		if err == nil {
+			self.addSendAckGroup(sendPacketGroup)
+		} else {
+			self.addError(err)
+		}
+	}
+	var opts []any
+	if self.performanceProfile != nil && self.performanceProfile.AllowDirect {
+		opts = append(opts, ForceStream())
+	}
+	if !ack {
+		opts = append(opts, NoAck())
+	}
+	success, err := self.client.sendMultiHopGroupWithTimeoutDetailed(
+		frames,
+		self.args.Destination,
+		ackCallback,
+		timeout,
+		opts...,
+	)
+	if err != nil || !success {
+		self.addSendAbandonedGroup(sendPacketGroup)
+		for _, frame := range frames {
+			if !frame.Raw {
+				MessagePoolReturn(frame.MessageBytes)
+			}
+		}
+		return success, err
+	}
+	for packetIndex, frame := range frames {
+		if !frame.Raw {
+			MessagePoolReturn(sendPacketGroup.packets[packetIndex].packet)
+		}
+	}
+	return true, nil
 }
 
 func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, timeout time.Duration, ack bool) (bool, error) {
@@ -12093,6 +12462,10 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 		// here is also the faithful simulation -- the packet is committed and
 		// simply never acknowledged.
 		if self.stalled.Load() {
+			if !frame.Raw {
+				MessagePoolReturn(frame.MessageBytes)
+			}
+			MessagePoolReturn(parsedPacket.packet)
 			return true, nil
 		}
 
@@ -13144,6 +13517,44 @@ func (self *multiClientChannel) addSend(packetByteCount ByteCount, ipPath *IpPat
 	self.addSourceToEventBucketWithLock(eventBucket, ipPath)
 }
 
+// Records an admitted group in one existing channel-lock section while
+// retaining packet-accurate health and event accounting.
+func (self *multiClientChannel) addSendGroup(sendPacketGroup *parsedPacketGroup) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	eventBucket := self.eventBucket()
+	packetCount := len(sendPacketGroup.packets)
+	if self.packetStats.sendNackCount == 0 {
+		self.pendingSendTime = time.Now()
+	}
+	self.packetStats.sendNackCount += packetCount
+	self.packetStats.sendNackByteCount += sendPacketGroup.byteCount
+	if eventBucket.sendNackCount == 0 {
+		eventBucket.sendNackTime = time.Now()
+	}
+	eventBucket.sendNackCount += packetCount
+	eventBucket.sendNackByteCount += sendPacketGroup.byteCount
+
+	synCount := 0
+	for packetIndex := range sendPacketGroup.packets {
+		if sendPacketGroup.packets[packetIndex].ipPath.Syn {
+			synCount += 1
+		}
+	}
+	if 0 < synCount {
+		if self.packetStats.firstUnansweredSendSynTime.IsZero() {
+			self.packetStats.firstUnansweredSendSynTime = time.Now()
+		}
+		self.packetStats.sendSynCount += synCount
+		if eventBucket.sendSynCount == 0 {
+			eventBucket.sendSynTime = time.Now()
+		}
+		eventBucket.sendSynCount += synCount
+	}
+	self.addSourceToEventBucketWithLock(eventBucket, sendPacketGroup.ipPath)
+}
+
 // addSendAbandoned is the symmetric undo of addSend for a send the transport
 // refused: a hard error from the send call, or a false success (backpressure
 // -- the pack never entered a send sequence before the timeout). Both returns
@@ -13197,6 +13608,27 @@ func (self *multiClientChannel) addSendAbandoned(packetByteCount ByteCount) {
 	}
 }
 
+// Retracts one refused logical group's exact packet and byte accounting.
+func (self *multiClientChannel) addSendAbandonedGroup(sendPacketGroup *parsedPacketGroup) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	packetCount := len(sendPacketGroup.packets)
+	self.packetStats.sendNackCount -= packetCount
+	self.packetStats.sendNackByteCount -= sendPacketGroup.byteCount
+	if self.packetStats.sendNackCount <= 0 {
+		self.pendingSendTime = time.Time{}
+	}
+	if eventBucketCount := len(self.eventBuckets); 0 < eventBucketCount {
+		eventBucket := self.eventBuckets[eventBucketCount-1]
+		eventBucket.sendNackCount = max(eventBucket.sendNackCount-packetCount, 0)
+		eventBucket.sendNackByteCount = max(
+			eventBucket.sendNackByteCount-sendPacketGroup.byteCount,
+			0,
+		)
+	}
+}
+
 func (self *multiClientChannel) addSendNack(ackByteCount ByteCount) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -13230,6 +13662,27 @@ func (self *multiClientChannel) addSendAck(ackByteCount ByteCount) {
 	}
 	eventBucket.sendAckCount += 1
 	eventBucket.sendAckByteCount += ackByteCount
+}
+
+// Retires one logical group's packet-accurate outstanding accounting.
+func (self *multiClientChannel) addSendAckGroup(sendPacketGroup *parsedPacketGroup) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	packetCount := len(sendPacketGroup.packets)
+	self.packetStats.sendNackCount -= packetCount
+	self.packetStats.sendNackByteCount -= sendPacketGroup.byteCount
+	self.packetStats.sendAckCount += packetCount
+	self.packetStats.sendAckByteCount += sendPacketGroup.byteCount
+	self.lastSendAckTime = time.Now()
+	self.pendingSendTime = time.Now()
+
+	eventBucket := self.eventBucket()
+	if eventBucket.sendAckCount == 0 {
+		eventBucket.sendAckTime = time.Now()
+	}
+	eventBucket.sendAckCount += packetCount
+	eventBucket.sendAckByteCount += sendPacketGroup.byteCount
 }
 
 func (self *multiClientChannel) addSendSyn(synCount int) {

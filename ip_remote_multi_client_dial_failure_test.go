@@ -487,11 +487,11 @@ func TestSendPathInferenceUsesDialProbePacket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, ok := functionBody(source, "func (self *RemoteUserNatMultiClient) sendPacket(")
+	body, ok := functionBody(source, "func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(")
 	if !ok {
-		t.Fatal("could not find sendPacket")
+		t.Fatal("could not find sendParsedPacketGroup")
 	}
 	if !strings.Contains(body, "dialProbePacket(ipPath)") {
-		t.Error("sendPacket does not gate the dial-failure inference on dialProbePacket: udp handshakes have lost their early escape")
+		t.Error("sendParsedPacketGroup does not gate the dial-failure inference on dialProbePacket: udp handshakes have lost their early escape")
 	}
 }
