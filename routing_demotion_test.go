@@ -167,11 +167,18 @@ func front(candidates []*multiClientChannel) *multiClientChannel {
 
 // TestScoredPlacementReorderZeroPlacementDemoteConsecutiveIsInert proves the
 // zero-value-off contract for PlacementDemoteConsecutive specifically: with
-// it left at 0 (never set), demotionState.observe would treat a bare 0 as
-// needBad<=1 -- act on EVERY sample -- if scoredPlacementReorder ever passed
-// it through uninspected. It must not: the exact same hysteresis-protected
-// mild deficit that demotes within 3 calls in the test above must never move
-// the incumbent at all here, across many more calls than that.
+// it AT 0, demotionState.observe would treat a bare 0 as needBad<=1 -- act on
+// EVERY sample -- if scoredPlacementReorder ever passed it through
+// uninspected. It must not: the exact same hysteresis-protected mild deficit
+// that demotes within 3 calls in the test above must never move the
+// incumbent at all here, across many more calls than that.
+//
+// PlacementDemoteConsecutive is set to 0 EXPLICITLY below rather than left
+// unset: Task 8 (feat(routing): enable class-aware scored placement by
+// default) made DefaultMultiClientSettings' own value 3, not 0, so relying
+// on flowCapTestParent's default here would silently test needBad=3 instead
+// of needBad=0 -- the same demotion-within-3-calls behavior the sibling test
+// above already covers, just for the wrong stated reason.
 func TestScoredPlacementReorderZeroPlacementDemoteConsecutiveIsInert(t *testing.T) {
 	parent, clients := flowCapTestParent(t, 0, 0, 0)
 	incumbent, challenger := clients[0], clients[1]
@@ -179,7 +186,7 @@ func TestScoredPlacementReorderZeroPlacementDemoteConsecutiveIsInert(t *testing.
 	setClientId(challenger, NewId())
 	demotionTestReconvict(incumbent, 1)
 
-	// PlacementDemoteConsecutive left at its zero value
+	parent.settings.PlacementDemoteConsecutive = 0 // <-- explicit: no longer the default (Task 8 set it to 3)
 	parent.settings.PlacementHysteresisPct = 150
 	parent.SetFlowClassifier(fixedClassifier{class: ClassBulk})
 	ipPath := &IpPath{Version: 4, Protocol: IpProtocolTcp}

@@ -6,31 +6,33 @@ import (
 	"testing"
 )
 
-// TestLightClassifierDefaultZeroValueOff pins the actual regression risk: a
-// default build must behave exactly like today (no classifier installed). If
-// a future well-meaning edit ever sets LightClassifier in
-// DefaultMultiClientSettings, this test catches it before it ships and
-// silently opts every default build into class-aware placement.
-func TestLightClassifierDefaultZeroValueOff(t *testing.T) {
+// TestLightClassifierOnByDefault pins the actual regression risk post-Task-8:
+// DefaultMultiClientSettings must keep LightClassifier on. Renamed from
+// TestLightClassifierDefaultZeroValueOff, which asserted the pre-Task-8
+// contract (off); Task 8 (feat(routing): enable class-aware scored placement
+// by default) is the one task in the smart-routing phase permitted to change
+// a default, and a future well-meaning "restore the zero-value-off
+// convention" edit would silently revert every default build to no
+// classifier installed. See also routing_defaults_test.go for the full
+// six-knob pin including the session banner.
+func TestLightClassifierOnByDefault(t *testing.T) {
 	s := DefaultMultiClientSettings()
-	if s.LightClassifier {
-		t.Fatal("DefaultMultiClientSettings must leave LightClassifier off (false)")
+	if !s.LightClassifier {
+		t.Fatal("DefaultMultiClientSettings must leave LightClassifier on (true)")
 	}
 }
 
 // TestLightClassifierSettingsZeroValueOff asserts LightClassifier follows the
-// same zero-value-off contract as every other ReliabilitySettings field: a
-// nil override (or one built from an older struct) must leave it off, and
-// ReliabilitySettingsFrom must faithfully copy it through when set.
+// same zero-value-off contract as every other ReliabilitySettings field for a
+// nil override (or one built from an older struct): that must still leave it
+// off, and ReliabilitySettingsFrom must faithfully copy it through when set.
+// This is the backward-compatibility contract, orthogonal to
+// DefaultMultiClientSettings' own default, which Task 8 turns on (see
+// TestLightClassifierOnByDefault above).
 func TestLightClassifierSettingsZeroValueOff(t *testing.T) {
 	z := ReliabilitySettingsFrom(nil) // nil -> zero value
 	if z.LightClassifier {
 		t.Fatal("LightClassifier must be zero-value-off (legacy behavior) for a nil override")
-	}
-
-	d := DefaultMultiClientSettings()
-	if ReliabilitySettingsFrom(d).LightClassifier {
-		t.Fatal("DefaultMultiClientSettings must leave LightClassifier zero-value-off")
 	}
 
 	src := &MultiClientSettings{LightClassifier: true}
@@ -40,30 +42,35 @@ func TestLightClassifierSettingsZeroValueOff(t *testing.T) {
 	}
 }
 
-// TestLightClassifierBannerDefaultZeroValue confirms the reflection-based
-// session banner (relSettingsFields) renders lightclassifier=0 for a default
-// build without any hand-edited banner list -- adding the field to
-// ReliabilitySettings is sufficient.
-func TestLightClassifierBannerDefaultZeroValue(t *testing.T) {
+// TestLightClassifierBannerOnByDefault confirms the reflection-based session
+// banner (relSettingsFields) renders lightclassifier=1 for a default build
+// without any hand-edited banner list -- setting the field in
+// DefaultMultiClientSettings (Task 8) is sufficient. Renamed from
+// TestLightClassifierBannerDefaultZeroValue, which asserted lightclassifier=0.
+func TestLightClassifierBannerOnByDefault(t *testing.T) {
 	settings := ReliabilitySettingsFrom(DefaultMultiClientSettings())
 	lines := relSessionBannerLines("", settings, relLineMaxChars)
 	if len(lines) != 1 {
 		t.Fatalf("expected a single banner line, got %d: %v", len(lines), lines)
 	}
-	if !strings.Contains(lines[0], "lightclassifier=0") {
-		t.Fatalf("default banner does not render lightclassifier=0: %s", lines[0])
+	if !strings.Contains(lines[0], "lightclassifier=1") {
+		t.Fatalf("default banner does not render lightclassifier=1: %s", lines[0])
 	}
 }
 
 // TestMaybeInstallLightClassifier is Task 2's install-site test: with
-// LightClassifier false (the zero value), flowClassifier must stay nil --
-// nothing changes versus today. With it true, a classifier must be installed
-// via the existing SetFlowClassifier seam.
+// LightClassifier false, flowClassifier must stay nil -- nothing changes
+// versus the legacy order. With it true (now DefaultMultiClientSettings'
+// own value as of Task 8), a classifier must be installed via the existing
+// SetFlowClassifier seam. The "off" case sets LightClassifier=false
+// explicitly rather than relying on DefaultMultiClientSettings' zero value,
+// which Task 8 changed -- see TestLightClassifierOnByDefault.
 func TestMaybeInstallLightClassifier(t *testing.T) {
 	off := &RemoteUserNatMultiClient{settings: DefaultMultiClientSettings()}
+	off.settings.LightClassifier = false // <-- explicit: no longer the default
 	off.maybeInstallLightClassifier()
 	if off.flowClassifier.Load() != nil {
-		t.Fatal("LightClassifier off (zero value) must leave flowClassifier nil")
+		t.Fatal("LightClassifier off must leave flowClassifier nil")
 	}
 
 	on := &RemoteUserNatMultiClient{settings: DefaultMultiClientSettings()}

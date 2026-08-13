@@ -195,14 +195,19 @@ func TestRecordFlowRewardKeyedByProviderIdentityNotChannelIdentity(t *testing.T)
 	}
 }
 
-// TestRewardInstrumentationOffRecordsAndPersistsNothing pins the zero-value-off
-// contract: with RewardInstrumentation left at its zero value (false), a
-// completed flow -- even a good one -- must record no sample, allocate no
-// accumulator, fold nothing into priors, persist nothing to the store, and
-// log no [rel] event=reward line.
+// TestRewardInstrumentationOffRecordsAndPersistsNothing pins the
+// RewardInstrumentation=off contract: with it explicitly false, a completed
+// flow -- even a good one -- must record no sample, allocate no accumulator,
+// fold nothing into priors, persist nothing to the store, and log no [rel]
+// event=reward line.
+//
+// RewardInstrumentation is set to false EXPLICITLY below rather than left
+// unset: Task 8 (feat(routing): enable class-aware scored placement by
+// default) made DefaultMultiClientSettings' own value true, so relying on
+// the zero value here would no longer produce the off state this test needs.
 func TestRewardInstrumentationOffRecordsAndPersistsNothing(t *testing.T) {
 	parent := &RemoteUserNatMultiClient{settings: DefaultMultiClientSettings()}
-	// RewardInstrumentation left unset (false)
+	parent.settings.RewardInstrumentation = false // <-- explicit: no longer the default
 	parent.SetFlowClassifier(fixedClassifier{class: ClassBulk})
 	ipPath := &IpPath{Version: 4, Protocol: IpProtocolTcp}
 

@@ -46,33 +46,45 @@ func TestBenchDurationNegativeReconvictionsClamped(t *testing.T) {
 	}
 }
 
-// TestDefaultMultiClientSettingsQuarantineKnobsZeroValueOff pins the actual
-// regression risk: a default build must behave exactly like today. If a
-// future well-meaning edit ever sets one of these in
-// DefaultMultiClientSettings, this test catches it before it ships and
-// silently opts every default build into flap damping or the re-entry ramp.
-func TestDefaultMultiClientSettingsQuarantineKnobsZeroValueOff(t *testing.T) {
+// TestDefaultMultiClientSettingsQuarantineKnobsMatchTask8Contract pins the
+// actual regression risk post-Task-8: DefaultMultiClientSettings must keep
+// QuarantineDampening on, while QuarantineReentryRamp -- deliberately NOT in
+// Task 8's list, its decay story is separate -- stays at 0. Renamed from
+// TestDefaultMultiClientSettingsQuarantineKnobsZeroValueOff, which asserted
+// the pre-Task-8 contract (both off); Task 8
+// (feat(routing): enable class-aware scored placement by default) is the one
+// task in the smart-routing phase permitted to change a default, and a
+// future well-meaning "restore the zero-value-off convention" edit would
+// silently revert every default build's flap damping. See also
+// routing_defaults_test.go for the full six-knob pin including the session
+// banner.
+func TestDefaultMultiClientSettingsQuarantineKnobsMatchTask8Contract(t *testing.T) {
 	s := DefaultMultiClientSettings()
-	if s.QuarantineDampening {
-		t.Fatal("DefaultMultiClientSettings must leave QuarantineDampening off (false)")
+	if !s.QuarantineDampening {
+		t.Fatal("DefaultMultiClientSettings must leave QuarantineDampening on (true)")
 	}
 	if s.QuarantineReentryRamp != 0 {
-		t.Fatal("DefaultMultiClientSettings must leave QuarantineReentryRamp at 0")
+		t.Fatal("DefaultMultiClientSettings must leave QuarantineReentryRamp at 0 (not in Task 8's scope)")
 	}
 }
 
 // TestNewQuarantineKnobsZeroValueOff asserts QuarantineDampening and
 // QuarantineReentryRamp follow the same zero-value-off contract as every
-// other ReliabilitySettings field: a nil override (or one built from an
-// older struct) must leave them off, and ReliabilitySettingsFrom must
-// faithfully copy each through when it is set.
+// other ReliabilitySettings field for a nil override (or one built from an
+// older struct): that must still leave them off, and ReliabilitySettingsFrom
+// must faithfully copy each through when it is set. This is the
+// backward-compatibility contract -- an old caller that never heard of these
+// fields must see exactly the pre-Phase-2 behavior -- which is orthogonal to
+// DefaultMultiClientSettings' own default, which Task 8 turns
+// QuarantineDampening on for (see
+// TestDefaultMultiClientSettingsQuarantineKnobsMatchTask8Contract above).
 //
 // The copy-fidelity half deliberately does NOT source its input from
-// DefaultMultiClientSettings(): the zero-value-off requirement means the
-// defaults leave both knobs at false/0, so a comparison built on the
-// defaults (got.X != s.X) is false != false regardless of whether
-// ReliabilitySettingsFrom copies the field at all -- deleting the copy line
-// entirely would still pass. Instead an explicit, fully-populated
+// DefaultMultiClientSettings(): Task 8 means the defaults no longer leave
+// both knobs at false/0, so a comparison built on the defaults (got.X !=
+// s.X) would be true != true regardless of whether ReliabilitySettingsFrom
+// copies the field at all -- deleting the copy line entirely could still
+// pass by coincidence. Instead an explicit, fully-populated
 // MultiClientSettings is round-tripped, with distinct non-zero values (true
 // / 45s, not the same value twice) so a copy line wired to the wrong source
 // field is caught too, not just a missing one.
@@ -80,11 +92,6 @@ func TestNewQuarantineKnobsZeroValueOff(t *testing.T) {
 	z := ReliabilitySettingsFrom(nil) // nil -> zero value
 	if z.QuarantineDampening || z.QuarantineReentryRamp != 0 {
 		t.Fatal("new quarantine knobs must be zero-value-off (legacy behavior)")
-	}
-
-	d := DefaultMultiClientSettings()
-	if d.QuarantineDampening || d.QuarantineReentryRamp != 0 {
-		t.Fatal("DefaultMultiClientSettings must leave the new quarantine knobs zero-value-off")
 	}
 
 	src := &MultiClientSettings{

@@ -377,6 +377,22 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		IpAssocSettings:             DefaultIpAssocSettings(),
 
 		RemoteUserNatMultiClientMonitorSettings: *DefaultRemoteUserNatMultiClientMonitorSettings(),
+
+		// Smart routing (Phase 2), turned on by default -- see the
+		// ReliabilitySettings field comments above for what each knob does.
+		// This is the one place in the smart-routing phase permitted to
+		// change a default: the classifier, telemetry, and reward tap this
+		// phase built are otherwise inert (scoredplacement=1 with no
+		// classifier installed is a no-op), so the owner could never observe
+		// them working without a hand-flipped developer-menu override.
+		// QuarantineReentryRamp is deliberately left at its zero value here
+		// -- its decay story is separate and not part of this change.
+		LightClassifier:            true,
+		ScoredPlacement:            true,
+		RewardInstrumentation:      true,
+		PlacementHysteresisPct:     10,
+		PlacementDemoteConsecutive: 3,
+		QuarantineDampening:        true,
 	}
 }
 

@@ -20,13 +20,15 @@ func (f fixedClassifier) Classify(*IpPath, string) FlowClass {
 }
 
 // TestScoredPlacementGatedOff is the brief's gate test: with ScoredPlacement
-// false -- the default, and what every current build and both live beta
-// testers run -- SetFlowClassifier installs the classifier (the seam works)
-// but nothing on the placement path may call it. There is no
-// newBareMultiClientForTest in this package; the suite's own bare-fixture
-// convention (a literal &RemoteUserNatMultiClient{}, e.g. flowCapTestParent
-// in ip_remote_multi_client_flow_cap_test.go, ip_remote_multi_client_test.go)
-// is reused here instead of inventing a new constructor.
+// false -- the zero value, still what a bare/never-configured client (nil
+// settings) reports, though as of Task 8 no longer what
+// DefaultMultiClientSettings itself produces -- SetFlowClassifier installs
+// the classifier (the seam works) but nothing on the placement path may call
+// it. There is no newBareMultiClientForTest in this package; the suite's own
+// bare-fixture convention (a literal &RemoteUserNatMultiClient{}, e.g.
+// flowCapTestParent in ip_remote_multi_client_flow_cap_test.go,
+// ip_remote_multi_client_test.go) is reused here instead of inventing a new
+// constructor.
 func TestScoredPlacementGatedOff(t *testing.T) {
 	c := &panicClassifier{}
 	client := &RemoteUserNatMultiClient{}
@@ -36,9 +38,9 @@ func TestScoredPlacementGatedOff(t *testing.T) {
 	if client.flowClassifier.Load() == nil {
 		t.Fatal("classifier should be stored")
 	}
-	// the gate: off by default
+	// the gate: off for a bare/nil-settings client
 	if scoredPlacementEnabled(client.reliabilitySettings()) {
-		t.Fatal("scored placement must be off by default")
+		t.Fatal("scored placement must be off for a bare client with nil settings")
 	}
 }
 
