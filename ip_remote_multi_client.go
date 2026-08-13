@@ -9993,18 +9993,30 @@ type multiClientChannel struct {
 	// as quarantineMigrated and the rest of the episode bookkeeping beside
 	// it, not new durable state. Guarded by stateLock.
 	//
-	// This raw field is the historical high-water mark and is NEVER
-	// decremented in storage -- decay is applied lazily at read time by
-	// quarantineReconvictionCount(), which removes one step per whole
-	// quarantineReconvictionDecayInterval elapsed since quarantineLiftTime
-	// (the same stamp this field advances beside above, so a fresh
-	// conviction resets the decay clock for free -- no separate field to
-	// keep in sync). See quarantineReconvictionDecay for the pure math.
-	// QuarantineDampening off short-circuits the whole computation --
-	// quarantineReconvictionCount() returns this field verbatim, no clock
-	// read at all -- so a default build's benchDuration, and the
-	// StallEvents telemetry this field also feeds (see exitMetricsSnapshot),
-	// stay byte-for-byte what they were before decay existed.
+	// With QuarantineDampening on, this field is a decaying (leaky-bucket
+	// style) count kept up to date at TWO points, both sharing the same pure
+	// quarantineReconvictionDecay math and the same quarantineLiftTime
+	// anchor (so a fresh conviction resets the decay clock for free -- no
+	// separate field to keep in sync):
+	//   - on WRITE (clearQuarantineWithLock): decay-then-increment. The OLD
+	//     quarantineLiftTime is read and folded into this field via
+	//     quarantineReconvictionDecay BEFORE it is overwritten and this
+	//     lift's +1 is added -- so a count that decayed to a read of 0
+	//     during a long quiet interval is stored back as 1 at the next
+	//     conviction, not the historical peak + 1. This is what makes the
+	//     decay durable across the count's next climb rather than a view
+	//     that evaporates the instant this channel reconvicts.
+	//   - on READ (quarantineReconvictionCount): the same decay is applied
+	//     again, non-destructively, against elapsed time since that same
+	//     quarantineLiftTime -- this is what lets a STILL-OPEN episode's
+	//     benchDuration/StallEvents reading shrink as it sits quiet, before
+	//     its own eventual lift ever runs the write-side fold.
+	// QuarantineDampening off keeps both sites exactly what they were before
+	// decay existed: the write site is exactly self.quarantineReconvictions++,
+	// and the read site returns this field verbatim with no clock read at
+	// all -- so a default build's benchDuration, and the StallEvents
+	// telemetry this field also feeds (see exitMetricsSnapshot), stay
+	// byte-for-byte what they were before decay existed.
 	quarantineReconvictions int
 
 	// pendingSendTime is when the current run of unacked sends began, reset on
@@ -10591,13 +10603,38 @@ func (self *multiClientChannel) clearQuarantine() {
 func (self *multiClientChannel) clearQuarantineWithLock() {
 	if self.quarantined {
 		self.survivedQuarantine = true
-		self.quarantineLiftTime = time.Now()
-		self.quarantineLiftConnectSeen = false
+		now := time.Now()
 		// this episode is now a completed cycle, so the NEXT bench (if any)
 		// escalates one step; see quarantineReconvictions and benchDuration.
 		// A no-op lift (already clear, the branch above did not run) must not
 		// count -- there was no episode to have completed.
-		self.quarantineReconvictions++
+		//
+		// QuarantineDampening on: decay-then-increment, not increment then
+		// decay-on-read. quarantineReconvictionCount()'s read-side decay is a
+		// pure lens over this field and quarantineLiftTime -- it can shrink
+		// what a still-open episode reads, but it never writes anything
+		// back, so on its own a count that decayed to a read of 0 during a
+		// long quiet interval would resume climbing from the historical raw
+		// peak the instant this channel reconvicts (raw+1, not 0+1) --
+		// resurrecting exactly the convictions the decay exists to forgive.
+		// Folding the SAME decay math into the stored value here, using the
+		// OLD quarantineLiftTime read below before this line overwrites it,
+		// makes the forgiveness durable across the count's next climb
+		// instead of a view that evaporates on the next event. No second
+		// timestamp field: the existing anchor need only be read once, right
+		// before it moves.
+		//
+		// QuarantineDampening off: exactly self.quarantineReconvictions++,
+		// byte-for-byte -- the dampening check keeps the stored counter from
+		// ever depending on the clock, matching quarantineReconvictionCount's
+		// own off-path guarantee.
+		if self.reliabilitySettings().QuarantineDampening {
+			self.quarantineReconvictions = quarantineReconvictionDecay(self.quarantineReconvictions, now.Sub(self.quarantineLiftTime)) + 1
+		} else {
+			self.quarantineReconvictions++
+		}
+		self.quarantineLiftTime = now
+		self.quarantineLiftConnectSeen = false
 	}
 	self.quarantined = false
 	self.quarantineReason = blackholeNone

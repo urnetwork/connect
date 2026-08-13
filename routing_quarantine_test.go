@@ -243,6 +243,50 @@ func TestQuarantineReconvictionCountDecaysOverQuietTime(t *testing.T) {
 	}
 }
 
+// TestQuarantineReconvictionDecayIsDurableAcrossAReconviction is fix-round-1's
+// required proof: a count that decayed to a read of 0 during a long quiet
+// interval must be STORED back that way at the very next conviction
+// (decay-then-increment inside clearQuarantineWithLock), not resume climbing
+// from the historical raw peak. A pure read-time-only lens cannot do this: it
+// reads back the OLD raw value at the instant quarantineLiftTime is
+// overwritten, so a channel with 3 completed cycles that goes quiet long
+// enough to read 0, then reconvicts once, would read back 4 (3+1, the
+// historical raw plus one) instead of 1 -- resurrecting exactly the
+// convictions the decay exists to forgive, in precisely the "misbehaved
+// hours ago, quiet since, then right now" scenario Task 6 exists for.
+func TestQuarantineReconvictionDecayIsDurableAcrossAReconviction(t *testing.T) {
+	client := stallTestChannel()
+	client.settings.QuarantineDampening = true
+
+	// three completed bench-then-lift cycles -> raw reconvictions = 3
+	client.setQuarantined(blackholeNoReceiveAck)
+	client.clearQuarantine()
+	client.setQuarantined(blackholeNoReceiveSyn)
+	client.clearQuarantine()
+	client.setQuarantined(blackholeNoReceiveAck)
+	client.clearQuarantine()
+	if got := client.quarantineReconvictionCount(); got != 3 {
+		t.Fatalf("expected 3 reconvictions after three lifts, got %d", got)
+	}
+
+	// age the last lift back far enough that the read-side decay reads 0
+	client.stateLock.Lock()
+	client.quarantineLiftTime = time.Now().Add(-10 * quarantineReconvictionDecayInterval)
+	client.stateLock.Unlock()
+	if got := client.quarantineReconvictionCount(); got != 0 {
+		t.Fatalf("setup: expected the count to read 0 after a long quiet interval, got %d", got)
+	}
+
+	// one more conviction, right now (no further quiet time to fake): the
+	// decay must already be folded into the STORED value, so this reads back
+	// 1, not the historical raw (3) + 1
+	client.setQuarantined(blackholeNoReceiveSyn)
+	client.clearQuarantine()
+	if got := client.quarantineReconvictionCount(); got != 1 {
+		t.Fatalf("a reconviction after a full decay must store back 1 (decay-then-increment), got %d, want 1", got)
+	}
+}
+
 // TestQuarantineReconvictionCountInertWhenDampeningOff pins the zero-value-off
 // contract: with QuarantineDampening at its zero value (false), an aged
 // quarantineLiftTime must not decay the count at all -- quarantineReconvictionCount()
