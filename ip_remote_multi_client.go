@@ -1006,6 +1006,17 @@ type MultiClientSettings struct {
 	PlacementHysteresisPct     float64
 	PlacementDemoteConsecutive int
 	RewardInstrumentation      bool
+	// LightClassifier installs the pure-Go light-tier FlowClassifier
+	// (routing_classifier_light.go) at session construction, resolving
+	// server names through the existing ServerNameLookup seam
+	// (SetServerNameLookup / the mux's IP->hostname reverse index) -- see
+	// maybeInstallLightClassifier. false (the zero value) leaves
+	// flowClassifier nil exactly as before this knob existed:
+	// classifyOrUnknown then always names ClassUnknown, so
+	// scoredPlacementReorder stays a no-op even with ScoredPlacement on. On
+	// its own (ScoredPlacement still off) this changes nothing observable
+	// except the session banner and the sampled classify line.
+	LightClassifier bool
 
 	// Quarantine flap damping (Phase 1), zero-value-off like the rest of this
 	// block. QuarantineDampening false leaves benchDuration returning the
@@ -1406,6 +1417,64 @@ func (self *RemoteUserNatMultiClient) SetFlowClassifier(c FlowClassifier) {
 	}
 }
 
+// serverNameResolver adapts the multi-client's live ServerNameLookup (see
+// SetServerNameLookup and the config's serverNameLookup field) to the
+// LightClassifier's ServerNameResolver shape, for the server-name tier of
+// the light classifier.
+//
+// It reads self.config on every call rather than closing over a snapshot
+// taken at install time. That matters because of construction order: at
+// session construction the config's ServerNameLookup is nil (see
+// NewRemoteUserNatMultiClient) -- the real lookup, an *UpgradeMux, is wired
+// afterward by SetServerNameLookup. A resolver that captured the lookup once
+// at install time would stay forever blind to it; reading self.config here
+// means the classifier immediately sees a lookup installed or swapped in
+// later, with no reinstall required.
+//
+// Table lookup only, no I/O: config.Load() is an atomic read and
+// ServerNameLookup.ServerNames (the UpgradeMux's reverseIndex.serverNames)
+// is a map lookup under its own leaf lock. Safe to call inline on the
+// placement path at new-flow frequency, per LightClassifier's contract.
+func (self *RemoteUserNatMultiClient) serverNameResolver(ip netip.Addr) (string, bool) {
+	config := self.config.Load()
+	if config == nil || config.serverNameLookup == nil {
+		return "", false
+	}
+	names := config.serverNameLookup.ServerNames(ip.String())
+	if len(names) == 0 {
+		return "", false
+	}
+	// the reverse index keeps the names it has seen for an ip in no
+	// particular scoring order; the first is as good a signal as any -- the
+	// classifier only needs one name to match a suffix table entry.
+	return names[0], true
+}
+
+// maybeInstallLightClassifier installs the pure-Go light-tier classifier
+// (routing_classifier_light.go, Task 1) when settings.LightClassifier is on,
+// through the existing SetFlowClassifier seam. false (the zero value) is a
+// no-op: flowClassifier stays nil, exactly as before this knob existed.
+//
+// Extracted from NewRemoteUserNatMultiClient as its own method so the
+// install site is directly unit-testable (construct a bare client, flip the
+// knob, call this, assert on flowClassifier) without needing a full session
+// -- windows, goroutines, a live generator -- that the constructor also
+// stands up.
+//
+// Construction-time only: an override that flips LightClassifier on later
+// via SetReliabilitySettings does not retroactively install a classifier
+// (unlike ScoredPlacement, which is read fresh from reliabilitySettings() on
+// every placement decision). Installing one is a one-way, one-time seam --
+// see SetFlowClassifier -- and the runtime override surface exists for the
+// knobs that can be safely toggled per-decision, not for wiring a new
+// object into a running session.
+func (self *RemoteUserNatMultiClient) maybeInstallLightClassifier() {
+	if self.settings == nil || !self.settings.LightClassifier {
+		return
+	}
+	self.SetFlowClassifier(NewLightClassifier(self.serverNameResolver))
+}
+
 // flowOwnerAppId answers "which pinned app owns this flow" -- from the cache
 // when the key has been seen, else from the platform lookup.
 //
@@ -1667,6 +1736,11 @@ func NewRemoteUserNatMultiClient(
 		version: 0,
 		matcher: nil,
 	})
+
+	// the smart-routing classifier install site (Phase 2 Task 2): a no-op
+	// when settings.LightClassifier is off, the zero value and every current
+	// build's default.
+	multiClient.maybeInstallLightClassifier()
 
 	multiClient.SetReceivePacketCallback(receivePacketCallback)
 
@@ -2194,6 +2268,11 @@ type ReliabilitySettings struct {
 	PlacementHysteresisPct     float64
 	PlacementDemoteConsecutive int
 	RewardInstrumentation      bool
+	// LightClassifier; see the matching MultiClientSettings field for what it
+	// does. Runtime overrides do not reinstall the classifier -- it is wired
+	// once at session construction (see maybeInstallLightClassifier) -- so
+	// this field's only effect via an override is what the banner reports.
+	LightClassifier bool
 
 	// the quarantine flap-damping pair; see the matching MultiClientSettings
 	// fields for what each one does
@@ -2254,6 +2333,7 @@ func ReliabilitySettingsFrom(settings *MultiClientSettings) *ReliabilitySettings
 		PlacementHysteresisPct:     settings.PlacementHysteresisPct,
 		PlacementDemoteConsecutive: settings.PlacementDemoteConsecutive,
 		RewardInstrumentation:      settings.RewardInstrumentation,
+		LightClassifier:            settings.LightClassifier,
 
 		QuarantineDampening:   settings.QuarantineDampening,
 		QuarantineReentryRamp: settings.QuarantineReentryRamp,
@@ -2572,6 +2652,22 @@ func (self *RemoteUserNatMultiClient) leastLoadedClients(clients []*multiClientC
 	return least
 }
 
+// classifyLogInterval bounds the `[rel] event=classify` emission rate (see
+// classifyLogThrottle). scoredPlacementReorder runs at new-flow frequency, so
+// an un-throttled line would flood the log the moment a page load opens a
+// burst of connections at once -- the exact "flow-storm" case the sampling
+// requirement exists for. Short enough that a field capture still narrates
+// what the classifier is doing within a few seconds of a session starting;
+// long enough that a storm of hundreds of new flows costs one line, not
+// hundreds. Package-level (not per-client) on the same pattern as
+// dropErrThrottle/oobErrThrottle/authErrThrottle: this process runs at most
+// one multi-client session, and a shared throttle is lock-free and needs no
+// per-instance init, so bare test fixtures (a literal &RemoteUserNatMultiClient{})
+// never see a nil-throttle panic.
+const classifyLogInterval = 5 * time.Second
+
+var classifyLogThrottle = newLogThrottle(classifyLogInterval)
+
 // scoredPlacementReorder is the Phase 1 scored-placement path, called ONLY
 // when scoredPlacementEnabled is true (see the guarded branch in sendPacket's
 // coalesceOrderedClients). It NEVER changes which exits are eligible --
@@ -2580,12 +2676,13 @@ func (self *RemoteUserNatMultiClient) leastLoadedClients(clients []*multiClientC
 // promoting the scorer's pick to the front. The learner never overrides the
 // safety layer: membership is untouched, only order.
 //
-// classifyOrUnknown is nil-safe, so an unset flowClassifier (every build
-// today -- no classifier implementation exists yet; it lands in a later
-// phase) always classifies ClassUnknown, which returns candidates completely
+// classifyOrUnknown is nil-safe, so an unset flowClassifier (every build by
+// default -- LightClassifier, Task 2's install knob, is zero-value-off)
+// always classifies ClassUnknown, which returns candidates completely
 // untouched: there is nothing to score against. This is what makes turning
-// ScoredPlacement on, by itself, a no-op today -- behavior only ever
-// *refines*, never regresses, once a real classifier is installed.
+// ScoredPlacement on, by itself, a no-op with no classifier installed --
+// behavior only ever *refines*, never regresses, once a real classifier is
+// installed.
 func (self *RemoteUserNatMultiClient) scoredPlacementReorder(candidates []*multiClientChannel, ipPath *IpPath, appId string) []*multiClientChannel {
 	if len(candidates) < 2 {
 		// nothing to reorder
@@ -2596,7 +2693,32 @@ func (self *RemoteUserNatMultiClient) scoredPlacementReorder(candidates []*multi
 	if p := self.flowClassifier.Load(); p != nil {
 		classifier = *p
 	}
-	class := classifyOrUnknown(classifier, ipPath, appId).Class
+	flowClass := classifyOrUnknown(classifier, ipPath, appId)
+	class := flowClass.Class
+
+	// [rel] event=classify, SAMPLED via classifyLogThrottle rather than
+	// per-flow: this runs at new-flow frequency on the placement path, and a
+	// per-flow line would flood the log at flow-storm rates (a page load
+	// opening dozens of connections at once). One line per
+	// classifyLogInterval is enough to prove the classifier is alive in a
+	// field capture without paying flood cost; the throttle's own suppressed
+	// counter is folded in so the capture also shows how much was elided.
+	// Emitted for every call (including ClassUnknown) so a capture can also
+	// show the classifier declining to name a class, not just its hits.
+	if ok, suppressed := classifyLogThrottle.Allow(time.Now()); ok {
+		port := 0
+		if ipPath != nil {
+			port = ipPath.DestinationPort
+		}
+		loggerOrDefault(self.log).Infof("%s\n", relEvent(
+			"classify",
+			"class", class,
+			"app", flowClass.AppId,
+			"port", port,
+			"suppressed", suppressed,
+		))
+	}
+
 	if class == ClassUnknown {
 		// no classifier installed, or it declined to name a class: nothing to
 		// score against, so the field stands in the legacy order raceCandidates
