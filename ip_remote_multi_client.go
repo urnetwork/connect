@@ -9695,7 +9695,23 @@ func (self *multiClientWindow) Close() {
 	for _, client := range removedClients {
 		client.Close()
 	}
-	// self.removeClients(removedClients)
+	// DELIBERATELY NOT self.removeClients(removedClients) -- but the reason is
+	// worth stating, because the bare commented-out call above invited exactly
+	// the wrong fix.
+	//
+	// removeClients does TWO things: it emits ProviderStateRemoved to the
+	// monitor, and it invokes clientRemoveCallback (multiClient.removeClient),
+	// which migrates the dying exit's flows onto replacement exits. The second
+	// is meaningless here -- this is session teardown, every replacement was
+	// just closed in the loop above -- so calling removeClients wholesale would
+	// have every exit try to rebind its flows onto corpses.
+	//
+	// The cost of skipping it is that providers leave no removal record at
+	// session close. That is a real observability gap (issue #51), and the fix
+	// is to emit the monitor event WITHOUT the migration callback -- not to
+	// uncomment this line. Note #51's reported symptom is a MID-SESSION
+	// self-close, which is a different path than this one; this is a second,
+	// confirmed instance of the same class, not necessarily its cause.
 }
 
 func (self *multiClientWindow) removeClients(removedClients ...*multiClientChannel) {
