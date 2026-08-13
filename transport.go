@@ -767,16 +767,21 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		// every exit path.
 		var connectTime time.Time
 		releaseReconnect := func() {}
+		cancelConnect := func() {}
 		if hadConnection {
 			connectTime, releaseReconnect = self.clientStrategy.NextReconnectTime()
 			hadConnection = false
 		} else {
-			connectTime = self.clientStrategy.NextConnectTime()
+			// cancelConnect gives the staircase reservation back if this wait
+			// is cancelled before the dial happens; it must NOT be called once
+			// the dial proceeds — see NextConnectTime
+			connectTime, cancelConnect = self.clientStrategy.NextConnectTime()
 		}
 		if connectDelay := connectTime.Sub(time.Now()); 0 < connectDelay {
 			select {
 			case <-self.ctx.Done():
 				releaseReconnect()
+				cancelConnect()
 				return
 			case <-self.kickMonitor.NotifyChannel():
 				// network changed while waiting to dial: any pacing computed
@@ -1427,7 +1432,15 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			// bind to the physical egress interface so the platform QUIC
 			// connection never loops into the tunnel this process provides
 			// (R1); a no-op off Windows and when no egress index is set.
-			_ = applyEgress(udpConn)
+			// not fatal -- the connection is still worth attempting -- but it
+			// must not be silent: an unpinned socket here follows the route
+			// table into our own tun and blackholes, which is indistinguishable
+			// from a dead network unless someone says so.
+			egressPinned := egressBound()
+			if err := applyEgress(udpConn); err != nil {
+				egressPinned = false
+				self.log.Infof("[tr]egress bind failed, the platform connection may loop into the tunnel: %s\n", err)
+			}
 			// single close path: once packetConn is bound (either directly
 			// to udpConn or wrapping it via packetTranslation), it owns the
 			// close. before that, we close udpConn directly. avoids the
@@ -1452,7 +1465,11 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			switch ptMode {
 			case TransportModeH3Dns:
 				tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
-				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", serverName, self.settings.DnsPort))
+				// resolveEgressUDPAddr, not net.ResolveUDPAddr: the socket is
+				// egress-pinned above, but the NAME must not resolve through
+				// the OS resolver, whose query follows the route table into
+				// the tunnel this process provides. See egress_dial.go.
+				udpAddr, err = resolveEgressUDPAddr(self.ctx, fmt.Sprintf("%s:%d", serverName, self.settings.DnsPort))
 				if err != nil {
 					return nil, err
 				}
@@ -1468,7 +1485,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				if err != nil {
 					return nil, err
 				}
-				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", pumpServerName, self.settings.DnsPort))
+				udpAddr, err = resolveEgressUDPAddr(self.ctx, fmt.Sprintf("%s:%d", pumpServerName, self.settings.DnsPort))
 				if err != nil {
 					return nil, err
 				}
@@ -1479,14 +1496,14 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 					return nil, err
 				}
 			default:
-				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", serverName, self.settings.H3Port))
+				udpAddr, err = resolveEgressUDPAddr(self.ctx, fmt.Sprintf("%s:%d", serverName, self.settings.H3Port))
 				if err != nil {
 					return nil, err
 				}
 				packetConn = udpConn
 			}
 
-			self.log.Infof("[c]h3 connect to %v (%s)\n", udpAddr, serverName)
+			self.log.Infof("[c]h3 connect to %v (%s) local=%v bound=%t\n", udpAddr, serverName, udpConn.LocalAddr(), egressPinned)
 
 			tlsConfig.ServerName = serverName
 			quicTransport := &quic.Transport{
@@ -1545,16 +1562,21 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 		// every exit path.
 		var connectTime time.Time
 		releaseReconnect := func() {}
+		cancelConnect := func() {}
 		if hadConnection {
 			connectTime, releaseReconnect = self.clientStrategy.NextReconnectTime()
 			hadConnection = false
 		} else {
-			connectTime = self.clientStrategy.NextConnectTime()
+			// cancelConnect gives the staircase reservation back if this wait
+			// is cancelled before the dial happens; it must NOT be called once
+			// the dial proceeds — see NextConnectTime
+			connectTime, cancelConnect = self.clientStrategy.NextConnectTime()
 		}
 		if connectDelay := connectTime.Sub(time.Now()); 0 < connectDelay {
 			select {
 			case <-self.ctx.Done():
 				releaseReconnect()
+				cancelConnect()
 				return
 			case <-self.kickMonitor.NotifyChannel():
 				// network changed while waiting to dial: any pacing computed

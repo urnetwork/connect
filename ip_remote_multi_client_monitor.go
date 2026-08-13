@@ -17,6 +17,16 @@ type WindowExpandEvent struct {
 	// CurrentSize int
 	TargetSize   int
 	MinSatisfied bool
+	// Reason is the machine-readable stall diagnosis while the window is still
+	// forming: one of the WindowStall* constants (evaluating,
+	// platform-unreachable, providers-unresponsive, rate-limited,
+	// auth-failing). Derived by the window from the dominant recent evaluation
+	// failure class; empty (a legacy sender, or a bare fixture) reads as
+	// evaluating. See ip_remote_multi_client_outcome.go.
+	Reason string
+	// Failed is the terminal outcome state: the window hit its outcome
+	// deadline twice with zero providers Added. Cleared when a provider lands.
+	Failed bool
 }
 
 // provider state machine is:
@@ -123,6 +133,7 @@ func NewRemoteUserNatMultiClientMonitor(settings *RemoteUserNatMultiClientMonito
 			// CurrentSize: 0,
 			TargetSize:   0,
 			MinSatisfied: false,
+			Reason:       WindowStallEvaluating,
 		},
 		clientIdProviderEvents: map[Id]*ProviderEvent{},
 		monitorEventCallbacks:  NewCallbackList[*monitorEventCallbackWorker](),
@@ -377,6 +388,11 @@ func (self *RemoteUserNatMultiClientMonitor) AddWindowExpandEvent(minSatisfied b
 			// CurrentSize: currentSize,
 			TargetSize:   targetSize,
 			MinSatisfied: minSatisfied,
+			// the stall diagnosis is carried, not owned, by the expand event:
+			// this call updates the size half only (SetStallStatus owns the
+			// other half)
+			Reason: self.windowExpandEvent.Reason,
+			Failed: self.windowExpandEvent.Failed,
 		}
 
 		if self.windowExpandEvent != windowExpandEvent {
@@ -392,6 +408,35 @@ func (self *RemoteUserNatMultiClientMonitor) AddWindowExpandEvent(minSatisfied b
 			}
 		}
 	}
+}
+
+// SetStallStatus records the window's stall diagnosis (see
+// ip_remote_multi_client_outcome.go) on the expand event and dispatches to
+// listeners when it changed. Returns whether anything changed, so the caller
+// can log the transition — once per change, never per pass.
+func (self *RemoteUserNatMultiClientMonitor) SetStallStatus(reason string, failed bool) bool {
+	var windowExpandEvent WindowExpandEvent
+	changed := false
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+
+		if self.windowExpandEvent.Reason != reason || self.windowExpandEvent.Failed != failed {
+			self.windowExpandEvent.Reason = reason
+			self.windowExpandEvent.Failed = failed
+			changed = true
+		}
+		windowExpandEvent = self.windowExpandEvent
+	}()
+
+	if changed {
+		if callbacks := self.monitorEventCallbacks.Get(); 0 < len(callbacks) {
+			for _, callback := range callbacks {
+				callback.Dispatch(&windowExpandEvent, nil, false)
+			}
+		}
+	}
+	return changed
 }
 
 // provider events are serialized per `clientId`
@@ -481,11 +526,30 @@ func (self *MergedMultiClientMonitor) WindowExpandEvent() *WindowExpandEvent {
 		TargetSize:   0,
 		MinSatisfied: false,
 	}
+	// the stall diagnosis merges by sharpness (stallReasonRank), and Failed
+	// only when EVERY window that is actually trying (failed, or a non-zero
+	// target) has failed — a disabled window (target 0 under a fixed-window
+	// profile) must not veto, and a live window must
+	trying := 0
+	failed := 0
 	for _, monitor := range self.monitors {
 		windowExpandEvent := monitor.WindowExpandEvent()
 		netWindowExpandEvent.TargetSize += windowExpandEvent.TargetSize
 		netWindowExpandEvent.MinSatisfied = netWindowExpandEvent.MinSatisfied || windowExpandEvent.MinSatisfied
+		if stallReasonRank(netWindowExpandEvent.Reason) < stallReasonRank(windowExpandEvent.Reason) {
+			netWindowExpandEvent.Reason = windowExpandEvent.Reason
+		}
+		if windowExpandEvent.Failed {
+			trying += 1
+			failed += 1
+		} else if 0 < windowExpandEvent.TargetSize {
+			trying += 1
+		}
 	}
+	if netWindowExpandEvent.Reason == "" {
+		netWindowExpandEvent.Reason = WindowStallEvaluating
+	}
+	netWindowExpandEvent.Failed = 0 < failed && failed == trying && !netWindowExpandEvent.MinSatisfied
 	return &netWindowExpandEvent
 }
 

@@ -22,7 +22,7 @@ func TestNextConnectTimeSerializesCallers(t *testing.T) {
 	start := time.Now()
 	var last time.Time
 	for i := range 8 {
-		next := strategy.NextConnectTime()
+		next, _ := strategy.NextConnectTime()
 		if next.Before(last) {
 			t.Fatalf("call %d went backwards: %s < %s", i, next, last)
 		}
@@ -55,7 +55,7 @@ func TestNextConnectTimeReconnectFastPath(t *testing.T) {
 	start := time.Now()
 	var serialLast time.Time
 	for range 3 {
-		serialLast = strategy.NextConnectTime()
+		serialLast, _ = strategy.NextConnectTime()
 	}
 	if serialLast.Before(start.Add(2 * settings.MinNextConnectDelay)) {
 		t.Fatalf("staircase priming failed: %s", serialLast.Sub(start))
@@ -103,6 +103,90 @@ func TestNextConnectTimeReconnectFastPath(t *testing.T) {
 	for range reconnectFastPathLimit {
 		_, release := strategy.NextReconnectTime()
 		defer release()
+	}
+}
+
+// a cancelled pacing wait gives its staircase reservation back. Before the
+// release existed, a dialer torn down while waiting for its slot left its
+// 100ms-1s step consumed forever, so rapid connect/disconnect cycles pushed
+// the one shared timestamp arbitrarily far ahead of wall clock (2026-08-09
+// field capture: 60s+ lead, cohorts of ~10 transport-downs expiring every 15s,
+// 0 proven connections). All arithmetic on returned times -- no sleeps.
+// Min == Max pins the serialized step to exactly 100ms so the assertions are
+// deterministic.
+func TestNextConnectTimeCancelReleasesReservation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	settings := DefaultClientStrategySettings()
+	settings.MinNextConnectDelay = 100 * time.Millisecond
+	settings.MaxNextConnectDelay = 100 * time.Millisecond
+	strategy := NewClientStrategy(ctx, settings)
+
+	// 50 dialers reserve a step each and are cancelled before dialing -- the
+	// shape of a multi-client window torn down mid-connect
+	releases := []func(){}
+	var deepest time.Time
+	for range 50 {
+		var release func()
+		deepest, release = strategy.NextConnectTime()
+		releases = append(releases, release)
+	}
+	// the staircase is genuinely deep before the releases...
+	if lead := time.Until(deepest); lead < 4*time.Second {
+		t.Fatalf("staircase priming failed: lead %s", lead)
+	}
+	for _, release := range releases {
+		release()
+	}
+	// ...and every cancelled wait gave its step back: a fresh caller is paced
+	// one step from now, not queued behind 50 dials that will never happen
+	next, release := strategy.NextConnectTime()
+	release()
+	if lead := time.Until(next); 2*settings.MaxNextConnectDelay < lead {
+		t.Errorf("cancelled waits leaked their reservations: lead %s", lead)
+	}
+
+	// release is idempotent: a double release must not free a second step.
+	// reserve three steps, double-release the first, and the next reservation
+	// must land one step past the third (back where the third was), not two
+	// steps down.
+	_, releaseA := strategy.NextConnectTime()
+	strategy.NextConnectTime()
+	last, _ := strategy.NextConnectTime()
+	releaseA()
+	releaseA()
+	final, _ := strategy.NextConnectTime()
+	if final.Before(last) {
+		t.Errorf("double release freed a second step: %s < %s", final, last)
+	}
+}
+
+// the safety clamp behind the release: even when reservations leak (a release
+// never runs -- e.g. the over-cap reconnect fallback), the shared timestamp
+// never runs more than nextConnectMaxLead ahead of wall clock, so no dialer is
+// ever born more than that from its first dial.
+func TestNextConnectTimeLeadClamp(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	settings := DefaultClientStrategySettings()
+	settings.MinNextConnectDelay = 100 * time.Millisecond
+	settings.MaxNextConnectDelay = 200 * time.Millisecond
+	strategy := NewClientStrategy(ctx, settings)
+
+	// 200 leaked reservations would stack >= 20s of staircase unclamped
+	var last time.Time
+	for range 200 {
+		last, _ = strategy.NextConnectTime()
+	}
+	if lead := time.Until(last); nextConnectMaxLead < lead {
+		t.Errorf("staircase lead %s exceeds the clamp %s", lead, nextConnectMaxLead)
+	}
+	// the clamp bounds the lead but does not erase pacing: with >= 20s of
+	// unclamped demand the lead must be sitting AT the bound, not below it
+	if lead := time.Until(last); lead < nextConnectMaxLead-time.Second {
+		t.Errorf("lead %s is far below the clamp %s: the bound is not what limited it", lead, nextConnectMaxLead)
 	}
 }
 
