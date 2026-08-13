@@ -2,6 +2,7 @@ package connect
 
 import (
 	"fmt"
+	"math"
 	"reflect"
 	"strconv"
 	"strings"
@@ -504,11 +505,28 @@ type heartbeatState struct {
 	// mechanism never engaged.
 	pinnedApps  int
 	pinnedExits int
+
+	// goodputBps is the mean per-exit effective goodput (send+receive
+	// bytes/sec), from the exact windowStatsWithCoalesce(false) read
+	// exitMetricsSnapshot uses for scoring -- so this is a direct readout of
+	// the scorer's own input, not a separate measurement. 0 with exits>0 is
+	// an honest "no window activity yet", the same reading a brand new
+	// exit's own score would use.
+	//
+	// rttMillis is the mean RTT of ONLY the exits with a completed send-ack
+	// round trip (see rttEwmaSnapshot's rttOk); rttMeasured counts how many
+	// of the pool that mean covers. Always read the pair together --
+	// rttMillis alone cannot distinguish "every exit is fast" from "nothing
+	// has acked yet", which is exactly the zero-RTT trap exitMetricsSnapshot
+	// itself is careful to avoid (see its doc).
+	goodputBps  uint64
+	rttMillis   uint64
+	rttMeasured int
 }
 
 // heartbeatStateFrom folds the existing readouts into the beat's state. Pure,
 // so the content is testable from a fixture without windows, clocks or
-// goroutines -- both inputs are snapshots the caller already took.
+// goroutines -- every input is a snapshot the caller already took.
 //
 // `warned` counts exits new flows avoid, which by isWarning's definition
 // includes the quarantined ones; the two are reported separately rather than
@@ -517,7 +535,18 @@ type heartbeatState struct {
 // asks. Tiers are EFFECTIVE tiers (the rank selection actually uses), so a
 // heartbeat showing tiers=0/3 on a good pool says three exits are carrying
 // demerits.
-func heartbeatStateFrom(exits []*ExitInfo, metrics *ReliabilityMetricsSnapshot, appPins []*AppPin) heartbeatState {
+//
+// telemetry folds separately from exits: it has no per-ExitInfo association
+// (exitTelemetrySnapshot is its own walk, over ExitMetrics, not ExitInfo),
+// so goodput/rtt are pool-wide means rather than attributed to one row.
+// GoodputBytesPerSec always contributes (0 is a real "no activity yet"
+// reading, per exitScore's own guard); RttMillis only contributes when it is
+// not NaN, i.e. when the channel completed at least one timed send-ack round
+// trip -- averaging in the "unmeasured" sentinel would corrupt the mean with
+// the very fabricated-zero exitMetricsSnapshot exists to avoid, and reporting
+// nothing here (rttMeasured stays 0) is the honest reading of a pool that has
+// not acked anything back yet.
+func heartbeatStateFrom(exits []*ExitInfo, metrics *ReliabilityMetricsSnapshot, appPins []*AppPin, telemetry []ExitMetrics) heartbeatState {
 	state := heartbeatState{}
 	pinnedExits := map[Id]bool{}
 	for _, appPin := range appPins {
@@ -565,6 +594,21 @@ func heartbeatStateFrom(exits []*ExitInfo, metrics *ReliabilityMetricsSnapshot, 
 		state.groupsFollowed = metrics.GroupsFollowed
 		state.groupsScattered = metrics.GroupsScattered
 	}
+	if 0 < len(telemetry) {
+		var goodputSum float64
+		var rttSum float64
+		for _, m := range telemetry {
+			goodputSum += m.GoodputBytesPerSec
+			if !math.IsNaN(m.RttMillis) && !math.IsInf(m.RttMillis, 0) {
+				rttSum += m.RttMillis
+				state.rttMeasured += 1
+			}
+		}
+		state.goodputBps = uint64(goodputSum / float64(len(telemetry)))
+		if 0 < state.rttMeasured {
+			state.rttMillis = uint64(rttSum / float64(state.rttMeasured))
+		}
+	}
 	return state
 }
 
@@ -584,6 +628,12 @@ func relHeartbeatLine(state heartbeatState, uptime time.Duration) string {
 		"warned", state.warned,
 		"flows", state.flows,
 		"tiers", pair(state.tierMin, state.tierMax),
+		// mean per-exit goodput (bytes/sec), and mean RTT (ms) over ONLY the
+		// exits that have timed a round trip so far / how many that is out of
+		// the pool -- read the pair together: rtt=0/0 is "nothing has acked
+		// yet", not "every exit is instant".
+		"goodput", state.goodputBps,
+		"rtt", pair(state.rttMillis, state.rttMeasured),
 		"held", pair(state.heldUplink, state.heldTransport),
 		// destructive verdicts held because enough exits went silent inside
 		// one shared-fate window that the shared path is the likely cause; a
@@ -661,10 +711,10 @@ func (self *RemoteUserNatMultiClient) runHeartbeat() {
 			continue
 		}
 
-		// both readouts take their own locks internally and are called with
-		// nothing held, which is the contract Exits() and the metrics snapshot
-		// document
-		state := heartbeatStateFrom(self.Exits(), self.ReliabilityMetrics(), self.AppPins())
+		// all three readouts take their own locks internally and are called
+		// with nothing held, which is the contract Exits(), the metrics
+		// snapshot, and exitTelemetrySnapshot all document
+		state := heartbeatStateFrom(self.Exits(), self.ReliabilityMetrics(), self.AppPins(), self.exitTelemetrySnapshot())
 		if beaten && state == last {
 			// nothing moved since the last beat; an idle session stays quiet
 			continue

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"strings"
 	"sync"
@@ -358,7 +359,17 @@ func TestHeartbeatContentFromFixture(t *testing.T) {
 		GroupsScattered:           1,
 	}
 
-	state := heartbeatStateFrom(heartbeatTestExits(), metrics, heartbeatTestAppPins())
+	// three exits' worth of telemetry: two with a completed RTT sample, one
+	// (still forming, no acks yet) with none -- the NaN it reports per
+	// exitMetricsSnapshot's contract must be excluded from the mean, not
+	// averaged in as a fabricated 0ms.
+	telemetry := []ExitMetrics{
+		{GoodputBytesPerSec: 300, RttMillis: 20},
+		{GoodputBytesPerSec: 600, RttMillis: 40},
+		{GoodputBytesPerSec: 0, RttMillis: math.NaN()},
+	}
+
+	state := heartbeatStateFrom(heartbeatTestExits(), metrics, heartbeatTestAppPins(), telemetry)
 	AssertEqual(t, state.exits, 3)
 	AssertEqual(t, state.proven, 2)
 	AssertEqual(t, state.quarantined, 1)
@@ -374,9 +385,15 @@ func TestHeartbeatContentFromFixture(t *testing.T) {
 	AssertEqual(t, state.pinnedApps, 2)
 	AssertEqual(t, state.pinnedExits, 1)
 
+	// goodput means over all three (300+600+0)/3 = 300; rtt means over only
+	// the two with a sample, (20+40)/2 = 30, and reports 2 measured of 3
+	AssertEqual(t, state.goodputBps, uint64(300))
+	AssertEqual(t, state.rttMillis, uint64(30))
+	AssertEqual(t, state.rttMeasured, 2)
+
 	line := relHeartbeatLine(state, 125*time.Second)
 	want := "[rel] event=heartbeat exits=3 proven=2 quarantined=1 warned=2 flows=6 " +
-		"tiers=0/3 held=7/2 fate=0 deferred=1 rebinds=9/3 probes=40/38 follow=6/1 pins=2/1 removals=5 uptime=125"
+		"tiers=0/3 goodput=300 rtt=30/2 held=7/2 fate=0 deferred=1 rebinds=9/3 probes=40/38 follow=6/1 pins=2/1 removals=5 uptime=125"
 	AssertEqual(t, line, want)
 }
 
@@ -388,12 +405,12 @@ func TestHeartbeatPinsCountDistinctExits(t *testing.T) {
 	split := heartbeatStateFrom(nil, nil, []*AppPin{
 		{AppId: "com.a", ClientId: clientA},
 		{AppId: "com.b", ClientId: clientB},
-	})
+	}, nil)
 	AssertEqual(t, split.pinnedApps, 2)
 	AssertEqual(t, split.pinnedExits, 2)
 
 	// and nothing pinned reads as zero, never as an error
-	none := heartbeatStateFrom(nil, nil, nil)
+	none := heartbeatStateFrom(nil, nil, nil, nil)
 	AssertEqual(t, none.pinnedApps, 0)
 	AssertEqual(t, none.pinnedExits, 0)
 }
@@ -401,7 +418,7 @@ func TestHeartbeatPinsCountDistinctExits(t *testing.T) {
 // An empty pool and a nil metrics snapshot are both ordinary states (a window
 // still forming, a bare client), not crashes.
 func TestHeartbeatEmptyState(t *testing.T) {
-	state := heartbeatStateFrom(nil, nil, nil)
+	state := heartbeatStateFrom(nil, nil, nil, nil)
 	AssertEqual(t, state, heartbeatState{})
 	line := relHeartbeatLine(state, 0)
 	if !strings.Contains(line, "exits=0") || !strings.Contains(line, "tiers=0/0") {
@@ -416,8 +433,8 @@ func TestHeartbeatSignatureSuppression(t *testing.T) {
 	metrics := &ReliabilityMetricsSnapshot{ProbesSent: 1}
 	exits := heartbeatTestExits()
 
-	first := heartbeatStateFrom(exits, metrics, nil)
-	second := heartbeatStateFrom(exits, metrics, nil)
+	first := heartbeatStateFrom(exits, metrics, nil, nil)
+	second := heartbeatStateFrom(exits, metrics, nil, nil)
 	if first != second {
 		t.Error("two identical readouts produce different signatures, so an idle session would log every beat")
 	}
@@ -446,6 +463,9 @@ func TestHeartbeatSignatureSuppression(t *testing.T) {
 		"answered":    func(s *heartbeatState) { s.probesAnswered += 1 },
 		"removals":    func(s *heartbeatState) { s.removals += 1 },
 		"fate":        func(s *heartbeatState) { s.heldSharedFate += 1 },
+		"goodput":     func(s *heartbeatState) { s.goodputBps += 1 },
+		"rtt":         func(s *heartbeatState) { s.rttMillis += 1 },
+		"rttMeasured": func(s *heartbeatState) { s.rttMeasured += 1 },
 	} {
 		changed := first
 		mutate(&changed)

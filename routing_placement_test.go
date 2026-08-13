@@ -89,9 +89,10 @@ func TestScoredPlacementReorderSingleCandidateIsNoop(t *testing.T) {
 }
 
 // TestScoredPlacementReorderPrefersLessLoadedForClassifiedFlow exercises the
-// real scoring path end to end with a classifier installed. No per-exit RTT/
-// goodput/jitter/stall telemetry is wired yet (see exitMetricsSnapshot's
-// doc), so every candidate's exitScore is identical except for Flows, and a
+// real scoring path end to end with a classifier installed. Both bare
+// fixture channels have no window activity and no RTT samples, so
+// exitMetricsSnapshot reads identically "no data" for each of them (see its
+// doc) -- their exitScore is therefore identical except for Flows, and a
 // classified flow must reduce to the less-loaded tie-break: the lighter
 // exit is promoted to the front.
 func TestScoredPlacementReorderPrefersLessLoadedForClassifiedFlow(t *testing.T) {

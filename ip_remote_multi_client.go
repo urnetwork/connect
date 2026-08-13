@@ -2810,14 +2810,13 @@ func (self *RemoteUserNatMultiClient) scoredPlacementReorder(candidates []*multi
 
 	// flow counts are parent-lock state (the same bookkeeping
 	// leastLoadedClients reads above), gathered in one locked pass and then
-	// scored with no lock held. WindowStats (the per-exit goodput source used
-	// elsewhere in this file, e.g. the resize pass) has the side effect of
-	// advancing the channel's healthy/unhealthy duration bookkeeping, tuned
-	// for that pass's ~15s cadence -- calling it here, at new-flow frequency,
-	// would perturb that state at a much higher rate for no benefit yet. So
-	// RttMillis, GoodputBytesPerSec, and Jitter are left at their zero value
-	// (see exitMetricsSnapshot); real per-exit telemetry for those is future
-	// work, once a side-effect-free accessor exists.
+	// scored with no lock held. The rest of exitMetricsSnapshot's inputs
+	// (windowStatsWithCoalesce(false), quarantineReconvictionCount,
+	// rttEwmaSnapshot) each take only their OWN channel's stateLock, in their
+	// own short critical section -- never the parent lock, never held across
+	// another call -- so gathering them per-candidate below is the same
+	// no-lock-across-a-call discipline as this flow-count pass, just without
+	// the need to pre-gather into a map first.
 	flowCounts := make(map[*multiClientChannel]int, len(candidates))
 	func() {
 		self.stateLock.Lock()
@@ -2837,10 +2836,10 @@ func (self *RemoteUserNatMultiClient) scoredPlacementReorder(candidates []*multi
 
 	bestIndex := 0
 	bestFlows := flowCounts[candidates[0]]
-	bestScore := exitScore(exitMetricsSnapshot(bestFlows), weights) - candidates[0].reentryPenalty(reentryRamp)
+	bestScore := exitScore(exitMetricsSnapshot(candidates[0], bestFlows), weights) - candidates[0].reentryPenalty(reentryRamp)
 	for i := 1; i < len(candidates); i++ {
 		flows := flowCounts[candidates[i]]
-		score := exitScore(exitMetricsSnapshot(flows), weights) - candidates[i].reentryPenalty(reentryRamp)
+		score := exitScore(exitMetricsSnapshot(candidates[i], flows), weights) - candidates[i].reentryPenalty(reentryRamp)
 		if lessLoadedTieBreak(bestScore, score, bestFlows, flows, hysteresisPct) {
 			bestIndex, bestScore, bestFlows = i, score, flows
 		}
@@ -2859,21 +2858,63 @@ func (self *RemoteUserNatMultiClient) scoredPlacementReorder(candidates []*multi
 	return reordered
 }
 
-// exitMetricsSnapshot builds the scorer's read of one candidate from what is
-// safely available on the placement path today: Flows, the same live
-// flow-cap bookkeeping leastLoadedClients already reads. RttMillis,
-// GoodputBytesPerSec, and Jitter have no per-exit accessor that is safe to
-// call at new-flow frequency without perturbing the resize pass's health
-// bookkeeping (see scoredPlacementReorder) and StallEvents has no per-exit
-// counter in this file at all yet (stall state here is a boolean, not a
-// count). All four are left at their zero value, which contributes the SAME
-// constant to every candidate's score (see exitScore's hostile-input guards,
-// which already treat a zero RTT/Jitter/StallEvents as a valid, sanitized
-// input) -- so today scoredPlacementReorder reduces to the less-loaded
-// tie-break among classified candidates. Wiring real per-exit telemetry is
-// later-phase work; see the Task 8 report for the reasoning.
-func exitMetricsSnapshot(flows int) ExitMetrics {
-	return ExitMetrics{Flows: flows}
+// exitMetricsSnapshot builds the scorer's read of one candidate, entirely
+// from side-effect-free accessors -- no lock held across a call, no I/O, no
+// blocking, safe at new-flow frequency:
+//
+//   - Flows is the caller's own flow-count read (leastLoadedClients' same
+//     bookkeeping), passed in rather than re-read here.
+//   - GoodputBytesPerSec comes from windowStatsWithCoalesce(false), the
+//     side-effect-free twin of WindowStats() -- WindowStats() itself must
+//     NEVER be called from this path: it coalesces event buckets and
+//     perturbs the resize pass's ~15s cadence bookkeeping.
+//   - StallEvents is quarantineReconvictionCount(): this channel's completed
+//     bench-then-lift cycle count. A hard send-stall conviction removes the
+//     channel outright (convictSendStalls), so a convicted exit is never a
+//     candidate here at all -- reconvictions are the chronic-misbehavior
+//     signal that survives while still in the window.
+//   - RttMillis/Jitter come from rttEwmaSnapshot, this channel's own
+//     send-to-ack EWMA (see addSendRttSample). Nothing else in this file
+//     timed a round trip before this task (see the field comment beside
+//     rttEwmaMillis).
+//
+// THE ZERO-RTT TRAP: exitScore sanitizes a bare 0 RTT/Jitter into the BEST
+// possible sub-score (routing_score.go), the same treatment it gives a
+// genuinely excellent measurement. A zero is therefore not a neutral
+// "unknown" -- it is a maximal bonus, and an unmeasured exit would outrank
+// every measured one. So an exit with no completed round trip yet (rttOk
+// false: every bare test fixture, and a real channel before its first ack)
+// reports RttMillis/Jitter as math.NaN(), NOT 0 -- exitScore's existing
+// hostile-input guard already sanitizes NaN to the WORST sub-score (0.0),
+// exactly the intended "unmeasured must not beat measured" reading, reusing
+// tested code instead of adding a second convention. jitterOk is gated one
+// sample stricter than rttOk (a single round trip has no deviation to
+// report yet), so a channel with exactly one sample reports a real RttMillis
+// but NaN Jitter -- consistent with the same rule.
+func exitMetricsSnapshot(client *multiClientChannel, flows int) ExitMetrics {
+	m := ExitMetrics{
+		Flows:     flows,
+		RttMillis: math.NaN(),
+		Jitter:    math.NaN(),
+	}
+	if client == nil {
+		return m
+	}
+
+	if stats, _ := client.windowStatsWithCoalesce(false); stats != nil {
+		m.GoodputBytesPerSec = float64(stats.EffectiveByteCountPerSecond())
+	}
+
+	m.StallEvents = client.quarantineReconvictionCount()
+
+	if rttMillis, jitterMillis, rttOk, jitterOk := client.rttEwmaSnapshot(); rttOk {
+		m.RttMillis = rttMillis
+		if jitterOk {
+			m.Jitter = jitterMillis
+		}
+	}
+
+	return m
 }
 
 // bindClientFlow records that a flow is now committed to client, which is what
@@ -6272,6 +6313,32 @@ func (self *RemoteUserNatMultiClient) Exits() []*ExitInfo {
 	return exits
 }
 
+// exitTelemetrySnapshot gathers this session's live per-exit ExitMetrics for
+// the heartbeat line, using exactly the same side-effect-free accessors
+// exitMetricsSnapshot uses for scoring (windowStatsWithCoalesce(false),
+// quarantineReconvictionCount, rttEwmaSnapshot) -- so what the heartbeat
+// reports is what the scorer actually saw, not a second, drifting readout.
+// Same walk shape as Exits() (every window, every client, no lock held
+// across a channel's own accessors), and the same nil-safe reading of a
+// window with nothing in it. Flows is left at 0: the heartbeat already
+// reports total flow count from Exits()' own walk, and this readout only
+// exists for the goodput/rtt aggregate beside it.
+func (self *RemoteUserNatMultiClient) exitTelemetrySnapshot() []ExitMetrics {
+	if self == nil {
+		return nil
+	}
+	var telemetry []ExitMetrics
+	for _, window := range self.windows {
+		if window == nil {
+			continue
+		}
+		for _, client := range window.unorderedClients() {
+			telemetry = append(telemetry, exitMetricsSnapshot(client, 0))
+		}
+	}
+	return telemetry
+}
+
 // DestinationExit is one (destination ip, exit) pairing in the live flow
 // table: FlowCount flows to DestinationIp currently ride the exit ClientId.
 type DestinationExit struct {
@@ -9660,6 +9727,30 @@ type multiClientChannel struct {
 	// recentOwnSendAck arm). Guarded by stateLock, like lastReceiveAckTime.
 	lastSendAckTime time.Time
 
+	// rttEwmaMillis/rttJitterMillis/rttSamples are the placement scorer's only
+	// source of per-exit round-trip time (see exitMetricsSnapshot). Nothing
+	// on the transfer layer timed a send-ack round trip before this:
+	// SendDetailedMessage just relays an opaque ackCallback, and the busy
+	// probe's own wait (busyLivenessProbe) only measures elapsed time to
+	// detect a suspended scheduler and throws the duration away. So this
+	// channel times it itself -- SendDetailedWithAck's ackCallback captures
+	// the send instant in its closure and folds time.Since(that) in here on a
+	// successful ack, via addSendRttSample.
+	//
+	// rttEwmaMillis smooths with the classic 1/8 TCP SRTT weight (RFC 6298);
+	// rttJitterMillis is the matching RTTVAR-style mean absolute deviation,
+	// seeded (not smoothed) from the first gap since a single sample has no
+	// deviation to report. rttSamples is the fold count: 0 means "never
+	// completed a timed send-ack round trip", which rttEwmaSnapshot reports
+	// as rttOk=false rather than as a fabricated 0ms. This matters because
+	// exitScore sanitizes a bare 0 RTT into the BEST possible sub-score (see
+	// routing_score.go) -- a channel with no measurement must read as
+	// unmeasured, never as a perfect one. Guarded by stateLock like every
+	// other field in this block.
+	rttEwmaMillis   float64
+	rttJitterMillis float64
+	rttSamples      int
+
 	// stalled is a test/diagnostic hook, set only by StallExit. Read on the
 	// send hot path, so an atomic rather than the state lock.
 	stalled atomic.Bool
@@ -10048,6 +10139,14 @@ func (self *multiClientChannel) effectiveTier() int {
 }
 
 func (self *multiClientChannel) EstimatedByteCountPerSecond() ByteCount {
+	// nil-safe like the other self.args readers in this file (see
+	// clientReceive's `self.args != nil` guard): a channel built without args
+	// -- every routing-scorer test fixture that only cares about flow counts
+	// -- has nothing estimated yet, which is the same fact this returns for a
+	// channel with args but no traffic.
+	if self.args == nil {
+		return ByteCount(0)
+	}
 	return self.args.EstimatedBytesPerSecond
 }
 
@@ -10755,6 +10854,71 @@ func (self *multiClientChannel) hasRecentSendAck(window time.Duration) bool {
 	return !self.lastSendAckTime.IsZero() && time.Since(self.lastSendAckTime) < window
 }
 
+// rttEwmaAlpha weights each new round-trip sample against the running
+// average. 1/8 is the classic TCP SRTT smoothing constant (RFC 6298) --
+// fast enough to track a real path change within a handful of samples,
+// slow enough that one spiky packet cannot swing the estimate into
+// implausible territory.
+const rttEwmaAlpha = 0.125
+
+// addSendRttSample folds one measured send-to-ack round trip into this
+// channel's smoothed RTT/jitter estimate. Called only from
+// SendDetailedWithAck's ackCallback, on a successful ack, with the elapsed
+// time since that specific packet's own send call -- never from a shared
+// clock like pendingSendTime, which measures the OLDEST outstanding send and
+// would misattribute the round trip under concurrent in-flight packets.
+//
+// A non-positive duration is not a real measurement (clock skew, or a test
+// driving the callback with a synthetic time) and is dropped rather than
+// folded in: exitScore reads a 0 RTT as the BEST possible sub-score, so
+// recording one here would be the same trap exitMetricsSnapshot's ok gating
+// exists to avoid, just moved one layer down.
+func (self *multiClientChannel) addSendRttSample(rtt time.Duration) {
+	if rtt <= 0 {
+		return
+	}
+	millis := float64(rtt) / float64(time.Millisecond)
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	if self.rttSamples == 0 {
+		self.rttEwmaMillis = millis
+	} else {
+		diff := millis - self.rttEwmaMillis
+		self.rttEwmaMillis += rttEwmaAlpha * diff
+		absDiff := math.Abs(diff)
+		if self.rttSamples == 1 {
+			// the first-ever deviation: seeded, not smoothed, the same
+			// convention RFC 6298 uses to initialize RTTVAR
+			self.rttJitterMillis = absDiff
+		} else {
+			self.rttJitterMillis += rttEwmaAlpha * (absDiff - self.rttJitterMillis)
+		}
+	}
+	self.rttSamples += 1
+}
+
+// rttEwmaSnapshot reads the current smoothed RTT/jitter estimate.
+// rttOk is false for a channel that has never completed a timed send-ack
+// round trip (every bare test fixture, and every real channel before its
+// first ack) -- callers MUST treat that as "no data", never as a 0ms
+// measurement (see exitMetricsSnapshot). jitterOk additionally requires a
+// SECOND sample: one round trip alone has no deviation to report, and
+// reporting 0 there would trip the same zero-is-best trap RTT itself is
+// guarded against.
+func (self *multiClientChannel) rttEwmaSnapshot() (rttMillis float64, jitterMillis float64, rttOk bool, jitterOk bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.rttSamples == 0 {
+		return 0, 0, false, false
+	}
+	if self.rttSamples == 1 {
+		return self.rttEwmaMillis, 0, true, false
+	}
+	return self.rttEwmaMillis, self.rttJitterMillis, true, true
+}
+
 // hasRecentReceive reports whether return traffic arrived on this channel
 // inside window -- the per-sibling half of the comparative connect cut's
 // evidence (see RemoteUserNatMultiClient.receivingChannelCount). Takes only
@@ -11193,6 +11357,11 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 	} else {
 		packetByteCount := ByteCount(len(parsedPacket.packet))
 		self.addSend(packetByteCount, parsedPacket.ipPath)
+		// sendTime anchors THIS packet's own round trip -- captured here rather
+		// than read back from pendingSendTime, which tracks the OLDEST
+		// outstanding send and would misattribute the RTT under concurrent
+		// in-flight packets. See addSendRttSample.
+		sendTime := time.Now()
 
 		// a stalled exit swallows the packet: reported sent, never acknowledged,
 		// and crucially no error -- an error would reset the flow immediately,
@@ -11214,6 +11383,7 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 		ackCallback := func(err error) {
 			if err == nil {
 				self.addSendAck(packetByteCount)
+				self.addSendRttSample(time.Since(sendTime))
 			} else {
 				self.addError(err)
 			}
@@ -12678,25 +12848,31 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 	for _, sourceCounts := range self.ip6DestinationSourceCount {
 		netSourceCount += len(sourceCounts)
 	}
-	if self.log.V(2).Enabled() {
+	// loggerOrDefault, not raw self.log: this accessor is now also called
+	// from the scored-placement path (exitMetricsSnapshot), which runs
+	// against bare test fixtures that carry no logger the same way several
+	// of this file's other placement-path helpers already tolerate a nil
+	// self.log would panic on a nil interface's method set.
+	log := loggerOrDefault(self.log)
+	if log.V(2).Enabled() {
 		for ip4Path, sourceCounts := range self.ip4DestinationSourceCount {
 			if isPublicPort(ip4Path.DestinationPort) {
 				if len(sourceCounts) == maxSourceCount {
-					self.log.Infof("[multi]max source count %d = %v\n", maxSourceCount, ip4Path)
+					log.Infof("[multi]max source count %d = %v\n", maxSourceCount, ip4Path)
 				}
 			}
 		}
 		for ip6Path, sourceCounts := range self.ip6DestinationSourceCount {
 			if isPublicPort(ip6Path.DestinationPort) {
 				if len(sourceCounts) == maxSourceCount {
-					self.log.Infof("[multi]max source count %d = %v\n", maxSourceCount, ip6Path)
+					log.Infof("[multi]max source count %d = %v\n", maxSourceCount, ip6Path)
 				}
 			}
 		}
 	}
 
 	stats := &clientWindowStats{
-		log:            self.log,
+		log:            log,
 		sourceCount:    maxSourceCount,
 		netSourceCount: netSourceCount,
 		// distinct destination paths with sends in the window: the maps are
@@ -12798,8 +12974,15 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 
 	err := self.endErr
 	if err == nil {
+		// a bare fixture may carry no context -- same pattern
+		// busyLivenessProbe uses. A nil channel never fires in a select, which
+		// is the right reading of "nothing has cancelled this".
+		var ctxDone <-chan struct{}
+		if self.ctx != nil {
+			ctxDone = self.ctx.Done()
+		}
 		select {
-		case <-self.ctx.Done():
+		case <-ctxDone:
 			err = errors.New("Done.")
 		case <-self.clientDone():
 			err = errors.New("Done.")
