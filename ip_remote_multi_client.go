@@ -556,6 +556,53 @@ type MultiClientSettings struct {
 	// false restores the veto, the A/B comparison point.
 	AffinityStickyPastCap bool
 
+	// ScoredAffinityDonor makes the learner load-bearing on the placement
+	// path that actually carries most flows.
+	//
+	// READ THIS WITH scoredPlacementReorder's header. That function scores
+	// the RACE field, and the race is the LAST of four placement steps in
+	// sendUpdate -- reached only when the flow's own affinity groups, its
+	// app pin, and the destination bridge have all declined to donate. Most
+	// flows never get there. The step that does carry them,
+	// inheritAffinityClient{4,6}WithLock, picked its donor by
+	// `createTime.After(mostRecentCreateTime)`: pure recency, with no
+	// quality signal of any kind. So the learner could observe everything
+	// and steer nothing -- ProviderPriors.Bias had zero production callers
+	// before this knob.
+	//
+	// On, the donor scan ranks eligible donors by Bias (the persisted
+	// per-provider reward EWMA, less a conviction penalty) and falls back to
+	// the recency rule on a tie. This is the FIRST production consumer of
+	// the priors the reward tap has been accumulating.
+	//
+	// Why this is the safe place to put the learner, and raising
+	// MultiRaceClientCount is not:
+	//
+	//   - This tiebreak only decides anything when a group ALREADY spans
+	//     more than one exit, i.e. the group is already scattered. It
+	//     chooses which exit a scattered group reconverges onto. It cannot
+	//     break the one-egress-ip-per-site invariant, because the invariant
+	//     is already broken in every case that reaches the comparison.
+	//   - It removes no starvation guard. MaxFlowsPerExit (16, on by
+	//     default) gates this path through clientAtFlowCapWithLock, so a
+	//     well-scoring exit still stops collecting new sites at the cap.
+	//     The wide race is the starvation guard on the RACE path, which is
+	//     why narrowing that race to make the scorer matter would have
+	//     traded a guard away. This trades nothing.
+	//   - It costs no lock and no I/O at placement time. Bias is a map read
+	//     plus arithmetic under ProviderPriors' own mutex; nothing here
+	//     calls windowStatsWithCoalesce, whose "already called on this path"
+	//     safety argument holds for the race and NOT for affinity.
+	//
+	// One behavior difference beyond ordering, on only: the legacy loop
+	// checked recency BEFORE eligibility, so a donor older than the current
+	// best never had affinityDonorEligible called on it and could not report
+	// donorQuarantineScattered. Ranking requires evaluating every candidate,
+	// so scattered is now observed on quarantined donors the legacy scan
+	// skipped. That makes the G-1 scatter ledger MORE complete, never less;
+	// with the knob off the legacy short-circuit is preserved exactly.
+	ScoredAffinityDonor bool
+
 	// QuarantineGroupFollow lets a QUARANTINED exit keep inheriting new flows
 	// from affinity groups already living on it. A benched site's established
 	// flows are already on the suspect exit -- placing the site's next flow
@@ -2474,6 +2521,7 @@ type ReliabilitySettings struct {
 	BlackholeReceiveTimeout  time.Duration
 	MaxFlowsPerExit          int
 	AffinityStickyPastCap    bool
+	ScoredAffinityDonor      bool
 	// the G-1 group-follow pair; see the MultiClientSettings fields
 	QuarantineGroupFollow      bool
 	GroupFollowWindow          time.Duration
@@ -2557,6 +2605,7 @@ func ReliabilitySettingsFrom(settings *MultiClientSettings) *ReliabilitySettings
 		BlackholeReceiveTimeout:    settings.BlackholeReceiveTimeout,
 		MaxFlowsPerExit:            settings.MaxFlowsPerExit,
 		AffinityStickyPastCap:      settings.AffinityStickyPastCap,
+		ScoredAffinityDonor:        settings.ScoredAffinityDonor,
 		QuarantineGroupFollow:      settings.QuarantineGroupFollow,
 		GroupFollowWindow:          settings.GroupFollowWindow,
 		DialFailureRerace:          settings.DialFailureRerace,
@@ -3353,8 +3402,66 @@ func (self *RemoteUserNatMultiClient) clientAtFlowCapWithLock(client *multiClien
 	return maxFlows <= len(self.clientUpdates[client])
 }
 
-// inheritAffinityClient4WithLock adopts the most recently joined healthy client
-// in an affinity group. Only ever called with `update.client` nil -- it must
+// affinityDonorBias is the learner's read at the affinity placement point:
+// this exit's provider identity, looked up in the priors the reward tap has
+// been accumulating (and that PriorsStore persists across restarts).
+//
+// Answers priorsNeutralBias whenever there is nothing learned to say -- no
+// priors created yet, or a channel with no resolvable provider identity -- so
+// an unrankable donor neither wins nor loses against a known-neutral one.
+// Deliberately NOT the zero-rtt trap's shape: 0.5 is the middle of Bias's
+// range, not an extreme, so "unknown" cannot outrank a good measured provider
+// the way a bare 0 rtt outranks a real measurement in exitScore.
+//
+// Locking: called with stateLock held. rewardLock is a leaf (see its field
+// comment) and is taken here only to read the lazily-created providerPriors
+// POINTER. Bias synchronizes on ProviderPriors' OWN mutex and is called with
+// rewardLock already released, so this adds one uncontended leaf acquisition
+// to the placement path and never nests two hot locks. Nothing here calls
+// windowStatsWithCoalesce: that accessor is safe on the race path only
+// because orderedClients has already called its coalescing twin at the same
+// frequency, and affinity placement never calls orderedClients at all.
+//
+// called with stateLock
+func (self *RemoteUserNatMultiClient) affinityDonorBias(client *multiClientChannel) float64 {
+	providerId, ok := providerIdentity(client)
+	if !ok {
+		return priorsNeutralBias
+	}
+	self.rewardLock.Lock()
+	priors := self.providerPriors
+	self.rewardLock.Unlock()
+	if priors == nil {
+		return priorsNeutralBias
+	}
+	return priors.Bias(providerId.String())
+}
+
+// betterAffinityDonor ranks two eligible donors under ScoredAffinityDonor:
+// higher bias wins, then the legacy recency rule, then provider id ascending
+// so an otherwise exact tie resolves identically on every pass instead of
+// following Go's randomized map iteration order. Donors equal on all three are
+// interchangeable and the scan keeps whichever it saw first.
+func betterAffinityDonor(
+	bias float64,
+	createTime time.Time,
+	providerId string,
+	bestBias float64,
+	bestCreateTime time.Time,
+	bestProviderId string,
+) bool {
+	if bias != bestBias {
+		return bias > bestBias
+	}
+	if !createTime.Equal(bestCreateTime) {
+		return createTime.After(bestCreateTime)
+	}
+	return providerId < bestProviderId
+}
+
+// inheritAffinityClient4WithLock adopts a healthy client in an affinity group:
+// the most recently joined one, or -- under ScoredAffinityDonor -- the one the
+// learner rates highest, falling back to recency on a tie. Only ever called with `update.client` nil -- it must
 // never repoint a flow that already has a client, since providers terminate tcp
 // and a moved flow is a broken flow.
 //
@@ -3384,22 +3491,51 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *mul
 		follow = true
 		window = pinnedFollowWindow(window)
 	}
+	scored := reliabilitySettings.ScoredAffinityDonor
 	var mostRecentCreateTime time.Time
+	var bestBias float64
+	var bestProviderId string
 	winnerVerdict, scattered := donorRefused, false
 	for copyIp4Path, createTime := range paths {
-		if copyUpdate, ok := self.ip4PathUpdates[copyIp4Path]; ok {
-			if c := copyUpdate.client.Load(); c != nil && !c.IsDone() && (sticky || !self.clientAtFlowCapWithLock(c)) && createTime.After(mostRecentCreateTime) {
-				switch verdict := c.affinityDonorEligible(follow, window); verdict {
-				case donorEligible, donorQuarantineFollowed:
-					// donorQuarantineFollowed is the G-1 follow: a benched
-					// donor inside the follow window keeps its own site
-					mostRecentCreateTime = createTime
-					update.client.Store(c)
-					winnerVerdict = verdict
-				case donorQuarantineScattered:
-					scattered = true
+		copyUpdate, ok := self.ip4PathUpdates[copyIp4Path]
+		if !ok {
+			continue
+		}
+		c := copyUpdate.client.Load()
+		if c == nil || c.IsDone() || (!sticky && self.clientAtFlowCapWithLock(c)) {
+			continue
+		}
+		// off: the legacy short-circuit, preserved exactly -- a donor no more
+		// recent than the current best is never even asked for its verdict.
+		// On, every candidate must be evaluated to be ranked, which is the one
+		// documented behavior difference (see ScoredAffinityDonor): quarantined
+		// donors the legacy scan skipped now report their scatter.
+		if !scored && !createTime.After(mostRecentCreateTime) {
+			continue
+		}
+		switch verdict := c.affinityDonorEligible(follow, window); verdict {
+		case donorEligible, donorQuarantineFollowed:
+			// donorQuarantineFollowed is the G-1 follow: a benched
+			// donor inside the follow window keeps its own site
+			bias, providerId := 0.0, ""
+			if scored {
+				bias = self.affinityDonorBias(c)
+				if id, idOk := providerIdentity(c); idOk {
+					providerId = id.String()
+				}
+				if winnerVerdict != donorRefused && !betterAffinityDonor(
+					bias, createTime, providerId,
+					bestBias, mostRecentCreateTime, bestProviderId,
+				) {
+					continue
 				}
 			}
+			bestBias, bestProviderId = bias, providerId
+			mostRecentCreateTime = createTime
+			update.client.Store(c)
+			winnerVerdict = verdict
+		case donorQuarantineScattered:
+			scattered = true
 		}
 	}
 	return winnerVerdict, scattered
@@ -3419,20 +3555,44 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient6WithLock(update *mul
 		follow = true
 		window = pinnedFollowWindow(window)
 	}
+	scored := reliabilitySettings.ScoredAffinityDonor
 	var mostRecentCreateTime time.Time
+	var bestBias float64
+	var bestProviderId string
 	winnerVerdict, scattered := donorRefused, false
 	for copyIp6Path, createTime := range paths {
-		if copyUpdate, ok := self.ip6PathUpdates[copyIp6Path]; ok {
-			if c := copyUpdate.client.Load(); c != nil && !c.IsDone() && (sticky || !self.clientAtFlowCapWithLock(c)) && createTime.After(mostRecentCreateTime) {
-				switch verdict := c.affinityDonorEligible(follow, window); verdict {
-				case donorEligible, donorQuarantineFollowed:
-					mostRecentCreateTime = createTime
-					update.client.Store(c)
-					winnerVerdict = verdict
-				case donorQuarantineScattered:
-					scattered = true
+		copyUpdate, ok := self.ip6PathUpdates[copyIp6Path]
+		if !ok {
+			continue
+		}
+		c := copyUpdate.client.Load()
+		if c == nil || c.IsDone() || (!sticky && self.clientAtFlowCapWithLock(c)) {
+			continue
+		}
+		if !scored && !createTime.After(mostRecentCreateTime) {
+			continue
+		}
+		switch verdict := c.affinityDonorEligible(follow, window); verdict {
+		case donorEligible, donorQuarantineFollowed:
+			bias, providerId := 0.0, ""
+			if scored {
+				bias = self.affinityDonorBias(c)
+				if id, idOk := providerIdentity(c); idOk {
+					providerId = id.String()
+				}
+				if winnerVerdict != donorRefused && !betterAffinityDonor(
+					bias, createTime, providerId,
+					bestBias, mostRecentCreateTime, bestProviderId,
+				) {
+					continue
 				}
 			}
+			bestBias, bestProviderId = bias, providerId
+			mostRecentCreateTime = createTime
+			update.client.Store(c)
+			winnerVerdict = verdict
+		case donorQuarantineScattered:
+			scattered = true
 		}
 	}
 	return winnerVerdict, scattered
