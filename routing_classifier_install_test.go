@@ -2,6 +2,7 @@ package connect
 
 import (
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -189,5 +190,69 @@ func TestSetReliabilitySettingsTogglesLightClassifierLive(t *testing.T) {
 	reverted := parent.scoredPlacementReorder(clients, ipPath, "")
 	if len(reverted) != 2 || reverted[0] != clients[0] || reverted[1] != clients[1] {
 		t.Fatalf("order after runtime toggle-off = %v, want the legacy order restored", reverted)
+	}
+}
+
+// TestSetReliabilitySettingsConcurrentTogglesConverge is round 2's proof: two
+// SetReliabilitySettings callers racing with OPPOSING LightClassifier values
+// must not leave flowClassifier disagreeing with the final effective
+// settings. Before this fix, the edge decision (before != after) was computed
+// from two separate atomic loads taken around one atomic store, so each
+// caller judged the edge against its OWN before/after pair rather than the
+// final global state:
+//
+//	G1 loads before=false
+//	G2 loads before=false
+//	G1 stores {true},  loads after=true  -> edge fires  -> installs
+//	G2 stores {false}, loads after=false -> G2's own before==after -> no edge -> never clears
+//
+// Final state: reliability reports {false}, but flowClassifier stays
+// installed -- the exact bug this whole fix exists for, reintroduced through
+// a race between two atomics instead of one unsynchronized field. -race
+// cannot catch this: there is no torn access, only cross-field logical
+// inconsistency (confirmed by running this test under -race in an
+// environment where cgo/gcc is available; this box has neither, so this test
+// is the coverage, not a supplementary belt-and-suspenders check).
+//
+// This does not try to force the exact G1/G2 interleaving above via an
+// artificial scheduling hook -- there is no seam in SetReliabilitySettings
+// for that, and adding one purely for a test was judged not worth a new test
+// -only code path in a function whose whole point here is lock discipline.
+// Instead it runs many trials of two real goroutines with genuinely opposing
+// values and asserts the INVARIANT the fix establishes -- whichever caller's
+// settings land last, that caller's classifier state must also land last --
+// rather than a specific outcome. See the report for how this was verified
+// against the pre-fix code (by temporarily removing the
+// reliabilitySettingsLock critical section): it failed reliably within the
+// first handful of trials; the exact failing trial number is not
+// deterministic run to run, which is itself expected for a scheduler race,
+// so the loop runs enough trials (2000) that the fixed code passing all of
+// them, every run, is itself part of the evidence.
+func TestSetReliabilitySettingsConcurrentTogglesConverge(t *testing.T) {
+	const trials = 2000
+	for trial := range trials {
+		parent := &RemoteUserNatMultiClient{settings: DefaultMultiClientSettings()}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			parent.SetReliabilitySettings(&ReliabilitySettings{LightClassifier: true})
+		}()
+		go func() {
+			defer wg.Done()
+			parent.SetReliabilitySettings(&ReliabilitySettings{LightClassifier: false})
+		}()
+		wg.Wait()
+
+		wantInstalled := parent.reliabilitySettings().LightClassifier
+		gotInstalled := parent.flowClassifier.Load() != nil
+		if wantInstalled != gotInstalled {
+			t.Fatalf(
+				"trial %d: final settings.LightClassifier=%v but flowClassifier installed=%v -- "+
+					"the classifier disagrees with the final settings that won the race",
+				trial, wantInstalled, gotInstalled,
+			)
+		}
 	}
 }

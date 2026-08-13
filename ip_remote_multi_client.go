@@ -1203,6 +1203,21 @@ type RemoteUserNatMultiClient struct {
 	// the values in settings", which is what every non-overridden client does.
 	// Read on the packet hot path, so an atomic rather than a lock.
 	reliability atomic.Pointer[ReliabilitySettings]
+	// reliabilitySettingsLock serializes SetReliabilitySettings callers against
+	// each other -- NOT against readers, and NEVER taken on the placement path
+	// (reliabilitySettings() stays a bare atomic load, exactly as before). It
+	// exists solely because LightClassifier's edge-trigger reads `before`,
+	// stores, and reads `after` as three separate steps around the single
+	// atomic `reliability` swap: two concurrent SetReliabilitySettings callers
+	// can otherwise each compute their edge decision from their OWN
+	// before/after pair, so the caller whose store lands SECOND in
+	// `reliability` is not guaranteed to be the caller whose flowClassifier
+	// install/clear runs last -- the settings and the classifier can disagree
+	// about which caller "won". A leaf lock: only ever held across a settings
+	// store, a classifier install/clear (SetFlowClassifier, itself lock-free),
+	// and a handful of log lines, all inside SetReliabilitySettings; a
+	// developer-menu action is rare enough that serializing it costs nothing.
+	reliabilitySettingsLock sync.Mutex
 
 	localUserNat      *LocalUserNat
 	localUserNatUnsub func()
@@ -1409,7 +1424,18 @@ func (self *RemoteUserNatMultiClient) SetFlowClassifier(c FlowClassifier) {
 		"flow_classifier",
 		"installed", c != nil,
 	))
+	self.setFlowClassifierUnlogged(c)
+}
 
+// setFlowClassifierUnlogged performs the raw flowClassifier swap without
+// SetFlowClassifier's own log line. It exists for SetReliabilitySettings,
+// which must perform this swap INSIDE reliabilitySettingsLock (see that
+// function) so the classifier install/clear lands atomically-as-a-unit with
+// the settings store, but must NOT hold that lock across a logging call --
+// logging is I/O-adjacent and this lock's whole contract is that nothing
+// blocking runs under it. SetReliabilitySettings logs the same
+// "flow_classifier" event itself, after releasing the lock.
+func (self *RemoteUserNatMultiClient) setFlowClassifierUnlogged(c FlowClassifier) {
 	if c == nil {
 		self.flowClassifier.Store(nil)
 	} else {
@@ -1461,13 +1487,14 @@ func (self *RemoteUserNatMultiClient) serverNameResolver(ip netip.Addr) (string,
 // -- windows, goroutines, a live generator -- that the constructor also
 // stands up.
 //
-// Construction-time only: an override that flips LightClassifier on later
-// via SetReliabilitySettings does not retroactively install a classifier
-// (unlike ScoredPlacement, which is read fresh from reliabilitySettings() on
-// every placement decision). Installing one is a one-way, one-time seam --
-// see SetFlowClassifier -- and the runtime override surface exists for the
-// knobs that can be safely toggled per-decision, not for wiring a new
-// object into a running session.
+// This is only the CONSTRUCTION-time install: it runs once, from
+// NewRemoteUserNatMultiClient, for a session that starts with the knob
+// already on. A later runtime toggle -- SetReliabilitySettings flipping
+// LightClassifier at 0->1 or 1->0 on a live session -- does NOT come back
+// through here; SetReliabilitySettings installs or clears the classifier
+// itself (via setFlowClassifierUnlogged, under reliabilitySettingsLock) so
+// the toggle is real rather than merely changing what the banner reports.
+// See SetReliabilitySettings for that path and why it needs its own lock.
 func (self *RemoteUserNatMultiClient) maybeInstallLightClassifier() {
 	if self.settings == nil || !self.settings.LightClassifier {
 		return
@@ -2269,9 +2296,11 @@ type ReliabilitySettings struct {
 	PlacementDemoteConsecutive int
 	RewardInstrumentation      bool
 	// LightClassifier; see the matching MultiClientSettings field for what it
-	// does. Runtime overrides do not reinstall the classifier -- it is wired
-	// once at session construction (see maybeInstallLightClassifier) -- so
-	// this field's only effect via an override is what the banner reports.
+	// does. Unlike the rest of this block, a runtime override DOES take
+	// effect immediately: SetReliabilitySettings installs or clears the
+	// classifier itself on a 0->1 / 1->0 edge, so toggling this through a
+	// developer menu changes placement on the next flow, not just the
+	// banner's report. See SetReliabilitySettings.
 	LightClassifier bool
 
 	// the quarantine flap-damping pair; see the matching MultiClientSettings
@@ -2383,35 +2412,56 @@ func scoredPlacementEnabled(r *ReliabilitySettings) bool {
 // "field=lightclassifier from=0 to=1" and the banner would agree, while
 // flowClassifier stayed nil and placement never changed -- a confirming log
 // line for a mechanism that never engaged. So an edge (before != after) on
-// this one field additionally installs or clears the classifier through
-// SetFlowClassifier, which is what makes the toggle real rather than
-// decorative. The initial install at construction (maybeInstallLightClassifier,
-// called once from NewRemoteUserNatMultiClient) is unaffected by this and
-// stays as the first install for a session that starts with the knob already
-// on.
+// this one field additionally installs or clears the classifier, which is
+// what makes the toggle real rather than decorative. The initial install at
+// construction (maybeInstallLightClassifier, called once from
+// NewRemoteUserNatMultiClient) is unaffected by this and stays as the first
+// install for a session that starts with the knob already on.
 //
-// Lock discipline: nothing is held. The store is a single atomic swap, the
-// classifier install/clear below is a second atomic swap
-// (flowClassifier.Store, inside SetFlowClassifier), and the rendering runs
-// after both. Two concurrent callers can race the same before/after read the
-// diff-logging above already accepted as racy; the worst case is the same
-// last-store-wins outcome relSettingsDiffLines already has, and flowClassifier
-// itself is never torn -- each Store leaves it fully nil or fully a valid
-// classifier, matching whichever settings value happened to land last.
+// Lock discipline: reliabilitySettingsLock, a dedicated leaf mutex, is held
+// ONLY across the before/store/after/classifier-swap sequence below -- two
+// atomic operations and nothing else, never a log call, never another lock,
+// never anything that can block. It is NEVER taken on the placement path
+// (nothing else in this file takes it; reliabilitySettings() itself stays a
+// bare atomic load, so ordinary reads of the effective settings are
+// unaffected). It exists because the edge decision spans two separate atomic
+// operations (the `reliability` swap and the `flowClassifier` swap) that must
+// land as one unit: without it, two concurrent callers can each compute
+// before/after from their own interleaved snapshot, so the caller whose
+// settings store lands last in `reliability` is not guaranteed to be the
+// caller whose classifier install/clear runs last either -- the settings and
+// the classifier can end up disagreeing about which caller "won" (see
+// TestSetReliabilitySettingsConcurrentTogglesConverge). Serializing this
+// rare, developer-menu-triggered call against itself costs nothing.
+//
+// The classifier's own "flow_classifier" log line is deliberately emitted
+// AFTER the lock is released (via setFlowClassifierUnlogged inside the lock,
+// then a manual log line below), rather than by calling SetFlowClassifier
+// directly from the locked section -- SetFlowClassifier logs before it
+// stores, and this function's lock must never wrap a logging call.
 func (self *RemoteUserNatMultiClient) SetReliabilitySettings(reliabilitySettings *ReliabilitySettings) {
+	self.reliabilitySettingsLock.Lock()
 	before := self.reliabilitySettings()
 	self.reliability.Store(reliabilitySettings)
 	after := self.reliabilitySettings()
 
-	if before.LightClassifier != after.LightClassifier {
+	classifierChanged := before.LightClassifier != after.LightClassifier
+	if classifierChanged {
 		if after.LightClassifier {
-			self.SetFlowClassifier(NewLightClassifier(self.serverNameResolver))
+			self.setFlowClassifierUnlogged(NewLightClassifier(self.serverNameResolver))
 		} else {
-			self.SetFlowClassifier(nil)
+			self.setFlowClassifierUnlogged(nil)
 		}
 	}
+	self.reliabilitySettingsLock.Unlock()
 
 	log := loggerOrDefault(self.log)
+	if classifierChanged {
+		log.Infof("%s\n", relEvent(
+			"flow_classifier",
+			"installed", after.LightClassifier,
+		))
+	}
 	for _, line := range relSettingsDiffLines(before, after) {
 		log.Infof("%s\n", line)
 	}
