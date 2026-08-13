@@ -1565,7 +1565,9 @@ func providerIdentity(client *multiClientChannel) (Id, bool) {
 // actually finished (sendUpdate's per-flow idle-timeout teardown goroutine,
 // both ip versions -- see the flow-close path there), with no lock held. It
 // stays as cheap as a placement decision -- a classify lookup, a metrics
-// snapshot already proven side-effect-free by exitMetricsSnapshot's own
+// snapshot taken through the non-coalescing accessor (see exitMetricsSnapshot;
+// it is NOT side-effect-free, only a weaker duplicate of a call already made
+// on this path) via its own
 // contract, and a map insert under a leaf lock -- never I/O, never a
 // blocking call, matching the same discipline scoredPlacementReorder's
 // demotionObserve call already established.
@@ -3046,6 +3048,19 @@ var demotionLogThrottle = newLogThrottle(classifyLogInterval)
 // promoting the scorer's pick to the front. The learner never overrides the
 // safety layer: membership is untouched, only order.
 //
+// READ THIS BEFORE ASSUMING THIS FUNCTION STEERS TRAFFIC. It does not, in the
+// shipped configuration. MultiRaceClientCount is 0 (see its default), so
+// raceOrderedClients is the WHOLE candidate list: every exit is dialed in
+// parallel and completeRace binds whichever responds with the lowest
+// MEASURED rtt, ignoring list order entirely. Most flows never race at all
+// (destination affinity short-circuits first). So promoting an exit to index
+// 0 changes goroutine launch order and the degenerate no-response lock-in,
+// and nothing else. The scorer becomes load-bearing only if
+// MultiRaceClientCount is raised above 0 -- and note that the wide race is
+// also currently the only thing preventing rich-get-richer starvation,
+// because a measured exit outscores an unmeasured one badly enough to defeat
+// lessLoadedTieBreak. Raising it is a design change, not a knob flip.
+//
 // classifyOrUnknown is nil-safe, so an unset flowClassifier (every build by
 // default -- LightClassifier, Task 2's install knob, is zero-value-off)
 // always classifies ClassUnknown, which returns candidates completely
@@ -3191,13 +3206,19 @@ func (self *RemoteUserNatMultiClient) scoredPlacementReorder(candidates []*multi
 }
 
 // exitMetricsSnapshot builds the scorer's read of one candidate, entirely
-// from side-effect-free accessors -- no lock held across a call, no I/O, no
+// from non-coalescing accessors -- no lock held across a call, no I/O, no
 // blocking, safe at new-flow frequency:
 //
 //   - Flows is the caller's own flow-count read (leastLoadedClients' same
 //     bookkeeping), passed in rather than re-read here.
 //   - GoodputBytesPerSec comes from windowStatsWithCoalesce(false), the
-//     side-effect-free twin of WindowStats() -- WindowStats() itself must
+//     NON-coalescing twin of WindowStats(). It is NOT side-effect-free: it
+//     still writes maxEffectiveByteCountPerSecond, healthy, lastHealthy/
+//     UnhealthyTime and the healthy/unhealthy durations. It is safe here only
+//     because orderedClients() already calls the COALESCING WindowStats() on
+//     every client on this same path at this same frequency, so this is a
+//     strictly weaker duplicate rather than new perturbation. WindowStats()
+//     itself must
 //     NEVER be called from this path: it coalesces event buckets and
 //     perturbs the resize pass's ~15s cadence bookkeeping.
 //   - StallEvents is quarantineReconvictionCount(): this channel's completed
@@ -6683,7 +6704,7 @@ func (self *RemoteUserNatMultiClient) Exits() []*ExitInfo {
 }
 
 // exitTelemetrySnapshot gathers this session's live per-exit ExitMetrics for
-// the heartbeat line, using exactly the same side-effect-free accessors
+// the heartbeat line, using exactly the same non-coalescing accessors
 // exitMetricsSnapshot uses for scoring (windowStatsWithCoalesce(false),
 // quarantineReconvictionCount, rttEwmaSnapshot) -- so what the heartbeat
 // reports is what the scorer actually saw, not a second, drifting readout.
