@@ -2372,12 +2372,44 @@ func scoredPlacementEnabled(r *ReliabilitySettings) bool {
 // configurations (before and after the store), so clearing an override logs the
 // restoration rather than a misleading "everything went to zero".
 //
-// Lock discipline: nothing is held. The store is a single atomic swap, and the
-// rendering runs after it.
+// LightClassifier is the one knob among these that this function must do more
+// than report on. Every other field here is read fresh from
+// reliabilitySettings() at the point it is consulted (e.g.
+// scoredPlacementEnabled, benchDuration), so swapping the override is the
+// whole story for them. LightClassifier instead gates whether an *object* --
+// the classifier -- sits behind the separate SetFlowClassifier/flowClassifier
+// seam, and nothing about storing a new ReliabilitySettings touches that seam
+// on its own. Left alone, a runtime toggle would log
+// "field=lightclassifier from=0 to=1" and the banner would agree, while
+// flowClassifier stayed nil and placement never changed -- a confirming log
+// line for a mechanism that never engaged. So an edge (before != after) on
+// this one field additionally installs or clears the classifier through
+// SetFlowClassifier, which is what makes the toggle real rather than
+// decorative. The initial install at construction (maybeInstallLightClassifier,
+// called once from NewRemoteUserNatMultiClient) is unaffected by this and
+// stays as the first install for a session that starts with the knob already
+// on.
+//
+// Lock discipline: nothing is held. The store is a single atomic swap, the
+// classifier install/clear below is a second atomic swap
+// (flowClassifier.Store, inside SetFlowClassifier), and the rendering runs
+// after both. Two concurrent callers can race the same before/after read the
+// diff-logging above already accepted as racy; the worst case is the same
+// last-store-wins outcome relSettingsDiffLines already has, and flowClassifier
+// itself is never torn -- each Store leaves it fully nil or fully a valid
+// classifier, matching whichever settings value happened to land last.
 func (self *RemoteUserNatMultiClient) SetReliabilitySettings(reliabilitySettings *ReliabilitySettings) {
 	before := self.reliabilitySettings()
 	self.reliability.Store(reliabilitySettings)
 	after := self.reliabilitySettings()
+
+	if before.LightClassifier != after.LightClassifier {
+		if after.LightClassifier {
+			self.SetFlowClassifier(NewLightClassifier(self.serverNameResolver))
+		} else {
+			self.SetFlowClassifier(nil)
+		}
+	}
 
 	log := loggerOrDefault(self.log)
 	for _, line := range relSettingsDiffLines(before, after) {

@@ -130,3 +130,64 @@ func TestLightClassifierInstalledChangesPlacementOrder(t *testing.T) {
 		t.Fatal("LightClassifier=true did not change which candidate is promoted to front: classification is not reaching placement")
 	}
 }
+
+// TestSetReliabilitySettingsTogglesLightClassifierLive is the fix-round
+// proof: SetReliabilitySettings is the developer-menu A/B seam, used to flip
+// a knob on a LIVE session with no reconnect. Every other Phase 1/2 knob
+// (ScoredPlacement, hysteresis, dampening, ...) is read fresh from
+// reliabilitySettings() on each placement decision, so a runtime override
+// "just works" for them with no extra wiring. LightClassifier is different:
+// it gates whether an *object* -- the classifier -- is installed behind the
+// SetFlowClassifier seam, and reflection-based settings plumbing
+// (relSettingsDiffLines, the banner) cannot install an object; it can only
+// report that a bool changed. Before this fix, SetReliabilitySettings would
+// happily log `field=lightclassifier from=0 to=1` and the banner would
+// report `lightclassifier=1` while flowClassifier stayed nil and placement
+// never changed -- a confirming log line for something that did not happen.
+//
+// This asserts the thing that actually matters -- placement order changes --
+// not just that flowClassifier becomes non-nil, so a fix that installs a
+// classifier which is somehow never consulted would still be caught.
+func TestSetReliabilitySettingsTogglesLightClassifierLive(t *testing.T) {
+	ipPath := testLightIpPath(IpProtocolTcp, "93.184.216.1", 443)
+
+	parent, clients := flowCapTestParent(t, 0, 50, 1)
+	parent.config.Store(&multiClientConfig{
+		serverNameLookup: stubServerNameLookup{names: []string{"netflix.com"}},
+	})
+
+	// before any toggle: constructed with LightClassifier off (flowCapTestParent
+	// uses DefaultMultiClientSettings, which is zero-value-off), so no
+	// classifier and the legacy order stands.
+	if parent.flowClassifier.Load() != nil {
+		t.Fatal("no classifier should be installed before any runtime toggle")
+	}
+	legacy := parent.scoredPlacementReorder(clients, ipPath, "")
+	if len(legacy) != 2 || legacy[0] != clients[0] || legacy[1] != clients[1] {
+		t.Fatalf("legacy order = %v, want [clients[0], clients[1]] unchanged", legacy)
+	}
+
+	// flip LightClassifier on at RUNTIME -- exactly what a developer menu A/B
+	// does mid-session, no reconnect. This must install a classifier, not
+	// just change what the banner/diff log report.
+	parent.SetReliabilitySettings(&ReliabilitySettings{LightClassifier: true})
+	if parent.flowClassifier.Load() == nil {
+		t.Fatal("runtime toggle on must install a classifier, not merely change the reported setting")
+	}
+	scored := parent.scoredPlacementReorder(clients, ipPath, "")
+	if len(scored) != 2 || scored[0] != clients[1] || scored[1] != clients[0] {
+		t.Fatalf("scored order after runtime toggle-on = %v, want the less-loaded exit (clients[1]) promoted to front -- the toggle changed the report but not the placement", scored)
+	}
+
+	// flip back off at runtime: the classifier must be CLEARED (SetFlowClassifier(nil)),
+	// not merely left installed with the setting now reading false, and
+	// placement must revert to the legacy order.
+	parent.SetReliabilitySettings(&ReliabilitySettings{LightClassifier: false})
+	if parent.flowClassifier.Load() != nil {
+		t.Fatal("runtime toggle off must clear the classifier")
+	}
+	reverted := parent.scoredPlacementReorder(clients, ipPath, "")
+	if len(reverted) != 2 || reverted[0] != clients[0] || reverted[1] != clients[1] {
+		t.Fatalf("order after runtime toggle-off = %v, want the legacy order restored", reverted)
+	}
+}
