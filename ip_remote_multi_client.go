@@ -4162,23 +4162,31 @@ func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 			self.log.Errorf("[multi]removed client that is not marked as done. This might lead to memory leak.")
 		}
 
-		updates, ok := self.clientUpdates[client]
-		if !ok {
-			return
-		}
-		delete(self.clientUpdates, client)
-
 		// evict this exit's demotion streaks (every class) now that its
 		// channel is gone -- see demotionKey's doc for why this, and not a
 		// size-bound LRU like qualification's, is the right lifecycle for
 		// this particular map: an unbounded map keyed by exit identity would
 		// otherwise leak across a long session's churn.
+		//
+		// THIS MUST STAY ABOVE the clientUpdates lookup below. That lookup
+		// returns early when the exit never had a flow bound to it, and
+		// demotionObserve creates an entry for whichever exit is at the head
+		// of the candidate list whether or not it ever wins a race -- so an
+		// exit that is repeatedly ranked first and never chosen is exactly
+		// the case that leaks. Evicting after the early return covered only
+		// the exits that could never leak.
 		clientId := client.ClientId()
 		for key := range self.demotionStates {
 			if key.clientId == clientId {
 				delete(self.demotionStates, key)
 			}
 		}
+
+		updates, ok := self.clientUpdates[client]
+		if !ok {
+			return
+		}
+		delete(self.clientUpdates, client)
 
 		// partition the dying exit's flows: established quic moves, the rest
 		// gets the teardown signal

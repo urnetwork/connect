@@ -236,3 +236,47 @@ func TestDemotionEvictedOnRemoveClient(t *testing.T) {
 		t.Fatal("post-eviction observation must not inherit the pre-removal streak")
 	}
 }
+
+// TestDemotionEvictedOnRemoveClientThatNeverCarriedAFlow is the case the
+// sibling test above deliberately steps around. That one seeds an empty
+// clientUpdates entry so removeClient's locked body runs at all -- which
+// quietly accepts that an exit with NO clientUpdates entry returns early and
+// evicts nothing.
+//
+// That exit is exactly the one that leaks. demotionObserve creates an entry
+// for whichever exit is at the HEAD of the candidate list, win or lose, and
+// with MultiRaceClientCount at 0 the head of the list is usually not the exit
+// that ends up carrying the flow. So "ranked first, never chosen, then gone"
+// is the common case, not a corner: no clientUpdates entry ever existed, and
+// before the eviction was hoisted above that early return its demotionStates
+// entries survived for the life of the session.
+//
+// No clientUpdates entry is seeded here on purpose. Do not add one.
+func TestDemotionEvictedOnRemoveClientThatNeverCarriedAFlow(t *testing.T) {
+	parent, dying, _, _ := rebindTestParent(t, false, nil)
+	id := NewId()
+	setClientId(dying, id)
+
+	if _, seeded := parent.clientUpdates[dying]; seeded {
+		t.Fatal("fixture must start with no clientUpdates entry for this test to mean anything")
+	}
+
+	if parent.demotionObserve(id, ClassBulk, false, 3) {
+		t.Fatal("must not demote on the 1st bad observation")
+	}
+	if parent.demotionObserve(id, ClassBulk, false, 3) {
+		t.Fatal("must not demote on the 2nd bad observation")
+	}
+	if len(parent.demotionStates) == 0 {
+		t.Fatal("precondition: the observations must have created state to evict")
+	}
+
+	parent.removeClient(dying)
+
+	if n := len(parent.demotionStates); n != 0 {
+		t.Fatalf("demotionStates = %d entries after removeClient, want 0 -- an exit that never carried a flow still leaks", n)
+	}
+	if parent.demotionObserve(id, ClassBulk, false, 3) {
+		t.Fatal("post-eviction observation must not inherit the pre-removal streak")
+	}
+}
