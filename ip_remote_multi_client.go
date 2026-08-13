@@ -998,6 +998,25 @@ type MultiClientSettings struct {
 	// since the previous one, so an idle session costs nothing.
 	HeartbeatInterval time.Duration
 
+	// Smart routing (Phase 1), all zero-value-off so an override from an older
+	// struct keeps today's placement. ScoredPlacement is the master gate;
+	// PlacementHysteresisPct==0 is plain greater-than; PlacementDemoteConsecutive<=1
+	// acts on every sample; RewardInstrumentation==false emits no reward lines.
+	ScoredPlacement            bool
+	PlacementHysteresisPct     float64
+	PlacementDemoteConsecutive int
+	RewardInstrumentation      bool
+
+	// Quarantine flap damping (Phase 1), zero-value-off like the rest of this
+	// block. QuarantineDampening false leaves benchDuration returning the
+	// constant StatsWindowKeepUnhealthyDuration it always has -- today's
+	// behavior. QuarantineReentryRamp==0 disables the released-exit score
+	// ramp entirely, so a lifted quarantine returns to full scored-placement
+	// standing immediately, exactly as before this task. See benchDuration
+	// and reentryScorePenalty.
+	QuarantineDampening   bool
+	QuarantineReentryRamp time.Duration
+
 	SecurityPolicyGenerator func(context.Context, *SecurityPolicyStatsCollector) SecurityPolicy
 
 	// the epoch for flushing block action and packet stats events to listeners
@@ -1194,6 +1213,15 @@ type RemoteUserNatMultiClient struct {
 	flowOwnerLock       sync.Mutex
 	flowOwner4          map[Ip4Path]flowOwnerEntry
 	flowOwner6          map[Ip6Path]flowOwnerEntry
+	// the smart-routing classifier seam (Phase 1): the platform's traffic
+	// classifier, installed by SetFlowClassifier. Mirrors flowOwnerFunc
+	// exactly -- atomic pointer, nil clears, one-branch nil cost paid via
+	// classifyOrUnknown (routing_class.go). Zero value is fully inert: no
+	// constructor wiring is required and bare fixtures are unaffected.
+	// Consulted ONLY from the guarded scored-placement path (see
+	// scoredPlacementEnabled); with that gate off, or with no classifier
+	// installed, nothing in this file's new routing code runs.
+	flowClassifier atomic.Pointer[FlowClassifier]
 	// appPinClients is the cross-version half of an app pin: the exit an
 	// app's flows are currently placed on, keyed by app id. The affinity
 	// groups are per-ip-version by construction (separate path maps), so a
@@ -1356,6 +1384,26 @@ func (self *RemoteUserNatMultiClient) SetFlowOwnerLookup(lookup FlowOwnerLookupF
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	self.clearAppPinsWithLock()
+}
+
+// SetFlowClassifier installs (or, with nil, removes) the smart-routing
+// traffic classifier. Mirrors SetFlowOwnerLookup: a bare atomic store, safe
+// at runtime and on a bare client. Installing a classifier does not, by
+// itself, change placement -- scoredPlacementEnabled must also be true (see
+// the guarded branch in sendPacket's placement helper), so this is inert
+// until both are true, matching every other nil-func convention in this
+// file.
+func (self *RemoteUserNatMultiClient) SetFlowClassifier(c FlowClassifier) {
+	loggerOrDefault(self.log).Infof("%s\n", relEvent(
+		"flow_classifier",
+		"installed", c != nil,
+	))
+
+	if c == nil {
+		self.flowClassifier.Store(nil)
+	} else {
+		self.flowClassifier.Store(&c)
+	}
 }
 
 // flowOwnerAppId answers "which pinned app owns this flow" -- from the cache
@@ -2137,6 +2185,20 @@ type ReliabilitySettings struct {
 	// capture is sometimes taken with the beat turned up to spot a transition,
 	// and sometimes with it off to keep an hour of buffer for something else.
 	HeartbeatInterval time.Duration
+
+	// Smart routing (Phase 1), all zero-value-off so an override from an older
+	// struct keeps today's placement. ScoredPlacement is the master gate;
+	// PlacementHysteresisPct==0 is plain greater-than; PlacementDemoteConsecutive<=1
+	// acts on every sample; RewardInstrumentation==false emits no reward lines.
+	ScoredPlacement            bool
+	PlacementHysteresisPct     float64
+	PlacementDemoteConsecutive int
+	RewardInstrumentation      bool
+
+	// the quarantine flap-damping pair; see the matching MultiClientSettings
+	// fields for what each one does
+	QuarantineDampening   bool
+	QuarantineReentryRamp time.Duration
 }
 
 // ReliabilitySettingsFrom reads the effective values out of a settings struct.
@@ -2187,6 +2249,14 @@ func ReliabilitySettingsFrom(settings *MultiClientSettings) *ReliabilitySettings
 		SchedulerPauseRecoveryTimeout:      settings.SchedulerPauseRecoveryTimeout,
 		BlackholeConnectComparativeTimeout: settings.BlackholeConnectComparativeTimeout,
 		HeartbeatInterval:                  settings.HeartbeatInterval,
+
+		ScoredPlacement:            settings.ScoredPlacement,
+		PlacementHysteresisPct:     settings.PlacementHysteresisPct,
+		PlacementDemoteConsecutive: settings.PlacementDemoteConsecutive,
+		RewardInstrumentation:      settings.RewardInstrumentation,
+
+		QuarantineDampening:   settings.QuarantineDampening,
+		QuarantineReentryRamp: settings.QuarantineReentryRamp,
 	}
 }
 
@@ -2198,6 +2268,15 @@ func (self *RemoteUserNatMultiClient) reliabilitySettings() *ReliabilitySettings
 		return overrides
 	}
 	return ReliabilitySettingsFrom(self.settings)
+}
+
+// scoredPlacementEnabled is the single gate the placement path checks. When
+// false (the zero value, and every current build's default) selection is
+// exactly today's; nothing in this file's new routing code runs. See the
+// guarded branch in sendPacket's placement helper (coalesceOrderedClients)
+// and scoredPlacementReorder.
+func scoredPlacementEnabled(r *ReliabilitySettings) bool {
+	return r != nil && r.ScoredPlacement
 }
 
 // SetReliabilitySettings installs runtime overrides for the reliability knobs.
@@ -2491,6 +2570,106 @@ func (self *RemoteUserNatMultiClient) leastLoadedClients(clients []*multiClientC
 		}
 	}
 	return least
+}
+
+// scoredPlacementReorder is the Phase 1 scored-placement path, called ONLY
+// when scoredPlacementEnabled is true (see the guarded branch in sendPacket's
+// coalesceOrderedClients). It NEVER changes which exits are eligible --
+// candidates has already been through raceCandidates' verdict/quarantine/
+// tier/flow-cap gates -- it only ever re-orders that already-healthy field,
+// promoting the scorer's pick to the front. The learner never overrides the
+// safety layer: membership is untouched, only order.
+//
+// classifyOrUnknown is nil-safe, so an unset flowClassifier (every build
+// today -- no classifier implementation exists yet; it lands in a later
+// phase) always classifies ClassUnknown, which returns candidates completely
+// untouched: there is nothing to score against. This is what makes turning
+// ScoredPlacement on, by itself, a no-op today -- behavior only ever
+// *refines*, never regresses, once a real classifier is installed.
+func (self *RemoteUserNatMultiClient) scoredPlacementReorder(candidates []*multiClientChannel, ipPath *IpPath, appId string) []*multiClientChannel {
+	if len(candidates) < 2 {
+		// nothing to reorder
+		return candidates
+	}
+
+	var classifier FlowClassifier
+	if p := self.flowClassifier.Load(); p != nil {
+		classifier = *p
+	}
+	class := classifyOrUnknown(classifier, ipPath, appId).Class
+	if class == ClassUnknown {
+		// no classifier installed, or it declined to name a class: nothing to
+		// score against, so the field stands in the legacy order raceCandidates
+		// already computed.
+		return candidates
+	}
+
+	// flow counts are parent-lock state (the same bookkeeping
+	// leastLoadedClients reads above), gathered in one locked pass and then
+	// scored with no lock held. WindowStats (the per-exit goodput source used
+	// elsewhere in this file, e.g. the resize pass) has the side effect of
+	// advancing the channel's healthy/unhealthy duration bookkeeping, tuned
+	// for that pass's ~15s cadence -- calling it here, at new-flow frequency,
+	// would perturb that state at a much higher rate for no benefit yet. So
+	// RttMillis, GoodputBytesPerSec, and Jitter are left at their zero value
+	// (see exitMetricsSnapshot); real per-exit telemetry for those is future
+	// work, once a side-effect-free accessor exists.
+	flowCounts := make(map[*multiClientChannel]int, len(candidates))
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		for _, c := range candidates {
+			flowCounts[c] = len(self.clientUpdates[c])
+		}
+	}()
+
+	weights := classWeights(class)
+	hysteresisPct := self.reliabilitySettings().PlacementHysteresisPct
+	// the re-entry ramp: 0 (QuarantineReentryRamp's zero value) makes every
+	// reentryPenalty call below return 0 unconditionally, so this loop's
+	// scores are byte-for-byte exitScore(...) with no penalty applied --
+	// exactly as before this task.
+	reentryRamp := self.reliabilitySettings().QuarantineReentryRamp
+
+	bestIndex := 0
+	bestFlows := flowCounts[candidates[0]]
+	bestScore := exitScore(exitMetricsSnapshot(bestFlows), weights) - candidates[0].reentryPenalty(reentryRamp)
+	for i := 1; i < len(candidates); i++ {
+		flows := flowCounts[candidates[i]]
+		score := exitScore(exitMetricsSnapshot(flows), weights) - candidates[i].reentryPenalty(reentryRamp)
+		if lessLoadedTieBreak(bestScore, score, bestFlows, flows, hysteresisPct) {
+			bestIndex, bestScore, bestFlows = i, score, flows
+		}
+	}
+	if bestIndex == 0 {
+		return candidates
+	}
+
+	reordered := make([]*multiClientChannel, 0, len(candidates))
+	reordered = append(reordered, candidates[bestIndex])
+	for i, c := range candidates {
+		if i != bestIndex {
+			reordered = append(reordered, c)
+		}
+	}
+	return reordered
+}
+
+// exitMetricsSnapshot builds the scorer's read of one candidate from what is
+// safely available on the placement path today: Flows, the same live
+// flow-cap bookkeeping leastLoadedClients already reads. RttMillis,
+// GoodputBytesPerSec, and Jitter have no per-exit accessor that is safe to
+// call at new-flow frequency without perturbing the resize pass's health
+// bookkeeping (see scoredPlacementReorder) and StallEvents has no per-exit
+// counter in this file at all yet (stall state here is a boolean, not a
+// count). All four are left at their zero value, which contributes the SAME
+// constant to every candidate's score (see exitScore's hostile-input guards,
+// which already treat a zero RTT/Jitter/StallEvents as a valid, sanitized
+// input) -- so today scoredPlacementReorder reduces to the less-loaded
+// tie-break among classified candidates. Wiring real per-exit telemetry is
+// later-phase work; see the Task 8 report for the reasoning.
+func exitMetricsSnapshot(flows int) ExitMetrics {
+	return ExitMetrics{Flows: flows}
 }
 
 // bindClientFlow records that a flow is now committed to client, which is what
@@ -4667,6 +4846,15 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 			for _, windowType := range self.selectWindowTypes(sendPacket) {
 				if window, ok := self.windows[windowType]; ok {
 					orderedClients := self.raceCandidates(window)
+					if scoredPlacementEnabled(self.reliabilitySettings()) {
+						// guarded scored-placement path (Phase 1): re-orders the
+						// already health-filtered field above, never widens or
+						// narrows it. See scoredPlacementReorder.
+						orderedClients = self.scoredPlacementReorder(orderedClients, ipPath, sendPacket.pin.appId)
+					}
+					// legacy selection unchanged: with the gate off (every
+					// current build's default), orderedClients is exactly what
+					// raceCandidates returned, untouched.
 					if 0 < len(orderedClients) {
 						return orderedClients
 					}
@@ -9180,6 +9368,29 @@ type multiClientChannel struct {
 	quarantineLiftTime        time.Time
 	quarantineLiftConnectSeen bool
 
+	// quarantineReconvictions counts this channel's completed bench-then-lift
+	// cycles: 0 through its first-ever bench, incremented on every lift (see
+	// clearQuarantineWithLock). Feeds benchDuration so a channel that keeps
+	// re-earning a bench holds it longer each time (RFC 2439-style flap
+	// damping) instead of the constant hold every episode got before this
+	// task. Deliberately session-scoped and never persisted -- same lifetime
+	// as quarantineMigrated and the rest of the episode bookkeeping beside
+	// it, not new durable state. Guarded by stateLock.
+	//
+	// KNOWN LIMITATION, tracked separately, not yet fixed: this counter never
+	// DECAYS within a session -- a provider that flaps early and then runs
+	// clean for hours still escalates straight to the 240s cap on its next
+	// bench rather than re-starting at 60s. The blast radius is bounded and
+	// self-healing even so: the worst case is a stale-bad exit taking up to
+	// 240s instead of 60s to be force-evicted by the expiry escape, and
+	// release-on-receive-progress (addReceiveAck's clear, unrelated to this
+	// counter) remains a fully independent per-poll acquittal path this
+	// cannot delay -- a genuinely recovered exit is never held past the
+	// evidence that acquits it. Clean-interval decay analogous to
+	// quarantineMemoryDuration should land before QuarantineDampening is
+	// ever turned on for real traffic.
+	quarantineReconvictions int
+
 	// pendingSendTime is when the current run of unacked sends began, reset on
 	// every ack. With sendNackCount > 0 it is the age of the oldest unmade
 	// progress, which is what sendStalled tests. Guarded by stateLock.
@@ -9734,6 +9945,11 @@ func (self *multiClientChannel) clearQuarantineWithLock() {
 		self.survivedQuarantine = true
 		self.quarantineLiftTime = time.Now()
 		self.quarantineLiftConnectSeen = false
+		// this episode is now a completed cycle, so the NEXT bench (if any)
+		// escalates one step; see quarantineReconvictions and benchDuration.
+		// A no-op lift (already clear, the branch above did not run) must not
+		// count -- there was no episode to have completed.
+		self.quarantineReconvictions++
 	}
 	self.quarantined = false
 	self.quarantineReason = blackholeNone
@@ -9795,6 +10011,45 @@ func (self *multiClientChannel) quarantineState() (blackholeReason, time.Time) {
 		return blackholeNone, time.Time{}
 	}
 	return self.quarantineReason, self.quarantineStart
+}
+
+// quarantineReconvictionCount reads the completed bench-then-lift cycle
+// count benchDuration escalates on; see the field comment.
+func (self *multiClientChannel) quarantineReconvictionCount() int {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.quarantineReconvictions
+}
+
+// quarantineReentryElapsed reports how long it has been since this channel's
+// most recent quarantine lift, and whether a lift has ever been recorded at
+// all -- ok is false for a channel that has never been quarantined, which
+// must read as "no ramp applies" rather than as a zero (== just-released)
+// elapsed. Reuses quarantineLiftTime, the same stamp the survived-quarantine
+// effectiveTier memory already reads, so the re-entry ramp adds no new
+// persistent state of its own.
+func (self *multiClientChannel) quarantineReentryElapsed(now time.Time) (time.Duration, bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.quarantineLiftTime.IsZero() {
+		return 0, false
+	}
+	return now.Sub(self.quarantineLiftTime), true
+}
+
+// reentryPenalty is the scored-placement convenience wrapper around
+// reentryScorePenalty: 0 when ramp is disabled (QuarantineReentryRamp's
+// zero-value-off) or this channel has never been quarantined, else the
+// current point on the decay curve since its last lift.
+func (self *multiClientChannel) reentryPenalty(ramp time.Duration) float64 {
+	if ramp <= 0 {
+		return 0
+	}
+	elapsed, ok := self.quarantineReentryElapsed(time.Now())
+	if !ok {
+		return 0
+	}
+	return reentryScorePenalty(elapsed, ramp)
 }
 
 // hasOutstandingSends reports whether this channel currently holds sends that
@@ -11173,6 +11428,70 @@ const (
 	verdictActionExecuteExpired verdictActionKind = 3
 )
 
+// benchDuration is the RFC 2439-style flap-damping schedule for how long a
+// quarantine holds before the expiry escape (verdictActionExecuteExpired,
+// below) may act on it. dampening off returns base unconditionally -- the
+// constant StatsWindowKeepUnhealthyDuration hold every episode got before
+// this task, and what QuarantineDampening's zero value preserves exactly.
+// dampening on escalates 60s -> 120s -> 240s by reconvictions (this
+// channel's count of prior completed bench-then-lift cycles, see
+// quarantineReconvictionCount), capped at the third step: real field
+// evidence showed the SAME exits bench/lift 4-5 times in 10-20 minutes with
+// zero effect from bench migration (movable=0 on all 20 attempts) -- the
+// escalation exists to make repeat churn cost more without holding a
+// genuinely-recovered exit's bench open indefinitely. base is accepted but
+// ignored when dampening is on: the schedule is fixed by the literature, not
+// tunable per-deployment through the pre-existing knob. Pure: no clock
+// reads, no locks.
+func benchDuration(reconvictions int, base time.Duration, dampening bool) time.Duration {
+	if !dampening {
+		return base
+	}
+	steps := []time.Duration{60 * time.Second, 120 * time.Second, 240 * time.Second}
+	i := reconvictions
+	if i < 0 {
+		i = 0
+	}
+	if i >= len(steps) {
+		i = len(steps) - 1
+	}
+	return steps[i]
+}
+
+// reentryPenaltyWeight is the ceiling of the re-entry ramp's score
+// subtraction, at the instant a quarantine lifts (elapsed==0). exitScore's
+// own stall term alone can already cost up to 3.0 (see exitScore's
+// stallPenalty cap), so 1.0 is a meaningful push against a freshly released
+// exit without being able to outweigh a genuinely large health gap on its
+// own -- a just-lifted exit can still win if it is clearly the best
+// candidate, it just does not win a close tie-break on the strength of a
+// lift that happened a second ago.
+const reentryPenaltyWeight = 1.0
+
+// reentryScorePenalty is the asymmetric-re-entry half of the flap-damping
+// pair: a released exit does not return to full scored-placement standing
+// the instant its quarantine lifts (fast to leave selection, slow to return
+// to it in full), it returns at reduced weight that decays LINEARLY to zero
+// once `ramp` has elapsed since the lift. ramp<=0 disables the ramp entirely
+// (returns 0 for any input), which is QuarantineReentryRamp's zero-value-off
+// contract -- the legacy, pre-this-task behavior, where a lifted quarantine
+// carries no score penalty at all. elapsed<0 is clamped to 0 (full penalty)
+// rather than read as "already decayed" -- a caller passing a negative
+// elapsed has a clock problem, not evidence of a longer-than-possible clean
+// interval. This is a temporary SCORE adjustment only: it never touches
+// quarantined/warning state, membership, or which exits are convicted --
+// see reentryPenalty, its only caller, and scoredPlacementReorder, its
+// only consumer. Pure: no clock reads, no locks.
+func reentryScorePenalty(elapsed time.Duration, ramp time.Duration) float64 {
+	if ramp <= 0 || elapsed >= ramp {
+		return 0
+	}
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	return reentryPenaltyWeight * float64(ramp-elapsed) / float64(ramp)
+}
+
 // verdictAction decides between executing, quarantining, and expiring a
 // blackhole verdict. The core invariant it encodes: an exit carrying live
 // flows may only be closed on hard evidence. Of the verdicts that reach here,
@@ -11435,13 +11754,29 @@ func (self *multiClientChannel) detectBlackhole() {
 				if quarantineReason, quarantineStart := self.quarantineState(); quarantineReason == reason {
 					quarantinedSince = quarantineStart
 				}
+				// the bench hold time: short-circuited on the knob BEFORE
+				// quarantineReconvictionCount() (which takes stateLock) is
+				// ever called, so a default build with QuarantineDampening
+				// off does not acquire a new lock on this live path -- the
+				// off-path value stays byte-for-byte
+				// self.settings.StatsWindowKeepUnhealthyDuration, exactly as
+				// it was passed directly before this task. benchDuration's
+				// own `if !dampening { return base }` guard is kept as
+				// defence in depth, not relied on here for the lock-skip.
+				// dampening is always true inside this branch (that is the
+				// condition), so it is passed to benchDuration as a literal
+				// rather than re-read.
+				quarantineExpiry := self.settings.StatsWindowKeepUnhealthyDuration
+				if self.reliabilitySettings().QuarantineDampening {
+					quarantineExpiry = benchDuration(self.quarantineReconvictionCount(), quarantineExpiry, true)
+				}
 				action := verdictAction(
 					reason,
 					self.reliabilitySettings().SoftVerdictDemote,
 					flowCount,
 					quarantinedSince,
 					now,
-					self.settings.StatsWindowKeepUnhealthyDuration,
+					quarantineExpiry,
 					self.emptiedByMigration(),
 				)
 
