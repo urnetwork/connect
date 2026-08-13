@@ -1191,6 +1191,14 @@ type RemoteUserNatMultiClient struct {
 	// (created lazily, so a fixture-assembled parent works), bounded by
 	// qualificationMaxEntries. See ip_remote_multi_client_probe.go.
 	qualification map[MultiHopId]*providerQualification
+	// demotionStates is scoredPlacementReorder's owned N-of-M demotion
+	// bookkeeping (routing_score.go's demotionState), keyed per (exit,
+	// class) by demotionKey. Guarded by stateLock, created lazily like
+	// qualification above. Unlike qualification, an entry does NOT survive a
+	// channel's teardown -- removeClient evicts every entry for a departing
+	// ClientId, so this cannot grow unbounded across a long session's churn.
+	// See demotionObserve and demotionKey's own doc for the keying rationale.
+	demotionStates map[demotionKey]*demotionState
 
 	// config is an immutable snapshot of the rarely-changed routing config
 	// (performance profile + local security bypass). it is rebuilt under
@@ -2750,6 +2758,67 @@ const classifyLogInterval = 5 * time.Second
 
 var classifyLogThrottle = newLogThrottle(classifyLogInterval)
 
+// demotionKey identifies one (exit, class) demotion streak -- an exit's own
+// TrafficClass-scoped N-of-M bad-interval count (demotionState,
+// routing_score.go).
+//
+// Keyed by the exit's stable ClientId, NOT the *multiClientChannel pointer.
+// The reason is not "an exit reconnecting should keep its old streak" --
+// removeClient (below) evicts every entry for a ClientId the moment its
+// channel goes away, so a genuine reconnect (same ClientId, new channel
+// object) starts with a clean streak exactly as a pointer-keyed map would
+// give it too. The reason is what happens when eviction is EVER missed (a
+// bug, a narrow race): once a *multiClientChannel is unreachable, Go's
+// allocator is free to reuse its freed memory for a later, wholly unrelated
+// object. A pointer-keyed map has no way to tell "the same exit came back"
+// apart from "an unrelated exit's channel happened to land at the address a
+// stale entry was still keyed by" -- a real, if rare, Go footgun for any map
+// that outlives the pointers it was built from. ClientId is a logical value
+// that cannot collide between two different exits, so a missed eviction can
+// only ever leak memory (the entry sits unread forever), never hand a new
+// exit an old one's bad reputation.
+type demotionKey struct {
+	clientId Id
+	class    TrafficClass
+}
+
+// demotionObserve records one good/bad observation for (clientId, class) and
+// reports whether PlacementDemoteConsecutive consecutive bad observations
+// have now accumulated -- demotionState.observe's N-of-M rule, applied to
+// the map/state entry this method owns. The map and the per-key state are
+// both created lazily under stateLock, the same nil-safe convention as
+// qualification above: a bare test fixture (a literal
+// &RemoteUserNatMultiClient{}) leaves demotionStates nil until first use.
+// demotionState.observe is a couple of int comparisons -- no lock, I/O, or
+// blocking of its own -- so holding stateLock across the call (rather than
+// releasing it first) adds no risk and rules out a data race on the shared
+// *demotionState's bad counter when two flows for the same exit and class
+// are placed concurrently.
+func (self *RemoteUserNatMultiClient) demotionObserve(clientId Id, class TrafficClass, good bool, needBad int) bool {
+	key := demotionKey{clientId: clientId, class: class}
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	if self.demotionStates == nil {
+		self.demotionStates = map[demotionKey]*demotionState{}
+	}
+	d, ok := self.demotionStates[key]
+	if !ok {
+		d = &demotionState{}
+		self.demotionStates[key] = d
+	}
+	return d.observe(good, needBad)
+}
+
+// demotionLogInterval bounds the `[rel] event=demote` emission rate. Once an
+// exit crosses its bad-interval threshold, demotionState.observe reports
+// "demoted" on every subsequent bad interval, not just the transition -- at
+// new-flow call frequency an un-throttled line here would flood the log
+// exactly like an un-throttled classify line would, so this reuses that same
+// sampling discipline rather than inventing a new one.
+var demotionLogThrottle = newLogThrottle(classifyLogInterval)
+
 // scoredPlacementReorder is the Phase 1 scored-placement path, called ONLY
 // when scoredPlacementEnabled is true (see the guarded branch in sendPacket's
 // coalesceOrderedClients). It NEVER changes which exits are eligible --
@@ -2833,17 +2902,61 @@ func (self *RemoteUserNatMultiClient) scoredPlacementReorder(candidates []*multi
 	// scores are byte-for-byte exitScore(...) with no penalty applied --
 	// exactly as before this task.
 	reentryRamp := self.reliabilitySettings().QuarantineReentryRamp
+	// PlacementDemoteConsecutive's zero value must be inert -- today's
+	// behavior (before this task, and with the knob left unset) is no
+	// demotion at all. demotionState.observe treats needBad<=1 as
+	// act-on-every-sample, NOT as off, so needBad<=0 is guarded at the call
+	// site below rather than passed through into observe.
+	needBad := self.reliabilitySettings().PlacementDemoteConsecutive
+
+	incumbentScore := exitScore(exitMetricsSnapshot(candidates[0], flowCounts[candidates[0]]), weights) - candidates[0].reentryPenalty(reentryRamp)
 
 	bestIndex := 0
 	bestFlows := flowCounts[candidates[0]]
-	bestScore := exitScore(exitMetricsSnapshot(candidates[0], bestFlows), weights) - candidates[0].reentryPenalty(reentryRamp)
+	bestScore := incumbentScore
+	// plainBest tracks the highest raw score with NO hysteresis or load
+	// tie-break applied. demotionState ownership (below) needs to know
+	// whether a challenger has genuinely outscored the incumbent this round,
+	// independent of whether hysteresis was sticky enough to keep bestIndex
+	// at 0 -- that stickiness is exactly what N-of-M demotion exists to
+	// eventually override.
+	plainBestIndex := 0
+	plainBestScore := incumbentScore
 	for i := 1; i < len(candidates); i++ {
 		flows := flowCounts[candidates[i]]
 		score := exitScore(exitMetricsSnapshot(candidates[i], flows), weights) - candidates[i].reentryPenalty(reentryRamp)
 		if lessLoadedTieBreak(bestScore, score, bestFlows, flows, hysteresisPct) {
 			bestIndex, bestScore, bestFlows = i, score, flows
 		}
+		if score > plainBestScore {
+			plainBestIndex, plainBestScore = i, score
+		}
 	}
+
+	// demotionState ownership: an incumbent hysteresis is still protecting
+	// (bestIndex still 0) but that a challenger has genuinely, if mildly,
+	// outscored for needBad consecutive rounds gets re-ranked anyway -- a
+	// single noisy round never does this (demotionState's N-of-M smoothing
+	// absorbs it), but persistent quiet underperformance is not noise. This
+	// only ever moves bestIndex to plainBestIndex, one candidate already in
+	// this call's field -- never adds or removes a candidate, so membership
+	// stays exactly what raceCandidates decided.
+	if needBad > 0 {
+		bad := plainBestScore > incumbentScore
+		demoted := self.demotionObserve(candidates[0].ClientId(), class, !bad, needBad)
+		if demoted && bestIndex == 0 {
+			if ok, suppressed := demotionLogThrottle.Allow(time.Now()); ok {
+				loggerOrDefault(self.log).Infof("%s\n", relEvent(
+					"demote",
+					"exit", candidates[0].ClientId(),
+					"class", class,
+					"suppressed", suppressed,
+				))
+			}
+			bestIndex = plainBestIndex
+		}
+	}
+
 	if bestIndex == 0 {
 		return candidates
 	}
@@ -3818,6 +3931,18 @@ func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 			return
 		}
 		delete(self.clientUpdates, client)
+
+		// evict this exit's demotion streaks (every class) now that its
+		// channel is gone -- see demotionKey's doc for why this, and not a
+		// size-bound LRU like qualification's, is the right lifecycle for
+		// this particular map: an unbounded map keyed by exit identity would
+		// otherwise leak across a long session's churn.
+		clientId := client.ClientId()
+		for key := range self.demotionStates {
+			if key.clientId == clientId {
+				delete(self.demotionStates, key)
+			}
+		}
 
 		// partition the dying exit's flows: established quic moves, the rest
 		// gets the teardown signal
