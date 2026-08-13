@@ -17,14 +17,20 @@ type rewardStat struct {
 
 type rewardAccumulator struct {
 	m map[rewardKey]*rewardStat
-	// dropped counts (class, exitId) keys rejected by add's cap check since
-	// the last drainLines reset -- see rewardAccumulatorMaxKeys's own doc.
-	// This project has already been bitten twice by a silent cap (the
-	// quarantine reconviction count was the first); a bound that drops
-	// coverage without saying so is the same defect again. drainLines
-	// surfaces this as its own [rel] line only when it is nonzero, so an
-	// idle or unsaturated session costs nothing extra to read.
-	dropped int
+	// droppedSamples counts rejected add() calls -- SAMPLES, not distinct
+	// keys -- since the last drainLines reset. See rewardAccumulatorMaxKeys's
+	// own doc. The same never-admitted (class, exitId) key retried N times
+	// after the cap is full counts N here, not 1: this field answers "how
+	// many add() attempts did the cap cost me", not "how many distinct
+	// provider/class combinations did I lose" -- the latter would need its
+	// own bounded seen-but-rejected set, which just moves the unbounded-
+	// growth problem the cap exists to prevent. This project has already
+	// been bitten twice by a silent cap (the quarantine reconviction count
+	// was the first); a bound that drops coverage without saying so is the
+	// same defect again. drainLines surfaces this as its own [rel] line only
+	// when it is nonzero, so an idle or unsaturated session costs nothing
+	// extra to read.
+	droppedSamples int
 }
 
 func newRewardAccumulator() *rewardAccumulator {
@@ -41,9 +47,10 @@ func newRewardAccumulator() *rewardAccumulator {
 // many distinct (class, exit) pairs. Once at the cap, a brand-new key is
 // dropped rather than added; an already-tracked key keeps accumulating (it
 // is already paying rent, and this is a leak guard, not a fairness policy).
-// A drop is never silent: rewardAccumulator.dropped counts it, and
-// drainLines surfaces the count on an event=reward_dropped line the next
-// time it is nonzero. 256 mirrors maxRestoredWindowIdentityCount's own
+// A drop is never silent: rewardAccumulator.droppedSamples counts it (one
+// per rejected add() call, not one per distinct key -- see droppedSamples's
+// own doc), and drainLines surfaces the count on an event=reward_dropped
+// line the next time it is nonzero. 256 mirrors maxRestoredWindowIdentityCount's own
 // "several generations of slack over a normal window" sizing. Note the cap
 // is really "256 / number-of-classes providers" in the worst case (all
 // traffic filed under one TrafficClass), since keys are (class, exitId)
@@ -55,7 +62,7 @@ func (r *rewardAccumulator) add(class TrafficClass, exitId string, goodputBytes 
 	s := r.m[k]
 	if s == nil {
 		if rewardAccumulatorMaxKeys <= len(r.m) {
-			r.dropped++
+			r.droppedSamples++
 			return
 		}
 		s = &rewardStat{}
@@ -69,10 +76,12 @@ func (r *rewardAccumulator) add(class TrafficClass, exitId string, goodputBytes 
 }
 
 // drainLines emits one grammar line per key, plus (only when nonzero) one
-// more line reporting how many distinct (class, exitId) keys this interval
-// dropped for being past rewardAccumulatorMaxKeys, then resets both the
-// stats map and the drop counter. Interval-triggered by the caller (the
-// heartbeat tick), never per-packet.
+// more line reporting how many add() calls this interval rejected for
+// naming a new key past rewardAccumulatorMaxKeys, then resets both the
+// stats map and the drop counter. This is a SAMPLE count, not a
+// distinct-key count: a single never-admitted key retried N times
+// contributes N, not 1 -- see droppedSamples's own doc for why. Interval-
+// triggered by the caller (the heartbeat tick), never per-packet.
 //
 // The drop line is deliberately NOT folded into event=reward as a per-key
 // field: a drop is a fact about the accumulator as a whole (a key that never
@@ -108,15 +117,15 @@ func (r *rewardAccumulator) drainLines() []string {
 			))
 		}
 	}
-	if 0 < r.dropped {
+	if 0 < r.droppedSamples {
 		lines = append(lines, relEvent(
 			"reward_dropped",
-			"dropped", r.dropped,
+			"droppedsamples", r.droppedSamples,
 			"cap", rewardAccumulatorMaxKeys,
 		))
 	}
 	r.m = map[rewardKey]*rewardStat{}
-	r.dropped = 0
+	r.droppedSamples = 0
 	return lines
 }
 
