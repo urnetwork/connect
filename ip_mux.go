@@ -239,6 +239,28 @@ func (self *IpMux) SendPacketBatch(
 			sentPacketCount += len(group.packets)
 			continue
 		}
+		if smtpNeedsOrderedSend(group.ipPath) {
+			// SMTP's route/encryption decision advances per TCP segment and can
+			// accept an early negotiation segment while rejecting a later one.
+			// The exact-flow batch fast path enters RemoteUserNatMultiClient at
+			// sendPacketGroup, below its public SMTP gate. Preserve both the
+			// state machine and TCP/25's forced-local route by using the public
+			// singular upstream for these small, exceptional flows.
+			if upstream == nil {
+				for _, packet := range group.packets {
+					MessagePoolReturn(packet)
+				}
+				continue
+			}
+			for _, packet := range group.packets {
+				if upstream(source, provideMode, packet, timeout) {
+					sentPacketCount += 1
+				} else {
+					MessagePoolReturn(packet)
+				}
+			}
+			continue
+		}
 		if upstreamGroupSend != nil {
 			if upstreamGroupSend(source, provideMode, group, timeout) {
 				sentPacketCount += len(group.packets)

@@ -1222,6 +1222,7 @@ type RemoteUserNatMultiClient struct {
 	// bounded logging work while retaining first-error and total visibility.
 	sendParseDropCount        atomic.Uint64
 	sendPolicyDropCount       atomic.Uint64
+	sendSmtpDropCount         atomic.Uint64
 	sendIcmpDisabledDropCount atomic.Uint64
 	// Best-effort removal-generated packets are delivered by one isolated
 	// worker. A permanently blocked downstream therefore cannot wedge the
@@ -1237,6 +1238,7 @@ type RemoteUserNatMultiClient struct {
 
 	securityPolicyStats *SecurityPolicyStatsCollector
 	securityPolicy      SecurityPolicy
+	smtpEgressGuard     smtpEgressGuard
 
 	// the provide mode of the source packets
 	// for locally generated packets this is `ProvideMode_Network`
@@ -5045,6 +5047,86 @@ func (self *RemoteUserNatMultiClient) logSparseSendDrop(
 	)
 }
 
+// smtpBlockActionParts performs the ordinary association/override lookup for
+// the two SMTP decisions that occur before the general security policy. This
+// keeps the explicit local route and an encryption rejection visible through
+// the same BlockAction stream as every other egress routing decision.
+func (self *RemoteUserNatMultiClient) smtpBlockActionParts(
+	ipPath *IpPath,
+) (decision *blockActionDecision, match *blockActionMatch, blockerBlock bool) {
+	ignored := self.blockActionIgnored(ipPath)
+	if !ignored && self.ipAssoc != nil {
+		self.ipAssoc.AddEgressPacket(ipPath)
+	}
+
+	blockActionState := self.blockActionState.Load()
+	config := self.config.Load()
+	blockerActive := config.blocker != nil && config.blocker.Enabled()
+	if !ignored && (blockActionState.matcher != nil || self.blockActionCollector.hasCallbacks() || blockerActive) {
+		decision = self.blockActionDecision(blockActionState, config.blocker, blockerActive, ipPath)
+	}
+	if decision != nil {
+		match = decision.match
+		blockerBlock = decision.blockerBlock
+	}
+	return
+}
+
+// sendSmtpLocal routes TCP/25 directly regardless of localSecurityBypass. The
+// forced Drop+local combination is deliberate: block and blocker overrides
+// still work, but a route override cannot move port 25 onto a provider.
+func (self *RemoteUserNatMultiClient) sendSmtpLocal(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	packet []byte,
+) bool {
+	decision, match, blockerBlock := self.smtpBlockActionParts(ipPath)
+	block, local := blockActionApply(
+		SecurityPolicyResultDrop,
+		true,
+		blockerBlock,
+		match,
+	)
+	byteCount := ByteCount(len(packet))
+	if decision != nil && self.blockActionCollector.hasCallbacks() {
+		self.blockActionCollector.add(decision, block, local, match, byteCount)
+	}
+	if block {
+		self.packetStatsCounters.blockEgressPacketCount.Add(1)
+		self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
+		return false
+	}
+	if !local || self.localUserNat == nil {
+		return false
+	}
+	success := self.localUserNat.SendPacket(source, provideMode, packet, 0)
+	if success {
+		self.packetStatsCounters.localEgressPacketCount.Add(1)
+		self.packetStatsCounters.localEgressByteCount.Add(int64(byteCount))
+	}
+	return success
+}
+
+func (self *RemoteUserNatMultiClient) rejectSmtpPacket(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	packet []byte,
+) {
+	decision, _, _ := self.smtpBlockActionParts(ipPath)
+	byteCount := ByteCount(len(packet))
+	if decision != nil && self.blockActionCollector.hasCallbacks() {
+		// Encryption enforcement is not overridable. Pass no match so a user
+		// override is not reported as the cause of this mandatory rejection.
+		self.blockActionCollector.add(decision, true, false, nil, byteCount)
+	}
+	self.packetStatsCounters.blockEgressPacketCount.Add(1)
+	self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
+	self.logSparseSendDrop("smtp encryption", &self.sendSmtpDropCount, errSmtpEncryptionRequired)
+	deliverTcpPolicyReset(self.deliverReceivePacket, source, provideMode, ipPath, packet)
+}
+
 // `SendPacketFunction`
 func (self *RemoteUserNatMultiClient) SendPacket(
 	source TransferPath,
@@ -5064,6 +5146,16 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 		// fleet broadly parses icmp, since a not-yet-upgraded provider
 		// silently blackholes icmp flows
 		self.logSparseSendDrop("icmp disabled", &self.sendIcmpDisabledDropCount, errIcmpDisabled)
+		return false
+	}
+	// Port 25 is a deliberate local-only route and must be selected before
+	// CFAA inspection (which classifies privileged SMTP as a drop). Ports
+	// 465/587 remain provider-routed only while their SMTP/TLS stream validates.
+	if smtpRoutesLocally(ipPath) {
+		return self.sendSmtpLocal(source, provideMode, ipPath, packet)
+	}
+	if self.smtpEgressGuard.inspect(ipPath, payload) == smtpEgressReject {
+		self.rejectSmtpPacket(source, provideMode, ipPath, packet)
 		return false
 	}
 	r, err := self.securityPolicy.InspectEgress(relationship, ipPath, payload)
@@ -5163,6 +5255,20 @@ func (self *RemoteUserNatMultiClient) SendPacketBatch(
 
 	sentPacketCount := 0
 	for _, group := range groups {
+		if smtpNeedsOrderedSend(group.ipPath) {
+			// SMTP validation is stream-ordered and may accept an earlier
+			// negotiation segment while rejecting a later plaintext segment.
+			// Preserve that per-packet result instead of applying the ordinary
+			// all-or-nothing flow-group transaction.
+			for _, packet := range group.packets {
+				if self.SendPacket(source, provideMode, packet, timeout) {
+					sentPacketCount += 1
+				} else {
+					MessagePoolReturn(packet)
+				}
+			}
+			continue
+		}
 		if self.sendPacketGroup(source, provideMode, group, timeout) {
 			sentPacketCount += len(group.packets)
 			continue

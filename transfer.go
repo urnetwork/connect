@@ -5638,14 +5638,13 @@ func NewReceiveBuffer(ctx context.Context,
 	client *Client,
 	receiveBufferSettings *ReceiveBufferSettings) *ReceiveBuffer {
 	return &ReceiveBuffer{
-		ctx:                        ctx,
-		client:                     client,
-		log:                        client.log,
-		receiveBufferSettings:      receiveBufferSettings,
-		receiveSequences:           map[receiveSequenceId]*ReceiveSequence{},
-		headReceiveSequenceIds:     map[receiveSequenceHeadKey]receiveSequenceId{},
-		rejectedReceiveSequenceIds: map[receiveSequenceHeadKey]Id{},
-		activeReceiveSequences:     map[*ReceiveSequence]bool{},
+		ctx:                    ctx,
+		client:                 client,
+		log:                    client.log,
+		receiveBufferSettings:  receiveBufferSettings,
+		receiveSequences:       map[receiveSequenceId]*ReceiveSequence{},
+		headReceiveSequenceIds: map[receiveSequenceHeadKey]receiveSequenceId{},
+		activeReceiveSequences: map[*ReceiveSequence]bool{},
 		beforeCreateReceiveSequenceForTest: receiveBufferSettings.
 			beforeCreateReceiveSequenceForTest,
 		beforeRunReceiveSequenceForTest: receiveBufferSettings.
@@ -5653,11 +5652,6 @@ func NewReceiveBuffer(ctx context.Context,
 		beforeCloseWaitForTest: receiveBufferSettings.beforeCloseWaitForTest,
 		afterRunReceiveSequenceForTest: receiveBufferSettings.
 			afterRunReceiveSequenceForTest,
-		rejectedReceiveSequenceOrder: make(
-			[]receiveSequenceHeadKey,
-			0,
-			rejectedReceiveSequenceCapacity,
-		),
 	}
 }
 
@@ -5693,6 +5687,18 @@ func (self *ReceiveBuffer) rejectReceiveSequenceWithLock(
 	headKey receiveSequenceHeadKey,
 	sequenceId Id,
 ) {
+	// Contract rejection is exceptional. Allocating the full tombstone FIFO
+	// for every Client made the normal provider path pay roughly 48 KiB per
+	// receive buffer even when no peer had ever presented a bad contract.
+	// Keep the exact bounded capacity, but materialize it only on first use.
+	if self.rejectedReceiveSequenceIds == nil {
+		self.rejectedReceiveSequenceIds = map[receiveSequenceHeadKey]Id{}
+		self.rejectedReceiveSequenceOrder = make(
+			[]receiveSequenceHeadKey,
+			0,
+			rejectedReceiveSequenceCapacity,
+		)
+	}
 	if rejectedSequenceId, ok := self.rejectedReceiveSequenceIds[headKey]; ok {
 		if rejectedSequenceId.LessThan(sequenceId) {
 			self.rejectedReceiveSequenceIds[headKey] = sequenceId

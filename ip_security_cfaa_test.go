@@ -68,12 +68,16 @@ func TestCfaaPortClassification(t *testing.T) {
 		{443, IpProtocolUdp, cfaaPass},
 		{853, IpProtocolTcp, cfaaPass},
 		{465, IpProtocolTcp, cfaaPass},
+		{587, IpProtocolTcp, cfaaPass},
+		{587, IpProtocolUdp, cfaaDrop},
 		{993, IpProtocolTcp, cfaaPass},
 		{995, IpProtocolTcp, cfaaPass},
 		// http: pass over tcp, drop over udp (privileged)
 		{80, IpProtocolTcp, cfaaPass},
 		{80, IpProtocolUdp, cfaaDrop},
 		// other privileged ports -> drop
+		{25, IpProtocolTcp, cfaaDrop},
+		{25, IpProtocolUdp, cfaaDrop},
 		{22, IpProtocolTcp, cfaaDrop},
 		{179, IpProtocolTcp, cfaaDrop},
 		// user / ephemeral ports -> pass (handed to DPI on egress)

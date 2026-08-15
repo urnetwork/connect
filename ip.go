@@ -5140,11 +5140,15 @@ func (self *providerReturnItem) returnPackets() {
 }
 
 type RemoteUserNatProvider struct {
-	ctx               context.Context
-	client            *Client
-	cancel            context.CancelFunc
-	localUserNat      *LocalUserNat
-	securityPolicy    SecurityPolicy
+	ctx            context.Context
+	client         *Client
+	cancel         context.CancelFunc
+	localUserNat   *LocalUserNat
+	securityPolicy SecurityPolicy
+	// Defense in depth at the exit. Client and provider policies are
+	// intentionally independent, and multiple tunnel clients can share an IP
+	// tuple, so smtpEgressGuard namespaces its state by the authenticated source.
+	smtpIngressGuard  smtpEgressGuard
 	settings          *RemoteUserNatProviderSettings
 	localUserNatUnsub func()
 	clientUnsub       func()
@@ -6106,6 +6110,40 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 			var ipPath IpPath
 			payload, err := parseIpPathWithPayloadBorrowed(packetBytes, &ipPath)
 			if err == nil {
+				// The provider independently enforces the same SMTP encryption
+				// boundary as the client. This must precede the reversed general
+				// policy: TCP/587 legitimately starts with a small plaintext
+				// EHLO/STARTTLS exchange, while transaction/authentication commands
+				// are forbidden until a TLS ClientHello has been observed.
+				if self.smtpIngressGuard.inspectForOwner(
+					source.SourceId,
+					&ipPath,
+					payload,
+				) == smtpEgressReject {
+					self.packetStatsCounters.blockIngressPacketCount.Add(1)
+					self.packetStatsCounters.blockIngressByteCount.Add(int64(len(packetBytes)))
+					deliverTcpPolicyReset(
+						func(
+							resetSource TransferPath,
+							resetProvideMode protocol.ProvideMode,
+							resetPath *IpPath,
+							reset []byte,
+						) {
+							self.receiveTransfer(
+								resetSource,
+								transferKey,
+								resetProvideMode,
+								resetPath,
+								reset,
+							)
+						},
+						source,
+						provideMode,
+						&ipPath,
+						packetBytes,
+					)
+					continue
+				}
 				// the provider's ingress is the remote client's egress (outbound, received from the
 				// tunnel); the reversed provider policy applies the client-egress DPI here
 				r, err := inspectAndRefreshIngressBorrowed(self.securityPolicy, provideMode, ipPath, payload)
@@ -6214,6 +6252,7 @@ type RemoteUserNatClient struct {
 	cancel                context.CancelFunc
 	receivePacketCallback ReceivePacketFunction
 	securityPolicy        SecurityPolicy
+	smtpEgressGuard       smtpEgressGuard
 	pathTable             *pathTable
 	// the provide mode of the source packets
 	// for locally generated packets this is `ProvideMode_Network`
@@ -6293,6 +6332,23 @@ func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode pro
 	var ipPath IpPath
 	payload, err := parseIpPathWithPayloadBorrowed(packet, &ipPath)
 	if err != nil {
+		return false
+	}
+	// TCP/25 is a deliberate kill-switch exception: it is routed directly
+	// before CFAA inspection so an SMTP relay attempt can never reach a
+	// provider. Ports 465/587 stay remote, but only after their per-flow SMTP
+	// state has accepted this segment.
+	if smtpRoutesLocally(&ipPath) {
+		return self.localUserNat.SendPacket(source, provideMode, packet, 0)
+	}
+	if self.smtpEgressGuard.inspect(&ipPath, payload) == smtpEgressReject {
+		deliverTcpPolicyReset(
+			self.receivePacketCallback,
+			source,
+			provideMode,
+			&ipPath,
+			packet,
+		)
 		return false
 	}
 	r, err := inspectAndRefreshEgressBorrowed(self.securityPolicy, relationship, ipPath, payload)

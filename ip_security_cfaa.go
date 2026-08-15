@@ -70,7 +70,7 @@ func newCfaaDetector(settings *CfaaSecurityPolicySettings) *cfaaDetector {
 // Port policy (see ip_security_cfaa_test.go for the exhaustive table):
 //   - bittorrent / abused ports                     -> drop
 //   - ntp (123), ike+nat-t (500, 4500), dns/udp     -> allow (never inspected)
-//   - https/quic (443), dot (853), email (465/993/995), http/tcp (80),
+//   - https/quic (443), dot (853), email (465/587/993/995), http/tcp (80),
 //     and user/ephemeral ports (>=1024)             -> pass (to DPI)
 //   - every other privileged port (<1024),
 //     dns/tcp and 80/udp                            -> drop
@@ -118,8 +118,12 @@ func (self *cfaaDetector) inspect(ip net.IP, port int, protocol IpProtocol, vers
 			return cfaaAllow
 		}
 		return cfaaDrop
-	case port == 443, port == 853, port == 465, port == 993, port == 995:
+	case port == 443, port == 853, port == 465, port == 993, port == 995,
+		port == smtpStartTlsPort && protocol == IpProtocolTcp:
 		// https/quic, dns over tls, and secure email -> downstream DPI
+		// The main client egress paths invoke the SMTP guard before this policy,
+		// restricting TCP/587 plaintext negotiation and requiring STARTTLS plus
+		// a ClientHello before transaction or authentication commands.
 		return cfaaPass
 	case port == 80:
 		// http over tcp is allowed through to DPI (some radio streaming relies on

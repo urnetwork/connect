@@ -145,12 +145,24 @@ func TestReceiveBufferRejectedSequenceTombstonesAreBounded(t *testing.T) {
 		},
 		DefaultReceiveBufferSettings(),
 	)
+	if buffer.rejectedReceiveSequenceIds != nil ||
+		buffer.rejectedReceiveSequenceOrder != nil {
+		t.Fatal("unused rejection tombstones were allocated eagerly")
+	}
 	firstHeadKey := receiveSequenceHeadKey{
 		Source:         SourceId(NewId()),
 		EncryptionRole: sequenceTlsRoleServer,
 	}
 	buffer.mutex.Lock()
 	buffer.rejectReceiveSequenceWithLock(firstHeadKey, NewId())
+	if cap(buffer.rejectedReceiveSequenceOrder) !=
+		rejectedReceiveSequenceCapacity {
+		t.Fatalf(
+			"rejected sequence order capacity = %d, want %d",
+			cap(buffer.rejectedReceiveSequenceOrder),
+			rejectedReceiveSequenceCapacity,
+		)
+	}
 	for i := 1; i <= rejectedReceiveSequenceCapacity; i++ {
 		buffer.rejectReceiveSequenceWithLock(
 			receiveSequenceHeadKey{
