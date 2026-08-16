@@ -1,15 +1,27 @@
 package connect
 
 import (
+	"context"
 	"encoding/binary"
 	"net"
 	"testing"
 	"time"
+
+	"github.com/urnetwork/connect/protocol"
 )
 
 var smtpTestClientHello = []byte{
-	0x16, 0x03, 0x01, 0x00, 0x40, // TLS handshake record, 64 bytes.
-	0x01, 0x00, 0x00, 0x3c, // ClientHello, 60-byte body.
+	0x16, 0x03, 0x01, 0x00, 0x2d, // TLS Handshake record, 45 bytes.
+	0x01, 0x00, 0x00, 0x29, // ClientHello, 41-byte body.
+	0x03, 0x03, // TLS 1.2 legacy version.
+	0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+	0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+	0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+	0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+	0x00,       // Empty legacy session id.
+	0x00, 0x02, // One cipher suite.
+	0xc0, 0x2f,
+	0x01, 0x00, // One null compression method.
 }
 
 func smtpTestPath(sourcePort int, destinationPort int, sequence uint32) *IpPath {
@@ -39,6 +51,39 @@ func requireSmtpVerdict(t *testing.T, want smtpEgressVerdict, got smtpEgressVerd
 		t.Fatalf("SMTP verdict = %d, want %d", got, want)
 	}
 }
+
+// Captures both policy edges so return-direction tests can assert exact paths.
+type smtpReturnPathSecurityPolicy struct {
+	inspectPath IpPath
+	refreshPath IpPath
+}
+
+func (self *smtpReturnPathSecurityPolicy) Stats() *SecurityPolicyStatsCollector {
+	return DefaultSecurityPolicyStatsCollector()
+}
+
+func (self *smtpReturnPathSecurityPolicy) InspectEgress(
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	self.inspectPath = *ipPath
+	return SecurityPolicyResultAllow, nil
+}
+
+func (self *smtpReturnPathSecurityPolicy) InspectIngress(
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	return SecurityPolicyResultAllow, nil
+}
+
+func (self *smtpReturnPathSecurityPolicy) RefreshEgress(ipPath *IpPath) {
+	self.refreshPath = *ipPath
+}
+
+func (self *smtpReturnPathSecurityPolicy) RefreshIngress(ipPath *IpPath) {}
 
 func TestSmtpPortClassification(t *testing.T) {
 	path := smtpTestPath(41000, smtpLocalPort, 1)
@@ -78,11 +123,11 @@ func TestSmtp465RequiresFragmentedTlsClientHello(t *testing.T) {
 	requireSmtpVerdict(t, smtpEgressAllow, guard.inspect(
 		smtpTestPath(sourcePort, smtpImplicitTlsPort, synSequence+1), first,
 	))
-	// An overlapping retransmission supplies the rest of the nine-byte prefix.
+	// An overlapping retransmission supplies the rest of the complete hello.
 	requireSmtpVerdict(t, smtpEgressAllow, guard.inspect(
 		smtpTestPath(sourcePort, smtpImplicitTlsPort, synSequence+2), smtpTestClientHello[1:],
 	))
-	// Once the prefix is verified, opaque TLS records are no longer inspected.
+	// Once the full hello is verified, opaque TLS records are no longer inspected.
 	requireSmtpVerdict(t, smtpEgressAllow, guard.inspect(
 		smtpTestPath(sourcePort, smtpImplicitTlsPort, synSequence+10), []byte{0xff, 0x00, 0x7f},
 	))
@@ -106,21 +151,117 @@ func TestSmtp465RejectsPlaintextAndLatchesFlow(t *testing.T) {
 }
 
 func TestSmtp465RejectsMalformedClientHelloPrefixes(t *testing.T) {
-	tests := map[string][]byte{
-		"application data record": {0x17, 0x03, 0x03, 0x00, 0x40, 0x01, 0x00, 0x00, 0x3c},
-		"non TLS version":         {0x16, 0x02, 0x00, 0x00, 0x40, 0x01, 0x00, 0x00, 0x3c},
-		"SSLv3 version":           {0x16, 0x03, 0x00, 0x00, 0x40, 0x01, 0x00, 0x00, 0x3c},
-		"oversized record":        {0x16, 0x03, 0x03, 0x40, 0x01, 0x01, 0x00, 0x00, 0x3c},
-		"server hello":            {0x16, 0x03, 0x03, 0x00, 0x40, 0x02, 0x00, 0x00, 0x3c},
-		"short client hello":      {0x16, 0x03, 0x03, 0x00, 0x40, 0x01, 0x00, 0x00, 0x28},
+	tests := []struct {
+		name   string
+		prefix []byte
+	}{
+		{name: "application data record", prefix: []byte{0x17, 0x03, 0x03, 0x00, 0x40, 0x01, 0x00, 0x00, 0x3c}},
+		{name: "non TLS version", prefix: []byte{0x16, 0x02, 0x00, 0x00, 0x40, 0x01, 0x00, 0x00, 0x3c}},
+		{name: "SSLv3 version", prefix: []byte{0x16, 0x03, 0x00, 0x00, 0x40, 0x01, 0x00, 0x00, 0x3c}},
+		{name: "oversized record", prefix: []byte{0x16, 0x03, 0x03, 0x40, 0x01, 0x01, 0x00, 0x00, 0x3c}},
+		{name: "server hello", prefix: []byte{0x16, 0x03, 0x03, 0x00, 0x40, 0x02, 0x00, 0x00, 0x3c}},
+		{name: "short client hello", prefix: []byte{0x16, 0x03, 0x03, 0x00, 0x40, 0x01, 0x00, 0x00, 0x28}},
 	}
-	for name, prefix := range tests {
-		t.Run(name, func(t *testing.T) {
-			var guard smtpEgressGuard
-			requireSmtpVerdict(t, smtpEgressReject, guard.inspect(
-				smtpTestPath(41005, smtpImplicitTlsPort, 3600), prefix,
-			))
-		})
+	for index, testCase := range tests {
+		var guard smtpEgressGuard
+		verdict := guard.inspect(
+			smtpTestPath(41005+index, smtpImplicitTlsPort, 3600),
+			testCase.prefix,
+		)
+		if verdict != smtpEgressReject {
+			t.Errorf("%s verdict = %d, want reject", testCase.name, verdict)
+		}
+	}
+}
+
+func smtpTestClientHelloWithBody(body []byte) []byte {
+	handshakeBytes := smtpTlsHandshakeHeaderBytes + len(body)
+	record := make([]byte, smtpTlsRecordHeaderBytes+handshakeBytes)
+	record[0] = 0x16
+	record[1] = 0x03
+	record[2] = 0x01
+	binary.BigEndian.PutUint16(record[3:5], uint16(handshakeBytes))
+	record[5] = 0x01
+	record[6] = byte(len(body) >> 16)
+	record[7] = byte(len(body) >> 8)
+	record[8] = byte(len(body))
+	copy(record[9:], body)
+	return record
+}
+
+func TestSmtp465RejectsMalformedCompleteClientHello(t *testing.T) {
+	validBody := smtpTestClientHello[smtpTlsRecordHeaderBytes+smtpTlsHandshakeHeaderBytes:]
+	invalidLegacyVersion := append([]byte{}, validBody...)
+	invalidLegacyVersion[0] = 0x02
+	oversizedSessionId := append([]byte{}, validBody...)
+	oversizedSessionId[34] = 33
+	oddCipherSuites := append([]byte{}, validBody...)
+	oddCipherSuites[35] = 0
+	oddCipherSuites[36] = 1
+	missingCompressionMethod := append([]byte{}, validBody...)
+	missingCompressionMethod[39] = 0
+	badExtensionLength := append(append([]byte{}, validBody...), 0x00, 0x01, 0x00)
+	duplicateExtensions := append(
+		append([]byte{}, validBody...),
+		0x00, 0x08,
+		0x00, 0x15, 0x00, 0x00,
+		0x00, 0x15, 0x00, 0x00,
+	)
+	cases := []struct {
+		name string
+		body []byte
+	}{
+		{name: "legacy version", body: invalidLegacyVersion},
+		{name: "session id length", body: oversizedSessionId},
+		{name: "cipher suite length", body: oddCipherSuites},
+		{name: "compression methods", body: missingCompressionMethod},
+		{name: "extension vector length", body: badExtensionLength},
+		{name: "duplicate extension", body: duplicateExtensions},
+	}
+	for index, testCase := range cases {
+		var guard smtpEgressGuard
+		verdict := guard.inspect(
+			smtpTestPath(41100+index, smtpImplicitTlsPort, 3700),
+			smtpTestClientHelloWithBody(testCase.body),
+		)
+		if verdict != smtpEgressReject {
+			t.Errorf("%s verdict = %d, want reject", testCase.name, verdict)
+		}
+	}
+}
+
+func TestSmtp465AcceptsClientHelloSplitAcrossTlsRecords(t *testing.T) {
+	handshake := smtpTestClientHello[smtpTlsRecordHeaderBytes:]
+	firstPayloadBytes := 7
+	firstRecord := make([]byte, smtpTlsRecordHeaderBytes+firstPayloadBytes)
+	copy(firstRecord, []byte{0x16, 0x03, 0x01})
+	binary.BigEndian.PutUint16(firstRecord[3:5], uint16(firstPayloadBytes))
+	copy(firstRecord[smtpTlsRecordHeaderBytes:], handshake[:firstPayloadBytes])
+	secondPayload := handshake[firstPayloadBytes:]
+	secondRecord := make([]byte, smtpTlsRecordHeaderBytes+len(secondPayload))
+	copy(secondRecord, []byte{0x16, 0x03, 0x01})
+	binary.BigEndian.PutUint16(secondRecord[3:5], uint16(len(secondPayload)))
+	copy(secondRecord[smtpTlsRecordHeaderBytes:], secondPayload)
+	wireHello := append(firstRecord, secondRecord...)
+
+	var guard smtpEgressGuard
+	sequence := uint32(3800)
+	cut := len(firstRecord) + 3
+	requireSmtpVerdict(t, smtpEgressAllow, guard.inspect(
+		smtpTestPath(41110, smtpImplicitTlsPort, sequence),
+		wireHello[:cut],
+	))
+	requireSmtpVerdict(t, smtpEgressAllow, guard.inspect(
+		smtpTestPath(41110, smtpImplicitTlsPort, sequence+uint32(cut)),
+		wireHello[cut:],
+	))
+
+	guard.stateLock.Lock()
+	defer guard.stateLock.Unlock()
+	for _, flow := range guard.flows {
+		if !flow.secure || len(flow.stream) != 0 {
+			t.Fatalf("record-fragmented ClientHello state: secure=%t retained=%d", flow.secure, len(flow.stream))
+		}
 	}
 }
 
@@ -268,29 +409,30 @@ func TestSmtp587RejectsTransactionCommandsBeforeStartTls(t *testing.T) {
 		"VRFY user\r\n",
 	}
 	for index, command := range commands {
-		t.Run(command[:4], func(t *testing.T) {
-			var guard smtpEgressGuard
-			port := 43000 + index
-			requireSmtpVerdict(t, smtpEgressReject, guard.inspect(
-				smtpTestPath(port, smtpStartTlsPort, 5000), []byte(command),
-			))
-		})
+		var guard smtpEgressGuard
+		verdict := guard.inspect(
+			smtpTestPath(43000+index, smtpStartTlsPort, 5000),
+			[]byte(command),
+		)
+		if verdict != smtpEgressReject {
+			t.Errorf("%q verdict = %d, want reject", command, verdict)
+		}
 	}
 }
 
 func TestSmtp587RejectsFragmentedTransactionCommandAtFirstDisallowedPrefix(t *testing.T) {
 	commands := []string{"AUTH", "MAIL", "RCPT", "DATA"}
 	for index, command := range commands {
-		t.Run(command, func(t *testing.T) {
-			var guard smtpEgressGuard
-			// None of the permitted pre-TLS negotiation commands starts with these
-			// bytes, so a segmented transaction command must fail closed before a
-			// later segment can carry credentials or message data.
-			requireSmtpVerdict(t, smtpEgressReject, guard.inspect(
-				smtpTestPath(43500+index, smtpStartTlsPort, 5500),
-				[]byte(command[:1]),
-			))
-		})
+		var guard smtpEgressGuard
+		// None of the permitted pre-TLS negotiation commands starts with these
+		// bytes, so reject before a later segment can carry private data.
+		verdict := guard.inspect(
+			smtpTestPath(43500+index, smtpStartTlsPort, 5500),
+			[]byte(command[:1]),
+		)
+		if verdict != smtpEgressReject {
+			t.Errorf("%s prefix verdict = %d, want reject", command, verdict)
+		}
 	}
 }
 
@@ -330,26 +472,24 @@ func TestSmtp587BoundsNegotiationBuffer(t *testing.T) {
 	}
 }
 
-func TestSmtpGuardRejectsGapsAndConflictingRetransmissions(t *testing.T) {
-	t.Run("gap", func(t *testing.T) {
-		var guard smtpEgressGuard
-		requireSmtpVerdict(t, smtpEgressAllow, guard.inspect(
-			smtpTestPath(45001, smtpStartTlsPort, 7000), []byte("EH"),
-		))
-		requireSmtpVerdict(t, smtpEgressReject, guard.inspect(
-			smtpTestPath(45001, smtpStartTlsPort, 7003), []byte("LO client\r\n"),
-		))
-	})
+func TestSmtpGuardRejectsSequenceGap(t *testing.T) {
+	var guard smtpEgressGuard
+	requireSmtpVerdict(t, smtpEgressAllow, guard.inspect(
+		smtpTestPath(45001, smtpStartTlsPort, 7000), []byte("EH"),
+	))
+	requireSmtpVerdict(t, smtpEgressReject, guard.inspect(
+		smtpTestPath(45001, smtpStartTlsPort, 7003), []byte("LO client\r\n"),
+	))
+}
 
-	t.Run("conflicting overlap", func(t *testing.T) {
-		var guard smtpEgressGuard
-		requireSmtpVerdict(t, smtpEgressAllow, guard.inspect(
-			smtpTestPath(45002, smtpStartTlsPort, 8000), []byte("EH"),
-		))
-		requireSmtpVerdict(t, smtpEgressReject, guard.inspect(
-			smtpTestPath(45002, smtpStartTlsPort, 8000), []byte("EX"),
-		))
-	})
+func TestSmtpGuardRejectsConflictingRetransmission(t *testing.T) {
+	var guard smtpEgressGuard
+	requireSmtpVerdict(t, smtpEgressAllow, guard.inspect(
+		smtpTestPath(45002, smtpStartTlsPort, 8000), []byte("EH"),
+	))
+	requireSmtpVerdict(t, smtpEgressReject, guard.inspect(
+		smtpTestPath(45002, smtpStartTlsPort, 8000), []byte("EX"),
+	))
 }
 
 func TestSmtpGuardFreshSynReplacesTupleState(t *testing.T) {
@@ -422,6 +562,217 @@ func TestSmtpGuardFinClearsTupleState(t *testing.T) {
 	}
 }
 
+func TestSmtpGuardServerTeardownClearsOnlyMatchingOwner(t *testing.T) {
+	var guard smtpEgressGuard
+	firstOwnerId := NewId()
+	secondOwnerId := NewId()
+	path := smtpTestPath(46004, smtpImplicitTlsPort, 10800)
+	for _, ownerId := range []Id{firstOwnerId, secondOwnerId} {
+		requireSmtpVerdict(t, smtpEgressAllow, guard.inspectForOwner(
+			ownerId,
+			path,
+			smtpTestClientHello,
+		))
+	}
+	returnPath := path.Reverse()
+	returnPath.Fin = true
+	guard.retireReturnForOwner(firstOwnerId, returnPath)
+	firstKey, firstOk := smtpFlowKeyForOwnerPath(firstOwnerId, path)
+	secondKey, secondOk := smtpFlowKeyForOwnerPath(secondOwnerId, path)
+	if !firstOk || !secondOk {
+		t.Fatal("could not build server teardown flow keys")
+	}
+
+	guard.stateLock.Lock()
+	defer guard.stateLock.Unlock()
+	if _, ok := guard.flows[firstKey]; ok {
+		t.Fatal("server FIN retained the matching owner flow")
+	}
+	if flow := guard.flows[secondKey]; flow == nil || !flow.secure {
+		t.Fatal("server FIN retired another owner's identical tuple")
+	}
+}
+
+func TestProviderTcpFlowCloseRetiresSmtpAndDmcaState(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	policy := Reverse(DefaultSecurityPolicy(ctx))
+	provider := &RemoteUserNatProvider{securityPolicy: policy}
+	senderClientId := NewId()
+	source := SourceId(senderClientId)
+
+	smtpPath := smtpTestPath(46005, smtpImplicitTlsPort, 10900)
+	requireSmtpVerdict(t, smtpEgressAllow, provider.smtpIngressGuard.inspectForOwner(
+		senderClientId,
+		smtpPath,
+		smtpTestClientHello,
+	))
+	dmcaIpPath := dmcaPath(IpProtocolTcp, 46006, 50000, false)
+	result, err := inspectAndRefreshIngressForSenderBorrowed(
+		policy,
+		senderClientId,
+		protocol.ProvideMode_Public,
+		*dmcaIpPath,
+		[]byte("GET / HTTP/1.1\r\n\r\n"),
+	)
+	if err != nil || result != SecurityPolicyResultAllow {
+		t.Fatalf("provider DMCA setup result = (%d, %v), want allow", result, err)
+	}
+	provider.tcpFlowClosed(source, smtpPath)
+	provider.tcpFlowClosed(source, dmcaIpPath)
+
+	provider.smtpIngressGuard.stateLock.Lock()
+	smtpFlowCount := len(provider.smtpIngressGuard.flows)
+	provider.smtpIngressGuard.stateLock.Unlock()
+	if smtpFlowCount != 0 {
+		t.Fatalf("provider TCP close retained %d SMTP flows, want 0", smtpFlowCount)
+	}
+	flowCounter := policy.(interface{ Testing_FlowCount() int })
+	if dmcaFlowCount := flowCounter.Testing_FlowCount(); dmcaFlowCount != 0 {
+		t.Fatalf("provider TCP close retained %d DMCA flows, want 0", dmcaFlowCount)
+	}
+}
+
+func TestProviderAuthenticatedDisconnectRetiresOnlySenderState(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	policy := Reverse(DefaultSecurityPolicy(ctx))
+	provider := &RemoteUserNatProvider{
+		securityPolicy:           policy,
+		sourceProvideMode:        map[Id]protocol.ProvideMode{},
+		sourceP2pPriorityRefresh: map[Id]time.Time{},
+	}
+	firstSenderClientId := NewId()
+	secondSenderClientId := NewId()
+	smtpPath := smtpTestPath(46007, smtpImplicitTlsPort, 10950)
+	dmcaIpPath := dmcaPath(IpProtocolTcp, 46008, 50000, false)
+	for _, senderClientId := range []Id{firstSenderClientId, secondSenderClientId} {
+		requireSmtpVerdict(t, smtpEgressAllow, provider.smtpIngressGuard.inspectForOwner(
+			senderClientId,
+			smtpPath,
+			smtpTestClientHello,
+		))
+		result, err := inspectAndRefreshIngressForSenderBorrowed(
+			policy,
+			senderClientId,
+			protocol.ProvideMode_Public,
+			*dmcaIpPath,
+			[]byte("GET / HTTP/1.1\r\n\r\n"),
+		)
+		if err != nil || result != SecurityPolicyResultAllow {
+			t.Fatalf("provider sender setup result = (%d, %v), want allow", result, err)
+		}
+		provider.sourceProvideMode[senderClientId] = protocol.ProvideMode_Public
+		provider.sourceP2pPriorityRefresh[senderClientId] = time.Unix(1700000000, 0)
+	}
+
+	disconnectTime := uint64(1700000000000)
+	disconnectFrame := RequireToFrameWithDefaultProtocolVersion(&protocol.NetworkPeersUpdate{
+		Peers: []*protocol.NetworkPeer{
+			{
+				ClientId:       firstSenderClientId.Bytes(),
+				DisconnectTime: &disconnectTime,
+			},
+		},
+	})
+	provider.ClientReceive(
+		SourceId(ControlId),
+		[]*protocol.Frame{disconnectFrame},
+		Peer{ProvideMode: protocol.ProvideMode_Network},
+	)
+
+	firstSmtpKey, firstOk := smtpFlowKeyForOwnerPath(firstSenderClientId, smtpPath)
+	secondSmtpKey, secondOk := smtpFlowKeyForOwnerPath(secondSenderClientId, smtpPath)
+	if !firstOk || !secondOk {
+		t.Fatal("could not build disconnect flow keys")
+	}
+	var firstSmtpPresent bool
+	var secondSmtpSecure bool
+	func() {
+		provider.smtpIngressGuard.stateLock.Lock()
+		defer provider.smtpIngressGuard.stateLock.Unlock()
+		_, firstSmtpPresent = provider.smtpIngressGuard.flows[firstSmtpKey]
+		secondSmtpFlow := provider.smtpIngressGuard.flows[secondSmtpKey]
+		secondSmtpSecure = secondSmtpFlow != nil && secondSmtpFlow.secure
+	}()
+	if firstSmtpPresent {
+		t.Fatal("authenticated disconnect retained the matching SMTP owner")
+	}
+	if !secondSmtpSecure {
+		t.Fatal("authenticated disconnect retired another SMTP owner")
+	}
+	flowCounter := policy.(interface{ Testing_FlowCount() int })
+	if dmcaFlowCount := flowCounter.Testing_FlowCount(); dmcaFlowCount != 1 {
+		t.Fatalf("authenticated disconnect retained %d DMCA flows, want other sender only", dmcaFlowCount)
+	}
+	var firstModePresent bool
+	var secondModePresent bool
+	var firstRefreshPresent bool
+	var secondRefreshPresent bool
+	func() {
+		provider.stateLock.Lock()
+		defer provider.stateLock.Unlock()
+		_, firstModePresent = provider.sourceProvideMode[firstSenderClientId]
+		_, secondModePresent = provider.sourceProvideMode[secondSenderClientId]
+		_, firstRefreshPresent = provider.sourceP2pPriorityRefresh[firstSenderClientId]
+		_, secondRefreshPresent = provider.sourceP2pPriorityRefresh[secondSenderClientId]
+	}()
+	if firstModePresent || firstRefreshPresent {
+		t.Fatal("authenticated disconnect retained matching provider sender metadata")
+	}
+	if !secondModePresent || !secondRefreshPresent {
+		t.Fatal("authenticated disconnect retired another sender's provider metadata")
+	}
+}
+
+func TestProviderReturnInspectionUsesPacketDirectionAndTeardown(t *testing.T) {
+	policy := &smtpReturnPathSecurityPolicy{}
+	provider := &RemoteUserNatProvider{securityPolicy: policy}
+	senderClientId := NewId()
+	outboundPath := smtpTestPath(47001, smtpImplicitTlsPort, 11000)
+	requireSmtpVerdict(t, smtpEgressAllow, provider.smtpIngressGuard.inspectForOwner(
+		senderClientId,
+		outboundPath,
+		smtpTestClientHello,
+	))
+
+	outboundPacket := smtpTestTcp4Packet(byte(tcpFlagAck), 11000, 12000, nil)
+	returnReset := tcpRstForPolicyReject(outboundPacket)
+	if returnReset == nil {
+		t.Fatal("could not build deterministic provider return reset")
+	}
+	defer MessagePoolReturn(returnReset)
+	result, err := provider.inspectReturnPacketsForSender(
+		senderClientId,
+		protocol.ProvideMode_Public,
+		[][]byte{returnReset},
+	)
+	if err != nil || result != SecurityPolicyResultAllow {
+		t.Fatalf("provider return inspection = (%d, %v), want allow", result, err)
+	}
+	for _, captured := range []struct {
+		name string
+		path IpPath
+	}{
+		{name: "inspection", path: policy.inspectPath},
+		{name: "refresh", path: policy.refreshPath},
+	} {
+		path := captured.path
+		if !path.SourceIp.Equal(net.IPv4(203, 0, 113, 10)) ||
+			path.SourcePort != smtpImplicitTlsPort ||
+			!path.DestinationIp.Equal(net.IPv4(10, 0, 0, 2)) ||
+			path.DestinationPort != 47001 || !path.Rst {
+			t.Fatalf("provider return %s path = %v, want server-to-client RST", captured.name, path)
+		}
+	}
+	provider.smtpIngressGuard.stateLock.Lock()
+	flowCount := len(provider.smtpIngressGuard.flows)
+	provider.smtpIngressGuard.stateLock.Unlock()
+	if flowCount != 0 {
+		t.Fatalf("provider return RST retained %d SMTP flows, want 0", flowCount)
+	}
+}
+
 func TestSmtpGuardNamespacesProviderFlowsBySource(t *testing.T) {
 	var guard smtpEgressGuard
 	firstSource := NewId()
@@ -443,15 +794,30 @@ func TestSmtpGuardNamespacesProviderFlowsBySource(t *testing.T) {
 	))
 }
 
-func TestSmtpGuardCapsProviderSynEntriesPerOwner(t *testing.T) {
+func TestSmtpGuardRejectsProviderOwnerOverflowWithoutEviction(t *testing.T) {
 	var guard smtpEgressGuard
 	ownerId := NewId()
-	for index := 0; index < smtpMaxOwnerFlowCount+1; index++ {
+	for index := 0; index < smtpMaxOwnerFlowCount; index++ {
 		requireSmtpVerdict(t, smtpEgressAllow, guard.inspectForOwner(
 			ownerId,
 			smtpTestSyn(18000+index, smtpImplicitTlsPort, uint32(index+1)),
 			nil,
 		))
+	}
+	firstPath := smtpTestSyn(18000, smtpImplicitTlsPort, 1)
+	firstKey, ok := smtpFlowKeyForOwnerPath(ownerId, firstPath)
+	if !ok {
+		t.Fatal("could not build first owner flow key")
+	}
+	overflowPath := smtpTestSyn(
+		18000+smtpMaxOwnerFlowCount,
+		smtpImplicitTlsPort,
+		uint32(smtpMaxOwnerFlowCount+1),
+	)
+	requireSmtpVerdict(t, smtpEgressReject, guard.inspectForOwner(ownerId, overflowPath, nil))
+	overflowKey, ok := smtpFlowKeyForOwnerPath(ownerId, overflowPath)
+	if !ok {
+		t.Fatal("could not build owner overflow flow key")
 	}
 
 	guard.stateLock.Lock()
@@ -465,59 +831,41 @@ func TestSmtpGuardCapsProviderSynEntriesPerOwner(t *testing.T) {
 	if ownerFlowCount != smtpMaxOwnerFlowCount {
 		t.Fatalf("provider owner retained %d SYN entries, want %d", ownerFlowCount, smtpMaxOwnerFlowCount)
 	}
+	if _, ok := guard.flows[firstKey]; !ok {
+		t.Fatal("owner overflow evicted an admitted flow")
+	}
+	if _, ok := guard.flows[overflowKey]; ok {
+		t.Fatal("owner overflow was admitted")
+	}
 }
 
-func TestSmtpGuardOwnerCapContainsFakeTlsFlood(t *testing.T) {
+func TestSmtpGuardDoesNotTrustClientHelloHeader(t *testing.T) {
 	var guard smtpEgressGuard
-	protectedOwnerId := NewId()
-	noisyOwnerId := NewId()
-	protectedPath := smtpTestPath(19000, smtpImplicitTlsPort, 1000)
+	ownerId := NewId()
+	path := smtpTestPath(19000, smtpImplicitTlsPort, 1000)
+	headerBytes := smtpTlsRecordHeaderBytes + smtpTlsHandshakeHeaderBytes
 	requireSmtpVerdict(t, smtpEgressAllow, guard.inspectForOwner(
-		protectedOwnerId,
-		protectedPath,
-		smtpTestClientHello,
+		ownerId,
+		path,
+		smtpTestClientHello[:headerBytes],
 	))
-	protectedKey, ok := smtpFlowKeyForOwnerPath(protectedOwnerId, protectedPath)
+	key, ok := smtpFlowKeyForOwnerPath(ownerId, path)
 	if !ok {
-		t.Fatal("could not build protected SMTP flow key")
+		t.Fatal("could not build incomplete ClientHello flow key")
 	}
-
-	// Reproduce the reported 2,048-packet fill: SYN followed by the minimal
-	// nine-byte prefix that makes an entry look like established TLS. Without
-	// an owner cap, the protected flow is the oldest secure eviction candidate.
-	for index := 0; index < smtpMaxFlowCount; index++ {
-		sourcePort := 20000 + index
-		sequence := uint32(20000 + index*16)
-		requireSmtpVerdict(t, smtpEgressAllow, guard.inspectForOwner(
-			noisyOwnerId,
-			smtpTestSyn(sourcePort, smtpImplicitTlsPort, sequence),
-			nil,
-		))
-		requireSmtpVerdict(t, smtpEgressAllow, guard.inspectForOwner(
-			noisyOwnerId,
-			smtpTestPath(sourcePort, smtpImplicitTlsPort, sequence+1),
-			smtpTestClientHello[:smtpTlsClientHelloPrefixBytes],
-		))
-	}
-
 	guard.stateLock.Lock()
-	defer guard.stateLock.Unlock()
-	protectedFlow, ok := guard.flows[protectedKey]
-	if !ok || !protectedFlow.secure {
-		t.Fatal("one provider owner evicted another owner's established TLS flow")
+	flow := guard.flows[key]
+	secure := flow != nil && flow.secure
+	guard.stateLock.Unlock()
+	if secure {
+		t.Fatal("nine-byte TLS/handshake header marked an incomplete ClientHello secure")
 	}
-	noisyFlowCount := 0
-	for key := range guard.flows {
-		if key.ownerId == noisyOwnerId {
-			noisyFlowCount += 1
-		}
-	}
-	if noisyFlowCount != smtpMaxOwnerFlowCount {
-		t.Fatalf("noisy owner retained %d fake-TLS entries, want %d", noisyFlowCount, smtpMaxOwnerFlowCount)
-	}
-	if len(guard.flows) != smtpMaxOwnerFlowCount+1 {
-		t.Fatalf("provider table retained %d flows, want %d", len(guard.flows), smtpMaxOwnerFlowCount+1)
-	}
+	malformedBody := make([]byte, len(smtpTestClientHello)-headerBytes)
+	requireSmtpVerdict(t, smtpEgressReject, guard.inspectForOwner(
+		ownerId,
+		smtpTestPath(19000, smtpImplicitTlsPort, 1000+uint32(headerBytes)),
+		malformedBody,
+	))
 }
 
 func TestSmtpGuardIdleTimeoutExpiresSecureTuple(t *testing.T) {
@@ -585,39 +933,61 @@ func TestSmtpGuardIdleReaperKeepsRecentlyActiveFlow(t *testing.T) {
 
 func TestSmtpGuardBoundsFlowTable(t *testing.T) {
 	var guard smtpEgressGuard
-	for index := 0; index < smtpMaxFlowCount+1; index++ {
+	for index := 0; index < smtpMaxFlowCount; index++ {
 		requireSmtpVerdict(t, smtpEgressAllow, guard.inspect(
 			smtpTestSyn(10000+index, smtpImplicitTlsPort, uint32(index+1)), nil,
 		))
 	}
+	firstPath := smtpTestSyn(10000, smtpImplicitTlsPort, 1)
+	firstKey, ok := smtpFlowKeyForOwnerPath(Id{}, firstPath)
+	if !ok {
+		t.Fatal("could not build first global flow key")
+	}
+	overflowPath := smtpTestSyn(10000+smtpMaxFlowCount, smtpImplicitTlsPort, smtpMaxFlowCount+1)
+	requireSmtpVerdict(t, smtpEgressReject, guard.inspect(overflowPath, nil))
 	guard.stateLock.Lock()
 	defer guard.stateLock.Unlock()
 	if len(guard.flows) != smtpMaxFlowCount {
 		t.Fatalf("SMTP flow table size = %d, want %d", len(guard.flows), smtpMaxFlowCount)
 	}
+	if _, ok := guard.flows[firstKey]; !ok {
+		t.Fatal("global overflow evicted an admitted flow")
+	}
 }
 
-func TestSmtpGuardEvictsNegotiatingFlowBeforeSecureFlow(t *testing.T) {
-	guard := smtpEgressGuard{
-		flows: make(map[smtpFlowKey]*smtpFlowState, smtpMaxFlowCount),
+func TestSmtpGuardRejectsGlobalOwnerOverflowWithoutEviction(t *testing.T) {
+	var guard smtpEgressGuard
+	ownerCount := smtpMaxFlowCount / smtpMaxOwnerFlowCount
+	ownerIds := make([]Id, ownerCount)
+	for ownerIndex := range ownerIds {
+		ownerIds[ownerIndex] = NewId()
 	}
-	for index := 0; index < smtpMaxFlowCount-1; index++ {
-		key := smtpFlowKey{sourcePort: uint16(index + 1)}
-		guard.flows[key] = &smtpFlowState{secure: true, lastUsed: 1}
+	for index := 0; index < smtpMaxFlowCount; index++ {
+		ownerId := ownerIds[index/smtpMaxOwnerFlowCount]
+		requireSmtpVerdict(t, smtpEgressAllow, guard.inspectForOwner(
+			ownerId,
+			smtpTestPath(20000+index, smtpImplicitTlsPort, uint32(index+1)),
+			smtpTestClientHello,
+		))
 	}
-	negotiatingKey := smtpFlowKey{sourcePort: uint16(smtpMaxFlowCount)}
-	guard.flows[negotiatingKey] = &smtpFlowState{lastUsed: 2}
-	newKey := smtpFlowKey{sourcePort: uint16(smtpMaxFlowCount + 1)}
+	protectedPath := smtpTestPath(20000, smtpImplicitTlsPort, 1)
+	protectedKey, ok := smtpFlowKeyForOwnerPath(ownerIds[0], protectedPath)
+	if !ok {
+		t.Fatal("could not build protected global flow key")
+	}
+	overflowOwnerId := NewId()
+	overflowPath := smtpTestSyn(20000+smtpMaxFlowCount, smtpImplicitTlsPort, 50000)
+	requireSmtpVerdict(t, smtpEgressReject, guard.inspectForOwner(
+		overflowOwnerId,
+		overflowPath,
+		nil,
+	))
 
 	guard.stateLock.Lock()
-	guard.newFlowWithLock(newKey, smtpImplicitTlsPort, time.Unix(1, 0))
-	guard.stateLock.Unlock()
-
-	if _, ok := guard.flows[negotiatingKey]; ok {
-		t.Fatal("negotiating SMTP flow survived eviction ahead of established TLS flows")
-	}
-	if _, ok := guard.flows[newKey]; !ok {
-		t.Fatal("new SMTP flow was not added after eviction")
+	defer guard.stateLock.Unlock()
+	protectedFlow := guard.flows[protectedKey]
+	if protectedFlow == nil || !protectedFlow.secure {
+		t.Fatal("global overflow evicted an admitted secure flow")
 	}
 	if len(guard.flows) != smtpMaxFlowCount {
 		t.Fatalf("SMTP flow table size = %d, want %d", len(guard.flows), smtpMaxFlowCount)

@@ -6553,6 +6553,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePackets(
 		packet := packets[i]
 
 		// mirror clientReceivePacket's pre-delivery pipeline exactly
+		self.smtpEgressGuard.retireReturn(ipPath)
 		r, err := self.securityPolicy.InspectIngress(provideMode, ipPath, nil)
 		if err != nil {
 			continue
@@ -6600,6 +6601,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 	ipPath *IpPath,
 	packet []byte,
 ) {
+	self.smtpEgressGuard.retireReturn(ipPath)
 	r, err := self.securityPolicy.InspectIngress(provideMode, ipPath, nil)
 	if err != nil {
 		return

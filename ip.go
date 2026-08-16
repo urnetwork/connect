@@ -103,6 +103,10 @@ type receiveTransferPacketsBatchFunction func(
 	packets [][]byte,
 ) (batched bool)
 
+// Internal TCP lifecycle delivery carries the authenticated source and the
+// canonical outbound tuple. Both are borrowed for the call.
+type tcpFlowCloseFunction func(source TransferPath, ipPath *IpPath)
+
 // A flow's authenticated source is immutable while its receiver-visible reply
 // lane may change. Keeping both under one lock prevents a callback from
 // observing a source with another update's lane.
@@ -600,6 +604,9 @@ type LocalUserNat struct {
 	receivePacketsCallbacks *CallbackList[ReceivePacketsFunction]
 	// provider batch callback that retains the transfer lane
 	receiveTransferPacketsCallbacks *CallbackList[receiveTransferPacketsFunction]
+	// TCP completion includes teardown, socket failure, capacity retirement,
+	// and idle timeout.
+	tcpFlowCloseCallbacks *CallbackList[tcpFlowCloseFunction]
 
 	// Test-only completed-disposition edge. Nil is a production no-op.
 	afterSendPacketForTest func()
@@ -651,6 +658,7 @@ func NewLocalUserNat(ctx context.Context, clientTag string, settings *LocalUserN
 		receiveTransferCallbacks:        NewCallbackList[receiveTransferPacketFunction](),
 		receivePacketsCallbacks:         NewCallbackList[ReceivePacketsFunction](),
 		receiveTransferPacketsCallbacks: NewCallbackList[receiveTransferPacketsFunction](),
+		tcpFlowCloseCallbacks:           NewCallbackList[tcpFlowCloseFunction](),
 	}
 	go HandleError(localUserNat.Run)
 
@@ -877,6 +885,23 @@ func (self *LocalUserNat) addReceiveTransferPacketsCallback(
 	}
 }
 
+// addTcpFlowCloseCallback registers an internal provider lifecycle consumer.
+func (self *LocalUserNat) addTcpFlowCloseCallback(callback tcpFlowCloseFunction) func() {
+	callbackId := self.tcpFlowCloseCallbacks.Add(callback)
+	return func() {
+		self.tcpFlowCloseCallbacks.Remove(callbackId)
+	}
+}
+
+// closeTcpFlow delivers one synchronous, nonblocking lifecycle edge.
+func (self *LocalUserNat) closeTcpFlow(source TransferPath, ipPath *IpPath) {
+	for _, callback := range self.tcpFlowCloseCallbacks.Get() {
+		HandleError(func() {
+			callback(source, ipPath)
+		})
+	}
+}
+
 func (self *LocalUserNat) Run() {
 	defer self.cancel()
 
@@ -1028,6 +1053,8 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 	udp6Buffer := newUdp6BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.UdpBufferSettings)
 	tcp4Buffer := newTcp4BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.TcpBufferSettings)
 	tcp6Buffer := newTcp6BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.TcpBufferSettings)
+	tcp4Buffer.flowCloseCallback = self.closeTcpFlow
+	tcp6Buffer.flowCloseCallback = self.closeTcpFlow
 	icmp4Buffer := newIcmp4BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.IcmpBufferSettings)
 	icmp6Buffer := newIcmp6BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.IcmpBufferSettings)
 	// the per-flow read-loops route their drained batch through
@@ -2842,6 +2869,7 @@ type TcpBuffer[BufferId comparable] struct {
 	receiveCallback                receiveTransferPacketFunction
 	receiveTransferPacketsCallback receiveTransferPacketsBatchFunction
 	tcpBufferSettings              *TcpBufferSettings
+	flowCloseCallback              tcpFlowCloseFunction
 
 	mutex sync.Mutex
 
@@ -3033,6 +3061,7 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 			self.tcpBufferSettings,
 		)
 		sequence.receiveTransferPacketsCallback = self.receiveTransferPacketsCallback
+		sequence.flowCloseCallback = self.flowCloseCallback
 		self.sequences[bufferId] = sequence
 		sourceSequences := self.sourceSequences[source]
 		if sourceSequences == nil {
@@ -3042,9 +3071,9 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 		sourceSequences[bufferId] = sequence
 		go HandleError(func() {
 			defer func() {
+				sequence.Close()
 				self.mutex.Lock()
 				defer self.mutex.Unlock()
-				sequence.Close()
 				// clean up
 				if sequence == self.sequences[bufferId] {
 					delete(self.sequences, bufferId)
@@ -3240,6 +3269,9 @@ type TcpSequence struct {
 	// immutable generation identity used to distinguish a retransmitted SYN
 	// from four-tuple reuse while the previous flow is still being reaped
 	initialSynSeq uint32
+	flowCloseOnce sync.Once
+	// Called once after Run and its child workers release the socket lifecycle.
+	flowCloseCallback tcpFlowCloseFunction
 
 	// Tests observe exact reorder decisions without using negative socket-read
 	// timeouts. The callback must not block; nil is a production no-op.
@@ -4519,7 +4551,12 @@ func (self *TcpSequence) Cancel() {
 }
 
 func (self *TcpSequence) Close() {
-	self.cancel()
+	self.flowCloseOnce.Do(func() {
+		self.cancel()
+		if self.flowCloseCallback != nil {
+			self.flowCloseCallback(self.source, self.ipPath)
+		}
+	})
 }
 
 type TcpSendItem struct {
@@ -5240,9 +5277,13 @@ func NewRemoteUserNatProvider(
 	localUserNatPacketUnsub := localUserNat.addReceiveTransferPacketCallback(
 		userNatProvider.receiveTransferWithRecovery,
 	)
+	localUserNatFlowCloseUnsub := localUserNat.addTcpFlowCloseCallback(
+		userNatProvider.tcpFlowClosed,
+	)
 	localUserNatUnsub := func() {
 		localUserNatBatchUnsub()
 		localUserNatPacketUnsub()
+		localUserNatFlowCloseUnsub()
 	}
 	userNatProvider.localUserNatUnsub = localUserNatUnsub
 	clientUnsub := client.AddReceiveCallback(userNatProvider.ClientReceive)
@@ -5250,6 +5291,52 @@ func NewRemoteUserNatProvider(
 	context.AfterFunc(cancelCtx, userNatProvider.Close)
 
 	return userNatProvider
+}
+
+// tcpFlowClosed retires policy state when the provider NAT releases the actual
+// upstream TCP lifecycle, including failures without an observed FIN/RST.
+func (self *RemoteUserNatProvider) tcpFlowClosed(source TransferPath, ipPath *IpPath) {
+	senderClientId := source.LocalMask().SourceId
+	self.smtpIngressGuard.retireForOwner(senderClientId, ipPath)
+	retireIngressSecurityFlowForSender(self.securityPolicy, senderClientId, ipPath)
+}
+
+// Purges all state for a sender after an authenticated platform disconnect.
+func (self *RemoteUserNatProvider) senderDisconnected(senderClientId Id) {
+	self.smtpIngressGuard.retireOwner(senderClientId)
+	retireSecuritySender(self.securityPolicy, senderClientId)
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		delete(self.sourceProvideMode, senderClientId)
+		delete(self.sourceP2pPriorityRefresh, senderClientId)
+	}()
+}
+
+// Applies the authoritative disconnect markers delivered on the control path.
+func (self *RemoteUserNatProvider) retireDisconnectedSenders(frames []*protocol.Frame) {
+	for _, frame := range frames {
+		if frame.MessageType != protocol.MessageType_TransferNetworkPeersUpdate {
+			continue
+		}
+		message, err := FromFrame(frame)
+		if err != nil {
+			continue
+		}
+		update, ok := message.(*protocol.NetworkPeersUpdate)
+		if !ok {
+			continue
+		}
+		for _, networkPeer := range update.Peers {
+			if networkPeer.DisconnectTime == nil {
+				continue
+			}
+			senderClientId, err := IdFromBytes(networkPeer.ClientId)
+			if err == nil {
+				self.senderDisconnected(senderClientId)
+			}
+		}
+	}
 }
 
 // startReturnSenders creates fixed-capacity datagram shards before callbacks
@@ -5886,6 +5973,37 @@ func (self *RemoteUserNatProvider) receiveTransferBatch(
 	)
 }
 
+// inspectReturnPacketsForSender evaluates actual server-to-client packet
+// paths. LocalUserNat's callback path is the canonical outbound identity and
+// intentionally does not contain return-direction endpoints or teardown flags.
+func (self *RemoteUserNatProvider) inspectReturnPacketsForSender(
+	senderClientId Id,
+	provideMode protocol.ProvideMode,
+	packets [][]byte,
+) (SecurityPolicyResult, error) {
+	var returnIpPath *IpPath
+	for _, packet := range packets {
+		packetIpPath, err := ParseIpPath(packet)
+		if err != nil {
+			return SecurityPolicyResultDrop, err
+		}
+		if returnIpPath == nil {
+			returnIpPath = packetIpPath
+		}
+		self.smtpIngressGuard.retireReturnForOwner(senderClientId, packetIpPath)
+	}
+	if returnIpPath == nil {
+		return SecurityPolicyResultDrop, errors.New("empty provider return packet group")
+	}
+	return inspectAndRefreshEgressForSenderBorrowed(
+		self.securityPolicy,
+		senderClientId,
+		provideMode,
+		*returnIpPath,
+		nil,
+	)
+}
+
 // Returns a keyed NAT batch without dropping its explicit recovery owner.
 func (self *RemoteUserNatProvider) receiveTransferBatchWithRecovery(
 	source TransferPath,
@@ -5923,12 +6041,16 @@ func (self *RemoteUserNatProvider) receiveTransferBatchWithRecovery(
 		}
 		return
 	}
-	// flow-level egress policy (ipPath is constant across the batch)
-	r, err := self.securityPolicy.InspectEgress(provideMode, ipPath, nil)
+	// Every member has the same reverse tuple. Scan all members so a trailing
+	// FIN/RST retires SMTP state before the flow-level policy decision.
+	r, err := self.inspectReturnPacketsForSender(
+		source.SourceId,
+		provideMode,
+		packets,
+	)
 	if err != nil {
 		return
 	}
-	self.securityPolicy.RefreshEgress(ipPath)
 	if r != SecurityPolicyResultAllow {
 		var blockedBytes int64
 		for _, packet := range packets {
@@ -6001,15 +6123,17 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecovery(
 		}
 		return
 	}
-
 	// the provider's egress is the return into the tunnel (destination->client); the reversed
 	// provider policy applies the client-ingress source check here, then refreshes the flow so an
 	// active download isn't reclaimed while the outbound side is quiet
-	r, err := self.securityPolicy.InspectEgress(provideMode, ipPath, nil)
+	r, err := self.inspectReturnPacketsForSender(
+		source.SourceId,
+		provideMode,
+		[][]byte{packet},
+	)
 	if err != nil {
 		return
 	}
-	self.securityPolicy.RefreshEgress(ipPath)
 	if r != SecurityPolicyResultAllow {
 		self.packetStatsCounters.blockEgressPacketCount.Add(1)
 		self.packetStatsCounters.blockEgressByteCount.Add(int64(len(packet)))
@@ -6038,6 +6162,10 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecovery(
 func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*protocol.Frame, peer Peer) {
 	// receive functions should be non-blocking
 	// clients should manage their own congestion protocols on top to avoid overflowing the sequence queues
+	if source.IsControlSource() {
+		self.retireDisconnectedSenders(frames)
+		return
+	}
 	source = source.LocalMask()
 	transferKey := peer.TransferKey
 
@@ -6146,7 +6274,13 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 				}
 				// the provider's ingress is the remote client's egress (outbound, received from the
 				// tunnel); the reversed provider policy applies the client-egress DPI here
-				r, err := inspectAndRefreshIngressBorrowed(self.securityPolicy, provideMode, ipPath, payload)
+				r, err := inspectAndRefreshIngressForSenderBorrowed(
+					self.securityPolicy,
+					source.SourceId,
+					provideMode,
+					ipPath,
+					payload,
+				)
 				if err == nil {
 					switch r {
 					case SecurityPolicyResultAllow:
@@ -6444,6 +6578,7 @@ func (self *RemoteUserNatClient) ClientReceive(source TransferPath, frames []*pr
 
 			ipPath, err := ParseIpPath(packet)
 			if err == nil {
+				self.smtpEgressGuard.retireReturn(ipPath)
 				self.securityPolicy.RefreshIngress(ipPath)
 				HandleError(func() {
 					self.receivePacketCallback(

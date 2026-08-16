@@ -18,16 +18,20 @@ var errSmtpEncryptionRequired = errors.New("SMTP encryption required")
 // ClientHello; port 587 may send only bounded SMTP negotiation until STARTTLS
 // is immediately followed by a TLS ClientHello.
 const (
-	smtpLocalPort                 = 25
-	smtpImplicitTlsPort           = 465
-	smtpStartTlsPort              = 587
-	smtpTlsClientHelloPrefixBytes = 9
-	smtpMaxNegotiationBytes       = 2048
-	smtpMaxCommandLineBytes       = 510 // RFC 5321's 512 includes CRLF.
-	smtpMaxFlowCount              = 1024
-	smtpMaxOwnerFlowCount         = 128
-	smtpFlowIdleTimeout           = 10 * time.Minute
-	smtpFlowIdleReapInterval      = time.Minute
+	smtpLocalPort                  = 25
+	smtpImplicitTlsPort            = 465
+	smtpStartTlsPort               = 587
+	smtpTlsRecordHeaderBytes       = 5
+	smtpTlsHandshakeHeaderBytes    = 4
+	smtpMaxTlsRecordBytes          = 16 * 1024
+	smtpMaxTlsClientHelloBodyBytes = 64 * 1024
+	smtpMaxTlsClientHelloWireBytes = 68 * 1024
+	smtpMaxNegotiationBytes        = 2048
+	smtpMaxCommandLineBytes        = 510 // RFC 5321's 512 includes CRLF.
+	smtpMaxFlowCount               = 1024
+	smtpMaxOwnerFlowCount          = 128
+	smtpFlowIdleTimeout            = 5 * time.Minute
+	smtpFlowIdleReapInterval       = time.Minute
 )
 
 type smtpEgressVerdict uint8
@@ -37,6 +41,14 @@ const (
 	smtpEgressAllow
 	smtpEgressReject
 )
+
+// Carries the verdict plus one-shot state transitions for in-package
+// diagnostics without coupling enforcement to any telemetry format.
+type smtpEgressInspection struct {
+	verdict        smtpEgressVerdict
+	becameSecure   bool
+	becameRejected bool
+}
 
 func smtpRoutesLocally(ipPath *IpPath) bool {
 	return ipPath != nil &&
@@ -106,6 +118,45 @@ func smtpFlowKeyForOwnerPath(ownerId Id, ipPath *IpPath) (smtpFlowKey, bool) {
 	return key, true
 }
 
+// retireForOwner removes one outbound tuple after its transport lifecycle ends.
+func (self *smtpEgressGuard) retireForOwner(ownerId Id, ipPath *IpPath) {
+	if !smtpNeedsEncryptionInspection(ipPath) {
+		return
+	}
+	key, ok := smtpFlowKeyForOwnerPath(ownerId, ipPath)
+	if !ok {
+		return
+	}
+	self.stateLock.Lock()
+	delete(self.flows, key)
+	self.stateLock.Unlock()
+}
+
+// retireReturnForOwner maps a server-side FIN/RST back to its outbound tuple.
+func (self *smtpEgressGuard) retireReturnForOwner(ownerId Id, ipPath *IpPath) {
+	if ipPath == nil || ipPath.Protocol != IpProtocolTcp ||
+		(!ipPath.Fin && !ipPath.Rst) {
+		return
+	}
+	self.retireForOwner(ownerId, ipPath.Reverse())
+}
+
+// retireReturn is the single-owner client-side form.
+func (self *smtpEgressGuard) retireReturn(ipPath *IpPath) {
+	self.retireReturnForOwner(Id{}, ipPath)
+}
+
+// retireOwner removes every tuple owned by an authenticated provider sender.
+func (self *smtpEgressGuard) retireOwner(ownerId Id) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	for key := range self.flows {
+		if key.ownerId == ownerId {
+			delete(self.flows, key)
+		}
+	}
+}
+
 type smtp587Phase uint8
 
 const (
@@ -148,7 +199,7 @@ type smtpEgressGuard struct {
 }
 
 func (self *smtpEgressGuard) inspect(ipPath *IpPath, payload []byte) smtpEgressVerdict {
-	return self.inspectForOwner(Id{}, ipPath, payload)
+	return self.inspectForOwnerResult(Id{}, ipPath, payload).verdict
 }
 
 // inspectForOwner is the provider-side form of inspect. The authenticated
@@ -159,12 +210,24 @@ func (self *smtpEgressGuard) inspectForOwner(
 	ipPath *IpPath,
 	payload []byte,
 ) smtpEgressVerdict {
+	return self.inspectForOwnerResult(ownerId, ipPath, payload).verdict
+}
+
+// Performs one atomic state-machine step and reports any new terminal state.
+func (self *smtpEgressGuard) inspectForOwnerResult(
+	ownerId Id,
+	ipPath *IpPath,
+	payload []byte,
+) smtpEgressInspection {
 	if !smtpNeedsEncryptionInspection(ipPath) {
-		return smtpEgressNotApplicable
+		return smtpEgressInspection{verdict: smtpEgressNotApplicable}
 	}
 	key, ok := smtpFlowKeyForOwnerPath(ownerId, ipPath)
 	if !ok {
-		return smtpEgressReject
+		return smtpEgressInspection{
+			verdict:        smtpEgressReject,
+			becameRejected: true,
+		}
 	}
 
 	self.stateLock.Lock()
@@ -177,7 +240,7 @@ func (self *smtpEgressGuard) inspectForOwner(
 	self.reapIdleFlowsWithLock(now)
 	if ipPath.Rst {
 		delete(self.flows, key)
-		return smtpEgressAllow
+		return smtpEgressInspection{verdict: smtpEgressAllow}
 	}
 	if ipPath.Fin {
 		// A FIN may carry the last payload bytes, so inspect it before retiring
@@ -190,34 +253,60 @@ func (self *smtpEgressGuard) inspectForOwner(
 	if ipPath.Syn {
 		segmentSequence += 1
 		if flow == nil || !flow.synSeen || flow.synSeq != ipPath.SequenceNumber {
-			flow = self.newFlowWithLock(key, ipPath.DestinationPort, now)
+			var admitted bool
+			flow, admitted = self.newFlowWithLock(key, ipPath.DestinationPort, now)
+			if !admitted {
+				return smtpEgressInspection{
+					verdict:        smtpEgressReject,
+					becameRejected: true,
+				}
+			}
 			flow.synSeen = true
 			flow.synSeq = ipPath.SequenceNumber
 			flow.baseSequence = segmentSequence
 			flow.baseSet = true
 		}
 	} else if flow == nil {
-		flow = self.newFlowWithLock(key, ipPath.DestinationPort, now)
+		var admitted bool
+		flow, admitted = self.newFlowWithLock(key, ipPath.DestinationPort, now)
+		if !admitted {
+			return smtpEgressInspection{
+				verdict:        smtpEgressReject,
+				becameRejected: true,
+			}
+		}
 	}
 
 	self.clock += 1
 	flow.lastUsed = self.clock
 	flow.lastUsedTime = now
 	if flow.rejected {
-		return smtpEgressReject
+		return smtpEgressInspection{verdict: smtpEgressReject}
 	}
 	if len(payload) == 0 {
-		return smtpEgressAllow
+		return smtpEgressInspection{verdict: smtpEgressAllow}
 	}
 	if !flow.baseSet {
 		flow.baseSequence = segmentSequence
 		flow.baseSet = true
 	}
+	wasSecure := flow.secure
 	if !flow.inspectPayload(segmentSequence, payload) {
+		flow.stream = nil
+		flow.parseOffset = 0
 		flow.rejected = true
-		return smtpEgressReject
+		return smtpEgressInspection{
+			verdict:        smtpEgressReject,
+			becameRejected: true,
+		}
 	}
-	return smtpEgressAllow
+	if !wasSecure && flow.secure {
+		return smtpEgressInspection{
+			verdict:      smtpEgressAllow,
+			becameSecure: true,
+		}
+	}
+	return smtpEgressInspection{verdict: smtpEgressAllow}
 }
 
 // currentTimeWithLock returns the guard's time source. Caller holds stateLock.
@@ -256,71 +345,28 @@ func (self *smtpEgressGuard) ownerFlowCountWithLock(ownerId Id) int {
 	return count
 }
 
-// evictOldestFlowWithLock removes one eligible flow, preferring rejected or
-// negotiating state over an established TLS marker. When ownerOnly is true,
-// no other authenticated client's flow can be selected. Caller holds stateLock.
-func (self *smtpEgressGuard) evictOldestFlowWithLock(ownerId Id, ownerOnly bool) bool {
-	var oldestKey smtpFlowKey
-	var oldestUse uint64
-	found := false
-	for candidateKey, candidate := range self.flows {
-		if ownerOnly && candidateKey.ownerId != ownerId {
-			continue
-		}
-		if candidate.secure && !candidate.rejected {
-			continue
-		}
-		if !found || candidate.lastUsed < oldestUse {
-			oldestKey = candidateKey
-			oldestUse = candidate.lastUsed
-			found = true
-		}
-	}
-	if !found {
-		for candidateKey, candidate := range self.flows {
-			if ownerOnly && candidateKey.ownerId != ownerId {
-				continue
-			}
-			if !found || candidate.lastUsed < oldestUse {
-				oldestKey = candidateKey
-				oldestUse = candidate.lastUsed
-				found = true
-			}
-		}
-	}
-	if found {
-		delete(self.flows, oldestKey)
-	}
-	return found
-}
-
-// Allocates state while preserving the per-owner and whole-table bounds.
-// Caller holds stateLock and has already reaped idle flows.
+// Allocates state without evicting a live tuple. Overflow is rejected so one
+// sender, or a group of senders, cannot reset an admitted flow. Caller holds
+// stateLock and has already reaped idle flows.
 func (self *smtpEgressGuard) newFlowWithLock(
 	key smtpFlowKey,
 	destinationPort int,
 	now time.Time,
-) *smtpFlowState {
+) (*smtpFlowState, bool) {
 	_, replacing := self.flows[key]
 	if !replacing && key.ownerId != (Id{}) &&
 		smtpMaxOwnerFlowCount <= self.ownerFlowCountWithLock(key.ownerId) {
-		// A noisy provider client pays for its own next tuple, including when
-		// all of its entries have sent a minimal TLS-looking prefix.
-		self.evictOldestFlowWithLock(key.ownerId, true)
+		return nil, false
 	}
 	if !replacing && smtpMaxFlowCount <= len(self.flows) {
-		// Rejected and still-negotiating flows are expendable. Preserve an
-		// established TLS flow unless every entry in the bounded table is an
-		// active secure flow; losing its marker would make the next opaque TLS
-		// record look like a fresh plaintext negotiation.
-		self.evictOldestFlowWithLock(Id{}, false)
+		return nil, false
 	}
 	flow := &smtpFlowState{
 		destinationPort: destinationPort,
 		lastUsedTime:    now,
 	}
 	self.flows[key] = flow
-	return flow
+	return flow, true
 }
 
 func (self *smtpFlowState) inspectPayload(sequence uint32, payload []byte) bool {
@@ -329,7 +375,7 @@ func (self *smtpFlowState) inspectPayload(sequence uint32, payload []byte) bool 
 	}
 
 	// TCP serial arithmetic is safe here because the retained prefix is at
-	// most 2 KiB, far below the half-sequence-space ambiguity boundary.
+	// most about 70 KiB, far below the half-sequence-space ambiguity boundary.
 	relative := int64(int32(sequence - self.baseSequence))
 	if relative < 0 || int64(len(self.stream)) < relative {
 		// A gap cannot be forwarded safely: bytes hidden in the gap could turn
@@ -352,9 +398,9 @@ func (self *smtpFlowState) inspectPayload(sequence uint32, payload []byte) bool 
 	}
 
 	newBytes := payload[overlap:]
-	limit := smtpTlsClientHelloPrefixBytes
+	limit := smtpMaxTlsClientHelloWireBytes
 	if self.destinationPort == smtpStartTlsPort {
-		limit = smtpMaxNegotiationBytes
+		limit += smtpMaxNegotiationBytes
 	}
 	remainingCapacity := limit - len(self.stream)
 	retainedBytes := newBytes
@@ -366,7 +412,7 @@ func (self *smtpFlowState) inspectPayload(sequence uint32, payload []byte) bool 
 	var valid bool
 	switch self.destinationPort {
 	case smtpImplicitTlsPort:
-		valid, self.secure = tlsClientHelloStreamPrefix(self.stream)
+		valid, self.secure = tlsClientHelloStream(self.stream)
 	case smtpStartTlsPort:
 		valid, self.secure = self.inspect587Stream()
 	default:
@@ -383,56 +429,154 @@ func (self *smtpFlowState) inspectPayload(sequence uint32, payload []byte) bool 
 	return valid && len(retainedBytes) == len(newBytes)
 }
 
-// tlsClientHelloStreamPrefix validates the TLS record header and handshake
-// header as bytes arrive. A complete prefix is nine bytes: TLS Handshake,
-// legacy record version, a sane non-empty record, ClientHello, and a sane
-// ClientHello body length. The ClientHello body may span TLS records.
-func tlsClientHelloStreamPrefix(stream []byte) (valid bool, complete bool) {
-	if smtpTlsClientHelloPrefixBytes < len(stream) {
-		stream = stream[:smtpTlsClientHelloPrefixBytes]
-	}
-	for index, value := range stream {
+// tlsHandshakeRecordHeaderPrefix validates an incomplete or complete TLS
+// Handshake record header.
+func tlsHandshakeRecordHeaderPrefix(header []byte) bool {
+	for index, value := range header {
 		switch index {
 		case 0:
-			if value != 0x16 { // Handshake record.
-				return false, false
+			if value != 0x16 {
+				return false
 			}
 		case 1:
 			if value != 0x03 {
-				return false, false
+				return false
 			}
 		case 2:
 			if value < 0x01 || 0x04 < value {
-				return false, false
-			}
-		case 5:
-			if value != 0x01 { // ClientHello handshake message.
-				return false, false
+				return false
 			}
 		}
 	}
-	if 5 <= len(stream) {
-		recordBytes := int(binary.BigEndian.Uint16(stream[3:5]))
-		if recordBytes < 4 || 1<<14 < recordBytes {
-			return false, false
+	if smtpTlsRecordHeaderBytes <= len(header) {
+		recordBytes := int(binary.BigEndian.Uint16(header[3:5]))
+		if recordBytes == 0 || smtpMaxTlsRecordBytes < recordBytes {
+			return false
 		}
 	}
-	if len(stream) < smtpTlsClientHelloPrefixBytes {
-		return true, false
+	return true
+}
+
+// validTlsClientHelloBody validates every length-delimited field in a complete
+// ClientHello, including the extension vector and duplicate-extension rule.
+func validTlsClientHelloBody(body []byte) bool {
+	if len(body) < 41 || body[0] != 0x03 || body[1] < 0x01 || 0x03 < body[1] {
+		return false
 	}
-	handshakeBytes := int(stream[6])<<16 | int(stream[7])<<8 | int(stream[8])
-	// 41 bytes is the minimum ClientHello body (legacy version, random,
-	// empty session id, one cipher suite, and one compression method).
-	if handshakeBytes < 41 || 1<<20 < handshakeBytes {
+	offset := 2 + 32
+	sessionIdBytes := int(body[offset])
+	offset += 1
+	if 32 < sessionIdBytes || len(body) < offset+sessionIdBytes+2 {
+		return false
+	}
+	offset += sessionIdBytes
+	cipherSuiteBytes := int(binary.BigEndian.Uint16(body[offset : offset+2]))
+	offset += 2
+	if cipherSuiteBytes < 2 || cipherSuiteBytes%2 != 0 || len(body) < offset+cipherSuiteBytes+1 {
+		return false
+	}
+	offset += cipherSuiteBytes
+	compressionMethodBytes := int(body[offset])
+	offset += 1
+	if compressionMethodBytes == 0 || len(body) < offset+compressionMethodBytes {
+		return false
+	}
+	offset += compressionMethodBytes
+	if offset == len(body) {
+		return true
+	}
+	if len(body) < offset+2 {
+		return false
+	}
+	extensionBytes := int(binary.BigEndian.Uint16(body[offset : offset+2]))
+	offset += 2
+	if extensionBytes != len(body)-offset {
+		return false
+	}
+	extensionTypes := map[uint16]bool{}
+	for offset < len(body) {
+		if len(body) < offset+4 {
+			return false
+		}
+		extensionType := binary.BigEndian.Uint16(body[offset : offset+2])
+		extensionDataBytes := int(binary.BigEndian.Uint16(body[offset+2 : offset+4]))
+		offset += 4
+		if extensionTypes[extensionType] || len(body) < offset+extensionDataBytes {
+			return false
+		}
+		extensionTypes[extensionType] = true
+		offset += extensionDataBytes
+	}
+	return true
+}
+
+// tlsClientHelloStream validates complete TLS records until a complete,
+// structurally valid ClientHello has arrived. Handshake bytes may span records;
+// both logical and wire sizes are bounded before the flow can become secure.
+func tlsClientHelloStream(stream []byte) (valid bool, complete bool) {
+	if smtpMaxTlsClientHelloWireBytes < len(stream) {
 		return false, false
 	}
-	return true, true
+	handshake := make([]byte, 0, min(len(stream), smtpMaxTlsClientHelloBodyBytes+smtpTlsHandshakeHeaderBytes))
+	for recordOffset := 0; ; {
+		remaining := stream[recordOffset:]
+		if len(remaining) < smtpTlsRecordHeaderBytes {
+			return tlsHandshakeRecordHeaderPrefix(remaining), false
+		}
+		header := remaining[:smtpTlsRecordHeaderBytes]
+		if !tlsHandshakeRecordHeaderPrefix(header) {
+			return false, false
+		}
+		recordBytes := int(binary.BigEndian.Uint16(header[3:5]))
+		recordEnd := recordOffset + smtpTlsRecordHeaderBytes + recordBytes
+		if smtpMaxTlsClientHelloWireBytes < recordEnd {
+			return false, false
+		}
+		if len(stream) < recordEnd {
+			handshake = append(handshake, stream[recordOffset+smtpTlsRecordHeaderBytes:]...)
+			if 0 < len(handshake) && handshake[0] != 0x01 {
+				return false, false
+			}
+			if smtpTlsHandshakeHeaderBytes <= len(handshake) {
+				handshakeBodyBytes := int(handshake[1])<<16 |
+					int(handshake[2])<<8 |
+					int(handshake[3])
+				if handshakeBodyBytes < 41 || smtpMaxTlsClientHelloBodyBytes < handshakeBodyBytes {
+					return false, false
+				}
+			}
+			return true, false
+		}
+		handshake = append(handshake, stream[recordOffset+smtpTlsRecordHeaderBytes:recordEnd]...)
+		if 0 < len(handshake) && handshake[0] != 0x01 {
+			return false, false
+		}
+		if smtpTlsHandshakeHeaderBytes <= len(handshake) {
+			handshakeBodyBytes := int(handshake[1])<<16 |
+				int(handshake[2])<<8 |
+				int(handshake[3])
+			if handshakeBodyBytes < 41 || smtpMaxTlsClientHelloBodyBytes < handshakeBodyBytes {
+				return false, false
+			}
+			handshakeEnd := smtpTlsHandshakeHeaderBytes + handshakeBodyBytes
+			if handshakeEnd <= len(handshake) {
+				if !validTlsClientHelloBody(handshake[smtpTlsHandshakeHeaderBytes:handshakeEnd]) {
+					return false, false
+				}
+				return true, true
+			}
+		}
+		recordOffset = recordEnd
+		if recordOffset == len(stream) {
+			return true, false
+		}
+	}
 }
 
 func (self *smtpFlowState) inspect587Stream() (valid bool, secure bool) {
 	for {
 		if self.phase587 == smtp587ExpectClientHello {
-			return tlsClientHelloStreamPrefix(self.stream[self.parseOffset:])
+			return tlsClientHelloStream(self.stream[self.parseOffset:])
 		}
 		if self.parseOffset == len(self.stream) {
 			return true, false
@@ -441,7 +585,8 @@ func (self *smtpFlowState) inspect587Stream() (valid bool, secure bool) {
 		remaining := self.stream[self.parseOffset:]
 		lineEnd := bytes.Index(remaining, []byte("\r\n"))
 		if lineEnd < 0 {
-			return validPartialSmtpNegotiationLine(remaining), false
+			return len(self.stream) <= smtpMaxNegotiationBytes &&
+				validPartialSmtpNegotiationLine(remaining), false
 		}
 		if smtpMaxCommandLineBytes < lineEnd ||
 			bytes.IndexByte(remaining[:lineEnd], '\r') >= 0 ||
@@ -454,6 +599,9 @@ func (self *smtpFlowState) inspect587Stream() (valid bool, secure bool) {
 			return false, false
 		}
 		self.parseOffset += lineEnd + 2
+		if smtpMaxNegotiationBytes < self.parseOffset {
+			return false, false
+		}
 		if command == smtpCommandStartTls {
 			self.phase587 = smtp587ExpectClientHello
 		}

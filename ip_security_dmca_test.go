@@ -185,6 +185,79 @@ func TestDmcaFreshSynReplacesTerminalVerdict(t *testing.T) {
 	}
 }
 
+func TestDmcaNamespacesIdenticalFlowBySenderClientId(t *testing.T) {
+	detector := newDmcaDetector(
+		nil,
+		DefaultDmcaSecurityPolicySettings(),
+		newWebStandardDetector(DefaultWebStandardSettings()),
+	)
+	firstSenderClientId := NewId()
+	secondSenderClientId := NewId()
+	path := dmcaPath(IpProtocolTcp, 40016, 50000, false)
+
+	if verdict := detector.classifyForSender(
+		firstSenderClientId,
+		path,
+		[]byte("GET / HTTP/1.1\r\n\r\n"),
+	); verdict != dmcaAllow {
+		t.Fatalf("first sender verdict = %d, want allow", verdict)
+	}
+	if verdict := detector.classifyForSender(
+		secondSenderClientId,
+		path,
+		btHandshake(),
+	); verdict != dmcaBittorrent {
+		t.Fatalf("second sender inherited first sender verdict: got %d, want bittorrent", verdict)
+	}
+	if flowCount := detector.flowCount(); flowCount != 2 {
+		t.Fatalf("identical tuple across senders retained %d flows, want 2", flowCount)
+	}
+
+	returnFin := path.Reverse()
+	returnFin.Fin = true
+	detector.touchIngressForSender(firstSenderClientId, returnFin)
+	if flowCount := detector.flowCount(); flowCount != 1 {
+		t.Fatalf("first sender return FIN left %d flows, want second sender only", flowCount)
+	}
+	if verdict := detector.classifyForSender(secondSenderClientId, path, nil); verdict != dmcaBittorrent {
+		t.Fatalf("first sender teardown changed second sender verdict to %d", verdict)
+	}
+	detector.retireEgressForSender(secondSenderClientId, path)
+	if flowCount := detector.flowCount(); flowCount != 0 {
+		t.Fatalf("provider flow close left %d sender-scoped flows, want 0", flowCount)
+	}
+}
+
+func TestProviderReversePolicyCarriesSenderClientId(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	policy := Reverse(DefaultSecurityPolicy(ctx))
+	firstSenderClientId := NewId()
+	secondSenderClientId := NewId()
+	path := dmcaPath(IpProtocolTcp, 40017, 50000, false)
+
+	firstResult, err := inspectAndRefreshIngressForSenderBorrowed(
+		policy,
+		firstSenderClientId,
+		protocol.ProvideMode_Public,
+		*path,
+		[]byte("GET / HTTP/1.1\r\n\r\n"),
+	)
+	if err != nil || firstResult != SecurityPolicyResultAllow {
+		t.Fatalf("first provider sender result = (%d, %v), want allow", firstResult, err)
+	}
+	secondResult, err := inspectAndRefreshIngressForSenderBorrowed(
+		policy,
+		secondSenderClientId,
+		protocol.ProvideMode_Public,
+		*path,
+		btHandshake(),
+	)
+	if err != nil || secondResult != SecurityPolicyResultIncident {
+		t.Fatalf("second provider sender result = (%d, %v), want incident", secondResult, err)
+	}
+}
+
 func TestDmcaTcpTeardownClearsFlowState(t *testing.T) {
 	detector := newDmcaDetector(
 		nil,
@@ -392,8 +465,7 @@ func TestDmcaFlowTtl(t *testing.T) {
 	eg := dmcaPath(IpProtocolTcp, 41100, 40000, false)
 	d.classify(eg, []byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n"))
 
-	key := eg.ToIp6Path()
-	key.ServerName = ""
+	key := dmcaFlowKeyForPath(Id{}, eg)
 	shard := d.shards[dmcaShardIndex(key)]
 	read := func() (*dmcaFlowState, bool) {
 		shard.mu.RLock()

@@ -143,3 +143,38 @@ func TestTcpBufferSynReplacesCanceledGeneration(t *testing.T) {
 		t.Fatal("a SYN did not replace the canceled sequence generation")
 	}
 }
+
+func TestTcpSequenceCloseDeliversFlowLifecycleOnce(t *testing.T) {
+	cancel, buffer, source, bufferId, tcp := newTcpGenerationTestBuffer(t)
+	defer cancel()
+	callbackCount := 0
+	var callbackSource TransferPath
+	var callbackPath *IpPath
+	buffer.flowCloseCallback = func(closedSource TransferPath, closedPath *IpPath) {
+		callbackCount += 1
+		callbackSource = closedSource
+		callbackPath = closedPath
+	}
+
+	sendTcpGenerationTestSyn(t, buffer, source, tcp)
+	sequence := tcpGenerationTestSequence(buffer, bufferId)
+	if sequence == nil {
+		t.Fatal("SYN did not create a sequence")
+	}
+	sequence.Close()
+	sequence.Close()
+
+	if callbackCount != 1 {
+		t.Fatalf("TCP sequence close delivered %d lifecycle callbacks, want 1", callbackCount)
+	}
+	if callbackSource != source.LocalMask() {
+		t.Fatalf("TCP lifecycle source = %s, want %s", callbackSource, source.LocalMask())
+	}
+	if callbackPath == nil ||
+		!callbackPath.SourceIp.Equal(tcp.sourceIp) ||
+		callbackPath.SourcePort != int(tcp.sourcePort) ||
+		!callbackPath.DestinationIp.Equal(tcp.destinationIp) ||
+		callbackPath.DestinationPort != int(tcp.destinationPort) {
+		t.Fatalf("TCP lifecycle path = %v, want canonical outbound tuple", callbackPath)
+	}
+}
