@@ -1142,7 +1142,9 @@ func raceTunDialContext(
 
 // safe to call from multiple goroutines
 func (self *Tun) dialContext(ctx context.Context, network string, address string) (net.Conn, error) {
-	dialCtx := self.dialCtx(ctx)
+	if network == "tcp6" || network == "udp6" {
+		return nil, syscall.EAFNOSUPPORT
+	}
 
 	host, portStr, err := net.SplitHostPort(address)
 	if err != nil {
@@ -1152,20 +1154,30 @@ func (self *Tun) dialContext(ctx context.Context, network string, address string
 	if err != nil {
 		return nil, err
 	}
+	if port < 0 || 65535 < port {
+		return nil, fmt.Errorf("invalid port %q", portStr)
+	}
+
+	parsedAddr, parsedAddrErr := netip.ParseAddr(host)
+	if parsedAddrErr == nil {
+		parsedAddr = parsedAddr.Unmap()
+		if !parsedAddr.Is4() {
+			return nil, syscall.EAFNOSUPPORT
+		}
+	}
+	dialCtx := self.dialCtx(ctx)
 
 	var addrs []netip.Addr
-	if addr, err := netip.ParseAddr(host); err == nil {
+	if parsedAddrErr == nil {
 		// address is ip:port
-		addrs = append(addrs, addr)
+		addrs = append(addrs, parsedAddr)
 	} else {
-		// resolve ips using doh, local
-
-		resolvedAddrs := self.DohCache().Query(dialCtx, "A", host)
+		// Remote providers currently forward IPv4 only. Resolve A records so
+		// an internal dial cannot select an IPv6 address that will blackhole at
+		// the provider.
+		addrs = append(addrs, self.DohCache().Query(dialCtx, "A", host)...)
 		if self.log.V(1).Enabled() {
-			self.log.Infof("[tun]query doh (%s) found %v\n", host, resolvedAddrs)
-		}
-		for _, addr := range resolvedAddrs {
-			addrs = append(addrs, addr)
+			self.log.Infof("[tun]query doh (%s) found %v\n", host, addrs)
 		}
 	}
 
@@ -1174,13 +1186,10 @@ func (self *Tun) dialContext(ctx context.Context, network string, address string
 	}
 
 	addr := addrs[mathrand.Intn(len(addrs))]
-
-	// var returnErr error
-	// for _, addr := range addrs {
 	addrPort := netip.AddrPortFrom(addr, uint16(port))
 
 	switch network {
-	case "tcp", "tcp4", "tcp6":
+	case "tcp", "tcp4":
 		fa, pn := self.convertToFullAddr(addrPort)
 		conn, err := gonet.DialContextTCP(dialCtx, self.stack, fa, pn)
 		if err == nil {
@@ -1193,7 +1202,7 @@ func (self *Tun) dialContext(ctx context.Context, network string, address string
 			self.log.Infof("[tun]tcp connect (%s)->%s err = %s\n", host, addrPort, err)
 		}
 		return nil, err
-	case "udp", "udp4", "udp6":
+	case "udp", "udp4":
 		fa, pn := self.convertToFullAddr(addrPort)
 		conn, err := self.dialUdp(nil, &fa, pn)
 		if err == nil {

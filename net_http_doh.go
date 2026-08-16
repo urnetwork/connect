@@ -11,6 +11,7 @@ import (
 	mathrand "math/rand"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/netip"
 	"net/url"
 	"sort"
@@ -245,6 +246,20 @@ type DohSettings struct {
 	// association logic along with the server names
 	// (see `reverseIndex.record` and `SetBlockActionIgnoreHosts`)
 	DohServerResolvedCallback func(domain string, addrs []netip.Addr)
+	// DohResultCallback observes a successful remote-DoH address answer and
+	// the exact tunnel TCP flow that delivered it. UpgradeMux uses this to pin
+	// the resulting destination names to the same provider exit, preserving
+	// topology-sensitive DNS locality without exposing the queried name in
+	// telemetry. nil and host-dialed DoH remain inert.
+	DohResultCallback func(domain string, addrs []netip.Addr, route *DohRoute)
+}
+
+// DohRoute identifies the tunnel TCP connection that delivered a DoH answer.
+// It intentionally contains only the socket tuple; the owning multi-client
+// resolves that tuple to its current provider channel.
+type DohRoute struct {
+	Local  netip.AddrPort
+	Remote netip.AddrPort
 }
 
 func (self *DohSettings) ResolverIp() string {
@@ -590,7 +605,7 @@ func NewDohCache(settings *DohSettings) *DohCache {
 	}
 
 	return &DohCache{
-		remoteClient:          &dohClient{httpClient: httpClient, httpSem: httpSem, primarySem: primarySem, activeQueries: activeQueries, stats: stats, memoryTarget: settings.MemoryTarget, lifecycle: lifecycle},
+		remoteClient:          &dohClient{httpClient: httpClient, httpSem: httpSem, primarySem: primarySem, activeQueries: activeQueries, stats: stats, memoryTarget: settings.MemoryTarget, lifecycle: lifecycle, captureRoute: settings.DialContextSettings != nil},
 		localClient:           &dohClient{httpClient: localHttpClient, httpSem: httpSem, primarySem: primarySem, activeQueries: activeQueries, stats: stats, memoryTarget: settings.MemoryTarget, lifecycle: lifecycle},
 		remoteResolver:        remoteResolver,
 		localResolver:         localResolver,
@@ -997,6 +1012,15 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]n
 		for addr, ttlSeconds := range queryResult.AddrTtls {
 			addrExpirations[addr] = now.Add(max(time.Duration(ttlSeconds)*time.Second, minCacheTtl))
 		}
+		if 0 < len(queryResult.AddrTtls) && queryResult.Route != nil && self.settings.DohResultCallback != nil {
+			addrs := make([]netip.Addr, 0, len(queryResult.AddrTtls))
+			for addr := range queryResult.AddrTtls {
+				addrs = append(addrs, addr)
+			}
+			HandleError(func() {
+				self.settings.DohResultCallback(q.Domain, addrs, queryResult.Route)
+			})
+		}
 		if len(addrExpirations) == 0 && queryResult.Miss {
 			cacheMiss = true
 		}
@@ -1194,6 +1218,7 @@ func localDohUrls(settings *DohSettings, ipVersion int) []string {
 type dohQueryResult struct {
 	AddrTtls map[netip.Addr]int
 	Miss     bool
+	Route    *DohRoute
 }
 
 func newDohQueryResult() *dohQueryResult {
@@ -1217,6 +1242,10 @@ type dohClient struct {
 	memoryTarget *MemoryTarget
 	// nil only for caller-owned HTTP clients supplied to DohQueryWithClient.
 	lifecycle *dohCacheLifecycle
+	// captureRoute is true only when the remote DoH client dials through an
+	// owner-supplied tunnel stack. Host/local clients must never manufacture a
+	// provider-affinity hint from their physical socket.
+	captureRoute bool
 }
 
 // beginQuery admits one logical lookup into the shared quiet-query counter.
@@ -1428,6 +1457,9 @@ func (self *dohClient) queryResult(
 			}
 		case result := <-receiveResults:
 			maps.Copy(mergedResult.AddrTtls, result.AddrTtls)
+			if 0 < len(result.AddrTtls) && result.Route != nil {
+				mergedResult.Route = result.Route
+			}
 			if result.Miss {
 				mergedResult.Miss = true
 			}
@@ -1439,6 +1471,7 @@ func (self *dohClient) queryResult(
 				stopLaunching()
 				return &dohQueryResult{
 					AddrTtls: mergedResult.AddrTtls,
+					Route:    mergedResult.Route,
 				}
 			}
 		}
@@ -1468,11 +1501,13 @@ func (self *dohClient) queryWireDetailed(ctx context.Context, dohUrl string, rec
 	default:
 		return result, fmt.Errorf("unsupported record type %q", recordType)
 	}
-	data, err := self.queryWireRawDetailed(ctx, dohUrl, qType, name)
+	data, route, err := self.queryWireRawDetailedWithRoute(ctx, dohUrl, qType, name)
 	if err != nil {
 		return result, err
 	}
-	return parseDohWire(data, qType), nil
+	result = parseDohWire(data, qType)
+	result.Route = route
+	return result, nil
 }
 
 // queryWireRaw issues one RFC 8484 query for (qType, name) to dohUrl and returns the raw
@@ -1489,10 +1524,45 @@ func (self *dohClient) queryWireRaw(ctx context.Context, dohUrl string, qType dn
 // encoded DNS question. Maintenance logs therefore identify the failed DoH
 // server and transport stage while preserving the queried hostname.
 func (self *dohClient) queryWireRawDetailed(ctx context.Context, dohUrl string, qType dnsmessage.Type, name string) ([]byte, error) {
+	data, _, err := self.queryWireRawDetailedWithRoute(ctx, dohUrl, qType, name)
+	return data, err
+}
+
+func dohRouteForConn(conn net.Conn) *DohRoute {
+	if conn == nil {
+		return nil
+	}
+	addrPort := func(addr net.Addr) (netip.AddrPort, bool) {
+		if tcpAddr, ok := addr.(*net.TCPAddr); ok {
+			ip, found := netip.AddrFromSlice(tcpAddr.IP)
+			if !found || tcpAddr.Port < 0 || 65535 < tcpAddr.Port {
+				return netip.AddrPort{}, false
+			}
+			ip = ip.Unmap()
+			if tcpAddr.Zone != "" && ip.Is6() {
+				ip = ip.WithZone(tcpAddr.Zone)
+			}
+			return netip.AddrPortFrom(ip, uint16(tcpAddr.Port)), true
+		}
+		parsed, err := netip.ParseAddrPort(addr.String())
+		return parsed, err == nil
+	}
+	local, localOk := addrPort(conn.LocalAddr())
+	remote, remoteOk := addrPort(conn.RemoteAddr())
+	if !localOk || !remoteOk {
+		return nil
+	}
+	return &DohRoute{Local: local, Remote: remote}
+}
+
+// queryWireRawDetailedWithRoute is the route-observing form used for parsed
+// A/AAAA answers. The compatibility wrapper above keeps raw forwarders and
+// maintenance probes on their existing signature.
+func (self *dohClient) queryWireRawDetailedWithRoute(ctx context.Context, dohUrl string, qType dnsmessage.Type, name string) ([]byte, *DohRoute, error) {
 	if self.lifecycle != nil {
 		linkedCtx, done, ok := self.lifecycle.context(ctx)
 		if !ok {
-			return nil, context.Canceled
+			return nil, nil, context.Canceled
 		}
 		defer done()
 		ctx = linkedCtx
@@ -1500,7 +1570,7 @@ func (self *dohClient) queryWireRawDetailed(ctx context.Context, dohUrl string, 
 
 	dnsName, err := dnsmessage.NewName(name + ".")
 	if err != nil {
-		return nil, fmt.Errorf("build name: %w", err)
+		return nil, nil, fmt.Errorf("build name: %w", err)
 	}
 	// id 0 is recommended for DoH (RFC 8484 §4.1); recursion desired
 	msg := dnsmessage.Message{
@@ -1509,13 +1579,23 @@ func (self *dohClient) queryWireRawDetailed(ctx context.Context, dohUrl string, 
 	}
 	wire, err := msg.Pack()
 	if err != nil {
-		return nil, fmt.Errorf("pack query: %w", err)
+		return nil, nil, fmt.Errorf("pack query: %w", err)
 	}
 	requestUrl := fmt.Sprintf("%s?dns=%s", dohUrl, base64.RawURLEncoding.EncodeToString(wire))
 
 	request, err := http.NewRequestWithContext(ctx, "GET", requestUrl, nil)
 	if err != nil {
-		return nil, fmt.Errorf("build request for %s: %w", dohUrl, err)
+		return nil, nil, fmt.Errorf("build request for %s: %w", dohUrl, err)
+	}
+	var route atomic.Pointer[DohRoute]
+	if self.captureRoute {
+		request = request.WithContext(httptrace.WithClientTrace(request.Context(), &httptrace.ClientTrace{
+			GotConn: func(info httptrace.GotConnInfo) {
+				if observed := dohRouteForConn(info.Conn); observed != nil {
+					route.Store(observed)
+				}
+			},
+		}))
 	}
 	request.Header.Set("Accept", "application/dns-message")
 
@@ -1527,17 +1607,17 @@ func (self *dohClient) queryWireRawDetailed(ctx context.Context, dohUrl string, 
 		if errors.As(err, &urlError) {
 			err = urlError.Err
 		}
-		return nil, fmt.Errorf("request %s: %w", dohUrl, err)
+		return nil, nil, fmt.Errorf("request %s: %w", dohUrl, err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("request %s: HTTP status %s", dohUrl, response.Status)
+		return nil, nil, fmt.Errorf("request %s: HTTP status %s", dohUrl, response.Status)
 	}
 	data, err := io.ReadAll(io.LimitReader(response.Body, maxDohResponseBytes))
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", dohUrl, err)
+		return nil, nil, fmt.Errorf("read %s: %w", dohUrl, err)
 	}
-	return data, nil
+	return data, route.Load(), nil
 }
 
 // forwardRaw resolves qType for domain across dohUrls (best recent performers

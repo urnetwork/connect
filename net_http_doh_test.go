@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -213,6 +214,54 @@ func TestDohCacheCachesMiss(t *testing.T) {
 		AssertEqual(t, len(ips), 0)
 	}
 	AssertEqual(t, int32(1), atomic.LoadInt32(&requestCount))
+}
+
+func TestDohCacheReportsTunnelRouteForAResult(t *testing.T) {
+	answer := netip.MustParseAddr("203.0.113.65")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeDohWire(w, r, []netip.Addr{answer}, 300, false)
+	}))
+	defer server.Close()
+
+	type observedResult struct {
+		domain string
+		addrs  []netip.Addr
+		route  *DohRoute
+	}
+	observed := make(chan observedResult, 1)
+	settings := DefaultDohSettings()
+	settings.RequestTimeout = time.Second
+	settings.DnsResolverSettings.EnableRemoteDoh = true
+	settings.DnsResolverSettings.EnableRemoteDns = false
+	settings.DnsResolverSettings.EnableLocalDoh = false
+	settings.DnsResolverSettings.EnableLocalDns = false
+	settings.DnsResolverSettings.RemoteDohUrlsIpv4 = []string{server.URL}
+	// An owner-supplied dialer is the signal that this cache rides a tunnel;
+	// use the host dialer in the test while retaining the same observation path.
+	settings.DialContextSettings = &DialContextSettings{
+		DialContext: (&net.Dialer{}).DialContext,
+	}
+	settings.DohResultCallback = func(domain string, addrs []netip.Addr, route *DohRoute) {
+		observed <- observedResult{domain: domain, addrs: addrs, route: route}
+	}
+
+	cache := NewDohCache(settings)
+	defer cache.Close()
+	addrs, authoritative := cache.QueryResult(context.Background(), "A", "smtp.example.test")
+	if !authoritative || !slices.Equal(addrs, []netip.Addr{answer}) {
+		t.Fatalf("A result = %v authoritative=%v, want %v true", addrs, authoritative, answer)
+	}
+	select {
+	case result := <-observed:
+		if result.domain != "smtp.example.test" || !slices.Equal(result.addrs, []netip.Addr{answer}) {
+			t.Fatalf("observed result = %+v", result)
+		}
+		if result.route == nil || !result.route.Local.IsValid() || !result.route.Remote.IsValid() {
+			t.Fatalf("observed route = %+v, want valid tunnel tuple", result.route)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("successful A answer did not report its tunnel route")
+	}
 }
 
 // TestDohCacheDoesNotCacheHttpError: an HTTP 5xx (transient server failure, not an

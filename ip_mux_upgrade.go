@@ -352,6 +352,11 @@ type UpgradeMux struct {
 	// cache emits no query the mux sees). Observation only — the flow always passes
 	// through. Self-contained + independently testable (see sniSniffer).
 	sni *sniSniffer
+
+	// upstreamMultiClient resolves a successful DoH connection's exact socket
+	// tuple to the provider that carried it. Installed with the batch upstream;
+	// nil for generic/server uses where provider affinity is not meaningful.
+	upstreamMultiClient atomic.Pointer[RemoteUserNatMultiClient]
 }
 
 // dnsResolverSettings extracts the resolver config from the mux settings (nil = no DNS
@@ -523,6 +528,9 @@ func NewUpgradeMux(
 	// also matches the resolved server addresses
 	dohSettings.DohServerResolvedCallback = func(domain string, addrs []netip.Addr) {
 		self.reverse.record(addrs, domain)
+	}
+	dohSettings.DohResultCallback = func(domain string, addrs []netip.Addr, route *DohRoute) {
+		self.bindDnsResultToExit(domain, addrs, route)
 	}
 	tunSettings.DohSettings = dohSettings
 	// ResolveTimeout is the single DNS-resolution timeout: it bounds each handleDns attempt (the
@@ -2498,11 +2506,37 @@ func (self *UpgradeMux) AddPacketsReceiver(receiver ReceivePacketsFunction) func
 
 // SetUpstream wires the wrapped upstream send (the remote UserNat).
 func (self *UpgradeMux) SetUpstream(upstream IpMuxSend) {
+	self.upstreamMultiClient.Store(nil)
 	self.mux.SetUpstream(upstream)
+}
+
+func (self *UpgradeMux) bindDnsResultToExit(domain string, addrs []netip.Addr, route *DohRoute) {
+	upstream := self.upstreamMultiClient.Load()
+	if upstream == nil || route == nil || !route.Local.IsValid() || !route.Remote.IsValid() {
+		return
+	}
+	localAddr := route.Local.Addr().Unmap()
+	remoteAddr := route.Remote.Addr().Unmap()
+	if localAddr.Is4() != remoteAddr.Is4() {
+		return
+	}
+	version := 6
+	if localAddr.Is4() {
+		version = 4
+	}
+	upstream.bindDnsResultToExit(&IpPath{
+		Version:         version,
+		Protocol:        IpProtocolTcp,
+		SourceIp:        net.IP(localAddr.AsSlice()),
+		SourcePort:      int(route.Local.Port()),
+		DestinationIp:   net.IP(remoteAddr.AsSlice()),
+		DestinationPort: int(route.Remote.Port()),
+	}, domain, addrs)
 }
 
 // Wires an exact-flow group path when the upstream supports it.
 func (self *UpgradeMux) SetUpstreamBatchClient(upstream *RemoteUserNatMultiClient) {
+	self.upstreamMultiClient.Store(upstream)
 	self.mux.SetUpstream(upstream.SendPacket)
 	self.mux.setUpstreamGroupSend(func(
 		source TransferPath,

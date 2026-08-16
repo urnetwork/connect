@@ -124,6 +124,30 @@ func TestTunWriteReleasesUnsupportedPacketBufferReference(t *testing.T) {
 	}
 }
 
+func TestTunStaysIpv4OnlyUntilProvidersSupportIpv6(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tun, err := CreateTunWithDefaults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tun.Close()
+
+	if len(tun.localAddresses) != 1 || !tun.localAddresses[0].Is4() {
+		t.Fatalf("tun local addresses = %v, want one IPv4 address", tun.localAddresses)
+	}
+	for _, network := range []string{"tcp6", "tcp"} {
+		conn, dialErr := tun.dialContext(ctx, network, "[2001:db8::25]:465")
+		if conn != nil {
+			conn.Close()
+			t.Fatalf("%s IPv6 dial unexpectedly returned a connection", network)
+		}
+		if dialErr != syscall.EAFNOSUPPORT {
+			t.Fatalf("%s IPv6 dial error = %v, want %v", network, dialErr, syscall.EAFNOSUPPORT)
+		}
+	}
+}
+
 type tunLinkWriteResult struct {
 	n   int
 	err tcpip.Error
