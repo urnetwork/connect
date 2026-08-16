@@ -161,6 +161,22 @@ func TestSmtpSecureFlowValidatesNegotiationRetransmissions(t *testing.T) {
 	))
 }
 
+func TestSmtpSecureFlowAllowsOpaqueDataPastHalfSequenceSpace(t *testing.T) {
+	var guard smtpEgressGuard
+	const sequence = uint32(3700)
+	requireSmtpVerdict(t, smtpEgressAllow, guard.inspect(
+		smtpTestPath(41006, smtpImplicitTlsPort, sequence), smtpTestClientHello,
+	))
+
+	// Once TLS is established, a forward offset at the TCP half-sequence-space
+	// boundary is opaque application data rather than a segment from before the
+	// negotiation prefix.
+	requireSmtpVerdict(t, smtpEgressAllow, guard.inspect(
+		smtpTestPath(41006, smtpImplicitTlsPort, sequence+(uint32(1)<<31)),
+		[]byte{0x17, 0x03, 0x03},
+	))
+}
+
 func TestSmtp587AllowsNegotiationThenRequiresClientHello(t *testing.T) {
 	var guard smtpEgressGuard
 	const sourcePort = 42001
@@ -387,6 +403,33 @@ func TestSmtpGuardBoundsFlowTable(t *testing.T) {
 	}
 	guard.stateLock.Lock()
 	defer guard.stateLock.Unlock()
+	if len(guard.flows) != smtpMaxFlowCount {
+		t.Fatalf("SMTP flow table size = %d, want %d", len(guard.flows), smtpMaxFlowCount)
+	}
+}
+
+func TestSmtpGuardEvictsNegotiatingFlowBeforeSecureFlow(t *testing.T) {
+	guard := smtpEgressGuard{
+		flows: make(map[smtpFlowKey]*smtpFlowState, smtpMaxFlowCount),
+	}
+	for index := 0; index < smtpMaxFlowCount-1; index++ {
+		key := smtpFlowKey{sourcePort: uint16(index + 1)}
+		guard.flows[key] = &smtpFlowState{secure: true, lastUsed: 1}
+	}
+	negotiatingKey := smtpFlowKey{sourcePort: uint16(smtpMaxFlowCount)}
+	guard.flows[negotiatingKey] = &smtpFlowState{lastUsed: 2}
+	newKey := smtpFlowKey{sourcePort: uint16(smtpMaxFlowCount + 1)}
+
+	guard.stateLock.Lock()
+	guard.newFlowWithLock(newKey, smtpImplicitTlsPort)
+	guard.stateLock.Unlock()
+
+	if _, ok := guard.flows[negotiatingKey]; ok {
+		t.Fatal("negotiating SMTP flow survived eviction ahead of established TLS flows")
+	}
+	if _, ok := guard.flows[newKey]; !ok {
+		t.Fatal("new SMTP flow was not added after eviction")
+	}
 	if len(guard.flows) != smtpMaxFlowCount {
 		t.Fatalf("SMTP flow table size = %d, want %d", len(guard.flows), smtpMaxFlowCount)
 	}

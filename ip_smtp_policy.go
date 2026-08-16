@@ -24,7 +24,6 @@ const (
 	smtpMaxNegotiationBytes       = 2048
 	smtpMaxCommandLineBytes       = 510 // RFC 5321's 512 includes CRLF.
 	smtpMaxFlowCount              = 1024
-	smtpFlowEvictionSampleSize    = 32
 )
 
 type smtpEgressVerdict uint8
@@ -211,16 +210,27 @@ func (self *smtpEgressGuard) newFlowWithLock(key smtpFlowKey, destinationPort in
 		var oldestKey smtpFlowKey
 		var oldestUse uint64
 		found := false
-		sampled := 0
+		// Rejected and still-negotiating flows are expendable. Preserve an
+		// established TLS flow unless every entry in the bounded table is an
+		// active secure flow; losing its marker would make the next opaque TLS
+		// record look like a fresh plaintext negotiation.
 		for candidateKey, candidate := range self.flows {
+			if candidate.secure && !candidate.rejected {
+				continue
+			}
 			if !found || candidate.lastUsed < oldestUse {
 				oldestKey = candidateKey
 				oldestUse = candidate.lastUsed
 				found = true
 			}
-			sampled += 1
-			if smtpFlowEvictionSampleSize <= sampled {
-				break
+		}
+		if !found {
+			for candidateKey, candidate := range self.flows {
+				if !found || candidate.lastUsed < oldestUse {
+					oldestKey = candidateKey
+					oldestUse = candidate.lastUsed
+					found = true
+				}
 			}
 		}
 		if found {
@@ -292,19 +302,18 @@ func (self *smtpFlowState) inspectPayload(sequence uint32, payload []byte) bool 
 }
 
 func (self *smtpFlowState) inspectSecureRetransmission(sequence uint32, payload []byte) bool {
-	relative := int64(int32(sequence - self.baseSequence))
-	if relative < 0 {
-		return false
-	}
-	offset := int(relative)
-	if len(self.stream) <= offset {
+	offset := sequence - self.baseSequence
+	if uint32(len(self.stream)) <= offset {
 		return true
 	}
-	overlap := len(self.stream) - offset
+	// The bound above proves this conversion is safe even on 32-bit hosts:
+	// the retained negotiation prefix is at most smtpMaxNegotiationBytes.
+	start := int(offset)
+	overlap := len(self.stream) - start
 	if len(payload) < overlap {
 		overlap = len(payload)
 	}
-	return bytes.Equal(self.stream[offset:offset+overlap], payload[:overlap])
+	return bytes.Equal(self.stream[start:start+overlap], payload[:overlap])
 }
 
 // tlsClientHelloStreamPrefix validates the TLS record header and handshake
