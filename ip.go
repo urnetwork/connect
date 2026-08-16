@@ -6595,6 +6595,7 @@ type IpPath struct {
 	SequenceNumber    uint32
 	AckSequenceNumber uint32
 	Syn               bool
+	Fin               bool
 	Rst               bool
 	Ack               bool
 
@@ -6682,6 +6683,7 @@ func parseIpPathWithPayloadBorrowed(ipPacket []byte, ipPath *IpPath) ([]byte, er
 			SequenceNumber:    tcp.seq,
 			AckSequenceNumber: tcp.ackNumber,
 			Syn:               tcp.syn,
+			Fin:               tcp.fin,
 			Rst:               tcp.rst,
 			Ack:               tcp.ack,
 		}

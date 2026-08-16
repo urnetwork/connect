@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/urnetwork/connect/protocol"
 )
@@ -24,6 +25,9 @@ const (
 	smtpMaxNegotiationBytes       = 2048
 	smtpMaxCommandLineBytes       = 510 // RFC 5321's 512 includes CRLF.
 	smtpMaxFlowCount              = 1024
+	smtpMaxOwnerFlowCount         = 128
+	smtpFlowIdleTimeout           = 10 * time.Minute
+	smtpFlowIdleReapInterval      = time.Minute
 )
 
 type smtpEgressVerdict uint8
@@ -121,23 +125,26 @@ type smtpFlowState struct {
 	parseOffset  int
 	phase587     smtp587Phase
 
-	secure   bool
-	rejected bool
-	lastUsed uint64
+	secure       bool
+	rejected     bool
+	lastUsed     uint64
+	lastUsedTime time.Time
 }
 
 // smtpEgressGuard keeps only the bounded, pre-encryption prefix of each SMTP
-// flow. Once TLS is identified the prefix remains as a retransmission guard:
-// bytes that overlap the validated negotiation must match, while later TLS
-// sequence space stays opaque. A fresh SYN replaces the marker on tuple reuse.
+// flow. Once TLS is identified the prefix is discarded and all later sequence
+// space stays opaque. A fresh SYN replaces the marker on tuple reuse, while
+// RST and FIN retire it.
 //
 // One lock is intentionally sufficient: it is touched only by ports 465/587,
 // and a single SMTP stream's packets are ordered through the lock. The map and
 // every field have useful zero values, which keeps fixture-built clients safe.
 type smtpEgressGuard struct {
-	stateLock sync.Mutex
-	flows     map[smtpFlowKey]*smtpFlowState
-	clock     uint64
+	stateLock        sync.Mutex
+	flows            map[smtpFlowKey]*smtpFlowState
+	clock            uint64
+	timeNow          func() time.Time
+	nextIdleReapTime time.Time
 }
 
 func (self *smtpEgressGuard) inspect(ipPath *IpPath, payload []byte) smtpEgressVerdict {
@@ -166,9 +173,16 @@ func (self *smtpEgressGuard) inspectForOwner(
 	if self.flows == nil {
 		self.flows = map[smtpFlowKey]*smtpFlowState{}
 	}
+	now := self.currentTimeWithLock()
+	self.reapIdleFlowsWithLock(now)
 	if ipPath.Rst {
 		delete(self.flows, key)
 		return smtpEgressAllow
+	}
+	if ipPath.Fin {
+		// A FIN may carry the last payload bytes, so inspect it before retiring
+		// the tuple. A retransmitted FIN also leaves no empty replacement state.
+		defer delete(self.flows, key)
 	}
 
 	flow := self.flows[key]
@@ -176,18 +190,19 @@ func (self *smtpEgressGuard) inspectForOwner(
 	if ipPath.Syn {
 		segmentSequence += 1
 		if flow == nil || !flow.synSeen || flow.synSeq != ipPath.SequenceNumber {
-			flow = self.newFlowWithLock(key, ipPath.DestinationPort)
+			flow = self.newFlowWithLock(key, ipPath.DestinationPort, now)
 			flow.synSeen = true
 			flow.synSeq = ipPath.SequenceNumber
 			flow.baseSequence = segmentSequence
 			flow.baseSet = true
 		}
 	} else if flow == nil {
-		flow = self.newFlowWithLock(key, ipPath.DestinationPort)
+		flow = self.newFlowWithLock(key, ipPath.DestinationPort, now)
 	}
 
 	self.clock += 1
 	flow.lastUsed = self.clock
+	flow.lastUsedTime = now
 	if flow.rejected {
 		return smtpEgressReject
 	}
@@ -205,17 +220,65 @@ func (self *smtpEgressGuard) inspectForOwner(
 	return smtpEgressAllow
 }
 
-func (self *smtpEgressGuard) newFlowWithLock(key smtpFlowKey, destinationPort int) *smtpFlowState {
-	if smtpMaxFlowCount <= len(self.flows) {
-		var oldestKey smtpFlowKey
-		var oldestUse uint64
-		found := false
-		// Rejected and still-negotiating flows are expendable. Preserve an
-		// established TLS flow unless every entry in the bounded table is an
-		// active secure flow; losing its marker would make the next opaque TLS
-		// record look like a fresh plaintext negotiation.
+// currentTimeWithLock returns the guard's time source. Caller holds stateLock.
+func (self *smtpEgressGuard) currentTimeWithLock() time.Time {
+	if self.timeNow != nil {
+		return self.timeNow()
+	}
+	return time.Now()
+}
+
+// reapIdleFlowsWithLock periodically retires abandoned tuples. Caller holds
+// stateLock. Packet-driven reaping avoids a background goroutine and still
+// cleans the bounded table before a newly observed flow is admitted.
+func (self *smtpEgressGuard) reapIdleFlowsWithLock(now time.Time) {
+	if !self.nextIdleReapTime.IsZero() && now.Before(self.nextIdleReapTime) {
+		return
+	}
+	for key, flow := range self.flows {
+		if !flow.lastUsedTime.IsZero() &&
+			!now.Before(flow.lastUsedTime.Add(smtpFlowIdleTimeout)) {
+			delete(self.flows, key)
+		}
+	}
+	self.nextIdleReapTime = now.Add(smtpFlowIdleReapInterval)
+}
+
+// ownerFlowCountWithLock returns the number of provider-side flows belonging
+// to ownerId. Caller holds stateLock.
+func (self *smtpEgressGuard) ownerFlowCountWithLock(ownerId Id) int {
+	count := 0
+	for key := range self.flows {
+		if key.ownerId == ownerId {
+			count += 1
+		}
+	}
+	return count
+}
+
+// evictOldestFlowWithLock removes one eligible flow, preferring rejected or
+// negotiating state over an established TLS marker. When ownerOnly is true,
+// no other authenticated client's flow can be selected. Caller holds stateLock.
+func (self *smtpEgressGuard) evictOldestFlowWithLock(ownerId Id, ownerOnly bool) bool {
+	var oldestKey smtpFlowKey
+	var oldestUse uint64
+	found := false
+	for candidateKey, candidate := range self.flows {
+		if ownerOnly && candidateKey.ownerId != ownerId {
+			continue
+		}
+		if candidate.secure && !candidate.rejected {
+			continue
+		}
+		if !found || candidate.lastUsed < oldestUse {
+			oldestKey = candidateKey
+			oldestUse = candidate.lastUsed
+			found = true
+		}
+	}
+	if !found {
 		for candidateKey, candidate := range self.flows {
-			if candidate.secure && !candidate.rejected {
+			if ownerOnly && candidateKey.ownerId != ownerId {
 				continue
 			}
 			if !found || candidate.lastUsed < oldestUse {
@@ -224,27 +287,45 @@ func (self *smtpEgressGuard) newFlowWithLock(key smtpFlowKey, destinationPort in
 				found = true
 			}
 		}
-		if !found {
-			for candidateKey, candidate := range self.flows {
-				if !found || candidate.lastUsed < oldestUse {
-					oldestKey = candidateKey
-					oldestUse = candidate.lastUsed
-					found = true
-				}
-			}
-		}
-		if found {
-			delete(self.flows, oldestKey)
-		}
 	}
-	flow := &smtpFlowState{destinationPort: destinationPort}
+	if found {
+		delete(self.flows, oldestKey)
+	}
+	return found
+}
+
+// Allocates state while preserving the per-owner and whole-table bounds.
+// Caller holds stateLock and has already reaped idle flows.
+func (self *smtpEgressGuard) newFlowWithLock(
+	key smtpFlowKey,
+	destinationPort int,
+	now time.Time,
+) *smtpFlowState {
+	_, replacing := self.flows[key]
+	if !replacing && key.ownerId != (Id{}) &&
+		smtpMaxOwnerFlowCount <= self.ownerFlowCountWithLock(key.ownerId) {
+		// A noisy provider client pays for its own next tuple, including when
+		// all of its entries have sent a minimal TLS-looking prefix.
+		self.evictOldestFlowWithLock(key.ownerId, true)
+	}
+	if !replacing && smtpMaxFlowCount <= len(self.flows) {
+		// Rejected and still-negotiating flows are expendable. Preserve an
+		// established TLS flow unless every entry in the bounded table is an
+		// active secure flow; losing its marker would make the next opaque TLS
+		// record look like a fresh plaintext negotiation.
+		self.evictOldestFlowWithLock(Id{}, false)
+	}
+	flow := &smtpFlowState{
+		destinationPort: destinationPort,
+		lastUsedTime:    now,
+	}
 	self.flows[key] = flow
 	return flow
 }
 
 func (self *smtpFlowState) inspectPayload(sequence uint32, payload []byte) bool {
 	if self.secure {
-		return self.inspectSecureRetransmission(sequence, payload)
+		return true
 	}
 
 	// TCP serial arithmetic is safe here because the retained prefix is at
@@ -292,28 +373,14 @@ func (self *smtpFlowState) inspectPayload(sequence uint32, payload []byte) bool 
 		return false
 	}
 	if self.secure {
-		// Keep only the already-bounded verified prefix. It prevents a
-		// conflicting retransmission from replacing the negotiation bytes after
-		// the connection has moved into opaque TLS sequence space.
+		// The negotiation bytes have already been accepted. Retaining and
+		// comparing them would alias opaque data whenever TCP sequence space wraps.
+		self.stream = nil
+		self.parseOffset = 0
 		return valid
 	}
 	// More unverified bytes than the bounded prefix can represent fail closed.
 	return valid && len(retainedBytes) == len(newBytes)
-}
-
-func (self *smtpFlowState) inspectSecureRetransmission(sequence uint32, payload []byte) bool {
-	offset := sequence - self.baseSequence
-	if uint32(len(self.stream)) <= offset {
-		return true
-	}
-	// The bound above proves this conversion is safe even on 32-bit hosts:
-	// the retained negotiation prefix is at most smtpMaxNegotiationBytes.
-	start := int(offset)
-	overlap := len(self.stream) - start
-	if len(payload) < overlap {
-		overlap = len(payload)
-	}
-	return bytes.Equal(self.stream[start:start+overlap], payload[:overlap])
 }
 
 // tlsClientHelloStreamPrefix validates the TLS record header and handshake

@@ -148,6 +148,10 @@ type dmcaFlowState struct {
 	terminal int32
 
 	key Ip6Path
+	// These identify the TCP generation that created the state. They are set
+	// before publication and remain immutable.
+	synSeen     bool
+	synSequence uint32
 
 	// mu guards the inspection bookkeeping below, touched only while INSPECTING
 	mu               sync.Mutex
@@ -424,25 +428,70 @@ func (self *dmcaDetector) classify(ipPath *IpPath, payload []byte) dmcaVerdict {
 	key.ServerName = ""
 	shard := self.shards[dmcaShardIndex(key)]
 
-	shard.mu.RLock()
-	st := shard.flows[key]
-	shard.mu.RUnlock()
-	if st == nil {
+	if ipPath.Protocol == IpProtocolTcp && ipPath.Rst {
 		shard.mu.Lock()
-		st = shard.flows[key]
-		if st == nil {
-			// seed the activity time on creation; ongoing refreshes come from the per-direction
-			// RefreshEgress/RefreshIngress calls at the forwarding points
-			st = &dmcaFlowState{key: key, lastActivityUnixNanos: time.Now().UnixNano()}
-			self.evictWithLock(shard)
-			shard.flows[key] = st
-		}
+		delete(shard.flows, key)
 		shard.mu.Unlock()
+		return dmcaAllow
 	}
 
-	v := dmcaVerdict(atomic.LoadInt32(&st.terminal))
+	createState := func() *dmcaFlowState {
+		state := &dmcaFlowState{
+			key:                   key,
+			lastActivityUnixNanos: time.Now().UnixNano(),
+		}
+		if ipPath.Protocol == IpProtocolTcp && ipPath.Syn {
+			state.synSeen = true
+			state.synSequence = ipPath.SequenceNumber
+		}
+		return state
+	}
+
+	var state *dmcaFlowState
+	if ipPath.Protocol == IpProtocolTcp && ipPath.Syn {
+		// A SYN is the generation boundary. Serialize its replacement so a new
+		// connection cannot inherit a terminal verdict from tuple reuse.
+		shard.mu.Lock()
+		state = shard.flows[key]
+		if state == nil || !state.synSeen || state.synSequence != ipPath.SequenceNumber {
+			replacing := state != nil
+			state = createState()
+			if !replacing {
+				self.evictWithLock(shard)
+			}
+			shard.flows[key] = state
+		}
+		shard.mu.Unlock()
+	} else {
+		shard.mu.RLock()
+		state = shard.flows[key]
+		shard.mu.RUnlock()
+		if state == nil {
+			shard.mu.Lock()
+			state = shard.flows[key]
+			if state == nil {
+				// Ongoing refreshes come from the per-direction forwarding points.
+				state = createState()
+				self.evictWithLock(shard)
+				shard.flows[key] = state
+			}
+			shard.mu.Unlock()
+		}
+	}
+	if ipPath.Protocol == IpProtocolTcp && ipPath.Fin {
+		// Inspect a payload-bearing FIN, then retire only the generation seen here.
+		defer func() {
+			shard.mu.Lock()
+			defer shard.mu.Unlock()
+			if shard.flows[key] == state {
+				delete(shard.flows, key)
+			}
+		}()
+	}
+
+	v := dmcaVerdict(atomic.LoadInt32(&state.terminal))
 	if dmcaInspecting == v {
-		v = st.advance(ipPath, payload, self.settings, self.web)
+		v = state.advance(ipPath, payload, self.settings, self.web)
 	}
 	return v
 }

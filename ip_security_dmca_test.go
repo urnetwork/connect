@@ -154,6 +154,65 @@ func TestDmcaStateMachineEncryptedTcpMidstreamAllowed(t *testing.T) {
 	}
 }
 
+func TestDmcaFreshSynReplacesTerminalVerdict(t *testing.T) {
+	settings := DefaultDmcaSecurityPolicySettings()
+	detector := newDmcaDetector(
+		nil,
+		settings,
+		newWebStandardDetector(DefaultWebStandardSettings()),
+	)
+
+	firstSyn := dmcaPath(IpProtocolTcp, 40013, 50000, true)
+	firstSyn.SequenceNumber = 1000
+	if verdict := detector.classify(firstSyn, nil); verdict != dmcaInspecting {
+		t.Fatalf("first SYN verdict = %d, want inspecting", verdict)
+	}
+	firstData := dmcaPath(IpProtocolTcp, 40013, 50000, false)
+	firstData.SequenceNumber = 1001
+	if verdict := detector.classify(firstData, []byte("GET / HTTP/1.1\r\n\r\n")); verdict != dmcaAllow {
+		t.Fatalf("first connection verdict = %d, want allow", verdict)
+	}
+
+	secondSyn := dmcaPath(IpProtocolTcp, 40013, 50000, true)
+	secondSyn.SequenceNumber = 2000
+	if verdict := detector.classify(secondSyn, nil); verdict != dmcaInspecting {
+		t.Fatalf("reused-tuple SYN verdict = %d, want inspecting", verdict)
+	}
+	secondData := dmcaPath(IpProtocolTcp, 40013, 50000, false)
+	secondData.SequenceNumber = 2001
+	if verdict := detector.classify(secondData, btHandshake()); verdict != dmcaBittorrent {
+		t.Fatalf("second connection verdict = %d, want bittorrent", verdict)
+	}
+}
+
+func TestDmcaTcpTeardownClearsFlowState(t *testing.T) {
+	detector := newDmcaDetector(
+		nil,
+		DefaultDmcaSecurityPolicySettings(),
+		newWebStandardDetector(DefaultWebStandardSettings()),
+	)
+
+	finPath := dmcaPath(IpProtocolTcp, 40014, 50000, true)
+	finPath.SequenceNumber = 3000
+	detector.classify(finPath, nil)
+	finPath.Syn = false
+	finPath.Fin = true
+	finPath.SequenceNumber = 3001
+	detector.classify(finPath, nil)
+
+	rstPath := dmcaPath(IpProtocolTcp, 40015, 50000, true)
+	rstPath.SequenceNumber = 4000
+	detector.classify(rstPath, nil)
+	rstPath.Syn = false
+	rstPath.Rst = true
+	rstPath.SequenceNumber = 4001
+	detector.classify(rstPath, nil)
+
+	if flowCount := detector.flowCount(); flowCount != 0 {
+		t.Fatalf("DMCA flow table retained %d TCP teardown states, want 0", flowCount)
+	}
+}
+
 // encrypted UDP (first datagram is the start) -> drop
 func TestDmcaStateMachineEncryptedUdpDropped(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

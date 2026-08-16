@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"net"
 	"testing"
+	"time"
 )
 
 var smtpTestClientHello = []byte{
@@ -123,7 +124,7 @@ func TestSmtp465RejectsMalformedClientHelloPrefixes(t *testing.T) {
 	}
 }
 
-func TestSmtp465AcceptsLargeFirstTlsSegmentWithBoundedPrefix(t *testing.T) {
+func TestSmtp465AcceptsLargeFirstTlsSegmentWithoutRetainingPayload(t *testing.T) {
 	var guard smtpEgressGuard
 	payload := append(append([]byte{}, smtpTestClientHello...), make([]byte, 4096)...)
 	requireSmtpVerdict(t, smtpEgressAllow, guard.inspect(
@@ -133,13 +134,13 @@ func TestSmtp465AcceptsLargeFirstTlsSegmentWithBoundedPrefix(t *testing.T) {
 	guard.stateLock.Lock()
 	defer guard.stateLock.Unlock()
 	for _, flow := range guard.flows {
-		if !flow.secure || len(flow.stream) != smtpTlsClientHelloPrefixBytes {
-			t.Fatalf("verified 465 flow retained prefix: secure=%t bytes=%d", flow.secure, len(flow.stream))
+		if !flow.secure || len(flow.stream) != 0 {
+			t.Fatalf("verified 465 flow state: secure=%t retained bytes=%d", flow.secure, len(flow.stream))
 		}
 	}
 }
 
-func TestSmtpSecureFlowValidatesNegotiationRetransmissions(t *testing.T) {
+func TestSmtpSecureFlowTreatsLaterSequenceSpaceAsOpaque(t *testing.T) {
 	var guard smtpEgressGuard
 	const sequence = uint32(3500)
 	requireSmtpVerdict(t, smtpEgressAllow, guard.inspect(
@@ -147,17 +148,12 @@ func TestSmtpSecureFlowValidatesNegotiationRetransmissions(t *testing.T) {
 	))
 
 	// Exact retransmissions and opaque data after the validated prefix remain
-	// valid, but the prefix cannot be replaced once the flow is marked secure.
+	// valid once the flow is marked secure.
 	requireSmtpVerdict(t, smtpEgressAllow, guard.inspect(
 		smtpTestPath(41004, smtpImplicitTlsPort, sequence), smtpTestClientHello,
 	))
 	requireSmtpVerdict(t, smtpEgressAllow, guard.inspect(
 		smtpTestPath(41004, smtpImplicitTlsPort, sequence+uint32(len(smtpTestClientHello))), []byte{0x17, 0x03, 0x03},
-	))
-	conflict := append([]byte(nil), smtpTestClientHello...)
-	conflict[5] = 0x02
-	requireSmtpVerdict(t, smtpEgressReject, guard.inspect(
-		smtpTestPath(41004, smtpImplicitTlsPort, sequence), conflict,
 	))
 }
 
@@ -173,6 +169,21 @@ func TestSmtpSecureFlowAllowsOpaqueDataPastHalfSequenceSpace(t *testing.T) {
 	// negotiation prefix.
 	requireSmtpVerdict(t, smtpEgressAllow, guard.inspect(
 		smtpTestPath(41006, smtpImplicitTlsPort, sequence+(uint32(1)<<31)),
+		[]byte{0x17, 0x03, 0x03},
+	))
+}
+
+func TestSmtpSecureFlowAllowsOpaqueDataAfterFullSequenceWrap(t *testing.T) {
+	var guard smtpEgressGuard
+	const sequence = uint32(3800)
+	requireSmtpVerdict(t, smtpEgressAllow, guard.inspect(
+		smtpTestPath(41007, smtpImplicitTlsPort, sequence), smtpTestClientHello,
+	))
+
+	// The same uint32 value represents baseSequence + 2^32 after one complete
+	// sequence-space wrap. It must not alias the discarded negotiation prefix.
+	requireSmtpVerdict(t, smtpEgressAllow, guard.inspect(
+		smtpTestPath(41007, smtpImplicitTlsPort, sequence),
 		[]byte{0x17, 0x03, 0x03},
 	))
 }
@@ -373,6 +384,44 @@ func TestSmtpGuardRstClearsTupleState(t *testing.T) {
 	))
 }
 
+func TestSmtpGuardFinClearsTupleState(t *testing.T) {
+	var guard smtpEgressGuard
+	const sequence = uint32(10700)
+
+	var path IpPath
+	payload, err := parseIpPathWithPayloadBorrowed(
+		smtpTestTcp4Packet(byte(tcpFlagAck|tcpFlagPsh), sequence, 9000, smtpTestClientHello),
+		&path,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireSmtpVerdict(t, smtpEgressAllow, guard.inspect(&path, payload))
+
+	payload, err = parseIpPathWithPayloadBorrowed(
+		smtpTestTcp4Packet(
+			byte(tcpFlagAck|tcpFlagFin),
+			sequence+uint32(len(smtpTestClientHello)),
+			9000,
+			nil,
+		),
+		&path,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !path.Fin {
+		t.Fatal("TCP FIN was not exposed on the SMTP inspection path")
+	}
+	requireSmtpVerdict(t, smtpEgressAllow, guard.inspect(&path, payload))
+
+	guard.stateLock.Lock()
+	defer guard.stateLock.Unlock()
+	if len(guard.flows) != 0 {
+		t.Fatalf("SMTP flow table retained %d entries after FIN, want 0", len(guard.flows))
+	}
+}
+
 func TestSmtpGuardNamespacesProviderFlowsBySource(t *testing.T) {
 	var guard smtpEgressGuard
 	firstSource := NewId()
@@ -392,6 +441,146 @@ func TestSmtpGuardNamespacesProviderFlowsBySource(t *testing.T) {
 		path,
 		smtpTestClientHello,
 	))
+}
+
+func TestSmtpGuardCapsProviderSynEntriesPerOwner(t *testing.T) {
+	var guard smtpEgressGuard
+	ownerId := NewId()
+	for index := 0; index < smtpMaxOwnerFlowCount+1; index++ {
+		requireSmtpVerdict(t, smtpEgressAllow, guard.inspectForOwner(
+			ownerId,
+			smtpTestSyn(18000+index, smtpImplicitTlsPort, uint32(index+1)),
+			nil,
+		))
+	}
+
+	guard.stateLock.Lock()
+	defer guard.stateLock.Unlock()
+	ownerFlowCount := 0
+	for key := range guard.flows {
+		if key.ownerId == ownerId {
+			ownerFlowCount += 1
+		}
+	}
+	if ownerFlowCount != smtpMaxOwnerFlowCount {
+		t.Fatalf("provider owner retained %d SYN entries, want %d", ownerFlowCount, smtpMaxOwnerFlowCount)
+	}
+}
+
+func TestSmtpGuardOwnerCapContainsFakeTlsFlood(t *testing.T) {
+	var guard smtpEgressGuard
+	protectedOwnerId := NewId()
+	noisyOwnerId := NewId()
+	protectedPath := smtpTestPath(19000, smtpImplicitTlsPort, 1000)
+	requireSmtpVerdict(t, smtpEgressAllow, guard.inspectForOwner(
+		protectedOwnerId,
+		protectedPath,
+		smtpTestClientHello,
+	))
+	protectedKey, ok := smtpFlowKeyForOwnerPath(protectedOwnerId, protectedPath)
+	if !ok {
+		t.Fatal("could not build protected SMTP flow key")
+	}
+
+	// Reproduce the reported 2,048-packet fill: SYN followed by the minimal
+	// nine-byte prefix that makes an entry look like established TLS. Without
+	// an owner cap, the protected flow is the oldest secure eviction candidate.
+	for index := 0; index < smtpMaxFlowCount; index++ {
+		sourcePort := 20000 + index
+		sequence := uint32(20000 + index*16)
+		requireSmtpVerdict(t, smtpEgressAllow, guard.inspectForOwner(
+			noisyOwnerId,
+			smtpTestSyn(sourcePort, smtpImplicitTlsPort, sequence),
+			nil,
+		))
+		requireSmtpVerdict(t, smtpEgressAllow, guard.inspectForOwner(
+			noisyOwnerId,
+			smtpTestPath(sourcePort, smtpImplicitTlsPort, sequence+1),
+			smtpTestClientHello[:smtpTlsClientHelloPrefixBytes],
+		))
+	}
+
+	guard.stateLock.Lock()
+	defer guard.stateLock.Unlock()
+	protectedFlow, ok := guard.flows[protectedKey]
+	if !ok || !protectedFlow.secure {
+		t.Fatal("one provider owner evicted another owner's established TLS flow")
+	}
+	noisyFlowCount := 0
+	for key := range guard.flows {
+		if key.ownerId == noisyOwnerId {
+			noisyFlowCount += 1
+		}
+	}
+	if noisyFlowCount != smtpMaxOwnerFlowCount {
+		t.Fatalf("noisy owner retained %d fake-TLS entries, want %d", noisyFlowCount, smtpMaxOwnerFlowCount)
+	}
+	if len(guard.flows) != smtpMaxOwnerFlowCount+1 {
+		t.Fatalf("provider table retained %d flows, want %d", len(guard.flows), smtpMaxOwnerFlowCount+1)
+	}
+}
+
+func TestSmtpGuardIdleTimeoutExpiresSecureTuple(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	guard := smtpEgressGuard{
+		timeNow: func() time.Time {
+			return now
+		},
+	}
+	ownerId := NewId()
+	path := smtpTestPath(22000, smtpImplicitTlsPort, 30000)
+	requireSmtpVerdict(t, smtpEgressAllow, guard.inspectForOwner(
+		ownerId,
+		path,
+		smtpTestClientHello,
+	))
+
+	now = now.Add(smtpFlowIdleTimeout)
+	// The identical tuple must no longer inherit the old secure marker. With
+	// no fresh ClientHello, its first post-timeout payload fails closed.
+	requireSmtpVerdict(t, smtpEgressReject, guard.inspectForOwner(
+		ownerId,
+		path,
+		[]byte("plaintext after idle timeout"),
+	))
+}
+
+func TestSmtpGuardIdleReaperKeepsRecentlyActiveFlow(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	guard := smtpEgressGuard{
+		timeNow: func() time.Time {
+			return now
+		},
+	}
+	ownerId := NewId()
+	stalePath := smtpTestSyn(22001, smtpImplicitTlsPort, 31000)
+	activePath := smtpTestSyn(22002, smtpImplicitTlsPort, 32000)
+	triggerPath := smtpTestSyn(22003, smtpImplicitTlsPort, 33000)
+	requireSmtpVerdict(t, smtpEgressAllow, guard.inspectForOwner(ownerId, stalePath, nil))
+
+	now = now.Add(smtpFlowIdleTimeout / 2)
+	requireSmtpVerdict(t, smtpEgressAllow, guard.inspectForOwner(ownerId, activePath, nil))
+
+	now = now.Add(smtpFlowIdleTimeout / 2)
+	requireSmtpVerdict(t, smtpEgressAllow, guard.inspectForOwner(ownerId, triggerPath, nil))
+
+	staleKey, staleOk := smtpFlowKeyForOwnerPath(ownerId, stalePath)
+	activeKey, activeOk := smtpFlowKeyForOwnerPath(ownerId, activePath)
+	triggerKey, triggerOk := smtpFlowKeyForOwnerPath(ownerId, triggerPath)
+	if !staleOk || !activeOk || !triggerOk {
+		t.Fatal("could not build SMTP idle-reaper flow keys")
+	}
+	guard.stateLock.Lock()
+	defer guard.stateLock.Unlock()
+	if _, ok := guard.flows[staleKey]; ok {
+		t.Fatal("idle SMTP flow survived its deterministic timeout")
+	}
+	if _, ok := guard.flows[activeKey]; !ok {
+		t.Fatal("recently active SMTP flow was reaped")
+	}
+	if _, ok := guard.flows[triggerKey]; !ok {
+		t.Fatal("flow that triggered SMTP idle reaping was not retained")
+	}
 }
 
 func TestSmtpGuardBoundsFlowTable(t *testing.T) {
@@ -421,7 +610,7 @@ func TestSmtpGuardEvictsNegotiatingFlowBeforeSecureFlow(t *testing.T) {
 	newKey := smtpFlowKey{sourcePort: uint16(smtpMaxFlowCount + 1)}
 
 	guard.stateLock.Lock()
-	guard.newFlowWithLock(newKey, smtpImplicitTlsPort)
+	guard.newFlowWithLock(newKey, smtpImplicitTlsPort, time.Unix(1, 0))
 	guard.stateLock.Unlock()
 
 	if _, ok := guard.flows[negotiatingKey]; ok {
@@ -432,6 +621,37 @@ func TestSmtpGuardEvictsNegotiatingFlowBeforeSecureFlow(t *testing.T) {
 	}
 	if len(guard.flows) != smtpMaxFlowCount {
 		t.Fatalf("SMTP flow table size = %d, want %d", len(guard.flows), smtpMaxFlowCount)
+	}
+}
+
+func TestSmtpGuardTupleReplacementAtCapacityDoesNotEvictAnotherFlow(t *testing.T) {
+	var guard smtpEgressGuard
+	const firstSourcePort = 12000
+	for index := 0; index < smtpMaxFlowCount; index++ {
+		requireSmtpVerdict(t, smtpEgressAllow, guard.inspect(
+			smtpTestPath(firstSourcePort+index, smtpImplicitTlsPort, uint32(index+1)),
+			smtpTestClientHello,
+		))
+	}
+
+	firstPath := smtpTestPath(firstSourcePort, smtpImplicitTlsPort, 1)
+	firstKey, ok := smtpFlowKeyForOwnerPath(Id{}, firstPath)
+	if !ok {
+		t.Fatal("could not build the first SMTP flow key")
+	}
+	lastSourcePort := firstSourcePort + smtpMaxFlowCount - 1
+	requireSmtpVerdict(t, smtpEgressAllow, guard.inspect(
+		smtpTestSyn(lastSourcePort, smtpImplicitTlsPort, 50000),
+		nil,
+	))
+
+	guard.stateLock.Lock()
+	defer guard.stateLock.Unlock()
+	if len(guard.flows) != smtpMaxFlowCount {
+		t.Fatalf("SMTP tuple replacement left %d flows, want %d", len(guard.flows), smtpMaxFlowCount)
+	}
+	if _, ok := guard.flows[firstKey]; !ok {
+		t.Fatal("SMTP tuple replacement evicted an unrelated established flow")
 	}
 }
 
