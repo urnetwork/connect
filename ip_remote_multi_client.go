@@ -206,6 +206,8 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// wait this time before enumerating potential clients again
 		// WindowEnumerateEmptyTimeout: 5 * time.Second,
 		WindowEnumerateErrorTimeout: 1 * time.Second,
+		WindowRateLimitBackoffMin:   5 * time.Second,
+		WindowRateLimitBackoffMax:   2 * time.Minute,
 		// long enough for a slow-but-alive platform API round trip; a hung
 		// API must never wedge the enumerate/expand machinery
 		WindowGeneratorTimeout: 20 * time.Second,
@@ -649,6 +651,26 @@ type MultiClientSettings struct {
 	WindowExpandBlockCount int
 	// WindowEnumerateEmptyTimeout time.Duration
 	WindowEnumerateErrorTimeout time.Duration
+	// WindowRateLimitBackoffMin / Max bound the retry cadence when the platform
+	// answers a window generator call with a RATE LIMIT (429).
+	//
+	// WindowEnumerateErrorTimeout alone is a FIXED 1s retry with no jitter, and
+	// it is applied per expander goroutine. That is a thundering herd by
+	// construction: the window runs one expander per slot it wants to fill, so
+	// the aggregate request rate scales linearly with WindowSizeMin, and once
+	// the platform starts refusing, every expander re-asks every second
+	// forever. Measured on a real client 2026-08-17: 3,726 429s over 39
+	// minutes, climbing 327 -> 672 per minute as more slots entered the failing
+	// loop, against a platform budget of 1000/min. Nothing in the loop backed
+	// off, because classifyWindowFailure already recognised the 429 and the
+	// verdict was recorded for the stall label and then discarded.
+	//
+	// Backoff is exponential from Min to Max, doubling per consecutive rate
+	// limit, and JITTERED — jitter is not decoration here, since dozens of
+	// expanders that all failed at the same instant would otherwise retry in
+	// lockstep no matter how long the delay. Any success resets it.
+	WindowRateLimitBackoffMin time.Duration
+	WindowRateLimitBackoffMax time.Duration
 	// WindowGeneratorTimeout bounds each generator call the window's
 	// enumerate/expand machinery makes (NextDestinations, NewClientArgs,
 	// NewClientArgsForDestination). The generator wraps a platform API that
@@ -8023,6 +8045,12 @@ type multiClientWindow struct {
 	cancel context.CancelFunc
 	log    Logger
 
+	// Consecutive platform rate limits across ALL expanders in this window.
+	// Shared deliberately: the herd is the problem, so the backoff has to be a
+	// property of the window rather than of each goroutine. See
+	// windowRetryDelay.
+	rateLimitStreak atomic.Uint64
+
 	generator                    MultiClientGenerator
 	clientReceivePacketCallback  clientReceivePacketFunction
 	clientReceivePacketsCallback clientReceivePacketsFunction
@@ -8701,14 +8729,17 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			self.log.Infof("[multi]window enumerate error timeout = %s\n", err)
 			// a hung/erroring platform api is the platform-unreachable class
 			// unless the message names auth or rate limiting
-			self.recordEvaluationFailure(windowFailurePlatform, err)
+			class := self.recordEvaluationFailure(windowFailurePlatform, err)
 			select {
 			case <-self.ctx.Done():
 				return
-			case <-time.After(self.settings.WindowEnumerateErrorTimeout):
+			case <-time.After(self.windowRetryDelay(class)):
 			}
 			continue
 		}
+		// The platform answered. Any success clears the rate-limit backoff so
+		// the window returns to its normal cadence once the limit lifts.
+		self.windowRetryReset()
 
 		// unconditional (V0): the platform answered with ZERO candidates. Only
 		// a failure while the window is empty — a full window legitimately
@@ -8762,14 +8793,15 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 						// platform api again: the client mint is a platform
 						// round trip, so its timeout is platform-unreachable
 						// (auth/rate refine via the message)
-						self.recordEvaluationFailure(windowFailurePlatform, err)
+						class := self.recordEvaluationFailure(windowFailurePlatform, err)
 						select {
 						case <-self.ctx.Done():
 							return
-						case <-time.After(self.settings.WindowEnumerateErrorTimeout):
+						case <-time.After(self.windowRetryDelay(class)):
 						}
 						continue
 					}
+					self.windowRetryReset()
 
 					args := &multiClientChannelArgs{
 						Destination:                    destination,
