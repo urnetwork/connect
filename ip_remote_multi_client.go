@@ -138,9 +138,24 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		WindowSizes: map[WindowType]WindowSizeSettings{
 			// TODO increase `WindowSizeMinP2pOnly` when p2p is deployed
 			WindowTypeQuality: WindowSizeSettings{
-				WindowSizeMin:     2,
-				WindowSizeMax:     6,
-				WindowSizeHardMax: 12,
+				// RAISED 2/6/12 -> 6/12/16. A quality window of 2 has no
+				// redundancy: one bad provider is half the window, and a
+				// second is a total failure with nothing left to fall back
+				// to. Field report on linux: an idle session sat at 2 held /
+				// ~4 probed (EvaluationPoolMultiple=2), both went
+				// unresponsive, and because windowOutcomeAction returns
+				// outcomeNone once failOutcome has latched, the window never
+				// rebuilt for the remaining 22 minutes of the session. A
+				// larger floor does not fix that latch, but it makes a single
+				// bad provider survivable rather than fatal, which is the
+				// point of holding a window at all.
+				//
+				// Cost is real and deliberate: WindowSizeMin is a floor that
+				// holds AT IDLE, so this raises steady-state provider
+				// sessions and the contracts behind them.
+				WindowSizeMin:     6,
+				WindowSizeMax:     12,
+				WindowSizeHardMax: 16,
 				// reconnects per source
 				WindowSizeReconnectScale: 1.2,
 				KeepHealthiestCount:      0,
