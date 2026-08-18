@@ -9474,8 +9474,12 @@ func (self *multiClientWindow) expand(
 				"exit", clientId,
 				"reason", "carrying_flows",
 			))
+			// The constructed channel owns both the Client and its generator
+			// args. Canceling it runs the newMultiClientChannel cleanup, which
+			// calls RemoveClientWithArgs only after Client/OOB work is joined.
+			// Calling RemoveClientArgs here would revoke the derived JWT first
+			// and turn the channel's final contract closes into 401s.
 			client.Cancel()
-			self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
 			self.monitor.AddProviderEvent(args.ClientId, ProviderStateAdded, args.Destination.Tail(), args.Location)
 			return false
 		}
@@ -9527,8 +9531,10 @@ func (self *multiClientWindow) expand(
 	//
 	// must be called with mutex
 	cancelCandidate := func(candidate *expandEvaluatedCandidate) {
+		// A successfully constructed channel owns its generator args. Its
+		// cancellation cleanup returns them through RemoveClientWithArgs after
+		// the Client/OOB join; do not also revoke them directly here.
 		candidate.client.Cancel()
-		self.generator.RemoveClientArgs(&candidate.args.MultiClientGeneratorClientArgs)
 		self.monitor.AddProviderEvent(candidate.args.ClientId, ProviderStateNotAdded, candidate.args.Destination.Tail(), candidate.args.Location)
 	}
 
@@ -9609,16 +9615,6 @@ func (self *multiClientWindow) expand(
 			if !ok {
 				return
 			}
-			// func() {
-			// 	self.stateLock.Lock()
-			// 	defer self.stateLock.Unlock()
-			// 	_, ok = self.destinationClients[args.Destination]
-			// }()
-
-			// if ok {
-			// 	// already have a client in the window for this destination
-			// 	self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
-			// } else {
 			// randomly set to p2p only to meet the minimum requirement
 			if !args.MultiClientGeneratorClientArgs.P2pOnly {
 				var a int
@@ -9702,8 +9698,9 @@ func (self *multiClientWindow) expand(
 					}
 
 					pingCancel()
+					// The channel cleanup owns the generator args and preserves the
+					// derived identity through its final contract-close controls.
 					client.Cancel()
-					self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
 					self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed, args.Destination.Tail(), args.Location)
 				}
 				pendingPingFailures = append(pendingPingFailures, fail)
@@ -10885,10 +10882,10 @@ func newMultiClientChannel(
 		// peer churn. See TestMultiClientCleanupPrecedesBlockedObservers.
 		contractStatusSub()
 		peerIdentitySub()
-		// Deregister the platform identity BEFORE the synchronous local
-		// teardown: Pion close can be slow, and making RemoveClientWithArgs
-		// wait behind it leaves the remote provider's StreamOpen/P2P state
-		// alive while the local side has already decided the client is gone.
+		// Detach the platform transport before the synchronous local teardown.
+		// The API generator retires the derived identity asynchronously after
+		// Client and OOB cleanup have joined, so a slow Pion close never blocks
+		// this path and the final contract-close controls retain valid auth.
 		generator.RemoveClientWithArgs(client, &args.MultiClientGeneratorClientArgs)
 		client.Cancel()
 		// Fire the contract-close events for this client's still-open

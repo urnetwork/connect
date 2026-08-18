@@ -559,7 +559,39 @@ func (self *ApiMultiClientGenerator) RemoveClientWithArgs(client *Client, args *
 	if transport != nil {
 		transport.Close()
 	}
-	self.RemoveClientArgs(args)
+
+	// Keep the derived network-client identity alive until this client's
+	// contract-close controls have finished. Removing the identity first makes
+	// those controls authenticate with a JWT that the server has already
+	// revoked, so every close returns 401 and the server has to reap the open
+	// contracts later. Besides leaking cleanup work, that ordering creates a
+	// large, window-size-dependent source of database and log noise in the
+	// latency simulator.
+	//
+	// The channel owner cancels the client immediately after this method
+	// returns. Retire asynchronously so a slow WebRTC/stream teardown never
+	// blocks window replacement. CloseAndWait joins every Client-owned producer
+	// of contract-close controls; closing and joining the OOB boundary after
+	// that proves all admitted cleanup requests and callbacks are done before
+	// RemoveClientArgs revokes the identity. Both waits are bounded by the
+	// strategy request timeout, with a defensive 30-second floor.
+	go HandleError(func() {
+		<-client.Done()
+		retireTimeout := self.clientStrategy.settings.RequestTimeout
+		if retireTimeout < 30*time.Second {
+			retireTimeout = 30 * time.Second
+		}
+		retireCtx, retireCancel := context.WithTimeout(context.Background(), retireTimeout)
+		defer retireCancel()
+
+		_ = client.CloseAndWait(retireCtx)
+		if clientOob, ok := client.ClientOob().(interface {
+			CloseAndWait(context.Context) error
+		}); ok {
+			_ = clientOob.CloseAndWait(retireCtx)
+		}
+		self.RemoveClientArgs(args)
+	})
 }
 
 func (self *ApiMultiClientGenerator) NewClientSettings() *ClientSettings {

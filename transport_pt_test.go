@@ -7,7 +7,6 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	mathrand "math/rand"
 	"net"
 	"os"
 	"sync"
@@ -34,11 +33,11 @@ import (
 )
 
 func TestPtDnsEncodeDecode(t *testing.T) {
-	ptEncodeDecodeTest(t, PacketTranslationModeDns, PacketTranslationModeDecode53, 6555)
+	ptEncodeDecodeTest(t, PacketTranslationModeDns, PacketTranslationModeDecode53)
 }
 
 func TestPtDnsPumpEncodeDecode(t *testing.T) {
-	ptEncodeDecodeTest(t, PacketTranslationModeDnsPump, PacketTranslationModeDecode53RequireDnsPump, 6555)
+	ptEncodeDecodeTest(t, PacketTranslationModeDnsPump, PacketTranslationModeDecode53RequireDnsPump)
 }
 
 func TestPacketTranslationReadyDeadlineDoesNotAddAllocations(t *testing.T) {
@@ -216,7 +215,7 @@ func (self *packetTranslationTestCloseConnection) CloseWithError(
 	return self.closeWithError(code, reason)
 }
 
-func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, serverPtMode PacketTranslationMode, basePort int) {
+func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, serverPtMode PacketTranslationMode) {
 	if testing.Short() {
 		return
 	}
@@ -226,10 +225,6 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 	if os.Getenv("CONNECT_PT_STRESS") != "" {
 		iterations = 64
 		attempts = 8
-	}
-
-	select {
-	case <-time.After(1 * time.Second):
 	}
 
 	ctx := context.Background()
@@ -244,25 +239,28 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 
 	for i := range iterations {
 		headerPrefix := make([]byte, 8)
-		mathrand.Read(headerPrefix)
+		binary.BigEndian.PutUint64(headerPrefix, uint64(i+1))
 
 		// FIXME quic does not seem to recover well with packet loss
 		packetLossN := i + 100
 
 		fmt.Printf("[%d]dns test (loss=%.1f%%)\n", i, 100.0/float32(packetLossN))
-		success := runPacketTranslationAttempts(ctx, attempts, time.Second, func() bool {
+		attemptIndex := 0
+		success := runPacketTranslationAttempts(ctx, attempts, 0, func() bool {
+			currentAttemptIndex := attemptIndex
+			attemptIndex++
 			attemptCtx, attemptCancel := context.WithTimeout(ctx, 20*time.Second)
 			defer attemptCancel()
 
 			handleCtx, handleCancel := context.WithCancel(attemptCtx)
 			defer handleCancel()
 
-			n := 1024 * (8 + mathrand.Intn(8))
+			n := 1024 * (8 + (3*i+5*currentAttemptIndex)%8)
 			data := consecutive(n)
 
 			tld := []byte("foo.com.")
 
-			serverAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: basePort + i}
+			serverAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}
 
 			ioTimeout := 5 * time.Second
 			ioDeadline := func() time.Time {
@@ -317,8 +315,15 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 			serverConn, err := net.ListenUDP("udp", serverAddr)
 			AssertEqual(t, err, nil)
 			defer serverConn.Close()
+			serverAddr = serverConn.LocalAddr().(*net.UDPAddr)
 
-			serverLossConn := newPacketLossPacketConn(packetLossN, serverConn)
+			impairmentOffset := 8*i + 4*currentAttemptIndex
+			serverLossConn := newPacketLossPacketConn(
+				packetLossN,
+				serverConn,
+				impairmentOffset,
+				impairmentOffset+1,
+			)
 
 			serverPtSettings := DefaultPacketTranslationSettings()
 			serverPtSettings.DnsTlds = [][]byte{tld}
@@ -337,7 +342,9 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 			AssertEqual(t, err, nil)
 			defer earlyListener.Close()
 
+			serverDone := make(chan struct{})
 			go func() {
+				defer close(serverDone)
 				defer serverCancel()
 				// defer ptConn.Close()
 				// defer earlyListener.Close()
@@ -371,6 +378,10 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 					if m != len(data) {
 						reportErr(fmt.Errorf("server short write: %d != %d", m, len(data)))
 					}
+				}()
+				defer func() {
+					closeEarlyConnection()
+					<-writeCtx.Done()
 				}()
 
 				readData := make([]byte, 0, len(data))
@@ -408,6 +419,10 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 				}
 
 			}()
+			defer func() {
+				handleCancel()
+				<-serverDone
+			}()
 
 			// }()
 
@@ -420,7 +435,12 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 			AssertEqual(t, err, nil)
 			defer clientConn.Close()
 
-			lossConn := newPacketLossPacketConn(packetLossN, clientConn)
+			lossConn := newPacketLossPacketConn(
+				packetLossN,
+				clientConn,
+				impairmentOffset+2,
+				impairmentOffset+3,
+			)
 
 			ptSettings := DefaultPacketTranslationSettings()
 			ptSettings.DnsTlds = [][]byte{tld}
@@ -466,6 +486,10 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 				if m != len(data) {
 					reportErr(fmt.Errorf("client short write: %d != %d", m, len(data)))
 				}
+			}()
+			defer func() {
+				closeConnection()
+				<-writeCtx.Done()
 			}()
 
 			readData := make([]byte, 0, len(data))
@@ -581,61 +605,215 @@ func TestPacketTranslationAttemptsRetryRecoverableFailure(t *testing.T) {
 	}
 }
 
-// drops one of n outgoing packets randomly
+// A fixed cadence makes the lossy integration test replay the same independent
+// read/write actions on every invocation.
+func TestPacketLossPacketConnUsesDeterministicIndependentSchedules(t *testing.T) {
+	conn := newPacketLossPacketConn(4, nil, 0, 1)
+	expectedReadImpairments := []packetLossImpairment{
+		packetLossNone,
+		packetLossNone,
+		packetLossNone,
+		packetLossScramble,
+		packetLossNone,
+		packetLossNone,
+		packetLossNone,
+		packetLossDrop,
+	}
+	expectedWriteImpairments := []packetLossImpairment{
+		packetLossNone,
+		packetLossNone,
+		packetLossScramble,
+		packetLossNone,
+		packetLossNone,
+		packetLossNone,
+		packetLossDrop,
+		packetLossNone,
+	}
+	for i := range expectedReadImpairments {
+		if impairment := conn.nextImpairment(true); impairment != expectedReadImpairments[i] {
+			t.Fatalf("read impairment %d = %d, want %d", i, impairment, expectedReadImpairments[i])
+		}
+		if impairment := conn.nextImpairment(false); impairment != expectedWriteImpairments[i] {
+			t.Fatalf("write impairment %d = %d, want %d", i, impairment, expectedWriteImpairments[i])
+		}
+	}
+}
+
+// Scrambling simulates corruption on the wire, not corruption of the QUIC
+// buffer whose ownership remains with the WriteTo caller.
+func TestPacketLossPacketConnWriteScramblePreservesCallerBuffer(t *testing.T) {
+	packetConn := &packetLossRecordingPacketConn{}
+	conn := newPacketLossPacketConn(1, packetConn, 0, 0)
+	packetBytes := []byte{0x01, 0x02, 0x03, 0x04}
+	originalBytes := bytes.Clone(packetBytes)
+
+	n, err := conn.WriteTo(packetBytes, &net.UDPAddr{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len(packetBytes) {
+		t.Fatalf("write size = %d, want %d", n, len(packetBytes))
+	}
+	if !bytes.Equal(packetBytes, originalBytes) {
+		t.Fatalf("caller buffer changed: got %x, want %x", packetBytes, originalBytes)
+	}
+	if bytes.Equal(packetConn.writtenBytes, originalBytes) {
+		t.Fatalf("wire packet was not scrambled: %x", packetConn.writtenBytes)
+	}
+}
+
+// Minimal synchronous PacketConn records the exact bytes offered by WriteTo.
+type packetLossRecordingPacketConn struct {
+	writtenBytes []byte
+}
+
+// Read is unsupported because the ownership regression exercises only writes.
+func (self *packetLossRecordingPacketConn) ReadFrom([]byte) (int, net.Addr, error) {
+	return 0, nil, fmt.Errorf("read is not supported")
+}
+
+// Record a private copy so later caller changes cannot alter the observation.
+func (self *packetLossRecordingPacketConn) WriteTo(packetBytes []byte, _ net.Addr) (int, error) {
+	self.writtenBytes = bytes.Clone(packetBytes)
+	return len(packetBytes), nil
+}
+
+// The fake has no physical address.
+func (self *packetLossRecordingPacketConn) LocalAddr() net.Addr {
+	return &net.UDPAddr{}
+}
+
+// Closing the synchronous fake has no work to join.
+func (self *packetLossRecordingPacketConn) Close() error {
+	return nil
+}
+
+// Deadlines do not affect its synchronous writes.
+func (self *packetLossRecordingPacketConn) SetDeadline(time.Time) error {
+	return nil
+}
+
+// Read deadlines are accepted for PacketConn conformance.
+func (self *packetLossRecordingPacketConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+
+// Write deadlines are accepted for PacketConn conformance.
+func (self *packetLossRecordingPacketConn) SetWriteDeadline(time.Time) error {
+	return nil
+}
+
+// A reproducible impairment applied by the lossy packet-connection fixture.
+type packetLossImpairment int
+
+const (
+	packetLossNone packetLossImpairment = iota
+	packetLossScramble
+	packetLossDrop
+)
+
+// Per-direction state keeps the loss cadence independent across read and write.
+type packetLossSchedule struct {
+	packetIndex     int
+	impairmentIndex int
+	offset          int
+}
+
+// Deterministically impairs one of every n packets without changing buffers
+// owned by PacketConn callers. Its methods are safe for concurrent use.
 type packetLossPacketConn struct {
 	n          int
 	packetConn net.PacketConn
 
-	readRand  *mathrand.Rand
-	writeRand *mathrand.Rand
+	stateLock     sync.Mutex
+	readSchedule  packetLossSchedule
+	writeSchedule packetLossSchedule
 }
 
-func newPacketLossPacketConn(n int, packetConn net.PacketConn) *packetLossPacketConn {
+// Offsets make endpoint directions exercise different deterministic packets.
+func newPacketLossPacketConn(
+	n int,
+	packetConn net.PacketConn,
+	readOffset int,
+	writeOffset int,
+) *packetLossPacketConn {
+	normalizeOffset := func(offset int) int {
+		if n <= 0 {
+			return 0
+		}
+		offset %= n
+		if offset < 0 {
+			offset += n
+		}
+		return offset
+	}
 	return &packetLossPacketConn{
-		n:          n,
-		packetConn: packetConn,
-		readRand:   mathrand.New(mathrand.NewSource(time.Now().UnixMilli())),
-		writeRand:  mathrand.New(mathrand.NewSource(time.Now().UnixMilli())),
+		n:             n,
+		packetConn:    packetConn,
+		readSchedule:  packetLossSchedule{offset: normalizeOffset(readOffset)},
+		writeSchedule: packetLossSchedule{offset: normalizeOffset(writeOffset)},
 	}
 }
 
+// Selects the next fixed action for one direction.
+func (self *packetLossPacketConn) nextImpairment(read bool) packetLossImpairment {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	schedule := &self.writeSchedule
+	if read {
+		schedule = &self.readSchedule
+	}
+	packetIndex := schedule.packetIndex
+	schedule.packetIndex++
+	if self.n <= 0 || (packetIndex+schedule.offset+1)%self.n != 0 {
+		return packetLossNone
+	}
+	impairmentIndex := schedule.impairmentIndex
+	schedule.impairmentIndex++
+	if impairmentIndex%2 == 0 {
+		return packetLossScramble
+	}
+	return packetLossDrop
+}
+
+// Applies the read-side schedule after the underlying socket supplies a packet.
 func (self *packetLossPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	for {
 		n, addr, err = self.packetConn.ReadFrom(p)
 		if err != nil {
 			return
 		}
-		if 0 < self.n && self.readRand.Intn(self.n+1) == 0 {
-			if self.readRand.Intn(2) == 0 {
-				// scramble the packet
-				self.readRand.Read(p[:n])
-				fmt.Printf("s")
-			} else {
-				// drop the packet
-				fmt.Printf("d")
-				continue
+		switch self.nextImpairment(true) {
+		case packetLossScramble:
+			if 0 < n {
+				p[0] ^= 0xff
 			}
+			fmt.Printf("s")
+		case packetLossDrop:
+			fmt.Printf("d")
+			continue
 		}
 		return
 	}
 }
 
+// Applies the write-side schedule while preserving the caller-owned packet.
 func (self *packetLossPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	if 0 < self.n && self.writeRand.Intn(self.n+1) == 0 {
-		if self.writeRand.Intn(2) == 0 {
-			// scramble the packet
-			self.writeRand.Read(p)
-			fmt.Printf("s")
-		} else {
-			// drop the packet
-			n = len(p)
-			fmt.Printf("d")
-			return
+	switch self.nextImpairment(false) {
+	case packetLossScramble:
+		wirePacket := bytes.Clone(p)
+		if 0 < len(wirePacket) {
+			wirePacket[0] ^= 0xff
 		}
+		fmt.Printf("s")
+		return self.packetConn.WriteTo(wirePacket, addr)
+	case packetLossDrop:
+		fmt.Printf("d")
+		return len(p), nil
 	}
 
-	n, err = self.packetConn.WriteTo(p, addr)
-	return
+	return self.packetConn.WriteTo(p, addr)
 }
 
 func (self *packetLossPacketConn) LocalAddr() net.Addr {

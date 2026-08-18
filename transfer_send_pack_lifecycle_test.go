@@ -110,7 +110,7 @@ func decodeSendPackLifecycleWirePack(
 	}
 	frame := transferFrame.GetFrame()
 	if frame == nil || frame.MessageType != protocol.MessageType_TransferPack {
-		t.Fatalf("lifecycle transfer had no Pack: %+v", transferFrame)
+		t.Fatalf("lifecycle transfer had no Pack: %+v", &transferFrame)
 	}
 	pack := &protocol.Pack{}
 	if err := ProtoUnmarshal(frame.MessageBytes, pack); err != nil {

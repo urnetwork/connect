@@ -12,9 +12,12 @@ import (
 )
 
 // A ping result held before the pass terminal lock is canceled and its
-// generator args are returned when the pass ends. Before the fix, releasing
-// this callback installed one client from the ended pass; repeated timeouts
-// let a fixed-size-one window grow once per overlapping pass.
+// constructed channel returns the generator args through RemoveClientWithArgs
+// when the pass ends. It must not also call RemoveClientArgs: that would revoke
+// the derived identity before the channel's final cleanup controls finish.
+// Before the pass-boundary fix, releasing this callback installed one client
+// from the ended pass; repeated timeouts let a fixed-size-one window grow once
+// per overlapping pass.
 func TestMultiClientExpandRejectsPingResultAfterPassEnds(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
@@ -173,8 +176,8 @@ func TestMultiClientExpandRejectsPingResultAfterPassEnds(t *testing.T) {
 	}
 	select {
 	case <-argsRemoved:
+		t.Fatal("ended expand pass bypassed constructed-channel cleanup with RemoveClientArgs")
 	default:
-		t.Fatal("ended expand pass retained generator args")
 	}
 	close(releasePingResult)
 	select {
@@ -186,6 +189,11 @@ func TestMultiClientExpandRejectsPingResultAfterPassEnds(t *testing.T) {
 	case <-clientRemoved:
 	case <-ctx.Done():
 		t.Fatalf("join ended expand-pass generator cleanup: %v", ctx.Err())
+	}
+	select {
+	case <-argsRemoved:
+		t.Fatal("constructed client args were removed twice")
+	default:
 	}
 
 	window.stateLock.Lock()

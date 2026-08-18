@@ -173,8 +173,13 @@ func TestExpandReplacementDeclineSourceAnchor(t *testing.T) {
 	if !strings.Contains(body, `"expand_decline"`) {
 		t.Error("a declined replacement is not logged, so the decline is invisible in field logs")
 	}
-	if !strings.Contains(body, "RemoveClientArgs(&args.MultiClientGeneratorClientArgs)") {
-		t.Error("expand no longer returns declined/failed args to the generator")
+	// Once newMultiClientChannel succeeds, its cancellation goroutine owns both
+	// the Client and its generator args and retires them through
+	// RemoveClientWithArgs. A second direct RemoveClientArgs call revokes the
+	// derived JWT before final contract-close controls finish. The one remaining
+	// call is the pre-ownership construction-error path.
+	if count := strings.Count(body, "RemoveClientArgs("); count != 1 {
+		t.Errorf("expand has %d direct RemoveClientArgs calls, want only the construction-error cleanup", count)
 	}
 
 	gate, ok := functionBody(source, "func (self *multiClientWindow) replacementAllowed(")

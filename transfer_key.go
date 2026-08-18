@@ -81,7 +81,6 @@ type ClientKeyManager struct {
 // fresh seed is generated. Callers can read the running seed back via
 // `Seed()` to persist it across restarts.
 func NewClientKeyManager(ctx context.Context, client *Client) (*ClientKeyManager, error) {
-	managerCtx, cancel := context.WithCancel(ctx)
 	var pub ed25519.PublicKey
 	var priv ed25519.PrivateKey
 	seed := client.settings.ClientKeySeed
@@ -106,6 +105,7 @@ func NewClientKeyManager(ctx context.Context, client *Client) (*ClientKeyManager
 			return nil, fmt.Errorf("generate client key: %w", err)
 		}
 	}
+	managerCtx, cancel := context.WithCancel(ctx)
 	m := &ClientKeyManager{
 		ctx:         managerCtx,
 		cancel:      cancel,
