@@ -1,20 +1,16 @@
 package connect
 
-// Tests for the sequence lane discriminators (Pack fields 10/11, 2026-08).
-// The sender stamps its local route options (force_stream,
-// companion_contract) on every Pack so the receiver keys its head slot per
-// lane: same-class sequences on different lanes coexist instead of
-// superseding each other, which removes the wire-indistinguishable retire
-// for those axes (and its lossy flapping under alternating senders).
+// Tests for receiver-visible sequence discriminators (Pack fields 10/11/12,
+// 2026-08). The sender stamps its local force_stream, companion_contract, and
+// bounded logical-lane identity on every Pack so distinct sequences coexist
+// instead of superseding each other.
 //
 // Edge cases covered here:
-//   - older clients: a Pack without the lane fields decodes to the
-//     false/false lane, byte-identical to the legacy behavior
-//   - parallel sequences on every legal lane at once, interleaved per
-//     message (the historical flap trigger), with exact-once in-order
-//     delivery per lane (no cross-talk)
-//   - sender and receiver each hold one live sequence per lane, no
-//     supersession across lanes
+//   - older clients: a Pack without discriminator fields decodes to
+//     false/false/logical-zero, byte-identical to the legacy behavior
+//   - the historical force-stream/companion sequences remain isolated when
+//     interleaved; logical-lane loss isolation is covered separately
+//   - sender and receiver each hold one live sequence per discriminator
 // Same-lane supersession (the legacy reset semantic) is covered by
 // TestSendReceiveSenderReset, which is unchanged by lanes.
 
@@ -47,35 +43,48 @@ func TestPackLaneCodecLegacyAbsent(t *testing.T) {
 	AssertEqual(t, ok, true)
 	AssertEqual(t, pack.ForceStream, false)
 	AssertEqual(t, pack.CompanionContract, false)
+	AssertEqual(t, pack.LogicalLane, uint32(0))
 	returnDecodedPackMessageBytes(pack)
 
 	owner, ok := decodePackOwned(legacyBytes)
 	AssertEqual(t, ok, true)
 	AssertEqual(t, owner.pack.ForceStream, false)
 	AssertEqual(t, owner.pack.CompanionContract, false)
+	AssertEqual(t, owner.pack.LogicalLane, uint32(0))
 	owner.release()
 
-	for _, lane := range [][2]bool{{true, false}, {false, true}, {true, true}} {
+	for _, lane := range []struct {
+		forceStream       bool
+		companionContract bool
+		logicalLane       uint32
+	}{
+		{forceStream: true, logicalLane: 1},
+		{companionContract: true, logicalLane: 8},
+		{forceStream: true, companionContract: true, logicalLane: 4},
+	} {
 		laned := &protocol.Pack{
 			MessageId:         NewId().Bytes(),
 			SequenceId:        NewId().Bytes(),
 			SequenceNumber:    9,
-			ForceStream:       lane[0],
-			CompanionContract: lane[1],
+			ForceStream:       lane.forceStream,
+			CompanionContract: lane.companionContract,
+			LogicalLane:       lane.logicalLane,
 		}
 		lanedBytes, err := proto.Marshal(laned)
 		AssertEqual(t, err, nil)
 
 		pack, ok := decodePack(lanedBytes)
 		AssertEqual(t, ok, true)
-		AssertEqual(t, pack.ForceStream, lane[0])
-		AssertEqual(t, pack.CompanionContract, lane[1])
+		AssertEqual(t, pack.ForceStream, lane.forceStream)
+		AssertEqual(t, pack.CompanionContract, lane.companionContract)
+		AssertEqual(t, pack.LogicalLane, lane.logicalLane)
 		returnDecodedPackMessageBytes(pack)
 
 		owner, ok := decodePackOwned(lanedBytes)
 		AssertEqual(t, ok, true)
-		AssertEqual(t, owner.pack.ForceStream, lane[0])
-		AssertEqual(t, owner.pack.CompanionContract, lane[1])
+		AssertEqual(t, owner.pack.ForceStream, lane.forceStream)
+		AssertEqual(t, owner.pack.CompanionContract, lane.companionContract)
+		AssertEqual(t, owner.pack.LogicalLane, lane.logicalLane)
 		owner.release()
 	}
 }

@@ -1,7 +1,7 @@
 # Low-bar network delivery plan
 
 Status: living implementation plan
-Last updated: 2026-08-18
+Last updated: 2026-08-19
 
 ## Outcome
 
@@ -134,6 +134,13 @@ Current code facts:
   ([RFC 8446](https://www.rfc-editor.org/rfc/rfc8446.html#section-8)).
 - Transfer normally ACKs, orders, and retries Packs. Its cold resend interval is
   two seconds; sampled intervals use a bounded mean-RTT-derived estimator.
+- A Transfer ACK now keeps reply affinity with the carrier that delivered the
+  newest Pack covered by that ACK. Queue pressure cannot spill it onto a tied
+  sibling; physical carrier withdrawal permits immediate fallback. A late
+  retransmit below the cumulative head cannot move a newer H3 ACK back to H1.
+  If an ordinary H1 Transfer RTO occurs while tied H3 remains healthy, only
+  that affected ordered selector moves to H3; both transports remain active,
+  and queue pressure alone is never failover evidence.
 - Recovery now follows the lane that accepted each exact write, not the
   route-wide H3 capability. Only a successful DATAGRAM write consumes the
   unreliable flight and uses the two-second retry ceiling. A successful hybrid
@@ -148,17 +155,56 @@ Current code facts:
   reliable stream. A single-packet inner MTU of 944 bytes (934 for two
   coalesced packets totaling the MTU) is the exact one-DATAGRAM boundary. The
   observed 1,515-byte opening item is contract-only and also uses stream.
-- Most ordinary IP traffic to one provider currently shares one ordered
-  Transfer lane. A missing sequence number can therefore delay later Packs for
-  unrelated inner flows even after all callback handoffs are nonblocking.
-- Native P2P fast traffic now publishes its actual unreliable RTP/SRTP carrier
-  semantics to Transfer. Transfer therefore keeps end-to-end ACK recovery but
-  limits its unacknowledged flight instead of treating a live data channel as
-  proof of delivery. The carrier readers enqueue without waiting into a
-  16-message / 256-KiB queue; that count includes the item held by the one
-  owned worker that may wait on RouteManager. The
-  separate count and byte limits preserve the former worst-case payload memory
-  while admitting the small ACK/control bursts seen on the one-bar trace.
+- IPv4 UDP now remains correct at that product MTU. A QUIC Initial is at least
+  1,200 UDP bytes, so the synthetic gVisor device stack emits two IPv4 fragments
+  at an advertised 1,100-byte TUN MTU. NAT send shards pin all fragments of one
+  datagram together and reassemble them before UDP parsing. Device and provider
+  security gates independently inspect the complete UDP datagram, then Transfer
+  retains the original ordered fragments so no tunnel packet exceeds the
+  product MTU. Provider replies are emitted as real IPv4 fragments rather than
+  several corrupt independent UDP datagrams. Fragmented TCP is rejected at both
+  security boundaries—including TCP/25—rather than letting a partial transport
+  header bypass SMTP or CFAA policy; ordinary TCP is expected to segment at its
+  negotiated MSS. Each gate or NAT shard retains at most 16 incomplete
+  datagrams, 64 fragments per datagram, and 64 KiB for a hard 15-second lifetime;
+  overlaps and conflicting final boundaries discard the whole datagram. The
+  reassembler accepts the DF+fragment form emitted by gVisor and clears fragment
+  flags on the canonical policy copy. Before retained fragments cross parallel
+  H3 stream/DATAGRAM routes, each completed group receives a fresh nonzero IPv4
+  identification and corrected checksums; this prevents two gVisor ID-zero
+  groups from collapsing into one reassembly identity after interleaving. The
+  provider UDP read buffer is a bounded 2 KiB so an ordinary QUIC datagram is
+  complete before packetization. IPv6 remains unadvertised and oversized IPv6
+  UDP is rejected instead of being split into application-visible datagrams.
+  Real iOS and Android behavior when an app sends QUIC's 1,200-byte minimum
+  through a 1,100-byte VPN route remains an explicit real-device follow-up; the
+  synthetic result is not evidence that a platform kernel will fragment rather
+  than return a message-too-large error.
+- The production default still sends ordinary IP traffic to one provider on
+  one ordered Transfer lane. An opt-in, version-negotiated prototype can hash
+  exact directional IP five-tuples over 1, 4, or 8 bounded data lanes while
+  retaining lane 0 for compatibility/control. A peer must advertise support in
+  an ACK from its live lane-0 sequence before implicit data lanes activate;
+  old peers therefore stay on lane 0. The lane is Transfer identity, not a QUIC
+  stream id, and follows sequence, ACK, retransmit, reply, encryption, contract,
+  replay, and teardown paths. Nonzero lanes share fixed lazy byte budgets and
+  divided channel headroom, so enabling eight lanes does not multiply the
+  configured memory ceiling. Active data lanes pin their negotiating lane-0
+  lifetime; losing that base sequence clears capability and cancels its data
+  lanes rather than silently continuing with stale negotiation.
+- Every P2P data-plane mode publishes unreliable delivery semantics to
+  Transfer. Fast RTP/SRTP can lose below Transfer, while legacy SCTP still ends
+  at the same bounded, nonblocking application handoff; a live carrier in
+  either mode is not proof of end-to-end delivery. Transfer therefore retains
+  ACK recovery and limits one destination to 255 unacknowledged messages and a
+  240-KiB data flight. The carrier readers enqueue without waiting into a
+  256-message / 256-KiB queue; the remaining 16 KiB is carrier-specific reserve
+  for cumulative ACK, compact-recovery, contract, and probe traffic.
+  That count includes the item held by the one owned worker that may wait on
+  RouteManager. The shared Client ReceiveSequence handoff independently admits
+  256 messages with a hard 256-KiB retained-Transfer-byte ceiling. Matching the
+  count headroom removes avoidable small-packet drops without increasing the
+  prior byte budget or violating `receiveBuffer.Pack(..., 0)`.
 - Transfer queues are sized in bytes, but at a 64 kbit/s uplink even 1 MiB is
   more than two minutes of serialization. A memory-safe queue can still be a
   catastrophic latency queue.
@@ -176,6 +222,8 @@ baseline. See
 | Provider TCP timestamps at 1 s RTT / 64 KiB upload | 25.087 s to 3.081 s (8.14x). Endpoint TCP behavior can dominate tunnel results. |
 | Provider window growth | Raising the provider maximum helped warmed tests; raising TUN capacity to 16 MiB overflowed the 4096-packet queue and timed out. More buffering is not a general low-bar fix. |
 | Mixed Auto, 256 KiB warmed upload at 1/0.25 Mbit/s | A refreshed five-run current-tree matrix measured Auto at 14.983 s / 876,468 B, forced H3 at 15.268 s / 818,234 B, and forced H1 at 30.285 s / 1,976,566 B using all correctness-valid samples. Auto and H3 were about 50% faster and 56--59% lower-byte than H1. |
+| Repaired 1,100-MTU Auto download, 256 KiB latency under load | Before ACK carrier affinity, three exact runs had 17.007 s tunneled, 22.749 s carrier, and 1,437,926 B wire medians. With newest-covered-Pack ACK affinity and selector-local H1 timeout failover, three exact runs measured 13.255 s, 18.727 s, and 1,216,878 B: 22.1% faster tunneled completion, 17.7% faster carrier completion, and 15.4% fewer wire bytes. Forced H3 remains faster at 9.760 s tunneled and 851,562 B wire median. |
+| Same-harness Auto upload ACK-affinity control | Three exact ACK-affine runs measured 15.967 s and 905,198 B medians versus 17.267 s and 922,338 B with only ACK affinity disabled: 7.5% faster and 1.9% fewer wire bytes. The loaded-probe delivery median also rose from 93.1% to 94.7%. |
 | Native P2P fast, same workload/profile | The initial current-tree baseline delivered only 1/5 exact payloads: 44.646 s / 561,768 B median, with small receive-queue drops in four runs. Publishing unreliable carrier semantics plus the byte-bounded receive queue delivered 5/5 in 22.921 s / 478,585 B with zero receive-queue drops: 48.7% faster and 14.8% lower-byte. |
 
 The authoritative five-run Wi-Fi/LTE/mobile-poor campaign is incomplete. No
@@ -328,17 +376,24 @@ Remaining work:
 cross-flow head-of-line blocking when many independent five-tuples share the
 lane.
 
-- [ ] Measure gap delay by inner five-tuple and identify which current
-  `TransferKey` combinations share a sequence.
-- [ ] Prototype a bounded number of logical data lanes: one control lane plus
+- [~] Measure gap delay by inner five-tuple and identify which current
+  `TransferKey` combinations share a sequence. Deterministic loss now proves
+  lane-1 blackholing does not stop lane 2; production-trace attribution remains.
+- [x] Prototype a bounded number of logical data lanes: one control lane plus
   4 and 8 five-tuple-hash data-lane candidates. Do not create an unbounded
   sequence per flow.
-- [ ] Add the lane as a logical routing key following every producer and
+- [x] Add the lane as a logical routing key following every producer and
   consumer rule in `CODESTYLE.md`; never use a transport-local QUIC stream ID.
-- [ ] Share byte budgets across lanes so lane count does not multiply memory.
-- [ ] Verify that loss in one lane does not delay another, and that in-lane
+- [x] Share byte budgets across lanes so lane count does not multiply memory.
+  Disabled clients allocate no lane budget; enabled clients create one shared
+  send and receive budget lazily, and channel capacity is divided across the
+  maximum supported lane count.
+- [x] Verify that loss in one lane does not delay another, and that in-lane
   ordering, contract state, encryption role/companion, reform, replay, and
-  fallback compatibility remain correct.
+  fallback compatibility remain correct. The lossy negotiated-pair regression
+  holds lane 1, delivers and ACKs lane 2, then releases lane 1; codec-equivalence,
+  legacy-peer, exact-ACK-routing, capability-lifetime, budget, and race tests
+  cover the adjacent boundaries.
 
 Queue admission must happen before Transfer assigns a sequence number. Dropping
 an already-numbered item creates the very gap the scheduler is meant to avoid.
@@ -581,6 +636,22 @@ the tunnel's completion as an infinite percentage win.
   resident generation instead of silently skipping acknowledged state.
 - [x] Record device/provider platform carrier refusals at PERFVAR's exact
   interval boundary and invalidate contaminated schema-5 measurements.
+- [x] Make the 1,100-byte product MTU compatible with standards-required QUIC
+  startup. Add bounded, overlap-rejecting IPv4 fragment reassembly before NAT
+  parsing, complete-datagram device/provider security inspection, ordered
+  original-fragment forwarding, standards-correct IPv4 fragmentation for
+  provider UDP replies, and enough bounded UDP socket read space for a complete
+  QUIC Initial. Fragmented TCP is rejected before SMTP/CFAA routing. The real
+  full-TUN inner-QUIC synthetic correctness workload covers both directions;
+  platform-kernel behavior remains in the real-device follow-up.
+- [x] Give every retained IPv4 fragment group a fresh nonzero wire identity
+  before asynchronous routing. This preserves two interleaved gVisor ID-zero
+  datagrams across parallel H3 lanes without relaxing the fragment budgets.
+- [x] Match unreliable P2P flight and zero-wait receive handoffs by message
+  count while retaining independent 256-KiB byte ceilings. All P2P modes remain
+  Transfer-ACKed and are bounded as unreliable through their final handoff; a
+  240-KiB carrier-specific flight leaves 16 KiB inside the unchanged queue
+  ceiling for untracked control.
 - [x] Complete the adjacent receive-callback audit. The shared Client pump,
   exact-delivery and encryption fixtures, control-sync collector, mux and
   multi-client provider echoes, contention benchmarks, WebRTC signal/data,
@@ -615,8 +686,51 @@ single trace can attribute each retry and queue delay to its owning layer.
   1,400-to-1,280-to-1,400 outer-MTU transition in direct calibration and all
   four current carriers. NAT rebind, address-change, UDP-blocked, oscillating
   capacity, and field-trace replay still need campaign integration.
-- [ ] Add privacy-safe trace capture/replay and collect representative physical
-  iOS and Android cellular traces.
+- [~] In the next real-device follow-up, add privacy-safe trace capture/replay
+  and collect representative physical iOS and Android cellular traces. Android
+  now has a dependency-free host sampler in
+  `app/scripts/physical_lowbar_capture.mjs`. It keeps raw `dumpsys` data only in
+  memory, emits allow-listed NDJSON radio/VPN/battery/thermal/memory/interface
+  telemetry, and can invalidate any sample that is not cellular, active-VPN,
+  unmetered, IPv4-only, unplugged, and at or below a requested Android signal
+  level. Its parser/eligibility fixtures pass, and a physical-device smoke run
+  correctly rejected a strong-signal, USB-powered, no-VPN sample. The Debug
+  iOS physical-page driver now records sanitized physical-path state, app
+  footprint, power/thermal state, exact transport settings, and aggregate plus
+  per-transport `DeviceRemote` packet-counter deltas. It can now stop the
+  Network Extension non-destructively for a proven Direct sample or pin H1,
+  H3, Auto, DNS, or DNS-pump on the active `DeviceRemote`; readiness verifies
+  the stopped/connected route and requested mode before timing. Focused
+  simulator tests validate its configuration, serialization, SDK bindings,
+  counter attribution, explicit reset detection, and bounded device-log
+  framing. A dependency-free iOS host collector now launches the driver,
+  reassembles those frames, strips URLs/identifiers/raw errors, waits for route
+  cleanup, and rejects unconfirmed one-bar, non-cellular, powered, low-power,
+  hot, wrong-route, wrong-carrier, reset-counter, or incomplete samples. These
+  are instrumentation validations, not physical low-bar performance evidence.
+  A paired campaign analyzer now requires at least five balanced-order
+  Direct-before/H1-H3-Auto/Direct-after cycles, stable sanitized path and page
+  content shape, chronological unique runs, bounded cycle duration, and
+  per-page Direct drift below a configured threshold. It reports candidate
+  timing/byte ratios against the enclosing Direct mean plus actual carrier
+  bytes per browser byte without emitting source paths or timestamps. A
+  one-command campaign runner creates a non-overwriting private directory,
+  randomizes a position-balanced six-order design, executes all Direct brackets
+  and forced candidates, persists the first failed sanitized sample, and emits
+  a comparison only when the complete analyzer gate passes.
+  Still run the iOS driver on a physical weak-signal device, add header-only
+  device and edge capture plus privacy-safe trace replay, and correlate captures
+  with the production transport/reliability counters.
+  Then compare direct, forced H1, forced H3, Auto, and P2P where available on
+  the same real weak-radio path.
+  Capture cold readiness, exact
+  completion, loaded p50/p95, delivery ratio, retries, carrier bytes, H3 lane
+  selection, memory recovery, battery/thermal state, interface transitions,
+  and the application-visible result of a 1,200-byte QUIC Initial over the
+  advertised 1,100-byte VPN route. Device/edge packet captures and platform
+  radio telemetry are the acceptance evidence. Do not treat simulator,
+  shaped-host, or an eligibility-rejected device run as physical-radio
+  evidence.
 - [ ] Measure direct traffic beside each tunnel mode and freeze release gates.
 
 Exit: checked-in profiles and artifacts reproduce the current tails closely
@@ -665,8 +779,12 @@ candidate beats current H3 without regressing H1 completion.
 
 ### Phase 3 — lanes, scheduling, and collapse ownership
 
-- [ ] Add bounded logical lane negotiation and carry its routing key through
+- [x] Add bounded logical lane negotiation and carry its routing key through
   every in-order, optimistic, batch, resend, replay, encryption, and reply path.
+  The wire version is advertised only by a live lane-0 ACK. Old peers ignore the
+  additive fields and never activate implicit lanes; an explicit reply retains
+  the inbound lane. Data lanes reuse the negotiated encryption session and pin
+  the base sequence until their last dependent sequence exits.
 - [~] Add the pre-sequence flow-fair scheduler and control/interactive reserve.
   The sender now carries a stable scheduling key into a packet-aware per-flow
   scheduler, skips blocked flow heads without blocking receive callbacks, and
@@ -678,7 +796,10 @@ candidate beats current H3 without regressing H1 completion.
   and a separately budgeted control lane remain open.
 - [ ] Bind multi-TCP collapse holds to explicit Transfer recovery items and
   adaptive recovery timing.
-- [ ] Run 1/4/8-lane A/B tests under loss and 4/16/64-flow workloads.
+- [~] Run 1/4/8-lane A/B tests under loss and 4/16/64-flow workloads. The first
+  schema-13 four-flow, 256-KiB one-bar trace completed correctly for 0/1/4/8,
+  but every nonzero candidate was slower; keep the default at zero. Repeated
+  16/64-flow and interactive-tail campaigns remain before any rollout.
 
 Exit: loss in one data lane does not stall another, memory stays within the
 single shared budget, and interactive tails improve under bulk load.
@@ -758,6 +879,19 @@ single shared budget, and interactive tails improve under bulk load.
   Keep affinity per destination-keyed sequence so H1 and H3 retain equal
   precedence and remain live in parallel. Flow-identity propagation through
   Transfer and physical-radio validation remain open.
+- [x] Keep Transfer ACKs on the carrier of the newest Pack they cumulatively
+  acknowledge. The ACK writer uses an immutable, allocation-free per-carrier
+  route view, waits on that live carrier under queue pressure, and falls back
+  only after withdrawal. Selective and contract-recovery ACKs retain their own
+  inbound carrier; cumulative coalescing retains the newest covered Pack, so a
+  late H1 retransmit cannot poison a newer H3 ACK. A same-harness three-run
+  download comparison improved median tunneled completion 22.1% and wire bytes
+  15.4%; the upload control improved completion 7.5% and wire bytes 1.9%. An
+  H1 end-to-end timeout may move only the affected selector to healthy H3. A
+  broader client-wide timeout preference was not retained: with the corrected
+  ACK rule its three-run median was 15.539 seconds / 1,378,095 bytes versus the
+  selector-local candidate's 13.255 seconds / 1,216,878 bytes, and none of
+  those measured intervals actually activated the broader transition.
 - [~] Bound native P2P fast traffic from receiver evidence. The RTP/SRTP lane
   now advertises unreliable semantics through every connected/readiness route
   publication, so Transfer ACK flight control remains active. Carrier readers
@@ -922,7 +1056,9 @@ or fallback regression.
 - Recovery: single loss, burst loss, ACK loss, duplicate, reorder, long gap,
   outage, and connection-generation replay.
 - Fragmentation: every boundary size, last-fragment loss, duplicate fragments,
-  inconsistent metadata, timeout, peer/global budget exhaustion, and fuzzing.
+  inconsistent metadata, timeout, peer/global budget exhaustion, complete-
+  datagram security inspection at client and provider, fragmented-TCP policy
+  rejection, and fuzzing.
 - Lanes: deterministic loss in lane A with progress in lane B; all routing-key
   delivery paths; legacy peer fallback; lane-count mismatch; shared budget.
 - Collapse: SYN/RST, FIN, ACK/window progress, zero window, wraparound, held
@@ -968,6 +1104,11 @@ timeouts, following `CODESTYLE.md`.
     sticky across network changes?
 11. What authenticated health signal and conntrack-drain threshold should gate
     the now-Warp-owned UDP/53-to-8053 DNAT during activation and rollback?
+12. On real iOS and Android VPN routes advertised at 1,100 bytes, do common QUIC
+    stacks emit fragmentable IPv4 traffic, adapt without falling below QUIC's
+    1,200-byte Initial requirement, or fail the send with message-too-large?
+    Resolve this from packet capture and application-visible errors on physical
+    devices before treating synthetic inner-QUIC success as a mobile result.
 
 ## Findings log
 
@@ -1031,6 +1172,12 @@ timeouts, following `CODESTYLE.md`.
 | 2026-08-18 | A count-only P2P flight cap exposed a queue-shape conflict: four slots avoid large-frame memory growth but can reject tiny ACK/control bursts; reserving still more slots removed drops only by reducing throughput. | Separate receive count from bytes. Sixteen messages with a hard 256-KiB aggregate ceiling retain the former four-by-64-KiB worst-case payload memory, while a 15-message Transfer data flight leaves one untracked ACK/control slot. The retained five-run result is 5/5 exact, zero queue drops, 22.921 s / 478,585 B median. |
 | 2026-08-18 | Loaded-latency instrumentation showed 20--24 H3 flow-reserve selections per run but zero reserve uses. Those selected Packs were requested NoAck logical groups: the reserve was acting as an implicit scheduler permission even though the messages never entered ACK flight. | Make NoAck admission explicit and contract-safe for the exact next serialized chunk. Keep the single bounded reserve for genuinely ACK-required new flows. Schema 9 records NoAck bypass, reserve selection/use, and both endpoints' H3 DATAGRAM/stream lanes so the two mechanisms cannot be conflated again. |
 | 2026-08-18 | quic-go's packet packer takes one submitted DATAGRAM before retransmitted or new STREAM data, but URnetwork's H3 writer consumes both lanes from one FIFO and may block while handing a ready stream batch to QUIC. Disabling hybrid stream batching did not expose a latency win: two runs were 32--39% slower than the retained median and 8--9% higher-byte. | Keep stream batching. If lane submission is split, preserve one byte-bounded ownership budget and prove DATAGRAM progress while a stream handoff is blocked; do not approximate that architecture by shrinking batches. |
+| 2026-08-19 | The production 1,100-byte application MTU is below QUIC's mandatory 1,200-byte Initial payload. The synthetic gVisor TUN emits two IPv4 fragments, including a nonstandard-looking DF+MF/offset combination; the previous NAT parser dropped them, and the previous UDP return path split one payload into corrupt independent datagrams. | Retain bounded IPv4 reassembly and real fragmentation. Inspect only a canonical complete UDP datagram at both device and provider security boundaries, forward the original ordered fragments through Transfer, reject fragmented TCP before SMTP/CFAA routing, and accept then normalize gVisor's emitted flag form. Treat whether real iOS/Android kernels fragment or reject this send as a separate physical-device gate. |
+| 2026-08-19 | Race instrumentation stretched a clean loaded phase past 1,000 probes and exposed overlap between the old loaded range beginning at 1,000 and post-load range beginning at 2,000. A late, valid loaded reply was consequently reported as corrupt post-load data. | Assign idle, loaded, and post-load probes disjoint 64-bit sequence ranges and pin a late reply after 5,000 loaded sequences. Keep the ordinary 2 MiB directional correctness phases; scale only the race-instrumented payload to 256 KiB so the race gate checks ownership and concurrency instead of timing out on instrumentation overhead. |
+| 2026-08-19 | gVisor emits locally fragmented DF packets with IPv4 identification zero. That identity is sufficient while each group stays contiguous, but parallel H3 stream and DATAGRAM routes can interleave two retained groups and make the downstream reassembler treat them as one datagram. | After complete-datagram policy inspection, assign every retained group a fresh nonzero identification, clear DF on its owned fragments, and recompute each header checksum before asynchronous routing. A deterministic interleaving regression proves both groups reassemble independently. |
+| 2026-08-19 | The 1 s RTT P2P 32 MiB gate first transferred only 3,381,116 bytes of its 12.5 MiB BDP warmup before timing out behind the old 15-message destination flight. Removing that cap progressed much farther, but then exposed zero-wait drops at the default 32-slot Client ReceiveSequence even though the P2P carrier queue itself dropped nothing. Matching both count bounds produced one isolated pass, but a combined repetition then filled essentially all 256 KiB of carrier payload and dropped one 1,206-byte message. | Keep every P2P mode Transfer-ACKed and classify its complete bounded handoff as unreliable. Derive a 255-message destination flight from the 256-message P2P queue, give the Client handoff matching 256-message headroom, and independently cap both handoffs at 256 KiB. Tighten only P2P's data flight to 240 KiB, retaining 16 KiB under the unchanged carrier ceiling for untracked ACK/recovery/contract/probe traffic. The old timer then reached 31,616,264/33,554,432 bytes with zero queue drops, gaps, timeouts, or reductions; correctness-only deadline headroom preserved the slower result and the exact gate passed in 272.99 s. |
+| 2026-08-19 | One ordered Transfer sequence is a real cross-flow loss domain, but an additive wire field alone is not a safe rollout. A peer could ignore the field or capability evidence could outlive the lane-0 sequence that negotiated it. | Retain the bounded logical-lane implementation as an opt-in correctness feature: stable exact directional five-tuple hashing over at most eight lanes; capability accepted only from a live lane-0 ACK; base-lifetime pinning and downgrade cancellation; exact per-sequence ACK routing; and shared lazy send/receive budgets. Keep the production default at zero until latency measurements win. |
+| 2026-08-19 | The first schema-13 one-bar four-flow comparison completed exact and calibration-valid at every 0/1/4/8 setting, but nonzero lanes took 5.8--10.2% longer. They reduced wire bytes by 36.2--68.6%; allocation bytes improved for 1 and 8 but regressed for 4. | Do not trade completion for byte count on a low-bar path and do not enable lanes by default. Preserve the correctness work and its benchmark switch, then measure repeated 16/64-flow and latency-under-load cohorts before revisiting the default. |
 
 ## Results log
 
@@ -1131,6 +1278,19 @@ timeouts, following `CODESTYLE.md`.
 | 2026-08-18 | Rejected H1/legacy reliable-stream recovery-delay generalization | A fixed eight-second delay first improved an isolated severe carrier, but the ten-pair production-shaped H1 workload raised total bytes 1.6%, drops 7.2%, and device/provider timeout rewrites 6.5%/16.0%; only 6/10 time pairs and 5/10 wire pairs won. A scaled four-to-eight-second variant then regressed five-pair H1 median time 38.4%, wire bytes 10.8%, and queue drops 90%. | Both candidates were removed. Only negotiated H3 hybrid-stream writes use the delayed nested recovery and exact accepting-route retirement retry. H1/legacy retains normal Transfer ACK/retry. Transport-up is never treated as proof of delivery. |
 | 2026-08-18 | Terminal raw `SendPack` pool-publication ownership | The broad PERFVAR race tier found sequence cleanup reading `SendPack.admission` after `releaseRaw()` had already published the object to the Client reuse pool and another provider-return sender had begun reinitializing it. `releaseRaw()` is now explicitly terminal; every redundant post-publication admission release was removed, leaving enqueue rejection as the only separate pre-publication release path. | Focused raw lifecycle/cancellation tests passed 20 times under `-race`; the exact P2P-fast MTU reproducer passed in 58.481 s; the complete PERFVAR short race tier passed in 398.440 s with no `GORACE` report. The earlier `becfc1575333` performance cohort is retained only as variance evidence because it predates this repair. |
 | 2026-08-18 | Authoritative repaired-source loaded-latency A/B, frozen binaries `2dec572e9a2a` and `fb9907a00f08` | Five alternating-order, fresh-process pre-split/final pairs under the same schema-11 one-bar scenario; artifacts `/tmp/lowbar-openloop-v20-paired-{baseline,final}-{1..5}.log` | All ten exact payloads passed. Final won all five completion pairs: median 13.531 to 12.593 s (**6.93% faster**). Loaded p50/p95 fell 1.065/2.147 to 0.572/1.453 s (**46.22%/32.33% lower**), probe delivery rose 87.26% to 95.07% (**+7.81 points**), successes/s rose **7.54%**, queue drops fell 168 to 101 (**39.88% fewer**), provider waits fell 22.14% / 30.65% by count/duration, and timeout rewrites fell 15.0%. Median wire bytes rose 836,233 to 862,065 (**3.09% higher**) and won only 1/5 pairs, so this is a latency/delivery win with a small byte-cost regression. Four final calibrations were headroom-invalid; this is the current raw paired candidate comparison, not a release-throughput or physical-radio claim. Physical one-bar iOS/Android validation remains open. |
+| 2026-08-19 | Retained-fragment identity and bounded P2P/Client handoff unit gates | Fragment interleaving and receive/P2P bound selections repeated 20 times; changed boundaries repeated five times under `-race` | Pass. Distinct nonzero IPv4 identities survive parallel-route interleaving. P2P publishes 255-message / 240-KiB data flight limits, while both carrier and Client receive handoffs remain zero-wait and hard-capped at 256 KiB. |
+| 2026-08-19 | P2P prime route-transition integration | Four direct and stream-P2P discovery/forced transition tests in one local-server invocation | Pass in 16.994 s. Each target probe was ACK-required and reached its exact terminal before exchange disable or route-ready publication. |
+| 2026-08-19 | Current-source regional warmed TCP correctness | `TestPerfvarRegionalWarmedTCPThirtyTwoMiBCorrectness/exchange-h3/single-region-500ms-rtt/upload` and the corresponding P2P-fast 1,000 ms download | H3 passed its exact 32 MiB upload in 179.80 s, then repeated after the carrier-specific controller change in 161.32 s. After preserving 16 KiB of P2P carrier headroom and separating correctness timeout from performance reporting, P2P passed its exact 32 MiB download in 272.99 s without increasing the 256-KiB receive ceilings. |
+| 2026-08-19 | Final current-source Connect package gate | `go test ./...` | Pass. Main package 482.170 s; `blocker`, `connectctl`, and `extender` green. This includes the carrier-specific byte policy, 256-message/256-KiB Client handoff, P2P queue bounds, fragment identity normalization, and adjacent recovery changes. |
+| 2026-08-19 | Canonical current-source PERFVAR gate | `go test -p=1 ./connect/perfvar -parallel=1 -count=1 -timeout=0` in the documented local server environment | Pass in 1,522.654 s. This closes the synthetic single-host validation tier for the current worktree; it is not a physical-radio performance claim. Real iOS and Android capture remains the next follow-up. |
+| 2026-08-19 | Android physical telemetry collector | Seven dependency-free parser/eligibility/privacy tests plus one strict sample on an attached physical Android handset | Tests pass. The sampler retained only allow-listed telemetry, forces replaced output files to private permissions, and correctly marked the device ineligible because the VPN was absent, the platform signal level was 4 rather than at most 1, and USB power was connected. No timing or throughput result was recorded. |
+| 2026-08-19 | iOS physical benchmark telemetry and deterministic route selection | Focused iPhone 16 Pro simulator suite covering benchmark JSON, Direct/VPN readiness, H1/H3/Auto/DNS/DNS-pump configuration, suite behavior, and three packet-snapshot tests, including the real generated SDK per-transport list binding; generic and signed physical-device builds | Pass. The Debug driver now emits sanitized path, app-memory, power/thermal, active-transport, and aggregate/per-transport packet-delta evidence; it can non-destructively stop the tunnel for Direct or temporarily pin and then restore a VPN carrier without changing persisted app settings. The signed Debug app installed on the physical iPhone. The first control channel timed out; a later launch reached the phone but iOS denied it while locked, so no physical-radio timing or throughput result was recorded. |
+| 2026-08-19 | iOS physical host acceptance gate | Twelve dependency-free Node tests, including an injected CoreDevice-process lifecycle, privacy-safe launch-failure classification, and replacement of permissive existing output files, plus the focused simulator suite with a Unicode multi-chunk round trip | Pass. Large results use bounded base64 console frames instead of one truncation-prone log message. Direct now snapshots the active provider, includes tunnel shutdown in readiness, and reconnects/verifies that provider after timing; failed preparation is transactional. The host retains raw CoreDevice output only in memory, emits allow-listed NDJSON with enforced private file permissions, requires explicit one-bar confirmation and eligible cellular/power/thermal state, proves forced-carrier or zero-remote Direct traffic, waits for policy/route restoration, and classifies locked/unreachable devices without retaining raw identities. The signed current build is installed; three real launches were correctly rejected before measurement while the phone was locked. This closes collection integrity, not the still-missing physical-radio evidence. |
+| 2026-08-19 | iOS paired physical campaign acceptance | Eight dependency-free Node tests covering a valid five-cycle campaign, summary/route/page/content/path/chronology/drift/order rejection, bounded NDJSON parsing, privacy, and the real CLI output-permission path | Pass. The analyzer requires balanced Direct-bracketed H1/H3/Auto ordering, stable cellular path fingerprints and resource/origin shape, unique chronological captures, exact eligible route/carrier evidence, bounded Direct drift, and no packet-counter inconsistency. It emits only normalized per-mode timing/byte aggregates, wins/tails, carrier cost and mix, and sanitized cycle labels. No physical result exists yet because the installed phone remains locked and no eligible one-bar campaign has run. |
+| 2026-08-19 | iOS automated physical campaign acquisition | Six dependency-free Node tests covering required signal attestation, all 5--100-cycle balanced schedules, private manifests, exact Direct/candidate sequencing, fail-fast retention, analyzer suppression on failure, and non-overwriting `0700`/`0600` storage | Pass. One command now runs a randomized position-balanced Direct-before/H1-H3-Auto/Direct-after campaign and invokes the paired analyzer only after all captures are eligible. It never persists device/provider identifiers and leaves a failed sanitized run for diagnosis. Signal-bar truth remains an operator attestation because public iOS APIs do not expose it; the actual campaign still requires an unlocked, unplugged phone on a confirmed one-bar cellular-only path. |
+| 2026-08-19 | Negotiated logical Transfer lanes | Focused wire-codec, official-codec equivalence, negotiation/downgrade, base-lifetime, exact-ACK, bounded-budget, encryption reuse, loss isolation, legacy fallback, and reply tests; changed boundaries also run under `-race` | Pass. In the lossy end-to-end pair, lane 1 was held while lane 2 delivered and ACKed independently; lane 1 then recovered after release. Disabled clients allocate no logical-lane budget, nonzero lanes share fixed byte ceilings, and an old peer remains on lane 0. |
+| 2026-08-19 | Initial logical-lane PERFVAR matrix, server schema 13 | One fresh four-flow `tcp-parallel` 256-KiB upload per 0/1/4/8 setting; `exchange-h3`, `cell-edge-1m-down-250k-up`, one hop, mobile surrogate, seed `20260810` | All four runs were exact and calibration-valid. Lane 0: 16.668 s / 670,546 B wire / 15,768,520 B allocated. Lane 1: 17.638 s / 424,735 B / 12,951,160 B. Lane 4: 18.367 s / 210,290 B / 17,269,944 B. Lane 8: 18.040 s / 427,946 B / 10,106,112 B. The nonzero candidates were respectively 5.8%, 10.2%, and 8.2% slower, so `LogicalDataLaneCount` remains zero by default despite lower wire bytes. |
+| 2026-08-19 | Post-logical-lane package and harness gates | Connect `go test . -count=1 -timeout=20m`; `blocker`, `connectctl`, and `extender`; server schema/config/construction selection normally and under `-race` | Pass. The full Connect package completed in 523.856 s; all three subpackages passed. The final added callback-key, encryption-session, contract-queue, reply, and lane-isolation selection passed normally and under the race detector. Both worktrees pass `git diff --check`. |
 
 ## References
 

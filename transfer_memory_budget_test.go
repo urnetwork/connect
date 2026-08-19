@@ -846,3 +846,71 @@ func TestTransferBudgetChurnBalance(t *testing.T) {
 	}
 	fmt.Printf("churn balance: reserved=released=%d across 4 cycles\n", reserved)
 }
+
+// The ordinary client matches the maximum unreliable message flight with
+// zero-wait receive headroom, while explicit buffer-size constructors retain
+// their caller-selected count for constrained and deadlock tests.
+func TestDefaultReceiveSequenceHandoffIsCountAndByteBounded(t *testing.T) {
+	settings := DefaultClientSettings()
+	if got := settings.ReceiveBufferSettings.SequenceBufferSize; got != 256 {
+		t.Fatalf("default receive sequence slots = %d, want 256", got)
+	}
+	if got := settings.ReceiveBufferSettings.SequenceBufferByteCount; got != kib(256) {
+		t.Fatalf("default receive sequence byte limit = %d, want %d", got, kib(256))
+	}
+
+	explicit := DefaultClientSettingsWithBufferSize(7)
+	if got := explicit.ReceiveBufferSettings.SequenceBufferSize; got != 7 {
+		t.Fatalf("explicit receive sequence slots = %d, want 7", got)
+	}
+}
+
+// Small frames may use independent count headroom, but encoded bytes waiting
+// for one ReceiveSequence worker never exceed the configured budget. Removing
+// one channel item immediately restores byte admission without waiting.
+func TestReceiveSequenceHandoffEnforcesByteBudgetWithoutBlocking(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultReceiveBufferSettingsWithBufferSize(8)
+	settings.SequenceBufferByteCount = 100
+	sequence := newReceiveSequence(
+		ctx,
+		&Client{},
+		SourceId(NewId()),
+		NewId(),
+		TransferKey{},
+		settings,
+	)
+
+	newPack := func() *ReceivePack {
+		return &ReceivePack{
+			MessageByteCount:   40,
+			TransferFrameBytes: MessagePoolGet(40),
+		}
+	}
+	first := newPack()
+	second := newPack()
+	third := newPack()
+	for index, pack := range []*ReceivePack{first, second} {
+		if accepted, err := sequence.Pack(pack, 0); !accepted || err != nil {
+			t.Fatalf("admit pack %d: accepted=%t err=%v", index, accepted, err)
+		}
+	}
+	if accepted, err := sequence.Pack(third, 0); accepted || err != nil {
+		t.Fatalf("byte-overflow pack: accepted=%t err=%v", accepted, err)
+	}
+	if got := sequence.packQueueByteCount.Load(); got != 80 {
+		t.Fatalf("retained handoff bytes = %d, want 80", got)
+	}
+
+	dequeued := <-sequence.packs
+	sequence.releasePackQueue(dequeued)
+	dequeued.messagePoolReturn()
+	if accepted, err := sequence.Pack(third, 0); !accepted || err != nil {
+		t.Fatalf("readmit after dequeue: accepted=%t err=%v", accepted, err)
+	}
+	sequence.Close()
+	if got := sequence.packQueueByteCount.Load(); got != 0 {
+		t.Fatalf("closed sequence retained %d handoff bytes", got)
+	}
+}

@@ -852,6 +852,45 @@ func TestFlushContractQueueDrainAndDetachAreAtomic(t *testing.T) {
 	manager.closeContractQueue(key, freshQueue)
 }
 
+// Logical lanes request the same backend contract class, but their local
+// queue generations must be independent. One idle lane may flush only its own
+// pending work; draining a healthy sibling would reintroduce cross-flow loss.
+func TestLogicalLanesUseIndependentContractQueueGenerations(t *testing.T) {
+	manager := &ContractManager{
+		client: &Client{log: NewNoopLogger()},
+		settings: &ContractManagerSettings{
+			TrackUsedContracts: true,
+		},
+		destinationContracts: map[ContractKey]*contractQueue{},
+	}
+	base := ContractKey{Destination: DestinationId(NewId())}
+	laneOneKey := base
+	laneOneKey.LogicalLane = 1
+	laneTwoKey := base
+	laneTwoKey.LogicalLane = 2
+	laneOneQueue := manager.openContractQueue(laneOneKey)
+	laneTwoQueue := manager.openContractQueue(laneTwoKey)
+	if laneOneQueue == laneTwoQueue {
+		t.Fatal("distinct logical lanes shared one local contract queue")
+	}
+
+	manager.FlushContractQueue(laneOneKey, true)
+	if !laneOneQueue.Drained() {
+		t.Fatal("flushed logical lane did not drain its queue")
+	}
+	if laneTwoQueue.Drained() {
+		t.Fatal("flushing one logical lane drained its healthy sibling")
+	}
+	manager.mutex.Lock()
+	retainedLaneTwo := manager.destinationContracts[laneTwoKey]
+	_, retainedLaneOne := manager.destinationContracts[laneOneKey]
+	manager.mutex.Unlock()
+	if retainedLaneOne || retainedLaneTwo != laneTwoQueue {
+		t.Fatal("logical-lane contract queue indexes were not isolated")
+	}
+	manager.closeContractQueue(laneTwoKey, laneTwoQueue)
+}
+
 // TestContractQueueShutdownFlush verifies that when the contract manager
 // closes (client context canceled), still-queued pending contracts are
 // flushed and closed rather than abandoned. The expire timeout is set long so

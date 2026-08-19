@@ -97,10 +97,17 @@ func (self *p2pRouteTestFastConn) FastPathMessages() <-chan p2pFastPathReceivedM
 	return nil
 }
 
-// The native P2P lane has no carrier retransmission. Publishing it as
-// unreliable is what activates Transfer's bounded ACK flight; Auto retains a
-// reliable disposition only while it is actually falling back to SCTP.
+// Every P2P lane ends at the same bounded, nonblocking receive handoff.
+// Publishing that complete path as unreliable activates Transfer's bounded
+// ACK flight even while Auto is falling back to SCTP.
 func TestP2pConnectionRoutePublishesFastCarrierProperties(t *testing.T) {
+	defaultSettings := DefaultP2pTransportSettings()
+	if limit := p2pUnreliableFlightMessageLimit(defaultSettings); limit != 255 {
+		t.Fatalf("default P2P route flight limit = %d, want queue-derived 255", limit)
+	}
+	if limit := p2pUnreliableFlightByteLimit(defaultSettings); limit != kib(240) {
+		t.Fatalf("default P2P route byte flight limit = %d, want 240 KiB", limit)
+	}
 	local, remote := net.Pipe()
 	defer local.Close()
 	defer remote.Close()
@@ -111,6 +118,8 @@ func TestP2pConnectionRoutePublishesFastCarrierProperties(t *testing.T) {
 			DataPlaneMode:            P2pDataPlaneModeAuto,
 			ChannelBufferSize:        4,
 			ReceiveQueueMessageCount: 16,
+			ReceiveQueueByteCount:    kib(256),
+			MaxMessageByteCount:      64 * 1024,
 		},
 	}
 	manager := &recordingP2pRouteManager{}
@@ -132,8 +141,14 @@ func TestP2pConnectionRoutePublishesFastCarrierProperties(t *testing.T) {
 			manager.properties.unreliableFlightMessageLimit,
 		)
 	}
-	if manager.properties.messageUnreliable([]byte("legacy fallback")) {
-		t.Fatal("Auto classified its not-ready SCTP fallback as unreliable")
+	if manager.properties.unreliableFlightByteLimit != kib(240) {
+		t.Fatalf(
+			"Auto fast route byte flight limit = %d, want 16 KiB receive reserve",
+			manager.properties.unreliableFlightByteLimit,
+		)
+	}
+	if !manager.properties.messageUnreliable([]byte("legacy fallback")) {
+		t.Fatal("Auto did not bound its SCTP fallback against the receive handoff")
 	}
 	fastConn.ready.Store(true)
 	if !manager.properties.messageUnreliable([]byte("native fast")) {
@@ -141,8 +156,11 @@ func TestP2pConnectionRoutePublishesFastCarrierProperties(t *testing.T) {
 	}
 
 	transport.settings.DataPlaneMode = P2pDataPlaneModeLegacyOnly
-	if properties := p2pTransferCarrierProperties(transport); properties.Unreliable {
-		t.Fatal("legacy-only P2P route was classified as unreliable")
+	if properties := p2pTransferCarrierProperties(transport); !properties.Unreliable ||
+		!properties.messageUnreliable([]byte("legacy only")) ||
+		properties.unreliableFlightByteLimit != kib(240) ||
+		properties.unreliableFlightMessageLimit != 15 {
+		t.Fatalf("legacy-only P2P route properties = %+v, want bounded handoff flight", properties)
 	}
 	transport.settings.DataPlaneMode = P2pDataPlaneModeFastOnly
 	if properties := p2pTransferCarrierProperties(transport); !properties.Unreliable ||
@@ -156,9 +174,9 @@ func TestP2pConnectionRoutePublishesFastCarrierProperties(t *testing.T) {
 	}
 }
 
-// Small ACK/control messages use the independent count headroom while large
-// frames remain constrained by the same 256 KiB payload ceiling as the former
-// four-entry 64 KiB route channel.
+// Concurrent small data/ACK/control/probe sequences use independent count
+// headroom while large frames remain constrained by the same 256 KiB payload
+// ceiling as the former four-entry 64 KiB route channel.
 func TestP2pReceiveQueueSeparatesMessageAndByteBounds(t *testing.T) {
 	settings := DefaultP2pTransportSettings()
 	settings.DataPlaneStats = &P2pDataPlaneStats{}

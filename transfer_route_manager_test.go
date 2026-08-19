@@ -267,6 +267,127 @@ func TestMultiRouteWriterDirectAffinityFailsOverWithoutOscillation(t *testing.T)
 	}
 }
 
+// An ordinary Transfer timeout on bytes already accepted by H1 is stronger
+// evidence than local queue pressure. It moves only this destination sequence
+// to the tied H3 route while keeping H1 active for other sequences.
+func TestMultiRouteWriterDirectAffinityFailsH1OverToHealthyH3OnTimeout(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	selector := NewMultiRouteSelector(
+		ctx,
+		"direct-affinity-h1-timeout",
+		nil,
+		DestinationId(NewId()),
+		true,
+	)
+	defer selector.Close()
+	h1Transport := NewSendGatewayTransportWithType(TransportTypeH1)
+	h1Route := make(Route, 2)
+	selector.updateTransport(h1Transport, []Route{h1Route})
+	h3Transport := NewSendGatewayTransportWithType(TransportTypeH3)
+	h3Route := make(Route, 2)
+	selector.updateTransport(h3Transport, []Route{h3Route})
+
+	writeAndRequire := func(want TransportType) {
+		t.Helper()
+		message := MessagePoolGet(64)
+		success, disposition, err := selector.writeDetailedWithCarrier(
+			ctx,
+			message,
+			time.Second,
+		)
+		if err != nil || !success || disposition.transportType != want {
+			if !success || err != nil {
+				MessagePoolReturn(message)
+			}
+			t.Fatalf("write=(%t, %+v, %v), want %s", success, disposition, err, want)
+		}
+		switch want {
+		case TransportTypeH1:
+			MessagePoolReturn(<-h1Route)
+		case TransportTypeH3:
+			MessagePoolReturn(<-h3Route)
+		}
+	}
+
+	writeAndRequire(TransportTypeH1)
+	if !selector.transferPreferH3AfterH1Timeout(h1Route) {
+		t.Fatal("H1 timeout did not move the tied selector to healthy H3")
+	}
+	if selector.transferPreferH3AfterH1Timeout(h1Route) {
+		t.Fatal("stale H1 timeout changed an already-H3-affine selector twice")
+	}
+	writeAndRequire(TransportTypeH3)
+	if len(selector.GetActiveRoutes()) != 2 {
+		t.Fatalf("timeout failover removed a healthy carrier: %v", selector.GetActiveRoutes())
+	}
+	stats := selector.directAffinity.snapshot()
+	if stats.PreferredH1WriteCount != 1 ||
+		stats.PreferredH3WriteCount != 1 ||
+		stats.FallbackH1WriteCount != 0 ||
+		stats.FallbackH3WriteCount != 0 ||
+		stats.H1TimeoutFailoverCount != 1 ||
+		stats.RouteChangeCount != 1 ||
+		!stats.H3PreferredAfterH1Timeout {
+		t.Fatalf("H1 timeout affinity stats=%+v", stats)
+	}
+}
+
+func TestRouteManagerH1TimeoutPreferenceStaysOnAffectedSelector(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager := NewRouteManager(ctx, "shared-h1-timeout")
+	destinationA := DestinationId(NewId())
+	destinationB := DestinationId(NewId())
+	writerA := manager.OpenMultiRouteWriter(destinationA)
+	defer manager.CloseMultiRouteWriter(writerA)
+	writerB := manager.OpenMultiRouteWriter(destinationB)
+	defer manager.CloseMultiRouteWriter(writerB)
+	h1Transport := NewSendGatewayTransportWithType(TransportTypeH1)
+	h1Route := make(Route, 4)
+	manager.UpdateTransport(h1Transport, []Route{h1Route})
+	h3Transport := NewSendGatewayTransportWithType(TransportTypeH3)
+	h3Route := make(Route, 4)
+	manager.UpdateTransport(h3Transport, []Route{h3Route})
+
+	writeAndRequire := func(writer MultiRouteWriter, want TransportType) {
+		t.Helper()
+		selector := writer.(*MultiRouteSelector)
+		message := MessagePoolGet(64)
+		success, disposition, err := selector.writeDetailedWithCarrier(
+			ctx,
+			message,
+			time.Second,
+		)
+		if err != nil || !success || disposition.transportType != want {
+			if err != nil || !success {
+				MessagePoolReturn(message)
+			}
+			t.Fatalf("write=(%t, %+v, %v), want %s", success, disposition, err, want)
+		}
+		if want == TransportTypeH1 {
+			MessagePoolReturn(<-h1Route)
+		} else {
+			MessagePoolReturn(<-h3Route)
+		}
+	}
+
+	writeAndRequire(writerA, TransportTypeH1)
+	writeAndRequire(writerB, TransportTypeH1)
+	if !writerA.(*MultiRouteSelector).transferPreferH3AfterH1Timeout(h1Route) {
+		t.Fatal("H1 timeout did not move the affected selector to H3")
+	}
+	writeAndRequire(writerA, TransportTypeH3)
+	writeAndRequire(writerB, TransportTypeH1)
+	stats := manager.DirectCarrierAffinityStats()
+	if !stats.H3PreferredAfterH1Timeout || stats.H1TimeoutFailoverCount != 1 ||
+		stats.RouteChangeCount != 1 ||
+		stats.FallbackH1WriteCount != 0 || stats.FallbackH3WriteCount != 0 {
+		t.Fatalf("selector-local H1 timeout stats=%+v", stats)
+	}
+}
+
 // A full preferred queue is shared-uplink congestion, not evidence that the
 // carrier disappeared. The writer waits instead of opening a second
 // congestion-controller burst, but a physical route publication wakes that
@@ -362,6 +483,78 @@ func TestMultiRouteWriterDirectAffinityWaitsUntilRouteWithdrawal(t *testing.T) {
 		stats.PreferredBlockedCount != 2 || stats.RouteChangeCount != 1 {
 		t.Fatalf("direct affinity backpressure stats = %+v", stats)
 	}
+}
+
+func TestMultiRouteWriterCarrierPreferenceWaitsAndFallsBackOnlyAfterWithdrawal(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	selector := NewMultiRouteSelector(
+		ctx,
+		"carrier-reply-affinity",
+		nil,
+		DestinationId(NewId()),
+		true,
+	)
+	defer selector.Close()
+	h1Transport := NewSendGatewayTransportWithType(TransportTypeH1)
+	h1Route := make(Route, 1)
+	selector.updateTransport(h1Transport, []Route{h1Route})
+	h3Transport := NewSendGatewayTransportWithType(TransportTypeH3)
+	h3Route := make(Route, 1)
+	selector.updateTransport(h3Transport, []Route{h3Route})
+
+	write := func(want TransportType) {
+		t.Helper()
+		message := MessagePoolGet(64)
+		success, disposition, err := selector.writeDetailedWithCarrierPreference(
+			ctx,
+			message,
+			time.Second,
+			TransportTypeH3,
+		)
+		if err != nil || !success || disposition.transportType != want {
+			if !success {
+				MessagePoolReturn(message)
+			}
+			t.Fatalf("preferred write=(%t, %+v, %v), want %s", success, disposition, err, want)
+		}
+		if want == TransportTypeH3 {
+			MessagePoolReturn(<-h3Route)
+		} else {
+			MessagePoolReturn(<-h1Route)
+		}
+	}
+
+	write(TransportTypeH3)
+	blocker := MessagePoolGet(32)
+	h3Route <- blocker
+	blockedMessage := MessagePoolGet(64)
+	success, _, err := selector.writeDetailedWithCarrierPreference(
+		ctx,
+		blockedMessage,
+		10*time.Millisecond,
+		TransportTypeH3,
+	)
+	if err != nil || success {
+		if success {
+			MessagePoolReturn(<-h3Route)
+		} else {
+			MessagePoolReturn(blockedMessage)
+		}
+		t.Fatalf("backpressured carrier-affine write=(%t, %v), want timeout", success, err)
+	}
+	MessagePoolReturn(blockedMessage)
+	select {
+	case message := <-h1Route:
+		MessagePoolReturn(message)
+		t.Fatal("carrier-affine write spilled to H1 under H3 queue pressure")
+	default:
+	}
+	MessagePoolReturn(<-h3Route)
+
+	selector.updateTransport(h3Transport, nil)
+	write(TransportTypeH1)
 }
 
 // Affinity is intentionally narrower than generic route weighting. P2P and

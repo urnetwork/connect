@@ -128,6 +128,13 @@ message Pack {
     // traffic.
     bool force_stream = 10;
     bool companion_contract = 11;
+
+    // A bounded receiver-visible ordering lane. Lane zero is the legacy and
+    // control lane. A sender may use lanes 1..8 only after a delivery Ack on
+    // the live lane-zero sequence advertises logical_lane_version >= 1.
+    // Legacy peers ignore this field and never advertise the capability, so
+    // they continue to receive exactly one ordered sequence.
+    uint32 logical_lane = 12;
 }
 
 
@@ -159,6 +166,12 @@ message Ack {
     // contract state is missing. A sender must not emit compact contract heads
     // until a delivery Ack carries this capability; false is the legacy peer.
     bool compact_contract_recovery = 6;
+
+    // Advertises support for Pack.logical_lane. Version zero is a legacy peer.
+    // The sender scopes this evidence to the live lane-zero SendSequence and
+    // retires every nonzero lane when that sequence closes or a later delivery
+    // Ack omits the capability.
+    uint32 logical_lane_version = 7;
 }
 
 

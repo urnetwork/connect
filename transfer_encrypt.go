@@ -3461,13 +3461,36 @@ func (self *EncryptionSessionManager) AcquireForSend(
 	forceStream bool,
 	networkPeer bool,
 ) *peerEncryptionSession {
+	return self.acquireForLogicalLaneSend(
+		peerId,
+		role,
+		companion,
+		forceStream,
+		networkPeer,
+		0,
+	)
+}
+
+// acquireForLogicalLaneSend shares the existing peer/session cipher across
+// bounded data lanes. Capability is learned only from a successful lane-zero
+// delivery, so a nonzero lane never needs to start another handshake epoch;
+// doing so for each newly active flow would turn lane isolation into rekey
+// traffic on the constrained uplink.
+func (self *EncryptionSessionManager) acquireForLogicalLaneSend(
+	peerId Id,
+	role sequenceTlsRole,
+	companion bool,
+	forceStream bool,
+	networkPeer bool,
+	logicalLane uint32,
+) *peerEncryptionSession {
 	session := self.acquireSession(peerId, role, companion)
 	if session == nil {
 		return nil
 	}
 	session.carrierForceStream.Store(forceStream)
 	session.carrierNetworkPeer.Store(networkPeer)
-	if role == sequenceTlsRoleClient {
+	if role == sequenceTlsRoleClient && logicalLane == 0 {
 		session.restartHandshake()
 	}
 	return session

@@ -1379,6 +1379,60 @@ func TestAcquireForSendRestartPolicy(t *testing.T) {
 	}
 }
 
+// A negotiated data lane is another ordering sequence, not another peer
+// identity. It must retain the established cipher without starting one TLS
+// epoch per active five-tuple; lane zero remains the sole restart owner.
+func TestLogicalDataLaneReusesEncryptionSessionWithoutHandshakeRestart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultClientSettings()
+	settings.EncryptionSettings.Mode = EncryptionModeOpportunistic
+	settings.EncryptionSettings.TlsTimeout = 2 * time.Second
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+	defer client.Cancel()
+	keyManager, err := NewClientKeyManager(ctx, client)
+	AssertEqual(t, nil, err)
+	manager := NewEncryptionSessionManager(
+		ctx,
+		client,
+		keyManager,
+		settings.EncryptionSettings,
+	)
+
+	peerId := NewId()
+	laneZero := manager.acquireForLogicalLaneSend(
+		peerId,
+		sequenceTlsRoleClient,
+		false,
+		false,
+		false,
+		0,
+	)
+	if laneZero == nil {
+		t.Fatal("lane zero did not acquire an encryption session")
+	}
+	established := injectEstablishedTestEpoch(laneZero)
+	dataLane := manager.acquireForLogicalLaneSend(
+		peerId,
+		sequenceTlsRoleClient,
+		false,
+		false,
+		false,
+		4,
+	)
+	if dataLane != laneZero {
+		t.Fatal("logical data lane created a different peer encryption session")
+	}
+	if got := dataLane.currentEpoch(); got != established {
+		t.Fatal("logical data lane restarted the established handshake epoch")
+	}
+	if dataLane.establishedEpoch != established {
+		t.Fatal("logical data lane replaced the serving encryption epoch")
+	}
+	dataLane.Release()
+	laneZero.Release()
+}
+
 // TestEncryptedControlCarrierMirrorsForceStream is the regression test for
 // the network-peer + post-quantum data blackhole: the multi-client sends
 // application data with ForceStream (AllowDirect is forced on for

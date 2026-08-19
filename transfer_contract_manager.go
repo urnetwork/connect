@@ -40,6 +40,10 @@ type ContractKey struct {
 	IntermediaryIds   MultiHopId
 	CompanionContract bool
 	ForceStream       bool
+	// LogicalLane is local queue-generation identity only. It is intentionally
+	// absent from CreateContract: every lane requests the same backend contract
+	// class, but must not flush a sibling lane's pending queue on idle exit.
+	LogicalLane uint32
 	// NetworkPeer is contract sizing/retention policy, not routing identity:
 	// it is true only when the sender has an authenticated same-network
 	// relationship with Destination. Unlike ForceStream, it never classifies a

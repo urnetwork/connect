@@ -174,10 +174,11 @@ func DefaultP2pTransportSettings() *P2pTransportSettings {
 		// Receive handoff has independent count and byte limits below.
 		ChannelBufferSize: 4,
 		// The carrier readers hand off without waiting. Count and bytes are
-		// independent so ordinary 89--154-byte ACK/control bursts get enough
-		// slots while four worst-case 64 KiB messages retain exactly the old
-		// 256 KiB memory ceiling.
-		ReceiveQueueMessageCount: 16,
+		// independent: 256 slots absorb concurrent data, ACK, contract, and
+		// probe sequence bursts, while the separate byte bound still permits at
+		// most four worst-case 64 KiB messages. Channel metadata adds only a few
+		// KiB per connection and cannot expand retained payload ownership.
+		ReceiveQueueMessageCount: 256,
 		ReceiveQueueByteCount:    kib(256),
 		// Transfer batching is capped at 3 KiB, so almost every data-channel
 		// message fits in the 4 KiB pooled class. The receiver retries once
@@ -327,41 +328,49 @@ type p2pRouteManager interface {
 	RemoveTransport(Transport)
 }
 
-// p2pTransferCarrierProperties exposes the native RTP/SRTP lane to Transfer's
-// acknowledgement-flight controller. The legacy SCTP data channel performs
-// its own retransmission and remains reliable. Fast-only always uses the
-// datagram lane; Auto is potentially unreliable as soon as the peer exposes
-// that capability, while the per-message callback keeps legacy fallback
-// writes on the reliable recovery cadence until the fast lane is ready.
+// p2pTransferCarrierProperties exposes the complete P2P receive path to
+// Transfer's acknowledgement-flight controller. Both native RTP/SRTP and the
+// legacy SCTP lane terminate in a deliberately nonblocking bounded handoff;
+// even SCTP can therefore lose a complete Transfer message after its carrier
+// write succeeds. Advertising every mode as unreliable keeps at most the
+// receiver's data-slot capacity in flight and leaves one slot for cumulative
+// ACK, compact-recovery, probe, and contract control messages.
 func p2pTransferCarrierProperties(transport Transport) TransferCarrierProperties {
 	send, ok := transport.(*P2pSendTransport)
-	if !ok || send.settings == nil ||
-		send.settings.DataPlaneMode == P2pDataPlaneModeLegacyOnly {
-		return TransferCarrierProperties{}
-	}
-	if send.settings.DataPlaneMode == P2pDataPlaneModeFastOnly {
-		return TransferCarrierProperties{
-			Unreliable:                   true,
-			unreliableFlightMessageLimit: p2pUnreliableFlightMessageLimit(send.settings),
-		}
-	}
-	fastConn, ok := send.conn.(webRtcFastPathConn)
-	if !ok {
+	if !ok || send.settings == nil {
 		return TransferCarrierProperties{}
 	}
 	return TransferCarrierProperties{
 		Unreliable:                   true,
+		unreliableFlightByteLimit:    p2pUnreliableFlightByteLimit(send.settings),
 		unreliableFlightMessageLimit: p2pUnreliableFlightMessageLimit(send.settings),
-		unreliableForMessageByteCount: func(int) bool {
-			return fastConn.FastPathReady()
-		},
 	}
 }
 
-// One receive slot remains outside the ACK-required flight for cumulative
-// ACKs, compact recovery, probes, and contract control, none of which consume
-// SendSequence's flight count. A one-slot route still admits one message so a
-// minimal/test configuration cannot deadlock.
+// Reserve at least 16 KiB, or one sixteenth of a larger queue, outside the
+// destination-wide Transfer data flight. Carrier admission is deliberately
+// nonblocking and also receives untracked cumulative ACK, compact-recovery,
+// contract, and probe messages. The reserve prevents an ordinary maximum
+// flight from consuming the complete hard byte ceiling while keeping retained
+// payload at the same configured bound.
+func p2pUnreliableFlightByteLimit(settings *P2pTransportSettings) ByteCount {
+	queueByteCount := p2pReceiveQueueByteCount(settings)
+	if queueByteCount <= 1 {
+		return 1
+	}
+	reserveByteCount := min(
+		queueByteCount-1,
+		max(kib(16), queueByteCount/16),
+	)
+	return queueByteCount - reserveByteCount
+}
+
+// Transfer maintains one destination-wide acknowledgement flight. Keep its
+// message ceiling below the complete-message receive queue while the separate
+// adaptive byte limit remains the tighter retained-payload bound. Reserving
+// one queue slot leaves immediate admission for cumulative ACK, compact
+// recovery, probe, and contract traffic; a one-slot route retains a progress
+// floor of one.
 func p2pUnreliableFlightMessageLimit(settings *P2pTransportSettings) int {
 	return max(1, p2pReceiveQueueMessageCount(settings)-1)
 }

@@ -168,6 +168,46 @@ func TestSendFlightControllerAppliesCarrierMessageLimit(t *testing.T) {
 	}
 }
 
+// A carrier whose final handoff has a smaller byte ceiling can reserve part of
+// that queue for untracked control without reducing the global H3 policy.
+func TestSendFlightControllerAppliesCarrierByteLimit(t *testing.T) {
+	settings := DefaultSendBufferSettings()
+	settings.UnreliableInitialFlightByteCount = 100
+	settings.UnreliableMinimumFlightByteCount = 50
+	settings.UnreliableMaximumFlightByteCount = 400
+	settings.UnreliableSlowStartGrowthDivisor = 1
+	controller := newSendFlightController(settings)
+	controller.applyPolicy(transferFlightPolicySnapshot{
+		generation: 1,
+		limited:    true,
+		byteLimit:  180,
+	})
+	if controller.byteLimit != 100 || controller.activeMaximumByteCount != 180 {
+		t.Fatalf(
+			"carrier-capped byte flight = %d/%d, want 100/180",
+			controller.byteLimit,
+			controller.activeMaximumByteCount,
+		)
+	}
+	controller.send(100)
+	controller.acknowledge(100)
+	if controller.byteLimit != 180 {
+		t.Fatalf("carrier-capped byte flight grew to %d, want 180", controller.byteLimit)
+	}
+
+	controller.applyPolicy(transferFlightPolicySnapshot{
+		generation: 2,
+		limited:    true,
+	})
+	if controller.byteLimit != 100 || controller.activeMaximumByteCount != 400 {
+		t.Fatalf(
+			"uncapped next carrier byte flight = %d/%d, want 100/400",
+			controller.byteLimit,
+			controller.activeMaximumByteCount,
+		)
+	}
+}
+
 // Tail loss has no later receiver delivery with which to form a selective-Ack
 // gap. Its acknowledgement timeout must still exit slow start and reduce both
 // independent bounds before the retry enters the same carrier queue.
@@ -247,7 +287,10 @@ func TestMultiRouteWriterPublishesUnreliableTransferPolicy(t *testing.T) {
 	routeManager.UpdateTransportWithProperties(
 		transport,
 		[]Route{route},
-		TransferCarrierProperties{Unreliable: true},
+		TransferCarrierProperties{
+			Unreliable:                true,
+			unreliableFlightByteLimit: 123,
+		},
 	)
 	select {
 	case <-initialPolicy.notify:
@@ -255,7 +298,8 @@ func TestMultiRouteWriterPublishesUnreliableTransferPolicy(t *testing.T) {
 		t.Fatal("route publication did not retire the prior policy generation")
 	}
 	unreliablePolicy := provider.transferFlightPolicy()
-	if !unreliablePolicy.limited || unreliablePolicy.generation == initialPolicy.generation {
+	if !unreliablePolicy.limited || unreliablePolicy.byteLimit != 123 ||
+		unreliablePolicy.generation == initialPolicy.generation {
 		t.Fatalf("unreliable policy = %+v after generation %+v", unreliablePolicy, initialPolicy)
 	}
 
@@ -346,7 +390,12 @@ func TestMultiRouteWriterClassifiesSelectedHybridMessage(t *testing.T) {
 		t.Fatal("hybrid route did not publish its unreliable capability")
 	}
 
-	assertWrite := func(message string, wantUnreliable bool, wantHybridReliable bool) {
+	assertWrite := func(
+		message string,
+		wantUnreliable bool,
+		wantReliable bool,
+		wantHybridReliable bool,
+	) {
 		t.Helper()
 		success, disposition, err := selector.writeDetailedWithCarrier(
 			ctx,
@@ -356,21 +405,23 @@ func TestMultiRouteWriterClassifiesSelectedHybridMessage(t *testing.T) {
 		if err != nil || !success ||
 			disposition.transportType != TransportTypeH3 ||
 			disposition.unreliable != wantUnreliable ||
+			disposition.reliable != wantReliable ||
 			disposition.hybridReliable != wantHybridReliable {
 			t.Fatalf(
-				"write %q = (%t, %+v, %v), want H3 unreliable=%t hybrid_reliable=%t",
+				"write %q = (%t, %+v, %v), want H3 unreliable=%t reliable=%t hybrid_reliable=%t",
 				message,
 				success,
 				disposition,
 				err,
 				wantUnreliable,
+				wantReliable,
 				wantHybridReliable,
 			)
 		}
 		<-h3Route
 	}
-	assertWrite("udp", true, false)
-	assertWrite("stream", false, true)
+	assertWrite("udp", true, false, false)
+	assertWrite("stream", false, true, true)
 }
 
 // A ready non-tied route wins over an unavailable hybrid H3 route and reports
@@ -405,7 +456,7 @@ func TestMultiRouteWriterClassifiesActuallySelectedCarrier(t *testing.T) {
 		time.Second,
 	)
 	if err != nil || !success || disposition.transportType != TransportTypeH3Dns ||
-		disposition.unreliable || disposition.hybridReliable {
+		disposition.unreliable || !disposition.reliable || disposition.hybridReliable {
 		t.Fatalf("selected write = (%t, %+v, %v), want reliable H3 DNS", success, disposition, err)
 	}
 	<-dnsRoute
@@ -826,85 +877,89 @@ func TestSendSequenceHybridReliableLaneDoesNotUseUnreliableFlight(t *testing.T) 
 	}
 }
 
-// QUIC owns ordinary retransmission for a hybrid stream write, but it cannot
-// recover bytes accepted by a connection whose exact route was withdrawn.
-// Route retirement must therefore bypass the eight-second nested-recovery
-// interval and hand the same Transfer item to the replacement immediately.
-func TestSendSequenceHybridReliableRouteRemovalRetriesImmediately(t *testing.T) {
-	client, peerId, transport, oldRoute, fromPeer, _ := newTransferFlightTestClient(t)
-	properties := TransferCarrierProperties{
-		Unreliable: true,
-		unreliableForMessageByteCount: func(int) bool {
-			return false
+// A reliable carrier owns ordinary byte retransmission after accepting a
+// Transfer item, but it cannot recover bytes from an exact route that has
+// retired. Both H1 and H3-stream route retirement must therefore bypass the
+// conservative nested-recovery interval and retry through the replacement.
+func TestSendSequenceReliableRouteRemovalRetriesImmediately(t *testing.T) {
+	tests := []struct {
+		name       string
+		properties TransferCarrierProperties
+	}{
+		{name: "h1"},
+		{
+			name: "h3-stream",
+			properties: TransferCarrierProperties{
+				Unreliable: true,
+				unreliableForMessageByteCount: func(int) bool {
+					return false
+				},
+			},
 		},
 	}
-	client.RouteManager().UpdateTransportWithProperties(
-		transport,
-		[]Route{oldRoute},
-		properties,
-	)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client, peerId, transport, oldRoute, fromPeer, _ := newTransferFlightTestClient(t)
+			client.RouteManager().UpdateTransportWithProperties(
+				transport,
+				[]Route{oldRoute},
+				test.properties,
+			)
 
-	sendTransferFlightTestMessage(t, client, peerId, 0)
-	firstPack := takeTransferFlightTestPack(t, oldRoute)
-	replacementRoute := make(chan []byte, 16)
-	client.RouteManager().UpdateTransportWithProperties(
-		transport,
-		[]Route{replacementRoute},
-		properties,
-	)
+			sendTransferFlightTestMessage(t, client, peerId, 0)
+			firstPack := takeTransferFlightTestPack(t, oldRoute)
+			replacementRoute := make(chan []byte, 16)
+			client.RouteManager().UpdateTransportWithProperties(
+				transport,
+				[]Route{replacementRoute},
+				test.properties,
+			)
 
-	replacementPack := takeTransferFlightTestPack(t, replacementRoute)
-	if !bytes.Equal(replacementPack.GetMessageId(), firstPack.GetMessageId()) ||
-		replacementPack.GetSequenceNumber() != firstPack.GetSequenceNumber() {
-		t.Fatalf(
-			"replacement Pack = (%s, %d), want original (%s, %d)",
-			replacementPack.GetMessageId(),
-			replacementPack.GetSequenceNumber(),
-			firstPack.GetMessageId(),
-			firstPack.GetSequenceNumber(),
-		)
-	}
-	acknowledgeTransferFlightTestPack(t, client, peerId, fromPeer, replacementPack)
-	if !waitForCondition(time.Second, func() bool {
-		return client.SendRecoveryStats().CarrierChangeWriteCount == 1
-	}) {
-		t.Fatalf("carrier-change recovery stats = %+v", client.SendRecoveryStats())
-	}
-	recovery := client.SendRecoveryStats()
-	if recovery.TimeoutResendWriteCount != 0 {
-		t.Fatalf("route removal used timeout recovery: %+v", recovery)
+			replacementPack := takeTransferFlightTestPack(t, replacementRoute)
+			if !bytes.Equal(replacementPack.GetMessageId(), firstPack.GetMessageId()) ||
+				replacementPack.GetSequenceNumber() != firstPack.GetSequenceNumber() {
+				t.Fatalf(
+					"replacement Pack = (%s, %d), want original (%s, %d)",
+					replacementPack.GetMessageId(),
+					replacementPack.GetSequenceNumber(),
+					firstPack.GetMessageId(),
+					firstPack.GetSequenceNumber(),
+				)
+			}
+			acknowledgeTransferFlightTestPack(t, client, peerId, fromPeer, replacementPack)
+			if !waitForCondition(time.Second, func() bool {
+				return client.SendRecoveryStats().CarrierChangeWriteCount == 1
+			}) {
+				t.Fatalf("carrier-change recovery stats = %+v", client.SendRecoveryStats())
+			}
+			recovery := client.SendRecoveryStats()
+			if recovery.TimeoutResendWriteCount != 0 {
+				t.Fatalf("route removal used timeout recovery: %+v", recovery)
+			}
+		})
 	}
 }
 
-// Publishing an equal-priority sibling does not imply that the original QUIC
-// connection lost its accepted stream bytes. Keep QUIC in sole recovery
-// control while that exact route remains active.
-func TestSendSequenceHybridReliableSiblingRouteAdditionDoesNotRetry(t *testing.T) {
-	client, peerId, transport, h3Route, fromPeer, _ := newTransferFlightTestClient(t)
-	client.RouteManager().UpdateTransportWithProperties(
-		transport,
-		[]Route{h3Route},
-		TransferCarrierProperties{
-			Unreliable: true,
-			unreliableForMessageByteCount: func(int) bool {
-				return false
-			},
-		},
-	)
+// Publishing an equal-priority sibling does not imply that the original
+// reliable connection lost its accepted stream bytes. Keep its carrier in
+// sole recovery control while that exact route remains active.
+func TestSendSequenceReliableSiblingRouteAdditionDoesNotRetry(t *testing.T) {
+	client, peerId, transport, originalRoute, fromPeer, _ := newTransferFlightTestClient(t)
+	client.RouteManager().UpdateTransport(transport, []Route{originalRoute})
 
 	sendTransferFlightTestMessage(t, client, peerId, 0)
-	firstPack := takeTransferFlightTestPack(t, h3Route)
-	h1Transport := NewSendClientTransport(DestinationId(peerId))
-	h1Route := make(chan []byte, 16)
-	client.RouteManager().UpdateTransport(h1Transport, []Route{h1Route})
+	firstPack := takeTransferFlightTestPack(t, originalRoute)
+	siblingTransport := NewSendClientTransport(DestinationId(peerId))
+	siblingRoute := make(chan []byte, 16)
+	client.RouteManager().UpdateTransport(siblingTransport, []Route{siblingRoute})
 
 	select {
-	case unexpected := <-h3Route:
+	case unexpected := <-originalRoute:
 		MessagePoolReturn(unexpected)
-		t.Fatal("adding a sibling route retried over the original H3 route")
-	case unexpected := <-h1Route:
+		t.Fatal("adding a sibling route retried over the original reliable route")
+	case unexpected := <-siblingRoute:
 		MessagePoolReturn(unexpected)
-		t.Fatal("adding a sibling route retried over the new route")
+		t.Fatal("adding a sibling route retried over the new reliable route")
 	case <-time.After(350 * time.Millisecond):
 	}
 	if recovery := client.SendRecoveryStats(); recovery.CarrierChangeWriteCount != 0 || recovery.TimeoutResendWriteCount != 0 {

@@ -33,6 +33,7 @@ func buildEquivalentTransferFrame(m *sendPackFrame) *protocol.TransferFrame {
 		Tag:               &protocol.Tag{SendTime: m.tagSendTime},
 		ForceStream:       m.forceStream,
 		CompanionContract: m.companionContract,
+		LogicalLane:       m.logicalLane,
 	}
 	if m.contractId != nil {
 		pack.ContractId = m.contractId.Bytes()
@@ -228,6 +229,9 @@ func TestFrameCodecRandomized(t *testing.T) {
 		m.nack = mathrandv2.IntN(2) == 0
 		m.forceStream = mathrandv2.IntN(2) == 0
 		m.companionContract = mathrandv2.IntN(2) == 0
+		if mathrandv2.IntN(3) == 0 {
+			m.logicalLane = uint32(1 + mathrandv2.IntN(maxLogicalDataLaneCount))
+		}
 		if mathrandv2.IntN(4) != 0 {
 			frameCount := mathrandv2.IntN(3)
 			for i := 0; i < frameCount; i++ {
@@ -274,6 +278,7 @@ func buildEquivalentAckFrame(m *sendAckFrame) *protocol.TransferFrame {
 		Tag:                     tag,
 		MissingContractId:       missingContractId,
 		CompactContractRecovery: m.compactContractRecovery,
+		LogicalLaneVersion:      m.logicalLaneVersion,
 	}
 	tf := &protocol.TransferFrame{
 		TransferPath: m.path.ToProtobuf(),
@@ -339,9 +344,29 @@ func TestAckCodecEdgeCases(t *testing.T) {
 			missingContractId:       &idD,
 			compactContractRecovery: true,
 		},
+		"logical lane capability": {
+			path:               TransferPath{DestinationId: idA, SourceId: idB},
+			messageId:          idC,
+			sequenceId:         idA,
+			logicalLaneVersion: transferLogicalLaneVersion,
+		},
 	}
 	for _, m := range cases {
 		assertAckCodecMatches(t, m)
+		encoded := marshalSendAckTransferFrame(m)
+		var frame protocol.TransferFrame
+		if !unmarshalTransferFrame(encoded, &frame, true) {
+			MessagePoolReturn(encoded)
+			t.Fatal("hand decoder rejected Ack frame")
+		}
+		MessagePoolReturn(encoded)
+		if frame.Ack.GetLogicalLaneVersion() != m.logicalLaneVersion {
+			t.Fatalf(
+				"hand decoder logical lane version = %d, want %d",
+				frame.Ack.GetLogicalLaneVersion(),
+				m.logicalLaneVersion,
+			)
+		}
 	}
 }
 
@@ -370,6 +395,9 @@ func TestAckCodecRandomized(t *testing.T) {
 			m.missingContractId = &missingContractId
 		}
 		m.compactContractRecovery = mathrandv2.IntN(2) == 0
+		if mathrandv2.IntN(3) == 0 {
+			m.logicalLaneVersion = transferLogicalLaneVersion
+		}
 		switch mathrandv2.IntN(3) {
 		case 0:
 			m.tagSendTime = mathrandv2.Uint64()

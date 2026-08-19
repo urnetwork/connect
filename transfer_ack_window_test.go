@@ -80,3 +80,49 @@ func TestSequenceAckWindowPreservesCompactRecoveryCapability(t *testing.T) {
 		t.Fatalf("coalesced capability snapshot=%+v", snapshot)
 	}
 }
+
+func TestSequenceAckWindowTracksCarrierOfLatestAckTrigger(t *testing.T) {
+	window := newSequenceAckWindow()
+	window.Update(sequenceAck{
+		sequenceNumber: 1,
+		messageId:      NewId(),
+		transportType:  TransportTypeH1,
+	})
+	window.Update(sequenceAck{
+		sequenceNumber: 2,
+		messageId:      NewId(),
+		transportType:  TransportTypeH3,
+	})
+	if got := window.Snapshot(true).headAck.transportType; got != TransportTypeH3 {
+		t.Fatalf("coalesced head carrier=%s, want H3", got)
+	}
+
+	// A retransmit below the cumulative head causes that head ACK to be sent
+	// again, but cannot move an ACK covering newer H3 data onto the old H1 lane.
+	window.Update(sequenceAck{
+		sequenceNumber: 1,
+		messageId:      NewId(),
+		transportType:  TransportTypeH1,
+	})
+	if got := window.Snapshot(true).headAck.transportType; got != TransportTypeH3 {
+		t.Fatalf("retransmit-triggered head carrier=%s, want preserved H3", got)
+	}
+
+	selectiveId := NewId()
+	window.Update(sequenceAck{
+		sequenceNumber: 3,
+		messageId:      selectiveId,
+		selective:      true,
+		transportType:  TransportTypeH3,
+	})
+	window.Update(sequenceAck{
+		sequenceNumber: 3,
+		messageId:      selectiveId,
+		selective:      true,
+		transportType:  TransportTypeUnknown,
+	})
+	snapshot := window.Snapshot(true)
+	if got := snapshot.selectiveAcks[selectiveId].transportType; got != TransportTypeH3 {
+		t.Fatalf("selective ACK carrier=%s, want preserved H3", got)
+	}
+}

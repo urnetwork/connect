@@ -1318,6 +1318,7 @@ type RemoteUserNatMultiClient struct {
 	securityPolicyStats *SecurityPolicyStatsCollector
 	securityPolicy      SecurityPolicy
 	smtpEgressGuard     smtpEgressGuard
+	egressIpv4Fragments ipv4FragmentGate
 
 	// the provide mode of the source packets
 	// for locally generated packets this is `ProvideMode_Network`
@@ -5287,6 +5288,30 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 	packet []byte,
 	timeout time.Duration,
 ) bool {
+	if isIpv4FragmentPacket(packet) {
+		result := self.egressIpv4Fragments.processOwned(
+			source,
+			TransferKey{},
+			provideMode,
+			packet,
+		)
+		if result.packet != nil {
+			if self.sendReassembledIpv4UdpFragments(
+				source,
+				provideMode,
+				result.packet,
+				result.fragments,
+				timeout,
+			) {
+				result.fragments = nil
+			}
+		}
+		returnIpv4FragmentProcessResult(result)
+		// The fragment owner has been consumed by the bounded gate even when
+		// the completed datagram is later rejected by security policy.
+		return true
+	}
+
 	relationship := egressRelationship(provideMode, self.provideMode)
 
 	ipPath, payload, err := ParseIpPathWithPayload(packet)
@@ -5407,9 +5432,159 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 	return success
 }
 
+// Applies SMTP/CFAA/block routing policy to one complete device-originated
+// fragmented UDP datagram, then sends the original MTU-sized fragments as one
+// exact-flow group. Fragmented TCP is deliberately unsupported: normal TCP
+// uses MSS, while accepting a partial transport header could evade the SMTP
+// state machine or another flow policy.
+func (self *RemoteUserNatMultiClient) sendReassembledIpv4UdpFragments(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	reassembled []byte,
+	fragments [][]byte,
+	timeout time.Duration,
+) bool {
+	if len(fragments) == 0 {
+		return false
+	}
+	ipPath, payload, err := ParseIpPathWithPayload(reassembled)
+	if err != nil || ipPath.Version != 4 || ipPath.Protocol != IpProtocolUdp {
+		return false
+	}
+	relationship := egressRelationship(provideMode, self.provideMode)
+	r, err := self.securityPolicy.InspectEgress(relationship, ipPath, payload)
+	if err != nil {
+		self.logSparseSendDrop("fragment policy", &self.sendPolicyDropCount, err)
+		return false
+	}
+	self.securityPolicy.RefreshEgress(ipPath)
+
+	ignored := self.blockActionIgnored(ipPath)
+	if !ignored && self.ipAssoc != nil {
+		self.ipAssoc.AddEgressPacket(ipPath)
+	}
+	blockActionState := self.blockActionState.Load()
+	config := self.config.Load()
+	blockerActive := config.blocker != nil && config.blocker.Enabled()
+	var decision *blockActionDecision
+	if !ignored && (blockActionState.matcher != nil || self.blockActionCollector.hasCallbacks() || blockerActive) {
+		decision = self.blockActionDecision(blockActionState, config.blocker, blockerActive, ipPath)
+	}
+	var match *blockActionMatch
+	blockerBlock := false
+	if decision != nil {
+		match = decision.match
+		blockerBlock = decision.blockerBlock
+	}
+	block, local := blockActionApply(r, config.localSecurityBypass, blockerBlock, match)
+	byteCount := ByteCount(0)
+	for _, fragment := range fragments {
+		fragmentByteCount := ByteCount(len(fragment))
+		byteCount += fragmentByteCount
+		if decision != nil && self.blockActionCollector.hasCallbacks() {
+			self.blockActionCollector.add(decision, block, local, match, fragmentByteCount)
+		}
+	}
+	if block {
+		self.packetStatsCounters.blockEgressPacketCount.Add(int64(len(fragments)))
+		self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
+		return false
+	}
+	if local {
+		if self.localUserNat == nil || !self.localUserNat.SendPackets(
+			source,
+			provideMode,
+			fragments,
+			timeout,
+		) {
+			return false
+		}
+		self.packetStatsCounters.localEgressPacketCount.Add(int64(len(fragments)))
+		self.packetStatsCounters.localEgressByteCount.Add(int64(byteCount))
+		return true
+	}
+
+	pin := flowPin{
+		site: match != nil && match.routeOverride != nil && match.routeOverride.Pin,
+	}
+	if lookupPtr := self.flowOwnerFunc.Load(); lookupPtr != nil {
+		pin.appId = self.flowOwnerAppId(ipPath, *lookupPtr)
+	}
+	parsedPackets := make([]parsedPacket, len(fragments))
+	for i, fragment := range fragments {
+		parsedPackets[i] = parsedPacket{
+			packet: fragment,
+			ipPath: ipPath,
+		}
+	}
+	parsedGroup := &parsedPacketGroup{
+		packets:   parsedPackets,
+		ipPath:    ipPath,
+		pin:       pin,
+		byteCount: byteCount,
+		transportAttribution: newTransportPacketAttribution(
+			self.packetStatsCounters,
+			len(fragments),
+			byteCount,
+		),
+	}
+	if !self.sendParsedPacketGroup(source, provideMode, parsedGroup, timeout) {
+		return false
+	}
+	parsedGroup.transportAttribution.admit()
+	return true
+}
+
 // Consumes a packet burst after grouping it by exact directional flow. One
 // group is accepted or rejected as a unit; malformed packets are returned.
 func (self *RemoteUserNatMultiClient) SendPacketBatch(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	packets [][]byte,
+	timeout time.Duration,
+) int {
+	containsFragments := false
+	for _, packet := range packets {
+		if isIpv4FragmentPacket(packet) {
+			containsFragments = true
+			break
+		}
+	}
+	if !containsFragments {
+		return self.sendCompletePacketBatch(source, provideMode, packets, timeout)
+	}
+
+	// Preserve wire order around a fragmented datagram. Ordinary contiguous
+	// runs retain the existing exact-flow batch path; fragments enter their
+	// bounded gate one at a time and complete atomically when the final member
+	// arrives (possibly in a later native read batch).
+	acceptedCount := 0
+	completeStart := 0
+	flushComplete := func(end int) {
+		if completeStart < end {
+			acceptedCount += self.sendCompletePacketBatch(
+				source,
+				provideMode,
+				packets[completeStart:end],
+				timeout,
+			)
+		}
+	}
+	for i, packet := range packets {
+		if !isIpv4FragmentPacket(packet) {
+			continue
+		}
+		flushComplete(i)
+		if self.SendPacket(source, provideMode, packet, timeout) {
+			acceptedCount++
+		}
+		completeStart = i + 1
+	}
+	flushComplete(len(packets))
+	return acceptedCount
+}
+
+func (self *RemoteUserNatMultiClient) sendCompletePacketBatch(
 	source TransferPath,
 	provideMode protocol.ProvideMode,
 	packets [][]byte,
@@ -7616,6 +7791,7 @@ func (self *RemoteUserNatMultiClient) RemoveProvider(egressClientId Id) bool {
 
 func (self *RemoteUserNatMultiClient) Close() {
 	self.cancel()
+	self.egressIpv4Fragments.close()
 
 	// detach retired owner references: later deliveries observe nil and stop
 	// retaining/calling the retired owner (typically an UpgradeMux), and the
@@ -10820,6 +10996,7 @@ type multiClientChannel struct {
 	clientReceivePacketCallback clientReceivePacketFunction
 	dialFailureCallback         dialFailureFunction
 	ingressSecurityPolicy       SecurityPolicy
+	ingressIpv4Fragments        ipv4FragmentGate
 	// optional owner of this client's platform transport. Captured once at
 	// construction so ordinary receive frames do not pay a type assertion.
 	transportMigrator  MultiClientGeneratorTransportMigrator
@@ -14823,6 +15000,12 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 	// delivery is batched.
 	var batchIpPaths []*IpPath
 	var batchPackets [][]byte
+	var ownedBatchPackets [][]byte
+	defer func() {
+		for _, packet := range ownedBatchPackets {
+			MessagePoolReturn(packet)
+		}
+	}()
 	batch := self.args != nil && self.args.ReceivePackets != nil
 
 	for _, frame := range frames {
@@ -14852,6 +15035,40 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 				ipPacketFromProvider := ipPacketFromProvider_.(*protocol.IpPacketFromProvider)
 
 				packet := ipPacketFromProvider.IpPacket.PacketBytes
+				if isIpv4FragmentPacket(packet) {
+					result := self.ingressIpv4Fragments.processOwned(
+						source,
+						peer.TransferKey,
+						peer.ProvideMode,
+						MessagePoolCopy(packet),
+					)
+					if result.packet != nil {
+						ipPath, parseErr := ParseIpPath(result.packet)
+						if parseErr == nil && ipPath.Version == 4 && ipPath.Protocol == IpProtocolUdp {
+							for _, fragment := range result.fragments {
+								self.addReceiveAck(ByteCount(len(fragment)))
+								if batch {
+									batchIpPaths = append(batchIpPaths, ipPath)
+									batchPackets = append(batchPackets, fragment)
+									ownedBatchPackets = append(ownedBatchPackets, fragment)
+								} else {
+									self.clientReceivePacketCallback(
+										self,
+										source,
+										peer.ProvideMode,
+										peer.TransportType,
+										ipPath,
+										fragment,
+									)
+									MessagePoolReturn(fragment)
+								}
+							}
+							result.fragments = nil
+						}
+					}
+					returnIpv4FragmentProcessResult(result)
+					continue
+				}
 
 				ipPath, err := ParseIpPath(packet)
 				if err == nil {
@@ -14913,6 +15130,7 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 
 func (self *multiClientChannel) Cancel() {
 	self.addError(errors.New("Done."))
+	self.ingressIpv4Fragments.close()
 	// nil-guard each teardown hook: bare fixture channels (built literally by
 	// tests, per the ClientId/Tier convention above) have none of them, and
 	// the stall watchdog now calls Cancel directly against the same fixtures
@@ -14934,6 +15152,7 @@ func (self *multiClientChannel) Cancel() {
 
 func (self *multiClientChannel) Close() {
 	self.addError(errors.New("Done."))
+	self.ingressIpv4Fragments.close()
 	self.cancel()
 	// the local client teardown (which can wait on a slow Pion close) is
 	// handled by the channel's own teardown goroutine, after the platform

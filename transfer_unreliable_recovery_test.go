@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -73,7 +74,7 @@ func TestZeroUnreliableRecoverySettingsPreserveReliablePolicy(t *testing.T) {
 	}
 }
 
-func TestHybridRecoveryPolicyFollowsObservedMessageLane(t *testing.T) {
+func TestCarrierRecoveryPolicyFollowsObservedMessageLane(t *testing.T) {
 	settings := DefaultSendBufferSettings()
 	sequence := testUnreliableRecoverySequence(settings)
 	sequence.client = &Client{}
@@ -88,23 +89,37 @@ func TestHybridRecoveryPolicyFollowsObservedMessageLane(t *testing.T) {
 	}
 
 	sequence.observeCarrierWrite(item, transferWriteDisposition{
-		transportType:  TransportTypeH3,
-		hybridReliable: true,
+		transportType: TransportTypeH1,
+		reliable:      true,
 	})
 	if item.unreliableCarrierObserved || item.unreliableFlightTracked ||
+		!item.reliableCarrierObserved ||
+		item.hybridReliableCarrierObserved {
+		t.Fatalf("reliable H1 stream write changed recovery policy: %+v", item)
+	}
+	h1Interval := sequence.resendIntervalForItem(item, 1)
+	if h1Interval != settings.MinResendInterval ||
+		item.ackTimeout != settings.AckTimeout {
+		t.Fatalf(
+			"reliable H1 recovery = interval %s timeout %s, want %s/%s",
+			h1Interval,
+			item.ackTimeout,
+			settings.MinResendInterval,
+			settings.AckTimeout,
+		)
+	}
+
+	sequence.observeCarrierWrite(item, transferWriteDisposition{
+		transportType:  TransportTypeH3,
+		reliable:       true,
+		hybridReliable: true,
+	})
+	if !item.reliableCarrierObserved ||
 		!item.hybridReliableCarrierObserved {
 		t.Fatalf("reliable H3 stream write changed recovery policy: %+v", item)
 	}
-	reliableInterval := sequence.resendIntervalForItem(item, 1)
-	if reliableInterval != settings.MaxResendInterval ||
-		item.ackTimeout != settings.AckTimeout {
-		t.Fatalf(
-			"reliable H3 recovery = interval %s timeout %s, want %s/%s",
-			reliableInterval,
-			item.ackTimeout,
-			settings.MaxResendInterval,
-			settings.AckTimeout,
-		)
+	if interval := sequence.resendIntervalForItem(item, 1); interval != settings.MaxResendInterval {
+		t.Fatalf("reliable H3 recovery interval=%s, want=%s", interval, settings.MaxResendInterval)
 	}
 
 	sequence.observeCarrierWrite(item, transferWriteDisposition{
@@ -132,9 +147,49 @@ func TestHybridRecoveryPolicyFollowsObservedMessageLane(t *testing.T) {
 	sequence.releaseUnreliableFlight(item)
 	sequence.observeCarrierWrite(item, transferWriteDisposition{
 		transportType: TransportTypeH1,
+		reliable:      true,
 	})
 	if !item.unreliableCarrierObserved || item.unreliableFlightTracked {
 		t.Fatalf("reliable retry erased prior DATAGRAM recovery evidence: %+v", item)
+	}
+}
+
+func TestSendSequenceUsesOnlyOrdinaryH1TimeoutAsH3FailoverEvidence(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	selector := NewMultiRouteSelector(
+		ctx,
+		"sequence-h1-timeout",
+		nil,
+		DestinationId(NewId()),
+		true,
+	)
+	defer selector.Close()
+	h1Route := make(Route, 1)
+	selector.updateTransport(
+		NewSendGatewayTransportWithType(TransportTypeH1),
+		[]Route{h1Route},
+	)
+	selector.updateTransport(
+		NewSendGatewayTransportWithType(TransportTypeH3),
+		[]Route{make(Route, 1)},
+	)
+	sequence := testUnreliableRecoverySequence(DefaultSendBufferSettings())
+	sequence.contractMultiRouteWriter = selector
+	item := &sendItem{
+		reliableCarrierObserved: true,
+		reliableRoute:           h1Route,
+		recoveryKind:            sendRecoveryCarrierChange,
+	}
+	if sequence.preferH3AfterH1Timeout(item) {
+		t.Fatal("route-retirement recovery was treated as an ordinary H1 timeout")
+	}
+	item.recoveryKind = sendRecoveryNone
+	if !sequence.preferH3AfterH1Timeout(item) {
+		t.Fatal("ordinary H1 timeout did not fail over to the healthy H3 sibling")
+	}
+	if sequence.preferH3AfterH1Timeout(item) {
+		t.Fatal("stale H1 evidence repeated an already-completed failover")
 	}
 }
 

@@ -44,6 +44,11 @@ type TransferCarrierProperties struct {
 	// complete-message queue while retaining admission for untracked ACK and
 	// control traffic.
 	unreliableFlightMessageLimit int
+	// unreliableFlightByteLimit optionally tightens Transfer's configured byte
+	// flight for this carrier. A bounded nonblocking carrier can reserve payload
+	// capacity for untracked ACK, compact-recovery, contract, and probe traffic
+	// without changing the process-wide Transfer defaults.
+	unreliableFlightByteLimit ByteCount
 	// unreliableForMessageByteCount refines a hybrid carrier after an exact route has
 	// accepted one complete routed Transfer frame. Nil preserves the historical
 	// route-wide meaning of Unreliable. The callback must be safe for concurrent
@@ -97,26 +102,31 @@ func TransportTypes() []TransportType {
 // preferred-route pressure backpressures instead of spilling onto the tied
 // peer. Fallback writes expose any violation of that strict policy and should
 // remain zero. Activations count selector route generations entering the
-// tied-direct policy, and route changes count a preferred physical route
-// disappearing while another direct route survives.
+// tied-direct policy. Route changes include physical withdrawal and the
+// evidence-driven H1-to-H3 transition; H1TimeoutFailoverCount distinguishes
+// the latter without marking either transport unhealthy.
 type DirectCarrierAffinityStats struct {
-	PreferredH1WriteCount uint64
-	PreferredH3WriteCount uint64
-	FallbackH1WriteCount  uint64
-	FallbackH3WriteCount  uint64
-	PreferredBlockedCount uint64
-	ActivationCount       uint64
-	RouteChangeCount      uint64
+	PreferredH1WriteCount     uint64
+	PreferredH3WriteCount     uint64
+	FallbackH1WriteCount      uint64
+	FallbackH3WriteCount      uint64
+	PreferredBlockedCount     uint64
+	ActivationCount           uint64
+	RouteChangeCount          uint64
+	H1TimeoutFailoverCount    uint64
+	H3PreferredAfterH1Timeout bool
 }
 
 type directCarrierAffinityCounters struct {
-	preferredH1WriteCount atomic.Uint64
-	preferredH3WriteCount atomic.Uint64
-	fallbackH1WriteCount  atomic.Uint64
-	fallbackH3WriteCount  atomic.Uint64
-	preferredBlockedCount atomic.Uint64
-	activationCount       atomic.Uint64
-	routeChangeCount      atomic.Uint64
+	preferredH1WriteCount     atomic.Uint64
+	preferredH3WriteCount     atomic.Uint64
+	fallbackH1WriteCount      atomic.Uint64
+	fallbackH3WriteCount      atomic.Uint64
+	preferredBlockedCount     atomic.Uint64
+	activationCount           atomic.Uint64
+	routeChangeCount          atomic.Uint64
+	h1TimeoutFailoverCount    atomic.Uint64
+	h3PreferredAfterH1Timeout atomic.Bool
 }
 
 func (self *directCarrierAffinityCounters) snapshot() DirectCarrierAffinityStats {
@@ -124,13 +134,15 @@ func (self *directCarrierAffinityCounters) snapshot() DirectCarrierAffinityStats
 		return DirectCarrierAffinityStats{}
 	}
 	return DirectCarrierAffinityStats{
-		PreferredH1WriteCount: self.preferredH1WriteCount.Load(),
-		PreferredH3WriteCount: self.preferredH3WriteCount.Load(),
-		FallbackH1WriteCount:  self.fallbackH1WriteCount.Load(),
-		FallbackH3WriteCount:  self.fallbackH3WriteCount.Load(),
-		PreferredBlockedCount: self.preferredBlockedCount.Load(),
-		ActivationCount:       self.activationCount.Load(),
-		RouteChangeCount:      self.routeChangeCount.Load(),
+		PreferredH1WriteCount:     self.preferredH1WriteCount.Load(),
+		PreferredH3WriteCount:     self.preferredH3WriteCount.Load(),
+		FallbackH1WriteCount:      self.fallbackH1WriteCount.Load(),
+		FallbackH3WriteCount:      self.fallbackH3WriteCount.Load(),
+		PreferredBlockedCount:     self.preferredBlockedCount.Load(),
+		ActivationCount:           self.activationCount.Load(),
+		RouteChangeCount:          self.routeChangeCount.Load(),
+		H1TimeoutFailoverCount:    self.h1TimeoutFailoverCount.Load(),
+		H3PreferredAfterH1Timeout: self.h3PreferredAfterH1Timeout.Load(),
 	}
 }
 
@@ -206,11 +218,13 @@ type TransportMultiRouteReader interface {
 
 // transferWriteDisposition is returned only by the production selector. The
 // public optional writer interface remains source-compatible for custom
-// writers, while Transfer can distinguish H1 / H3-stream writes from actual
-// DATAGRAM-eligible writes on a hybrid route.
+// writers, while Transfer can distinguish writes accepted by a reliable
+// carrier (H1, H3 stream, DNS stream, or legacy P2P) from writes accepted by
+// an unreliable message lane such as QUIC DATAGRAM or native P2P.
 type transferWriteDisposition struct {
 	transportType  TransportType
 	unreliable     bool
+	reliable       bool
 	hybridReliable bool
 	route          Route
 }
@@ -225,6 +239,10 @@ type transferCarrierMultiRouteWriter interface {
 
 type transferCarrierRouteStateProvider interface {
 	transferRouteActive(route Route) bool
+}
+
+type transferCarrierH1TimeoutFailoverProvider interface {
+	transferPreferH3AfterH1Timeout(route Route) bool
 }
 
 type RouteManager struct {
@@ -1383,9 +1401,11 @@ type routeSnapshot struct {
 	transports                   []Transport
 	routes                       []Route
 	routeTransportTypes          map[Route]TransportType
+	activeRoutesByTransport      map[TransportType][]Route
 	routeCarrierProperties       map[Route]TransferCarrierProperties
 	generation                   uint64
 	unreliableTransferPath       bool
+	unreliableFlightByteLimit    ByteCount
 	unreliableFlightMessageLimit int
 	unreliableFlowIsolation      bool
 	unreliableFlowReserve        bool
@@ -1448,6 +1468,7 @@ func (self *routeSnapshot) observeDirectAffinityBlocked() {
 type transferFlightPolicySnapshot struct {
 	generation    uint64
 	limited       bool
+	byteLimit     ByteCount
 	messageLimit  int
 	flowIsolation bool
 	flowReserve   bool
@@ -1460,6 +1481,7 @@ func (self *MultiRouteSelector) transferFlightPolicy() transferFlightPolicySnaps
 	return transferFlightPolicySnapshot{
 		generation:    snapshot.generation,
 		limited:       snapshot.unreliableTransferPath,
+		byteLimit:     snapshot.unreliableFlightByteLimit,
 		messageLimit:  snapshot.unreliableFlightMessageLimit,
 		flowIsolation: snapshot.unreliableFlowIsolation,
 		flowReserve:   snapshot.unreliableFlowReserve,
@@ -1580,6 +1602,22 @@ func (self *routeSnapshot) writeRoutes() []Route {
 	return self.shuffled()
 }
 
+// writeRoutesForTransport keeps a reply on the carrier that delivered the
+// packet it acknowledges. An active matching carrier is sticky under queue
+// pressure; only its withdrawal permits the normal route policy to take over.
+// The per-transport slices are built with the immutable route snapshot, so
+// this ACK hot path does not allocate.
+func (self *routeSnapshot) writeRoutesForTransport(
+	preferredTransportType TransportType,
+) []Route {
+	if preferredTransportType != TransportTypeUnknown {
+		if routes := self.activeRoutesByTransport[preferredTransportType]; 0 < len(routes) {
+			return routes
+		}
+	}
+	return self.writeRoutes()
+}
+
 func (self *routeSnapshot) transportType(route Route) TransportType {
 	if transportType, ok := self.routeTransportTypes[route]; ok {
 		return transportType
@@ -1596,6 +1634,14 @@ func (self *routeSnapshot) writeDisposition(
 	return transferWriteDisposition{
 		transportType: self.transportType(route),
 		unreliable:    unreliable,
+		// A successful production-route write that is not explicitly
+		// unreliable is owned by that carrier's recovery. Transfer still
+		// requires its end-to-end ACK; this flag changes only duplicate-send
+		// cadence and enables immediate recovery when the exact route retires.
+		reliable: !unreliable,
+		// Only the reliable-stream lane of a carrier that also exposes an
+		// unreliable message lane uses the long nested-recovery interval.
+		// Ordinary H1 keeps its normal Transfer resend interval.
 		hybridReliable: properties.Unreliable &&
 			properties.unreliableForMessageByteCount != nil && !unreliable,
 		route: route,
@@ -1609,6 +1655,64 @@ func (self *MultiRouteSelector) transferRouteActive(route Route) bool {
 	snapshot := self.activeRoutesSnapshot.Load()
 	_, ok := snapshot.routeCarrierProperties[route]
 	return ok
+}
+
+func (self *MultiRouteSelector) canPreferH3AfterH1Timeout(route Route) bool {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+
+	snapshot := self.activeRoutesSnapshot.Load()
+	if snapshot == nil || snapshot.preferDirectRoute != route ||
+		snapshot.transportType(route) != TransportTypeH1 {
+		return false
+	}
+	for _, candidate := range snapshot.routes {
+		if candidate != route && snapshot.transportType(candidate) == TransportTypeH3 {
+			return true
+		}
+	}
+	return false
+}
+
+// preferH3IfTied changes no transport health or configured priority. It only
+// changes sticky writer affinity after the shared Client observed an H1
+// end-to-end timeout. Queue backpressure and sibling publication remain
+// insufficient evidence.
+func (self *MultiRouteSelector) preferH3IfTied() bool {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+
+	snapshot := self.activeRoutesSnapshot.Load()
+	if snapshot == nil || snapshot.preferDirectRoute == nil ||
+		snapshot.transportType(snapshot.preferDirectRoute) != TransportTypeH1 {
+		return false
+	}
+	for _, candidate := range snapshot.routes {
+		if snapshot.transportType(candidate) != TransportTypeH3 {
+			continue
+		}
+		self.preferredDirectRoute = candidate
+		if self.directAffinity != nil {
+			self.directAffinity.routeChangeCount.Add(1)
+		}
+		self.transportUpdate.NotifyAll()
+		self.updateActiveRoutesWithLock()
+		return true
+	}
+	return false
+}
+
+func (self *MultiRouteSelector) transferPreferH3AfterH1Timeout(route Route) bool {
+	if !self.canPreferH3AfterH1Timeout(route) {
+		return false
+	}
+	self.directAffinity.h3PreferredAfterH1Timeout.Store(true)
+	self.directAffinity.h1TimeoutFailoverCount.Add(1)
+	changed := self.preferH3IfTied()
+	if changed {
+		waitForRouteSnapshotWriters(self.takeRetiredWriterSnapshots())
+	}
+	return changed
 }
 
 func NewMultiRouteSelector(ctx context.Context, clientTag string, log Logger, destination TransferPath, weightedRoutes bool) *MultiRouteSelector {
@@ -1643,8 +1747,10 @@ func (self *MultiRouteSelector) updateActiveRoutesWithLock() {
 	activeRoutes := []Route{}
 	activeTransports := []Transport{}
 	routeTransportTypes := map[Route]TransportType{}
+	activeRoutesByTransport := map[TransportType][]Route{}
 	routeCarrierProperties := map[Route]TransferCarrierProperties{}
 	unreliableTransferPath := false
+	unreliableFlightByteLimit := ByteCount(0)
 	unreliableFlightMessageLimit := 0
 	unreliableFlowIsolation := true
 	unreliableFlowReserve := true
@@ -1661,6 +1767,10 @@ func (self *MultiRouteSelector) updateActiveRoutesWithLock() {
 				activeRoutes = append(activeRoutes, route)
 				transportType := transportTypeOf(transport)
 				routeTransportTypes[route] = transportType
+				activeRoutesByTransport[transportType] = append(
+					activeRoutesByTransport[transportType],
+					route,
+				)
 				routeCarrierProperties[route] = self.transportProperties[transport]
 				switch transportType {
 				case TransportTypeH1:
@@ -1690,6 +1800,10 @@ func (self *MultiRouteSelector) updateActiveRoutesWithLock() {
 					properties.UnreliableFlowIsolation
 				unreliableFlowReserve = unreliableFlowReserve &&
 					properties.UnreliableFlowReserve
+				if limit := properties.unreliableFlightByteLimit; 0 < limit &&
+					(unreliableFlightByteLimit == 0 || limit < unreliableFlightByteLimit) {
+					unreliableFlightByteLimit = limit
+				}
 				if limit := properties.unreliableFlightMessageLimit; 0 < limit &&
 					(unreliableFlightMessageLimit == 0 || limit < unreliableFlightMessageLimit) {
 					unreliableFlightMessageLimit = limit
@@ -1756,9 +1870,11 @@ func (self *MultiRouteSelector) updateActiveRoutesWithLock() {
 		transports:                   activeTransports,
 		routes:                       activeRoutes,
 		routeTransportTypes:          routeTransportTypes,
+		activeRoutesByTransport:      activeRoutesByTransport,
 		routeCarrierProperties:       routeCarrierProperties,
 		generation:                   self.nextRouteGeneration,
 		unreliableTransferPath:       unreliableTransferPath,
+		unreliableFlightByteLimit:    unreliableFlightByteLimit,
 		unreliableFlightMessageLimit: unreliableFlightMessageLimit,
 		unreliableFlowIsolation:      unreliableTransferPath && unreliableFlowIsolation,
 		unreliableFlowReserve:        unreliableTransferPath && unreliableFlowReserve,
@@ -2274,6 +2390,24 @@ func (self *MultiRouteSelector) writeDetailedWithCarrier(
 	transferFrameBytes []byte,
 	timeout time.Duration,
 ) (bool, transferWriteDisposition, error) {
+	return self.writeDetailedWithCarrierPreference(
+		ctx,
+		transferFrameBytes,
+		timeout,
+		TransportTypeUnknown,
+	)
+}
+
+// writeDetailedWithCarrierPreference pins a reply to its observed inbound
+// carrier while that carrier remains active. It deliberately does not spill
+// to an equal-priority sibling merely because the selected route is busy;
+// route withdrawal republishes the snapshot and enables the normal fallback.
+func (self *MultiRouteSelector) writeDetailedWithCarrierPreference(
+	ctx context.Context,
+	transferFrameBytes []byte,
+	timeout time.Duration,
+	preferredTransportType TransportType,
+) (bool, transferWriteDisposition, error) {
 	enterTime := time.Now()
 	preferredBlockedObserved := false
 
@@ -2281,7 +2415,7 @@ func (self *MultiRouteSelector) writeDetailedWithCarrier(
 	// writer selector and writes its ordered stream serially; the mutex below is
 	// only needed when a write must retain and reuse the selector timer.
 	initialSnapshot := self.acquireWriterSnapshot()
-	initialRoutes := initialSnapshot.writeRoutes()
+	initialRoutes := initialSnapshot.writeRoutesForTransport(preferredTransportType)
 	if self.log.V(2).Enabled() {
 		self.log.Infof("[mrw] %s->%s s(%s) routes = %d\n", self.clientTag, self.destination.DestinationId, self.destination.StreamId, len(initialRoutes))
 	}
@@ -2332,7 +2466,7 @@ func (self *MultiRouteSelector) writeDetailedWithCarrier(
 		// on every packet
 		snapshot := self.acquireWriterSnapshot()
 		notify := snapshot.notify
-		activeRoutes := snapshot.writeRoutes()
+		activeRoutes := snapshot.writeRoutesForTransport(preferredTransportType)
 
 		if self.log.V(2).Enabled() {
 			self.log.Infof("[mrw] %s->%s s(%s) routes = %d\n", self.clientTag, self.destination.DestinationId, self.destination.StreamId, len(activeRoutes))

@@ -301,6 +301,7 @@ func TestPlatformTransportH3DatagramRoundTrip(t *testing.T) {
 	writeHybridMessage := func(
 		message []byte,
 		wantUnreliable bool,
+		wantReliable bool,
 		wantHybridReliable bool,
 	) {
 		t.Helper()
@@ -316,16 +317,18 @@ func TestPlatformTransportH3DatagramRoundTrip(t *testing.T) {
 		}
 		if disposition.transportType != TransportTypeH3 ||
 			disposition.unreliable != wantUnreliable ||
+			disposition.reliable != wantReliable ||
 			disposition.hybridReliable != wantHybridReliable {
 			t.Fatalf(
-				"hybrid disposition = %+v, want H3 unreliable=%t hybrid_reliable=%t",
+				"hybrid disposition = %+v, want H3 unreliable=%t reliable=%t hybrid_reliable=%t",
 				disposition,
 				wantUnreliable,
+				wantReliable,
 				wantHybridReliable,
 			)
 		}
 	}
-	writeHybridMessage(clientMessage, false, true)
+	writeHybridMessage(clientMessage, false, true, true)
 	select {
 	case <-streamWriteEntered:
 	case serverErr := <-serverErrors:
@@ -333,7 +336,7 @@ func TestPlatformTransportH3DatagramRoundTrip(t *testing.T) {
 	case <-testCtx.Done():
 		t.Fatalf("wait for held hybrid stream write: %v", testCtx.Err())
 	}
-	writeHybridMessage(serverMessage, true, false)
+	writeHybridMessage(serverMessage, true, false, false)
 	select {
 	case <-datagramSendObserved:
 	case serverErr := <-serverErrors:

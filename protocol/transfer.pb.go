@@ -611,8 +611,14 @@ type Pack struct {
 	// traffic.
 	ForceStream       bool `protobuf:"varint,10,opt,name=force_stream,json=forceStream,proto3" json:"force_stream,omitempty"`
 	CompanionContract bool `protobuf:"varint,11,opt,name=companion_contract,json=companionContract,proto3" json:"companion_contract,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// A bounded receiver-visible ordering lane. Lane zero is the legacy and
+	// control lane. A sender may use lanes 1..8 only after a delivery Ack on
+	// the live lane-zero sequence advertises logical_lane_version >= 1.
+	// Legacy peers ignore this field and never advertise the capability, so
+	// they continue to receive exactly one ordered sequence.
+	LogicalLane   uint32 `protobuf:"varint,12,opt,name=logical_lane,json=logicalLane,proto3" json:"logical_lane,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Pack) Reset() {
@@ -722,6 +728,13 @@ func (x *Pack) GetCompanionContract() bool {
 	return false
 }
 
+func (x *Pack) GetLogicalLane() uint32 {
+	if x != nil {
+		return x.LogicalLane
+	}
+	return 0
+}
+
 // used for deep message inspection
 type FilteredPack struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -787,8 +800,13 @@ type Ack struct {
 	// contract state is missing. A sender must not emit compact contract heads
 	// until a delivery Ack carries this capability; false is the legacy peer.
 	CompactContractRecovery bool `protobuf:"varint,6,opt,name=compact_contract_recovery,json=compactContractRecovery,proto3" json:"compact_contract_recovery,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	// Advertises support for Pack.logical_lane. Version zero is a legacy peer.
+	// The sender scopes this evidence to the live lane-zero SendSequence and
+	// retires every nonzero lane when that sequence closes or a later delivery
+	// Ack omits the capability.
+	LogicalLaneVersion uint32 `protobuf:"varint,7,opt,name=logical_lane_version,json=logicalLaneVersion,proto3" json:"logical_lane_version,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *Ack) Reset() {
@@ -861,6 +879,13 @@ func (x *Ack) GetCompactContractRecovery() bool {
 		return x.CompactContractRecovery
 	}
 	return false
+}
+
+func (x *Ack) GetLogicalLaneVersion() uint32 {
+	if x != nil {
+		return x.LogicalLaneVersion
+	}
+	return 0
 }
 
 type Tag struct {
@@ -2604,7 +2629,7 @@ const file_transfer_proto_rawDesc = "" +
 	"\r_session_roleB\x14\n" +
 	"\x12_session_companion\"U\n" +
 	"\x15FilteredTransferFrame\x12<\n" +
-	"\rtransfer_path\x18\x01 \x01(\v2\x17.bringyour.TransferPathR\ftransferPath\"\xc9\x03\n" +
+	"\rtransfer_path\x18\x01 \x01(\v2\x17.bringyour.TransferPathR\ftransferPath\"\xec\x03\n" +
 	"\x04Pack\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\x01 \x01(\fR\tmessageId\x12\x1f\n" +
@@ -2620,13 +2645,14 @@ const file_transfer_proto_rawDesc = "" +
 	"contractId\x88\x01\x01\x12!\n" +
 	"\fforce_stream\x18\n" +
 	" \x01(\bR\vforceStream\x12-\n" +
-	"\x12companion_contract\x18\v \x01(\bR\x11companionContractB\x11\n" +
+	"\x12companion_contract\x18\v \x01(\bR\x11companionContract\x12!\n" +
+	"\flogical_lane\x18\f \x01(\rR\vlogicalLaneB\x11\n" +
 	"\x0f_contract_frameB\x06\n" +
 	"\x04_tagB\x0e\n" +
 	"\f_contract_id\"_\n" +
 	"\fFilteredPack\x12<\n" +
 	"\x0econtract_frame\x18\a \x01(\v2\x10.bringyour.FrameH\x00R\rcontractFrame\x88\x01\x01B\x11\n" +
-	"\x0f_contract_frame\"\x9b\x02\n" +
+	"\x0f_contract_frame\"\xcd\x02\n" +
 	"\x03Ack\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\x01 \x01(\fR\tmessageId\x12\x1f\n" +
@@ -2635,7 +2661,8 @@ const file_transfer_proto_rawDesc = "" +
 	"\tselective\x18\x03 \x01(\bR\tselective\x12%\n" +
 	"\x03tag\x18\x04 \x01(\v2\x0e.bringyour.TagH\x00R\x03tag\x88\x01\x01\x123\n" +
 	"\x13missing_contract_id\x18\x05 \x01(\fH\x01R\x11missingContractId\x88\x01\x01\x12:\n" +
-	"\x19compact_contract_recovery\x18\x06 \x01(\bR\x17compactContractRecoveryB\x06\n" +
+	"\x19compact_contract_recovery\x18\x06 \x01(\bR\x17compactContractRecovery\x120\n" +
+	"\x14logical_lane_version\x18\a \x01(\rR\x12logicalLaneVersionB\x06\n" +
 	"\x04_tagB\x16\n" +
 	"\x14_missing_contract_id\"\"\n" +
 	"\x03Tag\x12\x1b\n" +

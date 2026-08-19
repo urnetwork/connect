@@ -20,7 +20,10 @@ type sendFlightController struct {
 	increaseMessageCount int
 	slowStartDivisor     ByteCount
 	// The active carrier may tighten, but never enlarge, the configured
-	// message bounds for one route generation.
+	// byte/message bounds for one route generation.
+	activeMinimumByteCount    ByteCount
+	activeMaximumByteCount    ByteCount
+	policyByteLimit           ByteCount
 	activeMinimumMessageCount int
 	activeMaximumMessageCount int
 	policyMessageLimit        int
@@ -103,12 +106,14 @@ func newSendFlightController(settings *SendBufferSettings) *sendFlightController
 func (self *sendFlightController) applyPolicy(policy transferFlightPolicySnapshot) bool {
 	limited := policy.limited && 0 < self.initialByteCount
 	if self.generation == policy.generation && self.limited == limited &&
+		self.policyByteLimit == policy.byteLimit &&
 		self.policyMessageLimit == policy.messageLimit &&
 		self.flowReserveEnabled == policy.flowReserve {
 		return false
 	}
 	self.generation = policy.generation
 	self.limited = limited
+	self.policyByteLimit = policy.byteLimit
 	self.policyMessageLimit = policy.messageLimit
 	self.flowReserveEnabled = policy.flowReserve
 	self.additiveIncreaseRemainder = 0
@@ -116,7 +121,21 @@ func (self *sendFlightController) applyPolicy(policy transferFlightPolicySnapsho
 	self.additiveMessageRemainder = 0
 	self.slowStartMessageRemainder = 0
 	if limited {
-		self.byteLimit = self.initialByteCount
+		self.activeMaximumByteCount = self.maximumByteCount
+		if 0 < policy.byteLimit {
+			self.activeMaximumByteCount = min(
+				self.activeMaximumByteCount,
+				policy.byteLimit,
+			)
+		}
+		self.activeMinimumByteCount = min(
+			self.minimumByteCount,
+			self.activeMaximumByteCount,
+		)
+		self.byteLimit = min(
+			max(self.initialByteCount, self.activeMinimumByteCount),
+			self.activeMaximumByteCount,
+		)
 		self.activeMinimumMessageCount = self.minimumMessageCount
 		self.activeMaximumMessageCount = self.maximumMessageCount
 		if 0 < policy.messageLimit && 0 < self.initialMessageCount {
@@ -136,6 +155,8 @@ func (self *sendFlightController) applyPolicy(policy transferFlightPolicySnapsho
 		self.slowStart = true
 	} else {
 		self.byteLimit = 0
+		self.activeMinimumByteCount = 0
+		self.activeMaximumByteCount = 0
 		self.messageLimit = 0
 		self.activeMinimumMessageCount = 0
 		self.activeMaximumMessageCount = 0
@@ -230,12 +251,12 @@ func (self *sendFlightController) acknowledgeForKey(
 		return
 	}
 	if self.slowStart {
-		if 0 < acknowledgedByteCount && self.byteLimit < self.maximumByteCount {
+		if 0 < acknowledgedByteCount && self.byteLimit < self.activeMaximumByteCount {
 			numerator := self.slowStartIncreaseRemainder + acknowledgedByteCount
 			increaseByteCount := numerator / self.slowStartDivisor
 			self.slowStartIncreaseRemainder = numerator % self.slowStartDivisor
 			self.byteLimit = min(
-				self.maximumByteCount,
+				self.activeMaximumByteCount,
 				self.byteLimit+increaseByteCount,
 			)
 		}
@@ -253,13 +274,13 @@ func (self *sendFlightController) acknowledgeForKey(
 		return
 	}
 
-	if 0 < acknowledgedByteCount && self.byteLimit < self.maximumByteCount {
+	if 0 < acknowledgedByteCount && self.byteLimit < self.activeMaximumByteCount {
 		numerator := self.additiveIncreaseRemainder +
 			self.increaseByteCount*acknowledgedByteCount
 		increaseByteCount := numerator / self.byteLimit
 		self.additiveIncreaseRemainder = numerator % self.byteLimit
 		self.byteLimit = min(
-			self.maximumByteCount,
+			self.activeMaximumByteCount,
 			self.byteLimit+increaseByteCount,
 		)
 	}
@@ -291,7 +312,7 @@ func (self *sendFlightController) reduceForLoss() bool {
 	self.slowStartIncreaseRemainder = 0
 	self.additiveMessageRemainder = 0
 	self.slowStartMessageRemainder = 0
-	reducedByteLimit := max(self.minimumByteCount, self.byteLimit/2)
+	reducedByteLimit := max(self.activeMinimumByteCount, self.byteLimit/2)
 	reduced := self.byteLimit > reducedByteLimit
 	self.byteLimit = reducedByteLimit
 	if 0 < self.messageLimit {

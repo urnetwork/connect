@@ -151,11 +151,12 @@ func TestReceiveTransferKeySeparatesReceiverVisibleLanes(t *testing.T) {
 	AssertEqual(t, protocol.SequenceRole_SequenceRoleClient, baseKey.EncryptionRole)
 
 	keys := []TransferKey{baseKey}
-	variants := []receiveSequenceHeadKey{base, base, base, base}
+	variants := []receiveSequenceHeadKey{base, base, base, base, base}
 	variants[0].ForceStream = true
 	variants[1].CompanionContract = true
 	variants[2].EncryptionRole = sequenceTlsRoleServer
 	variants[3].EncryptionCompanion = true
+	variants[4].LogicalLane = 4
 	for _, variant := range variants {
 		key := variant.transferKey()
 		for _, prior := range keys {
@@ -180,6 +181,7 @@ func TestReceiveTransferKeySurvivesBufferedBatch(t *testing.T) {
 		ForceStream:         true,
 		EncryptionRole:      protocol.SequenceRole_SequenceRoleServer,
 		EncryptionCompanion: true,
+		LogicalLane:         4,
 	}
 	receiveSequence := newReceiveSequence(
 		ctx,
@@ -350,7 +352,14 @@ func TestReceiveFirstStreamedContractRoutesAckAndRemovesAlias(t *testing.T) {
 
 	go receiveSequence.Run()
 	messageId := NewId()
-	receiveSequence.sendAck(1, messageId, false, sequenceTag{}, true)
+	receiveSequence.sendAck(
+		1,
+		messageId,
+		false,
+		sequenceTag{},
+		true,
+		TransportTypeUnknown,
+	)
 	AssertEqual(t, nil, remoteConn.SetReadDeadline(time.Now().Add(5*time.Second)))
 	buffer := make([]byte, 4096)
 	readByteCount, err := remoteConn.Read(buffer)
@@ -372,6 +381,126 @@ func TestReceiveFirstStreamedContractRoutesAckAndRemovesAlias(t *testing.T) {
 			t.Fatal("receive sequence teardown retained its ACK stream alias")
 		}
 	}()
+}
+
+// A Transfer ACK follows the carrier that delivered the covered Pack. This
+// avoids feeding an H3 download's control loop through an independently chosen
+// H1 queue. If that carrier is withdrawn before the ACK is written, the
+// selector immediately falls back to the remaining healthy route.
+func TestReceiveAckFollowsInboundTransportAndFallsBackAfterWithdrawal(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	settings := DefaultClientSettings()
+	settings.Log = NewNoopLogger()
+	settings.ReceiveBufferSettings.AckCompressTimeout = time.Millisecond
+	settings.ReceiveBufferSettings.WriteTimeout = time.Second
+	ackWriterOpened := make(chan struct{})
+	settings.ReceiveBufferSettings.afterAckWriterOpenForTest = func(
+		receiveSequenceId,
+		MultiRouteWriter,
+	) {
+		close(ackWriterOpened)
+	}
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+	defer client.Cancel()
+
+	h1Transport := NewSendGatewayTransportWithType(TransportTypeH1)
+	h1Route := make(Route, 8)
+	client.RouteManager().UpdateTransport(h1Transport, []Route{h1Route})
+	defer client.RouteManager().RemoveTransport(h1Transport)
+	h3Transport := NewSendGatewayTransportWithType(TransportTypeH3)
+	h3Route := make(Route, 8)
+	client.RouteManager().UpdateTransport(h3Transport, []Route{h3Route})
+
+	receiveSequence := NewReceiveSequence(
+		ctx,
+		client,
+		SourceId(NewId()),
+		NewId(),
+		sequenceTlsRoleServer,
+		false,
+		settings.ReceiveBufferSettings,
+	)
+	go receiveSequence.Run()
+	defer func() {
+		receiveSequence.Cancel()
+		receiveSequence.WaitForExit()
+	}()
+	select {
+	case <-ackWriterOpened:
+	case <-time.After(time.Second):
+		t.Fatal("ACK writer did not open")
+	}
+	isAckFor := func(message []byte, messageId Id) bool {
+		transferFrame := &protocol.TransferFrame{}
+		if err := ProtoUnmarshal(message, transferFrame); err != nil || transferFrame.Ack == nil {
+			return false
+		}
+		ackMessageId, err := IdFromBytes(transferFrame.Ack.MessageId)
+		return err == nil && ackMessageId == messageId
+	}
+
+	h3AckMessageId := NewId()
+	receiveSequence.sendAck(
+		1,
+		h3AckMessageId,
+		false,
+		sequenceTag{},
+		true,
+		TransportTypeH3,
+	)
+	h3Deadline := time.After(time.Second)
+	for {
+		select {
+		case message := <-h3Route:
+			matched := isAckFor(message, h3AckMessageId)
+			MessagePoolReturn(message)
+			if matched {
+				goto h3AckReceived
+			}
+		case message := <-h1Route:
+			matched := isAckFor(message, h3AckMessageId)
+			MessagePoolReturn(message)
+			if matched {
+				t.Fatal("H3-delivered Pack emitted its ACK on H1")
+			}
+		case <-h3Deadline:
+			t.Fatal("H3-affine ACK was not written")
+		}
+	}
+
+h3AckReceived:
+
+	client.RouteManager().RemoveTransport(h3Transport)
+	fallbackAckMessageId := NewId()
+	receiveSequence.sendAck(
+		2,
+		fallbackAckMessageId,
+		false,
+		sequenceTag{},
+		true,
+		TransportTypeH3,
+	)
+	fallbackDeadline := time.After(time.Second)
+	for {
+		select {
+		case message := <-h1Route:
+			matched := isAckFor(message, fallbackAckMessageId)
+			MessagePoolReturn(message)
+			if matched {
+				return
+			}
+		case message := <-h3Route:
+			matched := isAckFor(message, fallbackAckMessageId)
+			MessagePoolReturn(message)
+			if matched {
+				t.Fatal("withdrawn H3 route still carried an ACK")
+			}
+		case <-fallbackDeadline:
+			t.Fatal("ACK did not fall back after H3 withdrawal")
+		}
+	}
 }
 
 // A verified wire contract records the final peer on the endpoint stream.

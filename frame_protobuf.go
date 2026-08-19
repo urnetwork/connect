@@ -161,6 +161,9 @@ type sendPackFrame struct {
 	// true (proto3 implicit presence; false is the legacy default lane)
 	forceStream       bool
 	companionContract bool
+	// logicalLane is Pack field 12. Zero is the legacy/control lane and is
+	// omitted; nonzero values are capability-negotiated and bounded to 1..8.
+	logicalLane uint32
 }
 
 // sizePack returns the encoded size of the Pack submessage body.
@@ -200,6 +203,9 @@ func (m *sendPackFrame) sizePack() int {
 	}
 	if m.companionContract {
 		n += protoSizeTag(11) + 1
+	}
+	if m.logicalLane != 0 {
+		n += protoSizeTag(12) + protoSizeVarint(uint64(m.logicalLane))
 	}
 	return n
 }
@@ -250,6 +256,10 @@ func (m *sendPackFrame) appendPack(b []byte) []byte {
 	if m.companionContract {
 		b = protoAppendTag(b, 11, protoWireVarint)
 		b = append(b, 1)
+	}
+	if m.logicalLane != 0 {
+		b = protoAppendTag(b, 12, protoWireVarint)
+		b = protoAppendVarint(b, uint64(m.logicalLane))
 	}
 	return b
 }
@@ -330,6 +340,7 @@ type sendAckFrame struct {
 	tagSet                  bool
 	missingContractId       *Id
 	compactContractRecovery bool
+	logicalLaneVersion      uint32
 }
 
 func (m *sendAckFrame) sizeAck() int {
@@ -349,6 +360,9 @@ func (m *sendAckFrame) sizeAck() int {
 	}
 	if m.compactContractRecovery {
 		n += protoSizeTag(6) + 1
+	}
+	if m.logicalLaneVersion != 0 {
+		n += protoSizeTag(7) + protoSizeVarint(uint64(m.logicalLaneVersion))
 	}
 	return n
 }
@@ -371,6 +385,10 @@ func (m *sendAckFrame) appendAck(b []byte) []byte {
 	if m.compactContractRecovery {
 		b = protoAppendTag(b, 6, protoWireVarint)
 		b = append(b, 1)
+	}
+	if m.logicalLaneVersion != 0 {
+		b = protoAppendTag(b, 7, protoWireVarint)
+		b = protoAppendVarint(b, uint64(m.logicalLaneVersion))
 	}
 	return b
 }
@@ -1058,7 +1076,7 @@ func decodePack(b []byte) (pack *protocol.Pack, success bool) {
 			}
 			b = b[vn:]
 			pack.Nack = protowire.DecodeBool(v)
-		case 10, 11: // force_stream, companion_contract (sequence lane)
+		case 10, 11, 12: // force_stream, companion_contract, logical_lane
 			if typ != protowire.VarintType {
 				return nil, false
 			}
@@ -1069,8 +1087,10 @@ func decodePack(b []byte) (pack *protocol.Pack, success bool) {
 			b = b[vn:]
 			if num == 10 {
 				pack.ForceStream = protowire.DecodeBool(v)
-			} else {
+			} else if num == 11 {
 				pack.CompanionContract = protowire.DecodeBool(v)
+			} else {
+				pack.LogicalLane = uint32(v)
 			}
 		case 5, 7: // frames (repeated), contract_frame (Frame)
 			if typ != protowire.BytesType {
@@ -1188,7 +1208,7 @@ func decodePackOwned(b []byte) (owner *decodedPackOwner, success bool) {
 			}
 			b = b[vn:]
 			pack.Nack = protowire.DecodeBool(v)
-		case 10, 11: // force_stream, companion_contract (sequence lane)
+		case 10, 11, 12: // force_stream, companion_contract, logical_lane
 			if typ != protowire.VarintType {
 				return nil, false
 			}
@@ -1199,8 +1219,10 @@ func decodePackOwned(b []byte) (owner *decodedPackOwner, success bool) {
 			b = b[vn:]
 			if num == 10 {
 				pack.ForceStream = protowire.DecodeBool(v)
-			} else {
+			} else if num == 11 {
 				pack.CompanionContract = protowire.DecodeBool(v)
+			} else {
+				pack.LogicalLane = uint32(v)
 			}
 		case 5: // frames (repeated)
 			if typ != protowire.BytesType {
@@ -1321,6 +1343,16 @@ func decodeAck(b []byte) (*protocol.Ack, bool) {
 			}
 			b = b[vn:]
 			ack.CompactContractRecovery = protowire.DecodeBool(v)
+		case 7: // logical_lane_version
+			if typ != protowire.VarintType {
+				return nil, false
+			}
+			v, vn := protowire.ConsumeVarint(b)
+			if vn < 0 {
+				return nil, false
+			}
+			b = b[vn:]
+			ack.LogicalLaneVersion = uint32(v)
 		default:
 			fn := protowire.ConsumeFieldValue(num, typ, b)
 			if fn < 0 {

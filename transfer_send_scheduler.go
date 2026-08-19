@@ -2,9 +2,9 @@ package connect
 
 import "sync"
 
-// sendSchedulingKey is local-only metadata. It never enters a sequence id or
-// a wire frame: the scheduler uses it before assigning sequence numbers so
-// receiver-visible ordering remains unchanged.
+// sendSchedulingKey keeps the exact five-tuple local. The scheduler consumes
+// it before assigning sequence numbers; after logical-lane negotiation, only
+// its bounded stable lane hash can enter sequence identity and the wire Pack.
 type sendSchedulingKey struct {
 	ipFlow ipPacketFlowKey
 	valid  bool
