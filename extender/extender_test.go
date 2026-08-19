@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -24,57 +25,95 @@ func TestExtender(t *testing.T) {
 		t.Skip("skipping testing in short mode")
 	}
 
-	// actual content server, port 443 (127.0.0.1)
-	// https, self signed
-	// one route, /hello
-
-	// extender server, port 442
-
-	// client
-
-	// test uses extender http client to GET /hello
-
 	settings := DefaultExtenderSettings()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	certPemBytes, keyPemBytes, err := selfSign([]string{"localhost"}, "Connect Test", settings.ValidFrom, settings.ValidFor)
-	connect.AssertEqual(t, err, nil)
+	certPemBytes, keyPemBytes, err := selfSign([]string{"127.0.0.1"}, "Connect Test", settings.ValidFrom, settings.ValidFor)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	tempDirPath := t.TempDir()
 
 	certFile := filepath.Join(tempDirPath, "localhost.pem")
 	keyFile := filepath.Join(tempDirPath, "localhost.key")
-	connect.AssertEqual(t, os.WriteFile(certFile, certPemBytes, 0o600), nil)
-	connect.AssertEqual(t, os.WriteFile(keyFile, keyPemBytes, 0o600), nil)
+	if err := os.WriteFile(certFile, certPemBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, keyPemBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
 
+	contentListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	contentPort := contentListener.Addr().(*net.TCPAddr).Port
 	server := &http.Server{
-		Addr:    fmt.Sprintf(":%d", 443),
 		Handler: &testExtenderServer{},
 	}
-	defer server.Close()
-	go server.ListenAndServeTLS(certFile, keyFile)
+	contentDone := make(chan error, 1)
+	go func() {
+		contentDone <- server.ServeTLS(contentListener, certFile, keyFile)
+	}()
+	t.Cleanup(func() {
+		server.Close()
+		if err := <-contentDone; err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("content server: %v", err)
+		}
+	})
+
+	extenderListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	extenderPort := extenderListener.Addr().(*net.TCPAddr).Port
+	listenerClaimed := false
+	settings.Listen = func(network string, address string) (net.Listener, error) {
+		if network != "tcp" || address != fmt.Sprintf(":%d", extenderPort) {
+			return nil, fmt.Errorf("unexpected extender listen %s %s", network, address)
+		}
+		if listenerClaimed {
+			return nil, fmt.Errorf("extender listener requested more than once")
+		}
+		listenerClaimed = true
+		return extenderListener, nil
+	}
+	handlerErrors := make(chan error, 1)
+	settings.ErrorHandler = func(stage string, err error) {
+		select {
+		case handlerErrors <- fmt.Errorf("%s: %w", stage, err):
+		default:
+		}
+	}
 
 	extenderServer := NewExtenderServer(
 		ctx,
 		[]string{"montrose"},
-		[]string{"localhost"},
+		[]string{"127.0.0.1"},
 		map[int][]connect.ExtenderConnectMode{
-			1442: []connect.ExtenderConnectMode{connect.ExtenderConnectModeTcpTls},
+			extenderPort: {connect.ExtenderConnectModeTcpTls},
 		},
 		&net.Dialer{},
 		settings,
 	)
-	defer extenderServer.Close()
-	go extenderServer.ListenAndServe()
-
-	select {
-	case <-time.After(1 * time.Second):
-	}
+	extenderDone := make(chan error, 1)
+	go func() {
+		extenderDone <- extenderServer.ListenAndServe()
+	}()
+	t.Cleanup(func() {
+		extenderServer.CloseAndWait()
+		if err := <-extenderDone; err != nil {
+			t.Errorf("extender server: %v", err)
+		}
+	})
 
 	localIp, err := netip.ParseAddr("127.0.0.1")
-	connect.AssertEqual(t, err, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	rootCAs := x509.NewCertPool()
 	if !rootCAs.AppendCertsFromPEM(certPemBytes) {
@@ -91,21 +130,35 @@ func TestExtender(t *testing.T) {
 			Profile: connect.ExtenderProfile{
 				ConnectMode: connect.ExtenderConnectModeTcpTls,
 				ServerName:  "bringyour.com",
-				Port:        1442,
+				Port:        extenderPort,
 			},
 			Ip:     localIp,
 			Secret: "montrose",
 		},
 	)
+	t.Cleanup(client.CloseIdleConnections)
 
-	r, err := client.Get("https://localhost/hello")
+	response, err := client.Get(fmt.Sprintf("https://127.0.0.1:%d/hello", contentPort))
+	if err != nil {
+		select {
+		case handlerErr := <-handlerErrors:
+			t.Fatalf("request: %v; extender: %v", err, handlerErr)
+		default:
+			t.Fatal(err)
+		}
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, expected %d", response.StatusCode, http.StatusOK)
+	}
 
-	connect.AssertEqual(t, err, nil)
-	connect.AssertEqual(t, r.StatusCode, 200)
-
-	body, err := io.ReadAll(r.Body)
-	connect.AssertEqual(t, err, nil)
-	connect.AssertEqual(t, string(body), "{}")
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "{}" {
+		t.Fatalf("body = %q, expected %q", body, "{}")
+	}
 
 }
 
