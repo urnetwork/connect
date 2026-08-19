@@ -34,17 +34,34 @@ import (
 // Everything here is inert unless an egress interface is set: mobile and
 // desktop app builds keep the platform resolver they always had.
 
-// egressBound reports whether an egress interface is currently forced, which
-// is true exactly while this process provides a tunnel (the Windows service in
-// Connecting/Connected, and the Windows app while the tunnel is up).
+// egressSelfExcluded is the platform's answer to "are this process's own
+// sockets steered around the tunnel it provides by something other than a
+// forced interface index". Only Linux sets it (from an init in
+// egress_resolver_linux.go): urnetwork-linux excludes the daemon with an
+// fwmark stamped at socket creation by a cgroup-BPF program, never with
+// IP_UNICAST_IF, so EgressInterfaceIndex stays zero there even while the
+// tunnel is up and this file's escapes would otherwise all read "unbound".
+// Nil — the value on Windows and on every other platform — means the interface
+// index is the whole story, exactly as before.
+var egressSelfExcluded func() bool
+
+// egressBound reports whether this process's own sockets are currently steered
+// around the tunnel it provides, which is true exactly while this process
+// provides a tunnel: the Windows service in Connecting/Connected and the
+// Windows app while the tunnel is up (a forced egress interface), and the Linux
+// daemon once its cgroup program is attached (the egress fwmark).
 func egressBound() bool {
 	index4, index6 := EgressInterfaceIndex()
-	return index4 != 0 || index6 != 0
+	if index4 != 0 || index6 != 0 {
+		return true
+	}
+	return egressSelfExcluded != nil && egressSelfExcluded()
 }
 
 // egressAwareResolver returns the resolver control dials should use: the
 // caller's own resolver when one is configured, else the platform's
-// egress-bound in-process resolver (Windows), else nil (the OS resolver).
+// egress-bound in-process resolver (Windows always, Linux while this process
+// is the tunnel daemon), else nil (the OS resolver).
 func egressAwareResolver(custom *net.Resolver) *net.Resolver {
 	if custom != nil {
 		return custom
@@ -52,11 +69,15 @@ func egressAwareResolver(custom *net.Resolver) *net.Resolver {
 	return egressResolver()
 }
 
-// resolveEgressUDPAddr is net.ResolveUDPAddr for control dials: while an
-// egress interface is forced it resolves through the egress-bound resolver
-// instead of the OS resolver, preferring an address family the bind can
-// actually carry. Off Windows / with no egress set it is exactly
-// net.ResolveUDPAddr.
+// resolveEgressUDPAddr is net.ResolveUDPAddr for control dials: while this
+// process's own sockets are steered around the tunnel it provides, it resolves
+// through the egress-bound resolver instead of the OS resolver, preferring an
+// address family the bind can actually carry. On a platform with no egress
+// escape, or with none in force, it is exactly net.ResolveUDPAddr.
+//
+// This is the H3/QUIC platform transport's name path (transport.go), and it is
+// the second half of the Linux fix: pinning the resolver into NetDialer alone
+// would leave these three call sites resolving through the captured stub.
 func resolveEgressUDPAddr(ctx context.Context, addr string) (*net.UDPAddr, error) {
 	resolver := egressResolver()
 	if resolver == nil || !egressBound() {
