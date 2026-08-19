@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	mathrand "math/rand"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,20 +40,27 @@ func TestControlSync(t *testing.T) {
 
 	controlSyncM1 := NewControlSync(ctx, clientA, "m1")
 
-	receive := make(chan *protocol.SimpleMessage)
+	receiveMessageIndexes := make(chan uint32, k*b)
+	receiveErrors := make(chan error, 1)
+	var receiveDropCount atomic.Int64
 
-	// on receive a test message, set the channel
+	// Snapshot each received test index without blocking the shared callback.
 	controlClientA.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, peer Peer) {
 		for _, frame := range frames {
 			m, err := FromFrame(frame)
-			AssertEqual(t, err, nil)
+			if err != nil {
+				select {
+				case receiveErrors <- err:
+				default:
+				}
+				continue
+			}
 			switch v := m.(type) {
 			case *protocol.SimpleMessage:
 				select {
-				case <-ctx.Done():
-				case receive <- v:
-				case <-time.After(timeout):
-					t.FailNow()
+				case receiveMessageIndexes <- v.MessageIndex:
+				default:
+					receiveDropCount.Add(1)
 				}
 			}
 		}
@@ -133,19 +141,24 @@ func TestControlSync(t *testing.T) {
 				// if timeout, error
 
 				select {
-				case m := <-receive:
+				case messageIndex := <-receiveMessageIndexes:
 					end := uint32(b*i + b - 1)
-					fmt.Printf("[csync]%d/%d (%d)\n", m.MessageIndex, end, p)
+					fmt.Printf("[csync]%d/%d (%d)\n", messageIndex, end, p)
 
-					AssertEqual(t, p <= m.MessageIndex, true)
-					p = m.MessageIndex
-					if m.MessageIndex == end {
+					AssertEqual(t, p <= messageIndex, true)
+					p = messageIndex
+					if messageIndex == end {
 						return
 					}
+				case err := <-receiveErrors:
+					t.Fatalf("decode control message: %v", err)
 				case <-time.After(timeout):
 					t.FailNow()
 				}
 			}
 		}()
+	}
+	if dropCount := receiveDropCount.Load(); dropCount != 0 {
+		t.Fatalf("control receive callback dropped %d message(s)", dropCount)
 	}
 }

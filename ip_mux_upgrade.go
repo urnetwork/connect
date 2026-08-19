@@ -1101,8 +1101,16 @@ func dnsColdProbeDelay(failureCount int, initialDelay time.Duration, maxDelay ti
 }
 
 func (self *UpgradeMux) coldDohProbeNeeded() bool {
-	return self.dnsProbeRequested.Load() ||
-		(self.fallbackDohCache.Load() != nil && self.tunnelDohCold())
+	return self.dnsUpgradeEnabled() && (self.dnsProbeRequested.Load() ||
+		(self.fallbackDohCache.Load() != nil && self.tunnelDohCold()))
+}
+
+// dnsUpgradeEnabled reports whether this mux owns DNS interception. An
+// UpgradeMux may exist only for HTTP/SNI policy with Dns nil; in that mode its
+// internal Tun still has a DohCache for implementation uniformity, but it must
+// not open speculative DoH connections or retain their retry workers.
+func (self *UpgradeMux) dnsUpgradeEnabled() bool {
+	return dnsResolverSettings(self.settings.Load()) != nil
 }
 
 // ensureColdProber starts at most one background warm-probe worker. A cold mux
@@ -1184,6 +1192,10 @@ func (self *UpgradeMux) runColdDohProber() {
 }
 
 func (self *UpgradeMux) wakeColdProber() {
+	if !self.dnsUpgradeEnabled() {
+		self.dnsProbeRequested.Store(false)
+		return
+	}
 	self.dnsProbeRequested.Store(true)
 	if self.ensureColdProber() {
 		return
@@ -1195,7 +1207,8 @@ func (self *UpgradeMux) wakeColdProber() {
 }
 
 func (self *UpgradeMux) warmFallbackDns() {
-	if self.ctx.Err() != nil || self.fallbackDohCache.Load() == nil {
+	if !self.dnsUpgradeEnabled() || self.ctx.Err() != nil || self.fallbackDohCache.Load() == nil {
+		self.fallbackDohWarmPending.Store(false)
 		return
 	}
 	self.fallbackDohWarmPending.Store(true)

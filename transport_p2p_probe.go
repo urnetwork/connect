@@ -503,7 +503,16 @@ func (self *p2pStreamProbe) setReady(
 		}
 		generation.routeUpdates.Add(1)
 		self.stateLock.Unlock()
-		self.routeManager.UpdateTransport(sendTransport, []Route{sendRoute})
+		// Readiness rematches the same physical generation. Preserve its
+		// delivery semantics: a propertyless update here used to erase the
+		// native RTP/SRTP lane's unreliable classification immediately after
+		// the end-to-end probe succeeded, disabling Transfer flight control for
+		// the entire useful lifetime of the P2P route.
+		self.routeManager.UpdateTransportWithProperties(
+			sendTransport,
+			[]Route{sendRoute},
+			p2pTransferCarrierProperties(sendTransport),
+		)
 		generation.routeUpdates.Done()
 	} else {
 		generation.routeUpdates.Add(1)

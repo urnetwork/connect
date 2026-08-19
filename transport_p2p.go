@@ -168,13 +168,17 @@ func DefaultP2pTransportSettings() *P2pTransportSettings {
 		// continuously at that round-trip time.
 		EndToEndProbeInterval: 5 * time.Second,
 		EndToEndProbeTimeout:  15 * time.Second,
-		// Four transfer batches absorb ordinary goroutine scheduling jitter.
-		// A real detached-data-channel measurement sustained the same
-		// 53-54 MiB/s at depths 1/4/8/32. Keeping 32 therefore added no
-		// throughput, but allowed up to 2 MiB of MaxMessageByteCount payloads
-		// to sit in each unbudgeted receive route. Four cuts that hard bound
-		// to 256 KiB and shortens queueing latency.
+		// Four transfer batches absorb ordinary goroutine scheduling jitter on
+		// send and bound readiness prefetch. A real detached-data-channel
+		// measurement sustained the same 53-54 MiB/s at depths 1/4/8/32.
+		// Receive handoff has independent count and byte limits below.
 		ChannelBufferSize: 4,
+		// The carrier readers hand off without waiting. Count and bytes are
+		// independent so ordinary 89--154-byte ACK/control bursts get enough
+		// slots while four worst-case 64 KiB messages retain exactly the old
+		// 256 KiB memory ceiling.
+		ReceiveQueueMessageCount: 16,
+		ReceiveQueueByteCount:    kib(256),
 		// Transfer batching is capped at 3 KiB, so almost every data-channel
 		// message fits in the 4 KiB pooled class. The receiver retries once
 		// with Pion's exact required length for a legacy/atypical larger
@@ -247,6 +251,14 @@ type P2pTransportSettings struct {
 	// responses stop crossing the complete path.
 	EndToEndProbeTimeout time.Duration
 	ChannelBufferSize    int
+	// ReceiveQueueMessageCount bounds complete messages waiting between the
+	// SCTP/SRTP readers and the RouteManager, including the one currently held
+	// by the forwarding worker. ReceiveQueueByteCount is the hard retained
+	// payload ceiling for that same queue. Nonpositive values retain
+	// compatibility by deriving the old ChannelBufferSize*MaxMessageByteCount
+	// bound.
+	ReceiveQueueMessageCount int
+	ReceiveQueueByteCount    ByteCount
 	// InitialReadBufferByteCount is the first pooled receive size.
 	// io.ErrShortBuffer retries with Pion's exact required length up to
 	// MaxMessageByteCount without consuming the queued SCTP message.
@@ -311,7 +323,69 @@ type P2pTransport struct {
 
 type p2pRouteManager interface {
 	UpdateTransport(Transport, []Route)
+	UpdateTransportWithProperties(Transport, []Route, TransferCarrierProperties)
 	RemoveTransport(Transport)
+}
+
+// p2pTransferCarrierProperties exposes the native RTP/SRTP lane to Transfer's
+// acknowledgement-flight controller. The legacy SCTP data channel performs
+// its own retransmission and remains reliable. Fast-only always uses the
+// datagram lane; Auto is potentially unreliable as soon as the peer exposes
+// that capability, while the per-message callback keeps legacy fallback
+// writes on the reliable recovery cadence until the fast lane is ready.
+func p2pTransferCarrierProperties(transport Transport) TransferCarrierProperties {
+	send, ok := transport.(*P2pSendTransport)
+	if !ok || send.settings == nil ||
+		send.settings.DataPlaneMode == P2pDataPlaneModeLegacyOnly {
+		return TransferCarrierProperties{}
+	}
+	if send.settings.DataPlaneMode == P2pDataPlaneModeFastOnly {
+		return TransferCarrierProperties{
+			Unreliable:                   true,
+			unreliableFlightMessageLimit: p2pUnreliableFlightMessageLimit(send.settings),
+		}
+	}
+	fastConn, ok := send.conn.(webRtcFastPathConn)
+	if !ok {
+		return TransferCarrierProperties{}
+	}
+	return TransferCarrierProperties{
+		Unreliable:                   true,
+		unreliableFlightMessageLimit: p2pUnreliableFlightMessageLimit(send.settings),
+		unreliableForMessageByteCount: func(int) bool {
+			return fastConn.FastPathReady()
+		},
+	}
+}
+
+// One receive slot remains outside the ACK-required flight for cumulative
+// ACKs, compact recovery, probes, and contract control, none of which consume
+// SendSequence's flight count. A one-slot route still admits one message so a
+// minimal/test configuration cannot deadlock.
+func p2pUnreliableFlightMessageLimit(settings *P2pTransportSettings) int {
+	return max(1, p2pReceiveQueueMessageCount(settings)-1)
+}
+
+func p2pReceiveQueueMessageCount(settings *P2pTransportSettings) int {
+	if settings != nil && 0 < settings.ReceiveQueueMessageCount {
+		return settings.ReceiveQueueMessageCount
+	}
+	if settings == nil {
+		return 1
+	}
+	return max(1, settings.ChannelBufferSize)
+}
+
+func p2pReceiveQueueByteCount(settings *P2pTransportSettings) ByteCount {
+	if settings == nil {
+		return 1
+	}
+	maximumMessageByteCount := max(1, settings.MaxMessageByteCount)
+	if 0 < settings.ReceiveQueueByteCount {
+		return max(ByteCount(maximumMessageByteCount), settings.ReceiveQueueByteCount)
+	}
+	return ByteCount(max(1, settings.ChannelBufferSize)) *
+		ByteCount(maximumMessageByteCount)
 }
 
 // p2pConnectionRouteTestHooks exposes the two sides of a connected route
@@ -341,7 +415,11 @@ func updateP2pConnectionRoute(
 		if hooks.beforeConnectedUpdate != nil {
 			hooks.beforeConnectedUpdate()
 		}
-		manager.UpdateTransport(transport, []Route{route})
+		manager.UpdateTransportWithProperties(
+			transport,
+			[]Route{route},
+			p2pTransferCarrierProperties(transport),
+		)
 		if hooks.afterConnectedUpdate != nil {
 			hooks.afterConnectedUpdate()
 		}
@@ -1233,6 +1311,10 @@ func (self *P2pSendTransport) TransportId() Id {
 	return self.transportId
 }
 
+func (self *P2pSendTransport) TransportType() TransportType {
+	return TransportTypeP2p
+}
+
 // lower priority takes precedence
 func (self *P2pSendTransport) Priority() int {
 	// p2p routes have highest priority
@@ -1294,13 +1376,20 @@ func (self *P2pSendTransport) Downgrade(source TransferPath) {
 type P2pReceiveTransport struct {
 	transportId Id
 
-	ctx       context.Context
-	cancel    context.CancelFunc
-	conn      net.Conn
-	streamId  Id
-	receive   chan []byte
-	done      chan struct{}
-	closeOnce sync.Once
+	ctx      context.Context
+	cancel   context.CancelFunc
+	conn     net.Conn
+	streamId Id
+	receive  chan []byte
+	// pendingReceive is the carrier-reader handoff. A separate forwarding
+	// worker may wait on the RouteManager, but no SCTP/SRTP callback does.
+	pendingReceive             chan []byte
+	pendingReceiveMessageCount atomic.Int64
+	pendingReceiveMessageLimit int64
+	pendingReceiveByteCount    atomic.Int64
+	pendingReceiveByteLimit    int64
+	done                       chan struct{}
+	closeOnce                  sync.Once
 	// messageHandler consumes endpoint-only raw stream control before Client.
 	messageHandler func([]byte) bool
 
@@ -1334,27 +1423,161 @@ func newP2pReceiveTransport(
 	prefetched [][]byte,
 	messageHandler func([]byte) bool,
 ) (Transport, Route) {
-	receive := make(chan []byte, settings.ChannelBufferSize)
+	receive := make(chan []byte)
 	p2pReceiveTransport := &P2pReceiveTransport{
-		transportId:    NewId(),
-		ctx:            ctx,
-		cancel:         cancel,
-		conn:           conn,
-		streamId:       streamId,
-		receive:        receive,
-		done:           make(chan struct{}),
-		messageHandler: messageHandler,
-		settings:       settings,
+		transportId:                NewId(),
+		ctx:                        ctx,
+		cancel:                     cancel,
+		conn:                       conn,
+		streamId:                   streamId,
+		receive:                    receive,
+		pendingReceive:             make(chan []byte, p2pReceiveQueueMessageCount(settings)),
+		pendingReceiveMessageLimit: int64(p2pReceiveQueueMessageCount(settings)),
+		pendingReceiveByteLimit:    int64(p2pReceiveQueueByteCount(settings)),
+		done:                       make(chan struct{}),
+		messageHandler:             messageHandler,
+		settings:                   settings,
 	}
-	for _, message := range prefetched {
+	for messageIndex, message := range prefetched {
 		if messageHandler != nil && messageHandler(message) {
 			MessagePoolReturn(message)
 			continue
 		}
-		receive <- message
+		if !p2pReceiveTransport.offerReceive(
+			message,
+			false,
+			0,
+			isP2pStreamProbe(message),
+			false,
+		) {
+			for _, remaining := range prefetched[messageIndex+1:] {
+				MessagePoolReturn(remaining)
+			}
+			break
+		}
 	}
 	go HandleError(p2pReceiveTransport.run, cancel)
 	return p2pReceiveTransport, receive
+}
+
+// offerReceive transfers one complete Transfer frame to the Client route
+// without parking either the reliable SCTP reader or the datagram worker. A
+// full route is a loss signal owned by Transfer recovery, not backpressure for
+// the carrier receive path.
+func (self *P2pReceiveTransport) offerReceive(
+	message []byte,
+	fast bool,
+	fragmentCount int,
+	probeMessage bool,
+	countDeliveredStats bool,
+) bool {
+	if !self.reservePendingReceive(len(message)) {
+		self.recordReceiveQueueDrop(message, fast, probeMessage)
+		return true
+	}
+	select {
+	case <-self.ctx.Done():
+		self.releasePendingReceive(len(message))
+		MessagePoolReturn(message)
+		return false
+	case self.pendingReceive <- message:
+		if stats := self.settings.DataPlaneStats; stats != nil && !probeMessage && countDeliveredStats {
+			if fast {
+				stats.fastReceiveMessageCount.Add(1)
+				stats.fastReceiveByteCount.Add(uint64(len(message)))
+				stats.fastReceiveFragmentCount.Add(uint64(max(0, fragmentCount)))
+			} else {
+				stats.legacyReceiveMessageCount.Add(1)
+				stats.legacyReceiveByteCount.Add(uint64(len(message)))
+			}
+		}
+		return true
+	default:
+		self.releasePendingReceive(len(message))
+		self.recordReceiveQueueDrop(message, fast, probeMessage)
+		return true
+	}
+}
+
+func (self *P2pReceiveTransport) recordReceiveQueueDrop(
+	message []byte,
+	fast bool,
+	probeMessage bool,
+) {
+	if stats := self.settings.DataPlaneStats; stats != nil && !probeMessage {
+		if fast {
+			stats.fastReceiveQueueDropCount.Add(1)
+			stats.fastReceiveQueueDropByteCount.Add(uint64(len(message)))
+			stats.fastDropCount.Add(1)
+		} else {
+			stats.legacyReceiveQueueDropCount.Add(1)
+			stats.legacyReceiveQueueDropByteCount.Add(uint64(len(message)))
+		}
+	}
+	MessagePoolReturn(message)
+}
+
+func (self *P2pReceiveTransport) reservePendingReceive(byteCount int) bool {
+	if byteCount <= 0 {
+		return false
+	}
+	for {
+		current := self.pendingReceiveMessageCount.Load()
+		if self.pendingReceiveMessageLimit <= current {
+			return false
+		}
+		if self.pendingReceiveMessageCount.CompareAndSwap(current, current+1) {
+			break
+		}
+	}
+	delta := int64(byteCount)
+	for {
+		current := self.pendingReceiveByteCount.Load()
+		if self.pendingReceiveByteLimit < current+delta {
+			self.releasePendingReceiveMessage()
+			return false
+		}
+		if self.pendingReceiveByteCount.CompareAndSwap(current, current+delta) {
+			return true
+		}
+	}
+}
+
+func (self *P2pReceiveTransport) releasePendingReceive(byteCount int) {
+	if byteCount <= 0 {
+		return
+	}
+	if remaining := self.pendingReceiveByteCount.Add(-int64(byteCount)); remaining < 0 {
+		panic("negative P2P receive queue byte count")
+	}
+	self.releasePendingReceiveMessage()
+}
+
+func (self *P2pReceiveTransport) releasePendingReceiveMessage() {
+	if remaining := self.pendingReceiveMessageCount.Add(-1); remaining < 0 {
+		panic("negative P2P receive queue message count")
+	}
+}
+
+// The only worker allowed to wait for RouteManager consumption. Carrier
+// readers enqueue to pendingReceive with a zero-wait send and therefore keep
+// obeying the receive callback policy under a stalled Client.
+func (self *P2pReceiveTransport) runReceiveQueue() {
+	for {
+		select {
+		case <-self.ctx.Done():
+			return
+		case message := <-self.pendingReceive:
+			select {
+			case <-self.ctx.Done():
+				self.releasePendingReceive(len(message))
+				MessagePoolReturn(message)
+				return
+			case self.receive <- message:
+				self.releasePendingReceive(len(message))
+			}
+		}
+	}
 }
 
 // Close cancels this receive route and interrupts its read without closing the
@@ -1382,12 +1605,17 @@ func (self *P2pReceiveTransport) CloseAndWait(ctx context.Context) error {
 
 func (self *P2pReceiveTransport) run() {
 	defer close(self.done)
-	var fastWorker sync.WaitGroup
+	var receiveWorkers sync.WaitGroup
+	receiveWorkers.Add(1)
+	go HandleError(func() {
+		defer receiveWorkers.Done()
+		self.runReceiveQueue()
+	}, self.cancel)
 	if fastConn, ok := self.conn.(webRtcFastPathConn); ok &&
 		self.settings.DataPlaneMode != P2pDataPlaneModeLegacyOnly {
-		fastWorker.Add(1)
+		receiveWorkers.Add(1)
 		go HandleError(func() {
-			defer fastWorker.Done()
+			defer receiveWorkers.Done()
 			self.runFast(fastConn)
 		}, self.cancel)
 	}
@@ -1395,7 +1623,7 @@ func (self *P2pReceiveTransport) run() {
 	// yet at shutdown.
 	defer func() {
 		self.cancel()
-		fastWorker.Wait()
+		receiveWorkers.Wait()
 		defer func() {
 			if self.testingBeforeDoneForTest != nil {
 				self.testingBeforeDoneForTest()
@@ -1403,10 +1631,8 @@ func (self *P2pReceiveTransport) run() {
 		}()
 		for {
 			select {
-			case b, ok := <-self.receive:
-				if !ok {
-					return
-				}
+			case b := <-self.pendingReceive:
+				self.releasePendingReceive(len(b))
 				MessagePoolReturn(b)
 			default:
 				return
@@ -1462,16 +1688,9 @@ func (self *P2pReceiveTransport) run() {
 				}
 				continue
 			}
-			// The route now owns this exact slice and returns it to the pool.
-			select {
-			case <-self.ctx.Done():
-				MessagePoolReturn(transferFrameBytes)
+			// The route owns the exact slice only when immediate admission wins.
+			if !self.offerReceive(transferFrameBytes, false, 0, probeMessage, true) {
 				return
-			case self.receive <- transferFrameBytes:
-				if stats := self.settings.DataPlaneStats; stats != nil && !probeMessage {
-					stats.legacyReceiveMessageCount.Add(1)
-					stats.legacyReceiveByteCount.Add(uint64(len(transferFrameBytes)))
-				}
 			}
 		}
 		if err != nil {
@@ -1487,8 +1706,7 @@ func (self *P2pReceiveTransport) run() {
 }
 
 // runFast transfers complete datagram-lane messages into the shared receive
-// route. This worker may apply route backpressure; the independent SRTP reader
-// retains a bounded queue and drops only after that queue is also exhausted.
+// route. It never propagates route backpressure into the native SRTP reader.
 func (self *P2pReceiveTransport) runFast(conn webRtcFastPathConn) {
 	messages := conn.FastPathMessages()
 	for {
@@ -1504,16 +1722,14 @@ func (self *P2pReceiveTransport) runFast(conn webRtcFastPathConn) {
 				MessagePoolReturn(received.message)
 				continue
 			}
-			select {
-			case <-self.ctx.Done():
-				MessagePoolReturn(received.message)
+			if !self.offerReceive(
+				received.message,
+				true,
+				received.fragmentCount,
+				probeMessage,
+				true,
+			) {
 				return
-			case self.receive <- received.message:
-				if stats := self.settings.DataPlaneStats; stats != nil && !probeMessage {
-					stats.fastReceiveMessageCount.Add(1)
-					stats.fastReceiveByteCount.Add(uint64(len(received.message)))
-					stats.fastReceiveFragmentCount.Add(uint64(received.fragmentCount))
-				}
 			}
 		}
 	}
@@ -1521,6 +1737,10 @@ func (self *P2pReceiveTransport) runFast(conn webRtcFastPathConn) {
 
 func (self *P2pReceiveTransport) TransportId() Id {
 	return self.transportId
+}
+
+func (self *P2pReceiveTransport) TransportType() TransportType {
+	return TransportTypeP2p
 }
 
 // lower priority takes precedence

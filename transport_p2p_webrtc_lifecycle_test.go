@@ -249,3 +249,45 @@ func TestReceivePathSignalSendsDoNotBlock(t *testing.T) {
 		t.Fatal("the receive-path response send did not carry the non-blocking contract")
 	}
 }
+
+// A Pion ICE callback shares Pion's event machinery. Candidate publication
+// must therefore use the same zero-timeout transfer handoff as an inbound
+// signal response, even though the candidate was generated locally.
+func TestPionIceCandidateCallbackSendDoesNotBlock(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sender := &blockingSignalSender{ctx: ctx}
+	conn := &peerConn{
+		ctx:                ctx,
+		key:                peerConnKey{PeerId: NewId(), StreamId: NewId()},
+		signalSender:       sender,
+		signalGeneration:   NewId(),
+		iceCandidatesReady: true,
+	}
+	candidate := &webrtc.ICECandidate{
+		Foundation: "nonblocking",
+		Priority:   1,
+		Address:    "192.0.2.1",
+		Protocol:   webrtc.ICEProtocolUDP,
+		Port:       10000,
+		Typ:        webrtc.ICECandidateTypeHost,
+		Component:  1,
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn.handleLocalIceCandidate(candidate)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Pion ICE callback blocked on a saturated Transfer sender")
+	}
+	if got := atomic.LoadInt32(&sender.nonBlockingCount); got != 1 {
+		t.Fatalf("nonblocking candidate sends = %d, want 1", got)
+	}
+	if got := atomic.LoadInt32(&sender.blockedCount); got != 0 {
+		t.Fatalf("blocking candidate sends = %d, want 0", got)
+	}
+}

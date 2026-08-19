@@ -165,7 +165,7 @@ func TestRemoteUserNatProviderPacketStats(t *testing.T) {
 	for {
 		select {
 		case packetStats := <-packetStatsChannel:
-			if *packetStats == final {
+			if packetStatsEqual(packetStats, &final) {
 				return
 			}
 			// an earlier epoch's partial snapshot; keep waiting

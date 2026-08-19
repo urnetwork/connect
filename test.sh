@@ -1,5 +1,17 @@
 #!/usr/bin/env zsh
 
+# The transport and edge integration tests exercise NGINX 1.31.4 UDP upstream
+# PROXY protocol v2. Build the same pinned source used by warp/lb, then make the
+# capability path explicit for every child `go test` process.
+connect_dir=${0:A:h}
+warp_lb_dir=${connect_dir:h}/warp/lb
+make -C "$warp_lb_dir" nginx_local
+nginx_build_status=$?
+if [[ $nginx_build_status != 0 ]]; then
+    exit $nginx_build_status
+fi
+export NGINX_UDP_PROXY_V2_BINARY="$warp_lb_dir/build/nginx-local/sbin/nginx"
+
 # Some tests are timing-sensitive: they pass in a fresh process but stall or
 # fail late in the full -race suite, once accumulated GC/race overhead slows
 # delivery. Run each such group first, in its own process, so it executes under

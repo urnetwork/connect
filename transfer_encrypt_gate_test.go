@@ -65,16 +65,12 @@ func requiredGatePair(
 	provideModes := map[protocol.ProvideMode]bool{protocol.ProvideMode_Network: true}
 
 	makeSettings := func(mode EncryptionMode) *ClientSettings {
-		s := DefaultClientSettings()
-		s.SendBufferSettings.SequenceBufferSize = 0
-		s.SendBufferSettings.AckBufferSize = 0
+		s := DefaultClientSettingsWithBufferSize(64)
 		s.SendBufferSettings.AckTimeout = 60 * time.Second
 		s.SendBufferSettings.IdleTimeout = 60 * time.Second
 		s.SendBufferSettings.MinResendInterval = 10 * time.Millisecond
-		s.ReceiveBufferSettings.SequenceBufferSize = 0
 		s.ReceiveBufferSettings.GapTimeout = 60 * time.Second
 		s.ReceiveBufferSettings.IdleTimeout = 60 * time.Second
-		s.ForwardBufferSettings.SequenceBufferSize = 0
 		s.ForwardBufferSettings.IdleTimeout = 1 * time.Second
 		s.ContractManagerSettings.LegacyCreateContract = false
 		s.EncryptionSettings.Mode = mode
@@ -130,7 +126,10 @@ func requiredGatePair(
 		for _, frame := range frames {
 			if m, err := FromFrame(frame); err == nil {
 				if sm, ok := m.(*protocol.SimpleMessage); ok {
-					receivesB <- sm.Content
+					select {
+					case receivesB <- sm.Content:
+					default:
+					}
 				}
 			}
 		}

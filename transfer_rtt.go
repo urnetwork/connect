@@ -83,8 +83,8 @@ func NewRttWindow(
 	}
 }
 
-// must be called inside the state lock
-func (self *RttWindow) coalesce(windowTime time.Time) {
+// Removes expired samples while stateLock is held.
+func (self *RttWindow) coalesceWithLock(windowTime time.Time) {
 	windowStartTime := windowTime.Add(-self.windowTimeout)
 	for self.windowTailIndex != self.windowHeadIndex {
 		item := self.window[self.windowTailIndex]
@@ -133,7 +133,7 @@ func (self *RttWindow) closeSendTime(sendTimeUnixMilli uint64, receiveTime time.
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
-	self.coalesce(receiveTime)
+	self.coalesceWithLock(receiveTime)
 
 	item := newRttWindowItem(
 		sendTime,
@@ -160,9 +160,7 @@ func (self *RttWindow) ScaledRtt() time.Duration {
 
 func (self *RttWindow) scaledRtt(sendTime time.Time) time.Duration {
 	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
-
-	self.coalesce(sendTime)
+	self.coalesceWithLock(sendTime)
 
 	useRtt := self.rtts.MeanRtt()
 	floor := self.rttMinScaledRtt
@@ -177,6 +175,7 @@ func (self *RttWindow) scaledRtt(sendTime time.Time) time.Duration {
 		),
 		self.maxScaledRtt,
 	)
+	self.stateLock.Unlock()
 	// guard the V(2) diagnostic: this runs per packet (resend timing), and the
 	// disabled-level call would still box the Duration arg into []any and build
 	// the variadic slice on the heap. the guard keeps the hot path allocation-free.
@@ -184,6 +183,39 @@ func (self *RttWindow) scaledRtt(sendTime time.Time) time.Duration {
 		self.log.Infof("[rtt]scaled=%dms\n", scaledRtt/time.Millisecond)
 	}
 	return scaledRtt
+}
+
+// Returns a bounded minimum-path RTT for one receiver-paced recovery probe.
+// Queue-inflated mean RTT remains the ordinary resend timer; using the minimum
+// here prevents one deep serialization queue from turning a tail probe into the
+// same multi-second RTO it is meant to precede. Callers bound duplicate cost to
+// one probe per item.
+func (self *RttWindow) ProbeRtt() time.Duration {
+	return self.probeRtt(time.Now())
+}
+
+func (self *RttWindow) probeRtt(probeTime time.Time) time.Duration {
+	self.stateLock.Lock()
+	self.coalesceWithLock(probeTime)
+
+	useRtt := self.rtts.MinRtt()
+	floor := self.rttMinScaledRtt
+	if useRtt == 0 {
+		floor = self.minScaledRtt
+	}
+	probeRtt := min(
+		max(
+			time.Duration(float32(useRtt/time.Millisecond)*self.rttScale)*time.Millisecond,
+			floor,
+		),
+		self.maxScaledRtt,
+	)
+	self.stateLock.Unlock()
+
+	if self.log.V(2).Enabled() {
+		self.log.Infof("[rtt]probe=%dms\n", probeRtt/time.Millisecond)
+	}
+	return probeRtt
 }
 
 type rttHeap struct {
@@ -212,12 +244,10 @@ func (self *rttHeap) Remove(item *rttWindowItem) {
 }
 
 func (self *rttHeap) MinRtt() time.Duration {
-	n := len(self.items)
-	if n == 0 {
+	if len(self.items) == 0 {
 		return time.Duration(0)
 	}
-	maxItem := self.items[n-1]
-	return maxItem.rtt
+	return self.items[0].rtt
 }
 
 func (self *rttHeap) MeanRtt() time.Duration {

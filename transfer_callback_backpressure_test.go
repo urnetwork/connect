@@ -1,5 +1,5 @@
-// Callback backpressure regressions keep per-sequence waits from holding
-// buffer-wide state locks shared by unrelated peers.
+// Callback backpressure regressions keep receive pumps nonblocking and keep
+// sender-owned waits from holding state shared by unrelated peers.
 package connect
 
 import (
@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"google.golang.org/protobuf/proto"
 
 	"github.com/urnetwork/connect/protocol"
 )
@@ -106,12 +108,11 @@ func TestSendSequenceCloseCallbackBackpressureIsDestinationLocal(t *testing.T) {
 	}
 }
 
-// TestReceiveSequenceReplacementBackpressureIsSourceLocal models a receive
-// worker parked in an intentional receive callback. A newer generation for the
-// same source must wait for that callback to finish to preserve ordering, but
-// the wait must occur outside ReceiveBuffer.mutex so unrelated sources remain
-// observable and admissible.
-func TestReceiveSequenceReplacementBackpressureIsSourceLocal(t *testing.T) {
+// TestReceiveSequenceReplacementDropsWithoutWaiting models a receive worker
+// parked in a callback. A newer generation cancels that worker but drops its
+// first Pack instead of parking the shared receive pump on worker exit. The
+// sender retains the Pack until Transfer acknowledges a later retry.
+func TestReceiveSequenceReplacementDropsWithoutWaiting(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	settings := DefaultClientSettings()
@@ -148,6 +149,12 @@ func TestReceiveSequenceReplacementBackpressureIsSourceLocal(t *testing.T) {
 	receiveBuffer.receiveSequences[oldId] = oldSequence
 	receiveBuffer.headReceiveSequenceIds[headKey] = oldId
 	receiveBuffer.mutex.Unlock()
+	defer func() {
+		receiveBuffer.mutex.Lock()
+		delete(receiveBuffer.receiveSequences, oldId)
+		delete(receiveBuffer.headReceiveSequenceIds, headKey)
+		receiveBuffer.mutex.Unlock()
+	}()
 
 	transferFrameBytes := MessagePoolGet(1)
 	transferFrameBytes[0] = 1
@@ -173,7 +180,7 @@ func TestReceiveSequenceReplacementBackpressureIsSourceLocal(t *testing.T) {
 				Unwrapped:          true,
 				EncryptionRole:     sequenceTlsRoleServer,
 			},
-			time.Second,
+			0,
 		)
 		replacementResult <- struct {
 			success bool
@@ -182,46 +189,347 @@ func TestReceiveSequenceReplacementBackpressureIsSourceLocal(t *testing.T) {
 	}()
 
 	select {
-	case <-oldCtx.Done():
-		// The replacement reached the old worker and canceled it.
-	case <-time.After(time.Second):
-		t.Fatal("new generation did not retire the old receive sequence")
-	}
-	select {
-	case result := <-replacementResult:
-		t.Fatalf(
-			"same-source replacement bypassed callback ordering: (%t, %v)",
-			result.success,
-			result.err,
-		)
-	default:
-	}
-
-	unrelatedDone := make(chan struct{})
-	go func() {
-		defer close(unrelatedDone)
-		receiveBuffer.ReceiveQueueSizeAndMessageTypes(
-			SourceId(NewId()),
-			NewId(),
-		)
-	}()
-	select {
-	case <-unrelatedDone:
-	case <-time.After(250 * time.Millisecond):
-		t.Fatal("same-source callback backpressure retained the buffer-wide receive lock")
-	}
-
-	close(oldSequence.exit)
-	select {
 	case result := <-replacementResult:
 		if result.err != nil || !result.success {
 			t.Fatalf(
-				"replacement result after callback release = (%t, %v)",
+				"nonblocking replacement drop = (%t, %v), want accepted drop",
 				result.success,
 				result.err,
 			)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("same-source replacement did not resume after callback release")
+		t.Fatal("zero-timeout replacement waited for the old receive callback")
+	}
+	select {
+	case <-oldCtx.Done():
+		// The replacement reached and canceled the old generation.
+	default:
+		t.Fatal("new generation did not retire the old receive sequence")
+	}
+	if stats := client.ReceiveStats(); stats.PackHandoffDropCount != 1 ||
+		stats.PackHandoffDropByteCount != 0 || stats.AckHandoffDropCount != 0 {
+		t.Fatalf("replacement receive stats = %+v", stats)
+	}
+}
+
+// TestReceiveSequenceClosingGenerationDropsWithoutWaiting covers the other
+// generation race: Pack first finds the exact indexed worker, but that worker
+// is already canceled when admission runs. The retry must not wait for the
+// worker's exit before returning to the shared receive pump.
+func TestReceiveSequenceClosingGenerationDropsWithoutWaiting(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultClientSettings()
+	settings.Log = NewNoopLogger()
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+	defer client.Cancel()
+
+	receiveBuffer := client.receiveBuffer
+	source := SourceId(NewId())
+	sequenceId := NewId()
+	sequenceCtx, sequenceCancel := context.WithCancel(ctx)
+	sequenceCancel()
+	sequence := &ReceiveSequence{
+		ctx:    sequenceCtx,
+		cancel: sequenceCancel,
+		exit:   make(chan struct{}),
+	}
+	id := receiveSequenceId{
+		Source:         source,
+		SequenceId:     sequenceId,
+		EncryptionRole: sequenceTlsRoleServer,
+	}
+	headKey := receiveSequenceHeadKey{
+		Source:         source,
+		EncryptionRole: sequenceTlsRoleServer,
+	}
+	receiveBuffer.mutex.Lock()
+	receiveBuffer.receiveSequences[id] = sequence
+	receiveBuffer.headReceiveSequenceIds[headKey] = id
+	receiveBuffer.mutex.Unlock()
+	defer func() {
+		receiveBuffer.mutex.Lock()
+		delete(receiveBuffer.receiveSequences, id)
+		delete(receiveBuffer.headReceiveSequenceIds, headKey)
+		receiveBuffer.mutex.Unlock()
+	}()
+
+	transferFrameBytes := MessagePoolGet(1)
+	transferFrameBytes[0] = 1
+	result := make(chan struct {
+		success bool
+		err     error
+	}, 1)
+	go func() {
+		success, packErr := receiveBuffer.Pack(
+			&ReceivePack{
+				Source:     source,
+				SequenceId: sequenceId,
+				Pack: &protocol.Pack{
+					MessageId:      NewId().Bytes(),
+					SequenceId:     sequenceId.Bytes(),
+					SequenceNumber: 0,
+					Head:           true,
+				},
+				ReceiveCallback:    func(TransferPath, []*protocol.Frame, Peer) {},
+				TransferFrameBytes: transferFrameBytes,
+				Ctx:                ctx,
+				Unwrapped:          true,
+				EncryptionRole:     sequenceTlsRoleServer,
+			},
+			0,
+		)
+		result <- struct {
+			success bool
+			err     error
+		}{success: success, err: packErr}
+	}()
+
+	select {
+	case packResult := <-result:
+		if packResult.err != nil || !packResult.success {
+			t.Fatalf(
+				"closing-generation drop = (%t, %v), want accepted drop",
+				packResult.success,
+				packResult.err,
+			)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("zero-timeout Pack waited for the closing receive generation")
+	}
+	if stats := client.ReceiveStats(); stats.PackHandoffDropCount != 1 ||
+		stats.PackHandoffDropByteCount != 0 || stats.AckHandoffDropCount != 0 {
+		t.Fatalf("closing-generation receive stats = %+v", stats)
+	}
+}
+
+// callbackBackpressurePackBytes builds one plaintext, contract-free reliable
+// Pack for deterministic injection through the production Client receive pump.
+func callbackBackpressurePackBytes(
+	t *testing.T,
+	sourceId Id,
+	destinationId Id,
+	sequenceId Id,
+	sequenceNumber uint64,
+	head bool,
+	content string,
+) []byte {
+	t.Helper()
+	transferFrameBytes, err := proto.Marshal(&protocol.TransferFrame{
+		TransferPath: TransferPath{
+			SourceId:      sourceId,
+			DestinationId: destinationId,
+		}.ToProtobuf(),
+		Pack: &protocol.Pack{
+			MessageId:      NewId().Bytes(),
+			SequenceId:     sequenceId.Bytes(),
+			SequenceNumber: sequenceNumber,
+			Head:           head,
+			Frames: []*protocol.Frame{{
+				MessageType:  protocol.MessageType_TransferExchangeSignals,
+				MessageBytes: []byte(content),
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal receive Pack: %v", err)
+	}
+	return transferFrameBytes
+}
+
+// TestClientReceivePackHandoffDoesNotBlockUnrelatedSource fills one receive
+// sequence while its callback is parked, then puts another Pack for that
+// sequence ahead of an unrelated source. The full handoff must drop
+// immediately; using ClientSettings.BufferTimeout here stalls the unrelated
+// source for that entire timeout.
+func TestClientReceivePackHandoffDoesNotBlockUnrelatedSource(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultClientSettings()
+	settings.Log = NewNoopLogger()
+	settings.BufferTimeout = time.Hour
+	settings.ReceiveBufferSettings.SequenceBufferSize = 1
+	settings.ReceiveBufferSettings.IdleTimeout = time.Hour
+	settings.EncryptionSettings.Mode = EncryptionModeOff
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+	defer client.Cancel()
+
+	blockedSourceId := NewId()
+	unrelatedSourceId := NewId()
+	client.ContractManager().AddNoContractPeer(blockedSourceId)
+	client.ContractManager().AddNoContractPeer(unrelatedSourceId)
+
+	incoming := make(chan []byte, 8)
+	receiveTransport := NewReceiveGatewayTransport()
+	client.RouteManager().UpdateTransport(receiveTransport, []Route{incoming})
+	defer client.RouteManager().RemoveTransport(receiveTransport)
+
+	callbackStarted := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	unrelatedDelivered := make(chan struct{})
+	var callbackStartedOnce sync.Once
+	var unrelatedDeliveredOnce sync.Once
+	var releaseCallbackOnce sync.Once
+	release := func() {
+		releaseCallbackOnce.Do(func() { close(releaseCallback) })
+	}
+	defer release()
+	client.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, peer Peer) {
+		for _, frame := range frames {
+			switch string(frame.MessageBytes) {
+			case "blocked":
+				callbackStartedOnce.Do(func() { close(callbackStarted) })
+				<-releaseCallback
+			case "unrelated":
+				unrelatedDeliveredOnce.Do(func() { close(unrelatedDelivered) })
+			}
+		}
+	})
+
+	blockedSequenceId := NewId()
+	incoming <- callbackBackpressurePackBytes(
+		t,
+		blockedSourceId,
+		client.ClientId(),
+		blockedSequenceId,
+		0,
+		true,
+		"blocked",
+	)
+	select {
+	case <-callbackStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first receive callback did not start")
+	}
+
+	// The blocked sequence can retain one queued Pack. Its next Pack is the
+	// deterministic full-handoff case, and it precedes the unrelated source in
+	// the single shared receive pump.
+	incoming <- callbackBackpressurePackBytes(
+		t,
+		blockedSourceId,
+		client.ClientId(),
+		blockedSequenceId,
+		1,
+		false,
+		"queued",
+	)
+	incoming <- callbackBackpressurePackBytes(
+		t,
+		blockedSourceId,
+		client.ClientId(),
+		blockedSequenceId,
+		2,
+		false,
+		"dropped",
+	)
+	incoming <- callbackBackpressurePackBytes(
+		t,
+		unrelatedSourceId,
+		client.ClientId(),
+		NewId(),
+		0,
+		true,
+		"unrelated",
+	)
+
+	select {
+	case <-unrelatedDelivered:
+	case <-time.After(time.Second):
+		t.Fatal("a full receive Pack handoff blocked an unrelated source")
+	}
+	if stats := client.ReceiveStats(); stats.PackHandoffDropCount != 1 ||
+		stats.PackHandoffDropByteCount == 0 || stats.AckHandoffDropCount != 0 {
+		t.Fatalf("full Pack handoff receive stats = %+v", stats)
+	}
+}
+
+// TestClientReceiveAckHandoffDoesNotBlockUnrelatedSource fills one send
+// sequence's ACK channel, then injects another ACK ahead of an unrelated Pack.
+// ACK admission is part of the shared receive pump and must also use a zero
+// timeout.
+func TestClientReceiveAckHandoffDoesNotBlockUnrelatedSource(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultClientSettings()
+	settings.Log = NewNoopLogger()
+	settings.BufferTimeout = time.Hour
+	settings.ReceiveBufferSettings.SequenceBufferSize = 1
+	settings.EncryptionSettings.Mode = EncryptionModeOff
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+	defer client.Cancel()
+
+	ackSourceId := NewId()
+	unrelatedSourceId := NewId()
+	client.ContractManager().AddNoContractPeer(unrelatedSourceId)
+
+	sequenceCtx, sequenceCancel := context.WithCancel(ctx)
+	sequenceId := NewId()
+	sequence := &SendSequence{
+		ctx:        sequenceCtx,
+		cancel:     sequenceCancel,
+		sequenceId: sequenceId,
+		acks:       make(chan *protocol.Ack, 1),
+	}
+	sequence.acks <- &protocol.Ack{}
+	client.sendBuffer.mutex.Lock()
+	client.sendBuffer.sendSequencesByDestination[ackSourceId] = map[*SendSequence]bool{
+		sequence: true,
+	}
+	client.sendBuffer.mutex.Unlock()
+	defer func() {
+		client.sendBuffer.mutex.Lock()
+		delete(client.sendBuffer.sendSequencesByDestination, ackSourceId)
+		client.sendBuffer.mutex.Unlock()
+		sequenceCancel()
+	}()
+
+	incoming := make(chan []byte, 4)
+	receiveTransport := NewReceiveGatewayTransport()
+	client.RouteManager().UpdateTransport(receiveTransport, []Route{incoming})
+	defer client.RouteManager().RemoveTransport(receiveTransport)
+
+	unrelatedDelivered := make(chan struct{})
+	var unrelatedDeliveredOnce sync.Once
+	client.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, peer Peer) {
+		for _, frame := range frames {
+			if string(frame.MessageBytes) == "unrelated" {
+				unrelatedDeliveredOnce.Do(func() { close(unrelatedDelivered) })
+			}
+		}
+	})
+
+	ackBytes, err := proto.Marshal(&protocol.TransferFrame{
+		TransferPath: TransferPath{
+			SourceId:      ackSourceId,
+			DestinationId: client.ClientId(),
+		}.ToProtobuf(),
+		Ack: &protocol.Ack{
+			MessageId:  NewId().Bytes(),
+			SequenceId: sequenceId.Bytes(),
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal receive ACK: %v", err)
+	}
+	incoming <- ackBytes
+	incoming <- callbackBackpressurePackBytes(
+		t,
+		unrelatedSourceId,
+		client.ClientId(),
+		NewId(),
+		0,
+		true,
+		"unrelated",
+	)
+
+	select {
+	case <-unrelatedDelivered:
+	case <-time.After(time.Second):
+		t.Fatal("a full receive ACK handoff blocked an unrelated source")
+	}
+	if stats := client.ReceiveStats(); stats.PackHandoffDropCount != 0 ||
+		stats.PackHandoffDropByteCount != 0 || stats.AckHandoffDropCount != 1 {
+		t.Fatalf("full ACK handoff receive stats = %+v", stats)
 	}
 }

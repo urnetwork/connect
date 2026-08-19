@@ -370,6 +370,15 @@ func TestProviderReturnIpTransferOptionsMatchRecoveryOwner(t *testing.T) {
 			wantAck:       true,
 			wantCompanion: true,
 		},
+		{
+			name:          "platform TCP ignores NoAck default",
+			options:       tcpDefaultOptions,
+			provideMode:   protocol.ProvideMode_Public,
+			transferKey:   TransferKey{CompanionContract: true},
+			ipProtocol:    IpProtocolTcp,
+			wantAck:       true,
+			wantCompanion: true,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

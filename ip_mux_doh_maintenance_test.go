@@ -89,6 +89,7 @@ func TestUpgradeMuxColdDohProberIsSingleAndNetworkWakeable(t *testing.T) {
 		dnsProbeInitialDelay: time.Hour,
 		dnsProbeMaxDelay:     time.Hour,
 	}
+	mux.settings.Store(&UpgradeMuxSettings{Dns: &DnsUpgradeSettings{Resolver: &DnsResolverSettings{}}})
 	mux.markTunnelDohUnproven()
 	mux.fallbackDohCache.Store(&DohCache{})
 
@@ -165,6 +166,7 @@ func TestUpgradeMuxColdDohProberStopsAfterSuccess(t *testing.T) {
 		dnsProbeInitialDelay: time.Millisecond,
 		dnsProbeMaxDelay:     time.Millisecond,
 	}
+	mux.settings.Store(&UpgradeMuxSettings{Dns: &DnsUpgradeSettings{Resolver: &DnsResolverSettings{}}})
 	mux.markTunnelDohUnproven()
 	mux.fallbackDohCache.Store(&DohCache{})
 	var probeCount atomic.Int32
@@ -197,6 +199,7 @@ func TestUpgradeMuxWarmDnsWithoutFallbackIsOneShot(t *testing.T) {
 		dnsProbeInitialDelay: time.Millisecond,
 		dnsProbeMaxDelay:     time.Millisecond,
 	}
+	mux.settings.Store(&UpgradeMuxSettings{Dns: &DnsUpgradeSettings{Resolver: &DnsResolverSettings{}}})
 	mux.markTunnelDohUnproven()
 	var probeCount atomic.Int32
 	mux.tunnelDohWarmFunction = func(ctx context.Context, serverCount int) bool {
@@ -216,11 +219,72 @@ func TestUpgradeMuxWarmDnsWithoutFallbackIsOneShot(t *testing.T) {
 	}
 }
 
+func TestUpgradeMuxWarmDnsDoesNothingWhenDnsInterceptionIsDisabled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mux := &UpgradeMux{
+		ctx:                  ctx,
+		dnsProberWake:        make(chan struct{}, 1),
+		dnsProbeInitialDelay: time.Millisecond,
+		dnsProbeMaxDelay:     time.Millisecond,
+	}
+	mux.settings.Store(&UpgradeMuxSettings{
+		Http: &HttpUpgradeSettings{Mode: HttpUpgradeUnencrypted},
+	})
+	// Model a stale fallback left while settings are being swapped. Disabled
+	// DNS must suppress both warm paths regardless of the cache's presence.
+	mux.fallbackDohCache.Store(&DohCache{})
+	var tunnelWarmCount atomic.Int32
+	var fallbackWarmCount atomic.Int32
+	mux.tunnelDohWarmFunction = func(context.Context, int) bool {
+		tunnelWarmCount.Add(1)
+		return true
+	}
+	mux.fallbackDohWarmFunction = func(context.Context, *DohCache, int) bool {
+		fallbackWarmCount.Add(1)
+		return true
+	}
+
+	mux.WarmDns()
+	time.Sleep(20 * time.Millisecond)
+	if got := tunnelWarmCount.Load(); got != 0 {
+		t.Fatalf("disabled DNS launched %d tunnel warm calls, expected none", got)
+	}
+	if got := fallbackWarmCount.Load(); got != 0 {
+		t.Fatalf("disabled DNS launched %d fallback warm calls, expected none", got)
+	}
+	if mux.dnsProbeRequested.Load() || mux.fallbackDohWarmPending.Load() ||
+		mux.dnsProberRunning.Load() || mux.fallbackDohWarmerRunning.Load() {
+		t.Fatal("disabled DNS retained warm-up work")
+	}
+
+	// Enabling DNS later must still make the same mux warm normally.
+	mux.settings.Store(&UpgradeMuxSettings{
+		Dns: &DnsUpgradeSettings{Resolver: &DnsResolverSettings{}},
+	})
+	mux.markTunnelDohUnproven()
+	mux.WarmDns()
+	if !waitForCondition(time.Second, func() bool {
+		return tunnelWarmCount.Load() == 1 && fallbackWarmCount.Load() == 1 &&
+			!mux.dnsProberRunning.Load() && !mux.fallbackDohWarmerRunning.Load()
+	}) {
+		t.Fatalf(
+			"enabled DNS warm did not finish: tunnel=%d fallback=%d tunnel_running=%t fallback_running=%t",
+			tunnelWarmCount.Load(),
+			fallbackWarmCount.Load(),
+			mux.dnsProberRunning.Load(),
+			mux.fallbackDohWarmerRunning.Load(),
+		)
+	}
+}
+
 func TestUpgradeMuxFallbackWarmRequestsCoalesce(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	mux := &UpgradeMux{ctx: ctx}
+	mux.settings.Store(&UpgradeMuxSettings{Dns: &DnsUpgradeSettings{Resolver: &DnsResolverSettings{}}})
 	mux.fallbackDohCache.Store(&DohCache{})
 	firstStarted := make(chan struct{})
 	releaseFirst := make(chan struct{})

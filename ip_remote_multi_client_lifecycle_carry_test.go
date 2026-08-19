@@ -114,7 +114,7 @@ func TestMultiClientCleanupPrecedesBlockedObservers(t *testing.T) {
 			Destination:                    RequireMultiHopId(NewId()),
 		},
 		generator,
-		func(*multiClientChannel, TransferPath, protocol.ProvideMode, *IpPath, []byte) {},
+		func(*multiClientChannel, TransferPath, protocol.ProvideMode, TransportType, *IpPath, []byte) {},
 		nil,
 		DefaultSecurityPolicy(ctx),
 		func(*ContractStatus) {},

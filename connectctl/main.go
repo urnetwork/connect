@@ -21,6 +21,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sync/atomic"
 
 	// "encoding/base64"
 	"bytes"
@@ -49,6 +50,17 @@ type sinkReceive struct {
 	source       connect.TransferPath
 	frameSummary string
 	provideMode  protocol.ProvideMode
+}
+
+// Performs the sink's callback-to-printer handoff without stalling the
+// client's shared receive pump.
+func enqueueSinkReceive(receives chan<- *sinkReceive, receive *sinkReceive) bool {
+	select {
+	case receives <- receive:
+		return true
+	default:
+		return false
+	}
 }
 
 // snapshotSinkReceive formats borrowed receive frames before the callback
@@ -708,17 +720,31 @@ func sink(opts docopt.Opts) {
 		// go platformTransport.Run(routeManager)
 	}
 
-	receives := make(chan *sinkReceive)
+	const receiveBufferSize = 256
+	receives := make(chan *sinkReceive, receiveBufferSize)
+	var receiveDropCount atomic.Uint64
 
 	client.AddReceiveCallback(func(source connect.TransferPath, frames []*protocol.Frame, peer connect.Peer) {
-		receives <- snapshotSinkReceive(source, frames, peer)
+		if !enqueueSinkReceive(receives, snapshotSinkReceive(source, frames, peer)) {
+			receiveDropCount.Add(1)
+		}
 	})
 
 	// FIXME reassemble the chunks. Only a complete message counts as 1 against the message count
-	for i := 0; messageCount < 0 || i < messageCount; i += 1 {
+	reportDrops := func() {
+		if dropCount := receiveDropCount.Swap(0); 0 < dropCount {
+			Err.Printf("sink receive buffer full; dropped %d callback delivery(s)", dropCount)
+		}
+	}
+	defer reportDrops()
+	for receiveCount := 0; messageCount < 0 || receiveCount < messageCount; {
 		select {
 		case receive := <-receives:
 			fmt.Printf("[%s %s] %s\n", receive.source, receive.provideMode, receive.frameSummary)
+			receiveCount += 1
+			reportDrops()
+		case <-time.After(time.Second):
+			reportDrops()
 		}
 	}
 }

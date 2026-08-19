@@ -52,39 +52,47 @@ const (
 // counts refer to complete TransferFrame messages; fragment counts refer to
 // independently authenticated SRTP datagrams.
 type P2pDataPlaneStatsSnapshot struct {
-	ActiveSendRouteCount      int64
-	ActiveReceiveRouteCount   int64
-	FastSendMessageCount      uint64
-	FastSendByteCount         uint64
-	FastSendFragmentCount     uint64
-	FastReceiveMessageCount   uint64
-	FastReceiveByteCount      uint64
-	FastReceiveFragmentCount  uint64
-	LegacySendMessageCount    uint64
-	LegacySendByteCount       uint64
-	LegacyReceiveMessageCount uint64
-	LegacyReceiveByteCount    uint64
-	FastFallbackCount         uint64
-	FastDropCount             uint64
+	ActiveSendRouteCount            int64
+	ActiveReceiveRouteCount         int64
+	FastSendMessageCount            uint64
+	FastSendByteCount               uint64
+	FastSendFragmentCount           uint64
+	FastReceiveMessageCount         uint64
+	FastReceiveByteCount            uint64
+	FastReceiveFragmentCount        uint64
+	LegacySendMessageCount          uint64
+	LegacySendByteCount             uint64
+	LegacyReceiveMessageCount       uint64
+	LegacyReceiveByteCount          uint64
+	LegacyReceiveQueueDropCount     uint64
+	LegacyReceiveQueueDropByteCount uint64
+	FastReceiveQueueDropCount       uint64
+	FastReceiveQueueDropByteCount   uint64
+	FastFallbackCount               uint64
+	FastDropCount                   uint64
 }
 
 // P2pDataPlaneStats holds lock-free counters shared by all P2P streams owned
 // by one client settings tree.
 type P2pDataPlaneStats struct {
-	activeSendRouteCount      atomic.Int64
-	activeReceiveRouteCount   atomic.Int64
-	fastSendMessageCount      atomic.Uint64
-	fastSendByteCount         atomic.Uint64
-	fastSendFragmentCount     atomic.Uint64
-	fastReceiveMessageCount   atomic.Uint64
-	fastReceiveByteCount      atomic.Uint64
-	fastReceiveFragmentCount  atomic.Uint64
-	legacySendMessageCount    atomic.Uint64
-	legacySendByteCount       atomic.Uint64
-	legacyReceiveMessageCount atomic.Uint64
-	legacyReceiveByteCount    atomic.Uint64
-	fastFallbackCount         atomic.Uint64
-	fastDropCount             atomic.Uint64
+	activeSendRouteCount            atomic.Int64
+	activeReceiveRouteCount         atomic.Int64
+	fastSendMessageCount            atomic.Uint64
+	fastSendByteCount               atomic.Uint64
+	fastSendFragmentCount           atomic.Uint64
+	fastReceiveMessageCount         atomic.Uint64
+	fastReceiveByteCount            atomic.Uint64
+	fastReceiveFragmentCount        atomic.Uint64
+	legacySendMessageCount          atomic.Uint64
+	legacySendByteCount             atomic.Uint64
+	legacyReceiveMessageCount       atomic.Uint64
+	legacyReceiveByteCount          atomic.Uint64
+	legacyReceiveQueueDropCount     atomic.Uint64
+	legacyReceiveQueueDropByteCount atomic.Uint64
+	fastReceiveQueueDropCount       atomic.Uint64
+	fastReceiveQueueDropByteCount   atomic.Uint64
+	fastFallbackCount               atomic.Uint64
+	fastDropCount                   atomic.Uint64
 }
 
 // Snapshot reads a consistent-enough lock-free view without stopping packet
@@ -95,20 +103,24 @@ func (self *P2pDataPlaneStats) Snapshot() P2pDataPlaneStatsSnapshot {
 		return P2pDataPlaneStatsSnapshot{}
 	}
 	return P2pDataPlaneStatsSnapshot{
-		ActiveSendRouteCount:      self.activeSendRouteCount.Load(),
-		ActiveReceiveRouteCount:   self.activeReceiveRouteCount.Load(),
-		FastSendMessageCount:      self.fastSendMessageCount.Load(),
-		FastSendByteCount:         self.fastSendByteCount.Load(),
-		FastSendFragmentCount:     self.fastSendFragmentCount.Load(),
-		FastReceiveMessageCount:   self.fastReceiveMessageCount.Load(),
-		FastReceiveByteCount:      self.fastReceiveByteCount.Load(),
-		FastReceiveFragmentCount:  self.fastReceiveFragmentCount.Load(),
-		LegacySendMessageCount:    self.legacySendMessageCount.Load(),
-		LegacySendByteCount:       self.legacySendByteCount.Load(),
-		LegacyReceiveMessageCount: self.legacyReceiveMessageCount.Load(),
-		LegacyReceiveByteCount:    self.legacyReceiveByteCount.Load(),
-		FastFallbackCount:         self.fastFallbackCount.Load(),
-		FastDropCount:             self.fastDropCount.Load(),
+		ActiveSendRouteCount:            self.activeSendRouteCount.Load(),
+		ActiveReceiveRouteCount:         self.activeReceiveRouteCount.Load(),
+		FastSendMessageCount:            self.fastSendMessageCount.Load(),
+		FastSendByteCount:               self.fastSendByteCount.Load(),
+		FastSendFragmentCount:           self.fastSendFragmentCount.Load(),
+		FastReceiveMessageCount:         self.fastReceiveMessageCount.Load(),
+		FastReceiveByteCount:            self.fastReceiveByteCount.Load(),
+		FastReceiveFragmentCount:        self.fastReceiveFragmentCount.Load(),
+		LegacySendMessageCount:          self.legacySendMessageCount.Load(),
+		LegacySendByteCount:             self.legacySendByteCount.Load(),
+		LegacyReceiveMessageCount:       self.legacyReceiveMessageCount.Load(),
+		LegacyReceiveByteCount:          self.legacyReceiveByteCount.Load(),
+		LegacyReceiveQueueDropCount:     self.legacyReceiveQueueDropCount.Load(),
+		LegacyReceiveQueueDropByteCount: self.legacyReceiveQueueDropByteCount.Load(),
+		FastReceiveQueueDropCount:       self.fastReceiveQueueDropCount.Load(),
+		FastReceiveQueueDropByteCount:   self.fastReceiveQueueDropByteCount.Load(),
+		FastFallbackCount:               self.fastFallbackCount.Load(),
+		FastDropCount:                   self.fastDropCount.Load(),
 	}
 }
 

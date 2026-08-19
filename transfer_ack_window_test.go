@@ -61,3 +61,22 @@ func TestSequenceAckWindowSteadyStateDoesNotAllocate(t *testing.T) {
 		t.Fatalf("ack update + reset allocated %.0f times, want 0", allocs)
 	}
 }
+
+func TestSequenceAckWindowPreservesCompactRecoveryCapability(t *testing.T) {
+	window := newSequenceAckWindow()
+	window.Update(sequenceAck{
+		sequenceNumber:                   1,
+		messageId:                        NewId(),
+		compactContractRecoverySupported: true,
+	})
+	window.Update(sequenceAck{
+		sequenceNumber: 2,
+		messageId:      NewId(),
+	})
+
+	snapshot := window.Snapshot(true)
+	if snapshot.ackUpdateCount != 2 ||
+		!snapshot.headAck.compactContractRecoverySupported {
+		t.Fatalf("coalesced capability snapshot=%+v", snapshot)
+	}
+}

@@ -54,7 +54,7 @@ func DefaultTunSettingsWithBufferSize(bufferSize int) *TunSettings {
 		// must match `DefaultMtu`. packets are written directly into the
 		// receiver tap/tun interface, so this must not exceed the device
 		// interface mtu.
-		Mtu: 1440,
+		Mtu: DefaultMtu,
 
 		DialRace:          2,
 		DialRaceTimeout:   2 * time.Second,

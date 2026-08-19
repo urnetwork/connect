@@ -295,6 +295,9 @@ func (self *IpMux) SendPacketBatch(
 // internal stack; the rest go downstream.
 func (self *IpMux) Receive(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
 	if self.isLocalPacketDestination(packet) {
+		// The mux's userspace Tun is a final local-stack injection boundary,
+		// covered by the device-TUN exception in CODESTYLE.md. Returning from
+		// this callback is what permits Transfer to acknowledge the packet.
 		self.tun.Write(packet)
 		return
 	}
@@ -320,6 +323,7 @@ func (self *IpMux) ReceivePackets(
 		}
 	}
 	if localPacketCount == len(packets) {
+		// Batched form of the synchronous local-stack boundary above.
 		_, _ = self.tun.WriteBatch(packets)
 		return
 	}

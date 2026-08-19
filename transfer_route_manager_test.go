@@ -11,6 +11,25 @@ import (
 	"time"
 )
 
+type typedPriorityRouteTestTransport struct {
+	*prioritySendGatewayTransport
+	transportType TransportType
+}
+
+func newTypedPriorityRouteTestTransport(
+	transportType TransportType,
+	priority int,
+) *typedPriorityRouteTestTransport {
+	return &typedPriorityRouteTestTransport{
+		prioritySendGatewayTransport: NewPrioritySendGatewayTransport(priority, 1),
+		transportType:                transportType,
+	}
+}
+
+func (self *typedPriorityRouteTestTransport) TransportType() TransportType {
+	return self.transportType
+}
+
 func TestMultiRoute(t *testing.T) {
 	// create route manager
 	// add multiple transports and routes
@@ -116,6 +135,312 @@ func TestMultiRoute(t *testing.T) {
 	}
 }
 
+// Auto keeps both direct carriers healthy, but one ordered destination
+// sequence must not alternate messages between independent congestion
+// controllers sharing the same physical uplink. The first healthy route is
+// therefore tried first for every write while both routes remain writable.
+func TestMultiRouteWriterKeepsEqualPriorityH1H3Affinity(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	selector := NewMultiRouteSelector(
+		ctx,
+		"direct-affinity",
+		nil,
+		DestinationId(NewId()),
+		true,
+	)
+	defer selector.Close()
+	h3Transport := NewSendGatewayTransportWithType(TransportTypeH3)
+	h3Route := make(Route, 64)
+	selector.updateTransport(h3Transport, []Route{h3Route})
+	h1Transport := NewSendGatewayTransportWithType(TransportTypeH1)
+	h1Route := make(Route, 64)
+	selector.updateTransport(h1Transport, []Route{h1Route})
+
+	for i := 0; i < 32; i++ {
+		message := MessagePoolGet(64)
+		success, disposition, err := selector.writeDetailedWithCarrier(
+			ctx,
+			message,
+			time.Second,
+		)
+		if err != nil || !success || disposition.transportType != TransportTypeH3 {
+			if !success || err != nil {
+				MessagePoolReturn(message)
+			}
+			t.Fatalf(
+				"write %d = (%t, %+v, %v), want first-healthy H3",
+				i,
+				success,
+				disposition,
+				err,
+			)
+		}
+	}
+	if got := len(h1Route); got != 0 {
+		t.Fatalf("non-preferred H1 accepted %d messages while H3 remained writable", got)
+	}
+	if got := len(h3Route); got != 32 {
+		t.Fatalf("preferred H3 accepted %d messages, want 32", got)
+	}
+	stats := selector.directAffinity.snapshot()
+	if stats.PreferredH3WriteCount != 32 ||
+		stats.PreferredH1WriteCount != 0 ||
+		stats.FallbackH1WriteCount != 0 ||
+		stats.FallbackH3WriteCount != 0 ||
+		stats.PreferredBlockedCount != 0 ||
+		stats.ActivationCount != 1 ||
+		stats.RouteChangeCount != 0 {
+		t.Fatalf("direct affinity stats = %+v, want 32 preferred H3 writes only", stats)
+	}
+	for len(h3Route) != 0 {
+		MessagePoolReturn(<-h3Route)
+	}
+}
+
+// Route affinity is not a connection pin. Withdrawing the preferred route
+// publishes a new immutable generation whose remaining carrier accepts the
+// very next write; reconnecting the old carrier does not oscillate the stream
+// back again.
+func TestMultiRouteWriterDirectAffinityFailsOverWithoutOscillation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	selector := NewMultiRouteSelector(
+		ctx,
+		"direct-affinity-failover",
+		nil,
+		DestinationId(NewId()),
+		true,
+	)
+	defer selector.Close()
+	h3Transport := NewSendGatewayTransportWithType(TransportTypeH3)
+	h3Route := make(Route, 4)
+	selector.updateTransport(h3Transport, []Route{h3Route})
+	h1Transport := NewSendGatewayTransportWithType(TransportTypeH1)
+	h1Route := make(Route, 4)
+	selector.updateTransport(h1Transport, []Route{h1Route})
+
+	writeAndRequire := func(want TransportType) {
+		t.Helper()
+		message := MessagePoolGet(64)
+		success, disposition, err := selector.writeDetailedWithCarrier(
+			ctx,
+			message,
+			time.Second,
+		)
+		if err != nil || !success || disposition.transportType != want {
+			if !success || err != nil {
+				MessagePoolReturn(message)
+			}
+			t.Fatalf(
+				"write = (%t, %+v, %v), want %s",
+				success,
+				disposition,
+				err,
+				want,
+			)
+		}
+		switch want {
+		case TransportTypeH3:
+			MessagePoolReturn(<-h3Route)
+		case TransportTypeH1:
+			MessagePoolReturn(<-h1Route)
+		}
+	}
+
+	writeAndRequire(TransportTypeH3)
+	selector.updateTransport(h3Transport, nil)
+	writeAndRequire(TransportTypeH1)
+	selector.updateTransport(h3Transport, []Route{h3Route})
+	writeAndRequire(TransportTypeH1)
+	stats := selector.directAffinity.snapshot()
+	if stats.PreferredH3WriteCount != 1 ||
+		stats.PreferredH1WriteCount != 1 ||
+		stats.FallbackH1WriteCount != 0 ||
+		stats.FallbackH3WriteCount != 0 ||
+		stats.PreferredBlockedCount != 0 ||
+		stats.ActivationCount != 2 ||
+		stats.RouteChangeCount != 1 {
+		t.Fatalf("direct affinity failover stats = %+v", stats)
+	}
+}
+
+// A full preferred queue is shared-uplink congestion, not evidence that the
+// carrier disappeared. The writer waits instead of opening a second
+// congestion-controller burst, but a physical route publication wakes that
+// exact blocked write and moves it to the surviving carrier immediately.
+func TestMultiRouteWriterDirectAffinityWaitsUntilRouteWithdrawal(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	selector := NewMultiRouteSelector(
+		ctx,
+		"direct-affinity-backpressure",
+		nil,
+		DestinationId(NewId()),
+		true,
+	)
+	defer selector.Close()
+	h3Transport := NewSendGatewayTransportWithType(TransportTypeH3)
+	h3Route := make(Route)
+	selector.updateTransport(h3Transport, []Route{h3Route})
+	h1Transport := NewSendGatewayTransportWithType(TransportTypeH1)
+	h1Route := make(Route, 1)
+	selector.updateTransport(h1Transport, []Route{h1Route})
+
+	timedOutMessage := MessagePoolGet(64)
+	success, _, err := selector.writeDetailedWithCarrier(
+		ctx,
+		timedOutMessage,
+		10*time.Millisecond,
+	)
+	if err != nil || success {
+		if success {
+			MessagePoolReturn(<-h1Route)
+		} else {
+			MessagePoolReturn(timedOutMessage)
+		}
+		t.Fatalf("backpressured preferred write = (%t, %v), want timeout", success, err)
+	}
+	MessagePoolReturn(timedOutMessage)
+	if len(h1Route) != 0 {
+		MessagePoolReturn(<-h1Route)
+		t.Fatal("transient H3 backpressure spilled onto H1")
+	}
+
+	type writeResult struct {
+		success bool
+		err     error
+	}
+	blockedMessage := MessagePoolGet(64)
+	writeDone := make(chan writeResult, 1)
+	go func() {
+		success, _, err := selector.writeDetailedWithCarrier(
+			ctx,
+			blockedMessage,
+			time.Second,
+		)
+		writeDone <- writeResult{success: success, err: err}
+	}()
+	deadline := time.Now().Add(time.Second)
+	for selector.directAffinity.snapshot().PreferredBlockedCount < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if selector.directAffinity.snapshot().PreferredBlockedCount < 2 {
+		selector.updateTransport(h3Transport, nil)
+		result := <-writeDone
+		if !result.success || result.err != nil {
+			MessagePoolReturn(blockedMessage)
+		} else {
+			MessagePoolReturn(<-h1Route)
+		}
+		t.Fatal("second write did not block on its preferred route")
+	}
+	if len(h1Route) != 0 {
+		selector.updateTransport(h3Transport, nil)
+		<-writeDone
+		MessagePoolReturn(<-h1Route)
+		t.Fatal("blocked preferred write reached H1 before route withdrawal")
+	}
+
+	selector.updateTransport(h3Transport, nil)
+	select {
+	case result := <-writeDone:
+		if !result.success || result.err != nil {
+			MessagePoolReturn(blockedMessage)
+			t.Fatalf("withdrawal failover = (%t, %v)", result.success, result.err)
+		}
+	case <-time.After(time.Second):
+		MessagePoolReturn(blockedMessage)
+		t.Fatal("route withdrawal did not wake the blocked write")
+	}
+	MessagePoolReturn(<-h1Route)
+	stats := selector.directAffinity.snapshot()
+	if stats.FallbackH1WriteCount != 0 || stats.FallbackH3WriteCount != 0 ||
+		stats.PreferredBlockedCount != 2 || stats.RouteChangeCount != 1 {
+		t.Fatalf("direct affinity backpressure stats = %+v", stats)
+	}
+}
+
+// Affinity is intentionally narrower than generic route weighting. P2P and
+// DNS routes can have different failure domains, and explicitly unequal H1/H3
+// priorities are an operator policy; none may be silently converted to the
+// direct Auto tie behavior.
+func TestMultiRouteWriterDirectAffinityScope(t *testing.T) {
+	tests := []struct {
+		name       string
+		transports []Transport
+		wantSticky bool
+	}{
+		{
+			name: "equal direct tie",
+			transports: []Transport{
+				newTypedPriorityRouteTestTransport(TransportTypeH3, 10),
+				newTypedPriorityRouteTestTransport(TransportTypeH1, 10),
+			},
+			wantSticky: true,
+		},
+		{
+			name: "unequal direct priorities",
+			transports: []Transport{
+				newTypedPriorityRouteTestTransport(TransportTypeH3, 10),
+				newTypedPriorityRouteTestTransport(TransportTypeH1, 20),
+			},
+		},
+		{
+			name: "p2p route present",
+			transports: []Transport{
+				newTypedPriorityRouteTestTransport(TransportTypeH3, 10),
+				newTypedPriorityRouteTestTransport(TransportTypeH1, 10),
+				NewSendGatewayTransportWithType(TransportTypeP2p),
+			},
+		},
+		{
+			name: "dns fallback present",
+			transports: []Transport{
+				newTypedPriorityRouteTestTransport(TransportTypeH3, 10),
+				newTypedPriorityRouteTestTransport(TransportTypeH1, 10),
+				NewSendGatewayTransportWithType(TransportTypeH3Dns),
+			},
+		},
+		{
+			name: "one direct type",
+			transports: []Transport{
+				newTypedPriorityRouteTestTransport(TransportTypeH3, 10),
+				newTypedPriorityRouteTestTransport(TransportTypeH3, 10),
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			selector := NewMultiRouteSelector(
+				ctx,
+				"direct-affinity-scope",
+				nil,
+				DestinationId(NewId()),
+				true,
+			)
+			defer selector.Close()
+			for _, transport := range test.transports {
+				selector.updateTransport(transport, []Route{make(Route, 1)})
+			}
+			snapshot := selector.activeRoutesSnapshot.Load()
+			if gotSticky := snapshot.preferDirectRoute != nil; gotSticky != test.wantSticky {
+				t.Fatalf(
+					"preferDirectRoute present = %t, want %t for routes %v",
+					gotSticky,
+					test.wantSticky,
+					snapshot.routeTransportTypes,
+				)
+			}
+		})
+	}
+}
+
 // HasActiveTransport is the transport cross-check the blackhole and stall
 // verdicts consult: an empty transport set means the client has no carrier,
 // so its silence proves nothing about the remote end. The set must read empty
@@ -128,14 +453,25 @@ func TestRouteManagerHasActiveTransport(t *testing.T) {
 
 	routeManager := NewRouteManager(ctx, "test")
 	AssertEqual(t, routeManager.HasActiveTransport(), false)
+	AssertEqual(t, routeManager.HasActiveUnreliableSendTransport(), false)
 
 	transport := NewSendGatewayTransport()
-	routeManager.UpdateTransport(transport, []Route{make(chan []byte)})
+	routes := []Route{make(chan []byte)}
+	routeManager.UpdateTransport(transport, routes)
 	AssertEqual(t, routeManager.HasActiveTransport(), true)
+	AssertEqual(t, routeManager.HasActiveUnreliableSendTransport(), false)
+
+	routeManager.UpdateTransportWithProperties(
+		transport,
+		routes,
+		TransferCarrierProperties{Unreliable: true},
+	)
+	AssertEqual(t, routeManager.HasActiveUnreliableSendTransport(), true)
 
 	// removal registers nil routes, which must empty the set
 	routeManager.RemoveTransport(transport)
 	AssertEqual(t, routeManager.HasActiveTransport(), false)
+	AssertEqual(t, routeManager.HasActiveUnreliableSendTransport(), false)
 }
 
 // finishPausedRouteWrite releases and joins a test writer before returning its

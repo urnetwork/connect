@@ -156,24 +156,38 @@ func TestSendReceiveParallelLanes(t *testing.T) {
 		transferKey TransferKey
 	}
 	receives := make(chan laneReceive, 3*n)
+	asyncErrors := make(chan error, 1)
+	recordAsyncError := func(err error) {
+		select {
+		case asyncErrors <- err:
+		default:
+		}
+	}
 	b.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, peer Peer) {
 		for _, frame := range frames {
 			m, err := FromFrame(frame)
 			if err != nil {
-				panic(err)
+				recordAsyncError(fmt.Errorf("decode lane receive: %w", err))
+				return
 			}
 			switch v := m.(type) {
 			case *protocol.SimpleMessage:
 				parts := strings.SplitN(v.Content, " ", 2)
 				index, err := strconv.Atoi(parts[1])
 				if err != nil {
-					panic(err)
+					recordAsyncError(fmt.Errorf("decode lane index: %w", err))
+					return
 				}
-				receives <- laneReceive{
+				receive := laneReceive{
 					lane:        parts[0],
 					index:       index,
 					source:      source,
 					transferKey: peer.TransferKey,
+				}
+				select {
+				case receives <- receive:
+				default:
+					recordAsyncError(fmt.Errorf("lane receive collector overflow"))
 				}
 			}
 		}
@@ -201,7 +215,9 @@ func TestSendReceiveParallelLanes(t *testing.T) {
 	}
 
 	acks := make(chan error, 3*n)
+	sendDone := make(chan struct{})
 	go func() {
+		defer close(sendDone)
 		// interleave lanes per message: the historical flap trigger
 		for i := 0; i < n; i += 1 {
 			for _, l := range lanes {
@@ -210,12 +226,20 @@ func TestSendReceiveParallelLanes(t *testing.T) {
 				}
 				frame, err := ToFrame(message, DefaultProtocolVersion)
 				if err != nil {
-					panic(err)
+					recordAsyncError(fmt.Errorf("encode lane %s message %d: %w", l.name, i, err))
+					return
 				}
 				success := a.SendWithTimeout(frame, bClientId, func(err error) {
-					acks <- err
+					select {
+					case acks <- err:
+					default:
+						recordAsyncError(fmt.Errorf("lane ack collector overflow: %v", err))
+					}
 				}, -1, l.opts...)
-				AssertEqual(t, success, true)
+				if !success {
+					recordAsyncError(fmt.Errorf("send lane %s message %d", l.name, i))
+					return
+				}
 			}
 		}
 	}()
@@ -255,12 +279,21 @@ func TestSendReceiveParallelLanes(t *testing.T) {
 		case err := <-acks:
 			AssertEqual(t, err, nil)
 			ackCount += 1
+		case asyncErr := <-asyncErrors:
+			t.Fatalf("asynchronous lane worker: %v", asyncErr)
 		case <-time.After(progressTimeout):
 			t.Fatalf(
 				"lane starvation: receives=%d/%d acks=%d/%d next=%v",
 				receiveCount, 3*n, ackCount, 3*n, nextIndex,
 			)
 		}
+	}
+	select {
+	case <-sendDone:
+	case asyncErr := <-asyncErrors:
+		t.Fatalf("asynchronous lane sender: %v", asyncErr)
+	case <-time.After(timeout):
+		t.Fatal("lane sender did not finish")
 	}
 	for _, l := range lanes {
 		AssertEqual(t, nextIndex[l.name], n)

@@ -112,7 +112,7 @@ func TestMultiClientExpandRejectsPingResultAfterPassEnds(t *testing.T) {
 		cancel:                       cancel,
 		log:                          NewNoopLogger(),
 		generator:                    generator,
-		clientReceivePacketCallback:  func(*multiClientChannel, TransferPath, protocol.ProvideMode, *IpPath, []byte) {},
+		clientReceivePacketCallback:  func(*multiClientChannel, TransferPath, protocol.ProvideMode, TransportType, *IpPath, []byte) {},
 		clientReceivePacketsCallback: nil,
 		ingressSecurityPolicy:        DefaultSecurityPolicy(ctx),
 		windowType:                   WindowTypeQuality,

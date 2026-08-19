@@ -6,9 +6,100 @@ import (
 	"context"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/urnetwork/connect/protocol"
 )
+
+// A provider queues synthesized controls but sends bytes consumed from a TCP
+// socket synchronously. The SYN+ACK must use that same recovery lane or an
+// immediately server-first greeting can overtake it and be discarded by the
+// client's not-yet-established TCP stack.
+func TestTcpSynAckUsesOrderedSocketRecoveryLane(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sequenceSocket, upstreamSocket := net.Pipe()
+	defer upstreamSocket.Close()
+	settings := DefaultTcpBufferSettingsWithBufferSize(1)
+	settings.DialContextSettings = &DialContextSettings{
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			return sequenceSocket, nil
+		},
+	}
+
+	recoveryModes := make(chan receiveRecoveryMode, 1)
+	sequence := newTcpSequenceWithTransferKey(
+		ctx,
+		func(
+			_ TransferPath,
+			_ TransferKey,
+			_ protocol.ProvideMode,
+			recoveryMode receiveRecoveryMode,
+			_ *IpPath,
+			packet []byte,
+		) {
+			_, sourceIp, destinationIp, transport, ok := parseIpv4(packet)
+			if !ok {
+				return
+			}
+			var tcp parsedTcp
+			if parseTcpPacket(sourceIp, destinationIp, transport, &tcp) && tcp.syn && tcp.ack {
+				recoveryModes <- recoveryMode
+			}
+		},
+		SourceId(NewId()),
+		TransferKey{},
+		protocol.ProvideMode_Network,
+		4,
+		net.IPv4(10, 0, 0, 1).To4(),
+		40001,
+		net.IPv4(203, 0, 113, 7).To4(),
+		587,
+		1000,
+		settings,
+	)
+	done := make(chan struct{})
+	go func() {
+		sequence.Run()
+		close(done)
+	}()
+
+	synPacket := MessagePoolGet(Ipv4HeaderSizeWithoutExtensions + TcpHeaderSizeWithoutExtensions)
+	success, err := sequence.send(
+		&TcpSendItem{
+			provideMode: protocol.ProvideMode_Network,
+			tcp: parsedTcp{
+				syn:        true,
+				seq:        1000,
+				windowSize: 65535,
+			},
+			ipPacket: synPacket,
+		},
+		-1,
+	)
+	if err != nil || !success {
+		MessagePoolReturn(synPacket)
+		t.Fatalf("send SYN: success=%t err=%v", success, err)
+	}
+
+	select {
+	case recoveryMode := <-recoveryModes:
+		if recoveryMode != receiveRecoveryModeTcpSocket {
+			t.Fatalf("SYN+ACK recovery mode=%d, want ordered TCP socket lane", recoveryMode)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("SYN+ACK was not returned")
+	}
+
+	sequence.Cancel()
+	upstreamSocket.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("TCP sequence did not stop")
+	}
+}
 
 // A source/lane snapshot is returned from one NAT callback.
 type natTransferSnapshot struct {

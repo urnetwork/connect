@@ -791,7 +791,9 @@ func TestMultiClientStaleFlowCleanupCannotDeleteReplacement(t *testing.T) {
 				affinityIp4Paths: map[Ip4Path]map[Ip4Path]time.Time{},
 				affinityIp6Paths: map[Ip6Path]map[Ip6Path]time.Time{},
 				clientUpdates:    map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
+				flowReaperWake:   make(chan struct{}, 1),
 			}
+			go multi.runFlowReaper()
 			path := &IpPath{
 				Version:         version,
 				Protocol:        IpProtocolTcp,
@@ -816,13 +818,14 @@ func TestMultiClientStaleFlowCleanupCannotDeleteReplacement(t *testing.T) {
 			replacement := newMultiClientChannelUpdate(ctx, path)
 			defer replacement.Close()
 
-			// Hold the parent lock while waking the old teardown and installing
-			// the replacement. This deterministically makes the old goroutine
-			// observe the newer generation when it resumes.
+			// Hold the parent lock while waking the shared reaper and installing
+			// the replacement. This deterministically makes cleanup observe the
+			// newer generation when it resumes.
 			multi.stateLock.Lock()
 			old.client.Store(client)
 			multi.clientUpdates[client] = map[*multiClientChannelUpdate]bool{old: true}
 			old.cancel()
+			multi.notifyFlowReaper()
 			if version == 4 {
 				multi.ip4PathUpdates[path.ToIp4Path()] = replacement
 			} else {
@@ -1226,7 +1229,7 @@ func TestOptionalIdentityLoadCannotSuppressFixedDestination(t *testing.T) {
 	}
 }
 
-func testTransferCallbackBackpressure(t *testing.T, invoke func(*stallGate)) {
+func testTransferCallbackInlineDispatch(t *testing.T, invoke func(*stallGate)) {
 	t.Helper()
 	gate := newStallGate()
 	done := make(chan struct{})
@@ -1235,27 +1238,30 @@ func testTransferCallbackBackpressure(t *testing.T, invoke func(*stallGate)) {
 		invoke(gate)
 	}()
 	waitForStallStart(t, gate)
-	assertStillBlocked(t, done, 25*time.Millisecond, "transfer callback did not apply backpressure")
+	assertStillBlocked(t, done, 25*time.Millisecond, "transfer callback was not dispatched inline")
 	gate.Release()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("transfer callback did not resume after backpressure released")
+		t.Fatal("inline transfer callback did not return after release")
 	}
 }
 
 func TestTransferSendAckCallbackPreservesIntentionalBackpressure(t *testing.T) {
-	testTransferCallbackBackpressure(t, func(gate *stallGate) {
+	testTransferCallbackInlineDispatch(t, func(gate *stallGate) {
 		safeAck(func(error) { gate.Wait() }, nil)
 	})
 }
 
-func TestTransferReceiveCallbackPreservesIntentionalBackpressure(t *testing.T) {
+// Receive callbacks are inline so borrowed frames cannot escape. This test
+// deliberately installs a contract-violating blocker only to pin that
+// ownership property; production callbacks must never block (CODESTYLE.md).
+func TestTransferReceiveCallbackDispatchIsInline(t *testing.T) {
 	client := &Client{
 		log:              DefaultLogger(),
 		receiveCallbacks: NewCallbackList[ReceiveFunction](),
 	}
-	testTransferCallbackBackpressure(t, func(gate *stallGate) {
+	testTransferCallbackInlineDispatch(t, func(gate *stallGate) {
 		client.AddReceiveCallback(func(TransferPath, []*protocol.Frame, Peer) {
 			gate.Wait()
 		})
@@ -1263,12 +1269,13 @@ func TestTransferReceiveCallbackPreservesIntentionalBackpressure(t *testing.T) {
 	})
 }
 
-func TestTransferForwardCallbackPreservesIntentionalBackpressure(t *testing.T) {
+// Forward callbacks have the same inline borrowed-bytes ownership contract.
+func TestTransferForwardCallbackDispatchIsInline(t *testing.T) {
 	client := &Client{
 		log:              DefaultLogger(),
 		forwardCallbacks: NewCallbackList[ForwardFunction](),
 	}
-	testTransferCallbackBackpressure(t, func(gate *stallGate) {
+	testTransferCallbackInlineDispatch(t, func(gate *stallGate) {
 		client.AddForwardCallback(func(TransferPath, []byte) {
 			gate.Wait()
 		})
@@ -1276,7 +1283,7 @@ func TestTransferForwardCallbackPreservesIntentionalBackpressure(t *testing.T) {
 	})
 }
 
-func TestTransferCancelDoesNotBypassInFlightReceiveBackpressure(t *testing.T) {
+func TestTransferCancelDoesNotJoinInFlightReceiveCallback(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	client := NewClient(
@@ -1302,13 +1309,13 @@ func TestTransferCancelDoesNotBypassInFlightReceiveBackpressure(t *testing.T) {
 		t,
 		250*time.Millisecond,
 		client.Cancel,
-		"client cancellation waited for intentional receive backpressure",
+		"client cancellation joined an in-flight receive callback",
 	)
 	assertStillBlocked(
 		t,
 		done,
 		25*time.Millisecond,
-		"cancellation incorrectly bypassed an in-flight receive callback",
+		"cancellation changed inline callback execution",
 	)
 	gate.Release()
 	select {
@@ -1517,7 +1524,7 @@ func TestMultiClientRemovalDoesNotWaitForPeerConnectionTeardown(t *testing.T) {
 			Destination:                    RequireMultiHopId(NewId()),
 		},
 		generator,
-		func(*multiClientChannel, TransferPath, protocol.ProvideMode, *IpPath, []byte) {},
+		func(*multiClientChannel, TransferPath, protocol.ProvideMode, TransportType, *IpPath, []byte) {},
 		nil,
 		DefaultSecurityPolicy(ctx),
 		func(*ContractStatus) {},

@@ -322,12 +322,14 @@ func marshalSendPackTransferFrame(m *sendPackFrame) []byte {
 // carrying an Ack. The inner ack frame is not session-stamped (wrapping, when
 // it happens, adds the role/companion hint to the outer encrypted frame).
 type sendAckFrame struct {
-	path        TransferPath
-	messageId   Id
-	sequenceId  Id
-	selective   bool
-	tagSendTime uint64
-	tagSet      bool
+	path                    TransferPath
+	messageId               Id
+	sequenceId              Id
+	selective               bool
+	tagSendTime             uint64
+	tagSet                  bool
+	missingContractId       *Id
+	compactContractRecovery bool
 }
 
 func (m *sendAckFrame) sizeAck() int {
@@ -341,6 +343,12 @@ func (m *sendAckFrame) sizeAck() int {
 	if m.tagSet {
 		tagBody := sizeTagBody(m.tagSendTime)
 		n += protoSizeTag(4) + protoSizeVarint(uint64(tagBody)) + tagBody
+	}
+	if m.missingContractId != nil {
+		n += protoSizeTag(5) + protoSizeVarint(16) + 16
+	}
+	if m.compactContractRecovery {
+		n += protoSizeTag(6) + 1
 	}
 	return n
 }
@@ -356,6 +364,13 @@ func (m *sendAckFrame) appendAck(b []byte) []byte {
 		b = protoAppendTag(b, 4, protoWireBytes)
 		b = protoAppendVarint(b, uint64(sizeTagBody(m.tagSendTime)))
 		b = appendTagBody(b, m.tagSendTime)
+	}
+	if m.missingContractId != nil {
+		b = appendIdField(b, 5, *m.missingContractId)
+	}
+	if m.compactContractRecovery {
+		b = protoAppendTag(b, 6, protoWireVarint)
+		b = append(b, 1)
 	}
 	return b
 }
@@ -1286,6 +1301,26 @@ func decodeAck(b []byte) (*protocol.Ack, bool) {
 				return nil, false
 			}
 			ack.Tag = tg
+		case 5: // missing_contract_id (bytes)
+			if typ != protowire.BytesType {
+				return nil, false
+			}
+			v, vn := protowire.ConsumeBytes(b)
+			if vn < 0 {
+				return nil, false
+			}
+			b = b[vn:]
+			ack.MissingContractId = copyProtoBytes(v)
+		case 6: // compact_contract_recovery
+			if typ != protowire.VarintType {
+				return nil, false
+			}
+			v, vn := protowire.ConsumeVarint(b)
+			if vn < 0 {
+				return nil, false
+			}
+			b = b[vn:]
+			ack.CompactContractRecovery = protowire.DecodeBool(v)
 		default:
 			fn := protowire.ConsumeFieldValue(num, typ, b)
 			if fn < 0 {

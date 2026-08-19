@@ -3,6 +3,7 @@ package connect
 import (
 	"context"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -89,11 +90,7 @@ func TestRemoteUserNatClientRawSendPoolBalance(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	settings := DefaultClientSettings()
-	settings.SendBufferSettings.SequenceBufferSize = 0
-	settings.SendBufferSettings.AckBufferSize = 0
-	settings.ReceiveBufferSettings.SequenceBufferSize = 0
-	settings.ForwardBufferSettings.SequenceBufferSize = 0
+	settings := DefaultClientSettingsWithBufferSize(32)
 	providerClient := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 
 	received := make(chan struct{}, 32)
@@ -371,16 +368,46 @@ func runMultiClientPoolCycle(ctx context.Context, t *testing.T) {
 	cycleCtx, cycleCancel := context.WithCancel(ctx)
 	defer cycleCancel()
 
-	clientSettings := DefaultClientSettings()
-	clientSettings.SendBufferSettings.SequenceBufferSize = 0
-	clientSettings.SendBufferSettings.AckBufferSize = 0
-	clientSettings.ReceiveBufferSettings.SequenceBufferSize = 0
-	clientSettings.ForwardBufferSettings.SequenceBufferSize = 0
+	clientSettings := DefaultClientSettingsWithBufferSize(32)
 	providerClient := NewClient(cycleCtx, NewId(), NewNoContractClientOob(), clientSettings)
-	defer providerClient.Cancel()
+
+	type providerEcho struct {
+		frame       *protocol.Frame
+		destination Id
+		transferKey TransferKey
+	}
+	providerEchoes := make(chan providerEcho, 32)
+	var providerEchoWaitGroup sync.WaitGroup
+	providerEchoWaitGroup.Add(1)
+	go func() {
+		defer providerEchoWaitGroup.Done()
+		for {
+			select {
+			case <-cycleCtx.Done():
+				for {
+					select {
+					case echo := <-providerEchoes:
+						MessagePoolReturn(echo.frame.MessageBytes)
+					default:
+						return
+					}
+				}
+			case echo := <-providerEchoes:
+				if !providerClient.SendWithTimeout(
+					echo.frame,
+					echo.destination,
+					func(error) {},
+					time.Second,
+					echo.transferKey,
+				) {
+					MessagePoolReturn(echo.frame.MessageBytes)
+				}
+			}
+		}
+	}()
 
 	// echo any IpPacketToProvider back with the path reversed, like an exit would
-	providerClient.AddReceiveCallback(func(src TransferPath, frames []*protocol.Frame, peer Peer) {
+	providerReceiveUnsub := providerClient.AddReceiveCallback(func(src TransferPath, frames []*protocol.Frame, peer Peer) {
 		for _, frame := range frames {
 			if frame.MessageType != protocol.MessageType_IpIpPacketToProvider {
 				continue
@@ -404,12 +431,23 @@ func runMultiClientPoolCycle(ctx context.Context, t *testing.T) {
 				MessagePoolReturn(packet)
 				continue
 			}
-			sent := providerClient.SendWithTimeout(frame, src.SourceId, func(err error) {}, -1)
-			if !sent {
+			select {
+			case providerEchoes <- providerEcho{
+				frame:       frame,
+				destination: src.SourceId,
+				transferKey: peer.TransferKey,
+			}:
+			default:
 				MessagePoolReturn(frame.MessageBytes)
 			}
 		}
 	})
+	defer func() {
+		providerReceiveUnsub()
+		cycleCancel()
+		providerClient.Cancel()
+		providerEchoWaitGroup.Wait()
+	}()
 
 	multiSettings := DefaultMultiClientSettings()
 	multiSettings.SecurityPolicyGenerator = DisableSecurityPolicyWithStats

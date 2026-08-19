@@ -268,8 +268,8 @@ func TestRebindCandidatesUnprovenSortLast(t *testing.T) {
 	// is not what this test is about
 	parent.rebindCandidatesFunc = nil
 	window := &multiClientWindow{
-		ctx:  context.Background(),
-		log:  NewNoopLogger(),
+		ctx:      context.Background(),
+		log:      NewNoopLogger(),
 		settings: parent.settings,
 		clients: map[Id]*multiClientChannel{
 			proven.ClientId():   proven,

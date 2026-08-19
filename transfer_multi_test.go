@@ -40,6 +40,7 @@ func TestSendMultiWithTimeoutDeliversOneBatchAndOneAck(t *testing.T) {
 
 	received := make(chan []string, 1)
 	var callbackCount atomic.Int32
+	var callbackDropCount atomic.Int32
 	unsub := receiver.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, peer Peer) {
 		callbackCount.Add(1)
 		contents := make([]string, 0, len(frames))
@@ -56,7 +57,11 @@ func TestSendMultiWithTimeoutDeliversOneBatchAndOneAck(t *testing.T) {
 			}
 			contents = append(contents, simple.Content)
 		}
-		received <- contents
+		select {
+		case received <- contents:
+		default:
+			callbackDropCount.Add(1)
+		}
 	})
 	defer unsub()
 
@@ -88,6 +93,9 @@ func TestSendMultiWithTimeoutDeliversOneBatchAndOneAck(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for batch")
+	}
+	if dropCount := callbackDropCount.Load(); dropCount != 0 {
+		t.Fatalf("receive callback dropped %d batch(es)", dropCount)
 	}
 	select {
 	case err := <-ack:

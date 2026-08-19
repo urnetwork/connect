@@ -30,3 +30,21 @@ func TestSnapshotSinkReceiveDoesNotRetainBorrowedFrames(t *testing.T) {
 		t.Fatalf("frame summary changed after borrowed frame reuse: got %q want %q", snapshot.frameSummary, wantSummary)
 	}
 }
+
+// A full printer queue drops immediately instead of blocking the shared
+// client receive pump.
+func TestEnqueueSinkReceiveDropsWhenFull(t *testing.T) {
+	receives := make(chan *sinkReceive, 1)
+	first := &sinkReceive{frameSummary: "first"}
+	second := &sinkReceive{frameSummary: "second"}
+
+	if !enqueueSinkReceive(receives, first) {
+		t.Fatal("first receive was not admitted")
+	}
+	if enqueueSinkReceive(receives, second) {
+		t.Fatal("second receive was admitted to a full queue")
+	}
+	if got := <-receives; got != first {
+		t.Fatalf("queued receive = %p, want %p", got, first)
+	}
+}

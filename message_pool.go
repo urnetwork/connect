@@ -3,6 +3,7 @@ package connect
 import (
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/maphash"
 	"io"
@@ -545,6 +546,28 @@ func MessagePool(targetSize int) (*messagePool, int) {
 
 func MessagePoolReadAll(r io.Reader) ([]byte, error) {
 	return MessagePoolReadAllWithTag(r, 0)
+}
+
+var ErrMessageTooLarge = errors.New("message exceeds byte limit")
+
+// MessagePoolReadAllLimit preserves MessagePoolReadAll's ownership contract
+// while putting a hard ceiling on data read from an untrusted framed stream.
+// On an error it returns no buffer, so callers never need to return a partial
+// message to the pool.
+func MessagePoolReadAllLimit(r io.Reader, maxBytes int64) ([]byte, error) {
+	if maxBytes < 0 {
+		return nil, fmt.Errorf("invalid message byte limit %d", maxBytes)
+	}
+
+	message, err := MessagePoolReadAll(io.LimitReader(r, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if maxBytes < int64(len(message)) {
+		MessagePoolReturn(message)
+		return nil, fmt.Errorf("%w: limit %d", ErrMessageTooLarge, maxBytes)
+	}
+	return message, nil
 }
 
 func MessagePoolReadAllWithTag(r io.Reader, tag uint8) ([]byte, error) {

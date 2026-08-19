@@ -187,8 +187,10 @@ type CallbackList[T any] struct {
 
 // coalescingCallbackWorker isolates a state-change observer from its producer.
 // At most one callback is in flight and one additional wake is pending. It is
-// intentionally not used for Client send/receive/forward callbacks, whose
-// blocking behavior is part of the transfer backpressure contract.
+// intentionally not wrapped around Client receive/forward callbacks: those
+// borrow their arguments and run inline, so each callback must finish promptly
+// or make its own bounded zero-timeout handoff. Sender callbacks may retain
+// sender-side backpressure.
 type coalescingCallbackWorker struct {
 	ctx      context.Context
 	cancel   context.CancelFunc

@@ -289,21 +289,20 @@ func TestFoldRewardAndPersistEmitsRewardLineAndPersistsOnce(t *testing.T) {
 
 // --- production wiring, source-anchored ---
 
-// TestSendUpdateTeardownRecordsFlowReward proves the tap is actually wired
-// into the real flow-close path (sendUpdate's per-flow idle-timeout teardown
-// goroutine), not just reachable from a test. Both the ip4 and ip6 branches
-// must call it -- one flow-close hook is not enough for a dual-stack client.
-func TestSendUpdateTeardownRecordsFlowReward(t *testing.T) {
+// TestFlowReaperRecordsFlowReward proves the tap is actually wired into the
+// shared idle-flow close path, not just reachable from a test. IPv4 and IPv6
+// are both detached into the same retired-flow list, so one hook covers both.
+func TestFlowReaperRecordsFlowReward(t *testing.T) {
 	source, err := readSource("ip_remote_multi_client.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, ok := functionBody(source, "func (self *RemoteUserNatMultiClient) sendUpdate(")
+	body, ok := functionBody(source, "func (self *RemoteUserNatMultiClient) finishRetiredFlows(")
 	if !ok {
-		t.Fatal("could not find sendUpdate")
+		t.Fatal("could not find finishRetiredFlows")
 	}
-	if n := strings.Count(body, "self.recordFlowReward("); n != 2 {
-		t.Fatalf("want 2 recordFlowReward call sites (ip4 and ip6 teardown), got %d", n)
+	if n := strings.Count(body, "self.recordFlowReward("); n != 1 {
+		t.Fatalf("want one shared recordFlowReward call site, got %d", n)
 	}
 }
 

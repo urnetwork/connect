@@ -69,6 +69,21 @@ const (
 	platformH3WriteBatchMaxByteCount    = 64 * 1024
 )
 
+func transportTypeFromMode(mode TransportMode) TransportType {
+	switch mode {
+	case TransportModeH3:
+		return TransportTypeH3
+	case TransportModeH1:
+		return TransportTypeH1
+	case TransportModeH3Dns:
+		return TransportTypeH3Dns
+	case TransportModeH3DnsPump:
+		return TransportTypeH3DnsPump
+	default:
+		return TransportTypeUnknown
+	}
+}
+
 type TransportControl = byte
 
 const (
@@ -88,6 +103,161 @@ const (
 	TransportModeH3        TransportMode = "h3"
 	TransportModeNone      TransportMode = ""
 )
+
+// DefaultTransportModePreferences returns the production Auto policy. Lower
+// numbers are preferred. H3 and H1 deliberately tie so every healthy direct
+// carrier remains registered in parallel; DNS and DNS pump are progressively
+// lower availability fallbacks.
+func DefaultTransportModePreferences() map[TransportMode]int {
+	return map[TransportMode]int{
+		TransportModeH3: 1,
+		TransportModeH1: 1,
+
+		TransportModeH3Dns:     2,
+		TransportModeH3DnsPump: 3,
+	}
+}
+
+func normalizeTransportModePreferences(preferences map[TransportMode]int) map[TransportMode]int {
+	if preferences == nil {
+		return DefaultTransportModePreferences()
+	}
+	normalized := map[TransportMode]int{}
+	for mode, priority := range preferences {
+		switch mode {
+		case TransportModeH3, TransportModeH1, TransportModeH3Dns, TransportModeH3DnsPump:
+			if 0 < priority {
+				normalized[mode] = priority
+			}
+		}
+	}
+	if len(normalized) == 0 {
+		return DefaultTransportModePreferences()
+	}
+	return normalized
+}
+
+// PlatformTransportReceiveModeStatsSnapshot is one lock-free view of complete
+// Transfer-frame messages refused by a full platform receive route. Bytes are
+// the complete message bytes read from the carrier, before pool ownership is
+// returned. Transfer recovery owns retransmission for these drops.
+type PlatformTransportReceiveModeStatsSnapshot struct {
+	QueueDropMessageCount uint64
+	QueueDropByteCount    uint64
+}
+
+// PlatformTransportReceiveStatsSnapshot keeps the carrier mode visible: DNS
+// translation and direct QUIC can behave very differently on a constrained
+// cellular path even though both ultimately use the H3 reader.
+type PlatformTransportReceiveStatsSnapshot struct {
+	H1                    PlatformTransportReceiveModeStatsSnapshot
+	H3                    PlatformTransportReceiveModeStatsSnapshot
+	H3Dns                 PlatformTransportReceiveModeStatsSnapshot
+	H3DnsPump             PlatformTransportReceiveModeStatsSnapshot
+	H1ControlRefusalCount uint64
+	H1ControlRefusalBytes uint64
+}
+
+type platformTransportReceiveModeStats struct {
+	queueDropMessageCount atomic.Uint64
+	queueDropByteCount    atomic.Uint64
+}
+
+func (self *platformTransportReceiveModeStats) snapshot() PlatformTransportReceiveModeStatsSnapshot {
+	return PlatformTransportReceiveModeStatsSnapshot{
+		QueueDropMessageCount: self.queueDropMessageCount.Load(),
+		QueueDropByteCount:    self.queueDropByteCount.Load(),
+	}
+}
+
+// PlatformTransportReceiveStats is shared by every reconnect generation of
+// one PlatformTransport. All counters are monotonic and add no receive-path
+// lock or observer callback.
+type PlatformTransportReceiveStats struct {
+	h1                    platformTransportReceiveModeStats
+	h3                    platformTransportReceiveModeStats
+	h3Dns                 platformTransportReceiveModeStats
+	h3DnsPump             platformTransportReceiveModeStats
+	h1ControlRefusalCount atomic.Uint64
+	h1ControlRefusalBytes atomic.Uint64
+}
+
+func (self *PlatformTransportReceiveStats) mode(mode TransportMode) *platformTransportReceiveModeStats {
+	if self == nil {
+		return nil
+	}
+	switch mode {
+	case TransportModeH1:
+		return &self.h1
+	case TransportModeH3:
+		return &self.h3
+	case TransportModeH3Dns:
+		return &self.h3Dns
+	case TransportModeH3DnsPump:
+		return &self.h3DnsPump
+	default:
+		return nil
+	}
+}
+
+func (self *PlatformTransportReceiveStats) recordQueueDrop(mode TransportMode, byteCount int) {
+	if counters := self.mode(mode); counters != nil {
+		counters.queueDropMessageCount.Add(1)
+		counters.queueDropByteCount.Add(uint64(max(0, byteCount)))
+	}
+}
+
+func (self *PlatformTransportReceiveStats) recordH1ControlRefusal(byteCount int) {
+	if self == nil {
+		return
+	}
+	self.h1ControlRefusalCount.Add(1)
+	self.h1ControlRefusalBytes.Add(uint64(max(0, byteCount)))
+}
+
+func (self *PlatformTransportReceiveStats) Snapshot() PlatformTransportReceiveStatsSnapshot {
+	if self == nil {
+		return PlatformTransportReceiveStatsSnapshot{}
+	}
+	return PlatformTransportReceiveStatsSnapshot{
+		H1:                    self.h1.snapshot(),
+		H3:                    self.h3.snapshot(),
+		H3Dns:                 self.h3Dns.snapshot(),
+		H3DnsPump:             self.h3DnsPump.snapshot(),
+		H1ControlRefusalCount: self.h1ControlRefusalCount.Load(),
+		H1ControlRefusalBytes: self.h1ControlRefusalBytes.Load(),
+	}
+}
+
+type pooledReceiveOfferResult uint8
+
+const (
+	pooledReceiveOfferDelivered pooledReceiveOfferResult = iota
+	pooledReceiveOfferFull
+	pooledReceiveOfferDone
+)
+
+// tryOfferPooledReceive is the common carrier-reader handoff. It never waits;
+// the caller retains ownership unless delivery succeeds.
+func tryOfferPooledReceive(
+	done <-chan struct{},
+	destination chan<- []byte,
+	message []byte,
+) pooledReceiveOfferResult {
+	select {
+	case <-done:
+		return pooledReceiveOfferDone
+	default:
+	}
+	select {
+	case <-done:
+		return pooledReceiveOfferDone
+	case destination <- message:
+		return pooledReceiveOfferDelivered
+	default:
+		return pooledReceiveOfferFull
+	}
+}
 
 type ClientAuth struct {
 	ByJwt string
@@ -254,6 +424,10 @@ type PlatformTransportSettings struct {
 	// SendRouteObserver exposes route ownership to deterministic integration
 	// harnesses. It must not block. Nil retains normal production behavior.
 	SendRouteObserver func(transport Transport, route Route, connected bool)
+	// ReceiveStats, when non-nil, aggregates zero-wait carrier-to-route
+	// admission loss across every reconnect generation. The constructor uses a
+	// private counter set when it is nil.
+	ReceiveStats *PlatformTransportReceiveStats
 	// AuthFrameObserver borrows the exact pooled authentication frame before
 	// transport I/O. Tests may retain it to prove lifecycle ownership. It must
 	// not block; nil retains normal production behavior.
@@ -262,6 +436,10 @@ type PlatformTransportSettings struct {
 	InactiveDrainTimeout time.Duration
 	// it smoothes out the h3 transition to not start/stop h1 if h3 connects in this time
 	ModeInitialDelay time.Duration
+	// ModePreferences configures the enabled Auto modes and their priorities.
+	// Lower values are preferred and every healthy mode tied at the best live
+	// priority remains active. Nil selects DefaultTransportModePreferences.
+	ModePreferences map[TransportMode]int
 
 	// MinConnectDelay time.Duration
 	// MaxConnectDelay time.Duration
@@ -283,6 +461,22 @@ type PlatformTransportSettings struct {
 	// retains the host UDP socket and physical-egress binding path. The
 	// platform transport owns and closes every returned endpoint.
 	H3PacketConnFactory func(context.Context) (net.PacketConn, error)
+	// Enables the RFC 9221 Transfer carrier only when the server accepts the
+	// same version on the authenticated control stream. A legacy peer retains
+	// the existing reliable-stream path on this same connection.
+	EnableH3Datagrams bool
+	// Nil selects conservative bounded defaults. Callers may inject a stats
+	// collector to aggregate reconnect generations in a larger measurement.
+	H3DatagramSettings *H3DatagramSettings
+	H3DatagramStats    *H3DatagramStats
+	// H3QuicPacketStats, when non-nil, enables packet-level qlog reduction for
+	// diagnostics. It distinguishes SendDatagram queue admission from actual
+	// QUIC DATAGRAM frame emission and application dequeue.
+	H3QuicPacketStats *H3QuicPacketStats
+	// Borrows one complete routed Transfer message after its successful H3
+	// carrier write. datagram distinguishes the packet lane from the reliable
+	// stream lane. The callback must not retain the bytes or block.
+	H3SendLaneObserver func(message []byte, datagram bool)
 
 	// Nil outside package tests. A barrier here can hold the exact seam after
 	// logical route removal and before connection and writer cleanup.
@@ -290,6 +484,10 @@ type PlatformTransportSettings struct {
 	// Nil outside package tests. A barrier here can hold a receive worker before
 	// it releases channel and pooled-message ownership.
 	beforeReceiveWorkerCleanupForTest func()
+	// Nil outside package tests. A barrier here holds a routed hybrid stream
+	// write after lane dispatch so DATAGRAM progress can be verified
+	// independently of the reliable writer.
+	beforeH3StreamWriteForTest func()
 	// Nil outside package tests. The observer borrows one H3 receive message
 	// after the channel accepts its ownership.
 	afterH3ReceiveEnqueueForTest func([]byte)
@@ -314,6 +512,7 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		TransportBufferSize:  32,
 		InactiveDrainTimeout: 30 * time.Second,
 		ModeInitialDelay:     2 * time.Second,
+		ModePreferences:      DefaultTransportModePreferences(),
 		// MinConnectDelay:      0,
 		// MaxConnectDelay:      1 * time.Second,
 		ProtocolVersion: DefaultProtocolVersion,
@@ -325,8 +524,10 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		V2H1Auth: true,
 		// the platform transport must carry the per-peer encryption handshake,
 		// so its framer max is the connect runtime minimum message length
-		FramerSettings:    DefaultFramerSettings(int(DefaultClientSettings().MinimumMessageLenLimit())),
-		PtDnsSlowMultiple: 4,
+		FramerSettings:     DefaultFramerSettings(int(DefaultClientSettings().MinimumMessageLenLimit())),
+		PtDnsSlowMultiple:  4,
+		EnableH3Datagrams:  true,
+		H3DatagramSettings: DefaultH3DatagramSettings(),
 	}
 }
 
@@ -347,12 +548,20 @@ type PlatformTransport struct {
 	auth        *ClientAuth
 
 	settings *PlatformTransportSettings
+	// receiveStats is always non-nil, including when the settings did not expose
+	// an aggregate collector.
+	receiveStats *PlatformTransportReceiveStats
 	// the effective framer settings: `settings.FramerSettings`, or a private
 	// copy of it when the transport log is propagated into a nil
 	// `FramerSettings.Log`. The caller's settings are never mutated — they
 	// may be shared with concurrent framer users (see
 	// NewPlatformTransportWithTargetMode).
 	framerSettings *FramerSettings
+	// One process budget spans every H3 mode and reconnect generation owned by
+	// this transport. Each live connection adds its smaller peer-local bound.
+	h3DatagramSettings         *H3DatagramSettings
+	h3DatagramStats            *H3DatagramStats
+	h3DatagramReassemblyBudget *H3DatagramReassemblyBudget
 
 	stateLock sync.Mutex
 	// notified when availableModes changes. availableModes is a map, so it
@@ -360,7 +569,10 @@ type PlatformTransport struct {
 	// scope as the mutation (see setModeAvailable)
 	availableModeMonitor *Monitor
 	availableModes       map[TransportMode]bool
-	targetMode           TransportMode
+	// immutable after construction; normalized and cloned from settings so a
+	// caller can reuse or mutate its settings without racing the run loop
+	modePreferences map[TransportMode]int
+	targetMode      TransportMode
 	// the elected active mode, watched by every transport's mode gate and
 	// inactive-drain watchdog. a MonitorValue so the mutation cannot be
 	// separated from its notification, and so re-electing the same mode does
@@ -396,13 +608,16 @@ func newPlatformQuicConfig(
 	settings *PlatformTransportSettings,
 	slowMultiple int,
 ) *quic.Config {
-	return &quic.Config{
+	config := &quic.Config{
 		HandshakeIdleTimeout: time.Duration(slowMultiple) *
 			(settings.QuicConnectTimeout + settings.QuicHandshakeTimeout),
-		MaxIdleTimeout:    settings.PingTimeout * 4,
-		KeepAlivePeriod:   0,
+		MaxIdleTimeout: settings.PingTimeout * 4,
+		// QUIC owns hybrid-carrier liveness. Its keepalive loop is independent
+		// of the application writer, which can legitimately wait behind
+		// quic-go's bounded DATAGRAM queue on a constrained uplink.
+		KeepAlivePeriod:   settings.PingTimeout,
 		Allow0RTT:         true,
-		InitialPacketSize: 1400,
+		InitialPacketSize: H3InitialPacketByteCount,
 		// Pin the receive windows and stream counts. The platform transport
 		// uses one bidirectional stream; the stream counts bound abuse.
 		InitialStreamReceiveWindow:     uint64(kib(256)),
@@ -411,7 +626,12 @@ func newPlatformQuicConfig(
 		MaxConnectionReceiveWindow:     uint64(MemoryScaledByteCount(mib(4), kib(512))),
 		MaxIncomingStreams:             8,
 		MaxIncomingUniStreams:          8,
+		EnableDatagrams:                settings.EnableH3Datagrams,
 	}
+	if settings.H3QuicPacketStats != nil {
+		config.Tracer = settings.H3QuicPacketStats.Tracer
+	}
+	return config
 }
 
 // Kick closes the transport's live connection (if any) and skips any pending
@@ -432,6 +652,63 @@ func (self *PlatformTransport) IsConnected() bool {
 // change. Capture the channel before checking `IsConnected`.
 func (self *PlatformTransport) ConnectedNotify() <-chan struct{} {
 	return self.connectedMonitor.NotifyChannel()
+}
+
+// ReceiveStats returns a lock-free lifetime snapshot for this transport. It
+// includes all reconnect generations and every mode runner owned by Auto.
+func (self *PlatformTransport) ReceiveStats() PlatformTransportReceiveStatsSnapshot {
+	return self.receiveStats.Snapshot()
+}
+
+// DatagramStats returns lifetime candidate-carrier counters across every H3
+// mode and reconnect generation owned by this transport.
+func (self *PlatformTransport) DatagramStats() H3DatagramStatsSnapshot {
+	return self.h3DatagramStats.Snapshot()
+}
+
+// offerReceive transfers one complete carrier message to the shared Client
+// route without parking the socket reader. A full queue drops and counts the
+// frame; Transfer ACK/retry is the only recovery owner above this boundary.
+// False means the connection generation ended and its reader should exit.
+func (self *PlatformTransport) offerReceive(
+	done <-chan struct{},
+	mode TransportMode,
+	receive chan<- []byte,
+	message []byte,
+) (open bool, delivered bool) {
+	switch tryOfferPooledReceive(done, receive, message) {
+	case pooledReceiveOfferDelivered:
+		return true, true
+	case pooledReceiveOfferFull:
+		self.receiveStats.recordQueueDrop(mode, len(message))
+		MessagePoolReturn(message)
+		return true, false
+	default:
+		MessagePoolReturn(message)
+		return false, false
+	}
+}
+
+// offerH1Control refuses a saturated reliable control queue immediately. A
+// speed-test/latency control message has no Transfer acknowledgement above it,
+// so skipping it would desynchronize state; the caller closes this websocket
+// generation and reconnects instead.
+func (self *PlatformTransport) offerH1Control(
+	done <-chan struct{},
+	controlSend chan<- []byte,
+	message []byte,
+) bool {
+	switch tryOfferPooledReceive(done, controlSend, message) {
+	case pooledReceiveOfferDelivered:
+		return true
+	case pooledReceiveOfferFull:
+		self.receiveStats.recordH1ControlRefusal(len(message))
+		MessagePoolReturn(message)
+		return false
+	default:
+		MessagePoolReturn(message)
+		return false
+	}
 }
 
 func (self *PlatformTransport) setRegistered(registered bool) {
@@ -499,6 +776,21 @@ func NewPlatformTransportWithTargetMode(
 		copied.Log = log
 		framerSettings = &copied
 	}
+	receiveStats := settings.ReceiveStats
+	if receiveStats == nil {
+		receiveStats = &PlatformTransportReceiveStats{}
+	}
+	h3DatagramSettings := settings.H3DatagramSettings
+	if h3DatagramSettings == nil {
+		h3DatagramSettings = DefaultH3DatagramSettings()
+	}
+	if err := h3DatagramSettings.Validate(); err != nil {
+		panic(err)
+	}
+	h3DatagramStats := settings.H3DatagramStats
+	if h3DatagramStats == nil {
+		h3DatagramStats = &H3DatagramStats{}
+	}
 	transport := &PlatformTransport{
 		ctx:    cancelCtx,
 		cancel: cancel,
@@ -512,14 +804,21 @@ func NewPlatformTransportWithTargetMode(
 		// 		cancel()
 		// 	}
 		// },
-		clientStrategy:       clientStrategy,
-		routeManager:         routeManager,
-		platformUrl:          platformUrl,
-		auth:                 auth,
-		settings:             settings,
-		framerSettings:       framerSettings,
+		clientStrategy:     clientStrategy,
+		routeManager:       routeManager,
+		platformUrl:        platformUrl,
+		auth:               auth,
+		settings:           settings,
+		receiveStats:       receiveStats,
+		framerSettings:     framerSettings,
+		h3DatagramSettings: h3DatagramSettings,
+		h3DatagramStats:    h3DatagramStats,
+		h3DatagramReassemblyBudget: NewH3DatagramReassemblyBudget(
+			h3DatagramSettings.ProcessReassemblyByteCount,
+		),
 		availableModeMonitor: NewMonitor(),
 		availableModes:       map[TransportMode]bool{},
+		modePreferences:      normalizeTransportModePreferences(settings.ModePreferences),
 		targetMode:           targetMode,
 		mode:                 NewMonitorValue(TransportModeNone),
 		connectedMonitor:     NewMonitor(),
@@ -579,33 +878,25 @@ func (self *PlatformTransport) activeMode() (TransportMode, chan struct{}) {
 	return self.mode.Get()
 }
 
-// transportModePreferences ranks the real transport modes. LOWER IS BETTER (see
+// transportModePreferences ranks the default real transport modes. LOWER IS BETTER (see
 // isBetterMode). TransportModeNone is deliberately NOT a key: modePreference
 // ranks it, and any unknown mode, worse than every real mode. Leaving it out of
 // the table and reading the map directly scored it 0 — better than everything —
 // which is why no mode gate ever parked and the election could not distinguish
 // "no transport" from "the best transport".
 //
-// Two tiers, with a tie inside each:
+// Three tiers, with a tie in the direct tier:
 //   - the direct modes (h3, h1) are equally preferred. whichever connects first
-//     becomes active and the other does not preempt it; the election is sticky
-//     among equals (see run).
-//   - the packet translation modes (h3dns, h3dnspump) tunnel over dns to stay
-//     reachable where the direct modes are filtered. they are an availability
-//     fallback, so they rank below the direct modes and are equally preferred
-//     among themselves.
+//     becomes elected and the other remains active alongside it; the election
+//     is sticky among equals (see run).
+//   - h3dns tunnels over DNS where direct modes are filtered.
+//   - h3dnspump is the final availability fallback below h3dns.
 //
 // This table previously had the tiers inverted — it made h3dnspump the most
 // preferred mode — contradicting the mode constants, which are declared "in
 // order of increasing preference". Nothing enforced the ordering then (the mode
 // was never elected at all), so the inversion was inert; the gates enforce it now.
-var transportModePreferences = map[TransportMode]int{
-	TransportModeH3: 1,
-	TransportModeH1: 1,
-
-	TransportModeH3Dns:     2,
-	TransportModeH3DnsPump: 2,
-}
+var transportModePreferences = DefaultTransportModePreferences()
 
 // modePreferenceNone ranks TransportModeNone — the absence of a transport — and
 // any mode missing from the table as worse than every real mode.
@@ -618,43 +909,89 @@ func modePreference(mode TransportMode) int {
 	return modePreferenceNone
 }
 
+func (self *PlatformTransport) modePreference(mode TransportMode) int {
+	preferences := self.modePreferences
+	if preferences == nil {
+		preferences = transportModePreferences
+	}
+	if preference, ok := preferences[mode]; ok {
+		return preference
+	}
+	return modePreferenceNone
+}
+
+func (self *PlatformTransport) orderedModes() []TransportMode {
+	preferences := self.modePreferences
+	if preferences == nil {
+		preferences = transportModePreferences
+	}
+	orderedModes := slices.Collect(maps.Keys(preferences))
+	slices.SortFunc(orderedModes, func(a TransportMode, b TransportMode) int {
+		preferenceA := self.modePreference(a)
+		preferenceB := self.modePreference(b)
+		if preferenceA < preferenceB {
+			return -1
+		} else if preferenceB < preferenceA {
+			return 1
+		}
+		return strings.Compare(string(a), string(b))
+	})
+	return orderedModes
+}
+
+// modeInitialDelay returns one ModeInitialDelay per distinct preference tier,
+// not per numeric gap. Custom priorities 10 and 100 therefore remain a one-step
+// fallback rather than accidentally waiting 90 intervals.
+func (self *PlatformTransport) modeInitialDelay(mode TransportMode) time.Duration {
+	priority := self.modePreference(mode)
+	if priority == modePreferenceNone {
+		return 0
+	}
+	preferences := self.modePreferences
+	if preferences == nil {
+		preferences = transportModePreferences
+	}
+	tiers := []int{}
+	for _, candidatePriority := range preferences {
+		if !slices.Contains(tiers, candidatePriority) {
+			tiers = append(tiers, candidatePriority)
+		}
+	}
+	slices.Sort(tiers)
+	return time.Duration(slices.Index(tiers, priority)) * self.settings.ModeInitialDelay
+}
+
+func (self *PlatformTransport) runMode(mode TransportMode, initialDelay time.Duration) {
+	switch mode {
+	case TransportModeH1:
+		self.runH1(initialDelay)
+	case TransportModeH3:
+		self.runH3(TransportModeH3, initialDelay, 1)
+	case TransportModeH3Dns:
+		self.runH3(TransportModeH3Dns, initialDelay, self.settings.PtDnsSlowMultiple)
+	case TransportModeH3DnsPump:
+		self.runH3(TransportModeH3DnsPump, initialDelay, self.settings.PtDnsSlowMultiple)
+	}
+}
+
 func (self *PlatformTransport) run() {
 	defer func() {
 		self.cancel()
 		self.runWaitGroup.Wait()
 	}()
 
-	// TODO udp protocols need proxy protocol support in the load balancer
-	// see https://github.com/nginx/nginx/issues/1061
 	switch self.targetMode {
 	case TransportModeAuto:
+		for _, mode := range self.orderedModes() {
+			mode := mode
+			initialDelay := self.modeInitialDelay(mode)
+			self.startModeRunner(func() {
+				self.runMode(mode, initialDelay)
+			})
+		}
+	case TransportModeH3, TransportModeH1, TransportModeH3Dns, TransportModeH3DnsPump:
 		self.startModeRunner(func() {
-			self.runH1(0)
-		})
-		// go HandleError(func() {
-		// 	self.runH3(TransportModeH3, 0, 1)
-		// }, self.cancel)
-		// go HandleError(func() {
-		// 	self.runH3(TransportModeH3Dns, self.settings.ModeInitialDelay, self.settings.PtDnsSlowMultiple)
-		// }, self.cancel)
-		// go HandleError(func() {
-		// 	self.runH3(TransportModeH3DnsPump, self.settings.ModeInitialDelay*2, self.settings.PtDnsSlowMultiple)
-		// }, self.cancel)
-	case TransportModeH3:
-		self.startModeRunner(func() {
-			self.runH3(TransportModeH3, 0, 1)
-		})
-	case TransportModeH1:
-		self.startModeRunner(func() {
-			self.runH1(0)
-		})
-	case TransportModeH3Dns:
-		self.startModeRunner(func() {
-			self.runH3(TransportModeH3Dns, 0, self.settings.PtDnsSlowMultiple)
-		})
-	case TransportModeH3DnsPump:
-		self.startModeRunner(func() {
-			self.runH3(TransportModeH3DnsPump, 0, self.settings.PtDnsSlowMultiple)
+			self.runMode(self.targetMode, 0)
 		})
 	}
 
@@ -666,17 +1003,7 @@ func (self *PlatformTransport) run() {
 		// (h3 and h1 do), and `maps.Keys` is randomly ordered, so the election
 		// picked an arbitrary winner among tied modes on every pass — flipping
 		// the active mode and thrashing the gates. break ties on the mode name
-		orderedModes := slices.Collect(maps.Keys(transportModePreferences))
-		slices.SortFunc(orderedModes, func(a TransportMode, b TransportMode) int {
-			preferenceA := modePreference(a)
-			preferenceB := modePreference(b)
-			if preferenceA < preferenceB {
-				return -1
-			} else if preferenceB < preferenceA {
-				return 1
-			}
-			return strings.Compare(string(a), string(b))
-		})
+		orderedModes := self.orderedModes()
 		bestMode := TransportModeNone
 		for _, mode := range orderedModes {
 			if available[mode] {
@@ -695,7 +1022,7 @@ func (self *PlatformTransport) run() {
 		// set of a constant map), so a mode that dropped left the active mode
 		// pinned to its stale value
 		activeMode := self.mode.Value()
-		if !available[activeMode] || isBetterMode(bestMode, activeMode) {
+		if !available[activeMode] || self.isBetterMode(bestMode, activeMode) {
 			activeMode = bestMode
 		}
 		self.setActiveMode(activeMode)
@@ -725,6 +1052,10 @@ func isBetterMode(mode TransportMode, other TransportMode) bool {
 	return modePreference(mode) < modePreference(other)
 }
 
+func (self *PlatformTransport) isBetterMode(mode TransportMode, other TransportMode) bool {
+	return self.modePreference(mode) < self.modePreference(other)
+}
+
 // standDown reports whether a transport running mode should stand down because a
 // strictly better mode is currently active, along with the channel that closes
 // when the active mode changes. A transport runs when it is the active mode, or
@@ -738,7 +1069,7 @@ func isBetterMode(mode TransportMode, other TransportMode) bool {
 // false and no transport ever stood down.
 func (self *PlatformTransport) standDown(mode TransportMode) (bool, chan struct{}) {
 	activeMode, notify := self.activeMode()
-	return isBetterMode(activeMode, mode), notify
+	return self.isBetterMode(activeMode, mode), notify
 }
 
 func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
@@ -952,7 +1283,6 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 			var readCounter atomic.Uint64
 			var writeCounter atomic.Uint64
-
 			send := make(chan []byte, self.settings.TransportBufferSize)
 			receive := make(chan []byte, self.settings.TransportBufferSize)
 			controlSend := make(chan []byte, self.settings.TransportBufferSize)
@@ -1016,8 +1346,8 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			if self.settings.TransportGenerator != nil {
 				sendTransport, receiveTransport = self.settings.TransportGenerator()
 			} else {
-				sendTransport = NewSendGatewayTransport()
-				receiveTransport = NewReceiveGatewayTransport()
+				sendTransport = NewSendGatewayTransportWithType(TransportTypeH1)
+				receiveTransport = NewReceiveGatewayTransportWithType(TransportTypeH1)
 			}
 
 			self.routeManager.UpdateTransport(sendTransport, []Route{exportedSend})
@@ -1264,13 +1594,6 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					drain(receive)
 					drain(controlSend)
 				}()
-				var receiveTimer *time.Timer
-				defer func() {
-					if receiveTimer != nil {
-						receiveTimer.Stop()
-					}
-				}()
-
 				speedTest := false
 
 				for {
@@ -1314,31 +1637,22 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 								case TransportControlSpeedStart:
 									speedTest = true
 									// echo
-									select {
-									case <-handleCtx.Done():
-										MessagePoolReturn(message)
+									if !self.offerH1Control(handleCtx.Done(), controlSend, message) {
 										return
-									case controlSend <- message:
 									}
 								case TransportControlSpeedStop:
 									speedTest = false
 									// echo
-									select {
-									case <-handleCtx.Done():
-										MessagePoolReturn(message)
+									if !self.offerH1Control(handleCtx.Done(), controlSend, message) {
 										return
-									case controlSend <- message:
 									}
 								default:
 									MessagePoolReturn(message)
 								}
 							} else if len(message) == 16 {
 								// latency test echo
-								select {
-								case <-handleCtx.Done():
-									MessagePoolReturn(message)
+								if !self.offerH1Control(handleCtx.Done(), controlSend, message) {
 									return
-								case controlSend <- message:
 								}
 							} else {
 								MessagePoolReturn(message)
@@ -1347,29 +1661,23 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						}
 						if speedTest {
 							// speed test echo
-							select {
-							case <-handleCtx.Done():
-								MessagePoolReturn(message)
+							if !self.offerH1Control(handleCtx.Done(), controlSend, message) {
 								return
-							case controlSend <- message:
 							}
 							continue
 						}
 
-						timeoutChan := resetOrCreateTimer(&receiveTimer, self.settings.ReadTimeout)
-						select {
-						case <-handleCtx.Done():
-							receiveTimer.Stop()
-							MessagePoolReturn(message)
+						open, delivered := self.offerReceive(
+							handleCtx.Done(),
+							TransportModeH1,
+							receive,
+							message,
+						)
+						if !open {
 							return
-						case receive <- message:
-							receiveTimer.Stop()
-							if self.log.V(2).Enabled() {
-								self.log.Infof("[tr]%s<-\n", clientId)
-							}
-						case <-timeoutChan:
-							self.log.Infof("[tr]drop %s<-\n", clientId)
-							MessagePoolReturn(message)
+						}
+						if delivered && self.log.V(2).Enabled() {
+							self.log.Infof("[tr]%s<-\n", clientId)
 						}
 					default:
 						if self.log.V(2).Enabled() {
@@ -1464,21 +1772,24 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 		reconnect := NewReconnect(self.settings.ReconnectTimeout)
 
 		type ConnStream struct {
-			conn          *quic.Conn
-			stream        *quic.Stream
-			packetConn    net.PacketConn
-			quicTransport *quic.Transport
+			conn           *quic.Conn
+			stream         *quic.Stream
+			packetConn     net.PacketConn
+			quicTransport  *quic.Transport
+			useH3Datagrams bool
 		}
 
 		connect := func() (*ConnStream, error) {
 			// quicConfig := &quic.Config{
 			// 	HandshakeIdleTimeout: self.settings.QuicConnectTimeout + self.settings.QuicHandshakeTimeout,
 			// }
-			authBytes, err := EncodeFrame(&protocol.Auth{
+			authMessage := &protocol.Auth{
 				ByJwt:      self.auth.ByJwt,
 				AppVersion: self.auth.AppVersion,
 				InstanceId: self.auth.InstanceId.Bytes(),
-			}, self.settings.ProtocolVersion)
+			}
+			SetH3DatagramAuthOffer(authMessage, self.settings.EnableH3Datagrams)
+			authBytes, err := EncodeFrame(authMessage, self.settings.ProtocolVersion)
 			if err != nil {
 				return nil, err
 			}
@@ -1639,23 +1950,39 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				return nil, err
 			}
 			stream.SetReadDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.AuthTimeout))
-			if message, err := framer.Read(stream); err != nil {
+			useH3Datagrams := false
+			if responseBytes, err := framer.Read(stream); err != nil {
 				return nil, err
 			} else {
-				// verify the auth echo
-				equal := bytes.Equal(authBytes, message)
-				MessagePoolReturn(message)
-				if !equal {
-					return nil, fmt.Errorf("Auth response error: bad bytes.")
+				defer MessagePoolReturn(responseBytes)
+				responseMessage, responseErr := DecodeFrame(responseBytes)
+				if responseErr != nil {
+					return nil, responseErr
+				}
+				authResponse, ok := responseMessage.(*protocol.Auth)
+				if !ok {
+					return nil, fmt.Errorf("Auth response error: got %T.", responseMessage)
+				}
+				connectionState := conn.ConnectionState()
+				useH3Datagrams, responseErr = ValidateH3DatagramAuthResponse(
+					authMessage,
+					authResponse,
+					self.settings.EnableH3Datagrams,
+					connectionState.SupportsDatagrams.Local,
+					connectionState.SupportsDatagrams.Remote,
+				)
+				if responseErr != nil {
+					return nil, responseErr
 				}
 			}
 
 			success = true
 			return &ConnStream{
-				conn:          conn,
-				stream:        stream,
-				packetConn:    packetConn,
-				quicTransport: quicTransport,
+				conn:           conn,
+				stream:         stream,
+				packetConn:     packetConn,
+				quicTransport:  quicTransport,
+				useH3Datagrams: useH3Datagrams,
 			}, nil
 		}
 
@@ -1776,9 +2103,43 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			})
 
 			framer := NewFramer(self.framerSettings)
+			var datagramFragmenter *H3DatagramFragmenter
+			var datagramReassembler *H3DatagramReassembler
+			if connStream.useH3Datagrams {
+				var datagramErr error
+				datagramFragmenter, datagramErr = NewH3DatagramFragmenter(
+					self.h3DatagramSettings,
+					self.h3DatagramStats,
+				)
+				if datagramErr != nil {
+					self.log.Infof("[t]H3 DATAGRAM sender init error = %s\n", datagramErr)
+					return
+				}
+				datagramReassembler, datagramErr = NewH3DatagramReassembler(
+					self.h3DatagramSettings,
+					self.h3DatagramReassemblyBudget,
+					self.h3DatagramStats,
+				)
+				if datagramErr != nil {
+					self.log.Infof("[t]H3 DATAGRAM receiver init error = %s\n", datagramErr)
+					return
+				}
+				defer datagramReassembler.Close()
+			}
 
 			var readCounter atomic.Uint64
 			var writeCounter atomic.Uint64
+			// The route selector classifies the exact message accepted by this H3
+			// generation. Keep the live QUIC DATAGRAM ceiling atomic because Transfer
+			// reads it on its sender goroutine while the carrier writer lowers it
+			// after synchronous DatagramTooLarge feedback.
+			var maxDatagramByteCount atomic.Int64
+			maxDatagramByteCount.Store(
+				int64(initialH3DatagramPathByteCount(
+					self.h3DatagramSettings.TargetDatagramByteCount,
+					conn.SendDatagram,
+				)),
+			)
 
 			send := make(chan []byte, self.settings.TransportBufferSize)
 			receive := make(chan []byte, self.settings.TransportBufferSize)
@@ -1804,11 +2165,28 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			if self.settings.TransportGenerator != nil {
 				sendTransport, receiveTransport = self.settings.TransportGenerator()
 			} else {
-				sendTransport = NewSendGatewayTransport()
-				receiveTransport = NewReceiveGatewayTransport()
+				transportType := transportTypeFromMode(ptMode)
+				sendTransport = NewSendGatewayTransportWithType(transportType)
+				receiveTransport = NewReceiveGatewayTransportWithType(transportType)
 			}
 
-			self.routeManager.UpdateTransport(sendTransport, []Route{send})
+			sendCarrierProperties := TransferCarrierProperties{}
+			if connStream.useH3Datagrams {
+				sendCarrierProperties.Unreliable = true
+				sendCarrierProperties.UnreliableFlowIsolation = true
+				sendCarrierProperties.UnreliableFlowReserve = true
+				sendCarrierProperties.unreliableForMessageByteCount = func(messageByteCount int) bool {
+					return self.h3DatagramSettings.UseDatagramForPath(
+						messageByteCount,
+						int(maxDatagramByteCount.Load()),
+					)
+				}
+			}
+			self.routeManager.UpdateTransportWithProperties(
+				sendTransport,
+				[]Route{send},
+				sendCarrierProperties,
+			)
 			if self.settings.SendRouteObserver != nil {
 				self.settings.SendRouteObserver(sendTransport, send, true)
 			}
@@ -1835,7 +2213,37 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				drain(send)
 				drain(receive)
 			}()
-			writeBatchStorage := make([]byte, platformH3WriteBatchMaxByteCount)
+			// Hybrid H3 dispatches the two physical lanes before either writer can
+			// block. The extra queue transfers pooled-message ownership under both
+			// count and retained-backing-byte limits. Legacy stream-only H3 consumes
+			// the published route directly.
+			var streamSend chan []byte
+			var streamSendBudget *H3HybridStreamSendBudget
+			streamInput := (<-chan []byte)(send)
+			if connStream.useH3Datagrams {
+				streamQueueMessageCount := min(
+					H3HybridStreamQueueMessageCount,
+					max(1, self.settings.TransportBufferSize),
+				)
+				streamSend = make(chan []byte, streamQueueMessageCount)
+				streamSendBudget = NewH3HybridStreamSendBudget(
+					streamQueueMessageCount,
+					H3HybridStreamQueueByteCount,
+					self.h3DatagramStats,
+				)
+				streamInput = streamSend
+			}
+			releaseStreamMessage := func(message []byte) {
+				if streamSendBudget != nil {
+					streamSendBudget.Release(H3HybridStreamRetainedByteCount(message))
+				}
+				MessagePoolReturn(message)
+			}
+
+			// Allocated only if this generation actually selects the reliable data
+			// lane. A small-message-only hybrid keeps the former DATAGRAM memory
+			// profile instead of pinning the 64 KiB stream batch eagerly.
+			var writeBatchStorage []byte
 			writeReadySendBatch := func(
 				firstMessage []byte,
 			) (sendOpen bool, pendingMessage []byte, err error) {
@@ -1850,7 +2258,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 					case <-handleCtx.Done():
 						sendOpen = false
 						break drainReady
-					case message, ok := <-send:
+					case message, ok := <-streamInput:
 						if !ok {
 							sendOpen = false
 							break drainReady
@@ -1870,18 +2278,56 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				stream.SetWriteDeadline(
 					time.Now().Add(time.Duration(slowMultiple) * self.settings.WriteTimeout),
 				)
+				if self.settings.beforeH3StreamWriteForTest != nil {
+					self.settings.beforeH3StreamWriteForTest()
+				}
+				if writeBatchStorage == nil {
+					writeBatchStorage = make([]byte, platformH3WriteBatchMaxByteCount)
+				}
 				err = framer.WriteBatchWithStorage(
 					stream,
 					messages,
 					writeBatchStorage,
 				)
-				for _, message := range messages {
-					MessagePoolReturn(message)
-				}
 				if err == nil {
 					writeCounter.Add(uint64(len(messages)))
+					for _, message := range messages {
+						if connStream.useH3Datagrams {
+							self.h3DatagramStats.RecordStreamSent(len(message))
+						}
+						if self.settings.H3SendLaneObserver != nil {
+							self.settings.H3SendLaneObserver(message, false)
+						}
+					}
+				}
+				for _, message := range messages {
+					releaseStreamMessage(message)
 				}
 				return
+			}
+			sendDatagramMessage := func(message []byte) (useStream bool, sendErr error) {
+				currentMaxDatagramByteCount := int(maxDatagramByteCount.Load())
+				var nextMaxDatagramByteCount int
+				useStream, nextMaxDatagramByteCount, sendErr = datagramFragmenter.SendHybrid(
+					message,
+					currentMaxDatagramByteCount,
+					conn.SendDatagram,
+				)
+				if nextMaxDatagramByteCount != currentMaxDatagramByteCount {
+					maxDatagramByteCount.Store(int64(nextMaxDatagramByteCount))
+				}
+				return useStream, sendErr
+			}
+			logH3WriteError := func(err error) {
+				if ok, suppressed := shouldLogWriteErr(); ok {
+					if suppressed > 0 {
+						self.log.Infof("[ts]%s-> error = %s (%d suppressed)\n", clientId, err, suppressed)
+					} else {
+						self.log.Infof("[ts]%s-> error = %s\n", clientId, err)
+					}
+				} else if v := self.log.V(1); v.Enabled() {
+					v.Infof("[ts]%s-> error = %s\n", clientId, err)
+				}
 			}
 
 			startConnectionWorker(func() {
@@ -1914,6 +2360,13 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 
 			startConnectionWorker(func() {
 				defer handleCancel()
+				if streamSend != nil {
+					defer func() {
+						for message := range streamSend {
+							releaseStreamMessage(message)
+						}
+					}()
+				}
 
 				pingTimer := time.NewTimer(0)
 				defer pingTimer.Stop()
@@ -1922,7 +2375,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				var pendingMessage []byte
 				defer func() {
 					if pendingMessage != nil {
-						MessagePoolReturn(pendingMessage)
+						releaseStreamMessage(pendingMessage)
 					}
 				}()
 				for {
@@ -1932,7 +2385,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 						select {
 						case <-handleCtx.Done():
 							return
-						case nextMessage, ok := <-send:
+						case nextMessage, ok := <-streamInput:
 							if !ok {
 								return
 							}
@@ -1946,35 +2399,150 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 							continue
 						}
 					}
-					{
-						// if !MessagePoolCheckShared(message) {
-						// 	panic("[t]shared should be set")
-						// }
-						sendOpen, nextMessage, err := writeReadySendBatch(message)
-						pendingMessage = nextMessage
-						if err != nil {
-							// note that for websocket a dealine timeout cannot be recovered
-							if ok, suppressed := shouldLogWriteErr(); ok {
-								if suppressed > 0 {
-									self.log.Infof("[ts]%s-> error = %s (%d suppressed)\n", clientId, err, suppressed)
-								} else {
-									self.log.Infof("[ts]%s-> error = %s\n", clientId, err)
-								}
-							} else if v := self.log.V(1); v.Enabled() {
-								v.Infof("[ts]%s-> error = %s\n", clientId, err)
-							}
-							return
-						}
-						if !sendOpen {
-							return
-						}
-						if self.log.V(2).Enabled() {
-							self.log.Infof("[ts]%s->\n", clientId)
-						}
-						resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+					sendOpen, nextMessage, err := writeReadySendBatch(message)
+					pendingMessage = nextMessage
+					if err != nil {
+						logH3WriteError(err)
+						return
 					}
+					if !sendOpen {
+						return
+					}
+					if self.log.V(2).Enabled() {
+						self.log.Infof("[ts]%s->stream\n", clientId)
+					}
+					resetWakeupTimer(
+						pingTimer,
+						self.settings.PingTimeout,
+						self.settings.PingTimeout,
+					)
 				}
 			}, handleCancel)
+
+			if connStream.useH3Datagrams {
+				startConnectionWorker(func() {
+					defer handleCancel()
+					defer close(streamSend)
+
+					offerStream := func(message []byte) bool {
+						retainedByteCount := H3HybridStreamRetainedByteCount(message)
+						if streamSendBudget.MaxByteCount() < retainedByteCount &&
+							len(message) <= streamSendBudget.MaxByteCount()-MessagePoolMetaByteCount {
+							compactMessage := MessagePoolCopy(message)
+							MessagePoolReturn(message)
+							message = compactMessage
+							retainedByteCount = H3HybridStreamRetainedByteCount(message)
+						}
+						if !streamSendBudget.Acquire(handleCtx, retainedByteCount) {
+							MessagePoolReturn(message)
+							if handleCtx.Err() == nil {
+								logH3WriteError(fmt.Errorf(
+									"H3 hybrid stream message retained bytes %d exceed queue limit %d",
+									retainedByteCount,
+									streamSendBudget.MaxByteCount(),
+								))
+							}
+							return false
+						}
+						select {
+						case <-handleCtx.Done():
+							streamSendBudget.Release(retainedByteCount)
+							MessagePoolReturn(message)
+							return false
+						case streamSend <- message:
+							return true
+						}
+					}
+					for {
+						select {
+						case <-handleCtx.Done():
+							return
+						case message, ok := <-send:
+							if !ok {
+								return
+							}
+							useDatagram := self.h3DatagramSettings.UseDatagramForPath(
+								len(message),
+								int(maxDatagramByteCount.Load()),
+							)
+							if useDatagram {
+								useStream, err := sendDatagramMessage(message)
+								if err != nil {
+									MessagePoolReturn(message)
+									logH3WriteError(err)
+									return
+								}
+								if !useStream {
+									if self.settings.H3SendLaneObserver != nil {
+										self.settings.H3SendLaneObserver(message, true)
+									}
+									MessagePoolReturn(message)
+									writeCounter.Add(1)
+									if self.log.V(2).Enabled() {
+										self.log.Infof("[ts]%s->datagram\n", clientId)
+									}
+									continue
+								}
+							}
+							if !offerStream(message) {
+								return
+							}
+						}
+					}
+				}, handleCancel)
+			}
+
+			offerRoutedMessage := func(message []byte) bool {
+				readCounter.Add(1)
+				open, delivered := self.offerReceive(
+					handleCtx.Done(),
+					ptMode,
+					receive,
+					message,
+				)
+				if delivered {
+					if self.settings.afterH3ReceiveEnqueueForTest != nil {
+						self.settings.afterH3ReceiveEnqueueForTest(message)
+					}
+					if self.log.V(2).Enabled() {
+						self.log.Infof("[tr]%s<-\n", clientId)
+					}
+				}
+				return open
+			}
+
+			if connStream.useH3Datagrams {
+				// Authentication, liveness, and routed frames above the hybrid
+				// threshold share the reliable stream. The single stream reader
+				// remains independent from the DATAGRAM receive pump below. Clear
+				// the authentication deadline: DATAGRAM activity is invisible to a
+				// stream read deadline, so keeping an application deadline here can
+				// tear down an otherwise active QUIC connection when the stream is
+				// legitimately idle. QUIC's connection-level idle timeout still
+				// detects a dead peer, and closing the connection unblocks this read.
+				startConnectionWorker(func() {
+					defer handleCancel()
+					if err := stream.SetReadDeadline(time.Time{}); err != nil {
+						return
+					}
+					for {
+						message, err := framer.Read(stream)
+						if err != nil {
+							return
+						}
+						if len(message) != 0 {
+							self.h3DatagramStats.RecordStreamReceived(len(message))
+							if !offerRoutedMessage(message) {
+								return
+							}
+							continue
+						}
+						readCounter.Add(1)
+						MessagePoolReturn(message)
+						datagramReassembler.Expire(time.Now())
+					}
+				}, handleCancel)
+			}
 
 			startConnectionWorker(func() {
 				defer func() {
@@ -1984,12 +2552,6 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 					handleCancel()
 					close(receive)
 				}()
-				var receiveTimer *time.Timer
-				defer func() {
-					if receiveTimer != nil {
-						receiveTimer.Stop()
-					}
-				}()
 
 				for {
 					select {
@@ -1998,42 +2560,35 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 					default:
 					}
 
-					stream.SetReadDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.ReadTimeout))
-					message, err := framer.Read(stream)
-					if err != nil {
-						self.log.Infof("[tr]%s<- error = %s\n", clientId, err)
-						return
+					var message []byte
+					if connStream.useH3Datagrams {
+						datagram, err := conn.ReceiveDatagram(handleCtx)
+						if err != nil {
+							return
+						}
+						message = datagramReassembler.Accept(datagram, time.Now())
+						if message == nil {
+							continue
+						}
+					} else {
+						stream.SetReadDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.ReadTimeout))
+						var err error
+						message, err = framer.Read(stream)
+						if err != nil {
+							self.log.Infof("[tr]%s<- error = %s\n", clientId, err)
+							return
+						}
+						if 0 == len(message) {
+							// ping
+							if self.log.V(2).Enabled() {
+								self.log.Infof("[tr]ping %s<-\n", clientId)
+							}
+							MessagePoolReturn(message)
+							continue
+						}
 					}
-
-					if 0 == len(message) {
-						// ping
-						if self.log.V(2).Enabled() {
-							self.log.Infof("[tr]ping %s<-\n", clientId)
-						}
-						MessagePoolReturn(message)
-						continue
-					}
-
-					timeoutChan := resetOrCreateTimer(
-						&receiveTimer,
-						time.Duration(slowMultiple)*self.settings.ReadTimeout,
-					)
-					select {
-					case <-handleCtx.Done():
-						receiveTimer.Stop()
-						MessagePoolReturn(message)
+					if !offerRoutedMessage(message) {
 						return
-					case receive <- message:
-						receiveTimer.Stop()
-						if self.settings.afterH3ReceiveEnqueueForTest != nil {
-							self.settings.afterH3ReceiveEnqueueForTest(message)
-						}
-						if self.log.V(2).Enabled() {
-							self.log.Infof("[tr]%s<-\n", clientId)
-						}
-					case <-timeoutChan:
-						self.log.Infof("[tr]drop %s<-\n", clientId)
-						MessagePoolReturn(message)
 					}
 				}
 			}, func() {

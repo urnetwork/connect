@@ -2,7 +2,9 @@ package connect
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -32,15 +34,54 @@ func TestUpgradeMuxMultiClientIntegration(t *testing.T) {
 	source := SourceId(clientId)
 
 	// provider/exit: echo each IP packet back with its path reversed
-	clientSettings := DefaultClientSettings()
-	clientSettings.SendBufferSettings.SequenceBufferSize = 0
-	clientSettings.SendBufferSettings.AckBufferSize = 0
-	clientSettings.ReceiveBufferSettings.SequenceBufferSize = 0
-	clientSettings.ForwardBufferSettings.SequenceBufferSize = 0
+	clientSettings := DefaultClientSettingsWithBufferSize(32)
 	providerClient := NewClient(ctx, NewId(), NewNoContractClientOob(), clientSettings)
 	defer providerClient.Cancel()
 
-	providerClient.AddReceiveCallback(func(src TransferPath, frames []*protocol.Frame, peer Peer) {
+	type echo struct {
+		frame       *protocol.Frame
+		destination Id
+		transferKey TransferKey
+	}
+	echoes := make(chan echo, 32)
+	asyncErrors := make(chan error, 1)
+	recordAsyncError := func(err error) {
+		select {
+		case asyncErrors <- err:
+		default:
+		}
+	}
+	var echoWaitGroup sync.WaitGroup
+	echoWaitGroup.Add(1)
+	go func() {
+		defer echoWaitGroup.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				for {
+					select {
+					case echo := <-echoes:
+						MessagePoolReturn(echo.frame.MessageBytes)
+					default:
+						return
+					}
+				}
+			case echo := <-echoes:
+				if !providerClient.SendWithTimeout(
+					echo.frame,
+					echo.destination,
+					func(error) {},
+					30*time.Second,
+					echo.transferKey,
+				) {
+					MessagePoolReturn(echo.frame.MessageBytes)
+					recordAsyncError(fmt.Errorf("send provider echo"))
+					return
+				}
+			}
+		}
+	}()
+	providerReceiveUnsub := providerClient.AddReceiveCallback(func(src TransferPath, frames []*protocol.Frame, peer Peer) {
 		for _, frame := range frames {
 			msg, err := FromFrame(frame)
 			if err != nil {
@@ -61,14 +102,33 @@ func TestUpgradeMuxMultiClientIntegration(t *testing.T) {
 			if err != nil {
 				continue
 			}
-			providerClient.SendWithTimeout(echoFrame, src.SourceId, func(err error) {}, -1)
+			select {
+			case echoes <- echo{
+				frame:       echoFrame,
+				destination: src.SourceId,
+				transferKey: peer.TransferKey,
+			}:
+			default:
+				MessagePoolReturn(echoFrame.MessageBytes)
+				recordAsyncError(fmt.Errorf("provider echo queue overflow"))
+			}
 		}
 	})
+	defer func() {
+		providerReceiveUnsub()
+		cancel()
+		echoWaitGroup.Wait()
+	}()
 
 	// client-side receiver (the "OS TUN")
 	received := make(chan []byte, 32)
 	clientReceive := func(src TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
-		received <- append([]byte{}, packet...)
+		packetCopy := append([]byte{}, packet...)
+		select {
+		case received <- packetCopy:
+		default:
+			recordAsyncError(fmt.Errorf("client receive collector overflow"))
+		}
 	}
 
 	// the mux resolves DNS through a local DoH server
@@ -119,6 +179,8 @@ func TestUpgradeMuxMultiClientIntegration(t *testing.T) {
 			if err != nil || string(payload) != string(passPayload) {
 				t.Fatalf("pass-through echo payload=%q (err %v), want %q", payload, err, passPayload)
 			}
+		case asyncErr := <-asyncErrors:
+			t.Fatalf("asynchronous mux integration worker: %v", asyncErr)
 		case <-time.After(30 * time.Second):
 			t.Fatal("pass-through echo not received through the multi-client + provider")
 		}
@@ -147,6 +209,8 @@ func TestUpgradeMuxMultiClientIntegration(t *testing.T) {
 			if !dnsReplyHasAddr(payload, resolvedIp) {
 				t.Fatalf("dns reply missing %s", resolvedIp)
 			}
+		case asyncErr := <-asyncErrors:
+			t.Fatalf("asynchronous mux integration worker: %v", asyncErr)
 		case <-time.After(30 * time.Second):
 			t.Fatal("dns reply not received")
 		}
@@ -184,11 +248,7 @@ func TestUpgradeMuxDefaultDnsThroughTunnel(t *testing.T) {
 	// provider/exit: a real RemoteUserNatProvider over a host-proxying LocalUserNat, so
 	// the mux's DoH connection actually egresses to the local DoH server through the
 	// tunnel. Permissive security so the loopback test server is not dropped.
-	clientSettings := DefaultClientSettings()
-	clientSettings.SendBufferSettings.SequenceBufferSize = 0
-	clientSettings.SendBufferSettings.AckBufferSize = 0
-	clientSettings.ReceiveBufferSettings.SequenceBufferSize = 0
-	clientSettings.ForwardBufferSettings.SequenceBufferSize = 0
+	clientSettings := DefaultClientSettingsWithBufferSize(32)
 	providerClient := NewClient(ctx, NewId(), NewNoContractClientOob(), clientSettings)
 	defer providerClient.Cancel()
 
@@ -205,8 +265,19 @@ func TestUpgradeMuxDefaultDnsThroughTunnel(t *testing.T) {
 	defer dohServer.Close()
 
 	received := make(chan []byte, 32)
+	var receiveDropCount int
+	var receiveDropLock sync.Mutex
 	clientReceive := func(src TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
-		received <- append([]byte{}, packet...)
+		packetCopy := append([]byte{}, packet...)
+		select {
+		case received <- packetCopy:
+		default:
+			func() {
+				receiveDropLock.Lock()
+				defer receiveDropLock.Unlock()
+				receiveDropCount += 1
+			}()
+		}
 	}
 
 	// the default app mux, but with DoH pointed at the local server (remote DoH = through
@@ -260,6 +331,13 @@ func TestUpgradeMuxDefaultDnsThroughTunnel(t *testing.T) {
 	case <-time.After(25 * time.Second):
 		t.Fatal("dns reply not received — remote DoH through the tunnel black-holed the query")
 	}
+	func() {
+		receiveDropLock.Lock()
+		defer receiveDropLock.Unlock()
+		if receiveDropCount != 0 {
+			t.Fatalf("client receive callback dropped %d packet(s)", receiveDropCount)
+		}
+	}()
 }
 
 func buildDnsQuery(t *testing.T, domain string) []byte {

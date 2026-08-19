@@ -79,3 +79,22 @@ func TestRttWindowColdVsSampledFloor(t *testing.T) {
 	// after the window ages out (quiet gap), back to the cold floor
 	AssertEqual(t, rttWindow.scaledRtt(start.Add(30*time.Second)), 2*time.Second)
 }
+
+// A recovery probe is deliberately based on the minimum live RTT sample: the
+// ordinary resend timer keeps the conservative mean, while a single bounded
+// tail probe must not inherit seconds of sender serialization queueing.
+func TestRttWindowProbeUsesMinimumSample(t *testing.T) {
+	rttWindow := NewRttWindow(nil, 8, 10*time.Second, 2.0, 2*time.Second, 300*time.Millisecond, 8*time.Second)
+	receiveTime := time.Unix(1_700_000_000, 0)
+	rttWindow.closeSendTime(
+		uint64(receiveTime.Add(-250*time.Millisecond).UnixMilli()),
+		receiveTime,
+	)
+	rttWindow.closeSendTime(
+		uint64(receiveTime.Add(-2250*time.Millisecond).UnixMilli()),
+		receiveTime,
+	)
+
+	AssertEqual(t, rttWindow.scaledRtt(receiveTime), 2500*time.Millisecond)
+	AssertEqual(t, rttWindow.probeRtt(receiveTime), 500*time.Millisecond)
+}

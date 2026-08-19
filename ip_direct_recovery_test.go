@@ -1,12 +1,14 @@
-// This file verifies that stream-capable IP data removes the duplicate
-// Transfer recovery loop while non-direct compatibility routes retain their
-// established reliability policy.
+// This file verifies that TCP retains end-to-end Transfer recovery while
+// UDP/ICMP preserve their configured datagram policy.
 package connect
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
-// Every IP protocol uses unacknowledged Transfer on a direct-capable stream;
-// only the historical UDP collapse option changes a non-direct route.
+// TCP is acknowledged even on a direct-capable carrier. Only the historical
+// UDP collapse option changes a non-direct datagram route.
 func TestIpPacketTransferAckRequired(t *testing.T) {
 	tests := []struct {
 		name                  string
@@ -19,7 +21,7 @@ func TestIpPacketTransferAckRequired(t *testing.T) {
 			name:        "direct tcp",
 			protocol:    IpProtocolTcp,
 			allowDirect: true,
-			ackRequired: false,
+			ackRequired: true,
 		},
 		{
 			name:        "direct udp",
@@ -67,5 +69,53 @@ func TestIpPacketTransferAckRequired(t *testing.T) {
 	}
 	if !ipPacketTransferAckRequired(nil, false, true) {
 		t.Fatal("missing IP metadata disabled compatibility acknowledgement")
+	}
+}
+
+// The final packet-to-Transfer boundary must reject an explicit NoAck hint for
+// TCP. This keeps a new caller from bypassing the normal route-policy helper.
+func TestTcpTransferAckCannotBeDisabledAtSendBoundary(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		ipPath    *IpPath
+		requested bool
+		want      bool
+	}{
+		{name: "tcp noack request", ipPath: &IpPath{Protocol: IpProtocolTcp}, want: true},
+		{name: "udp noack request", ipPath: &IpPath{Protocol: IpProtocolUdp}, want: false},
+		{name: "udp ack request", ipPath: &IpPath{Protocol: IpProtocolUdp}, requested: true, want: true},
+		{name: "missing metadata", want: true},
+	} {
+		if got := ipPacketTransferAckForRequest(test.ipPath, test.requested); got != test.want {
+			t.Errorf("%s ACK=%t, want %t", test.name, got, test.want)
+		}
+	}
+
+	var observed []bool
+	client := &multiClientChannel{
+		sendGroupForTest: func(
+			_ *parsedPacketGroup,
+			_ time.Duration,
+			ack bool,
+		) (bool, error) {
+			observed = append(observed, ack)
+			return true, nil
+		},
+	}
+	for _, ipPath := range []*IpPath{
+		{Protocol: IpProtocolTcp},
+		{Protocol: IpProtocolUdp},
+		nil,
+	} {
+		if success, err := client.SendGroupDetailedWithAck(
+			&parsedPacketGroup{ipPath: ipPath},
+			0,
+			false,
+		); err != nil || !success {
+			t.Fatalf("send boundary = %t, %v", success, err)
+		}
+	}
+	if len(observed) != 3 || !observed[0] || observed[1] || !observed[2] {
+		t.Fatalf("observed ACK policies=%v, want [true false true]", observed)
 	}
 }

@@ -263,11 +263,17 @@ func buildEquivalentAckFrame(m *sendAckFrame) *protocol.TransferFrame {
 	if m.tagSet {
 		tag = &protocol.Tag{SendTime: m.tagSendTime}
 	}
+	var missingContractId []byte
+	if m.missingContractId != nil {
+		missingContractId = m.missingContractId.Bytes()
+	}
 	ack := &protocol.Ack{
-		MessageId:  m.messageId.Bytes(),
-		SequenceId: m.sequenceId.Bytes(),
-		Selective:  m.selective,
-		Tag:        tag,
+		MessageId:               m.messageId.Bytes(),
+		SequenceId:              m.sequenceId.Bytes(),
+		Selective:               m.selective,
+		Tag:                     tag,
+		MissingContractId:       missingContractId,
+		CompactContractRecovery: m.compactContractRecovery,
 	}
 	tf := &protocol.TransferFrame{
 		TransferPath: m.path.ToProtobuf(),
@@ -299,7 +305,7 @@ func assertAckCodecMatches(t *testing.T, m *sendAckFrame) {
 }
 
 func TestAckCodecEdgeCases(t *testing.T) {
-	idA, idB, idC := NewId(), NewId(), NewId()
+	idA, idB, idC, idD := NewId(), NewId(), NewId(), NewId()
 	cases := map[string]*sendAckFrame{
 		"minimal no tag": {
 			path:       TransferPath{DestinationId: idA, SourceId: idB},
@@ -325,6 +331,13 @@ func TestAckCodecEdgeCases(t *testing.T) {
 			messageId:  idC,
 			sequenceId: idA,
 			selective:  true,
+		},
+		"missing contract recovery": {
+			path:                    TransferPath{DestinationId: idA, SourceId: idB},
+			messageId:               idC,
+			sequenceId:              idA,
+			missingContractId:       &idD,
+			compactContractRecovery: true,
 		},
 	}
 	for _, m := range cases {
@@ -352,6 +365,11 @@ func TestAckCodecRandomized(t *testing.T) {
 			m.path.StreamId = randId()
 		}
 		m.selective = mathrandv2.IntN(2) == 0
+		if mathrandv2.IntN(4) == 0 {
+			missingContractId := randId()
+			m.missingContractId = &missingContractId
+		}
+		m.compactContractRecovery = mathrandv2.IntN(2) == 0
 		switch mathrandv2.IntN(3) {
 		case 0:
 			m.tagSendTime = mathrandv2.Uint64()
@@ -644,10 +662,12 @@ func TestDecodeTransferFrameEdgeCases(t *testing.T) {
 			TransferPath: TransferPath{DestinationId: idA, SourceId: idB}.ToProtobuf(),
 			MessageType:  &mtAck,
 			Ack: &protocol.Ack{
-				MessageId:  idC.Bytes(),
-				SequenceId: idA.Bytes(),
-				Selective:  true,
-				Tag:        &protocol.Tag{SendTime: 7},
+				MessageId:               idC.Bytes(),
+				SequenceId:              idA.Bytes(),
+				Selective:               true,
+				Tag:                     &protocol.Tag{SendTime: 7},
+				MissingContractId:       idB.Bytes(),
+				CompactContractRecovery: true,
 			},
 		},
 		{
@@ -743,10 +763,14 @@ func TestDecodeTransferFrameRandomized(t *testing.T) {
 			mt := protocol.MessageType_TransferAck
 			ref.MessageType = &mt
 			ref.Ack = &protocol.Ack{
-				MessageId:  randId().Bytes(),
-				SequenceId: randId().Bytes(),
-				Selective:  mathrandv2.IntN(2) == 0,
-				Tag:        randTag(),
+				MessageId:               randId().Bytes(),
+				SequenceId:              randId().Bytes(),
+				Selective:               mathrandv2.IntN(2) == 0,
+				Tag:                     randTag(),
+				CompactContractRecovery: mathrandv2.IntN(2) == 0,
+			}
+			if mathrandv2.IntN(3) == 0 {
+				ref.Ack.MissingContractId = randId().Bytes()
 			}
 		case 2: // encrypted
 			ref.EncryptedTransferFrame = randBytes(64)
@@ -974,11 +998,19 @@ func TestDecodedPackOwnerPoolRetentionIsBounded(t *testing.T) {
 }
 
 func TestOwnedPackDecodeSteadyStateAllocs(t *testing.T) {
+	frames := make([]*protocol.Frame, sendPackBatchMaxFrames)
+	for i := range frames {
+		frames[i] = &protocol.Frame{
+			MessageType:  protocol.MessageType_IpIpPacketFromProvider,
+			MessageBytes: make([]byte, 64),
+			Raw:          true,
+		}
+	}
 	m := &sendPackFrame{
 		path:        TransferPath{DestinationId: NewId(), SourceId: NewId()},
 		messageId:   NewId(),
 		sequenceId:  NewId(),
-		frames:      []*protocol.Frame{{MessageType: protocol.MessageType_IpIpPacketFromProvider, MessageBytes: make([]byte, 1400), Raw: true}},
+		frames:      frames,
 		tagSendTime: 1,
 	}
 	encoded := marshalSendPackTransferFrame(m)
@@ -991,7 +1023,7 @@ func TestOwnedPackDecodeSteadyStateAllocs(t *testing.T) {
 		}
 		inboundDecodedTransferFrames.put(decoded)
 	})
-	t.Logf("owned pack decode steady-state allocations: %.2f", allocs)
+	t.Logf("owned %d-frame pack decode steady-state allocations: %.2f", len(frames), allocs)
 	if allocs != 0 {
 		t.Fatalf("owned pack decode allocated %.2f times per packet, want 0", allocs)
 	}

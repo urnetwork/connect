@@ -291,6 +291,470 @@ func TestControlSyncRetriesAfterAckFailure(t *testing.T) {
 	}
 }
 
+// Builds inert in-flight state for deterministic selective-ACK scheduling
+// tests. No goroutine or wall-clock timer participates in these assertions.
+func newSelectiveAckRecoveryTestSequence(
+	itemCount int,
+	sendTime time.Time,
+) (*SendSequence, []*sendItem) {
+	settings := DefaultSendBufferSettings()
+	sequence := &SendSequence{
+		sendBufferSettings: settings,
+		resendQueue:        newResendQueue(nil, 0),
+		rttWindow: NewRttWindow(
+			NewNoopLogger(),
+			settings.RttWindowSize,
+			settings.RttWindowTimeout,
+			settings.RttScale,
+			settings.MinResendInterval,
+			settings.RttMinResendInterval,
+			settings.MaxResendInterval,
+		),
+	}
+	items := make([]*sendItem, 0, itemCount)
+	for i := range itemCount {
+		item := &sendItem{
+			transferItem: transferItem{
+				messageId:      NewId(),
+				sequenceNumber: uint64(i),
+			},
+			sendTime:           sendTime,
+			resendTime:         sendTime.Add(settings.SelectiveAckTimeout),
+			sendCount:          1,
+			transferFrameBytes: []byte{byte(i)},
+		}
+		items = append(items, item)
+		sequence.sendItems = append(sequence.sendItems, item)
+		sequence.resendQueue.Add(item)
+	}
+	return sequence, items
+}
+
+// Three distinct later selective ACKs are receiver evidence for every earlier
+// hole. One ACK round may release a bounded scoreboard of such holes instead of
+// serializing each loss behind another full RTT.
+func TestSelectiveAckGapSchedulesBoundedMissingPacks(t *testing.T) {
+	sendTime := time.Unix(1_700_000_000, 0)
+	currentTime := sendTime.Add(100 * time.Millisecond)
+	sequence, items := newSelectiveAckRecoveryTestSequence(8, sendTime)
+	for _, index := range []int{1, 2, 3, 5, 6, 7} {
+		items[index].selectiveAcked = true
+	}
+
+	sequence.scheduleSelectiveAckRecovery(currentTime)
+
+	if items[0].resendTime != currentTime {
+		t.Fatalf("earliest gap resend time = %s, want %s", items[0].resendTime, currentTime)
+	}
+	if !items[0].selectiveGapRecovered || items[0].recoveryKind != sendRecoverySelectiveGap {
+		t.Fatal("earliest gap was not marked as one bounded selective recovery")
+	}
+	if items[4].resendTime != currentTime ||
+		items[4].recoveryKind != sendRecoverySelectiveGap {
+		t.Fatal("a second receiver-proven gap was serialized behind another RTT")
+	}
+	if first := sequence.resendQueue.PeekFirst(); first.resendTime != currentTime ||
+		first.recoveryKind != sendRecoverySelectiveGap {
+		t.Fatal("selective recovery items are not first in the resend queue")
+	}
+}
+
+// A selective scoreboard never releases the whole missing window at once. The
+// configured burst cap leaves later holes on their ordinary timers until ACK
+// progress opens another recovery round.
+func TestSelectiveAckGapRecoveryHonorsBurstBound(t *testing.T) {
+	sendTime := time.Unix(1_700_000_000, 0)
+	currentTime := sendTime.Add(100 * time.Millisecond)
+	sequence, items := newSelectiveAckRecoveryTestSequence(10, sendTime)
+	for i := 5; i < len(items); i += 1 {
+		items[i].selectiveAcked = true
+	}
+
+	sequence.scheduleSelectiveAckRecovery(currentTime)
+
+	for i := 0; i < sequence.sendBufferSettings.SelectiveAckGapBurstSize; i += 1 {
+		if items[i].resendTime != currentTime ||
+			items[i].recoveryKind != sendRecoverySelectiveGap {
+			t.Fatalf("proven gap %d was not released inside the burst", i)
+		}
+	}
+	boundedItem := items[sequence.sendBufferSettings.SelectiveAckGapBurstSize]
+	if boundedItem.resendTime != sendTime.Add(sequence.sendBufferSettings.SelectiveAckTimeout) ||
+		boundedItem.recoveryKind != sendRecoveryNone {
+		t.Fatal("selective gap recovery exceeded its burst bound")
+	}
+}
+
+// One or two later deliveries are plausible packet reordering and must not
+// trigger a fast retransmit. The production default deliberately requires
+// three distinct selectively acknowledged Packs.
+func TestSelectiveAckGapRequiresThreeDistinctLaterPacks(t *testing.T) {
+	if threshold := DefaultSendBufferSettings().SelectiveAckGapThreshold; threshold != 3 {
+		t.Fatalf("default selective gap threshold = %d, want 3", threshold)
+	}
+	if burstSize := DefaultSendBufferSettings().SelectiveAckGapBurstSize; burstSize != 4 {
+		t.Fatalf("default selective gap burst size = %d, want 4", burstSize)
+	}
+	if limit := DefaultSendBufferSettings().AckTailProbeLimit; limit != 2 {
+		t.Fatalf("default ACK tail probe limit = %d, want 2", limit)
+	}
+	sendTime := time.Unix(1_700_000_000, 0)
+	for _, selectiveAckCount := range []int{1, 2} {
+		sequence, items := newSelectiveAckRecoveryTestSequence(4, sendTime)
+		sequence.sendBufferSettings.AckTailProbeLimit = 0
+		for i := 1; i <= selectiveAckCount; i += 1 {
+			items[i].selectiveAcked = true
+		}
+		originalResendTime := items[0].resendTime
+
+		sequence.scheduleSelectiveAckRecovery(sendTime.Add(time.Second))
+
+		if items[0].resendTime != originalResendTime ||
+			items[0].selectiveGapRecovered || items[0].recoveryKind != sendRecoveryNone {
+			t.Fatalf("%d later selective ACK(s) triggered gap recovery", selectiveAckCount)
+		}
+	}
+}
+
+// Cumulative progress with too few later ACKs to prove a gap is the tail-loss
+// case. Only the oldest remaining Pack gets a bounded pair of delayed probes,
+// and the delay uses minimum path RTT rather than a serialization-queue-inflated
+// mean.
+func TestAckTailProbeUsesMinimumRttAndSchedulesOnePack(t *testing.T) {
+	sendTime := time.Unix(1_700_000_000, 0)
+	currentTime := sendTime.Add(300 * time.Millisecond)
+	sequence, items := newSelectiveAckRecoveryTestSequence(4, sendTime)
+	sequence.selectiveGapRecoveryActive = true
+	sequence.rttWindow.closeSendTime(
+		uint64(sendTime.Add(-250*time.Millisecond).UnixMilli()),
+		sendTime,
+	)
+	sequence.rttWindow.closeSendTime(
+		uint64(sendTime.Add(-2250*time.Millisecond).UnixMilli()),
+		sendTime,
+	)
+
+	sequence.scheduleSelectiveAckRecovery(currentTime)
+
+	expectedProbeTime := currentTime.Add(500 * time.Millisecond)
+	if items[0].resendTime != expectedProbeTime {
+		t.Fatalf("tail probe time = %s, want minimum-RTT time %s", items[0].resendTime, expectedProbeTime)
+	}
+	if items[0].ackTailProbeCount != 1 || items[0].recoveryKind != sendRecoveryAckTailProbe {
+		t.Fatal("oldest remaining Pack was not marked for one tail probe")
+	}
+	for i := 1; i < len(items); i += 1 {
+		if items[i].resendTime != sendTime.Add(sequence.sendBufferSettings.SelectiveAckTimeout) {
+			t.Fatalf("remaining Pack %d was also tail-probed", i)
+		}
+	}
+
+	sequence.scheduleSelectiveAckRecovery(currentTime.Add(100 * time.Millisecond))
+	if items[0].resendTime != expectedProbeTime {
+		t.Fatal("ACK progress moved a tail probe that was already pending")
+	}
+
+	removed := sequence.resendQueue.RemoveByMessageId(items[0].messageId)
+	if removed != items[0] {
+		t.Fatal("missing first tail probe item")
+	}
+	items[0].recoveryKind = sendRecoveryNone
+	items[0].resendTime = expectedProbeTime.Add(5 * time.Second)
+	sequence.resendQueue.Add(items[0])
+	secondProgressTime := expectedProbeTime.Add(100 * time.Millisecond)
+	sequence.scheduleSelectiveAckRecovery(secondProgressTime)
+	secondProbeTime := secondProgressTime.Add(500 * time.Millisecond)
+	if items[0].resendTime != secondProbeTime || items[0].ackTailProbeCount != 2 {
+		t.Fatalf("second tail probe = %s/count %d, want %s/count 2", items[0].resendTime, items[0].ackTailProbeCount, secondProbeTime)
+	}
+
+	removed = sequence.resendQueue.RemoveByMessageId(items[0].messageId)
+	if removed != items[0] {
+		t.Fatal("missing second tail probe item")
+	}
+	items[0].recoveryKind = sendRecoveryNone
+	items[0].resendTime = secondProbeTime.Add(5 * time.Second)
+	sequence.resendQueue.Add(items[0])
+	sequence.scheduleSelectiveAckRecovery(secondProbeTime.Add(100 * time.Millisecond))
+	if items[0].resendTime != secondProbeTime.Add(5*time.Second) || items[0].ackTailProbeCount != 2 {
+		t.Fatal("tail probing exceeded its two-attempt bound")
+	}
+}
+
+// Ordinary cumulative progress on a reliable ordered carrier is not loss
+// evidence. Tail probing stays dormant until this sequence has observed a
+// threshold-qualified selective gap.
+func TestAckTailProbeRequiresSelectiveGapEvidence(t *testing.T) {
+	sendTime := time.Unix(1_700_000_000, 0)
+	sequence, items := newSelectiveAckRecoveryTestSequence(2, sendTime)
+	originalResendTime := items[0].resendTime
+	sequence.rttWindow.closeSendTime(
+		uint64(sendTime.Add(-250*time.Millisecond).UnixMilli()),
+		sendTime,
+	)
+
+	sequence.scheduleSelectiveAckRecovery(sendTime.Add(300 * time.Millisecond))
+
+	if items[0].resendTime != originalResendTime ||
+		items[0].ackTailProbeCount != 0 || items[0].recoveryKind != sendRecoveryNone {
+		t.Fatal("cumulative progress without a selective gap triggered a tail probe")
+	}
+}
+
+// Repeated ACK snapshots retain the same later-delivery evidence. They must
+// not repeatedly release one missing Pack and recreate a sender-side storm.
+func TestSelectiveAckGapRecoveryIsOncePerMissingPack(t *testing.T) {
+	sendTime := time.Unix(1_700_000_000, 0)
+	firstRecoveryTime := sendTime.Add(100 * time.Millisecond)
+	sequence, items := newSelectiveAckRecoveryTestSequence(4, sendTime)
+	for i := 1; i < len(items); i += 1 {
+		items[i].selectiveAcked = true
+	}
+	sequence.scheduleSelectiveAckRecovery(firstRecoveryTime)
+
+	removed := sequence.resendQueue.RemoveByMessageId(items[0].messageId)
+	if removed != items[0] {
+		t.Fatal("missing scheduled gap item")
+	}
+	items[0].recoveryKind = sendRecoveryNone
+	items[0].resendTime = firstRecoveryTime.Add(2 * time.Second)
+	sequence.resendQueue.Add(items[0])
+
+	sequence.scheduleSelectiveAckRecovery(firstRecoveryTime.Add(10 * time.Millisecond))
+
+	if items[0].resendTime != firstRecoveryTime.Add(2*time.Second) {
+		t.Fatal("the same gap received more than one immediate recovery")
+	}
+	if items[0].recoveryKind != sendRecoveryNone {
+		t.Fatal("repeated selective evidence re-armed immediate recovery")
+	}
+}
+
+// A fast gap retransmit can itself be lost on a saturated uplink. Continued ACK
+// progress may shorten its queue-inflated ordinary RTO once, but only with a
+// minimum-RTT-delayed tail probe—not another immediate fast retransmit.
+func TestSelectiveAckGapRecoveryAllowsOnePacedFollowup(t *testing.T) {
+	sendTime := time.Unix(1_700_000_000, 0)
+	firstRecoveryTime := sendTime.Add(100 * time.Millisecond)
+	sequence, items := newSelectiveAckRecoveryTestSequence(4, sendTime)
+	for i := 1; i < len(items); i += 1 {
+		items[i].selectiveAcked = true
+	}
+	sequence.scheduleSelectiveAckRecovery(firstRecoveryTime)
+
+	removed := sequence.resendQueue.RemoveByMessageId(items[0].messageId)
+	if removed != items[0] {
+		t.Fatal("missing fast gap recovery item")
+	}
+	items[0].recoveryKind = sendRecoveryNone
+	items[0].resendTime = firstRecoveryTime.Add(5 * time.Second)
+	sequence.resendQueue.Add(items[0])
+	sequence.rttWindow.closeSendTime(
+		uint64(firstRecoveryTime.Add(-250*time.Millisecond).UnixMilli()),
+		firstRecoveryTime,
+	)
+	sequence.rttWindow.closeSendTime(
+		uint64(firstRecoveryTime.Add(-2250*time.Millisecond).UnixMilli()),
+		firstRecoveryTime,
+	)
+
+	ackProgressTime := firstRecoveryTime.Add(100 * time.Millisecond)
+	sequence.scheduleSelectiveAckRecovery(ackProgressTime)
+
+	expectedProbeTime := ackProgressTime.Add(500 * time.Millisecond)
+	if items[0].resendTime != expectedProbeTime {
+		t.Fatalf("paced follow-up time = %s, want %s", items[0].resendTime, expectedProbeTime)
+	}
+	if items[0].ackTailProbeCount != 1 || items[0].recoveryKind != sendRecoveryAckTailProbe {
+		t.Fatal("lost fast gap recovery did not receive one paced follow-up")
+	}
+
+	sequence.scheduleSelectiveAckRecovery(ackProgressTime.Add(100 * time.Millisecond))
+	if items[0].resendTime != expectedProbeTime {
+		t.Fatal("ACK progress moved a paced follow-up that was already pending")
+	}
+}
+
+// A written gap recovery gets one conservative fallback without waiting for a
+// new ACK edge. It is delayed by one minimum probe interval so a successful
+// gap write can be acknowledged before any duplicate enters QUIC.
+func TestSelectiveGapWriteSchedulesOneConservativeProbe(t *testing.T) {
+	sendTime := time.Unix(1_700_000_000, 0)
+	sequence, items := newSelectiveAckRecoveryTestSequence(1, sendTime)
+	item := sequence.resendQueue.RemoveByMessageId(items[0].messageId)
+	if item != items[0] {
+		t.Fatal("missing gap recovery item")
+	}
+	sequence.rttWindow.closeSendTime(
+		uint64(sendTime.Add(-250*time.Millisecond).UnixMilli()),
+		sendTime,
+	)
+	sequence.rttWindow.closeSendTime(
+		uint64(sendTime.Add(-2250*time.Millisecond).UnixMilli()),
+		sendTime,
+	)
+	ackDeadline := sendTime.Add(time.Minute)
+
+	if !sequence.scheduleGapRecoveryProbe(item, sendTime, ackDeadline) {
+		t.Fatal("gap recovery did not schedule its conservative fallback")
+	}
+	expectedProbeTime := sendTime.Add(500 * time.Millisecond)
+	if item.resendTime != expectedProbeTime || item.ackTailProbeCount != 1 ||
+		item.recoveryKind != sendRecoveryAckTailProbe || !item.gapFollowupScheduled {
+		t.Fatalf("gap fallback = %s/count %d/kind %d", item.resendTime, item.ackTailProbeCount, item.recoveryKind)
+	}
+	if sequence.scheduleGapRecoveryProbe(item, expectedProbeTime, ackDeadline) {
+		t.Fatal("one gap write scheduled more than one automatic fallback")
+	}
+}
+
+// When every outstanding Pack was selectively acknowledged, data is already
+// present and the missing state is the cumulative ACK. Probe only the oldest
+// item at the measured RTT cadence, rather than waiting for the maximum resend
+// interval or duplicating the entire window.
+func TestSelectiveAckCumulativeProbeUsesMeasuredRtt(t *testing.T) {
+	sendTime := time.Unix(1_700_000_000, 0)
+	sequence, items := newSelectiveAckRecoveryTestSequence(4, sendTime)
+	for _, item := range items {
+		item.selectiveAcked = true
+	}
+	sequence.rttWindow.closeSendTime(
+		uint64(sendTime.Add(-250*time.Millisecond).UnixMilli()),
+		sendTime,
+	)
+
+	sequence.scheduleSelectiveAckRecovery(sendTime)
+
+	expectedProbeTime := sendTime.Add(500 * time.Millisecond)
+	if items[0].resendTime != expectedProbeTime {
+		t.Fatalf("cumulative ACK probe time = %s, want sampled RTT time %s", items[0].resendTime, expectedProbeTime)
+	}
+	if items[0].recoveryKind != sendRecoveryCumulativeProbe {
+		t.Fatal("oldest selectively acknowledged item was not marked as the probe")
+	}
+	for i := 1; i < len(items); i += 1 {
+		if items[i].resendTime != sendTime.Add(sequence.sendBufferSettings.SelectiveAckTimeout) {
+			t.Fatalf("selectively acknowledged item %d was also scheduled", i)
+		}
+	}
+
+	sequence.scheduleSelectiveAckRecovery(sendTime.Add(100 * time.Millisecond))
+	if items[0].resendTime != expectedProbeTime {
+		t.Fatal("re-reading the same ACK evidence moved the existing probe")
+	}
+}
+
+// The real SendSequence must apply the scheduler after ACK-window coalescing,
+// not merely pass its isolated state tests. Four separately observed Packs and
+// three explicit later selective ACKs force retransmission of the first Pack
+// while its ordinary timeout is one hour away.
+func TestSelectiveAckGapRecoversEarliestMissingPackEndToEnd(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	settings := DefaultClientSettings()
+	settings.EncryptionSettings.Mode = EncryptionModeOff
+	settings.SendBufferSettings.MinResendInterval = time.Hour
+	settings.SendBufferSettings.RttMinResendInterval = time.Hour
+	settings.SendBufferSettings.MaxResendInterval = time.Hour
+	settings.SendBufferSettings.AckTimeout = 2 * time.Hour
+	settings.SendBufferSettings.SelectiveAckTimeout = 2 * time.Hour
+	settings.SendBufferSettings.SelectiveAckGapThreshold = 3
+
+	peerId := NewId()
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+	defer client.Cancel()
+	client.ContractManager().AddNoContractPeer(peerId)
+
+	toPeer := make(chan []byte, 64)
+	client.RouteManager().UpdateTransport(
+		NewSendClientTransport(DestinationId(peerId)),
+		[]Route{toPeer},
+	)
+	fromPeer := make(chan []byte, 64)
+	client.RouteManager().UpdateTransport(NewReceiveGatewayTransport(), []Route{fromPeer})
+
+	readPack := func(timeout time.Duration) *protocol.Pack {
+		for {
+			select {
+			case transferFrameBytes := <-toPeer:
+				var transferFrame protocol.TransferFrame
+				err := proto.Unmarshal(transferFrameBytes, &transferFrame)
+				MessagePoolReturn(transferFrameBytes)
+				if err != nil {
+					continue
+				}
+				if transferFrame.Pack != nil {
+					return transferFrame.Pack
+				}
+				frame := transferFrame.GetFrame()
+				if frame == nil || frame.GetMessageType() != protocol.MessageType_TransferPack {
+					continue
+				}
+				pack := &protocol.Pack{}
+				if err := proto.Unmarshal(frame.MessageBytes, pack); err == nil {
+					return pack
+				}
+			case <-time.After(timeout):
+				return nil
+			}
+		}
+	}
+
+	initialPacks := make([]*protocol.Pack, 0, 4)
+	for i := range 4 {
+		frame := &protocol.Frame{
+			MessageType:  protocol.MessageType_TransferExchangeSignals,
+			MessageBytes: []byte(fmt.Sprintf("selective-gap-%d", i)),
+		}
+		if !client.SendWithTimeout(frame, peerId, nil, 5*time.Second) {
+			t.Fatalf("send %d failed", i)
+		}
+		pack := readPack(20 * time.Second)
+		if pack == nil {
+			t.Fatalf("no initial Pack %d", i)
+		}
+		initialPacks = append(initialPacks, pack)
+	}
+
+	for _, pack := range initialPacks[1:] {
+		ackBytes, err := proto.Marshal(&protocol.TransferFrame{
+			TransferPath: TransferPath{
+				SourceId:      peerId,
+				DestinationId: client.ClientId(),
+			}.ToProtobuf(),
+			Ack: &protocol.Ack{
+				MessageId:  pack.MessageId,
+				SequenceId: pack.SequenceId,
+				Selective:  true,
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case fromPeer <- ackBytes:
+		case <-time.After(5 * time.Second):
+			t.Fatal("could not deliver selective ACK")
+		}
+	}
+
+	recoveryPack := readPack(20 * time.Second)
+	if recoveryPack == nil {
+		t.Fatal("three later selective ACKs did not recover the earliest gap")
+	}
+	if string(recoveryPack.MessageId) != string(initialPacks[0].MessageId) ||
+		recoveryPack.SequenceNumber != initialPacks[0].SequenceNumber {
+		t.Fatalf(
+			"recovered Pack = %d/%x, want earliest %d/%x",
+			recoveryPack.SequenceNumber,
+			recoveryPack.MessageId,
+			initialPacks[0].SequenceNumber,
+			initialPacks[0].MessageId,
+		)
+	}
+}
+
 // TestSelectiveAckPauseKeepsAProbeScheduled covers the selective-ack pause
 // probe.
 //

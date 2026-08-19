@@ -138,13 +138,7 @@ func testMultiClientGenerator(providerClient *Client) *TestMultiClientGenerator 
 			}
 		},
 		newClientSettings: func() *ClientSettings {
-			settings := DefaultClientSettings()
-			settings.SendBufferSettings.SequenceBufferSize = 0
-			settings.SendBufferSettings.AckBufferSize = 0
-			settings.ReceiveBufferSettings.SequenceBufferSize = 0
-			// settings.ReceiveBufferSettings.AckBufferSize = 0
-			settings.ForwardBufferSettings.SequenceBufferSize = 0
-			return settings
+			return DefaultClientSettingsWithBufferSize(testClientTransferBufferSize)
 		},
 		newClient: func(ctx context.Context, args *MultiClientGeneratorClientArgs, clientSettings *ClientSettings) (*Client, error) {
 			client := NewClient(ctx, args.ClientId, NewNoContractClientOob(), clientSettings)
@@ -190,6 +184,16 @@ func testingNewMultiClient(ctx context.Context, providerClient *Client, receiveP
 	settings := DefaultMultiClientSettings()
 	// TODO the tcp packets must use real seq numbers for this to work
 	settings.TcpCollapsePrevention = false
+	// testClient is a Transfer/routing stress fixture: it deliberately creates
+	// 48 long-lived tuples behind one synthetic exit and later verifies every
+	// payload and echo. Keep lifecycle policy out of that contract. Production
+	// defaults cap exits and reap idle UDP flows (with an ICMP teardown), which
+	// dedicated flow-cap and flow-reaper tests cover; allowing either here turns
+	// an expected policy action into a packet the echo-only callback cannot parse.
+	settings.MaxFlowsPerExit = 0
+	settings.SequenceIdleTimeout = time.Hour
+	settings.TcpSequenceIdleTimeout = time.Hour
+	settings.UdpTeardownSignal = false
 
 	multiClient := NewRemoteUserNatMultiClient(
 		ctx,
@@ -278,7 +282,7 @@ func TestMultiClientChannelWindowStats(t *testing.T) {
 		},
 	}
 
-	clientReceivePacket := func(client *multiClientChannel, source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
+	clientReceivePacket := func(client *multiClientChannel, source TransferPath, provideMode protocol.ProvideMode, transportType TransportType, ipPath *IpPath, packet []byte) {
 		// Do nothing
 	}
 

@@ -124,6 +124,7 @@ func TestMultiClientCommittedIngressUsesOwnedFlowPathWithoutAllocating(t *testin
 			sourceClient,
 			TransferPath{},
 			protocol.ProvideMode_Network,
+			TransportTypeUnknown,
 			&inbound,
 			inboundPacket,
 		)

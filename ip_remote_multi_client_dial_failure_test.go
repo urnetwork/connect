@@ -323,7 +323,7 @@ func TestChannelInterceptDoesNotBumpReceiveCounters(t *testing.T) {
 		args:        &multiClientChannelArgs{},
 		settings:    DefaultMultiClientSettings(),
 		packetStats: &clientWindowStats{log: DefaultLogger()},
-		clientReceivePacketCallback: func(client *multiClientChannel, source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
+		clientReceivePacketCallback: func(client *multiClientChannel, source TransferPath, provideMode protocol.ProvideMode, transportType TransportType, ipPath *IpPath, packet []byte) {
 		},
 		dialFailureCallback: func(sourceClient *multiClientChannel, egressIpPath *IpPath) bool {
 			gotClient = sourceClient

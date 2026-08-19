@@ -226,11 +226,9 @@ func TestTransportModeNoneIsWorst(t *testing.T) {
 	}
 }
 
-// TestTransportModeTiers pins the two-tier preference: the direct modes (h3, h1)
-// are equally preferred, and the packet translation modes (h3dns, h3dnspump) are
-// an availability fallback below them, equally preferred among themselves. The
-// table previously had the tiers inverted, making h3dnspump the most preferred
-// mode of all.
+// TestTransportModeTiers pins the three-tier production preference: the direct
+// modes (h3, h1) tie and remain live together, h3dns is the first availability
+// fallback, and h3dnspump is the final fallback.
 func TestTransportModeTiers(t *testing.T) {
 	direct := []TransportMode{TransportModeH3, TransportModeH1}
 	translation := []TransportMode{TransportModeH3Dns, TransportModeH3DnsPump}
@@ -246,15 +244,51 @@ func TestTransportModeTiers(t *testing.T) {
 			}
 		}
 	}
-	// within a tier nothing is strictly better, so neither preempts the other
-	for _, tier := range [][]TransportMode{direct, translation} {
-		for _, a := range tier {
-			for _, b := range tier {
-				if isBetterMode(a, b) {
-					t.Errorf("%q is better than %q: modes in a tier must tie", a, b)
-				}
+	// within the direct tier nothing is strictly better, so neither preempts
+	// the other and both healthy routes remain registered
+	for _, a := range direct {
+		for _, b := range direct {
+			if isBetterMode(a, b) {
+				t.Errorf("%q is better than %q: direct modes must tie", a, b)
 			}
 		}
+	}
+	if !isBetterMode(TransportModeH3Dns, TransportModeH3DnsPump) {
+		t.Error("h3dns must outrank h3dnspump")
+	}
+	if isBetterMode(TransportModeH3DnsPump, TransportModeH3Dns) {
+		t.Error("h3dnspump must not outrank h3dns")
+	}
+}
+
+// TestPlatformTransportCustomModePreferences verifies that Auto can enable a
+// subset and that equal custom priorities retain the same coexistence rule.
+func TestPlatformTransportCustomModePreferences(t *testing.T) {
+	transport := testingPlatformTransportModes()
+	transport.settings = DefaultPlatformTransportSettings()
+	transport.settings.ModeInitialDelay = 250 * time.Millisecond
+	transport.modePreferences = normalizeTransportModePreferences(map[TransportMode]int{
+		TransportModeH3:        10,
+		TransportModeH1:        10,
+		TransportModeH3DnsPump: 100,
+	})
+
+	wantOrder := []TransportMode{TransportModeH1, TransportModeH3, TransportModeH3DnsPump}
+	if got := transport.orderedModes(); !slices.Equal(got, wantOrder) {
+		t.Fatalf("ordered modes = %v, want %v", got, wantOrder)
+	}
+	if standDown, _ := transport.standDown(TransportModeH1); standDown {
+		t.Fatal("h1 stood down at startup")
+	}
+	transport.setActiveMode(TransportModeH3)
+	if standDown, _ := transport.standDown(TransportModeH1); standDown {
+		t.Fatal("equal-priority h1 stood down for h3")
+	}
+	if delay := transport.modeInitialDelay(TransportModeH3); delay != 0 {
+		t.Fatalf("h3 delay = %s, want 0", delay)
+	}
+	if delay := transport.modeInitialDelay(TransportModeH3DnsPump); delay != 250*time.Millisecond {
+		t.Fatalf("h3dnspump delay = %s, want one tier interval", delay)
 	}
 }
 

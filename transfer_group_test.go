@@ -646,12 +646,12 @@ func TestSendMultiHopGroupCloseJoinsMaterializedAndPendingChunks(t *testing.T) {
 
 func TestNextSendGroupChunkEndUsesCompatibilityBounds(t *testing.T) {
 	frames := []*protocol.Frame{
-		{MessageBytes: make([]byte, 1600)},
-		{MessageBytes: make([]byte, 1600)},
+		{MessageBytes: make([]byte, int(sendPackBatchMaxMessageByteCount)+1)},
+		{MessageBytes: make([]byte, int(sendPackBatchMaxMessageByteCount)-64)},
 		{MessageBytes: make([]byte, 64)},
 	}
 	if end := nextSendGroupChunkEnd(frames, 0); end != 1 {
-		t.Fatalf("3 KiB payload bound first chunk end=%d, want 1", end)
+		t.Fatalf("payload bound first chunk end=%d, want 1", end)
 	}
 	if end := nextSendGroupChunkEnd(frames, 1); end != 3 {
 		t.Fatalf("2-frame compatibility bound second chunk end=%d, want 3", end)

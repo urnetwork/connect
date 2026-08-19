@@ -153,7 +153,7 @@ func TestProbeSynAckCompletesAndIsNotForwarded(t *testing.T) {
 	egress := update.probe.ipPath
 	ingressPath, packet := probeTestSynAck(t, egress, 0x5150)
 
-	parent.clientReceivePacket(client, TransferPath{}, protocol.ProvideMode_Public, ingressPath, packet)
+	parent.clientReceivePacket(client, TransferPath{}, protocol.ProvideMode_Public, TransportTypeUnknown, ingressPath, packet)
 
 	var result probeResult
 	select {
@@ -218,7 +218,7 @@ func TestProbeRstIsNotAnAnswer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	parent.clientReceivePacket(client, TransferPath{}, protocol.ProvideMode_Public, ingressPath, rstPacket)
+	parent.clientReceivePacket(client, TransferPath{}, protocol.ProvideMode_Public, TransportTypeUnknown, ingressPath, rstPacket)
 
 	var result probeResult
 	select {
@@ -267,7 +267,7 @@ func TestProbeDnsAnswerPasses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	parent.clientReceivePacket(client, TransferPath{}, protocol.ProvideMode_Public, ingressPath, answer)
+	parent.clientReceivePacket(client, TransferPath{}, protocol.ProvideMode_Public, TransportTypeUnknown, ingressPath, answer)
 
 	var result probeResult
 	select {
@@ -338,7 +338,7 @@ func TestProbeLateAnswerIsConsumedNotForwarded(t *testing.T) {
 		DestinationPort: target.Port,
 	}
 	ingressPath, packet := probeTestSynAck(t, egress, 0x5150)
-	parent.clientReceivePacket(client, TransferPath{}, protocol.ProvideMode_Public, ingressPath, packet)
+	parent.clientReceivePacket(client, TransferPath{}, protocol.ProvideMode_Public, TransportTypeUnknown, ingressPath, packet)
 
 	if n := len(*forwarded); n != 0 {
 		t.Errorf("a late probe answer was forwarded to the application (%d packet(s))", n)

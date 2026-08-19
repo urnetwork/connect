@@ -2,6 +2,7 @@ package connect
 
 import (
 	"context"
+	"maps"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -342,5 +343,75 @@ func TestApiWindowTransportCreationCloseJoinsHeldMigrationCreator(t *testing.T) 
 	case <-lateCreation:
 		t.Fatal("migration created a transport after generator close")
 	default:
+	}
+}
+
+// A runtime Device policy change replaces every live window
+// make-before-break and preserves equal Auto priorities in the concrete
+// PlatformTransport settings used for the replacement.
+func TestApiWindowTransportPolicyChangeIsLiveAndMakeBeforeBreak(t *testing.T) {
+	client, _ := newApiMigrationTestClient(t)
+	old := newFakeWindowPlatformTransport(true)
+	next := newFakeWindowPlatformTransport(false)
+	createdSettings := make(chan *PlatformTransportSettings, 1)
+	state := &apiWindowClientTransport{
+		current:       old,
+		settings:      DefaultPlatformTransportSettings(),
+		auth:          ClientAuth{InstanceId: NewId()},
+		policyVersion: 1,
+	}
+	generator := &ApiMultiClientGenerator{
+		settings:                   DefaultApiMultiClientGeneratorSettings(),
+		platformTransportMode:      TransportModeH1,
+		platformTransportPolicyVer: 1,
+		transports:                 map[*Client]*apiWindowClientTransport{client: state},
+		newPlatformTransport: func(
+			client *Client,
+			auth *ClientAuth,
+			settings *PlatformTransportSettings,
+		) apiWindowPlatformTransport {
+			createdSettings <- settings
+			return next
+		},
+	}
+
+	preferences := map[TransportMode]int{
+		TransportModeH3:        1,
+		TransportModeH1:        1,
+		TransportModeH3Dns:     2,
+		TransportModeH3DnsPump: 3,
+	}
+	generator.SetPlatformTransportPolicy(TransportModeAuto, preferences)
+	var settings *PlatformTransportSettings
+	select {
+	case settings = <-createdSettings:
+	case <-time.After(time.Second):
+		t.Fatal("policy change did not construct a replacement")
+	}
+	if !maps.Equal(settings.ModePreferences, preferences) {
+		t.Fatalf("replacement preferences = %v, want %v", settings.ModePreferences, preferences)
+	}
+	select {
+	case <-old.closed:
+		t.Fatal("old transport closed before policy replacement connected")
+	default:
+	}
+
+	next.connect()
+	select {
+	case <-old.closed:
+	case <-time.After(time.Second):
+		t.Fatal("old transport was not closed after policy replacement connected")
+	}
+	if state.current != next {
+		t.Fatal("policy replacement was not installed")
+	}
+
+	// Canonically identical input is a no-op and cannot churn live routes.
+	generator.SetPlatformTransportPolicy(TransportModeAuto, maps.Clone(preferences))
+	select {
+	case <-createdSettings:
+		t.Fatal("identical policy constructed another replacement")
+	case <-time.After(50 * time.Millisecond):
 	}
 }

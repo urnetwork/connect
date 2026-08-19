@@ -2829,8 +2829,9 @@ type peerConn struct {
 	// Pion's offer/answer state machine is not safe to advance concurrently.
 	// Client signal sharding serializes a peer/stream in production, but this
 	// lock also protects direct SignalReceiver users and teardown races.
-	// Never call SignalSender while holding it: sends are intentional
-	// synchronous backpressure and can synchronously deliver the response.
+	// Never call SignalSender while holding it: sender-owned sends may apply
+	// synchronous backpressure and can synchronously deliver the response;
+	// receive/Pion-callback sends use the zero-timeout marker.
 	signalLock sync.Mutex
 	stateLock  sync.Mutex
 	conn       datachannel.ReadWriteCloserDeadliner
@@ -3360,9 +3361,9 @@ func (self *peerConn) receiveSignalFromPeerWithTransferKey(
 		}
 		return err
 	}
-	// These sends intentionally remain synchronous. Keeping them outside
-	// signalLock permits a synchronous answer/candidate response without a
-	// lock cycle while preserving transfer-client backpressure.
+	// Keep the immediate call outside signalLock so a synchronous response
+	// cannot form a lock cycle. The receive-originated transfer handoff itself
+	// is marked zero-timeout and drops under congestion.
 	if len(toSend) != 0 {
 		self.sendSignalsWithTransferKey(
 			toSend,
@@ -3759,11 +3760,14 @@ func (self *peerConn) handleLocalIceCandidate(candidate *webrtc.ICECandidate) {
 		}
 	}()
 	if send {
+		// Pion invokes this inline on its gathering path. It is a receive/event
+		// callback, so a full Transfer queue must drop the candidate rather than
+		// park Pion and its other associations (CODESTYLE.md).
 		self.sendIceCandidatesWithTransferKey(
 			[]*webrtc.ICECandidate{candidate},
 			transferKey,
 			transferKeySet,
-			false,
+			true,
 		)
 	}
 }

@@ -3,10 +3,33 @@ package connect
 import (
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	mathrand "math/rand"
 	"testing"
 )
+
+func TestMessagePoolReadAllLimit(t *testing.T) {
+	const limit = 8192
+
+	exact := bytes.Repeat([]byte{0x5a}, limit)
+	message, err := MessagePoolReadAllLimit(bytes.NewReader(exact), limit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(message, exact) {
+		t.Fatal("exact-limit message changed")
+	}
+	MessagePoolReturn(message)
+
+	message, err = MessagePoolReadAllLimit(bytes.NewReader(append(exact, 0x01)), limit)
+	if !errors.Is(err, ErrMessageTooLarge) {
+		t.Fatalf("oversized message error = %v, want %v", err, ErrMessageTooLarge)
+	}
+	if message != nil {
+		t.Fatal("oversized read returned a buffer")
+	}
+}
 
 func TestMessagePool(t *testing.T) {
 	ResetMessagePoolStats()

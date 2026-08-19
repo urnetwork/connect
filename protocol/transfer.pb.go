@@ -777,9 +777,18 @@ type Ack struct {
 	// all data buffered in the receiver is acked with `selective=true`. When released it is acked with `selective=false`
 	Selective bool `protobuf:"varint,3,opt,name=selective,proto3" json:"selective,omitempty"`
 	// from the `Pack` this responds to
-	Tag           *Tag `protobuf:"bytes,4,opt,name=tag,proto3,oneof" json:"tag,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Tag *Tag `protobuf:"bytes,4,opt,name=tag,proto3,oneof" json:"tag,omitempty"`
+	// The receiver could not resolve a compact Pack.contract_id from verified
+	// sequence state. This is a recovery request, not delivery acknowledgement:
+	// message_id remains pending until the sender retransmits a full contract.
+	// ulid
+	MissingContractId []byte `protobuf:"bytes,5,opt,name=missing_contract_id,json=missingContractId,proto3,oneof" json:"missing_contract_id,omitempty"`
+	// Advertises that this receiver can request a full contract when compact
+	// contract state is missing. A sender must not emit compact contract heads
+	// until a delivery Ack carries this capability; false is the legacy peer.
+	CompactContractRecovery bool `protobuf:"varint,6,opt,name=compact_contract_recovery,json=compactContractRecovery,proto3" json:"compact_contract_recovery,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *Ack) Reset() {
@@ -840,6 +849,20 @@ func (x *Ack) GetTag() *Tag {
 	return nil
 }
 
+func (x *Ack) GetMissingContractId() []byte {
+	if x != nil {
+		return x.MissingContractId
+	}
+	return nil
+}
+
+func (x *Ack) GetCompactContractRecovery() bool {
+	if x != nil {
+		return x.CompactContractRecovery
+	}
+	return false
+}
+
 type Tag struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	SendTime      uint64                 `protobuf:"varint,1,opt,name=send_time,json=sendTime,proto3" json:"send_time,omitempty"`
@@ -896,9 +919,16 @@ type Auth struct {
 	AppVersion string `protobuf:"bytes,2,opt,name=app_version,json=appVersion,proto3" json:"app_version,omitempty"`
 	// the pair (client_id, instance_id) represents a single in memory instance
 	// this helps the platform distinguish multiple instances from multiple transports of the same instance
-	InstanceId    []byte `protobuf:"bytes,3,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	InstanceId []byte `protobuf:"bytes,3,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
+	// offered only on the H3 control stream. Zero keeps the legacy reliable
+	// stream data path. An old server echoes this unknown field but cannot set
+	// the separate accepted field, which makes mixed-version fallback safe.
+	H3DatagramVersion uint32 `protobuf:"varint,4,opt,name=h3_datagram_version,json=h3DatagramVersion,proto3" json:"h3_datagram_version,omitempty"`
+	// set by the server only when it accepts the offered envelope version and
+	// both QUIC endpoints negotiated RFC 9221 DATAGRAM support.
+	H3DatagramAcceptedVersion uint32 `protobuf:"varint,5,opt,name=h3_datagram_accepted_version,json=h3DatagramAcceptedVersion,proto3" json:"h3_datagram_accepted_version,omitempty"`
+	unknownFields             protoimpl.UnknownFields
+	sizeCache                 protoimpl.SizeCache
 }
 
 func (x *Auth) Reset() {
@@ -950,6 +980,20 @@ func (x *Auth) GetInstanceId() []byte {
 		return x.InstanceId
 	}
 	return nil
+}
+
+func (x *Auth) GetH3DatagramVersion() uint32 {
+	if x != nil {
+		return x.H3DatagramVersion
+	}
+	return 0
+}
+
+func (x *Auth) GetH3DatagramAcceptedVersion() uint32 {
+	if x != nil {
+		return x.H3DatagramAcceptedVersion
+	}
+	return 0
 }
 
 type Provide struct {
@@ -2582,23 +2626,28 @@ const file_transfer_proto_rawDesc = "" +
 	"\f_contract_id\"_\n" +
 	"\fFilteredPack\x12<\n" +
 	"\x0econtract_frame\x18\a \x01(\v2\x10.bringyour.FrameH\x00R\rcontractFrame\x88\x01\x01B\x11\n" +
-	"\x0f_contract_frame\"\x92\x01\n" +
+	"\x0f_contract_frame\"\x9b\x02\n" +
 	"\x03Ack\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\x01 \x01(\fR\tmessageId\x12\x1f\n" +
 	"\vsequence_id\x18\x02 \x01(\fR\n" +
 	"sequenceId\x12\x1c\n" +
 	"\tselective\x18\x03 \x01(\bR\tselective\x12%\n" +
-	"\x03tag\x18\x04 \x01(\v2\x0e.bringyour.TagH\x00R\x03tag\x88\x01\x01B\x06\n" +
-	"\x04_tag\"\"\n" +
+	"\x03tag\x18\x04 \x01(\v2\x0e.bringyour.TagH\x00R\x03tag\x88\x01\x01\x123\n" +
+	"\x13missing_contract_id\x18\x05 \x01(\fH\x01R\x11missingContractId\x88\x01\x01\x12:\n" +
+	"\x19compact_contract_recovery\x18\x06 \x01(\bR\x17compactContractRecoveryB\x06\n" +
+	"\x04_tagB\x16\n" +
+	"\x14_missing_contract_id\"\"\n" +
 	"\x03Tag\x12\x1b\n" +
-	"\tsend_time\x18\x01 \x01(\x04R\bsendTime\"_\n" +
+	"\tsend_time\x18\x01 \x01(\x04R\bsendTime\"\xd0\x01\n" +
 	"\x04Auth\x12\x15\n" +
 	"\x06by_jwt\x18\x01 \x01(\tR\x05byJwt\x12\x1f\n" +
 	"\vapp_version\x18\x02 \x01(\tR\n" +
 	"appVersion\x12\x1f\n" +
 	"\vinstance_id\x18\x03 \x01(\fR\n" +
-	"instanceId\"4\n" +
+	"instanceId\x12.\n" +
+	"\x13h3_datagram_version\x18\x04 \x01(\rR\x11h3DatagramVersion\x12?\n" +
+	"\x1ch3_datagram_accepted_version\x18\x05 \x01(\rR\x19h3DatagramAcceptedVersion\"4\n" +
 	"\aProvide\x12)\n" +
 	"\x04keys\x18\x01 \x03(\v2\x15.bringyour.ProvideKeyR\x04keys\"f\n" +
 	"\n" +

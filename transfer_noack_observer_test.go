@@ -94,7 +94,10 @@ func TestNoAckSendObserverPairsCoalescedRouteWrite(t *testing.T) {
 		[]Route{route},
 	)
 
-	for _, content := range []string{"first", "second"} {
+	contents := []string{
+		"first", "second",
+	}
+	for _, content := range contents {
 		frame := RequireToFrameWithDefaultProtocolVersion(&protocol.SimpleMessage{Content: content})
 		if !client.SendWithTimeout(frame, destinationId, nil, time.Second, NoAck()) {
 			MessagePoolReturn(frame.MessageBytes)
@@ -106,12 +109,15 @@ func TestNoAckSendObserverPairsCoalescedRouteWrite(t *testing.T) {
 		t.Fatalf("wait for held sequence: %v", ctx.Err())
 	case <-sequenceEntered:
 	}
-	firstStarted := waitNoAckObservation(t, ctx, events)
-	secondStarted := waitNoAckObservation(t, ctx, events)
-	if firstStarted.Phase != NoAckSendPhaseStarted ||
-		secondStarted.Phase != NoAckSendPhaseStarted ||
-		firstStarted.Token == secondStarted.Token {
-		t.Fatalf("started observations=%+v %+v", firstStarted, secondStarted)
+	started := make([]NoAckSendObservation, 0, len(contents))
+	startedTokens := map[uint64]bool{}
+	for range contents {
+		observation := waitNoAckObservation(t, ctx, events)
+		if observation.Phase != NoAckSendPhaseStarted || startedTokens[observation.Token] {
+			t.Fatalf("started observation=%+v prior=%+v", observation, started)
+		}
+		started = append(started, observation)
+		startedTokens[observation.Token] = true
 	}
 	release()
 	var transferFrameBytes []byte
@@ -124,21 +130,21 @@ func TestNoAckSendObserverPairsCoalescedRouteWrite(t *testing.T) {
 	if err := ProtoUnmarshal(transferFrameBytes, &transferFrame); err != nil {
 		t.Fatalf("decode coalesced transfer: %v", err)
 	}
-	if transferFrame.Pack == nil || len(transferFrame.Pack.Frames) != 2 {
+	if transferFrame.Pack == nil || len(transferFrame.Pack.Frames) != len(contents) {
 		t.Fatalf("coalesced transfer=%+v", transferFrame.Pack)
 	}
 	MessagePoolReturn(transferFrameBytes)
 	completions := map[uint64]NoAckSendObservation{}
-	for len(completions) < 2 {
+	for len(completions) < len(contents) {
 		observation := waitNoAckObservation(t, ctx, events)
 		if observation.Phase != NoAckSendPhaseCompleted || observation.Err != nil {
 			t.Fatalf("completion=%+v", observation)
 		}
 		completions[observation.Token] = observation
 	}
-	for _, started := range []NoAckSendObservation{firstStarted, secondStarted} {
-		if _, ok := completions[started.Token]; !ok {
-			t.Fatalf("started token %d had no completion", started.Token)
+	for _, observation := range started {
+		if _, ok := completions[observation.Token]; !ok {
+			t.Fatalf("started token %d had no completion", observation.Token)
 		}
 	}
 }

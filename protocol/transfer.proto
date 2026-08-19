@@ -148,6 +148,17 @@ message Ack {
 
     // from the `Pack` this responds to
     optional Tag tag = 4;
+
+    // The receiver could not resolve a compact Pack.contract_id from verified
+    // sequence state. This is a recovery request, not delivery acknowledgement:
+    // message_id remains pending until the sender retransmits a full contract.
+    // ulid
+    optional bytes missing_contract_id = 5;
+
+    // Advertises that this receiver can request a full contract when compact
+    // contract state is missing. A sender must not emit compact contract heads
+    // until a delivery Ack carries this capability; false is the legacy peer.
+    bool compact_contract_recovery = 6;
 }
 
 
@@ -169,6 +180,15 @@ message Auth {
     // the pair (client_id, instance_id) represents a single in memory instance
     // this helps the platform distinguish multiple instances from multiple transports of the same instance
     bytes instance_id = 3;
+
+    // offered only on the H3 control stream. Zero keeps the legacy reliable
+    // stream data path. An old server echoes this unknown field but cannot set
+    // the separate accepted field, which makes mixed-version fallback safe.
+    uint32 h3_datagram_version = 4;
+
+    // set by the server only when it accepts the offered envelope version and
+    // both QUIC endpoints negotiated RFC 9221 DATAGRAM support.
+    uint32 h3_datagram_accepted_version = 5;
 }
 
 

@@ -209,7 +209,7 @@ func TestProbeResolutionThroughChannel(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		parent.clientReceivePacket(client, TransferPath{}, 0, ingressPath, answerPacket)
+		parent.clientReceivePacket(client, TransferPath{}, 0, TransportTypeUnknown, ingressPath, answerPacket)
 	}
 
 	// stage B: tcp syns to exactly the answered addresses (plus any literal
@@ -225,7 +225,7 @@ func TestProbeResolutionThroughChannel(t *testing.T) {
 			resolvedSeen += 1
 		}
 		ingressPath, packet := probeTestSynAck(t, probe.ipPath, probe.synSequence)
-		parent.clientReceivePacket(client, TransferPath{}, 0, ingressPath, packet)
+		parent.clientReceivePacket(client, TransferPath{}, 0, TransportTypeUnknown, ingressPath, packet)
 	}
 	if resolvedSeen != len(expectedNames) {
 		t.Errorf("saw %d tcp probes for resolved names, want %d", resolvedSeen, len(expectedNames))
@@ -290,7 +290,7 @@ func TestProbeResolverDownFallsBackToLiterals(t *testing.T) {
 			t.Errorf("fallback pass probed %q, not a literal-ip host", probe.target.Host)
 		}
 		ingressPath, packet := probeTestSynAck(t, probe.ipPath, probe.synSequence)
-		parent.clientReceivePacket(client, TransferPath{}, 0, ingressPath, packet)
+		parent.clientReceivePacket(client, TransferPath{}, 0, TransportTypeUnknown, ingressPath, packet)
 	}
 
 	var result probeResult

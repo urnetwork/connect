@@ -30,9 +30,13 @@ import (
 const defaultIpBufferSize = 1024
 
 // packets are written directly into the receiver tap/tun interface,
-// so the packet size must not exceed the device interface mtu (1440).
+// so the packet size must not exceed the device interface MTU.
 // this is a contract with the devices and must not be raised.
-const DefaultMtu = 1440
+// DefaultMtu is shared by every native tunnel interface and the provider-side
+// packetizer. At 1,100 bytes, a full steady-state encrypted IP Transfer frame
+// uses H3's reliable stream at QUIC's safe 1,200-byte packet floor; smaller
+// complete messages that fit one DATAGRAM retain the unordered packet lane.
+const DefaultMtu = 1100
 const Ipv4HeaderSizeWithoutExtensions = 20
 const Ipv6HeaderSize = 40
 const UdpHeaderSize = 8
@@ -51,14 +55,17 @@ type SendPacketFunction func(provideMode protocol.ProvideMode, packet []byte, ti
 // or destination must inspect packet rather than infer its direction from
 // ipPath. Both are read-only for the duration of the callback. A callee that
 // retains packet must call MessagePoolShareReadOnly; a callee that needs a
-// mutable path must clone it.
+// mutable path must clone it. The callback runs inline and must not block,
+// except when it is the documented final device-TUN injection boundary.
 type ReceivePacketFunction func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte)
 
 // receive a batch of packets from one flow (same source, provideMode, ipPath)
 // in a single call, so a consumer can coalesce them (see the provider return
 // path, which packs the batch into one wire Pack). The packet buffers are
 // read-only and valid only for the duration of the callback. A callee that
-// retains one must call MessagePoolShareReadOnly before returning.
+// retains one must call MessagePoolShareReadOnly before returning. It has the
+// same inline/nonblocking contract and final device-TUN exception as
+// ReceivePacketFunction.
 type ReceivePacketsFunction func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packets [][]byte)
 
 // Identifies whether the callback owns irreplaceable upstream TCP state. It is
@@ -178,6 +185,42 @@ type ipPacketFlowKey struct {
 	ipVersion       uint8
 }
 
+// ipPacketFlowKeyFromPath returns the exact directional tuple without
+// retaining any of the packet-backed IP slices in ipPath.
+func ipPacketFlowKeyFromPath(ipPath *IpPath) (ipPacketFlowKey, bool) {
+	if ipPath == nil ||
+		ipPath.SourcePort < 0 || 65535 < ipPath.SourcePort ||
+		ipPath.DestinationPort < 0 || 65535 < ipPath.DestinationPort {
+		return ipPacketFlowKey{}, false
+	}
+
+	var sourceIp net.IP
+	var destinationIp net.IP
+	switch ipPath.Version {
+	case 4:
+		sourceIp = ipPath.SourceIp.To4()
+		destinationIp = ipPath.DestinationIp.To4()
+	case 6:
+		sourceIp = ipPath.SourceIp.To16()
+		destinationIp = ipPath.DestinationIp.To16()
+	default:
+		return ipPacketFlowKey{}, false
+	}
+	if sourceIp == nil || destinationIp == nil {
+		return ipPacketFlowKey{}, false
+	}
+
+	key := ipPacketFlowKey{
+		protocol:        ipPath.Protocol,
+		sourcePort:      uint16(ipPath.SourcePort),
+		destinationPort: uint16(ipPath.DestinationPort),
+		ipVersion:       uint8(ipPath.Version),
+	}
+	copy(key.sourceIp[:], sourceIp)
+	copy(key.destinationIp[:], destinationIp)
+	return key, true
+}
+
 // ipPacketGroup owns its packet-slice header and a canonical path whose
 // addresses do not alias packet storage. The packet buffers remain with the
 // caller until that caller transfers or returns them.
@@ -191,39 +234,20 @@ type ipPacketGroup struct {
 
 // Returns a comparable flow key and a path with owned canonical addresses.
 func ownIpPacketFlow(ipPath *IpPath) (ipPacketFlowKey, *IpPath, bool) {
-	if ipPath == nil ||
-		ipPath.SourcePort < 0 || 65535 < ipPath.SourcePort ||
-		ipPath.DestinationPort < 0 || 65535 < ipPath.DestinationPort {
+	key, ok := ipPacketFlowKeyFromPath(ipPath)
+	if !ok {
 		return ipPacketFlowKey{}, nil, false
 	}
 
-	var sourceIp net.IP
-	var destinationIp net.IP
 	var ipByteCount int
 	switch ipPath.Version {
 	case 4:
-		sourceIp = ipPath.SourceIp.To4()
-		destinationIp = ipPath.DestinationIp.To4()
 		ipByteCount = net.IPv4len
 	case 6:
-		sourceIp = ipPath.SourceIp.To16()
-		destinationIp = ipPath.DestinationIp.To16()
 		ipByteCount = net.IPv6len
-	default:
-		return ipPacketFlowKey{}, nil, false
 	}
-	if sourceIp == nil || destinationIp == nil {
-		return ipPacketFlowKey{}, nil, false
-	}
-
-	key := ipPacketFlowKey{
-		protocol:        ipPath.Protocol,
-		sourcePort:      uint16(ipPath.SourcePort),
-		destinationPort: uint16(ipPath.DestinationPort),
-		ipVersion:       uint8(ipPath.Version),
-	}
-	copy(key.sourceIp[:], sourceIp)
-	copy(key.destinationIp[:], destinationIp)
+	sourceIp := ipPath.SourceIp[len(ipPath.SourceIp)-ipByteCount:]
+	destinationIp := ipPath.DestinationIp[len(ipPath.DestinationIp)-ipByteCount:]
 
 	ownedIpPath := *ipPath
 	ipBacking := make(net.IP, 2*ipByteCount)
@@ -3686,7 +3710,13 @@ func (self *TcpSequence) Run() {
 	}
 
 	self.log.V(2).Infof("[init]receive SYN+ACK\n")
-	self.receivePacket(packet, receiveRecoveryModeNonblocking)
+	// The upstream may be server-first (SMTP/587, SSH, IMAP): socket bytes can
+	// be readable immediately after connect. Keep the SYN+ACK on the same
+	// synchronous recovery lane as those bytes so the socket reader cannot
+	// overtake a queued handshake packet. The provider has already consumed the
+	// successful dial and the following stream is lossless, so this control is
+	// part of that ordered ownership boundary too.
+	self.receivePacket(packet, receiveRecoveryModeTcpSocket)
 
 	/*
 		if v, ok := socket.(*net.TCPConn); ok {
@@ -5013,6 +5043,7 @@ type providerReturnItem struct {
 	packets         [][]byte
 	packetByteCount ByteCount
 	batch           bool
+	schedulingKey   sendSchedulingKey
 	observer        func(RemoteUserNatProviderReturnSendObservation)
 	observerToken   uint64
 	observerFlowKey RemoteUserNatProviderReturnFlowKey
@@ -5587,7 +5618,7 @@ func (self *RemoteUserNatProvider) AddPacketStatsCallback(packetStatsCallback Pa
 
 // flushes packet stats events to listeners on the event epoch
 func (self *RemoteUserNatProvider) runPacketStats() {
-	lastPacketStats := PacketStats{}
+	var lastPacketStats *PacketStats
 	for {
 		select {
 		case <-self.ctx.Done():
@@ -5597,8 +5628,8 @@ func (self *RemoteUserNatProvider) runPacketStats() {
 
 		if callbacks := self.packetStatsCallbacks.Get(); 0 < len(callbacks) {
 			packetStats := self.packetStatsCounters.snapshot()
-			if *packetStats != lastPacketStats {
-				lastPacketStats = *packetStats
+			if !packetStatsEqual(packetStats, lastPacketStats) {
+				lastPacketStats = packetStats
 				for _, callback := range callbacks {
 					HandleError(func() {
 						callback(packetStats)
@@ -5711,10 +5742,11 @@ func providerReturnTransferOptions(
 	return defaultOptions
 }
 
-// Provider-return TCP stays Transfer-reliable even on a direct stream because
-// the proxy may have already consumed upstream socket bytes. UDP and ICMP
-// retain datagram semantics on the direct carrier. Platform and DataChannel
-// returns retain their established acknowledgements.
+// Provider-return TCP always stays Transfer-reliable because the proxy may
+// have already consumed upstream socket bytes. Carrier reliability cannot
+// commit those bytes across a disconnect or route replacement. UDP and ICMP
+// retain datagram semantics on a direct carrier; otherwise they retain the
+// configured default.
 func providerReturnIpTransferOptions(
 	defaultOptions TransferOptions,
 	provideMode protocol.ProvideMode,
@@ -5722,17 +5754,19 @@ func providerReturnIpTransferOptions(
 	ipProtocol IpProtocol,
 ) TransferOptions {
 	options := providerReturnTransferOptions(defaultOptions, provideMode, transferKey)
-	if transferKey.ForceStream {
-		options.Ack = ipProtocol == IpProtocolTcp
+	if ipProtocol == IpProtocolTcp {
+		options.Ack = true
+	} else if transferKey.ForceStream {
+		options.Ack = false
 	}
 	return options
 }
 
 // `ReceivePacketFunction`
 // providerReturnBatchMaxFrames / providerReturnBatchMaxBytes bound one
-// coalesced return Pack so the complete transfer frame stays below the
-// platform and resident transport's 4 KiB message limit. Two mtu packets
-// plus the Pack/TransferFrame envelope fit; three do not.
+// coalesced return Pack so the complete encrypted Transfer frame stays eligible
+// for one H3 DATAGRAM. One full-MTU packet, or up to two smaller packets whose
+// combined message bytes stay within one MTU, fit the bound.
 const providerReturnBatchMaxFrames = sendPackBatchMaxFrames
 const providerReturnBatchMaxBytes = sendPackBatchMaxMessageByteCount
 
@@ -5787,6 +5821,11 @@ func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bo
 		item.ipProtocol,
 	)
 	destinationId := item.source.SourceId
+	transportAttribution := newTransportPacketAttribution(
+		self.packetStatsCounters,
+		1,
+		item.packetByteCount,
+	)
 	var sent bool
 	if 2 <= self.settings.ProtocolVersion {
 		sent = self.retryReturnSend(item, 1, item.packetByteCount, func() bool {
@@ -5800,6 +5839,8 @@ func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bo
 				returnOption,
 				returnTransferKey,
 				Ctx(self.ctx),
+				sendSchedulingKeyOption{key: item.schedulingKey},
+				observeTransportWrite(transportAttribution.observe),
 			)
 			return attemptSent
 		})
@@ -5828,6 +5869,8 @@ func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bo
 				returnOption,
 				returnTransferKey,
 				Ctx(self.ctx),
+				sendSchedulingKeyOption{key: item.schedulingKey},
+				observeTransportWrite(transportAttribution.observe),
 			)
 		})
 		if !sent {
@@ -5835,8 +5878,7 @@ func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bo
 		}
 	}
 	if sent {
-		self.packetStatsCounters.remoteEgressPacketCount.Add(1)
-		self.packetStatsCounters.remoteEgressByteCount.Add(int64(item.packetByteCount))
+		transportAttribution.admit()
 	} else {
 		self.congestionDrops.addReturnSend(1, item.packetByteCount)
 	}
@@ -5875,6 +5917,11 @@ func (self *RemoteUserNatProvider) sendReturnBatch(item *providerReturnItem) boo
 		frames = make([]*protocol.Frame, 0, providerReturnBatchMaxFrames)
 		frameCount := len(sendFrames)
 		packetBytes := chunkPacketBytes
+		transportAttribution := newTransportPacketAttribution(
+			self.packetStatsCounters,
+			frameCount,
+			ByteCount(packetBytes),
+		)
 		sent := self.retryReturnSend(
 			item,
 			frameCount,
@@ -5888,12 +5935,13 @@ func (self *RemoteUserNatProvider) sendReturnBatch(item *providerReturnItem) boo
 					returnOption,
 					returnTransferKey,
 					Ctx(self.ctx),
+					sendSchedulingKeyOption{key: item.schedulingKey},
+					observeTransportWrite(transportAttribution.observe),
 				)
 			},
 		)
 		if sent {
-			self.packetStatsCounters.remoteEgressPacketCount.Add(int64(frameCount))
-			self.packetStatsCounters.remoteEgressByteCount.Add(packetBytes)
+			transportAttribution.admit()
 		} else {
 			allSent = false
 			self.congestionDrops.addReturnSend(frameCount, ByteCount(packetBytes))
@@ -5920,6 +5968,13 @@ func (self *RemoteUserNatProvider) sendReturnBatch(item *providerReturnItem) boo
 		frame, err := ipPacketFromProviderFrame(packet, self.settings.ProtocolVersion)
 		if err != nil {
 			panic(err)
+		}
+		// Keep a complete Pack within the same one-MTU message-byte bound used
+		// by Transfer's ordinary coalescer. One individually oversized frame
+		// still advances alone; the H3 selector will place it on the stream.
+		if 0 < len(frames) &&
+			providerReturnBatchMaxBytes < chunkBytes+int64(len(frame.MessageBytes)) {
+			flush()
 		}
 		if frame.Raw {
 			packets[packetIndex] = nil
@@ -6069,6 +6124,7 @@ func (self *RemoteUserNatProvider) receiveTransferBatchWithRecovery(
 	item.provideMode = returnProvideMode
 	item.recoveryMode = recoveryMode
 	item.ipProtocol = ipPath.Protocol
+	item.schedulingKey = ipSendSchedulingKey(ipPath)
 	item.batch = true
 	for _, packet := range packets {
 		item.packets = append(item.packets, MessagePoolShareReadOnly(packet))
@@ -6153,6 +6209,7 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecovery(
 	item.provideMode = returnProvideMode
 	item.recoveryMode = recoveryMode
 	item.ipProtocol = ipPath.Protocol
+	item.schedulingKey = ipSendSchedulingKey(ipPath)
 	item.packet = MessagePoolShareReadOnly(packet)
 	item.packetByteCount = ByteCount(len(packet))
 	self.enqueueReturnItem(item)
@@ -6322,8 +6379,11 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 				0,
 			)
 			if success {
-				self.packetStatsCounters.remoteIngressPacketCount.Add(int64(len(packetGroup.packets)))
-				self.packetStatsCounters.remoteIngressByteCount.Add(int64(packetGroup.byteCount))
+				self.packetStatsCounters.recordRemoteIngress(
+					peer.TransportType,
+					int64(len(packetGroup.packets)),
+					packetGroup.byteCount,
+				)
 			} else {
 				self.congestionDrops.addIngressNat(len(packetGroup.packets), packetGroup.byteCount)
 				for _, packet := range packetGroup.packets {
@@ -6580,6 +6640,10 @@ func (self *RemoteUserNatClient) ClientReceive(source TransferPath, frames []*pr
 			if err == nil {
 				self.smtpEgressGuard.retireReturn(ipPath)
 				self.securityPolicy.RefreshIngress(ipPath)
+				// Deliberate device-TUN exception from CODESTYLE.md: Transfer
+				// acknowledges only after this borrowed packet returns, so the
+				// synchronous final injection is its receive-side flow control.
+				// This exception does not permit another send or queued wait here.
 				HandleError(func() {
 					self.receivePacketCallback(
 						source,
@@ -6729,10 +6793,19 @@ type IpPath struct {
 
 	SequenceNumber    uint32
 	AckSequenceNumber uint32
-	Syn               bool
-	Fin               bool
-	Rst               bool
-	Ack               bool
+	// TcpWindowSize is the raw 16-bit advertised receive window. Keeping it in
+	// the parsed path lets tunnel collapse prevention distinguish a genuine
+	// zero-window close/reopen from a duplicate ACK; the negotiated scale is
+	// irrelevant for that change detector.
+	TcpWindowSize uint16
+	// TcpPayloadByteCount makes the FIN edge unambiguous: a FIN can legally
+	// share a segment with application bytes, and its acknowledged sequence is
+	// therefore seq + payload + 1 rather than merely seq + 1.
+	TcpPayloadByteCount int
+	Syn                 bool
+	Fin                 bool
+	Rst                 bool
+	Ack                 bool
 
 	ServerName string
 }
@@ -6809,18 +6882,20 @@ func parseIpPathWithPayloadBorrowed(ipPacket []byte, ipPath *IpPath) ([]byte, er
 		}
 
 		*ipPath = IpPath{
-			Version:           int(ipVersion),
-			Protocol:          IpProtocolTcp,
-			SourceIp:          sourceIp,
-			SourcePort:        int(tcp.sourcePort),
-			DestinationIp:     destinationIp,
-			DestinationPort:   int(tcp.destinationPort),
-			SequenceNumber:    tcp.seq,
-			AckSequenceNumber: tcp.ackNumber,
-			Syn:               tcp.syn,
-			Fin:               tcp.fin,
-			Rst:               tcp.rst,
-			Ack:               tcp.ack,
+			Version:             int(ipVersion),
+			Protocol:            IpProtocolTcp,
+			SourceIp:            sourceIp,
+			SourcePort:          int(tcp.sourcePort),
+			DestinationIp:       destinationIp,
+			DestinationPort:     int(tcp.destinationPort),
+			SequenceNumber:      tcp.seq,
+			AckSequenceNumber:   tcp.ackNumber,
+			TcpWindowSize:       tcp.windowSize,
+			TcpPayloadByteCount: len(tcp.payload),
+			Syn:                 tcp.syn,
+			Fin:                 tcp.fin,
+			Rst:                 tcp.rst,
+			Ack:                 tcp.ack,
 		}
 		return tcp.payload, nil
 	default:

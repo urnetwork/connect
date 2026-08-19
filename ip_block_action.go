@@ -114,9 +114,50 @@ type PacketStats struct {
 	BlockEgressByteCount     ByteCount
 	BlockIngressPacketCount  int64
 	BlockIngressByteCount    ByteCount
+	// TransportStats partitions only the remote ingress/egress totals by the
+	// physical carrier. Local and blocked traffic never entered a carrier.
+	// Every TransportTypes entry is present in snapshots, including unknown.
+	TransportStats map[TransportType]*PacketStats
 }
 
 type PacketStatsFunction func(packetStats *PacketStats)
+
+func packetStatsEqual(a *PacketStats, b *PacketStats) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if a.RemoteEgressPacketCount != b.RemoteEgressPacketCount ||
+		a.RemoteEgressByteCount != b.RemoteEgressByteCount ||
+		a.RemoteIngressPacketCount != b.RemoteIngressPacketCount ||
+		a.RemoteIngressByteCount != b.RemoteIngressByteCount ||
+		a.LocalEgressPacketCount != b.LocalEgressPacketCount ||
+		a.LocalEgressByteCount != b.LocalEgressByteCount ||
+		a.LocalIngressPacketCount != b.LocalIngressPacketCount ||
+		a.LocalIngressByteCount != b.LocalIngressByteCount ||
+		a.BlockEgressPacketCount != b.BlockEgressPacketCount ||
+		a.BlockEgressByteCount != b.BlockEgressByteCount ||
+		a.BlockIngressPacketCount != b.BlockIngressPacketCount ||
+		a.BlockIngressByteCount != b.BlockIngressByteCount {
+		return false
+	}
+	for _, transportType := range TransportTypes() {
+		aStats := a.TransportStats[transportType]
+		bStats := b.TransportStats[transportType]
+		if aStats == nil || bStats == nil {
+			if aStats != bStats {
+				return false
+			}
+			continue
+		}
+		if aStats.RemoteEgressPacketCount != bStats.RemoteEgressPacketCount ||
+			aStats.RemoteEgressByteCount != bStats.RemoteEgressByteCount ||
+			aStats.RemoteIngressPacketCount != bStats.RemoteIngressPacketCount ||
+			aStats.RemoteIngressByteCount != bStats.RemoteIngressByteCount {
+			return false
+		}
+	}
+	return true
+}
 
 type packetStatsCounters struct {
 	remoteEgressPacketCount  atomic.Int64
@@ -131,10 +172,14 @@ type packetStatsCounters struct {
 	blockEgressByteCount     atomic.Int64
 	blockIngressPacketCount  atomic.Int64
 	blockIngressByteCount    atomic.Int64
+	transportStatsLock       sync.Mutex
+	transportStats           map[TransportType]*PacketStats
 }
 
 func (self *packetStatsCounters) snapshot() *PacketStats {
-	return &PacketStats{
+	self.transportStatsLock.Lock()
+	defer self.transportStatsLock.Unlock()
+	packetStats := &PacketStats{
 		RemoteEgressPacketCount:  self.remoteEgressPacketCount.Load(),
 		RemoteEgressByteCount:    ByteCount(self.remoteEgressByteCount.Load()),
 		RemoteIngressPacketCount: self.remoteIngressPacketCount.Load(),
@@ -147,7 +192,159 @@ func (self *packetStatsCounters) snapshot() *PacketStats {
 		BlockEgressByteCount:     ByteCount(self.blockEgressByteCount.Load()),
 		BlockIngressPacketCount:  self.blockIngressPacketCount.Load(),
 		BlockIngressByteCount:    ByteCount(self.blockIngressByteCount.Load()),
+		TransportStats:           map[TransportType]*PacketStats{},
 	}
+	for _, transportType := range TransportTypes() {
+		transportStats := &PacketStats{}
+		if current := self.transportStats[transportType]; current != nil {
+			transportStats.RemoteEgressPacketCount = current.RemoteEgressPacketCount
+			transportStats.RemoteEgressByteCount = current.RemoteEgressByteCount
+			transportStats.RemoteIngressPacketCount = current.RemoteIngressPacketCount
+			transportStats.RemoteIngressByteCount = current.RemoteIngressByteCount
+		}
+		packetStats.TransportStats[transportType] = transportStats
+	}
+	return packetStats
+}
+
+func normalizedTransportType(transportType TransportType) TransportType {
+	switch transportType {
+	case TransportTypeH3,
+		TransportTypeH1,
+		TransportTypeH3Dns,
+		TransportTypeH3DnsPump,
+		TransportTypeP2p,
+		TransportTypeUnknown:
+		return transportType
+	default:
+		return TransportTypeUnknown
+	}
+}
+
+func (self *packetStatsCounters) transportStatsWithLock(transportType TransportType) *PacketStats {
+	if self.transportStats == nil {
+		self.transportStats = map[TransportType]*PacketStats{}
+	}
+	transportType = normalizedTransportType(transportType)
+	stats := self.transportStats[transportType]
+	if stats == nil {
+		stats = &PacketStats{}
+		self.transportStats[transportType] = stats
+	}
+	return stats
+}
+
+func (self *packetStatsCounters) recordRemoteEgress(
+	transportType TransportType,
+	packetCount int64,
+	byteCount ByteCount,
+) {
+	self.transportStatsLock.Lock()
+	defer self.transportStatsLock.Unlock()
+	self.remoteEgressPacketCount.Add(packetCount)
+	self.remoteEgressByteCount.Add(int64(byteCount))
+	stats := self.transportStatsWithLock(transportType)
+	stats.RemoteEgressPacketCount += packetCount
+	stats.RemoteEgressByteCount += byteCount
+}
+
+func (self *packetStatsCounters) moveRemoteEgress(
+	from TransportType,
+	to TransportType,
+	packetCount int64,
+	byteCount ByteCount,
+) {
+	from = normalizedTransportType(from)
+	to = normalizedTransportType(to)
+	if from == to {
+		return
+	}
+	self.transportStatsLock.Lock()
+	defer self.transportStatsLock.Unlock()
+	fromStats := self.transportStatsWithLock(from)
+	toStats := self.transportStatsWithLock(to)
+	fromStats.RemoteEgressPacketCount -= packetCount
+	fromStats.RemoteEgressByteCount -= byteCount
+	toStats.RemoteEgressPacketCount += packetCount
+	toStats.RemoteEgressByteCount += byteCount
+}
+
+func (self *packetStatsCounters) recordRemoteIngress(
+	transportType TransportType,
+	packetCount int64,
+	byteCount ByteCount,
+) {
+	self.transportStatsLock.Lock()
+	defer self.transportStatsLock.Unlock()
+	self.remoteIngressPacketCount.Add(packetCount)
+	self.remoteIngressByteCount.Add(int64(byteCount))
+	stats := self.transportStatsWithLock(transportType)
+	stats.RemoteIngressPacketCount += packetCount
+	stats.RemoteIngressByteCount += byteCount
+}
+
+// transportPacketAttribution joins asynchronous route selection to the
+// synchronous logical-packet admission. Before a physical route is known the
+// admitted packet lives in unknown; the first known route moves it atomically.
+// Race attempts share one tracker, so duplicate physical sends cannot inflate
+// logical packet totals.
+type transportPacketAttribution struct {
+	stateLock     sync.Mutex
+	counters      *packetStatsCounters
+	packetCount   int64
+	byteCount     ByteCount
+	admitted      bool
+	observed      bool
+	transportType TransportType
+}
+
+func newTransportPacketAttribution(
+	counters *packetStatsCounters,
+	packetCount int,
+	byteCount ByteCount,
+) *transportPacketAttribution {
+	return &transportPacketAttribution{
+		counters:      counters,
+		packetCount:   int64(packetCount),
+		byteCount:     byteCount,
+		transportType: TransportTypeUnknown,
+	}
+}
+
+func (self *transportPacketAttribution) observe(transportType TransportType) {
+	transportType = normalizedTransportType(transportType)
+	if transportType == TransportTypeUnknown {
+		return
+	}
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.observed {
+		return
+	}
+	self.observed = true
+	self.transportType = transportType
+	if self.admitted {
+		self.counters.moveRemoteEgress(
+			TransportTypeUnknown,
+			transportType,
+			self.packetCount,
+			self.byteCount,
+		)
+	}
+}
+
+func (self *transportPacketAttribution) admit() {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.admitted {
+		return
+	}
+	self.admitted = true
+	self.counters.recordRemoteEgress(
+		self.transportType,
+		self.packetCount,
+		self.byteCount,
+	)
 }
 
 // compiled override rules

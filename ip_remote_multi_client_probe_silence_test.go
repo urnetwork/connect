@@ -44,7 +44,7 @@ func TestProbeSilenceStreakCountsAndClears(t *testing.T) {
 	}()
 	update := waitForProbeFlow(t, parent)
 	ingressPath, packet := probeTestSynAck(t, update.probe.ipPath, 0x5150)
-	parent.clientReceivePacket(client, TransferPath{}, protocol.ProvideMode_Public, ingressPath, packet)
+	parent.clientReceivePacket(client, TransferPath{}, protocol.ProvideMode_Public, TransportTypeUnknown, ingressPath, packet)
 	select {
 	case result := <-resultCh:
 		if result.Answered != 1 {

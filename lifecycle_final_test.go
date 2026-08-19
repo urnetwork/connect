@@ -742,7 +742,7 @@ func TestP2pReceiveTransportDoneFollowsFinalPoolDrain(t *testing.T) {
 	}
 	defer localPipe.Close()
 	defer remotePipe.Close()
-	transportValue, route := NewP2pReceiveTransport(
+	transportValue, _ := NewP2pReceiveTransport(
 		transportCtx,
 		cancelTransport,
 		conn,
@@ -769,7 +769,18 @@ func TestP2pReceiveTransportDoneFollowsFinalPoolDrain(t *testing.T) {
 	blockedReadCapture.requireOwnerLive(t, "P2P blocked-read buffer")
 	capture := newLifecyclePoolCapture(MessagePoolGet(512))
 	defer capture.cleanup()
-	route <- capture.owner
+	// Exercise the production carrier-reader handoff. The public route is now
+	// the consumer side of an unbuffered ownership transfer; injecting into it
+	// would bypass the bounded pending queue whose final drain this test pins.
+	if !transport.offerReceive(capture.owner, false, 0, false, false) {
+		t.Fatal("receive final-drain frame was not admitted")
+	}
+	if retained := transport.pendingReceiveByteCount.Load(); retained != 512 {
+		t.Fatalf("receive final-drain retained bytes = %d, want 512", retained)
+	}
+	if retained := transport.pendingReceiveMessageCount.Load(); retained != 1 {
+		t.Fatalf("receive final-drain retained messages = %d, want 1", retained)
+	}
 	capture.requireOwnerLive(t, "receive final-drain frame")
 	joinResult := make(chan error, 1)
 	go func() { joinResult <- lifecycle.CloseAndWait(ctx) }()

@@ -19,6 +19,7 @@ func collapseTestPacket(seq uint32, ack uint32, payload int, syn bool, rst bool)
 			DestinationPort:   443,
 			SequenceNumber:    seq,
 			AckSequenceNumber: ack,
+			TcpWindowSize:     32 * 1024,
 			Syn:               syn,
 			Rst:               rst,
 		},
@@ -111,6 +112,55 @@ func TestTcpCollapseHoldAllowsProgress(t *testing.T) {
 	AssertEqual(t, collapseTestCanSend(client, update, collapseTestPacket(1000, 5000, 100, false, true)), true)
 }
 
+func TestTcpCollapseAllowsReceiveWindowCloseAndReopen(t *testing.T) {
+	client, update := collapseTestClient(time.Hour)
+
+	open := collapseTestPacket(1000, 5000, 0, false, false)
+	if !collapseTestCanSend(client, update, open) {
+		t.Fatal("initial open-window ACK was not admitted")
+	}
+	update.updateSequence(open)
+
+	closed := collapseTestPacket(1000, 5000, 0, false, false)
+	closed.ipPath.TcpWindowSize = 0
+	if !collapseTestCanSend(client, update, closed) {
+		t.Fatal("zero-window update was collapsed as a duplicate ACK")
+	}
+	update.updateSequence(closed)
+
+	reopened := collapseTestPacket(1000, 5000, 0, false, false)
+	if !collapseTestCanSend(client, update, reopened) {
+		t.Fatal("receive-window reopen was collapsed as a duplicate ACK")
+	}
+	update.updateSequence(reopened)
+	if collapseTestCanSend(client, update, reopened) {
+		t.Fatal("identical reopened-window ACK bypassed collapse prevention")
+	}
+}
+
+func TestTcpCollapseAccountsForFinSequenceSpace(t *testing.T) {
+	client, update := collapseTestClient(time.Hour)
+
+	data := collapseTestPacket(1000, 5000, 100, false, false)
+	if !collapseTestCanSend(client, update, data) {
+		t.Fatal("initial data was not admitted")
+	}
+	update.updateSequence(data)
+
+	fin := collapseTestPacket(1100, 5000, 0, false, false)
+	fin.ipPath.Fin = true
+	if !collapseTestCanSend(client, update, fin) {
+		t.Fatal("FIN at the data edge was collapsed as a retransmission")
+	}
+	update.updateSequence(fin)
+	if got := update.sequenceNumber; got != 1101 {
+		t.Fatalf("sequence after FIN = %d, want 1101", got)
+	}
+	if collapseTestCanSend(client, update, fin) {
+		t.Fatal("duplicate FIN bypassed collapse prevention")
+	}
+}
+
 // with collapse prevention off entirely, the hold is irrelevant and everything
 // passes as before
 func TestTcpCollapseHoldIgnoredWhenPreventionOff(t *testing.T) {
@@ -139,10 +189,10 @@ func TestTcpCollapseHoldUdpUnaffected(t *testing.T) {
 	AssertEqual(t, collapseTestCanSend(client, update, udp), true)
 }
 
-// Collapse prevention may suppress retransmits only while a live selected
-// client owns Transfer recovery. A direct client deliberately leaves recovery
-// to inner TCP; an unbound flow retains the established collapse behavior.
-func TestTcpCollapseRequiresReliableSelectedClient(t *testing.T) {
+// Direct and platform clients both retain Transfer recovery for TCP, so both
+// apply the same bounded collapse policy. An unbound flow remains conservative
+// and retains that policy too.
+func TestTcpCollapseIncludesDirectSelectedClient(t *testing.T) {
 	client, update := collapseTestClient(time.Hour)
 	first := collapseTestPacket(1000, 5000, 100, false, false)
 	acknowledgedClient := &multiClientChannel{
@@ -165,11 +215,11 @@ func TestTcpCollapseRequiresReliableSelectedClient(t *testing.T) {
 	if client.canSendPacket(retransmit, update, acknowledgedClient) {
 		t.Fatal("acknowledged Transfer retransmit bypassed collapse prevention")
 	}
-	if !client.canSendPacket(retransmit, update, directClient) {
-		t.Fatal("direct unacknowledged Transfer suppressed inner TCP retransmit")
+	if client.canSendPacket(retransmit, update, directClient) {
+		t.Fatal("direct acknowledged Transfer retransmit bypassed collapse prevention")
 	}
-	if !client.canSendPacket(retransmit, update, directClient) {
-		t.Fatal("second direct inner TCP retransmit was collapsed")
+	if client.canSendPacket(retransmit, update, directClient) {
+		t.Fatal("second direct acknowledged Transfer retransmit bypassed collapse prevention")
 	}
 	if client.canSendPacket(retransmit, update, nil) {
 		t.Fatal("unbound flow changed the established collapse policy")

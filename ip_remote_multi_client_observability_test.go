@@ -103,6 +103,7 @@ func TestRelRemovalReason(t *testing.T) {
 		{errors.New("Blackhole no-send-ack quarantine expired (send 1/2B)"), "no-send-ack"},
 		{errors.New("send stalled: no ack progress for 3s"), "send-stalled"},
 		{errors.New("cping timeout"), "cping"},
+		{errTransportDownTimeout, "transport"},
 		{errors.New(""), "unknown"},
 	} {
 		if got := relRemovalReason(testCase.err); got != testCase.want {
