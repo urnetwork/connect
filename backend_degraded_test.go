@@ -238,21 +238,30 @@ func TestAuthCancellationIsNotBackendFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, fn := range []string{
-		"func (self *PlatformTransport) runH1(",
-		"func (self *PlatformTransport) runH3(",
+	for _, test := range []struct {
+		fn    string
+		guard string
+	}{
+		{
+			fn:    "func (self *PlatformTransport) runH1(",
+			guard: "if self.ctx.Err() == nil {",
+		},
+		{
+			fn:    "func (self *PlatformTransport) runH3(",
+			guard: "if ctx.Err() == nil {",
+		},
 	} {
-		body, ok := functionBody(source, fn)
+		body, ok := functionBody(source, test.fn)
 		if !ok {
-			t.Fatalf("could not find %s", fn)
+			t.Fatalf("could not find %s", test.fn)
 		}
 		note := strings.Index(body, "noteBackendFailure()")
 		if note < 0 {
-			t.Fatalf("%s no longer records auth failures; the degraded signal lost its transport half", fn)
+			t.Fatalf("%s no longer records auth failures; the degraded signal lost its transport half", test.fn)
 		}
-		guarded := strings.Index(body, "if self.ctx.Err() == nil {")
+		guarded := strings.Index(body, test.guard)
 		if guarded < 0 || note < guarded {
-			t.Fatalf("%s records auth failures without the local-teardown carve-out: a canceled dial would count as a backend failure", fn)
+			t.Fatalf("%s records auth failures without the local-teardown carve-out: a canceled dial would count as a backend failure", test.fn)
 		}
 	}
 }

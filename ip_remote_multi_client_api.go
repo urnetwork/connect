@@ -715,7 +715,7 @@ func (self *ApiMultiClientGenerator) NewClientContext(
 			return
 		}
 	}
-	transport, policyVersion := self.createPlatformTransport(client, args.ClientAuth, settings)
+	transport, _, policyVersion := self.createPlatformTransport(client, args.ClientAuth, settings)
 	// Enable return traffic for this client and block until the platform has
 	// committed the provide secret. The companion (Stream) contract on the return
 	// path is verified against this secret, so using the client before it is
@@ -787,7 +787,7 @@ func (self *ApiMultiClientGenerator) createPlatformTransport(
 	client *Client,
 	auth *ClientAuth,
 	settings *PlatformTransportSettings,
-) (apiWindowPlatformTransport, uint64) {
+) (apiWindowPlatformTransport, TransportMode, uint64) {
 	targetMode, modePreferences, policyVersion := self.platformTransportPolicy()
 	settingsValue := *settings
 	if modePreferences != nil {
@@ -813,7 +813,7 @@ func (self *ApiMultiClientGenerator) createPlatformTransport(
 			self.settings.PlatformTransportCreated(client, platformTransport)
 		}
 	}
-	return transport, policyVersion
+	return transport, targetMode, policyVersion
 }
 
 // MigrateClientTransport implements MultiClientGeneratorTransportMigrator.
@@ -890,7 +890,27 @@ func (self *ApiMultiClientGenerator) MigrateClientTransport(
 			return
 		}
 
-		next, nextPolicyVersion := self.createPlatformTransport(client, &auth, settings)
+		next, nextTargetMode, nextPolicyVersion := self.createPlatformTransport(client, &auth, settings)
+		brokeBeforeMake := false
+		if nextTargetMode != TransportModeAuto {
+			// A low-memory policy transition can be impossible to perform
+			// make-before-break: the old H1 reservation fills the capacity an
+			// explicitly selected H3 replacement needs. In that case the user's
+			// explicit carrier choice wins. Drop the old route so the waiting
+			// replacement can acquire its reservation; ordinary migrations and
+			// replacements that fit retain seamless make-before-break behavior.
+			if waiter, ok := next.(interface{ IsWaitingForBudget() bool }); ok && waiter.IsWaitingForBudget() {
+				self.transportLock.Lock()
+				stillCurrent := self.transports[client] == state && state.current == current
+				self.transportLock.Unlock()
+				if !stillCurrent {
+					next.Close()
+					return
+				}
+				current.Close()
+				brokeBeforeMake = true
+			}
+		}
 		connectTimeout := self.settings.MigrateConnectTimeout
 		if connectTimeout <= 0 {
 			connectTimeout = 60 * time.Second
@@ -910,8 +930,10 @@ func (self *ApiMultiClientGenerator) MigrateClientTransport(
 				return
 			case <-notify:
 			case <-connectTimer.C:
-				// Keep the old transport: it is still a valid route, and the
-				// server's drain excuse/reconnect path remains the backstop.
+				// Normally keep the old transport: it is still a valid route, and
+				// the server's drain excuse/reconnect path remains the backstop.
+				// A budget-blocked explicit selection already closed it above;
+				// falling back to that carrier would violate the selected policy.
 				// Disarm BEFORE closing the replacement so the close is the
 				// definitive "migration released" signal: the deferred disarm
 				// runs after this return, so an observer gating on the
@@ -945,7 +967,9 @@ func (self *ApiMultiClientGenerator) MigrateClientTransport(
 		}
 		// Only now break the old route. For the interval between next becoming
 		// connected and this close, RouteManager can carry traffic over both.
-		current.Close()
+		if !brokeBeforeMake {
+			current.Close()
+		}
 	})
 }
 

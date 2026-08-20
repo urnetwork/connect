@@ -57,11 +57,12 @@ func (self *recordingWindowTransportMigrator) MigrateClientTransport(
 }
 
 type fakeWindowPlatformTransport struct {
-	mutex     sync.Mutex
-	connected bool
-	notify    chan struct{}
-	closed    chan struct{}
-	closeOnce sync.Once
+	mutex            sync.Mutex
+	connected        bool
+	waitingForBudget bool
+	notify           chan struct{}
+	closed           chan struct{}
+	closeOnce        sync.Once
 	// onClose, when set, runs synchronously inside Close before `closed` is
 	// signaled — a seam to observe migrator state at the exact instant of
 	// close (see TestApiWindowTransportMigrationDisarmsBeforeClosingReplacement).
@@ -86,6 +87,12 @@ func (self *fakeWindowPlatformTransport) IsConnected() bool {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 	return self.connected
+}
+
+func (self *fakeWindowPlatformTransport) IsWaitingForBudget() bool {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	return self.waitingForBudget
 }
 
 func (self *fakeWindowPlatformTransport) Close() {
@@ -413,5 +420,59 @@ func TestApiWindowTransportPolicyChangeIsLiveAndMakeBeforeBreak(t *testing.T) {
 	case <-createdSettings:
 		t.Fatal("identical policy constructed another replacement")
 	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestApiWindowExplicitPolicyBreaksOldCarrierWhenBudgetBlocked(t *testing.T) {
+	client, _ := newApiMigrationTestClient(t)
+	old := newFakeWindowPlatformTransport(true)
+	next := newFakeWindowPlatformTransport(false)
+	next.waitingForBudget = true
+	created := make(chan struct{}, 1)
+	state := &apiWindowClientTransport{
+		current:       old,
+		settings:      DefaultPlatformTransportSettings(),
+		auth:          ClientAuth{InstanceId: NewId()},
+		policyVersion: 1,
+	}
+	generator := &ApiMultiClientGenerator{
+		settings:                   DefaultApiMultiClientGeneratorSettings(),
+		platformTransportMode:      TransportModeAuto,
+		platformModePreferences:    DefaultTransportModePreferences(),
+		platformTransportPolicyVer: 1,
+		transports:                 map[*Client]*apiWindowClientTransport{client: state},
+		newPlatformTransport: func(
+			client *Client,
+			auth *ClientAuth,
+			settings *PlatformTransportSettings,
+		) apiWindowPlatformTransport {
+			created <- struct{}{}
+			return next
+		},
+	}
+
+	generator.SetPlatformTransportPolicy(TransportModeH3, nil)
+	select {
+	case <-created:
+	case <-time.After(time.Second):
+		t.Fatal("explicit H3 policy did not construct a replacement")
+	}
+	select {
+	case <-old.closed:
+	case <-time.After(time.Second):
+		t.Fatal("budget-blocked explicit H3 retained the old H1 carrier")
+	}
+
+	next.connect()
+	currentTransport := func() apiWindowPlatformTransport {
+		generator.transportLock.Lock()
+		defer generator.transportLock.Unlock()
+		return state.current
+	}
+	for deadline := time.Now().Add(time.Second); currentTransport() != next && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
+	if currentTransport() != next {
+		t.Fatal("explicit H3 replacement was not installed after connecting")
 	}
 }

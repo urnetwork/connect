@@ -135,10 +135,10 @@ func TestMultiRoute(t *testing.T) {
 	}
 }
 
-// Auto keeps both direct carriers healthy, but one ordered destination
-// sequence must not alternate messages between independent congestion
-// controllers sharing the same physical uplink. The first healthy route is
-// therefore tried first for every write while both routes remain writable.
+// A custom Auto policy may keep equal-priority direct carriers healthy, but one
+// ordered destination sequence must not alternate messages between independent
+// congestion controllers sharing the same physical uplink. The first healthy
+// route is therefore tried first for every write while both remain writable.
 func TestMultiRouteWriterKeepsEqualPriorityH1H3Affinity(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -632,6 +632,102 @@ func TestMultiRouteWriterDirectAffinityScope(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTransportAffinityIsASetAndAllowsHigherPriorityRoutes(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	selector := NewMultiRouteSelector(
+		ctx,
+		"priority-aware-affinity",
+		nil,
+		DestinationId(NewId()),
+		true,
+	)
+	defer selector.Close()
+
+	affinity10 := make(Route, 1)
+	affinity20 := make(Route, 1)
+	higher5 := make(Route, 1)
+	higher15 := make(Route, 1)
+	equal20 := make(Route, 1)
+	lower30 := make(Route, 1)
+	selector.updateTransport(
+		newTypedPriorityRouteTestTransport(TransportTypeH1, 10),
+		[]Route{affinity10},
+	)
+	selector.updateTransport(
+		newTypedPriorityRouteTestTransport(TransportTypeH1, 20),
+		[]Route{affinity20},
+	)
+	selector.updateTransport(
+		newTypedPriorityRouteTestTransport(TransportTypeH3, 5),
+		[]Route{higher5},
+	)
+	selector.updateTransport(
+		newTypedPriorityRouteTestTransport(TransportTypeH3, 15),
+		[]Route{higher15},
+	)
+	selector.updateTransport(
+		newTypedPriorityRouteTestTransport(TransportTypeH3, 20),
+		[]Route{equal20},
+	)
+	selector.updateTransport(
+		newTypedPriorityRouteTestTransport(TransportTypeH3, 30),
+		[]Route{lower30},
+	)
+
+	routes := selector.activeRoutesSnapshot.Load().writeRoutesForTransport(TransportTypeH1)
+	got := map[Route]bool{}
+	for _, route := range routes {
+		got[route] = true
+	}
+	for _, route := range []Route{affinity10, affinity20, higher5, higher15} {
+		if !got[route] {
+			t.Fatalf("eligible routes omitted affinity or higher-priority route %p", route)
+		}
+	}
+	for _, route := range []Route{equal20, lower30} {
+		if got[route] {
+			t.Fatalf("affinity admitted same/lower-priority non-affinity route %p", route)
+		}
+	}
+
+	message := MessagePoolGet(64)
+	success, disposition, err := selector.writeDetailedWithCarrierPreference(
+		ctx,
+		message,
+		time.Second,
+		TransportTypeH1,
+	)
+	if err != nil || !success || disposition.route != higher5 {
+		if !success {
+			MessagePoolReturn(message)
+		}
+		t.Fatalf("priority-aware affinity write=(%t, %+v, %v), want priority-5 route", success, disposition, err)
+	}
+	MessagePoolReturn(<-higher5)
+
+	block5 := MessagePoolGet(8)
+	block15 := MessagePoolGet(8)
+	higher5 <- block5
+	higher15 <- block15
+	message = MessagePoolGet(64)
+	success, disposition, err = selector.writeDetailedWithCarrierPreference(
+		ctx,
+		message,
+		time.Second,
+		TransportTypeH1,
+	)
+	if err != nil || !success || (disposition.route != affinity10 && disposition.route != affinity20) {
+		if !success {
+			MessagePoolReturn(message)
+		}
+		t.Fatalf("blocked higher-priority affinity write=(%t, %+v, %v), want an original H1 route", success, disposition, err)
+	}
+	MessagePoolReturn(<-disposition.route)
+	MessagePoolReturn(<-higher5)
+	MessagePoolReturn(<-higher15)
 }
 
 // HasActiveTransport is the transport cross-check the blackhole and stall

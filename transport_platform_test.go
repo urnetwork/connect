@@ -142,6 +142,14 @@ func (self *testingPlatformServer) closeConns() {
 	self.conns = nil
 }
 
+func (self *testingPlatformServer) sendBinary(message []byte) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	for _, ws := range self.conns {
+		_ = ws.WriteMessage(websocket.BinaryMessage, message)
+	}
+}
+
 // down stops the platform from accepting, and drops the live connections, so the
 // transport disconnects and cannot reconnect.
 func (self *testingPlatformServer) down() {
@@ -218,6 +226,75 @@ func TestPlatformTransportConnectsAndElects(t *testing.T) {
 	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
 		mode, _ := transport.activeMode()
 		t.Fatalf("active mode = %q, want h1: the connected transport was never elected", mode)
+	}
+}
+
+func TestPlatformTransportH1RejectsOversizedWebSocketMessage(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	platform := newTestingPlatformServer(t)
+	settings := testingPlatformTransportSettings()
+	settings.H1MaxMessageByteCount = 64
+	transport := testingPlatformTransport(t, ctx, platform.url, settings)
+	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+		t.Fatal("the H1 transport was never elected")
+	}
+	connectCount := platform.connectCount.Load()
+	platform.sendBinary(make([]byte, settings.H1MaxMessageByteCount+1))
+	if !waitForCondition(15*time.Second, func() bool {
+		return connectCount < platform.connectCount.Load()
+	}) {
+		t.Fatal("oversized WebSocket message did not close and replace the H1 connection")
+	}
+}
+
+func TestPlatformTransportInactiveDrainIgnoresH1ControlTraffic(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	platform := newTestingPlatformServer(t)
+	settings := testingPlatformTransportSettings()
+	settings.ModePreferences = map[TransportMode]int{
+		TransportModeH3: 1,
+		TransportModeH1: 2,
+	}
+	settings.InactiveDrainTimeout = 80 * time.Millisecond
+	settings.InactiveDrainMaxTimeout = 2 * time.Second
+	settings.PingTimeout = 10 * time.Millisecond
+	transport := testingPlatformTransport(t, ctx, platform.url, settings)
+	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+		t.Fatal("the H1 transport was never elected")
+	}
+	connectCount := platform.connectCount.Load()
+
+	// Empty inbound messages and the transport's frequent outbound keepalives
+	// are control traffic. Neither may extend the payload-only quiet drain once
+	// a strictly better mode supersedes H1.
+	stopPings := make(chan struct{})
+	pingsDone := make(chan struct{})
+	defer func() {
+		close(stopPings)
+		<-pingsDone
+	}()
+	go func() {
+		defer close(pingsDone)
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopPings:
+				return
+			case <-ticker.C:
+				platform.sendBinary(nil)
+			}
+		}
+	}()
+	transport.setActiveMode(TransportModeH3)
+	if !waitForCondition(750*time.Millisecond, func() bool {
+		return connectCount < platform.connectCount.Load()
+	}) {
+		t.Fatal("H1 control traffic prevented the superseded carrier from draining")
 	}
 }
 

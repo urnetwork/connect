@@ -1,7 +1,7 @@
 # Low-bar network delivery plan
 
 Status: living implementation plan
-Last updated: 2026-08-19
+Last updated: 2026-08-20
 
 ## Outcome
 
@@ -111,14 +111,15 @@ Current code facts:
 - H3 uses `quic-go`, one bidirectional control stream, and, only after explicit
   new/new negotiation, RFC 9221 DATAGRAM for complete routed Transfer frames.
   Either old endpoint stays on the existing stream path on the same connection.
-- Auto mode enables H3 and H1 together at equal priority and retains every
-  healthy carrier at that priority; DNS and DNS pump follow at priorities two
-  and three. An ordered destination sequence stays on its first healthy H1 or
-  H3 route instead of shuffling between two congestion controllers on every
-  frame. A full preferred route backpressures the sender, and only actual route
-  withdrawal moves the sequence to its surviving equal-priority peer.
-  Production H3 reachability still depends on the UDP Proxy Protocol v2 ingress
-  rollout.
+- Production Auto orders H1 first, direct H3 second, DNS H3 third, and DNS pump
+  fourth. H3 remains a fallback when H1 is unavailable; a restored H1 preempts
+  lower-priority H3 and the H3 generation drains. Transport affinity can retain
+  an eligible route only against transports at the same or lower priority; it
+  cannot hide an available higher-priority H1 route. Explicit H3 selection
+  bypasses the Auto ordering. When the process budget can fit H1 but not
+  optional Auto H3, Auto reports a degraded H1-only status rather than opening
+  H3 sockets. Production H3 reachability still depends on the UDP Proxy
+  Protocol v2 ingress rollout.
 - Legacy H3 writes ready-only batches of at most 16 messages / 64 KiB retained
   storage. Negotiated hybrid generations allocate that stream batch lazily only
   if a large routed frame selects the stream, and otherwise retain bounded
@@ -592,6 +593,130 @@ Use at least five measured runs per candidate/profile cell after a separately
 reported warm-up. Pin revisions, random seeds, and CPU/resource limits. Report
 all runs plus median and tail, not only the best. Run the canonical commands in
 `PERFVAR.md`; add any new command there and link its output here.
+
+### Real-device memory-stability focus
+
+The deterministic Connect and SDK memory tests prove important ownership and
+queue bounds, but they do not include the complete mobile footprint: Network
+Extension/runtime overhead, allocator retention, TLS and QUIC state, kernel
+socket buffers, radio/network lifecycle, or operating-system termination
+policy. Simulator and Go-heap results are guardrails, not release evidence for
+this campaign.
+
+Run in this order:
+
+1. the lowest-memory supported physical iPhone, with the packet-tunnel
+   extension as the measured process;
+2. the lowest-memory supported physical iPad and a current iPhone as controls;
+3. the lowest-memory supported Android device in always-on and lockdown VPN
+   configurations; and
+4. representative macOS, Windows, and Linux service hosts after the mobile
+   gates pass.
+
+For every run, record a cold pre-connect baseline, warmed connected plateau,
+peak burst, immediate post-burst value, and quiescent values at 1, 5, and 15
+minutes. Preserve the operating-system termination or jetsam report with the
+traffic trace, policy transitions, device model, OS build, app/extension build,
+available-memory tier, and whether the run was cold or warmed.
+
+Required observability:
+
+- [ ] Record the OS-reported extension/process physical footprint and
+  resident/PSS memory, system memory pressure, and termination reason alongside
+  Go `HeapAlloc`, `HeapInuse`, `HeapSys`, `StackSys`, GC count, and pause time.
+  A falling Go heap does not prove that socket, kernel, or runtime memory was
+  returned.
+- [ ] Record goroutines, file descriptors, TCP/UDP socket count, active QUIC
+  connections and streams, MessagePool outstanding buffers/bytes, bounded queue
+  count/bytes/oldest age, and fragment, DNS-combine, and H3-reassembly retained
+  bytes.
+- [ ] Snapshot all `PlatformTransportBudget` counters: total/used bytes,
+  transport slots, pending H1 claims, cumulative reserved/released bytes, and H3
+  preemptions. Also record configured, eligible, available, and elected
+  transports from `TransportStatus`; eligibility must not be inferred from the
+  active carrier alone.
+- [ ] Add missing counters before interpreting a run. In particular, do not
+  infer released affinity, DNS, QUIC, or socket state only from RSS, which can
+  remain high after correct logical cleanup.
+
+Exercise these transport and budget sequences on each mobile memory tier:
+
+- [ ] Explicit H1 as the control; enough-memory Auto with healthy H1; Auto with
+  H1 unavailable so direct H3 must start; H1 restoration so H1 is elected and
+  every lower-priority H3 generation drains by its bounded timeout; and
+  explicit H3, because H1-first Auto no longer exercises H3's worst resident
+  footprint while H1 is healthy.
+- [ ] Repeated deterministic `H1 -> Auto -> H3 -> Auto` transitions during live
+  bidirectional traffic. The final Auto must rediscover its policy without the
+  explicit-H3 step acting as a hidden reset. Repeat transitions across app and
+  extension restart, not only within one process generation.
+- [ ] Run Auto immediately below, at, and above the H1-plus-H3 admission
+  boundary. H1 must win when both do not fit. Low-memory Auto must report
+  degraded H1-only eligibility and retain no H3 sockets or QUIC state; explicit
+  H3 must still honor the user's H3 choice rather than silently running H1.
+- [ ] Run foreground client and provider transports together, with several
+  windows claiming the aggregate budget in different construction orders.
+  Cancel queued claims and force foreground/background H3 preemption. Used
+  bytes, slots, and pending H1 claims must return to their expected values after
+  every claimant closes.
+- [ ] Create affinity on several transports, then introduce a higher-priority
+  transport, withdraw routes, change policy, and tear down the generation.
+  Affinity may keep a same- or lower-priority choice but cannot exclude the
+  higher-priority carrier, and its set must not grow across identical cycles.
+
+Focus packet-pressure testing on the native/extension boundary, where a valid
+Go queue bound can still coexist with retained native buffers or blocked
+threads:
+
+- [ ] Drive multiple concurrent bidirectional floods using both many small
+  packets and near-MTU packets, inner TCP and UDP/QUIC, and fast and deliberately
+  paused/slow destinations. Include receive loss, a UDP blackhole, and recovery
+  while the flood is still active.
+- [ ] Verify a stable memory plateau rather than merely eventual completion.
+  Goroutines must not scale per packet; no state lock may be held across a
+  blocking sender boundary; route publication, status delivery, control/ACK
+  work, and an unrelated interactive flow must continue within their bounds.
+  Count overload drops/refusals explicitly instead of allowing an unbounded
+  queue or a blocked receive callback.
+- [ ] Use SDK
+  [`TestDeviceLocalParallelPacketFloodMemoryBounded`](../sdk/device_packet_flood_memory_test.go)
+  as the deterministic ownership/locking guard, then reproduce its parallel
+  stream shape through the physical packet tunnel. That test cannot prove the
+  extension's native, socket, QUIC, or kernel-memory behavior.
+
+Exercise allocation cliffs and retained-state cleanup directly:
+
+- [ ] Confirm the quality-window target remains six and every multi-client
+  expansion pass creates at most four candidates. Repeatedly expand, contract,
+  reconnect, reject surplus candidates, and churn providers while measuring
+  each step's peak. Closed clients must release routes, affinity entries,
+  sockets, goroutines, callbacks, and transport-budget reservations before the
+  next expansion wave.
+- [ ] Send H1 WebSocket messages at the maximum accepted size and one byte over;
+  drive DNS combine at its per-message, per-address, and global caps using many
+  unique addresses and expiry; and fill H3 DATAGRAM/stream queues, reassembly
+  budget, socket buffers, and QUIC receive windows. Refusal and cleanup must be
+  bounded and visible.
+- [ ] Repeat cold start, authentication failure/reconnect, burst/quiescence,
+  long idle then burst, Wi-Fi/cellular/airplane transitions, path and MTU
+  changes, screen lock, background/foreground, extension stop/start, and app
+  process death. Include many short cycles to expose generation leaks and a
+  long soak to expose slow accumulation.
+
+Acceptance criteria:
+
+- no jetsam/OOM, watchdog termination, deadlock, livelock, or receive-path
+  blocking;
+- sustained load reaches a bounded plateau and identical lifecycle cycles do
+  not show monotonic growth;
+- after quiescence, physical footprint returns to a pre-registered warmed
+  baseline band, chosen before evaluating the candidate rather than adjusted to
+  fit it;
+- after teardown, pool ownership, queues, routes, affinity entries, sockets,
+  goroutines, budget used/pending claims, and transport status return to the
+  expected steady or zero state; and
+- overload drops are allowed only when bounded and counted, with exact traffic,
+  policy, and higher-priority H1 behavior preserved.
 
 ### Provisional release gates
 
@@ -1071,9 +1196,11 @@ or fallback regression.
   fallback from a blocked or rewritten port 53.
 - Performance: all Phase 1 profiles and workloads with direct/H1/current-H3
   controls, at least five recorded runs.
-- Memory: long DeviceLocal + DeviceRemote synthetic run with web, mail, blocked,
-  bulk, loss, path churn, and post-burst recovery; assert byte/fragment/lane
-  bounds and RSS recovery.
+- Memory: retain the long DeviceLocal + DeviceRemote synthetic run with web,
+  mail, blocked, bulk, loss, path churn, and post-burst recovery, then run the
+  physical-device campaign above. Assert logical byte/fragment/lane bounds,
+  OS-level footprint plateau and recovery, native packet-flood progress, and
+  complete transport/budget cleanup.
 - Policy: encryption required/opportunistic/off matrices where supported, kill
   switch, CFAA/SMTP, provider eligibility, and no IPv6 advertisement or route.
 
@@ -1178,6 +1305,7 @@ timeouts, following `CODESTYLE.md`.
 | 2026-08-19 | The 1 s RTT P2P 32 MiB gate first transferred only 3,381,116 bytes of its 12.5 MiB BDP warmup before timing out behind the old 15-message destination flight. Removing that cap progressed much farther, but then exposed zero-wait drops at the default 32-slot Client ReceiveSequence even though the P2P carrier queue itself dropped nothing. Matching both count bounds produced one isolated pass, but a combined repetition then filled essentially all 256 KiB of carrier payload and dropped one 1,206-byte message. | Keep every P2P mode Transfer-ACKed and classify its complete bounded handoff as unreliable. Derive a 255-message destination flight from the 256-message P2P queue, give the Client handoff matching 256-message headroom, and independently cap both handoffs at 256 KiB. Tighten only P2P's data flight to 240 KiB, retaining 16 KiB under the unchanged carrier ceiling for untracked ACK/recovery/contract/probe traffic. The old timer then reached 31,616,264/33,554,432 bytes with zero queue drops, gaps, timeouts, or reductions; correctness-only deadline headroom preserved the slower result and the exact gate passed in 272.99 s. |
 | 2026-08-19 | One ordered Transfer sequence is a real cross-flow loss domain, but an additive wire field alone is not a safe rollout. A peer could ignore the field or capability evidence could outlive the lane-0 sequence that negotiated it. | Retain the bounded logical-lane implementation as an opt-in correctness feature: stable exact directional five-tuple hashing over at most eight lanes; capability accepted only from a live lane-0 ACK; base-lifetime pinning and downgrade cancellation; exact per-sequence ACK routing; and shared lazy send/receive budgets. Keep the production default at zero until latency measurements win. |
 | 2026-08-19 | The first schema-13 one-bar four-flow comparison completed exact and calibration-valid at every 0/1/4/8 setting, but nonzero lanes took 5.8--10.2% longer. They reduced wire bytes by 36.2--68.6%; allocation bytes improved for 1 and 8 but regressed for 4. | Do not trade completion for byte count on a low-bar path and do not enable lanes by default. Preserve the correctness work and its benchmark switch, then measure repeated 16/64-flow and latency-under-load cohorts before revisiting the default. |
+| 2026-08-20 | Intermittent iOS extension memory terminations have been observed around Auto/H3 operation and parallel packet floods, but deterministic Go ownership tests do not reproduce an unbounded heap or identify whether the retained memory is Go, native runtime, QUIC, socket, or kernel state. | Prefer H1 over H3 in production Auto while retaining explicit H3 and H3 fallback for diagnosis. Treat the physical-device campaign above, including OS footprint and termination evidence, as the release gate; synthetic heap tests remain guardrails rather than proof of mobile stability. |
 
 ## Results log
 

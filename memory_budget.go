@@ -21,15 +21,45 @@ import (
 var referenceMemoryBudgetByteCount = mib(64)
 
 var memoryBudgetByteCount atomic.Int64
+var defaultPlatformTransportBudget atomic.Pointer[PlatformTransportBudget]
+
+func init() {
+	defaultPlatformTransportBudget.Store(newDefaultPlatformTransportBudget(referenceMemoryBudgetByteCount))
+}
+
+func newDefaultPlatformTransportBudget(budgetByteCount ByteCount) *PlatformTransportBudget {
+	return NewPlatformTransportBudget(
+		// Keep the normal share at one quarter, but leave room for one H3
+		// carrier at the supported low-memory floor. Without this matching
+		// floor, an explicit H3 selection on the 8 MiB legacy host target
+		// would wait forever on a 2 MiB aggregate budget for a 3 MiB claim.
+		min(budgetByteCount, max(mib(3), budgetByteCount/4)),
+		16,
+	)
+}
 
 // SetMemoryBudget sets the process-wide memory budget that scales the
 // memory-dominant default settings. 0 (the default) disables scaling.
 func SetMemoryBudget(budgetByteCount ByteCount) {
 	memoryBudgetByteCount.Store(budgetByteCount)
+	if budgetByteCount <= 0 {
+		budgetByteCount = referenceMemoryBudgetByteCount
+	}
+	// Platform carriers normally share one quarter of the process target, with
+	// the single-H3 working floor applied above. A separate count cap throttles
+	// cold multi-client candidate expansion even when H1's byte reservation
+	// alone would allow every candidate to dial at once.
+	defaultPlatformTransportBudget.Store(newDefaultPlatformTransportBudget(budgetByteCount))
 }
 
 func MemoryBudget() ByteCount {
 	return memoryBudgetByteCount.Load()
+}
+
+// DefaultPlatformTransportBudget returns the process-wide budget sampled by
+// new PlatformTransport settings.
+func DefaultPlatformTransportBudget() *PlatformTransportBudget {
+	return defaultPlatformTransportBudget.Load()
 }
 
 // memoryScale returns the budget scale in (0, 1]

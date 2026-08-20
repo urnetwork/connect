@@ -13,6 +13,18 @@ func TestMemoryBudgetUnsetDefaults(t *testing.T) {
 	AssertEqual(t, DefaultReceiveBufferSettings().ReceiveQueueMaxByteCount, mib(2)+kib(512))
 	AssertEqual(t, DefaultWebRtcSettings().ReceiveBufferSize, kib(512))
 	AssertEqual(t, DefaultDohSettings().CacheMaxEntries, 4096)
+	platformBudget := DefaultPlatformTransportBudget()
+	if platformBudget == nil {
+		t.Fatal("unscaled defaults did not install the aggregate platform budget")
+	}
+	AssertEqual(t, platformBudget.Stats().TotalByteCount, mib(16))
+	AssertEqual(t, platformBudget.Stats().MaxTransportCount, 16)
+	firstPlatformBudget := DefaultPlatformTransportSettings().PlatformTransportBudget
+	secondPlatformBudget := DefaultPlatformTransportSettings().PlatformTransportBudget
+	if firstPlatformBudget != secondPlatformBudget {
+		t.Fatal("default platform settings did not share one process budget")
+	}
+	AssertEqual(t, DefaultMultiClientSettings().EvaluationPoolMultiple, 2)
 	tunSettings := DefaultTunSettings()
 	AssertEqual(t, tunSettings.UdpReceiveBufferByteCount, int(mib(1)))
 	// 2026-08: raised so a single stream's auto-tuned window can cover the
@@ -30,6 +42,31 @@ func TestMemoryBudgetScaledSettings(t *testing.T) {
 	AssertEqual(t, DefaultReceiveBufferSettings().ReceiveQueueMaxByteCount, (mib(2)+kib(512))/2)
 	AssertEqual(t, DefaultWebRtcSettings().ReceiveBufferSize, kib(256))
 	AssertEqual(t, DefaultDohSettings().CacheMaxEntries, 2048)
+	platformBudget := DefaultPlatformTransportBudget()
+	if platformBudget == nil {
+		t.Fatal("scaled process budget did not create a shared platform transport budget")
+	}
+	platformStats := platformBudget.Stats()
+	AssertEqual(t, platformStats.TotalByteCount, mib(8))
+	AssertEqual(t, platformStats.MaxTransportCount, 16)
+	platformSettings := DefaultPlatformTransportSettings()
+	if platformSettings.PlatformTransportBudget != platformBudget {
+		t.Fatal("platform settings did not use the current shared budget")
+	}
+	AssertEqual(t, platformSettings.H1BudgetByteCount, kib(256))
+	AssertEqual(t, platformSettings.H3BudgetByteCount, mib(4))
+	AssertEqual(t, platformSettings.H3SocketReadBufferByteCount, kib(512))
+	AssertEqual(t, platformSettings.H3SocketWriteBufferByteCount, kib(512))
+	if platformStats.TotalByteCount <
+		platformSettings.H1BudgetByteCount+platformSettings.H3BudgetByteCount {
+		t.Fatal("32 MiB Auto budget cannot fit one H1 and one H3 carrier")
+	}
+	AssertEqual(t, DefaultMultiClientSettings().EvaluationPoolMultiple, 1)
+	packetTranslationSettings := DefaultPacketTranslationSettings()
+	AssertEqual(t, packetTranslationSettings.DnsMaxCombineBytes, mib(1))
+	AssertEqual(t, packetTranslationSettings.DnsMaxCombineBytesPerAddress, kib(128))
+	AssertEqual(t, packetTranslationSettings.DnsMaxPumpHostsPerAddress, 512)
+	AssertEqual(t, packetTranslationSettings.DnsMaxPumpHosts, int64(4096))
 	tunSettings := DefaultTunSettings()
 	AssertEqual(t, tunSettings.UdpReceiveBufferByteCount, int(kib(512)))
 	AssertEqual(t, tunSettings.TcpReceiveBuffer.Default, int(kib(512)))
@@ -46,6 +83,18 @@ func TestMemoryBudgetFloors(t *testing.T) {
 	AssertEqual(t, DefaultWebRtcSettings().ReceiveBufferSize, kib(256))
 	AssertEqual(t, DefaultDohSettings().CacheMaxEntries, 512)
 	AssertEqual(t, DefaultTunSettings().TcpReceiveBuffer.Max, int(kib(512)))
+
+	// The smallest supported host target can still admit one explicitly
+	// selected H3 carrier; its aggregate budget and reservation share a floor.
+	SetMemoryBudget(mib(8))
+	legacyPlatformBudget := DefaultPlatformTransportBudget().Stats()
+	legacyPlatformSettings := DefaultPlatformTransportSettings()
+	AssertEqual(t, legacyPlatformBudget.TotalByteCount, mib(3))
+	AssertEqual(t, legacyPlatformSettings.H3BudgetByteCount, mib(3))
+	if legacyPlatformSettings.H1BudgetByteCount+legacyPlatformSettings.H3BudgetByteCount <=
+		legacyPlatformBudget.TotalByteCount {
+		t.Fatal("8 MiB Auto budget unexpectedly admitted H1 and H3 together")
+	}
 
 	// budgets above the reference never scale up
 	SetMemoryBudget(mib(1024))

@@ -2,8 +2,10 @@ package connect
 
 // This file exposes an opt-in, lock-free measurement boundary between
 // Conn.SendDatagram queue admission and the application's ReceiveDatagram
-// dequeue. It is disabled in production unless a caller supplies the counter
-// set in PlatformTransportSettings (or the server's analogous settings).
+// dequeue. Default client settings supply a counter set so PTO and handshake
+// blackholes are observable in production; callers can still set it to nil on
+// a custom settings value to disable tracing. The server's analogous setting
+// remains opt-in.
 
 import (
 	"context"
@@ -57,6 +59,11 @@ type H3QuicPacketStatsSnapshot struct {
 	RemoteKeyUpdateCount                           uint64
 	KeyDiscardCount                                uint64
 	LostPacketCount                                uint64
+	ProbeTimeoutCount                              uint64
+	HandshakeAttemptCount                          uint64
+	HandshakeSuccessCount                          uint64
+	HandshakeFailureCount                          uint64
+	HandshakeSentWithoutResponseCount              uint64
 	MtuUpdateCount                                 uint64
 	CurrentMtu                                     int64
 }
@@ -206,6 +213,11 @@ type H3QuicPacketStats struct {
 	remoteKeyUpdateCount                           atomic.Uint64
 	keyDiscardCount                                atomic.Uint64
 	lostPacketCount                                atomic.Uint64
+	probeTimeoutCount                              atomic.Uint64
+	handshakeAttemptCount                          atomic.Uint64
+	handshakeSuccessCount                          atomic.Uint64
+	handshakeFailureCount                          atomic.Uint64
+	handshakeSentWithoutResponseCount              atomic.Uint64
 	mtuUpdateCount                                 atomic.Uint64
 	currentMtu                                     atomic.Int64
 }
@@ -247,6 +259,11 @@ func (self *H3QuicPacketStats) Snapshot() H3QuicPacketStatsSnapshot {
 		RemoteKeyUpdateCount:                           self.remoteKeyUpdateCount.Load(),
 		KeyDiscardCount:                                self.keyDiscardCount.Load(),
 		LostPacketCount:                                self.lostPacketCount.Load(),
+		ProbeTimeoutCount:                              self.probeTimeoutCount.Load(),
+		HandshakeAttemptCount:                          self.handshakeAttemptCount.Load(),
+		HandshakeSuccessCount:                          self.handshakeSuccessCount.Load(),
+		HandshakeFailureCount:                          self.handshakeFailureCount.Load(),
+		HandshakeSentWithoutResponseCount:              self.handshakeSentWithoutResponseCount.Load(),
 		MtuUpdateCount:                                 self.mtuUpdateCount.Load(),
 		CurrentMtu:                                     self.currentMtu.Load(),
 	}
@@ -255,20 +272,67 @@ func (self *H3QuicPacketStats) Snapshot() H3QuicPacketStatsSnapshot {
 // Tracer matches quic.Config.Tracer. Each returned trace reduces events into
 // atomics immediately and never retains frame slices or payload bytes.
 func (self *H3QuicPacketStats) Tracer(
-	_ context.Context,
-	_ bool,
-	_ quic.ConnectionID,
+	ctx context.Context,
+	perspective bool,
+	connectionID quic.ConnectionID,
 ) qlogwriter.Trace {
-	self.connectionCount.Add(1)
-	return &h3QuicPacketStatsTrace{stats: self}
+	return self.tracerForAttempt(nil)(ctx, perspective, connectionID)
+}
+
+func (self *H3QuicPacketStats) tracerForAttempt(
+	attempt *h3QuicHandshakeAttempt,
+) func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace {
+	return func(
+		_ context.Context,
+		_ bool,
+		_ quic.ConnectionID,
+	) qlogwriter.Trace {
+		self.connectionCount.Add(1)
+		return &h3QuicPacketStatsTrace{stats: self, attempt: attempt}
+	}
+}
+
+type h3QuicHandshakeAttempt struct {
+	stats    *H3QuicPacketStats
+	sent     atomic.Uint64
+	received atomic.Uint64
+	pto      atomic.Uint64
+	finished atomic.Bool
+}
+
+func (self *H3QuicPacketStats) beginHandshakeAttempt() *h3QuicHandshakeAttempt {
+	if self == nil {
+		return nil
+	}
+	self.handshakeAttemptCount.Add(1)
+	return &h3QuicHandshakeAttempt{stats: self}
+}
+
+func (self *h3QuicHandshakeAttempt) finish(success bool) {
+	if self == nil || !self.finished.CompareAndSwap(false, true) {
+		return
+	}
+	if success {
+		self.stats.handshakeSuccessCount.Add(1)
+		return
+	}
+	self.stats.handshakeFailureCount.Add(1)
+	if 0 < self.sent.Load() && self.received.Load() == 0 {
+		self.stats.handshakeSentWithoutResponseCount.Add(1)
+	}
+}
+
+func (self *h3QuicHandshakeAttempt) sentWithoutResponse() bool {
+	return self != nil && 0 < self.sent.Load() && self.received.Load() == 0
 }
 
 type h3QuicPacketStatsTrace struct {
-	stats *H3QuicPacketStats
+	stats   *H3QuicPacketStats
+	attempt *h3QuicHandshakeAttempt
 }
 
 func (self *h3QuicPacketStatsTrace) AddProducer() qlogwriter.Recorder {
-	return &h3QuicPacketStatsRecorder{stats: self.stats}
+	return &h3QuicPacketStatsRecorder{stats: self.stats, attempt: self.attempt}
 }
 
 func (self *h3QuicPacketStatsTrace) SupportsSchemas(string) bool {
@@ -276,8 +340,9 @@ func (self *h3QuicPacketStatsTrace) SupportsSchemas(string) bool {
 }
 
 type h3QuicPacketStatsRecorder struct {
-	stats  *H3QuicPacketStats
-	closed atomic.Bool
+	stats   *H3QuicPacketStats
+	attempt *h3QuicHandshakeAttempt
+	closed  atomic.Bool
 }
 
 func h3QuicDatagramFrames(frames []qlog.Frame) (count uint64, byteCount uint64) {
@@ -292,6 +357,9 @@ func h3QuicDatagramFrames(frames []qlog.Frame) (count uint64, byteCount uint64) 
 
 func (self *h3QuicPacketStatsRecorder) recordSent(event qlog.PacketSent) {
 	self.stats.sentPacketCount.Add(1)
+	if self.attempt != nil {
+		self.attempt.sent.Add(1)
+	}
 	self.stats.sentPacketByteCount.Add(uint64(max(0, event.Raw.Length)))
 	self.stats.PacketFingerprints.recordSent(event.DatagramPayloadChecksum)
 	frameCount, byteCount := h3QuicDatagramFrames(event.Frames)
@@ -304,6 +372,9 @@ func (self *h3QuicPacketStatsRecorder) recordSent(event qlog.PacketSent) {
 
 func (self *h3QuicPacketStatsRecorder) recordReceived(event qlog.PacketReceived) {
 	self.stats.receivedPacketCount.Add(1)
+	if self.attempt != nil {
+		self.attempt.received.Add(1)
+	}
 	self.stats.receivedPacketByteCount.Add(uint64(max(0, event.Raw.Length)))
 	self.stats.PacketFingerprints.recordReceived(event.DatagramPayloadChecksum)
 	frameCount, byteCount := h3QuicDatagramFrames(event.Frames)
@@ -398,6 +469,20 @@ func (self *h3QuicPacketStatsRecorder) RecordEvent(event qlogwriter.Event) {
 		self.recordDropped(*event)
 	case qlog.PacketLost, *qlog.PacketLost:
 		self.stats.lostPacketCount.Add(1)
+	case qlog.LossTimerUpdated:
+		if event.Type == qlog.LossTimerUpdateTypeExpired && event.TimerType == qlog.TimerTypePTO {
+			self.stats.probeTimeoutCount.Add(1)
+			if self.attempt != nil {
+				self.attempt.pto.Add(1)
+			}
+		}
+	case *qlog.LossTimerUpdated:
+		if event.Type == qlog.LossTimerUpdateTypeExpired && event.TimerType == qlog.TimerTypePTO {
+			self.stats.probeTimeoutCount.Add(1)
+			if self.attempt != nil {
+				self.attempt.pto.Add(1)
+			}
+		}
 	case qlog.KeyUpdated:
 		self.recordKeyUpdated(event)
 	case *qlog.KeyUpdated:

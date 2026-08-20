@@ -67,6 +67,7 @@ const platformWebSocketWriteBatchMaxMessages = 8
 const (
 	platformH3WriteBatchMaxMessageCount = 16
 	platformH3WriteBatchMaxByteCount    = 64 * 1024
+	DefaultDnsPumpHost                  = "whodis.bringyour.com"
 )
 
 func transportTypeFromMode(mode TransportMode) TransportType {
@@ -99,22 +100,23 @@ const (
 	TransportModeAuto      TransportMode = "auto"
 	TransportModeH3DnsPump TransportMode = "h3dnspump"
 	TransportModeH3Dns     TransportMode = "h3dns"
-	TransportModeH1        TransportMode = "h1"
 	TransportModeH3        TransportMode = "h3"
+	TransportModeH1        TransportMode = "h1"
 	TransportModeNone      TransportMode = ""
 )
 
 // DefaultTransportModePreferences returns the production Auto policy. Lower
-// numbers are preferred. H3 and H1 deliberately tie so every healthy direct
-// carrier remains registered in parallel; DNS and DNS pump are progressively
+// numbers are preferred. H1 is deliberately the primary carrier while H3
+// remains a direct fallback for paths where H1 is unavailable. Explicit H3
+// selection bypasses this Auto ordering. DNS and DNS pump are progressively
 // lower availability fallbacks.
 func DefaultTransportModePreferences() map[TransportMode]int {
 	return map[TransportMode]int{
-		TransportModeH3: 1,
 		TransportModeH1: 1,
+		TransportModeH3: 2,
 
-		TransportModeH3Dns:     2,
-		TransportModeH3DnsPump: 3,
+		TransportModeH3Dns:     3,
+		TransportModeH3DnsPump: 4,
 	}
 }
 
@@ -434,6 +436,27 @@ type PlatformTransportSettings struct {
 	AuthFrameObserver    func(authFrameBytes []byte)
 	TransportBufferSize  int
 	InactiveDrainTimeout time.Duration
+	// InactiveDrainMaxTimeout is the absolute lifetime of a carrier after a
+	// strictly better mode supersedes it. Payload activity may extend the quiet
+	// drain, but never beyond this bound. A non-positive value uses twice
+	// InactiveDrainTimeout.
+	InactiveDrainMaxTimeout time.Duration
+	// H1MaxMessageByteCount caps each complete WebSocket message before it can
+	// grow a pooled buffer. A non-positive value resolves to the framer limit.
+	H1MaxMessageByteCount int64
+	// PlatformTransportBudget is shared across window transports. Reservations
+	// remain held through reconnects so socket churn cannot escape the cap.
+	PlatformTransportBudget *PlatformTransportBudget
+	// Non-positive carrier/socket values resolve to the memory-scaled defaults.
+	H1BudgetByteCount            ByteCount
+	H3BudgetByteCount            ByteCount
+	H3SocketReadBufferByteCount  ByteCount
+	H3SocketWriteBufferByteCount ByteCount
+	// PlatformTransportBudgetPriority orders optional Auto-H3 leases when the
+	// aggregate budget cannot hold every caller. Foreground client windows use
+	// the zero value; background/provider transports use the background value.
+	// Explicit H3 ignores this value and always outranks optional Auto H3.
+	PlatformTransportBudgetPriority int
 	// it smoothes out the h3 transition to not start/stop h1 if h3 connects in this time
 	ModeInitialDelay time.Duration
 	// ModePreferences configures the enabled Auto modes and their priorities.
@@ -448,6 +471,11 @@ type PlatformTransportSettings struct {
 
 	H3Port  int
 	DnsPort int
+	// DnsPumpHost is only the public UDP/53 destination for H3DnsPump. QUIC
+	// authentication and TLS SNI continue to use the platform URL's hostname.
+	// Keeping this explicit avoids deriving an infrastructure hostname from the
+	// packet codec's canonical TLD representation.
+	DnsPumpHost string
 
 	// FIXME
 	DnsTlds        [][]byte
@@ -469,9 +497,11 @@ type PlatformTransportSettings struct {
 	// collector to aggregate reconnect generations in a larger measurement.
 	H3DatagramSettings *H3DatagramSettings
 	H3DatagramStats    *H3DatagramStats
-	// H3QuicPacketStats, when non-nil, enables packet-level qlog reduction for
-	// diagnostics. It distinguishes SendDatagram queue admission from actual
-	// QUIC DATAGRAM frame emission and application dequeue.
+	// H3QuicPacketStats, when non-nil, enables packet-level qlog reduction. The
+	// default collector makes PTO and sent-with-zero-response handshakes visible
+	// in production and also distinguishes SendDatagram queue admission from
+	// actual QUIC DATAGRAM frame emission and application dequeue. Set nil on a
+	// custom settings value only when tracing overhead is intentionally disabled.
 	H3QuicPacketStats *H3QuicPacketStats
 	// Borrows one complete routed Transfer message after its successful H3
 	// carrier write. datagram distinguishes the packet lane from the reliable
@@ -491,6 +521,9 @@ type PlatformTransportSettings struct {
 	// Nil outside package tests. The observer borrows one H3 receive message
 	// after the channel accepts its ownership.
 	afterH3ReceiveEnqueueForTest func([]byte)
+	// Nil outside package tests. Replaces one H3 carrier runner so budget lease
+	// preemption can hold its exact teardown boundary without opening a socket.
+	runH3ModeForTest func(context.Context, TransportMode, time.Duration)
 }
 
 func DefaultPlatformTransportSettings() *PlatformTransportSettings {
@@ -499,35 +532,44 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		panic(err)
 	}
 	return &PlatformTransportSettings{
-		HttpConnectTimeout:   15 * time.Second,
-		WsHandshakeTimeout:   15 * time.Second,
-		QuicConnectTimeout:   15 * time.Second,
-		QuicHandshakeTimeout: 15 * time.Second,
-		QuicTlsConfig:        tlsConfig,
-		AuthTimeout:          5 * time.Second,
-		ReconnectTimeout:     5 * time.Second,
-		PingTimeout:          5 * time.Second,
-		WriteTimeout:         10 * time.Second,
-		ReadTimeout:          30 * time.Second,
-		TransportBufferSize:  32,
-		InactiveDrainTimeout: 30 * time.Second,
-		ModeInitialDelay:     2 * time.Second,
-		ModePreferences:      DefaultTransportModePreferences(),
+		HttpConnectTimeout:      15 * time.Second,
+		WsHandshakeTimeout:      15 * time.Second,
+		QuicConnectTimeout:      15 * time.Second,
+		QuicHandshakeTimeout:    15 * time.Second,
+		QuicTlsConfig:           tlsConfig,
+		AuthTimeout:             5 * time.Second,
+		ReconnectTimeout:        5 * time.Second,
+		PingTimeout:             5 * time.Second,
+		WriteTimeout:            10 * time.Second,
+		ReadTimeout:             30 * time.Second,
+		TransportBufferSize:     32,
+		InactiveDrainTimeout:    30 * time.Second,
+		InactiveDrainMaxTimeout: 60 * time.Second,
+		ModeInitialDelay:        2 * time.Second,
+		ModePreferences:         DefaultTransportModePreferences(),
 		// MinConnectDelay:      0,
 		// MaxConnectDelay:      1 * time.Second,
 		ProtocolVersion: DefaultProtocolVersion,
 		H3Port:          443,
 		DnsPort:         53,
+		DnsPumpHost:     DefaultDnsPumpHost,
 		// FIXME
 		DnsTlds: [][]byte{[]byte("ur.xyz.")},
 		// servers are migrated on 2025-06-12. We can remove this and always use true.
 		V2H1Auth: true,
 		// the platform transport must carry the per-peer encryption handshake,
 		// so its framer max is the connect runtime minimum message length
-		FramerSettings:     DefaultFramerSettings(int(DefaultClientSettings().MinimumMessageLenLimit())),
-		PtDnsSlowMultiple:  4,
-		EnableH3Datagrams:  true,
-		H3DatagramSettings: DefaultH3DatagramSettings(),
+		FramerSettings:               DefaultFramerSettings(int(DefaultClientSettings().MinimumMessageLenLimit())),
+		H1MaxMessageByteCount:        DefaultClientSettings().MinimumMessageLenLimit(),
+		PlatformTransportBudget:      DefaultPlatformTransportBudget(),
+		H1BudgetByteCount:            MemoryScaledByteCount(kib(512), kib(256)),
+		H3BudgetByteCount:            MemoryScaledByteCount(mib(8), mib(3)),
+		H3SocketReadBufferByteCount:  MemoryScaledByteCount(mib(1), kib(256)),
+		H3SocketWriteBufferByteCount: MemoryScaledByteCount(mib(1), kib(256)),
+		PtDnsSlowMultiple:            4,
+		EnableH3Datagrams:            true,
+		H3DatagramSettings:           DefaultH3DatagramSettings(),
+		H3QuicPacketStats:            &H3QuicPacketStats{},
 	}
 }
 
@@ -562,6 +604,11 @@ type PlatformTransport struct {
 	h3DatagramSettings         *H3DatagramSettings
 	h3DatagramStats            *H3DatagramStats
 	h3DatagramReassemblyBudget *H3DatagramReassemblyBudget
+	// Claims register synchronously in the constructor, before carrier
+	// goroutines start, so pending H1 demand is visible to every H3 admission.
+	h1BudgetReservation *platformTransportBudgetReservation
+	h3BudgetReservation *platformTransportBudgetReservation
+	h3Gate              *platformH3Gate
 
 	stateLock sync.Mutex
 	// notified when availableModes changes. availableModes is a map, so it
@@ -646,6 +693,24 @@ func (self *PlatformTransport) Kick() {
 // registered on the route manager
 func (self *PlatformTransport) IsConnected() bool {
 	return 0 < self.registeredCount.Load()
+}
+
+// IsWaitingForBudget reports whether the reservation required by the selected
+// target mode is currently blocked. Auto's H3 reservation is optional and is
+// therefore not reported once its required H1 path can run. Policy migration
+// uses this to break an old carrier only when an explicit user selection cannot
+// otherwise obtain its memory reservation.
+func (self *PlatformTransport) IsWaitingForBudget() bool {
+	switch self.targetMode {
+	case TransportModeH1:
+		return self.h1BudgetReservation.IsWaiting()
+	case TransportModeH3, TransportModeH3Dns, TransportModeH3DnsPump:
+		return self.h3BudgetReservation.IsWaiting()
+	case TransportModeAuto:
+		return self.h1BudgetReservation.IsWaiting()
+	default:
+		return false
+	}
 }
 
 // ConnectedNotify returns a channel that closes on the next connect state
@@ -824,6 +889,37 @@ func NewPlatformTransportWithTargetMode(
 		connectedMonitor:     NewMonitor(),
 		kickMonitor:          NewMonitor(),
 	}
+	transport.h3Gate = newPlatformH3Gate(transport)
+	h1Enabled := targetMode == TransportModeH1 ||
+		(targetMode == TransportModeAuto &&
+			transport.modePreference(TransportModeH1) != modePreferenceNone)
+	h3Enabled := targetMode == TransportModeH3 || targetMode == TransportModeH3Dns ||
+		targetMode == TransportModeH3DnsPump ||
+		(targetMode == TransportModeAuto &&
+			(transport.modePreference(TransportModeH3) != modePreferenceNone ||
+				transport.modePreference(TransportModeH3Dns) != modePreferenceNone ||
+				transport.modePreference(TransportModeH3DnsPump) != modePreferenceNone))
+	if settings.PlatformTransportBudget != nil {
+		if h1Enabled {
+			transport.h1BudgetReservation = settings.PlatformTransportBudget.register(
+				platformTransportBudgetH1,
+				transport.h1BudgetByteCount(),
+				true,
+			)
+		}
+		if h3Enabled {
+			h3BudgetClass := platformTransportBudgetH3Explicit
+			if targetMode == TransportModeAuto {
+				h3BudgetClass = platformTransportBudgetH3Auto
+			}
+			transport.h3BudgetReservation = settings.PlatformTransportBudget.registerWithPriority(
+				h3BudgetClass,
+				transport.h3BudgetByteCount(),
+				!h1Enabled,
+				settings.PlatformTransportBudgetPriority,
+			)
+		}
+	}
 	// a host network path change kicks the live connection so the re-dial
 	// happens now instead of after a ping/write timeout notices the dead path.
 	// unsubscribe rides the run loop exit (ctx cancel), not just Close — most
@@ -966,12 +1062,106 @@ func (self *PlatformTransport) runMode(mode TransportMode, initialDelay time.Dur
 	case TransportModeH1:
 		self.runH1(initialDelay)
 	case TransportModeH3:
-		self.runH3(TransportModeH3, initialDelay, 1)
+		self.runH3(self.ctx, TransportModeH3, initialDelay, 1)
 	case TransportModeH3Dns:
-		self.runH3(TransportModeH3Dns, initialDelay, self.settings.PtDnsSlowMultiple)
+		self.runH3(self.ctx, TransportModeH3Dns, initialDelay, self.settings.PtDnsSlowMultiple)
 	case TransportModeH3DnsPump:
-		self.runH3(TransportModeH3DnsPump, initialDelay, self.settings.PtDnsSlowMultiple)
+		self.runH3(self.ctx, TransportModeH3DnsPump, initialDelay, self.settings.PtDnsSlowMultiple)
 	}
+}
+
+func (self *PlatformTransport) runH3Mode(
+	ctx context.Context,
+	mode TransportMode,
+	initialDelay time.Duration,
+) {
+	if self.settings.runH3ModeForTest != nil {
+		self.settings.runH3ModeForTest(ctx, mode, initialDelay)
+		return
+	}
+	switch mode {
+	case TransportModeH3:
+		self.runH3(ctx, TransportModeH3, initialDelay, 1)
+	case TransportModeH3Dns:
+		self.runH3(ctx, TransportModeH3Dns, initialDelay, self.settings.PtDnsSlowMultiple)
+	case TransportModeH3DnsPump:
+		self.runH3(ctx, TransportModeH3DnsPump, initialDelay, self.settings.PtDnsSlowMultiple)
+	}
+}
+
+func isH3TransportMode(mode TransportMode) bool {
+	switch mode {
+	case TransportModeH3, TransportModeH3Dns, TransportModeH3DnsPump:
+		return true
+	default:
+		return false
+	}
+}
+
+func (self *PlatformTransport) startH3ModeGroup(modes []TransportMode, auto bool) {
+	if len(modes) == 0 {
+		return
+	}
+	self.startModeRunner(func() {
+		reservation := self.h3BudgetReservation
+		if reservation != nil {
+			defer reservation.Release()
+		}
+		for self.ctx.Err() == nil {
+			if reservation != nil && !reservation.Acquire(self.ctx) {
+				return
+			}
+
+			groupCtx, cancelGroup := context.WithCancel(self.ctx)
+			var waitGroup sync.WaitGroup
+			for _, mode := range modes {
+				mode := mode
+				initialDelay := time.Duration(0)
+				if auto {
+					initialDelay = self.modeInitialDelay(mode)
+				}
+				waitGroup.Add(1)
+				go HandleError(func() {
+					defer waitGroup.Done()
+					self.runH3Mode(groupCtx, mode, initialDelay)
+					// A carrier runner is normally process-lifetime. Preserve the old
+					// fail-closed behavior for an unexpected return, but not for an
+					// intentional budget preemption of this H3 group.
+					if groupCtx.Err() == nil {
+						self.cancel()
+					}
+				}, self.cancel)
+			}
+			groupDone := make(chan struct{})
+			go func() {
+				waitGroup.Wait()
+				close(groupDone)
+			}()
+
+			var preempt <-chan struct{}
+			if reservation != nil {
+				preempt = reservation.PreemptNotify()
+			}
+			preempted := false
+			select {
+			case <-self.ctx.Done():
+			case <-groupDone:
+			case <-preempt:
+				preempted = true
+			}
+			cancelGroup()
+			waitGroup.Wait()
+			if !preempted || self.ctx.Err() != nil || reservation == nil {
+				return
+			}
+			// Routes and sockets are gone before the accounting lease is
+			// yielded. The pending reservation will reacquire when the higher-
+			// precedence claimant leaves.
+			if !reservation.Yield() {
+				return
+			}
+		}
+	})
 }
 
 func (self *PlatformTransport) run() {
@@ -979,28 +1169,44 @@ func (self *PlatformTransport) run() {
 		self.cancel()
 		self.runWaitGroup.Wait()
 	}()
+	if self.h1BudgetReservation != nil {
+		defer self.h1BudgetReservation.Release()
+		if !self.h1BudgetReservation.Acquire(self.ctx) {
+			return
+		}
+	}
 
 	switch self.targetMode {
 	case TransportModeAuto:
+		h3Modes := []TransportMode{}
 		for _, mode := range self.orderedModes() {
 			mode := mode
+			if isH3TransportMode(mode) && self.h3BudgetReservation != nil {
+				h3Modes = append(h3Modes, mode)
+				continue
+			}
 			initialDelay := self.modeInitialDelay(mode)
 			self.startModeRunner(func() {
 				self.runMode(mode, initialDelay)
 			})
 		}
+		self.startH3ModeGroup(h3Modes, true)
 	case TransportModeH3, TransportModeH1, TransportModeH3Dns, TransportModeH3DnsPump:
-		self.startModeRunner(func() {
-			self.runMode(self.targetMode, 0)
-		})
+		if isH3TransportMode(self.targetMode) && self.h3BudgetReservation != nil {
+			self.startH3ModeGroup([]TransportMode{self.targetMode}, false)
+		} else {
+			self.startModeRunner(func() {
+				self.runMode(self.targetMode, 0)
+			})
+		}
 	}
 
 	for {
 		available, notify := self.modesAvailable()
 
 		// descending preference. the comparator must be consistent: the previous
-		// one returned 1 for both (a, b) and (b, a) when the preferences tied
-		// (h3 and h1 do), and `maps.Keys` is randomly ordered, so the election
+		// one returned 1 for both (a, b) and (b, a) when custom preferences tied,
+		// and `maps.Keys` is randomly ordered, so the election
 		// picked an arbitrary winner among tied modes on every pass — flipping
 		// the active mode and thrashing the gates. break ties on the mode name
 		orderedModes := self.orderedModes()
@@ -1012,9 +1218,9 @@ func (self *PlatformTransport) run() {
 			}
 		}
 
-		// equally preferred modes do not preempt each other: whichever connected
-		// first stays active (h3 and h1 tie, as do h3dns and h3dnspump). the
-		// active mode changes only when something strictly better becomes
+		// equally preferred custom modes do not preempt each other: whichever
+		// connected first stays active. the active mode changes only when
+		// something strictly better becomes
 		// available, or when it is no longer available itself — in which case it
 		// falls back to the best that remains, and to TransportModeNone when
 		// nothing does. that fallback previously lived in an `else` on
@@ -1072,6 +1278,122 @@ func (self *PlatformTransport) standDown(mode TransportMode) (bool, chan struct{
 	return self.isBetterMode(activeMode, mode), notify
 }
 
+func (self *PlatformTransport) h1MaxMessageByteCount() int64 {
+	if 0 < self.settings.H1MaxMessageByteCount {
+		return self.settings.H1MaxMessageByteCount
+	}
+	if self.framerSettings != nil && 0 < self.framerSettings.MaxMessageLen {
+		return int64(self.framerSettings.MaxMessageLen)
+	}
+	return DefaultClientSettings().MinimumMessageLenLimit()
+}
+
+func (self *PlatformTransport) h1BudgetByteCount() ByteCount {
+	if 0 < self.settings.H1BudgetByteCount {
+		return self.settings.H1BudgetByteCount
+	}
+	return MemoryScaledByteCount(kib(512), kib(256))
+}
+
+func (self *PlatformTransport) h3BudgetByteCount() ByteCount {
+	if 0 < self.settings.H3BudgetByteCount {
+		return self.settings.H3BudgetByteCount
+	}
+	return MemoryScaledByteCount(mib(8), mib(3))
+}
+
+func (self *PlatformTransport) h3SocketReadBufferByteCount() ByteCount {
+	if 0 < self.settings.H3SocketReadBufferByteCount {
+		return self.settings.H3SocketReadBufferByteCount
+	}
+	return MemoryScaledByteCount(mib(1), kib(256))
+}
+
+func (self *PlatformTransport) h3SocketWriteBufferByteCount() ByteCount {
+	if 0 < self.settings.H3SocketWriteBufferByteCount {
+		return self.settings.H3SocketWriteBufferByteCount
+	}
+	return MemoryScaledByteCount(mib(1), kib(256))
+}
+
+// runInactiveDrain bounds a carrier only after a strictly better mode has
+// superseded it. Control frames and keepalives never reset the quiet interval;
+// callers increment the counters only for routed payload. Even continuous
+// payload cannot retain the fallback beyond the absolute deadline.
+func (self *PlatformTransport) runInactiveDrain(
+	ctx context.Context,
+	mode TransportMode,
+	slowMultiple int,
+	readCounter *atomic.Uint64,
+	writeCounter *atomic.Uint64,
+	cancel context.CancelFunc,
+) {
+	quietTimeout := time.Duration(slowMultiple) * self.settings.InactiveDrainTimeout
+	if quietTimeout <= 0 {
+		quietTimeout = time.Millisecond
+	}
+	maxTimeout := time.Duration(slowMultiple) * self.settings.InactiveDrainMaxTimeout
+	if maxTimeout <= 0 {
+		maxTimeout = 2 * quietTimeout
+	}
+
+	var supersededSince time.Time
+	var startReadCount uint64
+	var startWriteCount uint64
+	for {
+		activeMode, notify := self.activeMode()
+		if !self.isBetterMode(activeMode, mode) {
+			supersededSince = time.Time{}
+			select {
+			case <-ctx.Done():
+				return
+			case <-notify:
+			}
+			continue
+		}
+
+		if supersededSince.IsZero() {
+			supersededSince = time.Now()
+			startReadCount = readCounter.Load()
+			startWriteCount = writeCounter.Load()
+		}
+		remaining := maxTimeout - time.Since(supersededSince)
+		if remaining <= 0 {
+			cancel()
+			return
+		}
+		wait := min(quietTimeout, remaining)
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		case <-notify:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			continue
+		case <-timer.C:
+		}
+
+		if maxTimeout <= time.Since(supersededSince) ||
+			(readCounter.Load() == startReadCount && writeCounter.Load() == startWriteCount) {
+			cancel()
+			return
+		}
+		startReadCount = readCounter.Load()
+		startWriteCount = writeCounter.Load()
+	}
+}
+
 func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 	// connect and update route manager for this transport
 	defer self.cancel()
@@ -1122,6 +1444,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			if err != nil {
 				return nil, err
 			}
+			ws.SetReadLimit(self.h1MaxMessageByteCount())
 
 			success := false
 			defer func() {
@@ -1380,31 +1703,14 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				drain(send)
 			}()
 			startConnectionWorker(func() {
-				defer handleCancel()
-
-				for {
-					mode, notify := self.activeMode()
-					if mode != TransportModeH1 {
-						startReadCount := readCounter.Load()
-						startWriteCount := writeCounter.Load()
-						select {
-						case <-handleCtx.Done():
-							return
-						case <-time.After(self.settings.InactiveDrainTimeout):
-							// no activity after cool down, shut down this transport
-							if readCounter.Load() == startReadCount && writeCounter.Load() == startWriteCount {
-								handleCancel()
-							}
-						case <-notify:
-						}
-					} else {
-						select {
-						case <-handleCtx.Done():
-							return
-						case <-notify:
-						}
-					}
-				}
+				self.runInactiveDrain(
+					handleCtx,
+					TransportModeH1,
+					1,
+					&readCounter,
+					&writeCounter,
+					handleCancel,
+				)
 			}, handleCancel)
 
 			startConnectionWorker(func() {
@@ -1434,13 +1740,18 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					if self.log.V(2).Enabled() {
 						self.log.Infof("[ts]%s->\n", clientId)
 					}
-
-					writeCounter.Add(1)
 					return nil
 				}
 				write := func(message []byte) error {
 					ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
 					return writeMessage(message)
+				}
+				writePayload := func(message []byte) error {
+					if err := write(message); err != nil {
+						return err
+					}
+					writeCounter.Add(1)
+					return nil
 				}
 				writeSendMessage := func(message []byte) error {
 					if len(message) <= 16 {
@@ -1448,7 +1759,11 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						MessagePoolReturn(message)
 						return nil
 					}
-					return writeMessage(message)
+					if err := writeMessage(message); err != nil {
+						return err
+					}
+					writeCounter.Add(1)
+					return nil
 				}
 
 				writeBatchConn, _ :=
@@ -1534,7 +1849,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							if len(message) <= 16 {
 								self.log.Infof("[ts]send message must be >16 bytes (%d)\n", len(message))
 								MessagePoolReturn(message)
-							} else if write(message) != nil {
+							} else if writePayload(message) != nil {
 								return
 							}
 							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
@@ -1615,15 +1930,13 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					switch messageType {
 					case websocket.BinaryMessage:
 
-						message, err := MessagePoolReadAll(r)
+						message, err := MessagePoolReadAllLimit(r, self.h1MaxMessageByteCount())
 						if err != nil {
 							if self.log.V(2).Enabled() {
 								self.log.Infof("[tr]%s<- error = %s\n", clientId, err)
 							}
 							return
 						}
-
-						readCounter.Add(1)
 
 						if len(message) <= 16 {
 							if len(message) == 0 {
@@ -1666,7 +1979,6 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							}
 							continue
 						}
-
 						open, delivered := self.offerReceive(
 							handleCtx.Done(),
 							TransportModeH1,
@@ -1675,6 +1987,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						)
 						if !open {
 							return
+						}
+						if delivered {
+							readCounter.Add(1)
 						}
 						if delivered && self.log.V(2).Enabled() {
 							self.log.Infof("[tr]%s<-\n", clientId)
@@ -1728,10 +2043,13 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 	}
 }
 
-func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.Duration, slowMultiple int) {
+func (self *PlatformTransport) runH3(
+	ctx context.Context,
+	ptMode TransportMode,
+	initialTimeout time.Duration,
+	slowMultiple int,
+) {
 	// connect and update route manager for this transport
-	defer self.cancel()
-
 	if slowMultiple < 1 {
 		panic(fmt.Errorf("Bad slow multiple: %d", slowMultiple))
 	}
@@ -1740,7 +2058,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 
 	if 0 < initialTimeout {
 		select {
-		case <-self.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-time.After(initialTimeout):
 		}
@@ -1762,12 +2080,15 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 					return
 				}
 				select {
-				case <-self.ctx.Done():
+				case <-ctx.Done():
 					return
 				case <-notify:
 				}
 			}
 		}()
+		if ctx.Err() != nil {
+			return
+		}
 
 		reconnect := NewReconnect(self.settings.ReconnectTimeout)
 
@@ -1779,7 +2100,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			useH3Datagrams bool
 		}
 
-		connect := func() (*ConnStream, error) {
+		connect := func(attemptCtx context.Context) (*ConnStream, error) {
 			// quicConfig := &quic.Config{
 			// 	HandshakeIdleTimeout: self.settings.QuicConnectTimeout + self.settings.QuicHandshakeTimeout,
 			// }
@@ -1815,7 +2136,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			// socket is pinned to the physical egress interface.
 			egressPinned := false
 			if ptMode == TransportModeH3 && self.settings.H3PacketConnFactory != nil {
-				packetConn, err = self.settings.H3PacketConnFactory(self.ctx)
+				packetConn, err = self.settings.H3PacketConnFactory(attemptCtx)
 			} else {
 				udpConn, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 				if err == nil {
@@ -1848,6 +2169,11 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			if packetConn == nil {
 				return nil, fmt.Errorf("H3 packet connection factory returned nil")
 			}
+			packetConn = capPlatformPacketConn(
+				packetConn,
+				self.h3SocketReadBufferByteCount(),
+				self.h3SocketWriteBufferByteCount(),
+			)
 			// single close path: once packetConn is bound (either directly
 			// to udpConn or wrapping it via packetTranslation), it owns the
 			// close. before that, we close udpConn directly. avoids the
@@ -1876,34 +2202,34 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				// egress-pinned above, but the NAME must not resolve through
 				// the OS resolver, whose query follows the route table into
 				// the tunnel this process provides. See egress_dial.go.
-				udpAddr, err = resolveEgressUDPAddr(self.ctx, fmt.Sprintf("%s:%d", serverName, self.settings.DnsPort))
+				udpAddr, err = resolveEgressUDPAddr(attemptCtx, fmt.Sprintf("%s:%d", serverName, self.settings.DnsPort))
 				if err != nil {
 					return nil, err
 				}
 				ptSettings := DefaultPacketTranslationSettings()
 				ptSettings.DnsTlds = [][]byte{tld}
-				packetConn, err = NewPacketTranslation(self.ctx, PacketTranslationModeDns, udpConn, ptSettings)
+				packetConn, err = NewPacketTranslation(attemptCtx, PacketTranslationModeDns, packetConn, ptSettings)
 				if err != nil {
 					return nil, err
 				}
 			case TransportModeH3DnsPump:
 				tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
-				pumpServerName, err := pumpHost(self.platformUrl, tld)
-				if err != nil {
-					return nil, err
+				pumpServerName := strings.TrimSpace(self.settings.DnsPumpHost)
+				if pumpServerName == "" {
+					return nil, fmt.Errorf("H3 DNS pump host is empty")
 				}
-				udpAddr, err = resolveEgressUDPAddr(self.ctx, fmt.Sprintf("%s:%d", pumpServerName, self.settings.DnsPort))
+				udpAddr, err = resolveEgressUDPAddr(attemptCtx, fmt.Sprintf("%s:%d", pumpServerName, self.settings.DnsPort))
 				if err != nil {
 					return nil, err
 				}
 				ptSettings := DefaultPacketTranslationSettings()
 				ptSettings.DnsTlds = [][]byte{tld}
-				packetConn, err = NewPacketTranslation(self.ctx, PacketTranslationModeDnsPump, udpConn, ptSettings)
+				packetConn, err = NewPacketTranslation(attemptCtx, PacketTranslationModeDnsPump, packetConn, ptSettings)
 				if err != nil {
 					return nil, err
 				}
 			default:
-				udpAddr, err = resolveEgressUDPAddr(self.ctx, fmt.Sprintf("%s:%d", serverName, self.settings.H3Port))
+				udpAddr, err = resolveEgressUDPAddr(attemptCtx, fmt.Sprintf("%s:%d", serverName, self.settings.H3Port))
 				if err != nil {
 					return nil, err
 				}
@@ -1924,12 +2250,58 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 					quicTransport.Close()
 				}
 			}()
-			conn, err := quicTransport.DialEarly(self.ctx, udpAddr, tlsConfig, quicConfig)
+			handshakeAttempt := self.settings.H3QuicPacketStats.beginHandshakeAttempt()
+			if handshakeAttempt != nil {
+				quicConfig.Tracer = self.settings.H3QuicPacketStats.tracerForAttempt(handshakeAttempt)
+			}
+			conn, err := quicTransport.DialEarly(attemptCtx, udpAddr, tlsConfig, quicConfig)
 
 			// conn, err := quic.Dial(self.ctx, packetConn, packetConn.ConnectedAddr(), self.settings.QuicTlsConfig, quicConfig)
 			if err != nil {
+				handshakeAttempt.finish(false)
+				if handshakeAttempt.sentWithoutResponse() {
+					self.log.Infof(
+						"[c]h3 handshake no response mode=%s sent_packets=%d pto=%d err=%s\n",
+						ptMode,
+						handshakeAttempt.sent.Load(),
+						handshakeAttempt.pto.Load(),
+						err,
+					)
+				}
 				self.log.Infof("[c]h3 connect err = %s\n", err)
 				return nil, err
+			}
+			// DialEarly may return as soon as cached 0-RTT transport parameters
+			// are available, before the peer has answered this connection. Keep
+			// the attempt open until QUIC confirms the handshake or the connection
+			// dies; otherwise an Initial blackhole after a 0-RTT dial is falsely
+			// counted as a success and never reaches the no-response signal.
+			if handshakeAttempt != nil {
+				go func() {
+					handshakeComplete := conn.HandshakeComplete()
+					select {
+					case <-handshakeComplete:
+						handshakeAttempt.finish(true)
+					case <-conn.Context().Done():
+						// If both channels closed together, handshake completion wins.
+						select {
+						case <-handshakeComplete:
+							handshakeAttempt.finish(true)
+							return
+						default:
+						}
+						handshakeAttempt.finish(false)
+						if handshakeAttempt.sentWithoutResponse() {
+							self.log.Infof(
+								"[c]h3 handshake no response mode=%s sent_packets=%d pto=%d err=%s\n",
+								ptMode,
+								handshakeAttempt.sent.Load(),
+								handshakeAttempt.pto.Load(),
+								context.Cause(conn.Context()),
+							)
+						}
+					}
+				}()
 			}
 			defer func() {
 				if !success {
@@ -1937,7 +2309,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				}
 			}()
 
-			stream, err := conn.OpenStreamSync(self.ctx)
+			stream, err := conn.OpenStreamSync(attemptCtx)
 			if err != nil {
 				self.log.Infof("[c]h3 open stream err = %s\n", err)
 				return nil, err
@@ -2005,7 +2377,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 		}
 		if connectDelay := connectTime.Sub(time.Now()); 0 < connectDelay {
 			select {
-			case <-self.ctx.Done():
+			case <-ctx.Done():
 				releaseReconnect()
 				cancelConnect()
 				return
@@ -2015,16 +2387,32 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			case <-time.After(connectDelay):
 			}
 		}
+		attemptCtx, releaseAttempt, acquired := self.h3Gate.Acquire(ctx, ptMode)
+		if !acquired {
+			releaseReconnect()
+			cancelConnect()
+			return
+		}
+		if standDown, _ := self.standDown(ptMode); standDown {
+			releaseAttempt()
+			releaseReconnect()
+			cancelConnect()
+			continue
+		}
 
 		var connStream *ConnStream
 		var err error
 		if self.log.V(2).Enabled() {
-			connStream, err = TraceWithReturnError(fmt.Sprintf("[t]connect %s", clientId), connect)
+			connStream, err = TraceWithReturnError(fmt.Sprintf("[t]connect %s", clientId), func() (*ConnStream, error) {
+				return connect(attemptCtx)
+			})
 		} else {
-			connStream, err = connect()
+			connStream, err = connect(attemptCtx)
 		}
 		releaseReconnect()
 		if err != nil {
+			attemptCanceled := attemptCtx.Err() != nil
+			releaseAttempt()
 			// a canceled dial is local teardown -- this transport or its owner
 			// shutting down mid-connect -- not a backend signal. Without this
 			// carve-out, closing a multi-client window cancels many transports
@@ -2032,8 +2420,10 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			// threshold with fresh timestamps, so the NEXT session starts
 			// gated. The contract OOB path makes the same carve-out on
 			// client.Done.
-			if self.ctx.Err() == nil {
-				noteBackendFailure()
+			if ctx.Err() == nil {
+				if !attemptCanceled {
+					noteBackendFailure()
+				}
 			}
 			if ok, suppressed := shouldLogAuthErr(); ok {
 				if suppressed > 0 {
@@ -2046,7 +2436,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				v.Infof("[t]auth error %s = %s\n", clientId, err)
 			}
 			select {
-			case <-self.ctx.Done():
+			case <-ctx.Done():
 				return
 			case <-self.kickMonitor.NotifyChannel():
 				// network changed: retry now over the new path and take the
@@ -2072,7 +2462,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			self.setModeAvailable(ptMode, true)
 			defer self.setModeAvailable(ptMode, false)
 
-			handleCtx, handleCancel := context.WithCancel(self.ctx)
+			handleCtx, handleCancel := context.WithCancel(attemptCtx)
 			defer handleCancel()
 
 			// The connection owns every worker it starts. Registration happens
@@ -2331,31 +2721,14 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			}
 
 			startConnectionWorker(func() {
-				defer handleCancel()
-
-				for {
-					mode, notify := self.activeMode()
-					if mode != ptMode {
-						startReadCount := readCounter.Load()
-						startWriteCount := writeCounter.Load()
-						select {
-						case <-handleCtx.Done():
-							return
-						case <-time.After(time.Duration(slowMultiple) * self.settings.InactiveDrainTimeout):
-							// no activity after cool down, shut down this transport
-							if readCounter.Load() == startReadCount && writeCounter.Load() == startWriteCount {
-								handleCancel()
-							}
-						case <-notify:
-						}
-					} else {
-						select {
-						case <-handleCtx.Done():
-							return
-						case <-notify:
-						}
-					}
-				}
+				self.runInactiveDrain(
+					handleCtx,
+					ptMode,
+					slowMultiple,
+					&readCounter,
+					&writeCounter,
+					handleCancel,
+				)
 			}, handleCancel)
 
 			startConnectionWorker(func() {
@@ -2493,7 +2866,6 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			}
 
 			offerRoutedMessage := func(message []byte) bool {
-				readCounter.Add(1)
 				open, delivered := self.offerReceive(
 					handleCtx.Done(),
 					ptMode,
@@ -2501,6 +2873,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 					message,
 				)
 				if delivered {
+					readCounter.Add(1)
 					if self.settings.afterH3ReceiveEnqueueForTest != nil {
 						self.settings.afterH3ReceiveEnqueueForTest(message)
 					}
@@ -2537,7 +2910,6 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 							}
 							continue
 						}
-						readCounter.Add(1)
 						MessagePoolReturn(message)
 						datagramReassembler.Expire(time.Now())
 					}
@@ -2606,11 +2978,12 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 		} else {
 			c()
 		}
+		releaseAttempt()
 		// the connection ran and died: the next dial is a reconnect
 		hadConnection = true
 
 		select {
-		case <-self.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-self.kickMonitor.NotifyChannel():
 			// a kick arriving after the connection already died skips the
@@ -2656,21 +3029,4 @@ func connectHost(platformUrl string) (string, error) {
 		return "", err
 	}
 	return u.Hostname(), nil
-}
-
-// this host should resolve in dns to the root zone ips for the tld
-func pumpHost(platformUrl string, tld []byte) (string, error) {
-	u, err := url.Parse(platformUrl)
-	if err != nil {
-		return "", err
-	}
-	host := u.Hostname()
-	if net.ParseIP(host) != nil {
-		return host, nil
-	}
-	// tld replace . with -
-	// zone-<tld>.<base>
-	baseHost := strings.SplitN(host, ".", 2)[1]
-	pumpHost := fmt.Sprintf("zone-%s.%s", strings.ReplaceAll(string(tld), ".", "-"), baseHost)
-	return pumpHost, nil
 }

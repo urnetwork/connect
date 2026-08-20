@@ -1,13 +1,83 @@
 package connect
 
 import (
+	"context"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"maps"
 )
+
+func TestInactiveDrainIgnoresEqualPriorityMode(t *testing.T) {
+	transport := testingPlatformTransportModes()
+	transport.settings = DefaultPlatformTransportSettings()
+	transport.settings.InactiveDrainTimeout = 10 * time.Millisecond
+	transport.settings.InactiveDrainMaxTimeout = 20 * time.Millisecond
+	transport.modePreferences = normalizeTransportModePreferences(map[TransportMode]int{
+		TransportModeH1: 7,
+		TransportModeH3: 7,
+	})
+	transport.setActiveMode(TransportModeH3)
+	ctx, cancelCtx := context.WithCancel(t.Context())
+	defer cancelCtx()
+	canceled := make(chan struct{})
+	var once atomic.Bool
+	go transport.runInactiveDrain(
+		ctx,
+		TransportModeH1,
+		1,
+		&atomic.Uint64{},
+		&atomic.Uint64{},
+		func() {
+			if once.CompareAndSwap(false, true) {
+				close(canceled)
+			}
+		},
+	)
+	select {
+	case <-canceled:
+		t.Fatal("equal-priority H3 incorrectly drained H1")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestInactiveDrainHasAbsoluteDeadlineDespitePayload(t *testing.T) {
+	transport := testingPlatformTransportModes()
+	transport.settings = DefaultPlatformTransportSettings()
+	transport.settings.InactiveDrainTimeout = 20 * time.Millisecond
+	transport.settings.InactiveDrainMaxTimeout = 60 * time.Millisecond
+	transport.modePreferences = normalizeTransportModePreferences(nil)
+	transport.setActiveMode(TransportModeH1)
+	ctx, cancelCtx := context.WithCancel(t.Context())
+	defer cancelCtx()
+	var reads atomic.Uint64
+	var writes atomic.Uint64
+	canceled := make(chan struct{})
+	go transport.runInactiveDrain(
+		ctx,
+		TransportModeH3Dns,
+		1,
+		&reads,
+		&writes,
+		func() { close(canceled) },
+	)
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.After(500 * time.Millisecond)
+	for {
+		select {
+		case <-ticker.C:
+			reads.Add(1)
+		case <-canceled:
+			return
+		case <-deadline:
+			t.Fatal("payload activity defeated the absolute superseded-carrier deadline")
+		}
+	}
+}
 
 // testingPlatformTransportModes builds just the mode state of a
 // PlatformTransport, without the network side, so the election plumbing can be
@@ -114,11 +184,11 @@ func TestPlatformTransportActiveModeDoesNotWakeElection(t *testing.T) {
 	}
 }
 
-// TestPlatformTransportElectPreference walks the election decision the run loop
-// makes: equally preferred modes do not preempt each other (whichever connected
-// first stays active), a strictly better mode does preempt, and losing the
-// active mode falls back — to TransportModeNone when nothing remains, which was
-// previously unreachable so a dropped mode left the active mode pinned stale.
+// TestPlatformTransportElectPreference walks the default election decision the
+// run loop makes: H1 preempts H3, a worse fallback does not preempt, and losing
+// the active mode falls back — to TransportModeNone when nothing remains,
+// which was previously unreachable so a dropped mode left the active mode
+// pinned stale.
 func TestPlatformTransportElectPreference(t *testing.T) {
 	transport := testingPlatformTransportModes()
 
@@ -162,14 +232,14 @@ func TestPlatformTransportElectPreference(t *testing.T) {
 		t.Fatalf("mode = %q, want h3", mode)
 	}
 
-	// h1 connects second. it ties with h3, so it must NOT preempt: whichever
-	// connected first keeps the active designation
+	// h1 connects second. The production Auto policy strictly prefers it, so it
+	// must preempt H3 even though H3 connected first.
 	transport.setModeAvailable(TransportModeH1, true)
-	if mode := elect(); mode != TransportModeH3 {
-		t.Fatalf("mode = %q, want h3: an equally preferred mode preempted the one that connected first", mode)
+	if mode := elect(); mode != TransportModeH1 {
+		t.Fatalf("mode = %q, want h1: H3 remained active after H1 became available", mode)
 	}
 
-	// h3 drops: fall back to the equal mode that remains
+	// h3 drops: the preferred H1 remains active
 	transport.setModeAvailable(TransportModeH3, false)
 	if mode := elect(); mode != TransportModeH1 {
 		t.Fatalf("mode = %q, want h1", mode)
@@ -226,38 +296,25 @@ func TestTransportModeNoneIsWorst(t *testing.T) {
 	}
 }
 
-// TestTransportModeTiers pins the three-tier production preference: the direct
-// modes (h3, h1) tie and remain live together, h3dns is the first availability
-// fallback, and h3dnspump is the final fallback.
+// TestTransportModeTiers pins the four-tier production preference: H1 is the
+// primary carrier, direct H3 is its first fallback, H3-over-DNS follows, and
+// H3-over-DNS-pump is the final fallback.
 func TestTransportModeTiers(t *testing.T) {
-	direct := []TransportMode{TransportModeH3, TransportModeH1}
-	translation := []TransportMode{TransportModeH3Dns, TransportModeH3DnsPump}
-
-	// a direct mode beats every translation mode
-	for _, d := range direct {
-		for _, tr := range translation {
-			if !isBetterMode(d, tr) {
-				t.Errorf("%q is not better than %q: the translation fallback outranks a direct mode", d, tr)
-			}
-			if isBetterMode(tr, d) {
-				t.Errorf("%q is better than %q: the translation fallback outranks a direct mode", tr, d)
-			}
-		}
+	want := []TransportMode{
+		TransportModeH1,
+		TransportModeH3,
+		TransportModeH3Dns,
+		TransportModeH3DnsPump,
 	}
-	// within the direct tier nothing is strictly better, so neither preempts
-	// the other and both healthy routes remain registered
-	for _, a := range direct {
-		for _, b := range direct {
-			if isBetterMode(a, b) {
-				t.Errorf("%q is better than %q: direct modes must tie", a, b)
+	for betterIndex, better := range want {
+		for _, worse := range want[betterIndex+1:] {
+			if !isBetterMode(better, worse) {
+				t.Errorf("%q is not better than %q", better, worse)
+			}
+			if isBetterMode(worse, better) {
+				t.Errorf("%q incorrectly outranks %q", worse, better)
 			}
 		}
-	}
-	if !isBetterMode(TransportModeH3Dns, TransportModeH3DnsPump) {
-		t.Error("h3dns must outrank h3dnspump")
-	}
-	if isBetterMode(TransportModeH3DnsPump, TransportModeH3Dns) {
-		t.Error("h3dnspump must not outrank h3dns")
 	}
 }
 
@@ -293,9 +350,9 @@ func TestPlatformTransportCustomModePreferences(t *testing.T) {
 }
 
 // TestPlatformTransportStandDown covers the gate predicate. A transport runs
-// when it is active, when only an equal mode is active (ties coexist), when a
-// worse mode is active, and — critically — at startup when the active mode is
-// none. It stands down only while a STRICTLY better mode is active. The
+// when it is active, when only an equal custom mode is active (ties coexist),
+// when a worse mode is active, and — critically — at startup when the active
+// mode is none. It stands down only while a STRICTLY better mode is active. The
 // arguments were previously reversed, so a transport stood down when it was
 // BETTER than the active mode.
 func TestPlatformTransportStandDown(t *testing.T) {
@@ -314,15 +371,18 @@ func TestPlatformTransportStandDown(t *testing.T) {
 		t.Fatalf("h1 stood down while it was the active mode")
 	}
 
-	// an EQUAL mode is active: neither stands down, they coexist and whichever
-	// connected first keeps the active designation
+	// H3 is active, but H1 is strictly better and must be allowed to start so it
+	// can replace H3.
 	transport.setActiveMode(TransportModeH3)
 	if standDown, _ := transport.standDown(TransportModeH1); standDown {
-		t.Fatalf("h1 stood down for h3, but the direct modes tie")
+		t.Fatalf("h1 stood down for lower-priority h3")
 	}
 
-	// a strictly better mode is active: the translation fallback stands down
+	// a strictly better mode is active: H3 and the translation fallback stand down
 	transport.setActiveMode(TransportModeH1)
+	if standDown, _ := transport.standDown(TransportModeH3); !standDown {
+		t.Fatalf("h3 kept running while preferred h1 was active")
+	}
 	if standDown, _ := transport.standDown(TransportModeH3DnsPump); !standDown {
 		t.Fatalf("the translation fallback kept running while a direct mode was active")
 	}
@@ -349,9 +409,9 @@ func TestPlatformTransportStandDown(t *testing.T) {
 }
 
 // TestTransportModeOrderDeterministic: the election sorts the modes and takes
-// the first available one. maps.Keys is randomly ordered and both tiers tie
-// internally, so without a tie break the winner among tied modes differed on
-// every pass — flipping the active mode and thrashing the gates.
+// the first available one. maps.Keys is randomly ordered, so without a stable
+// comparator the winner could differ on every pass — flipping the active mode
+// and thrashing the gates.
 func TestTransportModeOrderDeterministic(t *testing.T) {
 	order := func() []TransportMode {
 		orderedModes := slices.Collect(maps.Keys(transportModePreferences))
@@ -368,18 +428,16 @@ func TestTransportModeOrderDeterministic(t *testing.T) {
 		return orderedModes
 	}
 
-	want := order()
+	want := []TransportMode{
+		TransportModeH1,
+		TransportModeH3,
+		TransportModeH3Dns,
+		TransportModeH3DnsPump,
+	}
 	for range 50 {
 		got := order()
 		if !slices.Equal(got, want) {
-			t.Fatalf("election order is not deterministic: %v then %v", want, got)
+			t.Fatalf("election order = %v, want %v", got, want)
 		}
-	}
-	// the direct modes sort ahead of the translation fallbacks
-	if modePreference(want[0]) != modePreference(TransportModeH1) {
-		t.Fatalf("order = %v, want a direct mode first", want)
-	}
-	if modePreference(want[len(want)-1]) != modePreference(TransportModeH3DnsPump) {
-		t.Fatalf("order = %v, want a translation fallback last", want)
 	}
 }

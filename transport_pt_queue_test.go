@@ -88,7 +88,14 @@ func TestCombine(t *testing.T) {
 			Port: 8081,
 		}
 
-		cq := newCombineQueue(DefaultPacketTranslationSettings())
+		settings := DefaultPacketTranslationSettings()
+		settings.DnsMaxCombine = 2048
+		settings.DnsMaxCombinePerAddress = 2048
+		settings.DnsMaxCombineFragmentCount = 255
+		settings.DnsMaxCombinedPacketByteCount = 2 * 1024 * 1024
+		settings.DnsMaxCombineBytes = 512 * 1024 * 1024
+		settings.DnsMaxCombineBytesPerAddress = 512 * 1024 * 1024
+		cq := newCombineQueue(settings)
 
 		for _, a := range as {
 			out, limit, err := cq.Combine(addrA, a.header, MessagePoolCopy(a.data))
@@ -116,6 +123,10 @@ func TestCombineTrim(t *testing.T) {
 	settings := DefaultPacketTranslationSettings()
 	settings.DnsMaxCombine = 1024 * 1024
 	settings.DnsMaxCombinePerAddress = 1024
+	settings.DnsMaxCombineFragmentCount = 255
+	settings.DnsMaxCombinedPacketByteCount = 2 * 1024 * 1024
+	settings.DnsMaxCombineBytes = 2 * 1024 * 1024 * 1024
+	settings.DnsMaxCombineBytesPerAddress = 2 * 1024 * 1024 * 1024
 	cq := newCombineQueue(settings)
 
 	m := 128
@@ -185,6 +196,75 @@ func TestCombineTrim(t *testing.T) {
 	}
 	AssertEqual(t, int64(cq.Len()), settings.DnsMaxCombine)
 
+}
+
+func TestCombineQueueBoundsFragmentFanoutAndRetainedBytes(t *testing.T) {
+	settings := DefaultPacketTranslationSettings()
+	settings.DnsMaxCombineFragmentCount = 2
+	settings.DnsMaxCombineBytes = 4096
+	settings.DnsMaxCombineBytesPerAddress = 4096
+	settings.DnsMaxCombinedPacketByteCount = 128
+	cq := newCombineQueue(settings)
+	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 53}
+
+	var tooMany [18]byte
+	tooMany[16] = 3
+	data := MessagePoolCopy(make([]byte, 8))
+	_, limit, err := cq.Combine(addr, tooMany, data)
+	if err != nil || !limit {
+		MessagePoolReturn(data)
+		t.Fatalf("fragment fanout = (limit=%t, err=%v), want bounded refusal", limit, err)
+	}
+	MessagePoolReturn(data)
+	if cq.Len() != 0 || cq.RetainedByteCount() != 0 {
+		t.Fatalf("refused fanout retained queue state: len=%d bytes=%d", cq.Len(), cq.RetainedByteCount())
+	}
+
+	var header [18]byte
+	header[16] = 2
+	first := MessagePoolCopy(make([]byte, 80))
+	_, limit, err = cq.Combine(addr, header, first)
+	if err != nil || limit {
+		MessagePoolReturn(first)
+		t.Fatalf("first bounded fragment = (limit=%t, err=%v)", limit, err)
+	}
+	retained := cq.RetainedByteCount()
+	if retained <= 0 || settings.DnsMaxCombineBytes < retained {
+		t.Fatalf("retained bytes = %d, cap %d", retained, settings.DnsMaxCombineBytes)
+	}
+	header[17] = 1
+	second := MessagePoolCopy(make([]byte, 80))
+	_, limit, err = cq.Combine(addr, header, second)
+	if err != nil || !limit {
+		MessagePoolReturn(second)
+		t.Fatalf("oversized combined packet = (limit=%t, err=%v), want refusal", limit, err)
+	}
+	MessagePoolReturn(second)
+	if cq.RetainedByteCount() != retained {
+		t.Fatal("refused fragment changed retained-byte accounting")
+	}
+
+	// A second incomplete packet must be refused once the retained-capacity
+	// ceiling is exactly the amount held by the first packet.
+	settings.DnsMaxCombineBytes = retained
+	settings.DnsMaxCombineBytesPerAddress = retained
+	var anotherHeader [18]byte
+	anotherHeader[0] = 1
+	anotherHeader[16] = 2
+	third := MessagePoolCopy(make([]byte, 8))
+	_, limit, err = cq.Combine(addr, anotherHeader, third)
+	if err != nil || !limit {
+		MessagePoolReturn(third)
+		t.Fatalf("retained-byte overflow = (limit=%t, err=%v), want refusal", limit, err)
+	}
+	MessagePoolReturn(third)
+	if cq.Len() != 1 || cq.RetainedByteCount() != retained {
+		t.Fatalf("retained-byte refusal changed queue: len=%d bytes=%d", cq.Len(), cq.RetainedByteCount())
+	}
+	cq.RemoveOlder(time.Now().Add(time.Hour))
+	if cq.Len() != 0 || cq.RetainedByteCount() != 0 {
+		t.Fatalf("expiry retained queue state: len=%d bytes=%d", cq.Len(), cq.RetainedByteCount())
+	}
 }
 
 func TestPump(t *testing.T) {

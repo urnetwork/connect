@@ -1397,18 +1397,22 @@ type TestingMultiRouteWriterRouteStateObserver struct {
 // An immutable hot-path route view keeps its writer lifecycle and optional
 // testing pause in independent atomics.
 type routeSnapshot struct {
-	selector                     *MultiRouteSelector
-	transports                   []Transport
-	routes                       []Route
-	routeTransportTypes          map[Route]TransportType
-	activeRoutesByTransport      map[TransportType][]Route
-	routeCarrierProperties       map[Route]TransferCarrierProperties
-	generation                   uint64
-	unreliableTransferPath       bool
-	unreliableFlightByteLimit    ByteCount
-	unreliableFlightMessageLimit int
-	unreliableFlowIsolation      bool
-	unreliableFlowReserve        bool
+	selector            *MultiRouteSelector
+	transports          []Transport
+	routes              []Route
+	routeTransportTypes map[Route]TransportType
+	// affinityWriteRoutesByTransport retains every route with the requested
+	// carrier affinity plus every strictly higher-priority route. Values are
+	// sets materialized as slices at publication time, so multiple transports
+	// can share affinity without allocating on the write path.
+	affinityWriteRoutesByTransport map[TransportType][]Route
+	routeCarrierProperties         map[Route]TransferCarrierProperties
+	generation                     uint64
+	unreliableTransferPath         bool
+	unreliableFlightByteLimit      ByteCount
+	unreliableFlightMessageLimit   int
+	unreliableFlowIsolation        bool
+	unreliableFlowReserve          bool
 	// preferDirectRoute is non-nil only when every active route is an H1/H3
 	// platform carrier at the same priority and both transport types are live.
 	// routes is published with this route first. Writers use only that first
@@ -1602,16 +1606,15 @@ func (self *routeSnapshot) writeRoutes() []Route {
 	return self.shuffled()
 }
 
-// writeRoutesForTransport keeps a reply on the carrier that delivered the
-// packet it acknowledges. An active matching carrier is sticky under queue
-// pressure; only its withdrawal permits the normal route policy to take over.
-// The per-transport slices are built with the immutable route snapshot, so
-// this ACK hot path does not allocate.
+// writeRoutesForTransport keeps a reply eligible for every active carrier of
+// the requested type. Strictly higher-priority carriers are eligible too;
+// same- and lower-priority non-affinity carriers are not. The slices are built
+// with the immutable route snapshot, so this ACK hot path does not allocate.
 func (self *routeSnapshot) writeRoutesForTransport(
 	preferredTransportType TransportType,
 ) []Route {
 	if preferredTransportType != TransportTypeUnknown {
-		if routes := self.activeRoutesByTransport[preferredTransportType]; 0 < len(routes) {
+		if routes := self.affinityWriteRoutesByTransport[preferredTransportType]; 0 < len(routes) {
 			return routes
 		}
 	}
@@ -1748,6 +1751,7 @@ func (self *MultiRouteSelector) updateActiveRoutesWithLock() {
 	activeTransports := []Transport{}
 	routeTransportTypes := map[Route]TransportType{}
 	activeRoutesByTransport := map[TransportType][]Route{}
+	routePriorities := map[Route]int{}
 	routeCarrierProperties := map[Route]TransferCarrierProperties{}
 	unreliableTransferPath := false
 	unreliableFlightByteLimit := ByteCount(0)
@@ -1771,6 +1775,7 @@ func (self *MultiRouteSelector) updateActiveRoutesWithLock() {
 					activeRoutesByTransport[transportType],
 					route,
 				)
+				routePriorities[route] = transport.Priority()
 				routeCarrierProperties[route] = self.transportProperties[transport]
 				switch transportType {
 				case TransportTypeH1:
@@ -1855,6 +1860,42 @@ func (self *MultiRouteSelector) updateActiveRoutesWithLock() {
 		self.directAffinity.activationCount.Add(1)
 	}
 
+	// A carrier affinity is a set, not a pin to one route. Preserve every
+	// matching transport, then add routes that outrank at least one affinity
+	// member. Same- and lower-priority non-affinity routes remain filtered.
+	affinityWriteRoutesByTransport := map[TransportType][]Route{}
+	for transportType, affinityRoutes := range activeRoutesByTransport {
+		if len(affinityRoutes) == 0 {
+			continue
+		}
+		lowestAffinityPriority := routePriorities[affinityRoutes[0]]
+		included := make(map[Route]bool, len(activeRoutes))
+		for _, route := range affinityRoutes {
+			included[route] = true
+			lowestAffinityPriority = max(lowestAffinityPriority, routePriorities[route])
+		}
+		higherPriorityRoutes := make([]Route, 0, len(activeRoutes))
+		for _, route := range activeRoutes {
+			if !included[route] && routePriorities[route] < lowestAffinityPriority {
+				higherPriorityRoutes = append(higherPriorityRoutes, route)
+				included[route] = true
+			}
+		}
+		slices.SortStableFunc(higherPriorityRoutes, func(a Route, b Route) int {
+			if routePriorities[a] < routePriorities[b] {
+				return -1
+			}
+			if routePriorities[b] < routePriorities[a] {
+				return 1
+			}
+			return 0
+		})
+		eligible := make([]Route, 0, len(higherPriorityRoutes)+len(affinityRoutes))
+		eligible = append(eligible, higherPriorityRoutes...)
+		eligible = append(eligible, affinityRoutes...)
+		affinityWriteRoutesByTransport[transportType] = eligible
+	}
+
 	var weight map[Route]float32
 	if self.weightedRoutes {
 		// copy so the published map is immutable
@@ -1866,22 +1907,22 @@ func (self *MultiRouteSelector) updateActiveRoutesWithLock() {
 
 	self.nextRouteGeneration += 1
 	retiredSnapshot := self.activeRoutesSnapshot.Swap(&routeSnapshot{
-		selector:                     self,
-		transports:                   activeTransports,
-		routes:                       activeRoutes,
-		routeTransportTypes:          routeTransportTypes,
-		activeRoutesByTransport:      activeRoutesByTransport,
-		routeCarrierProperties:       routeCarrierProperties,
-		generation:                   self.nextRouteGeneration,
-		unreliableTransferPath:       unreliableTransferPath,
-		unreliableFlightByteLimit:    unreliableFlightByteLimit,
-		unreliableFlightMessageLimit: unreliableFlightMessageLimit,
-		unreliableFlowIsolation:      unreliableTransferPath && unreliableFlowIsolation,
-		unreliableFlowReserve:        unreliableTransferPath && unreliableFlowReserve,
-		preferDirectRoute:            preferDirectRoute,
-		weight:                       weight,
-		notify:                       self.transportUpdate.NotifyChannel(),
-		writerDone:                   make(chan struct{}),
+		selector:                       self,
+		transports:                     activeTransports,
+		routes:                         activeRoutes,
+		routeTransportTypes:            routeTransportTypes,
+		affinityWriteRoutesByTransport: affinityWriteRoutesByTransport,
+		routeCarrierProperties:         routeCarrierProperties,
+		generation:                     self.nextRouteGeneration,
+		unreliableTransferPath:         unreliableTransferPath,
+		unreliableFlightByteLimit:      unreliableFlightByteLimit,
+		unreliableFlightMessageLimit:   unreliableFlightMessageLimit,
+		unreliableFlowIsolation:        unreliableTransferPath && unreliableFlowIsolation,
+		unreliableFlowReserve:          unreliableTransferPath && unreliableFlowReserve,
+		preferDirectRoute:              preferDirectRoute,
+		weight:                         weight,
+		notify:                         self.transportUpdate.NotifyChannel(),
+		writerDone:                     make(chan struct{}),
 	})
 	if retiredSnapshot != nil && retiredSnapshot.retireWriter() {
 		self.retiredWriterSnapshots = append(
@@ -2398,10 +2439,10 @@ func (self *MultiRouteSelector) writeDetailedWithCarrier(
 	)
 }
 
-// writeDetailedWithCarrierPreference pins a reply to its observed inbound
-// carrier while that carrier remains active. It deliberately does not spill
-// to an equal-priority sibling merely because the selected route is busy;
-// route withdrawal republishes the snapshot and enables the normal fallback.
+// writeDetailedWithCarrierPreference applies the observed inbound carrier as
+// an affinity set. Every matching route and every strictly higher-priority
+// route remains eligible; equal- or lower-priority non-affinity routes do not
+// become queue-pressure fallbacks.
 func (self *MultiRouteSelector) writeDetailedWithCarrierPreference(
 	ctx context.Context,
 	transferFrameBytes []byte,

@@ -62,6 +62,18 @@ func TestH3QuicPacketStatsReduceFrameBoundaries(t *testing.T) {
 		KeyPhase: 0,
 	})
 	recorder.RecordEvent(qlog.PacketLost{})
+	recorder.RecordEvent(qlog.LossTimerUpdated{
+		Type:      qlog.LossTimerUpdateTypeExpired,
+		TimerType: qlog.TimerTypePTO,
+	})
+	recorder.RecordEvent(qlog.LossTimerUpdated{
+		Type:      qlog.LossTimerUpdateTypeSet,
+		TimerType: qlog.TimerTypePTO,
+	})
+	recorder.RecordEvent(qlog.LossTimerUpdated{
+		Type:      qlog.LossTimerUpdateTypeExpired,
+		TimerType: qlog.TimerTypeACK,
+	})
 	recorder.RecordEvent(qlog.MTUUpdated{Value: 1200})
 	if err := recorder.Close(); err != nil {
 		t.Fatal(err)
@@ -95,11 +107,50 @@ func TestH3QuicPacketStatsReduceFrameBoundaries(t *testing.T) {
 		RemoteKeyUpdateCount:                      1,
 		KeyDiscardCount:                           1,
 		LostPacketCount:                           1,
+		ProbeTimeoutCount:                         1,
 		MtuUpdateCount:                            1,
 		CurrentMtu:                                1200,
 	}
 	if got := stats.Snapshot(); got != want {
 		t.Fatalf("QUIC packet stats=%+v want=%+v", got, want)
+	}
+}
+
+func TestH3QuicPacketStatsSeparatesPtoAndHandshakeNoResponse(t *testing.T) {
+	stats := &H3QuicPacketStats{}
+
+	failedAttempt := stats.beginHandshakeAttempt()
+	failedRecorder := stats.tracerForAttempt(failedAttempt)(
+		context.Background(),
+		true,
+		quic.ConnectionID{},
+	).AddProducer()
+	failedRecorder.RecordEvent(qlog.PacketSent{Raw: qlog.RawInfo{Length: 1200}})
+	failedRecorder.RecordEvent(qlog.LossTimerUpdated{
+		Type:      qlog.LossTimerUpdateTypeExpired,
+		TimerType: qlog.TimerTypePTO,
+	})
+	failedRecorder.RecordEvent(qlog.PacketSent{Raw: qlog.RawInfo{Length: 1200}})
+	failedAttempt.finish(false)
+	failedAttempt.finish(false)
+
+	successfulAttempt := stats.beginHandshakeAttempt()
+	successfulRecorder := stats.tracerForAttempt(successfulAttempt)(
+		context.Background(),
+		true,
+		quic.ConnectionID{},
+	).AddProducer()
+	successfulRecorder.RecordEvent(qlog.PacketSent{Raw: qlog.RawInfo{Length: 1200}})
+	successfulRecorder.RecordEvent(qlog.PacketReceived{Raw: qlog.RawInfo{Length: 1200}})
+	successfulAttempt.finish(true)
+
+	snapshot := stats.Snapshot()
+	if snapshot.ProbeTimeoutCount != 1 ||
+		snapshot.HandshakeAttemptCount != 2 ||
+		snapshot.HandshakeSuccessCount != 1 ||
+		snapshot.HandshakeFailureCount != 1 ||
+		snapshot.HandshakeSentWithoutResponseCount != 1 {
+		t.Fatalf("QUIC handshake/PTO stats=%+v", snapshot)
 	}
 }
 

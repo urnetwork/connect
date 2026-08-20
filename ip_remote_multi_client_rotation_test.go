@@ -350,10 +350,9 @@ func TestStandingReserveTargetTable(t *testing.T) {
 	}{
 		// the speed window's shape: fixed size 1, hard max 4
 		{"speed window", 1, 4, true, false, 2},
-		// the quality window's shape: demand target up to 6, hard max 12.
-		// the spare may exceed WindowSizeMax -- the max bounds demand
-		// growth, the spare is insurance on top
-		{"quality window", 6, 12, true, false, 7},
+		// the quality window's default shape: its memory ceiling prevents
+		// the reserve from adding a seventh full client graph
+		{"quality window at memory ceiling", 6, 6, true, false, 6},
 		// the hard max is a hard bound: the spare never breaches it
 		{"at hard max", 4, 4, true, false, 4},
 		// 0 hard max is unbounded, as everywhere else
@@ -383,6 +382,17 @@ func TestStandingReserveTargetTable(t *testing.T) {
 func TestStandingReserveDefaultsAndOverrideRoundTrip(t *testing.T) {
 	settings := DefaultMultiClientSettings()
 	AssertEqual(t, settings.StandingReserve, true)
+
+	qualityWindow := settings.WindowSizes[WindowTypeQuality]
+	AssertEqual(t, qualityWindow.WindowSizeMin, 6)
+	AssertEqual(t, qualityWindow.WindowSizeMax, 6)
+	AssertEqual(t, qualityWindow.WindowSizeHardMax, 6)
+	AssertEqual(t, standingReserveTarget(
+		qualityWindow.WindowSizeMax,
+		qualityWindow.WindowSizeHardMax,
+		settings.StandingReserve,
+		false,
+	), 6)
 
 	reliabilitySettings := ReliabilitySettingsFrom(settings)
 	AssertEqual(t, reliabilitySettings.StandingReserve, true)

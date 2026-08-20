@@ -54,11 +54,15 @@ func DefaultPacketTranslationSettings() *PacketTranslationSettings {
 		// DnsReadTimeout: 1 * time.Second:
 		DnsStateTimeout: 5 * time.Second,
 
-		DnsMaxCombinePerAddress: 64 * 1024,
-		DnsMaxCombine:           64 * 1024 * 1024 * 1024,
+		DnsMaxCombinePerAddress:       64,
+		DnsMaxCombine:                 512,
+		DnsMaxCombineFragmentCount:    32,
+		DnsMaxCombinedPacketByteCount: 64 * 1024,
+		DnsMaxCombineBytesPerAddress:  MemoryScaledByteCount(kib(256), kib(64)),
+		DnsMaxCombineBytes:            MemoryScaledByteCount(mib(2), kib(512)),
 
-		DnsMaxPumpHostsPerAddress: 2 * 1024,
-		DnsMaxPumpHosts:           1024 * 1024 * 1024,
+		DnsMaxPumpHostsPerAddress: MemoryScaledCount(1024, 256),
+		DnsMaxPumpHosts:           int64(MemoryScaledCount(8192, 2048)),
 
 		WritePacketsPerSecond: 200,
 		SequenceBufferSize:    32,
@@ -78,6 +82,12 @@ type PacketTranslationSettings struct {
 
 	DnsMaxCombinePerAddress int
 	DnsMaxCombine           int64
+	// The count limits above bound map/heap cardinality. These limits also
+	// bound attacker-controlled fragment fanout and retained pooled capacity.
+	DnsMaxCombineFragmentCount    int
+	DnsMaxCombinedPacketByteCount ByteCount
+	DnsMaxCombineBytesPerAddress  ByteCount
+	DnsMaxCombineBytes            ByteCount
 
 	DnsMaxPumpHostsPerAddress int
 	DnsMaxPumpHosts           int64
@@ -124,6 +134,18 @@ func NewPacketTranslation(
 	packetConn net.PacketConn,
 	settings *PacketTranslationSettings,
 ) (*packetTranslation, error) {
+	if settings.DnsStateTimeout <= 0 {
+		return nil, fmt.Errorf("DNS state timeout must be positive")
+	}
+	if settings.DnsMaxCombinePerAddress <= 0 || settings.DnsMaxCombine <= 0 ||
+		settings.DnsMaxCombineFragmentCount <= 0 ||
+		settings.DnsMaxCombinedPacketByteCount <= 0 ||
+		settings.DnsMaxCombineBytesPerAddress <= 0 || settings.DnsMaxCombineBytes <= 0 {
+		return nil, fmt.Errorf("DNS combine limits must be positive")
+	}
+	if settings.DnsMaxPumpHostsPerAddress <= 0 || settings.DnsMaxPumpHosts <= 0 {
+		return nil, fmt.Errorf("DNS pump limits must be positive")
+	}
 	return NewPacketTranslationWithPrefix(
 		ctx,
 		ptMode,
@@ -547,16 +569,41 @@ func (self *packetTranslation) decodeDns() {
 				}
 			}
 		}()
+		expiryTimer := time.NewTimer(time.Hour)
+		if !expiryTimer.Stop() {
+			<-expiryTimer.C
+		}
+		defer expiryTimer.Stop()
+		var expiry <-chan time.Time
+		resetExpiry := func() {
+			if !expiryTimer.Stop() && expiry != nil {
+				select {
+				case <-expiryTimer.C:
+				default:
+				}
+			}
+			if oldest, ok := dnsCombineQueue.OldestUpdateTime(); ok {
+				delay := time.Until(oldest.Add(self.settings.DnsStateTimeout))
+				expiryTimer.Reset(max(time.Duration(0), delay))
+				expiry = expiryTimer.C
+			} else {
+				expiry = nil
+			}
+		}
 
 		for {
 			select {
 			case <-self.ctx.Done():
 				return
+			case <-expiry:
+				dnsCombineQueue.RemoveOlder(time.Now().Add(-self.settings.DnsStateTimeout))
+				resetExpiry()
 			case r := <-readPipeline:
 				minUpdateTime := time.Now().Add(-self.settings.DnsStateTimeout)
 				dnsCombineQueue.RemoveOlder(minUpdateTime)
 
 				out, limit, err := dnsCombineQueue.Combine(r.addr, r.header, r.data)
+				resetExpiry()
 				if err != nil {
 					// drop the packet
 					MessagePoolReturn(r.data)
@@ -581,6 +628,7 @@ func (self *packetTranslation) decodeDns() {
 
 				select {
 				case <-self.ctx.Done():
+					MessagePoolReturn(out.data)
 					return
 				case self.in <- out:
 				}
@@ -590,16 +638,45 @@ func (self *packetTranslation) decodeDns() {
 
 	go HandleError(func() {
 		defer self.cancel()
+		if self.dnsPumpQueue == nil {
+			<-self.ctx.Done()
+			return
+		}
+		expiryTimer := time.NewTimer(time.Hour)
+		if !expiryTimer.Stop() {
+			<-expiryTimer.C
+		}
+		defer expiryTimer.Stop()
+		var expiry <-chan time.Time
+		resetExpiry := func() {
+			if !expiryTimer.Stop() && expiry != nil {
+				select {
+				case <-expiryTimer.C:
+				default:
+				}
+			}
+			if oldest, ok := self.dnsPumpQueue.OldestUpdateTime(); ok {
+				delay := time.Until(oldest.Add(self.settings.DnsStateTimeout))
+				expiryTimer.Reset(max(time.Duration(0), delay))
+				expiry = expiryTimer.C
+			} else {
+				expiry = nil
+			}
+		}
 
 		for {
 			select {
 			case <-self.ctx.Done():
 				return
+			case <-expiry:
+				self.dnsPumpQueue.RemoveOlder(time.Now().Add(-self.settings.DnsStateTimeout))
+				resetExpiry()
 			case item := <-pumpPipeline:
 				minUpdateTime := time.Now().Add(-self.settings.DnsStateTimeout)
 				self.dnsPumpQueue.RemoveOlder(minUpdateTime)
 				// if limit, drop the pump header but continue to process the packet
 				self.dnsPumpQueue.Add(item)
+				resetExpiry()
 			}
 		}
 	}, self.cancel)

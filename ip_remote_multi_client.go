@@ -138,24 +138,17 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		WindowSizes: map[WindowType]WindowSizeSettings{
 			// TODO increase `WindowSizeMinP2pOnly` when p2p is deployed
 			WindowTypeQuality: WindowSizeSettings{
-				// RAISED 2/6/12 -> 6/12/16. A quality window of 2 has no
-				// redundancy: one bad provider is half the window, and a
-				// second is a total failure with nothing left to fall back
-				// to. Field report on linux: an idle session sat at 2 held /
-				// ~4 probed (EvaluationPoolMultiple=2), both went
-				// unresponsive, and because windowOutcomeAction returns
-				// outcomeNone once failOutcome has latched, the window never
-				// rebuilt for the remaining 22 minutes of the session. A
-				// larger floor does not fix that latch, but it makes a single
-				// bad provider survivable rather than fatal, which is the
-				// point of holding a window at all.
+				// Six providers preserve quality-window redundancy without the
+				// memory cost of growing the target to twelve. Keep the hard max
+				// at six too: StandingReserve normally adds one provider beyond
+				// the target, but that seventh client still owns a full client and
+				// transport graph.
 				//
-				// Cost is real and deliberate: WindowSizeMin is a floor that
-				// holds AT IDLE, so this raises steady-state provider
-				// sessions and the contracts behind them.
+				// WindowSizeMin is held at idle, so the quality window remains
+				// ready rather than rebuilding from a smaller floor.
 				WindowSizeMin:     6,
-				WindowSizeMax:     12,
-				WindowSizeHardMax: 16,
+				WindowSizeMax:     6,
+				WindowSizeHardMax: 6,
 				// reconnects per source
 				WindowSizeReconnectScale: 1.2,
 				KeepHealthiestCount:      0,
@@ -364,9 +357,10 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// deaths; see the field comment
 		SharedFateMinExits: 3,
 		SharedFateWindow:   10 * time.Second,
-		// mainnet-aggressive: evaluate twice the candidates a window expansion
-		// needs and keep the best. 1 is today's behavior, the A/B point.
-		EvaluationPoolMultiple: 2,
+		// mainnet-aggressive: evaluate up to twice the candidates a window
+		// expansion needs and keep the best. The four-client expansion-step cap
+		// still bounds complete client constructions in one pass.
+		EvaluationPoolMultiple: MemoryScaledCount(2, 1),
 
 		// the outcome deadline (window honesty): zero Added this long after
 		// the window first tries to expand triggers ONE silent window rebuild
@@ -997,26 +991,23 @@ type MultiClientSettings struct {
 	SharedFateMinExits int
 	SharedFateWindow   time.Duration
 
-	// EvaluationPoolMultiple is the aggressive-pooling knob: window expansion
-	// requests and ping-evaluates this multiple of the candidates it actually
-	// needs, then admits only the needed count -- preferring qualified
-	// providers (see poolAdmitOrder) -- and politely cancels the evaluated
-	// surplus, which carries no flows by construction (an unadmitted candidate
-	// never enters the window, so selection can never have placed a flow on
-	// it).
+	// EvaluationPoolMultiple is the aggressive-pooling knob: within the
+	// four-client expansion-step cap, window expansion requests and
+	// ping-evaluates this multiple of the candidates it needs, then admits only
+	// the needed count -- preferring qualified providers (see poolAdmitOrder) --
+	// and politely cancels the evaluated surplus, which carries no flows by
+	// construction (an unadmitted candidate never enters the window, so
+	// selection can never have placed a flow on it).
 	//
-	// The multiple applies to the CANDIDATE-REQUEST count only, never to the
-	// admit count: the window's size math -- the demand target, the standing
-	// reserve's +1, and the WindowSizeHardMax collapse -- all keep operating
-	// on the same admitted counts as before, so the window can never grow past
-	// its target because of this knob. It is also skipped for fixed-destination
-	// generators, whose destination set cannot produce surplus candidates
-	// (asking would only stall each expand pass against its args timeout, the
-	// same reason the standing reserve skips them).
+	// The multiple applies to the candidate-request count, while both requests
+	// and admissions are capped at four per pass. The window's size math -- the
+	// demand target, standing reserve, and WindowSizeHardMax collapse -- remains
+	// unchanged; a large deficit is filled over several resize passes instead
+	// of one allocation spike. Pooling is skipped for fixed-destination
+	// generators, whose destination set cannot produce useful surplus.
 	//
-	// 1 (and, via the zero-value ReliabilitySettings, 0) is today's behavior:
-	// request exactly what is needed, admit every evaluation that passes. 2 is
-	// the mainnet-aggressive default on this fork.
+	// 1 (and, via the zero-value ReliabilitySettings, 0) requests up to four
+	// needed candidates. 2 is the mainnet-aggressive default on this fork.
 	EvaluationPoolMultiple int
 
 	// WindowOutcomeDeadline is the outcome deadline (window honesty, see
@@ -9843,7 +9834,12 @@ func (self *multiClientWindow) resize() {
 		addedCount := 0
 		if len(clients) < targetWindowSize {
 			// expand
-			n := targetWindowSize - len(clients)
+			neededCount := targetWindowSize - len(clients)
+			plannedAdmitCount, _ := multiClientExpandPlan(
+				neededCount,
+				self.reliabilitySettings().EvaluationPoolMultiple,
+				fixedDestination,
+			)
 			self.monitor.AddWindowExpandEvent(
 				windowMinSatisfied(windowSizeMin, len(clients), len(warnedClients), fixedDestination),
 				targetWindowSize+len(warnedClients),
@@ -9854,10 +9850,17 @@ func (self *multiClientWindow) resize() {
 				p2pOnlyWindowSize,
 				targetWindowSize,
 				windowSizeMin,
-				targetWindowSize-len(clients),
+				neededCount,
 			)
 			if self.log.V(1).Enabled() {
-				self.log.Infof("[multi]window expand +%d %d->%d (+%d)\n", n, len(clients), targetWindowSize, addedCount)
+				self.log.Infof(
+					"[multi]window expand +%d needed=%d %d->%d (+%d)\n",
+					plannedAdmitCount,
+					neededCount,
+					len(clients),
+					targetWindowSize,
+					addedCount,
+				)
 			}
 		}
 		if 0 < windowSize.WindowSizeHardMax && windowSize.WindowSizeHardMax < len(clients)+len(warnedClients)+addedCount {
@@ -9903,6 +9906,35 @@ type expandEvaluatedCandidate struct {
 	args   *multiClientChannelArgs
 }
 
+// multiClientExpandStepMax bounds every object-producing expansion pass, not
+// just the number ultimately admitted. Evaluated surplus candidates own full
+// Client / PlatformTransport graphs too, so capping only admissions would
+// still permit the sharp memory jump this limit is meant to prevent.
+const multiClientExpandStepMax = 4
+
+func multiClientExpandPlan(
+	neededCount int,
+	evaluationPoolMultiple int,
+	fixedDestination bool,
+) (admitCount int, requestCount int) {
+	if neededCount <= 0 {
+		return 0, 0
+	}
+	evaluationPoolMultiple = min(
+		multiClientExpandStepMax,
+		max(1, evaluationPoolMultiple),
+	)
+	if fixedDestination {
+		evaluationPoolMultiple = 1
+	}
+	requestCount = min(
+		multiClientExpandStepMax,
+		min(neededCount, multiClientExpandStepMax)*evaluationPoolMultiple,
+	)
+	admitCount = min(neededCount, requestCount)
+	return
+}
+
 func (self *multiClientWindow) expand(
 	windowSize WindowSizeSettings,
 	currentWindowSize int,
@@ -9929,24 +9961,23 @@ func (self *multiClientWindow) expand(
 	// needed count -- preferring qualified providers -- and politely cancel
 	// the evaluated surplus.
 	//
-	// The multiple applies HERE, to the candidate-REQUEST count, and nowhere
-	// else. admitBudget stays n, the count the size math asked for, so the
-	// window can never grow past its target because of pooling: the demand
-	// target, the standing reserve's +1, and the WindowSizeHardMax collapse
-	// all keep seeing the same admitted counts they always did. The terminal
-	// cleanup below cancels unresolved pings before the pass returns, so this
-	// private budget cannot overlap the next resize pass.
+	// The multiple applies HERE, to the candidate-request count. Both requests
+	// and admissions are capped by multiClientExpandStepMax: an evaluated
+	// candidate already owns the same memory-heavy client and transport graph,
+	// even if it is later discarded as surplus. The terminal cleanup below
+	// cancels unresolved pings before the pass returns, so this private budget
+	// cannot overlap the next resize pass.
 	//
 	// Fixed-destination generators skip the multiple for the same reason they
 	// skip the standing reserve: their destination set cannot produce surplus
 	// candidates, and asking would only stall each pass against its args
 	// timeout.
-	admitBudget := n
-	evaluationPoolMultiple := max(1, self.reliabilitySettings().EvaluationPoolMultiple)
-	if _, fixedDestination := self.generator.FixedDestinationSize(); fixedDestination {
-		evaluationPoolMultiple = 1
-	}
-	requestCount := n * evaluationPoolMultiple
+	_, fixedDestination := self.generator.FixedDestinationSize()
+	admitBudget, requestCount := multiClientExpandPlan(
+		n,
+		self.reliabilitySettings().EvaluationPoolMultiple,
+		fixedDestination,
+	)
 
 	admitted := 0
 	pending := []*expandEvaluatedCandidate{}

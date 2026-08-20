@@ -45,12 +45,12 @@ func TestPlatformQuicConfigEnablesPathMtuDiscovery(t *testing.T) {
 			settings.PingTimeout,
 		)
 	}
-	if config.Tracer != nil {
-		t.Fatal("H3 packet tracing enabled without an explicit stats collector")
+	if config.Tracer == nil {
+		t.Fatal("default H3 PTO/no-response tracing is disabled")
 	}
-	settings.H3QuicPacketStats = &H3QuicPacketStats{}
-	if newPlatformQuicConfig(settings, 1).Tracer == nil {
-		t.Fatal("H3 packet stats did not enable the QUIC tracer")
+	settings.H3QuicPacketStats = nil
+	if newPlatformQuicConfig(settings, 1).Tracer != nil {
+		t.Fatal("explicitly disabled H3 packet tracing remained enabled")
 	}
 	settings.EnableH3Datagrams = false
 	if newPlatformQuicConfig(settings, 1).EnableDatagrams {
@@ -58,11 +58,21 @@ func TestPlatformQuicConfigEnablesPathMtuDiscovery(t *testing.T) {
 	}
 }
 
-// The internal edge/server listener is UDP/8053, but client traffic must still
-// reach the public DNS service port and rely on ingress DNAT.
+// The private edge/server listener is UDP/4053 (with 8053 retained only during
+// migration), but client traffic must still reach public DNS and rely on DNAT.
 func TestPlatformDnsTransportUsesPublicPort(t *testing.T) {
 	settings := DefaultPlatformTransportSettings()
 	if settings.DnsPort != 53 {
 		t.Fatalf("DNS-encoded QUIC destination port=%d want=53", settings.DnsPort)
+	}
+}
+
+func TestPlatformDnsPumpUsesStableWhoDisHost(t *testing.T) {
+	settings := DefaultPlatformTransportSettings()
+	if settings.DnsPumpHost != DefaultDnsPumpHost {
+		t.Fatalf("DNS pump host=%q want %q", settings.DnsPumpHost, DefaultDnsPumpHost)
+	}
+	if settings.DnsPumpHost != "whodis.bringyour.com" {
+		t.Fatalf("default DNS pump host=%q want whodis.bringyour.com", settings.DnsPumpHost)
 	}
 }
