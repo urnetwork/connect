@@ -224,10 +224,9 @@ func testVerifyFill32(b byte) [32]byte {
 	return out
 }
 
-// TestVerifyFinalDigestGolden pins the FINAL digest: sha256 over the exact
-// golden FINAL message above. FINAL signatures (server final_sig, validator
-// vpk co-signature in effort leaves) are over this 32-byte digest — the form
-// the 0x402 on-chain Ed25519 precompile can verify in a leaf dispute. The
+// TestVerifyFinalDigestGolden pins the compact artifact identity: sha256 over
+// the exact golden FINAL message above. FINAL signatures cover the raw
+// canonical message. The
 // expected hex was computed with an independent non-Go sha256 over the same
 // message bytes.
 func TestVerifyFinalDigestGolden(t *testing.T) {
@@ -256,31 +255,6 @@ func TestVerifyFinalDigestGolden(t *testing.T) {
 		t,
 		"5fd6b821ebe7815e67b6b1ea65de0d4cf2d6acb5646895928fa10149e97c6395",
 		hex.EncodeToString(digest[:]),
-	)
-}
-
-// TestVerifyEffortDigestGolden pins the effort digest that binds coverage into
-// the FINAL attestation: sha256(finalDigest ‖ uint256_be(coverage)). It reuses
-// the golden FINAL digest from TestVerifyFinalDigestGolden. The expected hex
-// was computed with an independent non-Go sha256 over `finalDigest ‖
-// coverage.to_bytes(32,'big')` and MUST equal the contract's
-// `sha256(abi.encodePacked(bytes32 finalDigest, uint256 coverage))`.
-func TestVerifyEffortDigestGolden(t *testing.T) {
-	var finalDigest [32]byte
-	fd := testVerifyHexBytes(t, "6e85e7bf93f67bf6669a16523874f8efe4ae321449badc8f940567a19ce377ee")
-	copy(finalDigest[:], fd)
-
-	d1 := VerifyEffortDigest(finalDigest, 1)
-	AssertEqual(
-		t,
-		"706d76c16b69676f8a4f22ec332440903f0cfb4edb61cceb1bd00705aaead5c4",
-		hex.EncodeToString(d1[:]),
-	)
-	d7 := VerifyEffortDigest(finalDigest, 7)
-	AssertEqual(
-		t,
-		"75ee47fe12ab6bdedc0d9884c6d293eadb8891948d5647426ab0b38d02c792b4",
-		hex.EncodeToString(d7[:]),
 	)
 }
 
