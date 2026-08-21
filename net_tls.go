@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"fmt"
+	"sync"
 
 	"golang.org/x/crypto/cryptobyte"
 
@@ -62,6 +63,25 @@ func PinnedCertPool() (*x509.CertPool, error) {
 	return certPool, nil
 }
 
+var (
+	defaultPinnedCertPoolOnce sync.Once
+	defaultPinnedCertPool     *x509.CertPool
+	defaultPinnedCertPoolErr  error
+)
+
+// sharedDefaultPinnedCertPool parses the embedded immutable roots once for
+// the SDK's default client configurations. A connection gets its own TLS
+// session cache below, but x509 verification only reads RootCAs, so duplicating
+// the same parsed certificates for every Auto exit is allocation and retained
+// memory with no isolation benefit. PinnedCertPool intentionally remains the
+// public fresh-pool API for callers that plan to mutate their result.
+func sharedDefaultPinnedCertPool() (*x509.CertPool, error) {
+	defaultPinnedCertPoolOnce.Do(func() {
+		defaultPinnedCertPool, defaultPinnedCertPoolErr = PinnedCertPool()
+	})
+	return defaultPinnedCertPool, defaultPinnedCertPoolErr
+}
+
 // tlsClientSessionCacheCapacity sizes the per-config LRU session cache. The
 // client talks to a handful of platform hosts (api, connect, extenders resolved
 // to the platform), each caching at most a couple of tickets, so 32 is
@@ -69,7 +89,7 @@ func PinnedCertPool() (*x509.CertPool, error) {
 const tlsClientSessionCacheCapacity = 32
 
 func DefaultTlsConfig() (*tls.Config, error) {
-	certPool, err := PinnedCertPool()
+	certPool, err := sharedDefaultPinnedCertPool()
 	if err != nil {
 		return nil, err
 	}

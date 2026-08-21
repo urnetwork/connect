@@ -199,6 +199,33 @@ func (self *messagePool) Clear() {
 	}
 }
 
+// trim drops free buffers above maxRetained without shrinking the configured
+// capacity. A later burst can therefore refill the same bounded free list;
+// unlike Resize, this is decay of an idle high-water mark rather than a new
+// packet-path policy.
+func (self *messagePool) trim(maxRetained int) int {
+	self.adminLock.Lock()
+	defer self.adminLock.Unlock()
+
+	maxRetained = max(0, min(maxRetained, self.capacity()))
+	dropped := 0
+	for shardIndex := range messagePoolShardCount {
+		shardTarget := maxRetained / messagePoolShardCount
+		if shardIndex < maxRetained%messagePoolShardCount {
+			shardTarget += 1
+		}
+		shard := &self.shards[shardIndex]
+		shard.stateLock.Lock()
+		dropped += max(0, shard.count-shardTarget)
+		for shardTarget < shard.count {
+			shard.count -= 1
+			shard.pool[shard.count] = nil
+		}
+		shard.stateLock.Unlock()
+	}
+	return dropped
+}
+
 func (self *messagePool) shardFor(poolMessage []byte) (*messagePoolShard, uint64) {
 	id := binary.BigEndian.Uint64(poolMessage[self.size:])
 	return &self.shards[id&messagePoolShardMask], id
@@ -415,6 +442,29 @@ func WarmMessagePools() {
 	}
 }
 
+// TrimMessagePoolsToWarm drops an idle burst's excess free buffers while
+// preserving both the startup-sized reuse set and every class's configured
+// capacity. Packet buffers retain at most the same 1-MiB working set used by
+// WarmMessagePools; larger protocol objects retain their fixed 256-KiB floor
+// per class. Buffers still held by consumers are untouched, and subsequent
+// returns may refill the original capacity during the next burst.
+func TrimMessagePoolsToWarm() ByteCount {
+	var droppedByteCount ByteCount
+	for _, pool := range orderedMessagePools() {
+		if pool.size == packetPoolSize {
+			const maxWarmByteCount = 1024 * 1024
+			droppedByteCount += ByteCount(
+				pool.trim(min(pool.capacity()/4, maxWarmByteCount/pool.size)) * pool.size,
+			)
+		} else {
+			droppedByteCount += ByteCount(
+				pool.trim(largeObjectPoolFloorCount(pool.size)) * pool.size,
+			)
+		}
+	}
+	return droppedByteCount
+}
+
 func ClearMessagePools() {
 	for _, pool := range orderedMessagePools() {
 		pool.Clear()
@@ -469,15 +519,48 @@ func ResetMessagePoolStats() {
 // leak) even though the heap does not move (the GC quietly collects lost buffers). This is
 // always tracked (independent of debugTags), so tests can assert pool balance in any build.
 func MessagePoolCounts() (taken uint64, returned uint64, created uint64) {
-	for _, pool := range orderedMessagePools() {
+	stats := GetMessagePoolAggregateStats()
+	return stats.Taken, stats.Returned, stats.Created
+}
+
+// MessagePoolAggregateStats is an allocation-free process-wide snapshot used
+// by frequent host memory telemetry. Retained describes free-list ownership,
+// which is intentionally distinct from the in-flight Taken-Returned count.
+type MessagePoolAggregateStats struct {
+	Taken                        uint64
+	Returned                     uint64
+	Created                      uint64
+	RetainedCount                int
+	RetainedByteCount            ByteCount
+	CapacityByteCount            ByteCount
+	PacketRetainedCount          int
+	PacketRetainedByteCount      ByteCount
+	LargeObjectRetainedCount     int
+	LargeObjectRetainedByteCount ByteCount
+}
+
+func GetMessagePoolAggregateStats() MessagePoolAggregateStats {
+	var stats MessagePoolAggregateStats
+	for index, pool := range orderedMessagePools() {
 		snapshot := pool.snapshot()
 		for tag := range 256 {
-			taken += snapshot.takenTags[tag]
-			returned += snapshot.returnedTags[tag]
-			created += snapshot.createdTags[tag]
+			stats.Taken += snapshot.takenTags[tag]
+			stats.Returned += snapshot.returnedTags[tag]
+			stats.Created += snapshot.createdTags[tag]
+		}
+		retainedByteCount := ByteCount(snapshot.retained * pool.size)
+		stats.RetainedCount += snapshot.retained
+		stats.RetainedByteCount += retainedByteCount
+		stats.CapacityByteCount += ByteCount(snapshot.capacity * pool.size)
+		if index == 0 {
+			stats.PacketRetainedCount = snapshot.retained
+			stats.PacketRetainedByteCount = retainedByteCount
+		} else {
+			stats.LargeObjectRetainedCount += snapshot.retained
+			stats.LargeObjectRetainedByteCount += retainedByteCount
 		}
 	}
-	return
+	return stats
 }
 
 // MessagePoolClassStats is a point-in-time view of one size class. Capacity

@@ -128,3 +128,61 @@ func TestResizeMessagePoolsSplitsBudget(t *testing.T) {
 		AssertEqual(t, pool.capacity(), int(mib(3))/pool.size)
 	}
 }
+
+func TestTrimMessagePoolsToWarmPreservesCapacity(t *testing.T) {
+	defer ResizeMessagePools(InitialMessagePoolByteCount/2, InitialMessagePoolByteCount/2)
+	defer ClearMessagePools()
+
+	ResizeMessagePools(mib(4), mib(2))
+	pools := orderedMessagePools()
+	for _, pool := range pools {
+		pool.Clear()
+		messages := make([][]byte, pool.capacity())
+		for i := range messages {
+			messages[i] = pool.take(pool.size, 0)
+		}
+		for _, message := range messages {
+			pool.release(message[:cap(message)])
+		}
+	}
+
+	capacities := make([]int, len(pools))
+	for i, pool := range pools {
+		capacities[i] = pool.capacity()
+	}
+	TrimMessagePoolsToWarm()
+
+	for i, pool := range pools {
+		snapshot := pool.snapshot()
+		AssertEqual(t, snapshot.capacity, capacities[i])
+		if pool.size == packetPoolSize {
+			AssertEqual(t, snapshot.retained, min(capacities[i]/4, int(mib(1))/pool.size))
+		} else {
+			AssertEqual(t, snapshot.retained, largeObjectPoolFloorCount(pool.size))
+		}
+
+		// Trimming is not a permanent cap reduction: one take/return can grow
+		// the free list again, up to the unchanged configured capacity.
+		messages := make([][]byte, snapshot.retained+1)
+		for j := range messages {
+			messages[j] = pool.take(pool.size, 0)
+		}
+		for _, message := range messages {
+			pool.release(message[:cap(message)])
+		}
+		AssertEqual(t, pool.snapshot().retained, snapshot.retained+1)
+	}
+}
+
+func TestMessagePoolAggregateStatsDoesNotAllocate(t *testing.T) {
+	var stats MessagePoolAggregateStats
+	allocations := testing.AllocsPerRun(100, func() {
+		stats = GetMessagePoolAggregateStats()
+	})
+	if stats.CapacityByteCount <= 0 {
+		t.Fatal("aggregate pool stats reported no configured capacity")
+	}
+	if allocations != 0 {
+		t.Fatalf("GetMessagePoolAggregateStats allocated %.0f objects, want 0", allocations)
+	}
+}

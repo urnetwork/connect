@@ -1302,6 +1302,11 @@ type RemoteUserNatMultiClient struct {
 
 	settings *MultiClientSettings
 	log      Logger
+	// defaultReliabilitySettings is the immutable projection of settings used
+	// when no live override is installed. The packet and watchdog hot paths ask
+	// for this frequently; rebuilding the projection on every read creates a
+	// steady stream of short-lived configuration objects.
+	defaultReliabilitySettings *ReliabilitySettings
 
 	windows map[WindowType]*multiClientWindow
 	monitor MultiClientMonitor
@@ -2098,6 +2103,7 @@ func NewRemoteUserNatMultiClient(
 		log:                        log,
 		generator:                  generator,
 		settings:                   settings,
+		defaultReliabilitySettings: ReliabilitySettingsFrom(settings),
 		windows:                    map[WindowType]*multiClientWindow{},
 		securityPolicyStats:        securityPolicyStats,
 		securityPolicy:             settings.SecurityPolicyGenerator(cancelCtx, securityPolicyStats),
@@ -2750,6 +2756,11 @@ func (self *RemoteUserNatMultiClient) reliabilitySettings() *ReliabilitySettings
 	if overrides := self.reliability.Load(); overrides != nil {
 		return overrides
 	}
+	if self.defaultReliabilitySettings != nil {
+		return self.defaultReliabilitySettings
+	}
+	// Preserve the mutable-settings behavior of literal test fixtures. Real
+	// clients always install the immutable projection in the constructor.
 	return ReliabilitySettingsFrom(self.settings)
 }
 
