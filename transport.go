@@ -697,9 +697,8 @@ func (self *PlatformTransport) IsConnected() bool {
 
 // IsWaitingForBudget reports whether the reservation required by the selected
 // target mode is currently blocked. Auto's H3 reservation is optional and is
-// therefore not reported once its required H1 path can run. Policy migration
-// uses this to break an old carrier only when an explicit user selection cannot
-// otherwise obtain its memory reservation.
+// therefore not reported once its required H1 path can run. It is diagnostic;
+// policy migration uses CanMakeBeforeBreakFrom for its terminal decision.
 func (self *PlatformTransport) IsWaitingForBudget() bool {
 	switch self.targetMode {
 	case TransportModeH1:
@@ -711,6 +710,46 @@ func (self *PlatformTransport) IsWaitingForBudget() bool {
 	default:
 		return false
 	}
+}
+
+// AllowBudgetHandoffFrom pairs the reservation needed to activate this
+// transport with one acquired reservation on previous. It is deliberately
+// limited to transitions with H1 on at least one side: H1 -> H3 is bounded by
+// old H1, and H3 -> H1 is bounded by new H1. Two full H3 claims never bypass
+// the memory cap. The caller still closes previous only after this transport
+// reports connected.
+func (self *PlatformTransport) AllowBudgetHandoffFrom(previous *PlatformTransport) bool {
+	if self == nil || previous == nil {
+		return false
+	}
+	replacement := self.h1BudgetReservation
+	if replacement == nil {
+		replacement = self.h3BudgetReservation
+	}
+	if replacement == nil {
+		return false
+	}
+	// Prefer the previous H1 claim. This keeps Auto's optional H3 lease
+	// independently preemptible while its usable H1 route survives the handoff.
+	if replacement.AllowHandoffFrom(previous.h1BudgetReservation) {
+		return true
+	}
+	return replacement.AllowHandoffFrom(previous.h3BudgetReservation)
+}
+
+// CanMakeBeforeBreakFrom prepares the bounded budget handoff and reports
+// whether previous can remain alive until this transport connects. If normal
+// capacity already fits, no loan is needed. A budget-blocked H3 -> H3-family
+// replacement returns false rather than temporarily allocating a second full
+// H3 working set; callers may then release the old H3 to guarantee progress.
+func (self *PlatformTransport) CanMakeBeforeBreakFrom(previous *PlatformTransport) bool {
+	if self == nil || previous == nil {
+		return true
+	}
+	if self.AllowBudgetHandoffFrom(previous) {
+		return true
+	}
+	return !self.IsWaitingForBudget()
 }
 
 // ConnectedNotify returns a channel that closes on the next connect state
@@ -981,12 +1020,8 @@ func (self *PlatformTransport) activeMode() (TransportMode, chan struct{}) {
 // which is why no mode gate ever parked and the election could not distinguish
 // "no transport" from "the best transport".
 //
-// Three tiers, with a tie in the direct tier:
-//   - the direct modes (h3, h1) are equally preferred. whichever connects first
-//     becomes elected and the other remains active alongside it; the election
-//     is sticky among equals (see run).
-//   - h3dns tunnels over DNS where direct modes are filtered.
-//   - h3dnspump is the final availability fallback below h3dns.
+// Four strict production tiers: H1, direct H3, H3-over-DNS, then DNS-pump.
+// Custom policies may still tie modes; the election is sticky among equals.
 //
 // This table previously had the tiers inverted — it made h3dnspump the most
 // preferred mode — contradicting the mode constants, which are declared "in
@@ -1164,6 +1199,43 @@ func (self *PlatformTransport) startH3ModeGroup(modes []TransportMode, auto bool
 	})
 }
 
+// electAvailableMode is the pure Auto transition decision. Keeping the
+// decision separate from runner startup and notifications gives policy
+// transitions one deterministic module: retain an available current mode
+// unless a strictly higher-priority mode is available, otherwise fall back to
+// the best live mode (or None). Equal custom priorities remain sticky.
+func (self *PlatformTransport) electAvailableMode(
+	activeMode TransportMode,
+	available map[TransportMode]bool,
+) TransportMode {
+	bestMode := TransportModeNone
+	for _, mode := range self.orderedModes() {
+		if available[mode] {
+			bestMode = mode
+			break
+		}
+	}
+	if !available[activeMode] || self.isBetterMode(bestMode, activeMode) {
+		return bestMode
+	}
+	return activeMode
+}
+
+// runModeElection owns Auto promotion/fallback. setModeAvailable notifies this
+// loop; setActiveMode intentionally notifies only carrier gates so the loop
+// cannot wake itself and spin.
+func (self *PlatformTransport) runModeElection(ctx context.Context) {
+	for {
+		available, notify := self.modesAvailable()
+		self.setActiveMode(self.electAvailableMode(self.mode.Value(), available))
+		select {
+		case <-notify:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 func (self *PlatformTransport) run() {
 	defer func() {
 		self.cancel()
@@ -1201,44 +1273,7 @@ func (self *PlatformTransport) run() {
 		}
 	}
 
-	for {
-		available, notify := self.modesAvailable()
-
-		// descending preference. the comparator must be consistent: the previous
-		// one returned 1 for both (a, b) and (b, a) when custom preferences tied,
-		// and `maps.Keys` is randomly ordered, so the election
-		// picked an arbitrary winner among tied modes on every pass — flipping
-		// the active mode and thrashing the gates. break ties on the mode name
-		orderedModes := self.orderedModes()
-		bestMode := TransportModeNone
-		for _, mode := range orderedModes {
-			if available[mode] {
-				bestMode = mode
-				break
-			}
-		}
-
-		// equally preferred custom modes do not preempt each other: whichever
-		// connected first stays active. the active mode changes only when
-		// something strictly better becomes
-		// available, or when it is no longer available itself — in which case it
-		// falls back to the best that remains, and to TransportModeNone when
-		// nothing does. that fallback previously lived in an `else` on
-		// `0 < len(orderedModes)`, which is unreachable (orderedModes is the key
-		// set of a constant map), so a mode that dropped left the active mode
-		// pinned to its stale value
-		activeMode := self.mode.Value()
-		if !available[activeMode] || self.isBetterMode(bestMode, activeMode) {
-			activeMode = bestMode
-		}
-		self.setActiveMode(activeMode)
-
-		select {
-		case <-notify:
-		case <-self.ctx.Done():
-			return
-		}
-	}
+	self.runModeElection(self.ctx)
 }
 
 // Starts one owned mode runner. All runners are registered before run can

@@ -180,6 +180,7 @@ type ApiMultiClientGenerator struct {
 	newPlatformTransport func(
 		client *Client,
 		auth *ClientAuth,
+		targetMode TransportMode,
 		settings *PlatformTransportSettings,
 	) apiWindowPlatformTransport
 }
@@ -796,7 +797,7 @@ func (self *ApiMultiClientGenerator) createPlatformTransport(
 	effectiveSettings := &settingsValue
 	var transport apiWindowPlatformTransport
 	if self.newPlatformTransport != nil {
-		transport = self.newPlatformTransport(client, auth, effectiveSettings)
+		transport = self.newPlatformTransport(client, auth, targetMode, effectiveSettings)
 	} else {
 		transport = NewPlatformTransportWithTargetMode(
 			client.Ctx(),
@@ -890,16 +891,14 @@ func (self *ApiMultiClientGenerator) MigrateClientTransport(
 			return
 		}
 
-		next, nextTargetMode, nextPolicyVersion := self.createPlatformTransport(client, &auth, settings)
+		next, _, nextPolicyVersion := self.createPlatformTransport(client, &auth, settings)
 		brokeBeforeMake := false
-		if nextTargetMode != TransportModeAuto {
-			// A low-memory policy transition can be impossible to perform
-			// make-before-break: the old H1 reservation fills the capacity an
-			// explicitly selected H3 replacement needs. In that case the user's
-			// explicit carrier choice wins. Drop the old route so the waiting
-			// replacement can acquire its reservation; ordinary migrations and
-			// replacements that fit retain seamless make-before-break behavior.
-			if waiter, ok := next.(interface{ IsWaitingForBudget() bool }); ok && waiter.IsWaitingForBudget() {
+		if nextPlatform, ok := next.(*PlatformTransport); ok {
+			if currentPlatform, ok := current.(*PlatformTransport); ok &&
+				!nextPlatform.CanMakeBeforeBreakFrom(currentPlatform) {
+				// Two full H3 claims can exceed the platform memory cap. Recheck
+				// ownership before releasing the old carrier; transitions involving
+				// H1 use the bounded handoff and retain make-before-break instead.
 				self.transportLock.Lock()
 				stillCurrent := self.transports[client] == state && state.current == current
 				self.transportLock.Unlock()
@@ -930,10 +929,28 @@ func (self *ApiMultiClientGenerator) MigrateClientTransport(
 				return
 			case <-notify:
 			case <-connectTimer.C:
-				// Normally keep the old transport: it is still a valid route, and
-				// the server's drain excuse/reconnect path remains the backstop.
-				// A budget-blocked explicit selection already closed it above;
-				// falling back to that carrier would violate the selected policy.
+				if brokeBeforeMake {
+					// The old full-H3 working set was released to respect the
+					// memory cap. It is no longer a usable fallback, so install the
+					// replacement even if its first dial has not connected yet. The
+					// PlatformTransport owns its reconnect loop and will continue
+					// trying under the requested policy.
+					swapped := false
+					self.transportLock.Lock()
+					if self.transports[client] == state && state.current == current {
+						state.current = next
+						state.policyVersion = nextPolicyVersion
+						swapped = true
+					}
+					self.transportLock.Unlock()
+					if !swapped {
+						next.Close()
+					}
+					return
+				}
+				// Keep the old transport: it is still a valid route, and the
+				// server's drain excuse/reconnect path remains the backstop. Closing
+				// the failed replacement also returns any temporary handoff loan.
 				// Disarm BEFORE closing the replacement so the close is the
 				// definitive "migration released" signal: the deferred disarm
 				// runs after this return, so an observer gating on the

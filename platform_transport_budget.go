@@ -12,6 +12,9 @@ import (
 // H3 when both do not fit. Optional H3 leases are revocable: an explicit H3
 // choice can reclaim one, and foreground client Auto H3 can reclaim a provider
 // lease, so construction order cannot permanently pin outbound traffic to H1.
+// A policy replacement with H1 on either side may also use one serialized
+// temporary handoff bounded to the H1 claim, preserving make-before-break
+// without allowing two full H3 working sets to escape the aggregate limit.
 type PlatformTransportBudget struct {
 	mutex sync.Mutex
 
@@ -25,8 +28,15 @@ type PlatformTransportBudget struct {
 	reservedByteCount  ByteCount
 	releasedByteCount  ByteCount
 	preemptedH3Count   uint64
-	reservations       map[*platformTransportBudgetReservation]bool
-	nextSequence       uint64
+	// activeHandoff is the only reservation allowed to exceed the ordinary
+	// byte/socket ceiling while its paired carrier remains live. A handoff is
+	// allowed only when one endpoint is H1, so the temporary overage is bounded
+	// by the H1 claim: old H1 while moving to H3, or new H1 while moving from H3.
+	// More than one replacement may wait, but admission serializes the overage.
+	activeHandoff           *platformTransportBudgetReservation
+	handoffAcquisitionCount uint64
+	reservations            map[*platformTransportBudgetReservation]bool
+	nextSequence            uint64
 }
 
 type platformTransportBudgetClass uint8
@@ -64,18 +74,29 @@ type platformTransportBudgetReservation struct {
 	closed           bool
 	preempt          chan struct{}
 	preemptRequested bool
+	// A policy replacement may pair with the claim it will replace when one side
+	// is H1. The pair remains linked after admission until either transport
+	// releases; that is the accounting proof that the temporary overage is
+	// bounded by the H1 reservation rather than a second full H3 working set.
+	handoffFrom *platformTransportBudgetReservation
+	handoffTo   *platformTransportBudgetReservation
 }
 
 type PlatformTransportBudgetStats struct {
-	TotalByteCount     ByteCount
-	UsedByteCount      ByteCount
-	MaxTransportCount  int
-	UsedTransportCount int
-	PendingH1ByteCount ByteCount
-	PendingH1Count     int
-	ReservedByteCount  ByteCount
-	ReleasedByteCount  ByteCount
-	PreemptedH3Count   uint64
+	TotalByteCount              ByteCount
+	UsedByteCount               ByteCount
+	MaxTransportCount           int
+	UsedTransportCount          int
+	PendingH1ByteCount          ByteCount
+	PendingH1Count              int
+	ReservedByteCount           ByteCount
+	ReleasedByteCount           ByteCount
+	PreemptedH3Count            uint64
+	PendingHandoffCount         int
+	ActiveHandoffCount          int
+	ActiveHandoffByteCount      ByteCount
+	ActiveHandoffTransportCount int
+	HandoffAcquisitionCount     uint64
 }
 
 // NewPlatformTransportBudget creates a byte budget with an optional aggregate
@@ -98,17 +119,31 @@ func (self *PlatformTransportBudget) Stats() PlatformTransportBudgetStats {
 	}
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
-	return PlatformTransportBudgetStats{
-		TotalByteCount:     self.totalByteCount,
-		UsedByteCount:      self.usedByteCount,
-		MaxTransportCount:  self.maxTransportCount,
-		UsedTransportCount: self.usedTransportCount,
-		PendingH1ByteCount: self.pendingH1ByteCount,
-		PendingH1Count:     self.pendingH1SlotCount,
-		ReservedByteCount:  self.reservedByteCount,
-		ReleasedByteCount:  self.releasedByteCount,
-		PreemptedH3Count:   self.preemptedH3Count,
+	stats := PlatformTransportBudgetStats{
+		TotalByteCount:          self.totalByteCount,
+		UsedByteCount:           self.usedByteCount,
+		MaxTransportCount:       self.maxTransportCount,
+		UsedTransportCount:      self.usedTransportCount,
+		PendingH1ByteCount:      self.pendingH1ByteCount,
+		PendingH1Count:          self.pendingH1SlotCount,
+		ReservedByteCount:       self.reservedByteCount,
+		ReleasedByteCount:       self.releasedByteCount,
+		PreemptedH3Count:        self.preemptedH3Count,
+		HandoffAcquisitionCount: self.handoffAcquisitionCount,
 	}
+	for reservation := range self.reservations {
+		if reservation.handoffFrom != nil && reservation.pending && !reservation.closed {
+			stats.PendingHandoffCount += 1
+		}
+	}
+	if active := self.activeHandoff; active != nil && active.handoffFrom != nil {
+		stats.ActiveHandoffCount = 1
+		stats.ActiveHandoffByteCount = min(active.byteCount, active.handoffFrom.byteCount)
+		if active.usesSlot && active.handoffFrom.usesSlot {
+			stats.ActiveHandoffTransportCount = 1
+		}
+	}
+	return stats
 }
 
 func (self *PlatformTransportBudget) notifyChangedLocked() {
@@ -265,8 +300,10 @@ func (self *platformTransportBudgetReservation) requiredCapacityLocked() (
 	return
 }
 
-func (self *platformTransportBudgetReservation) canAcquireLocked() bool {
-	byteCount, transportCount := self.requiredCapacityLocked()
+func (self *platformTransportBudgetReservation) capacityFitsLocked(
+	byteCount ByteCount,
+	transportCount int,
+) bool {
 	budget := self.budget
 	if budget.totalByteCount < byteCount {
 		return false
@@ -275,6 +312,111 @@ func (self *platformTransportBudgetReservation) canAcquireLocked() bool {
 		return false
 	}
 	return true
+}
+
+// handoffCapacityLocked returns the capacity required when this claim replaces
+// its paired, already-acquired claim. One endpoint must be H1. Accounting
+// continues to include the old carrier until it actually drains; only the
+// admission decision discounts it, and activeHandoff ensures no second claim
+// can do the same at the same time.
+func (self *platformTransportBudgetReservation) handoffCapacityLocked() (
+	byteCount ByteCount,
+	transportCount int,
+	ok bool,
+) {
+	previous := self.handoffFrom
+	budget := self.budget
+	if previous == nil || previous.budget != budget || previous.closed ||
+		!previous.acquired ||
+		self.closed || self.acquired || !self.pending ||
+		(self.class != platformTransportBudgetH1 &&
+			previous.class != platformTransportBudgetH1) ||
+		(budget.activeHandoff != nil && budget.activeHandoff != self) {
+		return 0, 0, false
+	}
+
+	byteCount, transportCount = self.requiredCapacityLocked()
+	byteCount -= previous.byteCount
+	if previous.usesSlot {
+		transportCount -= 1
+	}
+	return byteCount, transportCount, true
+}
+
+func (self *platformTransportBudgetReservation) admissionLocked() (
+	canAcquire bool,
+	usesHandoff bool,
+) {
+	byteCount, transportCount := self.requiredCapacityLocked()
+	if self.capacityFitsLocked(byteCount, transportCount) {
+		return true, false
+	}
+	byteCount, transportCount, ok := self.handoffCapacityLocked()
+	return ok && self.capacityFitsLocked(byteCount, transportCount), ok
+}
+
+func (self *platformTransportBudgetReservation) canAcquireLocked() bool {
+	canAcquire, _ := self.admissionLocked()
+	return canAcquire
+}
+
+// AllowHandoffFrom pairs two replacement reservations when at least one is H1.
+// Multiple pairs may wait, but admission uses at most one pair at a time. This
+// method never releases the old reservation; the migration owner closes it
+// only after the replacement has authenticated and published its routes.
+func (self *platformTransportBudgetReservation) AllowHandoffFrom(
+	previous *platformTransportBudgetReservation,
+) bool {
+	if self == nil || previous == nil || self.budget == nil ||
+		self.budget != previous.budget {
+		return false
+	}
+	budget := self.budget
+	budget.mutex.Lock()
+	defer budget.mutex.Unlock()
+
+	if self.closed || self.acquired || !self.pending ||
+		previous.closed || !previous.acquired ||
+		(self.class != platformTransportBudgetH1 &&
+			previous.class != platformTransportBudgetH1) {
+		return false
+	}
+	if self.handoffFrom != nil && self.handoffFrom != previous {
+		return false
+	}
+	if previous.handoffTo != nil && previous.handoffTo != self {
+		return false
+	}
+	self.handoffFrom = previous
+	previous.handoffTo = self
+	budget.notifyChangedLocked()
+	return true
+}
+
+func (self *platformTransportBudgetReservation) clearHandoffLocked() {
+	budget := self.budget
+	if previous := self.handoffFrom; previous != nil {
+		if previous.handoffTo == self {
+			previous.handoffTo = nil
+		}
+		self.handoffFrom = nil
+	}
+	if budget.activeHandoff == self {
+		budget.activeHandoff = nil
+	}
+}
+
+func (self *platformTransportBudgetReservation) clearHandoffToLocked() {
+	budget := self.budget
+	if replacement := self.handoffTo; replacement != nil {
+		if replacement.handoffFrom == self {
+			replacement.handoffFrom = nil
+		}
+		if budget.activeHandoff == replacement {
+			budget.activeHandoff = nil
+		}
+		self.handoffTo = nil
+	}
 }
 
 func (self *platformTransportBudgetReservation) canPreemptLocked(
@@ -300,6 +442,13 @@ func (self *platformTransportBudgetReservation) canPreemptLocked(
 func (self *platformTransportBudgetReservation) requestPreemptionLocked() {
 	budget := self.budget
 	requiredBytes, requiredTransports := self.requiredCapacityLocked()
+	if handoffBytes, handoffTransports, ok := self.handoffCapacityLocked(); ok {
+		// Reclaim only the optional leases still needed after the paired previous
+		// reservation is discounted. The previous carrier stays acquired until
+		// the replacement connects.
+		requiredBytes = handoffBytes
+		requiredTransports = handoffTransports
+	}
 	byteDeficit := max(ByteCount(0), requiredBytes-budget.totalByteCount)
 	transportDeficit := 0
 	if 0 < budget.maxTransportCount {
@@ -367,7 +516,7 @@ func (self *platformTransportBudgetReservation) Acquire(ctx context.Context) boo
 			budget.mutex.Unlock()
 			return true
 		}
-		if self.canAcquireLocked() {
+		if canAcquire, usesHandoff := self.admissionLocked(); canAcquire {
 			if self.class == platformTransportBudgetH1 && self.pending {
 				budget.pendingH1ByteCount -= self.byteCount
 				if self.usesSlot {
@@ -376,6 +525,15 @@ func (self *platformTransportBudgetReservation) Acquire(ctx context.Context) boo
 			}
 			self.pending = false
 			self.acquired = true
+			if usesHandoff {
+				budget.activeHandoff = self
+				budget.handoffAcquisitionCount += 1
+			} else {
+				// Capacity became available without a loan between construction
+				// and admission. Drop the unused pair so another migration is not
+				// needlessly tied to the old carrier.
+				self.clearHandoffLocked()
+			}
 			budget.usedByteCount += self.byteCount
 			budget.reservedByteCount += self.byteCount
 			if self.usesSlot {
@@ -440,6 +598,11 @@ func (self *platformTransportBudgetReservation) Yield() bool {
 	if self.closed || !self.acquired || self.class != platformTransportBudgetH3Auto {
 		return false
 	}
+	// Yield can occur while this optional Auto-H3 reservation is either side
+	// of a policy handoff. Returning its capacity must also return the loan;
+	// otherwise activeHandoff could remain pinned to a no-longer-acquired pair.
+	self.clearHandoffToLocked()
+	self.clearHandoffLocked()
 	budget.usedByteCount -= self.byteCount
 	budget.releasedByteCount += self.byteCount
 	if self.usesSlot {
@@ -470,6 +633,10 @@ func (self *platformTransportBudgetReservation) releaseLocked() {
 	}
 	self.closed = true
 	budget := self.budget
+	// This reservation may be either the replacement or the old carrier.
+	// Releasing either endpoint resolves the loan before waking another waiter.
+	self.clearHandoffToLocked()
+	self.clearHandoffLocked()
 	if self.class == platformTransportBudgetH1 && self.pending {
 		budget.pendingH1ByteCount -= self.byteCount
 		if self.usesSlot {

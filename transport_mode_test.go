@@ -195,28 +195,7 @@ func TestPlatformTransportElectPreference(t *testing.T) {
 	// the election exactly as `run` performs it
 	elect := func() TransportMode {
 		available, _ := transport.modesAvailable()
-		orderedModes := slices.Collect(maps.Keys(transportModePreferences))
-		slices.SortFunc(orderedModes, func(a TransportMode, b TransportMode) int {
-			preferenceA := modePreference(a)
-			preferenceB := modePreference(b)
-			if preferenceA < preferenceB {
-				return -1
-			} else if preferenceB < preferenceA {
-				return 1
-			}
-			return strings.Compare(string(a), string(b))
-		})
-		bestMode := TransportModeNone
-		for _, mode := range orderedModes {
-			if available[mode] {
-				bestMode = mode
-				break
-			}
-		}
-		activeMode := transport.mode.Value()
-		if !available[activeMode] || isBetterMode(bestMode, activeMode) {
-			activeMode = bestMode
-		}
+		activeMode := transport.electAvailableMode(transport.mode.Value(), available)
 		transport.setActiveMode(activeMode)
 		return activeMode
 	}
@@ -268,6 +247,118 @@ func TestPlatformTransportElectPreference(t *testing.T) {
 	transport.setModeAvailable(TransportModeH3DnsPump, false)
 	if mode := elect(); mode != TransportModeNone {
 		t.Fatalf("mode = %q, want none — a dropped mode left the active mode stale", mode)
+	}
+}
+
+// The production election loop must promote and fall back through every Auto
+// tier without reconstructing the PlatformTransport. This exercises the real
+// notification loop rather than duplicating its decision in the test.
+func TestPlatformTransportAutoPromotionAndFallbackLive(t *testing.T) {
+	transport := testingPlatformTransportModes()
+	transport.modePreferences = DefaultTransportModePreferences()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		transport.runModeElection(ctx)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("Auto election loop did not stop")
+		}
+	})
+
+	waitMode := func(want TransportMode) {
+		t.Helper()
+		deadline := time.NewTimer(time.Second)
+		defer deadline.Stop()
+		for {
+			mode, notify := transport.activeMode()
+			if mode == want {
+				return
+			}
+			select {
+			case <-notify:
+			case <-deadline.C:
+				t.Fatalf("active mode = %q, want %q", mode, want)
+			}
+		}
+	}
+
+	waitMode(TransportModeNone)
+	for _, step := range []struct {
+		mode TransportMode
+		want TransportMode
+	}{
+		{TransportModeH3DnsPump, TransportModeH3DnsPump},
+		{TransportModeH3Dns, TransportModeH3Dns},
+		{TransportModeH3, TransportModeH3},
+		{TransportModeH1, TransportModeH1},
+	} {
+		transport.setModeAvailable(step.mode, true)
+		waitMode(step.want)
+	}
+
+	// Remove each winner in strict priority order. The next-best live carrier
+	// must become active immediately, ending at None when all are gone.
+	for _, step := range []struct {
+		mode TransportMode
+		want TransportMode
+	}{
+		{TransportModeH1, TransportModeH3},
+		{TransportModeH3, TransportModeH3Dns},
+		{TransportModeH3Dns, TransportModeH3DnsPump},
+		{TransportModeH3DnsPump, TransportModeNone},
+	} {
+		transport.setModeAvailable(step.mode, false)
+		waitMode(step.want)
+	}
+
+	// Recovery may announce modes in the worst possible order. Every higher
+	// tier must still preempt the lower one, ending at H1.
+	for _, mode := range []TransportMode{
+		TransportModeH3DnsPump,
+		TransportModeH3Dns,
+		TransportModeH3,
+		TransportModeH1,
+	} {
+		transport.setModeAvailable(mode, true)
+		waitMode(mode)
+	}
+}
+
+// Every combination of live Auto carriers must elect the strict production
+// winner, independent of the previously active mode. This covers all 16
+// availability sets times all five possible prior states.
+func TestPlatformTransportAutoElectionExhaustiveAvailabilityMatrix(t *testing.T) {
+	transport := testingPlatformTransportModes()
+	transport.modePreferences = DefaultTransportModePreferences()
+	modes := []TransportMode{
+		TransportModeH1,
+		TransportModeH3,
+		TransportModeH3Dns,
+		TransportModeH3DnsPump,
+	}
+	priorModes := append([]TransportMode{TransportModeNone}, modes...)
+	for mask := 0; mask < 1<<len(modes); mask++ {
+		available := map[TransportMode]bool{}
+		want := TransportModeNone
+		for i, mode := range modes {
+			if mask&(1<<i) != 0 {
+				available[mode] = true
+				if want == TransportModeNone {
+					want = mode
+				}
+			}
+		}
+		for _, prior := range priorModes {
+			if got := transport.electAvailableMode(prior, available); got != want {
+				t.Errorf("mask=%04b prior=%q elected=%q want=%q", mask, prior, got, want)
+			}
+		}
 	}
 }
 
