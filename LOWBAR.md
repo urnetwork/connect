@@ -1020,6 +1020,199 @@ the iOS Network Extension's native footprint, GOGC-10 behavior, memory-pressure
 callback timing, or jetsam boundary. The active H3 breach is a measured failure
 of a hard 28-MiB-at-all-times interpretation and remains a physical-iOS gate.
 
+### 2026-08-23 zandroid follow-up: a 20-MiB steady target
+
+This pass lowered the proposed iOS-proxy goal from 28 MiB to a steady 20 MiB
+and used the connected Pixel 8 Pro (Android 17/API 37) as `zandroid`. Android
+was adeb792799e2, Connect was c1d9ab4, and SDK was f9652cb. The ordinary build
+kept the 32-MiB Go soft limit, 20-MiB `DeviceLocal` target, and Go's production
+524,288-byte heap-profile rate. A second private process used a 65,536-byte
+rate only to rank allocation stacks. Device/client identities, credentials,
+addresses, DNS answers, and signed traffic URLs were not retained in this
+document. The phone was USB-powered at 100%, cellular signal level 0 was
+available but the measured underlay was Wi-Fi, and every OS sample reported
+thermal status 0. This remains memory evidence, not battery or physical-iOS
+evidence.
+
+The 20-MiB signal is `MemoryStats.TotalRuntimeByteCount`, exactly Go runtime
+total mapped memory minus heap pages released to the OS. It is neither Android
+whole-process PSS nor an estimate of an iOS Network Extension's total native
+footprint. The debug/instrumentation process reached 450,220 KiB whole-app PSS
+and contained large Java, code, graphics, and test-runner components, so PSS is
+not used for this cross-platform Go-runtime target. "Steady" also cannot mean
+"at every instant": live packet work alone exceeded 20 MiB during fast.com.
+Active peak and post-traffic recovery need separate gates.
+
+The production-rate process remained alive for 1,551.6 seconds. Auto used H1
+according to exact SDK carrier deltas. Five uncached Wikipedia navigations and
+five streamed 1-MiB Cloudflare downloads completed; their medians were 476.7
+ms and 1.02 Mbit/s. A 60-second fast.com session also completed and moved about
+40.4 MiB through H1 according to SDK counters. All 593 external traffic
+collector samples were eligible Wi-Fi-plus-VPN, IPv4-only, and thermal-zero
+samples. Functional success therefore did not hide the memory miss.
+
+The production-rate timeline was:
+
+| Point | Go runtime | Live heap | Pool state | Topology | 20-MiB result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Cold, aged and disconnected | 15.19 MiB | 3.78 MiB | 1.00 MiB returned | 0 exits / 57 goroutines | Pass |
+| Auto connect completion | 20.23 MiB | 6.78 MiB | 0.99 MiB returned | 5 exits / 254 goroutines | Fail by 0.23 MiB |
+| Auto, about 90 seconds idle | 22.76 MiB | about 7.1 MiB | 1.00 MiB returned | 8--9 exits / about 300 goroutines | Fail |
+| Auto, later pre-traffic plateau | 25.06 MiB median, 25.55 MiB peak | about 7.4 MiB | 1.00 MiB returned | 8 exits / 283 median goroutines | Fail |
+| fast.com/recovery sampled peak | 35.83 MiB | 20.76 MiB | 4,764 objects outstanding at peak | 10--12 exits / 402 peak goroutines | Active failure; no crash |
+| Just before automatic trim | 34.44 MiB | 18.42 MiB | 9.28 MiB returned | 11 exits / 344 goroutines | Fail |
+| Immediately after automatic trim | 24.22 MiB | 7.21 MiB | rebuilt to 1.00 MiB returned | topology unchanged | Fail, but 10.22 MiB lower |
+| About five minutes after fast.com | 26.15 MiB | about 8.17 MiB | 1.00 MiB returned | 10 exits | Fail after rebound |
+
+The 32-MiB soft limit induced severe collection pressure rather than enforcing
+a hard footprint. Across fast.com and recovery the process advanced roughly
+5,100 GC cycles; phase rates reached about 23.6 collections/second during the
+transfer and 10.4/second during recovery. Live buffers could not be reclaimed,
+and the heap goal repeatedly collapsed close to the live set. Pools prevented
+some allocation but could not make 4,764 owned objects disappear.
+
+The automatic pool rebuild was effective but late. It ran 192 seconds after
+fast.com, not after the configured 60 seconds. There were 13 post-transfer
+one-second packet-stat epochs of at least 4 KiB; the last occurred exactly 60
+seconds before the rebuild. Multi-exit H1 health/control traffic is included
+in the aggregate remote counters and therefore repeatedly reset the global
+user-quiet timer. The code behaved as written, but the activity signal is too
+broad for a steady-footprint policy.
+
+Matched pressure points in the same long-lived production process separated
+warm retention from the connected live floor:
+
+| Mode | Explicit `TrimMemory` (warm pool) | Explicit `FreeMemory` (no returned pool/caches) | Live heap after full pressure | Live exits |
+| --- | ---: | ---: | ---: | ---: |
+| Disconnected | 20.63 MiB | 19.06 MiB | 3.91 MiB | 0 |
+| H3 | 23.62 MiB | 21.68 MiB | 5.80 MiB | 1 |
+| H1 | 24.76 MiB | 22.40 MiB | 6.23 MiB | 8 |
+
+The nominal 1-MiB warm packet set costs more than one MiB of runtime at these
+floors because reachable slices can pin allocator spans and because
+`FreeMemory` also sheds resolver, connection, and affinity caches. The observed
+warm-to-full-pressure differences were 1.57--2.36 MiB. Conversely, reducing
+H1 from eight exits to the one-exit H3 topology changed the pressure floor by
+only about 0.72 MiB. Exit count matters, but mostly through goroutine/control
+churn and delayed reclaim; topology reduction alone is not a 2--3-MiB fix.
+
+Allocator history remains after reachable objects drain. From the cold state
+to the long-run disconnected pressure floor, stack in-use rose from about 1.28
+to 2.41 MiB and GC metadata from about 3.30 to 4.03 MiB even though goroutines
+returned to 57 and live heap was only 3.91 MiB. The fast.com process had peaked
+at 402 goroutines. Packet concurrency, goroutine fan-out, and stack depth thus
+raise the later runtime floor; optimizing only the final object graph misses
+this high-water effect.
+
+The private 64-KiB profiles are ranking evidence, not byte-exact accounting.
+The pressure profile sampled 6.18 MiB of live allocations while runtime gauges
+reported a larger total that also includes stacks, allocator/GC metadata, and
+released-versus-retained spans. Sampling variance is especially high for
+small objects. Still, the repeated leading sites were useful:
+
+- a returned 1-MiB message-pool set sampled as about 1.40 MiB before pressure
+  and disappeared from the full-pressure profile;
+- `newContractStatusCallbackWorker` sampled about 0.77 MiB after pressure;
+- gomobile `seq.ToRefNum` tables sampled about 0.53--0.69 MiB, attributable in
+  different profiles to `ExitList_Get` and the one-second transport/status
+  object getters;
+- H1 WebSocket batch buffers, `bufio` readers/writers, HPACK state, decoded-pack
+  owners, RTT windows, location/grid projections, JSON type metadata, and TLS
+  state each appeared in the roughly 0.1--0.4-MiB sampled tier; and
+- cumulative allocation ranked the SDK I/O loop, IP packet grouping, remote
+  packet-group sends, pool misses, TLS record encryption, decoded-pack owners,
+  timers, and send scheduling as the main burst/churn paths.
+
+The gomobile result is partly an observer effect. `ToRefNum` grows global Go
+reference maps when object graphs cross into Java; deleting entries does not
+necessarily shrink their map buckets. Calling exits, throughput lists,
+transport distributions, packet-stat objects, and transport status every
+second therefore perturbs the exact heap being measured. The retained
+0.53--0.69-MiB samples are not all product steady state. A 20-MiB release gate
+needs Go-side or primitive-only sampling and should project topology no more
+often than every 15--30 seconds.
+
+One final A/B measured Go heap profiling itself. Merely calling
+`SetMemoryProfileRate(0)` from Android application startup was too late: the Go
+runtime already held 1,447,889 bytes of profiling buckets. Removing the SDK
+helper was also insufficient because gomobile links a Go shared library and
+retains `runtime.memProfileInternal`. A controlled build with profiling
+disabled at native-runtime initialization reduced profiling buckets to 5,649
+bytes. At the same approximately seven-second ready point, runtime fell from
+13,146,376 to 11,419,664 bytes, a 1.65-MiB reduction. No such build change was
+retained; the ordinary SDK artifact was rebuilt after the experiment.
+
+The native-profile-off process then showed both the opportunity and its limit:
+
+| State | Runtime result with native profiling disabled |
+| --- | ---: |
+| Cold ready, first sample / short ready-phase median | 10.92 / 13.74 MiB |
+| Auto connect-completion median | 19.05 MiB |
+| Auto early-idle median / p95 | 21.10 / 21.42 MiB |
+| Auto after `TrimMemory`, nine exits and 1-MiB warm pool | 20.58 MiB |
+| Auto after `FreeMemory`, eight exits | 19.20 MiB immediate; 20.42 MiB about 75 seconds later |
+| H3 one-exit idle median / p95 | 19.38 / 19.55 MiB |
+| H3 one-exit full-pressure floor | 18.84 MiB |
+
+This was a focused hypothesis test, not a matched full fast.com rerun, so its
+numbers must not be subtracted mechanically from the longer production
+history. It does establish that a connected sub-20-MiB state is technically
+reachable, that one-exit H3 can hold it for a minute, and that profiler removal
+alone does not keep multi-exit Auto below 20 MiB after normal repopulation.
+
+The ranked plan to make 20 MiB a repeatable steady state is:
+
+1. **Make the gate non-observing and explicit.** Add a bounded Go-side sampler
+   that records primitive memory/pool/topology counters and exports one batch
+   after the interval. Stop constructing bound exit/status/list objects every
+   second. Gate a production build on five fresh-process repetitions with
+   `TotalRuntimeByteCount` p50 and p95 at or below 20 MiB after five connected
+   quiet minutes. Report cold, one-minute, five-minute, and fifteen-minute
+   values separately. Keep fast.com active peak and recovery time as separate
+   gates; do not hide a peak failure in a steady average.
+2. **Fix mobile quiet detection and reclaim.** Drive the quiet timer from user
+   TUN payload activity, or explicitly exclude/tag carrier health, probe, and
+   status traffic. When pool outstanding ownership is drained and runtime is
+   above target, use a short 10--15-second high-water debounce followed by one
+   full shed/collection per quiet epoch; do not wait for a control-silent
+   minute. Measure a 256- or 512-KiB mobile warm packet set versus the current
+   1 MiB. Full shedding and a smaller warm set are needed because pool-only
+   trim left 20.58 MiB even in the profiling-off process. Never collect while
+   buffers are in flight, and add rate/cooldown counters so this cannot become
+   a battery-expensive periodic GC.
+3. **Disable heap profiling before the release mobile Go runtime starts.** A
+   diagnostic library should retain `WriteHeapProfile` and selectable sampling;
+   Android/iOS release libraries should start with `memprofilerate=0`. Android
+   application callbacks are too late because `go.Seq` loads `libgojni.so` in
+   its static initializer, so this needs a controlled gomobile loader/runtime
+   build rather than an `Application.onCreate` call. Re-measure binary startup,
+   crash diagnostics, and the physical iOS extension before adopting it. The
+   measured steady benefit was about 1.1 MiB in early Auto and 1.65 MiB at the
+   matched cold point, not the full 1.45-MiB bucket counter in every state.
+4. **Reduce the connected live/control set.** Add a mobile-low-memory
+   `MultiClient` profile and A/B the quality window at three instead of six,
+   speed at one with a hard cap of one or two, and standing reserve only when
+   measured quality requires it. Coalesce contract status through one worker
+   per window/device and size its latest-value queue to live contracts rather
+   than the transfer sequence buffer. Right-size H1 WebSocket/bufio/HPACK
+   buffers and share only immutable TLS/root state. The 0.72-MiB H1-versus-H3
+   pressure difference means window reduction must be justified by lower
+   control traffic, goroutines, and allocation rate as well as direct bytes.
+5. **Lower burst high-water instead of deleting useful pools.** Bound H1/H3
+   send/receive flight and packet-group fan-out so fast.com cannot create 4,764
+   simultaneous pool owners or a 402-goroutine stack high-water. Preserve
+   bounded reuse for active traffic, then reclaim returned objects. Track quiet
+   GC cadence with a provisional goal of at most one collection/minute and no
+   forced collection outside a recorded reclaim event.
+
+The warm-set/reclaim policy must remain mobile-specific. Do not shrink global
+Connect pool capacity or apply mobile forced-reclaim timing to `server/connect`
+or `server/proxy`; any shared-pool implementation change must rerun their
+performance suites and `server/connect/perfvar`. For mobile acceptance, repeat
+Wikipedia, the streamed 1-MiB object, and fast.com on Auto/H1/H3, verify exact
+carrier bytes and no latency/goodput regression, then use the physical iOS
+Network Extension footprint and jetsam behavior as the actual release gate.
+
 ### Provisional release gates
 
 Freeze exact gates after Phase 1 measures variance. Until then, the target is:
