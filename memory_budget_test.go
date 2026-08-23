@@ -174,6 +174,48 @@ func TestTrimMessagePoolsToWarmPreservesCapacity(t *testing.T) {
 	}
 }
 
+func TestMessagePoolCapacitySlotsGrowLazilyAndReclaim(t *testing.T) {
+	const logicalCapacity = 1 << 20
+	pool := newMessagePool(packetPoolSize, logicalCapacity)
+	AssertEqual(t, pool.capacity(), logicalCapacity)
+	for shardIndex := range messagePoolShardCount {
+		AssertEqual(t, len(pool.shards[shardIndex].pool), 0)
+	}
+
+	message := pool.take(pool.size, 0)
+	pool.release(message[:cap(message)])
+	allocatedSlotCount := 0
+	for shardIndex := range messagePoolShardCount {
+		allocatedSlotCount += len(pool.shards[shardIndex].pool)
+	}
+	AssertEqual(t, allocatedSlotCount, 1)
+
+	pool.trim(0)
+	AssertEqual(t, pool.capacity(), logicalCapacity)
+	for shardIndex := range messagePoolShardCount {
+		AssertEqual(t, len(pool.shards[shardIndex].pool), 0)
+	}
+
+	message = pool.take(pool.size, 0)
+	pool.release(message[:cap(message)])
+	pool.Clear()
+	AssertEqual(t, pool.capacity(), logicalCapacity)
+	for shardIndex := range messagePoolShardCount {
+		AssertEqual(t, len(pool.shards[shardIndex].pool), 0)
+	}
+
+	boundedPool := newMessagePool(packetPoolSize, messagePoolShardCount)
+	messages := make([][]byte, 2*messagePoolShardCount)
+	for index := range messages {
+		messages[index] = boundedPool.take(boundedPool.size, 0)
+	}
+	for _, boundedMessage := range messages {
+		boundedPool.release(boundedMessage[:cap(boundedMessage)])
+	}
+	AssertEqual(t, boundedPool.snapshot().retained, messagePoolShardCount)
+	AssertEqual(t, boundedPool.capacity(), messagePoolShardCount)
+}
+
 func TestMessagePoolAggregateStatsDoesNotAllocate(t *testing.T) {
 	var stats MessagePoolAggregateStats
 	allocations := testing.AllocsPerRun(100, func() {

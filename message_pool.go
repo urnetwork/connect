@@ -59,6 +59,7 @@ type messagePoolShard struct {
 	stateLock    sync.Mutex
 	pool         [][]byte
 	count        int
+	maxCount     int
 	takenTags    [256]uint64
 	returnedTags [256]uint64
 	createdTags  [256]uint64
@@ -92,10 +93,19 @@ func (self *messagePool) Resize(maxCount int) {
 		}
 		shard := &self.shards[shardIndex]
 		shard.stateLock.Lock()
-		newPool := make([][]byte, shardCapacity)
-		newCount := copy(newPool, shard.pool[:shard.count])
-		shard.pool = newPool
-		shard.count = newCount
+		if shardCapacity < shard.count {
+			shard.count = shardCapacity
+		}
+		if shardCapacity < len(shard.pool) {
+			// Capacity is a logical bound, not a reason to preallocate one
+			// slice header per possible retained buffer. This matters for the
+			// multi-GiB server limits, where an empty dense index consumed
+			// hundreds of MiB before the first packet arrived.
+			newPool := make([][]byte, shard.count)
+			copy(newPool, shard.pool[:shard.count])
+			shard.pool = newPool
+		}
+		shard.maxCount = shardCapacity
 		shard.stateLock.Unlock()
 	}
 }
@@ -105,7 +115,7 @@ func (self *messagePool) capacity() int {
 	for shardIndex := range messagePoolShardCount {
 		shard := &self.shards[shardIndex]
 		shard.stateLock.Lock()
-		capacity += len(shard.pool)
+		capacity += shard.maxCount
 		shard.stateLock.Unlock()
 	}
 	return capacity
@@ -136,7 +146,7 @@ func (self *messagePool) snapshot() messagePoolSnapshot {
 	var snapshot messagePoolSnapshot
 	for shardIndex := range messagePoolShardCount {
 		shard := &self.shards[shardIndex]
-		snapshot.capacity += len(shard.pool)
+		snapshot.capacity += shard.maxCount
 		snapshot.retained += shard.count
 		for tag := range 256 {
 			snapshot.takenTags[tag] += shard.takenTags[tag]
@@ -170,14 +180,18 @@ func (self *messagePool) warm(count int) {
 		}
 		shard := &self.shards[shardIndex]
 		shard.stateLock.Lock()
-		targetCount = min(targetCount, len(shard.pool))
+		targetCount = min(targetCount, shard.maxCount)
 		for shard.count < targetCount {
 			poolMessage := make([]byte, self.size+MessagePoolMetaByteCount)
 			shard.nextId += 1
 			id := shard.nextId<<messagePoolShardBits | uint64(shardIndex)
 			binary.BigEndian.PutUint64(poolMessage[self.size:], id)
 			poolMessage[self.size+8] = 255
-			shard.pool[shard.count] = poolMessage
+			if shard.count < len(shard.pool) {
+				shard.pool[shard.count] = poolMessage
+			} else {
+				shard.pool = append(shard.pool, poolMessage)
+			}
 			shard.count += 1
 		}
 		shard.stateLock.Unlock()
@@ -191,9 +205,7 @@ func (self *messagePool) Clear() {
 	for shardIndex := range messagePoolShardCount {
 		shard := &self.shards[shardIndex]
 		shard.stateLock.Lock()
-		for i := range shard.count {
-			shard.pool[i] = nil
-		}
+		shard.pool = nil
 		shard.count = 0
 		shard.stateLock.Unlock()
 	}
@@ -216,10 +228,17 @@ func (self *messagePool) trim(maxRetained int) int {
 		}
 		shard := &self.shards[shardIndex]
 		shard.stateLock.Lock()
-		dropped += max(0, shard.count-shardTarget)
-		for shardTarget < shard.count {
-			shard.count -= 1
-			shard.pool[shard.count] = nil
+		if shardTarget < shard.count {
+			dropped += shard.count - shardTarget
+			shard.count = shardTarget
+		}
+		if shard.count < len(shard.pool) {
+			// Preserve the configured maxCount while releasing the dense index
+			// that described an earlier high-water mark. It will grow lazily on
+			// later returns, just like the buffer working set itself.
+			newPool := make([][]byte, shard.count)
+			copy(newPool, shard.pool[:shard.count])
+			shard.pool = newPool
 		}
 		shard.stateLock.Unlock()
 	}
@@ -307,6 +326,12 @@ func (self *messagePool) release(poolMessage []byte) bool {
 	if shard.count < len(shard.pool) {
 		// The payload does not need to be zeroed.
 		shard.pool[shard.count] = poolMessage
+		shard.count += 1
+	} else if shard.count < shard.maxCount {
+		// Grow only when a returned high-water mark needs another slot. The
+		// ordinary take/return cycle continues to use the branch above, so
+		// multi-GiB logical limits add no allocation to the steady hot path.
+		shard.pool = append(shard.pool, poolMessage)
 		shard.count += 1
 	}
 	shard.stateLock.Unlock()
