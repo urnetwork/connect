@@ -1,7 +1,7 @@
 # Low-bar network delivery plan
 
 Status: living implementation plan
-Last updated: 2026-08-23
+Last updated: 2026-08-24
 
 ## Outcome
 
@@ -1360,6 +1360,115 @@ but an actual Network Extension footprint/termination run remains the release
 gate. A 20-MiB Go steady result on Android is not proof of a 20-MiB iOS process
 footprint.
 
+### 2026-08-24 24-MiB performance rebalance
+
+The 20-MiB profile met its memory target, but a matched fresh-process Wi-Fi
+Auto pass on the same attached `zandroid` exposed an unacceptable real-site
+cost. The exact `m20-iospace-20260823` artifact loaded Wikipedia in a 3,967.8-ms
+median, with 1,575.2-ms median document TTFB and 2,359.23-ms median per-page
+request p95. A streamed Cloudflare 1-MiB object took 33.279 seconds at 0.25
+Mbit/s median; the direct control completed in 0.412 seconds at 20.37 Mbit/s.
+The page phase never reached the 512-root pressure gate, so its latency was not
+caused by packet rejection. The transfer phase did accumulate 1,135 pressure
+drops and 72 collections, showing that the 20-MiB combination was also too
+aggressive under bulk traffic.
+
+The accepted profile treats 24 MiB as the mobile Go-runtime steady target and
+keeps 28 MiB as a separate active diagnostic failure threshold. It spends the
+additional room narrowly:
+
+- mobile Android/iOS defaults and Android's explicit per-device target are 24
+  MiB; desktop/server retains its established 20-MiB default;
+- Auto quality/speed windows are fixed at 4/1 rather than 3/1, giving route
+  selection one additional quality candidate without restoring the much
+  larger desktop live set;
+- Android and iOS use `GOGC=25`, midway between the slow 10 setting and the
+  unsafe 50 experiment, and keep `memprofilerate=0` plus the 32-MiB soft limit;
+- the post-reclaim packet warm set is 512 KiB rather than 256 KiB, avoiding a
+  completely cold allocation wave while leaving the pool capacity unchanged;
+  and
+- the measured H3-safe 16-message sequence/unreliable-flight ceiling,
+  16-packet/24-KiB group ceiling, 512-root aggregate pressure gate, and
+  three-minute flow retirement remain unchanged.
+
+The physical A/B rejected every apparently faster configuration that weakened
+the H3 safety margin. These are threshold experiments, not directly comparable
+latency samples: live network conditions and process ages differed.
+
+| Candidate | Queue / aggregate policy | Explicit-H3 runtime max | Decision |
+| --- | --- | ---: | --- |
+| `GOGC=50`, 32-message/group, 768-root gate | both per-flow and process-wide admission widened | 28.41 MiB | reject: crossed 28 MiB |
+| `GOGC=50`, 32-message/group, 512-root gate | restored aggregate gate only | 29.30 MiB | reject: already-admitted per-flow work still crossed 28 MiB |
+| `GOGC=50`, 16-message, 16-packet/24-KiB group, 512-root gate | restored all packet safety ceilings | 29.95 MiB | reject: GC heap float alone remained unsafe |
+| `GOGC=25`, unchanged H3-safe ceilings | final `m24-route-gc25-safe-20260824` profile | 24.73 MiB whole-session; 24.03 MiB under sustained H3 traffic | accept on Android surrogate |
+
+The final artifact used a fresh authenticated process, Chrome's cache-disabled
+benchmark path, real Wikipedia/Cloudflare/fast.com traffic, the 32-MiB Go soft
+limit, and production `memprofilerate=0`. Against the exact 20-MiB baseline,
+the observed performance was:
+
+| Workload | 20-MiB profile | Accepted 24-MiB profile | Observed change |
+| --- | ---: | ---: | ---: |
+| Wikipedia load, 7 runs | 3,967.8 ms median | 745.0 ms median | 81.2% lower |
+| Wikipedia document TTFB | 1,575.2 ms median | 248.1 ms median | 84.3% lower |
+| Wikipedia request p95 per page | 2,359.23 ms median | 294.58 ms median | 87.5% lower |
+| Cloudflare streamed 1 MiB, 5 runs | 33.279 s / 0.25 Mbit/s median | 3.892 s / 2.16 Mbit/s median | 88.3% less time / 8.64x goodput |
+
+This live-route result demonstrates that the severe regression is removable;
+it is not a confidence interval or proof that every gain comes from one knob.
+The accepted `GOGC=25` Wikipedia median was slower than the rejected
+`GOGC=50` candidate's 519.9 ms, which is the expected safety/performance trade.
+Two newly-created DevTools targets closed their websocket during the explicit
+H3 phase; the retained existing-target attempt completed in 2.624 seconds.
+Those two harness-visible failures remain recorded rather than being converted
+into successes.
+
+Memory telemetry for the accepted run separated active high-water from steady
+recovery:
+
+| Phase | Samples | Go runtime p50 / p95 / max | Live/pool ownership | Result |
+| --- | ---: | ---: | ---: | --- |
+| Auto fast.com | 7 | 20.65 / 20.92 / 20.92 MiB | 8.22-MiB live heap; 1,248 roots max | below both targets |
+| Explicit H3 page | 5 | 22.66 / 23.19 / 23.19 MiB | returned pool <=2.73 MiB | below both targets |
+| Explicit H3 fast.com | 8 | 23.86 / 24.03 / 24.03 MiB | 10.08-MiB live heap; 1,152 roots max | active headroom retained |
+| H3 recovery, including drain | 25 / 360 s | 20.20 / 24.61 / 24.73 MiB | first 105 s include in-flight drain | below 28-MiB active guard |
+| H3 recovery after reclaim | 18 | 20.12 / 20.52 / 20.52 MiB | reclaim 24.12 -> 19.53 MiB; warm pool about 0.5 MiB | steady 24-MiB pass |
+
+The final summary contained 59 samples, zero 28-MiB breaches, a 24.73-MiB
+runtime peak, 10.33-MiB live-heap peak, 1,289 maximum outstanding pooled
+objects, and 5,512 cumulative overload drops. Exact carrier counters recorded
+16.75 MiB H1 and 6.32 MiB H3 ingress. One quiet reclaim fired 105 seconds after
+the H3 traffic phase and flows drained from 45 to six. Cumulative GC pause was
+0.953 seconds over the 887.7-second process (about 0.11%). The instrumentation
+finished successfully, the temporary client was released, and credentials
+were removed from the device.
+
+Server isolation used an exact same-session A/B rather than the misleading
+prior-day comparison. Server `1806bbc9` and every non-SDK dependency were held
+fixed; SDK `49f756f` was compared with only this patch. Every benchmark ran for
+300 ms with `-benchmem`, `GOMAXPROCS=10`, and six repetitions per side in
+baseline/candidate/candidate/baseline order over three cycles:
+
+| Server package | Time geomean change | Allocation result |
+| --- | ---: | --- |
+| `server/connect` | -0.05% | B/op +0.01%; allocs/op unchanged |
+| `server/connect/perfvar` | -0.17% | B/op and allocs/op unchanged |
+| `server/proxy` | +0.05% | every B/op and allocs/op result unchanged |
+
+No individual timing comparison was significant. This rejects a server
+performance regression and confirms that the mobile/default split leaves
+Linux at `GOGC=100`, its previous 20-MiB device default, the 1-MiB server warm
+wrapper, and no mobile packet gate/reclaimer. The broad server short-suite
+attempt remained environment-blocked by missing `WARP_ENV` and vault `pg.yml`,
+matching its documented fixture limitation; the benchmark and focused policy
+processes passed.
+
+Only one Android remained attached, so this pass could not create a new P2P
+pair; the successful 2026-08-21 bidirectional same-LAN result remains the
+current evidence. The 24-MiB result is still a Go-runtime Android surrogate,
+not proof that an iOS Network Extension remains below its `phys_footprint` or
+jetsam limit. A physical iOS run remains the release gate.
+
 ### Provisional release gates
 
 Freeze exact gates after Phase 1 measures variance. Until then, the target is:
@@ -2086,6 +2195,8 @@ timeouts, following `CODESTYLE.md`.
 | 2026-08-23 | 20-MiB source and regression gates | Full Connect and SDK package suites; final Connect/SDK focused race selections; SDK iOS-extension build and linked runtime-policy check; Android Github Debug AAR/app/instrumentation assembly, unit tests, and 10 collector tests | Pass. Connect's full suite completed in 444.586 s and its final short suite in 199.909 s; the final SDK full suite passed, including three measured provider-load repetitions at a 30.4--30.5-MiB host-process peak. New tests cover pool root/share/final-return ownership and zero allocation, bounded grouping, strict window admission, callback coalescing, mobile-only pressure admission and ownership returns, sampler/reclaim/physical-footprint transitions, nested-settings ownership, exact Android/iOS `GOGC=10`, desktop defaults, and linked `memprofilerate=0`. The final Android build and both test tiers passed. |
 | 2026-08-23 | Exact iOS-paced Android physical surrogate | Fresh Wi-Fi Auto and cellular H1 processes on `zandroid`, 32-MiB Go soft limit, 20-MiB target, `GOGC=10`, `memprofilerate=0`; Wikipedia, Cloudflare 1 MiB, and fast.com | Wi-Fi active traffic was 21.08/21.13-MiB p50/p95 and five-minute steady recovery was 17.76/17.88 MiB. Cellular H1 active traffic was 19.69/19.89 MiB and post-reclaim steady recovery was 17.38/17.57 MiB. Neither process exceeded 28 MiB or terminated; one reclaim per process returned the pool to a small reuse floor. Temporary clients were released and credentials removed. Only one Android was attached, so fresh P2P could not replace the successful 2026-08-21 bidirectional evidence; physical iOS remains required. |
 | 2026-08-23 | Server isolation after mobile pool/pressure work | Five serial 300-ms `-benchmem` repetitions of every benchmark in `server/connect`, its PERFVAR link primitives, and `server/proxy`, exact Connect parent versus candidate | Time geomeans changed -0.79%, +0.25%, and +0.01%; allocation geomeans and every individual proxy allocation result were unchanged. Server keeps the 1-MiB warm wrapper and has no mobile pressure/reclaim path. The canonical DB-backed PERFVAR attempt was retained as blocked after Redis `10.211.55.5:6379` returned `host is down`; its focused non-DB comparison passed three normal repetitions and once under `-race`. |
+| 2026-08-24 | 24-MiB mobile performance rebalance on `zandroid` | Exact 20-MiB baseline plus three rejected 24-MiB candidates and final `m24-route-gc25-safe-20260824`; Wikipedia, Cloudflare 1 MiB, fast.com, explicit-H3 stress, and six-minute recovery | The accepted profile uses quality/speed 4/1, `GOGC=25`, and a 512-KiB warm set while retaining the 16-message, 16-packet/24-KiB, and 512-root H3 safety ceilings. Wikipedia median load fell 81.2% and Cloudflare median goodput rose 8.64x versus the exact 20-MiB run. The final 59-sample session peaked at 24.73 MiB with zero 28-MiB breaches; post-reclaim steady p50/p95 were 20.12/20.52 MiB. `GOGC=50` and both widened-queue candidates were rejected at 28.41--29.95 MiB under explicit H3. |
+| 2026-08-24 | Exact server isolation for the 24-MiB SDK patch | Six order-balanced 300-ms `-benchmem` repetitions per side across every benchmark in `server/connect`, `server/connect/perfvar`, and `server/proxy`; SDK `49f756f` versus only the candidate patch | Time geomeans changed -0.05%, -0.17%, and +0.05%; no individual timing result was significant. Allocation geomeans were unchanged except +0.01% B/op in Connect, and alloc counts were identical. Linux retains `GOGC=100`, the 20-MiB default device budget, 1-MiB server warm wrapper, and no mobile gate/reclaimer. |
 
 ## References
 
