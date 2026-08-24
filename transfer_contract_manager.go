@@ -435,6 +435,11 @@ type ContractManager struct {
 	sendNoContractClientIds    map[Id]bool
 
 	contractStatusCallbacks *CallbackList[*contractStatusCallbackWorker]
+	// Multi-client windows install one nonblocking dispatcher per client and
+	// coalesce all of those clients into the window's single callback worker.
+	// Keeping this internal prevents a general caller from putting blocking work
+	// back on HandleControlFrame.
+	contractStatusDispatchCallbacks *CallbackList[ContractStatusFunction]
 
 	localStats *ContractManagerStats
 
@@ -488,26 +493,27 @@ func NewContractManager(
 	}
 
 	contractManager := &ContractManager{
-		ctx:                        managerCtx,
-		cancel:                     cancel,
-		client:                     client,
-		settings:                   settings,
-		provideSecretKeys:          map[protocol.ProvideMode][]byte{},
-		provideModes:               map[protocol.ProvideMode]bool{},
-		providePaused:              false,
-		provideMonitor:             NewMonitor(),
-		destinationContracts:       map[ContractKey]*contractQueue{},
-		receiveNoContractClientIds: receiveNoContractClientIds,
-		sendNoContractClientIds:    sendNoContractClientIds,
-		contractStatusCallbacks:    NewCallbackList[*contractStatusCallbackWorker](),
-		localStats:                 NewContractManagerStats(),
-		contractStatsEntries:       map[contractStatsKey]*contractStatsEntry{},
-		contractStatsCallbacks:     NewCallbackList[ContractStatsFunction](),
-		contractStatsSequences:     map[Id]uint64{},
-		controlSyncProvide:         NewControlSync(managerCtx, client, "provide"),
-		controlSyncProvideOob:      NewControlSyncOob(managerCtx, client, "provide-oob"),
-		workers:                    newLifecycleAdmission(),
-		closeControlSyncs:          map[*ControlSync]bool{},
+		ctx:                             managerCtx,
+		cancel:                          cancel,
+		client:                          client,
+		settings:                        settings,
+		provideSecretKeys:               map[protocol.ProvideMode][]byte{},
+		provideModes:                    map[protocol.ProvideMode]bool{},
+		providePaused:                   false,
+		provideMonitor:                  NewMonitor(),
+		destinationContracts:            map[ContractKey]*contractQueue{},
+		receiveNoContractClientIds:      receiveNoContractClientIds,
+		sendNoContractClientIds:         sendNoContractClientIds,
+		contractStatusCallbacks:         NewCallbackList[*contractStatusCallbackWorker](),
+		contractStatusDispatchCallbacks: NewCallbackList[ContractStatusFunction](),
+		localStats:                      NewContractManagerStats(),
+		contractStatsEntries:            map[contractStatsKey]*contractStatsEntry{},
+		contractStatsCallbacks:          NewCallbackList[ContractStatsFunction](),
+		contractStatsSequences:          map[Id]uint64{},
+		controlSyncProvide:              NewControlSync(managerCtx, client, "provide"),
+		controlSyncProvideOob:           NewControlSyncOob(managerCtx, client, "provide-oob"),
+		workers:                         newLifecycleAdmission(),
+		closeControlSyncs:               map[*ControlSync]bool{},
 	}
 
 	if client.ClientId() != ControlId {
@@ -844,8 +850,35 @@ func (self *ContractManager) AddContractStatusCallback(contractStatusCallback Co
 	}
 }
 
+// addContractStatusDispatchCallback registers an internal callback whose only
+// permitted work is a bounded, nonblocking Dispatch into a parent-owned
+// worker. RemoteUserNatMultiClient uses it to avoid allocating a goroutine and
+// SequenceBufferSize-sized ring for every exit when one coalescer per window is
+// sufficient. Public callbacks continue through AddContractStatusCallback and
+// retain independent failure containment.
+func (self *ContractManager) addContractStatusDispatchCallback(
+	contractStatusCallback ContractStatusFunction,
+) func() {
+	if contractStatusCallback == nil {
+		return func() {}
+	}
+	self.mutex.Lock()
+	if self.closed {
+		self.mutex.Unlock()
+		return func() {}
+	}
+	callbackId := self.contractStatusDispatchCallbacks.Add(contractStatusCallback)
+	self.mutex.Unlock()
+	return func() {
+		self.contractStatusDispatchCallbacks.Remove(callbackId)
+	}
+}
+
 // ContractStatusFunction
 func (self *ContractManager) contractStatus(contractStatus *ContractStatus) {
+	for _, dispatch := range self.contractStatusDispatchCallbacks.Get() {
+		dispatch(contractStatus)
+	}
 	for _, contractStatusCallback := range self.contractStatusCallbacks.Get() {
 		contractStatusCallback.Dispatch(contractStatus)
 	}

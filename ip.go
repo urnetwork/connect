@@ -267,11 +267,37 @@ func appendIpPacketGroup(
 	payload []byte,
 	packet []byte,
 ) bool {
+	return appendIpPacketGroupBounded(
+		groups,
+		groupsByKey,
+		ipPath,
+		payload,
+		packet,
+		0,
+		0,
+	)
+}
+
+func appendIpPacketGroupBounded(
+	groups *[]*ipPacketGroup,
+	groupsByKey map[ipPacketFlowKey]*ipPacketGroup,
+	ipPath *IpPath,
+	payload []byte,
+	packet []byte,
+	maxPacketCount int,
+	maxByteCount ByteCount,
+) bool {
 	key, ownedIpPath, ok := ownIpPacketFlow(ipPath)
 	if !ok {
 		return false
 	}
 	group := groupsByKey[key]
+	if group != nil &&
+		((0 < maxPacketCount && maxPacketCount <= len(group.packets)) ||
+			(0 < maxByteCount && 0 < group.byteCount &&
+				maxByteCount < group.byteCount+ByteCount(len(packet)))) {
+		group = nil
+	}
 	if group == nil {
 		group = &ipPacketGroup{
 			ipPath:   ownedIpPath,
@@ -294,12 +320,28 @@ func appendIpPacketGroup(
 // first-seen order, packets retain in-flow order, and rejected packets remain
 // caller-owned.
 func groupIpPackets(packets [][]byte) (groups []*ipPacketGroup, rejected [][]byte) {
+	return groupIpPacketsBounded(packets, 0, 0)
+}
+
+func groupIpPacketsBounded(
+	packets [][]byte,
+	maxPacketCount int,
+	maxByteCount ByteCount,
+) (groups []*ipPacketGroup, rejected [][]byte) {
 	groupsByKey := map[ipPacketFlowKey]*ipPacketGroup{}
 	for _, packet := range packets {
 		var ipPath IpPath
 		payload, err := parseIpPathWithPayloadBorrowed(packet, &ipPath)
 		if err != nil ||
-			!appendIpPacketGroup(&groups, groupsByKey, &ipPath, payload, packet) {
+			!appendIpPacketGroupBounded(
+				&groups,
+				groupsByKey,
+				&ipPath,
+				payload,
+				packet,
+				maxPacketCount,
+				maxByteCount,
+			) {
 			rejected = append(rejected, packet)
 		}
 	}

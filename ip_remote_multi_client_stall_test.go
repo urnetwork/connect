@@ -980,6 +980,37 @@ func TestContractStatusObserverStallIsBoundedAndNonBlocking(t *testing.T) {
 	gate.Release()
 }
 
+func TestMultiClientContractStatusWorkerSizesToLiveContracts(t *testing.T) {
+	settings := DefaultMultiClientSettings()
+	settings.SequenceBufferSize = 4096
+	settings.MaxFlowsPerExit = 7
+	settings.WindowSizes[WindowTypeQuality] = WindowSizeSettings{
+		WindowSizeMin:     3,
+		WindowSizeMax:     3,
+		WindowSizeHardMax: 3,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	window := &multiClientWindow{
+		ctx:                     ctx,
+		windowType:              WindowTypeQuality,
+		settings:                settings,
+		contractStatusCallbacks: NewCallbackList[*contractStatusCallbackWorker](),
+	}
+	unsub := window.AddContractStatusCallback(func(*ContractStatus) {})
+	defer unsub()
+	workers := window.contractStatusCallbacks.Get()
+	if len(workers) != 1 {
+		t.Fatalf("contract status workers = %d, want 1", len(workers))
+	}
+	if got, want := workers[0].maxCount, 21; got != want {
+		t.Fatalf("contract status pending max = %d, want %d", got, want)
+	}
+	if workers[0].maxCount == settings.SequenceBufferSize {
+		t.Fatal("contract status ring still follows packet SequenceBufferSize")
+	}
+}
+
 func TestContractStatsObserverStallIsBoundedAndCoalesced(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -130,6 +130,37 @@ func TestMessagePoolShare(t *testing.T) {
 	}
 }
 
+func TestMessagePoolPacketOutstandingCountTracksRootOwnershipWithoutAllocating(t *testing.T) {
+	baseline := MessagePoolPacketOutstandingCount()
+	message := MessagePoolGet(DefaultMtu)
+	if got := MessagePoolPacketOutstandingCount(); got != baseline+1 {
+		t.Fatalf("packet outstanding after take = %d, want %d", got, baseline+1)
+	}
+
+	MessagePoolShareReadOnly(message)
+	if got := MessagePoolPacketOutstandingCount(); got != baseline+1 {
+		t.Fatalf("packet outstanding after share = %d, want %d", got, baseline+1)
+	}
+	if MessagePoolReturn(message) {
+		t.Fatal("non-final shared return unexpectedly released packet root")
+	}
+	if got := MessagePoolPacketOutstandingCount(); got != baseline+1 {
+		t.Fatalf("packet outstanding after non-final return = %d, want %d", got, baseline+1)
+	}
+	if !MessagePoolReturn(message) {
+		t.Fatal("final shared return did not release packet root")
+	}
+	if got := MessagePoolPacketOutstandingCount(); got != baseline {
+		t.Fatalf("packet outstanding after final return = %d, want %d", got, baseline)
+	}
+
+	if allocations := testing.AllocsPerRun(100, func() {
+		_ = MessagePoolPacketOutstandingCount()
+	}); allocations != 0 {
+		t.Fatalf("MessagePoolPacketOutstandingCount allocated %.0f objects, want 0", allocations)
+	}
+}
+
 func TestBase64(t *testing.T) {
 	for range 128 {
 		n := mathrand.Intn(512)

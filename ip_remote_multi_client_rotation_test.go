@@ -194,6 +194,75 @@ func TestExpandReplacementDeclineSourceAnchor(t *testing.T) {
 	}
 }
 
+func TestStrictWindowAdmissionHardMax(t *testing.T) {
+	firstId := NewId()
+	secondId := NewId()
+	newId := NewId()
+	windowSize := WindowSizeSettings{WindowSizeHardMax: 2}
+	window := &multiClientWindow{
+		settings: &MultiClientSettings{StrictWindowSizeHardMax: true},
+		clients: map[Id]*multiClientChannel{
+			firstId:  nil,
+			secondId: nil,
+		},
+	}
+
+	if window.strictWindowAdmissionAllowed(newId, windowSize) {
+		t.Fatal("strict hard max admitted a new identity at the ownership ceiling")
+	}
+	if !window.strictWindowAdmissionAllowed(firstId, windowSize) {
+		t.Fatal("strict hard max rejected a same-identity replacement")
+	}
+
+	delete(window.clients, secondId)
+	if !window.strictWindowAdmissionAllowed(newId, windowSize) {
+		t.Fatal("strict hard max rejected a new identity below the ceiling")
+	}
+}
+
+func TestStrictWindowAdmissionIsOptInAndZeroMaxIsUnbounded(t *testing.T) {
+	newId := NewId()
+	var nilWindow *multiClientWindow
+	if !nilWindow.strictWindowAdmissionAllowed(newId, WindowSizeSettings{WindowSizeHardMax: 1}) {
+		t.Fatal("nil window unexpectedly enabled strict admission")
+	}
+	bareWindow := &multiClientWindow{}
+	if !bareWindow.strictWindowAdmissionAllowed(newId, WindowSizeSettings{WindowSizeHardMax: 1}) {
+		t.Fatal("partial settings unexpectedly enabled strict admission")
+	}
+	window := &multiClientWindow{
+		settings: DefaultMultiClientSettings(),
+		clients: map[Id]*multiClientChannel{
+			NewId(): nil,
+		},
+	}
+	if !window.strictWindowAdmissionAllowed(newId, WindowSizeSettings{WindowSizeHardMax: 1}) {
+		t.Fatal("default settings unexpectedly enabled strict admission")
+	}
+
+	window.settings.StrictWindowSizeHardMax = true
+	if !window.strictWindowAdmissionAllowed(newId, WindowSizeSettings{}) {
+		t.Fatal("zero hard max did not retain its unbounded meaning")
+	}
+}
+
+func TestExpandConsultsStrictWindowAdmissionGate(t *testing.T) {
+	source, err := readSource("ip_remote_multi_client.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, ok := functionBody(source, "func (self *multiClientWindow) expand(")
+	if !ok {
+		t.Fatal("could not find expand")
+	}
+	if !strings.Contains(body, "self.strictWindowAdmissionAllowed(") {
+		t.Fatal("expand bypasses the strict hard-max admission gate")
+	}
+	if !strings.Contains(body, `"strict_hard_max"`) {
+		t.Fatal("strict hard-max declines are not observable in field logs")
+	}
+}
+
 // --- item 3: the per-channel lifetime jitter ---
 
 // The effective lifetime must stay within [0.75, 1.0) x the configured

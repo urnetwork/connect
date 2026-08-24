@@ -449,37 +449,43 @@ func ResizeMessagePools(packetByteCount ByteCount, largeObjectByteCounts ...Byte
 	}
 }
 
-// WarmMessagePools pre-allocates up to 1 MiB of the PACKET class's free-list,
-// capped at a quarter of the configured class capacity. This is enough to
-// absorb the measured first-burst allocation storm without making warm
-// retention grow linearly with a host's (potentially much larger) pool cap.
-// Only the packet (2048) class is warmed — the large object (protocol frame)
-// classes are not on the same cold-start hot path, so warming them would only
-// inflate early retention for no first-burst benefit. Call once at process
-// start after sizing the pools; do not call from memory-pressure paths —
-// re-warming immediately after a shed fights the host's request for memory.
-func WarmMessagePools() {
+// WarmMessagePoolsTo pre-allocates at most packetByteCount of the PACKET
+// class's free-list, additionally capped at a quarter of the configured class
+// capacity. Only the packet (2048) class is warmed — the large object
+// (protocol frame) classes are not on the same cold-start hot path, so warming
+// them would only inflate early retention for no first-burst benefit.
+//
+// This parameterized form lets memory-constrained mobile embedders retain a
+// smaller reuse set without changing the server default or the configured
+// burst capacity. Call once at process start after sizing the pools; do not
+// call directly from a memory-pressure path.
+func WarmMessagePoolsTo(packetByteCount ByteCount) {
+	packetByteCount = max(0, packetByteCount)
 	for _, pool := range orderedMessagePools() {
 		if pool.size == packetPoolSize {
-			const maxWarmByteCount = 1024 * 1024
-			pool.warm(min(pool.capacity()/4, maxWarmByteCount/pool.size))
+			pool.warm(min(pool.capacity()/4, int(packetByteCount/ByteCount(pool.size))))
 		}
 	}
 }
 
-// TrimMessagePoolsToWarm drops an idle burst's excess free buffers while
-// preserving both the startup-sized reuse set and every class's configured
-// capacity. Packet buffers retain at most the same 1-MiB working set used by
-// WarmMessagePools; larger protocol objects retain their fixed 256-KiB floor
-// per class. Buffers still held by consumers are untouched, and subsequent
-// returns may refill the original capacity during the next burst.
-func TrimMessagePoolsToWarm() ByteCount {
+// WarmMessagePools preserves the historical 1-MiB startup reuse set used by
+// desktop and server processes.
+func WarmMessagePools() {
+	WarmMessagePoolsTo(mib(1))
+}
+
+// TrimMessagePoolsTo drops an idle burst's excess free buffers while
+// preserving a caller-selected packet reuse set and every class's configured
+// capacity. Larger protocol objects retain their fixed 256-KiB floor per
+// class. Buffers still held by consumers are untouched, and subsequent returns
+// may refill the original capacity during the next burst.
+func TrimMessagePoolsTo(packetByteCount ByteCount) ByteCount {
+	packetByteCount = max(0, packetByteCount)
 	var droppedByteCount ByteCount
 	for _, pool := range orderedMessagePools() {
 		if pool.size == packetPoolSize {
-			const maxWarmByteCount = 1024 * 1024
 			droppedByteCount += ByteCount(
-				pool.trim(min(pool.capacity()/4, maxWarmByteCount/pool.size)) * pool.size,
+				pool.trim(min(pool.capacity()/4, int(packetByteCount/ByteCount(pool.size)))) * pool.size,
 			)
 		} else {
 			droppedByteCount += ByteCount(
@@ -488,6 +494,12 @@ func TrimMessagePoolsToWarm() ByteCount {
 		}
 	}
 	return droppedByteCount
+}
+
+// TrimMessagePoolsToWarm preserves the historical 1-MiB packet reuse set for
+// desktop and server callers.
+func TrimMessagePoolsToWarm() ByteCount {
+	return TrimMessagePoolsTo(mib(1))
 }
 
 func ClearMessagePools() {
@@ -546,6 +558,43 @@ func ResetMessagePoolStats() {
 func MessagePoolCounts() (taken uint64, returned uint64, created uint64) {
 	stats := GetMessagePoolAggregateStats()
 	return stats.Taken, stats.Returned, stats.Created
+}
+
+// MessagePoolPacketOutstandingCount returns the number of packet-class root
+// buffers that consumers currently own. Shares do not increase this count: a
+// buffer remains outstanding until its final MessagePoolReturn. The narrow
+// snapshot avoids copying the large per-class diagnostics when a constrained
+// mobile embedder only needs an overload signal.
+//
+// The call is allocation-free, but it takes each packet-pool shard lock. It is
+// therefore intended for sampled admission control and telemetry, not every
+// packet on unconstrained server paths.
+func MessagePoolPacketOutstandingCount() uint64 {
+	var outstanding uint64
+	for _, pool := range orderedMessagePools() {
+		if pool.size != packetPoolSize {
+			continue
+		}
+		for shardIndex := range messagePoolShardCount {
+			shard := &pool.shards[shardIndex]
+			shard.stateLock.Lock()
+			var taken uint64
+			var returned uint64
+			for tag := range 256 {
+				taken += shard.takenTags[tag]
+				returned += shard.returnedTags[tag]
+			}
+			shard.stateLock.Unlock()
+			// A diagnostic reset while a packet is in flight can make the
+			// post-reset returned count temporarily exceed taken. Treat that
+			// shard as zero rather than underflowing the pressure signal.
+			if returned < taken {
+				outstanding += taken - returned
+			}
+		}
+		break
+	}
+	return outstanding
 }
 
 // MessagePoolAggregateStats is an allocation-free process-wide snapshot used

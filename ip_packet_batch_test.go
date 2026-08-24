@@ -97,6 +97,55 @@ func TestGroupIpPacketsPreservesDirectionalFlowOrder(t *testing.T) {
 	MessagePoolReturn(flowAFirst)
 }
 
+func TestGroupIpPacketsBoundedSplitsOwnershipWithoutRejectingPackets(t *testing.T) {
+	packets := [][]byte{
+		ipPacketBatchTestPacket(41101, 443, "a"),
+		ipPacketBatchTestPacket(41101, 443, "b"),
+		ipPacketBatchTestPacket(41101, 443, "c"),
+		ipPacketBatchTestPacket(41101, 443, "d"),
+		ipPacketBatchTestPacket(41101, 443, "e"),
+	}
+	defer func() {
+		for _, packet := range packets {
+			MessagePoolReturn(packet)
+		}
+	}()
+
+	groups, rejected := groupIpPacketsBounded(packets, 2, mib(1))
+	if len(rejected) != 0 {
+		t.Fatalf("bounded grouping rejected %d valid packets", len(rejected))
+	}
+	wantCounts := []int{2, 2, 1}
+	if len(groups) != len(wantCounts) {
+		t.Fatalf("group count = %d, want %d", len(groups), len(wantCounts))
+	}
+	packetIndex := 0
+	for groupIndex, group := range groups {
+		if len(group.packets) != wantCounts[groupIndex] {
+			t.Fatalf("group %d packets = %d, want %d", groupIndex, len(group.packets), wantCounts[groupIndex])
+		}
+		for _, packet := range group.packets {
+			if &packet[0] != &packets[packetIndex][0] {
+				t.Fatalf("group order changed at packet %d", packetIndex)
+			}
+			packetIndex++
+		}
+	}
+
+	// A byte bound splits before crossing it, but cannot make one otherwise
+	// valid oversized packet impossible to send.
+	byteBound := ByteCount(len(packets[0]) + len(packets[1]) - 1)
+	groups, rejected = groupIpPacketsBounded(packets[:2], 8, byteBound)
+	if len(rejected) != 0 || len(groups) != 2 ||
+		len(groups[0].packets) != 1 || len(groups[1].packets) != 1 {
+		t.Fatalf("byte-bounded groups = %#v rejected=%d", groups, len(rejected))
+	}
+	groups, rejected = groupIpPacketsBounded(packets[:1], 8, 1)
+	if len(rejected) != 0 || len(groups) != 1 || len(groups[0].packets) != 1 {
+		t.Fatal("oversized singleton was rejected by the ownership bound")
+	}
+}
+
 // Local admission is all-or-nothing, while the additive batch API consumes
 // every input on both admission outcomes and reports the exact accepted count.
 func TestLocalUserNatSendPacketBatchConsumesAllPackets(t *testing.T) {

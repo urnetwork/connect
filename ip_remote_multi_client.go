@@ -290,6 +290,11 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		DegradedMode:            &atomic.Bool{},
 		DegradedLivenessScale:   3.0,
 		RemovalReceiveQueueSize: 256,
+		// One native bridge batch is at most 64 packets / 96 KiB. Keep the
+		// default ownership transaction no larger than that; mobile profiles can
+		// select smaller chunks without changing bridge acceptance.
+		PacketGroupMaxPacketCount: 64,
+		PacketGroupMaxByteCount:   96 * 1024,
 
 		UdpTeardownSignal:        true,
 		QuicRebindOnExitLoss:     true,
@@ -420,6 +425,16 @@ type MultiClientSettings struct {
 	// behavior. See `sequenceIdleTimeout`.
 	TcpSequenceIdleTimeout time.Duration
 	WindowSizes            map[WindowType]WindowSizeSettings
+	// StrictWindowSizeHardMax makes WindowSizeHardMax an admission ceiling as
+	// well as a resize target. When a flow-carrying warned client cannot yet be
+	// collapsed, a new identity is declined instead of temporarily growing the
+	// live client/transport graph beyond the hard max. Replacements of an
+	// existing identity remain allowed and existing flows are never torn down.
+	//
+	// The zero value preserves the server/default behavior, where availability
+	// takes precedence over a transient ownership overshoot. Mobile low-memory
+	// profiles opt in because their process has a strict memory envelope.
+	StrictWindowSizeHardMax bool
 	// ClientNackInitialLimit int
 	// ClientNackMaxLimit int
 	// ClientNackScale float64
@@ -781,6 +796,12 @@ type MultiClientSettings struct {
 	// window maintenance, and repeated removals must not grow memory without
 	// bound.
 	RemovalReceiveQueueSize int
+	// PacketGroupMax* bounds one exact-flow ownership transaction after a
+	// native packet batch is parsed. A nonpositive value preserves the legacy
+	// unbounded-per-input-batch behavior. An individually oversized packet is
+	// still admitted as a singleton.
+	PacketGroupMaxPacketCount int
+	PacketGroupMaxByteCount   ByteCount
 
 	// TcpCollapseMaxHold bounds how long TcpCollapsePrevention may keep
 	// discarding a sender's retransmits while the committed packet makes no
@@ -1515,6 +1536,40 @@ type RemoteUserNatMultiClient struct {
 	// rather than growing a second one. Guarded by uplinkStateLock alongside
 	// the epoch fields it rides with.
 	schedulerPauseHoldUntil time.Time
+}
+
+// MultiClientMemorySnapshot is an allocation-free primitive view for a
+// low-frequency mobile memory sampler. It deliberately contains counts only:
+// callers that need identities or status objects use Exits/Monitor instead.
+type MultiClientMemorySnapshot struct {
+	QualityClientCount int
+	SpeedClientCount   int
+	FlowCount          int
+}
+
+// MemorySnapshot samples the current connected topology without constructing
+// ExitInfo, ProviderEvent, or monitor maps. The windows map is immutable after
+// construction; each mutable count is read under its owning lock and no two
+// locks are held together.
+func (self *RemoteUserNatMultiClient) MemorySnapshot() MultiClientMemorySnapshot {
+	if self == nil {
+		return MultiClientMemorySnapshot{}
+	}
+	var snapshot MultiClientMemorySnapshot
+	if window := self.windows[WindowTypeQuality]; window != nil {
+		window.stateLock.Lock()
+		snapshot.QualityClientCount = len(window.clients)
+		window.stateLock.Unlock()
+	}
+	if window := self.windows[WindowTypeSpeed]; window != nil {
+		window.stateLock.Lock()
+		snapshot.SpeedClientCount = len(window.clients)
+		window.stateLock.Unlock()
+	}
+	self.stateLock.Lock()
+	snapshot.FlowCount = len(self.flowUpdates)
+	self.stateLock.Unlock()
+	return snapshot
 }
 
 // ServerNameLookup resolves a destination IP to the server name(s) previously observed
@@ -5592,7 +5647,11 @@ func (self *RemoteUserNatMultiClient) sendCompletePacketBatch(
 	packets [][]byte,
 	timeout time.Duration,
 ) int {
-	groups, rejectedPackets := groupIpPackets(packets)
+	groups, rejectedPackets := groupIpPacketsBounded(
+		packets,
+		self.settings.PacketGroupMaxPacketCount,
+		self.settings.PacketGroupMaxByteCount,
+	)
 	for _, packet := range rejectedPackets {
 		MessagePoolReturn(packet)
 	}
@@ -9029,12 +9088,33 @@ func (self *multiClientWindow) convictSendStalls(stallTimeout time.Duration) boo
 }
 
 func (self *multiClientWindow) AddContractStatusCallback(contractStatusCallback ContractStatusFunction) func() {
-	worker := newContractStatusCallbackWorker(self.ctx, contractStatusCallback, self.settings.SequenceBufferSize)
+	worker := newContractStatusCallbackWorker(
+		self.ctx,
+		contractStatusCallback,
+		self.contractStatusPendingMaxCount(),
+	)
 	callbackId := self.contractStatusCallbacks.Add(worker)
 	return func() {
 		self.contractStatusCallbacks.Remove(callbackId)
 		worker.Close()
 	}
+}
+
+// contractStatusPendingMaxCount sizes observability to the contracts that can
+// actually be live in this window, not to Transfer's packet sequence channel.
+// A window can place at most MaxFlowsPerExit flows on each admitted exit, and
+// each live flow needs at most one latest status entry. The fixed ring remains
+// bounded when settings are partial in tests.
+func (self *multiClientWindow) contractStatusPendingMaxCount() int {
+	windowHardMax := 1
+	if self.settings != nil {
+		if windowSize, ok := self.settings.WindowSizes[self.windowType]; ok &&
+			0 < windowSize.WindowSizeHardMax {
+			windowHardMax = windowSize.WindowSizeHardMax
+		}
+		return max(1, windowHardMax*max(1, self.settings.MaxFlowsPerExit))
+	}
+	return 1
 }
 
 func (self *multiClientWindow) contractStatus(contractStatus *ContractStatus) {
@@ -10045,6 +10125,20 @@ func (self *multiClientWindow) expand(
 			self.monitor.AddProviderEvent(args.ClientId, ProviderStateAdded, args.Destination.Tail(), args.Location)
 			return false
 		}
+		if !self.strictWindowAdmissionAllowed(clientId, windowSize) {
+			self.log.Infof("%s\n", relEvent(
+				"expand_decline",
+				"exit", clientId,
+				"reason", "strict_hard_max",
+			))
+			// The candidate was fully constructed but never made visible to
+			// selection, so cancellation can return all client/transport
+			// ownership without disturbing an existing flow. The channel owns
+			// its generator args at this point; do not return them separately.
+			client.Cancel()
+			self.monitor.AddProviderEvent(args.ClientId, ProviderStateNotAdded, args.Destination.Tail(), args.Location)
+			return false
+		}
 
 		self.log.V(1).Infof("[multi]expand new client\n")
 
@@ -10445,6 +10539,27 @@ func (self *multiClientWindow) flowCount(client *multiClientChannel) int {
 		return 0
 	}
 	return self.flowCountFunc(client)
+}
+
+// strictWindowAdmissionAllowed applies the opt-in ownership ceiling at the
+// last responsible moment before a candidate is installed. Resize already
+// targets WindowSizeHardMax, but it deliberately retains flow-carrying warned
+// clients; without this gate, backfill can temporarily add a fourth mobile
+// quality client while three remain live. A same-identity replacement does
+// not increase ownership and therefore remains admissible at the ceiling.
+func (self *multiClientWindow) strictWindowAdmissionAllowed(
+	clientId Id,
+	windowSize WindowSizeSettings,
+) bool {
+	if self == nil || self.settings == nil ||
+		!self.settings.StrictWindowSizeHardMax || windowSize.WindowSizeHardMax <= 0 {
+		return true
+	}
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	_, replacing := self.clients[clientId]
+	return replacing || len(self.clients) < windowSize.WindowSizeHardMax
 }
 
 // collapseRemovalAllowed is the capacity-collapse gate: it admits removing a
@@ -11433,7 +11548,11 @@ func newMultiClientChannel(
 		client.webRtcManager.PrioritizePeer(args.Destination.Tail())
 	}
 
-	contractStatusSub := client.ContractManager().AddContractStatusCallback(contractStatusCallback)
+	// contractStatusCallback is multiClientWindow.contractStatus, which performs
+	// only bounded Dispatch into the window-owned coalescer. Register that exact
+	// internal shape directly so every exit does not allocate its own goroutine
+	// and packet-sequence-sized status ring.
+	contractStatusSub := client.ContractManager().addContractStatusDispatchCallback(contractStatusCallback)
 	contractStatsSub := client.ContractManager().AddContractStatsCallback(contractStatsCallback)
 	peerIdentitySub := client.EncryptionSessionManager().AddPeerIdentityChangeCallback(peerIdentityChangeCallback)
 	go HandleError(func() {

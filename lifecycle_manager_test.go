@@ -412,6 +412,61 @@ func TestClientCloseAndWaitJoinsContractStatusCallback(t *testing.T) {
 	joined = true
 }
 
+func TestContractStatusWindowDispatcherDoesNotCreatePerClientWorker(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), DefaultClientSettings())
+	defer client.Close()
+	manager := client.ContractManager()
+	delivered := make(chan *ContractStatus, 1)
+	unsub := manager.addContractStatusDispatchCallback(func(status *ContractStatus) {
+		delivered <- status
+	})
+
+	if got := len(manager.contractStatusCallbacks.Get()); got != 0 {
+		t.Fatalf("per-client status workers = %d, want 0", got)
+	}
+	status := &ContractStatus{Key: ContractKey{Destination: DestinationId(NewId())}}
+	manager.contractStatus(status)
+	select {
+	case got := <-delivered:
+		if got != status {
+			t.Fatal("direct dispatcher changed status identity")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("direct status dispatcher did not run")
+	}
+
+	unsub()
+	manager.contractStatus(status)
+	select {
+	case <-delivered:
+		t.Fatal("unsubscribed direct status dispatcher still ran")
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestContractStatusWindowDispatcherRejectsAdmissionAfterClose(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), DefaultClientSettings())
+	manager := client.ContractManager()
+	client.Close()
+
+	called := false
+	unsub := manager.addContractStatusDispatchCallback(func(*ContractStatus) {
+		called = true
+	})
+	unsub()
+	manager.contractStatus(&ContractStatus{})
+	if called {
+		t.Fatal("closed manager admitted a direct status dispatcher")
+	}
+	if got := len(manager.contractStatusDispatchCallbacks.Get()); got != 0 {
+		t.Fatalf("closed manager direct dispatchers = %d, want 0", got)
+	}
+}
+
 // TestContractManagerCloseRejectsPausedCallbackAdmission proves callback
 // registration cannot create a detached worker after shutdown wins the lock.
 func TestContractManagerCloseRejectsPausedCallbackAdmission(t *testing.T) {

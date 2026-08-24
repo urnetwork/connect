@@ -44,7 +44,7 @@ const DefaultMaxHttpResponseBodyBytes int64 = 2 * 1024 * 1024
 var ErrHttpResponseBodyTooLarge = errors.New("http response body exceeds memory limit")
 
 func DefaultClientStrategySettings() *ClientStrategySettings {
-	return &ClientStrategySettings{
+	settings := &ClientStrategySettings{
 		ExposeServerIps:       true,
 		ExposeServerHostNames: true,
 
@@ -76,6 +76,25 @@ func DefaultClientStrategySettings() *ClientStrategySettings {
 
 		ConnectSettings: *DefaultConnectSettings(),
 	}
+	// A configured process budget identifies an embedded/mobile client. Bound
+	// the connection-resident HTTP/WebSocket working set there; an unset or
+	// reference-sized budget leaves Go and gorilla defaults untouched for
+	// desktop and server callers.
+	if 0 < MemoryBudget() && MemoryBudget() < referenceMemoryBudgetByteCount {
+		settings.HttpReadBufferSize = MemoryScaledCount(4*1024, 2*1024)
+		settings.HttpWriteBufferSize = MemoryScaledCount(4*1024, 2*1024)
+		settings.WebSocketReadBufferSize = MemoryScaledCount(4*1024, 2*1024)
+		settings.WebSocketWriteBufferSize = MemoryScaledCount(4*1024, 2*1024)
+		settings.Http2MaxDecoderHeaderTableSize = MemoryScaledCount(4*1024, 2*1024)
+		settings.Http2MaxEncoderHeaderTableSize = MemoryScaledCount(4*1024, 2*1024)
+		settings.Http2MaxReceiveBufferPerConnection = int(
+			MemoryScaledByteCount(mib(1), kib(256)),
+		)
+		settings.Http2MaxReceiveBufferPerStream = int(
+			MemoryScaledByteCount(kib(512), kib(128)),
+		)
+	}
+	return settings
 }
 
 type ClientStrategySettings struct {
@@ -124,6 +143,18 @@ type ClientStrategySettings struct {
 	// materialize. Values <= 0 use DefaultMaxHttpResponseBodyBytes so a partial
 	// settings struct cannot accidentally restore an unbounded io.ReadAll.
 	MaxHttpResponseBodyBytes int64
+
+	// Embedded low-memory transports set explicit connection-resident buffer
+	// and HTTP/2 dynamic-table/receive-window bounds. Zero preserves the
+	// library defaults, which is the desktop/server behavior.
+	HttpReadBufferSize                 int
+	HttpWriteBufferSize                int
+	WebSocketReadBufferSize            int
+	WebSocketWriteBufferSize           int
+	Http2MaxDecoderHeaderTableSize     int
+	Http2MaxEncoderHeaderTableSize     int
+	Http2MaxReceiveBufferPerConnection int
+	Http2MaxReceiveBufferPerStream     int
 
 	// retry a GET whose RESPONSE status is in `GetRetryStatusCodes` —
 	// transient gateway statuses meaning the lb momentarily had no healthy
@@ -1335,6 +1366,8 @@ func (self *clientDialer) HttpClient() *http.Client {
 			ResponseHeaderTimeout: self.settings.ConnectTimeout,
 			ExpectContinueTimeout: self.settings.ConnectTimeout,
 			DisableKeepAlives:     false,
+			ReadBufferSize:        self.settings.HttpReadBufferSize,
+			WriteBufferSize:       self.settings.HttpWriteBufferSize,
 			// A custom DialTLSContext disables net/http's automatic HTTP/2
 			// attempt unless this is set. ConnectControl and peer-key requests
 			// arrive in parallel while a provider window forms; keeping the
@@ -1343,6 +1376,17 @@ func (self *clientDialer) HttpClient() *http.Client {
 			// and creating visible CPU/pause bursts on mobile. HTTP/2
 			// multiplexes those requests over the established connection.
 			ForceAttemptHTTP2: true,
+		}
+		if 0 < self.settings.Http2MaxDecoderHeaderTableSize ||
+			0 < self.settings.Http2MaxEncoderHeaderTableSize ||
+			0 < self.settings.Http2MaxReceiveBufferPerConnection ||
+			0 < self.settings.Http2MaxReceiveBufferPerStream {
+			transport.HTTP2 = &http.HTTP2Config{
+				MaxDecoderHeaderTableSize:     self.settings.Http2MaxDecoderHeaderTableSize,
+				MaxEncoderHeaderTableSize:     self.settings.Http2MaxEncoderHeaderTableSize,
+				MaxReceiveBufferPerConnection: self.settings.Http2MaxReceiveBufferPerConnection,
+				MaxReceiveBufferPerStream:     self.settings.Http2MaxReceiveBufferPerStream,
+			}
 		}
 		// a custom dial context applies to plain (non-tls) connections;
 		// tls connections use the dialTlsContext chain above
@@ -1383,8 +1427,8 @@ func (self *clientDialer) WsDialer(settings *ClientStrategySettings) *websocket.
 		self.websocketDialer = &websocket.Dialer{
 			NetDialTLSContext: netDialTlsContext,
 			HandshakeTimeout:  settings.HandshakeTimeout,
-			// ReadBufferSize: size,
-			// WriteBufferSize: size,
+			ReadBufferSize:    settings.WebSocketReadBufferSize,
+			WriteBufferSize:   settings.WebSocketWriteBufferSize,
 			// WriteBufferPool: pool,
 			EnableCompression: false,
 		}

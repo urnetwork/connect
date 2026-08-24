@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"net/http"
 	"testing"
 )
 
@@ -13,6 +14,13 @@ func TestMemoryBudgetUnsetDefaults(t *testing.T) {
 	AssertEqual(t, DefaultReceiveBufferSettings().ReceiveQueueMaxByteCount, mib(2)+kib(512))
 	AssertEqual(t, DefaultWebRtcSettings().ReceiveBufferSize, kib(512))
 	AssertEqual(t, DefaultDohSettings().CacheMaxEntries, 4096)
+	clientStrategySettings := DefaultClientStrategySettings()
+	AssertEqual(t, clientStrategySettings.HttpReadBufferSize, 0)
+	AssertEqual(t, clientStrategySettings.HttpWriteBufferSize, 0)
+	AssertEqual(t, clientStrategySettings.WebSocketReadBufferSize, 0)
+	AssertEqual(t, clientStrategySettings.WebSocketWriteBufferSize, 0)
+	AssertEqual(t, clientStrategySettings.Http2MaxDecoderHeaderTableSize, 0)
+	AssertEqual(t, clientStrategySettings.Http2MaxReceiveBufferPerConnection, 0)
 	platformBudget := DefaultPlatformTransportBudget()
 	if platformBudget == nil {
 		t.Fatal("unscaled defaults did not install the aggregate platform budget")
@@ -42,6 +50,30 @@ func TestMemoryBudgetScaledSettings(t *testing.T) {
 	AssertEqual(t, DefaultReceiveBufferSettings().ReceiveQueueMaxByteCount, (mib(2)+kib(512))/2)
 	AssertEqual(t, DefaultWebRtcSettings().ReceiveBufferSize, kib(256))
 	AssertEqual(t, DefaultDohSettings().CacheMaxEntries, 2048)
+	clientStrategySettings := DefaultClientStrategySettings()
+	AssertEqual(t, clientStrategySettings.HttpReadBufferSize, 2*1024)
+	AssertEqual(t, clientStrategySettings.HttpWriteBufferSize, 2*1024)
+	AssertEqual(t, clientStrategySettings.WebSocketReadBufferSize, 2*1024)
+	AssertEqual(t, clientStrategySettings.WebSocketWriteBufferSize, 2*1024)
+	AssertEqual(t, clientStrategySettings.Http2MaxDecoderHeaderTableSize, 2*1024)
+	AssertEqual(t, clientStrategySettings.Http2MaxEncoderHeaderTableSize, 2*1024)
+	AssertEqual(t, clientStrategySettings.Http2MaxReceiveBufferPerConnection, int(kib(512)))
+	AssertEqual(t, clientStrategySettings.Http2MaxReceiveBufferPerStream, int(kib(256)))
+	dialer := &clientDialer{settings: clientStrategySettings}
+	webSocketDialer := dialer.WsDialer(clientStrategySettings)
+	AssertEqual(t, webSocketDialer.ReadBufferSize, 2*1024)
+	AssertEqual(t, webSocketDialer.WriteBufferSize, 2*1024)
+	httpTransport, ok := dialer.HttpClient().Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("HTTP transport type = %T", dialer.HttpClient().Transport)
+	}
+	AssertEqual(t, httpTransport.ReadBufferSize, 2*1024)
+	AssertEqual(t, httpTransport.WriteBufferSize, 2*1024)
+	if httpTransport.HTTP2 == nil {
+		t.Fatal("scaled client strategy did not install HTTP/2 memory bounds")
+	}
+	AssertEqual(t, httpTransport.HTTP2.MaxDecoderHeaderTableSize, 2*1024)
+	AssertEqual(t, httpTransport.HTTP2.MaxReceiveBufferPerConnection, int(kib(512)))
 	platformBudget := DefaultPlatformTransportBudget()
 	if platformBudget == nil {
 		t.Fatal("scaled process budget did not create a shared platform transport budget")
@@ -82,6 +114,12 @@ func TestMemoryBudgetFloors(t *testing.T) {
 	AssertEqual(t, DefaultReceiveBufferSettings().ReceiveQueueMaxByteCount, kib(320))
 	AssertEqual(t, DefaultWebRtcSettings().ReceiveBufferSize, kib(256))
 	AssertEqual(t, DefaultDohSettings().CacheMaxEntries, 512)
+	clientStrategySettings := DefaultClientStrategySettings()
+	AssertEqual(t, clientStrategySettings.HttpReadBufferSize, 2*1024)
+	AssertEqual(t, clientStrategySettings.WebSocketReadBufferSize, 2*1024)
+	AssertEqual(t, clientStrategySettings.Http2MaxDecoderHeaderTableSize, 2*1024)
+	AssertEqual(t, clientStrategySettings.Http2MaxReceiveBufferPerConnection, int(kib(256)))
+	AssertEqual(t, clientStrategySettings.Http2MaxReceiveBufferPerStream, int(kib(128)))
 	AssertEqual(t, DefaultTunSettings().TcpReceiveBuffer.Max, int(kib(512)))
 
 	// The smallest supported host target can still admit one explicitly
@@ -171,6 +209,48 @@ func TestTrimMessagePoolsToWarmPreservesCapacity(t *testing.T) {
 			pool.release(message[:cap(message)])
 		}
 		AssertEqual(t, pool.snapshot().retained, snapshot.retained+1)
+	}
+}
+
+func TestMobileMessagePoolWarmSetIsParameterized(t *testing.T) {
+	defer ResizeMessagePools(InitialMessagePoolByteCount/2, InitialMessagePoolByteCount/2)
+	defer ClearMessagePools()
+
+	ResizeMessagePools(mib(4), mib(2))
+	pools := orderedMessagePools()
+	for _, pool := range pools {
+		pool.Clear()
+		messages := make([][]byte, pool.capacity())
+		for i := range messages {
+			messages[i] = pool.take(pool.size, 0)
+		}
+		for _, message := range messages {
+			pool.release(message[:cap(message)])
+		}
+	}
+
+	const mobileWarmByteCount = ByteCount(256 * 1024)
+	TrimMessagePoolsTo(mobileWarmByteCount)
+	for _, pool := range pools {
+		snapshot := pool.snapshot()
+		if pool.size == packetPoolSize {
+			AssertEqual(t, snapshot.retained, int(mobileWarmByteCount)/pool.size)
+		} else {
+			AssertEqual(t, snapshot.retained, largeObjectPoolFloorCount(pool.size))
+		}
+	}
+
+	for _, pool := range pools {
+		pool.Clear()
+	}
+	WarmMessagePoolsTo(mobileWarmByteCount)
+	for _, pool := range pools {
+		snapshot := pool.snapshot()
+		if pool.size == packetPoolSize {
+			AssertEqual(t, snapshot.retained, int(mobileWarmByteCount)/pool.size)
+		} else {
+			AssertEqual(t, snapshot.retained, 0)
+		}
 	}
 }
 
