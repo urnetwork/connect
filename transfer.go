@@ -7858,7 +7858,9 @@ type ReceiveBufferSettings struct {
 	// H1PackHandoffTimeout applies bounded reader backpressure only after an
 	// H1 ReceiveSequence handoff is full. Zero preserves nonblocking loss;
 	// H3 and unknown carriers always remain nonblocking at the Client reader.
-	// A positive value is a total wait bound, not a per-retry delay.
+	// A positive value is a total wait bound, not a per-retry delay. A negative
+	// value waits until capacity or sequence/client cancellation, extending an
+	// already-reliable H1 stream's backpressure without enlarging the channel.
 	H1PackHandoffTimeout time.Duration
 	// H1AckHandoffTimeout applies the same reliable-carrier backpressure rule
 	// when an inbound ACK burst momentarily fills its SendSequence queue. ACK

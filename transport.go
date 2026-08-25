@@ -194,12 +194,15 @@ func normalizeTransportModePreferences(preferences map[TransportMode]int) map[Tr
 }
 
 // PlatformTransportReceiveModeStatsSnapshot is one lock-free view of complete
-// Transfer-frame messages refused by a full platform receive route. Bytes are
-// the complete message bytes read from the carrier, before pool ownership is
-// returned. Transfer recovery owns retransmission for these drops.
+// Transfer-frame messages encountering a full platform receive route. Bytes
+// are the complete message bytes read from the carrier. QueueDrop is
+// application-level loss returned to Transfer recovery; QueueBackpressure is
+// reliable-carrier ownership retained while waiting for bounded route space.
 type PlatformTransportReceiveModeStatsSnapshot struct {
-	QueueDropMessageCount uint64
-	QueueDropByteCount    uint64
+	QueueDropMessageCount         uint64
+	QueueDropByteCount            uint64
+	QueueBackpressureMessageCount uint64
+	QueueBackpressureByteCount    uint64
 }
 
 // PlatformTransportReceiveStatsSnapshot keeps the carrier mode visible: DNS
@@ -215,14 +218,18 @@ type PlatformTransportReceiveStatsSnapshot struct {
 }
 
 type platformTransportReceiveModeStats struct {
-	queueDropMessageCount atomic.Uint64
-	queueDropByteCount    atomic.Uint64
+	queueDropMessageCount         atomic.Uint64
+	queueDropByteCount            atomic.Uint64
+	queueBackpressureMessageCount atomic.Uint64
+	queueBackpressureByteCount    atomic.Uint64
 }
 
 func (self *platformTransportReceiveModeStats) snapshot() PlatformTransportReceiveModeStatsSnapshot {
 	return PlatformTransportReceiveModeStatsSnapshot{
-		QueueDropMessageCount: self.queueDropMessageCount.Load(),
-		QueueDropByteCount:    self.queueDropByteCount.Load(),
+		QueueDropMessageCount:         self.queueDropMessageCount.Load(),
+		QueueDropByteCount:            self.queueDropByteCount.Load(),
+		QueueBackpressureMessageCount: self.queueBackpressureMessageCount.Load(),
+		QueueBackpressureByteCount:    self.queueBackpressureByteCount.Load(),
 	}
 }
 
@@ -260,6 +267,16 @@ func (self *PlatformTransportReceiveStats) recordQueueDrop(mode TransportMode, b
 	if counters := self.mode(mode); counters != nil {
 		counters.queueDropMessageCount.Add(1)
 		counters.queueDropByteCount.Add(uint64(max(0, byteCount)))
+	}
+}
+
+func (self *PlatformTransportReceiveStats) recordQueueBackpressure(
+	mode TransportMode,
+	byteCount int,
+) {
+	if counters := self.mode(mode); counters != nil {
+		counters.queueBackpressureMessageCount.Add(1)
+		counters.queueBackpressureByteCount.Add(uint64(max(0, byteCount)))
 	}
 }
 
@@ -480,9 +497,9 @@ type PlatformTransportSettings struct {
 	// SendRouteObserver exposes route ownership to deterministic integration
 	// harnesses. It must not block. Nil retains normal production behavior.
 	SendRouteObserver func(transport Transport, route Route, connected bool)
-	// ReceiveStats, when non-nil, aggregates zero-wait carrier-to-route
-	// admission loss across every reconnect generation. The constructor uses a
-	// private counter set when it is nil.
+	// ReceiveStats, when non-nil, aggregates carrier-to-route admission loss and
+	// reliable-H1 backpressure across every reconnect generation. The
+	// constructor uses a private counter set when it is nil.
 	ReceiveStats *PlatformTransportReceiveStats
 	// AuthFrameObserver borrows the exact pooled authentication frame before
 	// transport I/O. Tests may retain it to prove lifecycle ownership. It must
@@ -830,9 +847,13 @@ func (self *PlatformTransport) DatagramStats() H3DatagramStatsSnapshot {
 }
 
 // offerReceive transfers one complete carrier message to the shared Client
-// route without parking the socket reader. A full queue drops and counts the
-// frame; Transfer ACK/retry is the only recovery owner above this boundary.
-// False means the connection generation ended and its reader should exit.
+// route. H1 is already an ordered, reliable byte stream: dropping after the
+// WebSocket read manufactures a Transfer hole, pins every later Pack in the
+// reorder queue, and makes retransmits compete with new data on the same TCP
+// stream. When its bounded route is full, retain this one already-budgeted
+// message and let TCP backpressure the peer until the Client pump makes room.
+// Datagram/H3 modes keep the nonblocking recovery contract for now. False
+// means the connection generation ended and its reader should exit.
 func (self *PlatformTransport) offerReceive(
 	done <-chan struct{},
 	mode TransportMode,
@@ -843,6 +864,16 @@ func (self *PlatformTransport) offerReceive(
 	case pooledReceiveOfferDelivered:
 		return true, true
 	case pooledReceiveOfferFull:
+		if mode == TransportModeH1 {
+			self.receiveStats.recordQueueBackpressure(mode, len(message))
+			select {
+			case <-done:
+				MessagePoolReturn(message)
+				return false, false
+			case receive <- message:
+				return true, true
+			}
+		}
 		self.receiveStats.recordQueueDrop(mode, len(message))
 		MessagePoolReturn(message)
 		return true, false

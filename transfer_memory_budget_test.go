@@ -1145,6 +1145,7 @@ func TestReceiveSequenceH1HandoffUsesCarrierSpecificCountLimit(t *testing.T) {
 		settings,
 	)
 	defer sequence.Close()
+	defer cancel()
 	if got := cap(sequence.packs); got != 4 {
 		t.Fatalf("carrier-aware handoff channel capacity = %d, want 4", got)
 	}
@@ -1742,6 +1743,153 @@ func TestReceiveSequenceH1HandoffWaitRescuesFullQueue(t *testing.T) {
 		t.Fatalf("H1 rescued wait count = %d, want 1", got)
 	}
 	dequeued = <-sequence.packs
+	sequence.releasePackQueue(dequeued)
+	dequeued.messagePoolReturn()
+}
+
+func TestReceiveSequenceH1HandoffNegativeWaitPreservesReliableBackpressure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultReceiveBufferSettingsWithBufferSize(1)
+	settings.H1PackHandoffTimeout = -1
+	client := &Client{}
+	sequence := newReceiveSequence(
+		ctx,
+		client,
+		SourceId(NewId()),
+		NewId(),
+		TransferKey{},
+		settings,
+	)
+	defer sequence.Close()
+	newPack := func() *ReceivePack {
+		return &ReceivePack{
+			MessageByteCount:   40,
+			TransferFrameBytes: MessagePoolGet(40),
+			TransportType:      TransportTypeH1,
+		}
+	}
+	first := newPack()
+	second := newPack()
+	if accepted, err := sequence.Pack(first, 0); !accepted || err != nil {
+		t.Fatalf("fill H1 handoff: accepted=%t err=%v", accepted, err)
+	}
+	type packResult struct {
+		accepted bool
+		err      error
+	}
+	result := make(chan packResult, 1)
+	go func() {
+		accepted, err := sequence.Pack(
+			second,
+			settings.packHandoffTimeout(second.TransportType),
+		)
+		result <- packResult{accepted: accepted, err: err}
+	}()
+	deadline := time.Now().Add(time.Second)
+	for client.ReceiveStats().PackHandoffWaitCount == 0 && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if client.ReceiveStats().PackHandoffWaitCount != 1 {
+		t.Fatal("full H1 handoff did not enter lossless wait")
+	}
+	// This is longer than the rejected mobile 10-ms timeout. The wait must
+	// remain owned by channel capacity rather than turn into a synthetic gap.
+	select {
+	case premature := <-result:
+		t.Fatalf("negative H1 wait completed while full: %+v", premature)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	dequeued := <-sequence.packs
+	sequence.releasePackQueue(dequeued)
+	dequeued.messagePoolReturn()
+	select {
+	case got := <-result:
+		if !got.accepted || got.err != nil {
+			t.Fatalf("lossless H1 handoff result: accepted=%t err=%v", got.accepted, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lossless H1 handoff did not wake after capacity opened")
+	}
+	if got := client.ReceiveStats(); got.PackHandoffWaitSuccess != 1 ||
+		got.PackHandoffDropCount != 0 {
+		t.Fatalf("lossless H1 handoff stats = %+v", got)
+	}
+	dequeued = <-sequence.packs
+	sequence.releasePackQueue(dequeued)
+	dequeued.messagePoolReturn()
+}
+
+func TestReceiveSequenceH1HandoffNegativeWaitCancellationReturnsToCaller(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	settings := DefaultReceiveBufferSettingsWithBufferSize(1)
+	settings.H1PackHandoffTimeout = -1
+	client := &Client{}
+	sequence := newReceiveSequence(
+		ctx,
+		client,
+		SourceId(NewId()),
+		NewId(),
+		TransferKey{},
+		settings,
+	)
+	defer sequence.Close()
+	defer cancel()
+	first := &ReceivePack{
+		MessageByteCount:   40,
+		TransferFrameBytes: MessagePoolGet(40),
+		TransportType:      TransportTypeH1,
+	}
+	second := &ReceivePack{
+		MessageByteCount:   40,
+		TransferFrameBytes: MessagePoolGet(40),
+		TransportType:      TransportTypeH1,
+	}
+	if accepted, err := sequence.Pack(first, 0); !accepted || err != nil {
+		t.Fatalf("fill H1 handoff: accepted=%t err=%v", accepted, err)
+	}
+	type packResult struct {
+		accepted bool
+		err      error
+	}
+	result := make(chan packResult, 1)
+	go func() {
+		accepted, err := sequence.Pack(
+			second,
+			settings.packHandoffTimeout(second.TransportType),
+		)
+		result <- packResult{accepted: accepted, err: err}
+	}()
+	deadline := time.Now().Add(time.Second)
+	for client.ReceiveStats().PackHandoffWaitCount == 0 && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if client.ReceiveStats().PackHandoffWaitCount != 1 {
+		t.Fatal("full H1 handoff did not enter lossless wait")
+	}
+	cancel()
+	select {
+	case got := <-result:
+		if got.accepted || got.err == nil {
+			t.Fatalf("canceled H1 handoff result: accepted=%t err=%v", got.accepted, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled H1 handoff remained blocked")
+	}
+	if second.sequenceQueueByteCount != 0 || second.sequenceQueueBudgetByteCount != 0 ||
+		second.sequenceQueueBudget != nil {
+		t.Fatalf("canceled caller-owned Pack retained queue charge: %+v", second)
+	}
+	if pooled, _ := MessagePoolCheck(second.TransferFrameBytes); !pooled {
+		t.Fatal("canceled H1 Pack did not return ownership to its caller")
+	}
+	secondBytes := second.TransferFrameBytes
+	second.messagePoolReturn()
+	if pooled, _ := MessagePoolCheck(secondBytes); pooled {
+		t.Fatal("caller did not release canceled H1 Pack ownership")
+	}
+	dequeued := <-sequence.packs
 	sequence.releasePackQueue(dequeued)
 	dequeued.messagePoolReturn()
 }

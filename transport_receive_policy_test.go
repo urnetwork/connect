@@ -3,6 +3,7 @@ package connect
 import (
 	"context"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -26,7 +27,7 @@ func requirePromptTransportOffer(
 	}
 }
 
-func TestPlatformTransportReceiveQueueRefusalDoesNotWait(t *testing.T) {
+func TestPlatformTransportH3DnsReceiveQueueRefusalDoesNotWait(t *testing.T) {
 	stats := &PlatformTransportReceiveStats{}
 	transport := &PlatformTransport{receiveStats: stats}
 	receive := make(chan []byte, 1)
@@ -51,6 +52,121 @@ func TestPlatformTransportReceiveQueueRefusalDoesNotWait(t *testing.T) {
 	if snapshot.H3Dns.QueueDropMessageCount != 1 ||
 		snapshot.H3Dns.QueueDropByteCount != 137 {
 		t.Fatalf("H3 DNS queue-drop stats = %+v, want one message / 137 bytes", snapshot.H3Dns)
+	}
+}
+
+// A full route below a reliable H1 socket used to drop the just-read message.
+// The sender could not know which ordered message vanished, so every later
+// message filled the receiver's reorder budget while Transfer retransmits
+// queued behind the same new traffic. Keep the channel bounded, but make its
+// full edge ordinary TCP backpressure rather than application-level loss.
+func TestPlatformTransportH1ReceiveQueueBackpressuresWithoutDropping(t *testing.T) {
+	stats := &PlatformTransportReceiveStats{}
+	transport := &PlatformTransport{receiveStats: stats}
+	receive := make(chan []byte, 1)
+	queued := MessagePoolGet(1)
+	receive <- queued
+
+	type offerResult struct {
+		open      bool
+		delivered bool
+	}
+	result := make(chan offerResult, 1)
+	started := make(chan struct{})
+	pending := MessagePoolGet(137)
+	if pooled, _ := MessagePoolCheck(pending); !pooled {
+		t.Fatal("pending H1 message is not pool-owned before offer")
+	}
+	go func() {
+		close(started)
+		open, delivered := transport.offerReceive(
+			make(chan struct{}),
+			TransportModeH1,
+			receive,
+			pending,
+		)
+		result <- offerResult{open: open, delivered: delivered}
+	}()
+	<-started
+	deadline := time.Now().Add(time.Second)
+	for stats.Snapshot().H1.QueueBackpressureMessageCount == 0 &&
+		time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	snapshot := stats.Snapshot()
+	if snapshot.H1.QueueBackpressureMessageCount != 1 ||
+		snapshot.H1.QueueBackpressureByteCount != 137 ||
+		snapshot.H1.QueueDropMessageCount != 0 {
+		t.Fatalf("full H1 route stats = %+v", snapshot.H1)
+	}
+	select {
+	case premature := <-result:
+		t.Fatalf("full H1 route returned instead of applying backpressure: %+v", premature)
+	default:
+	}
+
+	MessagePoolReturn(<-receive)
+	select {
+	case got := <-result:
+		if !got.open || !got.delivered {
+			t.Fatalf("H1 route result = %+v, want open delivered", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("H1 route did not resume after bounded channel space opened")
+	}
+	if got := <-receive; &got[0] != &pending[0] {
+		t.Fatal("H1 route changed message ownership while backpressured")
+	} else {
+		if pooled, _ := MessagePoolCheck(got); !pooled {
+			t.Fatal("H1 route returned pool ownership before delivery")
+		}
+		MessagePoolReturn(got)
+		if pooled, _ := MessagePoolCheck(got); pooled {
+			t.Fatal("receiver did not return delivered H1 pool ownership")
+		}
+	}
+}
+
+func TestPlatformTransportH1ReceiveBackpressureCancellationReturns(t *testing.T) {
+	stats := &PlatformTransportReceiveStats{}
+	transport := &PlatformTransport{receiveStats: stats}
+	receive := make(chan []byte, 1)
+	queued := MessagePoolGet(1)
+	receive <- queued
+	defer func() { MessagePoolReturn(<-receive) }()
+	done := make(chan struct{})
+	result := make(chan bool, 1)
+	pending := MessagePoolGet(137)
+	go func() {
+		open, delivered := transport.offerReceive(
+			done,
+			TransportModeH1,
+			receive,
+			pending,
+		)
+		result <- open || delivered
+	}()
+	deadline := time.Now().Add(time.Second)
+	for stats.Snapshot().H1.QueueBackpressureMessageCount == 0 &&
+		time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	close(done)
+	select {
+	case accepted := <-result:
+		if accepted {
+			t.Fatal("canceled H1 route transferred ownership")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled H1 route remained blocked")
+	}
+	snapshot := stats.Snapshot().H1
+	if snapshot.QueueBackpressureMessageCount != 1 ||
+		snapshot.QueueDropMessageCount != 0 {
+		t.Fatalf("canceled H1 route stats = %+v", snapshot)
+	}
+	if pooled, _ := MessagePoolCheck(pending); pooled {
+		t.Fatal("canceled H1 route retained pooled message ownership")
 	}
 }
 
@@ -129,11 +245,12 @@ func TestP2pReceiveRouteRefusalDoesNotWait(t *testing.T) {
 	}
 }
 
-// This inventory deliberately targets the carrier readers rather than every
-// channel send in these large files. Any reintroduction of their former
-// blocking select shapes fails even if a timing test happens to get scheduled
-// after capacity becomes available.
-func TestProductionCarrierReadersUseZeroWaitReceiveAdmission(t *testing.T) {
+// This inventory deliberately targets the carrier readers rather than relying
+// only on timing tests. Platform H1 owns exactly one cancellable backpressure
+// send inside offerReceive; H3/DNS and both P2P readers retain zero-wait
+// admission. A direct carrier-reader send or a timer silently changes that
+// ownership contract and must fail this audit.
+func TestProductionCarrierReadersUseModeSpecificReceiveAdmission(t *testing.T) {
 	checks := []struct {
 		path              string
 		required          map[string]int
@@ -142,11 +259,11 @@ func TestProductionCarrierReadersUseZeroWaitReceiveAdmission(t *testing.T) {
 		{
 			path: "transport.go",
 			required: map[string]int{
-				"self.offerReceive(":   2,
-				"self.offerH1Control(": 4,
+				"self.offerReceive(":       2,
+				"self.offerH1Control(":     4,
+				"case receive <- message:": 1,
 			},
 			forbiddenSnippets: []string{
-				"case receive <- message:",
 				"case controlSend <- message:",
 				"resetOrCreateTimer(&receiveTimer",
 			},
@@ -178,6 +295,24 @@ func TestProductionCarrierReadersUseZeroWaitReceiveAdmission(t *testing.T) {
 		for _, snippet := range check.forbiddenSnippets {
 			if strings.Contains(source, snippet) {
 				t.Fatalf("%s reintroduced blocking carrier receive handoff %q", check.path, snippet)
+			}
+		}
+		if check.path == "transport.go" {
+			offerStart := strings.Index(source, "func (self *PlatformTransport) offerReceive(")
+			offerEnd := strings.Index(source, "func (self *PlatformTransport) offerH1Control(")
+			if offerStart < 0 || offerEnd <= offerStart {
+				t.Fatal("could not isolate platform receive-admission source boundary")
+			}
+			offerSource := source[offerStart:offerEnd]
+			for _, required := range []string{
+				"if mode == TransportModeH1",
+				"case <-done:",
+				"case receive <- message:",
+				"recordQueueDrop(mode",
+			} {
+				if !strings.Contains(offerSource, required) {
+					t.Fatalf("platform receive admission is missing %q", required)
+				}
 			}
 		}
 		if check.path == "transport_p2p.go" {

@@ -451,6 +451,56 @@ func TestLogicalLaneBuffersShareFixedLazyBudgets(t *testing.T) {
 	}
 }
 
+func TestLogicalLaneAdaptiveH1DepthDividesCountAndKeepsBytesFixed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultReceiveBufferSettingsWithBufferSize(16)
+	settings.H1SequenceBufferSize = 64
+	settings.H1SequenceBufferAdaptiveMaxSize = 512
+	settings.H1SequenceBufferAdaptiveStepSize = 64
+	settings.H1SequenceBufferAdaptiveSaturationThreshold = 2
+	settings.H1SequenceBufferAdaptiveSaturationWindow = 100 * time.Millisecond
+	settings.SequenceBufferByteCount = 128 * 1024
+	settings.H1SequenceBufferByteCount = 128 * 1024
+	// Count-only iterative depth must never manufacture a second byte window.
+	settings.H1SequenceBufferAdaptiveMaxByteCount = 0
+	settings.H1SequenceBufferAdaptiveStepByteCount = 0
+
+	sequence := newReceiveSequenceWithLogicalLaneBudget(
+		ctx,
+		&Client{},
+		SourceId(NewId()),
+		NewId(),
+		TransferKey{LogicalLane: 1},
+		settings,
+		NewTransferMemoryBudget(2*1024*1024),
+	)
+	defer sequence.Close()
+	if got := cap(sequence.packs); got != 64 {
+		t.Fatalf("adaptive lane channel capacity = %d, want 64", got)
+	}
+	if sequence.packQueueH1Limit != 8 ||
+		sequence.packQueueH1AdaptiveMaxLimit != 64 ||
+		sequence.packQueueH1AdaptiveStep != 8 {
+		t.Fatalf(
+			"adaptive lane depths = %d/%d step %d, want 8/64 step 8",
+			sequence.packQueueH1Limit,
+			sequence.packQueueH1AdaptiveMaxLimit,
+			sequence.packQueueH1AdaptiveStep,
+		)
+	}
+	if sequence.packQueueH1ByteLimit != 128*1024 ||
+		sequence.packQueueH1AdaptiveMaxByteLimit != 128*1024 ||
+		sequence.packQueueH1AdaptiveByteStep != 0 {
+		t.Fatalf(
+			"adaptive lane bytes = %d/%d step %d, want fixed 128 KiB",
+			sequence.packQueueH1ByteLimit,
+			sequence.packQueueH1AdaptiveMaxByteLimit,
+			sequence.packQueueH1AdaptiveByteStep,
+		)
+	}
+}
+
 func TestReceiveLogicalLanesCoexistAndRejectOutOfRange(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
