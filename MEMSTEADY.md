@@ -442,6 +442,7 @@ failed samples.
 | 2026-08-25 `h1-rxalloc-separate-wait10-20260825` | Final candidate: 32-ready H1, 64/128-KiB H1 receive handoff, 10-ms reliable-carrier wait, independent logical per-flow window, and exact shared 2-MiB retained-allocation budget | pre-load median load/request-to-first-byte/TTFB 455.1/164.5/169.6 ms; hot median 627.4/245.3/248.8 ms with one isolated reused-H2 5.3-s resource wait and no concurrent tunnel loss; post-recovery median 613.6/223.7/227.8 ms with 7/7 success and no multi-second resource tail | all ten full 1-MiB responses completed at 2.04--6.00 Mbit/s; median 2.78 Mbit/s and 554.22-ms median first byte | at least 20.53 MiB ingress in the inner 75-s counter bracket; public-provider rate remains far below the adjacent 41.53-Mbit/s Direct upper-pair median | active runtime peaked at 21.77 MiB with 8.91-MiB live heap, 1.78-MiB packet roots, exact receive use 2.00/2.00 MiB, and zero samples above either 24 or 28 MiB. Five-minute recovery p50/p95/range/last were 19.91/20.16/19.85--20.20/19.91 MiB with a 256-KiB warm set, zero queued receive bytes, zero forced GCs, and zero trims. Across the burst, 9/11 bounded Pack waits succeeded; two drops returned only 2,880 bytes and all payloads completed. | **Accept the client memory/performance profile.** Exact retained charging fixes the 29--30-MiB high-water without shrinking the protocol BDP window. Do not claim 40 Mbit/s until the retained provider grouping/ACK changes are deployed to a controlled exit and measured end to end. Physical iOS footprint validation remains separate. |
 | 2026-08-25 `h1-adaptive-depth-20260825` | Diagnostic: H1 count depth starts at 64, requires two full observations within 100 ms, and grows by 16 toward 128; logical bytes remained fixed at 128 KiB | pre-load Wikipedia median load/TTFB 604.2/252.6 ms; post-recovery 463.8/196.2 ms after one 6.02-s cold restart | 7/10 completed before one 120-s stream abort; completed median 1.54 Mbit/s | 3.29 MiB ingress in 75 s, about 0.37 Mbit/s; adjacent Direct 4-MiB median 86.74 Mbit/s | runtime peak 21.39 MiB; recovery p50/p95 19.86/20.24 MiB. Thirteen saturations and four grants across two flows reached an earned maximum of 96, but actual HWM stopped at 92 Packs / 130,978 of 131,072 bytes. | Reject count-only deepening. It stayed inside memory, but the fixed logical-byte cap became the next boundary and performance remained public-provider limited. Test paired count/byte growth once. |
 | 2026-08-25 `h1-adaptive-depth-bytes-20260825` | Diagnostic: paired 64/128-KiB -> 128/256-KiB H1 growth in 16/32-KiB steps under the unchanged exact shared retained budget | pre-load Wikipedia median load/TTFB 404.3/149.8 ms; post-recovery seven-run median 439.6/186.2 ms, including a 2.51-s cold connection setup | all 10 completed; median 1.18 Mbit/s and 476.82-ms first byte | 1.77 MiB ingress in 75 s, about 0.20 Mbit/s; Direct 4-MiB median 87.4 Mbit/s | runtime peak 22.45 MiB; 390-s recovery p50/p95/range/last 20.58/20.91/20.19--20.97/20.19 MiB; zero samples above 24/28 MiB. One flow earned 128/256 KiB and queued 128/194,688 bytes; all four grants occurred before fast.com, which added none. Session timeout resends reached 620. | Reject as the production mobile default. Full adaptive depth is memory-safe in this arm but does not improve bulk or fast.com and increases recovery work. Keep fixed 64/128 KiB; retain the generic opt-in and telemetry only for a controlled-provider A/B. |
+| 2026-08-25 `h1-logical-lanes8-20260825` / adjacent lane-zero control | Explicit H1/provider off with fixed 64/128-KiB receive policy; eight bounded five-tuple lanes plus lossless Transfer-ACK overflow folding, followed by a rebuilt lane-zero arm in the same device session | lane 8 median load/TTFB 348.8/126.1 ms; lane 0 median 1,157.8/367.9 ms | not repeated; the earlier complete fixed-depth cohort remains the payload control | lane 8 displayed 10 then 3.6 Mbit/s; its exact repeat moved 3.06 MiB H1 ingress in 19.3 s. Lane 0 displayed 4.4 Mbit/s and moved 18.55 MiB in 34.7 s. Same-session Direct displayed 410 Mbit/s before the first arm and 1.1 Gbit/s after the second. | lane 8 runtime peak 20.60 MiB, 2.00/2.00-MiB receive use, zero >28-MiB samples, and 152 timeout resends in the exact repeat; lane 0 peak 19.43 MiB, 1.41/2.00-MiB receive use, zero >28-MiB samples, and 1,053 timeout resends. Both arms had zero Transfer-ACK handoff loss. | Keep eight lanes as a controlled explicit-H1 client/provider candidate, not as a public-provider speed claim. Client lanes materially improve request/inner-TCP-ACK isolation and page latency, but provider download data remained on lane zero. Enable the same negotiated lanes on a pinned provider sender and deploy provider grouping/direct ACK before the decisive end-to-end A/B. |
 
 ### ACK and grouping microbenchmarks
 
@@ -499,6 +500,30 @@ proxy +0.64% overall; all B/op and alloc counts were identical. The roughly
 frequency drift, not a code regression. Server queues leave retained-root
 scanning disabled, so no server-specific reclaim behavior is needed.
 
+The logical-lane follow-up also isolated the compact Transfer-ACK overflow
+path. At a clean 50-ms RTT, fixed lane-zero H1 measured 134.551 Mbit/s before
+and 134.529 Mbit/s after folding a full ACK handoff directly into the existing
+monotonic cumulative/selective window (-0.016%). The fallback adds no queue,
+wait, timer, or per-ACK allocation. In the impaired four-flow PERFVAR arm,
+lane zero measured 20.247 Mbit/s on a 41.474-Mbit/s underlay and eight lanes
+measured 29.058 Mbit/s on a 43.704-Mbit/s underlay: +43.5% raw goodput at
+similar calibration. Order-balanced repeats were route-variable, so this is a
+causal flow-isolation signal rather than a universal multiplier. It complements
+the physical page/retransmission result; it does not overcome a provider that
+still puts every return flow on lane zero.
+
+Final-source validation passed the complete Connect and SDK short suites in
+199.341 and 97.135 seconds, focused normal/race repetitions, all affected vet
+tiers, and the Android AAR/app/test build. After stopping a stale campaign-owned
+benchmark probe that had contaminated the broad host cohort, five clean-host
+repetitions measured production H1 TLS at 891.7 ns full-payload and 370.3 ns
+ACK-sized medians with two allocations/op; PERFVAR receive credits measured
+673.6 ns and proxy batch-64 measured 5,406 ns. This rules out a shared-server
+performance regression from the ACK fallback or explicit-H1 mobile policy.
+The broad server correctness attempt remains externally blocked by unset
+`WARP_ENV` and absent vault `pg.yml`; focused tests and benchmark-only packages
+do not require those fixtures and are green.
+
 ### Current ACK decision matrix
 
 | Option | Memory/performance result | Decision |
@@ -507,6 +532,7 @@ scanning disabled, so no server-specific reclaim behavior is needed.
 | Iterative H1 receive 64/128 KiB -> 128/256 KiB | A flow reached the full earned limit and queued 128 Packs / 194,688 bytes at a 22.45-MiB runtime peak, but Cloudflare fell to a 1.18-Mbit/s median and fast.com moved about 0.20 Mbit/s. No depth grant occurred during fast.com and timeout resends reached 620. | Reject for the production mobile policy. Keep the generic opt-in for fixed-provider diagnosis; do not spend the client budget until a controlled provider A/B identifies this boundary. |
 | H1 Pack handoff wait 0 -> 10 ms | A 1-ms arm left a rare timeout and multi-second resource recovery. At 10 ms, 9/11 final-run waits succeeded; the two misses returned only 2,880 bytes and every payload completed. The wait does not enlarge either queue. | Keep for reliable H1 Pack handoff only; ACK handoff remains 1 ms and H3/unknown remains zero-wait. |
 | Transfer ACK handoff 16 -> 64 | Inbound ACK-handoff drops remained zero while Pack loss was high. | Do not spend memory here. |
+| Full Transfer-ACK handoff -> shared ACK window | Clean 50-ms H1 changed 134.551 -> 134.529 Mbit/s (-0.016%). A saturated compact channel now folds progress into its existing monotonic cumulative/selective window without growing the queue or waiting. | Keep as lossless overload handling. This coalesces Transfer protocol ACK state, not inner TCP ACK packets. |
 | First Transfer ACK | A fixed 10-ms delay is directly on sparse request/response turns. | Send the first after idle immediately; retain 10-ms sustained spacing. |
 | Shorter sustained Transfer-ACK interval | The 512-KiB resend budget holds roughly ten times 10 ms of 40-Mbit/s traffic; no ACK-handoff loss was observed. | Do not add ACK traffic without a causal trace. |
 | ACK-only packet reserve | Protects up to 256 extra H1/provider-off packet roots (about 512 KiB worst-case) and preserves exact packet order among admitted packets. | Keep as overload progress protection; disable for Auto/H3/provider-on. |
@@ -515,6 +541,7 @@ scanning disabled, so no server-specific reclaim behavior is needed.
 | TCP ACK Transfer-NoAck | Removed most ACK-of-ACK retries but did not improve physical performance and breaks commit across route replacement. | Rejected and removed. |
 | Established provider pure-ACK direct apply | Removes one `TcpSendItem`, queue crossing, and worker wakeup per browser ACK; local download work fell 3.1%, 52% B/op, and 19.6% allocs/op. | Keep with handshake, lifecycle-lock, exact-owner, monotonic-ACK/window, and zero-allocation tests. It requires provider deployment before a device throughput claim. |
 | Provider return logical groups | Halves full-MTU H1 Transfer messages, cuts local boundary allocations 65%, and leaves H3 physical chunks unchanged. | Keep 16 frames / 24 KiB logical fairness bound; require deployment/full-TUN validation. |
+| H1 logical lanes 0 -> 8 | On the physical client, Wikipedia median load improved 1,157.8 -> 348.8 ms and timeout resends fell 1,053 -> 152 while runtime stayed below 20.61 MiB. Controlled four-flow goodput improved 20.247 -> 29.058 Mbit/s at similar underlay capacity. Public fast.com did not improve consistently because its provider return sender remained on lane zero. | Keep for a symmetric explicit-H1 client/provider A/B. Byte budgets remain shared and nonzero channel capacity is bounded; do not enable default Auto until the provider result covers carrier transitions. |
 | H1 ready-only WebSocket drain 16 -> 32 | ACK-sized host throughput rose about 20% and writes/frame fell 36%; full payload and sparse arrival were neutral with unchanged fixed storage. Exact receive-allocation accounting then held the final sustained device run to 21.77 MiB active and 20.16 MiB recovery p95. | Keep; byte stop 12 KiB, wrapper 16 KiB, and no batching wait. Attribute Internet goodput only after a controlled provider A/B. |
 | Dedicated priority carrier lane for Transfer ACKs | Could bypass a full data FIFO, but requires a second ordered transport lane and lifecycle/backpressure design. The NoAck diagnostic rules out downstream ACK-of-ACK HOL as the present primary limiter. | Protocol/transport candidate only after direct ACK-write wait telemetry proves contention. |
 | Piggyback cumulative Transfer ACK on reverse data | Can remove a separate frame on full-duplex flows, but changes the wire contract and needs downgrade/retry semantics. | Future negotiated protocol candidate. |
@@ -524,7 +551,7 @@ scanning disabled, so no server-specific reclaim behavior is needed.
 
 | Rank | Boundary | Evidence | Highest-value next action |
 | ---: | --- | --- | --- |
-| 1 | Public provider/exit path and deployed provider code | Same-session Direct reached 85.03 and 87.4-Mbit/s medians while public H1 remained slow. Historical controlled full-TUN H1 exceeds 40 Mbit/s; neither removing client TCP ACK recovery nor letting one H1 receive flow reach 128 Packs / 256 KiB moved fast.com. | Deploy the provider logical-group/direct-ACK changes to a controlled provider and alternate binaries on the same pinned exit/underlay. Capture provider CPU, socket read batch, Transfer message/frame rate, and timeout recovery at every relay boundary. |
+| 1 | Public provider/exit path and deployed provider code | Same-session Direct reached 85.03 and 87.4-Mbit/s medians and later 410-Mbit/s / 1.1-Gbit/s displays while public H1 remained slow. Historical controlled full-TUN H1 exceeds 40 Mbit/s; neither removing client TCP ACK recovery nor letting one H1 receive flow reach 128 Packs / 256 KiB moved fast.com. Client-only lanes improved pages and recovery but could not split provider return data. | Pin an explicit-H1 controlled provider with the same eight negotiated lanes, provider logical grouping, and direct ACK application; then alternate old/new binaries on one exit/underlay. Capture provider CPU, socket read batch, Transfer message/frame rate, per-lane occupancy, and timeout recovery at every relay boundary. |
 | 2 | Download Transfer-message amplification | The hybrid H3 ceiling made deployed H1 provider returns singleton full-MTU messages. The retained local group halves their H1 sequence numbers/wire Packs and cuts boundary allocations 65.3%. | Validate exact payload/goodput in PERFVAR when Redis/DB is restored, then on the attached device against that provider. |
 | 3 | Client H1 receive-pump scheduling | Before bounded waiting, Pack handoff drops reached 82--2,280 while ACK handoff stayed zero. The exact-budget/10-ms final run converted 9/11 full-queue events into progress and lost only 2,880 bytes while completing every payload. Adaptive diagnosis then reached the full 128/256-KiB allowance without a speed gain. | Keep the fixed 64/128-KiB fix. Re-enable iterative depth only against a controlled provider if boundary telemetry again shows continuous client saturation. |
 | 4 | Hot packet-root pressure | Fresh pages stay below the gate, but overlapping fast.com work drove mixed ACK/data drops and runtime growth. Raising roots to 4,096 removed drops without improving speed; receive 128 exceeded 24 MiB. | Reduce messages/allocations upstream with provider grouping. Do not buy speed by weakening the memory backstop. |
@@ -539,8 +566,11 @@ Cloudflare median is still only 2.78 Mbit/s while the adjacent Direct upper pair
 reaches 41.53 Mbit/s. The later iterative arm made the diagnosis stronger: a
 flow reached 128 Packs / 256 KiB while Direct measured 87.4 Mbit/s, yet fast.com
 moved about 0.20 Mbit/s and requested no further depth. The next large
-multiplier is deploying the provider return grouping/direct-ACK work and
-measuring one fixed provider/exit. If that still leaves a gap, boundary
+multiplier is deploying the provider return grouping/direct-ACK work and the
+same negotiated H1 lanes on one fixed provider/exit. Eight client lanes already
+cut the physical page median about 70% and timeout resends about 86%, while
+staying below 20.61 MiB, but public fast.com return data still used provider
+lane zero. If the symmetric provider arm still leaves a gap, boundary
 goodput/CPU/socket-batch telemetry decides whether to tune provider socket
 windows, server/provider drains, a priority lane, or a negotiated envelope.
 
@@ -550,14 +580,17 @@ Run one change at a time where practical, then combine only independently
 useful changes. The search covers the whole H1 path rather than assuming that
 every slow result is a queue-size problem:
 
-1. **Deployable provider A/B.** Put the logical provider-return group on a
-   controlled current server/provider, alternate old/new binaries, and run H1
+1. **Deployable provider A/B.** Put eight negotiated data lanes and the logical
+   provider-return group/direct-ACK path on a controlled current
+   server/provider, alternate old/new binaries, and run H1
    download in the full-TUN PERFVAR matrix plus the physical Direct/H1 bracket.
    Pin provider/exit selection; do not compare two public-provider races. The
    local Redis/DB fixture must be restored first. Record goodput separately for
    client-to-server, server-to-provider, and provider-to-origin, plus Transfer
    messages, frames/message, provider socket-read batches/windows, route-write
-   wait, timeout resends, exact payload, CPU, and allocated bytes.
+   wait, timeout resends, per-lane occupancy, exact payload, CPU, and allocated
+   bytes. Pin explicit H1 for this experiment; production Auto remains unchanged
+   because its Client settings can outlive an H1-to-H3 carrier transition.
 2. **Retained mobile profile.** Keep H1 receive 64 / 128 KiB and the 10-ms H1
    Pack handoff; keep every other Transfer/control count at 16, ACK handoff at
    1 ms, the packet-root gate at 1 MiB base / 2 MiB exact H1 ACK maximum, and

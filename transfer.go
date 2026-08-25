@@ -4581,6 +4581,11 @@ type SendSequence struct {
 	flowIsolation atomic.Bool
 	ackMutex      sync.Mutex
 	acks          chan receiveAckMessage
+	// ackWindow is the allocation-free cumulative/selective ACK coalescer shared
+	// by the normal ACK worker and the saturated-handoff fallback. Publishing it
+	// at construction lets a full compact channel fold progress into the same
+	// window instead of dropping an ACK and waiting for Transfer recovery.
+	ackWindow *sequenceAckWindow
 
 	resendQueue        *resendQueue
 	sendItems          []*sendItem
@@ -4717,6 +4722,7 @@ func newSendSequenceWithLogicalLane(
 		packs:                          make(chan *SendPack, sequenceBufferSize),
 		packAdmission:                  newSendPackAdmission(sequenceBufferSize),
 		acks:                           make(chan receiveAckMessage, ackBufferSize),
+		ackWindow:                      newSequenceAckWindow(),
 		resendQueue:                    newResendQueue(resendQueueBudget, resendQueueMinByteCount),
 		sendItems:                      []*sendItem{},
 		nextSequenceNumber:             0,
@@ -5151,6 +5157,17 @@ func (self *SendSequence) ackMessageDetailed(
 	default:
 	}
 
+	// The ACK worker already folds cumulative and selective progress into one
+	// allocation-free window. If its compact handoff channel is momentarily
+	// full, publish this ACK to that same window instead of dropping progress or
+	// retaining the carrier reader in a timed wait. Older queued cumulative ACKs
+	// can arrive afterward safely: sequenceAckWindow is monotonic and absorbs
+	// stale heads while preserving selective and contract-recovery state.
+	if self.ackWindow != nil && self.resendQueue != nil {
+		self.coalesceReceivedAck(self.ackWindow, ack)
+		return receiveAckHandoffAccepted, nil
+	}
+
 	if timeout < 0 {
 		select {
 		case <-self.ctx.Done():
@@ -5179,6 +5196,43 @@ func (self *SendSequence) ackMessageDetailed(
 			return receiveAckHandoffQueueWaitTimeout, nil
 		}
 	}
+}
+
+// coalesceReceivedAck performs the ACK worker's bounded validation and folds
+// one live ACK into the shared monotonic window. It is safe from either the
+// worker or a saturated receive callback: resendQueue and sequenceAckWindow
+// provide their own short critical sections, and all counters are atomic.
+func (self *SendSequence) coalesceReceivedAck(
+	ackWindow *sequenceAckWindow,
+	ack receiveAckMessage,
+) {
+	sequenceNumber, ok := self.resendQueue.ContainsMessageId(ack.messageId)
+	if !ok {
+		return
+	}
+	if self.sendBuffer != nil {
+		self.sendBuffer.observeLogicalLaneVersion(
+			self,
+			ack.logicalLaneVersion,
+		)
+	}
+	if ack.compactContractRecoverySupported && self.client != nil {
+		self.client.compactRecoveryAckCount.Add(1)
+	}
+	sequenceAck := sequenceAck{
+		messageId:                        ack.messageId,
+		sequenceNumber:                   sequenceNumber,
+		selective:                        ack.selective,
+		tag:                              ack.tag,
+		compactContractRecoverySupported: ack.compactContractRecoverySupported,
+	}
+	if ack.contractMissing {
+		sequenceAck.contractMissing = true
+		sequenceAck.missingContractId = ack.missingContractId
+		ackWindow.UpdateContractMissing(sequenceAck)
+		return
+	}
+	ackWindow.Update(sequenceAck)
 }
 
 // processLogicalGroupChunk materializes at most one transport-safe wire Pack.
@@ -5584,7 +5638,13 @@ func (self *SendSequence) Run() {
 
 	self.prewarmOpeningContract()
 
-	ackWindow := newSequenceAckWindow()
+	ackWindow := self.ackWindow
+	if ackWindow == nil {
+		// Directly constructed test sequences may predate constructor-owned ACK
+		// state. Keep their historical channel-only handoff semantics; production
+		// sequences publish the shared window before they are indexed.
+		ackWindow = newSequenceAckWindow()
+	}
 	ackWorkerStarted = true
 	go func() {
 		defer close(ackWorkerDone)
@@ -5599,31 +5659,7 @@ func (self *SendSequence) Run() {
 					if !ok {
 						return
 					}
-					if sequenceNumber, ok := self.resendQueue.ContainsMessageId(ack.messageId); ok {
-						if self.sendBuffer != nil {
-							self.sendBuffer.observeLogicalLaneVersion(
-								self,
-								ack.logicalLaneVersion,
-							)
-						}
-						if ack.compactContractRecoverySupported {
-							self.client.compactRecoveryAckCount.Add(1)
-						}
-						sequenceAck := sequenceAck{
-							messageId:                        ack.messageId,
-							sequenceNumber:                   sequenceNumber,
-							selective:                        ack.selective,
-							tag:                              ack.tag,
-							compactContractRecoverySupported: ack.compactContractRecoverySupported,
-						}
-						if ack.contractMissing {
-							sequenceAck.contractMissing = true
-							sequenceAck.missingContractId = ack.missingContractId
-							ackWindow.UpdateContractMissing(sequenceAck)
-							continue
-						}
-						ackWindow.Update(sequenceAck)
-					}
+					self.coalesceReceivedAck(ackWindow, ack)
 				}
 			}
 		}, self.cancel)

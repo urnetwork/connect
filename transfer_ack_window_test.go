@@ -60,6 +60,58 @@ func TestReceiveAckH1HandoffWaitRescuesFullCompactQueue(t *testing.T) {
 	}
 }
 
+func TestReceiveAckFullHandoffCoalescesWithoutWaitingOrAllocatingDepth(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sequenceId := NewId()
+	olderMessageId := NewId()
+	messageId := NewId()
+	ackWindow := newSequenceAckWindow()
+	resendQueue := newResendQueue(nil, 0)
+	resendQueue.Add(&sendItem{transferItem: transferItem{
+		messageId:        olderMessageId,
+		messageByteCount: 1,
+		sequenceNumber:   6,
+	}})
+	resendQueue.Add(&sendItem{transferItem: transferItem{
+		messageId:        messageId,
+		messageByteCount: 1,
+		sequenceNumber:   7,
+	}})
+	sequence := &SendSequence{
+		ctx:         ctx,
+		client:      &Client{},
+		sequenceId:  sequenceId,
+		acks:        make(chan receiveAckMessage, 1),
+		ackWindow:   ackWindow,
+		resendQueue: resendQueue,
+	}
+	sequence.acks <- receiveAckMessage{sequenceId: sequenceId, messageId: olderMessageId}
+
+	start := time.Now()
+	handoff, err := sequence.ackMessageDetailed(
+		receiveAckMessage{sequenceId: sequenceId, messageId: messageId},
+		200*time.Millisecond,
+	)
+	if err != nil || handoff != receiveAckHandoffAccepted {
+		t.Fatalf("coalesced ACK handoff = (%v, %v), want accepted", handoff, err)
+	}
+	if elapsed := time.Since(start); elapsed >= 100*time.Millisecond {
+		t.Fatalf("coalesced ACK handoff waited %s on a full channel", elapsed)
+	}
+	if len(sequence.acks) != 1 {
+		t.Fatalf("coalesced ACK changed compact queue depth to %d, want 1", len(sequence.acks))
+	}
+	// The worker may process the older queued cumulative ACK after the newer
+	// fallback update. The shared window must remain monotonic in that order.
+	sequence.coalesceReceivedAck(ackWindow, <-sequence.acks)
+	snapshot := ackWindow.Snapshot(true)
+	if snapshot.ackUpdateCount != 2 || snapshot.headAck.messageId != messageId ||
+		snapshot.headAck.sequenceNumber != 7 {
+		t.Fatalf("coalesced ACK snapshot = %+v", snapshot)
+	}
+}
+
 func TestReceiveAckHandoffClassifiesQueueFullAndMissingSequence(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
