@@ -1242,6 +1242,19 @@ func TestDecodedTransferFramePoolRetainedSizeStaysSmall(t *testing.T) {
 }
 
 func TestDecodedPackOwnerPoolRetentionIsBounded(t *testing.T) {
+	size := unsafe.Sizeof(decodedPackOwner{})
+	if size > uintptr(decodedPackOwnerQueueByteCount) {
+		t.Fatalf(
+			"decoded Pack owner size = %d, exceeds %d-byte receive-budget charge",
+			size,
+			decodedPackOwnerQueueByteCount,
+		)
+	}
+	t.Logf(
+		"decoded Pack owner=%d bytes; exact pool ceiling=%d bytes",
+		size,
+		uintptr(decodedPackOwnerPoolCapacity)*size,
+	)
 	pool := newDecodedPackOwnerPool()
 	for i := 0; i < decodedPackOwnerPoolCapacity+97; i++ {
 		pool.put(&decodedPackOwner{})

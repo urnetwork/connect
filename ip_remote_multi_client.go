@@ -1549,32 +1549,37 @@ type MultiClientMemorySnapshot struct {
 	// Aggregate existing per-Client Transfer counters without installing a
 	// packet observer. These distinguish a full receive/ACK handoff from
 	// upstream route variance in physical low-memory measurements.
-	PackHandoffDropCount       uint64
-	PackHandoffDropByteCount   uint64
-	PackHandoffWaitCount       uint64
-	PackHandoffWaitSuccess     uint64
-	PackHandoffMaxCount        uint64
-	PackHandoffMaxByteCount    uint64
-	AckHandoffDropCount        uint64
-	AckHandoffQueueFullCount   uint64
-	AckHandoffMissCount        uint64
-	AckHandoffWaitCount        uint64
-	AckHandoffWaitSuccess      uint64
-	AckRouteWriteCount         uint64
-	AckRoutePriorityWriteCount uint64
-	AckRouteWriteBlockedCount  uint64
-	AckRouteWriteErrorCount    uint64
-	AckRouteWriteWaitNanos     uint64
-	AckRouteWriteMaxWaitNanos  uint64
-	InitialWriteCount          uint64
-	InitialFrameCount          uint64
-	InitialMessageByteCount    uint64
-	TimeoutResendWriteCount    uint64
-	CarrierChangeWriteCount    uint64
-	SelectiveGapWriteCount     uint64
-	AckTailProbeWriteCount     uint64
-	CumulativeProbeWriteCount  uint64
-	RecoveryWriteErrorCount    uint64
+	PackHandoffDropCount            uint64
+	PackHandoffDropByteCount        uint64
+	PackHandoffWaitCount            uint64
+	PackHandoffWaitSuccess          uint64
+	PackHandoffMaxCount             uint64
+	PackHandoffMaxByteCount         uint64
+	PackHandoffSaturationCount      uint64
+	PackHandoffDepthGrowCount       uint64
+	PackHandoffDeepenedFlows        uint64
+	PackHandoffAdaptiveMaxDepth     uint64
+	PackHandoffAdaptiveMaxByteCount uint64
+	AckHandoffDropCount             uint64
+	AckHandoffQueueFullCount        uint64
+	AckHandoffMissCount             uint64
+	AckHandoffWaitCount             uint64
+	AckHandoffWaitSuccess           uint64
+	AckRouteWriteCount              uint64
+	AckRoutePriorityWriteCount      uint64
+	AckRouteWriteBlockedCount       uint64
+	AckRouteWriteErrorCount         uint64
+	AckRouteWriteWaitNanos          uint64
+	AckRouteWriteMaxWaitNanos       uint64
+	InitialWriteCount               uint64
+	InitialFrameCount               uint64
+	InitialMessageByteCount         uint64
+	TimeoutResendWriteCount         uint64
+	CarrierChangeWriteCount         uint64
+	SelectiveGapWriteCount          uint64
+	AckTailProbeWriteCount          uint64
+	CumulativeProbeWriteCount       uint64
+	RecoveryWriteErrorCount         uint64
 }
 
 func addMultiClientTransferMemorySnapshot(
@@ -1603,6 +1608,17 @@ func addMultiClientTransferMemorySnapshot(
 		snapshot.PackHandoffMaxByteCount = max(
 			snapshot.PackHandoffMaxByteCount,
 			receive.PackHandoffMaxByteCount,
+		)
+		snapshot.PackHandoffSaturationCount += receive.PackHandoffSaturationCount
+		snapshot.PackHandoffDepthGrowCount += receive.PackHandoffDepthGrowCount
+		snapshot.PackHandoffDeepenedFlows += receive.PackHandoffDeepenedFlows
+		snapshot.PackHandoffAdaptiveMaxDepth = max(
+			snapshot.PackHandoffAdaptiveMaxDepth,
+			receive.PackHandoffAdaptiveMaxDepth,
+		)
+		snapshot.PackHandoffAdaptiveMaxByteCount = max(
+			snapshot.PackHandoffAdaptiveMaxByteCount,
+			receive.PackHandoffAdaptiveMaxByteCount,
 		)
 		snapshot.AckHandoffDropCount += receive.AckHandoffDropCount
 		snapshot.AckHandoffQueueFullCount += receive.AckHandoffQueueFullCount

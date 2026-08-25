@@ -991,13 +991,24 @@ type ReceivePack struct {
 	MessageByteCount   ByteCount
 	TransferFrameBytes []byte
 	// sequenceQueueByteCount is owned by ReceiveSequence between successful
-	// Pack admission and channel dequeue. It is zero outside that interval.
+	// Pack admission and channel dequeue. It is the per-flow logical encoded
+	// byte charge and is zero outside that interval.
 	sequenceQueueByteCount ByteCount
+	// sequenceQueueBudgetByteCount is the independently selected aggregate
+	// charge. Opt-in diagnostics can use the retained allocation computed by
+	// receiveQueueByteCount; default mobile, desktop, and server paths retain
+	// encoded-byte accounting. It is released with sequenceQueueByteCount.
+	sequenceQueueBudgetByteCount ByteCount
 	// sequenceQueueBudget is the optional aggregate budget reservation paired
-	// with sequenceQueueByteCount. It is cleared at the same dequeue boundary.
+	// with sequenceQueueBudgetByteCount. It is cleared at the same dequeue
+	// boundary.
 	sequenceQueueBudget *TransferMemoryBudget
-	TransportType       TransportType
-	Ctx                 context.Context
+	// retainedQueueByteCount memoizes the allocation scan shared by handoff and
+	// reorder accounting. Zero means not computed; every live Pack has a
+	// positive charge.
+	retainedQueueByteCount ByteCount
+	TransportType          TransportType
+	Ctx                    context.Context
 	// Unwrapped is true when the inbound TransferFrame arrived as plaintext (no
 	// outer wrap). The ack for this pack (and any aggregated ack including it) is
 	// sent plaintext to mirror, so a peer whose cipher isn't up yet isn't handed
@@ -1016,7 +1027,7 @@ type ReceivePack struct {
 	EncryptionCompanion bool
 }
 
-// A decoded owner is 928 bytes on the measured arm64 mobile target. Charge a
+// A decoded owner is 968 bytes on the measured arm64 mobile target. Charge a
 // rounded KiB so the aggregate receive budget covers the pipeline envelope as
 // well as both pooled byte roots and remains conservative on other targets.
 const decodedPackOwnerQueueByteCount = ByteCount(1024)
@@ -1036,6 +1047,9 @@ func addReceiveQueueByteCount(total ByteCount, value ByteCount) ByteCount {
 func (self *ReceivePack) receiveQueueByteCount() ByteCount {
 	if self == nil {
 		return 0
+	}
+	if 0 < self.retainedQueueByteCount {
+		return self.retainedQueueByteCount
 	}
 	byteCount := MessagePoolRootByteCount(self.TransferFrameBytes)
 	if self.Pack != nil {
@@ -1057,7 +1071,8 @@ func (self *ReceivePack) receiveQueueByteCount() ByteCount {
 	if self.decodedOwner != nil {
 		byteCount = addReceiveQueueByteCount(byteCount, decodedPackOwnerQueueByteCount)
 	}
-	return max(byteCount, self.MessageByteCount)
+	self.retainedQueueByteCount = max(1, max(byteCount, self.MessageByteCount))
+	return self.retainedQueueByteCount
 }
 
 func (self *ReceivePack) messagePoolReturn() {
@@ -1246,23 +1261,28 @@ func (self *ClientSettings) MinimumMessageLenLimit() ByteCount {
 // application message bytes, not encoded carrier bytes. Counters are monotonic
 // for the lifetime of one Client.
 type ClientReceiveStatsSnapshot struct {
-	PackHandoffDropCount       uint64
-	PackHandoffDropByteCount   uint64
-	PackHandoffWaitCount       uint64
-	PackHandoffWaitSuccess     uint64
-	PackHandoffMaxCount        uint64
-	PackHandoffMaxByteCount    uint64
-	AckHandoffDropCount        uint64
-	AckHandoffQueueFullCount   uint64
-	AckHandoffMissCount        uint64
-	AckHandoffWaitCount        uint64
-	AckHandoffWaitSuccess      uint64
-	AckRouteWriteCount         uint64
-	AckRoutePriorityWriteCount uint64
-	AckRouteWriteBlockedCount  uint64
-	AckRouteWriteErrorCount    uint64
-	AckRouteWriteWaitDuration  time.Duration
-	AckRouteWriteMaxWait       time.Duration
+	PackHandoffDropCount            uint64
+	PackHandoffDropByteCount        uint64
+	PackHandoffWaitCount            uint64
+	PackHandoffWaitSuccess          uint64
+	PackHandoffMaxCount             uint64
+	PackHandoffMaxByteCount         uint64
+	PackHandoffSaturationCount      uint64
+	PackHandoffDepthGrowCount       uint64
+	PackHandoffDeepenedFlows        uint64
+	PackHandoffAdaptiveMaxDepth     uint64
+	PackHandoffAdaptiveMaxByteCount uint64
+	AckHandoffDropCount             uint64
+	AckHandoffQueueFullCount        uint64
+	AckHandoffMissCount             uint64
+	AckHandoffWaitCount             uint64
+	AckHandoffWaitSuccess           uint64
+	AckRouteWriteCount              uint64
+	AckRoutePriorityWriteCount      uint64
+	AckRouteWriteBlockedCount       uint64
+	AckRouteWriteErrorCount         uint64
+	AckRouteWriteWaitDuration       time.Duration
+	AckRouteWriteMaxWait            time.Duration
 }
 
 func updateAtomicMaximum(target *atomic.Uint64, value uint64) {
@@ -1337,50 +1357,55 @@ type Client struct {
 	// The shared receive pump remains nonblocking for H3/unknown. H1 may spend a
 	// separately configured bounded wait after a queue fills; primitive counters
 	// expose those rare waits and drops without a metrics handoff or hot log.
-	receivePackHandoffDropCount         atomic.Uint64
-	receivePackHandoffDropByteCount     atomic.Uint64
-	receivePackHandoffWaitCount         atomic.Uint64
-	receivePackHandoffWaitSuccess       atomic.Uint64
-	receivePackHandoffMaxCount          atomic.Uint64
-	receivePackHandoffMaxByteCount      atomic.Uint64
-	receiveAckHandoffDropCount          atomic.Uint64
-	receiveAckHandoffQueueFullCount     atomic.Uint64
-	receiveAckHandoffMissCount          atomic.Uint64
-	receiveAckHandoffWaitCount          atomic.Uint64
-	receiveAckHandoffWaitSuccess        atomic.Uint64
-	receiveAckRouteWriteCount           atomic.Uint64
-	receiveAckRoutePriorityWriteCount   atomic.Uint64
-	receiveAckRouteWriteBlockedCount    atomic.Uint64
-	receiveAckRouteWriteErrorCount      atomic.Uint64
-	receiveAckRouteWriteWaitNanoseconds atomic.Uint64
-	receiveAckRouteWriteMaxWaitNanos    atomic.Uint64
-	initialSendWriteCount               atomic.Uint64
-	initialSendFrameCount               atomic.Uint64
-	initialSendMessageByteCount         atomic.Uint64
-	selectiveGapWriteCount              atomic.Uint64
-	timeoutResendWriteCount             atomic.Uint64
-	carrierChangeWriteCount             atomic.Uint64
-	ackTailProbeWriteCount              atomic.Uint64
-	cumulativeProbeWriteCount           atomic.Uint64
-	recoveryWriteErrorCount             atomic.Uint64
-	missingContractWriteCount           atomic.Uint64
-	missingContractRequestCount         atomic.Uint64
-	compactRecoveryAckCount             atomic.Uint64
-	compactRecoveryContractCount        atomic.Uint64
-	unreliableFlowIsolationBypassCount  atomic.Uint64
-	unreliableNoAckAdmissionBypassCount atomic.Uint64
-	unreliableFlowReserveSelectionCount atomic.Uint64
-	unreliableFlowReserveUseCount       atomic.Uint64
-	unreliableFlightWaitCount           atomic.Uint64
-	unreliableFlightWaitNanoseconds     atomic.Uint64
-	unreliableFlightMaximumWaitNanos    atomic.Uint64
-	unreliableFlightGapCount            atomic.Uint64
-	unreliableFlightTimeoutCount        atomic.Uint64
-	unreliableFlightReductionCount      atomic.Uint64
-	unreliableFlightMaximumBytes        atomic.Uint64
-	unreliableFlightMaximumLimit        atomic.Uint64
-	unreliableFlightMaximumMessages     atomic.Uint64
-	unreliableFlightMaximumMessageLimit atomic.Uint64
+	receivePackHandoffDropCount            atomic.Uint64
+	receivePackHandoffDropByteCount        atomic.Uint64
+	receivePackHandoffWaitCount            atomic.Uint64
+	receivePackHandoffWaitSuccess          atomic.Uint64
+	receivePackHandoffMaxCount             atomic.Uint64
+	receivePackHandoffMaxByteCount         atomic.Uint64
+	receivePackHandoffSaturationCount      atomic.Uint64
+	receivePackHandoffDepthGrowCount       atomic.Uint64
+	receivePackHandoffDeepenedFlowCount    atomic.Uint64
+	receivePackHandoffAdaptiveMaxDepth     atomic.Uint64
+	receivePackHandoffAdaptiveMaxByteCount atomic.Uint64
+	receiveAckHandoffDropCount             atomic.Uint64
+	receiveAckHandoffQueueFullCount        atomic.Uint64
+	receiveAckHandoffMissCount             atomic.Uint64
+	receiveAckHandoffWaitCount             atomic.Uint64
+	receiveAckHandoffWaitSuccess           atomic.Uint64
+	receiveAckRouteWriteCount              atomic.Uint64
+	receiveAckRoutePriorityWriteCount      atomic.Uint64
+	receiveAckRouteWriteBlockedCount       atomic.Uint64
+	receiveAckRouteWriteErrorCount         atomic.Uint64
+	receiveAckRouteWriteWaitNanoseconds    atomic.Uint64
+	receiveAckRouteWriteMaxWaitNanos       atomic.Uint64
+	initialSendWriteCount                  atomic.Uint64
+	initialSendFrameCount                  atomic.Uint64
+	initialSendMessageByteCount            atomic.Uint64
+	selectiveGapWriteCount                 atomic.Uint64
+	timeoutResendWriteCount                atomic.Uint64
+	carrierChangeWriteCount                atomic.Uint64
+	ackTailProbeWriteCount                 atomic.Uint64
+	cumulativeProbeWriteCount              atomic.Uint64
+	recoveryWriteErrorCount                atomic.Uint64
+	missingContractWriteCount              atomic.Uint64
+	missingContractRequestCount            atomic.Uint64
+	compactRecoveryAckCount                atomic.Uint64
+	compactRecoveryContractCount           atomic.Uint64
+	unreliableFlowIsolationBypassCount     atomic.Uint64
+	unreliableNoAckAdmissionBypassCount    atomic.Uint64
+	unreliableFlowReserveSelectionCount    atomic.Uint64
+	unreliableFlowReserveUseCount          atomic.Uint64
+	unreliableFlightWaitCount              atomic.Uint64
+	unreliableFlightWaitNanoseconds        atomic.Uint64
+	unreliableFlightMaximumWaitNanos       atomic.Uint64
+	unreliableFlightGapCount               atomic.Uint64
+	unreliableFlightTimeoutCount           atomic.Uint64
+	unreliableFlightReductionCount         atomic.Uint64
+	unreliableFlightMaximumBytes           atomic.Uint64
+	unreliableFlightMaximumLimit           atomic.Uint64
+	unreliableFlightMaximumMessages        atomic.Uint64
+	unreliableFlightMaximumMessageLimit    atomic.Uint64
 
 	routeManager             *RouteManager
 	contractManager          *ContractManager
@@ -1658,21 +1683,26 @@ func (self *Client) ClientTag() string {
 // message counts are consistent-enough telemetry rather than a transaction.
 func (self *Client) ReceiveStats() ClientReceiveStatsSnapshot {
 	return ClientReceiveStatsSnapshot{
-		PackHandoffDropCount:       self.receivePackHandoffDropCount.Load(),
-		PackHandoffDropByteCount:   self.receivePackHandoffDropByteCount.Load(),
-		PackHandoffWaitCount:       self.receivePackHandoffWaitCount.Load(),
-		PackHandoffWaitSuccess:     self.receivePackHandoffWaitSuccess.Load(),
-		PackHandoffMaxCount:        self.receivePackHandoffMaxCount.Load(),
-		PackHandoffMaxByteCount:    self.receivePackHandoffMaxByteCount.Load(),
-		AckHandoffDropCount:        self.receiveAckHandoffDropCount.Load(),
-		AckHandoffQueueFullCount:   self.receiveAckHandoffQueueFullCount.Load(),
-		AckHandoffMissCount:        self.receiveAckHandoffMissCount.Load(),
-		AckHandoffWaitCount:        self.receiveAckHandoffWaitCount.Load(),
-		AckHandoffWaitSuccess:      self.receiveAckHandoffWaitSuccess.Load(),
-		AckRouteWriteCount:         self.receiveAckRouteWriteCount.Load(),
-		AckRoutePriorityWriteCount: self.receiveAckRoutePriorityWriteCount.Load(),
-		AckRouteWriteBlockedCount:  self.receiveAckRouteWriteBlockedCount.Load(),
-		AckRouteWriteErrorCount:    self.receiveAckRouteWriteErrorCount.Load(),
+		PackHandoffDropCount:            self.receivePackHandoffDropCount.Load(),
+		PackHandoffDropByteCount:        self.receivePackHandoffDropByteCount.Load(),
+		PackHandoffWaitCount:            self.receivePackHandoffWaitCount.Load(),
+		PackHandoffWaitSuccess:          self.receivePackHandoffWaitSuccess.Load(),
+		PackHandoffMaxCount:             self.receivePackHandoffMaxCount.Load(),
+		PackHandoffMaxByteCount:         self.receivePackHandoffMaxByteCount.Load(),
+		PackHandoffSaturationCount:      self.receivePackHandoffSaturationCount.Load(),
+		PackHandoffDepthGrowCount:       self.receivePackHandoffDepthGrowCount.Load(),
+		PackHandoffDeepenedFlows:        self.receivePackHandoffDeepenedFlowCount.Load(),
+		PackHandoffAdaptiveMaxDepth:     self.receivePackHandoffAdaptiveMaxDepth.Load(),
+		PackHandoffAdaptiveMaxByteCount: self.receivePackHandoffAdaptiveMaxByteCount.Load(),
+		AckHandoffDropCount:             self.receiveAckHandoffDropCount.Load(),
+		AckHandoffQueueFullCount:        self.receiveAckHandoffQueueFullCount.Load(),
+		AckHandoffMissCount:             self.receiveAckHandoffMissCount.Load(),
+		AckHandoffWaitCount:             self.receiveAckHandoffWaitCount.Load(),
+		AckHandoffWaitSuccess:           self.receiveAckHandoffWaitSuccess.Load(),
+		AckRouteWriteCount:              self.receiveAckRouteWriteCount.Load(),
+		AckRoutePriorityWriteCount:      self.receiveAckRoutePriorityWriteCount.Load(),
+		AckRouteWriteBlockedCount:       self.receiveAckRouteWriteBlockedCount.Load(),
+		AckRouteWriteErrorCount:         self.receiveAckRouteWriteErrorCount.Load(),
 		AckRouteWriteWaitDuration: time.Duration(
 			self.receiveAckRouteWriteWaitNanoseconds.Load(),
 		),
@@ -7745,6 +7775,30 @@ type ReceiveBufferSettings struct {
 	// Pack enforces the carrier-specific limit so H3 cannot consume H1's memory
 	// spend. Encoded bytes remain independently bounded below.
 	H1SequenceBufferSize int
+	// H1SequenceBufferAdaptiveMaxSize optionally lets a continuously saturated
+	// reliable H1 flow deepen beyond H1SequenceBufferSize. The channel reserves
+	// pointer slots up to this hard maximum, while Pack ownership is admitted
+	// incrementally and remains subject to the unchanged byte limits and shared
+	// PackQueueBudget. Nonpositive or <= H1SequenceBufferSize disables growth.
+	H1SequenceBufferAdaptiveMaxSize int
+	// H1SequenceBufferAdaptiveStepSize is the number of slots granted per
+	// qualifying saturation epoch. Nonpositive disables growth.
+	H1SequenceBufferAdaptiveStepSize int
+	// H1SequenceBufferAdaptiveSaturationThreshold is the number of distinct
+	// full-queue Pack calls required before one step is granted.
+	H1SequenceBufferAdaptiveSaturationThreshold int
+	// H1SequenceBufferAdaptiveSaturationWindow bounds the elapsed time between
+	// qualifying full-queue calls. A later episode starts a new streak.
+	// Nonpositive disables growth.
+	H1SequenceBufferAdaptiveSaturationWindow time.Duration
+	// H1SequenceBufferAdaptiveMaxByteCount is the maximum logical encoded-byte
+	// allowance earned alongside adaptive H1 count depth. The shared exact
+	// retained-allocation budget remains the hard device-wide memory bound.
+	// Nonpositive or <= H1SequenceBufferByteCount keeps the byte limit fixed.
+	H1SequenceBufferAdaptiveMaxByteCount ByteCount
+	// H1SequenceBufferAdaptiveStepByteCount is the logical byte allowance
+	// granted with each qualifying count step. Nonpositive keeps bytes fixed.
+	H1SequenceBufferAdaptiveStepByteCount ByteCount
 	// SequenceBufferByteCount bounds encoded TransferFrame bytes waiting in
 	// one ReceiveSequence handoff channel. Nonpositive values retain legacy
 	// count-only behavior for explicitly constructed settings.
@@ -7759,6 +7813,12 @@ type ReceiveBufferSettings struct {
 	// and byte limits still preserve local fairness; this aggregate prevents a
 	// large flow fan-out from multiplying those independent burst allowances.
 	PackQueueBudget *TransferMemoryBudget
+	// PackQueueRetainedByteAccounting charges PackQueueBudget for pooled outer
+	// and decoded message roots plus the decoded-owner envelope. The per-flow
+	// SequenceBufferByteCount limits remain encoded logical bytes. This is an
+	// opt-in diagnostic; default mobile, desktop, and server paths avoid the
+	// extra scan.
+	PackQueueRetainedByteAccounting bool
 	// H1PackHandoffTimeout applies bounded reader backpressure only after an
 	// H1 ReceiveSequence handoff is full. Zero preserves nonblocking loss;
 	// H3 and unknown carriers always remain nonblocking at the Client reader.
@@ -7813,6 +7873,7 @@ type ReceiveBufferSettings struct {
 	afterRunReceiveSequenceForTest     func(receiveSequenceId)
 	beforeAckCompressWaitForTest       func(receiveSequenceId)
 	afterAckWriteForTest               func(receiveSequenceId)
+	h1SaturationNowForTest             func() time.Time
 	beforeAckWorkerStopForTest         func(receiveSequenceId)
 	afterAckWriterOpenForTest          func(receiveSequenceId, MultiRouteWriter)
 	afterAckWritesCanceledForTest      func(receiveSequenceId)
@@ -8403,9 +8464,18 @@ type ReceiveSequence struct {
 	// H1 may use a larger reliable-carrier burst allowance than H3/unknown
 	// without widening every mobile sequence queue. Producers are serialized by
 	// packMutex; the worker decrements the atomic count as soon as it dequeues.
-	packQueueCount     atomic.Int64
-	packQueueBaseLimit int64
-	packQueueH1Limit   int64
+	packQueueCount                  atomic.Int64
+	packQueueBaseLimit              int64
+	packQueueH1Limit                int64
+	packQueueH1AdaptiveMaxLimit     int64
+	packQueueH1AdaptiveStep         int64
+	packQueueH1SaturationThreshold  int
+	packQueueH1SaturationWindow     time.Duration
+	packQueueH1AdaptiveMaxByteLimit ByteCount
+	packQueueH1AdaptiveByteStep     ByteCount
+	packQueueH1SaturationStreak     int
+	packQueueH1LastSaturationTime   time.Time
+	packQueueH1Deepened             bool
 	// Producers are serialized by packMutex, while the worker releases bytes
 	// after a channel receive. The atomic keeps this byte budget independent of
 	// the zero-wait channel admission operation.
@@ -8543,11 +8613,46 @@ func newReceiveSequenceWithLogicalLaneBudget(
 		h1SequenceBufferSize,
 		transferKey.LogicalLane,
 	)
+	h1SequenceBufferAdaptiveMaxSize := h1SequenceBufferSize
+	h1SequenceBufferAdaptiveStepSize := 0
+	h1SequenceBufferAdaptiveSaturationThreshold := 0
+	h1SequenceBufferAdaptiveSaturationWindow := time.Duration(0)
+	if h1SequenceBufferSize > 0 &&
+		receiveBufferSettings.H1SequenceBufferAdaptiveMaxSize > 0 &&
+		receiveBufferSettings.H1SequenceBufferAdaptiveStepSize > 0 &&
+		receiveBufferSettings.H1SequenceBufferAdaptiveSaturationThreshold > 0 &&
+		receiveBufferSettings.H1SequenceBufferAdaptiveSaturationWindow > 0 {
+		configuredMax := logicalLaneSequenceBufferSize(
+			receiveBufferSettings.H1SequenceBufferAdaptiveMaxSize,
+			transferKey.LogicalLane,
+		)
+		if h1SequenceBufferSize < configuredMax {
+			h1SequenceBufferAdaptiveMaxSize = configuredMax
+			h1SequenceBufferAdaptiveStepSize = logicalLaneSequenceBufferSize(
+				receiveBufferSettings.H1SequenceBufferAdaptiveStepSize,
+				transferKey.LogicalLane,
+			)
+			h1SequenceBufferAdaptiveSaturationThreshold =
+				receiveBufferSettings.H1SequenceBufferAdaptiveSaturationThreshold
+			h1SequenceBufferAdaptiveSaturationWindow =
+				receiveBufferSettings.H1SequenceBufferAdaptiveSaturationWindow
+		}
+	}
 	h1SequenceBufferByteCount := receiveBufferSettings.H1SequenceBufferByteCount
 	if h1SequenceBufferByteCount <= 0 {
 		h1SequenceBufferByteCount = receiveBufferSettings.SequenceBufferByteCount
 	}
-	channelBufferSize := max(sequenceBufferSize, h1SequenceBufferSize)
+	h1SequenceBufferAdaptiveMaxByteCount := h1SequenceBufferByteCount
+	h1SequenceBufferAdaptiveStepByteCount := ByteCount(0)
+	if h1SequenceBufferAdaptiveMaxSize > h1SequenceBufferSize &&
+		receiveBufferSettings.H1SequenceBufferAdaptiveMaxByteCount > h1SequenceBufferByteCount &&
+		receiveBufferSettings.H1SequenceBufferAdaptiveStepByteCount > 0 {
+		h1SequenceBufferAdaptiveMaxByteCount =
+			receiveBufferSettings.H1SequenceBufferAdaptiveMaxByteCount
+		h1SequenceBufferAdaptiveStepByteCount =
+			receiveBufferSettings.H1SequenceBufferAdaptiveStepByteCount
+	}
+	channelBufferSize := max(sequenceBufferSize, h1SequenceBufferAdaptiveMaxSize)
 	receiveQueueBudget := receiveBufferSettings.ReceiveQueueBudget
 	receiveQueueMinByteCount := receiveBufferSettings.ReceiveQueueMinByteCount
 	if transferKey.LogicalLane != 0 {
@@ -8558,30 +8663,36 @@ func newReceiveSequenceWithLogicalLaneBudget(
 	}
 	source = source.LocalMask()
 	seq := &ReceiveSequence{
-		ctx:                    cancelCtx,
-		cancel:                 cancel,
-		done:                   make(chan struct{}),
-		client:                 client,
-		log:                    client.log,
-		source:                 source,
-		sequenceId:             sequenceId,
-		transferKey:            transferKey,
-		encryptionRole:         encryptionRole,
-		encryptionCompanion:    transferKey.EncryptionCompanion,
-		receiveBufferSettings:  receiveBufferSettings,
-		openReceiveContracts:   map[Id]*sequenceContract{},
-		receiveContract:        nil,
-		packs:                  make(chan *ReceivePack, channelBufferSize),
-		packQueueBaseLimit:     int64(sequenceBufferSize),
-		packQueueH1Limit:       int64(h1SequenceBufferSize),
-		packQueueBaseByteLimit: receiveBufferSettings.SequenceBufferByteCount,
-		packQueueH1ByteLimit:   h1SequenceBufferByteCount,
-		packQueueSpace:         make(chan struct{}, 1),
-		receiveQueue:           newReceiveQueue(receiveQueueBudget, receiveQueueMinByteCount),
-		nextSequenceNumber:     0,
-		idleCondition:          NewIdleCondition(),
-		ackWindow:              newSequenceAckWindow(),
-		exit:                   make(chan struct{}),
+		ctx:                             cancelCtx,
+		cancel:                          cancel,
+		done:                            make(chan struct{}),
+		client:                          client,
+		log:                             client.log,
+		source:                          source,
+		sequenceId:                      sequenceId,
+		transferKey:                     transferKey,
+		encryptionRole:                  encryptionRole,
+		encryptionCompanion:             transferKey.EncryptionCompanion,
+		receiveBufferSettings:           receiveBufferSettings,
+		openReceiveContracts:            map[Id]*sequenceContract{},
+		receiveContract:                 nil,
+		packs:                           make(chan *ReceivePack, channelBufferSize),
+		packQueueBaseLimit:              int64(sequenceBufferSize),
+		packQueueH1Limit:                int64(h1SequenceBufferSize),
+		packQueueH1AdaptiveMaxLimit:     int64(h1SequenceBufferAdaptiveMaxSize),
+		packQueueH1AdaptiveStep:         int64(h1SequenceBufferAdaptiveStepSize),
+		packQueueH1SaturationThreshold:  h1SequenceBufferAdaptiveSaturationThreshold,
+		packQueueH1SaturationWindow:     h1SequenceBufferAdaptiveSaturationWindow,
+		packQueueH1AdaptiveMaxByteLimit: h1SequenceBufferAdaptiveMaxByteCount,
+		packQueueH1AdaptiveByteStep:     h1SequenceBufferAdaptiveStepByteCount,
+		packQueueBaseByteLimit:          receiveBufferSettings.SequenceBufferByteCount,
+		packQueueH1ByteLimit:            h1SequenceBufferByteCount,
+		packQueueSpace:                  make(chan struct{}, 1),
+		receiveQueue:                    newReceiveQueue(receiveQueueBudget, receiveQueueMinByteCount),
+		nextSequenceNumber:              0,
+		idleCondition:                   NewIdleCondition(),
+		ackWindow:                       newSequenceAckWindow(),
+		exit:                            make(chan struct{}),
 	}
 	// Never encrypt control-plane traffic. A ReceiveSequence's data source is
 	// the peer (source.SourceId) and its destination is always this client
@@ -8618,6 +8729,96 @@ func (self *ReceiveSequence) ReceiveQueueSizeAndMessageTypes() (int, ByteCount, 
 	return count, byteSize, messageTypes
 }
 
+// tryDeepenH1PackQueue grants one bounded count and/or logical-byte step only
+// after distinct Pack calls repeatedly observe a full H1 queue without a
+// substantial drain. It does not reserve message memory: the resulting
+// per-flow limits and exact shared Pack budget still decide the subsequent
+// admission.
+func (self *ReceiveSequence) tryDeepenH1PackQueue(
+	currentCount int64,
+	currentByteCount ByteCount,
+	byteCount ByteCount,
+	budgetByteCount ByteCount,
+	saturationRecorded *bool,
+) bool {
+	if *saturationRecorded {
+		return false
+	}
+	*saturationRecorded = true
+	self.client.receivePackHandoffSaturationCount.Add(1)
+
+	threshold := self.packQueueH1SaturationThreshold
+	if threshold <= 0 ||
+		(self.packQueueH1AdaptiveMaxLimit <= self.packQueueH1Limit &&
+			self.packQueueH1AdaptiveMaxByteLimit <= self.packQueueH1ByteLimit) {
+		return false
+	}
+	now := time.Now()
+	if nowForTest := self.receiveBufferSettings.h1SaturationNowForTest; nowForTest != nil {
+		now = nowForTest()
+	}
+	if elapsed := now.Sub(self.packQueueH1LastSaturationTime); self.packQueueH1LastSaturationTime.IsZero() ||
+		elapsed < 0 || self.packQueueH1SaturationWindow < elapsed {
+		self.packQueueH1SaturationStreak = 0
+	}
+	self.packQueueH1LastSaturationTime = now
+	if self.packQueueH1SaturationStreak < threshold {
+		self.packQueueH1SaturationStreak++
+	}
+	if self.packQueueH1SaturationStreak < threshold {
+		return false
+	}
+
+	previousLimit := self.packQueueH1Limit
+	nextLimit := min(
+		self.packQueueH1AdaptiveMaxLimit,
+		previousLimit+self.packQueueH1AdaptiveStep,
+	)
+	previousByteLimit := self.packQueueH1ByteLimit
+	nextByteLimit := previousByteLimit
+	if 0 < self.packQueueH1AdaptiveByteStep &&
+		previousByteLimit < self.packQueueH1AdaptiveMaxByteLimit {
+		nextByteLimit = min(
+			self.packQueueH1AdaptiveMaxByteLimit,
+			previousByteLimit+self.packQueueH1AdaptiveByteStep,
+		)
+	}
+	if nextLimit <= previousLimit && nextByteLimit <= previousByteLimit {
+		return false
+	}
+	// Earning a limit allocates no Pack ownership, but require the next step to
+	// admit the packet that demonstrated saturation. This avoids recording a
+	// useless count increase when a fixed logical byte cap is the real bound.
+	if 0 < nextLimit && nextLimit <= currentCount {
+		return false
+	}
+	if 0 < nextByteLimit && currentByteCount != 0 &&
+		(currentByteCount > nextByteLimit || nextByteLimit-currentByteCount < byteCount) {
+		return false
+	}
+	if budget := self.receiveBufferSettings.PackQueueBudget; budget != nil &&
+		budget.Available() < budgetByteCount {
+		return false
+	}
+	self.packQueueH1Limit = nextLimit
+	self.packQueueH1ByteLimit = nextByteLimit
+	self.packQueueH1SaturationStreak = 0
+	self.client.receivePackHandoffDepthGrowCount.Add(1)
+	if !self.packQueueH1Deepened {
+		self.packQueueH1Deepened = true
+		self.client.receivePackHandoffDeepenedFlowCount.Add(1)
+	}
+	updateAtomicMaximum(
+		&self.client.receivePackHandoffAdaptiveMaxDepth,
+		uint64(nextLimit),
+	)
+	updateAtomicMaximum(
+		&self.client.receivePackHandoffAdaptiveMaxByteCount,
+		uint64(nextByteLimit),
+	)
+	return true
+}
+
 // success, error
 func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duration) (bool, error) {
 	self.packMutex.Lock()
@@ -8634,10 +8835,17 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 	}
 	defer self.idleCondition.UpdateClose()
 
+	h1SaturationRecorded := false
+	packQueueBudget := self.receiveBufferSettings.PackQueueBudget
 	reserve := func() bool {
 		byteCount := ByteCount(len(receivePack.TransferFrameBytes))
 		if byteCount <= 0 {
 			byteCount = max(1, receivePack.MessageByteCount)
+		}
+		budgetByteCount := byteCount
+		if packQueueBudget != nil &&
+			self.receiveBufferSettings.PackQueueRetainedByteAccounting {
+			budgetByteCount = receivePack.receiveQueueByteCount()
 		}
 		countLimit := self.packQueueBaseLimit
 		if receivePack.TransportType == TransportTypeH1 {
@@ -8649,6 +8857,17 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 			// A nonpositive count retains the legacy unbuffered/synchronous
 			// behavior: channel readiness, rather than this reservation, decides.
 			if 0 < countLimit && countLimit <= current {
+				if receivePack.TransportType == TransportTypeH1 &&
+					self.tryDeepenH1PackQueue(
+						current,
+						self.packQueueByteCount.Load(),
+						byteCount,
+						budgetByteCount,
+						&h1SaturationRecorded,
+					) {
+					countLimit = self.packQueueH1Limit
+					continue
+				}
 				return false
 			}
 			if self.packQueueCount.CompareAndSwap(current, current+1) {
@@ -8665,12 +8884,22 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 			// One oversized message may enter an empty queue so a configured
 			// byte limit cannot deadlock progress.
 			if 0 < byteLimit && current != 0 && byteLimit-current < byteCount {
+				if receivePack.TransportType == TransportTypeH1 &&
+					self.tryDeepenH1PackQueue(
+						self.packQueueCount.Load(),
+						current,
+						byteCount,
+						budgetByteCount,
+						&h1SaturationRecorded,
+					) {
+					byteLimit = self.packQueueH1ByteLimit
+					continue
+				}
 				self.packQueueCount.Add(-1)
 				return false
 			}
 			if self.packQueueByteCount.CompareAndSwap(current, current+byteCount) {
-				budget := self.receiveBufferSettings.PackQueueBudget
-				if budget != nil && !budget.TryReserve(byteCount) {
+				if packQueueBudget != nil && !packQueueBudget.TryReserve(budgetByteCount) {
 					if remaining := self.packQueueByteCount.Add(-byteCount); remaining < 0 {
 						panic("negative receive sequence handoff byte count")
 					}
@@ -8680,7 +8909,10 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 					return false
 				}
 				receivePack.sequenceQueueByteCount = byteCount
-				receivePack.sequenceQueueBudget = budget
+				if packQueueBudget != nil {
+					receivePack.sequenceQueueBudgetByteCount = budgetByteCount
+					receivePack.sequenceQueueBudget = packQueueBudget
+				}
 				updateAtomicMaximum(&self.client.receivePackHandoffMaxCount, uint64(count))
 				updateAtomicMaximum(
 					&self.client.receivePackHandoffMaxByteCount,
@@ -8770,7 +9002,9 @@ func (self *ReceiveSequence) releasePackQueue(receivePack *ReceivePack) {
 	budget := receivePack.sequenceQueueBudget
 	receivePack.sequenceQueueBudget = nil
 	if budget != nil {
-		budget.Release(byteCount)
+		budgetByteCount := receivePack.sequenceQueueBudgetByteCount
+		receivePack.sequenceQueueBudgetByteCount = 0
+		budget.Release(budgetByteCount)
 	}
 	if remaining := self.packQueueByteCount.Add(-byteCount); remaining < 0 {
 		panic("negative receive sequence handoff byte count")

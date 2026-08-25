@@ -1270,6 +1270,405 @@ func TestReceiveSequenceH1HandoffUsesCarrierSpecificByteLimit(t *testing.T) {
 	}
 }
 
+func TestReceiveSequenceH1HandoffDeepensAfterContinuousSaturation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultReceiveBufferSettingsWithBufferSize(2)
+	settings.H1SequenceBufferSize = 2
+	settings.H1SequenceBufferAdaptiveMaxSize = 6
+	settings.H1SequenceBufferAdaptiveStepSize = 2
+	settings.H1SequenceBufferAdaptiveSaturationThreshold = 2
+	settings.H1SequenceBufferAdaptiveSaturationWindow = time.Hour
+	settings.SequenceBufferByteCount = 1024
+	settings.H1SequenceBufferByteCount = 1024
+	settings.H1SequenceBufferAdaptiveMaxByteCount = 2048
+	settings.H1SequenceBufferAdaptiveStepByteCount = 512
+	client := &Client{}
+	sequence := newReceiveSequence(
+		ctx,
+		client,
+		SourceId(NewId()),
+		NewId(),
+		TransferKey{},
+		settings,
+	)
+	defer sequence.Close()
+	if got := cap(sequence.packs); got != 6 {
+		t.Fatalf("adaptive channel hard capacity = %d, want 6", got)
+	}
+	if got := sequence.packQueueH1Limit; got != 2 {
+		t.Fatalf("adaptive initial depth = %d, want 2", got)
+	}
+
+	newPack := func() *ReceivePack {
+		return &ReceivePack{
+			MessageByteCount:   40,
+			TransferFrameBytes: MessagePoolGet(40),
+			TransportType:      TransportTypeH1,
+		}
+	}
+	queued := make([]*ReceivePack, 0, 6)
+	admit := func() *ReceivePack {
+		pack := newPack()
+		accepted, err := sequence.Pack(pack, 0)
+		if !accepted || err != nil {
+			pack.messagePoolReturn()
+			t.Fatalf("adaptive admission: accepted=%t err=%v", accepted, err)
+		}
+		queued = append(queued, pack)
+		return pack
+	}
+	reject := func() {
+		pack := newPack()
+		accepted, err := sequence.Pack(pack, 0)
+		pack.messagePoolReturn()
+		if accepted || err != nil {
+			t.Fatalf("adaptive saturation: accepted=%t err=%v", accepted, err)
+		}
+	}
+	drainOne := func() {
+		pack := <-sequence.packs
+		sequence.releasePackQueue(pack)
+		pack.messagePoolReturn()
+		queued = queued[1:]
+	}
+
+	admit()
+	admit()
+	reject() // first full episode: retain depth 2
+	if got := sequence.packQueueH1Limit; got != 2 {
+		t.Fatalf("depth after first saturation = %d, want 2", got)
+	}
+	drainOne()
+	admit() // the next full episode remains inside the continuity window
+	admit() // second full episode grants 2 -> 4 and admits this Pack
+	if got := sequence.packQueueH1Limit; got != 4 {
+		t.Fatalf("depth after second saturation = %d, want 4", got)
+	}
+	admit()
+	reject()
+	drainOne()
+	admit()
+	admit() // second sustained episode at four grants 4 -> 6
+	if got := sequence.packQueueH1Limit; got != 6 {
+		t.Fatalf("depth after fourth saturation = %d, want 6", got)
+	}
+	if got := sequence.packQueueH1ByteLimit; got != 2048 {
+		t.Fatalf("byte depth after fourth saturation = %d, want 2048", got)
+	}
+
+	stats := client.ReceiveStats()
+	if stats.PackHandoffSaturationCount != 4 ||
+		stats.PackHandoffDepthGrowCount != 2 ||
+		stats.PackHandoffDeepenedFlows != 1 ||
+		stats.PackHandoffAdaptiveMaxDepth != 6 ||
+		stats.PackHandoffAdaptiveMaxByteCount != 2048 {
+		t.Fatalf("adaptive handoff stats = %+v", stats)
+	}
+	for len(queued) > 0 {
+		drainOne()
+	}
+}
+
+func TestReceiveSequenceH1HandoffDeepensWhenLogicalBytesSaturateFirst(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultReceiveBufferSettingsWithBufferSize(4)
+	settings.H1SequenceBufferSize = 4
+	settings.H1SequenceBufferAdaptiveMaxSize = 5
+	settings.H1SequenceBufferAdaptiveStepSize = 1
+	settings.H1SequenceBufferAdaptiveSaturationThreshold = 1
+	settings.H1SequenceBufferAdaptiveSaturationWindow = time.Hour
+	settings.SequenceBufferByteCount = 80
+	settings.H1SequenceBufferByteCount = 80
+	settings.H1SequenceBufferAdaptiveMaxByteCount = 160
+	settings.H1SequenceBufferAdaptiveStepByteCount = 40
+	client := &Client{}
+	sequence := newReceiveSequence(
+		ctx,
+		client,
+		SourceId(NewId()),
+		NewId(),
+		TransferKey{},
+		settings,
+	)
+	defer sequence.Close()
+	newPack := func() *ReceivePack {
+		return &ReceivePack{
+			MessageByteCount:   40,
+			TransferFrameBytes: MessagePoolGet(40),
+			TransportType:      TransportTypeH1,
+		}
+	}
+	for range 4 {
+		pack := newPack()
+		if accepted, err := sequence.Pack(pack, 0); !accepted || err != nil {
+			pack.messagePoolReturn()
+			t.Fatalf("byte-saturated adaptive admission: accepted=%t err=%v", accepted, err)
+		}
+	}
+	if sequence.packQueueH1Limit != 5 || sequence.packQueueH1ByteLimit != 160 {
+		t.Fatalf(
+			"byte-saturated adaptive limits = %d/%d, want 5/160",
+			sequence.packQueueH1Limit,
+			sequence.packQueueH1ByteLimit,
+		)
+	}
+	stats := client.ReceiveStats()
+	if stats.PackHandoffSaturationCount != 2 ||
+		stats.PackHandoffDepthGrowCount != 2 ||
+		stats.PackHandoffAdaptiveMaxDepth != 5 ||
+		stats.PackHandoffAdaptiveMaxByteCount != 160 {
+		t.Fatalf("byte-saturated adaptive stats = %+v", stats)
+	}
+	for range 4 {
+		pack := <-sequence.packs
+		sequence.releasePackQueue(pack)
+		pack.messagePoolReturn()
+	}
+}
+
+func TestReceiveSequenceH1HandoffDeepeningExpiresAndExcludesH3(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultReceiveBufferSettingsWithBufferSize(2)
+	settings.H1SequenceBufferSize = 2
+	settings.H1SequenceBufferAdaptiveMaxSize = 4
+	settings.H1SequenceBufferAdaptiveStepSize = 2
+	settings.H1SequenceBufferAdaptiveSaturationThreshold = 2
+	settings.H1SequenceBufferAdaptiveSaturationWindow = 100 * time.Millisecond
+	now := time.Unix(1, 0)
+	settings.h1SaturationNowForTest = func() time.Time { return now }
+	settings.SequenceBufferByteCount = 1024
+	settings.H1SequenceBufferByteCount = 1024
+	client := &Client{}
+	sequence := newReceiveSequence(
+		ctx,
+		client,
+		SourceId(NewId()),
+		NewId(),
+		TransferKey{},
+		settings,
+	)
+	defer sequence.Close()
+	newPack := func(transportType TransportType) *ReceivePack {
+		return &ReceivePack{
+			MessageByteCount:   40,
+			TransferFrameBytes: MessagePoolGet(40),
+			TransportType:      transportType,
+		}
+	}
+	admit := func(transportType TransportType) {
+		pack := newPack(transportType)
+		if accepted, err := sequence.Pack(pack, 0); !accepted || err != nil {
+			pack.messagePoolReturn()
+			t.Fatalf("admit %v: accepted=%t err=%v", transportType, accepted, err)
+		}
+	}
+	reject := func(transportType TransportType) {
+		pack := newPack(transportType)
+		accepted, err := sequence.Pack(pack, 0)
+		pack.messagePoolReturn()
+		if accepted || err != nil {
+			t.Fatalf("reject %v: accepted=%t err=%v", transportType, accepted, err)
+		}
+	}
+	drain := func(count int) {
+		for range count {
+			pack := <-sequence.packs
+			sequence.releasePackQueue(pack)
+			pack.messagePoolReturn()
+		}
+	}
+
+	admit(TransportTypeH1)
+	admit(TransportTypeH1)
+	reject(TransportTypeH1) // one saturation toward the threshold
+	drain(2)
+	now = now.Add(200 * time.Millisecond) // outside the continuity window
+	admit(TransportTypeH1)
+	admit(TransportTypeH1)
+	reject(TransportTypeH1)
+	if got := sequence.packQueueH1Limit; got != 2 {
+		t.Fatalf("depth grew across expired saturation episodes: %d", got)
+	}
+	drain(2)
+
+	admit(TransportTypeH3)
+	admit(TransportTypeH3)
+	reject(TransportTypeH3)
+	if got := sequence.packQueueH1Limit; got != 2 {
+		t.Fatalf("H3 saturation changed H1 adaptive depth to %d", got)
+	}
+	stats := client.ReceiveStats()
+	if stats.PackHandoffSaturationCount != 2 ||
+		stats.PackHandoffDepthGrowCount != 0 {
+		t.Fatalf("drain/H3 adaptive stats = %+v", stats)
+	}
+	drain(2)
+}
+
+func TestReceiveSequenceH1HandoffDeepeningRequiresCountAndMemoryHeadroom(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		byteLimit ByteCount
+		budget    *TransferMemoryBudget
+	}{
+		{name: "per-flow-byte-limit", byteLimit: 80},
+		{name: "shared-budget", byteLimit: 1024, budget: NewTransferMemoryBudget(80)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			settings := DefaultReceiveBufferSettingsWithBufferSize(2)
+			settings.H1SequenceBufferSize = 2
+			settings.H1SequenceBufferAdaptiveMaxSize = 4
+			settings.H1SequenceBufferAdaptiveStepSize = 2
+			settings.H1SequenceBufferAdaptiveSaturationThreshold = 1
+			settings.H1SequenceBufferAdaptiveSaturationWindow = time.Hour
+			settings.SequenceBufferByteCount = test.byteLimit
+			settings.H1SequenceBufferByteCount = test.byteLimit
+			settings.PackQueueBudget = test.budget
+			client := &Client{}
+			sequence := newReceiveSequence(
+				ctx,
+				client,
+				SourceId(NewId()),
+				NewId(),
+				TransferKey{},
+				settings,
+			)
+			defer sequence.Close()
+			newPack := func() *ReceivePack {
+				return &ReceivePack{
+					MessageByteCount:   40,
+					TransferFrameBytes: MessagePoolGet(40),
+					TransportType:      TransportTypeH1,
+				}
+			}
+			for range 2 {
+				pack := newPack()
+				if accepted, err := sequence.Pack(pack, 0); !accepted || err != nil {
+					t.Fatalf("fill bounded queue: accepted=%t err=%v", accepted, err)
+				}
+			}
+			overflow := newPack()
+			accepted, err := sequence.Pack(overflow, 0)
+			overflow.messagePoolReturn()
+			if accepted || err != nil {
+				t.Fatalf("memory-bound adaptive overflow: accepted=%t err=%v", accepted, err)
+			}
+			if got := sequence.packQueueH1Limit; got != 2 {
+				t.Fatalf("memory-bound adaptive depth = %d, want 2", got)
+			}
+			if stats := client.ReceiveStats(); stats.PackHandoffSaturationCount != 1 ||
+				stats.PackHandoffDepthGrowCount != 0 {
+				t.Fatalf("memory-bound adaptive stats = %+v", stats)
+			}
+			for range 2 {
+				pack := <-sequence.packs
+				sequence.releasePackQueue(pack)
+				pack.messagePoolReturn()
+			}
+		})
+	}
+}
+
+func TestReceiveSequencePackBudgetCanChargeRetainedAllocation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	budget := NewTransferMemoryBudget(500)
+	settings := DefaultReceiveBufferSettingsWithBufferSize(4)
+	settings.SequenceBufferByteCount = 1024
+	settings.H1SequenceBufferByteCount = 1024
+	settings.PackQueueBudget = budget
+	settings.PackQueueRetainedByteAccounting = true
+	sequence := newReceiveSequence(
+		ctx,
+		&Client{},
+		SourceId(NewId()),
+		NewId(),
+		TransferKey{},
+		settings,
+	)
+	defer sequence.Close()
+	newPack := func() *ReceivePack {
+		return &ReceivePack{
+			MessageByteCount:   40,
+			TransferFrameBytes: MessagePoolGet(40),
+			TransportType:      TransportTypeH1,
+		}
+	}
+	first := newPack()
+	second := newPack()
+	if accepted, err := sequence.Pack(first, 0); !accepted || err != nil {
+		t.Fatalf("first retained-budget Pack: accepted=%t err=%v", accepted, err)
+	}
+	if got := budget.UsedByteCount(); got != 256 {
+		t.Fatalf("retained Pack budget used = %d, want 256", got)
+	}
+	if got := sequence.packQueueByteCount.Load(); got != 40 {
+		t.Fatalf("logical per-flow Pack bytes = %d, want 40", got)
+	}
+	if accepted, err := sequence.Pack(second, 0); accepted || err != nil {
+		t.Fatalf("retained aggregate overflow: accepted=%t err=%v", accepted, err)
+	}
+	second.messagePoolReturn()
+	dequeued := <-sequence.packs
+	sequence.releasePackQueue(dequeued)
+	dequeued.messagePoolReturn()
+	if got := budget.UsedByteCount(); got != 0 {
+		t.Fatalf("retained Pack budget after release = %d, want 0", got)
+	}
+}
+
+func BenchmarkReceiveSequenceH1AdaptiveHandoffUncontended(b *testing.B) {
+	for _, adaptive := range []bool{false, true} {
+		name := "fixed"
+		if adaptive {
+			name = "adaptive"
+		}
+		b.Run(name, func(b *testing.B) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			settings := DefaultReceiveBufferSettingsWithBufferSize(64)
+			settings.H1SequenceBufferSize = 64
+			settings.SequenceBufferByteCount = 128 * 1024
+			settings.H1SequenceBufferByteCount = 128 * 1024
+			if adaptive {
+				settings.H1SequenceBufferAdaptiveMaxSize = 128
+				settings.H1SequenceBufferAdaptiveStepSize = 16
+				settings.H1SequenceBufferAdaptiveSaturationThreshold = 2
+				settings.H1SequenceBufferAdaptiveSaturationWindow = 100 * time.Millisecond
+			}
+			sequence := newReceiveSequence(
+				ctx,
+				&Client{},
+				SourceId(NewId()),
+				NewId(),
+				TransferKey{},
+				settings,
+			)
+			defer sequence.Close()
+			pack := &ReceivePack{
+				MessageByteCount:   64,
+				TransferFrameBytes: make([]byte, 64),
+				TransportType:      TransportTypeH1,
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				accepted, err := sequence.Pack(pack, 0)
+				if !accepted || err != nil {
+					b.Fatalf("uncontended Pack: accepted=%t err=%v", accepted, err)
+				}
+				dequeued := <-sequence.packs
+				sequence.releasePackQueue(dequeued)
+			}
+		})
+	}
+}
+
 func TestReceiveSequenceH1HandoffWaitRescuesFullQueue(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

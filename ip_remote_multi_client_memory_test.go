@@ -10,6 +10,11 @@ func TestMultiClientMemorySnapshotIsPrimitiveAndAllocationFree(t *testing.T) {
 	qualityTransferClient.receivePackHandoffDropByteCount.Store(2200)
 	qualityTransferClient.receivePackHandoffMaxCount.Store(4)
 	qualityTransferClient.receivePackHandoffMaxByteCount.Store(4400)
+	qualityTransferClient.receivePackHandoffSaturationCount.Store(17)
+	qualityTransferClient.receivePackHandoffDepthGrowCount.Store(2)
+	qualityTransferClient.receivePackHandoffDeepenedFlowCount.Store(1)
+	qualityTransferClient.receivePackHandoffAdaptiveMaxDepth.Store(80)
+	qualityTransferClient.receivePackHandoffAdaptiveMaxByteCount.Store(160 * 1024)
 	qualityTransferClient.receiveAckHandoffDropCount.Store(3)
 	qualityTransferClient.receiveAckHandoffQueueFullCount.Store(5)
 	qualityTransferClient.receiveAckHandoffMissCount.Store(7)
@@ -34,6 +39,11 @@ func TestMultiClientMemorySnapshotIsPrimitiveAndAllocationFree(t *testing.T) {
 	speedTransferClient.receivePackHandoffDropByteCount.Store(14300)
 	speedTransferClient.receivePackHandoffMaxCount.Store(9)
 	speedTransferClient.receivePackHandoffMaxByteCount.Store(9900)
+	speedTransferClient.receivePackHandoffSaturationCount.Store(19)
+	speedTransferClient.receivePackHandoffDepthGrowCount.Store(3)
+	speedTransferClient.receivePackHandoffDeepenedFlowCount.Store(2)
+	speedTransferClient.receivePackHandoffAdaptiveMaxDepth.Store(96)
+	speedTransferClient.receivePackHandoffAdaptiveMaxByteCount.Store(192 * 1024)
 	speedTransferClient.receiveAckHandoffDropCount.Store(17)
 	speedTransferClient.receiveAckHandoffQueueFullCount.Store(19)
 	speedTransferClient.receiveAckHandoffMissCount.Store(23)
@@ -77,6 +87,11 @@ func TestMultiClientMemorySnapshotIsPrimitiveAndAllocationFree(t *testing.T) {
 		snapshot.PackHandoffDropByteCount != 16500 ||
 		snapshot.PackHandoffMaxCount != 9 ||
 		snapshot.PackHandoffMaxByteCount != 9900 ||
+		snapshot.PackHandoffSaturationCount != 36 ||
+		snapshot.PackHandoffDepthGrowCount != 5 ||
+		snapshot.PackHandoffDeepenedFlows != 3 ||
+		snapshot.PackHandoffAdaptiveMaxDepth != 96 ||
+		snapshot.PackHandoffAdaptiveMaxByteCount != 192*1024 ||
 		snapshot.AckHandoffDropCount != 20 ||
 		snapshot.AckHandoffQueueFullCount != 24 ||
 		snapshot.AckHandoffMissCount != 30 ||

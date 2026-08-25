@@ -564,7 +564,7 @@ const (
 	// Free objects, not in-flight objects. 256 covers the parallel receive
 	// width of the production-shaped provider kernel (166 owners created in
 	// the exact profile) while bounding retained protocol + pipeline state to
-	// roughly 232 KiB (928 bytes/owner on arm64). The previous 1024 x 536-byte
+	// roughly 242 KiB (968 bytes/owner on arm64). The previous 1024 x 536-byte
 	// protocol-only cache had a ~536 KiB worst retained bound and still
 	// allocated separate ReceivePack/receiveItem envelopes.
 	decodedPackOwnerPoolCapacity = 256
