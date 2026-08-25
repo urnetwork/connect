@@ -172,12 +172,21 @@ func TestLocalUserNatSendPacketBatchConsumesAllPackets(t *testing.T) {
 	if acceptedCount != len(acceptedPackets) {
 		t.Fatalf("accepted count = %d, want %d", acceptedCount, len(acceptedPackets))
 	}
+	acceptedFirst := acceptedPackets[0]
+	acceptedPackets[0] = nil
 	queued := <-localUserNat.sendPackets
 	if len(queued.packets) != len(acceptedPackets) {
 		t.Fatalf("queued packet count = %d, want %d", len(queued.packets), len(acceptedPackets))
 	}
+	if queued.packets[0] == nil || &queued.packets[0][0] != &acceptedFirst[0] {
+		t.Fatal("queued packet list aliases caller slice metadata")
+	}
 	for packetIndex, packet := range queued.packets {
-		if &packet[0] != &acceptedPackets[packetIndex][0] {
+		wantPacket := acceptedPackets[packetIndex]
+		if packetIndex == 0 {
+			wantPacket = acceptedFirst
+		}
+		if &packet[0] != &wantPacket[0] {
 			t.Fatalf("queued packet %d is not the exact input", packetIndex)
 		}
 		MessagePoolReturn(packet)

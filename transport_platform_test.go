@@ -82,6 +82,7 @@ type testingPlatformServer struct {
 
 	connectCount  atomic.Int64
 	emptyMessages atomic.Int64
+	dataMessages  atomic.Int64
 	rejecting     atomic.Bool
 
 	stateLock sync.Mutex
@@ -120,6 +121,8 @@ func newTestingPlatformServer(t *testing.T) *testingPlatformServer {
 			}
 			if len(message) == 0 {
 				platform.emptyMessages.Add(1)
+			} else {
+				platform.dataMessages.Add(1)
 			}
 		}
 	}))
@@ -226,6 +229,222 @@ func TestPlatformTransportConnectsAndElects(t *testing.T) {
 	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
 		mode, _ := transport.activeMode()
 		t.Fatalf("active mode = %q, want h1: the connected transport was never elected", mode)
+	}
+}
+
+func TestPlatformWebSocketAckAndPacketBurstsCoalesce(t *testing.T) {
+	prioritySend := make(chan []byte, platformWebSocketWriteBatchMaxMessages)
+	ordinarySend := make(chan []byte, 3)
+	for index := range cap(prioritySend) {
+		prioritySend <- []byte{byte(index)}
+	}
+	for index := range cap(ordinarySend) {
+		ordinarySend <- []byte{byte(0x80 + index)}
+	}
+
+	// The first ACK has already started this physical batch. Prove that two
+	// complete subsequent ACK bursts and their ordinary turns remain in it:
+	// 7 ACKs, packet, 8 ACKs, packet, 8 ACKs, packet. (The first ACK makes the
+	// initial burst eight.)
+	priorityMessageCount := 1
+	var selection []bool
+	for len(selection) < 7+1+8+1+8+1 {
+		message, priority, sendOpen, ready :=
+			platformWebSocketWriteBatchNextReady(
+				prioritySend,
+				ordinarySend,
+				priorityMessageCount,
+			)
+		if !ready || !sendOpen || len(message) != 1 {
+			t.Fatalf(
+				"selection %d = (%v, %t, %t, %t)",
+				len(selection),
+				message,
+				priority,
+				sendOpen,
+				ready,
+			)
+		}
+		selection = append(selection, priority)
+		if priority {
+			priorityMessageCount++
+		} else {
+			priorityMessageCount = 0
+		}
+	}
+	wantPriority := func(index int) bool {
+		return index < 7 ||
+			(8 <= index && index < 16) ||
+			(17 <= index && index < 25)
+	}
+	for index, priority := range selection {
+		if priority != wantPriority(index) {
+			t.Fatalf("selection %d priority = %t, want %t; sequence = %v", index, priority, wantPriority(index), selection)
+		}
+	}
+	if len(prioritySend) == 0 {
+		t.Fatal("bounded ACK bursts consumed the entire continuously ready lane")
+	}
+
+	// With ordinary traffic absent, the ready ACK lane continues draining even
+	// after its quantum instead of turning the quantum into a flush boundary.
+	message, priority, sendOpen, ready :=
+		platformWebSocketWriteBatchNextReady(
+			prioritySend,
+			ordinarySend,
+			platformWebSocketAckPriorityBurstMaxMessages,
+		)
+	if len(message) != 1 || !priority || !sendOpen || !ready {
+		t.Fatalf("priority-only ready drain = (%v, %t, %t, %t)", message, priority, sendOpen, ready)
+	}
+
+	// The inverse is also a burst: with no ACK ready, ordinary packets drain
+	// consecutively into the same bulk write.
+	packetBurst := make(chan []byte, 3)
+	for index := range cap(packetBurst) {
+		packetBurst <- []byte{byte(index)}
+	}
+	for index := range cap(packetBurst) {
+		message, priority, sendOpen, ready =
+			platformWebSocketWriteBatchNextReady(nil, packetBurst, 0)
+		if len(message) != 1 || priority || !sendOpen || !ready {
+			t.Fatalf("ordinary burst slot %d = (%v, %t, %t, %t)", index, message, priority, sendOpen, ready)
+		}
+	}
+}
+
+func BenchmarkPlatformWebSocketAckPacketReadyDrain(b *testing.B) {
+	prioritySend := make(chan []byte, platformWebSocketWriteBatchMaxMessages)
+	ordinarySend := make(chan []byte, platformWebSocketWriteBatchMaxMessages)
+	priorityMessage := []byte{1}
+	ordinaryMessage := []byte{2}
+
+	b.ReportAllocs()
+	b.ReportMetric(platformWebSocketWriteBatchMaxMessages, "frames/batch")
+	for b.Loop() {
+		// Together with the already-selected first ACK, this fills one exact
+		// production batch with three ordinary turns and repeated ACK bursts.
+		for range platformWebSocketWriteBatchMaxMessages - 4 {
+			prioritySend <- priorityMessage
+		}
+		for range 3 {
+			ordinarySend <- ordinaryMessage
+		}
+		priorityMessageCount := 1
+		for range platformWebSocketWriteBatchMaxMessages - 1 {
+			_, priority, sendOpen, ready :=
+				platformWebSocketWriteBatchNextReady(
+					prioritySend,
+					ordinarySend,
+					priorityMessageCount,
+				)
+			if !ready || !sendOpen {
+				b.Fatal("ready mixed batch ended early")
+			}
+			if priority {
+				priorityMessageCount++
+			} else {
+				priorityMessageCount = 0
+			}
+		}
+	}
+}
+
+func BenchmarkPlatformWebSocketOrdinaryReadyDrain(b *testing.B) {
+	ordinarySend := make(chan []byte, platformWebSocketWriteBatchMaxMessages)
+	ordinaryMessage := []byte{2}
+
+	b.ReportAllocs()
+	b.ReportMetric(platformWebSocketWriteBatchMaxMessages, "frames/batch")
+	for b.Loop() {
+		for range platformWebSocketWriteBatchMaxMessages - 1 {
+			ordinarySend <- ordinaryMessage
+		}
+		for range platformWebSocketWriteBatchMaxMessages - 1 {
+			_, priority, sendOpen, ready :=
+				platformWebSocketWriteBatchNextReady(nil, ordinarySend, 0)
+			if !ready || !sendOpen || priority {
+				b.Fatal("ready ordinary batch ended early")
+			}
+		}
+	}
+}
+
+func TestPlatformTransportOptionalH1AckPriorityLaneWritesAndUnregisters(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	platform := newTestingPlatformServer(t)
+	settings := testingPlatformTransportSettings()
+	settings.H1AckPriorityBufferSize = 8
+	connectedRoute := make(chan Route, 1)
+	settings.SendRouteObserver = func(_ Transport, route Route, connected bool) {
+		if connected {
+			select {
+			case connectedRoute <- route:
+			default:
+			}
+		}
+	}
+	transport := testingPlatformTransport(t, ctx, platform.url, settings)
+	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+		t.Fatal("the H1 transport was never elected")
+	}
+
+	var route Route
+	select {
+	case route = <-connectedRoute:
+	case <-time.After(time.Second):
+		t.Fatal("H1 send route was not observed")
+	}
+	priorityRoute, ok := h1AckPriorityRoute(route)
+	if !ok || cap(priorityRoute) != settings.H1AckPriorityBufferSize {
+		t.Fatalf("priority route = (%v, %t), want capacity %d", priorityRoute, ok, settings.H1AckPriorityBufferSize)
+	}
+	message := MessagePoolGet(64)
+	priorityRoute <- message
+	if !waitForCondition(time.Second, func() bool {
+		return 0 < platform.dataMessages.Load()
+	}) {
+		t.Fatal("H1 writer did not drain the ACK priority lane")
+	}
+
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), time.Second)
+	defer closeCancel()
+	if err := transport.CloseAndWait(closeCtx); err != nil {
+		t.Fatalf("close H1 priority transport: %v", err)
+	}
+	if _, ok := h1AckPriorityRoute(route); ok {
+		t.Fatal("H1 ACK priority route remained registered after transport close")
+	}
+}
+
+func TestPlatformTransportDefaultDoesNotRegisterH1AckPriorityLane(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	platform := newTestingPlatformServer(t)
+	settings := testingPlatformTransportSettings()
+	connectedRoute := make(chan Route, 1)
+	settings.SendRouteObserver = func(_ Transport, route Route, connected bool) {
+		if connected {
+			select {
+			case connectedRoute <- route:
+			default:
+			}
+		}
+	}
+	transport := testingPlatformTransport(t, ctx, platform.url, settings)
+	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+		t.Fatal("the H1 transport was never elected")
+	}
+	select {
+	case route := <-connectedRoute:
+		if _, ok := h1AckPriorityRoute(route); ok {
+			t.Fatal("default/server transport unexpectedly registered an ACK priority lane")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("H1 send route was not observed")
 	}
 }
 

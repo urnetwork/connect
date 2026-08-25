@@ -838,9 +838,9 @@ func TestRemoteUserNatProviderReturnV1RetriesRejectedSocketPacket(t *testing.T) 
 	}
 }
 
-// A keyed no-contract return batch must use SendMulti while preserving the
-// received force-stream, role, and session independently of contract policy,
-// while retaining TCP recovery ownership for every frame in the batch.
+// A keyed no-contract return batch must remain one logical group while
+// preserving the received force-stream, role, and session independently of
+// contract policy, and retaining TCP recovery ownership for every frame.
 func TestRemoteUserNatProviderReturnBatchPreservesTransferKey(t *testing.T) {
 	provider, client, _ := newProviderTransferKeyTestFixture(t)
 	peerId := NewId()
@@ -894,8 +894,14 @@ func TestRemoteUserNatProviderReturnBatchPreservesTransferKey(t *testing.T) {
 	)
 	queued := waitProviderReturnTestPack(t, sequence)
 	defer queued.returnFrames()
-	if queued.Frame != nil || len(queued.Frames) != len(responses) {
-		t.Fatalf("provider batch shape = (%p,%d), want (nil,%d)", queued.Frame, len(queued.Frames), len(responses))
+	if queued.Frame != nil || !queued.logicalGroup || len(queued.Frames) != len(responses) {
+		t.Fatalf(
+			"provider batch shape = (%p,logical=%t,%d), want (nil,true,%d)",
+			queued.Frame,
+			queued.logicalGroup,
+			len(queued.Frames),
+			len(responses),
+		)
 	}
 	for frameIndex, frame := range queued.Frames {
 		if !frame.Raw {
@@ -921,6 +927,79 @@ func TestRemoteUserNatProviderReturnBatchPreservesTransferKey(t *testing.T) {
 			queued.EncryptionRole,
 			queued.EncryptionCompanion,
 		)
+	}
+}
+
+// Contract-bearing socket drains must enter the same logical group path. The
+// selected SendSequence, not this callback, owns carrier-safe chunking and
+// contract-envelope boundaries; falling back to one Pack per packet would
+// silently restore H1's download-direction framing and ACK amplification.
+func TestRemoteUserNatProviderReturnBatchGroupsContractBearingDrain(t *testing.T) {
+	provider, client, _ := newProviderTransferKeyTestFixture(t)
+	peerId := NewId()
+	source := SourceId(peerId)
+	transferKey := TransferKey{
+		ForceStream:         true,
+		EncryptionRole:      protocol.SequenceRole_SequenceRoleServer,
+		EncryptionCompanion: false,
+	}
+	sequence := installProviderReturnTestSequence(t, provider, client, sendSequenceId{
+		Destination:       peerId,
+		CompanionContract: true,
+		ForceStream:       true,
+		EncryptionRole:    sequenceTlsRoleServer,
+	})
+	responses := [][]byte{
+		craftSecurityPacket(
+			IpProtocolTcp,
+			net.ParseIP("203.0.113.11"),
+			443,
+			net.ParseIP("10.0.0.12"),
+			43001,
+			false,
+			[]byte{1},
+		),
+		craftSecurityPacket(
+			IpProtocolTcp,
+			net.ParseIP("203.0.113.11"),
+			443,
+			net.ParseIP("10.0.0.12"),
+			43001,
+			false,
+			[]byte{2},
+		),
+	}
+	responsePath, err := ParseIpPath(responses[0])
+	if err != nil {
+		t.Fatalf("parse contract-bearing provider return batch: %v", err)
+	}
+
+	provider.receiveTransferBatch(
+		source,
+		transferKey,
+		protocol.ProvideMode_Public,
+		responsePath,
+		responses,
+	)
+	queued := waitProviderReturnTestPack(t, sequence)
+	defer queued.returnFrames()
+	if queued.Frame != nil || !queued.logicalGroup || len(queued.Frames) != len(responses) {
+		t.Fatalf(
+			"contract-bearing provider batch shape=(%p,logical=%t,%d), want (nil,true,%d)",
+			queued.Frame,
+			queued.logicalGroup,
+			len(queued.Frames),
+			len(responses),
+		)
+	}
+	for frameIndex, frame := range queued.Frames {
+		packetBytes, decodeErr := ipPacketFromProviderBytes(frame)
+		if decodeErr != nil {
+			t.Fatalf("decode contract-bearing provider frame %d: %v", frameIndex, decodeErr)
+		}
+		if !bytes.Equal(packetBytes, responses[frameIndex]) {
+			t.Fatalf("contract-bearing provider frame %d changed or reordered", frameIndex)
+		}
 	}
 }
 
@@ -1029,8 +1108,14 @@ func TestRemoteUserNatProviderReturnV1RetriesRejectedSocketBatch(t *testing.T) {
 			queued.returnFrames()
 		}
 	}()
-	if queued.Frame != nil || len(queued.Frames) != len(expectedResponses) {
-		t.Fatalf("retried provider v1 batch shape=(%p,%d), want (nil,%d)", queued.Frame, len(queued.Frames), len(expectedResponses))
+	if queued.Frame != nil || !queued.logicalGroup || len(queued.Frames) != len(expectedResponses) {
+		t.Fatalf(
+			"retried provider v1 batch shape=(%p,logical=%t,%d), want (nil,true,%d)",
+			queued.Frame,
+			queued.logicalGroup,
+			len(queued.Frames),
+			len(expectedResponses),
+		)
 	}
 	for frameIndex, frame := range queued.Frames {
 		if frame.Raw {

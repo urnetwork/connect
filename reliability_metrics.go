@@ -131,12 +131,12 @@ type reliabilityMetrics struct {
 	// postponed while a hold was in effect. This package only defines them --
 	// the verdict-gating work that increments them lands separately, and
 	// defining the counters first means that work ships already measured.
-	verdictsHeldUplinkStale   atomic.Uint64
+	verdictsHeldUplinkStale atomic.Uint64
 	// verdictsHeldSharedFate counts destructive verdicts held because enough
 	// DISTINCT exits developed silence/stall evidence inside one short window
 	// that the common cause is overwhelmingly the shared path (the phone's
 	// access network), not that many independent providers died at once.
-	verdictsHeldSharedFate atomic.Uint64
+	verdictsHeldSharedFate    atomic.Uint64
 	verdictsHeldTransportDown atomic.Uint64
 	removalsDeferred          atomic.Uint64
 
@@ -150,8 +150,8 @@ type reliabilityMetrics struct {
 	// change reached for when it wanted to act on one. The gap between
 	// probesSent and probesAnswered is available to anyone who wants the drop
 	// rate for tuning; nothing attributes it.
-	probesSent         atomic.Uint64
-	probesAnswered     atomic.Uint64
+	probesSent     atomic.Uint64
+	probesAnswered atomic.Uint64
 
 	// the shared-fate evidence ring: which exits have CURRENT silence/stall
 	// evidence, deduplicated by exit and pruned to the configured window on
@@ -159,7 +159,7 @@ type reliabilityMetrics struct {
 	// never on a packet path.
 	sharedFateLock      sync.Mutex
 	sharedFateEvidences map[Id]time.Time
-	providersQualified atomic.Uint64
+	providersQualified  atomic.Uint64
 
 	// the busy-flow liveness probe (see busyLivenessProbe). busyProbesSent
 	// counts probes that reached the wire against a stalled exit;

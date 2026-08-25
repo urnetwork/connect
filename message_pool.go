@@ -39,10 +39,14 @@ const debugTags = false
 
 // [8 byte id][1 byte tag][1 byte flags][2 byte ref count]
 const MessagePoolMetaByteCount = 12
-const MessagePoolFlagShared = uint8(0x01)
+const (
+	MessagePoolFlagShared          = uint8(0x01)
+	messagePoolFlagDeviceTunEgress = uint8(0x02)
+)
 
-// InitialMessagePoolByteCount is the initial total free-list byte budget,
-// split evenly across the pool size classes (see ResizeMessagePools)
+// InitialMessagePoolByteCount is the initial total free-list byte budget. One
+// third backs the small/full packet classes and two thirds backs the two large
+// protocol-frame classes (see orderedMessagePools and ResizeMessagePools).
 var InitialMessagePoolByteCount = mib(2)
 
 const (
@@ -56,14 +60,22 @@ const (
 )
 
 type messagePoolShard struct {
-	stateLock    sync.Mutex
-	pool         [][]byte
-	count        int
-	maxCount     int
-	takenTags    [256]uint64
-	returnedTags [256]uint64
-	createdTags  [256]uint64
-	nextId       uint64
+	stateLock sync.Mutex
+	pool      [][]byte
+	count     int
+	maxCount  int
+	// outstanding is mobile root ownership, independent of the resettable
+	// diagnostic tag counters. Mobile builds maintain it inside the Get/Return
+	// lock already held by the hot path; server builds compile those writes out.
+	outstanding uint64
+	// Device TUN egress is a subset of packet-root ownership. It is marked by
+	// the SDK after acquisition and follows the root through read-only shares,
+	// allowing mobile ACK admission to ignore unrelated inbound packet roots.
+	deviceTunEgressOutstanding uint64
+	takenTags                  [256]uint64
+	returnedTags               [256]uint64
+	createdTags                [256]uint64
+	nextId                     uint64
 }
 
 type messagePool struct {
@@ -122,11 +134,12 @@ func (self *messagePool) capacity() int {
 }
 
 type messagePoolSnapshot struct {
-	capacity     int
-	retained     int
-	takenTags    [256]uint64
-	returnedTags [256]uint64
-	createdTags  [256]uint64
+	capacity                   int
+	retained                   int
+	deviceTunEgressOutstanding uint64
+	takenTags                  [256]uint64
+	returnedTags               [256]uint64
+	createdTags                [256]uint64
 }
 
 // snapshot locks shards in index order and copies the whole class in one
@@ -148,6 +161,7 @@ func (self *messagePool) snapshot() messagePoolSnapshot {
 		shard := &self.shards[shardIndex]
 		snapshot.capacity += shard.maxCount
 		snapshot.retained += shard.count
+		snapshot.deviceTunEgressOutstanding += shard.deviceTunEgressOutstanding
 		for tag := range 256 {
 			snapshot.takenTags[tag] += shard.takenTags[tag]
 			snapshot.returnedTags[tag] += shard.returnedTags[tag]
@@ -274,6 +288,9 @@ func (self *messagePool) take(n int, tag uint8) []byte {
 			shard.createdTags[tag] += 1
 		}
 		shard.takenTags[tag] += 1
+		if messagePoolTrackPacketOutstanding && isPacketPoolSize(self.size) {
+			shard.outstanding += 1
+		}
 		poolMessage[self.size+8] = tag
 		poolMessage[self.size+9] = 0
 		binary.BigEndian.PutUint16(poolMessage[self.size+10:], 1)
@@ -288,6 +305,9 @@ func (self *messagePool) take(n int, tag uint8) []byte {
 	id := shard.nextId<<messagePoolShardBits | uint64(shardIndex)
 	shard.createdTags[tag] += 1
 	shard.takenTags[tag] += 1
+	if messagePoolTrackPacketOutstanding && isPacketPoolSize(self.size) {
+		shard.outstanding += 1
+	}
 	shard.stateLock.Unlock()
 
 	poolMessage := make([]byte, self.size+MessagePoolMetaByteCount)
@@ -319,10 +339,21 @@ func (self *messagePool) release(poolMessage []byte) bool {
 		return false
 	}
 
+	flags := poolMessage[self.size+9]
 	poolMessage[self.size+8] = 0
 	poolMessage[self.size+9] = 0
 	binary.BigEndian.PutUint16(poolMessage[self.size+10:], 0)
 	shard.returnedTags[tag] += 1
+	if messagePoolTrackPacketOutstanding && isPacketPoolSize(self.size) {
+		shard.outstanding -= 1
+	}
+	if flags&messagePoolFlagDeviceTunEgress != 0 {
+		if shard.deviceTunEgressOutstanding == 0 {
+			shard.stateLock.Unlock()
+			panic("negative device TUN egress packet ownership")
+		}
+		shard.deviceTunEgressOutstanding -= 1
+	}
 	if shard.count < len(shard.pool) {
 		// The payload does not need to be zeroed.
 		shard.pool[shard.count] = poolMessage
@@ -338,14 +369,44 @@ func (self *messagePool) release(poolMessage []byte) bool {
 	return true
 }
 
-// the packet class, sized to hold a device mtu packet (see `DefaultMtu`)
-// plus headers. the first (smallest) size class.
-const packetPoolSize = 2048
+const (
+	// The small packet/control class fits ordinary IPv4/IPv6 TCP ACKs,
+	// including TCP options, without making every 40--100 byte ACK retain a
+	// 2-KiB packet root. It is also useful for the compact Transfer ACK and
+	// other control frames selected by the generic MessagePoolGet path.
+	smallPacketPoolSize = 256
+	// The full packet class is sized to hold a device MTU packet (see
+	// `DefaultMtu`) plus headers.
+	packetPoolSize = 2048
+
+	// Keep the packet classes within the historical packet-byte budget. One
+	// quarter is ample for thousands of small ACK/control roots while the
+	// remaining three quarters preserve the full-MTU working set.
+	smallPacketPoolBudgetDivisor = 4
+)
+
+func isPacketPoolSize(poolSize int) bool {
+	return poolSize == smallPacketPoolSize || poolSize == packetPoolSize
+}
+
+func splitPacketPoolByteCount(byteCount ByteCount) (small ByteCount, full ByteCount) {
+	byteCount = max(0, byteCount)
+	small = byteCount / smallPacketPoolBudgetDivisor
+	return small, byteCount - small
+}
 
 // free list retention floors preserve a working reuse set on the hot paths
 // even under a tiny budget. there is no in-flight cap here; `Get` always
 // allocates on an empty list, so a zeroed class costs reuse, not liveness.
-const packetPoolFloorCount = 128
+const packetPoolFloorByteCount = 256 * 1024
+
+func packetPoolFloorCount(poolSize int) int {
+	smallBytes, fullBytes := splitPacketPoolByteCount(packetPoolFloorByteCount)
+	if poolSize == smallPacketPoolSize {
+		return int(smallBytes) / poolSize
+	}
+	return int(fullBytes) / poolSize
+}
 
 // Keep the large-class floor constant in bytes, not buffers. That prevents a
 // newly-added larger class from multiplying the minimum retained footprint.
@@ -356,17 +417,30 @@ func largeObjectPoolFloorCount(poolSize int) int {
 }
 
 var orderedMessagePools = sync.OnceValue(func() []*messagePool {
-	// the initial byte budget is split evenly across the size classes
-	// (rebounded by ResizeMessagePools). 4096 fits a two-packet transfer
-	// batch without retaining an 8 KiB buffer for a ~3 KiB message; 8192 is
-	// sized so a full `MinimumMessageLenLimit` (4 KiB) message still fits
-	// after the pack/transfer frame proto envelope. Larger frames remain
-	// unpooled.
-	poolSizes := []int{packetPoolSize, 4096, 8192}
-	poolByteCount := InitialMessagePoolByteCount / ByteCount(len(poolSizes))
+	// Preserve the historical one-third packet / two-thirds large-object
+	// initial split. The packet third is now divided between the small and
+	// full-MTU classes, while each large class keeps its prior byte cap.
+	// 4096 fits a two-packet transfer batch without retaining an 8 KiB buffer
+	// for a ~3 KiB message; 8192 fits a full MinimumMessageLenLimit frame plus
+	// its protocol envelope. Larger frames remain unpooled.
+	poolSizes := []int{smallPacketPoolSize, packetPoolSize, 4096, 8192}
+	initialPacketBytes := InitialMessagePoolByteCount / 3
+	initialSmallPacketBytes, initialFullPacketBytes :=
+		splitPacketPoolByteCount(initialPacketBytes)
+	initialLargeClassBytes := (InitialMessagePoolByteCount - initialPacketBytes) / 2
 	pools := []*messagePool{}
 	for _, poolSize := range poolSizes {
-		pools = append(pools, newMessagePool(poolSize, int(poolByteCount/ByteCount(poolSize))))
+		poolByteCount := initialLargeClassBytes
+		switch poolSize {
+		case smallPacketPoolSize:
+			poolByteCount = initialSmallPacketBytes
+		case packetPoolSize:
+			poolByteCount = initialFullPacketBytes
+		}
+		pools = append(
+			pools,
+			newMessagePool(poolSize, int(poolByteCount/ByteCount(poolSize))),
+		)
 	}
 
 	go HandleError(func() {
@@ -418,11 +492,11 @@ func poolStats(pools []*messagePool) {
 	}
 }
 
-// ResizeMessagePools bounds the free lists. With two arguments, the packet
-// class (`packetPoolSize`) retains at most `packetByteCount`, and the large
-// object classes (all the others, serving protocol frames) split the second
-// byte count evenly. The one-argument form preserves the historical API and
-// gives every size class that byte cap.
+// ResizeMessagePools bounds the free lists. With two arguments, the small and
+// full-MTU packet classes split packetByteCount 1:3, and the large object
+// classes split the second byte count evenly. The one-argument form preserves
+// the historical API: packet classes share the supplied cap while every large
+// class receives that cap.
 //
 // Buffers in use are unaffected; this only bounds what the free lists retain,
 // with per-class floors that preserve a working reuse set. Safe to call at
@@ -431,7 +505,7 @@ func ResizeMessagePools(packetByteCount ByteCount, largeObjectByteCounts ...Byte
 	pools := orderedMessagePools()
 	largeObjectPoolCount := 0
 	for _, pool := range pools {
-		if pool.size != packetPoolSize {
+		if !isPacketPoolSize(pool.size) {
 			largeObjectPoolCount += 1
 		}
 	}
@@ -439,31 +513,79 @@ func ResizeMessagePools(packetByteCount ByteCount, largeObjectByteCounts ...Byte
 	if 0 < len(largeObjectByteCounts) {
 		largeObjectByteCount = largeObjectByteCounts[0]
 	}
+	smallPacketByteCount, fullPacketByteCount := splitPacketPoolByteCount(packetByteCount)
 	for _, pool := range pools {
-		if pool.size == packetPoolSize {
-			pool.Resize(max(packetPoolFloorCount, int(packetByteCount/ByteCount(pool.size))))
-		} else {
+		switch pool.size {
+		case smallPacketPoolSize:
+			pool.Resize(max(
+				packetPoolFloorCount(pool.size),
+				int(smallPacketByteCount/ByteCount(pool.size)),
+			))
+		case packetPoolSize:
+			pool.Resize(max(
+				packetPoolFloorCount(pool.size),
+				int(fullPacketByteCount/ByteCount(pool.size)),
+			))
+		default:
 			poolByteCount := largeObjectByteCount / ByteCount(largeObjectPoolCount)
 			pool.Resize(max(largeObjectPoolFloorCount(pool.size), int(poolByteCount/ByteCount(pool.size))))
 		}
 	}
 }
 
-// WarmMessagePoolsTo pre-allocates at most packetByteCount of the PACKET
-// class's free-list, additionally capped at a quarter of the configured class
-// capacity. Only the packet (2048) class is warmed — the large object
-// (protocol frame) classes are not on the same cold-start hot path, so warming
-// them would only inflate early retention for no first-burst benefit.
+func messagePoolPacketWarmByteCounts(packetByteCount ByteCount) (
+	smallWarmByteCount ByteCount,
+	fullWarmByteCount ByteCount,
+) {
+	packetByteCount = max(0, packetByteCount)
+	smallWarmByteCount = packetByteCount / 2
+	fullWarmByteCount = packetByteCount - smallWarmByteCount
+	var smallCapacityByteCount ByteCount
+	var fullCapacityByteCount ByteCount
+	for _, pool := range orderedMessagePools() {
+		switch pool.size {
+		case smallPacketPoolSize:
+			smallCapacityByteCount = ByteCount(pool.capacity() * pool.size)
+		case packetPoolSize:
+			fullCapacityByteCount = ByteCount(pool.capacity() * pool.size)
+		}
+	}
+	smallWarmByteCount = min(smallWarmByteCount, smallCapacityByteCount)
+	fullWarmByteCount = min(fullWarmByteCount, fullCapacityByteCount)
+	remainingByteCount := packetByteCount - smallWarmByteCount - fullWarmByteCount
+	additionalSmallByteCount := min(
+		remainingByteCount,
+		smallCapacityByteCount-smallWarmByteCount,
+	)
+	smallWarmByteCount += additionalSmallByteCount
+	remainingByteCount -= additionalSmallByteCount
+	fullWarmByteCount += min(
+		remainingByteCount,
+		fullCapacityByteCount-fullWarmByteCount,
+	)
+	return
+}
+
+// WarmMessagePoolsTo pre-allocates at most packetByteCount across the small and
+// full-MTU packet classes. The warm bytes split evenly until one class reaches
+// its configured capacity, then its unused share moves to the other class.
+// This lets a tiny mobile cap warm its entire 1:3-sized reuse set instead of
+// accidentally keeping only one quarter of it.
+// Large protocol-frame classes are not on the same cold-start path and stay cold.
 //
 // This parameterized form lets memory-constrained mobile embedders retain a
 // smaller reuse set without changing the server default or the configured
 // burst capacity. Call once at process start after sizing the pools; do not
 // call directly from a memory-pressure path.
 func WarmMessagePoolsTo(packetByteCount ByteCount) {
-	packetByteCount = max(0, packetByteCount)
+	smallWarmByteCount, fullWarmByteCount :=
+		messagePoolPacketWarmByteCounts(packetByteCount)
 	for _, pool := range orderedMessagePools() {
-		if pool.size == packetPoolSize {
-			pool.warm(min(pool.capacity()/4, int(packetByteCount/ByteCount(pool.size))))
+		switch pool.size {
+		case smallPacketPoolSize:
+			pool.warm(min(pool.capacity(), int(smallWarmByteCount/ByteCount(pool.size))))
+		case packetPoolSize:
+			pool.warm(min(pool.capacity(), int(fullWarmByteCount/ByteCount(pool.size))))
 		}
 	}
 }
@@ -480,14 +602,20 @@ func WarmMessagePools() {
 // class. Buffers still held by consumers are untouched, and subsequent returns
 // may refill the original capacity during the next burst.
 func TrimMessagePoolsTo(packetByteCount ByteCount) ByteCount {
-	packetByteCount = max(0, packetByteCount)
+	smallWarmByteCount, fullWarmByteCount :=
+		messagePoolPacketWarmByteCounts(packetByteCount)
 	var droppedByteCount ByteCount
 	for _, pool := range orderedMessagePools() {
-		if pool.size == packetPoolSize {
+		switch pool.size {
+		case smallPacketPoolSize:
 			droppedByteCount += ByteCount(
-				pool.trim(min(pool.capacity()/4, int(packetByteCount/ByteCount(pool.size)))) * pool.size,
+				pool.trim(min(pool.capacity(), int(smallWarmByteCount/ByteCount(pool.size)))) * pool.size,
 			)
-		} else {
+		case packetPoolSize:
+			droppedByteCount += ByteCount(
+				pool.trim(min(pool.capacity(), int(fullWarmByteCount/ByteCount(pool.size)))) * pool.size,
+			)
+		default:
 			droppedByteCount += ByteCount(
 				pool.trim(largeObjectPoolFloorCount(pool.size)) * pool.size,
 			)
@@ -506,9 +634,9 @@ func ClearMessagePools() {
 	for _, pool := range orderedMessagePools() {
 		pool.Clear()
 	}
-	// ACK-lifetime metadata is also a bounded, recoverable packet-path pool.
-	// Drop it under the same host memory-pressure signal; it repopulates
-	// lazily and never affects in-flight items.
+	// ACK-lifetime metadata and the uncommon H1 callback tails are also bounded,
+	// recoverable packet-path pools. Drop them under the same host memory-
+	// pressure signal; they repopulate lazily and never affect in-flight items.
 	clearSendItemPool()
 }
 
@@ -560,62 +688,167 @@ func MessagePoolCounts() (taken uint64, returned uint64, created uint64) {
 	return stats.Taken, stats.Returned, stats.Created
 }
 
-// MessagePoolPacketOutstandingCount returns the number of packet-class root
-// buffers that consumers currently own. Shares do not increase this count: a
-// buffer remains outstanding until its final MessagePoolReturn. The narrow
-// snapshot avoids copying the large per-class diagnostics when a constrained
-// mobile embedder only needs an overload signal.
+// MessagePoolPacketOutstandingCount returns the number of small and full-MTU
+// packet-class roots that consumers currently own. Shares do not increase this
+// count: a buffer remains outstanding until its final MessagePoolReturn. Use
+// MessagePoolPacketOutstandingByteCount for memory admission, because a small
+// root costs one eighth of a full root.
 //
 // The call is allocation-free, but it takes each packet-pool shard lock. It is
 // therefore intended for sampled admission control and telemetry, not every
 // packet on unconstrained server paths.
-func MessagePoolPacketOutstandingCount() uint64 {
-	var outstanding uint64
+func messagePoolPacketOutstandingSnapshot(fast bool) (uint64, ByteCount) {
+	var outstandingCount uint64
+	var outstandingBytes ByteCount
 	for _, pool := range orderedMessagePools() {
-		if pool.size != packetPoolSize {
+		if !isPacketPoolSize(pool.size) {
 			continue
 		}
 		for shardIndex := range messagePoolShardCount {
 			shard := &pool.shards[shardIndex]
 			shard.stateLock.Lock()
-			var taken uint64
-			var returned uint64
-			for tag := range 256 {
-				taken += shard.takenTags[tag]
-				returned += shard.returnedTags[tag]
+			owned := shard.outstanding
+			if !fast {
+				var taken uint64
+				var returned uint64
+				for tag := range 256 {
+					taken += shard.takenTags[tag]
+					returned += shard.returnedTags[tag]
+				}
+				owned = 0
+				if returned < taken {
+					owned = taken - returned
+				}
 			}
 			shard.stateLock.Unlock()
-			// A diagnostic reset while a packet is in flight can make the
-			// post-reset returned count temporarily exceed taken. Treat that
-			// shard as zero rather than underflowing the pressure signal.
-			if returned < taken {
-				outstanding += taken - returned
-			}
+			outstandingCount += owned
+			outstandingBytes += ByteCount(owned) * ByteCount(pool.size)
 		}
-		break
 	}
+	return outstandingCount, outstandingBytes
+}
+
+func MessagePoolPacketOutstandingCount() uint64 {
+	outstanding, _ := messagePoolPacketOutstandingSnapshot(
+		messagePoolTrackPacketOutstanding,
+	)
 	return outstanding
+}
+
+// MessagePoolPacketOutstandingByteCount is the allocation-free packet-root
+// ownership signal used by byte-bounded mobile admission. It intentionally
+// charges the size class, not len(message): a live pooled ACK owns all 256
+// bytes of its root and a live MTU packet owns all 2048 bytes.
+func MessagePoolPacketOutstandingByteCount() ByteCount {
+	_, outstandingBytes := messagePoolPacketOutstandingSnapshot(
+		messagePoolTrackPacketOutstanding,
+	)
+	return outstandingBytes
+}
+
+// MessagePoolPacketRootByteCount reports how many bytes of packet-class root
+// ownership are represented by message. Non-packet and unpooled buffers return
+// zero; they are not included in MessagePoolPacketOutstandingByteCount either.
+func MessagePoolPacketRootByteCount(message []byte) ByteCount {
+	switch cap(message) {
+	case smallPacketPoolSize + MessagePoolMetaByteCount:
+		return smallPacketPoolSize
+	case packetPoolSize + MessagePoolMetaByteCount:
+		return packetPoolSize
+	}
+	return 0
+}
+
+// MessagePoolRootByteCount reports the retained backing-store charge for a
+// complete owned message. Pooled slices are charged at their size class rather
+// than len(message); an unpooled slice is charged at its visible length. The
+// receive reorder budget uses this for complete frame/message owners, where
+// callers hold the original slice rather than an arbitrary subslice.
+func MessagePoolRootByteCount(message []byte) ByteCount {
+	switch cap(message) {
+	case smallPacketPoolSize + MessagePoolMetaByteCount:
+		return smallPacketPoolSize
+	case packetPoolSize + MessagePoolMetaByteCount:
+		return packetPoolSize
+	case 4096 + MessagePoolMetaByteCount:
+		return 4096
+	case 8192 + MessagePoolMetaByteCount:
+		return 8192
+	default:
+		return ByteCount(len(message))
+	}
+}
+
+// Marks a packet root as originating at the device TUN. The classification is
+// idempotent and follows read-only shares until the final return. Non-packet,
+// unpooled, or already-returned buffers are unchanged. The SDK calls this
+// before mobile pressure admission so remote download roots cannot consume the
+// client ACK reserve.
+func MessagePoolMarkDeviceTunEgress(message []byte) bool {
+	var pool *messagePool
+	switch cap(message) {
+	case smallPacketPoolSize + MessagePoolMetaByteCount:
+		pool = orderedMessagePools()[0]
+	case packetPoolSize + MessagePoolMetaByteCount:
+		pool = orderedMessagePools()[1]
+	default:
+		return false
+	}
+	poolMessage := message[:cap(message)]
+	shard, _ := pool.shardFor(poolMessage)
+	shard.stateLock.Lock()
+	defer shard.stateLock.Unlock()
+	if binary.BigEndian.Uint16(poolMessage[pool.size+10:]) == 0 {
+		return false
+	}
+	if poolMessage[pool.size+9]&messagePoolFlagDeviceTunEgress == 0 {
+		poolMessage[pool.size+9] |= messagePoolFlagDeviceTunEgress
+		shard.deviceTunEgressOutstanding += 1
+	}
+	return true
+}
+
+// Reports exact small/full root bytes currently owned by device-originated
+// TUN packets. The snapshot is allocation-free and takes the packet shard
+// locks, matching the existing sampled aggregate ownership query.
+func MessagePoolDeviceTunEgressOutstandingByteCount() ByteCount {
+	var byteCount ByteCount
+	for _, pool := range orderedMessagePools() {
+		if !isPacketPoolSize(pool.size) {
+			continue
+		}
+		for shardIndex := range messagePoolShardCount {
+			shard := &pool.shards[shardIndex]
+			shard.stateLock.Lock()
+			outstanding := shard.deviceTunEgressOutstanding
+			shard.stateLock.Unlock()
+			byteCount += ByteCount(outstanding) * ByteCount(pool.size)
+		}
+	}
+	return byteCount
 }
 
 // MessagePoolAggregateStats is an allocation-free process-wide snapshot used
 // by frequent host memory telemetry. Retained describes free-list ownership,
 // which is intentionally distinct from the in-flight Taken-Returned count.
 type MessagePoolAggregateStats struct {
-	Taken                        uint64
-	Returned                     uint64
-	Created                      uint64
-	RetainedCount                int
-	RetainedByteCount            ByteCount
-	CapacityByteCount            ByteCount
-	PacketRetainedCount          int
-	PacketRetainedByteCount      ByteCount
-	LargeObjectRetainedCount     int
-	LargeObjectRetainedByteCount ByteCount
+	Taken                               uint64
+	Returned                            uint64
+	Created                             uint64
+	RetainedCount                       int
+	RetainedByteCount                   ByteCount
+	CapacityByteCount                   ByteCount
+	PacketRetainedCount                 int
+	PacketRetainedByteCount             ByteCount
+	LargeObjectRetainedCount            int
+	LargeObjectRetainedByteCount        ByteCount
+	DeviceTunEgressOutstandingCount     uint64
+	DeviceTunEgressOutstandingByteCount ByteCount
 }
 
 func GetMessagePoolAggregateStats() MessagePoolAggregateStats {
 	var stats MessagePoolAggregateStats
-	for index, pool := range orderedMessagePools() {
+	for _, pool := range orderedMessagePools() {
 		snapshot := pool.snapshot()
 		for tag := range 256 {
 			stats.Taken += snapshot.takenTags[tag]
@@ -626,9 +859,13 @@ func GetMessagePoolAggregateStats() MessagePoolAggregateStats {
 		stats.RetainedCount += snapshot.retained
 		stats.RetainedByteCount += retainedByteCount
 		stats.CapacityByteCount += ByteCount(snapshot.capacity * pool.size)
-		if index == 0 {
-			stats.PacketRetainedCount = snapshot.retained
-			stats.PacketRetainedByteCount = retainedByteCount
+		if isPacketPoolSize(pool.size) {
+			stats.PacketRetainedCount += snapshot.retained
+			stats.PacketRetainedByteCount += retainedByteCount
+			stats.DeviceTunEgressOutstandingCount +=
+				snapshot.deviceTunEgressOutstanding
+			stats.DeviceTunEgressOutstandingByteCount +=
+				ByteCount(snapshot.deviceTunEgressOutstanding) * ByteCount(pool.size)
 		} else {
 			stats.LargeObjectRetainedCount += snapshot.retained
 			stats.LargeObjectRetainedByteCount += retainedByteCount
@@ -729,10 +966,17 @@ func MessagePoolReadAllLimit(r io.Reader, maxBytes int64) ([]byte, error) {
 
 func MessagePoolReadAllWithTag(r io.Reader, tag uint8) ([]byte, error) {
 	orderedMessagePools := orderedMessagePools()
+	// Stream reads historically start with one full packet-sized buffer. Do
+	// not add an extra 256-byte read/copy step merely because the small class
+	// now precedes it for exact-size Get/Copy calls.
+	startPoolIndex := 0
+	for orderedMessagePools[startPoolIndex].size != packetPoolSize {
+		startPoolIndex += 1
+	}
 
-	b, _ := MessagePoolGetDetailedWithTag(orderedMessagePools[0].size, tag)
+	b := orderedMessagePools[startPoolIndex].take(packetPoolSize, tag)
 	i := 0
-	for j := 0; j < len(orderedMessagePools); j += 1 {
+	for j := startPoolIndex; j < len(orderedMessagePools); j += 1 {
 		for i < len(b) {
 			n, err := r.Read(b[i:])
 			if n > 0 {
@@ -818,7 +1062,20 @@ func MessagePoolGetDetailed(n int) ([]byte, bool) {
 func MessagePoolGetDetailedWithTag(n int, tag uint8) ([]byte, bool) {
 	orderedMessagePools := orderedMessagePools()
 
-	for _, pool := range orderedMessagePools {
+	// Full-MTU packets are the dominant server/provider case. Keep their
+	// historical one-comparison fast path even though the small ACK/control
+	// class sorts before them. Tiny messages take one additional comparison,
+	// and the uncommon larger classes retain the ordered walk.
+	// One unsigned range comparison covers [small+1, full]. Values below the
+	// range wrap above it, so full packets do not pay two ordered comparisons.
+	if uint(n-smallPacketPoolSize-1) <
+		uint(packetPoolSize-smallPacketPoolSize) {
+		return orderedMessagePools[1].take(n, tag), true
+	}
+	if n <= smallPacketPoolSize {
+		return orderedMessagePools[0].take(n, tag), true
+	}
+	for _, pool := range orderedMessagePools[2:] {
 		if n <= pool.size {
 			return pool.take(n, tag), true
 		}
@@ -845,7 +1102,16 @@ func MessagePoolReturn(message []byte) bool {
 	orderedMessagePools := orderedMessagePools()
 
 	c := cap(message)
-	for _, pool := range orderedMessagePools {
+	// Mirror Get's full-packet fast path. Server proxy batches overwhelmingly
+	// return 2-KiB roots; making them scan the preceding 256-byte class measured
+	// as a small but repeatable batch-throughput regression.
+	if c == packetPoolSize+MessagePoolMetaByteCount {
+		return orderedMessagePools[1].release(message[:c])
+	}
+	if c == smallPacketPoolSize+MessagePoolMetaByteCount {
+		return orderedMessagePools[0].release(message[:c])
+	}
+	for _, pool := range orderedMessagePools[2:] {
 		if c == pool.size+MessagePoolMetaByteCount {
 			return pool.release(message[:c])
 		}
@@ -858,7 +1124,13 @@ func MessagePoolShareReadOnly(message []byte) []byte {
 	orderedMessagePools := orderedMessagePools()
 
 	c := cap(message)
-	for _, pool := range orderedMessagePools {
+	candidatePools := orderedMessagePools[2:]
+	if c == packetPoolSize+MessagePoolMetaByteCount {
+		candidatePools = orderedMessagePools[1:2]
+	} else if c == smallPacketPoolSize+MessagePoolMetaByteCount {
+		candidatePools = orderedMessagePools[0:1]
+	}
+	for _, pool := range candidatePools {
 		if c == pool.size+MessagePoolMetaByteCount {
 			poolMessage := message[:c]
 			shard, id := pool.shardFor(poolMessage)

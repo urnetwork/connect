@@ -11,6 +11,43 @@ import (
 var ipPathAllocationSink *IpPath
 var ipPathPortAllocationSink int
 
+func TestTcpAckOnlyPacketClassificationIsAllocationFree(t *testing.T) {
+	path := &IpPath{
+		Version:           4,
+		Protocol:          IpProtocolTcp,
+		SourceIp:          net.IPv4(10, 0, 0, 2).To4(),
+		SourcePort:        47001,
+		DestinationIp:     net.IPv4(203, 0, 113, 10).To4(),
+		DestinationPort:   443,
+		SequenceNumber:    100,
+		AckSequenceNumber: 200,
+		Ack:               true,
+	}
+	ack := ipOosTcpPacket(path, tcpFlagAck, nil)
+	if !IsTcpAckOnlyPacket(ack) {
+		t.Fatal("pure TCP ACK was not classified as ACK-only")
+	}
+	for name, packet := range map[string][]byte{
+		"payload":   ipOosTcpPacket(path, tcpFlagAck|tcpFlagPsh, []byte("data")),
+		"syn":       ipOosTcpPacket(path, tcpFlagSyn|tcpFlagAck, nil),
+		"fin":       ipOosTcpPacket(path, tcpFlagFin|tcpFlagAck, nil),
+		"rst":       ipOosTcpPacket(path, tcpFlagRst|tcpFlagAck, nil),
+		"udp":       testingUdp4Packet("10.0.0.2", "203.0.113.10", 443, nil),
+		"malformed": {0x45},
+	} {
+		if IsTcpAckOnlyPacket(packet) {
+			t.Fatalf("%s packet was classified as ACK-only", name)
+		}
+	}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		if !IsTcpAckOnlyPacket(ack) {
+			panic("ACK-only classification changed")
+		}
+	}); allocations != 0 {
+		t.Fatalf("ACK-only classification allocated %.0f objects, want 0", allocations)
+	}
+}
+
 func TestBorrowedIpPathAvoidsAddressAllocations(t *testing.T) {
 	packet := testingUdp4Packet("10.0.0.1", "203.0.113.7", 443, []byte("payload"))
 

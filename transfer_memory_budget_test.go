@@ -3,6 +3,7 @@ package connect
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -470,6 +471,128 @@ func TestTransferQueueBudgetBorrow(t *testing.T) {
 	AssertEqual(t, reserved, released)
 }
 
+// A zero byte floor charges every reorder item after the queue's mandatory
+// first progress item. This is the mobile topology: many browser flows must
+// not each multiply a large unaccounted byte floor, while an empty flow still
+// makes progress when another flow temporarily owns the aggregate window.
+func TestTransferQueueZeroFloorBoundsManyFlowReorderOwnership(t *testing.T) {
+	budget := NewTransferMemoryBudget(kib(8))
+	newQueue := func() *transferQueue[*transferItem] {
+		queue := newTransferQueue[*transferItem](func(a *transferItem, b *transferItem) int {
+			if a.sequenceNumber < b.sequenceNumber {
+				return -1
+			}
+			if b.sequenceNumber < a.sequenceNumber {
+				return 1
+			}
+			return 0
+		})
+		queue.setBudget(budget, 0)
+		return queue
+	}
+	newItem := func(sequenceNumber uint64, byteCount ByteCount) *transferItem {
+		return &transferItem{
+			messageId:        NewId(),
+			messageByteCount: byteCount,
+			sequenceNumber:   sequenceNumber,
+		}
+	}
+
+	first := newQueue()
+	if !first.CanAdd(kib(4), kib(64)) {
+		t.Fatal("empty first flow did not admit its progress item")
+	}
+	first.Add(newItem(1, kib(4)))
+	if !first.CanAdd(kib(4), kib(64)) {
+		t.Fatal("aggregate headroom did not admit the second first-flow item")
+	}
+	first.Add(newItem(2, kib(4)))
+	AssertEqual(t, budget.UsedByteCount(), kib(8))
+	if first.CanAdd(1, kib(64)) {
+		t.Fatal("full aggregate budget admitted additional ownership")
+	}
+
+	second := newQueue()
+	if !second.CanAdd(kib(4), kib(64)) {
+		t.Fatal("empty second flow did not retain one-item liveness")
+	}
+	second.Add(newItem(1, kib(4)))
+	AssertEqual(t, budget.UsedByteCount(), kib(12))
+	if second.CanAdd(1, kib(64)) {
+		t.Fatal("second flow multiplied its one-item overdraft")
+	}
+
+	first.Clear()
+	second.Clear()
+	AssertEqual(t, budget.UsedByteCount(), ByteCount(0))
+	reserved, released := budget.Counts()
+	AssertEqual(t, reserved, released)
+}
+
+func TestReceivePackQueueChargeIncludesEveryRetainedRoot(t *testing.T) {
+	outer := MessagePoolGet(3000)
+	message := MessagePoolGet(1500)
+	contract := MessagePoolGet(60)
+	defer MessagePoolReturn(outer)
+	defer MessagePoolReturn(message)
+	defer MessagePoolReturn(contract)
+	receivePack := &ReceivePack{
+		Pack: &protocol.Pack{
+			Frames: []*protocol.Frame{{MessageBytes: message}},
+			ContractFrame: &protocol.Frame{
+				MessageBytes: contract,
+			},
+		},
+		decodedOwner:       &decodedPackOwner{},
+		MessageByteCount:   ByteCount(len(message)),
+		TransferFrameBytes: outer,
+	}
+	want := ByteCount(4096 + 2048 + 256 + 1024)
+	if got := receivePack.receiveQueueByteCount(); got != want {
+		t.Fatalf("receive queue allocation charge = %d, want %d", got, want)
+	}
+
+	item := &transferItem{
+		messageId:        NewId(),
+		messageByteCount: receivePack.MessageByteCount,
+		queueByteCount:   receivePack.receiveQueueByteCount(),
+		sequenceNumber:   1,
+	}
+	budget := NewTransferMemoryBudget(2 * want)
+	queue := newTransferQueue[*transferItem](func(a *transferItem, b *transferItem) int {
+		return int(a.sequenceNumber - b.sequenceNumber)
+	})
+	queue.setBudget(budget, 0)
+	queue.Add(item)
+	_, messageBytes := queue.QueueSize()
+	AssertEqual(t, messageBytes, receivePack.MessageByteCount)
+	AssertEqual(t, budget.UsedByteCount(), want)
+	if !queue.CanAddWithQueueByteCount(
+		receivePack.MessageByteCount,
+		receivePack.receiveQueueByteCount(),
+		4001,
+	) {
+		t.Fatal("allocation charge incorrectly shrank the logical per-flow window")
+	}
+	second := &transferItem{
+		messageId:        NewId(),
+		messageByteCount: receivePack.MessageByteCount,
+		queueByteCount:   receivePack.receiveQueueByteCount(),
+		sequenceNumber:   2,
+	}
+	queue.Add(second)
+	AssertEqual(t, budget.UsedByteCount(), 2*want)
+	if queue.CanAddWithQueueByteCount(
+		receivePack.MessageByteCount,
+		receivePack.receiveQueueByteCount(),
+		4001,
+	) {
+		t.Fatal("logical per-flow maximum admitted a third payload")
+	}
+	queue.Clear()
+	AssertEqual(t, budget.UsedByteCount(), ByteCount(0))
+}
+
 // budgetTestPeer wires a sender client to one receiver client over direct
 // channel routes, optionally without the ack return path so the sender's
 // resend queue holds every sent message (deterministic queue depth).
@@ -855,13 +978,22 @@ func TestDefaultReceiveSequenceHandoffIsCountAndByteBounded(t *testing.T) {
 	if got := settings.ReceiveBufferSettings.SequenceBufferSize; got != 256 {
 		t.Fatalf("default receive sequence slots = %d, want 256", got)
 	}
+	if got := settings.ReceiveBufferSettings.H1SequenceBufferSize; got != 256 {
+		t.Fatalf("default H1 receive sequence slots = %d, want 256", got)
+	}
 	if got := settings.ReceiveBufferSettings.SequenceBufferByteCount; got != kib(256) {
 		t.Fatalf("default receive sequence byte limit = %d, want %d", got, kib(256))
+	}
+	if got := settings.ReceiveBufferSettings.H1SequenceBufferByteCount; got != kib(256) {
+		t.Fatalf("default H1 receive sequence byte limit = %d, want %d", got, kib(256))
 	}
 
 	explicit := DefaultClientSettingsWithBufferSize(7)
 	if got := explicit.ReceiveBufferSettings.SequenceBufferSize; got != 7 {
 		t.Fatalf("explicit receive sequence slots = %d, want 7", got)
+	}
+	if got := explicit.ReceiveBufferSettings.H1SequenceBufferSize; got != 7 {
+		t.Fatalf("explicit H1 receive sequence slots = %d, want 7", got)
 	}
 }
 
@@ -902,6 +1034,9 @@ func TestReceiveSequenceHandoffEnforcesByteBudgetWithoutBlocking(t *testing.T) {
 	if got := sequence.packQueueByteCount.Load(); got != 80 {
 		t.Fatalf("retained handoff bytes = %d, want 80", got)
 	}
+	if got := sequence.packQueueCount.Load(); got != 2 {
+		t.Fatalf("retained handoff count = %d, want 2", got)
+	}
 
 	dequeued := <-sequence.packs
 	sequence.releasePackQueue(dequeued)
@@ -913,4 +1048,301 @@ func TestReceiveSequenceHandoffEnforcesByteBudgetWithoutBlocking(t *testing.T) {
 	if got := sequence.packQueueByteCount.Load(); got != 0 {
 		t.Fatalf("closed sequence retained %d handoff bytes", got)
 	}
+	if got := sequence.packQueueCount.Load(); got != 0 {
+		t.Fatalf("closed sequence retained %d handoff items", got)
+	}
+}
+
+// Per-sequence burst limits are not an aggregate bound: many browser flows can
+// otherwise each retain their full allowance at once. The optional shared
+// budget admits across sequences exactly and releases at channel dequeue.
+func TestReceiveSequenceHandoffEnforcesSharedPackBudget(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	budget := NewTransferMemoryBudget(60)
+	settings := DefaultReceiveBufferSettingsWithBufferSize(8)
+	settings.SequenceBufferByteCount = 1024
+	settings.H1SequenceBufferByteCount = 1024
+	settings.PackQueueBudget = budget
+	firstSequence := newReceiveSequence(
+		ctx,
+		&Client{},
+		SourceId(NewId()),
+		NewId(),
+		TransferKey{},
+		settings,
+	)
+	secondSequence := newReceiveSequence(
+		ctx,
+		&Client{},
+		SourceId(NewId()),
+		NewId(),
+		TransferKey{},
+		settings,
+	)
+	defer firstSequence.Close()
+	defer secondSequence.Close()
+
+	newPack := func() *ReceivePack {
+		return &ReceivePack{
+			MessageByteCount:   40,
+			TransferFrameBytes: MessagePoolGet(40),
+			TransportType:      TransportTypeH1,
+		}
+	}
+	first := newPack()
+	second := newPack()
+	if accepted, err := firstSequence.Pack(first, 0); !accepted || err != nil {
+		t.Fatalf("first shared-budget pack: accepted=%t err=%v", accepted, err)
+	}
+	if accepted, err := secondSequence.Pack(second, 0); accepted || err != nil {
+		t.Fatalf("aggregate-overflow pack: accepted=%t err=%v", accepted, err)
+	}
+	if got := budget.UsedByteCount(); got != 40 {
+		t.Fatalf("shared pack budget used=%d, want 40", got)
+	}
+	if got := secondSequence.packQueueByteCount.Load(); got != 0 {
+		t.Fatalf("rejected sequence retained %d local bytes", got)
+	}
+
+	dequeued := <-firstSequence.packs
+	firstSequence.releasePackQueue(dequeued)
+	dequeued.messagePoolReturn()
+	if got := budget.UsedByteCount(); got != 0 {
+		t.Fatalf("shared pack budget after dequeue=%d, want 0", got)
+	}
+	if accepted, err := secondSequence.Pack(second, 0); !accepted || err != nil {
+		t.Fatalf("readmit after shared release: accepted=%t err=%v", accepted, err)
+	}
+	dequeued = <-secondSequence.packs
+	secondSequence.releasePackQueue(dequeued)
+	dequeued.messagePoolReturn()
+	if got := budget.UsedByteCount(); got != 0 {
+		t.Fatalf("shared pack budget after final dequeue=%d, want 0", got)
+	}
+	reserved, released := budget.Counts()
+	if reserved != released || reserved != 80 {
+		t.Fatalf("shared pack budget counts=(%d,%d), want (80,80)", reserved, released)
+	}
+}
+
+// One ordered channel can absorb an H1 burst without silently widening H3.
+// Carrier changes preserve arrival order because both limits govern the same
+// queue rather than using a secondary overflow channel.
+func TestReceiveSequenceH1HandoffUsesCarrierSpecificCountLimit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultReceiveBufferSettingsWithBufferSize(2)
+	settings.H1SequenceBufferSize = 4
+	settings.SequenceBufferByteCount = 1024
+	client := &Client{}
+	sequence := newReceiveSequence(
+		ctx,
+		client,
+		SourceId(NewId()),
+		NewId(),
+		TransferKey{},
+		settings,
+	)
+	defer sequence.Close()
+	if got := cap(sequence.packs); got != 4 {
+		t.Fatalf("carrier-aware handoff channel capacity = %d, want 4", got)
+	}
+
+	newPack := func(transportType TransportType) *ReceivePack {
+		return &ReceivePack{
+			MessageByteCount:   40,
+			TransferFrameBytes: MessagePoolGet(40),
+			TransportType:      transportType,
+		}
+	}
+	first := newPack(TransportTypeH3)
+	second := newPack(TransportTypeH3)
+	third := newPack(TransportTypeH3)
+	for index, pack := range []*ReceivePack{first, second} {
+		if accepted, err := sequence.Pack(pack, 0); !accepted || err != nil {
+			t.Fatalf("admit H3 pack %d: accepted=%t err=%v", index, accepted, err)
+		}
+	}
+	if accepted, err := sequence.Pack(third, 0); accepted || err != nil {
+		t.Fatalf("H3 count overflow: accepted=%t err=%v", accepted, err)
+	}
+	third.messagePoolReturn()
+
+	for _, want := range []*ReceivePack{first, second} {
+		got := <-sequence.packs
+		if got != want {
+			t.Fatalf("H3 queue order got %p, want %p", got, want)
+		}
+		sequence.releasePackQueue(got)
+		got.messagePoolReturn()
+	}
+
+	h1Packs := make([]*ReceivePack, 4)
+	for index := range h1Packs {
+		h1Packs[index] = newPack(TransportTypeH1)
+		if accepted, err := sequence.Pack(h1Packs[index], 0); !accepted || err != nil {
+			t.Fatalf("admit H1 pack %d: accepted=%t err=%v", index, accepted, err)
+		}
+	}
+	overflow := newPack(TransportTypeH1)
+	if accepted, err := sequence.Pack(overflow, 0); accepted || err != nil {
+		t.Fatalf("H1 count overflow: accepted=%t err=%v", accepted, err)
+	}
+	overflow.messagePoolReturn()
+	if got := sequence.packQueueCount.Load(); got != 4 {
+		t.Fatalf("H1 retained handoff count = %d, want 4", got)
+	}
+	stats := client.ReceiveStats()
+	if stats.PackHandoffMaxCount != 4 || stats.PackHandoffMaxByteCount != 160 {
+		t.Fatalf("H1 handoff high water = (%d, %d), want (4, 160)", stats.PackHandoffMaxCount, stats.PackHandoffMaxByteCount)
+	}
+}
+
+// The H1 byte reserve follows the same carrier discriminator as the count
+// reserve. H3 remains bounded by the base budget and mixed arrivals retain one
+// ordered channel; releasing an H3 item immediately restores base admission.
+func TestReceiveSequenceH1HandoffUsesCarrierSpecificByteLimit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultReceiveBufferSettingsWithBufferSize(8)
+	settings.SequenceBufferByteCount = 80
+	settings.H1SequenceBufferByteCount = 160
+	sequence := newReceiveSequence(
+		ctx,
+		&Client{},
+		SourceId(NewId()),
+		NewId(),
+		TransferKey{},
+		settings,
+	)
+	defer sequence.Close()
+
+	newPack := func(transportType TransportType) *ReceivePack {
+		return &ReceivePack{
+			MessageByteCount:   40,
+			TransferFrameBytes: MessagePoolGet(40),
+			TransportType:      transportType,
+		}
+	}
+	first := newPack(TransportTypeH3)
+	second := newPack(TransportTypeH3)
+	third := newPack(TransportTypeH3)
+	for index, pack := range []*ReceivePack{first, second} {
+		if accepted, err := sequence.Pack(pack, 0); !accepted || err != nil {
+			t.Fatalf("admit H3 pack %d: accepted=%t err=%v", index, accepted, err)
+		}
+	}
+	if accepted, err := sequence.Pack(third, 0); accepted || err != nil {
+		t.Fatalf("H3 byte overflow: accepted=%t err=%v", accepted, err)
+	}
+	third.messagePoolReturn()
+
+	dequeued := <-sequence.packs
+	if dequeued != first {
+		t.Fatalf("mixed queue first pack = %p, want %p", dequeued, first)
+	}
+	sequence.releasePackQueue(dequeued)
+	dequeued.messagePoolReturn()
+
+	h1First := newPack(TransportTypeH1)
+	h1Second := newPack(TransportTypeH1)
+	for index, pack := range []*ReceivePack{h1First, h1Second} {
+		if accepted, err := sequence.Pack(pack, 0); !accepted || err != nil {
+			t.Fatalf("admit H1 reserve pack %d: accepted=%t err=%v", index, accepted, err)
+		}
+	}
+	if got := sequence.packQueueByteCount.Load(); got != 120 {
+		t.Fatalf("mixed H1 handoff bytes = %d, want 120", got)
+	}
+
+	h3Overflow := newPack(TransportTypeH3)
+	if accepted, err := sequence.Pack(h3Overflow, 0); accepted || err != nil {
+		t.Fatalf("H3 consumed H1 byte reserve: accepted=%t err=%v", accepted, err)
+	}
+	h3Overflow.messagePoolReturn()
+	h1Third := newPack(TransportTypeH1)
+	if accepted, err := sequence.Pack(h1Third, 0); !accepted || err != nil {
+		t.Fatalf("H1 byte reserve rejected: accepted=%t err=%v", accepted, err)
+	}
+	if got := sequence.packQueueByteCount.Load(); got != 160 {
+		t.Fatalf("full H1 handoff bytes = %d, want 160", got)
+	}
+}
+
+func TestReceiveSequenceH1HandoffWaitRescuesFullQueue(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultReceiveBufferSettingsWithBufferSize(1)
+	settings.H1PackHandoffTimeout = 200 * time.Millisecond
+	if got := settings.packHandoffTimeout(TransportTypeH1); got != 200*time.Millisecond {
+		t.Fatalf("H1 handoff timeout = %v, want 200ms", got)
+	}
+	for _, transportType := range []TransportType{TransportTypeUnknown, TransportTypeH3} {
+		if got := settings.packHandoffTimeout(transportType); got != 0 {
+			t.Fatalf("non-H1 handoff timeout = %v, want zero", got)
+		}
+	}
+
+	client := &Client{}
+	sequence := newReceiveSequence(
+		ctx,
+		client,
+		SourceId(NewId()),
+		NewId(),
+		TransferKey{},
+		settings,
+	)
+	defer sequence.Close()
+	newPack := func() *ReceivePack {
+		return &ReceivePack{
+			MessageByteCount:   40,
+			TransferFrameBytes: MessagePoolGet(40),
+			TransportType:      TransportTypeH1,
+		}
+	}
+	first := newPack()
+	second := newPack()
+	if accepted, err := sequence.Pack(first, 0); !accepted || err != nil {
+		t.Fatalf("fill H1 handoff: accepted=%t err=%v", accepted, err)
+	}
+	type packResult struct {
+		accepted bool
+		err      error
+	}
+	result := make(chan packResult, 1)
+	go func() {
+		accepted, err := sequence.Pack(second, settings.packHandoffTimeout(second.TransportType))
+		result <- packResult{accepted: accepted, err: err}
+	}()
+	deadline := time.Now().Add(time.Second)
+	for client.ReceiveStats().PackHandoffWaitCount == 0 && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if client.ReceiveStats().PackHandoffWaitCount != 1 {
+		t.Fatal("full H1 handoff did not enter bounded wait")
+	}
+	select {
+	case premature := <-result:
+		t.Fatalf("H1 handoff wait completed before space: %+v", premature)
+	default:
+	}
+
+	dequeued := <-sequence.packs
+	sequence.releasePackQueue(dequeued)
+	dequeued.messagePoolReturn()
+	select {
+	case got := <-result:
+		if !got.accepted || got.err != nil {
+			t.Fatalf("H1 handoff wait result: accepted=%t err=%v", got.accepted, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("H1 handoff did not wake after space release")
+	}
+	if got := client.ReceiveStats().PackHandoffWaitSuccess; got != 1 {
+		t.Fatalf("H1 rescued wait count = %d, want 1", got)
+	}
+	dequeued = <-sequence.packs
+	sequence.releasePackQueue(dequeued)
+	dequeued.messagePoolReturn()
 }

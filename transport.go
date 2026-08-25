@@ -59,10 +59,64 @@ const TransportVersion = 2
 const DebugCloseSend = false
 
 // The platform WebSocket writer combines only messages already waiting on its
-// bounded route. Eight ordinary transfer frames remain below the wrapper's
-// 16 KiB retained-byte bound, reducing write syscalls without adding a
-// batching delay. Oversized frames flush through the same bounded wrapper.
-const platformWebSocketWriteBatchMaxMessages = 8
+// bounded route. ACK-sized traffic may drain thirty-two at once; ordinary data
+// stops once the batch has reached 12 KiB, so one complete <=4-KiB H1 message
+// cannot make the writer retain more than its existing 16-KiB buffer. A
+// dedicated ACK lane may consume at most eight ready slots before one ready
+// ordinary packet gets a turn. The writer then starts another ACK burst and
+// repeats both bursts inside the same nonblocking physical flush. If either
+// lane is empty, the other drains without an artificial flush boundary. This
+// changes neither storage nor sparse latency and prevents Transfer feedback
+// from starving inner TCP ACKs or request data during a sustained download.
+const platformWebSocketWriteBatchMaxMessages = 32
+const platformWebSocketWriteBatchDrainByteCount = 12 * 1024
+const platformWebSocketAckPriorityBurstMaxMessages = 8
+
+func platformWebSocketWriteBatchCanDrain(
+	messageCount int,
+	messageByteCount int,
+) bool {
+	return messageCount < platformWebSocketWriteBatchMaxMessages &&
+		messageByteCount < platformWebSocketWriteBatchDrainByteCount
+}
+
+func platformWebSocketWriteBatchNextReady(
+	ackPrioritySend <-chan []byte,
+	send <-chan []byte,
+	priorityMessageCount int,
+) (
+	message []byte,
+	priority bool,
+	sendOpen bool,
+	ready bool,
+) {
+	// Once the ACK quantum is consumed, give already-ready ordinary work the
+	// first look. If none exists, keep draining ready ACKs into this same
+	// physical write rather than flushing a partial batch. The caller resets
+	// priorityMessageCount after an ordinary selection, producing repeated
+	// <=8 ACK / 1 ordinary-packet bursts while both sources remain continuously
+	// ready. The enclosing writer keeps those bursts in one bulk flush.
+	if platformWebSocketAckPriorityBurstMaxMessages <= priorityMessageCount {
+		select {
+		case message, sendOpen = <-send:
+			return message, false, sendOpen, true
+		default:
+		}
+	}
+	if ackPrioritySend != nil {
+		select {
+		case message = <-ackPrioritySend:
+			return message, true, true, true
+		default:
+		}
+	}
+	select {
+	case message, sendOpen = <-send:
+		return message, false, sendOpen, true
+	default:
+		return nil, false, true, false
+	}
+}
 
 const (
 	platformH3WriteBatchMaxMessageCount = 16
@@ -433,9 +487,14 @@ type PlatformTransportSettings struct {
 	// AuthFrameObserver borrows the exact pooled authentication frame before
 	// transport I/O. Tests may retain it to prove lifecycle ownership. It must
 	// not block; nil retains normal production behavior.
-	AuthFrameObserver    func(authFrameBytes []byte)
-	TransportBufferSize  int
-	InactiveDrainTimeout time.Duration
+	AuthFrameObserver   func(authFrameBytes []byte)
+	TransportBufferSize int
+	// H1AckPriorityBufferSize enables a separate bounded writer lane used only
+	// by Transfer acknowledgements. Zero (the server/default policy) leaves the
+	// lane absent. Mobile embedders can spend a handful of channel slots so ACK
+	// feedback cannot sit behind a full bulk route and trigger resend storms.
+	H1AckPriorityBufferSize int
+	InactiveDrainTimeout    time.Duration
 	// InactiveDrainMaxTimeout is the absolute lifetime of a carrier after a
 	// strictly better mode supersedes it. Payload activity may extend the quiet
 	// drain, but never beyond this bound. A non-positive value uses twice
@@ -1644,6 +1703,14 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			send := make(chan []byte, self.settings.TransportBufferSize)
 			receive := make(chan []byte, self.settings.TransportBufferSize)
 			controlSend := make(chan []byte, self.settings.TransportBufferSize)
+			var ackPrioritySend chan []byte
+			ackPriorityBufferSize := min(
+				max(0, self.settings.H1AckPriorityBufferSize),
+				max(0, self.settings.TransportBufferSize),
+			)
+			if 0 < ackPriorityBufferSize {
+				ackPrioritySend = make(chan []byte, ackPriorityBufferSize)
+			}
 
 			drain := func(c chan []byte) {
 				for {
@@ -1696,6 +1763,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			} else {
 				exportedSend = send
 			}
+			if ackPrioritySend != nil {
+				registerH1AckPriorityRoute(exportedSend, ackPrioritySend)
+			}
 
 			// the platform can route any destination,
 			// since every client has a platform transport
@@ -1717,6 +1787,10 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 			defer func() {
 				self.setRegistered(false)
+				// Stop new priority admissions before retiring the public route.
+				// RemoveTransport then joins any writer that already acquired the
+				// old snapshot, so the final drain cannot race an enqueue.
+				unregisterH1AckPriorityRoute(exportedSend)
 				self.routeManager.RemoveTransport(sendTransport)
 				if self.settings.SendRouteObserver != nil {
 					self.settings.SendRouteObserver(sendTransport, exportedSend, false)
@@ -1734,8 +1808,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				// and socket-writer ownership before completion is published.
 				connectionWaitGroup.Wait()
 				// No producer can enqueue after the join, so one deterministic
-				// drain releases every pooled message still sitting in send.
+				// drain releases every pooled message still sitting in either lane.
 				drain(send)
+				drain(ackPrioritySend)
 			}()
 			startConnectionWorker(func() {
 				self.runInactiveDrain(
@@ -1805,6 +1880,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					ws.UnderlyingConn().(*WebSocketWriteBatchConn)
 				writeReadySendBatch := func(
 					firstMessage []byte,
+					firstPriority bool,
 				) (sendOpen bool, err error) {
 					if writeBatchConn == nil {
 						ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
@@ -1819,23 +1895,46 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					}
 
 					sendOpen = true
+					batchMessageCount := 1
+					batchMessageByteCount := len(firstMessage)
+					priorityMessageCount := 0
+					if firstPriority {
+						priorityMessageCount = 1
+					}
 				drainReady:
-					for range platformWebSocketWriteBatchMaxMessages - 1 {
+					for platformWebSocketWriteBatchCanDrain(
+						batchMessageCount,
+						batchMessageByteCount,
+					) {
 						select {
 						case <-handleCtx.Done():
 							writeBatchConn.AbortWriteBatch()
 							return false, nil
-						case message, ok := <-send:
-							if !ok {
-								sendOpen = false
-								break drainReady
-							}
-							if err = writeSendMessage(message); err != nil {
-								writeBatchConn.AbortWriteBatch()
-								return true, err
-							}
 						default:
+						}
+						message, priority, open, ready :=
+							platformWebSocketWriteBatchNextReady(
+								ackPrioritySend,
+								send,
+								priorityMessageCount,
+							)
+						if !ready {
 							break drainReady
+						}
+						if !open {
+							sendOpen = false
+							break drainReady
+						}
+						if err = writeSendMessage(message); err != nil {
+							writeBatchConn.AbortWriteBatch()
+							return true, err
+						}
+						batchMessageCount += 1
+						batchMessageByteCount += len(message)
+						if priority {
+							priorityMessageCount += 1
+						} else {
+							priorityMessageCount = 0
 						}
 					}
 					if err = writeBatchConn.FlushWriteBatch(); err != nil {
@@ -1848,6 +1947,31 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				}
 
 				for {
+					// A nonblocking pass makes priority deterministic when the
+					// ordinary route is continuously readable. The blocking
+					// selects below also include the lane so a newly arriving ACK
+					// wakes an otherwise idle writer.
+					if ackPrioritySend != nil && !speedTest {
+						select {
+						case message := <-ackPrioritySend:
+							if speedTest {
+								if len(message) <= 16 {
+									self.log.Infof("[ts]send message must be >16 bytes (%d)\n", len(message))
+									MessagePoolReturn(message)
+								} else if writePayload(message) != nil {
+									return
+								}
+							} else {
+								sendOpen, err := writeReadySendBatch(message, true)
+								if err != nil || !sendOpen {
+									return
+								}
+							}
+							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+							continue
+						default:
+						}
+					}
 					if speedTest {
 						// during speed test, continue draining user traffic
 						// so the route manager does not back up. mixing user
@@ -1888,6 +2012,14 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 								return
 							}
 							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+						case message := <-ackPrioritySend:
+							if len(message) <= 16 {
+								self.log.Infof("[ts]send message must be >16 bytes (%d)\n", len(message))
+								MessagePoolReturn(message)
+							} else if writePayload(message) != nil {
+								return
+							}
+							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						}
 					} else {
 						select {
@@ -1901,7 +2033,13 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							// 	panic("[t]shared should be set")
 							// }
 
-							sendOpen, err := writeReadySendBatch(message)
+							sendOpen, err := writeReadySendBatch(message, false)
+							if err != nil || !sendOpen {
+								return
+							}
+							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+						case message := <-ackPrioritySend:
+							sendOpen, err := writeReadySendBatch(message, true)
 							if err != nil || !sendOpen {
 								return
 							}

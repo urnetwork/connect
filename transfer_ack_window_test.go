@@ -1,9 +1,130 @@
 package connect
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 )
+
+func TestReceiveAckH1HandoffWaitRescuesFullCompactQueue(t *testing.T) {
+	settings := DefaultReceiveBufferSettingsWithBufferSize(1)
+	settings.H1AckHandoffTimeout = 200 * time.Millisecond
+	if got := settings.ackHandoffTimeout(TransportTypeH1); got != 200*time.Millisecond {
+		t.Fatalf("H1 ACK handoff timeout = %s, want 200ms", got)
+	}
+	for _, transportType := range []TransportType{TransportTypeUnknown, TransportTypeH3} {
+		if got := settings.ackHandoffTimeout(transportType); got != 0 {
+			t.Fatalf("non-H1 ACK handoff timeout = %s, want zero", got)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sequenceId := NewId()
+	sequence := &SendSequence{
+		ctx:        ctx,
+		sequenceId: sequenceId,
+		acks:       make(chan receiveAckMessage, 1),
+	}
+	sequence.acks <- receiveAckMessage{sequenceId: sequenceId, messageId: NewId()}
+
+	result := make(chan receiveAckHandoffResult, 1)
+	go func() {
+		handoff, _ := sequence.ackMessageDetailed(
+			receiveAckMessage{sequenceId: sequenceId, messageId: NewId()},
+			settings.ackHandoffTimeout(TransportTypeH1),
+		)
+		result <- handoff
+	}()
+	select {
+	case premature := <-result:
+		t.Fatalf("H1 ACK wait completed before queue space: %v", premature)
+	case <-time.After(10 * time.Millisecond):
+	}
+	<-sequence.acks
+	select {
+	case got := <-result:
+		if got != receiveAckHandoffAcceptedAfterWait {
+			t.Fatalf("H1 ACK handoff result = %v, want accepted after wait", got)
+		}
+		client := &Client{}
+		client.recordReceiveAckHandoff(got)
+		stats := client.ReceiveStats()
+		if stats.AckHandoffWaitCount != 1 || stats.AckHandoffWaitSuccess != 1 ||
+			stats.AckHandoffDropCount != 0 {
+			t.Fatalf("rescued ACK handoff stats = %+v", stats)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("H1 ACK handoff did not wake after queue space")
+	}
+}
+
+func TestReceiveAckHandoffClassifiesQueueFullAndMissingSequence(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	destination := NewId()
+	sequenceId := NewId()
+	sequence := &SendSequence{
+		ctx:         ctx,
+		destination: destination,
+		sequenceId:  sequenceId,
+		acks:        make(chan receiveAckMessage, 1),
+	}
+	sequence.acks <- receiveAckMessage{sequenceId: sequenceId, messageId: NewId()}
+	buffer := &SendBuffer{
+		ctx: ctx,
+		log: NewNoopLogger(),
+		sendSequencesBySequenceId: map[Id]*SendSequence{
+			sequenceId: sequence,
+		},
+	}
+	client := &Client{log: NewNoopLogger()}
+	full := buffer.ackMessageDetailed(
+		destination,
+		receiveAckMessage{sequenceId: sequenceId, messageId: NewId()},
+		0,
+	)
+	client.recordReceiveAckHandoff(full)
+	missing := buffer.ackMessageDetailed(
+		destination,
+		receiveAckMessage{sequenceId: NewId(), messageId: NewId()},
+		0,
+	)
+	client.recordReceiveAckHandoff(missing)
+	stats := client.ReceiveStats()
+	if full != receiveAckHandoffQueueFull ||
+		missing != receiveAckHandoffSequenceMissing ||
+		stats.AckHandoffDropCount != 2 ||
+		stats.AckHandoffQueueFullCount != 1 ||
+		stats.AckHandoffMissCount != 1 {
+		t.Fatalf("classified ACK handoff stats = %+v (full=%v missing=%v)", stats, full, missing)
+	}
+}
+
+func TestReceiveAckRouteWriteStatsSeparateBlockedWaitsAndErrors(t *testing.T) {
+	client := &Client{}
+	client.recordReceiveAckRouteWrite(2*time.Millisecond, false, true, nil)
+	client.recordReceiveAckRouteWrite(5*time.Millisecond, true, false, nil)
+	client.recordReceiveAckRouteWrite(7*time.Millisecond, true, false, errors.New("write"))
+	stats := client.ReceiveStats()
+	if stats.AckRouteWriteCount != 3 ||
+		stats.AckRoutePriorityWriteCount != 1 ||
+		stats.AckRouteWriteBlockedCount != 2 ||
+		stats.AckRouteWriteErrorCount != 1 ||
+		stats.AckRouteWriteWaitDuration != 12*time.Millisecond ||
+		stats.AckRouteWriteMaxWait != 7*time.Millisecond {
+		t.Fatalf("ACK route-write stats = %+v", stats)
+	}
+}
+
+func BenchmarkReceiveAckRouteWriteStatsImmediate(b *testing.B) {
+	client := &Client{}
+	b.ReportAllocs()
+	for range b.N {
+		client.recordReceiveAckRouteWrite(0, false, false, nil)
+	}
+}
 
 func TestSequenceAckWindowCoalescesReusableNotification(t *testing.T) {
 	window := newSequenceAckWindow()
@@ -55,10 +176,39 @@ func TestSequenceAckWindowSteadyStateDoesNotAllocate(t *testing.T) {
 
 	allocs := testing.AllocsPerRun(1000, func() {
 		window.Update(ack)
+		if !window.Pending() {
+			t.Fatal("updated ack window is not pending")
+		}
 		window.Snapshot(true)
 	})
 	if allocs != 0 {
 		t.Fatalf("ack update + reset allocated %.0f times, want 0", allocs)
+	}
+}
+
+func TestSequenceAckWindowPendingDoesNotCloneSelectiveAcks(t *testing.T) {
+	window := newSequenceAckWindow()
+	for i := range 64 {
+		window.Update(sequenceAck{
+			sequenceNumber: uint64(i + 2),
+			messageId:      NewId(),
+			selective:      true,
+		})
+	}
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		if !window.Pending() {
+			t.Fatal("selective ack window is not pending")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("pending check allocated %.0f times, want 0", allocs)
+	}
+	if got := len(window.Snapshot(true).selectiveAcks); got != 64 {
+		t.Fatalf("selective snapshot size = %d, want 64", got)
+	}
+	if window.Pending() {
+		t.Fatal("reset ack window remained pending")
 	}
 }
 

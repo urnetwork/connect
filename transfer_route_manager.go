@@ -22,6 +22,48 @@ import (
 // routes are expected to have flow control and error detection and rejection
 type Route = chan []byte
 
+// H1 ACK priority routes are an optional companion to an ordinary platform
+// send route. Route intentionally remains a channel alias on the packet hot
+// path, so the narrow registry carries the extra writer lane without changing
+// every Route user or allocating a wrapper per write. Server/default
+// transports never register a companion; the atomic count keeps their ACK
+// path out of sync.Map entirely.
+var h1AckPriorityRoutes sync.Map
+var h1AckPriorityRouteCount atomic.Int64
+
+func registerH1AckPriorityRoute(route Route, priorityRoute Route) {
+	if route == nil || priorityRoute == nil {
+		return
+	}
+	if _, loaded := h1AckPriorityRoutes.LoadOrStore(route, priorityRoute); loaded {
+		panic("H1 ACK priority route already registered")
+	}
+	h1AckPriorityRouteCount.Add(1)
+}
+
+func unregisterH1AckPriorityRoute(route Route) {
+	if route == nil {
+		return
+	}
+	if _, loaded := h1AckPriorityRoutes.LoadAndDelete(route); loaded {
+		if h1AckPriorityRouteCount.Add(-1) < 0 {
+			panic("negative H1 ACK priority route count")
+		}
+	}
+}
+
+func h1AckPriorityRoute(route Route) (Route, bool) {
+	if h1AckPriorityRouteCount.Load() == 0 {
+		return nil, false
+	}
+	value, ok := h1AckPriorityRoutes.Load(route)
+	if !ok {
+		return nil, false
+	}
+	priorityRoute, ok := value.(Route)
+	return priorityRoute, ok
+}
+
 // Describes delivery semantics that affect Transfer's sender. Reliable
 // carriers leave this zero-valued. An unreliable carrier delivers complete
 // routed frames without retransmitting them, so Transfer must also bound its
@@ -227,6 +269,13 @@ type transferWriteDisposition struct {
 	reliable       bool
 	hybridReliable bool
 	route          Route
+	// initiallyBlocked is true when no eligible route accepted the frame in
+	// the selector's allocation-free first pass. ReceiveSequence uses this to
+	// distinguish ACK production/compression time from carrier-queue wait.
+	initiallyBlocked bool
+	// Reuse the selector's existing deadline clock for the uncommon blocked
+	// case instead of surrounding every ACK write with another pair of reads.
+	initialWaitDuration time.Duration
 }
 
 type transferCarrierMultiRouteWriter interface {
@@ -1413,6 +1462,10 @@ type routeSnapshot struct {
 	unreliableFlightMessageLimit   int
 	unreliableFlowIsolation        bool
 	unreliableFlowReserve          bool
+	// h1Only is true only when every currently active writer route is an H1
+	// carrier. Transfer uses it to recover H1's larger WebSocket message
+	// envelope without making an H3 DATAGRAM candidate exceed one tunnel MTU.
+	h1Only bool
 	// preferDirectRoute is non-nil only when every active route is an H1/H3
 	// platform carrier at the same priority and both transport types are live.
 	// routes is published with this route first. Writers use only that first
@@ -1476,6 +1529,7 @@ type transferFlightPolicySnapshot struct {
 	messageLimit  int
 	flowIsolation bool
 	flowReserve   bool
+	h1Only        bool
 	notify        <-chan struct{}
 }
 
@@ -1489,6 +1543,7 @@ func (self *MultiRouteSelector) transferFlightPolicy() transferFlightPolicySnaps
 		messageLimit:  snapshot.unreliableFlightMessageLimit,
 		flowIsolation: snapshot.unreliableFlowIsolation,
 		flowReserve:   snapshot.unreliableFlowReserve,
+		h1Only:        snapshot.h1Only,
 		notify:        snapshot.notify,
 	}
 }
@@ -1649,6 +1704,17 @@ func (self *routeSnapshot) writeDisposition(
 			properties.unreliableForMessageByteCount != nil && !unreliable,
 		route: route,
 	}
+}
+
+func (self *routeSnapshot) blockedWriteDisposition(
+	route Route,
+	transferFrameBytes []byte,
+	waitDuration time.Duration,
+) transferWriteDisposition {
+	disposition := self.writeDisposition(route, transferFrameBytes)
+	disposition.initiallyBlocked = true
+	disposition.initialWaitDuration = waitDuration
+	return disposition
 }
 
 func (self *MultiRouteSelector) transferRouteActive(route Route) bool {
@@ -1818,8 +1884,12 @@ func (self *MultiRouteSelector) updateActiveRoutesWithLock() {
 	}
 
 	allDirectRoutes := 0 < len(activeRoutes)
+	h1Only := 0 < len(activeRoutes)
 	for _, route := range activeRoutes {
 		transportType := routeTransportTypes[route]
+		if transportType != TransportTypeH1 {
+			h1Only = false
+		}
 		if transportType != TransportTypeH1 && transportType != TransportTypeH3 {
 			allDirectRoutes = false
 			break
@@ -1919,6 +1989,7 @@ func (self *MultiRouteSelector) updateActiveRoutesWithLock() {
 		unreliableFlightMessageLimit:   unreliableFlightMessageLimit,
 		unreliableFlowIsolation:        unreliableTransferPath && unreliableFlowIsolation,
 		unreliableFlowReserve:          unreliableTransferPath && unreliableFlowReserve,
+		h1Only:                         h1Only,
 		preferDirectRoute:              preferDirectRoute,
 		weight:                         weight,
 		notify:                         self.transportUpdate.NotifyChannel(),
@@ -2439,6 +2510,40 @@ func (self *MultiRouteSelector) writeDetailedWithCarrier(
 	)
 }
 
+// tryWriteH1AckPriorityWithCarrierPreference bypasses a full ordinary H1
+// carrier route when that transport opted into its bounded ACK companion.
+// It never waits: a full/missing priority lane falls through to the normal
+// writer, preserving its timeout, route withdrawal, and fallback behavior.
+// Accounting stays attached to the public route because the companion is one
+// writer lane of that exact carrier, not a separately selectable transport.
+func (self *MultiRouteSelector) tryWriteH1AckPriorityWithCarrierPreference(
+	transferFrameBytes []byte,
+	preferredTransportType TransportType,
+) (bool, transferWriteDisposition) {
+	if h1AckPriorityRouteCount.Load() == 0 {
+		return false, transferWriteDisposition{}
+	}
+
+	snapshot := self.acquireWriterSnapshot()
+	for _, route := range snapshot.writeRoutesForTransport(preferredTransportType) {
+		priorityRoute, ok := h1AckPriorityRoute(route)
+		if !ok {
+			continue
+		}
+		select {
+		case priorityRoute <- transferFrameBytes:
+			self.updateSendStats(route, 1, ByteCount(len(transferFrameBytes)))
+			snapshot.observeDirectAffinityWrite(route)
+			disposition := snapshot.writeDisposition(route, transferFrameBytes)
+			snapshot.releaseWriter()
+			return true, disposition
+		default:
+		}
+	}
+	snapshot.releaseWriter()
+	return false, transferWriteDisposition{}
+}
+
 // writeDetailedWithCarrierPreference applies the observed inbound carrier as
 // an affinity set. Every matching route and every strictly higher-priority
 // route remains eligible; equal- or lower-priority non-affinity routes do not
@@ -2523,7 +2628,11 @@ func (self *MultiRouteSelector) writeDetailedWithCarrierPreference(
 				if self.log.V(2).Enabled() {
 					self.log.Infof("[mrw]nb %s->%s s(%s)\n", self.clientTag, self.destination.DestinationId, self.destination.StreamId)
 				}
-				return true, snapshot.writeDisposition(route, transferFrameBytes), nil
+				return true, snapshot.blockedWriteDisposition(
+					route,
+					transferFrameBytes,
+					time.Since(enterTime),
+				), nil
 			default:
 				if route == snapshot.preferDirectRoute && !preferredBlockedObserved {
 					snapshot.observeDirectAffinityBlocked()
@@ -2574,7 +2683,11 @@ func (self *MultiRouteSelector) writeDetailedWithCarrierPreference(
 			self.updateSendStats(selectedRoute, 1, ByteCount(len(transferFrameBytes)))
 			snapshot.observeDirectAffinityWrite(selectedRoute)
 			snapshot.releaseWriter()
-			return true, snapshot.writeDisposition(selectedRoute, transferFrameBytes), nil
+			return true, snapshot.blockedWriteDisposition(
+				selectedRoute,
+				transferFrameBytes,
+				time.Since(enterTime),
+			), nil
 		}
 
 		// select cases are in order:
@@ -2663,7 +2776,11 @@ func (self *MultiRouteSelector) writeDetailedWithCarrierPreference(
 				if self.log.V(2).Enabled() {
 					self.log.Infof("[mrw]b %s->%s s(%s)\n", self.clientTag, self.destination.DestinationId, self.destination.SourceId)
 				}
-				return true, snapshot.writeDisposition(route, transferFrameBytes), nil
+				return true, snapshot.blockedWriteDisposition(
+					route,
+					transferFrameBytes,
+					time.Since(enterTime),
+				), nil
 			}
 		}
 	}

@@ -140,30 +140,46 @@ func TestMemoryBudgetFloors(t *testing.T) {
 }
 
 func TestResizeMessagePoolsSplitsBudget(t *testing.T) {
-	// the packet class takes the packet byte budget; the large object
-	// classes split the large object byte budget evenly
+	// The small/full packet classes split the packet budget 1:3; the large
+	// object classes split their budget evenly.
 	defer ResizeMessagePools(InitialMessagePoolByteCount/2, InitialMessagePoolByteCount/2)
 
 	ResizeMessagePools(mib(4), mib(2))
 	pools := orderedMessagePools()
-	AssertEqual(t, len(pools), 3)
-	AssertEqual(t, pools[0].size, packetPoolSize)
-	AssertEqual(t, pools[0].capacity(), int(mib(4))/pools[0].size)
-	for _, pool := range pools[1:] {
-		AssertEqual(t, pool.capacity(), int(mib(2))/len(pools[1:])/pool.size)
+	AssertEqual(t, len(pools), 4)
+	for _, pool := range pools {
+		switch pool.size {
+		case smallPacketPoolSize:
+			AssertEqual(t, pool.capacity(), int(mib(1))/pool.size)
+		case packetPoolSize:
+			AssertEqual(t, pool.capacity(), int(mib(3))/pool.size)
+		default:
+			AssertEqual(t, pool.capacity(), int(mib(1))/pool.size)
+		}
 	}
 
 	// tiny budgets clamp to the retention floors
 	ResizeMessagePools(0, 0)
-	AssertEqual(t, pools[0].capacity(), packetPoolFloorCount)
-	for _, pool := range pools[1:] {
-		AssertEqual(t, pool.capacity(), largeObjectPoolFloorCount(pool.size))
+	for _, pool := range pools {
+		if isPacketPoolSize(pool.size) {
+			AssertEqual(t, pool.capacity(), packetPoolFloorCount(pool.size))
+		} else {
+			AssertEqual(t, pool.capacity(), largeObjectPoolFloorCount(pool.size))
+		}
 	}
 
-	// the historical one-argument API gives every class the supplied cap
+	// The historical one-argument API gives every large class the supplied cap
+	// while the two packet classes share one supplied cap.
 	ResizeMessagePools(mib(3))
 	for _, pool := range pools {
-		AssertEqual(t, pool.capacity(), int(mib(3))/pool.size)
+		switch pool.size {
+		case smallPacketPoolSize:
+			AssertEqual(t, pool.capacity(), int(3*mib(1)/4)/pool.size)
+		case packetPoolSize:
+			AssertEqual(t, pool.capacity(), int(9*mib(1)/4)/pool.size)
+		default:
+			AssertEqual(t, pool.capacity(), int(mib(3))/pool.size)
+		}
 	}
 }
 
@@ -193,9 +209,12 @@ func TestTrimMessagePoolsToWarmPreservesCapacity(t *testing.T) {
 	for i, pool := range pools {
 		snapshot := pool.snapshot()
 		AssertEqual(t, snapshot.capacity, capacities[i])
-		if pool.size == packetPoolSize {
-			AssertEqual(t, snapshot.retained, min(capacities[i]/4, int(mib(1))/pool.size))
-		} else {
+		switch pool.size {
+		case smallPacketPoolSize:
+			AssertEqual(t, snapshot.retained, min(capacities[i]/2, int(mib(1)/2)/pool.size))
+		case packetPoolSize:
+			AssertEqual(t, snapshot.retained, min(capacities[i]/4, int(mib(1)/2)/pool.size))
+		default:
 			AssertEqual(t, snapshot.retained, largeObjectPoolFloorCount(pool.size))
 		}
 
@@ -233,9 +252,10 @@ func TestMobileMessagePoolWarmSetIsParameterized(t *testing.T) {
 	TrimMessagePoolsTo(mobileWarmByteCount)
 	for _, pool := range pools {
 		snapshot := pool.snapshot()
-		if pool.size == packetPoolSize {
-			AssertEqual(t, snapshot.retained, int(mobileWarmByteCount)/pool.size)
-		} else {
+		switch pool.size {
+		case smallPacketPoolSize, packetPoolSize:
+			AssertEqual(t, snapshot.retained, int(mobileWarmByteCount/2)/pool.size)
+		default:
 			AssertEqual(t, snapshot.retained, largeObjectPoolFloorCount(pool.size))
 		}
 	}
@@ -246,10 +266,41 @@ func TestMobileMessagePoolWarmSetIsParameterized(t *testing.T) {
 	WarmMessagePoolsTo(mobileWarmByteCount)
 	for _, pool := range pools {
 		snapshot := pool.snapshot()
-		if pool.size == packetPoolSize {
-			AssertEqual(t, snapshot.retained, int(mobileWarmByteCount)/pool.size)
+		switch pool.size {
+		case smallPacketPoolSize, packetPoolSize:
+			AssertEqual(t, snapshot.retained, int(mobileWarmByteCount/2)/pool.size)
+		default:
+			AssertEqual(t, snapshot.retained, 0)
+		}
+	}
+}
+
+func TestTinyPacketPoolWarmsAndTrimsToItsFullCapacity(t *testing.T) {
+	defer ResizeMessagePools(InitialMessagePoolByteCount/2, InitialMessagePoolByteCount/2)
+	defer ClearMessagePools()
+
+	const tinyPacketByteCount = ByteCount(256 * 1024)
+	ResizeMessagePools(tinyPacketByteCount, 512*1024)
+	ClearMessagePools()
+	WarmMessagePoolsTo(tinyPacketByteCount)
+
+	var retainedPacketByteCount ByteCount
+	for _, pool := range orderedMessagePools() {
+		snapshot := pool.snapshot()
+		if isPacketPoolSize(pool.size) {
+			AssertEqual(t, snapshot.retained, snapshot.capacity)
+			retainedPacketByteCount += ByteCount(snapshot.retained * pool.size)
 		} else {
 			AssertEqual(t, snapshot.retained, 0)
+		}
+	}
+	AssertEqual(t, retainedPacketByteCount, tinyPacketByteCount)
+
+	TrimMessagePoolsTo(tinyPacketByteCount)
+	for _, pool := range orderedMessagePools() {
+		if isPacketPoolSize(pool.size) {
+			snapshot := pool.snapshot()
+			AssertEqual(t, snapshot.retained, snapshot.capacity)
 		}
 	}
 }

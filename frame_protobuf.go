@@ -722,6 +722,9 @@ type decodedTransferFrame struct {
 	pathIds     [3]Id
 	carrier     protocol.Frame
 	packOwner   *decodedPackOwner
+	ack         protocol.Ack
+	ackIds      [3]Id
+	ackTag      protocol.Tag
 	sessionRole protocol.SequenceRole
 	companion   bool
 }
@@ -729,7 +732,9 @@ type decodedTransferFrame struct {
 // decodedTransferFrame itself contains pointer-bearing protobuf views into its
 // inline path/role storage, so Go conservatively moves it to the heap. Reuse
 // those synchronous wrappers through a second, much smaller bounded cache.
-// At 384 bytes/object on arm64, the 256-object cap retains at most 96 KiB.
+// Inline ACK storage raises the arm64 owner to 608 bytes; the 256-object cap
+// therefore retains at most 152 KiB while removing 240 B / five allocations
+// from every received ACK.
 const decodedTransferFramePoolCapacity = 256
 
 type decodedTransferFramePoolShard struct {
@@ -811,6 +816,7 @@ func (decoded *decodedTransferFrame) release() {
 		decoded.frame.Pack = nil
 	}
 	decoded.frame.TransferPath = nil
+	decoded.frame.Ack = nil
 	decoded.frame.EncryptedTransferFrame = nil
 	decoded.frame.SessionRole = nil
 	decoded.frame.SessionCompanion = nil
@@ -1364,6 +1370,99 @@ func decodeAck(b []byte) (*protocol.Ack, bool) {
 	return ack, true
 }
 
+// decodeAckOwned keeps the synchronous ACK wrapper and its fixed-size IDs in
+// decodedTransferFrame. Client.run copies the small semantic value into the
+// destination SendSequence before returning that owner, so the ACK hot path
+// does not allocate a protocol object or three byte slices per frame.
+func decodeAckOwned(b []byte, decoded *decodedTransferFrame) bool {
+	ack := &decoded.ack
+	for 0 < len(b) {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			return false
+		}
+		b = b[n:]
+		switch num {
+		case 1, 2: // message_id, sequence_id (bytes)
+			if typ != protowire.BytesType {
+				return false
+			}
+			v, vn := protowire.ConsumeBytes(b)
+			if vn < 0 {
+				return false
+			}
+			b = b[vn:]
+			if num == 1 {
+				if !setInlineProtoId(&ack.MessageId, &decoded.ackIds[0], v) {
+					return false
+				}
+			} else if !setInlineProtoId(&ack.SequenceId, &decoded.ackIds[1], v) {
+				return false
+			}
+		case 3: // selective
+			if typ != protowire.VarintType {
+				return false
+			}
+			v, vn := protowire.ConsumeVarint(b)
+			if vn < 0 {
+				return false
+			}
+			b = b[vn:]
+			ack.Selective = protowire.DecodeBool(v)
+		case 4: // tag (Tag)
+			if typ != protowire.BytesType {
+				return false
+			}
+			v, vn := protowire.ConsumeBytes(b)
+			if vn < 0 || !decodeTagInto(v, &decoded.ackTag) {
+				return false
+			}
+			b = b[vn:]
+			ack.Tag = &decoded.ackTag
+		case 5: // missing_contract_id (bytes)
+			if typ != protowire.BytesType {
+				return false
+			}
+			v, vn := protowire.ConsumeBytes(b)
+			if vn < 0 || !setInlineProtoId(
+				&ack.MissingContractId,
+				&decoded.ackIds[2],
+				v,
+			) {
+				return false
+			}
+			b = b[vn:]
+		case 6: // compact_contract_recovery
+			if typ != protowire.VarintType {
+				return false
+			}
+			v, vn := protowire.ConsumeVarint(b)
+			if vn < 0 {
+				return false
+			}
+			b = b[vn:]
+			ack.CompactContractRecovery = protowire.DecodeBool(v)
+		case 7: // logical_lane_version
+			if typ != protowire.VarintType {
+				return false
+			}
+			v, vn := protowire.ConsumeVarint(b)
+			if vn < 0 {
+				return false
+			}
+			b = b[vn:]
+			ack.LogicalLaneVersion = uint32(v)
+		default:
+			fn := protowire.ConsumeFieldValue(num, typ, b)
+			if fn < 0 {
+				return false
+			}
+			b = b[fn:]
+		}
+	}
+	return true
+}
+
 // unmarshalTransferFrame decodes b into tf (see the section comment for the
 // message_type/transfer_path deviations). decodePath controls whether the
 // transfer_path is materialized (true for the inner/unwrapped frame, which is
@@ -1487,11 +1586,18 @@ func unmarshalTransferFrameInto(
 				return false
 			}
 			b = b[vn:]
-			a, ok := decodeAck(v)
-			if !ok {
-				return false
+			if decoded == nil {
+				a, ok := decodeAck(v)
+				if !ok {
+					return false
+				}
+				tf.Ack = a
+			} else {
+				if !decodeAckOwned(v, decoded) {
+					return false
+				}
+				tf.Ack = &decoded.ack
 			}
-			tf.Ack = a
 		case 6: // encryptedTransferFrame (bytes)
 			if typ != protowire.BytesType {
 				return false

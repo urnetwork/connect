@@ -364,6 +364,37 @@ func TestMultiRouteWriterPublishesFlowReserveConservatively(t *testing.T) {
 	}
 }
 
+func TestMultiRouteWriterPublishesH1OnlyPolicy(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	selector := NewMultiRouteSelector(ctx, "h1-group-policy", nil, TransferPath{}, false)
+	defer selector.Close()
+
+	h1Transport := NewSendGatewayTransportWithType(TransportTypeH1)
+	h1Route := make(Route, 1)
+	selector.updateTransportWithProperties(h1Transport, []Route{h1Route}, TransferCarrierProperties{})
+	if policy := selector.transferFlightPolicy(); !policy.h1Only {
+		t.Fatalf("H1 route policy = %+v, want H1-only", policy)
+	}
+
+	h3Transport := NewSendGatewayTransportWithType(TransportTypeH3)
+	h3Route := make(Route, 1)
+	selector.updateTransportWithProperties(h3Transport, []Route{h3Route}, TransferCarrierProperties{})
+	if policy := selector.transferFlightPolicy(); policy.h1Only {
+		t.Fatalf("mixed H1/H3 policy = %+v, must keep MTU-compatible groups", policy)
+	}
+
+	selector.updateTransport(h3Transport, nil)
+	if policy := selector.transferFlightPolicy(); !policy.h1Only {
+		t.Fatalf("restored H1 policy = %+v, want H1-only", policy)
+	}
+
+	selector.updateTransport(h1Transport, nil)
+	if policy := selector.transferFlightPolicy(); policy.h1Only {
+		t.Fatalf("empty policy = %+v, must not assume H1", policy)
+	}
+}
+
 // The route-wide policy still tells Transfer that a hybrid carrier exists,
 // while the exact accepted message disposition distinguishes its reliable and
 // unreliable lanes. The public transport-only result remains unchanged.

@@ -81,6 +81,51 @@ func BenchmarkRouteSnapshotWriterAdmission(b *testing.B) {
 	})
 }
 
+// Isolates the extra ACK-only probe. Default/server transports keep the
+// process-wide registration count at zero, so their cost is one atomic load
+// and no route-snapshot admission or map lookup.
+func BenchmarkRouteSelectorH1AckPriorityProbe(b *testing.B) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	selector := NewMultiRouteSelector(ctx, "bench", nil, SourceId(NewId()), true)
+	defer selector.Close()
+	route := make(Route, 1)
+	selector.updateTransport(
+		NewSendGatewayTransportWithType(TransportTypeH1),
+		[]Route{route},
+	)
+	frame := make([]byte, 128)
+
+	b.Run("server_disabled", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if success, _ := selector.tryWriteH1AckPriorityWithCarrierPreference(
+				frame,
+				TransportTypeH1,
+			); success {
+				b.Fatal("disabled priority probe accepted a frame")
+			}
+		}
+	})
+
+	priorityRoute := make(Route, 1)
+	registerH1AckPriorityRoute(route, priorityRoute)
+	defer unregisterH1AckPriorityRoute(route)
+	b.Run("mobile_enabled", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if success, _ := selector.tryWriteH1AckPriorityWithCarrierPreference(
+				frame,
+				TransportTypeH1,
+			); !success {
+				b.Fatal("enabled priority probe rejected a ready frame")
+			}
+			<-priorityRoute
+		}
+	})
+}
+
 // isolates the route-selector read hot path (one active route).
 func BenchmarkRouteSelectorRead(b *testing.B) {
 	ctx, cancel := context.WithCancel(context.Background())

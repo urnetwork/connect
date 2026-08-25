@@ -256,6 +256,30 @@ func TestWebSocketWriteBatchSteadyStateDoesNotAllocate(t *testing.T) {
 	AssertEqual(t, allocCount, float64(0))
 }
 
+func TestPlatformWebSocketReadyDrainBalancesAcksAndPayloadBytes(t *testing.T) {
+	readyCount := func(messageByteCount int) (count int, byteCount int) {
+		count = 1
+		byteCount = messageByteCount
+		for platformWebSocketWriteBatchCanDrain(count, byteCount) {
+			count += 1
+			byteCount += messageByteCount
+		}
+		return
+	}
+
+	if count, bytes := readyCount(128); count != 32 || bytes != 4*1024 {
+		t.Fatalf("ACK-sized ready drain=(%d, %dB), want (32, 4096B)", count, bytes)
+	}
+	if count, bytes := readyCount(DefaultMtu); count != 12 ||
+		bytes >= webSocketWriteBatchMaxByteCount {
+		t.Fatalf("tunnel-MTU ready drain=(%d, %dB), want 12 below 16KiB", count, bytes)
+	}
+	if count, bytes := readyCount(4 * 1024); count != 3 ||
+		bytes != platformWebSocketWriteBatchDrainByteCount {
+		t.Fatalf("maximum H1 ready drain=(%d, %dB), want (3, 12288B)", count, bytes)
+	}
+}
+
 func BenchmarkWebSocketWriteBatchReadyMessages(b *testing.B) {
 	underlying := &immediateWriteConn{}
 	conn := NewWebSocketWriteBatchConn(underlying)

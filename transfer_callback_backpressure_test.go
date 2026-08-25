@@ -36,7 +36,7 @@ func TestSendSequenceCloseCallbackBackpressureIsDestinationLocal(t *testing.T) {
 		cancel:      sequenceCancel,
 		destination: destination,
 		packs:       make(chan *SendPack, 1),
-		acks:        make(chan *protocol.Ack, 1),
+		acks:        make(chan receiveAckMessage, 1),
 	}
 	id := sequence.id()
 	wireId := id.wireId()
@@ -466,20 +466,19 @@ func TestClientReceiveAckHandoffDoesNotBlockUnrelatedSource(t *testing.T) {
 	sequenceCtx, sequenceCancel := context.WithCancel(ctx)
 	sequenceId := NewId()
 	sequence := &SendSequence{
-		ctx:        sequenceCtx,
-		cancel:     sequenceCancel,
-		sequenceId: sequenceId,
-		acks:       make(chan *protocol.Ack, 1),
+		ctx:         sequenceCtx,
+		cancel:      sequenceCancel,
+		destination: ackSourceId,
+		sequenceId:  sequenceId,
+		acks:        make(chan receiveAckMessage, 1),
 	}
-	sequence.acks <- &protocol.Ack{}
+	sequence.acks <- receiveAckMessage{}
 	client.sendBuffer.mutex.Lock()
-	client.sendBuffer.sendSequencesByDestination[ackSourceId] = map[*SendSequence]bool{
-		sequence: true,
-	}
+	client.sendBuffer.sendSequencesBySequenceId[sequenceId] = sequence
 	client.sendBuffer.mutex.Unlock()
 	defer func() {
 		client.sendBuffer.mutex.Lock()
-		delete(client.sendBuffer.sendSequencesByDestination, ackSourceId)
+		delete(client.sendBuffer.sendSequencesBySequenceId, sequenceId)
 		client.sendBuffer.mutex.Unlock()
 		sequenceCancel()
 	}()
@@ -529,7 +528,8 @@ func TestClientReceiveAckHandoffDoesNotBlockUnrelatedSource(t *testing.T) {
 		t.Fatal("a full receive ACK handoff blocked an unrelated source")
 	}
 	if stats := client.ReceiveStats(); stats.PackHandoffDropCount != 0 ||
-		stats.PackHandoffDropByteCount != 0 || stats.AckHandoffDropCount != 1 {
+		stats.PackHandoffDropByteCount != 0 || stats.AckHandoffDropCount != 1 ||
+		stats.AckHandoffQueueFullCount != 1 || stats.AckHandoffMissCount != 0 {
 		t.Fatalf("full ACK handoff receive stats = %+v", stats)
 	}
 }

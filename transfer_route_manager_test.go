@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
+	"runtime"
 	"slices"
 	"testing"
 	"time"
@@ -555,6 +556,162 @@ func TestMultiRouteWriterCarrierPreferenceWaitsAndFallsBackOnlyAfterWithdrawal(t
 
 	selector.updateTransport(h3Transport, nil)
 	write(TransportTypeH1)
+}
+
+func TestMultiRouteWriterH1AckPriorityBypassesFullOrdinaryRoute(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	selector := NewMultiRouteSelector(
+		ctx,
+		"h1-ack-priority",
+		nil,
+		DestinationId(NewId()),
+		true,
+	)
+	defer selector.Close()
+	h1Route := make(Route, 1)
+	priorityRoute := make(Route, 1)
+	selector.updateTransport(
+		NewSendGatewayTransportWithType(TransportTypeH1),
+		[]Route{h1Route},
+	)
+	registerH1AckPriorityRoute(h1Route, priorityRoute)
+	defer unregisterH1AckPriorityRoute(h1Route)
+
+	ordinaryBlocker := MessagePoolGet(32)
+	h1Route <- ordinaryBlocker
+	ack := MessagePoolGet(64)
+	success, disposition := selector.tryWriteH1AckPriorityWithCarrierPreference(
+		ack,
+		TransportTypeH1,
+	)
+	if !success || disposition.route != h1Route ||
+		disposition.transportType != TransportTypeH1 || !disposition.reliable {
+		if !success {
+			MessagePoolReturn(ack)
+		}
+		t.Fatalf("priority ACK disposition = (%t, %+v)", success, disposition)
+	}
+	if got := <-priorityRoute; &got[0] != &ack[0] {
+		MessagePoolReturn(got)
+		t.Fatal("priority route did not receive the original pooled ownership")
+	} else {
+		MessagePoolReturn(got)
+	}
+	MessagePoolReturn(<-h1Route)
+
+	unregisterH1AckPriorityRoute(h1Route)
+	ack = MessagePoolGet(64)
+	if success, _ := selector.tryWriteH1AckPriorityWithCarrierPreference(
+		ack,
+		TransportTypeH1,
+	); success {
+		MessagePoolReturn(<-priorityRoute)
+		t.Fatal("unregistered priority route accepted an ACK")
+	}
+	MessagePoolReturn(ack)
+}
+
+func TestMultiRouteWriterFullH1AckPriorityFallsThroughWithoutOwnership(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	selector := NewMultiRouteSelector(
+		ctx,
+		"h1-ack-priority-full",
+		nil,
+		DestinationId(NewId()),
+		true,
+	)
+	defer selector.Close()
+	h1Route := make(Route, 1)
+	priorityRoute := make(Route, 1)
+	selector.updateTransport(
+		NewSendGatewayTransportWithType(TransportTypeH1),
+		[]Route{h1Route},
+	)
+	registerH1AckPriorityRoute(h1Route, priorityRoute)
+	defer unregisterH1AckPriorityRoute(h1Route)
+
+	priorityBlocker := MessagePoolGet(32)
+	priorityRoute <- priorityBlocker
+	ack := MessagePoolGet(64)
+	if success, _ := selector.tryWriteH1AckPriorityWithCarrierPreference(
+		ack,
+		TransportTypeH1,
+	); success {
+		MessagePoolReturn(<-priorityRoute)
+		t.Fatal("full priority route unexpectedly accepted an ACK")
+	}
+	// A failed nonblocking attempt transfers no ownership.
+	MessagePoolReturn(ack)
+	MessagePoolReturn(<-priorityRoute)
+}
+
+func TestMultiRouteWriterDispositionReportsInitialQueueBlock(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	selector := NewMultiRouteSelector(
+		ctx,
+		"blocked-write-disposition",
+		nil,
+		DestinationId(NewId()),
+		true,
+	)
+	defer selector.Close()
+	route := make(Route, 1)
+	route <- MessagePoolGet(32)
+	selector.updateTransport(
+		NewSendGatewayTransportWithType(TransportTypeH1),
+		[]Route{route},
+	)
+
+	type result struct {
+		success     bool
+		disposition transferWriteDisposition
+		err         error
+	}
+	done := make(chan result, 1)
+	message := MessagePoolGet(64)
+	go func() {
+		success, disposition, err := selector.writeDetailedWithCarrier(
+			ctx,
+			message,
+			time.Second,
+		)
+		done <- result{success, disposition, err}
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for selector.writeMutex.TryLock() {
+		selector.writeMutex.Unlock()
+		if deadline.Before(time.Now()) {
+			MessagePoolReturn(<-route)
+			t.Fatal("write did not enter the blocked selector path")
+		}
+		runtime.Gosched()
+	}
+	MessagePoolReturn(<-route)
+	writeResult := <-done
+	if !writeResult.success || writeResult.err != nil {
+		MessagePoolReturn(message)
+		t.Fatalf(
+			"blocked write result=(%t, %v)",
+			writeResult.success,
+			writeResult.err,
+		)
+	}
+	MessagePoolReturn(<-route)
+	if !writeResult.disposition.initiallyBlocked {
+		t.Fatal("blocked route write was reported as an immediate write")
+	}
+	if writeResult.disposition.initialWaitDuration <= 0 {
+		t.Fatalf(
+			"blocked route wait=%v, want positive duration",
+			writeResult.disposition.initialWaitDuration,
+		)
+	}
 }
 
 // Affinity is intentionally narrower than generic route weighting. P2P and

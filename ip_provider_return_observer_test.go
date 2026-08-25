@@ -406,8 +406,8 @@ func TestRemoteUserNatProviderReturnObserverPairsInvalidFlowKey(t *testing.T) {
 	}
 }
 
-// One logical batch larger than the two-frame chunk cap emits one observer
-// pair with aggregate accounting, even though it creates three SendPacks.
+// One socket drain larger than the provider fairness cap emits one observer
+// pair with aggregate accounting, even though it creates three logical groups.
 func TestRemoteUserNatProviderReturnObserverPairsMultichunkBatch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -426,7 +426,7 @@ func TestRemoteUserNatProviderReturnObserverPairsMultichunkBatch(t *testing.T) {
 	sequence.packs = make(chan *SendPack, 3)
 	releases := make(chan struct{}, 1)
 	provider.afterReturnReleaseForTest = func() { releases <- struct{}{} }
-	fixture := newProviderReturnObserverItem(t, peerId, 5, true)
+	fixture := newProviderReturnObserverItem(t, peerId, 33, true)
 	if !provider.enqueueReturnItem(fixture.item) {
 		t.Fatal("multichunk provider return was not admitted")
 	}
@@ -439,7 +439,7 @@ func TestRemoteUserNatProviderReturnObserverPairsMultichunkBatch(t *testing.T) {
 		RemoteUserNatProviderReturnSendPhaseStarted,
 		started.Token,
 		fixture.flowKey,
-		5,
+		33,
 		fixture.totalBytes,
 		false,
 	)
@@ -449,14 +449,20 @@ func TestRemoteUserNatProviderReturnObserverPairsMultichunkBatch(t *testing.T) {
 		RemoteUserNatProviderReturnSendPhaseCompleted,
 		started.Token,
 		fixture.flowKey,
-		5,
+		33,
 		fixture.totalBytes,
 		true,
 	)
-	for chunkIndex, wantFrameCount := range []int{2, 2, 1} {
+	for chunkIndex, wantFrameCount := range []int{16, 16, 1} {
 		queued := waitProviderReturnTestPack(t, sequence)
-		if len(queued.Frames) != wantFrameCount {
-			t.Fatalf("multichunk Pack %d frame count=%d, want %d", chunkIndex, len(queued.Frames), wantFrameCount)
+		if !queued.logicalGroup || len(queued.Frames) != wantFrameCount {
+			t.Fatalf(
+				"multichunk logical group %d = (logical=%t, frames=%d), want (true,%d)",
+				chunkIndex,
+				queued.logicalGroup,
+				len(queued.Frames),
+				wantFrameCount,
+			)
 		}
 		queued.returnFrames()
 	}
@@ -466,8 +472,8 @@ func TestRemoteUserNatProviderReturnObserverPairsMultichunkBatch(t *testing.T) {
 	fixture.releaseWitnesses(t)
 }
 
-// If only the first chunk enters Transfer, the one item completion remains
-// aggregate and false while congestion accounting names only failed chunks.
+// If only the first logical group enters Transfer, the item completion remains
+// aggregate and false while congestion accounting names only failed groups.
 func TestRemoteUserNatProviderReturnObserverPairsPartialChunkFailure(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -486,7 +492,7 @@ func TestRemoteUserNatProviderReturnObserverPairsPartialChunkFailure(t *testing.
 	sequence.packs = make(chan *SendPack, 1)
 	releases := make(chan struct{}, 1)
 	provider.afterReturnReleaseForTest = func() { releases <- struct{}{} }
-	fixture := newProviderReturnObserverItem(t, peerId, 5, true)
+	fixture := newProviderReturnObserverItem(t, peerId, 33, true)
 	if !provider.enqueueReturnItem(fixture.item) {
 		t.Fatal("partial-failure provider return was not admitted")
 	}
@@ -499,7 +505,7 @@ func TestRemoteUserNatProviderReturnObserverPairsPartialChunkFailure(t *testing.
 		RemoteUserNatProviderReturnSendPhaseStarted,
 		started.Token,
 		fixture.flowKey,
-		5,
+		33,
 		fixture.totalBytes,
 		false,
 	)
@@ -509,19 +515,26 @@ func TestRemoteUserNatProviderReturnObserverPairsPartialChunkFailure(t *testing.
 		RemoteUserNatProviderReturnSendPhaseCompleted,
 		started.Token,
 		fixture.flowKey,
-		5,
+		33,
 		fixture.totalBytes,
 		false,
 	)
 	queued := waitProviderReturnTestPack(t, sequence)
-	if len(queued.Frames) != 2 {
-		t.Fatalf("partial-failure admitted frame count=%d, want 2", len(queued.Frames))
+	if !queued.logicalGroup || len(queued.Frames) != 16 {
+		t.Fatalf(
+			"partial-failure admitted group = (logical=%t, frames=%d), want (true,16)",
+			queued.logicalGroup,
+			len(queued.Frames),
+		)
 	}
 	queued.returnFrames()
-	failedBytes := fixture.byteCounts[2] + fixture.byteCounts[3] + fixture.byteCounts[4]
+	var failedBytes ByteCount
+	for _, byteCount := range fixture.byteCounts[16:] {
+		failedBytes += byteCount
+	}
 	drops := provider.CongestionDropStats()
-	if drops.ReturnSendPacketCount != 3 || drops.ReturnSendByteCount != failedBytes {
-		t.Fatalf("partial chunk failure drops=%+v, want 3/%d", drops, failedBytes)
+	if drops.ReturnSendPacketCount != 17 || drops.ReturnSendByteCount != failedBytes {
+		t.Fatalf("partial group failure drops=%+v, want 17/%d", drops, failedBytes)
 	}
 	if eventCount := len(events); eventCount != 0 {
 		t.Fatalf("partial-failure item emitted %d extra observations", eventCount)

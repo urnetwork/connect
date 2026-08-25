@@ -58,8 +58,8 @@ func startDnsResponder(t *testing.T, answer [4]byte) int {
 			q := query.Questions[0]
 			response := dnsmessage.Message{
 				Header: dnsmessage.Header{
-					ID:            query.Header.ID,
-					Response:      true,
+					ID:                 query.Header.ID,
+					Response:           true,
 					RecursionDesired:   query.Header.RecursionDesired,
 					RecursionAvailable: true,
 				},

@@ -44,13 +44,18 @@ func TestReceiveSequenceCancelDrainsFinalAck(t *testing.T) {
 	receiveBufferSettings.AckCompressTimeout = time.Hour
 	receiveBufferSettings.WriteTimeout = time.Second
 	compressWaiting := make(chan struct{})
+	primeWritten := make(chan struct{})
 	cleanupPaused := make(chan struct{})
 	releaseCleanup := make(chan struct{})
 	var compressWaitingOnce sync.Once
+	var primeWrittenOnce sync.Once
 	var cleanupPausedOnce sync.Once
 	var releaseCleanupOnce sync.Once
 	receiveBufferSettings.beforeAckCompressWaitForTest = func(receiveSequenceId) {
 		compressWaitingOnce.Do(func() { close(compressWaiting) })
+	}
+	receiveBufferSettings.afterAckWriteForTest = func(receiveSequenceId) {
+		primeWrittenOnce.Do(func() { close(primeWritten) })
 	}
 	receiveBufferSettings.beforeAckWorkerStopForTest = func(receiveSequenceId) {
 		cleanupPausedOnce.Do(func() { close(cleanupPaused) })
@@ -72,17 +77,31 @@ func TestReceiveSequenceCancelDrainsFinalAck(t *testing.T) {
 		false,
 		receiveBufferSettings,
 	)
-	receiveSequence.deliverItems = []*receiveItem{
-		{
-			transferItem: transferItem{
-				messageId:      messageId,
-				sequenceNumber: 1,
-			},
-			ack: true,
-		},
+	go receiveSequence.Run()
+	// Prime the rate limiter with one idle-burst ACK. The optimized worker sends
+	// that first ACK immediately; cancellation below publishes the final item
+	// inside the one-hour interval and therefore pins the compression wait.
+	primeMessageId := NewId()
+	receiveSequence.ackWindow.Update(sequenceAck{
+		sequenceNumber: 0,
+		messageId:      primeMessageId,
+	})
+	select {
+	case transferFrameBytes := <-gatewayRoute:
+		MessagePoolReturn(transferFrameBytes)
+	case <-time.After(5 * time.Second):
+		t.Fatal("idle-burst ACK waited for the compression interval")
+	}
+	select {
+	case <-primeWritten:
+	case <-time.After(5 * time.Second):
+		t.Fatal("idle-burst ACK write did not complete")
 	}
 
-	go receiveSequence.Run()
+	receiveSequence.ackWindow.Update(sequenceAck{
+		sequenceNumber: 1,
+		messageId:      messageId,
+	})
 	select {
 	case <-compressWaiting:
 	case <-time.After(5 * time.Second):

@@ -1545,6 +1545,91 @@ type MultiClientMemorySnapshot struct {
 	QualityClientCount int
 	SpeedClientCount   int
 	FlowCount          int
+
+	// Aggregate existing per-Client Transfer counters without installing a
+	// packet observer. These distinguish a full receive/ACK handoff from
+	// upstream route variance in physical low-memory measurements.
+	PackHandoffDropCount       uint64
+	PackHandoffDropByteCount   uint64
+	PackHandoffWaitCount       uint64
+	PackHandoffWaitSuccess     uint64
+	PackHandoffMaxCount        uint64
+	PackHandoffMaxByteCount    uint64
+	AckHandoffDropCount        uint64
+	AckHandoffQueueFullCount   uint64
+	AckHandoffMissCount        uint64
+	AckHandoffWaitCount        uint64
+	AckHandoffWaitSuccess      uint64
+	AckRouteWriteCount         uint64
+	AckRoutePriorityWriteCount uint64
+	AckRouteWriteBlockedCount  uint64
+	AckRouteWriteErrorCount    uint64
+	AckRouteWriteWaitNanos     uint64
+	AckRouteWriteMaxWaitNanos  uint64
+	InitialWriteCount          uint64
+	InitialFrameCount          uint64
+	InitialMessageByteCount    uint64
+	TimeoutResendWriteCount    uint64
+	CarrierChangeWriteCount    uint64
+	SelectiveGapWriteCount     uint64
+	AckTailProbeWriteCount     uint64
+	CumulativeProbeWriteCount  uint64
+	RecoveryWriteErrorCount    uint64
+}
+
+func addMultiClientTransferMemorySnapshot(
+	snapshot *MultiClientMemorySnapshot,
+	window *multiClientWindow,
+	clientCount *int,
+) {
+	if window == nil {
+		return
+	}
+	window.stateLock.Lock()
+	*clientCount = len(window.clients)
+	for _, channel := range window.clients {
+		if channel == nil || channel.client == nil {
+			continue
+		}
+		receive := channel.client.ReceiveStats()
+		snapshot.PackHandoffDropCount += receive.PackHandoffDropCount
+		snapshot.PackHandoffDropByteCount += receive.PackHandoffDropByteCount
+		snapshot.PackHandoffWaitCount += receive.PackHandoffWaitCount
+		snapshot.PackHandoffWaitSuccess += receive.PackHandoffWaitSuccess
+		snapshot.PackHandoffMaxCount = max(
+			snapshot.PackHandoffMaxCount,
+			receive.PackHandoffMaxCount,
+		)
+		snapshot.PackHandoffMaxByteCount = max(
+			snapshot.PackHandoffMaxByteCount,
+			receive.PackHandoffMaxByteCount,
+		)
+		snapshot.AckHandoffDropCount += receive.AckHandoffDropCount
+		snapshot.AckHandoffQueueFullCount += receive.AckHandoffQueueFullCount
+		snapshot.AckHandoffMissCount += receive.AckHandoffMissCount
+		snapshot.AckHandoffWaitCount += receive.AckHandoffWaitCount
+		snapshot.AckHandoffWaitSuccess += receive.AckHandoffWaitSuccess
+		snapshot.AckRouteWriteCount += receive.AckRouteWriteCount
+		snapshot.AckRoutePriorityWriteCount += receive.AckRoutePriorityWriteCount
+		snapshot.AckRouteWriteBlockedCount += receive.AckRouteWriteBlockedCount
+		snapshot.AckRouteWriteErrorCount += receive.AckRouteWriteErrorCount
+		snapshot.AckRouteWriteWaitNanos += uint64(receive.AckRouteWriteWaitDuration)
+		snapshot.AckRouteWriteMaxWaitNanos = max(
+			snapshot.AckRouteWriteMaxWaitNanos,
+			uint64(receive.AckRouteWriteMaxWait),
+		)
+		recovery := channel.client.SendRecoveryStats()
+		snapshot.InitialWriteCount += recovery.InitialWriteCount
+		snapshot.InitialFrameCount += recovery.InitialFrameCount
+		snapshot.InitialMessageByteCount += recovery.InitialMessageByteCount
+		snapshot.TimeoutResendWriteCount += recovery.TimeoutResendWriteCount
+		snapshot.CarrierChangeWriteCount += recovery.CarrierChangeWriteCount
+		snapshot.SelectiveGapWriteCount += recovery.SelectiveGapWriteCount
+		snapshot.AckTailProbeWriteCount += recovery.AckTailProbeWriteCount
+		snapshot.CumulativeProbeWriteCount += recovery.CumulativeProbeWriteCount
+		snapshot.RecoveryWriteErrorCount += recovery.RecoveryWriteErrorCount
+	}
+	window.stateLock.Unlock()
 }
 
 // MemorySnapshot samples the current connected topology without constructing
@@ -1556,16 +1641,16 @@ func (self *RemoteUserNatMultiClient) MemorySnapshot() MultiClientMemorySnapshot
 		return MultiClientMemorySnapshot{}
 	}
 	var snapshot MultiClientMemorySnapshot
-	if window := self.windows[WindowTypeQuality]; window != nil {
-		window.stateLock.Lock()
-		snapshot.QualityClientCount = len(window.clients)
-		window.stateLock.Unlock()
-	}
-	if window := self.windows[WindowTypeSpeed]; window != nil {
-		window.stateLock.Lock()
-		snapshot.SpeedClientCount = len(window.clients)
-		window.stateLock.Unlock()
-	}
+	addMultiClientTransferMemorySnapshot(
+		&snapshot,
+		self.windows[WindowTypeQuality],
+		&snapshot.QualityClientCount,
+	)
+	addMultiClientTransferMemorySnapshot(
+		&snapshot,
+		self.windows[WindowTypeSpeed],
+		&snapshot.SpeedClientCount,
+	)
 	self.stateLock.Lock()
 	snapshot.FlowCount = len(self.flowUpdates)
 	self.stateLock.Unlock()

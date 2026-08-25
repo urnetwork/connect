@@ -163,7 +163,9 @@ type UserNatClient interface {
 }
 
 // UserNatBatchClient optionally admits an owned packet list. The method
-// consumes every packet and returns the number accepted for delivery.
+// consumes every packet and returns the number accepted for delivery. The
+// outer slice is borrowed only for the duration of the call; implementations
+// that queue a batch asynchronously must copy that slice metadata.
 type UserNatBatchClient interface {
 	UserNatClient
 	SendPacketBatch(
@@ -771,7 +773,10 @@ func (self *LocalUserNat) SendPacketBatch(
 	if len(packets) == 0 {
 		return 0
 	}
-	if self.SendPacketsWithTimeout(source, provideMode, packets, timeout) {
+	// SendPacketsWithTimeout queues the list itself. Preserve the batch-client
+	// contract by owning the slice metadata while retaining packet ownership.
+	ownedPackets := slices.Clone(packets)
+	if self.SendPacketsWithTimeout(source, provideMode, ownedPackets, timeout) {
 		return len(packets)
 	}
 	for _, packet := range packets {
@@ -3178,14 +3183,8 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 		})
 		return sequence
 	}
-	sendItem := &TcpSendItem{
-		source:      source,
-		transferKey: transferKey,
-		provideMode: provideMode,
-		tcp:         *tcp,
-		ipPacket:    ipPacket,
-	}
-	if sequence := initSequence(); sequence == nil {
+	sequence := initSequence()
+	if sequence == nil {
 		if orphanRst != nil {
 			// The shared local-NAT shard owns this synthesized control, so its
 			// callback must retain a nonblocking recovery contract.
@@ -3208,9 +3207,26 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 		}
 		// sequence does not exist and not a syn packet, drop
 		return false, nil
-	} else {
-		return sequence.send(sendItem, timeout)
 	}
+
+	// An established pure ACK has no sequence-space ordering dependency. Apply
+	// its monotonic acknowledgement/window update directly so a download does
+	// not allocate and schedule one TcpSendItem for every browser ACK. The
+	// sequence method returns false until the SYN has initialized the flow, in
+	// which case the ordinary queue preserves handshake order.
+	if tcp.ack && !tcp.syn && !tcp.fin && !tcp.rst && len(tcp.payload) == 0 &&
+		sequence.applyEstablishedPureAck(source, transferKey, tcp, ipPacket) {
+		return true, nil
+	}
+
+	sendItem := &TcpSendItem{
+		source:      source,
+		transferKey: transferKey,
+		provideMode: provideMode,
+		tcp:         *tcp,
+		ipPacket:    ipPacket,
+	}
+	return sequence.send(sendItem, timeout)
 }
 
 // removeSequenceWithLock is the TCP counterpart of the UDP helper above.
@@ -3353,6 +3369,13 @@ type TcpSequence struct {
 	// Lazily allocated only when the bounded send queue actually blocks.
 	// sendMutex serializes Reset/Stop.
 	sendTimer *time.Timer
+	// Pure return-path ACKs can update an established flow without occupying
+	// the sequence-space data queue. The condition remains shared with the
+	// socket reader so a direct window update wakes a blocked download. Some
+	// focused tests build TcpSequence values directly, hence lazy initialization.
+	receiveAckCondOnce sync.Once
+	receiveAckCond     *sync.Cond
+	established        bool // guarded by ConnectionState.mutex
 
 	idleCondition *IdleCondition
 	transferState transferState
@@ -3533,6 +3556,61 @@ func (self *TcpSequence) send(sendItem *TcpSendItem, timeout time.Duration) (boo
 	}
 }
 
+func (self *TcpSequence) receiveAckCondition() *sync.Cond {
+	self.receiveAckCondOnce.Do(func() {
+		self.receiveAckCond = sync.NewCond(&self.mutex)
+	})
+	return self.receiveAckCond
+}
+
+// applyEstablishedPureAck applies the independent ACK/window half of a TCP
+// packet directly after the flow handshake. Pure ACKs consume no TCP sequence
+// space, and applySendAckWithLock already preserves the greatest advertised
+// window edge, so making them wait behind upload data only adds allocation and
+// scheduler latency. Packets that arrive before initializeSynWithLock, carry
+// payload, or change connection state retain the ordered sendItems path.
+//
+// A true result transfers and returns ipPacket ownership. False leaves it with
+// the caller, which must use the ordinary sequence queue or reject it.
+func (self *TcpSequence) applyEstablishedPureAck(
+	source TransferPath,
+	transferKey TransferKey,
+	tcp *parsedTcp,
+	ipPacket []byte,
+) bool {
+	self.sendMutex.Lock()
+	defer self.sendMutex.Unlock()
+
+	select {
+	case <-self.ctx.Done():
+		return false
+	default:
+	}
+
+	self.mutex.Lock()
+	if !self.established {
+		self.mutex.Unlock()
+		return false
+	}
+	self.mutex.Unlock()
+
+	self.transferState.update(source, transferKey)
+	if !self.idleCondition.UpdateOpen() {
+		return false
+	}
+	defer self.idleCondition.UpdateClose()
+
+	self.mutex.Lock()
+	self.updateTimestampRecentWithLock(tcp)
+	if self.applySendAckWithLock(tcp) {
+		self.receiveAckCondition().Broadcast()
+	}
+	self.mutex.Unlock()
+
+	MessagePoolReturn(ipPacket)
+	return true
+}
+
 // initializeSynWithLock establishes sequence and window state from the first
 // SYN. The sequence mutex must be held.
 func (self *TcpSequence) initializeSynWithLock(tcp *parsedTcp) {
@@ -3556,6 +3634,7 @@ func (self *TcpSequence) initializeSynWithLock(tcp *parsedTcp) {
 	self.receiveWindowSize = uint32(tcp.windowSize)
 	self.receiveWindowEnd = self.receiveSeqAck + self.receiveWindowSize
 	self.receiveWindowEndSet = true
+	self.established = true
 	if self.enableWindowScale {
 		bits := math.Log2(float64(self.tcpBufferSettings.MaxWindowSize) / float64(math.MaxUint16))
 		if 0 <= bits {
@@ -3795,7 +3874,7 @@ func (self *TcpSequence) Run() {
 		}
 	*/
 
-	receiveAckCond := sync.NewCond(&self.mutex)
+	receiveAckCond := self.receiveAckCondition()
 	ackCond := sync.NewCond(&self.mutex)
 	defer func() {
 		self.mutex.Lock()
@@ -5831,12 +5910,13 @@ func providerReturnIpTransferOptions(
 }
 
 // `ReceivePacketFunction`
-// providerReturnBatchMaxFrames / providerReturnBatchMaxBytes bound one
-// coalesced return Pack so the complete encrypted Transfer frame stays eligible
-// for one H3 DATAGRAM. One full-MTU packet, or up to two smaller packets whose
-// combined message bytes stay within one MTU, fit the bound.
-const providerReturnBatchMaxFrames = sendPackBatchMaxFrames
-const providerReturnBatchMaxBytes = sendPackBatchMaxMessageByteCount
+// providerReturnBatchMaxFrames / providerReturnBatchMaxBytes bound one logical
+// provider return group. SendSequence applies the actual carrier wire bound:
+// H3 keeps the existing two-frame/one-MTU DATAGRAM-safe chunks, while H1 can
+// amortize routing, encryption, and framing over a larger reliable-stream
+// group. The byte cap also prevents one busy flow from monopolizing admission.
+const providerReturnBatchMaxFrames = 16
+const providerReturnBatchMaxBytes = 24 * 1024
 
 // Retries caller-owned socket-return data until Transfer accepts it or the
 // provider closes. Every non-owned callback has one downstream disposition,
@@ -5953,7 +6033,8 @@ func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bo
 	return sent
 }
 
-// sendReturnBatch builds bounded frame chunks and sends each as one Pack.
+// sendReturnBatch builds bounded logical frame groups. SendSequence splits each
+// group into carrier-safe physical Packs after its route generation is known.
 // Every packet share either moves into a raw frame or is returned after legacy
 // wrapping before this function exits.
 func (self *RemoteUserNatProvider) sendReturnBatch(item *providerReturnItem) bool {
@@ -5995,7 +6076,7 @@ func (self *RemoteUserNatProvider) sendReturnBatch(item *providerReturnItem) boo
 			frameCount,
 			ByteCount(packetBytes),
 			func() bool {
-				return self.client.SendMultiWithTimeout(
+				admitted, _ := self.client.sendGroupWithTimeoutDetailed(
 					sendFrames,
 					destinationId,
 					func(err error) {},
@@ -6006,6 +6087,7 @@ func (self *RemoteUserNatProvider) sendReturnBatch(item *providerReturnItem) boo
 					sendSchedulingKeyOption{key: item.schedulingKey},
 					observeTransportWrite(transportAttribution.observe),
 				)
+				return admitted
 			},
 		)
 		if sent {
@@ -6037,9 +6119,9 @@ func (self *RemoteUserNatProvider) sendReturnBatch(item *providerReturnItem) boo
 		if err != nil {
 			panic(err)
 		}
-		// Keep a complete Pack within the same one-MTU message-byte bound used
-		// by Transfer's ordinary coalescer. One individually oversized frame
-		// still advances alone; the H3 selector will place it on the stream.
+		// Keep a logical group within the provider fairness bound. The selected
+		// SendSequence later applies its H1/H3 wire-size limit without rerunning
+		// provider routing or changing packet order.
 		if 0 < len(frames) &&
 			providerReturnBatchMaxBytes < chunkBytes+int64(len(frame.MessageBytes)) {
 			flush()
@@ -6063,9 +6145,9 @@ func (self *RemoteUserNatProvider) sendReturnBatch(item *providerReturnItem) boo
 }
 
 // `ReceivePacketsFunction`
-// ReceiveBatch coalesces a flow's drained packet batch into one wire Pack
-// (chunked to the frame/byte bounds), collapsing the per-packet
-// route/transport handoffs to one per chunk. All packets share the flow's
+// ReceiveBatch coalesces a flow's drained packet batch into bounded logical
+// groups, collapsing per-packet policy/routing admission while leaving
+// carrier-safe physical chunking to SendSequence. All packets share the flow's
 // source/ipPath, so the egress policy is evaluated once. Ownership mirrors
 // the per-packet Receive: each packet is shared read-only into a frame; the
 // share/marshal buffers are freed on the same raw/wrapped rules.
@@ -6243,22 +6325,19 @@ func (self *RemoteUserNatProvider) receiveTransferBatchWithRecovery(
 		}
 		return
 	}
-	// A contract frame is attached to a sequence head and at contract
-	// boundaries. This layer cannot see that overhead, so only pre-batch when
-	// the peer is explicitly no-contract. Contract-bearing traffic returns to
-	// the per-packet path; SendSequence performs envelope-safe coalescing once
-	// a contract is established and an earlier item is still outstanding.
-	if !self.client.ContractManager().SendNoContract(source.SourceId) {
-		for _, packet := range packets {
-			self.receiveTransferWithRecovery(
-				source,
-				transferKey,
-				provideMode,
-				recoveryMode,
-				ipPath,
-				packet,
-			)
-		}
+	// Preserve the sparse single-packet path, including its raw-frame fast
+	// path. Multi-packet drains remain one logical group even when a contract
+	// must be attached: SendSequence owns contract-envelope-safe H1/H3 wire
+	// chunking and keeps a single routing/admission decision for the group.
+	if len(packets) == 1 {
+		self.receiveTransferWithRecovery(
+			source,
+			transferKey,
+			provideMode,
+			recoveryMode,
+			ipPath,
+			packets[0],
+		)
 		return
 	}
 	// Every member has the same reverse tuple. Scan all members so a trailing
@@ -7206,6 +7285,23 @@ func ParseIpPathWithPayload(ipPacket []byte) (*IpPath, []byte, error) {
 	ipPath.SourceIp = ipBacking[:sourceByteCount:sourceByteCount]
 	ipPath.DestinationIp = ipBacking[sourceByteCount:]
 	return &ipPath, payload, nil
+}
+
+// IsTcpAckOnlyPacket identifies a TCP acknowledgement with no sequence-space
+// payload or connection-state edge. SACK, ECN, duplicate ACK, and advertised
+// window information may still be present. Callers may use the classification
+// for bounded admission priority, but must preserve both the exact packet bytes
+// and ordinary Transfer recovery. Parsing is synchronous and allocation-free.
+func IsTcpAckOnlyPacket(ipPacket []byte) bool {
+	var ipPath IpPath
+	payload, err := parseIpPathWithPayloadBorrowed(ipPacket, &ipPath)
+	return err == nil &&
+		ipPath.Protocol == IpProtocolTcp &&
+		ipPath.Ack &&
+		!ipPath.Syn &&
+		!ipPath.Fin &&
+		!ipPath.Rst &&
+		len(payload) == 0
 }
 
 // parseIpPathWithPayloadBorrowed fills ipPath without allocating address

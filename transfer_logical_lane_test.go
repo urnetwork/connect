@@ -228,18 +228,18 @@ func TestLogicalLaneAckRoutesOnlyExactSequence(t *testing.T) {
 	destination := NewId()
 	unrelatedId := NewId()
 	targetId := NewId()
-	unrelatedAck := &protocol.Ack{SequenceId: unrelatedId.Bytes()}
+	unrelatedAck := receiveAckMessage{sequenceId: unrelatedId}
 	unrelated := &SendSequence{
 		ctx:         ctx,
 		destination: destination,
 		sequenceId:  unrelatedId,
-		acks:        make(chan *protocol.Ack, 1),
+		acks:        make(chan receiveAckMessage, 1),
 	}
 	target := &SendSequence{
 		ctx:         ctx,
 		destination: destination,
 		sequenceId:  targetId,
-		acks:        make(chan *protocol.Ack, 1),
+		acks:        make(chan receiveAckMessage, 1),
 	}
 	unrelated.acks <- unrelatedAck // a broadcast implementation stalls here
 	buffer := &SendBuffer{
@@ -250,13 +250,17 @@ func TestLogicalLaneAckRoutesOnlyExactSequence(t *testing.T) {
 			targetId:    target,
 		},
 	}
-	targetAck := &protocol.Ack{SequenceId: targetId.Bytes()}
+	targetMessageId := NewId()
+	targetAck := &protocol.Ack{
+		MessageId:  targetMessageId.Bytes(),
+		SequenceId: targetId.Bytes(),
+	}
 	if !buffer.Ack(destination, targetAck, 0) {
 		t.Fatal("exact target ACK was rejected by an unrelated full ACK queue")
 	}
 	select {
 	case got := <-target.acks:
-		if got != targetAck {
+		if got.messageId != targetMessageId || got.sequenceId != targetId {
 			t.Fatal("target sequence received a different ACK")
 		}
 	default:

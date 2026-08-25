@@ -13,6 +13,7 @@ import (
 	"crypto/cipher"
 	mathrandv2 "math/rand/v2"
 	"testing"
+	"unsafe"
 
 	"google.golang.org/protobuf/proto"
 
@@ -550,6 +551,149 @@ func TestTwoPacketEncryptedPackFitsMinimumMessageLimit(t *testing.T) {
 	}
 }
 
+// H1 may use more small frames than the compatibility coalescer. Assert the
+// maximum frame-count/byte combination, a bounded ordinary opening contract,
+// and outer sequence encryption still fit the deployed 4-KiB WebSocket
+// envelope. Opening/rotating contracts retain 3 KiB; an established contract
+// can safely use three full 1,100-byte packets only while no contract frame
+// rides on that Pack.
+func TestH1MaximumLogicalGroupEncryptedPackFitsMinimumMessageLimit(t *testing.T) {
+	c := newFrameCodecTestSequenceCipher(t)
+	path := TransferPath{DestinationId: NewId(), SourceId: NewId(), StreamId: NewId()}
+	frames := make([]*protocol.Frame, sendPackH1GroupMaxFrames)
+	baseFrameByteCount := int(sendPackH1GroupMaxMessageByteCount) / len(frames)
+	remainingByteCount := int(sendPackH1GroupMaxMessageByteCount)
+	for frameIndex := range frames {
+		frameByteCount := baseFrameByteCount
+		if frameIndex == len(frames)-1 {
+			frameByteCount = remainingByteCount
+		}
+		remainingByteCount -= frameByteCount
+		frames[frameIndex] = &protocol.Frame{
+			MessageType:  protocol.MessageType_IpIpPacketFromProvider,
+			MessageBytes: make([]byte, frameByteCount),
+			Raw:          true,
+		}
+	}
+	m := &sendPackFrame{
+		path:           path,
+		messageId:      NewId(),
+		sequenceId:     NewId(),
+		sequenceNumber: ^uint64(0),
+		head:           true,
+		frames:         frames,
+		contractFrame: &protocol.Frame{
+			MessageType:  protocol.MessageType_TransferContract,
+			MessageBytes: make([]byte, 512),
+		},
+		tagSendTime:    ^uint64(0),
+		sessionRole:    protocol.SequenceRole_SequenceRoleServer,
+		sessionRoleSet: true,
+		companion:      true,
+	}
+	inner := marshalSendPackTransferFrame(m)
+	defer MessagePoolReturn(inner)
+	wrapped, err := c.SealOuterFrame(
+		path,
+		inner,
+		protocol.SequenceRole_SequenceRoleServer,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("SealOuterFrame: %s", err)
+	}
+	defer MessagePoolReturn(wrapped)
+	limit := int(DefaultClientSettings().MinimumMessageLenLimit())
+	if limit < len(wrapped) {
+		t.Fatalf(
+			"maximum H1 logical-group encrypted Pack is %d bytes, exceeds minimum transport limit %d",
+			len(wrapped),
+			limit,
+		)
+	}
+
+	establishedFrames := make([]*protocol.Frame, 3)
+	for frameIndex := range establishedFrames {
+		establishedFrames[frameIndex] = &protocol.Frame{
+			MessageType:  protocol.MessageType_IpIpPacketFromProvider,
+			MessageBytes: make([]byte, DefaultMtu),
+			Raw:          true,
+		}
+	}
+	contractId := NewId()
+	m.frames = establishedFrames
+	m.contractId = &contractId
+	m.contractFrame = nil
+	establishedInner := marshalSendPackTransferFrame(m)
+	defer MessagePoolReturn(establishedInner)
+	establishedWrapped, err := c.SealOuterFrame(
+		path,
+		establishedInner,
+		protocol.SequenceRole_SequenceRoleServer,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("Seal established H1 frame: %s", err)
+	}
+	defer MessagePoolReturn(establishedWrapped)
+	if limit < len(establishedWrapped) {
+		t.Fatalf(
+			"established three-MTU H1 Pack is %d bytes, exceeds minimum transport limit %d",
+			len(establishedWrapped),
+			limit,
+		)
+	}
+
+	m.contractFrame = &protocol.Frame{
+		MessageType:  protocol.MessageType_TransferContract,
+		MessageBytes: make([]byte, 512),
+	}
+	rotatingInner := marshalSendPackTransferFrame(m)
+	defer MessagePoolReturn(rotatingInner)
+	rotatingWrapped, err := c.SealOuterFrame(
+		path,
+		rotatingInner,
+		protocol.SequenceRole_SequenceRoleServer,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("Seal rotating H1 frame: %s", err)
+	}
+	defer MessagePoolReturn(rotatingWrapped)
+	if remaining := limit - len(rotatingWrapped); remaining < 0 || 32 < remaining {
+		t.Fatalf(
+			"contract-bearing three-MTU H1 Pack is %d bytes at limit %d, want no more than 32 bytes of fragile headroom",
+			len(rotatingWrapped),
+			limit,
+		)
+	}
+
+	// A slightly larger still-ordinary signed contract crosses the deployed
+	// envelope. The established path must therefore prove that no contract
+	// frame can ride on its larger chunk instead of relying on the 512-byte
+	// example's accidental ten-byte margin.
+	m.contractFrame.MessageBytes = make([]byte, 544)
+	largeContractInner := marshalSendPackTransferFrame(m)
+	defer MessagePoolReturn(largeContractInner)
+	largeContractWrapped, err := c.SealOuterFrame(
+		path,
+		largeContractInner,
+		protocol.SequenceRole_SequenceRoleServer,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("Seal large-contract H1 frame: %s", err)
+	}
+	defer MessagePoolReturn(largeContractWrapped)
+	if len(largeContractWrapped) <= limit {
+		t.Fatalf(
+			"large-contract three-MTU H1 Pack is %d bytes, want above minimum limit %d",
+			len(largeContractWrapped),
+			limit,
+		)
+	}
+}
+
 func BenchmarkSequenceCipherOuterWrap(b *testing.B) {
 	c := newFrameCodecTestSequenceCipher(b)
 	path := TransferPath{DestinationId: NewId(), SourceId: NewId(), StreamId: NewId()}
@@ -1004,6 +1148,99 @@ func TestOwnedDecodeHasExplicitCallbackLifetime(t *testing.T) {
 	MessagePoolReturn(retained)
 }
 
+func TestOwnedAckDecodeCopiesCompactQueueValueBeforeRelease(t *testing.T) {
+	messageId := NewId()
+	sequenceId := NewId()
+	missingContractId := NewId()
+	m := &sendAckFrame{
+		path:                    TransferPath{DestinationId: NewId(), SourceId: NewId()},
+		messageId:               messageId,
+		sequenceId:              sequenceId,
+		selective:               true,
+		tagSendTime:             1_700_000_000_000,
+		tagSet:                  true,
+		missingContractId:       &missingContractId,
+		compactContractRecovery: true,
+		logicalLaneVersion:      transferLogicalLaneVersion,
+	}
+	encoded := marshalSendAckTransferFrame(m)
+	defer MessagePoolReturn(encoded)
+
+	decoded := inboundDecodedTransferFrames.take()
+	if !unmarshalOwnedTransferFrame(encoded, decoded, true) {
+		inboundDecodedTransferFrames.put(decoded)
+		t.Fatal("owned ACK decode failed")
+	}
+	ack := decoded.frame.Ack
+	if ack != &decoded.ack ||
+		&ack.MessageId[0] != &decoded.ackIds[0][0] ||
+		&ack.SequenceId[0] != &decoded.ackIds[1][0] ||
+		&ack.MissingContractId[0] != &decoded.ackIds[2][0] ||
+		ack.Tag != &decoded.ackTag {
+		inboundDecodedTransferFrames.put(decoded)
+		t.Fatal("owned ACK fields do not use inline decoder storage")
+	}
+	receiveAck, err := receiveAckMessageFromProtocol(ack)
+	if err != nil {
+		inboundDecodedTransferFrames.put(decoded)
+		t.Fatalf("copy compact ACK: %s", err)
+	}
+	inboundDecodedTransferFrames.put(decoded)
+
+	if receiveAck.messageId != messageId ||
+		receiveAck.sequenceId != sequenceId ||
+		receiveAck.missingContractId != missingContractId ||
+		!receiveAck.selective || !receiveAck.contractMissing ||
+		!receiveAck.compactContractRecoverySupported ||
+		receiveAck.logicalLaneVersion != transferLogicalLaneVersion ||
+		!receiveAck.tag.set || receiveAck.tag.sendTime != m.tagSendTime {
+		t.Fatalf("compact ACK changed after decoder release: %+v", receiveAck)
+	}
+}
+
+func TestOwnedAckDecodeSteadyStateDoesNotAllocate(t *testing.T) {
+	m := &sendAckFrame{
+		path:        TransferPath{DestinationId: NewId(), SourceId: NewId()},
+		messageId:   NewId(),
+		sequenceId:  NewId(),
+		tagSendTime: 1,
+		tagSet:      true,
+	}
+	encoded := marshalSendAckTransferFrame(m)
+	defer MessagePoolReturn(encoded)
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		decoded := inboundDecodedTransferFrames.take()
+		if !unmarshalOwnedTransferFrame(encoded, decoded, true) {
+			panic("owned ACK decode failed")
+		}
+		if _, err := receiveAckMessageFromProtocol(decoded.frame.Ack); err != nil {
+			panic(err)
+		}
+		inboundDecodedTransferFrames.put(decoded)
+	})
+	if allocs != 0 {
+		t.Fatalf("owned ACK decode + compact copy allocated %.2f times, want 0", allocs)
+	}
+}
+
+func TestDecodedTransferFramePoolRetainedSizeStaysSmall(t *testing.T) {
+	size := unsafe.Sizeof(decodedTransferFrame{})
+	if size > 640 {
+		t.Fatalf("decoded TransferFrame owner size = %d, want <= 640 bytes", size)
+	}
+	t.Logf(
+		"decoded TransferFrame owner=%d bytes; exact pool ceiling=%d bytes",
+		size,
+		uintptr(decodedTransferFramePoolCapacity)*size,
+	)
+	ackSize := unsafe.Sizeof(receiveAckMessage{})
+	if ackSize > 96 {
+		t.Fatalf("compact receive ACK size = %d, want <= 96 bytes", ackSize)
+	}
+	t.Logf("compact receive ACK=%d bytes", ackSize)
+}
+
 func TestDecodedPackOwnerPoolRetentionIsBounded(t *testing.T) {
 	pool := newDecodedPackOwnerPool()
 	for i := 0; i < decodedPackOwnerPoolCapacity+97; i++ {
@@ -1084,6 +1321,46 @@ func BenchmarkTransferFrameDecode(b *testing.B) {
 			decoded := inboundDecodedTransferFrames.take()
 			if !unmarshalOwnedTransferFrame(encoded, decoded, true) {
 				b.Fatal("decode failed")
+			}
+			inboundDecodedTransferFrames.put(decoded)
+		}
+	})
+}
+
+func BenchmarkTransferAckFrameDecode(b *testing.B) {
+	missingContractId := NewId()
+	m := &sendAckFrame{
+		path:                    TransferPath{DestinationId: NewId(), SourceId: NewId()},
+		messageId:               NewId(),
+		sequenceId:              NewId(),
+		selective:               true,
+		tagSendTime:             1_700_000_000_000,
+		tagSet:                  true,
+		missingContractId:       &missingContractId,
+		compactContractRecovery: true,
+		logicalLaneVersion:      transferLogicalLaneVersion,
+	}
+	encoded := marshalSendAckTransferFrame(m)
+	defer MessagePoolReturn(encoded)
+
+	b.Run("copy-safe-protocol-objects", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			var decoded protocol.TransferFrame
+			if !unmarshalTransferFrame(encoded, &decoded, true) {
+				b.Fatal("decode failed")
+			}
+		}
+	})
+	b.Run("bounded-owned-values", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			decoded := inboundDecodedTransferFrames.take()
+			if !unmarshalOwnedTransferFrame(encoded, decoded, true) {
+				b.Fatal("decode failed")
+			}
+			if _, err := receiveAckMessageFromProtocol(decoded.frame.Ack); err != nil {
+				b.Fatal(err)
 			}
 			inboundDecodedTransferFrames.put(decoded)
 		}
