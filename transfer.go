@@ -1304,6 +1304,7 @@ type ClientSendRecoveryStatsSnapshot struct {
 	InitialFrameCount                     uint64
 	InitialMessageByteCount               uint64
 	TimeoutResendWriteCount               uint64
+	AckPendingResendPreemptCount          uint64
 	CarrierChangeWriteCount               uint64
 	SelectiveGapWriteCount                uint64
 	AckTailProbeWriteCount                uint64
@@ -1388,6 +1389,7 @@ type Client struct {
 	initialSendMessageByteCount            atomic.Uint64
 	selectiveGapWriteCount                 atomic.Uint64
 	timeoutResendWriteCount                atomic.Uint64
+	ackPendingResendPreemptCount           atomic.Uint64
 	carrierChangeWriteCount                atomic.Uint64
 	ackTailProbeWriteCount                 atomic.Uint64
 	cumulativeProbeWriteCount              atomic.Uint64
@@ -1723,6 +1725,7 @@ func (self *Client) SendRecoveryStats() ClientSendRecoveryStatsSnapshot {
 		InitialFrameCount:                   self.initialSendFrameCount.Load(),
 		InitialMessageByteCount:             self.initialSendMessageByteCount.Load(),
 		TimeoutResendWriteCount:             self.timeoutResendWriteCount.Load(),
+		AckPendingResendPreemptCount:        self.ackPendingResendPreemptCount.Load(),
 		CarrierChangeWriteCount:             self.carrierChangeWriteCount.Load(),
 		SelectiveGapWriteCount:              self.selectiveGapWriteCount.Load(),
 		AckTailProbeWriteCount:              self.ackTailProbeWriteCount.Load(),
@@ -3727,7 +3730,10 @@ type SendBufferSettings struct {
 	afterRunSendSequenceForTest     func(sendSequenceId)
 	// Runs synchronously after one reliable send item reaches terminal Ack
 	// disposition and before the Ack worker advances to another item.
+	afterInitialWriteQueuedForTest        func(sendSequenceId, uint64)
+	afterAckCoalescedForTest              func(sendSequenceId, uint64)
 	afterAckSendItemForTest               func(sendSequenceId, uint64)
+	beforeDueResendForTest                func(sendSequenceId, uint64)
 	afterCreateSendGroupCompletionForTest func(sendSequenceId, int)
 	// Nil test barrier pauses one encrypted-control owner before Pack.
 	beforeEncryptedControlPackForTest func([]byte)
@@ -3922,7 +3928,10 @@ type SendBuffer struct {
 	beforeCloseWaitForTest                func(sendSequenceId)
 	beforeResendCapacityWaitForTest       func(sendSequenceId)
 	afterRunSendSequenceForTest           func(sendSequenceId)
+	afterInitialWriteQueuedForTest        func(sendSequenceId, uint64)
+	afterAckCoalescedForTest              func(sendSequenceId, uint64)
 	afterAckSendItemForTest               func(sendSequenceId, uint64)
+	beforeDueResendForTest                func(sendSequenceId, uint64)
 	afterCreateSendGroupCompletionForTest func(sendSequenceId, int)
 	beforeEncryptedControlPackForTest     func([]byte)
 	forceAckTimeoutForTest                func(sendSequenceId) bool
@@ -3950,7 +3959,10 @@ func NewSendBuffer(ctx context.Context,
 		beforeCloseWaitForTest:                sendBufferSettings.beforeCloseWaitForTest,
 		beforeResendCapacityWaitForTest:       sendBufferSettings.beforeResendCapacityWaitForTest,
 		afterRunSendSequenceForTest:           sendBufferSettings.afterRunSendSequenceForTest,
+		afterInitialWriteQueuedForTest:        sendBufferSettings.afterInitialWriteQueuedForTest,
+		afterAckCoalescedForTest:              sendBufferSettings.afterAckCoalescedForTest,
 		afterAckSendItemForTest:               sendBufferSettings.afterAckSendItemForTest,
+		beforeDueResendForTest:                sendBufferSettings.beforeDueResendForTest,
 		afterCreateSendGroupCompletionForTest: sendBufferSettings.afterCreateSendGroupCompletionForTest,
 		beforeEncryptedControlPackForTest:     sendBufferSettings.beforeEncryptedControlPackForTest,
 		forceAckTimeoutForTest:                sendBufferSettings.forceAckTimeoutForTest,
@@ -5248,6 +5260,9 @@ func (self *SendSequence) coalesceReceivedAck(
 		return
 	}
 	ackWindow.Update(sequenceAck)
+	if self.sendBuffer != nil && self.sendBuffer.afterAckCoalescedForTest != nil {
+		self.sendBuffer.afterAckCoalescedForTest(self.id(), sequenceNumber)
+	}
 }
 
 // processLogicalGroupChunk materializes at most one transport-safe wire Pack.
@@ -5716,6 +5731,7 @@ func (self *SendSequence) Run() {
 			}
 		}
 	}
+sendSequenceLoop:
 	for {
 		flightPolicy := self.transferFlightPolicy()
 		self.flowIsolation.Store(flightPolicy.flowIsolation)
@@ -5830,6 +5846,18 @@ func (self *SendSequence) Run() {
 						timeout = itemResendTimeout
 					}
 					break
+				}
+				if self.sendBuffer != nil && self.sendBuffer.beforeDueResendForTest != nil {
+					self.sendBuffer.beforeDueResendForTest(self.id(), item.sequenceNumber)
+				}
+				// An Ack may have reached the coalescer after this iteration took
+				// its snapshot. Apply that receiver evidence before an already-due
+				// recovery write; otherwise a busy sender can emit one spurious
+				// retransmit for every snapshot/arrival race. The lock is paid only
+				// on the due-recovery path, never for an ordinary initial write.
+				if ackWindow.PendingDispositionFor(item.sequenceNumber, item.messageId) {
+					self.client.ackPendingResendPreemptCount.Add(1)
+					continue sendSequenceLoop
 				}
 				self.preferH3AfterH1Timeout(item)
 				self.resendQueue.RemoveByMessageId(item.messageId)
@@ -6946,6 +6974,9 @@ func (self *SendSequence) sendWithSetContractRecords(
 		}
 		self.sendItems = append(self.sendItems, item)
 		self.resendQueue.Add(item)
+		if self.sendBuffer != nil && self.sendBuffer.afterInitialWriteQueuedForTest != nil {
+			self.sendBuffer.afterInitialWriteQueuedForTest(self.id(), sequenceNumber)
+		}
 		// ignore the write error since the item will be resent
 	} else {
 		// immediately ack
@@ -10542,6 +10573,29 @@ func (self *sequenceAckWindow) Pending() bool {
 	return 0 < self.ackUpdateCount ||
 		0 < len(self.selectiveAcks) ||
 		0 < len(self.contractMissingAcks)
+}
+
+// PendingDispositionFor reports whether the not-yet-snapshotted window can
+// retire or materially rewrite one exact due item. Unrelated ACK progress must
+// not postpone its recovery: on a busy sequence, duplicate/newer selective
+// ACKs can otherwise keep Pending true indefinitely while the actual hole is
+// never retransmitted.
+func (self *sequenceAckWindow) PendingDispositionFor(
+	sequenceNumber uint64,
+	messageId Id,
+) bool {
+	self.ackLock.Lock()
+	defer self.ackLock.Unlock()
+	if 0 < self.ackUpdateCount && self.hasHeadAck &&
+		sequenceNumber <= self.headAck.sequenceNumber {
+		return true
+	}
+	if ack, ok := self.selectiveAcks[messageId]; ok &&
+		ack.sequenceNumber == sequenceNumber {
+		return true
+	}
+	_, contractMissing := self.contractMissingAcks[messageId]
+	return contractMissing
 }
 
 func (self *sequenceAckWindow) UpdateContractMissing(ack sequenceAck) {

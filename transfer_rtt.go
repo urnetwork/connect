@@ -5,25 +5,18 @@ import (
 	"sync"
 	"time"
 
-	"container/heap"
-
 	"github.com/urnetwork/connect/protocol"
 )
 
 type rttWindowItem struct {
-	sendTime    time.Time
-	receiveTime time.Time
-	rtt         time.Duration
-
-	heapIndex int
+	receiveUnixNano int64
+	rtt             time.Duration
+	sequence        uint64
 }
 
-func newRttWindowItem(sendTime time.Time, receiveTime time.Time) *rttWindowItem {
-	return &rttWindowItem{
-		sendTime:    sendTime,
-		receiveTime: receiveTime,
-		rtt:         receiveTime.Sub(sendTime),
-	}
+type rttWindowMinimum struct {
+	rtt      time.Duration
+	sequence uint64
 }
 
 type RttWindow struct {
@@ -43,11 +36,18 @@ type RttWindow struct {
 	maxScaledRtt    time.Duration
 
 	stateLock       sync.Mutex
-	window          []*rttWindowItem
+	window          []rttWindowItem
 	windowTailIndex int
-	windowHeadIndex int
+	windowCount     int
+	nextSequence    uint64
+	netRtt          time.Duration
 
-	rtts *rttHeap
+	// minimums is a fixed-capacity monotonic deque. Keeping the smallest live
+	// RTT at its head avoids both the old per-Ack heap node allocation and an
+	// O(window) scan on the recovery-probe path.
+	minimums         []rttWindowMinimum
+	minimumHeadIndex int
+	minimumCount     int
 }
 
 func NewRttWindow(
@@ -67,7 +67,7 @@ func NewRttWindow(
 		// (the historical flat-floor behavior)
 		rttMinScaledRtt = minScaledRtt
 	}
-	window := make([]*rttWindowItem, windowSize)
+	window := make([]rttWindowItem, windowSize)
 
 	return &RttWindow{
 		log:             loggerOrDefault(log),
@@ -78,22 +78,37 @@ func NewRttWindow(
 		maxScaledRtt:    maxScaledRtt,
 		window:          window,
 		windowTailIndex: 0,
-		windowHeadIndex: 0,
-		rtts:            newRttHeap(),
+		minimums:        make([]rttWindowMinimum, windowSize),
 	}
+}
+
+// removeOldestWithLock removes exactly one live sample while stateLock is held.
+func (self *RttWindow) removeOldestWithLock() {
+	if self.windowCount == 0 {
+		return
+	}
+	item := self.window[self.windowTailIndex]
+	self.netRtt -= item.rtt
+	if self.minimumCount != 0 &&
+		self.minimums[self.minimumHeadIndex].sequence == item.sequence {
+		self.minimums[self.minimumHeadIndex] = rttWindowMinimum{}
+		self.minimumHeadIndex = (self.minimumHeadIndex + 1) % len(self.minimums)
+		self.minimumCount--
+	}
+	self.window[self.windowTailIndex] = rttWindowItem{}
+	self.windowTailIndex = (self.windowTailIndex + 1) % len(self.window)
+	self.windowCount--
 }
 
 // Removes expired samples while stateLock is held.
 func (self *RttWindow) coalesceWithLock(windowTime time.Time) {
-	windowStartTime := windowTime.Add(-self.windowTimeout)
-	for self.windowTailIndex != self.windowHeadIndex {
+	windowStartUnixNano := windowTime.Add(-self.windowTimeout).UnixNano()
+	for self.windowCount != 0 {
 		item := self.window[self.windowTailIndex]
-		if !item.receiveTime.Before(windowStartTime) {
+		if item.receiveUnixNano >= windowStartUnixNano {
 			break
 		}
-		self.rtts.Remove(item)
-		self.window[self.windowTailIndex] = nil
-		self.windowTailIndex = (self.windowTailIndex + 1) % len(self.window)
+		self.removeOldestWithLock()
 	}
 }
 
@@ -135,20 +150,34 @@ func (self *RttWindow) closeSendTime(sendTimeUnixMilli uint64, receiveTime time.
 
 	self.coalesceWithLock(receiveTime)
 
-	item := newRttWindowItem(
-		sendTime,
-		receiveTime,
-	)
-	self.rtts.Add(item)
+	if self.windowCount == len(self.window) {
+		self.removeOldestWithLock()
+	}
+	self.nextSequence++
+	item := rttWindowItem{
+		receiveUnixNano: receiveTime.UnixNano(),
+		rtt:             receiveTime.Sub(sendTime),
+		sequence:        self.nextSequence,
+	}
+	windowHeadIndex := (self.windowTailIndex + self.windowCount) % len(self.window)
+	self.window[windowHeadIndex] = item
+	self.windowCount++
+	self.netRtt += item.rtt
 
-	if replaceItem := self.window[self.windowHeadIndex]; replaceItem != nil {
-		self.rtts.Remove(replaceItem)
+	// Newer equal minima supersede older ones. This keeps the deque shortest
+	// and guarantees its head remains live until the matching sequence leaves
+	// the sample ring.
+	for self.minimumCount != 0 {
+		minimumTailIndex := (self.minimumHeadIndex + self.minimumCount - 1) % len(self.minimums)
+		if self.minimums[minimumTailIndex].rtt < item.rtt {
+			break
+		}
+		self.minimums[minimumTailIndex] = rttWindowMinimum{}
+		self.minimumCount--
 	}
-	self.window[self.windowHeadIndex] = item
-	self.windowHeadIndex = (self.windowHeadIndex + 1) % len(self.window)
-	if self.windowTailIndex == self.windowHeadIndex {
-		self.windowTailIndex = (self.windowTailIndex + 1) % len(self.window)
-	}
+	minimumTailIndex := (self.minimumHeadIndex + self.minimumCount) % len(self.minimums)
+	self.minimums[minimumTailIndex] = rttWindowMinimum{rtt: item.rtt, sequence: item.sequence}
+	self.minimumCount++
 }
 
 // clamp(mean rtt of window * scale, floor, overall max), where the floor is
@@ -162,7 +191,10 @@ func (self *RttWindow) scaledRtt(sendTime time.Time) time.Duration {
 	self.stateLock.Lock()
 	self.coalesceWithLock(sendTime)
 
-	useRtt := self.rtts.MeanRtt()
+	var useRtt time.Duration
+	if self.windowCount != 0 {
+		useRtt = self.netRtt / time.Duration(self.windowCount)
+	}
 	floor := self.rttMinScaledRtt
 	if useRtt == 0 {
 		// no samples: no evidence to be aggressive on
@@ -198,7 +230,10 @@ func (self *RttWindow) probeRtt(probeTime time.Time) time.Duration {
 	self.stateLock.Lock()
 	self.coalesceWithLock(probeTime)
 
-	useRtt := self.rtts.MinRtt()
+	var useRtt time.Duration
+	if self.minimumCount != 0 {
+		useRtt = self.minimums[self.minimumHeadIndex].rtt
+	}
 	floor := self.rttMinScaledRtt
 	if useRtt == 0 {
 		floor = self.minScaledRtt
@@ -216,77 +251,4 @@ func (self *RttWindow) probeRtt(probeTime time.Time) time.Duration {
 		self.log.Infof("[rtt]probe=%dms\n", probeRtt/time.Millisecond)
 	}
 	return probeRtt
-}
-
-type rttHeap struct {
-	items  []*rttWindowItem
-	netRtt time.Duration
-}
-
-// `heap` is a min heap
-func newRttHeap() *rttHeap {
-	h := &rttHeap{
-		items:  []*rttWindowItem{},
-		netRtt: time.Duration(0),
-	}
-	heap.Init(h)
-	return h
-}
-
-func (self *rttHeap) Add(item *rttWindowItem) {
-	heap.Push(self, item)
-	self.netRtt += item.rtt
-}
-
-func (self *rttHeap) Remove(item *rttWindowItem) {
-	heap.Remove(self, item.heapIndex)
-	self.netRtt -= item.rtt
-}
-
-func (self *rttHeap) MinRtt() time.Duration {
-	if len(self.items) == 0 {
-		return time.Duration(0)
-	}
-	return self.items[0].rtt
-}
-
-func (self *rttHeap) MeanRtt() time.Duration {
-	n := len(self.items)
-	if n == 0 {
-		return 0
-	}
-	return self.netRtt / time.Duration(n)
-}
-
-// `heap.Interface`
-
-func (self *rttHeap) Len() int {
-	return len(self.items)
-}
-
-func (self *rttHeap) Less(i, j int) bool {
-	return self.items[i].rtt < self.items[j].rtt
-}
-
-func (self *rttHeap) Swap(i, j int) {
-	a := self.items[i]
-	b := self.items[j]
-	b.heapIndex = i
-	self.items[i] = b
-	a.heapIndex = j
-	self.items[j] = a
-}
-
-func (self *rttHeap) Push(x any) {
-	item := x.(*rttWindowItem)
-	item.heapIndex = len(self.items)
-	self.items = append(self.items, item)
-}
-
-func (self *rttHeap) Pop() any {
-	n := len(self.items)
-	item := self.items[n-1]
-	self.items[n-1] = nil
-	self.items = self.items[0 : n-1]
-	return item
 }

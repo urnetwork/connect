@@ -98,3 +98,72 @@ func TestRttWindowProbeUsesMinimumSample(t *testing.T) {
 	AssertEqual(t, rttWindow.scaledRtt(receiveTime), 2500*time.Millisecond)
 	AssertEqual(t, rttWindow.probeRtt(receiveTime), 500*time.Millisecond)
 }
+
+func TestRttWindowFullCapacityMeanAndMinimumAging(t *testing.T) {
+	rttWindow := NewRttWindow(nil, 4, time.Second, 1.0, 0, 0, 10*time.Second)
+	base := time.Unix(1_700_000_000, 0)
+	addSample := func(receiveTime time.Time, rtt time.Duration) {
+		rttWindow.closeSendTime(
+			uint64(receiveTime.Add(-rtt).UnixMilli()),
+			receiveTime,
+		)
+	}
+
+	addSample(base, 400*time.Millisecond)
+	addSample(base.Add(time.Millisecond), 300*time.Millisecond)
+	addSample(base.Add(2*time.Millisecond), 200*time.Millisecond)
+	addSample(base.Add(3*time.Millisecond), 100*time.Millisecond)
+	AssertEqual(t, rttWindow.scaledRtt(base.Add(3*time.Millisecond)), 250*time.Millisecond)
+	AssertEqual(t, rttWindow.probeRtt(base.Add(3*time.Millisecond)), 100*time.Millisecond)
+
+	// The fifth sample evicts exactly the oldest sample while the newer
+	// minimum remains available to the receiver-paced probe.
+	addSample(base.Add(4*time.Millisecond), 500*time.Millisecond)
+	AssertEqual(t, rttWindow.scaledRtt(base.Add(4*time.Millisecond)), 275*time.Millisecond)
+	AssertEqual(t, rttWindow.probeRtt(base.Add(4*time.Millisecond)), 100*time.Millisecond)
+
+	// Expiry removes both the mean and monotonic-minimum ownership.
+	AssertEqual(t, rttWindow.scaledRtt(base.Add(2*time.Second)), time.Duration(0))
+	AssertEqual(t, rttWindow.probeRtt(base.Add(2*time.Second)), time.Duration(0))
+}
+
+func TestRttWindowCloseSendTimeDoesNotAllocate(t *testing.T) {
+	rttWindow := NewRttWindow(nil, 128, time.Minute, 2.0, 2*time.Second, 300*time.Millisecond, 8*time.Second)
+	receiveTime := time.Unix(1_700_000_000, 0)
+	allocations := testing.AllocsPerRun(1_000, func() {
+		receiveTime = receiveTime.Add(time.Millisecond)
+		rttWindow.closeSendTime(
+			uint64(receiveTime.Add(-37*time.Millisecond).UnixMilli()),
+			receiveTime,
+		)
+	})
+	if allocations != 0 {
+		t.Fatalf("RTT Ack accounting allocated %.2f objects/run, want 0", allocations)
+	}
+}
+
+// BenchmarkRttWindowCloseSendTime measures the per-Ack RTT accounting path.
+// Keep the receive clock synthetic so scheduler and wall-clock noise do not
+// obscure allocation or CPU changes in this hot path.
+func BenchmarkRttWindowCloseSendTime(b *testing.B) {
+	rttWindow := NewRttWindow(
+		nil,
+		128,
+		60*time.Second,
+		2.0,
+		2*time.Second,
+		300*time.Millisecond,
+		8*time.Second,
+	)
+	receiveTime := time.Unix(1_700_000_000, 0)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		receiveTime = receiveTime.Add(time.Millisecond)
+		rttWindow.closeSendTime(
+			uint64(receiveTime.Add(-37*time.Millisecond).UnixMilli()),
+			receiveTime,
+		)
+	}
+}

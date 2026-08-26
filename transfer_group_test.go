@@ -1001,6 +1001,290 @@ func TestH1ReadyDrainCoalescesSixteenIndependentPacks(t *testing.T) {
 	releaseTransferGroupTestWitnesses(t, frames, witnesses)
 }
 
+// A cumulative Ack that arrives after the sender's snapshot but before an
+// already-due recovery write must retire the ready-drained H1 write first. The
+// two explicit barriers make the snapshot/arrival ordering independent of
+// wall-clock and scheduler timing.
+func TestH1ReadyHotPathAckSuppressesEveryRecoveryWrite(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	destinationId := NewId()
+	sequenceEntered := make(chan struct{})
+	releaseSequence := make(chan struct{})
+	initialWriteQueued := make(chan struct{})
+	releaseInitialWrite := make(chan struct{})
+	ackCoalesced := make(chan struct{})
+	ackItemRemoved := make(chan struct{})
+	dueResendReached := make(chan struct{})
+	releaseDueResend := make(chan struct{})
+	var sequenceEnteredOnce sync.Once
+	var releaseSequenceOnce sync.Once
+	var initialWriteQueuedOnce sync.Once
+	var releaseInitialWriteOnce sync.Once
+	var ackCoalescedOnce sync.Once
+	var ackItemRemovedOnce sync.Once
+	var dueResendReachedOnce sync.Once
+	var releaseDueResendOnce sync.Once
+	releaseSequenceBarrier := func() {
+		releaseSequenceOnce.Do(func() { close(releaseSequence) })
+	}
+	releaseInitialWriteBarrier := func() {
+		releaseInitialWriteOnce.Do(func() { close(releaseInitialWrite) })
+	}
+	releaseDueResendBarrier := func() {
+		releaseDueResendOnce.Do(func() { close(releaseDueResend) })
+	}
+
+	var forceDue atomic.Bool
+	type wireEvent struct {
+		messageId Id
+		sendCount int
+		resend    bool
+	}
+	var wireEventsMutex sync.Mutex
+	var wireEvents []wireEvent
+	settings := DefaultClientSettings()
+	settings.EncryptionSettings.Mode = EncryptionModeOff
+	settings.SendBufferSettings.TransferWireMessageObserver = func(
+		observation TransferWireMessageObservation,
+	) {
+		wireEventsMutex.Lock()
+		wireEvents = append(wireEvents, wireEvent{
+			messageId: observation.MessageId,
+			sendCount: observation.SendCount,
+			resend:    observation.Resend,
+		})
+		wireEventsMutex.Unlock()
+	}
+	settings.SendBufferSettings.beforeRunSendSequenceForTest = func(id sendSequenceId) {
+		if id.Destination != destinationId {
+			return
+		}
+		sequenceEnteredOnce.Do(func() { close(sequenceEntered) })
+		<-releaseSequence
+	}
+	settings.SendBufferSettings.afterInitialWriteQueuedForTest = func(
+		id sendSequenceId,
+		sequenceNumber uint64,
+	) {
+		if id.Destination != destinationId || sequenceNumber != 0 {
+			return
+		}
+		initialWriteQueuedOnce.Do(func() { close(initialWriteQueued) })
+		<-releaseInitialWrite
+	}
+	settings.SendBufferSettings.afterAckSendItemForTest = func(
+		id sendSequenceId,
+		sequenceNumber uint64,
+	) {
+		if id.Destination == destinationId && sequenceNumber == 0 {
+			ackItemRemovedOnce.Do(func() { close(ackItemRemoved) })
+		}
+	}
+	settings.SendBufferSettings.afterAckCoalescedForTest = func(
+		id sendSequenceId,
+		sequenceNumber uint64,
+	) {
+		if id.Destination == destinationId && sequenceNumber == 0 {
+			ackCoalescedOnce.Do(func() { close(ackCoalesced) })
+		}
+	}
+	settings.SendBufferSettings.beforeDueResendForTest = func(
+		id sendSequenceId,
+		sequenceNumber uint64,
+	) {
+		if id.Destination != destinationId || sequenceNumber != 0 {
+			return
+		}
+		dueResendReachedOnce.Do(func() { close(dueResendReached) })
+		<-releaseDueResend
+	}
+	settings.SendBufferSettings.forceResendForTest = func(id sendSequenceId) bool {
+		return id.Destination == destinationId && forceDue.Load()
+	}
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+	defer func() {
+		releaseSequenceBarrier()
+		releaseInitialWriteBarrier()
+		releaseDueResendBarrier()
+		closeTransferGroupTestClient(t, client)
+	}()
+	client.ContractManager().AddNoContractPeer(destinationId)
+	route := make(chan []byte, 32)
+	client.RouteManager().UpdateTransport(
+		&h1SendClientTransportForGroupTest{
+			sendClientTransport: NewSendClientTransport(DestinationId(destinationId)),
+		},
+		[]Route{route},
+	)
+
+	frames, witnesses := transferGroupTestFrames(t, sendPackH1GroupMaxFrames, 64)
+	results := make(chan int, len(frames))
+	for index, frame := range frames {
+		index := index
+		if !client.SendWithTimeout(
+			frame,
+			destinationId,
+			func(err error) {
+				if err != nil {
+					results <- -index - 1
+					return
+				}
+				results <- index
+			},
+			time.Second,
+		) {
+			for frameIndex := index; frameIndex < len(frames); frameIndex++ {
+				MessagePoolReturn(frames[frameIndex].MessageBytes)
+			}
+			for _, witness := range witnesses {
+				MessagePoolReturn(witness)
+			}
+			t.Fatalf("H1 retransmit-regression Pack %d was not admitted", index)
+		}
+		if index == 0 {
+			select {
+			case <-sequenceEntered:
+			case <-ctx.Done():
+				t.Fatalf("wait for H1 retransmit-regression startup: %v", ctx.Err())
+			}
+		}
+	}
+
+	releaseSequenceBarrier()
+	var transferFrameBytes []byte
+	select {
+	case transferFrameBytes = <-route:
+	case <-ctx.Done():
+		t.Fatalf("wait for initial H1 wire Pack: %v", ctx.Err())
+	}
+	pack := decodeSendPackLifecycleWirePack(t, transferFrameBytes)
+	packMessageId, err := IdFromBytes(pack.MessageId)
+	if err != nil {
+		MessagePoolReturn(transferFrameBytes)
+		t.Fatalf("decode initial H1 message id: %v", err)
+	}
+	if len(pack.Frames) != sendPackH1GroupMaxFrames {
+		MessagePoolReturn(transferFrameBytes)
+		t.Fatalf(
+			"initial H1 frame count=%d, want %d",
+			len(pack.Frames),
+			sendPackH1GroupMaxFrames,
+		)
+	}
+	select {
+	case <-initialWriteQueued:
+	case <-ctx.Done():
+		MessagePoolReturn(transferFrameBytes)
+		t.Fatalf("wait for initial H1 resend ownership: %v", ctx.Err())
+	}
+
+	// Force the first recovery deadline due, then stop immediately after the
+	// sender has already consumed its empty Ack snapshot. Only now admit the
+	// cumulative Ack. Releasing the due-write barrier must return to the Ack
+	// snapshot instead of putting a duplicate Pack on the physical route.
+	forceDue.Store(true)
+	releaseInitialWriteBarrier()
+	select {
+	case <-dueResendReached:
+	case <-ctx.Done():
+		MessagePoolReturn(transferFrameBytes)
+		t.Fatalf("wait for due H1 recovery write: %v", ctx.Err())
+	}
+	acknowledgeSendPackLifecycleWirePack(t, client, destinationId, pack)
+	select {
+	case <-ackCoalesced:
+	case <-ctx.Done():
+		MessagePoolReturn(transferFrameBytes)
+		t.Fatalf("wait for H1 Ack coalescing: %v", ctx.Err())
+	}
+	MessagePoolReturn(transferFrameBytes)
+	releaseDueResendBarrier()
+	select {
+	case <-ackItemRemoved:
+	case <-ctx.Done():
+		t.Fatalf("wait for H1 Ack retirement: %v", ctx.Err())
+	}
+
+	for want := range len(frames) {
+		select {
+		case got := <-results:
+			if got != want {
+				t.Fatalf("H1 retransmit-regression callback %d=%d", want, got)
+			}
+		case <-ctx.Done():
+			t.Fatalf("wait for H1 retransmit-regression callback %d: %v", want, ctx.Err())
+		}
+	}
+	queueCount, queueByteCount, _ := client.ResendQueueSize(
+		destinationId,
+		MultiHopId{},
+		false,
+		false,
+	)
+	if queueCount != 0 || queueByteCount != 0 {
+		t.Fatalf("Acked H1 resend queue=%d/%dB, want empty", queueCount, queueByteCount)
+	}
+	wireEventsMutex.Lock()
+	matchingWriteCount := 0
+	matchingResendCount := 0
+	matchingNonInitialSendCount := 0
+	for _, event := range wireEvents {
+		if event.messageId != packMessageId {
+			continue
+		}
+		matchingWriteCount++
+		if event.resend {
+			matchingResendCount++
+		}
+		if event.sendCount != 1 {
+			matchingNonInitialSendCount++
+		}
+	}
+	allWireEvents := append([]wireEvent{}, wireEvents...)
+	wireEventsMutex.Unlock()
+	if matchingWriteCount != 1 || matchingResendCount != 0 {
+		t.Fatalf(
+			"H1 Pack physical wire writes/resends=%d/%d, want 1/0; all=%+v",
+			matchingWriteCount,
+			matchingResendCount,
+			allWireEvents,
+		)
+	}
+	if got := matchingNonInitialSendCount; got != 0 {
+		t.Fatalf("H1 observations with send_count != 1: %d", got)
+	}
+	stats := client.SendRecoveryStats()
+	if stats.InitialWriteCount < 1 ||
+		stats.InitialFrameCount < uint64(sendPackH1GroupMaxFrames) {
+		t.Fatalf(
+			"H1 initial writes/frames=%d/%d, want at least 1/%d",
+			stats.InitialWriteCount,
+			stats.InitialFrameCount,
+			sendPackH1GroupMaxFrames,
+		)
+	}
+	if stats.AckPendingResendPreemptCount != 1 {
+		t.Fatalf(
+			"H1 Ack-pending due-resend preemptions=%d, want 1",
+			stats.AckPendingResendPreemptCount,
+		)
+	}
+	if stats.TimeoutResendWriteCount != 0 ||
+		stats.CarrierChangeWriteCount != 0 ||
+		stats.SelectiveGapWriteCount != 0 ||
+		stats.AckTailProbeWriteCount != 0 ||
+		stats.CumulativeProbeWriteCount != 0 ||
+		stats.RecoveryWriteErrorCount != 0 ||
+		stats.MissingContractWriteCount != 0 {
+		t.Fatalf("clean H1 path emitted recovery writes: %+v", stats)
+	}
+	if len(route) != 0 {
+		t.Fatalf("clean H1 path emitted %d extra wire Packs", len(route))
+	}
+	releaseTransferGroupTestWitnesses(t, frames, witnesses)
+}
+
 func TestH1ReadyDrainCallbackOverflowIsBoundedAndReclaimable(t *testing.T) {
 	clearSendItemPool()
 	t.Cleanup(clearSendItemPool)

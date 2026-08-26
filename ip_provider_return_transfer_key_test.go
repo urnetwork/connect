@@ -1003,6 +1003,184 @@ func TestRemoteUserNatProviderReturnBatchGroupsContractBearingDrain(t *testing.T
 	}
 }
 
+func TestRemoteUserNatProviderReturnBatchUsesProductionLogicalBound(t *testing.T) {
+	provider, client, _ := newProviderTransferKeyTestFixture(t)
+	peerId := NewId()
+	client.ContractManager().AddNoContractPeer(peerId)
+	sequence := installProviderReturnTestSequence(t, provider, client, sendSequenceId{
+		Destination:       peerId,
+		CompanionContract: true,
+		ForceStream:       true,
+		EncryptionRole:    sequenceTlsRoleServer,
+	})
+	sequence.packs = make(chan *SendPack, 2)
+	template := craftSecurityPacket(
+		IpProtocolTcp,
+		net.ParseIP("203.0.113.11"),
+		443,
+		net.ParseIP("10.0.0.12"),
+		43001,
+		false,
+		make([]byte, 1400),
+	)
+	path, err := ParseIpPath(template)
+	if err != nil {
+		t.Fatalf("parse provider production-bound packet: %v", err)
+	}
+	packets := make([][]byte, providerReturnBatchMaxFrames+1)
+	for packetIndex := range packets {
+		packets[packetIndex] = MessagePoolCopy(template)
+	}
+	item := providerReturnItem{
+		source: SourceId(peerId),
+		transferKey: TransferKey{
+			ForceStream:       true,
+			CompanionContract: true,
+			EncryptionRole:    protocol.SequenceRole_SequenceRoleServer,
+		},
+		provideMode:     protocol.ProvideMode_Public,
+		recoveryMode:    receiveRecoveryModeTcpSocket,
+		ipProtocol:      IpProtocolTcp,
+		packets:         packets,
+		packetByteCount: ByteCount(len(packets) * len(template)),
+		batch:           true,
+		schedulingKey:   ipSendSchedulingKey(path),
+	}
+	if !provider.sendReturnBatch(&item) {
+		t.Fatal("provider production-bound batch was not admitted")
+	}
+	if got := len(sequence.packs); got != 2 {
+		t.Fatalf("provider production-bound logical groups=%d, want 2", got)
+	}
+	first := <-sequence.packs
+	second := <-sequence.packs
+	defer first.returnFrames()
+	defer second.returnFrames()
+	if len(first.Frames) != providerReturnBatchMaxFrames || len(second.Frames) != 1 {
+		t.Fatalf(
+			"provider production-bound group frames=%d/%d, want %d/1",
+			len(first.Frames),
+			len(second.Frames),
+			providerReturnBatchMaxFrames,
+		)
+	}
+}
+
+// BenchmarkRemoteUserNatProviderReturnBatchLimits measures the provider-side
+// policy/routing admission boundary that a larger socket drain can amortize.
+// Carrier-safe H1 chunks remain independently bounded by SendSequence; this
+// benchmark changes only the logical group presented to that scheduler.
+func BenchmarkRemoteUserNatProviderReturnBatchLimits(b *testing.B) {
+	const packetCount = 64
+	variants := []struct {
+		name      string
+		maxFrames int
+		maxBytes  int64
+	}{
+		{name: "16_frames_24_KiB", maxFrames: 16, maxBytes: 24 * 1024},
+		{name: "32_frames_48_KiB", maxFrames: 32, maxBytes: 48 * 1024},
+	}
+	for _, variant := range variants {
+		b.Run(variant.name, func(b *testing.B) {
+			ctx, cancel := context.WithCancel(context.Background())
+			client := NewClient(ctx, NewId(), NewNoContractClientOob(), DefaultClientSettings())
+			b.Cleanup(func() {
+				cancel()
+				client.Cancel()
+			})
+			provider := &RemoteUserNatProvider{
+				ctx:                 ctx,
+				client:              client,
+				settings:            DefaultRemoteUserNatProviderSettings(),
+				packetStatsCounters: &packetStatsCounters{},
+			}
+			peerId := NewId()
+			client.ContractManager().AddNoContractPeer(peerId)
+			sequenceId := sendSequenceId{
+				Destination:       peerId,
+				CompanionContract: true,
+				ForceStream:       true,
+				EncryptionRole:    sequenceTlsRoleServer,
+			}
+			sequence := &SendSequence{
+				ctx:           ctx,
+				cancel:        func() {},
+				packs:         make(chan *SendPack, packetCount),
+				idleCondition: NewIdleCondition(),
+			}
+			client.sendBuffer.mutex.Lock()
+			client.sendBuffer.sendSequences[sequenceId] = sequence
+			client.sendBuffer.wireSendSequences[sequenceId.wireId()] = sequence
+			client.sendBuffer.mutex.Unlock()
+			b.Cleanup(func() {
+				client.sendBuffer.mutex.Lock()
+				delete(client.sendBuffer.sendSequences, sequenceId)
+				delete(client.sendBuffer.wireSendSequences, sequenceId.wireId())
+				client.sendBuffer.mutex.Unlock()
+				for 0 < len(sequence.packs) {
+					(<-sequence.packs).returnFrames()
+				}
+			})
+
+			template := craftSecurityPacket(
+				IpProtocolTcp,
+				net.ParseIP("203.0.113.11"),
+				443,
+				net.ParseIP("10.0.0.12"),
+				43001,
+				false,
+				make([]byte, 1400),
+			)
+			path, err := ParseIpPath(template)
+			if err != nil {
+				b.Fatalf("parse provider benchmark packet: %v", err)
+			}
+			b.ReportAllocs()
+			b.SetBytes(int64(packetCount * len(template)))
+			var logicalGroupCount int64
+			b.ResetTimer()
+			for range b.N {
+				var packetValues [packetCount][]byte
+				packets := packetValues[:]
+				for packetIndex := range packets {
+					packets[packetIndex] = MessagePoolCopy(template)
+				}
+				item := providerReturnItem{
+					source: SourceId(peerId),
+					transferKey: TransferKey{
+						ForceStream:       true,
+						CompanionContract: true,
+						EncryptionRole:    protocol.SequenceRole_SequenceRoleServer,
+					},
+					provideMode:     protocol.ProvideMode_Public,
+					recoveryMode:    receiveRecoveryModeTcpSocket,
+					ipProtocol:      IpProtocolTcp,
+					packets:         packets,
+					packetByteCount: ByteCount(packetCount * len(template)),
+					batch:           true,
+					schedulingKey:   ipSendSchedulingKey(path),
+				}
+				if !provider.sendReturnBatchWithLimits(
+					&item,
+					variant.maxFrames,
+					variant.maxBytes,
+				) {
+					b.Fatal("provider benchmark batch was not admitted")
+				}
+				groupCount := len(sequence.packs)
+				if groupCount == 0 {
+					b.Fatal("provider benchmark emitted no logical group")
+				}
+				logicalGroupCount += int64(groupCount)
+				for range groupCount {
+					(<-sequence.packs).returnFrames()
+				}
+			}
+			b.ReportMetric(float64(logicalGroupCount)/float64(b.N), "logical-groups/op")
+		})
+	}
+}
+
 // A rejected legacy no-contract batch retains every wrapped frame as one
 // ordered socket-owned disposition until Transfer accepts it.
 func TestRemoteUserNatProviderReturnV1RetriesRejectedSocketBatch(t *testing.T) {

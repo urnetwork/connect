@@ -264,6 +264,64 @@ func TestSequenceAckWindowPendingDoesNotCloneSelectiveAcks(t *testing.T) {
 	}
 }
 
+func TestSequenceAckWindowDueDispositionIgnoresUnrelatedProgress(t *testing.T) {
+	window := newSequenceAckWindow()
+	targetMessageId := NewId()
+	unrelatedMessageId := NewId()
+
+	window.Update(sequenceAck{
+		sequenceNumber: 6,
+		messageId:      unrelatedMessageId,
+		selective:      true,
+	})
+	if !window.Pending() {
+		t.Fatal("unrelated selective ACK was not pending")
+	}
+	if window.PendingDispositionFor(5, targetMessageId) {
+		t.Fatal("unrelated selective ACK postponed the due target")
+	}
+	if !window.PendingDispositionFor(6, unrelatedMessageId) {
+		t.Fatal("exact selective ACK did not cover its due item")
+	}
+	window.Snapshot(true)
+
+	window.Update(sequenceAck{sequenceNumber: 4, messageId: NewId()})
+	if window.PendingDispositionFor(5, targetMessageId) {
+		t.Fatal("lower cumulative ACK postponed a higher due item")
+	}
+	window.Update(sequenceAck{sequenceNumber: 5, messageId: targetMessageId})
+	if !window.PendingDispositionFor(5, targetMessageId) {
+		t.Fatal("covering cumulative ACK did not preempt the due item")
+	}
+	window.Snapshot(true)
+
+	window.UpdateContractMissing(sequenceAck{
+		messageId:         unrelatedMessageId,
+		contractMissing:   true,
+		missingContractId: NewId(),
+	})
+	if window.PendingDispositionFor(5, targetMessageId) {
+		t.Fatal("unrelated missing-contract request postponed the due target")
+	}
+	window.UpdateContractMissing(sequenceAck{
+		messageId:         targetMessageId,
+		contractMissing:   true,
+		missingContractId: NewId(),
+	})
+	if !window.PendingDispositionFor(5, targetMessageId) {
+		t.Fatal("exact missing-contract request did not preempt the due item")
+	}
+
+	allocs := testing.AllocsPerRun(1_000, func() {
+		if !window.PendingDispositionFor(5, targetMessageId) {
+			t.Fatal("exact pending disposition disappeared")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("exact pending-disposition check allocated %.0f times, want 0", allocs)
+	}
+}
+
 func TestSequenceAckWindowPreservesCompactRecoveryCapability(t *testing.T) {
 	window := newSequenceAckWindow()
 	window.Update(sequenceAck{

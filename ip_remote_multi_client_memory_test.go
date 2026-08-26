@@ -30,6 +30,7 @@ func TestMultiClientMemorySnapshotIsPrimitiveAndAllocationFree(t *testing.T) {
 	qualityTransferClient.initialSendFrameCount.Store(41)
 	qualityTransferClient.initialSendMessageByteCount.Store(4300)
 	qualityTransferClient.timeoutResendWriteCount.Store(5)
+	qualityTransferClient.ackPendingResendPreemptCount.Store(3)
 	qualityTransferClient.selectiveGapWriteCount.Store(7)
 	qualityTransferClient.recoveryWriteErrorCount.Store(11)
 	qualityClient := &multiClientChannel{client: qualityTransferClient}
@@ -59,6 +60,7 @@ func TestMultiClientMemorySnapshotIsPrimitiveAndAllocationFree(t *testing.T) {
 	speedTransferClient.initialSendFrameCount.Store(47)
 	speedTransferClient.initialSendMessageByteCount.Store(5300)
 	speedTransferClient.carrierChangeWriteCount.Store(19)
+	speedTransferClient.ackPendingResendPreemptCount.Store(5)
 	speedTransferClient.ackTailProbeWriteCount.Store(23)
 	speedTransferClient.cumulativeProbeWriteCount.Store(29)
 	speedTransferClient.recoveryWriteErrorCount.Store(31)
@@ -107,6 +109,7 @@ func TestMultiClientMemorySnapshotIsPrimitiveAndAllocationFree(t *testing.T) {
 		snapshot.InitialFrameCount != 88 ||
 		snapshot.InitialMessageByteCount != 9600 ||
 		snapshot.TimeoutResendWriteCount != 5 ||
+		snapshot.AckPendingResendPreemptCount != 8 ||
 		snapshot.CarrierChangeWriteCount != 19 ||
 		snapshot.SelectiveGapWriteCount != 7 ||
 		snapshot.AckTailProbeWriteCount != 23 ||

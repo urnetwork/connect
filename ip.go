@@ -6038,6 +6038,24 @@ func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bo
 // Every packet share either moves into a raw frame or is returned after legacy
 // wrapping before this function exits.
 func (self *RemoteUserNatProvider) sendReturnBatch(item *providerReturnItem) bool {
+	return self.sendReturnBatchWithLimits(
+		item,
+		providerReturnBatchMaxFrames,
+		providerReturnBatchMaxBytes,
+	)
+}
+
+// sendReturnBatchWithLimits keeps the production fairness bounds explicit and
+// lets deterministic benchmarks compare candidate batch shapes without a
+// mutable process-wide knob.
+func (self *RemoteUserNatProvider) sendReturnBatchWithLimits(
+	item *providerReturnItem,
+	maxFrames int,
+	maxBytes int64,
+) bool {
+	if maxFrames <= 0 || maxBytes <= 0 {
+		panic("provider return batch limits must be positive")
+	}
 	packets := item.packets
 	item.packets = nil
 	defer func() {
@@ -6053,8 +6071,8 @@ func (self *RemoteUserNatProvider) sendReturnBatch(item *providerReturnItem) boo
 		item.ipProtocol,
 	)
 	destinationId := item.source.SourceId
-	frames := make([]*protocol.Frame, 0, providerReturnBatchMaxFrames)
-	wrappedShares := make([][]byte, 0, providerReturnBatchMaxFrames)
+	frames := make([]*protocol.Frame, 0, maxFrames)
+	wrappedShares := make([][]byte, 0, maxFrames)
 	var chunkBytes int64
 	var chunkPacketBytes int64
 	allSent := true
@@ -6063,7 +6081,7 @@ func (self *RemoteUserNatProvider) sendReturnBatch(item *providerReturnItem) boo
 			return
 		}
 		sendFrames := frames
-		frames = make([]*protocol.Frame, 0, providerReturnBatchMaxFrames)
+		frames = make([]*protocol.Frame, 0, maxFrames)
 		frameCount := len(sendFrames)
 		packetBytes := chunkPacketBytes
 		transportAttribution := newTransportPacketAttribution(
@@ -6123,7 +6141,7 @@ func (self *RemoteUserNatProvider) sendReturnBatch(item *providerReturnItem) boo
 		// SendSequence later applies its H1/H3 wire-size limit without rerunning
 		// provider routing or changing packet order.
 		if 0 < len(frames) &&
-			providerReturnBatchMaxBytes < chunkBytes+int64(len(frame.MessageBytes)) {
+			maxBytes < chunkBytes+int64(len(frame.MessageBytes)) {
 			flush()
 		}
 		if frame.Raw {
@@ -6135,8 +6153,7 @@ func (self *RemoteUserNatProvider) sendReturnBatch(item *providerReturnItem) boo
 		frames = append(frames, frame)
 		chunkBytes += int64(len(frame.MessageBytes))
 		chunkPacketBytes += int64(len(packet))
-		if providerReturnBatchMaxFrames <= len(frames) ||
-			providerReturnBatchMaxBytes <= chunkBytes {
+		if maxFrames <= len(frames) || maxBytes <= chunkBytes {
 			flush()
 		}
 	}

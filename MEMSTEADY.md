@@ -797,6 +797,172 @@ efficiency target, but it is no longer evidence for buying more receive depth.
 Public-fleet deployment and an iOS extension footprint run remain distinct
 release gates.
 
+## 2026-08-26 cross-project and two-device research pass
+
+This pass tested the eight limiter directions above on both attached Android
+devices, then compared the results with the designs used by WireGuard,
+wireguard-go, Tailscale, gVisor, DPDK, VPP, quic-go, and BoringTun. The useful
+lesson is not that this data path should imitate a kernel VPN wholesale.
+Android `VpnService` exposes one IP packet per TUN read and accepts one IP
+packet per TUN write, so Linux-only TUN GSO/GRO, `sendmmsg`, kernel DCO, and
+busy polling are not available at this boundary. The transferable ideas are
+bounded ownership, draining all work that is already ready, fixed worker
+pools, flow locality, and avoiding allocation on packet/ACK accounting paths.
+
+### What the other implementations establish
+
+| Project / technique | Primary-source result | Transfer to this mobile H1 path |
+| --- | --- | --- |
+| [WireGuard paper](https://www.wireguard.com/papers/wireguard.pdf) and [kernel-integration paper](https://www.wireguard.com/papers/wireguard-netdev22.pdf) | GSO super-packets let routing and network-stack work be reused across a packet cluster; the paper reports sending gains around 35% from batching and cache locality. WireGuard uses fixed rings and balances single-flow locality against multiflow parallelism. | Keep one ready drain together through parse/policy/Transfer admission and cache immutable per-flow decisions. Do not add a wait to create a batch. Android does not expose the Linux vnet/GSO metadata needed to create true super-packets. |
+| [wireguard-go Android queue policy](https://github.com/WireGuard/wireguard-go/blob/master/device/queueconstants_android.go) and [device workers](https://github.com/WireGuard/wireguard-go/blob/master/device/device.go) | Android deliberately uses smaller fixed queues; buffers come from preallocated pools, and crypto work runs through a fixed worker set rather than one worker graph per packet. | The fixed-capacity byte gates and warm pools are directionally correct. The provider NAT's per-UDP-flow goroutines are the remaining mismatch: flow fanout scales stacks even when packet buffers are bounded. |
+| [Tailscale TSO/GRO/mmsg work](https://tailscale.com/blog/throughput-improvements) and [UDP/QUIC follow-up](https://tailscale.com/blog/quic-udp-throughput) | Moving more packets per I/O produced a best-case 2.2x wireguard-go gain, up to 33% on Tailscale Linux, and a 4x UDP gain on bare metal after end-to-end offload work. | The SDK already performs one blocking TUN read, up to 63 nonblocking reads, then one `sendPacketsNoCopy` call. Provider socket reads already drain into bounded logical groups. TUN injection must remain one write per IP packet; `writev` would erase packet boundaries. |
+| [gVisor buffer-pooling work](https://gvisor.dev/blog/2022/10/24/buffer-pooling/) | Netstack attributed 20--30% of processing time to allocation/GC; explicit ownership and tiered pools removed 99% of allocations and improved throughput by more than 30%. | Continue tiered exact-size pools and ownership/leak tests, but cap the returned warm floor. This pass removes the last per-ACK RTT heap node; increasing retained pool capacity is rejected because physical spikes were not caused by returned-pool bytes. |
+| [DPDK ring/burst API](https://doc.dpdk.org/guides/prog_guide/ring_lib.html), [DPDK poll-mode guidance](https://doc.dpdk.org/guides/prog_guide/ethdev/ethdev.html), and [VPP vectors](https://docs.fd.io/vpp/24.02/aboutvpp/scalar-vs-vector-packet-processing.html) | Fixed rings, bulk/burst operations, run-to-completion processing, and vectors amortize atomics, queue crossings, and instruction-cache work. VPP processes vectors of up to 256 packets. | Use small ready-only bursts at every existing ownership boundary. Mobile fairness and memory bounds matter more than a datacenter-sized vector: the retained provider group remains 16 frames / 24 KiB after the 32/48 candidate failed to show a physical speed win. |
+| [Linux receive/transmit scaling](https://docs.kernel.org/networking/scaling.html) | Flow-to-CPU locality reduces cache misses and queue-lock contention; software steering can instead add inter-processor interrupts. | Do not add workers merely because CPUs exist. Pin a flow to one ordered shard and increase worker count only after block/CPU profiles prove one shard saturated. The current one-shard NAT default measured neutral versus eight shards in earlier tests. |
+| [quic-go flow control](https://quic-go.net/docs/quic/flowcontrol/) and [GSO notes](https://quic-go.net/docs/quic/optimizations/) | Receive windows must cover BDP, but aggregate connection limits bound memory; Linux GSO can submit up to 64 KiB. | At 40 Mbit/s and 200 ms, BDP is about 1 MiB. Existing shared resend capacity (about 9 MiB provider-off), 768-KiB per-flow logical receive, and multiple H1 flows already cover the target class. Earlier 128-depth experiments consumed more memory without increasing physical speed, so no new window spend is retained. |
+| [Linux `MSG_ZEROCOPY`](https://docs.kernel.org/next/networking/msg_zerocopy.html) | Copy avoidance generally pays only above roughly 10 KiB and adds completion/ownership work. | It does not fit MTU-sized Android TUN writes or the current H1 message envelope. Exact pooled copies are cheaper and easier to bound here. Revisit only with a negotiated larger H1 envelope on a platform that exposes completion semantics. |
+| [BoringTun](https://github.com/cloudflare/boringtun) | Its portable core is deliberately separate from platform tunnel/network-stack integration and is deployed on iOS and Android. | Preserve the same separation: optimize the shared Transfer core where measured, but keep Android TUN and iOS NetworkExtension constraints explicit. Android runtime measurements predict Go allocation behavior; they do not substitute for iOS `phys_footprint`. |
+
+WireGuard's own [performance roadmap](https://www.wireguard.com/performance/)
+lists GRO, lock-free queues, core autoscaling, packet locality, and fair queue
+management, while warning that its published benchmark table is old. The
+applicable ordering here is locality and bounded bursts first, worker scaling
+second, and queue growth only after a measured saturated boundary. Linux
+offloads and queue disciplines are useful controls, not directly shippable
+Android changes.
+
+### Eight-direction result
+
+| Direction | Measurement in this pass | Decision |
+| --- | --- | --- |
+| 1. End-to-end hop timing | Schema 12 separates client and provider Pack, ACK-write, initial-write, timeout, and recovery counters. In the reverse physical topology the provider accumulated 7,576 timeout recovery writes while its runtime reached 30.43 MiB; the client phases stayed below 24 MiB. | Keep the primitive provider telemetry. The next timestamp work should be sampled at ownership boundaries rather than adding a clock read to every packet. |
+| 2. ACK/RTO behavior | A deterministic snapshot/arrival barrier reproduced a due resend after its covering ACK was already in the coalescer. Rechecking the exact item before the recovery write yields one initial H1 wire write, zero recovery writes, and one recorded preemption. Replacing the RTT pointer heap with a fixed ring plus monotonic minimum deque changed the per-ACK median from 43.64--44.92 ns and 64 B / one allocation to 20.26--20.32 ns and 0 B / zero allocations, about 54% less time. | Keep both changes. The exact check ignores unrelated cumulative/selective progress, so a real hole cannot be postponed indefinitely. |
+| 3. Provider-controlled A/B | The devices were cross-pinned by exact peer identity and alternated provider/client roles. This removed public provider selection but not the two different cellular/Wi-Fi exits. The controlled same-device campaign immediately before this pass remains the valid 40-Mbit/s proof: 38/41/52 Mbit/s with zero reliable handoff drops. | Keep exact peer pinning in the procedure. Do not convert the variable two-phone Internet results into a code speedup/regression percentage. |
+| 4. Effective BDP/window | No client phase filled a memory ceiling; maxima were 18.57 MiB on the Galaxy and 23.04 MiB on the Pixel. Previous iterative 64 -> 128 depth reached its earned maximum but did not improve fast.com. | Keep H1 receive 64/128 KiB and existing shared byte budgets. Reject further static or iterative depth for production until a fixed route shows outstanding useful bytes actually capped there. |
+| 5. fast.com flow distribution | Existing eight-lane work improves page parallelism, but a public provider can still put its return data on lane zero. In this exact-peer matrix, fast.com varied 0.61--7.6 Mbit/s through the tunnel while adjacent Direct Wi-Fi medians were 390 and 960 Mbit/s. | Provider-side symmetric lane deployment and per-lane useful-byte telemetry remain required. Client-only lane or queue expansion is not retained as a 40-Mbit/s fix. |
+| 6. Provider return batching | For one 64-packet drain, 16 frames / 24 KiB produced four groups at a 4,959--4,981-ns median, 9,424 B, and 98 allocations. A test-only 32/48 shape produced two groups at 4,371--4,391 ns, 8,424 B, and 82 allocations: about 12% less local time. The physical matrix did not establish an end-to-end speed improvement and the larger owner increases fairness/memory exposure. | Keep the benchmark helper and production-bound regression test; retain production 16/24. A local microbenchmark win alone is insufficient to spend mobile burst memory. |
+| 7. Provider IP stack | A fresh synthetic provider run moved 4.5 MiB of echoed TCP at 49.4 MiB/s and measured 30.7 MiB peak runtime / 13.6 MiB peak live heap. After 192 short UDP flows, 621 goroutines remained: 192 socket readers plus 192 per-flow send/idle loops. The physical provider similarly reached 748 goroutines. | Highest-value memory direction is a shared nonblocking UDP socket poller or bounded receive-worker set, not smaller packet pools. It is research-only until it preserves datagram order, idle/lifecycle behavior, and measured UDP latency/throughput. |
+| 8. Conditional provider-off budget | Both physical client roles remained below 24 MiB without consuming the extra budget through deeper queues. Direct-versus-tunnel gaps persisted even with ample memory. | Leave unused provider-off headroom as safety margin. Spend it only on a boundary that first reports saturation and then improves a same-route A/B. |
+
+Only the RTT representation, exact ACK-pending resend preemption, schema-12
+provider attribution, and their deterministic tests remain in the candidate.
+The 32/48 provider group, deeper windows, larger pools, shorter provider idle
+timeouts, extra NAT shards, and zero-copy paths are not enabled in production.
+The complete benchmark-only server gate then passed all 190
+`server/connect`, 10 `server/connect/perfvar`, and 20 `server/proxy` samples.
+The production ACK-sized H1 TLS median was 371.5 ns with 10 B and two
+allocations per operation; PERFVAR receive-credit was 681.0 ns, and proxy
+batch-64 was 5,526 ns. These are current-source guard values, not a detached
+baseline comparison; the changed RTT path is exercised in Connect, not in the
+server relay/proxy packet loops.
+The complete Connect and SDK short suites passed in 198.041 and 99.190
+seconds, both affected vet trees passed, and focused normal/race repetitions
+passed. The Android schema parser's ten privacy/eligibility tests also passed.
+
+The deterministic root-cause gate is:
+
+```sh
+go test . -run '^TestH1ReadyHotPathAckSuppressesEveryRecoveryWrite$' -count=100
+go test -race . -run '^TestH1ReadyHotPathAckSuppressesEveryRecoveryWrite$' -count=10
+go test . -run '^TestSequenceAckWindowDueDispositionIgnoresUnrelatedProgress$' -count=100
+go test . -run '^$' -bench '^BenchmarkRttWindowCloseSendTime$' -benchmem -count=7
+```
+
+The first test places a cumulative ACK after the sender's empty snapshot and
+before its already-due recovery write. It must observe exactly one physical
+write for the H1 Pack, zero recovery writes, an empty resend queue, and exactly
+one `ack_pending_resend_preempts` event. The second test proves unrelated ACK
+progress does not suppress a real hole. The benchmark must stay at zero B/op
+and zero allocations/op. On a physical clean H1 phase, compare counter deltas,
+not cumulative totals: carrier/Pack drops and recovery errors must remain zero;
+timeout writes should be explained by actual missing receiver progress, while
+ACK-pending preemptions identify races safely avoided. This combination catches
+both forbidden duplicate writes and an over-broad optimization that hides loss.
+
+### Two-device physical matrix
+
+Both devices ran the final schema-12 artifact as long-lived authenticated
+sessions. Each became provider once; the other device then alternated Wi-Fi,
+same-LAN P2P, and cellular. Chrome used cache-disabled DevTools navigation to
+real Wikipedia pages and canonical fast.com runs. Direct controls ran after
+disconnecting the tunnel. One cellular page attempt ended when Chrome closed
+the DevTools WebSocket; it is recorded as a harness failure and excluded from
+the stable seven-page cohort, not silently retried into that cohort.
+
+| Provider -> client / path | Wikipedia median load / document TTFB | fast.com displays | Runtime result |
+| --- | ---: | ---: | --- |
+| Pixel -> Galaxy, Wi-Fi H1 | 766.3 / 182.1 ms | 0.61, 3.6, 5.0 Mbit/s | Galaxy client max 17.19 MiB |
+| Pixel -> Galaxy, same-LAN P2P | 1,025.1 / 290.2 ms | 2.7 Mbit/s | Galaxy client max 18.57 MiB |
+| Pixel -> Galaxy, cellular H1 | 543.1 / 242.3 ms | 4.7, 7.6, 9.4 Mbit/s | Galaxy client max 18.46 MiB |
+| Galaxy -> Pixel, Wi-Fi H1 | 6,459.3 / 927.3 ms | 0.73, 0.58, 0.61 Mbit/s | Pixel client max 22.78 MiB |
+| Galaxy -> Pixel, same-LAN P2P | 1,451.3 / 236.6 ms | 2.9 Mbit/s | Pixel client max 23.04 MiB |
+| Galaxy -> Pixel, cellular H1 | 720.2 / 301.2 ms | 1.1, 6.5, 5.3 Mbit/s | Pixel client max 22.85 MiB |
+| Pixel Direct cellular | 359.7 / 165.3 ms | 32, 34, 1.5 Mbit/s | Tunnel stopped |
+| Pixel Direct Wi-Fi | 293.5 / 115.4 ms | 390, 350, 390 Mbit/s | Tunnel stopped |
+| Galaxy Direct cellular | 266.0 / 96.0 ms | 1.4, 1.5, 1.5 Mbit/s | Tunnel stopped |
+| Galaxy Direct Wi-Fi | 164.4 / 63.6 ms | 730, 960, 960 Mbit/s | Tunnel stopped |
+
+The Wi-Fi controls prove both radios and fast.com targets had far more than
+40 Mbit/s available. The cellular controls also show why a displayed speed
+alone is not a stable cross-arm benchmark: one carrier/target cohort was only
+1.5 Mbit/s even though page TTFB was 96 ms. The exact-peer tunnel results are
+therefore useful failure attribution, not evidence that the previously
+measured 38/41/52-Mbit/s lossless-H1 result disappeared.
+
+Across 71 Pixel and 70 Galaxy samples, Pixel runtime peaked at 26.12 MiB with
+five samples above 24 MiB and none above 28 MiB. Galaxy peaked at 30.43 MiB
+with 16 samples above 24 MiB and ten above 28 MiB. Every client/P2P/cellular
+phase stayed below 24 MiB; all violations were provider work:
+
+- Pixel provider: 26.12-MiB runtime max, 11.23-MiB live-heap max, 1.32-MiB
+  packet-outstanding max, and 4,458 provider timeout writes.
+- Galaxy provider: 30.43-MiB runtime max, 13.99-MiB live-heap max, 1.78-MiB
+  packet-outstanding max, and 7,576 provider timeout writes. At the maximum,
+  returned packet-pool storage was only about 0.21 MiB while 748 goroutines
+  were live.
+- After provider work stopped, Galaxy first recovered to 19.89 MiB before
+  automatic reclaim; its final finish sample was 16.95 MiB after one idle
+  trim/forced GC. Pixel's final finish sample was 19.91 MiB with no forced GC.
+  The active excess was live provider/NAT/Transfer state plus
+  goroutine/allocator-span retention, not a returned-pool high-water that a
+  harsher reclaim timer alone could solve.
+
+This final physical matrix therefore fails the active provider <=24-MiB and
+zero->28-MiB gates even though client mode passes. It also does not provide a
+new 40-Mbit/s public-route pass. Release work must preserve the already proven
+lossless-H1 throughput while replacing per-flow provider scheduling state with
+bounded workers and then repeat provider-on/off/on steady recovery on both
+devices. An iOS Network Extension `phys_footprint`/jetsam run remains the final
+memory authority.
+
+### Next measured research order
+
+1. Add primitive provider TCP/UDP/ICMP flow counts and socket-worker counts to
+   the sampler. Validate that the counter path allocates nothing.
+2. Prototype one provider-only UDP poller/sharded event loop. Against the
+   existing 192-flow fixture, require fewer than half the current 384 UDP
+   flow goroutines, at least 2 MiB lower peak runtime, identical payload/order,
+   and no loss in UDP requests/s or p95 latency. Keep the current design if it
+   misses any condition.
+3. Deploy the retained provider ACK/group/reliable-handoff code to one fixed
+   exit and alternate old/current/current/old. Record useful bytes per lane,
+   timeout writes, ACK-pending preemptions, and CPU per delivered MiB.
+4. Add sampled stage deltas for TUN read -> client Pack -> H1 write -> server
+   relay -> provider Pack -> NAT socket -> return H1 -> TUN write. Sampling
+   must be deterministic and below 0.5% CPU in the local throughput benchmark.
+5. Only if H1 socket writes remain limiting, negotiate a larger carrier
+   envelope and sweep 4/8/16/32 KiB under the same 24-MiB gate. Do not infer a
+   win from logical grouping without physical-write and device goodput deltas.
+6. Profile route/policy lookup reuse across one ready burst, following
+   WireGuard's once-per-cluster route-cache pattern. Retain only a cache with
+   explicit invalidation and an end-to-end CPU/TTFB gain.
+7. Measure scheduler locality before changing shard counts. A new worker must
+   reduce block/mutex/CPU cost on both phone classes and must not increase
+   active runtime or sparse request TTFB.
+8. Re-run H3/DNS separately in the future iteration. Their UDP/QUIC flow
+   control and datagram loss semantics differ from default H1; none of the H1
+   Internet rates in this pass are H3/DNS performance evidence.
+
 ## Experiment queue
 
 Run one change at a time where practical, then combine only independently

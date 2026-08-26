@@ -1575,6 +1575,7 @@ type MultiClientMemorySnapshot struct {
 	InitialFrameCount               uint64
 	InitialMessageByteCount         uint64
 	TimeoutResendWriteCount         uint64
+	AckPendingResendPreemptCount    uint64
 	CarrierChangeWriteCount         uint64
 	SelectiveGapWriteCount          uint64
 	AckTailProbeWriteCount          uint64
@@ -1639,6 +1640,7 @@ func addMultiClientTransferMemorySnapshot(
 		snapshot.InitialFrameCount += recovery.InitialFrameCount
 		snapshot.InitialMessageByteCount += recovery.InitialMessageByteCount
 		snapshot.TimeoutResendWriteCount += recovery.TimeoutResendWriteCount
+		snapshot.AckPendingResendPreemptCount += recovery.AckPendingResendPreemptCount
 		snapshot.CarrierChangeWriteCount += recovery.CarrierChangeWriteCount
 		snapshot.SelectiveGapWriteCount += recovery.SelectiveGapWriteCount
 		snapshot.AckTailProbeWriteCount += recovery.AckTailProbeWriteCount
