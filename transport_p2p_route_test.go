@@ -54,8 +54,9 @@ func (self *p2pRouteTestTransport) MatchesReceive(TransferPath) bool { return tr
 func (self *p2pRouteTestTransport) Downgrade(TransferPath)           {}
 
 type recordingP2pRouteManager struct {
-	properties TransferCarrierProperties
-	active     bool
+	properties      TransferCarrierProperties
+	propertyUpdates []TransferCarrierProperties
+	active          bool
 }
 
 func (self *recordingP2pRouteManager) UpdateTransport(Transport, []Route) {
@@ -69,6 +70,7 @@ func (self *recordingP2pRouteManager) UpdateTransportWithProperties(
 	properties TransferCarrierProperties,
 ) {
 	self.properties = properties
+	self.propertyUpdates = append(self.propertyUpdates, properties)
 	self.active = true
 }
 
@@ -97,9 +99,48 @@ func (self *p2pRouteTestFastConn) FastPathMessages() <-chan p2pFastPathReceivedM
 	return nil
 }
 
-// Every P2P lane ends at the same bounded, nonblocking receive handoff.
-// Publishing that complete path as unreliable activates Transfer's bounded
-// ACK flight even while Auto is falling back to SCTP.
+func TestP2pReceiveConstructorPublishesExactPhysicalLanes(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	local, remote := net.Pipe()
+	defer remote.Close()
+	transport, lanes := newP2pReceiveTransportWithLanes(
+		ctx,
+		cancel,
+		local,
+		NewId(),
+		DefaultP2pTransportSettings(),
+		nil,
+		nil,
+	)
+	if len(lanes) != 2 {
+		t.Fatalf("P2P receive lanes=%d want=2", len(lanes))
+	}
+	if lanes[0].reliability != CarrierReliabilityReliable ||
+		lanes[1].reliability != CarrierReliabilityUnreliable {
+		t.Fatalf("P2P receive lane contracts=%v/%v", lanes[0].reliability, lanes[1].reliability)
+	}
+	if lanes[0].transport.TransportId() == lanes[1].transport.TransportId() ||
+		lanes[0].route == lanes[1].route {
+		t.Fatal("P2P physical lanes share route identity")
+	}
+	manager := &recordingP2pRouteManager{}
+	if !updateP2pConnectionReceiveRoutes(ctx, manager, lanes, true) {
+		t.Fatal("active P2P receive lanes were not published")
+	}
+	if len(manager.propertyUpdates) != 2 ||
+		manager.propertyUpdates[0].ReceiveReliability != CarrierReliabilityReliable ||
+		manager.propertyUpdates[1].ReceiveReliability != CarrierReliabilityUnreliable {
+		t.Fatalf("published P2P lane properties=%+v", manager.propertyUpdates)
+	}
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), time.Second)
+	defer closeCancel()
+	if err := transport.CloseAndWait(closeCtx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Auto applies bounded unreliable flight only while the native fast path is
+// actually eligible. Its reliable SCTP fallback must keep normal stream flight.
 func TestP2pConnectionRoutePublishesFastCarrierProperties(t *testing.T) {
 	defaultSettings := DefaultP2pTransportSettings()
 	if limit := p2pUnreliableFlightMessageLimit(defaultSettings); limit != 255 {
@@ -147,8 +188,8 @@ func TestP2pConnectionRoutePublishesFastCarrierProperties(t *testing.T) {
 			manager.properties.unreliableFlightByteLimit,
 		)
 	}
-	if !manager.properties.messageUnreliable([]byte("legacy fallback")) {
-		t.Fatal("Auto did not bound its SCTP fallback against the receive handoff")
+	if manager.properties.messageUnreliable([]byte("legacy fallback")) {
+		t.Fatal("Auto classified its reliable SCTP fallback as unreliable")
 	}
 	fastConn.ready.Store(true)
 	if !manager.properties.messageUnreliable([]byte("native fast")) {
@@ -156,11 +197,11 @@ func TestP2pConnectionRoutePublishesFastCarrierProperties(t *testing.T) {
 	}
 
 	transport.settings.DataPlaneMode = P2pDataPlaneModeLegacyOnly
-	if properties := p2pTransferCarrierProperties(transport); !properties.Unreliable ||
-		!properties.messageUnreliable([]byte("legacy only")) ||
-		properties.unreliableFlightByteLimit != kib(240) ||
-		properties.unreliableFlightMessageLimit != 15 {
-		t.Fatalf("legacy-only P2P route properties = %+v, want bounded handoff flight", properties)
+	if properties := p2pTransferCarrierProperties(transport); properties.Unreliable ||
+		properties.messageUnreliable([]byte("legacy only")) ||
+		properties.unreliableFlightByteLimit != 0 ||
+		properties.unreliableFlightMessageLimit != 0 {
+		t.Fatalf("legacy-only P2P route properties = %+v, want reliable", properties)
 	}
 	transport.settings.DataPlaneMode = P2pDataPlaneModeFastOnly
 	if properties := p2pTransferCarrierProperties(transport); !properties.Unreliable ||

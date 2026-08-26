@@ -17,6 +17,69 @@ type typedPriorityRouteTestTransport struct {
 	transportType TransportType
 }
 
+func TestMultiRouteReaderReportsExactHybridReceiveLane(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	selector := NewMultiRouteSelector(
+		ctx,
+		"hybrid-receive-lane",
+		nil,
+		DestinationId(NewId()),
+		true,
+	)
+	defer selector.Close()
+	base := NewReceiveGatewayTransportWithType(TransportTypeH3)
+	reliableRoute := make(Route, 1)
+	unreliableRoute := make(Route, 1)
+	selector.updateTransportWithProperties(
+		base,
+		[]Route{reliableRoute},
+		TransferCarrierProperties{ReceiveReliability: CarrierReliabilityReliable},
+	)
+	selector.updateTransportWithProperties(
+		newReceiveLaneTransport(base),
+		[]Route{unreliableRoute},
+		TransferCarrierProperties{ReceiveReliability: CarrierReliabilityUnreliable},
+	)
+
+	for _, testCase := range []struct {
+		name        string
+		route       Route
+		reliability CarrierReliability
+	}{
+		{name: "QUIC stream", route: reliableRoute, reliability: CarrierReliabilityReliable},
+		{name: "DATAGRAM", route: unreliableRoute, reliability: CarrierReliabilityUnreliable},
+	} {
+		message := MessagePoolGet(23)
+		testCase.route <- message
+		got, disposition, err := selector.readWithCarrier(ctx, time.Second)
+		if err != nil {
+			t.Fatalf("%s: %v", testCase.name, err)
+		}
+		if disposition.transportType != TransportTypeH3 ||
+			disposition.reliability != testCase.reliability {
+			MessagePoolReturn(got)
+			t.Fatalf("%s receive disposition=%+v", testCase.name, disposition)
+		}
+		MessagePoolReturn(got)
+	}
+}
+
+func TestTransferCarrierHybridSendCutoffClassifiesOnlyDatagramFrames(t *testing.T) {
+	properties := TransferCarrierProperties{
+		Unreliable:                    true,
+		UnreliableMaxMessageByteCount: 31,
+		UnreliableFlowIsolation:       true,
+		UnreliableFlowReserve:         true,
+	}
+	if !properties.messageUnreliable(make([]byte, 31)) {
+		t.Fatal("message at DATAGRAM cutoff was classified reliable")
+	}
+	if properties.messageUnreliable(make([]byte, 32)) {
+		t.Fatal("message above DATAGRAM cutoff was classified unreliable")
+	}
+}
+
 func newTypedPriorityRouteTestTransport(
 	transportType TransportType,
 	priority int,

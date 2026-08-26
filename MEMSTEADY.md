@@ -15,9 +15,13 @@ topology budgets decide whether that headroom can do useful work.
 
 ## Scope and acceptance signals
 
-The current iteration optimizes the default H1 carrier. H3 and tunneled DNS
-need their own follow-up because their working sets and failure modes are
-different; an H1 result must not be presented as H3/DNS evidence.
+The current performance iteration optimizes the default H1 carrier. H3 and
+tunneled DNS still need their own throughput/TTFB follow-up because their
+working sets and failure modes are different; an H1 speed result must not be
+presented as H3/DNS performance evidence. The receive-correctness contract is
+now carrier-independent, however: every exact reliable stream/SCTP/framed-TCP
+lane preserves fixed-capacity backpressure, and every true datagram lane stays
+bounded and zero-wait.
 
 The performance goal is to recover the previously observed fast.com class of
 40+ Mbit/s while making ordinary pages feel immediate. Each device run must
@@ -264,8 +268,10 @@ same new traffic. Increasing Pack or reorder depth only stores a larger blocked
 tail. The first corrective experiment keeps the channel capacity unchanged and
 retains only the one message already read and already charged to the carrier:
 when the H1 route is full, the reader waits for route space or connection
-cancellation and lets TCP apply backpressure to the peer. H3/DNS/P2P keep their
-existing nonblocking policies until their separate iteration.
+cancellation and lets TCP apply backpressure to the peer. The adjacent audit
+found the same correctness boundary on H3/DNS QUIC streams and P2P SCTP, while
+H3 DATAGRAM and native P2P remain deliberately nonblocking. This generalization
+does not claim an H3/DNS performance win.
 
 The first carrier-only candidate proved both the correction and the next
 boundary. H1 carrier drops fell from 530 / 1,186,363 bytes to zero, with 25
@@ -275,10 +281,13 @@ baseline), the reorder queue again pinned 1.994 MiB, provider recovery reached
 1,544 timeout plus 564 selective writes, and fast.com displayed 3.5 Mbit/s.
 This is not a reason to restore the upstream drops: it is the same synthetic
 loss contract one hop later. The second candidate therefore uses the existing
-negative H1 handoff setting to wait until Pack capacity or cancellation. It
+negative reliable-lane handoff setting to wait until Pack capacity or
+cancellation. It
 does not add a slot or byte; per-sequence count/byte gates and the shared exact
-2-MiB Pack budget remain the ownership ceiling. H3/unknown handoff stays
-zero-wait and H1 ACK handoff retains its separate compact coalescing path.
+2-MiB Pack budget remain the ownership ceiling. Exact H3/DNS stream and SCTP
+handoffs use the same cancellation-bounded rule; H3 DATAGRAM, native P2P, and
+unknown custom lanes stay zero-wait. H1 ACK handoff retains its separate compact
+coalescing path.
 
 The combined lossless H1 pipeline removed the cliff. Three consecutive
 canonical fast.com runs through the pinned provider displayed 38, 41, and
@@ -315,35 +324,117 @@ server regression. The DB-backed H1 PERFVAR correctness track was attempted
 with its documented environment and remains externally unavailable because
 the local Redis fixture is down; it is not counted as a passing gate.
 
+### Cross-carrier remediation fast.com regression bracket
+
+The exact-lane remediation was measured on the attached Pixel with explicit H1,
+provider work disabled, a fresh authenticated process and Chrome process per
+arm, two stable DevTools probes five seconds apart, cache disabled, and three
+canonical fast.com runs. The order deliberately bracketed the retained
+pre-change SDK AAR with the current build:
+
+| Arm | fast.com displays | Median | Exact H1 ingress | Go runtime peak | Reliable-handoff result |
+| --- | --- | ---: | ---: | ---: | --- |
+| Current opening | 8.7, 6.9, 7.3 Mbit/s | 7.3 Mbit/s | 43.80 MB | 18.73 MiB | 19/19 Pack waits; zero Pack/route drops |
+| Retained pre-change AAR | 84, 95, 1.2 Mbit/s | 84 Mbit/s | 223.70 MB | 19.25 MiB | 154/154 Pack waits; zero Pack/route drops |
+| Current closing | 160, 130, 140 Mbit/s | 140 Mbit/s | 504.00 MB | 20.21 MiB | 5,769 route backpressures / 8,483,576 bytes; zero route drops; 1,804/1,804 Pack waits and zero Pack drops |
+
+The public provider was not pinned across the three fresh clients, and the
+opening-current plus baseline outliers expose that route variance. Do not use
+the 140-versus-84 medians as a claimed product speedup. The closing current arm
+is nevertheless a valid regression gate: it carried all three runs above the
+40-Mbit/s target, exceeded the bracketed baseline median, moved 504.00 MB on the
+H1 counter rather than leaking Direct, drained Pack/reorder use to zero, and
+stayed below 24 MiB. Thus the lane remediation does not impose a systematic H1
+fast.com ceiling. A precise percentage comparison still requires a pinned
+provider and alternating old/current binaries on the same exit.
+
+Keep this gate paired with queue evidence. For a future release candidate, run
+at least three baseline and three current canonical samples, bracket each arm
+with exact carrier counters, preserve every outlier, and reject a candidate
+that cannot reach 40 Mbit/s on a path whose adjacent baseline can, or that
+creates any reliable route/Pack drop. A displayed speed alone is insufficient
+if traffic is not attributed to H1 or the fixed memory/ownership queues do not
+drain.
+
+The final pull added only generated IP-security and blocker data, but the
+physical artifact was rebuilt and bracketed again so that result was not
+assumed equivalent. On the now-degraded public route, the first three current
+displays were 0.58, 27, and 52 Mbit/s (27 median); three preserved extension
+samples were 17, 8.1, and 13. The retained AAR then displayed 28, 15, and 10
+Mbit/s (15 median), and closing current displayed 0.65, 17, and 10 (10 median).
+The current opening/retained/closing exact H1 deltas were 302.43 MB across six
+runs, 147.21 MB across three, and 64.37 MB across three. Runtime peaks were
+19.66, 17.70, and 19.89 MiB. All three arms had zero carrier and Pack drops;
+current opening completed 165/165 Pack waits and current closing 38/38. The
+same slow route also held the baseline below 40, while the candidate still
+produced the only above-40 sample. Treat this as a neutral route-limited
+current--baseline--current bracket, not as a replacement for the earlier
+140-Mbit/s closing target gate. Its 14,057/330/6,926 timeout-resend counts expose
+severe changing provider conditions and make a percentage comparison invalid.
+
+The post-remediation server performance gate is also neutral. Before the pull,
+all 210 `server/connect`, 10 PERFVAR, and 20 proxy samples passed at five
+repetitions / 300 ms. After the generated-data rebase, the exact 30 affected H1
+and queue-admission samples passed again. Production full-payload and ACK-sized
+H1 TLS medians were 884.2 and 366.7 ns/op with unchanged 17/10 B/op and two
+allocations, -1.34%/-1.69% versus the adjacent 896.2/373.0-ns cohort. The
+pre-rebase PERFVAR receive-credit was 673.4 ns (+5.75%) and unchanged proxy
+batch-64 was 5,444 ns (+1.80%); the small mixed directions are host noise rather
+than a shared regression. Post-rebase direct hot-path benchmarks measured
+reliable/unreliable fixed-queue admission at 31.17/32.67 ns and the complete
+ResidentTransport admission wrapper at 40.47/38.06 ns, all with zero bytes and
+zero allocations per operation. Reliable admission does not charge the ready
+path for its cancellation-bounded full-queue behavior.
+
 The deterministic root-cause gate is intentionally smaller than an Internet
-benchmark:
+benchmark and now covers the complete lane matrix:
 
-1. Create a one-slot platform receive route and fill it.
-2. Offer a second pooled 137-byte message as H1. Assert that the call remains
-   pending, increments `QueueBackpressureMessageCount` once, transfers no pool
-   ownership early, and records zero queue drops.
-3. Drain the first slot. Assert that the exact second slice is delivered once,
-   the call returns open/delivered, and the receiver returns its ownership.
-4. Repeat with cancellation while full and assert prompt termination without a
-   channel send. This pins teardown and pool-return liveness.
-5. Repeat the full-route case as H3 DNS and assert the historical prompt drop
-   plus exact drop counters. This prevents the H1 correction from silently
-   changing unreliable-carrier semantics.
+1. Publish reliable-stream and DATAGRAM siblings under one H3 family and prove
+   RouteManager returns the exact lane reliability with each message.
+2. Fill a one-slot platform route. H1 and every H3/H3Dns/H3DnsPump QUIC stream
+   must retain the exact second pooled message until capacity or cancellation;
+   the corresponding DATAGRAM lanes must refuse promptly and return ownership.
+3. Fill the ReceiveSequence handoff. H1, H3/DNS stream, P2P SCTP, and framed
+   server routes use the cancellation-bounded reliable setting; H3 DATAGRAM,
+   native P2P, and unknown/custom routes remain zero-wait. An artificial marker
+   after a full H3 stream queue must emerge in order with no manufactured gap.
+4. Split hybrid H3 without multiplying memory: the reliable route is
+   unbuffered while DATAGRAM owns the existing payload queue. Stream-only H3
+   retains the historical queue; the sum of route slots is unchanged.
+5. Exercise P2P separately. SCTP must block only on its exact reliable route
+   and return ownership on cancellation; native SRTP must keep its bounded
+   nonblocking queue and counted drop. Constructor and connection updates must
+   publish two immutable physical receive routes.
+6. Saturate every reliable server socket/exchange boundary. It must propagate
+   fixed-queue backpressure or retire the generation—never return a pooled frame
+   and continue. Preserve the exact server H3 send cutoff through the gob
+   exchange so only messages actually eligible for DATAGRAM consume unreliable
+   flight.
 
-Those cases live in `transport_receive_policy_test.go` as
-`TestPlatformTransportH1ReceiveQueueBackpressuresWithoutDropping`,
-`TestPlatformTransportH1ReceiveBackpressureCancellationReturns`, and
-`TestPlatformTransportH3DnsReceiveQueueRefusalDoesNotWait`. The existing
-`TestReceiveSequenceH1HandoffWaitRescuesFullQueue` pins finite waiting, while
-`TestReceiveSequenceH1HandoffNegativeWaitPreservesReliableBackpressure` pins
-the lossless H1 setting selected after the carrier-only arm and
-`TestReceiveSequenceH1HandoffNegativeWaitCancellationReturnsToCaller` pins
-teardown and caller ownership. Run the isolated deterministic gate from the
-Connect repository with:
+The primary Connect cases are
+`TestMultiRouteReaderReportsExactHybridReceiveLane`,
+`TestPackHandoffTimeoutUsesExactReceiveLaneReliability`,
+`TestReceiveSequenceReliableH3SaturationPreservesOrder`,
+`TestPlatformTransportH3StreamLanesBackpressureWithoutDropping`,
+`TestPlatformTransportH3DatagramLanesRefuseWithoutWaiting`,
+`TestP2pSctpReceiveBackpressuresAndCancelsWithOwnership`, and
+`TestP2pFastReceiveRefusesFullQueueWithoutWaiting`. The cutoff and memory gates
+are `TestH3DatagramTransferFrameLimitMatchesLaneSelection`,
+`TestTransferCarrierHybridSendCutoffClassifiesOnlyDatagramFrames`, and
+`TestPlatformH3ReceiveLaneSplitKeepsOnePayloadQueue`. Run the isolated Connect
+gate with:
 
 ```sh
-go test ./... \
-  -run 'TestProductionCarrierReadersUseModeSpecificReceiveAdmission|TestPlatformTransportH(1ReceiveQueueBackpressuresWithoutDropping|1ReceiveBackpressureCancellationReturns|3DnsReceiveQueueRefusalDoesNotWait)|TestReceiveSequenceH1Handoff(WaitRescuesFullQueue|NegativeWait.*)' \
+go test . \
+  -run 'Test(MultiRouteReaderReportsExactHybridReceiveLane|PackHandoffTimeoutUsesExactReceiveLaneReliability|ReceiveSequenceReliableH3SaturationPreservesOrder|PlatformH3ReceiveLaneSplitKeepsOnePayloadQueue|PlatformTransportH(1Receive.*|3(StreamLanesBackpressureWithoutDropping|DatagramLanesRefuseWithoutWaiting))|P2p(SctpReceiveBackpressuresAndCancelsWithOwnership|FastReceiveRefusesFullQueueWithoutWaiting)|H3DatagramTransferFrameLimitMatchesLaneSelection|TransferCarrierHybridSendCutoffClassifiesOnlyDatagramFrames|ProductionCarrierReadersUseModeSpecificReceiveAdmission)' \
+  -count=50
+```
+
+Run the server generation/cutoff gate from the Server repository with:
+
+```sh
+go test ./connect \
+  -run 'Test(SendPooledReceive.*|ReliableExchangeQueueSaturationPreservesFramedOrder|ExchangeGenerationRetiresAfterAnyUndeliveredFrame|ResidentTransportReceiveAdmissionUsesExactLane|ProductionSocketReadersDeclareExactReceiveLanes|ResidentForwardCallbackRetiresFullIngressWithoutWaiting|ExchangeHeaderUnreliableTransferGobCompatibility|ResidentTransportConstructorCarriesTransferProperties|ConnectH3TransferCarrierEnablesBoundedAckReserve)' \
   -count=50
 ```
 
@@ -356,10 +447,10 @@ go test ./... \
 ```
 
 These tests use filled one-slot queues, explicit release/cancellation barriers,
-exact pooled-slice ownership, and counters; they need no Internet timing or
-scheduler race to reproduce the boundary. On a physical
-acceptance run, sampler schema 11 must show
-zero delta in `platformH1ReceiveQueueDropCount`; a nonzero
+exact pooled-slice ownership, artificial sequence markers, and counters; they
+need no Internet timing or scheduler race to reproduce the boundary. On a
+physical H1 acceptance run, sampler schema 11 must show zero delta in
+`platformH1ReceiveQueueDropCount`; a nonzero
 `platformH1ReceiveBackpressureCount` is expected load evidence, not loss. Also
 require the Pack-drop delta and final reorder bytes to return to zero, compare
 provider timeout/selective recovery per MiB, and preserve <=24-MiB active and
@@ -437,7 +528,9 @@ reader/worker scheduling mismatches without enlarging either queue. The pinned
 provider A/B subsequently showed that any finite expiry can still manufacture
 a permanent sequence hole. The accepted H1 Pack policy therefore waits for
 capacity or cancellation under the same fixed count/byte gates. ACK admission
-remains at 1 ms and H3/unknown carriers remain zero-wait.
+remains at 1 ms. The adjacent remediation applies this Pack rule to exact
+H3/DNS QUIC-stream and SCTP lanes as well; H3 DATAGRAM, native P2P, and unknown
+custom carriers remain zero-wait.
 
 ACK scheduling has a separate low-memory win. Instead of delaying the first ACK
 after an idle period by 10 ms, the worker now enforces the same 10-ms *minimum
@@ -576,7 +669,9 @@ failed samples.
 | 2026-08-25 `h1-adaptive-depth-20260825` | Diagnostic: H1 count depth starts at 64, requires two full observations within 100 ms, and grows by 16 toward 128; logical bytes remained fixed at 128 KiB | pre-load Wikipedia median load/TTFB 604.2/252.6 ms; post-recovery 463.8/196.2 ms after one 6.02-s cold restart | 7/10 completed before one 120-s stream abort; completed median 1.54 Mbit/s | 3.29 MiB ingress in 75 s, about 0.37 Mbit/s; adjacent Direct 4-MiB median 86.74 Mbit/s | runtime peak 21.39 MiB; recovery p50/p95 19.86/20.24 MiB. Thirteen saturations and four grants across two flows reached an earned maximum of 96, but actual HWM stopped at 92 Packs / 130,978 of 131,072 bytes. | Reject count-only deepening. It stayed inside memory, but the fixed logical-byte cap became the next boundary and performance remained public-provider limited. Test paired count/byte growth once. |
 | 2026-08-25 `h1-adaptive-depth-bytes-20260825` | Diagnostic: paired 64/128-KiB -> 128/256-KiB H1 growth in 16/32-KiB steps under the unchanged exact shared retained budget | pre-load Wikipedia median load/TTFB 404.3/149.8 ms; post-recovery seven-run median 439.6/186.2 ms, including a 2.51-s cold connection setup | all 10 completed; median 1.18 Mbit/s and 476.82-ms first byte | 1.77 MiB ingress in 75 s, about 0.20 Mbit/s; Direct 4-MiB median 87.4 Mbit/s | runtime peak 22.45 MiB; 390-s recovery p50/p95/range/last 20.58/20.91/20.19--20.97/20.19 MiB; zero samples above 24/28 MiB. One flow earned 128/256 KiB and queued 128/194,688 bytes; all four grants occurred before fast.com, which added none. Session timeout resends reached 620. | Reject as the production mobile default. Full adaptive depth is memory-safe in this arm but does not improve bulk or fast.com and increases recovery work. Keep fixed 64/128 KiB; retain the generic opt-in and telemetry only for a controlled-provider A/B. |
 | 2026-08-25 `h1-logical-lanes8-20260825` / adjacent lane-zero control | Explicit H1/provider off with fixed 64/128-KiB receive policy; eight bounded five-tuple lanes plus lossless Transfer-ACK overflow folding, followed by a rebuilt lane-zero arm in the same device session | lane 8 median load/TTFB 348.8/126.1 ms; lane 0 median 1,157.8/367.9 ms | not repeated; the earlier complete fixed-depth cohort remains the payload control | lane 8 displayed 10 then 3.6 Mbit/s; its exact repeat moved 3.06 MiB H1 ingress in 19.3 s. Lane 0 displayed 4.4 Mbit/s and moved 18.55 MiB in 34.7 s. Same-session Direct displayed 410 Mbit/s before the first arm and 1.1 Gbit/s after the second. | lane 8 runtime peak 20.60 MiB, 2.00/2.00-MiB receive use, zero >28-MiB samples, and 152 timeout resends in the exact repeat; lane 0 peak 19.43 MiB, 1.41/2.00-MiB receive use, zero >28-MiB samples, and 1,053 timeout resends. Both arms had zero Transfer-ACK handoff loss. | Keep eight lanes as a controlled explicit-H1 client/provider candidate, not as a public-provider speed claim. Client lanes materially improve request/inner-TCP-ACK isolation and page latency, but provider download data remained on lane zero. Enable the same negotiated lanes on a pinned provider sender and deploy provider grouping/direct ACK before the decisive end-to-end A/B. |
-| 2026-08-25 `h1-lossless-20260825` | Pinned controlled provider, explicit H1/eight logical lanes, fixed 64/128-KiB H1 receive policy, lossless carrier-route and Pack backpressure, unchanged exact 2-MiB shared budgets | seven-run Wikipedia load/document-TTFB/request-p95 medians 439.2/181.5/183.58 ms; 7/7 success. The fresh connection loaded in 1,019.3 ms; six reused loads were 404.6--517.0 ms. | not repeated; fast.com is the decisive bulk workload for this root cause | consecutive displays 38, 41, and 52 Mbit/s; host-adjacent Direct was 1.3 Gbit/s. The latter repeats moved about 70.2 and 73.2 MB of new provider return traffic. | active runtime peak 17.60 MiB; zero samples above 24/28 MiB; cumulative 262 / 687,039-byte carrier backpressures with zero carrier drops; 762/762 Pack waits succeeded with zero Pack drops; Pack and reorder queues drained to zero. A 345-s recovery measured runtime p50/p95/range/last 17.57/17.61/17.23--17.61/17.41 MiB, zero queued ownership, 0.50-MiB maximum retained pools, and no forced GC/trim. | **Accept the lossless H1 pipeline.** It restores the 40-Mbit/s class and fast reused-page loads by removing synthetic gaps, not by spending more depth or memory. H3/DNS behavior remains unchanged for its future iteration; iOS footprint remains a separate gate. |
+| 2026-08-25 `h1-lossless-20260825` | Pinned controlled provider, explicit H1/eight logical lanes, fixed 64/128-KiB H1 receive policy, lossless carrier-route and Pack backpressure, unchanged exact 2-MiB shared budgets | seven-run Wikipedia load/document-TTFB/request-p95 medians 439.2/181.5/183.58 ms; 7/7 success. The fresh connection loaded in 1,019.3 ms; six reused loads were 404.6--517.0 ms. | not repeated; fast.com is the decisive bulk workload for this root cause | consecutive displays 38, 41, and 52 Mbit/s; host-adjacent Direct was 1.3 Gbit/s. The latter repeats moved about 70.2 and 73.2 MB of new provider return traffic. | active runtime peak 17.60 MiB; zero samples above 24/28 MiB; cumulative 262 / 687,039-byte carrier backpressures with zero carrier drops; 762/762 Pack waits succeeded with zero Pack drops; Pack and reorder queues drained to zero. A 345-s recovery measured runtime p50/p95/range/last 17.57/17.61/17.23--17.61/17.41 MiB, zero queued ownership, 0.50-MiB maximum retained pools, and no forced GC/trim. | **Accept the lossless H1 pipeline.** It restores the 40-Mbit/s class and fast reused-page loads by removing synthetic gaps, not by spending more depth or memory. H3/DNS performance tuning remains a future iteration; its stream-versus-DATAGRAM correctness contract is now covered separately. iOS footprint remains a separate gate. |
+| 2026-08-25 `lane-remediation-20260825` / retained AAR / `lane-candidate-close-20260825` | Current–pre-change–current public explicit-H1 bracket on the attached Pixel; fresh app/client/Chrome each arm; exact H1 counters | not repeated | not repeated | opening current 8.7/6.9/7.3; retained AAR 84/95/1.2; closing current 160/130/140 Mbit/s. Exact ingress was 43.80/223.70/504.00 MB. | Go-runtime peaks 18.73/19.25/20.21 MiB. Closing current recorded 5,769 / 8,483,576-byte route backpressures, zero route drops, 1,804/1,804 Pack waits, zero Pack drops, and zero final Pack/reorder use. | **No H1 fast.com regression detected.** The closing current median was 140 Mbit/s versus the bracketed baseline's 84 Mbit/s and all three current-closing samples exceeded 40. Preserve the opening/current and baseline outliers: unpinned public-provider selection makes this a target/regression gate, not a percentage speedup claim. |
+| 2026-08-25 final rebased current / retained AAR / final rebased current | Post-pull explicit-H1 current–baseline–current bracket on the same Pixel, Wi-Fi route, Chrome version, and canonical harness; fresh app/client/Chrome each arm; the pull changed only generated IP-security/blocker data | not repeated | not repeated | current primary 0.58/27/52 Mbit/s (27 median), with preserved extension 17/8.1/13; retained AAR 28/15/10 (15 median); closing current 0.65/17/10 (10 median). Exact H1 deltas were 302.43 MB over six / 147.21 MB over three / 64.37 MB over three. | Runtime peaks were 19.66/17.70/19.89 MiB with zero >28-MiB samples. Every arm had zero carrier/Pack drops; current Pack waits completed 165/165 opening and 38/38 closing. Timeout resends were 14,057/330/6,926, proving that provider conditions changed sharply across arms. | **Neutral route-limited confirmation.** Baseline was also below 40 and current produced the only above-40 result; do not infer a percentage from this degraded public route. Together with the earlier 140-Mbit/s current closing arm and pinned 38/41/52 arm, it finds no systematic fast.com regression. The final APK was restored, all three clients released, and device credentials/artifacts removed. |
 
 ### ACK and grouping microbenchmarks
 
@@ -664,7 +759,7 @@ do not require those fixtures and are green.
 | --- | --- | --- |
 | H1 receive depth 32 -> 64 | Page median improved from 543.7 to 457.6 ms in the global isolation; carrier-attributed runs filled all 64 slots while staying below 24 MiB. | Keep fixed 64 for H1 only, with the 128-KiB byte cap. |
 | Iterative H1 receive 64/128 KiB -> 128/256 KiB | A flow reached the full earned limit and queued 128 Packs / 194,688 bytes at a 22.45-MiB runtime peak, but Cloudflare fell to a 1.18-Mbit/s median and fast.com moved about 0.20 Mbit/s. No depth grant occurred during fast.com and timeout resends reached 620. | Reject for the production mobile policy. Keep the generic opt-in for fixed-provider diagnosis; do not spend the client budget until a controlled provider A/B identifies this boundary. |
-| H1 Pack handoff wait 0 -> 10 ms | A 1-ms arm left a rare timeout and multi-second resource recovery. At 10 ms, 9/11 final-run waits succeeded; the two misses returned only 2,880 bytes and every payload completed. The wait does not enlarge either queue. | Keep for reliable H1 Pack handoff only; ACK handoff remains 1 ms and H3/unknown remains zero-wait. |
+| Reliable Pack handoff finite -> cancellation-bounded | A 1-ms arm left a rare timeout; at 10 ms, 9/11 waits succeeded. On the pinned provider, the finite boundary then dropped 24 messages and fast.com measured 3.5 Mbit/s. Waiting to capacity/cancellation produced 38/41/52 Mbit/s with 762/762 successful waits and no added slot or byte. | Keep for every exact reliable H1, H3/DNS stream, SCTP, and framed-server lane. ACK handoff remains 1 ms; H3 DATAGRAM, native P2P, and unknown custom lanes remain zero-wait. |
 | Transfer ACK handoff 16 -> 64 | Inbound ACK-handoff drops remained zero while Pack loss was high. | Do not spend memory here. |
 | Full Transfer-ACK handoff -> shared ACK window | Clean 50-ms H1 changed 134.551 -> 134.529 Mbit/s (-0.016%). A saturated compact channel now folds progress into its existing monotonic cumulative/selective window without growing the queue or waiting. | Keep as lossless overload handling. This coalesces Transfer protocol ACK state, not inner TCP ACK packets. |
 | First Transfer ACK | A fixed 10-ms delay is directly on sparse request/response turns. | Send the first after idle immediately; retain 10-ms sustained spacing. |
@@ -719,9 +814,9 @@ every slow result is a queue-size problem:
    wait, timeout resends, per-lane occupancy, exact payload, CPU, and allocated
    bytes. Pin explicit H1 for this experiment; production Auto remains unchanged
    because its Client settings can outlive an H1-to-H3 carrier transition.
-2. **Retained mobile profile.** Keep H1 receive 64 / 128 KiB and lossless H1
-   carrier/Pack backpressure to cancellation; keep every other Transfer/control
-   count at 16, ACK handoff at
+2. **Retained mobile profile.** Keep H1 receive 64 / 128 KiB and lossless exact
+   reliable-lane carrier/Pack backpressure to cancellation; keep every other
+   Transfer/control count at 16, ACK handoff at
    1 ms, the packet-root gate at 1 MiB base / 2 MiB exact H1 ACK maximum, and
    the exact provider-aware shared receive-allocation budget (1.68 MiB on and
    2 MiB off at the 24-MiB target). Leave adaptive H1 depth disabled in the

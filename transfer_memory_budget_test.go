@@ -1670,6 +1670,116 @@ func BenchmarkReceiveSequenceH1AdaptiveHandoffUncontended(b *testing.B) {
 	}
 }
 
+func TestPackHandoffTimeoutUsesExactReceiveLaneReliability(t *testing.T) {
+	settings := DefaultReceiveBufferSettingsWithBufferSize(1)
+	settings.H1PackHandoffTimeout = 200 * time.Millisecond
+	settings.ReliablePackHandoffTimeout = -1
+	for _, testCase := range []struct {
+		name        string
+		transport   TransportType
+		reliability CarrierReliability
+		want        time.Duration
+	}{
+		{name: "H1 stream", transport: TransportTypeH1, reliability: CarrierReliabilityReliable, want: -1},
+		{name: "H3 stream", transport: TransportTypeH3, reliability: CarrierReliabilityReliable, want: -1},
+		{name: "DNS QUIC stream", transport: TransportTypeH3Dns, reliability: CarrierReliabilityReliable, want: -1},
+		{name: "P2P SCTP", transport: TransportTypeP2p, reliability: CarrierReliabilityReliable, want: -1},
+		{name: "H3 DATAGRAM", transport: TransportTypeH3, reliability: CarrierReliabilityUnreliable, want: 0},
+		{name: "native P2P", transport: TransportTypeP2p, reliability: CarrierReliabilityUnreliable, want: 0},
+		{name: "legacy typed H1", transport: TransportTypeH1, reliability: CarrierReliabilityUnknown, want: 200 * time.Millisecond},
+		{name: "legacy typed H3", transport: TransportTypeH3, reliability: CarrierReliabilityUnknown, want: 0},
+	} {
+		if got := settings.packHandoffTimeout(
+			testCase.transport,
+			testCase.reliability,
+		); got != testCase.want {
+			t.Fatalf("%s handoff timeout=%v want=%v", testCase.name, got, testCase.want)
+		}
+	}
+}
+
+// Reproduces the root failure deterministically: a reliable H3 frame arrives
+// while the per-sequence handoff is full. The second frame must remain owned by
+// the reader and emerge after the first, never become an artificial gap.
+func TestReceiveSequenceReliableH3SaturationPreservesOrder(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultReceiveBufferSettingsWithBufferSize(1)
+	settings.ReliablePackHandoffTimeout = -1
+	client := &Client{}
+	sequence := newReceiveSequence(
+		ctx,
+		client,
+		SourceId(NewId()),
+		NewId(),
+		TransferKey{},
+		settings,
+	)
+	defer sequence.Close()
+	newPack := func(marker byte) *ReceivePack {
+		message := MessagePoolGet(40)
+		message[0] = marker
+		return &ReceivePack{
+			MessageByteCount:   ByteCount(len(message)),
+			TransferFrameBytes: message,
+			TransportType:      TransportTypeH3,
+		}
+	}
+	first := newPack(1)
+	second := newPack(2)
+	if accepted, err := sequence.Pack(first, 0); !accepted || err != nil {
+		t.Fatalf("fill reliable H3 handoff: accepted=%t err=%v", accepted, err)
+	}
+	type packResult struct {
+		accepted bool
+		err      error
+	}
+	result := make(chan packResult, 1)
+	go func() {
+		accepted, err := sequence.Pack(
+			second,
+			settings.packHandoffTimeout(
+				TransportTypeH3,
+				CarrierReliabilityReliable,
+			),
+		)
+		result <- packResult{accepted: accepted, err: err}
+	}()
+	deadline := time.Now().Add(time.Second)
+	for client.ReceiveStats().PackHandoffWaitCount == 0 && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	select {
+	case premature := <-result:
+		t.Fatalf("reliable H3 frame was not backpressured: %+v", premature)
+	default:
+	}
+	dequeued := <-sequence.packs
+	if dequeued.TransferFrameBytes[0] != 1 {
+		t.Fatalf("first marker=%d want=1", dequeued.TransferFrameBytes[0])
+	}
+	sequence.releasePackQueue(dequeued)
+	dequeued.messagePoolReturn()
+	select {
+	case got := <-result:
+		if !got.accepted || got.err != nil {
+			t.Fatalf("second reliable H3 frame: accepted=%t err=%v", got.accepted, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second reliable H3 frame did not resume")
+	}
+	dequeued = <-sequence.packs
+	if dequeued.TransferFrameBytes[0] != 2 {
+		t.Fatalf("second marker=%d want=2", dequeued.TransferFrameBytes[0])
+	}
+	sequence.releasePackQueue(dequeued)
+	dequeued.messagePoolReturn()
+	if stats := client.ReceiveStats(); stats.PackHandoffDropCount != 0 ||
+		stats.PackHandoffWaitSuccess != 1 {
+		t.Fatalf("reliable H3 handoff stats=%+v", stats)
+	}
+}
+
 func TestReceiveSequenceH1HandoffWaitRescuesFullQueue(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

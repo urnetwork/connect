@@ -769,10 +769,10 @@ func TestP2pReceiveTransportDoneFollowsFinalPoolDrain(t *testing.T) {
 	blockedReadCapture.requireOwnerLive(t, "P2P blocked-read buffer")
 	capture := newLifecyclePoolCapture(MessagePoolGet(512))
 	defer capture.cleanup()
-	// Exercise the production carrier-reader handoff. The public route is now
-	// the consumer side of an unbuffered ownership transfer; injecting into it
-	// would bypass the bounded pending queue whose final drain this test pins.
-	if !transport.offerReceive(capture.owner, false, 0, false, false) {
+	// Exercise the native-datagram carrier handoff. Reliable SCTP now waits
+	// directly on its exact route; only the fast lane owns the bounded pending
+	// queue whose final drain this test pins.
+	if !transport.offerReceive(capture.owner, true, 0, false, false) {
 		t.Fatal("receive final-drain frame was not admitted")
 	}
 	if retained := transport.pendingReceiveByteCount.Load(); retained != 512 {

@@ -272,6 +272,28 @@ func TestPlatformTransportH3DatagramRoundTrip(t *testing.T) {
 	}
 
 	routeManager := NewRouteManager(testCtx, "h3-datagram-round-trip")
+	// Production always has the Client receive pump attached. Hybrid reliable
+	// stream admission is intentionally unbuffered, so this carrier integration
+	// must model that consumer instead of relying on the old route queue to hold
+	// a stream frame indefinitely.
+	reader := routeManager.OpenMultiRouteReader(DestinationId(NewId()))
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		for {
+			message, readErr := reader.Read(testCtx, time.Second)
+			if message != nil {
+				MessagePoolReturn(message)
+			}
+			if readErr != nil {
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		routeManager.CloseMultiRouteReader(reader)
+		<-readerDone
+	})
 	transport := NewPlatformTransportWithTargetMode(
 		testCtx,
 		NewClientStrategyWithDefaults(testCtx),

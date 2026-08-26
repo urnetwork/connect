@@ -64,12 +64,24 @@ func h1AckPriorityRoute(route Route) (Route, bool) {
 	return priorityRoute, ok
 }
 
-// Describes delivery semantics that affect Transfer's sender. Reliable
-// carriers leave this zero-valued. An unreliable carrier delivers complete
-// routed frames without retransmitting them, so Transfer must also bound its
-// own acknowledgement flight instead of filling the carrier's startup window.
+// TransferCarrierProperties describes exact delivery semantics at route
+// boundaries. Send-side unreliable fields bound acknowledgement flight;
+// ReceiveReliability tells Pack admission whether the physical lane can safely
+// propagate fixed-queue backpressure.
 type TransferCarrierProperties struct {
 	Unreliable bool
+	// ReceiveReliability describes the exact physical lane feeding a receive
+	// route. Hybrid carriers publish one route per lane so a complete message
+	// recovered by a reliable stream can apply bounded backpressure while a
+	// DATAGRAM reader remains nonblocking. Unknown preserves compatibility for
+	// custom transports that predate lane-aware receive admission.
+	ReceiveReliability CarrierReliability
+	// UnreliableMaxMessageByteCount refines a hybrid send carrier whose lane is
+	// selected by a contiguous message-size threshold. A positive limit means
+	// frames at or below the limit are unreliable and larger frames are reliable.
+	// It is exported so server exchange headers can preserve the same decision on
+	// a remote resident without serializing a callback.
+	UnreliableMaxMessageByteCount int
 	// UnreliableFlowIsolation enables bounded per-IP-flow scheduling before
 	// Transfer assigns sequence numbers. It preserves FIFO order within each
 	// flow while preventing a saturated bulk flow from hiding a newly active
@@ -107,8 +119,22 @@ func (self TransferCarrierProperties) messageUnreliable(
 	if self.unreliableForMessageByteCount != nil {
 		return self.unreliableForMessageByteCount(len(transferFrameBytes))
 	}
+	if 0 < self.UnreliableMaxMessageByteCount {
+		return len(transferFrameBytes) <= self.UnreliableMaxMessageByteCount
+	}
 	return true
 }
+
+// CarrierReliability is the delivery contract of the exact receive lane that
+// produced one complete Transfer frame. It is independent of TransportType: an
+// H3 or P2P connection can expose both reliable and unreliable lanes.
+type CarrierReliability uint8
+
+const (
+	CarrierReliabilityUnknown CarrierReliability = iota
+	CarrierReliabilityReliable
+	CarrierReliabilityUnreliable
+)
 
 // TransportType is the carrier that actually accepted or delivered a routed
 // Transfer frame. It is intentionally distinct from TransportMode: p2p and an
@@ -201,6 +227,48 @@ func transportTypeOf(transport Transport) TransportType {
 	return TransportTypeUnknown
 }
 
+// receiveLaneTransport gives one physical receive lane an independent route
+// identity while preserving the base transport's matching and priority rules.
+// Hybrid H3 and P2P connections use siblings so immutable route properties can
+// carry exact lane reliability without changing Route's allocation-free byte
+// channel contract.
+type receiveLaneTransport struct {
+	transportId Id
+	base        Transport
+}
+
+func newReceiveLaneTransport(base Transport) *receiveLaneTransport {
+	return &receiveLaneTransport{transportId: NewId(), base: base}
+}
+
+func (self *receiveLaneTransport) TransportId() Id { return self.transportId }
+func (self *receiveLaneTransport) TransportType() TransportType {
+	return transportTypeOf(self.base)
+}
+func (self *receiveLaneTransport) Priority() int   { return self.base.Priority() }
+func (self *receiveLaneTransport) Weight() float32 { return self.base.Weight() }
+func (self *receiveLaneTransport) CanEvalRouteWeight(
+	stats *RouteStats,
+	remainingStats map[Transport]*RouteStats,
+) bool {
+	return self.base.CanEvalRouteWeight(stats, remainingStats)
+}
+func (self *receiveLaneTransport) RouteWeight(
+	stats *RouteStats,
+	remainingStats map[Transport]*RouteStats,
+) float32 {
+	return self.base.RouteWeight(stats, remainingStats)
+}
+func (self *receiveLaneTransport) MatchesSend(destination TransferPath) bool {
+	return false
+}
+func (self *receiveLaneTransport) MatchesReceive(destination TransferPath) bool {
+	return self.base.MatchesReceive(destination)
+}
+func (self *receiveLaneTransport) Downgrade(source TransferPath) {
+	self.base.Downgrade(source)
+}
+
 const TransportMaxPriority = 0
 const TransportMinPriority = 100
 const TransportMaxWeight = float32(1)
@@ -256,6 +324,21 @@ type TransportMultiRouteWriter interface {
 
 type TransportMultiRouteReader interface {
 	ReadWithTransport(ctx context.Context, timeout time.Duration) ([]byte, TransportType, error)
+}
+
+// transferReceiveDisposition remains internal so existing custom reader
+// interfaces stay source-compatible while the production selector carries the
+// exact route lane into Client admission.
+type transferReceiveDisposition struct {
+	transportType TransportType
+	reliability   CarrierReliability
+}
+
+type transferCarrierMultiRouteReader interface {
+	readWithCarrier(
+		ctx context.Context,
+		timeout time.Duration,
+	) ([]byte, transferReceiveDisposition, error)
 }
 
 // transferWriteDisposition is returned only by the production selector. The
@@ -1683,6 +1766,13 @@ func (self *routeSnapshot) transportType(route Route) TransportType {
 	return TransportTypeUnknown
 }
 
+func (self *routeSnapshot) receiveDisposition(route Route) transferReceiveDisposition {
+	return transferReceiveDisposition{
+		transportType: self.transportType(route),
+		reliability:   self.routeCarrierProperties[route].ReceiveReliability,
+	}
+}
+
 func (self *routeSnapshot) writeDisposition(
 	route Route,
 	transferFrameBytes []byte,
@@ -2788,13 +2878,23 @@ func (self *MultiRouteSelector) writeDetailedWithCarrierPreference(
 
 // MultiRouteReader
 func (self *MultiRouteSelector) Read(ctx context.Context, timeout time.Duration) ([]byte, error) {
-	transferFrameBytes, _, err := self.ReadWithTransport(ctx, timeout)
+	transferFrameBytes, _, err := self.readWithCarrier(ctx, timeout)
 	return transferFrameBytes, err
 }
 
 // ReadWithTransport reports the immutable transport tag published with the
 // exact route whose channel delivered the frame.
 func (self *MultiRouteSelector) ReadWithTransport(ctx context.Context, timeout time.Duration) ([]byte, TransportType, error) {
+	transferFrameBytes, disposition, err := self.readWithCarrier(ctx, timeout)
+	return transferFrameBytes, disposition.transportType, err
+}
+
+// readWithCarrier reports both the stable transport family and the exact
+// receive-lane reliability published with the route that delivered the frame.
+func (self *MultiRouteSelector) readWithCarrier(
+	ctx context.Context,
+	timeout time.Duration,
+) ([]byte, transferReceiveDisposition, error) {
 	self.readMutex.Lock()
 	defer self.readMutex.Unlock()
 	defer func() {
@@ -2827,7 +2927,7 @@ func (self *MultiRouteSelector) ReadWithTransport(ctx context.Context, timeout t
 						self.log.Infof("[mrr]nb %s/%s<- s(%s)\n", self.clientTag, self.destination.DestinationId, self.destination.StreamId)
 					}
 					self.updateReceiveStats(route, 1, ByteCount(len(transferFrameBytes)))
-					return transferFrameBytes, snapshot.transportType(route), nil
+					return transferFrameBytes, snapshot.receiveDisposition(route), nil
 				} else {
 					// mark the route as closed, try again
 					self.setActive(route, false)
@@ -2857,22 +2957,22 @@ func (self *MultiRouteSelector) ReadWithTransport(ctx context.Context, timeout t
 			if 0 <= timeout {
 				remainingTimeout := enterTime.Add(timeout).Sub(time.Now())
 				if remainingTimeout <= 0 {
-					return nil, TransportTypeUnknown, nil
+					return nil, transferReceiveDisposition{}, nil
 				}
 				timeoutChan = resetOrCreateTimer(&self.readTimer, remainingTimeout)
 			}
 			select {
 			case <-ctx.Done():
-				return nil, TransportTypeUnknown, errors.New("Context done")
+				return nil, transferReceiveDisposition{}, errors.New("Context done")
 			case <-self.ctx.Done():
-				return nil, TransportTypeUnknown, errors.New("Done")
+				return nil, transferReceiveDisposition{}, errors.New("Done")
 			case <-notify:
 				// new routes, try again
 				continue
 			case transferFrameBytes, ok := <-route0:
 				if ok {
 					self.updateReceiveStats(route0, 1, ByteCount(len(transferFrameBytes)))
-					return transferFrameBytes, snapshot.transportType(route0), nil
+					return transferFrameBytes, snapshot.receiveDisposition(route0), nil
 				}
 				// mark the route as closed, try again
 				self.setActive(route0, false)
@@ -2880,12 +2980,12 @@ func (self *MultiRouteSelector) ReadWithTransport(ctx context.Context, timeout t
 			case transferFrameBytes, ok := <-route1:
 				if ok {
 					self.updateReceiveStats(route1, 1, ByteCount(len(transferFrameBytes)))
-					return transferFrameBytes, snapshot.transportType(route1), nil
+					return transferFrameBytes, snapshot.receiveDisposition(route1), nil
 				}
 				self.setActive(route1, false)
 				continue
 			case <-timeoutChan:
-				return nil, TransportTypeUnknown, nil
+				return nil, transferReceiveDisposition{}, nil
 			}
 		}
 
@@ -2955,14 +3055,14 @@ func (self *MultiRouteSelector) ReadWithTransport(ctx context.Context, timeout t
 
 		switch chosenIndex {
 		case contextDoneIndex:
-			return nil, TransportTypeUnknown, errors.New("Context done")
+			return nil, transferReceiveDisposition{}, errors.New("Context done")
 		case doneIndex:
-			return nil, TransportTypeUnknown, errors.New("Done")
+			return nil, transferReceiveDisposition{}, errors.New("Done")
 		case transportUpdateIndex:
 			// new routes, try again
 		case timeoutIndex:
 			// FIXME return nil, nil? don't use errors for timeouts
-			return nil, TransportTypeUnknown, nil
+			return nil, transferReceiveDisposition{}, nil
 		default:
 			// a route
 			routeIndex := chosenIndex - routeStartIndex
@@ -2970,7 +3070,7 @@ func (self *MultiRouteSelector) ReadWithTransport(ctx context.Context, timeout t
 			if ok {
 				transferFrameBytes := value.Bytes()
 				self.updateReceiveStats(route, 1, ByteCount(len(transferFrameBytes)))
-				return transferFrameBytes, snapshot.transportType(route), nil
+				return transferFrameBytes, snapshot.receiveDisposition(route), nil
 			} else {
 				// mark the route as closed, try again
 				self.setActive(route, false)

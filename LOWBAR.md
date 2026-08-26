@@ -1,7 +1,7 @@
 # Low-bar network delivery plan
 
 Status: living implementation plan
-Last updated: 2026-08-24
+Last updated: 2026-08-25
 
 ## Outcome
 
@@ -65,11 +65,17 @@ fit a candidate.
    multiple lossy DATAGRAMs. Transfer sequencing and ACKs do not change with
    the carrier lane. Explicit two-fragment controls remain available for
    compatibility tests and measurement, not production selection.
-5. **Receive never waits for admission.** The invariant in
-   [CODESTYLE.md](./CODESTYLE.md#receive-callbacks-must-not-block) applies to the
-   shared Client receive pump, every callback handoff, and each carrier/socket
-   reader handing data to a bounded route queue. A full destination is dropped
-   and counted immediately. Sender-side backpressure may block.
+5. **Receive admission follows the exact physical lane.** Shared callbacks and
+   true datagram readers remain bounded, zero-wait, and counted on refusal. An
+   H1, QUIC-stream, SCTP, or framed internal-TCP reader retains only its one
+   already-read complete message while waiting for fixed queue capacity or
+   lifecycle cancellation; dropping there manufactures loss above a reliable
+   carrier. The final Client-to-Pack handoff uses the same exact lane metadata:
+   reliable lanes wait within unchanged count/byte budgets, while H3 DATAGRAM,
+   outer DNS datagrams, and native P2P datagrams never wait. A shared server
+   callback that cannot propagate reliable backpressure retires its generation
+   instead of silently skipping a frame. See
+   [CODESTYLE.md](./CODESTYLE.md#receive-callbacks-and-reliable-carrier-backpressure).
 6. **Preserve security and routing policy.** Transport changes do not weaken
    encryption, CFAA policy, SMTP policy, kill-switch behavior, provider
    eligibility, or route authentication.
@@ -193,19 +199,18 @@ Current code facts:
   configured memory ceiling. Active data lanes pin their negotiating lane-0
   lifetime; losing that base sequence clears capability and cancels its data
   lanes rather than silently continuing with stale negotiation.
-- Every P2P data-plane mode publishes unreliable delivery semantics to
-  Transfer. Fast RTP/SRTP can lose below Transfer, while legacy SCTP still ends
-  at the same bounded, nonblocking application handoff; a live carrier in
-  either mode is not proof of end-to-end delivery. Transfer therefore retains
-  ACK recovery and limits one destination to 255 unacknowledged messages and a
-  240-KiB data flight. The carrier readers enqueue without waiting into a
-  256-message / 256-KiB queue; the remaining 16 KiB is carrier-specific reserve
-  for cumulative ACK, compact-recovery, contract, and probe traffic.
-  That count includes the item held by the one owned worker that may wait on
-  RouteManager. The shared Client ReceiveSequence handoff independently admits
-  256 messages with a hard 256-KiB retained-Transfer-byte ceiling. Matching the
-  count headroom removes avoidable small-packet drops without increasing the
-  prior byte budget or violating `receiveBuffer.Pack(..., 0)`.
+- P2P publishes its physical lanes separately. Legacy SCTP is reliable and
+  propagates fixed-capacity backpressure from its dedicated reader; native
+  RTP/SRTP is unreliable and enters the existing zero-wait 256-message /
+  256-KiB queue. Auto send policy activates the bounded unreliable Transfer
+  flight only while the native fast path can be selected; LegacyOnly does not
+  pay that flight limit. Transfer ACK recovery remains end-to-end on both
+  lanes because route replacement can invalidate carrier-local delivery. The
+  native data flight remains 240 KiB, leaving 16 KiB inside the unchanged queue
+  ceiling for cumulative ACK, compact-recovery, contract, and probe traffic.
+  Exact receive-lane metadata follows the selected route into the shared Client
+  Pack admission, so SCTP waits within the existing 256-message / 256-KiB
+  retained-Transfer ceiling and native datagrams remain zero-wait.
 - Transfer queues are sized in bytes, but at a 64 kbit/s uplink even 1 MiB is
   more than two minutes of serialization. A memory-safe queue can still be a
   catastrophic latency queue.
@@ -1475,7 +1480,9 @@ Freeze exact gates after Phase 1 measures variance. Until then, the target is:
 
 - zero packet corruption, policy bypass, encryption downgrade, sequence/lane
   cross-talk, unbounded allocation, or IPv6 advertisement;
-- no shared receive handoff waits for queue space or worker exit;
+- no shared callback or unreliable physical lane waits for queue space or
+  worker exit; every reliable-lane wait owns at most its one already-read frame,
+  stays inside unchanged fixed queue/byte budgets, and ends on cancellation;
 - sparse interactive p95 at least 20% below current H1/H3 on mobile-poor and no
   more than 10% above direct when direct completes;
 - loaded interactive p95 at least 25% below the better current tunnel mode;
@@ -1495,17 +1502,22 @@ the tunnel's completion as an infinite percentage win.
 
 ### Phase 0 — correctness and observability
 
-- [x] Enforce zero-timeout Pack admission in the shared Client receive pump.
+- [x] Carry exact receive-lane reliability through RouteManager and make the
+  shared Client Pack handoff wait only for H1, H3/DNS QUIC stream, SCTP, and
+  framed reliable routes. H3 DATAGRAM and native P2P remain zero-timeout.
 - [x] Enforce zero-timeout inbound ACK admission.
 - [x] Drop rather than wait on receive-generation replacement when admission is
   nonblocking.
 - [x] Count Pack/byte and ACK handoff drops and add deterministic regressions.
 - [x] Expose Pack/byte and ACK handoff drops through the lock-free
   `Client.ReceiveStats()` snapshot.
-- [x] Make H1, H3, H3Dns, H3DnsPump, legacy P2P, and fast P2P carrier-reader
-  route admission zero-wait; count mode-specific refused messages and bytes.
-- [x] Make connect-server socket/exchange receive handoffs zero-wait and expose
-  bounded-label refusal counters.
+- [x] Make H1, H3/H3Dns/H3DnsPump QUIC stream, and legacy SCTP readers preserve
+  fixed-capacity backpressure to cancellation. Publish hybrid H3 and production
+  P2P receive lanes as distinct immutable routes; keep H3/DNS DATAGRAM and
+  native P2P carrier-reader admission zero-wait with exact refusal counters.
+- [x] Make reliable connect-server socket/exchange readers wait for their fixed
+  handoff or cancellation. When a shared resident callback cannot wait, retire
+  that generation on refusal rather than continuing past an invisible frame.
 - [x] Move resident control throttling and forward construction/storage checks
   out of Client callbacks. Control remains ordered; forwards use bounded
   destination-stable worker shards. Reliable-control overflow retires the
@@ -1523,11 +1535,11 @@ the tunnel's completion as an infinite percentage win.
 - [x] Give every retained IPv4 fragment group a fresh nonzero wire identity
   before asynchronous routing. This preserves two interleaved gVisor ID-zero
   datagrams across parallel H3 lanes without relaxing the fragment budgets.
-- [x] Match unreliable P2P flight and zero-wait receive handoffs by message
-  count while retaining independent 256-KiB byte ceilings. All P2P modes remain
-  Transfer-ACKed and are bounded as unreliable through their final handoff; a
-  240-KiB carrier-specific flight leaves 16 KiB inside the unchanged queue
-  ceiling for untracked control.
+- [x] Match native-P2P unreliable flight and zero-wait receive handoffs by
+  message count while retaining independent 256-KiB byte ceilings. Legacy SCTP
+  now publishes reliable receive semantics and waits only on its fixed route;
+  a 240-KiB native carrier flight leaves 16 KiB inside the unchanged queue
+  ceiling for untracked control. Both modes remain Transfer-ACKed.
 - [x] Complete the adjacent receive-callback audit. The shared Client pump,
   exact-delivery and encryption fixtures, control-sync collector, mux and
   multi-client provider echoes, contention benchmarks, WebRTC signal/data,
@@ -2217,6 +2229,10 @@ timeouts, following `CODESTYLE.md`.
 | 2026-08-25 | Symmetric-H1 candidate final gates | ACK overflow and logical-lane selections 20 times normally / 10 and three times under race; complete Connect/SDK short suites; all affected vet tiers; clean-host affected server benchmarks; Android SDK AAR, Github Debug app/test APKs and unit tests; physical collector and fast.com harness syntax/privacy checks | Pass for every self-contained gate. Exact-source Connect/SDK complete suites finished in 199.341/97.135 s. An earlier Connect rerun under an accidentally retained benchmark probe missed 2/240 callbacks in the unrelated six-minute `TestTransferBudgetLiveness`; after stopping that 15.5-hour campaign process, the exact test passed 20/20 normally and 5/5 under race, followed by the complete green rerun. Five clean-host repetitions measured production server H1 TLS at 891.7 ns full-payload and 370.3 ns ACK-sized with two allocations/op; PERFVAR receive credits were 673.6 ns and proxy batch-64 was 5,406 ns. Android built successfully in 32 s; all ten collector tests and the fast.com script syntax gate passed. The broad server correctness attempt reproduced the documented external fixture block (`WARP_ENV` unset and vault `pg.yml` absent, including `TestProxyWgHandoffPollExpiry` after five retries); it is not reported as green. The production change is deliberately limited to mobile <=24-MiB explicit H1 on both client and provider; Auto/H3 are unchanged pending the pinned provider A/B. |
 | 2026-08-25 | Deterministic reliable-H1 synthetic-loss isolation | Pinned controlled provider over explicit H1/eight lanes; fixed 64/128-KiB receive depth and unchanged exact 2-MiB Pack/reorder budgets; schema-11 carrier-drop/backpressure and Pack/recovery counters; three canonical fast.com runs, seven Wikipedia pages, and a 345-second quiet connected window | The fixed-depth control displayed 6.1 Mbit/s while the 32-message platform route discarded 530 complete messages / 1,186,363 bytes, the receive-reorder budget pinned at 1.993/2.000 MiB, and provider recovery produced 1,357 timeout plus 348 selective writes. Making only the carrier route lossless moved the failure to the finite Pack boundary: carrier drops became zero, Pack drops rose to 24, reorder pinned at 1.994 MiB, and fast.com displayed 3.5 Mbit/s. Making both reliable H1 handoffs wait for capacity or cancellation—without adding a slot or byte—produced 38, 41, and 52 Mbit/s. Across the accepted session, carrier/Pack drop deltas were zero, 762/762 Pack waits succeeded, final Pack/reorder use was zero, and selective provider recovery rose only during the first run. Wikipedia load/document-TTFB/request-p95 medians were 439.2/181.5/183.58 ms with 7/7 success. Runtime peaked at 17.60 MiB; quiet p50/p95/range/last were 17.57/17.61/17.23--17.61/17.41 MiB with no >24/28-MiB sample, zero queued ownership, 0.50-MiB maximum retained pools, and no forced GC/trim. Accept for mobile H1; H3/DNS and physical iOS footprint remain separate gates. |
 | 2026-08-25 | Lossless-H1 root-cause and regression gates | Filled one-slot carrier and Pack queues; exact pooled-slice delivery/return, cancellation, H3-DNS nonblocking policy, and production-source mode audit; 50 normal and three race repetitions; complete Connect/SDK suites; Android AAR/app/test/unit build; shared server/connect, PERFVAR, and proxy benchmarks | All deterministic repetitions pass, including cancellation returning Pack ownership to its caller and the audit permitting exactly one cancellable H1 receive send while forbidding direct blocking H3/DNS/P2P reader handoffs. Complete Connect/SDK suites passed in 442.156/459.385 s; affected race selections, vet, and the Android 90-task build passed. All 190/10/20 server benchmark samples passed. Production full-payload/ACK-sized H1 TLS medians were 896.2/373.0 ns with unchanged 17/10 B/op and two allocations (about +0.5%/+0.7% versus the adjacent cohort); PERFVAR receive-credit improved 673.6 -> 636.8 ns and proxy batch-64 improved 5,406 -> 5,348 ns. The DB-backed H1 PERFVAR track was attempted with its documented environment and remains externally blocked by the down local Redis fixture; it is not reported green. The 29.7-minute instrumentation session finished normally, all four temporary Android clients were released, provider shutdown removed its retained client, and private device credentials/pins plus the temporary provider harness were removed. |
+| 2026-08-25 | Complete exact-lane receive remediation | RouteManager-to-Pack receive reliability; H1, H3/H3Dns/H3DnsPump stream, SCTP, H3 DATAGRAM, native P2P, resident/exchange TCP, resident shared-callback overflow, and server H3 hybrid cutoff; filled one-slot queues, explicit cancellation barriers, pooled-owner witnesses, artificial sequence markers, gob round trips, source inventories, and hybrid queue-slot accounting | Supersedes the earlier H1-only policy above. Hybrid H3 and production P2P publish distinct immutable receive routes. Reliable stream/SCTP/framed-TCP lanes retain only their already-read frame to fixed capacity or cancellation; H3 DATAGRAM and native P2P remain bounded zero-wait. The final Pack handoff uses exact lane reliability rather than transport family. Internal server readers backpressure; a shared callback that cannot wait retires the generation instead of skipping a reliable frame. Server H3 serializes the exact contiguous DATAGRAM byte cutoff through the resident exchange. Splitting H3 lanes keeps the same total payload slots. The affected topology test now requires one SCTP and one native P2P receive route in each intermediary direction. |
+| 2026-08-25 | Exact-lane fast.com regression bracket on the attached Pixel | Current `lane-remediation-20260825`, retained pre-change SDK AAR, then closing current `lane-candidate-close-20260825`; fresh authenticated app and Chrome per arm; explicit H1/provider off; stable DevTools; three canonical runs per arm; SDK carrier/memory counters | Opening current displayed 8.7/6.9/7.3 Mbit/s (7.3 median), the retained AAR 84/95/1.2 (84 median), and closing current 160/130/140 (140 median). Exact H1 ingress deltas were 43.80/223.70/504.00 MB, ruling out Direct leakage. Go-runtime peaks were 18.73/19.25/20.21 MiB. Closing current recorded 5,769 backpressures / 8,483,576 bytes, zero route drops, 1,804/1,804 successful Pack waits, zero Pack drops, and zero final Pack/reorder use. All three closing samples exceeded the 40-Mbit/s target and the median exceeded the bracketed baseline, so no systematic H1 fast.com regression is present. Preserve the slow opening arm and baseline outlier: public-provider selection was not pinned, so this is a target/regression gate, not a 66.7% speedup claim. All three temporary clients were released and private credentials/device artifacts removed. |
+| 2026-08-25 | Post-pull fast.com route-limited bracket | Final rebased current, retained pre-change AAR, final rebased current; same attached Pixel/Wi-Fi/Chrome/canonical harness; fresh authenticated app and Chrome per arm; explicit H1/provider off; exact counters and memory | Current primary displayed 0.58/27/52 Mbit/s (27 median), followed by preserved extension 17/8.1/13; retained AAR displayed 28/15/10 (15 median); closing current displayed 0.65/17/10 (10 median). Exact H1 deltas were 302.43 MB over six / 147.21 MB over three / 64.37 MB over three. Runtime peaks were 19.66/17.70/19.89 MiB; carrier and Pack drops were zero in every arm, and current completed 165/165 opening plus 38/38 closing Pack waits. Timeout resends were 14,057/330/6,926, exposing sharply changing provider conditions. Baseline was also below 40 and current produced the only above-40 sample, so this degraded public route is neutral regression evidence, not a percentage comparison or replacement for the earlier 140-Mbit/s closing target gate. The final APK was restored, all clients released, and private artifacts removed. |
+| 2026-08-25 | Exact-lane final source, memory, and server-performance gates | Complete Connect/SDK short suites; focused Connect/server/SDK normal and race repetitions; intermediary P2P topology 20 times plus three race runs; vet; Android final AAR, Github Debug app/test APKs and unit tests; collector/parser and fast harness checks; five-repeat 300-ms benchmem sweeps | Connect/SDK complete suites passed in 199.474/98.001 s; every focused normal/race gate and all affected vet tiers passed. The Android 90-task build passed in 1m12s and all ten privacy/eligibility collector tests passed. Before the final generated-data pull, all 210 server/connect, 10 PERFVAR, and 20 proxy samples passed. The rebased source then passed all 30 exact affected H1/admission samples: production full-payload/ACK-sized H1 TLS medians were 884.2/366.7 ns with unchanged 17/10 B/op and two allocations, -1.34%/-1.69% versus the adjacent cohort. Pre-rebase PERFVAR receive-credit was 673.4 ns (+5.75%) and unchanged proxy batch-64 5,444 ns (+1.80%); these unaffected cross-package shifts are host noise. Post-rebase reliable/unreliable queue fast paths measured 31.17/32.67 ns and full ResidentTransport wrappers 40.47/38.06 ns, all zero B/op and zero allocs/op. No server or device-throughput regression is detected. |
 
 ## References
 

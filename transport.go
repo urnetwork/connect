@@ -846,17 +846,30 @@ func (self *PlatformTransport) DatagramStats() H3DatagramStatsSnapshot {
 	return self.h3DatagramStats.Snapshot()
 }
 
-// offerReceive transfers one complete carrier message to the shared Client
-// route. H1 is already an ordered, reliable byte stream: dropping after the
-// WebSocket read manufactures a Transfer hole, pins every later Pack in the
-// reorder queue, and makes retransmits compete with new data on the same TCP
-// stream. When its bounded route is full, retain this one already-budgeted
-// message and let TCP backpressure the peer until the Client pump makes room.
-// Datagram/H3 modes keep the nonblocking recovery contract for now. False
-// means the connection generation ended and its reader should exit.
+// Splitting hybrid receive-lane metadata must not duplicate the payload queue.
+// DATAGRAM retains the historical bounded queue while the reliable stream uses
+// an unbuffered route and may retain only its one already-read frame.
+func platformH3ReceiveRouteBufferSizes(
+	transportBufferSize int,
+	useH3Datagrams bool,
+) (reliable int, unreliable int) {
+	if useH3Datagrams {
+		return 0, transportBufferSize
+	}
+	return transportBufferSize, 0
+}
+
+// offerReceive transfers one complete carrier message to a lane-specific
+// Client route. Dropping after a reliable WebSocket, QUIC-stream, or other
+// stream read manufactures a Transfer hole and defeats the carrier's own
+// backpressure. A reliable reader therefore retains exactly its already-read
+// message until route capacity or cancellation. Unreliable DATAGRAM lanes keep
+// zero-wait admission and Transfer recovery. False means the connection
+// generation ended and its reader should exit.
 func (self *PlatformTransport) offerReceive(
 	done <-chan struct{},
 	mode TransportMode,
+	reliability CarrierReliability,
 	receive chan<- []byte,
 	message []byte,
 ) (open bool, delivered bool) {
@@ -864,7 +877,7 @@ func (self *PlatformTransport) offerReceive(
 	case pooledReceiveOfferDelivered:
 		return true, true
 	case pooledReceiveOfferFull:
-		if mode == TransportModeH1 {
+		if reliability == CarrierReliabilityReliable {
 			self.receiveStats.recordQueueBackpressure(mode, len(message))
 			select {
 			case <-done:
@@ -1813,7 +1826,13 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			if self.settings.SendRouteObserver != nil {
 				self.settings.SendRouteObserver(sendTransport, exportedSend, true)
 			}
-			self.routeManager.UpdateTransport(receiveTransport, []Route{receive})
+			self.routeManager.UpdateTransportWithProperties(
+				receiveTransport,
+				[]Route{receive},
+				TransferCarrierProperties{
+					ReceiveReliability: CarrierReliabilityReliable,
+				},
+			)
 			self.setRegistered(true)
 
 			defer func() {
@@ -2186,6 +2205,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						open, delivered := self.offerReceive(
 							handleCtx.Done(),
 							TransportModeH1,
+							CarrierReliabilityReliable,
 							receive,
 							message,
 						)
@@ -2736,7 +2756,20 @@ func (self *PlatformTransport) runH3(
 			)
 
 			send := make(chan []byte, self.settings.TransportBufferSize)
-			receive := make(chan []byte, self.settings.TransportBufferSize)
+			// Stream-only H3 retains its historical bounded burst queue. Hybrid H3
+			// gives the existing bounded queue to DATAGRAM while the reliable stream
+			// route is unbuffered: its reader may retain exactly one already-read
+			// frame, so splitting lane metadata cannot double payload retention.
+			reliableReceiveBufferSize, unreliableReceiveBufferSize :=
+				platformH3ReceiveRouteBufferSizes(
+					self.settings.TransportBufferSize,
+					connStream.useH3Datagrams,
+				)
+			reliableReceive := make(chan []byte, reliableReceiveBufferSize)
+			var unreliableReceive chan []byte
+			if connStream.useH3Datagrams {
+				unreliableReceive = make(chan []byte, unreliableReceiveBufferSize)
+			}
 
 			drain := func(c chan []byte) {
 				for {
@@ -2784,7 +2817,24 @@ func (self *PlatformTransport) runH3(
 			if self.settings.SendRouteObserver != nil {
 				self.settings.SendRouteObserver(sendTransport, send, true)
 			}
-			self.routeManager.UpdateTransport(receiveTransport, []Route{receive})
+			self.routeManager.UpdateTransportWithProperties(
+				receiveTransport,
+				[]Route{reliableReceive},
+				TransferCarrierProperties{
+					ReceiveReliability: CarrierReliabilityReliable,
+				},
+			)
+			var unreliableReceiveTransport Transport
+			if unreliableReceive != nil {
+				unreliableReceiveTransport = newReceiveLaneTransport(receiveTransport)
+				self.routeManager.UpdateTransportWithProperties(
+					unreliableReceiveTransport,
+					[]Route{unreliableReceive},
+					TransferCarrierProperties{
+						ReceiveReliability: CarrierReliabilityUnreliable,
+					},
+				)
+			}
 			self.setRegistered(true)
 
 			defer func() {
@@ -2794,6 +2844,9 @@ func (self *PlatformTransport) runH3(
 					self.settings.SendRouteObserver(sendTransport, send, false)
 				}
 				self.routeManager.RemoveTransport(receiveTransport)
+				if unreliableReceiveTransport != nil {
+					self.routeManager.RemoveTransport(unreliableReceiveTransport)
+				}
 				if self.settings.afterRoutesRemovedForTest != nil {
 					self.settings.afterRoutesRemovedForTest()
 				}
@@ -2805,7 +2858,10 @@ func (self *PlatformTransport) runH3(
 				// Route removal and the worker join leave no producer that can
 				// enqueue after these deterministic pooled-message drains.
 				drain(send)
-				drain(receive)
+				drain(reliableReceive)
+				if unreliableReceive != nil {
+					drain(unreliableReceive)
+				}
 			}()
 			// Hybrid H3 dispatches the two physical lanes before either writer can
 			// block. The extra queue transfers pooled-message ownership under both
@@ -3069,10 +3125,15 @@ func (self *PlatformTransport) runH3(
 				}, handleCancel)
 			}
 
-			offerRoutedMessage := func(message []byte) bool {
+			offerRoutedMessage := func(
+				message []byte,
+				reliability CarrierReliability,
+				receive chan<- []byte,
+			) bool {
 				open, delivered := self.offerReceive(
 					handleCtx.Done(),
 					ptMode,
+					reliability,
 					receive,
 					message,
 				)
@@ -3098,7 +3159,10 @@ func (self *PlatformTransport) runH3(
 				// legitimately idle. QUIC's connection-level idle timeout still
 				// detects a dead peer, and closing the connection unblocks this read.
 				startConnectionWorker(func() {
-					defer handleCancel()
+					defer func() {
+						handleCancel()
+						close(reliableReceive)
+					}()
 					if err := stream.SetReadDeadline(time.Time{}); err != nil {
 						return
 					}
@@ -3109,7 +3173,11 @@ func (self *PlatformTransport) runH3(
 						}
 						if len(message) != 0 {
 							self.h3DatagramStats.RecordStreamReceived(len(message))
-							if !offerRoutedMessage(message) {
+							if !offerRoutedMessage(
+								message,
+								CarrierReliabilityReliable,
+								reliableReceive,
+							) {
 								return
 							}
 							continue
@@ -3126,7 +3194,11 @@ func (self *PlatformTransport) runH3(
 						self.settings.beforeReceiveWorkerCleanupForTest()
 					}
 					handleCancel()
-					close(receive)
+					if unreliableReceive != nil {
+						close(unreliableReceive)
+					} else {
+						close(reliableReceive)
+					}
 				}()
 
 				for {
@@ -3163,13 +3235,23 @@ func (self *PlatformTransport) runH3(
 							continue
 						}
 					}
-					if !offerRoutedMessage(message) {
+					reliability := CarrierReliabilityReliable
+					receive := (chan<- []byte)(reliableReceive)
+					if unreliableReceive != nil {
+						reliability = CarrierReliabilityUnreliable
+						receive = unreliableReceive
+					}
+					if !offerRoutedMessage(message, reliability, receive) {
 						return
 					}
 				}
 			}, func() {
 				handleCancel()
-				close(receive)
+				if unreliableReceive != nil {
+					close(unreliableReceive)
+				} else {
+					close(reliableReceive)
+				}
 			})
 
 			select {

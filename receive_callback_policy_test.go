@@ -332,8 +332,9 @@ func TestProductionClientReceiveCallbacksAreAudited(t *testing.T) {
 
 // TestSharedClientReceivePumpHandoffsUseCarrierPolicy pins the two admissions
 // that run before per-sequence callbacks. Pack may use only the bounded
-// carrier-specific handoff policy (currently H1-only). Neither may inherit
-// ClientSettings.BufferTimeout, and H3/unknown remain zero-wait by policy.
+// exact carrier-lane handoff policy. Neither may inherit
+// ClientSettings.BufferTimeout; reliable lanes wait and datagrams remain
+// zero-wait independently of the broad transport family.
 func TestSharedClientReceivePumpHandoffsUseCarrierPolicy(t *testing.T) {
 	parsed := parseProductionGo(t)
 	body := findReceiveCallbackBody(t, parsed, receiveCallbackBody{
@@ -349,7 +350,7 @@ func TestSharedClientReceivePumpHandoffsUseCarrierPolicy(t *testing.T) {
 		if ok && len(assignment.Lhs) == 1 && len(assignment.Rhs) == 1 &&
 			formatAstExpr(t, parsed.fileSet, assignment.Lhs[0]) == "handoffTimeout" &&
 			strings.Join(strings.Fields(formatAstExpr(t, parsed.fileSet, assignment.Rhs[0])), "") ==
-				"self.settings.ReceiveBufferSettings.packHandoffTimeout(transportType)" {
+				"self.settings.ReceiveBufferSettings.packHandoffTimeout(transportType,carrierReliability)" {
 			packTimeoutPolicyCount++
 		}
 		if ok && len(assignment.Lhs) == 1 && len(assignment.Rhs) == 1 &&

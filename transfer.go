@@ -747,6 +747,10 @@ func DefaultReceiveBufferSettingsWithBufferSize(bufferSize int) *ReceiveBufferSe
 		// cannot multiply the channel capacity into a memory spike.
 		SequenceBufferByteCount:   kib(256),
 		H1SequenceBufferByteCount: kib(256),
+		// A reliable carrier reader may retain its one already-read frame until
+		// the bounded per-sequence queue drains or the sequence/client closes.
+		// This restores stream backpressure without enlarging any queue.
+		ReliablePackHandoffTimeout: -1,
 		// AckBufferSize: DefaultTransferBufferSize,
 		// coalesce acks into a periodic cumulative head ack
 		// without coalescing, every received message emits an ack frame, which
@@ -2940,16 +2944,27 @@ func (self *Client) run() {
 
 		var transferFrameBytes []byte
 		var transportType TransportType
+		var carrierReliability CarrierReliability
 		var err error
 		c := func() error {
-			if transportReader, ok := multiRouteReader.(TransportMultiRouteReader); ok {
+			if carrierReader, ok := multiRouteReader.(transferCarrierMultiRouteReader); ok {
+				var disposition transferReceiveDisposition
+				transferFrameBytes, disposition, err = carrierReader.readWithCarrier(
+					self.ctx,
+					self.settings.ReadTimeout,
+				)
+				transportType = disposition.transportType
+				carrierReliability = disposition.reliability
+			} else if transportReader, ok := multiRouteReader.(TransportMultiRouteReader); ok {
 				transferFrameBytes, transportType, err = transportReader.ReadWithTransport(
 					self.ctx,
 					self.settings.ReadTimeout,
 				)
+				carrierReliability = CarrierReliabilityUnknown
 			} else {
 				transferFrameBytes, err = multiRouteReader.Read(self.ctx, self.settings.ReadTimeout)
 				transportType = TransportTypeUnknown
+				carrierReliability = CarrierReliabilityUnknown
 			}
 			return err
 		}
@@ -3324,7 +3339,7 @@ func (self *Client) run() {
 						EncryptionCompanion: receiveCompanion,
 					}
 					handoffTimeout := self.settings.ReceiveBufferSettings.
-						packHandoffTimeout(transportType)
+						packHandoffTimeout(transportType, carrierReliability)
 					success, err := self.receiveBuffer.Pack(receivePack, handoffTimeout)
 					if !success {
 						if err == nil {
@@ -7856,12 +7871,19 @@ type ReceiveBufferSettings struct {
 	// extra scan.
 	PackQueueRetainedByteAccounting bool
 	// H1PackHandoffTimeout applies bounded reader backpressure only after an
-	// H1 ReceiveSequence handoff is full. Zero preserves nonblocking loss;
-	// H3 and unknown carriers always remain nonblocking at the Client reader.
+	// unclassified legacy H1 ReceiveSequence handoff is full. Exact production
+	// lanes use ReliablePackHandoffTimeout below. This field remains for custom
+	// readers that report only TransportType.
 	// A positive value is a total wait bound, not a per-retry delay. A negative
 	// value waits until capacity or sequence/client cancellation, extending an
 	// already-reliable H1 stream's backpressure without enlarging the channel.
 	H1PackHandoffTimeout time.Duration
+	// ReliablePackHandoffTimeout applies to an exact route explicitly published
+	// as reliable (H1, H3/DNS QUIC stream, SCTP, or a framed server exchange).
+	// A negative value waits for capacity or cancellation without enlarging the
+	// queue. Zero preserves nonblocking behavior for explicitly customized
+	// settings; production defaults to a cancellation-bounded wait.
+	ReliablePackHandoffTimeout time.Duration
 	// H1AckHandoffTimeout applies the same reliable-carrier backpressure rule
 	// when an inbound ACK burst momentarily fills its SendSequence queue. ACK
 	// objects are compact values; this wait does not retain the carrier frame.
@@ -7917,8 +7939,22 @@ type ReceiveBufferSettings struct {
 	afterAckWritesCanceledForTest      func(receiveSequenceId)
 }
 
-func (self *ReceiveBufferSettings) packHandoffTimeout(transportType TransportType) time.Duration {
-	if self != nil && transportType == TransportTypeH1 {
+func (self *ReceiveBufferSettings) packHandoffTimeout(
+	transportType TransportType,
+	reliabilities ...CarrierReliability,
+) time.Duration {
+	if self == nil {
+		return 0
+	}
+	if 0 < len(reliabilities) {
+		switch reliabilities[0] {
+		case CarrierReliabilityReliable:
+			return self.ReliablePackHandoffTimeout
+		case CarrierReliabilityUnreliable:
+			return 0
+		}
+	}
+	if transportType == TransportTypeH1 {
 		return self.H1PackHandoffTimeout
 	}
 	return 0

@@ -266,6 +266,36 @@ func (self *H3DatagramSettings) UseDatagramForPath(
 	return fragmentCount <= self.MaxFragmentCount
 }
 
+// H3DatagramTransferFrameByteLimit returns the largest complete Transfer frame
+// selected for DATAGRAM on one observed QUIC path. UseDatagramForPath is a
+// contiguous size predicate, so this limit can be serialized across the server
+// exchange and reconstructed without losing the stream-vs-DATAGRAM decision.
+func H3DatagramTransferFrameByteLimit(
+	settings *H3DatagramSettings,
+	maxDatagramByteCount int,
+) int {
+	if settings == nil || settings.MaxFragmentCount <= 0 {
+		return 0
+	}
+	fragmentPayloadByteCount := maxDatagramByteCount - H3DatagramHeaderByteCount
+	if fragmentPayloadByteCount <= 0 {
+		return 0
+	}
+	pathLimit := int64(fragmentPayloadByteCount) * int64(settings.MaxFragmentCount)
+	limit := min(
+		int64(settings.HybridDatagramMessageByteCount),
+		int64(settings.MaxMessageByteCount),
+		pathLimit,
+	)
+	if limit <= 0 {
+		return 0
+	}
+	if int64(int(limit)) != limit {
+		return int(^uint(0) >> 1)
+	}
+	return int(limit)
+}
+
 // H3DatagramStatsSnapshot is one lock-free lifetime view of the candidate data
 // carrier. All byte counters contain envelope bytes passed to or accepted by
 // quic-go, not UDP/IP overhead.

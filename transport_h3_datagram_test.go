@@ -235,6 +235,38 @@ func TestH3HybridDatagramSelectionUsesLivePathLimit(t *testing.T) {
 	}
 }
 
+func TestH3DatagramTransferFrameLimitMatchesLaneSelection(t *testing.T) {
+	for _, testCase := range []struct {
+		name          string
+		fragmentCount int
+		pathByteCount int
+	}{
+		{name: "default path", fragmentCount: 1, pathByteCount: H3InitialDatagramByteCount},
+		{name: "reduced path", fragmentCount: 1, pathByteCount: 1200},
+		{name: "bounded fragmentation", fragmentCount: 2, pathByteCount: 1200},
+	} {
+		settings := *DefaultH3DatagramSettings()
+		settings.MaxFragmentCount = testCase.fragmentCount
+		limit := H3DatagramTransferFrameByteLimit(&settings, testCase.pathByteCount)
+		if limit <= 0 {
+			t.Fatalf("%s serialized DATAGRAM limit=%d", testCase.name, limit)
+		}
+		for byteCount := 1; byteCount <= settings.MaxMessageByteCount; byteCount++ {
+			wantDatagram := settings.UseDatagramForPath(byteCount, testCase.pathByteCount)
+			if gotDatagram := byteCount <= limit; gotDatagram != wantDatagram {
+				t.Fatalf(
+					"%s bytes=%d serialized DATAGRAM=%t live selection=%t limit=%d",
+					testCase.name,
+					byteCount,
+					gotDatagram,
+					wantDatagram,
+					limit,
+				)
+			}
+		}
+	}
+}
+
 func TestH3HybridDatagramPathReductionFallsBackPastFragmentLimit(t *testing.T) {
 	settings := DefaultH3DatagramSettings()
 	stats := &H3DatagramStats{}
