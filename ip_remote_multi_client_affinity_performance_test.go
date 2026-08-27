@@ -76,8 +76,30 @@ func recordAffinityPerformanceTestSample(
 	sourcePort int,
 	ackedBytes uint32,
 	activeDuration time.Duration,
+	leaveOutsideWindows ...bool,
 ) *multiClientChannelUpdate {
 	t.Helper()
+	if len(leaveOutsideWindows) == 0 || !leaveOutsideWindows[0] {
+		attached := false
+		for _, window := range parent.windows {
+			if window == nil {
+				continue
+			}
+			if window.clients == nil {
+				window.clients = map[Id]*multiClientChannel{}
+			}
+			window.clients[client.ClientId()] = client
+			attached = true
+			break
+		}
+		if !attached {
+			parent.windows = map[WindowType]*multiClientWindow{
+				WindowTypeQuality: {
+					clients: map[Id]*multiClientChannel{client.ClientId(): client},
+				},
+			}
+		}
+	}
 	path := affinityPerformanceTestPath(sourcePort)
 	update := newMultiClientChannelUpdate(context.Background(), path)
 	update.openTime = time.Now().Add(-activeDuration)
@@ -124,6 +146,9 @@ func TestAffinityPerformanceUsesAdvertisedRateAsUnmeasuredNull(t *testing.T) {
 	parent.reliabilityMetrics = newReliabilityMetrics()
 	low := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
 	fresh := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
+	secondFresh := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
+	thirdFresh := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
+	fourthFresh := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
 	path := affinityPerformanceTestPath(44300)
 
 	if score, prior, measured := parent.affinityPerformanceScore(fresh, path, time.Now()); measured || score != 5_000_000 || prior != 5_000_000 {
@@ -140,11 +165,11 @@ func TestAffinityPerformanceUsesAdvertisedRateAsUnmeasuredNull(t *testing.T) {
 	}
 
 	preferred := parent.preferAffinityPerformanceCandidates(
-		[]*multiClientChannel{low, fresh},
+		[]*multiClientChannel{low, fresh, secondFresh, thirdFresh, fourthFresh},
 		affinityPerformanceTestCandidateUpdate(path),
 	)
-	if len(preferred) != 1 || preferred[0] != fresh {
-		t.Fatal("fresh provider did not outrank the low-ACK provider on the next TLS flow")
+	if len(preferred) != 4 || preferred[0] != fresh || preferred[1] != secondFresh || preferred[2] != thirdFresh || preferred[3] != fourthFresh {
+		t.Fatal("unmeasured providers did not outrank the low-ACK provider on the next TLS flow")
 	}
 	metrics := parent.ReliabilityMetrics()
 	if metrics.AffinityPerformanceSamples != 1 ||
@@ -152,6 +177,127 @@ func TestAffinityPerformanceUsesAdvertisedRateAsUnmeasuredNull(t *testing.T) {
 		metrics.AffinityPerformanceCandidatesFiltered != 1 {
 		t.Fatalf("affinity-performance metrics=%+v, want sample/bypass/filter 1/1/1", metrics)
 	}
+}
+
+func TestAffinityPerformanceKeepsFourRouteTailInsurance(t *testing.T) {
+	parent := reputationTestParent("www.bloomberg.com")
+	parent.reliabilityMetrics = newReliabilityMetrics()
+	fresh := affinityPerformanceTestClient(DestinationStats{
+		EstimatedBytesPerSecond: 5_000_000,
+	})
+	low := [5]*multiClientChannel{}
+	for i := range low {
+		low[i] = affinityPerformanceTestClient(DestinationStats{
+			EstimatedBytesPerSecond: 5_000_000,
+		})
+		update := recordAffinityPerformanceTestSample(
+			t,
+			parent,
+			low[i],
+			44360+i,
+			25_000,
+			time.Second,
+		)
+		update.Close()
+	}
+
+	path := affinityPerformanceTestPath(44370)
+	preferred := parent.preferAffinityPerformanceCandidates(
+		[]*multiClientChannel{low[0], fresh, low[1], low[2], low[3], low[4]},
+		affinityPerformanceTestCandidateUpdate(path),
+	)
+	if len(preferred) != affinityPerformanceMinRaceCandidates {
+		t.Fatalf("preferred route count=%d, want exploration floor %d",
+			len(preferred), affinityPerformanceMinRaceCandidates)
+	}
+	if preferred[0] != fresh || preferred[1] != low[0] ||
+		preferred[2] != low[1] || preferred[3] != low[2] {
+		t.Fatal("four-route floor did not retain the best route plus stable tail insurance")
+	}
+	if filtered := parent.ReliabilityMetrics().AffinityPerformanceCandidatesFiltered; filtered != 2 {
+		t.Fatalf("filtered candidates=%d, want 2 beyond the four-route floor", filtered)
+	}
+}
+
+func TestAffinityPerformanceRecordsOnlyActiveHealthyRoute(t *testing.T) {
+	newFixture := func() (*RemoteUserNatMultiClient, *multiClientChannel) {
+		parent := reputationTestParent("www.bloomberg.com")
+		parent.reliabilityMetrics = newReliabilityMetrics()
+		client := affinityPerformanceTestClient(DestinationStats{
+			EstimatedBytesPerSecond: 5_000_000,
+		})
+		return parent, client
+	}
+	record := func(
+		parent *RemoteUserNatMultiClient,
+		client *multiClientChannel,
+		port int,
+		leaveOutsideWindows ...bool,
+	) {
+		update := recordAffinityPerformanceTestSample(
+			t,
+			parent,
+			client,
+			port,
+			25_000,
+			time.Second,
+			leaveOutsideWindows...,
+		)
+		update.Close()
+	}
+
+	t.Run("active healthy route", func(t *testing.T) {
+		parent, client := newFixture()
+		record(parent, client, 44350)
+		if len(parent.affinityPerformance) == 0 ||
+			parent.ReliabilityMetrics().AffinityPerformanceSamples != 1 {
+			t.Fatal("active healthy route did not publish performance evidence")
+		}
+	})
+
+	t.Run("canceled route", func(t *testing.T) {
+		parent, client := newFixture()
+		ctx, cancel := context.WithCancel(context.Background())
+		client.ctx = ctx
+		cancel()
+		record(parent, client, 44351)
+		if len(parent.affinityPerformance) != 0 ||
+			parent.ReliabilityMetrics().AffinityPerformanceSamples != 0 {
+			t.Fatal("canceled route poisoned performance evidence")
+		}
+	})
+
+	t.Run("warned route", func(t *testing.T) {
+		parent, client := newFixture()
+		client.setWarning(true, warnUnhealthy)
+		record(parent, client, 44352)
+		if len(parent.affinityPerformance) != 0 ||
+			parent.ReliabilityMetrics().AffinityPerformanceSamples != 0 {
+			t.Fatal("unhealthy warned route poisoned performance evidence")
+		}
+	})
+
+	t.Run("quarantined route", func(t *testing.T) {
+		parent, client := newFixture()
+		client.setQuarantined(blackholeNoReceiveAck)
+		record(parent, client, 44353)
+		if len(parent.affinityPerformance) != 0 ||
+			parent.ReliabilityMetrics().AffinityPerformanceSamples != 0 {
+			t.Fatal("quarantined route poisoned performance evidence")
+		}
+	})
+
+	t.Run("route absent from live windows", func(t *testing.T) {
+		parent, client := newFixture()
+		parent.windows = map[WindowType]*multiClientWindow{
+			WindowTypeQuality: {clients: map[Id]*multiClientChannel{}},
+		}
+		record(parent, client, 44354, true)
+		if len(parent.affinityPerformance) != 0 ||
+			parent.ReliabilityMetrics().AffinityPerformanceSamples != 0 {
+			t.Fatal("route outside the live window poisoned performance evidence")
+		}
+	})
 }
 
 func TestAffinityPerformanceColdFreshRaceAllocatesNothing(t *testing.T) {
@@ -181,17 +327,20 @@ func TestAffinityPerformanceMeasuredFreshRaceAllocatesNothing(t *testing.T) {
 	parent.defaultReliabilitySettings = ReliabilitySettingsFrom(parent.settings)
 	low := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
 	fresh := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
+	secondFresh := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
+	thirdFresh := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
+	fourthFresh := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
 	recordAffinityPerformanceTestSample(t, parent, low, 46999, 25_000, time.Second)
-	storage := [2]*multiClientChannel{}
+	storage := [5]*multiClientChannel{}
 	path := affinityPerformanceTestPath(47000)
 	update := affinityPerformanceTestCandidateUpdate(path)
 	allocs := testing.AllocsPerRun(100, func() {
 		// The filter deliberately compacts this placement-local field in place.
 		// Restore the synthetic field just as raceCandidates does for each real
 		// fresh flow.
-		storage[0], storage[1] = low, fresh
-		if got := parent.preferAffinityPerformanceCandidates(storage[:], update); len(got) != 1 || got[0] != fresh {
-			t.Fatalf("measured race = %v, want only unmeasured provider", got)
+		storage[0], storage[1], storage[2], storage[3], storage[4] = low, fresh, secondFresh, thirdFresh, fourthFresh
+		if got := parent.preferAffinityPerformanceCandidates(storage[:], update); len(got) != 4 || got[0] != fresh || got[1] != secondFresh || got[2] != thirdFresh || got[3] != fourthFresh {
+			t.Fatalf("measured race = %v, want the four unmeasured providers", got)
 		}
 	})
 	if allocs != 0 {
@@ -203,16 +352,19 @@ func TestAffinityPerformanceUsesStillOpenH2EvidenceForNextFreshFlow(t *testing.T
 	parent := reputationTestParent("www.bloomberg.com")
 	low := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
 	fresh := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
+	secondFresh := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
+	thirdFresh := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
+	fourthFresh := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
 	live := attachLiveAffinityPerformanceTestSample(parent, low, 47010, 25_000, time.Second)
 	defer live.Close()
 
 	path := affinityPerformanceTestPath(47011)
 	preferred := parent.preferAffinityPerformanceCandidates(
-		[]*multiClientChannel{low, fresh},
+		[]*multiClientChannel{low, fresh, secondFresh, thirdFresh, fourthFresh},
 		affinityPerformanceTestCandidateUpdate(path),
 	)
-	if len(preferred) != 1 || preferred[0] != fresh {
-		t.Fatalf("fresh race with open low-rate H2 flow = %v, want unmeasured provider", preferred)
+	if len(preferred) != 4 || preferred[0] != fresh || preferred[1] != secondFresh || preferred[2] != thirdFresh || preferred[3] != fourthFresh {
+		t.Fatalf("fresh race with open low-rate H2 flow = %v, want four unmeasured providers", preferred)
 	}
 	if len(parent.affinityPerformance) != 0 {
 		t.Fatal("live evidence unexpectedly allocated or retained completed-flow history")
@@ -243,14 +395,17 @@ func TestAffinityPerformanceLiveFreshRaceAllocatesNothing(t *testing.T) {
 	parent.defaultReliabilitySettings = ReliabilitySettingsFrom(parent.settings)
 	low := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
 	fresh := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
+	secondFresh := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
+	thirdFresh := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
+	fourthFresh := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
 	live := attachLiveAffinityPerformanceTestSample(parent, low, 47030, 25_000, time.Second)
 	defer live.Close()
-	storage := [2]*multiClientChannel{}
+	storage := [5]*multiClientChannel{}
 	update := affinityPerformanceTestCandidateUpdate(affinityPerformanceTestPath(47031))
 	allocs := testing.AllocsPerRun(100, func() {
-		storage[0], storage[1] = low, fresh
-		if got := parent.preferAffinityPerformanceCandidates(storage[:], update); len(got) != 1 || got[0] != fresh {
-			t.Fatalf("live measured race = %v, want only unmeasured provider", got)
+		storage[0], storage[1], storage[2], storage[3], storage[4] = low, fresh, secondFresh, thirdFresh, fourthFresh
+		if got := parent.preferAffinityPerformanceCandidates(storage[:], update); len(got) != 4 || got[0] != fresh || got[1] != secondFresh || got[2] != thirdFresh || got[3] != fourthFresh {
+			t.Fatalf("live measured race = %v, want four unmeasured providers", got)
 		}
 	})
 	if allocs != 0 {
@@ -378,6 +533,11 @@ func TestPerformanceAwareAffinityExplicitPinStillWins(t *testing.T) {
 func TestAffinityPerformanceTableIsBoundedAndExpires(t *testing.T) {
 	parent := reputationTestParent("www.bloomberg.com")
 	client := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
+	parent.windows = map[WindowType]*multiClientWindow{
+		WindowTypeQuality: {
+			clients: map[Id]*multiClientChannel{client.ClientId(): client},
+		},
+	}
 	for i := 0; i < affinityPerformanceMaxEntries+10; i++ {
 		update := newMultiClientChannelUpdate(context.Background(), affinityPerformanceTestPath(45000+i))
 		update.openTime = time.Now().Add(-time.Second)
@@ -473,15 +633,18 @@ func BenchmarkAffinityPerformanceMeasuredFreshRace(b *testing.B) {
 	parent.defaultReliabilitySettings = ReliabilitySettingsFrom(parent.settings)
 	low := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
 	fresh := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
+	secondFresh := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
+	thirdFresh := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
+	fourthFresh := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
 	recordAffinityPerformanceTestSample(b, parent, low, 47001, 25_000, time.Second)
-	candidates := []*multiClientChannel{low, fresh}
+	candidates := []*multiClientChannel{low, fresh, secondFresh, thirdFresh, fourthFresh}
 	path := affinityPerformanceTestPath(47002)
 	update := affinityPerformanceTestCandidateUpdate(path)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		candidates[0], candidates[1] = low, fresh
-		if preferred := parent.preferAffinityPerformanceCandidates(candidates, update); len(preferred) != 1 || preferred[0] != fresh {
+		candidates[0], candidates[1], candidates[2], candidates[3], candidates[4] = low, fresh, secondFresh, thirdFresh, fourthFresh
+		if preferred := parent.preferAffinityPerformanceCandidates(candidates, update); len(preferred) != 4 || preferred[0] != fresh || preferred[1] != secondFresh || preferred[2] != thirdFresh || preferred[3] != fourthFresh {
 			b.Fatal("measured race was not narrowed")
 		}
 	}
@@ -492,15 +655,18 @@ func BenchmarkAffinityPerformanceLiveFreshRace(b *testing.B) {
 	parent.defaultReliabilitySettings = ReliabilitySettingsFrom(parent.settings)
 	low := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
 	fresh := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
+	secondFresh := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
+	thirdFresh := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
+	fourthFresh := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
 	live := attachLiveAffinityPerformanceTestSample(parent, low, 47003, 25_000, time.Second)
 	defer live.Close()
-	candidates := []*multiClientChannel{low, fresh}
+	candidates := []*multiClientChannel{low, fresh, secondFresh, thirdFresh, fourthFresh}
 	update := affinityPerformanceTestCandidateUpdate(affinityPerformanceTestPath(47004))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		candidates[0], candidates[1] = low, fresh
-		if preferred := parent.preferAffinityPerformanceCandidates(candidates, update); len(preferred) != 1 || preferred[0] != fresh {
+		candidates[0], candidates[1], candidates[2], candidates[3], candidates[4] = low, fresh, secondFresh, thirdFresh, fourthFresh
+		if preferred := parent.preferAffinityPerformanceCandidates(candidates, update); len(preferred) != 4 || preferred[0] != fresh || preferred[1] != secondFresh || preferred[2] != thirdFresh || preferred[3] != fourthFresh {
 			b.Fatal("live measured race was not narrowed")
 		}
 	}

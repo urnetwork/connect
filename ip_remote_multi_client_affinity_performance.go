@@ -31,6 +31,13 @@ const (
 	// overrides while retaining all candidate scores on the placement stack;
 	// an unexpectedly wider field fails open instead of allocating.
 	affinityPerformanceCandidateStack = 16
+	// A posterior is a routing hint, not proof that one public exit will keep
+	// working for the next origin connection. Preserve a small simultaneous
+	// escape set when measurements would otherwise collapse a full quality race
+	// to one candidate. Three alternatives retain rough-pool tail insurance
+	// without returning to the six-way fresh-flow fan-out that exceeded the
+	// mobile memory budget.
+	affinityPerformanceMinRaceCandidates = 4
 )
 
 // tcpAckPerformance measures useful return progress without looking inside
@@ -259,12 +266,53 @@ func affinityPerformancePosterior(priorRate float64, entry *affinityPerformanceE
 		(affinityPerformancePriorWeight + entry.evidenceWeight)
 }
 
+// affinityPerformanceRecordEligible reports whether evidence still belongs to
+// a route that could carry a fresh flow now. Flow retirement is asynchronous:
+// by the time it reaches recordAffinityPerformance, the winning channel may
+// already have lost every transport, entered warning/quarantine, or left its
+// window. Recording that teardown interval as provider throughput poisons the
+// next placement decision with a carrier failure that is no longer current.
+//
+// This check is deliberately on the cold flow-retirement path. It adds no work
+// to ACK observation. A route outside every live window is ineligible even if
+// its channel-local transport has not finished closing yet.
+func (self *RemoteUserNatMultiClient) affinityPerformanceRecordEligible(
+	client *multiClientChannel,
+) bool {
+	if client == nil || (client.ctx != nil && client.IsDone()) ||
+		!client.hasActiveTransport() || client.isWarning() {
+		return false
+	}
+	active := false
+	for _, window := range self.windows {
+		if window == nil {
+			continue
+		}
+		window.stateLock.Lock()
+		for _, candidate := range window.clients {
+			if candidate == client {
+				active = true
+				break
+			}
+		}
+		window.stateLock.Unlock()
+		if active {
+			break
+		}
+	}
+	// Recheck channel-local state after the window scan. A concurrent removal
+	// cannot make a stale route look eligible merely because it occupied a
+	// window slot at the beginning of this cold-path check.
+	return active && (client.ctx == nil || !client.IsDone()) &&
+		client.hasActiveTransport() && !client.isWarning()
+}
+
 func (self *RemoteUserNatMultiClient) recordAffinityPerformance(
 	update *multiClientChannelUpdate,
 	client *multiClientChannel,
 ) {
 	if update == nil || client == nil || !self.reliabilitySettings().PerformanceAwareAffinity ||
-		!update.receivedInbound.Load() {
+		!update.receivedInbound.Load() || !self.affinityPerformanceRecordEligible(client) {
 		return
 	}
 	destinationSet := affinityPerformanceDestinationSetForUpdate(update)
@@ -630,21 +678,17 @@ func (self *RemoteUserNatMultiClient) preferAffinityPerformanceCandidates(
 		return candidates
 	}
 
-	// raceCandidates returns a placement-local slice. Compact and order it in
-	// place so measured fresh flows do not pay a heap allocation precisely when
-	// the session is already carrying enough traffic to have useful evidence.
-	// keptCount is known to be smaller than len(candidates), so every write is
-	// at or behind the range cursor and cannot overwrite an unread candidate.
+	// raceCandidates returns a placement-local slice. Order it in place so
+	// measured fresh flows do not pay a heap allocation precisely when the
+	// session is already carrying enough traffic to have useful evidence. Sort
+	// the whole tiny field, then retain the threshold set or the exploration
+	// floor, whichever is wider.
 	preferred := candidates[:0]
 	var preferredScores [affinityPerformanceCandidateStack]float64
 	for i := range len(candidates) {
 		candidate := candidateScores[i].client
 		score := candidateScores[i].score
-		if score < threshold {
-			continue
-		}
 		// Stable insertion keeps the highest posterior first for a truncated
-		// MultiRaceClientCount. Candidate fields are tiny (normally <=6), so
 		// rescoring the preceding kept item costs less memory than retaining a
 		// heap score buffer on every measured flow.
 		insertAt := len(preferred)
@@ -660,6 +704,10 @@ func (self *RemoteUserNatMultiClient) preferAffinityPerformanceCandidates(
 		preferred[insertAt] = candidate
 		preferredScores[insertAt] = score
 	}
-	self.reliabilityMetrics.affinityPerformanceCandidatesRemoved(len(candidates) - len(preferred))
-	return preferred
+	selectedCount := max(
+		keptCount,
+		min(affinityPerformanceMinRaceCandidates, len(preferred)),
+	)
+	self.reliabilityMetrics.affinityPerformanceCandidatesRemoved(len(candidates) - selectedCount)
+	return preferred[:selectedCount]
 }

@@ -1405,6 +1405,117 @@ regression; client steady p95 at or below 24 MiB with zero >28-MiB samples; and
 the existing provider-memory gate remains separately open until the shared UDP
 poller/lifecycle work reduces its live topology.
 
+## 2026-08-27 provider topology and fresh-race correction
+
+This pass closed the first three provider-memory research directions, then
+investigated a real fast.com regression introduced by making TLS-blind
+performance evidence load-bearing. Every candidate used a fresh child process;
+physical arms used one attached Android phone, validated Wi-Fi, explicit H1,
+the production United States pool, a fresh app/client/Chrome session per arm,
+the canonical fast.com harness, and primitive Go/queue counters. Public exits
+were not pinned, so the physical results are target and regression gates, not a
+causal percentage benchmark between provider sets.
+
+### Direction 1: shared provider UDP socket lifecycle
+
+The retained constrained-provider profile replaces one blocking reader, send
+loop, send channel and idle timer per UDP flow with:
+
+- one OS-readiness worker per existing receive-dispatch shard and address
+  family (`epoll` on Linux/Android, `kqueue` on Darwin/iOS, portable fallback
+  elsewhere);
+- direct serialized datagram writes, which preserve UDP message boundaries;
+- the existing bounded receive dispatcher, which drains all immediately ready
+  datagrams in one callback batch; and
+- one buffer-level idle-deadline worker.
+
+Construction remains lazy, so a TCP-only provider allocates no poll backend.
+The profile is enabled only by provider settings with a nonzero memory target;
+generic callers and the target-zero server defaults keep the established
+portable topology. Readiness callbacks use `syscall.RawConn.Read` to pin the
+descriptor through a drain: an event queued before unregister/close cannot read
+a newly reused descriptor into the old flow.
+
+Five fresh 16-packet/24-KiB SDK provider-load repetitions gave:
+
+| Arm | TCP echo median | UDP median | Loaded runtime / live heap | Goroutines peak / loaded | Runtime peak | Decision |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Per-flow reader/send/timer control | 53.1 MiB/s | 13,960.4 round trips/s | 27.9 / 10.4 MiB | 641 / 621 | about 31.1 MiB | Control |
+| Shared readiness + direct write + shared idle lifecycle | 54.1 MiB/s | 15,414.3 round trips/s | 25.8 / 9.4 MiB | 356 / 242 | about 30.9 MiB | **Keep**: TCP +1.9%, UDP +10.4%, loaded runtime -2.1 MiB, loaded goroutines -61.0% |
+
+All five retained-candidate repetitions stayed below the synthetic 31-MiB
+host ceiling. Allocation/CPU profiles explain the direction: sampled GC drain
+fell from 0.48 to 0.33 cumulative seconds, and the loaded `time.NewTimer`
+allocation sample disappeared. Profiling overhead itself can cross the memory
+ceiling, so profile runs remain attribution-only. Ordering, idle reap, absent
+per-flow queues, descriptor unregister, race behavior, Linux/Android and
+Darwin/iOS compilation are deterministic gates.
+
+### Directions 2 and 3: provider group bound and telemetry
+
+The local 32-packet/48-KiB provider group reduced admission time from 4,929 to
+4,344 ns/op (-11.9%) and allocations from 98 to 82 in the narrow microbenchmark.
+The complete provider path reversed that result: TCP median fell from 54.1 to
+52.7 MiB/s (-2.6%), and two of five repetitions crossed 31 MiB. Production
+therefore remains 16 packets/24 KiB. A larger logical group is rejected until a
+controlled physical provider proves a complete-path win.
+
+Schema-12 already exposes ACK/recovery writes, route-write wait, Pack handoff,
+carrier/queue drops and pressure. The profile separated timer/GC work without a
+new ACK-hot-path atomic, so no additional sampled counter was retained in this
+pass.
+
+### Fast.com regression root cause and retained correction
+
+The active performance learner was not merely ordering the fresh TLS field. It
+could reduce a four-to-six-exit quality race to one provider. That is unsafe in
+a rough public pool: a posterior is evidence about prior flows, not proof that
+the next origin socket will remain healthy. The regression was visible without
+carrier or Pack loss; candidate removal, timeout recovery and the loss of
+parallel tail insurance were the limiting boundary.
+
+Separately, completed evidence is now published only if the exact route still
+has an active transport, has no warning/quarantine verdict, is not canceled,
+and remains present in a live window. Channel state is rechecked after the
+window scan. This cold retirement-path guard adds no ACK work and prevents a
+retired route's teardown interval from poisoning a later decision. It was
+correct but did not by itself restore speed: the guarded hard-filter arm still
+accepted 67 healthy samples and removed 1,706 candidates.
+
+The measured exploration sweep was:
+
+| Fresh TCP/443 policy | fast.com displays | Median | Runtime result | Placement/recovery evidence | Decision |
+| --- | --- | ---: | --- | --- | --- |
+| Installed hard-filter control | 110 / 55 / 66 Mbit/s | 66 Mbit/s | 21.91-MiB peak | 55 samples; 502 candidates removed | Regression control; variable route still reached 40, but filtering was already heavy |
+| Learner disabled / full field | 130 / 110 / 140 Mbit/s | 130 Mbit/s | **30.43-MiB peak** | zero learner work; 7,629 timeout resends; 10--13 failed page requests/run | Reject: fast but outside 24/28 MiB and less reliable |
+| Active/healthy guard, hard filter | 0.91 / 6.2 / 4.9 Mbit/s | 4.9 Mbit/s | 24.23-MiB peak | 67 samples; 1,706 removed; 991 pressure drops; zero carrier/Pack drops | Reject hard collapse; keep lifecycle guard independently |
+| Minimum two candidates | 15 / 0.52 / 89 Mbit/s | 15 Mbit/s | 20.47-MiB peak | 60 samples; 1,249 removed; zero carrier/Pack drops | Reject: memory-safe and better than the adjacent hard arm, but bad tail |
+| Minimum three candidates | 0.68 / 0.89 / 0.95 Mbit/s | 0.89 Mbit/s | 18.83-MiB peak | 57 samples; 282 removed; zero pressure/carrier/Pack drops; two page-target transfers independently measured about 29 Mbit/s | Reject: canonical displayed result did not improve |
+| **Minimum four candidates** | **47 / 100 / 110**, then **68 / 85 / 130 Mbit/s** | **92.5 Mbit/s across six** | first cohort 24.30-MiB peak; hot repeat 22.75-MiB peak | more than 1.1 GB exact H1 ingress; 2,243/2,243 Pack waits at the observed maximum; zero carrier/Pack drops | **Keep**: all six exceed 40 Mbit/s; warm 24.30-MiB crest remains disclosed below |
+
+The four-route floor keeps the highest posterior first and retains three escape
+routes; fields wider than four can still discard clearly weaker candidates.
+It sorts the placement-local slice using a fixed stack array. Current M4 Pro
+medians were 132.4 ns for a cold race, 309.1 ns with completed evidence, and
+279.5 ns with live evidence, all 0 B/op and zero allocations. The deterministic
+six-candidate regression test verifies that a strong route plus three stable
+alternatives survive while the two weakest routes are removed.
+
+The first four-route burst had one 24.30-MiB sample, 304 KiB above the nominal
+24-MiB line, then returned to about 20.3 MiB. After a quiet interval, the next
+three fast.com runs peaked at 22.75 MiB rather than growing. Five subsequent
+cache-disabled Wikipedia runs peaked at 20.92 MiB and measured 478.3-ms median
+load, 195.2-ms median document TTFB, and zero failed requests. Thus the steady
+24-MiB goal and 40-Mbit/s target pass on this Android surrogate, but this is not
+an absolute all-samples <=24-MiB claim. Do not spend throughput to erase one
+non-repeating 304-KiB GC-phase crest without a paired improvement; physical iOS
+`phys_footprint`/jetsam remains the release gate.
+
+The complete Connect/SDK short suites, both vets, focused race-detector tests,
+iOS/Linux cross-builds, and final Android AAR/app/test/unit build passed. Every
+temporary production client, on-device credential file and private session
+artifact was removed after its arm.
+
 ## Experiment queue
 
 Run one change at a time where practical, then combine only independently
@@ -1431,11 +1542,10 @@ every slow result is a queue-size problem:
    mobile policy; its full-depth physical arm did not improve throughput.
    Repeat provider off/on/off under traffic so the provider share transition
    cannot retain an old H1 burst.
-3. **Provider logical-group bound.** After the 16/24-KiB deployment A/B, compare
-   16/24 KiB with 32/48 KiB on complete 64-KiB socket drains. Physical H1 wire
-   chunks remain two full-MTU frames under the deployed 4-KiB envelope; a larger
-   logical bound is useful only if fewer admissions/callbacks beat the longer
-   retained owner without hurting cross-flow fairness.
+3. **Provider logical-group bound (closed locally).** Keep 16/24 KiB. Although
+   32/48 KiB won the admission microbenchmark by 11.9%, it lost 2.6% TCP on the
+   complete provider path and crossed the synthetic memory ceiling in two of
+   five runs. Reopen only for an exact controlled-provider physical A/B.
 4. **ACK-write contention telemetry.** Measure direct Transfer-ACK route-write
    wait/failure by carrier before building a priority lane. Keep instrumentation
    sampled or test-only so an atomic on every ACK does not become the result.

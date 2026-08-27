@@ -566,6 +566,13 @@ func DefaultProviderLocalUserNatSettingsWithMemoryTarget(targetByteCount ByteCou
 		tcpGlobalLimit := max(providerMinTcpGlobalLimit, int(natTarget*2/5/providerTcpFlowByteCount))
 		settings.UdpBufferSettings.UserLimit = max(providerMinUdpUserLimit, udpGlobalLimit/4)
 		settings.UdpBufferSettings.GlobalLimit = udpGlobalLimit
+		// One readiness shard per receive-dispatch shard removes the socket-read
+		// goroutine from every provider UDP flow while preserving a bounded
+		// callback failure domain. Unsupported platforms transparently retain the
+		// portable per-flow reader.
+		settings.UdpBufferSettings.SocketReadShardCount =
+			settings.UdpBufferSettings.ReceiveShardCount
+		settings.UdpBufferSettings.SharedSocketLifecycle = true
 		settings.TcpBufferSettings.UserLimit = max(providerMinTcpUserLimit, tcpGlobalLimit/2)
 		settings.TcpBufferSettings.GlobalLimit = tcpGlobalLimit
 		// icmp is its own budget item, additive above the udp/tcp split: an
@@ -1495,6 +1502,17 @@ type UdpBufferSettings struct {
 	// SequenceBufferSize slots, making aggregate user-space receive
 	// backpressure independent of flow count.
 	ReceiveShardCount int
+	// SocketReadShardCount replaces one blocking socket-reader goroutine per
+	// UDP flow with this many OS-readiness workers per address family. Zero
+	// retains the portable per-flow reader. Constrained provider profiles turn
+	// this on; generic/custom callers keep the established implementation until
+	// their platform and latency cohorts are measured.
+	SocketReadShardCount int
+	// SharedSocketLifecycle writes each provider UDP datagram directly under
+	// its flow lock and uses one buffer-level idle timer instead of retaining a
+	// send goroutine, channel, and timer per flow. It requires the readiness
+	// poller; unsupported platforms fall back to the established Run loop.
+	SharedSocketLifecycle bool
 	// the number of open sockets per user
 	// uses an lru cleanup where new sockets over the limit close old sockets
 	UserLimit int
@@ -2071,6 +2089,9 @@ type UdpBuffer[BufferId comparable] struct {
 	receiveTransferPacketsCallback receiveTransferPacketsBatchFunction
 	udpBufferSettings              *UdpBufferSettings
 	receiveDispatcher              *udpReceiveDispatcher
+	socketReadPoller               *udpSocketReadPoller
+	sharedLifecycleOnce            sync.Once
+	sharedLifecycleWake            chan struct{}
 
 	mutex sync.Mutex
 
@@ -2084,13 +2105,14 @@ func newUdpBuffer[BufferId comparable](
 	udpBufferSettings *UdpBufferSettings,
 ) *UdpBuffer[BufferId] {
 	return &UdpBuffer[BufferId]{
-		ctx:               ctx,
-		log:               loggerOrDefault(udpBufferSettings.Log),
-		receiveCallback:   receiveCallback,
-		udpBufferSettings: udpBufferSettings,
-		receiveDispatcher: newUdpReceiveDispatcher(ctx, udpBufferSettings),
-		sequences:         map[BufferId]*UdpSequence{},
-		sourceSequences:   map[TransferPath]map[BufferId]*UdpSequence{},
+		ctx:                 ctx,
+		log:                 loggerOrDefault(udpBufferSettings.Log),
+		receiveCallback:     receiveCallback,
+		udpBufferSettings:   udpBufferSettings,
+		receiveDispatcher:   newUdpReceiveDispatcher(ctx, udpBufferSettings),
+		sharedLifecycleWake: make(chan struct{}, 1),
+		sequences:           map[BufferId]*UdpSequence{},
+		sourceSequences:     map[TransferPath]map[BufferId]*UdpSequence{},
 	}
 }
 
@@ -2114,13 +2136,7 @@ func (self *UdpBuffer[BufferId]) udpSend(
 			if skip == nil || skip != sequence {
 				return sequence
 			} else {
-				sequence.Cancel()
-				delete(self.sequences, bufferId)
-				sourceSequences := self.sourceSequences[sequence.source]
-				delete(sourceSequences, bufferId)
-				if 0 == len(sourceSequences) {
-					delete(self.sourceSequences, sequence.source)
-				}
+				self.removeSequenceWithLock(bufferId, sequence)
 			}
 		}
 
@@ -2190,6 +2206,16 @@ func (self *UdpBuffer[BufferId]) udpSend(
 		sequence.receiveTransferPacketsCallback = self.receiveTransferPacketsCallback
 		sequence.receiveDispatcher = self.receiveDispatcher
 		sequence.receiveShard = self.receiveDispatcher.assignShard()
+		if self.socketReadPoller == nil {
+			// The buffer mutex serializes this lazy construction. A TCP-only
+			// provider and an unused address family retain no poll descriptors,
+			// worker stacks, or scheduler wakeups.
+			self.socketReadPoller = newUdpSocketReadPoller(self.ctx, self.udpBufferSettings)
+		}
+		sequence.socketReadPoller = self.socketReadPoller
+		sequence.sharedSocketLifecycle =
+			self.socketReadPoller != nil && self.udpBufferSettings.SharedSocketLifecycle
+		sequence.sharedLifecycleWake = self.sharedLifecycleWake
 		self.sequences[bufferId] = sequence
 		sourceSequences := self.sourceSequences[source]
 		if sourceSequences == nil {
@@ -2197,23 +2223,34 @@ func (self *UdpBuffer[BufferId]) udpSend(
 			self.sourceSequences[source] = sourceSequences
 		}
 		sourceSequences[bufferId] = sequence
-		go HandleError(func() {
-			defer func() {
-				self.mutex.Lock()
-				defer self.mutex.Unlock()
-				sequence.Close()
-				// clean up
-				if sequence == self.sequences[bufferId] {
-					delete(self.sequences, bufferId)
-					sourceSequences := self.sourceSequences[sequence.source]
-					delete(sourceSequences, bufferId)
-					if 0 == len(sourceSequences) {
-						delete(self.sourceSequences, sequence.source)
+		if sequence.sharedSocketLifecycle {
+			sequence.sharedSocketLifecycle = sequence.startSharedSocket()
+		}
+		if sequence.sharedSocketLifecycle {
+			self.sharedLifecycleOnce.Do(func() {
+				go HandleError(self.runSharedSocketLifecycle)
+			})
+			self.wakeSharedSocketLifecycle()
+		} else {
+			sequence.ensureSendItems()
+			go HandleError(func() {
+				defer func() {
+					self.mutex.Lock()
+					defer self.mutex.Unlock()
+					sequence.Close()
+					// clean up
+					if sequence == self.sequences[bufferId] {
+						delete(self.sequences, bufferId)
+						sourceSequences := self.sourceSequences[sequence.source]
+						delete(sourceSequences, bufferId)
+						if 0 == len(sourceSequences) {
+							delete(self.sourceSequences, sequence.source)
+						}
 					}
-				}
-			}()
-			sequence.Run()
-		})
+				}()
+				sequence.Run()
+			})
+		}
 		return sequence
 	}
 
@@ -2247,7 +2284,87 @@ func (self *UdpBuffer[BufferId]) removeSequenceWithLock(bufferId BufferId, seque
 	if len(sourceSequences) == 0 {
 		delete(self.sourceSequences, sequence.source)
 	}
-	sequence.Cancel()
+	sequence.Close()
+}
+
+func (self *UdpBuffer[BufferId]) wakeSharedSocketLifecycle() {
+	select {
+	case self.sharedLifecycleWake <- struct{}{}:
+	default:
+	}
+}
+
+func udpSequenceDone(sequence *UdpSequence) bool {
+	if sequence == nil {
+		return true
+	}
+	select {
+	case <-sequence.ctx.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+// runSharedSocketLifecycle replaces one idle timer and one parked send loop per
+// readiness-managed UDP flow. Activity can only move a deadline later, so the
+// worker needs a wakeup for construction/close but not for every packet; an
+// early timer simply rescans and rearms to the new minimum.
+func (self *UdpBuffer[BufferId]) runSharedSocketLifecycle() {
+	var idleTimer *time.Timer
+	var idleTimerChannel <-chan time.Time
+	stopTimer := func() {
+		if idleTimer == nil || !idleTimer.Stop() {
+			return
+		}
+	}
+	defer stopTimer()
+
+	for {
+		select {
+		case <-self.ctx.Done():
+			self.mutex.Lock()
+			for bufferId, sequence := range self.sequences {
+				self.removeSequenceWithLock(bufferId, sequence)
+			}
+			self.mutex.Unlock()
+			return
+		case <-self.sharedLifecycleWake:
+		case <-idleTimerChannel:
+		}
+
+		now := time.Now()
+		var nextDeadline time.Time
+		self.mutex.Lock()
+		for bufferId, sequence := range self.sequences {
+			if !sequence.sharedSocketLifecycle {
+				continue
+			}
+			deadline := sequence.LastActivityTime().Add(self.udpBufferSettings.IdleTimeout)
+			if udpSequenceDone(sequence) || !now.Before(deadline) {
+				self.removeSequenceWithLock(bufferId, sequence)
+				continue
+			}
+			if nextDeadline.IsZero() || deadline.Before(nextDeadline) {
+				nextDeadline = deadline
+			}
+		}
+		self.mutex.Unlock()
+
+		if nextDeadline.IsZero() || self.udpBufferSettings.IdleTimeout <= 0 {
+			stopTimer()
+			idleTimerChannel = nil
+			continue
+		}
+		delay := max(time.Until(nextDeadline), time.Millisecond)
+		if idleTimer == nil {
+			idleTimer = time.NewTimer(delay)
+		} else {
+			stopTimer()
+			idleTimer.Reset(delay)
+		}
+		idleTimerChannel = idleTimer.C
+	}
 }
 
 type UdpSequence struct {
@@ -2258,7 +2375,15 @@ type UdpSequence struct {
 	receiveTransferPacketsCallback receiveTransferPacketsBatchFunction
 	receiveDispatcher              *udpReceiveDispatcher
 	receiveShard                   int
+	socketReadPoller               *udpSocketReadPoller
+	socketReadPollShard            int
+	socketReadPollFd               int
+	sharedSocketLifecycle          bool
+	sharedLifecycleWake            chan struct{}
 	udpBufferSettings              *UdpBufferSettings
+	sharedSocket                   net.Conn
+	sharedSocketErr                error
+	closeOnce                      sync.Once
 
 	sendMutex sync.Mutex
 	sendItems chan *UdpSendItem
@@ -2310,14 +2435,19 @@ func newUdpSequenceWithTransferKey(
 ) *UdpSequence {
 	source = source.LocalMask()
 	cancelCtx, cancel := context.WithCancel(ctx)
+	var sendItems chan *UdpSendItem
+	if !udpBufferSettings.SharedSocketLifecycle {
+		sendItems = make(chan *UdpSendItem, udpBufferSettings.SequenceBufferSize)
+	}
 	return &UdpSequence{
 		ctx:               cancelCtx,
 		cancel:            cancel,
 		log:               loggerOrDefault(udpBufferSettings.Log),
 		receiveCallback:   receiveCallback,
-		sendItems:         make(chan *UdpSendItem, udpBufferSettings.SequenceBufferSize),
+		sendItems:         sendItems,
 		udpBufferSettings: udpBufferSettings,
 		idleCondition:     NewIdleCondition(),
+		socketReadPollFd:  -1,
 		transferState:     newTransferState(source, transferKey),
 		StreamState: StreamState{
 			source:          source,
@@ -2334,7 +2464,16 @@ func newUdpSequenceWithTransferKey(
 	}
 }
 
+func (self *UdpSequence) ensureSendItems() {
+	if self.sendItems == nil {
+		self.sendItems = make(chan *UdpSendItem, self.udpBufferSettings.SequenceBufferSize)
+	}
+}
+
 func (self *UdpSequence) send(sendItem *UdpSendItem, timeout time.Duration) (bool, error) {
+	if self.sharedSocketLifecycle {
+		return self.sendSharedSocket(sendItem)
+	}
 	self.sendMutex.Lock()
 	defer self.sendMutex.Unlock()
 
@@ -2394,6 +2533,49 @@ func (self *UdpSequence) send(sendItem *UdpSendItem, timeout time.Duration) (boo
 	}
 }
 
+func (self *UdpSequence) sendSharedSocket(sendItem *UdpSendItem) (bool, error) {
+	self.sendMutex.Lock()
+	defer self.sendMutex.Unlock()
+	select {
+	case <-self.ctx.Done():
+		if self.sharedSocketErr != nil {
+			return false, self.sharedSocketErr
+		}
+		return false, errors.New("Done.")
+	default:
+	}
+	if self.sharedSocket == nil {
+		return false, errors.New("udp shared socket unavailable")
+	}
+
+	self.transferState.update(sendItem.source, sendItem.transferKey)
+	payload := sendItem.udp.payload
+	if len(payload) != 0 {
+		if err := self.sharedSocket.SetWriteDeadline(
+			time.Now().Add(self.udpBufferSettings.WriteTimeout),
+		); err != nil {
+			self.sharedSocketErr = err
+			self.Close()
+			return false, err
+		}
+		n, err := self.sharedSocket.Write(payload)
+		if err != nil {
+			self.sharedSocketErr = err
+			self.Close()
+			return false, err
+		}
+		if n != len(payload) {
+			err = io.ErrShortWrite
+			self.sharedSocketErr = err
+			self.Close()
+			return false, err
+		}
+		self.UpdateLastActivityTime()
+	}
+	MessagePoolReturn(sendItem.ipPacket)
+	return true, nil
+}
+
 func (self *UdpSequence) receivePacket(packet []byte) {
 	source, transferKey := self.transferState.get()
 	self.receiveCallback(
@@ -2431,7 +2613,51 @@ func (self *UdpSequence) receiveBatch(packets [][]byte) {
 	}
 }
 
+func (self *UdpSequence) openSocket() (net.Conn, error) {
+	self.log.V(2).Infof("[init]udp connect\n")
+	socket, err := self.udpBufferSettings.DialContext(
+		self.ctx,
+		"udp",
+		self.IpPath().DestinationHostPort(),
+	)
+	if err != nil {
+		if self.log.V(1).Enabled() {
+			self.log.Infof("[init]udp connect error = %s\n", err)
+		}
+		// A UDP dial cannot yield a meaningful refusal to the inner source.
+		if _, signal := classifyDialFailure(self.IpPath(), err); signal != nil {
+			self.receivePacket(MessagePoolCopy(signal))
+		}
+		return nil, err
+	}
+	self.UpdateLastActivityTime()
+	self.log.V(2).Infof("[init]connect success\n")
+	if udpConn, ok := socket.(*net.UDPConn); ok {
+		// The OS may cap these requests at its configured limits.
+		udpConn.SetReadBuffer(int(self.udpBufferSettings.MaxWindowSize))
+		udpConn.SetWriteBuffer(int(self.udpBufferSettings.MaxWindowSize))
+	}
+	return socket, nil
+}
+
+func (self *UdpSequence) startSharedSocket() bool {
+	socket, err := self.openSocket()
+	if err != nil {
+		self.sharedSocketErr = err
+		self.cancel()
+		return true
+	}
+	self.sharedSocket = socket
+	if self.socketReadPoller == nil || !self.socketReadPoller.register(self, socket) {
+		_ = socket.Close()
+		self.sharedSocket = nil
+		return false
+	}
+	return true
+}
+
 func (self *UdpSequence) Run() {
+	self.ensureSendItems()
 	defer func() {
 		self.cancel()
 
@@ -2457,40 +2683,16 @@ func (self *UdpSequence) Run() {
 		}()
 	}()
 
-	self.log.V(2).Infof("[init]udp connect\n")
-	socket, err := self.udpBufferSettings.DialContext(
-		self.ctx,
-		"udp",
-		self.IpPath().DestinationHostPort(),
-	)
+	socket, err := self.openSocket()
 	if err != nil {
-		if self.log.V(1).Enabled() {
-			self.log.Infof("[init]udp connect error = %s\n", err)
-		}
-		// answer the source instead of going silent: udp "dial" cannot yield a
-		// meaningful refusal at connect time, so always send the capacity-class
-		// unreachable through the same receive callback, then return -- no
-		// socket exists.
-		if _, signal := classifyDialFailure(self.IpPath(), err); signal != nil {
-			self.receivePacket(MessagePoolCopy(signal))
-		}
 		return
 	}
 	defer socket.Close()
-	self.UpdateLastActivityTime()
-	self.log.V(2).Infof("[init]connect success\n")
-
-	if udpConn, ok := socket.(*net.UDPConn); ok {
-		// size the kernel buffers to the max window.
-		// the os may silently cap these at system limits.
-		udpConn.SetReadBuffer(int(self.udpBufferSettings.MaxWindowSize))
-		udpConn.SetWriteBuffer(int(self.udpBufferSettings.MaxWindowSize))
-	}
 	// f, _ := udpConn.File()
 	// fd := SocketHandle(f.Fd())
 	// syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_MTU, self.udpBufferSettings.Mtu)
 
-	go HandleError(func() {
+	readSocket := func() {
 		// The dispatcher owns every successfully enqueued packet. Canceling
 		// the sequence closes the socket/main send loop, but already queued
 		// packets remain valid and drain in shard FIFO order.
@@ -2557,7 +2759,12 @@ func (self *UdpSequence) Run() {
 				}
 			}
 		}
-	}, self.cancel)
+	}
+	if self.socketReadPoller != nil && self.socketReadPoller.register(self, socket) {
+		defer self.socketReadPoller.unregister(self)
+	} else {
+		go HandleError(readSocket, self.cancel)
+	}
 
 	sendIter := uint64(0)
 	// The sequence goroutine owns the outbound socket writes directly. The
@@ -2647,11 +2854,25 @@ func (self *UdpSequence) Run() {
 }
 
 func (self *UdpSequence) Cancel() {
-	self.cancel()
+	self.Close()
 }
 
 func (self *UdpSequence) Close() {
-	self.cancel()
+	self.closeOnce.Do(func() {
+		self.cancel()
+		if self.sharedSocketLifecycle {
+			if self.socketReadPoller != nil {
+				self.socketReadPoller.unregister(self)
+			}
+			if self.sharedSocket != nil {
+				_ = self.sharedSocket.Close()
+			}
+			select {
+			case self.sharedLifecycleWake <- struct{}{}:
+			default:
+			}
+		}
+	})
 }
 
 type UdpSendItem struct {
