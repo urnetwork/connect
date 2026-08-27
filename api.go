@@ -376,6 +376,12 @@ type FindProvidersProvider struct {
 	HasEstimatedBytesPerSecond bool      `json:"has_estimated_bytes_per_second"`
 	Tier                       int       `json:"tier"`
 	IntermediaryIds            []Id      `json:"intermediary_ids,omitempty"`
+	// NetworkOnly is true when this provider is available through the caller's
+	// own network relationship rather than as a public exit.
+	NetworkOnly bool `json:"network_only,omitempty"`
+	// ReputationFailedNames comes from low-rate external probes. Values are
+	// opaque domain/vendor labels; the tunnel does not infer them from TLS.
+	ReputationFailedNames string `json:"reputation_failed_names,omitempty"`
 	// Location is the provider's location. nil when the server does not know
 	// it (or an older server).
 	Location *ProviderLocation `json:"location,omitempty"`

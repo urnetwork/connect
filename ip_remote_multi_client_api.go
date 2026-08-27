@@ -459,6 +459,8 @@ func (self *ApiMultiClientGenerator) NextDestinationsContext(ctx context.Context
 				destinations[destination] = DestinationStats{
 					EstimatedBytesPerSecond: provider.EstimatedBytesPerSecond,
 					Tier:                    provider.Tier,
+					NetworkOnly:             provider.NetworkOnly,
+					ReputationFailures:      normalizeProviderReputationFailures(provider.ReputationFailedNames),
 					Location:                provider.Location,
 				}
 			}

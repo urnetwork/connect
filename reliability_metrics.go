@@ -129,6 +129,13 @@ type reliabilityMetrics struct {
 	quarantineTcpResets             atomic.Uint64
 	quarantineAffinityInvalidations atomic.Uint64
 	stickyFlowsRetired              atomic.Uint64
+	// Performance-aware affinity learns from TLS-blind inner-TCP ACK
+	// progress. Samples counts completed measurements, donorBypasses counts
+	// fresh-flow affinity decisions released to the race, and candidatesFiltered
+	// counts low-posterior exits removed from those fresh races.
+	affinityPerformanceSamples            atomic.Uint64
+	affinityPerformanceDonorBypasses      atomic.Uint64
+	affinityPerformanceCandidatesFiltered atomic.Uint64
 
 	// a blackhole verdict is only as good as the evidence it is built on, and
 	// two conditions make the evidence inadmissible: the local uplink went
@@ -333,6 +340,27 @@ func (self *reliabilityMetrics) stickyFlowRetired() {
 		return
 	}
 	self.stickyFlowsRetired.Add(1)
+}
+
+func (self *reliabilityMetrics) affinityPerformanceSample() {
+	if self == nil {
+		return
+	}
+	self.affinityPerformanceSamples.Add(1)
+}
+
+func (self *reliabilityMetrics) affinityPerformanceDonorBypass() {
+	if self == nil {
+		return
+	}
+	self.affinityPerformanceDonorBypasses.Add(1)
+}
+
+func (self *reliabilityMetrics) affinityPerformanceCandidatesRemoved(count int) {
+	if self == nil || count <= 0 {
+		return
+	}
+	self.affinityPerformanceCandidatesFiltered.Add(uint64(count))
 }
 
 func (self *reliabilityMetrics) probeAnswered() {
@@ -563,6 +591,9 @@ func (self *reliabilityMetrics) reset() {
 	self.quarantineTcpResets.Store(0)
 	self.quarantineAffinityInvalidations.Store(0)
 	self.stickyFlowsRetired.Store(0)
+	self.affinityPerformanceSamples.Store(0)
+	self.affinityPerformanceDonorBypasses.Store(0)
+	self.affinityPerformanceCandidatesFiltered.Store(0)
 	self.verdictsHeldUplinkStale.Store(0)
 	self.verdictsHeldSharedFate.Store(0)
 	self.verdictsHeldTransportDown.Store(0)
@@ -621,9 +652,12 @@ type ReliabilityMetricsSnapshot struct {
 	RebindsAccepted uint64
 	RebindsRedialed uint64
 
-	QuarantineTcpResets             uint64
-	QuarantineAffinityInvalidations uint64
-	StickyFlowsRetired              uint64
+	QuarantineTcpResets                   uint64
+	QuarantineAffinityInvalidations       uint64
+	StickyFlowsRetired                    uint64
+	AffinityPerformanceSamples            uint64
+	AffinityPerformanceDonorBypasses      uint64
+	AffinityPerformanceCandidatesFiltered uint64
 
 	// VerdictsHeldUplinkStale and VerdictsHeldTransportDown count blackhole
 	// verdicts suppressed because the evidence was inadmissible (the local
@@ -683,9 +717,12 @@ func (self *reliabilityMetrics) snapshot() *ReliabilityMetricsSnapshot {
 		RebindsAccepted: self.rebindsAccepted.Load(),
 		RebindsRedialed: self.rebindsRedialed.Load(),
 
-		QuarantineTcpResets:             self.quarantineTcpResets.Load(),
-		QuarantineAffinityInvalidations: self.quarantineAffinityInvalidations.Load(),
-		StickyFlowsRetired:              self.stickyFlowsRetired.Load(),
+		QuarantineTcpResets:                   self.quarantineTcpResets.Load(),
+		QuarantineAffinityInvalidations:       self.quarantineAffinityInvalidations.Load(),
+		StickyFlowsRetired:                    self.stickyFlowsRetired.Load(),
+		AffinityPerformanceSamples:            self.affinityPerformanceSamples.Load(),
+		AffinityPerformanceDonorBypasses:      self.affinityPerformanceDonorBypasses.Load(),
+		AffinityPerformanceCandidatesFiltered: self.affinityPerformanceCandidatesFiltered.Load(),
 
 		VerdictsHeldUplinkStale:   self.verdictsHeldUplinkStale.Load(),
 		VerdictsHeldSharedFate:    self.verdictsHeldSharedFate.Load(),

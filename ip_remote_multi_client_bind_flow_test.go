@@ -11,6 +11,10 @@ import (
 
 func bindFlowTestParent() *RemoteUserNatMultiClient {
 	settings := DefaultMultiClientSettings()
+	// This helper exercises the legacy donor mechanics themselves. Production
+	// defaults ordinary fresh flows to the race; tests for that default use an
+	// unmodified settings value explicitly below.
+	settings.FreshFlowAffinity = true
 	return &RemoteUserNatMultiClient{
 		settings:      settings,
 		clientUpdates: map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
@@ -237,6 +241,59 @@ func TestAffinityInheritanceIsStickyPastTheFlowCap(t *testing.T) {
 	parent.stateLock.Unlock()
 	if vetoed.client.Load() != nil {
 		t.Error("with the veto restored, a donor at cap still donated")
+	}
+}
+
+// Ordinary fresh flows must reach the provider race by default. A live page
+// connection is useful performance evidence, but it must not be a hard route
+// assignment for a later media connection. Explicit pins are the opt-in to
+// stable one-egress behavior.
+func TestFreshFlowAffinityDefaultsToRaceAndExplicitPinStillInherits(t *testing.T) {
+	settings := DefaultMultiClientSettings()
+	if settings.FreshFlowAffinity {
+		t.Fatal("FreshFlowAffinity must default off")
+	}
+	if ReliabilitySettingsFrom(settings).FreshFlowAffinity {
+		t.Fatal("default reliability projection unexpectedly enabled fresh-flow affinity")
+	}
+
+	parent := bindFlowTestParent()
+	parent.settings = settings
+	parent.ip4PathUpdates = map[Ip4Path]*multiClientChannelUpdate{}
+	donor := bindFlowTestChannel(parent)
+	donorPath := affinityPerformanceTestPath(43990)
+	donorUpdate := newMultiClientChannelUpdate(context.Background(), donorPath)
+	defer donorUpdate.Close()
+	donorUpdate.client.Store(donor)
+	donorKey := donorPath.ToIp4Path()
+	parent.ip4PathUpdates[donorKey] = donorUpdate
+	donorPaths := map[Ip4Path]time.Time{donorKey: time.Now()}
+
+	fresh := newMultiClientChannelUpdate(context.Background(), affinityPerformanceTestPath(43991))
+	defer fresh.Close()
+	parent.stateLock.Lock()
+	verdict, scattered := parent.inheritAffinityClient4WithLock(fresh, donorPaths)
+	parent.stateLock.Unlock()
+	if verdict != donorRefused || scattered || fresh.client.Load() != nil {
+		t.Fatal("ordinary fresh flow inherited a site/IP donor instead of reaching the provider race")
+	}
+	if donorUpdate.client.Load() != donor || donorUpdate.IsDone() {
+		t.Fatal("disabling fresh inheritance disturbed the established donor flow")
+	}
+
+	pinned := newMultiClientChannelUpdate(context.Background(), affinityPerformanceTestPath(43992))
+	defer pinned.Close()
+	pinned.pinned = true
+	parent.stateLock.Lock()
+	verdict, _ = parent.inheritAffinityClient4WithLock(pinned, donorPaths)
+	parent.stateLock.Unlock()
+	if verdict == donorRefused || pinned.client.Load() != donor {
+		t.Fatal("explicit pin did not opt back into stable-exit inheritance")
+	}
+
+	settings.FreshFlowAffinity = true
+	if !ReliabilitySettingsFrom(settings).FreshFlowAffinity {
+		t.Fatal("set FreshFlowAffinity was dropped by the reliability projection")
 	}
 }
 
@@ -795,6 +852,9 @@ func TestAffinityNameCollapsesCdnConstellations(t *testing.T) {
 	}
 	if got := affinityNameForServerName("i.ytimg.com"); got != "youtube.com" {
 		t.Errorf("ytimg collapsed to %q, want youtube.com", got)
+	}
+	if got := affinityNameForServerName("assets.bwbx.io"); got != "bloomberg.com" {
+		t.Errorf("Bloomberg media collapsed to %q, want bloomberg.com", got)
 	}
 	// a site outside the table gets base-domain collapse and nothing else
 	if got := affinityNameForServerName("b.c.example.com"); got != "example.com" {

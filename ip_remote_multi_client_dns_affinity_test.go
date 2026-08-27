@@ -5,10 +5,14 @@ import (
 	"net"
 	"net/netip"
 	"testing"
+	"time"
 )
 
 func dnsAffinityTestParent() *RemoteUserNatMultiClient {
 	settings := DefaultMultiClientSettings()
+	// These fixtures test the legacy DNS-donor mechanism. Production leaves
+	// hard fresh-flow inheritance off unless an explicit pin requests it.
+	settings.FreshFlowAffinity = true
 	settings.Log = NewNoopLogger()
 	return &RemoteUserNatMultiClient{
 		settings:                   settings,
@@ -34,6 +38,65 @@ func bindDnsAffinityTestFlow(
 		parent.ip6PathUpdates[path.ToIp6Path()] = update
 	}
 	return update
+}
+
+func TestDnsExitHintDoesNotHardBindOrdinaryFreshFlowByDefault(t *testing.T) {
+	parent := dnsAffinityTestParent()
+	parent.settings.FreshFlowAffinity = false
+	exit := &multiClientChannel{ctx: context.Background(), settings: parent.settings}
+	address := netip.MustParseAddr("203.0.113.24")
+	affinityName := affinityNameForServerName("video.example.test")
+	dohPath := destinationServiceTestPath(4, "1.1.1.1", 443)
+	dohUpdate := bindDnsAffinityTestFlow(parent, exit, dohPath)
+	defer dohUpdate.Close()
+	if parent.bindDnsResultToExit(dohPath, "video.example.test", []netip.Addr{address}) {
+		t.Fatal("disabled fresh-flow affinity retained a DNS-exit hint")
+	}
+	if len(parent.dnsExitHints) != 0 || len(parent.dnsAddressExitHints) != 0 {
+		t.Fatal("disabled DNS-exit affinity retained provider channel state")
+	}
+
+	// Inject one legacy hint to prove the read path independently honors the
+	// default-off policy (including state restored by an older build).
+	parent.dnsAddressExitHints[address] = dnsExitHint{
+		client: exit, affinityName: affinityName, createTime: time.Now(),
+	}
+
+	path := destinationServiceTestPath(4, address.String(), 443)
+	update := newMultiClientChannelUpdate(context.Background(), path)
+	defer update.Close()
+	parent.stateLock.Lock()
+	bound := parent.inheritDnsExitHintWithLock(update, path, []*IpPath{{ServerName: affinityName}})
+	parent.stateLock.Unlock()
+	if bound || update.client.Load() != nil {
+		t.Fatal("ordinary fresh TLS flow hard-bound to its resolver exit")
+	}
+
+	update.pinned = true
+	parent.stateLock.Lock()
+	bound = parent.inheritDnsExitHintWithLock(update, path, []*IpPath{{ServerName: affinityName}})
+	parent.stateLock.Unlock()
+	if !bound || update.client.Load() != exit {
+		t.Fatal("explicitly pinned flow did not retain DNS-exit affinity")
+	}
+}
+
+func TestDisablingFreshFlowAffinityReleasesDnsChannelHints(t *testing.T) {
+	parent := dnsAffinityTestParent()
+	exit := &multiClientChannel{ctx: context.Background(), settings: parent.settings}
+	parent.dnsExitHints["example.test"] = dnsExitHint{
+		client: exit, affinityName: "example.test", createTime: time.Now(),
+	}
+	parent.dnsAddressExitHints[netip.MustParseAddr("203.0.113.29")] = dnsExitHint{
+		client: exit, affinityName: "example.test", createTime: time.Now(),
+	}
+
+	override := ReliabilitySettingsFrom(parent.settings)
+	override.FreshFlowAffinity = false
+	parent.SetReliabilitySettings(override)
+	if len(parent.dnsExitHints) != 0 || len(parent.dnsAddressExitHints) != 0 {
+		t.Fatal("disabling hard fresh affinity retained DNS provider references")
+	}
 }
 
 func TestDnsAnswerUsesTheExitThatResolvedItsAddress(t *testing.T) {

@@ -177,6 +177,8 @@ var serverNameSuffixTable = []serverNameSuffixEntry{
 	{"spotify.com", ClassStreaming},
 	{"scdn.co", ClassStreaming},
 	{"primevideo.com", ClassStreaming},
+	{"bloomberg.com", ClassStreaming},
+	{"bwbx.io", ClassStreaming},
 
 	// bulk: large-transfer / distribution
 	{"steampowered.com", ClassBulk},

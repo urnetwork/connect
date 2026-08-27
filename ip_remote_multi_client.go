@@ -71,6 +71,15 @@ type dialFailureFunction func(sourceClient *multiClientChannel, egressIpPath *Ip
 type DestinationStats struct {
 	EstimatedBytesPerSecond ByteCount
 	Tier                    int
+	// NetworkOnly identifies a provider that the server admitted because it
+	// belongs to the caller's own network. Auto routing may prefer one for a
+	// fresh web/media session only when its measured quality is fast enough;
+	// it never changes an established flow's exit.
+	NetworkOnly bool
+	// ReputationFailures is the normalized, bounded set of domains/vendor
+	// labels rejected by the provider's external reputation probes. It is
+	// discovery metadata only: Connect never inspects encrypted HTTP status.
+	ReputationFailures []string
 	// Location is the destination (egress) provider's location from
 	// find-providers2. nil for fixed client-id and restored-identity
 	// destinations, which bypass discovery.
@@ -185,8 +194,16 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		BlackholeTimeout:        5 * time.Second,
 		BlackholeReceiveTimeout: 20 * time.Second,
 		MaxFlowsPerExit:         16,
-		// a site keeps its exit as it grows; see the field comment
+		// Legacy/explicit affinity keeps its exit as it grows; ordinary fresh
+		// flows race by default (FreshFlowAffinity is false).
 		AffinityStickyPastCap: true,
+		// Ordinary fresh flows do not inherit a site/IP donor. Affinity state is
+		// still collected as a bounded measurement key, and explicit app/host
+		// pins remain strict opt-ins to one-egress behavior.
+		FreshFlowAffinity: false,
+		// Fresh TLS races learn from peak inner-TCP ACK progress relative to
+		// each provider's advertised bandwidth prior.
+		PerformanceAwareAffinity: true,
 		// Sticky sites retain one egress IP, but idle H1 state is trimmed once
 		// the site has grown well beyond an ordinary browser connection set.
 		MaxStickyFlowsPerExit: 64,
@@ -571,11 +588,10 @@ type MultiClientSettings struct {
 	// placed anyway.
 	MaxFlowsPerExit int
 
-	// AffinityStickyPastCap exempts affinity-group inheritance from the flow
-	// cap: a new flow whose site already lives on an exit stays on that exit
-	// even when the exit is past MaxFlowsPerExit. The cap still gates every
-	// race and rebind placement, so an exit can only exceed it by the growth
-	// of the sites it already hosts -- never by collecting new ones.
+	// AffinityStickyPastCap exempts hard affinity-group inheritance from the
+	// flow cap. It applies to explicit pins and legacy A/B runs with
+	// FreshFlowAffinity enabled; ordinary production flows race and remain
+	// capped normally.
 	//
 	// This exists because the cap veto was observed splitting a busy site's
 	// egress ip exactly when the site was busiest: flow 17 of a video session
@@ -588,10 +604,39 @@ type MultiClientSettings struct {
 	// false restores the veto, the A/B comparison point.
 	AffinityStickyPastCap bool
 
+	// FreshFlowAffinity lets an ordinary NEW flow directly inherit the exit of
+	// another flow in the same IP/domain affinity group. Existing flows never
+	// use this switch: their exact TCP/UDP tuple remains on its committed exit.
+	// Explicit app/host pins also bypass it because the user selected stable
+	// egress semantics for those flows.
+	//
+	// The production default is false. With hard inheritance disabled, each
+	// fresh flow reaches the health- and performance-weighted provider race,
+	// preventing one long-lived page connection from pinning every later media
+	// connection to the same mediocre or challenged exit. DestinationAffinity
+	// may remain enabled: its bounded groups are still useful measurement keys
+	// and do not themselves assign an exit. True restores legacy hard site/IP
+	// affinity for controlled A/B tests.
+	FreshFlowAffinity bool
+
+	// PerformanceAwareAffinity weights fresh TCP/443 placement using a bounded,
+	// session-local peak rate from cumulative inner-TCP ACK progress. An
+	// unmeasured provider starts at its advertised EstimatedBytesPerSecond (the
+	// null hypothesis). The score removes materially slower candidates from a
+	// fresh full-field race while preserving equal candidates and failing open.
+	// When FreshFlowAffinity is explicitly enabled for an A/B run, the same
+	// score also vetoes a materially slow live/history donor.
+	//
+	// This never moves an established flow, never inspects TLS plaintext, and
+	// does not apply to explicit app pins. The measurement table is bounded and
+	// expires quickly; false or stale evidence therefore cannot become a
+	// permanent provider ban. False restores unconditional affinity.
+	PerformanceAwareAffinity bool
+
 	// MaxStickyFlowsPerExit is the steady-state bound for an exit that grows
-	// past MaxFlowsPerExit through affinity inheritance. It does not split the
-	// site's egress IP: when the bound is exceeded, the shared flow reaper
-	// retires only the oldest TCP flows that have been idle for at least
+	// past MaxFlowsPerExit through explicit or legacy hard affinity. It does not
+	// split that affinity group: when the bound is exceeded, the shared flow
+	// reaper retires only the oldest TCP flows that have been idle for at least
 	// StickyFlowIdleTimeout. Active bursts may exceed the bound temporarily;
 	// preserving an in-flight request is preferable to enforcing a numeric cap
 	// by resetting useful work. 0 disables sticky-flow trimming.
@@ -608,14 +653,17 @@ type MultiClientSettings struct {
 	// configured.
 	StickyFlowIdleTimeout time.Duration
 
-	// ScoredAffinityDonor makes the learner load-bearing on the placement
-	// path that actually carries most flows.
+	// ScoredAffinityDonor makes the learner load-bearing on the legacy hard
+	// affinity path. It is inert for ordinary production flows while
+	// FreshFlowAffinity is false, but remains available for controlled A/B runs
+	// and still applies to explicit affinity groups.
 	//
 	// READ THIS WITH scoredPlacementReorder's header. That function scores
 	// the RACE field, and the race is the LAST of four placement steps in
-	// sendUpdate -- reached only when the flow's own affinity groups, its
-	// app pin, and the destination bridge have all declined to donate. Most
-	// flows never get there. The step that does carry them,
+	// sendUpdate -- reached only when the flow's own hard affinity groups, its
+	// app pin, and the destination bridge have all declined to donate. With
+	// legacy FreshFlowAffinity enabled, most flows never get there. The step
+	// that carries them in that mode,
 	// inheritAffinityClient{4,6}WithLock, picked its donor by
 	// `createTime.After(mostRecentCreateTime)`: pure recency, with no
 	// quality signal of any kind. So the learner could observe everything
@@ -756,10 +804,10 @@ type MultiClientSettings struct {
 
 	ProtocolVersion int
 
-	// note destination affinity will affect retry with different source ports
-	// it relies on the performance of the initial race being good enough,
-	// and all-or-nothing bad clients where if one destination does not route via a client,
-	// all destinations should not route, so that the client can be detected as unhealthy
+	// DestinationAffinity creates bounded IP/domain grouping state. With the
+	// default FreshFlowAffinity=false those groups are measurement keys only;
+	// they do not assign ordinary new flows. Explicit pins and controlled
+	// legacy A/B runs may still consume them as hard affinity.
 	DestinationAffinity bool
 
 	DefaultPerformanceProfile *PerformanceProfile
@@ -1386,6 +1434,15 @@ type RemoteUserNatMultiClient struct {
 	// See demotionObserve and demotionKey's own doc for the keying rationale.
 	demotionStates map[demotionKey]*demotionState
 
+	// affinityPerformance is the bounded session-local per-(site/IP,provider)
+	// completed TCP ACK-rate evidence used to weight a fresh provider race (and
+	// to veto a legacy hard donor in A/B mode). Its leaf lock is never held
+	// across parent/window locks or I/O. The map stays nil until the first
+	// completed measured flow; still-open evidence uses clientUpdates directly
+	// and retains no second index.
+	affinityPerformanceLock sync.Mutex
+	affinityPerformance     map[affinityPerformanceKey]*affinityPerformanceEntry
+
 	// config is an immutable snapshot of the rarely-changed routing config
 	// (performance profile + local security bypass). it is rebuilt under
 	// stateLock by the setters and read lock-free by selectWindowTypes, the
@@ -1869,7 +1926,10 @@ func providerIdentity(client *multiClientChannel) (Id, bool) {
 	if destination.Len() == 0 {
 		return Id{}, false
 	}
-	return destination.Tail(), true
+	// The length check above already proves Tail's precondition. Read the
+	// comparable value directly so the compiler does not materialize Tail's
+	// defensive panic error on this placement-hot path.
+	return destination.ids[destination.len-1], true
 }
 
 // recordFlowReward is the reward tap's per-flow half: called once a flow has
@@ -2281,8 +2341,6 @@ func NewRemoteUserNatMultiClient(
 		clientUpdates:              map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
 		qualification:              map[MultiHopId]*providerQualification{},
 		destinationServiceFailures: map[destinationServiceFailureKey]destinationServiceFailure{},
-		dnsExitHints:               map[string]dnsExitHint{},
-		dnsAddressExitHints:        map[netip.Addr]dnsExitHint{},
 		localUserNat:               localUserNat,
 		blockActionCache:           newBlockActionCache(settings.BlockActionDecisionTtl, settings.BlockActionDecisionMaxCount),
 		blockActionCollector:       newBlockActionCollector(settings.BlockActionAggMaxCount, log),
@@ -2752,7 +2810,7 @@ func (self *RemoteUserNatMultiClient) LocalSecurityBypass() bool {
 }
 
 // ordered by choice descending
-func (self *RemoteUserNatMultiClient) selectWindowTypes(sendPacket *parsedPacket) []WindowType {
+func (self *RemoteUserNatMultiClient) selectWindowTypes(sendPacket *parsedPacket, appId string) []WindowType {
 	// - web traffic is routed to quality providers
 	// - all other traffic is routed to speed providers
 
@@ -2763,7 +2821,15 @@ func (self *RemoteUserNatMultiClient) selectWindowTypes(sendPacket *parsedPacket
 	if windowType, _, ok := self.config.Load().performanceProfile.FixedWindow(); ok {
 		return []WindowType{windowType}
 	} else {
-		if sendPacket.ipPath.DestinationPort == 443 {
+		// HTTPS remains quality-first even with no classifier. A classifier can
+		// additionally identify streaming carried on another port (or by a
+		// streaming app), which needs the same low-stall quality window rather
+		// than the bulk-oriented speed window.
+		flowClass := ClassUnknown
+		if p := self.flowClassifier.Load(); p != nil {
+			flowClass = classifyOrUnknown(*p, sendPacket.ipPath, appId).Class
+		}
+		if sendPacket.ipPath.DestinationPort == 443 || flowClass == ClassStreaming {
 			return []WindowType{WindowTypeQuality, WindowTypeSpeed}
 		}
 		return []WindowType{WindowTypeSpeed, WindowTypeQuality}
@@ -2788,6 +2854,8 @@ type ReliabilitySettings struct {
 	BlackholeReceiveTimeout  time.Duration
 	MaxFlowsPerExit          int
 	AffinityStickyPastCap    bool
+	FreshFlowAffinity        bool
+	PerformanceAwareAffinity bool
 	MaxStickyFlowsPerExit    int
 	StickyFlowIdleTimeout    time.Duration
 	ScoredAffinityDonor      bool
@@ -2874,6 +2942,8 @@ func ReliabilitySettingsFrom(settings *MultiClientSettings) *ReliabilitySettings
 		BlackholeReceiveTimeout:    settings.BlackholeReceiveTimeout,
 		MaxFlowsPerExit:            settings.MaxFlowsPerExit,
 		AffinityStickyPastCap:      settings.AffinityStickyPastCap,
+		FreshFlowAffinity:          settings.FreshFlowAffinity,
+		PerformanceAwareAffinity:   settings.PerformanceAwareAffinity,
 		MaxStickyFlowsPerExit:      settings.MaxStickyFlowsPerExit,
 		StickyFlowIdleTimeout:      settings.StickyFlowIdleTimeout,
 		ScoredAffinityDonor:        settings.ScoredAffinityDonor,
@@ -2933,6 +3003,53 @@ func (self *RemoteUserNatMultiClient) reliabilitySettings() *ReliabilitySettings
 	return ReliabilitySettingsFrom(self.settings)
 }
 
+// rebuildAffinityDonorIndexesWithLock changes only the reverse donor indexes.
+// Every update keeps its small local group keys for performance measurement,
+// so a rare developer A/B toggle can make the legacy mode immediately exact
+// without retaining ordinary reverse entries while that mode is off.
+//
+// called with stateLock
+func (self *RemoteUserNatMultiClient) rebuildAffinityDonorIndexesWithLock(includeOrdinary bool) {
+	ip4 := map[Ip4Path]map[Ip4Path]time.Time{}
+	for path, update := range self.ip4PathUpdates {
+		if update == nil || update.IsDone() || (!includeOrdinary && !update.pinned) {
+			continue
+		}
+		createTime := update.activityTime
+		if createTime.IsZero() {
+			createTime = update.openTime
+		}
+		for affinityPath := range update.affinityIp4Paths {
+			paths := ip4[affinityPath]
+			if paths == nil {
+				paths = map[Ip4Path]time.Time{}
+				ip4[affinityPath] = paths
+			}
+			paths[path] = createTime
+		}
+	}
+	ip6 := map[Ip6Path]map[Ip6Path]time.Time{}
+	for path, update := range self.ip6PathUpdates {
+		if update == nil || update.IsDone() || (!includeOrdinary && !update.pinned) {
+			continue
+		}
+		createTime := update.activityTime
+		if createTime.IsZero() {
+			createTime = update.openTime
+		}
+		for affinityPath := range update.affinityIp6Paths {
+			paths := ip6[affinityPath]
+			if paths == nil {
+				paths = map[Ip6Path]time.Time{}
+				ip6[affinityPath] = paths
+			}
+			paths[path] = createTime
+		}
+	}
+	self.affinityIp4Paths = ip4
+	self.affinityIp6Paths = ip6
+}
+
 // scoredPlacementEnabled is the single gate the placement path checks. When
 // false (the zero value, and every current build's default) selection is
 // exactly today's; nothing in this file's new routing code runs. See the
@@ -2955,8 +3072,8 @@ func scoredPlacementEnabled(r *ReliabilitySettings) bool {
 // configurations (before and after the store), so clearing an override logs the
 // restoration rather than a misleading "everything went to zero".
 //
-// LightClassifier is the one knob among these that this function must do more
-// than report on. Every other field here is read fresh from
+// LightClassifier and FreshFlowAffinity are the two knobs this function must
+// do more than report on. Every other field here is read fresh from
 // reliabilitySettings() at the point it is consulted (e.g.
 // scoredPlacementEnabled, benchDuration), so swapping the override is the
 // whole story for them. LightClassifier instead gates whether an *object* --
@@ -2971,6 +3088,10 @@ func scoredPlacementEnabled(r *ReliabilitySettings) bool {
 // construction (maybeInstallLightClassifier, called once from
 // NewRemoteUserNatMultiClient) is unaffected by this and stays as the first
 // install for a session that starts with the knob already on.
+// FreshFlowAffinity is still read directly on placement, but its enabled mode
+// retains DNS-exit channel hints. A true->false edge clears those references
+// after releasing the settings leaf lock; otherwise disabling hard affinity
+// could retain an hour of state that no production decision will consume.
 //
 // Lock discipline: reliabilitySettingsLock, a dedicated leaf mutex, is held
 // ONLY across the before/store/after/classifier-swap sequence below -- two
@@ -3000,6 +3121,7 @@ func (self *RemoteUserNatMultiClient) SetReliabilitySettings(reliabilitySettings
 	after := self.reliabilitySettings()
 
 	classifierChanged := before.LightClassifier != after.LightClassifier
+	hardAffinityChanged := before.FreshFlowAffinity != after.FreshFlowAffinity
 	if classifierChanged {
 		if after.LightClassifier {
 			self.setFlowClassifierUnlogged(NewLightClassifier(self.serverNameResolver))
@@ -3008,6 +3130,15 @@ func (self *RemoteUserNatMultiClient) SetReliabilitySettings(reliabilitySettings
 		}
 	}
 	self.reliabilitySettingsLock.Unlock()
+	if hardAffinityChanged {
+		self.stateLock.Lock()
+		if !after.FreshFlowAffinity {
+			clear(self.dnsExitHints)
+			clear(self.dnsAddressExitHints)
+		}
+		self.rebuildAffinityDonorIndexesWithLock(after.FreshFlowAffinity)
+		self.stateLock.Unlock()
+	}
 	// SequenceIdleTimeout and TcpSequenceIdleTimeout are runtime reliability
 	// knobs. Wake the shared reaper so a shorter override applies immediately;
 	// a longer one is harmlessly rechecked before any flow is detached.
@@ -3395,13 +3526,12 @@ var demotionLogThrottle = newLogThrottle(classifyLogInterval)
 // that influence by spending a guard, over the minority of flows that race
 // at all.
 //
-// The learner is instead made load-bearing where the flows actually are:
-// ScoredAffinityDonor, on inheritAffinityClient{4,6}WithLock -- the FIRST of
-// sendUpdate's four placement steps, and the one that places most flows.
-// That knob costs no guard (MaxFlowsPerExit still gates the affinity path)
-// and cannot break site egress-ip consistency (its comparison only decides
-// anything for a group already spread across several exits). See its field
-// comment for the full argument.
+// In legacy FreshFlowAffinity A/B mode, the learner is instead made
+// load-bearing at ScoredAffinityDonor, on
+// inheritAffinityClient{4,6}WithLock. With the production default off,
+// ordinary fresh flows skip that hard-donor step and reach this full race;
+// explicit pins retain their requested stable-exit semantics. See the two
+// settings' field comments for the full argument.
 //
 // classifyOrUnknown is nil-safe, so an unset flowClassifier (every build by
 // default -- LightClassifier, Task 2's install knob, is zero-value-off)
@@ -3772,6 +3902,13 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *mul
 	// group's egress ip is worth more than the cap, which continues to gate
 	// every placement that would put a NEW site on the exit
 	reliabilitySettings := self.reliabilitySettings()
+	if update == nil || (!update.pinned && !reliabilitySettings.FreshFlowAffinity) {
+		// Ordinary fresh flows race. The group remains registered so completed
+		// flows can contribute bounded IP/domain performance evidence, but a
+		// live page connection is no longer a hard placement shortcut for a
+		// later media connection.
+		return donorRefused, false
+	}
 	sticky := reliabilitySettings.AffinityStickyPastCap
 	follow := reliabilitySettings.QuarantineGroupFollow
 	window := reliabilitySettings.GroupFollowWindow
@@ -3808,6 +3945,9 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *mul
 		}
 		switch verdict := c.affinityDonorEligible(follow, window); verdict {
 		case donorEligible, donorQuarantineFollowed:
+			if !update.pinned && !self.affinityPerformanceAllowsFlowDonor(c, copyUpdate, update.ipPath) {
+				continue
+			}
 			// donorQuarantineFollowed is the G-1 follow: a benched
 			// donor inside the follow window keeps its own site
 			bias, providerId := 0.0, ""
@@ -3841,6 +3981,9 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient6WithLock(update *mul
 	// see inheritAffinityClient4WithLock for the sticky, follow, pin, and
 	// caller-side-counting rationale
 	reliabilitySettings := self.reliabilitySettings()
+	if update == nil || (!update.pinned && !reliabilitySettings.FreshFlowAffinity) {
+		return donorRefused, false
+	}
 	sticky := reliabilitySettings.AffinityStickyPastCap
 	follow := reliabilitySettings.QuarantineGroupFollow
 	window := reliabilitySettings.GroupFollowWindow
@@ -3867,6 +4010,9 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient6WithLock(update *mul
 		}
 		switch verdict := c.affinityDonorEligible(follow, window); verdict {
 		case donorEligible, donorQuarantineFollowed:
+			if !update.pinned && !self.affinityPerformanceAllowsFlowDonor(c, copyUpdate, update.ipPath) {
+				continue
+			}
 			bias, providerId := 0.0, ""
 			if scored {
 				bias = self.affinityDonorBias(c)
@@ -3903,16 +4049,12 @@ func (self *RemoteUserNatMultiClient) bookGroupLedger(placed bool, followWinner 
 	}
 }
 
-// domainAffinityAliases collapses the cdn constellations one service operates
-// onto a single affinity name, because the service binds state ACROSS its
-// domains: a video player fetches its manifest from the site domain and its
-// media from the cdn domain, and the signed media urls carry the client ip
-// the manifest was fetched from. With the constellation split across exits
-// the media requests present the wrong egress ip and are rejected -- observed
-// as players stalling and rebuffering behind the tunnel while direct traffic
-// plays fine. One group, one exit, one egress ip is the fix, at the accepted
-// cost that a heavy service's whole constellation grows on a single exit
-// (which is exactly what AffinityStickyPastCap permits).
+// domainAffinityAliases collapses the CDN constellations one service operates
+// onto one bounded measurement group. With ordinary hard affinity disabled by
+// default, this lets a weak media endpoint inform the next fresh connection
+// without pinning the constellation to its page connection. Explicit pins and
+// legacy FreshFlowAffinity A/B runs also use the canonical key when stable
+// one-egress semantics are intentionally requested.
 //
 // Values must be canonical (never themselves keys); the anchor test walks the
 // table.
@@ -3937,6 +4079,11 @@ var domainAffinityAliases = map[string]string{
 	"nflxvideo.net": "netflix.com",
 	"nflximg.net":   "netflix.com",
 	"nflxso.net":    "netflix.com",
+	// bloomberg: player assets and manifests are served across the publisher
+	// domain and its bwbx media/static constellation. Share bounded performance
+	// evidence by default; only an explicit pin or legacy A/B mode hard-binds
+	// the group to one egress IP.
+	"bwbx.io": "bloomberg.com",
 	// twitch
 	"ttvnw.net": "twitch.tv",
 	"jtvnw.net": "twitch.tv",
@@ -3952,8 +4099,8 @@ var domainAffinityAliases = map[string]string{
 
 // affinityNameForServerName is the one place a server name becomes an affinity
 // group name: base domain (a.foo.com, b.c.foo.com and foo.com all collapse to
-// foo.com), then the constellation alias, so a site's flows -- and its cdn's
-// -- pin to one client channel.
+// foo.com), then the constellation alias. It is a measurement key by default
+// and a hard-placement key only for explicit or legacy affinity.
 func affinityNameForServerName(serverName string) string {
 	affinityName := serverName
 	if rootDomain, err := publicsuffix.EffectiveTLDPlusOne(serverName); err == nil {
@@ -4274,6 +4421,7 @@ func (self *RemoteUserNatMultiClient) finishRetiredFlows(retired []retiredMultiC
 			self.reliabilityMetrics.stickyFlowRetired()
 		}
 		if flow.client != nil {
+			self.recordAffinityPerformance(flow.update, flow.client)
 			self.recordFlowReward(flow.update.ipPath, flow.update.pinAppId, flow.client, flow.client.flowCount())
 		}
 		if flow.shouldSignal && self.ctx.Err() == nil {
@@ -4294,6 +4442,9 @@ func (self *RemoteUserNatMultiClient) finishRetiredFlows(retired []retiredMultiC
 // is the useful half: it makes H1 retry immediately on a fresh flow.
 func (self *RemoteUserNatMultiClient) finishQuarantinedTcpFlows(retired []retiredMultiClientFlow) {
 	for _, flow := range retired {
+		if flow.client != nil {
+			self.recordAffinityPerformance(flow.update, flow.client)
+		}
 		if self.ctx != nil && self.ctx.Err() == nil {
 			if packet, ok := self.teardownSourcePacket(flow.update.ipPath, flow.update.sourceRstSequence()); ok {
 				self.enqueueRemovalReceive(&receivePacket{
@@ -4447,15 +4598,14 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 			// follow window (see inheritAffinityClient4WithLock).
 			update.pinned = pin.pinned()
 			update.pinAppId = pin.appId
+			hardAffinity := update.pinned || self.reliabilitySettings().FreshFlowAffinity
 			if pin.appId != "" {
 				affinityIpPaths = []*IpPath{{ServerName: appAffinityName(pin.appId)}}
 			}
-			// A tunneled DNS answer is topology-sensitive: for an unpinned
-			// flow, its exact resolver exit outranks an older hostname donor.
-			// The flow still joins its ordinary groups below, but those groups
-			// cannot silently move the first connection away from the egress
-			// location that produced its A/AAAA answer.
-			if pin.appId == "" {
+			// DNS topology is a hard placement input only for explicit pins or
+			// the legacy A/B mode. Ordinary fresh flows skip the lookup and
+			// reach the provider race.
+			if pin.appId == "" && hardAffinity {
 				self.inheritDnsExitHintWithLock(update, ipPath, affinityIpPaths)
 			}
 
@@ -4463,6 +4613,12 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 			for _, affinityIpPath := range affinityIpPaths {
 				affinityIp4Path := affinityIpPath.ToIp4Path()
 				update.affinityIp4Paths[affinityIp4Path] = true
+				if !hardAffinity {
+					// Retain only the update-local measurement key. The
+					// reverse donor index would consume map entries and a
+					// timestamp while no production decision can read it.
+					continue
+				}
 				paths, ok := self.affinityIp4Paths[affinityIp4Path]
 				if !ok {
 					paths = map[Ip4Path]time.Time{}
@@ -4503,7 +4659,7 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 			// joining them, so this flow converges onto the exit already in
 			// use. NOT for an app-pinned flow: its placement is the app's,
 			// and a destination bridge would hand it a stranger's exit.
-			if update.client.Load() == nil && pin.appId == "" {
+			if hardAffinity && update.client.Load() == nil && pin.appId == "" {
 				for _, fallbackIpPath := range self.affinityFallbackIpPathsWithLock(ipPath) {
 					fallbackIp4Path := fallbackIpPath.ToIp4Path()
 					if update.affinityIp4Paths[fallbackIp4Path] {
@@ -4554,12 +4710,12 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 			// see the v4 twin for the pin rationale
 			update.pinned = pin.pinned()
 			update.pinAppId = pin.appId
+			hardAffinity := update.pinned || self.reliabilitySettings().FreshFlowAffinity
 			if pin.appId != "" {
 				affinityIpPaths = []*IpPath{{ServerName: appAffinityName(pin.appId)}}
 			}
-			// See the v4 twin: DNS topology outranks older domain affinity for
-			// unpinned flows, while the explicit app pin remains authoritative.
-			if pin.appId == "" {
+			// See the v4 twin: ordinary flows skip hard DNS placement.
+			if pin.appId == "" && hardAffinity {
 				self.inheritDnsExitHintWithLock(update, ipPath, affinityIpPaths)
 			}
 
@@ -4567,6 +4723,9 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 			for _, affinityIpPath := range affinityIpPaths {
 				affinityIp6Path := affinityIpPath.ToIp6Path()
 				update.affinityIp6Paths[affinityIp6Path] = true
+				if !hardAffinity {
+					continue
+				}
 				paths, ok := self.affinityIp6Paths[affinityIp6Path]
 				if !ok {
 					paths = map[Ip6Path]time.Time{}
@@ -4599,7 +4758,7 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 			// before the server name was learned -- read those groups without
 			// joining them, so this flow converges onto the exit already in
 			// use. NOT for an app-pinned flow; see the v4 twin.
-			if update.client.Load() == nil && pin.appId == "" {
+			if hardAffinity && update.client.Load() == nil && pin.appId == "" {
 				for _, fallbackIpPath := range self.affinityFallbackIpPathsWithLock(ipPath) {
 					fallbackIp6Path := fallbackIpPath.ToIp6Path()
 					if update.affinityIp6Paths[fallbackIp6Path] {
@@ -6181,7 +6340,7 @@ func blockerCheck(blocker Blocker, addr netip.Addr, serverNames []string) bool {
 
 func (self *RemoteUserNatMultiClient) serverNames(addr netip.Addr) []string {
 	config := self.config.Load()
-	if config.serverNameLookup == nil {
+	if config == nil || config.serverNameLookup == nil {
 		return nil
 	}
 	return config.serverNameLookup.ServerNames(addr.String())
@@ -6636,7 +6795,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 			if self.groupRaceCandidatesForTest != nil {
 				return self.groupRaceCandidatesForTest(sendPacketGroup)
 			}
-			for _, windowType := range self.selectWindowTypes(firstPacket) {
+			for _, windowType := range self.selectWindowTypes(firstPacket, sendPacketGroup.pin.appId) {
 				if window, ok := self.windows[windowType]; ok {
 					orderedClients := self.raceCandidates(window)
 					// A destination+port failure is narrower than the
@@ -6651,6 +6810,22 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 						}
 					}
 					orderedClients = self.filterDestinationServiceFailures(orderedClients, ipPath)
+					// External probe reputation is used only here, after affinity
+					// declined to bind this fresh flow. It cannot move an established
+					// media session and it has no access to TLS plaintext.
+					orderedClients = self.filterReputationFailedCandidates(orderedClients, update)
+					// A completed short TLS flow is weaker evidence than an
+					// unmeasured provider's advertised-rate prior. Weight the fresh
+					// race by peak inner-TCP ACK progress before affinity can keep
+					// selecting the same low-throughput exit.
+					orderedClients = self.preferAffinityPerformanceCandidates(orderedClients, update)
+					if windowType == WindowTypeQuality {
+						orderedClients = self.preferFastSameNetworkCandidates(
+							orderedClients,
+							ipPath,
+							sendPacketGroup.pin.appId,
+						)
+					}
 					if scoredPlacementEnabled(self.reliabilitySettings()) {
 						// guarded scored-placement path (Phase 1): re-orders the
 						// already health-filtered field above, never widens or
@@ -8226,6 +8401,11 @@ func (self *RemoteUserNatMultiClient) Close() {
 type multiClientChannelUpdate struct {
 	ctx    context.Context
 	cancel context.CancelFunc
+	// openTime and activityTime bound one TCP generation's active lifetime for
+	// the affinity-performance learner; no timer or goroutine is retained per
+	// flow. Construction initializes it, and a same-tuple fresh SYN resets it
+	// under stateLock with the other generation state.
+	openTime time.Time
 
 	// client is the channel this flow is committed to. it is read on the
 	// per-packet hot path (egress send target, ingress steady-state match) and
@@ -8287,6 +8467,10 @@ type multiClientChannelUpdate struct {
 	ipPath       *IpPath
 
 	sequencePacketCount int // guarded by stateLock
+	// ackPerformance observes cumulative inner-TCP ACK sequence progress on
+	// successfully admitted source packets. It contains only counters and
+	// timestamps, never payload or TLS metadata, and is guarded by stateLock.
+	ackPerformance tcpAckPerformance
 	// sequenceTime is when the sequence state last advanced. it bounds how long
 	// TcpCollapsePrevention may keep discarding a sender's retransmits while
 	// the committed packet makes no progress. guarded by stateLock.
@@ -8347,6 +8531,7 @@ func newMultiClientChannelUpdate(ctx context.Context, ipPath *IpPath) *multiClie
 	return &multiClientChannelUpdate{
 		ctx:              cancelCtx,
 		cancel:           cancel,
+		openTime:         time.Now(),
 		ipPath:           ipPath,
 		affinityIp4Paths: map[Ip4Path]bool{},
 		affinityIp6Paths: map[Ip6Path]bool{},
@@ -8475,6 +8660,8 @@ func (self *multiClientChannelUpdate) resetSequenceWithLock(sendPacket *parsedPa
 		self.ingressFinSeen = false
 		self.egressAckSeen = false
 		self.ingressAckSeen = false
+		self.openTime = time.Now()
+		self.ackPerformance.reset()
 	}
 
 	self.ackSequenceNumber = ipPath.AckSequenceNumber
@@ -8509,6 +8696,13 @@ func (self *multiClientChannelUpdate) updateSequenceWithLock(sendPacket *parsedP
 
 	ipPath := sendPacket.ipPath
 	update := false
+	var now time.Time
+	if ipPath.Protocol == IpProtocolTcp {
+		if self.ackPerformance.needsTimestamp(ipPath.Ack, ipPath.AckSequenceNumber) {
+			now = time.Now()
+		}
+		self.ackPerformance.observe(now, ipPath.Ack, ipPath.AckSequenceNumber)
+	}
 
 	nextAckSequenceNumber := ipPath.AckSequenceNumber
 	if self.ackSequenceNumber != nextAckSequenceNumber {
@@ -8530,7 +8724,10 @@ func (self *multiClientChannelUpdate) updateSequenceWithLock(sendPacket *parsedP
 
 	if update {
 		self.sequencePacketCount += 1
-		self.sequenceTime = time.Now()
+		if now.IsZero() {
+			now = time.Now()
+		}
+		self.sequenceTime = now
 	}
 }
 

@@ -28,6 +28,13 @@ func (self *RemoteUserNatMultiClient) bindDnsResultToExit(
 	if dohPath == nil || domain == "" {
 		return false
 	}
+	if !self.reliabilitySettings().FreshFlowAffinity {
+		// Ordinary flows no longer consume hard DNS-exit hints. Avoid retaining
+		// provider channel graphs (up to two 4096-entry maps for an hour) for a
+		// disabled policy; a runtime A/B enable begins learning from subsequent
+		// DNS answers.
+		return false
+	}
 	affinityName := affinityNameForServerName(domain)
 	if affinityName == "" {
 		return false
@@ -138,6 +145,12 @@ func (self *RemoteUserNatMultiClient) inheritDnsExitHintWithLock(
 	if update == nil || update.client.Load() != nil || ipPath == nil {
 		return false
 	}
+	if !update.pinned && !self.reliabilitySettings().FreshFlowAffinity {
+		// A DNS answer says which exit resolved a name, not which exit will
+		// serve it best. Ordinary fresh flows therefore keep the hint only as
+		// measurement context and proceed to the provider race.
+		return false
+	}
 	now := time.Now()
 	eligible := func(hint dnsExitHint) bool {
 		client := hint.client
@@ -151,6 +164,16 @@ func (self *RemoteUserNatMultiClient) inheritDnsExitHintWithLock(
 			}
 		}
 		if !self.reliabilitySettings().AffinityStickyPastCap && self.clientAtFlowCapWithLock(client) {
+			return false
+		}
+		// A DNS result is a fresh-session placement hint, not an established
+		// site binding. Do not donate an exit that an external probe currently
+		// knows the resolved domain rejects. Ordinary established affinity is
+		// intentionally left untouched by this check.
+		if clientFailsAffinityPathReputation(client, affinityPaths) {
+			return false
+		}
+		if !self.affinityPerformanceAllowsDonor(client, ipPath) {
 			return false
 		}
 		return client.affinityDonorEligible(false, 0) == donorEligible

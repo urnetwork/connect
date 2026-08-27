@@ -30,14 +30,19 @@ func TestNextDestinationsRetainsMaximumIntermediariesAndDestination(t *testing.T
 		intermediaryIds[idIndex] = NewId()
 	}
 	providerId := NewId()
+	wantEstimatedBytesPerSecond := ByteCount(7_500_000)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/network/find-providers2" {
 			t.Errorf("discovery path=%q", request.URL.Path)
 		}
 		if err := json.NewEncoder(w).Encode(&FindProviders2Result{
 			Providers: []*FindProvidersProvider{{
-				ClientId:        providerId,
-				IntermediaryIds: intermediaryIds,
+				ClientId:                providerId,
+				IntermediaryIds:         intermediaryIds,
+				EstimatedBytesPerSecond: wantEstimatedBytesPerSecond,
+				Tier:                    0,
+				NetworkOnly:             true,
+				ReputationFailedNames:   " Bloomberg ,canva,bloomberg",
 			}},
 		}); err != nil {
 			t.Errorf("encode discovery response: %v", err)
@@ -77,9 +82,15 @@ func TestNextDestinationsRetainsMaximumIntermediariesAndDestination(t *testing.T
 		slices.Clone(intermediaryIds[len(intermediaryIds)-MaxMultihopLength:]),
 		providerId,
 	)
-	for destination := range destinations {
+	for destination, stats := range destinations {
 		if !slices.Equal(destination.Ids(), wantIds) {
 			t.Fatalf("destination ids=%v want=%v", destination.Ids(), wantIds)
+		}
+		if stats.EstimatedBytesPerSecond != wantEstimatedBytesPerSecond || !stats.NetworkOnly {
+			t.Fatalf("discovery stats=%+v, want speed and network-only metadata", stats)
+		}
+		if !slices.Equal(stats.ReputationFailures, []string{"bloomberg", "canva"}) {
+			t.Fatalf("reputation failures=%q, want normalized Bloomberg/Canva", stats.ReputationFailures)
 		}
 	}
 }

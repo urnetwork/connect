@@ -41,6 +41,7 @@ func scoredDonorClient(ctx context.Context, scored bool) *RemoteUserNatMultiClie
 		ctx: ctx,
 		settings: &MultiClientSettings{
 			DestinationAffinity:    true,
+			FreshFlowAffinity:      true,
 			SequenceIdleTimeout:    10 * time.Minute,
 			TcpSequenceIdleTimeout: 10 * time.Minute,
 			ScoredAffinityDonor:    scored,

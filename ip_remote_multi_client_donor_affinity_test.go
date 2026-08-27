@@ -73,6 +73,7 @@ func donorAffinityClient(ctx context.Context) *RemoteUserNatMultiClient {
 		ctx: ctx,
 		settings: &MultiClientSettings{
 			DestinationAffinity:    true,
+			FreshFlowAffinity:      true,
 			SequenceIdleTimeout:    10 * time.Minute,
 			TcpSequenceIdleTimeout: 10 * time.Minute,
 		},
@@ -115,6 +116,92 @@ func TestDonorAffinityRetiredFlowDonatesItsExit(t *testing.T) {
 			"a new flow to the same site must inherit the retired flow's exit (got current=%p committed=%p want %p)",
 			current2, update2.client.Load(), exit,
 		)
+	}
+}
+
+// The production policy keeps the same measurement key but does not build or
+// consume the reverse donor index for an ordinary fresh flow. This drives the
+// complete sendUpdate path, not only the donor helper.
+func TestDonorAffinityDefaultFreshFlowReachesRace(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mc := donorAffinityClient(ctx)
+	mc.settings.FreshFlowAffinity = false
+	exit := &multiClientChannel{ctx: ctx}
+	flow1 := donorAffinityPath(40011)
+	update1 := registerDonorFlow(mc, flow1, exit)
+	defer update1.Close()
+
+	update2, _, current2 := mc.sendUpdate(donorAffinityPath(40012), flowPin{})
+	defer update2.Close()
+	if current2 != nil || update2.client.Load() != nil {
+		t.Fatal("ordinary fresh flow bypassed the provider race through a donor")
+	}
+	if len(update2.affinityIp4Paths) == 0 {
+		t.Fatal("fresh flow lost its bounded affinity-performance key")
+	}
+
+	for key := range update2.affinityIp4Paths {
+		if _, retained := mc.affinityIp4Paths[key][update2.ipPath.ToIp4Path()]; retained {
+			t.Fatal("default-off hard affinity retained a reverse donor-index entry")
+		}
+	}
+
+	pinned, _, pinnedCurrent := mc.sendUpdate(
+		donorAffinityPath(40013),
+		flowPin{site: true},
+	)
+	defer pinned.Close()
+	if pinnedCurrent != exit || pinned.client.Load() != exit {
+		t.Fatal("explicit host pin did not opt back into hard site affinity")
+	}
+}
+
+func TestFreshFlowAffinityRuntimeToggleRebuildsOnlyNeededDonorIndexes(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mc := donorAffinityClient(ctx)
+	exit := &multiClientChannel{ctx: ctx}
+	ordinary := registerDonorFlow(mc, donorAffinityPath(40021), exit)
+	defer ordinary.Close()
+	pinned := registerDonorFlow(mc, donorAffinityPath(40022), exit)
+	defer pinned.Close()
+	pinned.pinned = true
+
+	override := ReliabilitySettingsFrom(mc.settings)
+	override.FreshFlowAffinity = false
+	mc.SetReliabilitySettings(override)
+	foundOrdinary := false
+	foundPinned := false
+	for _, paths := range mc.affinityIp4Paths {
+		if _, ok := paths[ordinary.ipPath.ToIp4Path()]; ok {
+			foundOrdinary = true
+		}
+		if _, ok := paths[pinned.ipPath.ToIp4Path()]; !ok {
+			continue
+		}
+		foundPinned = true
+	}
+	if foundOrdinary {
+		t.Fatal("disabled hard affinity retained an ordinary donor index")
+	}
+	if !foundPinned {
+		t.Fatal("disabled ordinary affinity discarded an explicit pin index")
+	}
+
+	// Clearing the override restores the constructed legacy A/B setting and
+	// immediately rebuilds current ordinary donors.
+	mc.SetReliabilitySettings(nil)
+	foundOrdinary = false
+	for _, paths := range mc.affinityIp4Paths {
+		if _, ok := paths[ordinary.ipPath.ToIp4Path()]; ok {
+			foundOrdinary = true
+		}
+	}
+	if !foundOrdinary {
+		t.Fatal("reenabling hard affinity did not rebuild current donor indexes")
 	}
 }
 

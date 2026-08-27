@@ -1213,6 +1213,198 @@ directions, and no regression from the controlled H1 fast.com 38/41/52-Mbit/s
 cohort. Reclaim, flow lifetime and object-layout candidates should be combined
 only after each wins its own same-route A/B.
 
+## 2026-08-27 fresh-flow placement: affinity as evidence, not assignment
+
+The Bloomberg device trace exposed a routing mistake adjacent to the provider
+memory work. A long-lived page H2 connection was acting as a hard IP/domain
+affinity donor for later media connections. That policy bypassed the provider
+race before quality, external reputation, or endpoint-specific history could
+matter. It also retained DNS name/address-to-channel maps that were not useful
+once ordinary flows stopped consuming hard affinity.
+
+The transport boundary is exact:
+
+- an established TCP/TLS tuple cannot move because providers terminate TCP;
+- six HTTP retries multiplexed on the same Chrome H2 connection cannot invoke
+  MultiClient placement again;
+- a new source port/SYN is a fresh placement opportunity;
+- explicit app/host pins remain the opt-in when one egress IP is required;
+- ordinary fresh flows now reach the provider race by default. Setting
+  `FreshFlowAffinity=true` restores legacy hard IP/domain inheritance for an
+  A/B run, but is not the production policy.
+
+`DestinationAffinity` remains enabled as bounded grouping metadata. A group is
+now a performance key, not permission to assign a provider. With hard fresh
+affinity off, DNS-exit hints are neither written nor read; this avoids retaining
+up to two 4,096-entry, one-hour maps of provider channel references. Existing
+flow tables and exact-tuple routing are unchanged.
+
+### TLS-blind performance model
+
+For TCP/443, the client measures cumulative inner-TCP ACK sequence progress.
+The first ACK is only the origin's random sequence baseline. Duplicate,
+reordered and regressing ACKs contribute nothing; signed 32-bit deltas preserve
+sequence wrap. One-second peak-rate buckets and a 250-ms floor on a final
+partial bucket reject compressed ACK bursts without delaying a fresh-flow
+decision.
+
+Evidence is keyed by both canonical domain constellation and exact destination
+IP. Domain evidence carries a result to the next selected video, while exact-IP
+evidence prevents a fast page endpoint from hiding a weak media endpoint. The
+conservative score is the minimum matching posterior. An unmeasured provider's
+score is its advertised `EstimatedBytesPerSecond`, the null hypothesis requested
+for this research. For one provider/destination:
+
+```text
+weight = min(round(active time, 100 ms), 10 s)
+       + min(ACKed bytes / advertised bytes-per-second, 10 s)
+
+posterior = (advertised rate * 1 s + sum(peak rate * weight))
+          / (1 s + sum(weight))
+```
+
+Combined evidence is capped at 30 seconds. The session-local table is capped at
+128 entries and expires after ten minutes. Candidates within the configured
+10% placement hysteresis of the best score remain in the race. Equal short
+histories therefore remain exactly tied, and if every provider is equally weak
+the field fails open instead of making the site unroutable. Established flows
+are never moved or closed by this learner. External provider probes remain the
+only safe source for domain-specific HTTP challenge reputation because Connect
+does not decrypt TLS.
+
+Completed history alone is insufficient for a browser that leaves its page H2
+connection open. At each fresh TCP/443 race, the scorer therefore also walks
+the existing per-provider `clientUpdates` set (normally bounded by the
+16-flow exit cap) and snapshots matching live flows. This is not a new retained
+index: it uses the exact-IP/canonical-group keys already owned by each flow,
+takes only the existing leaf flow lock, and never adds work or a shared lock to
+the ACK hot path. A low-rate still-open page/media connection can therefore
+anti-bias the next selected video's genuinely fresh socket; equal low-rate live
+connections still have equal weight. Requests reused on that same H2 transport
+remain outside the placement boundary.
+
+### Deterministic and cost gates
+
+The current tests cover:
+
+- default ordinary-flow race, explicit-pin inheritance, and legacy A/B restore
+  for IPv4 plus DNS hints;
+- first-ACK baseline, duplicate/reorder suppression, sequence wrap, and
+  partial-window ACK-compression capping;
+- advertised-rate null, a low measured provider losing to an unmeasured peer,
+  equal short outcomes retaining the whole field, and a fast result remaining
+  eligible;
+- a still-open H2 flow steering the next fresh full-field race, equal live
+  outcomes preserving the full race, a live donor check in legacy mode,
+  established-flow immobility, bounded table/TTL, metrics reset/snapshot, and
+  Connect-to-SDK round trips;
+- six opaque TLS response bursts on one established flow, matching Chrome's
+  same-H2 retries and proving they are progress rather than a blackhole or new
+  placement event.
+
+Five 500-ms M4 Pro repetitions measured median advancing/duplicate ACK costs of
+9.426/1.003 ns/op. Cold, completed-history, and still-open-live fresh-race
+scoring measured 137.9/195.7/198.7 ns/op. Every benchmark was 0 B/op and zero
+allocations. The advancing production path reuses the timestamp already
+required by sequence accounting; a duplicate does not read the clock. Per live
+flow the meter is only counters/timestamps. The history is bounded, stores
+stable provider IDs instead of channel pointers, and allocates lazily after
+completed evidence. The candidate scorer uses a fixed 16-entry stack array and
+fails open for an unexpectedly wider runtime override rather than turning exit
+count into an allocation vector.
+
+### Physical failure and memory bracket
+
+The pre-policy two-device trace must remain the control, not be rewritten as a
+fix result:
+
+| Role/path | Samples | Runtime peak | Live-heap peak | >28-MiB samples | Goroutine peak | Packet-root peak | Returned packet storage |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Pixel client, public H1 and P2P | 76 | 20.26 MiB | 6.96 MiB | 0 | 257 | 0.39 MiB | 0.25 MiB |
+| Galaxy, including P2P provider | 76 | 30.38 MiB | 15.52 MiB | 7 | 740 | 1.05 MiB | 0.25 MiB |
+
+Direct Galaxy cellular playback advanced to 1.674 seconds in five seconds with
+13.34 seconds buffered. Public United States H1 on both devices and same-LAN
+P2P remained at time zero; P2P nevertheless returned about 10.5 MiB and had
+zero local/provider security blocks. The provider memory crest is again live
+heap plus flow/goroutine topology, not a returned-pool high-water. The default
+affinity change should reduce stale DNS reference retention and give every new
+media connection another provider-selection opportunity, but neither playback
+nor memory improvement may be claimed until the rebuilt artifact is measured.
+
+### Current-source two-device result
+
+The rebuilt default-off policy was measured in two approximately 20.25-minute
+Android sessions. Each phone used validated Wi-Fi and validated cellular in
+opposite arms, then one phone provided an exact-ID same-LAN P2P exit to the
+other. These are variable public-route observations, not a paired provider
+benchmark:
+
+| Client path | Wikipedia median document TTFB | Wikipedia median load | fast.com samples | fast.com median |
+| --- | ---: | ---: | --- | ---: |
+| Pixel Wi-Fi, public United States H1 | 153.1 ms | 550.6 ms | 61 / 40 / 110 Mbit/s | **61 Mbit/s** |
+| Galaxy cellular, public United States H1 | 355.2 ms | 1,886.0 ms | 0.63 / 0.76 / 0.68 Mbit/s | 0.68 Mbit/s |
+| Pixel cellular, public United States H1 | 453.8 ms | 979.7 ms | 6.3 / 0.55 / 9.6 Mbit/s | 6.3 Mbit/s |
+| Galaxy Wi-Fi, public United States H1 | 174.3 ms | 402.0 ms | 18 / 0.96 / 4.4 Mbit/s | 4.4 Mbit/s |
+| Galaxy provider to Pixel client, exact P2P H1 | 168.7 ms | 1,233.8 ms | 3.5 / 3.5 / 3.5 Mbit/s | 3.5 Mbit/s |
+
+The 61-Mbit/s median demonstrates that the policy does not impose a 40-Mbit/s
+ceiling and restores the requested class on one real public route. The other
+arms demonstrate why this is not a universal 40-Mbit/s claim: exit quality and
+radio path still dominate. After public traffic, the two clients reported
+395/3,129 and 319/7,280 performance samples/candidates-filtered respectively.
+The learner was therefore active in the fresh races. Donor-bypass remained
+zero, as expected when legacy hard inheritance is disabled rather than entered
+and rejected.
+
+Bloomberg playback succeeded on the Galaxy Wi-Fi public-H1 arm: the media clock
+advanced from 8.718 to 9.724 seconds with `readyState=4` and about 20.26 seconds
+buffered. Five encrypted Fetch responses with status 403 occurred on one reused
+H2 connection during that successful playback. The Pixel cellular arm did not
+advance and had seven 403 Fetch responses on one reused H2 connection. Forcing
+a genuinely fresh Chrome transport afterward produced a top-level document
+403 on a new H2 connection, which Chrome did not retry. The P2P exit likewise
+returned a fresh document challenge while reporting a nonempty provider build
+and policy identity and zero provider-side block counters. This proves all
+three boundaries: same-H2 HTTP retries cannot be reraced; fresh-flow placement
+does get another chance; and another provider may still have the same
+destination-specific reputation. Public exits exposed no build/policy
+diagnostics, so deployment of external reputation metadata remains unverified.
+
+Memory remained streamlined for the client but not for the provider:
+
+| Role | Samples | Runtime peak / p95 | Quiet-window p50 / p95 / range / last | >24 / >28-MiB samples | Live-heap peak | Goroutine peak | Packet-root / returned-pool peak |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Pixel client | 81 | 22.00 / 21.61 MiB | 21.02 / 21.70 / 20.51--22.00 / 20.57 MiB | 0 / 0 | 7.97 MiB | 233 | 0.35 / 0.25 MiB |
+| Galaxy, including provider | 81 | 29.45 / 26.74 MiB | 24.01 / 25.20 / 23.10--25.20 / 23.56 MiB | 27 / 2 | 11.97 MiB | 340 | 1.22 / 0.25 MiB |
+
+Each quiet window contains 20 primitive samples. The client passes the active
+and steady 24/28-MiB gates. The provider does not: even after traffic quieted,
+11 of its 20 samples remained above 24 MiB. At the 29.45-MiB runtime crest the
+live heap was about 11.90 MiB, 304 goroutines were live, packet roots were only
+about 0.57 MiB, returned packet storage was about 0.25 MiB, one automatic GC
+had occurred, and queues were empty. Across both sessions there were zero
+packet-pressure drops and zero H1 receive-queue drops. This repeats the live
+provider flow/goroutine-topology attribution and rejects both hard-affinity
+removal and more aggressive returned-pool reclaim as its fix. The bounded
+shared provider UDP poller/lifecycle experiment remains the highest-priority
+provider-memory direction.
+
+The exact source gates passed: Connect `go test ./... -short -count=1` and
+`go vet ./...`, the focused routing tests under the race detector, the complete
+short SDK suite, focused server model tests and vet, the current SDK AAR plus
+stamped Android app/test/unit build, and all 13 dependency-free Android script
+tests. The server database integration fixture remained unavailable because
+the documented `WARP_ENV`/vault PostgreSQL inputs were absent; the pure
+provider-metadata assembly tests passed.
+
+Release acceptance for this direction is: no fresh ordinary flow directly
+inherits an IP/domain donor; retry on an existing H2 connection remains
+untouched; a fresh SYN can select another provider; no fast.com or page-TTFB
+regression; client steady p95 at or below 24 MiB with zero >28-MiB samples; and
+the existing provider-memory gate remains separately open until the shared UDP
+poller/lifecycle work reduces its live topology.
+
 ## Experiment queue
 
 Run one change at a time where practical, then combine only independently

@@ -28,6 +28,7 @@ func testLightIpPath(protocol IpProtocol, destIp string, destPort int) *IpPath {
 func TestLightClassifier(t *testing.T) {
 	resolver := fakeServerNameResolver(map[string]string{
 		"93.184.216.1": "netflix.com",
+		"93.184.216.3": "www.bloomberg.com",
 	})
 	classifier := NewLightClassifier(resolver)
 
@@ -38,6 +39,12 @@ func TestLightClassifier(t *testing.T) {
 		want           TrafficClass
 		wantConfidence uint8
 	}{
+		{
+			name:           "Bloomberg video site is streaming",
+			ipPath:         testLightIpPath(IpProtocolTcp, "93.184.216.3", 443),
+			want:           ClassStreaming,
+			wantConfidence: serverNameMatchConfidence,
+		},
 		{
 			name:           "server name beats port default: streaming",
 			ipPath:         testLightIpPath(IpProtocolTcp, "93.184.216.1", 443),
