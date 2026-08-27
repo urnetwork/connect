@@ -1053,6 +1053,38 @@ zero packet-pressure, H1 receive-queue-drop or H1 receive-backpressure events.
 This confirms the final mobile telemetry surface and playback remediation, but
 also independently reproduces the provider-memory failure on a short run.
 
+The subsequent pull brought two generated IP-security/blocker revisions, so a
+new pushed-head artifact was mandatory rather than treating the prior APK as
+final. Build `cnnfixmem-20260826-e` used Connect `b35e03f`, SDK `702356e`, and
+Android `683d0d3e`. Fresh cache-busted CNN sessions again reversed the exact
+same-network provider/client roles; both phones progressed through advertising
+and into moving CNN footage. Each client saw one diagnostic with the stamped
+build and the new effective-policy hash, and every local/provider block counter
+remained zero. Pixel/Galaxy client snapshots were 19.09/21.98 MiB. The complete
+4.1-minute sessions peaked at 32.02/31.96 MiB runtime, 17.30/17.37 MiB live
+heap, and 1,032/1,066 goroutines, with 4/5 samples over 28 MiB. Packet ownership
+peaked at only 0.28/0.32 MiB, returned pools at 0.25 MiB, and packet-pressure,
+H1 queue-drop and H1 backpressure counters remained zero. This pushed-head run
+supersedes the earlier artifact for functional release evidence and preserves
+the same provider-memory failure.
+
+A final generated IP-security/blocker revision (`8b1d9bf`) landed during
+closeout, so build `cnnfixmem-20260826-f` was rebuilt from that exact policy and
+run in a fresh Galaxy-provider -> Pixel-client P2P session. The real,
+cache-busted CNN page loaded over explicit H1; its preroll advanced into moving
+CNN flood footage. The client published one provider diagnostic with nonempty
+build and effective-policy hashes, and local client, local provider, and
+source-scoped remote-provider block counters were all zero. At the playback
+snapshot the client/provider runtimes were 22.56/33.85 MiB. Across the complete
+162/168-second instrumentation sessions they peaked at 23.31/39.41 MiB, with
+zero/seven samples over 28 MiB, 210/1,392 goroutines, only 0.33/0.28 MiB maximum
+packet ownership, 0.25 MiB returned packet pools, and zero packet-pressure,
+H1 receive-drop, or H1 receive-backpressure events. Both tests passed, both
+temporary clients were released, and private artifacts were removed. This
+latest-policy check closes functional source parity; the 39.41-MiB provider
+crest again fails the memory gate and reinforces per-flow/provider concurrency,
+not returned pools or security drops, as the remaining streamline target.
+
 Final-source correctness and adjacent server performance gates are green. The
 complete Connect package passed in 440.220 seconds, all remaining Connect
 subpackages passed, the affected blackhole/affinity/sticky/provider-diagnostic
@@ -1065,6 +1097,18 @@ cohort. PERFVAR receive-credit improved 673.4 -> 651.0 ns (-3.33%), while proxy
 batch-64 moved 5,444 -> 5,523 ns (+1.45%) with identical allocation shapes.
 The small opposing host shifts and unchanged allocations do not identify a
 performance regression from the recovery/diagnostic work.
+
+After the pull, the complete benchmark tiers again passed all 210/10/20
+samples. The thermally later absolute medians were 962.0/388.5 ns for
+production H1 full/ACK-sized work, 664.1 ns for PERFVAR receive-credit, and
+5,848 ns for proxy batch-64, with unchanged allocation shapes. To distinguish
+host drift from the change, a clean parent/current/parent bracket compared
+Connect parent `dacaa01` with `b35e03f` for seven 500-ms samples per benchmark.
+Parent full-payload medians opened/closed at 945.8/955.1 ns; current was 956.6
+ns, +0.65% versus the interpolated parent. Parent ACK-sized medians were
+383.7/385.3 ns; current was 387.8 ns, +0.86%. All arms retained 17/10 B/op and
+two allocations. Those sub-1% bracketed shifts are within host noise and show
+no material shared-server performance regression.
 
 The Pixel session recorded 20 samples over 28 MiB and the Galaxy 15. They were
 provider-active or provider-span-recovery samples, not client-only P2P steady
