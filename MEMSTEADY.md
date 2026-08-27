@@ -963,6 +963,212 @@ memory authority.
    control and datagram loss semantics differ from default H1; none of the H1
    Internet rates in this pass are H3/DNS performance evidence.
 
+## 2026-08-26 CNN H1 poison recovery and P2P-memory follow-up
+
+This pass used the two attached Android phones as long-lived, production-rate
+(`memprofilerate=0`) sessions. Each phone used public United States H1 over
+Wi-Fi and cellular, and each direction of an exact-ID same-LAN P2P pairing.
+Chrome loaded the real CNN Nepal flooding live-news page and started its main
+video. Both public paths and both P2P directions advanced through preroll into
+news footage. A reused Chrome media session deliberately carried across an
+egress change returned CNN error 1400899; a fresh page connection on the now
+stable P2P route played. That is the intended boundary: never change egress IP
+inside an established media connection; retire a confirmed poisoned H1
+connection and let Chrome establish a healthy one.
+
+No local client or provider security-block counter advanced during any
+successful playback. Provider diagnostics now cross the complete
+Connect -> SDK -> RPC/mobile boundary: availability, provider build, effective
+policy hash, source-scoped ingress/egress packet and byte counters, and
+publication sequence. The physical harness records only availability/count
+aggregates, not provider/client identities or policy strings.
+
+### Remediation and deterministic gate
+
+A sustained no-receive quarantine now performs one bounded recovery action:
+
+- erase DNS-name/address hints, app affinity and site affinity associated with
+  the poisoned exit;
+- make every new handshake scatter instead of inheriting a quarantined donor;
+- rebind only established UDP/443 flows that can move safely;
+- remove established TCP flow/path bookkeeping and synthesize a source-side
+  RST so Chrome retries, rather than silently waiting on the old H1 socket;
+- retain established-session egress identity until that explicit teardown;
+- bound one exit's sticky graph to 64 flows, retiring only its oldest idle
+  entries after the 30-second idle threshold;
+- expose affinity invalidations, quarantine TCP resets and sticky retirements
+  in reliability metrics.
+
+The provider publishes identity on first authenticated source traffic and
+republishes only when that source's block generation changes. Diagnostics are
+strictly lower priority than a synthesized policy RST. The deterministic SMTP
+test uses a one-slot paused send sequence; the RST must occupy it and the
+diagnostic attempt must never displace/drop the reset.
+
+The root-cause commands are:
+
+```sh
+go test . -run '^TestH1DashBlackholeQuarantineResetsAndRebinds$' -count=100
+go test . -run '^TestFreshHandshakeNeverFollowsQuarantinedAffinityDonor$' -count=100
+go test . -run '^TestFlowReaperBoundsStickyExitWithOldestIdleFlows$' -count=100
+go test . -run '^TestProviderSmtpRejectionReturnsTcpReset$' -count=100
+go test . -run '^(TestSecurityPolicyHashIdentifiesEffectiveRules|TestProviderDiagnosticsAreSourceScopedAndGenerationGated|TestProviderDiagnosticsFrameAndChannelOrdering)$' -count=100
+go test -race . -run '^(TestH1DashBlackholeQuarantineResetsAndRebinds|TestFreshHandshakeNeverFollowsQuarantinedAffinityDonor|TestProviderSmtpRejectionReturnsTcpReset|TestProviderDiagnostics.*)$' -count=10
+```
+
+The DASH test establishes several CNN-shaped H1 media flows through one exit,
+blackholes it after establishment, matures the no-receive verdict, and requires
+DNS/site-affinity invalidation, prompt TCP RSTs, removal of every poisoned flow,
+and a fresh handshake on the healthy exit. It fails if an established H1 flow
+is silently rebound (mid-session IP change), if a new flow follows the
+quarantined donor, or if recovery waits for ordinary TCP timeout.
+
+### Physical playback and memory measurements
+
+The sessions ran for about 27 minutes each and finished normally. Wi-Fi was
+restored, both temporary authenticated clients were released, and credentials,
+peer pins and device test artifacts were removed.
+
+| Role and real workload | Go runtime | Live heap | Goroutines | Packet-pool ownership | Result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Pixel provider -> Galaxy P2P client, CNN playback | 38.84 MiB peak | 21.54 MiB peak | 1,346 peak | 0.39 MiB outstanding; 0.25 MiB returned | Playback completed; provider memory fails 24/28-MiB gates |
+| Galaxy P2P client | 23.40 MiB p50, 23.95 MiB p95, 24.02 MiB max | 9.25 MiB peak | 209 peak | 0.006 MiB outstanding; 0.25 MiB returned | Playback completed |
+| Galaxy provider -> Pixel P2P client, CNN playback | 39.26 MiB peak | 22.35 MiB peak | 1,071 peak | 1.31 MiB outstanding; 0.25 MiB returned | Playback completed; provider memory fails 24/28-MiB gates |
+| Pixel P2P client | 23.46 MiB p50, 23.73 MiB p95, 23.74 MiB max | 8.35 MiB peak | 263 peak | 0.29 MiB outstanding; 0.25 MiB returned | Playback completed |
+| Pixel public cellular H1, 35 samples | 23.89 MiB p50, 24.23 MiB p95, 24.39 MiB max | 8.47 MiB peak | 264 peak | 0.04 MiB outstanding; 0.25 MiB returned | The initial spinner advanced into CNN footage; zero block counters |
+| Final disconnected state, Pixel / Galaxy | 23.70 / 22.38 MiB | 7.39 / 7.95 MiB | 208 / 193 | 0.25 / 0.25 MiB returned | Both below 24 MiB after teardown |
+
+An exact-final-artifact smoke then rebuilt the SDK and APKs with provider build
+`cnnfixmem-20260826-d` and repeated the real CNN page in both P2P directions.
+Both phones advanced through a video advertisement and into/through moving
+media. Each H1 client saw one provider diagnostic with a nonempty build and
+policy hash; local client, local provider and source-scoped remote provider
+block counts were all zero. Galaxy-provider -> Pixel-client moved 7.16/2.67
+MiB through the provider and left provider/client runtime at 29.34/19.78 MiB;
+Pixel-provider -> Galaxy-client moved 5.52/1.80 MiB and left them at
+30.38/21.83 MiB. The complete 5.8-minute role-reversal sessions peaked at
+32.23 MiB on Pixel and 31.16 MiB on Galaxy, with 4/11 samples over 28 MiB,
+0.39/0.28 MiB maximum packet ownership, 0.25 MiB returned packet pools, and
+zero packet-pressure, H1 receive-queue-drop or H1 receive-backpressure events.
+This confirms the final mobile telemetry surface and playback remediation, but
+also independently reproduces the provider-memory failure on a short run.
+
+Final-source correctness and adjacent server performance gates are green. The
+complete Connect package passed in 440.220 seconds, all remaining Connect
+subpackages passed, the affected blackhole/affinity/sticky/provider-diagnostic
+selection passed three times under the race detector, and the complete short
+SDK suite passed in 100.040 seconds. All 210/10/20 benchmark samples in
+`server/connect`, `server/connect/perfvar`, and `server/proxy` passed. Current
+production H1 full-payload/ACK-sized medians were 908.5/371.4 ns with unchanged
+17/10 B/op and two allocations, +2.75%/+1.28% versus the adjacent pre-change
+cohort. PERFVAR receive-credit improved 673.4 -> 651.0 ns (-3.33%), while proxy
+batch-64 moved 5,444 -> 5,523 ns (+1.45%) with identical allocation shapes.
+The small opposing host shifts and unchanged allocations do not identify a
+performance regression from the recovery/diagnostic work.
+
+The Pixel session recorded 20 samples over 28 MiB and the Galaxy 15. They were
+provider-active or provider-span-recovery samples, not client-only P2P steady
+state. A later Pixel public-Wi-Fi phase inherited the earlier provider arena
+high-water and reached 25.63 MiB; therefore this long-session result does not
+claim that switching provider off instantly restores the clean client ceiling.
+It does show normal teardown eventually returning both devices below 24 MiB.
+
+The earlier approximately 49-MB provider / 29-MB client observation is not
+reproduced as an exact magnitude: this run reached about 41.2 MB provider and
+25.2 MB client in decimal bytes. Real ad/media fanout changes between runs, so
+that difference is not attributed to a code improvement. The important result
+is directionally stable: the provider role, not returned pools and not the
+client role, owns the large crest.
+
+### What is allocated
+
+A fresh current-source synthetic provider profile moved 4.5 MiB of echoed TCP
+at 53.4 MiB/s, then left 192 short UDP flows alive. It measured 30.9 MiB peak
+Go runtime, 14.8 MiB peak heap, 10.5 MiB loaded heap and 621 loaded goroutines
+(179 before load). A repeat reached 31.2 MiB and tripped the deliberately tight
+31-MiB host regression ceiling, confirming that this is active headroom, not a
+comfortable pass. The grouped goroutine profile is decisive:
+
+- 192 goroutines were blocked in each connected UDP socket's `Read`;
+- 192 more were in each `UdpSequence.Run` send/idle loop;
+- only four goroutines served the already-shared ordered receive dispatcher;
+- the remainder was gVisor/Transfer/device/provider fixed work.
+
+At a 64-KiB heap-profile sampling rate, loaded in-use attribution included
+about 3.12 MiB from live message-pool acquisitions, 1.02 MiB from the bounded
+warm set, 0.64 MiB in UDP reader buffers, 0.44 MiB in UDP sequence construction,
+0.39 MiB in receive-dispatch structures and 0.19 MiB in the sequence run loop.
+Those samples are directional rather than exact accounting, but they agree
+with the topology. `messagePool.take` means a live acquisition attributed to
+that allocator; it is not evidence that the returned free list owns 3.12 MiB.
+
+The device's exact pool counter resolves that ambiguity: total returned pool
+storage at the provider peaks was only 0.26--0.29 MiB. Detailed post-peak
+snapshots instead showed:
+
+- Pixel provider: 30.35 MiB runtime = 10.83 MiB live heap, 7.34 MiB stacks,
+  6.06 MiB heap fragmentation, plus runtime metadata; returned packet pool
+  0.25 MiB.
+- Galaxy provider: 34.70 MiB runtime = 16.32 MiB live heap, 5.88 MiB stacks,
+  6.67 MiB heap fragmentation, plus runtime metadata; returned packet pool
+  0.25 MiB.
+
+Therefore a harsher pool reclaim or a larger pool does not address the active
+crest. Pools remain useful for hot allocation/GC cost, but the reclaimable
+free list is two orders of magnitude smaller than the approximately 15-MiB
+reduction needed to move a 39-MiB provider below 24 MiB. The active excess is
+the combination of per-flow socket/read/send state, hundreds of goroutine
+stacks, live packet/Transfer state and allocator spans created by that fanout.
+Outer H1 does not eliminate this: Chrome can still create inner DNS and
+UDP/443/QUIC attempts while the tunnel carrier itself is H1.
+
+### Resolution candidates, in measured order
+
+1. **Connected-socket readiness poller.** Keep one connected UDP socket/NAT
+   port per flow, but replace its two parked goroutines with Android/Linux
+   epoll and iOS kqueue readiness shards. A bounded worker drains every ready
+   socket nonblocking, then performs the existing bulk callback. This preserves
+   tuple identity and reply demultiplexing. A naively shared unconnected socket
+   does not: two inner source ports contacting the same remote tuple become
+   ambiguous. Prototype platform implementations behind the same interface.
+2. **Collision-safe socket sharing.** As a harder second prototype, use a
+   small socket/port set plus a remote-tuple map, falling back to a distinct
+   socket whenever two inner flows would collide. This can reduce descriptors
+   as well as goroutines but must prove source-port/NAT behavior, ICMP error
+   attribution, IPv4/IPv6 parity and sender isolation. Do not ship it merely
+   because a single-server benchmark passes.
+3. **Adaptive UDP lifecycle.** Preserve the 300-second provider timeout for
+   VoIP, games and long-lived UDP. Measure a short post-response timeout only
+   for classifiable one-shot DNS/probe flows, and prompt retirement for a
+   quarantined exit. A blanket shorter timeout is rejected: it can break a
+   quiet healthy session and does not reduce memory while traffic is active.
+4. **Flatten per-flow live objects.** The 192-flow heap profile gives a much
+   smaller but real second target: make the send queue lazy/smaller only after
+   queue-HWM telemetry proves the slots unused; keep addresses inline; avoid
+   closures/timers created per flow; and isolate the socket-reader's blocking
+   frame from deep callback frames. Retain a change only if p95 UDP latency and
+   goodput do not regress.
+5. **Fragmentation-aware construction.** Batch or arena-like ownership is safe
+   only inside one flow lifecycle and with an exact release point. Measure
+   size-class/span changes; do not introduce an unbounded object pool. Forced
+   GC/trim can return idle spans but is not an active-memory fix and can worsen
+   page TTFB.
+6. **TCP and Transfer fanout accounting.** Add allocation-free primitive
+   counts for live TCP/UDP/ICMP flows, socket readers and return workers. The
+   current synthetic result isolates UDP, while CNN also creates TCP/media and
+   Transfer state. The device sampler must show which population tracks each
+   crest before shrinking a functional cold-page floor.
+
+The first retained prototype must reduce the 192-flow incremental goroutine
+count from 384 to at most 32, cut fresh-process peak runtime by at least 4 MiB,
+preserve every datagram and its per-flow order, and match or improve UDP p95
+latency/requests per second. That is only the first step: the physical release
+gate remains active/steady provider p95 at or below 24 MiB, zero samples above
+28 MiB, successful CNN playback in public Wi-Fi/cellular and both P2P
+directions, and no regression from the controlled H1 fast.com 38/41/52-Mbit/s
+cohort. Reclaim, flow lifetime and object-layout candidates should be combined
+only after each wins its own same-route A/B.
+
 ## Experiment queue
 
 Run one change at a time where practical, then combine only independently

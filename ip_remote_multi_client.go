@@ -187,9 +187,13 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		MaxFlowsPerExit:         16,
 		// a site keeps its exit as it grows; see the field comment
 		AffinityStickyPastCap: true,
+		// Sticky sites retain one egress IP, but idle H1 state is trimmed once
+		// the site has grown well beyond an ordinary browser connection set.
+		MaxStickyFlowsPerExit: 64,
+		StickyFlowIdleTimeout: 30 * time.Second,
 		// a benched site keeps its exit through the early bench;
 		// see the field comments
-		QuarantineGroupFollow:   true,
+		QuarantineGroupFollow:   false,
 		GroupFollowWindow:       45 * time.Second,
 		DialFailureRerace:       true,
 		BlackholeConnectTimeout: 30 * time.Second,
@@ -584,6 +588,26 @@ type MultiClientSettings struct {
 	// false restores the veto, the A/B comparison point.
 	AffinityStickyPastCap bool
 
+	// MaxStickyFlowsPerExit is the steady-state bound for an exit that grows
+	// past MaxFlowsPerExit through affinity inheritance. It does not split the
+	// site's egress IP: when the bound is exceeded, the shared flow reaper
+	// retires only the oldest TCP flows that have been idle for at least
+	// StickyFlowIdleTimeout. Active bursts may exceed the bound temporarily;
+	// preserving an in-flight request is preferable to enforcing a numeric cap
+	// by resetting useful work. 0 disables sticky-flow trimming.
+	//
+	// The separate bound is intentional. MaxFlowsPerExit=16 prevents an exit
+	// from collecting new sites, while 64 leaves headroom for one H1-heavy
+	// video constellation without retaining the 186-195 flows observed in the
+	// CNN failure. Every replacement connection remains on the same provider,
+	// so signed URLs and session IP binding remain valid.
+	MaxStickyFlowsPerExit int
+
+	// StickyFlowIdleTimeout is the minimum idle age before an excess sticky TCP
+	// flow may be reset. 0 disables sticky-flow trimming even when the count is
+	// configured.
+	StickyFlowIdleTimeout time.Duration
+
 	// ScoredAffinityDonor makes the learner load-bearing on the placement
 	// path that actually carries most flows.
 	//
@@ -631,34 +655,17 @@ type MultiClientSettings struct {
 	// with the knob off the legacy short-circuit is preserved exactly.
 	ScoredAffinityDonor bool
 
-	// QuarantineGroupFollow lets a QUARANTINED exit keep inheriting new flows
-	// from affinity groups already living on it. A benched site's established
-	// flows are already on the suspect exit -- placing the site's next flow
-	// elsewhere breaks the site's egress-ip consistency without reducing the
-	// group's exposure at all. New groups, races, and rebinds still avoid the
-	// exit; only its own sites follow. If the exit is genuinely dead the
-	// whole group fails together and the existing escalation (sustained
-	// evidence -> hard removal -> rebind/re-race) recovers everything at
-	// once. Field motivation: five quarantines in six minutes on 2026-08-03,
-	// every one acquitted on receive progress -- each one scattered its
-	// sites' new flows for nothing.
-	//
-	// false restores the scatter, the A/B comparison point.
+	// QuarantineGroupFollow is retained for settings compatibility but no
+	// longer admits a fresh flow to a quarantined donor. The CNN DASH failure
+	// demonstrated that preserving the egress IP of a path already proven
+	// receive-silent strands every new H1 handshake on that path. Existing
+	// flows remain protected until the parent handles the sustained verdict;
+	// new flows always scatter immediately.
 	QuarantineGroupFollow bool
 
-	// GroupFollowWindow is the safety gate on the follow: a group follows its
-	// donor only through the FIRST GroupFollowWindow of a quarantine episode.
-	// It cannot be a receive-recency gate -- the benching verdicts require
-	// ~30s of receive silence to fire and any receive lifts the bench
-	// atomically, so a quarantined exit NEVER has recent receive evidence and
-	// a recency gate is structurally unreachable (review finding, 2026-08-03).
-	// Episode age is the honest signal: early in a bench the verdict is least
-	// proven (every field bench that acquitted did so inside ~50s), while a
-	// bench that sustains past this window is trending toward the ~60s
-	// drain-to-conviction execution and must stop collecting flows before it.
-	// A followed flow into a genuinely dead exit is still not stranded: its
-	// unanswered dial re-races in ~3s via the dial-failure inference. 0
-	// disables the follow as surely as QuarantineGroupFollow false.
+	// GroupFollowWindow is retained for settings compatibility with older
+	// clients. Fresh flows no longer follow a quarantined exit, regardless of
+	// this value.
 	GroupFollowWindow time.Duration
 	// DialFailureRerace, when a provider reports it could not open the
 	// upstream for a new flow (see ipOosUnreachable's dial-failure use),
@@ -2781,6 +2788,8 @@ type ReliabilitySettings struct {
 	BlackholeReceiveTimeout  time.Duration
 	MaxFlowsPerExit          int
 	AffinityStickyPastCap    bool
+	MaxStickyFlowsPerExit    int
+	StickyFlowIdleTimeout    time.Duration
 	ScoredAffinityDonor      bool
 	// the G-1 group-follow pair; see the MultiClientSettings fields
 	QuarantineGroupFollow      bool
@@ -2865,6 +2874,8 @@ func ReliabilitySettingsFrom(settings *MultiClientSettings) *ReliabilitySettings
 		BlackholeReceiveTimeout:    settings.BlackholeReceiveTimeout,
 		MaxFlowsPerExit:            settings.MaxFlowsPerExit,
 		AffinityStickyPastCap:      settings.AffinityStickyPastCap,
+		MaxStickyFlowsPerExit:      settings.MaxStickyFlowsPerExit,
+		StickyFlowIdleTimeout:      settings.StickyFlowIdleTimeout,
 		ScoredAffinityDonor:        settings.ScoredAffinityDonor,
 		QuarantineGroupFollow:      settings.QuarantineGroupFollow,
 		GroupFollowWindow:          settings.GroupFollowWindow,
@@ -4102,6 +4113,7 @@ type retiredMultiClientFlow struct {
 	update       *multiClientChannelUpdate
 	client       *multiClientChannel
 	shouldSignal bool
+	stickyTrim   bool
 }
 
 // notifyFlowReaper is an edge-triggered wake. It is nil-safe for the small
@@ -4140,6 +4152,38 @@ func (self *RemoteUserNatMultiClient) detachIdleFlows(now time.Time) (
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
+	// Affinity may deliberately grow one site's exit past the ordinary flow
+	// cap to preserve a stable egress IP. Bound the retained H1 state without
+	// changing that IP: select only the oldest idle excess TCP flows on each
+	// overloaded exit. Active flows are never selected, so a burst can exceed
+	// the steady bound temporarily and settle as connections go idle.
+	stickyTrim := map[*multiClientChannelUpdate]bool{}
+	stickyLimit := reliabilitySettings.MaxStickyFlowsPerExit
+	stickyIdle := reliabilitySettings.StickyFlowIdleTimeout
+	if 0 < stickyLimit && 0 < stickyIdle {
+		for _, updates := range self.clientUpdates {
+			excess := len(updates) - stickyLimit
+			if excess <= 0 {
+				continue
+			}
+			candidates := make([]*multiClientChannelUpdate, 0, excess)
+			for update := range updates {
+				if update == nil || update.IsDone() || update.ipPath == nil ||
+					update.ipPath.Protocol != IpProtocolTcp ||
+					now.Sub(update.activityTime) < stickyIdle {
+					continue
+				}
+				candidates = append(candidates, update)
+			}
+			slices.SortFunc(candidates, func(a, b *multiClientChannelUpdate) int {
+				return a.activityTime.Compare(b.activityTime)
+			})
+			for _, update := range candidates[:min(excess, len(candidates))] {
+				stickyTrim[update] = true
+			}
+		}
+	}
+
 	rememberDeadline := func(deadline time.Time) {
 		if nextDeadline.IsZero() || deadline.Before(nextDeadline) {
 			nextDeadline = deadline
@@ -4166,6 +4210,7 @@ func (self *RemoteUserNatMultiClient) detachIdleFlows(now time.Time) (
 			update:       update,
 			client:       client,
 			shouldSignal: shouldSignal,
+			stickyTrim:   stickyTrim[update],
 		})
 	}
 
@@ -4175,7 +4220,7 @@ func (self *RemoteUserNatMultiClient) detachIdleFlows(now time.Time) (
 			continue
 		}
 		deadline := update.activityTime.Add(sequenceIdleTimeoutWithSettings(update.ipPath, reliabilitySettings))
-		if !update.IsDone() && now.Before(deadline) {
+		if !stickyTrim[update] && !update.IsDone() && now.Before(deadline) {
 			rememberDeadline(deadline)
 			continue
 		}
@@ -4225,6 +4270,9 @@ func (self *RemoteUserNatMultiClient) detachIdleFlows(now time.Time) (
 
 func (self *RemoteUserNatMultiClient) finishRetiredFlows(retired []retiredMultiClientFlow) {
 	for _, flow := range retired {
+		if flow.stickyTrim {
+			self.reliabilityMetrics.stickyFlowRetired()
+		}
 		if flow.client != nil {
 			self.recordFlowReward(flow.update.ipPath, flow.update.pinAppId, flow.client, flow.client.flowCount())
 		}
@@ -4235,6 +4283,27 @@ func (self *RemoteUserNatMultiClient) finishRetiredFlows(retired []retiredMultiC
 		// resurrect it. Close now clears race state and returns pooled packets;
 		// shouldSignal preserves the historical idle teardown despite that early
 		// cancellation.
+		flow.update.Close()
+	}
+}
+
+// finishQuarantinedTcpFlows signals only the local/source endpoint. The
+// provider was quarantined because its receive path is silent, so sending a
+// destination RST through that same path cannot make browser recovery faster
+// and can itself wait behind the congestion being diagnosed. The source RST
+// is the useful half: it makes H1 retry immediately on a fresh flow.
+func (self *RemoteUserNatMultiClient) finishQuarantinedTcpFlows(retired []retiredMultiClientFlow) {
+	for _, flow := range retired {
+		if self.ctx != nil && self.ctx.Err() == nil {
+			if packet, ok := self.teardownSourcePacket(flow.update.ipPath, flow.update.sourceRstSequence()); ok {
+				self.enqueueRemovalReceive(&receivePacket{
+					Source:      TransferPath{},
+					ProvideMode: protocol.ProvideMode_Network,
+					IpPath:      flow.update.ipPath,
+					Packet:      packet,
+				})
+			}
+		}
 		flow.update.Close()
 	}
 }
@@ -4303,7 +4372,10 @@ func (self *RemoteUserNatMultiClient) teardownSourcePacket(ipPath *IpPath, sourc
 }
 
 func (self *RemoteUserNatMultiClient) rstFlow(ipPath *IpPath, client *multiClientChannel, sourceRstSequence uint32) {
-	if client != nil {
+	// Bare fixture channels have no underlying transfer client. Production
+	// channels always do; keeping the source reset below independent also
+	// makes local recovery robust if a channel loses its transport first.
+	if client != nil && client.client != nil {
 		// rst to destination
 		if packet, ok := ipOosRst(ipPath); ok {
 			client.Send(&parsedPacket{
@@ -4839,21 +4911,24 @@ func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 	}
 }
 
-// migrateClientFlows is G-3's drain-time move: the proactive half of the
-// rebind removeClient performs at death, run while the exit is STILL ALIVE,
-// so a planned retirement is a coordinated hand-off instead of a deadline
-// teardown. Established quic flows are re-pinned to live replacements now --
-// the same partition, candidate order, and affinity-group cohesion as the
-// removal-time rebind -- and everything else (tcp, unestablished, flows with
-// no under-cap replacement) STAYS on the draining exit and finishes
-// naturally. Nothing is ever torn down here; that is the entire point. New
-// flows already avoid the exit through its drain warning, so after this pass
-// the exit only shrinks, and the eventual close (flowless, or the lifetime
-// hard deadline) finds little or nothing to kill.
+// migrateClientFlows is the common proactive hand-off for a planned drain and
+// a sustained quarantine verdict. Established QUIC flows are re-pinned to
+// live replacements in both cases. A planned drain keeps split-TCP flows alive
+// so they can finish naturally. A quarantine is materially different: the
+// exit has already gone receive-silent, so preserving established H1 flows is
+// preserving the user's freeze. Those TCP flows are detached and reset toward
+// the source immediately, which makes the browser open a new connection on a
+// healthy exit.
 //
-// Returns flows moved, replacement exits used, and flows that remain --
-// deliberately (tcp) or for lack of headroom, indistinguishable here and
-// equally fine, since they keep working.
+// The quarantine pass also invalidates every DNS, site, and app-affinity
+// reference still naming the failed exit. This happens under the same parent
+// lock as the flow detach; affinityDonorEligible already refuses quarantine,
+// closing the smaller channel-state -> parent-callback race before this pass
+// begins.
+//
+// Returns flows moved, replacement exits used, and flows that remain. During a
+// planned drain, TCP remains deliberately; during quarantine, remaining flows
+// are non-TCP flows that could not safely move or lacked replacement headroom.
 func (self *RemoteUserNatMultiClient) migrateClientFlows(client *multiClientChannel, cause string) (rebound int, replacements int, remaining int) {
 	if client == nil {
 		return
@@ -4866,10 +4941,34 @@ func (self *RemoteUserNatMultiClient) migrateClientFlows(client *multiClientChan
 	}
 
 	var reboundFlows []reboundFlow
+	var retiredTcp []retiredMultiClientFlow
 	movable := 0
+	affinityInvalidations := 0
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
+		quarantine := cause == "bench"
+
+		if quarantine {
+			for name, hint := range self.dnsExitHints {
+				if hint.client == client {
+					delete(self.dnsExitHints, name)
+					affinityInvalidations += 1
+				}
+			}
+			for addr, hint := range self.dnsAddressExitHints {
+				if hint.client == client {
+					delete(self.dnsAddressExitHints, addr)
+					affinityInvalidations += 1
+				}
+			}
+			for appId, pinned := range self.appPinClients {
+				if pinned == client {
+					delete(self.appPinClients, appId)
+					affinityInvalidations += 1
+				}
+			}
+		}
 
 		updates, ok := self.clientUpdates[client]
 		if !ok {
@@ -4877,17 +4976,13 @@ func (self *RemoteUserNatMultiClient) migrateClientFlows(client *multiClientChan
 		}
 
 		rebindable := []*multiClientChannelUpdate{}
-		// pointing counts entries whose flow genuinely still rides this exit;
-		// stale entries (already re-raced away, or mid-re-race nil) belong to
-		// nobody's remaining count and are cleaned up by the send path
-		pointing := 0
 		for update := range updates {
 			if update.client.Load() != client {
 				continue
 			}
-			pointing += 1
 			// removeClient's partition: established quic moves; everything
-			// else stays -- here, stays ALIVE on the draining exit
+			// else stays on a planned drain. A quarantine's TCP partition is
+			// detached below after QUIC has had first use of its affinity groups.
 			if 0 < len(candidates) &&
 				update.ipPath.Protocol == IpProtocolUdp &&
 				update.ipPath.DestinationPort == 443 &&
@@ -4895,13 +4990,10 @@ func (self *RemoteUserNatMultiClient) migrateClientFlows(client *multiClientChan
 				rebindable = append(rebindable, update)
 			}
 		}
-		if len(rebindable) == 0 || len(candidates) == 0 {
-			remaining = pointing
-			return
+		if 0 < len(rebindable) && 0 < len(candidates) {
+			movable = len(rebindable)
+			reboundFlows, replacements, _ = self.rebindFlowsWithLock(client, rebindable, candidates)
 		}
-
-		movable = len(rebindable)
-		reboundFlows, replacements, _ = self.rebindFlowsWithLock(client, rebindable, candidates)
 		// unlike the removal, unplaced flows are NOT torn down: they stay
 		// registered on the alive exit and keep working
 
@@ -4919,12 +5011,95 @@ func (self *RemoteUserNatMultiClient) migrateClientFlows(client *multiClientChan
 				delete(updates, update)
 			}
 		}
+
+		if quarantine {
+			// Remove one flow's membership from every site-affinity index. The
+			// flow tuple itself is removed only for TCP below; UDP can remain on
+			// the benched exit without donating that exit to another handshake.
+			invalidateFlowAffinity := func(update *multiClientChannelUpdate) {
+				if update == nil || update.ipPath == nil {
+					return
+				}
+				switch update.ipPath.Version {
+				case 4:
+					path := update.ipPath.ToIp4Path()
+					for affinityPath := range update.affinityIp4Paths {
+						if paths := self.affinityIp4Paths[affinityPath]; paths != nil {
+							if _, found := paths[path]; found {
+								delete(paths, path)
+								affinityInvalidations += 1
+							}
+							if len(paths) == 0 {
+								delete(self.affinityIp4Paths, affinityPath)
+							}
+						}
+						delete(update.affinityIp4Paths, affinityPath)
+					}
+				case 6:
+					path := update.ipPath.ToIp6Path()
+					for affinityPath := range update.affinityIp6Paths {
+						if paths := self.affinityIp6Paths[affinityPath]; paths != nil {
+							if _, found := paths[path]; found {
+								delete(paths, path)
+								affinityInvalidations += 1
+							}
+							if len(paths) == 0 {
+								delete(self.affinityIp6Paths, affinityPath)
+							}
+						}
+						delete(update.affinityIp6Paths, affinityPath)
+					}
+				}
+			}
+
+			for update := range updates {
+				if update.client.Load() != client {
+					delete(updates, update)
+					continue
+				}
+				invalidateFlowAffinity(update)
+				if update.ipPath == nil || update.ipPath.Protocol != IpProtocolTcp {
+					continue
+				}
+
+				// Detach the exact generation before signaling the source. A SYN
+				// that follows the RST then creates a clean generation and races a
+				// healthy exit; no stale nil-client update can resurrect the old
+				// provider binding.
+				switch update.ipPath.Version {
+				case 4:
+					path := update.ipPath.ToIp4Path()
+					if self.ip4PathUpdates[path] == update {
+						delete(self.ip4PathUpdates, path)
+					}
+				case 6:
+					path := update.ipPath.ToIp6Path()
+					if self.ip6PathUpdates[path] == update {
+						delete(self.ip6PathUpdates, path)
+					}
+				}
+				delete(self.flowUpdates, update)
+				delete(updates, update)
+				update.client.Store(nil)
+				if update.cancel != nil {
+					update.cancel()
+				}
+				retiredTcp = append(retiredTcp, retiredMultiClientFlow{
+					update:       update,
+					client:       client,
+					shouldSignal: true,
+				})
+			}
+		}
 		remaining = len(updates)
 		if len(updates) == 0 {
 			delete(self.clientUpdates, client)
 		}
 	}()
 	rebound = len(reboundFlows)
+	self.finishQuarantinedTcpFlows(retiredTcp)
+	self.reliabilityMetrics.quarantineTcpReset(len(retiredTcp))
+	self.reliabilityMetrics.quarantineAffinityInvalidated(affinityInvalidations)
 
 	// The recovery tracker is deliberately NOT armed here, unlike the
 	// removal path. Its entries close on the next provider-originated
@@ -4950,6 +5125,8 @@ func (self *RemoteUserNatMultiClient) migrateClientFlows(client *multiClientChan
 		"rebound", rebound,
 		"replacements", replacements,
 		"remaining", remaining,
+		"tcpresets", len(retiredTcp),
+		"affinityinvalidated", affinityInvalidations,
 		// why nothing moved, when nothing moved
 		"movable", movable,
 		"candidates", len(candidates),
@@ -7693,6 +7870,17 @@ type ExitInfo struct {
 	// Can exceed QualificationMaxAge (then Proven is false): a stale age is
 	// still information a dev screen can show.
 	ProbeAge time.Duration
+	// Provider identity and source-scoped block counters are populated after
+	// the first diagnostics message. They make stale provider policy directly
+	// visible instead of inferring it from client-side timeouts.
+	ProviderDiagnosticsAvailable bool
+	ProviderBuildVersion         string
+	ProviderSecurityPolicyHash   string
+	ProviderBlockIngressPackets  int64
+	ProviderBlockIngressBytes    int64
+	ProviderBlockEgressPackets   int64
+	ProviderBlockEgressBytes     int64
+	ProviderDiagnosticsSequence  int64
 }
 
 // Exits reports the provider channels across every window, with the number of
@@ -7740,7 +7928,7 @@ func (self *RemoteUserNatMultiClient) Exits() []*ExitInfo {
 			// effectiveTier below also reaches the parent lock through the
 			// injected lookup -- nothing here may hold it across these calls
 			proven, probeAge := self.qualificationExitInfo(client.probeDestination())
-			exits = append(exits, &ExitInfo{
+			exitInfo := &ExitInfo{
 				ClientId:   clientId,
 				WindowType: windowType,
 				Warning:    client.isWarning(),
@@ -7757,7 +7945,18 @@ func (self *RemoteUserNatMultiClient) Exits() []*ExitInfo {
 				EffectiveTier:    client.effectiveTier(),
 				Proven:           proven,
 				ProbeAge:         probeAge,
-			})
+			}
+			if diagnostics := client.providerDiagnosticsSnapshot(); diagnostics != nil {
+				exitInfo.ProviderDiagnosticsAvailable = true
+				exitInfo.ProviderBuildVersion = diagnostics.BuildVersion
+				exitInfo.ProviderSecurityPolicyHash = diagnostics.SecurityPolicyHash
+				exitInfo.ProviderBlockIngressPackets = diagnostics.BlockIngressPacketCount
+				exitInfo.ProviderBlockIngressBytes = diagnostics.BlockIngressByteCount
+				exitInfo.ProviderBlockEgressPackets = diagnostics.BlockEgressPacketCount
+				exitInfo.ProviderBlockEgressBytes = diagnostics.BlockEgressByteCount
+				exitInfo.ProviderDiagnosticsSequence = diagnostics.Sequence
+			}
+			exits = append(exits, exitInfo)
 		}
 	}
 	// deterministic order: the walk above ranges two maps (windows, then each
@@ -11353,6 +11552,9 @@ type multiClientChannel struct {
 	// nanos), the atomic gate that keeps touchQualificationOnReceive near-free
 	// on the per-packet path.
 	qualificationRefreshedNanos atomic.Int64
+	// Latest immutable provider identity/block snapshot. Atomic publication
+	// keeps the receive callback off stateLock and Exits reads contention-free.
+	providerDiagnostics atomic.Pointer[ProviderDiagnostics]
 
 	// sourceFilter map[TransferPath]bool
 
@@ -12990,46 +13192,23 @@ const (
 )
 
 // affinityDonorEligible decides whether this channel may donate to a new flow
-// of an affinity group it already hosts. A resize warning always refuses --
-// draining, starved, capacity, and unhealthy exits shed new flows on purpose
-// (draining changes under G-3's coordinated migration, not here). Quarantine
-// refuses UNLESS group-follow is on and the episode is younger than window:
-// suspicion alone must not split a site's egress ip while the verdict is
-// least proven, but a bench that sustains toward the drain-to-conviction
-// execution stops collecting flows first. The gate is deliberately NOT
-// receive recency -- the benching verdicts require a silent stats window and
-// any receive lifts the bench, so a quarantined channel structurally never
-// has recent receive evidence and a recency gate can never open (review
-// finding, 2026-08-03). Takes only this channel's own stateLock, the same
-// discipline as isWarning -- the inherit path calls this under the parent
-// lock.
+// of an affinity group it already hosts. Warnings and quarantine both refuse.
+// In particular, a sustained no-receive verdict must close admission before
+// the parent callback invalidates the affinity tables; otherwise a fresh H1
+// handshake can land in that small transition window and inherit the exact
+// exit the verdict proved receive-silent. The follow arguments remain in the
+// signature for source/settings compatibility but no longer override a
+// quarantine for a newly-created flow.
 func (self *multiClientChannel) affinityDonorEligible(followQuarantine bool, window time.Duration) donorVerdict {
+	_ = followQuarantine
+	_ = window
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	if self.warning {
 		return donorRefused
 	}
 	if self.quarantined {
-		if !followQuarantine || window <= 0 {
-			return donorQuarantineScattered
-		}
-		if self.lastReceiveAckTime.IsZero() {
-			// following a BENCHED donor is a bet that the bench is a false
-			// positive -- reasonable for an exit that has been delivering
-			// and went briefly silent, and indefensible for one that has
-			// never delivered anything at all. The 2026-08-05 capture is the
-			// latter: a dead-on-arrival replacement (send 0/0B recv 0/0B)
-			// grew from 20 to 32 flows by group-follow while already
-			// benched, then executed and took them all down. An exit that
-			// has never received scatters instead; a fresh exit that has not
-			// been benched is unaffected, since normal inheritance never
-			// reaches this branch.
-			return donorQuarantineScattered
-		}
-		if self.quarantineStart.IsZero() || window <= time.Since(self.quarantineStart) {
-			return donorQuarantineScattered
-		}
-		return donorQuarantineFollowed
+		return donorQuarantineScattered
 	}
 	return donorEligible
 }
@@ -15242,6 +15421,14 @@ func (self *multiClientChannel) clientDone() <-chan struct{} {
 	return self.client.Done()
 }
 
+func (self *multiClientChannel) providerDiagnosticsSnapshot() *ProviderDiagnostics {
+	if diagnostics := self.providerDiagnostics.Load(); diagnostics != nil {
+		copy := *diagnostics
+		return &copy
+	}
+	return nil
+}
+
 // `connect.ReceiveFunction`
 func (self *multiClientChannel) clientReceive(source TransferPath, frames []*protocol.Frame, peer Peer) {
 	select {
@@ -15274,6 +15461,25 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 
 	for _, frame := range frames {
 		switch frame.MessageType {
+		case protocol.MessageType_IpIpProviderDiagnostics:
+			message, err := FromFrame(frame)
+			if err != nil {
+				continue
+			}
+			diagnostics, ok := message.(*protocol.IpProviderDiagnostics)
+			if !ok {
+				continue
+			}
+			next := providerDiagnosticsFromProtocol(diagnostics)
+			for {
+				current := self.providerDiagnostics.Load()
+				if current != nil && next.Sequence <= current.Sequence {
+					break
+				}
+				if self.providerDiagnostics.CompareAndSwap(current, next) {
+					break
+				}
+			}
 		case protocol.MessageType_TransferResidentMigrate:
 			// Drain migration is a platform control instruction. A provider
 			// must not be able to make us churn transports by injecting the

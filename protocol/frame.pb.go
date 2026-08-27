@@ -86,6 +86,9 @@ const (
 	// Older clients ignore the unknown message type and fall back to the
 	// drain eviction plus excuse path (CONNECTDRAIN2.md).
 	MessageType_TransferResidentMigrate MessageType = 28
+	// Provider build/policy identity and per-source security block counters.
+	// Older clients ignore this data-path message.
+	MessageType_IpIpProviderDiagnostics MessageType = 29
 )
 
 // Enum value maps for MessageType.
@@ -120,6 +123,7 @@ var (
 		26: "TransferNetworkPeersReset",
 		27: "TransferNetworkPeersUpdate",
 		28: "TransferResidentMigrate",
+		29: "IpIpProviderDiagnostics",
 	}
 	MessageType_value = map[string]int32{
 		"TransferPack":                 0,
@@ -151,6 +155,7 @@ var (
 		"TransferNetworkPeersReset":    26,
 		"TransferNetworkPeersUpdate":   27,
 		"TransferResidentMigrate":      28,
+		"IpIpProviderDiagnostics":      29,
 	}
 )
 
@@ -251,7 +256,7 @@ const file_frame_proto_rawDesc = "" +
 	"\x05Frame\x129\n" +
 	"\fmessage_type\x18\x01 \x01(\x0e2\x16.bringyour.MessageTypeR\vmessageType\x12#\n" +
 	"\rmessage_bytes\x18\x02 \x01(\fR\fmessageBytes\x12\x10\n" +
-	"\x03raw\x18\x03 \x01(\bR\x03raw*\xeb\x05\n" +
+	"\x03raw\x18\x03 \x01(\bR\x03raw*\x88\x06\n" +
 	"\vMessageType\x12\x10\n" +
 	"\fTransferPack\x10\x00\x12\x0f\n" +
 	"\vTransferAck\x10\x01\x12\x14\n" +
@@ -282,7 +287,8 @@ const file_frame_proto_rawDesc = "" +
 	"\x11TransferClientKey\x10\x19\x12\x1d\n" +
 	"\x19TransferNetworkPeersReset\x10\x1a\x12\x1e\n" +
 	"\x1aTransferNetworkPeersUpdate\x10\x1b\x12\x1b\n" +
-	"\x17TransferResidentMigrate\x10\x1cB'Z%github.com/urnetwork/connect/protocolb\x06proto3"
+	"\x17TransferResidentMigrate\x10\x1c\x12\x1b\n" +
+	"\x17IpIpProviderDiagnostics\x10\x1dB'Z%github.com/urnetwork/connect/protocolb\x06proto3"
 
 var (
 	file_frame_proto_rawDescOnce sync.Once

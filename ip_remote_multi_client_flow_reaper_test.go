@@ -144,3 +144,51 @@ func TestFlowReaperExpiresFlowsWithoutPerFlowWaiters(t *testing.T) {
 		t.Fatal("shared flow reaper did not stop with its parent")
 	}
 }
+
+// Sticky affinity preserves one provider/IP for a busy site, but it must not
+// retain hundreds of idle H1 connections on that exit. Once the steady bound
+// is exceeded, the shared reaper retires only the oldest idle excess; active
+// flows stay on the same provider and no mid-session egress-IP split occurs.
+func TestFlowReaperBoundsStickyExitWithOldestIdleFlows(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	settings := DefaultMultiClientSettings()
+	settings.MaxStickyFlowsPerExit = 2
+	settings.StickyFlowIdleTimeout = 30 * time.Second
+	parent := flowReaperTestParent(ctx, settings)
+	parent.reliabilityMetrics = newReliabilityMetrics()
+	client := &multiClientChannel{ctx: ctx, settings: settings}
+	now := time.Now()
+
+	updates := make([]*multiClientChannelUpdate, 0, 3)
+	for i := 0; i < 3; i++ {
+		path := flowReaperTestPath(4, IpProtocolTcp, 45000+i)
+		update := newMultiClientChannelUpdate(ctx, path)
+		update.activityTime = now.Add(-time.Duration(40-i*15) * time.Second)
+		update.client.Store(client)
+		parent.ip4PathUpdates[path.ToIp4Path()] = update
+		parent.flowUpdates[update] = true
+		parent.bindClientFlow(update, client)
+		updates = append(updates, update)
+	}
+
+	retired, _, _ := parent.detachIdleFlows(now)
+	if len(retired) != 1 || retired[0].update != updates[0] {
+		t.Fatalf("retired %#v, want only the oldest idle excess flow", retired)
+	}
+	if updates[1].client.Load() != client || updates[2].client.Load() != client {
+		t.Fatal("the sticky site's active flows changed provider")
+	}
+	if got := len(parent.clientUpdates[client]); got != 2 {
+		t.Fatalf("sticky exit retains %d flows, want steady bound 2", got)
+	}
+
+	parent.finishRetiredFlows(retired)
+	for _, update := range updates[1:] {
+		update.Close()
+	}
+	if got := parent.ReliabilityMetrics().StickyFlowsRetired; got != 1 {
+		t.Fatalf("sticky flows retired = %d, want 1", got)
+	}
+}

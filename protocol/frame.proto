@@ -66,6 +66,9 @@ enum MessageType {
     // Older clients ignore the unknown message type and fall back to the
     // drain eviction plus excuse path (CONNECTDRAIN2.md).
     TransferResidentMigrate = 28;
+    // Provider build/policy identity and per-source security block counters.
+    // Older clients ignore this data-path message.
+    IpIpProviderDiagnostics = 29;
 }
 
 

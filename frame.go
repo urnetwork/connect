@@ -61,6 +61,8 @@ func ToFrame(message proto.Message, protocolVersion int) (*protocol.Frame, error
 				Raw:         true,
 			}, nil
 		}
+	case *protocol.IpProviderDiagnostics:
+		messageType = protocol.MessageType_IpIpProviderDiagnostics
 	case *protocol.ControlPing:
 		messageType = protocol.MessageType_TransferControlPing
 	case *protocol.ProvidePing:
@@ -221,6 +223,8 @@ func FromFrame(frame *protocol.Frame) (proto.Message, error) {
 			return v, nil
 		}
 		message = v
+	case protocol.MessageType_IpIpProviderDiagnostics:
+		message = &protocol.IpProviderDiagnostics{}
 	case protocol.MessageType_TransferControlPing:
 		message = &protocol.ControlPing{}
 	case protocol.MessageType_TransferProvidePing:

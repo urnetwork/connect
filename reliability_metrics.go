@@ -122,6 +122,14 @@ type reliabilityMetrics struct {
 	rebindsAccepted atomic.Uint64
 	rebindsRedialed atomic.Uint64
 
+	// A sustained quarantine fails established split-TCP flows fast so the
+	// application can reconnect, and removes every placement reference that
+	// could board another handshake onto that exit. Sticky-flow retirement is
+	// the independent steady-state cap that preserves the same provider/IP.
+	quarantineTcpResets             atomic.Uint64
+	quarantineAffinityInvalidations atomic.Uint64
+	stickyFlowsRetired              atomic.Uint64
+
 	// a blackhole verdict is only as good as the evidence it is built on, and
 	// two conditions make the evidence inadmissible: the local uplink went
 	// stale (nothing was deliverable, so silence convicts the network, not
@@ -304,6 +312,27 @@ func (self *reliabilityMetrics) groupScattered() {
 		return
 	}
 	self.groupsScattered.Add(1)
+}
+
+func (self *reliabilityMetrics) quarantineTcpReset(count int) {
+	if self == nil || count <= 0 {
+		return
+	}
+	self.quarantineTcpResets.Add(uint64(count))
+}
+
+func (self *reliabilityMetrics) quarantineAffinityInvalidated(count int) {
+	if self == nil || count <= 0 {
+		return
+	}
+	self.quarantineAffinityInvalidations.Add(uint64(count))
+}
+
+func (self *reliabilityMetrics) stickyFlowRetired() {
+	if self == nil {
+		return
+	}
+	self.stickyFlowsRetired.Add(1)
 }
 
 func (self *reliabilityMetrics) probeAnswered() {
@@ -531,6 +560,9 @@ func (self *reliabilityMetrics) reset() {
 	self.flowsRebound.Store(0)
 	self.rebindsAccepted.Store(0)
 	self.rebindsRedialed.Store(0)
+	self.quarantineTcpResets.Store(0)
+	self.quarantineAffinityInvalidations.Store(0)
+	self.stickyFlowsRetired.Store(0)
 	self.verdictsHeldUplinkStale.Store(0)
 	self.verdictsHeldSharedFate.Store(0)
 	self.verdictsHeldTransportDown.Store(0)
@@ -589,6 +621,10 @@ type ReliabilityMetricsSnapshot struct {
 	RebindsAccepted uint64
 	RebindsRedialed uint64
 
+	QuarantineTcpResets             uint64
+	QuarantineAffinityInvalidations uint64
+	StickyFlowsRetired              uint64
+
 	// VerdictsHeldUplinkStale and VerdictsHeldTransportDown count blackhole
 	// verdicts suppressed because the evidence was inadmissible (the local
 	// uplink was stale, the transport was known down); RemovalsDeferred
@@ -646,6 +682,10 @@ func (self *reliabilityMetrics) snapshot() *ReliabilityMetricsSnapshot {
 		FlowsRebound:    self.flowsRebound.Load(),
 		RebindsAccepted: self.rebindsAccepted.Load(),
 		RebindsRedialed: self.rebindsRedialed.Load(),
+
+		QuarantineTcpResets:             self.quarantineTcpResets.Load(),
+		QuarantineAffinityInvalidations: self.quarantineAffinityInvalidations.Load(),
+		StickyFlowsRetired:              self.stickyFlowsRetired.Load(),
 
 		VerdictsHeldUplinkStale:   self.verdictsHeldUplinkStale.Load(),
 		VerdictsHeldSharedFate:    self.verdictsHeldSharedFate.Load(),

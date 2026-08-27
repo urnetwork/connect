@@ -303,12 +303,10 @@ func TestDestinationExitsJoinsFlowsToCurrentExits(t *testing.T) {
 	}
 }
 
-// The G-1 verdict table: a resize warning always refuses (those exits shed
-// new flows on purpose); quarantine refuses only without group-follow or once
-// the episode has outlived the follow window. The gate is episode age, NOT
-// receive recency -- the benching verdicts require a silent stats window and
-// any receive lifts the bench, so a quarantined channel structurally never
-// has recent receive evidence and a recency gate could never open.
+// Admission closes as soon as an exit is quarantined. This deliberately makes
+// group-follow and its legacy window irrelevant for fresh handshakes: the
+// quarantine callback may not yet have invalidated every affinity index, so
+// the donor gate is the final race-free boundary.
 func TestAffinityDonorEligibleVerdicts(t *testing.T) {
 	parent := bindFlowTestParent()
 	client := bindFlowTestChannel(parent)
@@ -324,18 +322,14 @@ func TestAffinityDonorEligibleVerdicts(t *testing.T) {
 	}
 	client.setWarning(false, warnNone)
 
-	// a FRESH quarantine episode follows: the exact state production creates
-	// (setQuarantined stamps quarantineStart = now). The past receive is
-	// production state too, not evidence hand-set to reach the mechanism: an
-	// exit earns flows by delivering, so a benched one has always received
-	// at SOME point -- what it lacks is a RECENT receive, and requiring that
-	// is what made this branch unreachable before (review, 2026-08-03).
+	// A fresh quarantine must scatter even when the obsolete group-follow
+	// controls ask to follow it.
 	client.stateLock.Lock()
 	client.lastReceiveAckTime = time.Now().Add(-time.Hour)
 	client.stateLock.Unlock()
 	client.setQuarantined(blackholeNoReceiveAck)
-	if got := client.affinityDonorEligible(true, window); got != donorQuarantineFollowed {
-		t.Errorf("fresh quarantine: verdict %v, want donorQuarantineFollowed", got)
+	if got := client.affinityDonorEligible(true, window); got != donorQuarantineScattered {
+		t.Errorf("fresh quarantine: verdict %v, want donorQuarantineScattered", got)
 	}
 	if got := client.affinityDonorEligible(false, window); got != donorQuarantineScattered {
 		t.Errorf("quarantined, follow off: verdict %v, want donorQuarantineScattered", got)
@@ -380,14 +374,10 @@ func TestAffinityDonorEligibleVerdicts(t *testing.T) {
 	}
 }
 
-// The inherit path end to end: a freshly benched donor keeps its own site
-// under the shipped defaults -- the exact state production creates, with no
-// hand-set evidence -- and the flow-level ledger counts one follow; with
-// follow off the same flow is scattered and counted as such. The ledger is
-// booked by the CALLER's aggregate (bookGroupLedger), never per inherit call:
-// a flow whose first group scattered but whose second group donated was
-// placed with its group, not scattered.
-func TestQuarantinedDonorKeepsItsSite(t *testing.T) {
+// The inherit path end to end: a freshly benched donor immediately loses its
+// site. The legacy follow switch cannot reopen admission while asynchronous
+// affinity invalidation is still catching up.
+func TestQuarantinedDonorLosesItsSite(t *testing.T) {
 	parent := bindFlowTestParent()
 	parent.ip4PathUpdates = map[Ip4Path]*multiClientChannelUpdate{}
 	parent.reliabilityMetrics = newReliabilityMetrics()
@@ -416,18 +406,20 @@ func TestQuarantinedDonorKeepsItsSite(t *testing.T) {
 	parent.stateLock.Lock()
 	verdict, scattered := parent.inheritAffinityClient4WithLock(newFlow, donorPaths)
 	parent.stateLock.Unlock()
-	if newFlow.client.Load() != donor {
-		t.Error("a freshly benched donor did not keep its site")
+	if newFlow.client.Load() != nil {
+		t.Error("a freshly benched donor kept its site")
 	}
-	if verdict != donorQuarantineFollowed {
-		t.Errorf("verdict %v, want donorQuarantineFollowed", verdict)
+	if verdict != donorRefused || !scattered {
+		t.Errorf("verdict=%v scattered=%t, want refused/scattered aggregate", verdict, scattered)
 	}
 	parent.bookGroupLedger(newFlow.client.Load() != nil, verdict == donorQuarantineFollowed, scattered)
-	if got := parent.reliabilityMetrics.groupsFollowed.Load(); got != 1 {
-		t.Errorf("follows counted %d, want 1", got)
+	if got := parent.reliabilityMetrics.groupsScattered.Load(); got != 1 {
+		t.Errorf("scatters counted %d, want 1", got)
 	}
 
-	// the A/B point: follow off scatters, and the ledger says so
+	// Follow off has the same result; reset the ledger so this assertion is
+	// independent of the first admission attempt.
+	parent.reliabilityMetrics.reset()
 	parent.settings.QuarantineGroupFollow = false
 	scatteredFlow := &multiClientChannelUpdate{}
 	parent.stateLock.Lock()
@@ -451,11 +443,9 @@ func TestQuarantinedDonorKeepsItsSite(t *testing.T) {
 	}
 }
 
-// A pinned flow (host pin or app pin) follows its benched donor past the
-// follow window: stability over everything short of removal. An unpinned
-// flow of the same group scatters at the same moment -- the window still
-// governs everyone else.
-func TestPinnedFlowFollowsBenchWithoutWindow(t *testing.T) {
+// A host/app pin preserves egress stability only while its exit is healthy.
+// It cannot send a fresh handshake to a quarantined donor, at any episode age.
+func TestPinnedFlowCannotFollowBench(t *testing.T) {
 	parent := bindFlowTestParent()
 	parent.ip4PathUpdates = map[Ip4Path]*multiClientChannelUpdate{}
 	donor := bindFlowTestChannel(parent)
@@ -493,12 +483,12 @@ func TestPinnedFlowFollowsBenchWithoutWindow(t *testing.T) {
 	parent.stateLock.Lock()
 	verdict, _ = parent.inheritAffinityClient4WithLock(pinnedFlow, donorPaths)
 	parent.stateLock.Unlock()
-	if pinnedFlow.client.Load() != donor || verdict != donorQuarantineFollowed {
-		t.Error("a pinned flow scattered off an aged bench: the pin does not hold")
+	if pinnedFlow.client.Load() != nil || verdict == donorQuarantineFollowed {
+		t.Error("a pinned flow followed an aged quarantined donor")
 	}
 
-	// but the pin's window is BOUNDED: past it, even a pinned flow scatters,
-	// so a failing exit can finally drain, execute, and be replaced
+	// An even older episode remains scattered; the former wider pin window
+	// cannot override quarantine either.
 	donor.stateLock.Lock()
 	donor.quarantineStart = time.Now().Add(-2 * pinnedFollowWindow(parent.settings.GroupFollowWindow))
 	donor.stateLock.Unlock()
@@ -720,12 +710,10 @@ func TestVerdictDoesNotExecuteAnExitOurMigrationEmptied(t *testing.T) {
 	}
 }
 
-// G-3's drain-time migration: established quic moves to a live replacement
-// with its bookkeeping, tcp STAYS ALIVE on the draining exit (split-tcp: the
-// exit holds the remote end, moving it would break it), and nothing is ever
-// torn down or unpinned -- the whole point of migrating at drain time instead
-// of at the deadline.
-func TestMigrateClientFlowsMovesQuicKeepsTcp(t *testing.T) {
+// Quarantine recovery moves established QUIC to a live replacement and
+// promptly retires established TCP so the local stack retries a fresh H1
+// connection. Unestablished QUIC remains until normal cleanup.
+func TestMigrateClientFlowsMovesQuicResetsTcp(t *testing.T) {
 	parent := bindFlowTestParent()
 	parent.ip4PathUpdates = map[Ip4Path]*multiClientChannelUpdate{}
 	parent.reliabilityMetrics = newReliabilityMetrics()
@@ -769,21 +757,23 @@ func TestMigrateClientFlowsMovesQuicKeepsTcp(t *testing.T) {
 	if rebound != 1 || replacements != 1 {
 		t.Errorf("rebound=%d replacements=%d, want 1/1", rebound, replacements)
 	}
-	if remaining != 2 {
-		t.Errorf("remaining=%d, want 2 (the tcp flow and the unestablished quic)", remaining)
+	if remaining != 1 {
+		t.Errorf("remaining=%d, want 1 (the unestablished quic)", remaining)
 	}
 	if quicEstablished.client.Load() != target {
 		t.Error("the established quic flow did not move to the replacement")
 	}
-	// the stayers are untouched: still pinned, still booked, never nil'd
-	if tcp.client.Load() != draining {
-		t.Error("the tcp flow left the draining exit; split-tcp cannot move")
+	if tcp.client.Load() != nil {
+		t.Error("the established tcp flow was not retired")
 	}
 	if quicUnestablished.client.Load() != draining {
 		t.Error("the unestablished quic flow moved without a proven connection")
 	}
-	if !parent.clientUpdates[draining][tcp] || !parent.clientUpdates[draining][quicUnestablished] {
-		t.Error("a staying flow lost its bookkeeping on the draining exit")
+	if parent.clientUpdates[draining][tcp] {
+		t.Error("the retired tcp flow remains booked on the draining exit")
+	}
+	if !parent.clientUpdates[draining][quicUnestablished] {
+		t.Error("the unestablished quic flow lost its bookkeeping on the draining exit")
 	}
 	// and the mover's book followed it
 	if parent.clientUpdates[draining][quicEstablished] {

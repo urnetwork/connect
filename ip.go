@@ -5192,6 +5192,11 @@ type providerReturnItem struct {
 	observer        func(RemoteUserNatProviderReturnSendObservation)
 	observerToken   uint64
 	observerFlowKey RemoteUserNatProviderReturnFlowKey
+	// afterRelease runs only after this item's packet ownership has reached a
+	// terminal disposition. Rare control-plane telemetry uses it to stay
+	// behind a synthesized TCP reset instead of competing with that reset for
+	// the same bounded send-sequence slot.
+	afterRelease func()
 }
 
 // One sender-worker result exposes the exact completed accounting edge to
@@ -5358,6 +5363,11 @@ type RemoteUserNatProvider struct {
 	cancel         context.CancelFunc
 	localUserNat   *LocalUserNat
 	securityPolicy SecurityPolicy
+	// Immutable provider identity sent to each authenticated source on its
+	// first packet. The policy digest is computed once at construction, never
+	// on a packet hot path.
+	buildVersion       string
+	securityPolicyHash string
 	// Defense in depth at the exit. Client and provider policies are
 	// intentionally independent, and multiple tunnel clients can share an IP
 	// tuple, so smtpEgressGuard namespaces its state by the authenticated source.
@@ -5382,6 +5392,9 @@ type RemoteUserNatProvider struct {
 	// which skips the public security rules and forgoes the companion contract.
 	stateLock         sync.Mutex
 	sourceProvideMode map[Id]protocol.ProvideMode
+	// sourceDiagnostics holds source-scoped block counters and the publication
+	// generation. It is bounded and evicted with sourceProvideMode.
+	sourceDiagnostics map[Id]*providerSourceDiagnostics
 	// sourceP2pPriorityRefresh rate-limits Network-peer admission promotion
 	// on the provider packet path. Entries are bounded with
 	// sourceProvideMode and removed on the same arbitrary safe eviction.
@@ -5430,16 +5443,20 @@ func NewRemoteUserNatProvider(
 	// the security policy runs a background scan goroutine; scope it to this provider (a child of
 	// the client ctx) so Close stops it, rather than leaking it for the life of the client
 	cancelCtx, cancel := context.WithCancel(client.Ctx())
+	securityPolicy := settings.SecurityPolicyGenerator(cancelCtx, DefaultSecurityPolicyStatsCollector())
 	userNatProvider := &RemoteUserNatProvider{
 		ctx:                      cancelCtx,
 		client:                   client,
 		cancel:                   cancel,
 		localUserNat:             localUserNat,
-		securityPolicy:           settings.SecurityPolicyGenerator(cancelCtx, DefaultSecurityPolicyStatsCollector()),
+		securityPolicy:           securityPolicy,
+		buildVersion:             BuildVersion(),
+		securityPolicyHash:       SecurityPolicyHash(securityPolicy),
 		settings:                 settings,
 		packetStatsCounters:      &packetStatsCounters{},
 		packetStatsCallbacks:     NewCallbackList[PacketStatsFunction](),
 		sourceProvideMode:        map[Id]protocol.ProvideMode{},
+		sourceDiagnostics:        map[Id]*providerSourceDiagnostics{},
 		sourceP2pPriorityRefresh: map[Id]time.Time{},
 	}
 	userNatProvider.startReturnSenders()
@@ -5488,6 +5505,7 @@ func (self *RemoteUserNatProvider) senderDisconnected(senderClientId Id) {
 		defer self.stateLock.Unlock()
 		delete(self.sourceProvideMode, senderClientId)
 		delete(self.sourceP2pPriorityRefresh, senderClientId)
+		delete(self.sourceDiagnostics, senderClientId)
 	}()
 }
 
@@ -5571,12 +5589,17 @@ func (self *RemoteUserNatProvider) releaseReturnItem(item *providerReturnItem) {
 		})
 	}
 	item.returnPackets()
+	afterRelease := item.afterRelease
+	item.afterRelease = nil
 	packets := item.packets
 	*item = providerReturnItem{}
 	item.packets = packets
 	select {
 	case self.returnItemPool <- item:
 	default:
+	}
+	if afterRelease != nil {
+		HandleError(afterRelease)
 	}
 }
 
@@ -5806,6 +5829,7 @@ func (self *RemoteUserNatProvider) recordSourceProvideMode(sourceId Id, provideM
 			for evictSourceId := range self.sourceProvideMode {
 				delete(self.sourceProvideMode, evictSourceId)
 				delete(self.sourceP2pPriorityRefresh, evictSourceId)
+				delete(self.sourceDiagnostics, evictSourceId)
 				break
 			}
 		}
@@ -5817,6 +5841,7 @@ func (self *RemoteUserNatProvider) recordSourceProvideMode(sourceId Id, provideM
 	default:
 		self.sourceProvideMode[sourceId] = provideMode
 	}
+	self.ensureSourceDiagnosticsWithLock(sourceId)
 }
 
 const providerP2pPriorityRefreshInterval = 5 * time.Second
@@ -6263,6 +6288,8 @@ func (self *RemoteUserNatProvider) enqueueFragmentedReturn(
 	if r != SecurityPolicyResultAllow {
 		self.packetStatsCounters.blockEgressPacketCount.Add(int64(len(fragments)))
 		self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
+		self.recordProviderBlock(source.SourceId, false, len(fragments), byteCount)
+		self.publishProviderDiagnostics(source, transferKey, provideMode)
 		return false
 	}
 
@@ -6374,6 +6401,8 @@ func (self *RemoteUserNatProvider) receiveTransferBatchWithRecovery(
 		}
 		self.packetStatsCounters.blockEgressPacketCount.Add(int64(len(packets)))
 		self.packetStatsCounters.blockEgressByteCount.Add(blockedBytes)
+		self.recordProviderBlock(source.SourceId, false, len(packets), ByteCount(blockedBytes))
+		self.publishProviderDiagnostics(source, transferKey, provideMode)
 		return
 	}
 
@@ -6430,6 +6459,36 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecovery(
 	ipPath *IpPath,
 	packet []byte,
 ) {
+	self.receiveTransferWithRecoveryAndRelease(
+		source,
+		transferKey,
+		provideMode,
+		recoveryMode,
+		ipPath,
+		packet,
+		nil,
+	)
+}
+
+// receiveTransferWithRecoveryAndRelease attaches a rare lifecycle action to
+// the packet's terminal return disposition. The action also runs on every
+// early rejection, so callers never need a timeout or a second ownership
+// channel to learn that the packet can no longer precede their control work.
+func (self *RemoteUserNatProvider) receiveTransferWithRecoveryAndRelease(
+	source TransferPath,
+	transferKey TransferKey,
+	provideMode protocol.ProvideMode,
+	recoveryMode receiveRecoveryMode,
+	ipPath *IpPath,
+	packet []byte,
+	afterRelease func(),
+) {
+	pendingAfterRelease := afterRelease
+	defer func() {
+		if pendingAfterRelease != nil {
+			HandleError(pendingAfterRelease)
+		}
+	}()
 	source = source.LocalMask()
 	// self.client.log.Infof("[trace]provider return packet for %s\n", source.SourceId)
 
@@ -6475,6 +6534,8 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecovery(
 	if r != SecurityPolicyResultAllow {
 		self.packetStatsCounters.blockEgressPacketCount.Add(1)
 		self.packetStatsCounters.blockEgressByteCount.Add(int64(len(packet)))
+		self.recordProviderBlock(source.SourceId, false, 1, ByteCount(len(packet)))
+		self.publishProviderDiagnostics(source, transferKey, provideMode)
 		return
 	}
 
@@ -6494,6 +6555,8 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecovery(
 	item.schedulingKey = ipSendSchedulingKey(ipPath)
 	item.packet = MessagePoolShareReadOnly(packet)
 	item.packetByteCount = ByteCount(len(packet))
+	item.afterRelease = pendingAfterRelease
+	pendingAfterRelease = nil
 	self.enqueueReturnItem(item)
 }
 
@@ -6521,6 +6584,10 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 	// changing first-seen group or in-flow order.
 	var packetGroups []*ipPacketGroup
 	packetGroupsByKey := map[ipPacketFlowKey]*ipPacketGroup{}
+	// A synthesized policy reset must enter the bounded return sequence before
+	// diagnostics for the same rejection. The barrier is allocated only on the
+	// rare SMTP-block path; its completion never blocks a return worker.
+	var diagnosticsAfterReset chan struct{}
 	for _, frame := range frames {
 		switch frame.MessageType {
 		case protocol.MessageType_IpIpPing:
@@ -6619,6 +6686,12 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 							}
 							self.packetStatsCounters.blockIngressPacketCount.Add(int64(len(result.fragments)))
 							self.packetStatsCounters.blockIngressByteCount.Add(fragmentByteCount)
+							self.recordProviderBlock(
+								source.SourceId,
+								true,
+								len(result.fragments),
+								ByteCount(fragmentByteCount),
+							)
 							if r == SecurityPolicyResultIncident {
 								self.client.ReportAbuse(source)
 							}
@@ -6644,6 +6717,21 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 				) == smtpEgressReject {
 					self.packetStatsCounters.blockIngressPacketCount.Add(1)
 					self.packetStatsCounters.blockIngressByteCount.Add(int64(len(packetBytes)))
+					self.recordProviderBlock(source.SourceId, true, 1, ByteCount(len(packetBytes)))
+					var afterResetRelease func()
+					if diagnosticsAfterReset == nil {
+						diagnosticsAfterReset = make(chan struct{})
+						barrier := diagnosticsAfterReset
+						afterResetRelease = func() {
+							go func() {
+								select {
+								case <-barrier:
+									self.publishProviderDiagnostics(source, transferKey, provideMode)
+								case <-self.ctx.Done():
+								}
+							}()
+						}
+					}
 					deliverTcpPolicyReset(
 						func(
 							resetSource TransferPath,
@@ -6651,12 +6739,14 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 							resetPath *IpPath,
 							reset []byte,
 						) {
-							self.receiveTransfer(
+							self.receiveTransferWithRecoveryAndRelease(
 								resetSource,
 								transferKey,
 								resetProvideMode,
+								receiveRecoveryModeNonblocking,
 								resetPath,
 								reset,
+								afterResetRelease,
 							)
 						},
 						source,
@@ -6697,6 +6787,7 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 						// drop or incident: blocked by the provider security policy
 						self.packetStatsCounters.blockIngressPacketCount.Add(1)
 						self.packetStatsCounters.blockIngressByteCount.Add(int64(len(packetBytes)))
+						self.recordProviderBlock(source.SourceId, true, 1, ByteCount(len(packetBytes)))
 						if r == SecurityPolicyResultIncident {
 							self.client.ReportAbuse(source)
 						}
@@ -6704,6 +6795,15 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 				}
 			}
 		}
+	}
+	// A block observed while processing this callback increments the source's
+	// generation. Normally publish that final state after the borrowed frame
+	// loop. If a reset was synthesized, release its completion instead; that
+	// makes diagnostics strictly lower priority than the recovery packet.
+	if diagnosticsAfterReset == nil {
+		self.publishProviderDiagnostics(source, transferKey, provideMode)
+	} else {
+		close(diagnosticsAfterReset)
 	}
 
 	for _, packetGroup := range packetGroups {

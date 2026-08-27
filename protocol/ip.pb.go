@@ -191,6 +191,101 @@ func (*IpPing) Descriptor() ([]byte, []int) {
 	return file_ip_proto_rawDescGZIP(), []int{3}
 }
 
+// ProviderDiagnostics lets a client distinguish a stale provider build or
+// policy from an ordinary transport blackhole. Counters are cumulative for
+// the authenticated source receiving this message, never provider-global.
+type IpProviderDiagnostics struct {
+	state                   protoimpl.MessageState `protogen:"open.v1"`
+	BuildVersion            string                 `protobuf:"bytes,1,opt,name=build_version,json=buildVersion,proto3" json:"build_version,omitempty"`
+	SecurityPolicyHash      string                 `protobuf:"bytes,2,opt,name=security_policy_hash,json=securityPolicyHash,proto3" json:"security_policy_hash,omitempty"`
+	BlockIngressPacketCount uint64                 `protobuf:"varint,3,opt,name=block_ingress_packet_count,json=blockIngressPacketCount,proto3" json:"block_ingress_packet_count,omitempty"`
+	BlockIngressByteCount   uint64                 `protobuf:"varint,4,opt,name=block_ingress_byte_count,json=blockIngressByteCount,proto3" json:"block_ingress_byte_count,omitempty"`
+	BlockEgressPacketCount  uint64                 `protobuf:"varint,5,opt,name=block_egress_packet_count,json=blockEgressPacketCount,proto3" json:"block_egress_packet_count,omitempty"`
+	BlockEgressByteCount    uint64                 `protobuf:"varint,6,opt,name=block_egress_byte_count,json=blockEgressByteCount,proto3" json:"block_egress_byte_count,omitempty"`
+	Sequence                uint64                 `protobuf:"varint,7,opt,name=sequence,proto3" json:"sequence,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
+}
+
+func (x *IpProviderDiagnostics) Reset() {
+	*x = IpProviderDiagnostics{}
+	mi := &file_ip_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *IpProviderDiagnostics) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*IpProviderDiagnostics) ProtoMessage() {}
+
+func (x *IpProviderDiagnostics) ProtoReflect() protoreflect.Message {
+	mi := &file_ip_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use IpProviderDiagnostics.ProtoReflect.Descriptor instead.
+func (*IpProviderDiagnostics) Descriptor() ([]byte, []int) {
+	return file_ip_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *IpProviderDiagnostics) GetBuildVersion() string {
+	if x != nil {
+		return x.BuildVersion
+	}
+	return ""
+}
+
+func (x *IpProviderDiagnostics) GetSecurityPolicyHash() string {
+	if x != nil {
+		return x.SecurityPolicyHash
+	}
+	return ""
+}
+
+func (x *IpProviderDiagnostics) GetBlockIngressPacketCount() uint64 {
+	if x != nil {
+		return x.BlockIngressPacketCount
+	}
+	return 0
+}
+
+func (x *IpProviderDiagnostics) GetBlockIngressByteCount() uint64 {
+	if x != nil {
+		return x.BlockIngressByteCount
+	}
+	return 0
+}
+
+func (x *IpProviderDiagnostics) GetBlockEgressPacketCount() uint64 {
+	if x != nil {
+		return x.BlockEgressPacketCount
+	}
+	return 0
+}
+
+func (x *IpProviderDiagnostics) GetBlockEgressByteCount() uint64 {
+	if x != nil {
+		return x.BlockEgressByteCount
+	}
+	return 0
+}
+
+func (x *IpProviderDiagnostics) GetSequence() uint64 {
+	if x != nil {
+		return x.Sequence
+	}
+	return 0
+}
+
 var File_ip_proto protoreflect.FileDescriptor
 
 const file_ip_proto_rawDesc = "" +
@@ -202,7 +297,15 @@ const file_ip_proto_rawDesc = "" +
 	"\tip_packet\x18\x01 \x01(\v2\x13.bringyour.IpPacketR\bipPacket\"H\n" +
 	"\x14IpPacketFromProvider\x120\n" +
 	"\tip_packet\x18\x01 \x01(\v2\x13.bringyour.IpPacketR\bipPacket\"\b\n" +
-	"\x06IpPingB'Z%github.com/urnetwork/connect/protocolb\x06proto3"
+	"\x06IpPing\"\xf2\x02\n" +
+	"\x15IpProviderDiagnostics\x12#\n" +
+	"\rbuild_version\x18\x01 \x01(\tR\fbuildVersion\x120\n" +
+	"\x14security_policy_hash\x18\x02 \x01(\tR\x12securityPolicyHash\x12;\n" +
+	"\x1ablock_ingress_packet_count\x18\x03 \x01(\x04R\x17blockIngressPacketCount\x127\n" +
+	"\x18block_ingress_byte_count\x18\x04 \x01(\x04R\x15blockIngressByteCount\x129\n" +
+	"\x19block_egress_packet_count\x18\x05 \x01(\x04R\x16blockEgressPacketCount\x125\n" +
+	"\x17block_egress_byte_count\x18\x06 \x01(\x04R\x14blockEgressByteCount\x12\x1a\n" +
+	"\bsequence\x18\a \x01(\x04R\bsequenceB'Z%github.com/urnetwork/connect/protocolb\x06proto3"
 
 var (
 	file_ip_proto_rawDescOnce sync.Once
@@ -216,12 +319,13 @@ func file_ip_proto_rawDescGZIP() []byte {
 	return file_ip_proto_rawDescData
 }
 
-var file_ip_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
+var file_ip_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
 var file_ip_proto_goTypes = []any{
-	(*IpPacket)(nil),             // 0: bringyour.IpPacket
-	(*IpPacketToProvider)(nil),   // 1: bringyour.IpPacketToProvider
-	(*IpPacketFromProvider)(nil), // 2: bringyour.IpPacketFromProvider
-	(*IpPing)(nil),               // 3: bringyour.IpPing
+	(*IpPacket)(nil),              // 0: bringyour.IpPacket
+	(*IpPacketToProvider)(nil),    // 1: bringyour.IpPacketToProvider
+	(*IpPacketFromProvider)(nil),  // 2: bringyour.IpPacketFromProvider
+	(*IpPing)(nil),                // 3: bringyour.IpPing
+	(*IpProviderDiagnostics)(nil), // 4: bringyour.IpProviderDiagnostics
 }
 var file_ip_proto_depIdxs = []int32{
 	0, // 0: bringyour.IpPacketToProvider.ip_packet:type_name -> bringyour.IpPacket
@@ -244,7 +348,7 @@ func file_ip_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_ip_proto_rawDesc), len(file_ip_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   4,
+			NumMessages:   5,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
