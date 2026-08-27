@@ -220,7 +220,7 @@ func drainReadyUdpSocket(fd int, sequence *UdpSequence, buffer []byte) error {
 	}
 	maxReads := max(1, sequence.udpBufferSettings.WriteBatchSize)
 	for range maxReads {
-		n, err := syscall.Read(fd, buffer)
+		n, err := syscall.Read(SocketHandle(fd), buffer)
 		if 0 < n {
 			sequence.UpdateLastActivityTime()
 			packets, packetsErr := sequence.DataPackets(buffer, n, sequence.udpBufferSettings.Mtu)
