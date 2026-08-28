@@ -14,6 +14,7 @@ import (
 	"net/http/httptrace"
 	"net/netip"
 	"net/url"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -1539,6 +1540,13 @@ func dohRouteForConn(conn net.Conn) *DohRoute {
 		// result path.
 		if addr == nil {
 			return netip.AddrPort{}, false
+		}
+		addrValue := reflect.ValueOf(addr)
+		switch addrValue.Kind() {
+		case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+			if addrValue.IsNil() {
+				return netip.AddrPort{}, false
+			}
 		}
 		if tcpAddr, ok := addr.(*net.TCPAddr); ok {
 			ip, found := netip.AddrFromSlice(tcpAddr.IP)

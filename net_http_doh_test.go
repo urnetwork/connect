@@ -1,14 +1,17 @@
 package connect
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/netip"
 	"slices"
 	"sync"
@@ -278,6 +281,14 @@ func (self *dohRouteConn) RemoteAddr() net.Addr {
 	return self.remote
 }
 
+// Adapts one deterministic callback into an HTTP transport.
+type dohRoundTripperFunc func(*http.Request) (*http.Response, error)
+
+// Delegates each request to the deterministic test callback.
+func (self dohRoundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return self(request)
+}
+
 // TestDohRouteForConnRejectsMissingEndpoint pins the live proxy panic: an
 // HTTP/2 GotConn callback can retain a non-nil connection wrapper after one
 // endpoint address has disappeared. Route metadata is optional, so either
@@ -285,6 +296,7 @@ func (self *dohRouteConn) RemoteAddr() net.Addr {
 func TestDohRouteForConnRejectsMissingEndpoint(t *testing.T) {
 	local := &net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 41000}
 	remote := &net.TCPAddr{IP: net.ParseIP("192.0.2.20"), Port: 443}
+	var typedNilAddr *net.TCPAddr
 	for _, test := range []struct {
 		name string
 		conn net.Conn
@@ -292,12 +304,56 @@ func TestDohRouteForConnRejectsMissingEndpoint(t *testing.T) {
 		{name: "nil connection"},
 		{name: "nil local", conn: &dohRouteConn{remote: remote}},
 		{name: "nil remote", conn: &dohRouteConn{local: local}},
+		{name: "typed nil local", conn: &dohRouteConn{local: typedNilAddr, remote: remote}},
+		{name: "typed nil remote", conn: &dohRouteConn{local: local, remote: typedNilAddr}},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			if route := dohRouteForConn(test.conn); route != nil {
-				t.Fatalf("route = %+v, want nil for missing endpoint", route)
-			}
+		if route := dohRouteForConn(test.conn); route != nil {
+			t.Errorf("%s: route = %+v, want nil for missing endpoint", test.name, route)
+		}
+	}
+}
+
+// Pins the complete live failure path: HTTP/2 invokes GotConn with a wrapper
+// whose endpoint disappeared, but route observation is optional and the valid
+// DoH response must still reach the resolver.
+func TestDohQueryPreservesResponseWhenRouteEndpointMissing(t *testing.T) {
+	responseWire := []byte{0x01, 0x02, 0x03, 0x04}
+	remote := &net.TCPAddr{IP: net.ParseIP("192.0.2.20"), Port: 443}
+	transport := dohRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		trace := httptrace.ContextClientTrace(request.Context())
+		if trace == nil || trace.GotConn == nil {
+			return nil, fmt.Errorf("request has no GotConn trace")
+		}
+		trace.GotConn(httptrace.GotConnInfo{
+			Conn: &dohRouteConn{remote: remote},
 		})
+		return &http.Response{
+			Status:     "200 OK",
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(bytes.NewReader(responseWire)),
+			Request:    request,
+		}, nil
+	})
+	client := &dohClient{
+		httpClient:   &http.Client{Transport: transport},
+		captureRoute: true,
+	}
+
+	data, route, err := client.queryWireRawDetailedWithRoute(
+		context.Background(),
+		"https://doh.example.test/dns-query",
+		dnsmessage.TypeA,
+		"smtp.example.test",
+	)
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	if !bytes.Equal(data, responseWire) {
+		t.Fatalf("response = %v, want %v", data, responseWire)
+	}
+	if route != nil {
+		t.Fatalf("route = %+v, want no metadata for missing endpoint", route)
 	}
 }
 
