@@ -1533,6 +1533,13 @@ func dohRouteForConn(conn net.Conn) *DohRoute {
 		return nil
 	}
 	addrPort := func(addr net.Addr) (netip.AddrPort, bool) {
+		// httptrace may report a live wrapper whose address is temporarily nil
+		// while an HTTP/2 connection is being retired. Route observation is
+		// diagnostic only; an absent endpoint must not panic and abort the DoH
+		// result path.
+		if addr == nil {
+			return netip.AddrPort{}, false
+		}
 		if tcpAddr, ok := addr.(*net.TCPAddr); ok {
 			ip, found := netip.AddrFromSlice(tcpAddr.IP)
 			if !found || tcpAddr.Port < 0 || 65535 < tcpAddr.Port {

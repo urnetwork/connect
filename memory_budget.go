@@ -38,6 +38,19 @@ func newDefaultPlatformTransportBudget(budgetByteCount ByteCount) *PlatformTrans
 	)
 }
 
+// NewPlatformTransportBudgetForMemoryTarget creates an independently owned
+// carrier budget using the same sizing policy as the process default. A
+// nonpositive target preserves the legacy process-wide budget so callers that
+// explicitly disable per-owner memory sizing retain their prior behavior.
+func NewPlatformTransportBudgetForMemoryTarget(
+	memoryTargetByteCount ByteCount,
+) *PlatformTransportBudget {
+	if memoryTargetByteCount <= 0 {
+		return DefaultPlatformTransportBudget()
+	}
+	return newDefaultPlatformTransportBudget(memoryTargetByteCount)
+}
+
 // SetMemoryBudget sets the process-wide memory budget that scales the
 // memory-dominant default settings. 0 (the default) disables scaling.
 func SetMemoryBudget(budgetByteCount ByteCount) {
@@ -63,12 +76,29 @@ func DefaultPlatformTransportBudget() *PlatformTransportBudget {
 }
 
 // memoryScale returns the budget scale in (0, 1]
-func memoryScale() float64 {
-	budgetByteCount := memoryBudgetByteCount.Load()
+func memoryTargetScale(budgetByteCount ByteCount) float64 {
 	if budgetByteCount <= 0 || referenceMemoryBudgetByteCount <= budgetByteCount {
 		return 1
 	}
 	return float64(budgetByteCount) / float64(referenceMemoryBudgetByteCount)
+}
+
+func memoryScale() float64 {
+	return memoryTargetScale(memoryBudgetByteCount.Load())
+}
+
+// MemoryTargetScaledByteCount scales one default byte count from an explicit
+// owner target instead of the process-global target. A nonpositive target
+// retains the unscaled default; floorByteCount preserves the working minimum.
+func MemoryTargetScaledByteCount(
+	memoryTargetByteCount ByteCount,
+	unscaledByteCount ByteCount,
+	floorByteCount ByteCount,
+) ByteCount {
+	scaledByteCount := ByteCount(
+		memoryTargetScale(memoryTargetByteCount) * float64(unscaledByteCount),
+	)
+	return max(floorByteCount, scaledByteCount)
 }
 
 // MemoryScaledByteCount scales a default byte count by the memory budget,

@@ -359,6 +359,95 @@ func TestWindowOutcomeFailAndRecover(t *testing.T) {
 		outcomeNone)
 }
 
+// outcomeRetryGenerator exposes each deterministic enumeration boundary while
+// retaining the empty generator's cleanup behavior.
+type outcomeRetryGenerator struct {
+	testingEmptyMultiClientGenerator
+	calls chan struct{}
+}
+
+// NextDestinations records one enumeration attempt and returns no providers,
+// leaving the window parked on its already-captured generator notification.
+func (self *outcomeRetryGenerator) NextDestinations(
+	count int,
+	excludeDestinations []MultiHopId,
+	rankMode string,
+) (map[MultiHopId]DestinationStats, error) {
+	self.calls <- struct{}{}
+	return map[MultiHopId]DestinationStats{}, nil
+}
+
+// TestWindowOutcomeFailureRetriesEnumerationUntilCanceled pins Failed as a
+// status latch, never a terminal machinery state. Many consecutive empty
+// provider passes under the failed latch must each accept another exact fill
+// request under the same live evaluation epoch. Only explicit lifetime
+// cancellation may terminate the enumerator.
+func TestWindowOutcomeFailureRetriesEnumerationUntilCanceled(t *testing.T) {
+	const retryCount = 64
+
+	ctx, cancel := context.WithCancel(context.Background())
+	log := newRecordingLogger()
+	window := outcomeTestWindow(ctx, log)
+	window.settings.WindowGeneratorTimeout = 0
+	window.generator = &outcomeRetryGenerator{calls: make(chan struct{})}
+	window.clientChannelArgs = make(chan *multiClientChannelArgs)
+	epoch := window.evalEpochContext()
+	resizeNotify := window.resizeMonitor.NotifyChannel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		window.randomEnumerateClientArgs()
+	}()
+
+	select {
+	case <-window.generator.(*outcomeRetryGenerator).calls:
+	case <-done:
+		t.Fatal("window enumerator terminated before its first fill attempt")
+	}
+	window.failOutcome(45 * time.Second)
+	if !window.monitor.WindowExpandEvent().Failed {
+		t.Fatal("window did not publish the failed status latch")
+	}
+	select {
+	case <-ctx.Done():
+		t.Fatal("failed status canceled the window")
+	case <-epoch.Done():
+		t.Fatal("failed status canceled the evaluation epoch")
+	case <-resizeNotify:
+		t.Fatal("failed status closed an unrelated resize epoch")
+	default:
+	}
+
+	for attempt := 1; attempt <= retryCount; attempt += 1 {
+		window.generatorMonitor.NotifyAll()
+		select {
+		case <-window.generator.(*outcomeRetryGenerator).calls:
+		case <-done:
+			t.Fatalf("window enumerator terminally gave up after %d retries", attempt-1)
+		}
+		if !window.monitor.WindowExpandEvent().Failed {
+			t.Fatalf("retry %d cleared the failure status without a provider", attempt)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("retry %d canceled the window", attempt)
+		case <-epoch.Done():
+			t.Fatalf("retry %d canceled the evaluation epoch", attempt)
+		case <-done:
+			t.Fatalf("window enumerator stopped after retry %d", attempt)
+		default:
+		}
+	}
+	window.resizeMonitor.NotifyAll()
+	<-resizeNotify
+
+	cancel()
+	<-done
+	if _, ok := <-window.clientChannelArgs; ok {
+		t.Fatal("enumerator did not close its output after explicit cancellation")
+	}
+}
+
 // the stall transition is logged once per change through publishStallStatus
 func TestWindowStallTransitionLogsOnce(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

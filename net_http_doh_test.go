@@ -264,6 +264,43 @@ func TestDohCacheReportsTunnelRouteForAResult(t *testing.T) {
 	}
 }
 
+type dohRouteConn struct {
+	net.Conn
+	local  net.Addr
+	remote net.Addr
+}
+
+func (self *dohRouteConn) LocalAddr() net.Addr {
+	return self.local
+}
+
+func (self *dohRouteConn) RemoteAddr() net.Addr {
+	return self.remote
+}
+
+// TestDohRouteForConnRejectsMissingEndpoint pins the live proxy panic: an
+// HTTP/2 GotConn callback can retain a non-nil connection wrapper after one
+// endpoint address has disappeared. Route metadata is optional, so either
+// missing endpoint must return no route instead of dereferencing net.Addr.
+func TestDohRouteForConnRejectsMissingEndpoint(t *testing.T) {
+	local := &net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 41000}
+	remote := &net.TCPAddr{IP: net.ParseIP("192.0.2.20"), Port: 443}
+	for _, test := range []struct {
+		name string
+		conn net.Conn
+	}{
+		{name: "nil connection"},
+		{name: "nil local", conn: &dohRouteConn{remote: remote}},
+		{name: "nil remote", conn: &dohRouteConn{local: local}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if route := dohRouteForConn(test.conn); route != nil {
+				t.Fatalf("route = %+v, want nil for missing endpoint", route)
+			}
+		})
+	}
+}
+
 // TestDohCacheDoesNotCacheHttpError: an HTTP 5xx (transient server failure, not an
 // authoritative NXDOMAIN) is not negative-cached — every query re-hits the resolver (a
 // cached negative would be a single request). Contrast TestDohCacheCachesMiss.

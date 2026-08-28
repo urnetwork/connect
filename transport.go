@@ -524,10 +524,14 @@ type PlatformTransportSettings struct {
 	// remain held through reconnects so socket churn cannot escape the cap.
 	PlatformTransportBudget *PlatformTransportBudget
 	// Non-positive carrier/socket values resolve to the memory-scaled defaults.
-	H1BudgetByteCount            ByteCount
-	H3BudgetByteCount            ByteCount
-	H3SocketReadBufferByteCount  ByteCount
-	H3SocketWriteBufferByteCount ByteCount
+	H1BudgetByteCount                         ByteCount
+	H3BudgetByteCount                         ByteCount
+	H3SocketReadBufferByteCount               ByteCount
+	H3SocketWriteBufferByteCount              ByteCount
+	H3InitialStreamReceiveWindowByteCount     ByteCount
+	H3MaxStreamReceiveWindowByteCount         ByteCount
+	H3InitialConnectionReceiveWindowByteCount ByteCount
+	H3MaxConnectionReceiveWindowByteCount     ByteCount
 	// PlatformTransportBudgetPriority orders optional Auto-H3 leases when the
 	// aggregate budget cannot hold every caller. Foreground client windows use
 	// the zero value; background/provider transports use the background value.
@@ -635,18 +639,78 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		V2H1Auth: true,
 		// the platform transport must carry the per-peer encryption handshake,
 		// so its framer max is the connect runtime minimum message length
-		FramerSettings:               DefaultFramerSettings(int(DefaultClientSettings().MinimumMessageLenLimit())),
-		H1MaxMessageByteCount:        DefaultClientSettings().MinimumMessageLenLimit(),
-		PlatformTransportBudget:      DefaultPlatformTransportBudget(),
-		H1BudgetByteCount:            MemoryScaledByteCount(kib(512), kib(256)),
-		H3BudgetByteCount:            MemoryScaledByteCount(mib(8), mib(3)),
-		H3SocketReadBufferByteCount:  MemoryScaledByteCount(mib(1), kib(256)),
-		H3SocketWriteBufferByteCount: MemoryScaledByteCount(mib(1), kib(256)),
-		PtDnsSlowMultiple:            4,
-		EnableH3Datagrams:            true,
-		H3DatagramSettings:           DefaultH3DatagramSettings(),
-		H3QuicPacketStats:            &H3QuicPacketStats{},
+		FramerSettings:                            DefaultFramerSettings(int(DefaultClientSettings().MinimumMessageLenLimit())),
+		H1MaxMessageByteCount:                     DefaultClientSettings().MinimumMessageLenLimit(),
+		PlatformTransportBudget:                   DefaultPlatformTransportBudget(),
+		H1BudgetByteCount:                         MemoryScaledByteCount(kib(512), kib(256)),
+		H3BudgetByteCount:                         MemoryScaledByteCount(mib(8), mib(3)),
+		H3SocketReadBufferByteCount:               MemoryScaledByteCount(mib(1), kib(256)),
+		H3SocketWriteBufferByteCount:              MemoryScaledByteCount(mib(1), kib(256)),
+		H3InitialStreamReceiveWindowByteCount:     kib(256),
+		H3MaxStreamReceiveWindowByteCount:         MemoryScaledByteCount(mib(3), kib(384)),
+		H3InitialConnectionReceiveWindowByteCount: kib(512),
+		H3MaxConnectionReceiveWindowByteCount:     MemoryScaledByteCount(mib(4), kib(512)),
+		PtDnsSlowMultiple:                         4,
+		EnableH3Datagrams:                         true,
+		H3DatagramSettings:                        DefaultH3DatagramSettings(),
+		H3QuicPacketStats:                         &H3QuicPacketStats{},
 	}
+}
+
+// DefaultPlatformTransportSettingsWithMemoryTarget returns platform carrier
+// settings whose admission, socket buffers, QUIC receive windows, and
+// datagram reassembly state derive from one explicit owner memory target. Each
+// call owns a private carrier budget. A nonpositive target retains the legacy
+// process-global defaults.
+func DefaultPlatformTransportSettingsWithMemoryTarget(
+	memoryTargetByteCount ByteCount,
+) *PlatformTransportSettings {
+	settings := DefaultPlatformTransportSettings()
+	if memoryTargetByteCount <= 0 {
+		return settings
+	}
+	settings.PlatformTransportBudget =
+		NewPlatformTransportBudgetForMemoryTarget(memoryTargetByteCount)
+	settings.H1BudgetByteCount = MemoryTargetScaledByteCount(
+		memoryTargetByteCount,
+		kib(512),
+		kib(256),
+	)
+	settings.H3BudgetByteCount = MemoryTargetScaledByteCount(
+		memoryTargetByteCount,
+		mib(8),
+		mib(3),
+	)
+	settings.H3SocketReadBufferByteCount = MemoryTargetScaledByteCount(
+		memoryTargetByteCount,
+		mib(1),
+		kib(256),
+	)
+	settings.H3SocketWriteBufferByteCount = MemoryTargetScaledByteCount(
+		memoryTargetByteCount,
+		mib(1),
+		kib(256),
+	)
+	settings.H3MaxStreamReceiveWindowByteCount = MemoryTargetScaledByteCount(
+		memoryTargetByteCount,
+		mib(3),
+		kib(384),
+	)
+	settings.H3MaxConnectionReceiveWindowByteCount = MemoryTargetScaledByteCount(
+		memoryTargetByteCount,
+		mib(4),
+		kib(512),
+	)
+	if settings.H3DatagramSettings != nil {
+		settings.H3DatagramSettings.ProcessReassemblyByteCount = int64(
+			MemoryTargetScaledByteCount(
+				memoryTargetByteCount,
+				mib(8),
+				kib(512),
+			),
+		)
+	}
+	return settings
 }
 
 type PlatformTransport struct {
@@ -731,6 +795,22 @@ func newPlatformQuicConfig(
 	settings *PlatformTransportSettings,
 	slowMultiple int,
 ) *quic.Config {
+	initialStreamReceiveWindow := settings.H3InitialStreamReceiveWindowByteCount
+	if initialStreamReceiveWindow <= 0 {
+		initialStreamReceiveWindow = kib(256)
+	}
+	maxStreamReceiveWindow := settings.H3MaxStreamReceiveWindowByteCount
+	if maxStreamReceiveWindow <= 0 {
+		maxStreamReceiveWindow = MemoryScaledByteCount(mib(3), kib(384))
+	}
+	initialConnectionReceiveWindow := settings.H3InitialConnectionReceiveWindowByteCount
+	if initialConnectionReceiveWindow <= 0 {
+		initialConnectionReceiveWindow = kib(512)
+	}
+	maxConnectionReceiveWindow := settings.H3MaxConnectionReceiveWindowByteCount
+	if maxConnectionReceiveWindow <= 0 {
+		maxConnectionReceiveWindow = MemoryScaledByteCount(mib(4), kib(512))
+	}
 	config := &quic.Config{
 		HandshakeIdleTimeout: time.Duration(slowMultiple) *
 			(settings.QuicConnectTimeout + settings.QuicHandshakeTimeout),
@@ -743,10 +823,10 @@ func newPlatformQuicConfig(
 		InitialPacketSize: H3InitialPacketByteCount,
 		// Pin the receive windows and stream counts. The platform transport
 		// uses one bidirectional stream; the stream counts bound abuse.
-		InitialStreamReceiveWindow:     uint64(kib(256)),
-		MaxStreamReceiveWindow:         uint64(MemoryScaledByteCount(mib(3), kib(384))),
-		InitialConnectionReceiveWindow: uint64(kib(512)),
-		MaxConnectionReceiveWindow:     uint64(MemoryScaledByteCount(mib(4), kib(512))),
+		InitialStreamReceiveWindow:     uint64(initialStreamReceiveWindow),
+		MaxStreamReceiveWindow:         uint64(maxStreamReceiveWindow),
+		InitialConnectionReceiveWindow: uint64(initialConnectionReceiveWindow),
+		MaxConnectionReceiveWindow:     uint64(maxConnectionReceiveWindow),
 		MaxIncomingStreams:             8,
 		MaxIncomingUniStreams:          8,
 		EnableDatagrams:                settings.EnableH3Datagrams,

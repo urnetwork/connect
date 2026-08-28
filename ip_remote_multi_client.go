@@ -9215,7 +9215,8 @@ type multiClientWindow struct {
 	outcomeArmTime time.Time
 	// outcomeRebuilt: the ONE automatic rebuild has been spent.
 	outcomeRebuilt bool
-	// outcomeFailed: the terminal failed state, cleared by noteClientAdded.
+	// outcomeFailed is a UI/status latch cleared by noteClientAdded. It never
+	// terminates enumeration, resize, evaluation, or carrier retries.
 	outcomeFailed bool
 	// everAdded: a provider has been installed; permanently disarms the
 	// outcome watchdog for this window.

@@ -58,6 +58,51 @@ func TestPlatformQuicConfigEnablesPathMtuDiscovery(t *testing.T) {
 	}
 }
 
+// TestPlatformQuicConfigDefaultsZeroReceiveWindows preserves compatibility
+// with callers that construct partial PlatformTransportSettings literals.
+func TestPlatformQuicConfigDefaultsZeroReceiveWindows(t *testing.T) {
+	settings := DefaultPlatformTransportSettings()
+	settings.H3InitialStreamReceiveWindowByteCount = 0
+	settings.H3MaxStreamReceiveWindowByteCount = 0
+	settings.H3InitialConnectionReceiveWindowByteCount = 0
+	settings.H3MaxConnectionReceiveWindowByteCount = 0
+	config := newPlatformQuicConfig(settings, 1)
+
+	if config.InitialStreamReceiveWindow != uint64(kib(256)) ||
+		config.MaxStreamReceiveWindow != uint64(MemoryScaledByteCount(mib(3), kib(384))) ||
+		config.InitialConnectionReceiveWindow != uint64(kib(512)) ||
+		config.MaxConnectionReceiveWindow != uint64(MemoryScaledByteCount(mib(4), kib(512))) {
+		t.Fatalf(
+			"zero-value H3 receive windows resolved to stream=%d/%d connection=%d/%d",
+			config.InitialStreamReceiveWindow,
+			config.MaxStreamReceiveWindow,
+			config.InitialConnectionReceiveWindow,
+			config.MaxConnectionReceiveWindow,
+		)
+	}
+}
+
+// TestPlatformQuicConfigUsesDeviceMemoryTargetReceiveWindows proves the
+// per-device target reaches quic-go instead of being replaced by process
+// defaults at carrier construction.
+func TestPlatformQuicConfigUsesDeviceMemoryTargetReceiveWindows(t *testing.T) {
+	settings := DefaultPlatformTransportSettingsWithMemoryTarget(24 * 1024 * 1024)
+	config := newPlatformQuicConfig(settings, 1)
+	if config.InitialStreamReceiveWindow != uint64(settings.H3InitialStreamReceiveWindowByteCount) ||
+		config.MaxStreamReceiveWindow != uint64(settings.H3MaxStreamReceiveWindowByteCount) ||
+		config.InitialConnectionReceiveWindow != uint64(settings.H3InitialConnectionReceiveWindowByteCount) ||
+		config.MaxConnectionReceiveWindow != uint64(settings.H3MaxConnectionReceiveWindowByteCount) {
+		t.Fatalf(
+			"device-target H3 receive windows = stream=%d/%d connection=%d/%d, want settings %+v",
+			config.InitialStreamReceiveWindow,
+			config.MaxStreamReceiveWindow,
+			config.InitialConnectionReceiveWindow,
+			config.MaxConnectionReceiveWindow,
+			settings,
+		)
+	}
+}
+
 // The private edge/server listener is UDP/4053 (with 8053 retained only during
 // migration), but client traffic must still reach public DNS and rely on DNAT.
 func TestPlatformDnsTransportUsesPublicPort(t *testing.T) {

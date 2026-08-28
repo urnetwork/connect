@@ -46,6 +46,24 @@ security:
   - BearerAuth: []
 
 paths:
+  /clock:
+    get:
+      description: |
+        Get the cumulative destination-reported bytes for contracts finalized
+        on or after the start of subnet block 9.
+        The counter advances when contracts reach a final outcome and is
+        intended for public clients polling every 1-5 seconds.
+      operationId: Clock
+      security: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClockResult"
+        "503":
+          description: The clock has not completed its initial block-9 backfill.
+
   /stats/last-90:
     get:
       description: |
@@ -1944,6 +1962,28 @@ components:
       description: URnetwork JWT
 
   schemas:
+    ClockResult:
+      type: object
+      required:
+        - total_transfer_byte_count
+        - since_block
+        - since_time
+      properties:
+        total_transfer_byte_count:
+          type: string
+          pattern: "^[0-9]+$"
+          description: |
+            Base-10 destination-reported bytes for contracts finalized since
+            since_block. This is a string so clients do not lose integer
+            precision as the lifetime total grows.
+        since_block:
+          type: integer
+          description: First subnet block included in the counter.
+        since_time:
+          type: string
+          format: date-time
+          description: UTC start time of since_block.
+
     ProvideMode:
       type: integer
       oneOf:
