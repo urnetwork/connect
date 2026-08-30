@@ -81,6 +81,114 @@ func TestTunTcpInboundShardHandoffCadenceIsBounded(t *testing.T) {
 	}
 }
 
+// A small origin response often consists of one returned TCP packet. The
+// producer may never inject a 16th packet, so Write itself must complete the
+// gVisor endpoint handoff instead of leaving the finite tail pending forever.
+func TestTunWriteFinishesFiniteTcpInboundHandoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tun, err := CreateTunWithDefaults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tun.Close()
+
+	packet := newTunTcpInboundTestPacket(40000, 443)
+	_, shardIndex, ok := tcpInboundFlow(packet)
+	if !ok {
+		t.Fatal("test packet was not classified as TCP")
+	}
+	if _, err := tun.Write(packet); err != nil {
+		t.Fatalf("write finite TCP return: %v", err)
+	}
+
+	shard := &tun.tcpInboundShards[shardIndex]
+	shard.writeLock.Lock()
+	defer shard.writeLock.Unlock()
+	if shard.packetCount != 1 || shard.endpointCount != 0 {
+		t.Fatalf(
+			"finite write cadence/handoff packet_count=%d endpoint_count=%d, want 1/0",
+			shard.packetCount,
+			shard.endpointCount,
+		)
+	}
+}
+
+// Immediate endpoint handoff must not erase the bounded scheduler-yield
+// cadence shared by consecutive one-packet callbacks on the same flow.
+func TestTunWriteRetainsTcpInboundYieldCadence(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tun, err := CreateTunWithDefaults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tun.Close()
+
+	packet := newTunTcpInboundTestPacket(40000, 443)
+	_, shardIndex, ok := tcpInboundFlow(packet)
+	if !ok {
+		t.Fatal("test packet was not classified as TCP")
+	}
+	for packetIndex := 1; packetIndex <= tunTcpInboundBurstPacketCount; packetIndex += 1 {
+		if _, err := tun.Write(packet); err != nil {
+			t.Fatalf("write packet %d: %v", packetIndex, err)
+		}
+		shard := &tun.tcpInboundShards[shardIndex]
+		shard.writeLock.Lock()
+		packetCount := shard.packetCount
+		endpointCount := shard.endpointCount
+		shard.writeLock.Unlock()
+		wantPacketCount := uint32(packetIndex % tunTcpInboundBurstPacketCount)
+		if packetCount != wantPacketCount || endpointCount != 0 {
+			t.Fatalf(
+				"packet %d cadence/handoff=%d/%d, want %d/0",
+				packetIndex,
+				packetCount,
+				endpointCount,
+				wantPacketCount,
+			)
+		}
+	}
+}
+
+// WriteBatch may touch several TCP endpoints and end below the mid-batch
+// cadence on every one. Its return is the lossless boundary: no touched shard
+// may retain state that assumes another callback will arrive to wake it.
+func TestTunWriteBatchFinishesEveryTcpInboundHandoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tun, err := CreateTunWithDefaults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tun.Close()
+
+	packets := [][]byte{
+		newTunTcpInboundTestPacket(40000, 443),
+		newTunTcpInboundTestPacket(40001, 443),
+		newTunTcpInboundTestPacket(40002, 443),
+	}
+	if _, err := tun.WriteBatch(packets); err != nil {
+		t.Fatalf("write finite TCP return batch: %v", err)
+	}
+	for shardIndex := range tun.tcpInboundShards {
+		shard := &tun.tcpInboundShards[shardIndex]
+		shard.writeLock.Lock()
+		packetCount := shard.packetCount
+		endpointCount := shard.endpointCount
+		shard.writeLock.Unlock()
+		if packetCount != 0 || endpointCount != 0 {
+			t.Fatalf(
+				"batch left shard %d unsynchronized: packet_count=%d endpoint_count=%d",
+				shardIndex,
+				packetCount,
+				endpointCount,
+			)
+		}
+	}
+}
+
 func TestTunWriteReleasesInjectedPacketBufferReference(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
