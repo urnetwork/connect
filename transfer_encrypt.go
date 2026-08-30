@@ -1066,6 +1066,8 @@ type peerEncryptionSession struct {
 	// Nil test barriers expose supervisor entry and its child-worker join.
 	afterRunStartedForTest  func()
 	beforeWorkerWaitForTest func()
+	// Nil test observer borrows the constructed unknown-wrap nack before send.
+	unknownWrapNackForTest func(*protocol.EncryptedControl)
 	// peerClientPublicKey is the peer's long-lived Ed25519 public identity key,
 	// set via `SetPeerClientPublicKey` (from the SendSequence after a contract
 	// for the peer arrives). nil until a contract has been seen; until then any
@@ -4099,9 +4101,10 @@ func (self *EncryptionSessionManager) Testing_DropSessions(peerId Id) {
 // sealer's wraps; without feedback the sealer only re-initiates through its
 // send-sequence lifecycle, which stalls an active flow for the full
 // AckTimeout (see TestEncryptedPeerSessionLossRecovery). The receiver nacks
-// the unknown wrap with the epoch it CAN read (none = unset), and the sealer
-// restarts its handshake only on a genuine mismatch. Corruption in flight
-// produces a nack echoing the sealer's own established epoch and is ignored.
+// the unknown wrap with the epoch it can read or is actively establishing
+// (none = unset), and the sealer restarts its handshake only when the peer has
+// no live generation. Corruption in flight and ordinary establishment races
+// echo a real epoch and are ignored.
 
 func (self *peerEncryptionSession) unknownWrapNackMinInterval() time.Duration {
 	if self.settings != nil && 0 < self.settings.UnknownWrapNackMinInterval {
@@ -4138,13 +4141,15 @@ func (self *EncryptionSessionManager) NotifyUndecryptableWrap(
 }
 
 // sendUnknownWrapNack emits one rate-limited EncryptedControlUnknownWrapNack
-// carrying the epoch this session can currently read (unset when none). Sent
-// fire-and-forget on the session's own EC carrier: if the send fails, the
-// next undecryptable wrap re-nacks after the interval — the signal is a
-// latency optimization, and the sequence-lifecycle recovery remains the
-// backstop.
+// carrying the epoch this session can currently read or is actively
+// establishing (unset when neither exists). Naming the in-flight generation
+// distinguishes the normal window where the initiator seals first from a peer
+// that actually lost its responder state. Sent fire-and-forget on the
+// session's own EC carrier: if the send fails, the next undecryptable wrap
+// re-nacks after the interval — the signal is a latency optimization, and the
+// sequence-lifecycle recovery remains the backstop.
 func (self *peerEncryptionSession) sendUnknownWrapNack() {
-	var readableEpochId Id
+	var knownEpochId Id
 	emit := func() bool {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -4154,7 +4159,9 @@ func (self *peerEncryptionSession) sendUnknownWrapNack() {
 		}
 		self.lastUnknownWrapNackTime = now
 		if self.establishedEpoch != nil {
-			readableEpochId = self.establishedEpoch.epochId
+			knownEpochId = self.establishedEpoch.epochId
+		} else if self.handshakeInFlightLocked() {
+			knownEpochId = self.epoch.epochId
 		}
 		return true
 	}()
@@ -4166,8 +4173,11 @@ func (self *peerEncryptionSession) sendUnknownWrapNack() {
 		SessionRole: self.role.toProtobuf(),
 		Companion:   self.companion,
 	}
-	if readableEpochId != (Id{}) {
-		ec.EpochId = readableEpochId.Bytes()
+	if knownEpochId != (Id{}) {
+		ec.EpochId = knownEpochId.Bytes()
+	}
+	if self.unknownWrapNackForTest != nil {
+		self.unknownWrapNackForTest(ec)
 	}
 	if self.client == nil || self.client.sendBuffer == nil {
 		return

@@ -19,6 +19,14 @@ func (self *h1SendClientTransportForGroupTest) TransportType() TransportType {
 	return TransportTypeH1
 }
 
+type h3SendClientTransportForGroupTest struct {
+	*sendClientTransport
+}
+
+func (self *h3SendClientTransportForGroupTest) TransportType() TransportType {
+	return TransportTypeH3
+}
+
 type h1ReadyDrainAckTarget struct {
 	results chan ByteCount
 }
@@ -837,6 +845,126 @@ func TestH1EstablishedLogicalGroupWritesThreeTunnelPacketsPerPack(t *testing.T) 
 		t.Fatalf("H1 established tunnel-MTU frame counts=%v, want [3 3 1]", frameCounts)
 	}
 	releaseTransferGroupTestWitnesses(t, frames, witnesses)
+}
+
+// H3 may rotate between active flows after each physical Pack, but a partially
+// materialized logical group remains the head of its own flow. Otherwise two
+// adjacent provider-return groups from one TCP connection are striped on the
+// wire and can overflow the receiver's out-of-order segment queue.
+func TestH3LogicalGroupsPreserveSameFlowFrameOrder(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	destinationId := NewId()
+	sequenceEntered := make(chan struct{})
+	releaseSequence := make(chan struct{})
+	var sequenceEnteredOnce sync.Once
+	var releaseSequenceOnce sync.Once
+	release := func() { releaseSequenceOnce.Do(func() { close(releaseSequence) }) }
+
+	settings := DefaultClientSettings()
+	settings.EncryptionSettings.Mode = EncryptionModeOff
+	settings.SendBufferSettings.beforeRunSendSequenceForTest = func(id sendSequenceId) {
+		if id.Destination != destinationId {
+			return
+		}
+		sequenceEnteredOnce.Do(func() { close(sequenceEntered) })
+		<-releaseSequence
+	}
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+	defer func() {
+		release()
+		closeTransferGroupTestClient(t, client)
+	}()
+	client.ContractManager().AddNoContractPeer(destinationId)
+	route := make(chan []byte, 16)
+	client.RouteManager().UpdateTransportWithProperties(
+		&h3SendClientTransportForGroupTest{
+			sendClientTransport: NewSendClientTransport(DestinationId(destinationId)),
+		},
+		[]Route{route},
+		TransferCarrierProperties{
+			Unreliable:              true,
+			UnreliableFlowIsolation: true,
+		},
+	)
+
+	firstFrames, firstWitnesses := transferGroupTestFrames(t, 4, DefaultMtu)
+	secondFrames, secondWitnesses := transferGroupTestFrames(t, 4, DefaultMtu)
+	results := make(chan error, 2)
+	flowKey := testSendSchedulingKey(3000)
+	admit := func(frames []*protocol.Frame, witnesses [][]byte) {
+		success, err := client.sendGroupWithTimeoutDetailed(
+			frames,
+			destinationId,
+			func(err error) { results <- err },
+			time.Second,
+			NoAck(),
+			sendSchedulingKeyOption{key: flowKey},
+		)
+		if success && err == nil {
+			return
+		}
+		for _, frame := range frames {
+			MessagePoolReturn(frame.MessageBytes)
+		}
+		for _, witness := range witnesses {
+			MessagePoolReturn(witness)
+		}
+		t.Fatalf("H3 logical-group admission success=%t err=%v", success, err)
+	}
+
+	admit(firstFrames, firstWitnesses)
+	select {
+	case <-sequenceEntered:
+	case <-ctx.Done():
+		t.Fatalf("wait for held H3 logical-group sequence: %v", ctx.Err())
+	}
+	admit(secondFrames, secondWitnesses)
+	release()
+
+	for groupIndex := range 2 {
+		select {
+		case err := <-results:
+			if err != nil {
+				t.Fatalf("H3 logical group %d completion: %v", groupIndex, err)
+			}
+		case <-ctx.Done():
+			t.Fatalf("wait for H3 logical group %d: %v", groupIndex, ctx.Err())
+		}
+	}
+
+	wantMarkers := []byte{1, 2, 3, 4, 1, 2, 3, 4}
+	for wireIndex, wantMarker := range wantMarkers {
+		var transferFrameBytes []byte
+		select {
+		case transferFrameBytes = <-route:
+		case <-ctx.Done():
+			t.Fatalf("wait for H3 logical-group wire Pack %d: %v", wireIndex, ctx.Err())
+		}
+		pack := decodeSendPackLifecycleWirePack(t, transferFrameBytes)
+		gotMarker := byte(0)
+		validShape := len(pack.Frames) == 1 &&
+			len(pack.Frames[0].MessageBytes) == DefaultMtu
+		if validShape {
+			gotMarker = pack.Frames[0].MessageBytes[0]
+		}
+		if !validShape || gotMarker != wantMarker {
+			MessagePoolReturn(transferFrameBytes)
+			t.Fatalf(
+				"H3 logical-group wire Pack %d frames=%d marker=%d, want one frame with marker %d",
+				wireIndex,
+				len(pack.Frames),
+				gotMarker,
+				wantMarker,
+			)
+		}
+		MessagePoolReturn(transferFrameBytes)
+	}
+	if len(route) != 0 {
+		t.Fatalf("H3 logical groups emitted %d extra wire Packs", len(route))
+	}
+	releaseTransferGroupTestWitnesses(t, firstFrames, firstWitnesses)
+	releaseTransferGroupTestWitnesses(t, secondFrames, secondWitnesses)
 }
 
 func TestH1EstablishedLogicalGroupRequiresContractForWholeRemainder(t *testing.T) {

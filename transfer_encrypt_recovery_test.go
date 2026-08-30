@@ -19,10 +19,13 @@ package connect
 // the recovery.
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/urnetwork/connect/protocol"
 )
 
 // waitForSealedSession polls until the client reports a sealed peer session,
@@ -481,6 +484,67 @@ func TestUnknownWrapNackEmissionIsRateLimited(t *testing.T) {
 	session.sendUnknownWrapNack()
 	if got := sessionLastNackEmitStamp(session); got.Equal(firstStamp) {
 		t.Fatal("an emission after the interval elapsed was not admitted")
+	}
+}
+
+// An undecryptable wrap can race the responder's identity-proof completion:
+// its matching handshake epoch is live but not readable yet. The nack must
+// name that generation so the already-sealed initiator recognizes normal
+// convergence instead of demoting the cipher and putting a new ClientHello
+// behind the dropped application's receive-sequence gap.
+func TestUnknownWrapNackNamesInFlightEpoch(t *testing.T) {
+	epochId := NewId()
+	var nackedEpochId Id
+	session := &peerEncryptionSession{
+		settings: DefaultEncryptionSettings(),
+		epoch: &tlsHandshakeEpoch{
+			epochId:           epochId,
+			establishmentDone: make(chan struct{}),
+		},
+		unknownWrapNackForTest: func(ec *protocol.EncryptedControl) {
+			if parsed, err := IdFromBytes(ec.GetEpochId()); err == nil {
+				nackedEpochId = parsed
+			}
+		},
+	}
+
+	session.sendUnknownWrapNack()
+
+	if nackedEpochId != epochId {
+		t.Fatalf(
+			"nack epoch = %s, want live handshake epoch %s; empty feedback falsely claims the responder lost all session state",
+			nackedEpochId,
+			epochId,
+		)
+	}
+}
+
+// A finished but unestablished epoch is not convergence evidence. Leaving the
+// nack generation unset is what tells a sealed initiator to replace state the
+// responder can no longer complete or read.
+func TestUnknownWrapNackDoesNotNameFailedEpoch(t *testing.T) {
+	epochId := NewId()
+	establishmentDone := make(chan struct{})
+	close(establishmentDone)
+	var nackedEpochBytes []byte
+	session := &peerEncryptionSession{
+		settings: DefaultEncryptionSettings(),
+		epoch: &tlsHandshakeEpoch{
+			epochId:           epochId,
+			establishmentDone: establishmentDone,
+		},
+		unknownWrapNackForTest: func(ec *protocol.EncryptedControl) {
+			nackedEpochBytes = bytes.Clone(ec.GetEpochId())
+		},
+	}
+
+	session.sendUnknownWrapNack()
+
+	if len(nackedEpochBytes) != 0 {
+		t.Fatalf(
+			"failed epoch was advertised as live: got %x, want an unset nack generation",
+			nackedEpochBytes,
+		)
 	}
 }
 

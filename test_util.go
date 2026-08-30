@@ -47,6 +47,11 @@ func AssertNotEqual(t testing.TB, v1 any, v2 any) {
 func assertIsEqual(val1 any, val2 any) bool {
 	v1 := reflect.ValueOf(val1)
 	v2 := reflect.ValueOf(val2)
+	v1Nil := !v1.IsValid() || reflectValueIsNil(v1)
+	v2Nil := !v2.IsValid() || reflectValueIsNil(v2)
+	if v1Nil || v2Nil {
+		return v1Nil && v2Nil
+	}
 
 	if v1.Kind() == reflect.Ptr {
 		v1 = v1.Elem()
@@ -97,4 +102,14 @@ CASE3:
 	return reflect.DeepEqual(v1, v2.Interface())
 CASE4:
 	return reflect.DeepEqual(v1, v2)
+}
+
+// reflectValueIsNil reports nil only for reflection kinds that permit IsNil.
+func reflectValueIsNil(value reflect.Value) bool {
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
 }

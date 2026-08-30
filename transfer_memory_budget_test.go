@@ -855,6 +855,7 @@ func TestTransferBudgetLiveness(t *testing.T) {
 	const peerCount = 6
 	const messagesPerPeer = 40
 	const payloadByteCount = 2 * 1024
+	const sendAdmissionTimeout = 15 * time.Second
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -894,8 +895,9 @@ func TestTransferBudgetLiveness(t *testing.T) {
 							ackCount.Add(1)
 						}
 					},
-					// block until the sequence accepts (liveness under test)
-					-1,
+					// Wait generously for the sequence to accept, but keep a broken
+					// admission path from hanging the whole package indefinitely.
+					sendAdmissionTimeout,
 				)
 				if !success {
 					t.Errorf("send %d/%d refused", i, j)
@@ -904,7 +906,21 @@ func TestTransferBudgetLiveness(t *testing.T) {
 			}
 		}(i)
 	}
-	wg.Wait()
+	producersDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(producersDone)
+	}()
+	select {
+	case <-producersDone:
+	case <-time.After(sendAdmissionTimeout + 5*time.Second):
+		cancel()
+		<-producersDone
+		t.Fatal("send producers did not finish within the admission bound")
+	}
+	if t.Failed() {
+		return
+	}
 
 	// every message delivers and acks despite the exhausted pool
 	deadline := time.Now().Add(60 * time.Second)

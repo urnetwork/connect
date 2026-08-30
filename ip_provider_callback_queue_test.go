@@ -249,6 +249,96 @@ func TestRemoteUserNatProviderUdpReturnCallbackDoesNotWaitForClientSend(t *testi
 	})
 }
 
+// A datagram sender worker is still shared across unrelated flows after the
+// receive callback hands ownership to its bounded queue. It must therefore use
+// a zero-wait Transfer admission even when the provider's reliable-socket
+// timeout is long.
+func TestRemoteUserNatProviderUdpReturnWorkerDoesNotWaitForClientSend(t *testing.T) {
+	settings := DefaultRemoteUserNatProviderSettings()
+	settings.WriteTimeout = time.Hour
+	settings.ReturnSendWorkerCount = 1
+	settings.ReturnSendQueueSize = 1
+	provider, client, _ := newProviderTransferKeyTestFixtureWithSettings(t, settings)
+	peerId := NewId()
+	sequence := installProviderReturnTestSequence(t, provider, client, sendSequenceId{
+		Destination:       peerId,
+		CompanionContract: true,
+	})
+	sequence.packs = make(chan *SendPack)
+	sendResults := make(chan providerReturnSendResult, 1)
+	provider.afterReturnSendForTest = func(result providerReturnSendResult) {
+		sendResults <- result
+	}
+	packet := MessagePoolCopy(craftSecurityPacket(
+		IpProtocolUdp,
+		net.ParseIP("203.0.113.7"),
+		8080,
+		net.ParseIP("10.0.0.9"),
+		42001,
+		false,
+		[]byte("nonblocking worker"),
+	))
+	packetByteCount := ByteCount(len(packet))
+	ipPath, err := ParseIpPath(packet)
+	if err != nil {
+		MessagePoolReturn(packet)
+		t.Fatalf("parse provider return packet: %v", err)
+	}
+	provider.Receive(
+		SourceId(peerId),
+		protocol.ProvideMode_Public,
+		ipPath,
+		packet,
+	)
+	waitProviderReturnSendResult(t, sendResults, false, 1, packetByteCount)
+	if !MessagePoolReturn(packet) {
+		t.Fatal("rejected datagram return retained its borrowed packet share")
+	}
+	drops := provider.CongestionDropStats()
+	if drops.ReturnSendPacketCount != 1 || drops.ReturnSendByteCount != packetByteCount {
+		t.Fatalf("datagram send drops=%+v, want one rejected packet", drops)
+	}
+}
+
+// A dedicated socket reader retains its consumed bytes across failed attempts,
+// and synthesized control can be regenerated after a shared sender's zero-wait
+// refusal. An arbitrary public callback makes neither ownership promise.
+func TestRemoteUserNatProviderReturnRecoveryOptionClassifiesOwnedRecovery(t *testing.T) {
+	provider := &RemoteUserNatProvider{}
+	for _, testCase := range []struct {
+		name            string
+		recoveryMode    receiveRecoveryMode
+		wantRecoverable bool
+	}{
+		{
+			name:         "public callback",
+			recoveryMode: receiveRecoveryModeNonblocking,
+		},
+		{
+			name:            "dedicated socket",
+			recoveryMode:    receiveRecoveryModeTcpSocket,
+			wantRecoverable: true,
+		},
+		{
+			name:            "regenerable control",
+			recoveryMode:    receiveRecoveryModeRegenerableControl,
+			wantRecoverable: true,
+		},
+	} {
+		option := provider.returnSendRecoveryOption(&providerReturnItem{
+			recoveryMode: testCase.recoveryMode,
+		})
+		if option.upstreamRecoverable != testCase.wantRecoverable {
+			t.Fatalf(
+				"%s recovery option=%t, want %t",
+				testCase.name,
+				option.upstreamRecoverable,
+				testCase.wantRecoverable,
+			)
+		}
+	}
+}
+
 // Exported/public TCP callbacks have no dedicated socket reader that can
 // recover consumed bytes. They therefore return after one nonblocking queue
 // admission and record a rejected downstream send without retrying.
@@ -359,11 +449,22 @@ func TestRemoteUserNatProviderUdpReturnQueueIsBoundedAndOrdered(t *testing.T) {
 		sendResults <- result
 	}
 	started := make(chan struct{}, 3)
+	releaseFirst := make(chan struct{})
+	var releaseFirstOnce sync.Once
+	t.Cleanup(func() {
+		releaseFirstOnce.Do(func() {
+			close(releaseFirst)
+		})
+	})
+	var blockFirst sync.Once
 	provider.returnSendStarted = func() {
 		select {
 		case started <- struct{}{}:
 		default:
 		}
+		blockFirst.Do(func() {
+			<-releaseFirst
+		})
 	}
 
 	packets := make([][]byte, 3)
@@ -420,6 +521,10 @@ func TestRemoteUserNatProviderUdpReturnQueueIsBoundedAndOrdered(t *testing.T) {
 		t.Fatalf("overflow changed provider sender queue size to %d, want 1", queueSize)
 	}
 
+	sequence.packs = make(chan *SendPack, 1)
+	releaseFirstOnce.Do(func() {
+		close(releaseFirst)
+	})
 	first := waitProviderReturnTestPack(t, sequence)
 	if !bytes.Equal(providerCallbackQueuePacketBytes(t, first), expectedPackets[0]) {
 		t.Fatal("provider changed the first queued packet")
@@ -641,9 +746,9 @@ func TestRemoteUserNatProviderOrphanRstDoesNotBlockLocalNatShard(t *testing.T) {
 				transferKey,
 			)
 		}
-		if observation.recoveryMode != receiveRecoveryModeNonblocking {
+		if observation.recoveryMode != receiveRecoveryModeRegenerableControl {
 			t.Fatalf(
-				"orphan RST %d recovery mode=%d, want nonblocking",
+				"orphan RST %d recovery mode=%d, want regenerable control",
 				observationIndex,
 				observation.recoveryMode,
 			)
@@ -1295,6 +1400,7 @@ func TestRemoteUserNatProviderCloseInterruptsAndDrainsDatagramReturnQueue(t *tes
 		case started <- struct{}{}:
 		default:
 		}
+		<-provider.ctx.Done()
 	}
 	packets := [][]byte{
 		MessagePoolCopy(craftSecurityPacket(
@@ -1327,7 +1433,7 @@ func TestRemoteUserNatProviderCloseInterruptsAndDrainsDatagramReturnQueue(t *tes
 	select {
 	case <-started:
 	case <-time.After(time.Second):
-		t.Fatal("provider return worker did not block on the fake sequence")
+		t.Fatal("provider return worker did not reach the shutdown barrier")
 	}
 	waitProviderCallbackReturn(t, func() {
 		provider.receiveTransfer(source, transferKey, protocol.ProvideMode_Public, ipPath, packets[1])

@@ -4,6 +4,7 @@ package connect
 
 import (
 	"context"
+	"errors"
 	"io"
 	"math"
 	"net"
@@ -286,7 +287,10 @@ func (self *tcpReorderTestHarness) readPayload(want string) {
 func (self *tcpReorderTestHarness) requireUpstreamEof() {
 	self.t.Helper()
 
-	if err := self.upstreamSocket.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+	// The sequence closes its net.Pipe endpoint as soon as it forwards FIN.
+	// net.Pipe rejects deadline changes once either endpoint is closed, which is
+	// already the condition this helper is about to require.
+	if err := self.upstreamSocket.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil && !errors.Is(err, io.ErrClosedPipe) {
 		self.t.Fatalf("set upstream FIN deadline: %v", err)
 	}
 	buffer := make([]byte, 1)
@@ -295,6 +299,17 @@ func (self *tcpReorderTestHarness) requireUpstreamEof() {
 	if n != 0 || err != io.EOF {
 		self.t.Fatalf("upstream FIN read=(%d, %v), want (0, EOF)", n, err)
 	}
+}
+
+// The FIN assertion is independent of whether the sequence closes immediately
+// before or immediately after the test installs its read deadline.
+func TestTcpReorderHarnessAcceptsPeerCloseBeforeEofDeadline(t *testing.T) {
+	sequenceSocket, upstreamSocket := net.Pipe()
+	if err := sequenceSocket.Close(); err != nil {
+		t.Fatal(err)
+	}
+	defer upstreamSocket.Close()
+	(&tcpReorderTestHarness{t: t, upstreamSocket: upstreamSocket}).requireUpstreamEof()
 }
 
 // Tears down the sequence and waits until every retained item is owned by

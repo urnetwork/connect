@@ -68,14 +68,19 @@ type ReceivePacketFunction func(source TransferPath, provideMode protocol.Provid
 // ReceivePacketFunction.
 type ReceivePacketsFunction func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packets [][]byte)
 
-// Identifies whether the callback owns irreplaceable upstream TCP state. It is
-// deliberately independent of the wire protocol: synthesized controls and
-// public callbacks retain the conservative nonblocking recovery contract.
+// Identifies the provider return's recovery promise after failed admission. It
+// is deliberately independent of the wire protocol: socket data stays retained,
+// internal controls can be regenerated, and arbitrary public callbacks make no
+// recovery promise.
 type receiveRecoveryMode int
 
 const (
 	receiveRecoveryModeNonblocking receiveRecoveryMode = iota
 	receiveRecoveryModeTcpSocket
+	// A synthesized ACK, reset, or unreachable response is safe to refuse
+	// without blocking its producer: the peer's retry elicits another response.
+	// Keep that promise distinct from arbitrary public callbacks.
+	receiveRecoveryModeRegenerableControl
 )
 
 // Internal provider delivery retains the receiver-visible transfer identity
@@ -672,6 +677,10 @@ type LocalUserNat struct {
 	log       Logger
 
 	sendPackets chan *SendPacket
+	sendLock    sync.Mutex
+	sendClosed  bool
+	sendWg      sync.WaitGroup
+	runDone     chan struct{}
 
 	settings *LocalUserNatSettings
 
@@ -732,6 +741,7 @@ func NewLocalUserNat(ctx context.Context, clientTag string, settings *LocalUserN
 		clientTag:                       clientTag,
 		log:                             log,
 		sendPackets:                     make(chan *SendPacket, settings.SequenceBufferSize),
+		runDone:                         make(chan struct{}),
 		settings:                        settings,
 		receiveCallbacks:                NewCallbackList[ReceivePacketFunction](),
 		receiveTransferCallbacks:        NewCallbackList[receiveTransferPacketFunction](),
@@ -739,7 +749,10 @@ func NewLocalUserNat(ctx context.Context, clientTag string, settings *LocalUserN
 		receiveTransferPacketsCallbacks: NewCallbackList[receiveTransferPacketsFunction](),
 		tcpFlowCloseCallbacks:           NewCallbackList[tcpFlowCloseFunction](),
 	}
-	go HandleError(localUserNat.Run)
+	go func() {
+		defer close(localUserNat.runDone)
+		HandleError(localUserNat.Run)
+	}()
 
 	return localUserNat
 }
@@ -800,6 +813,11 @@ func (self *LocalUserNat) sendTransferPacketsWithTimeout(
 	packets [][]byte,
 	timeout time.Duration,
 ) bool {
+	if !self.beginSend() {
+		return false
+	}
+	defer self.sendWg.Done()
+
 	sendPacket := &SendPacket{
 		source:      source.LocalMask(),
 		transferKey: transferKey,
@@ -840,6 +858,27 @@ func (self *LocalUserNat) sendTransferPacketsWithTimeout(
 			return false
 		}
 	}
+}
+
+// beginSend registers one sender before shutdown can start waiting for all
+// possible channel publications. The lock makes WaitGroup.Add and Wait
+// mutually exclusive, so a canceled NAT cannot acquire a late queued batch.
+func (self *LocalUserNat) beginSend() bool {
+	self.sendLock.Lock()
+	defer self.sendLock.Unlock()
+	if self.sendClosed || self.ctx.Err() != nil {
+		return false
+	}
+	self.sendWg.Add(1)
+	return true
+}
+
+// stopSending closes admission and releases senders blocked on a full queue.
+func (self *LocalUserNat) stopSending() {
+	self.sendLock.Lock()
+	self.sendClosed = true
+	self.sendLock.Unlock()
+	self.cancel()
 }
 
 // `SendPacketFunction`
@@ -985,9 +1024,19 @@ func (self *LocalUserNat) closeTcpFlow(source TransferPath, ipPath *IpPath) {
 }
 
 func (self *LocalUserNat) Run() {
-	defer self.cancel()
-
 	shardCount := max(1, self.settings.SendShardCount)
+	var shardSendPackets []chan *SendPacket
+	var shardWg sync.WaitGroup
+	defer func() {
+		self.stopSending()
+		self.sendWg.Wait()
+		shardWg.Wait()
+		returnQueuedSendPackets(self.sendPackets)
+		for _, sendPackets := range shardSendPackets {
+			returnQueuedSendPackets(sendPackets)
+		}
+	}()
+
 	if shardCount == 1 {
 		self.runSendShard(self.sendPackets)
 		return
@@ -995,13 +1044,17 @@ func (self *LocalUserNat) Run() {
 
 	// shard the send dispatch. flows are pinned to a shard by their address
 	// tuple, which preserves the per flow lossless in-order assumption.
-	shardSendPackets := make([]chan *SendPacket, shardCount)
+	shardSendPackets = make([]chan *SendPacket, shardCount)
 	for i := 0; i < shardCount; i += 1 {
 		sendPackets := make(chan *SendPacket, self.settings.SequenceBufferSize)
 		shardSendPackets[i] = sendPackets
-		go HandleError(func() {
-			self.runSendShard(sendPackets)
-		}, self.cancel)
+		shardWg.Add(1)
+		go func() {
+			defer shardWg.Done()
+			HandleError(func() {
+				self.runSendShard(sendPackets)
+			}, self.cancel)
+		}()
 	}
 
 	forward := func(shard int, sendPacket *SendPacket) bool {
@@ -1082,6 +1135,21 @@ send:
 					continue send
 				}
 			}
+		}
+	}
+}
+
+// returnQueuedSendPackets releases packet ownership left in a retired dispatch
+// queue. Callers first stop and join every possible producer of the queue.
+func returnQueuedSendPackets(sendPackets chan *SendPacket) {
+	for {
+		select {
+		case sendPacket := <-sendPackets:
+			for _, packet := range sendPacket.packets {
+				MessagePoolReturn(packet)
+			}
+		default:
+			return
 		}
 	}
 }
@@ -1435,7 +1503,7 @@ send:
 }
 
 func (self *LocalUserNat) Close() {
-	self.cancel()
+	self.stopSending()
 }
 
 // a batch of packets from one source
@@ -3413,7 +3481,7 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 				source,
 				transferKey,
 				provideMode,
-				receiveRecoveryModeNonblocking,
+				receiveRecoveryModeRegenerableControl,
 				&IpPath{
 					Version:         ipVersion,
 					Protocol:        IpProtocolTcp,
@@ -4054,10 +4122,13 @@ func (self *TcpSequence) Run() {
 					rstPacket, rstErr = self.RstAck()
 				}()
 				if rstErr == nil {
-					self.receivePacket(rstPacket, receiveRecoveryModeNonblocking)
+					self.receivePacket(rstPacket, receiveRecoveryModeRegenerableControl)
 				}
 			case dialFailureUnreachable:
-				self.receivePacket(MessagePoolCopy(signal), receiveRecoveryModeNonblocking)
+				self.receivePacket(
+					MessagePoolCopy(signal),
+					receiveRecoveryModeRegenerableControl,
+				)
 			}
 		}
 		return
@@ -4494,7 +4565,7 @@ func (self *TcpSequence) Run() {
 			default:
 			}
 
-			self.receivePacket(packet, receiveRecoveryModeNonblocking)
+			self.receivePacket(packet, receiveRecoveryModeRegenerableControl)
 
 			if 0 < self.tcpBufferSettings.AckCompressTimeout {
 				// coalesce acks up to the timeout.
@@ -4643,7 +4714,7 @@ func (self *TcpSequence) Run() {
 		case <-self.ctx.Done():
 			MessagePoolReturn(packet)
 		default:
-			self.receivePacket(packet, receiveRecoveryModeNonblocking)
+			self.receivePacket(packet, receiveRecoveryModeRegenerableControl)
 		}
 	}
 
@@ -6202,6 +6273,30 @@ func (self *RemoteUserNatProvider) retryReturnSend(
 	}
 }
 
+// only one dedicated TCP socket reader can retain consumed upstream bytes
+// while Transfer admission waits. Datagram and shared callback workers serve
+// unrelated flows, so one full destination must receive a zero-wait refusal
+// instead of parking that worker for the provider-wide write timeout.
+func (self *RemoteUserNatProvider) returnWriteTimeout(item *providerReturnItem) time.Duration {
+	if item.recoveryMode == receiveRecoveryModeTcpSocket {
+		return self.settings.WriteTimeout
+	}
+	return 0
+}
+
+// A dedicated TCP socket reader retains the exact consumed bytes until a
+// later attempt succeeds, while synthesized controls can be regenerated when
+// the peer retries. This metadata changes measurement only; it never changes
+// Transfer admission, retry, or ownership.
+func (self *RemoteUserNatProvider) returnSendRecoveryOption(
+	item *providerReturnItem,
+) sendPackUpstreamRecoveryOption {
+	return sendPackUpstreamRecoveryOption{
+		upstreamRecoverable: item.recoveryMode == receiveRecoveryModeTcpSocket ||
+			item.recoveryMode == receiveRecoveryModeRegenerableControl,
+	}
+}
+
 // sendReturnPacket transfers one packet share to Transfer on success. A
 // rejected socket-owned TCP attempt retains and retries the exact same bytes.
 func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bool {
@@ -6215,6 +6310,8 @@ func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bo
 		item.ipProtocol,
 	)
 	destinationId := item.source.SourceId
+	writeTimeout := self.returnWriteTimeout(item)
+	recoveryOption := self.returnSendRecoveryOption(item)
 	transportAttribution := newTransportPacketAttribution(
 		self.packetStatsCounters,
 		1,
@@ -6229,12 +6326,13 @@ func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bo
 				destinationId,
 				self.returnAckTargetForTest,
 				0,
-				self.settings.WriteTimeout,
+				writeTimeout,
 				returnOption,
 				returnTransferKey,
 				Ctx(self.ctx),
 				sendSchedulingKeyOption{key: item.schedulingKey},
 				observeTransportWrite(transportAttribution.observe),
+				recoveryOption,
 			)
 			return attemptSent
 		})
@@ -6259,12 +6357,13 @@ func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bo
 				frame,
 				destinationId,
 				func(err error) {},
-				self.settings.WriteTimeout,
+				writeTimeout,
 				returnOption,
 				returnTransferKey,
 				Ctx(self.ctx),
 				sendSchedulingKeyOption{key: item.schedulingKey},
 				observeTransportWrite(transportAttribution.observe),
+				recoveryOption,
 			)
 		})
 		if !sent {
@@ -6317,6 +6416,8 @@ func (self *RemoteUserNatProvider) sendReturnBatchWithLimits(
 		item.ipProtocol,
 	)
 	destinationId := item.source.SourceId
+	writeTimeout := self.returnWriteTimeout(item)
+	recoveryOption := self.returnSendRecoveryOption(item)
 	frames := make([]*protocol.Frame, 0, maxFrames)
 	wrappedShares := make([][]byte, 0, maxFrames)
 	var chunkBytes int64
@@ -6344,12 +6445,13 @@ func (self *RemoteUserNatProvider) sendReturnBatchWithLimits(
 					sendFrames,
 					destinationId,
 					func(err error) {},
-					self.settings.WriteTimeout,
+					writeTimeout,
 					returnOption,
 					returnTransferKey,
 					Ctx(self.ctx),
 					sendSchedulingKeyOption{key: item.schedulingKey},
 					observeTransportWrite(transportAttribution.observe),
+					recoveryOption,
 				)
 				return admitted
 			},
@@ -6964,7 +7066,7 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 								resetSource,
 								transferKey,
 								resetProvideMode,
-								receiveRecoveryModeNonblocking,
+								receiveRecoveryModeRegenerableControl,
 								resetPath,
 								reset,
 								afterResetRelease,

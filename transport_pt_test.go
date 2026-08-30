@@ -40,7 +40,10 @@ func TestPtDnsPumpEncodeDecode(t *testing.T) {
 	ptEncodeDecodeTest(t, PacketTranslationModeDnsPump, PacketTranslationModeDecode53RequireDnsPump)
 }
 
-func TestPacketTranslationReadyDeadlineDoesNotAddAllocations(t *testing.T) {
+// A synchronous translated write needs a deadline timer while its encoder owns
+// the packet. Keep that fixed cost bounded, and preserve the allocation-free
+// ready-read path.
+func TestPacketTranslationReadyDeadlineAllocationIsBounded(t *testing.T) {
 	measureWrite := func(withDeadline bool) float64 {
 		pt := &packetTranslation{
 			ctx:                  context.Background(),
@@ -48,6 +51,24 @@ func TestPacketTranslationReadyDeadlineDoesNotAddAllocations(t *testing.T) {
 			out:                  make(chan *packet, 1),
 			writeDeadlineMonitor: NewMonitor(),
 		}
+		consumerDone := make(chan struct{})
+		consumerExited := make(chan struct{})
+		defer func() {
+			close(consumerDone)
+			<-consumerExited
+		}()
+		go func() {
+			defer close(consumerExited)
+			for {
+				select {
+				case queued := <-pt.out:
+					MessagePoolReturn(queued.data)
+					finishPacketWrite(queued, nil)
+				case <-consumerDone:
+					return
+				}
+			}
+		}()
 		if withDeadline {
 			pt.writeDeadline = time.Now().Add(time.Hour)
 		}
@@ -57,8 +78,6 @@ func TestPacketTranslationReadyDeadlineDoesNotAddAllocations(t *testing.T) {
 			if _, err := pt.WriteTo(packetData, addr); err != nil {
 				panic(err)
 			}
-			queued := <-pt.out
-			MessagePoolReturn(queued.data)
 		})
 	}
 	measureRead := func(withDeadline bool) float64 {
@@ -84,7 +103,15 @@ func TestPacketTranslationReadyDeadlineDoesNotAddAllocations(t *testing.T) {
 		})
 	}
 
-	AssertEqual(t, measureWrite(false), measureWrite(true))
+	writeAllocations := measureWrite(false)
+	deadlineWriteAllocations := measureWrite(true)
+	if writeAllocations+4 < deadlineWriteAllocations {
+		t.Fatalf(
+			"ready write deadline allocations = %.2f, without deadline %.2f",
+			deadlineWriteAllocations,
+			writeAllocations,
+		)
+	}
 	AssertEqual(t, measureRead(false), measureRead(true))
 }
 
@@ -118,6 +145,139 @@ func TestPtDnsPumpZeroWriteRateDisablesPacing(t *testing.T) {
 	packetData := make([]byte, 2048)
 	if _, _, err := destinationConn.ReadFrom(packetData); err != nil {
 		t.Fatalf("unpaced dns translation did not write: %v", err)
+	}
+}
+
+// packetTranslationLifecyclePacketConn holds the first encoded write until
+// Close, making the translation's owned out queue deterministic.
+type packetTranslationLifecyclePacketConn struct {
+	closed       chan struct{}
+	writeStarted chan struct{}
+	closeOnce    sync.Once
+	writeOnce    sync.Once
+}
+
+func newPacketTranslationLifecyclePacketConn() *packetTranslationLifecyclePacketConn {
+	return &packetTranslationLifecyclePacketConn{
+		closed:       make(chan struct{}),
+		writeStarted: make(chan struct{}),
+	}
+}
+
+func (self *packetTranslationLifecyclePacketConn) ReadFrom([]byte) (int, net.Addr, error) {
+	<-self.closed
+	return 0, nil, net.ErrClosed
+}
+
+func (self *packetTranslationLifecyclePacketConn) WriteTo([]byte, net.Addr) (int, error) {
+	self.writeOnce.Do(func() { close(self.writeStarted) })
+	<-self.closed
+	return 0, net.ErrClosed
+}
+
+func (self *packetTranslationLifecyclePacketConn) LocalAddr() net.Addr {
+	return &net.UDPAddr{}
+}
+
+func (self *packetTranslationLifecyclePacketConn) Close() error {
+	self.closeOnce.Do(func() { close(self.closed) })
+	return nil
+}
+
+func (self *packetTranslationLifecyclePacketConn) SetDeadline(time.Time) error {
+	return nil
+}
+
+func (self *packetTranslationLifecyclePacketConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+
+func (self *packetTranslationLifecyclePacketConn) SetWriteDeadline(time.Time) error {
+	return nil
+}
+
+// Close joins a blocked encoder and decoder, wakes every synchronous WriteTo,
+// then returns both outbound copies and an inbound packet at the PacketConn edge.
+func TestPacketTranslationCloseReturnsQueuedPacketOwnership(t *testing.T) {
+	beforeTaken, beforeReturned, _ := MessagePoolCounts()
+	beforeOutstanding := int64(beforeTaken) - int64(beforeReturned)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	packetConn := newPacketTranslationLifecyclePacketConn()
+	settings := DefaultPacketTranslationSettings()
+	settings.DnsTlds = [][]byte{[]byte("example.com.")}
+	settings.SequenceBufferSize = 8
+	settings.WritePacketsPerSecond = 0
+	translation, err := NewPacketTranslation(
+		ctx,
+		PacketTranslationModeDns,
+		packetConn,
+		settings,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	addr := &net.UDPAddr{}
+	writeResults := make(chan error, settings.SequenceBufferSize+1)
+	startWrite := func(data []byte) {
+		go func() {
+			_, writeErr := translation.WriteTo(data, addr)
+			writeResults <- writeErr
+		}()
+	}
+	startWrite([]byte("blocked encoder"))
+	select {
+	case <-packetConn.writeStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("packet translation encoder did not reach the blocked write")
+	}
+	select {
+	case err := <-writeResults:
+		t.Fatalf("WriteTo returned before its wire write completed: %v", err)
+	default:
+	}
+	for packetIndex := 0; packetIndex < settings.SequenceBufferSize; packetIndex++ {
+		startWrite([]byte("queued packet"))
+	}
+	queueDeadline := time.Now().Add(5 * time.Second)
+	for len(translation.out) != settings.SequenceBufferSize {
+		if queueDeadline.Before(time.Now()) {
+			t.Fatalf("queued writes = %d, want %d", len(translation.out), settings.SequenceBufferSize)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	translation.in <- &packet{
+		data: MessagePoolCopy([]byte("queued inbound packet")),
+		addr: addr,
+	}
+
+	if err := translation.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for writeIndex := 0; writeIndex < settings.SequenceBufferSize+1; writeIndex++ {
+		select {
+		case writeErr := <-writeResults:
+			if writeErr == nil {
+				t.Fatalf("write %d succeeded although its wire operation was interrupted", writeIndex)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("write %d did not return after Close", writeIndex)
+		}
+	}
+	if _, err := translation.WriteTo([]byte("late packet"), addr); err == nil {
+		t.Fatal("closed packet translation admitted a late write")
+	}
+
+	afterTaken, afterReturned, _ := MessagePoolCounts()
+	afterOutstanding := int64(afterTaken) - int64(afterReturned)
+	if afterOutstanding != beforeOutstanding {
+		t.Fatalf(
+			"packet translation close left pooled buffers outstanding: %d -> %d",
+			beforeOutstanding,
+			afterOutstanding,
+		)
 	}
 }
 

@@ -508,16 +508,20 @@ enum EncryptedControlType {
     EncryptedControlIdentityProof = 2;
     // Undecryptable-wrap feedback (changes 2026-08): the receiver of a wrapped
     // frame that no local session/epoch can open sends this (no payload,
-    // rate-limited) back to the sealer. `session_role` is the NACKING
+    // rate-limited) back to the sealer. `session_role` is the nacking
     // session's role per the envelope convention, so the sealer routes it to
     // its complement (client) session; `epoch_id` is the epoch the nacking
-    // side can currently read, unset when it has none (e.g. a process restart
-    // that lost the responder session).
+    // side can currently read or is actively establishing, unset when it has
+    // neither (e.g. a process restart that lost the responder session). The
+    // establishing case distinguishes the ordinary window where the TLS
+    // initiator seals first from genuine state loss: destroying the healthy
+    // initiator epoch there puts its replacement ClientHello behind the
+    // dropped application's receive-sequence gap.
     //
-    // The sealer acts ONLY when the nacked epoch differs from its own
-    // established epoch — a nack echoing its current epoch means the peer can
-    // read it (the failed unwrap was corruption in flight), and is ignored.
-    // On genuine desync the sealer DEMOTES the dead epochs (the peer provably
+    // The sealer acts only when `epoch_id` is unset. A real epoch means the
+    // peer can read that generation or is already converging onto one the
+    // initiator minted, so moving the target with another restart is wrong.
+    // On genuine desync the sealer demotes the dead epochs (the peer provably
     // cannot read them) and re-handshakes; each mode's own contract then
     // recovers the flow: Opportunistic resends re-wrap as plaintext (its
     // fail-open baseline; a forged nack can force this rate-limited window,

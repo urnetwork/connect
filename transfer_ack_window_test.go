@@ -5,7 +5,146 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/urnetwork/connect/protocol"
 )
+
+// immediateAckTestWriter returns a peer Ack from inside the initial route
+// write, before the sender can execute anything after that call.
+type immediateAckTestWriter struct {
+	t           *testing.T
+	sequence    *SendSequence
+	handoff     receiveAckHandoffResult
+	handoffErr  error
+	writeCalled bool
+}
+
+// Write consumes the successful route share after synchronously handing its
+// decoded Pack back to the sequence as a cumulative Ack.
+func (self *immediateAckTestWriter) Write(
+	ctx context.Context,
+	transferFrameBytes []byte,
+	timeout time.Duration,
+) error {
+	defer MessagePoolReturn(transferFrameBytes)
+	self.writeCalled = true
+	pack := decodeSendPackLifecycleWirePack(self.t, transferFrameBytes)
+	messageId, err := IdFromBytes(pack.MessageId)
+	if err != nil {
+		self.t.Fatalf("decode immediate Ack message id: %v", err)
+	}
+	sequenceId, err := IdFromBytes(pack.SequenceId)
+	if err != nil {
+		self.t.Fatalf("decode immediate Ack sequence id: %v", err)
+	}
+	self.handoff, self.handoffErr = self.sequence.ackMessageDetailed(
+		receiveAckMessage{
+			messageId:  messageId,
+			sequenceId: sequenceId,
+		},
+		0,
+	)
+	return nil
+}
+
+// WriteDetailed implements the compatibility writer path used outside this
+// regression; this test's sender calls Write directly.
+func (self *immediateAckTestWriter) WriteDetailed(
+	ctx context.Context,
+	transferFrameBytes []byte,
+	timeout time.Duration,
+) (bool, error) {
+	err := self.Write(ctx, transferFrameBytes, timeout)
+	return err == nil, err
+}
+
+// GetActiveRoutes reports no physical routes for this synchronous test writer.
+func (self *immediateAckTestWriter) GetActiveRoutes() []Route {
+	return nil
+}
+
+// GetInactiveRoutes reports no physical routes for this synchronous test writer.
+func (self *immediateAckTestWriter) GetInactiveRoutes() []Route {
+	return nil
+}
+
+// An Ack can return before the initial route write does. The sender must index
+// the item before publication so that Ack becomes pending progress rather than
+// a permanent miss that waits for Transfer recovery.
+func TestInitialWritePublishesAckIdentityBeforePeerExposure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := &Client{
+		ctx:       ctx,
+		clientId:  NewId(),
+		clientTag: "immediate-ack",
+		log:       NewNoopLogger(),
+	}
+	settings := DefaultSendBufferSettings()
+	sequence := NewSendSequence(
+		ctx,
+		client,
+		nil,
+		NewId(),
+		MultiHopId{},
+		false,
+		false,
+		false,
+		sequenceTlsRoleClient,
+		false,
+		settings,
+	)
+	sequence.acks = make(chan receiveAckMessage)
+	writer := &immediateAckTestWriter{t: t, sequence: sequence}
+	sequence.contractMultiRouteWriter = writer
+	sequence.contractMultiRouteWriterDestination = DestinationId(sequence.destination)
+
+	var callbackCount int
+	var callbackErr error
+	messageBytes := MessagePoolCopy([]byte("immediate Ack"))
+	sequence.send(
+		[]*protocol.Frame{{
+			MessageType:  protocol.MessageType_TransferExchangeSignals,
+			MessageBytes: messageBytes,
+		}},
+		func(err error) {
+			callbackCount += 1
+			callbackErr = err
+		},
+		true,
+		false,
+	)
+
+	if !writer.writeCalled || writer.handoffErr != nil ||
+		writer.handoff != receiveAckHandoffAccepted {
+		t.Fatalf(
+			"synchronous Ack write=(called=%t handoff=%d err=%v)",
+			writer.writeCalled,
+			writer.handoff,
+			writer.handoffErr,
+		)
+	}
+	snapshot := sequence.ackWindow.Snapshot(true)
+	if snapshot.ackUpdateCount != 1 {
+		t.Fatalf("synchronous Ack updates=%d, want 1", snapshot.ackUpdateCount)
+	}
+	sequence.receiveAck(
+		snapshot.headAck.messageId,
+		false,
+		snapshot.headAck.tag,
+		snapshot.headAck.compactContractRecoverySupported,
+	)
+	if queueCount, _ := sequence.resendQueue.QueueSize(); queueCount != 0 {
+		t.Fatalf("synchronous Ack left %d resend items", queueCount)
+	}
+	if len(sequence.sendItems) != 0 {
+		t.Fatalf("synchronous Ack left %d send items", len(sequence.sendItems))
+	}
+	if callbackCount != 1 || callbackErr != nil {
+		t.Fatalf("synchronous Ack callback=(count=%d err=%v)", callbackCount, callbackErr)
+	}
+}
 
 func TestReceiveAckH1HandoffWaitRescuesFullCompactQueue(t *testing.T) {
 	settings := DefaultReceiveBufferSettingsWithBufferSize(1)

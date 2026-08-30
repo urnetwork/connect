@@ -2512,7 +2512,16 @@ func (self *PlatformTransport) runH3(
 				}
 				ptSettings := DefaultPacketTranslationSettings()
 				ptSettings.DnsTlds = [][]byte{tld}
-				packetConn, err = NewPacketTranslation(attemptCtx, PacketTranslationModeDns, packetConn, ptSettings)
+				// The connection cleanup owns the translated PacketConn. Keep its
+				// encoder alive while cancellation closes QUIC gracefully; otherwise
+				// the parent cancellation can discard the CONNECTION_CLOSE before
+				// CloseWithError reaches the wire and leave a stale server route.
+				packetConn, err = NewPacketTranslation(
+					context.WithoutCancel(attemptCtx),
+					PacketTranslationModeDns,
+					packetConn,
+					ptSettings,
+				)
 				if err != nil {
 					return nil, err
 				}
@@ -2528,7 +2537,12 @@ func (self *PlatformTransport) runH3(
 				}
 				ptSettings := DefaultPacketTranslationSettings()
 				ptSettings.DnsTlds = [][]byte{tld}
-				packetConn, err = NewPacketTranslation(attemptCtx, PacketTranslationModeDnsPump, packetConn, ptSettings)
+				packetConn, err = NewPacketTranslation(
+					context.WithoutCancel(attemptCtx),
+					PacketTranslationModeDnsPump,
+					packetConn,
+					ptSettings,
+				)
 				if err != nil {
 					return nil, err
 				}

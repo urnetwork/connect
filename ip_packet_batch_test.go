@@ -4,11 +4,80 @@ package connect
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/urnetwork/connect/protocol"
 )
+
+// Closing either dispatch topology must return every pooled packet that was
+// accepted into a queue but not yet handed to a protocol flow.
+func TestLocalUserNatCloseReturnsQueuedPacketOwnership(t *testing.T) {
+	for _, shardCount := range []int{1, 4} {
+		t.Run(fmt.Sprintf("shards-%d", shardCount), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			settings := DefaultLocalUserNatSettingsWithBufferSize(64)
+			settings.SendShardCount = shardCount
+			localUserNat := NewLocalUserNat(ctx, "close-queue-ownership", settings)
+
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			var blockOnce sync.Once
+			localUserNat.afterSendPacketForTest = func() {
+				blockOnce.Do(func() {
+					close(entered)
+					<-release
+				})
+			}
+
+			// The malformed lead packet is returned synchronously by the worker,
+			// then its test edge holds that worker while the owned queue fills.
+			lead := MessagePoolCopy([]byte{0xff})
+			if !localUserNat.SendPacket(SourceId(NewId()), protocol.ProvideMode_Public, lead, time.Second) {
+				MessagePoolReturn(lead)
+				t.Fatal("lead packet was not admitted")
+			}
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("local NAT worker did not reach the disposition edge")
+			}
+
+			witnesses := make([][]byte, 64)
+			for packetIndex := range witnesses {
+				packet := MessagePoolCopy([]byte{0xff})
+				witnesses[packetIndex] = MessagePoolShareReadOnly(packet)
+				if !localUserNat.SendPacket(
+					SourceId(NewId()),
+					protocol.ProvideMode_Public,
+					packet,
+					time.Second,
+				) {
+					MessagePoolReturn(packet)
+					for _, witness := range witnesses[:packetIndex+1] {
+						MessagePoolReturn(witness)
+					}
+					close(release)
+					localUserNat.Close()
+					t.Fatalf("queued packet %d was not admitted", packetIndex)
+				}
+			}
+
+			localUserNat.Close()
+			close(release)
+			select {
+			case <-localUserNat.runDone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("local NAT shutdown did not finish")
+			}
+			requireIpPacketBatchWitnessesReleased(t, witnesses)
+		})
+	}
+}
 
 // Returns pooled UDP packet bytes suitable for exact directional-flow tests.
 func ipPacketBatchTestPacket(sourcePort int, destinationPort int, payload string) []byte {

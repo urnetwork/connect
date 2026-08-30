@@ -134,12 +134,13 @@ func (self sendAckRecord) firstRouteWrite(err error) {
 // One original SendPack retains one immutable identity across coalescing,
 // route disposition, resend ownership, and terminal acknowledgement.
 type sendPackLifecycleRecord struct {
-	observer      func(SendPackLifecycleObservation)
-	clientId      Id
-	destinationId Id
-	token         uint64
-	ackRequired   bool
-	messageType   protocol.MessageType
+	observer            func(SendPackLifecycleObservation)
+	clientId            Id
+	destinationId       Id
+	token               uint64
+	ackRequired         bool
+	messageType         protocol.MessageType
+	upstreamRecoverable bool
 }
 
 // safeSendPackLifecycleObserve prevents optional measurement code from
@@ -191,13 +192,14 @@ func (self sendPackLifecycleRecord) observe(phase SendPackLifecyclePhase, err er
 		return
 	}
 	safeSendPackLifecycleObserve(self.observer, SendPackLifecycleObservation{
-		Phase:         phase,
-		ClientId:      self.clientId,
-		DestinationId: self.destinationId,
-		Token:         self.token,
-		AckRequired:   self.ackRequired,
-		MessageType:   self.messageType,
-		Err:           err,
+		Phase:               phase,
+		ClientId:            self.clientId,
+		DestinationId:       self.destinationId,
+		Token:               self.token,
+		AckRequired:         self.ackRequired,
+		MessageType:         self.messageType,
+		UpstreamRecoverable: self.upstreamRecoverable,
+		Err:                 err,
 	})
 }
 
@@ -870,11 +872,12 @@ type SendPack struct {
 	noAckToken    uint64
 	// Optional all-Pack lifecycle observation follows this original Pack
 	// through coalescing and terminal Ack/error disposition.
-	lifecycleObserver      func(SendPackLifecycleObservation)
-	lifecycleClientId      Id
-	lifecycleToken         uint64
-	lifecycleMessageType   protocol.MessageType
-	transportWriteObserver func(TransportType)
+	lifecycleObserver            func(SendPackLifecycleObservation)
+	lifecycleClientId            Id
+	lifecycleToken               uint64
+	lifecycleMessageType         protocol.MessageType
+	lifecycleUpstreamRecoverable bool
+	transportWriteObserver       func(TransportType)
 	// schedulingKey is local-only pre-sequence metadata. Its exact five-tuple is
 	// never put on the wire; after negotiation only its bounded lane hash enters
 	// the sequence identity. It is cleared when this Pack is recycled.
@@ -898,12 +901,13 @@ func (self *SendPack) ackRecord() sendAckRecord {
 // The immutable lifecycle identity follows this Pack into the send item.
 func (self *SendPack) lifecycleRecord() sendPackLifecycleRecord {
 	return sendPackLifecycleRecord{
-		observer:      self.lifecycleObserver,
-		clientId:      self.lifecycleClientId,
-		destinationId: self.Destination,
-		token:         self.lifecycleToken,
-		ackRequired:   self.Ack,
-		messageType:   self.lifecycleMessageType,
+		observer:            self.lifecycleObserver,
+		clientId:            self.lifecycleClientId,
+		destinationId:       self.Destination,
+		token:               self.lifecycleToken,
+		ackRequired:         self.Ack,
+		messageType:         self.lifecycleMessageType,
+		upstreamRecoverable: self.lifecycleUpstreamRecoverable,
 	}
 }
 
@@ -1161,6 +1165,13 @@ type transferOptionsSetForceStream struct {
 // resend when the initial route attempt failed.
 type transportWriteOption struct {
 	observer func(TransportType)
+}
+
+// sendPackUpstreamRecoveryOption is internal measurement metadata. It marks a
+// caller-owned enclosing transport that retains or can regenerate this Pack
+// after a failed attempt; it never changes Transfer admission or reliability.
+type sendPackUpstreamRecoveryOption struct {
+	upstreamRecoverable bool
 }
 
 func observeTransportWrite(observer func(TransportType)) transportWriteOption {
@@ -2239,18 +2250,19 @@ func (self *Client) SendMultiWithTimeout(
 	resolved := self.resolveSendOptions(opts)
 
 	sendPack := &SendPack{
-		TransferOptions:        resolved.transferOptions,
-		Frames:                 frames,
-		Destination:            destinationId,
-		AckCallback:            ackCallback,
-		MessageByteCount:       MessageByteCount(frames),
-		Ctx:                    resolved.ctx,
-		EncryptionRole:         resolved.encryptionRole,
-		EncryptionCompanion:    resolved.encryptionCompanion,
-		transportWriteObserver: resolved.transportWriteObserver,
-		schedulingKey:          resolved.schedulingKey,
-		logicalLane:            resolved.logicalLane,
-		logicalLaneExplicit:    resolved.logicalLaneExplicit,
+		TransferOptions:              resolved.transferOptions,
+		Frames:                       frames,
+		Destination:                  destinationId,
+		AckCallback:                  ackCallback,
+		MessageByteCount:             MessageByteCount(frames),
+		Ctx:                          resolved.ctx,
+		EncryptionRole:               resolved.encryptionRole,
+		EncryptionCompanion:          resolved.encryptionCompanion,
+		transportWriteObserver:       resolved.transportWriteObserver,
+		schedulingKey:                resolved.schedulingKey,
+		logicalLane:                  resolved.logicalLane,
+		logicalLaneExplicit:          resolved.logicalLaneExplicit,
+		lifecycleUpstreamRecoverable: resolved.upstreamRecoverable,
 	}
 	success, err := self.enqueueSendPack(sendPack, timeout)
 	return success && err == nil
@@ -2321,20 +2333,21 @@ func (self *Client) sendGroupToWithTimeoutDetailed(
 	resolved := self.resolveSendOptions(opts)
 
 	sendPack := &SendPack{
-		TransferOptions:        resolved.transferOptions,
-		Frames:                 frames,
-		logicalGroup:           true,
-		Destination:            destinationId,
-		IntermediaryIds:        intermediaryIds,
-		AckCallback:            ackCallback,
-		MessageByteCount:       MessageByteCount(frames),
-		Ctx:                    resolved.ctx,
-		EncryptionRole:         resolved.encryptionRole,
-		EncryptionCompanion:    resolved.encryptionCompanion,
-		transportWriteObserver: resolved.transportWriteObserver,
-		schedulingKey:          resolved.schedulingKey,
-		logicalLane:            resolved.logicalLane,
-		logicalLaneExplicit:    resolved.logicalLaneExplicit,
+		TransferOptions:              resolved.transferOptions,
+		Frames:                       frames,
+		logicalGroup:                 true,
+		Destination:                  destinationId,
+		IntermediaryIds:              intermediaryIds,
+		AckCallback:                  ackCallback,
+		MessageByteCount:             MessageByteCount(frames),
+		Ctx:                          resolved.ctx,
+		EncryptionRole:               resolved.encryptionRole,
+		EncryptionCompanion:          resolved.encryptionCompanion,
+		transportWriteObserver:       resolved.transportWriteObserver,
+		schedulingKey:                resolved.schedulingKey,
+		logicalLane:                  resolved.logicalLane,
+		logicalLaneExplicit:          resolved.logicalLaneExplicit,
+		lifecycleUpstreamRecoverable: resolved.upstreamRecoverable,
 	}
 	return self.enqueueSendPack(sendPack, timeout)
 }
@@ -2363,15 +2376,16 @@ func (self *Client) sendWithTimeoutDetailed(
 		IntermediaryIds: intermediaryIds,
 		// store the raw callback; invoked via safeAck so no per-send wrapper
 		// closure is allocated.
-		AckCallback:            ackCallback,
-		MessageByteCount:       messageByteCount,
-		Ctx:                    resolved.ctx,
-		EncryptionRole:         resolved.encryptionRole,
-		EncryptionCompanion:    resolved.encryptionCompanion,
-		transportWriteObserver: resolved.transportWriteObserver,
-		schedulingKey:          resolved.schedulingKey,
-		logicalLane:            resolved.logicalLane,
-		logicalLaneExplicit:    resolved.logicalLaneExplicit,
+		AckCallback:                  ackCallback,
+		MessageByteCount:             messageByteCount,
+		Ctx:                          resolved.ctx,
+		EncryptionRole:               resolved.encryptionRole,
+		EncryptionCompanion:          resolved.encryptionCompanion,
+		transportWriteObserver:       resolved.transportWriteObserver,
+		schedulingKey:                resolved.schedulingKey,
+		logicalLane:                  resolved.logicalLane,
+		logicalLaneExplicit:          resolved.logicalLaneExplicit,
+		lifecycleUpstreamRecoverable: resolved.upstreamRecoverable,
 	}
 	return self.enqueueSendPack(sendPack, timeout)
 }
@@ -2386,6 +2400,7 @@ type resolvedSendOptions struct {
 	schedulingKey          sendSchedulingKey
 	logicalLane            uint32
 	logicalLaneExplicit    bool
+	upstreamRecoverable    bool
 }
 
 // Applies options left-to-right. A received TransferKey reproduces the exact
@@ -2435,6 +2450,8 @@ func (self *Client) resolveSendOptions(opts []any) resolvedSendOptions {
 			resolved.transportWriteObserver = v.observer
 		case sendSchedulingKeyOption:
 			resolved.schedulingKey = v.key
+		case sendPackUpstreamRecoveryOption:
+			resolved.upstreamRecoverable = v.upstreamRecoverable
 		}
 	}
 	return resolved
@@ -2516,20 +2533,21 @@ func (self *Client) sendRawToWithTimeoutDetailed(
 		sendPack = &SendPack{}
 	}
 	*sendPack = SendPack{
-		TransferOptions:        resolved.transferOptions,
-		Destination:            destinationId,
-		IntermediaryIds:        intermediaryIds,
-		ackTarget:              ackTarget,
-		ackValue:               ackValue,
-		MessageByteCount:       ByteCount(len(messageBytes)),
-		Ctx:                    resolved.ctx,
-		EncryptionRole:         resolved.encryptionRole,
-		EncryptionCompanion:    resolved.encryptionCompanion,
-		transportWriteObserver: resolved.transportWriteObserver,
-		schedulingKey:          resolved.schedulingKey,
-		logicalLane:            resolved.logicalLane,
-		logicalLaneExplicit:    resolved.logicalLaneExplicit,
-		rawPool:                self.rawSendPacks,
+		TransferOptions:              resolved.transferOptions,
+		Destination:                  destinationId,
+		IntermediaryIds:              intermediaryIds,
+		ackTarget:                    ackTarget,
+		ackValue:                     ackValue,
+		MessageByteCount:             ByteCount(len(messageBytes)),
+		Ctx:                          resolved.ctx,
+		EncryptionRole:               resolved.encryptionRole,
+		EncryptionCompanion:          resolved.encryptionCompanion,
+		transportWriteObserver:       resolved.transportWriteObserver,
+		schedulingKey:                resolved.schedulingKey,
+		logicalLane:                  resolved.logicalLane,
+		logicalLaneExplicit:          resolved.logicalLaneExplicit,
+		lifecycleUpstreamRecoverable: resolved.upstreamRecoverable,
+		rawPool:                      self.rawSendPacks,
 	}
 	sendPack.singleFrameValue = protocol.Frame{
 		MessageType:  messageType,
@@ -2641,12 +2659,13 @@ func (self *Client) startSendPackLifecycle(sendPack *SendPack) {
 	sendPack.lifecycleToken = token
 	sendPack.lifecycleMessageType = messageType
 	safeSendPackLifecycleObserve(lifecycleObserver, SendPackLifecycleObservation{
-		Phase:         SendPackLifecyclePhaseStarted,
-		ClientId:      self.clientId,
-		DestinationId: sendPack.Destination,
-		Token:         token,
-		AckRequired:   sendPack.Ack,
-		MessageType:   messageType,
+		Phase:               SendPackLifecyclePhaseStarted,
+		ClientId:            self.clientId,
+		DestinationId:       sendPack.Destination,
+		Token:               token,
+		AckRequired:         sendPack.Ack,
+		MessageType:         messageType,
+		UpstreamRecoverable: sendPack.lifecycleUpstreamRecoverable,
 	})
 }
 
@@ -3801,7 +3820,11 @@ type SendPackLifecycleObservation struct {
 	Token         uint64
 	AckRequired   bool
 	MessageType   protocol.MessageType
-	Err           error
+	// UpstreamRecoverable is true only when the caller explicitly identifies
+	// an enclosing transport that retains or can regenerate this Pack after a
+	// failed attempt. It is observation metadata and never weakens delivery.
+	UpstreamRecoverable bool
+	Err                 error
 }
 
 // Correlates an encrypted carrier message with its inspectable Transfer
@@ -6046,7 +6069,11 @@ sendSequenceLoop:
 						return !packsClosed
 					}
 					if !complete {
-						scheduler.Push(sendPack)
+						// Physical chunks may rotate between active flows, but the
+						// remaining cursor stays ahead of later groups in this flow.
+						// Requeueing at the tail stripes one TCP stream's segments
+						// across independently admitted provider-return groups.
+						scheduler.PushFront(sendPack)
 					}
 					processingPacks[0] = nil
 					return success && !packsClosed
@@ -6928,6 +6955,14 @@ func (self *SendSequence) sendWithSetContractRecords(
 	self.client.initialSendWriteCount.Add(1)
 	self.client.initialSendFrameCount.Add(uint64(len(sendFrames)))
 	self.client.initialSendMessageByteCount.Add(uint64(messageByteCount))
+	if ack {
+		// Publish acknowledgement identity before any observer or route can expose
+		// the bytes to the peer. A direct route can return its Ack synchronously
+		// inside the write; validation must find the item instead of discarding that
+		// progress and leaving resend admission closed until the recovery timer.
+		self.sendItems = append(self.sendItems, item)
+		self.resendQueue.Add(item)
+	}
 
 	var writeDisposition transferWriteDisposition
 	c := func() error {
@@ -6972,8 +7007,6 @@ func (self *SendSequence) sendWithSetContractRecords(
 			self.observeCarrierWrite(item, writeDisposition)
 			item.resendTime = sendTime.Add(self.resendIntervalForItem(item, 1))
 		}
-		self.sendItems = append(self.sendItems, item)
-		self.resendQueue.Add(item)
 		if self.sendBuffer != nil && self.sendBuffer.afterInitialWriteQueuedForTest != nil {
 			self.sendBuffer.afterInitialWriteQueuedForTest(self.id(), sequenceNumber)
 		}
