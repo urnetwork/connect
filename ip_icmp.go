@@ -273,6 +273,9 @@ type IcmpBuffer[BufferId comparable] struct {
 	icmpBufferSettings             *IcmpBufferSettings
 
 	mutex sync.Mutex
+	// The local NAT closes send admission before waiting, so no Add can race
+	// the terminal Wait.
+	sequenceWaitGroup sync.WaitGroup
 
 	sequences       map[BufferId]*IcmpSequence
 	sourceSequences map[TransferPath]map[BufferId]*IcmpSequence
@@ -383,7 +386,9 @@ func (self *IcmpBuffer[BufferId]) icmpSend(
 			self.sourceSequences[source] = sourceSequences
 		}
 		sourceSequences[bufferId] = sequence
+		self.sequenceWaitGroup.Add(1)
 		go HandleError(func() {
+			defer self.sequenceWaitGroup.Done()
 			defer func() {
 				self.mutex.Lock()
 				defer self.mutex.Unlock()
@@ -417,6 +422,12 @@ func (self *IcmpBuffer[BufferId]) icmpSend(
 		// sequence closed
 		return initSequence(sequence).send(sendItem, timeout)
 	}
+}
+
+// Completion means every admitted echo sequence and its socket reader has
+// released all packet ownership. The caller has already stopped dispatch.
+func (self *IcmpBuffer[BufferId]) waitForLifecycle() {
+	self.sequenceWaitGroup.Wait()
 }
 
 // removeSequenceWithLock removes a sequence from both indexes before canceling
@@ -641,6 +652,8 @@ func (self *IcmpSequence) receivePacket(packet []byte) {
 }
 
 func (self *IcmpSequence) Run() {
+	var childWorkers sync.WaitGroup
+	defer childWorkers.Wait()
 	defer func() {
 		self.cancel()
 
@@ -680,7 +693,9 @@ func (self *IcmpSequence) Run() {
 	self.UpdateLastActivityTime()
 	self.log.V(2).Infof("[init]icmp connect success\n")
 
+	childWorkers.Add(1)
 	go HandleError(func() {
+		defer childWorkers.Done()
 		defer self.cancel()
 
 		for replyIter := uint64(0); ; replyIter += 1 {

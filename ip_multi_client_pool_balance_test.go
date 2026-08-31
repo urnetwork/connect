@@ -464,7 +464,13 @@ func runMultiClientPoolCycle(ctx context.Context, t *testing.T) {
 		protocol.ProvideMode_Network,
 		multiSettings,
 	)
-	defer multi.Close()
+	defer func() {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer closeCancel()
+		if err := multi.CloseAndWait(closeCtx); err != nil {
+			t.Errorf("join multi-client local NAT: %v", err)
+		}
+	}()
 
 	source := SourceId(NewId())
 	for i := 0; i < 20; i += 1 {

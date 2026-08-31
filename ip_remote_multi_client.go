@@ -8398,6 +8398,16 @@ func (self *RemoteUserNatMultiClient) Close() {
 	self.localUserNatUnsub()
 }
 
+// A successful join makes the embedded local packet dispatcher's ownership
+// terminal. Generated network clients remain owned by their generator.
+func (self *RemoteUserNatMultiClient) CloseAndWait(ctx context.Context) error {
+	self.Close()
+	if self.localUserNat == nil {
+		return nil
+	}
+	return self.localUserNat.CloseAndWait(ctx)
+}
+
 type multiClientChannelUpdate struct {
 	ctx    context.Context
 	cancel context.CancelFunc

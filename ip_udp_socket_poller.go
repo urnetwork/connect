@@ -40,7 +40,8 @@ type udpSocketReadPollShard struct {
 }
 
 type udpSocketReadPoller struct {
-	shards []udpSocketReadPollShard
+	shards    []udpSocketReadPollShard
+	waitGroup sync.WaitGroup
 }
 
 func newUdpSocketReadPoller(
@@ -69,9 +70,22 @@ func newUdpSocketReadPoller(
 	poller := &udpSocketReadPoller{shards: shards}
 	for i := range poller.shards {
 		shard := &poller.shards[i]
-		go HandleError(shard.run)
+		poller.waitGroup.Add(1)
+		go HandleError(func() {
+			defer poller.waitGroup.Done()
+			shard.run()
+		})
 	}
 	return poller
+}
+
+// Completion means every readiness shard has stopped reading and can no
+// longer publish a packet into the receive dispatcher.
+func (self *udpSocketReadPoller) waitForLifecycle() {
+	if self == nil {
+		return
+	}
+	self.waitGroup.Wait()
 }
 
 func socketRawConn(socket net.Conn) (syscall.RawConn, bool) {

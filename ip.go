@@ -665,6 +665,9 @@ type LocalUserNatSettings struct {
 	// via a private copy — the caller's settings are never mutated).
 	// nil resolves to `DefaultLogger()`.
 	Log Logger
+	// Tests observe the terminal dispatch-to-flow join edge. Nil is a
+	// production no-op.
+	beforeFlowWorkersWaitForTest func()
 }
 
 // Forwards packets using user-space sockets. Transfer is expected to remain
@@ -697,7 +700,8 @@ type LocalUserNat struct {
 	tcpFlowCloseCallbacks *CallbackList[tcpFlowCloseFunction]
 
 	// Test-only completed-disposition edge. Nil is a production no-op.
-	afterSendPacketForTest func()
+	afterSendPacketForTest   func()
+	beforeRunDoneWaitForTest func()
 }
 
 func NewLocalUserNatWithDefaults(ctx context.Context, clientTag string) *LocalUserNat {
@@ -1215,6 +1219,20 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 	tcp6Buffer.flowCloseCallback = self.closeTcpFlow
 	icmp4Buffer := newIcmp4BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.IcmpBufferSettings)
 	icmp6Buffer := newIcmp6BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.IcmpBufferSettings)
+	defer func() {
+		// Dispatch has stopped and its context is terminal. Join every flow
+		// owner before this shard can publish completion to LocalUserNat.Run.
+		self.cancel()
+		if self.settings.beforeFlowWorkersWaitForTest != nil {
+			self.settings.beforeFlowWorkersWaitForTest()
+		}
+		udp4Buffer.waitForLifecycle()
+		udp6Buffer.waitForLifecycle()
+		tcp4Buffer.waitForLifecycle()
+		tcp6Buffer.waitForLifecycle()
+		icmp4Buffer.waitForLifecycle()
+		icmp6Buffer.waitForLifecycle()
+	}()
 	// the per-flow read-loops route their drained batch through
 	// receiveTransferPackets, which coalesces it into one wire Pack when a batch
 	// consumer is registered (the provider return path) and otherwise
@@ -1504,6 +1522,16 @@ send:
 
 func (self *LocalUserNat) Close() {
 	self.stopSending()
+}
+
+// A successful join is the ownership barrier for queued packets and every
+// protocol-flow worker admitted before Close.
+func (self *LocalUserNat) CloseAndWait(ctx context.Context) error {
+	self.Close()
+	if self.beforeRunDoneWaitForTest != nil {
+		self.beforeRunDoneWaitForTest()
+	}
+	return waitForLifecycleDone(ctx, self.runDone, "local user NAT")
 }
 
 // a batch of packets from one source
@@ -1916,6 +1944,7 @@ type udpReceiveDispatcher struct {
 	ctx       context.Context
 	shards    []udpReceiveDispatchShard
 	nextShard int
+	waitGroup sync.WaitGroup
 }
 
 func newUdpReceiveDispatcher(ctx context.Context, settings *UdpBufferSettings) *udpReceiveDispatcher {
@@ -1950,7 +1979,11 @@ func (dispatcher *udpReceiveDispatcher) enqueue(sequence *UdpSequence, packet []
 	}
 	shard := &dispatcher.shards[sequence.receiveShard]
 	shard.startOnce.Do(func() {
-		go HandleError(shard.run)
+		dispatcher.waitGroup.Add(1)
+		go HandleError(func() {
+			defer dispatcher.waitGroup.Done()
+			shard.run()
+		})
 	})
 	select {
 	case <-dispatcher.ctx.Done():
@@ -1959,6 +1992,34 @@ func (dispatcher *udpReceiveDispatcher) enqueue(sequence *UdpSequence, packet []
 		return false
 	case shard.items <- udpReceiveDispatchItem{sequence: sequence, packet: packet}:
 		return true
+	}
+}
+
+// Completion means every receive shard returned its queued packet owners.
+// The parent first joins every producer, so no shard can start during Wait.
+func (dispatcher *udpReceiveDispatcher) waitForLifecycle() {
+	if dispatcher == nil {
+		return
+	}
+	dispatcher.waitGroup.Wait()
+	// Cancellation and a buffered send can become ready together. The worker's
+	// first drain may therefore finish just before that already-admitted send
+	// publishes. Every producer is joined before this method, so one terminal
+	// drain closes that select race without polling.
+	for i := range dispatcher.shards {
+		returnQueuedUdpDispatchItems(dispatcher.shards[i].items)
+	}
+}
+
+// Releases packet ownership left in a retired receive-dispatch queue.
+func returnQueuedUdpDispatchItems(items chan udpReceiveDispatchItem) {
+	for {
+		select {
+		case item := <-items:
+			MessagePoolReturn(item.packet)
+		default:
+			return
+		}
 	}
 }
 
@@ -1973,14 +2034,7 @@ func (shard *udpReceiveDispatchShard) run() {
 			pending = udpReceiveDispatchItem{}
 			hasPending = false
 		}
-		for {
-			select {
-			case item := <-shard.items:
-				MessagePoolReturn(item.packet)
-			default:
-				return
-			}
-		}
+		returnQueuedUdpDispatchItems(shard.items)
 	}
 
 	for {
@@ -2160,6 +2214,8 @@ type UdpBuffer[BufferId comparable] struct {
 	socketReadPoller               *udpSocketReadPoller
 	sharedLifecycleOnce            sync.Once
 	sharedLifecycleWake            chan struct{}
+	sharedLifecycleWaitGroup       sync.WaitGroup
+	sequenceWaitGroup              sync.WaitGroup
 
 	mutex sync.Mutex
 
@@ -2296,12 +2352,18 @@ func (self *UdpBuffer[BufferId]) udpSend(
 		}
 		if sequence.sharedSocketLifecycle {
 			self.sharedLifecycleOnce.Do(func() {
-				go HandleError(self.runSharedSocketLifecycle)
+				self.sharedLifecycleWaitGroup.Add(1)
+				go HandleError(func() {
+					defer self.sharedLifecycleWaitGroup.Done()
+					self.runSharedSocketLifecycle()
+				})
 			})
 			self.wakeSharedSocketLifecycle()
 		} else {
 			sequence.ensureSendItems()
+			self.sequenceWaitGroup.Add(1)
 			go HandleError(func() {
+				defer self.sequenceWaitGroup.Done()
 				defer func() {
 					self.mutex.Lock()
 					defer self.mutex.Unlock()
@@ -2336,6 +2398,19 @@ func (self *UdpBuffer[BufferId]) udpSend(
 		// sequence closed
 		return initSequence(sequence).send(sendItem, timeout)
 	}
+}
+
+// Completion means every sequence, readiness reader, lifecycle worker, and
+// receive-dispatch shard has released its queued packet owners. The local NAT
+// joins its send dispatcher before calling this method, so sequence admission
+// is already terminal.
+func (self *UdpBuffer[BufferId]) waitForLifecycle() {
+	self.sequenceWaitGroup.Wait()
+	self.sharedLifecycleWaitGroup.Wait()
+	if self.socketReadPoller != nil {
+		self.socketReadPoller.waitForLifecycle()
+	}
+	self.receiveDispatcher.waitForLifecycle()
 }
 
 // removeSequenceWithLock removes a UDP sequence from both indexes before
@@ -2725,6 +2800,8 @@ func (self *UdpSequence) startSharedSocket() bool {
 }
 
 func (self *UdpSequence) Run() {
+	var childWorkers sync.WaitGroup
+	defer childWorkers.Wait()
 	self.ensureSendItems()
 	defer func() {
 		self.cancel()
@@ -2831,7 +2908,11 @@ func (self *UdpSequence) Run() {
 	if self.socketReadPoller != nil && self.socketReadPoller.register(self, socket) {
 		defer self.socketReadPoller.unregister(self)
 	} else {
-		go HandleError(readSocket, self.cancel)
+		childWorkers.Add(1)
+		go HandleError(func() {
+			defer childWorkers.Done()
+			readSocket()
+		}, self.cancel)
 	}
 
 	sendIter := uint64(0)
@@ -3115,6 +3196,9 @@ type TcpBufferSettings struct {
 	// measurement of the tunnel path itself, isolated from origin and
 	// upstream network variability.
 	EnableSyntheticSpeed bool
+	// Tests may hold a newly admitted sequence before it can consume its first
+	// pooled packet. Nil is a production no-op.
+	beforeSequenceRunForTest func()
 
 	ConnectSettings
 }
@@ -3256,6 +3340,9 @@ type TcpBuffer[BufferId comparable] struct {
 	flowCloseCallback              tcpFlowCloseFunction
 
 	mutex sync.Mutex
+	// The local NAT closes send admission before waiting, so no Add can race
+	// the terminal Wait.
+	sequenceWaitGroup sync.WaitGroup
 
 	sequences       map[BufferId]*TcpSequence
 	sourceSequences map[TransferPath]map[BufferId]*TcpSequence
@@ -3453,7 +3540,9 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 			self.sourceSequences[source] = sourceSequences
 		}
 		sourceSequences[bufferId] = sequence
+		self.sequenceWaitGroup.Add(1)
 		go HandleError(func() {
+			defer self.sequenceWaitGroup.Done()
 			defer func() {
 				sequence.Close()
 				self.mutex.Lock()
@@ -3516,6 +3605,12 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 		ipPacket:    ipPacket,
 	}
 	return sequence.send(sendItem, timeout)
+}
+
+// Completion means every admitted TCP sequence and its child workers has
+// released all packet ownership. The caller has already stopped dispatch.
+func (self *TcpBuffer[BufferId]) waitForLifecycle() {
+	self.sequenceWaitGroup.Wait()
 }
 
 // removeSequenceWithLock is the TCP counterpart of the UDP helper above.
@@ -3687,6 +3782,9 @@ type TcpSequence struct {
 	// Tests observe the exact Run boundary immediately before all child workers
 	// are joined. Nil is a production no-op.
 	beforeChildWorkersWaitForTest func()
+	// Tests may hold Run before its first queued owner is consumed. Nil is a
+	// production no-op.
+	beforeRunForTest func()
 	ConnectionState
 }
 
@@ -3753,6 +3851,7 @@ func newTcpSequenceWithTransferKey(
 		idleCondition:     NewIdleCondition(),
 		transferState:     newTransferState(source, transferKey),
 		initialSynSeq:     initialSynSeq,
+		beforeRunForTest:  tcpBufferSettings.beforeSequenceRunForTest,
 		ConnectionState: ConnectionState{
 			source:          source,
 			provideMode:     provideMode,
@@ -4004,6 +4103,9 @@ func (self *TcpSequence) Run() {
 			}
 		}()
 	}()
+	if self.beforeRunForTest != nil {
+		self.beforeRunForTest()
+	}
 	runChildWorker := func(run func()) {
 		childWorkers.Add(1)
 		go HandleError(func() {
@@ -7565,6 +7667,17 @@ func (self *RemoteUserNatClient) Close() {
 	if self.closeCallback != nil {
 		self.closeCallback()
 	}
+}
+
+// A successful join makes this client's local packet dispatcher and all of
+// its protocol flows ownership-terminal. The underlying transfer client
+// remains owned by its caller.
+func (self *RemoteUserNatClient) CloseAndWait(ctx context.Context) error {
+	self.Close()
+	if self.localUserNat == nil {
+		return nil
+	}
+	return self.localUserNat.CloseAndWait(ctx)
 }
 
 func (self *RemoteUserNatClient) SetAllowDirect(allowDirect bool) {
