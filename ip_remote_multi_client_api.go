@@ -72,6 +72,9 @@ type apiWindowClientTransport struct {
 	current  apiWindowPlatformTransport
 	settings *PlatformTransportSettings
 	auth     ClientAuth
+	// Initial setup owns the transport before the provide secret is committed.
+	// Live policy migration must not replace that transport until setup returns.
+	initializing bool
 	// policyVersion identifies the target mode/preferences used to construct
 	// current. A concurrent policy change schedules one follow-up replacement.
 	policyVersion uint64
@@ -175,7 +178,10 @@ type ApiMultiClientGenerator struct {
 	// temporary replacement.
 	transportLock     sync.Mutex
 	transports        map[*Client]*apiWindowClientTransport
+	transportIdle     chan struct{}
 	transportCreation apiTransportCreationLifecycle
+	retirementOnce    sync.Once
+	retirements       *lifecycleAdmission
 	// injectable for deterministic make-before-break tests
 	newPlatformTransport func(
 		client *Client,
@@ -232,6 +238,8 @@ func NewApiMultiClientGenerator(
 ) *ApiMultiClientGenerator {
 	api := NewBringYourApi(ctx, clientStrategy, apiUrl)
 	api.SetByJwt(byJwt)
+	transportIdle := make(chan struct{})
+	close(transportIdle)
 
 	platformTransportMode := settings.PlatformTransportMode
 	if platformTransportMode == TransportModeNone {
@@ -257,6 +265,7 @@ func NewApiMultiClientGenerator(
 		api:                        api,
 		identityState:              newWindowIdentityState(ctx, nil),
 		transports:                 map[*Client]*apiWindowClientTransport{},
+		transportIdle:              transportIdle,
 	}
 }
 
@@ -306,8 +315,10 @@ func (self *ApiMultiClientGenerator) SetPlatformTransportPolicy(
 
 	self.transportLock.Lock()
 	clients := make([]*Client, 0, len(self.transports))
-	for client := range self.transports {
-		clients = append(clients, client)
+	for client, state := range self.transports {
+		if state != nil && !state.initializing {
+			clients = append(clients, client)
+		}
 	}
 	self.transportLock.Unlock()
 	for _, client := range clients {
@@ -330,6 +341,67 @@ func (self *ApiMultiClientGenerator) SetIdentityStore(store MultiClientIdentityS
 // has therefore returned for every generated transport when this returns.
 func (self *ApiMultiClientGenerator) CloseTransportCreationAndWait(ctx context.Context) error {
 	return self.transportCreation.closeAndWait(ctx)
+}
+
+// The retirement gate is lazy so focused tests that construct the generator
+// literally retain the same zero-value behavior as production constructors.
+func (self *ApiMultiClientGenerator) retirementLifecycle() *lifecycleAdmission {
+	self.retirementOnce.Do(func() {
+		self.retirements = newLifecycleAdmission()
+	})
+	return self.retirements
+}
+
+// CloseAndWait prevents new transports, cancels every generated client, waits
+// until each channel has handed its client back through RemoveClientWithArgs,
+// and joins the resulting Client/OOB retirement workers. A successful return
+// therefore makes every generated client's message-pool ownership terminal.
+func (self *ApiMultiClientGenerator) CloseAndWait(ctx context.Context) error {
+	if err := self.CloseTransportCreationAndWait(ctx); err != nil {
+		return err
+	}
+
+	self.transportLock.Lock()
+	clients := make([]*Client, 0, len(self.transports))
+	transports := make([]apiWindowPlatformTransport, 0, len(self.transports))
+	for client, state := range self.transports {
+		clients = append(clients, client)
+		if state != nil && state.current != nil {
+			transports = append(transports, state.current)
+		}
+	}
+	transportIdle := self.transportIdle
+	if 0 < len(self.transports) && transportIdle == nil {
+		transportIdle = make(chan struct{})
+		self.transportIdle = transportIdle
+	}
+	self.transportLock.Unlock()
+
+	// Stop physical ingress before canceling the client. The channel owner sees
+	// Client.Done and synchronously admits its retirement before deleting the
+	// matching transport entry, so the idle edge below cannot outrun admission.
+	for _, transport := range transports {
+		transport.Close()
+	}
+	for _, client := range clients {
+		client.Cancel()
+	}
+	if 0 < len(clients) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-transportIdle:
+		}
+	}
+
+	retirements := self.retirementLifecycle()
+	retirements.close()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-retirements.Done():
+		return nil
+	}
 }
 
 func (self *ApiMultiClientGenerator) NextDestinations(count int, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error) {
@@ -625,11 +697,16 @@ func (self *ApiMultiClientGenerator) RemoveClientArgs(args *MultiClientGenerator
 }
 
 func (self *ApiMultiClientGenerator) RemoveClientWithArgs(client *Client, args *MultiClientGeneratorClientArgs) {
+	retirements := self.retirementLifecycle()
+	retirementAdmitted := retirements.start()
 	var transport apiWindowPlatformTransport
 	self.transportLock.Lock()
 	if state := self.transports[client]; state != nil {
 		delete(self.transports, client)
 		transport = state.current
+		if len(self.transports) == 0 && self.transportIdle != nil {
+			close(self.transportIdle)
+		}
 	}
 	self.transportLock.Unlock()
 	if transport != nil {
@@ -652,6 +729,9 @@ func (self *ApiMultiClientGenerator) RemoveClientWithArgs(client *Client, args *
 	// RemoveClientArgs revokes the identity. Both waits are bounded by the
 	// strategy request timeout, with a defensive 30-second floor.
 	go HandleError(func() {
+		if retirementAdmitted {
+			defer retirements.finish()
+		}
 		<-client.Done()
 		retireTimeout := self.clientStrategy.settings.RequestTimeout
 		if retireTimeout < 30*time.Second {
@@ -719,6 +799,22 @@ func (self *ApiMultiClientGenerator) NewClientContext(
 		}
 	}
 	transport, _, policyVersion := self.createPlatformTransport(client, args.ClientAuth, settings)
+	auth := *args.ClientAuth
+	self.transportLock.Lock()
+	if self.transports == nil {
+		self.transports = map[*Client]*apiWindowClientTransport{}
+	}
+	if len(self.transports) == 0 {
+		self.transportIdle = make(chan struct{})
+	}
+	self.transports[client] = &apiWindowClientTransport{
+		current:       transport,
+		settings:      settings,
+		auth:          auth,
+		initializing:  true,
+		policyVersion: policyVersion,
+	}
+	self.transportLock.Unlock()
 	// Enable return traffic for this client and block until the platform has
 	// committed the provide secret. The companion (Stream) contract on the return
 	// path is verified against this secret, so using the client before it is
@@ -750,33 +846,26 @@ func (self *ApiMultiClientGenerator) NewClientContext(
 	select {
 	case err := <-provideAck:
 		if err != nil {
-			transport.Close()
+			self.RemoveClientWithArgs(client, args)
 			client.Cancel()
 			return nil, err
 		}
 	case <-provideTimer.C:
-		transport.Close()
+		self.RemoveClientWithArgs(client, args)
 		client.Cancel()
 		return nil, fmt.Errorf("provide secret registration timed out")
 	case <-callCtx.Done():
-		transport.Close()
+		self.RemoveClientWithArgs(client, args)
 		client.Cancel()
 		return nil, callCtx.Err()
 	case <-ctx.Done():
-		transport.Close()
+		self.RemoveClientWithArgs(client, args)
 		client.Cancel()
 		return nil, ctx.Err()
 	}
-	auth := *args.ClientAuth
 	self.transportLock.Lock()
-	if self.transports == nil {
-		self.transports = map[*Client]*apiWindowClientTransport{}
-	}
-	self.transports[client] = &apiWindowClientTransport{
-		current:       transport,
-		settings:      settings,
-		auth:          auth,
-		policyVersion: policyVersion,
+	if state := self.transports[client]; state != nil {
+		state.initializing = false
 	}
 	self.transportLock.Unlock()
 	_, _, currentPolicyVersion := self.platformTransportPolicy()
@@ -839,7 +928,7 @@ func (self *ApiMultiClientGenerator) MigrateClientTransport(
 	}()
 	self.transportLock.Lock()
 	state := self.transports[client]
-	if state == nil || state.migrating {
+	if state == nil || state.initializing || state.migrating {
 		self.transportLock.Unlock()
 		return
 	}

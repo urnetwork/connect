@@ -405,3 +405,79 @@ func TestRemoveClientWithArgsJoinsOobBeforeIdentityRevocation(t *testing.T) {
 		t.Fatal("identity was not revoked after cleanup control completed")
 	}
 }
+
+// A generated client's channel hands retirement back asynchronously after its
+// cancellation edge. Generator teardown must wait for that Client/OOB join;
+// otherwise a P2P send route can retain pooled Transfer frames after teardown.
+func TestApiMultiClientGeneratorCloseAndWaitJoinsGeneratedClientRetirement(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	strategySettings := DefaultClientStrategySettings()
+	strategy := NewClientStrategy(ctx, strategySettings)
+	generator := NewApiMultiClientGenerator(
+		ctx,
+		nil,
+		strategy,
+		nil,
+		"http://127.0.0.1:1",
+		"network-jwt",
+		"http://127.0.0.1:1",
+		"test-description",
+		"test-spec",
+		"0.0.0-test",
+		nil,
+		DefaultClientSettings,
+		DefaultApiMultiClientGeneratorSettings(),
+	)
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), closeWaitClientSettings())
+	args := &MultiClientGeneratorClientArgs{
+		ClientId: client.ClientId(),
+		ClientAuth: &ClientAuth{
+			InstanceId: NewId(),
+		},
+	}
+
+	// Model the successful NewClient boundary without making a platform request.
+	// The channel owner observes Client.Done and then returns the client through
+	// the same RemoveClientWithArgs path used by RemoteUserNatMultiClient.
+	generator.transportLock.Lock()
+	generator.transportIdle = make(chan struct{})
+	generator.transports[client] = &apiWindowClientTransport{}
+	generator.transportLock.Unlock()
+	go func() {
+		<-client.Done()
+		generator.RemoveClientWithArgs(client, args)
+	}()
+
+	retirementEntered := make(chan struct{})
+	releaseRetirement := make(chan struct{})
+	var enteredOnce sync.Once
+	var releaseOnce sync.Once
+	client.beforeRunDoneWaitForTest = func() {
+		enteredOnce.Do(func() { close(retirementEntered) })
+		<-releaseRetirement
+	}
+	defer releaseOnce.Do(func() { close(releaseRetirement) })
+
+	closeResult := make(chan error, 1)
+	go func() {
+		closeResult <- generator.CloseAndWait(ctx)
+	}()
+	waitCloseWaitBarrier(t, ctx, retirementEntered, "generated client retirement")
+	select {
+	case err := <-closeResult:
+		t.Fatalf("generator close skipped held client retirement: %v", err)
+	default:
+	}
+
+	releaseOnce.Do(func() { close(releaseRetirement) })
+	select {
+	case err := <-closeResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("wait for generated client retirement: %v", ctx.Err())
+	}
+}
