@@ -7,11 +7,36 @@ package connect
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
 )
+
+func TestContractOpenAckErrorDoesNotPromoteContract(t *testing.T) {
+	contract := &sequenceContract{}
+	sequence := &SendSequence{sendContract: contract}
+	callback := sequence.contractOpenAckCallback(contract)
+
+	callback(errors.New("opening contract send failed"))
+	if sequence.sendContractAcked {
+		t.Fatal("failed contract-open send promoted the contract")
+	}
+
+	callback(nil)
+	if !sequence.sendContractAcked {
+		t.Fatal("successful contract-open Ack did not promote the contract")
+	}
+
+	replacement := &sequenceContract{}
+	sequence.sendContract = replacement
+	sequence.sendContractAcked = false
+	callback(nil)
+	if sequence.sendContractAcked {
+		t.Fatal("late contract-open Ack promoted a replacement contract")
+	}
+}
 
 // Decodes one routed frame borrowed from a test route.
 func decodeCompactContractTestPack(t *testing.T, transferFrameBytes []byte) *protocol.Pack {

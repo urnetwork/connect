@@ -512,7 +512,7 @@ func TestSendPackLifecycleObserverCompletesRejectedPack(t *testing.T) {
 		func(callbackErr error) { callbackResults <- callbackErr },
 		0,
 		Ctx(sendCtx),
-		sendPackUpstreamRecoveryOption{upstreamRecoverable: true},
+		sendPackRecoveryOption{upstreamRecoverable: true},
 	)
 	if success || err == nil {
 		MessagePoolReturn(frame.MessageBytes)

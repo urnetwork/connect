@@ -90,6 +90,7 @@ type sendAckRecord struct {
 	value                  ByteCount
 	lifecycle              sendPackLifecycleRecord
 	group                  *sendGroupCompletion
+	retainAfterAckTimeout  bool
 	transportWriteObserver func(TransportType)
 }
 
@@ -100,7 +101,18 @@ func (self sendAckRecord) observeTransportWrite(transportType TransportType) {
 }
 
 func (self sendAckRecord) empty() bool {
-	return self.callback == nil && self.target == nil && self.lifecycle.empty() && self.group == nil
+	return self.callback == nil && self.target == nil && self.lifecycle.empty() &&
+		self.group == nil && !self.retainAfterAckTimeout
+}
+
+// retainPastAckTimeout reports whether this record contains bytes whose
+// upstream owner cannot regenerate them after Transfer admission. A logical
+// group's immutable parent record owns that promise for every physical chunk.
+func (self sendAckRecord) retainPastAckTimeout() bool {
+	if self.retainAfterAckTimeout {
+		return true
+	}
+	return self.group != nil && self.group.ack.retainAfterAckTimeout
 }
 
 func (self sendAckRecord) invoke(err error) {
@@ -551,6 +563,24 @@ func (self *sendAckSet) observeTransportWrite(transportType TransportType) {
 	}
 }
 
+// One retained record makes the complete serialized item non-discardable: an
+// Ack covers the whole item, so Transfer cannot terminally release only the
+// other coalesced records at the deadline.
+func (self *sendAckSet) retainPastAckTimeout() bool {
+	inlineCount := min(int(self.count), len(self.records))
+	for index := range inlineCount {
+		if self.records[index].retainPastAckTimeout() {
+			return true
+		}
+	}
+	for index := inlineCount; index < int(self.count); index++ {
+		if self.overflow.records[index-len(self.records)].retainPastAckTimeout() {
+			return true
+		}
+	}
+	return false
+}
+
 // The receiver-visible identity of a transfer lane. The callback carries the
 // source separately; peers reproduce these fields when constructing a reply.
 type TransferKey struct {
@@ -877,7 +907,11 @@ type SendPack struct {
 	lifecycleToken               uint64
 	lifecycleMessageType         protocol.MessageType
 	lifecycleUpstreamRecoverable bool
-	transportWriteObserver       func(TransportType)
+	// retainAfterAckTimeout transfers the only recoverable copy to Transfer.
+	// Its serialized resend item remains owned until peer Ack or lifecycle
+	// cancellation instead of becoming a silent loss at the ordinary deadline.
+	retainAfterAckTimeout  bool
+	transportWriteObserver func(TransportType)
 	// schedulingKey is local-only pre-sequence metadata. Its exact five-tuple is
 	// never put on the wire; after negotiation only its bounded lane hash enters
 	// the sequence identity. It is cleared when this Pack is recycled.
@@ -894,6 +928,7 @@ func (self *SendPack) ackRecord() sendAckRecord {
 		target:                 self.ackTarget,
 		value:                  self.ackValue,
 		lifecycle:              self.lifecycleRecord(),
+		retainAfterAckTimeout:  self.retainAfterAckTimeout,
 		transportWriteObserver: self.transportWriteObserver,
 	}
 }
@@ -1167,11 +1202,13 @@ type transportWriteOption struct {
 	observer func(TransportType)
 }
 
-// sendPackUpstreamRecoveryOption is internal measurement metadata. It marks a
-// caller-owned enclosing transport that retains or can regenerate this Pack
-// after a failed attempt; it never changes Transfer admission or reliability.
-type sendPackUpstreamRecoveryOption struct {
-	upstreamRecoverable bool
+// sendPackRecoveryOption is internal ownership metadata. UpstreamRecoverable
+// describes the caller before admission for lifecycle measurement. A retained
+// Pack moves its only recoverable bytes into Transfer on admission, so its
+// bounded resend item must live until peer Ack or lifecycle cancellation.
+type sendPackRecoveryOption struct {
+	upstreamRecoverable   bool
+	retainAfterAckTimeout bool
 }
 
 func observeTransportWrite(observer func(TransportType)) transportWriteOption {
@@ -2263,6 +2300,7 @@ func (self *Client) SendMultiWithTimeout(
 		logicalLane:                  resolved.logicalLane,
 		logicalLaneExplicit:          resolved.logicalLaneExplicit,
 		lifecycleUpstreamRecoverable: resolved.upstreamRecoverable,
+		retainAfterAckTimeout:        resolved.retainAfterAckTimeout,
 	}
 	success, err := self.enqueueSendPack(sendPack, timeout)
 	return success && err == nil
@@ -2348,6 +2386,7 @@ func (self *Client) sendGroupToWithTimeoutDetailed(
 		logicalLane:                  resolved.logicalLane,
 		logicalLaneExplicit:          resolved.logicalLaneExplicit,
 		lifecycleUpstreamRecoverable: resolved.upstreamRecoverable,
+		retainAfterAckTimeout:        resolved.retainAfterAckTimeout,
 	}
 	return self.enqueueSendPack(sendPack, timeout)
 }
@@ -2386,6 +2425,7 @@ func (self *Client) sendWithTimeoutDetailed(
 		logicalLane:                  resolved.logicalLane,
 		logicalLaneExplicit:          resolved.logicalLaneExplicit,
 		lifecycleUpstreamRecoverable: resolved.upstreamRecoverable,
+		retainAfterAckTimeout:        resolved.retainAfterAckTimeout,
 	}
 	return self.enqueueSendPack(sendPack, timeout)
 }
@@ -2401,6 +2441,7 @@ type resolvedSendOptions struct {
 	logicalLane            uint32
 	logicalLaneExplicit    bool
 	upstreamRecoverable    bool
+	retainAfterAckTimeout  bool
 }
 
 // Applies options left-to-right. A received TransferKey reproduces the exact
@@ -2450,8 +2491,9 @@ func (self *Client) resolveSendOptions(opts []any) resolvedSendOptions {
 			resolved.transportWriteObserver = v.observer
 		case sendSchedulingKeyOption:
 			resolved.schedulingKey = v.key
-		case sendPackUpstreamRecoveryOption:
+		case sendPackRecoveryOption:
 			resolved.upstreamRecoverable = v.upstreamRecoverable
+			resolved.retainAfterAckTimeout = v.retainAfterAckTimeout
 		}
 	}
 	return resolved
@@ -2547,6 +2589,7 @@ func (self *Client) sendRawToWithTimeoutDetailed(
 		logicalLane:                  resolved.logicalLane,
 		logicalLaneExplicit:          resolved.logicalLaneExplicit,
 		lifecycleUpstreamRecoverable: resolved.upstreamRecoverable,
+		retainAfterAckTimeout:        resolved.retainAfterAckTimeout,
 		rawPool:                      self.rawSendPacks,
 	}
 	sendPack.singleFrameValue = protocol.Frame{
@@ -5823,12 +5866,13 @@ sendSequenceLoop:
 					item.ackTimeout,
 					self.ackTimeoutForPolicy(item.unreliableRecoveryPolicy()),
 				)
+				retainPastAckTimeout := item.acks.retainPastAckTimeout()
 				itemAckTimeout := item.sendTime.Add(item.ackTimeout).Sub(sendTime)
 				if self.sendBuffer != nil && self.sendBuffer.forceAckTimeoutForTest != nil &&
 					self.sendBuffer.forceAckTimeoutForTest(self.id()) {
 					itemAckTimeout = 0
 				}
-				if itemAckTimeout <= 0 {
+				if itemAckTimeout <= 0 && !retainPastAckTimeout {
 					// message took too long to ack
 					// close the sequence
 					if self.log.V(1).Enabled() {
@@ -5855,7 +5899,7 @@ sendSequenceLoop:
 					}
 					return
 				}
-				if itemAckTimeout < timeout {
+				if !retainPastAckTimeout && itemAckTimeout < timeout {
 					timeout = itemAckTimeout
 				}
 				if self.sendBuffer != nil && self.sendBuffer.forceResendForTest != nil &&
@@ -5997,7 +6041,7 @@ sendSequenceLoop:
 				// whole in-flight window every interval, and the duplicates
 				// feed the congestion that delayed the acks in the first place.
 				itemResendTimeout := self.resendIntervalForItem(item, item.sendCount)
-				if itemAckTimeout <= itemResendTimeout {
+				if !retainPastAckTimeout && itemAckTimeout <= itemResendTimeout {
 					item.resendTime = sendTime.Add(itemAckTimeout)
 				} else {
 					item.resendTime = sendTime.Add(itemResendTimeout)
@@ -6421,9 +6465,13 @@ func (self *SendSequence) updateContractWithAckPromotion(
 				// up the open pack is queued unpinned and wraps normally,
 				// re-sealed per write like any other frame.
 				forceUnwrapped := self.session != nil && self.session.Cipher() == nil
-				self.sendWithSetContract(nil, func(error) {
-					self.setContractAcked(nextSendContract, true)
-				}, true, true, forceUnwrapped)
+				self.sendWithSetContract(
+					nil,
+					self.contractOpenAckCallback(nextSendContract),
+					true,
+					true,
+					forceUnwrapped,
+				)
 
 				// FIXME
 				self.log.Infof("[s]%s->%s...%s s(%s) contract set %s\n", self.client.ClientTag(), self.contractIntermediaryIds(), self.destination, self.contractMultiRouteWriterAlias.StreamId, nextSendContract.contractId)
@@ -6650,6 +6698,17 @@ func (self *SendSequence) setContract(
 func (self *SendSequence) setContractAcked(nextSendContract *sequenceContract, ack bool) {
 	if self.sendContract == nextSendContract {
 		self.sendContractAcked = ack
+	}
+}
+
+// A failed terminal disposition must not promote an opening contract. The
+// current-contract guard also prevents a late callback from mutating its
+// replacement.
+func (self *SendSequence) contractOpenAckCallback(
+	nextSendContract *sequenceContract,
+) AckFunction {
+	return func(err error) {
+		self.setContractAcked(nextSendContract, err == nil)
 	}
 }
 

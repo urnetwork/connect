@@ -1479,6 +1479,43 @@ func TestH1ReadyDrainCallbackOverflowIsBoundedAndReclaimable(t *testing.T) {
 	}
 }
 
+func TestSendAckSetRetainsNonRegenerableRecordPastAckTimeout(t *testing.T) {
+	var ordinary sendAckSet
+	ordinary.add(sendAckRecord{callback: func(error) {}})
+	if ordinary.retainPastAckTimeout() {
+		t.Fatal("ordinary Ack record acquired an infinite recovery lifetime")
+	}
+	ordinary.invoke(nil)
+
+	var retained sendAckSet
+	retained.add(sendAckRecord{retainAfterAckTimeout: true})
+	if !retained.retainPastAckTimeout() {
+		t.Fatal("callback-free retained Ack record was discarded")
+	}
+	retained.invoke(nil)
+
+	var coalesced sendAckSet
+	coalesced.add(sendAckRecord{callback: func(error) {}})
+	coalesced.add(sendAckRecord{callback: func(error) {}})
+	coalesced.add(sendAckRecord{retainAfterAckTimeout: true})
+	if coalesced.overflow == nil {
+		t.Fatal("retained coalesced record did not exercise the overflow path")
+	}
+	if !coalesced.retainPastAckTimeout() {
+		t.Fatal("coalesced overflow lost its retained record")
+	}
+	coalesced.invoke(nil)
+
+	group := &sendGroupCompletion{
+		ack: sendAckRecord{retainAfterAckTimeout: true},
+	}
+	var chunk sendAckSet
+	chunk.add(group.chunkAckRecord())
+	if !chunk.retainPastAckTimeout() {
+		t.Fatal("logical-group chunk lost its parent recovery lifetime")
+	}
+}
+
 func TestSendPackPinsLogicalGroupChunkLimits(t *testing.T) {
 	pack := &SendPack{logicalGroup: true}
 	pack.pinGroupChunkLimits(transferFlightPolicySnapshot{h1Only: true})

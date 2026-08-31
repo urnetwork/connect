@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1620,5 +1621,129 @@ func TestRemoteUserNatProviderForceStreamTcpReturnRetriesFirstDrop(t *testing.T)
 	case inspectionErr := <-ackInspectionErrs:
 		t.Fatalf("provider return ack gate: %v", inspectionErr)
 	default:
+	}
+}
+
+// A provider has already consumed TCP bytes from the origin socket before it
+// hands the reconstructed packet to Transfer. Admission therefore moves the
+// only recoverable copy into SendSequence: an end-to-end Ack timeout must keep
+// retrying that same item, not close the sequence and report a terminal error.
+//
+// This is the exact main-proxy failure from 2026-08-30. The origin LB returned
+// 200, the hosted DeviceLocal stayed ready, and remote ingress stopped until
+// the 30-second request deadline because the provider-return Transfer item hit
+// its finite AckTimeout while the H1 carrier was reforming.
+func TestRemoteUserNatProviderTcpReturnSurvivesAckTimeout(t *testing.T) {
+	var forceAckTimeout atomic.Bool
+	clientSettings := DefaultClientSettings()
+	clientSettings.EncryptionSettings.Mode = EncryptionModeOff
+	clientSettings.SendBufferSettings.MinResendInterval = 5 * time.Millisecond
+	clientSettings.SendBufferSettings.RttMinResendInterval = 5 * time.Millisecond
+	clientSettings.SendBufferSettings.MaxResendInterval = 10 * time.Millisecond
+	clientSettings.SendBufferSettings.AckTimeout = time.Hour
+	clientSettings.SendBufferSettings.IdleTimeout = time.Hour
+	clientSettings.SendBufferSettings.forceAckTimeoutForTest = func(sendSequenceId) bool {
+		return forceAckTimeout.Load()
+	}
+	provider, providerClient, _ := newProviderTransferKeyTestFixtureWithClientSettings(
+		t,
+		DefaultRemoteUserNatProviderSettings(),
+		clientSettings,
+	)
+
+	peerId := NewId()
+	providerClient.ContractManager().AddNoContractPeer(peerId)
+	providerToDrop := make(Route)
+	providerClient.RouteManager().UpdateTransport(
+		NewSendClientTransport(DestinationId(peerId)),
+		[]Route{providerToDrop},
+	)
+
+	response := craftSecurityPacket(
+		IpProtocolTcp,
+		net.ParseIP("203.0.113.7"),
+		8080,
+		net.ParseIP("10.0.0.9"),
+		42001,
+		false,
+		[]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"),
+	)
+	responsePath, err := ParseIpPath(response)
+	if err != nil {
+		t.Fatalf("parse provider TCP return: %v", err)
+	}
+	transferKey := TransferKey{
+		ForceStream:         true,
+		EncryptionRole:      protocol.SequenceRole_SequenceRoleServer,
+		EncryptionCompanion: false,
+	}
+	completion := &providerReturnTestAckTarget{completed: make(chan error, 1)}
+	provider.returnAckTargetForTest = completion
+
+	provider.receiveTransferWithRecovery(
+		SourceId(peerId),
+		transferKey,
+		protocol.ProvideMode_Public,
+		receiveRecoveryModeTcpSocket,
+		responsePath,
+		response,
+	)
+
+	waitWrite := func(name string) providerReturnRetryRecord {
+		t.Helper()
+		select {
+		case transferFrameBytes := <-providerToDrop:
+			defer MessagePoolReturn(transferFrameBytes)
+			record, target, decodeErr := providerReturnRetryRecordFromWire(
+				transferFrameBytes,
+				response,
+			)
+			if decodeErr != nil {
+				t.Fatalf("decode %s provider return: %v", name, decodeErr)
+			}
+			if !target {
+				t.Fatalf("%s write did not contain the provider TCP return", name)
+			}
+			return record
+		case completionErr := <-completion.completed:
+			t.Fatalf("provider return completed before %s write: %v", name, completionErr)
+			return providerReturnRetryRecord{}
+		case <-time.After(time.Second):
+			t.Fatalf("wait for %s provider return write", name)
+			return providerReturnRetryRecord{}
+		}
+	}
+
+	first := waitWrite("initial")
+	forceAckTimeout.Store(true)
+	for retryIndex := 1; retryIndex <= 3; retryIndex++ {
+		retry := waitWrite(fmt.Sprintf("post-timeout retry %d", retryIndex))
+		if !providerReturnRetryIdentityEqual(first, retry) ||
+			!bytes.Equal(first.wireBytes, retry.wireBytes) {
+			t.Fatalf(
+				"post-timeout retry %d changed provider return identity: first=%+v retry=%+v",
+				retryIndex,
+				first,
+				retry,
+			)
+		}
+		select {
+		case completionErr := <-completion.completed:
+			t.Fatalf(
+				"provider return became terminal after post-timeout retry %d: %v",
+				retryIndex,
+				completionErr,
+			)
+		default:
+		}
+	}
+	provider.Close()
+	select {
+	case completionErr := <-completion.completed:
+		if completionErr == nil {
+			t.Fatal("provider shutdown acknowledged an undelivered retained return")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("provider shutdown did not release its retained return")
 	}
 }

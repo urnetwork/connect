@@ -6386,16 +6386,17 @@ func (self *RemoteUserNatProvider) returnWriteTimeout(item *providerReturnItem) 
 	return 0
 }
 
-// A dedicated TCP socket reader retains the exact consumed bytes until a
-// later attempt succeeds, while synthesized controls can be regenerated when
-// the peer retries. This metadata changes measurement only; it never changes
-// Transfer admission, retry, or ownership.
+// A dedicated TCP socket reader retains the exact consumed bytes until
+// Transfer admission. Admission moves the only recoverable copy into the
+// bounded resend queue, which must keep retrying past the ordinary Ack timeout.
+// Synthesized controls remain regenerable by the peer and need no such lease.
 func (self *RemoteUserNatProvider) returnSendRecoveryOption(
 	item *providerReturnItem,
-) sendPackUpstreamRecoveryOption {
-	return sendPackUpstreamRecoveryOption{
+) sendPackRecoveryOption {
+	return sendPackRecoveryOption{
 		upstreamRecoverable: item.recoveryMode == receiveRecoveryModeTcpSocket ||
 			item.recoveryMode == receiveRecoveryModeRegenerableControl,
+		retainAfterAckTimeout: item.recoveryMode == receiveRecoveryModeTcpSocket,
 	}
 }
 
