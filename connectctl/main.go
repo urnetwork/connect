@@ -534,8 +534,10 @@ func send(opts docopt.Opts) {
 	defer cancel()
 
 	clientStrategy := connect.NewClientStrategyWithDefaults(cancelCtx)
+	defer clientStrategy.Close()
 
 	api := connect.NewBringYourApi(cancelCtx, clientStrategy, apiUrl)
+	defer api.Close()
 	api.SetByJwt(jwt)
 	oobControl := connect.NewApiOutOfBandControlWithApi(api)
 
@@ -678,8 +680,10 @@ func sink(opts docopt.Opts) {
 	defer cancel()
 
 	clientStrategy := connect.NewClientStrategyWithDefaults(cancelCtx)
+	defer clientStrategy.Close()
 
 	api := connect.NewBringYourApi(cancelCtx, clientStrategy, apiUrl)
+	defer api.Close()
 	api.SetByJwt(jwt)
 	oobControl := connect.NewApiOutOfBandControlWithApi(api)
 

@@ -184,8 +184,11 @@ type ClientStrategySettings struct {
 
 // stores statistics on client strategies
 type ClientStrategy struct {
-	ctx context.Context
-	log Logger
+	ctx                context.Context
+	cancel             context.CancelFunc
+	closeOnce          sync.Once
+	unsubNetworkChange func()
+	log                Logger
 
 	settings *ClientStrategySettings
 
@@ -383,8 +386,10 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 		}
 	*/
 
+	strategyCtx, strategyCancel := context.WithCancel(ctx)
 	clientStrategy := &ClientStrategy{
-		ctx:                 ctx,
+		ctx:                 strategyCtx,
+		cancel:              strategyCancel,
 		log:                 loggerOrDefault(settings.Log),
 		settings:            settings,
 		dialers:             dialers,
@@ -396,22 +401,44 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 	// find-providers) would otherwise stall on a dead socket until its
 	// timeout. Clients rebuild lazily on next use. Unsubscribe rides ctx.
 	unsubNetworkChange := AddNetworkChangeListener(clientStrategy.networkChanged)
+	clientStrategy.unsubNetworkChange = unsubNetworkChange
 	go HandleError(func() {
-		<-ctx.Done()
-		unsubNetworkChange()
+		<-strategyCtx.Done()
+		clientStrategy.Close()
 	})
 	return clientStrategy
+}
+
+// Releases every strategy-owned idle HTTP connection without making the
+// strategy terminal. Network changes use the same operation before lazy
+// redial on the new path.
+func (self *ClientStrategy) CloseIdleConnections() {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	for dialer := range self.dialers {
+		dialer.Close()
+	}
+}
+
+// Ends discovery and releases pooled HTTP connections. APIs and transports
+// sharing the strategy must be closed first; repeated calls are safe.
+func (self *ClientStrategy) Close() {
+	self.closeOnce.Do(func() {
+		if self.cancel != nil {
+			self.cancel()
+		}
+		if self.unsubNetworkChange != nil {
+			self.unsubNetworkChange()
+		}
+		self.CloseIdleConnections()
+	})
 }
 
 // networkChanged drops every dialer's pooled connections (idle sockets bound
 // to the old network path); in-flight requests finish on their own
 // connections, and the http clients rebuild lazily on next use.
 func (self *ClientStrategy) networkChanged() {
-	self.mutex.Lock()
-	defer self.mutex.Unlock()
-	for dialer := range self.dialers {
-		dialer.Close()
-	}
+	self.CloseIdleConnections()
 }
 
 func (self *ClientStrategy) SetCustomExtenders(extenderIpSecrets map[netip.Addr]string) {
