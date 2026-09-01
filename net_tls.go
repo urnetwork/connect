@@ -1,9 +1,12 @@
 package connect
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -90,6 +93,34 @@ func sharedDefaultPinnedCertPool() (*x509.CertPool, error) {
 	return defaultPinnedCertPool, defaultPinnedCertPoolErr
 }
 
+func appendStrictRootCertificates(certPool *x509.CertPool, contents []byte) error {
+	remaining := bytes.TrimSpace(contents)
+	count := 0
+	for len(remaining) != 0 {
+		if !bytes.HasPrefix(remaining, []byte("-----BEGIN CERTIFICATE-----")) {
+			return errors.New("root bundle contains non-certificate or malformed PEM data")
+		}
+		block, rest := pem.Decode(remaining)
+		if block == nil || block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
+			return errors.New("root bundle contains non-certificate or malformed PEM data")
+		}
+		certificate, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return fmt.Errorf("parse root certificate: %w", err)
+		}
+		if !certificate.BasicConstraintsValid || !certificate.IsCA || certificate.KeyUsage&x509.KeyUsageCertSign == 0 {
+			return errors.New("root bundle contains a certificate without CA signing authority")
+		}
+		certPool.AddCert(certificate)
+		count++
+		remaining = bytes.TrimSpace(rest)
+	}
+	if count == 0 {
+		return errors.New("root bundle contains no certificates")
+	}
+	return nil
+}
+
 // Builds the root set for one client configuration. Ordinary clients retain
 // the shared immutable pool. A private deployment gets a clone before its
 // explicit roots are appended, so one process cannot mutate another config's
@@ -118,8 +149,8 @@ func defaultRootCertPool() (*x509.CertPool, error) {
 		return nil, fmt.Errorf("read %s: %w", ExtraRootCAFileEnv, err)
 	}
 	configuredCertPool := certPool.Clone()
-	if !configuredCertPool.AppendCertsFromPEM(extraRootCAPem) {
-		return nil, fmt.Errorf("%s contains no certificates", ExtraRootCAFileEnv)
+	if err := appendStrictRootCertificates(configuredCertPool, extraRootCAPem); err != nil {
+		return nil, fmt.Errorf("%s: %w", ExtraRootCAFileEnv, err)
 	}
 	return configuredCertPool, nil
 }

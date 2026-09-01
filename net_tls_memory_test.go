@@ -134,6 +134,15 @@ func TestDefaultTlsConfigRejectsInvalidExplicitPrivateRoot(t *testing.T) {
 	if err := os.WriteFile(malformed, []byte("not a certificate\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	caPem, leafCertificate := testingPrivatePlatformCertificates(t)
+	leafOnly := filepath.Join(directory, "leaf.pem")
+	if err := os.WriteFile(leafOnly, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafCertificate.Raw}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	trailing := filepath.Join(directory, "trailing.pem")
+	if err := os.WriteFile(trailing, append(append([]byte(nil), caPem...), []byte("unreviewed trailing data\n")...), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	cases := []struct {
 		path   string
 		marker string
@@ -141,12 +150,34 @@ func TestDefaultTlsConfigRejectsInvalidExplicitPrivateRoot(t *testing.T) {
 		{path: "relative.pem", marker: "absolute path"},
 		{path: filepath.Join(directory, "missing.pem"), marker: "no such file"},
 		{path: directory, marker: "regular file"},
-		{path: malformed, marker: "contains no certificates"},
+		{path: malformed, marker: "malformed PEM"},
+		{path: leafOnly, marker: "without CA signing authority"},
+		{path: trailing, marker: "malformed PEM"},
 	}
 	for _, test := range cases {
 		t.Setenv(ExtraRootCAFileEnv, test.path)
 		if _, err := DefaultTlsConfig(); err == nil || !strings.Contains(err.Error(), test.marker) {
 			t.Errorf("root %q error=%v, want marker %q", test.path, err, test.marker)
+		}
+	}
+}
+
+func TestStrictPrivateRootsAcceptOnlyCompleteCABundles(t *testing.T) {
+	caPem, _ := testingPrivatePlatformCertificates(t)
+	pool := x509.NewCertPool()
+	if err := appendStrictRootCertificates(pool, append(append([]byte(nil), caPem...), caPem...)); err != nil {
+		t.Fatalf("complete two-CA bundle: %v", err)
+	}
+	if len(pool.Subjects()) == 0 {
+		t.Fatal("strict root parser added no CA subjects")
+	}
+	for _, contents := range [][]byte{
+		nil,
+		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte{1, 2, 3}}),
+		append([]byte("comment\n"), caPem...),
+	} {
+		if err := appendStrictRootCertificates(x509.NewCertPool(), contents); err == nil {
+			t.Errorf("strict root parser accepted %q", contents)
 		}
 	}
 }
