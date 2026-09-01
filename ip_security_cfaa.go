@@ -11,9 +11,10 @@ package connect
 //
 //   - cfaaDrop  -> blocked IP, or a known-abused / privileged-non-whitelisted
 //                  port. The packet is dropped outright.
-//   - cfaaAllow -> a structured/plaintext system protocol that must never be
-//                  entropy-dropped by the payload detector (NTP, IKE / wifi
-//                  calling, plain DNS over UDP). Allowed without further checks.
+//   - cfaaAllow -> a structured system protocol or narrow endpoint exception
+//                  that must never be entropy-dropped by the payload detector
+//                  (NTP, IKE / wifi calling, plain DNS, Telegram reflectors).
+//                  Allowed without further checks.
 //   - cfaaPass  -> no static verdict; the caller proceeds to DPI (egress) or
 //                  simply allows (ingress).
 //
@@ -45,11 +46,19 @@ type CfaaSecurityPolicySettings struct {
 	// Enabled turns the static policy on. When false, inspect always returns
 	// cfaaPass and neither the IP blocklist nor the port policy is applied.
 	Enabled bool
+
+	// AllowTelegramCalls enables the narrowly scoped Telegram reflector
+	// exception in ip_security_telegram.go. It applies only to Telegram's
+	// published IPv4 reflector endpoints on TCP or UDP ports 596-599 plus its
+	// exact protocol-v12 TCP fallback on port 595. It never overrides the IP
+	// blocklist.
+	AllowTelegramCalls bool
 }
 
 func DefaultCfaaSecurityPolicySettings() *CfaaSecurityPolicySettings {
 	return &CfaaSecurityPolicySettings{
-		Enabled: true,
+		Enabled:            true,
+		AllowTelegramCalls: true,
 	}
 }
 
@@ -65,11 +74,13 @@ func newCfaaDetector(settings *CfaaSecurityPolicySettings) *cfaaDetector {
 
 // inspect applies the static rules to a single endpoint (destination on egress,
 // source on ingress). version is the IP version (4 or 6); the blocklist is
-// currently IPv4 only.
+// checked in its corresponding address family.
 //
 // Port policy (see ip_security_cfaa_test.go for the exhaustive table):
 //   - bittorrent / abused ports                     -> drop
 //   - ntp (123), ike+nat-t (500, 4500), dns/udp     -> allow (never inspected)
+//   - Telegram reflector IPv4s on TCP/UDP 596-599,
+//     plus its exact TCP/595 v12 fallback           -> allow (explicit exception)
 //   - https/quic (443), dot (853), email (465/587/993/995), http/tcp (80),
 //     and user/ephemeral ports (>=1024)             -> pass (to DPI)
 //   - every other privileged port (<1024),
@@ -99,6 +110,14 @@ func (self *cfaaDetector) inspect(ip net.IP, port int, protocol IpProtocol, vers
 	// blocked-ip reputation check above still does. echo-only parsing
 	// constrains what reaches here (see ICMP.md).
 	if protocol == IpProtocolIcmp {
+		return cfaaAllow
+	}
+
+	// Telegram's call reflectors use privileged ports 596-599, with one exact
+	// TCP/595 fallback. Keep this as a named endpoint-and-port exception instead
+	// of weakening the privileged-port rule for every host. The reputation check
+	// above intentionally remains authoritative if an address is also blocked.
+	if self.settings.AllowTelegramCalls && isTelegramCallReflector(ip, port, protocol, version) {
 		return cfaaAllow
 	}
 

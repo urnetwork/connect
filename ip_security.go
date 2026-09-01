@@ -491,8 +491,9 @@ func (self *securityPolicy) inspectEgressForSender(
 		// No static verdict — run stateful payload DPI. Switch on the verdict so
 		// the policy reads explicitly: a positive BitTorrent signature is reported;
 		// a flow that looks fully encrypted is dropped UNLESS it matched a
-		// sanctioned web standard (TLS/QUIC/DTLS/STUN) — that web-standard match is
-		// the fallback that rescues an otherwise-ambiguous encrypted flow.
+		// sanctioned web/communication standard (TLS/QUIC/DTLS/STUN/TURN or
+		// RTP/RTCP), or an exact provider-scoped gaming exception — that positive
+		// match is the fallback that rescues an otherwise-ambiguous encrypted flow.
 		// Enforcement of each verdict honors the detector settings (log-only,
 		// drop/report toggles), applied by result().
 		switch v := self.dmca.classifyForSender(senderClientId, ipPath, payload); v {
@@ -501,7 +502,7 @@ func (self *securityPolicy) inspectEgressForSender(
 		case dmcaDropEncrypted:
 			return self.dmca.result(v), nil
 		default:
-			// still inspecting, a sanctioned web standard, or benign plaintext
+			// still inspecting, a sanctioned standard, or benign plaintext
 			return SecurityPolicyResultAllow, nil
 		}
 	}

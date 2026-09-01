@@ -80,6 +80,9 @@ func TestCfaaPortClassification(t *testing.T) {
 		{25, IpProtocolUdp, cfaaDrop},
 		{22, IpProtocolTcp, cfaaDrop},
 		{179, IpProtocolTcp, cfaaDrop},
+		{595, IpProtocolTcp, cfaaDrop},
+		{596, IpProtocolUdp, cfaaDrop},
+		{599, IpProtocolTcp, cfaaDrop},
 		// user / ephemeral ports -> pass (handed to DPI on egress)
 		{8080, IpProtocolTcp, cfaaPass},
 		{51413, IpProtocolTcp, cfaaPass},

@@ -14,9 +14,10 @@ package connect
 //     443) through. Peer traffic on high ports is still inspected.
 //   - a positive, plaintext BitTorrent signature  -> Incident (report) + Drop
 //   - an initial payload that looks fully encrypted/random AND is NOT a
-//     whitelisted web standard (TLS, DTLS, QUIC, STUN/TURN) -> Drop
-//   - anything else (plaintext unknown protocol, a web standard, or budget
-//     exhausted without a hit) -> Allow
+//     whitelisted standard (TLS, DTLS, QUIC, STUN/TURN, RTP/RTCP) or exact
+//     provider-scoped gaming endpoint -> Drop
+//   - anything else (plaintext unknown protocol, a sanctioned standard/provider
+//     endpoint, or budget exhausted without a hit) -> Allow
 //
 // Packets are allowed through while the flow is still INSPECTING; enforcement
 // only begins once a terminal verdict is reached. Detection is keyed off the
@@ -25,8 +26,10 @@ package connect
 // Everything here is a clean-room implementation from the public protocol
 // definitions: BitTorrent BEP 3 (peer wire / HTTP tracker), BEP 5 (DHT KRPC),
 // BEP 15 (UDP tracker), BEP 29 (uTP); TLS RFC 8446/5246; DTLS RFC 6347/9147;
-// QUIC RFC 9000/9369; STUN RFC 5389. The byte signatures are protocol facts,
-// not derived from any third-party implementation.
+// QUIC RFC 9000/9369; STUN RFC 8489; TURN RFC 8656; RTP/RTCP RFC 3550 and
+// RFC 7983. The byte signatures are protocol facts, not derived from any
+// third-party implementation. Provider prefix/port facts live separately in
+// ip_security_gaming.go with their first-party sources.
 
 import (
 	"bytes"
@@ -42,6 +45,14 @@ import (
 // number of flow-table shards. Sharding keeps the per-packet table lookup off a
 // single global lock on the hot path.
 const dmcaFlowShards = 16
+
+const (
+	// Two packets sharing the 32-bit SSRC and payload type, with coherent
+	// sequence/timestamp movement, provide far stronger evidence than RFC
+	// 7983's broad first-byte RTP range by itself.
+	rtpValidationPackets = 2
+	rtpMaxSequenceGap    = 64
+)
 
 // DmcaSecurityPolicySettings holds every threshold and decision input for the
 // egress BitTorrent detector, so behavior can be tuned (and later driven by a
@@ -66,9 +77,14 @@ type DmcaSecurityPolicySettings struct {
 
 	// DropUnsanctionedEncrypted enforces on flows whose initial payload looks
 	// fully encrypted/random and are not positively identified as a whitelisted
-	// web standard. This is the heuristic backstop for obfuscated BitTorrent
-	// (MSE/PE over TCP, or encrypted uTP over UDP).
+	// web or communication standard. This is the heuristic backstop for
+	// obfuscated BitTorrent (MSE/PE over TCP, or encrypted uTP over UDP).
 	DropUnsanctionedEncrypted bool
+
+	// Gaming configures provider-scoped gaming exceptions. These are evaluated
+	// after positive BitTorrent signatures but before the encrypted heuristic.
+	// Nil disables all gaming exceptions.
+	Gaming *GamingSecurityPolicySettings
 
 	// InspectionPacketBudget is the max number of payload-bearing packets to
 	// inspect for a flow before giving up and treating it as not-BitTorrent.
@@ -114,6 +130,7 @@ func DefaultDmcaSecurityPolicySettings() *DmcaSecurityPolicySettings {
 		DropBittorrentSignature:       true,
 		ReportBittorrentIncident:      true,
 		DropUnsanctionedEncrypted:     true,
+		Gaming:                        DefaultGamingSecurityPolicySettings(),
 		InspectionPacketBudget:        8,
 		EncryptedDecisionPackets:      3,
 		MaxInspectionPayload:          512,
@@ -168,6 +185,16 @@ type dmcaFlowState struct {
 	sawObservation   bool
 	sawFlowStart     bool
 	sawPlaintext     bool
+	rtpCandidates    [2]rtpCandidate
+}
+
+type rtpCandidate struct {
+	ssrc        uint32
+	timestamp   uint32
+	sequence    uint16
+	payloadType uint8
+	packets     uint8
+	used        bool
 }
 
 func (self *dmcaFlowState) LastActivityTime() time.Time {
@@ -181,6 +208,60 @@ func (self *dmcaFlowState) Cancel() {
 func (self *dmcaFlowState) setTerminal(v dmcaVerdict) dmcaVerdict {
 	atomic.StoreInt32(&self.terminal, int32(v))
 	return v
+}
+
+// observeRtp validates continuity for up to two interleaved media sources (for
+// example, audio and video). Out-of-order/duplicate packets do not destroy a
+// promising candidate; an implausibly large forward jump starts probation over.
+func (self *dmcaFlowState) observeRtp(header rtpHeader) bool {
+	replacement := 0
+	hasEmpty := false
+	for i := range self.rtpCandidates {
+		candidate := &self.rtpCandidates[i]
+		if candidate.used && candidate.ssrc == header.ssrc && candidate.payloadType == header.payloadType {
+			delta := uint16(header.sequence - candidate.sequence)
+			switch {
+			case delta == 0:
+				// Duplicate.
+				return false
+			case 0x8000 <= delta:
+				// Older/out-of-order under serial-number arithmetic.
+				return false
+			case rtpMaxSequenceGap < delta || 0x80000000 <= uint32(header.timestamp-candidate.timestamp):
+				// Forward, but not a credible continuation.
+				*candidate = newRtpCandidate(header)
+				return false
+			default:
+				candidate.sequence = header.sequence
+				candidate.timestamp = header.timestamp
+				if candidate.packets < 0xff {
+					candidate.packets++
+				}
+				return rtpValidationPackets <= candidate.packets
+			}
+		}
+
+		if !candidate.used {
+			replacement = i
+			hasEmpty = true
+		} else if !hasEmpty && candidate.packets < self.rtpCandidates[replacement].packets {
+			replacement = i
+		}
+	}
+
+	self.rtpCandidates[replacement] = newRtpCandidate(header)
+	return false
+}
+
+func newRtpCandidate(header rtpHeader) rtpCandidate {
+	return rtpCandidate{
+		ssrc:        header.ssrc,
+		timestamp:   header.timestamp,
+		sequence:    header.sequence,
+		payloadType: header.payloadType,
+		packets:     1,
+		used:        true,
+	}
 }
 
 // advance moves the state machine forward by one packet and returns the current
@@ -222,9 +303,21 @@ func (self *dmcaFlowState) advance(ipPath *IpPath, payload []byte, settings *Dmc
 	if detectBittorrentSignature(ipPath, b) {
 		return self.setTerminal(dmcaBittorrent)
 	}
-	if web.match(ipPath, b) {
-		// a sanctioned web standard (TLS/QUIC/DTLS/STUN): the fallback that keeps
-		// the encrypted-traffic heuristic from dropping a legitimate encrypted flow
+	if isSanctionedGamingEndpoint(settings.Gaming, ipPath) {
+		// Provider prefix + transport + documented remote port is sufficient
+		// evidence for the Steam exception. The positive BitTorrent checks above
+		// intentionally retain precedence.
+		return self.setTerminal(dmcaAllow)
+	}
+	if web.match(ipPath, payload) {
+		// A sanctioned web/communication standard. Full framing is evaluated over
+		// the complete payload; MaxInspectionPayload only caps signature and entropy
+		// work below.
+		return self.setTerminal(dmcaAllow)
+	}
+	if header, ok := web.rtpHeader(ipPath, payload); ok && self.observeRtp(header) {
+		// RTP/SRTP needs coherent headers from multiple packets before it is trusted;
+		// a single first byte in RFC 7983's 128-191 range is intentionally insufficient.
 		return self.setTerminal(dmcaAllow)
 	}
 	if isHttpRequest(b) {
@@ -473,7 +566,7 @@ func dmcaShardIndex(key dmcaFlowKey) int {
 }
 
 // classify advances the per-flow state machine and returns the raw verdict
-// (consulting the injected web-standards detector during inspection).
+// (consulting the injected standards detector during inspection).
 func (self *dmcaDetector) classify(ipPath *IpPath, payload []byte) dmcaVerdict {
 	return self.classifyForSender(Id{}, ipPath, payload)
 }
@@ -575,7 +668,7 @@ func (self *dmcaDetector) classifyForSender(
 
 // inspect classifies the flow and maps the verdict to a SecurityPolicyResult via
 // the policy settings. The egress policy switches on classify directly (to keep
-// the bittorrent / web-standard / encrypted decision explicit); this is the
+// the BitTorrent / sanctioned-standard / encrypted decision explicit); this is the
 // convenience form for callers that only want the enforced result.
 func (self *dmcaDetector) inspect(ipPath *IpPath, payload []byte) SecurityPolicyResult {
 	return self.result(self.classify(ipPath, payload))

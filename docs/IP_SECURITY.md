@@ -111,9 +111,11 @@ protocol, port)` only; `includeIp` additionally keys by IP. `Stats(reset)` retur
 |------|---------------|------|
 | `ip_security.go`             | yes | Interface, results, egress/ingress/disable policies, `isPublicUnicast`, stats. |
 | `ip_security_cfaa.go`        | yes | CFAA detector: settings, verdicts, port policy, `cfaaBlockedIp4`/`cfaaBlockedIp6` range lookups. |
+| `ip_security_telegram.go`    | yes | Exact Telegram call-reflector endpoint/port exception. |
+| `ip_security_gaming.go`      | yes | Provider-prefix + transport + documented-remote-port gaming exceptions. |
 | `ip_security_cfaa_block.go`  | **generated** | Packed IPv4 + IPv6 blocked-range tables + source attribution. |
-| `ip_security_dmca.go`        | yes | DMCA detector: per-flow DPI state machine, BitTorrent signatures, encrypted heuristic. |
-| `ip_security_webstandard.go` | yes | Stateless web-standard classifier (TLS/DTLS/QUIC/STUN) the DMCA detector consults. |
+| `ip_security_dmca.go`        | yes | Per-flow DPI state machine, including BitTorrent signatures, RTP probation, and the encrypted heuristic. |
+| `ip_security_webstandard.go` | yes | TLS/DTLS/QUIC/STUN/TURN/RTP/RTCP framing and header classifier. |
 | `security/main.go`           | yes | Generator for the block tables (`go generate ./...`). |
 | `*_test.go`                  | yes | Behavior, invariant, cross-check, and zero-alloc tests. |
 
@@ -130,10 +132,10 @@ the caller can tell a definitive decision from "no opinion":
 | `cfaaAllow` | Structured system protocol that must **not** be entropy-inspected | Allow (skip DPI) | Allow          |
 | `cfaaPass`  | No static verdict                                                 | Hand to DPI      | Allow          |
 
-`cfaaAllow` exists specifically so plaintext/structured protocols (NTP, IKE, plain
-DNS) are never handed to the DMCA encrypted-payload heuristic, which could otherwise
-misclassify them. When `CfaaSecurityPolicySettings.Enabled` is false, `inspect`
-always returns `cfaaPass`.
+`cfaaAllow` exists so plaintext/structured protocols (NTP, IKE, plain DNS), plus
+explicit endpoint exceptions such as Telegram call reflectors, are never handed to
+the DMCA encrypted-payload heuristic. When `CfaaSecurityPolicySettings.Enabled` is
+false, `inspect` always returns `cfaaPass`.
 
 ### 3.1 Decision procedure
 
@@ -141,7 +143,10 @@ always returns `cfaaPass`.
 2. **IP reputation takes precedence over the port policy.** If the address is in the
    blocked-range table (§3.3) → `cfaaDrop` — IPv4 via `cfaaBlockedIp4`, IPv6 via
    `cfaaBlockedIp6`, each a binary search over its packed range table.
-3. Otherwise apply the port policy:
+3. If `AllowTelegramCalls` is enabled and the endpoint is one of Telegram's
+   published call-reflector IPv4 addresses on TCP or UDP 596–599, or the exact
+   official protocol-v12 fallback at `91.108.9.38:595/TCP` → `cfaaAllow`.
+4. Otherwise apply the port policy:
 
 | Port(s)                                | Protocol | Verdict     | Rationale |
 |----------------------------------------|----------|-------------|-----------|
@@ -149,6 +154,8 @@ always returns `cfaaPass`.
 | 123, 500, 4500                         | any      | `cfaaAllow` | NTP, IKE / NAT-T (wifi calling) — see Apple HT103229; high-entropy IKE must not be entropy-dropped |
 | 53                                     | UDP      | `cfaaAllow` | plain DNS — structured, low-entropy (FIXME: upgrade to DoH inline) |
 | 53                                     | TCP      | `cfaaDrop`  | DNS-over-TCP not whitelisted |
+| 595                                    | TCP      | `cfaaAllow` | only for Telegram's exact `91.108.9.38` protocol-v12 fallback |
+| 596–599                                | TCP/UDP  | `cfaaAllow` | only for exact published Telegram call-reflector IPv4s; all other hosts retain the privileged-port drop |
 | 443, 853, 465, 993, 995                | any      | `cfaaPass`  | HTTPS/QUIC, DoT, secure email → DPI (TLS/QUIC whitelisted there, BitTorrent-over-443 caught) |
 | 80                                     | TCP      | `cfaaPass`  | HTTP → DPI (catches HTTP-tracker announces; plaintext web passes; FIXME upgrade to HTTPS inline) |
 | 80                                     | UDP      | `cfaaDrop`  | not HTTP |
@@ -161,6 +168,15 @@ always returns `cfaaPass`.
 > BitTorrent and sketchy-encrypted non-web traffic on those ports is still dropped.
 
 The exhaustive, authoritative port→verdict table is `TestCfaaPortClassification`.
+
+The Telegram exception is intentionally separate from the generic port table in
+`ip_security_telegram.go`. Its compact ranges are an exact snapshot of
+`https://core.telegram.org/getReflectorList` (154 IPv4 addresses / 616 endpoint
+pairs as verified 2026-09-01), not Telegram's broader service networks. The
+separate `91.108.9.38:595/TCP` entry is the protocol-v12 fallback in the current
+official Telegram-iOS `OngoingCallContext`. The IP reputation check runs first
+and therefore still wins over this exception. Set `AllowTelegramCalls=false` to
+restore the ordinary privileged-port drop.
 
 ### 3.2 The blocklist: feeds, classes, attribution
 
@@ -260,10 +276,11 @@ per-flow (5-tuple) state object and advances it one packet at a time until a
 
 ### 4.1 Design principles
 
-1. **Whitelist web standards; drop sketchy non-web encrypted traffic.** Traffic
-   positively identified as a web standard (TLS, DTLS, QUIC, STUN/TURN) is always
-   allowed. Traffic that looks fully encrypted but is *not* a recognized web
-   standard is dropped. Plaintext that is not a BitTorrent signature is allowed.
+1. **Whitelist positive standards/endpoints; drop sketchy unidentified encrypted
+   traffic.** Traffic positively identified as TLS, DTLS, QUIC, STUN/TURN, RTP,
+   RTCP, or an exact provider-scoped gaming endpoint is allowed. Traffic that
+   looks fully encrypted but matches neither is dropped. Plaintext that is not a
+   BitTorrent signature is allowed.
 2. **Allow until decided.** Packets pass while a flow is still being inspected;
    enforcement begins only at a terminal verdict. This bounds inspection cost and
    accepts a small bounded leak rather than buffering.
@@ -280,8 +297,8 @@ Internal verdicts and their mapping (default settings):
 |------------------|---------|---------|
 | `inspecting`     | Not yet decided | Allow (packet passes) |
 | `bittorrent`     | Positive plaintext BitTorrent signature | **Incident** (ReportAbuse) |
-| `dropEncrypted`  | Looks fully encrypted and is not a web standard | **Drop** |
-| `allow`          | Web standard, plaintext-unknown, or budget exhausted | Allow |
+| `dropEncrypted`  | Looks fully encrypted and is not a sanctioned standard/endpoint | **Drop** |
+| `allow`          | Sanctioned standard/endpoint, plaintext-unknown, or budget exhausted | Allow |
 
 `LogOnly` forces every verdict to Allow (still recorded);
 `ReportBittorrentIncident=false` turns a BitTorrent verdict into a silent Drop.
@@ -293,7 +310,10 @@ On the **first** observation: TCP `sawFlowStart = (SYN present)`; UDP
 2. Else increment `inspectedPackets`, examine up to `MaxInspectionPayload` leading
    bytes:
    - BitTorrent signature (§4.3) → terminal `bittorrent`;
-   - whitelisted web standard (§4.4) → terminal `allow`;
+   - provider-scoped gaming endpoint (§4.4.1) → terminal `allow`;
+   - whitelisted stateless standard (§4.4) → terminal `allow`;
+   - structurally valid RTP/SRTP → keep up to two SSRC candidates; two coherent
+     observations → terminal `allow`;
    - looks encrypted (§4.5) → increment `encryptedPackets`;
    - else if `>= MinEncryptedPayload` → mark `sawPlaintext`;
    - else (too short) → inconclusive, only consumes budget.
@@ -328,7 +348,7 @@ a drop trigger by itself; encrypted µTP (MSE/PE) is left to the encrypted heuri
 LSD (BEP 14) is org-local multicast and never traverses an exit node (rejected by the
 public-unicast rule).
 
-### 4.4 Whitelisted web standards (→ Allow)
+### 4.4 Whitelisted web and communication standards (→ Allow)
 
 A flow positively identified as one of these is allowed terminally and never
 re-inspected, so later high-entropy application-data packets are not mistaken for an
@@ -339,12 +359,45 @@ unsanctioned encrypted flow.
 | TLS | TCP | Record `0x16`, version `0x03 0x0X`, first handshake byte `0x01` (ClientHello) | RFC 8446 / 5246 |
 | DTLS | UDP | Record `0x16`, version `0xFE 0xFF`/`0xFE 0xFD`, handshake byte at offset 13 `0x01` | RFC 6347 / 9147 |
 | QUIC | UDP | Long-header + fixed bit (`byte0 & 0xC0 == 0xC0`), recognized version (v1, v2, version-negotiation, greasing, IETF drafts) | RFC 9000 / 9369 |
-| STUN / TURN | UDP | Two leading zero bits, length multiple of 4, magic cookie `0x2112A442` at offset 4 | RFC 5389 |
+| STUN / TURN control | UDP/TCP | RFC 7983 first byte 0–3, aligned and exact declared length, magic cookie `0x2112A442` | RFC 8489 / 7983 |
+| TURN ChannelData | UDP/TCP | Channel `0x4000–0x4fff`; exact declared data length, optional UDP alignment padding / required TCP padding | RFC 8656 / 7983 |
+| RTCP | UDP | Version 2, packet type 192–223, exact compound/reduced-size lengths, type-specific minima, final-packet-only padding | RFC 3550 / 7983 |
+| RTP / SRTP | UDP | Version 2 and complete CSRC/extension header; then two packets with the same SSRC/payload type and coherent sequence/timestamp movement | RFC 3550 / 7983 |
 
-These matchers live in a separate stateless `webStandardDetector`
-(`ip_security_webstandard.go`) that the DMCA state machine consults; `WebStandardSettings`
-toggles each protocol (all enabled by default). **Adding a new legitimate encrypted
-protocol means adding a positive detector for it here**, not loosening the heuristic.
+The framing and header matchers live in `webStandardDetector`
+(`ip_security_webstandard.go`), with RTP probation held in `dmcaFlowState` because
+RFC 7983's RTP byte range alone covers one quarter of possible first-byte values.
+Two candidate slots permit initial audio/video interleaving; duplicates and
+out-of-order packets are ignored, while implausible forward gaps reset probation.
+`WebStandardSettings` exposes `Tls`, `Dtls`, `Quic`, `Stun`, `Turn`, `Rtp`, and
+`Rtcp` toggles, all enabled by default. **Adding another legitimate encrypted
+protocol means adding a positive detector here**, not loosening the entropy heuristic.
+
+#### 4.4.1 Steam/Valve provider exception (→ Allow)
+
+`ip_security_gaming.go` allows Steam traffic only when all three dimensions match:
+
+- destination belongs to Valve's published AS32590 Steam list (11 IPv4 prefixes or
+  4 IPv6 prefixes, snapshot verified 2026-09-01);
+- transport is TCP or UDP; and
+- the destination port is labeled **remote** by Steam Support: TCP
+  `80`, `443`, or `27015–27050`; UDP `3478`, `4379`, `4380`, or
+  `27000–27250` (the union of its overlapping game/P2P ranges).
+
+Steam's local Remote Play and dedicated/listen-server guidance is not independently
+allowlisted. TCP 80/443 already follow the privileged/web policy, but remain in the
+source-faithful remote-port matcher. For inspected high ports, the DMCA state machine
+checks positive BitTorrent signatures first, then this exception, then protocol and
+entropy classification. The CFAA IP blocklist is an earlier layer and remains
+authoritative.
+
+The source data is Valve's
+[`ipv4.txt`](https://as32590.net/ipv4.txt) and
+[`ipv6.txt`](https://as32590.net/ipv6.txt), linked from the official
+[Steam required-ports page](https://help.steampowered.com/en/faqs/view/2EA8-4D75-DA21-31EB).
+`GamingSecurityPolicySettings.Enabled` and `AllowSteam` are both enabled by default;
+the settings are nested under `DmcaSecurityPolicySettings.Gaming`. A nil `Gaming`
+setting disables all gaming exceptions.
 
 ### 4.5 The "fully encrypted" heuristic
 
@@ -357,7 +410,7 @@ prefix (clamped to `MaxInspectionPayload`):
 - normalized Shannon entropy `>= EncryptedMinNormalizedEntropy`.
 
 This is a *category* signal (random vs. not), **not** a positive BitTorrent
-classifier — which is exactly why the web-standard whitelist is mandatory before it
+classifier — which is exactly why the positive standards whitelist is mandatory before it
 can drop.
 
 ### 4.6 Configuration (`DmcaSecurityPolicySettings`)
@@ -369,6 +422,8 @@ can drop.
 | `DropBittorrentSignature` | `true` | Enforce on positive BitTorrent signatures. |
 | `ReportBittorrentIncident` | `true` | Signature hits → Incident vs. silent Drop. |
 | `DropUnsanctionedEncrypted` | `true` | Enforce the encrypted heuristic. |
+| `Gaming.Enabled` | `true` | Master switch for provider-scoped gaming exceptions. |
+| `Gaming.AllowSteam` | `true` | Allow Valve-prefix + documented-remote-port Steam traffic after BitTorrent checks. |
 | `InspectionPacketBudget` | `8` | Max payload packets before giving up (→ Allow). |
 | `EncryptedDecisionPackets` | `3` | Encrypted-looking packets required before the heuristic drops. |
 | `MaxInspectionPayload` | `512` | Max leading payload bytes examined per packet. |
@@ -393,7 +448,7 @@ whitelist, then set `LogOnly: false`.
   are evicted (LRU by last-activity, `applyLruUserLimit`). No timer; eviction is lazy
   on insert.
 - **Buffer safety.** Payload is read synchronously and never retained; flow state
-  stores only counters and the verdict.
+  stores counters, two compact RTP candidates, and the verdict.
 
 ### 4.8 What it catches, and what it doesn't
 
@@ -411,8 +466,9 @@ whitelisted-protocol disguise; a UDP flow joined mid-stream (handshake missed; T
 protected by `sawFlowStart`, UDP is not); nested tunneling (VPN-over-VPN).
 
 **Accepted FP surface:** non-web encrypted protocols on inspected ports (a
-proprietary encrypted game protocol, a third-party VPN) are dropped by §4.5 — by
-design. To spare one, add a positive detector to the whitelist (§4.4).
+proprietary game outside a scoped exception, a third-party VPN) are dropped by
+§4.5 — by design. To spare one, add a positive protocol detector (§4.4) or a
+provider-prefix + remote-port exception (§4.4.1).
 
 ---
 
@@ -422,8 +478,11 @@ design. To spare one, add a positive detector to the whitelist (§4.4).
   ported code); only the Spamhaus DROP / DROPv6 credit must be retained.
 - **DMCA detector** is a clean-room implementation from public protocol specs:
   BitTorrent BEP 3 / 5 / 14 / 15 / 29; TLS RFC 8446 / 5246; DTLS RFC 6347 / 9147;
-  QUIC RFC 9000 / 9369; STUN RFC 5389. Byte signatures and constants are functional
+  QUIC RFC 9000 / 9369; STUN RFC 8489; TURN RFC 8656; RTP/RTCP RFC 3550 and
+  multiplexing RFC 7983. Byte signatures and constants are functional
   protocol facts, not derived from any third-party implementation.
+- **Steam exception** is factual prefix and port data published by Valve/Steam;
+  no client or server implementation code is incorporated.
 
 ---
 
@@ -439,6 +498,9 @@ design. To spare one, add a positive detector to the whitelist (§4.4).
   from higher-level data-plane settings is a follow-up if runtime config is needed.
 - **Feeds are a build-time snapshot.** The block table is only as fresh as the last
   regeneration; there is no runtime feed refresh.
+- **Provider exceptions are snapshots.** Valve may update AS32590 prefixes or Steam
+  ports; refresh `ip_security_gaming.go` from the cited first-party lists when this
+  policy is maintained.
 
 ---
 
@@ -452,6 +514,13 @@ design. To spare one, add a positive detector to the whitelist (§4.4).
   sorted/disjoint, v4 and v6), `TestCfaaBlockedIp4BruteForce` / `TestCfaaSearch6`
   (binary search vs. independent linear scan, v4 and v6), `TestCfaaInspectV6` (v6 port
   policy + IP block), `TestCfaaBlockedIp4ZeroAlloc` (allocation-free lookup).
-- **DMCA:** signature, encrypted-heuristic, state-machine, and lifecycle tests in
-  `ip_security_dmca_test.go`; web-standard detection and per-protocol toggles in
-  `ip_security_webstandard_test.go`.
+- **Telegram:** exact range boundaries, holes, ports/transports, toggle behavior,
+  and end-to-end ingress/egress coverage in `ip_security_telegram_test.go`.
+- **Gaming:** exact Valve prefix snapshots, first/last/adjacent addresses, remote
+  port boundaries, address-family/direction/toggle behavior, zero-allocation lookup,
+  encrypted-flow allowance, and BitTorrent precedence in
+  `ip_security_gaming_test.go`.
+- **DMCA / communications:** signature, encrypted-heuristic, state-machine, and
+  lifecycle tests in `ip_security_dmca_test.go`; strict STUN/TURN/RTP/RTCP parsing
+  in `ip_security_webstandard_test.go`; stateful RTP continuity and near-miss
+  enforcement in `ip_security_rtc_test.go`.
