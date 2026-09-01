@@ -6574,12 +6574,15 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 			}
 		}
 
-		// `currentClient` is the client snapshot read by `sendClientPath` under
-		// the parent lock it already held, so the steady-state send no longer
-		// takes the parent lock again just to read `update.client`.
-		for client := currentClient; client != nil; {
+		// Send through a committed client and preserve the selected-client error
+		// transition. Provider selection also calls this helper when its original
+		// nil snapshot becomes stale because another sender committed the flow.
+		sendBoundClient := func(client *multiClientChannel, sendTimeout time.Duration) bool {
+			if client == nil {
+				return false
+			}
 			var err error
-			success, err = client.SendGroupDetailed(sendPacketGroup, timeout)
+			success, err = client.SendGroupDetailed(sendPacketGroup, sendTimeout)
 			if success {
 				// sequence state is guarded by the per-flow `stateLock`
 				update.commitSequenceGroup(sendPacketGroup)
@@ -6600,7 +6603,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 				// failing means someone already moved this flow: there is
 				// nothing to reset and nothing to tell the app.
 				if !update.client.CompareAndSwap(client, nil) {
-					return
+					return true
 				}
 
 				self.log.Infof("[multi]reset error = %s\n", err)
@@ -6625,8 +6628,15 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 					}
 				}
 			}
-			// else the packet was dropped due to backpressure
-			// keep sending to the client until there is an error
+			return true
+		}
+
+		// `currentClient` is the client snapshot read by `sendClientPath` under
+		// the parent lock it already held, so the steady-state send no longer
+		// takes the parent lock again just to read `update.client`.
+		if sendBoundClient(currentClient, timeout) {
+			// A selected client owns this attempt even when bounded admission
+			// reports backpressure. The ordinary caller decides whether to retry.
 			return
 		}
 
@@ -6654,6 +6664,14 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 		// }
 
 		raceClients := func(orderedClients []*multiClientChannel, sendTimeout time.Duration) {
+			// sendClientPath deliberately snapshots without holding the parent
+			// lock through admission. A concurrent sender can therefore bind this
+			// flow after our nil snapshot but before provider selection. Refresh
+			// here and use that commitment; repeatedly selecting with the stale nil
+			// snapshot would otherwise wait forever without sending the packet.
+			if sendBoundClient(update.client.Load(), sendTimeout) {
+				return
+			}
 			switch len(orderedClients) {
 			case 0:
 				return
@@ -6664,10 +6682,12 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 				// Unlike a wide race, success still commits immediately because
 				// there is no winner decision to wait for.
 				var race *multiClientChannelUpdateRace
+				var committedClient *multiClientChannel
 				func() {
 					update.stateLock.Lock()
 					defer update.stateLock.Unlock()
-					if update.client.Load() != nil {
+					if client := update.client.Load(); client != nil {
+						committedClient = client
 						return
 					}
 					if update.race == nil {
@@ -6681,6 +6701,10 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 					}
 					state.pendingSendCount += 1
 				}()
+				if committedClient != nil {
+					sendBoundClient(committedClient, sendTimeout)
+					return
+				}
 				if race == nil {
 					return
 				}
@@ -6772,12 +6796,14 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 				// Registering afterwards drops that real response as unknown and
 				// leaves an unanswered flow even though an exit answered it.
 				var race *multiClientChannelUpdateRace
+				var committedClient *multiClientChannel
 				var initRace *multiClientChannelUpdateRace
 				var initRaceEarlyComplete <-chan struct{}
 				func() {
 					update.stateLock.Lock()
 					defer update.stateLock.Unlock()
-					if update.client.Load() != nil {
+					if client := update.client.Load(); client != nil {
+						committedClient = client
 						return
 					}
 					if update.race == nil {
@@ -6796,6 +6822,10 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 						state.pendingSendCount += 1
 					}
 				}()
+				if committedClient != nil {
+					sendBoundClient(committedClient, sendTimeout)
+					return
+				}
 				if race == nil {
 					return
 				}

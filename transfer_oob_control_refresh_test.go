@@ -79,6 +79,14 @@ func TestApiOutOfBandControlUsesRefreshedJwt(t *testing.T) {
 // ownership through its callback and decoded response Pack's final pool return.
 func TestApiOutOfBandControlCloseAndWaitJoinsPostClientClosePoolOwnership(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/hello" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path != "/connect/control" {
+			http.NotFound(w, r)
+			return
+		}
 		var args ConnectControlArgs
 		if err := json.NewDecoder(r.Body).Decode(&args); err != nil {
 			t.Errorf("decode request: %v", err)
@@ -186,6 +194,10 @@ func TestApiOutOfBandControlCloseAndWaitJoinsCanceledSendControlCallback(t *test
 			response.WriteHeader(http.StatusOK)
 			return
 		}
+		if request.URL.Path != "/connect/control" {
+			http.NotFound(response, request)
+			return
+		}
 		requestEnteredOnce.Do(func() { close(requestEntered) })
 		<-releaseServer
 	}))
@@ -245,6 +257,14 @@ func TestApiOutOfBandControlCloseAndWaitJoinsCanceledSendControlCallback(t *test
 // A control wrapper must not close the API supplied and owned by its caller.
 func TestApiOutOfBandControlWithApiClosePreservesSharedApi(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/hello" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path != "/connect/control" {
+			http.NotFound(w, r)
+			return
+		}
 		var args ConnectControlArgs
 		if err := json.NewDecoder(r.Body).Decode(&args); err != nil {
 			t.Errorf("decode request: %v", err)

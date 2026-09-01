@@ -32,8 +32,13 @@ func TestNextDestinationsRetainsMaximumIntermediariesAndDestination(t *testing.T
 	providerId := NewId()
 	wantEstimatedBytesPerSecond := ByteCount(7_500_000)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/hello" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		if request.URL.Path != "/network/find-providers2" {
-			t.Errorf("discovery path=%q", request.URL.Path)
+			http.NotFound(w, request)
+			return
 		}
 		if err := json.NewEncoder(w).Encode(&FindProviders2Result{
 			Providers: []*FindProvidersProvider{{

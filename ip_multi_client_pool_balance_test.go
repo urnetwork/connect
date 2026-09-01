@@ -21,6 +21,13 @@ func TestMultiClientLifecyclePoolBalance(t *testing.T) {
 		taken, returned, _ := MessagePoolCounts()
 		return int64(taken) - int64(returned)
 	}
+	poolOutstandingByClass := func() map[int]int64 {
+		outstanding := map[int]int64{}
+		for _, stats := range GetMessagePoolClassStats() {
+			outstanding[stats.Size] = int64(stats.Taken) - int64(stats.Returned)
+		}
+		return outstanding
+	}
 	settle := func() int64 {
 		prev := poolOutstanding()
 		stableCount := 0
@@ -47,6 +54,7 @@ func TestMultiClientLifecyclePoolBalance(t *testing.T) {
 	// warmup cycle to initialize process-global pools before the baseline
 	runMultiClientPoolCycle(ctx, t)
 	before := settle()
+	beforeByClass := poolOutstandingByClass()
 
 	const cycles = 10
 	for i := 0; i < cycles; i += 1 {
@@ -55,8 +63,15 @@ func TestMultiClientLifecyclePoolBalance(t *testing.T) {
 
 	after := settle()
 	if before < after {
-		t.Errorf("pool buffers not returned across %d multi-client lifecycles: outstanding %d -> %d (+%d)",
-			cycles, before, after, after-before)
+		afterByClass := poolOutstandingByClass()
+		growthByClass := map[int]int64{}
+		for size, afterCount := range afterByClass {
+			if growth := afterCount - beforeByClass[size]; growth != 0 {
+				growthByClass[size] = growth
+			}
+		}
+		t.Errorf("pool buffers not returned across %d multi-client lifecycles: outstanding %d -> %d (+%d), class growth=%v",
+			cycles, before, after, after-before, growthByClass)
 	}
 }
 

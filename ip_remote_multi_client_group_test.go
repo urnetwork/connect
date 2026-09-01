@@ -541,6 +541,7 @@ func TestMultiClientRaceRegistersCandidatesBeforeSend(t *testing.T) {
 func TestMultiClientOneCandidateRegistersBeforeSend(t *testing.T) {
 	parent, update, closeParent := groupTestParent(t, DisableSecurityPolicy())
 	defer closeParent()
+	poolOutstandingBefore := groupTestPoolOutstanding()
 
 	tcpPath := udpTestPath(4)
 	tcpPath.Protocol = IpProtocolTcp
@@ -564,14 +565,16 @@ func TestMultiClientOneCandidateRegistersBeforeSend(t *testing.T) {
 		settings: parent.settings,
 	}
 	client.sendGroupForTest = func(group *parsedPacketGroup, timeout time.Duration, ack bool) (bool, error) {
+		responsePacket := MessagePoolCopy([]byte{1})
 		parent.clientReceivePacketResolve(
 			client,
 			TransferPath{},
 			protocol.ProvideMode_Network,
 			group.ipPath,
-			[]byte{1},
+			responsePacket,
 			tcpControlObservation{},
 		)
+		MessagePoolReturn(responsePacket)
 		for packetIndex := range group.packets {
 			MessagePoolReturn(group.packets[packetIndex].packet)
 		}
@@ -592,6 +595,101 @@ func TestMultiClientOneCandidateRegistersBeforeSend(t *testing.T) {
 	}
 	if got := delivered.Load(); got != 1 {
 		t.Errorf("delivered responses = %d, want 1", got)
+	}
+	if poolOutstandingAfter := groupTestPoolOutstanding(); poolOutstandingAfter != poolOutstandingBefore {
+		t.Errorf(
+			"one-candidate synchronous response pool ownership = %d, want %d",
+			poolOutstandingAfter,
+			poolOutstandingBefore,
+		)
+	}
+}
+
+// Two device senders can snapshot an unbound flow before either enters
+// provider selection. Once the first sender commits the sole candidate, the
+// second must use that newly committed client instead of retrying forever with
+// its stale nil snapshot.
+func TestMultiClientOneCandidateStaleSnapshotUsesCommittedClient(t *testing.T) {
+	parent, update, closeParent := groupTestParent(t, DisableSecurityPolicy())
+	defer closeParent()
+
+	var sendCount atomic.Int32
+	client := &multiClientChannel{
+		ctx:      parent.ctx,
+		settings: parent.settings,
+		sendGroupForTest: func(group *parsedPacketGroup, timeout time.Duration, ack bool) (bool, error) {
+			sendCount.Add(1)
+			for packetIndex := range group.packets {
+				MessagePoolReturn(group.packets[packetIndex].packet)
+			}
+			return true, nil
+		},
+	}
+	parent.groupRaceCandidatesForTest = func(group *parsedPacketGroup) []*multiClientChannel {
+		return []*multiClientChannel{client}
+	}
+
+	entered := make(chan int, 2)
+	releases := []chan struct{}{make(chan struct{}), make(chan struct{})}
+	var pathCallCount atomic.Int32
+	parent.sendClientPathForTest = func(
+		ipPath *IpPath,
+		pin flowPin,
+		callback func(*multiClientChannelUpdate, *multiClientChannel),
+	) {
+		// Capture before either callback can commit the client. This is the
+		// ordinary concurrent sendUpdate boundary reproduced without timing.
+		snapshot := update.client.Load()
+		callIndex := int(pathCallCount.Add(1)) - 1
+		entered <- callIndex
+		select {
+		case <-parent.ctx.Done():
+			return
+		case <-releases[callIndex]:
+		}
+		update.ipPath = ipPath
+		callback(update, snapshot)
+	}
+
+	send := func(payload byte) (<-chan bool, []byte) {
+		packet := MessagePoolCopy(ipOosUdpPacket(udpTestPath(4), []byte{payload}))
+		group := requireGroupTestPacketGroup(t, packet)
+		result := make(chan bool, 1)
+		go func() {
+			result <- parent.sendPacketGroup(
+				SourceId(NewId()),
+				protocol.ProvideMode_Network,
+				group,
+				0,
+			)
+		}()
+		return result, packet
+	}
+
+	result1, packet1 := send(1)
+	if callIndex := <-entered; callIndex != 0 {
+		t.Fatalf("first path call index = %d, want 0", callIndex)
+	}
+	result2, packet2 := send(2)
+	if callIndex := <-entered; callIndex != 1 {
+		t.Fatalf("second path call index = %d, want 1", callIndex)
+	}
+	close(releases[0])
+	if !<-result1 {
+		MessagePoolReturn(packet1)
+		t.Fatal("first stale-snapshot sender did not commit the candidate")
+	}
+	if got := update.client.Load(); got != client {
+		t.Fatalf("first sender committed %p, want %p", got, client)
+	}
+
+	close(releases[1])
+	if !<-result2 {
+		MessagePoolReturn(packet2)
+		t.Fatal("second stale-snapshot sender did not use the committed client")
+	}
+	if got := sendCount.Load(); got != 2 {
+		t.Fatalf("candidate sends = %d, want 2", got)
 	}
 }
 
