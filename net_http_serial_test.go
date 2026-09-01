@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 )
@@ -207,6 +208,83 @@ func TestParallelEvalReservesRequestBudgetFromStalePreferredDialer(t *testing.T)
 			staleAttemptBudget,
 			settings.RequestTimeout,
 		)
+	}
+}
+
+// Cancellation asks every parallel attempt to stop, but completion remains
+// owned until each attempt stack has actually returned. Otherwise a caller can
+// release the strategy or its transport while a dial still uses their state.
+func TestParallelEvalCancellationJoinsAttemptWorker(t *testing.T) {
+	testCtx, testCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer testCancel()
+
+	strategyCtx, strategyCancel := context.WithCancel(context.Background())
+	defer strategyCancel()
+	settings := DefaultClientStrategySettings()
+	settings.RequestTimeout = 30 * time.Minute
+	settings.ParallelBlockSize = 1
+	dialer := &clientDialer{
+		description:   "blocked",
+		minimumWeight: 1,
+		settings:      settings,
+	}
+	strategy := &ClientStrategy{
+		ctx:               strategyCtx,
+		log:               loggerOrDefault(nil),
+		settings:          settings,
+		dialers:           map[*clientDialer]bool{dialer: true},
+		extenderIpSecrets: map[netip.Addr]string{},
+	}
+
+	attemptEntered := make(chan struct{})
+	attemptCanceled := make(chan struct{})
+	releaseAttempt := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			close(releaseAttempt)
+		})
+	}
+	t.Cleanup(release)
+
+	requestCtx, requestCancel := context.WithCancel(context.Background())
+	defer requestCancel()
+	result := make(chan *evalResult, 1)
+	go func() {
+		result <- strategy.parallelEval(requestCtx, func(evalCtx context.Context, _ *clientDialer) *evalResult {
+			close(attemptEntered)
+			<-evalCtx.Done()
+			close(attemptCanceled)
+			<-releaseAttempt
+			return &evalResult{err: evalCtx.Err()}
+		})
+	}()
+
+	select {
+	case <-testCtx.Done():
+		t.Fatalf("wait for parallel attempt: %v", testCtx.Err())
+	case <-attemptEntered:
+	}
+	requestCancel()
+	select {
+	case <-testCtx.Done():
+		t.Fatalf("wait for parallel attempt cancellation: %v", testCtx.Err())
+	case <-attemptCanceled:
+	}
+	select {
+	case <-result:
+		t.Fatal("parallel evaluation returned before its canceled attempt unwound")
+	default:
+	}
+
+	release()
+	select {
+	case <-testCtx.Done():
+		t.Fatalf("join parallel attempt: %v", testCtx.Err())
+	case parallelResult := <-result:
+		if parallelResult != nil {
+			t.Fatalf("canceled parallel evaluation result = %#v", parallelResult)
+		}
 	}
 }
 

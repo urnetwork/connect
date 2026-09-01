@@ -746,9 +746,23 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 	// 3. expand the extenders and try new extenders in parallel blocks
 
 	handleCtx, handleCancel := context.WithTimeout(ctx, self.settings.RequestTimeout)
-	defer handleCancel()
+	// Every parallel attempt remains owned by this call until its eval stack
+	// returns. Cancellation only asks a dial to stop; it is not completion.
+	// Register before launch so cleanup never races Wait with a later Add.
+	var workerWaitGroup sync.WaitGroup
+	startWorker := func(run func(), handlers ...any) {
+		workerWaitGroup.Add(1)
+		go func() {
+			defer workerWaitGroup.Done()
+			HandleError(run, handlers...)
+		}()
+	}
+	defer func() {
+		handleCancel()
+		workerWaitGroup.Wait()
+	}()
 	// merge handleCtx with self.ctx
-	go HandleError(func() {
+	startWorker(func() {
 		defer handleCancel()
 		select {
 		case <-handleCtx.Done():
@@ -756,7 +770,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 		case <-self.ctx.Done():
 			return
 		}
-	})
+	}, handleCancel)
 
 	out := make(chan *evalResult)
 
@@ -861,7 +875,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 			n := min(len(parallelDialers), self.settings.ParallelBlockSize)
 			p += n
 			for _, dialer := range parallelDialers[0:n] {
-				go HandleError(func() {
+				startWorker(func() {
 					run(dialer)
 				})
 			}
@@ -882,7 +896,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 						}
 						result.Close()
 					}
-					go HandleError(func() {
+					startWorker(func() {
 						run(dialer)
 					})
 				}
@@ -893,7 +907,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 			n := min(len(expandedDialers), self.settings.ParallelBlockSize-p)
 			p += n
 			for _, dialer := range expandedDialers[0:n] {
-				go HandleError(func() {
+				startWorker(func() {
 					run(dialer)
 				})
 			}
@@ -914,7 +928,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 						}
 						result.Close()
 					}
-					go HandleError(func() {
+					startWorker(func() {
 						run(dialer)
 					})
 				}
@@ -948,17 +962,27 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 
 func (self *ClientStrategy) serialEval(ctx context.Context, eval func(ctx context.Context, dialer *clientDialer) *evalResult, helloEval func(ctx context.Context, dialer *clientDialer) *evalResult) *evalResult {
 	handleCtx, handleCancel := context.WithTimeout(ctx, self.settings.RequestTimeout)
-	defer handleCancel()
+	// The strategy-context bridge is function-owned; join it so even a fast
+	// successful serial result leaves no callback racing the caller's cleanup.
+	var contextWaitGroup sync.WaitGroup
+	defer func() {
+		handleCancel()
+		contextWaitGroup.Wait()
+	}()
 	// merge handleCtx with self.ctx
-	go HandleError(func() {
-		defer handleCancel()
-		select {
-		case <-handleCtx.Done():
-			return
-		case <-self.ctx.Done():
-			return
-		}
-	}, handleCancel)
+	contextWaitGroup.Add(1)
+	go func() {
+		defer contextWaitGroup.Done()
+		HandleError(func() {
+			defer handleCancel()
+			select {
+			case <-handleCtx.Done():
+				return
+			case <-self.ctx.Done():
+				return
+			}
+		}, handleCancel)
+	}()
 
 	// keep trying as long as there is time left
 	for {
