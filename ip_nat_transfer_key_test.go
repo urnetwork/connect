@@ -101,6 +101,147 @@ func TestTcpSynAckUsesOrderedSocketRecoveryLane(t *testing.T) {
 	}
 }
 
+// A provider may finish its upstream dial while the first synthesized SYN-ACK
+// is lost at a later routing boundary. The source remains in SYN-SENT and
+// retransmits its identical SYN. A pure ACK cannot complete that state; the
+// provider must retransmit SYN-ACK until the source acknowledges the handshake.
+func TestTcpRetransmittedSynResendsSynAckBeforeHandshakeAck(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	sequenceSocket, upstreamSocket := net.Pipe()
+	settings := DefaultTcpBufferSettingsWithBufferSize(2)
+	settings.DialContextSettings = &DialContextSettings{
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			return sequenceSocket, nil
+		},
+	}
+
+	type responseFlags struct {
+		syn bool
+		ack bool
+		seq uint32
+	}
+	responses := make(chan responseFlags, 2)
+	sequence := newTcpSequenceWithTransferKey(
+		ctx,
+		func(
+			_ TransferPath,
+			_ TransferKey,
+			_ protocol.ProvideMode,
+			_ receiveRecoveryMode,
+			_ *IpPath,
+			packet []byte,
+		) {
+			_, sourceIp, destinationIp, transport, ok := parseIpv4(packet)
+			if !ok {
+				return
+			}
+			var tcp parsedTcp
+			if parseTcpPacket(sourceIp, destinationIp, transport, &tcp) {
+				responses <- responseFlags{syn: tcp.syn, ack: tcp.ack, seq: tcp.seq}
+			}
+		},
+		SourceId(NewId()),
+		TransferKey{},
+		protocol.ProvideMode_Network,
+		4,
+		net.IPv4(10, 0, 0, 1).To4(),
+		40001,
+		net.IPv4(203, 0, 113, 7).To4(),
+		443,
+		1000,
+		settings,
+	)
+	done := make(chan struct{})
+	go func() {
+		sequence.Run()
+		close(done)
+	}()
+	defer func() {
+		sequence.Cancel()
+		cancel()
+		upstreamSocket.Close()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("TCP sequence did not stop")
+		}
+	}()
+
+	sendSyn := func(label string) {
+		t.Helper()
+		packet := MessagePoolGet(Ipv4HeaderSizeWithoutExtensions + TcpHeaderSizeWithoutExtensions)
+		success, err := sequence.send(
+			&TcpSendItem{
+				provideMode: protocol.ProvideMode_Network,
+				tcp: parsedTcp{
+					syn:        true,
+					seq:        1000,
+					windowSize: 65535,
+				},
+				ipPacket: packet,
+			},
+			-1,
+		)
+		if err != nil || !success {
+			MessagePoolReturn(packet)
+			t.Fatalf("send %s SYN: success=%t err=%v", label, success, err)
+		}
+	}
+	receive := func(label string) responseFlags {
+		t.Helper()
+		select {
+		case flags := <-responses:
+			return flags
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s SYN received no provider response", label)
+			return responseFlags{}
+		}
+	}
+
+	sendSyn("initial")
+	initialResponse := receive("initial")
+	if !initialResponse.syn || !initialResponse.ack {
+		t.Fatalf("initial response = SYN:%t ACK:%t, want SYN-ACK", initialResponse.syn, initialResponse.ack)
+	}
+	sendSyn("retransmitted")
+	if flags := receive("retransmitted"); !flags.syn || !flags.ack || flags.seq != initialResponse.seq {
+		t.Fatalf(
+			"retransmitted response = SYN:%t ACK:%t seq:%d, want SYN-ACK seq:%d",
+			flags.syn,
+			flags.ack,
+			flags.seq,
+			initialResponse.seq,
+		)
+	}
+
+	// The source's ACK and the following stale SYN share one FIFO send
+	// sequence, so this deterministically checks the other state boundary with
+	// no polling: once the handshake is acknowledged, the stale SYN gets the
+	// established-flow pure ACK instead of reopening the handshake.
+	ackPacket := MessagePoolGet(Ipv4HeaderSizeWithoutExtensions + TcpHeaderSizeWithoutExtensions)
+	ackSuccess, ackErr := sequence.send(
+		&TcpSendItem{
+			provideMode: protocol.ProvideMode_Network,
+			tcp: parsedTcp{
+				ack:        true,
+				seq:        1001,
+				ackNumber:  1001,
+				windowSize: 65535,
+			},
+			ipPacket: ackPacket,
+		},
+		-1,
+	)
+	if ackErr != nil || !ackSuccess {
+		MessagePoolReturn(ackPacket)
+		t.Fatalf("send handshake ACK: success=%t err=%v", ackSuccess, ackErr)
+	}
+	sendSyn("post-handshake stale")
+	if flags := receive("post-handshake stale"); flags.syn || !flags.ack {
+		t.Fatalf("post-handshake response = SYN:%t ACK:%t, want pure ACK", flags.syn, flags.ack)
+	}
+}
+
 // A source/lane snapshot is returned from one NAT callback.
 type natTransferSnapshot struct {
 	source       TransferPath

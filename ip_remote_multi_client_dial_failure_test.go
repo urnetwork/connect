@@ -441,13 +441,39 @@ func TestDialFailureQuicFlowReraces(t *testing.T) {
 func TestSynWaitHandshakeTrips(t *testing.T) {
 	update := &multiClientChannelUpdate{}
 	client := &multiClientChannel{settings: DefaultMultiClientSettings()}
+	tcpPath := udpTestPath(4)
+	tcpPath.Protocol = IpProtocolTcp
+	tcpPath.Syn = true
 
-	if update.synWaitExceeded(client, 0) {
+	if update.synWaitExceeded(client, tcpPath, 0) {
 		t.Fatal("the first probe must only start the clock, never trip")
 	}
 	// a zero timeout is already exceeded by the second probe
-	if !update.synWaitExceeded(client, 0) {
+	if !update.synWaitExceeded(client, tcpPath, 0) {
 		t.Error("a retransmitting handshake past the timeout did not trip")
+	}
+}
+
+// A pure TCP SYN never becomes a one-way stream. Even an unusually persistent
+// dial must remain eligible for re-racing after the UDP ambiguity budget is
+// exhausted; otherwise a long caller timeout can strand it permanently.
+func TestSynWaitTCPHandshakeNeverExhaustsResponseBudget(t *testing.T) {
+	update := &multiClientChannelUpdate{}
+	client := &multiClientChannel{settings: DefaultMultiClientSettings()}
+	tcpPath := udpTestPath(4)
+	tcpPath.Protocol = IpProtocolTcp
+	tcpPath.Syn = true
+
+	if update.synWaitExceeded(client, tcpPath, time.Hour) {
+		t.Fatal("the first SYN tripped the silence clock")
+	}
+	for range dialProbeMaxSends {
+		if update.synWaitExceeded(client, tcpPath, time.Hour) {
+			t.Fatal("a SYN inside a deliberately wide timeout tripped the silence clock")
+		}
+	}
+	if !update.synWaitExceeded(client, tcpPath, 0) {
+		t.Fatal("a TCP handshake aged into the one-way UDP exemption")
 	}
 }
 
@@ -459,23 +485,24 @@ func TestSynWaitHandshakeTrips(t *testing.T) {
 func TestSynWaitStreamIsExempt(t *testing.T) {
 	update := &multiClientChannelUpdate{}
 	client := &multiClientChannel{settings: DefaultMultiClientSettings()}
+	udpPath := udpTestPath(4)
 
-	update.synWaitExceeded(client, 0) // starts the clock at count 1
+	update.synWaitExceeded(client, udpPath, 0) // starts the clock at count 1
 	for range dialProbeMaxSends - 1 {
-		update.synWaitExceeded(client, time.Hour) // burn the budget, no trip
+		update.synWaitExceeded(client, udpPath, time.Hour) // burn the budget, no trip
 	}
 	// the budget is spent; even a long-exceeded timeout must not trip
-	if update.synWaitExceeded(client, 0) {
+	if update.synWaitExceeded(client, udpPath, 0) {
 		t.Error("a flow past the probe budget was re-raced: streams belong to the blackhole detector")
 	}
 
 	// a re-race onto another exit re-keys clock and budget, so the flow is
 	// judged fresh where it actually dials fresh
 	other := &multiClientChannel{settings: DefaultMultiClientSettings()}
-	if update.synWaitExceeded(other, 0) {
+	if update.synWaitExceeded(other, udpPath, 0) {
 		t.Fatal("first probe on a fresh exit must only start the clock")
 	}
-	if !update.synWaitExceeded(other, 0) {
+	if !update.synWaitExceeded(other, udpPath, 0) {
 		t.Error("the re-keyed budget did not allow a fresh handshake to trip")
 	}
 }

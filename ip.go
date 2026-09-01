@@ -3766,7 +3766,12 @@ type TcpSequence struct {
 	// immutable generation identity used to distinguish a retransmitted SYN
 	// from four-tuple reuse while the previous flow is still being reaped
 	initialSynSeq uint32
-	flowCloseOnce sync.Once
+	// handshakeAcked records that the source acknowledged the synthesized
+	// SYN-ACK. Until then an identical SYN is a handshake retransmission and
+	// must receive SYN-ACK again, not the pure ACK used for a stale SYN on an
+	// established connection. Guarded by ConnectionState.mutex.
+	handshakeAcked bool
+	flowCloseOnce  sync.Once
 	// Called once after Run and its child workers release the socket lifecycle.
 	flowCloseCallback tcpFlowCloseFunction
 
@@ -4797,14 +4802,23 @@ func (self *TcpSequence) Run() {
 		}
 		return removeReorderItem(readyItemIndex)
 	}
-	sendCurrentAck := func() {
+	sendCurrentAck := func(retransmittedSyn bool) {
 		var packet []byte
+		recoveryMode := receiveRecoveryModeRegenerableControl
 		func() {
 			self.mutex.Lock()
 			defer self.mutex.Unlock()
 
 			var err error
-			packet, err = self.PureAck()
+			if retransmittedSyn && !self.handshakeAcked {
+				packet, err = self.synAckWithSequence(
+					self.tcpBufferSettings.Mtu,
+					self.initialSynSeq,
+				)
+				recoveryMode = receiveRecoveryModeTcpSocket
+			} else {
+				packet, err = self.PureAck()
+			}
 			if err != nil {
 				self.log.Infof("[r]duplicate ack err = %s\n", err)
 			}
@@ -4816,7 +4830,7 @@ func (self *TcpSequence) Run() {
 		case <-self.ctx.Done():
 			MessagePoolReturn(packet)
 		default:
-			self.receivePacket(packet, receiveRecoveryModeRegenerableControl)
+			self.receivePacket(packet, recoveryMode)
 		}
 	}
 
@@ -4860,10 +4874,13 @@ func (self *TcpSequence) Run() {
 			}()
 
 			if sendItem.tcp.syn {
-				// A SYN is only valid in the handshake above. A current ACK tells a
-				// retransmitting source which sequence this established flow expects.
+				// Until the source ACKs the synthesized handshake, an identical
+				// SYN means its SYN-ACK was lost and must be retransmitted. Once
+				// acknowledged, the current pure ACK is the established-flow
+				// response to a stale SYN.
+				retransmittedSyn := sendItem.tcp.seq == self.initialSynSeq
 				returnSendItem(sendItem)
-				sendCurrentAck()
+				sendCurrentAck(retransmittedSyn)
 				return true
 			}
 
@@ -4890,7 +4907,7 @@ func (self *TcpSequence) Run() {
 				}
 				// Both retained gaps and bounded-buffer rejection need an immediate
 				// duplicate ACK so ordinary TCP retransmission can recover.
-				sendCurrentAck()
+				sendCurrentAck(false)
 				return true
 			}
 			if end <= 0 {
@@ -4900,7 +4917,7 @@ func (self *TcpSequence) Run() {
 				if self.afterReorderDispositionForTest != nil {
 					self.afterReorderDispositionForTest(tcpReorderDispositionStale)
 				}
-				sendCurrentAck()
+				sendCurrentAck(false)
 				return true
 			}
 
@@ -5077,6 +5094,10 @@ func (self *TcpSequence) applySendAckWithLock(tcp *parsedTcp) (receiveAckUpdated
 	if tcp.ack &&
 		0 <= int32(tcp.ackNumber-self.receiveSeqAck) &&
 		0 <= int32(self.receiveSeq-tcp.ackNumber) {
+		if !self.handshakeAcked &&
+			0 <= int32(tcp.ackNumber-(self.initialSynSeq+1)) {
+			self.handshakeAcked = true
+		}
 		// ACK generation and upload packetization may run concurrently in the
 		// source TCP stack. A pure ACK can therefore arrive with a sequence
 		// just ahead of or behind upload payload already delivered here. Its
@@ -5242,6 +5263,14 @@ func (self *ConnectionState) updateTimestampRecentWithLock(tcp *parsedTcp) {
 // SynAck builds the syn-ack for the connect handshake into a single pool
 // buffer, advertising the mss and negotiated window/timestamp extensions.
 func (self *ConnectionState) SynAck(mtu int) ([]byte, error) {
+	return self.synAckWithSequence(mtu, self.receiveSeq)
+}
+
+// synAckWithSequence builds a SYN-ACK at the original handshake sequence.
+// The ordinary first-send path passes receiveSeq; a retransmission passes the
+// preserved initial value after receiveSeq has advanced past SYN's sequence
+// byte.
+func (self *ConnectionState) synAckWithSequence(mtu int, sequence uint32) ([]byte, error) {
 	var ipHeaderByteCount int
 	switch self.ipVersion {
 	case 4:
@@ -5273,7 +5302,7 @@ func (self *ConnectionState) SynAck(mtu int) ([]byte, error) {
 	tcp := packet[ipHeaderByteCount:]
 	binary.BigEndian.PutUint16(tcp[0:2], uint16(self.destinationPort))
 	binary.BigEndian.PutUint16(tcp[2:4], uint16(self.sourcePort))
-	binary.BigEndian.PutUint32(tcp[4:8], self.receiveSeq)
+	binary.BigEndian.PutUint32(tcp[4:8], sequence)
 	binary.BigEndian.PutUint32(tcp[8:12], self.sendSeq)
 	tcp[12] = byte(tcpHeaderByteCount/4) << 4
 	tcp[13] = tcpFlagSyn | tcpFlagAck

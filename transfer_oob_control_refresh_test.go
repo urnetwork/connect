@@ -13,9 +13,20 @@ import (
 )
 
 func TestApiOutOfBandControlUsesRefreshedJwt(t *testing.T) {
-	authorizations := make(chan string, 2)
+	var authorizationsMutex sync.Mutex
+	var authorizations []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		authorizations <- r.Header.Get("Authorization")
+		if r.URL.Path == "/hello" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path != "/connect/control" {
+			http.NotFound(w, r)
+			return
+		}
+		authorizationsMutex.Lock()
+		authorizations = append(authorizations, r.Header.Get("Authorization"))
+		authorizationsMutex.Unlock()
 		var args ConnectControlArgs
 		if err := json.NewDecoder(r.Body).Decode(&args); err != nil {
 			t.Errorf("decode request: %v", err)
@@ -50,14 +61,16 @@ func TestApiOutOfBandControlUsesRefreshedJwt(t *testing.T) {
 	control.SetByJwt("new-jwt")
 	send()
 
-	for i, want := range []string{"Bearer old-jwt", "Bearer new-jwt"} {
-		select {
-		case got := <-authorizations:
-			if got != want {
-				t.Fatalf("request %d authorization = %q, want %q", i+1, got, want)
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatalf("missing authorization for request %d", i+1)
+	authorizationsMutex.Lock()
+	gotAuthorizations := append([]string(nil), authorizations...)
+	authorizationsMutex.Unlock()
+	wantAuthorizations := []string{"Bearer old-jwt", "Bearer new-jwt"}
+	if len(gotAuthorizations) != len(wantAuthorizations) {
+		t.Fatalf("connect/control authorizations = %q, want %q", gotAuthorizations, wantAuthorizations)
+	}
+	for i, want := range wantAuthorizations {
+		if got := gotAuthorizations[i]; got != want {
+			t.Fatalf("request %d authorization = %q, want %q", i+1, got, want)
 		}
 	}
 }

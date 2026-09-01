@@ -6561,7 +6561,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 		if dialProbePacket(ipPath) &&
 			currentClient != nil && !update.receivedInbound.Load() &&
 			self.reliabilitySettings().DialFailureRerace &&
-			update.synWaitExceeded(currentClient, inferredDialFailureTimeout) {
+			update.synWaitExceeded(currentClient, ipPath, inferredDialFailureTimeout) {
 			// treat the flow as unbound locally only if it really was: the
 			// guards inside can decline after our check passed (a syn-ack can
 			// land in between), and racing while the flow is still committed
@@ -6658,108 +6658,227 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 			case 0:
 				return
 			case 1:
-				// send to one client, no race
 				client := orderedClients[0]
-				if client.SendGroup(sendPacketGroup, sendTimeout) {
-					success = true
+				// Even one candidate needs a published race state before queue
+				// admission: its response can arrive before SendGroup returns.
+				// Unlike a wide race, success still commits immediately because
+				// there is no winner decision to wait for.
+				var race *multiClientChannelUpdateRace
+				func() {
+					update.stateLock.Lock()
+					defer update.stateLock.Unlock()
+					if update.client.Load() != nil {
+						return
+					}
+					if update.race == nil {
+						update.initRaceWithLock()
+					}
+					race = update.race
+					state := race.clientStates[client]
+					if state == nil {
+						state = &multiClientChannelRaceClientState{sendTime: time.Now()}
+						race.clientStates[client] = state
+					}
+					state.pendingSendCount += 1
+				}()
+				if race == nil {
+					return
+				}
 
-					// client is atomic; lock-free store
-					update.client.Store(client)
+				sent := client.SendGroup(sendPacketGroup, sendTimeout)
+				var abandonedClients []*multiClientChannel
+				var receivePackets []*receivePacket
+				var returnPackets []*receivePacket
+				connectSucceeded := false
+				func() {
+					update.stateLock.Lock()
+					defer update.stateLock.Unlock()
+					if update.race != race {
+						return
+					}
+					state := race.clientStates[client]
+					if state == nil {
+						return
+					}
+					state.pendingSendCount -= 1
+					if !sent {
+						if state.pendingSendCount == 0 &&
+							state.sentPacketCount == 0 && len(state.packets) == 0 {
+							delete(race.clientStates, client)
+						}
+						if len(race.clientStates) == 0 {
+							update.clearRaceWithLock()
+						}
+						return
+					}
+					state.sentPacketCount += 1
+					race.sentPacketCount += 1
+					receivePackets, abandonedClients, returnPackets, connectSucceeded =
+						update.commitRaceClientWithLock(client)
+				}()
+				if !sent {
+					return
+				}
+
+				success = true
+				if connectSucceeded {
+					client.addConnectSuccess()
+					self.clearDestinationServiceFailure(client, update.ipPath)
+					self.logSmtpProviderOutcome(update.ipPath, client, "connected")
+				}
+				self.bindClientFlow(update, client)
+				if 0 < len(abandonedClients) {
+					if rstPacket, ok := ipOosRst(update.ipPath); ok {
+						for _, abandonedClient := range abandonedClients {
+							abandonedClient.Send(&parsedPacket{
+								packet: rstPacket,
+								ipPath: update.ipPath,
+							}, 0)
+						}
+					}
+				}
+				completed := false
+				for _, packet := range receivePackets {
+					self.deliverReceivePacket(packet.Source, packet.ProvideMode, packet.IpPath, packet.Packet)
+					if update.observeTcpControl(packet.tcpControl, true) {
+						completed = true
+					}
+				}
+				if completed {
+					self.retireCompletedTcpFlow(update)
+				}
+				for _, packet := range returnPackets {
+					MessagePoolReturn(packet.Packet)
+				}
+				// A successful no-response commitment still starts its silence
+				// clock on the first probe. A synchronous response sets
+				// receivedInbound above and makes startSynWait a no-op.
+				if dialProbePacket(ipPath) && update.client.Load() == client {
+					update.startSynWait(client)
 				}
 				return
 
 			default:
-				var successCount atomic.Int32
-
-				send := func(client *multiClientChannel) {
-					select {
-					case <-update.ctx.Done():
-						return
-					default:
-					}
-
-					if update.client.Load() != nil {
-						// another client already chosen, done
-						return
-					}
-
-					sent := sendMultiClientGroupRaceAttempt(
-						client,
-						sendPacketGroup,
-						sendTimeout,
-					)
-					if sent {
-						successCount.Add(1)
-
-						var initRace *multiClientChannelUpdateRace
-						var initRaceEarlyComplete <-chan struct{}
-						var abandonedClients []*multiClientChannel
-						func() {
-							// race state is guarded by the per-flow stateLock (a
-							// leaf); client is atomic
-							update.stateLock.Lock()
-							defer update.stateLock.Unlock()
-
-							if update.client.Load() != nil {
-								// another client already chosen, done
-								return
-							}
-
-							race := update.race
-							if race == nil {
-								update.initRaceWithLock()
-								race = update.race
-
-								initRace = race
-								initRaceEarlyComplete = race.completeMonitor.NotifyChannel()
-							}
-							state := race.clientStates[client]
-							if state == nil {
-								state = &multiClientChannelRaceClientState{
-									sendTime: time.Now(),
-								}
-								race.clientStates[client] = state
-							}
-							state.sentPacketCount += 1
-							race.sentPacketCount += 1
-							bufferExceeded := state != nil && self.settings.MultiRaceSetOnNoResponseTimeout <= time.Now().Sub(state.sendTime) || self.settings.MultiRaceClientSentPacketMaxCount < state.sentPacketCount
-							if race.packetCount == 0 && bufferExceeded {
-								// no client response in timeout, lock in this client
-								// this happens for example when the client only sends and does not receive (e.g. udp send)
-
-								for abandonedClient, _ := range race.clientStates {
-									if abandonedClient != client {
-										abandonedClients = append(abandonedClients, abandonedClient)
-									}
-								}
-
-								update.clearRaceWithLock()
-								update.client.Store(client)
-							}
-						}()
-
-						if initRace != nil {
-							self.scheduleCompleteRace(update.ipPath, initRace, initRaceEarlyComplete)
-						}
-
-						if 0 < len(abandonedClients) {
-							if rstPacket, ok := ipOosRst(update.ipPath); ok {
-								for _, abandonedClient := range abandonedClients {
-									abandonedClient.Send(&parsedPacket{
-										packet: rstPacket,
-										ipPath: update.ipPath,
-									}, 0)
-								}
-							}
-						}
-					}
-				}
-
 				var raceOrderedClients []*multiClientChannel
 				if 0 < self.settings.MultiRaceClientCount && self.settings.MultiRaceClientCount < len(orderedClients) {
 					raceOrderedClients = orderedClients[:self.settings.MultiRaceClientCount]
 				} else {
 					raceOrderedClients = orderedClients
+				}
+
+				// Publish the race and every candidate before any SendGroup call.
+				// Queue admission and provider return run on independent goroutines;
+				// a fast response can therefore arrive before SendGroup returns.
+				// Registering afterwards drops that real response as unknown and
+				// leaves an unanswered flow even though an exit answered it.
+				var race *multiClientChannelUpdateRace
+				var initRace *multiClientChannelUpdateRace
+				var initRaceEarlyComplete <-chan struct{}
+				func() {
+					update.stateLock.Lock()
+					defer update.stateLock.Unlock()
+					if update.client.Load() != nil {
+						return
+					}
+					if update.race == nil {
+						update.initRaceWithLock()
+						initRace = update.race
+						initRaceEarlyComplete = initRace.completeMonitor.NotifyChannel()
+					}
+					race = update.race
+					now := time.Now()
+					for _, client := range raceOrderedClients {
+						state := race.clientStates[client]
+						if state == nil {
+							state = &multiClientChannelRaceClientState{sendTime: now}
+							race.clientStates[client] = state
+						}
+						state.pendingSendCount += 1
+					}
+				}()
+				if race == nil {
+					return
+				}
+
+				var scheduleOnce sync.Once
+				scheduleRace := func() {
+					if initRace != nil {
+						scheduleOnce.Do(func() {
+							self.scheduleCompleteRace(update.ipPath, initRace, initRaceEarlyComplete)
+						})
+					}
+				}
+
+				var successCount atomic.Int32
+				send := func(client *multiClientChannel) {
+					sent := false
+					select {
+					case <-update.ctx.Done():
+					default:
+						if update.client.Load() == nil {
+							sent = sendMultiClientGroupRaceAttempt(
+								client,
+								sendPacketGroup,
+								sendTimeout,
+							)
+						}
+					}
+					if sent {
+						successCount.Add(1)
+					}
+
+					var abandonedClients []*multiClientChannel
+					func() {
+						update.stateLock.Lock()
+						defer update.stateLock.Unlock()
+						if update.race != race {
+							return
+						}
+						state := race.clientStates[client]
+						if state == nil {
+							return
+						}
+						state.pendingSendCount -= 1
+						if !sent {
+							if state.pendingSendCount == 0 &&
+								state.sentPacketCount == 0 && len(state.packets) == 0 {
+								delete(race.clientStates, client)
+							}
+							return
+						}
+						state.sentPacketCount += 1
+						race.sentPacketCount += 1
+						bufferExceeded := self.settings.MultiRaceSetOnNoResponseTimeout <= time.Since(state.sendTime) ||
+							self.settings.MultiRaceClientSentPacketMaxCount < state.sentPacketCount
+						if race.packetCount == 0 && bufferExceeded &&
+							!dialProbeAwaitsResponse(ipPath, state.sentPacketCount) {
+							// Silence can select a client only for traffic which may
+							// truly be send-only. TCP SYN and the bounded initial
+							// QUIC/DNS window still require response evidence.
+							for abandonedClient := range race.clientStates {
+								if abandonedClient != client {
+									abandonedClients = append(abandonedClients, abandonedClient)
+								}
+							}
+							update.clearRaceWithLock()
+							update.client.Store(client)
+						}
+					}()
+
+					// Start the response deadline only after an admission call
+					// returns. Starting it at registration can expire the race
+					// while a bounded send is still waiting for queue capacity.
+					scheduleRace()
+					if 0 < len(abandonedClients) {
+						if rstPacket, ok := ipOosRst(update.ipPath); ok {
+							for _, abandonedClient := range abandonedClients {
+								abandonedClient.Send(&parsedPacket{
+									packet: rstPacket,
+									ipPath: update.ipPath,
+								}, 0)
+							}
+						}
+					}
 				}
 
 				// if 0 < timeout {
@@ -7916,60 +8035,60 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 		// parent lock and must never nest under it
 		var boundUpdate *multiClientChannelUpdate
 		var boundClient *multiClientChannel
+		connectSucceeded := false
+		var connectClient *multiClientChannel
+		var connectPath *IpPath
 		self.receiveClientPath(ipPath, func(update *multiClientChannelUpdate) {
 			// race state is guarded by the per-flow stateLock (a leaf); client
 			// is atomic
 			update.stateLock.Lock()
 			defer update.stateLock.Unlock()
 
-			if update.race == race {
-				defer update.clearRaceWithLock()
+			if update.race != race {
+				return
+			}
 
-				if update.client.Load() == nil {
-
-					// weighted shuffle clients by rtt
-					orderedClients := []*multiClientChannel{}
-					weights := map[*multiClientChannel]float32{}
-					for client, state := range race.clientStates {
-						if 0 < len(state.packets) {
-							orderedClients = append(orderedClients, client)
-							rtt := state.receiveTime.Sub(state.sendTime)
-							weights[client] = float32(rtt / time.Millisecond)
-						}
-					}
-					WeightedShuffleWithEntropy(orderedClients, weights, self.settings.StatsWindowEntropy)
-
-					if 0 < len(orderedClients) {
-						// the last is the lowest rtt
-						client := orderedClients[len(orderedClients)-1]
-
-						update.client.Store(client)
-						boundUpdate, boundClient = update, client
-						receivePackets = race.clientStates[client].packets
-						for _, p := range receivePackets {
-							if p.Pooled {
-								p.Pooled = false
-								returnPackets = append(returnPackets, p)
-							}
-						}
+			winner := update.client.Load()
+			if winner == nil {
+				// weighted shuffle clients by rtt
+				orderedClients := []*multiClientChannel{}
+				weights := map[*multiClientChannel]float32{}
+				for client, state := range race.clientStates {
+					if 0 < len(state.packets) {
+						orderedClients = append(orderedClients, client)
+						rtt := state.receiveTime.Sub(state.sendTime)
+						weights[client] = float32(rtt / time.Millisecond)
 					}
 				}
-				// else the client is already set
-				committedClient := update.client.Load()
-				for abandonedClient, abandonedState := range race.clientStates {
-					if abandonedClient != committedClient {
-						abandonedClients = append(abandonedClients, abandonedClient)
-						for _, p := range abandonedState.packets {
-							if p.Pooled {
-								p.Pooled = false
-								returnPackets = append(returnPackets, p)
-							}
-						}
-					}
+				WeightedShuffleWithEntropy(orderedClients, weights, self.settings.StatsWindowEntropy)
+				if 0 < len(orderedClients) {
+					// the last is the lowest rtt
+					winner = orderedClients[len(orderedClients)-1]
 				}
 			}
-			// else the client is on a new race
+			if winner != nil {
+				receivePackets, abandonedClients, returnPackets, connectSucceeded =
+					update.commitRaceClientWithLock(winner)
+				if connectSucceeded {
+					connectClient = winner
+					connectPath = update.ipPath
+				}
+				if update.client.Load() == winner {
+					boundUpdate, boundClient = update, winner
+				}
+			}
+			// No response, or a committed client which was not in this stale
+			// race: release the race's buffered owners without changing the
+			// current binding.
+			if update.race == race {
+				update.clearRaceWithLock()
+			}
 		})
+		if connectSucceeded {
+			connectClient.addConnectSuccess()
+			self.clearDestinationServiceFailure(connectClient, connectPath)
+			self.logSmtpProviderOutcome(connectPath, connectClient, "connected")
+		}
 		// the race completion commits the flow with no send-path transition to
 		// notice it, so this is the only place its bookkeeping can be recorded
 		self.bindClientFlow(boundUpdate, boundClient)
@@ -7983,8 +8102,15 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 				}
 			}
 		}
+		completed := false
 		for _, p := range receivePackets {
 			self.deliverReceivePacket(p.Source, p.ProvideMode, p.IpPath, p.Packet)
+			if boundUpdate != nil && boundUpdate.observeTcpControl(p.tcpControl, true) {
+				completed = true
+			}
+		}
+		if completed {
+			self.retireCompletedTcpFlow(boundUpdate)
 		}
 		for _, p := range returnPackets {
 			MessagePoolReturn(p.Packet)
@@ -8604,6 +8730,39 @@ func dialProbePacket(ipPath *IpPath) bool {
 	return false
 }
 
+// dialProbeAwaitsResponse reports whether an unanswered dial-shaped send must
+// keep all race candidates eligible. TCP SYNs always require a response, so
+// silence can never choose a winner. UDP has no handshake bit; the bounded
+// probe window lets a send-only flow on a watched port eventually fall back to
+// the historical no-response commitment instead of racing forever.
+func dialProbeAwaitsResponse(ipPath *IpPath, sendCount int) bool {
+	if !dialProbePacket(ipPath) {
+		return false
+	}
+	return ipPath.Protocol == IpProtocolTcp || sendCount <= dialProbeMaxSends
+}
+
+// startSynWait records the first unanswered dial probe carried by a committed
+// client. It is used by the one-candidate path, where there is no response race
+// to perform this transition. An inbound packet racing the send wins and keeps
+// the flow established without arming stale failure state.
+func (self *multiClientChannelUpdate) startSynWait(client *multiClientChannel) {
+	if client == nil || self.receivedInbound.Load() {
+		return
+	}
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.receivedInbound.Load() {
+		return
+	}
+	if self.synWaitClient != client || self.synWaitStart.IsZero() {
+		self.synWaitClient = client
+		self.synWaitStart = time.Now()
+		self.synWaitSendCount = 1
+	}
+}
+
 // synWaitExceeded starts the connect-wait clock on the first dial probe (a
 // tcp syn or a udp handshake packet, see dialProbePacket) a given exit
 // carries for this flow, and reports whether it has run past timeout on later
@@ -8612,7 +8771,7 @@ func dialProbePacket(ipPath *IpPath) bool {
 // than inheriting the previous one's -- otherwise the first probe through a
 // fresh exit would strike it immediately. When it trips, the clock restarts
 // for the same reason.
-func (self *multiClientChannelUpdate) synWaitExceeded(client *multiClientChannel, timeout time.Duration) bool {
+func (self *multiClientChannelUpdate) synWaitExceeded(client *multiClientChannel, ipPath *IpPath, timeout time.Duration) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -8624,10 +8783,11 @@ func (self *multiClientChannelUpdate) synWaitExceeded(client *multiClientChannel
 		return false
 	}
 	self.synWaitSendCount += 1
-	// past an initial window of sends with nothing back this flow is a
-	// one-way stream, not a handshake -- see dialProbeMaxSends. It stays
-	// exempt on this exit; a re-race re-keys the clock and the count.
-	if dialProbeMaxSends < self.synWaitSendCount {
+	// Past an initial UDP window with nothing back this may be a one-way
+	// stream rather than a handshake -- see dialProbeMaxSends. A pure TCP SYN
+	// is unambiguously waiting for a response and must never age into that
+	// exemption.
+	if !dialProbeAwaitsResponse(ipPath, self.synWaitSendCount) {
 		return false
 	}
 	if timeout <= now.Sub(self.synWaitStart) {
@@ -8887,6 +9047,55 @@ func (self *multiClientChannelUpdate) canUpdateSequence(sendPacket *parsedPacket
 	return false
 }
 
+// commitRaceClientWithLock makes client the race winner and transfers every
+// buffered response owner to the caller. The caller holds stateLock. Marking
+// pooled packets before clearRaceWithLock is the ownership handoff: race.Close
+// then releases only packets this result did not claim.
+func (self *multiClientChannelUpdate) commitRaceClientWithLock(
+	client *multiClientChannel,
+) (
+	receivePackets []*receivePacket,
+	abandonedClients []*multiClientChannel,
+	returnPackets []*receivePacket,
+	connectSucceeded bool,
+) {
+	race := self.race
+	if race == nil || client == nil {
+		return
+	}
+	state := race.clientStates[client]
+	if state == nil {
+		return
+	}
+
+	for abandonedClient, abandonedState := range race.clientStates {
+		if abandonedClient == client {
+			continue
+		}
+		abandonedClients = append(abandonedClients, abandonedClient)
+		for _, packet := range abandonedState.packets {
+			if packet.Pooled {
+				packet.Pooled = false
+				returnPackets = append(returnPackets, packet)
+			}
+		}
+	}
+	receivePackets = append(receivePackets, state.packets...)
+	for _, packet := range receivePackets {
+		if packet.Pooled {
+			packet.Pooled = false
+			returnPackets = append(returnPackets, packet)
+		}
+	}
+
+	self.clearRaceWithLock()
+	self.client.Store(client)
+	if 0 < len(receivePackets) && self.receivedInbound.CompareAndSwap(false, true) {
+		connectSucceeded = true
+	}
+	return
+}
+
 // must be called with `stateLock`
 func (self *multiClientChannelUpdate) initRaceWithLock() {
 	if self.race == nil {
@@ -8972,6 +9181,11 @@ type multiClientChannelRaceClientState struct {
 	receiveTime     time.Time
 	packets         []*receivePacket
 	sentPacketCount int
+	// pendingSendCount keeps a pre-registered candidate present until every
+	// concurrent admission attempt returns. Without the count, one refused
+	// attempt can delete the response target of another attempt still in
+	// flight on the same flow.
+	pendingSendCount int
 }
 
 type parsedPacket struct {

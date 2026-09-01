@@ -413,6 +413,382 @@ func TestMultiClientPacketGroupRaceKeepsMembersTogether(t *testing.T) {
 	requireGroupTestWitnessesReleased(t, packets, witnesses)
 }
 
+// A provider response may race the local queue-admission return. The flow and
+// every candidate must be registered before SendGroup can make that response
+// observable; registering afterwards drops a real SYN-ACK as "no race and no
+// client" and leaves the kernel retransmitting through exits that did answer.
+func TestMultiClientRaceRegistersCandidatesBeforeSend(t *testing.T) {
+	parent, update, closeParent := groupTestParent(t, DisableSecurityPolicy())
+	defer closeParent()
+	parent.settings.MultiRaceSetOnResponseTimeout = time.Hour
+	parent.settings.MultiRaceClientEarlyCompleteFraction = 2
+	delivered := make(chan struct{}, 1)
+	parent.SetReceivePacketCallback(func(
+		source TransferPath,
+		provideMode protocol.ProvideMode,
+		ipPath *IpPath,
+		packet []byte,
+	) {
+		delivered <- struct{}{}
+	})
+
+	tcpPath := udpTestPath(4)
+	tcpPath.Protocol = IpProtocolTcp
+	packet := MessagePoolCopy(ipOosTcpPacketSequence(tcpPath, tcpFlagSyn, 1000, nil))
+	group := requireGroupTestPacketGroup(t, packet)
+	parent.ip4PathUpdates = map[Ip4Path]*multiClientChannelUpdate{
+		tcpPath.ToIp4Path(): update,
+	}
+
+	started := make(chan *multiClientChannel, 2)
+	deliverResponse := make(chan struct{})
+	responseDelivered := make(chan struct{})
+	finishSends := make(chan struct{})
+	var finishOnce sync.Once
+	finish := func() {
+		finishOnce.Do(func() {
+			close(finishSends)
+		})
+	}
+	defer finish()
+
+	makeClient := func(respond bool) *multiClientChannel {
+		client := groupTestStalledChannel(parent.settings.ProtocolVersion)
+		client.ctx = parent.ctx
+		client.settings = parent.settings
+		client.sendGroupForTest = func(group *parsedPacketGroup, timeout time.Duration, ack bool) (bool, error) {
+			started <- client
+			if respond {
+				<-deliverResponse
+				parent.clientReceivePacketResolve(
+					client,
+					TransferPath{},
+					protocol.ProvideMode_Network,
+					group.ipPath,
+					[]byte{1},
+					tcpControlObservation{},
+				)
+				close(responseDelivered)
+			}
+			<-finishSends
+			for packetIndex := range group.packets {
+				MessagePoolReturn(group.packets[packetIndex].packet)
+			}
+			return true, nil
+		}
+		return client
+	}
+	client1 := makeClient(true)
+	client2 := makeClient(false)
+	parent.groupRaceCandidatesForTest = func(group *parsedPacketGroup) []*multiClientChannel {
+		return []*multiClientChannel{client1, client2}
+	}
+
+	result := make(chan bool, 1)
+	go func() {
+		result <- parent.sendPacketGroup(SourceId(NewId()), protocol.ProvideMode_Network, group, time.Second)
+	}()
+	<-started
+	<-started
+	close(deliverResponse)
+	<-responseDelivered
+
+	update.stateLock.Lock()
+	race := update.race
+	packetCount := 0
+	registered := false
+	if race != nil {
+		packetCount = race.packetCount
+		_, registered = race.clientStates[client1]
+	}
+	update.stateLock.Unlock()
+	if race == nil || !registered || packetCount != 1 {
+		finish()
+		<-result
+		t.Fatalf(
+			"synchronous response race = race:%t candidate:%t packets:%d; want true/true/1",
+			race != nil,
+			registered,
+			packetCount,
+		)
+	}
+
+	// Complete the retained race through its ordinary async path. The buffered
+	// packet is not merely a winner vote: it must establish the flow before a
+	// later dial-failure signal can act on it.
+	race.completeMonitor.NotifyAll()
+	finish()
+	if !<-result {
+		t.Fatal("race rejected candidates after retaining the synchronous response")
+	}
+	select {
+	case <-delivered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("retained synchronous response was not delivered")
+	}
+	if got := update.client.Load(); got != client1 {
+		t.Fatalf("response race committed %p, want responding candidate %p", got, client1)
+	}
+	if !update.receivedInbound.Load() {
+		t.Error("race-selected response did not establish the flow")
+	}
+}
+
+// The one-candidate fast path has the same queue-admission boundary as a wide
+// race. Its sole exit must be visible to receive resolution before SendGroup
+// runs; otherwise the first SYN-ACK is dropped even though no winner decision
+// is needed.
+func TestMultiClientOneCandidateRegistersBeforeSend(t *testing.T) {
+	parent, update, closeParent := groupTestParent(t, DisableSecurityPolicy())
+	defer closeParent()
+
+	tcpPath := udpTestPath(4)
+	tcpPath.Protocol = IpProtocolTcp
+	packet := MessagePoolCopy(ipOosTcpPacketSequence(tcpPath, tcpFlagSyn, 1000, nil))
+	group := requireGroupTestPacketGroup(t, packet)
+	parent.ip4PathUpdates = map[Ip4Path]*multiClientChannelUpdate{
+		tcpPath.ToIp4Path(): update,
+	}
+	var delivered atomic.Int32
+	parent.SetReceivePacketCallback(func(
+		source TransferPath,
+		provideMode protocol.ProvideMode,
+		ipPath *IpPath,
+		packet []byte,
+	) {
+		delivered.Add(1)
+	})
+
+	client := &multiClientChannel{
+		ctx:      parent.ctx,
+		settings: parent.settings,
+	}
+	client.sendGroupForTest = func(group *parsedPacketGroup, timeout time.Duration, ack bool) (bool, error) {
+		parent.clientReceivePacketResolve(
+			client,
+			TransferPath{},
+			protocol.ProvideMode_Network,
+			group.ipPath,
+			[]byte{1},
+			tcpControlObservation{},
+		)
+		for packetIndex := range group.packets {
+			MessagePoolReturn(group.packets[packetIndex].packet)
+		}
+		return true, nil
+	}
+	parent.groupRaceCandidatesForTest = func(group *parsedPacketGroup) []*multiClientChannel {
+		return []*multiClientChannel{client}
+	}
+
+	if !parent.sendPacketGroup(SourceId(NewId()), protocol.ProvideMode_Network, group, 0) {
+		t.Fatal("one-candidate SYN was not accepted")
+	}
+	if got := update.client.Load(); got != client {
+		t.Fatalf("one-candidate response committed %p, want %p", got, client)
+	}
+	if !update.receivedInbound.Load() {
+		t.Error("one-candidate synchronous response did not establish the flow")
+	}
+	if got := delivered.Load(); got != 1 {
+		t.Errorf("delivered responses = %d, want 1", got)
+	}
+}
+
+// The adjacent no-response fallback exists for send-only traffic. It must not
+// commit a TCP handshake when a custom timeout or packet limit reaches that
+// branch: silence is not winner evidence for a SYN, and a caller can otherwise
+// stay pinned to an arbitrary silent exit until its own deadline.
+func TestMultiClientNoResponseRaceKeepsTCPHandshakeUncommitted(t *testing.T) {
+	parent, update, closeParent := groupTestParent(t, DisableSecurityPolicy())
+	defer closeParent()
+	parent.settings.MultiRaceSetOnNoResponseTimeout = 0
+	parent.settings.MultiRaceSetOnResponseTimeout = time.Hour
+
+	var client1Sends atomic.Int32
+	var client2Sends atomic.Int32
+	makeClient := func(sendCount *atomic.Int32) *multiClientChannel {
+		return &multiClientChannel{
+			ctx:      parent.ctx,
+			settings: parent.settings,
+			sendGroupForTest: func(group *parsedPacketGroup, timeout time.Duration, ack bool) (bool, error) {
+				sendCount.Add(1)
+				for packetIndex := range group.packets {
+					MessagePoolReturn(group.packets[packetIndex].packet)
+				}
+				return true, nil
+			},
+		}
+	}
+	client1 := makeClient(&client1Sends)
+	client2 := makeClient(&client2Sends)
+	parent.groupRaceCandidatesForTest = func(group *parsedPacketGroup) []*multiClientChannel {
+		return []*multiClientChannel{client1, client2}
+	}
+
+	tcpProbeCount := dialProbeMaxSends + 1
+	for sendIndex := 0; sendIndex < tcpProbeCount; sendIndex++ {
+		tcpPath := udpTestPath(4)
+		tcpPath.Protocol = IpProtocolTcp
+		packet := MessagePoolCopy(ipOosTcpPacketSequence(tcpPath, tcpFlagSyn, 1000, nil))
+		group := requireGroupTestPacketGroup(t, packet)
+		if !parent.sendPacketGroup(SourceId(NewId()), protocol.ProvideMode_Network, group, 0) {
+			t.Fatalf("SYN %d was not accepted by the race", sendIndex+1)
+		}
+	}
+
+	if client := update.client.Load(); client != nil {
+		t.Fatalf("an unanswered TCP handshake committed candidate %p", client)
+	}
+	if got := client1Sends.Load(); got != int32(tcpProbeCount) {
+		t.Errorf("candidate 1 sends = %d, want %d", got, tcpProbeCount)
+	}
+	if got := client2Sends.Load(); got != int32(tcpProbeCount) {
+		t.Errorf("candidate 2 sends = %d, want %d", got, tcpProbeCount)
+	}
+}
+
+// QUIC is also a request-response handshake. Keep its initial probe budget in
+// the wide race; otherwise the same no-evidence commitment strands QUIC on an
+// arbitrary exit before its PTO recovery can find a responder.
+func TestMultiClientNoResponseRaceKeepsQUICHandshakeUncommitted(t *testing.T) {
+	parent, update, closeParent := groupTestParent(t, DisableSecurityPolicy())
+	defer closeParent()
+	parent.settings.MultiRaceSetOnNoResponseTimeout = 0
+	parent.settings.MultiRaceSetOnResponseTimeout = time.Hour
+
+	var sendCount atomic.Int32
+	makeClient := func() *multiClientChannel {
+		return &multiClientChannel{
+			ctx:      parent.ctx,
+			settings: parent.settings,
+			sendGroupForTest: func(group *parsedPacketGroup, timeout time.Duration, ack bool) (bool, error) {
+				sendCount.Add(1)
+				for packetIndex := range group.packets {
+					MessagePoolReturn(group.packets[packetIndex].packet)
+				}
+				return true, nil
+			},
+		}
+	}
+	client1 := makeClient()
+	client2 := makeClient()
+	parent.groupRaceCandidatesForTest = func(group *parsedPacketGroup) []*multiClientChannel {
+		return []*multiClientChannel{client1, client2}
+	}
+
+	for sendIndex := 0; sendIndex < dialProbeMaxSends; sendIndex++ {
+		packet := MessagePoolCopy(ipOosUdpPacket(udpTestPath(4), []byte{byte(sendIndex)}))
+		group := requireGroupTestPacketGroup(t, packet)
+		if !parent.sendPacketGroup(SourceId(NewId()), protocol.ProvideMode_Network, group, 0) {
+			t.Fatalf("QUIC probe %d was not accepted", sendIndex+1)
+		}
+	}
+	if client := update.client.Load(); client != nil {
+		t.Fatalf("an unanswered QUIC handshake committed candidate %p inside its probe budget", client)
+	}
+	if got := sendCount.Load(); got != 2*dialProbeMaxSends {
+		t.Errorf("QUIC candidate sends = %d, want %d", got, 2*dialProbeMaxSends)
+	}
+
+	// The existing stream guard remains bounded: after the response-probe
+	// budget, a send-only UDP/443 flow may commit instead of racing forever.
+	packet := MessagePoolCopy(ipOosUdpPacket(udpTestPath(4), []byte{0xff}))
+	group := requireGroupTestPacketGroup(t, packet)
+	if !parent.sendPacketGroup(SourceId(NewId()), protocol.ProvideMode_Network, group, 0) {
+		t.Fatal("post-budget QUIC-shaped stream packet was not accepted")
+	}
+	if client := update.client.Load(); client == nil {
+		t.Fatal("post-budget UDP/443 stream did not make its bounded no-response commitment")
+	}
+}
+
+// When only one exit is eligible there is no race to preserve. Bind it, but
+// start its silence clock on the first SYN; starting on the next retransmit
+// consumes an extra rung of exponential backoff before a later exit can help.
+func TestMultiClientOneCandidateTCPHandshakeStartsSilenceClock(t *testing.T) {
+	parent, update, closeParent := groupTestParent(t, DisableSecurityPolicy())
+	defer closeParent()
+
+	client := &multiClientChannel{
+		ctx:      parent.ctx,
+		settings: parent.settings,
+		sendGroupForTest: func(group *parsedPacketGroup, timeout time.Duration, ack bool) (bool, error) {
+			for packetIndex := range group.packets {
+				MessagePoolReturn(group.packets[packetIndex].packet)
+			}
+			return true, nil
+		},
+	}
+	parent.groupRaceCandidatesForTest = func(group *parsedPacketGroup) []*multiClientChannel {
+		return []*multiClientChannel{client}
+	}
+
+	tcpPath := udpTestPath(4)
+	tcpPath.Protocol = IpProtocolTcp
+	packet := MessagePoolCopy(ipOosTcpPacketSequence(tcpPath, tcpFlagSyn, 1000, nil))
+	group := requireGroupTestPacketGroup(t, packet)
+	if !parent.sendPacketGroup(SourceId(NewId()), protocol.ProvideMode_Network, group, 0) {
+		t.Fatal("one-candidate SYN was not accepted")
+	}
+	if got := update.client.Load(); got != client {
+		t.Fatalf("one-candidate SYN committed %p, want %p", got, client)
+	}
+	update.stateLock.Lock()
+	waitClient := update.synWaitClient
+	waitStart := update.synWaitStart
+	waitSendCount := update.synWaitSendCount
+	update.stateLock.Unlock()
+	if waitClient != client || waitStart.IsZero() || waitSendCount != 1 {
+		t.Fatalf(
+			"one-candidate silence clock = client:%p start-zero:%t sends:%d; want client:%p start-zero:false sends:1",
+			waitClient,
+			waitStart.IsZero(),
+			waitSendCount,
+			client,
+		)
+	}
+}
+
+// A truly one-way UDP flow cannot supply response evidence. Preserve the
+// historical bounded no-response commitment for ports that do not denote a
+// request-response protocol.
+func TestMultiClientNoResponseRaceCommitsOneWayUDP(t *testing.T) {
+	parent, update, closeParent := groupTestParent(t, DisableSecurityPolicy())
+	defer closeParent()
+	parent.settings.MultiRaceSetOnNoResponseTimeout = 0
+	parent.settings.MultiRaceSetOnResponseTimeout = time.Hour
+
+	makeClient := func() *multiClientChannel {
+		return &multiClientChannel{
+			ctx:      parent.ctx,
+			settings: parent.settings,
+			sendGroupForTest: func(group *parsedPacketGroup, timeout time.Duration, ack bool) (bool, error) {
+				for packetIndex := range group.packets {
+					MessagePoolReturn(group.packets[packetIndex].packet)
+				}
+				return true, nil
+			},
+		}
+	}
+	client1 := makeClient()
+	client2 := makeClient()
+	parent.groupRaceCandidatesForTest = func(group *parsedPacketGroup) []*multiClientChannel {
+		return []*multiClientChannel{client1, client2}
+	}
+
+	path := udpTestPath(4)
+	path.DestinationPort = 5001
+	packet := MessagePoolCopy(ipOosUdpPacket(path, []byte{1}))
+	group := requireGroupTestPacketGroup(t, packet)
+	if !parent.sendPacketGroup(SourceId(NewId()), protocol.ProvideMode_Network, group, 0) {
+		t.Fatal("one-way UDP packet was not accepted")
+	}
+	if got := update.client.Load(); got != client1 && got != client2 {
+		t.Fatalf("one-way UDP committed candidate %p, want one of %p or %p", got, client1, client2)
+	}
+}
+
 // A simulated stalled exit consumes the packet just like an admitted Transfer
 // while retaining its outstanding health accounting. Raw and legacy framing
 // must both release every accepted buffer owner.

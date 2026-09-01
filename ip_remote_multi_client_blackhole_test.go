@@ -164,35 +164,38 @@ func TestSynWaitExceededIsPerExit(t *testing.T) {
 	update := &multiClientChannelUpdate{}
 	exitA := &multiClientChannel{}
 	exitB := &multiClientChannel{}
+	tcpPath := udpTestPath(4)
+	tcpPath.Protocol = IpProtocolTcp
+	tcpPath.Syn = true
 	// wide enough that a scheduler or GC stall between two adjacent calls
 	// cannot age the clock past the bound and fail the "does not trip"
 	// assertions spuriously on a loaded runner
 	timeout := 250 * time.Millisecond
 
 	// first syn arms the clock, nothing trips
-	if update.synWaitExceeded(exitA, timeout) {
+	if update.synWaitExceeded(exitA, tcpPath, timeout) {
 		t.Fatal("first syn tripped the clock")
 	}
 	// a retransmit inside the window does not trip
-	if update.synWaitExceeded(exitA, timeout) {
+	if update.synWaitExceeded(exitA, tcpPath, timeout) {
 		t.Fatal("retransmit inside the window tripped the clock")
 	}
 
 	time.Sleep(timeout + 50*time.Millisecond)
 
 	// moving to a new exit must restart the wait, not inherit the old one
-	if update.synWaitExceeded(exitB, timeout) {
+	if update.synWaitExceeded(exitB, tcpPath, timeout) {
 		t.Fatal("a fresh exit inherited the previous exit's wait")
 	}
 
 	time.Sleep(timeout + 50*time.Millisecond)
 
 	// the same exit past the timeout trips
-	if !update.synWaitExceeded(exitB, timeout) {
+	if !update.synWaitExceeded(exitB, tcpPath, timeout) {
 		t.Fatal("an aged wait on the same exit did not trip")
 	}
 	// and tripping restarts the clock rather than firing on every retransmit
-	if update.synWaitExceeded(exitB, timeout) {
+	if update.synWaitExceeded(exitB, tcpPath, timeout) {
 		t.Fatal("the clock did not restart after tripping")
 	}
 }
