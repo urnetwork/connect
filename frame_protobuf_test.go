@@ -553,11 +553,13 @@ func TestTwoPacketEncryptedPackFitsMinimumMessageLimit(t *testing.T) {
 
 // H1 may use more small frames than the compatibility coalescer. Assert the
 // maximum frame-count/byte combination, a bounded ordinary opening contract,
-// and outer sequence encryption still fit the deployed 4-KiB WebSocket
-// envelope. Opening/rotating contracts retain 3 KiB; an established contract
-// can safely use three full 1,100-byte packets only while no contract frame
-// rides on that Pack.
+// and outer sequence encryption still fit the ordinary 4-KiB data class inside
+// the minimum H1 envelope. Opening/rotating contracts retain 3 KiB; an
+// established contract can safely use three full 1,100-byte packets only while
+// no contract frame rides on that Pack.
 func TestH1MaximumLogicalGroupEncryptedPackFitsMinimumMessageLimit(t *testing.T) {
+	const ordinaryH1DataEnvelopeByteCount = 4 * 1024
+
 	c := newFrameCodecTestSequenceCipher(t)
 	path := TransferPath{DestinationId: NewId(), SourceId: NewId(), StreamId: NewId()}
 	frames := make([]*protocol.Frame, sendPackH1GroupMaxFrames)
@@ -660,11 +662,11 @@ func TestH1MaximumLogicalGroupEncryptedPackFitsMinimumMessageLimit(t *testing.T)
 		t.Fatalf("Seal rotating H1 frame: %s", err)
 	}
 	defer MessagePoolReturn(rotatingWrapped)
-	if remaining := limit - len(rotatingWrapped); remaining < 0 || 32 < remaining {
+	if remaining := ordinaryH1DataEnvelopeByteCount - len(rotatingWrapped); remaining < 0 || 32 < remaining {
 		t.Fatalf(
-			"contract-bearing three-MTU H1 Pack is %d bytes at limit %d, want no more than 32 bytes of fragile headroom",
+			"contract-bearing three-MTU H1 Pack is %d bytes at ordinary data limit %d, want no more than 32 bytes of fragile headroom",
 			len(rotatingWrapped),
-			limit,
+			ordinaryH1DataEnvelopeByteCount,
 		)
 	}
 
@@ -685,11 +687,11 @@ func TestH1MaximumLogicalGroupEncryptedPackFitsMinimumMessageLimit(t *testing.T)
 		t.Fatalf("Seal large-contract H1 frame: %s", err)
 	}
 	defer MessagePoolReturn(largeContractWrapped)
-	if len(largeContractWrapped) <= limit {
+	if len(largeContractWrapped) <= ordinaryH1DataEnvelopeByteCount {
 		t.Fatalf(
-			"large-contract three-MTU H1 Pack is %d bytes, want above minimum limit %d",
+			"large-contract three-MTU H1 Pack is %d bytes, want above ordinary data limit %d",
 			len(largeContractWrapped),
-			limit,
+			ordinaryH1DataEnvelopeByteCount,
 		)
 	}
 }

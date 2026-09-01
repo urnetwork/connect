@@ -420,9 +420,9 @@ var orderedMessagePools = sync.OnceValue(func() []*messagePool {
 	// Preserve the historical one-third packet / two-thirds large-object
 	// initial split. The packet third is now divided between the small and
 	// full-MTU classes, while each large class keeps its prior byte cap.
-	// 4096 fits a two-packet transfer batch without retaining an 8 KiB buffer
-	// for a ~3 KiB message; 8192 fits a full MinimumMessageLenLimit frame plus
-	// its protocol envelope. Larger frames remain unpooled.
+	// 4096 fits an ordinary two-packet transfer batch without retaining an
+	// 8 KiB buffer for a ~3 KiB message. 8192 is the exact pooled class for a
+	// full MinimumMessageLenLimit carrier. Larger frames remain unpooled.
 	poolSizes := []int{smallPacketPoolSize, packetPoolSize, 4096, 8192}
 	initialPacketBytes := InitialMessagePoolByteCount / 3
 	initialSmallPacketBytes, initialFullPacketBytes :=

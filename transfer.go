@@ -1020,8 +1020,9 @@ const sendPackH1GroupMaxFrames = 16
 const sendPackH1GroupMaxMessageByteCount = 3 * 1024
 
 // Once no contract frame can ride on the Pack, three complete tunnel-MTU
-// packets still fit the deployed 4-KiB encrypted H1 envelope. Opening and
-// rotating contracts retain the 3-KiB bound above.
+// packets still fit the ordinary 4-KiB encrypted H1 data envelope. Opening and
+// rotating contracts retain the 3-KiB bound above; handshake carriers use the
+// larger transport minimum.
 const sendPackH1EstablishedMaxMessageByteCount = 3 * DefaultMtu
 const rawSendPackPoolCapacity = 8
 
@@ -1291,22 +1292,20 @@ type ClientSettings struct {
 // mid-handshake, the retransmit re-sends the same oversized pack, and both sides
 // time out.
 //
-// Worst-case sizing (verified against the active TLS profile — TLS 1.3,
-// X25519MLKEM768 hybrid group, ephemeral ECDSA P-256 cert, mTLS):
+// Full-carrier measurements with the active TLS profile (TLS 1.3,
+// X25519MLKEM768 hybrid group, ephemeral ECDSA P-256 cert, mTLS) produce
+// 4,946–4,950-byte H1 messages after the encryption and protocol wraps. The
+// integrated carrier measurement is the admission baseline; component-only
+// TLS estimates do not include every byte emitted by the current sender.
 //
-//	ServerHello ~1.2 KiB (MLKEM768 key share ~1.1 KiB), ChangeCipherSpec ~6 B,
-//	EncryptedExtensions ~10 B, CertificateRequest ~30 B, Certificate ~500–600 B,
-//	CertificateVerify ~80 B, Finished ~45 B, + ~5 B record header each
-//	  ≈ 2 KiB raw; + ~200 B EC/Frame/Pack/TransferFrame proto wrap ≈ 2.2 KiB
-//
-// Rounded up to 4 KiB to absorb ASN.1 cert-size jitter, a future larger
-// post-quantum key share, and protobuf field-tag drift. Production transports
-// default well above this; tests and embedded callers should plumb it through
+// Round up to the existing 8 KiB message-pool class. This leaves more than
+// 3 KiB for ASN.1 cert-size jitter, a future larger post-quantum key share, and
+// protobuf field-tag drift. Tests and embedded callers should plumb it through
 // their framer caps (and matching receive-side limits):
 //
 //	settings.FramerSettings.MaxMessageLen = max(yourValue, int(client.MinimumMessageLenLimit()))
 func (self *ClientSettings) MinimumMessageLenLimit() ByteCount {
-	return ByteCount(4 * 1024)
+	return ByteCount(8 * 1024)
 }
 
 // An immutable, lock-free view of receive-pump admission loss. Pack bytes are
@@ -2204,10 +2203,11 @@ func (self *SendSequence) readyDrainChunkLimits(
 	return maxFrames, maxMessageByteCount
 }
 
-// H1 is a reliable ordered byte stream with the deployed 4-KiB message
-// envelope. It can combine more already-ready small frames than the shared
-// H3-compatible path without adding a batching timer. Mixed, H3, P2P, and
-// unknown routes retain the conservative DATAGRAM-safe bounds.
+// H1 is a reliable ordered byte stream whose ordinary data groups target the
+// 4-KiB pooled class inside the larger transport message envelope. It can
+// combine more already-ready small frames than the shared H3-compatible path
+// without adding a batching timer. Mixed, H3, P2P, and unknown routes retain
+// the conservative DATAGRAM-safe bounds.
 func sendPackChunkLimits(policy transferFlightPolicySnapshot) (int, ByteCount) {
 	if policy.h1Only {
 		return sendPackH1GroupMaxFrames, sendPackH1GroupMaxMessageByteCount

@@ -60,8 +60,9 @@ const DebugCloseSend = false
 
 // The platform WebSocket writer combines only messages already waiting on its
 // bounded route. ACK-sized traffic may drain thirty-two at once; ordinary data
-// stops once the batch has reached 12 KiB, so one complete <=4-KiB H1 message
-// cannot make the writer retain more than its existing 16-KiB buffer. A
+// stops once the batch has reached 12 KiB, so one complete ordinary <=4-KiB H1
+// data message fits the existing 16-KiB coalescer. A larger handshake carrier
+// may make the bounded wrapper flush its prefix before the batch ends. A
 // dedicated ACK lane may consume at most eight ready slots before one ready
 // ordinary packet gets a turn. The writer then starts another ACK burst and
 // repeats both bursts inside the same nonblocking physical flush. If either
