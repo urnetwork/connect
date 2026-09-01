@@ -64,14 +64,19 @@ func TestMultiClientLifecyclePoolBalance(t *testing.T) {
 	after := settle()
 	if before < after {
 		afterByClass := poolOutstandingByClass()
+		// Diagnose whether CloseAndWait lost an owner permanently or published
+		// before a delayed transport return. Either violates this lifecycle
+		// boundary; the late count keeps the failure signature actionable.
+		time.Sleep(2 * time.Second)
+		late := settle()
 		growthByClass := map[int]int64{}
 		for size, afterCount := range afterByClass {
 			if growth := afterCount - beforeByClass[size]; growth != 0 {
 				growthByClass[size] = growth
 			}
 		}
-		t.Errorf("pool buffers not returned across %d multi-client lifecycles: outstanding %d -> %d (+%d), class growth=%v",
-			cycles, before, after, after-before, growthByClass)
+		t.Errorf("pool buffers not returned across %d multi-client lifecycles: outstanding %d -> %d (+%d), late=%d, class growth=%v",
+			cycles, before, after, after-before, late, growthByClass)
 	}
 }
 
@@ -152,8 +157,20 @@ func TestRemoteUserNatClientRawSendPoolBalance(t *testing.T) {
 		}
 	}
 
-	natClient.Close()
-	providerClient.Close()
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer closeCancel()
+	if joinableNatClient, ok := natClient.(interface {
+		CloseAndWait(context.Context) error
+	}); ok {
+		if err := joinableNatClient.CloseAndWait(closeCtx); err != nil {
+			t.Fatalf("join single-destination local NAT: %v", err)
+		}
+	} else {
+		natClient.Close()
+	}
+	if err := providerClient.CloseAndWait(closeCtx); err != nil {
+		t.Fatalf("join single-destination provider client: %v", err)
+	}
 	cancel()
 	after := settle()
 	if before < after {
@@ -462,6 +479,11 @@ func runMultiClientPoolCycle(ctx context.Context, t *testing.T) {
 		cycleCancel()
 		providerClient.Cancel()
 		providerEchoWaitGroup.Wait()
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer closeCancel()
+		if err := providerClient.CloseAndWait(closeCtx); err != nil {
+			t.Errorf("join pool-balance provider client: %v", err)
+		}
 	}()
 
 	multiSettings := DefaultMultiClientSettings()
