@@ -119,7 +119,11 @@ func (self Id) String() string {
 	return encodeUuid(self)
 }
 
-func (self *Id) MarshalJSON() ([]byte, error) {
+// MarshalJSON has a value receiver so Id fields have one canonical encoding
+// whether their containing struct is passed to json.Marshal by value or by
+// pointer. A pointer receiver makes a non-addressable Id silently fall back to
+// encoding/json's [16]byte array representation.
+func (self Id) MarshalJSON() ([]byte, error) {
 	var buf [16]byte
 	copy(buf[0:16], self[0:16])
 	var buff bytes.Buffer

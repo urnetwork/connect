@@ -68,3 +68,34 @@ func TestIdJsonCodec(t *testing.T) {
 	AssertEqual(t, test3.B, nil)
 	AssertEqual(t, test3.B, test4.B)
 }
+
+func TestIdJsonCodecIsIndependentOfContainerAddressability(t *testing.T) {
+	id, err := ParseId("00112233-4455-6677-8899-aabbccddeeff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	type record struct {
+		Id Id `json:"id"`
+	}
+
+	valueJSON, err := json.Marshal(record{Id: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pointerJSON, err := json.Marshal(&record{Id: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `{"id":"00112233-4455-6677-8899-aabbccddeeff"}`
+	if string(valueJSON) != want || string(pointerJSON) != want {
+		t.Fatalf("Id JSON depends on addressability: value=%s pointer=%s want=%s", valueJSON, pointerJSON, want)
+	}
+
+	var decoded record
+	if err := json.Unmarshal(valueJSON, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Id != id {
+		t.Fatalf("Id JSON round trip = %s, want %s", decoded.Id, id)
+	}
+}
