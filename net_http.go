@@ -1046,12 +1046,51 @@ func (self *ClientStrategy) applyExtraHeaders(h http.Header) {
 	}
 }
 
+// Multi-route evaluation requires an independent body reader for every
+// attempt. Clone copies request metadata; GetBody resets consumed content.
+func cloneHttpRequestForAttempt(ctx context.Context, request *http.Request) (*http.Request, error) {
+	attemptRequest := request.Clone(ctx)
+	if request.Body == nil {
+		return attemptRequest, nil
+	}
+	if request.GetBody == nil {
+		return nil, fmt.Errorf("http request body is not replayable")
+	}
+	attemptBody, err := request.GetBody()
+	if err != nil {
+		return nil, fmt.Errorf("rebuild http request body: %w", err)
+	}
+	attemptRequest.Body = attemptBody
+	return attemptRequest, nil
+}
+
+// Rejects a body that cannot be rebuilt before any route consumes it.
+func validateHttpRequestForAttempts(request *http.Request) error {
+	if request == nil {
+		return fmt.Errorf("http request is nil")
+	}
+	if request.Body != nil && request.GetBody == nil {
+		return fmt.Errorf("http request body is not replayable")
+	}
+	return nil
+}
+
 func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, error) {
+	if err := validateHttpRequestForAttempts(request); err != nil {
+		return nil, err
+	}
+	if request.Body != nil {
+		defer request.Body.Close()
+	}
 	self.applyExtraHeaders(request.Header)
 
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
+		attemptRequest, err := cloneHttpRequestForAttempt(handleCtx, request)
+		if err != nil {
+			return &evalResult{err: err}
+		}
 		httpClient := dialer.HttpClient()
-		response, err := httpClient.Do(request.WithContext(handleCtx))
+		response, err := httpClient.Do(attemptRequest)
 		if self.log.V(2).Enabled() {
 			if err != nil {
 				self.log.Infof("[net]http parallel %s %s = %s\n", request.Method, request.URL, err)
@@ -1078,13 +1117,29 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 	// 2. retest and expand dialers using get of the hello request.
 	//    This is a basic ping to the server, which is run in parallel.
 	// 3. continue from 1 until timeout
+	if err := validateHttpRequestForAttempts(request); err != nil {
+		return nil, err
+	}
+	if err := validateHttpRequestForAttempts(helloRequest); err != nil {
+		return nil, err
+	}
+	if request.Body != nil {
+		defer request.Body.Close()
+	}
+	if helloRequest.Body != nil {
+		defer helloRequest.Body.Close()
+	}
 
 	self.applyExtraHeaders(request.Header)
 	self.applyExtraHeaders(helloRequest.Header)
 
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
+		attemptRequest, err := cloneHttpRequestForAttempt(handleCtx, request)
+		if err != nil {
+			return &evalResult{err: err}
+		}
 		httpClient := dialer.HttpClient()
-		response, err := httpClient.Do(request.WithContext(handleCtx))
+		response, err := httpClient.Do(attemptRequest)
 		if self.log.V(2).Enabled() {
 			if err != nil {
 				self.log.Infof("[net]http serial %s %s = %s\n", request.Method, request.URL, err)
@@ -1098,8 +1153,12 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 		return newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes)
 	}
 	helloEval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
+		attemptRequest, err := cloneHttpRequestForAttempt(handleCtx, helloRequest)
+		if err != nil {
+			return &evalResult{err: err}
+		}
 		httpClient := dialer.HttpClient()
-		response, err := httpClient.Do(helloRequest.WithContext(handleCtx))
+		response, err := httpClient.Do(attemptRequest)
 		if self.log.V(2).Enabled() {
 			if err != nil {
 				self.log.Infof("[net]http serial hello %s %s = %s\n", helloRequest.Method, helloRequest.URL, err)

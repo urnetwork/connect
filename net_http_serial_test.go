@@ -1,12 +1,22 @@
 package connect
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
+	"net/http"
 	"net/netip"
 	"testing"
 	"time"
 )
+
+// Provides a transport seam for exact request-attempt assertions.
+type serialTestRoundTripper func(request *http.Request) (*http.Response, error)
+
+func (self serialTestRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	return self(request)
+}
 
 // No outcome is not a successful outcome. Treating every cold dialer as a
 // previous success serializes first-use discovery and lets one black hole hide
@@ -197,5 +207,234 @@ func TestParallelEvalReservesRequestBudgetFromStalePreferredDialer(t *testing.T)
 			staleAttemptBudget,
 			settings.RequestTimeout,
 		)
+	}
+}
+
+// A failed route may consume the complete POST body before another proven
+// route is tried. Every route attempt must receive a fresh body reader.
+func TestHttpSerialReplaysCompletePostBodyAfterRouteFailure(t *testing.T) {
+	strategyCtx, strategyCancel := context.WithCancel(context.Background())
+	defer strategyCancel()
+
+	settings := DefaultClientStrategySettings()
+	settings.RequestTimeout = time.Second
+	now := time.Now()
+	requestBodyBytes := []byte(`{"user_auth":"acceptance@example.invalid"}`)
+	var firstBodyBytes []byte
+	var secondBodyBytes []byte
+
+	failedDialer := &clientDialer{
+		description:     "failed",
+		minimumWeight:   1,
+		priority:        0,
+		successCount:    1,
+		lastSuccessTime: now,
+		settings:        settings,
+		httpClient: &http.Client{Transport: serialTestRoundTripper(func(request *http.Request) (*http.Response, error) {
+			var err error
+			firstBodyBytes, err = io.ReadAll(request.Body)
+			if err != nil {
+				return nil, err
+			}
+			return nil, errors.New("route failed after consuming request body")
+		})},
+	}
+	healthyDialer := &clientDialer{
+		description:     "healthy",
+		minimumWeight:   1,
+		priority:        1,
+		successCount:    1,
+		lastSuccessTime: now,
+		settings:        settings,
+		httpClient: &http.Client{Transport: serialTestRoundTripper(func(request *http.Request) (*http.Response, error) {
+			var err error
+			secondBodyBytes, err = io.ReadAll(request.Body)
+			if err != nil {
+				return nil, err
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     http.Header{},
+				Body:       io.NopCloser(bytes.NewReader([]byte(`{}`))),
+				Request:    request,
+			}, nil
+		})},
+	}
+	strategy := &ClientStrategy{
+		ctx:               strategyCtx,
+		log:               loggerOrDefault(nil),
+		settings:          settings,
+		dialers:           map[*clientDialer]bool{failedDialer: true, healthyDialer: true},
+		extenderIpSecrets: map[netip.Addr]string{},
+	}
+
+	request, err := http.NewRequestWithContext(
+		context.Background(),
+		http.MethodPost,
+		"https://api.example.invalid/auth/login",
+		bytes.NewReader(requestBodyBytes),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	helloRequest, err := http.NewRequestWithContext(
+		context.Background(),
+		http.MethodGet,
+		"https://api.example.invalid/hello",
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := strategy.HttpSerial(request, helloRequest)
+	if err != nil {
+		t.Fatalf("serial POST failed: %v", err)
+	}
+	if result.response.StatusCode != http.StatusOK {
+		t.Fatalf("serial POST status = %s", result.response.Status)
+	}
+	if !bytes.Equal(firstBodyBytes, requestBodyBytes) {
+		t.Fatalf("first route body = %q, want %q", firstBodyBytes, requestBodyBytes)
+	}
+	if !bytes.Equal(secondBodyBytes, requestBodyBytes) {
+		t.Fatalf("fallback route body = %q, want %q", secondBodyBytes, requestBodyBytes)
+	}
+}
+
+// Parallel evaluation has the same preferred-route fast path and must not
+// share one consumed body between its attempts either.
+func TestHttpParallelReplaysCompleteBodyAfterRouteFailure(t *testing.T) {
+	strategyCtx, strategyCancel := context.WithCancel(context.Background())
+	defer strategyCancel()
+
+	settings := DefaultClientStrategySettings()
+	settings.RequestTimeout = time.Second
+	now := time.Now()
+	requestBodyBytes := []byte(`{"request":"complete"}`)
+	var firstBodyBytes []byte
+	var secondBodyBytes []byte
+
+	failedDialer := &clientDialer{
+		description:     "failed",
+		minimumWeight:   1,
+		priority:        0,
+		successCount:    1,
+		lastSuccessTime: now,
+		settings:        settings,
+		httpClient: &http.Client{Transport: serialTestRoundTripper(func(request *http.Request) (*http.Response, error) {
+			var err error
+			firstBodyBytes, err = io.ReadAll(request.Body)
+			if err != nil {
+				return nil, err
+			}
+			return nil, errors.New("route failed after consuming request body")
+		})},
+	}
+	healthyDialer := &clientDialer{
+		description:     "healthy",
+		minimumWeight:   1,
+		priority:        1,
+		successCount:    1,
+		lastSuccessTime: now,
+		settings:        settings,
+		httpClient: &http.Client{Transport: serialTestRoundTripper(func(request *http.Request) (*http.Response, error) {
+			var err error
+			secondBodyBytes, err = io.ReadAll(request.Body)
+			if err != nil {
+				return nil, err
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     http.Header{},
+				Body:       io.NopCloser(bytes.NewReader([]byte(`{}`))),
+				Request:    request,
+			}, nil
+		})},
+	}
+	strategy := &ClientStrategy{
+		ctx:               strategyCtx,
+		log:               loggerOrDefault(nil),
+		settings:          settings,
+		dialers:           map[*clientDialer]bool{failedDialer: true, healthyDialer: true},
+		extenderIpSecrets: map[netip.Addr]string{},
+	}
+
+	request, err := http.NewRequestWithContext(
+		context.Background(),
+		http.MethodPost,
+		"https://api.example.invalid/auth/login",
+		bytes.NewReader(requestBodyBytes),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := strategy.HttpParallel(request)
+	if err != nil {
+		t.Fatalf("parallel request failed: %v", err)
+	}
+	if result.response.StatusCode != http.StatusOK {
+		t.Fatalf("parallel request status = %s", result.response.Status)
+	}
+	if !bytes.Equal(firstBodyBytes, requestBodyBytes) {
+		t.Fatalf("first route body = %q, want %q", firstBodyBytes, requestBodyBytes)
+	}
+	if !bytes.Equal(secondBodyBytes, requestBodyBytes) {
+		t.Fatalf("fallback route body = %q, want %q", secondBodyBytes, requestBodyBytes)
+	}
+}
+
+// A one-shot body cannot safely participate in multi-route evaluation. Reject
+// it before the first route sees bytes rather than emitting a later empty POST.
+func TestHttpSerialRejectsNonReplayableBodyBeforeDial(t *testing.T) {
+	strategyCtx, strategyCancel := context.WithCancel(context.Background())
+	defer strategyCancel()
+
+	settings := DefaultClientStrategySettings()
+	dialCount := 0
+	dialer := &clientDialer{
+		minimumWeight:   1,
+		successCount:    1,
+		lastSuccessTime: time.Now(),
+		settings:        settings,
+		httpClient: &http.Client{Transport: serialTestRoundTripper(func(request *http.Request) (*http.Response, error) {
+			dialCount += 1
+			return nil, errors.New("unexpected dial")
+		})},
+	}
+	strategy := &ClientStrategy{
+		ctx:               strategyCtx,
+		log:               loggerOrDefault(nil),
+		settings:          settings,
+		dialers:           map[*clientDialer]bool{dialer: true},
+		extenderIpSecrets: map[netip.Addr]string{},
+	}
+	request, err := http.NewRequestWithContext(
+		context.Background(),
+		http.MethodPost,
+		"https://api.example.invalid/auth/login",
+		io.NopCloser(bytes.NewReader([]byte(`{}`))),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	helloRequest, err := http.NewRequestWithContext(
+		context.Background(),
+		http.MethodGet,
+		"https://api.example.invalid/hello",
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = strategy.HttpSerial(request, helloRequest)
+	if err == nil || err.Error() != "http request body is not replayable" {
+		t.Fatalf("non-replayable body error = %v", err)
+	}
+	if dialCount != 0 {
+		t.Fatalf("non-replayable request reached %d route(s)", dialCount)
 	}
 }
