@@ -5,6 +5,9 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 
 	"golang.org/x/crypto/cryptobyte"
@@ -15,6 +18,11 @@ import (
 )
 
 const clientTlsSessionCacheCapacity = 16
+
+// Names the optional private-platform CA bundle used by headless deployments.
+// The default remains the immutable Let's Encrypt pin set; an explicitly
+// configured absolute file adds roots without replacing those public pins.
+const ExtraRootCAFileEnv = "URNETWORK_CONNECT_EXTRA_ROOT_CA_FILE"
 
 var (
 	clientHttpNextProtos      = []string{"h2", "http/1.1"}
@@ -82,6 +90,40 @@ func sharedDefaultPinnedCertPool() (*x509.CertPool, error) {
 	return defaultPinnedCertPool, defaultPinnedCertPoolErr
 }
 
+// Builds the root set for one client configuration. Ordinary clients retain
+// the shared immutable pool. A private deployment gets a clone before its
+// explicit roots are appended, so one process cannot mutate another config's
+// default trust set.
+func defaultRootCertPool() (*x509.CertPool, error) {
+	certPool, err := sharedDefaultPinnedCertPool()
+	if err != nil {
+		return nil, err
+	}
+	extraRootCAFile := strings.TrimSpace(os.Getenv(ExtraRootCAFileEnv))
+	if extraRootCAFile == "" {
+		return certPool, nil
+	}
+	if !filepath.IsAbs(extraRootCAFile) {
+		return nil, fmt.Errorf("%s must be an absolute path", ExtraRootCAFileEnv)
+	}
+	info, err := os.Stat(extraRootCAFile)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", ExtraRootCAFileEnv, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", ExtraRootCAFileEnv)
+	}
+	extraRootCAPem, err := os.ReadFile(extraRootCAFile)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", ExtraRootCAFileEnv, err)
+	}
+	configuredCertPool := certPool.Clone()
+	if !configuredCertPool.AppendCertsFromPEM(extraRootCAPem) {
+		return nil, fmt.Errorf("%s contains no certificates", ExtraRootCAFileEnv)
+	}
+	return configuredCertPool, nil
+}
+
 // tlsClientSessionCacheCapacity sizes the per-config LRU session cache. The
 // client talks to a handful of platform hosts (api, connect, extenders resolved
 // to the platform), each caching at most a couple of tickets, so 32 is
@@ -89,7 +131,7 @@ func sharedDefaultPinnedCertPool() (*x509.CertPool, error) {
 const tlsClientSessionCacheCapacity = 32
 
 func DefaultTlsConfig() (*tls.Config, error) {
-	certPool, err := sharedDefaultPinnedCertPool()
+	certPool, err := defaultRootCertPool()
 	if err != nil {
 		return nil, err
 	}
