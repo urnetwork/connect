@@ -489,9 +489,30 @@ func runMultiClientPoolCycle(ctx context.Context, t *testing.T) {
 	multiSettings := DefaultMultiClientSettings()
 	multiSettings.SecurityPolicyGenerator = DisableSecurityPolicyWithStats
 	received := make(chan struct{}, 64)
+	generator := testMultiClientGenerator(providerClient)
+	// RemoteUserNatMultiClient owns its windows, while the generator owns the
+	// Clients it creates. Mirror ApiMultiClientGenerator's retirement join so
+	// this pool assertion measures a complete lifecycle rather than sampling
+	// generator-owned clients that the lightweight fixture left unjoined.
+	var generatedClientsMutex sync.Mutex
+	var generatedClients []*Client
+	newClient := generator.newClient
+	generator.newClient = func(
+		ctx context.Context,
+		args *MultiClientGeneratorClientArgs,
+		settings *ClientSettings,
+	) (*Client, error) {
+		client, err := newClient(ctx, args, settings)
+		if err == nil {
+			generatedClientsMutex.Lock()
+			generatedClients = append(generatedClients, client)
+			generatedClientsMutex.Unlock()
+		}
+		return client, err
+	}
 	multi := NewRemoteUserNatMultiClient(
 		cycleCtx,
-		testMultiClientGenerator(providerClient),
+		generator,
 		func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
 			select {
 			case received <- struct{}{}:
@@ -506,6 +527,17 @@ func runMultiClientPoolCycle(ctx context.Context, t *testing.T) {
 		defer closeCancel()
 		if err := multi.CloseAndWait(closeCtx); err != nil {
 			t.Errorf("join multi-client local NAT: %v", err)
+		}
+		generatedClientsMutex.Lock()
+		clients := append([]*Client(nil), generatedClients...)
+		generatedClientsMutex.Unlock()
+		for _, client := range clients {
+			client.Cancel()
+		}
+		for _, client := range clients {
+			if err := client.CloseAndWait(closeCtx); err != nil {
+				t.Errorf("join generator-owned client: %v", err)
+			}
 		}
 	}()
 
