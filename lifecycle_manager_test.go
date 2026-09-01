@@ -371,6 +371,33 @@ func TestClientCloseAndWaitJoinsContractManagerWorkers(t *testing.T) {
 	joined = true
 }
 
+// Cancel is the compatibility spelling for a non-joining client close. It
+// must still close every manager's worker admission; cancellation alone leaves
+// each contract-close join worker waiting forever on an admission that can
+// never publish completion.
+func TestClientCancelClosesContractManagerAdmission(t *testing.T) {
+	client := NewClient(
+		context.Background(),
+		NewId(),
+		NewNoContractClientOob(),
+		DefaultClientSettings(),
+	)
+	contractManager := client.ContractManager()
+	client.Cancel()
+
+	contractManager.mutex.Lock()
+	closed := contractManager.closed
+	contractManager.mutex.Unlock()
+	if !closed {
+		t.Fatal("client cancel left contract-manager worker admission open")
+	}
+	select {
+	case <-contractManager.workers.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("client cancel did not release contract-manager workers")
+	}
+}
+
 // TestClientCloseAndWaitJoinsContractStatusCallback proves a callback already
 // executing at shutdown is part of manager lifecycle, not a detached observer.
 func TestClientCloseAndWaitJoinsContractStatusCallback(t *testing.T) {

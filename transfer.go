@@ -3649,14 +3649,7 @@ func waitForLifecycleDone(
 }
 
 func (self *Client) Cancel() {
-	self.cancel()
-
-	self.sendBuffer.Cancel()
-	self.receiveBuffer.Cancel()
-	self.forwardBuffer.Cancel()
-	if self.webRtcManager != nil {
-		self.webRtcManager.Close()
-	}
+	self.Close()
 }
 
 // CloseContractStats fires the close events for all of this client's open

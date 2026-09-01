@@ -36,6 +36,7 @@ func TestAddrsInPrefix(t *testing.T) {
 func TestAddrGenerator(t *testing.T) {
 	prefix := netip.MustParsePrefix("169.254.0.0/16")
 	g := NewAddrGenerator(prefix)
+	t.Cleanup(g.Close)
 	addr, ok := g.Next()
 	AssertEqual(t, ok, true)
 	AssertEqual(t, addr, netip.MustParseAddr("169.254.0.1"))
@@ -48,4 +49,18 @@ func TestAddrGenerator(t *testing.T) {
 	addr, ok = g.Next()
 	AssertEqual(t, ok, true)
 	AssertEqual(t, addr, netip.MustParseAddr("169.254.0.4"))
+}
+
+// Cancellation is a stop request; closing an unconsumed generator must join
+// its producer before returning so a short-lived allocator cannot retain one
+// blocked goroutine per lifetime.
+func TestAddrGeneratorCloseJoinsBlockedProducer(t *testing.T) {
+	g := NewAddrGenerator(netip.MustParsePrefix("169.254.0.0/16"))
+	g.Close()
+	g.Close()
+	select {
+	case <-g.done:
+	default:
+		t.Fatal("address generator close returned before its producer exited")
+	}
 }
