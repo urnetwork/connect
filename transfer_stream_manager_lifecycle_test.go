@@ -194,15 +194,15 @@ func TestStreamReplacementReceiveDoesNotJoinAndPublishesAfterOldExit(t *testing.
 	oldScope := streamLifecycleAliasScope(client, streamId)
 	joinStarted := make(chan struct{})
 	joinOnce := sync.Once{}
-	replacementPublished := make(chan struct{}, 1)
+	replacementProcessed := make(chan struct{}, 1)
 	client.streamManager.streamBuffer.beforeRetiredStreamJoinForTest = func(retired *StreamSequence) {
 		if retired == oldSequence {
 			joinOnce.Do(func() { close(joinStarted) })
 		}
 	}
-	client.streamManager.streamBuffer.afterStreamSequencePublishForTest = func(sequence *StreamSequence) {
-		if sequence.streamId == streamId && sequence != oldSequence {
-			replacementPublished <- struct{}{}
+	client.streamManager.streamBuffer.afterStreamOpenProcessedForTest = func(request *streamOpenRequest) {
+		if request.streamId == streamId {
+			replacementProcessed <- struct{}{}
 		}
 	}
 
@@ -229,7 +229,7 @@ func TestStreamReplacementReceiveDoesNotJoinAndPublishesAfterOldExit(t *testing.
 	}
 
 	releaseOnce.Do(func() { close(exitRelease) })
-	waitForStreamLifecycleSignal(t, replacementPublished, "replacement did not publish after the old generation joined")
+	waitForStreamLifecycleSignal(t, replacementProcessed, "replacement did not finish activation after the old generation joined")
 	replacementSequence := streamLifecycleSequence(client, streamId)
 	if replacementSequence == nil || replacementSequence == oldSequence ||
 		replacementSequence.sourceId == nil || *replacementSequence.sourceId != newAdjacentId ||
