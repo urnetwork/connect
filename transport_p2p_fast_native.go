@@ -206,22 +206,29 @@ func (self *peerConn) configureFastPath() error {
 	if self.settings.afterFastPathPublishForTest != nil {
 		self.settings.afterFastPathPublishForTest()
 	}
-	self.pc.OnTrack(func(
-		remoteTrack *webrtc.TrackRemote,
-		receiver *webrtc.RTPReceiver,
-	) {
-		self.runPionCallback("fast path track callback", func() {
-			if self.settings.beforeFastPathOnTrackBodyForTest != nil {
-				self.settings.beforeFastPathOnTrackBodyForTest()
-			}
-			_ = receiver
-			if !strings.EqualFold(remoteTrack.Codec().MimeType, p2pFastPathMimeType) {
-				return
-			}
-			fastPath.startReceive(&webRtcFastPathTrackReader{track: remoteTrack})
-		}, self.cancel)
+	var sender *webrtc.RTPSender
+	err = self.withPionMutation(func() error {
+		if self.fastPath.Load() != fastPath {
+			return context.Canceled
+		}
+		self.pc.OnTrack(func(
+			remoteTrack *webrtc.TrackRemote,
+			receiver *webrtc.RTPReceiver,
+		) {
+			self.runPionCallback("fast path track callback", func() {
+				if self.settings.beforeFastPathOnTrackBodyForTest != nil {
+					self.settings.beforeFastPathOnTrackBodyForTest()
+				}
+				_ = receiver
+				if !strings.EqualFold(remoteTrack.Codec().MimeType, p2pFastPathMimeType) {
+					return
+				}
+				fastPath.startReceive(&webRtcFastPathTrackReader{track: remoteTrack})
+			}, self.cancel)
+		})
+		sender, err = self.pc.AddTrack(fastPath.track)
+		return err
 	})
-	sender, err := self.pc.AddTrack(fastPath.track)
 	if err != nil {
 		if self.fastPath.CompareAndSwap(fastPath, nil) {
 			fastPath.closeAndWait()

@@ -55,10 +55,8 @@ func TestWebRtc(t *testing.T) {
 	signalPipeA := newSignalPipe(nil)
 	signalPipeB := newSignalPipe(nil)
 
-	webRtcManagerA := NewWebRtcManager(ctx, signalPipeA, settingsA)
-	webRtcManagerB := NewWebRtcManager(ctx, signalPipeB, settingsB)
-	defer webRtcManagerA.Close()
-	defer webRtcManagerB.Close()
+	webRtcManagerA := newTestWebRtcManager(t, ctx, signalPipeA, settingsA)
+	webRtcManagerB := newTestWebRtcManager(t, ctx, signalPipeB, settingsB)
 
 	signalPipeA.SetSignalReceiver(webRtcManagerB)
 	signalPipeB.SetSignalReceiver(webRtcManagerA)
@@ -366,8 +364,8 @@ func TestWebRtcMessageRoundTrip(t *testing.T) {
 	signalPipeA := newSignalPipe(nil)
 	signalPipeB := newSignalPipe(nil)
 
-	webRtcManagerA := NewWebRtcManager(ctx, signalPipeA, settingsA)
-	webRtcManagerB := NewWebRtcManager(ctx, signalPipeB, settingsB)
+	webRtcManagerA := newTestWebRtcManager(t, ctx, signalPipeA, settingsA)
+	webRtcManagerB := newTestWebRtcManager(t, ctx, signalPipeB, settingsB)
 
 	signalPipeA.signalReceiver = webRtcManagerB
 	signalPipeB.signalReceiver = webRtcManagerA
@@ -761,8 +759,8 @@ func TestWebRtcBlockingWriteBackpressureAndDeadline(t *testing.T) {
 
 	signalPipeA := newSignalPipe(nil)
 	signalPipeB := newSignalPipe(nil)
-	managerA := NewWebRtcManager(ctx, signalPipeA, settingsA)
-	managerB := NewWebRtcManager(ctx, signalPipeB, settingsB)
+	managerA := newTestWebRtcManager(t, ctx, signalPipeA, settingsA)
+	managerB := newTestWebRtcManager(t, ctx, signalPipeB, settingsB)
 	signalPipeA.signalReceiver = managerB
 	signalPipeB.signalReceiver = managerA
 
@@ -823,10 +821,8 @@ func TestWebRtcSctpNoProgressWatchdogPreservesReceiverBackpressure(t *testing.T)
 
 	signalPipeA := newSignalPipe(nil)
 	signalPipeB := newSignalPipe(nil)
-	managerA := NewWebRtcManager(ctx, signalPipeA, settingsA)
-	managerB := NewWebRtcManager(ctx, signalPipeB, settingsB)
-	defer managerA.Close()
-	defer managerB.Close()
+	managerA := newTestWebRtcManager(t, ctx, signalPipeA, settingsA)
+	managerB := newTestWebRtcManager(t, ctx, signalPipeB, settingsB)
 	signalPipeA.SetSignalReceiver(managerB)
 	signalPipeB.SetSignalReceiver(managerA)
 
@@ -954,10 +950,8 @@ func TestWebRtcSctpSnapMixedCompatibility(t *testing.T) {
 
 	signalPipeA := newSignalPipe(nil)
 	signalPipeB := newSignalPipe(nil)
-	managerA := NewWebRtcManager(ctx, signalPipeA, settingsA)
-	managerB := NewWebRtcManager(ctx, signalPipeB, settingsB)
-	defer managerA.Close()
-	defer managerB.Close()
+	managerA := newTestWebRtcManager(t, ctx, signalPipeA, settingsA)
+	managerB := newTestWebRtcManager(t, ctx, signalPipeB, settingsB)
 	signalPipeA.SetSignalReceiver(managerB)
 	signalPipeB.SetSignalReceiver(managerA)
 
@@ -1021,10 +1015,8 @@ func TestWebRtcSctpZeroChecksumMixedCompatibility(t *testing.T) {
 
 	signalPipeA := newSignalPipe(nil)
 	signalPipeB := newSignalPipe(nil)
-	managerA := NewWebRtcManager(ctx, signalPipeA, settingsA)
-	managerB := NewWebRtcManager(ctx, signalPipeB, settingsB)
-	defer managerA.Close()
-	defer managerB.Close()
+	managerA := newTestWebRtcManager(t, ctx, signalPipeA, settingsA)
+	managerB := newTestWebRtcManager(t, ctx, signalPipeB, settingsB)
 	signalPipeA.SetSignalReceiver(managerB)
 	signalPipeB.SetSignalReceiver(managerA)
 
@@ -1126,8 +1118,8 @@ func TestWebRtcSctpSnapReadyLatencyMeasurement(t *testing.T) {
 
 			signalPipeA := newSignalPipe(nil)
 			signalPipeB := newSignalPipe(nil)
-			managerA := NewWebRtcManager(ctx, signalPipeA, settingsA)
-			managerB := NewWebRtcManager(ctx, signalPipeB, settingsB)
+			managerA := newTestWebRtcManager(t, ctx, signalPipeA, settingsA)
+			managerB := newTestWebRtcManager(t, ctx, signalPipeB, settingsB)
 			signalPipeA.SetSignalReceiver(managerB)
 			signalPipeB.SetSignalReceiver(managerA)
 
@@ -1196,7 +1188,7 @@ func TestWebRtcSharedBudgetAdmissionIsExactAcrossManagers(t *testing.T) {
 		settings.ReceiveBufferSize = reservationSize
 		settings.MemoryBudget = budget
 		settings.MaxPeerConnectionCount = 0
-		managers = append(managers, NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings))
+		managers = append(managers, newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings))
 	}
 
 	start := make(chan struct{})
@@ -1269,12 +1261,10 @@ func TestWebRtcSharedBudgetPriorityReclaimsOwnerAcrossManagers(t *testing.T) {
 		settings.ReceiveBufferSize = window
 		settings.MemoryBudget = budget
 		settings.MaxPeerConnectionCount = 0
-		return NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+		return newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 	}
 	firstManager := newManager()
 	secondManager := newManager()
-	defer firstManager.Close()
-	defer secondManager.Close()
 
 	firstPeerId := NewId()
 	firstManager.PrioritizePeer(firstPeerId)
@@ -1338,14 +1328,11 @@ func TestWebRtcSharedBudgetPendingRetirementPreventsCrossManagerDrain(t *testing
 		settings.ReceiveBufferSize = window
 		settings.MemoryBudget = budget
 		settings.MaxPeerConnectionCount = 0
-		return NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+		return newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 	}
 	firstManager := newManager()
 	secondManager := newManager()
 	waitingManager := newManager()
-	defer firstManager.Close()
-	defer secondManager.Close()
-	defer waitingManager.Close()
 
 	first, err := firstManager.NewP2pConnActive(
 		ctx,
@@ -1396,7 +1383,7 @@ func TestWebRtcPrioritizedNetworkPeerPreemptsWithoutRaisingAdmissionBounds(t *te
 	settings.ReceiveBufferSize = kib(128)
 	settings.MemoryBudget = NewTransferMemoryBudget(settings.ReceiveBufferSize)
 	settings.MaxPeerConnectionCount = 1
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	backgroundPeerId := NewId()
 	backgroundConn, err := manager.NewP2pConnActive(
@@ -1481,7 +1468,7 @@ func TestWebRtcNetworkPeerUsesDedicatedWindowAndBudget(t *testing.T) {
 	settings.NetworkPeerReceiveBufferSize = mib(2)
 	settings.NetworkPeerMemoryBudget = NewTransferMemoryBudget(2 * settings.NetworkPeerReceiveBufferSize)
 	settings.MaxPeerConnectionCount = 0
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	// A public (non-prioritized) peer reserves the small window from the public
 	// budget; the network-peer budget is untouched.
@@ -1542,10 +1529,8 @@ func TestWebRtcNetworkPeerAdvertisesDedicatedReceiveWindow(t *testing.T) {
 	settingsB := newSettings()
 	signalPipeA := newSignalPipe(nil)
 	signalPipeB := newSignalPipe(nil)
-	managerA := NewWebRtcManager(ctx, signalPipeA, settingsA)
-	managerB := NewWebRtcManager(ctx, signalPipeB, settingsB)
-	defer managerA.Close()
-	defer managerB.Close()
+	managerA := newTestWebRtcManager(t, ctx, signalPipeA, settingsA)
+	managerB := newTestWebRtcManager(t, ctx, signalPipeB, settingsB)
 	signalPipeA.SetSignalReceiver(managerB)
 	signalPipeB.SetSignalReceiver(managerA)
 
@@ -1632,7 +1617,7 @@ func TestWebRtcNetworkPeerAdmissionWaitsOnDedicatedBudget(t *testing.T) {
 	settings.NetworkPeerReceiveBufferSize = mib(2)
 	settings.NetworkPeerMemoryBudget = NewTransferMemoryBudget(settings.NetworkPeerReceiveBufferSize)
 	settings.MaxPeerConnectionCount = 0
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	firstPeerId := NewId()
 	manager.PrioritizePeer(firstPeerId)
@@ -1686,8 +1671,7 @@ func TestWebRtcAdmissionNotificationWakesOnlyCapacityFit(t *testing.T) {
 	settings.MemoryBudget = NewTransferMemoryBudget(settings.ReceiveBufferSize)
 	settings.MemoryBudget.Reserve(settings.ReceiveBufferSize)
 	settings.MaxPeerConnectionCount = 0
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
-	defer manager.Close()
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	firstWaiter := newTransferMemoryBudgetWaiter()
 	secondWaiter := newTransferMemoryBudgetWaiter()
@@ -1725,8 +1709,7 @@ func TestWebRtcAdmissionNotificationUsesDedicatedThreshold(t *testing.T) {
 	settings.NetworkPeerMemoryBudget =
 		NewTransferMemoryBudget(settings.NetworkPeerReceiveBufferSize)
 	settings.MaxPeerConnectionCount = 0
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
-	defer manager.Close()
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	peerId := NewId()
 	manager.PrioritizePeer(peerId)
@@ -1756,7 +1739,7 @@ func TestWebRtcNewestNetworkPeerReclaimsLeaseProtectedDedicatedBudget(t *testing
 		2 * settings.NetworkPeerReceiveBufferSize,
 	)
 	settings.MaxPeerConnectionCount = 0
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	oldestPeerId := NewId()
 	manager.PrioritizePeer(oldestPeerId)
@@ -1848,7 +1831,7 @@ func TestWebRtcNewestNetworkStreamReclaimsOldestSamePeerAssociation(t *testing.T
 		2 * settings.NetworkPeerReceiveBufferSize,
 	)
 	settings.MaxPeerConnectionCount = 0
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	peerId := NewId()
 	manager.PrioritizePeer(peerId)
@@ -1929,7 +1912,7 @@ func TestWebRtcDedicatedBudgetReclamationDoesNotEvictPublicAssociation(t *testin
 		settings.NetworkPeerReceiveBufferSize,
 	)
 	settings.MaxPeerConnectionCount = 0
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	publicValue, err := manager.NewP2pConnActive(
 		ctx,
@@ -1986,8 +1969,7 @@ func TestWebRtcSharedAdmissionBudgetReclaimsPublicAssociationForNetworkPeer(t *t
 	settings.NetworkPeerReceiveBufferSize = window
 	settings.NetworkPeerMemoryBudget = sharedBudget
 	settings.MaxPeerConnectionCount = 0
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
-	defer manager.Close()
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	publicValue, err := manager.NewP2pConnActive(
 		ctx,
@@ -2047,7 +2029,7 @@ func TestWebRtcDedicatedAssociationRemainsReclaimableAfterTrustRecordEviction(t 
 		settings.NetworkPeerReceiveBufferSize,
 	)
 	settings.MaxPeerConnectionCount = 0
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	oldPeerId := NewId()
 	manager.PrioritizePeer(oldPeerId)
@@ -2094,7 +2076,7 @@ func TestWebRtcPendingDedicatedPeerDoesNotBlockIndependentPublicAdmission(t *tes
 		settings.NetworkPeerReceiveBufferSize,
 	)
 	settings.MaxPeerConnectionCount = 2
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	// Model a shared dedicated budget whose only slot belongs to another
 	// manager. This manager cannot reclaim it, so its selected peer remains
@@ -2149,8 +2131,7 @@ func TestWebRtcPendingNetworkPeerReservesOnlyNeededSamePoolCapacity(t *testing.T
 		firstOrdinaryPeerId,
 		secondOrdinaryPeerId,
 	}
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
-	defer manager.Close()
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	pendingPeerId := NewId()
 	manager.PrioritizePeer(pendingPeerId)
@@ -2202,8 +2183,7 @@ func TestWebRtcPendingNetworkPeerReservesCapacityInSharedPublicBudget(t *testing
 	settings.NetworkPeerReceiveBufferSize = window
 	settings.NetworkPeerMemoryBudget = sharedBudget
 	settings.MaxPeerConnectionCount = 3
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
-	defer manager.Close()
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	pendingPeerId := NewId()
 	manager.PrioritizePeer(pendingPeerId)
@@ -2247,8 +2227,7 @@ func TestWebRtcReleasedCanceledAssociationDoesNotConsumePriorityReservation(t *t
 	settings.NetworkPeerReceiveBufferSize = window
 	settings.NetworkPeerMemoryBudget = sharedBudget
 	settings.MaxPeerConnectionCount = 4
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
-	defer manager.Close()
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	pendingPeerId := NewId()
 	manager.PrioritizePeer(pendingPeerId)
@@ -2300,8 +2279,7 @@ func TestWebRtcPendingPriorityBudgetAccountingDoesNotOverflow(t *testing.T) {
 		firstPendingPeerId,
 		secondPendingPeerId,
 	}
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
-	defer manager.Close()
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	manager.stateLock.Lock()
 	until := time.Now().Add(time.Minute)
@@ -2330,8 +2308,7 @@ func TestWebRtcFailedPriorityStreamRetainsReleasedBudgetReservation(t *testing.T
 	settings.NetworkPeerMemoryBudget = NewTransferMemoryBudget(window)
 	settings.MaxPeerConnectionCount = 2
 	settings.InitialNetworkPeerIds = []Id{ordinaryPeerId}
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
-	defer manager.Close()
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	selectedPeerId := NewId()
 	manager.PrioritizePeer(selectedPeerId)
@@ -2407,8 +2384,7 @@ func TestWebRtcPriorityRefreshPreservesAnotherStreamReservation(t *testing.T) {
 	settings.NetworkPeerReceiveBufferSize = window
 	settings.NetworkPeerMemoryBudget = NewTransferMemoryBudget(2 * window)
 	settings.MaxPeerConnectionCount = 2
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
-	defer manager.Close()
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	peerId := NewId()
 	manager.PrioritizePeer(peerId)
@@ -2459,8 +2435,7 @@ func TestWebRtcPendingPriorityAdmissionReportsLeaseRetry(t *testing.T) {
 	settings.NetworkPeerReceiveBufferSize = 0
 	settings.NetworkPeerMemoryBudget = nil
 	settings.MaxPeerConnectionCount = 1
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
-	defer manager.Close()
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	pendingPeerId := NewId()
 	manager.PrioritizePeer(pendingPeerId)
@@ -2549,8 +2524,7 @@ func TestWebRtcCountAdmissionReleaseWakesOneWaiter(t *testing.T) {
 	settings := DefaultWebRtcSettings()
 	settings.Log = NewNoopLogger()
 	settings.MaxPeerConnectionCount = 8
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
-	defer manager.Close()
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	firstWaiter := newTransferMemoryBudgetWaiter()
 	secondWaiter := newTransferMemoryBudgetWaiter()
@@ -2588,8 +2562,7 @@ func TestWebRtcInternalAdmissionIgnoresUnrelatedBroadcast(t *testing.T) {
 	settings.MaxPeerConnectionCount = 8
 	settings.MemoryBudget = NewTransferMemoryBudget(1)
 	settings.MemoryBudget.Reserve(1)
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
-	defer manager.Close()
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	waiter := newTransferMemoryBudgetWaiter()
 	defer waiter.reset()
@@ -2614,8 +2587,7 @@ func TestWebRtcAdmissionClassificationChangeHasDedicatedWake(t *testing.T) {
 
 	settings := DefaultWebRtcSettings()
 	settings.Log = NewNoopLogger()
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
-	defer manager.Close()
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	stateNotify := manager.admissionStateMonitor.NotifyChannel()
 	manager.PrioritizePeer(NewId())
@@ -2733,8 +2705,7 @@ func TestWebRtcLiveNetworkAssociationPreservesTrustAfterRecordEviction(t *testin
 		2 * settings.NetworkPeerReceiveBufferSize,
 	)
 	settings.MaxPeerConnectionCount = 2
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
-	defer manager.Close()
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	peerId := NewId()
 	manager.PrioritizePeer(peerId)
@@ -2797,8 +2768,7 @@ func TestWebRtcNetworkIdentityChurnEvictsInactiveBeforeLiveRecord(t *testing.T) 
 		2 * settings.NetworkPeerReceiveBufferSize,
 	)
 	settings.MaxPeerConnectionCount = 0
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
-	defer manager.Close()
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	livePeerId := NewId()
 	manager.PrioritizePeer(livePeerId)
@@ -2844,7 +2814,7 @@ func TestWebRtcNetworkPromotionWakesPublicAdmissionSubscription(t *testing.T) {
 		settings.NetworkPeerReceiveBufferSize,
 	)
 	settings.MaxPeerConnectionCount = 0
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	peerId := NewId()
 	countNotify, stalePublicBudgetNotify := manager.AdmissionNotify(peerId)
@@ -2892,7 +2862,7 @@ func TestWebRtcNetworkPeerIdentitySurvivesPriorityExpiry(t *testing.T) {
 	settings.NetworkPeerReceiveBufferSize = mib(2)
 	settings.NetworkPeerMemoryBudget = NewTransferMemoryBudget(settings.NetworkPeerReceiveBufferSize)
 	settings.MaxPeerConnectionCount = 0
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	peerId := NewId()
 	manager.PrioritizePeer(peerId)
@@ -2937,7 +2907,7 @@ func TestWebRtcInitialNetworkPeerUsesReservedAdmissionBeforeAnySignal(t *testing
 	settings.NetworkPeerMemoryBudget =
 		NewTransferMemoryBudget(2 * settings.NetworkPeerReceiveBufferSize)
 	settings.InitialNetworkPeerIds = []Id{peerId}
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	conn, err := manager.NewP2pConnActive(
 		ctx,
@@ -2970,7 +2940,7 @@ func TestWebRtcLateNetworkPromotionRebuildsPublicWindowConnection(t *testing.T) 
 	settings.NetworkPeerReceiveBufferSize = mib(2)
 	settings.NetworkPeerMemoryBudget = NewTransferMemoryBudget(settings.NetworkPeerReceiveBufferSize)
 	settings.MaxPeerConnectionCount = 1
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	peerId := NewId()
 	streamId := NewId()
@@ -3036,7 +3006,7 @@ func TestAuthenticatedNetworkSignalUpgradesExistingPublicWindowConnection(t *tes
 	settings.NetworkPeerReceiveBufferSize = mib(2)
 	settings.NetworkPeerMemoryBudget = NewTransferMemoryBudget(settings.NetworkPeerReceiveBufferSize)
 	settings.MaxPeerConnectionCount = 1
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	peerId := NewId()
 	streamId := NewId()
@@ -3108,7 +3078,7 @@ func TestWebRtcIncompleteNetworkPeerAdmissionFallsBackToPublicPool(t *testing.T)
 			settings.NetworkPeerReceiveBufferSize = test.networkWindow
 			settings.NetworkPeerMemoryBudget = test.networkBudget
 			settings.MaxPeerConnectionCount = 0
-			manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+			manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 			peerId := NewId()
 			manager.PrioritizePeer(peerId)
@@ -3143,7 +3113,7 @@ func TestAuthenticatedNetworkSignalPreemptsFullPeerAdmission(t *testing.T) {
 	settings.ReceiveBufferSize = kib(128)
 	settings.MemoryBudget = NewTransferMemoryBudget(settings.ReceiveBufferSize)
 	settings.MaxPeerConnectionCount = 1
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	backgroundConn, err := manager.NewP2pConnActive(
 		ctx,
@@ -3207,7 +3177,7 @@ func TestWebRtcPrioritizedNetworkPeerDoesNotEvictWhenCapacityIsFree(t *testing.T
 	settings.ReceiveBufferSize = kib(128)
 	settings.MemoryBudget = NewTransferMemoryBudget(2 * settings.ReceiveBufferSize)
 	settings.MaxPeerConnectionCount = 2
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	backgroundConn, err := manager.NewP2pConnActive(
 		ctx,
@@ -3246,7 +3216,7 @@ func TestWebRtcPeerPriorityStateIsHardBounded(t *testing.T) {
 	settings.Log = NewNoopLogger()
 	settings.MaxPeerConnectionCount = 0
 	settings.MemoryBudget = nil
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	var newestPeerId Id
 	for range 4 * maxPeerConnectionPriorityCount {
@@ -3276,8 +3246,7 @@ func TestWebRtcRepeatedNetworkSignalDoesNotRefreshAdmissionDemand(t *testing.T) 
 	settings.Log = NewNoopLogger()
 	settings.MaxPeerConnectionCount = 0
 	settings.MemoryBudget = nil
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
-	defer manager.Close()
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	peerId := NewId()
 	manager.ObserveNetworkPeerSignal(peerId)
@@ -3336,10 +3305,8 @@ func TestWebRtcRepeatedConnectCloseReleasesAdmissionWithoutStall(t *testing.T) {
 
 	signalPipeA := newSignalPipe(nil)
 	signalPipeB := newSignalPipe(nil)
-	managerA := NewWebRtcManager(ctx, signalPipeA, settingsA)
-	managerB := NewWebRtcManager(ctx, signalPipeB, settingsB)
-	defer managerA.Close()
-	defer managerB.Close()
+	managerA := newTestWebRtcManager(t, ctx, signalPipeA, settingsA)
+	managerB := newTestWebRtcManager(t, ctx, signalPipeB, settingsB)
 	signalPipeA.SetSignalReceiver(managerB)
 	signalPipeB.SetSignalReceiver(managerA)
 
@@ -4337,8 +4304,7 @@ func TestWebRtcManagerPeerConnectionFactoryIsLazy(t *testing.T) {
 	settings := DefaultWebRtcSettings()
 	settings.Log = NewNoopLogger()
 	settings.IceServerUrls = nil
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
-	defer manager.Close()
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 	if manager.networkChangeWorker != nil {
 		t.Fatal("idle manager eagerly started a network-change worker")
 	}
@@ -4381,7 +4347,7 @@ func TestWebRtcManagerFactoryFailureRetriesAfterBoundedCooldown(t *testing.T) {
 	settings := DefaultWebRtcSettings()
 	settings.Log = NewNoopLogger()
 	settings.IceServerUrls = nil
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	factoryErr := errors.New("transient factory failure")
 	factoryCalls := 0
@@ -4429,7 +4395,7 @@ func TestWebRtcManagerCanceledStreamDoesNotAllocatePeerConnection(t *testing.T) 
 	settings.IceServerUrls = nil
 	budget := NewTransferMemoryBudget(settings.ReceiveBufferSize)
 	settings.MemoryBudget = budget
-	manager := NewWebRtcManager(managerCtx, &testing_noopSignalSender{}, settings)
+	manager := newTestWebRtcManager(t, managerCtx, &testing_noopSignalSender{}, settings)
 
 	conn, err := manager.NewP2pConnActive(
 		streamCtx,
@@ -4454,7 +4420,7 @@ func TestWebRtcManagerCloseAndWaitReleasesOwnedResources(t *testing.T) {
 	parentCtx := context.Background()
 	streamCtx, streamCancel := context.WithCancel(parentCtx)
 	defer streamCancel()
-	manager := NewWebRtcManager(parentCtx, &testing_noopSignalSender{}, settings)
+	manager := newTestWebRtcManager(t, parentCtx, &testing_noopSignalSender{}, settings)
 	_, err := manager.NewP2pConnActive(
 		streamCtx,
 		NewTransferPath(NewId(), NewId(), NewId()),
@@ -4614,8 +4580,7 @@ func TestWebRtcCanceledPeerReleasesAdmissionWhileSignalSendIsBackpressured(t *te
 	settings.UseEgressOnlyIceInterfaces = false
 	settings.MaxPeerConnectionCount = 1
 	settings.MemoryBudget = NewTransferMemoryBudget(settings.ReceiveBufferSize)
-	manager := NewWebRtcManager(ctx, sender, settings)
-	defer manager.Close()
+	manager := newTestWebRtcManager(t, ctx, sender, settings)
 
 	path := NewTransferPath(NewId(), NewId(), NewId())
 	conn, err := manager.NewP2pConnActive(ctx, path)
@@ -4673,8 +4638,7 @@ func TestWebRtcReplacementBudgetPreservesNewestGenerationWhilePriorTeardownIsPen
 	settings.IceServerUrls = nil
 	settings.ReceiveBufferSize = window
 	settings.MemoryBudget = budget
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
-	defer manager.Close()
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	peerId := NewId()
 	streamId := NewId()
@@ -4738,8 +4702,7 @@ func TestWebRtcReplacementBudgetRetiresCurrentGenerationWithoutPriorRelease(t *t
 	settings.IceServerUrls = nil
 	settings.ReceiveBufferSize = window
 	settings.MemoryBudget = budget
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
-	defer manager.Close()
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	peerId := NewId()
 	streamId := NewId()
@@ -4786,8 +4749,7 @@ func TestWebRtcOffMapByteRetirementDoesNotClaimCountRelease(t *testing.T) {
 	settings.Log = NewNoopLogger()
 	settings.IceServerUrls = nil
 	settings.MaxPeerConnectionCount = 1
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
-	defer manager.Close()
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	currentKey := peerConnKey{PeerId: NewId(), StreamId: NewId()}
 	currentCtx, currentCancel := context.WithCancel(ctx)
@@ -5321,7 +5283,7 @@ func TestWebRtcManagerNetworkChangeRetiresConnectionsAndFactory(t *testing.T) {
 	settings.Log = NewNoopLogger()
 	settings.IceServerUrls = nil
 	settings.MaxPeerConnectionCount = 0
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	conn, err := manager.NewP2pConnActive(
 		ctx,
@@ -5399,8 +5361,7 @@ func TestWebRtcNetworkChangeDispatchDoesNotBlockHostCallback(t *testing.T) {
 		close(fastPathPublished)
 		<-releaseFastPath
 	}
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
-	defer manager.Close()
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 	defer releaseFastPathConfiguration()
 	conn, err := manager.NewP2pConnActive(
 		ctx,
@@ -5476,8 +5437,7 @@ func TestWebRtcInvalidSdpAndEarlyCandidateDoNotPoisonRetransmit(t *testing.T) {
 	settings.Log = NewNoopLogger()
 	settings.IceServerUrls = nil
 	settings.UseLoopbackOnlyIceInterfaces = true
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
-	defer manager.Close()
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	streamId := NewId()
 	passiveWebRtcConn, err := manager.NewP2pConnPassive(
@@ -5549,7 +5509,7 @@ func TestWebRtcEarlyCandidateBufferIsBounded(t *testing.T) {
 	settings := DefaultWebRtcSettings()
 	settings.Log = NewNoopLogger()
 	settings.IceServerUrls = nil
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 	webRtcConn, err := manager.NewP2pConnPassive(
 		ctx,
 		NewTransferPath(NewId(), NewId(), NewId()),
@@ -6007,8 +5967,8 @@ func TestWebRtcSignalingReadyLatencyMeasurement(t *testing.T) {
 
 	signalPipeA := newDelayedSignalPipe(ctx, signalDelay, nil)
 	signalPipeB := newDelayedSignalPipe(ctx, signalDelay, nil)
-	managerA := NewWebRtcManager(ctx, signalPipeA, settingsA)
-	managerB := NewWebRtcManager(ctx, signalPipeB, settingsB)
+	managerA := newTestWebRtcManager(t, ctx, signalPipeA, settingsA)
+	managerB := newTestWebRtcManager(t, ctx, signalPipeB, settingsB)
 	signalPipeA.SetSignalReceiver(managerB)
 	signalPipeB.SetSignalReceiver(managerA)
 
@@ -6224,8 +6184,8 @@ func TestWebRtcLiveResourceMeasurement(t *testing.T) {
 
 	signalPipeA := newSignalPipe(nil)
 	signalPipeB := newSignalPipe(nil)
-	managerA := NewWebRtcManager(ctx, signalPipeA, settingsA)
-	managerB := NewWebRtcManager(ctx, signalPipeB, settingsB)
+	managerA := newTestWebRtcManager(t, ctx, signalPipeA, settingsA)
+	managerB := newTestWebRtcManager(t, ctx, signalPipeB, settingsB)
 	signalPipeA.SetSignalReceiver(managerB)
 	signalPipeB.SetSignalReceiver(managerA)
 
@@ -6372,8 +6332,8 @@ func TestWebRtcP2pRouteThroughputMeasurement(t *testing.T) {
 
 				signalPipeA := newSignalPipe(nil)
 				signalPipeB := newSignalPipe(nil)
-				managerA := NewWebRtcManager(ctx, signalPipeA, settingsA)
-				managerB := NewWebRtcManager(ctx, signalPipeB, settingsB)
+				managerA := newTestWebRtcManager(t, ctx, signalPipeA, settingsA)
+				managerB := newTestWebRtcManager(t, ctx, signalPipeB, settingsB)
 				signalPipeA.SetSignalReceiver(managerB)
 				signalPipeB.SetSignalReceiver(managerA)
 

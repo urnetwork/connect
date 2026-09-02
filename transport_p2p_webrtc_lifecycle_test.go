@@ -31,7 +31,7 @@ func lifecycleTestManager(ctx context.Context, t *testing.T) *WebRtcManager {
 	// transport_p2p_webrtc_test.go
 	settings.IceServerUrls = nil
 	settings.UseLoopbackOnlyIceInterfaces = true
-	return NewWebRtcManager(ctx, newSignalPipe(nil), settings)
+	return newTestWebRtcManager(t, ctx, newSignalPipe(nil), settings)
 }
 
 func lifecycleCandidateSignals(t *testing.T, streamId Id, count int) *protocol.ExchangeSignals {
@@ -64,7 +64,6 @@ func TestClosedPeerConnDropsLateSignals(t *testing.T) {
 	defer cancel()
 
 	manager := lifecycleTestManager(ctx, t)
-	defer manager.Close()
 
 	peerId := NewId()
 	streamId := NewId()
@@ -201,8 +200,7 @@ func TestReceivePathSignalSendsDoNotBlock(t *testing.T) {
 	settings.IceServerUrls = nil
 	settings.UseLoopbackOnlyIceInterfaces = true
 	sender := &blockingSignalSender{ctx: ctx}
-	manager := NewWebRtcManager(ctx, sender, settings)
-	defer manager.Close()
+	manager := newTestWebRtcManager(t, ctx, sender, settings)
 
 	peerId := NewId()
 	streamId := NewId()

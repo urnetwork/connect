@@ -152,7 +152,7 @@ func TestIntermediaryStreamSequenceMatchesAdjacentDestinationsBothDirections(
 		settings.Log = NewNoopLogger()
 		settings.IceServerUrls = nil
 		settings.UseLoopbackOnlyIceInterfaces = true
-		return NewWebRtcManager(ctx, router.sender(clientId), settings)
+		return newTestWebRtcManager(t, ctx, router.sender(clientId), settings)
 	}
 	sourceWebRtcManager := newWebRtcManager(sourceId)
 	intermediaryWebRtcManager := newWebRtcManager(intermediaryId)

@@ -1486,10 +1486,8 @@ func TestP2pStreamProbeStreamSequenceCancelSynchronouslyWithdrawsReadiness(t *te
 	webRtcSettingsB.UseLoopbackOnlyIceInterfaces = true
 	signalPipeA := newP2pProbeSignalPipe()
 	signalPipeB := newP2pProbeSignalPipe()
-	webRtcManagerA := NewWebRtcManager(ctx, signalPipeA, webRtcSettingsA)
-	webRtcManagerB := NewWebRtcManager(ctx, signalPipeB, webRtcSettingsB)
-	defer webRtcManagerA.Close()
-	defer webRtcManagerB.Close()
+	webRtcManagerA := newTestWebRtcManager(t, ctx, signalPipeA, webRtcSettingsA)
+	webRtcManagerB := newTestWebRtcManager(t, ctx, signalPipeB, webRtcSettingsB)
 	signalPipeA.SetSignalReceiver(webRtcManagerB)
 	signalPipeB.SetSignalReceiver(webRtcManagerA)
 

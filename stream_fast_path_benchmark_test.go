@@ -599,8 +599,8 @@ func benchmarkStreamWebRtcRoute(
 
 	signalPipeA := newSignalPipe(nil)
 	signalPipeB := newSignalPipe(nil)
-	managerA := NewWebRtcManager(ctx, signalPipeA, settingsA)
-	managerB := NewWebRtcManager(ctx, signalPipeB, settingsB)
+	managerA := newTestWebRtcManager(b, ctx, signalPipeA, settingsA)
+	managerB := newTestWebRtcManager(b, ctx, signalPipeB, settingsB)
 	signalPipeA.SetSignalReceiver(managerB)
 	signalPipeB.SetSignalReceiver(managerA)
 

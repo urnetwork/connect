@@ -606,7 +606,7 @@ func TestWebRtcManagerPeerConnCap(t *testing.T) {
 	settings.IceServerUrls = nil
 	settings.MaxPeerConnectionCount = 2
 
-	manager := NewWebRtcManager(ctx, &testing_noopSignalSender{}, settings)
+	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
 
 	sourceId := NewId()
 	newPath := func() TransferPath {

@@ -182,8 +182,8 @@ func newP2pFastPathTestPairForStreamWithSettings(
 
 	signalPipeA := newSignalPipe(nil)
 	signalPipeB := newSignalPipe(nil)
-	managerA := NewWebRtcManager(ctx, signalPipeA, settingsA)
-	managerB := NewWebRtcManager(ctx, signalPipeB, settingsB)
+	managerA := newTestWebRtcManager(t, ctx, signalPipeA, settingsA)
+	managerB := newTestWebRtcManager(t, ctx, signalPipeB, settingsB)
 	signalErrors := make(chan error, 8)
 	signalPipeA.SetSignalReceiver(&p2pFastPathTestSignalReceiver{
 		receiver: managerB,

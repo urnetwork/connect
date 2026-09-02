@@ -301,8 +301,8 @@ func TestWebRtcIdleResumeSctpBlackholeReconnects(t *testing.T) {
 
 	signalPipeA := newSignalPipe(nil)
 	signalPipeB := newSignalPipe(nil)
-	managerA := NewWebRtcManager(ctx, signalPipeA, settingsA)
-	managerB := NewWebRtcManager(ctx, signalPipeB, settingsB)
+	managerA := newTestWebRtcManager(t, ctx, signalPipeA, settingsA)
+	managerB := newTestWebRtcManager(t, ctx, signalPipeB, settingsB)
 	managerA.newPeerConnectionFactory = func(
 		*WebRtcSettings,
 		*webrtc.Certificate,
