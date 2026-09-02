@@ -66,16 +66,20 @@ import (
 // Android's self-exclusion. Android therefore keeps egress_resolver_other.go,
 // whose tag is the exact complement of this one.
 //
-// AND IT IS STILL INERT ON ANY LINUX THAT IS NOT THE TUNNEL DAEMON. Desktop
-// Linux is not one platform, it is every embedding of this SDK: headless
-// providers on servers with split-horizon resolvers, CI, other applications.
-// None of those have a captured resolver and none of them should have their
-// DNS rerouted. egressResolver therefore returns nil — the platform resolver,
-// byte-for-byte the old behavior — unless this process is demonstrably the
-// tunnel-providing daemon. The test for that is egressSelfMarked: a socket
-// created right now is born carrying egressSocketMark, which happens only
-// inside the cgroup urnetwork-linux attached its program to. Nothing in a
-// container, in CI, or in any other embedding can satisfy it by accident.
+// AND IT REMAINS BEHAVIORALLY INERT ON ANY LINUX THAT IS NOT THE TUNNEL
+// DAEMON. Desktop Linux is not one platform, it is every embedding of this
+// SDK: headless providers on servers with split-horizon resolvers, CI, other
+// applications. The unmarked path therefore dials the server selected by Go
+// unchanged while that server is still present in the live resolv.conf. Its
+// one intervention is at a real configuration boundary: Go caches resolv.conf
+// for five seconds, so it replaces a cached server that the live file no
+// longer contains. That is required by the direct-file Linux tunnel backend,
+// which temporarily installs the UpgradeMux mask and restores the host file
+// at disconnect. egressSelfMarked selects the daemon's stronger off-tunnel
+// substitution: a socket created right now is born carrying egressSocketMark,
+// which happens only inside the cgroup urnetwork-linux attached its program
+// to. Nothing in a container, in CI, or in another embedding can satisfy it by
+// accident.
 
 // egressSocketMark is the fwmark urnetwork-linux's cgroup-BPF sock_create
 // program stamps on every AF_INET/AF_INET6 socket this process creates
@@ -85,19 +89,27 @@ import (
 // interface and never enters the tun.
 const egressSocketMark = 0x55524e57
 
-// egressBoundResolver is the resolver control dials use while this process
-// provides a tunnel. Same shape as the Windows one: the in-process Go resolver
-// plus a Dial that substitutes an off-tunnel server on an off-tunnel socket.
+// egressBoundResolver is the resolver Linux control dials use. Same shape as
+// the Windows one: the in-process Go resolver plus a Dial that substitutes an
+// off-tunnel server on an off-tunnel socket for the marked tunnel daemon. The
+// unmarked path preserves a current system choice and only refreshes a stale
+// choice after resolv.conf changes.
 var egressBoundResolver = &net.Resolver{
 	PreferGo: true,
 	Dial:     egressResolverDial,
 }
 
-// egressResolver returns the egress-bound resolver only when this process's
-// own sockets are steered around the tunnel it provides. Off that path — every
-// headless or embedded use of this SDK, every Linux host that is not running
-// the tunnel daemon — it returns nil, which means net.Dialer keeps
-// net.DefaultResolver exactly as before.
+// egressSystemResolvConfPath is the live resolver configuration consulted at
+// wire-dial time. Tests replace it with a private file to force a transition.
+var egressSystemResolvConfPath = "/etc/resolv.conf"
+
+// egressSystemResolverRotation distributes a stale choice across the current
+// resolver list instead of pinning every concurrent lookup to its first entry.
+var egressSystemResolverRotation atomic.Uint64
+
+// egressResolver returns the Linux control resolver unconditionally. Its Dial
+// hook decides per query whether the process is the marked tunnel daemon or an
+// ordinary process whose system resolver choice should be preserved.
 //
 // THE GATE IS INSIDE Dial, NOT HERE, and that is load-bearing rather than
 // stylistic. ConnectSettings.NetDialer() is called ONCE for the primary
@@ -143,13 +155,12 @@ var egressFallbackDnsServers = []string{
 
 func egressResolverDial(ctx context.Context, network string, addr string) (net.Conn, error) {
 	if !egressSelfMarked() {
-		// not providing a tunnel: dial the server the Go resolver chose from
-		// the system configuration, unmarked — the plain platform behavior.
-		// The normal state for every Linux process that is not the tunnel
-		// daemon: this resolver is always handed out, and this branch is what
-		// keeps it behaviourally identical to the platform resolver there.
+		// Not providing a tunnel: keep the Go resolver's choice while it still
+		// appears in the live system configuration. Go caches resolv.conf for
+		// five seconds; after a tunnel restores the file, replace its stale
+		// upgrade-mask choice at this final wire boundary.
 		dialer := &net.Dialer{Timeout: egressResolverDialTimeout}
-		return dialer.DialContext(ctx, network, addr)
+		return dialer.DialContext(ctx, network, freshSystemResolverAddress(addr))
 	}
 	_, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -173,6 +184,53 @@ func egressResolverDial(ctx context.Context, network string, addr string) (net.C
 	conn, err := dialer.DialContext(ctx, network, serverAddr)
 	logControlDialResult(nil, "dns", true, network, serverAddr, conn, err)
 	return conn, err
+}
+
+// Revalidates Go's cached resolver choice against the live resolv.conf. A
+// current choice is byte-for-byte the ordinary path; only a configuration
+// transition substitutes one of the newly configured IP literals.
+func freshSystemResolverAddress(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	selected, err := netip.ParseAddr(host)
+	if err != nil {
+		return addr
+	}
+	content, err := os.ReadFile(egressSystemResolvConfPath)
+	if err != nil {
+		return addr
+	}
+	currentServers := []netip.Addr{}
+	for _, line := range strings.Split(string(content), "\n") {
+		if commentIndex := strings.IndexAny(line, "#;"); 0 <= commentIndex {
+			line = line[:commentIndex]
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "nameserver" {
+			continue
+		}
+		server, parseErr := netip.ParseAddr(fields[1])
+		if parseErr != nil {
+			continue
+		}
+		server = server.Unmap()
+		if selected.Unmap() == server {
+			return addr
+		}
+		currentServers = append(currentServers, server)
+		// Match the Go resolver's resolv.conf parser: it considers at most
+		// the first three valid nameserver entries.
+		if len(currentServers) == 3 {
+			break
+		}
+	}
+	if len(currentServers) == 0 {
+		return addr
+	}
+	server := currentServers[int(egressSystemResolverRotation.Add(1)-1)%len(currentServers)]
+	return net.JoinHostPort(server.String(), port)
 }
 
 // egressMarkControl sets SO_MARK on the resolver's socket at creation time,
