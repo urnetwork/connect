@@ -10709,6 +10709,16 @@ func (self *multiClientWindow) resize() {
 		if 0 < targetWindowSize {
 			self.armOutcome()
 		}
+		minSatisfied := func(clientCount int) bool {
+			return windowMinSatisfied(
+				windowSizeMin,
+				clientCount,
+				len(warnedClients),
+				fixedDestination,
+				self.settings.StrictWindowSizeHardMax,
+				windowSize.WindowSizeHardMax,
+			)
+		}
 
 		addedCount := 0
 		if len(clients) < targetWindowSize {
@@ -10720,7 +10730,7 @@ func (self *multiClientWindow) resize() {
 				fixedDestination,
 			)
 			self.monitor.AddWindowExpandEvent(
-				windowMinSatisfied(windowSizeMin, len(clients), len(warnedClients), fixedDestination),
+				minSatisfied(len(clients)),
 				targetWindowSize+len(warnedClients),
 			)
 			addedCount = self.expand(
@@ -10744,7 +10754,7 @@ func (self *multiClientWindow) resize() {
 		}
 		if 0 < windowSize.WindowSizeHardMax && windowSize.WindowSizeHardMax < len(clients)+len(warnedClients)+addedCount {
 			self.monitor.AddWindowExpandEvent(
-				windowMinSatisfied(windowSizeMin, len(clients)+addedCount, len(warnedClients), fixedDestination),
+				minSatisfied(len(clients)+addedCount),
 				windowSize.WindowSizeHardMax,
 			)
 			collapseLowestWeighted(max(0, windowSize.WindowSizeHardMax-addedCount))
@@ -10753,7 +10763,7 @@ func (self *multiClientWindow) resize() {
 			}
 		} else {
 			self.monitor.AddWindowExpandEvent(
-				windowMinSatisfied(windowSizeMin, len(clients)+addedCount, len(warnedClients), fixedDestination),
+				minSatisfied(len(clients)+addedCount),
 				len(clients)+len(warnedClients)+addedCount,
 			)
 		}
@@ -11537,19 +11547,36 @@ func (self *multiClientWindow) lastResortClients() []*multiClientChannel {
 // traffic does not cross rank until necessary.
 // windowMinSatisfied is the monitor's "connected" gate. A fixed destination
 // counts warned clients toward the minimum: its only replacement is another
-// client to the same endpoint, so a warned sole selected peer must not
-// report "connecting" for its whole session while it is still routing (the
-// same judgment as the OrderedClients fixed-destination fallback).
+// client to the same endpoint, so a warned sole selected peer must not report
+// "connecting" for its whole session while it is still routing (the same
+// judgment as the OrderedClients fixed-destination fallback).
+//
+// An expanding window normally excludes warned clients because it can replace
+// them. A strict window at its ownership ceiling cannot: the admission gate
+// counts retained warned clients and rejects a new identity. Count those
+// clients toward the presentation minimum only when the ceiling is saturated
+// and at least one unwarned client remains selectable. This keeps the monitor
+// consistent with the admission policy without declaring an all-warned window
+// connected or concealing a replacement slot that can still be filled.
 func windowMinSatisfied(
 	windowSizeMin int,
 	clientCount int,
 	warnedCount int,
 	fixedDestination bool,
+	strictWindowSizeHardMax bool,
+	windowSizeHardMax int,
 ) bool {
 	if fixedDestination {
 		return windowSizeMin <= clientCount+warnedCount
 	}
-	return windowSizeMin <= clientCount
+	if windowSizeMin <= clientCount {
+		return true
+	}
+	return strictWindowSizeHardMax &&
+		0 < clientCount &&
+		0 < windowSizeHardMax &&
+		windowSizeHardMax <= clientCount+warnedCount &&
+		windowSizeMin <= clientCount+warnedCount
 }
 
 func (self *multiClientWindow) OrderedClients() []*multiClientChannel {

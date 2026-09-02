@@ -30,7 +30,12 @@ each a dedicated `Client` to one provider destination. Window types:
 `windowMinSatisfied` is what the UI renders as "connected". A warned sole
 destination that is still routing keeps a fixed window satisfied — there is
 no replacement to steer to, so warning it out only produces a permanent
-"Connecting" display.
+"Connecting" display. A strict low-memory window at its ownership ceiling
+likewise counts retained warned clients after confirming that at least one
+ordinary client remains selectable. The strict admission gate cannot backfill
+that warning without exceeding the memory ceiling, and excluding it from both
+the minimum and admission counts creates an unwinnable state. A window with a
+free replacement slot, or with every client warned, remains unsatisfied.
 
 ### Discovery and maintenance safety
 
