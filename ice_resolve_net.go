@@ -34,6 +34,28 @@ func newPeerConnectionResolveNet(
 	timeout time.Duration,
 ) (*peerConnectionResolveNet, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
+	if resolver != nil && resolver.Dial != nil {
+		// net.Resolver may detach a shared wire lookup from its caller's
+		// cancellation. Bind each underlying control dial to this exact peer as
+		// well, so the detached lookup cannot outlive the retired generation.
+		baseDial := resolver.Dial
+		resolver = &net.Resolver{
+			PreferGo:     resolver.PreferGo,
+			StrictErrors: resolver.StrictErrors,
+		}
+		resolver.Dial = func(dialCtx context.Context, network string, address string) (net.Conn, error) {
+			operationCtx, cancelOperation := context.WithCancelCause(dialCtx)
+			stop := context.AfterFunc(ctx, func() {
+				cancelOperation(context.Cause(ctx))
+			})
+			if ctx.Err() != nil {
+				cancelOperation(context.Cause(ctx))
+			}
+			defer stop()
+			defer cancelOperation(context.Canceled)
+			return baseDial(operationCtx, network, address)
+		}
+	}
 	return &peerConnectionResolveNet{
 		Net:      base,
 		ctx:      ctx,
