@@ -3791,10 +3791,11 @@ type SendBufferSettings struct {
 	beforeDueResendForTest                func(sendSequenceId, uint64)
 	afterCreateSendGroupCompletionForTest func(sendSequenceId, int)
 	// Nil test barrier pauses one encrypted-control owner before Pack.
-	beforeEncryptedControlPackForTest func([]byte)
-	forceAckTimeoutForTest            func(sendSequenceId) bool
-	forceContractFailureForTest       func(sendSequenceId) bool
-	forceResendForTest                func(sendSequenceId) bool
+	beforeEncryptedControlPackForTest    func([]byte)
+	beforeContractFailureClassifyForTest func(sendSequenceId)
+	forceAckTimeoutForTest               func(sendSequenceId) bool
+	forceContractFailureForTest          func(sendSequenceId) bool
+	forceResendForTest                   func(sendSequenceId) bool
 
 	// as this ->1, there is more risk that noack messages will get dropped due to out of sync contracts
 	ContractFillFraction float32
@@ -3993,6 +3994,7 @@ type SendBuffer struct {
 	beforeDueResendForTest                func(sendSequenceId, uint64)
 	afterCreateSendGroupCompletionForTest func(sendSequenceId, int)
 	beforeEncryptedControlPackForTest     func([]byte)
+	beforeContractFailureClassifyForTest  func(sendSequenceId)
 	forceAckTimeoutForTest                func(sendSequenceId) bool
 	forceContractFailureForTest           func(sendSequenceId) bool
 	forceResendForTest                    func(sendSequenceId) bool
@@ -4024,6 +4026,7 @@ func NewSendBuffer(ctx context.Context,
 		beforeDueResendForTest:                sendBufferSettings.beforeDueResendForTest,
 		afterCreateSendGroupCompletionForTest: sendBufferSettings.afterCreateSendGroupCompletionForTest,
 		beforeEncryptedControlPackForTest:     sendBufferSettings.beforeEncryptedControlPackForTest,
+		beforeContractFailureClassifyForTest:  sendBufferSettings.beforeContractFailureClassifyForTest,
 		forceAckTimeoutForTest:                sendBufferSettings.forceAckTimeoutForTest,
 		forceContractFailureForTest:           sendBufferSettings.forceContractFailureForTest,
 		forceResendForTest:                    sendBufferSettings.forceResendForTest,
@@ -5353,24 +5356,18 @@ func (self *SendSequence) processLogicalGroupChunk(
 	frames := sendPack.Frames[start:end]
 	messageByteCount := MessageByteCount(frames)
 	contractUpdated := false
+	var contractErr error
 	if withoutAckPromotion {
-		contractUpdated, deferForRecoveryAdmission =
-			self.updateContractWithoutAckPromotion(messageByteCount)
+		contractUpdated, deferForRecoveryAdmission, contractErr =
+			self.updateContractWithoutAckPromotionOutcome(messageByteCount)
 	} else {
-		contractUpdated = self.updateContract(messageByteCount)
+		contractUpdated, contractErr = self.updateContractOutcome(messageByteCount)
 	}
 	if deferForRecoveryAdmission {
 		return false, true, true
 	}
 	if !contractUpdated {
-		err := errors.New("No contract")
-		self.log.Errorf(
-			"[s]%s->%s...%s s(%s) exit could not create contract.\n",
-			self.client.ClientTag(),
-			self.contractIntermediaryIds(),
-			self.destination,
-			self.contractMultiRouteWriterAlias.StreamId,
-		)
+		err := self.classifyContractCreationFailure(contractErr)
 		sendPack.disposeUnsentGroup(err)
 		return true, false, false
 	}
@@ -6188,11 +6185,12 @@ sendSequenceLoop:
 				// that minimum by the contract implementation.
 				contractUpdated := false
 				deferForRecoveryAdmission := false
+				var contractErr error
 				if bypassedRecoveryAdmission {
-					contractUpdated, deferForRecoveryAdmission =
-						self.updateContractWithoutAckPromotion(messageByteCount)
+					contractUpdated, deferForRecoveryAdmission, contractErr =
+						self.updateContractWithoutAckPromotionOutcome(messageByteCount)
 				} else {
-					contractUpdated = self.updateContract(messageByteCount)
+					contractUpdated, contractErr = self.updateContractOutcome(messageByteCount)
 				}
 				if contractUpdated {
 					if bypassedRecoveryAdmission {
@@ -6238,9 +6236,8 @@ sendSequenceLoop:
 					return !packsClosed
 				}
 
-				self.log.Errorf("[s]%s->%s...%s s(%s) exit could not create contract.\n", self.client.ClientTag(), self.contractIntermediaryIds(), self.destination, self.contractMultiRouteWriterAlias.StreamId)
+				err := self.classifyContractCreationFailure(contractErr)
 				for packIndex := range sendPackCount {
-					err := errors.New("No contract")
 					sendPacks[packIndex].completeLifecycleFirstRouteWrite(err)
 					sendPacks[packIndex].completeNoAck(err)
 					sendPacks[packIndex].invokeAck(err)
@@ -6332,9 +6329,48 @@ sendSequenceLoop:
 	}
 }
 
+// Reports the exact terminal outcome captured inside contract acquisition.
+// A later sequence cancellation cannot reclassify an already-live exhaustion.
+func (self *SendSequence) classifyContractCreationFailure(err error) error {
+	if self.sendBuffer != nil && self.sendBuffer.beforeContractFailureClassifyForTest != nil {
+		self.sendBuffer.beforeContractFailureClassifyForTest(self.id())
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		if self.log.V(1).Enabled() {
+			self.log.Infof(
+				"[s]%s->%s...%s s(%s) exit contract creation canceled = %s\n",
+				self.client.ClientTag(),
+				self.contractIntermediaryIds(),
+				self.destination,
+				self.contractMultiRouteWriterAlias.StreamId,
+				err,
+			)
+		}
+		return err
+	}
+
+	if err == nil {
+		err = errors.New("No contract")
+	}
+	self.log.Errorf(
+		"[s]%s->%s...%s s(%s) exit could not create contract.\n",
+		self.client.ClientTag(),
+		self.contractIntermediaryIds(),
+		self.destination,
+		self.contractMultiRouteWriterAlias.StreamId,
+	)
+	return err
+}
+
 func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
-	updated, _ := self.updateContractWithAckPromotion(messageByteCount, true)
+	updated, _ := self.updateContractOutcome(messageByteCount)
 	return updated
+}
+
+// Preserves the terminal acquisition cause for the send loop's diagnostics.
+func (self *SendSequence) updateContractOutcome(messageByteCount ByteCount) (bool, error) {
+	updated, _, err := self.updateContractWithAckPromotion(messageByteCount, true)
+	return updated, err
 }
 
 // updateContractWithoutAckPromotion debits only an established contract that
@@ -6345,16 +6381,26 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 func (self *SendSequence) updateContractWithoutAckPromotion(
 	messageByteCount ByteCount,
 ) (updated bool, deferForRecoveryAdmission bool) {
+	updated, deferForRecoveryAdmission, _ =
+		self.updateContractWithoutAckPromotionOutcome(messageByteCount)
+	return
+}
+
+// Preserves the terminal acquisition cause while retaining the recovery-defer
+// outcome used by unreliable no-ack admission.
+func (self *SendSequence) updateContractWithoutAckPromotionOutcome(
+	messageByteCount ByteCount,
+) (updated bool, deferForRecoveryAdmission bool, err error) {
 	return self.updateContractWithAckPromotion(messageByteCount, false)
 }
 
 func (self *SendSequence) updateContractWithAckPromotion(
 	messageByteCount ByteCount,
 	allowAckPromotion bool,
-) (updated bool, deferForRecoveryAdmission bool) {
+) (updated bool, deferForRecoveryAdmission bool, err error) {
 	if self.sendBuffer != nil && self.sendBuffer.forceContractFailureForTest != nil &&
 		self.sendBuffer.forceContractFailureForTest(self.id()) {
-		return false, false
+		return false, false, errors.New("No contract")
 	}
 	// `sendNoContract` is a mutual configuration
 	// both sides must configure themselves to require no contract from each other
@@ -6376,7 +6422,7 @@ func (self *SendSequence) updateContractWithAckPromotion(
 			}
 			self.sendContract = nil
 		}
-		return true, false
+		return true, false, nil
 	}
 
 	metadata := self.contractMetadata()
@@ -6401,12 +6447,13 @@ func (self *SendSequence) updateContractWithAckPromotion(
 	if self.sendContract != nil &&
 		(allowAckPromotion || self.sendContractAcked) &&
 		self.sendContract.update(messageByteCount) {
-		return true, false
+		return true, false, nil
 	}
 	if !allowAckPromotion {
-		return false, true
+		return false, true, nil
 	}
 
+	var contractErr error
 	createContract := func() bool {
 		// the max overhead of the pack frame
 		// this is needed because the size of the contract pack is counted against the contract
@@ -6554,12 +6601,14 @@ func (self *SendSequence) updateContractWithAckPromotion(
 		for {
 			select {
 			case <-self.ctx.Done():
+				contractErr = self.ctx.Err()
 				return false
 			default:
 			}
 
 			timeout := endTime.Sub(time.Now())
 			if timeout <= 0 {
+				contractErr = errors.New("No contract")
 				return false
 			}
 
@@ -6612,7 +6661,7 @@ func (self *SendSequence) updateContractWithAckPromotion(
 	if d := contractWaitTime; self.sendBufferSettings.ContractWaitLogThreshold <= d {
 		self.log.Infof("[s]contract wait %.0fms ok=%t c=%t %s->%s...%s s(%s)\n", float64(d.Microseconds())/1000.0, ok, self.companionContract, self.client.ClientTag(), self.contractIntermediaryIds(), self.destination, self.contractMultiRouteWriterAlias.StreamId)
 	}
-	return ok, false
+	return ok, false, contractErr
 }
 
 func nextCreateContractRetryInterval(current time.Duration, maximum time.Duration) time.Duration {

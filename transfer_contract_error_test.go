@@ -2,6 +2,10 @@ package connect
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,8 +21,10 @@ import (
 type contractErrorOob struct {
 	clientId Id
 	// answer this many requests with an error; < 0 means all of them
-	errorCount int64
-	errorsSent atomic.Int64
+	errorCount  int64
+	errorsSent  atomic.Int64
+	requestSeen chan struct{}
+	requestOnce sync.Once
 }
 
 func (self *contractErrorOob) SendControl(frames []*protocol.Frame, callback func([]*protocol.Frame, error)) {
@@ -31,6 +37,9 @@ func (self *contractErrorOob) SendControl(frames []*protocol.Frame, callback fun
 		createContract, ok := message.(*protocol.CreateContract)
 		if !ok {
 			continue
+		}
+		if self.requestSeen != nil {
+			self.requestOnce.Do(func() { close(self.requestSeen) })
 		}
 
 		if self.errorCount < 0 || self.errorsSent.Load() < self.errorCount {
@@ -75,6 +84,77 @@ func (self *contractErrorOob) SendControl(frames []*protocol.Frame, callback fun
 		}
 	}
 	callback(out, nil)
+}
+
+// contractFailureLogger separates error and verbose lines so cancellation
+// tests can assert severity, not just message text.
+type contractFailureLogger struct {
+	stateLock    sync.Mutex
+	errorLines   []string
+	verboseLines []string
+}
+
+func (self *contractFailureLogger) Info(args ...any) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.verboseLines = append(self.verboseLines, fmt.Sprint(args...))
+}
+func (self *contractFailureLogger) Infof(format string, args ...any) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.verboseLines = append(self.verboseLines, fmt.Sprintf(format, args...))
+}
+func (self *contractFailureLogger) Warningf(format string, args ...any) {}
+func (self *contractFailureLogger) Errorf(format string, args ...any) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.errorLines = append(self.errorLines, fmt.Sprintf(format, args...))
+}
+func (self *contractFailureLogger) V(level int32) Verbose {
+	return &contractFailureVerbose{log: self}
+}
+
+// contractFailureVerbose records verbose diagnostics separately from errors.
+type contractFailureVerbose struct {
+	log *contractFailureLogger
+}
+
+func (self *contractFailureVerbose) Enabled() bool { return true }
+func (self *contractFailureVerbose) Info(args ...any) {
+	self.log.stateLock.Lock()
+	defer self.log.stateLock.Unlock()
+	self.log.verboseLines = append(self.log.verboseLines, fmt.Sprint(args...))
+}
+func (self *contractFailureVerbose) Infof(format string, args ...any) {
+	self.log.stateLock.Lock()
+	defer self.log.stateLock.Unlock()
+	self.log.verboseLines = append(self.log.verboseLines, fmt.Sprintf(format, args...))
+}
+
+// errorLinesContaining returns a stable snapshot filtered by one diagnostic key.
+func (self *contractFailureLogger) errorLinesContaining(substring string) []string {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	matched := []string{}
+	for _, line := range self.errorLines {
+		if strings.Contains(line, substring) {
+			matched = append(matched, line)
+		}
+	}
+	return matched
+}
+
+// verboseLinesContaining returns a stable snapshot filtered by one diagnostic key.
+func (self *contractFailureLogger) verboseLinesContaining(substring string) []string {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	matched := []string{}
+	for _, line := range self.verboseLines {
+		if strings.Contains(line, substring) {
+			matched = append(matched, line)
+		}
+	}
+	return matched
 }
 
 func contractErrorTestSettings() *ClientSettings {
@@ -188,4 +268,189 @@ func TestSendSequenceSurvivesTransientContractErrors(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("transient errors below the terminal count must be forgiven: the granted contract was never taken, so the wait failed fast on a transient")
+}
+
+// A sequence canceled while it owns a contract wait is ordinary lifecycle
+// teardown. It must return the cancellation cause without emitting the same
+// error used for a live acquisition failure.
+func TestSendSequenceContractWaitCancellationIsNotAnError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clientId := NewId()
+	requestSeen := make(chan struct{})
+	log := &contractFailureLogger{}
+	oob := &contractErrorOob{
+		clientId:    clientId,
+		errorCount:  -1,
+		requestSeen: requestSeen,
+	}
+	settings := contractErrorTestSettings()
+	settings.Log = log
+	settings.EncryptionSettings.Mode = EncryptionModeOff
+	// The request barrier must belong to this Pack's synchronous acquisition,
+	// not the sequence's earlier fire-and-forget prewarm request.
+	settings.SendBufferSettings.PrewarmOpeningContract = false
+	client := NewClient(ctx, clientId, oob, settings)
+	defer client.Cancel()
+
+	client.RouteManager().UpdateTransport(
+		NewSendGatewayTransport(),
+		[]Route{make(chan []byte, 1)},
+	)
+	frame, err := ToFrame(
+		&protocol.SimpleMessage{Content: "cancel contract wait"},
+		DefaultProtocolVersion,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination := NewId()
+	ackErrs := make(chan error, 1)
+	if !client.SendWithTimeout(frame, destination, func(err error) {
+		ackErrs <- err
+	}, -1) {
+		t.Fatal("the send must enqueue before cancellation")
+	}
+
+	select {
+	case <-requestSeen:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the send sequence never entered contract acquisition")
+	}
+
+	// Cancel only the sequence that owns the in-flight pack. Canceling the whole
+	// client lets SendBuffer teardown race the sequence's own classification and
+	// legitimately complete the callback with its broader "Send sequence
+	// closed." cause instead.
+	client.sendBuffer.mutex.Lock()
+	var sequence *SendSequence
+	for id, candidate := range client.sendBuffer.sendSequences {
+		if id.Destination == destination {
+			sequence = candidate
+			break
+		}
+	}
+	client.sendBuffer.mutex.Unlock()
+	if sequence == nil {
+		t.Fatal("the sequence disappeared before the cancellation boundary")
+	}
+	sequence.Cancel()
+
+	select {
+	case err := <-ackErrs:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("ack error = %v, want context cancellation", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("canceled contract wait did not complete its ack callback")
+	}
+
+	if lines := log.errorLinesContaining("could not create contract"); len(lines) != 0 {
+		t.Fatalf("ordinary cancellation emitted contract failure errors: %v", lines)
+	}
+	lines := log.verboseLinesContaining("contract creation canceled = context canceled")
+	if len(lines) != 1 {
+		t.Fatalf("cancellation diagnostics = %v, want one verbose root-cause line", lines)
+	}
+}
+
+// A live sequence whose configured acquisition budget is exhausted is still
+// an operational failure and must remain visible at error severity.
+func TestSendSequenceContractWaitExhaustionRemainsAnErrorAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clientId := NewId()
+	destination := NewId()
+	log := &contractFailureLogger{}
+	oob := &contractErrorOob{
+		clientId:   clientId,
+		errorCount: -1,
+	}
+	settings := contractErrorTestSettings()
+	settings.Log = log
+	settings.EncryptionSettings.Mode = EncryptionModeOff
+	// A zero budget enters the real exhaustion branch deterministically; no
+	// scheduler timing or abbreviated wall-clock wait decides the result.
+	settings.SendBufferSettings.CreateContractTimeout = 0
+	classificationReached := make(chan struct{})
+	allowClassification := make(chan struct{})
+	defer func() {
+		select {
+		case <-allowClassification:
+		default:
+			close(allowClassification)
+		}
+	}()
+	var classificationOnce sync.Once
+	settings.SendBufferSettings.beforeContractFailureClassifyForTest = func(id sendSequenceId) {
+		if id.Destination != destination {
+			return
+		}
+		classificationOnce.Do(func() { close(classificationReached) })
+		<-allowClassification
+	}
+	client := NewClient(ctx, clientId, oob, settings)
+	defer client.Cancel()
+
+	client.RouteManager().UpdateTransport(
+		NewSendGatewayTransport(),
+		[]Route{make(chan []byte, 1)},
+	)
+	frame, err := ToFrame(
+		&protocol.SimpleMessage{Content: "exhaust contract wait"},
+		DefaultProtocolVersion,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ackErrs := make(chan error, 1)
+	if !client.SendWithTimeout(frame, destination, func(err error) {
+		ackErrs <- err
+	}, -1) {
+		t.Fatal("the send must enqueue before acquisition exhausts")
+	}
+
+	select {
+	case <-classificationReached:
+	case <-time.After(10 * time.Second):
+		t.Fatal("live exhaustion did not reach the classification boundary")
+	}
+	client.sendBuffer.mutex.Lock()
+	var sequence *SendSequence
+	for id, candidate := range client.sendBuffer.sendSequences {
+		if id.Destination == destination {
+			sequence = candidate
+			break
+		}
+	}
+	client.sendBuffer.mutex.Unlock()
+	if sequence == nil {
+		t.Fatal("the exhausted sequence disappeared before classification")
+	}
+	// The outcome is already a live exhaustion. This later cancellation must
+	// not hide it by consulting the sequence context during classification.
+	sequence.Cancel()
+	close(allowClassification)
+
+	select {
+	case err := <-ackErrs:
+		if err == nil || err.Error() != "No contract" {
+			t.Fatalf("ack error = %v, want live No contract failure", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("exhausted contract wait did not complete its ack callback")
+	}
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("test context ended before the live failure was classified: %v", err)
+	}
+
+	lines := log.errorLinesContaining("exit could not create contract")
+	if len(lines) != 1 {
+		t.Fatalf("live failure diagnostics = %v, want one error line", lines)
+	}
+	if lines := log.verboseLinesContaining("contract creation canceled"); len(lines) != 0 {
+		t.Fatalf("live exhaustion was misclassified as cancellation: %v", lines)
+	}
 }
