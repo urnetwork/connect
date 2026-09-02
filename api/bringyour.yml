@@ -1659,6 +1659,29 @@ paths:
               schema:
                 $ref: "#/components/schemas/NetworkBalanceCodesResult"
 
+  /account/epochs:
+    get:
+      description: |
+        The caller network's finalized epochs, newest first: the points earned
+        inside each epoch's wall-clock window and the network's share of the
+        operator pool in basis points (0 when no coldkey was attached, i.e.
+        points only). `limit` defaults to 26 and is capped at 104.
+      operationId: Account Epochs
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: query
+          name: limit
+          required: false
+          schema:
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountEpochsResult"
+
   /account/referral-code:
     get:
       description: |
@@ -1898,9 +1921,15 @@ paths:
   /sn/wallet:
     post:
       description: |
-        Set the caller network's subnet coldkey - the ss58 address that pool
-        payouts for this network are claimable by. This wallet is deliberately
-        separate from the account payout wallet.
+        Attach the caller's subnet coldkey - the ss58 address that pool payouts
+        are claimable by. Proof of key possession is required: `message` is the
+        single-use challenge issued by POST /auth/wallet-challenge for
+        blockchain TAO and `signature` is the coldkey's sr25519 signature over
+        it. `client_id` scopes the wallet to one provider client (a
+        client-scoped JWT selects its own client). Banned addresses are
+        rejected. Not retroactive: the wallet applies from the next committed
+        epoch's leaf set. This wallet is deliberately separate from the
+        account payout wallet.
       operationId: Sn Set Wallet
       security:
         - BearerAuth: []
@@ -1916,6 +1945,92 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SnSetWalletResult"
+    get:
+      description: |
+        The coldkeys attached inside the caller's network: the network-level
+        wallet (no `client_id`) and every provider client's wallet. `wallet` is
+        the session's effective wallet (the client-scoped wallet for a client
+        session when set, else the network wallet); absent when none is
+        attached. An empty `wallets` list is not an error.
+      operationId: Sn Get Wallet
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnGetWalletResult"
+
+  /sn/wallet/validate:
+    post:
+      description: |
+        Checks an address before it is attached: ss58 syntax with the Bittensor
+        prefix, the operator ban list, and whether the account exists on the
+        subtensor chain. When the chain cannot be reached the result reports
+        `exists_on_chain: true` with a message, so an outage never blocks a
+        user. No authentication; chain lookups are rate limited per source
+        address.
+      operationId: Sn Validate Wallet
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnValidateWalletArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnValidateWalletResult"
+
+  /sn/head:
+    get:
+      description: |
+        The caller network's standing for a head mining spot (Top 200,
+        WHITEPAPER 8.4). `score` is the server's estimate of split-adjusted
+        distinct routable egress-IP breadth from the live trail egress index,
+        `floor` the score of the last network inside `cutoff` (0 while fewer
+        networks score), `rank_estimate` 1-based (0 without a score).
+        `bound`/`hotkey`/`uid` reflect an active head binding. `source` is
+        "server" until validators publish consensus scores on chain; a chain
+        outage degrades to the estimate, never an error.
+      operationId: Sn Head
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnHeadResult"
+
+  /sn/head/binding:
+    post:
+      description: |
+        Store a device's consent for a fleet binding (WHITEPAPER 11.4): the
+        canonical binding payload and the client's Ed25519 signature over its
+        keccak256 digest, optionally with the head hotkey's sr25519 signature.
+        When both signatures verify the response carries the
+        `bindFleetMember` calldata for the operator to submit from their own
+        key. The server never submits on chain.
+      operationId: Sn Head Binding
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnHeadBindingArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnHeadBindingResult"
 
   /sn/pool/claim:
     get:
@@ -4067,6 +4182,12 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/LeaderboardEarner"
+        rank:
+          description: The caller network's leaderboard position (1 = top earner); 0 when the network has no ranked payouts.
+          type: integer
+        total:
+          description: The number of ranked networks.
+          type: integer
         error:
           type: object
           properties:
@@ -4671,12 +4792,235 @@ components:
         - coldkey_ss58
       properties:
         coldkey_ss58:
-          description: The subnet coldkey as an ss58 address.
+          description: The subnet coldkey as an ss58 address (Bittensor prefix 42).
+          type: string
+        client_id:
+          description: uuid of the provider client the wallet is attached to. Defaults to the session client for a client-scoped JWT; must belong to the caller's network.
+          type: string
+        signature:
+          description: The coldkey's sr25519 signature (hex) over `message`. Required for app callers.
+          type: string
+        message:
+          description: The exact single-use challenge text issued by POST /auth/wallet-challenge for blockchain TAO and this address.
           type: string
 
     SnSetWalletResult:
       type: object
       properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    SnWallet:
+      type: object
+      properties:
+        coldkey_ss58:
+          type: string
+        client_id:
+          description: uuid of the provider client; absent for the network-level wallet.
+          type: string
+        set_at_millis:
+          description: Unix time in milliseconds the wallet was set.
+          type: integer
+
+    SnGetWalletResult:
+      type: object
+      properties:
+        wallet:
+          $ref: "#/components/schemas/SnWallet"
+        wallets:
+          type: array
+          items:
+            $ref: "#/components/schemas/SnWallet"
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    SnValidateWalletArgs:
+      type: object
+      required:
+        - address
+      properties:
+        address:
+          description: The ss58 address to check.
+          type: string
+
+    SnValidateWalletResult:
+      type: object
+      properties:
+        valid_syntax:
+          description: The address decodes as ss58 with the Bittensor prefix.
+          type: boolean
+        exists_on_chain:
+          description: The account exists on the subtensor chain (true when the chain could not be reached; see message).
+          type: boolean
+        banned:
+          description: The address is on the operator ban list and must not be attached.
+          type: boolean
+        message:
+          type: string
+
+    AccountEpoch:
+      type: object
+      properties:
+        epoch:
+          type: integer
+        start_millis:
+          description: Epoch window start, unix milliseconds.
+          type: integer
+        end_millis:
+          description: Epoch window end, unix milliseconds.
+          type: integer
+        points:
+          description: Points earned inside the window.
+          type: number
+          format: double
+        share_bps:
+          description: The network's share of the operator pool in basis points; 0 when no coldkey was attached.
+          type: integer
+
+    AccountEpochsResult:
+      type: object
+      properties:
+        epochs:
+          type: array
+          items:
+            $ref: "#/components/schemas/AccountEpoch"
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    SnHeadResult:
+      type: object
+      properties:
+        eligible:
+          description: The estimate places the network inside the cutoff.
+          type: boolean
+        score:
+          description: Split-adjusted distinct routable egress-IP breadth (server estimate).
+          type: number
+          format: double
+        floor:
+          description: Score of the last network inside the cutoff; 0 while fewer networks score.
+          type: number
+          format: double
+        rank_estimate:
+          description: 1-based estimated rank; 0 without a score.
+          type: integer
+        cutoff:
+          description: Head-tier size (200).
+          type: integer
+        bound:
+          description: An active head binding exists for one of the network's clients.
+          type: boolean
+        hotkey:
+          description: The bound head hotkey as ss58; absent when not bound.
+          type: string
+        uid:
+          description: The bound uid; 0 when not bound.
+          type: integer
+        rank:
+          description: The bound network's estimated rank; 0 when not bound.
+          type: integer
+        epoch:
+          description: The current contract epoch.
+          type: integer
+        netuid:
+          type: integer
+        source:
+          description: '"server" (estimate) or "chain" (validator consensus).'
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    SnFleetBinding:
+      type: object
+      description: |
+        protocol.FleetBinding on the wire: 32-byte values as 0x-hex, the
+        hotkey as ss58 or 0x-hex, the client id as its uuid. The digest is
+        keccak256(domain "urnetwork/fleet-binding/v1" + fields).
+      properties:
+        chain_id:
+          type: integer
+        netuid:
+          type: integer
+        coordinator:
+          description: 0x-hex coordinator contract address.
+          type: string
+        fleet_id:
+          type: string
+        hotkey:
+          type: string
+        client_id:
+          description: uuid
+          type: string
+        client_key:
+          description: 0x-hex 32-byte client Ed25519 public key.
+          type: string
+        generation:
+          type: integer
+        valid_from_epoch:
+          type: integer
+        valid_to_epoch:
+          type: integer
+        commitment_hash:
+          type: string
+
+    SnHeadBindingArgs:
+      type: object
+      required:
+        - binding
+        - client_signature
+      properties:
+        binding:
+          $ref: "#/components/schemas/SnFleetBinding"
+        client_signature:
+          description: The device's Ed25519 signature (hex) over the binding digest; `signature` is accepted as an alias.
+          type: string
+        signature:
+          type: string
+        hotkey_signature:
+          description: The head hotkey's sr25519 signature (hex) over the same digest; optional, required for calldata.
+          type: string
+        hotkey:
+          description: Optional override of the binding's hotkey (ss58 or 0x-hex).
+          type: string
+
+    SnHeadBindingResult:
+      type: object
+      properties:
+        digest:
+          description: 0x-hex keccak256 binding digest.
+          type: string
+        client_signature_valid:
+          type: boolean
+        hotkey_signature_valid:
+          type: boolean
+        ready:
+          description: Both signatures verified and calldata is present.
+          type: boolean
+        calldata:
+          description: 0x-hex `bindFleetMember` calldata for the operator to submit.
+          type: string
+        to:
+          description: The coordinator contract address to send the calldata to.
+          type: string
+        data:
+          description: Same as calldata.
+          type: string
+        contract_address:
+          type: string
+        chain_id:
+          type: integer
         error:
           type: object
           properties:
@@ -4744,6 +5088,17 @@ components:
           type: integer
         contract_address:
           description: 0x-hex EVM address of the subnet contract.
+          type: string
+        settlement_vault_address:
+          description: 0x-hex EVM address of the settlement vault claims are sent to; absent when unset.
+          type: string
+        no_id:
+          description: The operator id (decimal string); absent when unset.
+          type: string
+        netuid:
+          type: integer
+        rpc_url:
+          description: Public subtensor EVM JSON-RPC url for clients; absent when unset.
           type: string
 
     RefreshTokenResult:
