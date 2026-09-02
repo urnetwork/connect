@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"slices"
 	"sync"
 	"time"
@@ -140,9 +141,12 @@ type packetTranslation struct {
 
 	deadlineLock         sync.Mutex
 	readDeadline         time.Time
+	readDeadlineWakeup   bool
 	writeDeadline        time.Time
 	readDeadlineMonitor  *Monitor
 	writeDeadlineMonitor *Monitor
+
+	deadlineAfterForTest func(time.Duration) <-chan time.Time
 }
 
 func NewPacketTranslation(
@@ -842,16 +846,60 @@ func (self *packetTranslation) handleDnsOther(packetData []byte, addr net.Addr) 
 	return
 }
 
-func (self *packetTranslation) currentReadDeadline() (time.Time, <-chan struct{}) {
+func (self *packetTranslation) currentReadDeadline() (time.Time, bool, <-chan struct{}) {
 	self.deadlineLock.Lock()
 	defer self.deadlineLock.Unlock()
-	return self.readDeadline, self.readDeadlineMonitor.NotifyChannel()
+	return self.readDeadline, self.readDeadlineWakeup, self.readDeadlineMonitor.NotifyChannel()
 }
 
 func (self *packetTranslation) currentWriteDeadline() (time.Time, <-chan struct{}) {
 	self.deadlineLock.Lock()
 	defer self.deadlineLock.Unlock()
 	return self.writeDeadline, self.writeDeadlineMonitor.NotifyChannel()
+}
+
+// deadlineAfter returns the timeout signal used by PacketConn deadline waits.
+// The test seam makes timer-driven branches deterministic without changing
+// production deadline behavior.
+func (self *packetTranslation) deadlineAfter(timeout time.Duration) <-chan time.Time {
+	if self.deadlineAfterForTest != nil {
+		return self.deadlineAfterForTest(timeout)
+	}
+	return time.After(timeout)
+}
+
+// packetTranslationDeadlineError preserves the net.PacketConn deadline error
+// contract while identifying which operation expired.
+func packetTranslationDeadlineError(operation string) error {
+	return &net.OpError{
+		Op:  operation,
+		Net: "packet translation",
+		Err: os.ErrDeadlineExceeded,
+	}
+}
+
+// packetTranslationClosedError preserves the net.PacketConn closed-connection
+// contract for operations released by packet translation shutdown.
+func packetTranslationClosedError(operation string) error {
+	return &net.OpError{
+		Op:  operation,
+		Net: "packet translation",
+		Err: net.ErrClosed,
+	}
+}
+
+// logReadDeadline distinguishes an elapsed read deadline from an already
+// expired deadline used to wake a blocked PacketConn reader. quic-go uses the
+// latter during Transport.Close; retain it at V(1) without reporting a
+// misleading operational timeout at INFO.
+func (self *packetTranslation) logReadDeadline(wakeup bool) {
+	if wakeup {
+		if verbose := self.log.V(1); verbose.Enabled() {
+			verbose.Infof("[pt]read packet deadline wakeup\n")
+		}
+		return
+	}
+	self.log.Infof("[pt]read packet timeout\n")
 }
 
 // waitForWireWrite keeps PacketConn.WriteTo synchronous with the translated
@@ -882,7 +930,7 @@ func (self *packetTranslation) waitForWireWrite(
 				}
 				return packetByteCount, nil
 			case <-self.ctx.Done():
-				return 0, fmt.Errorf("Done.")
+				return 0, packetTranslationClosedError("write")
 			case <-deadlineChanged:
 			}
 			continue
@@ -891,7 +939,7 @@ func (self *packetTranslation) waitForWireWrite(
 		timeout := time.Until(writeDeadline)
 		if timeout <= 0 {
 			self.log.Infof("[pt]write packet timeout\n")
-			return 0, fmt.Errorf("Timeout.")
+			return 0, packetTranslationDeadlineError("write")
 		}
 		select {
 		case err := <-writeResult:
@@ -900,10 +948,10 @@ func (self *packetTranslation) waitForWireWrite(
 			}
 			return packetByteCount, nil
 		case <-self.ctx.Done():
-			return 0, fmt.Errorf("Done.")
-		case <-time.After(timeout):
+			return 0, packetTranslationClosedError("write")
+		case <-self.deadlineAfter(timeout):
 			self.log.Infof("[pt]write packet timeout\n")
-			return 0, fmt.Errorf("Timeout.")
+			return 0, packetTranslationDeadlineError("write")
 		case <-deadlineChanged:
 		}
 	}
@@ -911,7 +959,7 @@ func (self *packetTranslation) waitForWireWrite(
 
 func (self *packetTranslation) WriteTo(packetData []byte, addr net.Addr) (n int, err error) {
 	if !self.beginOperation() {
-		return 0, fmt.Errorf("Done.")
+		return 0, packetTranslationClosedError("write")
 	}
 	defer self.operationWg.Done()
 
@@ -936,7 +984,7 @@ func (self *packetTranslation) WriteTo(packetData []byte, addr net.Addr) (n int,
 		if writeDeadline.IsZero() {
 			select {
 			case <-self.ctx.Done():
-				err = fmt.Errorf("Done.")
+				err = packetTranslationClosedError("write")
 				return
 			case self.out <- p:
 				queued = true
@@ -949,7 +997,7 @@ func (self *packetTranslation) WriteTo(packetData []byte, addr net.Addr) (n int,
 
 		timeout := writeDeadline.Sub(time.Now())
 		if timeout <= 0 {
-			err = fmt.Errorf("Timeout.")
+			err = packetTranslationDeadlineError("write")
 			self.log.Infof("[pt]write packet timeout\n")
 			return
 		}
@@ -957,7 +1005,7 @@ func (self *packetTranslation) WriteTo(packetData []byte, addr net.Addr) (n int,
 		// complete now does not need to allocate a timer.
 		select {
 		case <-self.ctx.Done():
-			err = fmt.Errorf("Done.")
+			err = packetTranslationClosedError("write")
 			return
 		case self.out <- p:
 			queued = true
@@ -969,14 +1017,14 @@ func (self *packetTranslation) WriteTo(packetData []byte, addr net.Addr) (n int,
 		}
 		select {
 		case <-self.ctx.Done():
-			err = fmt.Errorf("Done.")
+			err = packetTranslationClosedError("write")
 			return
 		case self.out <- p:
 			queued = true
 			self.log.V(2).Infof("[pt]write packet\n")
 			return self.waitForWireWrite(p.writeResult, len(packetData))
-		case <-time.After(timeout):
-			err = fmt.Errorf("Timeout.")
+		case <-self.deadlineAfter(timeout):
+			err = packetTranslationDeadlineError("write")
 			self.log.Infof("[pt]write packet timeout\n")
 			return
 		case <-deadlineChanged:
@@ -986,16 +1034,16 @@ func (self *packetTranslation) WriteTo(packetData []byte, addr net.Addr) (n int,
 
 func (self *packetTranslation) ReadFrom(packetData []byte) (n int, addr net.Addr, err error) {
 	if !self.beginOperation() {
-		return 0, nil, fmt.Errorf("Done.")
+		return 0, nil, packetTranslationClosedError("read")
 	}
 	defer self.operationWg.Done()
 
 	for {
-		readDeadline, deadlineChanged := self.currentReadDeadline()
+		readDeadline, deadlineWakeup, deadlineChanged := self.currentReadDeadline()
 		if readDeadline.IsZero() {
 			select {
 			case <-self.ctx.Done():
-				err = fmt.Errorf("Done.")
+				err = packetTranslationClosedError("read")
 				return
 			case p := <-self.in:
 				addr = p.addr
@@ -1010,15 +1058,15 @@ func (self *packetTranslation) ReadFrom(packetData []byte) (n int, addr net.Addr
 
 		timeout := readDeadline.Sub(time.Now())
 		if timeout <= 0 {
-			err = fmt.Errorf("Timeout.")
-			self.log.Infof("[pt]read packet timeout\n")
+			err = packetTranslationDeadlineError("read")
+			self.logReadDeadline(deadlineWakeup)
 			return
 		}
 		// Ready fast path: preserve expired-deadline behavior while avoiding a
 		// timer allocation when a packet is already queued.
 		select {
 		case <-self.ctx.Done():
-			err = fmt.Errorf("Done.")
+			err = packetTranslationClosedError("read")
 			return
 		case p := <-self.in:
 			addr = p.addr
@@ -1032,7 +1080,7 @@ func (self *packetTranslation) ReadFrom(packetData []byte) (n int, addr net.Addr
 		}
 		select {
 		case <-self.ctx.Done():
-			err = fmt.Errorf("Done.")
+			err = packetTranslationClosedError("read")
 			return
 		case p := <-self.in:
 			addr = p.addr
@@ -1040,9 +1088,9 @@ func (self *packetTranslation) ReadFrom(packetData []byte) (n int, addr net.Addr
 			MessagePoolReturn(p.data)
 			self.log.V(2).Infof("[pt]read packet\n")
 			return
-		case <-time.After(timeout):
-			err = fmt.Errorf("Timeout.")
-			self.log.Infof("[pt]read packet timeout\n")
+		case <-self.deadlineAfter(timeout):
+			err = packetTranslationDeadlineError("read")
+			self.logReadDeadline(deadlineWakeup)
 			return
 		case <-deadlineChanged:
 		}
@@ -1057,6 +1105,7 @@ func (self *packetTranslation) SetDeadline(t time.Time) error {
 	self.deadlineLock.Lock()
 	defer self.deadlineLock.Unlock()
 	self.readDeadline = t
+	self.readDeadlineWakeup = !t.IsZero() && !t.After(time.Now())
 	self.writeDeadline = t
 	self.readDeadlineMonitor.NotifyAll()
 	self.writeDeadlineMonitor.NotifyAll()
@@ -1067,6 +1116,7 @@ func (self *packetTranslation) SetReadDeadline(t time.Time) error {
 	self.deadlineLock.Lock()
 	defer self.deadlineLock.Unlock()
 	self.readDeadline = t
+	self.readDeadlineWakeup = !t.IsZero() && !t.After(time.Now())
 	self.readDeadlineMonitor.NotifyAll()
 	return nil
 }
