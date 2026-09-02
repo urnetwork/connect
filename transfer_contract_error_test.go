@@ -11,9 +11,8 @@ import (
 
 // contractErrorOob answers every CreateContract with a terminal error result
 // until `errorCount` errors have been sent, then grants valid contracts. It
-// models the platform answering an unsatisfiable request — no balance, or a
-// companion request whose origin contract does not exist — which it does with
-// one error frame per request.
+// models the platform answering a retryable account/setup request with the
+// legacy InsufficientBalance result, one error frame per request.
 type contractErrorOob struct {
 	clientId Id
 	// answer this many requests with an error; < 0 means all of them
@@ -35,9 +34,9 @@ func (self *contractErrorOob) SendControl(frames []*protocol.Frame, callback fun
 
 		if self.errorCount < 0 || self.errorsSent.Load() < self.errorCount {
 			self.errorsSent.Add(1)
-			// the platform's answer for every unsatisfiable cause (see
-			// controller nextContract: "The client sees only
-			// InsufficientBalance, including unrelated failures")
+			// Legacy and account failures use InsufficientBalance. A distinct
+			// Reliability result is tested at the multi-client window boundary;
+			// it is intentionally terminal for that selected route.
 			contractError := protocol.ContractError_InsufficientBalance
 			result := &protocol.CreateContractResult{
 				Error: &contractError,
@@ -91,19 +90,13 @@ func contractErrorTestSettings() *ClientSettings {
 // TestSendSequenceSurvivesTransientContractErrors pins that transient error
 // results followed by a granted contract must not break the send.
 //
-// This is the normal path in live setups: the platform answers CreateContract
-// with terminal-LOOKING errors during setup races (balance/provide
-// propagation; a companion request that beats its origin contract) and then
-// starts granting. The platform collapses every cause into
-// ContractError_InsufficientBalance on the wire, so the client cannot tell
-// hopeless from not-yet — which is precisely why a client-side fail-fast on
-// repeated error results is WRONG: a 3-consecutive-errors exit was tried here
-// and broke five server/proxy integration tests whose contract acquisition
-// legitimately errors a few times before succeeding. The 30s blind wait it
-// targeted (see the create loop's CreateContractTimeout) is instead mitigated
-// at the detection layer, which reclaims a window client whose return path is
-// dead regardless of cause. Do not reintroduce a fail-fast without a
-// platform-side error-cause distinction on the wire.
+// This remains a normal path in live setups: balance and legacy setup failures
+// can look terminal for a few attempts and then start granting. That is why a
+// generic client-side fail-fast on repeated error results is wrong: a
+// 3-consecutive-errors exit was tried here and broke five server/proxy
+// integration tests whose contract acquisition legitimately errors before
+// succeeding. Only the platform's explicit ContractError_Reliability verdict
+// is allowed to retire a multi-client route.
 func TestSendSequenceSurvivesTransientContractErrors(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

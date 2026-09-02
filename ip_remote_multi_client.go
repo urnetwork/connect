@@ -9877,6 +9877,40 @@ func (self *multiClientWindow) contractStatus(contractStatus *ContractStatus) {
 	}
 }
 
+var errContractReliability = errors.New("Contract reliability failure.")
+
+// contractStatusMatchesClient keeps a reliability result scoped to the exact
+// window client whose destination requested the contract. A ContractManager is
+// owned by one channel, but the explicit key check makes that ownership
+// invariant fail closed if the manager ever starts carrying other routes.
+func contractStatusMatchesClient(client *multiClientChannel, status *ContractStatus) bool {
+	if client == nil || client.args == nil || status == nil || client.args.Destination.Len() == 0 {
+		return false
+	}
+	return status.Key.Destination.DestinationId == client.args.Destination.Tail()
+}
+
+// contractStatusFromClient receives the status together with the channel that
+// emitted it. Reliability is the platform's authoritative statement that the
+// selected destination is no longer a usable route: exclude that channel from
+// new-flow selection immediately, make its WindowStats terminal, and wake the
+// ordinary resize path to remove it, migrate eligible flows, and backfill the
+// window. Other contract errors are account, policy, setup, or trust results;
+// they remain observable but cannot poison provider selection.
+func (self *multiClientWindow) contractStatusFromClient(client *multiClientChannel, status *ContractStatus) {
+	if contractStatusMatchesClient(client, status) &&
+		status.Error != nil &&
+		*status.Error == protocol.ContractError_Reliability {
+		client.setWarning(true, warnUnhealthy)
+		client.addError(errContractReliability)
+		if self.resizeMonitor != nil {
+			self.resizeMonitor.NotifyAll()
+		}
+	}
+
+	self.contractStatus(status)
+}
+
 func (self *multiClientWindow) AddContractStatsCallback(contractStatsCallback ContractStatsFunction) func() {
 	callbackId := self.contractStatsCallbacks.Add(contractStatsCallback)
 	return func() {
@@ -11049,6 +11083,7 @@ func (self *multiClientWindow) expand(
 			// constructor signature stays put (nil falls back per-packet)
 			args.ReceivePackets = self.clientReceivePacketsCallback
 			args.NetworkPeerDestination = self.networkPeerDestination
+			args.contractStatus = self.contractStatusFromClient
 			// the evaluation epoch, not the window ctx: identical between
 			// rebuilds, and what lets the outcome rebuild fail every
 			// in-flight candidate fast (see evalEpochContext)
@@ -11759,6 +11794,12 @@ type multiClientChannelArgs struct {
 	// selected a trusted same-network peer and the entire multi-client uses
 	// the Network relationship.
 	NetworkPeerDestination bool
+
+	// contractStatus preserves the identity of the channel whose contract
+	// manager emitted a result. The public constructor callback does not carry
+	// that identity; the owning window needs it to retire only the failed route.
+	// nil keeps directly constructed test channels on the legacy relay path.
+	contractStatus func(client *multiClientChannel, status *ContractStatus)
 }
 
 // clientReceivePacketsFunction is the batch form of
@@ -12305,44 +12346,6 @@ func newMultiClientChannel(
 		client.webRtcManager.PrioritizePeer(args.Destination.Tail())
 	}
 
-	// contractStatusCallback is multiClientWindow.contractStatus, which performs
-	// only bounded Dispatch into the window-owned coalescer. Register that exact
-	// internal shape directly so every exit does not allocate its own goroutine
-	// and packet-sequence-sized status ring.
-	contractStatusSub := client.ContractManager().addContractStatusDispatchCallback(contractStatusCallback)
-	contractStatsSub := client.ContractManager().AddContractStatsCallback(contractStatsCallback)
-	peerIdentitySub := client.EncryptionSessionManager().AddPeerIdentityChangeCallback(peerIdentityChangeCallback)
-	go HandleError(func() {
-		select {
-		case <-cancelCtx.Done():
-		case <-client.Done():
-		}
-		// Essential cleanup first, observer-facing events after. A stats
-		// observer can remain parked (an app suspended mid-callback), and
-		// CloseContractStats dispatches to it SYNCHRONOUSLY — ordering it
-		// first let a parked observer block RemoveClientWithArgs, retaining
-		// the platform identity and another client/transport record on every
-		// peer churn. See TestMultiClientCleanupPrecedesBlockedObservers.
-		contractStatusSub()
-		peerIdentitySub()
-		// Detach the platform transport before the synchronous local teardown.
-		// The API generator retires the derived identity asynchronously after
-		// Client and OOB cleanup have joined, so a slow Pion close never blocks
-		// this path and the final contract-close controls retain valid auth.
-		generator.RemoveClientWithArgs(client, &args.MultiClientGeneratorClientArgs)
-		client.Cancel()
-		// Fire the contract-close events for this client's still-open
-		// contracts while the stats listener is still attached, or a removed
-		// peer's contracts linger open forever in the contract-details UI.
-		// The client is already cancelled — that is what woke this cleanup —
-		// and CloseAllContractStats is the deterministic synchronous backstop
-		// that emits regardless of the stopped epoch worker.
-		client.CloseContractStats()
-		contractStatsSub()
-		// the removed client's established peers leave the aggregate set
-		peerIdentityChangeCallback()
-	}, cancel)
-
 	// sourceFilter := map[TransferPath]bool{
 	//     Path{ClientId:args.DestinationId}: true,
 	// }
@@ -12383,6 +12386,54 @@ func newMultiClientChannel(
 		// affinityCount:             0,
 		// affinityTime:              time.Time{},
 	}
+
+	// The window-owned callback includes this channel's identity so a typed
+	// reliability failure can retire only its source. Direct constructor users
+	// leave it nil and retain the original public status relay.
+	effectiveContractStatusCallback := contractStatusCallback
+	if args.contractStatus != nil {
+		effectiveContractStatusCallback = func(status *ContractStatus) {
+			args.contractStatus(clientChannel, status)
+		}
+	}
+	// The callback performs only bounded Dispatch into the window-owned
+	// coalescer plus constant-time reliability classification. Register it
+	// directly so every exit does not allocate its own goroutine and
+	// packet-sequence-sized status ring.
+	contractStatusSub := client.ContractManager().addContractStatusDispatchCallback(effectiveContractStatusCallback)
+	contractStatsSub := client.ContractManager().AddContractStatsCallback(contractStatsCallback)
+	peerIdentitySub := client.EncryptionSessionManager().AddPeerIdentityChangeCallback(peerIdentityChangeCallback)
+	go HandleError(func() {
+		select {
+		case <-cancelCtx.Done():
+		case <-client.Done():
+		}
+		// Essential cleanup first, observer-facing events after. A stats
+		// observer can remain parked (an app suspended mid-callback), and
+		// CloseContractStats dispatches to it SYNCHRONOUSLY — ordering it
+		// first let a parked observer block RemoveClientWithArgs, retaining
+		// the platform identity and another client/transport record on every
+		// peer churn. See TestMultiClientCleanupPrecedesBlockedObservers.
+		contractStatusSub()
+		peerIdentitySub()
+		// Detach the platform transport before the synchronous local teardown.
+		// The API generator retires the derived identity asynchronously after
+		// Client and OOB cleanup have joined, so a slow Pion close never blocks
+		// this path and the final contract-close controls retain valid auth.
+		generator.RemoveClientWithArgs(client, &args.MultiClientGeneratorClientArgs)
+		client.Cancel()
+		// Fire the contract-close events for this client's still-open
+		// contracts while the stats listener is still attached, or a removed
+		// peer's contracts linger open forever in the contract-details UI.
+		// The client is already cancelled — that is what woke this cleanup —
+		// and CloseAllContractStats is the deterministic synchronous backstop
+		// that emits regardless of the stopped epoch worker.
+		client.CloseContractStats()
+		contractStatsSub()
+		// the removed client's established peers leave the aggregate set
+		peerIdentityChangeCallback()
+	}, cancel)
+
 	go HandleError(clientChannel.detectBlackhole, cancel)
 	go HandleError(clientChannel.ping, cancel)
 

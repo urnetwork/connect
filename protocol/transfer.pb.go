@@ -213,6 +213,11 @@ const (
 	ContractError_Setup               ContractError = 2
 	ContractError_Trust               ContractError = 3
 	ContractError_Invalid             ContractError = 4
+	// The requested destination is no longer a reliable route. Unlike an
+	// account or authorization error, this is actionable by a multi-client:
+	// retire the exact window client that produced the result and choose a
+	// replacement.
+	ContractError_Reliability ContractError = 5
 )
 
 // Enum value maps for ContractError.
@@ -223,6 +228,7 @@ var (
 		2: "Setup",
 		3: "Trust",
 		4: "Invalid",
+		5: "Reliability",
 	}
 	ContractError_value = map[string]int32{
 		"NoPermission":        0,
@@ -230,6 +236,7 @@ var (
 		"Setup":               2,
 		"Trust":               3,
 		"Invalid":             4,
+		"Reliability":         5,
 	}
 )
 
@@ -2828,13 +2835,14 @@ const file_transfer_proto_rawDesc = "" +
 	"\bSdpOffer\x10\x01\x12\r\n" +
 	"\tSdpAnswer\x10\x02\x12\x10\n" +
 	"\fIceCandidate\x10\x03\x12\x16\n" +
-	"\x12WaitingForSdpOffer\x10\x04*]\n" +
+	"\x12WaitingForSdpOffer\x10\x04*n\n" +
 	"\rContractError\x12\x10\n" +
 	"\fNoPermission\x10\x00\x12\x17\n" +
 	"\x13InsufficientBalance\x10\x01\x12\t\n" +
 	"\x05Setup\x10\x02\x12\t\n" +
 	"\x05Trust\x10\x03\x12\v\n" +
-	"\aInvalid\x10\x04*\x97\x01\n" +
+	"\aInvalid\x10\x04\x12\x0f\n" +
+	"\vReliability\x10\x05*\x97\x01\n" +
 	"\x14EncryptedControlType\x12\x18\n" +
 	"\x14EncryptedControlNone\x10\x00\x12\x1d\n" +
 	"\x19EncryptedControlHandshake\x10\x01\x12!\n" +

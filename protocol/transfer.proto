@@ -355,6 +355,11 @@ enum ContractError {
     Setup = 2;
     Trust = 3;
     Invalid = 4;
+    // The requested destination is no longer a reliable route. Unlike an
+    // account or authorization error, this is actionable by a multi-client:
+    // retire the exact window client that produced the result and choose a
+    // replacement.
+    Reliability = 5;
 }
 
 
