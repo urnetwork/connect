@@ -310,12 +310,11 @@ func (self *ResilientTlsConn) Write(b []byte) (int, error) {
 							if self.fragment && self.reorder {
 								tcpConn.SetNoDelay(true)
 
-								f, err := tcpConn.File()
+								fd, closeFd, err := duplicateSocketHandle(tcpConn)
 								if err != nil {
 									return 0, err
 								}
-								fd := SocketHandle(f.Fd())
-								defer f.Close()
+								defer closeFd()
 
 								nativeTtl := GetSocketTtl(fd)
 								if nativeTtl <= 0 {
@@ -329,8 +328,7 @@ func (self *ResilientTlsConn) Write(b []byte) (int, error) {
 									continue
 								}
 								// restore the TTL on every exit after this point,
-								// including fragment-write failures; defer LIFO
-								// runs it before f.Close() closes the dup'd fd.
+								// including fragment-write failures.
 								// Best effort: a defer has nobody to report to
 								defer func() { _ = self.applyTtl(fd, nativeTtl) }()
 
@@ -395,12 +393,11 @@ func (self *ResilientTlsConn) Write(b []byte) (int, error) {
 
 								tcpConn.SetNoDelay(true)
 
-								f, err := tcpConn.File()
+								fd, closeFd, err := duplicateSocketHandle(tcpConn)
 								if err != nil {
 									return 0, err
 								}
-								fd := SocketHandle(f.Fd())
-								defer f.Close()
+								defer closeFd()
 
 								nativeTtl := GetSocketTtl(fd)
 								if nativeTtl <= 0 {
@@ -412,8 +409,7 @@ func (self *ResilientTlsConn) Write(b []byte) (int, error) {
 									continue
 								}
 								// restore the TTL on every exit after this point,
-								// including block-write failures; defer LIFO
-								// runs it before f.Close() closes the dup'd fd.
+								// including block-write failures.
 								// Best effort: a defer has nobody to report to
 								defer func() { _ = self.applyTtl(fd, nativeTtl) }()
 

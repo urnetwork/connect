@@ -55,10 +55,11 @@ func TestWebRtcPeerConnectionFactoryUsesCallerOwnedNetwork(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer factory.Close()
-	peerConnection, err := factory.NewPeerConnection(false)
+	peerConnection, cancelResolve, err := factory.NewPeerConnection(false)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer cancelResolve()
 	if _, err := peerConnection.CreateDataChannel("network-seam", nil); err != nil {
 		peerConnection.Close()
 		t.Fatal(err)

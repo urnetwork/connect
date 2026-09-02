@@ -81,7 +81,10 @@ func egressAwareResolver(custom *net.Resolver) *net.Resolver {
 func resolveEgressUDPAddr(ctx context.Context, addr string) (*net.UDPAddr, error) {
 	resolver := egressResolver()
 	if resolver == nil || !egressBound() {
-		return net.ResolveUDPAddr("udp", addr)
+		// Keep the platform resolver but not net.ResolveUDPAddr: the caller
+		// supplied a lifecycle context specifically so a transport shutdown can
+		// interrupt a name lookup.
+		resolver = net.DefaultResolver
 	}
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {

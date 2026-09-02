@@ -310,7 +310,7 @@ func TestWebRtcPeerRunStartupFailureRetiresAdmissionSynchronously(t *testing.T) 
 		true,
 		newSignalPipe(nil),
 		settings,
-		func() (*webrtc.PeerConnection, error) {
+		func() (*webrtc.PeerConnection, context.CancelFunc, error) {
 			return factory.NewPeerConnection(false)
 		},
 	)
@@ -4909,6 +4909,46 @@ func TestWebRtcPeerTeardownStopsTransportBeforePeerConnection(t *testing.T) {
 	}
 }
 
+// The pre-close interrupt must target DTLS, whose connection is the SCTP read
+// boundary. ICE Stop closes and joins its mux/agent readers; the production
+// failure left teardown parked in that join before PeerConnection.Close could
+// release SCTP. A pristine PeerConnection makes the selected layer observable:
+// stopping DTLS changes only DTLS state, while the old ICE callback closed ICE.
+func TestWebRtcPeerConnectionPrecloseStopsDtlsWithoutJoiningIce(t *testing.T) {
+	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+
+	sctpTransport := pc.SCTP()
+	if sctpTransport == nil {
+		t.Fatal("PeerConnection has no SCTP transport")
+	}
+	dtlsTransport := sctpTransport.Transport()
+	if dtlsTransport == nil {
+		t.Fatal("SCTP transport has no DTLS transport")
+	}
+	iceTransport := dtlsTransport.ICETransport()
+	if iceTransport == nil {
+		t.Fatal("DTLS transport has no ICE transport")
+	}
+
+	stopTransport := webRtcPeerConnectionTransportStop(pc)
+	if stopTransport == nil {
+		t.Fatal("native PeerConnection has no pre-close transport stop")
+	}
+	if err := stopTransport(); err != nil {
+		t.Fatal(err)
+	}
+	if got := dtlsTransport.State(); got != webrtc.DTLSTransportStateClosed {
+		t.Fatalf("DTLS state after pre-close = %s, want closed", got)
+	}
+	if got := iceTransport.State(); got == webrtc.ICETransportStateClosed {
+		t.Fatal("pre-close joined ICE instead of interrupting the SCTP-facing DTLS transport")
+	}
+}
+
 func TestWebRtcPeerTeardownStillClosesPeerAfterTransportStopError(t *testing.T) {
 	stopError := errors.New("transport stop failure")
 	peerClosed := false
@@ -6031,10 +6071,11 @@ func BenchmarkCreateWebRtcPeerConnection(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		pc, err := factory.NewPeerConnection(false)
+		pc, cancelResolve, err := factory.NewPeerConnection(false)
 		if err != nil {
 			b.Fatal(err)
 		}
+		cancelResolve()
 		if err := pc.Close(); err != nil {
 			b.Fatal(err)
 		}
@@ -6055,10 +6096,11 @@ func BenchmarkWebRtcPeerConnectionFactoryReuse(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		pc, err := factory.NewPeerConnection(false)
+		pc, cancelResolve, err := factory.NewPeerConnection(false)
 		if err != nil {
 			b.Fatal(err)
 		}
+		cancelResolve()
 		if err := pc.Close(); err != nil {
 			b.Fatal(err)
 		}
@@ -6090,10 +6132,11 @@ func BenchmarkWebRtcPeerConnectionFactoryRebuildWithCertificate(b *testing.B) {
 		if nextCertificate != certificate {
 			b.Fatal("factory rebuild replaced certificate")
 		}
-		pc, createErr := factory.NewPeerConnection(false)
+		pc, cancelResolve, createErr := factory.NewPeerConnection(false)
 		if createErr != nil {
 			b.Fatal(createErr)
 		}
+		cancelResolve()
 		if err := pc.Close(); err != nil {
 			b.Fatal(err)
 		}

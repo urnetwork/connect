@@ -4,9 +4,14 @@ package connect
 
 import (
 	"errors"
+	"net"
 )
 
 type SocketHandle = int
+
+func duplicateSocketHandle(conn *net.TCPConn) (SocketHandle, func(), error) {
+	return 0, nil, errors.ErrUnsupported
+}
 
 func GetSocketTtl(fd SocketHandle) int {
 	// not supported

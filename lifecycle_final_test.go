@@ -1239,8 +1239,9 @@ func TestPeerConnPionStartupAndTeardownAreSerialized(t *testing.T) {
 		true,
 		consumingLifecycleSignalSender{},
 		settings,
-		func() (*webrtc.PeerConnection, error) {
-			return webrtc.NewPeerConnection(webrtc.Configuration{})
+		func() (*webrtc.PeerConnection, context.CancelFunc, error) {
+			pc, createErr := webrtc.NewPeerConnection(webrtc.Configuration{})
+			return pc, func() {}, createErr
 		},
 	)
 	if err != nil {
@@ -1287,8 +1288,9 @@ func TestPeerConnPionRegistrationUsesCallbackGate(t *testing.T) {
 		false,
 		consumingLifecycleSignalSender{},
 		settings,
-		func() (*webrtc.PeerConnection, error) {
-			return webrtc.NewPeerConnection(webrtc.Configuration{})
+		func() (*webrtc.PeerConnection, context.CancelFunc, error) {
+			pc, createErr := webrtc.NewPeerConnection(webrtc.Configuration{})
+			return pc, func() {}, createErr
 		},
 	)
 	if err != nil {
@@ -1421,8 +1423,9 @@ func TestPeerConnFastPathRtcpUsesOwnedWorker(t *testing.T) {
 		false,
 		consumingLifecycleSignalSender{},
 		settings,
-		func() (*webrtc.PeerConnection, error) {
-			return api.NewPeerConnection(webrtc.Configuration{})
+		func() (*webrtc.PeerConnection, context.CancelFunc, error) {
+			pc, createErr := api.NewPeerConnection(webrtc.Configuration{})
+			return pc, func() {}, createErr
 		},
 	)
 	if err != nil {
