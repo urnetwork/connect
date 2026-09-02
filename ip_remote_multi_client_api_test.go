@@ -19,6 +19,8 @@ import (
 	"testing"
 	"time"
 
+	gojwt "github.com/golang-jwt/jwt/v5"
+
 	"github.com/urnetwork/connect/protocol"
 )
 
@@ -96,6 +98,88 @@ func TestNextDestinationsRetainsMaximumIntermediariesAndDestination(t *testing.T
 		}
 		if !slices.Equal(stats.ReputationFailures, []string{"bloomberg", "canva"}) {
 			t.Fatalf("reputation failures=%q, want normalized Bloomberg/Canva", stats.ReputationFailures)
+		}
+	}
+}
+
+// A DeviceLocal refreshes its top-level client JWT independently of an
+// already-running destination window. Later expansion and retirement must use
+// that refreshed credential; keeping the generator's constructor JWT turns
+// healthy long-lived sessions into 401s once the old token expires.
+func TestApiMultiClientGeneratorUsesRefreshedJwtForFutureClientLifecycle(t *testing.T) {
+	derivedClientId := NewId()
+	derivedToken := gojwt.NewWithClaims(gojwt.SigningMethodHS256, gojwt.MapClaims{
+		"client_id": derivedClientId.String(),
+	})
+	derivedJwt, err := derivedToken.SignedString([]byte("test-only-key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type requestAuth struct {
+		path          string
+		authorization string
+	}
+	requests := make(chan requestAuth, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/hello":
+			w.WriteHeader(http.StatusOK)
+		case "/network/auth-client":
+			requests <- requestAuth{path: request.URL.Path, authorization: request.Header.Get("Authorization")}
+			_ = json.NewEncoder(w).Encode(&AuthNetworkClientResult{
+				ByClientJwt: derivedJwt,
+			})
+		case "/network/remove-client":
+			requests <- requestAuth{path: request.URL.Path, authorization: request.Header.Get("Authorization")}
+			_, _ = w.Write([]byte("{}"))
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	strategySettings := DefaultClientStrategySettings()
+	strategySettings.EnableNormal = true
+	strategySettings.EnableResilient = false
+	strategySettings.RequestTimeout = time.Second
+	strategy := NewClientStrategy(ctx, strategySettings)
+	generator := NewApiMultiClientGenerator(
+		ctx,
+		nil,
+		strategy,
+		nil,
+		server.URL,
+		"constructor-jwt",
+		server.URL,
+		"test-description",
+		"test-spec",
+		"0.0.0-test",
+		nil,
+		DefaultClientSettings,
+		DefaultApiMultiClientGeneratorSettings(),
+	)
+	generator.SetByJwt("refreshed-jwt")
+
+	args, err := generator.NewClientArgsContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generator.RemoveClientArgs(args)
+
+	for _, wantPath := range []string{"/network/auth-client", "/network/remove-client"} {
+		select {
+		case request := <-requests:
+			if request.path != wantPath {
+				t.Fatalf("request path = %q, want %q", request.path, wantPath)
+			}
+			if request.authorization != "Bearer refreshed-jwt" {
+				t.Fatalf("%s authorization = %q, want refreshed JWT", request.path, request.authorization)
+			}
+		case <-ctx.Done():
+			t.Fatalf("waiting for %s: %v", wantPath, ctx.Err())
 		}
 	}
 }
@@ -484,5 +568,56 @@ func TestApiMultiClientGeneratorCloseAndWaitJoinsGeneratedClientRetirement(t *te
 		}
 	case <-ctx.Done():
 		t.Fatalf("wait for generated client retirement: %v", ctx.Err())
+	}
+}
+
+// A destination generator is replaced while its parent DeviceLocal remains
+// alive. Its own API and identity workers must end at generator retirement;
+// otherwise every reconnect retains one loader/writer tree until the entire
+// device closes.
+func TestApiMultiClientGeneratorCloseCancelsOwnedIdentityWorkers(t *testing.T) {
+	parentCtx, parentCancel := context.WithCancel(context.Background())
+	defer parentCancel()
+	strategy := NewClientStrategy(parentCtx, DefaultClientStrategySettings())
+	generator := NewApiMultiClientGenerator(
+		parentCtx,
+		nil,
+		strategy,
+		nil,
+		"http://127.0.0.1:1",
+		"network-jwt",
+		"http://127.0.0.1:1",
+		"test-description",
+		"test-spec",
+		"0.0.0-test",
+		nil,
+		DefaultClientSettings,
+		DefaultApiMultiClientGeneratorSettings(),
+	)
+	store := &contextLoadIdentityStore{
+		started:  make(chan struct{}),
+		canceled: make(chan struct{}),
+	}
+	generator.SetIdentityStore(store)
+	select {
+	case <-store.started:
+	case <-time.After(time.Second):
+		t.Fatal("identity loader did not start")
+	}
+
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer closeCancel()
+	if err := generator.CloseAndWait(closeCtx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-store.canceled:
+	case <-time.After(time.Second):
+		t.Fatal("generator close did not cancel its identity loader")
+	}
+	select {
+	case <-parentCtx.Done():
+		t.Fatal("generator close canceled its DeviceLocal parent")
+	default:
 	}
 }

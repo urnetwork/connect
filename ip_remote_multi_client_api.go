@@ -140,7 +140,8 @@ func (self *apiTransportCreationLifecycle) closeAndWait(ctx context.Context) err
 }
 
 type ApiMultiClientGenerator struct {
-	ctx context.Context
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	specs          []*ProviderSpec
 	clientStrategy *ClientStrategy
@@ -150,7 +151,6 @@ type ApiMultiClientGenerator struct {
 	excludeClientIds []Id
 
 	apiUrl      string
-	byJwt       string
 	platformUrl string
 
 	deviceDescription       string
@@ -236,7 +236,8 @@ func NewApiMultiClientGenerator(
 	clientSettingsGenerator func() *ClientSettings,
 	settings *ApiMultiClientGeneratorSettings,
 ) *ApiMultiClientGenerator {
-	api := NewBringYourApi(ctx, clientStrategy, apiUrl)
+	generatorCtx, generatorCancel := context.WithCancel(ctx)
+	api := NewBringYourApi(generatorCtx, clientStrategy, apiUrl)
 	api.SetByJwt(byJwt)
 	transportIdle := make(chan struct{})
 	close(transportIdle)
@@ -246,12 +247,12 @@ func NewApiMultiClientGenerator(
 		platformTransportMode = TransportModeAuto
 	}
 	return &ApiMultiClientGenerator{
-		ctx:                        ctx,
+		ctx:                        generatorCtx,
+		cancel:                     generatorCancel,
 		specs:                      specs,
 		clientStrategy:             clientStrategy,
 		excludeClientIds:           excludeClientIds,
 		apiUrl:                     apiUrl,
-		byJwt:                      byJwt,
 		platformUrl:                platformUrl,
 		deviceDescription:          deviceDescription,
 		deviceSpec:                 deviceSpec,
@@ -263,10 +264,18 @@ func NewApiMultiClientGenerator(
 		platformModePreferences:    maps.Clone(settings.PlatformTransportModePreferences),
 		platformTransportPolicyVer: 1,
 		api:                        api,
-		identityState:              newWindowIdentityState(ctx, nil),
+		identityState:              newWindowIdentityState(generatorCtx, nil),
 		transports:                 map[*Client]*apiWindowClientTransport{},
 		transportIdle:              transportIdle,
 	}
+}
+
+// SetByJwt updates the network credential used to mint and retire future
+// derived window clients. A generator can outlive the device API's startup
+// refresh; retaining its constructor token eventually makes later window
+// expansion and cleanup authenticate with an expired credential.
+func (self *ApiMultiClientGenerator) SetByJwt(byJwt string) {
+	self.api.SetByJwt(byJwt)
 }
 
 func normalizePlatformTransportTargetMode(mode TransportMode) TransportMode {
@@ -357,6 +366,18 @@ func (self *ApiMultiClientGenerator) retirementLifecycle() *lifecycleAdmission {
 // and joins the resulting Client/OOB retirement workers. A successful return
 // therefore makes every generated client's message-pool ownership terminal.
 func (self *ApiMultiClientGenerator) CloseAndWait(ctx context.Context) error {
+	closeOwned := func() {
+		if self.cancel != nil {
+			self.cancel()
+		}
+		if self.api != nil {
+			self.api.Close()
+		}
+	}
+	// A canceled waiter must still stop this generator's private context.
+	// All clients are canceled below before the potentially bounded joins.
+	defer closeOwned()
+
 	if err := self.CloseTransportCreationAndWait(ctx); err != nil {
 		return err
 	}
@@ -400,8 +421,15 @@ func (self *ApiMultiClientGenerator) CloseAndWait(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-retirements.Done():
-		return nil
 	}
+
+	// The parent DeviceLocal deliberately outlives destination replacement.
+	// Cancel the generator's private context only after live-window retirement
+	// has authenticated its final contract cleanup and client removal. This
+	// stops the API context and identity writer without making RemoveClientArgs
+	// misclassify a destination change as process shutdown.
+	closeOwned()
+	return self.identityState.CloseAndWait(ctx)
 }
 
 func (self *ApiMultiClientGenerator) NextDestinations(count int, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error) {
@@ -666,7 +694,7 @@ func (self *ApiMultiClientGenerator) RemoveClientArgs(args *MultiClientGenerator
 				&RemoveNetworkClientArgs{
 					ClientId: args.ClientId,
 				},
-				self.byJwt,
+				self.api.ByJwt(),
 				&RemoveNetworkClientResult{},
 				NewNoopApiCallback[*RemoveNetworkClientResult](),
 			)

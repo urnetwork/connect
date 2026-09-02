@@ -91,6 +91,9 @@ const maxRestoredWindowIdentityCount = 64
 type windowIdentityState struct {
 	ctx   context.Context
 	store MultiClientIdentityStore
+	// storeDone closes after the single persistence writer's final drain. A
+	// nil store has no writer and starts terminal.
+	storeDone chan struct{}
 
 	mutex sync.Mutex
 	// Loading is one asynchronous single-flight operation. The store may be a
@@ -131,6 +134,7 @@ func newWindowIdentityState(ctx context.Context, store MultiClientIdentityStore)
 	state := &windowIdentityState{
 		ctx:         ctx,
 		store:       store,
+		storeDone:   make(chan struct{}),
 		restored:    map[MultiHopId][]*WindowClientIdentity{},
 		live:        map[Id]*WindowClientIdentity{},
 		loadDone:    make(chan struct{}),
@@ -147,8 +151,24 @@ func newWindowIdentityState(ctx context.Context, store MultiClientIdentityStore)
 		state.mutex.Lock()
 		state.startLoadWithLock()
 		state.mutex.Unlock()
+	} else {
+		close(state.storeDone)
 	}
 	return state
+}
+
+// CloseAndWait joins the persistence writer after its owning context has been
+// canceled. Context-aware loads receive that same cancellation separately;
+// a legacy store's unbounded Load remains isolated to its documented single
+// worker and cannot be joined by an interface that has no cancellation seam.
+func (self *windowIdentityState) CloseAndWait(ctx context.Context) error {
+	self.cancelLoad()
+	select {
+	case <-self.storeDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // hasStore reports whether an identity store is configured (the proxy case:
@@ -361,6 +381,7 @@ func (self *windowIdentityState) storeSnapshotWithLock() {
 // best-effort final drain so a snapshot scheduled just before shutdown still
 // reaches the store.
 func (self *windowIdentityState) runStoreWriter() {
+	defer close(self.storeDone)
 	lastWrittenGeneration := uint64(0)
 	for {
 		select {
