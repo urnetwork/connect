@@ -60,8 +60,16 @@ type ConnectSettings struct {
 	DisableIpv6 bool
 }
 
+// DialContextSettings carries the paired stream and packet egress seams used
+// by headless hosts which must keep one logical client on one source identity.
+// ConnectSettings consumes DialContext; higher-level carrier constructors copy
+// PacketConnFactory into transports which own an unconnected UDP endpoint.
 type DialContextSettings struct {
 	DialContext DialContextFunction
+	// PacketConnFactory creates one unconnected UDP endpoint per carrier dial.
+	// The caller owns and closes every non-nil endpoint, including one returned
+	// alongside an error. Nil retains the platform's ordinary wildcard socket.
+	PacketConnFactory func(context.Context) (net.PacketConn, error)
 }
 
 func (self *ConnectSettings) DialContext(ctx context.Context, network string, addr string) (net.Conn, error) {

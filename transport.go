@@ -566,9 +566,10 @@ type PlatformTransportSettings struct {
 	PtDnsSlowMultiple int
 
 	// H3PacketConnFactory, when set, creates the UDP endpoint for a plain H3
-	// dial. Tests use it to place QUIC below a userspace network model. Nil
-	// retains the host UDP socket and physical-egress binding path. The
-	// platform transport owns and closes every returned endpoint.
+	// dial. Tests use it to place QUIC below a userspace network model, while
+	// headless multi-provider hosts use it to preserve distinct source
+	// identities. Nil retains the host UDP socket and physical-egress binding
+	// path. The platform transport owns and closes every returned endpoint.
 	H3PacketConnFactory func(context.Context) (net.PacketConn, error)
 	// Enables the RFC 9221 Transfer carrier only when the server accepts the
 	// same version on the authenticated control stream. A legacy peer retains
