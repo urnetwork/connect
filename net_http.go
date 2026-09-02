@@ -1135,6 +1135,14 @@ func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, er
 	}
 	self.applyExtraHeaders(request.Header)
 
+	// js/wasm: one fetch, no dialer strategies (net_http_platform_js.go)
+	if result, ok := self.httpPlatformDirect(request); ok {
+		if result == nil {
+			return nil, fmt.Errorf("http request failed")
+		}
+		return result, nil
+	}
+
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
 		attemptRequest, err := cloneHttpRequestForAttempt(handleCtx, request)
 		if err != nil {
@@ -1183,6 +1191,14 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 
 	self.applyExtraHeaders(request.Header)
 	self.applyExtraHeaders(helloRequest.Header)
+
+	// js/wasm: one fetch, no dialer strategies (net_http_platform_js.go)
+	if result, ok := self.httpPlatformDirect(request); ok {
+		if result == nil {
+			return nil, fmt.Errorf("http request failed")
+		}
+		return result, nil
+	}
 
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
 		attemptRequest, err := cloneHttpRequestForAttempt(handleCtx, request)
@@ -2026,14 +2042,17 @@ func HttpPostStreamWithStrategyRaw(
 	// resolves in-process. See egress.go / egress_dial.go; identical behavior
 	// everywhere else.
 	settings := DefaultConnectSettings()
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext:         wrapControlDial("api", settings.Log, true, settings.DialContext),
-			TLSClientConfig:     settings.TlsConfig,
-			TLSHandshakeTimeout: settings.TlsTimeout,
-			ForceAttemptHTTP2:   true,
-		},
+	var transport http.RoundTripper = &http.Transport{
+		DialContext:         wrapControlDial("api", settings.Log, true, settings.DialContext),
+		TLSClientConfig:     settings.TlsConfig,
+		TLSHandshakeTimeout: settings.TlsTimeout,
+		ForceAttemptHTTP2:   true,
 	}
+	if direct := platformDirectHttpTransport(); direct != nil {
+		// js/wasm: the browser's fetch, which no custom dialer can reach
+		transport = direct
+	}
+	client := &http.Client{Transport: transport}
 	defer client.CloseIdleConnections()
 	res, err := client.Do(req)
 	if err != nil {
