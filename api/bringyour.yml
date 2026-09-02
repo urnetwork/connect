@@ -3884,6 +3884,20 @@ components:
           type: string
         total_referrals:
           type: integer
+        max_referrals:
+          description: |
+            Referrals a network is paid for (pro.yml referral.max_referrals).
+            0 when the server has no pro.yml (uncapped); clients treat 0 as unknown.
+          type: integer
+        bonus_per_referral_bytes:
+          description: Bytes granted to the referrer per referral, per bonus period. 0 when unknown.
+          type: integer
+        referred_bonus_bytes:
+          description: Bytes granted to the referred network, per bonus period. 0 when unknown.
+          type: integer
+        bonus_period_seconds:
+          description: The bonus grant period in seconds (24h = 86400). 0 when unknown.
+          type: integer
 
     TransferStatsResult:
       type: object
