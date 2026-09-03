@@ -1,0 +1,367 @@
+package connect
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"net/netip"
+	"sort"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"time"
+)
+
+// internalDohDialFallbackDelay is the Happy Eyeballs delay between raw
+// addresses. A definitive failure launches the next address immediately.
+const internalDohDialFallbackDelay = 250 * time.Millisecond
+
+// internalDohResolver is the client strategy's trusted name path for the
+// network-space domains. It resolves with the existing bounded DoH cache and
+// passes only IP literals to the underlying dialer. TLS remains outside this
+// layer, where it still sees the original hostname.
+type internalDohResolver struct {
+	cache       *DohCache
+	domains     []string
+	disableIpv4 bool
+	disableIpv6 bool
+	nextAddr    atomic.Uint64
+}
+
+// clientStrategySettingsWithInternalDoh installs the resolver ahead of every
+// normal, resilient, proxy, and injected control dial. The base settings are
+// captured before installing the wrapper so non-owned names retain their
+// existing resolution path and DoH endpoint dials cannot recurse through the
+// protected-domain rule.
+func clientStrategySettingsWithInternalDoh(settings *ClientStrategySettings) (*ClientStrategySettings, *internalDohResolver) {
+	if settings == nil || settings.ConnectSettings.Resolver != nil {
+		return settings, nil
+	}
+	domains := normalizeInternalDohDomains(settings.InternalDohDomains)
+	if len(domains) == 0 {
+		return settings, nil
+	}
+
+	copied := *settings
+	copied.ConnectSettings = settings.ConnectSettings
+	baseConnectSettings := copied.ConnectSettings
+	resolver := &internalDohResolver{
+		cache:       NewDohCache(internalDohSettings(settings.DohSettings)),
+		domains:     domains,
+		disableIpv4: copied.DisableIpv4,
+		disableIpv6: copied.DisableIpv6,
+	}
+	copied.ConnectSettings.DialContextSettings = &DialContextSettings{
+		DialContext: resolver.wrapDialContext(baseConnectSettings.DialContext),
+	}
+	return &copied, resolver
+}
+
+// internalDohSettings makes an owned copy because the control-name policy
+// deliberately excludes plain DNS fallback. The DoH endpoints themselves are
+// still resolved by DohCache's bootstrap rule when a caller configured a
+// hostname endpoint; production defaults are IP literals and need no DNS.
+func internalDohSettings(settings *DohSettings) *DohSettings {
+	if settings == nil {
+		settings = DefaultDohSettings()
+	}
+	copied := *settings
+	if settings.DnsResolverSettings == nil {
+		copied.DnsResolverSettings = DefaultDnsResolverSettings()
+	} else {
+		resolver := *settings.DnsResolverSettings
+		resolver.RemoteDohUrlsIpv4 = append([]string(nil), resolver.RemoteDohUrlsIpv4...)
+		resolver.RemoteDohUrlsIpv6 = append([]string(nil), resolver.RemoteDohUrlsIpv6...)
+		resolver.LocalDohUrlsIpv4 = append([]string(nil), resolver.LocalDohUrlsIpv4...)
+		resolver.LocalDohUrlsIpv6 = append([]string(nil), resolver.LocalDohUrlsIpv6...)
+		resolver.RemoteDnsIpv4 = append([]string(nil), resolver.RemoteDnsIpv4...)
+		resolver.RemoteDnsIpv6 = append([]string(nil), resolver.RemoteDnsIpv6...)
+		resolver.LocalDnsIpv4 = append([]string(nil), resolver.LocalDnsIpv4...)
+		resolver.LocalDnsIpv6 = append([]string(nil), resolver.LocalDnsIpv6...)
+		copied.DnsResolverSettings = &resolver
+	}
+	copied.DnsResolverSettings.EnableRemoteDns = false
+	copied.DnsResolverSettings.EnableLocalDns = false
+	// The protected set is a handful of service names, so retain enough room
+	// for migrations without paying the general-purpose resolver's cache and
+	// concurrency ceilings on every NetworkSpace.
+	copied.CacheMaxEntries = internalDohBound(copied.CacheMaxEntries, 64)
+	copied.MaxConcurrentResolutions = internalDohBound(copied.MaxConcurrentResolutions, 8)
+	copied.MaxConcurrentHttpRequests = internalDohBound(copied.MaxConcurrentHttpRequests, 4)
+	return &copied
+}
+
+func internalDohBound(value int, ceiling int) int {
+	if value <= 0 || ceiling < value {
+		return ceiling
+	}
+	return value
+}
+
+func normalizeInternalDohDomains(domains []string) []string {
+	seen := map[string]bool{}
+	normalized := make([]string, 0, len(domains))
+	for _, domain := range domains {
+		domain = normalizeInternalDohName(domain)
+		if domain == "" || seen[domain] {
+			continue
+		}
+		if _, err := netip.ParseAddr(domain); err == nil {
+			continue
+		}
+		// A network-space domain is an FQDN-like suffix, not a single DNS label.
+		// Besides avoiding accidental capture of an entire top-level domain,
+		// this leaves local/test names such as "localhost" and "test" on the
+		// resolver path their embedder configured.
+		if !strings.Contains(domain, ".") {
+			continue
+		}
+		seen[domain] = true
+		normalized = append(normalized, domain)
+	}
+	sort.Strings(normalized)
+	return normalized
+}
+
+func normalizeInternalDohName(name string) string {
+	name = strings.TrimSuffix(strings.TrimSpace(name), ".")
+	if name == "" {
+		return ""
+	}
+	ascii, err := Punycode(name)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSuffix(ascii, "."))
+}
+
+func (self *internalDohResolver) matches(host string) bool {
+	host = normalizeInternalDohName(host)
+	if host == "" {
+		return false
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return false
+	}
+	for _, domain := range self.domains {
+		if host == domain || strings.HasSuffix(host, "."+domain) {
+			return true
+		}
+	}
+	return false
+}
+
+type internalDohQueryResult struct {
+	addrs         []netip.Addr
+	authoritative bool
+}
+
+func (self *internalDohResolver) resolve(ctx context.Context, network string, host string) ([]netip.Addr, error) {
+	recordTypes := make([]string, 0, 2)
+	if !self.disableIpv6 && !strings.HasSuffix(network, "4") {
+		recordTypes = append(recordTypes, "AAAA")
+	}
+	if !self.disableIpv4 && !strings.HasSuffix(network, "6") {
+		recordTypes = append(recordTypes, "A")
+	}
+	if len(recordTypes) == 0 {
+		return nil, fmt.Errorf("resolve %s: ipv4 and ipv6 are both disabled", host)
+	}
+
+	results := make(chan internalDohQueryResult, len(recordTypes))
+	for _, recordType := range recordTypes {
+		go func() {
+			addrs, authoritative := self.cache.QueryResult(ctx, recordType, host)
+			results <- internalDohQueryResult{addrs: addrs, authoritative: authoritative}
+		}()
+	}
+
+	var addrs []netip.Addr
+	authoritativeCount := 0
+	for range recordTypes {
+		result := <-results
+		addrs = append(addrs, result.addrs...)
+		if result.authoritative {
+			authoritativeCount++
+		}
+	}
+	if 0 < len(addrs) {
+		return orderInternalDohAddrs(addrs), nil
+	}
+	if authoritativeCount == len(recordTypes) {
+		return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return nil, &net.DNSError{Err: "internal DoH resolution failed", Name: host, IsTemporary: true}
+}
+
+// orderInternalDohAddrs makes the raw dial order stable, alternating families
+// so a dead IPv6 or IPv4 path cannot consume the entire request deadline.
+func orderInternalDohAddrs(addrs []netip.Addr) []netip.Addr {
+	ipv4 := make([]netip.Addr, 0, len(addrs))
+	ipv6 := make([]netip.Addr, 0, len(addrs))
+	seen := map[netip.Addr]bool{}
+	for _, addr := range addrs {
+		addr = addr.Unmap()
+		if !addr.IsValid() || seen[addr] {
+			continue
+		}
+		seen[addr] = true
+		if addr.Is4() {
+			ipv4 = append(ipv4, addr)
+		} else {
+			ipv6 = append(ipv6, addr)
+		}
+	}
+	sort.Slice(ipv4, func(i int, j int) bool { return ipv4[i].Less(ipv4[j]) })
+	sort.Slice(ipv6, func(i int, j int) bool { return ipv6[i].Less(ipv6[j]) })
+	ordered := make([]netip.Addr, 0, len(ipv4)+len(ipv6))
+	for i := 0; i < max(len(ipv4), len(ipv6)); i++ {
+		if i < len(ipv6) {
+			ordered = append(ordered, ipv6[i])
+		}
+		if i < len(ipv4) {
+			ordered = append(ordered, ipv4[i])
+		}
+	}
+	return ordered
+}
+
+func (self *internalDohResolver) wrapDialContext(dialContext DialContextFunction) DialContextFunction {
+	return func(ctx context.Context, network string, address string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(address)
+		if err != nil || !self.matches(host) {
+			return dialContext(ctx, network, address)
+		}
+		addrs, err := self.resolve(ctx, network, host)
+		if err != nil {
+			return nil, err
+		}
+		return dialInternalDohAddrs(ctx, network, port, addrs, dialContext)
+	}
+}
+
+type internalDohDialResult struct {
+	conn net.Conn
+	err  error
+}
+
+func dialInternalDohAddrs(
+	ctx context.Context,
+	network string,
+	port string,
+	addrs []netip.Addr,
+	dialContext DialContextFunction,
+) (net.Conn, error) {
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("internal DoH returned no addresses")
+	}
+	raceCtx, raceCancel := context.WithCancel(ctx)
+	defer raceCancel()
+	results := make(chan internalDohDialResult)
+	launched := 0
+	completed := 0
+	errs := make([]error, 0, len(addrs))
+	launch := func() {
+		addr := net.JoinHostPort(addrs[launched].String(), port)
+		launched++
+		go func() {
+			conn, err := dialContext(raceCtx, network, addr)
+			select {
+			case results <- internalDohDialResult{conn: conn, err: err}:
+			case <-raceCtx.Done():
+				if conn != nil {
+					conn.Close()
+				}
+			}
+		}()
+	}
+
+	launch()
+	timer := time.NewTimer(internalDohDialFallbackDelay)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case result := <-results:
+			completed++
+			if result.err == nil && result.conn != nil {
+				raceCancel()
+				return result.conn, nil
+			}
+			if result.conn != nil {
+				result.conn.Close()
+			}
+			if result.err == nil {
+				result.err = errors.New("dial returned no connection")
+			}
+			errs = append(errs, result.err)
+			if completed == len(addrs) {
+				return nil, errors.Join(errs...)
+			}
+			if launched < len(addrs) {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				launch()
+				timer.Reset(internalDohDialFallbackDelay)
+			}
+		case <-timer.C:
+			if launched < len(addrs) {
+				launch()
+			}
+			if launched < len(addrs) {
+				timer.Reset(internalDohDialFallbackDelay)
+			}
+		}
+	}
+}
+
+func (self *internalDohResolver) resolveUDPAddr(ctx context.Context, address string) (*net.UDPAddr, error) {
+	host, portString, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil {
+		return nil, fmt.Errorf("resolve %s: non-numeric port: %w", address, err)
+	}
+	addrs, err := self.resolve(ctx, "udp", host)
+	if err != nil {
+		return nil, err
+	}
+	index := int((self.nextAddr.Add(1) - 1) % uint64(len(addrs)))
+	addr := addrs[index]
+	return &net.UDPAddr{IP: net.IP(addr.AsSlice()), Port: port, Zone: addr.Zone()}, nil
+}
+
+func (self *internalDohResolver) CloseIdleConnections() {
+	self.cache.CloseIdleConnections()
+}
+
+func (self *internalDohResolver) Close() {
+	self.cache.Close()
+}
+
+// resolveControlUDPAddr applies the same protected-domain policy to QUIC and
+// packet-translation transports. Those callers already set TLS.ServerName
+// from the original platform URL after receiving this raw destination.
+func (self *ClientStrategy) resolveControlUDPAddr(ctx context.Context, address string) (*net.UDPAddr, error) {
+	if self != nil && self.internalDohResolver != nil {
+		host, _, err := net.SplitHostPort(address)
+		if err == nil && self.internalDohResolver.matches(host) {
+			return self.internalDohResolver.resolveUDPAddr(ctx, address)
+		}
+	}
+	if self != nil && self.settings != nil && self.settings.ConnectSettings.Resolver != nil {
+		return resolveUDPAddrWithResolver(ctx, address, self.settings.ConnectSettings.Resolver)
+	}
+	return resolveEgressUDPAddr(ctx, address)
+}

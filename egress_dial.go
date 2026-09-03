@@ -84,6 +84,13 @@ func egressAwareResolver(custom *net.Resolver) *net.Resolver {
 // would leave these three call sites resolving through the captured stub.
 func resolveEgressUDPAddr(ctx context.Context, addr string) (*net.UDPAddr, error) {
 	resolver := egressResolver()
+	return resolveUDPAddrWithResolver(ctx, addr, resolver)
+}
+
+// resolveUDPAddrWithResolver is the context-aware UDP name path shared by the
+// platform resolver and an explicitly configured client-strategy resolver.
+// nil means the platform default resolver.
+func resolveUDPAddrWithResolver(ctx context.Context, addr string, resolver *net.Resolver) (*net.UDPAddr, error) {
 	if resolver == nil {
 		// Keep the platform resolver but not net.ResolveUDPAddr: the caller
 		// supplied a lifecycle context specifically so a transport shutdown can

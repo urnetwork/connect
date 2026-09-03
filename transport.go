@@ -2503,11 +2503,11 @@ func (self *PlatformTransport) runH3(
 			switch ptMode {
 			case TransportModeH3Dns:
 				tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
-				// resolveEgressUDPAddr, not net.ResolveUDPAddr: the socket is
-				// egress-pinned above, but the NAME must not resolve through
-				// the OS resolver, whose query follows the route table into
-				// the tunnel this process provides. See egress_dial.go.
-				udpAddr, err = resolveEgressUDPAddr(attemptCtx, fmt.Sprintf("%s:%d", serverName, self.settings.DnsPort))
+				// The strategy resolver applies the network-space DoH policy
+				// before preserving the existing egress-aware fallback. The
+				// socket can be pinned above while an OS name query still loops
+				// into this process's own tunnel. See egress_dial.go.
+				udpAddr, err = self.clientStrategy.resolveControlUDPAddr(attemptCtx, fmt.Sprintf("%s:%d", serverName, self.settings.DnsPort))
 				if err != nil {
 					return nil, err
 				}
@@ -2532,7 +2532,7 @@ func (self *PlatformTransport) runH3(
 				if pumpServerName == "" {
 					return nil, fmt.Errorf("H3 DNS pump host is empty")
 				}
-				udpAddr, err = resolveEgressUDPAddr(attemptCtx, fmt.Sprintf("%s:%d", pumpServerName, self.settings.DnsPort))
+				udpAddr, err = self.clientStrategy.resolveControlUDPAddr(attemptCtx, fmt.Sprintf("%s:%d", pumpServerName, self.settings.DnsPort))
 				if err != nil {
 					return nil, err
 				}
@@ -2548,7 +2548,7 @@ func (self *PlatformTransport) runH3(
 					return nil, err
 				}
 			default:
-				udpAddr, err = resolveEgressUDPAddr(attemptCtx, fmt.Sprintf("%s:%d", serverName, self.settings.H3Port))
+				udpAddr, err = self.clientStrategy.resolveControlUDPAddr(attemptCtx, fmt.Sprintf("%s:%d", serverName, self.settings.H3Port))
 				if err != nil {
 					return nil, err
 				}

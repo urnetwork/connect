@@ -136,6 +136,14 @@ type ClientStrategySettings struct {
 	ExtenderConfigs []*ExtenderConfig
 
 	DohSettings *DohSettings
+	// InternalDohDomains are network-space domains whose exact host and
+	// subdomains resolve through the strategy's direct DoH cache before a
+	// control connection is dialed by raw IP. The request hostname remains
+	// unchanged for HTTP Host, TLS SNI, and certificate verification.
+	//
+	// An explicit ConnectSettings.Resolver takes precedence and disables this
+	// rule. This lets embedders and tests retain a resolver they installed.
+	InternalDohDomains []string
 
 	HelloRetryTimeout time.Duration
 
@@ -191,6 +199,9 @@ type ClientStrategy struct {
 	log                Logger
 
 	settings *ClientStrategySettings
+	// internalDohResolver exists only when InternalDohDomains are configured
+	// and the caller did not install ConnectSettings.Resolver.
+	internalDohResolver *internalDohResolver
 
 	mutex sync.Mutex
 	// dialers are only updated inside the mutex
@@ -270,6 +281,8 @@ func newNormalDialTlsContext(
 
 // extender udp 53 to platform extender
 func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *ClientStrategy {
+	settings, internalDohResolver := clientStrategySettingsWithInternalDoh(settings)
+
 	// propagate so a strategy-level logger covers dial logging. Copy instead
 	// of writing through the caller's settings: the caller may share them
 	// with concurrent constructions or other readers (see the platform
@@ -392,6 +405,7 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 		cancel:              strategyCancel,
 		log:                 loggerOrDefault(settings.Log),
 		settings:            settings,
+		internalDohResolver: internalDohResolver,
 		dialers:             dialers,
 		resolvedExtenderIps: resolvedExtenderIps,
 		extenderIpSecrets:   map[netip.Addr]string{},
@@ -418,6 +432,9 @@ func (self *ClientStrategy) CloseIdleConnections() {
 	for dialer := range self.dialers {
 		dialer.Close()
 	}
+	if self.internalDohResolver != nil {
+		self.internalDohResolver.CloseIdleConnections()
+	}
 }
 
 // Ends discovery and releases pooled HTTP connections. APIs and transports
@@ -431,6 +448,9 @@ func (self *ClientStrategy) Close() {
 			self.unsubNetworkChange()
 		}
 		self.CloseIdleConnections()
+		if self.internalDohResolver != nil {
+			self.internalDohResolver.Close()
+		}
 	})
 }
 
