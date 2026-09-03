@@ -176,6 +176,34 @@ paths:
               schema:
                 $ref: "#/components/schemas/LeaderboardResult"
 
+  /stats/points-leaderboard:
+    post:
+      description: |
+        Page the all-time points leaderboard. Every network with points is
+        ranked on three dimensions (total points, finalized epochs with points
+        = "blocks", current streak of consecutive finalized epochs with points)
+        with competition ranks (1, 2, 2, 4); only networks that opted in
+        (/network/points-ranking-visibility) are listed, so ranks have gaps.
+        Pages use a keyset cursor pinned to a ranking snapshot (rebuilt when an
+        epoch finalizes, when a payout plan commits, and hourly); a cursor
+        whose snapshot was pruned returns `restart: true` and the client
+        reloads from the top. No authentication is required; with a bearer
+        token the response also carries `me`, the caller's own row whether or
+        not it opted in.
+      operationId: Stats Points Leaderboard
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PointsLeaderboardArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PointsLeaderboardResult"
+
   /auth/login:
     post:
       description: |
@@ -726,7 +754,11 @@ paths:
   /network/ranking:
     get:
       description: |
-        Get leaderboard ranking of current network
+        Get leaderboard ranking of current network. Besides the data
+        leaderboard rank, the result carries the network's points leaderboard
+        settings (`points_leaderboard_public`, `emoji_tag`) and its points
+        ranks (`rank_points`, `rank_blocks`, `rank_streak`; 0 until the
+        network has points and a ranking snapshot exists).
       operationId: Network Get Ranking
       security:
         - BearerAuth: []
@@ -757,6 +789,54 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SetNetworkRankingVisibilityResult"
+
+  /network/points-ranking-visibility:
+    post:
+      description: |
+        Opt the network in or out of the public all-time points leaderboard.
+        The opt-in only controls whether the network is LISTED; every network
+        with points is ranked either way. The network name shows on the listed
+        row only when the data leaderboard name visibility
+        (/network/ranking-visibility) is also on; the emoji tag always shows.
+      operationId: Network Points Ranking Visibility
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetNetworkPointsRankingVisibilityArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SetNetworkPointsRankingVisibilityResult"
+
+  /network/emoji:
+    post:
+      description: |
+        Set the network's emoji tag: 1 to 6 emoji (each grapheme cluster must
+        be a single emoji: pictographs with skin tones, ZWJ sequences, keycaps,
+        flags). Letters, digits and punctuation are rejected with the message
+        "Use 1 to 6 emoji.". An empty string clears the tag. The tag is shown
+        on the points leaderboard row and in the network's own header.
+      operationId: Network Set Emoji Tag
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetNetworkEmojiTagArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SetNetworkEmojiTagResult"
 
   /network/block-location:
     post:
@@ -4399,6 +4479,24 @@ components:
         leaderboard_public:
           description: Whether your network is publicly visibile on the leaderboard
           type: boolean
+        points_leaderboard_public:
+          description: Whether the network is listed on the points leaderboard
+          type: boolean
+        emoji_tag:
+          description: The network's emoji tag (1 to 6 emoji), absent when unset
+          type: string
+        rank_points:
+          description: Competition rank by total points, 0 when unranked
+          type: integer
+          format: int64
+        rank_blocks:
+          description: Competition rank by finalized epochs with points, 0 when unranked
+          type: integer
+          format: int64
+        rank_streak:
+          description: Competition rank by current streak, 0 when unranked
+          type: integer
+          format: int64
 
     NetworkRankingResult:
       type: object
@@ -4421,6 +4519,147 @@ components:
     SetNetworkRankingVisibilityResult:
       type: object
       properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    SetNetworkPointsRankingVisibilityArgs:
+      type: object
+      required:
+        - public
+      properties:
+        public:
+          description: true to list the network on the points leaderboard
+          type: boolean
+
+    SetNetworkPointsRankingVisibilityResult:
+      type: object
+      properties:
+        points_leaderboard_public:
+          type: boolean
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    SetNetworkEmojiTagArgs:
+      type: object
+      required:
+        - emoji_tag
+      properties:
+        emoji_tag:
+          description: 1 to 6 emoji; an empty string clears the tag
+          type: string
+          example: "🐬🔥"
+
+    SetNetworkEmojiTagResult:
+      type: object
+      properties:
+        emoji_tag:
+          description: The stored (NFC-normalized) tag, empty when cleared
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+              example: Use 1 to 6 emoji.
+
+    PointsLeaderboardArgs:
+      type: object
+      properties:
+        sort:
+          description: The dimension to page by
+          type: string
+          enum: [points, blocks, streak]
+          default: points
+        cursor:
+          description: The next_cursor of the previous page; omit for the first page
+          type: string
+        limit:
+          description: Page size, default 50, max 200
+          type: integer
+
+    PointsLeaderboardRow:
+      type: object
+      properties:
+        network_id:
+          type: string
+        network_name:
+          description: Present only when the network's name is public
+          type: string
+        emoji_tag:
+          description: The network's emoji tag, absent when unset
+          type: string
+        anonymous:
+          description: true when the network name is hidden
+          type: boolean
+        contains_profanity:
+          description: The public name contains profanity (apps may mask it)
+          type: boolean
+        total_points:
+          description: All-time points
+          type: number
+          format: double
+        blocks_with_points:
+          description: Finalized epochs in which the network earned points
+          type: integer
+        streak:
+          description: Consecutive finalized epochs with points ending at the latest finalized epoch
+          type: integer
+        longest_streak:
+          description: The best streak ever (informational, never ranked)
+          type: integer
+        rank_points:
+          type: integer
+          format: int64
+        rank_blocks:
+          type: integer
+          format: int64
+        rank_streak:
+          type: integer
+          format: int64
+
+    PointsLeaderboardMe:
+      allOf:
+        - $ref: "#/components/schemas/PointsLeaderboardRow"
+        - type: object
+          properties:
+            points_leaderboard_public:
+              type: boolean
+            ranked:
+              description: false when the network has no points yet
+              type: boolean
+
+    PointsLeaderboardResult:
+      type: object
+      properties:
+        rows:
+          type: array
+          items:
+            $ref: "#/components/schemas/PointsLeaderboardRow"
+        next_cursor:
+          description: Absent on the last page
+          type: string
+        restart:
+          description: The cursor's snapshot is gone; reload from the top
+          type: boolean
+        total_ranked:
+          description: Networks ranked in the snapshot (listed or not)
+          type: integer
+          format: int64
+        snapshot_time:
+          type: string
+          format: date-time
+        latest_epoch:
+          description: The latest finalized epoch the snapshot counts
+          type: integer
+          format: int64
+        me:
+          $ref: "#/components/schemas/PointsLeaderboardMe"
         error:
           type: object
           properties:
