@@ -1842,9 +1842,9 @@ paths:
   /pay/data/checkout:
     post:
       description: |
-        Buy a data pack without signing in (the ur.io buy-data page). Starts a
-        hosted checkout with Stripe or Coinbase Commerce and returns the url to
-        send the customer to.
+        Buy a data pack with a card without signing in (the ur.io buy-data
+        page). Starts a hosted Stripe checkout and returns the url to send the
+        customer to. To pay with USDC on Solana use /pay/data/solana-intent.
 
         With `network_name`, the data is applied to that network by the payment
         webhook as soon as the payment confirms, and the customer is emailed a
@@ -1853,14 +1853,13 @@ paths:
         name returns `error.message` "No network named <name>".
 
         Without `network_name`, the customer receives a data code by email, as
-        before. Stripe collects the email on its checkout page; Coinbase needs
-        `email` in the request.
+        before. Stripe collects the email on its checkout page when `email` is
+        not given.
 
         The success url is the configured checkout success url plus
         `item=<item_id>` and, when applying to a network, `network=<name>`.
         Unauthenticated, per-ip rate limited. Errors are returned as
-        `error.message` with a 200, including "Crypto checkout is not configured"
-        when the Coinbase Commerce api key is absent.
+        `error.message` with a 200.
       operationId: Pay Data Checkout
       security: []
       requestBody:
@@ -1899,6 +1898,65 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PayDataNetworkLookupResult"
+
+  /pay/data/solana-intent:
+    post:
+      description: |
+        Buy a data pack with USDC on Solana, without signing in or giving an
+        email: the data goes straight to the network named by `network_name`
+        (matched like /pay/data/network-lookup). Records the payment intent and
+        returns the exact `amount_usd` to send in USDC. The client generates
+        `reference` (a Solana Pay reference: a fresh base58 public key) and
+        either opens a Solana Pay url carrying it, or shows the buyer the
+        receiving address, the amount and `memo` (which is the reference) to
+        send by hand from any wallet or exchange. The Helius webhook
+        (/pay/solana) matches the transfer by the reference among the
+        transaction's account keys OR by the memo text, then lands the data on
+        the network (data only, valid for one year, no Pro) and emails the
+        network's admin when their login is an email.
+
+        The intent expires after 24 hours (`expires_at`); a payment that arrives
+        late still credits as long as the intent has not been swept. A reused
+        reference, an unknown item or an unknown network return `error.message`
+        with a 200. Unauthenticated, per-ip rate limited.
+      operationId: Pay Data Solana Intent
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PayDataSolanaIntentArgs"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PayDataSolanaIntentResult"
+
+  /pay/data/solana-status:
+    post:
+      description: |
+        The state of a data pack payment started with /pay/data/solana-intent,
+        for the buy-data page to poll while it waits: `pending` until the USDC
+        transfer is credited, `paid` once the data is on the network, `expired`
+        when the intent passed `expires_at` unpaid, `unknown` for a reference
+        that is not a data pack intent (plan intents made by a signed-in wallet
+        are not reported here). Unauthenticated, per-ip rate limited.
+      operationId: Pay Data Solana Status
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PayDataSolanaStatusArgs"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PayDataSolanaStatusResult"
 
   /stripe/create-checkout-session:
     post:
@@ -5406,13 +5464,14 @@ components:
           enum: [data_1tib, data_10tib]
         provider:
           type: string
-          enum: [stripe, coinbase]
+          enum: [stripe]
+          description: the hosted checkout; empty means stripe
         network_name:
           type: string
           description: the network that receives the data; omit to receive a code by email
         email:
           type: string
-          description: where the code (or the applied note) is sent; required for coinbase without network_name
+          description: where the code (or the applied note) is sent; Stripe collects it at checkout when omitted
     PayDataCheckoutResult:
       type: object
       properties:
@@ -5421,7 +5480,7 @@ components:
           description: the hosted checkout url to send the customer to
         provider:
           type: string
-          enum: [stripe, coinbase]
+          enum: [stripe]
         network_id:
           type: string
           format: uuid
@@ -5448,6 +5507,74 @@ components:
         network_name:
           type: string
           description: the name as stored, when it exists
+    PayDataSolanaIntentArgs:
+      type: object
+      required:
+        - item_id
+        - network_name
+        - reference
+      properties:
+        item_id:
+          type: string
+          enum: [data_1tib, data_10tib]
+        network_name:
+          type: string
+          description: the network that receives the data
+        reference:
+          type: string
+          description: |
+            the Solana Pay reference the client generated (a fresh base58 public
+            key); it doubles as the transfer memo for a payment sent by hand
+    PayDataSolanaIntentResult:
+      type: object
+      properties:
+        amount_usd:
+          type: number
+          description: the exact amount to send, in USDC
+        reference:
+          type: string
+        memo:
+          type: string
+          description: the transfer memo for a payment sent by hand (the reference)
+        expires_at:
+          type: string
+          format: date-time
+        network_name:
+          type: string
+          description: the resolved network name, as stored
+        network_id:
+          type: string
+          format: uuid
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+    PayDataSolanaStatusArgs:
+      type: object
+      required:
+        - reference
+      properties:
+        reference:
+          type: string
+    PayDataSolanaStatusResult:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum: [pending, paid, expired, unknown]
+        item_id:
+          type: string
+          enum: [data_1tib, data_10tib]
+        network_name:
+          type: string
+        amount_usd:
+          type: number
+        expires_at:
+          type: string
+          format: date-time
     StripeCreateCheckoutSessionArgs:
       type: object
       properties:
