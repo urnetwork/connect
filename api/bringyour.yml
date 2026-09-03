@@ -513,6 +513,68 @@ paths:
           description: Redirect to the app's `<scheme>://oauth/apple?…` return url.
         '400':
           description: No `state`.
+  /auth/google/callback:
+    get:
+      tags: [auth]
+      summary: Sign in with Google return for windows and linux
+      description: |
+        Windows and Linux have no native Google sign-in, so those apps open
+        Google's authorize page in the system browser with `client_id` = the
+        ur.io web sign-in client, `redirect_uri` = this endpoint,
+        `response_type=code`, `scope=openid email profile`,
+        `prompt=select_account`, and a fresh `state` and `nonce` per attempt
+        (android signs in with play services and ur.io in the page; neither
+        uses this). Google redirects the browser here with the authorization
+        code; this endpoint exchanges it at Google's token endpoint with the
+        web client's secret (vault `google.yml` `sign_in_oauth`) and answers
+        `302` to the app's own scheme so the browser hands control back to
+        the app:
+
+            <scheme>://oauth/google?state=…&id_token=…
+            <scheme>://oauth/google?state=…&error=…
+
+        Nothing is stored. The app checks that `state` is the attempt it
+        started and that the identity token's `nonce` claim is the one it
+        minted, then signs in with the token through `POST /auth/login`
+        (`auth_jwt_type: google`), which verifies the signature and the
+        audience.
+
+        `state` is opaque except for the optional `platform` claim shared
+        with the Apple callback: base64url JSON with a `platform` key picks
+        the scheme (`android` → `ur://`, `windows` and `linux` →
+        `urnetwork://`); without it the android scheme is used. Google's own
+        `error` (e.g. `access_denied`) is passed through; a failed exchange
+        or a missing client configuration comes back as `error` too
+        (`not_configured` when the vault has no `sign_in_oauth`).
+      parameters:
+        - in: query
+          name: state
+          required: true
+          schema:
+            type: string
+          description: The attempt's state, echoed by Google untouched.
+        - in: query
+          name: code
+          schema:
+            type: string
+          description: Google's authorization code, exchanged here for the identity token.
+        - in: query
+          name: error
+          schema:
+            type: string
+          description: Google's error, e.g. `access_denied`.
+      responses:
+        '302':
+          description: Redirect to the app's `<scheme>://oauth/google?…` return url.
+          headers:
+            Location:
+              schema:
+                type: string
+              example: 'urnetwork://oauth/google?state=eyJwbGF0Zm9ybSI6IndpbmRvd3MiLCJ0b2tlbiI6IjEyMyJ9&id_token=eyJ...'
+        '400':
+          description: No `state`.
+        '405':
+          description: Not a `GET`.
   /auth/code-login:
     post:
       description: |
