@@ -243,18 +243,28 @@ func TestSetReliabilitySettingsTogglesLightClassifierLive(t *testing.T) {
 // them, every run, is itself part of the evidence.
 func TestSetReliabilitySettingsConcurrentTogglesConverge(t *testing.T) {
 	const trials = 2000
+	// Preserve every other effective setting so the race and its audit output
+	// cover only the opposing LightClassifier edge under test. Sparse literals
+	// would also disable every nonzero default on every trial.
+	defaultSettings := DefaultMultiClientSettings()
+	enabledSettings := ReliabilitySettingsFrom(defaultSettings)
+	enabledSettings.LightClassifier = true
+	disabledSettingsValue := *enabledSettings
+	disabledSettingsValue.LightClassifier = false
+	disabledSettings := &disabledSettingsValue
+
 	for trial := range trials {
-		parent := &RemoteUserNatMultiClient{settings: DefaultMultiClientSettings()}
+		parent := &RemoteUserNatMultiClient{settings: defaultSettings}
 
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			parent.SetReliabilitySettings(&ReliabilitySettings{LightClassifier: true})
+			parent.SetReliabilitySettings(enabledSettings)
 		}()
 		go func() {
 			defer wg.Done()
-			parent.SetReliabilitySettings(&ReliabilitySettings{LightClassifier: false})
+			parent.SetReliabilitySettings(disabledSettings)
 		}()
 		wg.Wait()
 

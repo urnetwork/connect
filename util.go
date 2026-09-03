@@ -458,14 +458,45 @@ func (self *Event) SetOnSignals(signalValues ...syscall.Signal) func() {
 	}
 }
 
+// weightedRandomSource is the subset of a random generator used by the
+// weighted ordering routines. The public entry points use the concurrency-safe
+// math/rand package functions; tests can supply an isolated seeded generator.
+type weightedRandomSource interface {
+	Float32() float32
+	Intn(n int) int
+	Shuffle(n int, swap func(i int, j int))
+}
+
+// weightedGlobalRandomSource adapts math/rand's package-level generator without
+// changing the public routines' random-stream or concurrency semantics.
+type weightedGlobalRandomSource struct{}
+
+func (weightedGlobalRandomSource) Float32() float32 {
+	return mathrand.Float32()
+}
+
+func (weightedGlobalRandomSource) Intn(n int) int {
+	return mathrand.Intn(n)
+}
+
+func (weightedGlobalRandomSource) Shuffle(n int, swap func(i int, j int)) {
+	mathrand.Shuffle(n, swap)
+}
+
 func WeightedShuffle[T comparable](values []T, weights map[T]float32) {
 	WeightedShuffleWithEntropy[T](values, weights, float32(0))
 }
 
 func WeightedShuffleWithEntropy[T comparable](values []T, weights map[T]float32, entropy float32) {
+	weightedShuffleWithEntropy(values, weights, entropy, weightedGlobalRandomSource{})
+}
+
+// weightedShuffleWithEntropy contains the implementation behind
+// WeightedShuffleWithEntropy with an injectable random source.
+func weightedShuffleWithEntropy[T comparable, R weightedRandomSource](values []T, weights map[T]float32, entropy float32, random R) {
 	n := len(values)
 
-	mathrand.Shuffle(n, func(i int, j int) {
+	random.Shuffle(n, func(i int, j int) {
 		values[i], values[j] = values[j], values[i]
 	})
 
@@ -476,7 +507,7 @@ func WeightedShuffleWithEntropy[T comparable](values []T, weights map[T]float32,
 
 	for i := 0; i < n-1; i += 1 {
 		j := func() int {
-			r := mathrand.Float32()
+			r := random.Float32()
 			rnet := r * netRemaining
 			net := entropy * netRemaining
 			for j := i; j < n; j += 1 {
@@ -499,9 +530,15 @@ func WeightedShuffleFunc[T any](values []T, weight func(T) float32) {
 }
 
 func WeightedShuffleFuncWithEntropy[T any](values []T, weight func(T) float32, entropy float32) {
+	weightedShuffleFuncWithEntropy(values, weight, entropy, weightedGlobalRandomSource{})
+}
+
+// weightedShuffleFuncWithEntropy contains the implementation behind
+// WeightedShuffleFuncWithEntropy with an injectable random source.
+func weightedShuffleFuncWithEntropy[T any, R weightedRandomSource](values []T, weight func(T) float32, entropy float32, random R) {
 	n := len(values)
 
-	mathrand.Shuffle(n, func(i int, j int) {
+	random.Shuffle(n, func(i int, j int) {
 		values[i], values[j] = values[j], values[i]
 	})
 
@@ -512,7 +549,7 @@ func WeightedShuffleFuncWithEntropy[T any](values []T, weight func(T) float32, e
 
 	for i := 0; i < n-1; i += 1 {
 		j := func() int {
-			r := mathrand.Float32()
+			r := random.Float32()
 			rnet := r * netRemaining
 			net := entropy * netRemaining
 			for j := i; j < n; j += 1 {
@@ -536,6 +573,12 @@ func WeightedSelectFunc[T any](values []T, n int, weight func(T) float32) {
 
 // puts the result at the front of values
 func WeightedSelectFuncWithEntropy[T any](values []T, n int, weight func(T) float32, entropy float32) {
+	weightedSelectFuncWithEntropy(values, n, weight, entropy, weightedGlobalRandomSource{})
+}
+
+// weightedSelectFuncWithEntropy contains the implementation behind
+// WeightedSelectFuncWithEntropy with an injectable random source.
+func weightedSelectFuncWithEntropy[T any, R weightedRandomSource](values []T, n int, weight func(T) float32, entropy float32, random R) {
 	n = min(n, len(values))
 
 	netRemaining := float32(0)
@@ -545,10 +588,10 @@ func WeightedSelectFuncWithEntropy[T any](values []T, n int, weight func(T) floa
 
 	for i := 0; i < n; i += 1 {
 		j := func() int {
-			r := mathrand.Float32()
+			r := random.Float32()
 			rnet := r * netRemaining
 			net := entropy * netRemaining
-			j := i + (mathrand.Intn(len(values)-i) % (len(values) - i))
+			j := i + (random.Intn(len(values)-i) % (len(values) - i))
 			for c := 0; c < len(values)-i; c += 1 {
 				w := weight(values[j])
 				net += w
@@ -557,7 +600,7 @@ func WeightedSelectFuncWithEntropy[T any](values []T, n int, weight func(T) floa
 					return j
 				}
 				// shuffle iteration
-				j = i + (mathrand.Intn(len(values)-i) % (len(values) - i))
+				j = i + (random.Intn(len(values)-i) % (len(values) - i))
 			}
 			// zero weights, use the last value
 			return j
