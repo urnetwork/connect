@@ -948,6 +948,81 @@ paths:
               schema:
                 $ref: "#/components/schemas/SubscriptionBalanceResult"
 
+  /subscription/details:
+    get:
+      description: |
+        The "Manage subscription" screen: every store currently billing the
+        caller's network, one entry per store, with the window it bought
+        (`end_time` is the expiry, or the next renewal date when the store
+        renews), the store's auto-renew state and the control that stops it.
+
+        `auto_renew` is true/false when the store answered and null when the
+        store lookup failed (best-effort, ~5 s per store; the entry still
+        carries the window from our own records). `can_cancel` is true only
+        for Stripe, which /subscription/cancel acts on; Apple and Google
+        entries carry the store's own subscriptions page in `manage_url` (a
+        subscription is cancelled where it is billed); a Solana entry is a
+        one-time USDC payment that never renews. `has_stripe_customer` gates
+        the Stripe billing portal (/stripe/customer-portal errors without one).
+
+        The result is cached per network for 60 seconds; cancel and resume
+        invalidate it.
+      operationId: Subscription Details
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionDetailsResult"
+
+  /subscription/cancel:
+    post:
+      description: |
+        Stop the Stripe subscription billing the caller's network at the end of
+        the paid period (`cancel_at_period_end`); the customer keeps Pro until
+        `end_time`. Only `store` "stripe" (the default) is acted on: the other
+        stores answer with `error.message` and, for Apple/Google, the store's
+        subscriptions page in `manage_url`. Idempotent: an already-cancelling
+        subscription is not written again.
+      operationId: Subscription Cancel
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubscriptionCancelArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionCancelResult"
+
+  /subscription/resume:
+    post:
+      description: |
+        Undo /subscription/cancel while the paid period is still running: the
+        Stripe subscription renews again. Same request and result shapes.
+      operationId: Subscription Resume
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubscriptionCancelArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionCancelResult"
+
   /subscription/check-balance-code:
     post:
       description: |
@@ -5606,6 +5681,79 @@ components:
         session_id:
           type: string
           description: both modes; the caller can reconcile the purchase with this
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    SubscriptionDetailsResult:
+      type: object
+      properties:
+        subscriptions:
+          type: array
+          description: One entry per store billing the network, ordered by store.
+          items:
+            type: object
+            properties:
+              store:
+                type: string
+                description: stripe | apple | google | solana | manual | x402 | "" (unknown)
+              plan:
+                type: string
+                description: The wire plan value ("supporter"); shown as Pro.
+              cadence:
+                type: string
+                description: yearly | monthly | "" when unknown.
+              start_time:
+                type: string
+                description: datetime, the start of the active window
+              end_time:
+                type: string
+                description: datetime, the expiry or the next renewal date
+              auto_renew:
+                type: boolean
+                nullable: true
+                description: The store will bill again at end_time; null when the store lookup failed.
+              cancel_at_period_end:
+                type: boolean
+                description: The store lets the paid period run out and will not bill again.
+              can_cancel:
+                type: boolean
+                description: POST /subscription/cancel acts on this entry (Stripe only).
+              manage_url:
+                type: string
+                description: The store's own subscriptions page (Apple, Google), else empty.
+              transaction_id:
+                type: string
+                description: The store handle for support; invoice id, original transaction id, purchase token or payment reference.
+        has_stripe_customer:
+          type: boolean
+          description: A Stripe customer exists for the network; gate for /stripe/customer-portal.
+        update_time:
+          type: string
+          description: datetime
+
+    SubscriptionCancelArgs:
+      type: object
+      properties:
+        store:
+          type: string
+          description: The store to act on. "stripe" (default) is the only store the server can cancel.
+
+    SubscriptionCancelResult:
+      type: object
+      properties:
+        store:
+          type: string
+        end_time:
+          type: string
+          description: datetime, the end of the paid period (Pro is kept until then)
+        auto_renew:
+          type: boolean
+        manage_url:
+          type: string
+          description: For a store the server cannot act on, where the customer cancels.
         error:
           type: object
           properties:
