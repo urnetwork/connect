@@ -64,6 +64,12 @@ const defaultReceiveSequenceBufferSize = 256
 
 var DebugTransferCopyOnWrite = false
 
+// errTransferRouteWriteTimeout identifies a bounded route write that found no
+// accepting carrier. Keep the historical text for logs/API callers while
+// giving higher layers a typed distinction from structural sequence,
+// contract, and encryption failures.
+var errTransferRouteWriteTimeout = errors.New("Timeout.")
+
 // dropErrThrottle rate-limits `[r]drop`. A route that stops accepting writes
 // produces one of these per dropped frame, which under a sustained fault is
 // per-message. See logThrottle in log_throttle.go.
@@ -7635,7 +7641,7 @@ func writeMultiRouteWithCarrier(
 			return transferWriteDisposition{}, err
 		}
 		if !success {
-			return transferWriteDisposition{}, errors.New("Timeout.")
+			return transferWriteDisposition{}, errTransferRouteWriteTimeout
 		}
 		if disposition.transportType == "" {
 			disposition.transportType = TransportTypeUnknown
@@ -7652,7 +7658,7 @@ func writeMultiRouteWithCarrier(
 			return transferWriteDisposition{}, err
 		}
 		if !success {
-			return transferWriteDisposition{}, errors.New("Timeout.")
+			return transferWriteDisposition{}, errTransferRouteWriteTimeout
 		}
 		if transportType == "" {
 			transportType = TransportTypeUnknown
@@ -9443,7 +9449,7 @@ func (self *ReceiveSequence) Run() {
 						blocked = disposition.initiallyBlocked
 						waitDuration = disposition.initialWaitDuration
 						if writeErr == nil && !success {
-							writeErr = errors.New("Timeout.")
+							writeErr = errTransferRouteWriteTimeout
 						}
 					} else {
 						writeErr = ackMultiRouteWriter.Write(

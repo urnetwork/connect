@@ -14085,11 +14085,7 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 	}
 
 	ackCallback := func(err error) {
-		if err == nil {
-			self.addSendAckGroup(sendPacketGroup)
-		} else {
-			self.addError(err)
-		}
+		self.observePacketGroupTransferCompletion(sendPacketGroup, ack, err)
 	}
 	opts := []any{scheduleIpFlow(sendPacketGroup.ipPath)}
 	if self.performanceProfile != nil && self.performanceProfile.AllowDirect {
@@ -14166,12 +14162,7 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 		}
 
 		ackCallback := func(err error) {
-			if err == nil {
-				self.addSendAck(packetByteCount)
-				self.addSendRttSample(time.Since(sendTime))
-			} else {
-				self.addError(err)
-			}
+			self.observePacketTransferCompletion(packetByteCount, sendTime, ack, err)
 		}
 
 		opts := []any{scheduleIpFlow(parsedPacket.ipPath)}
@@ -14223,6 +14214,51 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 		}
 		return success, err
 	}
+}
+
+// Records the terminal disposition of one packet admitted to Transfer.
+//
+// For an Ack-required packet, a terminal error means the reliable Transfer
+// sequence failed and remains hard evidence against the provider. For a NoAck
+// packet, the callback is only the initial route-write disposition: a timeout
+// means this datagram was dropped under transient carrier backpressure, not
+// that the provider failed. Poisoning endErr in that case removes the whole
+// provider channel and resets unrelated TCP flows that share it.
+func (self *multiClientChannel) observePacketTransferCompletion(
+	packetByteCount ByteCount,
+	sendTime time.Time,
+	ack bool,
+	err error,
+) {
+	if err == nil {
+		self.addSendAck(packetByteCount)
+		self.addSendRttSample(time.Since(sendTime))
+		return
+	}
+	if ack || !errors.Is(err, errTransferRouteWriteTimeout) {
+		self.addError(err)
+		return
+	}
+	self.addSendAbandoned(packetByteCount)
+}
+
+// Applies the same reliable-vs-datagram failure boundary to a logical packet
+// group. One failed NoAck group is retired packet-accurately without giving a
+// transient route-write timeout provider-wide shared fate.
+func (self *multiClientChannel) observePacketGroupTransferCompletion(
+	sendPacketGroup *parsedPacketGroup,
+	ack bool,
+	err error,
+) {
+	if err == nil {
+		self.addSendAckGroup(sendPacketGroup)
+		return
+	}
+	if ack || !errors.Is(err, errTransferRouteWriteTimeout) {
+		self.addError(err)
+		return
+	}
+	self.addSendAbandonedGroup(sendPacketGroup)
 }
 
 func (self *multiClientChannel) SendDetailedMessage(message proto.Message, timeout time.Duration, ackCallback func(error)) (bool, error) {
@@ -15331,15 +15367,14 @@ func (self *multiClientChannel) addSendGroup(sendPacketGroup *parsedPacketGroup)
 	self.addSourceToEventBucketWithLock(eventBucket, sendPacketGroup.ipPath)
 }
 
-// addSendAbandoned is the symmetric undo of addSend for a send the transport
-// refused: a hard error from the send call, or a false success (backpressure
-// -- the pack never entered a send sequence before the timeout). Both returns
-// happen strictly before the pack is accepted into a sequence, so the ack
-// callback that would normally retire this accounting can never fire. Without
-// the undo, the refused send stays booked as outstanding forever: the nack
-// count stays up and pendingSendTime keeps aging, so a burst of backpressure
-// is enough for sendStalled to convict an exit that then goes innocently
-// idle.
+// addSendAbandoned is the symmetric undo of addSend for a send that cannot
+// earn acknowledgement credit. This includes a hard error/false result before
+// Transfer admission, and an admitted NoAck datagram whose initial route write
+// failed. The first case has no callback; the second callback describes only
+// that disposable write and must not poison the provider. Without the undo,
+// either send stays booked as outstanding forever: the nack count stays up and
+// pendingSendTime keeps aging, so a burst of backpressure is enough for
+// sendStalled to convict an exit that then goes innocently idle.
 //
 // The aggregate undo is exact. The refused send is by construction still
 // counted in packetStats -- only its own ack could have removed it, and no

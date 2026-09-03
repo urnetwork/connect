@@ -2561,7 +2561,7 @@ func (self *MultiRouteSelector) Write(ctx context.Context, transferFrameBytes []
 		return err
 	}
 	if !success {
-		return errors.New("Timeout.")
+		return errTransferRouteWriteTimeout
 	}
 	return nil
 }
