@@ -184,6 +184,11 @@ paths:
         = "blocks", current streak of consecutive finalized epochs with points)
         with competition ranks (1, 2, 2, 4); only networks that opted in
         (/network/points-ranking-visibility) are listed, so ranks have gaps.
+        Each sort has its own tie-break order, every key descending, then the
+        network id ascending so the order is total: `points` = (points,
+        streak, blocks), `blocks` = (blocks, streak, points), `streak` =
+        (streak, blocks, points). The pages come in exactly that order, and a
+        rank is shared only by networks whose three values all tie.
         Pages use a keyset cursor pinned to a ranking snapshot (rebuilt when an
         epoch finalizes, when a payout plan commits, and hourly); a cursor
         whose snapshot was pruned returns `restart: true` and the client
