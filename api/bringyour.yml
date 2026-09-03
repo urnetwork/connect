@@ -1839,6 +1839,67 @@ paths:
               schema:
                 $ref: "#/components/schemas/StripeCreateCustomerPortalResult"
 
+  /pay/data/checkout:
+    post:
+      description: |
+        Buy a data pack without signing in (the ur.io buy-data page). Starts a
+        hosted checkout with Stripe or Coinbase Commerce and returns the url to
+        send the customer to.
+
+        With `network_name`, the data is applied to that network by the payment
+        webhook as soon as the payment confirms, and the customer is emailed a
+        note that the data is on the network (the code is included, already
+        applied). The name is matched case-insensitively and exactly; an unknown
+        name returns `error.message` "No network named <name>".
+
+        Without `network_name`, the customer receives a data code by email, as
+        before. Stripe collects the email on its checkout page; Coinbase needs
+        `email` in the request.
+
+        The success url is the configured checkout success url plus
+        `item=<item_id>` and, when applying to a network, `network=<name>`.
+        Unauthenticated, per-ip rate limited. Errors are returned as
+        `error.message` with a 200, including "Crypto checkout is not configured"
+        when the Coinbase Commerce api key is absent.
+      operationId: Pay Data Checkout
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PayDataCheckoutArgs"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PayDataCheckoutResult"
+
+  /pay/data/network-lookup:
+    post:
+      description: |
+        Whether a network with exactly this name exists, for the buy-data page.
+        Matched the same way /pay/data/checkout resolves `network_name`
+        (case-insensitive, exact). Unlike /auth/network-check, which is a sign-up
+        similarity check, a name within a few characters of an existing one is
+        NOT reported as existing. Returns only the canonical name, no id.
+        Unauthenticated, per-ip rate limited.
+      operationId: Pay Data Network Lookup
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PayDataNetworkLookupArgs"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PayDataNetworkLookupResult"
+
   /stripe/create-checkout-session:
     post:
       description: |
@@ -5334,6 +5395,59 @@ components:
             message:
               type: string
 
+    PayDataCheckoutArgs:
+      type: object
+      required:
+        - item_id
+        - provider
+      properties:
+        item_id:
+          type: string
+          enum: [data_1tib, data_10tib]
+        provider:
+          type: string
+          enum: [stripe, coinbase]
+        network_name:
+          type: string
+          description: the network that receives the data; omit to receive a code by email
+        email:
+          type: string
+          description: where the code (or the applied note) is sent; required for coinbase without network_name
+    PayDataCheckoutResult:
+      type: object
+      properties:
+        url:
+          type: string
+          description: the hosted checkout url to send the customer to
+        provider:
+          type: string
+          enum: [stripe, coinbase]
+        network_id:
+          type: string
+          format: uuid
+          description: the resolved network when network_name was given
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+    PayDataNetworkLookupArgs:
+      type: object
+      required:
+        - network_name
+      properties:
+        network_name:
+          type: string
+    PayDataNetworkLookupResult:
+      type: object
+      required:
+        - exists
+      properties:
+        exists:
+          type: boolean
+        network_name:
+          type: string
+          description: the name as stored, when it exists
     StripeCreateCheckoutSessionArgs:
       type: object
       properties:
