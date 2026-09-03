@@ -3,6 +3,7 @@ package connect
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -21,6 +22,110 @@ import (
 
 type trackedTunDialConn struct {
 	closed atomic.Bool
+}
+
+// uncomparableTunTestContext catches interface equality on arbitrary Context
+// implementations; its slice deliberately makes the dynamic value uncomparable.
+type uncomparableTunTestContext struct {
+	context.Context
+	marker []byte
+}
+
+func TestTunDialCtxJoinsCallerAndLifecycleCancellation(t *testing.T) {
+	tunCtx, tunCancel := context.WithCancel(context.Background())
+	tun := &Tun{ctx: tunCtx}
+
+	callerCtx, callerCancel := context.WithCancel(context.Background())
+	linkedCtx, cleanup := tun.dialCtx(callerCtx)
+	callerCancel()
+	select {
+	case <-linkedCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("caller cancellation did not reach linked dial context")
+	}
+	cleanup()
+
+	callerCtx, callerCancel = context.WithCancel(context.Background())
+	linkedCtx, cleanup = tun.dialCtx(callerCtx)
+	cleanup()
+	if !errors.Is(linkedCtx.Err(), context.Canceled) {
+		t.Fatalf("cleanup left linked dial context active: %v", linkedCtx.Err())
+	}
+	if callerCtx.Err() != nil {
+		t.Fatalf("cleanup canceled caller context: %v", callerCtx.Err())
+	}
+	callerCancel()
+
+	callerCtx, callerCancel = context.WithCancel(context.Background())
+	linkedCtx, cleanup = tun.dialCtx(callerCtx)
+	tunCancel()
+	select {
+	case <-linkedCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("tun lifecycle cancellation did not reach linked dial context")
+	}
+	cleanup()
+	callerCancel()
+}
+
+func TestTunDialCtxHandlesAlreadyCanceledAndSharedContexts(t *testing.T) {
+	tunCtx, tunCancel := context.WithCancel(context.Background())
+	defer tunCancel()
+	tun := &Tun{ctx: tunCtx}
+
+	canceledCtx, canceledCtxCancel := context.WithCancel(context.Background())
+	canceledCtxCancel()
+	linkedCtx, cleanup := tun.dialCtx(canceledCtx)
+	defer cleanup()
+	if !errors.Is(linkedCtx.Err(), context.Canceled) {
+		t.Fatalf("already-canceled caller returned active dial context: %v", linkedCtx.Err())
+	}
+
+	sharedCtx, sharedCleanup := tun.dialCtx(tunCtx)
+	sharedCleanup()
+	if tunCtx.Err() != nil {
+		t.Fatalf("shared-context cleanup canceled tun lifecycle: %v", tunCtx.Err())
+	}
+	if !errors.Is(sharedCtx.Err(), context.Canceled) {
+		t.Fatalf("shared-context cleanup left derived dial active: %v", sharedCtx.Err())
+	}
+
+	uncomparableCtx := uncomparableTunTestContext{Context: context.Background(), marker: []byte{1}}
+	uncomparableTun := &Tun{ctx: uncomparableCtx}
+	uncomparableLinkedCtx, uncomparableCleanup := uncomparableTun.dialCtx(uncomparableCtx)
+	uncomparableCleanup()
+	if !errors.Is(uncomparableLinkedCtx.Err(), context.Canceled) {
+		t.Fatalf("uncomparable context cleanup left derived dial active: %v", uncomparableLinkedCtx.Err())
+	}
+}
+
+func TestTunDialCtxDoesNotParkOneGoroutinePerLiveCaller(t *testing.T) {
+	tunCtx, tunCancel := context.WithCancel(context.Background())
+	defer tunCancel()
+	tun := &Tun{ctx: tunCtx}
+	baselineGoroutines := runtime.NumGoroutine()
+	const callerCount = 256
+	callerCancels := make([]context.CancelFunc, 0, callerCount)
+	cleanups := make([]context.CancelFunc, 0, callerCount)
+	for range callerCount {
+		callerCtx, callerCancel := context.WithCancel(context.Background())
+		linkedCtx, cleanup := tun.dialCtx(callerCtx)
+		if linkedCtx.Err() != nil {
+			t.Fatalf("live caller produced canceled dial context: %v", linkedCtx.Err())
+		}
+		callerCancels = append(callerCancels, callerCancel)
+		cleanups = append(cleanups, cleanup)
+	}
+	runtime.Gosched()
+	if delta := runtime.NumGoroutine() - baselineGoroutines; 16 < delta {
+		t.Fatalf("%d live dial contexts parked %d goroutines", callerCount, delta)
+	}
+	for _, cleanup := range cleanups {
+		cleanup()
+	}
+	for _, callerCancel := range callerCancels {
+		callerCancel()
+	}
 }
 
 // newTunTcpInboundTestPacket builds the minimum packet shape needed to test

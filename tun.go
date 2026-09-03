@@ -1033,19 +1033,19 @@ func (self *Tun) convertToFullAddr(endpoint netip.AddrPort) (tcpip.FullAddress, 
 	}, protoNumber
 }
 
-func (self *Tun) dialCtx(ctx context.Context) context.Context {
-	if ctx == self.ctx {
-		return ctx
-	}
+// dialCtx joins one call's cancellation to the tun lifecycle without parking
+// a goroutine for every unresolved dial. The returned cleanup owns both the
+// callback registration and derived context and must be called by the caller.
+func (self *Tun) dialCtx(ctx context.Context) (context.Context, context.CancelFunc) {
 	dialCtx, dialCancel := context.WithCancel(self.ctx)
-	go func() {
-		defer dialCancel()
-		select {
-		case <-ctx.Done():
-		case <-self.ctx.Done():
-		}
-	}()
-	return dialCtx
+	stopCallerCancel := context.AfterFunc(ctx, dialCancel)
+	if ctx.Err() != nil {
+		dialCancel()
+	}
+	return dialCtx, func() {
+		stopCallerCancel()
+		dialCancel()
+	}
 }
 
 func (self *Tun) ListenTCP(addr *net.TCPAddr) (*gonet.TCPListener, error) {
@@ -1258,7 +1258,8 @@ func (self *Tun) dialContext(ctx context.Context, network string, address string
 			return nil, syscall.EAFNOSUPPORT
 		}
 	}
-	dialCtx := self.dialCtx(ctx)
+	dialCtx, dialCtxCancel := self.dialCtx(ctx)
+	defer dialCtxCancel()
 
 	var addrs []netip.Addr
 	if parsedAddrErr == nil {
