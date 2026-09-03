@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/net/dns/dnsmessage"
 )
 
 // The egress-aware resolver exists to close the control-plane capture hole:
@@ -15,6 +17,85 @@ import (
 // the tunnel's own (not yet working) resolver. These tests pin the portable
 // half: the resolver selection, the server usability filter, and the
 // control-dial evidence lines.
+
+// A local wire responder makes address-family tests independent of host files,
+// resolver order, external DNS, and whether the test host has IPv6 configured.
+func newFamilyTestResolver(t *testing.T, addrs ...netip.Addr) *net.Resolver {
+	t.Helper()
+	packetConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		packetConn.Close()
+	})
+
+	responsePayload := func(queryPayload []byte) ([]byte, bool) {
+		var query dnsmessage.Message
+		if err := query.Unpack(queryPayload); err != nil || len(query.Questions) != 1 {
+			return nil, false
+		}
+		question := query.Questions[0]
+		response := dnsmessage.Message{
+			Header: dnsmessage.Header{
+				ID:                 query.Header.ID,
+				Response:           true,
+				RecursionDesired:   query.Header.RecursionDesired,
+				RecursionAvailable: true,
+			},
+			Questions: query.Questions,
+		}
+		for _, addr := range addrs {
+			addr = addr.Unmap()
+			header := dnsmessage.ResourceHeader{
+				Name:  question.Name,
+				Class: dnsmessage.ClassINET,
+				TTL:   60,
+			}
+			switch {
+			case question.Type == dnsmessage.TypeA && addr.Is4():
+				header.Type = dnsmessage.TypeA
+				response.Answers = append(response.Answers, dnsmessage.Resource{
+					Header: header,
+					Body:   &dnsmessage.AResource{A: addr.As4()},
+				})
+			case question.Type == dnsmessage.TypeAAAA && addr.Is6():
+				header.Type = dnsmessage.TypeAAAA
+				response.Answers = append(response.Answers, dnsmessage.Resource{
+					Header: header,
+					Body:   &dnsmessage.AAAAResource{AAAA: addr.As16()},
+				})
+			}
+		}
+		payload, err := response.Pack()
+		return payload, err == nil
+	}
+
+	go func() {
+		buffer := make([]byte, 2048)
+		for {
+			count, sourceAddr, err := packetConn.ReadFrom(buffer)
+			if err != nil {
+				return
+			}
+			payload, ok := responsePayload(buffer[:count])
+			if !ok {
+				continue
+			}
+			if _, err := packetConn.WriteTo(payload, sourceAddr); err != nil {
+				return
+			}
+		}
+	}()
+
+	dialer := &net.Dialer{}
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, _ string, _ string) (net.Conn, error) {
+			return dialer.DialContext(ctx, "udp4", packetConn.LocalAddr().String())
+		},
+	}
+}
 
 func TestEgressAwareResolverPrefersCustom(t *testing.T) {
 	custom := &net.Resolver{}
@@ -158,32 +239,35 @@ func TestResolveEgressUDPAddrUnboundMatchesNet(t *testing.T) {
 	}
 }
 
-// resolveEgressUDPAddr is the actual call site the H3/QUIC transport uses;
-// pinning pickControlIPAddr alone does not prove it is wired in here. Both
-// force4 and force6 pick a real address because /etc/hosts publishes both
-// 127.0.0.1 and ::1 for "localhost", and with SetEgressInterfaceIndex(0, 0)
-// this exercises the unbound branch -- the only branch ever taken on mobile,
-// where this fix matters.
+// resolveEgressUDPAddr is the actual call site the H3/QUIC transport uses. Its
+// resolver-selection helper is exercised with the same unbound state used on
+// mobile and a controlled default resolver that publishes both families. A
+// host's localhost entry is not a dual-stack fixture: many valid host files
+// map localhost only to 127.0.0.1 and give ::1 a different alias.
 func TestResolveEgressUDPAddrHonorsForcedFamily(t *testing.T) {
-	SetEgressInterfaceIndex(0, 0)
+	ipv4 := netip.MustParseAddr("192.0.2.1")
+	ipv6 := netip.MustParseAddr("2001:db8::1")
+	resolver := newFamilyTestResolver(t, ipv6, ipv4)
 	defer SetControlIpFamilyPolicy(IpFamilyAuto)
 
 	SetControlIpFamilyPolicy(IpFamilyForce4)
-	got4, err := resolveEgressUDPAddr(context.Background(), "localhost:53")
+	got4, err := resolveEgressUDPAddrWithResolvers(
+		t.Context(), "dual-stack.resolver.test.:53", nil, resolver, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got4.IP.To4() == nil {
-		t.Fatalf("force4: got %s, want an IPv4 address", got4)
+	if !got4.IP.Equal(net.IP(ipv4.AsSlice())) {
+		t.Fatalf("force4: got %s, want %s", got4, ipv4)
 	}
 
 	SetControlIpFamilyPolicy(IpFamilyForce6)
-	got6, err := resolveEgressUDPAddr(context.Background(), "localhost:53")
+	got6, err := resolveEgressUDPAddrWithResolvers(
+		t.Context(), "dual-stack.resolver.test.:53", nil, resolver, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got6.IP.To4() != nil || got6.IP.To16() == nil {
-		t.Fatalf("force6: got %s, want an IPv6 address", got6)
+	if !got6.IP.Equal(net.IP(ipv6.AsSlice())) {
+		t.Fatalf("force6: got %s, want %s", got6, ipv6)
 	}
 }
 
@@ -191,24 +275,126 @@ func TestResolveEgressUDPAddrHonorsForcedFamily(t *testing.T) {
 // resolver. It must still honor the process-wide family policy, but it must
 // not inherit an interface-family constraint from an unrelated egress socket.
 func TestResolveUDPAddrWithResolverHonorsForcedFamily(t *testing.T) {
-	resolver := &net.Resolver{PreferGo: true}
+	ipv4 := netip.MustParseAddr("192.0.2.1")
+	ipv6 := netip.MustParseAddr("2001:db8::1")
+	resolver := newFamilyTestResolver(t, ipv6, ipv4)
 	defer SetControlIpFamilyPolicy(IpFamilyAuto)
 
 	SetControlIpFamilyPolicy(IpFamilyForce4)
-	got4, err := resolveUDPAddrWithResolver(context.Background(), "localhost:53", resolver, false)
+	got4, err := resolveUDPAddrWithResolver(
+		t.Context(), "dual-stack.resolver.test.:53", resolver, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got4.IP.To4() == nil {
-		t.Fatalf("force4 custom resolver: got %s, want an IPv4 address", got4)
+	if !got4.IP.Equal(net.IP(ipv4.AsSlice())) {
+		t.Fatalf("force4 custom resolver: got %s, want %s", got4, ipv4)
 	}
 
 	SetControlIpFamilyPolicy(IpFamilyForce6)
-	got6, err := resolveUDPAddrWithResolver(context.Background(), "localhost:53", resolver, false)
+	got6, err := resolveUDPAddrWithResolver(
+		t.Context(), "dual-stack.resolver.test.:53", resolver, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got6.IP.To4() != nil || got6.IP.To16() == nil {
-		t.Fatalf("force6 custom resolver: got %s, want an IPv6 address", got6)
+	if !got6.IP.Equal(net.IP(ipv6.AsSlice())) {
+		t.Fatalf("force6 custom resolver: got %s, want %s", got6, ipv6)
+	}
+}
+
+// A force chooses among addresses a name publishes; it does not make a
+// single-family control name unusable. Pin both fallback directions through
+// the resolver-level path, not only through pickControlIPAddr's slice test.
+func TestResolveUDPAddrWithResolverFallsBackWhenForcedFamilyIsUnavailable(t *testing.T) {
+	testCases := []struct {
+		policy    IpFamilyPolicy
+		available netip.Addr
+	}{
+		{policy: IpFamilyForce6, available: netip.MustParseAddr("192.0.2.1")},
+		{policy: IpFamilyForce4, available: netip.MustParseAddr("2001:db8::1")},
+	}
+	defer SetControlIpFamilyPolicy(IpFamilyAuto)
+	for _, test := range testCases {
+		resolver := newFamilyTestResolver(t, test.available)
+		SetControlIpFamilyPolicy(test.policy)
+		got, err := resolveUDPAddrWithResolver(
+			t.Context(), "single-stack.resolver.test.:53", resolver, false)
+		if err != nil {
+			t.Fatalf("policy %d with %s: %v", test.policy, test.available, err)
+		}
+		if !got.IP.Equal(net.IP(test.available.AsSlice())) {
+			t.Errorf(
+				"policy %d with only %s available: got %s",
+				test.policy,
+				test.available,
+				got,
+			)
+		}
+	}
+}
+
+// A successful DNS response with no usable A or AAAA records is not a zero IP
+// destination. The resolver path must return its no-address error instead.
+func TestResolveUDPAddrWithResolverRejectsEmptyAnswer(t *testing.T) {
+	resolver := newFamilyTestResolver(t)
+	if _, err := resolveUDPAddrWithResolver(
+		t.Context(), "empty.resolver.test.:53", resolver, false); err == nil {
+		t.Fatal("an empty DNS answer resolved successfully")
+	}
+}
+
+// A literal has no resolver-side family choice. An opposite force must leave
+// it intact, and neither the default nor a custom resolver may be consulted.
+func TestResolveUDPAddrWithResolverLeavesIPLiteralFamilyUnchanged(t *testing.T) {
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(context.Context, string, string) (net.Conn, error) {
+			return nil, context.Canceled
+		},
+	}
+	testCases := []struct {
+		policy IpFamilyPolicy
+		addr   string
+		want   string
+	}{
+		{policy: IpFamilyForce6, addr: "192.0.2.7:443", want: "192.0.2.7:443"},
+		{policy: IpFamilyForce4, addr: "[2001:db8::7]:443", want: "[2001:db8::7]:443"},
+		{policy: IpFamilyForce4, addr: "[fe80::1%7]:53", want: "[fe80::1%7]:53"},
+	}
+	defer SetControlIpFamilyPolicy(IpFamilyAuto)
+	for _, test := range testCases {
+		SetControlIpFamilyPolicy(test.policy)
+		got, err := resolveUDPAddrWithResolver(t.Context(), test.addr, resolver, false)
+		if err != nil {
+			t.Errorf("policy %d resolving %s: %v", test.policy, test.addr, err)
+			continue
+		}
+		if got.String() != test.want {
+			t.Errorf("policy %d resolving %s: got %s, want %s", test.policy, test.addr, got, test.want)
+		}
+	}
+}
+
+// Invalid address syntax and numeric ports outside UDP's range fail before a
+// lookup. In particular, strconv.Atoi alone accepts values net cannot dial.
+func TestResolveUDPAddrWithResolverRejectsMalformedAddress(t *testing.T) {
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(context.Context, string, string) (net.Conn, error) {
+			return nil, context.Canceled
+		},
+	}
+	addrs := []string{
+		"",
+		":53",
+		"missing-port",
+		"resolver.test.:not-a-port",
+		"resolver.test.:-1",
+		"resolver.test.:65536",
+		"2001:db8::1:53",
+	}
+	for _, addr := range addrs {
+		if _, err := resolveUDPAddrWithResolver(t.Context(), addr, resolver, false); err == nil {
+			t.Errorf("resolve %q succeeded, want an address error", addr)
+		}
 	}
 }

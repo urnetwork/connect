@@ -260,6 +260,23 @@ func TestInternalDohUdpFollowsRuntimeFamilyPolicy(t *testing.T) {
 	}
 }
 
+// The protected-domain UDP path parses its address before touching the DoH
+// cache. Empty hosts and numeric ports net cannot dial must fail immediately.
+func TestInternalDohUDPRejectsMalformedAddress(t *testing.T) {
+	resolver := &internalDohResolver{}
+	addrs := []string{
+		"",
+		":53",
+		"service.test.:-1",
+		"service.test.:65536",
+	}
+	for _, addr := range addrs {
+		if _, err := resolver.resolveUDPAddr(t.Context(), addr); err == nil {
+			t.Errorf("resolve %q succeeded, want an address error", addr)
+		}
+	}
+}
+
 func TestInternalDohRawDialFallsBackAcrossAddressFamilies(t *testing.T) {
 	addrs := orderInternalDohAddrs([]netip.Addr{
 		netip.MustParseAddr("192.0.2.1"),

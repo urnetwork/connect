@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/netip"
 	"sort"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -325,9 +324,12 @@ func (self *internalDohResolver) resolveUDPAddr(ctx context.Context, address str
 	if err != nil {
 		return nil, err
 	}
-	port, err := strconv.Atoi(portString)
+	if host == "" {
+		return nil, fmt.Errorf("resolve %s: empty host", address)
+	}
+	port, err := parseControlUDPPort(address, portString)
 	if err != nil {
-		return nil, fmt.Errorf("resolve %s: non-numeric port: %w", address, err)
+		return nil, err
 	}
 	// Unlike the stream path, this method is called directly by QUIC and
 	// packet-translation transports rather than through ConnectSettings.
