@@ -149,4 +149,40 @@ func TestResolveEgressUDPAddrUnboundMatchesNet(t *testing.T) {
 	if udpAddr.Port != want.Port {
 		t.Fatalf("got %s want %s", udpAddr, want)
 	}
+	// net.ResolveUDPAddr's own tie-break is IPv4-first (addrs.first(isIPv4),
+	// GOROOT/src/net/ipsock.go); pickControlIPAddr must reproduce it exactly
+	// so dropping the direct net.ResolveUDPAddr call did not quietly change
+	// the default family this path dials.
+	if !udpAddr.IP.Equal(want.IP) {
+		t.Fatalf("got %s want %s (family tie-break must match net.ResolveUDPAddr)", udpAddr, want)
+	}
+}
+
+// resolveEgressUDPAddr is the actual call site the H3/QUIC transport uses;
+// pinning pickControlIPAddr alone does not prove it is wired in here. Both
+// force4 and force6 pick a real address because /etc/hosts publishes both
+// 127.0.0.1 and ::1 for "localhost", and with SetEgressInterfaceIndex(0, 0)
+// this exercises the unbound branch -- the only branch ever taken on mobile,
+// where this fix matters.
+func TestResolveEgressUDPAddrHonorsForcedFamily(t *testing.T) {
+	SetEgressInterfaceIndex(0, 0)
+	defer SetControlIpFamilyPolicy(IpFamilyAuto)
+
+	SetControlIpFamilyPolicy(IpFamilyForce4)
+	got4, err := resolveEgressUDPAddr(context.Background(), "localhost:53")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got4.IP.To4() == nil {
+		t.Fatalf("force4: got %s, want an IPv4 address", got4)
+	}
+
+	SetControlIpFamilyPolicy(IpFamilyForce6)
+	got6, err := resolveEgressUDPAddr(context.Background(), "localhost:53")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got6.IP.To4() != nil || got6.IP.To16() == nil {
+		t.Fatalf("force6: got %s, want an IPv6 address", got6)
+	}
 }

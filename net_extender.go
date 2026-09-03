@@ -157,6 +157,15 @@ func newExtenderDialTlsContext(
 
 		switch extenderConfig.Profile.ConnectMode {
 		case ExtenderConnectModeTcpTls:
+			// Deliberately NOT routed through dialControlTlsWithFamilyFallback,
+			// unlike the normal and resilient dialers. `authority` is built
+			// from extenderConfig.Ip, a netip.Addr, so it is always an IP
+			// LITERAL: the family is fixed by the address, there is no other
+			// family to retry onto -- `dial tcp6 1.1.1.1:443` is "no suitable
+			// address found" -- and there is no name resolution whose family
+			// choice a strike could inform. controlDialNetwork leaves literal
+			// dials unnarrowed for the same reason, which is what keeps this
+			// whole fallback layer alive under a demotion.
 			conn, err := connectSettings.DialContext(ctx, "tcp", authority)
 			if err != nil {
 				return nil, err
