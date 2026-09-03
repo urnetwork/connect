@@ -11,8 +11,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // A direct TLS dial must use ConnectSettings.DialContext when one is supplied,
@@ -134,5 +136,112 @@ func TestClientStrategySeamDefaultsAreDisabled(t *testing.T) {
 	}
 	if settings.TlsConfig == nil || settings.TlsConfig.MinVersion < tls.VersionTLS12 {
 		t.Fatal("default strategy lost its production TLS configuration")
+	}
+}
+
+// The MOBILE configuration -- no proxy, no injected dial context -- is the one
+// that took the old fast path and bypassed ConnectSettings.DialContext
+// entirely. That bypass is why DisableIpv4/DisableIpv6 were dead: the flags
+// were honored by the fragment and reorder dialers and ignored by the default
+// one, so the strategy raced a forced dialer against an unforced one.
+//
+// The hook is on ConnectSettings.DialContext -- the seam the family policy
+// lives on -- and records the network string AFTER controlDialNetwork has
+// resolved it. That placement is what makes this test FAIL on unfixed code:
+// with the fast path still present the mobile shape returns a raw tls.Dialer
+// and never calls DialContext at all, so the hook never fires and the test
+// fails on "the seam is still bypassed".
+//
+// A hook on the net.Dialer's Control callback could not do this. Control is
+// documented to receive an already-family-specific network ("tcp4"/"tcp6"),
+// never "tcp", so against an IPv4 literal it records "tcp4" whether or not the
+// bypass was ever closed -- a guard that passes on the unfixed code it exists
+// to catch.
+//
+// The target is a NAME, not an address literal. controlDialNetwork
+// deliberately leaves a literal's network string alone -- the address already
+// fixes the family, so narrowing there can only break a working dial -- and
+// the seam this test exists to guard is the one that steers a RESOLUTION.
+func TestNormalTlsDialHonorsFamilyPolicyWithNoInjectedDialContext(t *testing.T) {
+	SetControlIpFamilyPolicy(IpFamilyForce4)
+	defer SetControlIpFamilyPolicy(IpFamilyAuto)
+
+	settings := DefaultClientStrategySettings()
+	if settings.ProxySettings != nil || settings.DialContextSettings != nil {
+		t.Fatal("the default settings are no longer the mobile shape this test pins")
+	}
+
+	var mutex sync.Mutex
+	var networks []string
+	settings.DialNetworkHook = func(network string, addr string) {
+		mutex.Lock()
+		defer mutex.Unlock()
+		networks = append(networks, network)
+	}
+
+	dialTls := newNormalDialTlsContext(settings, clientHttpNextProtos)
+	// the host is never reached: .invalid is reserved by RFC 2606 and never
+	// resolves. What is under test is the NETWORK STRING the seam resolved,
+	// which is recorded before the dial is attempted.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	conn, err := dialTls(ctx, "tcp", "family-seam.invalid:443")
+	if err == nil {
+		conn.Close()
+	}
+
+	mutex.Lock()
+	defer mutex.Unlock()
+	if len(networks) == 0 {
+		t.Fatal("ConnectSettings.DialContext was never called -- the seam is still bypassed")
+	}
+	if len(networks) != 1 || networks[0] != "tcp4" {
+		t.Fatalf("resolved %v, want exactly [tcp4] under IpFamilyForce4", networks)
+	}
+}
+
+// A pooled connection that connected cleanly and later went dark is invisible
+// to any dial-time logic: http/2 multiplexes every later request onto it, and
+// with no health check each one hangs to the request timeout. Go's default for
+// HTTP2Config.SendPingTimeout is zero, which its own doc defines as "no health
+// check is performed".
+//
+// This also pins that the config is built on EVERY platform. It used to be
+// built only under the mobile memory guard, so desktop had no HTTP2Config at
+// all and therefore no health check either.
+func TestHttpClientConfiguresHttp2HealthCheck(t *testing.T) {
+	settings := DefaultClientStrategySettings()
+	dialer := &clientDialer{
+		dialTlsContext:     newNormalDialTlsContext(settings, clientWebSocketNextProtos),
+		httpDialTlsContext: newNormalDialTlsContext(settings, clientHttpNextProtos),
+		settings:           settings,
+	}
+	client := dialer.HttpClient()
+	defer client.CloseIdleConnections()
+
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("unexpected transport type %T", client.Transport)
+	}
+	if transport.HTTP2 == nil {
+		t.Fatal("no HTTP2Config: a pooled dead connection is never detected")
+	}
+	// asserted against the SETTINGS, not against bare literals: the durations
+	// are tunable fields, so a test that pinned 10s/5s directly would fail an
+	// embedder that legitimately tuned them, and would stop testing that the
+	// transport is wired to the settings at all
+	if settings.Http2SendPingTimeout <= 0 {
+		t.Fatal("the default Http2SendPingTimeout is zero, which disables the health check")
+	}
+	if settings.Http2PingTimeout <= 0 {
+		t.Fatal("the default Http2PingTimeout is zero")
+	}
+	if transport.HTTP2.SendPingTimeout != settings.Http2SendPingTimeout {
+		t.Fatalf("SendPingTimeout is %s, want the settings value %s",
+			transport.HTTP2.SendPingTimeout, settings.Http2SendPingTimeout)
+	}
+	if transport.HTTP2.PingTimeout != settings.Http2PingTimeout {
+		t.Fatalf("PingTimeout is %s, want the settings value %s",
+			transport.HTTP2.PingTimeout, settings.Http2PingTimeout)
 	}
 }
