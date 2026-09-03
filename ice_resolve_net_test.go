@@ -32,7 +32,8 @@ func newBlockingIceResolver() *blockingIceResolver {
 	var enteredOnce sync.Once
 	var exitedOnce sync.Once
 	resolver := &net.Resolver{
-		PreferGo: true,
+		PreferGo:     true,
+		StrictErrors: true,
 		Dial: func(ctx context.Context, network string, address string) (
 			net.Conn,
 			error,
@@ -102,6 +103,12 @@ func TestPeerConnectionResolveNetCancelsStunAndTurnLookups(t *testing.T) {
 			blockedResolver.resolver,
 			time.Hour,
 		)
+		if network.resolver == blockedResolver.resolver {
+			t.Fatal("peer resolver aliases the shared resolver")
+		}
+		if !network.resolver.PreferGo || !network.resolver.StrictErrors {
+			t.Fatal("peer resolver did not preserve resolver policy")
+		}
 		resolveResult := make(chan error, 1)
 		go func() {
 			resolveResult <- testCase.resolve(network)

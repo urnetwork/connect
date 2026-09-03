@@ -364,6 +364,7 @@ type FindProviders2Args struct {
 	ExcludeClientIds    []Id            `json:"exclude_client_ids"`
 	ExcludeDestinations [][]Id          `json:"exclude_destinations,omitempty"`
 	RankMode            string          `json:"rank_mode"`
+	ForceMinimum        bool            `json:"force_minimum,omitempty"`
 }
 
 type FindProviders2Result struct {

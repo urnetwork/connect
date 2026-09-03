@@ -47,6 +47,54 @@ func TestPlatformPacketConnClampsQuicSocketRequests(t *testing.T) {
 	}
 }
 
+// The SDK desktop DeviceLocal target is intentionally repeated here instead
+// of importing the parent SDK package into Connect. This pins the exact cap
+// which quic-go's fixed 7 MiB request must not override in the simulator.
+func TestPlatformPacketConnClampsQuicRequestToDeviceMemoryTarget(t *testing.T) {
+	const deviceMemoryTargetByteCount = ByteCount(20 * 1024 * 1024)
+	const quicSocketBufferRequestByteCount = 7 * 1024 * 1024
+
+	settings := DefaultPlatformTransportSettingsWithMemoryTarget(
+		deviceMemoryTargetByteCount,
+	)
+	wantBufferByteCount := kib(320)
+	if settings.H3SocketReadBufferByteCount != wantBufferByteCount ||
+		settings.H3SocketWriteBufferByteCount != wantBufferByteCount {
+		t.Fatalf(
+			"device-target socket caps = (%d, %d), want (%d, %d)",
+			settings.H3SocketReadBufferByteCount,
+			settings.H3SocketWriteBufferByteCount,
+			wantBufferByteCount,
+			wantBufferByteCount,
+		)
+	}
+
+	spy := &packetBufferSpy{}
+	capped := capPlatformPacketConn(
+		spy,
+		settings.H3SocketReadBufferByteCount,
+		settings.H3SocketWriteBufferByteCount,
+	)
+	readSetter := capped.(interface{ SetReadBuffer(int) error })
+	writeSetter := capped.(interface{ SetWriteBuffer(int) error })
+	if err := readSetter.SetReadBuffer(quicSocketBufferRequestByteCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSetter.SetWriteBuffer(quicSocketBufferRequestByteCount); err != nil {
+		t.Fatal(err)
+	}
+	if spy.readBufferByteCount != int(wantBufferByteCount) ||
+		spy.writeBufferByteCount != int(wantBufferByteCount) {
+		t.Fatalf(
+			"quic-go socket requests resolved to (%d, %d), want capped (%d, %d)",
+			spy.readBufferByteCount,
+			spy.writeBufferByteCount,
+			wantBufferByteCount,
+			wantBufferByteCount,
+		)
+	}
+}
+
 func TestPlatformPacketConnPreservesUDPFastPath(t *testing.T) {
 	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero})
 	if err != nil {

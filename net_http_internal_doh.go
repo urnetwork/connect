@@ -22,11 +22,9 @@ const internalDohDialFallbackDelay = 250 * time.Millisecond
 // passes only IP literals to the underlying dialer. TLS remains outside this
 // layer, where it still sees the original hostname.
 type internalDohResolver struct {
-	cache       *DohCache
-	domains     []string
-	disableIpv4 bool
-	disableIpv6 bool
-	nextAddr    atomic.Uint64
+	cache    *DohCache
+	domains  []string
+	nextAddr atomic.Uint64
 }
 
 // clientStrategySettingsWithInternalDoh installs the resolver ahead of every
@@ -47,10 +45,8 @@ func clientStrategySettingsWithInternalDoh(settings *ClientStrategySettings) (*C
 	copied.ConnectSettings = settings.ConnectSettings
 	baseConnectSettings := copied.ConnectSettings
 	resolver := &internalDohResolver{
-		cache:       NewDohCache(internalDohSettings(settings.DohSettings)),
-		domains:     domains,
-		disableIpv4: copied.DisableIpv4,
-		disableIpv6: copied.DisableIpv6,
+		cache:   NewDohCache(internalDohSettings(settings.DohSettings)),
+		domains: domains,
 	}
 	copied.ConnectSettings.DialContextSettings = &DialContextSettings{
 		DialContext: resolver.wrapDialContext(baseConnectSettings.DialContext),
@@ -159,10 +155,10 @@ type internalDohQueryResult struct {
 
 func (self *internalDohResolver) resolve(ctx context.Context, network string, host string) ([]netip.Addr, error) {
 	recordTypes := make([]string, 0, 2)
-	if !self.disableIpv6 && !strings.HasSuffix(network, "4") {
+	if !strings.HasSuffix(network, "4") {
 		recordTypes = append(recordTypes, "AAAA")
 	}
-	if !self.disableIpv4 && !strings.HasSuffix(network, "6") {
+	if !strings.HasSuffix(network, "6") {
 		recordTypes = append(recordTypes, "A")
 	}
 	if len(recordTypes) == 0 {
@@ -333,7 +329,15 @@ func (self *internalDohResolver) resolveUDPAddr(ctx context.Context, address str
 	if err != nil {
 		return nil, fmt.Errorf("resolve %s: non-numeric port: %w", address, err)
 	}
-	addrs, err := self.resolve(ctx, "udp", host)
+	// Unlike the stream path, this method is called directly by QUIC and
+	// packet-translation transports rather than through ConnectSettings.
+	// Resolve the process-wide family policy here, at dial time, so a strategy
+	// constructed before a runtime policy change does not keep stale behavior.
+	network, err := controlDialNetwork("udp", address)
+	if err != nil {
+		return nil, err
+	}
+	addrs, err := self.resolve(ctx, network, host)
 	if err != nil {
 		return nil, err
 	}
@@ -361,7 +365,7 @@ func (self *ClientStrategy) resolveControlUDPAddr(ctx context.Context, address s
 		}
 	}
 	if self != nil && self.settings != nil && self.settings.ConnectSettings.Resolver != nil {
-		return resolveUDPAddrWithResolver(ctx, address, self.settings.ConnectSettings.Resolver)
+		return resolveUDPAddrWithResolver(ctx, address, self.settings.ConnectSettings.Resolver, false)
 	}
 	return resolveEgressUDPAddr(ctx, address)
 }

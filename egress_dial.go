@@ -73,30 +73,48 @@ func egressAwareResolver(custom *net.Resolver) *net.Resolver {
 	return egressResolver()
 }
 
-// resolveEgressUDPAddr is net.ResolveUDPAddr for control dials: while this
-// process's own sockets are steered around the tunnel it provides, it resolves
-// through the egress-bound resolver instead of the OS resolver, preferring an
-// address family the bind can actually carry. On a platform with no egress
-// escape, or with none in force, it is exactly net.ResolveUDPAddr.
+// resolveEgressUDPAddr is net.ResolveUDPAddr for control dials, made
+// family-aware: while this process's own sockets are steered around the
+// tunnel it provides, it resolves through the egress-bound resolver instead
+// of the OS resolver. On a platform with no egress escape, or with none in
+// force -- which is every mobile build, since egressBound() is never true
+// there -- it resolves through the OS resolver instead. Either way, the
+// address returned is chosen by pickControlIPAddr rather than taken as the
+// resolver's first result, so a forced family or a live demotion applies on
+// both paths.
+//
+// While bound, an interface index that is set for exactly one family (the
+// normal single-homed shape) is a hard constraint and overrides the pick;
+// when both are set (or neither), the bind constrains nothing about family
+// and the preference from pickControlIPAddr stands.
 //
 // This is the H3/QUIC platform transport's name path (transport.go), and it is
 // the second half of the Linux fix: pinning the resolver into NetDialer alone
 // would leave these three call sites resolving through the captured stub.
 func resolveEgressUDPAddr(ctx context.Context, addr string) (*net.UDPAddr, error) {
 	resolver := egressResolver()
-	return resolveUDPAddrWithResolver(ctx, addr, resolver)
+	bound := resolver != nil && egressBound()
+	if !bound {
+		// Keep the platform resolver but not net.ResolveUDPAddr: the caller
+		// supplied a lifecycle context specifically so a transport shutdown can
+		// interrupt a name lookup.
+		resolver = net.DefaultResolver
+	}
+	return resolveUDPAddrWithResolver(ctx, addr, resolver, bound)
 }
 
 // resolveUDPAddrWithResolver is the context-aware UDP name path shared by the
 // platform resolver and an explicitly configured client-strategy resolver.
-// nil means the platform default resolver.
-func resolveUDPAddrWithResolver(ctx context.Context, addr string, resolver *net.Resolver) (*net.UDPAddr, error) {
+// nil means the platform default resolver. bound applies an egress interface's
+// hard single-family constraint after the process-wide family preference.
+func resolveUDPAddrWithResolver(ctx context.Context, addr string, resolver *net.Resolver, bound bool) (*net.UDPAddr, error) {
 	if resolver == nil {
 		// Keep the platform resolver but not net.ResolveUDPAddr: the caller
 		// supplied a lifecycle context specifically so a transport shutdown can
 		// interrupt a name lookup.
 		resolver = net.DefaultResolver
 	}
+
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, err
@@ -105,7 +123,7 @@ func resolveUDPAddrWithResolver(ctx context.Context, addr string, resolver *net.
 	if err != nil {
 		return nil, fmt.Errorf("resolve %s: non-numeric port: %w", addr, err)
 	}
-	// an ip literal needs no resolution
+	// an ip literal needs no resolution and has no family choice to make
 	if ip, ipErr := netip.ParseAddr(host); ipErr == nil {
 		return &net.UDPAddr{IP: net.IP(ip.AsSlice()), Port: port, Zone: ip.Zone()}, nil
 	}
@@ -116,16 +134,36 @@ func resolveUDPAddrWithResolver(ctx context.Context, addr string, resolver *net.
 	if len(addrs) == 0 {
 		return nil, fmt.Errorf("resolve %s: no addresses", host)
 	}
-	index4, index6 := EgressInterfaceIndex()
-	pick := addrs[0]
+	pick := pickControlIPAddr(addrs)
+	if bound {
+		index4, index6 := EgressInterfaceIndex()
+		pick = egressBoundIPAddr(addrs, index4, index6, pick)
+	}
+	return &net.UDPAddr{IP: pick.IP, Port: port, Zone: pick.Zone}, nil
+}
+
+// egressBoundIPAddr applies an interface-index bind's family constraint on
+// top of pickControlIPAddr's preference, when the bind actually expresses
+// one. Only a SINGLE family's index being set is a family constraint. With
+// both indexes set -- the normal shape while the Windows service holds the
+// tunnel up, per EgressInterfaceIndex's doc comment -- the bind constrains
+// nothing about family: a naive "first address whose family has a nonzero
+// index" loop would match addrs[0] on its very first iteration regardless of
+// family, silently discarding pick (and with it any Force4/Force6 or
+// demotion). With neither index set there is no bind at all. So the override
+// only runs when exactly one of index4/index6 is nonzero; otherwise pick
+// stands unchanged.
+func egressBoundIPAddr(addrs []net.IPAddr, index4 uint32, index6 uint32, pick net.IPAddr) net.IPAddr {
+	if (index4 == 0) == (index6 == 0) {
+		return pick
+	}
 	for _, a := range addrs {
 		is4 := a.IP.To4() != nil
 		if (is4 && index4 != 0) || (!is4 && index6 != 0) {
-			pick = a
-			break
+			return a
 		}
 	}
-	return &net.UDPAddr{IP: pick.IP, Port: port, Zone: pick.Zone}, nil
+	return pick
 }
 
 // usableEgressDnsServer reports whether an adapter-configured resolver can be
@@ -205,6 +243,18 @@ func controlDialThrottle(key string) *logThrottle {
 // `bound` is whether this dial path rides the egress-bound dialer — false
 // names a path that is in-tunnel by design (e.g. the mux's tunnel DoH).
 func logControlDialResult(log Logger, tag string, bound bool, network string, addr string, conn net.Conn, err error) {
+	l := loggerOrDefault(log)
+
+	// The family line is NOT gated on egressBound(). The [egress]dial line
+	// below is desktop-only by design -- it reports an interface binding that
+	// only Windows and macOS ever force -- but Android and iOS are the two
+	// platforms where a broken address family is actually reported, and until
+	// this line existed no mobile bundle at any verbosity could say which
+	// family a control dial used.
+	if ok, _ := controlDialThrottle("family|" + tag + "|" + addr).Allow(time.Now()); ok {
+		l.Infof("%s\n", controlDialFamilyLine(tag, network, addr, conn, err))
+	}
+
 	if !egressBound() {
 		return
 	}
@@ -221,7 +271,6 @@ func logControlDialResult(log Logger, tag string, bound bool, network string, ad
 	if 0 < suppressed {
 		suffix = fmt.Sprintf(" (%d suppressed)", suppressed)
 	}
-	l := loggerOrDefault(log)
 	if err != nil {
 		l.Infof("[egress]dial tag=%s %s %s if=4:%d/6:%d bound=%s err=%s%s\n", tag, network, addr, index4, index6, boundStr, err, suffix)
 	} else {

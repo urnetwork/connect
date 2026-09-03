@@ -215,6 +215,51 @@ func TestInternalDohDoesNotOverrideCustomResolver(t *testing.T) {
 	}
 }
 
+// Protected-domain UDP resolution is the direct QUIC/packet-translation path;
+// it does not pass through ConnectSettings.DialContext. The family policy is
+// therefore read inside resolveUDPAddr, on every call, rather than captured
+// when the client strategy is constructed.
+func TestInternalDohUdpFollowsRuntimeFamilyPolicy(t *testing.T) {
+	dohServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		writeDohWire(w, request, []netip.Addr{
+			netip.MustParseAddr("192.0.2.1"),
+			netip.MustParseAddr("2001:db8::1"),
+		}, 60, false)
+	}))
+	defer dohServer.Close()
+
+	dohSettings := DefaultDohSettings()
+	dohSettings.RequestTimeout = time.Second
+	dohSettings.DnsResolverSettings = &DnsResolverSettings{
+		EnableRemoteDoh:   true,
+		RemoteDohUrlsIpv4: []string{dohServer.URL},
+	}
+	resolver := &internalDohResolver{
+		cache: NewDohCache(internalDohSettings(dohSettings)),
+	}
+	defer resolver.Close()
+	defer SetControlIpFamilyPolicy(IpFamilyAuto)
+
+	tests := []struct {
+		policy IpFamilyPolicy
+		want   netip.Addr
+	}{
+		{policy: IpFamilyForce4, want: netip.MustParseAddr("192.0.2.1")},
+		{policy: IpFamilyForce6, want: netip.MustParseAddr("2001:db8::1")},
+	}
+	for _, test := range tests {
+		SetControlIpFamilyPolicy(test.policy)
+		addr, err := resolver.resolveUDPAddr(t.Context(), "api.service.test:443")
+		if err != nil {
+			t.Fatalf("resolve under policy %d: %v", test.policy, err)
+		}
+		got, ok := netip.AddrFromSlice(addr.IP)
+		if !ok || got.Unmap() != test.want {
+			t.Fatalf("resolve under policy %d = %v, want %v", test.policy, addr.IP, test.want)
+		}
+	}
+}
+
 func TestInternalDohRawDialFallsBackAcrossAddressFamilies(t *testing.T) {
 	addrs := orderInternalDohAddrs([]netip.Addr{
 		netip.MustParseAddr("192.0.2.1"),
