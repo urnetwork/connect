@@ -12055,6 +12055,12 @@ type multiClientChannel struct {
 	// Nil outside focused tests. The callback assumes the same conditional
 	// ownership as Transfer: success consumes every group packet.
 	sendGroupForTest func(*parsedPacketGroup, time.Duration, bool) (bool, error)
+	// Nil outside focused tests. Replaces only concrete Client admission after
+	// the real packet/group callback is built, since Client is not an interface.
+	sendTransferForTest func(AckFunction) (bool, error)
+	// Nil outside focused tests. Makes the send-to-completion interval exact
+	// without replacing either side of the production callback path.
+	packetTransferNowForTest func() time.Time
 	// Nil outside focused tests. Overrides only the idle cping send so its
 	// timeout lifecycle can be tested without constructing a full Transfer
 	// route. Production uses SendDetailedMessage with the same signature.
@@ -12250,9 +12256,9 @@ type multiClientChannel struct {
 	// SendDetailedMessage just relays an opaque ackCallback, and the busy
 	// probe's own wait (busyLivenessProbe) only measures elapsed time to
 	// detect a suspended scheduler and throws the duration away. So this
-	// channel times it itself -- SendDetailedWithAck's ackCallback captures
-	// the send instant in its closure and folds time.Since(that) in here on a
-	// successful ack, via addSendRttSample.
+	// channel times it itself -- SendDetailedWithAck's Ack-required callback
+	// captures the send instant in its closure and folds the elapsed duration
+	// in here only after a successful peer Ack, via addSendRttSample.
 	//
 	// rttEwmaMillis smooths with the classic 1/8 TCP SRTT weight (RFC 6298);
 	// rttJitterMillis is the matching RTTVAR-style mean absolute deviation,
@@ -14084,8 +14090,11 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 		return true, nil
 	}
 
+	var completionOnce sync.Once
 	ackCallback := func(err error) {
-		self.observePacketGroupTransferCompletion(sendPacketGroup, ack, err)
+		completionOnce.Do(func() {
+			self.observePacketGroupTransferCompletion(sendPacketGroup, ack, err)
+		})
 	}
 	opts := []any{scheduleIpFlow(sendPacketGroup.ipPath)}
 	if self.performanceProfile != nil && self.performanceProfile.AllowDirect {
@@ -14100,13 +14109,19 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 			observeTransportWrite(sendPacketGroup.transportAttribution.observe),
 		)
 	}
-	success, err := self.client.sendMultiHopGroupWithTimeoutDetailed(
-		frames,
-		self.args.Destination,
-		ackCallback,
-		timeout,
-		opts...,
-	)
+	var success bool
+	var err error
+	if self.sendTransferForTest != nil {
+		success, err = self.sendTransferForTest(ackCallback)
+	} else {
+		success, err = self.client.sendMultiHopGroupWithTimeoutDetailed(
+			frames,
+			self.args.Destination,
+			ackCallback,
+			timeout,
+			opts...,
+		)
+	}
 	if err != nil || !success {
 		self.addSendAbandonedGroup(sendPacketGroup)
 		for _, frame := range frames {
@@ -14134,11 +14149,12 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 	} else {
 		packetByteCount := ByteCount(len(parsedPacket.packet))
 		self.addSend(packetByteCount, parsedPacket.ipPath)
-		// sendTime anchors THIS packet's own round trip -- captured here rather
-		// than read back from pendingSendTime, which tracks the OLDEST
-		// outstanding send and would misattribute the RTT under concurrent
-		// in-flight packets. See addSendRttSample.
-		sendTime := time.Now()
+		// The packet-local clock is needed only when a peer Ack will complete a
+		// real round trip. A NoAck callback observes the initial route write.
+		var sendTime time.Time
+		if ack {
+			sendTime = self.packetTransferNow()
+		}
 
 		// a stalled exit swallows the packet: reported sent, never acknowledged,
 		// and crucially no error -- an error would reset the flow immediately,
@@ -14161,8 +14177,11 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 			return true, nil
 		}
 
+		var completionOnce sync.Once
 		ackCallback := func(err error) {
-			self.observePacketTransferCompletion(packetByteCount, sendTime, ack, err)
+			completionOnce.Do(func() {
+				self.observePacketTransferCompletion(packetByteCount, sendTime, ack, err)
+			})
 		}
 
 		opts := []any{scheduleIpFlow(parsedPacket.ipPath)}
@@ -14172,13 +14191,18 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 		if !ack {
 			opts = append(opts, NoAck())
 		}
-		success, err := self.client.SendMultiHopWithTimeoutDetailed(
-			frame,
-			self.args.Destination,
-			ackCallback,
-			timeout,
-			opts...,
-		)
+		var success bool
+		if self.sendTransferForTest != nil {
+			success, err = self.sendTransferForTest(ackCallback)
+		} else {
+			success, err = self.client.SendMultiHopWithTimeoutDetailed(
+				frame,
+				self.args.Destination,
+				ackCallback,
+				timeout,
+				opts...,
+			)
+		}
 		// ownership: `parsedPacket.packet` is consumed on success and stays with the
 		// caller on any failure. The wrapped (!raw) marshal buffer is internal and
 		// must be freed on any failure; for raw frames the frame bytes ARE the
@@ -14223,7 +14247,9 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 // packet, the callback is only the initial route-write disposition: a timeout
 // means this datagram was dropped under transient carrier backpressure, not
 // that the provider failed. Poisoning endErr in that case removes the whole
-// provider channel and resets unrelated TCP flows that share it.
+// provider channel and resets unrelated TCP flows that share it. A successful
+// NoAck write retires its outstanding accounting but cannot contribute RTT:
+// no peer acknowledgement completed a round trip.
 func (self *multiClientChannel) observePacketTransferCompletion(
 	packetByteCount ByteCount,
 	sendTime time.Time,
@@ -14232,7 +14258,9 @@ func (self *multiClientChannel) observePacketTransferCompletion(
 ) {
 	if err == nil {
 		self.addSendAck(packetByteCount)
-		self.addSendRttSample(time.Since(sendTime))
+		if ack {
+			self.addSendRttSample(self.packetTransferNow().Sub(sendTime))
+		}
 		return
 	}
 	if ack || !errors.Is(err, errTransferRouteWriteTimeout) {
@@ -14240,6 +14268,15 @@ func (self *multiClientChannel) observePacketTransferCompletion(
 		return
 	}
 	self.addSendAbandoned(packetByteCount)
+}
+
+// Returns the packet completion clock. Production uses the monotonic wall
+// clock; focused tests can provide exact send and completion instants.
+func (self *multiClientChannel) packetTransferNow() time.Time {
+	if self.packetTransferNowForTest != nil {
+		return self.packetTransferNowForTest()
+	}
+	return time.Now()
 }
 
 // Applies the same reliable-vs-datagram failure boundary to a logical packet

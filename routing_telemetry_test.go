@@ -2,7 +2,7 @@ package connect
 
 import (
 	"math"
-	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -103,25 +103,30 @@ func TestExitMetricsSnapshotStallEventsFromReconvictions(t *testing.T) {
 	AssertEqual(t, exitMetricsSnapshot(client, 0).StallEvents, 2)
 }
 
-// TestExitMetricsSnapshotUsesCoalesceFalseNeverWindowStats is the hard
-// constraint from the brief, pinned in source: exitMetricsSnapshot must call
-// windowStatsWithCoalesce(false), and must NEVER call WindowStats() (the
-// coalescing variant), which perturbs the resize pass's ~15s cadence
-// bookkeeping and must not run at new-flow frequency.
-func TestExitMetricsSnapshotUsesCoalesceFalseNeverWindowStats(t *testing.T) {
-	source, err := readSource("ip_remote_multi_client.go")
-	if err != nil {
-		t.Fatal(err)
+// Placement telemetry must not prune the event window at new-flow frequency.
+// The subsequent public stats read proves this fixture would detect accidental
+// use of the coalescing accessor.
+func TestExitMetricsSnapshotDoesNotCoalesceEventBuckets(t *testing.T) {
+	client := stallTestChannel()
+	client.settings.StatsWindowDuration = time.Second
+	oldTime := time.Now().Add(-time.Hour)
+	client.eventBuckets = []*multiClientEventBucket{
+		{createTime: oldTime, eventTime: oldTime},
+		{createTime: oldTime, eventTime: oldTime},
+		{createTime: oldTime, eventTime: oldTime},
+		{createTime: oldTime, eventTime: oldTime},
 	}
-	body, ok := functionBody(source, "func exitMetricsSnapshot(")
-	if !ok {
-		t.Fatal("could not find exitMetricsSnapshot")
+
+	exitMetricsSnapshot(client, 0)
+	if got := len(client.eventBuckets); got != 4 {
+		t.Fatalf("placement snapshot retained %d event buckets, want 4", got)
 	}
-	if !strings.Contains(body, "windowStatsWithCoalesce(false)") {
-		t.Error("exitMetricsSnapshot does not call windowStatsWithCoalesce(false)")
+
+	if _, err := client.WindowStats(); err != nil {
+		t.Fatalf("coalescing stats read: %v", err)
 	}
-	if strings.Contains(body, ".WindowStats()") {
-		t.Error("exitMetricsSnapshot calls WindowStats() -- this perturbs the resize pass's cadence bookkeeping and must never run on the placement path")
+	if got := len(client.eventBuckets); 4 <= got {
+		t.Fatalf("fixture did not distinguish the coalescing accessor: retained %d buckets", got)
 	}
 }
 
@@ -131,6 +136,14 @@ func TestExitMetricsSnapshotUsesCoalesceFalseNeverWindowStats(t *testing.T) {
 // readability in the table test below.
 func telemetryTestEwma(client *multiClientChannel) (rtt float64, jitter float64, rttOk bool, jitterOk bool) {
 	return client.rttEwmaSnapshot()
+}
+
+// Builds the accounting fixture on the raw-frame path so a successful fake
+// admission does not strand a legacy wrapper buffer.
+func newPacketTransferTestChannel() *multiClientChannel {
+	client := stallTestChannel()
+	client.settings.ProtocolVersion = DefaultProtocolVersion
+	return client
 }
 
 func almostEqual(a, b float64) bool {
@@ -226,25 +239,138 @@ func TestExitMetricsSnapshotOneRttSampleHasNoJitterYet(t *testing.T) {
 	}
 }
 
-// TestSendDetailedWithAckRecordsRttSample is the production-wiring anchor:
-// the ack callback that fires on a successful send must feed
-// addSendRttSample, or nothing on the real transfer path ever populates the
-// EWMA this whole task exists to add. Source-anchored like
-// TestLifetimeJitterSourceAnchor and TestDrainBranchWarnsUnconditionally --
-// driving this through a real *Client/transport is what the busy-probe suite
-// already exists for, and duplicating that harness here would test the
-// transport, not this one call.
+// Two successful Ack-required sends drive the real callback boundary. Exact
+// clock instants prove the packet-local RTTs feed the EWMA, while concurrent
+// duplicate terminal attempts prove each callback can retire accounting once.
 func TestSendDetailedWithAckRecordsRttSample(t *testing.T) {
-	source, err := readSource("ip_remote_multi_client.go")
-	if err != nil {
-		t.Fatal(err)
+	client := newPacketTransferTestChannel()
+	baseTime := time.Unix(1700000000, 0)
+	orderedTimes := []time.Time{
+		baseTime,
+		baseTime.Add(100 * time.Millisecond),
+		baseTime.Add(time.Second),
+		baseTime.Add(time.Second + 140*time.Millisecond),
 	}
-	body, ok := functionBody(source, "func (self *multiClientChannel) SendDetailedWithAck(")
-	if !ok {
-		t.Fatal("could not find SendDetailedWithAck")
+	var clockLock sync.Mutex
+	clockCallCount := 0
+	client.packetTransferNowForTest = func() time.Time {
+		clockLock.Lock()
+		defer clockLock.Unlock()
+		index := clockCallCount
+		clockCallCount += 1
+		if len(orderedTimes) <= index {
+			return orderedTimes[len(orderedTimes)-1]
+		}
+		return orderedTimes[index]
 	}
-	if !strings.Contains(body, "self.addSendRttSample(") {
-		t.Error("SendDetailedWithAck's ack callback does not record an RTT sample -- the EWMA never sees real traffic")
+
+	const concurrentCompletions = 16
+	sendCallCount := 0
+	client.sendTransferForTest = func(ackCallback AckFunction) (bool, error) {
+		sendCallCount += 1
+		start := make(chan struct{})
+		var waitGroup sync.WaitGroup
+		waitGroup.Add(concurrentCompletions)
+		for range concurrentCompletions {
+			go func() {
+				defer waitGroup.Done()
+				<-start
+				ackCallback(nil)
+			}()
+		}
+		close(start)
+		waitGroup.Wait()
+		return true, nil
+	}
+
+	send := func(packetByteCount int) {
+		success, err := client.SendDetailedWithAck(&parsedPacket{
+			packet: make([]byte, packetByteCount),
+			ipPath: udpTestPath(4),
+		}, time.Second, true)
+		if err != nil || !success {
+			t.Fatalf("Ack send = %t, %v; want true, nil", success, err)
+		}
+	}
+	send(100)
+	send(200)
+
+	clockLock.Lock()
+	gotClockCallCount := clockCallCount
+	clockLock.Unlock()
+	if gotClockCallCount != len(orderedTimes) {
+		t.Errorf("packet clock calls = %d, want %d", gotClockCallCount, len(orderedTimes))
+	}
+	if sendCallCount != 2 {
+		t.Errorf("transport admissions = %d, want 2", sendCallCount)
+	}
+
+	client.stateLock.Lock()
+	sendNackCount := client.packetStats.sendNackCount
+	sendNackByteCount := client.packetStats.sendNackByteCount
+	sendAckCount := client.packetStats.sendAckCount
+	sendAckByteCount := client.packetStats.sendAckByteCount
+	rttSamples := client.rttSamples
+	client.stateLock.Unlock()
+	if sendNackCount != 0 || sendNackByteCount != 0 {
+		t.Errorf("outstanding sends = %d/%dB, want 0/0B", sendNackCount, sendNackByteCount)
+	}
+	if sendAckCount != 2 || sendAckByteCount != 300 {
+		t.Errorf("acknowledged sends = %d/%dB, want 2/300B", sendAckCount, sendAckByteCount)
+	}
+	if rttSamples != 2 {
+		t.Fatalf("RTT samples = %d, want one per Ack callback", rttSamples)
+	}
+	rtt, jitter, rttOk, jitterOk := telemetryTestEwma(client)
+	if !rttOk || !jitterOk || !almostEqual(rtt, 105) || !almostEqual(jitter, 40) {
+		t.Fatalf("Ack EWMA = rtt:%v jitter:%v ok:%t/%t, want 105/40 true/true", rtt, jitter, rttOk, jitterOk)
+	}
+}
+
+// A NoAck success is an initial route-write disposition. It retires the
+// outstanding send but cannot fabricate a peer round-trip measurement.
+func TestSendDetailedWithoutAckDoesNotRecordRttSample(t *testing.T) {
+	client := newPacketTransferTestChannel()
+	clockCallCount := 0
+	client.packetTransferNowForTest = func() time.Time {
+		clockCallCount += 1
+		return time.Unix(1700000000, 0)
+	}
+	client.sendTransferForTest = func(ackCallback AckFunction) (bool, error) {
+		ackCallback(nil)
+		return true, nil
+	}
+
+	const packetByteCount = 256
+	success, err := client.SendDetailedWithAck(&parsedPacket{
+		packet: make([]byte, packetByteCount),
+		ipPath: udpTestPath(4),
+	}, time.Second, false)
+	if err != nil || !success {
+		t.Fatalf("NoAck send = %t, %v; want true, nil", success, err)
+	}
+	if clockCallCount != 0 {
+		t.Errorf("NoAck completion read the RTT clock %d times, want 0", clockCallCount)
+	}
+	if _, _, rttOk, jitterOk := telemetryTestEwma(client); rttOk || jitterOk {
+		t.Fatal("NoAck route-write success fabricated an RTT measurement")
+	}
+
+	client.stateLock.Lock()
+	sendNackCount := client.packetStats.sendNackCount
+	sendNackByteCount := client.packetStats.sendNackByteCount
+	sendAckCount := client.packetStats.sendAckCount
+	sendAckByteCount := client.packetStats.sendAckByteCount
+	client.stateLock.Unlock()
+	if sendNackCount != 0 || sendNackByteCount != 0 || sendAckCount != 1 || sendAckByteCount != packetByteCount {
+		t.Errorf(
+			"NoAck completion accounting = outstanding:%d/%dB ack:%d/%dB, want 0/0B and 1/%dB",
+			sendNackCount,
+			sendNackByteCount,
+			sendAckCount,
+			sendAckByteCount,
+			packetByteCount,
+		)
 	}
 }
 
