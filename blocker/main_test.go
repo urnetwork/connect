@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/hex"
+	"fmt"
 	"go/format"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -343,6 +345,40 @@ func TestEmitDeterministicAndOpaque(t *testing.T) {
 	}
 	if !strings.Contains(string(out1), "const blockerBlockedPrefix6Count = 1") {
 		t.Fatalf("v6 count missing")
+	}
+}
+
+// Keep the emitted provenance and packed payload tied to the collision/size
+// constant, including the generated file that is committed for release.
+func TestGeneratedHeaderMatchesHostRecordWidth(t *testing.T) {
+	if hostRecordLen != 6 {
+		t.Fatalf("host record width = %d, want reviewed 6-byte width", hostRecordLen)
+	}
+	pepper, err := makePepper(strings.Repeat("ab", 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	emitted := string(emit("standard", pepper, []uint64{0x010203040506}, nil, nil, feeds[:1]))
+	generatedBytes, err := os.ReadFile(filepath.Join("..", "ip_blocker_block.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantHeader := fmt.Sprintf("blockerBlockedHostCount records of %d bytes each — the first %d bytes, big", hostRecordLen, hostRecordLen)
+	for _, source := range []struct {
+		name string
+		text string
+	}{
+		{name: "fresh emission", text: emitted},
+		{name: "checked-in generated source", text: string(generatedBytes)},
+	} {
+		if count := strings.Count(source.text, wantHeader); count != 1 {
+			t.Errorf("%s has reviewed record-width header %d times, want 1", source.name, count)
+		}
+	}
+	const wantPayload = `const blockerBlockedHostData = "" +
+	"\x01\x02\x03\x04\x05\x06"`
+	if !strings.Contains(emitted, wantPayload) {
+		t.Fatalf("fresh emission does not encode one exact %d-byte host record", hostRecordLen)
 	}
 }
 

@@ -8,7 +8,7 @@
 // Tier: standard. Regenerate with:  go generate ./blocker   (or: cd blocker && go run .)
 //
 // Representation: blockerBlockedHostData is a read-only string constant of
-// blockerBlockedHostCount records of 8 bytes each — the first 8 bytes, big
+// blockerBlockedHostCount records of 6 bytes each — the first 6 bytes, big
 // endian, of SHA256(blockerPepper || name) — sorted ascending and unique,
 // where name is the normalized (lower case, punycode) entry. an entry
 // blocks the name and all its subdomains; the lookup walks label suffixes

@@ -4,7 +4,7 @@
 // default data sets for the connect Blocker (ip_blocker.go) and writes them to
 // ip_blocker_block.go:
 //
-//   - hostnames as peppered truncated hashes: the first 8 bytes, big endian,
+//   - hostnames as peppered truncated hashes: the first 6 bytes, big endian,
 //     of SHA256(pepper || name), sorted and unique, where name is the
 //     normalized (lower case, punycode) entry. one entry blocks the name and
 //     all its subdomains (the runtime walks label suffixes), so the generator
@@ -933,7 +933,7 @@ func emit(tier string, pepper string, keys []uint64, ranges []iprange, ranges6 [
 	c(fmt.Sprintf("Tier: %s. Regenerate with:  go generate ./blocker   (or: cd blocker && go run .)", tier))
 	c("")
 	c("Representation: blockerBlockedHostData is a read-only string constant of")
-	c("blockerBlockedHostCount records of 8 bytes each — the first 8 bytes, big")
+	c(fmt.Sprintf("blockerBlockedHostCount records of %d bytes each — the first %d bytes, big", hostRecordLen, hostRecordLen))
 	c("endian, of SHA256(blockerPepper || name) — sorted ascending and unique,")
 	c("where name is the normalized (lower case, punycode) entry. an entry")
 	c("blocks the name and all its subdomains; the lookup walks label suffixes")
