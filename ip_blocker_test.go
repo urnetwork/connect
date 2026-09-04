@@ -470,9 +470,12 @@ func TestBlockerToggleRace(t *testing.T) {
 }
 
 // TestBlockerGeneratedTables asserts the structural invariants of the
-// committed generated data (ip_blocker_block.go). the checks hold trivially
-// for the placeholder empty tables and bite once the generator runs.
+// committed generated data (ip_blocker_block.go).
 func TestBlockerGeneratedTables(t *testing.T) {
+	const minimumReviewedHostCount = 120_000
+	if blockerBlockedHostCount < minimumReviewedHostCount {
+		t.Fatalf("host records = %d, want at least reviewed minimum %d", blockerBlockedHostCount, minimumReviewedHostCount)
+	}
 	if len(blockerPepper) != blockerPepperLen {
 		t.Fatalf("pepper length %d, want %d", len(blockerPepper), blockerPepperLen)
 	}
@@ -617,7 +620,7 @@ func BenchmarkBlockerIp4(b *testing.B) {
 // hit — but a broken pipeline (empty or mis-hashed data) fails hard.
 func TestBlockerDefaultDataSmoke(t *testing.T) {
 	if blockerBlockedHostCount == 0 {
-		t.Skip("placeholder data (run: go generate ./blocker)")
+		t.Fatal("default blocker data is empty (run and review: go generate ./blocker)")
 	}
 	b := NewBlockerWithDefaults()
 	if b.Enabled() {

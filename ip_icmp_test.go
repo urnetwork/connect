@@ -414,16 +414,27 @@ func TestCfaaInspectIcmp(t *testing.T) {
 	if got := d.inspect(net.ParseIP("203.0.113.7"), 0, IpProtocolIcmp, 4); got != cfaaAllow {
 		t.Fatalf("icmp4 clean = %v, want allow", got)
 	}
-	if got := d.inspect(net.ParseIP("2606:4700:4700::1111"), 0, IpProtocolIcmp, 6); got != cfaaAllow {
+	if got := d.inspect(net.ParseIP("2001:db8::7"), 0, IpProtocolIcmp, 6); got != cfaaAllow {
 		t.Fatalf("icmp6 clean = %v, want allow", got)
 	}
 
-	if 0 < cfaaBlockedPrefixCount {
-		lo, _ := cfaaRangeAt(0)
-		blocked := net.IPv4(byte(lo>>24), byte(lo>>16), byte(lo>>8), byte(lo))
-		if got := d.inspect(blocked, 0, IpProtocolIcmp, 4); got != cfaaDrop {
-			t.Fatalf("icmp blocked ip = %v, want drop", got)
-		}
+	if cfaaBlockedPrefixCount < 10_000 {
+		t.Fatalf("default CFAA IPv4 records = %d, want at least reviewed minimum 10000", cfaaBlockedPrefixCount)
+	}
+	lo4, _ := cfaaRangeAt(0)
+	blocked4 := net.IPv4(byte(lo4>>24), byte(lo4>>16), byte(lo4>>8), byte(lo4))
+	if got := d.inspect(blocked4, 0, IpProtocolIcmp, 4); got != cfaaDrop {
+		t.Fatalf("icmp4 blocked ip = %v, want drop", got)
+	}
+
+	if cfaaBlockedPrefix6Count < 100 {
+		t.Fatalf("default CFAA IPv6 records = %d, want at least reviewed minimum 100", cfaaBlockedPrefix6Count)
+	}
+	data6 := cfaaBlockedPrefix6Data
+	blocked6 := net.IP(make([]byte, net.IPv6len))
+	copy(blocked6, data6[:net.IPv6len])
+	if got := d.inspect(blocked6, 0, IpProtocolIcmp, 6); got != cfaaDrop {
+		t.Fatalf("icmp6 blocked ip = %v, want drop", got)
 	}
 }
 

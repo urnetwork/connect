@@ -1,8 +1,8 @@
 //go:generate go run .
 
 // Command gen aggregates public IPv4 threat-intelligence feeds into a packed,
-// sorted, pairwise-disjoint blocklist and writes it to ip_security_cfaa.go as a
-// zero-allocation, binary-searchable table.
+// sorted, pairwise-disjoint blocklist and writes it to
+// ip_security_cfaa_block.go as a zero-allocation, binary-searchable table.
 //
 // It replaces the old security/gen.sh pipeline. Unlike that script it:
 //   - preserves CIDR ranges instead of collapsing them to their network address
@@ -25,6 +25,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"encoding/csv"
 	"errors"
 	"flag"
@@ -68,7 +69,8 @@ type feed struct {
 	csvTypeCol int    // for kindCSV: 0-based column to filter on (with csvTypeVal); ignored when csvTypeVal is ""
 	csvTypeVal string // for kindCSV: only rows whose csvTypeCol equals this are taken
 	minCount   int    // hard-fail the build if fewer valid entries than this
-	deprecated bool   // tolerate emptiness (warn, never hard-fail); kept for the record
+	minV6Count int    // hard-fail the build if fewer valid IPv6 entries than this
+	deprecated bool   // accept a successfully fetched empty feed; fetch errors still fail
 	credit     string // attribution line embedded in the generated header
 }
 
@@ -100,7 +102,7 @@ var feeds = []feed{
 	{name: "et_compromised", url: "https://rules.emergingthreats.net/blockrules/compromised-ips.txt", kind: kindText, minCount: 300, credit: "Emerging Threats Open compromised IPs (BSD, sids 2000000-2799999) — rules.emergingthreats.net"},
 	// free for product use with attribution (Spamhaus credit retained in the header below)
 	{name: "spamhaus", url: "https://www.spamhaus.org/drop/drop.txt", kind: kindText, minCount: 800, credit: "The Spamhaus DROP list — spamhaus.org/drop (© The Spamhaus Project; credit retained below)"},
-	{name: "spamhaus6", url: "https://www.spamhaus.org/drop/dropv6.txt", kind: kindText, minCount: 0, credit: "The Spamhaus DROPv6 list — spamhaus.org/drop (© The Spamhaus Project)"},
+	{name: "spamhaus6", url: "https://www.spamhaus.org/drop/dropv6.txt", kind: kindText, minCount: 50, minV6Count: 50, credit: "The Spamhaus DROPv6 list — spamhaus.org/drop (© The Spamhaus Project)"},
 	// openly published, no stated license (treated as usable per the sourcing policy)
 	{name: "blocklistde", url: "https://lists.blocklist.de/lists/all.txt", kind: kindText, minCount: 8000, credit: "Blocklist.de fail2ban reports (no stated license) — lists.blocklist.de"},
 	{name: "cins", url: "https://cinsscore.com/list/ci-badguys.txt", kind: kindText, minCount: 7000, credit: "CINS Army / CI Army ci-badguys (no stated license) — cinsscore.com"},
@@ -149,23 +151,44 @@ type iprange struct{ lo, hi uint32 }
 
 type ip6range struct{ lo, hi netip.Addr }
 
+const (
+	feedDispositionAcceptedBlock      = "accepted_block"
+	feedDispositionAcceptedDeprecated = "accepted_deprecated"
+	feedDispositionSkippedMinCount    = "skipped_below_min_count"
+	feedDispositionUnavailable        = "unavailable"
+)
+
+// Holds one feed's decoded content and parse result.
 type result struct {
-	f       feed
-	ranges  []iprange
-	ranges6 []ip6range
-	host    int
-	cidr    int
-	bad     int
-	credit  string // captured dynamic attribution (Spamhaus)
-	err     error
+	f                feed
+	ranges           []iprange
+	ranges6          []ip6range
+	host             int
+	cidr             int
+	bad              int
+	credit           string // captured dynamic attribution (Spamhaus)
+	contentSHA256    [32]byte
+	contentBytes     int
+	contentAvailable bool
+	disposition      string
+	err              error
+}
+
+// Carries the accepted policy data and stable sanity failures.
+type aggregation struct {
+	ranges         []iprange
+	ranges6        []ip6range
+	spamhausCredit string
+	problems       []string
 }
 
 func main() {
-	out := flag.String("out", "", "output .go path (default: <connect module root>/ip_security_cfaa.go)")
+	out := flag.String("out", "", "output .go path (default: <connect module root>/ip_security_cfaa_block.go)")
 	timeout := flag.Duration("timeout", 90*time.Second, "per-feed HTTP timeout")
 	allowStale := flag.Bool("allow-stale", false, "generate even if some feeds fail or fall below min-count (skips them)")
 	maxCoverage := flag.Uint64("max-coverage", 64_000_000, "fail if total blocked address count exceeds this (poison guard)")
 	minRanges := flag.Int("min-ranges", 10_000, "fail if fewer than this many merged ranges result")
+	minRanges6 := flag.Int("min-ranges6", 100, "fail if fewer than this many merged IPv6 ranges result")
 	maxBytes := flag.Int("max-bytes", 1<<20, "size budget: fail if the EMBEDDED table exceeds this many bytes (the packed rodata that ships in the sdk binary, not the .go source, which is ~4x larger from \\xNN escapes)")
 	force := flag.Bool("force", false, "overwrite the output even if it lacks a generated-file marker")
 	flag.Parse()
@@ -180,10 +203,6 @@ func main() {
 
 	results := fetchAll(*timeout)
 
-	var problems []string
-	var all []iprange
-	var all6 []ip6range
-	var spamhausCredit string
 	fmt.Fprintln(os.Stderr, "feed report:")
 	for _, r := range results {
 		status := "ok"
@@ -196,39 +215,25 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  %-14s v4=%-6d v6=%-5d host=%-6d cidr=%-6d bad=%-5d %s\n",
 			r.f.name, len(r.ranges), len(r.ranges6), r.host, r.cidr, r.bad, status)
 
-		if r.err != nil {
-			if !r.f.deprecated {
-				problems = append(problems, fmt.Sprintf("%s: fetch error: %v", r.f.name, r.err))
-			}
-			continue
-		}
-		if len(r.ranges)+len(r.ranges6) < r.f.minCount && !r.f.deprecated {
-			problems = append(problems, fmt.Sprintf("%s: only %d valid entries (min %d) — feed may be broken or reformatted",
-				r.f.name, len(r.ranges)+len(r.ranges6), r.f.minCount))
-		}
-		if len(r.ranges) == 0 && len(r.ranges6) == 0 && !r.f.deprecated {
+		if r.err == nil && len(r.ranges) == 0 && len(r.ranges6) == 0 && !r.f.deprecated {
 			fmt.Fprintf(os.Stderr, "  WARNING: %s returned 0 entries\n", r.f.name)
 		}
-		if r.credit != "" {
-			spamhausCredit = r.credit
-		}
-		all = append(all, r.ranges...)
-		all6 = append(all6, r.ranges6...)
 	}
 
-	if len(problems) > 0 && !*allowStale {
+	aggregated := aggregateResults(results)
+	if len(aggregated.problems) > 0 && !*allowStale {
 		fmt.Fprintln(os.Stderr, "\nABORT: feed sanity checks failed (pass -allow-stale to skip the offending feeds):")
-		for _, p := range problems {
+		for _, p := range aggregated.problems {
 			fmt.Fprintln(os.Stderr, "  - "+p)
 		}
 		os.Exit(1)
 	}
 
-	merged := mergeRanges(all)
+	merged := mergeRanges(aggregated.ranges)
 	reserved := mergeRanges(parseReserved())
 	final := subtractAll(merged, reserved)
 
-	merged6 := mergeRanges6(all6)
+	merged6 := mergeRanges6(aggregated.ranges6)
 	reserved6 := mergeRanges6(parseReserved6())
 	final6 := subtractAll6(merged6, reserved6)
 
@@ -238,13 +243,13 @@ func main() {
 	}
 
 	fmt.Fprintf(os.Stderr, "\naggregate: %d source entries -> %d merged ranges (%d after reserved subtraction), %d addresses covered\n",
-		len(all), len(merged), len(final), coverage)
+		len(aggregated.ranges), len(merged), len(final), coverage)
 	fmt.Fprintf(os.Stderr, "ipv6: %d source entries -> %d merged ranges (%d after reserved subtraction)\n",
-		len(all6), len(merged6), len(final6))
+		len(aggregated.ranges6), len(merged6), len(final6))
 	printLargest(final, 5)
 
-	if len(final) < *minRanges {
-		fatal(fmt.Errorf("only %d merged ranges (min %d) — too few; aborting", len(final), *minRanges))
+	if err := validateMinimumRanges(len(final), len(final6), *minRanges, *minRanges6); err != nil {
+		fatal(err)
 	}
 	if coverage > *maxCoverage {
 		fatal(fmt.Errorf("coverage %d exceeds max %d — possible over-broad/poisoned feed; aborting", coverage, *maxCoverage))
@@ -261,7 +266,7 @@ func main() {
 			embedded, float64(embedded)/(1<<20), *maxBytes, float64(*maxBytes)/(1<<20)))
 	}
 
-	src := emit(final, final6, spamhausCredit)
+	src := emit(final, final6, aggregated.spamhausCredit, results)
 	formatted, ferr := format.Source(src)
 	if ferr != nil {
 		fmt.Fprintf(os.Stderr, "warning: gofmt failed (%v); writing unformatted output\n", ferr)
@@ -271,6 +276,51 @@ func main() {
 		fatal(err)
 	}
 	fmt.Fprintf(os.Stderr, "wrote %s (%d ranges, %d bytes)\n", outPath, len(final), len(formatted))
+}
+
+// Records feed disposition and excludes unusable inputs.
+func aggregateResults(results []result) aggregation {
+	var aggregated aggregation
+	for i := range results {
+		result := &results[i]
+		switch {
+		case result.err != nil:
+			result.disposition = feedDispositionUnavailable
+			aggregated.problems = append(aggregated.problems, fmt.Sprintf("%s: fetch error: %v", result.f.name, result.err))
+			continue
+		case !result.f.deprecated && len(result.ranges)+len(result.ranges6) < result.f.minCount:
+			result.disposition = feedDispositionSkippedMinCount
+			aggregated.problems = append(aggregated.problems, fmt.Sprintf("%s: only %d valid entries (min %d) — feed may be broken or reformatted",
+				result.f.name, len(result.ranges)+len(result.ranges6), result.f.minCount))
+			continue
+		case !result.f.deprecated && len(result.ranges6) < result.f.minV6Count:
+			result.disposition = feedDispositionSkippedMinCount
+			aggregated.problems = append(aggregated.problems, fmt.Sprintf("%s: only %d valid IPv6 entries (min %d) — feed may be broken or reformatted",
+				result.f.name, len(result.ranges6), result.f.minV6Count))
+			continue
+		case result.f.deprecated:
+			result.disposition = feedDispositionAcceptedDeprecated
+		default:
+			result.disposition = feedDispositionAcceptedBlock
+		}
+		if result.credit != "" {
+			aggregated.spamhausCredit = result.credit
+		}
+		aggregated.ranges = append(aggregated.ranges, result.ranges...)
+		aggregated.ranges6 = append(aggregated.ranges6, result.ranges6...)
+	}
+	return aggregated
+}
+
+// Rejects unexpectedly small generated tables.
+func validateMinimumRanges(v4Count int, v6Count int, minimumV4 int, minimumV6 int) error {
+	if v4Count < minimumV4 {
+		return fmt.Errorf("only %d merged IPv4 ranges (min %d) — too few; aborting", v4Count, minimumV4)
+	}
+	if v6Count < minimumV6 {
+		return fmt.Errorf("only %d merged IPv6 ranges (min %d) — too few; aborting", v6Count, minimumV6)
+	}
+	return nil
 }
 
 func fetchAll(timeout time.Duration) []result {
@@ -291,11 +341,20 @@ func fetchAll(timeout time.Duration) []result {
 }
 
 func fetchParse(f feed, timeout time.Duration) result {
-	res := result{f: f}
 	data, err := httpGet(f.url, timeout)
 	if err != nil {
-		res.err = err
-		return res
+		return result{f: f, err: err}
+	}
+	return parseResponse(f, data)
+}
+
+// Records the exact decoded response body before parser normalization.
+func parseResponse(f feed, data []byte) result {
+	res := result{
+		f:                f,
+		contentSHA256:    sha256.Sum256(data),
+		contentBytes:     len(data),
+		contentAvailable: true,
 	}
 	if f.name == "spamhaus" {
 		res.credit = captureSpamhausCredit(data)
@@ -685,7 +744,7 @@ func captureSpamhausCredit(data []byte) string {
 	return strings.Join(lines, " | ")
 }
 
-func emit(ranges []iprange, ranges6 []ip6range, spamhausCredit string) []byte {
+func emit(ranges []iprange, ranges6 []ip6range, spamhausCredit string, results []result) []byte {
 	var b strings.Builder
 	c := func(s string) {
 		for _, ln := range strings.Split(s, "\n") {
@@ -713,13 +772,13 @@ func emit(ranges []iprange, ranges6 []ip6range, spamhausCredit string) []byte {
 	c("non-overlapping. cfaaBlockedPrefix6Data is the IPv6 table: cfaaBlockedPrefix6Count")
 	c("records of 32 bytes each (16-byte big-endian lo then hi), same ordering.")
 	c("Being constants, they live in the binary's read-only data: package")
-	c("initialization performs zero heap allocation. The lookups that binary-search")
-	c("these tables (cfaaBlockedIp4, cfaaBlockedIp6) are hand-written in")
-	c("ip_security_cfaa.go.")
+	c("initialization performs zero heap allocation. The table definitions are")
+	c("generated in ip_security_cfaa_block.go; their binary-search lookups")
+	c("(cfaaBlockedIp4, cfaaBlockedIp6) are hand-written in ip_security_cfaa.go.")
 	c("")
 	c("Source feeds & attribution:")
-	for _, f := range feeds {
-		c("  - " + f.credit)
+	for _, result := range results {
+		c("  - " + result.f.credit)
 	}
 	if spamhausCredit != "" {
 		c("")
@@ -728,6 +787,16 @@ func emit(ranges []iprange, ranges6 []ip6range, spamhausCredit string) []byte {
 	}
 	c("")
 	c("Feed selection originally derived from github.com/Naunter/BT_BlockLists.")
+	c("")
+	c("Generated input provenance v1 (declared feed order):")
+	for _, result := range results {
+		if !result.contentAvailable {
+			c(fmt.Sprintf("  - name=%s url=%s disposition=%s", result.f.name, result.f.url, feedDispositionUnavailable))
+			continue
+		}
+		c(fmt.Sprintf("  - name=%s url=%s content_sha256=%x content_bytes=%d parsed_v4_ranges=%d parsed_v6_ranges=%d parsed_hosts=%d parsed_cidrs=%d parsed_bad=%d disposition=%s",
+			result.f.name, result.f.url, result.contentSHA256, result.contentBytes, len(result.ranges), len(result.ranges6), result.host, result.cidr, result.bad, result.disposition))
+	}
 	b.WriteString("\npackage connect\n\n")
 
 	fmt.Fprintf(&b, "const cfaaBlockedPrefixCount = %d\n\n", len(ranges))

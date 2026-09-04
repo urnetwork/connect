@@ -163,15 +163,26 @@ type iprange struct{ lo, hi uint32 }
 
 type ip6range struct{ lo, hi netip.Addr }
 
+const (
+	feedDispositionAcceptedBlock   = "accepted_block"
+	feedDispositionAcceptedAllow   = "accepted_allow"
+	feedDispositionSkippedMinCount = "skipped_below_min_count"
+	feedDispositionUnavailable     = "unavailable"
+)
+
 // parsed is one feed's parse result.
 type parsed struct {
-	f       feed
-	hosts   []string
-	ranges  []iprange
-	ranges6 []ip6range
-	invalid int
-	skipped int
-	err     error
+	f                feed
+	hosts            []string
+	ranges           []iprange
+	ranges6          []ip6range
+	invalid          int
+	skipped          int
+	contentSHA256    [32]byte
+	contentBytes     int
+	contentAvailable bool
+	disposition      string
+	err              error
 }
 
 func main() {
@@ -233,7 +244,8 @@ func main() {
 	var all6 []ip6range
 	pslRejected := 0
 	fmt.Fprintln(os.Stderr, "feed report:")
-	for _, r := range results {
+	for i := range results {
+		r := &results[i]
 		status := "ok"
 		if r.err != nil {
 			status = "ERROR: " + r.err.Error()
@@ -246,21 +258,25 @@ func main() {
 			r.f.name, kind, len(r.hosts), len(r.ranges), len(r.ranges6), r.invalid, r.skipped, status)
 
 		if r.err != nil {
+			r.disposition = feedDispositionUnavailable
 			problems = append(problems, fmt.Sprintf("%s: fetch error: %v", r.f.name, r.err))
 			continue
 		}
 		if len(r.hosts) < r.f.minCount {
+			r.disposition = feedDispositionSkippedMinCount
 			problems = append(problems, fmt.Sprintf("%s: only %d valid host entries (min %d) — feed may be broken or reformatted",
 				r.f.name, len(r.hosts), r.f.minCount))
 			continue
 		}
 		if r.f.allow {
+			r.disposition = feedDispositionAcceptedAllow
 			for _, name := range r.hosts {
 				allowNames[name] = true
 			}
 			// allow feeds contribute no ip entries
 			continue
 		}
+		r.disposition = feedDispositionAcceptedBlock
 		for _, name := range r.hosts {
 			if isPublicSuffixEntry(name) {
 				pslRejected += 1
@@ -352,7 +368,7 @@ func main() {
 			embedded, float64(embedded)/(1<<20), *maxBytes, float64(*maxBytes)/(1<<20)))
 	}
 
-	src := emit(*tier, pepper, keys, final, final6, tierFeeds)
+	src := emit(*tier, pepper, keys, final, final6, results)
 	formatted, ferr := format.Source(src)
 	if ferr != nil {
 		fmt.Fprintf(os.Stderr, "warning: gofmt failed (%v); writing unformatted output\n", ferr)
@@ -399,13 +415,21 @@ func fetchAll(tierFeeds []feed, timeout time.Duration) []parsed {
 				results[i] = parsed{f: f, err: err}
 				return
 			}
-			p := parseFeed(f.format, data)
-			p.f = f
-			results[i] = p
+			results[i] = parseResponse(f, data)
 		}(i)
 	}
 	wg.Wait()
 	return results
+}
+
+// Records the exact decoded response body before parser normalization.
+func parseResponse(f feed, data []byte) parsed {
+	p := parseFeed(f.format, data)
+	p.f = f
+	p.contentSHA256 = sha256.Sum256(data)
+	p.contentBytes = len(data)
+	p.contentAvailable = true
+	return p
 }
 
 func httpGet(feedUrl string, timeout time.Duration) ([]byte, error) {
@@ -910,7 +934,7 @@ func subtractAll6(block, reserved []ip6range) []ip6range {
 	return res
 }
 
-func emit(tier string, pepper string, keys []uint64, ranges []iprange, ranges6 []ip6range, tierFeeds []feed) []byte {
+func emit(tier string, pepper string, keys []uint64, ranges []iprange, ranges6 []ip6range, results []parsed) []byte {
 	var b strings.Builder
 	c := func(s string) {
 		for _, ln := range strings.Split(s, "\n") {
@@ -945,11 +969,21 @@ func emit(tier string, pepper string, keys []uint64, ranges []iprange, ranges6 [
 	c("read-only data: package initialization performs zero heap allocation.")
 	c("")
 	c("Source feeds & attribution (composition per sdk/BLOCKER.md):")
-	for _, f := range tierFeeds {
-		c("  - " + f.credit)
+	for _, result := range results {
+		c("  - " + result.f.credit)
 	}
 	c("  - " + localAllowFile + " (in-house) [subtracted]")
 	c("  - default resolver endpoints from DefaultDnsResolverSettings [excluded]")
+	c("")
+	c("Generated input provenance v1 (declared feed order):")
+	for _, result := range results {
+		if !result.contentAvailable {
+			c(fmt.Sprintf("  - name=%s url=%s disposition=%s", result.f.name, result.f.url, feedDispositionUnavailable))
+			continue
+		}
+		c(fmt.Sprintf("  - name=%s url=%s content_sha256=%x content_bytes=%d parsed_hosts=%d parsed_v4_ranges=%d parsed_v6_ranges=%d parsed_invalid=%d parsed_skipped=%d disposition=%s",
+			result.f.name, result.f.url, result.contentSHA256, result.contentBytes, len(result.hosts), len(result.ranges), len(result.ranges6), result.invalid, result.skipped, result.disposition))
+	}
 	b.WriteString("\npackage connect\n\n")
 
 	writeStringConst := func(name string, data []byte) {

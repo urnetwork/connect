@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -318,9 +319,10 @@ func TestEmitDeterministicAndOpaque(t *testing.T) {
 	}
 	ranges := []iprange{{0x01020304, 0x010203ff}}
 	ranges6 := []ip6range{{netip.MustParseAddr("2001:db8::"), netip.MustParseAddr("2001:db8::ff")}}
+	results := []parsed{{f: feeds[0]}, {f: feeds[1]}}
 
-	out1 := emit("standard", pepper, keys, ranges, ranges6, feeds[:2])
-	out2 := emit("standard", pepper, keys, ranges, ranges6, feeds[:2])
+	out1 := emit("standard", pepper, keys, ranges, ranges6, results)
+	out2 := emit("standard", pepper, keys, ranges, ranges6, results)
 	if string(out1) != string(out2) {
 		t.Fatalf("emit is not deterministic")
 	}
@@ -348,6 +350,102 @@ func TestEmitDeterministicAndOpaque(t *testing.T) {
 	}
 }
 
+// Pins deterministic, opaque response provenance.
+func TestEmitInputProvenance(t *testing.T) {
+	const contentSHA256 = "5663c871113d2abff62c09fde37d2137dc88648c4b6412f857e01e04235caaec"
+	content := []byte("\xef\xbb\xbf# fetched-at: 2099-01-02T03:04:05Z\nsecret-source.example\n1.2.3.4\nbad..name\n")
+	success := parseResponse(feed{name: "z-success", url: "https://feeds.example/z", credit: "success credit"}, content)
+	success.disposition = feedDispositionAcceptedBlock
+	if got := fmt.Sprintf("%x", success.contentSHA256); got != contentSHA256 {
+		t.Fatalf("content SHA-256 = %s, want %s", got, contentSHA256)
+	}
+	if success.contentBytes != 78 {
+		t.Fatalf("content bytes = %d, want 78", success.contentBytes)
+	}
+	skipped := parseResponse(feed{name: "m-skipped", url: "https://feeds.example/m", credit: "skipped credit"}, []byte("skipped-source.example\n"))
+	skipped.disposition = feedDispositionSkippedMinCount
+
+	pepper, err := makePepper(strings.Repeat("ab", 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unavailable := feed{name: "a-unavailable", url: "https://feeds.example/a", credit: "unavailable credit"}
+	out1 := string(emit("standard", pepper, nil, nil, nil, []parsed{
+		success,
+		skipped,
+		{f: unavailable, err: fmt.Errorf("volatile failure one")},
+	}))
+	out2 := string(emit("standard", pepper, nil, nil, nil, []parsed{
+		success,
+		skipped,
+		{f: unavailable, err: fmt.Errorf("different volatile failure")},
+	}))
+	if out1 != out2 {
+		t.Fatal("unavailable response details made emission nondeterministic")
+	}
+	wantSuccess := "name=z-success url=https://feeds.example/z content_sha256=" + contentSHA256 + " content_bytes=78 parsed_hosts=1 parsed_v4_ranges=1 parsed_v6_ranges=0 parsed_invalid=1 parsed_skipped=0 disposition=accepted_block"
+	wantSkipped := "name=m-skipped url=https://feeds.example/m content_sha256=cad344e98fd259125d4781e49190941dd91af9f213fa0bd750082a7a4b66aabf content_bytes=23 parsed_hosts=1 parsed_v4_ranges=0 parsed_v6_ranges=0 parsed_invalid=0 parsed_skipped=0 disposition=skipped_below_min_count"
+	wantUnavailable := "name=a-unavailable url=https://feeds.example/a disposition=unavailable"
+	for _, want := range []string{wantSuccess, wantSkipped, wantUnavailable} {
+		if strings.Count(out1, want) != 1 {
+			t.Errorf("provenance entry %q count = %d, want 1", want, strings.Count(out1, want))
+		}
+	}
+	if strings.Index(out1, wantSuccess) >= strings.Index(out1, wantSkipped) || strings.Index(out1, wantSkipped) >= strings.Index(out1, wantUnavailable) {
+		t.Fatal("provenance entries do not preserve declared feed order")
+	}
+	for _, forbidden := range []string{"fetched-at", "2099-01-02", "secret-source.example", "skipped-source.example", "1.2.3.4", "bad..name", "volatile failure", "different volatile failure"} {
+		if strings.Contains(out1, forbidden) {
+			t.Errorf("generated output leaked %q", forbidden)
+		}
+	}
+}
+
+// Rejects stale or unavailable checked-in inputs.
+func TestCheckedInGeneratedInputProvenance(t *testing.T) {
+	generatedBytes, err := os.ReadFile(filepath.Join("..", "ip_blocker_block.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	generated := string(generatedBytes)
+	const heading = "// Generated input provenance v1 (declared feed order):"
+	if count := strings.Count(generated, heading); count != 1 {
+		t.Fatalf("generated provenance heading count = %d, want 1", count)
+	}
+	const availableFields = ` content_sha256=[0-9a-f]{64} content_bytes=[1-9][0-9]* parsed_hosts=[0-9]+ parsed_v4_ranges=[0-9]+ parsed_v6_ranges=[0-9]+ parsed_invalid=[0-9]+ parsed_skipped=[0-9]+ disposition=accepted_(?:block|allow)`
+	availableRecord := regexp.MustCompile(`(?m)^//   - name=[^ ]+ url=[^ ]+` + availableFields + `$`)
+	if count := len(availableRecord.FindAllString(generated, -1)); count != len(feeds) {
+		t.Fatalf("valid available provenance records = %d, want %d", count, len(feeds))
+	}
+	rejectedRecord := regexp.MustCompile(`(?m)^//   - .* disposition=(?:unavailable|skipped_below_min_count)$`)
+	if count := len(rejectedRecord.FindAllString(generated, -1)); count != 0 {
+		t.Fatalf("unavailable or skipped provenance records = %d, want 0", count)
+	}
+	previous := strings.Index(generated, heading)
+	for _, f := range feeds {
+		disposition := feedDispositionAcceptedBlock
+		if f.allow {
+			disposition = feedDispositionAcceptedAllow
+		}
+		pattern := regexp.MustCompile(`(?m)^//   - name=` + regexp.QuoteMeta(f.name) + ` url=` + regexp.QuoteMeta(f.url) + ` content_sha256=[0-9a-f]{64} content_bytes=[1-9][0-9]* parsed_hosts=([0-9]+) parsed_v4_ranges=[0-9]+ parsed_v6_ranges=[0-9]+ parsed_invalid=[0-9]+ parsed_skipped=[0-9]+ disposition=` + disposition + `$`)
+		matches := pattern.FindAllStringSubmatchIndex(generated, -1)
+		if len(matches) != 1 {
+			t.Errorf("provenance records for %s = %d, want 1 available record", f.name, len(matches))
+			continue
+		}
+		if matches[0][0] <= previous {
+			t.Errorf("provenance record for %s is outside declared feed order", f.name)
+		}
+		hostCount, err := strconv.Atoi(generated[matches[0][2]:matches[0][3]])
+		if err != nil {
+			t.Errorf("provenance host count for %s: %v", f.name, err)
+		} else if hostCount < f.minCount {
+			t.Errorf("provenance host count for %s = %d, want configured minimum %d", f.name, hostCount, f.minCount)
+		}
+		previous = matches[0][0]
+	}
+}
+
 // Keep the emitted provenance and packed payload tied to the collision/size
 // constant, including the generated file that is committed for release.
 func TestGeneratedHeaderMatchesHostRecordWidth(t *testing.T) {
@@ -358,7 +456,7 @@ func TestGeneratedHeaderMatchesHostRecordWidth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	emitted := string(emit("standard", pepper, []uint64{0x010203040506}, nil, nil, feeds[:1]))
+	emitted := string(emit("standard", pepper, []uint64{0x010203040506}, nil, nil, []parsed{{f: feeds[0], disposition: feedDispositionAcceptedBlock}}))
 	generatedBytes, err := os.ReadFile(filepath.Join("..", "ip_blocker_block.go"))
 	if err != nil {
 		t.Fatal(err)

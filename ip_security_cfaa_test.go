@@ -41,7 +41,7 @@ func TestCfaaPortClassification(t *testing.T) {
 	// TEST-NET-3: reserved space, excluded from the table, never in any blocklist
 	ip := net.ParseIP("203.0.113.7")
 	if cfaaBlockedIp4(ip4u(203, 0, 113, 7)) {
-		t.Skip("test ip unexpectedly in blocklist")
+		t.Fatal("reserved TEST-NET-3 address unexpectedly present in generated blocklist")
 	}
 
 	cases := []struct {
@@ -97,8 +97,8 @@ func TestCfaaPortClassification(t *testing.T) {
 
 func TestCfaaBlockedIps(t *testing.T) {
 	d := newCfaaDetector(DefaultCfaaSecurityPolicySettings())
-	if 0 == cfaaBlockedPrefixCount {
-		t.Skip("empty blocklist")
+	if cfaaBlockedPrefixCount < 10_000 {
+		t.Fatalf("default CFAA IPv4 records = %d, want at least reviewed minimum 10000", cfaaBlockedPrefixCount)
 	}
 
 	// sample several blocked ips (the low address of the first ranges); each must
@@ -112,12 +112,14 @@ func TestCfaaBlockedIps(t *testing.T) {
 		}
 	}
 
-	// a non-blocked ip on an ephemeral port is not dropped by the cfaa detector
-	if !cfaaBlockedIp4(ip4u(203, 0, 113, 9)) {
-		clean := net.IPv4(203, 0, 113, 9)
-		if got := d.inspect(clean, 40000, IpProtocolTcp, 4); cfaaDrop == got {
-			t.Errorf("clean ip %s: got drop, want pass/allow", clean)
-		}
+	// Reserved TEST-NET-3 is deterministically subtracted, so it proves the
+	// non-blocked path without depending on live feed membership.
+	clean := net.IPv4(203, 0, 113, 9)
+	if cfaaBlockedIp4(ip4u(203, 0, 113, 9)) {
+		t.Fatalf("reserved clean ip %s unexpectedly present in generated blocklist", clean)
+	}
+	if got := d.inspect(clean, 40000, IpProtocolTcp, 4); cfaaDrop == got {
+		t.Errorf("clean ip %s: got drop, want pass/allow", clean)
 	}
 }
 
@@ -163,6 +165,9 @@ func TestCfaaIngressMirrorsSourceDrops(t *testing.T) {
 // record has lo<=hi, and records are sorted, disjoint and non-adjacent (proving
 // the generator's merge ran).
 func TestCfaaBlockedPrefixInvariant(t *testing.T) {
+	if cfaaBlockedPrefixCount < 10_000 {
+		t.Fatalf("v4 records = %d, want at least reviewed minimum 10000", cfaaBlockedPrefixCount)
+	}
 	if len(cfaaBlockedPrefixData) != cfaaBlockedPrefixCount*8 {
 		t.Fatalf("data length %d, want %d (= %d records * 8)",
 			len(cfaaBlockedPrefixData), cfaaBlockedPrefixCount*8, cfaaBlockedPrefixCount)
@@ -184,8 +189,8 @@ func TestCfaaBlockedPrefixInvariant(t *testing.T) {
 // independent O(n) linear scan over the decoded ranges, on exact boundaries and
 // a deterministic pseudo-random sample.
 func TestCfaaBlockedIp4BruteForce(t *testing.T) {
-	if 0 == cfaaBlockedPrefixCount {
-		t.Skip("empty blocklist")
+	if cfaaBlockedPrefixCount < 10_000 {
+		t.Fatalf("default CFAA IPv4 records = %d, want at least reviewed minimum 10000", cfaaBlockedPrefixCount)
 	}
 	type rng struct{ lo, hi uint32 }
 	ranges := make([]rng, cfaaBlockedPrefixCount)
@@ -317,7 +322,12 @@ func TestCfaaSearch6(t *testing.T) {
 
 func TestCfaaInspectV6(t *testing.T) {
 	d := newCfaaDetector(DefaultCfaaSecurityPolicySettings())
-	ip := net.ParseIP("2606:4700:4700::1111") // public ipv6
+	ip := net.ParseIP("2001:db8::7")
+	var clean [16]byte
+	copy(clean[:], ip.To16())
+	if cfaaBlockedIp6(clean) {
+		t.Fatalf("reserved clean IPv6 address %s unexpectedly present in generated blocklist", ip)
+	}
 
 	// the port policy applies to ipv6 exactly as to ipv4
 	for _, tc := range []struct {
@@ -335,20 +345,20 @@ func TestCfaaInspectV6(t *testing.T) {
 		}
 	}
 
-	// if the real ipv6 table is populated, a blocked address drops on any port
-	if 0 < cfaaBlockedPrefix6Count {
-		data := cfaaBlockedPrefix6Data // a variable, so the slice is runtime-bounded
-		var lo [16]byte
-		copy(lo[:], data[0:16])
-		if got := d.inspect(net.IP(lo[:]), 443, IpProtocolTcp, 6); got != cfaaDrop {
-			t.Errorf("blocked v6 %s on 443 -> %s, want drop", net.IP(lo[:]), cfaaVerdictName(got))
-		}
+	if cfaaBlockedPrefix6Count < 100 {
+		t.Fatalf("default CFAA IPv6 records = %d, want at least reviewed minimum 100", cfaaBlockedPrefix6Count)
+	}
+	data := cfaaBlockedPrefix6Data // a variable, so the slice is runtime-bounded
+	var lo [16]byte
+	copy(lo[:], data[0:16])
+	if got := d.inspect(net.IP(lo[:]), 443, IpProtocolTcp, 6); got != cfaaDrop {
+		t.Errorf("blocked v6 %s on 443 -> %s, want drop", net.IP(lo[:]), cfaaVerdictName(got))
 	}
 }
 
 func TestCfaaBlockedPrefix6Invariant(t *testing.T) {
-	if 0 == cfaaBlockedPrefix6Count {
-		t.Skip("ipv6 blocklist empty (run: cd security && go run .)")
+	if cfaaBlockedPrefix6Count < 100 {
+		t.Fatalf("v6 records = %d, want at least reviewed minimum 100", cfaaBlockedPrefix6Count)
 	}
 	if len(cfaaBlockedPrefix6Data) != cfaaBlockedPrefix6Count*32 {
 		t.Fatalf("data length %d, want %d", len(cfaaBlockedPrefix6Data), cfaaBlockedPrefix6Count*32)

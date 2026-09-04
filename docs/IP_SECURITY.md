@@ -212,9 +212,14 @@ writes — `ip_security_cfaa_block.go`:
    line feeds, the IP column (minus `:port`) from CSV feeds; **octet-validated** via
    `net/netip`; **CIDR preserved** as a `[lo,hi]` range; reject any prefix broader
    than `/8` (IPv4) or `/16` (IPv6).
-3. **Per-feed sanity** — each active feed has a min-count floor; falling below it
+3. **Per-feed sanity** — each active feed has a min-count floor, and an
+   IPv6-specific feed may additionally require an IPv6 entry floor. Any fetch error
+   or below-floor active result is excluded from aggregation, and normal generation
    **aborts** without writing (protection never silently shrinks). `-allow-stale`
-   overrides.
+   permits a diagnostic reduced-data emission with an explicit disposition, but
+   it is forbidden for release generation. A deprecated feed may be accepted
+   empty only after a successful fetch; its fetch failures abort normally and
+   remain visibly unavailable in diagnostic output.
 4. **Merge** into a minimal sorted, pairwise-disjoint range set (overlapping and
    adjacent ranges coalesced).
 5. **Subtract reserved space** — non-global IPv4 (RFC 6890: `0/8, 10/8, 100.64/10,
@@ -223,11 +228,30 @@ writes — `ip_security_cfaa_block.go`:
    (`::/8, 64:ff9b::/96, 100::/64, 2001:db8::/32, 2002::/16, fc00::/7, fe80::/10,
    ff00::/8`). The egress path already refuses these before the table; clipping also
    strips the large reserved blocks feeds (e.g. FireHOL fullbogons) sometimes include.
-6. **Aggregate sanity** — fail under `-min-ranges` (default 10k) or over
-   `-max-coverage` (default 64M addresses; poison guard). These guards apply to the
-   IPv4 table; the IPv6 table is reported but not floored (public IPv6 feed coverage
-   is sparse). Current output: ~64k IPv4 ranges (~18.5M addresses) and ~200 IPv6 ranges.
-7. **Emit** packed data and `gofmt`.
+6. **Aggregate sanity** — fail under `-min-ranges` (default 10k IPv4 ranges),
+   under `-min-ranges6` (default 100 IPv6 ranges), or over `-max-coverage`
+   (default 64M IPv4 addresses; poison guard).
+7. **Emit** packed data, deterministic input provenance v1, and `gofmt`.
+
+Each provenance record is emitted in declared feed order and contains the feed
+name and exact URL, `content_sha256` and `content_bytes` for the decoded response
+body before parser normalization (Go may transparently decompress HTTP responses),
+the format-specific parsed counts, and a deterministic disposition. It contains
+no fetch timestamp, response headers, or raw content. Dispositions are
+`accepted_block`, `accepted_allow`, `accepted_deprecated`,
+`skipped_below_min_count`, and `unavailable`.
+Active feeds always require positive content bytes; a successfully fetched empty
+deprecated feed is the sole accepted zero-byte case.
+
+For release review, every configured feed must have exactly one record: each
+nondeprecated security feed must be `accepted_block` with parsed IPv4-plus-IPv6
+entries at or above its configured floor, and each deprecated feed must be
+`accepted_deprecated`. No `skipped_below_min_count` or `unavailable` record is
+releaseable. The hermetic generator tests enforce this contract against the
+checked-in generated file. Release generation must never use `-allow-stale`.
+Provenance hashes identify parser inputs, but this repository does not archive
+or redistribute raw feed bodies; the checked-in generated tables plus the exact
+Connect source hash in `release.lock` are the deployable authority.
 
 A guard refuses to overwrite any file lacking a `DO NOT EDIT` marker, so the
 generator can never clobber a hand-written source file.
@@ -264,7 +288,8 @@ cache-resident data). The IPv6 search (`cfaaSearch6`) compares 128-bit values as
 > pointer-chasing for no benefit here.
 
 Regenerate: `go generate ./...` (or `cd security && go run .`). Flags: `-out`,
-`-timeout`, `-allow-stale`, `-max-coverage`, `-min-ranges`, `-force`.
+`-timeout`, `-allow-stale` (diagnostic only; forbidden for release),
+`-max-coverage`, `-min-ranges`, `-min-ranges6`, `-max-bytes`, `-force`.
 
 ---
 
