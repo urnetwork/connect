@@ -25,14 +25,14 @@ skip_filter="$pt_filter|$webrtc_filter"
 
 # run the WebRTC tests first, in their own process
 match="/$(basename $(pwd))/\\S*\.go\|^\\S*_test.go"
-GORACE="log_path=profile/race.out halt_on_error=1" go test -timeout 0 -v -race -run "$webrtc_filter" "$@" | grep --color=always -e "^" -e "$match"
+GORACE="log_path=profile/race.out halt_on_error=1" go test -timeout 0 -v -race -run "$webrtc_filter" "$@" | grep --line-buffered --color=always -e "^" -e "$match"
 if [[ ${pipestatus[1]} != 0 ]]; then
     exit ${pipestatus[1]}
 fi
 
 # run the packet-translation tests next, in their own process
 match="/$(basename $(pwd))/\\S*\.go\|^\\S*_test.go"
-GORACE="log_path=profile/race.out halt_on_error=1" go test -timeout 0 -v -race -run "$pt_filter" "$@" | grep --color=always -e "^" -e "$match"
+GORACE="log_path=profile/race.out halt_on_error=1" go test -timeout 0 -v -race -run "$pt_filter" "$@" | grep --line-buffered --color=always -e "^" -e "$match"
 if [[ ${pipestatus[1]} != 0 ]]; then
     exit ${pipestatus[1]}
 fi
@@ -42,7 +42,7 @@ for d in `find . -iname '*_test.go' | xargs -n 1 dirname | sort | uniq | paste -
         pushd $d
         # highlight source files in this dir
         match="/$(basename $(pwd))/\\S*\.go\|^\\S*_test.go"
-        GORACE="log_path=profile/race.out halt_on_error=1" go test -timeout 0 -v -race -skip "$skip_filter" -cpuprofile profile/cpu -memprofile profile/memory "$@" | grep --color=always -e "^" -e "$match"
+        GORACE="log_path=profile/race.out halt_on_error=1" go test -timeout 0 -v -race -skip "$skip_filter" -cpuprofile profile/cpu -memprofile profile/memory "$@" | grep --line-buffered --color=always -e "^" -e "$match"
         # -trace profile/trace -coverprofile profile/cover
         if [[ ${pipestatus[1]} != 0 ]]; then
             exit ${pipestatus[1]}
