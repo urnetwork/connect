@@ -729,7 +729,10 @@ type PlatformTransport struct {
 	routeManager   *RouteManager
 
 	platformUrl string
-	auth        *ClientAuth
+	// auth is an immutable clone guarded by stateLock. Each connection
+	// generation takes one value snapshot so its JWT, instance, app version,
+	// and JWT-derived client/device identity can never come from mixed updates.
+	auth *ClientAuth
 
 	settings *PlatformTransportSettings
 	// receiveStats is always non-nil, including when the settings did not expose
@@ -1096,7 +1099,7 @@ func NewPlatformTransportWithTargetMode(
 		clientStrategy:     clientStrategy,
 		routeManager:       routeManager,
 		platformUrl:        platformUrl,
-		auth:               auth,
+		auth:               cloneClientAuth(auth),
 		settings:           settings,
 		receiveStats:       receiveStats,
 		framerSettings:     framerSettings,
@@ -1157,12 +1160,28 @@ func NewPlatformTransportWithTargetMode(
 	return transport
 }
 
-// the auth is used on future connections
+// cloneClientAuth transfers a caller-owned auth value into transport ownership.
+// PlatformTransport historically requires non-nil auth and intentionally keeps
+// that fail-fast contract.
+func cloneClientAuth(auth *ClientAuth) *ClientAuth {
+	cloned := *auth
+	return &cloned
+}
+
+// authSnapshot returns one coherent auth generation for a connection attempt.
+func (self *PlatformTransport) authSnapshot() ClientAuth {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return *self.auth
+}
+
+// SetAuth installs an immutable snapshot for future connections. An existing
+// authenticated connection keeps its generation until it reconnects.
 func (self *PlatformTransport) SetAuth(auth *ClientAuth) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
-	self.auth = auth
+	self.auth = cloneClientAuth(auth)
 }
 
 // setModeAvailable records whether a mode has a live connection, waking the
@@ -1618,8 +1637,6 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 	// connect and update route manager for this transport
 	defer self.cancel()
 
-	clientId, _ := self.auth.ClientId()
-
 	if 0 < initialTimeout {
 		select {
 		case <-self.ctx.Done():
@@ -1649,14 +1666,16 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				}
 			}
 		}()
+		auth := self.authSnapshot()
+		clientId, _ := auth.ClientId()
 
 		reconnect := NewReconnect(self.settings.ReconnectTimeout)
 		connect := func() (*websocket.Conn, error) {
 			header := http.Header{}
 			if self.settings.V2H1Auth {
-				header.Add("Authorization", fmt.Sprintf("Bearer %s", self.auth.ByJwt))
-				header.Add("X-UR-AppVersion", self.auth.AppVersion)
-				header.Add("X-UR-InstanceId", self.auth.InstanceId.String())
+				header.Add("Authorization", fmt.Sprintf("Bearer %s", auth.ByJwt))
+				header.Add("X-UR-AppVersion", auth.AppVersion)
+				header.Add("X-UR-InstanceId", auth.InstanceId.String())
 				header.Add("X-UR-TransportVersion", fmt.Sprintf("%d", TransportVersion))
 			}
 
@@ -1675,9 +1694,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 			if !self.settings.V2H1Auth {
 				authBytes, err := EncodeFrame(&protocol.Auth{
-					ByJwt:      self.auth.ByJwt,
-					AppVersion: self.auth.AppVersion,
-					InstanceId: self.auth.InstanceId.Bytes(),
+					ByJwt:      auth.ByJwt,
+					AppVersion: auth.AppVersion,
+					InstanceId: auth.InstanceId.Bytes(),
 				}, self.settings.ProtocolVersion)
 				if err != nil {
 					return nil, err
@@ -2360,8 +2379,6 @@ func (self *PlatformTransport) runH3(
 		panic(fmt.Errorf("Bad slow multiple: %d", slowMultiple))
 	}
 
-	clientId, _ := self.auth.ClientId()
-
 	if 0 < initialTimeout {
 		select {
 		case <-ctx.Done():
@@ -2395,6 +2412,8 @@ func (self *PlatformTransport) runH3(
 		if ctx.Err() != nil {
 			return
 		}
+		auth := self.authSnapshot()
+		clientId, _ := auth.ClientId()
 
 		reconnect := NewReconnect(self.settings.ReconnectTimeout)
 
@@ -2411,9 +2430,9 @@ func (self *PlatformTransport) runH3(
 			// 	HandshakeIdleTimeout: self.settings.QuicConnectTimeout + self.settings.QuicHandshakeTimeout,
 			// }
 			authMessage := &protocol.Auth{
-				ByJwt:      self.auth.ByJwt,
-				AppVersion: self.auth.AppVersion,
-				InstanceId: self.auth.InstanceId.Bytes(),
+				ByJwt:      auth.ByJwt,
+				AppVersion: auth.AppVersion,
+				InstanceId: auth.InstanceId.Bytes(),
 			}
 			SetH3DatagramAuthOffer(authMessage, self.settings.EnableH3Datagrams)
 			authBytes, err := EncodeFrame(authMessage, self.settings.ProtocolVersion)
