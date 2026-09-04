@@ -725,7 +725,11 @@ paths:
   /network/clients:
     get:
       description: |
-        Get the latest status of all clients on this network.
+        Get the latest status of the network's devices: every top-level
+        client (no source_client_id) that is not a hosted proxy device, with
+        no provide-mode qualification. Child clients are never listed, and
+        neither are the network's cloud proxy devices (the "resident proxy"
+        clients the proxy host runs), which `/network/proxies` lists instead.
 
         Includes:
 
@@ -734,7 +738,27 @@ paths:
         - Connections, which are transports from the client to the platform.
         Note there can be multiple active connections for a single client.
         - Provide status
+
+        `proxy_client` is never present on this list.
       operationId: Network Clients
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkClientsResult"
+
+  /network/proxies:
+    get:
+      description: |
+        The network's cloud proxy devices: the clients that carry a hosted
+        proxy device (created with `proxy_config` on `/network/auth-client`),
+        each with its `proxy_client` credentials (proxy URLs, auth token,
+        WireGuard details). Same row shape as `/network/clients` otherwise:
+        resident status, connections, provide status.
+      operationId: Network Proxies
       security:
         - BearerAuth: []
       responses:
