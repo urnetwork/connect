@@ -1625,6 +1625,11 @@ type CreateContract struct {
 	ForceStream *bool `protobuf:"varint,7,opt,name=force_stream,json=forceStream,proto3,oneof" json:"force_stream,omitempty"`
 	// see stream version reference at top
 	StreamVersion *uint32 `protobuf:"varint,8,opt,name=stream_version,json=streamVersion,proto3,oneof" json:"stream_version,omitempty"`
+	// Fixed sender-side ContractKey sequence lane that requested this
+	// contract. This is diagnostic capability metadata only: it does not
+	// select or alter a route, contract, or encryption session. Presence
+	// proves the sender can report the lane; absence remains unknown.
+	SenderRole    *SequenceRole `protobuf:"varint,9,opt,name=sender_role,json=senderRole,proto3,enum=bringyour.SequenceRole,oneof" json:"sender_role,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1706,6 +1711,13 @@ func (x *CreateContract) GetStreamVersion() uint32 {
 		return *x.StreamVersion
 	}
 	return 0
+}
+
+func (x *CreateContract) GetSenderRole() SequenceRole {
+	if x != nil && x.SenderRole != nil {
+		return *x.SenderRole
+	}
+	return SequenceRole_SequenceRoleUnknown
 }
 
 type CreateContractResult struct {
@@ -2729,7 +2741,7 @@ const file_transfer_proto_rawDesc = "" +
 	"\x03sdp\x18\x04 \x01(\fH\x00R\x03sdp\x88\x01\x01\x12(\n" +
 	"\rice_candidate\x18\x05 \x01(\fH\x01R\ficeCandidate\x88\x01\x01B\x06\n" +
 	"\x04_sdpB\x10\n" +
-	"\x0e_ice_candidate\"\xfd\x02\n" +
+	"\x0e_ice_candidate\"\xcc\x03\n" +
 	"\x0eCreateContract\x12*\n" +
 	"\x0edestination_id\x18\x01 \x01(\fH\x00R\rdestinationId\x88\x01\x01\x12.\n" +
 	"\x13transfer_byte_count\x18\x02 \x01(\x04R\x11transferByteCount\x12\x1c\n" +
@@ -2737,10 +2749,13 @@ const file_transfer_proto_rawDesc = "" +
 	"\x11used_contract_ids\x18\x04 \x03(\fR\x0fusedContractIds\x12)\n" +
 	"\x10intermediary_ids\x18\x05 \x03(\fR\x0fintermediaryIds\x12&\n" +
 	"\fforce_stream\x18\a \x01(\bH\x01R\vforceStream\x88\x01\x01\x12*\n" +
-	"\x0estream_version\x18\b \x01(\rH\x02R\rstreamVersion\x88\x01\x01B\x11\n" +
+	"\x0estream_version\x18\b \x01(\rH\x02R\rstreamVersion\x88\x01\x01\x12=\n" +
+	"\vsender_role\x18\t \x01(\x0e2\x17.bringyour.SequenceRoleH\x03R\n" +
+	"senderRole\x88\x01\x01B\x11\n" +
 	"\x0f_destination_idB\x0f\n" +
 	"\r_force_streamB\x11\n" +
-	"\x0f_stream_versionJ\x04\b\x06\x10\aR\tstream_id\"\xf5\x01\n" +
+	"\x0f_stream_versionB\x0e\n" +
+	"\f_sender_roleJ\x04\b\x06\x10\aR\tstream_id\"\xf5\x01\n" +
 	"\x14CreateContractResult\x123\n" +
 	"\x05error\x18\x01 \x01(\x0e2\x18.bringyour.ContractErrorH\x00R\x05error\x88\x01\x01\x124\n" +
 	"\bcontract\x18\x02 \x01(\v2\x13.bringyour.ContractH\x01R\bcontract\x88\x01\x01\x12G\n" +
@@ -2922,17 +2937,18 @@ var file_transfer_proto_depIdxs = []int32{
 	18, // 16: bringyour.NetworkPeersUpdate.peers:type_name -> bringyour.NetworkPeer
 	22, // 17: bringyour.ExchangeSignals.signals:type_name -> bringyour.ExchangeSignal
 	2,  // 18: bringyour.ExchangeSignal.signal_type:type_name -> bringyour.SignalType
-	3,  // 19: bringyour.CreateContractResult.error:type_name -> bringyour.ContractError
-	25, // 20: bringyour.CreateContractResult.contract:type_name -> bringyour.Contract
-	23, // 21: bringyour.CreateContractResult.create_contract:type_name -> bringyour.CreateContract
-	1,  // 22: bringyour.Contract.provide_mode:type_name -> bringyour.ProvideMode
-	4,  // 23: bringyour.EncryptedControl.control_type:type_name -> bringyour.EncryptedControlType
-	0,  // 24: bringyour.EncryptedControl.session_role:type_name -> bringyour.SequenceRole
-	25, // [25:25] is the sub-list for method output_type
-	25, // [25:25] is the sub-list for method input_type
-	25, // [25:25] is the sub-list for extension type_name
-	25, // [25:25] is the sub-list for extension extendee
-	0,  // [0:25] is the sub-list for field type_name
+	0,  // 19: bringyour.CreateContract.sender_role:type_name -> bringyour.SequenceRole
+	3,  // 20: bringyour.CreateContractResult.error:type_name -> bringyour.ContractError
+	25, // 21: bringyour.CreateContractResult.contract:type_name -> bringyour.Contract
+	23, // 22: bringyour.CreateContractResult.create_contract:type_name -> bringyour.CreateContract
+	1,  // 23: bringyour.Contract.provide_mode:type_name -> bringyour.ProvideMode
+	4,  // 24: bringyour.EncryptedControl.control_type:type_name -> bringyour.EncryptedControlType
+	0,  // 25: bringyour.EncryptedControl.session_role:type_name -> bringyour.SequenceRole
+	26, // [26:26] is the sub-list for method output_type
+	26, // [26:26] is the sub-list for method input_type
+	26, // [26:26] is the sub-list for extension type_name
+	26, // [26:26] is the sub-list for extension extendee
+	0,  // [0:26] is the sub-list for field type_name
 }
 
 func init() { file_transfer_proto_init() }

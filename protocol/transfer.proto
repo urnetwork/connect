@@ -343,6 +343,12 @@ message CreateContract {
     optional bool force_stream = 7;
     // see stream version reference at top
     optional uint32 stream_version = 8;
+
+    // Fixed sender-side ContractKey sequence lane that requested this
+    // contract. This is diagnostic capability metadata only: it does not
+    // select or alter a route, contract, or encryption session. Presence
+    // proves the sender can report the lane; absence remains unknown.
+    optional SequenceRole sender_role = 9;
 }
 // the creator knows all the hops on the stream from the enumerated linpaths
 // when evaluating the completed contracts, the send and receive count involving the source_id

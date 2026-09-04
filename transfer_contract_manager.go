@@ -1499,6 +1499,7 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 	contractQueue := self.openContractQueue(contractKey)
 
 	streamVersion := uint32(DefaultStreamVersion)
+	senderRole := contractKey.EncryptionRole.toProtobuf()
 
 	createContract := &protocol.CreateContract{
 		DestinationId:     contractKey.Destination.DestinationId.Bytes(),
@@ -1507,6 +1508,7 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 		Companion:         contractKey.CompanionContract,
 		ForceStream:       &contractKey.ForceStream,
 		StreamVersion:     &streamVersion,
+		SenderRole:        &senderRole,
 	}
 	if self.settings.TrackUsedContracts {
 		createContract.UsedContractIds = contractQueue.UsedContractIdBytes()
