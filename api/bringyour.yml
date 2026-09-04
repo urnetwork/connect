@@ -182,8 +182,12 @@ paths:
         Page the all-time points leaderboard. Every network with points is
         ranked on three dimensions (total points, finalized epochs with points
         = "blocks", current streak of consecutive finalized epochs with points)
-        with competition ranks (1, 2, 2, 4); only networks that opted in
-        (/network/points-ranking-visibility) are listed, so ranks have gaps.
+        with competition ranks (1, 2, 2, 4), and every ranked network is
+        listed: the pages form one continuous list. A row carries the network
+        name only when that network turned on
+        /network/points-ranking-visibility (its "show my network name"
+        switch); otherwise the row is anonymous. The emoji tag (/network/emoji)
+        shows on every row that set one.
         Each sort has its own tie-break order, every key descending, then the
         network id ascending so the order is total: `points` = (points,
         streak, blocks), `blocks` = (blocks, streak, points), `streak` =
@@ -951,11 +955,10 @@ paths:
   /network/points-ranking-visibility:
     post:
       description: |
-        Opt the network in or out of the public all-time points leaderboard.
-        The opt-in only controls whether the network is LISTED; every network
-        with points is ranked either way. The network name shows on the listed
-        row only when the data leaderboard name visibility
-        (/network/ranking-visibility) is also on; the emoji tag always shows.
+        Turn the network's name on or off on the points leaderboard. Every
+        network with points is ranked and listed either way; this switch only
+        decides whether its row shows the network name or "Anonymous". The
+        emoji tag (/network/emoji) shows on the row regardless.
       operationId: Network Points Ranking Visibility
       security:
         - BearerAuth: []
@@ -4747,13 +4750,13 @@ components:
         network_id:
           type: string
         network_name:
-          description: Present only when the network's name is public
+          description: Present only when the network turned on points_leaderboard_public (/network/points-ranking-visibility)
           type: string
         emoji_tag:
-          description: The network's emoji tag, absent when unset
+          description: The network's emoji tag, absent when unset; shown whether or not the name is
           type: string
         anonymous:
-          description: true when the network name is hidden
+          description: true when the network name is hidden; the row is listed either way
           type: boolean
         contains_profanity:
           description: The public name contains profanity (apps may mask it)
@@ -4806,7 +4809,7 @@ components:
           description: The cursor's snapshot is gone; reload from the top
           type: boolean
         total_ranked:
-          description: Networks ranked in the snapshot (listed or not)
+          description: Networks ranked in the snapshot; every one of them is listed across the pages
           type: integer
           format: int64
         snapshot_time:
