@@ -1,7 +1,7 @@
 # Low-bar network delivery plan
 
 Status: living implementation plan
-Last updated: 2026-08-27
+Last updated: 2026-09-04
 
 ## Outcome
 
@@ -39,6 +39,24 @@ transport configuration, command or result artifact, run count, and whether the
 result is cold or warmed. Append results; do not replace an unfavorable run.
 Lock release thresholds after the Phase 1 baseline so they cannot be moved to
 fit a candidate.
+
+## Physical Android device allowlist
+
+LOWBAR physical validation uses exactly these two devices:
+
+| Role | Serial | Model |
+|---|---|---|
+| `device-a` | `3B161FDJG001KT` | Pixel 8 Pro |
+| `device-b` | `R5CX21FY6ND` | Galaxy S24 Ultra |
+
+Preflight must find both serials in `adb devices -l` with state `device` and no
+other serial. Drivers receive the serial explicitly; missing, unauthorized, or
+offline devices invalidate the physical block rather than being substituted.
+Public notes use the opaque roles, while the private run manifest keeps serials
+for identity and reproducibility.
+
+Verified 2026-09-04 with `adb devices -l`: exactly these two serials were
+attached and online; no third device was admitted to the performance cohort.
 
 ## Decisions
 

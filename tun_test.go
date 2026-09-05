@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"runtime"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -141,36 +140,6 @@ func newTunTcpInboundTestPacket(sourcePort uint16, destinationPort uint16) []byt
 	return packet
 }
 
-func waitForTunTcpInboundHandoff(
-	t *testing.T,
-	tun *Tun,
-	shardIndex int,
-	wantPacketCount uint32,
-) {
-	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for {
-		shard := &tun.tcpInboundShards[shardIndex]
-		shard.writeLock.Lock()
-		packetCount := shard.packetCount
-		endpointCount := shard.endpointCount
-		shard.writeLock.Unlock()
-		if packetCount == wantPacketCount && endpointCount == 0 {
-			return
-		}
-		if deadline.Before(time.Now()) {
-			t.Fatalf(
-				"timed out waiting for shard %d handoff: packet_count=%d endpoint_count=%d, want %d/0",
-				shardIndex,
-				packetCount,
-				endpointCount,
-				wantPacketCount,
-			)
-		}
-		runtime.Gosched()
-	}
-}
-
 func TestTunTcpInboundFlowUsesStableBoundedShards(t *testing.T) {
 	occupiedShards := map[int]bool{}
 	for sourcePort := uint16(40000); sourcePort < 40064; sourcePort += 1 {
@@ -218,138 +187,19 @@ func TestTunTcpInboundShardHandoffCadenceIsBounded(t *testing.T) {
 	}
 }
 
-// Repeated hot-flow publications must occupy one fixed shard bit and one
-// notification slot. This is the deterministic regression boundary for the
-// former per-packet endpoint handoff: callback volume cannot become endpoint
-// lock volume before the worker gets a scheduling turn.
-func TestTunTcpInboundHandoffRequestCoalescesHotShardEdges(t *testing.T) {
-	tun := &Tun{tcpInboundHandoffNotify: make(chan struct{}, 1)}
-	const firstShard = 3
-	const secondShard = 19
-	for range 64 {
-		tun.requestTcpInboundHandoff(firstShard)
-	}
-	for range 17 {
-		tun.requestTcpInboundHandoff(secondShard)
-	}
-
-	want := uint32(1)<<firstShard | uint32(1)<<secondShard
-	if pending := tun.tcpInboundHandoffShards.Swap(0); pending != want {
-		t.Fatalf("pending shard bits=%032b, want %032b", pending, want)
-	}
-	if queued := len(tun.tcpInboundHandoffNotify); queued != 1 {
-		t.Fatalf("notification edges=%d, want 1", queued)
-	}
-}
-
-// Concurrent writers may publish all 32 shards while one notification remains
-// queued. Atomic OR must preserve every shard rather than letting the last
-// writer replace an earlier finite tail.
-func TestTunTcpInboundHandoffRequestPreservesConcurrentShards(t *testing.T) {
-	tun := &Tun{tcpInboundHandoffNotify: make(chan struct{}, 1)}
-	start := make(chan struct{})
-	var writers sync.WaitGroup
-	for shardIndex := 0; shardIndex < tunTcpInboundShardCount; shardIndex += 1 {
-		writers.Add(1)
-		go func(shardIndex int) {
-			defer writers.Done()
-			<-start
-			for range 32 {
-				tun.requestTcpInboundHandoff(shardIndex)
-			}
-		}(shardIndex)
-	}
-	close(start)
-	writers.Wait()
-
-	if pending := tun.tcpInboundHandoffShards.Swap(0); pending != ^uint32(0) {
-		t.Fatalf("pending shard bits=%032b, want all shards", pending)
-	}
-	if queued := len(tun.tcpInboundHandoffNotify); queued != 1 {
-		t.Fatalf("notification edges=%d, want 1", queued)
-	}
-}
-
-func TestTunTcpInboundHandoffRequestDoesNotAllocate(t *testing.T) {
-	tun := &Tun{tcpInboundHandoffNotify: make(chan struct{}, 1)}
-	allocations := testing.AllocsPerRun(1_000, func() {
-		tun.requestTcpInboundHandoff(7)
-		tun.tcpInboundHandoffShards.Store(0)
-		select {
-		case <-tun.tcpInboundHandoffNotify:
-		default:
-		}
-	})
-	if allocations != 0 {
-		t.Fatalf("handoff request allocations/run=%.2f, want 0", allocations)
-	}
-}
-
-// A worker that has claimed a finite tail may be blocked behind its shard
-// writer when shutdown begins. Its lifecycle join must wait for that claimed
-// handoff instead of tearing down the gVisor stack underneath it.
-func TestTunTcpInboundHandoffWorkerJoinsClaimedShardOnShutdown(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	tun, err := CreateTunWithDefaults(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	closed := false
-	shard := &tun.tcpInboundShards[5]
-	shardLocked := true
-	shard.writeLock.Lock()
+// A small origin response often consists of one returned TCP packet. Raw Write
+// must complete its gVisor handoff before it returns: a shared deferred worker
+// can be blocked by unrelated traffic and leave the H1/TLS ACK tail stranded.
+// One P prevents an asynchronous handoff from running between Write's return
+// and this assertion, making the old deferred-worker failure deterministic.
+func TestTunWriteCompletesFiniteTcpInboundHandoffBeforeReturn(t *testing.T) {
+	previousProcs := runtime.GOMAXPROCS(1)
+	runtime.LockOSThread()
 	defer func() {
-		if shardLocked {
-			shard.writeLock.Unlock()
-		}
-		if !closed {
-			_ = tun.Close()
-		}
+		runtime.UnlockOSThread()
+		runtime.GOMAXPROCS(previousProcs)
 	}()
 
-	tun.requestTcpInboundHandoff(5)
-	deadline := time.Now().Add(time.Second)
-	for len(tun.tcpInboundHandoffNotify) != 0 ||
-		tun.tcpInboundHandoffShards.Load() != 0 {
-		if deadline.Before(time.Now()) {
-			t.Fatal("worker did not claim the published shard")
-		}
-		runtime.Gosched()
-	}
-
-	waitStarted := make(chan struct{})
-	waitDone := make(chan struct{})
-	go func() {
-		close(waitStarted)
-		tun.tcpInboundHandoffWait.Wait()
-		close(waitDone)
-	}()
-	<-waitStarted
-	tun.cancel()
-	select {
-	case <-waitDone:
-		t.Fatal("worker exited while its claimed shard remained locked")
-	case <-time.After(20 * time.Millisecond):
-	}
-
-	shard.writeLock.Unlock()
-	shardLocked = false
-	select {
-	case <-waitDone:
-	case <-time.After(time.Second):
-		t.Fatal("worker did not join after its claimed shard became available")
-	}
-	if err := tun.Close(); err != nil {
-		t.Fatalf("close after worker join: %v", err)
-	}
-	closed = true
-}
-
-// A small origin response often consists of one returned TCP packet. The
-// producer may never inject a 16th packet, so Write must publish a worker edge
-// that completes the gVisor handoff instead of leaving the tail pending forever.
-func TestTunWriteFinishesFiniteTcpInboundHandoff(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	tun, err := CreateTunWithDefaults(ctx)
@@ -367,12 +217,23 @@ func TestTunWriteFinishesFiniteTcpInboundHandoff(t *testing.T) {
 		t.Fatalf("write finite TCP return: %v", err)
 	}
 
-	waitForTunTcpInboundHandoff(t, tun, shardIndex, 1)
+	shard := &tun.tcpInboundShards[shardIndex]
+	shard.writeLock.Lock()
+	packetCount := shard.packetCount
+	endpointCount := shard.endpointCount
+	shard.writeLock.Unlock()
+	if packetCount != 1 || endpointCount != 0 {
+		t.Fatalf(
+			"Write returned before finite TCP handoff: packet_count=%d endpoint_count=%d, want 1/0",
+			packetCount,
+			endpointCount,
+		)
+	}
 }
 
-// Finite-tail worker handoffs must not erase the bounded inline handoff cadence
-// shared by consecutive one-packet callbacks on the same flow.
-func TestTunWriteRetainsTcpInboundBurstCadence(t *testing.T) {
+// Immediate endpoint handoff must not erase the bounded scheduler-yield
+// cadence shared by consecutive one-packet callbacks on the same flow.
+func TestTunWriteRetainsTcpInboundYieldCadence(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	tun, err := CreateTunWithDefaults(ctx)
@@ -390,8 +251,21 @@ func TestTunWriteRetainsTcpInboundBurstCadence(t *testing.T) {
 		if _, err := tun.Write(packet); err != nil {
 			t.Fatalf("write packet %d: %v", packetIndex, err)
 		}
+		shard := &tun.tcpInboundShards[shardIndex]
+		shard.writeLock.Lock()
+		packetCount := shard.packetCount
+		endpointCount := shard.endpointCount
+		shard.writeLock.Unlock()
 		wantPacketCount := uint32(packetIndex % tunTcpInboundBurstPacketCount)
-		waitForTunTcpInboundHandoff(t, tun, shardIndex, wantPacketCount)
+		if packetCount != wantPacketCount || endpointCount != 0 {
+			t.Fatalf(
+				"packet %d cadence/handoff=%d/%d, want %d/0",
+				packetIndex,
+				packetCount,
+				endpointCount,
+				wantPacketCount,
+			)
+		}
 	}
 }
 

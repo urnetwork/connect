@@ -13,6 +13,24 @@ fixed 24 MiB envelope, which movable bytes buy the most H1 TTFB and goodput?**
 Reducing allocation churn creates spendable headroom; queue, root, carrier, and
 topology budgets decide whether that headroom can do useful work.
 
+## Physical Android device allowlist
+
+Every MEMSTEADY device measurement is restricted to this exact allowlist:
+
+| Role | Serial | Model |
+|---|---|---|
+| `device-a` | `3B161FDJG001KT` | Pixel 8 Pro |
+| `device-b` | `R5CX21FY6ND` | Galaxy S24 Ultra |
+
+Preflight must require both serials in `adb devices -l` with state `device` and
+reject any additional serial. Drivers pass each serial explicitly; a missing,
+unauthorized, or offline allowlisted device invalidates the block instead of
+substituting another phone. Public notes use roles; the private manifest keeps
+serials for reproducibility.
+
+Verified 2026-09-04 with `adb devices -l`: both allowlisted phones were online
+and no other attached serial was admitted to the memory cohort.
+
 ## Scope and acceptance signals
 
 The current performance iteration optimizes the default H1 carrier. H3 and

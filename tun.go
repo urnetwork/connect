@@ -367,13 +367,6 @@ type Tun struct {
 	// tcpInboundShards preserve same-flow injection order while independent
 	// browser connections continue in parallel.
 	tcpInboundShards [tunTcpInboundShardCount]tunTcpInboundShard
-	// Single-packet receive callbacks publish finite-tail work through one
-	// coalesced edge and a fixed bit per shard. One worker completes the gVisor
-	// user-unlock handoff without making every packet callback contend on the
-	// endpoint lock. Flow churn cannot grow either structure.
-	tcpInboundHandoffShards atomic.Uint32
-	tcpInboundHandoffNotify chan struct{}
-	tcpInboundHandoffWait   sync.WaitGroup
 
 	// gro coalesces the tcp packets of a WriteBatch into super-segments
 	// before delivery, amortizing the per-segment dispatch, endpoint
@@ -465,8 +458,7 @@ func (self *Tun) advanceTcpInboundShardWithLock(shard *tunTcpInboundShard, endpo
 // unlock handoff for every endpoint touched in the burst. The shard write lock
 // remains held so the next burst cannot overtake the handoff. Endpoint state
 // is cleared independently from packetCount: individual finite callbacks must
-// retain their shared cadence until one of them performs the bounded inline
-// handoff.
+// retain their shared cadence until one of them performs the scheduler yield.
 func (self *Tun) synchronizeTcpInboundProcessorsWithLock(shard *tunTcpInboundShard) {
 	for endpointIndex := 0; endpointIndex < shard.endpointCount; endpointIndex += 1 {
 		endpointId := shard.endpointIds[endpointIndex]
@@ -482,53 +474,6 @@ func (self *Tun) synchronizeTcpInboundProcessorsWithLock(shard *tunTcpInboundSha
 		}
 	}
 	shard.endpointCount = 0
-}
-
-// requestTcpInboundHandoff publishes one shard to the bounded finite-tail
-// worker. Injection and the shard write lock release must happen first, so the
-// worker cannot overtake the packet that created the edge.
-func (self *Tun) requestTcpInboundHandoff(shardIndex int) {
-	self.tcpInboundHandoffShards.Or(uint32(1) << uint(shardIndex))
-	select {
-	case self.tcpInboundHandoffNotify <- struct{}{}:
-	default:
-	}
-}
-
-// runTcpInboundHandoffs completes finite tails while naturally combining
-// adjacent one-packet callbacks that become ready before this worker takes
-// their shard locks. There is no timer or batching sleep: sparse traffic wakes
-// the worker immediately, while hot traffic shares one fixed notification.
-func (self *Tun) runTcpInboundHandoffs() {
-	defer self.tcpInboundHandoffWait.Done()
-	for {
-		select {
-		case <-self.ctx.Done():
-			return
-		case <-self.tcpInboundHandoffNotify:
-		}
-
-		for {
-			if self.ctx.Err() != nil {
-				return
-			}
-			pending := self.tcpInboundHandoffShards.Swap(0)
-			if pending == 0 {
-				break
-			}
-			for shardIndex := 0; shardIndex < tunTcpInboundShardCount; shardIndex += 1 {
-				if pending&(uint32(1)<<uint(shardIndex)) == 0 {
-					continue
-				}
-				shard := &self.tcpInboundShards[shardIndex]
-				shard.writeLock.Lock()
-				if 0 < shard.endpointCount {
-					self.synchronizeTcpInboundProcessorsWithLock(shard)
-				}
-				shard.writeLock.Unlock()
-			}
-		}
-	}
 }
 
 // tunLinkEndpoint converts channel.Endpoint's silent bounded-queue drop into
@@ -689,7 +634,6 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 		nicIdAllocator:            nicIdAllocator,
 		localAddresses:            localAddresses,
 		localIpv4AddressAllocator: localIpv4AddressAllocator,
-		tcpInboundHandoffNotify:   make(chan struct{}, 1),
 	}
 
 	tun.dohResolver.Store(tun.buildDohCache(dnsResolverSettings, settings.DohRequestTimeout))
@@ -720,8 +664,6 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 	tun.stack.AddRoute(tcpip.Route{Destination: header.IPv4EmptySubnet, NIC: nicId})
 
 	tun.gro.Init(settings.TcpGro)
-	tun.tcpInboundHandoffWait.Add(1)
-	go tun.runTcpInboundHandoffs()
 
 	return tun, nil
 }
@@ -976,11 +918,11 @@ func (self *Tun) write(packet []byte, onRelease func()) (int, error) {
 
 	endpointId, shardIndex, tcpInbound := tcpInboundFlow(packet)
 	var tcpInboundShard *tunTcpInboundShard
-	inlineHandoff := false
+	yieldProcessor := false
 	if tcpInbound {
 		tcpInboundShard = &self.tcpInboundShards[shardIndex]
 		tcpInboundShard.writeLock.Lock()
-		inlineHandoff = self.advanceTcpInboundShardWithLock(tcpInboundShard, endpointId)
+		yieldProcessor = self.advanceTcpInboundShardWithLock(tcpInboundShard, endpointId)
 	}
 
 	// copy the packet
@@ -998,16 +940,15 @@ func (self *Tun) write(packet []byte, onRelease func()) (int, error) {
 		self.ep.InjectInbound(header.IPv4ProtocolNumber, pkb)
 		pkb.DecRef()
 		if tcpInbound {
-			// Keep the bounded inline cadence for a continuously hot producer.
-			// Below that cadence, the coalesced worker completes the finite tail:
-			// waiting for a future 16th packet can strand a short TLS/HTTP response
-			// forever, while locking the endpoint here on every packet serializes
-			// the receive callback with gVisor's processor.
-			if inlineHandoff {
-				self.synchronizeTcpInboundProcessorsWithLock(tcpInboundShard)
+			// A one-packet callback is itself a complete finite burst. Complete
+			// gVisor's user-unlock handoff before returning: deferred execution
+			// can strand a short H1/TLS response behind an unrelated shard or a
+			// worker scheduling delay, and the provider NAT cannot retransmit it.
+			self.synchronizeTcpInboundProcessorsWithLock(tcpInboundShard)
+			if yieldProcessor {
+				runtime.Gosched()
 			}
 			tcpInboundShard.writeLock.Unlock()
-			self.requestTcpInboundHandoff(shardIndex)
 		}
 		return len(packet), nil
 	default:
@@ -1328,9 +1269,6 @@ func (self *Tun) Close() error {
 		// stack, so net/http cannot install a late h2/TLS connection after the
 		// idle pool was closed.
 		self.dohResolver.Load().Close()
-		// The finite-tail worker may be between FindTransportEndpoint and the
-		// endpoint handoff. Join it before removing the NIC or closing the stack.
-		self.tcpInboundHandoffWait.Wait()
 		self.stack.RemoveNIC(self.nicId)
 		// ep.Close() drains and DecRefs any packets still queued in the endpoint.
 		self.ep.Close()
