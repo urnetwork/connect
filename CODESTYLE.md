@@ -133,6 +133,18 @@ The device-side tun write is one deliberate callback exception, documented at it
 
 ## Tests
 
+- **Test data must never contain production identity or secrets.** Do not copy
+  tokens, credentials, private route prefixes, customer/account identifiers,
+  real hostnames or domains, public or private IP addresses, or other live
+  configuration values into test code, fixtures, golden files, comments, or
+  snapshots. Use visibly synthetic names, `.example` hostnames, RFC-reserved
+  documentation addresses (`192.0.2.0/24`, `198.51.100.0/24`,
+  `203.0.113.0/24`, and `2001:db8::/32`), and generated test-only identifiers.
+  When reproducing a length, collision, parser, or topology boundary, construct
+  an equal-or-more-demanding synthetic value and test the invariant rather than
+  retaining the production literal. Sanitize any production capture before it
+  becomes a fixture; keep necessary raw incident evidence outside the source
+  repository under its restricted evidence policy.
 - **Deterministic reproduction is a completion gate.** A bug fix is not complete until a regression test deterministically reproduces the pre-fix failure and verifies the corrected behavior. Use explicit barriers, hooks, or state transitions to force the relevant ordering; do not make sleeps, short negative timeouts, queue-length polling, or scheduler luck the primary proof. Race, ownership, stale-generation, and topology bugs each need a test at the layer where the broken behavior is observable so the same issue cannot silently return through another path.
 - Each test is a top-level `func TestXxx(t *testing.T)`. Normal (positive) tests do not use `t.Run` subtests: if cases are logically separate, write separate top-level tests; if they are homogeneous variations of one thing, use a plain table loop (`for _, c := range cases { ... }`) reporting with `t.Errorf`/`t.Fatalf`.
 - `t.Run` is appropriate only when the subtest boundary itself is the point — notably when a test deliberately runs a subtest that is expected to FAIL and asserts that failure. The subtest isolates and captures the failure so the parent can check it.
