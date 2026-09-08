@@ -4,6 +4,8 @@ In the URnetwork code, the following Go style is used. A few conventions — not
 
 ## Naming
 
+- Treat acronyms and initialisms as ordinary words in Go identifiers: capitalize only the first letter of each acronym, not every letter. Write `EvmTxManager`, `Tcp`, `Rpc`, `Http`, `Api`, `Json`, `Id`, and `Uid`, not `EVMTxManager`, `TCP`, `RPC`, `HTTP`, `API`, `JSON`, `ID`, or `UID`. At the start of an unexported identifier, lowercase the whole acronym: `evmTxManager`, `tcpConnection`, `rpcClient`, `clientId`, and `validatorUid`. Apply this consistently to types, functions, methods, fields, variables, constants, and test names in code we write. This deliberately differs from standard Go initialism conventions.
+- Preserve identifiers required by external packages, generated bindings, or interface contracts, and preserve serialized field names and protocol formats unless changing that contract is explicitly part of the task. Rename an owned identifier and all its references together; a naming-only change must not alter behavior or wire compatibility.
 - Our receiver name is `self`: `func (self *T) f(...)` (pointer receiver) or `func (self T) f(...)` (value receiver).
 - Our canonical name for a `sync.Mutex` guarding state is `stateLock`.
 - Field and variable names are slightly more verbose than standard Go, so usage and type can be inferred from the name. The scheme is usage + type:
