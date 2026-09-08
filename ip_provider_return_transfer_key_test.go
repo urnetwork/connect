@@ -482,6 +482,7 @@ func TestRemoteUserNatProviderIngressPreservesTransferKey(t *testing.T) {
 
 	select {
 	case queued := <-localUserNat.sendPackets:
+		defer queued.finish()
 		if queued.source != source.LocalMask() {
 			t.Fatalf("NAT source = %s, want %s", queued.source, source.LocalMask())
 		}
@@ -541,6 +542,7 @@ func TestRemoteUserNatProviderIngressKeepsSourceAndTransferKeyPaired(t *testing.
 		default:
 			t.Fatalf("provider did not enqueue source/key pair %d", pairIndex)
 		}
+		defer queued.finish()
 		if queued.source != sources[pairIndex].LocalMask() {
 			t.Fatalf(
 				"NAT pair %d source = %s, want %s",

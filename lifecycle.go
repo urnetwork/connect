@@ -41,6 +41,13 @@ func (self *lifecycleAdmission) start() bool {
 // finish releases one admitted producer and publishes terminal completion
 // when it was the last producer behind a closed gate.
 func (self *lifecycleAdmission) finish() {
+	self.finishAndIdle()
+}
+
+// finishAndIdle releases one producer and reports whether the still-open gate
+// became idle. Owners use that exact edge to reclaim healthy keyed gates
+// without racing a concurrent close or a new admission.
+func (self *lifecycleAdmission) finishAndIdle() bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	if self.activeCount <= 0 {
@@ -50,6 +57,7 @@ func (self *lifecycleAdmission) finish() {
 	if !self.open && self.activeCount == 0 {
 		close(self.done)
 	}
+	return self.open && self.activeCount == 0
 }
 
 // close prevents later admission. It deliberately does not wait, so callers

@@ -234,6 +234,7 @@ func TestProviderInspectsCompleteUdpBeforeForwardingOriginalIpv4Fragments(t *tes
 	case <-time.After(5 * time.Second):
 		t.Fatal("provider did not forward the inspected fragment group")
 	}
+	defer queued.finish()
 	if queued.source != source.LocalMask() || queued.transferKey != transferKey {
 		t.Fatalf("queued fragment identity source=%v key=%+v", queued.source, queued.transferKey)
 	}

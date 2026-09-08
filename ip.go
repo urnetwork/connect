@@ -119,6 +119,10 @@ type receiveTransferPacketsBatchFunction func(
 // canonical outbound tuple. Both are borrowed for the call.
 type tcpFlowCloseFunction func(source TransferPath, ipPath *IpPath)
 
+// sourceRetirementFunction applies one owner-refcounted provider rejection to
+// every protocol buffer in a local NAT shard.
+type sourceRetirementFunction func(sourceId Id, retired bool) []<-chan struct{}
+
 // A flow's authenticated source is immutable while its receiver-visible reply
 // lane may change. Keeping both under one lock prevents a callback from
 // observing a source with another update's lane.
@@ -699,6 +703,18 @@ type LocalUserNat struct {
 	// and idle timeout.
 	tcpFlowCloseCallbacks *CallbackList[tcpFlowCloseFunction]
 
+	// Provider generations share a LocalUserNat during ordinary ownership
+	// handoffs. A rejected source remains tombstoned until every generation
+	// that claimed it releases its owner; no generation may clear a sibling's
+	// rejection. The lock order is this state then a protocol buffer mutex.
+	sourceRetirementLock      sync.Mutex
+	nextSourceRetirementOwner uint64
+	nextSourceRetirementCb    uint64
+	sourceRetirementOwnerIds  map[uint64]map[Id]bool
+	sourceRetirementSourceIds map[Id]map[uint64]bool
+	sourceRetirementDoneIds   map[Id][]<-chan struct{}
+	sourceRetirementCallbacks map[uint64]sourceRetirementFunction
+
 	// Test-only completed-disposition edge. Nil is a production no-op.
 	afterSendPacketForTest   func()
 	beforeRunDoneWaitForTest func()
@@ -752,6 +768,10 @@ func NewLocalUserNat(ctx context.Context, clientTag string, settings *LocalUserN
 		receivePacketsCallbacks:         NewCallbackList[ReceivePacketsFunction](),
 		receiveTransferPacketsCallbacks: NewCallbackList[receiveTransferPacketsFunction](),
 		tcpFlowCloseCallbacks:           NewCallbackList[tcpFlowCloseFunction](),
+		sourceRetirementOwnerIds:        map[uint64]map[Id]bool{},
+		sourceRetirementSourceIds:       map[Id]map[uint64]bool{},
+		sourceRetirementDoneIds:         map[Id][]<-chan struct{}{},
+		sourceRetirementCallbacks:       map[uint64]sourceRetirementFunction{},
 	}
 	go func() {
 		defer close(localUserNat.runDone)
@@ -759,6 +779,115 @@ func NewLocalUserNat(ctx context.Context, clientTag string, settings *LocalUserN
 	}()
 
 	return localUserNat
+}
+
+// Allocates one provider-generation owner. The owner must be released after
+// that provider has joined all source work.
+func (self *LocalUserNat) newSourceRetirementOwner() uint64 {
+	self.sourceRetirementLock.Lock()
+	defer self.sourceRetirementLock.Unlock()
+	for {
+		self.nextSourceRetirementOwner += 1
+		if self.nextSourceRetirementOwner != 0 {
+			break
+		}
+	}
+	ownerId := self.nextSourceRetirementOwner
+	self.sourceRetirementOwnerIds[ownerId] = map[Id]bool{}
+	return ownerId
+}
+
+// Publishes one exact-source tombstone for an owner. Protocol callbacks run
+// under the retirement lock to serialize registration, retirement, and final
+// release; callbacks only take their leaf buffer mutexes and never reenter the
+// LocalUserNat.
+func (self *LocalUserNat) retireSourceForOwner(
+	ownerId uint64,
+	sourceId Id,
+) []<-chan struct{} {
+	if ownerId == 0 || sourceId == (Id{}) {
+		return nil
+	}
+	self.sourceRetirementLock.Lock()
+	defer self.sourceRetirementLock.Unlock()
+	ownerSourceIds, ok := self.sourceRetirementOwnerIds[ownerId]
+	if !ok {
+		return nil
+	}
+	if ownerSourceIds[sourceId] {
+		return slices.Clone(self.sourceRetirementDoneIds[sourceId])
+	}
+	ownerSourceIds[sourceId] = true
+	sourceOwnerIds := self.sourceRetirementSourceIds[sourceId]
+	if sourceOwnerIds == nil {
+		sourceOwnerIds = map[uint64]bool{}
+		self.sourceRetirementSourceIds[sourceId] = sourceOwnerIds
+	}
+	firstOwner := len(sourceOwnerIds) == 0
+	sourceOwnerIds[ownerId] = true
+	if firstOwner {
+		for _, callback := range self.sourceRetirementCallbacks {
+			self.sourceRetirementDoneIds[sourceId] = append(
+				self.sourceRetirementDoneIds[sourceId],
+				callback(sourceId, true)...,
+			)
+		}
+	}
+	return slices.Clone(self.sourceRetirementDoneIds[sourceId])
+}
+
+// Releases only one generation's claims. A source becomes admissible again
+// only after its final owner has gone away.
+func (self *LocalUserNat) releaseSourceRetirementOwner(ownerId uint64) {
+	if ownerId == 0 {
+		return
+	}
+	self.sourceRetirementLock.Lock()
+	defer self.sourceRetirementLock.Unlock()
+	ownerSourceIds, ok := self.sourceRetirementOwnerIds[ownerId]
+	if !ok {
+		return
+	}
+	delete(self.sourceRetirementOwnerIds, ownerId)
+	for sourceId := range ownerSourceIds {
+		sourceOwnerIds := self.sourceRetirementSourceIds[sourceId]
+		delete(sourceOwnerIds, ownerId)
+		if len(sourceOwnerIds) != 0 {
+			continue
+		}
+		delete(self.sourceRetirementSourceIds, sourceId)
+		delete(self.sourceRetirementDoneIds, sourceId)
+		for _, callback := range self.sourceRetirementCallbacks {
+			callback(sourceId, false)
+		}
+	}
+}
+
+// Registers one shard and replays current tombstones before it can process a
+// packet. The returned unsubscribe is idempotent.
+func (self *LocalUserNat) addSourceRetirementCallback(callback sourceRetirementFunction) func() {
+	self.sourceRetirementLock.Lock()
+	for {
+		self.nextSourceRetirementCb += 1
+		if self.nextSourceRetirementCb != 0 {
+			break
+		}
+	}
+	callbackId := self.nextSourceRetirementCb
+	self.sourceRetirementCallbacks[callbackId] = callback
+	for sourceId := range self.sourceRetirementSourceIds {
+		callback(sourceId, true)
+	}
+	self.sourceRetirementLock.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			self.sourceRetirementLock.Lock()
+			delete(self.sourceRetirementCallbacks, callbackId)
+			self.sourceRetirementLock.Unlock()
+		})
+	}
 }
 
 func (self *LocalUserNat) SecurityPolicyStats(reset bool) SecurityPolicyStats {
@@ -816,8 +945,14 @@ func (self *LocalUserNat) sendTransferPacketsWithTimeout(
 	provideMode protocol.ProvideMode,
 	packets [][]byte,
 	timeout time.Duration,
+	completed ...func(),
 ) bool {
+	var disposition *localUserNatSendDisposition
+	if 0 < len(completed) && completed[0] != nil {
+		disposition = newLocalUserNatSendDisposition(completed[0])
+	}
 	if !self.beginSend() {
+		disposition.finish()
 		return false
 	}
 	defer self.sendWg.Done()
@@ -827,6 +962,7 @@ func (self *LocalUserNat) sendTransferPacketsWithTimeout(
 		transferKey: transferKey,
 		provideMode: provideMode,
 		packets:     packets,
+		disposition: disposition,
 	}
 	// fast path without arming a timer
 	select {
@@ -837,6 +973,7 @@ func (self *LocalUserNat) sendTransferPacketsWithTimeout(
 	if timeout < 0 {
 		select {
 		case <-self.ctx.Done():
+			sendPacket.finish()
 			return false
 		case self.sendPackets <- sendPacket:
 			return true
@@ -844,21 +981,25 @@ func (self *LocalUserNat) sendTransferPacketsWithTimeout(
 	} else if 0 == timeout {
 		select {
 		case <-self.ctx.Done():
+			sendPacket.finish()
 			return false
 		case self.sendPackets <- sendPacket:
 			return true
 		default:
 			// full
+			sendPacket.finish()
 			return false
 		}
 	} else {
 		select {
 		case <-self.ctx.Done():
+			sendPacket.finish()
 			return false
 		case self.sendPackets <- sendPacket:
 			return true
 		case <-time.After(timeout):
 			// full
+			sendPacket.finish()
 			return false
 		}
 	}
@@ -1067,6 +1208,7 @@ func (self *LocalUserNat) Run() {
 			for _, packet := range sendPacket.packets {
 				MessagePoolReturn(packet)
 			}
+			sendPacket.finish()
 			return false
 		case shardSendPackets[shard] <- sendPacket:
 			return true
@@ -1075,6 +1217,7 @@ func (self *LocalUserNat) Run() {
 
 	route := func(sendPacket *SendPacket) bool {
 		if len(sendPacket.packets) == 0 {
+			sendPacket.finish()
 			return true
 		}
 		// common case: all packets in the batch are for one shard
@@ -1095,6 +1238,13 @@ func (self *LocalUserNat) Run() {
 			packetShard := sendShard(packet, shardCount)
 			shardPackets[packetShard] = append(shardPackets[packetShard], packet)
 		}
+		childCount := 0
+		for _, packets := range shardPackets {
+			if 0 < len(packets) {
+				childCount += 1
+			}
+		}
+		sendPacket.disposition.add(childCount - 1)
 		for packetShard, packets := range shardPackets {
 			if len(packets) == 0 {
 				continue
@@ -1104,12 +1254,17 @@ func (self *LocalUserNat) Run() {
 				transferKey: sendPacket.transferKey,
 				provideMode: sendPacket.provideMode,
 				packets:     packets,
+				disposition: sendPacket.disposition,
 			}
 			if !forward(packetShard, shardSendPacket) {
 				for _, returnPackets := range shardPackets[packetShard+1:] {
+					if len(returnPackets) == 0 {
+						continue
+					}
 					for _, packet := range returnPackets {
 						MessagePoolReturn(packet)
 					}
+					sendPacket.disposition.finish()
 				}
 				return false
 			}
@@ -1149,9 +1304,12 @@ func returnQueuedSendPackets(sendPackets chan *SendPacket) {
 	for {
 		select {
 		case sendPacket := <-sendPackets:
-			for _, packet := range sendPacket.packets {
-				MessagePoolReturn(packet)
-			}
+			func() {
+				defer sendPacket.finish()
+				for _, packet := range sendPacket.packets {
+					MessagePoolReturn(packet)
+				}
+			}()
 		default:
 			return
 		}
@@ -1219,6 +1377,17 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 	tcp6Buffer.flowCloseCallback = self.closeTcpFlow
 	icmp4Buffer := newIcmp4BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.IcmpBufferSettings)
 	icmp6Buffer := newIcmp6BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.IcmpBufferSettings)
+	sourceRetirementUnsub := self.addSourceRetirementCallback(func(sourceId Id, retired bool) []<-chan struct{} {
+		var doneChannels []<-chan struct{}
+		doneChannels = append(doneChannels, udp4Buffer.setSourceRetired(sourceId, retired)...)
+		doneChannels = append(doneChannels, udp6Buffer.setSourceRetired(sourceId, retired)...)
+		doneChannels = append(doneChannels, tcp4Buffer.setSourceRetired(sourceId, retired)...)
+		doneChannels = append(doneChannels, tcp6Buffer.setSourceRetired(sourceId, retired)...)
+		doneChannels = append(doneChannels, icmp4Buffer.setSourceRetired(sourceId, retired)...)
+		doneChannels = append(doneChannels, icmp6Buffer.setSourceRetired(sourceId, retired)...)
+		return doneChannels
+	})
+	defer sourceRetirementUnsub()
 	defer func() {
 		// Dispatch has stopped and its context is terminal. Join every flow
 		// owner before this shard can publish completion to LocalUserNat.Run.
@@ -1490,6 +1659,7 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 	}
 
 	handleSendPacket := func(sendPacket *SendPacket) {
+		defer sendPacket.finish()
 		for _, ipPacket := range sendPacket.packets {
 			handleIpPacket(sendPacket.source, sendPacket.transferKey, sendPacket.provideMode, ipPacket)
 			if self.afterSendPacketForTest != nil {
@@ -1540,6 +1710,39 @@ type SendPacket struct {
 	transferKey TransferKey
 	provideMode protocol.ProvideMode
 	packets     [][]byte
+	disposition *localUserNatSendDisposition
+}
+
+// One provider admission can fan into several LocalUserNat send shards. The
+// shared disposition releases it only after every child has either handed all
+// packets to protocol flow ownership or returned them to the message pool.
+type localUserNatSendDisposition struct {
+	remaining atomic.Int64
+	completed func()
+}
+
+func newLocalUserNatSendDisposition(completed func()) *localUserNatSendDisposition {
+	disposition := &localUserNatSendDisposition{completed: completed}
+	disposition.remaining.Store(1)
+	return disposition
+}
+
+func (self *localUserNatSendDisposition) add(count int) {
+	if self != nil && 0 < count {
+		self.remaining.Add(int64(count))
+	}
+}
+
+func (self *localUserNatSendDisposition) finish() {
+	if self != nil && self.remaining.Add(-1) == 0 {
+		HandleError(self.completed)
+	}
+}
+
+func (self *SendPacket) finish() {
+	if self != nil {
+		self.disposition.finish()
+	}
 }
 
 // comparable
@@ -1977,6 +2180,9 @@ func (dispatcher *udpReceiveDispatcher) enqueue(sequence *UdpSequence, packet []
 	if dispatcher == nil || sequence == nil || len(dispatcher.shards) == 0 {
 		return false
 	}
+	if !sequence.startRetirementOperation() {
+		return false
+	}
 	shard := &dispatcher.shards[sequence.receiveShard]
 	shard.startOnce.Do(func() {
 		dispatcher.waitGroup.Add(1)
@@ -1987,8 +2193,10 @@ func (dispatcher *udpReceiveDispatcher) enqueue(sequence *UdpSequence, packet []
 	})
 	select {
 	case <-dispatcher.ctx.Done():
+		sequence.finishRetirementOperation()
 		return false
 	case <-sequence.ctx.Done():
+		sequence.finishRetirementOperation()
 		return false
 	case shard.items <- udpReceiveDispatchItem{sequence: sequence, packet: packet}:
 		return true
@@ -2017,6 +2225,7 @@ func returnQueuedUdpDispatchItems(items chan udpReceiveDispatchItem) {
 		select {
 		case item := <-items:
 			MessagePoolReturn(item.packet)
+			item.sequence.finishRetirementOperation()
 		default:
 			return
 		}
@@ -2031,6 +2240,7 @@ func (shard *udpReceiveDispatchShard) run() {
 	releaseQueued := func() {
 		if hasPending {
 			MessagePoolReturn(pending.packet)
+			pending.sequence.finishRetirementOperation()
 			pending = udpReceiveDispatchItem{}
 			hasPending = false
 		}
@@ -2072,7 +2282,14 @@ func (shard *udpReceiveDispatchShard) run() {
 				break fill
 			}
 		}
-		sequence.receiveBatch(batch)
+		func() {
+			defer func() {
+				for range batch {
+					sequence.finishRetirementOperation()
+				}
+			}()
+			sequence.receiveBatch(batch)
+		}()
 	}
 }
 
@@ -2219,8 +2436,9 @@ type UdpBuffer[BufferId comparable] struct {
 
 	mutex sync.Mutex
 
-	sequences       map[BufferId]*UdpSequence
-	sourceSequences map[TransferPath]map[BufferId]*UdpSequence
+	sequences        map[BufferId]*UdpSequence
+	sourceSequences  map[TransferPath]map[BufferId]*UdpSequence
+	retiredSourceIds map[Id]bool
 }
 
 func newUdpBuffer[BufferId comparable](
@@ -2237,6 +2455,7 @@ func newUdpBuffer[BufferId comparable](
 		sharedLifecycleWake: make(chan struct{}, 1),
 		sequences:           map[BufferId]*UdpSequence{},
 		sourceSequences:     map[TransferPath]map[BufferId]*UdpSequence{},
+		retiredSourceIds:    map[Id]bool{},
 	}
 }
 
@@ -2254,6 +2473,9 @@ func (self *UdpBuffer[BufferId]) udpSend(
 	initSequence := func(skip *UdpSequence) *UdpSequence {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
+		if self.retiredSourceIds[source.SourceId] {
+			return nil
+		}
 
 		sequence, ok := self.sequences[bufferId]
 		if ok {
@@ -2365,6 +2587,11 @@ func (self *UdpBuffer[BufferId]) udpSend(
 			go HandleError(func() {
 				defer self.sequenceWaitGroup.Done()
 				defer func() {
+					sequence.Close()
+					<-sequence.retirementOperations.Done()
+					close(sequence.retirementDone)
+				}()
+				defer func() {
 					self.mutex.Lock()
 					defer self.mutex.Unlock()
 					sequence.Close()
@@ -2392,11 +2619,18 @@ func (self *UdpBuffer[BufferId]) udpSend(
 		ipPacket:    ipPacket,
 	}
 	sequence := initSequence(nil)
+	if sequence == nil {
+		return false, nil
+	}
 	if success, err := sequence.send(sendItem, timeout); err == nil {
 		return success, nil
 	} else {
 		// sequence closed
-		return initSequence(sequence).send(sendItem, timeout)
+		sequence = initSequence(sequence)
+		if sequence == nil {
+			return false, nil
+		}
+		return sequence.send(sendItem, timeout)
 	}
 }
 
@@ -2428,6 +2662,31 @@ func (self *UdpBuffer[BufferId]) removeSequenceWithLock(bufferId BufferId, seque
 		delete(self.sourceSequences, sequence.source)
 	}
 	sequence.Close()
+}
+
+// Applies one exact provider-source tombstone and cancels every matching UDP
+// socket generation before allowing the retirement worker to join it.
+func (self *UdpBuffer[BufferId]) setSourceRetired(
+	sourceId Id,
+	retired bool,
+) (doneChannels []<-chan struct{}) {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	if !retired {
+		delete(self.retiredSourceIds, sourceId)
+		return nil
+	}
+	self.retiredSourceIds[sourceId] = true
+	for source, sourceSequences := range self.sourceSequences {
+		if source.SourceId != sourceId {
+			continue
+		}
+		for bufferId, sequence := range sourceSequences {
+			doneChannels = append(doneChannels, sequence.sourceRetirementDone())
+			self.removeSequenceWithLock(bufferId, sequence)
+		}
+	}
+	return doneChannels
 }
 
 func (self *UdpBuffer[BufferId]) wakeSharedSocketLifecycle() {
@@ -2527,6 +2786,8 @@ type UdpSequence struct {
 	sharedSocket                   net.Conn
 	sharedSocketErr                error
 	closeOnce                      sync.Once
+	retirementOperations           *lifecycleAdmission
+	retirementDone                 chan struct{}
 
 	sendMutex sync.Mutex
 	sendItems chan *UdpSendItem
@@ -2583,15 +2844,17 @@ func newUdpSequenceWithTransferKey(
 		sendItems = make(chan *UdpSendItem, udpBufferSettings.SequenceBufferSize)
 	}
 	return &UdpSequence{
-		ctx:               cancelCtx,
-		cancel:            cancel,
-		log:               loggerOrDefault(udpBufferSettings.Log),
-		receiveCallback:   receiveCallback,
-		sendItems:         sendItems,
-		udpBufferSettings: udpBufferSettings,
-		idleCondition:     NewIdleCondition(),
-		socketReadPollFd:  -1,
-		transferState:     newTransferState(source, transferKey),
+		ctx:                  cancelCtx,
+		cancel:               cancel,
+		retirementOperations: newLifecycleAdmission(),
+		retirementDone:       make(chan struct{}),
+		log:                  loggerOrDefault(udpBufferSettings.Log),
+		receiveCallback:      receiveCallback,
+		sendItems:            sendItems,
+		udpBufferSettings:    udpBufferSettings,
+		idleCondition:        NewIdleCondition(),
+		socketReadPollFd:     -1,
+		transferState:        newTransferState(source, transferKey),
 		StreamState: StreamState{
 			source:          source,
 			provideMode:     provideMode,
@@ -2613,7 +2876,24 @@ func (self *UdpSequence) ensureSendItems() {
 	}
 }
 
+// Direct low-level fixtures may omit retirement tracking. Constructor-owned
+// sequences always have it; the nil form preserves their historical behavior.
+func (self *UdpSequence) startRetirementOperation() bool {
+	return self != nil &&
+		(self.retirementOperations == nil || self.retirementOperations.start())
+}
+
+func (self *UdpSequence) finishRetirementOperation() {
+	if self != nil && self.retirementOperations != nil {
+		self.retirementOperations.finish()
+	}
+}
+
 func (self *UdpSequence) send(sendItem *UdpSendItem, timeout time.Duration) (bool, error) {
+	if !self.startRetirementOperation() {
+		return false, errors.New("Done.")
+	}
+	defer self.finishRetirementOperation()
 	if self.sharedSocketLifecycle {
 		return self.sendSharedSocket(sendItem)
 	}
@@ -3008,6 +3288,7 @@ func (self *UdpSequence) Cancel() {
 
 func (self *UdpSequence) Close() {
 	self.closeOnce.Do(func() {
+		self.retirementOperations.close()
 		self.cancel()
 		if self.sharedSocketLifecycle {
 			if self.socketReadPoller != nil {
@@ -3022,6 +3303,15 @@ func (self *UdpSequence) Close() {
 			}
 		}
 	})
+}
+
+// Completion includes every send and queued receive callback. Nonshared
+// sequences also wait for their socket worker and terminal queue drain.
+func (self *UdpSequence) sourceRetirementDone() <-chan struct{} {
+	if self.sharedSocketLifecycle {
+		return self.retirementOperations.Done()
+	}
+	return self.retirementDone
 }
 
 type UdpSendItem struct {
@@ -3344,8 +3634,9 @@ type TcpBuffer[BufferId comparable] struct {
 	// the terminal Wait.
 	sequenceWaitGroup sync.WaitGroup
 
-	sequences       map[BufferId]*TcpSequence
-	sourceSequences map[TransferPath]map[BufferId]*TcpSequence
+	sequences        map[BufferId]*TcpSequence
+	sourceSequences  map[TransferPath]map[BufferId]*TcpSequence
+	retiredSourceIds map[Id]bool
 
 	// orphan rst rate limiting (guarded by mutex; see EnableOrphanRst)
 	orphanRstWindowStart time.Time
@@ -3364,6 +3655,7 @@ func newTcpBuffer[BufferId comparable](
 		tcpBufferSettings: tcpBufferSettings,
 		sequences:         map[BufferId]*TcpSequence{},
 		sourceSequences:   map[TransferPath]map[BufferId]*TcpSequence{},
+		retiredSourceIds:  map[Id]bool{},
 	}
 }
 
@@ -3403,6 +3695,9 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 	initSequence := func() *TcpSequence {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
+		if self.retiredSourceIds[source.SourceId] {
+			return nil
+		}
 
 		if sequence, ok := self.sequences[bufferId]; ok {
 			if tcp.rst {
@@ -3543,6 +3838,7 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 		self.sequenceWaitGroup.Add(1)
 		go HandleError(func() {
 			defer self.sequenceWaitGroup.Done()
+			defer close(sequence.retirementDone)
 			defer func() {
 				sequence.Close()
 				self.mutex.Lock()
@@ -3628,6 +3924,31 @@ func (self *TcpBuffer[BufferId]) removeSequenceWithLock(bufferId BufferId, seque
 		delete(self.sourceSequences, sequence.source)
 	}
 	sequence.Cancel()
+}
+
+// Applies one exact provider-source tombstone and cancels matching TCP flow
+// ownership without disturbing sibling sources.
+func (self *TcpBuffer[BufferId]) setSourceRetired(
+	sourceId Id,
+	retired bool,
+) (doneChannels []<-chan struct{}) {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	if !retired {
+		delete(self.retiredSourceIds, sourceId)
+		return nil
+	}
+	self.retiredSourceIds[sourceId] = true
+	for source, sourceSequences := range self.sourceSequences {
+		if source.SourceId != sourceId {
+			continue
+		}
+		for bufferId, sequence := range sourceSequences {
+			doneChannels = append(doneChannels, sequence.retirementDone)
+			self.removeSequenceWithLock(bufferId, sequence)
+		}
+	}
+	return doneChannels
 }
 
 // tcpRstForOrphan builds the RFC 793 reset for a segment that matched no
@@ -3742,6 +4063,9 @@ type TcpSequence struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	log    Logger
+	// Closed by the owning buffer only after Run has joined child workers and
+	// drained every queued packet.
+	retirementDone chan struct{}
 
 	receiveCallback                receiveTransferPacketFunction
 	receiveTransferPacketsCallback receiveTransferPacketsBatchFunction
@@ -3850,6 +4174,7 @@ func newTcpSequenceWithTransferKey(
 		ctx:               cancelCtx,
 		cancel:            cancel,
 		log:               loggerOrDefault(tcpBufferSettings.Log),
+		retirementDone:    make(chan struct{}),
 		receiveCallback:   receiveCallback,
 		tcpBufferSettings: tcpBufferSettings,
 		sendItems:         make(chan *TcpSendItem, tcpBufferSettings.SequenceBufferSize),
@@ -5506,6 +5831,11 @@ type RemoteUserNatProviderSettings struct {
 	// final send/drop accounting. It must not block; a panic is recovered and
 	// logged without stopping return processing.
 	ReturnSendObserver func(RemoteUserNatProviderReturnSendObservation)
+
+	// SourceLifecycleSaturated reports once when permanent Reliability
+	// tombstones consume the source bound. The owner must schedule replacement
+	// and return promptly; provider callbacks never join their own Client tree.
+	SourceLifecycleSaturated func()
 }
 
 // RemoteUserNatProviderReturnSendPhase identifies exact item admission and
@@ -5620,6 +5950,9 @@ type providerReturnItem struct {
 	// behind a synthesized TCP reset instead of competing with that reset for
 	// the same bounded send-sequence slot.
 	afterRelease func()
+	// sourceLifecycle keeps the exact source behind the terminal verdict gate
+	// until this queued or in-flight return reaches final disposition.
+	sourceLifecycle *providerSourceLifecycle
 }
 
 // One sender-worker result exposes the exact completed accounting edge to
@@ -5780,6 +6113,29 @@ func (self *providerReturnItem) returnPackets() {
 	self.packets = self.packets[:0]
 }
 
+// Returns the exact source cancellation boundary when this item was admitted;
+// direct unit fixtures without a lifecycle retain the provider fallback.
+func (self *providerReturnItem) sendContext(fallback context.Context) context.Context {
+	if self.sourceLifecycle != nil {
+		return self.sourceLifecycle.ctx
+	}
+	return fallback
+}
+
+// One source gate linearizes callback admission with a terminal Reliability
+// verdict. Healthy gates are reclaimed at the final admission; terminal gates
+// remain for the provider generation lifetime.
+type providerSourceLifecycle struct {
+	sourceId   Id
+	ctx        context.Context
+	cancel     context.CancelFunc
+	admissions *lifecycleAdmission
+	terminal   bool
+	// Terminal lifecycles are their own pending cleanup nodes, so the status
+	// path allocates no second capacity-sized queue.
+	retirementNext *providerSourceLifecycle
+}
+
 type RemoteUserNatProvider struct {
 	ctx            context.Context
 	client         *Client
@@ -5800,6 +6156,11 @@ type RemoteUserNatProvider struct {
 	settings             *RemoteUserNatProviderSettings
 	localUserNatUnsub    func()
 	clientUnsub          func()
+	contractStatusUnsub  func()
+	// Joins an inline status callback captured by ContractManager before the
+	// callback was unsubscribed. The callback only closes one source gate and
+	// appends its existing lifecycle node to the fixed-worker pending list.
+	contractStatusAdmissions *lifecycleAdmission
 
 	// cumulative packet counts relayed for remote clients, in the same
 	// direction convention as the contracts: ingress is traffic received from
@@ -5822,6 +6183,20 @@ type RemoteUserNatProvider struct {
 	// on the provider packet path. Entries are bounded with
 	// sourceProvideMode and removed on the same arbitrary safe eviction.
 	sourceP2pPriorityRefresh map[Id]time.Time
+	// sourceLifecycles contains only active healthy sources and permanent
+	// terminal tombstones. Healthy entries disappear at their final admission;
+	// terminal entries never expire or evict within this provider generation.
+	sourceLifecycles            map[Id]*providerSourceLifecycle
+	terminalSourceCount         int
+	sourceLifecycleClosed       bool
+	sourceLifecycleSaturated    bool
+	sourceRetirementOwnerId     uint64
+	sourceRetirementNotify      chan struct{}
+	sourceRetirementHead        *providerSourceLifecycle
+	sourceRetirementTail        *providerSourceLifecycle
+	sourceRetirementClosed      bool
+	sourceRetirementWorkerCount int
+	sourceRetirementWorkers     sync.WaitGroup
 	// the packet stats epoch worker started (on the first callback)
 	packetStatsStarted bool
 
@@ -5840,15 +6215,23 @@ type RemoteUserNatProvider struct {
 
 	// Test-only synchronization seams. Nil keeps production callbacks and
 	// sender workers unchanged.
-	returnSendStarted                 func()
-	beforeTcpReturnSendRetryForTest   func()
-	beforeTcpReturnReleaseForTest     func()
-	beforeReturnAdmissionsWaitForTest func()
-	afterReturnEnqueueForTest         func(bool)
-	afterReturnSendAttemptForTest     func(providerReturnSendResult)
-	afterReturnSendForTest            func(providerReturnSendResult)
-	afterReturnReleaseForTest         func()
-	returnAckTargetForTest            sendAckTarget
+	returnSendStarted                   func()
+	beforeTcpReturnSendRetryForTest     func()
+	beforeTcpReturnReleaseForTest       func()
+	beforeReturnAdmissionsWaitForTest   func()
+	afterReturnEnqueueForTest           func(bool)
+	afterReturnSendAttemptForTest       func(providerReturnSendResult)
+	afterReturnSendForTest              func(providerReturnSendResult)
+	afterReturnReleaseForTest           func()
+	returnAckTargetForTest              sendAckTarget
+	afterContractStatusAdmissionForTest func()
+	beforeSourceAdmissionForTest        func(Id)
+	afterSourceAdmissionForTest         func(Id)
+	beforeLocalUserNatAdmissionForTest  func(Id, [][]byte)
+	beforeSourceRetirementWaitForTest   func(Id)
+	afterReceiveSourceRetirementForTest func(Id)
+	afterSendSourceRetirementForTest    func(Id)
+	afterSourceRetirementForTest        func(Id)
 }
 
 func NewRemoteUserNatProviderWithDefaults(
@@ -5881,7 +6264,10 @@ func NewRemoteUserNatProvider(
 		sourceProvideMode:        map[Id]protocol.ProvideMode{},
 		sourceDiagnostics:        map[Id]*providerSourceDiagnostics{},
 		sourceP2pPriorityRefresh: map[Id]time.Time{},
+		sourceLifecycles:         map[Id]*providerSourceLifecycle{},
+		contractStatusAdmissions: newLifecycleAdmission(),
 	}
+	userNatProvider.sourceRetirementOwnerId = localUserNat.newSourceRetirementOwner()
 	userNatProvider.startReturnSenders()
 
 	// Register both return paths. No-contract peers can take the NAT's drained
@@ -5906,9 +6292,280 @@ func NewRemoteUserNatProvider(
 	userNatProvider.localUserNatUnsub = localUserNatUnsub
 	clientUnsub := client.AddReceiveCallback(userNatProvider.ClientReceive)
 	userNatProvider.clientUnsub = clientUnsub
+	userNatProvider.contractStatusUnsub = client.ContractManager().addContractStatusDispatchCallback(
+		func(status *ContractStatus) {
+			if !userNatProvider.contractStatusAdmissions.start() {
+				return
+			}
+			defer userNatProvider.contractStatusAdmissions.finish()
+			if userNatProvider.afterContractStatusAdmissionForTest != nil {
+				userNatProvider.afterContractStatusAdmissionForTest()
+			}
+			userNatProvider.contractStatus(status)
+		},
+	)
 	context.AfterFunc(cancelCtx, userNatProvider.Close)
 
 	return userNatProvider
+}
+
+// Resolves a hard bound even for legacy settings that used zero to leave only
+// the return-mode cache unlimited. Permanent rejection state is never allowed
+// to grow without a ceiling.
+func (self *RemoteUserNatProvider) sourceLifecycleMaxCount() int {
+	if self.settings != nil && 0 < self.settings.MaxSourceCount {
+		return self.settings.MaxSourceCount
+	}
+	return MemoryScaledCount(8192, 1024)
+}
+
+// Starts a fixed cleanup cohort behind an intrusive pending list. Each
+// terminal lifecycle already owns one node, so even a very large configured
+// source ceiling does not allocate a capacity-sized channel backing array.
+func (self *RemoteUserNatProvider) startSourceRetirementWorkers() {
+	if self.sourceRetirementNotify != nil {
+		return
+	}
+	self.sourceRetirementNotify = make(chan struct{}, 1)
+	workerCount := 8
+	if self.settings != nil && 0 < self.settings.ReturnSendWorkerCount {
+		workerCount = min(8, self.settings.ReturnSendWorkerCount)
+	}
+	workerCount = max(1, workerCount)
+	self.sourceRetirementWorkerCount = workerCount
+	for range workerCount {
+		self.sourceRetirementWorkers.Add(1)
+		go HandleError(func() {
+			defer self.sourceRetirementWorkers.Done()
+			self.runSourceRetirementWorker()
+		})
+	}
+}
+
+// Wakes at most one cleanup consumer; each pop wakes another while work
+// remains, allowing the fixed cohort to progress concurrently.
+func (self *RemoteUserNatProvider) wakeSourceRetirementWorkers() {
+	select {
+	case self.sourceRetirementNotify <- struct{}{}:
+	default:
+	}
+}
+
+func (self *RemoteUserNatProvider) runSourceRetirementWorker() {
+	for {
+		<-self.sourceRetirementNotify
+		for {
+			self.stateLock.Lock()
+			sourceLifecycle := self.sourceRetirementHead
+			if sourceLifecycle != nil {
+				self.sourceRetirementHead = sourceLifecycle.retirementNext
+				sourceLifecycle.retirementNext = nil
+				if self.sourceRetirementHead == nil {
+					self.sourceRetirementTail = nil
+				}
+			}
+			more := self.sourceRetirementHead != nil
+			closed := self.sourceRetirementClosed && !more && sourceLifecycle == nil
+			self.stateLock.Unlock()
+			if more {
+				self.wakeSourceRetirementWorkers()
+			}
+			if sourceLifecycle == nil {
+				if closed {
+					self.wakeSourceRetirementWorkers()
+					return
+				}
+				break
+			}
+			self.retireSourceLifecycle(sourceLifecycle.sourceId, sourceLifecycle)
+		}
+	}
+}
+
+// Admits one exact source operation against the terminal verdict boundary.
+// The provider lock remains held through the gate admission, so a concurrent
+// Reliability status either observes this producer or wins first and rejects
+// it. Healthy entries at the concurrent cap recover when producers finish.
+func (self *RemoteUserNatProvider) acquireSourceLifecycle(sourceId Id) *providerSourceLifecycle {
+	if sourceId == (Id{}) {
+		return nil
+	}
+	if self.beforeSourceAdmissionForTest != nil {
+		self.beforeSourceAdmissionForTest(sourceId)
+	}
+	self.stateLock.Lock()
+	if self.sourceLifecycleClosed {
+		self.stateLock.Unlock()
+		return nil
+	}
+	if self.sourceLifecycles == nil {
+		self.sourceLifecycles = map[Id]*providerSourceLifecycle{}
+	}
+	sourceLifecycle := self.sourceLifecycles[sourceId]
+	if sourceLifecycle == nil {
+		if self.sourceLifecycleSaturated ||
+			self.sourceLifecycleMaxCount() <= len(self.sourceLifecycles) {
+			self.stateLock.Unlock()
+			return nil
+		}
+		sourceCtx, cancel := context.WithCancel(self.ctx)
+		sourceLifecycle = &providerSourceLifecycle{
+			sourceId:   sourceId,
+			ctx:        sourceCtx,
+			cancel:     cancel,
+			admissions: newLifecycleAdmission(),
+		}
+		self.sourceLifecycles[sourceId] = sourceLifecycle
+	}
+	admitted := sourceLifecycle.admissions.start()
+	self.stateLock.Unlock()
+	if !admitted {
+		return nil
+	}
+	if self.afterSourceAdmissionForTest != nil {
+		self.afterSourceAdmissionForTest(sourceId)
+	}
+	return sourceLifecycle
+}
+
+// Releases one source operation and reclaims a healthy idle gate at the same
+// provider-lock boundary as later admission and terminal status handling.
+func (self *RemoteUserNatProvider) releaseSourceLifecycle(
+	sourceId Id,
+	sourceLifecycle *providerSourceLifecycle,
+) {
+	if sourceLifecycle == nil {
+		return
+	}
+	self.stateLock.Lock()
+	idle := sourceLifecycle.admissions.finishAndIdle()
+	if idle && !sourceLifecycle.terminal &&
+		self.sourceLifecycles[sourceId] == sourceLifecycle {
+		delete(self.sourceLifecycles, sourceId)
+		sourceLifecycle.cancel()
+	}
+	self.stateLock.Unlock()
+}
+
+// Receives one status on the provider-owned inline callback. Exact Reliability closes
+// only the source gate and context synchronously; all protocol cancellation
+// and joins run on a tracked source worker, so a stuck source cannot stall
+// later status delivery.
+func (self *RemoteUserNatProvider) contractStatus(status *ContractStatus) {
+	if status == nil || status.Error == nil ||
+		*status.Error != protocol.ContractError_Reliability {
+		return
+	}
+	destination := status.Key.Destination
+	if destination.SourceId != (Id{}) || destination.StreamId != (Id{}) ||
+		destination.DestinationId == (Id{}) ||
+		destination.DestinationId == self.client.ClientId() {
+		return
+	}
+	sourceId := destination.DestinationId
+	var sourceLifecycle *providerSourceLifecycle
+	var saturationCallback func()
+	wakeRetirement := false
+	notifySaturated := false
+	self.stateLock.Lock()
+	if !self.sourceLifecycleClosed {
+		if self.sourceLifecycles == nil {
+			self.sourceLifecycles = map[Id]*providerSourceLifecycle{}
+		}
+		sourceLifecycle = self.sourceLifecycles[sourceId]
+		if sourceLifecycle == nil {
+			if self.sourceLifecycleMaxCount() <= len(self.sourceLifecycles) {
+				if !self.sourceLifecycleSaturated {
+					self.sourceLifecycleSaturated = true
+					notifySaturated = true
+				}
+			} else {
+				sourceCtx, cancel := context.WithCancel(self.ctx)
+				sourceLifecycle = &providerSourceLifecycle{
+					sourceId:   sourceId,
+					ctx:        sourceCtx,
+					cancel:     cancel,
+					admissions: newLifecycleAdmission(),
+					terminal:   true,
+				}
+				self.sourceLifecycles[sourceId] = sourceLifecycle
+				self.terminalSourceCount += 1
+				sourceLifecycle.admissions.close()
+				sourceLifecycle.cancel()
+			}
+		} else if !sourceLifecycle.terminal {
+			sourceLifecycle.terminal = true
+			self.terminalSourceCount += 1
+			sourceLifecycle.admissions.close()
+			sourceLifecycle.cancel()
+		} else {
+			sourceLifecycle = nil
+		}
+		if !self.sourceLifecycleSaturated &&
+			self.sourceLifecycleMaxCount() <= self.terminalSourceCount {
+			self.sourceLifecycleSaturated = true
+			notifySaturated = true
+		}
+		if sourceLifecycle != nil {
+			if self.sourceRetirementNotify == nil {
+				self.startSourceRetirementWorkers()
+			}
+			if self.sourceRetirementTail == nil {
+				self.sourceRetirementHead = sourceLifecycle
+			} else {
+				self.sourceRetirementTail.retirementNext = sourceLifecycle
+			}
+			self.sourceRetirementTail = sourceLifecycle
+			wakeRetirement = true
+		}
+		if notifySaturated && self.settings != nil &&
+			self.settings.SourceLifecycleSaturated != nil {
+			saturationCallback = self.settings.SourceLifecycleSaturated
+		}
+	}
+	self.stateLock.Unlock()
+
+	if wakeRetirement {
+		self.wakeSourceRetirementWorkers()
+	}
+	if saturationCallback != nil {
+		// Ownership transfers to the external provider owner. This callback
+		// may need the owner's state lock while that owner is synchronously
+		// closing this provider, so Close must not join the handoff.
+		go HandleError(saturationCallback)
+	}
+}
+
+// Publishes the LocalUserNat tombstone before waiting for already-admitted
+// callbacks and return items. After that gate drains, both Transfer directions
+// are canceled and joined, then source-scoped policy state is discarded.
+func (self *RemoteUserNatProvider) retireSourceLifecycle(
+	sourceId Id,
+	sourceLifecycle *providerSourceLifecycle,
+) {
+	flowDoneChannels := self.localUserNat.retireSourceForOwner(
+		self.sourceRetirementOwnerId,
+		sourceId,
+	)
+	if self.beforeSourceRetirementWaitForTest != nil {
+		self.beforeSourceRetirementWaitForTest(sourceId)
+	}
+	<-sourceLifecycle.admissions.Done()
+	for _, done := range flowDoneChannels {
+		<-done
+	}
+	self.client.receiveBuffer.cancelSourceAndWait(sourceId)
+	if self.afterReceiveSourceRetirementForTest != nil {
+		self.afterReceiveSourceRetirementForTest(sourceId)
+	}
+	self.client.sendBuffer.cancelDestinationAndWait(sourceId)
+	if self.afterSendSourceRetirementForTest != nil {
+		self.afterSendSourceRetirementForTest(sourceId)
+	}
+	self.senderDisconnected(sourceId)
+	if self.afterSourceRetirementForTest != nil {
+		self.afterSourceRetirementForTest(sourceId)
+	}
 }
 
 // tcpFlowClosed retires policy state when the provider NAT releases the actual
@@ -6014,6 +6671,9 @@ func (self *RemoteUserNatProvider) releaseReturnItem(item *providerReturnItem) {
 	item.returnPackets()
 	afterRelease := item.afterRelease
 	item.afterRelease = nil
+	sourceId := item.source.SourceId
+	sourceLifecycle := item.sourceLifecycle
+	item.sourceLifecycle = nil
 	packets := item.packets
 	*item = providerReturnItem{}
 	item.packets = packets
@@ -6021,6 +6681,7 @@ func (self *RemoteUserNatProvider) releaseReturnItem(item *providerReturnItem) {
 	case self.returnItemPool <- item:
 	default:
 	}
+	self.releaseSourceLifecycle(sourceId, sourceLifecycle)
 	if afterRelease != nil {
 		HandleError(afterRelease)
 	}
@@ -6053,6 +6714,13 @@ func providerReturnSendShard(
 // holding a state lock across a synchronous send.
 func (self *RemoteUserNatProvider) enqueueReturnItem(item *providerReturnItem) bool {
 	self.beginReturnSendObservation(item)
+	sourceLifecycle := self.acquireSourceLifecycle(item.source.SourceId)
+	if sourceLifecycle == nil {
+		self.congestionDrops.addReturnQueue(item.packetCount(), item.packetByteCount)
+		self.releaseReturnItem(item)
+		return false
+	}
+	item.sourceLifecycle = sourceLifecycle
 	if item.recoveryMode == receiveRecoveryModeTcpSocket {
 		admitted := false
 		self.returnStateLock.RLock()
@@ -6397,7 +7065,7 @@ func (self *RemoteUserNatProvider) retryReturnSend(
 			self.beforeTcpReturnSendRetryForTest()
 		}
 		select {
-		case <-self.ctx.Done():
+		case <-item.sendContext(self.ctx).Done():
 			return false
 		case <-retry.After():
 		}
@@ -6461,7 +7129,7 @@ func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bo
 				writeTimeout,
 				returnOption,
 				returnTransferKey,
-				Ctx(self.ctx),
+				Ctx(item.sendContext(self.ctx)),
 				sendSchedulingKeyOption{key: item.schedulingKey},
 				observeTransportWrite(transportAttribution.observe),
 				recoveryOption,
@@ -6492,7 +7160,7 @@ func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bo
 				writeTimeout,
 				returnOption,
 				returnTransferKey,
-				Ctx(self.ctx),
+				Ctx(item.sendContext(self.ctx)),
 				sendSchedulingKeyOption{key: item.schedulingKey},
 				observeTransportWrite(transportAttribution.observe),
 				recoveryOption,
@@ -6580,7 +7248,7 @@ func (self *RemoteUserNatProvider) sendReturnBatchWithLimits(
 					writeTimeout,
 					returnOption,
 					returnTransferKey,
-					Ctx(self.ctx),
+					Ctx(item.sendContext(self.ctx)),
 					sendSchedulingKeyOption{key: item.schedulingKey},
 					observeTransportWrite(transportAttribution.observe),
 					recoveryOption,
@@ -6665,6 +7333,12 @@ func (self *RemoteUserNatProvider) receiveTransferBatch(
 	ipPath *IpPath,
 	packets [][]byte,
 ) {
+	source = source.LocalMask()
+	sourceLifecycle := self.acquireSourceLifecycle(source.SourceId)
+	if sourceLifecycle == nil {
+		return
+	}
+	defer self.releaseSourceLifecycle(source.SourceId, sourceLifecycle)
 	self.receiveTransferBatchWithRecovery(
 		source,
 		transferKey,
@@ -6895,6 +7569,12 @@ func (self *RemoteUserNatProvider) receiveTransfer(
 	ipPath *IpPath,
 	packet []byte,
 ) {
+	source = source.LocalMask()
+	sourceLifecycle := self.acquireSourceLifecycle(source.SourceId)
+	if sourceLifecycle == nil {
+		return
+	}
+	defer self.releaseSourceLifecycle(source.SourceId, sourceLifecycle)
 	self.receiveTransferWithRecovery(
 		source,
 		transferKey,
@@ -7024,6 +7704,11 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 		return
 	}
 	source = source.LocalMask()
+	sourceLifecycle := self.acquireSourceLifecycle(source.SourceId)
+	if sourceLifecycle == nil {
+		return
+	}
+	defer self.releaseSourceLifecycle(source.SourceId, sourceLifecycle)
 	transferKey := peer.TransferKey
 
 	provideMode := peer.ProvideMode
@@ -7263,12 +7948,38 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 
 	for _, packetGroup := range packetGroups {
 		c := func() bool {
+			dropPacketGroup := func() {
+				self.congestionDrops.addIngressNat(
+					len(packetGroup.packets),
+					packetGroup.byteCount,
+				)
+				for _, packet := range packetGroup.packets {
+					MessagePoolReturn(packet)
+				}
+			}
+			// Extend the exact-source admission through LocalUserNat queue and
+			// shard disposition. The outer callback admission alone ends when
+			// this handoff returns, before a queued packet reaches its protocol
+			// tombstone.
+			if self.beforeLocalUserNatAdmissionForTest != nil {
+				self.beforeLocalUserNatAdmissionForTest(
+					source.SourceId,
+					packetGroup.packets,
+				)
+			}
+			if !sourceLifecycle.admissions.start() {
+				dropPacketGroup()
+				return false
+			}
 			success := self.localUserNat.sendTransferPacketsWithTimeout(
 				source,
 				transferKey,
 				provideMode,
 				packetGroup.packets,
 				0,
+				func() {
+					self.releaseSourceLifecycle(source.SourceId, sourceLifecycle)
+				},
 			)
 			if success {
 				self.packetStatsCounters.recordRemoteIngress(
@@ -7277,10 +7988,7 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 					packetGroup.byteCount,
 				)
 			} else {
-				self.congestionDrops.addIngressNat(len(packetGroup.packets), packetGroup.byteCount)
-				for _, packet := range packetGroup.packets {
-					MessagePoolReturn(packet)
-				}
+				dropPacketGroup()
 			}
 			return success
 		}
@@ -7297,11 +8005,18 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 
 func (self *RemoteUserNatProvider) Close() {
 	self.closeOnce.Do(func() {
+		if self.contractStatusUnsub != nil {
+			self.contractStatusUnsub()
+		}
 		if self.clientUnsub != nil {
 			self.clientUnsub()
 		}
 		if self.localUserNatUnsub != nil {
 			self.localUserNatUnsub()
+		}
+		if self.contractStatusAdmissions != nil {
+			self.contractStatusAdmissions.close()
+			<-self.contractStatusAdmissions.Done()
 		}
 		// Cancel before closing admission so an in-flight synchronous TCP retry
 		// can return. The admission wait makes packet ownership quiescent before
@@ -7309,6 +8024,24 @@ func (self *RemoteUserNatProvider) Close() {
 		// cancellation stopped their sender worker.
 		if self.cancel != nil {
 			self.cancel()
+		}
+		self.stateLock.Lock()
+		self.sourceLifecycleClosed = true
+		self.sourceRetirementClosed = true
+		sourceLifecycles := make(
+			[]*providerSourceLifecycle,
+			0,
+			len(self.sourceLifecycles),
+		)
+		for _, sourceLifecycle := range self.sourceLifecycles {
+			sourceLifecycle.admissions.close()
+			sourceLifecycle.cancel()
+			sourceLifecycles = append(sourceLifecycles, sourceLifecycle)
+		}
+		wakeSourceRetirement := self.sourceRetirementNotify != nil
+		self.stateLock.Unlock()
+		if wakeSourceRetirement {
+			self.wakeSourceRetirementWorkers()
 		}
 		self.ingressIpv4Fragments.close()
 		self.egressIpv4Fragments.close()
@@ -7331,6 +8064,11 @@ func (self *RemoteUserNatProvider) Close() {
 				}
 			}
 		}
+		for _, sourceLifecycle := range sourceLifecycles {
+			<-sourceLifecycle.admissions.Done()
+		}
+		self.sourceRetirementWorkers.Wait()
+		self.localUserNat.releaseSourceRetirementOwner(self.sourceRetirementOwnerId)
 	})
 }
 

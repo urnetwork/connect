@@ -4545,6 +4545,30 @@ func (self *SendBuffer) AssociateDestination(sendSequence *SendSequence, destina
 	destinations[destinationId] = true
 }
 
+// Cancels and joins every send sequence that can carry one exact destination.
+// The destination index covers multi-hop associations; the primary id scan
+// also catches a fresh sequence before its first route association.
+func (self *SendBuffer) cancelDestinationAndWait(destinationId Id) {
+	self.mutex.Lock()
+	sequences := map[*SendSequence]bool{}
+	for id, sequence := range self.sendSequences {
+		if id.Destination == destinationId {
+			sequences[sequence] = true
+		}
+	}
+	for sequence := range self.sendSequencesByDestination[destinationId] {
+		sequences[sequence] = true
+	}
+	self.mutex.Unlock()
+
+	for sequence := range sequences {
+		sequence.Cancel()
+	}
+	for sequence := range sequences {
+		<-sequence.done
+	}
+}
+
 func (self *SendBuffer) Close() {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
@@ -8613,6 +8637,27 @@ func (self *ReceiveBuffer) ReceiveQueueSizeAndMessageTypes(source TransferPath, 
 		messageTypes = append(messageTypes, sequenceMessageTypes...)
 	}
 	return count, byteSize, messageTypes
+}
+
+// Cancels and joins every inbound Transfer sequence authenticated as one
+// source. This prevents already-queued Packs from recreating provider work
+// after the source gate has accepted a terminal verdict.
+func (self *ReceiveBuffer) cancelSourceAndWait(sourceId Id) {
+	self.mutex.Lock()
+	sequences := map[*ReceiveSequence]bool{}
+	for id, sequence := range self.receiveSequences {
+		if id.Source.SourceId == sourceId {
+			sequences[sequence] = true
+		}
+	}
+	self.mutex.Unlock()
+
+	for sequence := range sequences {
+		sequence.Cancel()
+	}
+	for sequence := range sequences {
+		<-sequence.done
+	}
 }
 
 func (self *ReceiveBuffer) Close() {

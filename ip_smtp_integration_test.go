@@ -684,6 +684,7 @@ func requireSmtpProviderNatPacket(
 	t.Helper()
 	select {
 	case queued := <-localUserNat.sendPackets:
+		defer queued.finish()
 		if len(queued.packets) != 1 {
 			for _, packet := range queued.packets {
 				MessagePoolReturn(packet)
@@ -705,6 +706,7 @@ func requireNoSmtpProviderNatPacket(t *testing.T, localUserNat *LocalUserNat) {
 	t.Helper()
 	select {
 	case queued := <-localUserNat.sendPackets:
+		defer queued.finish()
 		for _, packet := range queued.packets {
 			MessagePoolReturn(packet)
 		}

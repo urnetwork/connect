@@ -183,6 +183,7 @@ func TestRemoteUserNatProviderClientReceiveUsesNonblockingNatHandoff(t *testing.
 	})
 	select {
 	case queued := <-localUserNat.sendPackets:
+		queued.finish()
 		for _, queuedPacket := range queued.packets {
 			MessagePoolReturn(queuedPacket)
 		}

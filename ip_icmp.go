@@ -277,8 +277,9 @@ type IcmpBuffer[BufferId comparable] struct {
 	// the terminal Wait.
 	sequenceWaitGroup sync.WaitGroup
 
-	sequences       map[BufferId]*IcmpSequence
-	sourceSequences map[TransferPath]map[BufferId]*IcmpSequence
+	sequences        map[BufferId]*IcmpSequence
+	sourceSequences  map[TransferPath]map[BufferId]*IcmpSequence
+	retiredSourceIds map[Id]bool
 }
 
 func newIcmpBuffer[BufferId comparable](
@@ -293,6 +294,7 @@ func newIcmpBuffer[BufferId comparable](
 		icmpBufferSettings: icmpBufferSettings,
 		sequences:          map[BufferId]*IcmpSequence{},
 		sourceSequences:    map[TransferPath]map[BufferId]*IcmpSequence{},
+		retiredSourceIds:   map[Id]bool{},
 	}
 }
 
@@ -310,6 +312,9 @@ func (self *IcmpBuffer[BufferId]) icmpSend(
 	initSequence := func(skip *IcmpSequence) *IcmpSequence {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
+		if self.retiredSourceIds[source.SourceId] {
+			return nil
+		}
 
 		sequence, ok := self.sequences[bufferId]
 		if ok {
@@ -389,6 +394,7 @@ func (self *IcmpBuffer[BufferId]) icmpSend(
 		self.sequenceWaitGroup.Add(1)
 		go HandleError(func() {
 			defer self.sequenceWaitGroup.Done()
+			defer close(sequence.retirementDone)
 			defer func() {
 				self.mutex.Lock()
 				defer self.mutex.Unlock()
@@ -416,11 +422,18 @@ func (self *IcmpBuffer[BufferId]) icmpSend(
 		ipPacket:    ipPacket,
 	}
 	sequence := initSequence(nil)
+	if sequence == nil {
+		return false, nil
+	}
 	if success, err := sequence.send(sendItem, timeout); err == nil {
 		return success, nil
 	} else {
 		// sequence closed
-		return initSequence(sequence).send(sendItem, timeout)
+		sequence = initSequence(sequence)
+		if sequence == nil {
+			return false, nil
+		}
+		return sequence.send(sendItem, timeout)
 	}
 }
 
@@ -445,6 +458,31 @@ func (self *IcmpBuffer[BufferId]) removeSequenceWithLock(bufferId BufferId, sequ
 	sequence.Cancel()
 }
 
+// Applies one exact provider-source tombstone and cancels matching echo-flow
+// ownership without disturbing sibling sources.
+func (self *IcmpBuffer[BufferId]) setSourceRetired(
+	sourceId Id,
+	retired bool,
+) (doneChannels []<-chan struct{}) {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	if !retired {
+		delete(self.retiredSourceIds, sourceId)
+		return nil
+	}
+	self.retiredSourceIds[sourceId] = true
+	for source, sourceSequences := range self.sourceSequences {
+		if source.SourceId != sourceId {
+			continue
+		}
+		for bufferId, sequence := range sourceSequences {
+			doneChannels = append(doneChannels, sequence.retirementDone)
+			self.removeSequenceWithLock(bufferId, sequence)
+		}
+	}
+	return doneChannels
+}
+
 type IcmpSendItem struct {
 	source      TransferPath
 	transferKey TransferKey
@@ -464,6 +502,9 @@ type IcmpSequence struct {
 	receiveCallback                receiveTransferPacketFunction
 	receiveTransferPacketsCallback receiveTransferPacketsBatchFunction
 	icmpBufferSettings             *IcmpBufferSettings
+	// Closed by the owning buffer after Run joins its echo backend and drains
+	// queued packet ownership.
+	retirementDone chan struct{}
 
 	sendMutex sync.Mutex
 	sendItems chan *IcmpSendItem
@@ -533,6 +574,7 @@ func newIcmpSequenceWithTransferKey(
 		log:                loggerOrDefault(icmpBufferSettings.Log),
 		receiveCallback:    receiveCallback,
 		icmpBufferSettings: icmpBufferSettings,
+		retirementDone:     make(chan struct{}),
 		sendItems:          make(chan *IcmpSendItem, icmpBufferSettings.SequenceBufferSize),
 		idleCondition:      NewIdleCondition(),
 		source:             source,

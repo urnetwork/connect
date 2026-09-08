@@ -462,6 +462,7 @@ func TestLocalUserNatSendPacketBatchConsumesAllPackets(t *testing.T) {
 	acceptedFirst := acceptedPackets[0]
 	acceptedPackets[0] = nil
 	queued := <-localUserNat.sendPackets
+	defer queued.finish()
 	if len(queued.packets) != len(acceptedPackets) {
 		t.Fatalf("queued packet count = %d, want %d", len(queued.packets), len(acceptedPackets))
 	}
@@ -577,6 +578,7 @@ func TestRemoteUserNatProviderGroupsIngressByDirectionalTuple(t *testing.T) {
 	}
 	for groupIndex, wantPacketIndexes := range wantGroupIndexes {
 		queued := <-localUserNat.sendPackets
+		defer queued.finish()
 		if queued.source != source.LocalMask() || queued.transferKey != transferKey {
 			t.Fatalf("group %d metadata = (%s, %#v), want (%s, %#v)", groupIndex, queued.source, queued.transferKey, source.LocalMask(), transferKey)
 		}
