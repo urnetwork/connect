@@ -24,10 +24,52 @@ type MultiClientGeneratorClientArgs struct {
 
 func DefaultApiMultiClientGeneratorSettings() *ApiMultiClientGeneratorSettings {
 	return &ApiMultiClientGeneratorSettings{
-		MigrateConnectTimeout:   60 * time.Second,
-		MigrateMaxScheduleDelay: 5 * time.Minute,
-		IdentityLoadTimeout:     5 * time.Second,
+		MigrateConnectTimeout:        60 * time.Second,
+		MigrateMaxScheduleDelay:      5 * time.Minute,
+		IdentityLoadTimeout:          5 * time.Second,
+		RuntimeExcludeClientMaxCount: defaultApiRuntimeExcludeClientMaxCount(),
 	}
+}
+
+// Retain one complete live-window generation for every normal maintenance
+// opportunity across a channel lifetime. Reliability exclusions are rare in a
+// healthy session, but this makes an incident's request and map growth finite
+// without inventing a second unrelated sizing constant.
+func apiRuntimeExcludeClientMaxCount(settings *MultiClientSettings) int {
+	liveClientMaxCount := 0
+	for _, windowSize := range settings.WindowSizes {
+		liveClientMaxCount += max(0, windowSize.WindowSizeHardMax)
+	}
+	liveClientMaxCount = max(1, liveClientMaxCount)
+
+	maintenanceCount := 1
+	if 0 < settings.MaxClientLifetime && 0 < settings.WindowResizeTimeout {
+		maintenanceCount = int(settings.MaxClientLifetime / settings.WindowResizeTimeout)
+		if settings.MaxClientLifetime%settings.WindowResizeTimeout != 0 {
+			maintenanceCount += 1
+		}
+	}
+	return liveClientMaxCount * max(1, maintenanceCount)
+}
+
+func defaultApiRuntimeExcludeClientMaxCount() int {
+	return apiRuntimeExcludeClientMaxCount(DefaultMultiClientSettings())
+}
+
+// Constructor policy is durable, but duplicate ids add no policy and should
+// not inflate every discovery request. Preserve first-seen order and detach
+// the generator from the caller's mutable slice.
+func cloneUniqueApiExcludeClientIds(clientIds []Id) []Id {
+	uniqueClientIds := make([]Id, 0, len(clientIds))
+	seen := map[Id]bool{}
+	for _, clientId := range clientIds {
+		if seen[clientId] {
+			continue
+		}
+		seen[clientId] = true
+		uniqueClientIds = append(uniqueClientIds, clientId)
+	}
+	return uniqueClientIds
 }
 
 type ApiMultiClientGeneratorSettings struct {
@@ -44,6 +86,16 @@ type ApiMultiClientGeneratorSettings struct {
 	// store cannot hold both window enumerators ahead of provider discovery.
 	// Values <= 0 use the caller's generator deadline.
 	IdentityLoadTimeout time.Duration
+	// RuntimeExcludeClientMaxCount bounds Reliability and app-removal
+	// exclusions added after construction. Under the default multi-client
+	// settings the strict bound is 2,400 ids: about 38 KiB of raw ids, with the
+	// complete JSON request pinned below 512 KiB by a wire-format test. Arbitrary
+	// custom settings can select a different bound. On overflow the oldest
+	// runtime exclusion is evicted, allowing eventual recovery instead of
+	// permanently closing discovery.
+	// Constructor-supplied exclusions are durable and do not consume this cap.
+	// Values <= 0 use the derived default.
+	RuntimeExcludeClientMaxCount int
 	// PlatformTransportSettingsGenerator customizes window transports. Tests
 	// use it to inject userspace sockets; nil or a nil result retains the
 	// production defaults. The returned settings are copied before use.
@@ -146,9 +198,15 @@ type ApiMultiClientGenerator struct {
 	specs          []*ProviderSpec
 	clientStrategy *ClientStrategy
 
-	// guarded by excludeLock; grows when the app removes a provider
-	excludeLock      sync.Mutex
-	excludeClientIds []Id
+	// Constructor exclusions are durable for the generator lifetime. Runtime
+	// exclusions use a lazy bounded FIFO ring so repeated Reliability churn
+	// cannot grow every subsequent discovery request without limit.
+	excludeLock                  sync.Mutex
+	excludeClientIds             []Id
+	runtimeExcludeClientIds      []Id
+	runtimeExcludeClientIdSet    map[Id]bool
+	runtimeExcludeClientHead     int
+	runtimeExcludeClientMaxCount int
 
 	apiUrl      string
 	platformUrl string
@@ -246,27 +304,32 @@ func NewApiMultiClientGenerator(
 	if platformTransportMode == TransportModeNone {
 		platformTransportMode = TransportModeAuto
 	}
+	runtimeExcludeClientMaxCount := settings.RuntimeExcludeClientMaxCount
+	if runtimeExcludeClientMaxCount <= 0 {
+		runtimeExcludeClientMaxCount = defaultApiRuntimeExcludeClientMaxCount()
+	}
 	return &ApiMultiClientGenerator{
-		ctx:                        generatorCtx,
-		cancel:                     generatorCancel,
-		specs:                      specs,
-		clientStrategy:             clientStrategy,
-		excludeClientIds:           excludeClientIds,
-		apiUrl:                     apiUrl,
-		platformUrl:                platformUrl,
-		deviceDescription:          deviceDescription,
-		deviceSpec:                 deviceSpec,
-		appVersion:                 appVersion,
-		sourceClientId:             sourceClientId,
-		clientSettingsGenerator:    clientSettingsGenerator,
-		settings:                   settings,
-		platformTransportMode:      platformTransportMode,
-		platformModePreferences:    maps.Clone(settings.PlatformTransportModePreferences),
-		platformTransportPolicyVer: 1,
-		api:                        api,
-		identityState:              newWindowIdentityState(generatorCtx, nil),
-		transports:                 map[*Client]*apiWindowClientTransport{},
-		transportIdle:              transportIdle,
+		ctx:                          generatorCtx,
+		cancel:                       generatorCancel,
+		specs:                        specs,
+		clientStrategy:               clientStrategy,
+		excludeClientIds:             cloneUniqueApiExcludeClientIds(excludeClientIds),
+		runtimeExcludeClientMaxCount: runtimeExcludeClientMaxCount,
+		apiUrl:                       apiUrl,
+		platformUrl:                  platformUrl,
+		deviceDescription:            deviceDescription,
+		deviceSpec:                   deviceSpec,
+		appVersion:                   appVersion,
+		sourceClientId:               sourceClientId,
+		clientSettingsGenerator:      clientSettingsGenerator,
+		settings:                     settings,
+		platformTransportMode:        platformTransportMode,
+		platformModePreferences:      maps.Clone(settings.PlatformTransportModePreferences),
+		platformTransportPolicyVer:   1,
+		api:                          api,
+		identityState:                newWindowIdentityState(generatorCtx, nil),
+		transports:                   map[*Client]*apiWindowClientTransport{},
+		transportIdle:                transportIdle,
 	}
 }
 
@@ -436,24 +499,49 @@ func (self *ApiMultiClientGenerator) NextDestinations(count int, excludeDestinat
 	return self.NextDestinationsContext(self.ctx, count, excludeDestinations, rankMode)
 }
 
-// ExcludeClientIds is the current exclusion set: the client ids never returned
-// by discovery. Read on the enumerator goroutine, mutated by the app thread
-// (see ExcludeClientId), so it is snapshot under the lock.
+// ExcludeClientIds snapshots durable constructor exclusions followed by
+// runtime exclusions in oldest-to-newest order.
 func (self *ApiMultiClientGenerator) ExcludeClientIds() []Id {
 	self.excludeLock.Lock()
 	defer self.excludeLock.Unlock()
-	return slices.Clone(self.excludeClientIds)
+	excludeClientIds := slices.Clone(self.excludeClientIds)
+	for i := range len(self.runtimeExcludeClientIds) {
+		index := (self.runtimeExcludeClientHead + i) % len(self.runtimeExcludeClientIds)
+		excludeClientIds = append(excludeClientIds, self.runtimeExcludeClientIds[index])
+	}
+	return excludeClientIds
 }
 
 // ExcludeClientId implements MultiClientGeneratorExcluder. The exclusion lives
-// as long as this generator: a destination change builds a new generator, so
-// reconnecting gives every provider a clean slate.
+// in the runtime FIFO. Duplicate and constructor-excluded ids are no-ops. Once
+// the bounded history is full, the oldest runtime id becomes eligible again;
+// this limits request growth and lets a long-lived generator recover after the
+// provider population changes instead of failing closed forever.
 func (self *ApiMultiClientGenerator) ExcludeClientId(clientId Id) {
 	self.excludeLock.Lock()
 	defer self.excludeLock.Unlock()
-	if !slices.Contains(self.excludeClientIds, clientId) {
-		self.excludeClientIds = append(self.excludeClientIds, clientId)
+	if slices.Contains(self.excludeClientIds, clientId) ||
+		self.runtimeExcludeClientIdSet[clientId] {
+		return
 	}
+	maxCount := self.runtimeExcludeClientMaxCount
+	if maxCount <= 0 {
+		maxCount = defaultApiRuntimeExcludeClientMaxCount()
+		self.runtimeExcludeClientMaxCount = maxCount
+	}
+	if self.runtimeExcludeClientIdSet == nil {
+		self.runtimeExcludeClientIdSet = map[Id]bool{}
+	}
+	if len(self.runtimeExcludeClientIds) < maxCount {
+		self.runtimeExcludeClientIds = append(self.runtimeExcludeClientIds, clientId)
+	} else {
+		oldestClientId := self.runtimeExcludeClientIds[self.runtimeExcludeClientHead]
+		delete(self.runtimeExcludeClientIdSet, oldestClientId)
+		self.runtimeExcludeClientIds[self.runtimeExcludeClientHead] = clientId
+		self.runtimeExcludeClientHead =
+			(self.runtimeExcludeClientHead + 1) % len(self.runtimeExcludeClientIds)
+	}
+	self.runtimeExcludeClientIdSet[clientId] = true
 }
 
 // NextDestinationsContext implements MultiClientGeneratorContext. Discovery is

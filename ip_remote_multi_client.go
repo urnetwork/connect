@@ -129,7 +129,8 @@ type MultiClientGenerator interface {
 }
 
 // MultiClientGeneratorExcluder is an optional generator capability: exclude a
-// provider from further discovery for the life of the generator. Used by
+// provider from near-term discovery. Implementations own the retention policy;
+// the API generator uses a bounded oldest-evicted runtime history. Used by
 // RemoteUserNatMultiClient.RemoveProvider so a removed provider is not handed
 // straight back by the next discovery call.
 type MultiClientGeneratorExcluder interface {
@@ -8459,7 +8460,7 @@ func (self *RemoteUserNatMultiClient) Shuffle() {
 
 // RemoveProvider drops the provider with this egress (destination tail) client
 // id from every window and, for a discovery-based connection, excludes it from
-// further discovery for the life of this multi client. Both halves are
+// near-term discovery under the generator's retention policy. Both halves are
 // required: the resize loop wakes as soon as a client dies, so a removal
 // without the exclusion is immediately undone by re-discovering the same
 // provider. Reports whether a window client was actually removed.
@@ -9901,11 +9902,23 @@ func (self *multiClientWindow) contractStatusFromClient(client *multiClientChann
 	if contractStatusMatchesClient(client, status) &&
 		status.Error != nil &&
 		*status.Error == protocol.ContractError_Reliability {
-		client.setWarning(true, warnUnhealthy)
-		client.addError(errContractReliability)
-		if self.resizeMonitor != nil {
-			self.resizeMonitor.NotifyAll()
-		}
+		client.contractReliabilityOnce.Do(func() {
+			// The exclusion must become visible to discovery before resize is
+			// woken. Otherwise the first replacement pass can immediately hand
+			// the terminal destination back to this window.
+			if self.generator != nil {
+				if _, fixed := self.generator.FixedDestinationSize(); !fixed {
+					if excluder, ok := self.generator.(MultiClientGeneratorExcluder); ok {
+						excluder.ExcludeClientId(client.args.Destination.Tail())
+					}
+				}
+			}
+			client.setWarning(true, warnUnhealthy)
+			client.addError(errContractReliability)
+			if self.resizeMonitor != nil {
+				self.resizeMonitor.NotifyAll()
+			}
+		})
 	}
 
 	self.contractStatus(status)
@@ -12107,6 +12120,11 @@ type multiClientChannel struct {
 	// sourceFilter map[TransferPath]bool
 
 	client *Client
+	// contractReliabilityOnce makes the platform's terminal destination
+	// verdict one lifecycle transition. Duplicate status frames may be
+	// dispatched concurrently, but they must not schedule unbounded window
+	// replacements or repeat generator mutations.
+	contractReliabilityOnce sync.Once
 
 	stateLock    sync.Mutex
 	eventBuckets []*multiClientEventBucket

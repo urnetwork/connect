@@ -2,10 +2,44 @@ package connect
 
 import (
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/urnetwork/connect/protocol"
 )
+
+// contractStatusTestGenerator records runtime exclusions behind the same
+// concurrent contract as the production API generator.
+type contractStatusTestGenerator struct {
+	testingEmptyMultiClientGenerator
+
+	stateLock sync.Mutex
+	fixed     bool
+	excluded  []Id
+}
+
+// FixedDestinationSize distinguishes explicit destinations, which must remain
+// redialable, from discovery destinations, which can be replaced.
+func (self *contractStatusTestGenerator) FixedDestinationSize() (int, bool) {
+	if self.fixed {
+		return 1, true
+	}
+	return 0, false
+}
+
+// ExcludeClientId records one runtime exclusion.
+func (self *contractStatusTestGenerator) ExcludeClientId(clientId Id) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.excluded = append(self.excluded, clientId)
+}
+
+// excludedClientIds returns a stable test snapshot.
+func (self *contractStatusTestGenerator) excludedClientIds() []Id {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return append([]Id{}, self.excluded...)
+}
 
 func newContractStatusWindowFixture(destination Id) (*multiClientWindow, *multiClientChannel) {
 	settings := DefaultMultiClientSettings()
@@ -119,5 +153,102 @@ func TestContractReliabilityFailureIsScopedToItsDestination(t *testing.T) {
 
 	if warning, err := contractStatusClientState(client); warning || err != nil {
 		t.Fatalf("another destination changed channel health: warning=%t err=%v", warning, err)
+	}
+}
+
+// A terminal discovery destination must be excluded before resize is woken,
+// or the first replacement pass can rediscover the same failed provider.
+func TestContractReliabilityFailureExcludesDiscoveryDestination(t *testing.T) {
+	destination := NewId()
+	window, client := newContractStatusWindowFixture(destination)
+	generator := &contractStatusTestGenerator{}
+	window.generator = generator
+	wake := window.resizeMonitor.NotifyChannel()
+	reliability := protocol.ContractError_Reliability
+
+	window.contractStatusFromClient(client, &ContractStatus{
+		Key:   ContractKey{Destination: DestinationId(destination)},
+		Error: &reliability,
+	})
+
+	select {
+	case <-wake:
+		excluded := generator.excludedClientIds()
+		if len(excluded) != 1 || excluded[0] != destination {
+			t.Fatalf("exclusions at resize wake = %v, want only the failed destination", excluded)
+		}
+	default:
+		t.Fatal("reliability failure did not wake resize")
+	}
+}
+
+// An explicitly selected destination has no alternate discovery candidate.
+// Reliability still retires its current channel, but the generator must be
+// allowed to redial the fixed destination.
+func TestContractReliabilityFailureKeepsFixedDestinationRedialable(t *testing.T) {
+	destination := NewId()
+	window, client := newContractStatusWindowFixture(destination)
+	generator := &contractStatusTestGenerator{fixed: true}
+	window.generator = generator
+	reliability := protocol.ContractError_Reliability
+
+	window.contractStatusFromClient(client, &ContractStatus{
+		Key:   ContractKey{Destination: DestinationId(destination)},
+		Error: &reliability,
+	})
+
+	if excluded := generator.excludedClientIds(); 0 < len(excluded) {
+		t.Fatalf("fixed destination exclusions = %v, want none", excluded)
+	}
+	if warning, err := contractStatusClientState(client); !warning || !errors.Is(err, errContractReliability) {
+		t.Fatalf("fixed channel state = warning %t, err %v; want terminal reliability", warning, err)
+	}
+}
+
+// Duplicate status frames can arrive from several contract lanes at once.
+// They describe one destination lifecycle transition, so exclusion, terminal
+// accounting, and replacement wake must remain bounded to one.
+func TestConcurrentContractReliabilityFailuresRetireDestinationOnce(t *testing.T) {
+	destination := NewId()
+	window, client := newContractStatusWindowFixture(destination)
+	generator := &contractStatusTestGenerator{}
+	window.generator = generator
+	reliability := protocol.ContractError_Reliability
+	status := &ContractStatus{
+		Key:   ContractKey{Destination: DestinationId(destination)},
+		Error: &reliability,
+	}
+
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	for range 32 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			window.contractStatusFromClient(client, status)
+		}()
+	}
+	close(start)
+	wait.Wait()
+
+	if excluded := generator.excludedClientIds(); len(excluded) != 1 || excluded[0] != destination {
+		t.Fatalf("concurrent exclusions = %v, want one failed destination", excluded)
+	}
+	client.stateLock.Lock()
+	errorCount := 0
+	for _, eventBucket := range client.eventBuckets {
+		errorCount += len(eventBucket.errs)
+	}
+	client.stateLock.Unlock()
+	if errorCount != 1 {
+		t.Fatalf("terminal error count = %d, want 1", errorCount)
+	}
+	lateWake := window.resizeMonitor.NotifyChannel()
+	window.contractStatusFromClient(client, status)
+	select {
+	case <-lateWake:
+		t.Fatal("duplicate terminal status scheduled another replacement wake")
+	default:
 	}
 }

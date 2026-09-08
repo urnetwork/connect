@@ -24,6 +24,176 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
+// The default runtime history is derived rather than copied: ten possible
+// live clients across both windows, retained for each 15-second maintenance
+// opportunity in one 60-minute channel lifetime.
+func TestDefaultApiRuntimeExcludeClientMaxCountTracksWindowLifecycle(t *testing.T) {
+	multiSettings := DefaultMultiClientSettings()
+	if got, want := apiRuntimeExcludeClientMaxCount(multiSettings), 2400; got != want {
+		t.Fatalf("default runtime exclusion max = %d, want %d", got, want)
+	}
+	if got, want := DefaultApiMultiClientGeneratorSettings().RuntimeExcludeClientMaxCount,
+		apiRuntimeExcludeClientMaxCount(multiSettings); got != want {
+		t.Fatalf("API runtime exclusion max = %d, want derived %d", got, want)
+	}
+
+	custom := &MultiClientSettings{
+		WindowSizes: map[WindowType]WindowSizeSettings{
+			WindowTypeQuality: {WindowSizeHardMax: 2},
+			WindowTypeSpeed:   {WindowSizeHardMax: 1},
+		},
+		MaxClientLifetime:   61 * time.Second,
+		WindowResizeTimeout: 30 * time.Second,
+	}
+	if got, want := apiRuntimeExcludeClientMaxCount(custom), 9; got != want {
+		t.Fatalf("custom runtime exclusion max = %d, want %d", got, want)
+	}
+}
+
+// Runtime exclusions are a bounded FIFO independent of constructor policy.
+// Overflow makes only the oldest runtime provider eligible again; seeded
+// exclusions remain durable and duplicate calls consume no capacity.
+func TestApiRuntimeExclusionsEvictOldestAndPreserveConstructor(t *testing.T) {
+	seeded := []Id{NewId(), NewId()}
+	constructorExclusions := []Id{seeded[0], seeded[1], seeded[0]}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultApiMultiClientGeneratorSettings()
+	settings.RuntimeExcludeClientMaxCount = 3
+	generator := NewApiMultiClientGenerator(
+		ctx,
+		nil,
+		nil,
+		constructorExclusions,
+		"",
+		"synthetic-token",
+		"",
+		"synthetic-device",
+		"synthetic-spec",
+		"0.0.0-test",
+		nil,
+		DefaultClientSettings,
+		settings,
+	)
+	constructorExclusions[0] = NewId()
+	if got := generator.ExcludeClientIds(); !slices.Equal(got, seeded) {
+		t.Fatalf("constructor exclusion snapshot aliases caller slice: %v, want %v", got, seeded)
+	}
+	first := NewId()
+	second := NewId()
+	third := NewId()
+	fourth := NewId()
+	for _, clientId := range []Id{seeded[0], first, second, third, second} {
+		generator.ExcludeClientId(clientId)
+	}
+	if got, want := generator.ExcludeClientIds(),
+		append(slices.Clone(seeded), first, second, third); !slices.Equal(got, want) {
+		t.Fatalf("full exclusions = %v, want %v", got, want)
+	}
+	fullCapacity := cap(generator.runtimeExcludeClientIds)
+
+	generator.ExcludeClientId(fourth)
+	if got, want := generator.ExcludeClientIds(),
+		append(slices.Clone(seeded), second, third, fourth); !slices.Equal(got, want) {
+		t.Fatalf("overflow exclusions = %v, want %v", got, want)
+	}
+	// The evicted id is eligible to enter again at the newest edge. This is the
+	// bounded recovery path; the generator never latches discovery closed.
+	generator.ExcludeClientId(first)
+	if got, want := generator.ExcludeClientIds(),
+		append(slices.Clone(seeded), third, fourth, first); !slices.Equal(got, want) {
+		t.Fatalf("recovered exclusions = %v, want %v", got, want)
+	}
+	if got := cap(generator.runtimeExcludeClientIds); got != fullCapacity {
+		t.Fatalf("runtime exclusion capacity grew after overflow: %d -> %d", fullCapacity, got)
+	}
+}
+
+// Concurrent status callbacks and discovery snapshots preserve the strict
+// runtime cap and set/ring agreement. Exact survivors depend on scheduling;
+// the final sequential add pins the newest ordering edge deterministically.
+func TestApiRuntimeExclusionsConcurrentAddAndSnapshot(t *testing.T) {
+	seeded := []Id{NewId(), NewId()}
+	const runtimeMax = 64
+	generator := &ApiMultiClientGenerator{
+		excludeClientIds:             slices.Clone(seeded),
+		runtimeExcludeClientMaxCount: runtimeMax,
+	}
+	clientIds := make([]Id, 8*runtimeMax)
+	for i := range clientIds {
+		clientIds[i] = NewId()
+	}
+
+	var wait sync.WaitGroup
+	for _, clientId := range clientIds {
+		clientId := clientId
+		wait.Add(2)
+		go func() {
+			defer wait.Done()
+			generator.ExcludeClientId(clientId)
+			generator.ExcludeClientId(clientId)
+			generator.ExcludeClientId(seeded[0])
+		}()
+		go func() {
+			defer wait.Done()
+			_ = generator.ExcludeClientIds()
+		}()
+	}
+	wait.Wait()
+
+	newest := NewId()
+	generator.ExcludeClientId(newest)
+	got := generator.ExcludeClientIds()
+	if len(got) != len(seeded)+runtimeMax {
+		t.Fatalf("bounded exclusion count = %d, want %d", len(got), len(seeded)+runtimeMax)
+	}
+	if !slices.Equal(got[:len(seeded)], seeded) {
+		t.Fatalf("constructor exclusions changed: %v, want %v", got[:len(seeded)], seeded)
+	}
+	if got[len(got)-1] != newest {
+		t.Fatalf("newest runtime exclusion = %s, want %s", got[len(got)-1], newest)
+	}
+	seen := map[Id]bool{}
+	for _, clientId := range got {
+		if seen[clientId] {
+			t.Fatalf("duplicate exclusion in snapshot: %s", clientId)
+		}
+		seen[clientId] = true
+	}
+	if len(generator.runtimeExcludeClientIdSet) != runtimeMax {
+		t.Fatalf("runtime exclusion set count = %d, want %d", len(generator.runtimeExcludeClientIdSet), runtimeMax)
+	}
+}
+
+// At the strict default runtime cap, the serialized discovery request remains
+// under a conservative Connect-owned 512 KiB amplification budget. This
+// measures the wire representation rather than estimating from 16-byte Id
+// storage or copying another repository's mutable HTTP limit.
+func TestDefaultApiRuntimeExclusionsKeepDiscoveryRequestBounded(t *testing.T) {
+	settings := DefaultApiMultiClientGeneratorSettings()
+	generator := &ApiMultiClientGenerator{
+		excludeClientIds:             []Id{NewId()},
+		runtimeExcludeClientMaxCount: settings.RuntimeExcludeClientMaxCount,
+	}
+	for range settings.RuntimeExcludeClientMaxCount + 17 {
+		generator.ExcludeClientId(NewId())
+	}
+	requestBytes, err := json.Marshal(&FindProviders2Args{
+		Specs:            []*ProviderSpec{{BestAvailable: true}},
+		ExcludeClientIds: generator.ExcludeClientIds(),
+		Count:            DefaultMultiClientSettings().WindowExpandBlockCount,
+		RankMode:         WindowTypeQuality.RankMode(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const discoveryRequestMax = 512 * 1024
+	if len(requestBytes) >= discoveryRequestMax {
+		t.Fatalf("bounded discovery request = %d bytes, want below %d-byte Connect budget", len(requestBytes), discoveryRequestMax)
+	}
+	t.Logf("bounded discovery request = %d bytes (%d runtime ids)", len(requestBytes), settings.RuntimeExcludeClientMaxCount)
+}
+
 // Discovery retains the destination and the nearest eight intermediaries when
 // a server returns a longer path; shorter legacy paths are unaffected.
 func TestNextDestinationsRetainsMaximumIntermediariesAndDestination(t *testing.T) {
