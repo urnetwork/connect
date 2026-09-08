@@ -197,8 +197,11 @@ paths:
         epoch finalizes, when a payout plan commits, and hourly); a cursor
         whose snapshot was pruned returns `restart: true` and the client
         reloads from the top. No authentication is required; with a bearer
-        token the response also carries `me`, the caller's own row whether or
-        not it opted in.
+        token the response also carries `me`, the caller's own row with its
+        network name for the caller's own card, whether or not it opted in.
+        In the list itself the caller's row is anonymous like everyone
+        else's until it opts in: the caller sees what everyone sees, and the
+        apps only highlight that row.
       operationId: Stats Points Leaderboard
       requestBody:
         required: true
