@@ -3748,12 +3748,17 @@ components:
           description: If this is a new device, sets the device spec.
           type: string
         time_zone:
-          x-status: planned
           description: |
-            Optional (planned: lands with the campaign engine). The device's
-            IANA time zone (e.g. America/Chicago),
-            recorded on the network for the onboarding campaign's local send
-            times and the tier display. Sent on every auth; the latest wins.
+            Optional. The device's IANA time zone (e.g. America/Chicago), used
+            only to place the onboarding campaign's emails in the user's local
+            day (08:00-21:00 local); never stored on the client. Every app
+            sends it on each auth-client call; the latest wins.
+          type: string
+        locale:
+          description: |
+            Optional. The device's BCP 47 locale ("de-DE"). Selects the onboarding
+            campaign's template language, falling back to English. Same rules as
+            time_zone.
           type: string
         roles:
           description: Optional. |
@@ -5446,11 +5451,22 @@ components:
           description: the send's tags; the campaign sends carry [onboarding, <step>, <variant>]
           items:
             type: string
+        tag:
+          type: string
+          description: Brevo's legacy form of the tags, a JSON-encoded array in a string
+        template_id:
+          type: integer
+        X-Mailin-custom:
+          type: string
+          description: the campaign sets this header to the step name on every send
         link:
           type: string
           description: the clicked URL (click events)
         date:
           type: string
+        ts_event:
+          type: integer
+          description: unix seconds of the event
 
     BrevoWebhookResult:
       type: object
