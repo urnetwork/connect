@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 
 	"github.com/urnetwork/connect/protocol"
@@ -64,7 +65,10 @@ type ClientKeyManager struct {
 	privateKey ed25519.PrivateKey
 	publicKey  ed25519.PublicKey
 
-	controlSync *ControlSync
+	controlSync         *ControlSync
+	registrationSync    *ControlSyncOob
+	registrationUpdates *MonitorValue[clientKeyRegistrationGeneration]
+	registrationReady   *MonitorValue[bool]
 
 	stateLock sync.RWMutex
 	closed    bool
@@ -81,6 +85,12 @@ type ClientKeyManager struct {
 // fresh seed is generated. Callers can read the running seed back via
 // `Seed()` to persist it across restarts.
 func NewClientKeyManager(ctx context.Context, client *Client) (*ClientKeyManager, error) {
+	if client.settings.ClientKeyRegistrationRequired {
+		control, ok := client.ClientOob().(*ApiOutOfBandControl)
+		if !ok || control == nil || control.api == nil {
+			return nil, errors.New("processed client key registration requires the actual ApiOutOfBandControl")
+		}
+	}
 	var pub ed25519.PublicKey
 	var priv ed25519.PrivateKey
 	seed := client.settings.ClientKeySeed
@@ -115,6 +125,11 @@ func NewClientKeyManager(ctx context.Context, client *Client) (*ClientKeyManager
 		controlSync: NewControlSync(managerCtx, client, "client-key"),
 		workers:     newLifecycleAdmission(),
 	}
+	if client.settings.ClientKeyRegistrationRequired {
+		m.registrationSync = NewControlSyncOob(managerCtx, client, "client-key-registration")
+		m.registrationUpdates = NewMonitorValue(clientKeyRegistrationGeneration{publicKey: [ed25519.PublicKeySize]byte(pub), generation: 1})
+		m.registrationReady = NewMonitorValue(false)
+	}
 	// Publish the public identity key once the client is fully wired.
 	// `publishClientKey` waits on `client.ReadyNotify()` internally;
 	// the goroutine launch here mirrors the pattern in
@@ -127,8 +142,8 @@ func NewClientKeyManager(ctx context.Context, client *Client) (*ClientKeyManager
 	return m, nil
 }
 
-// startPublisherWithLock admits one publication generation. The constructor
-// has exclusive ownership; later callers hold stateLock.
+// Admits the constructor's single processed-registration owner, or one legacy
+// publisher. Later legacy callers hold stateLock; processed rotations coalesce.
 func (self *ClientKeyManager) startPublisherWithLock() bool {
 	if !self.workers.start() {
 		return false
@@ -193,6 +208,22 @@ func (self *ClientKeyManager) SetSeed(seed []byte) error {
 		self.stateLock.Unlock()
 		return fmt.Errorf("client key manager closed")
 	}
+	if self.registrationSync != nil {
+		if !bytes.Equal(self.publicKey, publicKey) {
+			current := self.registrationUpdates.Value()
+			if current.generation == math.MaxUint64 {
+				self.stateLock.Unlock()
+				return errors.New("client key publication generation reached its finite limit")
+			}
+			// Invalidate the old key before publishing the new local identity.
+			self.registrationReady.Set(false)
+			self.privateKey = privateKey
+			self.publicKey = publicKey
+			self.registrationUpdates.Set(clientKeyRegistrationGeneration{publicKey: [ed25519.PublicKeySize]byte(publicKey), generation: current.generation + 1})
+		}
+		self.stateLock.Unlock()
+		return nil
+	}
 	if !self.startPublisherWithLock() {
 		self.stateLock.Unlock()
 		return fmt.Errorf("client key manager closed")
@@ -212,11 +243,17 @@ func (self *ClientKeyManager) Close() {
 		return
 	}
 	self.closed = true
+	if self.registrationReady != nil {
+		self.registrationReady.Set(false)
+	}
 	self.stateLock.Unlock()
 
 	self.cancel()
 	self.workers.close()
 	self.controlSync.Close()
+	if self.registrationSync != nil {
+		self.registrationSync.Close()
+	}
 }
 
 // closeAndWait joins every admitted publisher and its control retry workers,
@@ -236,6 +273,11 @@ func (self *ClientKeyManager) closeAndWait(ctx context.Context) error {
 	}
 	if err := self.controlSync.closeAndWait(ctx); err != nil {
 		result = errors.Join(result, err)
+	}
+	if self.registrationSync != nil {
+		if err := self.registrationSync.closeAndWait(ctx); err != nil {
+			result = errors.Join(result, err)
+		}
 	}
 	return result
 }
@@ -297,6 +339,10 @@ func VerifyCertChainSignature(peerPub ed25519.PublicKey, chain [][]byte, sig []b
 // `sendBuffer` is wired up; without this gate the send path races the
 // buffer wiring in `Client.initBuffers`.
 func (self *ClientKeyManager) publishClientKey() {
+	if self.registrationSync != nil {
+		self.publishRegisteredClientKey()
+		return
+	}
 	if self.controlSync == nil {
 		return
 	}

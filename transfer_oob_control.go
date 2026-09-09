@@ -146,6 +146,14 @@ func (self *ApiOutOfBandControl) sendControl(
 				safeCallback(nil, err)
 				return
 			}
+			if result == nil {
+				safeCallback(nil, errors.New("connect control response is absent"))
+				return
+			}
+			if result.Error != nil {
+				safeCallback(nil, errors.New("connect control rejected: "+result.Error.Message))
+				return
+			}
 
 			packBytes, err := DecodeBase64(base64.StdEncoding, result.Pack)
 			if err != nil {

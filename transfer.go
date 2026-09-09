@@ -1276,6 +1276,11 @@ type ClientSettings struct {
 	// across process lifetimes.
 	ClientKeySeed []byte
 
+	// Require processed platform registration before ClientKeyManager reports
+	// readiness. The real ApiOutOfBandControl returns controller/storage errors;
+	// custom delivery-only control implementations must leave this disabled.
+	ClientKeyRegistrationRequired bool
+
 	ProtocolVersion int
 
 	DefaultTransferOpts TransferOptions
