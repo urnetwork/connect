@@ -448,6 +448,215 @@ func TestWindowOutcomeFailureRetriesEnumerationUntilCanceled(t *testing.T) {
 	}
 }
 
+// outcomeEnumerationGenerator exposes one platform enumeration call at a
+// time, so tests can choose owner cancellation or a genuine platform error.
+type outcomeEnumerationGenerator struct {
+	testingEmptyMultiClientGenerator
+	entered chan struct{}
+	results chan error
+}
+
+// Blocks at the exact platform enumeration boundary until the test chooses a
+// result.
+func (self *outcomeEnumerationGenerator) NextDestinations(
+	count int,
+	excludeDestinations []MultiHopId,
+	rankMode string,
+) (map[MultiHopId]DestinationStats, error) {
+	self.entered <- struct{}{}
+	return nil, <-self.results
+}
+
+// outcomeClientArgsGenerator exposes the client-args call after returning one
+// synthetic destination from platform enumeration.
+type outcomeClientArgsGenerator struct {
+	testingEmptyMultiClientGenerator
+	destination MultiHopId
+	entered     chan struct{}
+	results     chan error
+}
+
+// Supplies one candidate so the enumerator reaches client-args creation.
+func (self *outcomeClientArgsGenerator) NextDestinations(
+	count int,
+	excludeDestinations []MultiHopId,
+	rankMode string,
+) (map[MultiHopId]DestinationStats, error) {
+	return map[MultiHopId]DestinationStats{self.destination: {}}, nil
+}
+
+// Blocks at the exact platform client-mint boundary until the test chooses a
+// result.
+func (self *outcomeClientArgsGenerator) NewClientArgs() (*MultiClientGeneratorClientArgs, error) {
+	self.entered <- struct{}{}
+	return nil, <-self.results
+}
+
+// outcomeEnumeratorTestWindow wires the production enumeration loop without
+// starting the rest of a multi-client window.
+func outcomeEnumeratorTestWindow(
+	ctx context.Context,
+	log *recordingLogger,
+	generator MultiClientGenerator,
+) *multiClientWindow {
+	window := outcomeTestWindow(ctx, log)
+	window.generator = generator
+	window.clientChannelArgs = make(chan *multiClientChannelArgs)
+	window.settings.WindowGeneratorTimeout = time.Hour
+	window.settings.WindowEnumerateErrorTimeout = 0
+	return window
+}
+
+// TestWindowEnumerationCancellationIsNotPlatformFailure pins window teardown
+// as lifecycle, not evidence that the platform was unreachable.
+func TestWindowEnumerationCancellationIsNotPlatformFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	log := newRecordingLogger()
+	generator := &outcomeEnumerationGenerator{
+		entered: make(chan struct{}),
+		results: make(chan error),
+	}
+	window := outcomeEnumeratorTestWindow(ctx, log, generator)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		window.randomEnumerateClientArgs()
+	}()
+
+	<-generator.entered
+	cancel()
+	<-done
+	generator.results <- nil
+
+	counts := window.failures.counts(time.Now())
+	if counts != [windowFailureClassCount]int{} {
+		t.Fatalf("teardown recorded window failures: %v", counts)
+	}
+	if got := window.monitor.WindowExpandEvent().Reason; got != WindowStallEvaluating {
+		t.Fatalf("teardown stall reason=%q, want %q", got, WindowStallEvaluating)
+	}
+	if lines := log.linesWith("[multi]window enumerate error"); len(lines) != 0 {
+		t.Fatalf("teardown logged an enumeration failure: %v", lines)
+	}
+	if lines := log.linesWith("event=window_stall"); len(lines) != 0 {
+		t.Fatalf("teardown published a window stall: %v", lines)
+	}
+}
+
+// TestWindowClientArgsCancellationIsNotPlatformFailure pins the same owner
+// cancellation boundary after a destination was enumerated.
+func TestWindowClientArgsCancellationIsNotPlatformFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	log := newRecordingLogger()
+	generator := &outcomeClientArgsGenerator{
+		destination: RequireMultiHopId(NewId()),
+		entered:     make(chan struct{}),
+		results:     make(chan error),
+	}
+	window := outcomeEnumeratorTestWindow(ctx, log, generator)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		window.randomEnumerateClientArgs()
+	}()
+
+	<-generator.entered
+	cancel()
+	<-done
+	generator.results <- nil
+
+	counts := window.failures.counts(time.Now())
+	if counts != [windowFailureClassCount]int{} {
+		t.Fatalf("teardown recorded window failures: %v", counts)
+	}
+	if got := window.monitor.WindowExpandEvent().Reason; got != WindowStallEvaluating {
+		t.Fatalf("teardown stall reason=%q, want %q", got, WindowStallEvaluating)
+	}
+	if lines := log.linesWith("[multi]create client args error"); len(lines) != 0 {
+		t.Fatalf("teardown logged a client-args failure: %v", lines)
+	}
+	if lines := log.linesWith("event=window_stall"); len(lines) != 0 {
+		t.Fatalf("teardown published a window stall: %v", lines)
+	}
+}
+
+// TestLiveWindowEnumerationErrorIsPlatformFailure preserves genuine platform
+// evidence while the owning window context remains live.
+func TestLiveWindowEnumerationErrorIsPlatformFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	log := newRecordingLogger()
+	generator := &outcomeEnumerationGenerator{
+		entered: make(chan struct{}),
+		results: make(chan error),
+	}
+	window := outcomeEnumeratorTestWindow(ctx, log, generator)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		window.randomEnumerateClientArgs()
+	}()
+
+	<-generator.entered
+	generator.results <- errors.New("synthetic platform timeout")
+	<-generator.entered
+	cancel()
+	<-done
+	generator.results <- nil
+
+	counts := window.failures.counts(time.Now())
+	if got := counts[windowFailurePlatform]; got != 1 {
+		t.Fatalf("platform failure count=%d, want 1", got)
+	}
+	if got := window.monitor.WindowExpandEvent().Reason; got != WindowStallPlatformUnreachable {
+		t.Fatalf("stall reason=%q, want %q", got, WindowStallPlatformUnreachable)
+	}
+	if lines := log.linesWith("[multi]window enumerate error"); len(lines) != 1 {
+		t.Fatalf("enumeration failure lines=%d, want 1: %v", len(lines), lines)
+	}
+	if lines := log.linesWith("event=window_stall"); len(lines) != 1 {
+		t.Fatalf("window-stall lines=%d, want 1: %v", len(lines), lines)
+	}
+}
+
+// TestLiveWindowClientArgsErrorIsPlatformFailure preserves genuine client-mint
+// evidence while the owning window context remains live.
+func TestLiveWindowClientArgsErrorIsPlatformFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	log := newRecordingLogger()
+	generator := &outcomeClientArgsGenerator{
+		destination: RequireMultiHopId(NewId()),
+		entered:     make(chan struct{}),
+		results:     make(chan error),
+	}
+	window := outcomeEnumeratorTestWindow(ctx, log, generator)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		window.randomEnumerateClientArgs()
+	}()
+
+	<-generator.entered
+	generator.results <- errors.New("synthetic client-args timeout")
+	<-generator.entered
+	cancel()
+	<-done
+	generator.results <- nil
+
+	counts := window.failures.counts(time.Now())
+	if got := counts[windowFailurePlatform]; got != 1 {
+		t.Fatalf("platform failure count=%d, want 1", got)
+	}
+	if got := window.monitor.WindowExpandEvent().Reason; got != WindowStallPlatformUnreachable {
+		t.Fatalf("stall reason=%q, want %q", got, WindowStallPlatformUnreachable)
+	}
+	if lines := log.linesWith("[multi]create client args error"); len(lines) != 1 {
+		t.Fatalf("client-args failure lines=%d, want 1: %v", len(lines), lines)
+	}
+	if lines := log.linesWith("event=window_stall"); len(lines) != 1 {
+		t.Fatalf("window-stall lines=%d, want 1: %v", len(lines), lines)
+	}
+}
+
 // the stall transition is logged once per change through publishStallStatus
 func TestWindowStallTransitionLogsOnce(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

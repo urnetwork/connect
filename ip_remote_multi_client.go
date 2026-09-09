@@ -10105,6 +10105,11 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			nil,
 		)
 		if err != nil {
+			select {
+			case <-self.ctx.Done():
+				return
+			default:
+			}
 			self.log.Infof("[multi]window enumerate error timeout = %s\n", err)
 			// a hung/erroring platform api is the platform-unreachable class
 			// unless the message names auth or rate limiting
@@ -10168,6 +10173,11 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 						)
 					}
 					if err != nil {
+						select {
+						case <-self.ctx.Done():
+							return
+						default:
+						}
 						self.log.Infof("[multi]create client args error = %s\n", err)
 						// platform api again: the client mint is a platform
 						// round trip, so its timeout is platform-unreachable
