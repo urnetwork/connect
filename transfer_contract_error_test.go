@@ -28,6 +28,14 @@ type contractErrorOob struct {
 
 func (self *contractErrorOob) SendControl(frames []*protocol.Frame, callback func([]*protocol.Frame, error)) {
 	var out []*protocol.Frame
+	defer func() {
+		for _, frame := range frames {
+			MessagePoolReturn(frame.MessageBytes)
+		}
+		for _, frame := range out {
+			MessagePoolReturn(frame.MessageBytes)
+		}
+	}()
 	for _, frame := range frames {
 		message, err := FromFrame(frame)
 		if err != nil {
@@ -81,6 +89,7 @@ func (self *contractErrorOob) SendControl(frames []*protocol.Frame, callback fun
 		if resultFrame, err := ToFrame(result, DefaultProtocolVersion); err == nil {
 			out = append(out, resultFrame)
 		}
+		MessagePoolReturn(storedContractBytes)
 	}
 	callback(out, nil)
 }
@@ -267,11 +276,27 @@ func TestSendSequenceSurvivesTransientContractErrors(t *testing.T) {
 // teardown. It must return the cancellation cause without emitting the same
 // error used for a live acquisition failure.
 func TestSendSequenceContractWaitCancellationIsNotAnError(t *testing.T) {
+	testSendSequenceContractWaitCancellation(t, nil)
+}
+
+// Observes the real queue-take boundary even when host-wide backend health
+// correctly suppresses outbound requests. The observer runs in the test owner.
+func testSendSequenceContractWaitCancellation(
+	t *testing.T,
+	atWait func(*contractErrorOob),
+) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	clientId := NewId()
+	destination := NewId()
 	requestSeen := make(chan struct{})
+	waitEntered := make(chan struct{})
+	allowWait := make(chan struct{})
+	var waitOnce sync.Once
+	var releaseOnce sync.Once
+	releaseWait := func() { releaseOnce.Do(func() { close(allowWait) }) }
 	log := &contractFailureLogger{}
 	oob := &contractErrorOob{
 		clientId:    clientId,
@@ -281,15 +306,41 @@ func TestSendSequenceContractWaitCancellationIsNotAnError(t *testing.T) {
 	settings := contractErrorTestSettings()
 	settings.Log = log
 	settings.EncryptionSettings.Mode = EncryptionModeOff
-	// The request barrier must belong to this Pack's synchronous acquisition,
-	// not the sequence's earlier fire-and-forget prewarm request.
+	// Prewarming is not this Pack's owned wait. Backend degradation may also
+	// suppress its Oob request without preventing the actual TakeContract call.
 	settings.SendBufferSettings.PrewarmOpeningContract = false
+	settings.SendBufferSettings.beforeTakeContractForTest = func(id sendSequenceId) {
+		if id.Destination != destination {
+			return
+		}
+		waitOnce.Do(func() {
+			close(waitEntered)
+			<-allowWait
+		})
+	}
 	client := NewClient(ctx, clientId, oob, settings)
-	defer client.Cancel()
+	route := make(chan []byte, 1)
+	defer func() {
+		cancel()
+		releaseWait()
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		if err := client.CloseAndWait(cleanupCtx); err != nil {
+			t.Errorf("join contract cancellation fixture: %v", err)
+		}
+		for {
+			select {
+			case message := <-route:
+				MessagePoolReturn(message)
+			default:
+				return
+			}
+		}
+	}()
 
 	client.RouteManager().UpdateTransport(
 		NewSendGatewayTransport(),
-		[]Route{make(chan []byte, 1)},
+		[]Route{route},
 	)
 	frame, err := ToFrame(
 		&protocol.SimpleMessage{Content: "cancel contract wait"},
@@ -298,18 +349,21 @@ func TestSendSequenceContractWaitCancellationIsNotAnError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	destination := NewId()
 	ackErrs := make(chan error, 1)
 	if !client.SendWithTimeout(frame, destination, func(err error) {
 		ackErrs <- err
 	}, -1) {
+		MessagePoolReturn(frame.MessageBytes)
 		t.Fatal("the send must enqueue before cancellation")
 	}
 
 	select {
-	case <-requestSeen:
+	case <-waitEntered:
 	case <-time.After(10 * time.Second):
-		t.Fatal("the send sequence never entered contract acquisition")
+		t.Fatal("the send sequence never reached the owned contract wait")
+	}
+	if atWait != nil {
+		atWait(oob)
 	}
 
 	// Cancel only the sequence that owns the in-flight pack. Canceling the whole
@@ -329,6 +383,7 @@ func TestSendSequenceContractWaitCancellationIsNotAnError(t *testing.T) {
 		t.Fatal("the sequence disappeared before the cancellation boundary")
 	}
 	sequence.Cancel()
+	releaseWait()
 
 	select {
 	case err := <-ackErrs:

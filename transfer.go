@@ -3804,6 +3804,7 @@ type SendBufferSettings struct {
 	// Nil test barrier pauses one encrypted-control owner before Pack.
 	beforeEncryptedControlPackForTest    func([]byte)
 	beforeContractFailureClassifyForTest func(sendSequenceId)
+	beforeTakeContractForTest            func(sendSequenceId)
 	forceAckTimeoutForTest               func(sendSequenceId) bool
 	forceContractFailureForTest          func(sendSequenceId) bool
 	forceResendForTest                   func(sendSequenceId) bool
@@ -4006,6 +4007,7 @@ type SendBuffer struct {
 	afterCreateSendGroupCompletionForTest func(sendSequenceId, int)
 	beforeEncryptedControlPackForTest     func([]byte)
 	beforeContractFailureClassifyForTest  func(sendSequenceId)
+	beforeTakeContractForTest             func(sendSequenceId)
 	forceAckTimeoutForTest                func(sendSequenceId) bool
 	forceContractFailureForTest           func(sendSequenceId) bool
 	forceResendForTest                    func(sendSequenceId) bool
@@ -4038,6 +4040,7 @@ func NewSendBuffer(ctx context.Context,
 		afterCreateSendGroupCompletionForTest: sendBufferSettings.afterCreateSendGroupCompletionForTest,
 		beforeEncryptedControlPackForTest:     sendBufferSettings.beforeEncryptedControlPackForTest,
 		beforeContractFailureClassifyForTest:  sendBufferSettings.beforeContractFailureClassifyForTest,
+		beforeTakeContractForTest:             sendBufferSettings.beforeTakeContractForTest,
 		forceAckTimeoutForTest:                sendBufferSettings.forceAckTimeoutForTest,
 		forceContractFailureForTest:           sendBufferSettings.forceContractFailureForTest,
 		forceResendForTest:                    sendBufferSettings.forceResendForTest,
@@ -6565,6 +6568,9 @@ func (self *SendSequence) updateContractWithAckPromotion(
 
 		nextContract := func(timeout time.Duration) bool {
 			metadata := self.contractMetadata()
+			if self.sendBuffer != nil && self.sendBuffer.beforeTakeContractForTest != nil {
+				self.sendBuffer.beforeTakeContractForTest(self.id())
+			}
 			contract := self.client.ContractManager().TakeContract(
 				metadata.ctx,
 				metadata.key,
