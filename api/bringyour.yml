@@ -2081,10 +2081,14 @@ paths:
 
   /referral-code/validate:
     post:
-      description: Validate the referral code.
+      description: |
+        Validate a referral (bonus) code: whether it exists and whether it has
+        been used up. The sign-up screens call this before an account exists,
+        so no authentication is required; a bearer token, if sent, is ignored.
+        Checks are budgeted per caller address (60 per 10 minutes) and across
+        all callers; over budget the response is 429 with a Retry-After header.
       operationId: Validate Referral Code
-      security:
-        - BearerAuth: []
+      security: []
       requestBody:
         required: true
         content:
@@ -2097,6 +2101,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ValidateReferralCodeResult"
+        "429":
+          description: Too many referral code checks from this address; retry after the Retry-After seconds.
 
   /account/referral-network:
     get:
