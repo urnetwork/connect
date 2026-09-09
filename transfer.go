@@ -747,6 +747,7 @@ func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings
 		// one fully acknowledged window adds about this much capacity.
 		UnreliableFlightIncreaseByteCount:    1150,
 		UnreliableFlightIncreaseMessageCount: 1,
+		UnreliableFloorSingleFlight:          false,
 		SequenceBufferSize:                   bufferSize,
 		AckBufferSize:                        bufferSize,
 		MinMessageByteCount:                  ByteCount(1),
@@ -3753,6 +3754,12 @@ type SendBufferSettings struct {
 	UnreliableMinimumFlightMessageCount  int
 	UnreliableMaximumFlightMessageCount  int
 	UnreliableFlightIncreaseMessageCount int
+	// UnreliableFloorSingleFlight keeps at most one message in flight on an
+	// unreliable carrier whose flight limit has collapsed to its floor after
+	// repeated loss, while a reliable carrier takes everything else. The lossy
+	// lane still proves itself with that one message (an ACK reopens growth)
+	// but no longer stripes an ordered stream with a carrier that drops it.
+	UnreliableFloorSingleFlight bool
 
 	SequenceBufferSize int
 	AckBufferSize      int
@@ -7408,9 +7415,17 @@ func (self *SendSequence) unreliableFlightGates(
 func (self *SendSequence) reliableOnlyWrite(
 	policy transferFlightPolicySnapshot,
 ) bool {
-	return policy.reliableRouteAvailable &&
-		self.flightController.limited &&
-		!self.flightController.canSend()
+	if !policy.reliableRouteAvailable || !self.flightController.limited {
+		return false
+	}
+	if !self.flightController.canSend() {
+		return true
+	}
+	// A carrier that loss has reduced to its floor keeps proving itself with
+	// a single message in flight; the ordered stream is not striped onto it.
+	return self.sendBufferSettings.UnreliableFloorSingleFlight &&
+		self.flightController.atFloor() &&
+		0 < self.flightController.messageCount
 }
 
 // observeUnreliableResendTimeout applies the RTO of an unreliable-tracked item.
@@ -9582,7 +9597,7 @@ func (self *ReceiveSequence) Run() {
 					} else if sendAck.transportType != TransportTypeUnknown {
 						var success bool
 						var disposition transferWriteDisposition
-						success, disposition, writeErr = selector.writeDetailedWithCarrierPreference(
+						success, disposition, writeErr = selector.writeDetailedReplyWithCarrierPreference(
 							ackWriteCtx,
 							shared,
 							self.receiveBufferSettings.WriteTimeout,

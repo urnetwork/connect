@@ -2727,6 +2727,58 @@ func (self *MultiRouteSelector) writeDetailedReliableOnly(
 	)
 }
 
+// writeDetailedReplyWithCarrierPreference writes a reply (an ACK) with the
+// carrier affinity of the packet it answers, except that a reply is never
+// pinned to a potentially unreliable carrier while a reliable one is active.
+// A cumulative ACK lost on a lossy datagram lane times out the sender's whole
+// window; on the reliable carrier it costs one extra hop of latency.
+func (self *MultiRouteSelector) writeDetailedReplyWithCarrierPreference(
+	ctx context.Context,
+	transferFrameBytes []byte,
+	timeout time.Duration,
+	preferredTransportType TransportType,
+) (bool, transferWriteDisposition, error) {
+	if self.transportPotentiallyUnreliable(preferredTransportType) {
+		return self.writeDetailedWithRoutePolicy(
+			ctx,
+			transferFrameBytes,
+			timeout,
+			TransportTypeUnknown,
+			true,
+		)
+	}
+	return self.writeDetailedWithRoutePolicy(
+		ctx,
+		transferFrameBytes,
+		timeout,
+		preferredTransportType,
+		false,
+	)
+}
+
+// transportPotentiallyUnreliable reports whether every active route of the
+// transport type is a potentially unreliable carrier and a reliable route
+// exists to take its place.
+func (self *MultiRouteSelector) transportPotentiallyUnreliable(
+	transportType TransportType,
+) bool {
+	snapshot := self.activeRoutesSnapshot.Load()
+	if snapshot == nil || len(snapshot.reliableRoutes) == 0 {
+		return false
+	}
+	found := false
+	for _, route := range snapshot.routes {
+		if snapshot.routeTransportTypes[route] != transportType {
+			continue
+		}
+		if !snapshot.routeCarrierProperties[route].Unreliable {
+			return false
+		}
+		found = true
+	}
+	return found
+}
+
 func (self *MultiRouteSelector) writeDetailedWithRoutePolicy(
 	ctx context.Context,
 	transferFrameBytes []byte,

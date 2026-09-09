@@ -159,3 +159,89 @@ func TestSendSequenceUnreliableResendTimeoutReleasesFlightWhenReliableRouteAvail
 		t.Fatal("flight stayed closed after the timed-out item was released")
 	}
 }
+
+func TestSendSequenceFloorSingleFlightKeepsOneMessageOnLossyCarrier(t *testing.T) {
+	settings := DefaultSendBufferSettings()
+	settings.UnreliableInitialFlightByteCount = 2048
+	settings.UnreliableMinimumFlightByteCount = 1024
+	settings.UnreliableMaximumFlightByteCount = 4096
+	settings.UnreliableInitialFlightMessageCount = 8
+	settings.UnreliableMinimumFlightMessageCount = 4
+	settings.UnreliableMaximumFlightMessageCount = 16
+	settings.UnreliableFloorSingleFlight = true
+	sequence := testUnreliableRecoverySequence(settings)
+	sequence.client = &Client{}
+	sequence.flightController = newSendFlightController(settings)
+	policy := transferFlightPolicySnapshot{generation: 1, limited: true, reliableRouteAvailable: true}
+	sequence.flightController.applyPolicy(policy)
+
+	// healthy carrier (limit above the floor): the flight decides alone
+	first := &sendItem{transferFrameBytes: make([]byte, 512)}
+	sequence.observeCarrierWrite(first, transferWriteDisposition{unreliable: true})
+	if sequence.flightController.atFloor() || sequence.reliableOnlyWrite(policy) {
+		t.Fatalf("healthy carrier forced reliable-only: floor=%t", sequence.flightController.atFloor())
+	}
+
+	// repeated loss pins the limit to the floor: one message may stay in
+	// flight, everything else goes reliable-only
+	for i := 0; i < 8; i++ {
+		sequence.flightController.reduceForLoss()
+	}
+	if !sequence.flightController.atFloor() {
+		t.Fatalf("flight not at floor after reductions: %d/%d", sequence.flightController.byteLimit, sequence.flightController.activeMinimumByteCount)
+	}
+	if !sequence.reliableOnlyWrite(policy) {
+		t.Fatal("floor carrier with a message in flight did not force reliable-only")
+	}
+	sequence.releaseUnreliableFlight(first)
+	if sequence.reliableOnlyWrite(policy) {
+		t.Fatal("floor carrier with an empty flight refused its single probe message")
+	}
+
+	// the rule is opt-in: without it only a full flight forces reliable-only
+	settings.UnreliableFloorSingleFlight = false
+	sequence.observeCarrierWrite(first, transferWriteDisposition{unreliable: true})
+	if sequence.reliableOnlyWrite(policy) {
+		t.Fatal("floor rule applied while disabled")
+	}
+	sequence.releaseUnreliableFlight(first)
+}
+
+// A reply keeps its carrier affinity on reliable carriers but never rides a
+// potentially unreliable one while a reliable route is active.
+func TestMultiRouteSelectorReplyAvoidsUnreliableCarrier(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	selector := NewMultiRouteSelector(ctx, "reply-affinity", nil, TransferPath{}, true)
+	defer selector.Close()
+	h1Transport := NewSendGatewayTransportWithType(TransportTypeH1)
+	h1Route := make(Route, 16)
+	selector.updateTransportWithProperties(h1Transport, []Route{h1Route}, TransferCarrierProperties{})
+	p2pTransport := NewSendGatewayTransportWithType(TransportTypeP2p)
+	p2pRoute := make(Route, 16)
+	selector.updateTransportWithProperties(p2pTransport, []Route{p2pRoute}, TransferCarrierProperties{Unreliable: true})
+
+	if !selector.transportPotentiallyUnreliable(TransportTypeP2p) || selector.transportPotentiallyUnreliable(TransportTypeH1) {
+		t.Fatal("carrier reliability classification is wrong")
+	}
+	for i := 0; i < 6; i++ {
+		success, disposition, err := selector.writeDetailedReplyWithCarrierPreference(ctx, []byte{byte(i)}, time.Second, TransportTypeP2p)
+		if err != nil || !success || disposition.transportType != TransportTypeH1 {
+			t.Fatalf("reply %d with p2p affinity: success=%t disposition=%+v err=%v; want H1", i, success, disposition, err)
+		}
+	}
+	if len(h1Route) != 6 || len(p2pRoute) != 0 {
+		t.Fatalf("routes after replies: h1=%d p2p=%d, want 6/0", len(h1Route), len(p2pRoute))
+	}
+
+	// with only the unreliable carrier the reply keeps using it
+	selector.updateTransport(h1Transport, nil)
+	if selector.transportPotentiallyUnreliable(TransportTypeP2p) {
+		t.Fatal("p2p flagged unreliable-replaceable without a reliable route")
+	}
+	success, disposition, err := selector.writeDetailedReplyWithCarrierPreference(ctx, []byte{9}, time.Second, TransportTypeP2p)
+	if err != nil || !success || disposition.transportType != TransportTypeP2p {
+		t.Fatalf("p2p-only reply: success=%t disposition=%+v err=%v", success, disposition, err)
+	}
+}

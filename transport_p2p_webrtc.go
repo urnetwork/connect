@@ -823,6 +823,7 @@ func DefaultWebRtcSettings() *WebRtcSettings {
 		// side. Keep roughly 24 ms of burst absorption; the queue stores pooled
 		// messages only while the route worker is actually behind.
 		DatagramFastPathReceiveBufferSize: 1024,
+		UdpSocketBufferByteCount:          int(mib(4)),
 		DatagramFastPathWriteQueueSize:    256,
 		DatagramFastPathWriteBatchSize:    64,
 		// Pion's Reno-style congestion avoidance otherwise adds one ~1.2 KiB
@@ -916,6 +917,10 @@ type WebRtcSettings struct {
 	// DatagramFastPathReceiveBufferSize bounds complete reassembled messages
 	// waiting for the route worker. Full queues drop datagrams; the inner
 	// transport recovers direct-IP loss without a second Transfer retry loop.
+	// UdpSocketBufferByteCount is requested as the kernel send and receive
+	// buffer of every ICE UDP socket; the kernel clamps it to its maximum
+	// (net.core.rmem_max/wmem_max on Linux). Zero keeps the kernel default.
+	UdpSocketBufferByteCount          int
 	DatagramFastPathReceiveBufferSize int
 	// DatagramFastPathWriteQueueSize bounds the native WebRTC socket's copied
 	// userspace send buffer. A full queue blocks the carrier writer, preserving

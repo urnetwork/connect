@@ -24,6 +24,11 @@ type p2pUdpBatchNet struct {
 	transport.Net
 	queueSize int
 	batchSize int
+	// socketBufferByteCount, when positive, is requested as the kernel send and
+	// receive buffer of every UDP socket (the kernel clamps it to its maximum).
+	// The default ~200 KB Linux buffer overflows under fast-path bursts and
+	// drops the peer's ACKs, which times out the sender's whole window.
+	socketBufferByteCount int
 }
 
 // newP2pUdpBatchNet creates a route-neutral socket wrapper. A zero or negative
@@ -32,14 +37,31 @@ func newP2pUdpBatchNet(
 	selectedNet transport.Net,
 	queueSize int,
 	batchSize int,
+	socketBufferByteCount int,
 ) transport.Net {
 	if selectedNet == nil || queueSize <= 0 || batchSize <= 0 {
 		return selectedNet
 	}
 	return &p2pUdpBatchNet{
-		Net:       selectedNet,
-		queueSize: queueSize,
-		batchSize: min(queueSize, batchSize),
+		Net:                   selectedNet,
+		queueSize:             queueSize,
+		batchSize:             min(queueSize, batchSize),
+		socketBufferByteCount: socketBufferByteCount,
+	}
+}
+
+// applyP2pUdpSocketBuffers requests the configured kernel buffers on a socket
+// that supports them. Failures are ignored: the kernel default still works,
+// just with more loss under bursts.
+func applyP2pUdpSocketBuffers(connection any, byteCount int) {
+	if byteCount <= 0 {
+		return
+	}
+	if setter, ok := connection.(interface{ SetReadBuffer(int) error }); ok {
+		_ = setter.SetReadBuffer(byteCount)
+	}
+	if setter, ok := connection.(interface{ SetWriteBuffer(int) error }); ok {
+		_ = setter.SetWriteBuffer(byteCount)
 	}
 }
 
@@ -52,6 +74,7 @@ func (self *p2pUdpBatchNet) ListenUDP(
 	if err != nil {
 		return nil, err
 	}
+	applyP2pUdpSocketBuffers(connection, self.socketBufferByteCount)
 	return newP2pUdpBatchConn(connection, network, self.queueSize, self.batchSize), nil
 }
 
@@ -68,6 +91,7 @@ func (self *p2pUdpBatchNet) ListenPacket(
 	if !ok {
 		return connection, nil
 	}
+	applyP2pUdpSocketBuffers(udpConnection, self.socketBufferByteCount)
 	return newP2pUdpBatchConn(
 		udpConnection,
 		network,

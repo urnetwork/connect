@@ -115,6 +115,7 @@ func newWebRtcPeerConnectionFactory(
 			selectedNet,
 			settings.DatagramFastPathWriteQueueSize,
 			settings.DatagramFastPathWriteBatchSize,
+			settings.UdpSocketBufferByteCount,
 		)
 	}
 	s.DetachDataChannels()
