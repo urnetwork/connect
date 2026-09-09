@@ -6607,8 +6607,24 @@ components:
           enum: [points, blocks, streak]
           default: points
         cursor:
-          description: The next_cursor of the previous page; omit for the first page
+          description: |
+            Continues a previous page in either direction: a `next_cursor`
+            opens the page after it, a `prev_cursor` the page before it.
+            Omit for the first page. A cursor is opaque and pins the snapshot
+            and the sort; `restart: true` means its snapshot is gone.
           type: string
+        seek_rank:
+          description: |
+            Jumps to a position: the page starts at the row whose `position`
+            in this sort's total order equals `seek_rank` (1-based, clamped to
+            [1, total_ranked]). Used without a cursor; the response then
+            carries both `prev_cursor` and `next_cursor` so the jumped-to
+            window pages in both directions. `total_ranked` from any previous
+            response is the client's denominator when it turns a scroll
+            position into a rank.
+          type: integer
+          format: int64
+          minimum: 1
         limit:
           description: Page size, default 50, max 200
           type: integer
@@ -6652,6 +6668,15 @@ components:
         rank_streak:
           type: integer
           format: int64
+        position:
+          description: |
+            The row's 1-based place in the requested sort's total order.
+            Ranks tie (competition ranks), positions never do: this is the
+            `seek_rank` coordinate and the key a client keeps its loaded
+            window by.
+          type: integer
+          format: int64
+          minimum: 1
 
     PointsLeaderboardMe:
       allOf:
@@ -6672,8 +6697,14 @@ components:
           items:
             $ref: "#/components/schemas/PointsLeaderboardRow"
         next_cursor:
-          description: Absent on the last page
+          description: Pages forward from this page's last row; absent on the last page
           type: string
+        prev_cursor:
+          description: |
+            Pages backward from this page's first row; null when the page
+            starts at position 1. Present on every page reached by a cursor or
+            a `seek_rank`.
+          type: [string, "null"]
         restart:
           description: The cursor's snapshot is gone; reload from the top
           type: boolean
