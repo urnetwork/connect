@@ -5521,7 +5521,15 @@ func (self *SendSequence) scheduleSelectiveAckRecovery(currentTime time.Time) bo
 		if gapItem == nil {
 			gapItem = item
 		}
-		if 0 < threshold && gapRecoveryCount < burstSize &&
+		// Mixed lanes: an item carried by the reliable route is routinely
+		// acknowledged after later items that rode a direct datagram lane
+		// with a fraction of its latency. Until it is older than the reliable
+		// lane's RTT it is late, not lost; a gap resend now only doubles the
+		// relay traffic. Its own RTO still covers a real loss.
+		lateNotLost := self.flightController != nil && self.flightController.limited &&
+			item.reliableCarrierObserved && !item.unreliableFlightTracked &&
+			currentTime.Before(item.sendTime.Add(self.rttWindow.ScaledRtt()))
+		if 0 < threshold && gapRecoveryCount < burstSize && !lateNotLost &&
 			!item.selectiveGapRecovered &&
 			(item.ackTailProbeCount == 0 || item.recoveryKind != sendRecoveryNone) &&
 			threshold <= remainingSelectiveAckCount {
@@ -7404,6 +7412,20 @@ func (self *SendSequence) releaseUnreliableFlight(item *sendItem) {
 // admitting packs. That is only the case when no reliable carrier is active:
 // with one, the overflow is written reliable-only instead of stalling the
 // sequence (and, on a client, its entire receive path behind it).
+// observeAckRtt feeds the sequence's RTT window from an acknowledged item,
+// except for items carried by an unreliable lane. A direct datagram lane
+// answers in ~20 ms while the relay carrier takes 150-300 ms; mixing both into
+// one window drags the scaled RTO down to its floor and every relay-carried
+// item is resent before its ACK can arrive (thousands of spurious timeout
+// resends per second while p2p is live). The unreliable lane has its own
+// bounded recovery policy and does not depend on this estimate.
+func (self *SendSequence) observeAckRtt(item *sendItem, tag sequenceTag) {
+	if !tag.set || item == nil || item.unreliableCarrierObserved {
+		return
+	}
+	self.rttWindow.CloseSendTime(tag.sendTime)
+}
+
 func (self *SendSequence) unreliableFlightGates(
 	policy transferFlightPolicySnapshot,
 ) bool {
@@ -7467,9 +7489,7 @@ func (self *SendSequence) receiveAck(
 		return
 	}
 
-	if tag.set {
-		self.rttWindow.CloseSendTime(tag.sendTime)
-	}
+	self.observeAckRtt(item, tag)
 
 	if selective {
 		if self.log.V(1).Enabled() {

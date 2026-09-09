@@ -245,3 +245,66 @@ func TestMultiRouteSelectorReplyAvoidsUnreliableCarrier(t *testing.T) {
 		t.Fatalf("p2p-only reply: success=%t disposition=%+v err=%v", success, disposition, err)
 	}
 }
+
+// Acks for unreliable-carried items must not feed the sequence RTT window.
+func TestSendSequenceAckRttIgnoresUnreliableCarrier(t *testing.T) {
+	settings := DefaultSendBufferSettings()
+	sequence := testUnreliableRecoverySequence(settings)
+	sequence.client = &Client{}
+	sequence.flightController = newSendFlightController(settings)
+	sequence.flightController.applyPolicy(transferFlightPolicySnapshot{generation: 1, limited: true, reliableRouteAvailable: true})
+	before := sequence.rttWindow.ScaledRtt()
+
+	unreliableItem := &sendItem{transferFrameBytes: make([]byte, 64)}
+	sequence.observeCarrierWrite(unreliableItem, transferWriteDisposition{unreliable: true})
+	tag := sequenceTag{sendTime: uint64(time.Now().Add(-5 * time.Second).UnixMilli()), set: true}
+	sequence.observeAckRtt(unreliableItem, tag)
+	if after := sequence.rttWindow.ScaledRtt(); after != before {
+		t.Fatalf("unreliable-carrier ack moved the RTT window: %s -> %s", before, after)
+	}
+
+	reliableItem := &sendItem{transferFrameBytes: make([]byte, 64)}
+	sequence.observeCarrierWrite(reliableItem, transferWriteDisposition{reliable: true})
+	sequence.observeAckRtt(reliableItem, tag)
+	if after := sequence.rttWindow.ScaledRtt(); after <= before {
+		t.Fatalf("reliable-carrier ack did not move the RTT window: %s -> %s", before, after)
+	}
+}
+
+// With a datagram lane active, a reliable-carried item that is not yet older
+// than the reliable lane's RTT is late, not lost: no gap resend for it.
+func TestSelectiveAckGapSkipsReliableItemsNotYetLateInMixedLanes(t *testing.T) {
+	sendTime := time.Unix(1_700_000_000, 0)
+	currentTime := sendTime.Add(100 * time.Millisecond)
+	sequence, items := newSelectiveAckRecoveryTestSequence(8, sendTime)
+	sequence.client = &Client{}
+	sequence.flightController = newSendFlightController(sequence.sendBufferSettings)
+	sequence.flightController.applyPolicy(transferFlightPolicySnapshot{generation: 1, limited: true, reliableRouteAvailable: true})
+	// items 0 and 4 are gaps; 0 rode the reliable lane 100 ms ago, 4 rode it long ago
+	items[0].reliableCarrierObserved = true
+	items[4].reliableCarrierObserved = true
+	items[4].sendTime = sendTime.Add(-5 * time.Second)
+	for _, index := range []int{1, 2, 3, 5, 6, 7} {
+		items[index].selectiveAcked = true
+	}
+	sequence.scheduleSelectiveAckRecovery(currentTime)
+	if items[0].selectiveGapRecovered {
+		t.Fatal("fresh reliable-carried gap item was gap-resent behind fast-lane acks")
+	}
+	if !items[4].selectiveGapRecovered || items[4].recoveryKind != sendRecoverySelectiveGap {
+		t.Fatalf("stale reliable-carried gap item was not gap-resent: recovered=%t kind=%d", items[4].selectiveGapRecovered, items[4].recoveryKind)
+	}
+
+	// single reliable lane (no unreliable carrier): behaviour unchanged
+	sequence2, items2 := newSelectiveAckRecoveryTestSequence(8, sendTime)
+	sequence2.client = &Client{}
+	sequence2.flightController = newSendFlightController(sequence2.sendBufferSettings)
+	items2[0].reliableCarrierObserved = true
+	for _, index := range []int{1, 2, 3, 5, 6, 7} {
+		items2[index].selectiveAcked = true
+	}
+	sequence2.scheduleSelectiveAckRecovery(currentTime)
+	if !items2[0].selectiveGapRecovered {
+		t.Fatal("single-lane gap recovery regressed")
+	}
+}
