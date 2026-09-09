@@ -11270,21 +11270,16 @@ func (self *multiClientWindow) expand(
 								}
 								pingCancel()
 							} else {
-								// unconditional (V0), was V(1): a ping-ack
-								// error is an evaluation-failure transition,
-								// and those were invisible in the field
-								if ok, suppressed := self.pingFailThrottle.Allow(time.Now()); ok {
-									self.log.Infof("[multi]evaluation ping error [%s] = %s%s\n",
-										args.ClientId, err, suppressedSuffix(suppressed))
-								}
-								self.recordEvaluationFailure(windowFailureProvider, err)
+								self.recordEvaluationPingFailure(evaluationCtx, args, err)
 								fail()
 							}
 						},
 					)
 					if err != nil {
-						self.log.Infof("[multi]create client ping error = %s\n", err)
-						self.recordEvaluationFailure(windowFailureProvider, err)
+						if !isEvaluationContextCancellation(evaluationCtx, err) {
+							self.log.Infof("[multi]create client ping error = %s\n", err)
+							self.recordEvaluationFailure(windowFailureProvider, err)
+						}
 						fail()
 					} else if !success {
 						fail()
@@ -11293,18 +11288,28 @@ func (self *multiClientWindow) expand(
 						go HandleError(func() {
 							select {
 							case <-pingDone.Done():
-							case <-time.After(self.settings.PingTimeout):
-								// unconditional (V0), was V(2): the unanswered
-								// evaluation ping is THE dominant transition of
-								// the field hang, and it logged nothing
-								if ok, suppressed := self.pingFailThrottle.Allow(time.Now()); ok {
-									self.log.Infof("[multi]evaluation ping timeout [%s]%s\n",
-										args.ClientId, suppressedSuffix(suppressed))
-								}
-								self.recordEvaluationFailure(windowFailureProvider, nil)
+							case <-evaluationCtx.Done():
 								func() {
 									mutex.Lock()
 									defer mutex.Unlock()
+									fail()
+								}()
+							case <-time.After(self.settings.PingTimeout):
+								func() {
+									mutex.Lock()
+									defer mutex.Unlock()
+									if evaluationCtx.Err() != nil {
+										fail()
+										return
+									}
+									// unconditional (V0), was V(2): the unanswered
+									// evaluation ping is THE dominant transition of
+									// the field hang, and it logged nothing
+									if ok, suppressed := self.pingFailThrottle.Allow(time.Now()); ok {
+										self.log.Infof("[multi]evaluation ping timeout [%s]%s\n",
+											args.ClientId, suppressedSuffix(suppressed))
+									}
+									self.recordEvaluationFailure(windowFailureProvider, nil)
 									fail()
 								}()
 							}
@@ -11337,6 +11342,36 @@ func (self *multiClientWindow) expand(
 	return
 }
 
+// isEvaluationContextCancellation distinguishes an owning evaluation-epoch
+// rebuild or window retirement from an identically worded provider error. The
+// context must be done and the returned error must match that exact context
+// outcome; a live-context context.Canceled remains provider evidence.
+func isEvaluationContextCancellation(evaluationCtx context.Context, err error) bool {
+	contextErr := evaluationCtx.Err()
+	return contextErr != nil && errors.Is(err, contextErr)
+}
+
+// recordEvaluationPingFailure keeps the provider-failure reason free of
+// cancellations caused by rebuildWindow replacing the evaluation epoch. The
+// caller still performs ordinary candidate cleanup on both branches.
+func (self *multiClientWindow) recordEvaluationPingFailure(
+	evaluationCtx context.Context,
+	args *multiClientChannelArgs,
+	err error,
+) bool {
+	if isEvaluationContextCancellation(evaluationCtx, err) {
+		return false
+	}
+	// unconditional (V0), was V(1): a ping-ack error is an
+	// evaluation-failure transition, and those were invisible in the field.
+	if ok, suppressed := self.pingFailThrottle.Allow(time.Now()); ok {
+		self.log.Infof("[multi]evaluation ping error [%s] = %s%s\n",
+			args.ClientId, err, suppressedSuffix(suppressed))
+	}
+	self.recordEvaluationFailure(windowFailureProvider, err)
+	return true
+}
+
 // recordChannelCreationFailure reports whether a failed candidate needs a
 // terminal provider event. A failure matching the construction context after
 // that context ended is caller-owned epoch rebuild or window retirement, not
@@ -11348,8 +11383,7 @@ func (self *multiClientWindow) recordChannelCreationFailure(
 	args *multiClientChannelArgs,
 	err error,
 ) bool {
-	contextErr := evaluationCtx.Err()
-	if contextErr != nil && errors.Is(err, contextErr) {
+	if isEvaluationContextCancellation(evaluationCtx, err) {
 		return false
 	}
 	// unconditional (V0): this transition was invisible in the field —

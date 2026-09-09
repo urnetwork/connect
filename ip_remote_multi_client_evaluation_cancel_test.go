@@ -3,6 +3,7 @@ package connect
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -245,5 +246,88 @@ func TestLiveEvaluationContextCancellationErrorsRemainProviderFailures(t *testin
 		}
 		requireChannelCreationState(t, window, generator, args, log, ctx, err, true, 1)
 		cancel()
+	}
+}
+
+// TestEvaluationEpochCancellationDoesNotBecomeProviderFailure reproduces the
+// outcome-rebuild ordering from the field: rebuildWindow cancels the exact
+// epoch that owns an in-flight ping, and its callback returns context.Canceled.
+// That local lifecycle result must not select providers-unresponsive, while
+// the independent zero-provider outcome remains terminal and visible.
+func TestEvaluationEpochCancellationDoesNotBecomeProviderFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	log := newRecordingLogger()
+	window := outcomeTestWindow(ctx, log)
+	args := &multiClientChannelArgs{
+		MultiClientGeneratorClientArgs: MultiClientGeneratorClientArgs{ClientId: NewId()},
+		Destination:                    RequireMultiHopId(NewId()),
+	}
+
+	evaluationCtx := window.evalEpochContext()
+	window.rebuildWindow(45 * time.Second)
+	if !errors.Is(evaluationCtx.Err(), context.Canceled) {
+		t.Fatalf("replaced evaluation epoch error=%v, want context canceled", evaluationCtx.Err())
+	}
+	if window.recordEvaluationPingFailure(evaluationCtx, args, context.Canceled) {
+		t.Fatal("rebuild-owned ping cancellation was recorded as provider failure")
+	}
+	if got := window.failures.counts(time.Now())[windowFailureProvider]; got != 0 {
+		t.Fatalf("provider failures=%d after rebuild-owned cancellation, want 0", got)
+	}
+	if lines := log.linesWith("[multi]evaluation ping error"); len(lines) != 0 {
+		t.Fatalf("rebuild-owned cancellation emitted provider diagnostics: %v", lines)
+	}
+
+	window.failOutcome(45 * time.Second)
+	if !window.monitor.WindowExpandEvent().Failed {
+		t.Fatal("zero-provider outcome was hidden with the cancellation diagnostic")
+	}
+	lines := log.linesWith("event=window_failed")
+	if len(lines) != 1 {
+		t.Fatalf("zero-provider outcome lines=%d, want 1", len(lines))
+	}
+	if !strings.Contains(lines[0], "reason=evaluating") || strings.Contains(lines[0], "reason=providers-unresponsive") {
+		t.Fatalf("terminal outcome inherited canceled-ping attribution: %q", lines[0])
+	}
+}
+
+// The cancellation text is not sufficient on its own. A live evaluation
+// context, or a nonmatching provider error observed after local cancellation,
+// remains genuine provider evidence.
+func TestEvaluationPingFailurePreservesLiveAndNonmatchingErrors(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		cancelCtx bool
+		err       error
+	}{
+		{name: "live identical cancellation", err: context.Canceled},
+		{name: "canceled epoch nonmatching provider error", cancelCtx: true, err: errors.New("provider ping refused")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			evaluationCtx, evaluationCancel := context.WithCancel(ctx)
+			defer evaluationCancel()
+			if test.cancelCtx {
+				evaluationCancel()
+			}
+			log := newRecordingLogger()
+			window := outcomeTestWindow(ctx, log)
+			args := &multiClientChannelArgs{
+				MultiClientGeneratorClientArgs: MultiClientGeneratorClientArgs{ClientId: NewId()},
+				Destination:                    RequireMultiHopId(NewId()),
+			}
+
+			if !window.recordEvaluationPingFailure(evaluationCtx, args, test.err) {
+				t.Fatal("genuine provider error was suppressed")
+			}
+			if got := window.failures.counts(time.Now())[windowFailureProvider]; got != 1 {
+				t.Fatalf("provider failures=%d, want 1", got)
+			}
+			if lines := log.linesWith("[multi]evaluation ping error"); len(lines) != 1 {
+				t.Fatalf("provider diagnostics=%d, want 1", len(lines))
+			}
+		})
 	}
 }
