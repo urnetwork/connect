@@ -369,6 +369,17 @@ type transferCarrierMultiRouteWriter interface {
 	) (bool, transferWriteDisposition, error)
 }
 
+// transferReliableOnlyMultiRouteWriter writes on the active carriers that are
+// not potentially unreliable. When none exist the write uses the ordinary
+// route set, so a sequence never loses a route it could otherwise use.
+type transferReliableOnlyMultiRouteWriter interface {
+	writeDetailedReliableOnly(
+		ctx context.Context,
+		transferFrameBytes []byte,
+		timeout time.Duration,
+	) (bool, transferWriteDisposition, error)
+}
+
 type transferCarrierRouteStateProvider interface {
 	transferRouteActive(route Route) bool
 }
@@ -1539,12 +1550,15 @@ type routeSnapshot struct {
 	// can share affinity without allocating on the write path.
 	affinityWriteRoutesByTransport map[TransportType][]Route
 	routeCarrierProperties         map[Route]TransferCarrierProperties
-	generation                     uint64
-	unreliableTransferPath         bool
-	unreliableFlightByteLimit      ByteCount
-	unreliableFlightMessageLimit   int
-	unreliableFlowIsolation        bool
-	unreliableFlowReserve          bool
+	// reliableRoutes is the subset of routes whose carrier is not potentially
+	// unreliable, in route order. Reliable-only writes use it when non-empty.
+	reliableRoutes               []Route
+	generation                   uint64
+	unreliableTransferPath       bool
+	unreliableFlightByteLimit    ByteCount
+	unreliableFlightMessageLimit int
+	unreliableFlowIsolation      bool
+	unreliableFlowReserve        bool
 	// h1Only is true only when every currently active writer route is an H1
 	// carrier. Transfer uses it to recover H1's larger WebSocket message
 	// envelope without making an H3 DATAGRAM candidate exceed one tunnel MTU.
@@ -1613,21 +1627,26 @@ type transferFlightPolicySnapshot struct {
 	flowIsolation bool
 	flowReserve   bool
 	h1Only        bool
-	notify        <-chan struct{}
+	// reliableRouteAvailable is true while at least one active carrier is not
+	// potentially unreliable. A full unreliable flight then writes the
+	// overflow reliable-only instead of gating the whole sequence.
+	reliableRouteAvailable bool
+	notify                 <-chan struct{}
 }
 
 // Reads the current carrier policy without taking the selector state lock.
 func (self *MultiRouteSelector) transferFlightPolicy() transferFlightPolicySnapshot {
 	snapshot := self.activeRoutesSnapshot.Load()
 	return transferFlightPolicySnapshot{
-		generation:    snapshot.generation,
-		limited:       snapshot.unreliableTransferPath,
-		byteLimit:     snapshot.unreliableFlightByteLimit,
-		messageLimit:  snapshot.unreliableFlightMessageLimit,
-		flowIsolation: snapshot.unreliableFlowIsolation,
-		flowReserve:   snapshot.unreliableFlowReserve,
-		h1Only:        snapshot.h1Only,
-		notify:        snapshot.notify,
+		generation:             snapshot.generation,
+		limited:                snapshot.unreliableTransferPath,
+		byteLimit:              snapshot.unreliableFlightByteLimit,
+		messageLimit:           snapshot.unreliableFlightMessageLimit,
+		flowIsolation:          snapshot.unreliableFlowIsolation,
+		flowReserve:            snapshot.unreliableFlowReserve,
+		h1Only:                 snapshot.h1Only,
+		reliableRouteAvailable: 0 < len(snapshot.reliableRoutes),
+		notify:                 snapshot.notify,
 	}
 }
 
@@ -1742,6 +1761,42 @@ func (self *routeSnapshot) writeRoutes() []Route {
 		return self.routes[:1]
 	}
 	return self.shuffled()
+}
+
+// writeRoutesReliableOnly excludes every potentially unreliable carrier. With
+// no reliable carrier active it degrades to the ordinary write set rather than
+// refusing the write.
+func (self *routeSnapshot) writeRoutesReliableOnly() []Route {
+	n := len(self.reliableRoutes)
+	if n == 0 {
+		return self.writeRoutes()
+	}
+	if self.preferDirectRoute != nil && !self.routeCarrierProperties[self.preferDirectRoute].Unreliable {
+		return []Route{self.preferDirectRoute}
+	}
+	if n == 1 {
+		return self.reliableRoutes
+	}
+	routes := make([]Route, n)
+	copy(routes, self.reliableRoutes)
+	if self.weight != nil {
+		WeightedShuffle(routes, self.weight)
+	} else {
+		mathrand.Shuffle(n, func(i int, j int) {
+			routes[i], routes[j] = routes[j], routes[i]
+		})
+	}
+	return routes
+}
+
+func (self *routeSnapshot) writeRoutesFor(
+	preferredTransportType TransportType,
+	reliableOnly bool,
+) []Route {
+	if reliableOnly {
+		return self.writeRoutesReliableOnly()
+	}
+	return self.writeRoutesForTransport(preferredTransportType)
 }
 
 // writeRoutesForTransport keeps a reply eligible for every active carrier of
@@ -1909,6 +1964,7 @@ func (self *MultiRouteSelector) updateActiveRoutesWithLock() {
 	activeRoutesByTransport := map[TransportType][]Route{}
 	routePriorities := map[Route]int{}
 	routeCarrierProperties := map[Route]TransferCarrierProperties{}
+	reliableRoutes := []Route{}
 	unreliableTransferPath := false
 	unreliableFlightByteLimit := ByteCount(0)
 	unreliableFlightMessageLimit := 0
@@ -1933,6 +1989,9 @@ func (self *MultiRouteSelector) updateActiveRoutesWithLock() {
 				)
 				routePriorities[route] = transport.Priority()
 				routeCarrierProperties[route] = self.transportProperties[transport]
+				if !self.transportProperties[transport].Unreliable {
+					reliableRoutes = append(reliableRoutes, route)
+				}
 				switch transportType {
 				case TransportTypeH1:
 					hasH1 = true
@@ -2073,6 +2132,7 @@ func (self *MultiRouteSelector) updateActiveRoutesWithLock() {
 		routeTransportTypes:            routeTransportTypes,
 		affinityWriteRoutesByTransport: affinityWriteRoutesByTransport,
 		routeCarrierProperties:         routeCarrierProperties,
+		reliableRoutes:                 reliableRoutes,
 		generation:                     self.nextRouteGeneration,
 		unreliableTransferPath:         unreliableTransferPath,
 		unreliableFlightByteLimit:      unreliableFlightByteLimit,
@@ -2644,6 +2704,36 @@ func (self *MultiRouteSelector) writeDetailedWithCarrierPreference(
 	timeout time.Duration,
 	preferredTransportType TransportType,
 ) (bool, transferWriteDisposition, error) {
+	return self.writeDetailedWithRoutePolicy(
+		ctx,
+		transferFrameBytes,
+		timeout,
+		preferredTransportType,
+		false,
+	)
+}
+
+func (self *MultiRouteSelector) writeDetailedReliableOnly(
+	ctx context.Context,
+	transferFrameBytes []byte,
+	timeout time.Duration,
+) (bool, transferWriteDisposition, error) {
+	return self.writeDetailedWithRoutePolicy(
+		ctx,
+		transferFrameBytes,
+		timeout,
+		TransportTypeUnknown,
+		true,
+	)
+}
+
+func (self *MultiRouteSelector) writeDetailedWithRoutePolicy(
+	ctx context.Context,
+	transferFrameBytes []byte,
+	timeout time.Duration,
+	preferredTransportType TransportType,
+	reliableOnly bool,
+) (bool, transferWriteDisposition, error) {
 	enterTime := time.Now()
 	preferredBlockedObserved := false
 
@@ -2651,7 +2741,7 @@ func (self *MultiRouteSelector) writeDetailedWithCarrierPreference(
 	// writer selector and writes its ordered stream serially; the mutex below is
 	// only needed when a write must retain and reuse the selector timer.
 	initialSnapshot := self.acquireWriterSnapshot()
-	initialRoutes := initialSnapshot.writeRoutesForTransport(preferredTransportType)
+	initialRoutes := initialSnapshot.writeRoutesFor(preferredTransportType, reliableOnly)
 	if self.log.V(2).Enabled() {
 		self.log.Infof("[mrw] %s->%s s(%s) routes = %d\n", self.clientTag, self.destination.DestinationId, self.destination.StreamId, len(initialRoutes))
 	}
@@ -2702,7 +2792,7 @@ func (self *MultiRouteSelector) writeDetailedWithCarrierPreference(
 		// on every packet
 		snapshot := self.acquireWriterSnapshot()
 		notify := snapshot.notify
-		activeRoutes := snapshot.writeRoutesForTransport(preferredTransportType)
+		activeRoutes := snapshot.writeRoutesFor(preferredTransportType, reliableOnly)
 
 		if self.log.V(2).Enabled() {
 			self.log.Infof("[mrw] %s->%s s(%s) routes = %d\n", self.clientTag, self.destination.DestinationId, self.destination.StreamId, len(activeRoutes))

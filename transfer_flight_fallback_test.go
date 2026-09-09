@@ -1,0 +1,161 @@
+package connect
+
+import (
+	"context"
+	"testing"
+	"time"
+)
+
+// A full unreliable flight must not stall a sequence that still has a
+// reliable carrier: the overflow is written reliable-only instead.
+
+func TestRouteSnapshotReliableOnlyWritesExcludeUnreliableCarrier(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	selector := NewMultiRouteSelector(ctx, "reliable-only", nil, TransferPath{}, true)
+	defer selector.Close()
+
+	h1Transport := NewSendGatewayTransportWithType(TransportTypeH1)
+	h1Route := make(Route, 16)
+	selector.updateTransportWithProperties(h1Transport, []Route{h1Route}, TransferCarrierProperties{})
+
+	if policy := selector.transferFlightPolicy(); !policy.reliableRouteAvailable {
+		t.Fatalf("H1-only policy = %+v, want reliable route available", policy)
+	}
+
+	p2pTransport := NewSendGatewayTransportWithType(TransportTypeP2p)
+	p2pRoute := make(Route, 16)
+	selector.updateTransportWithProperties(
+		p2pTransport,
+		[]Route{p2pRoute},
+		TransferCarrierProperties{Unreliable: true},
+	)
+
+	policy := selector.transferFlightPolicy()
+	if !policy.limited || !policy.reliableRouteAvailable {
+		t.Fatalf("mixed policy = %+v, want limited with a reliable route", policy)
+	}
+
+	// every reliable-only write lands on the reliable carrier even though the
+	// unreliable route has room and is the weighted first choice
+	for i := 0; i < 8; i++ {
+		success, disposition, err := selector.writeDetailedReliableOnly(ctx, []byte{byte(i)}, time.Second)
+		if err != nil || !success {
+			t.Fatalf("reliable-only write %d: success=%t err=%v", i, success, err)
+		}
+		if disposition.transportType != TransportTypeH1 || disposition.unreliable {
+			t.Fatalf("reliable-only write %d disposition = %+v, want H1 reliable", i, disposition)
+		}
+	}
+	if len(h1Route) != 8 || len(p2pRoute) != 0 {
+		t.Fatalf("routes after reliable-only writes: h1=%d p2p=%d, want 8/0", len(h1Route), len(p2pRoute))
+	}
+
+	// without any reliable carrier the reliable-only write falls back to the
+	// ordinary route set instead of failing
+	selector.updateTransport(h1Transport, nil)
+	if policy := selector.transferFlightPolicy(); policy.reliableRouteAvailable {
+		t.Fatalf("P2P-only policy = %+v, want no reliable route", policy)
+	}
+	success, disposition, err := selector.writeDetailedReliableOnly(ctx, []byte{9}, time.Second)
+	if err != nil || !success || disposition.transportType != TransportTypeP2p {
+		t.Fatalf("fallback write: success=%t disposition=%+v err=%v", success, disposition, err)
+	}
+	if len(p2pRoute) != 1 {
+		t.Fatalf("p2p route after fallback = %d, want 1", len(p2pRoute))
+	}
+}
+
+func TestSendSequenceFullUnreliableFlightWritesReliableOnlyInsteadOfStalling(t *testing.T) {
+	settings := DefaultSendBufferSettings()
+	settings.UnreliableInitialFlightByteCount = 512
+	settings.UnreliableMinimumFlightByteCount = 512
+	settings.UnreliableMaximumFlightByteCount = 512
+	sequence := testUnreliableRecoverySequence(settings)
+	sequence.client = &Client{}
+	sequence.flightController = newSendFlightController(settings)
+
+	withReliable := transferFlightPolicySnapshot{
+		generation:             1,
+		limited:                true,
+		reliableRouteAvailable: true,
+	}
+	sequence.flightController.applyPolicy(withReliable)
+
+	// an open flight never gates admission and never forces reliable-only writes
+	if sequence.unreliableFlightGates(withReliable) {
+		t.Fatal("open flight with a reliable route gated admission")
+	}
+	if sequence.reliableOnlyWrite(withReliable) {
+		t.Fatal("open flight forced reliable-only writes")
+	}
+
+	item := &sendItem{transferFrameBytes: make([]byte, 512)}
+	sequence.observeCarrierWrite(item, transferWriteDisposition{unreliable: true})
+	if sequence.flightController.canSend() {
+		t.Fatal("flight was not full after tracking the limit")
+	}
+
+	// a full flight with a reliable carrier: keep admitting packs, write them reliable-only
+	if sequence.unreliableFlightGates(withReliable) {
+		t.Fatal("full flight gated admission although a reliable route is available")
+	}
+	if !sequence.reliableOnlyWrite(withReliable) {
+		t.Fatal("full flight did not force reliable-only writes")
+	}
+
+	// a full flight with only unreliable carriers keeps the original gate
+	unreliableOnly := transferFlightPolicySnapshot{generation: 2, limited: true}
+	sequence.flightController.applyPolicy(unreliableOnly)
+	sequence.observeCarrierWrite(&sendItem{transferFrameBytes: make([]byte, 512)}, transferWriteDisposition{unreliable: true})
+	if !sequence.unreliableFlightGates(unreliableOnly) {
+		t.Fatal("full flight without a reliable route did not gate admission")
+	}
+	if sequence.reliableOnlyWrite(unreliableOnly) {
+		t.Fatal("reliable-only write requested without a reliable route")
+	}
+}
+
+func TestSendSequenceUnreliableResendTimeoutReleasesFlightWhenReliableRouteAvailable(t *testing.T) {
+	settings := DefaultSendBufferSettings()
+	settings.UnreliableInitialFlightByteCount = 1024
+	settings.UnreliableMinimumFlightByteCount = 1024
+	settings.UnreliableMaximumFlightByteCount = 1024
+	sequence := testUnreliableRecoverySequence(settings)
+	sequence.client = &Client{}
+	sequence.flightController = newSendFlightController(settings)
+
+	unreliableOnly := transferFlightPolicySnapshot{generation: 1, limited: true}
+	sequence.flightController.applyPolicy(unreliableOnly)
+	item := &sendItem{transferFrameBytes: make([]byte, 512)}
+	sequence.observeCarrierWrite(item, transferWriteDisposition{unreliable: true})
+	if sequence.flightController.byteCount != 512 {
+		t.Fatalf("tracked flight = %d, want 512", sequence.flightController.byteCount)
+	}
+
+	// no reliable carrier: the timeout halves admission but the item stays in flight
+	if sequence.observeUnreliableResendTimeout(item, unreliableOnly) {
+		t.Fatal("resend was marked reliable-only without a reliable route")
+	}
+	if sequence.flightController.byteCount != 512 || !item.unreliableFlightTracked {
+		t.Fatalf("flight after unreliable-only timeout = %d tracked=%t, want 512/true", sequence.flightController.byteCount, item.unreliableFlightTracked)
+	}
+	stats := sequence.client.SendRecoveryStats()
+	if stats.UnreliableFlightTimeoutCount != 1 {
+		t.Fatalf("timeout count = %d, want 1", stats.UnreliableFlightTimeoutCount)
+	}
+
+	// a reliable carrier takes the resend: release the flight so new packs are not stalled
+	withReliable := transferFlightPolicySnapshot{generation: 2, limited: true, reliableRouteAvailable: true}
+	sequence.flightController.applyPolicy(withReliable)
+	if !sequence.observeUnreliableResendTimeout(item, withReliable) {
+		t.Fatal("resend was not marked reliable-only with a reliable route")
+	}
+	if sequence.flightController.byteCount != 0 || item.unreliableFlightTracked {
+		t.Fatalf("flight after reliable-fallback timeout = %d tracked=%t, want 0/false", sequence.flightController.byteCount, item.unreliableFlightTracked)
+	}
+	if !sequence.flightController.canSend() {
+		t.Fatal("flight stayed closed after the timed-out item was released")
+	}
+}
