@@ -840,10 +840,10 @@ func bridgeTunBatch(ctx context.Context, dst *Tun, src *Tun) {
 // head-of-line-blocks the tun receive loop (e.g. holding a lock across a blocking
 // enqueue) collapses this number.
 func TestTunTCPThroughput(t *testing.T) {
-	// generous overall cap: the transfer is measured several times (below), and
-	// each run's stalls are independently bounded by per-chunk 55s deadlines.
-	// The cap only backstops a true hang; slow-but-progressing runs on a
-	// loaded -race host stay inside it.
+	// Generous overall cap: the transfer is measured several times (below), and
+	// each read/write phase is independently bounded by a 55s progress window.
+	// Every operation is also capped by this absolute deadline, so a loaded host
+	// may slow an attempt but cannot extend the complete test past the cap.
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 	defer cancel()
 
@@ -892,6 +892,10 @@ func TestTunTCPThroughput(t *testing.T) {
 	// throughputRuns independent attempts, so one slow or broken attempt is
 	// ridden out instead of failing the test early.
 	runTransfer := func() (mibs float64, runErr error) {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+
 		// a panic in the gvisor stack under load fails only this attempt.
 		defer func() {
 			if r := recover(); r != nil {
@@ -921,17 +925,15 @@ func TestTunTCPThroughput(t *testing.T) {
 				return
 			}
 			defer conn.Close()
-			// drain exactly totalBytes, so neither side needs a half-close.
-			// The deadline is refreshed per bounded step so it bounds a
-			// stall in the stack, not the whole transfer: under -race plus
-			// host load the full stream legitimately outlasts any single
-			// fixed deadline while still making progress.
+			// Drain exactly totalBytes, so neither side needs a half-close.
+			// Each bounded read gets a fresh progress window without exceeding
+			// the test's absolute deadline.
 			received := int64(0)
+			readBuffer := make([]byte, 1024*1024)
 			for received < totalBytes {
-				_ = conn.SetReadDeadline(time.Now().Add(55 * time.Second))
 				step := min(totalBytes-received, int64(1024*1024))
-				n, err := io.CopyN(io.Discard, conn, step)
-				received += n
+				n, err := readFullWithProgressDeadline(ctx, conn, readBuffer[:int(step)], 55*time.Second)
+				received += int64(n)
 				if err != nil {
 					recvErr <- err
 					return
@@ -955,14 +957,12 @@ func TestTunTCPThroughput(t *testing.T) {
 			if remaining := totalBytes - written; remaining < int64(len(chunk)) {
 				chunk = payload[:remaining]
 			}
-			// per-chunk deadline: bounds a stalled pipe without capping the
-			// whole transfer's wall clock (see the receiver note above)
-			_ = conn.SetWriteDeadline(time.Now().Add(55 * time.Second))
-			n, err := conn.Write(chunk)
-			if err != nil {
+			// Each chunk gets a progress window capped by the absolute test
+			// deadline; the helper checks cancellation before any socket write.
+			if err := writeConnPhaseWithDeadline(ctx, conn, chunk, 55*time.Second); err != nil {
 				return 0, fmt.Errorf("write through tun after %d bytes: %w", written, err)
 			}
-			written += int64(n)
+			written += int64(len(chunk))
 		}
 
 		select {
@@ -985,6 +985,9 @@ func TestTunTCPThroughput(t *testing.T) {
 	best := 0.0
 	failures := 0
 	for i := range throughputRuns {
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("throughput deadline before run %d/%d: %v", i+1, throughputRuns, err)
+		}
 		mibs, err := runTransfer()
 		if err != nil {
 			failures++

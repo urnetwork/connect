@@ -696,8 +696,7 @@ func TestIpEgressTcp4(t *testing.T) {
 					go HandleError(func() {
 						readErr <- func() error {
 							echoPayload := make([]byte, payloadSize)
-							conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-							if n, err := io.ReadFull(conn, echoPayload); err != nil {
+							if n, err := readFullWithProgressDeadline(ctx, conn, echoPayload, 10*time.Second); err != nil {
 								stats := tun.Stats()
 								return fmt.Errorf(
 									"read size=%d received=%d: %w (ip=%d/%d/%d malformed=%d tcp=%d/%d checksum=%d dropped=%d tx_no_buffer=%d)",
@@ -722,8 +721,7 @@ func TestIpEgressTcp4(t *testing.T) {
 						}()
 					})
 
-					conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-					if _, err := conn.Write(payload); err != nil {
+					if err := writeConnPhaseWithDeadline(ctx, conn, payload, 10*time.Second); err != nil {
 						return fmt.Errorf("write size=%d: %w", payloadSize, err)
 					}
 					if err := <-readErr; err != nil {
