@@ -225,6 +225,12 @@ paths:
         - phone number
         - Apple JWT
         - Google JWT
+        - a wallet (`wallet_auth`): a Solana or Bittensor signature over the
+          single-use challenge from /auth/wallet-challenge. A bound wallet
+          returns `network.by_jwt`; an unbound wallet echoes `wallet_auth`
+          and the client continues to /auth/network-create with a fresh
+          challenge.
+        - a seedphrase
       operationId: Auth Login
       security: []
       requestBody:
@@ -239,6 +245,37 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AuthLoginResult"
+
+  /auth/wallet-challenge:
+    post:
+      description: |
+        Issue a single-use wallet sign-in challenge. The wallet signs the
+        returned `message_template` byte for byte; the signature is then
+        submitted as `wallet_auth` to /auth/login, /auth/network-create or
+        /auth/add-auth, each of which consumes one challenge. The message is
+        exactly three LF-separated lines: `Sign in to URnetwork`,
+        `Challenge: <challenge>` and `Timestamp: <unix seconds>`; the server
+        rejects any other text (`400 invalid message format`), a challenge
+        that is unknown, expired (5 minutes), already used, issued for another
+        blockchain or address, or whose timestamp differs from the issued one.
+        Bittensor (TAO) wallets sign with sr25519 in the `substrate` context;
+        both the raw text and the polkadot-js `<Bytes>…</Bytes>`-wrapped form
+        of the signature verify, and the unwrapped text is what the client
+        submits. Rate limited per client address. See server/BITTENSOR-LOGIN.md.
+      operationId: Auth Wallet Challenge
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuthWalletChallengeArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthWalletChallengeResult"
 
   /auth/login-with-password:
     post:
@@ -613,7 +650,10 @@ paths:
     post:
       description: |
         Add an authentication method (email/phone + password, SSO, or wallet)
-        to the calling user. Subject to the account action rate limit.
+        to the calling user. A wallet (`wallet_auth`, Solana or Bittensor)
+        must sign the single-use challenge from /auth/wallet-challenge, the
+        same proof as wallet login; one wallet address binds to one user.
+        Subject to the account action rate limit.
       operationId: Auth Add Auth
       security:
         - BearerAuth: []
@@ -2725,13 +2765,19 @@ components:
           description: email or phone number
           type: string
         auth_allowed:
+          description: The sign-in methods on file for this user authority
           type: array
           items:
             type: string
             enum:
               - password
+              - email
+              - phone
               - apple
               - google
+              - solana
+              - bittensor
+              - seedphrase
         error:
           type: object
           properties:
@@ -4513,7 +4559,16 @@ components:
       type: object
       properties:
         auth_type:
+          description: The sign-in method to remove; the last remaining method cannot be removed
           type: string
+          enum:
+            - email
+            - phone
+            - apple
+            - google
+            - solana
+            - bittensor
+            - seedphrase
     RemoveAuthResult:
       type: object
       properties:
@@ -4559,21 +4614,58 @@ components:
           properties:
             message:
               type: string
+    AuthWalletChallengeArgs:
+      type: object
+      properties:
+        blockchain:
+          description: solana (default) or tao/bittensor; case-insensitive
+          type: string
+          enum:
+            - solana
+            - tao
+            - bittensor
+        wallet_address:
+          description: Optional. Solana base58 public key or Bittensor ss58 address; when given, the challenge is bound to it.
+          type: string
+    AuthWalletChallengeResult:
+      type: object
+      properties:
+        challenge:
+          description: 32 random bytes, base64url; embedded in message_template
+          type: string
+        timestamp:
+          description: unix seconds the challenge was issued; embedded in message_template
+          type: integer
+        expires_in:
+          description: seconds until the challenge expires (300)
+          type: integer
+        message_template:
+          description: "The exact text to sign: `Sign in to URnetwork\nChallenge: <challenge>\nTimestamp: <timestamp>`"
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
     WalletAuthArgs:
       type: object
       properties:
         wallet_address:
-          description: The user's wallet address
+          description: Solana base58 public key, or Bittensor ss58 address (prefix 42, checksum verified)
           type: string
         wallet_message:
-          description: The signed message
+          description: The message_template issued by /auth/wallet-challenge, unmodified (no `<Bytes>` wrapper, LF line endings)
           type: string
         wallet_signature:
+          description: "Solana: base64 ed25519 signature over the message. Bittensor: hex of the 64-byte sr25519 signature (with or without 0x) made in the `substrate` signing context, over the raw or `<Bytes>`-wrapped message"
           type: string
         blockchain:
+          description: solana (default) or tao/bittensor; case-insensitive
           type: string
           enum:
             - solana
+            - tao
+            - bittensor
 
     AccountPoint:
       type: object
