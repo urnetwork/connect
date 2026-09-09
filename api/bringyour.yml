@@ -1245,10 +1245,32 @@ paths:
   /subscription/balance:
     get:
       description: |
-        Get the current subscription status and transfer balance.
+        Get the current subscription status and transfer balance. This is also
+        the PLAN response of the onboarding program: it carries the caller's
+        regional `price_tier`, the welcome `onboarding_offer` (null when none
+        was issued) and the `experiments` assignments per surface.
+
+        Regional pricing rule (mmm/onboarding/PLAN.md): the tier is resolved,
+        in order, from `storefront_country` (the store's storefront country,
+        sent by the Apple and Google apps), the Stripe customer's billing
+        country when a customer exists, else the client IP as a DISPLAY
+        ESTIMATE (`price_tier.estimate: true`). The store charges its own
+        storefront's price; the Stripe tier actually charged is finalized from
+        the card's billing country once the payment method is attached, before
+        the trial ends. The regional price is tied to the storefront/billing
+        country, never to a VPN exit.
       operationId: Subscription Balance
       security:
         - BearerAuth: []
+      parameters:
+        - name: storefront_country
+          in: query
+          required: false
+          description: |
+            ISO 3166-1 alpha-2 (or alpha-3) storefront country of the app's
+            store (StoreKit `Storefront.countryCode`, Play billing region).
+          schema:
+            type: string
       responses:
         "200":
           content:
@@ -2577,6 +2599,221 @@ paths:
               schema:
                 $ref: "#/components/schemas/SnEpochResult"
 
+  # ----- onboarding program (mmm/onboarding/PLAN.md) -----
+
+  /onboarding/offer/issue:
+    post:
+      description: |
+        Issue the caller's welcome offer: 25% off the first year of Pro (3
+        months free), valid `validity_days` (5) from issue, stacked on the
+        14-day trial, redeemable on every store. Issued ONCE per network:
+        the call is idempotent and returns the existing offer in whatever
+        state it is in (`created: false`); an expired offer is never
+        re-issued. Call it the moment the offer surface renders (the intro
+        plan step), so the deadline is real.
+
+        Refused with `error` when the onboarding config is absent, or when
+        the caller is in the `holdout` variant of the in-app offer
+        experiment (`experiments["offer.in_app"]`): those networks show the
+        regular plan picker and reach the offer by email instead.
+
+        Budgeted per caller address (30 per 10 minutes): over budget the
+        response is 429 with a Retry-After header.
+      operationId: Onboarding Offer Issue
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OnboardingOfferIssueArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OnboardingOfferIssueResult"
+        "429":
+          description: Too many requests from this address; retry after the Retry-After seconds.
+
+  /client/events:
+    post:
+      description: |
+        Store a batch of product events (at most 200 per call) against the
+        CLOSED event schema (see ClientEvent). The network id comes from the
+        bearer token only; `country_tier`, path, experiment and variant are
+        stamped by the server. Unknown event names, unknown prop keys,
+        missing required props and ill-typed values are refused PER EVENT in
+        `rejected` (the rest of the batch is stored); a rejection is final,
+        the client must not resend that event. No free text is stored except
+        `feedback.submitted.text`, which is redacted (emails, phone numbers,
+        IP addresses) before storage.
+
+        Clients batch every 30 s or on background, drop an event after three
+        failed calls, and never send more than 200 per call (a larger batch
+        is a 400). Budgeted per caller address (120 calls per 10 minutes):
+        over budget the response is 429 with a Retry-After header.
+      operationId: Client Events Send
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClientEventsSendArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClientEventsSendResult"
+        "400":
+          description: More than 200 events in the batch, or a malformed body.
+        "429":
+          description: Too many event calls from this address; retry after the Retry-After seconds.
+
+  /onboarding/click:
+    post:
+      description: |
+        Record a campaign landing-page click. Every onboarding email link is
+        `https://ur.io/o/<step>?t=<token>`; the landing page posts the token
+        here, which writes the server-side `landing.clicked` attribution
+        event and answers with the in-app destination to route to
+        (`onboarding/connect`, `onboarding/widgets`, `onboarding/offer`,
+        `onboarding/feedback`). An app open (`/network/auth-client`) within
+        48 h of the click is attributed to it as `app.opened`.
+
+        No authentication: the signed token is the credential, and the
+        response carries nothing about the network. An expired token still
+        returns `step` and `destination` (with `ok: false`,
+        `error: expired`) so the page can route without attributing; an
+        invalid token returns `ok: false`, `error: invalid`. Budgeted per
+        caller address (60 per 10 minutes) -> 429 with Retry-After.
+      operationId: Onboarding Click
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OnboardingClickArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OnboardingClickResult"
+        "429":
+          description: Too many requests from this address; retry after the Retry-After seconds.
+
+  /onboarding/feedback/{token}:
+    get:
+      description: |
+        Resolve a feedback link token (`https://ur.io/f/<token>?r=n` or
+        `?why=n`) to the rating or reason the one-tap email button stood
+        for, so the in-app feedback screen opens pre-filled. The token
+        carries the step and may carry the rating/reason; `r` (1-5) and
+        `why` (a reason token) override when present. The app then submits
+        the actual feedback through `/feedback/send-feedback` and reports
+        `feedback.submitted` through `/client/events`.
+
+        No authentication: the signed token is the credential. Budgeted per
+        caller address (60 per 10 minutes) -> 429 with Retry-After.
+      operationId: Onboarding Feedback Token
+      security: []
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: r
+          in: query
+          required: false
+          description: rating 1-5 from the tapped button
+          schema:
+            type: integer
+        - name: why
+          in: query
+          required: false
+          description: reason token from the tapped button
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OnboardingFeedbackTokenResult"
+        "429":
+          description: Too many requests from this address; retry after the Retry-After seconds.
+
+  /subscription/stripe/payment-sheet:
+    post:
+      description: |
+        Prepare an inline Stripe PaymentSheet purchase of Pro (the non-Play
+        Android flavors, Windows and Linux; never the play flavor or
+        iOS/macOS). The server creates or reuses the Stripe customer
+        (metadata `network_id`) and the subscription at the caller's
+        regional tier price: the yearly plan with the 14-day trial and, when
+        the caller's welcome offer is redeemable, the 25% coupon applied
+        server-side; the monthly plan without a trial. The sheet confirms
+        the returned intent: a SetupIntent for the yearly plan
+        (`intent_type: setup`, `setup_intent_client_secret`) or the first
+        invoice's PaymentIntent for the monthly plan (`intent_type: payment`,
+        `payment_intent_client_secret`). Configure the sheet with
+        `customer_id`, `ephemeral_key_secret` and `publishable_key`; pass the
+        Stripe API version the mobile SDK requires as `stripe_version`.
+
+        The trial is credited only once the card is attached
+        (`setup_intent.succeeded`); an abandoned sheet leaves nothing behind.
+        The charged tier is finalized from the card's billing country before
+        the trial ends and the tier is recorded on the subscription.
+        Calling again replaces a pending, unfinished sheet.
+      operationId: Stripe Payment Sheet
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StripePaymentSheetArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StripePaymentSheetResult"
+        "429":
+          description: Too many requests from this address; retry after the Retry-After seconds.
+
+  /subscription/stripe/prices:
+    get:
+      description: |
+        The Stripe price ids (and USD amounts) of the caller's regional tier,
+        the publishable key, and the welcome-offer coupon id when the
+        caller's offer is redeemable -- for clients that build their own
+        Stripe flow (the Windows/Linux Payment Element).
+      operationId: Stripe Prices
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: storefront_country
+          in: query
+          required: false
+          description: ISO 3166-1 alpha-2 storefront country, when the app knows it.
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StripePricesResult"
+
 components:
   securitySchemes:
     BearerAuth:
@@ -2946,6 +3183,15 @@ components:
         balance_code:
           type: string
           description: Optional balance code to add transfer balance to the new network.
+        product_updates:
+          type: boolean
+          description: |
+            The sign-up form's "Periodic product updates" line. Absent = true
+            (the line ships ticked). false turns the product-updates
+            preference off from the first moment: no onboarding campaign mail
+            is ever sent. Honored on every create path, including sign-ups
+            that complete through /auth/verify. The server records a
+            `signup.optout_changed` event with the value.
 
     NetworkCreateResult:
       type: object
@@ -3821,6 +4067,395 @@ components:
           type: integer
         update_time:
           type: string
+        price_tier:
+          $ref: "#/components/schemas/PriceTier"
+        onboarding_offer:
+          description: The caller's welcome offer; null when none was issued.
+          oneOf:
+            - $ref: "#/components/schemas/OnboardingOffer"
+            - type: "null"
+        experiments:
+          type: object
+          description: |
+            The caller's variant per experiment surface, keyed by surface
+            (`offer.in_app`, `email.sequence`, `offer.intro_step`,
+            `offer.final_screen`, `offer.email`, `offer.account`,
+            `email.<step>`, `cadence`). Only running experiments appear. A
+            network keeps its variant for the life of an experiment
+            (hash(network_id, experiment_id), server-side). The variant
+            `holdout` on `offer.in_app` means: show the regular plan picker,
+            no offer screen, do not issue the offer in-app. Stamp the
+            surface's experiment_id/variant on `offer.screen.shown`.
+          additionalProperties:
+            $ref: "#/components/schemas/ExperimentAssignment"
+
+    PriceTier:
+      type: object
+      description: |
+        A regional price tier of Pro (config/all/pro.yml pro.price_tiers):
+        `standard` ($40/year, $5/month) for the developed-country list,
+        `regional` ($4/year, $0.50/month) everywhere else. Prices are USD;
+        the store or Stripe shows the local-currency figure. The 14-day
+        trial and the welcome offer apply on every tier.
+      properties:
+        name:
+          type: string
+          enum:
+            - standard
+            - regional
+        yearly_usd:
+          type: number
+        monthly_usd:
+          type: number
+        currency:
+          type: string
+          description: always USD
+        source:
+          type: string
+          description: how the country was resolved
+          enum:
+            - storefront
+            - billing
+            - ip
+            - default
+        estimate:
+          type: boolean
+          description: true when the tier is a display estimate (ip or default)
+
+    OnboardingOffer:
+      type: object
+      description: |
+        The welcome offer: `percent_off` (25) off the first year of Pro,
+        `months_free` (3) in the store copy, valid until `expires_at`.
+        `first_year_usd` / `regular_year_usd` are for the caller's current
+        tier ($30 / $40 standard, $3 / $4 regional; the store products show
+        $29.99 / $39.99). Redemption handles per store: the App Store offer
+        code (`apple_offer_code`, one-time from the batch or the custom
+        code), the Play offer tag (`play_offer_tag`, on the yearly base
+        plan's discounted first-cycle offer) and the Stripe coupon
+        (`stripe_coupon_id`, applied server-side by the checkout and the
+        payment sheet); Solana quotes the offer price for plan
+        `yearly_onboarding`. Every purchase path stamps `redeemed_at` and
+        `store` on the first redemption.
+      properties:
+        issued_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        percent_off:
+          type: integer
+        months_free:
+          type: integer
+        first_year_usd:
+          type: number
+        regular_year_usd:
+          type: number
+        tier:
+          type: string
+        currency:
+          type: string
+        state:
+          type: string
+          enum:
+            - active
+            - redeemed
+            - expired
+        apple_offer_code:
+          type: string
+        play_offer_tag:
+          type: string
+        stripe_coupon_id:
+          type: string
+        redeemed_at:
+          type: string
+          format: date-time
+        store:
+          type: string
+          enum:
+            - apple
+            - play
+            - stripe
+            - solana
+
+    ExperimentAssignment:
+      type: object
+      properties:
+        experiment_id:
+          type: string
+        variant:
+          type: string
+          description: a registry variant name; `holdout` means show nothing
+
+    OnboardingOfferIssueArgs:
+      type: object
+      properties:
+        surface:
+          type: string
+          description: where the offer is shown (default intro_step)
+          enum:
+            - intro_step
+            - final_screen
+            - account
+        storefront_country:
+          type: string
+          description: ISO 3166-1 storefront country, when the app knows it
+
+    OnboardingOfferIssueResult:
+      type: object
+      properties:
+        offer:
+          $ref: "#/components/schemas/OnboardingOffer"
+        created:
+          type: boolean
+          description: true for the call that issued the offer
+        error:
+          type: object
+          nullable: true
+          properties:
+            message:
+              type: string
+
+    ClientEvent:
+      type: object
+      description: |
+        One product event. The schema is CLOSED: `name` must be one of the
+        listed values and `props` may carry ONLY that name's keys (types in
+        parentheses; enums listed):
+
+        - onboarding.step.shown | onboarding.step.completed |
+          onboarding.step.skipped: step (token, required), index (int),
+          elapsed_ms (int)
+        - offer.screen.shown: surface (intro_step | final_screen |
+          email_link | account, required), experiment (token), variant
+          (token), tier (standard | regional), price_shown (number),
+          currency (3-letter), expires_in_s (int)
+        - offer.card.tapped: plan (yearly | monthly, required)
+        - offer.cta.tapped: plan (yearly | monthly, required), store (apple |
+          play | stripe | solana, required)
+        - offer.declined: control (free_plan_link | back | system_dismiss,
+          required), elapsed_ms (int)
+        - purchase.started | purchase.completed | purchase.cancelled |
+          purchase.failed: store (apple | play | stripe | solana, required),
+          product (token), plan (yearly | monthly), trial (bool), price
+          (number), currency (3-letter), error_class (token)
+        - connect.first: no props (once per network; resends are deduplicated)
+        - widget.added: kind (token, required)
+        - feedback.submitted: rating (int 1-5), reason (token), has_text
+          (bool), text (free text, at most 2000 characters, redacted)
+        - signup.optout_changed: product_updates (bool, required)
+
+        A token is [A-Za-z0-9_.:+-], at most 64 characters. Server-written
+        names (landing.clicked, app.opened, email.*, trial.*, refund,
+        retention.*) are refused from clients.
+      properties:
+        name:
+          type: string
+          enum:
+            - onboarding.step.shown
+            - onboarding.step.completed
+            - onboarding.step.skipped
+            - offer.screen.shown
+            - offer.card.tapped
+            - offer.cta.tapped
+            - offer.declined
+            - purchase.started
+            - purchase.completed
+            - purchase.cancelled
+            - purchase.failed
+            - connect.first
+            - widget.added
+            - feedback.submitted
+            - signup.optout_changed
+        at:
+          type: string
+          format: date-time
+          description: the client's event time (RFC 3339); missing = now; clamped to [now - 30 d, now]
+        platform:
+          type: string
+          enum:
+            - ios
+            - macos
+            - android
+            - web
+            - windows
+            - linux
+        app_version:
+          type: string
+          description: token, at most 64 characters
+        locale:
+          type: string
+          description: token, at most 32 characters (e.g. pt-BR)
+        session:
+          type: string
+          description: an opaque per-app-session token, at most 64 characters
+        props:
+          type: object
+          description: the name's closed prop set (see above)
+          additionalProperties: true
+
+    ClientEventsSendArgs:
+      type: object
+      properties:
+        events:
+          type: array
+          maxItems: 200
+          items:
+            $ref: "#/components/schemas/ClientEvent"
+
+    ClientEventsSendResult:
+      type: object
+      properties:
+        accepted:
+          type: integer
+          description: events stored (or deduplicated)
+        rejected:
+          type: array
+          description: schema refusals by batch index; final, do not resend
+          items:
+            type: object
+            properties:
+              index:
+                type: integer
+              message:
+                type: string
+
+    OnboardingClickArgs:
+      type: object
+      properties:
+        token:
+          type: string
+
+    OnboardingClickResult:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        step:
+          type: string
+          description: the campaign step the link belongs to (e.g. e1_connect)
+        destination:
+          type: string
+          description: the in-app destination to route to
+          enum:
+            - onboarding/connect
+            - onboarding/widgets
+            - onboarding/offer
+            - onboarding/feedback
+        error:
+          type: string
+          enum:
+            - invalid
+            - expired
+
+    OnboardingFeedbackTokenResult:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        step:
+          type: string
+        rating:
+          type: integer
+          description: 1-5, 0 when the link carried none
+        reason:
+          type: string
+        error:
+          type: string
+          enum:
+            - invalid
+            - expired
+
+    StripePaymentSheetArgs:
+      type: object
+      properties:
+        plan:
+          type: string
+          enum:
+            - yearly
+            - monthly
+        storefront_country:
+          type: string
+        stripe_version:
+          type: string
+          description: the Stripe API version the mobile SDK requires for its ephemeral key
+
+    StripePaymentSheetResult:
+      type: object
+      properties:
+        customer_id:
+          type: string
+        ephemeral_key_secret:
+          type: string
+        setup_intent_client_secret:
+          type: string
+          description: set for intent_type setup (the yearly plan with its trial)
+        payment_intent_client_secret:
+          type: string
+          description: set for intent_type payment (the monthly plan, no trial)
+        intent_type:
+          type: string
+          enum:
+            - setup
+            - payment
+        subscription_id:
+          type: string
+        publishable_key:
+          type: string
+        tier:
+          type: string
+        currency:
+          type: string
+        plan:
+          type: string
+        amount_first_period_usd:
+          type: number
+          description: the first period's price, with the welcome offer applied when eligible
+        regular_period_usd:
+          type: number
+        trial_days:
+          type: integer
+        trial_end_at:
+          type: string
+          format: date-time
+        offer_applied:
+          type: boolean
+        error:
+          type: object
+          nullable: true
+          properties:
+            message:
+              type: string
+
+    StripePricesResult:
+      type: object
+      properties:
+        tier:
+          type: string
+        currency:
+          type: string
+        yearly_price_id:
+          type: string
+        monthly_price_id:
+          type: string
+        yearly_usd:
+          type: number
+        monthly_usd:
+          type: number
+        publishable_key:
+          type: string
+        onboarding_coupon_id:
+          type: string
+          description: the welcome-offer coupon, when the caller's offer is redeemable (yearly only)
+        offer_eligible:
+          type: boolean
+        error:
+          type: object
+          nullable: true
+          properties:
+            message:
+              type: string
 
     StatsProvidersArgs:
       type: object
@@ -5200,10 +5835,38 @@ components:
         reference:
           description: A unique reference string to identify the payment intent added to the Solana transaction
           type: string
+        plan:
+          type: string
+          description: |
+            The plan. The PRICE is quoted by the server from the caller's
+            regional tier. `yearly_onboarding` is the welcome offer (the
+            tier's yearly price less 25%, crediting a year plus the 14-day
+            trial) and is refused unless the caller's offer is redeemable.
+          enum:
+            - yearly
+            - monthly
+            - yearly_onboarding
+        storefront_country:
+          type: string
+          description: ISO 3166-1 storefront country, when the app knows it (Solana keeps the estimate otherwise)
 
     SolanaPaymentIntentResult:
       type: object
       properties:
+        amount_usd:
+          type: number
+          description: the price the server quoted; the client must pay exactly this
+        tier:
+          type: string
+        plan:
+          type: string
+        regular_amount_usd:
+          type: number
+          description: the plan's regular price (the full-year price for yearly_onboarding)
+        offer_applied:
+          type: boolean
+        currency:
+          type: string
         error:
           type: object
           nullable: true
@@ -6180,6 +6843,14 @@ components:
       properties:
         item_id:
           type: string
+        storefront_country:
+          type: string
+          description: |
+            ISO 3166-1 storefront country, when the caller knows it. The Pro
+            items are priced at the caller's regional tier and, when the
+            welcome offer is redeemable (yearly only), the 25% coupon is
+            applied server-side; the charged tier is finalized from the
+            card's billing country once attached.
         ui_mode:
           type: string
           description: |
