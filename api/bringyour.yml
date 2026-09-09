@@ -3065,15 +3065,47 @@ paths:
       tags: [analytics]
       summary: Aggregated onboarding experiment results
       description: |
-        PLANNED, not yet deployed: the nightly aggregate the analysis script
-        (mmm/onboarding/analyze.mjs) reads. One row per cohort day,
-        experiment, variant, surface, platform, tier and path with the
-        exposures, every funnel count and the fixed-window outcomes. Rows
-        under the minimum-volume gate (the analytics privacy config) are
-        suppressed, and no per-network data is ever returned. Requires an
-        admin bearer token; ordinary network tokens are 403.
+        The nightly aggregate the analysis script (mmm/onboarding/analyze.mjs)
+        reads: `onboarding_results_daily`, recomputed at 02:00 UTC by the
+        `OnboardingResultsRollup` task for the last `onboarding.results.rollup_days`
+        cohort days (config/main/onboarding.yml). One row per cohort day
+        (the network's sign-up day, UTC), experiment, variant, surface,
+        platform, price tier and path. Counts are networks, never events.
+
+        Exposure is the registry assignment (hash of network id and
+        experiment id), so holdout rows exist without any stamped event; for
+        the email sequence it is the variant the campaign row was served, and
+        only networks with an email address are exposed to an email
+        experiment. The pseudo-experiment `_all` (variant `all`, surface
+        `all`) counts every network of the cohort so the funnel per platform,
+        tier and path is readable without an experiment.
+
+        Column definitions, measured from each network's cohort time:
+        `sent`, `delivered`, `opened`, `clicked`, `unsubscribe`, `complaint` =
+        at least one `email.*` event of that name, any step;
+        `landing_clicked` = a `landing.clicked`; `app_open_48h` = an
+        `app.opened` (the auth-client attribution within 48 h of a landing
+        click); `connect_7d` = a connection day or `connect.first` within 7
+        days; `widget_7d` = `widget.added` within 7 days; `feedback_7d` =
+        `feedback.submitted` or an account feedback within 7 days;
+        `pro_start_14d` = a `purchase.completed` or the first subscription
+        renewal (trial included) within 14 days; `trial_to_paid_35d` =
+        `trial.converted` within 35 days; `refund_60d` = a `refund` within
+        60 days; `retention_d7` = a connection on day 6 or 7;
+        `retention_d30` = a connection on day 28, 29 or 30. A window that has
+        not matured reports 0: read `matured_days` (the cohort's age at
+        `computed_at`) to tell "not yet" from "did not".
+
+        Volume floor: rows with fewer than `onboarding.results.min_exposures`
+        exposures (default 10) are suppressed, and no identifier of any kind
+        is returned. Ordered by the dimension tuple; keyset paged by
+        `cursor`.
+
+        Auth: `Authorization: Bearer <token>` where the token is listed in
+        vault `onboarding.yml` under `onboarding.admin_bearers` (compared in
+        constant time). A missing or unknown token is 401; a network JWT is
+        403. Without the vault entry the endpoint is closed.
       operationId: adminOnboardingResults
-      x-status: planned
       security:
         - BearerAuth: []
       parameters:
@@ -3125,6 +3157,12 @@ paths:
           description: The `next_cursor` of the previous page.
           schema:
             type: string
+        - name: limit
+          in: query
+          required: false
+          description: Rows per page, 1-1000 (default 500).
+          schema:
+            type: integer
       responses:
         "200":
           description: A page of aggregated rows.
@@ -3160,24 +3198,33 @@ paths:
                         retention_d30: 22
                         unsubscribe: 1
                         complaint: 0
+                        matured_days: 61
+                        computed_at: "2026-11-16T02:00:12Z"
                     next_cursor: null
+                    min_exposures: 10
+        "400":
+          description: Missing experiment, a date not YYYY-MM-DD, `to` before `from`, or an invalid cursor.
         "401":
           description: Missing or invalid bearer token.
         "403":
-          description: The token is not an admin token.
+          description: The token is a network token, not an admin bearer.
 
   /admin/onboarding/experiments:
     get:
       tags: [analytics]
       summary: The experiment registry as loaded
       description: |
-        PLANNED, not yet deployed: the onboarding experiment registry
-        (config/main/onboarding.yml `onboarding.experiments`) as the server
-        loaded it, so the analysis script judges results against the same
-        allocation, primary metric, guardrails and minimum exposures the
-        server applied. Requires an admin bearer token.
+        The onboarding experiment registry (config/main/onboarding.yml
+        `onboarding.experiments`) as the server loaded it, so the analysis
+        script judges results against the same allocation, primary metric,
+        guardrails and minimum exposures the server applied, plus each
+        experiment's live variant states from the pause overlay
+        (`network_onboarding_experiment_state`: a variant the nightly
+        guardrail check or `bringyourctl onboarding experiments --pause`
+        paused is served as `control` until resumed) and the results
+        configuration (`min_exposures`, `rollup_days`, `guardrail_days`).
+        Same auth as /admin/onboarding/results.
       operationId: adminOnboardingExperiments
-      x-status: planned
       security:
         - BearerAuth: []
       responses:
@@ -5302,9 +5349,10 @@ components:
     OnboardingResultsRow:
       type: object
       description: |
-        One aggregated row of the onboarding results (PLANNED, S3). Counts
-        are networks, not events; the fixed-window outcomes are measured
-        from each network's cohort day.
+        One aggregated row of the onboarding results. Counts are networks,
+        not events; the fixed-window outcomes are measured from each
+        network's cohort time (see GET /admin/onboarding/results for every
+        column's definition).
       properties:
         cohort_day:
           type: string
@@ -5316,12 +5364,14 @@ components:
         surface:
           type: string
         platform:
-          $ref: "#/components/schemas/EventPlatform"
+          type: string
+          description: An EventPlatform, or `unknown` when the sign-up did not say.
         tier:
-          $ref: "#/components/schemas/PriceTierName"
+          type: string
+          description: A PriceTierName, or `unknown` when the sign-up country is unknown.
         path:
           type: string
-          enum: [A, B]
+          description: The campaign path A or B, or `unknown`.
         exposures:
           type: integer
         sent:
@@ -5356,6 +5406,12 @@ components:
           type: integer
         complaint:
           type: integer
+        matured_days:
+          type: integer
+          description: The cohort's age in whole days at `computed_at`; a window longer than this has not been measured yet.
+        computed_at:
+          type: string
+          format: date-time
 
     OnboardingResultsPage:
       type: object
@@ -5367,6 +5423,9 @@ components:
         next_cursor:
           description: The cursor for the next page; null on the last page.
           type: [string, "null"]
+        min_exposures:
+          type: integer
+          description: The volume floor applied to this page.
 
     OnboardingExperiment:
       type: object
@@ -5390,7 +5449,7 @@ components:
           type: object
           description: percent per variant name, by hash(network_id, id)
           additionalProperties:
-            type: integer
+            type: number
         variants:
           type: object
           description: per variant, the Brevo template name or the store copy key set and layout id
@@ -5408,6 +5467,31 @@ components:
             type: number
         min_exposures:
           type: integer
+        active:
+          type: boolean
+          description: Whether the experiment assigns right now (status running, within start/stop).
+        variant_states:
+          type: array
+          description: The pause overlay rows of this experiment (empty when nothing was ever paused).
+          items:
+            $ref: "#/components/schemas/OnboardingExperimentVariantState"
+
+    OnboardingExperimentVariantState:
+      type: object
+      properties:
+        experiment_id:
+          type: string
+        variant:
+          type: string
+        status:
+          type: string
+          enum: [paused, running]
+          description: paused = served as control; running = resumed.
+        reason:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
 
     OnboardingExperimentsResult:
       type: object
@@ -5416,6 +5500,16 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/OnboardingExperiment"
+        results:
+          type: object
+          description: The results configuration the rollup and the results endpoint apply.
+          properties:
+            min_exposures:
+              type: integer
+            rollup_days:
+              type: integer
+            guardrail_days:
+              type: integer
 
     BrevoWebhookArgs:
       type: object
