@@ -45,6 +45,20 @@ servers:
 security:
   - BearerAuth: []
 
+tags:
+  - name: onboarding
+    description: |
+      The new-user onboarding program (mmm/onboarding/PLAN.md): the welcome
+      offer, the campaign landing and feedback links, and the sign-up
+      preferences the campaign honors.
+  - name: analytics
+    description: |
+      Product events and experiment results behind the onboarding
+      optimization loop: the closed client event schema, the experiment
+      registry and the aggregated results the analysis script reads.
+  - name: subscription
+    description: Pro subscriptions, prices and the store purchase paths.
+
 paths:
   /clock:
     get:
@@ -413,10 +427,12 @@ paths:
 
   /auth/network-create:
     post:
+      tags: [onboarding]
+      summary: Create a network
       description: |
         Create a new network.
         A user authority can be associated with at most one network.
-      operationId: Auth Network Create
+      operationId: authNetworkCreate
       security: []
       requestBody:
         required: true
@@ -426,10 +442,13 @@ paths:
               $ref: "#/components/schemas/NetworkCreateArgs"
       responses:
         "200":
+          description: The created network, or the verification/pending state.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/NetworkCreateResult"
+        "400":
+          description: The request was malformed, the network name is taken, or the referral code is invalid.
 
   /auth/network-delete:
     post:
@@ -723,13 +742,15 @@ paths:
 
   /network/auth-client:
     post:
+      tags: [onboarding]
+      summary: Authenticate a client on the network
       description: |
         Gain permission to use the `connect` protocol as the requested clientId,
         or assign a new clientId.
         Each network can have at most 128 clientIds.
         Above that number, new clientId requests will error until one or more
         existing clientIds are removed.
-      operationId: Auth Network Client
+      operationId: authNetworkClient
       security:
         - BearerAuth: []
       requestBody:
@@ -740,10 +761,13 @@ paths:
               $ref: "#/components/schemas/AuthNetworkClientArgs"
       responses:
         "200":
+          description: The client credentials.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AuthNetworkClientResult"
+        "401":
+          description: Missing or invalid bearer token.
 
   /network/remove-client:
     post:
@@ -1244,6 +1268,8 @@ paths:
 
   /subscription/balance:
     get:
+      tags: [subscription]
+      summary: Subscription status, balance and the onboarding plan data
       description: |
         Get the current subscription status and transfer balance. This is also
         the PLAN response of the onboarding program: it carries the caller's
@@ -1259,7 +1285,7 @@ paths:
         the card's billing country once the payment method is attached, before
         the trial ends. The regional price is tied to the storefront/billing
         country, never to a VPN exit.
-      operationId: Subscription Balance
+      operationId: subscriptionBalance
       security:
         - BearerAuth: []
       parameters:
@@ -1273,6 +1299,7 @@ paths:
             type: string
       responses:
         "200":
+          description: The balance, subscription and onboarding plan data.
           content:
             application/json:
               schema:
@@ -2190,9 +2217,11 @@ paths:
 
   /solana/payment-intent:
     post:
+      tags: [subscription]
+      summary: Create a Solana Pay intent for Pro
       description: |
         When paying for a subscription with Solana, we track the order through this intent.
-      operationId: Solana Payment Intent
+      operationId: solanaPaymentIntent
       security:
         - BearerAuth: []
       requestBody:
@@ -2203,10 +2232,13 @@ paths:
               $ref: "#/components/schemas/SolanaPaymentIntentArgs"
       responses:
         "200":
+          description: The quoted intent.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/SolanaPaymentIntentResult"
+        "401":
+          description: Missing or invalid bearer token.
 
   /stripe/payment-intent:
     post:
@@ -2603,6 +2635,8 @@ paths:
 
   /onboarding/offer/issue:
     post:
+      tags: [onboarding]
+      summary: Issue the welcome offer
       description: |
         Issue the caller's welcome offer: 25% off the first year of Pro (3
         months free), valid `validity_days` (5) from issue, stacked on the
@@ -2619,7 +2653,7 @@ paths:
 
         Budgeted per caller address (30 per 10 minutes): over budget the
         response is 429 with a Retry-After header.
-      operationId: Onboarding Offer Issue
+      operationId: onboardingOfferIssue
       security:
         - BearerAuth: []
       requestBody:
@@ -2628,17 +2662,64 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/OnboardingOfferIssueArgs"
+            examples:
+              introStep:
+                summary: The intro plan step renders
+                value:
+                  surface: intro_step
+                  storefront_country: US
       responses:
         "200":
+          description: The caller's offer, created now or already issued.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/OnboardingOfferIssueResult"
+              examples:
+                created:
+                  summary: Issued by this call
+                  value:
+                    created: true
+                    offer:
+                      issued_at: "2026-09-09T16:00:00Z"
+                      expires_at: "2026-09-14T16:00:00Z"
+                      percent_off: 25
+                      months_free: 3
+                      first_year_usd: 30
+                      regular_year_usd: 40
+                      tier: standard
+                      currency: USD
+                      state: active
+                      apple_offer_code: ONBOARD25
+                      play_offer_tag: onboarding25
+                      stripe_coupon_id: onboarding25
+                      redeemed_at: null
+                      store: null
+                holdout:
+                  summary: Refused for the in-app holdout
+                  value:
+                    created: false
+                    offer: null
+                    error:
+                      message: holdout
+        "401":
+          description: Missing or invalid bearer token.
         "429":
-          description: Too many requests from this address; retry after the Retry-After seconds.
+          description: Too many requests from this address.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RateLimitedError"
 
   /client/events:
     post:
+      tags: [analytics]
+      summary: Store a batch of product events
       description: |
         Store a batch of product events (at most 200 per call) against the
         CLOSED event schema (see ClientEvent). The network id comes from the
@@ -2654,7 +2735,7 @@ paths:
         failed calls, and never send more than 200 per call (a larger batch
         is a 400). Budgeted per caller address (120 calls per 10 minutes):
         over budget the response is 429 with a Retry-After header.
-      operationId: Client Events Send
+      operationId: clientEventsSend
       security:
         - BearerAuth: []
       requestBody:
@@ -2663,19 +2744,73 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/ClientEventsSendArgs"
+            examples:
+              batch:
+                summary: An offer exposure and a purchase start
+                value:
+                  events:
+                    - name: offer.screen.shown
+                      at: "2026-09-09T16:00:03Z"
+                      platform: android
+                      app_version: 2026.9.9
+                      locale: en-US
+                      session: 3f9c1a
+                      props:
+                        surface: intro_step
+                        experiment: offer_screen
+                        variant: control
+                        tier: standard
+                        price_shown: 29.99
+                        currency: USD
+                        expires_in_s: 431997
+                    - name: purchase.started
+                      at: "2026-09-09T16:00:41Z"
+                      platform: android
+                      app_version: 2026.9.9
+                      locale: en-US
+                      session: 3f9c1a
+                      props:
+                        store: play
+                        product: supporter-yearly
+                        plan: yearly
+                        trial: true
+                        price: 29.99
+                        currency: USD
       responses:
         "200":
+          description: Per-event acceptance for the batch.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ClientEventsSendResult"
+              examples:
+                partial:
+                  summary: One event refused
+                  value:
+                    accepted: 1
+                    rejected:
+                      - index: 1
+                        message: "props.plan: unknown value"
         "400":
           description: More than 200 events in the batch, or a malformed body.
+        "401":
+          description: Missing or invalid bearer token.
         "429":
-          description: Too many event calls from this address; retry after the Retry-After seconds.
+          description: Too many event calls from this address.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RateLimitedError"
 
   /onboarding/click:
     post:
+      tags: [onboarding, analytics]
+      summary: Record a campaign landing click
       description: |
         Record a campaign landing-page click. Every onboarding email link is
         `https://ur.io/o/<step>?t=<token>`; the landing page posts the token
@@ -2691,7 +2826,7 @@ paths:
         `error: expired`) so the page can route without attributing; an
         invalid token returns `ok: false`, `error: invalid`. Budgeted per
         caller address (60 per 10 minutes) -> 429 with Retry-After.
-      operationId: Onboarding Click
+      operationId: onboardingClick
       security: []
       requestBody:
         required: true
@@ -2699,17 +2834,45 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/OnboardingClickArgs"
+            examples:
+              click:
+                value:
+                  token: eyJzIjoiZTFfY29ubmVjdCIsIm4iOi4uLn0.sig
       responses:
         "200":
+          description: The step the link belongs to and where to route.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/OnboardingClickResult"
+              examples:
+                attributed:
+                  value:
+                    ok: true
+                    step: e1_connect
+                    destination: onboarding/connect
+                expired:
+                  value:
+                    ok: false
+                    step: e1_connect
+                    destination: onboarding/connect
+                    error: expired
         "429":
-          description: Too many requests from this address; retry after the Retry-After seconds.
+          description: Too many requests from this address.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RateLimitedError"
 
   /onboarding/feedback/{token}:
     get:
+      tags: [onboarding]
+      summary: Resolve a feedback link token
       description: |
         Resolve a feedback link token (`https://ur.io/f/<token>?r=n` or
         `?why=n`) to the rating or reason the one-tap email button stood
@@ -2721,37 +2884,65 @@ paths:
 
         No authentication: the signed token is the credential. Budgeted per
         caller address (60 per 10 minutes) -> 429 with Retry-After.
-      operationId: Onboarding Feedback Token
+      operationId: onboardingFeedbackToken
       security: []
       parameters:
         - name: token
           in: path
           required: true
+          description: The signed feedback token from the email link.
           schema:
             type: string
         - name: r
           in: query
           required: false
-          description: rating 1-5 from the tapped button
+          description: Rating 1-5 from the tapped button.
           schema:
             type: integer
+            minimum: 1
+            maximum: 5
         - name: why
           in: query
           required: false
-          description: reason token from the tapped button
+          description: Reason token from the tapped button.
           schema:
             type: string
       responses:
         "200":
+          description: The pre-fill for the feedback screen.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/OnboardingFeedbackTokenResult"
+              examples:
+                rating:
+                  value:
+                    ok: true
+                    step: e4_feedback
+                    rating: 4
+                    reason: ""
+                reason:
+                  value:
+                    ok: true
+                    step: e4_feedback
+                    rating: 0
+                    reason: did_not_work
         "429":
-          description: Too many requests from this address; retry after the Retry-After seconds.
+          description: Too many requests from this address.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RateLimitedError"
 
   /subscription/stripe/payment-sheet:
     post:
+      tags: [subscription, onboarding]
+      summary: Prepare an inline Stripe payment sheet
       description: |
         Prepare an inline Stripe PaymentSheet purchase of Pro (the non-Play
         Android flavors, Windows and Linux; never the play flavor or
@@ -2772,7 +2963,7 @@ paths:
         The charged tier is finalized from the card's billing country before
         the trial ends and the tier is recorded on the subscription.
         Calling again replaces a pending, unfinished sheet.
-      operationId: Stripe Payment Sheet
+      operationId: stripePaymentSheet
       security:
         - BearerAuth: []
       requestBody:
@@ -2781,23 +2972,60 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/StripePaymentSheetArgs"
+            examples:
+              yearly:
+                value:
+                  plan: yearly
+                  stripe_version: "2024-06-20"
       responses:
         "200":
+          description: The intent, customer and key material for the sheet.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/StripePaymentSheetResult"
+              examples:
+                yearlyWithOffer:
+                  value:
+                    customer_id: cus_123
+                    ephemeral_key_secret: ek_test_123
+                    setup_intent_client_secret: seti_123_secret_456
+                    intent_type: setup
+                    subscription_id: sub_123
+                    publishable_key: pk_test_123
+                    tier: standard
+                    currency: USD
+                    plan: yearly
+                    amount_first_period_usd: 30
+                    regular_period_usd: 40
+                    trial_days: 14
+                    trial_end_at: "2026-09-23T16:00:00Z"
+                    offer_applied: true
+                    error: null
+        "401":
+          description: Missing or invalid bearer token.
         "429":
-          description: Too many requests from this address; retry after the Retry-After seconds.
+          description: Too many requests from this address.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RateLimitedError"
 
   /subscription/stripe/prices:
     get:
+      tags: [subscription, onboarding]
+      summary: Stripe prices for the caller's tier
       description: |
         The Stripe price ids (and USD amounts) of the caller's regional tier,
         the publishable key, and the welcome-offer coupon id when the
         caller's offer is redeemable -- for clients that build their own
         Stripe flow (the Windows/Linux Payment Element).
-      operationId: Stripe Prices
+      operationId: stripePrices
       security:
         - BearerAuth: []
       parameters:
@@ -2809,10 +3037,226 @@ paths:
             type: string
       responses:
         "200":
+          description: The tier's price ids and key material.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/StripePricesResult"
+              examples:
+                standard:
+                  value:
+                    tier: standard
+                    currency: USD
+                    yearly_price_id: price_yearly_standard
+                    monthly_price_id: price_monthly_standard
+                    yearly_usd: 40
+                    monthly_usd: 5
+                    publishable_key: pk_test_123
+                    onboarding_coupon_id: onboarding25
+                    offer_eligible: true
+                    error: null
+        "401":
+          description: Missing or invalid bearer token.
+
+  # ----- optimization loop results (mmm/onboarding/PLAN.md, implemented by S3) -----
+
+  /admin/onboarding/results:
+    get:
+      tags: [analytics]
+      summary: Aggregated onboarding experiment results
+      description: |
+        PLANNED, not yet deployed: the nightly aggregate the analysis script
+        (mmm/onboarding/analyze.mjs) reads. One row per cohort day,
+        experiment, variant, surface, platform, tier and path with the
+        exposures, every funnel count and the fixed-window outcomes. Rows
+        under the minimum-volume gate (the analytics privacy config) are
+        suppressed, and no per-network data is ever returned. Requires an
+        admin bearer token; ordinary network tokens are 403.
+      operationId: adminOnboardingResults
+      x-status: planned
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: experiment
+          in: query
+          required: true
+          description: The experiment id from the registry.
+          schema:
+            type: string
+        - name: from
+          in: query
+          required: true
+          description: First cohort day, inclusive (YYYY-MM-DD).
+          schema:
+            type: string
+            format: date
+        - name: to
+          in: query
+          required: true
+          description: Last cohort day, inclusive (YYYY-MM-DD).
+          schema:
+            type: string
+            format: date
+        - name: surface
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: platform
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/EventPlatform"
+        - name: tier
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/PriceTierName"
+        - name: path
+          in: query
+          required: false
+          description: The campaign path, A (saw the in-app offer) or B.
+          schema:
+            type: string
+            enum: [A, B]
+        - name: cursor
+          in: query
+          required: false
+          description: The `next_cursor` of the previous page.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: A page of aggregated rows.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OnboardingResultsPage"
+              examples:
+                page:
+                  value:
+                    rows:
+                      - cohort_day: "2026-09-15"
+                        experiment: e1_subject_2026w38
+                        variant: control
+                        surface: email.e1
+                        platform: android
+                        tier: standard
+                        path: A
+                        exposures: 412
+                        sent: 412
+                        delivered: 401
+                        opened: 190
+                        clicked: 31
+                        landing_clicked: 31
+                        app_open_48h: 24
+                        connect_7d: 19
+                        widget_7d: 6
+                        feedback_7d: 9
+                        pro_start_14d: 5
+                        trial_to_paid_35d: 3
+                        refund_60d: 0
+                        retention_d7: 41
+                        retention_d30: 22
+                        unsubscribe: 1
+                        complaint: 0
+                    next_cursor: null
+        "401":
+          description: Missing or invalid bearer token.
+        "403":
+          description: The token is not an admin token.
+
+  /admin/onboarding/experiments:
+    get:
+      tags: [analytics]
+      summary: The experiment registry as loaded
+      description: |
+        PLANNED, not yet deployed: the onboarding experiment registry
+        (config/main/onboarding.yml `onboarding.experiments`) as the server
+        loaded it, so the analysis script judges results against the same
+        allocation, primary metric, guardrails and minimum exposures the
+        server applied. Requires an admin bearer token.
+      operationId: adminOnboardingExperiments
+      x-status: planned
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: The loaded registry.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OnboardingExperimentsResult"
+              examples:
+                registry:
+                  value:
+                    experiments:
+                      - id: offer_screen
+                        surface: offer.in_app
+                        status: running
+                        start: "2026-09-15"
+                        stop: "2026-10-27"
+                        allocation:
+                          control: 80
+                          holdout: 20
+                        variants:
+                          control: {}
+                          holdout: {}
+                        primary_metric: pro_start_14d
+                        secondary: [trial_to_paid_35d, refund_rate]
+                        guardrails:
+                          refund_rate: 0.06
+                        min_exposures: 3000
+        "401":
+          description: Missing or invalid bearer token.
+        "403":
+          description: The token is not an admin token.
+
+  /updates/brevo:
+    post:
+      tags: [analytics]
+      summary: Brevo transactional webhook
+      description: |
+        The Brevo transactional-email webhook. Brevo is registered
+        (idempotently, by the server when `onboarding.enabled` is on) to
+        post one event per delivery step; the request is authenticated by a
+        bearer token from the account's `webhook_bearers` list, not by a
+        network token. `unsubscribe` turns the account's product-updates
+        preference off (the existing behavior); for the onboarding campaign
+        the remaining events are recorded as server-written
+        `email.delivered|opened|clicked|bounced|complained|unsubscribed`
+        events against the network, with the campaign step taken from the
+        message's tag (`onboarding`, `<step>`, `<variant>`) or the
+        `X-Mailin-custom` header, so `e1_connect` clicks and `e4b_offer`
+        complaints land on the right step. A hard bounce or a complaint
+        exits the network from the sequence.
+      operationId: brevoWebhook
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BrevoWebhookArgs"
+            examples:
+              click:
+                value:
+                  event: click
+                  email: person@example.com
+                  message-id: "<202609091600.123@smtp-relay.mailin.fr>"
+                  tags: [onboarding, e1_connect, control]
+                  link: https://ur.io/o/e1_connect?t=...
+                  date: "2026-09-10 09:12:01"
+      responses:
+        "200":
+          description: Acknowledged.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BrevoWebhookResult"
+        "401":
+          description: The bearer is not one of the account's webhook bearers.
 
 components:
   securitySchemes:
@@ -3302,6 +3746,14 @@ components:
           type: string
         device_spec:
           description: If this is a new device, sets the device spec.
+          type: string
+        time_zone:
+          x-status: planned
+          description: |
+            Optional (planned: lands with the campaign engine). The device's
+            IANA time zone (e.g. America/Chicago),
+            recorded on the network for the onboarding campaign's local send
+            times and the tier display. Sent on every auth; the latest wins.
           type: string
         roles:
           description: Optional. |
@@ -4169,18 +4621,20 @@ components:
         stripe_coupon_id:
           type: string
         redeemed_at:
-          type: string
-          format: date-time
+          description: When the offer was first redeemed; null until then.
+          oneOf:
+            - type: string
+              format: date-time
+            - type: "null"
         store:
-          type: string
-          enum:
-            - apple
-            - play
-            - stripe
-            - solana
+          description: The store of the first redemption; null until then.
+          oneOf:
+            - $ref: "#/components/schemas/EventStore"
+            - type: "null"
 
     ExperimentAssignment:
       type: object
+      description: The caller's variant on one experiment surface.
       properties:
         experiment_id:
           type: string
@@ -4192,108 +4646,497 @@ components:
       type: object
       properties:
         surface:
-          type: string
-          description: where the offer is shown (default intro_step)
-          enum:
-            - intro_step
-            - final_screen
-            - account
+          $ref: "#/components/schemas/OfferSurface"
         storefront_country:
           type: string
           description: ISO 3166-1 storefront country, when the app knows it
+
+    OfferSurface:
+      type: string
+      description: Where the offer is shown.
+      enum:
+        - intro_step
+        - final_screen
+        - email_link
+        - account
+
+    OfferDeclineControl:
+      type: string
+      enum:
+        - free_plan_link
+        - back
+        - system_dismiss
+
+    OfferPlan:
+      type: string
+      enum:
+        - yearly
+        - monthly
+
+    EventStore:
+      type: string
+      enum:
+        - apple
+        - play
+        - stripe
+        - solana
+
+    EventPlatform:
+      type: string
+      enum:
+        - ios
+        - macos
+        - android
+        - web
+        - windows
+        - linux
+
+    PriceTierName:
+      type: string
+      enum:
+        - standard
+        - regional
+
+    RateLimitedError:
+      type: object
+      description: The body of a 429 response.
+      properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+            retry_after_seconds:
+              type: integer
 
     OnboardingOfferIssueResult:
       type: object
       properties:
         offer:
-          $ref: "#/components/schemas/OnboardingOffer"
+          description: The offer; null when refused.
+          oneOf:
+            - $ref: "#/components/schemas/OnboardingOffer"
+            - type: "null"
         created:
           type: boolean
           description: true for the call that issued the offer
         error:
-          type: object
-          nullable: true
-          properties:
-            message:
-              type: string
+          oneOf:
+            - $ref: "#/components/schemas/ErrorMessage"
+            - type: "null"
+
+    ErrorMessage:
+      type: object
+      properties:
+        message:
+          type: string
 
     ClientEvent:
-      type: object
       description: |
-        One product event. The schema is CLOSED: `name` must be one of the
-        listed values and `props` may carry ONLY that name's keys (types in
-        parentheses; enums listed):
+        One product event. The schema is CLOSED: `name` selects exactly one
+        of the variants below and `props` may carry only that variant's
+        keys (`additionalProperties: false`). A token is [A-Za-z0-9_.:+-],
+        at most 64 characters. Server-written names (landing.clicked,
+        app.opened, email.*, trial.*, refund, retention.*) are refused from
+        clients.
+      oneOf:
+        - $ref: "#/components/schemas/ClientEventOnboardingStepShown"
+        - $ref: "#/components/schemas/ClientEventOnboardingStepCompleted"
+        - $ref: "#/components/schemas/ClientEventOnboardingStepSkipped"
+        - $ref: "#/components/schemas/ClientEventOfferScreenShown"
+        - $ref: "#/components/schemas/ClientEventOfferCardTapped"
+        - $ref: "#/components/schemas/ClientEventOfferCtaTapped"
+        - $ref: "#/components/schemas/ClientEventOfferDeclined"
+        - $ref: "#/components/schemas/ClientEventPurchaseStarted"
+        - $ref: "#/components/schemas/ClientEventPurchaseCompleted"
+        - $ref: "#/components/schemas/ClientEventPurchaseCancelled"
+        - $ref: "#/components/schemas/ClientEventPurchaseFailed"
+        - $ref: "#/components/schemas/ClientEventConnectFirst"
+        - $ref: "#/components/schemas/ClientEventWidgetAdded"
+        - $ref: "#/components/schemas/ClientEventFeedbackSubmitted"
+        - $ref: "#/components/schemas/ClientEventSignupOptoutChanged"
+      discriminator:
+        propertyName: name
+        mapping:
+          onboarding.step.shown: "#/components/schemas/ClientEventOnboardingStepShown"
+          onboarding.step.completed: "#/components/schemas/ClientEventOnboardingStepCompleted"
+          onboarding.step.skipped: "#/components/schemas/ClientEventOnboardingStepSkipped"
+          offer.screen.shown: "#/components/schemas/ClientEventOfferScreenShown"
+          offer.card.tapped: "#/components/schemas/ClientEventOfferCardTapped"
+          offer.cta.tapped: "#/components/schemas/ClientEventOfferCtaTapped"
+          offer.declined: "#/components/schemas/ClientEventOfferDeclined"
+          purchase.started: "#/components/schemas/ClientEventPurchaseStarted"
+          purchase.completed: "#/components/schemas/ClientEventPurchaseCompleted"
+          purchase.cancelled: "#/components/schemas/ClientEventPurchaseCancelled"
+          purchase.failed: "#/components/schemas/ClientEventPurchaseFailed"
+          connect.first: "#/components/schemas/ClientEventConnectFirst"
+          widget.added: "#/components/schemas/ClientEventWidgetAdded"
+          feedback.submitted: "#/components/schemas/ClientEventFeedbackSubmitted"
+          signup.optout_changed: "#/components/schemas/ClientEventSignupOptoutChanged"
 
-        - onboarding.step.shown | onboarding.step.completed |
-          onboarding.step.skipped: step (token, required), index (int),
-          elapsed_ms (int)
-        - offer.screen.shown: surface (intro_step | final_screen |
-          email_link | account, required), experiment (token), variant
-          (token), tier (standard | regional), price_shown (number),
-          currency (3-letter), expires_in_s (int)
-        - offer.card.tapped: plan (yearly | monthly, required)
-        - offer.cta.tapped: plan (yearly | monthly, required), store (apple |
-          play | stripe | solana, required)
-        - offer.declined: control (free_plan_link | back | system_dismiss,
-          required), elapsed_ms (int)
-        - purchase.started | purchase.completed | purchase.cancelled |
-          purchase.failed: store (apple | play | stripe | solana, required),
-          product (token), plan (yearly | monthly), trial (bool), price
-          (number), currency (3-letter), error_class (token)
-        - connect.first: no props (once per network; resends are deduplicated)
-        - widget.added: kind (token, required)
-        - feedback.submitted: rating (int 1-5), reason (token), has_text
-          (bool), text (free text, at most 2000 characters, redacted)
-        - signup.optout_changed: product_updates (bool, required)
-
-        A token is [A-Za-z0-9_.:+-], at most 64 characters. Server-written
-        names (landing.clicked, app.opened, email.*, trial.*, refund,
-        retention.*) are refused from clients.
+    ClientEventBase:
+      type: object
+      description: The fields every client event carries.
+      required: [name]
       properties:
         name:
           type: string
-          enum:
-            - onboarding.step.shown
-            - onboarding.step.completed
-            - onboarding.step.skipped
-            - offer.screen.shown
-            - offer.card.tapped
-            - offer.cta.tapped
-            - offer.declined
-            - purchase.started
-            - purchase.completed
-            - purchase.cancelled
-            - purchase.failed
-            - connect.first
-            - widget.added
-            - feedback.submitted
-            - signup.optout_changed
         at:
           type: string
           format: date-time
           description: the client's event time (RFC 3339); missing = now; clamped to [now - 30 d, now]
         platform:
-          type: string
-          enum:
-            - ios
-            - macos
-            - android
-            - web
-            - windows
-            - linux
+          $ref: "#/components/schemas/EventPlatform"
         app_version:
-          type: string
-          description: token, at most 64 characters
+          $ref: "#/components/schemas/EventToken"
         locale:
           type: string
-          description: token, at most 32 characters (e.g. pt-BR)
+          maxLength: 32
+          description: a locale token (e.g. pt-BR)
         session:
-          type: string
-          description: an opaque per-app-session token, at most 64 characters
+          $ref: "#/components/schemas/EventToken"
+          description: an opaque per-app-session token
         props:
           type: object
-          description: the name's closed prop set (see above)
-          additionalProperties: true
+
+    EventToken:
+      type: string
+      pattern: "^[A-Za-z0-9_.:+-]{1,64}$"
+
+    CurrencyCode:
+      type: string
+      pattern: "^[A-Z]{3}$"
+
+    ClientEventOnboardingStepShown:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: An onboarding step was shown, completed or skipped.
+          properties:
+            name:
+              type: string
+              const: onboarding.step.shown
+            props:
+              type: object
+              additionalProperties: false
+              required: [step]
+              properties:
+                step:
+                  $ref: "#/components/schemas/EventToken"
+                index:
+                  type: integer
+                elapsed_ms:
+                  type: integer
+
+    ClientEventOnboardingStepCompleted:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: An onboarding step was shown, completed or skipped.
+          properties:
+            name:
+              type: string
+              const: onboarding.step.completed
+            props:
+              type: object
+              additionalProperties: false
+              required: [step]
+              properties:
+                step:
+                  $ref: "#/components/schemas/EventToken"
+                index:
+                  type: integer
+                elapsed_ms:
+                  type: integer
+
+    ClientEventOnboardingStepSkipped:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: An onboarding step was shown, completed or skipped.
+          properties:
+            name:
+              type: string
+              const: onboarding.step.skipped
+            props:
+              type: object
+              additionalProperties: false
+              required: [step]
+              properties:
+                step:
+                  $ref: "#/components/schemas/EventToken"
+                index:
+                  type: integer
+                elapsed_ms:
+                  type: integer
+
+    ClientEventOfferScreenShown:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: The welcome offer was shown on a surface.
+          properties:
+            name:
+              type: string
+              const: offer.screen.shown
+            props:
+              type: object
+              additionalProperties: false
+              required: [surface]
+              properties:
+                surface:
+                  $ref: "#/components/schemas/OfferSurface"
+                experiment:
+                  $ref: "#/components/schemas/EventToken"
+                variant:
+                  $ref: "#/components/schemas/EventToken"
+                tier:
+                  $ref: "#/components/schemas/PriceTierName"
+                price_shown:
+                  type: number
+                currency:
+                  $ref: "#/components/schemas/CurrencyCode"
+                expires_in_s:
+                  type: integer
+
+    ClientEventOfferCardTapped:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: A plan card on the offer screen was tapped.
+          properties:
+            name:
+              type: string
+              const: offer.card.tapped
+            props:
+              type: object
+              additionalProperties: false
+              required: [plan]
+              properties:
+                plan:
+                  $ref: "#/components/schemas/OfferPlan"
+
+    ClientEventOfferCtaTapped:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: The offer screen's primary button was tapped.
+          properties:
+            name:
+              type: string
+              const: offer.cta.tapped
+            props:
+              type: object
+              additionalProperties: false
+              required: [plan, store]
+              properties:
+                plan:
+                  $ref: "#/components/schemas/OfferPlan"
+                store:
+                  $ref: "#/components/schemas/EventStore"
+
+    ClientEventOfferDeclined:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: The offer screen was left without a purchase.
+          properties:
+            name:
+              type: string
+              const: offer.declined
+            props:
+              type: object
+              additionalProperties: false
+              required: [control]
+              properties:
+                control:
+                  $ref: "#/components/schemas/OfferDeclineControl"
+                elapsed_ms:
+                  type: integer
+
+    ClientEventPurchaseStarted:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: A purchase started, completed or was cancelled.
+          properties:
+            name:
+              type: string
+              const: purchase.started
+            props:
+              type: object
+              additionalProperties: false
+              required: [store]
+              properties:
+                store:
+                  $ref: "#/components/schemas/EventStore"
+                product:
+                  $ref: "#/components/schemas/EventToken"
+                plan:
+                  $ref: "#/components/schemas/OfferPlan"
+                trial:
+                  type: boolean
+                price:
+                  type: number
+                currency:
+                  $ref: "#/components/schemas/CurrencyCode"
+
+    ClientEventPurchaseCompleted:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: A purchase started, completed or was cancelled.
+          properties:
+            name:
+              type: string
+              const: purchase.completed
+            props:
+              type: object
+              additionalProperties: false
+              required: [store]
+              properties:
+                store:
+                  $ref: "#/components/schemas/EventStore"
+                product:
+                  $ref: "#/components/schemas/EventToken"
+                plan:
+                  $ref: "#/components/schemas/OfferPlan"
+                trial:
+                  type: boolean
+                price:
+                  type: number
+                currency:
+                  $ref: "#/components/schemas/CurrencyCode"
+
+    ClientEventPurchaseCancelled:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: A purchase started, completed or was cancelled.
+          properties:
+            name:
+              type: string
+              const: purchase.cancelled
+            props:
+              type: object
+              additionalProperties: false
+              required: [store]
+              properties:
+                store:
+                  $ref: "#/components/schemas/EventStore"
+                product:
+                  $ref: "#/components/schemas/EventToken"
+                plan:
+                  $ref: "#/components/schemas/OfferPlan"
+                trial:
+                  type: boolean
+                price:
+                  type: number
+                currency:
+                  $ref: "#/components/schemas/CurrencyCode"
+
+    ClientEventPurchaseFailed:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: A purchase failed.
+          properties:
+            name:
+              type: string
+              const: purchase.failed
+            props:
+              type: object
+              additionalProperties: false
+              required: [store]
+              properties:
+                store:
+                  $ref: "#/components/schemas/EventStore"
+                product:
+                  $ref: "#/components/schemas/EventToken"
+                plan:
+                  $ref: "#/components/schemas/OfferPlan"
+                trial:
+                  type: boolean
+                price:
+                  type: number
+                currency:
+                  $ref: "#/components/schemas/CurrencyCode"
+                error_class:
+                  $ref: "#/components/schemas/EventToken"
+
+    ClientEventConnectFirst:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: The network's first successful connection (once per network; resends are deduplicated).
+          properties:
+            name:
+              type: string
+              const: connect.first
+            props:
+              type: object
+              additionalProperties: false
+              properties: {}
+
+    ClientEventWidgetAdded:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: A widget, tile or control was added.
+          properties:
+            name:
+              type: string
+              const: widget.added
+            props:
+              type: object
+              additionalProperties: false
+              required: [kind]
+              properties:
+                kind:
+                  $ref: "#/components/schemas/EventToken"
+
+    ClientEventFeedbackSubmitted:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: In-app feedback was submitted.
+          properties:
+            name:
+              type: string
+              const: feedback.submitted
+            props:
+              type: object
+              additionalProperties: false
+              properties:
+                rating:
+                  type: integer
+                  minimum: 1
+                  maximum: 5
+                reason:
+                  $ref: "#/components/schemas/EventToken"
+                has_text:
+                  type: boolean
+                text:
+                  type: string
+                  maxLength: 2000
+                  description: free text, redacted (emails, phone numbers, IP addresses) before storage
+
+    ClientEventSignupOptoutChanged:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: The sign-up form's product-updates line was changed.
+          properties:
+            name:
+              type: string
+              const: signup.optout_changed
+            props:
+              type: object
+              additionalProperties: false
+              required: [product_updates]
+              properties:
+                product_updates:
+                  type: boolean
 
     ClientEventsSendArgs:
       type: object
@@ -4369,12 +5212,10 @@ components:
 
     StripePaymentSheetArgs:
       type: object
+      required: [plan]
       properties:
         plan:
-          type: string
-          enum:
-            - yearly
-            - monthly
+          $ref: "#/components/schemas/OfferPlan"
         storefront_country:
           type: string
         stripe_version:
@@ -4422,11 +5263,9 @@ components:
         offer_applied:
           type: boolean
         error:
-          type: object
-          nullable: true
-          properties:
-            message:
-              type: string
+          oneOf:
+            - $ref: "#/components/schemas/ErrorMessage"
+            - type: "null"
 
     StripePricesResult:
       type: object
@@ -4451,11 +5290,171 @@ components:
         offer_eligible:
           type: boolean
         error:
+          oneOf:
+            - $ref: "#/components/schemas/ErrorMessage"
+            - type: "null"
+
+    OnboardingResultsRow:
+      type: object
+      description: |
+        One aggregated row of the onboarding results (PLANNED, S3). Counts
+        are networks, not events; the fixed-window outcomes are measured
+        from each network's cohort day.
+      properties:
+        cohort_day:
+          type: string
+          format: date
+        experiment:
+          type: string
+        variant:
+          type: string
+        surface:
+          type: string
+        platform:
+          $ref: "#/components/schemas/EventPlatform"
+        tier:
+          $ref: "#/components/schemas/PriceTierName"
+        path:
+          type: string
+          enum: [A, B]
+        exposures:
+          type: integer
+        sent:
+          type: integer
+        delivered:
+          type: integer
+        opened:
+          type: integer
+        clicked:
+          type: integer
+        landing_clicked:
+          type: integer
+        app_open_48h:
+          type: integer
+        connect_7d:
+          type: integer
+        widget_7d:
+          type: integer
+        feedback_7d:
+          type: integer
+        pro_start_14d:
+          type: integer
+        trial_to_paid_35d:
+          type: integer
+        refund_60d:
+          type: integer
+        retention_d7:
+          type: integer
+        retention_d30:
+          type: integer
+        unsubscribe:
+          type: integer
+        complaint:
+          type: integer
+
+    OnboardingResultsPage:
+      type: object
+      properties:
+        rows:
+          type: array
+          items:
+            $ref: "#/components/schemas/OnboardingResultsRow"
+        next_cursor:
+          description: The cursor for the next page; null on the last page.
+          type: [string, "null"]
+
+    OnboardingExperiment:
+      type: object
+      description: One registry entry (config/main/onboarding.yml onboarding.experiments).
+      properties:
+        id:
+          type: string
+        surface:
+          type: string
+          description: email.<step> | offer.in_app | offer.email | cadence
+        status:
+          type: string
+          enum: [draft, running, paused, done]
+        start:
+          type: string
+          format: date
+        stop:
+          type: string
+          format: date
+        allocation:
           type: object
-          nullable: true
-          properties:
-            message:
-              type: string
+          description: percent per variant name, by hash(network_id, id)
+          additionalProperties:
+            type: integer
+        variants:
+          type: object
+          description: per variant, the Brevo template name or the store copy key set and layout id
+          additionalProperties:
+            type: object
+        primary_metric:
+          type: string
+        secondary:
+          type: array
+          items:
+            type: string
+        guardrails:
+          type: object
+          additionalProperties:
+            type: number
+        min_exposures:
+          type: integer
+
+    OnboardingExperimentsResult:
+      type: object
+      properties:
+        experiments:
+          type: array
+          items:
+            $ref: "#/components/schemas/OnboardingExperiment"
+
+    BrevoWebhookArgs:
+      type: object
+      description: |
+        A Brevo transactional webhook event (https://developers.brevo.com/docs/transactional-webhooks).
+        Only the fields the server reads are listed; Brevo sends more.
+      required: [event, email]
+      properties:
+        event:
+          type: string
+          enum:
+            - request
+            - delivered
+            - opened
+            - uniqueOpened
+            - click
+            - hardBounce
+            - softBounce
+            - blocked
+            - spam
+            - complaint
+            - unsubscribed
+            - unsubscribe
+            - invalid
+            - deferred
+            - error
+        email:
+          type: string
+        message-id:
+          type: string
+        tags:
+          type: array
+          description: the send's tags; the campaign sends carry [onboarding, <step>, <variant>]
+          items:
+            type: string
+        link:
+          type: string
+          description: the clicked URL (click events)
+        date:
+          type: string
+
+    BrevoWebhookResult:
+      type: object
+      properties: {}
 
     StatsProvidersArgs:
       type: object
@@ -5868,11 +6867,9 @@ components:
         currency:
           type: string
         error:
-          type: object
-          nullable: true
-          properties:
-            message:
-              type: string
+          oneOf:
+            - $ref: "#/components/schemas/ErrorMessage"
+            - type: "null"
 
     ValidateReferralCodeArgs:
       type: object
