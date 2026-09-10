@@ -1,6 +1,6 @@
 # Subprotocols on the core transfer layer — design proposal
 
-Status: design decided 2026-09-10 (§8); implementation follows §9. §3–§6 hold
+Status: design reviewed and approved 2026-09-10 (§8, and the review notes at the end of §10); implementation follows §9. §3–§6 hold
 the analysis and the shape as first proposed; where a decision in §8 changes
 them, §8 and §10 are authoritative.
 
@@ -513,9 +513,16 @@ transport framer's.
 sends a `SubprotocolsQuery` with a fresh ulid, registers the id in a pending
 table, and waits for the matching `SubprotocolsQueryResult` or `ctx`. The
 receiving client answers a query inline from its registry (codec ids and
-raw-listener ids, sorted, deduplicated) with the query id threaded back; both
-messages are ordinary top-level frames intercepted in `Client.receive` and
-never delivered to application callbacks. An old peer ignores the query, so a
+raw-listener ids, sorted, deduplicated) with the query id threaded back. The
+reply follows the provider ping echo (`ip.go`, `MessageType_IpIpPing`): it is
+sent to `source.SourceId` with zero timeout, its transfer key from
+`providerReplyTransferKey(peer.TransferKey, returnProvideMode)` and its options
+from `providerReturnTransferOptions(defaultOpts, returnProvideMode,
+returnTransferKey)`, where `returnProvideMode` is network for a same-network
+source and stream otherwise, so the reply rides a companion contract exactly
+as the ping echo does; a failed enqueue returns the reply's pool buffer and is
+counted. Both messages are ordinary top-level frames intercepted in
+`Client.receive` and never delivered to application callbacks. An old peer ignores the query, so a
 query against it times out: absence of a result means "unknown", not "none".
 The control id is not queried.
 
@@ -525,3 +532,11 @@ The control id is not queried.
 DroppedUnregistered, DroppedDecode, MarshalOverrun, QueriesAnswered}` plus a
 per-id received count, monotonic for the client's lifetime, exposed next to
 `ReceiveStats`.
+
+### 10.6 Review notes (2026-09-10)
+
+Confirmed on review: raw listeners attach per id (no wildcard); exactly one
+codec per id, because a subprotocol needs a deterministic codec or it is raw
+bytes; the query reply uses the provider ping's companion-reply behaviour
+(§10.4); `SendSubprotocolBytes` may copy once, the same cost as a protobuf
+marshal; the enum names of §9; `FromFrame` returns the wrapper for tooling only.
