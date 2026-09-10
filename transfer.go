@@ -1404,6 +1404,9 @@ type Client struct {
 
 	receiveCallbacks *CallbackList[ReceiveFunction]
 	forwardCallbacks *CallbackList[ForwardFunction]
+	// subprotocol codecs, raw listeners, pending queries and counters
+	// (subprotocol.go); read lock-free by the receive path
+	subprotocols *subprotocolRegistry
 	// Cached method value used by every ReceivePack. Constructing
 	// self.receive at the packet site allocates a closure per inbound pack.
 	receiveCallback ReceiveFunction
@@ -1580,6 +1583,7 @@ func NewClientWithTag(
 		settings:                     settings,
 		receiveCallbacks:             NewCallbackList[ReceiveFunction](),
 		forwardCallbacks:             NewCallbackList[ForwardFunction](),
+		subprotocols:                 newSubprotocolRegistry(),
 		loopback:                     make(chan *SendPack),
 		rawSendPacks:                 make(chan *SendPack, rawSendPackPoolCapacity),
 		ready:                        make(chan struct{}),
