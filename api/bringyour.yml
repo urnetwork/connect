@@ -3078,21 +3078,28 @@ paths:
         only networks with an email address are exposed to an email
         experiment. The pseudo-experiment `_all` (variant `all`, surface
         `all`) counts every network of the cohort so the funnel per platform,
-        tier and path is readable without an experiment.
+        tier and path is readable without an experiment. The cohort is the
+        campaign's real population: a network enters (its cohort time is the
+        enrollment time) when its login is an email address, otherwise on
+        its first device client within 30 days of creation; a network with
+        neither an email login nor a device is never a cohort member.
 
         Column definitions, measured from each network's cohort time:
         `sent`, `delivered`, `opened`, `clicked`, `unsubscribe`, `complaint` =
         at least one `email.*` event of that name, any step;
         `landing_clicked` = a `landing.clicked`; `app_open_48h` = an
         `app.opened` (the auth-client attribution within 48 h of a landing
-        click); `connect_7d` = a connection day or `connect.first` within 7
-        days; `widget_7d` = `widget.added` within 7 days; `feedback_7d` =
+        click); `connect_7d` = a `connect.day` (server-written on each UTC day the
+        network had a connection) or a `connect.first` within 7 days; `widget_7d` = `widget.added` within 7 days; `feedback_7d` =
         `feedback.submitted` or an account feedback within 7 days;
         `pro_start_14d` = a `purchase.completed` or the first subscription
         renewal (trial included) within 14 days; `trial_to_paid_35d` =
         `trial.converted` within 35 days; `refund_60d` = a `refund` within
-        60 days; `retention_d7` = a connection on day 6 or 7;
-        `retention_d30` = a connection on day 28, 29 or 30. A window that has
+        60 days; `retention_d7` = a `connect.day` on day 6 or 7;
+        `retention_d30` = a `connect.day` on day 28, 29 or 30. Connection
+        days are the analytics events, never the connection table (which
+        is pruned hours after disconnect), so they exist from the day the
+        server started writing `connect.day`. A window that has
         not matured reports 0: read `matured_days` (the cohort's age at
         `computed_at`) to tell "not yet" from "did not".
 
@@ -4789,8 +4796,8 @@ components:
         of the variants below and `props` may carry only that variant's
         keys (`additionalProperties: false`). A token is [A-Za-z0-9_.:+-],
         at most 64 characters. Server-written names (landing.clicked,
-        app.opened, email.*, trial.*, refund, retention.*) are refused from
-        clients.
+        app.opened, email.*, trial.*, refund, retention.*, connect.day) are
+        refused from clients.
       oneOf:
         - $ref: "#/components/schemas/ClientEventOnboardingStepShown"
         - $ref: "#/components/schemas/ClientEventOnboardingStepCompleted"
