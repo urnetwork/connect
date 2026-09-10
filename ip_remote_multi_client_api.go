@@ -1018,6 +1018,23 @@ func (self *ApiMultiClientGenerator) NewClientContext(
 		client.Cancel()
 		return nil, ctx.Err()
 	}
+	// A transport delivery ack does not prove the platform has published the
+	// identity key that the provider needs to authenticate this client's proof.
+	// Keep setup owned by callCtx until the processed registration completes.
+	if clientSettings.ClientKeyRegistrationRequired {
+		keyManager := client.ClientKeyManager()
+		var registrationErr error
+		if keyManager == nil {
+			registrationErr = errors.New("client key manager is unavailable")
+		} else {
+			registrationErr = keyManager.WaitForRegistration(callCtx)
+		}
+		if registrationErr != nil {
+			self.RemoveClientWithArgs(client, args)
+			client.Cancel()
+			return nil, fmt.Errorf("client key registration: %w", registrationErr)
+		}
+	}
 	self.transportLock.Lock()
 	if state := self.transports[client]; state != nil {
 		state.initializing = false
