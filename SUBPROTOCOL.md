@@ -452,9 +452,10 @@ Decoding on receive is hand-rolled with `protowire` over the frame's pooled
 copy. Unknown fields are skipped; a repeated singular field takes the last
 value, as `proto.Unmarshal` does; a malformed message is dropped and counted.
 The payload sub-slice has no pool identity of its own; it is borrowed for the
-callback like every received frame, and a listener that must keep it shares the
-frame's `message_bytes` (`RetainSubprotocolBytes(frame)`, which returns the
-release func) or copies.
+callback like every received frame, and a listener that must keep it calls
+`RetainSubprotocolBytes(messageBytes)`, which copies it into a pool buffer of
+its own and returns that copy with its release func (a sub-slice has no pool
+identity to share), or copies it itself.
 
 ### 10.2 Registration and listeners
 
