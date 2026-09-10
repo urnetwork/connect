@@ -2780,6 +2780,12 @@ func (self *Client) SendMultiHop(
 
 // ReceiveFunction
 func (self *Client) receive(source TransferPath, frames []*protocol.Frame, peer Peer) {
+	// subprotocol frames and queries are consumed here (subprotocol.go); the
+	// generic callbacks get the rest of the batch
+	frames = self.dispatchSubprotocolFrames(source, frames, peer)
+	if len(frames) == 0 {
+		return
+	}
 	for _, receiveCallback := range self.receiveCallbacks.Get() {
 		c := func() any {
 			return HandleError(func() {
