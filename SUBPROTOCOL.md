@@ -265,7 +265,7 @@ frame decoder already produced, owned by the receive item and returned by
 `flushDeliver` after the callback: the codec reads it in place, and a
 protobuf codec's `bytes`/`string` fields alias it only if unmarshalled with
 aliasing options, which is why the handler contract says borrowed. A handler
-that must keep the message calls `RetainSubprotocolBytes(frame)`, which is
+that must keep the message calls `RetainSubprotocolBytes(messageBytes)`, which is
 `MessagePoolShareReadOnly` plus a `MessagePoolReturn` obligation, or the codec
 copies what it keeps. Decode failures are counted per id and the frame is
 dropped, never delivered raw.
