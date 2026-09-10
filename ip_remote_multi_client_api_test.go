@@ -665,12 +665,129 @@ func TestRemoveClientWithArgsJoinsOobBeforeIdentityRevocation(t *testing.T) {
 	}
 }
 
+// A short-lived provider probe closes its generated Client and then the
+// generator. The final remove-client request is part of that retirement: if
+// the retirement worker merely launches it and returns, CloseAndWait cancels
+// the API context underneath the request and leaves the derived row active
+// until the server's much later idle reaper.
+func TestApiMultiClientGeneratorCloseAndWaitJoinsClientRemoval(t *testing.T) {
+	removeStarted := make(chan struct{})
+	removeRelease := make(chan struct{})
+	var startOnce sync.Once
+	var releaseOnce sync.Once
+	removeCount := &atomic.Int32{}
+
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/hello":
+			w.WriteHeader(http.StatusOK)
+		case "/network/remove-client":
+			removeCount.Add(1)
+			startOnce.Do(func() { close(removeStarted) })
+			select {
+			case <-removeRelease:
+				_, _ = w.Write([]byte("{}"))
+			case <-r.Context().Done():
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(apiServer.Close)
+	t.Cleanup(func() { releaseOnce.Do(func() { close(removeRelease) }) })
+
+	strategyCtx, strategyCancel := context.WithCancel(t.Context())
+	defer strategyCancel()
+	strategySettings := DefaultClientStrategySettings()
+	strategySettings.EnableNormal = true
+	strategySettings.EnableResilient = false
+	strategySettings.RequestTimeout = 5 * time.Second
+	strategy := NewClientStrategy(strategyCtx, strategySettings)
+
+	generatorCtx, generatorCancel := context.WithCancel(t.Context())
+	defer generatorCancel()
+	generator := NewApiMultiClientGenerator(
+		generatorCtx,
+		nil,
+		strategy,
+		nil,
+		apiServer.URL,
+		"synthetic-network-jwt",
+		apiServer.URL,
+		"synthetic-description",
+		"synthetic-spec",
+		"0.0.0-test",
+		nil,
+		DefaultClientSettings,
+		DefaultApiMultiClientGeneratorSettings(),
+	)
+	client := NewClient(generatorCtx, NewId(), NewNoContractClientOob(), closeWaitClientSettings())
+	args := &MultiClientGeneratorClientArgs{
+		ClientId: client.ClientId(),
+		ClientAuth: &ClientAuth{
+			InstanceId: NewId(),
+		},
+	}
+
+	// RemoveClientWithArgs admits the retirement synchronously before it
+	// launches the worker, so CloseAndWait must join this exact request.
+	generator.RemoveClientWithArgs(client, args)
+	client.Cancel()
+	select {
+	case <-removeStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("remove-client request did not reach the synthetic server")
+	}
+
+	closeCtx, closeCancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer closeCancel()
+	closeResult := make(chan error, 1)
+	go func() {
+		closeResult <- generator.CloseAndWait(closeCtx)
+	}()
+	retirements := generator.retirementLifecycle()
+	if !waitForCondition(time.Second, func() bool {
+		retirements.stateLock.Lock()
+		defer retirements.stateLock.Unlock()
+		return !retirements.open
+	}) {
+		t.Fatal("generator close did not close the retirement admission gate")
+	}
+	select {
+	case err := <-closeResult:
+		t.Fatalf("generator close returned before remove-client completed: %v", err)
+	default:
+	}
+
+	releaseOnce.Do(func() { close(removeRelease) })
+	select {
+	case err := <-closeResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-closeCtx.Done():
+		t.Fatalf("wait for joined remove-client request: %v", closeCtx.Err())
+	}
+	if count := removeCount.Load(); count != 1 {
+		t.Fatalf("remove-client request count = %d, want 1", count)
+	}
+}
+
 // A generated client's channel hands retirement back asynchronously after its
 // cancellation edge. Generator teardown must wait for that Client/OOB join;
 // otherwise a P2P send route can retain pooled Transfer frames after teardown.
 func TestApiMultiClientGeneratorCloseAndWaitJoinsGeneratedClientRetirement(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/hello", "/network/remove-client":
+			_, _ = w.Write([]byte("{}"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(apiServer.Close)
 
 	strategySettings := DefaultClientStrategySettings()
 	strategy := NewClientStrategy(ctx, strategySettings)
@@ -679,9 +796,9 @@ func TestApiMultiClientGeneratorCloseAndWaitJoinsGeneratedClientRetirement(t *te
 		nil,
 		strategy,
 		nil,
-		"http://127.0.0.1:1",
+		apiServer.URL,
 		"network-jwt",
-		"http://127.0.0.1:1",
+		apiServer.URL,
 		"test-description",
 		"test-spec",
 		"0.0.0-test",
