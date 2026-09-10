@@ -1,6 +1,10 @@
-# Subprotocols on the core transfer layer — design proposal
+# Subprotocols on the core transfer layer
 
-Status: design reviewed and approved 2026-09-10 (§8, and the review notes at the end of §10); implementation follows §9. §3–§6 hold
+Status: implemented 2026-09-10 in connect 5920959 (protocol: the message and the
+peer query), b52bb48 (subprotocol.go: codec, registry, dispatch, sends, query,
+stats), 57ea9fb (the Client.receive hook) and df6ac10 (end to end over the
+in-process transports). The design was reviewed and approved the same day
+(§8, and the review notes at the end of §10); the implementation followed §9. §3–§6 hold
 the analysis and the shape as first proposed; where a decision in §8 changes
 them, §8 and §10 are authoritative.
 
