@@ -83,6 +83,14 @@ func ToFrame(message proto.Message, protocolVersion int) (*protocol.Frame, error
 		messageType = protocol.MessageType_TransferNetworkPeersUpdate
 	case *protocol.ResidentMigrate:
 		messageType = protocol.MessageType_TransferResidentMigrate
+	case *protocol.SubprotocolMessage:
+		// the generic path; the send functions in subprotocol.go hand-roll
+		// this encoding so the codec writes the payload in place
+		messageType = protocol.MessageType_Subprotocol
+	case *protocol.SubprotocolsQuery:
+		messageType = protocol.MessageType_TransferSubprotocolsQuery
+	case *protocol.SubprotocolsQueryResult:
+		messageType = protocol.MessageType_TransferSubprotocolsQueryResult
 	default:
 		return nil, fmt.Errorf("Unknown message type: %T", v)
 	}
@@ -245,6 +253,14 @@ func FromFrame(frame *protocol.Frame) (proto.Message, error) {
 		message = &protocol.NetworkPeersUpdate{}
 	case protocol.MessageType_TransferResidentMigrate:
 		message = &protocol.ResidentMigrate{}
+	case protocol.MessageType_Subprotocol:
+		// the generic path copies the payload; the client's dispatch decodes
+		// the header in place instead (subprotocol.go)
+		message = &protocol.SubprotocolMessage{}
+	case protocol.MessageType_TransferSubprotocolsQuery:
+		message = &protocol.SubprotocolsQuery{}
+	case protocol.MessageType_TransferSubprotocolsQueryResult:
+		message = &protocol.SubprotocolsQueryResult{}
 	default:
 		return nil, fmt.Errorf("Unknown message type: %s", frame.MessageType)
 	}

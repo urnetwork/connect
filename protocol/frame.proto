@@ -69,6 +69,20 @@ enum MessageType {
     // Provider build/policy identity and per-source security block counters.
     // Older clients ignore this data-path message.
     IpIpProviderDiagnostics = 29;
+    // A message of a subprotocol registered on the receiving client
+    // (SUBPROTOCOL.md). `Frame.message_bytes` is a marshaled `SubprotocolMessage`
+    // whose own `message_bytes` are decoded in place by the subprotocol's
+    // codec. Never sent to the control id; older clients ignore the unknown
+    // message type.
+    Subprotocol = 30;
+    // Asks a peer which subprotocols it can receive. `Frame.message_bytes` is
+    // a marshaled `SubprotocolsQuery`; the peer answers with
+    // `TransferSubprotocolsQueryResult`. Intercepted by the receiving client,
+    // never delivered to application callbacks.
+    TransferSubprotocolsQuery = 31;
+    // The answer to `TransferSubprotocolsQuery`. `Frame.message_bytes` is a
+    // marshaled `SubprotocolsQueryResult`.
+    TransferSubprotocolsQueryResult = 32;
 }
 
 

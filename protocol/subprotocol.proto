@@ -1,0 +1,31 @@
+syntax = "proto3";
+package bringyour;
+
+option go_package = "github.com/urnetwork/connect/protocol";
+
+
+// A message of a subprotocol registered on the receiving client
+// (SUBPROTOCOL.md). The frame is `MessageType.Subprotocol` (an enum value
+// shares the package scope, hence the `Message` suffix here); the client
+// hand-rolls this encoding so the codec of the subprotocol writes and reads
+// `message_bytes` in place, with no second copy.
+message SubprotocolMessage {
+    // 1..65535; ids below 1024 are reserved for the network
+    uint32 subprotocol_id = 1;
+    // the subprotocol's own encoding, decoded in place by its codec
+    bytes message_bytes = 2;
+}
+
+// Asks a peer which subprotocols it can receive (registered codecs and raw
+// listeners). Answered with `SubprotocolsQueryResult`; an older peer ignores
+// the query, so no result means "unknown", not "none".
+message SubprotocolsQuery {
+    // ulid, threaded back on the result
+    bytes query_id = 1;
+}
+
+message SubprotocolsQueryResult {
+    bytes query_id = 1;
+    // every id the sender can receive, sorted and deduplicated
+    repeated uint32 subprotocol_ids = 2;
+}
