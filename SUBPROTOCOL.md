@@ -1,7 +1,8 @@
 # Subprotocols on the core transfer layer — design proposal
 
-Status: proposal for review, 2026-09-10. Nothing here is implemented. The
-open questions in §8 are the ones to settle before code.
+Status: design decided 2026-09-10 (§8); implementation follows §9. §3–§6 hold
+the analysis and the shape as first proposed; where a decision in §8 changes
+them, §8 and §10 are authoritative.
 
 ## 0. What is being asked for
 
@@ -346,78 +347,181 @@ dropped-unregistered, dropped-decode, dropped-oversized, marshal-overrun) is
 exposed next to `ClientReceiveStatsSnapshot` so a misbehaving codec shows up in
 numbers.
 
-## 8. Open questions to settle before implementation
+## 8. Decisions (2026-09-10)
 
-1. **Wire shape.** C (a `Frame.subprotocol_id` field, `raw` payload) as
-   recommended in §3, or A (a two-byte header inside the bytes, no proto
-   change)? C is cleaner for ownership and tooling; A touches no proto and no
-   codec. Recommendation: C.
-2. **Codec vs per-message interface**, and whether a send without a local
-   registration is allowed (with an explicit codec option) or every sender
-   must register. Recommendation: generic codec; sends require a codec, from
-   the registration or an option.
-3. **Typed delivery vs bytes.** Should the handler receive the decoded `T`
-   (codec-owned instance, released after the call) or the raw `[]byte` and
-   decode itself? Typed is proposed; a `RegisterSubprotocolBytes` variant with
-   a `func(source, id, bytes, peer)` handler is cheap to add for users who want
-   zero framework between them and the bytes. Recommendation: both, typed
-   first.
-4. **Unregistered id policy.** Drop and count (proposed), or deliver the raw
-   frame to the generic `ReceiveFunction`s so a catch-all can see it?
-   Recommendation: drop and count; a catch-all is a bytes registration on the
-   ids it wants.
-5. **Id space.** 0 invalid. Reserve a range for URnetwork's own future use
-   (e.g. 1..255) and leave 256..65535 to external users, or first-come? The
-   platform cannot police it; two apps on one client are the only conflict
-   case, and registration refuses a duplicate. Recommendation: reserve 1..255,
-   document the rest as user-managed.
-6. **Destinations.** Peer clients and multi-hop are in scope. Is sending a
-   subprotocol frame to `ControlId` (the platform) meaningful in v1? The
-   platform's clients would drop it. Recommendation: allowed but documented as
-   dropped until the platform registers handlers; no special casing.
-7. **Size and fragmentation.** A message must fit one transport message (8 KiB
-   floor, per-transport `MaxMessageLen`, less pack and encryption overhead).
-   Should v1 refuse oversized sends up front with a clear error (proposed), or
-   fragment? Recommendation: refuse; fragmentation is a subprotocol-level
-   concern until a second user needs it in the core.
-8. **Delivery semantics.** Frames arrive reliably and in order per sequence,
-   but an old peer that does not know the type acks the pack and discards the
-   frame, so "acked" does not mean "understood". A subprotocol that needs to
-   know its peer speaks it needs its own hello. Should `connect` offer a
-   capability bit (the peer advertises supported subprotocol ids) as part of
-   the existing peer capability exchange? Recommendation: not in v1; note it.
-9. **SDK exposure.** The Go API is generic and cannot cross gomobile. The
-   mobile SDK would need a bytes-only registration (`id`, `func(bytes)`) on
-   `DeviceLocal`. In scope now, or a follow-up once a mobile consumer exists?
-   Recommendation: follow-up.
-10. **Handler threading.** Inline on the receive goroutine, must not block, as
-    today's callbacks (proposed). Offer an optional bounded handoff queue in
-    the registration options, or leave it to the user? Recommendation: leave it
-    to the user, with the doc pointing at the drop-when-full rule.
-11. **Naming.** `Subprotocol` for the message type and `subprotocol_id` for the
-    field, `SubprotocolId`/`SubprotocolCodec`/`SubprotocolHandler` in Go, one
-    new file `subprotocol.go` plus `subprotocol_test.go` in package `connect`
-    (CODESTYLE: shared code stays in the parent package).
+1. **Wire.** A new message type in `connect/protocol`: `MessageType.Subprotocol`
+   carrying a protobuf `Subprotocol{subprotocol_id, message_bytes}` whose
+   `message_bytes` are the subprotocol's raw bytes, decoded in place by the
+   subprotocol's codec. This is shape B of §3, hand-rolled so it costs no
+   second copy (§10.1). `Frame.raw` stays false: the frame is a protobuf.
+2. **Any subprotocol may be sent.** A send needs a codec (from the local
+   registration or passed with the send); it does not need the id registered.
+   A received message whose id has no codec is dropped unless a raw listener is
+   attached for it.
+3. **Raw listeners.** A new raw receive callback delivers the subprotocol id and
+   the raw bytes. Dispatch order per message: raw listeners first, with the id,
+   then the typed handler if a codec is registered and the bytes parse. A client
+   can therefore observe both the raw bytes and the parsed message.
+4. **Unregistered ids** reach raw listeners only.
+5. **Reserved ids.** Ids below 1024 are reserved for the network, like
+   privileged ports; the public registration refuses them. 0 is invalid.
+6. **The control id speaks only the top-level protocol.** A subprotocol send
+   to `ControlId` is refused by the client; the platform drops any that arrive.
+7. **Frame size.** The top-level frame rules apply unchanged; a subprotocol adds
+   no size rule of its own and no fragmentation.
+8. **Peer query.** `connect/protocol` gains a peer-to-peer query of the
+   subprotocols a client supports (registered codecs and raw listeners), in
+   the spirit of the provider ping but with a reply (§10.4).
+9. **SDK.** The mobile SDK exposes the raw listener: an application enables
+   subprotocols by id and receives the bytes through the listener, managing its
+   own codec in application code. Users who want typed, allocation-free
+   handling build their own SDK linked against `connect` with their codec and
+   view controllers.
+10. **Delivery** of raw bytes and parsed messages is inline on the receive
+    goroutine, like every frame today.
 
-## 9. Implementation sketch (after the answers)
+## 9. Implementation plan
 
-1. `protocol/frame.proto`: `Subprotocol = 30`, `Frame.subprotocol_id = 4`;
-   regenerate `frame.pb.go` (`protocol/Makefile`).
-2. `frame_protobuf.go`: field 4 in `sizeFrame`, `appendFrame`,
-   `decodeFrameInto`; round-trip tests against `proto.Marshal` in
-   `frame_protobuf_test.go` (the byte-identical invariant).
-3. `frame.go`: `FromFrame` returns a typed error for `Subprotocol` ("decoded by
-   its codec"); `ToFrame` unchanged (subprotocol frames are built by the
-   codec path).
-4. `subprotocol.go`: `SubprotocolId`, `SubprotocolCodec`, `ProtoCodec`,
-   registry (immutable table behind `atomic.Pointer`, registration lock),
-   dispatch, `Register*`/`Send*` functions, stats, `RetainSubprotocolBytes`.
-5. `transfer.go`: the registry field on `Client`, the one-line dispatch in
-   `receive`, stats exposure.
-6. Tests: two clients over the test transport exchanging a hand-rolled codec
-   and a `ProtoCodec(SimpleMessage)`; unregistered, oversized and bad-decode
-   drops counted; old-peer compatibility (a frame with field 4 decoded by the
-   pre-change decoder path and by `proto.Unmarshal`); `AllocsPerRun` on both
-   paths; a benchmark next to the pack codec benchmarks.
-7. Docs: DESIGNNOTES §1 gains the subprotocol layer line; this file becomes
-   the reference and drops "proposal".
+Files in `connect`:
+
+1. `protocol/subprotocol.proto` (new): the three messages of §10; `frame.proto`:
+   `Subprotocol = 30`, `TransferSubprotocolsQuery = 31`,
+   `TransferSubprotocolsQueryResult = 32`; regenerate with `protocol/Makefile`.
+2. `frame.go`: `ToFrame`/`FromFrame` cases for the three messages (the generic,
+   reflection path; the hot path never uses it for `Subprotocol`).
+3. `subprotocol.go` (new): the hand-rolled `Subprotocol` encoder and decoder,
+   the codec interface and `ProtoCodec`, the registry, the dispatch, the raw
+   and typed listeners, the query, the stats, the reserved-id and control-id
+   rules. `subprotocol_test.go`: encoder byte-identity against `proto.Marshal`,
+   decoder against `proto.Unmarshal` (including unknown fields and duplicate
+   fields), dispatch order, drop counting, reserved ids, the control-id refusal,
+   the query round trip, and `testing.AllocsPerRun` on send and receive.
+4. `transfer.go`: the registry on `Client`, one line in `receive`, the query
+   interception, stats exposure.
+5. An end-to-end test over the in-process test transport (the `SimpleMessage`
+   pattern in `transfer_test.go`) with a hand-rolled codec, a `ProtoCodec`, a
+   raw listener alongside a typed handler, and an unregistered id.
+6. DESIGNNOTES §1 gains the layer line; this file drops "proposal".
+
+Then the SDK (`sdk` repository): `DeviceLocal.EnableSubprotocol(id, listener)`
+/ `DisableSubprotocol(id)` on the gomobile surface with a listener interface
+that receives the id, the source client id and the bytes (copied out of the
+pool for the binding boundary), and `QuerySubprotocols` for the peer query.
+
+## 10. Final design
+
+### 10.1 Wire
+
+```proto
+// protocol/subprotocol.proto
+message Subprotocol {
+    // 1..65535; ids below 1024 are reserved for the network
+    uint32 subprotocol_id = 1;
+    // the subprotocol's own encoding, decoded in place by its codec
+    bytes message_bytes = 2;
+}
+
+message SubprotocolsQuery {
+    // ulid, threaded back on the result
+    bytes query_id = 1;
+}
+
+message SubprotocolsQueryResult {
+    bytes query_id = 1;
+    // every id the sender can receive: registered codecs and raw listeners
+    repeated uint32 subprotocol_ids = 2;
+}
+```
+
+Encoding on send is hand-rolled into one pool buffer, in field order:
+`tag(1) varint(id) tag(2) varint(n) payload`, where `n = codec.Size(m)` is
+known before the payload is written, so the header is emitted first and the
+codec appends the payload after it. The buffer is `MessagePoolGet(header + n)`;
+`Frame.message_bytes` is that buffer, ownership passes to the send. If the
+codec overruns `Size` the append grows into a heap slice and the pool buffer is
+returned; the overrun is counted. The output is byte-identical to
+`proto.Marshal(&protocol.Subprotocol{...})` (tested), so any protobuf tool
+decodes it.
+
+Decoding on receive is hand-rolled with `protowire` over the frame's pooled
+`message_bytes`: the id is read, the payload is the sub-slice of field 2, no
+copy. Unknown fields are skipped; a repeated singular field takes the last
+value, as `proto.Unmarshal` does; a malformed message is dropped and counted.
+The payload sub-slice has no pool identity of its own; it is borrowed for the
+callback like every received frame, and a listener that must keep it shares the
+frame's `message_bytes` (`RetainSubprotocolBytes(frame)`, which returns the
+release func) or copies.
+
+### 10.2 Registration and listeners
+
+```go
+type SubprotocolId uint16
+const SubprotocolReservedLimit SubprotocolId = 1024   // ids below are the network's
+
+type SubprotocolCodec[T any] interface {
+    Size(m T) int
+    MarshalAppend(b []byte, m T) ([]byte, error)
+    Unmarshal(b []byte, m T) error
+}
+func ProtoCodec[T proto.Message]() SubprotocolCodec[T]
+
+// raw bytes, before any codec; runs for every listener attached to the id
+type SubprotocolRawFunction = func(source TransferPath, subprotocolId SubprotocolId, messageBytes []byte, peer Peer)
+// the parsed message, after the raw listeners; one codec and one handler per id
+type SubprotocolHandler[T any] = func(source TransferPath, message T, peer Peer)
+
+func (self *Client) AddSubprotocolRawCallback(subprotocolId SubprotocolId, callback SubprotocolRawFunction) (remove func(), err error)
+func RegisterSubprotocol[T any](client *Client, id SubprotocolId, codec SubprotocolCodec[T], handler SubprotocolHandler[T]) (unregister func(), err error)
+```
+
+Both refuse ids below `SubprotocolReservedLimit` (an unexported variant exists
+for the network's own subprotocols) and id 0. `RegisterSubprotocol` refuses an
+id that already has a codec; raw listeners may be attached in any number. The
+registry is an immutable table behind an `atomic.Pointer`, copied on change.
+
+Dispatch, in `Client.receive` before the generic callbacks, per `Subprotocol`
+frame: decode the header; if the id has no raw listener and no codec, drop and
+count; call each raw listener with the payload; if a codec is registered, take
+a message from the codec (a `SubprotocolCodec` may also implement
+`SubprotocolMessagePool[T]{New() T; Release(T)}` to bound its allocations),
+`Unmarshal` in place, call the handler, release. A decode failure after the raw
+listeners ran is counted and the handler is not called. `Subprotocol` frames are
+removed from the batch before the generic `ReceiveFunction`s see it.
+
+### 10.3 Sending
+
+```go
+func SendSubprotocol[T any](client *Client, id SubprotocolId, m T, destinationId Id, ackCallback AckFunction, opts ...any) bool
+func SendSubprotocolWithTimeout[T any](..., timeout time.Duration, opts ...any) (bool, error)
+func SendSubprotocolMultiHop[T any](client *Client, id SubprotocolId, m T, destination MultiHopId, ackCallback AckFunction, opts ...any) bool
+func SendSubprotocolMulti[T any](client *Client, id SubprotocolId, ms []T, destinationId Id, ackCallback AckFunction, opts ...any) bool
+func (self *Client) SendSubprotocolBytes(id SubprotocolId, messageBytes []byte, destinationId Id, ackCallback AckFunction, opts ...any) bool
+```
+
+The codec comes from the registration or from a `WithSubprotocolCodec(codec)`
+send option; a send with neither fails. `SendSubprotocolBytes` takes already
+encoded bytes (ownership of the slice passes as for any frame; the header is
+written into a fresh pool buffer and the bytes copied once, the same single
+copy the pack encoder would make). A destination of `ControlId` fails without
+enqueueing. Everything else (acks, timeouts, transfer options, multi-hop,
+contracts, encryption) is the existing `Send*` machinery; size limits are the
+transport framer's.
+
+### 10.4 Peer query
+
+`client.QuerySubprotocols(ctx, destinationId Id, opts ...any) ([]SubprotocolId, error)`
+sends a `SubprotocolsQuery` with a fresh ulid, registers the id in a pending
+table, and waits for the matching `SubprotocolsQueryResult` or `ctx`. The
+receiving client answers a query inline from its registry (codec ids and
+raw-listener ids, sorted, deduplicated) with the query id threaded back; both
+messages are ordinary top-level frames intercepted in `Client.receive` and
+never delivered to application callbacks. An old peer ignores the query, so a
+query against it times out: absence of a result means "unknown", not "none".
+The control id is not queried.
+
+### 10.5 Stats
+
+`ClientSubprotocolStatsSnapshot{Sent, SentBytes, Received, ReceivedBytes,
+DroppedUnregistered, DroppedDecode, MarshalOverrun, QueriesAnswered}` plus a
+per-id received count, monotonic for the client's lifetime, exposed next to
+`ReceiveStats`.
