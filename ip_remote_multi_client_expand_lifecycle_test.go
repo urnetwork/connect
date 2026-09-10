@@ -4,6 +4,7 @@ package connect
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -11,16 +12,45 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
-// A ping result held before the pass terminal lock is canceled and its
-// constructed channel returns the generator args through RemoveClientWithArgs
-// when the pass ends. It must not also call RemoveClientArgs: that would revoke
-// the derived identity before the channel's final cleanup controls finish.
-// Before the pass-boundary fix, releasing this callback installed one client
-// from the ended pass; repeated timeouts let a fixed-size-one window grow once
-// per overlapping pass.
-func TestMultiClientExpandRejectsPingResultAfterPassEnds(t *testing.T) {
+func TestEvaluationBudgetDeadlineOwnershipExcludesLifecycleCancellation(t *testing.T) {
+	windowCtx, cancelWindow := context.WithCancel(context.Background())
+	evaluationCtx, cancelEvaluation := context.WithCancel(windowCtx)
+
+	if !evaluationBudgetDeadlineOwned(true, windowCtx, evaluationCtx) {
+		t.Fatal("a natural live-window deadline lost ownership")
+	}
+	if evaluationBudgetDeadlineOwned(false, windowCtx, evaluationCtx) {
+		t.Fatal("an ordinary pass return claimed deadline ownership")
+	}
+
+	cancelEvaluation()
+	if evaluationBudgetDeadlineOwned(true, windowCtx, evaluationCtx) {
+		t.Fatal("an evaluation-epoch rebuild became a provider deadline")
+	}
+
+	retiredWindowCtx, retireWindow := context.WithCancel(context.Background())
+	retiredEvaluationCtx, cancelRetiredEvaluation := context.WithCancel(retiredWindowCtx)
+	defer cancelRetiredEvaluation()
+	retireWindow()
+	if evaluationBudgetDeadlineOwned(true, retiredWindowCtx, retiredEvaluationCtx) {
+		t.Fatal("window retirement became a provider deadline")
+	}
+
+	cancelWindow()
+}
+
+// A ping result held across the natural pass deadline is canceled and its
+// constructed channel returns the generator args through RemoveClientWithArgs.
+// The deadline must also contribute exactly one provider failure and emit one
+// identity-free budget diagnostic. It must not call RemoveClientArgs: that
+// would revoke the derived identity before the channel's final cleanup controls
+// finish. Before the pass-boundary fix, releasing this callback installed one
+// client from the ended pass; before the budget-attribution fix, cleanup hid the
+// failure because the 15-second pass ended before the 30-second ping timeout.
+func TestMultiClientExpandAccountsForPingAtPassDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
+	log := newRecordingLogger()
 
 	providerSettings := DefaultClientSettings()
 	providerSettings.Log = NewNoopLogger()
@@ -96,21 +126,21 @@ func TestMultiClientExpandRejectsPingResultAfterPassEnds(t *testing.T) {
 		}
 	})
 	settings := DefaultMultiClientSettings()
-	settings.Log = NewNoopLogger()
+	settings.Log = log
 	settings.PingWriteTimeout = 5 * time.Second
-	settings.PingTimeout = 5 * time.Second
-	settings.WindowExpandTimeout = 5 * time.Second
+	settings.PingTimeout = 30 * time.Second
+	settings.WindowExpandTimeout = 15 * time.Second
 
 	pingResultEntered := make(chan struct{})
 	releasePingResult := make(chan struct{})
 	pingResultDone := make(chan struct{})
-	finishExpandPass := make(chan struct{})
+	expireExpandPass := make(chan struct{})
 	var pingResultEnteredOnce sync.Once
 	var pingResultDoneOnce sync.Once
 	window := &multiClientWindow{
 		ctx:                          ctx,
 		cancel:                       cancel,
-		log:                          NewNoopLogger(),
+		log:                          log,
 		generator:                    generator,
 		clientReceivePacketCallback:  func(*multiClientChannel, TransferPath, protocol.ProvideMode, TransportType, *IpPath, []byte) {},
 		clientReceivePacketsCallback: nil,
@@ -125,6 +155,8 @@ func TestMultiClientExpandRejectsPingResultAfterPassEnds(t *testing.T) {
 		clients:                      map[Id]*multiClientChannel{},
 		generatorMonitor:             NewMonitor(),
 		resizeMonitor:                NewMonitor(),
+		failures:                     &windowFailureRecorder{},
+		budgetFailThrottle:           newLogThrottle(evaluationFailureLogInterval),
 		beforeExpandPingResultForTest: func() {
 			pingResultEnteredOnce.Do(func() {
 				close(pingResultEntered)
@@ -136,7 +168,7 @@ func TestMultiClientExpandRejectsPingResultAfterPassEnds(t *testing.T) {
 				close(pingResultDone)
 			})
 		},
-		finishExpandPassForTest: finishExpandPass,
+		expireExpandPassForTest: expireExpandPass,
 	}
 	clientArgs, err := generator.NewClientArgs()
 	if err != nil {
@@ -165,7 +197,7 @@ func TestMultiClientExpandRejectsPingResultAfterPassEnds(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatalf("wait for held initial-ping result: %v", ctx.Err())
 	}
-	close(finishExpandPass)
+	close(expireExpandPass)
 	select {
 	case admittedCount := <-expandDone:
 		if admittedCount != 0 {
@@ -173,6 +205,23 @@ func TestMultiClientExpandRejectsPingResultAfterPassEnds(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatalf("finish expand pass: %v", ctx.Err())
+	}
+	if got := window.failures.counts(time.Now())[windowFailureProvider]; got != 1 {
+		t.Fatalf("provider failures at natural pass deadline=%d, want 1", got)
+	}
+	budgetLines := log.linesWith("event=evaluation_budget_exhausted")
+	if len(budgetLines) != 1 {
+		t.Fatalf("budget-expiry lines=%d, want 1: %v", len(budgetLines), budgetLines)
+	}
+	if line := budgetLines[0]; !strings.Contains(line, "window=quality") ||
+		!strings.Contains(line, "candidates=1") ||
+		!strings.Contains(line, "effective_min=") ||
+		!strings.Contains(line, "observed_max=") ||
+		!strings.Contains(line, "ping_timeout=30000") ||
+		!strings.Contains(line, "expand_timeout=15000") ||
+		strings.Contains(line, " exit=") ||
+		strings.Contains(line, " client=") {
+		t.Fatalf("budget-expiry diagnostic is incomplete or identity-bearing: %q", line)
 	}
 	select {
 	case <-argsRemoved:
@@ -194,6 +243,9 @@ func TestMultiClientExpandRejectsPingResultAfterPassEnds(t *testing.T) {
 	case <-argsRemoved:
 		t.Fatal("constructed client args were removed twice")
 	default:
+	}
+	if got := window.failures.counts(time.Now())[windowFailureProvider]; got != 1 {
+		t.Fatalf("provider failures after delayed callback=%d, want exactly 1", got)
 	}
 
 	window.stateLock.Lock()
