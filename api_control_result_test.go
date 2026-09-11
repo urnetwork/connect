@@ -5,7 +5,6 @@ import (
 	"context"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -13,11 +12,11 @@ import (
 )
 
 // One bounded Http response is consumed by the real client strategy and Oob.
-func clientControlWireResult(t *testing.T, wire string) error {
+func clientControlWireResult(t *testing.T, ipVersion int, wire string) error {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	endpoint := newFamilyHttptestServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/hello" {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -52,24 +51,28 @@ func clientControlWireResult(t *testing.T, wire string) error {
 // Errors inside a valid pack, absent/null result shape, malformed base64 and
 // malformed protobuf all remain failures for registration and Provide alike.
 func TestApiOutOfBandControlRejectsUnprocessedWire(t *testing.T) {
-	for _, wire := range []string{
-		`{"pack":"","error":{"message":"controller storage failure"}}`,
-		`{"pack":"","error":{"message":""}}`,
-		`{}`, `{"pack":null}`, `null`, ``,
-		`{"pack":"!"}`, `{"pack":"gA=="}`,
-	} {
-		if err := clientControlWireResult(t, wire); err == nil {
-			t.Fatalf("unprocessed wire was acknowledged: %q", wire)
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		for _, wire := range []string{
+			`{"pack":"","error":{"message":"controller storage failure"}}`,
+			`{"pack":"","error":{"message":""}}`,
+			`{}`, `{"pack":null}`, `null`, ``,
+			`{"pack":"!"}`, `{"pack":"gA=="}`,
+		} {
+			if err := clientControlWireResult(t, ipVersion, wire); err == nil {
+				t.Fatalf("unprocessed wire was acknowledged: %q", wire)
+			}
 		}
-	}
+	})
 }
 
 // Empty protobuf is the server's legitimate result for a processed key frame;
 // requiring presence must not reject that exact successful wire representation.
 func TestApiOutOfBandControlAcceptsExplicitProcessedPack(t *testing.T) {
-	for _, wire := range []string{`{"pack":""}`, `{"pack":"","error":null}`} {
-		if err := clientControlWireResult(t, wire); err != nil {
-			t.Fatal("explicit empty processed response was rejected", err)
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		for _, wire := range []string{`{"pack":""}`, `{"pack":"","error":null}`} {
+			if err := clientControlWireResult(t, ipVersion, wire); err != nil {
+				t.Fatal("explicit empty processed response was rejected", err)
+			}
 		}
-	}
+	})
 }

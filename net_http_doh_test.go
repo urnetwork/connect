@@ -193,79 +193,83 @@ func TestDohCache(t *testing.T) {
 }
 
 func TestDohCacheCachesMiss(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	var requestCount int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&requestCount, 1)
-		writeDohWire(w, r, nil, 0, true) // NXDOMAIN
-	}))
-	defer server.Close()
+		var requestCount int32
+		server := newFamilyHttptestServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&requestCount, 1)
+			writeDohWire(w, r, nil, 0, true) // NXDOMAIN
+		}))
+		defer server.Close()
 
-	settings := DefaultDohSettings()
-	settings.RequestTimeout = 1 * time.Second
-	settings.MissExpiration = 1 * time.Minute
-	settings.DnsResolverSettings.EnableRemoteDoh = true
-	settings.DnsResolverSettings.EnableRemoteDns = false
-	settings.DnsResolverSettings.EnableLocalDns = false
-	settings.DnsResolverSettings.RemoteDohUrlsIpv4 = []string{server.URL}
+		settings := DefaultDohSettings()
+		settings.RequestTimeout = 1 * time.Second
+		settings.MissExpiration = 1 * time.Minute
+		settings.DnsResolverSettings.EnableRemoteDoh = true
+		settings.DnsResolverSettings.EnableRemoteDns = false
+		settings.DnsResolverSettings.EnableLocalDns = false
+		setRemoteDohUrls(settings, ipVersion, server.URL)
 
-	dohCache := NewDohCache(settings)
+		dohCache := NewDohCache(settings)
 
-	for range 3 {
-		ips := dohCache.Query(ctx, "A", "missing.example")
-		AssertEqual(t, len(ips), 0)
-	}
-	AssertEqual(t, int32(1), atomic.LoadInt32(&requestCount))
+		for range 3 {
+			ips := dohCache.Query(ctx, testDnsRecordType(ipVersion), "missing.example")
+			AssertEqual(t, len(ips), 0)
+		}
+		AssertEqual(t, int32(1), atomic.LoadInt32(&requestCount))
+	})
 }
 
 func TestDohCacheReportsTunnelRouteForAResult(t *testing.T) {
-	answer := netip.MustParseAddr("203.0.113.65")
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeDohWire(w, r, []netip.Addr{answer}, 300, false)
-	}))
-	defer server.Close()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		answer := testDocAddr(ipVersion, 65)
+		server := newFamilyHttptestServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeDohWire(w, r, []netip.Addr{answer}, 300, false)
+		}))
+		defer server.Close()
 
-	type observedResult struct {
-		domain string
-		addrs  []netip.Addr
-		route  *DohRoute
-	}
-	observed := make(chan observedResult, 1)
-	settings := DefaultDohSettings()
-	settings.RequestTimeout = time.Second
-	settings.DnsResolverSettings.EnableRemoteDoh = true
-	settings.DnsResolverSettings.EnableRemoteDns = false
-	settings.DnsResolverSettings.EnableLocalDoh = false
-	settings.DnsResolverSettings.EnableLocalDns = false
-	settings.DnsResolverSettings.RemoteDohUrlsIpv4 = []string{server.URL}
-	// An owner-supplied dialer is the signal that this cache rides a tunnel;
-	// use the host dialer in the test while retaining the same observation path.
-	settings.DialContextSettings = &DialContextSettings{
-		DialContext: (&net.Dialer{}).DialContext,
-	}
-	settings.DohResultCallback = func(domain string, addrs []netip.Addr, route *DohRoute) {
-		observed <- observedResult{domain: domain, addrs: addrs, route: route}
-	}
+		type observedResult struct {
+			domain string
+			addrs  []netip.Addr
+			route  *DohRoute
+		}
+		observed := make(chan observedResult, 1)
+		settings := DefaultDohSettings()
+		settings.RequestTimeout = time.Second
+		settings.DnsResolverSettings.EnableRemoteDoh = true
+		settings.DnsResolverSettings.EnableRemoteDns = false
+		settings.DnsResolverSettings.EnableLocalDoh = false
+		settings.DnsResolverSettings.EnableLocalDns = false
+		setRemoteDohUrls(settings, ipVersion, server.URL)
+		// An owner-supplied dialer is the signal that this cache rides a tunnel;
+		// use the host dialer in the test while retaining the same observation path.
+		settings.DialContextSettings = &DialContextSettings{
+			DialContext: (&net.Dialer{}).DialContext,
+		}
+		settings.DohResultCallback = func(domain string, addrs []netip.Addr, route *DohRoute) {
+			observed <- observedResult{domain: domain, addrs: addrs, route: route}
+		}
 
-	cache := NewDohCache(settings)
-	defer cache.Close()
-	addrs, authoritative := cache.QueryResult(context.Background(), "A", "smtp.example.test")
-	if !authoritative || !slices.Equal(addrs, []netip.Addr{answer}) {
-		t.Fatalf("A result = %v authoritative=%v, want %v true", addrs, authoritative, answer)
-	}
-	select {
-	case result := <-observed:
-		if result.domain != "smtp.example.test" || !slices.Equal(result.addrs, []netip.Addr{answer}) {
-			t.Fatalf("observed result = %+v", result)
+		cache := NewDohCache(settings)
+		defer cache.Close()
+		addrs, authoritative := cache.QueryResult(context.Background(), testDnsRecordType(ipVersion), "smtp.example.test")
+		if !authoritative || !slices.Equal(addrs, []netip.Addr{answer}) {
+			t.Fatalf("A result = %v authoritative=%v, want %v true", addrs, authoritative, answer)
 		}
-		if result.route == nil || !result.route.Local.IsValid() || !result.route.Remote.IsValid() {
-			t.Fatalf("observed route = %+v, want valid tunnel tuple", result.route)
+		select {
+		case result := <-observed:
+			if result.domain != "smtp.example.test" || !slices.Equal(result.addrs, []netip.Addr{answer}) {
+				t.Fatalf("observed result = %+v", result)
+			}
+			if result.route == nil || !result.route.Local.IsValid() || !result.route.Remote.IsValid() {
+				t.Fatalf("observed route = %+v, want valid tunnel tuple", result.route)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("successful A answer did not report its tunnel route")
 		}
-	case <-time.After(time.Second):
-		t.Fatal("successful A answer did not report its tunnel route")
-	}
+	})
 }
 
 type dohRouteConn struct {
@@ -537,299 +541,313 @@ func TestDohQueryPreservesResponseWhenRouteEndpointMissing(t *testing.T) {
 // authoritative NXDOMAIN) is not negative-cached — every query re-hits the resolver (a
 // cached negative would be a single request). Contrast TestDohCacheCachesMiss.
 func TestDohCacheDoesNotCacheHttpError(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	var requestCount int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&requestCount, 1)
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	defer server.Close()
+		var requestCount int32
+		server := newFamilyHttptestServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&requestCount, 1)
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		defer server.Close()
 
-	settings := DefaultDohSettings()
-	settings.RequestTimeout = 1 * time.Second
-	settings.MissExpiration = 1 * time.Minute
-	settings.DnsResolverSettings.EnableRemoteDoh = true
-	settings.DnsResolverSettings.EnableRemoteDns = false
-	settings.DnsResolverSettings.EnableLocalDns = false
-	settings.DnsResolverSettings.RemoteDohUrlsIpv4 = []string{server.URL}
+		settings := DefaultDohSettings()
+		settings.RequestTimeout = 1 * time.Second
+		settings.MissExpiration = 1 * time.Minute
+		settings.DnsResolverSettings.EnableRemoteDoh = true
+		settings.DnsResolverSettings.EnableRemoteDns = false
+		settings.DnsResolverSettings.EnableLocalDns = false
+		setRemoteDohUrls(settings, ipVersion, server.URL)
 
-	dohCache := NewDohCache(settings)
-	for range 3 {
-		AssertEqual(t, len(dohCache.Query(ctx, "A", "fail.example")), 0)
-	}
-	AssertEqual(t, int32(3), atomic.LoadInt32(&requestCount))
+		dohCache := NewDohCache(settings)
+		for range 3 {
+			AssertEqual(t, len(dohCache.Query(ctx, testDnsRecordType(ipVersion), "fail.example")), 0)
+		}
+		AssertEqual(t, int32(3), atomic.LoadInt32(&requestCount))
+	})
 }
 
 // TestDohCacheRetriesAfterTimeout: a timed-out query is not cached, so a retry after the
 // resolver recovers resolves rather than returning a poisoned empty record.
 func TestDohCacheRetriesAfterTimeout(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	testIp := netip.MustParseAddr("93.184.216.34")
-	var failing atomic.Bool
-	failing.Store(true)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if failing.Load() {
-			// stall until the client gives up (its request ctx is canceled on timeout)
-			<-r.Context().Done()
-			return
-		}
-		writeDohWire(w, r, []netip.Addr{testIp}, 60, false)
-	}))
-	defer server.Close()
+		testIp := testDocAddr(ipVersion, 34)
+		var failing atomic.Bool
+		failing.Store(true)
+		server := newFamilyHttptestServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if failing.Load() {
+				// stall until the client gives up (its request ctx is canceled on timeout)
+				<-r.Context().Done()
+				return
+			}
+			writeDohWire(w, r, []netip.Addr{testIp}, 60, false)
+		}))
+		defer server.Close()
 
-	settings := DefaultDohSettings()
-	settings.RequestTimeout = 500 * time.Millisecond
-	settings.MissExpiration = 1 * time.Minute
-	settings.DnsResolverSettings.EnableRemoteDoh = true
-	settings.DnsResolverSettings.EnableRemoteDns = false
-	settings.DnsResolverSettings.EnableLocalDns = false
-	settings.DnsResolverSettings.RemoteDohUrlsIpv4 = []string{server.URL}
+		settings := DefaultDohSettings()
+		settings.RequestTimeout = 500 * time.Millisecond
+		settings.MissExpiration = 1 * time.Minute
+		settings.DnsResolverSettings.EnableRemoteDoh = true
+		settings.DnsResolverSettings.EnableRemoteDns = false
+		settings.DnsResolverSettings.EnableLocalDns = false
+		setRemoteDohUrls(settings, ipVersion, server.URL)
 
-	dohCache := NewDohCache(settings)
-	// first query times out -> empty, and must not be cached
-	AssertEqual(t, len(dohCache.Query(ctx, "A", "recover.example")), 0)
-	// resolver recovers; the retry must re-query and resolve, not return a cached empty
-	failing.Store(false)
-	ips := dohCache.Query(ctx, "A", "recover.example")
-	AssertEqual(t, len(ips), 1)
-	AssertEqual(t, slices.Contains(ips, testIp), true)
+		dohCache := NewDohCache(settings)
+		// first query times out -> empty, and must not be cached
+		AssertEqual(t, len(dohCache.Query(ctx, testDnsRecordType(ipVersion), "recover.example")), 0)
+		// resolver recovers; the retry must re-query and resolve, not return a cached empty
+		failing.Store(false)
+		ips := dohCache.Query(ctx, testDnsRecordType(ipVersion), "recover.example")
+		AssertEqual(t, len(ips), 1)
+		AssertEqual(t, slices.Contains(ips, testIp), true)
+	})
 }
 
 // TestDohCacheSingleFlight: concurrent identical queries coalesce onto a single upstream
 // resolution rather than each firing its own DoH request (retry-storm / dup amplification).
 func TestDohCacheSingleFlight(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	testIp := netip.MustParseAddr("93.184.216.34")
-	var requestCount int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&requestCount, 1)
-		// hold the request so concurrent callers overlap and coalesce onto this one
-		select {
-		case <-time.After(200 * time.Millisecond):
-		case <-r.Context().Done():
+		testIp := testDocAddr(ipVersion, 34)
+		var requestCount int32
+		server := newFamilyHttptestServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&requestCount, 1)
+			// hold the request so concurrent callers overlap and coalesce onto this one
+			select {
+			case <-time.After(200 * time.Millisecond):
+			case <-r.Context().Done():
+			}
+			writeDohWire(w, r, []netip.Addr{testIp}, 60, false)
+		}))
+		defer server.Close()
+
+		settings := DefaultDohSettings()
+		settings.RequestTimeout = 5 * time.Second
+		settings.DnsResolverSettings.EnableRemoteDoh = true
+		settings.DnsResolverSettings.EnableRemoteDns = false
+		settings.DnsResolverSettings.EnableLocalDns = false
+		setRemoteDohUrls(settings, ipVersion, server.URL)
+
+		dohCache := NewDohCache(settings)
+
+		const n = 16
+		results := make(chan []netip.Addr, n)
+		for range n {
+			go func() {
+				results <- dohCache.Query(ctx, testDnsRecordType(ipVersion), "coalesce.example")
+			}()
 		}
-		writeDohWire(w, r, []netip.Addr{testIp}, 60, false)
-	}))
-	defer server.Close()
+		for range n {
+			addrs := <-results
+			AssertEqual(t, len(addrs), 1)
+			AssertEqual(t, slices.Contains(addrs, testIp), true)
+		}
 
-	settings := DefaultDohSettings()
-	settings.RequestTimeout = 5 * time.Second
-	settings.DnsResolverSettings.EnableRemoteDoh = true
-	settings.DnsResolverSettings.EnableRemoteDns = false
-	settings.DnsResolverSettings.EnableLocalDns = false
-	settings.DnsResolverSettings.RemoteDohUrlsIpv4 = []string{server.URL}
-
-	dohCache := NewDohCache(settings)
-
-	const n = 16
-	results := make(chan []netip.Addr, n)
-	for range n {
-		go func() {
-			results <- dohCache.Query(ctx, "A", "coalesce.example")
-		}()
-	}
-	for range n {
-		addrs := <-results
-		AssertEqual(t, len(addrs), 1)
-		AssertEqual(t, slices.Contains(addrs, testIp), true)
-	}
-
-	// all 16 concurrent callers coalesced onto a single upstream request
-	AssertEqual(t, int32(1), atomic.LoadInt32(&requestCount))
+		// all 16 concurrent callers coalesced onto a single upstream request
+		AssertEqual(t, int32(1), atomic.LoadInt32(&requestCount))
+	})
 }
 
 // TestDohWireFormat: a server is queried via RFC 8484 (?dns=<base64url>, application/dns-message)
 // and its wire-format response is parsed.
 func TestDohWireFormat(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	testIp := netip.MustParseAddr("93.184.216.34")
-	var gotWireQuery atomic.Bool
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("dns") != "" {
-			gotWireQuery.Store(true)
-		}
-		writeDohWire(w, r, []netip.Addr{testIp}, 60, false)
-	}))
-	defer server.Close()
+		testIp := testDocAddr(ipVersion, 34)
+		var gotWireQuery atomic.Bool
+		server := newFamilyHttptestServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Query().Get("dns") != "" {
+				gotWireQuery.Store(true)
+			}
+			writeDohWire(w, r, []netip.Addr{testIp}, 60, false)
+		}))
+		defer server.Close()
 
-	settings := DefaultDohSettings()
-	settings.RequestTimeout = 5 * time.Second
-	settings.DnsResolverSettings.EnableRemoteDoh = true
-	settings.DnsResolverSettings.EnableRemoteDns = false
-	settings.DnsResolverSettings.EnableLocalDns = false
-	settings.DnsResolverSettings.RemoteDohUrlsIpv4 = []string{server.URL}
+		settings := DefaultDohSettings()
+		settings.RequestTimeout = 5 * time.Second
+		settings.DnsResolverSettings.EnableRemoteDoh = true
+		settings.DnsResolverSettings.EnableRemoteDns = false
+		settings.DnsResolverSettings.EnableLocalDns = false
+		setRemoteDohUrls(settings, ipVersion, server.URL)
 
-	dohCache := NewDohCache(settings)
-	addrs := dohCache.Query(ctx, "A", "wire.example")
-	AssertEqual(t, gotWireQuery.Load(), true)
-	AssertEqual(t, len(addrs), 1)
-	AssertEqual(t, slices.Contains(addrs, testIp), true)
+		dohCache := NewDohCache(settings)
+		addrs := dohCache.Query(ctx, testDnsRecordType(ipVersion), "wire.example")
+		AssertEqual(t, gotWireQuery.Load(), true)
+		AssertEqual(t, len(addrs), 1)
+		AssertEqual(t, slices.Contains(addrs, testIp), true)
+	})
 }
 
 // TestDohFanoutFastestWins: with multiple resolvers fanned out at once (stagger disabled) a query
 // returns as soon as one returns records — a slow/dead server does not delay the lookup.
 func TestDohFanoutFastestWins(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	testIp := netip.MustParseAddr("93.184.216.34")
-	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case <-time.After(30 * time.Second):
-		case <-r.Context().Done():
+		testIp := testDocAddr(ipVersion, 34)
+		slow := newFamilyHttptestServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-time.After(30 * time.Second):
+			case <-r.Context().Done():
+			}
+		}))
+		defer slow.Close()
+		fast := newFamilyHttptestServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeDohWire(w, r, []netip.Addr{testIp}, 60, false)
+		}))
+		defer fast.Close()
+
+		settings := DefaultDohSettings()
+		settings.RequestTimeout = 8 * time.Second
+		settings.DohServerStagger = 0 // fan out simultaneously to test fastest-wins
+		settings.DnsResolverSettings.EnableRemoteDoh = true
+		settings.DnsResolverSettings.EnableRemoteDns = false
+		settings.DnsResolverSettings.EnableLocalDns = false
+		setRemoteDohUrls(settings, ipVersion, slow.URL, fast.URL)
+
+		dohCache := NewDohCache(settings)
+		start := time.Now()
+		addrs := dohCache.Query(ctx, testDnsRecordType(ipVersion), "fanout.example")
+		elapsed := time.Since(start)
+
+		AssertEqual(t, len(addrs), 1)
+		AssertEqual(t, slices.Contains(addrs, testIp), true)
+		// must not have waited on the slow server
+		if elapsed > 3*time.Second {
+			t.Fatalf("fan-out waited %v for the slow server; should return on the fast answer", elapsed)
 		}
-	}))
-	defer slow.Close()
-	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeDohWire(w, r, []netip.Addr{testIp}, 60, false)
-	}))
-	defer fast.Close()
-
-	settings := DefaultDohSettings()
-	settings.RequestTimeout = 8 * time.Second
-	settings.DohServerStagger = 0 // fan out simultaneously to test fastest-wins
-	settings.DnsResolverSettings.EnableRemoteDoh = true
-	settings.DnsResolverSettings.EnableRemoteDns = false
-	settings.DnsResolverSettings.EnableLocalDns = false
-	settings.DnsResolverSettings.RemoteDohUrlsIpv4 = []string{slow.URL, fast.URL}
-
-	dohCache := NewDohCache(settings)
-	start := time.Now()
-	addrs := dohCache.Query(ctx, "A", "fanout.example")
-	elapsed := time.Since(start)
-
-	AssertEqual(t, len(addrs), 1)
-	AssertEqual(t, slices.Contains(addrs, testIp), true)
-	// must not have waited on the slow server
-	if elapsed > 3*time.Second {
-		t.Fatalf("fan-out waited %v for the slow server; should return on the fast answer", elapsed)
-	}
+	})
 }
 
 // TestDohServerStagger: with the stagger enabled, a primary that answers within the stagger window
 // means the next server is never launched — only one upstream request is made.
 func TestDohServerStagger(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	testIp := netip.MustParseAddr("93.184.216.34")
-	var totalRequests int32
-	// responseDelay makes the race assertion deterministic: with instant
-	// answers the first server can respond before the launcher fires the
-	// second, legitimately short-circuiting the fan-out
-	var responseDelayMs int32
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&totalRequests, 1)
-		if delay := atomic.LoadInt32(&responseDelayMs); 0 < delay {
-			select {
-			case <-time.After(time.Duration(delay) * time.Millisecond):
-			case <-r.Context().Done():
-				return
+		testIp := testDocAddr(ipVersion, 34)
+		var totalRequests int32
+		// responseDelay makes the race assertion deterministic: with instant
+		// answers the first server can respond before the launcher fires the
+		// second, legitimately short-circuiting the fan-out
+		var responseDelayMs int32
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&totalRequests, 1)
+			if delay := atomic.LoadInt32(&responseDelayMs); 0 < delay {
+				select {
+				case <-time.After(time.Duration(delay) * time.Millisecond):
+				case <-r.Context().Done():
+					return
+				}
 			}
-		}
-		writeDohWire(w, r, []netip.Addr{testIp}, 60, false)
+			writeDohWire(w, r, []netip.Addr{testIp}, 60, false)
+		})
+		a := newFamilyHttptestServer(t, ipVersion, handler)
+		defer a.Close()
+		b := newFamilyHttptestServer(t, ipVersion, handler)
+		defer b.Close()
+
+		settings := DefaultDohSettings()
+		settings.RequestTimeout = 5 * time.Second
+		settings.DohServerStagger = 500 * time.Millisecond
+		// test the stagger mechanism in isolation: disable the quiet-cache race
+		// (which intentionally bypasses the stagger when little is in flight —
+		// see DohServerRaceMaxInFlight)
+		settings.DohServerRaceMaxInFlight = 0
+		settings.DnsResolverSettings.EnableRemoteDoh = true
+		settings.DnsResolverSettings.EnableRemoteDns = false
+		settings.DnsResolverSettings.EnableLocalDns = false
+		setRemoteDohUrls(settings, ipVersion, a.URL, b.URL)
+
+		dohCache := NewDohCache(settings)
+		addrs := dohCache.Query(ctx, testDnsRecordType(ipVersion), "stagger.example")
+		AssertEqual(t, slices.Contains(addrs, testIp), true)
+		// the first-ordered server answers immediately, well within the 500ms stagger, so the second
+		// server is never launched
+		AssertEqual(t, int32(1), atomic.LoadInt32(&totalRequests))
+
+		// with the quiet-cache race enabled (the default), an isolated query
+		// bypasses the stagger and fans out immediately (hedged request). the
+		// servers delay so both launches reliably precede either answer.
+		atomic.StoreInt32(&totalRequests, 0)
+		atomic.StoreInt32(&responseDelayMs, 100)
+		settings.DohServerRaceMaxInFlight = DefaultDohSettings().DohServerRaceMaxInFlight
+		raceCache := NewDohCache(settings)
+		addrs = raceCache.Query(ctx, testDnsRecordType(ipVersion), "race.example")
+		AssertEqual(t, slices.Contains(addrs, testIp), true)
+		AssertEqual(t, int32(2), atomic.LoadInt32(&totalRequests))
 	})
-	a := httptest.NewServer(handler)
-	defer a.Close()
-	b := httptest.NewServer(handler)
-	defer b.Close()
-
-	settings := DefaultDohSettings()
-	settings.RequestTimeout = 5 * time.Second
-	settings.DohServerStagger = 500 * time.Millisecond
-	// test the stagger mechanism in isolation: disable the quiet-cache race
-	// (which intentionally bypasses the stagger when little is in flight —
-	// see DohServerRaceMaxInFlight)
-	settings.DohServerRaceMaxInFlight = 0
-	settings.DnsResolverSettings.EnableRemoteDoh = true
-	settings.DnsResolverSettings.EnableRemoteDns = false
-	settings.DnsResolverSettings.EnableLocalDns = false
-	settings.DnsResolverSettings.RemoteDohUrlsIpv4 = []string{a.URL, b.URL}
-
-	dohCache := NewDohCache(settings)
-	addrs := dohCache.Query(ctx, "A", "stagger.example")
-	AssertEqual(t, slices.Contains(addrs, testIp), true)
-	// the first-ordered server answers immediately, well within the 500ms stagger, so the second
-	// server is never launched
-	AssertEqual(t, int32(1), atomic.LoadInt32(&totalRequests))
-
-	// with the quiet-cache race enabled (the default), an isolated query
-	// bypasses the stagger and fans out immediately (hedged request). the
-	// servers delay so both launches reliably precede either answer.
-	atomic.StoreInt32(&totalRequests, 0)
-	atomic.StoreInt32(&responseDelayMs, 100)
-	settings.DohServerRaceMaxInFlight = DefaultDohSettings().DohServerRaceMaxInFlight
-	raceCache := NewDohCache(settings)
-	addrs = raceCache.Query(ctx, "A", "race.example")
-	AssertEqual(t, slices.Contains(addrs, testIp), true)
-	AssertEqual(t, int32(2), atomic.LoadInt32(&totalRequests))
 }
 
 func TestDohServerStaggerTracksWarmPathState(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	testIp := netip.MustParseAddr("93.184.216.34")
-	var totalRequests atomic.Int32
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		totalRequests.Add(1)
-		select {
-		case <-time.After(200 * time.Millisecond):
-		case <-r.Context().Done():
-			return
+		testIp := testDocAddr(ipVersion, 34)
+		var totalRequests atomic.Int32
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			totalRequests.Add(1)
+			select {
+			case <-time.After(200 * time.Millisecond):
+			case <-r.Context().Done():
+				return
+			}
+			writeDohWire(w, r, []netip.Addr{testIp}, 60, false)
+		})
+		a := newFamilyHttptestServer(t, ipVersion, handler)
+		defer a.Close()
+		b := newFamilyHttptestServer(t, ipVersion, handler)
+		defer b.Close()
+
+		var pathWarm atomic.Bool
+		settings := DefaultDohSettings()
+		settings.RequestTimeout = 2 * time.Second
+		settings.DohServerStagger = 300 * time.Millisecond
+		settings.DohServerWarmStagger = 50 * time.Millisecond
+		settings.DohServerRaceMaxInFlight = 0
+		settings.DohPathWarm = pathWarm.Load
+		settings.MaxServersPerQuery = 2
+		settings.MaxConcurrentHttpRequests = 4
+		settings.DohServerHedgeReserve = 1
+		settings.DnsResolverSettings.EnableRemoteDoh = true
+		settings.DnsResolverSettings.EnableRemoteDns = false
+		settings.DnsResolverSettings.EnableLocalDns = false
+		setRemoteDohUrls(settings, ipVersion, a.URL, b.URL)
+
+		cache := NewDohCache(settings)
+		defer cache.Close()
+
+		// Cold: the first 200ms answer beats the conservative 300ms stagger.
+		addrs := cache.Query(ctx, testDnsRecordType(ipVersion), "cold-stagger.example")
+		if !slices.Contains(addrs, testIp) {
+			t.Fatalf("cold query missing %s: %v", testIp, addrs)
 		}
-		writeDohWire(w, r, []netip.Addr{testIp}, 60, false)
+		if got := totalRequests.Load(); got != 1 {
+			t.Fatalf("cold path launched %d requests, want 1", got)
+		}
+
+		// Warm: the 50ms override launches the hedge before either 200ms answer.
+		pathWarm.Store(true)
+		totalRequests.Store(0)
+		addrs = cache.Query(ctx, testDnsRecordType(ipVersion), "warm-stagger.example")
+		if !slices.Contains(addrs, testIp) {
+			t.Fatalf("warm query missing %s: %v", testIp, addrs)
+		}
+		if got := totalRequests.Load(); got != 2 {
+			t.Fatalf("warm path launched %d requests, want 2", got)
+		}
 	})
-	a := httptest.NewServer(handler)
-	defer a.Close()
-	b := httptest.NewServer(handler)
-	defer b.Close()
-
-	var pathWarm atomic.Bool
-	settings := DefaultDohSettings()
-	settings.RequestTimeout = 2 * time.Second
-	settings.DohServerStagger = 300 * time.Millisecond
-	settings.DohServerWarmStagger = 50 * time.Millisecond
-	settings.DohServerRaceMaxInFlight = 0
-	settings.DohPathWarm = pathWarm.Load
-	settings.MaxServersPerQuery = 2
-	settings.MaxConcurrentHttpRequests = 4
-	settings.DohServerHedgeReserve = 1
-	settings.DnsResolverSettings.EnableRemoteDoh = true
-	settings.DnsResolverSettings.EnableRemoteDns = false
-	settings.DnsResolverSettings.EnableLocalDns = false
-	settings.DnsResolverSettings.RemoteDohUrlsIpv4 = []string{a.URL, b.URL}
-
-	cache := NewDohCache(settings)
-	defer cache.Close()
-
-	// Cold: the first 200ms answer beats the conservative 300ms stagger.
-	addrs := cache.Query(ctx, "A", "cold-stagger.example")
-	if !slices.Contains(addrs, testIp) {
-		t.Fatalf("cold query missing %s: %v", testIp, addrs)
-	}
-	if got := totalRequests.Load(); got != 1 {
-		t.Fatalf("cold path launched %d requests, want 1", got)
-	}
-
-	// Warm: the 50ms override launches the hedge before either 200ms answer.
-	pathWarm.Store(true)
-	totalRequests.Store(0)
-	addrs = cache.Query(ctx, "A", "warm-stagger.example")
-	if !slices.Contains(addrs, testIp) {
-		t.Fatalf("warm query missing %s: %v", testIp, addrs)
-	}
-	if got := totalRequests.Load(); got != 2 {
-		t.Fatalf("warm path launched %d requests, want 2", got)
-	}
 }
 
 func TestDohWarmPrimaryWaveReservesHedgeCapacity(t *testing.T) {
@@ -852,163 +870,169 @@ func TestDohWarmPrimaryWaveReservesHedgeCapacity(t *testing.T) {
 }
 
 func TestDohQuietRaceAdmissionIsPredictablyBounded(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	const queryCount = 8
-	const raceMax = 2
-	// Every query launches its first server immediately; only raceMax queries
-	// may bypass the stagger and launch their second server too.
-	const expectedImmediateRequests = queryCount + raceMax
+		const queryCount = 8
+		const raceMax = 2
+		// Every query launches its first server immediately; only raceMax queries
+		// may bypass the stagger and launch their second server too.
+		const expectedImmediateRequests = queryCount + raceMax
 
-	testIp := netip.MustParseAddr("93.184.216.34")
-	release := make(chan struct{})
-	var releaseOnce sync.Once
-	defer releaseOnce.Do(func() { close(release) })
-	requestSeen := make(chan struct{}, 2*queryCount)
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestSeen <- struct{}{}
-		select {
-		case <-release:
-			writeDohWire(w, r, []netip.Addr{testIp}, 60, false)
-		case <-r.Context().Done():
+		testIp := testDocAddr(ipVersion, 34)
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		defer releaseOnce.Do(func() { close(release) })
+		requestSeen := make(chan struct{}, 2*queryCount)
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requestSeen <- struct{}{}
+			select {
+			case <-release:
+				writeDohWire(w, r, []netip.Addr{testIp}, 60, false)
+			case <-r.Context().Done():
+			}
+		})
+		a := newFamilyHttptestServer(t, ipVersion, handler)
+		defer a.Close()
+		b := newFamilyHttptestServer(t, ipVersion, handler)
+		defer b.Close()
+
+		settings := DefaultDohSettings()
+		settings.RequestTimeout = 5 * time.Second
+		settings.DohServerStagger = 2 * time.Second
+		settings.DohServerRaceMaxInFlight = raceMax
+		settings.MaxServersPerQuery = 2
+		settings.MaxConcurrentHttpRequests = 2 * queryCount
+		settings.MaxConcurrentResolutions = queryCount
+		settings.DnsResolverSettings.EnableRemoteDoh = true
+		settings.DnsResolverSettings.EnableRemoteDns = false
+		settings.DnsResolverSettings.EnableLocalDns = false
+		setRemoteDohUrls(settings, ipVersion, a.URL, b.URL)
+
+		dohCache := NewDohCache(settings)
+		defer dohCache.Close()
+		start := make(chan struct{})
+		results := make(chan []netip.Addr, queryCount)
+		for i := range queryCount {
+			go func(i int) {
+				<-start
+				results <- dohCache.Query(ctx, testDnsRecordType(ipVersion), fmt.Sprintf("race-bound-%d.example", i))
+			}(i)
 		}
-	})
-	a := httptest.NewServer(handler)
-	defer a.Close()
-	b := httptest.NewServer(handler)
-	defer b.Close()
+		close(start)
 
-	settings := DefaultDohSettings()
-	settings.RequestTimeout = 5 * time.Second
-	settings.DohServerStagger = 2 * time.Second
-	settings.DohServerRaceMaxInFlight = raceMax
-	settings.MaxServersPerQuery = 2
-	settings.MaxConcurrentHttpRequests = 2 * queryCount
-	settings.MaxConcurrentResolutions = queryCount
-	settings.DnsResolverSettings.EnableRemoteDoh = true
-	settings.DnsResolverSettings.EnableRemoteDns = false
-	settings.DnsResolverSettings.EnableLocalDns = false
-	settings.DnsResolverSettings.RemoteDohUrlsIpv4 = []string{a.URL, b.URL}
-
-	dohCache := NewDohCache(settings)
-	defer dohCache.Close()
-	start := make(chan struct{})
-	results := make(chan []netip.Addr, queryCount)
-	for i := range queryCount {
-		go func(i int) {
-			<-start
-			results <- dohCache.Query(ctx, "A", fmt.Sprintf("race-bound-%d.example", i))
-		}(i)
-	}
-	close(start)
-
-	timer := time.NewTimer(time.Second)
-	defer timer.Stop()
-	for i := 0; i < expectedImmediateRequests; i++ {
+		timer := time.NewTimer(time.Second)
+		defer timer.Stop()
+		for i := 0; i < expectedImmediateRequests; i++ {
+			select {
+			case <-requestSeen:
+			case <-timer.C:
+				t.Fatalf("saw only %d/%d immediate requests", i, expectedImmediateRequests)
+			}
+		}
+		// Well before the two-second stagger, no additional query may have raced.
 		select {
 		case <-requestSeen:
-		case <-timer.C:
-			t.Fatalf("saw only %d/%d immediate requests", i, expectedImmediateRequests)
+			t.Fatalf("more than %d requests bypassed the stagger", expectedImmediateRequests)
+		case <-time.After(150 * time.Millisecond):
 		}
-	}
-	// Well before the two-second stagger, no additional query may have raced.
-	select {
-	case <-requestSeen:
-		t.Fatalf("more than %d requests bypassed the stagger", expectedImmediateRequests)
-	case <-time.After(150 * time.Millisecond):
-	}
 
-	releaseOnce.Do(func() { close(release) })
-	for range queryCount {
-		select {
-		case addrs := <-results:
-			if !slices.Contains(addrs, testIp) {
-				t.Fatalf("query result missing %s: %v", testIp, addrs)
+		releaseOnce.Do(func() { close(release) })
+		for range queryCount {
+			select {
+			case addrs := <-results:
+				if !slices.Contains(addrs, testIp) {
+					t.Fatalf("query result missing %s: %v", testIp, addrs)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("timed out waiting for query results")
 			}
-		case <-time.After(3 * time.Second):
-			t.Fatal("timed out waiting for query results")
 		}
-	}
+	})
 }
 
 // TestDohHttpConcurrencyLimit: MaxConcurrentHttpRequests hard-caps concurrent in-flight DoH
 // requests across a cache, regardless of how wide the fan-out is.
 func TestDohHttpConcurrencyLimit(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	testIp := netip.MustParseAddr("93.184.216.34")
-	var inFlight, maxInFlight int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		n := atomic.AddInt32(&inFlight, 1)
-		for {
-			m := atomic.LoadInt32(&maxInFlight)
-			if n <= m || atomic.CompareAndSwapInt32(&maxInFlight, m, n) {
-				break
+		testIp := testDocAddr(ipVersion, 34)
+		var inFlight, maxInFlight int32
+		server := newFamilyHttptestServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			n := atomic.AddInt32(&inFlight, 1)
+			for {
+				m := atomic.LoadInt32(&maxInFlight)
+				if n <= m || atomic.CompareAndSwapInt32(&maxInFlight, m, n) {
+					break
+				}
 			}
+			time.Sleep(50 * time.Millisecond)
+			atomic.AddInt32(&inFlight, -1)
+			writeDohWire(w, r, []netip.Addr{testIp}, 60, false)
+		}))
+		defer server.Close()
+
+		settings := DefaultDohSettings()
+		settings.RequestTimeout = 5 * time.Second
+		settings.DohServerStagger = 0 // fan out simultaneously
+		settings.MaxConcurrentHttpRequests = 2
+		settings.DnsResolverSettings.EnableRemoteDoh = true
+		settings.DnsResolverSettings.EnableRemoteDns = false
+		settings.DnsResolverSettings.EnableLocalDns = false
+		// six servers fanned out at once; only MaxConcurrentHttpRequests may be in flight together
+		urls := make([]string, 6)
+		for i := range urls {
+			urls[i] = server.URL
 		}
-		time.Sleep(50 * time.Millisecond)
-		atomic.AddInt32(&inFlight, -1)
-		writeDohWire(w, r, []netip.Addr{testIp}, 60, false)
-	}))
-	defer server.Close()
+		setRemoteDohUrls(settings, ipVersion, urls...)
 
-	settings := DefaultDohSettings()
-	settings.RequestTimeout = 5 * time.Second
-	settings.DohServerStagger = 0 // fan out simultaneously
-	settings.MaxConcurrentHttpRequests = 2
-	settings.DnsResolverSettings.EnableRemoteDoh = true
-	settings.DnsResolverSettings.EnableRemoteDns = false
-	settings.DnsResolverSettings.EnableLocalDns = false
-	// six servers fanned out at once; only MaxConcurrentHttpRequests may be in flight together
-	urls := make([]string, 6)
-	for i := range urls {
-		urls[i] = server.URL
-	}
-	settings.DnsResolverSettings.RemoteDohUrlsIpv4 = urls
-
-	dohCache := NewDohCache(settings)
-	addrs := dohCache.Query(ctx, "A", "concurrency.example")
-	AssertEqual(t, slices.Contains(addrs, testIp), true)
-	if got := atomic.LoadInt32(&maxInFlight); got > 2 {
-		t.Fatalf("max concurrent in-flight requests = %d, want <= 2", got)
-	}
+		dohCache := NewDohCache(settings)
+		addrs := dohCache.Query(ctx, testDnsRecordType(ipVersion), "concurrency.example")
+		AssertEqual(t, slices.Contains(addrs, testIp), true)
+		if got := atomic.LoadInt32(&maxInFlight); got > 2 {
+			t.Fatalf("max concurrent in-flight requests = %d, want <= 2", got)
+		}
+	})
 }
 
 // TestDohCacheMinTtl: a record with a very low (here zero) DoH TTL is cached for at least
 // MinCacheTtl, so it isn't re-resolved (a full fan-out) on nearly every query.
 func TestDohCacheMinTtl(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	testIp := netip.MustParseAddr("93.184.216.34")
-	var requestCount int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&requestCount, 1)
-		writeDohWire(w, r, []netip.Addr{testIp}, 0, false)
-	}))
-	defer server.Close()
+		testIp := testDocAddr(ipVersion, 34)
+		var requestCount int32
+		server := newFamilyHttptestServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&requestCount, 1)
+			writeDohWire(w, r, []netip.Addr{testIp}, 0, false)
+		}))
+		defer server.Close()
 
-	settings := DefaultDohSettings()
-	settings.RequestTimeout = 5 * time.Second
-	settings.MinCacheTtl = 2 * time.Second
-	settings.DnsResolverSettings.EnableRemoteDoh = true
-	settings.DnsResolverSettings.EnableRemoteDns = false
-	settings.DnsResolverSettings.EnableLocalDns = false
-	settings.DnsResolverSettings.RemoteDohUrlsIpv4 = []string{server.URL}
+		settings := DefaultDohSettings()
+		settings.RequestTimeout = 5 * time.Second
+		settings.MinCacheTtl = 2 * time.Second
+		settings.DnsResolverSettings.EnableRemoteDoh = true
+		settings.DnsResolverSettings.EnableRemoteDns = false
+		settings.DnsResolverSettings.EnableLocalDns = false
+		setRemoteDohUrls(settings, ipVersion, server.URL)
 
-	dohCache := NewDohCache(settings)
+		dohCache := NewDohCache(settings)
 
-	addrs := dohCache.Query(ctx, "A", "lowttl.example")
-	AssertEqual(t, len(addrs), 1)
-	// past the record's real TTL (0) but within MinCacheTtl — still served from cache
-	time.Sleep(500 * time.Millisecond)
-	addrs = dohCache.Query(ctx, "A", "lowttl.example")
-	AssertEqual(t, len(addrs), 1)
-	AssertEqual(t, slices.Contains(addrs, testIp), true)
-	// the floor kept it cached: a single upstream request despite the zero TTL
-	AssertEqual(t, int32(1), atomic.LoadInt32(&requestCount))
+		addrs := dohCache.Query(ctx, testDnsRecordType(ipVersion), "lowttl.example")
+		AssertEqual(t, len(addrs), 1)
+		// past the record's real TTL (0) but within MinCacheTtl — still served from cache
+		time.Sleep(500 * time.Millisecond)
+		addrs = dohCache.Query(ctx, testDnsRecordType(ipVersion), "lowttl.example")
+		AssertEqual(t, len(addrs), 1)
+		AssertEqual(t, slices.Contains(addrs, testIp), true)
+		// the floor kept it cached: a single upstream request despite the zero TTL
+		AssertEqual(t, int32(1), atomic.LoadInt32(&requestCount))
+	})
 }
 
 // TestServerStatsTokenBucket: a server's score is the summed trailing-window success count, which
@@ -1071,97 +1095,95 @@ func TestServerStatsOrderBias(t *testing.T) {
 // weighted order); 0 fans out to all. On a dead path every launched request hangs holding
 // memory until the deadline, so a memory-constrained host caps this.
 func TestDohMaxServersPerQuery(t *testing.T) {
-	newFailingServer := func(hits *int32) *httptest.Server {
-		return httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			atomic.AddInt32(hits, 1)
-			w.WriteHeader(http.StatusServiceUnavailable)
-		}))
-	}
-	var hitsA, hitsB int32
-	serverA := newFailingServer(&hitsA)
-	defer serverA.Close()
-	serverB := newFailingServer(&hitsB)
-	defer serverB.Close()
-
-	pool := x509.NewCertPool()
-	pool.AddCert(serverA.Certificate())
-	pool.AddCert(serverB.Certificate())
-
-	newSettings := func(maxServers int) *DohSettings {
-		settings := DefaultDohSettings()
-		settings.RequestTimeout = 5 * time.Second
-		settings.DohServerStagger = 1 * time.Millisecond
-		settings.MaxServersPerQuery = maxServers
-		settings.DnsResolverSettings = &DnsResolverSettings{
-			EnableLocalDoh:   true,
-			LocalDohUrlsIpv4: []string{serverA.URL, serverB.URL},
-			TlsConfig:        &tls.Config{RootCAs: pool},
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		newFailingServer := func(hits *int32) *httptest.Server {
+			return newFamilyHttptestTlsServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(hits, 1)
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}))
 		}
-		return settings
-	}
+		var hitsA, hitsB int32
+		serverA := newFailingServer(&hitsA)
+		defer serverA.Close()
+		serverB := newFailingServer(&hitsB)
+		defer serverB.Close()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+		pool := x509.NewCertPool()
+		pool.AddCert(serverA.Certificate())
+		pool.AddCert(serverB.Certificate())
 
-	// capped: exactly one server is tried (both fail, so nothing short-circuits the wave)
-	NewDohCache(newSettings(1)).QueryResult(ctx, "A", "cap.example.test")
-	if got := atomic.LoadInt32(&hitsA) + atomic.LoadInt32(&hitsB); got != 1 {
-		t.Fatalf("with MaxServersPerQuery=1, servers hit = %d, want 1", got)
-	}
+		newSettings := func(maxServers int) *DohSettings {
+			settings := DefaultDohSettings()
+			settings.RequestTimeout = 5 * time.Second
+			settings.DohServerStagger = 1 * time.Millisecond
+			settings.MaxServersPerQuery = maxServers
+			settings.DnsResolverSettings = localDohResolverSettings(ipVersion, serverA.URL, serverB.URL)
+			settings.DnsResolverSettings.TlsConfig = &tls.Config{RootCAs: pool}
+			return settings
+		}
 
-	// uncapped: the fan-out reaches both servers
-	atomic.StoreInt32(&hitsA, 0)
-	atomic.StoreInt32(&hitsB, 0)
-	NewDohCache(newSettings(0)).QueryResult(ctx, "A", "nocap.example.test")
-	if got := atomic.LoadInt32(&hitsA) + atomic.LoadInt32(&hitsB); got != 2 {
-		t.Fatalf("with MaxServersPerQuery=0, servers hit = %d, want 2", got)
-	}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// capped: exactly one server is tried (both fail, so nothing short-circuits the wave)
+		NewDohCache(newSettings(1)).QueryResult(ctx, testDnsRecordType(ipVersion), "cap.example.test")
+		if got := atomic.LoadInt32(&hitsA) + atomic.LoadInt32(&hitsB); got != 1 {
+			t.Fatalf("with MaxServersPerQuery=1, servers hit = %d, want 1", got)
+		}
+
+		// uncapped: the fan-out reaches both servers
+		atomic.StoreInt32(&hitsA, 0)
+		atomic.StoreInt32(&hitsB, 0)
+		NewDohCache(newSettings(0)).QueryResult(ctx, testDnsRecordType(ipVersion), "nocap.example.test")
+		if got := atomic.LoadInt32(&hitsA) + atomic.LoadInt32(&hitsB); got != 2 {
+			t.Fatalf("with MaxServersPerQuery=0, servers hit = %d, want 2", got)
+		}
+	})
 }
 
 // TestDohCacheShedMemory: shedding drops the query result cache (a later query re-resolves)
 // and leaves the cache usable.
 func TestDohCacheShedMemory(t *testing.T) {
-	var requests int32
-	ip := netip.MustParseAddr("203.0.113.31")
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&requests, 1)
-		writeDohWire(w, r, []netip.Addr{ip}, 300, false)
-	}))
-	defer server.Close()
-	pool := x509.NewCertPool()
-	pool.AddCert(server.Certificate())
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		var requests int32
+		ip := testDocAddr(ipVersion, 31)
+		server := newFamilyHttptestTlsServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&requests, 1)
+			writeDohWire(w, r, []netip.Addr{ip}, 300, false)
+		}))
+		defer server.Close()
+		pool := x509.NewCertPool()
+		pool.AddCert(server.Certificate())
 
-	settings := DefaultDohSettings()
-	settings.RequestTimeout = 5 * time.Second
-	settings.DnsResolverSettings = &DnsResolverSettings{
-		EnableLocalDoh:   true,
-		LocalDohUrlsIpv4: []string{server.URL},
-		TlsConfig:        &tls.Config{RootCAs: pool},
-	}
-	cache := NewDohCache(settings)
+		settings := DefaultDohSettings()
+		settings.RequestTimeout = 5 * time.Second
+		settings.DnsResolverSettings = localDohResolverSettings(ipVersion, server.URL)
+		settings.DnsResolverSettings.TlsConfig = &tls.Config{RootCAs: pool}
+		cache := NewDohCache(settings)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	assertResolves := func(label string) {
-		addrs, authoritative := cache.QueryResult(ctx, "A", "shed.example.test")
-		if !authoritative || !slices.Contains(addrs, ip) {
-			t.Fatalf("%s: QueryResult = %v (authoritative %t), want %s", label, addrs, authoritative, ip)
+		assertResolves := func(label string) {
+			addrs, authoritative := cache.QueryResult(ctx, testDnsRecordType(ipVersion), "shed.example.test")
+			if !authoritative || !slices.Contains(addrs, ip) {
+				t.Fatalf("%s: QueryResult = %v (authoritative %t), want %s", label, addrs, authoritative, ip)
+			}
 		}
-	}
 
-	assertResolves("first query")
-	assertResolves("cached query")
-	if got := atomic.LoadInt32(&requests); got != 1 {
-		t.Fatalf("requests before shed = %d, want 1 (second query served from cache)", got)
-	}
+		assertResolves("first query")
+		assertResolves("cached query")
+		if got := atomic.LoadInt32(&requests); got != 1 {
+			t.Fatalf("requests before shed = %d, want 1 (second query served from cache)", got)
+		}
 
-	cache.ShedMemory()
+		cache.ShedMemory()
 
-	assertResolves("query after shed")
-	if got := atomic.LoadInt32(&requests); got != 2 {
-		t.Fatalf("requests after shed = %d, want 2 (the shed cache re-resolves)", got)
-	}
+		assertResolves("query after shed")
+		if got := atomic.LoadInt32(&requests); got != 2 {
+			t.Fatalf("requests after shed = %d, want 2 (the shed cache re-resolves)", got)
+		}
+	})
 }
 
 // expireCachedDohEntry rewinds every address expiration of the cached entry
@@ -1187,71 +1209,73 @@ func expireCachedDohEntry(t *testing.T, cache *DohCache, recordType string, doma
 // the exit-failover moment DNS must not add to. The stale serve never suppresses the resolution
 // attempt, and a later successful resolve replaces the stale answer with the fresh one.
 func TestDohCacheServesStaleOnResolverFailure(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	staleIp := netip.MustParseAddr("203.0.113.41")
-	freshIp := netip.MustParseAddr("203.0.113.42")
-	var failing atomic.Bool
-	var requestCount int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&requestCount, 1)
-		if failing.Load() {
-			// a transient resolver failure, NOT an authoritative answer
-			w.WriteHeader(http.StatusServiceUnavailable)
-			return
+		staleIp := testDocAddr(ipVersion, 41)
+		freshIp := testDocAddr(ipVersion, 42)
+		var failing atomic.Bool
+		var requestCount int32
+		server := newFamilyHttptestServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&requestCount, 1)
+			if failing.Load() {
+				// a transient resolver failure, NOT an authoritative answer
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			if atomic.LoadInt32(&requestCount) == 1 {
+				writeDohWire(w, r, []netip.Addr{staleIp}, 60, false)
+			} else {
+				writeDohWire(w, r, []netip.Addr{freshIp}, 60, false)
+			}
+		}))
+		defer server.Close()
+
+		settings := DefaultDohSettings()
+		settings.RequestTimeout = 1 * time.Second
+		settings.DnsResolverSettings.EnableRemoteDoh = true
+		settings.DnsResolverSettings.EnableRemoteDns = false
+		settings.DnsResolverSettings.EnableLocalDns = false
+		setRemoteDohUrls(settings, ipVersion, server.URL)
+
+		dohCache := NewDohCache(settings)
+
+		// resolve and cache
+		addrs, authoritative := dohCache.QueryResult(ctx, testDnsRecordType(ipVersion), "stale.example")
+		AssertEqual(t, authoritative, true)
+		AssertEqual(t, slices.Contains(addrs, staleIp), true)
+
+		// the record's TTL runs out, and then every resolver path fails
+		expireCachedDohEntry(t, dohCache, testDnsRecordType(ipVersion), "stale.example", 1*time.Second)
+		failing.Store(true)
+
+		addrs, authoritative = dohCache.QueryResult(ctx, testDnsRecordType(ipVersion), "stale.example")
+		if !slices.Contains(addrs, staleIp) {
+			t.Fatalf("stale answer not served on resolver failure: %v", addrs)
 		}
-		if atomic.LoadInt32(&requestCount) == 1 {
-			writeDohWire(w, r, []netip.Addr{staleIp}, 60, false)
-		} else {
-			writeDohWire(w, r, []netip.Addr{freshIp}, 60, false)
+		if !authoritative {
+			t.Error("a stale-served answer must not read as SERVFAIL to the caller")
 		}
-	}))
-	defer server.Close()
+		if got := dohCache.staleServeCount.Load(); got != 1 {
+			t.Errorf("staleServeCount = %d, want 1", got)
+		}
+		// the fresh resolution was attempted (stale never suppresses it)
+		if got := atomic.LoadInt32(&requestCount); got < 2 {
+			t.Errorf("requests = %d, want >= 2 (the stale serve must still attempt a fresh resolve)", got)
+		}
 
-	settings := DefaultDohSettings()
-	settings.RequestTimeout = 1 * time.Second
-	settings.DnsResolverSettings.EnableRemoteDoh = true
-	settings.DnsResolverSettings.EnableRemoteDns = false
-	settings.DnsResolverSettings.EnableLocalDns = false
-	settings.DnsResolverSettings.RemoteDohUrlsIpv4 = []string{server.URL}
-
-	dohCache := NewDohCache(settings)
-
-	// resolve and cache
-	addrs, authoritative := dohCache.QueryResult(ctx, "A", "stale.example")
-	AssertEqual(t, authoritative, true)
-	AssertEqual(t, slices.Contains(addrs, staleIp), true)
-
-	// the record's TTL runs out, and then every resolver path fails
-	expireCachedDohEntry(t, dohCache, "A", "stale.example", 1*time.Second)
-	failing.Store(true)
-
-	addrs, authoritative = dohCache.QueryResult(ctx, "A", "stale.example")
-	if !slices.Contains(addrs, staleIp) {
-		t.Fatalf("stale answer not served on resolver failure: %v", addrs)
-	}
-	if !authoritative {
-		t.Error("a stale-served answer must not read as SERVFAIL to the caller")
-	}
-	if got := dohCache.staleServeCount.Load(); got != 1 {
-		t.Errorf("staleServeCount = %d, want 1", got)
-	}
-	// the fresh resolution was attempted (stale never suppresses it)
-	if got := atomic.LoadInt32(&requestCount); got < 2 {
-		t.Errorf("requests = %d, want >= 2 (the stale serve must still attempt a fresh resolve)", got)
-	}
-
-	// the resolver recovers: the next query resolves fresh and replaces the
-	// stale answer rather than keeping it
-	failing.Store(false)
-	addrs, authoritative = dohCache.QueryResult(ctx, "A", "stale.example")
-	AssertEqual(t, authoritative, true)
-	AssertEqual(t, slices.Contains(addrs, freshIp), true)
-	AssertEqual(t, slices.Contains(addrs, staleIp), false)
-	if got := dohCache.staleServeCount.Load(); got != 1 {
-		t.Errorf("staleServeCount after recovery = %d, want 1 (fresh answers are not stale serves)", got)
-	}
+		// the resolver recovers: the next query resolves fresh and replaces the
+		// stale answer rather than keeping it
+		failing.Store(false)
+		addrs, authoritative = dohCache.QueryResult(ctx, testDnsRecordType(ipVersion), "stale.example")
+		AssertEqual(t, authoritative, true)
+		AssertEqual(t, slices.Contains(addrs, freshIp), true)
+		AssertEqual(t, slices.Contains(addrs, staleIp), false)
+		if got := dohCache.staleServeCount.Load(); got != 1 {
+			t.Errorf("staleServeCount after recovery = %d, want 1 (fresh answers are not stale serves)", got)
+		}
+	})
 }
 
 // TestDohCacheStaleDoesNotOverrideAuthoritative: an authoritative NXDOMAIN wins over retained
@@ -1259,103 +1283,107 @@ func TestDohCacheServesStaleOnResolverFailure(t *testing.T) {
 // re-confirmed absent must not keep resolving to its dead addresses. The authoritative miss
 // also replaces the retained entry (later queries hit the cached miss).
 func TestDohCacheStaleDoesNotOverrideAuthoritative(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	oldIp := netip.MustParseAddr("203.0.113.43")
-	var nxdomain atomic.Bool
-	var requestCount int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&requestCount, 1)
-		if nxdomain.Load() {
-			writeDohWire(w, r, nil, 0, true)
-		} else {
-			writeDohWire(w, r, []netip.Addr{oldIp}, 60, false)
+		oldIp := testDocAddr(ipVersion, 43)
+		var nxdomain atomic.Bool
+		var requestCount int32
+		server := newFamilyHttptestServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&requestCount, 1)
+			if nxdomain.Load() {
+				writeDohWire(w, r, nil, 0, true)
+			} else {
+				writeDohWire(w, r, []netip.Addr{oldIp}, 60, false)
+			}
+		}))
+		defer server.Close()
+
+		settings := DefaultDohSettings()
+		settings.RequestTimeout = 1 * time.Second
+		settings.MissExpiration = 1 * time.Minute
+		settings.DnsResolverSettings.EnableRemoteDoh = true
+		settings.DnsResolverSettings.EnableRemoteDns = false
+		settings.DnsResolverSettings.EnableLocalDns = false
+		setRemoteDohUrls(settings, ipVersion, server.URL)
+
+		dohCache := NewDohCache(settings)
+
+		addrs, authoritative := dohCache.QueryResult(ctx, testDnsRecordType(ipVersion), "gone.example")
+		AssertEqual(t, authoritative, true)
+		AssertEqual(t, slices.Contains(addrs, oldIp), true)
+
+		expireCachedDohEntry(t, dohCache, testDnsRecordType(ipVersion), "gone.example", 1*time.Second)
+		nxdomain.Store(true)
+
+		addrs, authoritative = dohCache.QueryResult(ctx, testDnsRecordType(ipVersion), "gone.example")
+		if len(addrs) != 0 {
+			t.Fatalf("stale data overrode an authoritative NXDOMAIN: %v", addrs)
 		}
-	}))
-	defer server.Close()
+		AssertEqual(t, authoritative, true)
+		if got := dohCache.staleServeCount.Load(); got != 0 {
+			t.Errorf("staleServeCount = %d, want 0 (authoritative answers are never stale serves)", got)
+		}
 
-	settings := DefaultDohSettings()
-	settings.RequestTimeout = 1 * time.Second
-	settings.MissExpiration = 1 * time.Minute
-	settings.DnsResolverSettings.EnableRemoteDoh = true
-	settings.DnsResolverSettings.EnableRemoteDns = false
-	settings.DnsResolverSettings.EnableLocalDns = false
-	settings.DnsResolverSettings.RemoteDohUrlsIpv4 = []string{server.URL}
-
-	dohCache := NewDohCache(settings)
-
-	addrs, authoritative := dohCache.QueryResult(ctx, "A", "gone.example")
-	AssertEqual(t, authoritative, true)
-	AssertEqual(t, slices.Contains(addrs, oldIp), true)
-
-	expireCachedDohEntry(t, dohCache, "A", "gone.example", 1*time.Second)
-	nxdomain.Store(true)
-
-	addrs, authoritative = dohCache.QueryResult(ctx, "A", "gone.example")
-	if len(addrs) != 0 {
-		t.Fatalf("stale data overrode an authoritative NXDOMAIN: %v", addrs)
-	}
-	AssertEqual(t, authoritative, true)
-	if got := dohCache.staleServeCount.Load(); got != 0 {
-		t.Errorf("staleServeCount = %d, want 0 (authoritative answers are never stale serves)", got)
-	}
-
-	// the authoritative miss replaced the retained entry: a repeat query is a
-	// cache hit (no new upstream request) and stays empty
-	before := atomic.LoadInt32(&requestCount)
-	addrs, authoritative = dohCache.QueryResult(ctx, "A", "gone.example")
-	AssertEqual(t, len(addrs), 0)
-	AssertEqual(t, authoritative, true)
-	AssertEqual(t, atomic.LoadInt32(&requestCount), before)
+		// the authoritative miss replaced the retained entry: a repeat query is a
+		// cache hit (no new upstream request) and stays empty
+		before := atomic.LoadInt32(&requestCount)
+		addrs, authoritative = dohCache.QueryResult(ctx, testDnsRecordType(ipVersion), "gone.example")
+		AssertEqual(t, len(addrs), 0)
+		AssertEqual(t, authoritative, true)
+		AssertEqual(t, atomic.LoadInt32(&requestCount), before)
+	})
 }
 
 // TestDohCacheStalePastBoundNotServed: the serve-stale bound is a hard limit -- an answer
 // expired longer than dohStaleServeBound ago is not served on failure, and its entry leaves
 // the cache.
 func TestDohCacheStalePastBoundNotServed(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	oldIp := netip.MustParseAddr("203.0.113.44")
-	var failing atomic.Bool
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if failing.Load() {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			return
+		oldIp := testDocAddr(ipVersion, 44)
+		var failing atomic.Bool
+		server := newFamilyHttptestServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if failing.Load() {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			writeDohWire(w, r, []netip.Addr{oldIp}, 60, false)
+		}))
+		defer server.Close()
+
+		settings := DefaultDohSettings()
+		settings.RequestTimeout = 1 * time.Second
+		settings.DnsResolverSettings.EnableRemoteDoh = true
+		settings.DnsResolverSettings.EnableRemoteDns = false
+		settings.DnsResolverSettings.EnableLocalDns = false
+		setRemoteDohUrls(settings, ipVersion, server.URL)
+
+		dohCache := NewDohCache(settings)
+
+		_, authoritative := dohCache.QueryResult(ctx, testDnsRecordType(ipVersion), "ancient.example")
+		AssertEqual(t, authoritative, true)
+
+		expireCachedDohEntry(t, dohCache, testDnsRecordType(ipVersion), "ancient.example", dohStaleServeBound+1*time.Second)
+		failing.Store(true)
+
+		addrs, authoritative := dohCache.QueryResult(ctx, testDnsRecordType(ipVersion), "ancient.example")
+		AssertEqual(t, len(addrs), 0)
+		AssertEqual(t, authoritative, false)
+		if got := dohCache.staleServeCount.Load(); got != 0 {
+			t.Errorf("staleServeCount = %d, want 0 (past the bound nothing may be served)", got)
 		}
-		writeDohWire(w, r, []netip.Addr{oldIp}, 60, false)
-	}))
-	defer server.Close()
 
-	settings := DefaultDohSettings()
-	settings.RequestTimeout = 1 * time.Second
-	settings.DnsResolverSettings.EnableRemoteDoh = true
-	settings.DnsResolverSettings.EnableRemoteDns = false
-	settings.DnsResolverSettings.EnableLocalDns = false
-	settings.DnsResolverSettings.RemoteDohUrlsIpv4 = []string{server.URL}
-
-	dohCache := NewDohCache(settings)
-
-	_, authoritative := dohCache.QueryResult(ctx, "A", "ancient.example")
-	AssertEqual(t, authoritative, true)
-
-	expireCachedDohEntry(t, dohCache, "A", "ancient.example", dohStaleServeBound+1*time.Second)
-	failing.Store(true)
-
-	addrs, authoritative := dohCache.QueryResult(ctx, "A", "ancient.example")
-	AssertEqual(t, len(addrs), 0)
-	AssertEqual(t, authoritative, false)
-	if got := dohCache.staleServeCount.Load(); got != 0 {
-		t.Errorf("staleServeCount = %d, want 0 (past the bound nothing may be served)", got)
-	}
-
-	// past-bound entries are dropped rather than retained
-	key := NewDohKey("A", "ancient.example")
-	dohCache.stateLock.Lock()
-	_, retained := dohCache.queryResultExpiration[key]
-	dohCache.stateLock.Unlock()
-	AssertEqual(t, retained, false)
+		// past-bound entries are dropped rather than retained
+		key := NewDohKey(testDnsRecordType(ipVersion), "ancient.example")
+		dohCache.stateLock.Lock()
+		_, retained := dohCache.queryResultExpiration[key]
+		dohCache.stateLock.Unlock()
+		AssertEqual(t, retained, false)
+	})
 }
 
 // TestDohStaleUsableBounds pins the retention predicate itself: records inside the bound are

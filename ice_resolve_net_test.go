@@ -70,73 +70,75 @@ func waitForIceResolveTestSignal(
 // entry points used by Pion gathering. The old transport.Net calls had no
 // cancellation input and remained parked in DNS after their peer was gone.
 func TestPeerConnectionResolveNetCancelsStunAndTurnLookups(t *testing.T) {
-	base, err := stdnet.NewNet()
-	if err != nil {
-		t.Fatal(err)
-	}
-	cases := []struct {
-		network string
-		address string
-		resolve func(*peerConnectionResolveNet) error
-	}{
-		{
-			network: "udp4",
-			address: "stun.blocked.invalid:3478",
-			resolve: func(network *peerConnectionResolveNet) error {
-				_, resolveErr := network.ResolveUDPAddr("udp4", "stun.blocked.invalid:3478")
-				return resolveErr
-			},
-		},
-		{
-			network: "tcp4",
-			address: "turn.blocked.invalid:3478",
-			resolve: func(network *peerConnectionResolveNet) error {
-				_, resolveErr := network.ResolveTCPAddr("tcp4", "turn.blocked.invalid:3478")
-				return resolveErr
-			},
-		},
-	}
-	for _, testCase := range cases {
-		blockedResolver := newBlockingIceResolver()
-		network, cancel := newPeerConnectionResolveNet(
-			base,
-			blockedResolver.resolver,
-			time.Hour,
-		)
-		if network.resolver == blockedResolver.resolver {
-			t.Fatal("peer resolver aliases the shared resolver")
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		base, err := stdnet.NewNet()
+		if err != nil {
+			t.Fatal(err)
 		}
-		if !network.resolver.PreferGo || !network.resolver.StrictErrors {
-			t.Fatal("peer resolver did not preserve resolver policy")
+		cases := []struct {
+			network string
+			address string
+			resolve func(*peerConnectionResolveNet) error
+		}{
+			{
+				network: testUdpNetwork(ipVersion),
+				address: "stun.blocked.invalid:3478",
+				resolve: func(network *peerConnectionResolveNet) error {
+					_, resolveErr := network.ResolveUDPAddr(testUdpNetwork(ipVersion), "stun.blocked.invalid:3478")
+					return resolveErr
+				},
+			},
+			{
+				network: testTcpNetwork(ipVersion),
+				address: "turn.blocked.invalid:3478",
+				resolve: func(network *peerConnectionResolveNet) error {
+					_, resolveErr := network.ResolveTCPAddr(testTcpNetwork(ipVersion), "turn.blocked.invalid:3478")
+					return resolveErr
+				},
+			},
 		}
-		resolveResult := make(chan error, 1)
-		go func() {
-			resolveResult <- testCase.resolve(network)
-		}()
-		waitForIceResolveTestSignal(
-			t,
-			blockedResolver.entered,
-			testCase.network+" resolver entry for "+testCase.address,
-		)
-		cancel()
-		select {
-		case resolveErr := <-resolveResult:
-			if !errors.Is(resolveErr, context.Canceled) {
-				t.Fatalf(
-					"%s resolve error = %v, want context cancellation",
-					testCase.network,
-					resolveErr,
-				)
+		for _, testCase := range cases {
+			blockedResolver := newBlockingIceResolver()
+			network, cancel := newPeerConnectionResolveNet(
+				base,
+				blockedResolver.resolver,
+				time.Hour,
+			)
+			if network.resolver == blockedResolver.resolver {
+				t.Fatal("peer resolver aliases the shared resolver")
 			}
-		case <-time.After(5 * time.Second):
-			t.Fatalf("%s resolve ignored peer cancellation", testCase.network)
+			if !network.resolver.PreferGo || !network.resolver.StrictErrors {
+				t.Fatal("peer resolver did not preserve resolver policy")
+			}
+			resolveResult := make(chan error, 1)
+			go func() {
+				resolveResult <- testCase.resolve(network)
+			}()
+			waitForIceResolveTestSignal(
+				t,
+				blockedResolver.entered,
+				testCase.network+" resolver entry for "+testCase.address,
+			)
+			cancel()
+			select {
+			case resolveErr := <-resolveResult:
+				if !errors.Is(resolveErr, context.Canceled) {
+					t.Fatalf(
+						"%s resolve error = %v, want context cancellation",
+						testCase.network,
+						resolveErr,
+					)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("%s resolve ignored peer cancellation", testCase.network)
+			}
+			waitForIceResolveTestSignal(
+				t,
+				blockedResolver.exited,
+				testCase.network+" resolver exit",
+			)
 		}
-		waitForIceResolveTestSignal(
-			t,
-			blockedResolver.exited,
-			testCase.network+" resolver exit",
-		)
-	}
+	})
 }
 
 // TestWebRtcPeerTeardownCancelsBlockedStunResolution reproduces the production
