@@ -362,7 +362,7 @@ func TestMultiClientRejectedProductionRaceRetainsOriginalPacket(t *testing.T) {
 		clientUpdates:      map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
 		reliabilityMetrics: newReliabilityMetrics(),
 	}
-	if candidates := multiClient.raceCandidates(window); len(candidates) != 2 {
+	if candidates := multiClient.raceCandidates(window, 0); len(candidates) != 2 {
 		t.Fatalf("production race candidates=%d, want=2", len(candidates))
 	}
 	packet := poolBalanceUdp4Packet(

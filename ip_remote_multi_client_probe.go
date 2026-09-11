@@ -867,7 +867,7 @@ func (self *RemoteUserNatMultiClient) clientReceiveProbePacket(
 	// destination answered). This is the positive half of the asymmetry; the
 	// failure half records nothing anywhere.
 	if sourceClient != nil && ipPath.Syn && ipPath.Ack {
-		sourceClient.addConnectSuccess()
+		sourceClient.addConnectSuccess(ipPath.Version)
 	}
 
 	// courtesy close, so the destination is not left holding a half-open

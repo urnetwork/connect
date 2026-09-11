@@ -116,7 +116,7 @@ func TestMonitorSetStallStatus(t *testing.T) {
 	AssertEqual(t, monitor.SetStallStatus(WindowStallProvidersUnresponsive, false), false)
 
 	// the size half preserves the diagnosis
-	monitor.AddWindowExpandEvent(false, 4)
+	monitor.AddWindowExpandEvent(false, 4, false)
 	windowExpandEvent := monitor.WindowExpandEvent()
 	AssertEqual(t, windowExpandEvent.TargetSize, 4)
 	AssertEqual(t, windowExpandEvent.Reason, WindowStallProvidersUnresponsive)
@@ -145,8 +145,8 @@ func TestMergedMonitorStallStatus(t *testing.T) {
 	AssertEqual(t, merged.WindowExpandEvent().Reason, WindowStallPlatformUnreachable)
 
 	// one window failed while the other is still trying (target > 0): not failed
-	quality.AddWindowExpandEvent(false, 4)
-	speed.AddWindowExpandEvent(false, 1)
+	quality.AddWindowExpandEvent(false, 4, false)
+	speed.AddWindowExpandEvent(false, 1, false)
 	quality.SetStallStatus(WindowStallProvidersUnresponsive, true)
 	AssertEqual(t, merged.WindowExpandEvent().Failed, false)
 
@@ -160,7 +160,7 @@ func TestMergedMonitorStallStatus(t *testing.T) {
 	AssertEqual(t, merged.WindowExpandEvent().Failed, true)
 
 	// min satisfied anywhere overrides failed
-	speed.AddWindowExpandEvent(true, 1)
+	speed.AddWindowExpandEvent(true, 1, false)
 	AssertEqual(t, merged.WindowExpandEvent().Failed, false)
 }
 

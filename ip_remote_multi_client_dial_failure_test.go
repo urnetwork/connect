@@ -218,13 +218,13 @@ func TestDialStarvedWindowing(t *testing.T) {
 		t.Fatal("a fresh channel reported starved with no failures")
 	}
 
-	client.addDialFailure("93.184.216.34")
-	client.addDialFailure("142.250.74.100")
+	client.addDialFailure("93.184.216.34", 4)
+	client.addDialFailure("142.250.74.100", 4)
 	if client.dialStarved() {
 		t.Fatal("2 failures (below the threshold) reported starved")
 	}
 
-	client.addDialFailure("93.184.216.34")
+	client.addDialFailure("93.184.216.34", 4)
 	if !client.dialStarved() {
 		t.Fatal("3 failures across 2 destinations with no successes did not report starved")
 	}
@@ -233,7 +233,7 @@ func TestDialStarvedWindowing(t *testing.T) {
 	}
 
 	// a single proven connect in the window resets starvation
-	client.addConnectSuccess()
+	client.addConnectSuccess(4)
 	if client.dialStarved() {
 		t.Fatal("a connect success in the window did not reset starvation")
 	}
@@ -248,9 +248,9 @@ func TestDialStarvedRequiresDistinctDestinations(t *testing.T) {
 	client := &multiClientChannel{settings: DefaultMultiClientSettings()}
 
 	// three strikes, one destination: not starvation
-	client.addDialFailure("93.184.216.34")
-	client.addDialFailure("93.184.216.34")
-	client.addDialFailure("93.184.216.34")
+	client.addDialFailure("93.184.216.34", 4)
+	client.addDialFailure("93.184.216.34", 4)
+	client.addDialFailure("93.184.216.34", 4)
 	if client.dialStarved() {
 		t.Fatal("3 strikes from a single destination reported starved: one dead site convicted the exit")
 	}
@@ -261,7 +261,7 @@ func TestDialStarvedRequiresDistinctDestinations(t *testing.T) {
 
 	// a strike for a second destination makes the span, and the exit is
 	// starved immediately -- demotion stays fast for the real dud
-	client.addDialFailure("142.250.74.100")
+	client.addDialFailure("142.250.74.100", 4)
 	if !client.dialStarved() {
 		t.Fatal("strikes spanning 2 destinations did not report starved")
 	}

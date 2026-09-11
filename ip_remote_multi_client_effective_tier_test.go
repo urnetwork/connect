@@ -21,9 +21,9 @@ func effectiveTierTestChannel(tier int) *multiClientChannel {
 // minimum that satisfies both the failure threshold and the distinct-
 // destination span, so dialStarved reports true.
 func starveChannel(c *multiClientChannel) {
-	c.addDialFailure("93.184.216.34")
-	c.addDialFailure("142.250.74.100")
-	c.addDialFailure("93.184.216.34")
+	c.addDialFailure("93.184.216.34", 4)
+	c.addDialFailure("142.250.74.100", 4)
+	c.addDialFailure("93.184.216.34", 4)
 }
 
 // The demerit table: each live signal adds its quantum on top of the static
@@ -143,7 +143,7 @@ func TestEffectiveTierPromoteSlow(t *testing.T) {
 	fresh := effectiveTierTestChannel(0)
 	fresh.setQuarantined(blackholeNoReceiveAck)
 	fresh.clearQuarantine()
-	fresh.addConnectSuccess()
+	fresh.addConnectSuccess(4)
 	AssertEqual(t, fresh.effectiveTier(), 2)
 
 	// both together promote, and the memory decays rather than being masked
@@ -151,7 +151,7 @@ func TestEffectiveTierPromoteSlow(t *testing.T) {
 	earned.setQuarantined(blackholeNoReceiveAck)
 	earned.clearQuarantine()
 	earned.quarantineLiftTime = time.Now().Add(-quarantineMemoryDuration - time.Minute)
-	earned.addConnectSuccess()
+	earned.addConnectSuccess(4)
 	AssertEqual(t, earned.effectiveTier(), 0)
 	AssertEqual(t, earned.survivedQuarantine, false)
 
@@ -160,7 +160,7 @@ func TestEffectiveTierPromoteSlow(t *testing.T) {
 	relifted := effectiveTierTestChannel(0)
 	relifted.setQuarantined(blackholeNoReceiveAck)
 	relifted.clearQuarantine()
-	relifted.addConnectSuccess()
+	relifted.addConnectSuccess(4)
 	relifted.setQuarantined(blackholeNoReceiveAck)
 	relifted.clearQuarantine()
 	relifted.quarantineLiftTime = time.Now().Add(-quarantineMemoryDuration - time.Minute)
