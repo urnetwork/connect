@@ -63,11 +63,12 @@ func DefaultTunSettingsWithBufferSize(bufferSize int) *TunSettings {
 		// queue in milliseconds), so ordinary bulk transfer still sees
 		// backpressure rather than drops.
 		OutboundQueueWaitTimeout: 250 * time.Millisecond,
-		// must match `DefaultMtu`. packets are written directly into the
-		// receiver tap/tun interface, so this must not exceed the device
-		// interface mtu. IPv6 needs at least tunIpv6MinimumMtu here; below
-		// that the tun is IPv4 only (see the file comment).
-		Mtu: DefaultMtu,
+		// the link mtu, matching the native tunnel interfaces
+		// (`DefaultTunnelMtu`). Packets written into the tun are at most
+		// `DefaultMtu`, which is below this by design. IPv6 needs at least
+		// tunIpv6MinimumMtu here; below that the tun is IPv4 only (see the
+		// file comment).
+		Mtu: DefaultTunnelMtu,
 
 		DialRace:          2,
 		DialRaceTimeout:   2 * time.Second,

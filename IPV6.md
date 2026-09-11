@@ -171,7 +171,14 @@ C1. gVisor tun (`tun.go`). Register `ipv6.NewProtocol` and
 mirroring the v4 allocator; add the `::/0` route; make `write`,
 `WriteBatch`, `tcpInboundFlow` and the endpoint lookup dual-stack; make
 `Tun.dialContext` accept `tcp6`/`udp6` and v6 literals and resolve A and AAAA
-with the shared happy-eyeballs dial. Assert `DefaultMtu >= 1280`.
+with the shared happy-eyeballs dial. The tunnel interface mtu is a separate
+constant, `DefaultTunnelMtu = 1280`: Linux, Darwin and gVisor refuse IPv6 on a
+link below RFC 8200's minimum, but IPv6 does not require packets to be that
+large, and the packet-size contract `DefaultMtu = 1100` is what keeps a full
+return packet inside one optimistic H3 DATAGRAM. Raising the packet size to
+1280 would have moved every full-size H3 packet onto the reliable stream on
+every real path. The tun, the native tunnels and the sdk mtu getter use
+`DefaultTunnelMtu`; the packetizer keeps `DefaultMtu` for both families.
 
 C2. Platform tuns. Android `MainService.kt`: `allowFamily(AF_INET6)`, a v6
 tunnel address, `::/0`, excluded routes for `fe80::/10`, `fc00::/7`,

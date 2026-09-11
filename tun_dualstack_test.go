@@ -32,10 +32,18 @@ func tunTestApplyIpVersion(settings *TunSettings, ipVersion int) *TunSettings {
 }
 
 // The design (IPV6.md C1) requires the DEFAULT tun to carry IPv6, which gVisor
-// only does on a link at least IPv6MinimumMTU wide. DefaultMtu lives in ip.go.
+// only does on a link at least IPv6MinimumMTU wide. The link mtu is
+// DefaultTunnelMtu; the packet-size contract DefaultMtu stays below it so a
+// full return packet keeps fitting one H3 DATAGRAM. Both live in ip.go.
 func TestDefaultMtuCarriesIpv6(t *testing.T) {
-	if DefaultMtu < tunIpv6MinimumMtu {
-		t.Fatalf("DefaultMtu (ip.go) = %d is below the IPv6 minimum mtu %d: a tun at the default mtu is IPv4-only; raise DefaultMtu to at least %d (IPV6.md C1)", DefaultMtu, tunIpv6MinimumMtu, tunIpv6MinimumMtu)
+	if DefaultTunnelMtu < tunIpv6MinimumMtu {
+		t.Fatalf("DefaultTunnelMtu (ip.go) = %d is below the IPv6 minimum mtu %d: a tun at the default mtu is IPv4-only (IPV6.md C1)", DefaultTunnelMtu, tunIpv6MinimumMtu)
+	}
+	if DefaultTunnelMtu < DefaultMtu {
+		t.Fatalf("DefaultTunnelMtu = %d is below the packet-size contract DefaultMtu = %d", DefaultTunnelMtu, DefaultMtu)
+	}
+	if DefaultMtu != 1100 {
+		t.Fatalf("DefaultMtu = %d, want the 1100-byte H3 single-DATAGRAM contract", DefaultMtu)
 	}
 }
 
@@ -107,14 +115,14 @@ func TestTunIpv6MinimumMtu(t *testing.T) {
 	}
 
 	// the default tun follows the same rule (TestDefaultMtuCarriesIpv6 pins
-	// which side of the minimum DefaultMtu must sit on)
+	// which side of the minimum DefaultTunnelMtu must sit on)
 	defaultTun, err := CreateTunWithDefaults(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer defaultTun.Close()
-	if want := tunIpv6MinimumMtu <= DefaultMtu; defaultTun.Ipv6Enabled() != want {
-		t.Fatalf("default tun Ipv6Enabled = %t, want %t for DefaultMtu %d", defaultTun.Ipv6Enabled(), want, DefaultMtu)
+	if want := tunIpv6MinimumMtu <= DefaultTunnelMtu; defaultTun.Ipv6Enabled() != want {
+		t.Fatalf("default tun Ipv6Enabled = %t, want %t for DefaultTunnelMtu %d", defaultTun.Ipv6Enabled(), want, DefaultTunnelMtu)
 	}
 }
 

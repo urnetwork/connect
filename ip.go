@@ -32,11 +32,25 @@ const defaultIpBufferSize = 1024
 // packets are written directly into the receiver tap/tun interface,
 // so the packet size must not exceed the device interface MTU.
 // this is a contract with the devices and must not be raised.
-// DefaultMtu is shared by every native tunnel interface and the provider-side
-// packetizer. At 1,100 bytes, a full steady-state encrypted IP Transfer frame
-// uses H3's reliable stream at QUIC's safe 1,200-byte packet floor; smaller
-// complete messages that fit one DATAGRAM retain the unordered packet lane.
+// DefaultMtu is the largest packet the provider-side packetizer builds, for
+// both families. At 1,100 bytes, a full steady-state encrypted IP Transfer
+// frame uses H3's reliable stream at QUIC's safe 1,200-byte packet floor and
+// fits one DATAGRAM on the optimistic discovered path; smaller complete
+// messages that fit one DATAGRAM retain the unordered packet lane. IPv6 does
+// not require packets to be 1,280 bytes, only that the link carry them, so
+// the packetizer keeps this size for v6 as well and the link requirement
+// lives in DefaultTunnelMtu.
 const DefaultMtu = 1100
+
+// DefaultTunnelMtu is the interface mtu every native tunnel and the gVisor tun
+// configure. It is 1,280 because Linux, Darwin and gVisor refuse IPv6 on a
+// link below RFC 8200's minimum, and it stays a separate constant from
+// DefaultMtu because raising the packet size would take a full return packet
+// off H3's single-DATAGRAM lane on every real path (see the H3 mtu sizing
+// test). Packets the client originates may be as large as this; the transfer
+// batch bound admits an oversized first frame on its own, and the provider
+// side accepts any size the tun can carry. Must never be below DefaultMtu.
+const DefaultTunnelMtu = 1280
 const Ipv4HeaderSizeWithoutExtensions = 20
 const Ipv6HeaderSize = 40
 const UdpHeaderSize = 8

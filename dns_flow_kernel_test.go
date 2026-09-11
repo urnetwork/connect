@@ -150,16 +150,27 @@ func TestDnsFlowKernel(t *testing.T) {
 			}
 			msg.Response = true
 			msg.Authoritative = true
-			if len(msg.Questions) == 1 && msg.Questions[0].Type == dnsmessage.TypeA {
-				msg.Answers = []dnsmessage.Resource{{
-					Header: dnsmessage.ResourceHeader{
-						Name:  msg.Questions[0].Name,
-						Type:  dnsmessage.TypeA,
-						Class: dnsmessage.ClassINET,
-						TTL:   60,
-					},
-					Body: &dnsmessage.AResource{A: [4]byte{127, 0, 0, 1}},
-				}}
+			// dual stack: answer A and AAAA so the kernel exercises both
+			// record types (IPV6.md D3)
+			if len(msg.Questions) == 1 {
+				header := dnsmessage.ResourceHeader{
+					Name:  msg.Questions[0].Name,
+					Type:  msg.Questions[0].Type,
+					Class: dnsmessage.ClassINET,
+					TTL:   60,
+				}
+				switch msg.Questions[0].Type {
+				case dnsmessage.TypeA:
+					msg.Answers = []dnsmessage.Resource{{
+						Header: header,
+						Body:   &dnsmessage.AResource{A: [4]byte{127, 0, 0, 1}},
+					}}
+				case dnsmessage.TypeAAAA:
+					msg.Answers = []dnsmessage.Resource{{
+						Header: header,
+						Body:   &dnsmessage.AAAAResource{AAAA: [16]byte{15: 1}},
+					}}
+				}
 			}
 			out, err := msg.Pack()
 			if err != nil {
@@ -259,7 +270,12 @@ func TestDnsFlowKernel(t *testing.T) {
 		go func(i int) {
 			defer burstWg.Done()
 			queryStart := time.Now()
-			addrs, authoritative := dohCache.QueryResult(ctx, "A", fmt.Sprintf("q%d.dnsflow.test", i))
+			// alternate record types so the run measures A and AAAA equally
+			recordType := "A"
+			if i%2 == 1 {
+				recordType = "AAAA"
+			}
+			addrs, authoritative := dohCache.QueryResult(ctx, recordType, fmt.Sprintf("q%d.dnsflow.test", i))
 			results[i] = queryResult{
 				latency:       time.Since(queryStart),
 				authoritative: authoritative,

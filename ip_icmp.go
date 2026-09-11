@@ -147,7 +147,7 @@ func DefaultIcmpBufferSettingsWithBufferSize(bufferSize int) *IcmpBufferSettings
 		// backends allocate one read and one write buffer of this size per
 		// flow, so it is the dominant per-flow heap item in the budget model
 		// (see providerIcmpFlowByteCount)
-		ReadBufferByteCount: DefaultMtu + 64,
+		ReadBufferByteCount: DefaultTunnelMtu + 64,
 		SequenceBufferSize:  bufferSize,
 		UserLimit:           0,
 		GlobalLimit:         globalLimit,
