@@ -16,8 +16,11 @@ import (
 
 // Address-family policy for this process's CONTROL-PLANE dials: the api
 // https client, the platform control websocket, and the h3/quic transport's
-// name path. The tunnelled user data plane is not affected and is IPv4-only by
-// its own design (see Tun.dialContext).
+// name path. The tunnelled user data plane is not affected: it carries both
+// families and picks an exit by the packet's own version (IPV6.md B3). A
+// family-PINNED platform transport (transport_family.go) obeys a Force by
+// idling and bypasses a demotion by construction, so the policy below only
+// ever steers the family-agnostic dials.
 //
 // Two independent pieces of state live here. The POLICY is what a developer
 // set and is never changed by anything else. The DEMOTION LEDGER (below) is
@@ -42,6 +45,16 @@ const (
 
 var controlIpFamilyPolicy atomic.Int32
 
+// controlFamilyPolicyMonitor wakes whoever parks on the policy -- a pinned
+// platform transport idled by a Force -- when it changes.
+var controlFamilyPolicyMonitor = NewMonitor()
+
+// controlFamilyPolicyNotify closes on the next policy change. Capture it
+// before reading ControlIpFamilyPolicy.
+func controlFamilyPolicyNotify() chan struct{} {
+	return controlFamilyPolicyMonitor.NotifyChannel()
+}
+
 // SetControlIpFamilyPolicy sets the control-plane family policy for this
 // process. An unrecognised value is Auto rather than an error: this is fed
 // from a persisted file and across a gomobile boundary where an older or
@@ -54,7 +67,9 @@ func SetControlIpFamilyPolicy(policy IpFamilyPolicy) {
 	default:
 		policy = IpFamilyAuto
 	}
-	controlIpFamilyPolicy.Store(int32(policy))
+	if controlIpFamilyPolicy.Swap(int32(policy)) != int32(policy) {
+		controlFamilyPolicyMonitor.NotifyAll()
+	}
 }
 
 // ControlIpFamilyPolicy returns the policy alone. It never reflects a learned
@@ -440,6 +455,12 @@ var controlFamilyTunnelInterfacePrefixes = []string{
 // from, and which this project's own tunnels DO use: 192.0.2.0/24 is
 // android's escape-mode tun address (MainService.ESCAPE_FALLBACK_ADDRESS).
 // They pass IsGlobalUnicast, so without this they would read as connectivity.
+//
+// Deliberately NOT here: 192.0.0.0/29, the 464XLAT CLAT range (RFC 7335). On
+// an IPv6-only mobile network the CLAT interface is the device's only IPv4
+// path, and it works -- a v4-pinned platform transport dials through it and
+// proves v4 over NAT64. Listing it would put every such provider to sleep for
+// v4 (transport_family.go).
 var controlFamilyReservedPrefixes = []*net.IPNet{
 	{IP: net.IPv4(192, 0, 2, 0), Mask: net.CIDRMask(24, 32)},    // TEST-NET-1
 	{IP: net.IPv4(198, 51, 100, 0), Mask: net.CIDRMask(24, 32)}, // TEST-NET-2
@@ -503,6 +524,15 @@ func probeFamilySupport(family int) bool {
 		}
 	}
 	return false
+}
+
+// controlFamilyProbe is probeFamilySupport through the ledger's test seam, so
+// a pinned transport's hold and a demotion's guard answer from the same source.
+func controlFamilyProbe(family int) bool {
+	controlFamilyLedger.mu.Lock()
+	probe := controlFamilyLedger.probe
+	controlFamilyLedger.mu.Unlock()
+	return probe(family)
 }
 
 func controlFamilyAddrIP(addr net.Addr) net.IP {

@@ -85,6 +85,19 @@ func dialControlTlsWithFamilyFallback(
 	dial DialContextFunction,
 	handshake func(ctx context.Context, conn net.Conn) (net.Conn, error),
 ) (net.Conn, error) {
+	// A family-pinned platform transport (transport_family.go) tags its dials
+	// with the family it proves. The narrowing happens HERE, above the
+	// strategy's ConnectSettings.DialContext, so name resolution below it
+	// requests only the pinned record type, and a Force that contradicts the
+	// pin surfaces there as the error the transport idles on.
+	pinnedFamily := pinnedIpFamilyFromContext(ctx)
+	if pinnedFamily != 0 {
+		narrowed, err := pinnedDialNetwork(network, pinnedFamily)
+		if err != nil {
+			return nil, err
+		}
+		network = narrowed
+	}
 	conn, err := dial(ctx, network, addr)
 	if err != nil {
 		conn, err = redialWithoutAContradictedDemotion(ctx, network, addr, dial, err)
@@ -111,6 +124,15 @@ func dialControlTlsWithFamilyFallback(
 	}
 	conn.Close()
 
+	// A pinned dial has nowhere else to go, but a handshake that stalled on
+	// its family is still evidence for the ledger the family-agnostic dials
+	// read: it is recorded (subject to the same guards) and not retried.
+	if pinnedFamily != 0 {
+		if isPathTimeout(err) && failed != 0 && ctx.Err() == nil && !isIPLiteralDialAddr(addr) {
+			controlFamilyDemote(failed)
+		}
+		return nil, err
+	}
 	// only a family-agnostic dial has somewhere else to go
 	if network != "tcp" && network != "udp" {
 		return nil, err
