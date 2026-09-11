@@ -51,6 +51,10 @@ func DefaultTunSettings() *TunSettings {
 func DefaultTunSettingsWithBufferSize(bufferSize int) *TunSettings {
 	return &TunSettings{
 		ChannelSize: bufferSize,
+		// Far above a healthy drain interval (the reader empties a full
+		// queue in milliseconds), so ordinary bulk transfer still sees
+		// backpressure rather than drops.
+		OutboundQueueWaitTimeout: 250 * time.Millisecond,
 		// must match `DefaultMtu`. packets are written directly into the
 		// receiver tap/tun interface, so this must not exceed the device
 		// interface mtu.
@@ -110,6 +114,12 @@ type TunSettings struct {
 
 	ChannelSize int
 	Mtu         int
+	// OutboundQueueWaitTimeout bounds how long netstack waits for space in
+	// the outbound (tun read) queue before dropping the rest of a write. The
+	// queue's consumer can be inside an inbound injection itself (SendPacket
+	// -> receive callback -> Tun.Write -> gVisor reply), which would otherwise
+	// deadlock the whole stack. Non-positive waits without bound.
+	OutboundQueueWaitTimeout time.Duration
 
 	DialRace        int
 	DialRaceTimeout time.Duration
@@ -484,6 +494,14 @@ type tunLinkEndpoint struct {
 	*channel.Endpoint
 	ctx   context.Context
 	space chan struct{}
+	// waitTimeout bounds how long a netstack writer waits for outbound queue
+	// space before the rest of its batch is dropped (counted in dropCount).
+	// The goroutine that drains this queue can itself be inside an inbound
+	// injection (SendPacket -> receive callback -> Tun.Write -> gVisor reply),
+	// so an unbounded wait is a self-deadlock. Non-positive keeps the
+	// unbounded backpressure.
+	waitTimeout time.Duration
+	dropCount   atomic.Uint64
 
 	// dispatcher is the NIC's network dispatcher, captured at Attach so
 	// WriteBatch can deliver GRO-coalesced packets through the same path
@@ -505,7 +523,7 @@ func (self *tunLinkEndpoint) networkDispatcher() stack.NetworkDispatcher {
 	return self.dispatcher
 }
 
-func newTunLinkEndpoint(ctx context.Context, size int, mtu uint32, linkAddr tcpip.LinkAddress) *tunLinkEndpoint {
+func newTunLinkEndpoint(ctx context.Context, size int, mtu uint32, linkAddr tcpip.LinkAddress, waitTimeout time.Duration) *tunLinkEndpoint {
 	endpoint := channel.New(size, mtu, linkAddr)
 	// Inbound packets originate from the in-process user NAT over an
 	// authenticated tunnel, so ip/tcp checksum validation here is redundant
@@ -516,9 +534,10 @@ func newTunLinkEndpoint(ctx context.Context, size int, mtu uint32, linkAddr tcpi
 	// packet as checksum-invalid.
 	endpoint.LinkEPCapabilities |= stack.CapabilityRXChecksumOffload
 	return &tunLinkEndpoint{
-		Endpoint: endpoint,
-		ctx:      ctx,
-		space:    make(chan struct{}, 1),
+		Endpoint:    endpoint,
+		ctx:         ctx,
+		space:       make(chan struct{}, 1),
+		waitTimeout: waitTimeout,
 	}
 }
 
@@ -549,6 +568,12 @@ func (self *tunLinkEndpoint) WritePackets(packets stack.PacketBufferList) (int, 
 	packetSlice := packets.AsSlice()
 	written := 0
 	remaining := packets
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
 	for {
 		n, err := self.Endpoint.WritePackets(remaining)
 		written += n
@@ -566,10 +591,27 @@ func (self *tunLinkEndpoint) WritePackets(packets stack.PacketBufferList) (int, 
 			}
 		}
 
+		if self.waitTimeout <= 0 {
+			select {
+			case <-self.ctx.Done():
+				return written, &tcpip.ErrClosedForSend{}
+			case <-self.space:
+			}
+			continue
+		}
+		if timer == nil {
+			timer = time.NewTimer(self.waitTimeout)
+		}
 		select {
 		case <-self.ctx.Done():
 			return written, &tcpip.ErrClosedForSend{}
 		case <-self.space:
+		case <-timer.C:
+			// Drop the rest like a saturated NIC queue would. The caller keeps
+			// its own packet references, so nothing is released here; TCP
+			// recovers by retransmission once the queue drains.
+			self.dropCount.Add(uint64(len(packetSlice) - written))
+			return written, nil
 		}
 	}
 }
@@ -610,6 +652,7 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 		settings.ChannelSize,
 		uint32(settings.Mtu),
 		tcpip.LinkAddress(fmt.Sprintf("%x", nicId)),
+		settings.OutboundQueueWaitTimeout,
 	)
 
 	releaseOnError := func() {
@@ -1289,6 +1332,12 @@ func (self *Tun) Close() error {
 }
 
 // Stats returns the gVisor stack statistics for this Tun's private stack.
+// OutboundDropCount is the number of netstack packets dropped because the
+// outbound queue stayed full past OutboundQueueWaitTimeout.
+func (self *Tun) OutboundDropCount() uint64 {
+	return self.ep.dropCount.Load()
+}
+
 func (self *Tun) Stats() tcpip.Stats {
 	return self.stack.Stats()
 }
