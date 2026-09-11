@@ -276,6 +276,16 @@ type UpgradeMux struct {
 	// cannot clear it.
 	blocker atomic.Pointer[Blocker]
 
+	// ipv6Unroutable, when set and true, answers every AAAA query with an
+	// empty NOERROR without an upstream lookup (IPV6.md B6): the windows have
+	// formed and no exit can carry v6, so a v6 address would only send the
+	// app into a blackholed connect until its own fallback fires, which many
+	// apps lack. The multi client owns the answer; the device installs it
+	// through SetIpv6Unroutable, outside the swappable settings like the
+	// blocker. A NOERROR with no records (not NXDOMAIN) keeps the A answer
+	// for the same name valid.
+	ipv6Unroutable atomic.Pointer[func() bool]
+
 	// fallbackDohCache resolves over the local host egress (not the tun); the handicapped local
 	// fallback used when the tunnel-DoH is slow to come up. nil when no Fallback is configured.
 	fallbackDohCache atomic.Pointer[DohCache]
@@ -1080,6 +1090,24 @@ func (self *UpgradeMux) getBlocker() Blocker {
 	return nil
 }
 
+// SetIpv6Unroutable installs (or, with nil, removes) the predicate that
+// reports whether the tunnel currently has no exit able to carry IPv6. While
+// it reports true, AAAA queries are answered empty; see the field comment.
+func (self *UpgradeMux) SetIpv6Unroutable(ipv6Unroutable func() bool) {
+	if ipv6Unroutable == nil {
+		self.ipv6Unroutable.Store(nil)
+	} else {
+		self.ipv6Unroutable.Store(&ipv6Unroutable)
+	}
+}
+
+func (self *UpgradeMux) isIpv6Unroutable() bool {
+	if f := self.ipv6Unroutable.Load(); f != nil {
+		return (*f)()
+	}
+	return false
+}
+
 // tunnelDohCold reports whether the tunnel-DoH path is cold: it has never
 // answered on this mux, its last success lease expired while idle, or it has
 // failed tunnelDohColdFailureCount consecutive resolutions. While cold, dns
@@ -1559,6 +1587,24 @@ func (self *UpgradeMux) handleDns(source TransferPath, provideMode protocol.Prov
 			addrs = []netip.Addr{netip.IPv6Unspecified()}
 		}
 		respPayload, err := buildDnsResponse(header.ID, question, addrs, responseTtl)
+		if err != nil {
+			return false
+		}
+		reverse := ipPath.Reverse()
+		self.mux.deliverDownstream(source, provideMode, reverse, ipOosPacket(reverse, respPayload))
+		return true
+	}
+
+	// while no exit can carry v6, an AAAA answers empty NOERROR locally so
+	// the app connects over v4 at once instead of timing out on a v6 address
+	// the tunnel cannot route (IPV6.md B6). Never cached and never recorded
+	// in the reverse index: the answer describes the tunnel, not the name.
+	if question.Type == dnsmessage.TypeAAAA && self.isIpv6Unroutable() {
+		var responseTtl uint32
+		if dns := self.settings.Load().Dns; dns != nil {
+			responseTtl = dns.ResponseTtl
+		}
+		respPayload, err := buildDnsResponse(header.ID, question, nil, responseTtl)
 		if err != nil {
 			return false
 		}

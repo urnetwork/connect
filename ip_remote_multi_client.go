@@ -5850,7 +5850,7 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 	packet []byte,
 	timeout time.Duration,
 ) bool {
-	if isIpv4FragmentPacket(packet) {
+	if isIpFragmentPacket(packet) {
 		result := self.egressIpv4Fragments.processOwned(
 			source,
 			TransferKey{},
@@ -5858,7 +5858,7 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 			packet,
 		)
 		if result.packet != nil {
-			if self.sendReassembledIpv4UdpFragments(
+			if self.sendReassembledUdpFragments(
 				source,
 				provideMode,
 				result.packet,
@@ -5868,7 +5868,7 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 				result.fragments = nil
 			}
 		}
-		returnIpv4FragmentProcessResult(result)
+		returnIpFragmentProcessResult(result)
 		// The fragment owner has been consumed by the bounded gate even when
 		// the completed datagram is later rejected by security policy.
 		return true
@@ -5999,7 +5999,7 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 // exact-flow group. Fragmented TCP is deliberately unsupported: normal TCP
 // uses MSS, while accepting a partial transport header could evade the SMTP
 // state machine or another flow policy.
-func (self *RemoteUserNatMultiClient) sendReassembledIpv4UdpFragments(
+func (self *RemoteUserNatMultiClient) sendReassembledUdpFragments(
 	source TransferPath,
 	provideMode protocol.ProvideMode,
 	reassembled []byte,
@@ -6010,7 +6010,7 @@ func (self *RemoteUserNatMultiClient) sendReassembledIpv4UdpFragments(
 		return false
 	}
 	ipPath, payload, err := ParseIpPathWithPayload(reassembled)
-	if err != nil || ipPath.Version != 4 || ipPath.Protocol != IpProtocolUdp {
+	if err != nil || ipPath.Protocol != IpProtocolUdp {
 		return false
 	}
 	relationship := egressRelationship(provideMode, self.provideMode)
@@ -6107,7 +6107,7 @@ func (self *RemoteUserNatMultiClient) SendPacketBatch(
 ) int {
 	containsFragments := false
 	for _, packet := range packets {
-		if isIpv4FragmentPacket(packet) {
+		if isIpFragmentPacket(packet) {
 			containsFragments = true
 			break
 		}
@@ -6133,7 +6133,7 @@ func (self *RemoteUserNatMultiClient) SendPacketBatch(
 		}
 	}
 	for i, packet := range packets {
-		if !isIpv4FragmentPacket(packet) {
+		if !isIpFragmentPacket(packet) {
 			continue
 		}
 		flushComplete(i)
@@ -16615,7 +16615,7 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 				ipPacketFromProvider := ipPacketFromProvider_.(*protocol.IpPacketFromProvider)
 
 				packet := ipPacketFromProvider.IpPacket.PacketBytes
-				if isIpv4FragmentPacket(packet) {
+				if isIpFragmentPacket(packet) {
 					result := self.ingressIpv4Fragments.processOwned(
 						source,
 						peer.TransferKey,
@@ -16624,7 +16624,7 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 					)
 					if result.packet != nil {
 						ipPath, parseErr := ParseIpPath(result.packet)
-						if parseErr == nil && ipPath.Version == 4 && ipPath.Protocol == IpProtocolUdp {
+						if parseErr == nil && ipPath.Protocol == IpProtocolUdp {
 							for _, fragment := range result.fragments {
 								self.addReceiveAck(ByteCount(len(fragment)))
 								if batch {
@@ -16646,7 +16646,7 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 							result.fragments = nil
 						}
 					}
-					returnIpv4FragmentProcessResult(result)
+					returnIpFragmentProcessResult(result)
 					continue
 				}
 
