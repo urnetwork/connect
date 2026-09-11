@@ -308,3 +308,45 @@ func TestSelectiveAckGapSkipsReliableItemsNotYetLateInMixedLanes(t *testing.T) {
 		t.Fatal("single-lane gap recovery regressed")
 	}
 }
+
+// A timed-out reliable-carried item waits (at most twice) while cumulative
+// acks are still advancing; it is re-sent at once when acks have stalled or
+// when it rode the unreliable lane.
+func TestSendSequenceDefersTimeoutResendWhileAcksProgress(t *testing.T) {
+	settings := DefaultSendBufferSettings()
+	sequence := testUnreliableRecoverySequence(settings)
+	sequence.client = &Client{}
+	sequence.flightController = newSendFlightController(settings)
+	now := time.Now()
+
+	item := &sendItem{transferFrameBytes: make([]byte, 64)}
+	sequence.observeCarrierWrite(item, transferWriteDisposition{reliable: true})
+	sequence.lastHeadAckTime = now.Add(-50 * time.Millisecond)
+	if !sequence.deferTimeoutResend(item, now) || item.timeoutDeferCount != 1 || !item.resendTime.After(now) {
+		t.Fatalf("first deferral: count=%d resendTime=%s", item.timeoutDeferCount, item.resendTime)
+	}
+	if !sequence.deferTimeoutResend(item, now) || item.timeoutDeferCount != 2 {
+		t.Fatalf("second deferral: count=%d", item.timeoutDeferCount)
+	}
+	if sequence.deferTimeoutResend(item, now) {
+		t.Fatal("third deferral granted; must resend")
+	}
+	if sequence.client.SendRecoveryStats().TimeoutResendDeferCount != 2 {
+		t.Fatalf("deferral stat = %d, want 2", sequence.client.SendRecoveryStats().TimeoutResendDeferCount)
+	}
+
+	stalled := &sendItem{transferFrameBytes: make([]byte, 64)}
+	sequence.observeCarrierWrite(stalled, transferWriteDisposition{reliable: true})
+	sequence.lastHeadAckTime = now.Add(-30 * time.Second)
+	if sequence.deferTimeoutResend(stalled, now) {
+		t.Fatal("deferred a timeout while acks were stalled")
+	}
+
+	unreliable := &sendItem{transferFrameBytes: make([]byte, 64)}
+	sequence.observeCarrierWrite(unreliable, transferWriteDisposition{unreliable: true})
+	sequence.lastHeadAckTime = now
+	if sequence.deferTimeoutResend(unreliable, now) {
+		t.Fatal("deferred a timeout of an unreliable-carried item")
+	}
+	sequence.releaseUnreliableFlight(unreliable)
+}
