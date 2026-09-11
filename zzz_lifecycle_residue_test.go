@@ -26,10 +26,11 @@ func lifecycleResidueStacks() []byte {
 	}
 }
 
-// A package-wide run may retain fixed process workers, including exactly one
-// lazily initialized default address allocator. Per-client contract workers,
-// per-peer ICE loops and additional address producers must have been joined by
-// the test that owned them before package qualification can succeed.
+// A package-wide run may retain fixed process workers, including the two
+// lazily initialized default address allocators (one per ip family; see the
+// tun allocators). Per-client contract workers, per-peer ICE loops and
+// additional address producers must have been joined by the test that owned
+// them before package qualification can succeed.
 func TestZZZNoPerInstanceLifecycleResidue(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -46,7 +47,7 @@ func TestZZZNoPerInstanceLifecycleResidue(t *testing.T) {
 			stackBytes,
 			"(*AddrGenerator).run(",
 		)
-		if contractWorkerCount == 0 && iceWorkerCount == 0 && addressWorkerCount <= 1 {
+		if contractWorkerCount == 0 && iceWorkerCount == 0 && addressWorkerCount <= 2 {
 			return
 		}
 		if deadline.Before(time.Now()) {
