@@ -130,7 +130,7 @@ func TestMultiClientMonitorBlockedCallbackCannotBlockMaintenance(t *testing.T) {
 	id3 := NewId()
 	id4 := NewId()
 	id5 := NewId()
-	monitor.AddProviderEvent(id1, ProviderStateInEvaluation, id1, nil)
+	monitor.AddProviderEvent(id1, ProviderStateInEvaluation, id1, nil, IpFamilyLegacy)
 	select {
 	case <-started:
 	case <-time.After(time.Second):
@@ -142,11 +142,11 @@ func TestMultiClientMonitorBlockedCallbackCannotBlockMaintenance(t *testing.T) {
 	publishDone := make(chan struct{})
 	go func() {
 		defer close(publishDone)
-		monitor.AddProviderEvent(id2, ProviderStateAdded, id2, nil)
-		monitor.AddProviderEvent(id3, ProviderStateEvaluationFailed, id3, nil)
-		monitor.AddProviderEvent(id4, ProviderStateNotAdded, id4, nil)
-		monitor.AddProviderEvent(id1, ProviderStateRemoved, id1, nil)
-		monitor.AddProviderEvent(id5, ProviderStateInEvaluation, id5, nil)
+		monitor.AddProviderEvent(id2, ProviderStateAdded, id2, nil, IpFamilyLegacy)
+		monitor.AddProviderEvent(id3, ProviderStateEvaluationFailed, id3, nil, IpFamilyLegacy)
+		monitor.AddProviderEvent(id4, ProviderStateNotAdded, id4, nil, IpFamilyLegacy)
+		monitor.AddProviderEvent(id1, ProviderStateRemoved, id1, nil, IpFamilyLegacy)
+		monitor.AddProviderEvent(id5, ProviderStateInEvaluation, id5, nil, IpFamilyLegacy)
 	}()
 	select {
 	case <-publishDone:
@@ -206,7 +206,7 @@ func TestMultiClientMonitorCallbackPanicIsListenerLocal(t *testing.T) {
 	})
 	defer unsub()
 
-	monitor.AddProviderEvent(NewId(), ProviderStateAdded, NewId(), nil)
+	monitor.AddProviderEvent(NewId(), ProviderStateAdded, NewId(), nil, IpFamilyLegacy)
 	waitForTestCondition(t, time.Second, func() bool {
 		return calls.Load() == 1
 	}, "first callback did not run")
@@ -216,7 +216,7 @@ func TestMultiClientMonitorCallbackPanicIsListenerLocal(t *testing.T) {
 		t.Fatal("listener panic was isolated but not reported")
 	}
 
-	monitor.AddProviderEvent(NewId(), ProviderStateAdded, NewId(), nil)
+	monitor.AddProviderEvent(NewId(), ProviderStateAdded, NewId(), nil, IpFamilyLegacy)
 	waitForTestCondition(t, time.Second, func() bool {
 		return 2 <= calls.Load()
 	}, "callback worker died after listener panic")
@@ -247,9 +247,9 @@ func TestMergedMultiClientMonitorResetIncludesEveryWindow(t *testing.T) {
 
 	firstId := NewId()
 	secondId := NewId()
-	first.AddProviderEvent(firstId, ProviderStateAdded, firstId, nil)
+	first.AddProviderEvent(firstId, ProviderStateAdded, firstId, nil, IpFamilyLegacy)
 	waitForStallStart(t, gate)
-	second.AddProviderEvent(secondId, ProviderStateAdded, secondId, nil)
+	second.AddProviderEvent(secondId, ProviderStateAdded, secondId, nil, IpFamilyLegacy)
 	// Inject the bounded reset that an underlying listener produces on
 	// overflow. Call its merge adapter directly so the test does not depend
 	// on scheduler timing between two asynchronous callback workers.
@@ -548,7 +548,7 @@ func TestMultiClientMonitorProviderEventCarriesDetails(t *testing.T) {
 	defer unsub()
 
 	before := time.Now()
-	monitor.AddProviderEvent(windowClientId, ProviderStateAdded, egressClientId, location)
+	monitor.AddProviderEvent(windowClientId, ProviderStateAdded, egressClientId, location, IpFamilyLegacy)
 	after := time.Now()
 
 	_, events := monitor.Events()
@@ -581,7 +581,7 @@ func TestMultiClientMonitorProviderEventCarriesDetails(t *testing.T) {
 		t.Fatal("callback diff was not delivered")
 	}
 
-	monitor.AddProviderEvent(windowClientId, ProviderStateRemoved, egressClientId, location)
+	monitor.AddProviderEvent(windowClientId, ProviderStateRemoved, egressClientId, location, IpFamilyLegacy)
 	if _, events := monitor.Events(); events[windowClientId] != nil {
 		t.Fatal("terminal event did not delete the retained provider")
 	}

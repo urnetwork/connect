@@ -79,6 +79,10 @@ type ProviderEvent struct {
 	// Location is the egress provider's location. nil when unknown. Immutable
 	// — events are shallow-cloned and the pointee is shared.
 	Location *ProviderLocation
+	// IpFamily is the egress provider's address-family category. Legacy
+	// (empty) reads as v4-only. This is what the apps' histogram and provider
+	// rows show.
+	IpFamily IpFamily
 }
 
 func DefaultRemoteUserNatMultiClientMonitorSettings() *RemoteUserNatMultiClientMonitorSettings {
@@ -440,7 +444,7 @@ func (self *RemoteUserNatMultiClientMonitor) SetStallStatus(reason string, faile
 }
 
 // provider events are serialized per `clientId`
-func (self *RemoteUserNatMultiClientMonitor) AddProviderEvent(clientId Id, state ProviderState, egressClientId Id, location *ProviderLocation) {
+func (self *RemoteUserNatMultiClientMonitor) AddProviderEvent(clientId Id, state ProviderState, egressClientId Id, location *ProviderLocation, ipFamily IpFamily) {
 	var windowExpandEvent WindowExpandEvent
 	clientIdProviderEvents := map[Id]*ProviderEvent{}
 
@@ -454,6 +458,7 @@ func (self *RemoteUserNatMultiClientMonitor) AddProviderEvent(clientId Id, state
 			State:          state,
 			EgressClientId: egressClientId,
 			Location:       location,
+			IpFamily:       ipFamily,
 		}
 
 		// self.providerEvents = append(self.providerEvents, providerEvent)

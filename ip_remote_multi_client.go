@@ -84,6 +84,10 @@ type DestinationStats struct {
 	// find-providers2. nil for fixed client-id and restored-identity
 	// destinations, which bypass discovery.
 	Location *ProviderLocation
+	// IpFamily is the destination provider's proven address-family
+	// category from find-providers2. Legacy (empty) for fixed and restored
+	// destinations and for older servers; legacy carries v4 only.
+	IpFamily IpFamily
 }
 
 type WindowType int
@@ -135,6 +139,15 @@ type MultiClientGenerator interface {
 // straight back by the next discovery call.
 type MultiClientGeneratorExcluder interface {
 	ExcludeClientId(clientId Id)
+}
+
+// MultiClientGeneratorWithIpFamily is an optional generator capability:
+// discover destinations that satisfy an address-family filter. A window uses
+// it to fill a family shortfall (see WindowSizeSettings.WindowSizeMinIpv6Capable).
+// A generator without it is called through `NextDestinations` and its
+// destinations are treated as legacy, which carries v4 only.
+type MultiClientGeneratorWithIpFamily interface {
+	NextDestinationsWithIpFamily(count int, excludeDestinations []MultiHopId, rankMode string, ipFamily IpFamilyFilter) (map[MultiHopId]DestinationStats, error)
 }
 
 func DefaultMultiClientSettings() *MultiClientSettings {
@@ -8155,6 +8168,9 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 type ExitInfo struct {
 	ClientId   Id
 	WindowType WindowType
+	// IpFamily is the exit's address-family category as discovered, after any
+	// local downgrade. Legacy reads as v4-only.
+	IpFamily IpFamily
 	// Warning marks a client new flows already avoid -- either unhealthy or
 	// past MaxClientLifetime and draining. Note this is isWarning(), which is
 	// true for a quarantined exit as well: quarantine's whole mechanism is
@@ -8263,6 +8279,7 @@ func (self *RemoteUserNatMultiClient) Exits() []*ExitInfo {
 			exitInfo := &ExitInfo{
 				ClientId:   clientId,
 				WindowType: windowType,
+				IpFamily:   client.args.IpFamily,
 				Warning:    client.isWarning(),
 				// each of these takes only the channel's own stateLock, and the
 				// parent lock is released above -- the same discipline the rest
@@ -10953,7 +10970,7 @@ func (self *multiClientWindow) expand(
 			// Calling RemoveClientArgs here would revoke the derived JWT first
 			// and turn the channel's final contract closes into 401s.
 			client.Cancel()
-			self.monitor.AddProviderEvent(args.ClientId, ProviderStateAdded, args.Destination.Tail(), args.Location)
+			self.monitor.AddProviderEvent(args.ClientId, ProviderStateAdded, args.Destination.Tail(), args.Location, args.IpFamily)
 			return false
 		}
 		if !self.strictWindowAdmissionAllowed(clientId, windowSize) {
@@ -10967,7 +10984,7 @@ func (self *multiClientWindow) expand(
 			// ownership without disturbing an existing flow. The channel owns
 			// its generator args at this point; do not return them separately.
 			client.Cancel()
-			self.monitor.AddProviderEvent(args.ClientId, ProviderStateNotAdded, args.Destination.Tail(), args.Location)
+			self.monitor.AddProviderEvent(args.ClientId, ProviderStateNotAdded, args.Destination.Tail(), args.Location, args.IpFamily)
 			return false
 		}
 
@@ -10991,7 +11008,7 @@ func (self *multiClientWindow) expand(
 			// while the client is still routing.
 			replacedClient.Cancel()
 		}
-		self.monitor.AddProviderEvent(args.ClientId, ProviderStateAdded, args.Destination.Tail(), args.Location)
+		self.monitor.AddProviderEvent(args.ClientId, ProviderStateAdded, args.Destination.Tail(), args.Location, args.IpFamily)
 		// the outcome watchdog stands down: this window has proven it can
 		// install a provider (and a latched failed state is cleared)
 		self.noteClientAdded(client)
@@ -11022,7 +11039,7 @@ func (self *multiClientWindow) expand(
 		// cancellation cleanup returns them through RemoveClientWithArgs after
 		// the Client/OOB join; do not also revoke them directly here.
 		candidate.client.Cancel()
-		self.monitor.AddProviderEvent(candidate.args.ClientId, ProviderStateNotAdded, candidate.args.Destination.Tail(), candidate.args.Location)
+		self.monitor.AddProviderEvent(candidate.args.ClientId, ProviderStateNotAdded, candidate.args.Destination.Tail(), candidate.args.Location, candidate.args.IpFamily)
 	}
 
 	// admitPending admits from the evaluated pool while budget remains. Every
@@ -11191,7 +11208,7 @@ func (self *multiClientWindow) expand(
 				providerFailure := self.recordChannelCreationFailure(evaluationCtx, args, err)
 				self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
 				if providerFailure {
-					self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed, args.Destination.Tail(), args.Location)
+					self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed, args.Destination.Tail(), args.Location, args.IpFamily)
 				}
 			} else {
 
@@ -11212,7 +11229,7 @@ func (self *multiClientWindow) expand(
 					// The channel cleanup owns the generator args and preserves the
 					// derived identity through its final contract-close controls.
 					client.Cancel()
-					self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed, args.Destination.Tail(), args.Location)
+					self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed, args.Destination.Tail(), args.Location, args.IpFamily)
 					return true
 				}
 				pingStartedAt := time.Now()
@@ -11269,7 +11286,7 @@ func (self *multiClientWindow) expand(
 						addedP2pOnly += 1
 					}
 
-					self.monitor.AddProviderEvent(args.ClientId, ProviderStateInEvaluation, args.Destination.Tail(), args.Location)
+					self.monitor.AddProviderEvent(args.ClientId, ProviderStateInEvaluation, args.Destination.Tail(), args.Location, args.IpFamily)
 
 					success, err := client.SendDetailedMessage(
 						&protocol.IpPing{},
@@ -11977,7 +11994,7 @@ func (self *multiClientWindow) Close() {
 
 func (self *multiClientWindow) removeClients(removedClients ...*multiClientChannel) {
 	for _, client := range removedClients {
-		self.monitor.AddProviderEvent(client.ClientId(), ProviderStateRemoved, client.args.Destination.Tail(), client.args.Location)
+		self.monitor.AddProviderEvent(client.ClientId(), ProviderStateRemoved, client.args.Destination.Tail(), client.args.Location, client.args.IpFamily)
 	}
 	for _, client := range removedClients {
 		self.clientRemoveCallback(client)
