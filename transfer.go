@@ -1364,6 +1364,7 @@ type ClientSendRecoveryStatsSnapshot struct {
 	InitialMessageByteCount               uint64
 	TimeoutResendWriteCount               uint64
 	AckPendingResendPreemptCount          uint64
+	TimeoutResendDeferCount               uint64
 	CarrierChangeWriteCount               uint64
 	SelectiveGapWriteCount                uint64
 	AckTailProbeWriteCount                uint64
@@ -1452,6 +1453,7 @@ type Client struct {
 	selectiveGapWriteCount                 atomic.Uint64
 	timeoutResendWriteCount                atomic.Uint64
 	ackPendingResendPreemptCount           atomic.Uint64
+	timeoutResendDeferCount                atomic.Uint64
 	carrierChangeWriteCount                atomic.Uint64
 	ackTailProbeWriteCount                 atomic.Uint64
 	cumulativeProbeWriteCount              atomic.Uint64
@@ -1789,6 +1791,7 @@ func (self *Client) SendRecoveryStats() ClientSendRecoveryStatsSnapshot {
 		InitialMessageByteCount:             self.initialSendMessageByteCount.Load(),
 		TimeoutResendWriteCount:             self.timeoutResendWriteCount.Load(),
 		AckPendingResendPreemptCount:        self.ackPendingResendPreemptCount.Load(),
+		TimeoutResendDeferCount:             self.timeoutResendDeferCount.Load(),
 		CarrierChangeWriteCount:             self.carrierChangeWriteCount.Load(),
 		SelectiveGapWriteCount:              self.selectiveGapWriteCount.Load(),
 		AckTailProbeWriteCount:              self.ackTailProbeWriteCount.Load(),
@@ -4755,6 +4758,8 @@ type SendSequence struct {
 	idleCondition *IdleCondition
 
 	rttWindow *RttWindow
+	// lastHeadAckTime is when the cumulative (head) ACK last advanced.
+	lastHeadAckTime time.Time
 
 	contractMultiRouteWriter            MultiRouteWriter
 	contractMultiRouteWriterDestination TransferPath
@@ -5872,6 +5877,7 @@ sendSequenceLoop:
 		ackSnapshot := ackWindow.Snapshot(true)
 		ackUpdated := 0 < ackSnapshot.ackUpdateCount || 0 < len(ackSnapshot.selectiveAcks)
 		if 0 < ackSnapshot.ackUpdateCount {
+			self.lastHeadAckTime = time.Now()
 			self.receiveAck(
 				ackSnapshot.headAck.messageId,
 				false,
@@ -5992,6 +5998,10 @@ sendSequenceLoop:
 				// ordinary cadence. Any resend awaits fresh acknowledgement state.
 				recoveryKind := item.recoveryKind
 				item.recoveryKind = sendRecoveryNone
+				if recoveryKind == sendRecoveryNone && self.deferTimeoutResend(item, sendTime) {
+					self.resendQueue.Add(item)
+					continue
+				}
 				reliableOnlyResend := false
 				if recoveryKind == sendRecoveryNone && item.unreliableFlightTracked {
 					reliableOnlyResend = self.observeUnreliableResendTimeout(item, flightPolicy)
@@ -7426,6 +7436,28 @@ func (self *SendSequence) observeAckRtt(item *sendItem, tag sequenceTag) {
 	self.rttWindow.CloseSendTime(tag.sendTime)
 }
 
+// deferTimeoutResend reports whether a timed-out item carried by a reliable
+// lane should wait one more scaled RTT instead of being re-sent now. While
+// the cumulative ACK is still advancing, an item behind the head is queued,
+// not lost (a real hole is recovered from selective ACKs); re-sending it only
+// deepens the queue that delayed its ACK, which is the spurious-RTO cascade
+// observed with a direct lane live. Bounded to two deferrals per item so a
+// genuine loss is still re-sent.
+func (self *SendSequence) deferTimeoutResend(item *sendItem, now time.Time) bool {
+	if item == nil || item.unreliableFlightTracked || 2 <= item.timeoutDeferCount ||
+		self.lastHeadAckTime.IsZero() {
+		return false
+	}
+	rtt := self.rttWindow.ScaledRtt()
+	if rtt < now.Sub(self.lastHeadAckTime) {
+		return false
+	}
+	item.timeoutDeferCount += 1
+	item.resendTime = now.Add(rtt)
+	self.client.timeoutResendDeferCount.Add(1)
+	return true
+}
+
 func (self *SendSequence) unreliableFlightGates(
 	policy transferFlightPolicySnapshot,
 ) bool {
@@ -8029,6 +8061,9 @@ type sendItem struct {
 	ackTailProbeCount     int
 	recoveryKind          sendRecoveryKind
 	promotedHead          bool
+	// timeoutDeferCount bounds how many times a timed-out item waits one more
+	// RTT while cumulative ACKs are still advancing (deferTimeoutResend).
+	timeoutDeferCount int
 	// forceUnwrapped pins this item to plaintext on every (re)send, so the
 	// outer wrap is skipped even if the per-peer cipher becomes available
 	// between the initial send and a retransmit.
