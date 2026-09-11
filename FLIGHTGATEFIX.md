@@ -1,6 +1,7 @@
 # FLIGHTGATEFIX: peer review and research plan for the pinned-provider collapse
 
-Status: research plan, 2026-09-10, revision 2. Nothing in this document is
+Status: research plan, 2026-09-10, revision 3 (§12 carries the Phase 0 and
+device results and the program change). Nothing in this document is
 implemented in this tree. The reporter's work lives on the
 `Ryanmello07/connect` fork (`beta/custom-server`) and in two upstream pull
 requests, urnetwork/connect#208 (transfer and p2p) and #209 (tun). Neither PR
@@ -345,3 +346,120 @@ both hosts; the client-registration leak is a separate bug.
   far end? That separates M1 to M4 from M6.
 - Willingness to split #208 per mechanism, and to run the static low-bar
   matrix on the fork before the split lands.
+
+## 12. Revision 3: Phase 0 and device results, reporter feedback, program change
+
+### 12.1 Reporter feedback on environments
+
+The reporter: "testing in a simulated perfect environment this issue may
+not show, which is why I had to host a provider that's a bit distant from
+me to get an accurate baseline." Accepted, and it matches the mechanism
+list: the collapse needs a direct lane that is lossy or reorders against a
+relay with 150 to 300 ms of RTT. A clean LAN profile shows neither. The
+PERFVAR mixed route therefore uses only the lossy direct profiles with the
+distant relay; `clean-lan` on the mixed route is a control that must not
+collapse. Real radios remain the primary evidence, and the third report's
+regression tests (12.3) were checked against the same rule.
+
+### 12.2 Device baseline (stream C, stock counters build)
+
+Pixel 8 Pro and Galaxy S24 Ultra, identical diagnostic build, pinned to
+each other as network peers, four-stream download, twelve 15 s windows per
+run, six runs per role assignment. The direct fast path was active from the
+first window in 11 of 12 runs.
+
+| Client to provider | Median per run (Mb/s) | Dead windows (< 5 Mb/s) |
+|---|---|---|
+| S24 on LTE to Pixel providing on Wi-Fi | 2.5 to 3.4 | 72 of 72 |
+| Pixel on LTE to S24 providing on LTE | 1.5 to 2.5 | 72 of 72 |
+
+The same devices download directly at about 65 Mb/s on LTE and 550 Mb/s on
+Wi-Fi. On a phone the gate is not a collapse after 30 to 90 s; it is the
+steady state from the first second. Counter readings per three-minute run,
+provider side: 6,000 to 11,000 flight waits, 98 to 99 % of them with a
+reliable route that had channel capacity (M1); the binding limit was the
+mobile ceiling of 16 messages in flight from `sdk/mobile_memory_policy.go`,
+not the byte floor, and 16 messages of about 930 bytes per RTT is the
+observed 2 to 3 Mb/s; 40 to 135 gap recoveries suspected to be reordering
+and 7,000 to 22,000 selective-gap resends (M3); 200 to 5,000 flight
+timeouts, 1,800 to 22,000 timeout resends, 170 to 650 blocked ack route
+writes on the provider and 280 to 1,170 on the client (M2, M4); 1.7
+fragments per message with up to 207 reassembler evictions per run (M5). No
+lane died within three minutes, so M6 was not observed. One LTE-to-LTE run
+in which the fast path never engaged still ran at 2.5 Mb/s over the legacy
+SCTP lane with the flight never waiting, so a cap below Transfer also
+exists on that radio pairing; relay-only and one-radio controls are
+running to separate it.
+
+### 12.3 Third report: regression tests on the PRs
+
+PR 208 now carries `transfer_mixed_lane_regression_test.go` (a full
+unreliable flight overflows onto the reliable lane; an ack for an
+unreliable-carried Pack leaves on the reliable carrier) and PR 209 carries
+a real-gVisor deadlock reproduction whose second half asserts the hang with
+the bound disabled. Each is stated to fail without its fix. That answers
+§4 finding 8 for M1, M2 and M7. M3, M4, M5 and M6 still have no failure
+test in the PRs; §5 tests 5, 6, 7, 8 and 9 supply them. The report's
+deliberate non-assertion (a retransmit may ride either lane once the flight
+has room) is correct.
+
+### 12.4 Phase 0 result (stream A, branch flight-gate-fix)
+
+Counters, thirteen tests, three benchmarks and five one-mechanism candidate
+sub-branches landed. Full race suites per branch:
+
+| Test | base | a1 | g1 | s1 | s2 | l1 |
+|---|---|---|---|---|---|---|
+| 1 flight does not gate reliable sibling (M1) | red | red | green | red | red | red |
+| 3, 4 ack head-of-line block, fall-through (M2) | red | green | red | red | red | red |
+| 5 reordering is not loss (M3) | red | red | red | green | red | red |
+| 6 RTT window describes the reliable lane (M4) | red | red | red | red | green | red |
+| 7 queue-inflated RTT, no whole-window timeouts (S3) | red | red | red | red | red | red |
+| 9 blackholed fast path retires and resets (M6) | red | red | red | red | red | green |
+| 11 tun inject from the reader goroutine (M7) | red | red | red | red | red | red |
+
+Guards 2 and the hybrid H3 ack affinity guard stay green
+everywhere; test 8 characterises M5 (a 14-fragment message is lost 32.7 %
+of the time at 3 % packet loss, model 34.7 %); tests 10, 12 and 13 are
+skipped until their candidate exists. Every candidate leaves the rest of
+the package green. Benchmarks: the blocked ack worker delivers an h1 ack
+only after the p2p write timeout, which is M2's head-of-line block in
+numbers.
+
+Design questions raised by the candidates, to be answered in the fix
+design: whether G1 may overflow onto H1 TCP when H1 is a sibling of a
+constrained link rather than a relay (the low-bar matrix decides); whether
+A1 should also fall through on "no ack progress for T" using the per-route
+ack clock rather than wait for L1 to retire the lane; S1 and S2 belong
+together (S1 reads the window S2 makes lane-accurate); L1 adds an 11-byte
+progress report to the fast path wire format and needs product values for
+its interval and timeout plus a check that older peers ignore it; whether a
+reliable resend after G2's forget should re-classify the item; and whether
+the per-carrier counter maps should become fixed arrays.
+
+### 12.5 Program change: the PRs are the starting point
+
+User decision 2026-09-10: PRs 208 and 209 are merged into flight-gate-fix
+and the merged tree is the base for the remaining work. The candidate
+sub-branches stay as attribution experiments and are not merged. Phase 2
+becomes: additional correctness and performance fixes on top of the merged
+tree, each backed by a deterministic test from §5 and by the PERFVAR mixed
+route and the device rig, with the design written here and reviewed before
+it lands. The first work items on the merged tree are the §4 findings:
+
+1. finding 1, a forget primitive on the flight controller in place of the
+   acknowledge-based RTO release (test 10 made red on the merged tree);
+2. finding 2, scope the reply fall-through so hybrid H3 keeps its measured
+   ack affinity (the hybrid H3 guard test, plus the low-bar upload and
+   download controls);
+3. finding 3, the static low-bar matrix on the merged gate change, and if
+   it regresses, G1's narrower rule;
+4. finding 5, a platform default for the ICE socket buffers with a
+   MEMSTEADY run;
+5. finding 7, R1 asynchronous race-commit delivery with test 11 and 12,
+   keeping 209's bound as a counter-backed guard;
+6. then M4 (S3 with test 7), M5 (S4 with test 8), M6 (L1 with test 9, wire
+   format reviewed), and P1.
+
+The Phase 1 attribution campaigns in PERFVAR run against the merged tree as
+the control and each remaining candidate on top of it.
