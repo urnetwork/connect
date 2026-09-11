@@ -104,6 +104,14 @@ const (
 	// so nothing downstream ever sees the code either way.
 	icmpv4CodeHostUnreachable = 1
 	icmpv6CodeNoRoute         = 0
+
+	// path-mtu signals: a source that received a packet larger than its path
+	// carries answers with the mtu it can take. v4 embeds the next-hop mtu in
+	// the second half of the unused word of a fragmentation-needed
+	// destination-unreachable (rfc 1191); v6 has a dedicated type whose whole
+	// unused word is the mtu (rfc 4443 §3.2).
+	icmpv4CodeFragmentationNeeded = 4
+	icmpv6TypePacketTooBig        = 2
 )
 
 // out-of-sequence destination-unreachable for a flow whose path is gone.
@@ -214,18 +222,41 @@ func ipOosUnreachable(ipPath *IpPath) ([]byte, bool) {
 // matching. A stack that consumed this packet for real would verify; the
 // channel intercept does not need to.
 //
-// v6 extension headers are not traversed: the builders in this package emit
-// none, and a packet with them is not ours. Any unreachable code is accepted
-// -- the caller distinguishes teardown from dial failure by context, not
-// code, since a matched flow with no inbound data can only mean the dial
-// failed.
+// v6 extension headers on the outer packet and on the embed are walked (see
+// ip_ipv6_ext.go); the builders in this package emit none, but a stack in the
+// path may. Any unreachable code is accepted -- the caller distinguishes
+// teardown from dial failure by context, not code, since a matched flow with
+// no inbound data can only mean the dial failed.
 func ipParseIcmpUnreachable(packet []byte) (*IpPath, bool) {
 	if len(packet) == 0 {
 		return nil, false
 	}
 
 	// outer header: find the icmp body
-	var icmp []byte
+	icmp, ok := ipIcmpBody(packet)
+	if !ok || len(icmp) < icmpUnreachableHeaderSize {
+		return nil, false
+	}
+	switch uint8(packet[0]) >> 4 {
+	case 4:
+		if icmp[0] != icmpv4TypeDestinationUnreachable {
+			return nil, false
+		}
+	case 6:
+		if icmp[0] != icmpv6TypeDestinationUnreachable {
+			return nil, false
+		}
+	}
+	return ipParseIcmpEmbeddedPath(icmp[icmpUnreachableHeaderSize:])
+}
+
+// ipIcmpBody finds the icmp message of a packet whose transport is icmp (v4)
+// or icmpv6 (v6), walking any v6 extension headers. ok is false for any other
+// protocol or a malformed header.
+func ipIcmpBody(packet []byte) ([]byte, bool) {
+	if len(packet) == 0 {
+		return nil, false
+	}
 	switch uint8(packet[0]) >> 4 {
 	case 4:
 		if len(packet) < Ipv4HeaderSizeWithoutExtensions {
@@ -238,30 +269,25 @@ func ipParseIcmpUnreachable(packet []byte) (*IpPath, bool) {
 		if ipProtocolNumber(packet[9]) != ipProtocolNumberIcmp4 {
 			return nil, false
 		}
-		icmp = packet[ihl:]
-		if len(icmp) < icmpUnreachableHeaderSize || icmp[0] != icmpv4TypeDestinationUnreachable {
-			return nil, false
-		}
+		return packet[ihl:], true
 	case 6:
-		if len(packet) < Ipv6HeaderSize {
+		nextHeader, transportOffset, payloadEnd, ok := ipv6TransportOffset(packet)
+		if !ok || nextHeader != ipProtocolNumberIcmp6 {
 			return nil, false
 		}
-		if ipProtocolNumber(packet[6]) != ipProtocolNumberIcmp6 {
-			return nil, false
-		}
-		icmp = packet[Ipv6HeaderSize:]
-		if len(icmp) < icmpUnreachableHeaderSize || icmp[0] != icmpv6TypeDestinationUnreachable {
-			return nil, false
-		}
+		return packet[transportOffset:payloadEnd], true
 	default:
 		return nil, false
 	}
+}
 
-	// embedded original datagram: ip header plus at least 8 transport bytes.
-	// parsed by hand rather than with parseTcpPacket/parseUdpPacket, which
-	// require full transport headers -- rfc 792 only guarantees 8 bytes, and
-	// 8 is what the builders here embed for udp.
-	embedded := icmp[icmpUnreachableHeaderSize:]
+// ipParseIcmpEmbeddedPath recovers the flow an icmp error refers to from the
+// original datagram embedded in its body: ip header plus at least 8 transport
+// bytes. Parsed by hand rather than with parseTcpPacket/parseUdpPacket, which
+// require full transport headers -- rfc 792 only guarantees 8 bytes, and 8 is
+// what the builders here embed for udp. A v6 embed with extension headers is
+// walked; a v6 fragment embed (no transport header to read) is rejected.
+func ipParseIcmpEmbeddedPath(embedded []byte) (*IpPath, bool) {
 	if len(embedded) == 0 {
 		return nil, false
 	}
@@ -287,10 +313,25 @@ func ipParseIcmpUnreachable(packet []byte) (*IpPath, bool) {
 		if len(embedded) < Ipv6HeaderSize+8 {
 			return nil, false
 		}
+		transportOffset := Ipv6HeaderSize
 		embeddedProtocol = ipProtocolNumber(embedded[6])
+		if isIpv6ExtensionHeader(embedded[6]) {
+			// an embed is truncated to what the sender chose to include, so
+			// the declared payload length may exceed the bytes present: walk
+			// against a header whose length is clamped to the embed
+			walk, ok := walkIpv6ExtensionHeaders(ipv6EmbedForWalk(embedded))
+			if !ok || walk.fragmented {
+				return nil, false
+			}
+			embeddedProtocol = walk.nextHeader
+			transportOffset = walk.transportOffset
+		}
+		if len(embedded) < transportOffset+8 {
+			return nil, false
+		}
 		sourceIp = net.IP(embedded[8:24])
 		destinationIp = net.IP(embedded[24:40])
-		transport = embedded[Ipv6HeaderSize:]
+		transport = embedded[transportOffset:]
 	default:
 		return nil, false
 	}
@@ -325,6 +366,107 @@ func ipParseIcmpUnreachable(packet []byte) (*IpPath, bool) {
 		ipPath.SequenceNumber = binary.BigEndian.Uint32(transport[4:8])
 	}
 	return ipPath, true
+}
+
+// ipv6EmbedForWalk returns a copy of a truncated v6 embed whose payload
+// length is clamped to the bytes present, so the extension walker's length
+// check passes on an embed the sender cut short. Embeds are rare (one per
+// icmp error), so the copy is not on any hot path.
+func ipv6EmbedForWalk(embedded []byte) []byte {
+	clamped := make([]byte, len(embedded))
+	copy(clamped, embedded)
+	if declared := Ipv6HeaderSize + int(binary.BigEndian.Uint16(clamped[4:6])); len(clamped) < declared {
+		binary.BigEndian.PutUint16(clamped[4:6], uint16(len(clamped)-Ipv6HeaderSize))
+	}
+	return clamped
+}
+
+// ipParseIcmpv4FragmentationNeeded recognizes an icmpv4 fragmentation-needed
+// (destination unreachable, code 4) in an icmp body and returns the next-hop
+// mtu with the flow the embedded datagram describes. A zero next-hop mtu
+// (rfc 1191 pre-dates the field) is not a usable signal and is rejected.
+func ipParseIcmpv4FragmentationNeeded(icmp []byte) (mtu int, embedded *IpPath, ok bool) {
+	if len(icmp) < icmpUnreachableHeaderSize ||
+		icmp[0] != icmpv4TypeDestinationUnreachable ||
+		icmp[1] != icmpv4CodeFragmentationNeeded {
+		return 0, nil, false
+	}
+	mtu = int(binary.BigEndian.Uint16(icmp[6:8]))
+	if mtu == 0 {
+		return 0, nil, false
+	}
+	embedded, ok = ipParseIcmpEmbeddedPath(icmp[icmpUnreachableHeaderSize:])
+	if !ok {
+		return 0, nil, false
+	}
+	return mtu, embedded, true
+}
+
+// ipParseIcmpv6PacketTooBig recognizes an icmpv6 packet-too-big (type 2) in
+// an icmpv6 body and returns the reported mtu with the flow the embedded
+// datagram describes.
+func ipParseIcmpv6PacketTooBig(icmp []byte) (mtu int, embedded *IpPath, ok bool) {
+	if len(icmp) < icmpUnreachableHeaderSize || icmp[0] != icmpv6TypePacketTooBig {
+		return 0, nil, false
+	}
+	mtu = int(binary.BigEndian.Uint32(icmp[4:8]))
+	if mtu <= 0 || 0xffff < mtu {
+		return 0, nil, false
+	}
+	embedded, ok = ipParseIcmpEmbeddedPath(icmp[icmpUnreachableHeaderSize:])
+	if !ok {
+		return 0, nil, false
+	}
+	return mtu, embedded, true
+}
+
+// ipOosPacketTooBig builds the icmp path-mtu signal a stack would send for a
+// packet that arrived larger than `mtu`: fragmentation-needed for v4,
+// packet-too-big for v6. `original` is the oversized packet's own direction
+// and the message is addressed back to its sender. The embed is the original
+// ip header plus 8 transport bytes, mirroring ipOosUnreachable.
+func ipOosPacketTooBig(original *IpPath, mtu int) ([]byte, bool) {
+	switch original.Version {
+	case 4, 6:
+	default:
+		return nil, false
+	}
+	var embedded []byte
+	switch original.Protocol {
+	case IpProtocolUdp:
+		embedded = ipOosUdpPacket(original, nil)
+	case IpProtocolTcp:
+		embedded = ipOosTcpPacketSequence(original, tcpFlagAck, original.SequenceNumber, nil)
+	default:
+		return nil, false
+	}
+	reverse := original.Reverse()
+	switch original.Version {
+	case 4:
+		packet, icmp := ipTransportPacket(reverse, ipProtocolNumberIcmp4, icmpUnreachableHeaderSize+len(embedded))
+		icmp[0] = icmpv4TypeDestinationUnreachable
+		icmp[1] = icmpv4CodeFragmentationNeeded
+		icmp[2], icmp[3] = 0, 0
+		binary.BigEndian.PutUint16(icmp[4:6], 0)
+		binary.BigEndian.PutUint16(icmp[6:8], uint16(mtu))
+		copy(icmp[icmpUnreachableHeaderSize:], embedded)
+		binary.BigEndian.PutUint16(icmp[2:4], checksumFinish(checksumAdd(0, icmp)))
+		return packet, true
+	default:
+		packet, icmp := ipTransportPacket(reverse, ipProtocolNumberIcmp6, icmpUnreachableHeaderSize+len(embedded))
+		icmp[0] = icmpv6TypePacketTooBig
+		icmp[1] = 0
+		icmp[2], icmp[3] = 0, 0
+		binary.BigEndian.PutUint32(icmp[4:8], uint32(mtu))
+		copy(icmp[icmpUnreachableHeaderSize:], embedded)
+		binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(
+			ipProtocolNumberIcmp6,
+			reverse.SourceIp.To16(),
+			reverse.DestinationIp.To16(),
+			icmp,
+		))
+		return packet, true
+	}
 }
 
 // builds a fresh packet in the path direction (source to destination) sized

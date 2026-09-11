@@ -42,13 +42,18 @@ const (
 	syntheticSpeedChunkByteCount = 64 * 1024
 )
 
-// isSyntheticSpeedIp reports whether ip is inside 198.18.0.0/15 (RFC 2544).
+// isSyntheticSpeedIp reports whether ip is inside the benchmarking ranges:
+// 198.18.0.0/15 (RFC 2544) or 2001:2::/48 (RFC 5180).
 func isSyntheticSpeedIp(ip net.IP) bool {
-	ip4 := ip.To4()
-	if ip4 == nil {
+	if ip4 := ip.To4(); ip4 != nil {
+		return ip4[0] == 198 && (ip4[1] == 18 || ip4[1] == 19)
+	}
+	ip16 := ip.To16()
+	if ip16 == nil {
 		return false
 	}
-	return ip4[0] == 198 && (ip4[1] == 18 || ip4[1] == 19)
+	return ip16[0] == 0x20 && ip16[1] == 0x01 && ip16[2] == 0x00 && ip16[3] == 0x02 &&
+		ip16[4] == 0x00 && ip16[5] == 0x00
 }
 
 var syntheticSpeedChunk = func() []byte {

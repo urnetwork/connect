@@ -78,3 +78,29 @@ func TestSyntheticSpeedIpRange(t *testing.T) {
 		}
 	}
 }
+
+// the synthetic speed server answers the v4 benchmarking range (RFC 2544)
+// and the v6 one (RFC 5180), including the mapped form of the v4 range, and
+// nothing adjacent to either
+func TestIsSyntheticSpeedIp(t *testing.T) {
+	for _, literal := range []string{
+		"198.18.0.1", "198.19.255.255", "198.18.255.254",
+		"2001:2::1", "2001:2:0:ffff::1", "2001:2::", "2001:2:0:ffff:ffff:ffff:ffff:ffff",
+		"::ffff:198.18.0.1",
+	} {
+		if !isSyntheticSpeedIp(net.ParseIP(literal)) {
+			t.Errorf("isSyntheticSpeedIp(%s) = false, want true", literal)
+		}
+	}
+	for _, literal := range []string{
+		"198.17.255.255", "198.20.0.0", "197.18.0.1", "8.8.8.8",
+		"2001:2:1::1", "2001:3::1", "2001:1::1", "2001:db8::1", "2002:2::1", "::1",
+	} {
+		if isSyntheticSpeedIp(net.ParseIP(literal)) {
+			t.Errorf("isSyntheticSpeedIp(%s) = true, want false", literal)
+		}
+	}
+	if isSyntheticSpeedIp(nil) {
+		t.Errorf("isSyntheticSpeedIp(nil) = true, want false")
+	}
+}

@@ -434,11 +434,12 @@ func (self *securityPolicy) inspectAndRefreshEgressGroupBorrowed(
 		if !isPublicUnicast(ipPath.DestinationIp) {
 			result = SecurityPolicyResultIncident
 		} else {
+			destinationIp, destinationVersion := policyAddress(ipPath.DestinationIp, ipPath.Version)
 			switch self.cfaa.inspect(
-				ipPath.DestinationIp,
+				destinationIp,
 				ipPath.DestinationPort,
 				ipPath.Protocol,
-				ipPath.Version,
+				destinationVersion,
 			) {
 			case cfaaDrop:
 				result = SecurityPolicyResultDrop
@@ -481,8 +482,10 @@ func (self *securityPolicy) inspectEgressForSender(
 		return SecurityPolicyResultIncident, nil
 	}
 
-	// static endpoint reputation (blocked ips + port policy) on the destination
-	switch self.cfaa.inspect(ipPath.DestinationIp, ipPath.DestinationPort, ipPath.Protocol, ipPath.Version) {
+	// static endpoint reputation (blocked ips + port policy) on the destination,
+	// with a v4-mapped v6 destination judged as its v4 address
+	destinationIp, destinationVersion := policyAddress(ipPath.DestinationIp, ipPath.Version)
+	switch self.cfaa.inspect(destinationIp, ipPath.DestinationPort, ipPath.Protocol, destinationVersion) {
 	case cfaaDrop:
 		return SecurityPolicyResultDrop, nil
 	case cfaaAllow:
@@ -577,8 +580,9 @@ func (self *securityPolicy) inspectIngress(provideMode protocol.ProvideMode, ipP
 	}
 
 	// mirror the egress static drops (blocked ips + port policy), evaluated on the
-	// source endpoint
-	if cfaaDrop == self.cfaa.inspect(ipPath.SourceIp, ipPath.SourcePort, ipPath.Protocol, ipPath.Version) {
+	// source endpoint, with a v4-mapped v6 source judged as its v4 address
+	sourceIp, sourceVersion := policyAddress(ipPath.SourceIp, ipPath.Version)
+	if cfaaDrop == self.cfaa.inspect(sourceIp, ipPath.SourcePort, ipPath.Protocol, sourceVersion) {
 		return SecurityPolicyResultDrop, nil
 	}
 	return SecurityPolicyResultAllow, nil
@@ -784,7 +788,16 @@ func (self *reverseSecurityPolicy) Testing_FlowCount() int {
 	return 0
 }
 
+// isPublicUnicast reports whether an egress destination is on the public
+// internet. An IPv4-mapped v6 address (::ffff:a.b.c.d) is judged as the v4
+// address it carries, so a v6 packet cannot reach private v4 space by
+// wrapping the address; the v6 prefixes that embed or tunnel to v4 (6to4,
+// Teredo, NAT64, IPv4-compatible) and the non-routable v6 ranges are not
+// public either. See IPV6.md C4.
 func isPublicUnicast(ip net.IP) bool {
+	if ip4 := ip.To4(); ip4 != nil {
+		ip = ip4
+	}
 	switch {
 	case ip.IsPrivate(),
 		ip.IsLoopback(),
@@ -792,9 +805,70 @@ func isPublicUnicast(ip net.IP) bool {
 		ip.IsMulticast(),
 		ip.IsUnspecified():
 		return false
-	default:
+	}
+	if len(ip) == net.IPv6len && isReservedIpv6(ip) {
+		return false
+	}
+	return true
+}
+
+// isReservedIpv6 lists the v6 prefixes that are never a public unicast
+// egress destination but pass net.IP's own predicates: the ranges that embed
+// a v4 address (6to4 2002::/16, Teredo 2001::/32, NAT64 64:ff9b::/96 and
+// its local-use 64:ff9b:1::/48, the deprecated IPv4-compatible ::/96), the
+// discard-only 100::/64, documentation 2001:db8::/32, the deprecated
+// site-local fec0::/10 and the historical 6bone 3ffe::/16. `ip` must be a
+// 16-byte address that is not v4-mapped.
+func isReservedIpv6(ip net.IP) bool {
+	switch {
+	case ip[0] == 0x20 && ip[1] == 0x02:
+		// 6to4
+		return true
+	case ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x00 && ip[3] == 0x00:
+		// teredo
+		return true
+	case ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x0d && ip[3] == 0xb8:
+		// documentation
+		return true
+	case ip[0] == 0x00 && ip[1] == 0x64 && ip[2] == 0xff && ip[3] == 0x9b &&
+		((ip[4] == 0 && ip[5] == 0 && ip[6] == 0 && ip[7] == 0 &&
+			ip[8] == 0 && ip[9] == 0 && ip[10] == 0 && ip[11] == 0) ||
+			(ip[4] == 0 && ip[5] == 1)):
+		// nat64 well-known prefix and its local-use prefix
+		return true
+	case ip[0] == 0x01 && ip[1] == 0x00 &&
+		ip[2] == 0 && ip[3] == 0 && ip[4] == 0 && ip[5] == 0 && ip[6] == 0 && ip[7] == 0:
+		// discard-only
+		return true
+	case ip[0] == 0xfe && ip[1]&0xc0 == 0xc0:
+		// site-local
+		return true
+	case ip[0] == 0x3f && ip[1] == 0xfe:
+		// 6bone
 		return true
 	}
+	// ipv4-compatible ::a.b.c.d: the first 96 bits zero. :: itself is
+	// unspecified and ::1 loopback, both already excluded by the caller, so
+	// this only matches the deprecated embedded-v4 form.
+	for _, b := range ip[:12] {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// policyAddress is the address a v4-keyed policy table sees for a packet: an
+// IPv4-mapped v6 destination is unwrapped to its v4 address and version so
+// the v4 block tables and port policies apply to it, everything else passes
+// through unchanged.
+func policyAddress(ip net.IP, version int) (net.IP, int) {
+	if version == 6 {
+		if ip4 := ip.To4(); ip4 != nil {
+			return ip4, 4
+		}
+	}
+	return ip, version
 }
 
 type SecurityPolicyStats = map[SecurityPolicyResult]map[SecurityDestination]uint64
