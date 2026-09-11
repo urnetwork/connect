@@ -317,7 +317,7 @@ func TestSendPathPlacesFlowsThroughRaceCandidates(t *testing.T) {
 	if !ok {
 		t.Fatal("could not find sendParsedPacketGroup")
 	}
-	if !strings.Contains(body, "self.raceCandidates(window)") {
+	if !strings.Contains(body, "self.raceCandidates(window, ipPath.Version)") {
 		t.Error("sendParsedPacketGroup does not assemble its field through raceCandidates: the cap and the rank gate are disconnected again")
 	}
 

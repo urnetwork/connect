@@ -27,6 +27,11 @@ type WindowExpandEvent struct {
 	// Failed is the terminal outcome state: the window hit its outcome
 	// deadline twice with zero providers Added. Cleared when a provider lands.
 	Failed bool
+	// Ipv6Available is whether the window holds an added, unwarned exit that
+	// can carry v6 (IPV6.md B6). Merged across windows by OR. While false the
+	// apps can tell the user v6 is not carried, the in-tunnel resolver
+	// answers AAAA empty, and v6 flows are answered with no-route.
+	Ipv6Available bool
 }
 
 // provider state machine is:
@@ -380,7 +385,7 @@ func (self *RemoteUserNatMultiClientMonitor) ProviderEvents() map[Id]*ProviderEv
 	return maps.Clone(self.clientIdProviderEvents)
 }
 
-func (self *RemoteUserNatMultiClientMonitor) AddWindowExpandEvent(minSatisfied bool, targetSize int) {
+func (self *RemoteUserNatMultiClientMonitor) AddWindowExpandEvent(minSatisfied bool, targetSize int, ipv6Available bool) {
 	var windowExpandEvent WindowExpandEvent
 	changed := false
 	func() {
@@ -390,8 +395,9 @@ func (self *RemoteUserNatMultiClientMonitor) AddWindowExpandEvent(minSatisfied b
 		windowExpandEvent = WindowExpandEvent{
 			// EventTime:   time.Now(),
 			// CurrentSize: currentSize,
-			TargetSize:   targetSize,
-			MinSatisfied: minSatisfied,
+			TargetSize:    targetSize,
+			MinSatisfied:  minSatisfied,
+			Ipv6Available: ipv6Available,
 			// the stall diagnosis is carried, not owned, by the expand event:
 			// this call updates the size half only (SetStallStatus owns the
 			// other half)
@@ -541,6 +547,7 @@ func (self *MergedMultiClientMonitor) WindowExpandEvent() *WindowExpandEvent {
 		windowExpandEvent := monitor.WindowExpandEvent()
 		netWindowExpandEvent.TargetSize += windowExpandEvent.TargetSize
 		netWindowExpandEvent.MinSatisfied = netWindowExpandEvent.MinSatisfied || windowExpandEvent.MinSatisfied
+		netWindowExpandEvent.Ipv6Available = netWindowExpandEvent.Ipv6Available || windowExpandEvent.Ipv6Available
 		if stallReasonRank(netWindowExpandEvent.Reason) < stallReasonRank(windowExpandEvent.Reason) {
 			netWindowExpandEvent.Reason = windowExpandEvent.Reason
 		}
@@ -565,4 +572,42 @@ func (self *MergedMultiClientMonitor) ProviderEvents() map[Id]*ProviderEvent {
 		maps.Copy(netProviderEvents, providerEvents)
 	}
 	return netProviderEvents
+}
+
+// SetProviderIpFamily rewrites the address-family category of a provider's
+// current event in place (IPV6.md B5, the local v6 downgrade) and dispatches
+// the change. The event's state and EventTime are untouched: the provider is
+// still Added and its connected-since time must not restart because its
+// category was corrected. Returns whether anything changed; unknown client
+// ids and unchanged categories are no-ops.
+func (self *RemoteUserNatMultiClientMonitor) SetProviderIpFamily(clientId Id, ipFamily IpFamily) bool {
+	var windowExpandEvent WindowExpandEvent
+	clientIdProviderEvents := map[Id]*ProviderEvent{}
+	changed := false
+
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+
+		providerEvent, ok := self.clientIdProviderEvents[clientId]
+		if !ok || providerEvent.IpFamily == ipFamily {
+			return
+		}
+		// shallow clone: events are shared with listeners by pointer
+		updated := *providerEvent
+		updated.IpFamily = ipFamily
+		self.clientIdProviderEvents[clientId] = &updated
+		windowExpandEvent = self.windowExpandEvent
+		clientIdProviderEvents[clientId] = &updated
+		changed = true
+	}()
+
+	if changed {
+		if callbacks := self.monitorEventCallbacks.Get(); 0 < len(callbacks) {
+			for _, callback := range callbacks {
+				callback.Dispatch(&windowExpandEvent, clientIdProviderEvents, false)
+			}
+		}
+	}
+	return changed
 }

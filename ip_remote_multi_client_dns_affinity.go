@@ -157,6 +157,12 @@ func (self *RemoteUserNatMultiClient) inheritDnsExitHintWithLock(
 		if dnsExitHintTtl <= now.Sub(hint.createTime) || client == nil || client.IsDone() {
 			return false
 		}
+		// a hint learned from one family's answer must not place a flow of
+		// the other on an exit that cannot carry it (IPV6.md B3): the AAAA
+		// answer for a name may have come back through a v4-only exit
+		if !client.supportsIpVersion(ipPath.Version) {
+			return false
+		}
 		if key, ok := destinationServiceFailureKeyFor(ipPath, client); ok {
 			if failure, failed := self.destinationServiceFailures[key]; failed &&
 				now.Sub(failure.time) < destinationServiceFailureTtl {

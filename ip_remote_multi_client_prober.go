@@ -314,6 +314,14 @@ func (self *RemoteUserNatMultiClient) probeProviderPass(client *multiClientChann
 	if !reliabilitySettings.ProviderProbe {
 		return probeResult{}
 	}
+	// the probe tables (resolvers and literal hosts) are v4: an exit that
+	// cannot carry v4 (v6-only, IPV6.md B1) can answer none of their
+	// questions for a reason that is not about the provider, so the pass
+	// asks nothing and records nothing -- the empty-targets contract --
+	// rather than read a v6-only exit as unqualifiable
+	if !client.supportsIpVersion(4) {
+		return probeResult{}
+	}
 	timeout := reliabilitySettings.ProbeTimeout
 	if timeout <= 0 {
 		timeout = defaultProbeTimeout
