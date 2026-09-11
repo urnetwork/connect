@@ -4362,9 +4362,10 @@ func TestPeerConnDeferredIceCandidateKeepsNegotiationTransferKey(t *testing.T) {
 func TestClientSignalSenderFailedSendReturnsMessageBytes(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
+	log := &captureLogger{}
 	client := &Client{
 		ctx: ctx,
-		log: NewNoopLogger(),
+		log: log,
 	}
 	sender := NewClientSignalSender(client)
 	messageBytes := MessagePoolCopy([]byte("rejected signal"))
@@ -4376,10 +4377,116 @@ func TestClientSignalSenderFailedSendReturnsMessageBytes(t *testing.T) {
 		MessageType:  protocol.MessageType_TransferExchangeSignals,
 		MessageBytes: messageBytes,
 	}
-	sender.SendSignal(NewId(), frame)
+	destinationId := NewId()
+	sender.SendSignal(destinationId, frame)
 	AssertEqual(t, frame.MessageBytes, []byte(nil))
 	if !MessagePoolReturn(witness) {
 		t.Fatal("rejected signal retained its exact pooled message ownership")
+	}
+	if len(log.info) != 1 || log.info[0] != "[signal]send failed mode=sender reason=canceled-or-closed\n" {
+		t.Fatalf("rejected signal log = %q", log.info)
+	}
+	if strings.Contains(log.info[0], destinationId.String()) {
+		t.Fatalf("rejected signal log retained destination id: %q", log.info[0])
+	}
+}
+
+// A receive-originated signal must retain its zero-wait contract while making
+// the admission refusal distinguishable from lifecycle closure.
+func TestClientSignalSenderReportsNonblockingAdmissionRefusal(t *testing.T) {
+	ctx := context.Background()
+	destinationId := NewId()
+	loopback := make(chan *SendPack, 1)
+	loopback <- &SendPack{}
+	log := &captureLogger{}
+	client := &Client{
+		ctx:      ctx,
+		clientId: destinationId,
+		loopback: loopback,
+		log:      log,
+		settings: &ClientSettings{},
+	}
+	sender := NewClientSignalSender(client)
+	messageBytes := MessagePoolCopy([]byte("nonblocking signal"))
+	witness := MessagePoolShareReadOnly(messageBytes)
+	frame := &protocol.Frame{
+		MessageType:  protocol.MessageType_TransferExchangeSignals,
+		MessageBytes: messageBytes,
+	}
+
+	sender.SendSignal(destinationId, frame, signalSendNonBlocking{})
+
+	AssertEqual(t, frame.MessageBytes, []byte(nil))
+	if !MessagePoolReturn(witness) {
+		t.Fatal("nonblocking refusal retained its exact pooled message ownership")
+	}
+	if len(log.info) != 1 || log.info[0] != "[signal]send failed mode=receive-reply reason=not-admitted\n" {
+		t.Fatalf("nonblocking refusal log = %q", log.info)
+	}
+	if strings.Contains(log.info[0], destinationId.String()) {
+		t.Fatalf("nonblocking refusal log retained destination id: %q", log.info[0])
+	}
+}
+
+// A successful handoff still transfers the pooled frame to the Client while
+// its verbose trace retains no destination identity.
+func TestClientSignalSenderSuccessfulSendTransfersOwnership(t *testing.T) {
+	ctx := context.Background()
+	destinationId := NewId()
+	loopback := make(chan *SendPack, 1)
+	log := &captureLogger{enabled: true}
+	client := &Client{
+		ctx:      ctx,
+		clientId: destinationId,
+		loopback: loopback,
+		log:      log,
+		settings: &ClientSettings{},
+	}
+	sender := NewClientSignalSender(client)
+	messageBytes := MessagePoolCopy([]byte("accepted signal"))
+	witness := MessagePoolShareReadOnly(messageBytes)
+	frame := &protocol.Frame{
+		MessageType:  protocol.MessageType_TransferExchangeSignals,
+		MessageBytes: messageBytes,
+	}
+
+	sender.SendSignal(destinationId, frame)
+
+	accepted := <-loopback
+	if accepted.Frame != frame {
+		t.Fatal("successful signal handoff changed frame ownership")
+	}
+	MessagePoolReturn(accepted.Frame.MessageBytes)
+	accepted.Frame.MessageBytes = nil
+	if !MessagePoolReturn(witness) {
+		t.Fatal("successful signal retained pooled message ownership after consumer return")
+	}
+	if len(log.info) != 1 || log.info[0] != "[signal]send mode=sender\n" {
+		t.Fatalf("successful signal log = %q", log.info)
+	}
+	if strings.Contains(log.info[0], destinationId.String()) {
+		t.Fatalf("successful signal log retained destination id: %q", log.info[0])
+	}
+}
+
+// Detailed transfer errors are reduced to fixed labels and never copied into
+// the signal log. Unary wrapping of the typed encryption error is preserved.
+func TestSignalSendFailureReasonIsBounded(t *testing.T) {
+	tests := []struct {
+		err  error
+		want string
+	}{
+		{err: nil, want: "not-admitted"},
+		{err: ErrEncryptionRequiredNotEstablished, want: "encryption-not-ready"},
+		{err: fmt.Errorf("synthetic wrapper: %w", ErrEncryptionRequiredNotEstablished), want: "encryption-not-ready"},
+		{err: errors.New("Done"), want: "canceled-or-closed"},
+		{err: errors.New("Done."), want: "canceled-or-closed"},
+		{err: errors.New("synthetic private detail"), want: "other"},
+	}
+	for _, test := range tests {
+		if got := signalSendFailureReason(test.err); got != test.want {
+			t.Errorf("signal send reason for %v = %q, want %q", test.err, got, test.want)
+		}
 	}
 }
 
