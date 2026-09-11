@@ -55,9 +55,9 @@ func kibStr(n int64) string { return fmt.Sprintf("%.1f KiB", float64(n)/1024) }
 
 // tunPair opens a listener on the tun's own address and returns a dial func that
 // loops back through the stack.
-func tunTcpPair(t *testing.T, tun *Tun) (dial func() (net.Conn, net.Conn, error), closeAll func()) {
+func tunTcpPair(t *testing.T, tun *Tun, ipVersion int) (dial func() (net.Conn, net.Conn, error), closeAll func()) {
 	t.Helper()
-	local := tun.LocalAddresses()[0]
+	local := tunTestLocalAddress(t, tun, ipVersion)
 	ln, err := tun.ListenTCP(&net.TCPAddr{IP: local.AsSlice(), Port: 0})
 	if err != nil {
 		t.Fatalf("listen tcp: %v", err)
@@ -96,8 +96,13 @@ func tunTcpPair(t *testing.T, tun *Tun) (dial func() (net.Conn, net.Conn, error)
 // TestTunEndpointCapacityTcp measures a gVisor TCP endpoint, idle and backlogged.
 func TestTunEndpointCapacityTcp(t *testing.T) {
 	skipUnlessTunCapacity(t)
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testTunEndpointCapacityTcp(t, ipVersion)
+	})
+}
 
-	settings := DefaultTunSettings()
+func testTunEndpointCapacityTcp(t *testing.T, ipVersion int) {
+	settings := tunTestApplyIpVersion(DefaultTunSettings(), ipVersion)
 	settings.DialRace = 1 // racing dials would double-count endpoints
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -108,7 +113,7 @@ func TestTunEndpointCapacityTcp(t *testing.T) {
 	}
 	defer tun.Close()
 
-	dial, closeAll := tunTcpPair(t, tun)
+	dial, closeAll := tunTcpPair(t, tun, ipVersion)
 	defer closeAll()
 
 	const conns = 400
@@ -167,8 +172,13 @@ func TestTunEndpointCapacityTcp(t *testing.T) {
 // Every socks ASSOCIATE flow is one of these.
 func TestTunEndpointCapacityUdp(t *testing.T) {
 	skipUnlessTunCapacity(t)
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testTunEndpointCapacityUdp(t, ipVersion)
+	})
+}
 
-	settings := DefaultTunSettings()
+func testTunEndpointCapacityUdp(t *testing.T, ipVersion int) {
+	settings := tunTestApplyIpVersion(DefaultTunSettings(), ipVersion)
 	settings.DialRace = 1
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -179,7 +189,7 @@ func TestTunEndpointCapacityUdp(t *testing.T) {
 	}
 	defer tun.Close()
 
-	local := tun.LocalAddresses()[0]
+	local := tunTestLocalAddress(t, tun, ipVersion)
 	server, err := tun.ListenUDP(&net.UDPAddr{IP: local.AsSlice(), Port: 0})
 	if err != nil {
 		t.Fatalf("listen udp: %v", err)
@@ -251,7 +261,12 @@ func TestTunEndpointCapacityUdp(t *testing.T) {
 // prompt reader never builds.
 func TestTunEndpointCapacityUdpSmallBuffers(t *testing.T) {
 	skipUnlessTunCapacity(t)
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testTunEndpointCapacityUdpSmallBuffers(t, ipVersion)
+	})
+}
 
+func testTunEndpointCapacityUdpSmallBuffers(t *testing.T, ipVersion int) {
 	for _, bufSize := range []int{
 		128 * 1024, // today's floor
 		64 * 1024,
@@ -263,7 +278,7 @@ func TestTunEndpointCapacityUdpSmallBuffers(t *testing.T) {
 		settings.UdpReceiveBufferByteCount = bufSize
 		settings.UdpSendBufferByteCount = bufSize
 
-		perLoaded := measureUdpBacklog(t, settings, 200)
+		perLoaded := measureUdpBacklog(t, settings, 200, ipVersion)
 		t.Logf("udp buffer %-9s -> backlogged flow %-11s | 64 flows = %5.1f MiB | 8GiB fits %s clients",
 			kibStr(int64(bufSize)), kibStr(int64(perLoaded)),
 			perLoaded*64/(1<<20),
@@ -271,23 +286,23 @@ func TestTunEndpointCapacityUdpSmallBuffers(t *testing.T) {
 	}
 }
 
-func measureUdpBacklog(t *testing.T, settings *TunSettings, flows int) float64 {
-	_, loaded := measureUdp(t, settings, flows)
+func measureUdpBacklog(t *testing.T, settings *TunSettings, flows int, ipVersion int) float64 {
+	_, loaded := measureUdp(t, settings, flows, ipVersion)
 	return loaded
 }
 
-func measureUdp(t *testing.T, settings *TunSettings, flows int) (idle float64, loaded float64) {
+func measureUdp(t *testing.T, settings *TunSettings, flows int, ipVersion int) (idle float64, loaded float64) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	tun, err := CreateTun(ctx, settings)
+	tun, err := CreateTun(ctx, tunTestApplyIpVersion(settings, ipVersion))
 	if err != nil {
 		t.Fatalf("create tun: %v", err)
 	}
 	defer tun.Close()
 
-	local := tun.LocalAddresses()[0]
+	local := tunTestLocalAddress(t, tun, ipVersion)
 	server, err := tun.ListenUDP(&net.UDPAddr{IP: local.AsSlice(), Port: 0})
 	if err != nil {
 		t.Fatalf("listen udp: %v", err)
@@ -390,8 +405,13 @@ func tcpCeilingSettings() *TunSettings {
 // mix rather than guessed from one blended figure.
 func TestActiveProxyCapacity(t *testing.T) {
 	skipUnlessTunCapacity(t)
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testActiveProxyCapacity(t, ipVersion)
+	})
+}
 
-	settings := proxyTunSettings()
+func testActiveProxyCapacity(t *testing.T, ipVersion int) {
+	settings := tunTestApplyIpVersion(proxyTunSettings(), ipVersion)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -431,14 +451,14 @@ func TestActiveProxyCapacity(t *testing.T) {
 	// --- term 2: a tcp tunnel, idle and backlogged ---
 	// The loopback holds BOTH endpoints of a connection; production holds one (the
 	// far end is in a remote kernel, not our heap). So halve to get a tunnel.
-	tcpIdleConn, _ := measureTcp(t, settings, 300)
+	tcpIdleConn, _ := measureTcp(t, settings, 300, ipVersion)
 	tcpIdle := tcpIdleConn / 2
-	_, tcpLoadedConn := measureTcp(t, tcpCeilingSettings(), 150)
+	_, tcpLoadedConn := measureTcp(t, tcpCeilingSettings(), 150, ipVersion)
 	tcpLoaded := tcpLoadedConn / 2
 
 	// --- term 3: a udp flow, idle and backlogged ---
 	// One endpoint per flow already, so no halving.
-	udpIdle, udpLoaded := measureUdp(t, settings, 200)
+	udpIdle, udpLoaded := measureUdp(t, settings, 200, ipVersion)
 	// an idle udp endpoint costs less than the GC noise floor of this measurement,
 	// so it can come out negative. Clamp rather than let noise flatter the model.
 	udpIdle = math.Max(udpIdle, 0)
@@ -494,18 +514,18 @@ type nopOob struct{}
 func (nopOob) SendControl(frames []*protocol.Frame, callback OobResultFunction) {}
 
 // measureTcp returns per-connection heap, idle and backlogged.
-func measureTcp(t *testing.T, settings *TunSettings, conns int) (idle float64, loaded float64) {
+func measureTcp(t *testing.T, settings *TunSettings, conns int, ipVersion int) (idle float64, loaded float64) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	tun, err := CreateTun(ctx, settings)
+	tun, err := CreateTun(ctx, tunTestApplyIpVersion(settings, ipVersion))
 	if err != nil {
 		t.Fatalf("create tun: %v", err)
 	}
 	defer tun.Close()
 
-	dial, closeAll := tunTcpPair(t, tun)
+	dial, closeAll := tunTcpPair(t, tun, ipVersion)
 	defer closeAll()
 
 	base := heapInUse()
@@ -560,7 +580,12 @@ func measureTcp(t *testing.T, settings *TunSettings, conns int) (idle float64, l
 // Capacity has to be sized against this number, not the loopback one.
 func TestTunTcpWindowCeiling(t *testing.T) {
 	skipUnlessTunCapacity(t)
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testTunTcpWindowCeiling(t, ipVersion)
+	})
+}
 
+func testTunTcpWindowCeiling(t *testing.T, ipVersion int) {
 	for _, maxWindow := range []int{128 * 1024, 1024 * 1024} {
 		settings := DefaultTunSettings()
 		settings.DialRace = 1
@@ -569,7 +594,7 @@ func TestTunTcpWindowCeiling(t *testing.T) {
 		settings.TcpReceiveBuffer = TcpBufferRange{Min: 4 * 1024, Default: maxWindow, Max: maxWindow}
 		settings.TcpSendBuffer = TcpBufferRange{Min: 4 * 1024, Default: maxWindow, Max: maxWindow}
 
-		_, perConn := measureTcp(t, settings, 150)
+		_, perConn := measureTcp(t, settings, 150, ipVersion)
 		// The loopback holds BOTH endpoints of every connection. In production the
 		// far endpoint lives in a remote kernel, not our heap, so a production
 		// tunnel costs about half this.

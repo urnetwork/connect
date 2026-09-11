@@ -73,6 +73,19 @@ func egressAwareResolver(custom *net.Resolver) *net.Resolver {
 	return egressResolver()
 }
 
+// dialResolver is the resolver a hostname dial resolves through before its
+// addresses are raced (net_dial_race.go): the caller's own when configured,
+// else the platform's egress-bound in-process resolver, else the OS resolver.
+// The OS resolver is reached as a value here, in this audited file, for the
+// same reason resolveEgressUDPAddr does it: net.Resolver methods need a
+// non-nil receiver to take a context.
+func dialResolver(custom *net.Resolver) *net.Resolver {
+	if resolver := egressAwareResolver(custom); resolver != nil {
+		return resolver
+	}
+	return net.DefaultResolver
+}
+
 // resolveEgressUDPAddr is net.ResolveUDPAddr for control dials, made
 // family-aware: while this process's own sockets are steered around the
 // tunnel it provides, it resolves through the egress-bound resolver instead

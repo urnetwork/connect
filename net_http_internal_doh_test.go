@@ -21,6 +21,12 @@ import (
 // gives the socket layer a raw IP, while HTTP Host, TLS SNI, and certificate
 // verification all continue to use the original api hostname.
 func TestInternalDohBypassesPoisonedDefaultResolution(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testInternalDohBypassesPoisonedDefaultResolution(t, ipVersion)
+	})
+}
+
+func testInternalDohBypassesPoisonedDefaultResolution(t *testing.T, ipVersion int) {
 	const domain = "service.test"
 	const apiHost = "api." + domain
 
@@ -43,6 +49,14 @@ func TestInternalDohBypassesPoisonedDefaultResolution(t *testing.T) {
 		requestHosts <- request.Host
 		_, _ = io.WriteString(w, "ok")
 	}))
+	// the api listens on the loopback of the family under test; the internal
+	// DoH answer below points the protected name at that same loopback
+	apiServer.Listener.Close()
+	apiListener, err := net.Listen(testTcpNetwork(ipVersion), testLoopbackHostPort(ipVersion, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiServer.Listener = apiListener
 	apiServer.TLS = &tls.Config{
 		Certificates: []tls.Certificate{certificate},
 		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
@@ -61,7 +75,7 @@ func TestInternalDohBypassesPoisonedDefaultResolution(t *testing.T) {
 	var dohQueries atomic.Int32
 	dohServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		dohQueries.Add(1)
-		writeDohWire(w, request, []netip.Addr{netip.MustParseAddr("127.0.0.1")}, 60, false)
+		writeDohWire(w, request, []netip.Addr{netip.MustParseAddr(testLoopbackIp(ipVersion))}, 60, false)
 	}))
 	defer dohServer.Close()
 
