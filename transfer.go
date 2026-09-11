@@ -747,6 +747,7 @@ func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings
 		// one fully acknowledged window adds about this much capacity.
 		UnreliableFlightIncreaseByteCount:    1150,
 		UnreliableFlightIncreaseMessageCount: 1,
+		UnreliableFloorSingleFlight:          false,
 		SequenceBufferSize:                   bufferSize,
 		AckBufferSize:                        bufferSize,
 		MinMessageByteCount:                  ByteCount(1),
@@ -3753,6 +3754,12 @@ type SendBufferSettings struct {
 	UnreliableMinimumFlightMessageCount  int
 	UnreliableMaximumFlightMessageCount  int
 	UnreliableFlightIncreaseMessageCount int
+	// UnreliableFloorSingleFlight keeps at most one message in flight on an
+	// unreliable carrier whose flight limit has collapsed to its floor after
+	// repeated loss, while a reliable carrier takes everything else. The lossy
+	// lane still proves itself with that one message (an ACK reopens growth)
+	// but no longer stripes an ordered stream with a carrier that drops it.
+	UnreliableFloorSingleFlight bool
 
 	SequenceBufferSize int
 	AckBufferSize      int
@@ -5514,7 +5521,15 @@ func (self *SendSequence) scheduleSelectiveAckRecovery(currentTime time.Time) bo
 		if gapItem == nil {
 			gapItem = item
 		}
-		if 0 < threshold && gapRecoveryCount < burstSize &&
+		// Mixed lanes: an item carried by the reliable route is routinely
+		// acknowledged after later items that rode a direct datagram lane
+		// with a fraction of its latency. Until it is older than the reliable
+		// lane's RTT it is late, not lost; a gap resend now only doubles the
+		// relay traffic. Its own RTO still covers a real loss.
+		lateNotLost := self.flightController != nil && self.flightController.limited &&
+			item.reliableCarrierObserved && !item.unreliableFlightTracked &&
+			currentTime.Before(item.sendTime.Add(self.rttWindow.ScaledRtt()))
+		if 0 < threshold && gapRecoveryCount < burstSize && !lateNotLost &&
 			!item.selectiveGapRecovered &&
 			(item.ackTailProbeCount == 0 || item.recoveryKind != sendRecoveryNone) &&
 			threshold <= remainingSelectiveAckCount {
@@ -5977,16 +5992,9 @@ sendSequenceLoop:
 				// ordinary cadence. Any resend awaits fresh acknowledgement state.
 				recoveryKind := item.recoveryKind
 				item.recoveryKind = sendRecoveryNone
+				reliableOnlyResend := false
 				if recoveryKind == sendRecoveryNone && item.unreliableFlightTracked {
-					// An RTO is the only congestion evidence available for a lost
-					// tail or a lost cumulative Ack. QUIC does not retransmit the
-					// DATAGRAM payload, so its lower-layer congestion response cannot
-					// release this Transfer flight; halve admission before retrying.
-					self.client.unreliableFlightTimeoutCount.Add(1)
-					if self.flightController.reduceForLoss() {
-						self.client.unreliableFlightReductionCount.Add(1)
-					}
-					self.client.observeUnreliableFlight(self.flightController)
+					reliableOnlyResend = self.observeUnreliableResendTimeout(item, flightPolicy)
 				}
 				item.selectiveAcked = false
 
@@ -6033,6 +6041,7 @@ sendSequenceLoop:
 						resendForceUnwrapped,
 						item,
 						true,
+						reliableOnlyResend,
 					)
 					return writeErr
 				}
@@ -6098,14 +6107,20 @@ sendSequenceLoop:
 			0,
 			self.sendBufferSettings.ResendQueueMaxByteCount,
 		)
+		// The unreliable flight only gates admission while no reliable carrier
+		// can take the overflow; otherwise a full flight is written reliable-only
+		// (see writeMaybeWrappedBytes) instead of stalling the sequence.
+		flightGates := self.unreliableFlightGates(flightPolicy)
 		flightEligible := func(sendPack *SendPack) bool {
 			return flightPolicy.flowIsolation &&
 				self.noAckPackCanBypassRecoveryAdmission(sendPack) ||
+				!flightGates ||
 				self.flightController.canSendForKey(sendPack.schedulingKey)
 		}
 		sendEligible := func(sendPack *SendPack) bool {
 			return self.noAckPackCanBypassRecoveryAdmission(sendPack) ||
-				resendCapacity && self.flightController.canSendForKey(sendPack.schedulingKey)
+				resendCapacity &&
+					(!flightGates || self.flightController.canSendForKey(sendPack.schedulingKey))
 		}
 		var sendPack *SendPack
 		bypassedRecoveryAdmission := false
@@ -6306,7 +6321,7 @@ sendSequenceLoop:
 			continue
 		}
 
-		flightBlocked := self.flightController.limited &&
+		flightBlocked := flightGates &&
 			(!self.flightController.canSend() ||
 				0 < scheduler.Len() && !scheduler.HasEligible(flightEligible))
 		if flightBlocked {
@@ -7129,6 +7144,7 @@ func (self *SendSequence) sendWithSetContractRecords(
 			item.forceUnwrapped,
 			item,
 			false,
+			false,
 		)
 		return writeErr
 	}
@@ -7392,6 +7408,72 @@ func (self *SendSequence) releaseUnreliableFlight(item *sendItem) {
 	self.client.observeUnreliableFlight(self.flightController)
 }
 
+// unreliableFlightGates reports whether a full unreliable flight must stop
+// admitting packs. That is only the case when no reliable carrier is active:
+// with one, the overflow is written reliable-only instead of stalling the
+// sequence (and, on a client, its entire receive path behind it).
+// observeAckRtt feeds the sequence's RTT window from an acknowledged item,
+// except for items carried by an unreliable lane. A direct datagram lane
+// answers in ~20 ms while the relay carrier takes 150-300 ms; mixing both into
+// one window drags the scaled RTO down to its floor and every relay-carried
+// item is resent before its ACK can arrive (thousands of spurious timeout
+// resends per second while p2p is live). The unreliable lane has its own
+// bounded recovery policy and does not depend on this estimate.
+func (self *SendSequence) observeAckRtt(item *sendItem, tag sequenceTag) {
+	if !tag.set || item == nil || item.unreliableCarrierObserved {
+		return
+	}
+	self.rttWindow.CloseSendTime(tag.sendTime)
+}
+
+func (self *SendSequence) unreliableFlightGates(
+	policy transferFlightPolicySnapshot,
+) bool {
+	return self.flightController.limited && !policy.reliableRouteAvailable
+}
+
+// reliableOnlyWrite reports whether the next write must avoid the unreliable
+// carrier because its flight is full and a reliable carrier can take it.
+func (self *SendSequence) reliableOnlyWrite(
+	policy transferFlightPolicySnapshot,
+) bool {
+	if !policy.reliableRouteAvailable || !self.flightController.limited {
+		return false
+	}
+	if !self.flightController.canSend() {
+		return true
+	}
+	// A carrier that loss has reduced to its floor keeps proving itself with
+	// a single message in flight; the ordered stream is not striped onto it.
+	return self.sendBufferSettings.UnreliableFloorSingleFlight &&
+		self.flightController.atFloor() &&
+		0 < self.flightController.messageCount
+}
+
+// observeUnreliableResendTimeout applies the RTO of an unreliable-tracked item.
+// An RTO is the only congestion evidence available for a lost tail or a lost
+// cumulative Ack. QUIC does not retransmit the DATAGRAM payload, so its
+// lower-layer congestion response cannot release this Transfer flight; halve
+// admission before retrying. When a reliable carrier is active the resend goes
+// there, so the item leaves the unreliable flight now instead of holding the
+// whole sequence until the (possibly dead) unreliable carrier acknowledges it.
+// Returns whether the resend must be written reliable-only.
+func (self *SendSequence) observeUnreliableResendTimeout(
+	item *sendItem,
+	policy transferFlightPolicySnapshot,
+) bool {
+	self.client.unreliableFlightTimeoutCount.Add(1)
+	if self.flightController.reduceForLoss() {
+		self.client.unreliableFlightReductionCount.Add(1)
+	}
+	if !policy.reliableRouteAvailable {
+		self.client.observeUnreliableFlight(self.flightController)
+		return false
+	}
+	self.releaseUnreliableFlight(item)
+	return true
+}
+
 func (self *SendSequence) receiveAck(
 	messageId Id,
 	selective bool,
@@ -7407,9 +7489,7 @@ func (self *SendSequence) receiveAck(
 		return
 	}
 
-	if tag.set {
-		self.rttWindow.CloseSendTime(tag.sendTime)
-	}
+	self.observeAckRtt(item, tag)
 
 	if selective {
 		if self.log.V(1).Enabled() {
@@ -7542,8 +7622,13 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 	forceUnwrapped bool,
 	item *sendItem,
 	resend bool,
+	reliableOnly bool,
 ) (transferWriteDisposition, error) {
 	writer := self.openContractMultiRouteWriter()
+	// A full unreliable flight must not stall this sequence while a reliable
+	// carrier is active: route the overflow reliable-only so it is neither
+	// tracked in the flight nor lost with the unreliable carrier.
+	reliableOnly = reliableOnly || self.reliableOnlyWrite(self.transferFlightPolicy())
 	var cipher *sequenceCipher
 	if self.session != nil && !forceUnwrapped {
 		cipher = self.session.Cipher()
@@ -7591,6 +7676,7 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 			self.ctx,
 			shared,
 			self.sendBufferSettings.WriteTimeout,
+			reliableOnly,
 		)
 		if err != nil {
 			// on failure (abort/timeout) no route consumer took the message, so
@@ -7631,6 +7717,7 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 		self.ctx,
 		shared,
 		self.sendBufferSettings.WriteTimeout,
+		reliableOnly,
 	)
 	if err != nil {
 		// see the plaintext branch: a failed write leaves ownership here
@@ -7679,7 +7766,27 @@ func writeMultiRouteWithCarrier(
 	ctx context.Context,
 	transferFrameBytes []byte,
 	timeout time.Duration,
+	reliableOnly bool,
 ) (transferWriteDisposition, error) {
+	if reliableOnly {
+		if reliableWriter, ok := writer.(transferReliableOnlyMultiRouteWriter); ok {
+			success, disposition, err := reliableWriter.writeDetailedReliableOnly(
+				ctx,
+				transferFrameBytes,
+				timeout,
+			)
+			if err != nil {
+				return transferWriteDisposition{}, err
+			}
+			if !success {
+				return transferWriteDisposition{}, errTransferRouteWriteTimeout
+			}
+			if disposition.transportType == "" {
+				disposition.transportType = TransportTypeUnknown
+			}
+			return disposition, nil
+		}
+	}
 	if carrierWriter, ok := writer.(transferCarrierMultiRouteWriter); ok {
 		success, disposition, err := carrierWriter.writeDetailedWithCarrier(
 			ctx,
@@ -9510,7 +9617,7 @@ func (self *ReceiveSequence) Run() {
 					} else if sendAck.transportType != TransportTypeUnknown {
 						var success bool
 						var disposition transferWriteDisposition
-						success, disposition, writeErr = selector.writeDetailedWithCarrierPreference(
+						success, disposition, writeErr = selector.writeDetailedReplyWithCarrierPreference(
 							ackWriteCtx,
 							shared,
 							self.receiveBufferSettings.WriteTimeout,

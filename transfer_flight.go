@@ -325,3 +325,16 @@ func (self *sendFlightController) reduceForLoss() bool {
 	}
 	return reduced
 }
+
+// atFloor reports whether loss reductions have pinned the unreliable flight
+// limit to its minimum: the carrier is currently proving unable to sustain
+// more than the floor, so striping an ordered stream onto it only reorders it.
+func (self *sendFlightController) atFloor() bool {
+	if !self.limited || self.slowStart {
+		return false
+	}
+	if self.byteLimit <= self.activeMinimumByteCount {
+		return true
+	}
+	return 0 < self.messageLimit && self.messageLimit <= self.activeMinimumMessageCount
+}
