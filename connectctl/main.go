@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
+	"strings"
 
 	// "os/exec"
 	// "path/filepath"
@@ -561,15 +564,14 @@ func send(opts docopt.Opts) {
 		AppVersion: fmt.Sprintf("connectctl %s", ConnectCtlVersion),
 	}
 	for i := 0; i < transportCount; i += 1 {
-		platformTransport := connect.NewPlatformTransportWithDefaults(
+		platformTransport := newFamilyPlatformTransportGroup(
 			cancelCtx,
 			clientStrategy,
 			client.RouteManager(),
-			fmt.Sprintf("%s/", connectUrl),
+			connectUrl,
 			auth,
 		)
 		defer platformTransport.Close()
-		// go platformTransport.Run(routeManager)
 	}
 
 	provideModes := map[protocol.ProvideMode]bool{
@@ -713,15 +715,14 @@ func sink(opts docopt.Opts) {
 		AppVersion: fmt.Sprintf("connectctl %s", ConnectCtlVersion),
 	}
 	for i := 0; i < transportCount; i += 1 {
-		platformTransport := connect.NewPlatformTransportWithDefaults(
+		platformTransport := newFamilyPlatformTransportGroup(
 			cancelCtx,
 			clientStrategy,
 			client.RouteManager(),
-			fmt.Sprintf("%s/", connectUrl),
+			connectUrl,
 			auth,
 		)
 		defer platformTransport.Close()
-		// go platformTransport.Run(routeManager)
 	}
 
 	const receiveBufferSize = 256
@@ -751,4 +752,71 @@ func sink(opts docopt.Opts) {
 			reportDrops()
 		}
 	}
+}
+
+// newFamilyPlatformTransportGroup runs the v4-pinned, v6-pinned and standby
+// platform transports for a cli provider (connect/IPV6.md A1, A4), so a
+// connectctl sink or sender proves both address families the way an app
+// provider does. The family urls derive from --connect_url by the same rule
+// the sdk uses; a url with no service label to suffix (an ip literal) runs
+// the legacy single transport.
+func newFamilyPlatformTransportGroup(
+	ctx context.Context,
+	clientStrategy *connect.ClientStrategy,
+	routeManager *connect.RouteManager,
+	connectUrl string,
+	auth *connect.ClientAuth,
+) *connect.FamilyPlatformTransportGroup {
+	platformUrl := fmt.Sprintf("%s/", connectUrl)
+	return connect.NewFamilyPlatformTransportGroup(
+		ctx,
+		connect.DefaultClientStrategySettings(),
+		clientStrategy,
+		routeManager,
+		platformUrl,
+		familyConnectUrl(platformUrl, 4),
+		familyConnectUrl(platformUrl, 6),
+		auth,
+		connect.TransportModeAuto,
+		connect.DefaultPlatformTransportSettings(),
+		nil,
+	)
+}
+
+// familyConnectUrl derives the family-pinned form of a connect url for ip
+// version 4 or 6 by inserting the suffix on the service label, so
+// `wss://connect.bringyour.com/` becomes `wss://connect-v4.bringyour.com/`
+// and `g2-connect` becomes `g2-connect-v4`. Scheme, port and path are kept.
+// "" when there is no label to suffix: an ip literal, a single-label host,
+// or a label the operator already pinned with -v4/-v6.
+func familyConnectUrl(connectUrl string, ipVersion int) string {
+	if ipVersion != 4 && ipVersion != 6 {
+		return ""
+	}
+	connectUrl = strings.TrimSpace(connectUrl)
+	if connectUrl == "" {
+		return ""
+	}
+	parsedUrl, err := url.Parse(connectUrl)
+	if err != nil || parsedUrl.Host == "" {
+		return ""
+	}
+	hostName := parsedUrl.Hostname()
+	if net.ParseIP(hostName) != nil {
+		return ""
+	}
+	label, domain, ok := strings.Cut(hostName, ".")
+	if !ok || label == "" || domain == "" {
+		return ""
+	}
+	if strings.HasSuffix(label, "-v4") || strings.HasSuffix(label, "-v6") {
+		return ""
+	}
+	familyHostName := fmt.Sprintf("%s-v%d.%s", label, ipVersion, domain)
+	if port := parsedUrl.Port(); port != "" {
+		parsedUrl.Host = net.JoinHostPort(familyHostName, port)
+	} else {
+		parsedUrl.Host = familyHostName
+	}
+	return parsedUrl.String()
 }

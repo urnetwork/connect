@@ -48,3 +48,31 @@ func TestEnqueueSinkReceiveDropsWhenFull(t *testing.T) {
 		t.Fatalf("queued receive = %p, want %p", got, first)
 	}
 }
+
+// The cli provider derives its family-pinned urls from --connect_url by the
+// sdk's rule: suffix the service label, keep scheme, port and path, and give
+// up on anything with no label to suffix.
+func TestFamilyConnectUrl(t *testing.T) {
+	cases := []struct {
+		connectUrl string
+		ipVersion  int
+		want       string
+	}{
+		{"wss://connect.bringyour.com/", 4, "wss://connect-v4.bringyour.com/"},
+		{"wss://connect.bringyour.com/", 6, "wss://connect-v6.bringyour.com/"},
+		{"wss://g2-connect.bringyour.com/secret", 4, "wss://g2-connect-v4.bringyour.com/secret"},
+		{"wss://connect.ur.network:8443/", 6, "wss://connect-v6.ur.network:8443/"},
+		{"ws://127.0.0.1:8080/", 4, ""},
+		{"wss://[::1]:8080/", 6, ""},
+		{"wss://localhost/", 4, ""},
+		{"wss://connect-v4.bringyour.com/", 6, ""},
+		{"wss://connect.bringyour.com/", 5, ""},
+		{"", 4, ""},
+		{"not a url", 4, ""},
+	}
+	for _, c := range cases {
+		if got := familyConnectUrl(c.connectUrl, c.ipVersion); got != c.want {
+			t.Errorf("familyConnectUrl(%q, %d) = %q, want %q", c.connectUrl, c.ipVersion, got, c.want)
+		}
+	}
+}
