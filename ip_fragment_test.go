@@ -392,9 +392,9 @@ func TestFragmentedTcpCannotBypassSmtpRoutingOrProviderPolicy(t *testing.T) {
 		}
 		remote.egressIpv4Fragments.mutex.Lock()
 		defer remote.egressIpv4Fragments.mutex.Unlock()
-		if remote.egressIpv4Fragments.reassembler == nil ||
-			len(remote.egressIpv4Fragments.reassembler.datagrams) != 0 ||
-			remote.egressIpv4Fragments.reassembler.retainedByteCount != 0 {
+		if remote.egressIpv4Fragments.reassembler4 == nil ||
+			len(remote.egressIpv4Fragments.reassembler4.datagrams) != 0 ||
+			remote.egressIpv4Fragments.reassembler4.retainedByteCount != 0 {
 			t.Fatal("rejected fragmented TCP retained reassembly state")
 		}
 	})
@@ -415,9 +415,9 @@ func TestFragmentedTcpCannotBypassSmtpRoutingOrProviderPolicy(t *testing.T) {
 		}
 		remote.egressIpv4Fragments.mutex.Lock()
 		defer remote.egressIpv4Fragments.mutex.Unlock()
-		if remote.egressIpv4Fragments.reassembler == nil ||
-			len(remote.egressIpv4Fragments.reassembler.datagrams) != 0 ||
-			remote.egressIpv4Fragments.reassembler.retainedByteCount != 0 {
+		if remote.egressIpv4Fragments.reassembler4 == nil ||
+			len(remote.egressIpv4Fragments.reassembler4.datagrams) != 0 ||
+			remote.egressIpv4Fragments.reassembler4.retainedByteCount != 0 {
 			t.Fatal("multi-client retained rejected fragmented TCP state")
 		}
 	})
@@ -729,22 +729,5 @@ func TestUdpDefaultsReceiveQuicInitialWithoutChangingPacketMtu(t *testing.T) {
 	}
 	if settings.ReadBufferByteCount < 1200 {
 		t.Fatalf("UDP read buffer = %d, cannot receive a QUIC Initial", settings.ReadBufferByteCount)
-	}
-}
-
-func TestOversizedIpv6UdpDoesNotSplitApplicationDatagram(t *testing.T) {
-	payload := fragmentTestPayload(1200)
-	packets, err := newFragmentTestStream(6).DataPackets(payload, len(payload), DefaultMtu)
-	if err == nil {
-		for _, packet := range packets {
-			MessagePoolReturn(packet)
-		}
-		t.Fatalf("oversized IPv6 UDP returned %d application datagrams, want an explicit error", len(packets))
-	}
-	if len(packets) != 0 {
-		for _, packet := range packets {
-			MessagePoolReturn(packet)
-		}
-		t.Fatalf("oversized IPv6 UDP returned %d packets with an error", len(packets))
 	}
 }

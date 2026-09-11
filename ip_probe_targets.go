@@ -161,9 +161,10 @@ var probeHostNames = []string{
 	"www.riotgames.com",
 }
 
-// probeResolverIps are the dns-class resolver ips, queried at :53. All v4 in
-// this revision of the list, which is why the sampler hands back a string and
-// the crafting side is the only place the family matters.
+// probeResolverIps are the v4 dns-class resolver ips, queried at :53. The v6
+// list below holds the same operators' v6 endpoints; sampleProbeTargetsForIpFamily
+// picks from whichever the exit can carry. The sampler hands back a string
+// and the crafting side is the only place the family matters.
 var probeResolverIps = []string{
 	"8.8.8.8",
 	"8.8.4.4",
@@ -188,6 +189,26 @@ var probeResolverIps = []string{
 	"119.29.29.29",
 	"114.114.114.114",
 	"185.222.222.222",
+}
+
+// probeResolverIpv6s are the v6 dns-class resolver ips (Cloudflare, Google,
+// Quad9, OpenDNS, AdGuard, Control D, CleanBrowsing, Yandex, DNS.SB), for
+// exits that can carry v6.
+var probeResolverIpv6s = []string{
+	"2606:4700:4700::1111",
+	"2606:4700:4700::1001",
+	"2001:4860:4860::8888",
+	"2001:4860:4860::8844",
+	"2620:fe::fe",
+	"2620:fe::9",
+	"2620:119:35::35",
+	"2620:119:53::53",
+	"2a10:50c0::ad1:ff",
+	"2a10:50c0::ad2:ff",
+	"2606:1a40::",
+	"2a0d:2a00:1::",
+	"2a02:6b8::feed:0ff",
+	"2a09::",
 }
 
 // The pass width (how many health hosts one probe pass uses, alongside one
@@ -227,8 +248,26 @@ const probePassFraction = 0.6
 // mechanism itself must not be able to introduce that confusion, so it is not
 // given the ability to resolve anything.
 func sampleProbeTargets(seed uint64, n int) (hosts []string, resolver string) {
-	if 0 < len(probeResolverIps) {
-		resolver = probeResolverIps[seed%uint64(len(probeResolverIps))]
+	return sampleProbeTargetsForIpFamily(seed, n, IpFamilyV4Only)
+}
+
+// sampleProbeTargetsForIpFamily is sampleProbeTargets with the resolver drawn
+// from the list the exit's address-family category can carry: v4-only and
+// legacy exits get a v4 resolver, v6-only exits a v6 resolver, and a
+// dualstack exit alternates by seed so a re-probed provider proves both
+// families over consecutive passes.
+func sampleProbeTargetsForIpFamily(seed uint64, n int, ipFamily IpFamily) (hosts []string, resolver string) {
+	resolverIps := probeResolverIps
+	switch ipFamily.Normalize() {
+	case IpFamilyV6Only:
+		resolverIps = probeResolverIpv6s
+	case IpFamilyDualstack:
+		if seed%2 == 1 {
+			resolverIps = probeResolverIpv6s
+		}
+	}
+	if 0 < len(resolverIps) {
+		resolver = resolverIps[seed%uint64(len(resolverIps))]
 	}
 	if n <= 0 || len(probeHostNames) == 0 {
 		return nil, resolver

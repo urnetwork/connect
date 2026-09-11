@@ -410,10 +410,11 @@ func (self *firstLoadTimeline) Samples() []*FirstLoadSample {
 }
 
 // firstLoadTcpPeek extracts (remote addr, remote port, local port, tcp
-// flags, payload length) from a raw ip packet at fixed offsets, without
-// allocating. ingress=false reads an egress packet (remote = destination);
-// ingress=true reads an ingress packet (remote = source). ok is false for
-// non-tcp, short, or extension-header packets (skipped for measurement).
+// flags, payload length) from a raw ip packet, without allocating.
+// ingress=false reads an egress packet (remote = destination); ingress=true
+// reads an ingress packet (remote = source). ok is false for non-tcp or
+// short packets and for v6 fragments (skipped for measurement); v6 extension
+// headers are walked (ip_ipv6_ext.go).
 func firstLoadTcpPeek(packet []byte, ingress bool) (remoteAddr netip.Addr, remotePort uint16, localPort uint16, flags byte, payloadLen int, ok bool) {
 	if len(packet) < 20 {
 		return
@@ -437,15 +438,12 @@ func firstLoadTcpPeek(packet []byte, ingress bool) (remoteAddr netip.Addr, remot
 			remoteAddr, _ = netip.AddrFromSlice(packet[16:20])
 		}
 	case 6:
-		if len(packet) < 60 || packet[6] != 6 {
+		nextHeader, transportOffset, end, ok6 := ipv6TransportOffset(packet)
+		if !ok6 || nextHeader != ipProtocolNumberTcp {
 			return
 		}
-		payloadLen6 := int(packet[4])<<8 | int(packet[5])
-		totalLen = 40 + payloadLen6
-		if len(packet) < totalLen {
-			totalLen = len(packet)
-		}
-		l4 = 40
+		totalLen = end
+		l4 = transportOffset
 		if ingress {
 			remoteAddr, _ = netip.AddrFromSlice(packet[8:24])
 		} else {

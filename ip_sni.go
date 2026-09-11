@@ -229,9 +229,10 @@ func (self *sniSniffer) shed() {
 }
 
 // peekTlsSegment extracts the flow 4-tuple and TCP payload of an egress TCP/443 packet
-// from fixed header offsets, without allocating. ok is false for anything that isn't a
-// well-formed TCP/443 packet (including IPv6 with extension headers, which are not
-// classified here). The returned payload aliases packet.
+// from the header offsets, without allocating. ok is false for anything that isn't a
+// well-formed TCP/443 packet. IPv6 extension headers are walked (ip_ipv6_ext.go); a v6
+// fragment has no transport header to read and is not classified. The returned payload
+// aliases packet.
 func peekTlsSegment(packet []byte) (tlsSegment, bool) {
 	if len(packet) < 20 {
 		return tlsSegment{}, false
@@ -258,20 +259,13 @@ func peekTlsSegment(packet []byte) (tlsSegment, bool) {
 		ipHeaderLen = ihl
 		ipPayloadEnd = totalLen
 	case 6:
-		if len(packet) < 40 {
+		nextHeader, transportOffset, end, ok := ipv6TransportOffset(packet)
+		if !ok || nextHeader != ipProtocolNumberTcp {
 			return tlsSegment{}, false
-		}
-		if packet[6] != 6 { // next header not TCP (extension headers unsupported here)
-			return tlsSegment{}, false
-		}
-		payloadLen := int(packet[4])<<8 | int(packet[5])
-		end := 40 + payloadLen
-		if len(packet) < end {
-			end = len(packet)
 		}
 		srcAddr, _ = netip.AddrFromSlice(packet[8:24])
 		dstAddr, _ = netip.AddrFromSlice(packet[24:40])
-		ipHeaderLen = 40
+		ipHeaderLen = transportOffset
 		ipPayloadEnd = end
 	default:
 		return tlsSegment{}, false

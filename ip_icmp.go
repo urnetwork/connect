@@ -29,6 +29,26 @@ const (
 	icmp6TypeEchoReply   = byte(129)
 )
 
+// icmpv6 link-local control types (rfc 4443, rfc 4861, rfc 3810): multicast
+// listener query/report/done (130-132), router solicitation/advertisement
+// (133-134), neighbor solicitation/advertisement (135-136) and redirect
+// (137). None has meaning across a point-to-point tunnel; they are dropped
+// silently wherever they appear (see isIcmpv6LinkControlType).
+const (
+	icmp6TypeMulticastListenerQuery = byte(130)
+	icmp6TypeRedirect               = byte(137)
+)
+
+// errIcmpv6LinkControl is the parse error for an icmpv6 link-local control
+// message, distinct from a malformed packet so a caller can drop it quietly.
+var errIcmpv6LinkControl = errors.New("icmpv6 link-local control message is not carried")
+
+// isIcmpv6LinkControlType reports whether an icmpv6 type is link-local control
+// chatter (mld, router and neighbor discovery, redirect).
+func isIcmpv6LinkControlType(icmpType byte) bool {
+	return icmp6TypeMulticastListenerQuery <= icmpType && icmpType <= icmp6TypeRedirect
+}
+
 // minimal parsed view of an icmp echo packet on the send path, matching the
 // tcp/udp views. all slices alias the backing ip packet.
 type parsedIcmp struct {
