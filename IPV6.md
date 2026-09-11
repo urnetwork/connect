@@ -69,7 +69,9 @@ the full dialer set and no intent runs only while neither pinned transport is
 connected, after a `StandbyDelay` (default 15s) from start or from the last
 pinned disconnect, and stops when a pinned transport connects. This covers
 unprovisioned names, blocked DNS and censored networks, where the provider is
-then tagged legacy v4.
+then tagged legacy v4. `FamilyPlatformTransportGroup` (transport_family.go)
+owns the three transports; the SDK exposes their states through
+`Device.GetProviderFamilyTransportStatus`.
 
 A5. Sleep instead of spin. A pinned transport sleeps while
 `probeFamilySupport(family)` reports no global address of its family and
@@ -107,7 +109,9 @@ A8. Server storage and categorization.
   legacy and is treated as v4-only.
 - Rank cache: a family facet on the sample buckets at build time (three
   facets per key). Capable filters draw the dualstack facet first, then the
-  single-family facet. Exact filters read one facet.
+  single-family facet. Exact filters read one facet. Readers fall back to the
+  un-faceted keys until one complete faceted export has set
+  `client_score_ip_family_v1_ready`, so deploy the api before the taskworker.
 - Category per provider: `dualstack`, `v4-only`, `v6-only`.
 
 A9. Infra. Add to `vault/main/services.yml` under `connect`, mirroring the
@@ -155,14 +159,20 @@ today and its destinations are treated as legacy v4-only.
 B5. Local downgrade. Per-exit dial-failure counters are split by version.
 When the v6 counter reaches the existing dial-starvation threshold while v4
 stays healthy, the exit is downgraded to v4-only for the life of the window.
-That may open a v6 shortfall and trigger a `v6-capable` fill.
+That may open a v6 shortfall and trigger a `v6-capable` fill. Qualification
+probing follows the category: v4-capable exits probe over v4, v6-only exits
+over v6, and dualstack exits alternate families across passes; a dualstack
+exit is proven by either family's pass.
 
 B6. No v6-capable exit. `RemoteUserNatMultiClient.Ipv6Available()` is true
-when any window has an added v6-capable exit. While false, the in-tunnel DNS
-interceptor in `ip_mux_upgrade.go` answers AAAA with an empty NOERROR without
-an upstream query, and a v6 packet with no candidate gets an ICMPv6
-destination-unreachable no-route reply (`ipOosUnreachable`) so connects fail
-fast. The flag is exported on the window status for the apps.
+when any window has an added v6-capable exit and is exported on the window
+status for the apps. The corrective actions key on the narrower
+`Ipv6Unroutable()`: the windows have formed and none carries v6. While that
+holds, the in-tunnel DNS interceptor in `ip_mux_upgrade.go` answers AAAA with
+an empty NOERROR without an upstream query (`SetIpv6Unroutable`), and a v6
+packet with no candidate gets an ICMPv6 destination-unreachable no-route
+reply so connects fail fast. Neither fires while the windows are still
+forming, which would push every dual-stack app onto v4 for the session.
 
 ### C. Data plane and DNS
 
@@ -285,3 +295,6 @@ and receive today's behavior; old cache entries read as v4-only.
 - Categories depend on the reliability aggregation and score-cache cadence,
   so a family change on a provider lags by up to one rebuild.
 - P2P transports are family-independent and are not part of the tag.
+- A parked pinned transport (sleeping, idle by policy, or the held standby)
+  keeps its required H1 budget claim and socket slot for its lifetime; only
+  the optional H3 lease is yielded while parked.
