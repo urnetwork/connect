@@ -139,6 +139,11 @@ func probeFlowsOfProtocol(parent *RemoteUserNatMultiClient, protocol IpProtocol)
 			probes = append(probes, update.probe)
 		}
 	}
+	for _, update := range parent.ip6PathUpdates {
+		if update.isProbe() && update.probe.ipPath.Protocol == protocol {
+			probes = append(probes, update.probe)
+		}
+	}
 	return probes
 }
 
@@ -824,5 +829,373 @@ func TestProberSweepTallyAllFailed(t *testing.T) {
 	}
 	if line.failed != 6 || line.passed != 0 {
 		t.Errorf("line = %+v, want all six failed", line)
+	}
+}
+
+// --- per-family probing (IPV6.md B1) ---
+
+func dnsTestAAAARecord(ip net.IP) dnsTestRecord {
+	return dnsTestRecord{recordType: 28, recordClass: 1, rdata: ip.To16()}
+}
+
+// dnsTestAddress is a distinct address of the version for the i-th answer.
+func dnsTestAddress(ipVersion int, i int) net.IP {
+	if ipVersion == 6 {
+		return net.ParseIP("2001:db8:ffff::" + string(rune('a'+i)))
+	}
+	return net.IPv4(198, 51, 100, byte(10+i))
+}
+
+func dnsTestAddressRecord(ipVersion int, ip net.IP) dnsTestRecord {
+	if ipVersion == 6 {
+		return dnsTestAAAARecord(ip)
+	}
+	return dnsTestARecord(ip)
+}
+
+// The family-aware parser keeps exactly the wanted family's address records,
+// skips the other family's, and keeps the "malformed is silence" contract.
+func TestDnsAddressResponseParser(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		const id = 0x6160
+		name := "www.example.com"
+		want := dnsTestAddress(ipVersion, 0)
+		other := dnsTestAddress(10-ipVersion, 0)
+
+		answer := dnsTestAnswer(t, id, name, 0x8180, []dnsTestRecord{
+			dnsTestAddressRecord(10-ipVersion, other),
+			dnsTestAddressRecord(ipVersion, want),
+			// a cname in the chain is skipped like any other type
+			{recordType: 5, recordClass: 1, rdata: []byte{3, 'w', 'w', 'w', 0}},
+		})
+		ips, ok := parseDnsAddressResponse(answer, id, ipVersion)
+		if !ok || len(ips) != 1 || !ips[0].Equal(want) {
+			t.Fatalf("v%d: parsed %v ok=%v, want [%v]", ipVersion, ips, ok, want)
+		}
+		if ipVersion == 6 && ips[0].To4() != nil {
+			t.Fatalf("v6 parse yielded a v4 address %v", ips[0])
+		}
+
+		// the other family's parser sees only its own records
+		ips, ok = parseDnsAddressResponse(answer, id, 10-ipVersion)
+		if !ok || len(ips) != 1 || !ips[0].Equal(other) {
+			t.Fatalf("v%d: other-family parse %v ok=%v, want [%v]", ipVersion, ips, ok, other)
+		}
+
+		// nxdomain: answered, no records
+		nx := dnsTestAnswer(t, id, name, 0x8183, nil)
+		if ips, ok := parseDnsAddressResponse(nx, id, ipVersion); !ok || len(ips) != 0 {
+			t.Fatalf("v%d: nxdomain parsed as %v ok=%v", ipVersion, ips, ok)
+		}
+		// a foreign id is not our answer
+		if _, ok := parseDnsAddressResponse(answer, id+1, ipVersion); ok {
+			t.Fatalf("v%d: a foreign transaction id parsed as an answer", ipVersion)
+		}
+		// an echoed query (QR unset) is not an answer
+		query := dnsTestAnswer(t, id, name, 0x0100, nil)
+		if _, ok := parseDnsAddressResponse(query, id, ipVersion); ok {
+			t.Fatalf("v%d: an echoed query parsed as an answer", ipVersion)
+		}
+		// truncation never yields a partial answer
+		for _, cut := range []int{13, len(answer) - 20, len(answer) - 2} {
+			if ips, ok := parseDnsAddressResponse(answer[:cut], id, ipVersion); ok && 0 < len(ips) {
+				t.Errorf("v%d: truncation at %d yielded records %v", ipVersion, cut, ips)
+			}
+		}
+		// a record of the wanted type with the wrong rdata length is skipped
+		short := dnsTestAnswer(t, id, name, 0x8180, []dnsTestRecord{
+			{recordType: probeDnsRecordTypeForIpVersion(ipVersion), recordClass: 1, rdata: []byte{1, 2, 3}},
+		})
+		if ips, ok := parseDnsAddressResponse(short, id, ipVersion); !ok || len(ips) != 0 {
+			t.Fatalf("v%d: a malformed rdata length parsed as %v ok=%v", ipVersion, ips, ok)
+		}
+	})
+}
+
+// The family a pass asks over follows the exit's category: v4-capable
+// categories over v4, v6-only over v6, dualstack alternating by seed.
+func TestProbeIpVersionForFamily(t *testing.T) {
+	for seed := uint64(0); seed < 8; seed += 1 {
+		for _, family := range []IpFamily{IpFamilyLegacy, IpFamilyV4Only, IpFamily("something-newer")} {
+			if got := probeIpVersionForFamily(seed, family); got != 4 {
+				t.Fatalf("seed %d %q -> v%d, want v4", seed, family, got)
+			}
+		}
+		if got := probeIpVersionForFamily(seed, IpFamilyV6Only); got != 6 {
+			t.Fatalf("seed %d v6-only -> v%d, want v6", seed, got)
+		}
+		want := 4
+		if seed%2 == 1 {
+			want = 6
+		}
+		if got := probeIpVersionForFamily(seed, IpFamilyDualstack); got != want {
+			t.Fatalf("seed %d dualstack -> v%d, want v%d", seed, got, want)
+		}
+		// the sampler's resolver agrees with the version choice
+		_, resolver := sampleProbeTargetsForIpFamily(seed, 4, IpFamilyDualstack)
+		if resolverIp := net.ParseIP(resolver); (resolverIp.To4() == nil) != (want == 6) {
+			t.Fatalf("seed %d dualstack resolver %s does not match v%d", seed, resolver, want)
+		}
+	}
+}
+
+// Literal hosts and the resolver-down fallback per family: over v4 the
+// table's v4 literals, over v6 their siblings, every one a native address of
+// the pass's family, and hostnames are never literals.
+func TestProbeLiteralHostsByFamily(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		targets := probeFallbackLiteralTargetsForIpVersion(ipVersion)
+		if len(targets) < 3 {
+			t.Fatalf("v%d: %d fallback literals, the fallback needs several", ipVersion, len(targets))
+		}
+		seen := map[string]bool{}
+		for _, target := range targets {
+			if (target.Ip.To4() != nil) != (ipVersion == 4) {
+				t.Fatalf("v%d: fallback literal %s (%s) is the wrong family", ipVersion, target.Host, target.Ip)
+			}
+			if target.Port != 443 || target.Class != probeClassHealth {
+				t.Fatalf("v%d: fallback literal %s is not a :443 health target", ipVersion, target.Host)
+			}
+			if seen[target.Ip.String()] {
+				t.Fatalf("v%d: fallback literal %s repeats", ipVersion, target.Ip)
+			}
+			seen[target.Ip.String()] = true
+			// the target keeps the sampled host as its name so a field
+			// report names the table entry, whichever family answered
+			if net.ParseIP(target.Host) == nil {
+				t.Fatalf("v%d: fallback target host %q is not the table's literal", ipVersion, target.Host)
+			}
+		}
+		if ipVersion == 4 {
+			// the v4 form is exactly what it was
+			if len(targets) != len(probeFallbackLiteralTargets()) {
+				t.Fatalf("v4 fallback changed: %d vs %d", len(targets), len(probeFallbackLiteralTargets()))
+			}
+		} else if len(targets) != len(probeHostLiteralIpv6s) {
+			t.Fatalf("v6 fallback has %d targets, want one per sibling (%d)", len(targets), len(probeHostLiteralIpv6s))
+		}
+		if _, ok := probeLiteralHostIp("www.google.com", ipVersion); ok {
+			t.Fatalf("v%d: a hostname read as a literal", ipVersion)
+		}
+	})
+	// a v4 literal with no v6 sibling is neither dialable nor resolvable over v6
+	if _, ok := probeLiteralHostIp("203.0.113.9", 6); ok {
+		t.Fatal("a sibling-less v4 literal read as a v6 literal")
+	}
+	// a v6 literal stands for itself over v6 and is nothing over v4
+	if ip, ok := probeLiteralHostIp("2001:db8::9", 6); !ok || ip.To4() != nil {
+		t.Fatalf("a v6 literal over v6 = %v %v", ip, ok)
+	}
+	if _, ok := probeLiteralHostIp("2001:db8::9", 4); ok {
+		t.Fatal("a v6 literal read as a v4 literal")
+	}
+}
+
+// The full pass over each family: a v6-only exit is asked v6 questions --
+// a v6 resolver, AAAA queries, v6 syns to the answered addresses -- and is
+// qualified by them; a legacy exit keeps the v4 pass exactly as it was.
+func TestProbeResolutionThroughChannelByFamily(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		parent, client, forwarded := probeTestParent(t)
+		parent.settings.ProbeSampleHostCount = 4
+		if ipVersion == 6 {
+			client.args.DestinationStats.IpFamily = IpFamilyV6Only
+		}
+
+		destination := client.probeDestination()
+		seed := probeSeedBase(destination)
+		if got := probeIpVersionForFamily(seed, client.IpFamily()); got != ipVersion {
+			t.Fatalf("the fixture's exit would be probed over v%d, want v%d", got, ipVersion)
+		}
+		hosts, resolver := sampleProbeTargetsForIpVersion(seed, 4, ipVersion)
+		resolverIp := net.ParseIP(resolver)
+		if (resolverIp.To4() != nil) != (ipVersion == 4) {
+			t.Fatalf("sampled resolver %s is not a v%d address", resolver, ipVersion)
+		}
+		expectedNames := []string{}
+		expectedLiterals := 0
+		for _, host := range hosts {
+			if _, ok := probeLiteralHostIp(host, ipVersion); ok {
+				expectedLiterals += 1
+			} else if net.ParseIP(host) == nil {
+				expectedNames = append(expectedNames, host)
+			}
+		}
+		if len(expectedNames) == 0 {
+			t.Fatal("the first sample block holds no hostnames; the fixture cannot exercise resolution")
+		}
+
+		resultCh := make(chan probeResult, 1)
+		go func() {
+			resultCh <- parent.probeProviderPass(client)
+		}()
+
+		// stage A: one address query per sampled hostname, over the pass's
+		// family, to the family's resolver, asking for the family's record
+		dnsProbes := waitForProbeFlows(t, parent, IpProtocolUdp, len(expectedNames))
+		answeredIps := map[string]net.IP{}
+		for i, probe := range dnsProbes {
+			if probe.ipPath.Version != ipVersion {
+				t.Errorf("resolution query is v%d, want v%d", probe.ipPath.Version, ipVersion)
+			}
+			if !probe.ipPath.DestinationIp.Equal(resolverIp) {
+				t.Errorf("resolution query went to %s, want the sampled resolver %s", probe.ipPath.DestinationIp, resolver)
+			}
+			query, ok := probePacket(probe.ipPath, probe.target, probe.synSequence)
+			if !ok {
+				t.Fatal("could not rebuild the resolution query")
+			}
+			queryPath, payload, err := ParseIpPathWithPayload(query)
+			if err != nil || queryPath.Version != ipVersion {
+				t.Fatalf("the resolution query does not parse as v%d: %v", ipVersion, err)
+			}
+			if qtype := binary.BigEndian.Uint16(payload[len(payload)-4 : len(payload)-2]); qtype != probeDnsRecordTypeForIpVersion(ipVersion) {
+				t.Errorf("v%d resolution query asks qtype %d", ipVersion, qtype)
+			}
+			ip := dnsTestAddress(ipVersion, i)
+			answeredIps[probe.target.QueryName] = ip
+			answer := dnsTestAnswer(t, uint16(probe.synSequence), probe.target.QueryName, 0x8180, []dnsTestRecord{
+				// the other family's record rides along and must be ignored
+				dnsTestAddressRecord(10-ipVersion, dnsTestAddress(10-ipVersion, i)),
+				dnsTestAddressRecord(ipVersion, ip),
+			})
+			answerPacket := ipOosUdpPacket(probe.ipPath.Reverse(), answer)
+			ingressPath, err := ParseIpPath(answerPacket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parent.clientReceivePacket(client, TransferPath{}, 0, TransportTypeUnknown, ingressPath, answerPacket)
+		}
+
+		// stage B: syns of the pass's family to exactly the answered
+		// addresses plus the family's literal hosts
+		tcpProbes := waitForProbeFlows(t, parent, IpProtocolTcp, len(expectedNames)+expectedLiterals)
+		resolvedSeen := 0
+		for _, probe := range tcpProbes {
+			if probe.ipPath.Version != ipVersion {
+				t.Errorf("tcp probe for %s is v%d, want v%d", probe.target.Host, probe.ipPath.Version, ipVersion)
+			}
+			if (probe.ipPath.DestinationIp.To4() != nil) != (ipVersion == 4) {
+				t.Errorf("tcp probe for %s dialed %s, the wrong family", probe.target.Host, probe.ipPath.DestinationIp)
+			}
+			if expected, ok := answeredIps[probe.target.Host]; ok {
+				if !probe.ipPath.DestinationIp.Equal(expected) {
+					t.Errorf("tcp probe for %s dialed %s, want the resolved %s", probe.target.Host, probe.ipPath.DestinationIp, expected)
+				}
+				resolvedSeen += 1
+			}
+			syn, ok := probePacket(probe.ipPath, probe.target, probe.synSequence)
+			if !ok {
+				t.Fatal("could not rebuild the syn")
+			}
+			if synPath, err := ParseIpPath(syn); err != nil || synPath.Version != ipVersion || !synPath.Syn {
+				t.Fatalf("the crafted syn does not parse as a v%d syn: %v", ipVersion, err)
+			}
+			ingressPath, packet := probeTestSynAck(t, probe.ipPath, probe.synSequence)
+			parent.clientReceivePacket(client, TransferPath{}, 0, TransportTypeUnknown, ingressPath, packet)
+		}
+		if resolvedSeen != len(expectedNames) {
+			t.Errorf("saw %d tcp probes for resolved names, want %d", resolvedSeen, len(expectedNames))
+		}
+
+		var result probeResult
+		select {
+		case result = <-resultCh:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the pass did not complete after every probe was answered")
+		}
+		if !result.Passed {
+			t.Errorf("a fully answered v%d pass failed: %d/%d", ipVersion, result.Answered, result.Sent)
+		}
+		if result.Sent != len(expectedNames)+expectedLiterals {
+			t.Errorf("stage B sent %d, want %d (resolved + literal)", result.Sent, len(expectedNames)+expectedLiterals)
+		}
+		if !parent.providerQualified(destination) {
+			t.Errorf("a passed v%d pass did not qualify the provider", ipVersion)
+		}
+		if n := len(*forwarded); n != 0 {
+			t.Errorf("%d probe packet(s) reached the application", n)
+		}
+	})
+}
+
+// A dualstack exit is asked over alternate families on consecutive passes,
+// and is proven by either: a v4 pass that qualified it stands when the next
+// pass, over v6, goes unanswered.
+func TestProbeDualstackExitAlternatesFamilies(t *testing.T) {
+	parent, client, _ := probeTestParent(t)
+	parent.settings.ProbeSampleHostCount = 2
+	parent.settings.ProbeTimeout = 500 * time.Millisecond
+	client.args.DestinationStats.IpFamily = IpFamilyDualstack
+	destination := client.probeDestination()
+	seed := probeSeedBase(destination)
+
+	// pass 0: answered in full over whichever family the seed picks
+	firstVersion := probeIpVersionForFamily(seed, IpFamilyDualstack)
+	resultCh := make(chan probeResult, 1)
+	go func() {
+		resultCh <- parent.probeProviderPass(client)
+	}()
+	dnsProbes := waitForProbeFlows(t, parent, IpProtocolUdp, 1)
+	for _, probe := range dnsProbes {
+		if probe.ipPath.Version != firstVersion {
+			t.Fatalf("pass 0 asked over v%d, want v%d", probe.ipPath.Version, firstVersion)
+		}
+	}
+	// the resolver stays silent; the fallback literals of the same family
+	// answer, which is enough to qualify
+	tcpProbes := waitForProbeFlows(t, parent, IpProtocolTcp, len(probeFallbackLiteralTargetsForIpVersion(firstVersion)))
+	for _, probe := range tcpProbes {
+		if probe.ipPath.Version != firstVersion {
+			t.Fatalf("pass 0 fallback dialed over v%d, want v%d", probe.ipPath.Version, firstVersion)
+		}
+		ingressPath, packet := probeTestSynAck(t, probe.ipPath, probe.synSequence)
+		parent.clientReceivePacket(client, TransferPath{}, 0, TransportTypeUnknown, ingressPath, packet)
+	}
+	select {
+	case result := <-resultCh:
+		if !result.Passed {
+			t.Fatalf("pass 0 failed: %d/%d", result.Answered, result.Sent)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("pass 0 did not complete")
+	}
+	if !parent.providerQualified(destination) {
+		t.Fatal("pass 0 did not qualify the provider")
+	}
+
+	// pass 1: the other family, and nothing answers
+	secondVersion := probeIpVersionForFamily(seed+1, IpFamilyDualstack)
+	if secondVersion == firstVersion {
+		t.Fatalf("consecutive dualstack passes both chose v%d", firstVersion)
+	}
+	go func() {
+		resultCh <- parent.probeProviderPass(client)
+	}()
+	dnsProbes = waitForProbeFlows(t, parent, IpProtocolUdp, 1)
+	for _, probe := range dnsProbes {
+		if probe.ipPath.Version != secondVersion {
+			t.Fatalf("pass 1 asked over v%d, want v%d", probe.ipPath.Version, secondVersion)
+		}
+	}
+	select {
+	case result := <-resultCh:
+		if result.Passed {
+			t.Fatal("an unanswered pass passed")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("pass 1 did not complete")
+	}
+	// proven by either family: the failed pass over the other family records
+	// nothing against the standing qualification
+	if !parent.providerQualified(destination) {
+		t.Fatal("an unanswered pass over the other family un-qualified a dualstack exit")
+	}
+	if client.IpFamily() != IpFamilyDualstack {
+		t.Fatalf("a failed probe pass changed the exit category to %q", client.IpFamily())
+	}
+	// and the third pass rotates back
+	if got := probeIpVersionForFamily(seed+2, IpFamilyDualstack); got != firstVersion {
+		t.Fatalf("pass 2 would ask over v%d, want v%d", got, firstVersion)
 	}
 }
