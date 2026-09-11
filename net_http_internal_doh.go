@@ -2,19 +2,18 @@ package connect
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"sort"
 	"strings"
 	"sync/atomic"
-	"time"
 )
 
 // internalDohDialFallbackDelay is the Happy Eyeballs delay between raw
-// addresses. A definitive failure launches the next address immediately.
-const internalDohDialFallbackDelay = 250 * time.Millisecond
+// addresses, the package-wide DefaultDialFallbackDelay. A definitive failure
+// launches the next address immediately.
+const internalDohDialFallbackDelay = DefaultDialFallbackDelay
 
 // internalDohResolver is the client strategy's trusted name path for the
 // network-space domains. It resolves with the existing bounded DoH cache and
@@ -147,82 +146,16 @@ func (self *internalDohResolver) matches(host string) bool {
 	return false
 }
 
-type internalDohQueryResult struct {
-	addrs         []netip.Addr
-	authoritative bool
-}
-
+// resolve answers a protected name for the families the (already narrowed)
+// network permits, ordered for the race. See resolveDohDialAddrs.
 func (self *internalDohResolver) resolve(ctx context.Context, network string, host string) ([]netip.Addr, error) {
-	recordTypes := make([]string, 0, 2)
-	if !strings.HasSuffix(network, "4") {
-		recordTypes = append(recordTypes, "AAAA")
-	}
-	if !strings.HasSuffix(network, "6") {
-		recordTypes = append(recordTypes, "A")
-	}
-	if len(recordTypes) == 0 {
-		return nil, fmt.Errorf("resolve %s: ipv4 and ipv6 are both disabled", host)
-	}
-
-	results := make(chan internalDohQueryResult, len(recordTypes))
-	for _, recordType := range recordTypes {
-		go func() {
-			addrs, authoritative := self.cache.QueryResult(ctx, recordType, host)
-			results <- internalDohQueryResult{addrs: addrs, authoritative: authoritative}
-		}()
-	}
-
-	var addrs []netip.Addr
-	authoritativeCount := 0
-	for range recordTypes {
-		result := <-results
-		addrs = append(addrs, result.addrs...)
-		if result.authoritative {
-			authoritativeCount++
-		}
-	}
-	if 0 < len(addrs) {
-		return orderInternalDohAddrs(addrs), nil
-	}
-	if authoritativeCount == len(recordTypes) {
-		return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	return nil, &net.DNSError{Err: "internal DoH resolution failed", Name: host, IsTemporary: true}
+	return resolveDohDialAddrs(ctx, self.cache, network, host)
 }
 
-// orderInternalDohAddrs makes the raw dial order stable, alternating families
-// so a dead IPv6 or IPv4 path cannot consume the entire request deadline.
+// orderInternalDohAddrs is the shared race order (orderDialAddrs): families
+// alternate v6 first so a dead path cannot consume the whole request deadline.
 func orderInternalDohAddrs(addrs []netip.Addr) []netip.Addr {
-	ipv4 := make([]netip.Addr, 0, len(addrs))
-	ipv6 := make([]netip.Addr, 0, len(addrs))
-	seen := map[netip.Addr]bool{}
-	for _, addr := range addrs {
-		addr = addr.Unmap()
-		if !addr.IsValid() || seen[addr] {
-			continue
-		}
-		seen[addr] = true
-		if addr.Is4() {
-			ipv4 = append(ipv4, addr)
-		} else {
-			ipv6 = append(ipv6, addr)
-		}
-	}
-	sort.Slice(ipv4, func(i int, j int) bool { return ipv4[i].Less(ipv4[j]) })
-	sort.Slice(ipv6, func(i int, j int) bool { return ipv6[i].Less(ipv6[j]) })
-	ordered := make([]netip.Addr, 0, len(ipv4)+len(ipv6))
-	for i := 0; i < max(len(ipv4), len(ipv6)); i++ {
-		if i < len(ipv6) {
-			ordered = append(ordered, ipv6[i])
-		}
-		if i < len(ipv4) {
-			ordered = append(ordered, ipv4[i])
-		}
-	}
-	return ordered
+	return orderDialAddrs(addrs)
 }
 
 func (self *internalDohResolver) wrapDialContext(dialContext DialContextFunction) DialContextFunction {
@@ -239,11 +172,9 @@ func (self *internalDohResolver) wrapDialContext(dialContext DialContextFunction
 	}
 }
 
-type internalDohDialResult struct {
-	conn net.Conn
-	err  error
-}
-
+// dialInternalDohAddrs races the resolved addresses of a protected name
+// through the underlying dialer. It is the shared race (dialAddrsRace) with
+// the fallback delay every hostname dial uses.
 func dialInternalDohAddrs(
 	ctx context.Context,
 	network string,
@@ -254,69 +185,7 @@ func dialInternalDohAddrs(
 	if len(addrs) == 0 {
 		return nil, fmt.Errorf("internal DoH returned no addresses")
 	}
-	raceCtx, raceCancel := context.WithCancel(ctx)
-	defer raceCancel()
-	results := make(chan internalDohDialResult)
-	launched := 0
-	completed := 0
-	errs := make([]error, 0, len(addrs))
-	launch := func() {
-		addr := net.JoinHostPort(addrs[launched].String(), port)
-		launched++
-		go func() {
-			conn, err := dialContext(raceCtx, network, addr)
-			select {
-			case results <- internalDohDialResult{conn: conn, err: err}:
-			case <-raceCtx.Done():
-				if conn != nil {
-					conn.Close()
-				}
-			}
-		}()
-	}
-
-	launch()
-	timer := time.NewTimer(internalDohDialFallbackDelay)
-	defer timer.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case result := <-results:
-			completed++
-			if result.err == nil && result.conn != nil {
-				raceCancel()
-				return result.conn, nil
-			}
-			if result.conn != nil {
-				result.conn.Close()
-			}
-			if result.err == nil {
-				result.err = errors.New("dial returned no connection")
-			}
-			errs = append(errs, result.err)
-			if completed == len(addrs) {
-				return nil, errors.Join(errs...)
-			}
-			if launched < len(addrs) {
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-				launch()
-				timer.Reset(internalDohDialFallbackDelay)
-			}
-		case <-timer.C:
-			if launched < len(addrs) {
-				launch()
-			}
-			if launched < len(addrs) {
-				timer.Reset(internalDohDialFallbackDelay)
-			}
-		}
-	}
+	return dialHostPortRace(ctx, network, port, addrs, internalDohDialFallbackDelay, dialContext)
 }
 
 func (self *internalDohResolver) resolveUDPAddr(ctx context.Context, address string) (*net.UDPAddr, error) {
@@ -346,6 +215,36 @@ func (self *internalDohResolver) resolveUDPAddr(ctx context.Context, address str
 	index := int((self.nextAddr.Add(1) - 1) % uint64(len(addrs)))
 	addr := addrs[index]
 	return &net.UDPAddr{IP: net.IP(addr.AsSlice()), Port: port, Zone: addr.Zone()}, nil
+}
+
+// resolveUDPAddrs is the list form of resolveUDPAddr for a caller that
+// races families itself (the QUIC platform transport): every address of the
+// protected name that the runtime family policy permits, in race order.
+func (self *internalDohResolver) resolveUDPAddrs(ctx context.Context, address string) ([]*net.UDPAddr, error) {
+	host, portString, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	if host == "" {
+		return nil, fmt.Errorf("resolve %s: empty host", address)
+	}
+	port, err := parseControlUDPPort(address, portString)
+	if err != nil {
+		return nil, err
+	}
+	network, err := controlDialNetwork("udp", address)
+	if err != nil {
+		return nil, err
+	}
+	addrs, err := self.resolve(ctx, network, host)
+	if err != nil {
+		return nil, err
+	}
+	udpAddrs := make([]*net.UDPAddr, 0, len(addrs))
+	for _, addr := range addrs {
+		udpAddrs = append(udpAddrs, &net.UDPAddr{IP: net.IP(addr.AsSlice()), Port: port, Zone: addr.Zone()})
+	}
+	return udpAddrs, nil
 }
 
 func (self *internalDohResolver) CloseIdleConnections() {

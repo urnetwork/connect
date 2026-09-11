@@ -339,37 +339,15 @@ func TestTunWriteReleasesUnsupportedPacketBufferReference(t *testing.T) {
 	defer tun.Close()
 
 	released := make(chan struct{})
-	if n, writeErr := tun.write([]byte{0x60}, func() { close(released) }); writeErr != syscall.EAFNOSUPPORT || n != 0 {
+	// version 7 is carried by no stack; a v6 packet is covered by the
+	// dual-stack tests, where its acceptance depends on the link mtu
+	if n, writeErr := tun.write([]byte{0x70}, func() { close(released) }); writeErr != syscall.EAFNOSUPPORT || n != 0 {
 		t.Fatalf("unsupported write = %d, %v; want 0, %v", n, writeErr, syscall.EAFNOSUPPORT)
 	}
 	select {
 	case <-released:
 	case <-time.After(time.Second):
 		t.Fatal("rejected packet retained its creator PacketBuffer reference")
-	}
-}
-
-func TestTunStaysIpv4OnlyUntilProvidersSupportIpv6(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	tun, err := CreateTunWithDefaults(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tun.Close()
-
-	if len(tun.localAddresses) != 1 || !tun.localAddresses[0].Is4() {
-		t.Fatalf("tun local addresses = %v, want one IPv4 address", tun.localAddresses)
-	}
-	for _, network := range []string{"tcp6", "tcp"} {
-		conn, dialErr := tun.dialContext(ctx, network, "[2001:db8::25]:465")
-		if conn != nil {
-			conn.Close()
-			t.Fatalf("%s IPv6 dial unexpectedly returned a connection", network)
-		}
-		if dialErr != syscall.EAFNOSUPPORT {
-			t.Fatalf("%s IPv6 dial error = %v, want %v", network, dialErr, syscall.EAFNOSUPPORT)
-		}
 	}
 }
 
@@ -718,16 +696,22 @@ func TestTunDialRaceUsesOneAbsoluteTimeout(t *testing.T) {
 }
 
 func TestTunTCPBridge(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testTunTCPBridge(t, ipVersion)
+	})
+}
+
+func testTunTCPBridge(t *testing.T, ipVersion int) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	left, err := CreateTunWithDefaults(ctx)
+	left, err := CreateTun(ctx, tunTestSettings(ipVersion))
 	if err != nil {
 		t.Fatalf("create left tun: %v", err)
 	}
 	defer left.Close()
 
-	right, err := CreateTunWithDefaults(ctx)
+	right, err := CreateTun(ctx, tunTestSettings(ipVersion))
 	if err != nil {
 		t.Fatalf("create right tun: %v", err)
 	}
@@ -736,7 +720,7 @@ func TestTunTCPBridge(t *testing.T) {
 	bridgeTun(ctx, left, right)
 	bridgeTun(ctx, right, left)
 
-	rightIP := net.IP(right.localAddresses[0].AsSlice())
+	rightIP := net.IP(tunTestLocalAddress(t, right, ipVersion).AsSlice())
 	ln, err := right.ListenTCP(&net.TCPAddr{IP: rightIP, Port: 0})
 	if err != nil {
 		t.Fatalf("listen tcp: %v", err)
@@ -840,6 +824,12 @@ func bridgeTunBatch(ctx context.Context, dst *Tun, src *Tun) {
 // head-of-line-blocks the tun receive loop (e.g. holding a lock across a blocking
 // enqueue) collapses this number.
 func TestTunTCPThroughput(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testTunTCPThroughput(t, ipVersion)
+	})
+}
+
+func testTunTCPThroughput(t *testing.T, ipVersion int) {
 	// Generous overall cap: the transfer is measured several times (below), and
 	// each read/write phase is independently bounded by a 55s progress window.
 	// Every operation is also capped by this absolute deadline, so a loaded host
@@ -849,13 +839,13 @@ func TestTunTCPThroughput(t *testing.T) {
 
 	// size the ring buffers well above the default (32) so the bridge can keep
 	// the pipe full under load, the way the proxy sizes its tun.
-	left, err := CreateTun(ctx, DefaultTunSettingsWithBufferSize(2048))
+	left, err := CreateTun(ctx, tunTestApplyIpVersion(DefaultTunSettingsWithBufferSize(2048), ipVersion))
 	if err != nil {
 		t.Fatalf("create left tun: %v", err)
 	}
 	defer left.Close()
 
-	right, err := CreateTun(ctx, DefaultTunSettingsWithBufferSize(2048))
+	right, err := CreateTun(ctx, tunTestApplyIpVersion(DefaultTunSettingsWithBufferSize(2048), ipVersion))
 	if err != nil {
 		t.Fatalf("create right tun: %v", err)
 	}
@@ -865,7 +855,7 @@ func TestTunTCPThroughput(t *testing.T) {
 	bridgeTunBatch(ctx, left, right)
 	bridgeTunBatch(ctx, right, left)
 
-	rightIP := net.IP(right.localAddresses[0].AsSlice())
+	rightIP := net.IP(tunTestLocalAddress(t, right, ipVersion).AsSlice())
 
 	// full speed moves ~300 MiB/s; under -race the gvisor stack runs ~250x slower
 	// (~1 MiB/s). Scale the transfer down under -race so it still streams enough

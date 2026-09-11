@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"io"
 	"net"
+	"net/netip"
 	"time"
 
 	"golang.org/x/net/proxy"
@@ -206,12 +207,13 @@ func (self *ConnectSettings) DialContext(ctx context.Context, network string, ad
 	} else {
 		netDialer := self.NetDialer()
 		if self.ProxySettings != nil {
+			// the proxy resolves names on its side; there is nothing to race
 			dialContext = self.ProxySettings.NewDialContext(
 				ctx,
 				netDialer,
 			)
 		} else {
-			dialContext = netDialer.DialContext
+			dialContext = self.raceDialContext(netDialer)
 		}
 	}
 
@@ -226,6 +228,34 @@ func (self *ConnectSettings) DialContext(ctx context.Context, network string, ad
 	return conn, err
 }
 
+// raceDialContext is the direct dial path: a hostname is resolved through the
+// egress-aware resolver for the families the (already narrowed) network
+// permits and its addresses are raced with DefaultDialFallbackDelay, v6
+// first (see net_dial_race.go). An ip literal, or a datagram network, goes
+// straight to the dialer: the former has no family choice left, the latter
+// cannot be raced meaningfully.
+func (self *ConnectSettings) raceDialContext(netDialer *net.Dialer) DialContextFunction {
+	return func(ctx context.Context, network string, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil || !isRaceableDialNetwork(network) || isIPLiteralDialAddr(host) || isZonedIPLiteralDialHost(host) {
+			return netDialer.DialContext(ctx, network, addr)
+		}
+		addrs, err := resolveDialAddrs(ctx, dialResolver(self.Resolver), network, host)
+		if err != nil {
+			return nil, err
+		}
+		return dialHostPortRace(ctx, network, port, addrs, DefaultDialFallbackDelay, netDialer.DialContext)
+	}
+}
+
+// isZonedIPLiteralDialHost catches the one literal shape isIPLiteralDialAddr
+// does not: a scoped v6 literal ("fe80::1%en0"), which net.ParseIP rejects
+// but a dialer accepts.
+func isZonedIPLiteralDialHost(host string) bool {
+	_, err := netip.ParseAddr(host)
+	return err == nil
+}
+
 func (self *ConnectSettings) NetDialer() *net.Dialer {
 	// egressDialer forces the physical egress interface on Windows so the
 	// service's own connections never loop into the tunnel it provides (R1);
@@ -235,10 +265,14 @@ func (self *ConnectSettings) NetDialer() *net.Dialer {
 	// resolver, whose wire query (issued by svchost's DNS Client, not this
 	// process) follows the tun default route to the tunnel's own resolver and
 	// deadlocks behind the tunnel being built. See egress_dial.go.
+	// FallbackDelay is explicit so any hostname dial that still reaches
+	// the stdlib race (a caller-injected use of this dialer) paces its
+	// families the same way raceDialContext does
 	return egressDialer(&net.Dialer{
 		Timeout:         self.ConnectTimeout,
 		KeepAlive:       self.KeepAliveTimeout,
 		KeepAliveConfig: self.KeepAliveConfig,
+		FallbackDelay:   DefaultDialFallbackDelay,
 		Resolver:        egressAwareResolver(self.Resolver),
 	})
 }
