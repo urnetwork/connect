@@ -738,12 +738,17 @@ func TestProbePacketsAreWellFormed(t *testing.T) {
 		if got := binary.BigEndian.Uint16(payload[4:6]); got != 1 {
 			t.Errorf("v%d: dns qdcount = %d, want 1", version, got)
 		}
+		// the query asks for an address the same pass can dial: A over v4,
+		// AAAA (28) over v6
 		wantQuestion := []byte{
 			3, 'w', 'w', 'w',
 			7, 'e', 'x', 'a', 'm', 'p', 'l', 'e',
 			3, 'c', 'o', 'm',
 			0,
 			0, 1, 0, 1,
+		}
+		if version == 6 {
+			wantQuestion[len(wantQuestion)-3] = 28
 		}
 		if got := payload[12:]; string(got) != string(wantQuestion) {
 			t.Errorf("v%d: dns question = %v, want %v", version, got, wantQuestion)
