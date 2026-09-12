@@ -7,7 +7,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -37,11 +36,11 @@ type registrationSetupResult struct {
 	err    error
 }
 
-func newGeneratorRegistrationFixture(t *testing.T, beforeClientJoin func()) (*ApiMultiClientGenerator, *Client, *fakeWindowPlatformTransport, *registrationSetupContext, context.CancelFunc, <-chan registrationSetupResult, <-chan clientKeyRegistrationHttpAttempt) {
+func newGeneratorRegistrationFixture(t *testing.T, ipVersion int, beforeClientJoin func()) (*ApiMultiClientGenerator, *Client, *fakeWindowPlatformTransport, *registrationSetupContext, context.CancelFunc, <-chan registrationSetupResult, <-chan clientKeyRegistrationHttpAttempt) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	attempts := make(chan clientKeyRegistrationHttpAttempt, 4)
-	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	endpoint := newFamilyHttptestServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/hello" || r.URL.Path == "/network/remove-client" {
 			_, _ = io.WriteString(w, `{}`)
 			return
@@ -147,7 +146,13 @@ func waitForGeneratedKeyRegistration(t *testing.T, ctx *registrationSetupContext
 }
 
 func TestApiMultiClientGeneratorWaitsForProcessedKeyRegistration(t *testing.T) {
-	_, client, _, callCtx, callCancel, result, attempts := newGeneratorRegistrationFixture(t, nil)
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testApiMultiClientGeneratorWaitsForProcessedKeyRegistration(t, ipVersion)
+	})
+}
+
+func testApiMultiClientGeneratorWaitsForProcessedKeyRegistration(t *testing.T, ipVersion int) {
+	_, client, _, callCtx, callCancel, result, attempts := newGeneratorRegistrationFixture(t, ipVersion, nil)
 	first := nextClientKeyRegistrationAttempt(t, attempts)
 	waitForGeneratedKeyRegistration(t, callCtx, result)
 	first.response <- `{"pack":"","error":{"message":"key publication failed"}}`
@@ -176,10 +181,16 @@ func TestApiMultiClientGeneratorWaitsForProcessedKeyRegistration(t *testing.T) {
 }
 
 func TestApiMultiClientGeneratorRegistrationCancellationJoinsCleanup(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testApiMultiClientGeneratorRegistrationCancellationJoinsCleanup(t, ipVersion)
+	})
+}
+
+func testApiMultiClientGeneratorRegistrationCancellationJoinsCleanup(t *testing.T, ipVersion int) {
 	joinEntered, releaseJoin := make(chan struct{}), make(chan struct{})
 	var enteredOnce, releaseOnce sync.Once
 	defer releaseOnce.Do(func() { close(releaseJoin) })
-	generator, client, transport, callCtx, callCancel, result, attempts := newGeneratorRegistrationFixture(t, func() {
+	generator, client, transport, callCtx, callCancel, result, attempts := newGeneratorRegistrationFixture(t, ipVersion, func() {
 		enteredOnce.Do(func() { close(joinEntered) })
 		<-releaseJoin
 	})

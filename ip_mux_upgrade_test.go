@@ -24,27 +24,34 @@ import (
 // TestUpgradeMuxPassthrough verifies that traffic the mux does not claim flows through
 // unchanged. (DNS interception and the HTTP pass/drop policy are covered by the tests below.)
 func TestUpgradeMuxPassthrough(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	rec := &ipMuxRecorder{}
-	mux, err := NewUpgradeMux(ctx, TransferPath{}, protocol.ProvideMode_Network, 0, rec.receive, DefaultUpgradeMuxSettings(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer mux.Close()
-	mux.SetUpstream(rec.upstream)
+		rec := &ipMuxRecorder{}
+		mux, err := NewUpgradeMux(ctx, TransferPath{}, protocol.ProvideMode_Network, 0, rec.receive, DefaultUpgradeMuxSettings(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer mux.Close()
+		mux.SetUpstream(rec.upstream)
 
-	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, []byte("x"), 0) {
-		t.Fatal("SendPacket returned false")
-	}
-	external := &IpPath{Version: 4, Protocol: IpProtocolTcp, DestinationIp: net.ParseIP("1.2.3.4"), DestinationPort: 80}
-	mux.Receive(TransferPath{}, protocol.ProvideMode_Network, external, []byte("y"))
+		if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, []byte("x"), 0) {
+			t.Fatal("SendPacket returned false")
+		}
+		external := &IpPath{
+			Version:         ipVersion,
+			Protocol:        IpProtocolTcp,
+			DestinationIp:   net.ParseIP(testDocAddr(ipVersion, 4).String()),
+			DestinationPort: 80,
+		}
+		mux.Receive(TransferPath{}, protocol.ProvideMode_Network, external, []byte("y"))
 
-	sent, received := rec.counts()
-	if sent != 1 || received != 1 {
-		t.Fatalf("pass-through mismatch: sent=%d received=%d, want 1/1", sent, received)
-	}
+		sent, received := rec.counts()
+		if sent != 1 || received != 1 {
+			t.Fatalf("pass-through mismatch: sent=%d received=%d, want 1/1", sent, received)
+		}
+	})
 }
 
 func TestUpgradeMuxDnsServerScoresExcludeLocalFallbackPath(t *testing.T) {
@@ -79,6 +86,12 @@ func TestUpgradeMuxDnsServerScoresExcludeLocalFallbackPath(t *testing.T) {
 }
 
 func TestUpgradeMuxReceiveRefreshesWireSourceAffinity(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testUpgradeMuxReceiveRefreshesWireSourceAffinity(t, ipVersion)
+	})
+}
+
+func testUpgradeMuxReceiveRefreshesWireSourceAffinity(t *testing.T, ipVersion int) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -89,8 +102,8 @@ func TestUpgradeMuxReceiveRefreshesWireSourceAffinity(t *testing.T) {
 	}
 	defer mux.Close()
 
-	server := netip.MustParseAddr("1.1.1.1")
-	client := mux.mux.Tun().LocalAddresses()[0]
+	server := testDocAddr(ipVersion, 1)
+	client := tunTestLocalAddress(t, mux.mux.Tun(), ipVersion)
 	mux.reverse.record([]netip.Addr{server, client}, "example.test")
 	mux.reverse.lock.Lock()
 	serverEntry := mux.reverse.entries[server]
@@ -102,14 +115,14 @@ func TestUpgradeMuxReceiveRefreshesWireSourceAffinity(t *testing.T) {
 	mux.reverse.lock.Unlock()
 
 	canonicalOutbound := &IpPath{
-		Version:         4,
+		Version:         ipVersion,
 		Protocol:        IpProtocolTcp,
 		SourceIp:        net.IP(client.AsSlice()),
 		SourcePort:      40000,
 		DestinationIp:   net.IP(server.AsSlice()),
 		DestinationPort: 443,
 	}
-	returnPacket := newIpMuxIpv4Packet(canonicalOutbound.DestinationIp, canonicalOutbound.SourceIp)
+	returnPacket := newIpMuxPacketVersion(ipVersion, canonicalOutbound.DestinationIp, canonicalOutbound.SourceIp)
 	mux.Receive(TransferPath{}, protocol.ProvideMode_Network, canonicalOutbound, returnPacket)
 
 	mux.reverse.lock.Lock()
@@ -132,6 +145,10 @@ func TestUpgradeMuxReceiveRefreshesWireSourceAffinity(t *testing.T) {
 type dnsClientHarness struct {
 	clientTun *Tun
 	mux       *UpgradeMux
+	// ipVersion is the family the client's own queries are addressed over.
+	// The mux claims udp/53 in both families, so this selects which of the
+	// two claim paths (and which reverse-index key width) the test drives.
+	ipVersion int
 }
 
 // createPrivateClientTun makes a client-side Tun on its own isolated stack, so multiple
@@ -146,7 +163,7 @@ func createPrivateClientTun(ctx context.Context) (*Tun, error) {
 	return CreateTun(ctx, settings)
 }
 
-func newDnsClientHarness(t *testing.T, ctx context.Context, dns *DnsResolverSettings) *dnsClientHarness {
+func newDnsClientHarness(t *testing.T, ctx context.Context, ipVersion int, dns *DnsResolverSettings) *dnsClientHarness {
 	t.Helper()
 
 	clientTun, err := createPrivateClientTun(ctx)
@@ -183,7 +200,7 @@ func newDnsClientHarness(t *testing.T, ctx context.Context, dns *DnsResolverSett
 		}
 	}()
 
-	return &dnsClientHarness{clientTun: clientTun, mux: mux}
+	return &dnsClientHarness{clientTun: clientTun, mux: mux, ipVersion: ipVersion}
 }
 
 func (self *dnsClientHarness) close() {
@@ -192,12 +209,13 @@ func (self *dnsClientHarness) close() {
 }
 
 // resolver returns a Go resolver whose queries are routed through the client Tun to
-// the mux. The dialed address is irrelevant — the mux intercepts by port (UDP/53).
+// the mux. The dialed address is irrelevant except for its family — the mux
+// intercepts by port (UDP/53), and it claims that port on both families.
 func (self *dnsClientHarness) resolver() *net.Resolver {
 	return &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			return self.clientTun.DialContext(ctx, "udp", "10.0.0.1:53")
+			return self.clientTun.DialContext(ctx, "udp", testDnsDialAddress(self.ipVersion))
 		},
 	}
 }
@@ -206,105 +224,101 @@ func (self *dnsClientHarness) resolver() *net.Resolver {
 // query over local DoH against a local HTTPS (httptest TLS) server, and verifies both
 // the resolution and the IP→hostname reverse index (point 4).
 func TestUpgradeMuxDnsDoh(t *testing.T) {
-	const resolved = "203.0.113.45"
-	const queryName = "host.example.test"
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		resolved := testDocAddr(ipVersion, 45).String()
+		const queryName = "host.example.test"
 
-	// local RFC 8484 wire DoH server over TLS
-	var dohRequests int32
-	dohServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&dohRequests, 1)
-		// answer A queries; AAAA returns an empty answer so LookupHost resolves to the A record
-		writeDohWire(w, r, []netip.Addr{netip.MustParseAddr(resolved)}, 60, false)
-	}))
-	defer dohServer.Close()
+		// local RFC 8484 wire DoH server over TLS. writeDohWire answers only
+		// the query's own record type, so the other family's question gets an
+		// empty answer and LookupHost settles on the family under test.
+		var dohRequests int32
+		dohServer := newFamilyHttptestTlsServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&dohRequests, 1)
+			writeDohWire(w, r, []netip.Addr{testDocAddr(ipVersion, 45)}, 60, false)
+		}))
+		defer dohServer.Close()
 
-	pool := x509.NewCertPool()
-	pool.AddCert(dohServer.Certificate())
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
+		h := newDnsClientHarness(t, ctx, ipVersion, localDohTlsResolverSettings(ipVersion, dohServer))
+		defer h.close()
 
-	h := newDnsClientHarness(t, ctx, &DnsResolverSettings{
-		EnableLocalDoh:   true,
-		LocalDohUrlsIpv4: []string{dohServer.URL},
-		TlsConfig:        &tls.Config{RootCAs: pool},
+		addrs, err := h.resolver().LookupHost(ctx, queryName)
+		if err != nil {
+			t.Fatalf("LookupHost: %v", err)
+		}
+		if !slices.Contains(addrs, resolved) {
+			t.Fatalf("LookupHost = %v, want to contain %s", addrs, resolved)
+		}
+		if atomic.LoadInt32(&dohRequests) == 0 {
+			t.Fatal("mux did not resolve via the local DoH server")
+		}
+
+		// reverse index (point 4): the mux records the hostname it served for the IP
+		names := h.mux.ServerNames(resolved)
+		if !slices.Contains(names, queryName) {
+			t.Fatalf("ServerNames(%s) = %v, want to contain %s", resolved, names, queryName)
+		}
 	})
-	defer h.close()
-
-	addrs, err := h.resolver().LookupHost(ctx, queryName)
-	if err != nil {
-		t.Fatalf("LookupHost: %v", err)
-	}
-	if !slices.Contains(addrs, resolved) {
-		t.Fatalf("LookupHost = %v, want to contain %s", addrs, resolved)
-	}
-	if atomic.LoadInt32(&dohRequests) == 0 {
-		t.Fatal("mux did not resolve via the local DoH server")
-	}
-
-	// reverse index (point 4): the mux records the hostname it served for the IP
-	names := h.mux.ServerNames(resolved)
-	if !slices.Contains(names, queryName) {
-		t.Fatalf("ServerNames(%s) = %v, want to contain %s", resolved, names, queryName)
-	}
 }
 
+// DNS over TCP/53, which the mux intercepts and answers on both families
+// (IPV6.md C5): one listener per family the tun has an address for.
 func TestUpgradeMuxDnsTcpFallback(t *testing.T) {
-	const resolved = "203.0.113.46"
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeDohWire(w, r, []netip.Addr{netip.MustParseAddr(resolved)}, 60, false)
-	}))
-	defer server.Close()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		resolvedAddr := testDocAddr(ipVersion, 46)
+		resolved := resolvedAddr.String()
+		server := newFamilyHttptestTlsServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeDohWire(w, r, []netip.Addr{resolvedAddr}, 60, false)
+		}))
+		defer server.Close()
 
-	pool := x509.NewCertPool()
-	pool.AddCert(server.Certificate())
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	h := newDnsClientHarness(t, ctx, &DnsResolverSettings{
-		EnableLocalDoh:   true,
-		LocalDohUrlsIpv4: []string{server.URL},
-		TlsConfig:        &tls.Config{RootCAs: pool},
-	})
-	defer h.close()
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		h := newDnsClientHarness(t, ctx, ipVersion, localDohTlsResolverSettings(ipVersion, server))
+		defer h.close()
 
-	conn, err := h.clientTun.DialContext(ctx, "tcp", "10.0.0.1:53")
-	if err != nil {
-		t.Fatalf("dial tcp dns: %v", err)
-	}
-	defer conn.Close()
-
-	for i, id := range []uint16{0x5151, 0x5252} {
-		packet := dnsQueryPacketTyped(t, "MiXeD.example.test.", dnsmessage.TypeA, id)
-		_, query, err := ParseIpPathWithPayload(packet)
+		conn, err := h.clientTun.DialContext(ctx, "tcp", testDnsDialAddress(ipVersion))
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("dial tcp dns: %v", err)
 		}
-		frame := make([]byte, 2+len(query))
-		binary.BigEndian.PutUint16(frame[:2], uint16(len(query)))
-		copy(frame[2:], query)
-		if _, err := conn.Write(frame); err != nil {
-			t.Fatalf("write tcp dns query %d: %v", i, err)
-		}
+		defer conn.Close()
 
-		var responseLength [2]byte
-		if _, err := io.ReadFull(conn, responseLength[:]); err != nil {
-			t.Fatalf("read tcp dns length %d: %v", i, err)
+		qtype := testDnsQType(ipVersion)
+		for i, id := range []uint16{0x5151, 0x5252} {
+			packet := dnsQueryPacketFromVersion(t, ipVersion, "MiXeD.example.test.", qtype, id, 40000)
+			_, query, err := ParseIpPathWithPayload(packet)
+			if err != nil {
+				t.Fatal(err)
+			}
+			frame := make([]byte, 2+len(query))
+			binary.BigEndian.PutUint16(frame[:2], uint16(len(query)))
+			copy(frame[2:], query)
+			if _, err := conn.Write(frame); err != nil {
+				t.Fatalf("write tcp dns query %d: %v", i, err)
+			}
+
+			var responseLength [2]byte
+			if _, err := io.ReadFull(conn, responseLength[:]); err != nil {
+				t.Fatalf("read tcp dns length %d: %v", i, err)
+			}
+			response := make([]byte, int(binary.BigEndian.Uint16(responseLength[:])))
+			if _, err := io.ReadFull(conn, response); err != nil {
+				t.Fatalf("read tcp dns response %d: %v", i, err)
+			}
+			if got := binary.BigEndian.Uint16(response[:2]); got != id {
+				t.Fatalf("response %d id = %04x, want %04x", i, got, id)
+			}
+			result := parseDohWire(response, qtype)
+			if _, ok := result.AddrTtls[resolvedAddr]; !ok {
+				t.Fatalf("response %d addresses = %v, want %s", i, result.AddrTtls, resolved)
+			}
 		}
-		response := make([]byte, int(binary.BigEndian.Uint16(responseLength[:])))
-		if _, err := io.ReadFull(conn, response); err != nil {
-			t.Fatalf("read tcp dns response %d: %v", i, err)
+		if names := h.mux.ServerNames(resolved); !slices.Contains(names, "mixed.example.test") {
+			t.Fatalf("ServerNames(%s) = %v, want mixed.example.test", resolved, names)
 		}
-		if got := binary.BigEndian.Uint16(response[:2]); got != id {
-			t.Fatalf("response %d id = %04x, want %04x", i, got, id)
-		}
-		result := parseDohWire(response, dnsmessage.TypeA)
-		if _, ok := result.AddrTtls[netip.MustParseAddr(resolved)]; !ok {
-			t.Fatalf("response %d addresses = %v, want %s", i, result.AddrTtls, resolved)
-		}
-	}
-	if names := h.mux.ServerNames(resolved); !slices.Contains(names, "mixed.example.test") {
-		t.Fatalf("ServerNames(%s) = %v, want mixed.example.test", resolved, names)
-	}
+	})
 }
 
 // TestUpgradeMuxDnsNoReplyOnFailure: on a DoH resolution failure (the resolver errors, not an
@@ -313,43 +327,38 @@ func TestUpgradeMuxDnsTcpFallback(t *testing.T) {
 // browser surfaces as "can't resolve address".
 func TestUpgradeMuxDnsNoReplyOnFailure(t *testing.T) {
 	// a DoH server that always fails: empty (no records) and not an authoritative no-record
-	dohServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	defer dohServer.Close()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		dohServer := newFamilyHttptestTlsServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		defer dohServer.Close()
 
-	pool := x509.NewCertPool()
-	pool.AddCert(dohServer.Certificate())
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+		rec := &ipMuxRecorder{}
+		settings := DefaultUpgradeMuxSettings()
+		settings.Dns.Resolver = localDohTlsResolverSettings(ipVersion, dohServer)
+		// isolate the no-reply-on-failure behavior: no local fallback to answer
+		settings.Dns.Fallback = nil
+		settings.Dns.ResolveTimeout = 200 * time.Millisecond
+		mux, err := NewUpgradeMux(ctx, TransferPath{}, protocol.ProvideMode_Network, 0, rec.receive, settings, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer mux.Close()
+		mux.SetUpstream(rec.upstream)
 
-	rec := &ipMuxRecorder{}
-	settings := DefaultUpgradeMuxSettings()
-	settings.Dns.Resolver = &DnsResolverSettings{
-		EnableLocalDoh:   true,
-		LocalDohUrlsIpv4: []string{dohServer.URL},
-		TlsConfig:        &tls.Config{RootCAs: pool},
-	}
-	// isolate the no-reply-on-failure behavior: no local fallback to answer
-	settings.Dns.Fallback = nil
-	settings.Dns.ResolveTimeout = 200 * time.Millisecond
-	mux, err := NewUpgradeMux(ctx, TransferPath{}, protocol.ProvideMode_Network, 0, rec.receive, settings, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer mux.Close()
-	mux.SetUpstream(rec.upstream)
+		if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketVersion(t, ipVersion, "fail.example.test."), 0) {
+			t.Fatal("SendPacket returned false; the DNS query was not claimed")
+		}
 
-	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacket(t, "fail.example.test."), 0) {
-		t.Fatal("SendPacket returned false; the DNS query was not claimed")
-	}
-
-	// let the resolve budget (200ms) be exhausted, then confirm nothing was sent back downstream
-	time.Sleep(1 * time.Second)
-	if _, received := rec.counts(); received != 0 {
-		t.Fatalf("mux sent %d downstream replies on a resolution failure; want 0 (no response)", received)
-	}
+		// let the resolve budget (200ms) be exhausted, then confirm nothing was sent back downstream
+		time.Sleep(1 * time.Second)
+		if _, received := rec.counts(); received != 0 {
+			t.Fatalf("mux sent %d downstream replies on a resolution failure; want 0 (no response)", received)
+		}
+	})
 }
 
 // TestUpgradeMuxDnsRawTypesClaimed verifies that every non-address record type
@@ -358,6 +367,12 @@ func TestUpgradeMuxDnsNoReplyOnFailure(t *testing.T) {
 // client-visible SERVFAIL. The success path is covered by TestDohCacheForward
 // and TestUpgradeMuxHttpsForwardFanOut.
 func TestUpgradeMuxDnsRawTypesClaimed(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testUpgradeMuxDnsRawTypesClaimed(t, ipVersion)
+	})
+}
+
+func testUpgradeMuxDnsRawTypesClaimed(t *testing.T, ipVersion int) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -383,7 +398,7 @@ func TestUpgradeMuxDnsRawTypesClaimed(t *testing.T) {
 		dnsmessage.TypeNS,
 	}
 	for _, qtype := range types {
-		if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "svc.example.test.", qtype, 0x4242), 0) {
+		if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTypedVersion(t, ipVersion, "svc.example.test.", qtype, 0x4242), 0) {
 			t.Fatalf("type %d query was not claimed", qtype)
 		}
 	}
@@ -419,6 +434,12 @@ func TestUpgradeMuxDnsRawTypesClaimed(t *testing.T) {
 // SERVFAIL — the resolver falls back to A/AAAA immediately instead of hanging on the
 // claimed type until its own timeout.
 func TestUpgradeMuxDnsHttpsFailFastServfail(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testUpgradeMuxDnsHttpsFailFastServfail(t, ipVersion)
+	})
+}
+
+func testUpgradeMuxDnsHttpsFailFastServfail(t *testing.T, ipVersion int) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -436,7 +457,7 @@ func TestUpgradeMuxDnsHttpsFailFastServfail(t *testing.T) {
 	mux.SetUpstream(rec.upstream)
 
 	start := time.Now()
-	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "svc65.example.test.", dnsTypeHttps, 0x6565), 0) {
+	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTypedVersion(t, ipVersion, "svc65.example.test.", dnsTypeHttps, 0x6565), 0) {
 		t.Fatal("type-65 query was not claimed")
 	}
 	if !waitForCondition(5*time.Second, func() bool { _, received := rec.counts(); return 1 <= received }) {
@@ -458,7 +479,7 @@ func TestUpgradeMuxDnsHttpsFailFastServfail(t *testing.T) {
 	}
 
 	// the flight retired: a retry is claimed again and answered again
-	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "svc65.example.test.", dnsTypeHttps, 0x6566), 0) {
+	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTypedVersion(t, ipVersion, "svc65.example.test.", dnsTypeHttps, 0x6566), 0) {
 		t.Fatal("retried type-65 query was not claimed")
 	}
 	if !waitForCondition(5*time.Second, func() bool { _, received := rec.counts(); return 2 <= received }) {
@@ -471,6 +492,12 @@ func TestUpgradeMuxDnsHttpsFailFastServfail(t *testing.T) {
 // the answer exists but exceeds UDP — rather than silence. The oversized record's hints are
 // still recorded into the reverse index.
 func TestUpgradeMuxDnsHttpsOversizedTruncated(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testUpgradeMuxDnsHttpsOversizedTruncated(t, ipVersion)
+	})
+}
+
+func testUpgradeMuxDnsHttpsOversizedTruncated(t *testing.T, ipVersion int) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -487,7 +514,7 @@ func TestUpgradeMuxDnsHttpsOversizedTruncated(t *testing.T) {
 
 	// attach a responder directly and drive the fan-out with a canned oversized
 	// response (the tunnel-DoH round trip itself is not drivable in a unit test)
-	queryPacket := dnsQueryPacketTyped(t, "big.example.test.", dnsTypeHttps, 0x7777)
+	queryPacket := dnsQueryPacketTypedVersion(t, ipVersion, "big.example.test.", dnsTypeHttps, 0x7777)
 	ipPath, payload, err := ParseIpPathWithPayload(queryPacket)
 	if err != nil {
 		t.Fatal(err)
@@ -662,6 +689,12 @@ func TestFallbackDohCacheAdmitsOneBrowserWave(t *testing.T) {
 // LocalFallbackTimeout handicap — against the local-egress fallback resolver, which answers so the
 // client (and the OS) gets a timely response rather than DNS hanging while the tunnel comes up.
 func TestUpgradeMuxDnsLocalFallback(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testUpgradeMuxDnsLocalFallback(t, ipVersion)
+	})
+}
+
+func testUpgradeMuxDnsLocalFallback(t *testing.T, ipVersion int) {
 	// The tunnel DoH accepts the request but never answers. Once the local
 	// fallback wins, its request context must be canceled immediately instead
 	// of occupying a resolver/semaphore slot until ResolveTimeout.
@@ -669,17 +702,15 @@ func TestUpgradeMuxDnsLocalFallback(t *testing.T) {
 	tunnelCanceled := make(chan struct{})
 	var tunnelStartedOnce sync.Once
 	var tunnelCanceledOnce sync.Once
-	tunnelServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	tunnelServer := newFamilyHttptestTlsServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tunnelStartedOnce.Do(func() { close(tunnelStarted) })
 		<-r.Context().Done()
 		tunnelCanceledOnce.Do(func() { close(tunnelCanceled) })
 	}))
 	defer tunnelServer.Close()
-	tunnelPool := x509.NewCertPool()
-	tunnelPool.AddCert(tunnelServer.Certificate())
 
 	// the local fallback resolves to a fixed IP
-	fallbackServer, fallbackResolver := newDohWireServer(t, "203.0.113.77")
+	fallbackServer, fallbackResolver := newDohWireServerOnFamily(t, ipVersion, testDocAddr(ipVersion, 77))
 	defer fallbackServer.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -687,11 +718,7 @@ func TestUpgradeMuxDnsLocalFallback(t *testing.T) {
 
 	rec := &ipMuxRecorder{}
 	settings := DefaultUpgradeMuxSettings()
-	settings.Dns.Resolver = &DnsResolverSettings{
-		EnableLocalDoh:   true,
-		LocalDohUrlsIpv4: []string{tunnelServer.URL},
-		TlsConfig:        &tls.Config{RootCAs: tunnelPool},
-	}
+	settings.Dns.Resolver = localDohTlsResolverSettings(ipVersion, tunnelServer)
 	settings.Dns.Fallback = fallbackResolver
 	settings.Dns.LocalFallbackTimeout = 200 * time.Millisecond
 	settings.Dns.ResolveTimeout = 5 * time.Second
@@ -702,7 +729,7 @@ func TestUpgradeMuxDnsLocalFallback(t *testing.T) {
 	defer mux.Close()
 	mux.SetUpstream(rec.upstream)
 
-	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacket(t, "fallback.example.test."), 0) {
+	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketVersion(t, ipVersion, "fallback.example.test."), 0) {
 		t.Fatal("SendPacket returned false; the DNS query was not claimed")
 	}
 	select {
@@ -754,69 +781,79 @@ func TestUpgradeMuxResolveTimeoutReDerived(t *testing.T) {
 	}
 }
 
-// newDohWireServer starts a local TLS DoH server (RFC 8484 wire) that answers A queries with
-// a fixed IP, and returns resolver settings wired to trust and use it (local DoH).
+// newDohWireServer starts a local TLS DoH server (RFC 8484 wire) on the
+// family's loopback that answers the family's address queries with a fixed IP,
+// and returns resolver settings wired to trust and use it (local DoH). The
+// other family's question gets an empty answer (NODATA).
+func newDohWireServerOnFamily(t *testing.T, ipVersion int, resolvedIp netip.Addr) (*httptest.Server, *DnsResolverSettings) {
+	t.Helper()
+	server := newFamilyHttptestTlsServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeDohWire(w, r, []netip.Addr{resolvedIp}, 60, false)
+	}))
+	return server, localDohTlsResolverSettings(ipVersion, server)
+}
+
+// newDohWireServer is newDohWireServerOnFamily over v4, kept for the callers
+// outside this conversion (ip_mux_integration_test.go).
 func newDohWireServer(t *testing.T, resolvedIp string) (*httptest.Server, *DnsResolverSettings) {
 	t.Helper()
-	ip := netip.MustParseAddr(resolvedIp)
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// answer A queries; AAAA gets an empty answer (NODATA)
-		writeDohWire(w, r, []netip.Addr{ip}, 60, false)
-	}))
-	pool := x509.NewCertPool()
-	pool.AddCert(server.Certificate())
-	dns := &DnsResolverSettings{
-		EnableLocalDoh:   true,
-		LocalDohUrlsIpv4: []string{server.URL},
-		TlsConfig:        &tls.Config{RootCAs: pool},
-	}
-	return server, dns
+	return newDohWireServerOnFamily(t, 4, netip.MustParseAddr(resolvedIp))
 }
 
 // TestUpgradeMuxDnsRebuild verifies SetSettings rebuilds the DohCache at runtime: after
 // switching to a different DoH server, resolution uses the new server.
 func TestUpgradeMuxDnsRebuild(t *testing.T) {
-	const ipA = "203.0.113.10"
-	const ipB = "203.0.113.20"
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		addrA := testDocAddr(ipVersion, 10)
+		addrB := testDocAddr(ipVersion, 20)
+		ipA := addrA.String()
+		ipB := addrB.String()
 
-	serverA, dnsA := newDohWireServer(t, ipA)
-	defer serverA.Close()
-	serverB, dnsB := newDohWireServer(t, ipB)
-	defer serverB.Close()
+		serverA, dnsA := newDohWireServerOnFamily(t, ipVersion, addrA)
+		defer serverA.Close()
+		serverB, dnsB := newDohWireServerOnFamily(t, ipVersion, addrB)
+		defer serverB.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
 
-	h := newDnsClientHarness(t, ctx, dnsA)
-	defer h.close()
+		h := newDnsClientHarness(t, ctx, ipVersion, dnsA)
+		defer h.close()
 
-	addrs, err := h.resolver().LookupHost(ctx, "a.example.test")
-	if err != nil || !slices.Contains(addrs, ipA) {
-		t.Fatalf("before rebuild: LookupHost = %v (err %v), want %s", addrs, err, ipA)
-	}
+		addrs, err := h.resolver().LookupHost(ctx, "a.example.test")
+		if err != nil || !slices.Contains(addrs, ipA) {
+			t.Fatalf("before rebuild: LookupHost = %v (err %v), want %s", addrs, err, ipA)
+		}
 
-	// switch the DNS resolution path at runtime
-	h.mux.SetSettings(&UpgradeMuxSettings{
-		Dns:  &DnsUpgradeSettings{Resolver: dnsB},
-		Http: &HttpUpgradeSettings{Mode: HttpUpgradeUnencrypted},
+		// switch the DNS resolution path at runtime
+		h.mux.SetSettings(&UpgradeMuxSettings{
+			Dns:  &DnsUpgradeSettings{Resolver: dnsB},
+			Http: &HttpUpgradeSettings{Mode: HttpUpgradeUnencrypted},
+		})
+
+		addrs2, err := h.resolver().LookupHost(ctx, "b.example.test")
+		if err != nil || !slices.Contains(addrs2, ipB) {
+			t.Fatalf("after rebuild: LookupHost = %v (err %v), want %s", addrs2, err, ipB)
+		}
 	})
-
-	addrs2, err := h.resolver().LookupHost(ctx, "b.example.test")
-	if err != nil || !slices.Contains(addrs2, ipB) {
-		t.Fatalf("after rebuild: LookupHost = %v (err %v), want %s", addrs2, err, ipB)
-	}
 }
 
 // TestUpgradeMuxHttpModes verifies the no-termination HTTP modes: Unencrypted passes
 // a TCP/80 packet through to the upstream, Block claims and drops it.
 func TestUpgradeMuxHttpModes(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testUpgradeMuxHttpModes(t, ipVersion)
+	})
+}
+
+func testUpgradeMuxHttpModes(t *testing.T, ipVersion int) {
 	craft := func() []byte {
 		ipPath := &IpPath{
-			Version:         4,
+			Version:         ipVersion,
 			Protocol:        IpProtocolTcp,
-			SourceIp:        net.ParseIP("169.254.9.9"),
+			SourceIp:        testClientIp(ipVersion),
 			SourcePort:      12345,
-			DestinationIp:   net.ParseIP("93.184.216.34"),
+			DestinationIp:   net.ParseIP(testExampleComIp(ipVersion)),
 			DestinationPort: 80,
 		}
 		return ipOosPacket(ipPath, nil)
@@ -924,11 +961,17 @@ func TestPeekClaim(t *testing.T) {
 // TestReverseEviction verifies the reverse index's idle affinity-record eviction (which
 // the mux's maintenance loop drives).
 func TestReverseEviction(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testReverseEviction(t, ipVersion)
+	})
+}
+
+func testReverseEviction(t *testing.T, ipVersion int) {
 	ri := newReverseIndex(func() int { return defaultReverseMaxEntries })
 	now := time.Now().UnixNano()
 	ttl := time.Minute
-	stale := netip.MustParseAddr("93.184.216.34")
-	fresh := netip.MustParseAddr("93.184.216.35")
+	stale := testDocAddr(ipVersion, 34)
+	fresh := testDocAddr(ipVersion, 35)
 	ri.entries[stale] = reverseEntry{serverNames: []string{"a.example"}, lastActivityNanos: now - int64(2*ttl)}
 	ri.entries[fresh] = reverseEntry{serverNames: []string{"b.example"}, lastActivityNanos: now}
 
@@ -948,8 +991,14 @@ func TestReverseEviction(t *testing.T) {
 // TestReverseTouchKeepsActive verifies that a return packet refreshes an affinity record, so
 // an IP with live return traffic is not idle-evicted (the fix for the routing-affinity flip).
 func TestReverseTouchKeepsActive(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testReverseTouchKeepsActive(t, ipVersion)
+	})
+}
+
+func testReverseTouchKeepsActive(t *testing.T, ipVersion int) {
 	ri := newReverseIndex(func() int { return defaultReverseMaxEntries })
-	ip := netip.MustParseAddr("93.184.216.34")
+	ip := testDocAddr(ipVersion, 34)
 	// an entry old enough to be evicted
 	ri.entries[ip] = reverseEntry{serverNames: []string{"x.example"}, lastActivityNanos: time.Now().UnixNano() - int64(2*time.Minute)}
 	// a return packet from that IP refreshes its activity
@@ -963,11 +1012,17 @@ func TestReverseTouchKeepsActive(t *testing.T) {
 // TestReverseIndexShed verifies memory-pressure shed keeps the most-recently-active
 // half of the records rather than clearing everything (so live flows keep their names).
 func TestReverseIndexShed(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testReverseIndexShed(t, ipVersion)
+	})
+}
+
+func testReverseIndexShed(t *testing.T, ipVersion int) {
 	ri := newReverseIndex(func() int { return defaultReverseMaxEntries })
 	now := time.Now().UnixNano()
 	// 10 records with increasing activity; the newest 5 must survive a shed
 	for i := range 10 {
-		addr := netip.AddrFrom4([4]byte{198, 51, 100, byte(i)})
+		addr := testDocAddr(ipVersion, i)
 		ri.entries[addr] = reverseEntry{serverNames: []string{"h.example"}, lastActivityNanos: now + int64(i)}
 	}
 	ri.shed()
@@ -976,7 +1031,7 @@ func TestReverseIndexShed(t *testing.T) {
 	}
 	// the 5 kept must be the most-recently-active (indices 5..9)
 	for i := 5; i < 10; i++ {
-		addr := netip.AddrFrom4([4]byte{198, 51, 100, byte(i)})
+		addr := testDocAddr(ipVersion, i)
 		if _, ok := ri.entries[addr]; !ok {
 			t.Fatalf("shed dropped a recently-active record (index %d)", i)
 		}
@@ -986,10 +1041,16 @@ func TestReverseIndexShed(t *testing.T) {
 // TestReverseIndexAdoptFrom verifies a rebuilt index inherits a prior index's names
 // (keeping the more-recently-active on collision) without copying callbacks.
 func TestReverseIndexAdoptFrom(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testReverseIndexAdoptFrom(t, ipVersion)
+	})
+}
+
+func testReverseIndexAdoptFrom(t *testing.T, ipVersion int) {
 	now := time.Now().UnixNano()
 	prior := newReverseIndex(func() int { return defaultReverseMaxEntries })
-	a := netip.MustParseAddr("203.0.113.1")
-	b := netip.MustParseAddr("203.0.113.2")
+	a := testDocAddr(ipVersion, 1)
+	b := testDocAddr(ipVersion, 2)
 	prior.entries[a] = reverseEntry{serverNames: []string{"a.example"}, lastActivityNanos: now}
 	prior.entries[b] = reverseEntry{serverNames: []string{"b.example"}, lastActivityNanos: now}
 
@@ -1019,6 +1080,12 @@ func TestReverseIndexAdoptFrom(t *testing.T) {
 // callbacks with exactly the ips that newly gained a server name — the signal the
 // multi-client uses to invalidate block-action decisions so they report the name.
 func TestReverseIndexLearnedCallbacks(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testReverseIndexLearnedCallbacks(t, ipVersion)
+	})
+}
+
+func testReverseIndexLearnedCallbacks(t *testing.T, ipVersion int) {
 	ri := newReverseIndex(func() int { return defaultReverseMaxEntries })
 
 	var learned [][]netip.Addr
@@ -1027,8 +1094,8 @@ func TestReverseIndexLearnedCallbacks(t *testing.T) {
 		learned = append(learned, append([]netip.Addr{}, addrs...))
 	})
 
-	a := netip.MustParseAddr("93.184.216.34")
-	b := netip.MustParseAddr("93.184.216.35")
+	a := testDocAddr(ipVersion, 34)
+	b := testDocAddr(ipVersion, 35)
 
 	// the first resolution learns the name for both ips
 	ri.record([]netip.Addr{a, b}, "example.com")
@@ -1050,7 +1117,7 @@ func TestReverseIndexLearnedCallbacks(t *testing.T) {
 
 	// after unsub, no more callbacks fire
 	unsub()
-	ri.record([]netip.Addr{netip.MustParseAddr("93.184.216.36")}, "other.example.com")
+	ri.record([]netip.Addr{testDocAddr(ipVersion, 36)}, "other.example.com")
 	if len(learned) != 2 {
 		t.Fatalf("no callback should fire after unsub, got %d fires", len(learned))
 	}
@@ -1104,12 +1171,11 @@ func TestUpgradeMuxServerNamesLearnedNotifier(t *testing.T) {
 // gatedDohWireServer starts a local TLS DoH server that blocks each request until the
 // gate is closed, then answers A queries with the given IP. It counts requests, so tests
 // can hold a resolution in flight and observe how many resolutions actually fired.
-func gatedDohWireServer(t *testing.T, resolvedIp string) (server *httptest.Server, dns *DnsResolverSettings, gate chan struct{}, requests *int32) {
+func gatedDohWireServerOnFamily(t *testing.T, ipVersion int, ip netip.Addr) (server *httptest.Server, dns *DnsResolverSettings, gate chan struct{}, requests *int32) {
 	t.Helper()
-	ip := netip.MustParseAddr(resolvedIp)
 	gate = make(chan struct{})
 	requests = new(int32)
-	server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server = newFamilyHttptestTlsServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(requests, 1)
 		select {
 		case <-gate:
@@ -1118,14 +1184,14 @@ func gatedDohWireServer(t *testing.T, resolvedIp string) (server *httptest.Serve
 		}
 		writeDohWire(w, r, []netip.Addr{ip}, 60, false)
 	}))
-	pool := x509.NewCertPool()
-	pool.AddCert(server.Certificate())
-	dns = &DnsResolverSettings{
-		EnableLocalDoh:   true,
-		LocalDohUrlsIpv4: []string{server.URL},
-		TlsConfig:        &tls.Config{RootCAs: pool},
-	}
+	dns = localDohTlsResolverSettings(ipVersion, server)
 	return
+}
+
+// gatedDohWireServer is gatedDohWireServerOnFamily over v4.
+func gatedDohWireServer(t *testing.T, resolvedIp string) (*httptest.Server, *DnsResolverSettings, chan struct{}, *int32) {
+	t.Helper()
+	return gatedDohWireServerOnFamily(t, 4, netip.MustParseAddr(resolvedIp))
 }
 
 // waitForCondition polls cond until it holds or the timeout passes.
@@ -1157,7 +1223,7 @@ func parseDnsReply(t *testing.T, packet []byte) (clientPort int, id uint16, addr
 	if err != nil {
 		t.Fatalf("parse reply dns: %v", err)
 	}
-	result := parseDohWire(payload, dnsmessage.TypeA)
+	result := parseDohWire(payload, testDnsQType(ipPath.Version))
 	for addr := range result.AddrTtls {
 		addrs = append(addrs, addr)
 	}
@@ -1169,8 +1235,15 @@ func parseDnsReply(t *testing.T, packet []byte) (clientPort int, id uint16, addr
 // still gets its own reply (its transaction id, its port). This is what bounds burst
 // memory under a client retransmit storm while the tunnel establishes.
 func TestUpgradeMuxDnsCoalesce(t *testing.T) {
-	const resolved = "203.0.113.99"
-	server, dns, gate, requests := gatedDohWireServer(t, resolved)
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testUpgradeMuxDnsCoalesce(t, ipVersion)
+	})
+}
+
+func testUpgradeMuxDnsCoalesce(t *testing.T, ipVersion int) {
+	resolvedAddr := testDocAddr(ipVersion, 99)
+	resolved := resolvedAddr.String()
+	server, dns, gate, requests := gatedDohWireServerOnFamily(t, ipVersion, resolvedAddr)
 	defer server.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1189,7 +1262,7 @@ func TestUpgradeMuxDnsCoalesce(t *testing.T) {
 	mux.SetUpstream(rec.upstream)
 
 	send := func(id uint16, port int) {
-		if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketFrom(t, "coalesce.example.test.", id, port), 0) {
+		if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketFromVersion(t, ipVersion, "coalesce.example.test.", testDnsQType(ipVersion), id, port), 0) {
 			t.Fatal("SendPacket returned false; the DNS query was not claimed")
 		}
 	}
@@ -1239,7 +1312,7 @@ func TestUpgradeMuxDnsCoalesce(t *testing.T) {
 		if id != wantId {
 			t.Fatalf("reply to port %d has id %04x, want %04x (each requester gets its own id)", port, id, wantId)
 		}
-		if !slices.Contains(addrs, netip.MustParseAddr(resolved)) {
+		if !slices.Contains(addrs, resolvedAddr) {
 			t.Fatalf("reply to port %d resolves %v, want %s", port, addrs, resolved)
 		}
 	}
@@ -1256,8 +1329,13 @@ func TestUpgradeMuxDnsCoalesce(t *testing.T) {
 // dropped unanswered (bounding burst memory); the slot frees once the in-flight pipeline
 // finishes, and the client's retry then resolves normally.
 func TestUpgradeMuxDnsInflightCap(t *testing.T) {
-	const resolved = "203.0.113.44"
-	server, dns, gate, requests := gatedDohWireServer(t, resolved)
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testUpgradeMuxDnsInflightCap(t, ipVersion)
+	})
+}
+
+func testUpgradeMuxDnsInflightCap(t *testing.T, ipVersion int) {
+	server, dns, gate, requests := gatedDohWireServerOnFamily(t, ipVersion, testDocAddr(ipVersion, 44))
 	defer server.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1277,7 +1355,7 @@ func TestUpgradeMuxDnsInflightCap(t *testing.T) {
 	mux.SetUpstream(rec.upstream)
 
 	// the first question fills the only slot and holds on the gate
-	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketFrom(t, "one.example.test.", 0xAAAA, 41001), 0) {
+	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketFromVersion(t, ipVersion, "one.example.test.", testDnsQType(ipVersion), 0xAAAA, 41001), 0) {
 		t.Fatal("first query was not claimed")
 	}
 	if !waitForCondition(5*time.Second, func() bool { return 1 <= atomic.LoadInt32(requests) }) {
@@ -1285,7 +1363,7 @@ func TestUpgradeMuxDnsInflightCap(t *testing.T) {
 	}
 
 	// a second, distinct question is claimed (the mux owns DNS) but dropped at the cap
-	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketFrom(t, "two.example.test.", 0xBBBB, 41002), 0) {
+	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketFromVersion(t, ipVersion, "two.example.test.", testDnsQType(ipVersion), 0xBBBB, 41002), 0) {
 		t.Fatal("over-cap query should still be claimed (claim-and-drop)")
 	}
 	func() {
@@ -1309,7 +1387,7 @@ func TestUpgradeMuxDnsInflightCap(t *testing.T) {
 	}) {
 		t.Fatal("the resolved question did not free its slot")
 	}
-	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketFrom(t, "two.example.test.", 0xBBBB, 41002), 0) {
+	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketFromVersion(t, ipVersion, "two.example.test.", testDnsQType(ipVersion), 0xBBBB, 41002), 0) {
 		t.Fatal("retried query was not claimed")
 	}
 	if !waitForCondition(5*time.Second, func() bool { _, received := rec.counts(); return 2 <= received }) {
@@ -1332,10 +1410,16 @@ func TestUpgradeMuxDnsInflightCap(t *testing.T) {
 // evict the least-recently-active of a sample) and each record keeps at most the most
 // recent maxServerNamesPerIp names.
 func TestReverseBounds(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testReverseBounds(t, ipVersion)
+	})
+}
+
+func testReverseBounds(t *testing.T, ipVersion int) {
 	ri := newReverseIndex(func() int { return 8 })
 
 	for i := range 20 {
-		addr := netip.AddrFrom4([4]byte{198, 51, 100, byte(i + 1)})
+		addr := testDocAddr(ipVersion, i+1)
 		ri.record([]netip.Addr{addr}, "host.example.test")
 		if 8 < ri.count() {
 			t.Fatalf("reverse map grew to %d entries, cap is 8", ri.count())
@@ -1346,7 +1430,7 @@ func TestReverseBounds(t *testing.T) {
 	}
 
 	// names per IP: the most recent maxServerNamesPerIp are kept, oldest dropped
-	addr := netip.MustParseAddr("198.51.100.200")
+	addr := testDocAddr(ipVersion, 200)
 	for i := range 6 {
 		ri.record([]netip.Addr{addr}, fmt.Sprintf("n%d.example.test", i))
 	}

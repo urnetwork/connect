@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"slices"
 	"strings"
 	"sync"
@@ -197,13 +196,19 @@ func TestDefaultApiRuntimeExclusionsKeepDiscoveryRequestBounded(t *testing.T) {
 // Discovery retains the destination and the nearest eight intermediaries when
 // a server returns a longer path; shorter legacy paths are unaffected.
 func TestNextDestinationsRetainsMaximumIntermediariesAndDestination(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testNextDestinationsRetainsMaximumIntermediariesAndDestination(t, ipVersion)
+	})
+}
+
+func testNextDestinationsRetainsMaximumIntermediariesAndDestination(t *testing.T, ipVersion int) {
 	intermediaryIds := make([]Id, MaxMultihopLength+3)
 	for idIndex := range intermediaryIds {
 		intermediaryIds[idIndex] = NewId()
 	}
 	providerId := NewId()
 	wantEstimatedBytesPerSecond := ByteCount(7_500_000)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+	server := newFamilyHttptestServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if request.URL.Path == "/hello" {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -277,6 +282,12 @@ func TestNextDestinationsRetainsMaximumIntermediariesAndDestination(t *testing.T
 // that refreshed credential; keeping the generator's constructor JWT turns
 // healthy long-lived sessions into 401s once the old token expires.
 func TestApiMultiClientGeneratorUsesRefreshedJwtForFutureClientLifecycle(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testApiMultiClientGeneratorUsesRefreshedJwtForFutureClientLifecycle(t, ipVersion)
+	})
+}
+
+func testApiMultiClientGeneratorUsesRefreshedJwtForFutureClientLifecycle(t *testing.T, ipVersion int) {
 	derivedClientId := NewId()
 	derivedToken := gojwt.NewWithClaims(gojwt.SigningMethodHS256, gojwt.MapClaims{
 		"client_id": derivedClientId.String(),
@@ -291,7 +302,7 @@ func TestApiMultiClientGeneratorUsesRefreshedJwtForFutureClientLifecycle(t *test
 		authorization string
 	}
 	requests := make(chan requestAuth, 2)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+	server := newFamilyHttptestServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/hello":
 			w.WriteHeader(http.StatusOK)
@@ -357,11 +368,11 @@ func TestApiMultiClientGeneratorUsesRefreshedJwtForFutureClientLifecycle(t *test
 // newRemoveClientTestGenerator builds a generator against a counting api
 // server. The client strategy lives on its own ctx (like the app-scoped
 // strategy in the field), so it outlives the generator teardown.
-func newRemoveClientTestGenerator(t *testing.T, generatorCtx context.Context, strategyCtx context.Context) (*ApiMultiClientGenerator, *atomic.Int32, func()) {
+func newRemoveClientTestGenerator(t *testing.T, ipVersion int, generatorCtx context.Context, strategyCtx context.Context) (*ApiMultiClientGenerator, *atomic.Int32, func()) {
 	t.Helper()
 
 	removeCount := &atomic.Int32{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newFamilyHttptestServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/network/remove-client") {
 			removeCount.Add(1)
 		}
@@ -395,11 +406,17 @@ func newRemoveClientTestGenerator(t *testing.T, generatorCtx context.Context, st
 }
 
 func TestRemoveClientArgsTeardownNoStoreDeletes(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testRemoveClientArgsTeardownNoStoreDeletes(t, ipVersion)
+	})
+}
+
+func testRemoveClientArgsTeardownNoStoreDeletes(t *testing.T, ipVersion int) {
 	strategyCtx, strategyCancel := context.WithCancel(context.Background())
 	defer strategyCancel()
 	generatorCtx, generatorCancel := context.WithCancel(context.Background())
 
-	generator, removeCount, closeServer := newRemoveClientTestGenerator(t, generatorCtx, strategyCtx)
+	generator, removeCount, closeServer := newRemoveClientTestGenerator(t, ipVersion, generatorCtx, strategyCtx)
 	defer closeServer()
 
 	// shutdown-caused teardown with NO identity store: the best-effort
@@ -417,11 +434,17 @@ func TestRemoveClientArgsTeardownNoStoreDeletes(t *testing.T) {
 }
 
 func TestRemoveClientArgsTeardownStorePreservesIdentities(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testRemoveClientArgsTeardownStorePreservesIdentities(t, ipVersion)
+	})
+}
+
+func testRemoveClientArgsTeardownStorePreservesIdentities(t *testing.T, ipVersion int) {
 	strategyCtx, strategyCancel := context.WithCancel(context.Background())
 	defer strategyCancel()
 	generatorCtx, generatorCancel := context.WithCancel(context.Background())
 
-	generator, removeCount, closeServer := newRemoveClientTestGenerator(t, generatorCtx, strategyCtx)
+	generator, removeCount, closeServer := newRemoveClientTestGenerator(t, ipVersion, generatorCtx, strategyCtx)
 	defer closeServer()
 
 	// an identity store is configured (the proxy case): identities must
@@ -458,12 +481,18 @@ func TestRemoveClientArgsTeardownStorePreservesIdentities(t *testing.T) {
 }
 
 func TestRemoveClientArgsLiveEvictionDeletes(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testRemoveClientArgsLiveEvictionDeletes(t, ipVersion)
+	})
+}
+
+func testRemoveClientArgsLiveEvictionDeletes(t *testing.T, ipVersion int) {
 	strategyCtx, strategyCancel := context.WithCancel(context.Background())
 	defer strategyCancel()
 	generatorCtx, generatorCancel := context.WithCancel(context.Background())
 	defer generatorCancel()
 
-	generator, removeCount, closeServer := newRemoveClientTestGenerator(t, generatorCtx, strategyCtx)
+	generator, removeCount, closeServer := newRemoveClientTestGenerator(t, ipVersion, generatorCtx, strategyCtx)
 	defer closeServer()
 
 	// a window eviction while the ctx is live removes for real — with or
@@ -496,12 +525,18 @@ func TestRemoveClientArgsLiveEvictionDeletes(t *testing.T) {
 }
 
 func TestRemoveClientArgsStaleGenerationCannotDeleteLiveReplacement(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testRemoveClientArgsStaleGenerationCannotDeleteLiveReplacement(t, ipVersion)
+	})
+}
+
+func testRemoveClientArgsStaleGenerationCannotDeleteLiveReplacement(t *testing.T, ipVersion int) {
 	strategyCtx, strategyCancel := context.WithCancel(context.Background())
 	defer strategyCancel()
 	generatorCtx, generatorCancel := context.WithCancel(context.Background())
 	defer generatorCancel()
 
-	generator, removeCount, closeServer := newRemoveClientTestGenerator(t, generatorCtx, strategyCtx)
+	generator, removeCount, closeServer := newRemoveClientTestGenerator(t, ipVersion, generatorCtx, strategyCtx)
 	defer closeServer()
 	store := &fakeIdentityStore{}
 	generator.SetIdentityStore(store)
@@ -565,6 +600,12 @@ func TestRemoveClientArgsStaleGenerationCannotDeleteLiveReplacement(t *testing.T
 // OOB lifecycle is joined; deleting the network-client row first makes the
 // close fail with 401 and leaves server-side contract cleanup behind.
 func TestRemoveClientWithArgsJoinsOobBeforeIdentityRevocation(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testRemoveClientWithArgsJoinsOobBeforeIdentityRevocation(t, ipVersion)
+	})
+}
+
+func testRemoveClientWithArgsJoinsOobBeforeIdentityRevocation(t *testing.T, ipVersion int) {
 	controlStarted := make(chan struct{})
 	controlRelease := make(chan struct{})
 	controlDone := make(chan error, 1)
@@ -573,7 +614,7 @@ func TestRemoveClientWithArgsJoinsOobBeforeIdentityRevocation(t *testing.T) {
 	t.Cleanup(func() { releaseOnce.Do(func() { close(controlRelease) }) })
 	removeCount := &atomic.Int32{}
 
-	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	apiServer := newFamilyHttptestServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/connect/control":
 			var args ConnectControlArgs
@@ -671,13 +712,19 @@ func TestRemoveClientWithArgsJoinsOobBeforeIdentityRevocation(t *testing.T) {
 // the API context underneath the request and leaves the derived row active
 // until the server's much later idle reaper.
 func TestApiMultiClientGeneratorCloseAndWaitJoinsClientRemoval(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testApiMultiClientGeneratorCloseAndWaitJoinsClientRemoval(t, ipVersion)
+	})
+}
+
+func testApiMultiClientGeneratorCloseAndWaitJoinsClientRemoval(t *testing.T, ipVersion int) {
 	removeStarted := make(chan struct{})
 	removeRelease := make(chan struct{})
 	var startOnce sync.Once
 	var releaseOnce sync.Once
 	removeCount := &atomic.Int32{}
 
-	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	apiServer := newFamilyHttptestServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/hello":
 			w.WriteHeader(http.StatusOK)
@@ -777,9 +824,15 @@ func TestApiMultiClientGeneratorCloseAndWaitJoinsClientRemoval(t *testing.T) {
 // cancellation edge. Generator teardown must wait for that Client/OOB join;
 // otherwise a P2P send route can retain pooled Transfer frames after teardown.
 func TestApiMultiClientGeneratorCloseAndWaitJoinsGeneratedClientRetirement(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testApiMultiClientGeneratorCloseAndWaitJoinsGeneratedClientRetirement(t, ipVersion)
+	})
+}
+
+func testApiMultiClientGeneratorCloseAndWaitJoinsGeneratedClientRetirement(t *testing.T, ipVersion int) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	apiServer := newFamilyHttptestServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/hello", "/network/remove-client":
 			_, _ = w.Write([]byte("{}"))
