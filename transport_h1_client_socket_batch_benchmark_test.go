@@ -13,7 +13,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -54,6 +53,8 @@ type clientH1TlsSocketBenchmarkSettings struct {
 	maxMessageCount   int
 	maxBatchByteCount int
 	payloadByteCount  int
+	// ipVersion selects the loopback family the server binds; 0 is v4.
+	ipVersion int
 }
 
 // Counts client TCP writes and parses complete outbound TLS records. The
@@ -233,8 +234,11 @@ func benchmarkClientH1TlsSocket(
 		}
 	})
 
-	testServer := httptest.NewUnstartedServer(handler)
-	testServer.StartTLS()
+	ipVersion := settings.ipVersion
+	if ipVersion == 0 {
+		ipVersion = 4
+	}
+	testServer := newTestingLoopbackHttpServer(b, ipVersion, handler, true)
 	b.Cleanup(testServer.Close)
 
 	serverTransport, ok := testServer.Client().Transport.(*http.Transport)
@@ -543,9 +547,20 @@ func benchmarkClientH1TlsSocket(
 	releaseHandler()
 }
 
+// benchmarkClientH1TlsSocketDualStack runs the benchmark once per ip family.
+func benchmarkClientH1TlsSocketDualStack(
+	b *testing.B,
+	settings clientH1TlsSocketBenchmarkSettings,
+) {
+	forEachIpVersionBenchmark(b, func(b *testing.B, ipVersion int) {
+		settings.ipVersion = ipVersion
+		benchmarkClientH1TlsSocket(b, settings)
+	})
+}
+
 // Measures the historical one-frame-per-deadline and TLS-write baseline.
 func BenchmarkClientH1TlsSocketSingletonSaturated(b *testing.B) {
-	benchmarkClientH1TlsSocket(b, clientH1TlsSocketBenchmarkSettings{
+	benchmarkClientH1TlsSocketDualStack(b, clientH1TlsSocketBenchmarkSettings{
 		mode:     clientH1TlsSocketBenchmarkSingleton,
 		workload: clientH1TlsSocketBenchmarkSaturated,
 	})
@@ -553,7 +568,7 @@ func BenchmarkClientH1TlsSocketSingletonSaturated(b *testing.B) {
 
 // Isolates scheduler/deadline gains from ready draining without coalescing.
 func BenchmarkClientH1TlsSocketReadyDrainSeparateSaturated(b *testing.B) {
-	benchmarkClientH1TlsSocket(b, clientH1TlsSocketBenchmarkSettings{
+	benchmarkClientH1TlsSocketDualStack(b, clientH1TlsSocketBenchmarkSettings{
 		mode:     clientH1TlsSocketBenchmarkReadySeparate,
 		workload: clientH1TlsSocketBenchmarkSaturated,
 	})
@@ -561,7 +576,7 @@ func BenchmarkClientH1TlsSocketReadyDrainSeparateSaturated(b *testing.B) {
 
 // Measures the current production ready-drain and above-TLS coalescing path.
 func BenchmarkClientH1TlsSocketProductionCoalescedSaturated(b *testing.B) {
-	benchmarkClientH1TlsSocket(b, clientH1TlsSocketBenchmarkSettings{
+	benchmarkClientH1TlsSocketDualStack(b, clientH1TlsSocketBenchmarkSettings{
 		mode:     clientH1TlsSocketBenchmarkReadyCoalesced,
 		workload: clientH1TlsSocketBenchmarkSaturated,
 	})
@@ -569,7 +584,7 @@ func BenchmarkClientH1TlsSocketProductionCoalescedSaturated(b *testing.B) {
 
 // Measures four-message TLS coalescing with every other axis fixed.
 func BenchmarkClientH1TlsSocketCoalescedBatch4Saturated(b *testing.B) {
-	benchmarkClientH1TlsSocket(b, clientH1TlsSocketBenchmarkSettings{
+	benchmarkClientH1TlsSocketDualStack(b, clientH1TlsSocketBenchmarkSettings{
 		mode:            clientH1TlsSocketBenchmarkReadyCoalesced,
 		workload:        clientH1TlsSocketBenchmarkSaturated,
 		maxMessageCount: 4,
@@ -578,7 +593,7 @@ func BenchmarkClientH1TlsSocketCoalescedBatch4Saturated(b *testing.B) {
 
 // Measures eight-message TLS coalescing with every other axis fixed.
 func BenchmarkClientH1TlsSocketCoalescedBatch8Saturated(b *testing.B) {
-	benchmarkClientH1TlsSocket(b, clientH1TlsSocketBenchmarkSettings{
+	benchmarkClientH1TlsSocketDualStack(b, clientH1TlsSocketBenchmarkSettings{
 		mode:            clientH1TlsSocketBenchmarkReadyCoalesced,
 		workload:        clientH1TlsSocketBenchmarkSaturated,
 		maxMessageCount: 8,
@@ -588,7 +603,7 @@ func BenchmarkClientH1TlsSocketCoalescedBatch8Saturated(b *testing.B) {
 // Measures whether a sixteen-message ready drain buys more ACK-heavy
 // throughput without changing the fixed 16-KiB coalescing storage.
 func BenchmarkClientH1TlsSocketCoalescedBatch16Saturated(b *testing.B) {
-	benchmarkClientH1TlsSocket(b, clientH1TlsSocketBenchmarkSettings{
+	benchmarkClientH1TlsSocketDualStack(b, clientH1TlsSocketBenchmarkSettings{
 		mode:            clientH1TlsSocketBenchmarkReadyCoalesced,
 		workload:        clientH1TlsSocketBenchmarkSaturated,
 		maxMessageCount: 16,
@@ -598,7 +613,7 @@ func BenchmarkClientH1TlsSocketCoalescedBatch16Saturated(b *testing.B) {
 // Measures the production count ceiling while retaining the same 12-KiB
 // ready-byte and fixed 16-KiB coalescing-storage bounds.
 func BenchmarkClientH1TlsSocketCoalescedBatch32Saturated(b *testing.B) {
-	benchmarkClientH1TlsSocket(b, clientH1TlsSocketBenchmarkSettings{
+	benchmarkClientH1TlsSocketDualStack(b, clientH1TlsSocketBenchmarkSettings{
 		mode:              clientH1TlsSocketBenchmarkReadyCoalesced,
 		workload:          clientH1TlsSocketBenchmarkSaturated,
 		maxMessageCount:   32,
@@ -607,7 +622,7 @@ func BenchmarkClientH1TlsSocketCoalescedBatch32Saturated(b *testing.B) {
 }
 
 func BenchmarkClientH1TlsSocketAckSizedBatch8Saturated(b *testing.B) {
-	benchmarkClientH1TlsSocket(b, clientH1TlsSocketBenchmarkSettings{
+	benchmarkClientH1TlsSocketDualStack(b, clientH1TlsSocketBenchmarkSettings{
 		mode:             clientH1TlsSocketBenchmarkReadyCoalesced,
 		workload:         clientH1TlsSocketBenchmarkSaturated,
 		maxMessageCount:  8,
@@ -616,7 +631,7 @@ func BenchmarkClientH1TlsSocketAckSizedBatch8Saturated(b *testing.B) {
 }
 
 func BenchmarkClientH1TlsSocketAckSizedBatch16Saturated(b *testing.B) {
-	benchmarkClientH1TlsSocket(b, clientH1TlsSocketBenchmarkSettings{
+	benchmarkClientH1TlsSocketDualStack(b, clientH1TlsSocketBenchmarkSettings{
 		mode:             clientH1TlsSocketBenchmarkReadyCoalesced,
 		workload:         clientH1TlsSocketBenchmarkSaturated,
 		maxMessageCount:  16,
@@ -625,7 +640,7 @@ func BenchmarkClientH1TlsSocketAckSizedBatch16Saturated(b *testing.B) {
 }
 
 func BenchmarkClientH1TlsSocketAckSizedBatch32Saturated(b *testing.B) {
-	benchmarkClientH1TlsSocket(b, clientH1TlsSocketBenchmarkSettings{
+	benchmarkClientH1TlsSocketDualStack(b, clientH1TlsSocketBenchmarkSettings{
 		mode:              clientH1TlsSocketBenchmarkReadyCoalesced,
 		workload:          clientH1TlsSocketBenchmarkSaturated,
 		maxMessageCount:   32,
@@ -635,7 +650,7 @@ func BenchmarkClientH1TlsSocketAckSizedBatch32Saturated(b *testing.B) {
 }
 
 func BenchmarkClientH1TlsSocketAckSizedProductionSaturated(b *testing.B) {
-	benchmarkClientH1TlsSocket(b, clientH1TlsSocketBenchmarkSettings{
+	benchmarkClientH1TlsSocketDualStack(b, clientH1TlsSocketBenchmarkSettings{
 		mode:             clientH1TlsSocketBenchmarkReadyCoalesced,
 		workload:         clientH1TlsSocketBenchmarkSaturated,
 		payloadByteCount: 128,
@@ -644,7 +659,7 @@ func BenchmarkClientH1TlsSocketAckSizedProductionSaturated(b *testing.B) {
 
 // Measures isolated-frame latency with historical singleton writes.
 func BenchmarkClientH1TlsSocketSingletonSparse(b *testing.B) {
-	benchmarkClientH1TlsSocket(b, clientH1TlsSocketBenchmarkSettings{
+	benchmarkClientH1TlsSocketDualStack(b, clientH1TlsSocketBenchmarkSettings{
 		mode:     clientH1TlsSocketBenchmarkSingleton,
 		workload: clientH1TlsSocketBenchmarkSparse,
 	})
@@ -652,7 +667,7 @@ func BenchmarkClientH1TlsSocketSingletonSparse(b *testing.B) {
 
 // Proves ready draining alone does not wait for an absent second message.
 func BenchmarkClientH1TlsSocketReadyDrainSeparateSparse(b *testing.B) {
-	benchmarkClientH1TlsSocket(b, clientH1TlsSocketBenchmarkSettings{
+	benchmarkClientH1TlsSocketDualStack(b, clientH1TlsSocketBenchmarkSettings{
 		mode:     clientH1TlsSocketBenchmarkReadySeparate,
 		workload: clientH1TlsSocketBenchmarkSparse,
 	})
@@ -660,7 +675,7 @@ func BenchmarkClientH1TlsSocketReadyDrainSeparateSparse(b *testing.B) {
 
 // Measures current production behavior for an isolated above-TLS frame.
 func BenchmarkClientH1TlsSocketProductionCoalescedSparse(b *testing.B) {
-	benchmarkClientH1TlsSocket(b, clientH1TlsSocketBenchmarkSettings{
+	benchmarkClientH1TlsSocketDualStack(b, clientH1TlsSocketBenchmarkSettings{
 		mode:     clientH1TlsSocketBenchmarkReadyCoalesced,
 		workload: clientH1TlsSocketBenchmarkSparse,
 	})

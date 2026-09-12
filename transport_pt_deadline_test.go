@@ -157,10 +157,11 @@ func assertPacketTranslationClosedError(t *testing.T, err error, operation strin
 }
 
 // attachPacketTranslationDeadlineSocket gives Close a real underlying
-// PacketConn while the translation queues remain controlled by the test.
-func attachPacketTranslationDeadlineSocket(t *testing.T, translation *packetTranslation) {
+// PacketConn of the family under test while the translation queues remain
+// controlled by the test.
+func attachPacketTranslationDeadlineSocket(t *testing.T, ipVersion int, translation *packetTranslation) {
 	t.Helper()
-	packetConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	packetConn, err := net.ListenPacket(testUdpNetwork(ipVersion), testLoopbackHostPort(ipVersion, 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,153 +310,165 @@ func TestPacketTranslationWriteTimerWireDeadlineErrorContract(t *testing.T) {
 }
 
 func TestPacketTranslationClosedReadImmediateErrorContract(t *testing.T) {
-	translation := newPacketTranslationDeadlineTestConn(t, nil)
-	attachPacketTranslationDeadlineSocket(t, translation)
-	if err := translation.Close(); err != nil {
-		t.Fatal(err)
-	}
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		translation := newPacketTranslationDeadlineTestConn(t, nil)
+		attachPacketTranslationDeadlineSocket(t, ipVersion, translation)
+		if err := translation.Close(); err != nil {
+			t.Fatal(err)
+		}
 
-	n, addr, err := translation.ReadFrom(make([]byte, 1))
-	if n != 0 || addr != nil {
-		t.Fatalf("closed read returned n=%d addr=%v", n, addr)
-	}
-	assertPacketTranslationClosedError(t, err, "read")
+		n, addr, err := translation.ReadFrom(make([]byte, 1))
+		if n != 0 || addr != nil {
+			t.Fatalf("closed read returned n=%d addr=%v", n, addr)
+		}
+		assertPacketTranslationClosedError(t, err, "read")
+	})
 }
 
 func TestPacketTranslationClosedWriteImmediateErrorContract(t *testing.T) {
-	translation := newPacketTranslationDeadlineTestConn(t, nil)
-	attachPacketTranslationDeadlineSocket(t, translation)
-	if err := translation.Close(); err != nil {
-		t.Fatal(err)
-	}
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		translation := newPacketTranslationDeadlineTestConn(t, nil)
+		attachPacketTranslationDeadlineSocket(t, ipVersion, translation)
+		if err := translation.Close(); err != nil {
+			t.Fatal(err)
+		}
 
-	n, err := translation.WriteTo([]byte{1}, &net.UDPAddr{})
-	if n != 0 {
-		t.Fatalf("closed write returned n=%d", n)
-	}
-	assertPacketTranslationClosedError(t, err, "write")
+		n, err := translation.WriteTo([]byte{1}, &net.UDPAddr{})
+		if n != 0 {
+			t.Fatalf("closed write returned n=%d", n)
+		}
+		assertPacketTranslationClosedError(t, err, "write")
+	})
 }
 
 func TestPacketTranslationClosedReadBlockedErrorContract(t *testing.T) {
-	translation := newPacketTranslationDeadlineTestConn(t, nil)
-	attachPacketTranslationDeadlineSocket(t, translation)
-	timer := newPacketTranslationDeadlineTimer()
-	translation.deadlineAfterForTest = timer.after
-	if err := translation.SetReadDeadline(time.Now().Add(time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-
-	result := make(chan packetTranslationDeadlineReadResult, 1)
-	go func() {
-		n, addr, err := translation.ReadFrom(make([]byte, 1))
-		result <- packetTranslationDeadlineReadResult{
-			n:    n,
-			addr: addr,
-			err:  err,
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		translation := newPacketTranslationDeadlineTestConn(t, nil)
+		attachPacketTranslationDeadlineSocket(t, ipVersion, translation)
+		timer := newPacketTranslationDeadlineTimer()
+		translation.deadlineAfterForTest = timer.after
+		if err := translation.SetReadDeadline(time.Now().Add(time.Hour)); err != nil {
+			t.Fatal(err)
 		}
-	}()
-	if timeout := awaitPacketTranslationDeadlineTimer(t, timer); timeout <= 0 {
-		t.Fatalf("read timer duration = %s, want positive", timeout)
-	}
-	if err := translation.Close(); err != nil {
-		t.Fatal(err)
-	}
 
-	readResult := awaitPacketTranslationDeadlineRead(t, result)
-	if readResult.n != 0 || readResult.addr != nil {
-		t.Fatalf("closed read returned n=%d addr=%v", readResult.n, readResult.addr)
-	}
-	assertPacketTranslationClosedError(t, readResult.err, "read")
+		result := make(chan packetTranslationDeadlineReadResult, 1)
+		go func() {
+			n, addr, err := translation.ReadFrom(make([]byte, 1))
+			result <- packetTranslationDeadlineReadResult{
+				n:    n,
+				addr: addr,
+				err:  err,
+			}
+		}()
+		if timeout := awaitPacketTranslationDeadlineTimer(t, timer); timeout <= 0 {
+			t.Fatalf("read timer duration = %s, want positive", timeout)
+		}
+		if err := translation.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		readResult := awaitPacketTranslationDeadlineRead(t, result)
+		if readResult.n != 0 || readResult.addr != nil {
+			t.Fatalf("closed read returned n=%d addr=%v", readResult.n, readResult.addr)
+		}
+		assertPacketTranslationClosedError(t, readResult.err, "read")
+	})
 }
 
 func TestPacketTranslationClosedWriteQueueBlockedErrorContract(t *testing.T) {
-	translation := newPacketTranslationDeadlineTestConn(t, nil)
-	attachPacketTranslationDeadlineSocket(t, translation)
-	timer := newPacketTranslationDeadlineTimer()
-	translation.deadlineAfterForTest = timer.after
-	if err := translation.SetWriteDeadline(time.Now().Add(time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-
-	result := make(chan packetTranslationDeadlineWriteResult, 1)
-	go func() {
-		n, err := translation.WriteTo([]byte{1}, &net.UDPAddr{})
-		result <- packetTranslationDeadlineWriteResult{
-			n:   n,
-			err: err,
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		translation := newPacketTranslationDeadlineTestConn(t, nil)
+		attachPacketTranslationDeadlineSocket(t, ipVersion, translation)
+		timer := newPacketTranslationDeadlineTimer()
+		translation.deadlineAfterForTest = timer.after
+		if err := translation.SetWriteDeadline(time.Now().Add(time.Hour)); err != nil {
+			t.Fatal(err)
 		}
-	}()
-	if timeout := awaitPacketTranslationDeadlineTimer(t, timer); timeout <= 0 {
-		t.Fatalf("write timer duration = %s, want positive", timeout)
-	}
-	if err := translation.Close(); err != nil {
-		t.Fatal(err)
-	}
 
-	writeResult := awaitPacketTranslationDeadlineWrite(t, result)
-	if writeResult.n != 0 {
-		t.Fatalf("closed write returned n=%d", writeResult.n)
-	}
-	assertPacketTranslationClosedError(t, writeResult.err, "write")
+		result := make(chan packetTranslationDeadlineWriteResult, 1)
+		go func() {
+			n, err := translation.WriteTo([]byte{1}, &net.UDPAddr{})
+			result <- packetTranslationDeadlineWriteResult{
+				n:   n,
+				err: err,
+			}
+		}()
+		if timeout := awaitPacketTranslationDeadlineTimer(t, timer); timeout <= 0 {
+			t.Fatalf("write timer duration = %s, want positive", timeout)
+		}
+		if err := translation.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		writeResult := awaitPacketTranslationDeadlineWrite(t, result)
+		if writeResult.n != 0 {
+			t.Fatalf("closed write returned n=%d", writeResult.n)
+		}
+		assertPacketTranslationClosedError(t, writeResult.err, "write")
+	})
 }
 
 func TestPacketTranslationClosedWriteWireBlockedErrorContract(t *testing.T) {
-	translation := newPacketTranslationDeadlineTestConn(t, nil)
-	attachPacketTranslationDeadlineSocket(t, translation)
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		translation := newPacketTranslationDeadlineTestConn(t, nil)
+		attachPacketTranslationDeadlineSocket(t, ipVersion, translation)
 
-	result := make(chan packetTranslationDeadlineWriteResult, 1)
-	go func() {
-		n, err := translation.WriteTo([]byte{1}, &net.UDPAddr{})
-		result <- packetTranslationDeadlineWriteResult{
-			n:   n,
-			err: err,
+		result := make(chan packetTranslationDeadlineWriteResult, 1)
+		go func() {
+			n, err := translation.WriteTo([]byte{1}, &net.UDPAddr{})
+			result <- packetTranslationDeadlineWriteResult{
+				n:   n,
+				err: err,
+			}
+		}()
+		queued := <-translation.out
+		defer MessagePoolReturn(queued.data)
+		if err := translation.Close(); err != nil {
+			t.Fatal(err)
 		}
-	}()
-	queued := <-translation.out
-	defer MessagePoolReturn(queued.data)
-	if err := translation.Close(); err != nil {
-		t.Fatal(err)
-	}
 
-	writeResult := awaitPacketTranslationDeadlineWrite(t, result)
-	if writeResult.n != 0 {
-		t.Fatalf("closed wire write returned n=%d", writeResult.n)
-	}
-	assertPacketTranslationClosedError(t, writeResult.err, "write")
+		writeResult := awaitPacketTranslationDeadlineWrite(t, result)
+		if writeResult.n != 0 {
+			t.Fatalf("closed wire write returned n=%d", writeResult.n)
+		}
+		assertPacketTranslationClosedError(t, writeResult.err, "write")
+	})
 }
 
 func TestPacketTranslationQuicCloseDeadlineWakeupIsVerbose(t *testing.T) {
-	log := &captureLogger{enabled: true}
-	translation := newPacketTranslationDeadlineTestConn(t, log)
-	attachPacketTranslationDeadlineSocket(t, translation)
-	t.Cleanup(func() {
-		if err := translation.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			t.Errorf("close packet translation: %v", err)
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		log := &captureLogger{enabled: true}
+		translation := newPacketTranslationDeadlineTestConn(t, log)
+		attachPacketTranslationDeadlineSocket(t, ipVersion, translation)
+		t.Cleanup(func() {
+			if err := translation.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				t.Errorf("close packet translation: %v", err)
+			}
+		})
+
+		transport := &quic.Transport{Conn: translation}
+		if err := transport.Close(); err != nil {
+			t.Fatalf("close quic transport: %v", err)
+		}
+
+		info, verbose := packetTranslationCapturedLogs(log)
+		for _, line := range info {
+			if strings.Contains(line, "[pt]read packet timeout") {
+				t.Fatalf("quic close wakeup logged as INFO timeout: %v", info)
+			}
+		}
+		foundWakeup := false
+		for _, line := range verbose {
+			if strings.Contains(line, "[pt]read packet deadline wakeup") {
+				foundWakeup = true
+			}
+		}
+		if !foundWakeup {
+			t.Fatalf("quic close wakeup verbose log missing: %v", verbose)
+		}
+		readDeadline, wakeup, _ := translation.currentReadDeadline()
+		if !readDeadline.IsZero() || wakeup {
+			t.Fatalf("quic close left read deadline=%s wakeup=%t", readDeadline, wakeup)
 		}
 	})
-
-	transport := &quic.Transport{Conn: translation}
-	if err := transport.Close(); err != nil {
-		t.Fatalf("close quic transport: %v", err)
-	}
-
-	info, verbose := packetTranslationCapturedLogs(log)
-	for _, line := range info {
-		if strings.Contains(line, "[pt]read packet timeout") {
-			t.Fatalf("quic close wakeup logged as INFO timeout: %v", info)
-		}
-	}
-	foundWakeup := false
-	for _, line := range verbose {
-		if strings.Contains(line, "[pt]read packet deadline wakeup") {
-			foundWakeup = true
-		}
-	}
-	if !foundWakeup {
-		t.Fatalf("quic close wakeup verbose log missing: %v", verbose)
-	}
-	readDeadline, wakeup, _ := translation.currentReadDeadline()
-	if !readDeadline.IsZero() || wakeup {
-		t.Fatalf("quic close left read deadline=%s wakeup=%t", readDeadline, wakeup)
-	}
 }

@@ -21,12 +21,13 @@ const (
 // handshake and stream publication finish before the benchmark timer starts.
 func newPlatformH3BatchBenchmarkStream(
 	benchmark *testing.B,
+	ipVersion int,
 ) (*quic.Stream, *quic.Stream) {
 	benchmark.Helper()
 
 	certificatePem, keyPem, err := selfSign(
-		[]string{"127.0.0.1"},
-		"127.0.0.1",
+		[]string{testLoopbackIp(ipVersion)},
+		testLoopbackIp(ipVersion),
 		24*time.Hour,
 		24*time.Hour,
 	)
@@ -39,7 +40,7 @@ func newPlatformH3BatchBenchmarkStream(
 	}
 	const nextProtocol = "urnetwork-h3-batch-benchmark"
 	listener, err := quic.ListenAddr(
-		"127.0.0.1:0",
+		testLoopbackHostPort(ipVersion, 0),
 		&tls.Config{
 			Certificates: []tls.Certificate{certificate},
 			NextProtos:   []string{nextProtocol},
@@ -134,13 +135,25 @@ func newPlatformH3BatchBenchmarkStream(
 }
 
 // Measures a fixed ready backlog while varying only the number of ordinary H3
-// frames copied into each QUIC stream write.
+// frames copied into each QUIC stream write, once per ip family.
 func runPlatformH3BatchBenchmark(
 	benchmark *testing.B,
 	maximumMessageCount int,
 	retainedStorage bool,
 ) {
-	clientStream, serverStream := newPlatformH3BatchBenchmarkStream(benchmark)
+	forEachIpVersionBenchmark(benchmark, func(benchmark *testing.B, ipVersion int) {
+		runPlatformH3BatchBenchmarkIpVersion(benchmark, ipVersion, maximumMessageCount, retainedStorage)
+	})
+}
+
+// One family's run of runPlatformH3BatchBenchmark.
+func runPlatformH3BatchBenchmarkIpVersion(
+	benchmark *testing.B,
+	ipVersion int,
+	maximumMessageCount int,
+	retainedStorage bool,
+) {
+	clientStream, serverStream := newPlatformH3BatchBenchmarkStream(benchmark, ipVersion)
 	framer := NewFramer(DefaultFramerSettings(platformH3BatchBenchmarkMessageByteCount))
 	payload := make([]byte, platformH3BatchBenchmarkMessageByteCount)
 	var messages [platformH3BatchBenchmarkBurstMessageCount][]byte
