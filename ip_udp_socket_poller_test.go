@@ -26,9 +26,9 @@ type udpTestBufferSend func(
 // provider udp flow, in the width the family's buffer keys by.
 func testUdpFlowIps(ipVersion int) (sourceIp net.IP, destinationIp net.IP) {
 	if ipVersion == 6 {
-		return net.ParseIP("fd00::1"), net.ParseIP("::1")
+		return net.ParseIP("2001:db8::1"), net.ParseIP("::1")
 	}
-	return net.IPv4(10, 0, 0, 1).To4(), net.IPv4(127, 0, 0, 1).To4()
+	return net.IPv4(192, 0, 2, 2).To4(), net.IPv4(127, 0, 0, 1).To4()
 }
 
 // Builds one in-memory shared flow inside the caller's synctest bubble. The
@@ -304,7 +304,7 @@ func TestProviderUdpSharedSocketLifecycleDoesNotAllocatePerFlowQueues(t *testing
 		port, closeEcho := startUdpLoopbackEcho(t, ipVersion)
 		defer closeEcho()
 
-		settings := DefaultProviderLocalUserNatSettingsWithMemoryTarget(4 << 20).UdpBufferSettings
+		settings := DefaultProviderLocalUserNatSettingsWithMemoryTarget(4 * 1024 * 1024).UdpBufferSettings
 		settings.IdleTimeout = time.Minute
 		responses := make(chan struct{}, providerColdPageTestFlowCount)
 		receive := func(_ TransferPath, _ protocol.ProvideMode, _ *IpPath, _ []byte) {

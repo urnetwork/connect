@@ -121,7 +121,7 @@ func TestIpMuxPassthrough(t *testing.T) {
 	}
 
 	// receive path: external destination => dispatched downstream
-	external := &IpPath{Version: 4, Protocol: IpProtocolUdp, DestinationIp: net.ParseIP("8.8.8.8"), DestinationPort: 443}
+	external := &IpPath{Version: 4, Protocol: IpProtocolUdp, DestinationIp: net.ParseIP("203.0.113.1"), DestinationPort: 443}
 	mux.Receive(TransferPath{}, protocol.ProvideMode_Network, external, []byte("a-receive-packet"))
 	if _, received := rec.counts(); received != 1 {
 		t.Fatalf("downstream got %d packets, want 1", received)
@@ -140,7 +140,7 @@ func TestIpMuxPassthrough(t *testing.T) {
 		Protocol:        IpProtocolUdp,
 		SourceIp:        localIp,
 		SourcePort:      40000,
-		DestinationIp:   net.ParseIP("1.1.1.1"),
+		DestinationIp:   net.ParseIP("198.51.100.1"),
 		DestinationPort: 443,
 	}
 	returnPacket := newIpMuxIpv4Packet(canonicalOutbound.DestinationIp, canonicalOutbound.SourceIp)
@@ -176,9 +176,9 @@ func TestIpMuxClaimedSendReturnsPacketOwnership(t *testing.T) {
 // preserving first-seen flow order and packet order within each flow.
 func TestIpMuxSendPacketBatchGroupsDirectionalFlows(t *testing.T) {
 	packets := [][]byte{
-		testingUdp4Packet("10.0.0.1", "203.0.113.7", 443, []byte("a1")),
-		testingUdp4Packet("10.0.0.2", "203.0.113.8", 443, []byte("b1")),
-		testingUdp4Packet("10.0.0.1", "203.0.113.7", 443, []byte("a2")),
+		testingUdp4Packet("192.0.2.1", "203.0.113.7", 443, []byte("a1")),
+		testingUdp4Packet("192.0.2.2", "203.0.113.8", 443, []byte("b1")),
+		testingUdp4Packet("192.0.2.1", "203.0.113.7", 443, []byte("a2")),
 	}
 	recorder := &ipMuxBatchUpstreamRecorder{}
 	groupClassificationCount := 0
@@ -242,7 +242,7 @@ func TestIpMuxReceiveDoesNotTrustMisleadingPathDestination(t *testing.T) {
 		Protocol:      IpProtocolUdp,
 		DestinationIp: localIp,
 	}
-	packetForOs := newIpMuxIpv4Packet(net.ParseIP("1.1.1.1"), net.ParseIP("10.0.0.2"))
+	packetForOs := newIpMuxIpv4Packet(net.ParseIP("198.51.100.2"), net.ParseIP("203.0.113.2"))
 	mux.Receive(TransferPath{}, protocol.ProvideMode_Network, misleadingPath, packetForOs)
 	if _, received := rec.counts(); received != 1 {
 		t.Fatalf("packet bytes addressed downstream were intercepted from misleading metadata: received=%d, want 1", received)
@@ -262,7 +262,7 @@ func TestIpMuxReceiveRoutesLocalPacketWithoutPathMetadata(t *testing.T) {
 	defer mux.Close()
 
 	localIp := net.IP(tun.LocalAddresses()[0].AsSlice())
-	packet := newIpMuxIpv4Packet(net.ParseIP("1.1.1.1"), localIp)
+	packet := newIpMuxIpv4Packet(net.ParseIP("198.51.100.3"), localIp)
 	mux.Receive(TransferPath{}, protocol.ProvideMode_Network, nil, packet)
 	if _, received := rec.counts(); received != 0 {
 		t.Fatalf("mux-local packet without metadata reached downstream: received=%d, want 0", received)
@@ -294,8 +294,8 @@ func TestIpMuxReceivePacketsBatchesDownstream(t *testing.T) {
 	unsub := mux.AddPacketsReceiver(recorder.receivePackets)
 	defer unsub()
 	packets := [][]byte{
-		newIpMuxIpv4Packet(net.ParseIP("1.1.1.1"), net.ParseIP("10.0.0.2")),
-		newIpMuxIpv4Packet(net.ParseIP("1.0.0.1"), net.ParseIP("10.0.0.2")),
+		newIpMuxIpv4Packet(net.ParseIP("198.51.100.4"), net.ParseIP("203.0.113.3")),
+		newIpMuxIpv4Packet(net.ParseIP("198.51.100.5"), net.ParseIP("203.0.113.3")),
 	}
 	mux.ReceivePackets(
 		TransferPath{},
@@ -316,7 +316,7 @@ func TestIpMuxReceivePacketsBatchesDownstream(t *testing.T) {
 }
 
 func TestIpMuxLocalPacketDestinationSupportsIpv6(t *testing.T) {
-	local := netip.MustParseAddr("fd00::53")
+	local := netip.MustParseAddr("2001:db8::53")
 	mux := &IpMux{localAddresses: []netip.Addr{local}}
 	packet := make([]byte, 40)
 	packet[0] = 0x60
@@ -327,9 +327,9 @@ func TestIpMuxLocalPacketDestinationSupportsIpv6(t *testing.T) {
 }
 
 func TestIpMuxLocalPacketDestinationDoesNotAllocate(t *testing.T) {
-	local := netip.MustParseAddr("169.254.1.2")
+	local := netip.MustParseAddr("192.0.2.53")
 	mux := &IpMux{localAddresses: []netip.Addr{local}}
-	packet := newIpMuxIpv4Packet(net.ParseIP("1.1.1.1"), net.IP(local.AsSlice()))
+	packet := newIpMuxIpv4Packet(net.ParseIP("198.51.100.6"), net.IP(local.AsSlice()))
 	var localDestination bool
 	allocations := testing.AllocsPerRun(1000, func() {
 		localDestination = mux.isLocalPacketDestination(packet)
