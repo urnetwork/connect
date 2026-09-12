@@ -56,7 +56,14 @@ func TestRecoveryKernel(t *testing.T) {
 	if os.Getenv("URNET_RECOVERY") == "" {
 		t.Skip("recovery kernel: set URNET_RECOVERY=1")
 	}
+	// one measurement per family: the flow, its echo target and the exits'
+	// category follow the version under test (IPV6.md D3), so each family
+	// emits its own [recovery] line
+	forEachIpVersion(t, runRecoveryKernel)
+}
 
+// runRecoveryKernel is one configuration of the kernel over one ip family.
+func runRecoveryKernel(t *testing.T, ipVersion int) {
 	providerCount := recoveryEnvInt("URNET_REC_PROVIDERS", 3)
 	pps := recoveryEnvInt("URNET_REC_PPS", 200)
 	payloadByteCount := recoveryEnvInt("URNET_REC_PAYLOAD", 1200)
@@ -66,8 +73,8 @@ func TestRecoveryKernel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// local udp echo egress target
-	echoConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	// local udp echo egress target on the family's loopback
+	echoConn, err := net.ListenUDP(testUdpNetwork(ipVersion), testLoopbackUdpAddr(ipVersion))
 	if err != nil {
 		t.Fatalf("echo listen: %v", err)
 	}
@@ -233,14 +240,19 @@ func TestRecoveryKernel(t *testing.T) {
 	})
 	defer unsubMonitor()
 
-	// one pinned busy flow: constant-rate udp to the echo server
+	// one pinned busy flow: constant-rate udp to the echo server, over the
+	// family under test
 	source := SourceId(NewId())
+	flowSourceIp := net.IPv4(72, 0, 0, 1)
+	if ipVersion == 6 {
+		flowSourceIp = net.ParseIP("2001:db8::72:1")
+	}
 	flowIpPath := &IpPath{
-		Version:         4,
+		Version:         ipVersion,
 		Protocol:        IpProtocolUdp,
-		SourceIp:        net.IPv4(72, 0, 0, 1),
+		SourceIp:        flowSourceIp,
 		SourcePort:      40001,
-		DestinationIp:   net.IPv4(127, 0, 0, 1),
+		DestinationIp:   net.ParseIP(testLoopbackIp(ipVersion)),
 		DestinationPort: echoPort,
 	}
 	payload := make([]byte, payloadByteCount)
@@ -385,7 +397,12 @@ func TestRecoveryKernel(t *testing.T) {
 			}
 		}
 		multiClient.stateLock.Lock()
-		flowUpdate := multiClient.ip4PathUpdates[flowIpPath.ToIp4Path()]
+		var flowUpdate *multiClientChannelUpdate
+		if ipVersion == 4 {
+			flowUpdate = multiClient.ip4PathUpdates[flowIpPath.ToIp4Path()]
+		} else {
+			flowUpdate = multiClient.ip6PathUpdates[flowIpPath.ToIp6Path()]
+		}
 		var flowClient *multiClientChannel
 		if flowUpdate != nil {
 			flowClient = flowUpdate.client.Load()
@@ -412,8 +429,8 @@ func TestRecoveryKernel(t *testing.T) {
 	if !gapStart.IsZero() && !gapEnd.IsZero() {
 		gapMs = gapEnd.Sub(gapStart).Milliseconds()
 	}
-	fmt.Printf("[recovery] providers=%d pps=%d ack_ms=%d statswin_ms=%d blackhole_ms=%d resize_ms=%d ping_always=%d cping_rest_ms=%d cping_timeout_ms=%d sendstall_ms=%d | pre_rate=%.1f detect_ms=%d refill_ms=%d gap_ms=%d recover90_ms=%d\n",
-		providerCount, pps,
+	fmt.Printf("[recovery] family=v%d providers=%d pps=%d ack_ms=%d statswin_ms=%d blackhole_ms=%d resize_ms=%d ping_always=%d cping_rest_ms=%d cping_timeout_ms=%d sendstall_ms=%d | pre_rate=%.1f detect_ms=%d refill_ms=%d gap_ms=%d recover90_ms=%d\n",
+		ipVersion, providerCount, pps,
 		recoveryEnvInt("URNET_REC_ACK_MS", 30000),
 		recoveryEnvInt("URNET_REC_STATSWIN_MS", 30000),
 		recoveryEnvInt("URNET_REC_BLACKHOLE_MS", 5000),
@@ -443,8 +460,13 @@ func recoveryEnvInt(name string, defaultValue int) int {
 }
 
 // recoveryGenerator is a multi-provider MultiClientGenerator +
-// MultiClientGeneratorWithDestination for the recovery kernel: each window
-// client binds to one provider over a buffered gateway route pair.
+// MultiClientGeneratorWithDestination + MultiClientGeneratorWithIpFamily for
+// the recovery kernel: each window client binds to one provider over a
+// buffered gateway route pair. Every provider egresses to the loopback echo
+// of either family, so the family-aware discovery reports each one as
+// dualstack; without that, a v6 flow would have no exit able to carry it
+// (a generator that answers only the plain NextDestinations reads as legacy
+// v4-only).
 type recoveryGenerator struct {
 	mutex            sync.Mutex
 	windowProvider   map[Id]Id // window clientId -> provider clientId
@@ -462,6 +484,24 @@ func (self *recoveryGenerator) NextDestinations(count int, excludeDestinations [
 		}
 	}
 	return self.nextDestinations(excluded), nil
+}
+
+// NextDestinationsWithIpFamily offers the same live providers, each stamped
+// dualstack, for any filter a dualstack provider satisfies; an exact
+// single-family filter matches none of them.
+func (self *recoveryGenerator) NextDestinationsWithIpFamily(count int, excludeDestinations []MultiHopId, rankMode string, ipFamily IpFamilyFilter) (map[MultiHopId]DestinationStats, error) {
+	destinations, err := self.NextDestinations(count, excludeDestinations, rankMode)
+	if err != nil {
+		return nil, err
+	}
+	if !ipFamily.Matches(IpFamilyDualstack) {
+		return map[MultiHopId]DestinationStats{}, nil
+	}
+	for destination, stats := range destinations {
+		stats.IpFamily = IpFamilyDualstack
+		destinations[destination] = stats
+	}
+	return destinations, nil
 }
 
 func (self *recoveryGenerator) NewClientArgs() (*MultiClientGeneratorClientArgs, error) {

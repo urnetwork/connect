@@ -45,11 +45,17 @@ func TestEgressRelationship(t *testing.T) {
 	}
 }
 
-func testEgressPath(dstIp string) *IpPath {
+// testEgressPath is a tcp syn from a private tunnel-side source of the family
+// to dstIp:443.
+func testEgressPath(ipVersion int, dstIp string) *IpPath {
+	sourceIp := net.ParseIP("10.0.0.2")
+	if ipVersion == 6 {
+		sourceIp = net.ParseIP("fd00:7572:6e65::2")
+	}
 	return &IpPath{
-		Version:         4,
+		Version:         ipVersion,
 		Protocol:        IpProtocolTcp,
-		SourceIp:        net.ParseIP("10.0.0.2"),
+		SourceIp:        sourceIp,
 		SourcePort:      12345,
 		DestinationIp:   net.ParseIP(dstIp),
 		DestinationPort: 443,
@@ -57,51 +63,94 @@ func testEgressPath(dstIp string) *IpPath {
 	}
 }
 
+// testNonPublicDestinations are the non-public destination classes the
+// public rules must refuse, in the family's own forms.
+func testNonPublicDestinations(ipVersion int) []string {
+	if ipVersion == 4 {
+		return []string{
+			"10.0.0.5",        // RFC1918
+			"192.168.1.10",    // RFC1918
+			"127.0.0.1",       // loopback
+			"169.254.169.254", // link-local: the cloud metadata endpoint
+		}
+	}
+	return []string{
+		"fd00::5",       // ULA (RFC 4193)
+		"fc00:1::10",    // ULA
+		"::1",           // loopback
+		"fe80::1",       // link-local
+		"fd00:ec2::254", // the cloud metadata endpoint's v6 identity (ULA)
+	}
+}
+
+// testMetadataEndpoint is the cloud metadata endpoint of the family.
+func testMetadataEndpoint(ipVersion int) string {
+	if ipVersion == 4 {
+		return "169.254.169.254"
+	}
+	return "fd00:ec2::254"
+}
+
+// testLanDestination is a same-network destination of the family.
+func testLanDestination(ipVersion int) string {
+	if ipVersion == 4 {
+		return "10.0.0.5"
+	}
+	return "fd00::5"
+}
+
+// testPublicResolver is a public unicast destination of the family.
+func testPublicResolver(ipVersion int) string {
+	if ipVersion == 4 {
+		return "8.8.8.8"
+	}
+	return "2001:4860:4860::8888"
+}
+
 // The security guarantee the proxy relies on: a same-Network relationship
 // bypasses the public rules (may reach a LAN), while any other relationship
 // enforces isPublicUnicast — so a private / loopback / link-local (incl. the
 // cloud metadata endpoint) destination is an Incident, which blockActionApply
-// treats as a non-overridable block.
+// treats as a non-overridable block. Both families: the v6 forms are ULA,
+// loopback and link-local.
 func TestInspectEgressNetworkBypassAndPublicEnforcement(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	policy := DefaultSecurityPolicy(ctx)
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		policy := DefaultSecurityPolicy(ctx)
 
-	nonPublic := []string{
-		"10.0.0.5",        // RFC1918
-		"192.168.1.10",    // RFC1918
-		"127.0.0.1",       // loopback
-		"169.254.169.254", // link-local: the cloud metadata endpoint
-	}
+		nonPublic := testNonPublicDestinations(ipVersion)
 
-	// ProvideMode_Network: trusted same-network relationship reaches the LAN
-	for _, ip := range nonPublic {
-		r, err := policy.InspectEgress(protocol.ProvideMode_Network, testEgressPath(ip), nil)
-		if err != nil {
-			t.Fatalf("InspectEgress(Network, %s): unexpected error %v", ip, err)
+		// ProvideMode_Network: trusted same-network relationship reaches the LAN
+		for _, ip := range nonPublic {
+			r, err := policy.InspectEgress(protocol.ProvideMode_Network, testEgressPath(ipVersion, ip), nil)
+			if err != nil {
+				t.Fatalf("InspectEgress(Network, %s): unexpected error %v", ip, err)
+			}
+			if r != SecurityPolicyResultAllow {
+				t.Errorf("InspectEgress(Network, %s) = %v, want Allow (same-network bypass)", ip, r)
+			}
 		}
-		if r != SecurityPolicyResultAllow {
-			t.Errorf("InspectEgress(Network, %s) = %v, want Allow (same-network bypass)", ip, r)
-		}
-	}
 
-	// ProvideMode_Public: the same LAN destinations are blocked as incidents
-	for _, ip := range nonPublic {
-		r, err := policy.InspectEgress(protocol.ProvideMode_Public, testEgressPath(ip), nil)
-		if err != nil {
-			t.Fatalf("InspectEgress(Public, %s): unexpected error %v", ip, err)
+		// ProvideMode_Public: the same LAN destinations are blocked as incidents
+		for _, ip := range nonPublic {
+			r, err := policy.InspectEgress(protocol.ProvideMode_Public, testEgressPath(ipVersion, ip), nil)
+			if err != nil {
+				t.Fatalf("InspectEgress(Public, %s): unexpected error %v", ip, err)
+			}
+			if r != SecurityPolicyResultIncident {
+				t.Errorf("InspectEgress(Public, %s) = %v, want Incident (isPublicUnicast enforced)", ip, r)
+			}
 		}
-		if r != SecurityPolicyResultIncident {
-			t.Errorf("InspectEgress(Public, %s) = %v, want Incident (isPublicUnicast enforced)", ip, r)
-		}
-	}
 
-	// a public destination under Public passes isPublicUnicast (not an incident)
-	if r, err := policy.InspectEgress(protocol.ProvideMode_Public, testEgressPath("8.8.8.8"), nil); err != nil {
-		t.Fatalf("InspectEgress(Public, 8.8.8.8): unexpected error %v", err)
-	} else if r == SecurityPolicyResultIncident {
-		t.Errorf("InspectEgress(Public, 8.8.8.8) = Incident, want a public unicast destination to pass")
-	}
+		// a public destination under Public passes isPublicUnicast (not an incident)
+		publicIp := testPublicResolver(ipVersion)
+		if r, err := policy.InspectEgress(protocol.ProvideMode_Public, testEgressPath(ipVersion, publicIp), nil); err != nil {
+			t.Fatalf("InspectEgress(Public, %s): unexpected error %v", publicIp, err)
+		} else if r == SecurityPolicyResultIncident {
+			t.Errorf("InspectEgress(Public, %s) = Incident, want a public unicast destination to pass", publicIp)
+		}
+	})
 }
 
 // Composition as the proxy experiences it: the DeviceLocal egress hard-codes a
@@ -109,22 +158,24 @@ func TestInspectEgressNetworkBypassAndPublicEnforcement(t *testing.T) {
 // egressRelationship resolves to Public and a LAN destination is blocked. A
 // genuine same-Network client (client mode Network) may still reach the LAN.
 func TestProxyEgressBlocksLocalDestinations(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	policy := DefaultSecurityPolicy(ctx)
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		policy := DefaultSecurityPolicy(ctx)
 
-	const hostedClientMode = protocol.ProvideMode_Public // the proxy multiclient
-	const egressSource = protocol.ProvideMode_Network    // device_local hard-codes this
+		const hostedClientMode = protocol.ProvideMode_Public // the proxy multiclient
+		const egressSource = protocol.ProvideMode_Network    // device_local hard-codes this
 
-	proxyRel := egressRelationship(egressSource, hostedClientMode)
-	if r, _ := policy.InspectEgress(proxyRel, testEgressPath("169.254.169.254"), nil); r != SecurityPolicyResultIncident {
-		t.Errorf("hosted proxy egress to metadata endpoint = %v, want Incident (blocked)", r)
-	}
+		proxyRel := egressRelationship(egressSource, hostedClientMode)
+		if r, _ := policy.InspectEgress(proxyRel, testEgressPath(ipVersion, testMetadataEndpoint(ipVersion)), nil); r != SecurityPolicyResultIncident {
+			t.Errorf("hosted proxy egress to metadata endpoint = %v, want Incident (blocked)", r)
+		}
 
-	sameNetworkRel := egressRelationship(egressSource, protocol.ProvideMode_Network)
-	if r, _ := policy.InspectEgress(sameNetworkRel, testEgressPath("10.0.0.5"), nil); r != SecurityPolicyResultAllow {
-		t.Errorf("same-network client egress to LAN = %v, want Allow", r)
-	}
+		sameNetworkRel := egressRelationship(egressSource, protocol.ProvideMode_Network)
+		if r, _ := policy.InspectEgress(sameNetworkRel, testEgressPath(ipVersion, testLanDestination(ipVersion)), nil); r != SecurityPolicyResultAllow {
+			t.Errorf("same-network client egress to LAN = %v, want Allow", r)
+		}
+	})
 }
 
 // newSourceProvideModeTestProvider creates provider state without a source cap

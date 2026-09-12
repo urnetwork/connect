@@ -2,11 +2,8 @@ package connect
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"net/netip"
 	"slices"
 	"testing"
@@ -88,8 +85,16 @@ func parseDnsBlockedReply(t *testing.T, packet []byte) (dnsmessage.Header, dnsme
 // mux send path directly and asserts the synthesized replies: A→0.0.0.0,
 // AAAA→::, every other type (HTTPS/SVCB 65, TXT) → empty NOERROR; and that
 // disabling the blocker (or removing it) returns queries to the resolution
-// pipeline without a mux rebuild.
+// pipeline without a mux rebuild. Both packet families: the query family
+// and the record type are independent, so every reply shape is checked
+// over v4 and v6 packets.
 func TestUpgradeMuxDnsBlocked(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testUpgradeMuxDnsBlocked(t, ipVersion)
+	})
+}
+
+func testUpgradeMuxDnsBlocked(t *testing.T, ipVersion int) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -121,7 +126,7 @@ func TestUpgradeMuxDnsBlocked(t *testing.T) {
 	responseTtl := settings.Dns.ResponseTtl
 
 	// blocked A: 0.0.0.0 with the settings ttl, echoing the transaction id
-	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "sub.ads.example.com.", dnsmessage.TypeA, 0x0a01), 0) {
+	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTypedVersion(t, ipVersion, "sub.ads.example.com.", dnsmessage.TypeA, 0x0a01), 0) {
 		t.Fatal("blocked A query not claimed")
 	}
 	if !waitReceived(1) {
@@ -145,7 +150,7 @@ func TestUpgradeMuxDnsBlocked(t *testing.T) {
 	}
 
 	// blocked AAAA: ::
-	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "ads.example.com.", dnsmessage.TypeAAAA, 0x0a02), 0) {
+	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTypedVersion(t, ipVersion, "ads.example.com.", dnsmessage.TypeAAAA, 0x0a02), 0) {
 		t.Fatal("blocked AAAA query not claimed")
 	}
 	if !waitReceived(2) {
@@ -161,7 +166,7 @@ func TestUpgradeMuxDnsBlocked(t *testing.T) {
 
 	// blocked HTTPS/SVCB (type 65): claimed with an empty NOERROR, so the
 	// browser cannot reconnect via the record's ip hints
-	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "ads.example.com.", dnsmessage.Type(65), 0x0a03), 0) {
+	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTypedVersion(t, ipVersion, "ads.example.com.", dnsmessage.Type(65), 0x0a03), 0) {
 		t.Fatal("blocked HTTPS query not claimed")
 	}
 	if !waitReceived(3) {
@@ -176,7 +181,7 @@ func TestUpgradeMuxDnsBlocked(t *testing.T) {
 	}
 
 	// blocked TXT: same empty NOERROR shape
-	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "ads.example.com.", dnsmessage.TypeTXT, 0x0a04), 0) {
+	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTypedVersion(t, ipVersion, "ads.example.com.", dnsmessage.TypeTXT, 0x0a04), 0) {
 		t.Fatal("blocked TXT query not claimed")
 	}
 	if !waitReceived(4) {
@@ -189,19 +194,19 @@ func TestUpgradeMuxDnsBlocked(t *testing.T) {
 
 	// an unblocked name is not answered by the blocker: it enters the
 	// pipeline, fails to resolve (no servers), and sends nothing
-	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "ok.example.org.", dnsmessage.TypeA, 0x0a05), 0) {
+	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTypedVersion(t, ipVersion, "ok.example.org.", dnsmessage.TypeA, 0x0a05), 0) {
 		t.Fatal("unblocked A query not claimed")
 	}
 	// an unblocked HTTPS/SVCB query is claimed and routed to the DoH forward path (not
 	// passed through). This test's resolver has remote DoH disabled, so the forward
 	// fails fast with a prompt SERVFAIL (never silence on the claimed type).
-	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "ok.example.org.", dnsmessage.Type(65), 0x0a06), 0) {
+	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTypedVersion(t, ipVersion, "ok.example.org.", dnsmessage.Type(65), 0x0a06), 0) {
 		t.Fatal("unblocked HTTPS query not claimed")
 	}
 	// Every other UDP/53 record type is also claimed and forwarded over DoH.
 	// With DoH disabled, TXT therefore gets the same prompt SERVFAIL rather
 	// than escaping as plaintext or being left unanswered.
-	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "ok.example.org.", dnsmessage.TypeTXT, 0x0a0a), 0) {
+	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTypedVersion(t, ipVersion, "ok.example.org.", dnsmessage.TypeTXT, 0x0a0a), 0) {
 		t.Fatal("unblocked TXT query not claimed")
 	}
 	if !waitReceived(6) {
@@ -238,7 +243,7 @@ func TestUpgradeMuxDnsBlocked(t *testing.T) {
 	// toggling off returns blocked names to the pipeline (no reply), and
 	// toggling back on blocks again — no mux rebuild
 	blocker.SetEnabled(false)
-	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "ads.example.com.", dnsmessage.TypeA, 0x0a07), 0) {
+	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTypedVersion(t, ipVersion, "ads.example.com.", dnsmessage.TypeA, 0x0a07), 0) {
 		t.Fatal("disabled-blocker A query not claimed")
 	}
 	time.Sleep(500 * time.Millisecond)
@@ -246,7 +251,7 @@ func TestUpgradeMuxDnsBlocked(t *testing.T) {
 		t.Fatalf("disabled blocker still replied: %d", received)
 	}
 	blocker.SetEnabled(true)
-	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "ads.example.com.", dnsmessage.TypeA, 0x0a08), 0) {
+	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTypedVersion(t, ipVersion, "ads.example.com.", dnsmessage.TypeA, 0x0a08), 0) {
 		t.Fatal("re-enabled blocker A query not claimed")
 	}
 	if !waitReceived(7) {
@@ -255,7 +260,7 @@ func TestUpgradeMuxDnsBlocked(t *testing.T) {
 
 	// removing the blocker entirely returns to pipeline behavior
 	mux.SetBlocker(nil)
-	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTyped(t, "ads.example.com.", dnsmessage.TypeA, 0x0a09), 0) {
+	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dnsQueryPacketTypedVersion(t, ipVersion, "ads.example.com.", dnsmessage.TypeA, 0x0a09), 0) {
 		t.Fatal("nil-blocker A query not claimed")
 	}
 	time.Sleep(500 * time.Millisecond)
@@ -269,59 +274,56 @@ func TestUpgradeMuxDnsBlocked(t *testing.T) {
 // blocker: the next query must be blocked — the check sits ahead of the
 // cache — and blocked answers must not pollute the reverse index.
 func TestUpgradeMuxDnsBlockBeatsCache(t *testing.T) {
-	const resolved = "203.0.113.45"
-	const queryName = "cached.blockme.test"
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		// the resolved address, the doh server and the client's dns path all
+		// follow the family under test
+		resolved := testFamilyIp(ipVersion, "203.0.113.45")
+		const queryName = "cached.blockme.test"
 
-	dohServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeDohWire(w, r, []netip.Addr{netip.MustParseAddr(resolved)}, 60, false)
-	}))
-	defer dohServer.Close()
+		dohServer := newFamilyHttptestTlsServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeDohWire(w, r, []netip.Addr{netip.MustParseAddr(resolved)}, 60, false)
+		}))
+		defer dohServer.Close()
 
-	pool := x509.NewCertPool()
-	pool.AddCert(dohServer.Certificate())
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+		h := newDnsClientHarness(t, ctx, ipVersion, localDohTlsResolverSettings(ipVersion, dohServer))
+		defer h.close()
 
-	h := newDnsClientHarness(t, ctx, &DnsResolverSettings{
-		EnableLocalDoh:   true,
-		LocalDohUrlsIpv4: []string{dohServer.URL},
-		TlsConfig:        &tls.Config{RootCAs: pool},
+		blocker := blockerTestNew([]string{"blockme.test"}, nil, nil)
+		blocker.SetEnabled(false)
+		h.mux.SetBlocker(blocker)
+
+		// disabled: resolves normally and records the reverse index
+		addrs, err := h.resolver().LookupHost(ctx, queryName)
+		if err != nil {
+			t.Fatalf("LookupHost (blocker disabled): %v", err)
+		}
+		if !slices.Contains(addrs, resolved) {
+			t.Fatalf("LookupHost = %v, want to contain %s", addrs, resolved)
+		}
+
+		// enabled: the same (cached) name is now blocked — subdomain semantics
+		// via the blocked base "blockme.test"
+		blocker.SetEnabled(true)
+		addrs, err = h.resolver().LookupHost(ctx, queryName)
+		if err != nil {
+			t.Fatalf("LookupHost (blocker enabled): %v", err)
+		}
+		if slices.Contains(addrs, resolved) {
+			t.Fatalf("blocked name still resolves the cached address: %v", addrs)
+		}
+		if !slices.Contains(addrs, "0.0.0.0") && !slices.Contains(addrs, "::") {
+			t.Fatalf("blocked name did not answer the unspecified address: %v", addrs)
+		}
+
+		// blocked answers never pollute the reverse index
+		if names := h.mux.ServerNames("0.0.0.0"); len(names) != 0 {
+			t.Fatalf("reverse index polluted for 0.0.0.0: %v", names)
+		}
+		if names := h.mux.ServerNames("::"); len(names) != 0 {
+			t.Fatalf("reverse index polluted for :: : %v", names)
+		}
 	})
-	defer h.close()
-
-	blocker := blockerTestNew([]string{"blockme.test"}, nil, nil)
-	blocker.SetEnabled(false)
-	h.mux.SetBlocker(blocker)
-
-	// disabled: resolves normally and records the reverse index
-	addrs, err := h.resolver().LookupHost(ctx, queryName)
-	if err != nil {
-		t.Fatalf("LookupHost (blocker disabled): %v", err)
-	}
-	if !slices.Contains(addrs, resolved) {
-		t.Fatalf("LookupHost = %v, want to contain %s", addrs, resolved)
-	}
-
-	// enabled: the same (cached) name is now blocked — subdomain semantics
-	// via the blocked base "blockme.test"
-	blocker.SetEnabled(true)
-	addrs, err = h.resolver().LookupHost(ctx, queryName)
-	if err != nil {
-		t.Fatalf("LookupHost (blocker enabled): %v", err)
-	}
-	if slices.Contains(addrs, resolved) {
-		t.Fatalf("blocked name still resolves the cached address: %v", addrs)
-	}
-	if !slices.Contains(addrs, "0.0.0.0") && !slices.Contains(addrs, "::") {
-		t.Fatalf("blocked name did not answer the unspecified address: %v", addrs)
-	}
-
-	// blocked answers never pollute the reverse index
-	if names := h.mux.ServerNames("0.0.0.0"); len(names) != 0 {
-		t.Fatalf("reverse index polluted for 0.0.0.0: %v", names)
-	}
-	if names := h.mux.ServerNames("::"); len(names) != 0 {
-		t.Fatalf("reverse index polluted for :: : %v", names)
-	}
 }
