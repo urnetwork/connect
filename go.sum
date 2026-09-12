@@ -78,7 +78,7 @@ google.golang.org/protobuf v1.36.11 h1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBN
 google.golang.org/protobuf v1.36.11/go.mod h1:HTf+CrKn2C3g5S8VImy6tdcUvCska2kB7j23XfzDpco=
 gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
 gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
-gvisor.dev/gvisor v0.0.0-20260805230438-8eba670122c5 h1:9z+CVRyCpwSK4J2uiS0Q1fA50BabXj1NLEF3XAz4f80=
-gvisor.dev/gvisor v0.0.0-20260805230438-8eba670122c5/go.mod h1:8aLQqUBHDH8fY5y60lzmwDpMMbQCcT3EBfoSwhfaGCY=
+gvisor.dev/gvisor v0.0.0-20260909230408-9b1144b679cb h1:/H4j2bexKDk2187mShk3oHdt84t4VGK5h9oxp9ZFchA=
+gvisor.dev/gvisor v0.0.0-20260909230408-9b1144b679cb/go.mod h1:8aLQqUBHDH8fY5y60lzmwDpMMbQCcT3EBfoSwhfaGCY=
 src.agwa.name/tlshacks v0.0.4 h1:zIxyKo4duQB9N61l6N1tbwgTmnUCcbtUtdk4ZnIJicM=
 src.agwa.name/tlshacks v0.0.4/go.mod h1:DjmhEIN3A1AG5jx6tKMv9oOHULPGf6CSQC2PQuTC/U0=

@@ -715,6 +715,7 @@ func (self *tunLinkEndpoint) WritePackets(packets stack.PacketBufferList) (int, 
 	packetSlice := packets.AsSlice()
 	written := 0
 	remaining := packets
+	waitedForSpace := false
 	var timer *time.Timer
 	defer func() {
 		if timer != nil {
@@ -724,9 +725,16 @@ func (self *tunLinkEndpoint) WritePackets(packets stack.PacketBufferList) (int, 
 	for {
 		n, err := self.Endpoint.WritePackets(remaining)
 		written += n
+		if 0 < n && waitedForSpace {
+			// Batch reads coalesce their space notifications into one token.
+			// Pass it on after making progress so other parked writers can
+			// use the remaining slots without waiting for another read.
+			self.notifySpace()
+		}
 		if err != nil || written == len(packetSlice) {
 			return written, err
 		}
+		waitedForSpace = true
 
 		// A partial batch is unusual (gVisor normally passes one packet), so
 		// construct its suffix only on queue saturation. A completely rejected

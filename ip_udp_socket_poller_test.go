@@ -1,9 +1,12 @@
+// Separates real-socket ordering and registration cleanup from virtual-clock
+// checks of the shared idle worker's autonomous deadlines.
 package connect
 
 import (
 	"context"
 	"net"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
@@ -26,6 +29,112 @@ func testUdpFlowIps(ipVersion int) (sourceIp net.IP, destinationIp net.IP) {
 		return net.ParseIP("fd00::1"), net.ParseIP("::1")
 	}
 	return net.IPv4(10, 0, 0, 1).To4(), net.IPv4(127, 0, 0, 1).To4()
+}
+
+// Builds one in-memory shared flow inside the caller's synctest bubble. The
+// socket integration tests cover registration; this fixture owns only indexes
+// and the real shared idle worker, with one construction wake and joined cleanup.
+func newSharedUdpLifecycleTestFlow(t *testing.T, idleTimeout time.Duration) (*Udp4Buffer, *UdpSequence) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	settings := DefaultUdpBufferSettingsWithBufferSize(1)
+	settings.IdleTimeout = idleTimeout
+	settings.SharedSocketLifecycle = true
+	settings.ReceiveShardCount = 1
+	settings.Log = NewNoopLogger()
+	buffer := NewUdp4Buffer(ctx, nil, settings)
+	source := SourceId(NewId())
+	sequence := NewUdpSequence(
+		ctx, nil, source, protocol.ProvideMode_Network, 4,
+		net.IPv4(192, 0, 2, 1).To4(), 42000,
+		net.IPv4(198, 51, 100, 1).To4(), 44000,
+		settings,
+	)
+	sequence.sharedSocketLifecycle = true
+	sequence.sharedLifecycleWake = buffer.sharedLifecycleWake
+	bufferId := NewBufferId4(source, sequence.sourceIp, int(sequence.sourcePort),
+		sequence.destinationIp, int(sequence.destinationPort))
+	buffer.sequences[bufferId] = sequence
+	buffer.sourceSequences[source] = map[BufferId4]*UdpSequence{bufferId: sequence}
+	buffer.sharedLifecycleWaitGroup.Add(1)
+	go func() {
+		defer buffer.sharedLifecycleWaitGroup.Done()
+		buffer.runSharedSocketLifecycle()
+	}()
+	t.Cleanup(func() {
+		cancel()
+		buffer.waitForLifecycle()
+	})
+	buffer.wakeSharedSocketLifecycle()
+	synctest.Wait()
+	return buffer, sequence
+}
+
+// The construction wake must arm a timer that retires the flow at its idle
+// deadline without another wake, backdated activity, or parent cancellation.
+func TestProviderUdpSharedSocketLifecycleExpiresWithoutWake(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		idleTimeout := 100 * time.Millisecond
+		buffer, sequence := newSharedUdpLifecycleTestFlow(t, idleTimeout)
+		time.Sleep(idleTimeout - time.Nanosecond)
+		synctest.Wait()
+		if udpSequenceDone(sequence) {
+			t.Fatal("shared flow expired before its idle deadline")
+		}
+
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+		if !udpSequenceDone(sequence) {
+			t.Fatal("shared idle timer did not expire the flow without another wake")
+		}
+		if err := buffer.ctx.Err(); err != nil {
+			t.Fatalf("parent cancellation caused expiry: %v", err)
+		}
+		buffer.mutex.Lock()
+		sequenceCount := len(buffer.sequences)
+		sourceCount := len(buffer.sourceSequences)
+		buffer.mutex.Unlock()
+		if sequenceCount != 0 || sourceCount != 0 {
+			t.Fatalf("automatic expiry retained indexes: sequences=%d sources=%d", sequenceCount, sourceCount)
+		}
+	})
+}
+
+// Activity moves the deadline without waking the shared worker. Its first
+// timer must observe that progress and rearm itself to the extended deadline.
+func TestProviderUdpSharedSocketLifecycleRearmsAfterActivityWithoutWake(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		idleTimeout := 100 * time.Millisecond
+		buffer, sequence := newSharedUdpLifecycleTestFlow(t, idleTimeout)
+		time.Sleep(idleTimeout / 2)
+		sequence.UpdateLastActivityTime()
+		time.Sleep(idleTimeout / 2)
+		synctest.Wait()
+		if udpSequenceDone(sequence) {
+			t.Fatal("original idle timer ignored subsequent activity")
+		}
+
+		time.Sleep(idleTimeout/2 - time.Nanosecond)
+		synctest.Wait()
+		if udpSequenceDone(sequence) {
+			t.Fatal("shared flow expired before its extended idle deadline")
+		}
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+		if !udpSequenceDone(sequence) {
+			t.Fatal("shared idle timer did not rearm after activity without another wake")
+		}
+		if err := buffer.ctx.Err(); err != nil {
+			t.Fatalf("parent cancellation caused expiry: %v", err)
+		}
+		buffer.mutex.Lock()
+		sequenceCount := len(buffer.sequences)
+		sourceCount := len(buffer.sourceSequences)
+		buffer.mutex.Unlock()
+		if sequenceCount != 0 || sourceCount != 0 {
+			t.Fatalf("extended expiry retained indexes: sequences=%d sources=%d", sequenceCount, sourceCount)
+		}
+	})
 }
 
 func startUdpLoopbackEcho(t *testing.T, ipVersion int) (uint16, func()) {
@@ -57,12 +166,13 @@ func startUdpLoopbackEcho(t *testing.T, ipVersion int) (uint16, func()) {
 func TestProviderUdpSharedSocketLifecyclePreservesOrderAndReaps(t *testing.T) {
 	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
 		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
 		port, closeEcho := startUdpLoopbackEcho(t, ipVersion)
 		defer closeEcho()
 
-		settings := DefaultProviderLocalUserNatSettingsWithMemoryTarget(4 << 20).UdpBufferSettings
-		settings.IdleTimeout = 100 * time.Millisecond
+		settings := DefaultProviderLocalUserNatSettingsWithMemoryTarget(4 * 1024 * 1024).UdpBufferSettings
+		// Keep the flow alive while the real socket reader is scheduled. Idle
+		// expiry is driven explicitly after all ordered responses arrive.
+		settings.IdleTimeout = time.Hour
 		settings.SequenceBufferSize = 8
 		responses := make(chan byte, 128)
 		receive := func(_ TransferPath, _ protocol.ProvideMode, _ *IpPath, packet []byte) {
@@ -70,10 +180,18 @@ func TestProviderUdpSharedSocketLifecyclePreservesOrderAndReaps(t *testing.T) {
 		}
 		if ipVersion == 6 {
 			buffer := NewUdp6Buffer(ctx, receive, settings)
-			testProviderUdpSharedSocketLifecyclePreservesOrderAndReaps(t, ipVersion, port, &buffer.UdpBuffer, buffer.send, responses)
+			defer func() {
+				cancel()
+				buffer.waitForLifecycle()
+			}()
+			testProviderUdpSharedSocketLifecyclePreservesOrderAndReaps(t, ipVersion, port, settings, &buffer.UdpBuffer, buffer.send, responses)
 		} else {
 			buffer := NewUdp4Buffer(ctx, receive, settings)
-			testProviderUdpSharedSocketLifecyclePreservesOrderAndReaps(t, ipVersion, port, &buffer.UdpBuffer, buffer.send, responses)
+			defer func() {
+				cancel()
+				buffer.waitForLifecycle()
+			}()
+			testProviderUdpSharedSocketLifecyclePreservesOrderAndReaps(t, ipVersion, port, settings, &buffer.UdpBuffer, buffer.send, responses)
 		}
 	})
 }
@@ -82,6 +200,7 @@ func testProviderUdpSharedSocketLifecyclePreservesOrderAndReaps[BufferId compara
 	t *testing.T,
 	ipVersion int,
 	port uint16,
+	settings *UdpBufferSettings,
 	buffer *UdpBuffer[BufferId],
 	send udpTestBufferSend,
 	responses chan byte,
@@ -144,11 +263,23 @@ func testProviderUdpSharedSocketLifecyclePreservesOrderAndReaps[BufferId compara
 	}
 	buffer.mutex.Unlock()
 
-	pollUntil(t, 5*time.Second, "shared UDP idle reap", func() bool {
-		buffer.mutex.Lock()
-		defer buffer.mutex.Unlock()
-		return len(buffer.sequences) == 0
-	})
+	activeSequence.userLimited.mutex.Lock()
+	activeSequence.lastActivityTime = time.Now().Add(-2 * settings.IdleTimeout)
+	activeSequence.userLimited.mutex.Unlock()
+	buffer.wakeSharedSocketLifecycle()
+	select {
+	case <-activeSequence.ctx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("shared UDP idle reap did not cancel the expired flow")
+	}
+	// Cancellation occurs inside removal; taking the buffer lock joins the
+	// rest of that transition, including poll registration retirement.
+	buffer.mutex.Lock()
+	sequenceCount := len(buffer.sequences)
+	buffer.mutex.Unlock()
+	if sequenceCount != 0 {
+		t.Fatalf("idle sequence count=%d, want 0", sequenceCount)
+	}
 	for i := range buffer.socketReadPoller.shards {
 		shard := &buffer.socketReadPoller.shards[i]
 		shard.mutex.RLock()

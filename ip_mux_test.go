@@ -352,14 +352,6 @@ func testIpMuxRejectedPumpPoolBalance(t *testing.T, installRejectingUpstream boo
 
 	ctx, cancel := context.WithCancel(context.Background())
 	settings := DefaultTunSettings()
-	settings.DialRace = 1
-	// The dial is only a way to make the stack emit a packet, and it is
-	// cancelled explicitly below once the packet arrives. It must not expire
-	// on its own: raceTunDialContext runs the attempt in a goroutine, and a
-	// budget that elapses before that goroutine reaches gonet.DialContextTCP
-	// makes it return on the already-cancelled context without calling
-	// ep.Connect, so no SYN is ever generated and no later wait can help.
-	settings.DialTimeout = 30 * time.Second
 	tun, err := CreateTun(ctx, settings)
 	if err != nil {
 		cancel()
@@ -386,25 +378,19 @@ func testIpMuxRejectedPumpPoolBalance(t *testing.T, installRejectingUpstream boo
 			return false
 		})
 	}
-
-	// Keep the dial in flight while waiting: a live endpoint retransmits its
-	// SYN, so the wait is bounded by real work rather than by whether one
-	// packet happened to be emitted before the dial was torn down.
-	dialCtx, dialCancel := context.WithCancel(ctx)
-	dialDone := make(chan struct{})
-	go func() {
-		defer close(dialDone)
-		conn, _ := tun.DialContext(dialCtx, "tcp", "192.0.2.1:443")
-		if conn != nil {
-			conn.Close()
-		}
-	}()
-	emitted := waitForCondition(5*time.Second, func() bool {
+	// Exercise the pump's ownership boundary directly. A short Tcp dial can
+	// expire before netstack schedules its Syn on a Cpu-constrained race run.
+	packet := newTunLinkTestPacket(1)
+	result := writeTunLinkPacket(tun.ep, packet)
+	packet.DecRef()
+	if result.n != 1 || result.err != nil {
+		mux.Close()
+		cancel()
+		t.Fatalf("queue pump packet: %d, %v", result.n, result.err)
+	}
+	if !waitForCondition(time.Second, func() bool {
 		return 0 < mux.rejectedPumpPacketCount.Load()
-	})
-	dialCancel()
-	<-dialDone
-	if !emitted {
+	}) {
 		mux.Close()
 		cancel()
 		t.Fatal("internal stack emitted no packet into the rejected upstream")
