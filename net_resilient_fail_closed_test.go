@@ -177,7 +177,6 @@ func readTlsRecords(t *testing.T, r io.Reader, wantPayloadLen int) []byte {
 
 func TestResilientTlsConnFragmentRestoresTtlAndClosesFd(t *testing.T) {
 	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
-		skipIpv6SocketTtl(t, ipVersion)
 		record := buildClientHelloRecord(t)
 		client, server := newTcpPairOnFamily(t, ipVersion)
 		setSocketTtl(t, client, 42)
@@ -209,7 +208,6 @@ func TestResilientTlsConnFragmentRestoresTtlAndClosesFd(t *testing.T) {
 
 func TestResilientTlsConnFragmentFailureDisablesAndRestoresTtl(t *testing.T) {
 	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
-		skipIpv6SocketTtl(t, ipVersion)
 		record := buildClientHelloRecord(t)
 		client, _ := newTcpPairOnFamily(t, ipVersion)
 
@@ -305,7 +303,6 @@ func TestResilientTlsConnOffDrainsPartialRecord(t *testing.T) {
 
 func TestResilientTlsConnReorderOnlyFragmentsOnFailure(t *testing.T) {
 	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
-		skipIpv6SocketTtl(t, ipVersion)
 		record := buildClientHelloRecord(t)
 		client, _ := newTcpPairOnFamily(t, ipVersion)
 
@@ -339,7 +336,6 @@ func TestResilientTlsConnReorderOnlyFragmentsOnFailure(t *testing.T) {
 
 func TestResilientTlsConnReorderOnlySuccessRestoresTtl(t *testing.T) {
 	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
-		skipIpv6SocketTtl(t, ipVersion)
 		record := buildClientHelloRecord(t)
 		client, server := newTcpPairOnFamily(t, ipVersion)
 		setSocketTtl(t, client, 42)

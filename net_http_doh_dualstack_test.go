@@ -43,9 +43,9 @@ func TestDefaultDnsResolverSettingsCarryIpv6(t *testing.T) {
 	}
 }
 
-// With IpVersion 0 the defaults produce an operator-interleaved list, and a
-// caller that replaces the v4 list with its own server gets ONLY that server:
-// the default v6 entries have no partner left and are not dialed.
+// With IpVersion 0 the defaults produce an operator-interleaved list. A
+// leftover v6 entry from the shipped table drops out when its v4 partner is
+// replaced, while a leftover entry the CALLER configured is always kept.
 func TestDohUrlsForDualStackPairsOperators(t *testing.T) {
 	rs := DefaultDnsResolverSettings()
 	urls := dohUrlsFor(rs.RemoteDohUrlsIpv4, rs.RemoteDohUrlsIpv6, 0)
@@ -59,10 +59,30 @@ func TestDohUrlsForDualStackPairsOperators(t *testing.T) {
 		t.Fatalf("urls[%d..%d] = %v, want v4 followed by its v6 sibling", i, i+1, urls[i:i+2])
 	}
 
+	// replacing the v4 list means "use my servers": the shipped v6 defaults are
+	// known-table entries whose v4 partners are now absent, so they drop out
 	custom := "http://127.0.0.1:1/dns-query"
 	only := dohUrlsFor([]string{custom}, rs.RemoteDohUrlsIpv6, 0)
 	if len(only) != 1 || only[0] != custom {
 		t.Fatalf("a replaced v4 list resolved to %v, want only the custom server", only)
+	}
+
+	// a v6-heavy CUSTOM configuration keeps every surplus server: those can
+	// only have come from the caller, and familySiblings can index-pair only
+	// min(len4, len6) of them
+	heavy := dohUrlsFor(
+		[]string{custom},
+		[]string{"http://[::1]:1/dns-query", "http://[::2]:2/dns-query", "http://[::3]:3/dns-query"},
+		0,
+	)
+	wantHeavy := []string{
+		custom,
+		"http://[::1]:1/dns-query",
+		"http://[::2]:2/dns-query",
+		"http://[::3]:3/dns-query",
+	}
+	if !slices.Equal(heavy, wantHeavy) {
+		t.Fatalf("v6-heavy list = %v, want %v (no caller server dropped)", heavy, wantHeavy)
 	}
 
 	// a custom pair outside the table pairs by index

@@ -1394,19 +1394,48 @@ func familySiblings(ipv4 []string, ipv6 []string, known [][2]string) map[string]
 
 // dualStackList is the list a family-agnostic (IpVersion 0) consumer walks:
 // every v4 entry in order, each followed by its v6 sibling, so the families
-// interleave by operator. A v6 entry with no sibling is included only when the
-// v4 list is empty (a pure v6 configuration); with a v4 list it is left out,
-// per familySiblings.
+// interleave by operator.
+//
+// Two kinds of leftover v6 entry are treated differently, and the difference
+// is what makes "start from the defaults and replace the v4 list" behave:
+//
+//   - A KNOWN-TABLE entry whose v4 partner is absent is left out. Those are
+//     the shipped defaults; a caller who replaced the v4 list means "use my
+//     servers", and pulling Cloudflare's v6 endpoint back in would send real
+//     queries to an operator they just removed.
+//   - An entry OUTSIDE the table is kept, at the end. Those can only have come
+//     from the caller, so dropping one would ignore a server they explicitly
+//     configured -- which is what happened to every custom v6 endpoint past
+//     the shorter list's length, since familySiblings can only index-pair
+//     min(len4, len6) of them.
 func dualStackList(ipv4 []string, ipv6 []string, known [][2]string) []string {
 	if len(ipv4) == 0 {
 		return append([]string{}, ipv6...)
 	}
+	inTable := make(map[string]bool, 2*len(known))
+	for _, pair := range known {
+		inTable[pair[0]] = true
+		inTable[pair[1]] = true
+	}
 	siblings := familySiblings(ipv4, ipv6, known)
 	list := make([]string, 0, len(ipv4)+len(ipv6))
-	for _, entry := range ipv4 {
+	emitted := make(map[string]bool, len(ipv4)+len(ipv6))
+	emit := func(entry string) {
+		if emitted[entry] {
+			return
+		}
+		emitted[entry] = true
 		list = append(list, entry)
+	}
+	for _, entry := range ipv4 {
+		emit(entry)
 		if sibling, ok := siblings[entry]; ok {
-			list = append(list, sibling)
+			emit(sibling)
+		}
+	}
+	for _, entry := range ipv6 {
+		if !inTable[entry] {
+			emit(entry)
 		}
 	}
 	return list
