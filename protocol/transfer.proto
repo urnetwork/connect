@@ -202,6 +202,12 @@ message Auth {
     // set by the server only when it accepts the offered envelope version and
     // both QUIC endpoints negotiated RFC 9221 DATAGRAM support.
     uint32 h3_datagram_accepted_version = 5;
+
+    // the address family a family-pinned platform transport intends to prove:
+    // 4 or 6. Zero (absent) is a legacy family-agnostic transport, which the
+    // platform counts as v4. The platform ignores the intent unless the
+    // family it observed the connection arrive on agrees.
+    int32 ip_family = 6;
 }
 
 

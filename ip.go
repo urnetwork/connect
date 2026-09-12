@@ -32,11 +32,25 @@ const defaultIpBufferSize = 1024
 // packets are written directly into the receiver tap/tun interface,
 // so the packet size must not exceed the device interface MTU.
 // this is a contract with the devices and must not be raised.
-// DefaultMtu is shared by every native tunnel interface and the provider-side
-// packetizer. At 1,100 bytes, a full steady-state encrypted IP Transfer frame
-// uses H3's reliable stream at QUIC's safe 1,200-byte packet floor; smaller
-// complete messages that fit one DATAGRAM retain the unordered packet lane.
+// DefaultMtu is the largest packet the provider-side packetizer builds, for
+// both families. At 1,100 bytes, a full steady-state encrypted IP Transfer
+// frame uses H3's reliable stream at QUIC's safe 1,200-byte packet floor and
+// fits one DATAGRAM on the optimistic discovered path; smaller complete
+// messages that fit one DATAGRAM retain the unordered packet lane. IPv6 does
+// not require packets to be 1,280 bytes, only that the link carry them, so
+// the packetizer keeps this size for v6 as well and the link requirement
+// lives in DefaultTunnelMtu.
 const DefaultMtu = 1100
+
+// DefaultTunnelMtu is the interface mtu every native tunnel and the gVisor tun
+// configure. It is 1,280 because Linux, Darwin and gVisor refuse IPv6 on a
+// link below RFC 8200's minimum, and it stays a separate constant from
+// DefaultMtu because raising the packet size would take a full return packet
+// off H3's single-DATAGRAM lane on every real path (see the H3 mtu sizing
+// test). Packets the client originates may be as large as this; the transfer
+// batch bound admits an oversized first frame on its own, and the provider
+// side accepts any size the tun can carry. Must never be below DefaultMtu.
+const DefaultTunnelMtu = 1280
 const Ipv4HeaderSizeWithoutExtensions = 20
 const Ipv6HeaderSize = 40
 const UdpHeaderSize = 8
@@ -1349,14 +1363,36 @@ func sendShard(ipPacket []byte, shardCount int) int {
 				}
 			}
 		case 6:
-			if Ipv6HeaderSize+4 <= len(ipPacket) {
+			if Ipv6HeaderSize <= len(ipPacket) {
 				hashBytes(ipPacket[8:40])
-				if ipProtocolNumber(ipPacket[6]) == ipProtocolNumberIcmp6 {
-					if Ipv6HeaderSize+6 <= len(ipPacket) {
-						hashBytes(ipPacket[Ipv6HeaderSize+4 : Ipv6HeaderSize+6])
+				nextHeader := ipProtocolNumber(ipPacket[6])
+				transportOffset := Ipv6HeaderSize
+				if isIpv6ExtensionHeader(ipPacket[6]) {
+					// walk the chain so a flow with extension headers pins
+					// to the same shard as its plain packets. Every fragment
+					// of one datagram, including the first, pins by the
+					// shared identification: non-first fragments carry no
+					// transport ports.
+					walk, ok := walkIpv6ExtensionHeaders(ipPacket)
+					if !ok {
+						break
 					}
-				} else {
-					hashBytes(ipPacket[Ipv6HeaderSize : Ipv6HeaderSize+4])
+					if walk.fragmented {
+						var identification [4]byte
+						binary.BigEndian.PutUint32(identification[:], walk.fragment.identification)
+						hashBytes(identification[:])
+						break
+					}
+					nextHeader = walk.nextHeader
+					transportOffset = walk.transportOffset
+				}
+				if nextHeader == ipProtocolNumberIcmp6 {
+					// the echo identifier is the flow identity
+					if transportOffset+6 <= len(ipPacket) {
+						hashBytes(ipPacket[transportOffset+4 : transportOffset+6])
+					}
+				} else if transportOffset+4 <= len(ipPacket) {
+					hashBytes(ipPacket[transportOffset : transportOffset+4])
 				}
 			}
 		}
@@ -1368,6 +1404,8 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 	defer self.cancel()
 	ipv4Fragments := newIpv4FragmentReassembler()
 	defer ipv4Fragments.close()
+	ipv6Fragments := newIpv6FragmentReassembler()
+	defer ipv6Fragments.close()
 
 	udp4Buffer := newUdp4BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.UdpBufferSettings)
 	udp6Buffer := newUdp6BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.UdpBufferSettings)
@@ -1501,6 +1539,14 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 					MessagePoolReturn(ipPacket)
 				}
 			case ipProtocolNumberIcmp4:
+				if mtu, embedded, ok := ipParseIcmpv4FragmentationNeeded(transport); ok {
+					// the source is telling us a packet we built toward it
+					// was too big for its path: shrink that flow, then drop
+					// the message itself (nothing to forward)
+					applyPathMtu(source, 4, embedded, mtu, tcp4Buffer, udp4Buffer)
+					MessagePoolReturn(ipPacket)
+					return
+				}
 				if !parseIcmpPacket(4, sourceIp, destinationIp, transport, &icmpPacket) {
 					// unsupported type or malformed, drop
 					MessagePoolReturn(ipPacket)
@@ -1543,6 +1589,10 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 				MessagePoolReturn(ipPacket)
 			}
 		case 6:
+			ipPacket = ipv6Fragments.process(source, transferKey, provideMode, ipPacket)
+			if ipPacket == nil {
+				return
+			}
 			ipProtocol, sourceIp, destinationIp, transport, ok := parseIpv6(ipPacket)
 			if !ok {
 				// malformed, drop
@@ -1611,6 +1661,19 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 					MessagePoolReturn(ipPacket)
 				}
 			case ipProtocolNumberIcmp6:
+				if 0 < len(transport) && isIcmpv6LinkControlType(transport[0]) {
+					// neighbor discovery, router discovery, mld and redirect
+					// are link-local chatter with no meaning across a
+					// point-to-point tunnel: drop silently, never log
+					MessagePoolReturn(ipPacket)
+					return
+				}
+				if mtu, embedded, ok := ipParseIcmpv6PacketTooBig(transport); ok {
+					// see the v4 fragmentation-needed case
+					applyPathMtu(source, 6, embedded, mtu, tcp6Buffer, udp6Buffer)
+					MessagePoolReturn(ipPacket)
+					return
+				}
 				if !parseIcmpPacket(6, sourceIp, destinationIp, transport, &icmpPacket) {
 					// unsupported type or malformed, drop
 					MessagePoolReturn(ipPacket)
@@ -1783,6 +1846,51 @@ func NewBufferId6(source TransferPath, sourceIp net.IP, sourcePort int, destinat
 	}
 }
 
+// the smallest mtu a path-mtu signal may shrink a flow to: the link minimum
+// of each family (rfc 791 §3.2 requires 68 but 576 is the practical floor
+// every stack assumes; rfc 8200 §5 requires 1280)
+const (
+	ipv4MinimumPathMtu = 576
+	ipv6MinimumPathMtu = 1280
+)
+
+func ipMinimumPathMtu(ipVersion int) int {
+	if ipVersion == 6 {
+		return ipv6MinimumPathMtu
+	}
+	return ipv4MinimumPathMtu
+}
+
+// applyPathMtu routes an icmp path-mtu signal from a source to the flow it
+// describes. `embedded` is the packet the source could not carry -- one this
+// NAT built toward the source, so it runs destination->source -- and the flow
+// it belongs to is the reverse tuple. A signal for a flow this NAT does not
+// hold is ignored: a source cannot shrink a flow it does not own.
+func applyPathMtu(
+	source TransferPath,
+	ipVersion int,
+	embedded *IpPath,
+	mtu int,
+	tcpBuffer interface {
+		applyPathMtuFor(TransferPath, *IpPath, int) bool
+	},
+	udpBuffer interface {
+		applyPathMtuFor(TransferPath, *IpPath, int) bool
+	},
+) bool {
+	if embedded == nil || embedded.Version != ipVersion {
+		return false
+	}
+	switch embedded.Protocol {
+	case IpProtocolTcp:
+		return tcpBuffer.applyPathMtuFor(source, embedded, mtu)
+	case IpProtocolUdp:
+		return udpBuffer.applyPathMtuFor(source, embedded, mtu)
+	default:
+		return false
+	}
+}
+
 type UdpBufferSettings struct {
 	// nil resolves to the local user nat `Log`
 	Log                 Logger
@@ -1922,20 +2030,38 @@ func parseIpv4(ipPacket []byte) (ipProtocol ipProtocolNumber, sourceIp net.IP, d
 }
 
 // parses the ipv6 header. the returned slices alias `ipPacket`.
-// extension headers are not walked, matching the previous decode behavior
-// which dropped non tcp/udp next headers.
+// the extension chain is walked (see ip_ipv6_ext.go), so `transport` starts
+// after any hop-by-hop, routing, destination-options or atomic fragment
+// headers and `ipProtocol` is the real upper-layer protocol. a non-atomic
+// fragment fails the parse, mirroring parseIpv4: fragments are reassembled
+// before they reach a parser, and a lone fragment would misparse payload
+// bytes as transport fields.
 func parseIpv6(ipPacket []byte) (ipProtocol ipProtocolNumber, sourceIp net.IP, destinationIp net.IP, transport []byte, ok bool) {
 	if len(ipPacket) < Ipv6HeaderSize {
 		return
 	}
-	payloadByteCount := int(binary.BigEndian.Uint16(ipPacket[4:6]))
-	if len(ipPacket) < Ipv6HeaderSize+payloadByteCount {
-		return
+	var transportOffset int
+	var payloadEnd int
+	if !isIpv6ExtensionHeader(ipPacket[6]) {
+		// the common case, answered without the walk
+		payloadEnd = Ipv6HeaderSize + int(binary.BigEndian.Uint16(ipPacket[4:6]))
+		if len(ipPacket) < payloadEnd {
+			return
+		}
+		ipProtocol = ipProtocolNumber(ipPacket[6])
+		transportOffset = Ipv6HeaderSize
+	} else {
+		walk, walkOk := walkIpv6ExtensionHeaders(ipPacket)
+		if !walkOk || walk.fragmented {
+			return
+		}
+		ipProtocol = walk.nextHeader
+		transportOffset = walk.transportOffset
+		payloadEnd = walk.payloadEnd
 	}
-	ipProtocol = ipProtocolNumber(ipPacket[6])
 	sourceIp = net.IP(ipPacket[8:24])
 	destinationIp = net.IP(ipPacket[24:40])
-	transport = ipPacket[Ipv6HeaderSize : Ipv6HeaderSize+payloadByteCount]
+	transport = ipPacket[transportOffset:payloadEnd]
 	ok = true
 	return
 }
@@ -2330,6 +2456,16 @@ func (self *Udp4Buffer) send(source TransferPath, provideMode protocol.ProvideMo
 }
 
 // Retains the reply lane separately from the UDP flow identity.
+// applyPathMtuFor keys the reverse of `embedded` (a packet this NAT built
+// toward the source) the way sendTransferKey keys the flow.
+func (self *Udp4Buffer) applyPathMtuFor(source TransferPath, embedded *IpPath, mtu int) bool {
+	return self.applyPathMtu(NewBufferId4(
+		source.LocalMask(),
+		embedded.DestinationIp.To4(), embedded.DestinationPort,
+		embedded.SourceIp.To4(), embedded.SourcePort,
+	), mtu)
+}
+
 func (self *Udp4Buffer) sendTransferKey(
 	source TransferPath,
 	transferKey TransferKey,
@@ -2394,6 +2530,16 @@ func (self *Udp6Buffer) send(source TransferPath, provideMode protocol.ProvideMo
 }
 
 // Retains the reply lane separately from the IPv6 flow identity.
+// applyPathMtuFor keys the reverse of `embedded` (a packet this NAT built
+// toward the source) the way sendTransferKey keys the flow.
+func (self *Udp6Buffer) applyPathMtuFor(source TransferPath, embedded *IpPath, mtu int) bool {
+	return self.applyPathMtu(NewBufferId6(
+		source.LocalMask(),
+		embedded.DestinationIp.To16(), embedded.DestinationPort,
+		embedded.SourceIp.To16(), embedded.SourcePort,
+	), mtu)
+}
+
 func (self *Udp6Buffer) sendTransferKey(
 	source TransferPath,
 	transferKey TransferKey,
@@ -2457,6 +2603,19 @@ func newUdpBuffer[BufferId comparable](
 		sourceSequences:     map[TransferPath]map[BufferId]*UdpSequence{},
 		retiredSourceIds:    map[Id]bool{},
 	}
+}
+
+// applyPathMtu shrinks a live flow's path mtu (see applyPathMtu). false
+// when no sequence holds the key.
+func (self *UdpBuffer[BufferId]) applyPathMtu(bufferId BufferId, mtu int) bool {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	sequence, ok := self.sequences[bufferId]
+	if !ok {
+		return false
+	}
+	sequence.applyPathMtu(mtu)
+	return true
 }
 
 func (self *UdpBuffer[BufferId]) udpSend(
@@ -3342,6 +3501,35 @@ type StreamState struct {
 	// before the next call, so the backing can be reused; fragmented payloads
 	// allocate a fresh slice.
 	singleDataPacket [1][]byte
+
+	// pathMtu is the largest packet the source has told us its path toward
+	// it can carry (icmp fragmentation-needed / packet-too-big), or zero when
+	// nothing has been learned. Read by DataPackets, written from the NAT
+	// dispatch goroutine, hence atomic.
+	pathMtu atomic.Int32
+}
+
+// clampPathMtu lowers the configured mtu to a learned path mtu.
+func (self *StreamState) clampPathMtu(mtu int) int {
+	if pathMtu := int(self.pathMtu.Load()); 0 < pathMtu && pathMtu < mtu {
+		return pathMtu
+	}
+	return mtu
+}
+
+// applyPathMtu records a smaller path mtu learned from the source. Never
+// grows an existing value, and never goes below the family minimum.
+func (self *StreamState) applyPathMtu(mtu int) {
+	mtu = max(mtu, ipMinimumPathMtu(self.ipVersion))
+	for {
+		current := self.pathMtu.Load()
+		if current != 0 && int(current) <= mtu {
+			return
+		}
+		if self.pathMtu.CompareAndSwap(current, int32(mtu)) {
+			return
+		}
+	}
 }
 
 // IpPath returns the immutable ip path for this stream. The path is built once
@@ -3381,17 +3569,18 @@ func (self *StreamState) DataPackets(payload []byte, n int, mtu int) ([][]byte, 
 	if 0xffff-Ipv4HeaderSizeWithoutExtensions-UdpHeaderSize < n && self.ipVersion == 4 {
 		return nil, errors.New("UDP payload exceeds the IPv4 packet limit")
 	}
+	mtu = self.clampPathMtu(mtu)
 	if n <= mtu-headerByteCount {
 		// reuse the single-packet backing for the common unfragmented case
 		// (see singleDataPacket); the result is consumed before the next call.
 		self.singleDataPacket[0] = self.udpPacket(payload[0:n])
 		return self.singleDataPacket[:], nil
 	}
+	// splitting one UDP payload into several independent datagrams would
+	// corrupt application framing, so an oversized datagram is fragmented at
+	// the ip layer in both families and reassembled by the source stack
 	if self.ipVersion == 6 {
-		// Splitting one UDP payload into several independent datagrams corrupts
-		// application framing. IPv6 is intentionally not advertised by the
-		// current product, and its Fragment extension is not parsed here.
-		return nil, errors.New("oversized IPv6 UDP datagram is unsupported")
+		return fragmentIpv6Packet(self.udpPacket(payload[:n]), mtu)
 	}
 	return fragmentIpv4Packet(self.udpPacket(payload[:n]), mtu)
 }
@@ -3530,6 +3719,16 @@ func (self *Tcp4Buffer) send(source TransferPath, provideMode protocol.ProvideMo
 }
 
 // Retains the reply lane separately from the TCP flow identity.
+// applyPathMtuFor keys the reverse of `embedded` (a packet this NAT built
+// toward the source) the way sendTransferKey keys the flow.
+func (self *Tcp4Buffer) applyPathMtuFor(source TransferPath, embedded *IpPath, mtu int) bool {
+	return self.applyPathMtu(NewBufferId4(
+		source.LocalMask(),
+		embedded.DestinationIp.To4(), embedded.DestinationPort,
+		embedded.SourceIp.To4(), embedded.SourcePort,
+	), mtu)
+}
+
 func (self *Tcp4Buffer) sendTransferKey(
 	source TransferPath,
 	transferKey TransferKey,
@@ -3594,6 +3793,16 @@ func (self *Tcp6Buffer) send(source TransferPath, provideMode protocol.ProvideMo
 }
 
 // Retains the reply lane separately from the IPv6 flow identity.
+// applyPathMtuFor keys the reverse of `embedded` (a packet this NAT built
+// toward the source) the way sendTransferKey keys the flow.
+func (self *Tcp6Buffer) applyPathMtuFor(source TransferPath, embedded *IpPath, mtu int) bool {
+	return self.applyPathMtu(NewBufferId6(
+		source.LocalMask(),
+		embedded.DestinationIp.To16(), embedded.DestinationPort,
+		embedded.SourceIp.To16(), embedded.SourcePort,
+	), mtu)
+}
+
 func (self *Tcp6Buffer) sendTransferKey(
 	source TransferPath,
 	transferKey TransferKey,
@@ -3657,6 +3866,19 @@ func newTcpBuffer[BufferId comparable](
 		sourceSequences:   map[TransferPath]map[BufferId]*TcpSequence{},
 		retiredSourceIds:  map[Id]bool{},
 	}
+}
+
+// applyPathMtu shrinks a live flow's path mtu (see applyPathMtu). false
+// when no sequence holds the key.
+func (self *TcpBuffer[BufferId]) applyPathMtu(bufferId BufferId, mtu int) bool {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	sequence, ok := self.sequences[bufferId]
+	if !ok {
+		return false
+	}
+	sequence.applyPathMtu(mtu)
+	return true
 }
 
 // allowOrphanRstWithLock applies the orphan rst rate limit. The caller must
@@ -5530,7 +5752,36 @@ type ConnectionState struct {
 	// allocate a fresh slice.
 	singleDataPacket [1][]byte
 
+	// pathMtu is the largest packet the source has told us its path toward
+	// it can carry (icmp fragmentation-needed / packet-too-big), or zero when
+	// nothing has been learned. Read by DataPackets, written from the NAT
+	// dispatch goroutine, hence atomic.
+	pathMtu atomic.Int32
+
 	userLimited
+}
+
+// clampPathMtu lowers the configured mtu to a learned path mtu.
+func (self *ConnectionState) clampPathMtu(mtu int) int {
+	if pathMtu := int(self.pathMtu.Load()); 0 < pathMtu && pathMtu < mtu {
+		return pathMtu
+	}
+	return mtu
+}
+
+// applyPathMtu records a smaller path mtu learned from the source. Never
+// grows an existing value, and never goes below the family minimum.
+func (self *ConnectionState) applyPathMtu(mtu int) {
+	mtu = max(mtu, ipMinimumPathMtu(self.ipVersion))
+	for {
+		current := self.pathMtu.Load()
+		if current != 0 && int(current) <= mtu {
+			return
+		}
+		if self.pathMtu.CompareAndSwap(current, int32(mtu)) {
+			return
+		}
+	}
 }
 
 // IpPath returns the immutable ip path for this connection. The path is
@@ -5692,6 +5943,7 @@ func (self *ConnectionState) DataPackets(payload []byte, n int, mtu int) ([][]by
 		headerByteCount += tcpTimestampOptionByteCount
 	}
 
+	mtu = self.clampPathMtu(mtu)
 	packetByteCount := mtu - headerByteCount
 	if self.peerMss != 0 {
 		optionByteCount := headerByteCount - ipHeaderByteCount - TcpHeaderSizeWithoutExtensions
@@ -7381,8 +7633,8 @@ func (self *RemoteUserNatProvider) inspectReturnPacketsForSender(
 }
 
 // Performs the provider-side return policy on a complete UDP datagram and
-// queues its original IPv4 fragments. The fragments are owned by the caller
-// and transfer to the return item only on success.
+// queues its original ip fragments (either family). The fragments are owned by
+// the caller and transfer to the return item only on success.
 func (self *RemoteUserNatProvider) enqueueFragmentedReturn(
 	source TransferPath,
 	transferKey TransferKey,
@@ -7396,7 +7648,7 @@ func (self *RemoteUserNatProvider) enqueueFragmentedReturn(
 		return false
 	}
 	returnIpPath, err := ParseIpPath(reassembled)
-	if err != nil || returnIpPath.Version != 4 || returnIpPath.Protocol != IpProtocolUdp {
+	if err != nil || returnIpPath.Protocol != IpProtocolUdp {
 		return false
 	}
 	self.smtpIngressGuard.retireReturnForOwner(source.SourceId, returnIpPath)
@@ -7457,16 +7709,16 @@ func (self *RemoteUserNatProvider) receiveTransferBatchWithRecovery(
 		}
 		return
 	}
-	containsIpv4Fragments := false
+	containsFragments := false
 	for _, packet := range packets {
-		if isIpv4FragmentPacket(packet) {
-			containsIpv4Fragments = true
+		if isIpFragmentPacket(packet) {
+			containsFragments = true
 			break
 		}
 	}
-	if containsIpv4Fragments {
+	if containsFragments {
 		for _, packet := range packets {
-			if !isIpv4FragmentPacket(packet) {
+			if !isIpFragmentPacket(packet) {
 				self.receiveTransferWithRecovery(
 					source,
 					transferKey,
@@ -7494,7 +7746,7 @@ func (self *RemoteUserNatProvider) receiveTransferBatchWithRecovery(
 			) {
 				result.fragments = nil
 			}
-			returnIpv4FragmentProcessResult(result)
+			returnIpFragmentProcessResult(result)
 		}
 		return
 	}
@@ -7634,7 +7886,7 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecoveryAndRelease(
 		}
 		return
 	}
-	if isIpv4FragmentPacket(packet) {
+	if isIpFragmentPacket(packet) {
 		result := self.egressIpv4Fragments.processOwned(
 			source,
 			transferKey,
@@ -7652,7 +7904,7 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecoveryAndRelease(
 		) {
 			result.fragments = nil
 		}
-		returnIpv4FragmentProcessResult(result)
+		returnIpFragmentProcessResult(result)
 		return
 	}
 	// the provider's egress is the return into the tunnel (destination->client); the reversed
@@ -7780,7 +8032,7 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 			if err != nil {
 				panic(err)
 			}
-			if isIpv4FragmentPacket(packetBytes) {
+			if isIpFragmentPacket(packetBytes) {
 				result := self.ingressIpv4Fragments.processOwned(
 					source,
 					transferKey,
@@ -7790,7 +8042,7 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 				if result.packet != nil {
 					var ipPath IpPath
 					payload, parseErr := parseIpPathWithPayloadBorrowed(result.packet, &ipPath)
-					if parseErr == nil && ipPath.Version == 4 && ipPath.Protocol == IpProtocolUdp {
+					if parseErr == nil && ipPath.Protocol == IpProtocolUdp {
 						r, inspectErr := inspectAndRefreshIngressForSenderBorrowed(
 							self.securityPolicy,
 							source.SourceId,
@@ -7838,7 +8090,7 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 						}
 					}
 				}
-				returnIpv4FragmentProcessResult(result)
+				returnIpFragmentProcessResult(result)
 				continue
 			}
 
@@ -8155,7 +8407,7 @@ func (self *RemoteUserNatClient) SecurityPolicyStats(reset bool) SecurityPolicyS
 
 // `SendPacketFunction`
 func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool {
-	if isIpv4FragmentPacket(packet) {
+	if isIpFragmentPacket(packet) {
 		result := self.egressIpv4Fragments.processOwned(
 			source,
 			TransferKey{},
@@ -8163,7 +8415,7 @@ func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode pro
 			packet,
 		)
 		if result.packet != nil {
-			if self.sendReassembledIpv4UdpFragments(
+			if self.sendReassembledUdpFragments(
 				source,
 				provideMode,
 				result.packet,
@@ -8174,7 +8426,7 @@ func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode pro
 				result.fragments = nil
 			}
 		}
-		returnIpv4FragmentProcessResult(result)
+		returnIpFragmentProcessResult(result)
 		// Fragment admission consumes the input even when the completed
 		// datagram is rejected by policy. Returning true preserves the
 		// SendPacket ownership contract; block/drop accounting happens at the
@@ -8263,10 +8515,11 @@ func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode pro
 }
 
 // Runs device-side policy once on a complete fragmented UDP datagram, then
-// forwards the original MTU-sized IPv4 fragments as one ordered Transfer
-// group. Other fragmented protocols are rejected; TCP should segment at MSS,
-// and accepting a partial TCP/SMTP header would create a policy-evasion path.
-func (self *RemoteUserNatClient) sendReassembledIpv4UdpFragments(
+// forwards the original MTU-sized ip fragments (either family) as one ordered
+// Transfer group. Other fragmented protocols are rejected; TCP should segment
+// at MSS, and accepting a partial TCP/SMTP header would create a
+// policy-evasion path.
+func (self *RemoteUserNatClient) sendReassembledUdpFragments(
 	source TransferPath,
 	provideMode protocol.ProvideMode,
 	reassembled []byte,
@@ -8277,7 +8530,7 @@ func (self *RemoteUserNatClient) sendReassembledIpv4UdpFragments(
 		return false
 	}
 	ipPath, payload, err := ParseIpPathWithPayload(reassembled)
-	if err != nil || ipPath.Version != 4 || ipPath.Protocol != IpProtocolUdp {
+	if err != nil || ipPath.Protocol != IpProtocolUdp {
 		return false
 	}
 	relationship := egressRelationship(provideMode, self.provideMode)
@@ -8370,7 +8623,7 @@ func (self *RemoteUserNatClient) ClientReceive(source TransferPath, frames []*pr
 			if err != nil {
 				panic(err)
 			}
-			if isIpv4FragmentPacket(packet) {
+			if isIpFragmentPacket(packet) {
 				result := self.ingressIpv4Fragments.processOwned(
 					source,
 					peer.TransferKey,
@@ -8379,7 +8632,7 @@ func (self *RemoteUserNatClient) ClientReceive(source TransferPath, frames []*pr
 				)
 				if result.packet != nil {
 					ipPath, parseErr := ParseIpPath(result.packet)
-					if parseErr == nil && ipPath.Version == 4 && ipPath.Protocol == IpProtocolUdp {
+					if parseErr == nil && ipPath.Protocol == IpProtocolUdp {
 						self.smtpEgressGuard.retireReturn(ipPath)
 						self.securityPolicy.RefreshIngress(ipPath)
 						for _, fragment := range result.fragments {
@@ -8395,7 +8648,7 @@ func (self *RemoteUserNatClient) ClientReceive(source TransferPath, frames []*pr
 						}
 					}
 				}
-				returnIpv4FragmentProcessResult(result)
+				returnIpFragmentProcessResult(result)
 				continue
 			}
 
@@ -8723,6 +8976,11 @@ func parseIcmpIpPathBorrowed(
 	}
 	var icmp parsedIcmp
 	if !parseIcmpPacket(int(ipVersion), sourceIp, destinationIp, transport, &icmp) {
+		if ipVersion == 6 && 0 < len(transport) && isIcmpv6LinkControlType(transport[0]) {
+			// a distinct error so a caller can drop link-local control
+			// chatter (neighbor/router discovery, mld) without logging it
+			return nil, errIcmpv6LinkControl
+		}
 		return nil, fmt.Errorf("Unsupported or malformed icmp packet.")
 	}
 

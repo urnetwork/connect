@@ -3,8 +3,15 @@ package connect
 // a userspace tun device backed by the gvisor network stack.
 // `Tun` exposes a packet interface on one side (`Read`/`Write`) and
 // socket interfaces on the other (`DialContext`, `ListenTCP`, `ListenUDP`).
-// all tun instances share a single gvisor stack, with one nic and one
-// link-local ipv4 address per instance.
+// each tun instance owns a private gvisor stack with one nic, one link-local
+// ipv4 address and, when the link mtu admits it, one ula ipv6 address.
+//
+// Dual stack (IPV6.md C1): the stack carries both families with a default
+// route for each, so a tun can originate and accept v6 flows exactly like v4.
+// gVisor refuses to emit IPv6 on a link narrower than the protocol's minimum
+// MTU (1280, RFC 8200 §5), so a tun whose settings.Mtu is below
+// tunIpv6MinimumMtu keeps IPv4 only: no v6 address, no v6 route, and v6 dials
+// and writes fail with EAFNOSUPPORT as they always did. See Ipv6Enabled.
 
 import (
 	// "bytes"
@@ -19,6 +26,7 @@ import (
 	// "regexp"
 	mathrand "math/rand"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -55,10 +63,12 @@ func DefaultTunSettingsWithBufferSize(bufferSize int) *TunSettings {
 		// queue in milliseconds), so ordinary bulk transfer still sees
 		// backpressure rather than drops.
 		OutboundQueueWaitTimeout: 250 * time.Millisecond,
-		// must match `DefaultMtu`. packets are written directly into the
-		// receiver tap/tun interface, so this must not exceed the device
-		// interface mtu.
-		Mtu: DefaultMtu,
+		// the link mtu, matching the native tunnel interfaces
+		// (`DefaultTunnelMtu`). Packets written into the tun are at most
+		// `DefaultMtu`, which is below this by design. IPv6 needs at least
+		// tunIpv6MinimumMtu here; below that the tun is IPv4 only (see the
+		// file comment).
+		Mtu: DefaultTunnelMtu,
 
 		DialRace:          2,
 		DialRaceTimeout:   2 * time.Second,
@@ -164,10 +174,29 @@ type TcpBufferRange struct {
 	Max     int
 }
 
+// tunIpv6MinimumMtu is the smallest link mtu on which gVisor will emit IPv6
+// (header.IPv6MinimumMTU, 1280). A tun below it is IPv4 only.
+const tunIpv6MinimumMtu = int(header.IPv6MinimumMTU)
+
 func newTunStack(tcpReceive TcpBufferRange, tcpSend TcpBufferRange, tcpMaxRto time.Duration) *stack.Stack {
 	opts := stack.Options{
-		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocolWithOptions(ipv4.Options{AllowExternalLoopbackTraffic: true})},
-		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol4},
+		NetworkProtocols: []stack.NetworkProtocolFactory{
+			ipv4.NewProtocolWithOptions(ipv4.Options{AllowExternalLoopbackTraffic: true}),
+			// the tun is a point-to-point link into the tunnel: there is no
+			// router to solicit and no neighbor to detect a duplicate
+			// address against, and every such probe would otherwise leave
+			// through the tunnel as user traffic (and hold the address
+			// tentative, failing dials, until it timed out)
+			ipv6.NewProtocolWithOptions(ipv6.Options{
+				NDPConfigs: ipv6.NDPConfigurations{
+					MaxRtrSolicitations: 0,
+					HandleRAs:           ipv6.HandlingRAsDisabled,
+				},
+				DADConfigs:                   stack.DADConfigurations{DupAddrDetectTransmits: 0},
+				AllowExternalLoopbackTraffic: true,
+			}),
+		},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol4, icmp.NewProtocol6},
 		HandleLocal:        true,
 	}
 	s := stack.New(opts)
@@ -281,6 +310,89 @@ var defaultLocalIpv4AddressAllocator = sync.OnceValue(func() *LocalIpv4AddressAl
 	)
 })
 
+// LocalIpv6Prefix is the one fixed unique-local /64 (RFC 4193) every tun and
+// native tunnel address in this process lives in: fd75:726e:6574::/64, the
+// hex of "urnet" under fd00::/8. A fixed prefix is the v6 counterpart of the
+// 169.254.0.0/16 pool: nothing on a real network routes it, and both ends of
+// a tunnel can recognize it as tunnel-internal.
+var LocalIpv6Prefix = netip.MustParsePrefix("fd75:726e:6574::/64")
+
+// localIpv6AllocatorPrefix is the low /96 of LocalIpv6Prefix that the tun
+// allocator hands out sequentially. A /96 keeps the address iterator's count
+// inside an int (a /64 has 2^64 hosts, which overflows it to zero).
+var localIpv6AllocatorPrefix = netip.MustParsePrefix("fd75:726e:6574::/96")
+
+// LocalIpv6AddressAllocator is the v6 counterpart of LocalIpv4AddressAllocator:
+// process-unique tun addresses from localIpv6AllocatorPrefix with a bounded
+// free list. Safe for concurrent use.
+type LocalIpv6AddressAllocator struct {
+	stateLock   sync.Mutex
+	generator   *AddrGenerator
+	freeList    []netip.Addr
+	maxFreeList int
+}
+
+func NewLocalIpv6AddressAllocator(prefix netip.Prefix, maxFreeList int) *LocalIpv6AddressAllocator {
+	return &LocalIpv6AddressAllocator{
+		generator:   NewAddrGenerator(prefix),
+		maxFreeList: maxFreeList,
+	}
+}
+
+func (self *LocalIpv6AddressAllocator) TakeAddr() (netip.Addr, bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if n := len(self.freeList); n > 0 {
+		addr := self.freeList[n-1]
+		self.freeList = self.freeList[:n-1]
+		return addr, true
+	}
+	return self.generator.Next()
+}
+
+func (self *LocalIpv6AddressAllocator) ReturnAddr(addr netip.Addr) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if len(self.freeList) >= self.maxFreeList {
+		return
+	}
+	self.freeList = append(self.freeList, addr)
+}
+
+// defaultLocalIpv6AddressAllocator is lazy for the same reason as the v4 one.
+var defaultLocalIpv6AddressAllocator = sync.OnceValue(func() *LocalIpv6AddressAllocator {
+	return NewLocalIpv6AddressAllocator(localIpv6AllocatorPrefix, 128)
+})
+
+// TakeLocalIpv6Address reserves a process-unique local IPv6 address from the
+// tun pool inside LocalIpv6Prefix. Return it with ReturnLocalIpv6Address when
+// the address is no longer in use.
+func TakeLocalIpv6Address() (netip.Addr, bool) {
+	return defaultLocalIpv6AddressAllocator().TakeAddr()
+}
+
+// ReturnLocalIpv6Address returns an address previously taken with
+// TakeLocalIpv6Address to the pool's free list.
+func ReturnLocalIpv6Address(addr netip.Addr) {
+	defaultLocalIpv6AddressAllocator().ReturnAddr(addr)
+}
+
+// RandomLocalIpv6 returns a native tunnel address in LocalIpv6Prefix with a
+// random 64-bit interface identifier outside the tun allocator's /96, the v6
+// counterpart of RandomLocalIpv4. A unique-local address never overlaps a
+// real network the way a 10/8 lease can, so there is nothing to avoid.
+func RandomLocalIpv6() netip.Addr {
+	addr := LocalIpv6Prefix.Masked().Addr().As16()
+	for {
+		mathrand.Read(addr[8:])
+		candidate := netip.AddrFrom16(addr)
+		// keep clear of the subnet anycast address and the tun pool
+		if candidate != LocalIpv6Prefix.Masked().Addr() && !localIpv6AllocatorPrefix.Contains(candidate) {
+			return candidate
+		}
+	}
+}
+
 // TakeLocalIpv4Address reserves a process-unique local IPv4 address from the default
 // 169.254.0.0/16 pool shared by Tun and the SDK tunnel address. Return it with
 // ReturnLocalIpv4Address when the address is no longer in use.
@@ -370,6 +482,10 @@ type Tun struct {
 	nicIdAllocator            *NicIdAllocator
 	localAddresses            []netip.Addr
 	localIpv4AddressAllocator *LocalIpv4AddressAllocator
+	localIpv6AddressAllocator *LocalIpv6AddressAllocator
+	// ipv6Enabled is whether the stack carries IPv6: a v6 address and default
+	// route exist. False when settings.Mtu is below tunIpv6MinimumMtu.
+	ipv6Enabled bool
 	// mtu                 int
 	// registeredAddresses map[netip.Addr]bool
 	dohResolver atomic.Pointer[DohCache]
@@ -413,31 +529,62 @@ type tunTcpInboundShard struct {
 }
 
 // tcpInboundFlow parses the endpoint identity and stable shard of a complete,
-// unfragmented IPv4 TCP packet.
+// unfragmented IPv4 or IPv6 TCP packet. A v6 packet whose next header is an
+// extension header is not a flow here: the in-process NAT writes plain
+// headers, so such a packet is not one whose finite-burst handoff this shard
+// machinery exists to protect.
 func tcpInboundFlow(packet []byte) (stack.TransportEndpointID, int, bool) {
-	if len(packet) < header.IPv4MinimumSize || packet[0]>>4 != 4 || packet[9] != uint8(header.TCPProtocolNumber) {
+	if len(packet) < header.IPv4MinimumSize {
 		return stack.TransportEndpointID{}, 0, false
 	}
-	ipHeaderByteCount := int(packet[0]&0x0f) * 4
-	if ipHeaderByteCount < header.IPv4MinimumSize ||
-		len(packet) < ipHeaderByteCount+header.TCPMinimumSize ||
-		binary.BigEndian.Uint16(packet[6:8])&0x1fff != 0 {
+	var transport []byte
+	var endpointId stack.TransportEndpointID
+	var flowHash uint32
+	switch packet[0] >> 4 {
+	case 4:
+		if packet[9] != uint8(header.TCPProtocolNumber) {
+			return stack.TransportEndpointID{}, 0, false
+		}
+		ipHeaderByteCount := int(packet[0]&0x0f) * 4
+		if ipHeaderByteCount < header.IPv4MinimumSize ||
+			len(packet) < ipHeaderByteCount+header.TCPMinimumSize ||
+			binary.BigEndian.Uint16(packet[6:8])&0x1fff != 0 {
+			return stack.TransportEndpointID{}, 0, false
+		}
+		transport = packet[ipHeaderByteCount:]
+		endpointId.LocalAddress = tcpip.AddrFrom4Slice(packet[16:20])
+		endpointId.RemoteAddress = tcpip.AddrFrom4Slice(packet[12:16])
+		flowHash = binary.BigEndian.Uint32(packet[12:16]) ^ binary.BigEndian.Uint32(packet[16:20])
+	case 6:
+		if len(packet) < header.IPv6MinimumSize+header.TCPMinimumSize ||
+			packet[6] != uint8(header.TCPProtocolNumber) {
+			return stack.TransportEndpointID{}, 0, false
+		}
+		transport = packet[header.IPv6MinimumSize:]
+		endpointId.LocalAddress = tcpip.AddrFrom16Slice(packet[24:40])
+		endpointId.RemoteAddress = tcpip.AddrFrom16Slice(packet[8:24])
+		for offset := 8; offset < 40; offset += 4 {
+			flowHash ^= binary.BigEndian.Uint32(packet[offset : offset+4])
+		}
+	default:
 		return stack.TransportEndpointID{}, 0, false
 	}
-	transport := packet[ipHeaderByteCount:]
 	localPort := binary.BigEndian.Uint16(transport[2:4])
 	remotePort := binary.BigEndian.Uint16(transport[0:2])
-	endpointId := stack.TransportEndpointID{
-		LocalPort:     localPort,
-		LocalAddress:  tcpip.AddrFrom4Slice(packet[16:20]),
-		RemotePort:    remotePort,
-		RemoteAddress: tcpip.AddrFrom4Slice(packet[12:16]),
-	}
-	flowHash := uint32(localPort)<<16 | uint32(remotePort)
-	flowHash ^= binary.BigEndian.Uint32(packet[12:16])
-	flowHash ^= binary.BigEndian.Uint32(packet[16:20])
+	endpointId.LocalPort = localPort
+	endpointId.RemotePort = remotePort
+	flowHash ^= uint32(localPort)<<16 | uint32(remotePort)
 	flowHash ^= flowHash >> 16
 	return endpointId, int(flowHash & (tunTcpInboundShardCount - 1)), true
+}
+
+// tcpInboundNetworkProtocol is the network protocol an inbound flow's
+// endpoint was registered under, read off the endpoint id's address width.
+func tcpInboundNetworkProtocol(endpointId stack.TransportEndpointID) tcpip.NetworkProtocolNumber {
+	if endpointId.LocalAddress.Len() == header.IPv6AddressSize {
+		return ipv6.ProtocolNumber
+	}
+	return ipv4.ProtocolNumber
 }
 
 // addTcpInboundEndpointWithLock records an endpoint once in the current
@@ -473,7 +620,7 @@ func (self *Tun) synchronizeTcpInboundProcessorsWithLock(shard *tunTcpInboundSha
 	for endpointIndex := 0; endpointIndex < shard.endpointCount; endpointIndex += 1 {
 		endpointId := shard.endpointIds[endpointIndex]
 		stackEndpoint := self.stack.FindTransportEndpoint(
-			ipv4.ProtocolNumber,
+			tcpInboundNetworkProtocol(endpointId),
 			tcp.ProtocolNumber,
 			endpointId,
 			self.nicId,
@@ -629,11 +776,24 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 
 	nicIdAllocator := defaultNicIdAllocator
 	localIpv4AddressAllocator := defaultLocalIpv4AddressAllocator()
+	localIpv6AddressAllocator := defaultLocalIpv6AddressAllocator()
 
 	localIpv4Address, ok := localIpv4AddressAllocator.TakeAddr()
 	if !ok {
 		cancel()
 		return nil, fmt.Errorf("No more local addresses")
+	}
+
+	// IPv6 rides only a link wide enough for it (see the file comment)
+	ipv6Enabled := tunIpv6MinimumMtu <= settings.Mtu
+	var localIpv6Address netip.Addr
+	if ipv6Enabled {
+		localIpv6Address, ok = localIpv6AddressAllocator.TakeAddr()
+		if !ok {
+			localIpv4AddressAllocator.ReturnAddr(localIpv4Address)
+			cancel()
+			return nil, fmt.Errorf("No more local ipv6 addresses")
+		}
 	}
 
 	nicId := nicIdAllocator.TakeNicId()
@@ -643,8 +803,13 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 	// closed Tun's connection endpoints, leaking them under Tun churn.)
 	tunStackInstance := newTunStack(settings.TcpReceiveBuffer, settings.TcpSendBuffer, settings.TcpMaxRto)
 
+	// v4 first: consumers that predate dual stack read the tun's address
+	// from the head of this list
 	localAddresses := []netip.Addr{
 		localIpv4Address,
+	}
+	if ipv6Enabled {
+		localAddresses = append(localAddresses, localIpv6Address)
 	}
 
 	ep := newTunLinkEndpoint(
@@ -661,6 +826,8 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 		for _, addr := range localAddresses {
 			if addr.Is4() {
 				localIpv4AddressAllocator.ReturnAddr(addr)
+			} else {
+				localIpv6AddressAllocator.ReturnAddr(addr)
 			}
 		}
 		cancel()
@@ -677,6 +844,8 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 		nicIdAllocator:            nicIdAllocator,
 		localAddresses:            localAddresses,
 		localIpv4AddressAllocator: localIpv4AddressAllocator,
+		localIpv6AddressAllocator: localIpv6AddressAllocator,
+		ipv6Enabled:               ipv6Enabled,
 	}
 
 	tun.dohResolver.Store(tun.buildDohCache(dnsResolverSettings, settings.DohRequestTimeout))
@@ -705,10 +874,36 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 		}
 	}
 	tun.stack.AddRoute(tcpip.Route{Destination: header.IPv4EmptySubnet, NIC: nicId})
+	if ipv6Enabled {
+		// ::/0 routes the same way as 0.0.0.0/0: everything leaves the nic
+		tun.stack.AddRoute(tcpip.Route{Destination: header.IPv6EmptySubnet, NIC: nicId})
+	} else if tun.log.V(1).Enabled() {
+		tun.log.Infof("[tun]ipv6 disabled: mtu %d is below the ipv6 minimum %d\n", settings.Mtu, tunIpv6MinimumMtu)
+	}
 
 	tun.gro.Init(settings.TcpGro)
 
 	return tun, nil
+}
+
+// Ipv6Enabled reports whether this tun carries IPv6: a v6 local address and
+// default route exist, so v6 packets are accepted and v6 dials are made.
+// False when the link mtu is below tunIpv6MinimumMtu.
+func (self *Tun) Ipv6Enabled() bool {
+	return self.ipv6Enabled
+}
+
+// injectNetworkProtocol maps a packet's version nibble to the network protocol
+// it is injected under, or false for a version this tun does not carry.
+func (self *Tun) injectNetworkProtocol(version byte) (tcpip.NetworkProtocolNumber, bool) {
+	switch version {
+	case 4:
+		return header.IPv4ProtocolNumber, true
+	case 6:
+		return header.IPv6ProtocolNumber, self.ipv6Enabled
+	default:
+		return 0, false
+	}
 }
 
 func (self *Tun) DohCache() *DohCache {
@@ -878,8 +1073,9 @@ func (self *Tun) WriteBatch(packets [][]byte) (int, error) {
 		if len(packet) == 0 {
 			continue
 		}
-		if packet[0]>>4 != 4 {
-			// ipv4-only tun, matching write()
+		networkProtocol, ok := self.injectNetworkProtocol(packet[0] >> 4)
+		if !ok {
+			// a version this tun does not carry, matching write()
 			continue
 		}
 
@@ -896,7 +1092,7 @@ func (self *Tun) WriteBatch(packets [][]byte) (int, error) {
 		pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{
 			Payload: buffer.MakeWithData(packet),
 		})
-		pkb.NetworkProtocolNumber = header.IPv4ProtocolNumber
+		pkb.NetworkProtocolNumber = networkProtocol
 		// the trusted in-process NAT computed these checksums; skipping GRO's
 		// re-validation matches the link's CapabilityRXChecksumOffload
 		pkb.RXChecksumValidated = true
@@ -978,29 +1174,28 @@ func (self *Tun) write(packet []byte, onRelease func()) (int, error) {
 	// endpoints do. Without this release, every inbound packet and its copied
 	// payload remain live for the process lifetime.
 
-	switch packet[0] >> 4 {
-	case 4:
-		self.ep.InjectInbound(header.IPv4ProtocolNumber, pkb)
-		pkb.DecRef()
-		if tcpInbound {
-			// A one-packet callback is itself a complete finite burst. Complete
-			// gVisor's user-unlock handoff before returning: deferred execution
-			// can strand a short H1/TLS response behind an unrelated shard or a
-			// worker scheduling delay, and the provider NAT cannot retransmit it.
-			self.synchronizeTcpInboundProcessorsWithLock(tcpInboundShard)
-			if yieldProcessor {
-				runtime.Gosched()
-			}
-			tcpInboundShard.writeLock.Unlock()
-		}
-		return len(packet), nil
-	default:
+	networkProtocol, ok := self.injectNetworkProtocol(packet[0] >> 4)
+	if !ok {
 		pkb.DecRef()
 		if tcpInbound {
 			tcpInboundShard.writeLock.Unlock()
 		}
 		return 0, syscall.EAFNOSUPPORT
 	}
+	self.ep.InjectInbound(networkProtocol, pkb)
+	pkb.DecRef()
+	if tcpInbound {
+		// A one-packet callback is itself a complete finite burst. Complete
+		// gVisor's user-unlock handoff before returning: deferred execution
+		// can strand a short H1/TLS response behind an unrelated shard or a
+		// worker scheduling delay, and the provider NAT cannot retransmit it.
+		self.synchronizeTcpInboundProcessorsWithLock(tcpInboundShard)
+		if yieldProcessor {
+			runtime.Gosched()
+		}
+		tcpInboundShard.writeLock.Unlock()
+	}
+	return len(packet), nil
 }
 
 func (self *Tun) convertToFullAddr(endpoint netip.AddrPort) (tcpip.FullAddress, tcpip.NetworkProtocolNumber) {
@@ -1035,8 +1230,10 @@ func (self *Tun) dialCtx(ctx context.Context) (context.Context, context.CancelFu
 func (self *Tun) ListenTCP(addr *net.TCPAddr) (*gonet.TCPListener, error) {
 	var addrPort netip.AddrPort
 	if addr != nil {
+		// Unmap: a 16-byte net.IP holding a v4 address must bind the v4
+		// endpoint, not a v4-mapped v6 one
 		ip, _ := netip.AddrFromSlice(addr.IP)
-		addrPort = netip.AddrPortFrom(ip, uint16(addr.Port))
+		addrPort = netip.AddrPortFrom(ip.Unmap(), uint16(addr.Port))
 	}
 	fa, pn := self.convertToFullAddr(addrPort)
 	return gonet.ListenTCP(self.stack, fa, pn)
@@ -1046,7 +1243,7 @@ func (self *Tun) ListenUDP(laddr *net.UDPAddr) (*gonet.UDPConn, error) {
 	var addrPort netip.AddrPort
 	if laddr != nil {
 		ip, _ := netip.AddrFromSlice(laddr.IP)
-		addrPort = netip.AddrPortFrom(ip, uint16(laddr.Port))
+		addrPort = netip.AddrPortFrom(ip.Unmap(), uint16(laddr.Port))
 	}
 	lfa, pn := self.convertToFullAddr(addrPort)
 	return self.dialUdp(&lfa, nil, pn)
@@ -1217,9 +1414,27 @@ func raceTunDialContext(
 	}
 }
 
+// dialContext is one attempt of the stream/datagram dial through this tun's
+// stack (raceTunDialContext may run several). A name resolves through the
+// tun's DoH cache for the families the network permits, A and AAAA
+// concurrently, and a stream dial races the addresses v6-first with the
+// package fallback delay (net_dial_race.go). A datagram dial cannot be raced
+// (connect always succeeds) and takes the first v4 address, else the first
+// address. Family-specific networks and literals are honored: a v6 target on
+// an IPv4-only tun is EAFNOSUPPORT.
+//
 // safe to call from multiple goroutines
 func (self *Tun) dialContext(ctx context.Context, network string, address string) (net.Conn, error) {
-	if network == "tcp6" || network == "udp6" {
+	var stream bool
+	switch network {
+	case "tcp", "tcp4", "tcp6":
+		stream = true
+	case "udp", "udp4", "udp6":
+		stream = false
+	default:
+		return nil, fmt.Errorf("Unsupported network %s", network)
+	}
+	if strings.HasSuffix(network, "6") && !self.ipv6Enabled {
 		return nil, syscall.EAFNOSUPPORT
 	}
 
@@ -1235,70 +1450,88 @@ func (self *Tun) dialContext(ctx context.Context, network string, address string
 		return nil, fmt.Errorf("invalid port %q", portStr)
 	}
 
-	parsedAddr, parsedAddrErr := netip.ParseAddr(host)
-	if parsedAddrErr == nil {
-		parsedAddr = parsedAddr.Unmap()
-		if !parsedAddr.Is4() {
-			return nil, syscall.EAFNOSUPPORT
-		}
-	}
 	dialCtx, dialCtxCancel := self.dialCtx(ctx)
 	defer dialCtxCancel()
 
 	var addrs []netip.Addr
-	if parsedAddrErr == nil {
-		// address is ip:port
-		addrs = append(addrs, parsedAddr)
+	if literal, literalErr := netip.ParseAddr(host); literalErr == nil {
+		// address is ip:port: no resolution, and the family is settled
+		literal = literal.Unmap()
+		if literal.Is6() && !self.ipv6Enabled {
+			return nil, syscall.EAFNOSUPPORT
+		}
+		if strings.HasSuffix(network, "4") && !literal.Is4() || strings.HasSuffix(network, "6") && !literal.Is6() {
+			return nil, syscall.EAFNOSUPPORT
+		}
+		addrs = []netip.Addr{literal}
 	} else {
-		// Remote providers currently forward IPv4 only. Resolve A records so
-		// an internal dial cannot select an IPv6 address that will blackhole at
-		// the provider.
-		addrs = append(addrs, self.DohCache().Query(dialCtx, "A", host)...)
+		resolveNetwork := network
+		if !self.ipv6Enabled {
+			// an IPv4-only tun must not resolve an address it cannot dial
+			resolveNetwork = strings.TrimRight(network, "46") + "4"
+		}
+		addrs, err = resolveDohDialAddrs(dialCtx, self.DohCache(), resolveNetwork, host)
 		if self.log.V(1).Enabled() {
-			self.log.Infof("[tun]query doh (%s) found %v\n", host, addrs)
+			self.log.Infof("[tun]query doh (%s) found %v err=%v\n", host, addrs, err)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("Could not resolve %s: %w", address, err)
 		}
 	}
-
 	if len(addrs) == 0 {
 		return nil, fmt.Errorf("Could not resolve %s", address)
 	}
 
-	addr := addrs[mathrand.Intn(len(addrs))]
-	addrPort := netip.AddrPortFrom(addr, uint16(port))
-
-	switch network {
-	case "tcp", "tcp4":
-		fa, pn := self.convertToFullAddr(addrPort)
-		conn, err := gonet.DialContextTCP(dialCtx, self.stack, fa, pn)
-		if err == nil {
-			if self.log.V(1).Enabled() {
-				self.log.Infof("[tun]tcp connect (%s)->%s success\n", host, addrPort)
-			}
-			return conn, nil
-		}
-		if self.log.V(1).Enabled() {
-			self.log.Infof("[tun]tcp connect (%s)->%s err = %s\n", host, addrPort, err)
-		}
-		return nil, err
-	case "udp", "udp4":
-		fa, pn := self.convertToFullAddr(addrPort)
-		conn, err := self.dialUdp(nil, &fa, pn)
-		if err == nil {
-			if self.log.V(1).Enabled() {
-				self.log.Infof("[tun]udp connect (%s)->%s success\n", host, addrPort)
-			}
-			return conn, nil
-		}
-		if self.log.V(1).Enabled() {
-			self.log.Infof("[tun]tcp connect (%s)->%s err = %s\n", host, addrPort, err)
-		}
-		return nil, err
-	default:
-		return nil, fmt.Errorf("Unsupported network %s", network)
+	if stream {
+		return dialAddrsRace(dialCtx, addrs, DefaultDialFallbackDelay, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
+			return self.dialTcpAddr(ctx, host, netip.AddrPortFrom(addr, uint16(port)))
+		})
 	}
-	// }
+	return self.dialUdpAddr(host, netip.AddrPortFrom(udpDialAddr(addrs), uint16(port)))
+}
 
-	// return nil, returnErr
+// udpDialAddr picks the one address a datagram dial uses: the first v4
+// address when there is one, since nothing can prove a v6 path before the
+// first reply, else the first address.
+func udpDialAddr(addrs []netip.Addr) netip.Addr {
+	for _, addr := range addrs {
+		if addr.Is4() {
+			return addr
+		}
+	}
+	return addrs[0]
+}
+
+// dialTcpAddr is one stream connect through the stack to a resolved address.
+func (self *Tun) dialTcpAddr(ctx context.Context, host string, addrPort netip.AddrPort) (net.Conn, error) {
+	fa, pn := self.convertToFullAddr(addrPort)
+	conn, err := gonet.DialContextTCP(ctx, self.stack, fa, pn)
+	if err == nil {
+		if self.log.V(1).Enabled() {
+			self.log.Infof("[tun]tcp connect (%s)->%s success\n", host, addrPort)
+		}
+		return conn, nil
+	}
+	if self.log.V(1).Enabled() {
+		self.log.Infof("[tun]tcp connect (%s)->%s err = %s\n", host, addrPort, err)
+	}
+	return nil, err
+}
+
+// dialUdpAddr is one datagram connect through the stack to a resolved address.
+func (self *Tun) dialUdpAddr(host string, addrPort netip.AddrPort) (net.Conn, error) {
+	fa, pn := self.convertToFullAddr(addrPort)
+	conn, err := self.dialUdp(nil, &fa, pn)
+	if err == nil {
+		if self.log.V(1).Enabled() {
+			self.log.Infof("[tun]udp connect (%s)->%s success\n", host, addrPort)
+		}
+		return conn, nil
+	}
+	if self.log.V(1).Enabled() {
+		self.log.Infof("[tun]udp connect (%s)->%s err = %s\n", host, addrPort, err)
+	}
+	return nil, err
 }
 
 func (self *Tun) Dial(network, address string) (net.Conn, error) {
@@ -1319,6 +1552,8 @@ func (self *Tun) Close() error {
 		for _, addr := range self.localAddresses {
 			if addr.Is4() {
 				self.localIpv4AddressAllocator.ReturnAddr(addr)
+			} else {
+				self.localIpv6AddressAllocator.ReturnAddr(addr)
 			}
 		}
 		// destroy this Tun's stack so its endpoints and background goroutines are released.

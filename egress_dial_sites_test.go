@@ -29,7 +29,8 @@ var allowedRawDialSites = map[string]map[string]string{
 	},
 	"egress_dial.go": {
 		"net.DefaultResolver": "the context-aware no-egress path inside resolveEgressUDPAddr itself, " +
-			"resolving to a list so pickControlIPAddr can honor the family policy",
+			"resolving to a list so pickControlIPAddr can honor the family policy; and dialResolver, " +
+			"the same fallback for the hostname dial race in ConnectSettings.DialContext",
 	},
 	"ice_resolve_net.go": {
 		"net.DefaultResolver": "the lifecycle-aware fallback inside the per-peer egress resolver",

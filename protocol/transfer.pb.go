@@ -963,8 +963,13 @@ type Auth struct {
 	// set by the server only when it accepts the offered envelope version and
 	// both QUIC endpoints negotiated RFC 9221 DATAGRAM support.
 	H3DatagramAcceptedVersion uint32 `protobuf:"varint,5,opt,name=h3_datagram_accepted_version,json=h3DatagramAcceptedVersion,proto3" json:"h3_datagram_accepted_version,omitempty"`
-	unknownFields             protoimpl.UnknownFields
-	sizeCache                 protoimpl.SizeCache
+	// the address family a family-pinned platform transport intends to prove:
+	// 4 or 6. Zero (absent) is a legacy family-agnostic transport, which the
+	// platform counts as v4. The platform ignores the intent unless the
+	// family it observed the connection arrive on agrees.
+	IpFamily      int32 `protobuf:"varint,6,opt,name=ip_family,json=ipFamily,proto3" json:"ip_family,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Auth) Reset() {
@@ -1028,6 +1033,13 @@ func (x *Auth) GetH3DatagramVersion() uint32 {
 func (x *Auth) GetH3DatagramAcceptedVersion() uint32 {
 	if x != nil {
 		return x.H3DatagramAcceptedVersion
+	}
+	return 0
+}
+
+func (x *Auth) GetIpFamily() int32 {
+	if x != nil {
+		return x.IpFamily
 	}
 	return 0
 }
@@ -2689,7 +2701,7 @@ const file_transfer_proto_rawDesc = "" +
 	"\x04_tagB\x16\n" +
 	"\x14_missing_contract_id\"\"\n" +
 	"\x03Tag\x12\x1b\n" +
-	"\tsend_time\x18\x01 \x01(\x04R\bsendTime\"\xd0\x01\n" +
+	"\tsend_time\x18\x01 \x01(\x04R\bsendTime\"\xed\x01\n" +
 	"\x04Auth\x12\x15\n" +
 	"\x06by_jwt\x18\x01 \x01(\tR\x05byJwt\x12\x1f\n" +
 	"\vapp_version\x18\x02 \x01(\tR\n" +
@@ -2697,7 +2709,8 @@ const file_transfer_proto_rawDesc = "" +
 	"\vinstance_id\x18\x03 \x01(\fR\n" +
 	"instanceId\x12.\n" +
 	"\x13h3_datagram_version\x18\x04 \x01(\rR\x11h3DatagramVersion\x12?\n" +
-	"\x1ch3_datagram_accepted_version\x18\x05 \x01(\rR\x19h3DatagramAcceptedVersion\"4\n" +
+	"\x1ch3_datagram_accepted_version\x18\x05 \x01(\rR\x19h3DatagramAcceptedVersion\x12\x1b\n" +
+	"\tip_family\x18\x06 \x01(\x05R\bipFamily\"4\n" +
 	"\aProvide\x12)\n" +
 	"\x04keys\x18\x01 \x03(\v2\x15.bringyour.ProvideKeyR\x04keys\"f\n" +
 	"\n" +

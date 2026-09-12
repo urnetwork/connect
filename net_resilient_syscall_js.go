@@ -14,16 +14,17 @@ func duplicateSocketHandle(conn *net.TCPConn) (SocketHandle, func(), error) {
 }
 
 func GetSocketTtl(fd SocketHandle) int {
-	// not supported
-	return 0
+	// not supported: socketTtlUnreadable keeps every caller on the
+	// single-unmodified-write fallback
+	return socketTtlUnreadable
 }
 
 // SetSocketTtl reports that the TTL cannot be set. There is no socket option
 // surface under js/wasm, and returning nil would claim the low TTL was applied
 // when nothing happened, so the reorder technique would look live when it is
 // not. Nothing in the resilient path reaches here: GetSocketTtl above returns
-// 0, and both reorder branches bail out to a single unmodified write on
-// nativeTtl <= 0 before any SetSocketTtl call. The unsupported error is for any
+// socketTtlUnreadable, and both reorder branches bail out to a single
+// unmodified write before any SetSocketTtl call. The unsupported error is for any
 // other caller.
 func SetSocketTtl(fd SocketHandle, ttl int) error {
 	// not supported

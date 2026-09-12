@@ -17,6 +17,13 @@ import (
 // Reassembly is deliberately small and local to one NAT send shard. It is not
 // a general-purpose fragment cache: the limits below bound both benign bursts
 // and adversarial incomplete datagrams.
+//
+// The IPv6 half (Fragment extension header, RFC 8200) lives in
+// ip_ipv6_fragment.go with the same bounds. The family-agnostic surface --
+// isIpFragmentPacket, ipFragmentGate, ipFragmentProcessResult and
+// returnIpFragmentProcessResult -- dispatches to whichever reassembler the
+// packet version needs; the pre-dual-stack v4 names are kept as aliases for
+// callers that still gate on isIpv4FragmentPacket.
 const (
 	ipv4FragmentReassemblyTimeout          = 15 * time.Second
 	ipv4FragmentReassemblyMaxDatagrams     = 16
@@ -64,7 +71,9 @@ type ipv4FragmentReassembler struct {
 	retainedByteCount int
 }
 
-type ipv4FragmentProcessResult struct {
+// ipFragmentProcessResult is the result of processing one packet through a
+// fragment gate, for either family.
+type ipFragmentProcessResult struct {
 	// packet is the complete packet: the original input for an unfragmented
 	// packet or a new owned reassembly for a completed fragment set.
 	packet []byte
@@ -75,26 +84,49 @@ type ipv4FragmentProcessResult struct {
 	accepted  bool
 }
 
-// ipv4FragmentGate serializes a zero-value fragment cache for callers whose
-// packet entry points may run concurrently. LocalUserNat uses one cache per
-// already-serialized send shard and does not pay this lock.
-type ipv4FragmentGate struct {
-	mutex       sync.Mutex
-	reassembler *ipv4FragmentReassembler
+// the pre-dual-stack name
+type ipv4FragmentProcessResult = ipFragmentProcessResult
+
+// ipFragmentGate serializes zero-value fragment caches, one per family, for
+// callers whose packet entry points may run concurrently. LocalUserNat uses
+// one cache per already-serialized send shard and does not pay this lock.
+type ipFragmentGate struct {
+	mutex        sync.Mutex
+	reassembler4 *ipv4FragmentReassembler
+	reassembler6 *ipv6FragmentReassembler
 }
 
-func (self *ipv4FragmentGate) processOwned(
+// the pre-dual-stack name
+type ipv4FragmentGate = ipFragmentGate
+
+// processOwned reassembles a fragment of either family. An unfragmented
+// packet comes back unchanged; a completed datagram comes back with the
+// original fragment owners attached (see ipFragmentProcessResult).
+func (self *ipFragmentGate) processOwned(
 	source TransferPath,
 	transferKey TransferKey,
 	provideMode protocol.ProvideMode,
 	packet []byte,
-) ipv4FragmentProcessResult {
+) ipFragmentProcessResult {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
-	if self.reassembler == nil {
-		self.reassembler = newIpv4FragmentReassembler()
+	if 0 < len(packet) && packet[0]>>4 == 6 {
+		if self.reassembler6 == nil {
+			self.reassembler6 = newIpv6FragmentReassembler()
+		}
+		return self.reassembler6.processResultAt(
+			source,
+			transferKey,
+			provideMode,
+			packet,
+			time.Now(),
+			true,
+		)
 	}
-	return self.reassembler.processResultAt(
+	if self.reassembler4 == nil {
+		self.reassembler4 = newIpv4FragmentReassembler()
+	}
+	return self.reassembler4.processResultAt(
 		source,
 		transferKey,
 		provideMode,
@@ -104,12 +136,16 @@ func (self *ipv4FragmentGate) processOwned(
 	)
 }
 
-func (self *ipv4FragmentGate) close() {
+func (self *ipFragmentGate) close() {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
-	if self.reassembler != nil {
-		self.reassembler.close()
-		self.reassembler = nil
+	if self.reassembler4 != nil {
+		self.reassembler4.close()
+		self.reassembler4 = nil
+	}
+	if self.reassembler6 != nil {
+		self.reassembler6.close()
+		self.reassembler6 = nil
 	}
 }
 
@@ -125,11 +161,32 @@ func isIpv4FragmentPacket(packet []byte) bool {
 		binary.BigEndian.Uint16(packet[6:8])&0x3fff != 0
 }
 
-func returnIpv4FragmentProcessResult(result ipv4FragmentProcessResult) {
+// isIpFragmentPacket reports whether the packet is a fragment of either
+// family that must be reassembled before it is parsed.
+func isIpFragmentPacket(packet []byte) bool {
+	if len(packet) == 0 {
+		return false
+	}
+	switch packet[0] >> 4 {
+	case 4:
+		return isIpv4FragmentPacket(packet)
+	case 6:
+		return isIpv6FragmentPacket(packet)
+	default:
+		return false
+	}
+}
+
+func returnIpFragmentProcessResult(result ipFragmentProcessResult) {
 	MessagePoolReturn(result.packet)
 	for _, fragment := range result.fragments {
 		MessagePoolReturn(fragment)
 	}
+}
+
+// the pre-dual-stack name
+func returnIpv4FragmentProcessResult(result ipFragmentProcessResult) {
+	returnIpFragmentProcessResult(result)
 }
 
 // process consumes packet only when it is an IPv4 fragment. An unfragmented
@@ -168,13 +225,13 @@ func (self *ipv4FragmentReassembler) processResultAt(
 	packet []byte,
 	now time.Time,
 	retainCompletedFragments bool,
-) ipv4FragmentProcessResult {
+) ipFragmentProcessResult {
 	if len(packet) < Ipv4HeaderSizeWithoutExtensions || packet[0]>>4 != 4 {
-		return ipv4FragmentProcessResult{packet: packet, accepted: true}
+		return ipFragmentProcessResult{packet: packet, accepted: true}
 	}
 	flagsAndOffset := binary.BigEndian.Uint16(packet[6:8])
 	if flagsAndOffset&0x3fff == 0 {
-		return ipv4FragmentProcessResult{packet: packet, accepted: true}
+		return ipFragmentProcessResult{packet: packet, accepted: true}
 	}
 
 	self.expire(now)
@@ -189,10 +246,10 @@ func (self *ipv4FragmentReassembler) processResultAt(
 	copy(key.sourceIp[:], packet[12:16])
 	copy(key.destinationIp[:], packet[16:20])
 
-	drop := func() ipv4FragmentProcessResult {
+	drop := func() ipFragmentProcessResult {
 		self.releaseDatagram(key)
 		MessagePoolReturn(packet)
-		return ipv4FragmentProcessResult{fragment: true}
+		return ipFragmentProcessResult{fragment: true}
 	}
 
 	// The reserved flag is invalid. gVisor marks locally fragmented datagrams
@@ -222,12 +279,12 @@ func (self *ipv4FragmentReassembler) processResultAt(
 		packetCost := cap(packet)
 		if ipv4FragmentReassemblyMaxRetainedBytes < packetCost {
 			MessagePoolReturn(packet)
-			return ipv4FragmentProcessResult{fragment: true}
+			return ipFragmentProcessResult{fragment: true}
 		}
 		for self.retainedByteCount+packetCost > ipv4FragmentReassemblyMaxRetainedBytes {
 			if !self.releaseOldestDatagram(ipv4FragmentKey{}) {
 				MessagePoolReturn(packet)
-				return ipv4FragmentProcessResult{fragment: true}
+				return ipFragmentProcessResult{fragment: true}
 			}
 		}
 		datagram = &ipv4FragmentDatagram{
@@ -250,7 +307,7 @@ func (self *ipv4FragmentReassembler) processResultAt(
 			if bytes.Equal(fragmentPayload, retained.payload()) {
 				MessagePoolReturn(packet)
 				datagram.updatedAt = now
-				return ipv4FragmentProcessResult{fragment: true, accepted: true}
+				return ipFragmentProcessResult{fragment: true, accepted: true}
 			}
 			return drop()
 		}
@@ -301,7 +358,7 @@ func (self *ipv4FragmentReassembler) processResultAt(
 	self.retainedByteCount += cap(packet)
 
 	if datagram.firstHeaderByteCount == 0 || datagram.finalPayloadByteCount < 0 {
-		return ipv4FragmentProcessResult{fragment: true, accepted: true}
+		return ipFragmentProcessResult{fragment: true, accepted: true}
 	}
 	slices.SortFunc(datagram.fragments, func(a ipv4RetainedFragment, b ipv4RetainedFragment) int {
 		if a.offset < b.offset {
@@ -315,12 +372,12 @@ func (self *ipv4FragmentReassembler) processResultAt(
 	position := 0
 	for _, fragment := range datagram.fragments {
 		if fragment.offset != position {
-			return ipv4FragmentProcessResult{fragment: true, accepted: true}
+			return ipFragmentProcessResult{fragment: true, accepted: true}
 		}
 		position += fragment.payloadByteCount
 	}
 	if position != datagram.finalPayloadByteCount {
-		return ipv4FragmentProcessResult{fragment: true, accepted: true}
+		return ipFragmentProcessResult{fragment: true, accepted: true}
 	}
 
 	packetByteCount := datagram.firstHeaderByteCount + datagram.finalPayloadByteCount
@@ -362,7 +419,7 @@ func (self *ipv4FragmentReassembler) processResultAt(
 			writeIpv4HeaderChecksum(packet[:headerByteCount])
 			fragments[i] = packet
 		}
-		return ipv4FragmentProcessResult{
+		return ipFragmentProcessResult{
 			packet:    reassembled,
 			fragments: fragments,
 			fragment:  true,
@@ -370,7 +427,7 @@ func (self *ipv4FragmentReassembler) processResultAt(
 		}
 	}
 	self.releaseDatagram(key)
-	return ipv4FragmentProcessResult{
+	return ipFragmentProcessResult{
 		packet:   reassembled,
 		fragment: true,
 		accepted: true,

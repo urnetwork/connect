@@ -91,7 +91,11 @@ func TestIpOosUnreachableUdpV6(t *testing.T) {
 // still comes out as a tcp rst rather than an icmp -- which is what the old
 // builder-level assertion actually protected.
 func TestIpOosUnreachableTcpUnchanged(t *testing.T) {
-	ipPath := udpTestPath(4)
+	forEachIpVersion(t, testIpOosUnreachableTcpUnchanged)
+}
+
+func testIpOosUnreachableTcpUnchanged(t *testing.T, ipVersion int) {
+	ipPath := udpTestPath(ipVersion)
 	ipPath.Protocol = IpProtocolTcp
 
 	// the builder now produces the dial-failure signal for tcp
@@ -116,8 +120,12 @@ func TestIpOosUnreachableTcpUnchanged(t *testing.T) {
 // the setting must be an honest switch: off reproduces the previous behavior
 // exactly, where udp had no teardown signal at all
 func TestTeardownSourcePacketRespectsSetting(t *testing.T) {
-	udpPath := udpTestPath(4)
-	tcpPath := udpTestPath(4)
+	forEachIpVersion(t, testTeardownSourcePacketRespectsSetting)
+}
+
+func testTeardownSourcePacketRespectsSetting(t *testing.T, ipVersion int) {
+	udpPath := udpTestPath(ipVersion)
+	tcpPath := udpTestPath(ipVersion)
 	tcpPath.Protocol = IpProtocolTcp
 
 	on := &RemoteUserNatMultiClient{settings: &MultiClientSettings{UdpTeardownSignal: true}}

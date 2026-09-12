@@ -91,11 +91,18 @@ type testingPlatformServer struct {
 
 func newTestingPlatformServer(t *testing.T) *testingPlatformServer {
 	t.Helper()
+	return newTestingPlatformServerIpVersion(t, 4)
+}
+
+// newTestingPlatformServerIpVersion binds the platform to the loopback of the
+// family under test, so the transport dials it over that family.
+func newTestingPlatformServerIpVersion(t *testing.T, ipVersion int) *testingPlatformServer {
+	t.Helper()
 	platform := &testingPlatformServer{}
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool { return true },
 	}
-	platform.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	platform.server = newTestingLoopbackHttpServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if platform.rejecting.Load() {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
@@ -125,7 +132,7 @@ func newTestingPlatformServer(t *testing.T) *testingPlatformServer {
 				platform.dataMessages.Add(1)
 			}
 		}
-	}))
+	}), false)
 	platform.url = "ws" + strings.TrimPrefix(platform.server.URL, "http")
 	t.Cleanup(func() {
 		// close the live connections first so the handlers return; httptest
@@ -214,22 +221,24 @@ func testingWaitForActiveMode(transport *PlatformTransport, want TransportMode, 
 // loop — which subscribes before it reads — parked on its very first iteration
 // and the active mode stayed TransportModeNone for the entire process lifetime.
 func TestPlatformTransportConnectsAndElects(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	platform := newTestingPlatformServer(t)
-	transport := testingPlatformTransport(t, ctx, platform.url, testingPlatformTransportSettings())
+		platform := newTestingPlatformServerIpVersion(t, ipVersion)
+		transport := testingPlatformTransport(t, ctx, platform.url, testingPlatformTransportSettings())
 
-	if !waitForCondition(15*time.Second, func() bool {
-		return 0 < platform.connectCount.Load()
-	}) {
-		t.Fatal("the transport never connected to the platform")
-	}
+		if !waitForCondition(15*time.Second, func() bool {
+			return 0 < platform.connectCount.Load()
+		}) {
+			t.Fatal("the transport never connected to the platform")
+		}
 
-	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
-		mode, _ := transport.activeMode()
-		t.Fatalf("active mode = %q, want h1: the connected transport was never elected", mode)
-	}
+		if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+			mode, _ := transport.activeMode()
+			t.Fatalf("active mode = %q, want h1: the connected transport was never elected", mode)
+		}
+	})
 }
 
 func TestPlatformWebSocketAckAndPacketBurstsCoalesce(t *testing.T) {
@@ -371,150 +380,158 @@ func BenchmarkPlatformWebSocketOrdinaryReadyDrain(b *testing.B) {
 }
 
 func TestPlatformTransportOptionalH1AckPriorityLaneWritesAndUnregisters(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	platform := newTestingPlatformServer(t)
-	settings := testingPlatformTransportSettings()
-	settings.H1AckPriorityBufferSize = 8
-	connectedRoute := make(chan Route, 1)
-	settings.SendRouteObserver = func(_ Transport, route Route, connected bool) {
-		if connected {
-			select {
-			case connectedRoute <- route:
-			default:
+		platform := newTestingPlatformServerIpVersion(t, ipVersion)
+		settings := testingPlatformTransportSettings()
+		settings.H1AckPriorityBufferSize = 8
+		connectedRoute := make(chan Route, 1)
+		settings.SendRouteObserver = func(_ Transport, route Route, connected bool) {
+			if connected {
+				select {
+				case connectedRoute <- route:
+				default:
+				}
 			}
 		}
-	}
-	transport := testingPlatformTransport(t, ctx, platform.url, settings)
-	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
-		t.Fatal("the H1 transport was never elected")
-	}
+		transport := testingPlatformTransport(t, ctx, platform.url, settings)
+		if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+			t.Fatal("the H1 transport was never elected")
+		}
 
-	var route Route
-	select {
-	case route = <-connectedRoute:
-	case <-time.After(time.Second):
-		t.Fatal("H1 send route was not observed")
-	}
-	priorityRoute, ok := h1AckPriorityRoute(route)
-	if !ok || cap(priorityRoute) != settings.H1AckPriorityBufferSize {
-		t.Fatalf("priority route = (%v, %t), want capacity %d", priorityRoute, ok, settings.H1AckPriorityBufferSize)
-	}
-	message := MessagePoolGet(64)
-	priorityRoute <- message
-	if !waitForCondition(time.Second, func() bool {
-		return 0 < platform.dataMessages.Load()
-	}) {
-		t.Fatal("H1 writer did not drain the ACK priority lane")
-	}
+		var route Route
+		select {
+		case route = <-connectedRoute:
+		case <-time.After(time.Second):
+			t.Fatal("H1 send route was not observed")
+		}
+		priorityRoute, ok := h1AckPriorityRoute(route)
+		if !ok || cap(priorityRoute) != settings.H1AckPriorityBufferSize {
+			t.Fatalf("priority route = (%v, %t), want capacity %d", priorityRoute, ok, settings.H1AckPriorityBufferSize)
+		}
+		message := MessagePoolGet(64)
+		priorityRoute <- message
+		if !waitForCondition(time.Second, func() bool {
+			return 0 < platform.dataMessages.Load()
+		}) {
+			t.Fatal("H1 writer did not drain the ACK priority lane")
+		}
 
-	closeCtx, closeCancel := context.WithTimeout(context.Background(), time.Second)
-	defer closeCancel()
-	if err := transport.CloseAndWait(closeCtx); err != nil {
-		t.Fatalf("close H1 priority transport: %v", err)
-	}
-	if _, ok := h1AckPriorityRoute(route); ok {
-		t.Fatal("H1 ACK priority route remained registered after transport close")
-	}
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), time.Second)
+		defer closeCancel()
+		if err := transport.CloseAndWait(closeCtx); err != nil {
+			t.Fatalf("close H1 priority transport: %v", err)
+		}
+		if _, ok := h1AckPriorityRoute(route); ok {
+			t.Fatal("H1 ACK priority route remained registered after transport close")
+		}
+	})
 }
 
 func TestPlatformTransportDefaultDoesNotRegisterH1AckPriorityLane(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	platform := newTestingPlatformServer(t)
-	settings := testingPlatformTransportSettings()
-	connectedRoute := make(chan Route, 1)
-	settings.SendRouteObserver = func(_ Transport, route Route, connected bool) {
-		if connected {
-			select {
-			case connectedRoute <- route:
-			default:
+		platform := newTestingPlatformServerIpVersion(t, ipVersion)
+		settings := testingPlatformTransportSettings()
+		connectedRoute := make(chan Route, 1)
+		settings.SendRouteObserver = func(_ Transport, route Route, connected bool) {
+			if connected {
+				select {
+				case connectedRoute <- route:
+				default:
+				}
 			}
 		}
-	}
-	transport := testingPlatformTransport(t, ctx, platform.url, settings)
-	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
-		t.Fatal("the H1 transport was never elected")
-	}
-	select {
-	case route := <-connectedRoute:
-		if _, ok := h1AckPriorityRoute(route); ok {
-			t.Fatal("default/server transport unexpectedly registered an ACK priority lane")
+		transport := testingPlatformTransport(t, ctx, platform.url, settings)
+		if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+			t.Fatal("the H1 transport was never elected")
 		}
-	case <-time.After(time.Second):
-		t.Fatal("H1 send route was not observed")
-	}
+		select {
+		case route := <-connectedRoute:
+			if _, ok := h1AckPriorityRoute(route); ok {
+				t.Fatal("default/server transport unexpectedly registered an ACK priority lane")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("H1 send route was not observed")
+		}
+	})
 }
 
 func TestPlatformTransportH1RejectsOversizedWebSocketMessage(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	platform := newTestingPlatformServer(t)
-	settings := testingPlatformTransportSettings()
-	settings.H1MaxMessageByteCount = 64
-	transport := testingPlatformTransport(t, ctx, platform.url, settings)
-	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
-		t.Fatal("the H1 transport was never elected")
-	}
-	connectCount := platform.connectCount.Load()
-	platform.sendBinary(make([]byte, settings.H1MaxMessageByteCount+1))
-	if !waitForCondition(15*time.Second, func() bool {
-		return connectCount < platform.connectCount.Load()
-	}) {
-		t.Fatal("oversized WebSocket message did not close and replace the H1 connection")
-	}
+		platform := newTestingPlatformServerIpVersion(t, ipVersion)
+		settings := testingPlatformTransportSettings()
+		settings.H1MaxMessageByteCount = 64
+		transport := testingPlatformTransport(t, ctx, platform.url, settings)
+		if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+			t.Fatal("the H1 transport was never elected")
+		}
+		connectCount := platform.connectCount.Load()
+		platform.sendBinary(make([]byte, settings.H1MaxMessageByteCount+1))
+		if !waitForCondition(15*time.Second, func() bool {
+			return connectCount < platform.connectCount.Load()
+		}) {
+			t.Fatal("oversized WebSocket message did not close and replace the H1 connection")
+		}
+	})
 }
 
 func TestPlatformTransportInactiveDrainIgnoresH1ControlTraffic(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	platform := newTestingPlatformServer(t)
-	settings := testingPlatformTransportSettings()
-	settings.ModePreferences = map[TransportMode]int{
-		TransportModeH3: 1,
-		TransportModeH1: 2,
-	}
-	settings.InactiveDrainTimeout = 80 * time.Millisecond
-	settings.InactiveDrainMaxTimeout = 2 * time.Second
-	settings.PingTimeout = 10 * time.Millisecond
-	transport := testingPlatformTransport(t, ctx, platform.url, settings)
-	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
-		t.Fatal("the H1 transport was never elected")
-	}
-	connectCount := platform.connectCount.Load()
-
-	// Empty inbound messages and the transport's frequent outbound keepalives
-	// are control traffic. Neither may extend the payload-only quiet drain once
-	// a strictly better mode supersedes H1.
-	stopPings := make(chan struct{})
-	pingsDone := make(chan struct{})
-	defer func() {
-		close(stopPings)
-		<-pingsDone
-	}()
-	go func() {
-		defer close(pingsDone)
-		ticker := time.NewTicker(5 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stopPings:
-				return
-			case <-ticker.C:
-				platform.sendBinary(nil)
-			}
+		platform := newTestingPlatformServerIpVersion(t, ipVersion)
+		settings := testingPlatformTransportSettings()
+		settings.ModePreferences = map[TransportMode]int{
+			TransportModeH3: 1,
+			TransportModeH1: 2,
 		}
-	}()
-	transport.setActiveMode(TransportModeH3)
-	if !waitForCondition(750*time.Millisecond, func() bool {
-		return connectCount < platform.connectCount.Load()
-	}) {
-		t.Fatal("H1 control traffic prevented the superseded carrier from draining")
-	}
+		settings.InactiveDrainTimeout = 80 * time.Millisecond
+		settings.InactiveDrainMaxTimeout = 2 * time.Second
+		settings.PingTimeout = 10 * time.Millisecond
+		transport := testingPlatformTransport(t, ctx, platform.url, settings)
+		if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+			t.Fatal("the H1 transport was never elected")
+		}
+		connectCount := platform.connectCount.Load()
+
+		// Empty inbound messages and the transport's frequent outbound keepalives
+		// are control traffic. Neither may extend the payload-only quiet drain once
+		// a strictly better mode supersedes H1.
+		stopPings := make(chan struct{})
+		pingsDone := make(chan struct{})
+		defer func() {
+			close(stopPings)
+			<-pingsDone
+		}()
+		go func() {
+			defer close(pingsDone)
+			ticker := time.NewTicker(5 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopPings:
+					return
+				case <-ticker.C:
+					platform.sendBinary(nil)
+				}
+			}
+		}()
+		transport.setActiveMode(TransportModeH3)
+		if !waitForCondition(750*time.Millisecond, func() bool {
+			return connectCount < platform.connectCount.Load()
+		}) {
+			t.Fatal("H1 control traffic prevented the superseded carrier from draining")
+		}
+	})
 }
 
 // TestPlatformTransportActiveModeIsNotDrained pins the watchdog's semantics: the
@@ -539,62 +556,66 @@ func TestPlatformTransportInactiveDrainIgnoresH1ControlTraffic(t *testing.T) {
 // isolate the watchdog from the read deadline, so it observes the drain decision
 // on its own rather than whichever timer happens to fire first.
 func TestPlatformTransportActiveModeIsNotDrained(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	platform := newTestingPlatformServer(t)
-	settings := testingPlatformTransportSettings()
-	transport := testingPlatformTransport(t, ctx, platform.url, settings)
+		platform := newTestingPlatformServerIpVersion(t, ipVersion)
+		settings := testingPlatformTransportSettings()
+		transport := testingPlatformTransport(t, ctx, platform.url, settings)
 
-	// wait for the connection, deliberately NOT for the election: the drain is a
-	// property of the live socket, so this measures the production symptom (a
-	// transport tearing its own connection down while idle) rather than depending
-	// on how the elected mode is published
-	if !waitForCondition(15*time.Second, func() bool {
-		return 0 < platform.connectCount.Load()
-	}) {
-		t.Fatal("the transport never connected to the platform")
-	}
-	connectCount := platform.connectCount.Load()
+		// wait for the connection, deliberately NOT for the election: the drain is a
+		// property of the live socket, so this measures the production symptom (a
+		// transport tearing its own connection down while idle) rather than depending
+		// on how the elected mode is published
+		if !waitForCondition(15*time.Second, func() bool {
+			return 0 < platform.connectCount.Load()
+		}) {
+			t.Fatal("the transport never connected to the platform")
+		}
+		connectCount := platform.connectCount.Load()
 
-	// idle well past the drain timeout. a transport that believes it is inactive
-	// cancels its own connection here, and reconnects, over and over
-	select {
-	case <-time.After(5 * settings.InactiveDrainTimeout):
-	}
+		// idle well past the drain timeout. a transport that believes it is inactive
+		// cancels its own connection here, and reconnects, over and over
+		select {
+		case <-time.After(5 * settings.InactiveDrainTimeout):
+		}
 
-	if reconnects := platform.connectCount.Load() - connectCount; 0 < reconnects {
-		t.Fatalf(
-			"the transport reconnected %d times while idle: it drained itself, believing it was not the active mode",
-			reconnects,
-		)
-	}
-	// it stayed up because it knows it is the active transport, so the watchdog
-	// sits on its benign branch instead of arming the kill timer
-	if mode, _ := transport.activeMode(); mode != TransportModeH1 {
-		t.Fatalf("active mode = %q after idling, want h1", mode)
-	}
+		if reconnects := platform.connectCount.Load() - connectCount; 0 < reconnects {
+			t.Fatalf(
+				"the transport reconnected %d times while idle: it drained itself, believing it was not the active mode",
+				reconnects,
+			)
+		}
+		// it stayed up because it knows it is the active transport, so the watchdog
+		// sits on its benign branch instead of arming the kill timer
+		if mode, _ := transport.activeMode(); mode != TransportModeH1 {
+			t.Fatalf("active mode = %q after idling, want h1", mode)
+		}
+	})
 }
 
 // TestPlatformTransportSendsRepeatedIdleKeepalives verifies both the initial
 // reusable writer timer and its reset after firing.
 func TestPlatformTransportSendsRepeatedIdleKeepalives(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	platform := newTestingPlatformServer(t)
-	settings := testingPlatformTransportSettings()
-	settings.PingTimeout = 20 * time.Millisecond
-	transport := testingPlatformTransport(t, ctx, platform.url, settings)
+		platform := newTestingPlatformServerIpVersion(t, ipVersion)
+		settings := testingPlatformTransportSettings()
+		settings.PingTimeout = 20 * time.Millisecond
+		transport := testingPlatformTransport(t, ctx, platform.url, settings)
 
-	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
-		t.Fatal("the transport was never elected")
-	}
-	if !waitForCondition(2*time.Second, func() bool {
-		return 2 <= platform.emptyMessages.Load()
-	}) {
-		t.Fatalf("idle keepalive count = %d, want at least 2", platform.emptyMessages.Load())
-	}
+		if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+			t.Fatal("the transport was never elected")
+		}
+		if !waitForCondition(2*time.Second, func() bool {
+			return 2 <= platform.emptyMessages.Load()
+		}) {
+			t.Fatalf("idle keepalive count = %d, want at least 2", platform.emptyMessages.Load())
+		}
+	})
 }
 
 // TestPlatformTransportModeFallsBackOnDisconnect: when the last available mode
@@ -605,23 +626,25 @@ func TestPlatformTransportSendsRepeatedIdleKeepalives(t *testing.T) {
 // unreachable, because orderedModes is the key set of a constant map. So a
 // disconnected transport left the active mode pinned to its stale value.
 func TestPlatformTransportModeFallsBackOnDisconnect(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	platform := newTestingPlatformServer(t)
-	transport := testingPlatformTransport(t, ctx, platform.url, testingPlatformTransportSettings())
+		platform := newTestingPlatformServerIpVersion(t, ipVersion)
+		transport := testingPlatformTransport(t, ctx, platform.url, testingPlatformTransportSettings())
 
-	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
-		t.Fatal("the transport was never elected")
-	}
+		if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+			t.Fatal("the transport was never elected")
+		}
 
-	// the platform goes away: the transport disconnects and cannot reconnect
-	platform.down()
+		// the platform goes away: the transport disconnects and cannot reconnect
+		platform.down()
 
-	if !testingWaitForActiveMode(transport, TransportModeNone, 15*time.Second) {
-		mode, _ := transport.activeMode()
-		t.Fatalf("active mode = %q after the transport disconnected, want none", mode)
-	}
+		if !testingWaitForActiveMode(transport, TransportModeNone, 15*time.Second) {
+			mode, _ := transport.activeMode()
+			t.Fatalf("active mode = %q after the transport disconnected, want none", mode)
+		}
+	})
 }
 
 // TestNetworkChangeKicksPlatformTransport pins the network-change path: a
@@ -629,90 +652,94 @@ func TestPlatformTransportModeFallsBackOnDisconnect(t *testing.T) {
 // re-dials immediately (the host's path-update signal, not a server drop).
 // Adapted from upstream main e05ecee's TestPlatformTransportNetworkChangeKick.
 func TestNetworkChangeKicksPlatformTransport(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	platform := newTestingPlatformServer(t)
-	transport := testingPlatformTransport(t, ctx, platform.url, testingPlatformTransportSettings())
+		platform := newTestingPlatformServerIpVersion(t, ipVersion)
+		transport := testingPlatformTransport(t, ctx, platform.url, testingPlatformTransportSettings())
 
-	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
-		t.Fatal("the transport was never elected")
-	}
-	connectCount := platform.connectCount.Load()
+		if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+			t.Fatal("the transport was never elected")
+		}
+		connectCount := platform.connectCount.Load()
 
-	// the host reports a network path change
-	NetworkChanged()
+		// the host reports a network path change
+		NetworkChanged()
 
-	if !waitForCondition(15*time.Second, func() bool {
-		return connectCount < platform.connectCount.Load()
-	}) {
-		t.Fatal("the transport did not re-dial after a network change")
-	}
-	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
-		mode, _ := transport.activeMode()
-		t.Fatalf("active mode = %q after network change, want h1", mode)
-	}
+		if !waitForCondition(15*time.Second, func() bool {
+			return connectCount < platform.connectCount.Load()
+		}) {
+			t.Fatal("the transport did not re-dial after a network change")
+		}
+		if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+			mode, _ := transport.activeMode()
+			t.Fatalf("active mode = %q after network change, want h1", mode)
+		}
 
-	// closing the transport unsubscribes it: a later broadcast must not panic
-	// or kick a dead transport
-	transport.Close()
-	NetworkChanged()
+		// closing the transport unsubscribes it: a later broadcast must not panic
+		// or kick a dead transport
+		transport.Close()
+		NetworkChanged()
+	})
 }
 
 // TestKickSkipsDialFailureBackoff: a kick that arrives while the transport is
 // waiting out a failed-dial backoff re-dials immediately instead of waiting,
 // and the re-dial takes the reconnect fast path (hadConnection semantics).
 func TestKickSkipsDialFailureBackoff(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	platform := newTestingPlatformServer(t)
-	settings := testingPlatformTransportSettings()
-	// make the backoff long enough that only a kick can plausibly beat it
-	settings.ReconnectTimeout = 60 * time.Second
-	transport := testingPlatformTransport(t, ctx, platform.url, settings)
-	defer transport.Close()
+		platform := newTestingPlatformServerIpVersion(t, ipVersion)
+		settings := testingPlatformTransportSettings()
+		// make the backoff long enough that only a kick can plausibly beat it
+		settings.ReconnectTimeout = 60 * time.Second
+		transport := testingPlatformTransport(t, ctx, platform.url, settings)
+		defer transport.Close()
 
-	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
-		t.Fatal("the transport was never elected")
-	}
-
-	// reject dials so the run loop lands in the dial-failure backoff, then
-	// drop the live connection to force the re-dial that will fail
-	platform.rejecting.Store(true)
-	platform.closeConns()
-	if !waitForCondition(15*time.Second, func() bool {
-		return !transport.IsConnected()
-	}) {
-		t.Fatal("the transport never observed the drop")
-	}
-	// let the failing re-dial complete and park in the 60s backoff
-	time.Sleep(500 * time.Millisecond)
-
-	platform.rejecting.Store(false)
-	connectCount := platform.connectCount.Load()
-	// kick periodically rather than once: a kick that lands while the failing
-	// dial is still in flight is deliberately dropped (the backoff select arms
-	// a fresh notify channel), and re-kicking is exactly what a host emitting
-	// repeated path updates does. every wait here is still far below the 60s
-	// backoff the kick must beat.
-	kicked := false
-	for deadline := time.Now().Add(15 * time.Second); time.Now().Before(deadline); {
-		transport.Kick()
-		if waitForCondition(250*time.Millisecond, func() bool {
-			return connectCount < platform.connectCount.Load()
-		}) {
-			kicked = true
-			break
+		if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+			t.Fatal("the transport was never elected")
 		}
-	}
-	if !kicked {
-		t.Fatal("the kick did not break the transport out of its dial backoff")
-	}
-	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
-		mode, _ := transport.activeMode()
-		t.Fatalf("active mode = %q after kicked re-dial, want h1", mode)
-	}
+
+		// reject dials so the run loop lands in the dial-failure backoff, then
+		// drop the live connection to force the re-dial that will fail
+		platform.rejecting.Store(true)
+		platform.closeConns()
+		if !waitForCondition(15*time.Second, func() bool {
+			return !transport.IsConnected()
+		}) {
+			t.Fatal("the transport never observed the drop")
+		}
+		// let the failing re-dial complete and park in the 60s backoff
+		time.Sleep(500 * time.Millisecond)
+
+		platform.rejecting.Store(false)
+		connectCount := platform.connectCount.Load()
+		// kick periodically rather than once: a kick that lands while the failing
+		// dial is still in flight is deliberately dropped (the backoff select arms
+		// a fresh notify channel), and re-kicking is exactly what a host emitting
+		// repeated path updates does. every wait here is still far below the 60s
+		// backoff the kick must beat.
+		kicked := false
+		for deadline := time.Now().Add(15 * time.Second); time.Now().Before(deadline); {
+			transport.Kick()
+			if waitForCondition(250*time.Millisecond, func() bool {
+				return connectCount < platform.connectCount.Load()
+			}) {
+				kicked = true
+				break
+			}
+		}
+		if !kicked {
+			t.Fatal("the kick did not break the transport out of its dial backoff")
+		}
+		if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+			mode, _ := transport.activeMode()
+			t.Fatalf("active mode = %q after kicked re-dial, want h1", mode)
+		}
+	})
 }
 
 // TestPlatformTransportReconnects: after the platform drops a connection the
@@ -722,60 +749,64 @@ func TestKickSkipsDialFailureBackoff(t *testing.T) {
 // NetworkChanged broadcast closes the live connection and the transport
 // re-dials immediately (the host's path-update signal, not a server drop).
 func TestPlatformTransportNetworkChangeKick(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	platform := newTestingPlatformServer(t)
-	transport := testingPlatformTransport(t, ctx, platform.url, testingPlatformTransportSettings())
+		platform := newTestingPlatformServerIpVersion(t, ipVersion)
+		transport := testingPlatformTransport(t, ctx, platform.url, testingPlatformTransportSettings())
 
-	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
-		t.Fatal("the transport was never elected")
-	}
-	connectCount := platform.connectCount.Load()
+		if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+			t.Fatal("the transport was never elected")
+		}
+		connectCount := platform.connectCount.Load()
 
-	// the host reports a network path change
-	NetworkChanged()
+		// the host reports a network path change
+		NetworkChanged()
 
-	if !waitForCondition(15*time.Second, func() bool {
-		return connectCount < platform.connectCount.Load()
-	}) {
-		t.Fatal("the transport did not re-dial after a network change")
-	}
-	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
-		mode, _ := transport.activeMode()
-		t.Fatalf("active mode = %q after network change, want h1", mode)
-	}
+		if !waitForCondition(15*time.Second, func() bool {
+			return connectCount < platform.connectCount.Load()
+		}) {
+			t.Fatal("the transport did not re-dial after a network change")
+		}
+		if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+			mode, _ := transport.activeMode()
+			t.Fatalf("active mode = %q after network change, want h1", mode)
+		}
 
-	// closing the transport unsubscribes it: a later broadcast must not panic
-	// or kick a dead transport
-	transport.Close()
-	NetworkChanged()
+		// closing the transport unsubscribes it: a later broadcast must not panic
+		// or kick a dead transport
+		transport.Close()
+		NetworkChanged()
+	})
 }
 
 func TestPlatformTransportReconnects(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	platform := newTestingPlatformServer(t)
-	transport := testingPlatformTransport(t, ctx, platform.url, testingPlatformTransportSettings())
+		platform := newTestingPlatformServerIpVersion(t, ipVersion)
+		transport := testingPlatformTransport(t, ctx, platform.url, testingPlatformTransportSettings())
 
-	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
-		t.Fatal("the transport was never elected")
-	}
-	connectCount := platform.connectCount.Load()
+		if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+			t.Fatal("the transport was never elected")
+		}
+		connectCount := platform.connectCount.Load()
 
-	// drop the live connection, leaving the platform accepting
-	platform.closeConns()
+		// drop the live connection, leaving the platform accepting
+		platform.closeConns()
 
-	if !waitForCondition(15*time.Second, func() bool {
-		return connectCount < platform.connectCount.Load()
-	}) {
-		t.Fatal("the transport did not reconnect after the platform dropped it")
-	}
-	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
-		mode, _ := transport.activeMode()
-		t.Fatalf("active mode = %q after reconnect, want h1", mode)
-	}
+		if !waitForCondition(15*time.Second, func() bool {
+			return connectCount < platform.connectCount.Load()
+		}) {
+			t.Fatal("the transport did not reconnect after the platform dropped it")
+		}
+		if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+			mode, _ := transport.activeMode()
+			t.Fatalf("active mode = %q after reconnect, want h1", mode)
+		}
+	})
 }
 
 // TestPlatformTransportCloseInterruptsBlockedH1Write is the regression for a
@@ -785,88 +816,90 @@ func TestPlatformTransportReconnects(t *testing.T) {
 // the deferred socket Close—which was the only operation able to wake that
 // writer—could not run until after the join.
 func TestPlatformTransportCloseInterruptsBlockedH1Write(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	platform := newTestingPlatformServer(t)
-	wrappedConn := make(chan *closeInterruptWriteConn, 1)
-	strategySettings := DefaultClientStrategySettings()
-	strategySettings.EnableResilient = false
-	strategySettings.ParallelBlockSize = 1
-	strategySettings.MinNextConnectDelay = 0
-	strategySettings.MaxNextConnectDelay = 0
-	netDialer := &net.Dialer{}
-	strategySettings.DialContextSettings = &DialContextSettings{
-		DialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {
-			conn, err := netDialer.DialContext(ctx, network, address)
-			if err != nil {
-				return nil, err
-			}
-			blocking := newCloseInterruptWriteConn(conn)
-			select {
-			case wrappedConn <- blocking:
-			default:
-			}
-			return blocking, nil
-		},
-	}
-	strategy := NewClientStrategy(ctx, strategySettings)
-	routeManager := NewRouteManager(ctx, "test")
-	settings := testingPlatformTransportSettings()
-	settings.WriteTimeout = 30 * time.Second
-	transport := NewPlatformTransportWithTargetMode(
-		ctx,
-		strategy,
-		routeManager,
-		platform.url,
-		&ClientAuth{
-			ByJwt:      "testing",
-			InstanceId: NewId(),
-			AppVersion: "testing",
-		},
-		TransportModeH1,
-		settings,
-	)
-	t.Cleanup(transport.Close)
+		platform := newTestingPlatformServerIpVersion(t, ipVersion)
+		wrappedConn := make(chan *closeInterruptWriteConn, 1)
+		strategySettings := DefaultClientStrategySettings()
+		strategySettings.EnableResilient = false
+		strategySettings.ParallelBlockSize = 1
+		strategySettings.MinNextConnectDelay = 0
+		strategySettings.MaxNextConnectDelay = 0
+		netDialer := &net.Dialer{}
+		strategySettings.DialContextSettings = &DialContextSettings{
+			DialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {
+				conn, err := netDialer.DialContext(ctx, network, address)
+				if err != nil {
+					return nil, err
+				}
+				blocking := newCloseInterruptWriteConn(conn)
+				select {
+				case wrappedConn <- blocking:
+				default:
+				}
+				return blocking, nil
+			},
+		}
+		strategy := NewClientStrategy(ctx, strategySettings)
+		routeManager := NewRouteManager(ctx, "test")
+		settings := testingPlatformTransportSettings()
+		settings.WriteTimeout = 30 * time.Second
+		transport := NewPlatformTransportWithTargetMode(
+			ctx,
+			strategy,
+			routeManager,
+			platform.url,
+			&ClientAuth{
+				ByJwt:      "testing",
+				InstanceId: NewId(),
+				AppVersion: "testing",
+			},
+			TransportModeH1,
+			settings,
+		)
+		t.Cleanup(transport.Close)
 
-	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
-		t.Fatal("the transport was never elected")
-	}
-	var blocking *closeInterruptWriteConn
-	select {
-	case blocking = <-wrappedConn:
-	case <-time.After(time.Second):
-		t.Fatal("the websocket did not expose its underlying connection")
-	}
-	// Ensure even the pre-fix path can be released after an assertion, rather
-	// than leaving the test process parked until the deliberately long deadline.
-	defer blocking.Close()
+		if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+			t.Fatal("the transport was never elected")
+		}
+		var blocking *closeInterruptWriteConn
+		select {
+		case blocking = <-wrappedConn:
+		case <-time.After(time.Second):
+			t.Fatal("the websocket did not expose its underlying connection")
+		}
+		// Ensure even the pre-fix path can be released after an assertion, rather
+		// than leaving the test process parked until the deliberately long deadline.
+		defer blocking.Close()
 
-	blocking.blockWrite.Store(true)
-	writer := routeManager.OpenMultiRouteWriter(DestinationId(NewId()))
-	defer routeManager.CloseMultiRouteWriter(writer)
-	message := MessagePoolGet(32)
-	if err := writer.Write(ctx, message, time.Second); err != nil {
-		MessagePoolReturn(message)
-		t.Fatalf("route write failed: %v", err)
-	}
-	select {
-	case <-blocking.writeStarted:
-	case <-time.After(time.Second):
-		t.Fatal("the transport writer did not enter the blocked socket write")
-	}
+		blocking.blockWrite.Store(true)
+		writer := routeManager.OpenMultiRouteWriter(DestinationId(NewId()))
+		defer routeManager.CloseMultiRouteWriter(writer)
+		message := MessagePoolGet(32)
+		if err := writer.Write(ctx, message, time.Second); err != nil {
+			MessagePoolReturn(message)
+			t.Fatalf("route write failed: %v", err)
+		}
+		select {
+		case <-blocking.writeStarted:
+		case <-time.After(time.Second):
+			t.Fatal("the transport writer did not enter the blocked socket write")
+		}
 
-	transport.Close()
-	select {
-	case <-blocking.closed:
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("transport Close did not close the socket before joining its blocked writer")
-	}
-	if !waitForCondition(time.Second, func() bool {
-		return !transport.IsConnected()
-	}) {
-		t.Fatal("transport remained registered after Close interrupted the blocked writer")
-	}
+		transport.Close()
+		select {
+		case <-blocking.closed:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("transport Close did not close the socket before joining its blocked writer")
+		}
+		if !waitForCondition(time.Second, func() bool {
+			return !transport.IsConnected()
+		}) {
+			t.Fatal("transport remained registered after Close interrupted the blocked writer")
+		}
+	})
 }
 
 // CloseAndWait must not confuse logical route removal with completed transport
@@ -874,283 +907,287 @@ func TestPlatformTransportCloseInterruptsBlockedH1Write(t *testing.T) {
 // cleanup; completion may publish only after socket close wakes the writer and
 // every owned connection worker returns.
 func TestPlatformTransportCloseAndWaitJoinsRouteWriterAndReceiveCleanup(t *testing.T) {
-	testCtx, testCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer testCancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testCtx, testCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer testCancel()
 
-	platform := newTestingPlatformServer(t)
-	wrappedConn := make(chan *closeInterruptWriteConn, 1)
-	strategySettings := DefaultClientStrategySettings()
-	strategySettings.EnableResilient = false
-	strategySettings.ParallelBlockSize = 1
-	strategySettings.MinNextConnectDelay = 0
-	strategySettings.MaxNextConnectDelay = 0
-	netDialer := &net.Dialer{}
-	strategySettings.DialContextSettings = &DialContextSettings{
-		DialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {
-			connection, err := netDialer.DialContext(ctx, network, address)
-			if err != nil {
-				return nil, err
+		platform := newTestingPlatformServerIpVersion(t, ipVersion)
+		wrappedConn := make(chan *closeInterruptWriteConn, 1)
+		strategySettings := DefaultClientStrategySettings()
+		strategySettings.EnableResilient = false
+		strategySettings.ParallelBlockSize = 1
+		strategySettings.MinNextConnectDelay = 0
+		strategySettings.MaxNextConnectDelay = 0
+		netDialer := &net.Dialer{}
+		strategySettings.DialContextSettings = &DialContextSettings{
+			DialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {
+				connection, err := netDialer.DialContext(ctx, network, address)
+				if err != nil {
+					return nil, err
+				}
+				blocking := newCloseInterruptWriteConn(connection)
+				select {
+				case wrappedConn <- blocking:
+				default:
+				}
+				return blocking, nil
+			},
+		}
+		strategy := NewClientStrategy(testCtx, strategySettings)
+		routeManager := NewRouteManager(testCtx, "close-and-wait")
+		settings := testingPlatformTransportSettings()
+		settings.WriteTimeout = 30 * time.Second
+		teardownArmed := atomic.Bool{}
+		teardownEntered := make(chan struct{})
+		releaseTeardown := make(chan struct{})
+		receiveCleanupEntered := make(chan struct{})
+		releaseReceiveCleanup := make(chan struct{})
+		var teardownOnce sync.Once
+		var receiveCleanupOnce sync.Once
+		settings.afterRoutesRemovedForTest = func() {
+			if teardownArmed.Load() {
+				teardownOnce.Do(func() {
+					close(teardownEntered)
+					<-releaseTeardown
+				})
 			}
-			blocking := newCloseInterruptWriteConn(connection)
+		}
+		settings.beforeReceiveWorkerCleanupForTest = func() {
+			if teardownArmed.Load() {
+				receiveCleanupOnce.Do(func() {
+					close(receiveCleanupEntered)
+					<-releaseReceiveCleanup
+				})
+			}
+		}
+		transport := NewPlatformTransportWithTargetMode(
+			testCtx,
+			strategy,
+			routeManager,
+			platform.url,
+			&ClientAuth{
+				ByJwt:      "testing",
+				InstanceId: NewId(),
+				AppVersion: "testing",
+			},
+			TransportModeH1,
+			settings,
+		)
+		var releaseTeardownOnce sync.Once
+		releaseRouteCleanup := func() {
+			releaseTeardownOnce.Do(func() {
+				close(releaseTeardown)
+			})
+		}
+		var releaseReceiveOnce sync.Once
+		releaseReceiverCleanup := func() {
+			releaseReceiveOnce.Do(func() {
+				close(releaseReceiveCleanup)
+			})
+		}
+		t.Cleanup(func() {
+			releaseRouteCleanup()
+			releaseReceiverCleanup()
+			transport.Close()
+		})
+
+		for !transport.IsConnected() {
+			notify := transport.ConnectedNotify()
+			if transport.IsConnected() {
+				break
+			}
 			select {
-			case wrappedConn <- blocking:
-			default:
+			case <-testCtx.Done():
+				t.Fatalf("wait for close-and-wait platform route: %v", testCtx.Err())
+			case <-notify:
 			}
-			return blocking, nil
-		},
-	}
-	strategy := NewClientStrategy(testCtx, strategySettings)
-	routeManager := NewRouteManager(testCtx, "close-and-wait")
-	settings := testingPlatformTransportSettings()
-	settings.WriteTimeout = 30 * time.Second
-	teardownArmed := atomic.Bool{}
-	teardownEntered := make(chan struct{})
-	releaseTeardown := make(chan struct{})
-	receiveCleanupEntered := make(chan struct{})
-	releaseReceiveCleanup := make(chan struct{})
-	var teardownOnce sync.Once
-	var receiveCleanupOnce sync.Once
-	settings.afterRoutesRemovedForTest = func() {
-		if teardownArmed.Load() {
-			teardownOnce.Do(func() {
-				close(teardownEntered)
-				<-releaseTeardown
-			})
 		}
-	}
-	settings.beforeReceiveWorkerCleanupForTest = func() {
-		if teardownArmed.Load() {
-			receiveCleanupOnce.Do(func() {
-				close(receiveCleanupEntered)
-				<-releaseReceiveCleanup
-			})
+		var blocking *closeInterruptWriteConn
+		select {
+		case <-testCtx.Done():
+			t.Fatalf("wait for close-and-wait socket: %v", testCtx.Err())
+		case blocking = <-wrappedConn:
 		}
-	}
-	transport := NewPlatformTransportWithTargetMode(
-		testCtx,
-		strategy,
-		routeManager,
-		platform.url,
-		&ClientAuth{
-			ByJwt:      "testing",
-			InstanceId: NewId(),
-			AppVersion: "testing",
-		},
-		TransportModeH1,
-		settings,
-	)
-	var releaseTeardownOnce sync.Once
-	releaseRouteCleanup := func() {
-		releaseTeardownOnce.Do(func() {
-			close(releaseTeardown)
-		})
-	}
-	var releaseReceiveOnce sync.Once
-	releaseReceiverCleanup := func() {
-		releaseReceiveOnce.Do(func() {
-			close(releaseReceiveCleanup)
-		})
-	}
-	t.Cleanup(func() {
-		releaseRouteCleanup()
-		releaseReceiverCleanup()
-		transport.Close()
-	})
-
-	for !transport.IsConnected() {
-		notify := transport.ConnectedNotify()
-		if transport.IsConnected() {
-			break
+		blocking.blockWrite.Store(true)
+		writer := routeManager.OpenMultiRouteWriter(DestinationId(NewId()))
+		defer routeManager.CloseMultiRouteWriter(writer)
+		message := MessagePoolGet(32)
+		if err := writer.Write(testCtx, message, time.Second); err != nil {
+			MessagePoolReturn(message)
+			t.Fatalf("write close-and-wait message: %v", err)
 		}
 		select {
 		case <-testCtx.Done():
-			t.Fatalf("wait for close-and-wait platform route: %v", testCtx.Err())
-		case <-notify:
+			t.Fatalf("wait for blocked close-and-wait writer: %v", testCtx.Err())
+		case <-blocking.writeStarted:
 		}
-	}
-	var blocking *closeInterruptWriteConn
-	select {
-	case <-testCtx.Done():
-		t.Fatalf("wait for close-and-wait socket: %v", testCtx.Err())
-	case blocking = <-wrappedConn:
-	}
-	blocking.blockWrite.Store(true)
-	writer := routeManager.OpenMultiRouteWriter(DestinationId(NewId()))
-	defer routeManager.CloseMultiRouteWriter(writer)
-	message := MessagePoolGet(32)
-	if err := writer.Write(testCtx, message, time.Second); err != nil {
-		MessagePoolReturn(message)
-		t.Fatalf("write close-and-wait message: %v", err)
-	}
-	select {
-	case <-testCtx.Done():
-		t.Fatalf("wait for blocked close-and-wait writer: %v", testCtx.Err())
-	case <-blocking.writeStarted:
-	}
 
-	teardownArmed.Store(true)
-	closeResult := make(chan error, 1)
-	go func() {
-		closeResult <- transport.CloseAndWait(testCtx)
-	}()
-	select {
-	case <-testCtx.Done():
-		t.Fatalf("wait for logical route removal: %v", testCtx.Err())
-	case <-teardownEntered:
-	}
-	if transport.IsConnected() {
-		t.Fatal("logical platform route remained registered at teardown barrier")
-	}
-	if activeRoutes := writer.GetActiveRoutes(); len(activeRoutes) != 0 {
-		t.Fatalf("logical platform routes=%d at teardown barrier, want zero", len(activeRoutes))
-	}
-	select {
-	case <-blocking.closed:
-		t.Fatal("platform socket closed before the post-route teardown barrier")
-	default:
-	}
-	select {
-	case err := <-closeResult:
-		t.Fatalf("CloseAndWait returned before writer cleanup: %v", err)
-	default:
-	}
-	select {
-	case <-transport.Done():
-		t.Fatal("transport completion published before writer cleanup")
-	default:
-	}
-
-	releaseRouteCleanup()
-	select {
-	case <-testCtx.Done():
-		t.Fatalf("wait for receive-worker cleanup: %v", testCtx.Err())
-	case <-receiveCleanupEntered:
-	}
-	select {
-	case <-blocking.closed:
-	default:
-		t.Fatal("receive cleanup began before the blocked socket was closed")
-	}
-	select {
-	case err := <-closeResult:
-		t.Fatalf("CloseAndWait returned before receive cleanup: %v", err)
-	default:
-	}
-	select {
-	case <-transport.Done():
-		t.Fatal("transport completion published before receive cleanup")
-	default:
-	}
-
-	releaseReceiverCleanup()
-	select {
-	case <-testCtx.Done():
-		t.Fatalf("join close-and-wait transport: %v", testCtx.Err())
-	case err := <-closeResult:
-		if err != nil {
-			t.Fatalf("close and wait: %v", err)
+		teardownArmed.Store(true)
+		closeResult := make(chan error, 1)
+		go func() {
+			closeResult <- transport.CloseAndWait(testCtx)
+		}()
+		select {
+		case <-testCtx.Done():
+			t.Fatalf("wait for logical route removal: %v", testCtx.Err())
+		case <-teardownEntered:
 		}
-	}
-	select {
-	case <-transport.Done():
-	default:
-		t.Fatal("CloseAndWait returned before Done closed")
-	}
-	select {
-	case <-blocking.closed:
-	default:
-		t.Fatal("CloseAndWait returned before closing the blocked socket")
-	}
+		if transport.IsConnected() {
+			t.Fatal("logical platform route remained registered at teardown barrier")
+		}
+		if activeRoutes := writer.GetActiveRoutes(); len(activeRoutes) != 0 {
+			t.Fatalf("logical platform routes=%d at teardown barrier, want zero", len(activeRoutes))
+		}
+		select {
+		case <-blocking.closed:
+			t.Fatal("platform socket closed before the post-route teardown barrier")
+		default:
+		}
+		select {
+		case err := <-closeResult:
+			t.Fatalf("CloseAndWait returned before writer cleanup: %v", err)
+		default:
+		}
+		select {
+		case <-transport.Done():
+			t.Fatal("transport completion published before writer cleanup")
+		default:
+		}
+
+		releaseRouteCleanup()
+		select {
+		case <-testCtx.Done():
+			t.Fatalf("wait for receive-worker cleanup: %v", testCtx.Err())
+		case <-receiveCleanupEntered:
+		}
+		select {
+		case <-blocking.closed:
+		default:
+			t.Fatal("receive cleanup began before the blocked socket was closed")
+		}
+		select {
+		case err := <-closeResult:
+			t.Fatalf("CloseAndWait returned before receive cleanup: %v", err)
+		default:
+		}
+		select {
+		case <-transport.Done():
+			t.Fatal("transport completion published before receive cleanup")
+		default:
+		}
+
+		releaseReceiverCleanup()
+		select {
+		case <-testCtx.Done():
+			t.Fatalf("join close-and-wait transport: %v", testCtx.Err())
+		case err := <-closeResult:
+			if err != nil {
+				t.Fatalf("close and wait: %v", err)
+			}
+		}
+		select {
+		case <-transport.Done():
+		default:
+			t.Fatal("CloseAndWait returned before Done closed")
+		}
+		select {
+		case <-blocking.closed:
+		default:
+			t.Fatal("CloseAndWait returned before closing the blocked socket")
+		}
+	})
 }
 
 // A canceled connection attempt remains owned until its dial stack returns.
 // The exact dial barrier prevents completion from treating context delivery as
 // equivalent to joining the mode runner that is still unwinding it.
 func TestPlatformTransportCloseAndWaitJoinsPendingDial(t *testing.T) {
-	testCtx, testCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer testCancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testCtx, testCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer testCancel()
 
-	dialEntered := make(chan struct{})
-	dialCanceled := make(chan struct{})
-	releaseDial := make(chan struct{})
-	var dialEnteredOnce sync.Once
-	var dialCanceledOnce sync.Once
-	strategySettings := DefaultClientStrategySettings()
-	strategySettings.EnableResilient = false
-	strategySettings.ParallelBlockSize = 1
-	strategySettings.MinNextConnectDelay = 0
-	strategySettings.MaxNextConnectDelay = 0
-	strategySettings.DialContextSettings = &DialContextSettings{
-		DialContext: func(ctx context.Context, _ string, _ string) (net.Conn, error) {
-			dialEnteredOnce.Do(func() {
-				close(dialEntered)
-			})
-			<-ctx.Done()
-			dialCanceledOnce.Do(func() {
-				close(dialCanceled)
-			})
-			<-releaseDial
-			return nil, ctx.Err()
-		},
-	}
-	transport := NewPlatformTransportWithTargetMode(
-		testCtx,
-		NewClientStrategy(testCtx, strategySettings),
-		NewRouteManager(testCtx, "pending-dial"),
-		"ws://127.0.0.1:1",
-		&ClientAuth{
-			ByJwt:      "testing",
-			InstanceId: NewId(),
-			AppVersion: "testing",
-		},
-		TransportModeH1,
-		testingPlatformTransportSettings(),
-	)
-	var releaseOnce sync.Once
-	release := func() {
-		releaseOnce.Do(func() {
-			close(releaseDial)
-		})
-	}
-	t.Cleanup(func() {
-		release()
-		transport.Close()
-	})
-
-	select {
-	case <-testCtx.Done():
-		t.Fatalf("wait for pending platform dial: %v", testCtx.Err())
-	case <-dialEntered:
-	}
-	closeResult := make(chan error, 1)
-	go func() {
-		closeResult <- transport.CloseAndWait(testCtx)
-	}()
-	select {
-	case <-testCtx.Done():
-		t.Fatalf("wait for pending dial cancellation: %v", testCtx.Err())
-	case <-dialCanceled:
-	}
-	select {
-	case err := <-closeResult:
-		t.Fatalf("CloseAndWait returned before the canceled dial unwound: %v", err)
-	default:
-	}
-	select {
-	case <-transport.Done():
-		t.Fatal("transport completion published before the canceled dial unwound")
-	default:
-	}
-
-	release()
-	select {
-	case <-testCtx.Done():
-		t.Fatalf("join released pending dial: %v", testCtx.Err())
-	case err := <-closeResult:
-		if err != nil {
-			t.Fatalf("close and join pending dial: %v", err)
+		dialEntered := make(chan struct{})
+		dialCanceled := make(chan struct{})
+		releaseDial := make(chan struct{})
+		var dialEnteredOnce sync.Once
+		var dialCanceledOnce sync.Once
+		strategySettings := DefaultClientStrategySettings()
+		strategySettings.EnableResilient = false
+		strategySettings.ParallelBlockSize = 1
+		strategySettings.MinNextConnectDelay = 0
+		strategySettings.MaxNextConnectDelay = 0
+		strategySettings.DialContextSettings = &DialContextSettings{
+			DialContext: func(ctx context.Context, _ string, _ string) (net.Conn, error) {
+				dialEnteredOnce.Do(func() {
+					close(dialEntered)
+				})
+				<-ctx.Done()
+				dialCanceledOnce.Do(func() {
+					close(dialCanceled)
+				})
+				<-releaseDial
+				return nil, ctx.Err()
+			},
 		}
-	}
+		transport := NewPlatformTransportWithTargetMode(
+			testCtx,
+			NewClientStrategy(testCtx, strategySettings),
+			NewRouteManager(testCtx, "pending-dial"),
+			"ws://"+testLoopbackHost(ipVersion)+":1",
+			&ClientAuth{
+				ByJwt:      "testing",
+				InstanceId: NewId(),
+				AppVersion: "testing",
+			},
+			TransportModeH1,
+			testingPlatformTransportSettings(),
+		)
+		var releaseOnce sync.Once
+		release := func() {
+			releaseOnce.Do(func() {
+				close(releaseDial)
+			})
+		}
+		t.Cleanup(func() {
+			release()
+			transport.Close()
+		})
+
+		select {
+		case <-testCtx.Done():
+			t.Fatalf("wait for pending platform dial: %v", testCtx.Err())
+		case <-dialEntered:
+		}
+		closeResult := make(chan error, 1)
+		go func() {
+			closeResult <- transport.CloseAndWait(testCtx)
+		}()
+		select {
+		case <-testCtx.Done():
+			t.Fatalf("wait for pending dial cancellation: %v", testCtx.Err())
+		case <-dialCanceled:
+		}
+		select {
+		case err := <-closeResult:
+			t.Fatalf("CloseAndWait returned before the canceled dial unwound: %v", err)
+		default:
+		}
+		select {
+		case <-transport.Done():
+			t.Fatal("transport completion published before the canceled dial unwound")
+		default:
+		}
+
+		release()
+		select {
+		case <-testCtx.Done():
+			t.Fatalf("join released pending dial: %v", testCtx.Err())
+		case err := <-closeResult:
+			if err != nil {
+				t.Fatalf("close and join pending dial: %v", err)
+			}
+		}
+	})
 }
 
 // TestPlatformTransportCloseInterruptsBlockedH3Write covers the adjacent QUIC
@@ -1158,315 +1195,321 @@ func TestPlatformTransportCloseAndWaitJoinsPendingDial(t *testing.T) {
 // parks Framer.Write inside quic.Stream.Write. Canceling handleCtx cannot wake
 // that write; connection close must precede a join of both socket workers.
 func TestPlatformTransportCloseInterruptsBlockedH3Write(t *testing.T) {
-	certPem, keyPem, err := selfSign(
-		[]string{"127.0.0.1"},
-		"127.0.0.1",
-		24*time.Hour,
-		24*time.Hour,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cert, err := tls.X509KeyPair(certPem, keyPem)
-	if err != nil {
-		t.Fatal(err)
-	}
-	const nextProto = "urnetwork-platform-test"
-	listener, err := quic.ListenAddrEarly(
-		"127.0.0.1:0",
-		&tls.Config{
-			Certificates: []tls.Certificate{cert},
-			NextProtos:   []string{nextProto},
-		},
-		&quic.Config{
-			MaxIdleTimeout:                 30 * time.Second,
-			InitialStreamReceiveWindow:     32 * 1024,
-			MaxStreamReceiveWindow:         32 * 1024,
-			InitialConnectionReceiveWindow: 64 * 1024,
-			MaxConnectionReceiveWindow:     64 * 1024,
-		},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = listener.Close()
-	})
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		certPem, keyPem, err := selfSign(
+			[]string{testLoopbackIp(ipVersion)},
+			testLoopbackIp(ipVersion),
+			24*time.Hour,
+			24*time.Hour,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cert, err := tls.X509KeyPair(certPem, keyPem)
+		if err != nil {
+			t.Fatal(err)
+		}
+		const nextProto = "urnetwork-platform-test"
+		listener, err := quic.ListenAddrEarly(
+			testLoopbackHostPort(ipVersion, 0),
+			&tls.Config{
+				Certificates: []tls.Certificate{cert},
+				NextProtos:   []string{nextProto},
+			},
+			&quic.Config{
+				MaxIdleTimeout:                 30 * time.Second,
+				InitialStreamReceiveWindow:     32 * 1024,
+				MaxStreamReceiveWindow:         32 * 1024,
+				InitialConnectionReceiveWindow: 64 * 1024,
+				MaxConnectionReceiveWindow:     64 * 1024,
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_ = listener.Close()
+		})
 
-	serverCtx, serverCancel := context.WithCancel(context.Background())
-	defer serverCancel()
-	serverConn := make(chan *quic.Conn, 1)
-	serverErr := make(chan error, 1)
-	framerSettings := DefaultFramerSettings(int(DefaultClientSettings().MinimumMessageLenLimit()))
-	go func() {
-		conn, acceptErr := listener.Accept(serverCtx)
-		if acceptErr != nil {
-			serverErr <- acceptErr
-			return
-		}
-		serverConn <- conn
-		stream, acceptErr := conn.AcceptStream(serverCtx)
-		if acceptErr != nil {
-			serverErr <- acceptErr
-			return
-		}
-		framer := NewFramer(framerSettings)
-		authBytes, readErr := framer.Read(stream)
-		if readErr != nil {
-			serverErr <- readErr
-			return
-		}
-		writeErr := framer.Write(stream, authBytes)
-		MessagePoolReturn(authBytes)
-		if writeErr != nil {
-			serverErr <- writeErr
-			return
-		}
-		// Deliberately never read another byte. The client's next large writes
-		// consume the fixed receive credit and then block.
-		<-conn.Context().Done()
-	}()
+		serverCtx, serverCancel := context.WithCancel(context.Background())
+		defer serverCancel()
+		serverConn := make(chan *quic.Conn, 1)
+		serverErr := make(chan error, 1)
+		framerSettings := DefaultFramerSettings(int(DefaultClientSettings().MinimumMessageLenLimit()))
+		go func() {
+			conn, acceptErr := listener.Accept(serverCtx)
+			if acceptErr != nil {
+				serverErr <- acceptErr
+				return
+			}
+			serverConn <- conn
+			stream, acceptErr := conn.AcceptStream(serverCtx)
+			if acceptErr != nil {
+				serverErr <- acceptErr
+				return
+			}
+			framer := NewFramer(framerSettings)
+			authBytes, readErr := framer.Read(stream)
+			if readErr != nil {
+				serverErr <- readErr
+				return
+			}
+			writeErr := framer.Write(stream, authBytes)
+			MessagePoolReturn(authBytes)
+			if writeErr != nil {
+				serverErr <- writeErr
+				return
+			}
+			// Deliberately never read another byte. The client's next large writes
+			// consume the fixed receive credit and then block.
+			<-conn.Context().Done()
+		}()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	settings := testingPlatformTransportSettings()
-	settings.H3Port = listener.Addr().(*net.UDPAddr).Port
-	settings.WriteTimeout = 30 * time.Second
-	settings.QuicTlsConfig = &tls.Config{
-		InsecureSkipVerify: true, // test-only self-signed endpoint
-		NextProtos:         []string{nextProto},
-	}
-	settings.FramerSettings = framerSettings
-	receiveCleanupArmed := atomic.Bool{}
-	receiveCleanupEntered := make(chan struct{})
-	releaseReceiveCleanup := make(chan struct{})
-	var receiveCleanupOnce sync.Once
-	settings.beforeReceiveWorkerCleanupForTest = func() {
-		if receiveCleanupArmed.Load() {
-			receiveCleanupOnce.Do(func() {
-				close(receiveCleanupEntered)
-				<-releaseReceiveCleanup
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		settings := testingPlatformTransportSettings()
+		settings.H3Port = listener.Addr().(*net.UDPAddr).Port
+		settings.resolveH3AddrsForTest = testingH3LoopbackResolver(ipVersion, settings.H3Port)
+		settings.WriteTimeout = 30 * time.Second
+		settings.QuicTlsConfig = &tls.Config{
+			InsecureSkipVerify: true, // test-only self-signed endpoint
+			NextProtos:         []string{nextProto},
+		}
+		settings.FramerSettings = framerSettings
+		receiveCleanupArmed := atomic.Bool{}
+		receiveCleanupEntered := make(chan struct{})
+		releaseReceiveCleanup := make(chan struct{})
+		var receiveCleanupOnce sync.Once
+		settings.beforeReceiveWorkerCleanupForTest = func() {
+			if receiveCleanupArmed.Load() {
+				receiveCleanupOnce.Do(func() {
+					close(receiveCleanupEntered)
+					<-releaseReceiveCleanup
+				})
+			}
+		}
+		routeManager := NewRouteManager(ctx, "test")
+		transport := NewPlatformTransportWithTargetMode(
+			ctx,
+			NewClientStrategyWithDefaults(ctx),
+			routeManager,
+			"https://"+testLoopbackHost(ipVersion),
+			&ClientAuth{
+				ByJwt:      "testing",
+				InstanceId: NewId(),
+				AppVersion: "testing",
+			},
+			TransportModeH3,
+			settings,
+		)
+		var releaseOnce sync.Once
+		releaseReceiverCleanup := func() {
+			releaseOnce.Do(func() {
+				close(releaseReceiveCleanup)
 			})
 		}
-	}
-	routeManager := NewRouteManager(ctx, "test")
-	transport := NewPlatformTransportWithTargetMode(
-		ctx,
-		NewClientStrategyWithDefaults(ctx),
-		routeManager,
-		"https://127.0.0.1",
-		&ClientAuth{
-			ByJwt:      "testing",
-			InstanceId: NewId(),
-			AppVersion: "testing",
-		},
-		TransportModeH3,
-		settings,
-	)
-	var releaseOnce sync.Once
-	releaseReceiverCleanup := func() {
-		releaseOnce.Do(func() {
-			close(releaseReceiveCleanup)
+		t.Cleanup(func() {
+			releaseReceiverCleanup()
+			transport.Close()
 		})
-	}
-	t.Cleanup(func() {
+
+		var accepted *quic.Conn
+		select {
+		case accepted = <-serverConn:
+		case acceptErr := <-serverErr:
+			t.Fatal(acceptErr)
+		case <-time.After(5 * time.Second):
+			t.Fatal("the QUIC server did not accept the platform connection")
+		}
+		if !testingWaitForActiveMode(transport, TransportModeH3, 5*time.Second) {
+			t.Fatal("the H3 transport was never elected")
+		}
+
+		writer := routeManager.OpenMultiRouteWriter(DestinationId(NewId()))
+		defer routeManager.CloseMultiRouteWriter(writer)
+		blocked := false
+		for range 128 {
+			message := MessagePoolGet(3 * 1024)
+			if writeErr := writer.Write(ctx, message, 20*time.Millisecond); writeErr != nil {
+				MessagePoolReturn(message)
+				blocked = true
+				break
+			}
+		}
+		if !blocked {
+			t.Fatal("the unread QUIC stream never exhausted its bounded send route")
+		}
+
+		receiveCleanupArmed.Store(true)
+		closeCtx, closeCancel := context.WithTimeout(ctx, 15*time.Second)
+		defer closeCancel()
+		closeResult := make(chan error, 1)
+		go func() {
+			closeResult <- transport.CloseAndWait(closeCtx)
+		}()
+		select {
+		case <-receiveCleanupEntered:
+		case <-closeCtx.Done():
+			t.Fatalf("H3 receive worker did not reach cleanup: %v", closeCtx.Err())
+		}
+		select {
+		case err := <-closeResult:
+			t.Fatalf("CloseAndWait returned before H3 receive cleanup: %v", err)
+		default:
+		}
+		select {
+		case <-transport.Done():
+			t.Fatal("H3 transport completion published before receive cleanup")
+		default:
+		}
 		releaseReceiverCleanup()
-		transport.Close()
+		select {
+		case err := <-closeResult:
+			if err != nil {
+				t.Fatalf("close and join flow-control-blocked H3 transport: %v", err)
+			}
+		case <-closeCtx.Done():
+			t.Fatalf("join flow-control-blocked H3 transport: %v", closeCtx.Err())
+		}
+		select {
+		case <-accepted.Context().Done():
+		case <-closeCtx.Done():
+			t.Fatalf("peer did not observe flow-control-blocked H3 close: %v", closeCtx.Err())
+		}
 	})
-
-	var accepted *quic.Conn
-	select {
-	case accepted = <-serverConn:
-	case acceptErr := <-serverErr:
-		t.Fatal(acceptErr)
-	case <-time.After(5 * time.Second):
-		t.Fatal("the QUIC server did not accept the platform connection")
-	}
-	if !testingWaitForActiveMode(transport, TransportModeH3, 5*time.Second) {
-		t.Fatal("the H3 transport was never elected")
-	}
-
-	writer := routeManager.OpenMultiRouteWriter(DestinationId(NewId()))
-	defer routeManager.CloseMultiRouteWriter(writer)
-	blocked := false
-	for range 128 {
-		message := MessagePoolGet(3 * 1024)
-		if writeErr := writer.Write(ctx, message, 20*time.Millisecond); writeErr != nil {
-			MessagePoolReturn(message)
-			blocked = true
-			break
-		}
-	}
-	if !blocked {
-		t.Fatal("the unread QUIC stream never exhausted its bounded send route")
-	}
-
-	receiveCleanupArmed.Store(true)
-	closeCtx, closeCancel := context.WithTimeout(ctx, 15*time.Second)
-	defer closeCancel()
-	closeResult := make(chan error, 1)
-	go func() {
-		closeResult <- transport.CloseAndWait(closeCtx)
-	}()
-	select {
-	case <-receiveCleanupEntered:
-	case <-closeCtx.Done():
-		t.Fatalf("H3 receive worker did not reach cleanup: %v", closeCtx.Err())
-	}
-	select {
-	case err := <-closeResult:
-		t.Fatalf("CloseAndWait returned before H3 receive cleanup: %v", err)
-	default:
-	}
-	select {
-	case <-transport.Done():
-		t.Fatal("H3 transport completion published before receive cleanup")
-	default:
-	}
-	releaseReceiverCleanup()
-	select {
-	case err := <-closeResult:
-		if err != nil {
-			t.Fatalf("close and join flow-control-blocked H3 transport: %v", err)
-		}
-	case <-closeCtx.Done():
-		t.Fatalf("join flow-control-blocked H3 transport: %v", closeCtx.Err())
-	}
-	select {
-	case <-accepted.Context().Done():
-	case <-closeCtx.Done():
-		t.Fatalf("peer did not observe flow-control-blocked H3 close: %v", closeCtx.Err())
-	}
 }
 
 // An H3 Framer.Read transfers its pooled message to the receive channel. Route
 // removal makes that channel unreachable to later MultiRouteReader snapshots,
 // so transport completion must return any message still queued there.
 func TestPlatformTransportH3CloseDrainsQueuedReceiveOwnership(t *testing.T) {
-	certPem, keyPem, err := selfSign(
-		[]string{"127.0.0.1"},
-		"127.0.0.1",
-		24*time.Hour,
-		24*time.Hour,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cert, err := tls.X509KeyPair(certPem, keyPem)
-	if err != nil {
-		t.Fatal(err)
-	}
-	const nextProto = "urnetwork-platform-pool-test"
-	listener, err := quic.ListenAddrEarly(
-		"127.0.0.1:0",
-		&tls.Config{
-			Certificates: []tls.Certificate{cert},
-			NextProtos:   []string{nextProto},
-		},
-		&quic.Config{MaxIdleTimeout: 30 * time.Second},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = listener.Close()
-	})
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		certPem, keyPem, err := selfSign(
+			[]string{testLoopbackIp(ipVersion)},
+			testLoopbackIp(ipVersion),
+			24*time.Hour,
+			24*time.Hour,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cert, err := tls.X509KeyPair(certPem, keyPem)
+		if err != nil {
+			t.Fatal(err)
+		}
+		const nextProto = "urnetwork-platform-pool-test"
+		listener, err := quic.ListenAddrEarly(
+			testLoopbackHostPort(ipVersion, 0),
+			&tls.Config{
+				Certificates: []tls.Certificate{cert},
+				NextProtos:   []string{nextProto},
+			},
+			&quic.Config{MaxIdleTimeout: 30 * time.Second},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_ = listener.Close()
+		})
 
-	serverCtx, serverCancel := context.WithCancel(t.Context())
-	defer serverCancel()
-	serverErrors := make(chan error, 1)
-	serverDone := make(chan struct{})
-	framerSettings := DefaultFramerSettings(int(DefaultClientSettings().MinimumMessageLenLimit()))
-	go func() {
-		defer close(serverDone)
-		connection, acceptErr := listener.Accept(serverCtx)
-		if acceptErr != nil {
-			serverErrors <- acceptErr
-			return
-		}
-		stream, acceptErr := connection.AcceptStream(serverCtx)
-		if acceptErr != nil {
-			serverErrors <- acceptErr
-			return
-		}
-		framer := NewFramer(framerSettings)
-		authBytes, readErr := framer.Read(stream)
-		if readErr != nil {
-			serverErrors <- readErr
-			return
-		}
-		writeErr := framer.Write(stream, authBytes)
-		MessagePoolReturn(authBytes)
-		if writeErr != nil {
-			serverErrors <- writeErr
-			return
-		}
-		if writeErr = framer.Write(stream, make([]byte, 128)); writeErr != nil {
-			serverErrors <- writeErr
-			return
-		}
-		<-connection.Context().Done()
-	}()
+		serverCtx, serverCancel := context.WithCancel(t.Context())
+		defer serverCancel()
+		serverErrors := make(chan error, 1)
+		serverDone := make(chan struct{})
+		framerSettings := DefaultFramerSettings(int(DefaultClientSettings().MinimumMessageLenLimit()))
+		go func() {
+			defer close(serverDone)
+			connection, acceptErr := listener.Accept(serverCtx)
+			if acceptErr != nil {
+				serverErrors <- acceptErr
+				return
+			}
+			stream, acceptErr := connection.AcceptStream(serverCtx)
+			if acceptErr != nil {
+				serverErrors <- acceptErr
+				return
+			}
+			framer := NewFramer(framerSettings)
+			authBytes, readErr := framer.Read(stream)
+			if readErr != nil {
+				serverErrors <- readErr
+				return
+			}
+			writeErr := framer.Write(stream, authBytes)
+			MessagePoolReturn(authBytes)
+			if writeErr != nil {
+				serverErrors <- writeErr
+				return
+			}
+			if writeErr = framer.Write(stream, make([]byte, 128)); writeErr != nil {
+				serverErrors <- writeErr
+				return
+			}
+			<-connection.Context().Done()
+		}()
 
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	settings := testingPlatformTransportSettings()
-	settings.H3Port = listener.Addr().(*net.UDPAddr).Port
-	settings.QuicTlsConfig = &tls.Config{
-		InsecureSkipVerify: true, // test-only self-signed endpoint
-		NextProtos:         []string{nextProto},
-	}
-	settings.FramerSettings = framerSettings
-	settings.TransportBufferSize = 1
-	receiveWitnesses := make(chan []byte, 1)
-	settings.afterH3ReceiveEnqueueForTest = func(message []byte) {
-		witness := MessagePoolShareReadOnly(message)
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		settings := testingPlatformTransportSettings()
+		settings.H3Port = listener.Addr().(*net.UDPAddr).Port
+		settings.resolveH3AddrsForTest = testingH3LoopbackResolver(ipVersion, settings.H3Port)
+		settings.QuicTlsConfig = &tls.Config{
+			InsecureSkipVerify: true, // test-only self-signed endpoint
+			NextProtos:         []string{nextProto},
+		}
+		settings.FramerSettings = framerSettings
+		settings.TransportBufferSize = 1
+		receiveWitnesses := make(chan []byte, 1)
+		settings.afterH3ReceiveEnqueueForTest = func(message []byte) {
+			witness := MessagePoolShareReadOnly(message)
+			select {
+			case receiveWitnesses <- witness:
+			default:
+				MessagePoolReturn(witness)
+			}
+		}
+		transport := NewPlatformTransportWithTargetMode(
+			ctx,
+			NewClientStrategyWithDefaults(ctx),
+			NewRouteManager(ctx, "h3-receive-pool"),
+			"https://"+testLoopbackHost(ipVersion),
+			&ClientAuth{
+				ByJwt:      "testing",
+				InstanceId: NewId(),
+				AppVersion: "testing",
+			},
+			TransportModeH3,
+			settings,
+		)
+		t.Cleanup(transport.Close)
+
+		var witness []byte
 		select {
-		case receiveWitnesses <- witness:
-		default:
-			MessagePoolReturn(witness)
+		case witness = <-receiveWitnesses:
+		case serverErr := <-serverErrors:
+			t.Fatal(serverErr)
+		case <-ctx.Done():
+			t.Fatalf("wait for H3 receive enqueue: %v", ctx.Err())
 		}
-	}
-	transport := NewPlatformTransportWithTargetMode(
-		ctx,
-		NewClientStrategyWithDefaults(ctx),
-		NewRouteManager(ctx, "h3-receive-pool"),
-		"https://127.0.0.1",
-		&ClientAuth{
-			ByJwt:      "testing",
-			InstanceId: NewId(),
-			AppVersion: "testing",
-		},
-		TransportModeH3,
-		settings,
-	)
-	t.Cleanup(transport.Close)
-
-	var witness []byte
-	select {
-	case witness = <-receiveWitnesses:
-	case serverErr := <-serverErrors:
-		t.Fatal(serverErr)
-	case <-ctx.Done():
-		t.Fatalf("wait for H3 receive enqueue: %v", ctx.Err())
-	}
-	closeCtx, closeCancel := context.WithTimeout(ctx, 5*time.Second)
-	defer closeCancel()
-	if err := transport.CloseAndWait(closeCtx); err != nil {
-		MessagePoolReturn(witness)
-		t.Fatalf("close and join H3 receive owner: %v", err)
-	}
-	if !MessagePoolReturn(witness) {
-		// Reclaim the old queued owner too, so a failure does not contaminate
-		// later process-wide pool checks.
-		MessagePoolReturn(witness)
-		t.Fatal("H3 transport completion retained its queued Framer.Read owner")
-	}
-	select {
-	case <-serverDone:
-	case serverErr := <-serverErrors:
-		t.Fatal(serverErr)
-	case <-closeCtx.Done():
-		t.Fatalf("join H3 pool test server: %v", closeCtx.Err())
-	}
+		closeCtx, closeCancel := context.WithTimeout(ctx, 5*time.Second)
+		defer closeCancel()
+		if err := transport.CloseAndWait(closeCtx); err != nil {
+			MessagePoolReturn(witness)
+			t.Fatalf("close and join H3 receive owner: %v", err)
+		}
+		if !MessagePoolReturn(witness) {
+			// Reclaim the old queued owner too, so a failure does not contaminate
+			// later process-wide pool checks.
+			MessagePoolReturn(witness)
+			t.Fatal("H3 transport completion retained its queued Framer.Read owner")
+		}
+		select {
+		case <-serverDone:
+		case serverErr := <-serverErrors:
+			t.Fatal(serverErr)
+		case <-closeCtx.Done():
+			t.Fatalf("join H3 pool test server: %v", closeCtx.Err())
+		}
+	})
 }

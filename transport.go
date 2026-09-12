@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"fmt"
 	"math"
-	mathrand "math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -544,6 +543,17 @@ type PlatformTransportSettings struct {
 	// Lower values are preferred and every healthy mode tied at the best live
 	// priority remains active. Nil selects DefaultTransportModePreferences.
 	ModePreferences map[TransportMode]int
+	// IpFamily pins the transport to one address family: 4, 6, or 0 for the
+	// family-agnostic transport this has always been. A pinned transport
+	// dials only its family, declares it to the platform, and never counts
+	// its dial failures against the backend. See transport_family.go.
+	IpFamily int
+	// StartDisabled constructs the transport held (see SetEnabled): it dials
+	// nothing until its owner enables it. The provider group's standby uses it.
+	StartDisabled bool
+	// PinnedReconnectMaxTimeout caps a pinned transport's own exponential
+	// dial backoff. Non-positive resolves to five minutes.
+	PinnedReconnectMaxTimeout time.Duration
 
 	// MinConnectDelay time.Duration
 	// MaxConnectDelay time.Duration
@@ -606,6 +616,9 @@ type PlatformTransportSettings struct {
 	// Nil outside package tests. Replaces one H3 carrier runner so budget lease
 	// preemption can hold its exact teardown boundary without opening a socket.
 	runH3ModeForTest func(context.Context, TransportMode, time.Duration)
+	// Nil outside package tests. Replaces plain-H3 name resolution so the
+	// family race can be driven against chosen addresses.
+	resolveH3AddrsForTest func(ctx context.Context, address string, ipFamily int) ([]*net.UDPAddr, error)
 }
 
 func DefaultPlatformTransportSettings() *PlatformTransportSettings {
@@ -614,21 +627,22 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		panic(err)
 	}
 	return &PlatformTransportSettings{
-		HttpConnectTimeout:      15 * time.Second,
-		WsHandshakeTimeout:      15 * time.Second,
-		QuicConnectTimeout:      15 * time.Second,
-		QuicHandshakeTimeout:    15 * time.Second,
-		QuicTlsConfig:           tlsConfig,
-		AuthTimeout:             5 * time.Second,
-		ReconnectTimeout:        5 * time.Second,
-		PingTimeout:             5 * time.Second,
-		WriteTimeout:            10 * time.Second,
-		ReadTimeout:             30 * time.Second,
-		TransportBufferSize:     32,
-		InactiveDrainTimeout:    30 * time.Second,
-		InactiveDrainMaxTimeout: 60 * time.Second,
-		ModeInitialDelay:        2 * time.Second,
-		ModePreferences:         DefaultTransportModePreferences(),
+		HttpConnectTimeout:        15 * time.Second,
+		WsHandshakeTimeout:        15 * time.Second,
+		QuicConnectTimeout:        15 * time.Second,
+		QuicHandshakeTimeout:      15 * time.Second,
+		QuicTlsConfig:             tlsConfig,
+		AuthTimeout:               5 * time.Second,
+		ReconnectTimeout:          5 * time.Second,
+		PingTimeout:               5 * time.Second,
+		WriteTimeout:              10 * time.Second,
+		ReadTimeout:               30 * time.Second,
+		TransportBufferSize:       32,
+		InactiveDrainTimeout:      30 * time.Second,
+		InactiveDrainMaxTimeout:   60 * time.Second,
+		ModeInitialDelay:          2 * time.Second,
+		ModePreferences:           DefaultTransportModePreferences(),
+		PinnedReconnectMaxTimeout: 5 * time.Minute,
 		// MinConnectDelay:      0,
 		// MaxConnectDelay:      1 * time.Second,
 		ProtocolVersion: DefaultProtocolVersion,
@@ -791,6 +805,17 @@ type PlatformTransport struct {
 	// unsubNetworkChange removes this transport from the process
 	// network-change listeners when the run loop exits.
 	unsubNetworkChange func()
+
+	// ipFamily is the pin: 4, 6, or 0. Immutable after construction.
+	ipFamily int
+	// enabled is the owner's switch (SetEnabled). familyHold is a pinned
+	// transport's own reason not to dial, a PlatformTransportState, with
+	// PlatformTransportStateConnecting meaning none. held derives from both
+	// and is what the mode runners wait on. See transport_family.go.
+	enabled       atomic.Bool
+	familyHold    atomic.Int32
+	held          *MonitorValue[bool]
+	pinnedBackoff *pinnedDialBackoff
 }
 
 // newPlatformQuicConfig keeps H3's memory and path-MTU behavior explicit and
@@ -1116,6 +1141,24 @@ func NewPlatformTransportWithTargetMode(
 		connectedMonitor:     NewMonitor(),
 		kickMonitor:          NewMonitor(),
 	}
+	transport.ipFamily = normalizeIpFamily(settings.IpFamily)
+	transport.enabled.Store(!settings.StartDisabled)
+	transport.held = NewMonitorValue(settings.StartDisabled)
+	pinnedReconnectMaxTimeout := settings.PinnedReconnectMaxTimeout
+	if pinnedReconnectMaxTimeout <= 0 {
+		pinnedReconnectMaxTimeout = 5 * time.Minute
+	}
+	transport.pinnedBackoff = newPinnedDialBackoff(settings.ReconnectTimeout, pinnedReconnectMaxTimeout)
+	if transport.ipFamily == 6 {
+		// the dns pump host publishes no AAAA record: the mode cannot work
+		// over a v6 pin, so it is not offered rather than left to fail
+		delete(transport.modePreferences, TransportModeH3DnsPump)
+		if targetMode == TransportModeH3DnsPump {
+			log.Infof("[t]h3dnspump is not available over ipv6; using h3dns\n")
+			targetMode = TransportModeH3Dns
+			transport.targetMode = targetMode
+		}
+	}
 	transport.h3Gate = newPlatformH3Gate(transport)
 	h1Enabled := targetMode == TransportModeH1 ||
 		(targetMode == TransportModeAuto &&
@@ -1152,6 +1195,12 @@ func NewPlatformTransportWithTargetMode(
 	// unsubscribe rides the run loop exit (ctx cancel), not just Close — most
 	// owners tear transports down by canceling the client ctx.
 	transport.unsubNetworkChange = AddNetworkChangeListener(transport.Kick)
+	if transport.pinned() {
+		// the initial hold is in place before any runner can dial, so a
+		// pinned transport on a device without its family never dials once
+		transport.refreshFamilyHold()
+		go HandleError(transport.runFamilyHoldWatcher, cancel)
+	}
 	go HandleError(func() {
 		defer close(transport.done)
 		defer transport.unsubNetworkChange()
@@ -1347,6 +1396,10 @@ func (self *PlatformTransport) startH3ModeGroup(modes []TransportMode, auto bool
 			defer reservation.Release()
 		}
 		for self.ctx.Err() == nil {
+			// a held transport neither dials nor holds an optional lease
+			if !self.waitDialAdmission(self.ctx) {
+				return
+			}
 			if reservation != nil && !reservation.Acquire(self.ctx) {
 				return
 			}
@@ -1381,23 +1434,40 @@ func (self *PlatformTransport) startH3ModeGroup(modes []TransportMode, auto bool
 			if reservation != nil {
 				preempt = reservation.PreemptNotify()
 			}
+			// a hold (the owner disabled the transport, or a pinned family
+			// went away) stops the runners and yields the optional lease
+			// exactly like a preemption, so a parked transport retains no H3
+			// working set. The runners restart when the hold lifts.
+			held, holdNotify := self.heldNotify()
+			if held {
+				closed := make(chan struct{})
+				close(closed)
+				holdNotify = closed
+			}
 			preempted := false
+			heldNow := false
 			select {
 			case <-self.ctx.Done():
 			case <-groupDone:
 			case <-preempt:
 				preempted = true
+			case <-holdNotify:
+				heldNow = true
 			}
 			cancelGroup()
 			waitGroup.Wait()
-			if !preempted || self.ctx.Err() != nil || reservation == nil {
+			if self.ctx.Err() != nil || (!preempted && !heldNow) {
 				return
 			}
 			// Routes and sockets are gone before the accounting lease is
 			// yielded. The pending reservation will reacquire when the higher-
-			// precedence claimant leaves.
-			if !reservation.Yield() {
-				return
+			// precedence claimant leaves, or when the hold lifts. An explicit
+			// H3 claim cannot yield and simply stays acquired across a hold.
+			if reservation != nil {
+				yielded := reservation.Yield()
+				if preempted && !yielded {
+					return
+				}
 			}
 		}
 	})
@@ -1666,6 +1736,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				}
 			}
 		}()
+		if !self.waitDialAdmission(self.ctx) {
+			return
+		}
 		auth := self.authSnapshot()
 		clientId, _ := auth.ClientId()
 
@@ -1677,9 +1750,10 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				header.Add("X-UR-AppVersion", auth.AppVersion)
 				header.Add("X-UR-InstanceId", auth.InstanceId.String())
 				header.Add("X-UR-TransportVersion", fmt.Sprintf("%d", TransportVersion))
+				self.applyIntentHeader(header)
 			}
 
-			ws, _, err := self.clientStrategy.WsDialContext(self.ctx, self.platformUrl, header)
+			ws, _, err := self.clientStrategy.WsDialContext(self.dialContext(self.ctx), self.platformUrl, header)
 			if err != nil {
 				return nil, err
 			}
@@ -1697,6 +1771,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					ByJwt:      auth.ByJwt,
 					AppVersion: auth.AppVersion,
 					InstanceId: auth.InstanceId.Bytes(),
+					IpFamily:   self.authIntent(),
 				}, self.settings.ProtocolVersion)
 				if err != nil {
 					return nil, err
@@ -1735,18 +1810,12 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		// the shared serializing staircase; see NextReconnectTime. The release
 		// frees the fast-path slot as soon as the dial attempt completes, on
 		// every exit path.
-		var connectTime time.Time
-		releaseReconnect := func() {}
-		cancelConnect := func() {}
-		if hadConnection {
-			connectTime, releaseReconnect = self.clientStrategy.NextReconnectTime()
-			hadConnection = false
-		} else {
-			// cancelConnect gives the staircase reservation back if this wait
-			// is cancelled before the dial happens; it must NOT be called once
-			// the dial proceeds — see NextConnectTime
-			connectTime, cancelConnect = self.clientStrategy.NextConnectTime()
-		}
+		// cancelConnect gives the staircase reservation back if this wait is
+		// cancelled before the dial happens; it must NOT be called once the
+		// dial proceeds — see NextConnectTime. A pinned transport paces
+		// itself and returns no-ops for both.
+		connectTime, releaseReconnect, cancelConnect := self.nextDialTime(hadConnection)
+		hadConnection = false
 		if connectDelay := connectTime.Sub(time.Now()); 0 < connectDelay {
 			select {
 			case <-self.ctx.Done():
@@ -1777,7 +1846,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			// gated. The contract OOB path makes the same carve-out on
 			// client.Done.
 			if self.ctx.Err() == nil {
-				noteBackendFailure()
+				self.noteDialFailure()
 			}
 			if ok, suppressed := shouldLogAuthErr(); ok {
 				if suppressed > 0 {
@@ -1797,6 +1866,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				// path — retry now over the new one instead of waiting out
 				// the backoff, and take the reconnect fast path (a network
 				// change is a legitimate fresh start, not staircase churn)
+				self.noteKick()
 				hadConnection = true
 				continue
 			case <-reconnect.After():
@@ -1805,7 +1875,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		}
 
 		// auth succeeded: the backend is reachable
-		noteBackendSuccess()
+		self.noteDialSuccess()
 
 		c := func() {
 			defer ws.Close()
@@ -2412,6 +2482,9 @@ func (self *PlatformTransport) runH3(
 		if ctx.Err() != nil {
 			return
 		}
+		if !self.waitDialAdmission(ctx) {
+			return
+		}
 		auth := self.authSnapshot()
 		clientId, _ := auth.ClientId()
 
@@ -2433,6 +2506,7 @@ func (self *PlatformTransport) runH3(
 				ByJwt:      auth.ByJwt,
 				AppVersion: auth.AppVersion,
 				InstanceId: auth.InstanceId.Bytes(),
+				IpFamily:   self.authIntent(),
 			}
 			SetH3DatagramAuthOffer(authMessage, self.settings.EnableH3Datagrams)
 			authBytes, err := EncodeFrame(authMessage, self.settings.ProtocolVersion)
@@ -2455,196 +2529,36 @@ func (self *PlatformTransport) runH3(
 				tlsConfig = &tls.Config{}
 			}
 
-			var packetConn net.PacketConn
-			var udpConn *net.UDPConn
-			// an injected endpoint owns its own routing, so only the host UDP
-			// socket is pinned to the physical egress interface.
-			egressPinned := false
-			if ptMode == TransportModeH3 && self.settings.H3PacketConnFactory != nil {
-				packetConn, err = self.settings.H3PacketConnFactory(attemptCtx)
-			} else {
-				udpConn, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
-				if err == nil {
-					// bind to the physical egress interface so the platform
-					// QUIC connection never loops into the tunnel this process
-					// provides (R1); a no-op off Windows and when no egress
-					// index is set. a bind failure is not fatal -- the
-					// connection is still worth attempting -- but it must not
-					// be silent: an unpinned socket here follows the route
-					// table into our own tun and blackholes, which is
-					// indistinguishable from a dead network unless someone
-					// says so.
-					egressPinned = egressBound()
-					if bindErr := applyEgress(udpConn); bindErr != nil {
-						egressPinned = false
-						self.log.Infof("[tr]egress bind failed, the platform connection may loop into the tunnel: %s\n", bindErr)
-					}
-					packetConn = udpConn
-				}
-			}
-			if err != nil {
-				// A factory can return a usable endpoint together with an error.
-				// Ownership transfers on every non-nil return, including this
-				// rejected result.
-				if packetConn != nil {
-					packetConn.Close()
-				}
-				return nil, err
-			}
-			if packetConn == nil {
-				return nil, fmt.Errorf("H3 packet connection factory returned nil")
-			}
-			packetConn = capPlatformPacketConn(
-				packetConn,
-				self.h3SocketReadBufferByteCount(),
-				self.h3SocketWriteBufferByteCount(),
-			)
-			// single close path: once packetConn is bound (either directly
-			// to udpConn or wrapping it via packetTranslation), it owns the
-			// close. before that, we close udpConn directly. avoids the
-			// double-close on udpConn when packetConn == udpConn or when
-			// packetTranslation.Close closes its inner udpConn.
-			defer func() {
-				if success {
-					return
-				}
-				if packetConn != nil {
-					packetConn.Close()
-				} else if udpConn != nil {
-					udpConn.Close()
-				}
-			}()
-
 			serverName, err := connectHost(self.platformUrl)
 			if err != nil {
 				return nil, err
 			}
-			var udpAddr *net.UDPAddr
-			switch ptMode {
-			case TransportModeH3Dns:
-				tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
-				// The strategy resolver applies the network-space DoH policy
-				// before preserving the existing egress-aware fallback. The
-				// socket can be pinned above while an OS name query still loops
-				// into this process's own tunnel. See egress_dial.go.
-				udpAddr, err = self.clientStrategy.resolveControlUDPAddr(attemptCtx, fmt.Sprintf("%s:%d", serverName, self.settings.DnsPort))
-				if err != nil {
-					return nil, err
-				}
-				ptSettings := DefaultPacketTranslationSettings()
-				ptSettings.DnsTlds = [][]byte{tld}
-				// The connection cleanup owns the translated PacketConn. Keep its
-				// encoder alive while cancellation closes QUIC gracefully; otherwise
-				// the parent cancellation can discard the CONNECTION_CLOSE before
-				// CloseWithError reaches the wire and leave a stale server route.
-				packetConn, err = NewPacketTranslation(
-					context.WithoutCancel(attemptCtx),
-					PacketTranslationModeDns,
-					packetConn,
-					ptSettings,
-				)
-				if err != nil {
-					return nil, err
-				}
-			case TransportModeH3DnsPump:
-				tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
-				pumpServerName := strings.TrimSpace(self.settings.DnsPumpHost)
-				if pumpServerName == "" {
-					return nil, fmt.Errorf("H3 DNS pump host is empty")
-				}
-				udpAddr, err = self.clientStrategy.resolveControlUDPAddr(attemptCtx, fmt.Sprintf("%s:%d", pumpServerName, self.settings.DnsPort))
-				if err != nil {
-					return nil, err
-				}
-				ptSettings := DefaultPacketTranslationSettings()
-				ptSettings.DnsTlds = [][]byte{tld}
-				packetConn, err = NewPacketTranslation(
-					context.WithoutCancel(attemptCtx),
-					PacketTranslationModeDnsPump,
-					packetConn,
-					ptSettings,
-				)
-				if err != nil {
-					return nil, err
-				}
-			default:
-				udpAddr, err = self.clientStrategy.resolveControlUDPAddr(attemptCtx, fmt.Sprintf("%s:%d", serverName, self.settings.H3Port))
-				if err != nil {
-					return nil, err
-				}
-			}
-
-			// packetConn, not udpConn: an injected endpoint has no host socket,
-			// and a packet translation reports the address of the one it wraps.
-			self.log.Infof("[c]h3 connect to %v (%s) local=%v bound=%t\n", udpAddr, serverName, packetConn.LocalAddr(), egressPinned)
-
 			tlsConfig.ServerName = serverName
-			quicTransport := &quic.Transport{
-				Conn: packetConn,
-				// createdConn: true,
-				// isSingleUse: true,
-			}
-			defer func() {
-				if !success {
-					quicTransport.Close()
-				}
-			}()
-			handshakeAttempt := self.settings.H3QuicPacketStats.beginHandshakeAttempt()
-			if handshakeAttempt != nil {
-				quicConfig.Tracer = self.settings.H3QuicPacketStats.tracerForAttempt(handshakeAttempt)
-			}
-			conn, err := quicTransport.DialEarly(attemptCtx, udpAddr, tlsConfig, quicConfig)
 
-			// conn, err := quic.Dial(self.ctx, packetConn, packetConn.ConnectedAddr(), self.settings.QuicTlsConfig, quicConfig)
+			// the candidate addresses in dial order, and how each socket is
+			// wrapped for the mode. One candidate is dialed directly; several
+			// race, v6 first with a stagger (see raceH3Dial).
+			candidates, wrapPacketConn, err := self.h3DialCandidates(attemptCtx, ptMode, serverName)
 			if err != nil {
-				handshakeAttempt.finish(false)
-				if handshakeAttempt.sentWithoutResponse() {
-					self.log.Infof(
-						"[c]h3 handshake no response mode=%s sent_packets=%d pto=%d err=%s\n",
-						ptMode,
-						handshakeAttempt.sent.Load(),
-						handshakeAttempt.pto.Load(),
-						err,
-					)
-				}
-				self.log.Infof("[c]h3 connect err = %s\n", err)
 				return nil, err
 			}
-			// DialEarly may return as soon as cached 0-RTT transport parameters
-			// are available, before the peer has answered this connection. Keep
-			// the attempt open until QUIC confirms the handshake or the connection
-			// dies; otherwise an Initial blackhole after a 0-RTT dial is falsely
-			// counted as a success and never reaches the no-response signal.
-			if handshakeAttempt != nil {
-				go func() {
-					handshakeComplete := conn.HandshakeComplete()
-					select {
-					case <-handshakeComplete:
-						handshakeAttempt.finish(true)
-					case <-conn.Context().Done():
-						// If both channels closed together, handshake completion wins.
-						select {
-						case <-handshakeComplete:
-							handshakeAttempt.finish(true)
-							return
-						default:
-						}
-						handshakeAttempt.finish(false)
-						if handshakeAttempt.sentWithoutResponse() {
-							self.log.Infof(
-								"[c]h3 handshake no response mode=%s sent_packets=%d pto=%d err=%s\n",
-								ptMode,
-								handshakeAttempt.sent.Load(),
-								handshakeAttempt.pto.Load(),
-								context.Cause(conn.Context()),
-							)
-						}
-					}
-				}()
+			var attempt *h3DialAttempt
+			if len(candidates) == 1 {
+				attempt, err = self.dialH3(attemptCtx, ptMode, candidates[0], wrapPacketConn, tlsConfig, quicConfig, slowMultiple, false)
+			} else {
+				attempt, err = raceH3Dial(attemptCtx, candidates, func(dialCtx context.Context, udpAddr *net.UDPAddr) (*h3DialAttempt, error) {
+					return self.dialH3(dialCtx, ptMode, udpAddr, wrapPacketConn, tlsConfig, quicConfig, slowMultiple, true)
+				})
 			}
+			if err != nil {
+				return nil, err
+			}
+			conn := attempt.conn
+			packetConn := attempt.packetConn
+			quicTransport := attempt.quicTransport
 			defer func() {
 				if !success {
-					conn.CloseWithError(0, "")
+					attempt.close()
 				}
 			}()
 
@@ -2702,18 +2616,12 @@ func (self *PlatformTransport) runH3(
 		// the shared serializing staircase; see NextReconnectTime. The release
 		// frees the fast-path slot as soon as the dial attempt completes, on
 		// every exit path.
-		var connectTime time.Time
-		releaseReconnect := func() {}
-		cancelConnect := func() {}
-		if hadConnection {
-			connectTime, releaseReconnect = self.clientStrategy.NextReconnectTime()
-			hadConnection = false
-		} else {
-			// cancelConnect gives the staircase reservation back if this wait
-			// is cancelled before the dial happens; it must NOT be called once
-			// the dial proceeds — see NextConnectTime
-			connectTime, cancelConnect = self.clientStrategy.NextConnectTime()
-		}
+		// cancelConnect gives the staircase reservation back if this wait is
+		// cancelled before the dial happens; it must NOT be called once the
+		// dial proceeds — see NextConnectTime. A pinned transport paces
+		// itself and returns no-ops for both.
+		connectTime, releaseReconnect, cancelConnect := self.nextDialTime(hadConnection)
+		hadConnection = false
 		if connectDelay := connectTime.Sub(time.Now()); 0 < connectDelay {
 			select {
 			case <-ctx.Done():
@@ -2761,7 +2669,7 @@ func (self *PlatformTransport) runH3(
 			// client.Done.
 			if ctx.Err() == nil {
 				if !attemptCanceled {
-					noteBackendFailure()
+					self.noteDialFailure()
 				}
 			}
 			if ok, suppressed := shouldLogAuthErr(); ok {
@@ -2780,6 +2688,7 @@ func (self *PlatformTransport) runH3(
 			case <-self.kickMonitor.NotifyChannel():
 				// network changed: retry now over the new path and take the
 				// reconnect fast path (see the h1 loop above)
+				self.noteKick()
 				hadConnection = true
 				continue
 			case <-reconnect.After():
@@ -2788,7 +2697,7 @@ func (self *PlatformTransport) runH3(
 		}
 
 		// auth succeeded: the backend is reachable
-		noteBackendSuccess()
+		self.noteDialSuccess()
 
 		conn := connStream.conn
 		stream := connStream.stream

@@ -499,6 +499,11 @@ func (self *ApiMultiClientGenerator) NextDestinations(count int, excludeDestinat
 	return self.NextDestinationsContext(self.ctx, count, excludeDestinations, rankMode)
 }
 
+// NextDestinationsWithIpFamily implements MultiClientGeneratorWithIpFamily.
+func (self *ApiMultiClientGenerator) NextDestinationsWithIpFamily(count int, excludeDestinations []MultiHopId, rankMode string, ipFamily IpFamilyFilter) (map[MultiHopId]DestinationStats, error) {
+	return self.nextDestinationsContext(self.ctx, count, excludeDestinations, rankMode, ipFamily)
+}
+
 // ExcludeClientIds snapshots durable constructor exclusions followed by
 // runtime exclusions in oldest-to-newest order.
 func (self *ApiMultiClientGenerator) ExcludeClientIds() []Id {
@@ -548,6 +553,13 @@ func (self *ApiMultiClientGenerator) ExcludeClientId(clientId Id) {
 // owned by the caller's maintenance deadline rather than only by the
 // generator's process-lifetime context.
 func (self *ApiMultiClientGenerator) NextDestinationsContext(ctx context.Context, count int, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error) {
+	return self.nextDestinationsContext(ctx, count, excludeDestinations, rankMode, IpFamilyFilterDefault)
+}
+
+// nextDestinationsContext is the discovery body shared by the plain and the
+// family-filtered entry points. The filter rides straight into find-providers2;
+// the server treats the empty filter as v4-capable.
+func (self *ApiMultiClientGenerator) nextDestinationsContext(ctx context.Context, count int, excludeDestinations []MultiHopId, rankMode string, ipFamily IpFamilyFilter) (map[MultiHopId]DestinationStats, error) {
 	excludeClientIds := self.ExcludeClientIds()
 	excludeDestinationsIds := [][]Id{}
 	for _, excludeDestination := range excludeDestinations {
@@ -622,6 +634,7 @@ func (self *ApiMultiClientGenerator) NextDestinationsContext(ctx context.Context
 			ExcludeDestinations: excludeDestinationsIds,
 			Count:               count,
 			RankMode:            rankMode,
+			IpFamily:            ipFamily,
 		}
 
 		result, err := self.api.FindProviders2SyncWithCtx(ctx, findProviders2)
@@ -650,6 +663,7 @@ func (self *ApiMultiClientGenerator) NextDestinationsContext(ctx context.Context
 					NetworkOnly:             provider.NetworkOnly,
 					ReputationFailures:      normalizeProviderReputationFailures(provider.ReputationFailedNames),
 					Location:                provider.Location,
+					IpFamily:                provider.IpFamily.Normalize(),
 				}
 			}
 		}

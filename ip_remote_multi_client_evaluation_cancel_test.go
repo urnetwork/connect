@@ -136,7 +136,7 @@ func requireChannelCreationState(
 	providerFailure := window.recordChannelCreationFailure(evaluationCtx, args, err)
 	window.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
 	if providerFailure {
-		window.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed, args.Destination.Tail(), args.Location)
+		window.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed, args.Destination.Tail(), args.Location, args.IpFamily)
 	}
 
 	if wantProviderEvent {

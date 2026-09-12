@@ -163,10 +163,12 @@ func TestMergedWindowMinimumSatisfiedAtStrictOwnershipCeiling(t *testing.T) {
 	quality.AddWindowExpandEvent(
 		windowMinSatisfied(4, 3, 1, false, true, 4),
 		4,
+		false,
 	)
 	speed.AddWindowExpandEvent(
 		windowMinSatisfied(1, 0, 1, false, true, 1),
 		1,
+		false,
 	)
 
 	if !merged.WindowExpandEvent().MinSatisfied {

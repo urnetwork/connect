@@ -16,13 +16,30 @@ import (
 
 	"github.com/urnetwork/connect/protocol"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
+
+// streamFastPathBatchConn is the batch syscall surface shared by x/net's ipv4
+// and ipv6 packet conns; their Message types are one alias, so one node serves
+// both families.
+type streamFastPathBatchConn interface {
+	ReadBatch(messages []ipv4.Message, flags int) (int, error)
+	WriteBatch(messages []ipv4.Message, flags int) (int, error)
+}
+
+// newStreamFastPathBatchConn wraps the socket in the batch conn of its family.
+func newStreamFastPathBatchConn(ipVersion int, udpConn *net.UDPConn) streamFastPathBatchConn {
+	if ipVersion == 6 {
+		return ipv6.NewPacketConn(udpConn)
+	}
+	return ipv4.NewPacketConn(udpConn)
+}
 
 // One socket represents one client in a directional stream. The same shape
 // works for the source, every intermediary, and the destination.
 type streamFastPathLoopbackNode struct {
 	udpConn       *net.UDPConn
-	packetConn    *ipv4.PacketConn
+	packetConn    streamFastPathBatchConn
 	address       *net.UDPAddr
 	addressPort   netip.AddrPort
 	readBuffers   [][]byte
@@ -35,16 +52,11 @@ type streamFastPathLoopbackNode struct {
 // Buffers and message vectors are fixed before the benchmark timer starts.
 func newStreamFastPathLoopbackNode(
 	b *testing.B,
+	ipVersion int,
 	batchSize int,
 ) *streamFastPathLoopbackNode {
 	b.Helper()
-	udpConn, err := net.ListenUDP(
-		"udp4",
-		&net.UDPAddr{
-			IP:   net.IPv4(127, 0, 0, 1),
-			Port: 0,
-		},
-	)
+	udpConn, err := net.ListenUDP(testUdpNetwork(ipVersion), testLoopbackUdpAddr(ipVersion))
 	if err != nil {
 		b.Fatalf("listen udp: %s", err)
 	}
@@ -63,7 +75,7 @@ func newStreamFastPathLoopbackNode(
 
 	node := &streamFastPathLoopbackNode{
 		udpConn:       udpConn,
-		packetConn:    ipv4.NewPacketConn(udpConn),
+		packetConn:    newStreamFastPathBatchConn(ipVersion, udpConn),
 		address:       udpConn.LocalAddr().(*net.UDPAddr),
 		addressPort:   udpConn.LocalAddr().(*net.UDPAddr).AddrPort(),
 		readBuffers:   make([][]byte, batchSize),
@@ -176,13 +188,14 @@ func (self *streamFastPathLoopbackNode) readBatch(packetCount int) ([][]byte, er
 // measures aggregate work, not the parallel pipeline of deployed hop clients.
 func benchmarkStreamFastPathUDPEndToEnd(
 	b *testing.B,
+	ipVersion int,
 	hopCount int,
 	batchSize int,
 ) {
 	chain := newStreamFastPathTestChain(b, hopCount)
 	nodes := make([]*streamFastPathLoopbackNode, hopCount+1)
 	for nodeIndex := range nodes {
-		nodes[nodeIndex] = newStreamFastPathLoopbackNode(b, batchSize)
+		nodes[nodeIndex] = newStreamFastPathLoopbackNode(b, ipVersion, batchSize)
 		defer nodes[nodeIndex].udpConn.Close()
 	}
 
@@ -262,13 +275,14 @@ func benchmarkStreamFastPathUDPEndToEnd(
 // measurement.
 func benchmarkStreamFastPathUDPPipeline(
 	b *testing.B,
+	ipVersion int,
 	hopCount int,
 	batchSize int,
 ) {
 	chain := newStreamFastPathTestChain(b, hopCount)
 	nodes := make([]*streamFastPathLoopbackNode, hopCount+1)
 	for nodeIndex := range nodes {
-		nodes[nodeIndex] = newStreamFastPathLoopbackNode(b, batchSize)
+		nodes[nodeIndex] = newStreamFastPathLoopbackNode(b, ipVersion, batchSize)
 		defer nodes[nodeIndex].udpConn.Close()
 	}
 
@@ -467,72 +481,98 @@ func BenchmarkStreamFastPathEndToEndNineHops(b *testing.B) {
 
 // This exposes the one-datagram syscall floor without batching.
 func BenchmarkStreamFastPathUDPOneHopSinglePacket(b *testing.B) {
-	benchmarkStreamFastPathUDPEndToEnd(b, 1, 1)
+	forEachIpVersionBenchmark(b, func(b *testing.B, ipVersion int) {
+		benchmarkStreamFastPathUDPEndToEnd(b, ipVersion, 1, 1)
+	})
 }
 
 // This measures the H1-sized four-packet drain at the P2P UDP boundary.
 func BenchmarkStreamFastPathUDPOneHopBatch4(b *testing.B) {
-	benchmarkStreamFastPathUDPEndToEnd(b, 1, 4)
+	forEachIpVersionBenchmark(b, func(b *testing.B, ipVersion int) {
+		benchmarkStreamFastPathUDPEndToEnd(b, ipVersion, 1, 4)
+	})
 }
 
 // This measures the proposed eight-packet drain at the P2P UDP boundary.
 func BenchmarkStreamFastPathUDPOneHopBatch8(b *testing.B) {
-	benchmarkStreamFastPathUDPEndToEnd(b, 1, 8)
+	forEachIpVersionBenchmark(b, func(b *testing.B, ipVersion int) {
+		benchmarkStreamFastPathUDPEndToEnd(b, ipVersion, 1, 8)
+	})
 }
 
 // This is the primary clean-path comparison with the production 64-packet
 // drain size. On Linux the socket layer uses sendmmsg and recvmmsg.
 func BenchmarkStreamFastPathUDPOneHopBatch64(b *testing.B) {
-	benchmarkStreamFastPathUDPEndToEnd(b, 1, 64)
+	forEachIpVersionBenchmark(b, func(b *testing.B, ipVersion int) {
+		benchmarkStreamFastPathUDPEndToEnd(b, ipVersion, 1, 64)
+	})
 }
 
 // This verifies that the identical UDP machinery composes through an
 // intermediary without a direct-endpoint special case.
 func BenchmarkStreamFastPathUDPTwoHopsBatch64(b *testing.B) {
-	benchmarkStreamFastPathUDPEndToEnd(b, 2, 64)
+	forEachIpVersionBenchmark(b, func(b *testing.B, ipVersion int) {
+		benchmarkStreamFastPathUDPEndToEnd(b, ipVersion, 2, 64)
+	})
 }
 
 // This applies the proposed eight-packet drain through one intermediary.
 func BenchmarkStreamFastPathUDPTwoHopsBatch8(b *testing.B) {
-	benchmarkStreamFastPathUDPEndToEnd(b, 2, 8)
+	forEachIpVersionBenchmark(b, func(b *testing.B, ipVersion int) {
+		benchmarkStreamFastPathUDPEndToEnd(b, ipVersion, 2, 8)
+	})
 }
 
 // This measures the existing maximum of eight intermediaries and nine hops.
 func BenchmarkStreamFastPathUDPNineHopsBatch64(b *testing.B) {
-	benchmarkStreamFastPathUDPEndToEnd(b, MaxMultihopLength+1, 64)
+	forEachIpVersionBenchmark(b, func(b *testing.B, ipVersion int) {
+		benchmarkStreamFastPathUDPEndToEnd(b, ipVersion, MaxMultihopLength+1, 64)
+	})
 }
 
 // This overlaps source and destination work as separate client stages.
 func BenchmarkStreamFastPathUDPPipelineOneHopBatch64(b *testing.B) {
-	benchmarkStreamFastPathUDPPipeline(b, 1, 64)
+	forEachIpVersionBenchmark(b, func(b *testing.B, ipVersion int) {
+		benchmarkStreamFastPathUDPPipeline(b, ipVersion, 1, 64)
+	})
 }
 
 // This measures a four-packet ready drain with independently scheduled P2P
 // endpoint stages.
 func BenchmarkStreamFastPathUDPPipelineOneHopBatch4(b *testing.B) {
-	benchmarkStreamFastPathUDPPipeline(b, 1, 4)
+	forEachIpVersionBenchmark(b, func(b *testing.B, ipVersion int) {
+		benchmarkStreamFastPathUDPPipeline(b, ipVersion, 1, 4)
+	})
 }
 
 // This measures an eight-packet ready drain with independently scheduled P2P
 // endpoint stages.
 func BenchmarkStreamFastPathUDPPipelineOneHopBatch8(b *testing.B) {
-	benchmarkStreamFastPathUDPPipeline(b, 1, 8)
+	forEachIpVersionBenchmark(b, func(b *testing.B, ipVersion int) {
+		benchmarkStreamFastPathUDPPipeline(b, ipVersion, 1, 8)
+	})
 }
 
 // This adds one independently running intermediary.
 func BenchmarkStreamFastPathUDPPipelineTwoHopsBatch64(b *testing.B) {
-	benchmarkStreamFastPathUDPPipeline(b, 2, 64)
+	forEachIpVersionBenchmark(b, func(b *testing.B, ipVersion int) {
+		benchmarkStreamFastPathUDPPipeline(b, ipVersion, 2, 64)
+	})
 }
 
 // This applies the eight-packet pipeline through one independently scheduled
 // intermediary.
 func BenchmarkStreamFastPathUDPPipelineTwoHopsBatch8(b *testing.B) {
-	benchmarkStreamFastPathUDPPipeline(b, 2, 8)
+	forEachIpVersionBenchmark(b, func(b *testing.B, ipVersion int) {
+		benchmarkStreamFastPathUDPPipeline(b, ipVersion, 2, 8)
+	})
 }
 
 // This fills the supported eight-intermediary stream on independent stages.
 func BenchmarkStreamFastPathUDPPipelineNineHopsBatch64(b *testing.B) {
-	benchmarkStreamFastPathUDPPipeline(b, MaxMultihopLength+1, 64)
+	forEachIpVersionBenchmark(b, func(b *testing.B, ipVersion int) {
+		benchmarkStreamFastPathUDPPipeline(b, ipVersion, MaxMultihopLength+1, 64)
+	})
 }
 
 // This is the direct legacy comparison for the same 1,380 useful bytes. It

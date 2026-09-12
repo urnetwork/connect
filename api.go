@@ -365,6 +365,10 @@ type FindProviders2Args struct {
 	ExcludeDestinations [][]Id          `json:"exclude_destinations,omitempty"`
 	RankMode            string          `json:"rank_mode"`
 	ForceMinimum        bool            `json:"force_minimum,omitempty"`
+	// IpFamily filters providers by proven address family. Empty means
+	// v4-capable, which is every provider an older server knows, so an older
+	// client keeps today's behavior. See ip_family.go.
+	IpFamily IpFamilyFilter `json:"ip_family,omitempty"`
 }
 
 type FindProviders2Result struct {
@@ -386,6 +390,9 @@ type FindProvidersProvider struct {
 	// Location is the provider's location. nil when the server does not know
 	// it (or an older server).
 	Location *ProviderLocation `json:"location,omitempty"`
+	// IpFamily is the provider's proven address-family category. Empty from
+	// an older server, which the client treats as v4-only (legacy).
+	IpFamily IpFamily `json:"ip_family,omitempty"`
 }
 
 func (self *BringYourApi) FindProviders2(findProviders2 *FindProviders2Args, callback FindProviders2Callback) {

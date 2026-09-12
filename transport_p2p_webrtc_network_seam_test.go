@@ -15,18 +15,37 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
+// testWebRtcSeamNetwork is the injected virtual network for the family under
+// test: a private CIDR carrying one static address, so a candidate that does
+// not come from the injected network is recognizable in the SDP.
+func testWebRtcSeamNetwork(ipVersion int) (cidr string, staticIp string, listenNetwork string, listenAddr string) {
+	if ipVersion == 6 {
+		return "fd77::/64", "fd77::2", "udp6", "[::]:0"
+	}
+	return "10.77.0.0/24", "10.77.0.2", "udp4", "0.0.0.0:0"
+}
+
 // Injected candidate enumeration takes precedence over host and loopback
 // selection, while peer teardown leaves the shared network usable by its owner.
+// Both families run: the seam is family-agnostic, and a v6-only virtual
+// network proves the factory does not quietly fall back to host v4 selection.
 func TestWebRtcPeerConnectionFactoryUsesCallerOwnedNetwork(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testWebRtcPeerConnectionFactoryUsesCallerOwnedNetwork(t, ipVersion)
+	})
+}
+
+func testWebRtcPeerConnectionFactoryUsesCallerOwnedNetwork(t *testing.T, ipVersion int) {
+	cidr, staticIp, listenNetwork, listenAddr := testWebRtcSeamNetwork(ipVersion)
 	router, err := vnet.NewRouter(&vnet.RouterConfig{
-		CIDR:          "10.77.0.0/24",
+		CIDR:          cidr,
 		MinDelay:      time.Millisecond,
 		LoggerFactory: logging.NewDefaultLoggerFactory(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	network, err := vnet.NewNet(&vnet.NetConfig{StaticIPs: []string{"10.77.0.2"}})
+	network, err := vnet.NewNet(&vnet.NetConfig{StaticIPs: []string{staticIp}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,15 +100,15 @@ func TestWebRtcPeerConnectionFactoryUsesCallerOwnedNetwork(t *testing.T) {
 		t.Fatal("virtual-network candidate gathering timed out")
 	}
 	localDescription := peerConnection.LocalDescription()
-	if localDescription == nil || !strings.Contains(localDescription.SDP, "10.77.0.2") {
+	if localDescription == nil || !strings.Contains(localDescription.SDP, staticIp) {
 		peerConnection.Close()
-		t.Fatalf("local candidates do not contain the injected address: %v", localDescription)
+		t.Fatalf("local candidates do not contain the injected address %s: %v", staticIp, localDescription)
 	}
 	if err := peerConnection.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	packetConn, err := network.ListenPacket("udp4", "0.0.0.0:0")
+	packetConn, err := network.ListenPacket(listenNetwork, listenAddr)
 	if err != nil {
 		t.Fatalf("peer teardown closed the caller-owned network: %v", err)
 	}

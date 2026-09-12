@@ -40,11 +40,18 @@ import (
 
 // --- dns answer parsing ---
 
-// parseDnsAResponse reads the A records out of a dns response, matching it to
-// the query by transaction id. It parses only what the prober needs -- the
-// header, enough of the question section to skip it, and the answer records'
-// type/class/rdata -- and treats everything unexpected as "no records" rather
-// than trying to be a resolver.
+// parseDnsAResponse reads the A records out of a dns response: the v4 form
+// of parseDnsAddressResponse.
+func parseDnsAResponse(payload []byte, id uint16) ([]net.IP, bool) {
+	return parseDnsAddressResponse(payload, id, 4)
+}
+
+// parseDnsAddressResponse reads the address records of one family out of a
+// dns response -- A over v4, AAAA over v6 -- matching it to the query by
+// transaction id. It parses only what the prober needs -- the header, enough
+// of the question section to skip it, and the answer records' type/class/rdata
+// -- and treats everything unexpected as "no records" rather than trying to
+// be a resolver.
 //
 // The return contract: ok reports a well-formed response bearing the expected
 // id (an NXDOMAIN or an answerless response is still ok -- the resolver
@@ -52,7 +59,12 @@ import (
 // a packet that is not a response at all return (nil, false), and the caller
 // treats that exactly like silence. A parser error must never be distinguishable
 // from no answer, because there is nothing honest to do with the distinction.
-func parseDnsAResponse(payload []byte, id uint16) ([]net.IP, bool) {
+func parseDnsAddressResponse(payload []byte, id uint16, ipVersion int) ([]net.IP, bool) {
+	wantRecordType := probeDnsRecordTypeForIpVersion(ipVersion)
+	wantRdataLength := net.IPv4len
+	if ipVersion == 6 {
+		wantRdataLength = net.IPv6len
+	}
 	if len(payload) < 12 {
 		return nil, false
 	}
@@ -103,12 +115,13 @@ func parseDnsAResponse(payload []byte, id uint16) ([]net.IP, bool) {
 		if len(payload) < rdataStart+rdataLength {
 			return nil, false
 		}
-		// type A (1), class IN (1), 4-byte rdata; every other record type
-		// (CNAME chains, AAAA, dnssec baggage) is skipped, not an error --
-		// resolvers legitimately mix them into an A response
-		if recordType == 1 && recordClass == 1 && rdataLength == 4 {
-			ip := make(net.IP, 4)
-			copy(ip, payload[rdataStart:rdataStart+4])
+		// the wanted address type (A, 4-byte rdata, or AAAA, 16-byte rdata),
+		// class IN (1); every other record type (CNAME chains, the other
+		// family's address, dnssec baggage) is skipped, not an error --
+		// resolvers legitimately mix them into an address response
+		if recordType == wantRecordType && recordClass == 1 && rdataLength == wantRdataLength {
+			ip := make(net.IP, wantRdataLength)
+			copy(ip, payload[rdataStart:rdataStart+wantRdataLength])
 			ips = append(ips, ip)
 		}
 		offset = rdataStart + rdataLength
@@ -157,9 +170,11 @@ func probeSampleWidth(reliabilitySettings *ReliabilitySettings) int {
 }
 
 // probeResolveNames resolves names by asking resolverIp over udp/53 THROUGH
-// the probed channel, one A query per name, all in flight together against one
-// deadline. It returns the addresses per name and whether the resolver
-// answered anything at all -- the signal the caller's fallback keys on.
+// the probed channel, one address query per name (A over a v4 resolver,
+// AAAA over a v6 one, so the answers are dialable over the same family), all
+// in flight together against one deadline. It returns the addresses per name
+// and whether the resolver answered anything at all -- the signal the
+// caller's fallback keys on.
 //
 // These queries are real probes: each one sent counts probesSent and each
 // answer counts probesAnswered (the provider demonstrably carried them), but
@@ -178,6 +193,12 @@ func (self *RemoteUserNatMultiClient) probeResolveNames(
 ) (resolved map[string][]net.IP, resolverAnswered bool) {
 	resolved = map[string][]net.IP{}
 	if self == nil || client == nil || resolverIp == nil || len(names) == 0 {
+		return
+	}
+	// the resolver's family is the pass's family: the query type and the
+	// records the parser keeps follow it
+	_, ipVersion, ok := probeSourceIpFor(resolverIp)
+	if !ok {
 		return
 	}
 	if timeout <= 0 {
@@ -251,7 +272,7 @@ waiting:
 		resolverAnswered = true
 		// the transaction id rode the same draw as the syn sequence (see
 		// probePacket), which is what ties the answer to this query
-		if ips, ok := parseDnsAResponse(r.probe.answer, uint16(r.probe.synSequence)); ok && 0 < len(ips) {
+		if ips, ok := parseDnsAddressResponse(r.probe.answer, uint16(r.probe.synSequence), ipVersion); ok && 0 < len(ips) {
 			resolved[r.name] = ips
 		}
 	}
@@ -274,15 +295,22 @@ func probeSeedBase(destination MultiHopId) uint64 {
 	return h.Sum64()
 }
 
-// probeFallbackLiteralTargets is the resolver-down fallback: every health host
-// in the table that is already a literal ip, dialable with no resolution at
-// all. This is what keeps "the sampled resolver is down" from reading as "the
-// provider is unqualifiable" -- the pass still asks real dial questions, just
-// fewer of them.
+// probeFallbackLiteralTargets is the v4 form of
+// probeFallbackLiteralTargetsForIpVersion.
 func probeFallbackLiteralTargets() []probeTarget {
+	return probeFallbackLiteralTargetsForIpVersion(4)
+}
+
+// probeFallbackLiteralTargetsForIpVersion is the resolver-down fallback:
+// every health host in the table that is a literal ip of the pass's family
+// (a v4 literal stands for its v6 sibling over v6, see probeLiteralHostIp),
+// dialable with no resolution at all. This is what keeps "the sampled
+// resolver is down" from reading as "the provider is unqualifiable" -- the
+// pass still asks real dial questions, just fewer of them.
+func probeFallbackLiteralTargetsForIpVersion(ipVersion int) []probeTarget {
 	targets := []probeTarget{}
 	for _, host := range probeHostNames {
-		if ip := net.ParseIP(host); ip != nil {
+		if ip, ok := probeLiteralHostIp(host, ipVersion); ok {
 			targets = append(targets, probeHostTarget(host, ip))
 		}
 	}
@@ -302,6 +330,25 @@ func probeFallbackLiteralTargets() []probeTarget {
 // reason that is not about the provider. A pass that ends with zero buildable
 // targets sends nothing and records nothing -- probeExit's empty-targets
 // contract.
+//
+// WHICH FAMILY A PASS ASKS OVER (IPV6.md B1)
+//
+// A pass asks its questions over one address family, chosen from the exit's
+// category by probeIpVersionForFamily: v4-capable exits (v4-only, legacy) are
+// asked over v4, a v6-only exit over v6, and a dualstack exit alternates by
+// pass index so both of its families are proven over consecutive passes. The
+// family drives everything the pass builds -- the resolver drawn, the literal
+// hosts (a v4 literal stands for its v6 sibling), the record type queried
+// and parsed, and the packets themselves. A family the exit cannot carry is
+// never asked, so a v6-only exit is never read as unqualifiable for failing
+// v4 questions that were never about the provider.
+//
+// Qualification is per provider, not per family: a dualstack exit is proven
+// by EITHER family's pass. A v6 pass that fails while the v4 pass succeeds
+// records nothing against the exit (no pass ever does, see recordProbeFail),
+// and "this host has no v6 path" must not read as a provider fault -- the
+// same rule as B5, where only repeated dial failures on one family, with the
+// other healthy, downgrade an exit's category.
 //
 // The two stages share the configured ProbeTimeout each, so a fully silent
 // provider costs one pass at most ~2x ProbeTimeout -- bounded, and paid off
@@ -323,16 +370,30 @@ func (self *RemoteUserNatMultiClient) probeProviderPass(client *multiClientChann
 	// the pass index advances the rotation so repeated passes cover the table;
 	// it is read from the same record the pass will update. With the default
 	// full-table width the rotation is a no-op (every pass covers everything);
-	// it only matters when ProbeSampleHostCount narrows the pass.
+	// it only matters when ProbeSampleHostCount narrows the pass. The same
+	// index alternates a dualstack exit's family.
 	_, _, passIndex := self.qualificationSnapshot(destination)
-	hosts, resolver := sampleProbeTargets(probeSeedBase(destination)+uint64(passIndex), probeSampleWidth(reliabilitySettings))
+	seed := probeSeedBase(destination) + uint64(passIndex)
+	ipVersion := probeIpVersionForFamily(seed, client.IpFamily())
+	if !client.supportsIpVersion(ipVersion) {
+		// unreachable by construction (the category is what the version was
+		// chosen from), kept as the guard that makes the no-wrong-family
+		// rule structural: a pass over a family the exit cannot carry asks
+		// nothing and records nothing -- the empty-targets contract
+		return probeResult{}
+	}
+	hosts, resolver := sampleProbeTargetsForIpVersion(seed, probeSampleWidth(reliabilitySettings), ipVersion)
 
 	targets := []probeTarget{}
 	names := []string{}
 	for _, host := range hosts {
-		if ip := net.ParseIP(host); ip != nil {
+		if ip, ok := probeLiteralHostIp(host, ipVersion); ok {
 			// literal-ip health hosts skip resolution entirely
 			targets = append(targets, probeHostTarget(host, ip))
+		} else if net.ParseIP(host) != nil {
+			// a literal of the other family with no sibling in this one:
+			// not dialable over this pass and not resolvable either
+			continue
 		} else {
 			names = append(names, host)
 		}
@@ -348,8 +409,9 @@ func (self *RemoteUserNatMultiClient) probeProviderPass(client *multiClientChann
 		resolved, _ := self.probeResolveNames(client, resolverIp, names, timeout)
 		resolvedAny := false
 		for _, name := range names {
-			// first A record only: one dial question per name. More addresses
-			// for one name are the same site again, not more evidence.
+			// first address record only: one dial question per name. More
+			// addresses for one name are the same site again, not more
+			// evidence.
 			if ips := resolved[name]; 0 < len(ips) {
 				targets = append(targets, probeHostTarget(name, ips[0]))
 				resolvedAny = true
@@ -362,7 +424,7 @@ func (self *RemoteUserNatMultiClient) probeProviderPass(client *multiClientChann
 			// of whatever literals the sample held) rather than let one
 			// resolver outage read as an unqualifiable provider. The
 			// unanswered resolution queries themselves feed nothing.
-			targets = probeFallbackLiteralTargets()
+			targets = probeFallbackLiteralTargetsForIpVersion(ipVersion)
 		}
 	} else if resolverIp != nil {
 		// a sample with no hostnames (all literal) still owes the pass its
@@ -371,10 +433,10 @@ func (self *RemoteUserNatMultiClient) probeProviderPass(client *multiClientChann
 	}
 
 	if len(targets) == 0 {
-		// unreachable with the shipped table (it always has literal-ip hosts),
-		// but a pass must degrade to asking fewer questions, never to asking
-		// none while a fallback exists
-		targets = probeFallbackLiteralTargets()
+		// unreachable with the shipped table (it always has literal-ip hosts
+		// of both families), but a pass must degrade to asking fewer
+		// questions, never to asking none while a fallback exists
+		targets = probeFallbackLiteralTargetsForIpVersion(ipVersion)
 	}
 
 	return self.probeExit(client, targets, timeout, resolvedCount)

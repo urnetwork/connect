@@ -41,6 +41,17 @@ func TestBlockActionMatcher(t *testing.T) {
 		Hosts:         []string{"1.2.3.4"},
 		RouteOverride: &RouteOverride{Local: true},
 	}
+	// the v6 forms of the subnet and exact-ip rules
+	subnet6Override := &BlockActionOverride{
+		OverrideId:    NewId(),
+		Hosts:         []string{"2001:db8:9::/48"},
+		RouteOverride: &RouteOverride{Local: true},
+	}
+	addr6Override := &BlockActionOverride{
+		OverrideId:    NewId(),
+		Hosts:         []string{"2001:DB8::1:2:3:4"},
+		RouteOverride: &RouteOverride{Local: true},
+	}
 
 	matcher := newBlockActionMatcher([]*BlockActionOverride{
 		exactOverride,
@@ -48,6 +59,8 @@ func TestBlockActionMatcher(t *testing.T) {
 		wildcardBaseOverride,
 		subnetOverride,
 		addrOverride,
+		subnet6Override,
+		addr6Override,
 	})
 
 	match := func(addr string, serverNames ...string) *blockActionMatch {
@@ -81,6 +94,20 @@ func TestBlockActionMatcher(t *testing.T) {
 	// exact ip
 	AssertEqual(t, true, match("1.2.3.4").any())
 	AssertEqual(t, false, match("1.2.3.5").any())
+
+	// v6 subnet: inside the /48 matches, the neighboring /48 does not
+	m = match("2001:db8:9:42::1")
+	AssertEqual(t, true, m.routeOverride != nil)
+	AssertEqual(t, subnet6Override.OverrideId, m.routeOverrideId)
+	AssertEqual(t, false, match("2001:db8:8::1").any())
+
+	// v6 exact ip, case normalized; a v4 rule never matches a v6 address
+	// and the v6 rules never match v4
+	AssertEqual(t, true, match("2001:db8::1:2:3:4").any())
+	AssertEqual(t, false, match("2001:db8::1:2:3:5").any())
+	AssertEqual(t, false, match("::ffff:1.2.3.5").any())
+	m = match("2001:db8::1:2:3:4")
+	AssertEqual(t, true, m.matchedIps[netip.MustParseAddr("2001:db8::1:2:3:4")])
 
 	// B1: the exact host and ip that triggered a match are recorded (original case),
 	// so the UI can render which cluster members an override rule hit
@@ -441,10 +468,27 @@ func testingUdp4Packet(sourceIp string, destinationIp string, destinationPort in
 	return packet
 }
 
-func TestMultiClientBlockActionOverrides(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+// testBlockActionSourceIp is the tunnel-side source of the crafted packets.
+func testBlockActionSourceIp(ipVersion int) string {
+	if ipVersion == 4 {
+		return "10.0.0.5"
+	}
+	return "fd00::5"
+}
 
+// testBlockActionLoopbackSubnet is a prefix that contains the family's
+// loopback, for the subnet forms of the override and ignore rules.
+func testBlockActionLoopbackSubnet(ipVersion int) string {
+	if ipVersion == 4 {
+		return "127.0.0.0/8"
+	}
+	return "::/96"
+}
+
+// newBlockActionTestMultiClient is a multi client over an empty generator
+// whose security policy always drops, so every crafted packet reaches the
+// block-action decision.
+func newBlockActionTestMultiClient(ctx context.Context) (*RemoteUserNatMultiClient, *MultiClientSettings) {
 	securityPolicy := &testingFixedSecurityPolicy{
 		stats:  DefaultSecurityPolicyStatsCollector(),
 		result: SecurityPolicyResultDrop,
@@ -464,267 +508,259 @@ func TestMultiClientBlockActionOverrides(t *testing.T) {
 		protocol.ProvideMode_Network,
 		settings,
 	)
-	defer multiClient.Close()
+	return multiClient, settings
+}
 
-	source := SourceId(NewId())
+func TestMultiClientBlockActionOverrides(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	blockActionsChannel := make(chan []*BlockAction, 16)
-	unsub := multiClient.AddBlockActionCallback(func(blockActions []*BlockAction) {
-		blockActionsChannel <- blockActions
-	})
-	defer unsub()
+		multiClient, _ := newBlockActionTestMultiClient(ctx)
+		defer multiClient.Close()
 
-	nextBlockActions := func() []*BlockAction {
-		select {
-		case blockActions := <-blockActionsChannel:
-			return blockActions
-		case <-time.After(5 * time.Second):
-			t.Fatal("timeout waiting for block actions")
-			return nil
+		source := SourceId(NewId())
+
+		blockActionsChannel := make(chan []*BlockAction, 16)
+		unsub := multiClient.AddBlockActionCallback(func(blockActions []*BlockAction) {
+			blockActionsChannel <- blockActions
+		})
+		defer unsub()
+
+		nextBlockActions := func() []*BlockAction {
+			select {
+			case blockActions := <-blockActionsChannel:
+				return blockActions
+			case <-time.After(5 * time.Second):
+				t.Fatal("timeout waiting for block actions")
+				return nil
+			}
 		}
-	}
 
-	// drop policy, no bypass, no overrides -> blocked
-	packet := testingUdp4Packet("10.0.0.5", "127.0.0.1", 9, []byte("hello"))
-	success := multiClient.SendPacket(source, protocol.ProvideMode_Network, packet, 0)
-	AssertEqual(t, false, success)
+		loopback := testLoopbackIp(ipVersion)
 
-	blockActions := nextBlockActions()
-	AssertEqual(t, 1, len(blockActions))
-	AssertEqual(t, true, blockActions[0].Block)
-	AssertEqual(t, false, blockActions[0].Local)
-	AssertEqual(t, true, blockActions[0].BlockOverrideId == nil)
-	AssertEqual(t, 1, blockActions[0].PacketCount)
+		// drop policy, no bypass, no overrides -> blocked
+		packet := testingUdpPacket(ipVersion, testBlockActionSourceIp(ipVersion), loopback, 9, []byte("hello"))
+		success := multiClient.SendPacket(source, protocol.ProvideMode_Network, packet, 0)
+		AssertEqual(t, false, success)
 
-	packetStats := multiClient.PacketStats()
-	AssertEqual(t, int64(1), packetStats.BlockEgressPacketCount)
-	AssertEqual(t, ByteCount(len(packet)), packetStats.BlockEgressByteCount)
+		blockActions := nextBlockActions()
+		AssertEqual(t, 1, len(blockActions))
+		AssertEqual(t, true, blockActions[0].Block)
+		AssertEqual(t, false, blockActions[0].Local)
+		AssertEqual(t, true, blockActions[0].BlockOverrideId == nil)
+		AssertEqual(t, 1, blockActions[0].PacketCount)
 
-	// an un-block override routes the drop-classified traffic locally, never egress
-	unblockOverride := &BlockActionOverride{
-		OverrideId:    NewId(),
-		Hosts:         []string{"127.0.0.1"},
-		BlockOverride: &BlockOverride{Block: false},
-	}
-	multiClient.SetBlockActionOverrides([]*BlockActionOverride{unblockOverride})
+		packetStats := multiClient.PacketStats()
+		AssertEqual(t, int64(1), packetStats.BlockEgressPacketCount)
+		AssertEqual(t, ByteCount(len(packet)), packetStats.BlockEgressByteCount)
 
-	success = multiClient.SendPacket(source, protocol.ProvideMode_Network, packet, 0)
-	AssertEqual(t, true, success)
+		// an un-block override routes the drop-classified traffic locally, never egress
+		unblockOverride := &BlockActionOverride{
+			OverrideId:    NewId(),
+			Hosts:         []string{loopback},
+			BlockOverride: &BlockOverride{Block: false},
+		}
+		multiClient.SetBlockActionOverrides([]*BlockActionOverride{unblockOverride})
 
-	blockActions = nextBlockActions()
-	AssertEqual(t, 1, len(blockActions))
-	AssertEqual(t, false, blockActions[0].Block)
-	AssertEqual(t, true, blockActions[0].Local)
-	AssertEqual(t, true, blockActions[0].BlockOverrideId != nil)
-	AssertEqual(t, unblockOverride.OverrideId, *blockActions[0].BlockOverrideId)
+		success = multiClient.SendPacket(source, protocol.ProvideMode_Network, packet, 0)
+		AssertEqual(t, true, success)
 
-	packetStats = multiClient.PacketStats()
-	AssertEqual(t, int64(1), packetStats.LocalEgressPacketCount)
-	AssertEqual(t, int64(1), packetStats.BlockEgressPacketCount)
+		blockActions = nextBlockActions()
+		AssertEqual(t, 1, len(blockActions))
+		AssertEqual(t, false, blockActions[0].Block)
+		AssertEqual(t, true, blockActions[0].Local)
+		AssertEqual(t, true, blockActions[0].BlockOverrideId != nil)
+		AssertEqual(t, unblockOverride.OverrideId, *blockActions[0].BlockOverrideId)
 
-	// with bypass on, a block override blocks traffic that would route local
-	multiClient.SetLocalSecurityBypass(true)
-	blockOverride := &BlockActionOverride{
-		OverrideId:    NewId(),
-		Hosts:         []string{"127.0.0.0/8"},
-		BlockOverride: &BlockOverride{Block: true},
-	}
-	multiClient.SetBlockActionOverrides([]*BlockActionOverride{blockOverride})
+		packetStats = multiClient.PacketStats()
+		AssertEqual(t, int64(1), packetStats.LocalEgressPacketCount)
+		AssertEqual(t, int64(1), packetStats.BlockEgressPacketCount)
 
-	success = multiClient.SendPacket(source, protocol.ProvideMode_Network, packet, 0)
-	AssertEqual(t, false, success)
+		// with bypass on, a block override blocks traffic that would route local
+		multiClient.SetLocalSecurityBypass(true)
+		blockOverride := &BlockActionOverride{
+			OverrideId:    NewId(),
+			Hosts:         []string{testBlockActionLoopbackSubnet(ipVersion)},
+			BlockOverride: &BlockOverride{Block: true},
+		}
+		multiClient.SetBlockActionOverrides([]*BlockActionOverride{blockOverride})
 
-	blockActions = nextBlockActions()
-	AssertEqual(t, true, blockActions[0].Block)
-	AssertEqual(t, blockOverride.OverrideId, *blockActions[0].BlockOverrideId)
+		success = multiClient.SendPacket(source, protocol.ProvideMode_Network, packet, 0)
+		AssertEqual(t, false, success)
 
-	// packet stats listener fires on the epoch with the cumulative counts
-	packetStatsChannel := make(chan *PacketStats, 16)
-	unsubPacketStats := multiClient.AddPacketStatsCallback(func(packetStats *PacketStats) {
-		packetStatsChannel <- packetStats
+		blockActions = nextBlockActions()
+		AssertEqual(t, true, blockActions[0].Block)
+		AssertEqual(t, blockOverride.OverrideId, *blockActions[0].BlockOverrideId)
+
+		// packet stats listener fires on the epoch with the cumulative counts
+		packetStatsChannel := make(chan *PacketStats, 16)
+		unsubPacketStats := multiClient.AddPacketStatsCallback(func(packetStats *PacketStats) {
+			packetStatsChannel <- packetStats
+		})
+		defer unsubPacketStats()
+
+		multiClient.SetBlockActionOverrides(nil)
+		success = multiClient.SendPacket(source, protocol.ProvideMode_Network, packet, 0)
+		AssertEqual(t, true, success)
+
+		select {
+		case packetStats = <-packetStatsChannel:
+			AssertEqual(t, int64(2), packetStats.LocalEgressPacketCount)
+			AssertEqual(t, int64(2), packetStats.BlockEgressPacketCount)
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for packet stats")
+		}
 	})
-	defer unsubPacketStats()
-
-	multiClient.SetBlockActionOverrides(nil)
-	success = multiClient.SendPacket(source, protocol.ProvideMode_Network, packet, 0)
-	AssertEqual(t, true, success)
-
-	select {
-	case packetStats = <-packetStatsChannel:
-		AssertEqual(t, int64(2), packetStats.LocalEgressPacketCount)
-		AssertEqual(t, int64(2), packetStats.BlockEgressPacketCount)
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for packet stats")
-	}
 }
 
 func TestMultiClientBlockActionIgnoreHosts(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	securityPolicy := &testingFixedSecurityPolicy{
-		stats:  DefaultSecurityPolicyStatsCollector(),
-		result: SecurityPolicyResultDrop,
-	}
+		multiClient, settings := newBlockActionTestMultiClient(ctx)
+		defer multiClient.Close()
 
-	settings := DefaultMultiClientSettings()
-	settings.EventEpoch = 20 * time.Millisecond
-	settings.SecurityPolicyGenerator = func(ctx context.Context, stats *SecurityPolicyStatsCollector) SecurityPolicy {
-		return securityPolicy
-	}
+		source := SourceId(NewId())
 
-	multiClient := NewRemoteUserNatMultiClient(
-		ctx,
-		&testingEmptyMultiClientGenerator{},
-		func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
-		},
-		protocol.ProvideMode_Network,
-		settings,
-	)
-	defer multiClient.Close()
+		blockActionsChannel := make(chan []*BlockAction, 16)
+		unsub := multiClient.AddBlockActionCallback(func(blockActions []*BlockAction) {
+			blockActionsChannel <- blockActions
+		})
+		defer unsub()
 
-	source := SourceId(NewId())
+		nextBlockActions := func() []*BlockAction {
+			select {
+			case blockActions := <-blockActionsChannel:
+				return blockActions
+			case <-time.After(5 * time.Second):
+				t.Fatal("timeout waiting for block actions")
+				return nil
+			}
+		}
 
-	blockActionsChannel := make(chan []*BlockAction, 16)
-	unsub := multiClient.AddBlockActionCallback(func(blockActions []*BlockAction) {
-		blockActionsChannel <- blockActions
-	})
-	defer unsub()
+		loopback := testLoopbackIp(ipVersion)
 
-	nextBlockActions := func() []*BlockAction {
+		// an ignored destination is excluded from the override logic:
+		// the un-block override must not match, so the drop policy blocks
+		unblockOverride := &BlockActionOverride{
+			OverrideId:    NewId(),
+			Hosts:         []string{loopback},
+			BlockOverride: &BlockOverride{Block: false},
+		}
+		multiClient.SetBlockActionOverrides([]*BlockActionOverride{unblockOverride})
+		multiClient.SetBlockActionIgnoreHosts([]string{loopback})
+
+		packet := testingUdpPacket(ipVersion, testBlockActionSourceIp(ipVersion), loopback, 9, []byte("hello"))
+		success := multiClient.SendPacket(source, protocol.ProvideMode_Network, packet, 0)
+		AssertEqual(t, false, success)
+
+		// no block action is surfaced for the ignored destination
 		select {
 		case blockActions := <-blockActionsChannel:
-			return blockActions
-		case <-time.After(5 * time.Second):
-			t.Fatal("timeout waiting for block actions")
-			return nil
+			t.Fatalf("expected no block actions for the ignored destination, got %d", len(blockActions))
+		case <-time.After(4 * settings.EventEpoch):
 		}
+
+		// the default decision and packet stats still apply
+		packetStats := multiClient.PacketStats()
+		AssertEqual(t, int64(1), packetStats.BlockEgressPacketCount)
+
+		// clearing the ignore list restores the override match and the block actions
+		multiClient.SetBlockActionIgnoreHosts(nil)
+
+		success = multiClient.SendPacket(source, protocol.ProvideMode_Network, packet, 0)
+		AssertEqual(t, true, success)
+
+		blockActions := nextBlockActions()
+		AssertEqual(t, 1, len(blockActions))
+		AssertEqual(t, false, blockActions[0].Block)
+		AssertEqual(t, true, blockActions[0].Local)
+		AssertEqual(t, true, blockActions[0].BlockOverrideId != nil)
+
+		// ignore by subnet also excludes the destination
+		multiClient.SetBlockActionIgnoreHosts([]string{testBlockActionLoopbackSubnet(ipVersion)})
+
+		success = multiClient.SendPacket(source, protocol.ProvideMode_Network, packet, 0)
+		AssertEqual(t, false, success)
+
+		select {
+		case blockActions := <-blockActionsChannel:
+			t.Fatalf("expected no block actions for the ignored subnet, got %d", len(blockActions))
+		case <-time.After(4 * settings.EventEpoch):
+		}
+	})
+}
+
+// testHardCodedRemoteDohIps are the DefaultDnsResolverSettings remote doh
+// resolver ips of the family, and a same-operator neighbor that is not in
+// the baseline.
+func testHardCodedRemoteDohIps(ipVersion int) (hardCodedIps []string, controlIp string) {
+	if ipVersion == 4 {
+		return []string{"1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222"}, "1.0.0.1"
 	}
-
-	// an ignored destination is excluded from the override logic:
-	// the un-block override must not match, so the drop policy blocks
-	unblockOverride := &BlockActionOverride{
-		OverrideId:    NewId(),
-		Hosts:         []string{"127.0.0.1"},
-		BlockOverride: &BlockOverride{Block: false},
-	}
-	multiClient.SetBlockActionOverrides([]*BlockActionOverride{unblockOverride})
-	multiClient.SetBlockActionIgnoreHosts([]string{"127.0.0.1"})
-
-	packet := testingUdp4Packet("10.0.0.5", "127.0.0.1", 9, []byte("hello"))
-	success := multiClient.SendPacket(source, protocol.ProvideMode_Network, packet, 0)
-	AssertEqual(t, false, success)
-
-	// no block action is surfaced for the ignored destination
-	select {
-	case blockActions := <-blockActionsChannel:
-		t.Fatalf("expected no block actions for the ignored destination, got %d", len(blockActions))
-	case <-time.After(4 * settings.EventEpoch):
-	}
-
-	// the default decision and packet stats still apply
-	packetStats := multiClient.PacketStats()
-	AssertEqual(t, int64(1), packetStats.BlockEgressPacketCount)
-
-	// clearing the ignore list restores the override match and the block actions
-	multiClient.SetBlockActionIgnoreHosts(nil)
-
-	success = multiClient.SendPacket(source, protocol.ProvideMode_Network, packet, 0)
-	AssertEqual(t, true, success)
-
-	blockActions := nextBlockActions()
-	AssertEqual(t, 1, len(blockActions))
-	AssertEqual(t, false, blockActions[0].Block)
-	AssertEqual(t, true, blockActions[0].Local)
-	AssertEqual(t, true, blockActions[0].BlockOverrideId != nil)
-
-	// ignore by subnet also excludes the destination
-	multiClient.SetBlockActionIgnoreHosts([]string{"127.0.0.0/8"})
-
-	success = multiClient.SendPacket(source, protocol.ProvideMode_Network, packet, 0)
-	AssertEqual(t, false, success)
-
-	select {
-	case blockActions := <-blockActionsChannel:
-		t.Fatalf("expected no block actions for the ignored subnet, got %d", len(blockActions))
-	case <-time.After(4 * settings.EventEpoch):
-	}
+	return []string{"2606:4700:4700::1111", "2001:4860:4860::8888", "2620:fe::fe", "2620:119:35::35"}, "2606:4700:4700::1001"
 }
 
 // TestMultiClientBlockActionDefaultRemoteDohIgnored verifies the built-in
 // ignore baseline: the hard coded remote doh resolver ips are excluded from
 // override decisions with NO SetBlockActionIgnoreHosts wiring at all, while
-// a neighboring non-baseline ip still matches overrides.
+// a neighboring non-baseline ip still matches overrides. Both families: the
+// baseline carries the v6 resolver endpoints too.
 func TestMultiClientBlockActionDefaultRemoteDohIgnored(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	securityPolicy := &testingFixedSecurityPolicy{
-		stats:  DefaultSecurityPolicyStatsCollector(),
-		result: SecurityPolicyResultDrop,
-	}
+		multiClient, settings := newBlockActionTestMultiClient(ctx)
+		defer multiClient.Close()
 
-	settings := DefaultMultiClientSettings()
-	settings.EventEpoch = 20 * time.Millisecond
-	settings.SecurityPolicyGenerator = func(ctx context.Context, stats *SecurityPolicyStatsCollector) SecurityPolicy {
-		return securityPolicy
-	}
+		source := SourceId(NewId())
 
-	multiClient := NewRemoteUserNatMultiClient(
-		ctx,
-		&testingEmptyMultiClientGenerator{},
-		func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
-		},
-		protocol.ProvideMode_Network,
-		settings,
-	)
-	defer multiClient.Close()
+		blockActionsChannel := make(chan []*BlockAction, 16)
+		unsub := multiClient.AddBlockActionCallback(func(blockActions []*BlockAction) {
+			blockActionsChannel <- blockActions
+		})
+		defer unsub()
 
-	source := SourceId(NewId())
+		// an un-block override covering the hard coded resolver ips and a
+		// non-baseline control ip. note: no SetBlockActionIgnoreHosts call.
+		hardCodedIps, controlIp := testHardCodedRemoteDohIps(ipVersion)
+		unblockOverride := &BlockActionOverride{
+			OverrideId:    NewId(),
+			Hosts:         append(append([]string{}, hardCodedIps...), controlIp),
+			BlockOverride: &BlockOverride{Block: false},
+		}
+		multiClient.SetBlockActionOverrides([]*BlockActionOverride{unblockOverride})
 
-	blockActionsChannel := make(chan []*BlockAction, 16)
-	unsub := multiClient.AddBlockActionCallback(func(blockActions []*BlockAction) {
-		blockActionsChannel <- blockActions
-	})
-	defer unsub()
+		// the baseline ignores the override for every hard coded resolver ip:
+		// the drop policy blocks, and no block action is surfaced
+		for _, ip := range hardCodedIps {
+			packet := testingUdpPacket(ipVersion, testBlockActionSourceIp(ipVersion), ip, 9, []byte("hello"))
+			success := multiClient.SendPacket(source, protocol.ProvideMode_Network, packet, 0)
+			AssertEqual(t, false, success)
+		}
+		select {
+		case blockActions := <-blockActionsChannel:
+			t.Fatalf("expected no block actions for the hard coded resolver ips, got %d", len(blockActions))
+		case <-time.After(4 * settings.EventEpoch):
+		}
 
-	// an un-block override covering the hard coded resolver ips and a
-	// non-baseline control ip. note: no SetBlockActionIgnoreHosts call.
-	hardCodedIps := []string{"1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222"}
-	controlIp := "1.0.0.1"
-	unblockOverride := &BlockActionOverride{
-		OverrideId:    NewId(),
-		Hosts:         append(append([]string{}, hardCodedIps...), controlIp),
-		BlockOverride: &BlockOverride{Block: false},
-	}
-	multiClient.SetBlockActionOverrides([]*BlockActionOverride{unblockOverride})
-
-	// the baseline ignores the override for every hard coded resolver ip:
-	// the drop policy blocks, and no block action is surfaced
-	for _, ip := range hardCodedIps {
-		packet := testingUdp4Packet("10.0.0.5", ip, 9, []byte("hello"))
+		// the control ip is not in the baseline: the override applies
+		packet := testingUdpPacket(ipVersion, testBlockActionSourceIp(ipVersion), controlIp, 9, []byte("hello"))
 		success := multiClient.SendPacket(source, protocol.ProvideMode_Network, packet, 0)
-		AssertEqual(t, false, success)
-	}
-	select {
-	case blockActions := <-blockActionsChannel:
-		t.Fatalf("expected no block actions for the hard coded resolver ips, got %d", len(blockActions))
-	case <-time.After(4 * settings.EventEpoch):
-	}
+		AssertEqual(t, true, success)
 
-	// the control ip is not in the baseline: the override applies
-	packet := testingUdp4Packet("10.0.0.5", controlIp, 9, []byte("hello"))
-	success := multiClient.SendPacket(source, protocol.ProvideMode_Network, packet, 0)
-	AssertEqual(t, true, success)
-
-	select {
-	case blockActions := <-blockActionsChannel:
-		AssertEqual(t, 1, len(blockActions))
-		AssertEqual(t, false, blockActions[0].Block)
-		AssertEqual(t, true, blockActions[0].BlockOverrideId != nil)
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for the control ip block action")
-	}
+		select {
+		case blockActions := <-blockActionsChannel:
+			AssertEqual(t, 1, len(blockActions))
+			AssertEqual(t, false, blockActions[0].Block)
+			AssertEqual(t, true, blockActions[0].BlockOverrideId != nil)
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for the control ip block action")
+		}
+	})
 }
 
 // testingLearningServerNameLookup is a ServerNameLookup that can learn names at runtime and
@@ -775,72 +811,56 @@ func (self *testingLearningServerNameLookup) learn(ip string, name string) {
 // cached invalidates that decision (via the learned notification), so the next flow to
 // the same ip rebuilds it and its event carries the host.
 func TestMultiClientBlockActionServerNames(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	securityPolicy := &testingFixedSecurityPolicy{
-		stats:  DefaultSecurityPolicyStatsCollector(),
-		result: SecurityPolicyResultDrop,
-	}
+		multiClient, _ := newBlockActionTestMultiClient(ctx)
+		defer multiClient.Close()
 
-	settings := DefaultMultiClientSettings()
-	settings.EventEpoch = 20 * time.Millisecond
-	settings.SecurityPolicyGenerator = func(ctx context.Context, stats *SecurityPolicyStatsCollector) SecurityPolicy {
-		return securityPolicy
-	}
+		lookup := newTestingLearningServerNameLookup()
+		multiClient.SetServerNameLookup(lookup)
 
-	multiClient := NewRemoteUserNatMultiClient(
-		ctx,
-		&testingEmptyMultiClientGenerator{},
-		func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
-		},
-		protocol.ProvideMode_Network,
-		settings,
-	)
-	defer multiClient.Close()
+		source := SourceId(NewId())
 
-	lookup := newTestingLearningServerNameLookup()
-	multiClient.SetServerNameLookup(lookup)
+		blockActionsChannel := make(chan []*BlockAction, 16)
+		unsub := multiClient.AddBlockActionCallback(func(blockActions []*BlockAction) {
+			blockActionsChannel <- blockActions
+		})
+		defer unsub()
 
-	source := SourceId(NewId())
-
-	blockActionsChannel := make(chan []*BlockAction, 16)
-	unsub := multiClient.AddBlockActionCallback(func(blockActions []*BlockAction) {
-		blockActionsChannel <- blockActions
-	})
-	defer unsub()
-
-	nextBlockActions := func() []*BlockAction {
-		select {
-		case blockActions := <-blockActionsChannel:
-			return blockActions
-		case <-time.After(5 * time.Second):
-			t.Fatal("timeout waiting for block actions")
-			return nil
+		nextBlockActions := func() []*BlockAction {
+			select {
+			case blockActions := <-blockActionsChannel:
+				return blockActions
+			case <-time.After(5 * time.Second):
+				t.Fatal("timeout waiting for block actions")
+				return nil
+			}
 		}
-	}
 
-	dstIp := "93.184.216.34"
-	dstAddr := netip.MustParseAddr(dstIp)
-	packet := testingUdp4Packet("10.0.0.5", dstIp, 9, []byte("hello"))
+		dstIp := testExampleComIp(ipVersion)
+		dstAddr := netip.MustParseAddr(dstIp)
+		packet := testingUdpPacket(ipVersion, testBlockActionSourceIp(ipVersion), dstIp, 9, []byte("hello"))
 
-	// before the name is known, the event reports the ip and no host
-	success := multiClient.SendPacket(source, protocol.ProvideMode_Network, packet, 0)
-	AssertEqual(t, false, success)
-	blockActions := nextBlockActions()
-	AssertEqual(t, 1, len(blockActions))
-	AssertEqual(t, []netip.Addr{dstAddr}, blockActions[0].Ips)
-	AssertEqual(t, 0, len(blockActions[0].Hosts))
+		// before the name is known, the event reports the ip and no host
+		success := multiClient.SendPacket(source, protocol.ProvideMode_Network, packet, 0)
+		AssertEqual(t, false, success)
+		blockActions := nextBlockActions()
+		AssertEqual(t, 1, len(blockActions))
+		AssertEqual(t, []netip.Addr{dstAddr}, blockActions[0].Ips)
+		AssertEqual(t, 0, len(blockActions[0].Hosts))
 
-	// learning the name fires the learned notification, invalidating the cached
-	// decision for that ip
-	lookup.learn(dstIp, "example.com")
+		// learning the name fires the learned notification, invalidating the cached
+		// decision for that ip
+		lookup.learn(dstIp, "example.com")
 
-	// the next flow to the same ip now reports the server name
-	success = multiClient.SendPacket(source, protocol.ProvideMode_Network, packet, 0)
-	AssertEqual(t, false, success)
-	blockActions = nextBlockActions()
-	AssertEqual(t, 1, len(blockActions))
-	AssertEqual(t, []netip.Addr{dstAddr}, blockActions[0].Ips)
-	AssertEqual(t, []string{"example.com"}, blockActions[0].Hosts)
+		// the next flow to the same ip now reports the server name
+		success = multiClient.SendPacket(source, protocol.ProvideMode_Network, packet, 0)
+		AssertEqual(t, false, success)
+		blockActions = nextBlockActions()
+		AssertEqual(t, 1, len(blockActions))
+		AssertEqual(t, []netip.Addr{dstAddr}, blockActions[0].Ips)
+		AssertEqual(t, []string{"example.com"}, blockActions[0].Hosts)
+	})
 }

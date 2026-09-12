@@ -634,9 +634,19 @@ func TestApiWindowExplicitPolicyKeepsOldCarrierUntilH3ConnectsWhenBudgetBlocked(
 // remains usable, then close H1 only after the H3 route is published. The
 // server auth barrier makes both sides of that ordering deterministic.
 func TestApiWindowAutoH1SaturatedBudgetToExplicitH3IsMakeBeforeBreak(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testApiWindowAutoH1SaturatedBudgetToExplicitH3IsMakeBeforeBreak(t, ipVersion)
+	})
+}
+
+func testApiWindowAutoH1SaturatedBudgetToExplicitH3IsMakeBeforeBreak(t *testing.T, ipVersion int) {
+	if ipVersion == 6 {
+	}
+	// the quic endpoint and its certificate live on the family's loopback, so
+	// the replacement H3 carrier binds a socket of that family (IPV6.md A7)
 	certPem, keyPem, err := selfSign(
-		[]string{"127.0.0.1"},
-		"127.0.0.1",
+		[]string{testLoopbackIp(ipVersion)},
+		testLoopbackIp(ipVersion),
 		24*time.Hour,
 		24*time.Hour,
 	)
@@ -649,7 +659,7 @@ func TestApiWindowAutoH1SaturatedBudgetToExplicitH3IsMakeBeforeBreak(t *testing.
 	}
 	const nextProto = "urnetwork-auto-h1-to-explicit-h3-test"
 	listener, err := quic.ListenAddrEarly(
-		"127.0.0.1:0",
+		testLoopbackHostPort(ipVersion, 0),
 		&tls.Config{
 			Certificates: []tls.Certificate{cert},
 			NextProtos:   []string{nextProto},
@@ -711,7 +721,7 @@ func TestApiWindowAutoH1SaturatedBudgetToExplicitH3IsMakeBeforeBreak(t *testing.
 		<-connection.Context().Done()
 	}()
 
-	platform := newTestingPlatformServer(t)
+	platform := newTestingPlatformServerOnFamily(t, ipVersion)
 	client, _ := newApiMigrationTestClient(t)
 	strategy := NewClientStrategyWithDefaults(client.Ctx())
 	budget := NewPlatformTransportBudget(4, 1)

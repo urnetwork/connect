@@ -34,9 +34,18 @@ func lifecycleTestManager(ctx context.Context, t *testing.T) *WebRtcManager {
 	return newTestWebRtcManager(t, ctx, newSignalPipe(nil), settings)
 }
 
-func lifecycleCandidateSignals(t *testing.T, streamId Id, count int) *protocol.ExchangeSignals {
+// testIceHostCandidate is a host ICE candidate line for the family: the
+// address sits in the family's documentation range so nothing routes.
+func testIceHostCandidate(ipVersion int) string {
+	if ipVersion == 6 {
+		return "candidate:0 1 udp 2122252543 2001:db8::1 40000 typ host"
+	}
+	return "candidate:0 1 udp 2122252543 192.0.2.1 40000 typ host"
+}
+
+func lifecycleCandidateSignals(t *testing.T, ipVersion int, streamId Id, count int) *protocol.ExchangeSignals {
 	candidateJson, err := json.Marshal(webrtc.ICECandidateInit{
-		Candidate: "candidate:0 1 udp 2122252543 127.0.0.1 40000 typ host",
+		Candidate: testIceHostCandidate(ipVersion),
 	})
 	if err != nil {
 		t.Fatalf("marshal candidate: %v", err)
@@ -60,6 +69,12 @@ func lifecycleCandidateSignals(t *testing.T, streamId Id, count int) *protocol.E
 // return in bounded time (the no-op is cheap — no locks into pion, no
 // per-signal work that could occupy the shared signal-delivery path).
 func TestClosedPeerConnDropsLateSignals(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testClosedPeerConnDropsLateSignals(t, ipVersion)
+	})
+}
+
+func testClosedPeerConnDropsLateSignals(t *testing.T, ipVersion int) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -86,7 +101,7 @@ func TestClosedPeerConnDropsLateSignals(t *testing.T) {
 		err = manager.ReceiveExchangeSignals(
 			source,
 			TransferKey{},
-			lifecycleCandidateSignals(t, streamId, 1),
+			lifecycleCandidateSignals(t, ipVersion, streamId, 1),
 		)
 		AssertEqual(t, err, nil)
 		buffered := func() int {
@@ -140,7 +155,7 @@ func TestClosedPeerConnDropsLateSignals(t *testing.T) {
 		err = manager.ReceiveExchangeSignals(
 			source,
 			TransferKey{},
-			lifecycleCandidateSignals(t, streamId, 10),
+			lifecycleCandidateSignals(t, ipVersion, streamId, 10),
 		)
 		if err != nil {
 			t.Fatalf("late signals to a closed conn must be a no-op, not an error (batch %d): %v", i, err)
@@ -252,6 +267,12 @@ func TestReceivePathSignalSendsDoNotBlock(t *testing.T) {
 // must therefore use the same zero-timeout transfer handoff as an inbound
 // signal response, even though the candidate was generated locally.
 func TestPionIceCandidateCallbackSendDoesNotBlock(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testPionIceCandidateCallbackSendDoesNotBlock(t, ipVersion)
+	})
+}
+
+func testPionIceCandidateCallbackSendDoesNotBlock(t *testing.T, ipVersion int) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sender := &blockingSignalSender{ctx: ctx}
@@ -265,7 +286,7 @@ func TestPionIceCandidateCallbackSendDoesNotBlock(t *testing.T) {
 	candidate := &webrtc.ICECandidate{
 		Foundation: "nonblocking",
 		Priority:   1,
-		Address:    "192.0.2.1",
+		Address:    testDocAddr(ipVersion, 1).String(),
 		Protocol:   webrtc.ICEProtocolUDP,
 		Port:       10000,
 		Typ:        webrtc.ICECandidateTypeHost,

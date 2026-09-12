@@ -64,10 +64,26 @@ const (
 	// answer (SynAck) requires the provider's own upstream connect to have
 	// succeeded, which is the whole point.
 	probeClassHealth probeClass = 0
-	// probeClassDns is a public resolver, asked an A query at udp/53. Any
-	// answer at all is success; the content is irrelevant and is not parsed.
+	// probeClassDns is a public resolver, asked an address query at udp/53
+	// (A over v4, AAAA over v6 -- the family of the resolver ip). Any answer
+	// at all is success; the content is irrelevant and is not parsed.
 	probeClassDns probeClass = 1
 )
+
+// the dns record types the probe asks for and the resolution stage parses
+const (
+	probeDnsRecordTypeA    uint16 = 1
+	probeDnsRecordTypeAAAA uint16 = 28
+)
+
+// probeDnsRecordTypeForIpVersion is the address record type a pass over
+// ipVersion asks for: the answer must be an address the same pass can dial.
+func probeDnsRecordTypeForIpVersion(ipVersion int) uint16 {
+	if ipVersion == 6 {
+		return probeDnsRecordTypeAAAA
+	}
+	return probeDnsRecordTypeA
+}
 
 // probeTarget is one destination of one probe pass, already resolved.
 //
@@ -76,6 +92,12 @@ const (
 // the confusion would be indistinguishable from a real dial failure. The
 // tunnel's doh cache resolves outside the probed channel and hands the
 // addresses in; F-1's tests use literals for the same reason.
+//
+// Ip carries the address family: registration picks the matching probe
+// source address and ip version from it, and every packet crafted for the
+// target is built for that version, so a v6 target is asked over v6 with no
+// further plumbing (IPV6.md B1: a pass asks only over a family the exit can
+// carry, see probeProviderPass).
 type probeTarget struct {
 	// Host is the name this target came from, for logging and for the dns
 	// query name. Empty is legal (a literal-ip target).
@@ -330,11 +352,13 @@ func probeCourtesyRstPacket(ipPath *IpPath, synSequence uint32) ([]byte, bool) {
 	return ipOosRstSequence(ipPath, synSequence+1)
 }
 
-// probeDnsQueryPacket builds a udp/53 packet carrying a standard recursive A
-// query for name. Returns false when the name cannot be encoded as a dns
-// question (labels are bounded at 63 bytes and names at 255).
+// probeDnsQueryPacket builds a udp/53 packet carrying a standard recursive
+// address query for name: A over a v4 path, AAAA over a v6 path, so the
+// resolution stage gets addresses the same pass can dial. Returns false when
+// the name cannot be encoded as a dns question (labels are bounded at 63
+// bytes and names at 255).
 func probeDnsQueryPacket(ipPath *IpPath, name string, id uint16) ([]byte, bool) {
-	question, ok := dnsQuestion(name)
+	question, ok := dnsQuestionType(name, probeDnsRecordTypeForIpVersion(ipPath.Version))
 	if !ok {
 		return nil, false
 	}
@@ -351,9 +375,15 @@ func probeDnsQueryPacket(ipPath *IpPath, name string, id uint16) ([]byte, bool) 
 	return ipOosUdpPacket(ipPath, payload), true
 }
 
-// dnsQuestion encodes name as a dns question section: length-prefixed labels,
-// a root label, then qtype A and qclass IN.
+// dnsQuestion encodes name as a dns question section for an A query: the
+// v4 form of dnsQuestionType.
 func dnsQuestion(name string) ([]byte, bool) {
+	return dnsQuestionType(name, probeDnsRecordTypeA)
+}
+
+// dnsQuestionType encodes name as a dns question section: length-prefixed
+// labels, a root label, then the given qtype and qclass IN.
+func dnsQuestionType(name string, recordType uint16) ([]byte, bool) {
 	name = strings.TrimSuffix(name, ".")
 	if name == "" {
 		return nil, false
@@ -372,8 +402,9 @@ func dnsQuestion(name string) ([]byte, bool) {
 	if 255 < len(question) {
 		return nil, false
 	}
-	// qtype A, qclass IN
-	question = append(question, 0, 1, 0, 1)
+	// qtype, qclass IN
+	question = binary.BigEndian.AppendUint16(question, recordType)
+	question = append(question, 0, 1)
 	return question, true
 }
 
@@ -867,7 +898,7 @@ func (self *RemoteUserNatMultiClient) clientReceiveProbePacket(
 	// destination answered). This is the positive half of the asymmetry; the
 	// failure half records nothing anywhere.
 	if sourceClient != nil && ipPath.Syn && ipPath.Ack {
-		sourceClient.addConnectSuccess()
+		sourceClient.addConnectSuccess(ipPath.Version)
 	}
 
 	// courtesy close, so the destination is not left holding a half-open

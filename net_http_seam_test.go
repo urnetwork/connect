@@ -11,7 +11,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"net/netip"
 	"os"
 	"sync"
@@ -25,47 +24,49 @@ import (
 // A direct TLS dial must use ConnectSettings.DialContext when one is supplied,
 // even when no proxy is configured. The old direct branch bypassed this seam.
 func TestNormalTlsDialUsesInjectedDialContext(t *testing.T) {
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("ok"))
-	}))
-	defer server.Close()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		server := newFamilyHttptestTlsServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte("ok"))
+		}))
+		defer server.Close()
 
-	serverTransport, ok := server.Client().Transport.(*http.Transport)
-	if !ok {
-		t.Fatalf("unexpected test server transport type %T", server.Client().Transport)
-	}
-	settings := DefaultClientStrategySettings()
-	settings.TlsConfig = serverTransport.TLSClientConfig.Clone()
-	var dialCount atomic.Int32
-	settings.DialContextSettings = &DialContextSettings{
-		DialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {
-			dialCount.Add(1)
-			return (&net.Dialer{}).DialContext(ctx, network, address)
-		},
-	}
-	dialer := &clientDialer{
-		dialTlsContext:     newNormalDialTlsContext(settings, clientWebSocketNextProtos),
-		httpDialTlsContext: newNormalDialTlsContext(settings, clientHttpNextProtos),
-		settings:           settings,
-	}
-	client := dialer.HttpClient()
-	defer client.CloseIdleConnections()
+		serverTransport, ok := server.Client().Transport.(*http.Transport)
+		if !ok {
+			t.Fatalf("unexpected test server transport type %T", server.Client().Transport)
+		}
+		settings := DefaultClientStrategySettings()
+		settings.TlsConfig = serverTransport.TLSClientConfig.Clone()
+		var dialCount atomic.Int32
+		settings.DialContextSettings = &DialContextSettings{
+			DialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {
+				dialCount.Add(1)
+				return (&net.Dialer{}).DialContext(ctx, network, address)
+			},
+		}
+		dialer := &clientDialer{
+			dialTlsContext:     newNormalDialTlsContext(settings, clientWebSocketNextProtos),
+			httpDialTlsContext: newNormalDialTlsContext(settings, clientHttpNextProtos),
+			settings:           settings,
+		}
+		client := dialer.HttpClient()
+		defer client.CloseIdleConnections()
 
-	response, err := client.Get(server.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, readErr := io.Copy(io.Discard, response.Body)
-	closeErr := response.Body.Close()
-	if readErr != nil {
-		t.Fatal(readErr)
-	}
-	if closeErr != nil {
-		t.Fatal(closeErr)
-	}
-	if got := dialCount.Load(); got != 1 {
-		t.Fatalf("injected dial context called %d times, expected one", got)
-	}
+		response, err := client.Get(server.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, readErr := io.Copy(io.Discard, response.Body)
+		closeErr := response.Body.Close()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if closeErr != nil {
+			t.Fatal(closeErr)
+		}
+		if got := dialCount.Load(); got != 1 {
+			t.Fatalf("injected dial context called %d times, expected one", got)
+		}
+	})
 }
 
 // Explicit extender endpoints are copied into persistent dialers. Discovery
@@ -168,41 +169,49 @@ func TestClientStrategySeamDefaultsAreDisabled(t *testing.T) {
 // fixes the family, so narrowing there can only break a working dial -- and
 // the seam this test exists to guard is the one that steers a RESOLUTION.
 func TestNormalTlsDialHonorsFamilyPolicyWithNoInjectedDialContext(t *testing.T) {
-	SetControlIpFamilyPolicy(IpFamilyForce4)
-	defer SetControlIpFamilyPolicy(IpFamilyAuto)
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		// the forced family is the one under test, so the narrowed network string
+		// is asserted for both families rather than for IPv4 alone
+		policy := IpFamilyForce4
+		if ipVersion == 6 {
+			policy = IpFamilyForce6
+		}
+		SetControlIpFamilyPolicy(policy)
+		defer SetControlIpFamilyPolicy(IpFamilyAuto)
 
-	settings := DefaultClientStrategySettings()
-	if settings.ProxySettings != nil || settings.DialContextSettings != nil {
-		t.Fatal("the default settings are no longer the mobile shape this test pins")
-	}
+		settings := DefaultClientStrategySettings()
+		if settings.ProxySettings != nil || settings.DialContextSettings != nil {
+			t.Fatal("the default settings are no longer the mobile shape this test pins")
+		}
 
-	var mutex sync.Mutex
-	var networks []string
-	settings.DialNetworkHook = func(network string, addr string) {
+		var mutex sync.Mutex
+		var networks []string
+		settings.DialNetworkHook = func(network string, addr string) {
+			mutex.Lock()
+			defer mutex.Unlock()
+			networks = append(networks, network)
+		}
+
+		dialTls := newNormalDialTlsContext(settings, clientHttpNextProtos)
+		// the host is never reached: .invalid is reserved by RFC 2606 and never
+		// resolves. What is under test is the NETWORK STRING the seam resolved,
+		// which is recorded before the dial is attempted.
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		conn, err := dialTls(ctx, "tcp", "family-seam.invalid:443")
+		if err == nil {
+			conn.Close()
+		}
+
 		mutex.Lock()
 		defer mutex.Unlock()
-		networks = append(networks, network)
-	}
-
-	dialTls := newNormalDialTlsContext(settings, clientHttpNextProtos)
-	// the host is never reached: .invalid is reserved by RFC 2606 and never
-	// resolves. What is under test is the NETWORK STRING the seam resolved,
-	// which is recorded before the dial is attempted.
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	conn, err := dialTls(ctx, "tcp", "family-seam.invalid:443")
-	if err == nil {
-		conn.Close()
-	}
-
-	mutex.Lock()
-	defer mutex.Unlock()
-	if len(networks) == 0 {
-		t.Fatal("ConnectSettings.DialContext was never called -- the seam is still bypassed")
-	}
-	if len(networks) != 1 || networks[0] != "tcp4" {
-		t.Fatalf("resolved %v, want exactly [tcp4] under IpFamilyForce4", networks)
-	}
+		if len(networks) == 0 {
+			t.Fatal("ConnectSettings.DialContext was never called -- the seam is still bypassed")
+		}
+		if want := testTcpNetwork(ipVersion); len(networks) != 1 || networks[0] != want {
+			t.Fatalf("resolved %v, want exactly [%s] under the forced v%d policy", networks, want, ipVersion)
+		}
+	})
 }
 
 // A pooled connection that connected cleanly and later went dark is invisible
@@ -577,10 +586,10 @@ type http2BlockedBodyRead struct {
 // newHttp2BlockedBodyRead negotiates a real local TLS/HTTP2 connection, then
 // arms its raw socket before consuming a response large enough to return flow
 // control credit.
-func newHttp2BlockedBodyRead(t *testing.T, disableWriteTimeout bool) *http2BlockedBodyRead {
+func newHttp2BlockedBodyRead(t *testing.T, ipVersion int, disableWriteTimeout bool) *http2BlockedBodyRead {
 	t.Helper()
 	responseBody := bytes.Repeat([]byte("x"), 128*1024)
-	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+	server := newFamilyHttptestUnstartedServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		_, _ = w.Write(responseBody)
 	}))
 	server.EnableHTTP2 = true
@@ -705,26 +714,28 @@ func waitForHttp2BodyRead(t *testing.T, readDone <-chan error) error {
 // that canceling its request cannot interrupt the raw Write: only the explicit
 // socket-release barrier lets the caller return.
 func TestHttp2CanceledBodyReadDoesNotInterruptBlockedWrite(t *testing.T) {
-	blockedRead := newHttp2BlockedBodyRead(t, true)
-	waitForHttp2Barrier(t, "blocked socket write", blockedRead.gate.writeEntered)
-	blockedRead.cancelRequest()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		blockedRead := newHttp2BlockedBodyRead(t, ipVersion, true)
+		waitForHttp2Barrier(t, "blocked socket write", blockedRead.gate.writeEntered)
+		blockedRead.cancelRequest()
 
-	select {
-	case readErr := <-blockedRead.readDone:
-		t.Fatalf("canceled body read returned before the blocked write was released: %v", readErr)
-	default:
-	}
-	select {
-	case <-blockedRead.gate.deadlineSeen:
-		t.Fatal("zero WriteByteTimeout unexpectedly installed a socket write deadline")
-	default:
-	}
+		select {
+		case readErr := <-blockedRead.readDone:
+			t.Fatalf("canceled body read returned before the blocked write was released: %v", readErr)
+		default:
+		}
+		select {
+		case <-blockedRead.gate.deadlineSeen:
+			t.Fatal("zero WriteByteTimeout unexpectedly installed a socket write deadline")
+		default:
+		}
 
-	if err := blockedRead.gate.Close(); err != nil {
-		t.Fatal(err)
-	}
-	_ = waitForHttp2BodyRead(t, blockedRead.readDone)
-	_ = blockedRead.response.Body.Close()
+		if err := blockedRead.gate.Close(); err != nil {
+			t.Fatal(err)
+		}
+		_ = waitForHttp2BodyRead(t, blockedRead.readDone)
+		_ = blockedRead.response.Body.Close()
+	})
 }
 
 // This is the pre-fix regression. With the production WriteByteTimeout left at
@@ -732,17 +743,19 @@ func TestHttp2CanceledBodyReadDoesNotInterruptBlockedWrite(t *testing.T) {
 // deadline is observed, expireWrite deterministically models its firing and the
 // canceled caller must unwind.
 func TestHttpClientHttp2WriteTimeoutReleasesCanceledBodyRead(t *testing.T) {
-	blockedRead := newHttp2BlockedBodyRead(t, false)
-	waitForHttp2Barrier(t, "blocked socket write", blockedRead.gate.writeEntered)
-	waitForHttp2Barrier(t, "socket write deadline", blockedRead.gate.deadlineSeen)
-	blockedRead.cancelRequest()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		blockedRead := newHttp2BlockedBodyRead(t, ipVersion, false)
+		waitForHttp2Barrier(t, "blocked socket write", blockedRead.gate.writeEntered)
+		waitForHttp2Barrier(t, "socket write deadline", blockedRead.gate.deadlineSeen)
+		blockedRead.cancelRequest()
 
-	select {
-	case readErr := <-blockedRead.readDone:
-		t.Fatalf("body read returned before the write deadline expired: %v", readErr)
-	default:
-	}
-	blockedRead.gate.expire()
-	_ = waitForHttp2BodyRead(t, blockedRead.readDone)
-	_ = blockedRead.response.Body.Close()
+		select {
+		case readErr := <-blockedRead.readDone:
+			t.Fatalf("body read returned before the write deadline expired: %v", readErr)
+		default:
+		}
+		blockedRead.gate.expire()
+		_ = waitForHttp2BodyRead(t, blockedRead.readDone)
+		_ = blockedRead.response.Body.Close()
+	})
 }

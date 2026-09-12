@@ -85,7 +85,11 @@ var dohServerWindows = []time.Duration{
 func DefaultDohSettings() *DohSettings {
 	return &DohSettings{
 		ConnectSettings: *DefaultConnectSettings(),
-		IpVersion:       4,
+		// both families: every resolver list below is consulted and, for DoH,
+		// each operator's v4 and v6 endpoint is raced as a pair (see
+		// dohLaunchWaves). A caller that knows its path carries one family
+		// pins 4 or 6.
+		IpVersion:       0,
 		MissExpiration:  300 * time.Second,
 		LocalExpiration: 300 * time.Second,
 		MinCacheTtl:     30 * time.Second,
@@ -149,11 +153,19 @@ func DefaultDnsResolverSettings() *DnsResolverSettings {
 		EnableRemoteDoh:       true,
 		EnableLocalDns:        true,
 		DnsUpgradeMaskAddress: DefaultDnsUpgradeMaskAddress,
+		// the v4 and v6 lists pair by operator (knownDohUrlPairs) and a
+		// query races each pair as one wave (see dohLaunchWaves)
 		RemoteDohUrlsIpv4: []string{
 			"https://1.1.1.1/dns-query",        // Cloudflare
 			"https://8.8.8.8/dns-query",        // Google
 			"https://9.9.9.9/dns-query",        // Quad9
 			"https://208.67.222.222/dns-query", // OpenDNS
+		},
+		RemoteDohUrlsIpv6: []string{
+			"https://[2606:4700:4700::1111]/dns-query", // Cloudflare
+			"https://[2001:4860:4860::8888]/dns-query", // Google
+			"https://[2620:fe::fe]/dns-query",          // Quad9
+			"https://[2620:119:35::35]/dns-query",      // OpenDNS
 		},
 		// remote plain-dns servers, dialed through the tunnel. remote dns
 		// stays disabled by default for general resolution — while disabled,
@@ -166,6 +178,12 @@ func DefaultDnsResolverSettings() *DnsResolverSettings {
 			"8.8.8.8",        // Google
 			"208.67.222.222", // OpenDNS
 		},
+		RemoteDnsIpv6: []string{
+			"2606:4700:4700::1111", // Cloudflare
+			"2620:fe::fe",          // Quad9
+			"2001:4860:4860::8888", // Google
+			"2620:119:35::35",      // OpenDNS
+		},
 		// local plain-dns servers: host-side resolution, and the actual tunnel
 		// resolver targets when the local-dns toggle is explicitly enabled. These
 		// are independent of DnsUpgradeMaskAddress, which is only the destination
@@ -173,6 +191,10 @@ func DefaultDnsResolverSettings() *DnsResolverSettings {
 		LocalDnsIpv4: []string{
 			"9.9.9.9", // Quad9
 			"1.1.1.1", // Cloudflare
+		},
+		LocalDnsIpv6: []string{
+			"2620:fe::fe",          // Quad9
+			"2606:4700:4700::1111", // Cloudflare
 		},
 	}
 }
@@ -501,8 +523,27 @@ func dnsResolverAddrs(settings *DohSettings, remote bool, network string) []stri
 		}
 		return ipv6
 	default:
-		addrs := append([]string{}, ipv4...)
-		return append(addrs, ipv6...)
+		// both families, operator-paired and so interleaved v4 first: the
+		// plain-dns dial hook walks this list one entry per resolver attempt
+		// (see NewDohCache), so two attempts cover both families whichever
+		// one the path lacks
+		return dualStackList(ipv4, ipv6, knownDnsServerPairs)
+	}
+}
+
+// dnsLookupNetwork is the net.Resolver network for a plain-dns lookup of one
+// record type: an A query must look up ip4 and an AAAA query ip6, whatever the
+// cache-wide IpVersion says, or the answer of one family would be cached under
+// the other's key. The second result is false when IpVersion excludes the
+// record type's family, in which case the lookup is skipped.
+func dnsLookupNetwork(recordType string, ipVersion int) (string, bool) {
+	switch recordType {
+	case "A":
+		return "ip4", ipVersion != 6
+	case "AAAA":
+		return "ip6", ipVersion != 4
+	default:
+		return "", false
 	}
 }
 
@@ -529,6 +570,11 @@ func NewDohCache(settings *DohSettings) *DohCache {
 	// (DefaultDohSettings) or an owner-supplied dial context (the mux's
 	// in-tunnel path) — carried into the control-dial evidence lines
 	remoteBound := settings.DialContextSettings == nil
+	// each resolver attempt takes the next server in the interleaved list
+	// (dnsResolverAddrs), so a family the path lacks costs one attempt, not
+	// a coin flip per attempt
+	var remoteDnsNext atomic.Uint64
+	var localDnsNext atomic.Uint64
 	remoteResolver := &net.Resolver{
 		PreferGo: true,
 		Dial: lifecycle.dialContext(func(ctx context.Context, network string, addr string) (net.Conn, error) {
@@ -540,7 +586,7 @@ func NewDohCache(settings *DohSettings) *DohCache {
 			if len(localAddrs) == 0 {
 				return nil, fmt.Errorf("no remote DNS resolvers configured")
 			}
-			localAddr := localAddrs[mathrand.Intn(len(localAddrs))]
+			localAddr := localAddrs[int((remoteDnsNext.Add(1)-1)%uint64(len(localAddrs)))]
 			addr = net.JoinHostPort(localAddr, port)
 			conn, err := settings.DialContext(ctx, network, addr)
 			logControlDialResult(settings.Log, "dns", remoteBound, network, addr, conn, err)
@@ -560,7 +606,7 @@ func NewDohCache(settings *DohSettings) *DohCache {
 			if len(localAddrs) == 0 {
 				return nil, fmt.Errorf("no local DNS resolvers configured")
 			}
-			localAddr := localAddrs[mathrand.Intn(len(localAddrs))]
+			localAddr := localAddrs[int((localDnsNext.Add(1)-1)%uint64(len(localAddrs)))]
 			addr = net.JoinHostPort(localAddr, port)
 			conn, err := netDialer.DialContext(ctx, network, addr)
 			logControlDialResult(settings.Log, "dns", true, network, addr, conn, err)
@@ -615,9 +661,11 @@ func NewDohCache(settings *DohSettings) *DohCache {
 		}
 	}
 
+	siblings := dohServerSiblings(settings.DnsResolverSettings)
+
 	return &DohCache{
-		remoteClient:          &dohClient{httpClient: httpClient, httpSem: httpSem, primarySem: primarySem, activeQueries: activeQueries, stats: stats, memoryTarget: settings.MemoryTarget, lifecycle: lifecycle, captureRoute: settings.DialContextSettings != nil},
-		localClient:           &dohClient{httpClient: localHttpClient, httpSem: httpSem, primarySem: primarySem, activeQueries: activeQueries, stats: stats, memoryTarget: settings.MemoryTarget, lifecycle: lifecycle},
+		remoteClient:          &dohClient{httpClient: httpClient, httpSem: httpSem, primarySem: primarySem, activeQueries: activeQueries, stats: stats, memoryTarget: settings.MemoryTarget, lifecycle: lifecycle, captureRoute: settings.DialContextSettings != nil, siblings: siblings},
+		localClient:           &dohClient{httpClient: localHttpClient, httpSem: httpSem, primarySem: primarySem, activeQueries: activeQueries, stats: stats, memoryTarget: settings.MemoryTarget, lifecycle: lifecycle, siblings: siblings},
 		remoteResolver:        remoteResolver,
 		localResolver:         localResolver,
 		settings:              settings,
@@ -1048,10 +1096,12 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]n
 		}
 	}
 
-	if len(addrExpirations) == 0 && (dohServerName || self.settings.DnsResolverSettings.EnableRemoteDns) &&
+	lookupNetwork, lookupFamilyEnabled := dnsLookupNetwork(q.RecordType, self.settings.IpVersion)
+
+	if len(addrExpirations) == 0 && lookupFamilyEnabled && (dohServerName || self.settings.DnsResolverSettings.EnableRemoteDns) &&
 		self.settings.MemoryTarget.Acquire(ctx, dnsLookupReserveByteCount) {
 		// try the remote resolver
-		resolvedIps, err := self.remoteResolver.LookupIP(ctx, self.settings.ResolverIp(), q.Domain)
+		resolvedIps, err := self.remoteResolver.LookupIP(ctx, lookupNetwork, q.Domain)
 		self.settings.MemoryTarget.Release(dnsLookupReserveByteCount)
 		if err == nil {
 			found := false
@@ -1071,10 +1121,10 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]n
 		}
 	}
 
-	if len(addrExpirations) == 0 && self.settings.DnsResolverSettings.EnableLocalDns &&
+	if len(addrExpirations) == 0 && lookupFamilyEnabled && self.settings.DnsResolverSettings.EnableLocalDns &&
 		self.settings.MemoryTarget.Acquire(ctx, dnsLookupReserveByteCount) {
 		// try the local resolver
-		resolvedIps, err := self.localResolver.LookupIP(ctx, self.settings.ResolverIp(), q.Domain)
+		resolvedIps, err := self.localResolver.LookupIP(ctx, lookupNetwork, q.Domain)
 		self.settings.MemoryTarget.Release(dnsLookupReserveByteCount)
 		if err == nil {
 			found := false
@@ -1199,6 +1249,7 @@ func dohQueryWithClient(
 		stats:         nil,
 		memoryTarget:  settings.MemoryTarget,
 		lifecycle:     lifecycle,
+		siblings:      dohServerSiblings(settings.DnsResolverSettings),
 	}
 	return c.queryResult(ctx, remoteDohUrls(settings, ipVersion), recordType, settings, domains...).AddrTtls
 }
@@ -1210,8 +1261,8 @@ func dohUrlsFor(ipv4 []string, ipv6 []string, ipVersion int) []string {
 	case 6:
 		return ipv6
 	default:
-		urls := append([]string{}, ipv4...)
-		return append(urls, ipv6...)
+		// both families, operator-paired (see dualStackList)
+		return dualStackList(ipv4, ipv6, knownDohUrlPairs)
 	}
 }
 
@@ -1257,6 +1308,177 @@ type dohClient struct {
 	// owner-supplied tunnel stack. Host/local clients must never manufacture a
 	// provider-affinity hint from their physical socket.
 	captureRoute bool
+	// siblings pairs each server url with the same operator's other-family
+	// url (dohServerSiblings), so a fan-out launches the pair as one wave.
+	siblings map[string]string
+}
+
+// knownDohUrlPairs are the v4/v6 endpoint pairs of the default DoH
+// operators. A pair is what "race each operator's v4 and v6 endpoint" means
+// for a url the defaults ship; a url outside this table pairs by index only
+// with another url outside it (see familySiblings).
+var knownDohUrlPairs = [][2]string{
+	{"https://1.1.1.1/dns-query", "https://[2606:4700:4700::1111]/dns-query"},
+	{"https://1.0.0.1/dns-query", "https://[2606:4700:4700::1001]/dns-query"},
+	{"https://8.8.8.8/dns-query", "https://[2001:4860:4860::8888]/dns-query"},
+	{"https://8.8.4.4/dns-query", "https://[2001:4860:4860::8844]/dns-query"},
+	{"https://9.9.9.9/dns-query", "https://[2620:fe::fe]/dns-query"},
+	{"https://149.112.112.112/dns-query", "https://[2620:fe::9]/dns-query"},
+	{"https://208.67.222.222/dns-query", "https://[2620:119:35::35]/dns-query"},
+	{"https://208.67.220.220/dns-query", "https://[2620:119:53::53]/dns-query"},
+}
+
+// knownDnsServerPairs are the v4/v6 pairs of the default and regional plain
+// dns operators, the same rule for the plain-dns lists.
+var knownDnsServerPairs = [][2]string{
+	{"1.1.1.1", "2606:4700:4700::1111"},
+	{"1.0.0.1", "2606:4700:4700::1001"},
+	{"8.8.8.8", "2001:4860:4860::8888"},
+	{"8.8.4.4", "2001:4860:4860::8844"},
+	{"9.9.9.9", "2620:fe::fe"},
+	{"149.112.112.112", "2620:fe::9"},
+	{"208.67.222.222", "2620:119:35::35"},
+	{"208.67.220.220", "2620:119:53::53"},
+	{"223.5.5.5", "2400:3200::1"},
+	{"119.29.29.29", "2402:4e00::"},
+	{"77.88.8.8", "2a02:6b8::feed:0ff"},
+}
+
+// familySiblings pairs the entries of a v4 list and a v6 list by operator:
+// a known pair from the table when both members are configured, else by
+// list index for entries that are outside the table on both sides. The
+// result maps each paired entry to its sibling in both directions.
+//
+// The table rule is what lets "start from the defaults and replace the v4
+// list" keep meaning "use only these servers": the default v6 entries are
+// known operators whose v4 partners are then absent, so they pair with
+// nothing and dualStackList leaves them out, instead of index-pairing a
+// caller's private server with Cloudflare's v6 endpoint.
+func familySiblings(ipv4 []string, ipv6 []string, known [][2]string) map[string]string {
+	siblings := map[string]string{}
+	knownOf := map[string]string{}
+	for _, pair := range known {
+		knownOf[pair[0]] = pair[1]
+		knownOf[pair[1]] = pair[0]
+	}
+	present6 := map[string]bool{}
+	for _, entry := range ipv6 {
+		present6[entry] = true
+	}
+	unknown4 := []string{}
+	for _, entry := range ipv4 {
+		if partner, ok := knownOf[entry]; ok {
+			if present6[partner] && partner != entry {
+				siblings[entry] = partner
+				siblings[partner] = entry
+			}
+			continue
+		}
+		unknown4 = append(unknown4, entry)
+	}
+	unknown6 := []string{}
+	for _, entry := range ipv6 {
+		if _, ok := knownOf[entry]; !ok {
+			unknown6 = append(unknown6, entry)
+		}
+	}
+	for i := 0; i < min(len(unknown4), len(unknown6)); i++ {
+		if unknown4[i] == "" || unknown6[i] == "" || unknown4[i] == unknown6[i] {
+			continue
+		}
+		siblings[unknown4[i]] = unknown6[i]
+		siblings[unknown6[i]] = unknown4[i]
+	}
+	return siblings
+}
+
+// dualStackList is the list a family-agnostic (IpVersion 0) consumer walks:
+// every v4 entry in order, each followed by its v6 sibling, so the families
+// interleave by operator.
+//
+// Two kinds of leftover v6 entry are treated differently, and the difference
+// is what makes "start from the defaults and replace the v4 list" behave:
+//
+//   - A KNOWN-TABLE entry whose v4 partner is absent is left out. Those are
+//     the shipped defaults; a caller who replaced the v4 list means "use my
+//     servers", and pulling Cloudflare's v6 endpoint back in would send real
+//     queries to an operator they just removed.
+//   - An entry OUTSIDE the table is kept, at the end. Those can only have come
+//     from the caller, so dropping one would ignore a server they explicitly
+//     configured -- which is what happened to every custom v6 endpoint past
+//     the shorter list's length, since familySiblings can only index-pair
+//     min(len4, len6) of them.
+func dualStackList(ipv4 []string, ipv6 []string, known [][2]string) []string {
+	if len(ipv4) == 0 {
+		return append([]string{}, ipv6...)
+	}
+	inTable := make(map[string]bool, 2*len(known))
+	for _, pair := range known {
+		inTable[pair[0]] = true
+		inTable[pair[1]] = true
+	}
+	siblings := familySiblings(ipv4, ipv6, known)
+	list := make([]string, 0, len(ipv4)+len(ipv6))
+	emitted := make(map[string]bool, len(ipv4)+len(ipv6))
+	emit := func(entry string) {
+		if emitted[entry] {
+			return
+		}
+		emitted[entry] = true
+		list = append(list, entry)
+	}
+	for _, entry := range ipv4 {
+		emit(entry)
+		if sibling, ok := siblings[entry]; ok {
+			emit(sibling)
+		}
+	}
+	for _, entry := range ipv6 {
+		if !inTable[entry] {
+			emit(entry)
+		}
+	}
+	return list
+}
+
+// dohServerSiblings is the sibling map over both DoH url lists, for the
+// launch waves.
+func dohServerSiblings(rs *DnsResolverSettings) map[string]string {
+	siblings := map[string]string{}
+	if rs == nil {
+		return siblings
+	}
+	maps.Copy(siblings, familySiblings(rs.RemoteDohUrlsIpv4, rs.RemoteDohUrlsIpv6, knownDohUrlPairs))
+	maps.Copy(siblings, familySiblings(rs.LocalDohUrlsIpv4, rs.LocalDohUrlsIpv6, knownDohUrlPairs))
+	return siblings
+}
+
+// dohLaunchWaves groups an ordered server list into launch waves: a server
+// and its operator sibling (when both are in the list) form one wave, so the
+// operator's v4 and v6 endpoints race each other inside the wave instead of
+// the v6 endpoint waiting a whole stagger behind the v4 one. Wave order
+// follows the first appearance of either member in the weighted order, so a
+// well-scoring operator still fires first. Every url appears exactly once.
+func dohLaunchWaves(ordered []string, siblings map[string]string) [][]string {
+	present := make(map[string]bool, len(ordered))
+	for _, dohUrl := range ordered {
+		present[dohUrl] = true
+	}
+	placed := make(map[string]bool, len(ordered))
+	waves := make([][]string, 0, len(ordered))
+	for _, dohUrl := range ordered {
+		if placed[dohUrl] {
+			continue
+		}
+		wave := []string{dohUrl}
+		placed[dohUrl] = true
+		if sibling, ok := siblings[dohUrl]; ok && present[sibling] && !placed[sibling] {
+			wave = append(wave, sibling)
+			placed[sibling] = true
+		}
+		waves = append(waves, wave)
+	}
+	return waves
 }
 
 // beginQuery admits one logical lookup into the shared quiet-query counter.
@@ -1357,6 +1579,8 @@ func (self *dohClient) queryResult(
 	if 0 < settings.MaxServersPerQuery && settings.MaxServersPerQuery < len(ordered) {
 		ordered = ordered[:settings.MaxServersPerQuery]
 	}
+	// an operator's v4 and v6 endpoints race inside one wave
+	waves := dohLaunchWaves(ordered, self.siblings)
 
 	queryCount := len(ordered) * len(names)
 	receiveResults := make(chan *dohQueryResult, queryCount)
@@ -1382,79 +1606,75 @@ func (self *dohClient) queryResult(
 	// launcher: start one server-wave per stagger interval (in weighted order) until an early
 	// server wins (stop), the deadline passes, or every server has been launched.
 	go HandleError(func() {
-		for i, dohUrl := range ordered {
-			if 0 < i && 0 < stagger {
-				select {
-				case <-time.After(stagger):
-				case <-stop:
-					return
-				case <-queryCtx.Done():
-					return
-				}
+		for waveIndex, wave := range waves {
+			if 0 < waveIndex && !waitDohLaunchStagger(queryCtx, stop, stagger) {
+				return
 			}
-			for _, name := range names {
-				primaryAcquired := false
-				if pathWarm && i == 0 && self.primarySem != nil {
-					select {
-					case self.primarySem <- struct{}{}:
-						primaryAcquired = true
-					case <-stop:
-						return
-					case <-queryCtx.Done():
-						return
+			for _, dohUrl := range wave {
+				for _, name := range names {
+					primaryAcquired := false
+					if pathWarm && waveIndex == 0 && self.primarySem != nil {
+						select {
+						case self.primarySem <- struct{}{}:
+							primaryAcquired = true
+						case <-stop:
+							return
+						case <-queryCtx.Done():
+							return
+						}
 					}
-				}
-				// acquire the in-flight slot and byte reservation here so work
-				// waiting on the caps parks in this one launcher instead of one
-				// parked goroutine per (server, name); the request goroutine owns
-				// both and releases them when done
-				if self.httpSem != nil {
-					select {
-					case self.httpSem <- struct{}{}:
-					case <-stop:
+					// acquire the in-flight slot and byte reservation here so work
+					// waiting on the caps parks in this one launcher instead of one
+					// parked goroutine per (server, name); the request goroutine owns
+					// both and releases them when done
+					if self.httpSem != nil {
+						select {
+						case self.httpSem <- struct{}{}:
+						case <-stop:
+							if primaryAcquired {
+								<-self.primarySem
+							}
+							return
+						case <-queryCtx.Done():
+							if primaryAcquired {
+								<-self.primarySem
+							}
+							return
+						}
+					}
+					// the request pins up to a full response read; the owner's dns
+					// memory target bounds its total in-flight bytes across all of
+					// its resolver caches
+					if !self.memoryTarget.Acquire(launchCtx, dohQueryReserveByteCount) {
+						if self.httpSem != nil {
+							<-self.httpSem
+						}
 						if primaryAcquired {
 							<-self.primarySem
 						}
 						return
-					case <-queryCtx.Done():
-						if primaryAcquired {
-							<-self.primarySem
+					}
+					go HandleError(func() {
+						defer self.memoryTarget.Release(dohQueryReserveByteCount)
+						if self.httpSem != nil {
+							defer func() { <-self.httpSem }()
 						}
-						return
-					}
+						if primaryAcquired {
+							defer func() { <-self.primarySem }()
+						}
+						result := self.queryWire(queryCtx, dohUrl, recordType, name)
+						// a server that returns records or an authoritative no-record answer is healthy;
+						// anything else (error, non-200, or no answer before it was beaten) counts
+						// against it. The large stagger means the first wave is the usual winner, so a
+						// later wave is only launched — and only judged — when an earlier server was
+						// slow or failed.
+						self.stats.record(dohUrl, 0 < len(result.AddrTtls) || result.Miss)
+						select {
+						case receiveResults <- result:
+						case <-queryCtx.Done():
+						}
+					})
 				}
-				// the request pins up to a full response read; the owner's dns
-				// memory target bounds its total in-flight bytes across all of
-				// its resolver caches
-				if !self.memoryTarget.Acquire(launchCtx, dohQueryReserveByteCount) {
-					if self.httpSem != nil {
-						<-self.httpSem
-					}
-					if primaryAcquired {
-						<-self.primarySem
-					}
-					return
-				}
-				go HandleError(func() {
-					defer self.memoryTarget.Release(dohQueryReserveByteCount)
-					if self.httpSem != nil {
-						defer func() { <-self.httpSem }()
-					}
-					if primaryAcquired {
-						defer func() { <-self.primarySem }()
-					}
-					result := self.queryWire(queryCtx, dohUrl, recordType, name)
-					// a server that returns records or an authoritative no-record answer is healthy;
-					// anything else (error, non-200, or no answer before it was beaten) counts
-					// against it. The large stagger means the first wave is the usual winner, so a
-					// later wave is only launched — and only judged — when an earlier server was
-					// slow or failed.
-					self.stats.record(dohUrl, 0 < len(result.AddrTtls) || result.Miss)
-					select {
-					case receiveResults <- result:
-					case <-queryCtx.Done():
-					}
-				})
 			}
 		}
 	})
@@ -1674,6 +1894,7 @@ func (self *dohClient) forwardRaw(ctx context.Context, dohUrls []string, qType d
 	if len(ordered) == 0 {
 		return nil, false
 	}
+	waves := dohLaunchWaves(ordered, self.siblings)
 
 	type rawResult struct {
 		data   []byte
@@ -1700,63 +1921,65 @@ func (self *dohClient) forwardRaw(ctx context.Context, dohUrls []string, qType d
 	stagger := dohServerStagger(settings, pathWarm, activeQueryCount)
 
 	go HandleError(func() {
-		for i, dohUrl := range ordered {
-			if 0 < i && !waitDohLaunchStagger(queryCtx, stop, stagger) {
+		for waveIndex, wave := range waves {
+			if 0 < waveIndex && !waitDohLaunchStagger(queryCtx, stop, stagger) {
 				return
 			}
+			for _, dohUrl := range wave {
 
-			primaryAcquired := false
-			if pathWarm && i == 0 && self.primarySem != nil {
-				select {
-				case self.primarySem <- struct{}{}:
-					primaryAcquired = true
-				case <-stop:
-					return
-				case <-queryCtx.Done():
-					return
+				primaryAcquired := false
+				if pathWarm && waveIndex == 0 && self.primarySem != nil {
+					select {
+					case self.primarySem <- struct{}{}:
+						primaryAcquired = true
+					case <-stop:
+						return
+					case <-queryCtx.Done():
+						return
+					}
 				}
-			}
-			if self.httpSem != nil {
-				select {
-				case self.httpSem <- struct{}{}:
-				case <-stop:
+				if self.httpSem != nil {
+					select {
+					case self.httpSem <- struct{}{}:
+					case <-stop:
+						if primaryAcquired {
+							<-self.primarySem
+						}
+						return
+					case <-queryCtx.Done():
+						if primaryAcquired {
+							<-self.primarySem
+						}
+						return
+					}
+				}
+				if !self.memoryTarget.Acquire(launchCtx, dohQueryReserveByteCount) {
+					if self.httpSem != nil {
+						<-self.httpSem
+					}
 					if primaryAcquired {
 						<-self.primarySem
 					}
 					return
-				case <-queryCtx.Done():
-					if primaryAcquired {
-						<-self.primarySem
-					}
-					return
 				}
-			}
-			if !self.memoryTarget.Acquire(launchCtx, dohQueryReserveByteCount) {
-				if self.httpSem != nil {
-					<-self.httpSem
-				}
-				if primaryAcquired {
-					<-self.primarySem
-				}
-				return
-			}
 
-			go HandleError(func() {
-				defer self.memoryTarget.Release(dohQueryReserveByteCount)
-				if self.httpSem != nil {
-					defer func() { <-self.httpSem }()
-				}
-				if primaryAcquired {
-					defer func() { <-self.primarySem }()
-				}
-				data, ok := self.queryWireRaw(queryCtx, dohUrl, qType, name)
-				usable := ok && dnsResponseUsable(data)
-				self.stats.record(dohUrl, usable)
-				select {
-				case results <- rawResult{data: data, usable: usable}:
-				case <-queryCtx.Done():
-				}
-			})
+				go HandleError(func() {
+					defer self.memoryTarget.Release(dohQueryReserveByteCount)
+					if self.httpSem != nil {
+						defer func() { <-self.httpSem }()
+					}
+					if primaryAcquired {
+						defer func() { <-self.primarySem }()
+					}
+					data, ok := self.queryWireRaw(queryCtx, dohUrl, qType, name)
+					usable := ok && dnsResponseUsable(data)
+					self.stats.record(dohUrl, usable)
+					select {
+					case results <- rawResult{data: data, usable: usable}:
+					case <-queryCtx.Done():
+					}
+				})
+			}
 		}
 	})
 

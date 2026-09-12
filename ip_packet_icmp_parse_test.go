@@ -110,13 +110,17 @@ func TestIcmpUnreachableParsesMinimalEmbed(t *testing.T) {
 }
 
 func TestIcmpUnreachableRejectsNonIcmp(t *testing.T) {
+	forEachIpVersion(t, testIcmpUnreachableRejectsNonIcmp)
+}
+
+func testIcmpUnreachableRejectsNonIcmp(t *testing.T, ipVersion int) {
 	// a plain tcp packet
-	tcpPacket := ipOosTcpPacketSequence(icmpTcpTestPath(4), tcpFlagSyn, 1, nil)
+	tcpPacket := ipOosTcpPacketSequence(icmpTcpTestPath(ipVersion), tcpFlagSyn, 1, nil)
 	if _, ok := ipParseIcmpUnreachable(tcpPacket); ok {
 		t.Error("accepted a tcp packet")
 	}
 	// a plain udp packet
-	udpPacket := ipOosUdpPacket(udpTestPath(4), nil)
+	udpPacket := ipOosUdpPacket(udpTestPath(ipVersion), nil)
 	if _, ok := ipParseIcmpUnreachable(udpPacket); ok {
 		t.Error("accepted a udp packet")
 	}
@@ -125,8 +129,12 @@ func TestIcmpUnreachableRejectsNonIcmp(t *testing.T) {
 		t.Error("accepted an empty packet")
 	}
 	// wrong icmp type: flip dest-unreachable to echo request
-	packet, _ := ipOosUnreachable(udpTestPath(4))
-	packet[Ipv4HeaderSizeWithoutExtensions] = 8
+	packet, _ := ipOosUnreachable(udpTestPath(ipVersion))
+	if ipVersion == 4 {
+		packet[Ipv4HeaderSizeWithoutExtensions] = 8
+	} else {
+		packet[Ipv6HeaderSize] = 128
+	}
 	if _, ok := ipParseIcmpUnreachable(packet); ok {
 		t.Error("accepted an icmp echo")
 	}
@@ -136,7 +144,11 @@ func TestIcmpUnreachableRejectsNonIcmp(t *testing.T) {
 // signal at ParseIpPath rather than misrouting it. If ParseIpPath ever learns
 // icmp, the intercept ordering in the channel receive loop must be revisited.
 func TestParseIpPathStillRejectsIcmp(t *testing.T) {
-	packet, ok := ipOosUnreachable(icmpTcpTestPath(4))
+	forEachIpVersion(t, testParseIpPathStillRejectsIcmp)
+}
+
+func testParseIpPathStillRejectsIcmp(t *testing.T, ipVersion int) {
+	packet, ok := ipOosUnreachable(icmpTcpTestPath(ipVersion))
 	if !ok {
 		t.Fatal("build failed")
 	}

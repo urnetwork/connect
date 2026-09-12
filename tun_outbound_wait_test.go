@@ -126,10 +126,16 @@ func TestTunOutboundQueueUnboundedWaitWhenDisabled(t *testing.T) {
 // call, an unbounded wait never returns. The bounded wait drops the reply and
 // lets the reader continue, exactly as a saturated NIC queue would.
 func TestTunInjectingReaderDoesNotDeadlockOnFullOutboundQueue(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testTunInjectingReaderDoesNotDeadlockOnFullOutboundQueue(t, ipVersion)
+	})
+}
+
+func testTunInjectingReaderDoesNotDeadlockOnFullOutboundQueue(t *testing.T, ipVersion int) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	settings := DefaultTunSettingsWithBufferSize(1)
+	settings := tunTestApplyIpVersion(DefaultTunSettingsWithBufferSize(1), ipVersion)
 	settings.OutboundQueueWaitTimeout = 100 * time.Millisecond
 	tun, err := CreateTun(ctx, settings)
 	if err != nil {
@@ -145,7 +151,7 @@ func TestTunInjectingReaderDoesNotDeadlockOnFullOutboundQueue(t *testing.T) {
 	}
 
 	// this is the injection the reader makes while holding the queue
-	syn := newTunClosedPortSynPacket(t, tun)
+	syn := newTunClosedPortSynPacket(t, tun, ipVersion)
 	written := make(chan error, 1)
 	go func() {
 		_, writeErr := tun.Write(syn)
@@ -172,7 +178,7 @@ func TestTunInjectingReaderDoesNotDeadlockOnFullOutboundQueue(t *testing.T) {
 
 	// the same injection with the bound disabled is the deadlock this guards
 	// against: it must not return while the queue stays full.
-	unboundedSettings := DefaultTunSettingsWithBufferSize(1)
+	unboundedSettings := tunTestApplyIpVersion(DefaultTunSettingsWithBufferSize(1), ipVersion)
 	unboundedSettings.OutboundQueueWaitTimeout = 0
 	unboundedTun, err := CreateTun(ctx, unboundedSettings)
 	if err != nil {
@@ -186,7 +192,7 @@ func TestTunInjectingReaderDoesNotDeadlockOnFullOutboundQueue(t *testing.T) {
 	}
 	unboundedWritten := make(chan error, 1)
 	go func() {
-		_, writeErr := unboundedTun.Write(newTunClosedPortSynPacket(t, unboundedTun))
+		_, writeErr := unboundedTun.Write(newTunClosedPortSynPacket(t, unboundedTun, ipVersion))
 		unboundedWritten <- writeErr
 	}()
 	select {
@@ -203,19 +209,21 @@ func TestTunInjectingReaderDoesNotDeadlockOnFullOutboundQueue(t *testing.T) {
 	}
 }
 
-// A SYN addressed to the tun's own address on a port nothing is listening on:
-// gVisor answers it with a RST written back to the link endpoint.
-func newTunClosedPortSynPacket(t *testing.T, tun *Tun) []byte {
+// A SYN addressed to the tun's own address of the given family on a port
+// nothing is listening on: gVisor answers it with a RST written back to the
+// link endpoint.
+func newTunClosedPortSynPacket(t *testing.T, tun *Tun, ipVersion int) []byte {
 	t.Helper()
-	if len(tun.localAddresses) == 0 {
-		t.Fatal("tun has no local address")
+	sourceIp := net.IPv4(198, 51, 100, 2).To4()
+	if ipVersion == 6 {
+		sourceIp = net.ParseIP("2001:db8::2")
 	}
 	path := &IpPath{
-		Version:         4,
+		Version:         ipVersion,
 		Protocol:        IpProtocolTcp,
-		SourceIp:        net.IPv4(198, 51, 100, 2).To4(),
+		SourceIp:        sourceIp,
 		SourcePort:      40001,
-		DestinationIp:   net.IP(tun.localAddresses[0].AsSlice()),
+		DestinationIp:   net.IP(tunTestLocalAddress(t, tun, ipVersion).AsSlice()),
 		DestinationPort: 9,
 	}
 	packet, tcpHeader := ipTransportPacket(path, ipProtocolNumberTcp, TcpHeaderSizeWithoutExtensions)
