@@ -19,7 +19,6 @@ package connect
 // tracked-flow packets.
 
 import (
-	"fmt"
 	"net/netip"
 	"sync"
 	"sync/atomic"
@@ -383,7 +382,7 @@ func (self *firstLoadTimeline) recordFlowLocked(key firstLoadFlowKey, flow *firs
 	if !flow.firstByteTime.IsZero() {
 		firstByteMillis = flow.firstByteTime.Sub(flow.synTime).Milliseconds()
 	}
-	target := fmt.Sprintf("%s:%d", key.remoteAddr, key.remotePort)
+	target := netip.AddrPortFrom(key.remoteAddr, key.remotePort).String()
 	self.samples = append(self.samples, &FirstLoadSample{
 		Kind:            "tcp",
 		Target:          target,

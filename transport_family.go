@@ -42,6 +42,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1214,7 +1215,7 @@ func (self *PlatformTransport) h3DialCandidates(ctx context.Context, ptMode Tran
 		// preserving the existing egress-aware fallback. The socket can be
 		// pinned while an OS name query still loops into this process's own
 		// tunnel. See egress_dial.go.
-		udpAddr, err := self.resolveSingleControlUDPAddr(ctx, fmt.Sprintf("%s:%d", serverName, self.settings.DnsPort))
+		udpAddr, err := self.resolveSingleControlUDPAddr(ctx, net.JoinHostPort(serverName, strconv.Itoa(self.settings.DnsPort)))
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1225,13 +1226,13 @@ func (self *PlatformTransport) h3DialCandidates(ctx context.Context, ptMode Tran
 		if pumpServerName == "" {
 			return nil, nil, fmt.Errorf("H3 DNS pump host is empty")
 		}
-		udpAddr, err := self.resolveSingleControlUDPAddr(ctx, fmt.Sprintf("%s:%d", pumpServerName, self.settings.DnsPort))
+		udpAddr, err := self.resolveSingleControlUDPAddr(ctx, net.JoinHostPort(pumpServerName, strconv.Itoa(self.settings.DnsPort)))
 		if err != nil {
 			return nil, nil, err
 		}
 		return []*net.UDPAddr{udpAddr}, translated(PacketTranslationModeDnsPump, tld), nil
 	default:
-		address := fmt.Sprintf("%s:%d", serverName, self.settings.H3Port)
+		address := net.JoinHostPort(serverName, strconv.Itoa(self.settings.H3Port))
 		if self.settings.resolveH3AddrsForTest != nil {
 			udpAddrs, err := self.settings.resolveH3AddrsForTest(ctx, address, self.ipFamily)
 			return udpAddrs, plain, err

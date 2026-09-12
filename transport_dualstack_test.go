@@ -3,8 +3,8 @@ package connect
 // transport_dualstack_test.go — dual-stack scaffolding for the transport and
 // platform tests (IPV6.md D3), on top of test_dualstack_test.go: the benchmark
 // fan-out, the url-host and socket-address forms of the loopback literal, an
-// httptest server bound to one family, and the H3 literal-host workaround
-// (see TestPlatformTransportH3ResolvesLiteralIpv6PlatformHost).
+// httptest server bound to one family, and the H3 address seam that points a
+// transport at a test listener.
 
 import (
 	"context"
@@ -103,10 +103,11 @@ func newTestingLoopbackHttpServer(tb testing.TB, ipVersion int, handler http.Han
 
 // testingH3LoopbackResolver returns the H3 address resolution a v6 subtest
 // installs (PlatformTransportSettings.resolveH3AddrsForTest) so the transport
-// dials the loopback listener directly: h3DialCandidates cannot yet form a
-// dialable address from a v6 literal platform host (see
-// TestPlatformTransportH3ResolvesLiteralIpv6PlatformHost). nil for v4, which
-// keeps exercising the real resolution path. Remove once that test passes.
+// dials the test's own loopback listener on its ephemeral port, which no
+// resolution of the platform host could produce. nil for v4, which keeps
+// exercising the real resolution path. h3DialCandidates itself forms v6
+// literal addresses correctly -- TestPlatformTransportH3ResolvesLiteralIpv6PlatformHost
+// covers that directly, without this seam.
 func testingH3LoopbackResolver(ipVersion int, port int) func(context.Context, string, int) ([]*net.UDPAddr, error) {
 	if ipVersion != 6 {
 		return nil
@@ -124,7 +125,6 @@ func testingH3LoopbackResolver(ipVersion int, port int) func(context.Context, st
 // it. Named hosts are unaffected. The v6 subtests of the H3 platform tests
 // install testingH3LoopbackResolver to get past this meanwhile.
 func TestPlatformTransportH3ResolvesLiteralIpv6PlatformHost(t *testing.T) {
-	t.Skip("h3DialCandidates (transport_family.go) formats the H3 dial address with a plain host:port Sprintf, so a v6 literal platform host fails resolution with \"address ::1:4433: too many colons in address\"; join host and port with net.JoinHostPort")
 	requireIpv6Loopback(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
