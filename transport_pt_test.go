@@ -33,11 +33,15 @@ import (
 )
 
 func TestPtDnsEncodeDecode(t *testing.T) {
-	ptEncodeDecodeTest(t, PacketTranslationModeDns, PacketTranslationModeDecode53)
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ptEncodeDecodeTest(t, ipVersion, PacketTranslationModeDns, PacketTranslationModeDecode53)
+	})
 }
 
 func TestPtDnsPumpEncodeDecode(t *testing.T) {
-	ptEncodeDecodeTest(t, PacketTranslationModeDnsPump, PacketTranslationModeDecode53RequireDnsPump)
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ptEncodeDecodeTest(t, ipVersion, PacketTranslationModeDnsPump, PacketTranslationModeDecode53RequireDnsPump)
+	})
 }
 
 // A synchronous translated write needs a deadline timer while its encoder owns
@@ -116,36 +120,34 @@ func TestPacketTranslationReadyDeadlineAllocationIsBounded(t *testing.T) {
 }
 
 func TestPtDnsPumpZeroWriteRateDisablesPacing(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	sourceConn, err := net.ListenUDP("udp", &net.UDPAddr{
-		IP: net.ParseIP("127.0.0.1"),
+		sourceConn, err := net.ListenUDP(testUdpNetwork(ipVersion), testLoopbackUdpAddr(ipVersion))
+		AssertEqual(t, err, nil)
+		defer sourceConn.Close()
+		destinationConn, err := net.ListenUDP(testUdpNetwork(ipVersion), testLoopbackUdpAddr(ipVersion))
+		AssertEqual(t, err, nil)
+		defer destinationConn.Close()
+
+		settings := DefaultPacketTranslationSettings()
+		settings.DnsTlds = [][]byte{[]byte("example.com.")}
+		settings.DnsPumpTimeout = time.Hour
+		settings.WritePacketsPerSecond = 0
+		pt, err := NewPacketTranslation(ctx, PacketTranslationModeDnsPump, sourceConn, settings)
+		AssertEqual(t, err, nil)
+		defer pt.Close()
+
+		_ = destinationConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if _, err := pt.WriteTo(make([]byte, 64), destinationConn.LocalAddr()); err != nil {
+			t.Fatal(err)
+		}
+		packetData := make([]byte, 2048)
+		if _, _, err := destinationConn.ReadFrom(packetData); err != nil {
+			t.Fatalf("unpaced dns translation did not write: %v", err)
+		}
 	})
-	AssertEqual(t, err, nil)
-	defer sourceConn.Close()
-	destinationConn, err := net.ListenUDP("udp", &net.UDPAddr{
-		IP: net.ParseIP("127.0.0.1"),
-	})
-	AssertEqual(t, err, nil)
-	defer destinationConn.Close()
-
-	settings := DefaultPacketTranslationSettings()
-	settings.DnsTlds = [][]byte{[]byte("example.com.")}
-	settings.DnsPumpTimeout = time.Hour
-	settings.WritePacketsPerSecond = 0
-	pt, err := NewPacketTranslation(ctx, PacketTranslationModeDnsPump, sourceConn, settings)
-	AssertEqual(t, err, nil)
-	defer pt.Close()
-
-	_ = destinationConn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	if _, err := pt.WriteTo(make([]byte, 64), destinationConn.LocalAddr()); err != nil {
-		t.Fatal(err)
-	}
-	packetData := make([]byte, 2048)
-	if _, _, err := destinationConn.ReadFrom(packetData); err != nil {
-		t.Fatalf("unpaced dns translation did not write: %v", err)
-	}
 }
 
 // packetTranslationLifecyclePacketConn holds the first encoded write until
@@ -375,7 +377,7 @@ func (self *packetTranslationTestCloseConnection) CloseWithError(
 	return self.closeWithError(code, reason)
 }
 
-func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, serverPtMode PacketTranslationMode) {
+func ptEncodeDecodeTest(t *testing.T, ipVersion int, clientPtMode PacketTranslationMode, serverPtMode PacketTranslationMode) {
 	if testing.Short() {
 		return
 	}
@@ -420,7 +422,7 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 
 			tld := []byte("foo.com.")
 
-			serverAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}
+			serverAddr := testLoopbackUdpAddr(ipVersion)
 
 			ioTimeout := 5 * time.Second
 			ioDeadline := func() time.Time {
@@ -472,7 +474,7 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 				},
 			}
 
-			serverConn, err := net.ListenUDP("udp", serverAddr)
+			serverConn, err := net.ListenUDP(testUdpNetwork(ipVersion), serverAddr)
 			AssertEqual(t, err, nil)
 			defer serverConn.Close()
 			serverAddr = serverConn.LocalAddr().(*net.UDPAddr)
@@ -591,7 +593,7 @@ func ptEncodeDecodeTest(t *testing.T, clientPtMode PacketTranslationMode, server
 				InsecureSkipVerify: true,
 			}
 
-			clientConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+			clientConn, err := net.ListenUDP(testUdpNetwork(ipVersion), &net.UDPAddr{IP: testUnspecifiedIp(ipVersion), Port: 0})
 			AssertEqual(t, err, nil)
 			defer clientConn.Close()
 
