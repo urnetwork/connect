@@ -44,9 +44,13 @@ test_pipeline_status() {
 # main run below.
 #   - TestPtDns*: real-time QUIC-over-DNS transfers with tight per-stream deadlines.
 #   - TestWebRtc*: pion/ice WebRTC transports whose ICE timing flakes under load.
+#   - TestTunTCPThroughput: a sustained gvisor tun transfer judged against a
+#     throughput floor, run once per ip family, whose per-family budget only
+#     closes while the host is not also running the rest of the -race suite.
 pt_filter='TestPtDnsEncodeDecode|TestPtDnsPumpEncodeDecode'
 webrtc_filter='TestWebRtc'
-skip_filter="$pt_filter|$webrtc_filter"
+tun_throughput_filter='TestTunTCPThroughput'
+skip_filter="$pt_filter|$webrtc_filter|$tun_throughput_filter"
 
 # run the WebRTC tests first, in their own process
 match="/$(basename $(pwd))/\\S*\.go\|^\\S*_test.go"
@@ -57,6 +61,12 @@ test_pipeline_status "${pipeline_status[1]}" "${pipeline_status[2]}" || exit $?
 # run the packet-translation tests next, in their own process
 match="/$(basename $(pwd))/\\S*\.go\|^\\S*_test.go"
 GORACE="log_path=profile/race.out halt_on_error=1" go test -timeout 0 -v -race -run "$pt_filter" "$@" | grep --binary-files=text --line-buffered --color=always -e "^" -e "$match"
+pipeline_status=("${pipestatus[@]}")
+test_pipeline_status "${pipeline_status[1]}" "${pipeline_status[2]}" || exit $?
+
+# run the tun throughput measurement next, in its own process
+match="/$(basename $(pwd))/\\S*\.go\|^\\S*_test.go"
+GORACE="log_path=profile/race.out halt_on_error=1" go test -timeout 0 -v -race -run "$tun_throughput_filter" "$@" | grep --binary-files=text --line-buffered --color=always -e "^" -e "$match"
 pipeline_status=("${pipestatus[@]}")
 test_pipeline_status "${pipeline_status[1]}" "${pipeline_status[2]}" || exit $?
 
