@@ -641,7 +641,6 @@ func TestApiWindowAutoH1SaturatedBudgetToExplicitH3IsMakeBeforeBreak(t *testing.
 
 func testApiWindowAutoH1SaturatedBudgetToExplicitH3IsMakeBeforeBreak(t *testing.T, ipVersion int) {
 	if ipVersion == 6 {
-		t.Skip("h3CandidateAddrs builds its dial target by formatting serverName and port as host-colon-port (transport_family.go:1217, :1228, :1234), which produces the unparseable \"::1:61492\" for an IPv6 literal platform host: the H3 dial fails with \"too many colons in address\" and the carrier never authenticates. net.JoinHostPort is the fix. A hostname platform url is unaffected, so this bites an ip-literal platform url (which NetworkSpace explicitly supports as an override)")
 	}
 	// the quic endpoint and its certificate live on the family's loopback, so
 	// the replacement H3 carrier binds a socket of that family (IPV6.md A7)

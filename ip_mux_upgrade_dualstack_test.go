@@ -82,12 +82,6 @@ func testExampleComIp(ipVersion int) string {
 	return "2606:2800:220:1:248:1893:25c8:1946"
 }
 
-// testLoopbackUdpAddr is the family's loopback with an ephemeral port, for
-// ListenUDP.
-func testLoopbackUdpAddr(ipVersion int) *net.UDPAddr {
-	return &net.UDPAddr{IP: net.ParseIP(testLoopbackIp(ipVersion))}
-}
-
 // dnsQueryPacketFromVersion crafts the udp dns query packet for name with the
 // record type, transaction id and client source port controlled, addressed
 // over the family (see dnsQueryPacketFrom for the v4-only A form).
