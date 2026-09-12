@@ -353,7 +353,13 @@ func testIpMuxRejectedPumpPoolBalance(t *testing.T, installRejectingUpstream boo
 	ctx, cancel := context.WithCancel(context.Background())
 	settings := DefaultTunSettings()
 	settings.DialRace = 1
-	settings.DialTimeout = 100 * time.Millisecond
+	// The dial is only a way to make the stack emit a packet, and it is
+	// cancelled explicitly below once the packet arrives. It must not expire
+	// on its own: raceTunDialContext runs the attempt in a goroutine, and a
+	// budget that elapses before that goroutine reaches gonet.DialContextTCP
+	// makes it return on the already-cancelled context without calling
+	// ep.Connect, so no SYN is ever generated and no later wait can help.
+	settings.DialTimeout = 30 * time.Second
 	tun, err := CreateTun(ctx, settings)
 	if err != nil {
 		cancel()
@@ -381,15 +387,24 @@ func testIpMuxRejectedPumpPoolBalance(t *testing.T, installRejectingUpstream boo
 		})
 	}
 
-	dialCtx, dialCancel := context.WithTimeout(ctx, 250*time.Millisecond)
-	conn, _ := tun.DialContext(dialCtx, "tcp", "192.0.2.1:443")
-	dialCancel()
-	if conn != nil {
-		conn.Close()
-	}
-	if !waitForCondition(time.Second, func() bool {
+	// Keep the dial in flight while waiting: a live endpoint retransmits its
+	// SYN, so the wait is bounded by real work rather than by whether one
+	// packet happened to be emitted before the dial was torn down.
+	dialCtx, dialCancel := context.WithCancel(ctx)
+	dialDone := make(chan struct{})
+	go func() {
+		defer close(dialDone)
+		conn, _ := tun.DialContext(dialCtx, "tcp", "192.0.2.1:443")
+		if conn != nil {
+			conn.Close()
+		}
+	}()
+	emitted := waitForCondition(5*time.Second, func() bool {
 		return 0 < mux.rejectedPumpPacketCount.Load()
-	}) {
+	})
+	dialCancel()
+	<-dialDone
+	if !emitted {
 		mux.Close()
 		cancel()
 		t.Fatal("internal stack emitted no packet into the rejected upstream")
