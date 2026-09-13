@@ -743,7 +743,12 @@ type MultiClientSettings struct {
 	StatsWindowGraceperiod                    time.Duration
 	StatsWindowMaxEstimatedByteCountPerSecond ByteCount
 	// StatsWindowMaxEffectiveByteCountPerSecondScale float32
-	StatsWindowEntropy  float32
+	StatsWindowEntropy float32
+	// WindowExpandTimeout bounds candidate acquisition for one expansion pass.
+	// A candidate accepted inside this phase remains owned by the same pass
+	// through its full PingTimeout; acquisition therefore cannot silently
+	// shorten initial evaluation, and a pass remains bounded by the sum of the
+	// two settings.
 	WindowExpandTimeout time.Duration
 	// WindowExpandBlockTimeout     time.Duration
 	WindowExpandBlockCount int
@@ -9529,10 +9534,12 @@ type multiClientWindow struct {
 	clients            map[Id]*multiClientChannel
 	performanceProfile *PerformanceProfile
 	// Nil test seams expose one initial-evaluation callback across the exact
-	// expand-pass terminal boundary. Production leaves all four unset.
+	// expand-pass phase and terminal boundaries. Production leaves all five
+	// unset.
 	beforeExpandPingResultForTest func()
 	afterExpandPingResultForTest  func()
-	finishExpandPassForTest       <-chan struct{}
+	finishExpandRequestsForTest   <-chan struct{}
+	expireExpandPingForTest       <-chan struct{}
 	expireExpandPassForTest       <-chan struct{}
 	// verdictRemovalTimes is the storm breaker's record of recent
 	// verdict-driven removals, pruned to RemovalBudgetWindow on each check.
@@ -11084,6 +11091,24 @@ func multiClientExpandPlan(
 	return
 }
 
+// expandCandidateWithinAcquisitionDeadline accepts the exact boundary while
+// rejecting a ready-channel result selected after acquisition already ended.
+func expandCandidateWithinAcquisitionDeadline(candidateTime time.Time, deadline time.Time) bool {
+	return !deadline.Before(candidateTime)
+}
+
+// multiClientExpandDeadlines keeps acquisition and initial evaluation as
+// distinct budgets while bounding one owning pass by their sum.
+func multiClientExpandDeadlines(
+	startTime time.Time,
+	requestTimeout time.Duration,
+	pingTimeout time.Duration,
+) (requestEndTime time.Time, passEndTime time.Time) {
+	requestEndTime = startTime.Add(requestTimeout)
+	passEndTime = requestEndTime.Add(pingTimeout)
+	return
+}
+
 func (self *multiClientWindow) expand(
 	windowSize WindowSizeSettings,
 	currentWindowSize int,
@@ -11311,8 +11336,8 @@ func (self *multiClientWindow) expand(
 		}
 	}
 
-	// the surplus MUST be released on every exit path -- including the expand
-	// timeout returns mid-loop -- so the cleanup is a defer, not a tail.
+	// the surplus MUST be released on every terminal exit path -- including the
+	// pass safety deadline -- so the cleanup is a defer, not a tail.
 	// Registered after the returnPingSuccess defer above (LIFO), so an
 	// admission completed here still counts in the returned total.
 	defer func() {
@@ -11359,22 +11384,26 @@ func (self *multiClientWindow) expand(
 		)
 	}()
 
-	endTime := time.Now().Add(self.settings.WindowExpandTimeout)
+	requestEndTime, passEndTime := multiClientExpandDeadlines(
+		time.Now(),
+		self.settings.WindowExpandTimeout,
+		self.settings.PingTimeout,
+	)
 
+requestCandidates:
 	for i := 0; i < requestCount; i += 1 {
-		timeout := endTime.Sub(time.Now())
+		timeout := requestEndTime.Sub(time.Now())
 		if timeout < 0 {
-			passDeadlineExpired = true
 			self.log.V(1).Infof("[multi]expand window timeout\n")
-			return
+			break
 		}
 
 		self.generatorMonitor.NotifyAll()
 		select {
 		case <-self.ctx.Done():
 			return
-		case <-self.finishExpandPassForTest:
-			return
+		case <-self.finishExpandRequestsForTest:
+			break requestCandidates
 		case <-self.expireExpandPassForTest:
 			passDeadlineExpired = true
 			return
@@ -11383,6 +11412,17 @@ func (self *multiClientWindow) expand(
 		case args, ok := <-self.clientChannelArgs:
 			if !ok {
 				return
+			}
+			// A ready args channel and the acquisition timer can race in select.
+			// Recheck the wall clock after receipt so a candidate observed after
+			// the phase boundary cannot extend the pass beyond its documented
+			// acquisition + evaluation bound. Returning its args is the ordinary
+			// unused-candidate ownership path.
+			pingStartedAt := time.Now()
+			if !expandCandidateWithinAcquisitionDeadline(pingStartedAt, requestEndTime) {
+				self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
+				self.log.V(2).Infof("[multi]expand window timeout before candidate evaluation\n")
+				break requestCandidates
 			}
 			// randomly set to p2p only to meet the minimum requirement
 			if !args.MultiClientGeneratorClientArgs.P2pOnly {
@@ -11473,14 +11513,59 @@ func (self *multiClientWindow) expand(
 					}
 					return true
 				}
-				pingStartedAt := time.Now()
-				effectiveBudget := min(self.settings.PingTimeout, max(time.Duration(0), endTime.Sub(pingStartedAt)))
 				pendingPingFailures = append(pendingPingFailures, pendingPingFailure{
 					fail:            fail,
 					evaluationCtx:   evaluationCtx,
 					startedAt:       pingStartedAt,
-					effectiveBudget: effectiveBudget,
+					effectiveBudget: self.settings.PingTimeout,
 				})
+
+				// PingTimeout owns the whole initial evaluation, including any
+				// transport or contract work SendDetailedMessage performs before
+				// returning. Start it here, not after the send returns. The pass
+				// waits for pingDone below, so a candidate accepted just before the
+				// acquisition deadline receives the same budget as the first one
+				// without letting its callback escape into a later resize pass.
+				pingTimer := time.NewTimer(max(
+					time.Duration(0),
+					pingStartedAt.Add(self.settings.PingTimeout).Sub(time.Now()),
+				))
+				go HandleError(func() {
+					defer pingTimer.Stop()
+					select {
+					case <-pingDone.Done():
+						return
+					case <-evaluationCtx.Done():
+						func() {
+							mutex.Lock()
+							defer mutex.Unlock()
+							fail()
+						}()
+						return
+					case <-pingTimer.C:
+					case <-self.expireExpandPingForTest:
+					}
+
+					func() {
+						mutex.Lock()
+						defer mutex.Unlock()
+						if evaluationCtx.Err() != nil {
+							fail()
+							return
+						}
+						if !fail() {
+							return
+						}
+						// unconditional (V0), was V(2): the unanswered
+						// evaluation ping is THE dominant transition of
+						// the field hang, and it logged nothing
+						if ok, suppressed := self.pingFailThrottle.Allow(time.Now()); ok {
+							self.log.Infof("[multi]evaluation ping timeout [%s]%s\n",
+								args.ClientId, suppressedSuffix(suppressed))
+						}
+						self.recordEvaluationFailure(windowFailureProvider, nil)
+					}()
+				}, client.Cancel)
 
 				// EncryptionCapabilityPrefilter: under EncryptionModeRequired
 				// a candidate that has never published a client identity key
@@ -11586,50 +11671,22 @@ func (self *multiClientWindow) expand(
 						fail()
 					} else if !success {
 						fail()
-					} else {
-						// async wait for the ping
-						go HandleError(func() {
-							select {
-							case <-pingDone.Done():
-							case <-evaluationCtx.Done():
-								func() {
-									mutex.Lock()
-									defer mutex.Unlock()
-									fail()
-								}()
-							case <-time.After(self.settings.PingTimeout):
-								func() {
-									mutex.Lock()
-									defer mutex.Unlock()
-									if evaluationCtx.Err() != nil {
-										fail()
-										return
-									}
-									// unconditional (V0), was V(2): the unanswered
-									// evaluation ping is THE dominant transition of
-									// the field hang, and it logged nothing
-									if ok, suppressed := self.pingFailThrottle.Allow(time.Now()); ok {
-										self.log.Infof("[multi]evaluation ping timeout [%s]%s\n",
-											args.ClientId, suppressedSuffix(suppressed))
-									}
-									self.recordEvaluationFailure(windowFailureProvider, nil)
-									fail()
-								}()
-							}
-						}, client.Cancel)
 					}
 				})
 			}
 		case <-time.After(timeout):
-			passDeadlineExpired = true
 			self.log.V(2).Infof("[multi]expand window timeout waiting for args\n")
-			return
+			break requestCandidates
 		}
 	}
 
-	// wait for pending pings
+	// Candidate acquisition is over. Retain pass ownership until every ping
+	// resolves, capped at acquisition budget + one full initial-ping budget.
+	// The individual ping timers normally close these contexts first; the pass
+	// cap is the terminal safety boundary that preserves bounded ownership if a
+	// callback or timer goroutine itself stalls.
 	for _, pingDone := range pendingPingDones {
-		timeout := endTime.Sub(time.Now())
+		timeout := passEndTime.Sub(time.Now())
 		if timeout <= 0 {
 			passDeadlineExpired = true
 			return
@@ -11637,8 +11694,6 @@ func (self *multiClientWindow) expand(
 
 		select {
 		case <-self.ctx.Done():
-			return
-		case <-self.finishExpandPassForTest:
 			return
 		case <-self.expireExpandPassForTest:
 			passDeadlineExpired = true
@@ -11663,12 +11718,11 @@ func evaluationBudgetDeadlineOwned(
 		evaluationCtx.Err() == nil
 }
 
-// recordEvaluationBudgetExhausted owns only candidates still unresolved when
-// the expansion pass reaches its natural deadline. Pass cleanup remains the
-// terminal owner, so a delayed ping callback cannot admit into a later pass;
-// this method restores the provider-failure evidence that cleanup previously
-// erased when WindowExpandTimeout was shorter than PingTimeout. Local epoch or
-// window cancellation is filtered by the caller before a candidate is counted.
+// recordEvaluationBudgetExhausted owns only candidates still unresolved after
+// candidate acquisition plus one full initial-ping budget. Pass cleanup stays
+// the terminal owner, so a delayed ping callback cannot admit into a later
+// pass. Local epoch or window cancellation is filtered by the caller before a
+// candidate is counted.
 func (self *multiClientWindow) recordEvaluationBudgetExhausted(
 	candidateCount int,
 	effectiveBudgetMin time.Duration,

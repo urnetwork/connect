@@ -127,28 +127,51 @@ func NewClientSignalSender(client *Client) *ClientSignalSender {
 // blocked receive path can wedge signal delivery for every peer.
 type signalSendNonBlocking struct{}
 
+// Reduces the detailed send result to a bounded diagnostic vocabulary. The
+// legacy transfer queues use both punctuated and unpunctuated Done errors for
+// context, client, sequence, and capability closure; keep those causes grouped
+// until their owning layer exposes a stronger typed result.
+func signalSendFailureReason(err error) string {
+	if err == nil {
+		return "not-admitted"
+	}
+	if errors.Is(err, ErrEncryptionRequiredNotEstablished) {
+		return "encryption-not-ready"
+	}
+	if err.Error() == "Done" || err.Error() == "Done." {
+		return "canceled-or-closed"
+	}
+	return "other"
+}
+
 // Uses normal sender backpressure unless a receive-originated reply explicitly
 // requests a nonblocking handoff. The supplied frame is consumed in all cases.
 func (self *ClientSignalSender) SendSignal(destinationId Id, signal *protocol.Frame, opts ...any) {
 	timeout := time.Duration(-1)
+	mode := "sender"
 	sendOpts := make([]any, 0, len(opts))
 	for _, opt := range opts {
 		if _, ok := opt.(signalSendNonBlocking); ok {
 			timeout = 0
+			mode = "receive-reply"
 			continue
 		}
 		sendOpts = append(sendOpts, opt)
 	}
-	success := self.client.SendWithTimeout(signal, destinationId, nil, timeout, sendOpts...)
-	// a dropped signal wedges the p2p setup until the transport retry —
-	// always loud. The V(1) positive is the send-side half of the signal
-	// delivery trace (receive side: [signal]receive).
-	if !success {
+	success, err := self.client.SendWithTimeoutDetailed(signal, destinationId, nil, timeout, sendOpts...)
+	// A failed signal delays p2p setup until transport retry, so keep it loud.
+	// Preserve SendWithTimeout's success-and-no-error contract exactly. The
+	// V(1) positive is the send-side half of the signal delivery trace.
+	if !success || err != nil {
 		MessagePoolReturn(signal.MessageBytes)
 		signal.MessageBytes = nil
-		self.client.log.Infof("[signal]send failed ->%s\n", destinationId)
+		self.client.log.Infof(
+			"[signal]send failed mode=%s reason=%s\n",
+			mode,
+			signalSendFailureReason(err),
+		)
 	} else if self.client.log.V(1).Enabled() {
-		self.client.log.Infof("[signal]send ->%s\n", destinationId)
+		self.client.log.Infof("[signal]send mode=%s\n", mode)
 	}
 }
 

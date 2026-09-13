@@ -5,8 +5,61 @@ import (
 	"encoding/binary"
 	"net"
 	"testing"
+	"testing/synctest"
 	"time"
 )
+
+// A batch drain may coalesce all freed slots into one notification. Every
+// parked writer must still get a turn while capacity remains available.
+func TestTunOutboundQueueWakesEveryWriterAfterBatchDrain(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		endpoint := newTunLinkEndpoint(ctx, 3, DefaultMtu, "", 0)
+		defer endpoint.Close()
+
+		for marker := byte(0); marker < 3; marker += 1 {
+			packet := newTunLinkTestPacket(marker)
+			result := writeTunLinkPacket(endpoint, packet)
+			packet.DecRef()
+			if result.n != 1 || result.err != nil {
+				t.Fatalf("fill queue: %d, %v", result.n, result.err)
+			}
+		}
+
+		results := make(chan tunLinkWriteResult, 3)
+		for marker := byte(3); marker < 6; marker += 1 {
+			go func() {
+				packet := newTunLinkTestPacket(marker)
+				defer packet.DecRef()
+				results <- writeTunLinkPacket(endpoint, packet)
+			}()
+		}
+		synctest.Wait()
+
+		// Withhold notifications until all three slots are free, forcing the
+		// same single-token state as reads that outrun their waiting writers.
+		for range 3 {
+			packet := endpoint.Endpoint.Read()
+			if packet == nil {
+				t.Fatal("filled queue lost a packet")
+			}
+			packet.DecRef()
+		}
+		endpoint.notifySpace()
+		synctest.Wait()
+		for range 3 {
+			select {
+			case result := <-results:
+				if result.n != 1 || result.err != nil {
+					t.Fatalf("resumed write: %d, %v", result.n, result.err)
+				}
+			default:
+				t.Fatal("coalesced drain left a writer parked with free queue space")
+			}
+		}
+	})
+}
 
 // A netstack writer must never wait forever for tun queue space: the
 // goroutine that drains the queue can itself be the one injecting inbound
@@ -88,14 +141,16 @@ func TestTunOutboundQueueUnboundedWaitWhenDisabled(t *testing.T) {
 	}
 	secondPacket := newTunLinkTestPacket(2)
 	defer secondPacket.DecRef()
+	waiting := make(chan struct{})
+	tun.ep.ctx = &tunLinkWaitContext{Context: tun.ctx, waiting: waiting}
 	done := make(chan tunLinkWriteResult, 1)
 	go func() {
 		done <- writeTunLinkPacket(tun.ep, secondPacket)
 	}()
 	select {
-	case result := <-done:
-		t.Fatalf("unbounded write returned without space: %d, %v", result.n, result.err)
-	case <-time.After(100 * time.Millisecond):
+	case <-waiting:
+	case <-time.After(5 * time.Second):
+		t.Fatal("writer did not reach the full outbound queue")
 	}
 	firstRead, readErr := tun.Read()
 	if readErr != nil {
@@ -191,14 +246,16 @@ func testTunInjectingReaderDoesNotDeadlockOnFullOutboundQueue(t *testing.T, ipVe
 		t.Fatalf("unbounded queue-filling link write = %d, %v; want 1, nil", result.n, result.err)
 	}
 	unboundedWritten := make(chan error, 1)
+	unboundedWaiting := make(chan struct{})
+	unboundedTun.ep.ctx = &tunLinkWaitContext{Context: unboundedTun.ctx, waiting: unboundedWaiting}
 	go func() {
 		_, writeErr := unboundedTun.Write(newTunClosedPortSynPacket(t, unboundedTun, ipVersion))
 		unboundedWritten <- writeErr
 	}()
 	select {
-	case <-unboundedWritten:
-		t.Fatal("unbounded injection returned without queue space; this test can no longer detect the deadlock")
-	case <-time.After(500 * time.Millisecond):
+	case <-unboundedWaiting:
+	case <-time.After(5 * time.Second):
+		t.Fatal("unbounded injection did not reach the full outbound queue")
 	}
 	// Close releases the blocked writer so the goroutine does not leak
 	unboundedTun.Close()

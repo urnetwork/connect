@@ -16,6 +16,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -73,136 +74,129 @@ func identify(client *multiClientChannel) *multiClientChannel {
 // not refreshed, so once the bench lifts a real stall convicts on carried
 // evidence.
 func TestStallConvictionHeldWhileQuarantined(t *testing.T) {
-	stallTimeout := 20 * time.Millisecond
+	synctest.Test(t, func(t *testing.T) {
+		stallTimeout := 20 * time.Millisecond
 
-	client := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
-		// queued, never answered: the conviction state
-		return true, nil
-	})
-	stallPast(client, stallTimeout)
+		client := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
+			// queued, never answered: the conviction state
+			return true, nil
+		})
+		stallPast(client, stallTimeout)
 
-	sibling := receivingSibling()
-	window := busyProbeTestWindow(40*time.Millisecond, client, sibling)
+		sibling := receivingSibling()
+		window := busyProbeTestWindow(40*time.Millisecond, client, sibling)
 
-	AssertEqual(t, client.setQuarantined(blackholeNoReceiveAck), true)
-	AssertEqual(t, window.convictSendStalls(stallTimeout), false)
-	AssertEqual(t, client.IsDone(), false)
-	client.stateLock.Lock()
-	endErr := client.endErr
-	client.stateLock.Unlock()
-	AssertEqual(t, endErr == nil, true)
+		AssertEqual(t, client.setQuarantined(blackholeNoReceiveAck), true)
+		AssertEqual(t, window.convictSendStalls(stallTimeout), false)
+		AssertEqual(t, client.IsDone(), false)
+		client.stateLock.Lock()
+		endErr := client.endErr
+		client.stateLock.Unlock()
+		AssertEqual(t, endErr == nil, true)
 
-	// the bench lifts with the stall still real: the carried evidence
-	// convicts once the probe budget of a fresh pass elapses
-	client.clearQuarantine()
-	AssertEqual(t, convictWithin(window, sibling, stallTimeout, 2*time.Second), true)
-	AssertEqual(t, client.IsDone(), true)
-}
-
-// convictWithin re-runs the stall pass until it convicts or the deadline
-// passes, re-freshening the sibling's receive stamp per attempt: the
-// corroboration window is stallTimeout+budget (tens of ms here), so a
-// sibling stamped once at fixture construction goes stale mid-loop and the
-// pass holds on "uplink unproven" instead of exercising the path under test.
-func convictWithin(window *multiClientWindow, sibling *multiClientChannel, stallTimeout time.Duration, deadline time.Duration) bool {
-	end := time.Now().Add(deadline)
-	for time.Now().Before(end) {
+		// the bench lifts with the stall still real: the carried evidence
+		// convicts once the probe budget of a fresh pass elapses
+		client.clearQuarantine()
 		sibling.stateLock.Lock()
 		sibling.lastReceiveAckTime = time.Now()
 		sibling.stateLock.Unlock()
-		if window.convictSendStalls(stallTimeout) {
-			return true
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	return false
+		AssertEqual(t, window.convictSendStalls(stallTimeout), true)
+		AssertEqual(t, client.IsDone(), true)
+	})
 }
 
 // --- fix 3: the shared-fate gate on the stall path ---
 
 func TestStallConvictionHeldOnSharedFate(t *testing.T) {
-	stallTimeout := 20 * time.Millisecond
+	synctest.Test(t, func(t *testing.T) {
+		stallTimeout := 20 * time.Millisecond
 
-	metrics := newReliabilityMetrics()
-	client := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
-		return true, nil
+		metrics := newReliabilityMetrics()
+		client := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
+			return true, nil
+		})
+		client.reliabilityMetricsFunc = func() *reliabilityMetrics { return metrics }
+		stallPast(client, stallTimeout)
+
+		sibling := receivingSibling()
+		window := busyProbeTestWindow(40*time.Millisecond, client, sibling)
+		window.reliabilitySettingsFunc = func() *ReliabilitySettings {
+			return &ReliabilitySettings{
+				BusyProbe:          true,
+				BusyProbeBudget:    40 * time.Millisecond,
+				SharedFateMinExits: 2,
+				SharedFateWindow:   time.Minute,
+			}
+		}
+
+		// another exit developed silence evidence moments ago: two exits inside
+		// one window is the shared-path signature at MinExits=2
+		metrics.recordSharedFate(NewId(), time.Now())
+
+		AssertEqual(t, window.convictSendStalls(stallTimeout), false)
+		AssertEqual(t, client.IsDone(), false)
+		AssertEqual(t, metrics.verdictsHeldSharedFate.Load() >= 1, true)
+
+		// the correlation clears (the peer's evidence ages out): the carried
+		// stall evidence convicts on the next pass
+		metrics.sharedFateLock.Lock()
+		for id := range metrics.sharedFateEvidences {
+			if id != client.ClientId() {
+				metrics.sharedFateEvidences[id] = time.Now().Add(-2 * time.Minute)
+			}
+		}
+		metrics.sharedFateLock.Unlock()
+
+		sibling.stateLock.Lock()
+		sibling.lastReceiveAckTime = time.Now()
+		sibling.stateLock.Unlock()
+		AssertEqual(t, window.convictSendStalls(stallTimeout), true)
+		AssertEqual(t, client.IsDone(), true)
 	})
-	client.reliabilityMetricsFunc = func() *reliabilityMetrics { return metrics }
-	stallPast(client, stallTimeout)
-
-	sibling := receivingSibling()
-	window := busyProbeTestWindow(40*time.Millisecond, client, sibling)
-	window.reliabilitySettingsFunc = func() *ReliabilitySettings {
-		return &ReliabilitySettings{
-			BusyProbe:          true,
-			BusyProbeBudget:    40 * time.Millisecond,
-			SharedFateMinExits: 2,
-			SharedFateWindow:   time.Minute,
-		}
-	}
-
-	// another exit developed silence evidence moments ago: two exits inside
-	// one window is the shared-path signature at MinExits=2
-	metrics.recordSharedFate(NewId(), time.Now())
-
-	AssertEqual(t, window.convictSendStalls(stallTimeout), false)
-	AssertEqual(t, client.IsDone(), false)
-	AssertEqual(t, metrics.verdictsHeldSharedFate.Load() >= 1, true)
-
-	// the correlation clears (the peer's evidence ages out): the carried
-	// stall evidence convicts on the next pass
-	metrics.sharedFateLock.Lock()
-	for id := range metrics.sharedFateEvidences {
-		if id != client.ClientId() {
-			metrics.sharedFateEvidences[id] = time.Now().Add(-2 * time.Minute)
-		}
-	}
-	metrics.sharedFateLock.Unlock()
-
-	AssertEqual(t, convictWithin(window, sibling, stallTimeout, 2*time.Second), true)
-	AssertEqual(t, client.IsDone(), true)
 }
 
 // The stall pass itself records evidence: two exits stalling in the same
 // pass see each other and both hold, even though neither was recorded before
 // the pass began.
 func TestStallPassCrossRecordsSharedFate(t *testing.T) {
-	stallTimeout := 20 * time.Millisecond
+	synctest.Test(t, func(t *testing.T) {
+		stallTimeout := 20 * time.Millisecond
 
-	metrics := newReliabilityMetrics()
-	newStalled := func() *multiClientChannel {
-		c := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
-			return true, nil
-		})
-		c.reliabilityMetricsFunc = func() *reliabilityMetrics { return metrics }
-		return c
-	}
-	clientA := identify(newStalled())
-	clientB := identify(newStalled())
-	// both must be past the bar: the pass judges only clients sendStalled
-	// reports, and the point of the test is that TWO of them see each other
-	clientA.addSend(1440, udpTestPath(4))
-	clientB.addSend(1440, udpTestPath(4))
-	time.Sleep(stallTimeout + 30*time.Millisecond)
-	AssertEqual(t, clientA.sendStalled(stallTimeout), true)
-	AssertEqual(t, clientB.sendStalled(stallTimeout), true)
-
-	window := busyProbeTestWindow(40*time.Millisecond, clientA, clientB, receivingSibling())
-	window.reliabilitySettingsFunc = func() *ReliabilitySettings {
-		return &ReliabilitySettings{
-			BusyProbe:          true,
-			BusyProbeBudget:    40 * time.Millisecond,
-			SharedFateMinExits: 2,
-			SharedFateWindow:   time.Minute,
+		metrics := newReliabilityMetrics()
+		newStalled := func() *multiClientChannel {
+			c := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
+				return true, nil
+			})
+			c.reliabilityMetricsFunc = func() *reliabilityMetrics { return metrics }
+			return c
 		}
-	}
+		clientA := identify(newStalled())
+		clientB := identify(newStalled())
+		// both must be past the bar: the pass judges only clients sendStalled
+		// reports, and the point of the test is that TWO of them see each other
+		clientA.addSend(1440, udpTestPath(4))
+		clientB.addSend(1440, udpTestPath(4))
+		time.Sleep(stallTimeout + 30*time.Millisecond)
+		AssertEqual(t, clientA.sendStalled(stallTimeout), true)
+		AssertEqual(t, clientB.sendStalled(stallTimeout), true)
 
-	window.convictSendStalls(stallTimeout)
-	// neither co-sufferer is executed: each saw the other's evidence,
-	// recorded by the same pass that judged them
-	AssertEqual(t, clientA.IsDone(), false)
-	AssertEqual(t, clientB.IsDone(), false)
-	AssertEqual(t, 2 <= metrics.verdictsHeldSharedFate.Load(), true)
+		window := busyProbeTestWindow(40*time.Millisecond, clientA, clientB, receivingSibling())
+		window.reliabilitySettingsFunc = func() *ReliabilitySettings {
+			return &ReliabilitySettings{
+				BusyProbe:          true,
+				BusyProbeBudget:    40 * time.Millisecond,
+				SharedFateMinExits: 2,
+				SharedFateWindow:   time.Minute,
+			}
+		}
+
+		window.convictSendStalls(stallTimeout)
+		// neither co-sufferer is executed: each saw the other's evidence,
+		// recorded by the same pass that judged them
+		AssertEqual(t, clientA.IsDone(), false)
+		AssertEqual(t, clientB.IsDone(), false)
+		AssertEqual(t, 2 <= metrics.verdictsHeldSharedFate.Load(), true)
+	})
 }
 
 // --- fix 3: the shared-fate gate at the blackhole verdict site ---

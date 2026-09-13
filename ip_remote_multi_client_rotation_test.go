@@ -176,10 +176,16 @@ func TestExpandReplacementDeclineSourceAnchor(t *testing.T) {
 	// Once newMultiClientChannel succeeds, its cancellation goroutine owns both
 	// the Client and its generator args and retires them through
 	// RemoveClientWithArgs. A second direct RemoveClientArgs call revokes the
-	// derived JWT before final contract-close controls finish. The one remaining
-	// call is the pre-ownership construction-error path.
-	if count := strings.Count(body, "RemoveClientArgs("); count != 1 {
-		t.Errorf("expand has %d direct RemoveClientArgs calls, want only the construction-error cleanup", count)
+	// derived JWT before final contract-close controls finish. The two remaining
+	// calls are both pre-ownership: an args delivery observed after acquisition
+	// closed, and the construction-error path.
+	if count := strings.Count(body, "RemoveClientArgs("); count != 2 {
+		t.Errorf("expand has %d direct RemoveClientArgs calls, want only the late-args and construction-error cleanups", count)
+	}
+	deadlineCheck := strings.Index(body, "expandCandidateWithinAcquisitionDeadline(")
+	channelConstruction := strings.Index(body, "newMultiClientChannel(")
+	if deadlineCheck < 0 || channelConstruction < 0 || channelConstruction < deadlineCheck {
+		t.Error("expand checks the acquisition deadline after channel construction, so direct args cleanup could revoke an owned channel")
 	}
 
 	gate, ok := functionBody(source, "func (self *multiClientWindow) replacementAllowed(")

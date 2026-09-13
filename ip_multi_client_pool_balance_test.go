@@ -1,9 +1,12 @@
+// Tracks pooled ownership across complete client and fixture-worker lifecycles.
+// Exact-owner barriers distinguish late callback handoffs from sampling noise.
 package connect
 
 import (
 	"context"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -52,13 +55,13 @@ func TestMultiClientLifecyclePoolBalance(t *testing.T) {
 	defer cancel()
 
 	// warmup cycle to initialize process-global pools before the baseline
-	runMultiClientPoolCycle(ctx, t)
+	runMultiClientPoolCycle(ctx, t, nil)
 	before := settle()
 	beforeByClass := poolOutstandingByClass()
 
 	const cycles = 10
 	for i := 0; i < cycles; i += 1 {
-		runMultiClientPoolCycle(ctx, t)
+		runMultiClientPoolCycle(ctx, t, nil)
 	}
 
 	after := settle()
@@ -78,6 +81,53 @@ func TestMultiClientLifecyclePoolBalance(t *testing.T) {
 		t.Errorf("pool buffers not returned across %d multi-client lifecycles: outstanding %d -> %d (+%d), late=%d, class growth=%v",
 			cycles, before, after, after-before, late, growthByClass)
 	}
+}
+
+// A receive callback captured before unsubscribe may publish its pooled echo
+// after the sender stops. Complete fixture teardown must return that exact owner.
+func TestMultiClientLifecyclePoolBalanceReturnsLateProviderEcho(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	captures := make(chan *lifecyclePoolCapture, 1)
+	releaseEcho := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseEcho) })
+	var captured atomic.Bool
+	var capture *lifecyclePoolCapture
+	defer func() {
+		if capture != nil {
+			capture.cleanup()
+		}
+	}()
+	hooks := &multiClientPoolCycleHooks{
+		beforeEchoPublish: func(packet []byte) {
+			if captured.CompareAndSwap(false, true) {
+				captures <- newLifecyclePoolCapture(packet)
+				select {
+				case <-releaseEcho:
+				case <-ctx.Done():
+				}
+			}
+		},
+		beforeClose: func() {
+			select {
+			case capture = <-captures:
+				capture.requireOwnerLive(t, "in-flight provider echo")
+			case <-ctx.Done():
+				t.Fatalf("wait for captured provider echo: %v", ctx.Err())
+			}
+		},
+		afterEchoWorkerDone: func() {
+			// The sender can no longer consume this publication. The client
+			// join still waits for the callback that is about to produce it.
+			releaseOnce.Do(func() { close(releaseEcho) })
+		},
+	}
+	runMultiClientPoolCycle(ctx, t, hooks)
+	if capture == nil {
+		t.Fatal("cycle did not capture a provider echo")
+	}
+	capture.requireOwnerReturned(t, "provider echo published after sender shutdown")
 }
 
 // The simple single-destination client uses the same raw v2 envelope as the
@@ -394,9 +444,17 @@ func TestMultiClientRejectedProductionRaceRetainsOriginalPacket(t *testing.T) {
 	}
 }
 
+// Ordering barriers for the exact-owner regression; ordinary cycles leave them nil.
+type multiClientPoolCycleHooks struct {
+	beforeEchoPublish   func([]byte)
+	beforeClose         func()
+	afterEchoWorkerDone func()
+}
+
 // runMultiClientPoolCycle is one destination-change cycle: an in-memory exit, a
 // multi-client over it, a burst of egress packets, then teardown of both.
-func runMultiClientPoolCycle(ctx context.Context, t *testing.T) {
+func runMultiClientPoolCycle(ctx context.Context, t *testing.T, hooks *multiClientPoolCycleHooks) {
+	t.Helper()
 	cycleCtx, cycleCancel := context.WithCancel(ctx)
 	defer cycleCancel()
 
@@ -416,14 +474,7 @@ func runMultiClientPoolCycle(ctx context.Context, t *testing.T) {
 		for {
 			select {
 			case <-cycleCtx.Done():
-				for {
-					select {
-					case echo := <-providerEchoes:
-						MessagePoolReturn(echo.frame.MessageBytes)
-					default:
-						return
-					}
-				}
+				return
 			case echo := <-providerEchoes:
 				if !providerClient.SendWithTimeout(
 					echo.frame,
@@ -463,6 +514,9 @@ func runMultiClientPoolCycle(ctx context.Context, t *testing.T) {
 				MessagePoolReturn(packet)
 				continue
 			}
+			if hooks != nil && hooks.beforeEchoPublish != nil {
+				hooks.beforeEchoPublish(frame.MessageBytes)
+			}
 			select {
 			case providerEchoes <- providerEcho{
 				frame:       frame,
@@ -479,10 +533,24 @@ func runMultiClientPoolCycle(ctx context.Context, t *testing.T) {
 		cycleCancel()
 		providerClient.Cancel()
 		providerEchoWaitGroup.Wait()
+		if hooks != nil && hooks.afterEchoWorkerDone != nil {
+			hooks.afterEchoWorkerDone()
+		}
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer closeCancel()
 		if err := providerClient.CloseAndWait(closeCtx); err != nil {
 			t.Errorf("join pool-balance provider client: %v", err)
+		}
+		// Unsubscribe does not join callbacks that already took a snapshot.
+		// Quiesce the sender's client calls, join those callback producers,
+		// then drain once no worker can publish another fixture-owned echo.
+		for {
+			select {
+			case echo := <-providerEchoes:
+				MessagePoolReturn(echo.frame.MessageBytes)
+			default:
+				return
+			}
 		}
 	}()
 
@@ -547,6 +615,10 @@ func runMultiClientPoolCycle(ctx context.Context, t *testing.T) {
 		if !multi.SendPacket(source, protocol.ProvideMode_Network, packet, 1*time.Second) {
 			MessagePoolReturn(packet)
 		}
+	}
+	if hooks != nil && hooks.beforeClose != nil {
+		hooks.beforeClose()
+		return
 	}
 
 	// wait briefly for echoes so the ingress path also runs

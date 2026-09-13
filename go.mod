@@ -22,7 +22,7 @@ require (
 	golang.org/x/sys v0.47.0
 	golang.org/x/text v0.40.0
 	google.golang.org/protobuf v1.36.11
-	gvisor.dev/gvisor v0.0.0-20260805230438-8eba670122c5
+	gvisor.dev/gvisor v0.0.0-20260909230408-9b1144b679cb
 	src.agwa.name/tlshacks v0.0.4
 )
 

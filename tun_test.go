@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -356,6 +357,19 @@ type tunLinkWriteResult struct {
 	err tcpip.Error
 }
 
+// Observes the full-queue wait without depending on how soon its writer runs.
+type tunLinkWaitContext struct {
+	context.Context
+	waiting chan struct{}
+	once    sync.Once
+}
+
+// Signals only after the endpoint has tried and failed to enqueue its packet.
+func (self *tunLinkWaitContext) Done() <-chan struct{} {
+	self.once.Do(func() { close(self.waiting) })
+	return self.Context.Done()
+}
+
 func newTunLinkTestPacket(marker byte) *stack.PacketBuffer {
 	return stack.NewPacketBuffer(stack.PacketBufferOptions{
 		Payload: buffer.MakeWithData([]byte{marker}),
@@ -372,7 +386,9 @@ func writeTunLinkPacket(endpoint *tunLinkEndpoint, packet *stack.PacketBuffer) t
 func TestTunOutboundQueueBackpressuresInsteadOfDropping(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	tun, err := CreateTun(ctx, DefaultTunSettingsWithBufferSize(1))
+	settings := DefaultTunSettingsWithBufferSize(1)
+	settings.OutboundQueueWaitTimeout = 0
+	tun, err := CreateTun(ctx, settings)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -386,17 +402,16 @@ func TestTunOutboundQueueBackpressuresInsteadOfDropping(t *testing.T) {
 
 	secondPacket := newTunLinkTestPacket(2)
 	defer secondPacket.DecRef()
-	started := make(chan struct{})
+	waiting := make(chan struct{})
+	tun.ep.ctx = &tunLinkWaitContext{Context: tun.ctx, waiting: waiting}
 	done := make(chan tunLinkWriteResult, 1)
 	go func() {
-		close(started)
 		done <- writeTunLinkPacket(tun.ep, secondPacket)
 	}()
-	<-started
 	select {
-	case result := <-done:
-		t.Fatalf("full outbound queue dropped write immediately: %d, %v", result.n, result.err)
-	case <-time.After(20 * time.Millisecond):
+	case <-waiting:
+	case <-time.After(5 * time.Second):
+		t.Fatal("writer did not reach the full outbound queue")
 	}
 
 	firstRead, readErr := tun.Read()
@@ -422,7 +437,9 @@ func TestTunOutboundQueueBackpressuresInsteadOfDropping(t *testing.T) {
 func TestTunCloseUnblocksOutboundQueueBackpressure(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	tun, err := CreateTun(ctx, DefaultTunSettingsWithBufferSize(1))
+	settings := DefaultTunSettingsWithBufferSize(1)
+	settings.OutboundQueueWaitTimeout = 0
+	tun, err := CreateTun(ctx, settings)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -436,17 +453,16 @@ func TestTunCloseUnblocksOutboundQueueBackpressure(t *testing.T) {
 
 	secondPacket := newTunLinkTestPacket(2)
 	defer secondPacket.DecRef()
-	started := make(chan struct{})
+	waiting := make(chan struct{})
+	tun.ep.ctx = &tunLinkWaitContext{Context: tun.ctx, waiting: waiting}
 	done := make(chan tunLinkWriteResult, 1)
 	go func() {
-		close(started)
 		done <- writeTunLinkPacket(tun.ep, secondPacket)
 	}()
-	<-started
 	select {
-	case result := <-done:
-		t.Fatalf("full outbound queue dropped write immediately: %d, %v", result.n, result.err)
-	case <-time.After(20 * time.Millisecond):
+	case <-waiting:
+	case <-time.After(5 * time.Second):
+		t.Fatal("writer did not reach the full outbound queue")
 	}
 
 	if closeErr := tun.Close(); closeErr != nil {
