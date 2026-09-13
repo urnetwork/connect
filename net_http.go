@@ -1734,15 +1734,21 @@ func (self *clientDialer) WsDialer(settings *ClientStrategySettings) *websocket.
 			// WriteBufferPool: pool,
 			EnableCompression: false,
 		}
-		// a custom dial context applies to plain ws:// connections;
-		// wss:// uses the dialTlsContext chain above
-		if dialContextSettings := settings.ConnectSettings.DialContextSettings; dialContextSettings != nil {
+		// Plain ws:// must also use an explicitly configured resolver. Keep
+		// injected dialers first; wss:// uses the TLS chain above, and an
+		// ordinary unconfigured ws:// dial retains gorilla's default path.
+		dialContextSettings := settings.ConnectSettings.DialContextSettings
+		if dialContextSettings != nil || settings.ConnectSettings.Resolver != nil {
+			dialContext := settings.ConnectSettings.DialContext
+			if dialContextSettings != nil {
+				dialContext = dialContextSettings.DialContext
+			}
 			self.websocketDialer.NetDialContext = func(
 				ctx context.Context,
 				network string,
 				address string,
 			) (net.Conn, error) {
-				conn, err := dialContextSettings.DialContext(ctx, network, address)
+				conn, err := dialContext(ctx, network, address)
 				if err != nil {
 					return nil, err
 				}
