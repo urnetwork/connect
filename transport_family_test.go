@@ -3,8 +3,9 @@ package connect
 // transport_family_test.go — family-pinned platform transports, the provider
 // transport group, and the per-family H3 socket and race (IPV6.md A2, A4-A7,
 // C6). Servers stand on the loopback of one family so that connecting at all
-// proves which family was dialed; the hostname `localhost` resolves to both,
-// so a pin is the only thing that decides.
+// proves which family was dialed. The dual-stack hostname is answered by an
+// owned wire DNS fixture with both loopbacks, so a pin decides the family
+// independently of the host machine's localhost aliases.
 
 import (
 	"context"
@@ -13,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -24,25 +26,35 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
-// requireLocalhostDualStack fails loudly when `localhost` does not resolve to
-// both loopback families: the pin tests rely on the name offering a choice.
-func requireLocalhostDualStack(t *testing.T) {
+const familyTransportTestHost = "platform.family.test"
+
+// Keep the real resolver and transport paths, supplying only the DNS records
+// through the existing caller-owned resolver setting. Literal-only URLs would
+// fail to exercise selection when both address families are offered.
+func newTestingFamilyStrategySettings(t *testing.T) *ClientStrategySettings {
 	t.Helper()
-	addrs, err := net.DefaultResolver.LookupIPAddr(context.Background(), "localhost")
+	settings := DefaultClientStrategySettings()
+	settings.ConnectSettings.Resolver = newFamilyTestResolver(t,
+		netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("::1"))
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	addrs, err := settings.ConnectSettings.Resolver.LookupIPAddr(ctx, familyTransportTestHost)
 	if err != nil {
-		t.Fatalf("localhost must resolve on a dual-stack test host: %v", err)
+		t.Fatalf("owned family hostname must resolve through its wire fixture: %v", err)
 	}
 	has4, has6 := false, false
 	for _, addr := range addrs {
-		if addr.IP.To4() != nil {
+		switch addr.IP.String() {
+		case "127.0.0.1":
 			has4 = true
-		} else {
+		case "::1":
 			has6 = true
 		}
 	}
-	if !has4 || !has6 {
-		t.Fatalf("localhost must resolve to both families on a dual-stack test host, got %v", addrs)
+	if len(addrs) != 2 || !has4 || !has6 {
+		t.Fatalf("owned family hostname must offer exactly both loopbacks, got %v", addrs)
 	}
+	return settings
 }
 
 // testingFamilyConnection is one accepted platform-side websocket.
@@ -149,6 +161,10 @@ func (self *testingFamilyPlatformServer) url() string {
 	return fmt.Sprintf("ws://localhost:%d", self.port)
 }
 
+func (self *testingFamilyPlatformServer) dualStackURL() string {
+	return fmt.Sprintf("ws://%s:%d", familyTransportTestHost, self.port)
+}
+
 func receiveFamilyConnection(t *testing.T, platform *testingFamilyPlatformServer, timeout time.Duration) testingFamilyConnection {
 	t.Helper()
 	select {
@@ -177,10 +193,10 @@ func testingFamilyAuth() *ClientAuth {
 
 // newTestingPinnedTransport is a pinned H1 transport with its own direct
 // strategy, the shape the group builds.
-func newTestingPinnedTransport(t *testing.T, ctx context.Context, platformUrl string, ipFamily int, settings *PlatformTransportSettings) *PlatformTransport {
+func newTestingPinnedTransport(t *testing.T, ctx context.Context, clientSettings *ClientStrategySettings, platformUrl string, ipFamily int, settings *PlatformTransportSettings) *PlatformTransport {
 	t.Helper()
 	settings.IpFamily = ipFamily
-	strategy := NewDirectClientStrategy(ctx, DefaultClientStrategySettings(), ipFamily)
+	strategy := NewDirectClientStrategy(ctx, clientSettings, ipFamily)
 	t.Cleanup(strategy.Close)
 	transport := NewPlatformTransportWithTargetMode(
 		ctx,
@@ -204,13 +220,13 @@ func waitForTransportState(transport *PlatformTransport, want PlatformTransportS
 // A pinned transport dials only its family and declares it. The server of
 // the other family never sees it.
 func TestFamilyPinnedTransportDialsOnlyItsFamilyAndDeclaresIt(t *testing.T) {
-	requireLocalhostDualStack(t)
+	clientSettings := newTestingFamilyStrategySettings(t)
 	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
 		platform := newTestingFamilyPlatformServer(t, ipVersion, false)
-		transport := newTestingPinnedTransport(t, ctx, platform.url(), ipVersion, testingFamilyTransportSettings())
+		transport := newTestingPinnedTransport(t, ctx, clientSettings, platform.dualStackURL(), ipVersion, testingFamilyTransportSettings())
 		if transport.IpFamily() != ipVersion {
 			t.Fatalf("IpFamily = %d, want %d", transport.IpFamily(), ipVersion)
 		}
@@ -233,7 +249,7 @@ func TestFamilyPinnedTransportDialsOnlyItsFamilyAndDeclaresIt(t *testing.T) {
 			other = 6
 		}
 		otherPlatformCount := platform.connectCount.Load()
-		otherTransport := newTestingPinnedTransport(t, ctx, platform.url(), other, testingFamilyTransportSettings())
+		otherTransport := newTestingPinnedTransport(t, ctx, clientSettings, platform.dualStackURL(), other, testingFamilyTransportSettings())
 		if waitForCondition(1500*time.Millisecond, func() bool {
 			return otherTransport.IsConnected() || otherPlatformCount < platform.connectCount.Load()
 		}) {
@@ -264,7 +280,7 @@ func TestFamilyAgnosticTransportSendsNoIntent(t *testing.T) {
 
 // The v1 in-band auth frame carries the same intent as the v2 header.
 func TestFamilyPinnedTransportV1AuthFrameCarriesIntent(t *testing.T) {
-	requireLocalhostDualStack(t)
+	clientSettings := newTestingFamilyStrategySettings(t)
 	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -282,7 +298,7 @@ func TestFamilyPinnedTransportV1AuthFrameCarriesIntent(t *testing.T) {
 				intents <- auth.IpFamily
 			}
 		}
-		transport := newTestingPinnedTransport(t, ctx, platform.url(), ipVersion, settings)
+		transport := newTestingPinnedTransport(t, ctx, clientSettings, platform.dualStackURL(), ipVersion, settings)
 		select {
 		case intent := <-intents:
 			if intent != int32(ipVersion) {
@@ -300,7 +316,7 @@ func TestFamilyPinnedTransportV1AuthFrameCarriesIntent(t *testing.T) {
 // A Force that contradicts the pin idles the transport: no dial, no backend
 // failure, no spin. Setting the policy back releases it.
 func TestFamilyPinnedTransportIdlesUnderContradictingForce(t *testing.T) {
-	requireLocalhostDualStack(t)
+	clientSettings := newTestingFamilyStrategySettings(t)
 	SetControlIpFamilyPolicy(IpFamilyForce4)
 	t.Cleanup(func() { SetControlIpFamilyPolicy(IpFamilyAuto) })
 	noteBackendSuccess()
@@ -309,7 +325,7 @@ func TestFamilyPinnedTransportIdlesUnderContradictingForce(t *testing.T) {
 	defer cancel()
 
 	platform := newTestingFamilyPlatformServer(t, 6, false)
-	transport := newTestingPinnedTransport(t, ctx, platform.url(), 6, testingFamilyTransportSettings())
+	transport := newTestingPinnedTransport(t, ctx, clientSettings, platform.dualStackURL(), 6, testingFamilyTransportSettings())
 	if !waitForTransportState(transport, PlatformTransportStateIdlePolicy, 5*time.Second) {
 		t.Fatalf("state = %s, want idle-policy", transport.State())
 	}
@@ -334,7 +350,7 @@ func TestFamilyPinnedTransportIdlesUnderContradictingForce(t *testing.T) {
 // Without a path of its family the transport sleeps instead of dialing, and a
 // network change re-probes and wakes it.
 func TestFamilyPinnedTransportSleepsWithoutFamilySupport(t *testing.T) {
-	requireLocalhostDualStack(t)
+	clientSettings := newTestingFamilyStrategySettings(t)
 	var supported atomic.Bool
 	restore := swapControlFamilyProbe(func(family int) bool {
 		if family == 6 {
@@ -348,7 +364,7 @@ func TestFamilyPinnedTransportSleepsWithoutFamilySupport(t *testing.T) {
 	defer cancel()
 
 	platform := newTestingFamilyPlatformServer(t, 6, false)
-	transport := newTestingPinnedTransport(t, ctx, platform.url(), 6, testingFamilyTransportSettings())
+	transport := newTestingPinnedTransport(t, ctx, clientSettings, platform.dualStackURL(), 6, testingFamilyTransportSettings())
 	if !waitForTransportState(transport, PlatformTransportStateSleeping, 5*time.Second) {
 		t.Fatalf("state = %s, want sleeping", transport.State())
 	}
@@ -382,7 +398,7 @@ func TestFamilyPinnedTransportSleepsWithoutFamilySupport(t *testing.T) {
 // A pinned transport's dial failures feed only its own backoff, never the
 // process-wide backend-degraded gate.
 func TestFamilyPinnedTransportFailuresDoNotDegradeBackend(t *testing.T) {
-	requireLocalhostDualStack(t)
+	clientSettings := newTestingFamilyStrategySettings(t)
 	noteBackendSuccess()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -399,7 +415,7 @@ func TestFamilyPinnedTransportFailuresDoNotDegradeBackend(t *testing.T) {
 	settings := testingFamilyTransportSettings()
 	settings.ReconnectTimeout = time.Millisecond
 	settings.PinnedReconnectMaxTimeout = 10 * time.Millisecond
-	transport := newTestingPinnedTransport(t, ctx, fmt.Sprintf("ws://localhost:%d", port), 6, settings)
+	transport := newTestingPinnedTransport(t, ctx, clientSettings, fmt.Sprintf("ws://%s:%d", familyTransportTestHost, port), 6, settings)
 	// a failed strategy dial reports only after the strategy has exhausted
 	// its dialers, so wait for the first recorded failure rather than sleep
 	if !waitForCondition(30*time.Second, func() bool {
@@ -462,7 +478,7 @@ func TestPlatformTransportSetEnabledParksAndResumes(t *testing.T) {
 // The group's standby dials only after the delay with no pinned transport
 // connected, and stands down when a pinned transport connects.
 func TestFamilyPlatformTransportGroupStandby(t *testing.T) {
-	requireLocalhostDualStack(t)
+	clientSettings := newTestingFamilyStrategySettings(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -485,16 +501,16 @@ func TestFamilyPlatformTransportGroupStandby(t *testing.T) {
 	settings.ReconnectTimeout = 20 * time.Millisecond
 	settings.PinnedReconnectMaxTimeout = 100 * time.Millisecond
 	groupSettings := &FamilyPlatformTransportGroupSettings{StandbyDelay: 400 * time.Millisecond}
-	strategy := NewClientStrategyWithDefaults(ctx)
+	strategy := NewClientStrategy(ctx, clientSettings)
 	defer strategy.Close()
 	group := NewFamilyPlatformTransportGroup(
 		ctx,
-		DefaultClientStrategySettings(),
+		clientSettings,
 		strategy,
 		NewRouteManager(ctx, "group"),
-		standbyPlatform.url(),
-		fmt.Sprintf("ws://localhost:%d", v4Port),
-		fmt.Sprintf("ws://localhost:%d", v6Port),
+		standbyPlatform.dualStackURL(),
+		fmt.Sprintf("ws://%s:%d", familyTransportTestHost, v4Port),
+		fmt.Sprintf("ws://%s:%d", familyTransportTestHost, v6Port),
 		testingFamilyAuth(),
 		TransportModeH1,
 		settings,
@@ -663,15 +679,18 @@ func TestPinnedDialNetwork(t *testing.T) {
 // resolveControlUDPAddrs narrows to the pin, refuses a contradicting literal,
 // and interleaves a family-agnostic answer v6 first.
 func TestResolveControlUDPAddrs(t *testing.T) {
-	requireLocalhostDualStack(t)
+	clientSettings := newTestingFamilyStrategySettings(t)
 	ctx := context.Background()
-	strategy := NewClientStrategyWithDefaults(ctx)
+	strategy := NewClientStrategy(ctx, clientSettings)
 	defer strategy.Close()
 
 	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
-		udpAddrs, err := strategy.resolveControlUDPAddrs(ctx, "localhost:443", ipVersion)
+		udpAddrs, err := strategy.resolveControlUDPAddrs(ctx, familyTransportTestHost+":443", ipVersion)
 		if err != nil {
 			t.Fatal(err)
+		}
+		if len(udpAddrs) != 1 {
+			t.Fatalf("ipv%d pin resolved %v, want its one loopback", ipVersion, udpAddrs)
 		}
 		for _, udpAddr := range udpAddrs {
 			if udpAddrFamily(udpAddr) != ipVersion || udpAddr.Port != 443 {
@@ -691,11 +710,11 @@ func TestResolveControlUDPAddrs(t *testing.T) {
 		}
 	})
 
-	both, err := strategy.resolveControlUDPAddrs(ctx, "localhost:443", 0)
+	both, err := strategy.resolveControlUDPAddrs(ctx, familyTransportTestHost+":443", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(both) < 2 || udpAddrFamily(both[0]) != 6 || udpAddrFamily(both[1]) != 4 {
+	if len(both) != 2 || udpAddrFamily(both[0]) != 6 || udpAddrFamily(both[1]) != 4 {
 		t.Fatalf("family-agnostic order = %v, want v6 then v4", both)
 	}
 
@@ -877,7 +896,7 @@ func (self *testingH3Platform) transportSettings() *PlatformTransportSettings {
 // A pinned H3 transport binds a socket of its family and reaches a platform
 // that only listens on that family, by name.
 func TestPlatformTransportH3BindsSocketPerFamily(t *testing.T) {
-	requireLocalhostDualStack(t)
+	clientSettings := newTestingFamilyStrategySettings(t)
 	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -885,13 +904,13 @@ func TestPlatformTransportH3BindsSocketPerFamily(t *testing.T) {
 		platform := newTestingH3Platform(t, ipVersion)
 		settings := platform.transportSettings()
 		settings.IpFamily = ipVersion
-		strategy := NewDirectClientStrategy(ctx, DefaultClientStrategySettings(), ipVersion)
+		strategy := NewDirectClientStrategy(ctx, clientSettings, ipVersion)
 		defer strategy.Close()
 		transport := NewPlatformTransportWithTargetMode(
 			ctx,
 			strategy,
 			NewRouteManager(ctx, "h3-family"),
-			"https://localhost",
+			"https://"+familyTransportTestHost,
 			testingFamilyAuth(),
 			TransportModeH3,
 			settings,
