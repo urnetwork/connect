@@ -147,97 +147,78 @@ func TestAClampedWindowIsTheCeilingAndFillsIt(t *testing.T) {
 	}
 }
 
-// The dynamic cases of a divided budget: a share that shrinks when other
-// clients arrive and grows when they leave.
-//
-// These matter more than they look. Both work from a full window, and it is the
-// half-filled unclamped case that stalls, which is the same asymmetry the
-// clamped regime turns out to have in its favour. A shrinking share has to
-// drain cleanly rather than evicting, and a growing one has to be taken up
-// rather than crept toward.
-//
-// Predictions, recorded before the run: lowering the budget lowers the window
-// to the new ceiling with no eviction at the receiver; raising it back takes
-// the window up to the new ceiling.
+// Explicit delivery above both shares holds this case in the memory-clamped
+// regime. Resizing changes admission immediately while retained items survive
+// the shrink and drain normally. A live one-second offer did not establish
+// that premise: valid delivery sizing sometimes put its window below the share.
 func TestAClampedWindowFollowsItsShareDownAndUp(t *testing.T) {
-	assertMessagePoolOwnership(t)
-
-	const propagation = 25 * time.Millisecond
-	// both small enough that the share binds rather than the delivery term,
-	// for the reason the row above records
 	const wide = ByteCount(384 * 1024)
 	const narrow = ByteCount(192 * 1024)
 	const payloadByteCount = 4 * 1024
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	budget := NewTransferMemoryBudget(wide)
-	harness := newSendWindowHarness(t, ctx, propagation,
-		func(settings *SendBufferSettings) {
-			settings.DeliverySizedWindowScale = deliverySizedWindowScale
-			settings.ResendQueueBudget = budget
-			settings.ResendQueueMinByteCount = ByteCount(32 * 1024)
-		})
-	harness.receiveHold(ByteCount(16 * 1024 * 1024))
-
-	harness.offer(t, payloadByteCount, time.Second)
-	atWide := harness.sender.DestinationSendStats(harness.receiverId).SendWindow
-
-	// other clients arrive: the share shrinks
+	sequence, budget, at := newSampledShareWindowFixture(t, 128*1024)
+	estimate := func(total ByteCount) SendWindowEstimate {
+		t.Helper()
+		window := sequence.sendWindowEstimate(at)
+		if !window.Sized || window.Ceiling != total-64*1024 ||
+			window.Window != window.Ceiling || window.Reason != "the memory budget's share" {
+			t.Fatalf("total %d: estimate=%+v, want a sampled memory clamp after two other floors", total, window)
+		}
+		return window
+	}
+	atWide := estimate(wide)
+	fill := func(window ByteCount) {
+		t.Helper()
+		for index := 0; index < int(wide/payloadByteCount); index += 1 {
+			if !sequence.resendQueue.CanAdd(payloadByteCount, window) {
+				return
+			}
+			sequence.resendQueue.Add(&sendItem{
+				transferItem: transferItem{
+					messageId:      NewId(),
+					sequenceNumber: sequence.nextSequenceNumber,
+				},
+				transferFrameBytes: make([]byte, payloadByteCount),
+			})
+			sequence.nextSequenceNumber += 1
+		}
+		t.Fatal("admission did not stop at the window")
+	}
+	fill(atWide.Window)
+	wideCount, wideQueued := sequence.resendQueue.QueueSize()
+	wideReserved := budget.UsedByteCount()
+	if wideQueued < atWide.Window-payloadByteCount {
+		t.Fatalf("wide occupancy=%d, want the full %d byte window less one item", wideQueued, atWide.Window)
+	}
 	budget.SetTotalByteCount(narrow)
-	harness.offer(t, payloadByteCount, time.Second)
-	atNarrow := harness.sender.DestinationSendStats(harness.receiverId).SendWindow
-	narrowStats := harness.receiver.ReceiveStats()
-
-	// and leave again
+	atNarrow := estimate(narrow)
+	if count, queued := sequence.resendQueue.QueueSize(); count != wideCount || queued != wideQueued || budget.UsedByteCount() != wideReserved {
+		t.Fatalf("shrinking evicted retained work: count=%d bytes=%d reserved=%d; before=%d/%d/%d", count, queued, budget.UsedByteCount(), wideCount, wideQueued, wideReserved)
+	}
+	if sequence.resendQueue.CanAdd(payloadByteCount, atNarrow.Window) {
+		t.Fatal("a full wide window admitted more work after its share shrank")
+	}
+	for range wideCount {
+		sequence.resendQueue.RemoveFirst()
+		if sequence.resendQueue.CanAdd(payloadByteCount, atNarrow.Window) {
+			break
+		}
+	}
+	fill(atNarrow.Window)
+	_, narrowQueued := sequence.resendQueue.QueueSize()
+	if narrowQueued < atNarrow.Window-payloadByteCount || atNarrow.Window <= narrowQueued {
+		t.Fatalf("drained occupancy=%d, want the new %d byte window less one item", narrowQueued, atNarrow.Window)
+	}
 	budget.SetTotalByteCount(wide)
-	harness.offer(t, payloadByteCount, time.Second)
-	atWideAgain := harness.sender.DestinationSendStats(harness.receiverId).SendWindow
-
-	t.Logf(
-		"share %d: window %d; share %d: window %d; share %d again: window %d. evictions %d, refusals %d",
-		wide, atWide.Window, narrow, atNarrow.Window, wide, atWideAgain.Window,
-		narrowStats.ReceiveQueueEvictionCount, narrowStats.ReceiveQueueDropCount,
-	)
-
-	// as above, the share is the pool less the other attached queues' floors
-	if atWide.Window != atWide.Ceiling {
-		t.Fatalf(
-			"the window is %d against a %d byte ceiling, so this cell is not clamped",
-			atWide.Window, atWide.Ceiling,
-		)
+	atWideAgain := estimate(wide)
+	if atWideAgain.Window != atWide.Window || !sequence.resendQueue.CanAdd(payloadByteCount, atWideAgain.Window) {
+		t.Fatalf("restored share did not reopen the full window: before=%+v after=%+v", atWide, atWideAgain)
 	}
-	if atNarrow.Window != atNarrow.Ceiling || atWide.Window <= atNarrow.Window {
-		t.Errorf(
-			"the share fell from %d to %d and the window went %d to %d against ceilings %d and %d; a window clamped by memory has to follow its share down when other clients arrive",
-			wide, narrow, atWide.Window, atNarrow.Window,
-			atWide.Ceiling, atNarrow.Ceiling,
-		)
+	fill(atWideAgain.Window)
+	_, wideAgainQueued := sequence.resendQueue.QueueSize()
+	if wideAgainQueued != wideQueued {
+		t.Fatalf("restored occupancy=%d, want %d", wideAgainQueued, wideQueued)
 	}
-	if 0 < narrowStats.ReceiveQueueEvictionCount {
-		t.Errorf(
-			"the receiver evicted %d items while the share was shrinking; draining to a lower ceiling is the sender's work and must not cost the receiver anything",
-			narrowStats.ReceiveQueueEvictionCount,
-		)
-	}
-	// Asserted as taking the room back rather than as an identical byte count.
-	// On the way back up the window is the lesser of the share and twice the
-	// delivery, and the delivery term varies run to run, so an equality here
-	// demands a quantity that is not stable: it read 324,398 against the
-	// 327,680 held before, a one per cent shortfall that is the delivery term
-	// rather than a failure to grow.
-	if atWideAgain.Window <= atNarrow.Window {
-		t.Errorf(
-			"the share returned to %d and the window is %d, no better than the %d it held while the share was narrow; a window clamped by memory has to take the room back when other clients leave",
-			wide, atWideAgain.Window, atNarrow.Window,
-		)
-	}
-	if float64(atWideAgain.Window) < 0.9*float64(atWide.Window) {
-		t.Errorf(
-			"the share returned to %d and the window recovered only to %d against the %d it held before, more than a tenth short; the room is back and the window has to take it",
-			wide, atWideAgain.Window, atWide.Window,
-		)
-	}
+	t.Logf("windows %d -> %d -> %d; retained bytes %d -> %d -> %d without eviction", atWide.Window, atNarrow.Window, atWideAgain.Window, wideQueued, narrowQueued, wideAgainQueued)
 }
 
 // The rule and delivery-bounded reliable admission do not coexist, and the tree

@@ -481,29 +481,9 @@ func TestLightLaneDeliveryBesideASaturatingLane(t *testing.T) {
 	})
 
 	// the wire, with a round trip on the acknowledgement half
-	pumpsDone := []chan struct{}{}
+	pumpsDone := []<-chan struct{}{}
 	pump := func(from Route, to Route, delay time.Duration) {
-		done := make(chan struct{})
-		pumpsDone = append(pumpsDone, done)
-		go func() {
-			defer close(done)
-			for {
-				select {
-				case transferFrameBytes := <-from:
-					if 0 < delay {
-						time.Sleep(delay)
-					}
-					select {
-					case to <- transferFrameBytes:
-					case <-ctx.Done():
-						MessagePoolReturn(transferFrameBytes)
-						return
-					}
-				case <-ctx.Done():
-					return
-				}
-			}
-		}()
+		pumpsDone = append(pumpsDone, startLaneAckTestPump(ctx, from, to, delay))
 	}
 	pump(senderOut, receiverIn, 0)
 	pump(receiverOut, senderIn, ackDelay)
@@ -599,12 +579,10 @@ func TestLightLaneDeliveryBesideASaturatingLane(t *testing.T) {
 	heavyByteCount := laneDelivered(1)
 	lightByteCount := laneDelivered(2)
 
-	// Per acknowledgement round trip, which is the rate a lane's in-flight
-	// allowance converts into delivery. Measured populations on this rig, so a
-	// later reader can see the margin the threshold sits in: with the floor,
-	// 873 to 1,027 bytes per round trip; without it, 103 to 195. Half a Pack
-	// separates them and is what a lane reduced to the single item an empty
-	// queue guarantees cannot reach.
+	// This live delivery smoke test keeps its original half-Pack threshold.
+	// The old measured bands included a serial acknowledgement bottleneck,
+	// not just propagation. Floor reuse itself is pinned by controlled rounds
+	// in TestLightLaneReusesItsFloorAcrossAcknowledgements.
 	roundTripCount := ByteCount(observationWindow / ackDelay)
 	lightByteCountPerRoundTrip := lightByteCount / roundTripCount
 	heavyByteCountPerRoundTrip := heavyByteCount / roundTripCount

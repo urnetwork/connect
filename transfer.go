@@ -10708,8 +10708,8 @@ func (self SendWindowEstimate) bindingTerm(sequence *SendSequence) string {
 		advertised <= self.Ceiling {
 		return "the peer's advertised capacity"
 	}
-	if budget := sequence.resendQueue.Budget(); budget != nil &&
-		budget.TotalByteCount() <= self.Ceiling {
+	if share := sequence.resendQueue.LendableByteCount(); 0 < share &&
+		share <= self.Ceiling {
 		return "the memory budget's share"
 	}
 	return "sized"

@@ -80,6 +80,7 @@ func TestTheWindowHasOneOwner(t *testing.T) {
 		},
 		"LendableByteCount": {
 			"sendWindowEstimate",
+			"bindingTerm",
 			"LendableByteCount",
 		},
 		"receivedWindowAdvertisement": {
