@@ -78,6 +78,17 @@ func TestADeliveryLimitedWindowCanCrossTheMemoryClamp(t *testing.T) {
 	}
 }
 
+// Even the smaller live fixture's share can exceed valid measured delivery.
+// This reproduces its failed window without demanding that delivery fill it.
+func TestADeliveryLimitedWindowRemainsBelowTheSmallMemoryShare(t *testing.T) {
+	sequence, budget, at := newSampledShareWindowFixture(t, 24518)
+	budget.SetTotalByteCount(192 * 1024)
+	estimate := sequence.sendWindowEstimate(at)
+	if !estimate.Sized || estimate.Window != 122590 || estimate.Ceiling != 131072 || estimate.Reason != "delivery" {
+		t.Fatalf("small-share delivery estimate=%+v, want window 122590 below share 131072", estimate)
+	}
+}
+
 // A configured ceiling below the lendable share is a separate bound even
 // when both are below the pool's total capacity.
 func TestAConfiguredCeilingDoesNotReportTheMemoryShare(t *testing.T) {

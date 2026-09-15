@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
@@ -60,18 +61,6 @@ type sendWindowHarness struct {
 	sender     *Client
 	receiver   *Client
 	receiverId Id
-	// when set, the data half drops the next frame it carries, once
-	dropNext *atomic.Bool
-	drops    *atomic.Int64
-	// When set to a positive number of nanoseconds, the data half holds the
-	// next frame it carries for that long, once. A deterministic reordering:
-	// everything behind it arrives first, so a cell that needs a full hold and
-	// then an earlier arrival gets exactly that, rather than depending on a
-	// retransmit racing the hold filling.
-	delayNextNanos *atomic.Int64
-	// when set, the acknowledgement half discards everything it carries, so a
-	// sequence's resend queue fills and stays full
-	holdAcks *atomic.Bool
 	// the carrier's drain in bytes per second, settable mid-flight so one
 	// cell can measure a path that changes
 	bytesPerSecond *atomic.Int64
@@ -81,8 +70,8 @@ type sendWindowHarness struct {
 	wireFrameCapacity int
 }
 
-// Sets the receiver's hold, which is what it advertises less what it holds,
-// and turns the advertisement on.
+// Sets and advertises the receiver's full hold capacity, independent of its
+// current occupancy.
 //
 // The advertisement used to ship off, so a row that wanted it asked here and no
 // row got it by default. It now ships ON, with the window rule (`f8d564b`), so
@@ -202,10 +191,6 @@ func newPacedSendWindowHarnessWithClient(
 	// per frame, concurrently: a pump that sleeps in its own loop is a serial
 	// line and would bound the measurement rather than the window
 	pumpsDone := []chan struct{}{}
-	dropNext := &atomic.Bool{}
-	drops := &atomic.Int64{}
-	delayNextNanos := &atomic.Int64{}
-	holdAcks := &atomic.Bool{}
 	rate := &atomic.Int64{}
 	rate.Store(int64(bytesPerSecond))
 	ratePump := func(from Route, to Route) {
@@ -253,28 +238,11 @@ func newPacedSendWindowHarnessWithClient(
 			for {
 				select {
 				case transferFrameBytes := <-from:
-					// the acknowledgement half, withheld
-					if 0 < delay && holdAcks.Load() {
-						MessagePoolReturn(transferFrameBytes)
-						continue
-					}
-					// one induced loss on the data half, for the loss cell
-					if delay == 0 && dropNext.CompareAndSwap(true, false) {
-						drops.Add(1)
-						MessagePoolReturn(transferFrameBytes)
-						continue
-					}
-					frameDelay := delay
-					if delay == 0 {
-						if held := delayNextNanos.Swap(0); 0 < held {
-							frameDelay = time.Duration(held)
-						}
-					}
 					framesInFlight.Add(1)
 					go func(transferFrameBytes []byte) {
 						defer framesInFlight.Done()
-						if 0 < frameDelay {
-							time.Sleep(frameDelay)
+						if 0 < delay {
+							time.Sleep(delay)
 						}
 						select {
 						case to <- transferFrameBytes:
@@ -323,10 +291,6 @@ func newPacedSendWindowHarnessWithClient(
 		sender:            sender,
 		receiver:          receiver,
 		receiverId:        receiverId,
-		dropNext:          dropNext,
-		drops:             drops,
-		delayNextNanos:    delayNextNanos,
-		holdAcks:          holdAcks,
 		bytesPerSecond:    rate,
 		wireFrameCapacity: cap(senderOut),
 	}
@@ -701,69 +665,62 @@ func TestDeliverySizedWindowRateFormHoldsAtAShortRoundTrip(t *testing.T) {
 // retransmission is the lost item rather than the window behind it.
 func TestReceiveAdvertisementStopsTheLossRetransmitStorm(t *testing.T) {
 	assertMessagePoolOwnership(t)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	const ceiling = ByteCount(16 * 1024 * 1024)
-	const hold = ByteCount(512 * 1024)
-	const payloadByteCount = 4 * 1024
-
-	harness := newSendWindowHarness(t, ctx, 25*time.Millisecond, func(settings *SendBufferSettings) {
-		settings.ResendQueueMaxByteCount = ByteCount(128 * 1024)
-		settings.DeliverySizedWindowScale = 2
-		settings.DeliverySizedWindowCeilingByteCount = ceiling
-		settings.ResendQueueBudget = NewTransferMemoryBudget(ceiling)
+	synctest.Test(t, func(t *testing.T) {
+		const ceiling = ByteCount(16 * 1024 * 1024)
+		const hold = ByteCount(512 * 1024)
+		const payloadByteCount = 4 * 1024
+		const propagation = 25 * time.Millisecond
+		fixture := newWindowRoundFixture(t, func(settings *SendBufferSettings) {
+			settings.ResendQueueMaxByteCount = 128 * 1024
+			settings.DeliverySizedWindowScale = deliverySizedWindowScale
+			settings.DeliverySizedWindowCeilingByteCount = ceiling
+			settings.ResendQueueBudget = NewTransferMemoryBudget(ceiling)
+		}, func(settings *ReceiveBufferSettings) {
+			settings.ReceiveQueueMaxByteCount = hold
+			settings.AdvertiseReceiveWindow = true
+		})
+		// Eight actual flights produce delivery and round-trip samples before
+		// the loss. Ack release follows each completed flight by exactly 25 ms.
+		for range 8 {
+			var lastAck *windowRoundFrame
+			for range 32 {
+				lastAck = fixture.receive(fixture.write(payloadByteCount))
+			}
+			time.Sleep(propagation)
+			fixture.forward(lastAck, fixture.senderIn)
+		}
+		before := fixture.sender.DestinationSendStats(fixture.receiver.ClientId())
+		window := before.SendWindow
+		if !window.Sized || hold < window.Window {
+			t.Fatalf("loss begins without a sampled advertised bound: %+v", window)
+		}
+		head := fixture.write(payloadByteCount)
+		heldCount := int(window.Window/ByteCount(len(head.bytes))) - 2
+		fixture.drop(head)
+		for range heldCount {
+			fixture.forward(fixture.receive(fixture.write(payloadByteCount)), fixture.senderIn)
+		}
+		receiveSequence := fixture.receiveSequence()
+		if count, queued := receiveSequence.receiveQueue.QueueSize(); count != heldCount || count <= 0 ||
+			queued != ByteCount(heldCount)*MessageByteCount(head.pack.Frames) ||
+			receiveSequence.nextSequenceNumber != head.pack.SequenceNumber {
+			t.Fatalf("loss left hold=%d/%d bytes in %d Packs at head %d, want %d Packs beyond dropped Pack %d", queued, hold, count, receiveSequence.nextSequenceNumber, heldCount, head.pack.SequenceNumber)
+		}
+		fixture.forward(fixture.receive(fixture.recovery(head)), fixture.senderIn)
+		after := fixture.sender.DestinationSendStats(fixture.receiver.ClientId())
+		resentByteCount := ByteCount(after.ResendWriteByteCount - before.ResendWriteByteCount)
+		if resentByteCount <= 0 || window.Window <= resentByteCount {
+			t.Fatalf("exact Pack %d loss cost %d resend bytes, want positive recovery below the %d byte window", head.pack.SequenceNumber, resentByteCount, window.Window)
+		}
+		stats := fixture.receiver.ReceiveStats()
+		if stats.ReceiveQueueDropCount != 0 || stats.ReceiveQueueEvictionCount != 0 {
+			t.Fatalf("advertised loss recovery refused=%d evicted=%d", stats.ReceiveQueueDropCount, stats.ReceiveQueueEvictionCount)
+		}
+		if fixture.deliveredCount != int(fixture.nextNumber) || fixture.ackedCount != int(fixture.nextNumber) {
+			t.Fatalf("loss recovery delivered/acknowledged %d/%d of %d", fixture.deliveredCount, fixture.ackedCount, fixture.nextNumber)
+		}
+		t.Logf("sampled window %d under hold %d: Pack %d loss held %d later Packs and cost %d resend bytes with zero receiver loss", window.Window, hold, head.pack.SequenceNumber, heldCount, resentByteCount)
 	})
-	harness.receiveHold(hold)
-
-	// reach the fixed point, then lose one Pack
-	harness.offer(t, payloadByteCount, time.Second)
-	window := harness.sender.DestinationSendStats(harness.receiverId).SendWindow
-	before := harness.sender.DestinationSendStats(harness.receiverId)
-	beforeDrops := harness.receiver.receiveQueueDropCount.Load()
-
-	harness.dropNext.Store(true)
-	harness.offer(t, payloadByteCount, time.Second)
-
-	after := harness.sender.DestinationSendStats(harness.receiverId)
-	afterDrops := harness.receiver.receiveQueueDropCount.Load()
-	resentByteCount := ByteCount(after.ResendWriteByteCount - before.ResendWriteByteCount)
-
-	if harness.drops.Load() != 1 {
-		t.Fatalf("the cell induced %d losses, want exactly one", harness.drops.Load())
-	}
-	if !window.Sized {
-		t.Fatalf("the window rule did not engage, so this cell does not test the advertisement: %+v", window)
-	}
-	if hold < window.Window {
-		t.Errorf("the window is %d above the %d byte hold, so the advertisement did not bind", window.Window, hold)
-	}
-	// the receiver never has to refuse an arrival, because the sender never
-	// sent more than it said it could hold
-	if beforeDrops != afterDrops {
-		t.Errorf(
-			"the receiver dropped %d arrivals through one induced loss; with the sender clamped to the advertised hold there is nothing above the hold to drop",
-			afterDrops-beforeDrops,
-		)
-	}
-	// And the retransmission is the item rather than the window behind it.
-	// The failure mode this replaces is a window or more: every arrival above
-	// the hold is refused and sent again. Measured here at 8 KB to 118 KB
-	// against a 512 KiB window, two to twenty-nine items, so the assertion is
-	// against the window rather than against a tighter band the noise of a
-	// shared runner would cross.
-	if window.Window <= resentByteCount {
-		t.Errorf(
-			"one induced loss cost %d bytes of retransmission against a %d byte window; the advertisement exists so that a loss costs the item rather than the window behind it",
-			resentByteCount,
-			window.Window,
-		)
-	}
-	t.Logf(
-		"window %d, hold %d: one loss cost %d bytes of retransmission (%d items of %d) and %d receiver drops",
-		window.Window, hold, resentByteCount, resentByteCount/payloadByteCount, payloadByteCount, afterDrops-beforeDrops,
-	)
 }
 
 // THROUGHPUTFIX §37.15's mechanism claim, the first of two: the window is

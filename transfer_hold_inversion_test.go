@@ -39,7 +39,8 @@ func TestTheReceiveHoldAndThePeerWindowCrossAtFourFifthsOfTheSendersBudget(t *te
 	// call and is still what a rollback produces, so it is pinned here as
 	// itself rather than as the default; the rule's own relationship is
 	// asserted at the end, where it belongs.
-	t.Cleanup(func() { SetWindowSizing(DefaultWindowSizing()) })
+	windowSizing := DefaultWindowSizing()
+	t.Cleanup(func() { SetWindowSizing(windowSizing) })
 	SetWindowSizing(WindowSizingConstant)
 
 	// a provider runs unbudgeted, so the sender's window is the unscaled

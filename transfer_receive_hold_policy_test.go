@@ -1,81 +1,21 @@
+// Controlled overruns compare receive commitments, eviction and drainage.
 package connect
 
 import (
-	"context"
-	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
-
-	"github.com/urnetwork/connect/protocol"
 )
 
-// THROUGHPUTFIX §37.20: what a full receive hold does with an arrival earlier
-// than what it holds. Three policies, one binary, one field.
+// Compare the three receive policies on one explicit overrun. Pack 32 is
+// dropped, Pack 40 is withheld, and the tail fills the 320 KiB hold before 40
+// returns. Both gap identities and the full held set are observed before the
+// middle admission, so host scheduling cannot select a different experiment.
 //
-// The defect, reproduced on unmodified main. Both shipping constants are
-// memory-scaled by the same factor, so on one host the hold is 1.25 times the
-// window at every budget and the ordering never inverts. The two live on
-// different hosts: a provider runs unbudgeted with a 2 MiB window, and a client
-// at budget B holds max(320 KiB, 2.5 MiB x B / 64 MiB), which is under 2 MiB
-// for every budget below 51.2 MiB. With one of two routes killed mid-transfer,
-// a 24 MiB client saturated its hold in four of four runs and none completed; a
-// 52 MiB client completed clean. Every mobile budget this program has discussed
-// is inverted.
-//
-// Why neither obvious policy is enough, both measured at a 6.4 times overrun,
-// four runs each. Evicting the latest held item to admit an earlier one keeps
-// the hold sequence-earliest, which is the only shape that drains: the head
-// arrives, the contiguous run behind it leaves, and the hold empties. It
-// completed two of four with 25,227 loss events. But an evicted item had been
-// acknowledged, and a selective acknowledgement leases the item at the sender
-// rather than releasing it, so its removal is a withdrawal the sender learns of
-// only from an acknowledgement-tail probe when the item reaches the head —
-// twice, and then the sixty second timeout. Refusing instead is truthful and
-// starves: a middle gap, earlier than held items but not the head, is exactly
-// what would extend the run, and refusing it means the hold keeps whatever
-// arrived first. None of four completed, 53,509 loss events.
-//
-// Committed-prefix acknowledgement has both. Keep the hold sequence-earliest
-// exactly as eviction does, and acknowledge a held item only once it can no
-// longer be evicted. An item is evicted only by an earlier arrival at a full
-// hold, so it is safe once every item missing below it could arrive and it
-// would still fit; with the delivery point D and the held items in ascending
-// order the number missing below the i-th is (seq_i - D) - i, and the item
-// commits when that count times the largest frame seen, plus the held sizes
-// through i, is within the hold's capacity. Below the boundary an item is
-// acknowledged and never discarded. Above it the item is held tentatively,
-// unacknowledged, and evictable with nothing withdrawn.
-//
-// What makes it the right answer is what it needs to know: its own capacity,
-// its delivery point, its held set and a frame size. Not its peer's window and
-// no round trip, so it is purely local and requires nothing of the sender.
-//
-// Predictions, recorded before the run, at a 6.4 times overrun:
-//
-//   - committed prefix: completes, evictions of acknowledged items zero,
-//     tentative evictions high, no item left on a lease;
-//   - evicting: completes sometimes, with acknowledged evictions above zero,
-//     which is the lie;
-//   - refusing: the worst of the three on completion.
-//
-// If the committed arm stalls, the boundary was crossed by an item later
-// evicted, which means the gap estimate under-counted, and the frame size it
-// used is the field to read.
-//
-// Measured here, two runs of the three arms at that overrun:
-//
-//	committed  600/600 in 3.13 s and 10.48 s, 0 acknowledged evictions,
-//	           103 and 95 tentative, 456 and 453 commits
-//	evicting   600/600 in 1.89 s and 6.43 s, 45 and 108 acknowledged
-//	           evictions, which is the lie
-//	refusing   118/600 and 107/600, neither completing inside thirty seconds
-//
-// So the committed arm keeps eviction's drainage and gives up none of
-// refusal's truth. It is slower than plain eviction by about a factor of 1.6,
-// which is the second-order cost the design names: a tentative item provides no
-// proving acknowledgement, so a gap just below the boundary recovers on the
-// paced resend rather than on gap recovery. The receive advertisement removes
-// that along with the overrun that causes it.
+// After that boundary real client recovery runs over ordered routes with 25 ms
+// Ack propagation. The original 600-message workload, 2 MiB sender window and
+// at-least-90%-within-30-seconds drainage contract remain. The clock is virtual;
+// elapsed host execution time does not decide whether the protocol drains.
 func TestTheHoldPolicyKeepsDrainageWithoutWithdrawingAnAcknowledgement(t *testing.T) {
 	assertMessagePoolOwnership(t)
 
@@ -89,7 +29,6 @@ func TestTheHoldPolicyKeepsDrainageWithoutWithdrawingAnAcknowledgement(t *testin
 	const propagation = 25 * time.Millisecond
 	const dropAt = 32
 	const reorderAt = 40
-	const reorder = 120 * time.Millisecond
 
 	type reading struct {
 		delivered          int64
@@ -101,62 +40,93 @@ func TestTheHoldPolicyKeepsDrainageWithoutWithdrawingAnAcknowledgement(t *testin
 	}
 
 	run := func(policy ReceiveHoldPolicyKind) reading {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		harness := newSendWindowHarness(t, ctx, propagation,
-			func(settings *SendBufferSettings) {
+		var result reading
+		synctest.Test(t, func(t *testing.T) {
+			fixture := newWindowRoundFixture(t, func(settings *SendBufferSettings) {
 				settings.ResendQueueMaxByteCount = window
+			}, func(settings *ReceiveBufferSettings) {
+				settings.ReceiveQueueMaxByteCount = hold
+				settings.ReceiveHoldPolicy = policy
 			})
-		harness.receiver.settings.ReceiveBufferSettings.ReceiveQueueMaxByteCount = hold
-		harness.receiver.settings.ReceiveBufferSettings.ReceiveHoldPolicy = policy
-		delivered := &atomic.Int64{}
-		harness.receiver.AddReceiveCallback(
-			func(_ TransferPath, frames []*protocol.Frame, _ Peer) {
-				delivered.Add(int64(len(frames)))
-			},
-		)
-
-		payload := string(make([]byte, payloadByteCount))
-		start := time.Now()
-		for i := range messageCount {
-			if i == dropAt {
-				// a real loss, which keeps the delivery point below the hold
-				harness.dropNext.Store(true)
+			start := time.Now()
+			var dropped, delayed *windowRoundFrame
+			for number := range reorderAt + 1 {
+				pack := fixture.write(payloadByteCount)
+				switch number {
+				case dropAt:
+					dropped = pack
+					fixture.drop(pack)
+				case reorderAt:
+					delayed = pack
+				default:
+					fixture.forward(pack, fixture.receiverIn)
+					fixture.acknowledge()
+				}
 			}
-			if i == reorderAt {
-				// and one frame held back, so the hold fills behind it and it
-				// arrives beyond the delivery point but earlier than what is
-				// held, which is the only arrival that can evict
-				harness.delayNextNanos.Store(int64(reorder))
+			itemByteCount := MessageByteCount(delayed.pack.Frames)
+			heldCount := int((hold - 1) / itemByteCount)
+			receiveSequence := fixture.receiveSequence()
+			prefixCount, _ := receiveSequence.receiveQueue.QueueSize()
+			if prefixCount != reorderAt-dropAt-1 {
+				t.Fatalf("policy %d held %d prefix Packs, want %d between the two gaps", policy, prefixCount, reorderAt-dropAt-1)
 			}
-			frame := RequireToFrameWithDefaultProtocolVersion(
-				&protocol.SimpleMessage{Content: payload},
-			)
-			admitted, _ := harness.sender.SendWithTimeoutDetailed(
-				frame,
-				harness.receiverId,
-				nil,
-				time.Second,
-				sendPackRecoveryOption{upstreamRecoverable: true, retainAfterAckTimeout: true},
-			)
-			if !admitted {
-				MessagePoolReturn(frame.MessageBytes)
+			for range heldCount - prefixCount {
+				fixture.forward(fixture.write(payloadByteCount), fixture.receiverIn)
+				fixture.acknowledge()
 			}
-		}
-		deadline := time.Now().Add(30 * time.Second)
-		for time.Now().Before(deadline) && delivered.Load() < messageCount {
-			time.Sleep(50 * time.Millisecond)
-		}
-		elapsed := time.Since(start)
-		stats := harness.receiver.ReceiveStats()
-		return reading{
-			delivered:          delivered.Load(),
-			elapsed:            elapsed,
-			evictions:          stats.ReceiveQueueEvictionCount,
-			tentativeEvictions: stats.ReceiveQueueTentativeEvictionCount,
-			refusals:           stats.ReceiveQueueDropCount,
-			commits:            stats.ReceiveQueueCommitCount,
-		}
+			count, queued := receiveSequence.receiveQueue.QueueSize()
+			if count != heldCount || queued != ByteCount(heldCount)*itemByteCount ||
+				receiveSequence.receiveQueue.CanAdd(itemByteCount, hold) ||
+				receiveSequence.nextSequenceNumber != uint64(dropAt) || fixture.deliveredCount != dropAt {
+				t.Fatalf("policy %d: hold=%d/%d bytes in %d Packs, delivered=%d; wanted a full hold beyond Pack %d", policy, queued, hold, count, fixture.deliveredCount, dropAt)
+			}
+			newest := receiveSequence.receiveQueue.PeekLast()
+			if wantCommitted := policy != ReceiveHoldCommittedPrefix; newest.committed != wantCommitted {
+				t.Fatalf("policy %d: full hold's newest Pack committed=%t, want %t", policy, newest.committed, wantCommitted)
+			}
+			fixture.forward(delayed, fixture.receiverIn)
+			fixture.acknowledge()
+			boundary := fixture.receiver.ReceiveStats()
+			wantEvictions, wantTentative, wantDrops := uint64(0), uint64(0), uint64(0)
+			switch policy {
+			case ReceiveHoldCommittedPrefix:
+				wantTentative = 1
+			case ReceiveHoldEvict:
+				wantEvictions = 1
+			case ReceiveHoldRefuse:
+				wantDrops = 1
+			}
+			if boundary.ReceiveQueueEvictionCount != wantEvictions ||
+				boundary.ReceiveQueueTentativeEvictionCount != wantTentative ||
+				boundary.ReceiveQueueDropCount != wantDrops {
+				t.Fatalf("policy %d middle arrival: acknowledged evictions=%d tentative evictions=%d refusals=%d, want %d/%d/%d", policy, boundary.ReceiveQueueEvictionCount, boundary.ReceiveQueueTentativeEvictionCount, boundary.ReceiveQueueDropCount, wantEvictions, wantTentative, wantDrops)
+			}
+			// The gap really lost its original physical write. Only a sender
+			// recovery copy can close it when the controlled outage ends.
+			fixture.forward(fixture.recovery(dropped), fixture.receiverIn)
+			fixture.acknowledge()
+			for _, frame := range fixture.heldFrames {
+				if frame.bytes != nil && frame.pack != nil {
+					fixture.forward(frame, fixture.receiverIn)
+					fixture.acknowledge()
+				}
+			}
+			fixture.startWire(propagation, DefaultReceiveBufferSettings().AckCompressTimeout)
+			fixture.offer(messageCount-int(fixture.nextNumber), payloadByteCount)
+			time.Sleep(30 * time.Second)
+			synctest.Wait()
+			stats := fixture.receiver.ReceiveStats()
+			result = reading{
+				delivered:          int64(fixture.deliveredCount),
+				elapsed:            time.Since(start),
+				evictions:          stats.ReceiveQueueEvictionCount,
+				tentativeEvictions: stats.ReceiveQueueTentativeEvictionCount,
+				refusals:           stats.ReceiveQueueDropCount,
+				commits:            stats.ReceiveQueueCommitCount,
+			}
+			t.Logf("policy %d forced Packs %d/%d against %d held Packs before allowing recovery", policy, dropped.pack.SequenceNumber, delayed.pack.SequenceNumber, heldCount)
+		})
+		return result
 	}
 
 	committed := run(ReceiveHoldCommittedPrefix)
@@ -207,11 +177,9 @@ func TestTheHoldPolicyKeepsDrainageWithoutWithdrawingAnAcknowledgement(t *testin
 			refusing.delivered,
 		)
 	}
-	// and the evicting arm is the control that shows the lie is real rather
-	// than hypothetical; when it does not evict, this run simply did not reach
-	// that regime
+	// The control must reach the forced acknowledged-eviction boundary.
 	if evicting.evictions == 0 {
-		t.Logf("the evicting control withdrew nothing this run, so the lie was not exercised")
+		t.Error("the evicting control withdrew nothing at the forced overrun")
 	}
 	if 0 < committed.tentativeEvictions {
 		t.Logf(
