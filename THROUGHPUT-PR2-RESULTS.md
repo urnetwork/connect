@@ -1,6 +1,6 @@
 # Window follow-up: implementation and local results
 
-Branch: `throughput-fix-2`, based on `d9eadf29`.
+Branch: `throughput-fix-2`, source revision `b51530f3a402cb1dd5fe5d1daae344302a1f3069`.
 Date: 2026-09-15. The delivery-sized window remains enabled.
 
 Final evidence is summarized in [THROUGHPUT-REPORT-PR2.md](THROUGHPUT-REPORT-PR2.md).

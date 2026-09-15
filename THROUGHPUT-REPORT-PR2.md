@@ -2,7 +2,7 @@
 
 Date: 2026-09-15
 Branch: `throughput-fix-2`
-Connect source revision: `8f30ab6a50664ad35ef685ccc2cfda65a540ddff`
+Connect source revision: `b51530f3a402cb1dd5fe5d1daae344302a1f3069`
 Connect source manifest: `034a8ba28c61e70407d050228067a342b36f49505ae915cb99a7824a19bd90ee`
 Server source revision reviewed: `77201554c49ec05bde83ec038bba6c600972892c`
 
