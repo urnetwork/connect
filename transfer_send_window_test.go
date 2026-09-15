@@ -797,7 +797,7 @@ func TestSizedWindowIsComputedFromTheMeasuredRoundTrip(t *testing.T) {
 	}
 	// the rule's own arithmetic, recomputed from the evidence it published
 	want := ByteCount(int64(estimate.DeliveredByteCount) *
-		estimate.RoundTrip.Nanoseconds() / estimate.Interval.Nanoseconds())
+		estimate.WindowRoundTrip.Nanoseconds() / estimate.Interval.Nanoseconds())
 	want = min(max(ByteCount(2)*want, estimate.Floor), estimate.Ceiling)
 	if estimate.Window != want {
 		t.Errorf(

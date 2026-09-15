@@ -93,7 +93,7 @@ Send and receive sit on opposite sides of the backpressure contract. **Senders b
 - **Refusal is correct only at a recoverable boundary.** A true datagram or shared callback can refuse promptly and let the transmission control above it discover the achievable rate. An already-read reliable carrier message is not that boundary: refusing it hides loss from the carrier and forces a much slower Transfer recovery cycle. Never infer the contract from H3 or P2P alone; use the lane metadata that accompanied the exact message.
 - The failure shape when this rule is broken is **head-of-line blocking across unrelated flows**: receive delivery is fanned out from shared pumps (a dispatch shard serves many flows; a client receive loop serves every sequence from a source), so one blocked callback parks every flow sharing the pump. One dead destination whose return send blocks for its full write timeout can starve delivery for all live destinations for that entire window — observed as flows that look dead on arrival while their peer is provably alive.
 
-The device-side tun write is one deliberate callback exception, documented at its call site: the provider NAT does not retransmit toward the device, so that handoff is synchronous and its inline write is the path's flow control. The provider's local-NAT TCP return callback is another: it runs on one flow's socket-reader goroutine after upstream bytes have been consumed, and no TCP or transfer layer can reconstruct a segment dropped before the transfer sender accepts it. It may therefore retry Transfer admission synchronously on that dedicated flow goroutine. The exact reliable-carrier and Pack waits above are the other documented exceptions; both retain fixed ownership and end at capacity or lifecycle cancellation. Do not put these waits behind a shared callback worker, extend them to UDP/ICMP/datagram lanes, or infer them from a transport family. An exception must be argued like these — in a comment, from the specific loss model — not assumed.
+The device-side tun write is one deliberate callback exception, documented at its call site: its synchronous handoff provides flow control; provider TCP replay is a bounded recovery backstop for loss after Transfer delivery. The provider's local-NAT TCP return callback is another: it runs on one flow's socket-reader or recovery goroutine, with origin bytes retained until the inner TCP acknowledges them. It may retry Transfer admission synchronously on that dedicated flow goroutine to propagate pressure without manufacturing retransmissions. The exact reliable-carrier and Pack waits above are the other documented exceptions; both retain fixed ownership and end at capacity or lifecycle cancellation. Do not put these waits behind a shared callback worker, extend them to UDP/ICMP/datagram lanes, or infer them from a transport family. An exception must be argued like these — in a comment, from the specific loss model — not assumed.
 
 ## Concurrency and goroutine safety
 
@@ -192,6 +192,7 @@ must return it after the call.
 
 - `RemoteUserNatProvider.Receive`, `receiveTransfer`, `receiveTransferWithRecovery`
 - `RemoteUserNatProvider.ReceiveBatch`, `receiveTransferBatch`
+- `TcpSequence.retainReturnChunk`
 - every `ReceiveFunction` / `ReceivePacketFunction` callback
 
 **Takes** — ownership moves at the call and the buffer is returned by the

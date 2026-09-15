@@ -290,17 +290,23 @@ func buildEquivalentAckFrame(m *sendAckFrame) *protocol.TransferFrame {
 		value := m.receiveWindowByteCount
 		receiveWindowByteCount = &value
 	}
+	var compression *uint32
+	if m.ackCompressTimeoutSet {
+		value := m.ackCompressTimeoutMicros
+		compression = &value
+	}
 	ack := &protocol.Ack{
-		MessageId:               m.messageId.Bytes(),
-		SequenceId:              m.sequenceId.Bytes(),
-		Selective:               m.selective,
-		Tag:                     tag,
-		MissingContractId:       missingContractId,
-		CompactContractRecovery: m.compactContractRecovery,
-		LogicalLaneVersion:      m.logicalLaneVersion,
-		ContractAhead:           m.contractAhead,
-		ReceiveWindowByteCount:  receiveWindowByteCount,
-		EvictedSequenceNumbers:  m.evictedSequenceNumbers,
+		AckCompressTimeoutMicros: compression,
+		MessageId:                m.messageId.Bytes(),
+		SequenceId:               m.sequenceId.Bytes(),
+		Selective:                m.selective,
+		Tag:                      tag,
+		MissingContractId:        missingContractId,
+		CompactContractRecovery:  m.compactContractRecovery,
+		LogicalLaneVersion:       m.logicalLaneVersion,
+		ContractAhead:            m.contractAhead,
+		ReceiveWindowByteCount:   receiveWindowByteCount,
+		EvictedSequenceNumbers:   m.evictedSequenceNumbers,
 	}
 	tf := &protocol.TransferFrame{
 		TransferPath: m.path.ToProtobuf(),
@@ -579,6 +585,8 @@ func TestAckCodecRandomized(t *testing.T) {
 				)
 			}
 		}
+		m.ackCompressTimeoutSet = mathrandv2.IntN(2) == 0
+		m.ackCompressTimeoutMicros = mathrandv2.Uint32()
 		assertAckCodecMatches(t, m)
 	}
 }
@@ -1545,11 +1553,15 @@ func TestOwnedAckDecodeCopiesCompactQueueValueBeforeRelease(t *testing.T) {
 
 func TestOwnedAckDecodeSteadyStateDoesNotAllocate(t *testing.T) {
 	m := &sendAckFrame{
-		path:        TransferPath{DestinationId: NewId(), SourceId: NewId()},
-		messageId:   NewId(),
-		sequenceId:  NewId(),
-		tagSendTime: 1,
-		tagSet:      true,
+		path:                     TransferPath{DestinationId: NewId(), SourceId: NewId()},
+		messageId:                NewId(),
+		sequenceId:               NewId(),
+		tagSendTime:              1,
+		tagSet:                   true,
+		receiveWindowSet:         true,
+		receiveWindowByteCount:   1 << 20,
+		ackCompressTimeoutSet:    true,
+		ackCompressTimeoutMicros: 10000,
 	}
 	encoded := marshalSendAckTransferFrame(m)
 	defer MessagePoolReturn(encoded)
@@ -1571,13 +1583,10 @@ func TestOwnedAckDecodeSteadyStateDoesNotAllocate(t *testing.T) {
 
 func TestDecodedTransferFramePoolRetainedSizeStaysSmall(t *testing.T) {
 	size := unsafe.Sizeof(decodedTransferFrame{})
-	// 648 rather than 640 since THROUGHPUTFIX §39.1: `Pack.contract_ahead` and
-	// `Ack.contract_ahead` are two generated bools that landed in one new word
-	// of the pooled owner. The ceiling moves with a deliberate wire change and
-	// not otherwise, which is what this row is for — it caught exactly this
-	// change and cost one word for the whole unit.
-	if size > 648 {
-		t.Fatalf("decoded TransferFrame owner size = %d, want <= 648 bytes", size)
+	// Includes optional compression metadata and inline capacity/compression
+	// storage: the hot decoder keeps these fields allocation-free.
+	if size > 680 {
+		t.Fatalf("decoded TransferFrame owner size = %d, want <= 680 bytes", size)
 	}
 	t.Logf(
 		"decoded TransferFrame owner=%d bytes; exact pool ceiling=%d bytes",
@@ -1585,8 +1594,8 @@ func TestDecodedTransferFramePoolRetainedSizeStaysSmall(t *testing.T) {
 		uintptr(decodedTransferFramePoolCapacity)*size,
 	)
 	ackSize := unsafe.Sizeof(receiveAckMessage{})
-	if ackSize > 96 {
-		t.Fatalf("compact receive ACK size = %d, want <= 96 bytes", ackSize)
+	if ackSize > 104 {
+		t.Fatalf("compact receive ACK size = %d, want <= 104 bytes", ackSize)
 	}
 	t.Logf("compact receive ACK=%d bytes", ackSize)
 }

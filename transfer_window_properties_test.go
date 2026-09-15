@@ -311,6 +311,7 @@ func TestGrowthDoublesFromAFullWindowAndStallsFromAHalfFilledOne(t *testing.T) {
 		})
 		sampleRoundTrip(sequence, roundTrip)
 		sequence.observeReceiveWindowAdvertisement(receiveAckMessage{
+			ackCompressTimeoutSet:  true, // this fixture delivers without receiver batching
 			receiveWindowSet:       true,
 			receiveWindowByteCount: uint32(mib(64)),
 		})

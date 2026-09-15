@@ -222,6 +222,14 @@ message Ack {
     // varint with a sentinel.
     optional uint64 receive_window_byte_count = 8;
 
+    // Maximum receiver acknowledgement compression, in microseconds. Zero
+    // means immediate acknowledgements; absent is a legacy receiver (10 ms).
+    // A sender sizes the window for this bounded residence in addition to
+    // its minimum RTT, without feeding its own queue delay back into growth.
+    // Latest present value wins within the sequence; absent does not erase
+    // previously received evidence from a newer peer.
+    optional uint32 ack_compress_timeout_micros = 11;
+
     // Sequence numbers of items this receiver had acknowledged and then removed
     // from its hold to admit an earlier arrival. A selective acknowledgement
     // leases an item rather than releasing it: the sender keeps it in its

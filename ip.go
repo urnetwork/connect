@@ -440,9 +440,15 @@ func DefaultTcpBufferSettingsWithBufferSize(bufferSize int) *TcpBufferSettings {
 	if 0 < MemoryBudget() {
 		globalLimit = MemoryScaledCount(512, 64)
 	}
+	returnBudget := mib(64)
+	if 0 < MemoryBudget() {
+		returnBudget = max(kib(320), transferBudgetShareByteCount())
+	}
 	tcpBufferSettings := &TcpBufferSettings{
 		// ConnectTimeout:     60 * time.Second,
-		ReadTimeout: 300 * time.Second,
+		ReadTimeout:         300 * time.Second,
+		ReturnQueueBudget:   NewTransferMemoryBudget(returnBudget),
+		ReturnResendTimeout: time.Second,
 		// WriteTimeout bounds ZERO-progress time on the upstream socket (the
 		// write pipeline re-arms it on partial progress). A closed window on
 		// the tunnel side legitimately parks the whole pipeline — the device's
@@ -3685,6 +3691,13 @@ func (self *StreamState) udpPacket(payload []byte) []byte {
 }
 
 type TcpBufferSettings struct {
+	// Shared retained origin bytes awaiting inner TCP acknowledgement. Defaults
+	// share one pool across this NAT's flows. Zero per-flow maximum borrows up
+	// to the shared pool; nil budget uses the configured TCP window per flow.
+	ReturnQueueBudget       *TransferMemoryBudget
+	ReturnQueueMaxByteCount ByteCount
+	ReturnResendTimeout     time.Duration
+
 	// nil resolves to the local user nat `Log`
 	Log Logger
 	// ConnectTimeout     time.Duration
@@ -4473,6 +4486,17 @@ type TcpSequence struct {
 
 	tcpBufferSettings *TcpBufferSettings
 
+	// Guarded by the connection mutex. Chunk copies survive Transfer delivery
+	// until the source's inner cumulative TCP acknowledgement releases them.
+	returnChunks        []tcpReturnChunk
+	returnHead          int
+	returnByteCount     ByteCount
+	returnDuplicateAcks int
+	returnAttempts      int
+	returnProgressTime  time.Time
+	returnWake          chan struct{}
+	returnCapacity      chan struct{}
+
 	sendMutex sync.Mutex
 	sendItems chan *TcpSendItem
 	// Lazily allocated only when the bounded send queue actually blocks.
@@ -4588,6 +4612,8 @@ func newTcpSequenceWithTransferKey(
 		cancel:            cancel,
 		log:               loggerOrDefault(tcpBufferSettings.Log),
 		retirementDone:    make(chan struct{}),
+		returnWake:        make(chan struct{}, 1),
+		returnCapacity:    make(chan struct{}, 1),
 		receiveCallback:   receiveCallback,
 		tcpBufferSettings: tcpBufferSettings,
 		sendItems:         make(chan *TcpSendItem, tcpBufferSettings.SequenceBufferSize),
@@ -4828,6 +4854,7 @@ func (self *TcpSequence) Run() {
 			self.beforeChildWorkersWaitForTest()
 		}
 		childWorkers.Wait()
+		self.releaseReturnChunks()
 	}()
 	defer func() {
 		self.cancel()
@@ -5032,6 +5059,8 @@ func (self *TcpSequence) Run() {
 		receiveAckCond.Broadcast()
 		ackCond.Broadcast()
 	}()
+
+	runChildWorker(self.runReturnRecovery)
 
 	// signals the ack pipeline to send a coalesced ack now
 	ackSignal := make(chan struct{}, 1)
@@ -5327,9 +5356,8 @@ func (self *TcpSequence) Run() {
 			if 0 < n {
 				self.UpdateLastActivityTime()
 
-				// Transfer must not lose these emitted segments. The source TCP stack
-				// can reorder a route crossover, but the user-NAT does not retain data
-				// for retransmission.
+				// Retain origin chunks until the inner TCP acknowledges delivery.
+				// Transfer delivery alone does not prove a TUN kept the segment.
 				// packetize and emit one window-sized chunk at a time, so that a
 				// read larger than the receive window cannot stall. each chunk
 				// must be emitted before waiting for window room for the next
@@ -5339,6 +5367,8 @@ func (self *TcpSequence) Run() {
 				packetCount := 0
 				for i := 0; i < n && !stop; {
 					var chunkPackets [][]byte
+					var chunkPayload []byte
+					var chunkStart uint32
 					func() {
 						self.mutex.Lock()
 						defer self.mutex.Unlock()
@@ -5353,7 +5383,17 @@ func (self *TcpSequence) Run() {
 
 							windowByteCount := int(int64(self.receiveWindowSize) - int64(self.receiveSeq-self.receiveSeqAck))
 							if 0 < windowByteCount {
-								j := min(i+windowByteCount, n)
+								// Leave room for pool-class rounding and chunk metadata in
+								// small replay pools; a large socket read must split to fit.
+								chunkLimit := ByteCount(self.tcpBufferSettings.ReadBufferByteCount)
+								if limit := self.tcpBufferSettings.ReturnQueueMaxByteCount; limit > 0 {
+									chunkLimit = min(chunkLimit, max(1, (limit-128)/2))
+								}
+								if budget := self.tcpBufferSettings.ReturnQueueBudget; budget != nil {
+									chunkLimit = min(chunkLimit, max(1, (budget.TotalByteCount()-128)/2))
+								}
+								j := min(i+windowByteCount, i+int(chunkLimit), n)
+								chunkPayload, chunkStart = buffer[i:j], self.receiveSeq
 								var err error
 								chunkPackets, err = self.DataPackets(buffer[i:j], j-i, self.tcpBufferSettings.Mtu)
 								if err != nil {
@@ -5373,6 +5413,9 @@ func (self *TcpSequence) Run() {
 							receiveAckCond.Wait()
 						}
 					}()
+					if len(chunkPackets) != 0 && !self.retainReturnChunk(chunkPayload, chunkStart, false) {
+						stop = true
+					}
 					for _, packet := range chunkPackets {
 						if stop {
 							MessagePoolReturn(packet)
@@ -5408,13 +5451,19 @@ func (self *TcpSequence) Run() {
 					self.log.V(2).Infof("[final]FIN\n")
 					var finPacket []byte
 					var finErr error
+					var finSeq uint32
 					func() {
 						self.mutex.Lock()
 						defer self.mutex.Unlock()
 
+						finSeq = self.receiveSeq
 						finPacket, finErr = self.FinAck()
 						self.receiveSeq += 1
 					}()
+					if finErr == nil && !self.retainReturnChunk(nil, finSeq, true) {
+						MessagePoolReturn(finPacket)
+						return
+					}
 					if finErr == nil {
 						select {
 						case <-self.ctx.Done():
@@ -5423,6 +5472,12 @@ func (self *TcpSequence) Run() {
 							fin = true
 						}
 					}
+					// Keep the data/FIN replay owner alive after the origin's EOF.
+					self.mutex.Lock()
+					for self.ctx.Err() == nil && self.returnByteCount != 0 {
+						receiveAckCond.Wait()
+					}
+					self.mutex.Unlock()
 					return
 				} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					if self.log.V(2).Enabled() {
@@ -6100,6 +6155,7 @@ func (self *TcpSequence) applySendAckWithLock(tcp *parsedTcp) (receiveAckUpdated
 	if tcp.ack &&
 		0 <= int32(tcp.ackNumber-self.receiveSeqAck) &&
 		0 <= int32(self.receiveSeq-tcp.ackNumber) {
+		self.acknowledgeReturnWithLock(tcp.ackNumber)
 		if !self.handshakeAcked &&
 			0 <= int32(tcp.ackNumber-(self.initialSynSeq+1)) {
 			self.handshakeAcked = true
