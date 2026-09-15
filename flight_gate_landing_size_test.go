@@ -38,6 +38,8 @@ const (
 	// the items a receiver removed from its hold after acknowledging them
 	// (THROUGHPUTFIX §37.16)
 	evictionNoticeStateByteCount = 8
+	// Optional receiver compression duration plus its presence bit/padding.
+	ackCompressionStateByteCount = 8
 )
 
 func TestLandingStructsMatchMergedLessTheDeferState(t *testing.T) {
@@ -48,11 +50,11 @@ func TestLandingStructsMatchMergedLessTheDeferState(t *testing.T) {
 	if got, want := unsafe.Sizeof(receiveAckMessage{}),
 		uintptr(mergedReceiveAckMessageByteCount+
 			receiveAdvertisementStateByteCount+
-			evictionNoticeStateByteCount); got != want {
+			evictionNoticeStateByteCount+ackCompressionStateByteCount); got != want {
 		t.Errorf(
-			"receiveAckMessage is %d bytes, want merged's %d plus %d for the receiver's advertised capacity and %d for the eviction notice",
+			"receiveAckMessage is %d bytes, want merged's %d plus %d for capacity, %d for evictions and %d for compression",
 			got, mergedReceiveAckMessageByteCount,
-			receiveAdvertisementStateByteCount, evictionNoticeStateByteCount,
+			receiveAdvertisementStateByteCount, evictionNoticeStateByteCount, ackCompressionStateByteCount,
 		)
 	}
 	want := uintptr(

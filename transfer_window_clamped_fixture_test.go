@@ -30,6 +30,8 @@ func newSampledShareWindowFixture(t *testing.T, perSample ByteCount) (*SendSeque
 	sequence.observeReceiveWindowAdvertisement(receiveAckMessage{
 		receiveWindowSet:       true,
 		receiveWindowByteCount: 16 * 1024 * 1024,
+		// This arithmetic fixture models immediate ACKs at a fixed 25 ms RTT.
+		ackCompressTimeoutSet: true,
 	})
 	sequence.receiveWindowSetAtNanos.Store(base.UnixNano())
 	at := base

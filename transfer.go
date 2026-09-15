@@ -6180,6 +6180,7 @@ type SendSequence struct {
 	// spends what the caller has left rather than a fresh write timeout.
 	// Owned by the sequence goroutine, which is the only writer and reader.
 	currentPackDeadline time.Time
+	windowPacer         windowBurstPacer
 	// THROUGHPUTFIX §38.12's first stage. The loop publishes an immutable
 	// snapshot of what an immediate no-acknowledgement write needs — the
 	// writer handle and the contract it may charge — and a caller reads the
@@ -7925,6 +7926,7 @@ func (self *SendSequence) noAckPackCanBypassRecoveryAdmission(
 }
 
 func (self *SendSequence) Run() {
+	defer self.windowPacer.close()
 	ackWorkerDone := make(chan struct{})
 	ackWorkerStarted := false
 	defer func() {
@@ -11152,10 +11154,20 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 	reliableOnly bool,
 ) (transferWriteDisposition, error) {
 	writer := self.openContractMultiRouteWriter()
+	policy := self.transferFlightPolicy()
+	paceWrite := func(byteCount int) error {
+		if item != nil && item.expectsAck && policy.h1Only &&
+			self.sendBufferSettings.DeliverySizedWindowScale > 0 &&
+			self.sendBufferSettings.TargetGoodputByteRate > 0 {
+			rate := ByteCount(float64(self.sendBufferSettings.TargetGoodputByteRate) / goodputFactor)
+			return self.windowPacer.wait(self.ctx, byteCount, rate)
+		}
+		return nil
+	}
 	// A full unreliable flight must not stall this sequence while a reliable
 	// carrier is active: route the overflow reliable-only so it is neither
 	// tracked in the flight nor lost with the unreliable carrier.
-	reliableOnly = reliableOnly || self.reliableOnlyWrite(self.transferFlightPolicy())
+	reliableOnly = reliableOnly || self.reliableOnlyWrite(policy)
 	var cipher *sequenceCipher
 	if self.session != nil && !forceUnwrapped {
 		cipher = self.session.Cipher()
@@ -11195,6 +11207,9 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 			// the copy is scoped to this write; the item's transferFrameBytes stays
 			// owned by the sequence
 			defer MessagePoolReturn(bytes)
+		}
+		if err := paceWrite(len(bytes)); err != nil {
+			return transferWriteDisposition{}, err
 		}
 		self.observeTransferWireMessage(bytes, transferFrameBytes, item, resend)
 		shared := MessagePoolShareReadOnly(bytes)
@@ -11237,6 +11252,9 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 		)
 	}
 	defer MessagePoolReturn(wrapped)
+	if err := paceWrite(len(wrapped)); err != nil {
+		return transferWriteDisposition{}, err
+	}
 	self.observeTransferWireMessage(wrapped, transferFrameBytes, item, resend)
 	shared := MessagePoolShareReadOnly(wrapped)
 	disposition, err := writeMultiRouteWithCarrier(
