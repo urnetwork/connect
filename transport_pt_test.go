@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"sync"
@@ -33,6 +34,9 @@ import (
 
 	"testing"
 )
+
+// Reads and writes use the same progress interval on the paced carrier.
+const packetTranslationTestIoByteCount = 2048
 
 func TestPtDnsEncodeDecode(t *testing.T) {
 	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
@@ -537,10 +541,10 @@ func ptEncodeDecodeTest(t *testing.T, ipVersion int, clientPtMode PacketTranslat
 				writeComplete := make(chan struct{})
 				go func() {
 					defer close(writeComplete)
-					stream.SetWriteDeadline(ioDeadline())
-					m, err := stream.Write(data)
+					writeStarted := time.Now()
+					m, err := writePacketTranslationTestData(stream, data, ioDeadline)
 					if err != nil {
-						reportErr(fmt.Errorf("server write: %w", err))
+						reportErr(fmt.Errorf("server write %d/%d after %s: %w", m, len(data), time.Since(writeStarted), err))
 						return
 					}
 					if m != len(data) {
@@ -553,7 +557,7 @@ func ptEncodeDecodeTest(t *testing.T, ipVersion int, clientPtMode PacketTranslat
 				}()
 
 				readData := make([]byte, 0, len(data))
-				buf := make([]byte, 2048)
+				buf := make([]byte, packetTranslationTestIoByteCount)
 
 				for len(readData) < len(data) {
 					select {
@@ -644,10 +648,10 @@ func ptEncodeDecodeTest(t *testing.T, ipVersion int, clientPtMode PacketTranslat
 			writeComplete := make(chan struct{})
 			go func() {
 				defer close(writeComplete)
-				stream.SetWriteDeadline(ioDeadline())
-				m, err := stream.Write(data)
+				writeStarted := time.Now()
+				m, err := writePacketTranslationTestData(stream, data, ioDeadline)
 				if err != nil {
-					reportErr(fmt.Errorf("client write: %w", err))
+					reportErr(fmt.Errorf("client write %d/%d after %s: %w", m, len(data), time.Since(writeStarted), err))
 					return
 				}
 				if m != len(data) {
@@ -660,7 +664,7 @@ func ptEncodeDecodeTest(t *testing.T, ipVersion int, clientPtMode PacketTranslat
 			}()
 
 			readData := make([]byte, 0, len(data))
-			buf := make([]byte, 2048)
+			buf := make([]byte, packetTranslationTestIoByteCount)
 
 			for len(readData) < len(data) {
 				select {
@@ -717,6 +721,34 @@ func ptEncodeDecodeTest(t *testing.T, ipVersion int, clientPtMode PacketTranslat
 		}
 	}
 
+}
+
+// Each bounded write gets the same inactivity budget as a read. A single
+// whole-payload deadline can expire while the paced carrier is still making
+// progress. The caller continues to clamp each deadline to the attempt limit.
+func writePacketTranslationTestData(
+	stream interface {
+		Write([]byte) (int, error)
+		SetWriteDeadline(time.Time) error
+	},
+	data []byte,
+	ioDeadline func() time.Time,
+) (n int, err error) {
+	for n < len(data) {
+		if err := stream.SetWriteDeadline(ioDeadline()); err != nil {
+			return n, err
+		}
+		block := data[n:min(n+packetTranslationTestIoByteCount, len(data))]
+		m, err := stream.Write(block)
+		n += m
+		if err != nil {
+			return n, err
+		}
+		if m != len(block) {
+			return n, io.ErrShortWrite
+		}
+	}
+	return n, nil
 }
 
 // A stream Write can return with unsent or unacknowledged frames. Both endpoints
