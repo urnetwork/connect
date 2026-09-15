@@ -1,11 +1,13 @@
 package connect
 
 import (
+	"cmp"
 	"context"
 	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"math"
+	"math/bits"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -752,6 +754,8 @@ func defaultInitialWindowByteCount() ByteCount {
 // the memory budget already is, so that turning the rule on is one change.
 var defaultWindowSizing atomic.Int32
 
+const defaultAckCompressTimeout = 10 * time.Millisecond
+
 func init() {
 	// The rule is the shipping default, because every ceiling this program
 	// raises sits above the transfer window. Under the constant policy that
@@ -1038,8 +1042,15 @@ func DefaultReceiveBufferSettingsWithBufferSize(bufferSize int) *ReceiveBufferSe
 		// the resend floors (RttMinResendInterval 300ms / cold 2s), so it does
 		// not affect resends; it does inflate measured rtt by up to 10ms,
 		// which the RttScale headroom absorbs.
-		AckCompressTimeout:  10 * time.Millisecond,
-		MinMessageByteCount: ByteCount(1),
+		AckCompressTimeout: defaultAckCompressTimeout,
+		// End one compression wait early when a hole becomes provable to the
+		// sender (this many later selective acks, its SelectiveAckGapThreshold)
+		// or when a head ack advances past selectively acked items (a hole
+		// filled). Written in sequence order, a partial batch can no longer
+		// "prove" the neighbours of one hole lost. The in-order ack rate is
+		// unchanged: a wake costs at most one extra write per interval.
+		AckGapWakeSelectiveCount: 3,
+		MinMessageByteCount:      ByteCount(1),
 		// ResendAbuseThreshold: 4,
 		// ResendAbuseMultiple:  0.5,
 		MaxPeerAuditDuration: 60 * time.Second,
@@ -4780,6 +4791,9 @@ func (self *Client) Flush() {
 }
 
 type SendBufferSettings struct {
+	// Isolates path-RTT-only sizing in deterministic performance controls.
+	ackCompressionResidenceOverrideForTest *time.Duration
+
 	CreateContractTimeout time.Duration
 	// CreateContractRetryInterval is the fast first retry interval.
 	CreateContractRetryInterval time.Duration
@@ -6195,7 +6209,7 @@ type SendSequence struct {
 	// did: a bare SendSequence built by a cell, driven through its pack
 	// channel with no send loop to publish anything, refused every retry. A
 	// gate that nothing has published must fail open.
-	resendCapacityUnavailable atomic.Bool
+	resendCapacityUnavailable resendCapacityGate
 	// Published by Run after each route-policy snapshot so concurrent Pack
 	// callers never read the goroutine-owned multi-route writer directly.
 	flowIsolation atomic.Bool
@@ -6263,6 +6277,9 @@ type SendSequence struct {
 	// smaller window and must not be allowed to drag the window back down
 	// (THROUGHPUTFIX §37.21).
 	receiveWindowSetAtNanos atomic.Int64
+	// Encodes the latest advertised microseconds plus one, so immediate
+	// acknowledgements and a legacy receiver remain distinct. Sequence scoped.
+	receiveAckCompressMicros atomic.Uint64
 	// whether any acknowledgement has arrived at all, which is what separates
 	// a sender that is still blind from one whose peer does not advertise
 	ackSeen atomic.Bool
@@ -6564,10 +6581,9 @@ func (self *SendSequence) ResendQueueSizeAndMessageTypes() (int, ByteCount, Id, 
 // loop reports that the resend queue could take it, or the caller's timeout
 // runs out. Returns the remaining timeout.
 //
-// Polled rather than signalled: the resend queue has no capacity notification,
-// the wait already costs a round trip when it happens at all, and the common
-// case is one atomic read. A stale true costs what the old behaviour cost — a
-// slot taken and a short wait inside the sequence — and never a lost pack.
+// A capacity publication wakes blocked producers immediately. The common
+// available case stays a single atomic read; a blocked producer subscribes
+// before reading again so an ACK cannot fall between its check and wait.
 func (self *SendSequence) awaitResendCapacity(
 	sendPack *SendPack,
 	timeout time.Duration,
@@ -6585,9 +6601,14 @@ func (self *SendSequence) awaitResendCapacity(
 		defer timer.Stop()
 		timeoutChannel = timer.C
 	}
-	poll := time.NewTicker(resendCapacityPollInterval)
-	defer poll.Stop()
 	for {
+		changed := self.resendCapacityUnavailable.Notify()
+		if !self.resendCapacityUnavailable.Load() {
+			if 0 < timeout {
+				timeout = max(time.Duration(0), timeout-time.Since(startTime))
+			}
+			return true, nil, timeout
+		}
 		select {
 		case <-sendPack.Ctx.Done():
 			return false, errors.New("Done."), timeout
@@ -6595,19 +6616,13 @@ func (self *SendSequence) awaitResendCapacity(
 			return false, errors.New("Done."), timeout
 		case <-timeoutChannel:
 			return false, nil, 0
-		case <-poll.C:
-			if !self.resendCapacityUnavailable.Load() {
-				if 0 < timeout {
-					timeout = max(time.Duration(0), timeout-time.Since(startTime))
-				}
-				return true, nil, timeout
-			}
+		case <-changed:
 		}
 	}
 }
 
-// How often a reliable pack rechecks for resend capacity while it waits
-// outside admission.
+// Compatibility cadence for external zero-timeout retry callers. The internal
+// reliable admission gate uses capacity notifications rather than this timer.
 const resendCapacityPollInterval = 2 * time.Millisecond
 
 func (self *SendSequence) acquirePackAdmission(
@@ -6886,8 +6901,10 @@ type receiveAckMessage struct {
 	// legacy peer, and zero is a receiver that is currently full. A receive
 	// hold is never near four gibibytes, so this is the narrow type and packs
 	// against the tail rather than adding a word of its own.
-	receiveWindowSet       bool
-	receiveWindowByteCount uint32
+	receiveWindowSet         bool
+	receiveWindowByteCount   uint32
+	ackCompressTimeoutMicros uint32
+	ackCompressTimeoutSet    bool
 	// Set when the receiver removed items from its hold after acknowledging
 	// them. A pointer rather than a slice so this struct stays comparable and
 	// so the common case, which is every acknowledgement that evicts nothing,
@@ -6935,6 +6952,10 @@ func receiveAckMessageFromProtocol(ack *protocol.Ack) (receiveAckMessage, error)
 	if ack.ReceiveWindowByteCount != nil {
 		receiveAck.receiveWindowByteCount = uint32(min(*ack.ReceiveWindowByteCount, math.MaxUint32))
 		receiveAck.receiveWindowSet = true
+	}
+	if ack.AckCompressTimeoutMicros != nil {
+		receiveAck.ackCompressTimeoutMicros = *ack.AckCompressTimeoutMicros
+		receiveAck.ackCompressTimeoutSet = true
 	}
 	if 0 < len(ack.EvictedSequenceNumbers) {
 		receiveAck.evictions = &ackEvictionNotice{
@@ -10116,11 +10137,9 @@ func (self *SendSequence) releaseUnreliableFlight(item *sendItem) {
 
 // deliveredBytesRingSize is how many delivery samples a sequence keeps.
 //
-// Sixty-four at the window rule's ten millisecond cadence is 640 ms of
-// history, which spans two round trips at the slowest delay the cell imposes
-// and many at the fastest. The rate the window rule reads must cover several
-// acknowledgement bursts or it projects the burst ratio rather than the path
-// (THROUGHPUTFIX §36.6), and a ring that holds less than a round trip cannot.
+// The cadence starts at ten milliseconds and grows to retain two effective
+// round trips at longer delays. A rate must cover several acknowledgement
+// bursts; projecting one burst's rate instead underfills or inflates a window.
 // The ring is allocated only for a sequence whose settings turn one of the
 // delivery-sized rules on, so an unconfigured client keeps none of it.
 const deliveredBytesRingSize = 64
@@ -10162,8 +10181,8 @@ func (self *SendSequence) observeDeliveredBytes(byteCount ByteCount, at time.Tim
 	if 0 < self.deliveredBytesCount {
 		newest := self.deliveredBytes[self.deliveredBytesHead]
 		if atNanos-newest.atNanos < interval {
-			// still inside the newest sample's interval: move its total up
-			self.deliveredBytes[self.deliveredBytesHead].total = self.deliveredByteTotal
+			// Keep the checkpoint's time and total paired. New bytes belong
+			// to the next checkpoint, not to the beginning of this interval.
 			return
 		}
 	}
@@ -10182,7 +10201,15 @@ func (self *SendSequence) observeDeliveredBytes(byteCount ByteCount, at time.Tim
 // a sum over a horizon and keeps the pacing-floor quarter it was built with.
 func (self *SendSequence) deliveredBytesSampleInterval() time.Duration {
 	if 0 < self.sendBufferSettings.DeliverySizedWindowScale {
-		return deliverySizedWindowSampleInterval
+		interval := deliverySizedWindowSampleInterval
+		if self.rttWindow != nil {
+			// Keep two acknowledgement cycles in the fixed ring even at
+			// long RTTs. Leave two slots for checkpoint quantization.
+			residence := self.rttWindow.Estimate().Min + self.ackCompressionResidence()
+			slots := time.Duration(max(1, len(self.deliveredBytes)-2))
+			interval = max(interval, (2*residence+slots-1)/slots)
+		}
+		return interval
 	}
 	return self.sendBufferSettings.RttMinResendInterval / 4
 }
@@ -10215,7 +10242,7 @@ func (self *SendSequence) deliveredRate(minSpan time.Duration) (ByteCount, time.
 		}
 	}
 	span := time.Duration(newest.atNanos - older.atNanos)
-	if span <= 0 {
+	if span <= 0 || span < minSpan {
 		return 0, 0, 0, false
 	}
 	return max(0, newest.total-older.total), span, older.atNanos, true
@@ -10231,6 +10258,9 @@ func (self *SendSequence) observeReceiveWindowAdvertisement(ack receiveAckMessag
 	// constant. Those are different facts and the window is different for
 	// each (THROUGHPUTFIX §37.21).
 	self.ackSeen.Store(true)
+	if ack.ackCompressTimeoutSet {
+		self.receiveAckCompressMicros.Store(uint64(ack.ackCompressTimeoutMicros) + 1)
+	}
 	if !ack.receiveWindowSet {
 		return
 	}
@@ -10239,6 +10269,18 @@ func (self *SendSequence) observeReceiveWindowAdvertisement(ack receiveAckMessag
 	}
 	self.receiveWindowByteCount.Store(uint64(ack.receiveWindowByteCount))
 	self.receiveWindowSet.Store(true)
+}
+
+// Receiver-owned delay is bounded independently of this sender's queue. Using
+// the raw mean RTT here would make a standing queue increase its own window.
+func (self *SendSequence) ackCompressionResidence() time.Duration {
+	if override := self.sendBufferSettings.ackCompressionResidenceOverrideForTest; override != nil {
+		return max(0, *override)
+	}
+	if encoded := self.receiveAckCompressMicros.Load(); encoded != 0 {
+		return time.Duration(encoded-1) * time.Microsecond
+	}
+	return defaultAckCompressTimeout
 }
 
 // Resends the items the receiver says it removed from its hold after
@@ -10330,8 +10372,9 @@ func (self *ReceiveSequence) takeEvictions() []uint64 {
 	if len(self.evictedSequenceNumbers) == 0 {
 		return nil
 	}
-	evicted := self.evictedSequenceNumbers
-	self.evictedSequenceNumbers = nil
+	count := min(len(self.evictedSequenceNumbers), evictionNoticeAckMaxCount)
+	evicted := self.evictedSequenceNumbers[:count:count]
+	self.evictedSequenceNumbers = self.evictedSequenceNumbers[count:]
 	return evicted
 }
 
@@ -10422,6 +10465,10 @@ type SendWindowEstimate struct {
 	DeliveredByteCount ByteCount
 	Interval           time.Duration
 	RoundTrip          time.Duration
+	// Minimum path RTT plus the peer's maximum compression delay. Both
+	// target and delivery use this residence; recovery timers keep raw RTT.
+	WindowRoundTrip    time.Duration
+	AckCompressTimeout time.Duration
 	SampleCount        int
 	// The bounds. Initial is a starting value the rule climbs away from and is
 	// never a bound. Floor is the guaranteed working minimum. Ceiling is the
@@ -10615,12 +10662,14 @@ func (self *SendSequence) sendWindowEstimate(now time.Time) SendWindowEstimate {
 	estimate.Window = max(ceiling, floor)
 
 	// The round trip it can see.
-	roundTrip := self.rttWindow.Estimate()
+	roundTrip := self.rttWindow.estimate(now)
 	if !roundTrip.Sampled() {
 		estimate.Reason = "no round trip samples"
 		return estimate
 	}
 	estimate.RoundTrip = roundTrip.Min
+	estimate.AckCompressTimeout = self.ackCompressionResidence()
+	estimate.WindowRoundTrip = roundTrip.Min + estimate.AckCompressTimeout
 	estimate.SampleCount = self.deliveredSampleCount()
 
 	// The target's own bandwidth-delay product, so a path faster than the
@@ -10629,7 +10678,7 @@ func (self *SendSequence) sendWindowEstimate(now time.Time) SendWindowEstimate {
 	if 0 < self.sendBufferSettings.TargetGoodputByteRate {
 		targetWindow := ByteCount(
 			float64(self.sendBufferSettings.TargetGoodputByteRate) *
-				roundTrip.Min.Seconds() / goodputFactor,
+				estimate.WindowRoundTrip.Seconds() / goodputFactor,
 		)
 		if bounded := max(targetWindow, floor); bounded < ceiling {
 			ceiling = bounded
@@ -10642,7 +10691,7 @@ func (self *SendSequence) sendWindowEstimate(now time.Time) SendWindowEstimate {
 	// the rate must span several acknowledgement bursts, and at least a couple
 	// of round trips where those are long
 	minSpan := max(
-		2*roundTrip.Min,
+		2*estimate.WindowRoundTrip,
 		4*self.deliveredBytesSampleInterval(),
 	)
 	delivered, span, spanStartNanos, ok := self.deliveredRate(minSpan)
@@ -10670,12 +10719,17 @@ func (self *SendSequence) sendWindowEstimate(now time.Time) SendWindowEstimate {
 		return estimate
 	}
 	estimate.Sized = true
-	perRoundTrip := ByteCount(int64(delivered) * roundTrip.Min.Nanoseconds() / span.Nanoseconds())
-	if capped := ByteCount(scale) * perRoundTrip; capped < estimate.Window {
-		estimate.Window = max(capped, floor)
-		estimate.Reason = "delivery"
-	} else {
-		estimate.Reason = estimate.bindingTerm(self)
+	// The optional peer delay can be minutes. Multiply at 128-bit precision
+	// before dividing, so a valid large residence cannot wrap a busy window.
+	hi, lo := bits.Mul64(uint64(delivered), uint64(estimate.WindowRoundTrip))
+	perRoundTrip, _ := bits.Div64(hi, lo, uint64(span)) // span >= 2 * residence
+	estimate.Reason = estimate.bindingTerm(self)
+	if perRoundTrip <= uint64(estimate.Window)/uint64(scale) {
+		capped := ByteCount(uint64(scale) * perRoundTrip)
+		if capped < estimate.Window {
+			estimate.Window = max(capped, floor)
+			estimate.Reason = "delivery"
+		}
 	}
 	return estimate
 }
@@ -11767,6 +11821,11 @@ type ReceiveBufferSettings struct {
 	// AckBufferSize int
 
 	AckCompressTimeout time.Duration
+	// Selective acks pending in one compression interval that end the wait
+	// early, and enable the early wake on a head ack that advances past
+	// selectively acked items. Should match the sender's
+	// SelectiveAckGapThreshold. Zero keeps the fixed compression interval.
+	AckGapWakeSelectiveCount int
 
 	MinMessageByteCount ByteCount
 
@@ -12432,12 +12491,19 @@ func (self *ReceiveBuffer) Flush() {
 	}
 }
 
-// The most eviction notices one acknowledgement will carry. An eviction
-// generation after a route death is bounded by what was in flight on the dead
-// route, so at a 16 MiB window and 4 KiB items it is a few thousand; anything
-// past this cap keeps the sixty second lease and is counted, because the one
-// thing this must not do is make the harm invisible again.
+// Pending eviction evidence is bounded separately from its wire chunks. A
+// uint64 sequence number can occupy ten bytes; 4096 notices cannot fit the
+// minimum 8 KiB carrier. Overflow beyond the pending bound remains counted.
 const evictionNoticeMaxCount = 4096
+const evictionNoticeAckMaxCount = 512
+
+// Each response contains at most 32 individually framed acknowledgements.
+// Reserve 320 bytes per entry for all fixed fields, legacy framing and the
+// encrypted outer frame, plus ten bytes per eviction on its first entry.
+// Tests exercise maximal varints and both codecs against this reservation.
+const ackResponseMaxCount = 32
+const ackResponseEntryMaxByteCount = 320
+const ackResponseMaxByteCount = 8 * 1024
 
 type ReceiveSequence struct {
 	ctx    context.Context
@@ -12713,7 +12779,7 @@ func newReceiveSequenceWithLogicalLaneBudget(
 		receiveQueue:                    newReceiveQueue(receiveQueueBudget, receiveQueueMinByteCount),
 		nextSequenceNumber:              0,
 		idleCondition:                   NewIdleCondition(),
-		ackWindow:                       newSequenceAckWindow(),
+		ackWindow:                       newSequenceAckWindowWithGapWake(receiveBufferSettings.AckGapWakeSelectiveCount),
 		exit:                            make(chan struct{}),
 	}
 	// Never encrypt control-plane traffic. A ReceiveSequence's data source is
@@ -13157,8 +13223,9 @@ func (self *ReceiveSequence) Run() {
 			)
 		}
 
-		writeAck := func(sendAck sequenceAck) {
+		writeAck := func(sendAck sequenceAck, evictedSequenceNumbers []uint64) {
 			path := sendTransferPath(self.client.ClientId(), ackDestination)
+			ackCompressMicros := uint32(min(max(0, self.receiveBufferSettings.AckCompressTimeout.Microseconds()), math.MaxUint32))
 
 			// what this receiver can still hold out of order, so the sender may
 			// clamp its window to it (THROUGHPUTFIX §37.3). A receiver that
@@ -13169,32 +13236,26 @@ func (self *ReceiveSequence) Run() {
 			if advertiseReceiveWindow {
 				receiveWindowByteCount = self.receiveWindowAdvertisement()
 			}
-			// Evictions ride the next acknowledgement whatever the
-			// advertisement setting: a receiver that withdraws bytes has to say
-			// so even to a peer that never told it anything
-			// (THROUGHPUTFIX §37.16).
-			evictedSequenceNumbers := []uint64(nil)
-			if self.receiveBufferSettings.EvictionNotice {
-				evictedSequenceNumbers = self.takeEvictions()
-			}
 
 			var transferFrameBytes []byte
 			if 2 <= self.receiveBufferSettings.ProtocolVersion {
 				// hand-rolled marshal of the hot Ack TransferFrame; wire-identical
 				// to the proto structs in the legacy branch (see frame_protobuf_test.go).
 				saf := sendAckFrame{
-					path:                    path,
-					messageId:               sendAck.messageId,
-					sequenceId:              self.sequenceId,
-					selective:               sendAck.selective,
-					tagSendTime:             sendAck.tag.sendTime,
-					tagSet:                  sendAck.tag.set,
-					compactContractRecovery: sendAck.compactContractRecoverySupported,
-					contractAhead:           self.receiveBufferSettings.AcceptContractAhead,
-					logicalLaneVersion:      transferLogicalLaneVersion,
-					receiveWindowByteCount:  receiveWindowByteCount,
-					receiveWindowSet:        advertiseReceiveWindow,
-					evictedSequenceNumbers:  evictedSequenceNumbers,
+					path:                     path,
+					messageId:                sendAck.messageId,
+					sequenceId:               self.sequenceId,
+					selective:                sendAck.selective,
+					tagSendTime:              sendAck.tag.sendTime,
+					tagSet:                   sendAck.tag.set,
+					compactContractRecovery:  sendAck.compactContractRecoverySupported,
+					contractAhead:            self.receiveBufferSettings.AcceptContractAhead,
+					logicalLaneVersion:       transferLogicalLaneVersion,
+					receiveWindowByteCount:   receiveWindowByteCount,
+					receiveWindowSet:         advertiseReceiveWindow,
+					ackCompressTimeoutMicros: ackCompressMicros,
+					ackCompressTimeoutSet:    true,
+					evictedSequenceNumbers:   evictedSequenceNumbers,
 				}
 				if sendAck.contractMissing {
 					saf.missingContractId = &sendAck.missingContractId
@@ -13202,13 +13263,14 @@ func (self *ReceiveSequence) Run() {
 				transferFrameBytes = marshalSendAckTransferFrame(&saf)
 			} else {
 				ack := &protocol.Ack{
-					MessageId:               sendAck.messageId.Bytes(),
-					SequenceId:              self.sequenceId.Bytes(),
-					Selective:               sendAck.selective,
-					Tag:                     sendAck.tag.protocol(),
-					CompactContractRecovery: sendAck.compactContractRecoverySupported,
-					ContractAhead:           self.receiveBufferSettings.AcceptContractAhead,
-					LogicalLaneVersion:      transferLogicalLaneVersion,
+					MessageId:                sendAck.messageId.Bytes(),
+					SequenceId:               self.sequenceId.Bytes(),
+					Selective:                sendAck.selective,
+					Tag:                      sendAck.tag.protocol(),
+					CompactContractRecovery:  sendAck.compactContractRecoverySupported,
+					ContractAhead:            self.receiveBufferSettings.AcceptContractAhead,
+					LogicalLaneVersion:       transferLogicalLaneVersion,
+					AckCompressTimeoutMicros: &ackCompressMicros,
 				}
 				if advertiseReceiveWindow {
 					ack.ReceiveWindowByteCount = &receiveWindowByteCount
@@ -13230,6 +13292,10 @@ func (self *ReceiveSequence) Run() {
 			}
 			defer MessagePoolReturn(transferFrameBytes)
 			writeFrame := func(frameBytes []byte) error {
+				if ackResponseEntryMaxByteCount+10*len(evictedSequenceNumbers) < len(frameBytes) {
+					self.cancel()
+					return fmt.Errorf("acknowledgement exceeds reserved response size: %d", len(frameBytes))
+				}
 				shared := MessagePoolShareReadOnly(frameBytes)
 				var writeErr error
 				blocked := false
@@ -13349,37 +13415,53 @@ func (self *ReceiveSequence) Run() {
 		// select arms it (go1.23+ delivers no stale fire after Reset).
 		ackCompressTimer := time.NewTimer(0)
 		defer ackCompressTimer.Stop()
-		writeSnapshot := func(ackSnapshot sequenceAckWindowSnapshot) bool {
-			wrote := false
-			if 0 < ackSnapshot.ackUpdateCount {
-				writeAck(ackSnapshot.headAck)
-				wrote = true
-			}
-			for messageId, ack := range ackSnapshot.selectiveAcks {
-				ack.messageId = messageId
-				ack.selective = true
-				writeAck(ack)
-				wrote = true
-			}
-			for messageId, ack := range ackSnapshot.contractMissingAcks {
-				ack.messageId = messageId
-				ack.contractMissing = true
-				writeAck(ack)
-				wrote = true
-			}
-			return wrote
-		}
+		var ackScratch [ackResponseMaxCount]sequenceAck
 		lastAckWriteTime := time.Time{}
-		writePending := func() {
-			if writeSnapshot(self.ackWindow.Snapshot(true)) {
+		var lastAck sequenceAck
+		hasLastAck := false
+		continueResponse := false
+		writePending := func() bool {
+			var evicted []uint64
+			if self.receiveBufferSettings.EvictionNotice && (hasLastAck || self.ackWindow.Pending()) {
+				evicted = self.takeEvictions()
+			}
+			countLimit := min(ackResponseMaxCount,
+				(ackResponseMaxByteCount-10*len(evicted))/ackResponseEntryMaxByteCount)
+			acks, overflow := self.ackWindow.takeResponse(ackScratch[:0], countLimit)
+			self.evictedMutex.Lock()
+			continueResponse = overflow || (self.receiveBufferSettings.EvictionNotice && len(self.evictedSequenceNumbers) != 0)
+			self.evictedMutex.Unlock()
+			if len(acks) == 0 && len(evicted) != 0 {
+				acks = append(acks, lastAck)
+			}
+			for i, ack := range acks {
+				if i == 0 {
+					writeAck(ack, evicted)
+				} else {
+					writeAck(ack, nil)
+				}
+				lastAck, hasLastAck = ack, true
+			}
+			if len(acks) != 0 {
 				lastAckWriteTime = time.Now()
 				if self.receiveBufferSettings.afterAckWriteForTest != nil {
 					self.receiveBufferSettings.afterAckWriteForTest(self.id())
 				}
+				return true
 			}
+			return false
+		}
+		pending := func() bool {
+			if self.ackWindow.Pending() {
+				return true
+			}
+			self.evictedMutex.Lock()
+			defer self.evictedMutex.Unlock()
+			return hasLastAck && self.receiveBufferSettings.EvictionNotice && len(self.evictedSequenceNumbers) != 0
 		}
 		drainAndStop := func() {
-			writePending()
+			for writePending() {
+			}
 		}
 		// ctxDone is disabled after its first edge. Cancellation may drain the
 		// ACKs already visible at that instant, but only ackWorkerStop may end
@@ -13401,7 +13483,7 @@ func (self *ReceiveSequence) Run() {
 			default:
 			}
 
-			if !self.ackWindow.Pending() {
+			if !pending() {
 				// wait for one ack
 				select {
 				case <-ctxDone:
@@ -13419,7 +13501,7 @@ func (self *ReceiveSequence) Run() {
 			// compression interval old. This removes a fixed 10 ms from sparse H1
 			// request/response turns without recreating one ACK per data Pack.
 			ackCompressWait := time.Duration(0)
-			if timeout := self.receiveBufferSettings.AckCompressTimeout; 0 < timeout && !lastAckWriteTime.IsZero() {
+			if timeout := self.receiveBufferSettings.AckCompressTimeout; 0 < timeout && !lastAckWriteTime.IsZero() && !continueResponse {
 				ackCompressWait = time.Until(lastAckWriteTime.Add(timeout))
 			}
 			if 0 < ackCompressWait {
@@ -13434,6 +13516,10 @@ func (self *ReceiveSequence) Run() {
 					drainAndStop()
 					return
 				case <-ackCompressTimer.C:
+				case <-self.ackWindow.GapNotify():
+					// a hole became provable or filled: the sender is waiting
+					// on exactly these acks, so do not hold them for the rest
+					// of the interval
 				}
 			}
 
@@ -14716,14 +14802,32 @@ type sequenceAckWindow struct {
 	// Recovery requests never acknowledge delivery and therefore remain
 	// separate from both cumulative and selective acknowledgement windows.
 	contractMissingAcks map[Id]sequenceAck
+	// A gap is proved once per cumulative head, independently of snapshots.
+	// Retain a bounded set of distinct evidence across compression intervals;
+	// repeating the same proof must not disable compression under sustained loss.
+	// Zero disables early wakes.
+	gapNotify             chan struct{}
+	gapWakeSelectiveCount int
+	gapWakeSignaled       bool
+	gapEvidence           []uint64
+	// highest selectively acked sequence number; a head below it has
+	// selective acks outstanding above it, whether or not they were already
+	// written, so the next head advance is a hole filling
+	gapSelectiveMax uint64
 }
 
 func newSequenceAckWindow() *sequenceAckWindow {
+	return newSequenceAckWindowWithGapWake(0)
+}
+
+func newSequenceAckWindowWithGapWake(gapWakeSelectiveCount int) *sequenceAckWindow {
 	return &sequenceAckWindow{
-		ackNotify:           make(chan struct{}, 1),
-		ackUpdateCount:      0,
-		selectiveAcks:       map[Id]sequenceAck{},
-		contractMissingAcks: map[Id]sequenceAck{},
+		ackNotify:             make(chan struct{}, 1),
+		ackUpdateCount:        0,
+		selectiveAcks:         map[Id]sequenceAck{},
+		contractMissingAcks:   map[Id]sequenceAck{},
+		gapNotify:             make(chan struct{}, 1),
+		gapWakeSelectiveCount: min(gapWakeSelectiveCount, ackResponseMaxCount),
 	}
 }
 
@@ -14733,10 +14837,27 @@ func (self *sequenceAckWindow) Notify() <-chan struct{} {
 	return self.ackNotify
 }
 
+// GapNotify is the early-wake edge for the consumer's compression wait. Like
+// Notify it never changes, so it is safe to fetch without a lock.
+func (self *sequenceAckWindow) GapNotify() <-chan struct{} {
+	return self.gapNotify
+}
+
+// signalGapWakeWithLock fires once per cumulative head.
+func (self *sequenceAckWindow) signalGapWakeWithLock() {
+	if self.gapWakeSignaled {
+		return
+	}
+	self.gapWakeSignaled = true
+	select {
+	case self.gapNotify <- struct{}{}:
+	default:
+	}
+}
+
 // Pending checks whether a worker can proceed without constructing a
-// snapshot. In particular, the ACK-compression worker uses this before its
-// wait so a large selective-ACK map is copied only once, when the worker
-// actually drains it after the compression interval.
+// snapshot. The ACK-compression worker uses this before its wait and extracts
+// only a bounded response when it actually drains the window.
 func (self *sequenceAckWindow) Pending() bool {
 	self.ackLock.Lock()
 	defer self.ackLock.Unlock()
@@ -14810,7 +14931,25 @@ func (self *sequenceAckWindow) Update(ack sequenceAck) {
 				}
 			}
 			self.selectiveAcks[ack.messageId] = ack
+			if self.gapSelectiveMax < ack.sequenceNumber {
+				self.gapSelectiveMax = ack.sequenceNumber
+			}
+			if 0 < self.gapWakeSelectiveCount && !self.gapWakeSignaled &&
+				!slices.Contains(self.gapEvidence, ack.sequenceNumber) {
+				self.gapEvidence = append(self.gapEvidence, ack.sequenceNumber)
+				if self.gapWakeSelectiveCount <= len(self.gapEvidence) {
+					self.signalGapWakeWithLock()
+				}
+			}
 		} else {
+			// a head advancing under outstanding selective acks is a hole
+			// filling; the sender's flight is head-blocked on this ack
+			self.gapWakeSignaled = false
+			self.gapEvidence = self.gapEvidence[:0]
+			if 0 < self.gapWakeSelectiveCount && self.gapSelectiveMax != 0 &&
+				(!self.hasHeadAck || self.headAck.sequenceNumber < self.gapSelectiveMax) {
+				self.signalGapWakeWithLock()
+			}
 			// cumulative head ack: or-in the prior head's plaintext bit
 			// (and any absorbed selective acks below the new head) so a
 			// single plaintext pack anywhere under the head keeps the
@@ -14913,16 +15052,78 @@ func (self *sequenceAckWindow) Snapshot(reset bool) sequenceAckWindowSnapshot {
 		self.ackUpdateCount = 0
 		clear(self.selectiveAcks)
 		clear(self.contractMissingAcks)
-		// The signal corresponds to state included in this snapshot. Drain it
-		// while ackLock excludes Update so the next empty snapshot cannot wake
-		// on a stale token.
+		// The signals correspond to state included in this snapshot. Drain
+		// them while ackLock excludes Update so the next empty snapshot cannot
+		// wake on a stale token. Gap evidence survives snapshots.
 		select {
 		case <-self.ackNotify:
+		default:
+		}
+		select {
+		case <-self.gapNotify:
 		default:
 		}
 	}
 
 	return snapshot
+}
+
+// takeResponse removes only the bounded response being sent. The caller owns
+// scratch; overflow stays pending and new cumulative progress can absorb it.
+// Selective entries are ordered even across responses, so a partial write
+// cannot manufacture multiple holes at the sender.
+func (self *sequenceAckWindow) takeResponse(scratch []sequenceAck, limit int) ([]sequenceAck, bool) {
+	self.ackLock.Lock()
+	defer self.ackLock.Unlock()
+	if limit <= 0 {
+		return scratch[:0], false
+	}
+	acks := scratch[:0]
+	if self.ackUpdateCount != 0 {
+		acks = append(acks, self.headAck)
+		self.ackUpdateCount = 0
+	}
+	headCount := len(acks)
+	for id, ack := range self.selectiveAcks {
+		if self.hasHeadAck && ack.sequenceNumber <= self.headAck.sequenceNumber {
+			delete(self.selectiveAcks, id)
+			continue
+		}
+		ack.messageId, ack.selective = id, true
+		index, _ := slices.BinarySearchFunc(acks[headCount:], ack, func(a, b sequenceAck) int {
+			return cmp.Compare(a.sequenceNumber, b.sequenceNumber)
+		})
+		index += headCount
+		if index < limit {
+			if len(acks) == limit {
+				acks = acks[:limit-1]
+			}
+			acks = slices.Insert(acks, index, ack)
+		}
+	}
+	for _, ack := range acks[headCount:] {
+		delete(self.selectiveAcks, ack.messageId)
+	}
+	for id, ack := range self.contractMissingAcks {
+		if len(acks) == limit {
+			break
+		}
+		ack.messageId, ack.contractMissing = id, true
+		acks = append(acks, ack)
+		delete(self.contractMissingAcks, id)
+	}
+	select {
+	case <-self.ackNotify:
+	default:
+	}
+	select {
+	case <-self.gapNotify:
+	default:
+	}
+	if len(self.selectiveAcks) != 0 || len(self.contractMissingAcks) != 0 {
+		self.ackNotify <- struct{}{}
+	}
+	return acks, len(self.selectiveAcks) != 0 || len(self.contractMissingAcks) != 0
 }
 
 type sequenceContract struct {
