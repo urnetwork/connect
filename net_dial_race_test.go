@@ -10,7 +10,9 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -316,92 +318,105 @@ func TestResolveDohDialAddrsQueriesBothRecordTypes(t *testing.T) {
 }
 
 // The ConnectSettings seam races a hostname's families end to end: with a
-// listener on only one family, the other family's address is refused and the
-// race still lands on the listener, for either family.
+// listener on one family, the other family's socket attempt is explicitly
+// refused. Another listener sharing its numeric port cannot change the race.
 func TestConnectSettingsDialContextRacesFamilies(t *testing.T) {
-	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
-		listener, err := net.Listen(testTcpNetwork(ipVersion), testLoopbackHostPort(ipVersion, 0))
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer listener.Close()
-		go func() {
-			for {
-				conn, err := listener.Accept()
-				if err != nil {
-					return
+	for _, ipVersion := range testIpVersions {
+		func() {
+			listener, err := net.Listen(testTcpNetwork(ipVersion), testLoopbackHostPort(ipVersion, 0))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			port := listener.Addr().(*net.TCPAddr).Port
+			resolver := newFamilyTestResolver(t, netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("::1"))
+
+			settings := DefaultConnectSettings()
+			settings.Resolver = resolver
+			settings.DialControl = func(network string, _ string, _ syscall.RawConn) error {
+				if network != testTcpNetwork(ipVersion) {
+					return errors.New("test family unavailable")
 				}
-				conn.Close()
+				return nil
+			}
+			var hooked []string
+			settings.DialNetworkHook = func(network string, addr string) {
+				hooked = append(hooked, network)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			conn, err := settings.DialContext(ctx, "tcp", net.JoinHostPort("dual.service.example", itoa(port)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			remote, _ := netip.ParseAddrPort(conn.RemoteAddr().String())
+			if (ipVersion == 4) != remote.Addr().Unmap().Is4() {
+				t.Fatalf("connected to %s, want the v%d listener", conn.RemoteAddr(), ipVersion)
+			}
+			if len(hooked) != 1 || hooked[0] != "tcp" {
+				t.Fatalf("hook saw %v, want exactly [tcp]: the seam narrows once, before the race", hooked)
 			}
 		}()
-		port := listener.Addr().(*net.TCPAddr).Port
-		// the other family resolves to loopback too, where nothing listens on
-		// this port: a definitive refusal, not a hang
-		resolver := newFamilyTestResolver(t, netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("::1"))
-
-		settings := DefaultConnectSettings()
-		settings.Resolver = resolver
-		var hooked []string
-		settings.DialNetworkHook = func(network string, addr string) {
-			hooked = append(hooked, network)
-		}
-		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-		defer cancel()
-		conn, err := settings.DialContext(ctx, "tcp", net.JoinHostPort("dual.service.test", itoa(port)))
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer conn.Close()
-		remote, _ := netip.ParseAddrPort(conn.RemoteAddr().String())
-		if (ipVersion == 4) != remote.Addr().Unmap().Is4() {
-			t.Fatalf("connected to %s, want the v%d listener", conn.RemoteAddr(), ipVersion)
-		}
-		if len(hooked) != 1 || hooked[0] != "tcp" {
-			t.Fatalf("hook saw %v, want exactly [tcp]: the seam narrows once, before the race", hooked)
-		}
-	})
+	}
 }
 
-// A forced family narrows both the resolution and the dial: under Force6 the
-// v4 listener is never a candidate even though the name has an A record.
+// A forced family narrows the hostname dial before resolution and every socket
+// attempt stays in that family. Success identifies the actual remote endpoint;
+// the same numeric port may independently be occupied in the other family.
 func TestConnectSettingsDialContextResolvesOnlyTheForcedFamily(t *testing.T) {
-	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
-		listener, err := net.Listen(testTcpNetwork(ipVersion), testLoopbackHostPort(ipVersion, 0))
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer listener.Close()
-		go func() {
-			for {
-				conn, err := listener.Accept()
-				if err != nil {
-					return
-				}
-				conn.Close()
+	defer SetControlIpFamilyPolicy(IpFamilyAuto)
+	for _, ipVersion := range testIpVersions {
+		func() {
+			listener, err := net.Listen(testTcpNetwork(ipVersion), testLoopbackHostPort(ipVersion, 0))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			port := listener.Addr().(*net.TCPAddr).Port
+			resolver := newFamilyTestResolver(t, netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("::1"))
+
+			if ipVersion == 4 {
+				SetControlIpFamilyPolicy(IpFamilyForce4)
+			} else {
+				SetControlIpFamilyPolicy(IpFamilyForce6)
+			}
+
+			settings := DefaultConnectSettings()
+			settings.Resolver = resolver
+			settings.ConnectTimeout = 2 * time.Second
+			wantNetwork := testTcpNetwork(ipVersion)
+			var hookedNetwork string
+			settings.DialNetworkHook = func(network string, _ string) { hookedNetwork = network }
+			var stateLock sync.Mutex
+			var attemptedNetworks []string
+			settings.DialControl = func(network string, _ string, _ syscall.RawConn) error {
+				stateLock.Lock()
+				defer stateLock.Unlock()
+				attemptedNetworks = append(attemptedNetworks, network)
+				return nil
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			conn, err := settings.DialContext(ctx, "tcp", net.JoinHostPort("dual.service.example", itoa(port)))
+			if err != nil {
+				t.Fatalf("forced v%d dial: %v", ipVersion, err)
+			}
+			defer conn.Close()
+			remote, err := netip.ParseAddrPort(conn.RemoteAddr().String())
+			if err != nil || remote.Addr().Unmap().String() != testLoopbackIp(ipVersion) || int(remote.Port()) != port {
+				t.Fatalf("forced v%d connected to %s, want %s", ipVersion, conn.RemoteAddr(), listener.Addr())
+			}
+			if hookedNetwork != wantNetwork {
+				t.Errorf("forced v%d resolved using %q, want %q", ipVersion, hookedNetwork, wantNetwork)
+			}
+			stateLock.Lock()
+			defer stateLock.Unlock()
+			if len(attemptedNetworks) != 1 || attemptedNetworks[0] != wantNetwork {
+				t.Errorf("forced v%d socket attempts = %v, want only [%s]", ipVersion, attemptedNetworks, wantNetwork)
 			}
 		}()
-		port := listener.Addr().(*net.TCPAddr).Port
-		resolver := newFamilyTestResolver(t, netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("::1"))
-
-		// force the OTHER family: the listening family must never be dialed
-		if ipVersion == 4 {
-			SetControlIpFamilyPolicy(IpFamilyForce6)
-		} else {
-			SetControlIpFamilyPolicy(IpFamilyForce4)
-		}
-		defer SetControlIpFamilyPolicy(IpFamilyAuto)
-
-		settings := DefaultConnectSettings()
-		settings.Resolver = resolver
-		settings.ConnectTimeout = 2 * time.Second
-		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-		defer cancel()
-		conn, err := settings.DialContext(ctx, "tcp", net.JoinHostPort("dual.service.test", itoa(port)))
-		if err == nil {
-			conn.Close()
-			t.Fatalf("v%d listener was reached under a policy that forces the other family", ipVersion)
-		}
-	})
+	}
 }
 
 func itoa(n int) string {

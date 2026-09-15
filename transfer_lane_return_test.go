@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"context"
 	"net"
 	"sync"
 	"testing"
@@ -9,18 +10,10 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
-// THROUGHPUTFIX §30.2, the row that decides whether lanes can work at all on
-// the direction they exist for. A provider's return carries the client's whole
-// transfer key with only the companion contract bit changed, and the return
-// send passes that key as a send option, which makes the lane explicit. Lane
-// selection gives an explicit key precedence over the hashed count, so if the
-// reading is right a client at lane zero pins every return to lane zero
-// whatever the provider's own count is.
-//
-// Three outcomes are distinguished rather than one asserted, because which one
-// holds decides whether a lane rollout needs a reply-key change beside the
-// lock fix and the floor. The gate's own view is read directly, so the row
-// says which gate binds rather than inferring it.
+// Provider returns preserve the peer's session class while choosing their own
+// data lane from the flow key and advertised capability. Observe only this
+// peer, retain the base of its written lane-zero generation, and force unrelated
+// gate decisions before advertising so background traffic cannot choose it.
 func TestProviderReturnsRideTheClientsLane(t *testing.T) {
 	assertMessagePoolOwnership(t)
 
@@ -29,9 +22,10 @@ func TestProviderReturnsRideTheClientsLane(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { listener.Close() })
 	accepted := make(chan net.Conn, 8)
+	acceptDone := make(chan struct{})
 	go func() {
+		defer close(acceptDone)
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
@@ -43,6 +37,8 @@ func TestProviderReturnsRideTheClientsLane(t *testing.T) {
 		}
 	}()
 	t.Cleanup(func() {
+		listener.Close()
+		<-acceptDone
 		for {
 			select {
 			case conn := <-accepted:
@@ -64,27 +60,42 @@ func TestProviderReturnsRideTheClientsLane(t *testing.T) {
 		versionRecorded bool
 	}
 	observeLane := func(clientLane uint32, advertised bool) laneGateReading {
+		peerId := NewId()
+		initialWrites := make(chan sendSequenceId, 16)
 		// the provider's own count, which is the setting a rollout turns on,
 		// set before the client starts because the send loop reads its
 		// settings from its own goroutine
-		provider, _, client := newProviderSourceLifecycleTestFixtureWithClientSettings(
+		provider, localUserNat, client := newProviderSourceLifecycleTestFixtureWithClientSettings(
 			t,
 			NewNoContractClientOob(),
 			func(settings *ClientSettings) {
 				settings.SendBufferSettings.LogicalDataLaneCount = 8
 				settings.SendBufferSettings.LaneFloorByteCount = ByteCount(256 * 1024)
+				settings.SendBufferSettings.afterInitialWriteQueuedForTest = func(id sendSequenceId, _ uint64) {
+					if id.Destination == peerId {
+						select {
+						case initialWrites <- id:
+						default:
+						}
+					}
+				}
 			},
 			nil,
 		)
 
-		var observationLock sync.Mutex
+		var stateLock sync.Mutex
+		observationMonitor := NewMonitor()
 		observations := []logicalLaneGateObservation{}
 		client.sendBuffer.logicalLaneGateObserverForTest.Store(
 			&logicalLaneGateObserver{
 				observe: func(observation logicalLaneGateObservation) {
-					observationLock.Lock()
-					defer observationLock.Unlock()
+					if observation.destination != peerId {
+						return
+					}
+					stateLock.Lock()
+					defer stateLock.Unlock()
 					observations = append(observations, observation)
+					observationMonitor.NotifyAll()
 				},
 			},
 		)
@@ -92,8 +103,9 @@ func TestProviderReturnsRideTheClientsLane(t *testing.T) {
 			client.sendBuffer.logicalLaneGateObserverForTest.Store(nil)
 		})
 
-		peerId := NewId()
 		route := make(chan []byte, 256)
+		// Same-peer control traffic can precede the first keyed return too.
+		client.sendBuffer.selectLogicalLane(&SendPack{Destination: peerId})
 		client.ContractManager().AddNoContractPeer(peerId)
 		client.RouteManager().UpdateTransport(
 			NewSendClientTransport(DestinationId(peerId)),
@@ -113,6 +125,18 @@ func TestProviderReturnsRideTheClientsLane(t *testing.T) {
 			}
 		}()
 		t.Cleanup(func() {
+			// The route's consumer outlives every producer; joining the owners
+			// replaces the old sleep before the pool reconciliation.
+			// The shared fixture's later cleanup repeats these idempotent joins.
+			provider.Close()
+			closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer closeCancel()
+			if err := localUserNat.CloseAndWait(closeCtx); err != nil {
+				t.Errorf("close return-path nat: %v", err)
+			}
+			if err := client.CloseAndWait(closeCtx); err != nil {
+				t.Errorf("close return-path client: %v", err)
+			}
 			close(drained)
 			<-drainDone
 			for {
@@ -132,7 +156,7 @@ func TestProviderReturnsRideTheClientsLane(t *testing.T) {
 		}
 		syn := MessagePoolCopy(craftSecurityPacket(
 			IpProtocolTcp,
-			net.ParseIP("10.11.12.13"),
+			net.ParseIP("192.0.2.13"),
 			54321,
 			net.ParseIP("127.0.0.1"),
 			originPort,
@@ -154,53 +178,76 @@ func TestProviderReturnsRideTheClientsLane(t *testing.T) {
 				syn,
 			)
 		})
-		// The origin's data comes back through the NAT and out as returns. Wait
-		// for the gate to have decided at least once rather than for a fixed
-		// second: the advertised arm reads the base class out of that first
-		// decision, and with no decision it would record the advertisement
-		// against the zero base and the second flow would meet an
-		// unadvertised destination. That was a one-in-ten flake.
-		waitForObservations := func(atLeast int) int {
-			deadline := time.Now().Add(10 * time.Second)
+		// Subscribe and inspect together. A keyed return for the written base,
+		// and after advertisement the hashed gate, must satisfy the wait.
+		waitForObservation := func(base sendSequenceId, bindingGate string) logicalLaneGateObservation {
+			timeout := time.After(10 * time.Second)
 			for {
-				observationLock.Lock()
-				count := len(observations)
-				observationLock.Unlock()
-				if atLeast <= count || !time.Now().Before(deadline) {
-					return count
+				update, observation, found := func() (<-chan struct{}, logicalLaneGateObservation, bool) {
+					stateLock.Lock()
+					defer stateLock.Unlock()
+					update := observationMonitor.NotifyChannel()
+					for _, observation := range observations {
+						if observation.schedulingValid && observation.base == base &&
+							(bindingGate == "" || observation.bindingGate == bindingGate) {
+							return update, observation, true
+						}
+					}
+					return update, logicalLaneGateObservation{}, false
+				}()
+				if found {
+					return observation
 				}
-				time.Sleep(20 * time.Millisecond)
+				select {
+				case <-update:
+				case <-timeout:
+					t.Fatalf("the provider's returns never reached gate %q for peer %s", bindingGate, peerId)
+				}
 			}
 		}
-		if count := waitForObservations(1); count == 0 {
-			t.Fatalf("the provider's returns never reached the lane gate, so this cell has nothing to read")
+		waitForWrite := func(dataLane bool) sendSequenceId {
+			timeout := time.After(10 * time.Second)
+			for {
+				select {
+				case id := <-initialWrites:
+					if !dataLane || id.LogicalLane != 0 {
+						return id
+					}
+				case <-timeout:
+					t.Fatalf("the provider did not write a return to peer %s (data lane=%t)", peerId, dataLane)
+				}
+			}
 		}
-		// and then let the flow settle, so nothing is still in flight when the
-		// pool ownership check runs
-		time.Sleep(time.Second)
+		base := waitForWrite(false).logicalLaneBase()
+		waitForObservation(base, "")
 
 		if advertised {
+			// Force unrelated control and data decisions after the return. The
+			// shared observer used to let the last one choose the advertised base.
+			client.sendBuffer.selectLogicalLane(&SendPack{Destination: NewId()})
+			client.sendBuffer.selectLogicalLane(&SendPack{
+				Destination: NewId(), schedulingKey: ipSendSchedulingKey(ipPath),
+			})
 			// The destination's lane-zero class advertised support. In the
-			// field this is recorded from an acknowledgement that matched an
-			// outstanding item; here it is set directly for the exact base the
-			// gate reported consulting, so the row isolates the gate under
-			// test rather than the negotiation in front of it, and a second
-			// flow then meets an advertised destination.
-			observationLock.Lock()
-			base := sendSequenceId{}
-			if 0 < len(observations) {
-				base = observations[len(observations)-1].base
-			}
+			// field this comes from a matching acknowledgement. Set it on the
+			// written generation here to isolate the return gate; the capability
+			// tests cover the negotiation that supplies it.
+			stateLock.Lock()
 			observations = nil
-			observationLock.Unlock()
+			observationMonitor.NotifyAll()
+			stateLock.Unlock()
 			client.sendBuffer.mutex.Lock()
+			if client.sendBuffer.sendSequences[base] == nil {
+				client.sendBuffer.mutex.Unlock()
+				t.Fatalf("the written lane-zero generation is no longer live: %+v", base)
+			}
 			client.sendBuffer.logicalLaneVersions[base] = transferLogicalLaneVersion
 			client.sendBuffer.publishLogicalLaneVersionsWithLock()
 			client.sendBuffer.mutex.Unlock()
 
 			secondSyn := MessagePoolCopy(craftSecurityPacket(
 				IpProtocolTcp,
-				net.ParseIP("10.11.12.13"),
+				net.ParseIP("192.0.2.13"),
 				54322,
 				net.ParseIP("127.0.0.1"),
 				originPort,
@@ -222,10 +269,12 @@ func TestProviderReturnsRideTheClientsLane(t *testing.T) {
 					secondSyn,
 				)
 			})
-			if count := waitForObservations(1); count == 0 {
-				t.Fatalf("the second flow's returns never reached the lane gate")
+			hashedObservation := waitForObservation(base, "hashed")
+			writtenId := waitForWrite(true)
+			if hashedObservation.base != base || writtenId.logicalLaneBase() != base {
+				t.Fatalf("the advertised return changed sequence class: observed %+v, written %+v, want %+v",
+					hashedObservation, writtenId, base)
 			}
-			time.Sleep(time.Second)
 		}
 
 		lanes := map[uint32]int{}
@@ -238,24 +287,15 @@ func TestProviderReturnsRideTheClientsLane(t *testing.T) {
 				}
 			}
 		}()
-		base := sendSequenceId{
-			Destination:    peerId,
-			EncryptionRole: sequenceTlsRoleServer,
-		}
 		recordedVersion, versionRecorded := func() (uint32, bool) {
 			client.sendBuffer.mutex.Lock()
 			defer client.sendBuffer.mutex.Unlock()
-			for id, version := range client.sendBuffer.logicalLaneVersions {
-				if id.Destination == peerId {
-					return version, true
-				}
-			}
-			_ = base
-			return 0, false
+			version, recorded := client.sendBuffer.logicalLaneVersions[base]
+			return version, recorded
 		}()
 
-		observationLock.Lock()
-		defer observationLock.Unlock()
+		stateLock.Lock()
+		defer stateLock.Unlock()
 		return laneGateReading{
 			lanes:           lanes,
 			observations:    append([]logicalLaneGateObservation{}, observations...),
@@ -304,13 +344,9 @@ func TestProviderReturnsRideTheClientsLane(t *testing.T) {
 		break
 	}
 
-	// The finding, asserted as the property a reply-key change would create.
-	// Not "the return did not ride lane 3": the provider's own hash could
-	// legitimately land there. What must change is which gate decides. Today
-	// the client's explicit reply key short-circuits before the provider's
-	// count, its advertised version and its scheduling key are consulted at
-	// all, so the provider's setting is inert on the download path whatever
-	// its value.
+	// The provider's own gate must decide. Its hash may legitimately choose
+	// the client's incoming lane, so inspect the decision instead of rejecting
+	// a matching lane number. An explicit reply key would bypass this gate.
 	explicitReturnCount := 0
 	for _, observation := range append(zeroObservations, dataObservations...) {
 		if observation.bindingGate == "explicit reply key" {

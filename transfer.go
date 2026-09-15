@@ -5346,6 +5346,7 @@ func (self *SendBuffer) selectLogicalLane(sendPack *SendPack) uint32 {
 	observe := func(gate string, version uint32, lane uint32) uint32 {
 		if observer := self.logicalLaneGateObserverForTest.Load(); observer != nil {
 			observer.observe(logicalLaneGateObservation{
+				destination:     sendPack.Destination,
 				base:            observedBase,
 				explicit:        sendPack.logicalLaneExplicit,
 				explicitLane:    sendPack.logicalLane,
@@ -5409,6 +5410,8 @@ func (self *SendBuffer) selectLogicalLane(sendPack *SendPack) uint32 {
 // What the lane gate saw and which of its gates decided, for the rows that ask
 // whether a provider's returns can ride a data lane at all. Test only.
 type logicalLaneGateObservation struct {
+	// Identifies the send even when an early gate does not consult a base.
+	destination Id
 	// the lane-zero class whose advertised version the gate consults
 	base            sendSequenceId
 	explicit        bool

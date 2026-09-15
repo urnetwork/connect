@@ -11,8 +11,12 @@ package connect
 // oldest outstanding item and holds the rest behind it.
 
 import (
+	"context"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"github.com/urnetwork/connect/protocol"
 )
 
 // laneScoreboard is a scoreboard whose items carry two distinct routes: a
@@ -158,92 +162,130 @@ func TestLaneProvenRecoveryIsOffByDefault(t *testing.T) {
 	}
 }
 
-// End to end on the stall the campaign's gap export measures: a relay with
-// a 200 ms lane that holds everything for 2.75 s mid-transfer. Reading the
-// lane replaces a firing per item with one probe per backoff interval.
-func TestLaneProbeReplacesTheWholeWindowOnASilentLane(t *testing.T) {
-	if testing.Short() {
-		t.Skip("relay stall")
-	}
-	measure := func(laneRule bool) ClientSendRecoveryStatsSnapshot {
-		harness := newMixedLaneHarnessWithOptions(t, mixedLaneOptions{
-			slowLatency:                200 * time.Millisecond,
-			slowSerialization:          time.Millisecond,
-			slowQueueFrames:            1024,
-			directLaneDisabled:         true,
-			deferTimeoutResend:         true,
-			slowStallAfter:             1500 * time.Millisecond,
-			slowStallFor:               2750 * time.Millisecond,
-			reliableLaneProvenRecovery: laneRule,
+// A fixed outstanding window on a silent reliable lane. The real sender and
+// ack pump run against a virtual clock; taking each initial Pack before sending
+// the next prevents batching from changing the number of outstanding positions.
+// The peer acknowledges the retained window only after the stall ends.
+func measureSilentLaneWindow(t *testing.T, windowSize int, laneRule bool) ClientSendRecoveryStatsSnapshot {
+	t.Helper()
+	var stats ClientSendRecoveryStatsSnapshot
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		settings := DefaultClientSettings()
+		settings.Log = NewNoopLogger()
+		settings.EncryptionSettings.Mode = EncryptionModeOff
+		settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
+		settings.SendBufferSettings.MinResendInterval = 750 * time.Millisecond
+		settings.SendBufferSettings.RttMinResendInterval = 750 * time.Millisecond
+		settings.SendBufferSettings.DeferTimeoutResendWhileCumulativeProgress = true
+		settings.SendBufferSettings.ReliableLaneProvenRecovery = laneRule
+		// This row owns its window size; admission throughput must not choose it.
+		settings.SendBufferSettings.ReliableAdmissionBoundedByDelivery = false
+		client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+		peerId := NewId()
+		client.ContractManager().AddNoContractPeer(peerId)
+		outbound := make(Route, 4*windowSize)
+		inbound := make(Route, 4)
+		client.RouteManager().UpdateTransport(
+			NewSendGatewayTransportWithType(TransportTypeH1), []Route{outbound})
+		client.RouteManager().UpdateTransport(
+			NewReceiveGatewayTransportWithType(TransportTypeH1), []Route{inbound})
+		t.Cleanup(func() {
+			cancel()
+			if err := client.CloseAndWait(context.Background()); err != nil {
+				t.Errorf("close silent-lane sender: %v", err)
+			}
+			for _, route := range []Route{outbound, inbound} {
+				for len(route) != 0 {
+					MessagePoolReturn(<-route)
+				}
+			}
 		})
-		return harness.run(t, 3000)
-	}
-	perItem := measure(false)
-	perLane := measure(true)
-	t.Logf("per item: rto=%d deferred=%d", perItem.TimeoutResendWriteCount, perItem.TimeoutResendDeferCount)
-	t.Logf("per lane: rto=%d deferred=%d probes=%d held=%d",
-		perLane.TimeoutResendWriteCount, perLane.TimeoutResendDeferCount,
-		perLane.LaneProbeWriteCount, perLane.LaneProbeRideCount)
 
-	if perItem.TimeoutResendWriteCount < 100 {
-		t.Fatalf("only %d whole-window writes through the stall: this no longer reproduces the "+
-			"excursion the gap export measures", perItem.TimeoutResendWriteCount)
-	}
-	// §27.2's falsification bar: more than ten writes during the stall
-	if 10 < perLane.TimeoutResendWriteCount {
-		t.Fatalf("reading the lane still wrote %d whole-window retransmits through the stall, "+
-			"want at most ten", perLane.TimeoutResendWriteCount)
-	}
-	if perLane.LaneProbeWriteCount == 0 {
-		t.Fatal("no probe was written, so the head was never retransmitted")
-	}
-	// Every write is the route head's probe, save one: a route that has never
-	// acknowledged anything has no lane evidence to read, so its first firing
-	// goes to §13.5 and is written exactly as merged writes it. What the rule
-	// removes is the second firing, so the allowance is one write and not a
-	// proportion.
-	if perLane.LaneProbeWriteCount+1 < perLane.TimeoutResendWriteCount {
-		t.Fatalf(
-			"%d whole-window writes against %d probes: beyond the one firing that precedes the "+
-				"route's first acknowledgement, the difference is a second firing written into a "+
-				"lane that is not draining, which §27.2 forbids",
-			perLane.TimeoutResendWriteCount, perLane.LaneProbeWriteCount,
-		)
-	}
-	if perLane.LaneProvenTimeoutWriteCount != 0 {
-		t.Fatalf("%d writes were charged to an endpoint drop during a stall that drops nothing",
-			perLane.LaneProvenTimeoutWriteCount)
-	}
-	// Deferrals are re-arms, not the metric; the writes above are. §27.2
-	// expected no item deferred twice inside the stall, which held under
-	// §27.3 because its draining window was one scaled round trip and a
-	// backed-off re-arm landed past it. §32.4 collapsed that window into the
-	// cold floor, so an item held through the stall's first two seconds is
-	// re-armed more than once by design: nothing on the round-trip scale
-	// reads whether the lane is silent. What the backoff still guarantees
-	// is that those re-arms are logarithmic, at most one per doubling of the
-	// item's interval inside the floor, never one per interval and never one
-	// per pass of the loop. The per-item arm defers each item it holds at
-	// onset exactly once before writing it, so its count is the items
-	// outstanding at onset, and the per-lane count must stay within the
-	// backoff's factor of that.
-	settings := DefaultSendBufferSettings()
-	reArmsPerItem := uint64(1)
-	for interval := settings.RttMinResendInterval; interval < settings.MinResendInterval; interval *= 2 {
-		reArmsPerItem += 1
-	}
-	if reArmsPerItem*perItem.TimeoutResendDeferCount+10 < perLane.TimeoutResendDeferCount {
-		t.Fatalf(
-			"reading the lane deferred %d times against %d per item: more than %d re-arms per "+
-				"item inside the cold floor, so the re-arm is not backing off",
-			perLane.TimeoutResendDeferCount, perItem.TimeoutResendDeferCount, reArmsPerItem,
-		)
-	}
-	// the hold must not spin: one hold per item per probe interval, not per
-	// pass of the resend loop
-	if 100*perLane.LaneProbeWriteCount < perLane.LaneProbeRideCount/100 {
-		t.Fatalf("%d holds against %d probes: the hold is re-arming into the past and spinning",
-			perLane.LaneProbeRideCount, perLane.LaneProbeWriteCount)
+		// Acknowledgement of position one gives every later position one free
+		// deferral. Virtual time fixes the round trip independently of host load.
+		for index := range 2 {
+			sendTransferFlightTestMessage(t, client, peerId, index)
+			pack := takeTransferFlightTestPack(t, outbound)
+			time.Sleep(200 * time.Millisecond)
+			acknowledgeTransferFlightTestPack(t, client, peerId, inbound, pack)
+			synctest.Wait()
+		}
+		var lastPack *protocol.Pack
+		var headSequenceNumber uint64
+		for index := range windowSize {
+			sendTransferFlightTestMessage(t, client, peerId, index+2)
+			lastPack = takeTransferFlightTestPack(t, outbound)
+			if index == 0 {
+				headSequenceNumber = lastPack.SequenceNumber
+			} else if lastPack.SequenceNumber != headSequenceNumber+uint64(index) {
+				t.Fatalf("initial window position %d has sequence number %d", index, lastPack.SequenceNumber)
+			}
+			synctest.Wait()
+		}
+		// At a 750 ms floor, the per-item arm writes at 1.5 s after its
+		// free deferral; the lane arm writes at 2.25 s after its doubled
+		// deferral. Neither second write is due before the 2.75 s stall ends.
+		time.Sleep(2750 * time.Millisecond)
+		synctest.Wait()
+		stats = client.SendRecoveryStats()
+
+		// Count actual writes as well as counters, after the sender is blocked.
+		writeCount := uint64(0)
+		writtenSequenceNumbers := map[uint64]bool{}
+		for len(outbound) != 0 {
+			pack := takeTransferFlightTestPack(t, outbound)
+			writtenSequenceNumbers[pack.SequenceNumber] = true
+			writeCount += 1
+			if laneRule && pack.SequenceNumber != headSequenceNumber {
+				t.Errorf("silent lane rewrote position %d behind head %d", pack.SequenceNumber, headSequenceNumber)
+			}
+		}
+		if writeCount != stats.TimeoutResendWriteCount {
+			t.Errorf("route carried %d rewrites, counter recorded %d", writeCount, stats.TimeoutResendWriteCount)
+		}
+		if !laneRule && len(writtenSequenceNumbers) != windowSize {
+			t.Errorf("per-item recovery rewrote %d of %d retained positions", len(writtenSequenceNumbers), windowSize)
+		}
+		acknowledgeTransferFlightTestPack(t, client, peerId, inbound, lastPack)
+		synctest.Wait()
+		client.sendBuffer.mutex.Lock()
+		for id, sequence := range client.sendBuffer.sendSequences {
+			if id.Destination == peerId && sequence.resendQueue.Len() != 0 {
+				t.Errorf("the resumed peer left %d outstanding positions", sequence.resendQueue.Len())
+			}
+		}
+		client.sendBuffer.mutex.Unlock()
+	})
+	return stats
+}
+
+// Reading a silent lane replaces a whole-window rewrite with its head's probe,
+// regardless of how many positions the sender admitted before the stall. The
+// old live-link row assumed at least 100; a valid 97-position window failed it.
+func TestLaneProbeReplacesTheWholeWindowOnASilentLane(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	for _, windowSize := range []int{97, 128} {
+		perItem := measureSilentLaneWindow(t, windowSize, false)
+		perLane := measureSilentLaneWindow(t, windowSize, true)
+		t.Logf("window=%d: per-item writes=%d; per-lane writes=%d probes=%d deferred=%d held=%d",
+			windowSize, perItem.TimeoutResendWriteCount, perLane.TimeoutResendWriteCount,
+			perLane.LaneProbeWriteCount, perLane.TimeoutResendDeferCount, perLane.LaneProbeRideCount)
+		if perItem.TimeoutResendWriteCount != uint64(windowSize) {
+			t.Errorf("per-item recovery wrote %d times, want one per retained position (%d)",
+				perItem.TimeoutResendWriteCount, windowSize)
+		}
+		if perLane.TimeoutResendWriteCount != 1 || perLane.LaneProbeWriteCount != 1 {
+			t.Errorf("silent lane wrote %d retransmits and %d probes, want exactly one head probe",
+				perLane.TimeoutResendWriteCount, perLane.LaneProbeWriteCount)
+		}
+		if perLane.LaneProvenTimeoutWriteCount != 0 ||
+			perLane.TimeoutResendDeferCount != uint64(windowSize) ||
+			perLane.LaneProbeRideCount != uint64(windowSize-1) {
+			t.Errorf("window %d: endpoint writes=%d deferrals=%d holds=%d, want 0/%d/%d",
+				windowSize, perLane.LaneProvenTimeoutWriteCount,
+				perLane.TimeoutResendDeferCount, perLane.LaneProbeRideCount, windowSize, windowSize-1)
+		}
 	}
 }
 

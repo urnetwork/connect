@@ -44,6 +44,7 @@ func TestTheSingleDestinationClientKeysItsIpTrafficPerFlow(t *testing.T) {
 
 	settings := DefaultClientSettings()
 	settings.SendBufferSettings.LogicalDataLaneCount = 8
+	route := make(chan []byte, 256)
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 	t.Cleanup(func() {
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -51,16 +52,35 @@ func TestTheSingleDestinationClientKeysItsIpTrafficPerFlow(t *testing.T) {
 		if err := client.CloseAndWait(closeCtx); err != nil {
 			t.Errorf("close the client: %v", err)
 		}
+		// No producer can publish another pooled share after the join.
+		for {
+			select {
+			case transferFrameBytes := <-route:
+				MessagePoolReturn(transferFrameBytes)
+			default:
+				return
+			}
+		}
 	})
 
-	var observationLock sync.Mutex
+	providerId := NewId()
+	var stateLock sync.Mutex
+	validObservationCount := NewMonitorValue(0)
 	observations := []logicalLaneGateObservation{}
 	client.sendBuffer.logicalLaneGateObserverForTest.Store(
 		&logicalLaneGateObserver{
 			observe: func(observation logicalLaneGateObservation) {
-				observationLock.Lock()
-				defer observationLock.Unlock()
-				observations = append(observations, observation)
+				if observation.destination != providerId {
+					return
+				}
+				func() {
+					stateLock.Lock()
+					defer stateLock.Unlock()
+					observations = append(observations, observation)
+				}()
+				if observation.schedulingValid {
+					validObservationCount.Update(func(count int) int { return count + 1 })
+				}
 			},
 		},
 	)
@@ -68,23 +88,10 @@ func TestTheSingleDestinationClientKeysItsIpTrafficPerFlow(t *testing.T) {
 		client.sendBuffer.logicalLaneGateObserverForTest.Store(nil)
 	})
 
-	providerId := NewId()
 	client.ContractManager().AddNoContractPeer(providerId)
 	// a route that accepts and discards, so the send path runs to the gate
-	route := make(chan []byte, 256)
 	client.RouteManager().UpdateTransport(
 		NewSendGatewayTransport(), []Route{route})
-	t.Cleanup(func() {
-		draining := true
-		for draining {
-			select {
-			case transferFrameBytes := <-route:
-				MessagePoolReturn(transferFrameBytes)
-			default:
-				draining = false
-			}
-		}
-	})
 
 	userNat := NewRemoteUserNatClient(
 		client,
@@ -94,13 +101,17 @@ func TestTheSingleDestinationClientKeysItsIpTrafficPerFlow(t *testing.T) {
 	)
 	t.Cleanup(userNat.Close)
 
+	// These control decisions must not satisfy the wait for two keyed packets.
+	for range 2 {
+		client.sendBuffer.selectLogicalLane(&SendPack{Destination: providerId})
+	}
 	source := SourceId(NewId())
 	for _, port := range []int{45001, 45002} {
 		packet := MessagePoolCopy(craftSecurityPacket(
 			IpProtocolTcp,
-			net.ParseIP("10.11.12.13"),
+			net.ParseIP("192.0.2.13"),
 			port,
-			net.ParseIP("93.184.216.34"),
+			net.ParseIP("198.51.100.34"),
 			443,
 			true,
 			nil,
@@ -111,23 +122,24 @@ func TestTheSingleDestinationClientKeysItsIpTrafficPerFlow(t *testing.T) {
 		}
 	}
 
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		observationLock.Lock()
-		count := len(observations)
-		observationLock.Unlock()
+	timeout := time.After(5 * time.Second)
+	for {
+		count, update := validObservationCount.Get()
 		if 2 <= count {
 			break
 		}
-		time.Sleep(20 * time.Millisecond)
+		select {
+		case <-update:
+		case <-timeout:
+			t.Fatalf("only %d keyed packets reached the provider's lane gate, want two", count)
+		}
 	}
 
-	observationLock.Lock()
+	stateLock.Lock()
 	seen := append([]logicalLaneGateObservation{}, observations...)
-	observationLock.Unlock()
+	stateLock.Unlock()
 
 	valid := 0
-	keys := map[sendSchedulingKey]int{}
 	for _, observation := range seen {
 		if observation.schedulingValid {
 			valid += 1
@@ -146,8 +158,4 @@ func TestTheSingleDestinationClientKeysItsIpTrafficPerFlow(t *testing.T) {
 			valid, len(seen),
 		)
 	}
-	_ = keys
-
-	// let anything the send accepted finish before the pool ownership check
-	time.Sleep(500 * time.Millisecond)
 }
