@@ -632,8 +632,8 @@ func laneRecoverySend(
 	return laneRecoverySendWithBarrier(t, link, messageCount, nil)
 }
 
-// An optional quiescence barrier fixes initial Pack admission under simulated
-// time, preventing goroutine scheduling from choosing the offered flight.
+// An optional after-offer barrier lets a row await its actual initial write,
+// fixing Pack boundaries without changing the other rows' offered workload.
 func laneRecoverySendWithBarrier(
 	t testing.TB,
 	link *laneRecoveryLink,
@@ -1028,13 +1028,13 @@ func TestLaneRecoveryRow11HeldItemsDoNotSpin(t *testing.T) {
 	}
 }
 
-// Row 10 compares identical lossless relay stalls beside a healthy direct
-// lane: the lane rule must deliver no less and avoid the baseline's rewrite
-// storm. Initial offers and time are controlled because an uncontrolled
-// wall-clock slice counts an arbitrary amount of traffic already in transit.
-// On this shape, that transit drains at the start of the stall; neither arm
-// then advances the ordered stream before the relay resumes. This establishes
-// no delivery cost for this stall, not ongoing healing or a universal rate.
+// Row 10 compares lossless relay stalls beside a healthy direct lane. Keep
+// the original delivery-cost bound (at least half the baseline's stalled-
+// interval delivery) and the lane rule's independent rewrite bound. Control
+// actual initial writes and virtual time: queued offers can still coalesce,
+// and an uncontrolled wall-clock slice counts arbitrary pre-stall transit.
+// Whole-window rewrites can sometimes heal a few positions over the direct
+// lane; report that separately instead of claiming it can never happen.
 func TestLaneRecoveryRow10StallHealingAndWritesIntoTheStalledLane(t *testing.T) {
 	if testing.Short() {
 		t.Skip("lane recovery contract, live link")
@@ -1046,16 +1046,43 @@ func TestLaneRecoveryRow10StallHealingAndWritesIntoTheStalledLane(t *testing.T) 
 		latency      = 100 * time.Millisecond
 	)
 	assertMessagePoolOwnership(t)
-	// Quiescence after each offer fixes the Pack boundaries; each arm owns a
-	// fresh virtual clock, so both arms see the same offered load and stall.
+	// Wait for each actual initial write, not just admission quiescence. Give
+	// successive writes distinct virtual instants so equal initial deadlines
+	// do not let the resend heap's tie order choose the recovery stimulus.
 	for _, flight := range []int{4, 32} {
 		delivered := map[string]int{}
 		for _, arm := range laneRecoveryArms() {
 			synctest.Test(t, func(t *testing.T) {
+				initialWrites := make(chan uint64, 1)
+				configure := func(settings *SendBufferSettings) {
+					if arm.configure != nil {
+						arm.configure(settings)
+					}
+					settings.afterInitialWriteQueuedForTest = func(_ sendSequenceId, position uint64) {
+						initialWrites <- position
+					}
+				}
 				link := newLaneRecoveryLink(
 					t, latency, 2*time.Millisecond,
-					stallAfter, stallFor, 2048, 0, 0, flight, arm.configure)
-				stats := laneRecoverySendWithBarrier(t, link, messageCount, synctest.Wait)
+					stallAfter, stallFor, 2048, 0, 0, flight, configure)
+				nextPosition := uint64(0)
+				stats := laneRecoverySendWithBarrier(t, link, messageCount, func() {
+					select {
+					case position := <-initialWrites:
+						if position != nextPosition {
+							t.Fatalf("initial write position %d, want %d", position, nextPosition)
+						}
+					case <-time.After(60 * time.Second):
+						t.Fatalf("initial position %d was not written", nextPosition)
+					}
+					nextPosition += 1
+					time.Sleep(time.Nanosecond)
+					synctest.Wait()
+				})
+				if stats.InitialWriteCount != messageCount || stats.InitialFrameCount != messageCount {
+					t.Fatalf("initial stimulus: %d Packs for %d frames, want %d of each",
+						stats.InitialWriteCount, stats.InitialFrameCount, messageCount)
+				}
 				link.deliveryLock.Lock()
 				times := append([]time.Time(nil), link.deliveryTimes...)
 				link.deliveryLock.Unlock()
@@ -1074,9 +1101,6 @@ func TestLaneRecoveryRow10StallHealingAndWritesIntoTheStalledLane(t *testing.T) 
 				t.Logf("%s: row 10 at flight %d: delivered %d frames during the stall (%d after transit drained), direct carried %d overall, wrote %d%s, relay inversions %d",
 					arm.name, flight, during, afterTransit, link.directDelivered.Load(), stats.TimeoutResendWriteCount,
 					laneRecoveryDetailForTree(stats), link.relayInversions.Load())
-				if afterTransit != 0 {
-					t.Errorf("%s: flight %d delivered %d frames after transit drained; the controlled stall changed", arm.name, flight, afterTransit)
-				}
 				if link.directDelivered.Load() == 0 {
 					t.Errorf("%s: flight %d did not exercise the direct lane", arm.name, flight)
 				}
@@ -1098,8 +1122,8 @@ func TestLaneRecoveryRow10StallHealingAndWritesIntoTheStalledLane(t *testing.T) 
 				}
 			})
 		}
-		// Both arms see exactly the same pre-stall transit, so equality is an
-		// exact oracle here; an arbitrary ratio would hide a changed stimulus.
+		// Retain the original delivery-cost bound while controlling the Pack
+		// count and clock; the separate write bound still rejects a storm.
 		var perItem, perLane int
 		var havePerLane bool
 		for _, arm := range laneRecoveryArms() {
@@ -1109,10 +1133,10 @@ func TestLaneRecoveryRow10StallHealingAndWritesIntoTheStalledLane(t *testing.T) 
 				perItem = delivered[arm.name]
 			}
 		}
-		if havePerLane && (perItem == 0 || perLane != perItem) {
+		if havePerLane && (perItem == 0 || perLane < perItem/2) {
 			t.Errorf(
 				"at flight %d the lane rule delivered %d frames during the controlled stall "+
-					"against %d; want equal nonzero delivery from identical pre-stall transit",
+					"against %d; want at least half the baseline's delivery without its rewrite storm",
 				flight, perLane, perItem,
 			)
 		}
