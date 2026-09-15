@@ -353,10 +353,9 @@ func TestAnAbsentCapacityAndAZeroCapacityTakeDifferentBranches(t *testing.T) {
 
 	settings := DefaultSendBufferSettings()
 	initial := settings.ResendQueueMaxByteCount
-	floor := settings.ResendQueueMinByteCount
 	t.Logf(
-		"absent gives window %d (this sender's constant %d), zero gives window %d (the working floor %d)",
-		absentEstimate.Window, initial, zeroEstimate.Window, floor,
+		"absent gives window %d (this sender's constant %d), zero gives window %d",
+		absentEstimate.Window, initial, zeroEstimate.Window,
 	)
 
 	if absentEstimate.Window != initial {
@@ -366,11 +365,10 @@ func TestAnAbsentCapacityAndAZeroCapacityTakeDifferentBranches(t *testing.T) {
 			initial,
 		)
 	}
-	if zeroEstimate.Window != floor {
+	if zeroEstimate.Window != 0 || zeroEstimate.Floor != 0 {
 		t.Errorf(
-			"a zero capacity gives a window of %d rather than the working floor %d; a receiver stating no room is clamped to nothing and held up only by the floor reliable admission already needs",
+			"a zero capacity gives a window of %d; the peer limit must apply before the queue's separate one-item progress allowance",
 			zeroEstimate.Window,
-			floor,
 		)
 	}
 	if absentEstimate.Window == zeroEstimate.Window {

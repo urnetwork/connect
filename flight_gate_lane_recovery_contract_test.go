@@ -1042,8 +1042,10 @@ func TestLaneRecoveryRow10StallHealingAndWritesIntoTheStalledLane(t *testing.T) 
 	const (
 		messageCount = 2500
 		stallAfter   = 1500 * time.Millisecond
-		stallFor     = 2750 * time.Millisecond
-		latency      = 100 * time.Millisecond
+		// Exceed the baseline's measured 3.15 s resend interval. With
+		// immediate gap evidence, the old 2.75 s stall ended before it fired.
+		stallFor = 5 * time.Second
+		latency  = 100 * time.Millisecond
 	)
 	assertMessagePoolOwnership(t)
 	// Wait for each actual initial write, not just admission quiescence. Give

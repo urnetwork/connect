@@ -176,6 +176,7 @@ func TestTcpReturnCacheSharesAnExactBudgetAcrossFlows(t *testing.T) {
 			t.Fatal("initial shared admission failed")
 		}
 		before := budget.UsedByteCount()
+		beforeBuffers := MessagePoolOutstandingByteCount()
 		done := make(chan bool, 1)
 		go func() { done <- second.retainReturnChunk(make([]byte, 256), 256, false) }()
 		synctest.Wait()
@@ -186,6 +187,9 @@ func TestTcpReturnCacheSharesAnExactBudgetAcrossFlows(t *testing.T) {
 		}
 		if budget.UsedByteCount() != before || before > budget.TotalByteCount() {
 			t.Fatal("blocked flow reserved beyond the budget")
+		}
+		if MessagePoolOutstandingByteCount() != beforeBuffers {
+			t.Error("blocked retention allocated a replay copy outside the shared budget")
 		}
 		first.mutex.Lock()
 		first.applySendAckWithLock(&parsedTcp{ack: true, ackNumber: 128, windowSize: 4096})

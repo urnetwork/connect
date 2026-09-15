@@ -20,13 +20,16 @@ import (
 // The finite relay queue counts only bytes/messages awaiting serialization;
 // already propagating messages are separately bounded by the flight limit.
 type windowPathLink struct {
-	rate       ByteCount
-	delay      time.Duration
-	queueCount int
-	queueBytes ByteCount
-	dropOnFull bool
-	dropped    atomic.Int64
-	maxQueued  atomic.Int64
+	rate            ByteCount
+	rateAfter       ByteCount
+	rateChangeAfter time.Duration
+	delay           time.Duration
+	queueCount      int
+	queueBytes      ByteCount
+	dropOnFull      bool
+	dropped         atomic.Int64
+	maxQueued       atomic.Int64
+	maxQueuedBytes  atomic.Int64
 }
 
 type windowPathFrame struct {
@@ -40,6 +43,9 @@ func (self *windowPathLink) run(ctx context.Context, from, to Route) {
 	head, serviced := 0, 0
 	queuedBytes := ByteCount(0)
 	departure := time.Now()
+	changeAt := departure.Add(self.rateChangeAfter)
+	rate := self.rate
+	changed := self.rateAfter <= 0
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	defer func() {
@@ -49,6 +55,30 @@ func (self *windowPathLink) run(ctx context.Context, from, to Route) {
 	}()
 	for {
 		now := time.Now()
+		if !changed && !now.Before(changeAt) {
+			// Finish the frame already in the serializer at its original
+			// rate. Reschedule only frames still waiting at the change.
+			for serviced < len(queue) && !changeAt.Before(queue[serviced].depart) {
+				queuedBytes -= ByteCount(len(queue[serviced].bytes))
+				serviced++
+			}
+			index := serviced
+			departure = changeAt
+			if index < len(queue) && rate > 0 {
+				serialization := time.Duration(int64(len(queue[index].bytes)) * int64(time.Second) / int64(rate))
+				if queue[index].depart.Add(-serialization).Before(changeAt) {
+					departure = queue[index].depart
+					index++
+				}
+			}
+			rate = self.rateAfter
+			for ; index < len(queue); index++ {
+				departure = departure.Add(time.Duration(int64(len(queue[index].bytes)) * int64(time.Second) / int64(rate)))
+				queue[index].depart = departure
+				queue[index].arrive = departure.Add(self.delay)
+			}
+			changed = true
+		}
 		for serviced < len(queue) && !now.Before(queue[serviced].depart) {
 			queuedBytes -= ByteCount(len(queue[serviced].bytes))
 			serviced++
@@ -60,13 +90,20 @@ func (self *windowPathLink) run(ctx context.Context, from, to Route) {
 		var output Route
 		var ready []byte
 		var timeout <-chan time.Time
+		var deadline time.Time
 		if head < len(queue) {
 			if remaining := time.Until(queue[head].arrive); remaining <= 0 {
 				output, ready = to, queue[head].bytes
 			} else {
-				timer.Reset(remaining)
-				timeout = timer.C
+				deadline = queue[head].arrive
 			}
+		}
+		if !changed && (deadline.IsZero() || changeAt.Before(deadline)) {
+			deadline = changeAt
+		}
+		if !deadline.IsZero() {
+			timer.Reset(time.Until(deadline))
+			timeout = timer.C
 		}
 		input := from
 		if (!self.dropOnFull && (queuedCount >= self.queueCount || queuedBytes >= self.queueBytes)) || len(queue)-head >= 65536 {
@@ -101,11 +138,13 @@ func (self *windowPathLink) run(ctx context.Context, from, to Route) {
 			if departure.Before(now) {
 				departure = now
 			}
-			if self.rate > 0 {
-				departure = departure.Add(time.Duration(int64(len(frame)) * int64(time.Second) / self.rate))
+			if rate > 0 {
+				departure = departure.Add(time.Duration(int64(len(frame)) * int64(time.Second) / int64(rate)))
 			}
 			queue = append(queue, windowPathFrame{bytes: frame, depart: departure, arrive: departure.Add(self.delay)})
 			queuedBytes += ByteCount(len(frame))
+			self.maxQueued.Store(max(self.maxQueued.Load(), int64(len(queue)-serviced)))
+			self.maxQueuedBytes.Store(max(self.maxQueuedBytes.Load(), int64(queuedBytes)))
 		}
 	}
 }
@@ -213,49 +252,92 @@ func TestWindowPathDeterministicPerformanceMatrix(t *testing.T) {
 // A relay may accept a reliable-carrier message and then refuse it at its
 // finite forwarding queue. Pin recovery and sustained delivery at that exact
 // boundary, where carrier reliability cannot recover the discarded Pack.
-func TestWindowPathRecoversFiniteRelayOverflow(t *testing.T) {
+func TestWindowPathBoundsBurstsAtFiniteRelay(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	for _, flows := range []int{1, 8} {
-		synctest.Test(t, func(t *testing.T) {
-			reading := measureWindowPathCell(t, windowPathCell{Arm: "delivery", RoundTrip: 100 * time.Millisecond, Compression: 10 * time.Millisecond, Flows: flows, Payload: 1280, Budget: mib(48), Rate: 125000000, Drop: true}, time.Second)
-			t.Logf("flows=%d goodput=%.1f min-flow=%.1f model Mb/s relay-drops=%d gap-repairs=%d", flows, reading.Mbps, reading.MinFlowMbps, reading.RelayDrops, reading.Recovery.SelectiveGapWriteCount)
-			if reading.RelayDrops == 0 || reading.Recovery.SelectiveGapWriteCount == 0 {
-				t.Fatal("finite relay overflow/recovery stimulus did not run")
+		for _, arm := range []string{"unpaced", "delivery"} {
+			synctest.Test(t, func(t *testing.T) {
+				reading := measureWindowPathCell(t, windowPathCell{Arm: arm, RoundTrip: 100 * time.Millisecond, Compression: 10 * time.Millisecond, Flows: flows, Payload: 1280, Budget: mib(48), Rate: 125000000, Drop: true}, time.Second)
+				t.Logf("%s flows=%d goodput=%.1f min-flow=%.1f model Mb/s relay-drops=%d gap-repairs=%d", arm, flows, reading.Mbps, reading.MinFlowMbps, reading.RelayDrops, reading.Recovery.SelectiveGapWriteCount)
+				if arm == "unpaced" {
+					if reading.RelayDrops == 0 || reading.Recovery.SelectiveGapWriteCount == 0 {
+						t.Fatal("unpaced relay overflow/recovery stimulus did not run")
+					}
+				} else if reading.RelayDrops != 0 || reading.Mbps < 900 || reading.MinFlowMbps == 0 {
+					t.Fatalf("paced relay is lossy, underfilled or stalled: %.1f model Mb/s, %d drops", reading.Mbps, reading.RelayDrops)
+				}
+			})
+		}
+	}
+}
+
+// The configured target is 1 Gb/s, but a slower physical path must still
+// converge to its own capacity. Its startup may overflow the finite relay;
+// retain those drops in the ledger rather than erasing the ramp.
+func TestWindowPathSlowLinkKeepsCapacity(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	for _, rtt := range []time.Duration{300 * time.Microsecond, 100 * time.Millisecond} {
+		for _, flows := range []int{1, 8} {
+			var ceiling, fixed windowPathReading
+			for _, arm := range []string{"ceiling", "delivery"} {
+				synctest.Test(t, func(t *testing.T) {
+					reading := measureWindowPathCell(t, windowPathCell{Arm: arm, RoundTrip: rtt, Compression: 10 * time.Millisecond, Flows: flows, Payload: 1280, Budget: mib(48), Rate: 12500000, Drop: arm == "delivery"}, time.Second)
+					if arm == "ceiling" {
+						ceiling = reading
+					} else {
+						fixed = reading
+					}
+				})
 			}
-			if reading.Mbps < 800 || reading.MinFlowMbps == 0 {
-				t.Fatalf("relay loss left an underfilled or stalled window: %.1f model Mb/s", reading.Mbps)
+			t.Logf("slow rtt=%s flows=%d ceiling=%.1f fixed=%.1f min-flow=%.1f model Mb/s startup-and-measurement-drops=%d", rtt, flows, ceiling.Mbps, fixed.Mbps, fixed.MinFlowMbps, fixed.RelayDrops)
+			if ceiling.Mbps < 90 || fixed.Mbps < .85*ceiling.Mbps || fixed.MinFlowMbps == 0 {
+				t.Fatalf("slow link lost capacity: ceiling=%.1f fixed=%.1f min-flow=%.1f", ceiling.Mbps, fixed.Mbps, fixed.MinFlowMbps)
 			}
-		})
+		}
 	}
 }
 
 type windowPathCell struct {
-	Tcp         bool
-	Upload      bool
-	Arm         string
-	RoundTrip   time.Duration
-	Compression time.Duration
-	Flows       int
-	Lanes       int
-	Payload     int
-	Budget      ByteCount
-	Drop        bool
-	Rate        ByteCount
+	CalibrationWindow  ByteCount
+	SendWindow         ByteCount
+	ReceiveWindow      ByteCount
+	ReceiveWindowAfter ByteCount
+	WindowChangeAfter  time.Duration
+	Tcp                bool
+	Upload             bool
+	TcpBufferMax       ByteCount
+	Arm                string
+	RoundTrip          time.Duration
+	Compression        time.Duration
+	Flows              int
+	RoundRobinOffer    bool
+	Lanes              int
+	Payload            int
+	Budget             ByteCount
+	Drop               bool
+	Rate               ByteCount
+	RateAfter          ByteCount
+	RateChangeAfter    time.Duration
+	Warmup             time.Duration
 }
 
 type windowPathReading struct {
-	Cell           windowPathCell
-	WarmupSeconds  float64
-	Seconds        float64
-	Bytes          int64
-	Mbps           float64
-	MinFlowMbps    float64
-	RelayDrops     int64
-	MaxRelayQueued int64
-	Recovery       ClientSendRecoveryStatsSnapshot
-	Receiver       ClientReceiveStatsSnapshot
-	SenderReceive  ClientReceiveStatsSnapshot
-	Window         SendWindowEstimate
+	Cell                  windowPathCell
+	WarmupSeconds         float64
+	Seconds               float64
+	Bytes                 int64
+	Mbps                  float64
+	MinFlowMbps           float64
+	IntervalMbps          []float64
+	RelayDrops            int64
+	MeasurementRelayDrops int64
+	NatRefused            int64
+	MaxRelayQueued        int64
+	MaxRelayQueuedBytes   int64
+	Recovery              ClientSendRecoveryStatsSnapshot
+	Receiver              ClientReceiveStatsSnapshot
+	SenderReceive         ClientReceiveStatsSnapshot
+	Window                SendWindowEstimate
 }
 
 // Measures receiver bytes over one common interval. Construction, warmup and
@@ -270,10 +352,11 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 		s.EncryptionSettings.Mode = EncryptionModeOff
 		s.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
 		s.SendBufferSettings.WindowSizing = WindowSizingConstant
-		if cell.Arm == "delivery" || cell.Arm == "path-rtt-only" {
+		if cell.Arm == "delivery" || cell.Arm == "path-rtt-only" || cell.Arm == "unpaced" {
 			s.SendBufferSettings.WindowSizing = WindowSizingFromDelivery
 		}
 		s.SendBufferSettings.ApplyWindowSizing()
+		s.SendBufferSettings.disableWindowPacingForTest = cell.Arm == "unpaced"
 		if cell.Arm == "path-rtt-only" {
 			zero := time.Duration(0)
 			s.SendBufferSettings.ackCompressionResidenceOverrideForTest = &zero
@@ -293,11 +376,28 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 		}
 		if cell.Arm == "ceiling" {
 			s.SendBufferSettings.ResendQueueMaxByteCount = cell.Budget
+			if cell.CalibrationWindow > 0 {
+				s.SendBufferSettings.ResendQueueMaxByteCount = cell.CalibrationWindow
+			}
 		}
 		return s
 	}
-	sender := NewClient(ctx, NewId(), NewNoContractClientOob(), settings())
-	receiver := NewClient(ctx, NewId(), NewNoContractClientOob(), settings())
+	senderSettings, receiverSettings := settings(), settings()
+	dataSenderSettings, dataReceiverSettings := senderSettings, receiverSettings
+	if cell.Upload {
+		dataSenderSettings, dataReceiverSettings = receiverSettings, senderSettings
+	}
+	if cell.SendWindow > 0 {
+		dataSenderSettings.SendBufferSettings.ResendQueueBudget = NewTransferMemoryBudget(cell.SendWindow)
+		dataSenderSettings.SendBufferSettings.DeliverySizedWindowCeilingByteCount = cell.SendWindow
+		dataSenderSettings.SendBufferSettings.ResendQueueMaxByteCount = min(dataSenderSettings.SendBufferSettings.ResendQueueMaxByteCount, cell.SendWindow)
+	}
+	if cell.ReceiveWindow > 0 {
+		dataReceiverSettings.ReceiveBufferSettings.ReceiveQueueBudget = NewTransferMemoryBudget(cell.ReceiveWindow)
+		dataReceiverSettings.ReceiveBufferSettings.ReceiveQueueMaxByteCount = max(cell.ReceiveWindow, cell.ReceiveWindowAfter)
+	}
+	sender := NewClient(ctx, NewId(), NewNoContractClientOob(), senderSettings)
+	receiver := NewClient(ctx, NewId(), NewNoContractClientOob(), receiverSettings)
 	sender.ContractManager().AddNoContractPeer(receiver.ClientId())
 	receiver.ContractManager().AddNoContractPeer(sender.ClientId())
 	sendOut, sendIn, receiveOut, receiveIn := make(Route, 128), make(Route, 128), make(Route, 128), make(Route, 128)
@@ -306,20 +406,33 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 	receiver.RouteManager().UpdateTransport(NewSendGatewayTransportWithType(TransportTypeH1), []Route{receiveOut})
 	receiver.RouteManager().UpdateTransportWithProperties(NewReceiveGatewayTransportWithType(TransportTypeH1), []Route{receiveIn}, TransferCarrierProperties{ReceiveReliability: CarrierReliabilityReliable})
 	var workers sync.WaitGroup
-	dataLink := windowPathLink{rate: cell.Rate, delay: cell.RoundTrip / 2, queueCount: 4096, queueBytes: mib(8), dropOnFull: cell.Drop}
+	if cell.ReceiveWindowAfter > 0 {
+		workers.Go(func() {
+			select {
+			case <-ctx.Done():
+			case <-time.After(cell.WindowChangeAfter):
+				dataReceiverSettings.ReceiveBufferSettings.ReceiveQueueBudget.SetTotalByteCount(cell.ReceiveWindowAfter)
+			}
+		})
+	}
+	dataLink := windowPathLink{rate: cell.Rate, rateAfter: cell.RateAfter, rateChangeAfter: cell.RateChangeAfter, delay: cell.RoundTrip / 2, queueCount: 4096, queueBytes: mib(8), dropOnFull: cell.Drop}
 	ackLink := windowPathLink{delay: cell.RoundTrip / 2, queueCount: 4096, queueBytes: mib(8)}
 	if cell.Upload {
 		dataLink.rate = 0
+		dataLink.rateAfter = 0
 		dataLink.dropOnFull = false
 		ackLink.rate = cell.Rate
+		ackLink.rateAfter = cell.RateAfter
+		ackLink.rateChangeAfter = cell.RateChangeAfter
 		ackLink.dropOnFull = cell.Drop
 	}
 	workers.Go(func() { dataLink.run(ctx, sendOut, receiveIn) })
 	workers.Go(func() { ackLink.run(ctx, receiveOut, sendIn) })
 	counts := make([]atomic.Int64, cell.Flows)
+	var natRefused atomic.Int64
 	cleanupWorkload := func() {}
 	if cell.Tcp {
-		cleanupWorkload = startWindowTcpWorkload(t, ctx, sender, receiver, counts, cell.Upload)
+		cleanupWorkload = startWindowTcpWorkload(t, ctx, sender, receiver, counts, cell.Upload, &natRefused, cell.TcpBufferMax)
 	} else {
 		receiver.AddReceiveCallback(func(_ TransferPath, frames []*protocol.Frame, _ Peer) {
 			for _, frame := range frames {
@@ -331,8 +444,13 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 				}
 			}
 		})
-		for flow := range cell.Flows {
+		producers := cell.Flows
+		if cell.RoundRobinOffer {
+			producers = max(1, min(cell.Lanes, cell.Flows))
+		}
+		for producer := range producers {
 			workers.Go(func() {
+				flow := producer
 				for ctx.Err() == nil {
 					payload := MessagePoolGet(cell.Payload)
 					clear(payload)
@@ -348,6 +466,12 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 							t.Errorf("performance producer: %v", err)
 						}
 						return
+					}
+					if cell.RoundRobinOffer {
+						flow += producers
+						if flow >= cell.Flows {
+							flow = producer
+						}
 					}
 				}
 			})
@@ -373,33 +497,75 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 	// Allow the blind RTT, the peer-capacity step and two complete delivery
 	// horizons to settle. A 2-RTT warmup included startup in 400-ms cells.
 	warmup := 300*time.Millisecond + 5*cell.RoundTrip
-	time.Sleep(warmup)
+	if cell.Tcp {
+		// Inner TCP startup is visible well after the Transfer window settles.
+		// Keep that ramp outside steady-state comparisons; the ledger retains
+		// the warmup duration and per-second readings to expose later ramps.
+		warmup += 2 * time.Second
+	}
+	if cell.Warmup > 0 {
+		warmup = cell.Warmup
+	}
+	if os.Getenv("CONNECT_WINDOW_PACING_TRACE") != "" {
+		traceStart := time.Now()
+		for time.Since(traceStart) < warmup {
+			time.Sleep(min(10*time.Millisecond, warmup-time.Since(traceStart)))
+			bytes := int64(0)
+			for i := range counts {
+				bytes += counts[i].Load()
+			}
+			estimate := sender.DestinationSendStats(receiver.ClientId()).SendWindow
+			t.Logf("pacing-trace at=%s bytes=%d window=%d rate=%d service=%d backlog=%t rtt=%s sampled=%t", time.Since(traceStart), bytes, estimate.Window, estimate.PacingByteRate, estimate.ServiceByteRate, estimate.ServiceBacklogged, estimate.RoundTrip, estimate.Sized)
+		}
+	} else {
+		time.Sleep(warmup)
+	}
+	dropsBefore := dataLink.dropped.Load()
+	if cell.Upload {
+		dropsBefore = ackLink.dropped.Load()
+	}
 	before := make([]int64, len(counts))
 	for i := range counts {
 		before[i] = counts[i].Load()
 	}
 	start := time.Now()
-	time.Sleep(duration)
+	previousTime := start
+	previousBytes := int64(0)
+	var intervalMbps []float64
+	for remaining := duration; remaining > 0; remaining = time.Until(start.Add(duration)) {
+		time.Sleep(min(time.Second, remaining))
+		now := time.Now()
+		delivered := int64(0)
+		for i := range counts {
+			delivered += counts[i].Load() - before[i]
+		}
+		intervalMbps = append(intervalMbps, float64(delivered-previousBytes)*8/now.Sub(previousTime).Seconds()/1e6)
+		previousTime, previousBytes = now, delivered
+	}
 	elapsed := time.Since(start)
-	reading := windowPathReading{Cell: cell, WarmupSeconds: warmup.Seconds(), Seconds: elapsed.Seconds(), MinFlowMbps: 1e20}
+	reading := windowPathReading{Cell: cell, WarmupSeconds: warmup.Seconds(), Seconds: elapsed.Seconds(), MinFlowMbps: 1e20, IntervalMbps: intervalMbps}
 	for i := range counts {
 		delivered := counts[i].Load() - before[i]
 		reading.Bytes += delivered
 		reading.MinFlowMbps = min(reading.MinFlowMbps, float64(delivered)*8/elapsed.Seconds()/1e6)
 	}
 	reading.Mbps = float64(reading.Bytes) * 8 / elapsed.Seconds() / 1e6
+	reading.NatRefused = natRefused.Load()
 	reading.RelayDrops = dataLink.dropped.Load()
 	reading.MaxRelayQueued = dataLink.maxQueued.Load()
+	reading.MaxRelayQueuedBytes = dataLink.maxQueuedBytes.Load()
 	statsSource, statsDestination := sender, receiver.ClientId()
 	if cell.Upload {
 		statsSource, statsDestination = receiver, sender.ClientId()
 		reading.RelayDrops = ackLink.dropped.Load()
 		reading.MaxRelayQueued = ackLink.maxQueued.Load()
+		reading.MaxRelayQueuedBytes = ackLink.maxQueuedBytes.Load()
 	}
 	reading.Recovery = statsSource.SendRecoveryStats()
 	reading.Receiver = receiver.ReceiveStats()
 	reading.SenderReceive = sender.ReceiveStats()
 	reading.Window = statsSource.DestinationSendStats(statsDestination).SendWindow
+	reading.MeasurementRelayDrops = reading.RelayDrops - dropsBefore
 	return reading
 }
 
@@ -441,11 +607,16 @@ func testWindowPathPerformanceMatrix(t *testing.T, tcp bool, upload bool) {
 					}
 					for _, arm := range arms {
 						switch arm {
-						case "ceiling", "constant", "matched", "path-rtt-only", "delivery":
+						case "ceiling", "constant", "matched", "path-rtt-only", "unpaced", "delivery":
 						default:
 							t.Fatalf("unknown performance arm %q", arm)
 						}
 						cell := windowPathCell{Tcp: tcp, Upload: upload, Arm: arm, RoundTrip: rtt, Compression: compression, Flows: count, Lanes: envInt(t, "CONNECT_WINDOW_PATH_LANES", 0), Payload: envInt(t, "CONNECT_WINDOW_PATH_PAYLOAD", 1280), Budget: mib(48), Rate: 125000000, Drop: os.Getenv("CONNECT_WINDOW_PATH_DROP") != ""}
+						bufferMib := envInt(t, "CONNECT_WINDOW_TCP_BUFFER_MAX_MIB", 0)
+						if bufferMib < 0 || bufferMib > 512 {
+							t.Fatal("TCP buffer maximum must be 0 (default) or 1–512 MiB")
+						}
+						cell.TcpBufferMax = ByteCount(bufferMib) * mib(1)
 						if cell.Payload < 1 || cell.Lanes < 0 {
 							t.Fatal("invalid payload size or lane count")
 						}

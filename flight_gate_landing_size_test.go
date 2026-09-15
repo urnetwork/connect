@@ -40,29 +40,32 @@ const (
 	evictionNoticeStateByteCount = 8
 	// Optional receiver compression duration plus its presence bit/padding.
 	ackCompressionStateByteCount = 8
+	// Local arrival survives ACK handoff without retaining the wire message.
+	ackArrivalStateByteCount = 8
+	pacingWireStateByteCount = 16
 )
 
 func TestLandingStructsMatchMergedLessTheDeferState(t *testing.T) {
-	if got, want := unsafe.Sizeof(sequenceAck{}), uintptr(mergedSequenceAckByteCount); got != want {
-		t.Errorf("sequenceAck is %d bytes, want merged's %d: the ack path carries nothing of this program's",
+	if got, want := unsafe.Sizeof(sequenceAck{}), uintptr(mergedSequenceAckByteCount+ackArrivalStateByteCount); got != want {
+		t.Errorf("sequenceAck is %d bytes, want baseline plus one arrival timestamp, %d",
 			got, want)
 	}
 	if got, want := unsafe.Sizeof(receiveAckMessage{}),
 		uintptr(mergedReceiveAckMessageByteCount+
 			receiveAdvertisementStateByteCount+
-			evictionNoticeStateByteCount+ackCompressionStateByteCount); got != want {
+			evictionNoticeStateByteCount+ackCompressionStateByteCount+ackArrivalStateByteCount); got != want {
 		t.Errorf(
-			"receiveAckMessage is %d bytes, want merged's %d plus %d for capacity, %d for evictions and %d for compression",
+			"receiveAckMessage is %d bytes, want merged's %d plus %d for capacity, %d for evictions, %d for compression and 8 for arrival",
 			got, mergedReceiveAckMessageByteCount,
 			receiveAdvertisementStateByteCount, evictionNoticeStateByteCount, ackCompressionStateByteCount,
 		)
 	}
 	want := uintptr(
-		mergedSendItemByteCount + deferStateByteCount + lanePositionStateByteCount)
+		mergedSendItemByteCount + deferStateByteCount + lanePositionStateByteCount + pacingWireStateByteCount)
 	if got := unsafe.Sizeof(sendItem{}); got != want {
 		t.Errorf(
 			"sendItem is %d bytes, want merged's %d plus %d for the deferred retransmit's own state "+
-				"and %d for the lane position it last looked at; "+
+				"and %d for the lane position it last looked at, plus 16 for paced wire bytes and actual write time; "+
 				"anything else means a removed mechanism left a field behind",
 			got, mergedSendItemByteCount, deferStateByteCount, lanePositionStateByteCount,
 		)

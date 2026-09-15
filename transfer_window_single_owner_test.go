@@ -92,6 +92,10 @@ func TestTheWindowHasOneOwner(t *testing.T) {
 			"sendWindowEstimate",
 			"deliveredRate",
 		},
+		"deliveredServiceRate": {
+			"sendWindowEstimate",
+			"deliveredServiceRate",
+		},
 	}
 
 	for symbol, allowed := range owners {

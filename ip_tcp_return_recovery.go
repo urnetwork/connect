@@ -20,12 +20,20 @@ type tcpReturnChunk struct {
 // reader calls it; waiting here propagates pressure into this flow's origin.
 // ACK callbacks merely release capacity and signal the dedicated replay worker.
 func (self *TcpSequence) retainReturnChunk(payload []byte, start uint32, fin bool) bool {
-	var owned []byte
-	if len(payload) != 0 {
-		owned = MessagePoolCopy(payload)
-	}
 	// Account for the pool root and geometric slice growth of chunk metadata.
-	charge := ByteCount(cap(owned) + 128)
+	// Reserve before copying: a blocked flow borrows its existing socket read
+	// buffer and must not allocate another uncharged replay buffer.
+	charge := ByteCount(128)
+	if len(payload) != 0 {
+		capacity := len(payload)
+		for _, pool := range orderedMessagePools() {
+			if capacity <= pool.size {
+				capacity = pool.size
+				break
+			}
+		}
+		charge += ByteCount(capacity + MessagePoolMetaByteCount)
+	}
 	budget := self.tcpBufferSettings.ReturnQueueBudget
 	limit := self.tcpBufferSettings.ReturnQueueMaxByteCount
 	if limit <= 0 {
@@ -35,7 +43,6 @@ func (self *TcpSequence) retainReturnChunk(payload []byte, start uint32, fin boo
 		}
 	}
 	if charge > limit || (budget != nil && charge > budget.TotalByteCount()) {
-		MessagePoolReturn(owned)
 		self.cancel()
 		return false
 	}
@@ -45,7 +52,6 @@ func (self *TcpSequence) retainReturnChunk(payload []byte, start uint32, fin boo
 	}
 	for {
 		if self.ctx.Err() != nil {
-			MessagePoolReturn(owned)
 			return false
 		}
 		var budgetChanged <-chan struct{}
@@ -55,10 +61,13 @@ func (self *TcpSequence) retainReturnChunk(payload []byte, start uint32, fin boo
 		self.mutex.Lock()
 		if int32(self.receiveSeqAck-end) >= 0 {
 			self.mutex.Unlock()
-			MessagePoolReturn(owned)
 			return true
 		}
 		if self.returnByteCount+charge <= limit && (budget == nil || budget.TryReserve(charge)) {
+			var owned []byte
+			if len(payload) != 0 {
+				owned = MessagePoolCopy(payload)
+			}
 			if self.returnHead == len(self.returnChunks) {
 				self.returnChunks = self.returnChunks[:0]
 				self.returnHead = 0
@@ -73,7 +82,6 @@ func (self *TcpSequence) retainReturnChunk(payload []byte, start uint32, fin boo
 		self.mutex.Unlock()
 		select {
 		case <-self.ctx.Done():
-			MessagePoolReturn(owned)
 			return false
 		case <-budgetChanged:
 		case <-self.returnCapacity:

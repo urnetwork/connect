@@ -9,10 +9,48 @@ import (
 	"net"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
 )
+
+// Cancellation can stop the socket writer while its producer still holds a
+// packet. Cleanup must consume that final publication before Run returns.
+func TestTcpSequenceCancelBeforeWritePublicationReturnsPacket(t *testing.T) {
+	// Start the global pool's statistics worker outside the virtual-time bubble.
+	MessagePoolReturn(MessagePoolGet(1))
+	synctest.Test(t, func(t *testing.T) {
+		publishing := make(chan struct{})
+		draining := make(chan struct{})
+		release := make(chan struct{})
+		var witness []byte
+		harness := newTcpReorderTestHarnessWithSetup(t, 1000, 8, 0, func(sequence *TcpSequence) {
+			sequence.beforeWritePayloadPublishForTest = func(packet []byte) {
+				witness = MessagePoolShareReadOnly(packet)
+				close(publishing)
+				<-release
+			}
+			sequence.beforeWritePayloadDrainForTest = func() { close(draining) }
+		})
+		harness.sendPayload(harness.nextSeq, "last upload packet", false)
+		<-publishing
+		harness.sequence.Cancel()
+		<-draining
+		// The old consumer exits at the empty queue. The fixed consumer waits
+		// for the producer to close it. Neither outcome depends on a sleep.
+		synctest.Wait()
+		close(release)
+		<-harness.runDone
+		harness.close()
+		if !MessagePoolReturn(witness) {
+			// Reclaim the old implementation's abandoned reference so a
+			// deliberate failure-before run does not contaminate other tests.
+			MessagePoolReturn(witness)
+			t.Fatal("canceled socket writer abandoned a late upload packet")
+		}
+	})
+}
 
 func newTcpAckOrderingTestSequence() *TcpSequence {
 	return &TcpSequence{

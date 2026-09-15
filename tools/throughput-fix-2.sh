@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# Reproduce the local window research without the PR author's native rig.
+# Usage: tools/throughput-fix-2.sh MODE [output-dir]
+# Modes: correctness, model, regression, ack, packet, tcp, server,
+#        server-integration, server-functional, server-tcp, server-proxy,
+#        server-connect-deterministic.
+set -euo pipefail
+
+# Parse the complete runner before executing it; edits during a long test
+# cannot move bash's file offset into a different command on return.
+run_throughput_fix_2() {
+mode=${1:-correctness}
+repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
+output=${2:-$(mktemp -d "${TMPDIR:-/tmp}/throughput-fix-2.XXXXXX")}
+mkdir -p -- "$output"
+output=$(cd -- "$output" && pwd)
+cd -- "$repo"
+run_flags=(-test.short=false)
+
+case "$mode" in
+  correctness)
+    pattern='^(TestAckCompression.*|TestAckResponses.*|TestAckOverflow.*|TestAckWorkerBounds.*|TestEvictionAcknowledgementsFitEveryCarrier|TestGapWake.*|TestSequenceAckWindow.*|TestWindow(TargetIncludes|DeliveryIncludes|DeliveryLargeResidence|DeliveryContractLead).*|TestDeliveryRate.*|TestResendCapacityRelease.*|TestTcpReturn.*|TestTcpSequenceCancelBeforeWritePublication.*|TestTunAckHandoff.*|TestWindow(BurstPacing|Pacing|Mismatch).*|TestWindowPathGapDeadline|TestTheWindowHasOneOwner|TestLandingStructs.*|TestDecodedTransferFramePoolRetainedSizeStaysSmall|TestFamilyStandbyTracks.*)$'
+    build_flags=(-race)
+    ;;
+  model)
+    pattern='^(TestWindowPathFifo.*|TestWindowPathGapDeadline|TestWindowCompressionResidence.*|TestWindowPathDeterministicPerformanceMatrix|TestWindowPathBoundsBurstsAtFiniteRelay|TestWindowPathSlowLinkKeepsCapacity|TestWindowPathService.*|TestWindowPathWindowMismatch.*)$'
+    build_flags=(-race=false)
+    ;;
+  regression)
+    pattern='.'
+    # The model mode runs these separately, retaining its full paired ledger.
+    run_flags=(-test.skip '^TestWindow(Path|CompressionResidence)')
+    build_flags=(-race=false)
+    ;;
+  ack)
+    pattern='^TestAckCompressionHeadDrainDoesNotAllocate$'
+    run_flags=(-test.bench '^BenchmarkAckCompression' -test.benchmem -test.benchtime=250ms)
+    build_flags=(-race=false)
+    ;;
+  packet|tcp)
+    pattern='^TestWindowPathPerformanceMatrix$'
+    if [[ "$mode" == tcp ]]; then
+      export CONNECT_WINDOW_TCP_MEASURE=1
+      pattern='^TestWindowTcp(Download|Upload)PerformanceMatrix$'
+    else
+      export CONNECT_WINDOW_PATH_MEASURE=1
+    fi
+    export CONNECT_WINDOW_PATH_RTT_US=${CONNECT_WINDOW_PATH_RTT_US:-300,100000}
+    export CONNECT_WINDOW_PATH_FLOWS=${CONNECT_WINDOW_PATH_FLOWS:-1,8}
+    export CONNECT_WINDOW_PATH_ACK_MS=${CONNECT_WINDOW_PATH_ACK_MS:-10}
+    export CONNECT_WINDOW_PATH_REPETITIONS=${CONNECT_WINDOW_PATH_REPETITIONS:-3}
+    export CONNECT_WINDOW_PATH_SECONDS=${CONNECT_WINDOW_PATH_SECONDS:-3}
+    build_flags=(-race=false)
+    ;;
+  server)
+    cd -- "$repo/../server"
+    pattern='^(TestSendPooledReceive.*|TestReliableExchangeQueueSaturation.*|TestExchangeGenerationRetires.*|TestResident.*|TestProductionSocketReaders.*|TestConnectH1(ReadyDrain|UserReadyBatch|WriteBatchForConn|WorkersJoin|BatchResponseWriter).*|TestConnectH3(InitialDatagram|TransferCarrier).*|TestExchangeHeaderUnreliableTransferGobCompatibility|TestExchangeOutboundBatchFormation)$'
+    build_flags=(-race)
+    ;;
+  server-connect-deterministic)
+    cd -- "$repo/../server"
+    pattern='^(TestSendPooledReceive.*|TestReliableExchangeQueueSaturation.*|TestExchangeGenerationRetires.*|TestResident.*|TestProductionSocketReaders.*|TestConnectH1(ReadyDrain|UserReadyBatch|WriteBatchForConn|WorkersJoin|BatchResponseWriter).*|TestConnectH3(InitialDatagram|TransferCarrier).*|TestExchangeHeaderUnreliableTransferGobCompatibility|TestExchangeOutboundBatchFormation)$'
+    run_flags=(-test.skip '^(TestResidentControllerReturnsDroppedResponseFrameOwnership|TestResidentRunJoinsStreamHopListenerCallback)$')
+    build_flags=(-race)
+    ;;
+  server-integration|server-functional|server-tcp)
+    cd -- "$repo/../server"
+    pattern='^(TestConnectH[13](Encrypted(AllowFallback)?)?|TestExchangeRelayPoolBalance|TestConnectMultiClientTcpDirectionalPerformance)$'
+    if [[ "$mode" == server-functional ]]; then
+      pattern='^(TestConnectH[13](Encrypted(AllowFallback)?)?|TestExchangeRelayPoolBalance)$'
+    elif [[ "$mode" == server-tcp ]]; then
+      pattern='^TestConnectMultiClientTcpDirectionalPerformance$'
+    fi
+    build_flags=(-race=false)
+    ;;
+  server-proxy)
+    cd -- "$repo/../server"
+    package=./proxy
+    # server/test.sh runs proxy's wall-clock packet tier without -race.  Keep
+    # the database-backed WireGuard handoff cases in the separate integration
+    # attempt; this mode is the deterministic ownership/lifecycle tier.
+    pattern='^(TestProxyDeviceMemoryBudget.*|TestProxyDeviceSendBorrowed.*|TestProxyDeviceWireGuardReturn.*|TestProxyDeviceTunDial.*|TestProxyDeviceManager.*|TestProxyLifecycle.*|TestWgClient.*|TestWindowIdentity.*|TestDrainCoordinator.*|TestProxyIngressCollector.*|TestProxyConnectionMetrics.*|TestProxySessionMaximum.*|TestProxySessionDuration.*|TestWireGuardPacketMetrics.*)$'
+    build_flags=(-race=false)
+    ;;
+  *) printf 'Unknown mode: %s\n' "$mode" >&2; exit 2 ;;
+esac
+
+package=./
+if [[ "$mode" == server* ]]; then package=./connect; fi
+if [[ "$mode" == server-proxy ]]; then package=./proxy; fi
+python3 - "$repo" "$output" "$mode" "$pattern" "${run_flags[@]}" <<'PY'
+import datetime, hashlib, json, os, pathlib, platform, subprocess, sys
+repo, output, mode, pattern, *run_flags = sys.argv[1:]
+def command(*args, cwd=None):
+    return subprocess.check_output(args, cwd=cwd, text=True).strip()
+def source_manifest(root):
+    names = command('git', 'ls-files', '--cached', '--others', '--exclude-standard',
+                    '--', '*.go', '*.proto', 'go.mod', 'go.sum', cwd=root).splitlines()
+    digest = hashlib.sha256()
+    for name in sorted(set(names)):
+        path = pathlib.Path(root, name)
+        if path.is_file():
+            digest.update(name.encode() + b'\0' + path.read_bytes() + b'\0')
+    return {'revision': command('git', 'rev-parse', 'HEAD', cwd=root),
+            'branch': command('git', 'branch', '--show-current', cwd=root),
+            'source_sha256': digest.hexdigest(),
+            'dirty': bool(command('git', 'status', '--porcelain', cwd=root))}
+manifest = {
+    'created_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    'mode': mode, 'test_pattern': pattern, 'run_flags': run_flags, 'connect': source_manifest(repo),
+    'go': command('go', 'version'), 'os': platform.system(),
+    'os_release': platform.release(), 'architecture': platform.machine(),
+    'logical_cpus': os.cpu_count(),
+    'environment': {k: v for k, v in os.environ.items()
+                    if k.startswith('CONNECT_WINDOW_') or k in ('GOMAXPROCS', 'GOGC')},
+    'instrument': 'local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN',
+}
+if mode.startswith('server'):
+    manifest['server'] = source_manifest(str(pathlib.Path(repo).parent / 'server'))
+pathlib.Path(output, 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+PY
+
+go test "${build_flags[@]}" -c -o "$output/tests" "$package"
+python3 - "$repo" "$output" <<'PY'
+import hashlib, json, pathlib, subprocess, sys
+repo, output = map(pathlib.Path, sys.argv[1:])
+manifest_path = output / 'manifest.json'
+manifest = json.loads(manifest_path.read_text())
+for name in ('connect', 'server'):
+    if name not in manifest:
+        continue
+    root = repo if name == 'connect' else repo.parent / 'server'
+    names = subprocess.check_output(
+        ['git', 'ls-files', '--cached', '--others', '--exclude-standard',
+         '--', '*.go', '*.proto', 'go.mod', 'go.sum'], cwd=root, text=True).splitlines()
+    digest = hashlib.sha256()
+    for filename in sorted(set(names)):
+        path = root / filename
+        if path.is_file():
+            digest.update(filename.encode() + b'\0' + path.read_bytes() + b'\0')
+    if digest.hexdigest() != manifest[name]['source_sha256']:
+        raise SystemExit(f'{name} sources changed during compilation; rerun for a consistent manifest')
+manifest['binary_sha256'] = hashlib.sha256((output / 'tests').read_bytes()).hexdigest()
+manifest['sources_stable_during_build'] = True
+manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
+PY
+
+status=0
+# Source-inspection tests use paths relative to their Go package, as go test does.
+if [[ "$mode" == server-proxy ]]; then
+  cd -- "$repo/../server/proxy"
+elif [[ "$mode" == server* ]]; then
+  cd -- "$repo/../server/connect"
+fi
+"$output/tests" -test.v -test.run "$pattern" "${run_flags[@]}" -test.count=1 -test.timeout=30m > "$output/run.log" 2>&1 || status=$?
+python3 - "$output" "$status" <<'PY'
+import json, pathlib, re, sys
+output = pathlib.Path(sys.argv[1])
+rows = []
+for line in (output / 'run.log').read_text().splitlines():
+    service = re.search(r'service-reading (\{.*\})$', line)
+    if service:
+        row = json.loads(service[1])
+        row['Kind'] = 'model-service'
+        rows.append(row)
+    match = re.search(r'(comparison )?repetition=(\d+) (\{.*\})$', line)
+    if match:
+        row = json.loads(match[3])
+        row['Repetition'] = int(match[2])
+        row['Kind'] = 'comparison' if match[1] else 'reading'
+        rows.append(row)
+    match = re.search(r'rtt=(\S+) flows=(\d+) compression=(\S+) ceiling=([\d.]+) fixed=([\d.]+) min-flow=([\d.]+) model Mb/s$', line)
+    if match:
+        rows.append(dict(Kind='model', RoundTrip=match[1], Flows=int(match[2]),
+                         Compression=match[3], CeilingMbps=float(match[4]),
+                         DeliveryMbps=float(match[5]), MinFlowMbps=float(match[6])))
+(output / 'ledger.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
+(output / 'status.json').write_text(json.dumps({'exit_code': int(sys.argv[2]), 'rows': len(rows)}) + '\n')
+PY
+printf 'Results: %s (exit %s)\n' "$output" "$status"
+exit "$status"
+}
+
+run_throughput_fix_2 "$@"

@@ -18,13 +18,24 @@ import (
 // matrix. Only dialing the synthetic destination is redirected to the owned
 // origin. This adds both inner TCP windows, segmentation, ACK cadence, replay
 // retention and the final TUN handoff to the measured delivery boundary.
-func startWindowTcpWorkload(t *testing.T, ctx context.Context, provider, device *Client, counts []atomic.Int64, upload bool) func() {
+func startWindowTcpWorkload(t *testing.T, ctx context.Context, provider, device *Client, counts []atomic.Int64, upload bool, natRefused *atomic.Int64, tcpBufferMax ByteCount) func() {
 	t.Helper()
+	tunSettings := DefaultTunSettingsWithBufferSize(2048)
+	if tcpBufferMax > 0 {
+		// A separate capacity control can reproduce the TCP ceiling of a
+		// larger process budget without changing global settings or the
+		// Transfer budget. Its explicit per-connection maximum is in the ledger.
+		if tcpBufferMax < ByteCount(max(tunSettings.TcpReceiveBuffer.Default, tunSettings.TcpSendBuffer.Default)) {
+			t.Fatal("TCP maximum is below the default buffer size")
+		}
+		tunSettings.TcpReceiveBuffer.Max = int(tcpBufferMax)
+		tunSettings.TcpSendBuffer.Max = int(tcpBufferMax)
+	}
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	tun, err := CreateTun(ctx, DefaultTunSettingsWithBufferSize(2048))
+	tun, err := CreateTun(ctx, tunSettings)
 	if err != nil {
 		listener.Close()
 		t.Fatal(err)
@@ -60,16 +71,22 @@ func startWindowTcpWorkload(t *testing.T, ctx context.Context, provider, device 
 		writePackets(provider, source.SourceId, protocol.MessageType_IpIpPacketFromProvider, packets)
 	})
 	provider.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, _ Peer) {
+		packets := make([][]byte, 0, len(frames))
 		for _, frame := range frames {
 			if frame.MessageType != protocol.MessageType_IpIpPacketToProvider {
 				continue
 			}
-			packet := MessagePoolShareReadOnly(frame.MessageBytes)
-			if !nat.SendPacket(source, protocol.ProvideMode_Network, packet, 0) {
+			packets = append(packets, MessagePoolShareReadOnly(frame.MessageBytes))
+		}
+		// Preserve the delivered batch at the NAT boundary. Splitting it into
+		// one channel admission per packet manufactures queue pressure absent
+		// from the provider's batch path.
+		if len(packets) != 0 && !nat.SendPackets(source, protocol.ProvideMode_Network, packets, 0) {
+			for _, packet := range packets {
 				MessagePoolReturn(packet)
-				if ctx.Err() == nil {
-					t.Error("TCP fixture NAT admission refused a packet")
-				}
+			}
+			if ctx.Err() == nil {
+				natRefused.Add(int64(len(packets)))
 			}
 		}
 	})

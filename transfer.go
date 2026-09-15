@@ -1,7 +1,6 @@
 package connect
 
 import (
-	"cmp"
 	"context"
 	"crypto/ed25519"
 	"errors"
@@ -2897,9 +2896,16 @@ func (self *SendSequence) shouldDeferTimeoutResend(
 	item *sendItem,
 	scaledRtt time.Duration,
 ) bool {
+	// A paced H1-only path can spend many timeout intervals draining its
+	// initial window. Each deferral still requires new cumulative progress;
+	// a lost head stops that progress and gets its ordinary timeout. The
+	// mixed/unreliable paths retain their existing bounded deferral policy.
+	pacedFifo := self.sendBufferSettings.DeliverySizedWindowScale > 0 &&
+		item.reliableCarrierObserved && !item.carrierChanged &&
+		self.transferFlightPolicy().h1Only
 	return self.sendBufferSettings.DeferTimeoutResendWhileCumulativeProgress &&
 		!item.unreliableCarrierObserved &&
-		item.timeoutDeferCount < self.sendBufferSettings.TimeoutResendDeferLimit &&
+		(pacedFifo || item.timeoutDeferCount < self.sendBufferSettings.TimeoutResendDeferLimit) &&
 		self.lastCumulativeAckTime.After(item.sendTime.Add(-scaledRtt)) &&
 		self.lastCumulativeAckTime.After(item.timeoutDeferAckTime)
 }
@@ -4793,6 +4799,7 @@ func (self *Client) Flush() {
 type SendBufferSettings struct {
 	// Isolates path-RTT-only sizing in deterministic performance controls.
 	ackCompressionResidenceOverrideForTest *time.Duration
+	disableWindowPacingForTest             bool
 
 	CreateContractTimeout time.Duration
 	// CreateContractRetryInterval is the fast first retry interval.
@@ -5289,6 +5296,7 @@ type SendBuffer struct {
 	// nonzero lane still shares this one fixed pool instead of receiving one
 	// independent ResendQueueMaxByteCount allocation per lane.
 	logicalLaneResendBudget *TransferMemoryBudget
+	windowPacingServices    map[sendSequenceId]*windowPacingService
 
 	// Nil test barriers expose exact sequence lifecycle boundaries without
 	// changing production behavior or relying on scheduler timing in regressions.
@@ -5572,6 +5580,19 @@ func (self *SendBuffer) createSendSequence(id sendSequenceId, sendPack *SendPack
 		sendSequence.logicalLaneBaseSequence = logicalLaneBaseSequence
 		sendSequence.logicalLaneBasePinned = true
 	}
+	if self.sendBufferSettings.DeliverySizedWindowScale > 0 {
+		if self.windowPacingServices == nil {
+			self.windowPacingServices = map[sendSequenceId]*windowPacingService{}
+		}
+		base := id.logicalLaneBase()
+		service := self.windowPacingServices[base]
+		if service == nil {
+			service = &windowPacingService{}
+			self.windowPacingServices[base] = service
+		}
+		service.references++
+		sendSequence.windowPacer.service = service
+	}
 	self.sendSequences[id] = sendSequence
 	self.wireSendSequences[wireId] = sendSequence
 	self.sendSequencesBySequenceId[sendSequence.sequenceId] = sendSequence
@@ -5646,6 +5667,12 @@ func (self *SendBuffer) runSendSequence(id sendSequenceId, wireId sendSequenceWi
 	defer func() {
 		self.mutex.Lock()
 		delete(self.activeSendSequences, sendSequence)
+		if service := sendSequence.windowPacer.service; service != nil {
+			service.references--
+			if service.references == 0 {
+				delete(self.windowPacingServices, id.logicalLaneBase())
+			}
+		}
 		close(sendSequence.done)
 		self.mutex.Unlock()
 	}()
@@ -6253,22 +6280,18 @@ type SendSequence struct {
 	resendWriteByteCount atomic.Uint64
 
 	contractMultiRouteWriter MultiRouteWriter
-	// deliveredBytes is a short history of what this lane has acknowledged:
-	// sixteen samples of (time, running acknowledged total), advanced on a
-	// cumulative acknowledgement when the newest is older than a quarter of
-	// the retransmit pacing floor. It measures the drain by delivery rather
-	// than by the round-trip mean, which lags an inflation by design
-	// (FLIGHTGATEFIX §22). Allocated once with the sequence: 256 bytes.
-	// nil unless ReliableAdmissionBoundedByDelivery is set: an off flag must
-	// not retain bytes (FLIGHTGATEFIX §29.4).
+	// Delivery checkpoints pair time, cumulative release and first-delivered
+	// service totals. The 64-entry ring costs 1,536 bytes, allocated only for
+	// a delivery-sized window or delivery-bounded reliable admission.
 	// The ring is advanced by the acknowledgement worker and read by the
 	// window rule, which a stats caller on any goroutine can reach through
 	// DestinationSendStats. A leaf lock: nothing is taken under it.
-	deliveredBytesMutex sync.Mutex
-	deliveredBytes      []deliveredBytesSample
-	deliveredBytesHead  int
-	deliveredBytesCount int
-	deliveredByteTotal  ByteCount
+	deliveredBytesMutex       sync.Mutex
+	deliveredBytes            []deliveredBytesSample
+	deliveredBytesHead        int
+	deliveredBytesCount       int
+	deliveredByteTotal        ByteCount
+	deliveredServiceByteTotal ByteCount
 	// the receiver's latest advertised hold (THROUGHPUTFIX §37.3)
 	receiveWindowByteCount atomic.Uint64
 	receiveWindowSet       atomic.Bool
@@ -6887,6 +6910,9 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 }
 
 type receiveAckMessage struct {
+	// Local arrival time survives both the compact handoff and coalescing;
+	// pacing waits in the send loop are not part of network service.
+	receivedAtNanos                  int64
 	messageId                        Id
 	sequenceId                       Id
 	missingContractId                Id
@@ -6994,6 +7020,7 @@ func (self *SendSequence) ackMessageDetailed(
 	ack receiveAckMessage,
 	timeout time.Duration,
 ) (receiveAckHandoffResult, error) {
+	ack.receivedAtNanos = time.Now().UnixNano()
 	self.ackMutex.Lock()
 	defer self.ackMutex.Unlock()
 
@@ -7104,6 +7131,7 @@ func (self *SendSequence) coalesceReceivedAck(
 		self.client.compactRecoveryAckCount.Add(1)
 	}
 	sequenceAck := sequenceAck{
+		receivedAtNanos:                  ack.receivedAtNanos,
 		messageId:                        ack.messageId,
 		sequenceNumber:                   sequenceNumber,
 		selective:                        ack.selective,
@@ -8090,19 +8118,21 @@ sendSequenceLoop:
 		ackUpdated := 0 < ackSnapshot.ackUpdateCount || 0 < len(ackSnapshot.selectiveAcks)
 		if 0 < ackSnapshot.ackUpdateCount {
 			self.lastHeadAckTime = time.Now()
-			self.receiveAck(
+			self.receiveAckAt(
 				ackSnapshot.headAck.messageId,
 				false,
 				ackSnapshot.headAck.tag,
 				ackSnapshot.headAck.compactContractRecoverySupported,
+				ackSnapshot.headAck.receivedAtNanos,
 			)
 		}
 		for messageId, ack := range ackSnapshot.selectiveAcks {
-			self.receiveAck(
+			self.receiveAckAt(
 				messageId,
 				true,
 				ack.tag,
 				ack.compactContractRecoverySupported,
+				ack.receivedAtNanos,
 			)
 		}
 		for messageId, ack := range ackSnapshot.contractMissingAcks {
@@ -8429,7 +8459,7 @@ sendSequenceLoop:
 						item.sendTime.Add(self.sendBufferSettings.AckTimeout),
 					) {
 					self.addResendItem(item)
-					continue
+					continue sendSequenceLoop
 				}
 
 				if recoveryKind == sendRecoveryNone {
@@ -8455,6 +8485,10 @@ sendSequenceLoop:
 					item.resendTime = sendTime.Add(itemResendTimeout)
 				}
 				self.addResendItem(item)
+				// A paced recovery write can take a complete service interval.
+				// Apply ACKs received during it before deciding whether another
+				// timeout is still needed or measuring the next pacing rate.
+				continue sendSequenceLoop
 			}
 		}
 
@@ -9186,16 +9220,16 @@ func nextCreateContractRetryInterval(current time.Duration, maximum time.Duratio
 }
 
 // THROUGHPUTFIX §39.1's threshold, derived from the sequence's own rate ring
-// and minimum round trip — the same two quantities the window rule uses —
-// rather than chosen: `max(scale x deliveredRate x rtt_min, floor)`.
+// and minimum path round trip: `max(scale x deliveredRate x rtt_min, floor)`.
+// Contract lead time uses the path RTT; the flight window additionally covers
+// receiver ACK compression residence.
 //
 // Read through the window estimate rather than from the ring directly, because
 // the estimate is the one owner of those ingredients
 // (TestTheWindowHasOneOwner): a consumer that reaches for an ingredient rather
 // than for what the estimator returns is the shape of three defects this
 // program has already paid for. The estimate reports the delivered bytes, the
-// span they were measured over and the minimum round trip it used, and the
-// product here is the same one it takes before applying its scale.
+// span they were measured over and the minimum path round trip.
 //
 // Derived where the evidence exists and the floor where it does not, and the
 // caller cannot tell the two apart, which is why both are named here. A
@@ -9211,11 +9245,13 @@ func (self *SendSequence) announceAheadByteCount() ByteCount {
 	if estimate.Interval <= 0 || estimate.RoundTrip <= 0 {
 		return floor
 	}
-	// delivered bytes per minimum round trip: the product the window rule
-	// reads, at the same scale
-	perRoundTrip := ByteCount(int64(estimate.DeliveredByteCount) *
-		estimate.RoundTrip.Nanoseconds() / estimate.Interval.Nanoseconds())
-	return max(ByteCount(scale)*perRoundTrip, floor)
+	// Delivered bytes per minimum path round trip.
+	hi, lo := bits.Mul64(uint64(estimate.DeliveredByteCount), uint64(estimate.RoundTrip))
+	perRoundTrip, _ := bits.Div64(hi, lo, uint64(estimate.Interval))
+	if perRoundTrip > uint64(math.MaxInt64)/uint64(scale) {
+		return math.MaxInt64
+	}
+	return max(ByteCount(uint64(scale)*perRoundTrip), floor)
 }
 
 // What is left of the current contract, in the same terms the contract itself
@@ -10164,20 +10200,33 @@ func receiveHoldShippingByteCount() ByteCount {
 // deliveredBytesSample is one running total of acknowledged bytes and when
 // it was taken.
 type deliveredBytesSample struct {
-	atNanos int64
-	total   ByteCount
+	atNanos      int64
+	total        ByteCount
+	serviceTotal ByteCount
 }
 
 // observeDeliveredBytes advances the ring on a cumulative acknowledgement.
 // The running total only grows, so a sample is a checkpoint rather than a
 // rate, and the ring is sized by time rather than by acknowledgement count.
 func (self *SendSequence) observeDeliveredBytes(byteCount ByteCount, at time.Time) {
-	if byteCount <= 0 || self.deliveredBytes == nil {
+	self.observeAckedBytes(byteCount, byteCount, at)
+}
+
+// Retained-window bytes leave on the cumulative head; service bytes count
+// exactly once, including SACKs. Filling a hole must not credit the already
+// delivered suffix as a new, impossibly fast serialization burst.
+func (self *SendSequence) observeAckedBytes(cumulative, serviced ByteCount, at time.Time) {
+	if (cumulative <= 0 && serviced <= 0) || self.deliveredBytes == nil {
 		return
+	}
+	if service := self.windowPacer.service; service != nil {
+		self.windowPacer.serviceAcked += serviced
+		service.observe(serviced, at)
 	}
 	self.deliveredBytesMutex.Lock()
 	defer self.deliveredBytesMutex.Unlock()
-	self.deliveredByteTotal += byteCount
+	self.deliveredByteTotal += cumulative
+	self.deliveredServiceByteTotal += serviced
 	atNanos := at.UnixNano()
 	interval := self.deliveredBytesSampleInterval().Nanoseconds()
 	if 0 < self.deliveredBytesCount {
@@ -10190,8 +10239,9 @@ func (self *SendSequence) observeDeliveredBytes(byteCount ByteCount, at time.Tim
 	}
 	self.deliveredBytesHead = (self.deliveredBytesHead + 1) % len(self.deliveredBytes)
 	self.deliveredBytes[self.deliveredBytesHead] = deliveredBytesSample{
-		atNanos: atNanos,
-		total:   self.deliveredByteTotal,
+		atNanos:      atNanos,
+		total:        self.deliveredByteTotal,
+		serviceTotal: self.deliveredServiceByteTotal,
 	}
 	if self.deliveredBytesCount < len(self.deliveredBytes) {
 		self.deliveredBytesCount += 1
@@ -10250,6 +10300,59 @@ func (self *SendSequence) deliveredRate(minSpan time.Duration) (ByteCount, time.
 	return max(0, newest.total-older.total), span, older.atNanos, true
 }
 
+// A serialized ACK train reveals service before a whole flight window has
+// returned. A shared service retains its discovery peak for one stable
+// feedback interval and uses a sustained rate when queue residence is observed.
+// Isolated checkpoint fixtures use the bounded local history below.
+func (self *SendSequence) deliveredServiceRate(horizon time.Duration, now time.Time) (ByteCount, ByteCount, ByteCount) {
+	if service := self.windowPacer.service; service != nil {
+		return service.measured(horizon, now)
+	}
+	if self.sendBufferSettings != nil {
+		interval := self.deliveredBytesSampleInterval()
+		residence := self.ackCompressionResidence()
+		if self.rttWindow != nil {
+			residence += self.rttWindow.Estimate().Min
+		}
+		horizon = min(horizon, max(4*interval, residence+2*interval))
+	}
+	self.deliveredBytesMutex.Lock()
+	defer self.deliveredBytesMutex.Unlock()
+	rate, latest := deliveryServiceRates(self.deliveredBytes, self.deliveredBytesHead, self.deliveredBytesCount, horizon, now)
+	return rate, self.deliveredServiceByteTotal, latest
+}
+
+// Reads a standalone sequence's checkpoint history. The caller owns or locks
+// the sample storage; managed sequences use the shared service clock above.
+func deliveryServiceRates(samples []deliveredBytesSample, head, count int, horizon time.Duration, now time.Time) (ByteCount, ByteCount) {
+	if count < 2 || horizon <= 0 {
+		return 0, 0
+	}
+	cutoff := now.Add(-horizon).UnixNano()
+	rate := ByteCount(0)
+	latest := ByteCount(0)
+	newer := samples[head]
+	for offset := 1; offset < count; offset++ {
+		index := (head - offset + len(samples)) % len(samples)
+		older := samples[index]
+		if span := newer.atNanos - older.atNanos; span > 0 {
+			measured := float64(max(0, newer.serviceTotal-older.serviceTotal)) * float64(time.Second) / float64(span)
+			measuredRate := ByteCount(math.MaxInt64)
+			if measured < float64(math.MaxInt64) {
+				measuredRate = ByteCount(measured)
+			}
+			if latest == 0 {
+				latest = measuredRate
+			}
+			if newer.atNanos >= cutoff {
+				rate = max(rate, measuredRate)
+			}
+		}
+		newer = older
+	}
+	return rate, latest
+}
+
 // Records the receiver's latest advertised hold. Stored atomically because it
 // is written from the acknowledgement worker and read by the send loop when it
 // sizes its window.
@@ -10266,7 +10369,7 @@ func (self *SendSequence) observeReceiveWindowAdvertisement(ack receiveAckMessag
 	if !ack.receiveWindowSet {
 		return
 	}
-	if !self.receiveWindowSet.Load() {
+	if !self.receiveWindowSet.Load() || self.receiveWindowByteCount.Load() < uint64(ack.receiveWindowByteCount) {
 		self.receiveWindowSetAtNanos.Store(time.Now().UnixNano())
 	}
 	self.receiveWindowByteCount.Store(uint64(ack.receiveWindowByteCount))
@@ -10415,7 +10518,7 @@ func (self *SendSequence) deliveredSampleCount() int {
 
 // deliveredBytesOver reports what this lane acknowledged in the last d: the
 // running total now, less the total at the newest sample older than d. A
-// scan of at most sixteen entries, allocation-free.
+// scan of at most sixty-four entries, allocation-free.
 func (self *SendSequence) deliveredBytesOver(d time.Duration, now time.Time) ByteCount {
 	if self.deliveredBytes == nil || d <= 0 {
 		return 0
@@ -10463,7 +10566,8 @@ type SendWindowEstimate struct {
 	Sized  bool
 	Reason string
 	// the rate the window was computed from: bytes acknowledged over the span
-	// they were acknowledged in, times the minimum round trip, times the scale
+	// they were acknowledged in. The delivery bound multiplies that rate by
+	// WindowRoundTrip and the configured scale.
 	DeliveredByteCount ByteCount
 	Interval           time.Duration
 	RoundTrip          time.Duration
@@ -10489,13 +10593,22 @@ type SendWindowEstimate struct {
 	// are measuring the target — and a reader has no other way to tell such a
 	// comparison from a meaningful one.
 	TargetBound bool
+	// The same owner computes pacing from recently serialized delivery, so
+	// writers consume its result without interpreting the target themselves.
+	ServiceByteRate      ByteCount
+	PacingByteRate       ByteCount
+	ServiceEstablished   bool
+	ServiceBacklogged    bool
+	PacingProbeByteRate  ByteCount
+	PacingProbeByteCount ByteCount
 }
 
 // sendWindowEstimate is the window this sequence may hold unacknowledged, and
 // the evidence behind it.
 //
-// The form is `scale × rate × minimum round trip`, clamped. Three parts of
-// that are deliberate and each replaced something that did not work.
+// The form is `scale × rate × (minimum RTT + receiver compression)`, clamped.
+// Receiver compression reserves residence for a full acknowledgement cycle,
+// even when the fastest tag measured none of that delay.
 //
 // The multiplier is the minimum round trip and not the mean. The sender stamps
 // its tag ahead of the writer, so the mean contains the queue the window
@@ -10542,6 +10655,38 @@ func (self *SendSequence) sendWindowEstimate(now time.Time) SendWindowEstimate {
 		estimate.Reason = "the rule is off"
 		return estimate
 	}
+	if self.sendBufferSettings.TargetGoodputByteRate > 0 {
+		estimate.PacingByteRate = ByteCount(float64(self.sendBufferSettings.TargetGoodputByteRate) / goodputFactor)
+		estimate.PacingProbeByteRate = estimate.PacingByteRate
+		estimate.PacingProbeByteCount = max(0, initial)
+		// Two compressed ACK intervals can measure one complete service
+		// interval even when the first and last replies are partial. Bound
+		// discovery to twice the ordinary opening window on slow services.
+		if initial > 0 {
+			extra := 2*float64(estimate.PacingProbeByteRate)*self.ackCompressionResidence().Seconds() - float64(initial)
+			if extra > 0 {
+				added := initial
+				if extra < float64(initial) {
+					added = ByteCount(math.Ceil(extra))
+				}
+				estimate.PacingProbeByteCount += min(added, ByteCount(math.MaxInt64)-initial)
+			}
+		}
+		// Another logical sequence may already have measured this shared
+		// service before this sequence has its first RTT sample.
+		if service := self.windowPacer.service; service != nil {
+			rate, total, latest := service.measured(time.Second, now)
+			if total >= kib(4) {
+				estimate.ServiceByteRate = rate
+				if rate == 0 {
+					estimate.ServiceByteRate = latest
+				}
+				estimate.ServiceEstablished = true
+				estimate.ServiceBacklogged = service.backlogged(estimate.ServiceByteRate)
+				estimate.PacingByteRate = windowPacingRate(estimate, estimate.PacingByteRate)
+			}
+		}
+	}
 	// The same refusal at the point of use, so a cell that sets the fields
 	// directly cannot have both either. With delivery-bounded admission on,
 	// the sender's limit comes from delivery over a resend timer rather than
@@ -10562,7 +10707,17 @@ func (self *SendSequence) sendWindowEstimate(now time.Time) SendWindowEstimate {
 		// keeps today's constant rather than falling to a floor, which would
 		// make every unbudgeted provider slower the moment the rule is on
 		// (THROUGHPUTFIX §37.22). Named so it is legible rather than silent.
-		estimate.Reason = "no memory budget: holding today's constant"
+		// Holding the constant does not grant permission to exceed known
+		// limits. Apply them even though memory cannot authorize growth.
+		if configured := self.sendBufferSettings.DeliverySizedWindowCeilingByteCount; configured > 0 {
+			estimate.Window = min(estimate.Window, configured)
+		}
+		if advertised, ok := self.receivedWindowAdvertisement(); ok {
+			estimate.Window = min(estimate.Window, advertised)
+		}
+		estimate.Floor = min(estimate.Floor, estimate.Window)
+		estimate.Ceiling = estimate.Window
+		estimate.Reason = "no memory budget: holding today's constant within known limits"
 		return estimate
 	}
 	// The share: what this queue's pool would lend it at full demand, read now
@@ -10581,10 +10736,10 @@ func (self *SendSequence) sendWindowEstimate(now time.Time) SendWindowEstimate {
 	if ceiling <= 0 {
 		ceiling = budget.TotalByteCount()
 	}
+	ceiling = max(ceiling, floor)
 	if configured := self.sendBufferSettings.DeliverySizedWindowCeilingByteCount; 0 < configured {
 		ceiling = min(ceiling, configured)
 	}
-	ceiling = max(ceiling, floor)
 	estimate.Obtainable = self.resendQueue.ObtainableByteCount()
 
 	// The receiver it can see, and the three cases are different facts
@@ -10633,6 +10788,10 @@ func (self *SendSequence) sendWindowEstimate(now time.Time) SendWindowEstimate {
 		ceiling = min(ceiling, min(defaultInitialWindowByteCount(), initial))
 	}
 	estimate.Ceiling = ceiling
+	// A local working floor grants memory, not permission to overrun a
+	// smaller peer or an explicit deployment ceiling.
+	floor = min(floor, ceiling)
+	estimate.Floor = floor
 	// The rule, stated here because the next layer to gain an initial size
 	// will need it and because omitting it is what this implementation got
 	// wrong first.
@@ -10673,6 +10832,24 @@ func (self *SendSequence) sendWindowEstimate(now time.Time) SendWindowEstimate {
 	estimate.AckCompressTimeout = self.ackCompressionResidence()
 	estimate.WindowRoundTrip = roundTrip.Min + estimate.AckCompressTimeout
 	estimate.SampleCount = self.deliveredSampleCount()
+	service, serviceDelivered, latestService := self.deliveredServiceRate(max(2*estimate.WindowRoundTrip, 4*self.deliveredBytesSampleInterval()), now)
+	estimate.ServiceByteRate = service
+	// A few complete data frames establish serialization even when the
+	// opening window takes seconds to drain on a slow link. Requiring that
+	// whole window kept using the optimistic startup rate in the meantime.
+	estimate.ServiceEstablished = min(initial, kib(4)) <= serviceDelivered
+	if service == 0 && estimate.ServiceEstablished {
+		// An idle or recovery-only interval supplies no new delivery
+		// evidence. Preserve the latest measured service rather than
+		// raising a known slow path back to its optimistic initial rate.
+		estimate.ServiceByteRate = latestService
+	}
+	if estimate.PacingByteRate > 0 {
+		if service := self.windowPacer.service; service != nil {
+			estimate.ServiceBacklogged = service.backlogged(estimate.ServiceByteRate)
+		}
+		estimate.PacingByteRate = windowPacingRate(estimate, estimate.PacingProbeByteRate)
+	}
 
 	// The target's own bandwidth-delay product, so a path faster than the
 	// target does not take more than the target (§37.4). Framed bytes, so the
@@ -10930,6 +11107,22 @@ func (self *SendSequence) receiveAck(
 	tag sequenceTag,
 	compactContractRecoverySupported bool,
 ) {
+	self.receiveAckAt(messageId, selective, tag, compactContractRecoverySupported, time.Now().UnixNano())
+}
+
+// Apply cumulative bytes using the ACK's local arrival timestamp. Control
+// state still advances in the send loop that owns the items and recovery.
+func (self *SendSequence) receiveAckAt(
+	messageId Id,
+	selective bool,
+	tag sequenceTag,
+	compactContractRecoverySupported bool,
+	receivedAtNanos int64,
+) {
+	deliveryTime := time.Now()
+	if receivedAtNanos != 0 {
+		deliveryTime = time.Unix(0, receivedAtNanos)
+	}
 	item := self.resendQueue.GetByMessageId(messageId)
 	if item == nil {
 		if self.log.V(1).Enabled() {
@@ -10940,8 +11133,22 @@ func (self *SendSequence) receiveAck(
 	}
 
 	self.observeAckRtt(item, tag)
+	// The wire tag precedes local pacing. Measure service residence from
+	// the actual first write, and exclude ambiguous retransmitted copies.
+	if service := self.windowPacer.service; service != nil && item.pacingSentAtNanos != 0 &&
+		item.sendCount == 1 && !item.deliveryObserved && !item.unreliableCarrierObserved && !item.carrierChanged {
+		service.observeRoundTrip(deliveryTime.Sub(time.Unix(0, item.pacingSentAtNanos)), self.ackCompressionResidence(), deliveryTime)
+	}
 
 	if selective {
+		if !item.deliveryObserved {
+			bytes := item.MessageByteCount()
+			if self.windowPacer.service != nil {
+				bytes = item.pacingByteCount
+			}
+			self.observeAckedBytes(0, bytes, deliveryTime)
+			item.deliveryObserved = true
+		}
 		if self.log.V(1).Enabled() {
 			self.log.Infof("[s]ack selective %s->%s...%s s(%s)\n", self.client.ClientTag(), self.contractIntermediaryIds(), self.destination, self.contractMultiRouteWriterAlias.StreamId)
 		}
@@ -10986,6 +11193,7 @@ func (self *SendSequence) receiveAck(
 	// FLIGHTGATEFIX §22: what this lane delivered, the measure the reliable
 	// admission bound reads.
 	cumulativeByteCount := ByteCount(0)
+	serviceByteCount := ByteCount(0)
 	// §34.3: an acknowledgement is cumulative, so every lane it touches has
 	// had its oldest unacknowledged item acknowledged. Collect those lanes
 	// and promote their new heads once the acknowledged prefix is gone.
@@ -11017,6 +11225,14 @@ func (self *SendSequence) receiveAck(
 		}
 
 		cumulativeByteCount += implicitItem.MessageByteCount()
+		if !implicitItem.deliveryObserved {
+			if self.windowPacer.service != nil {
+				serviceByteCount += implicitItem.pacingByteCount
+			} else {
+				serviceByteCount += implicitItem.MessageByteCount()
+			}
+			implicitItem.deliveryObserved = true
+		}
 		self.observeLaneAck(implicitItem, self.lastCumulativeAckTime)
 		self.observeReliableLaneAck(implicitItem, self.lastCumulativeAckTime)
 		if implicitItem.carrierRoute != nil && !implicitItem.carrierChanged &&
@@ -11063,7 +11279,7 @@ func (self *SendSequence) receiveAck(
 	if promoteLanes != 0 {
 		self.promoteLaneHeads(promoteLanes, self.lastCumulativeAckTime)
 	}
-	self.observeDeliveredBytes(cumulativeByteCount, self.lastCumulativeAckTime)
+	self.observeAckedBytes(cumulativeByteCount, serviceByteCount, deliveryTime)
 	if self.log.V(2).Enabled() {
 		a, b := self.resendQueue.QueueSize()
 		self.log.Infof("[s]ack %d/%d (stop %d %dB %d) %s->%s...%s s(%s)\n", ackSequenceNumber, self.nextSequenceNumber-1, a, b, len(self.sendItems), self.client.ClientTag(), self.contractIntermediaryIds(), self.destination, self.contractMultiRouteWriterAlias.StreamId)
@@ -11158,9 +11374,27 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 	paceWrite := func(byteCount int) error {
 		if item != nil && item.expectsAck && policy.h1Only &&
 			self.sendBufferSettings.DeliverySizedWindowScale > 0 &&
-			self.sendBufferSettings.TargetGoodputByteRate > 0 {
-			rate := ByteCount(float64(self.sendBufferSettings.TargetGoodputByteRate) / goodputFactor)
-			return self.windowPacer.wait(self.ctx, byteCount, rate)
+			!self.sendBufferSettings.disableWindowPacingForTest {
+			now := time.Now()
+			if self.windowPacer.rateUpdated.IsZero() || now.Sub(self.windowPacer.rateUpdated) >= defaultAckCompressTimeout {
+				estimate := self.sendWindowEstimate(now)
+				self.windowPacer.rate = estimate.PacingByteRate
+				self.windowPacer.probeRate = estimate.PacingProbeByteRate
+				self.windowPacer.probeLimit = estimate.PacingProbeByteCount
+				self.windowPacer.rateUpdated = now
+			}
+			if self.windowPacer.rate > 0 {
+				alreadyCounted := item.pacingByteCount > 0 || item.deliveryObserved
+				if !alreadyCounted {
+					item.pacingByteCount = ByteCount(byteCount)
+				}
+				if err := self.windowPacer.waitForServiceWrite(self.ctx, byteCount, alreadyCounted); err != nil {
+					return err
+				}
+				if !alreadyCounted {
+					item.pacingSentAtNanos = time.Now().UnixNano()
+				}
+			}
 		}
 		return nil
 	}
@@ -11572,11 +11806,17 @@ type sendItem struct {
 	sendCount          int
 	transferFrameBytes []byte
 	acks               sendAckSet
+	// The first paced wire envelope, including encryption/framing, is
+	// credited exactly once on delivery and released on sequence shutdown.
+	pacingByteCount   ByteCount
+	pacingSentAtNanos int64
 	// selectiveAcked marks an item whose resend is paused by a selective ack
 	// (see receiveAck). selectiveGapRecovered and ackTailProbeCount bound receiver-
 	// paced data recovery per item. recoveryKind marks the scheduled attempt so it
 	// does not inflate ordinary timeout backoff and remains observable.
-	selectiveAcked        bool
+	selectiveAcked bool
+	// Independent of recovery's SACK flag, which a resend can clear.
+	deliveryObserved      bool
 	selectiveGapRecovered bool
 	// deferralOutstanding is set while this item's own retransmit is waiting
 	// out a deferral and cleared when that retransmit is finally written. It
@@ -11839,7 +12079,7 @@ type ReceiveBufferSettings struct {
 	// AckBufferSize int
 
 	AckCompressTimeout time.Duration
-	// Selective acks pending in one compression interval that end the wait
+	// Distinct selective ACKs above one cumulative head that end the wait
 	// early, and enable the early wake on a head ack that advances past
 	// selectively acked items. Should match the sender's
 	// SelectiveAckGapThreshold. Zero keeps the fixed compression interval.
@@ -13437,6 +13677,8 @@ func (self *ReceiveSequence) Run() {
 		lastAckWriteTime := time.Time{}
 		var lastAck sequenceAck
 		hasLastAck := false
+		var lastHeadAck sequenceAck
+		hasLastHeadAck := false
 		continueResponse := false
 		writePending := func() bool {
 			var evicted []uint64
@@ -13446,11 +13688,21 @@ func (self *ReceiveSequence) Run() {
 			countLimit := min(ackResponseMaxCount,
 				(ackResponseMaxByteCount-10*len(evicted))/ackResponseEntryMaxByteCount)
 			acks, overflow := self.ackWindow.takeResponse(ackScratch[:0], countLimit)
-			self.evictedMutex.Lock()
-			continueResponse = overflow || (self.receiveBufferSettings.EvictionNotice && len(self.evictedSequenceNumbers) != 0)
-			self.evictedMutex.Unlock()
+			// SACK overflow belongs to this compression turn. Metadata alone
+			// needs another ACK carrier, so pace it at the next deadline rather
+			// than repeating a cumulative head in an immediate burst.
+			continueResponse = overflow
 			if len(acks) == 0 && len(evicted) != 0 {
-				acks = append(acks, lastAck)
+				// Eviction metadata is receiver state, not a new SACK. Repeat
+				// the most recent cumulative head when one exists, even if the
+				// last bounded overflow response ended with a selective ACK.
+				if hasLastHeadAck {
+					acks = append(acks, lastHeadAck)
+				} else if hasLastAck {
+					// An out-of-order sequence may have no cumulative head yet;
+					// retain the historical last-ACK fallback until one exists.
+					acks = append(acks, lastAck)
+				}
 			}
 			for i, ack := range acks {
 				if i == 0 {
@@ -13459,6 +13711,9 @@ func (self *ReceiveSequence) Run() {
 					writeAck(ack, nil)
 				}
 				lastAck, hasLastAck = ack, true
+				if !ack.selective && !ack.contractMissing {
+					lastHeadAck, hasLastHeadAck = ack, true
+				}
 			}
 			if len(acks) != 0 {
 				lastAckWriteTime = time.Now()
@@ -13566,7 +13821,7 @@ func (self *ReceiveSequence) Run() {
 				}
 
 				itemGapTimeout := item.receiveTime.Add(self.receiveBufferSettings.GapTimeout).Sub(receiveTime)
-				if itemGapTimeout < 0 {
+				if itemGapTimeout <= 0 {
 					self.log.Errorf("[r]%s<-%s s(%s) exit gap timeout\n", self.client.ClientTag(), self.source.SourceId, self.source.StreamId)
 					// did not receive a preceding message in time
 					return
@@ -14781,10 +15036,11 @@ func (tag *sequenceTag) protocol() *protocol.Tag {
 }
 
 type sequenceAck struct {
-	sequenceNumber uint64
-	messageId      Id
-	selective      bool
-	tag            sequenceTag
+	receivedAtNanos int64
+	sequenceNumber  uint64
+	messageId       Id
+	selective       bool
+	tag             sequenceTag
 	// transportType is the carrier that delivered the packet covered by this
 	// ACK. The receiver uses it only as reply affinity; it is not serialized.
 	transportType                    TransportType
@@ -14797,351 +15053,6 @@ type sequenceAck struct {
 	// ciphers haven't been established yet can read the ack. Cumulative
 	// head acks or-in the bit across every absorbed lower ack.
 	unwrapped bool
-}
-
-type sequenceAckWindowSnapshot struct {
-	ackNotify           <-chan struct{}
-	headAck             sequenceAck
-	ackUpdateCount      int
-	selectiveAcks       map[Id]sequenceAck
-	contractMissingAcks map[Id]sequenceAck
-}
-
-type sequenceAckWindow struct {
-	// There is exactly one Snapshot consumer per receive sequence. A
-	// capacity-one signal coalesces any number of updates while that consumer
-	// is running and avoids allocating/closing a broadcast channel per packet.
-	ackNotify      chan struct{}
-	ackLock        sync.Mutex
-	headAck        sequenceAck
-	hasHeadAck     bool
-	ackUpdateCount int
-	selectiveAcks  map[Id]sequenceAck
-	// Recovery requests never acknowledge delivery and therefore remain
-	// separate from both cumulative and selective acknowledgement windows.
-	contractMissingAcks map[Id]sequenceAck
-	// A gap is proved once per cumulative head, independently of snapshots.
-	// Retain a bounded set of distinct evidence across compression intervals;
-	// repeating the same proof must not disable compression under sustained loss.
-	// Zero disables early wakes.
-	gapNotify             chan struct{}
-	gapWakeSelectiveCount int
-	gapWakeSignaled       bool
-	gapEvidence           []uint64
-	// highest selectively acked sequence number; a head below it has
-	// selective acks outstanding above it, whether or not they were already
-	// written, so the next head advance is a hole filling
-	gapSelectiveMax uint64
-}
-
-func newSequenceAckWindow() *sequenceAckWindow {
-	return newSequenceAckWindowWithGapWake(0)
-}
-
-func newSequenceAckWindowWithGapWake(gapWakeSelectiveCount int) *sequenceAckWindow {
-	return &sequenceAckWindow{
-		ackNotify:             make(chan struct{}, 1),
-		ackUpdateCount:        0,
-		selectiveAcks:         map[Id]sequenceAck{},
-		contractMissingAcks:   map[Id]sequenceAck{},
-		gapNotify:             make(chan struct{}, 1),
-		gapWakeSelectiveCount: min(gapWakeSelectiveCount, ackResponseMaxCount),
-	}
-}
-
-// Notify is the stable coalesced edge consumed by the one sequence worker.
-// It is safe to fetch without a lock because the channel never changes.
-func (self *sequenceAckWindow) Notify() <-chan struct{} {
-	return self.ackNotify
-}
-
-// GapNotify is the early-wake edge for the consumer's compression wait. Like
-// Notify it never changes, so it is safe to fetch without a lock.
-func (self *sequenceAckWindow) GapNotify() <-chan struct{} {
-	return self.gapNotify
-}
-
-// signalGapWakeWithLock fires once per cumulative head.
-func (self *sequenceAckWindow) signalGapWakeWithLock() {
-	if self.gapWakeSignaled {
-		return
-	}
-	self.gapWakeSignaled = true
-	select {
-	case self.gapNotify <- struct{}{}:
-	default:
-	}
-}
-
-// Pending checks whether a worker can proceed without constructing a
-// snapshot. The ACK-compression worker uses this before its wait and extracts
-// only a bounded response when it actually drains the window.
-func (self *sequenceAckWindow) Pending() bool {
-	self.ackLock.Lock()
-	defer self.ackLock.Unlock()
-	return 0 < self.ackUpdateCount ||
-		0 < len(self.selectiveAcks) ||
-		0 < len(self.contractMissingAcks)
-}
-
-// PendingDispositionFor reports whether the not-yet-snapshotted window can
-// retire or materially rewrite one exact due item. Unrelated ACK progress must
-// not postpone its recovery: on a busy sequence, duplicate/newer selective
-// ACKs can otherwise keep Pending true indefinitely while the actual hole is
-// never retransmitted.
-func (self *sequenceAckWindow) PendingDispositionFor(
-	sequenceNumber uint64,
-	messageId Id,
-) bool {
-	self.ackLock.Lock()
-	defer self.ackLock.Unlock()
-	if 0 < self.ackUpdateCount && self.hasHeadAck &&
-		sequenceNumber <= self.headAck.sequenceNumber {
-		return true
-	}
-	if ack, ok := self.selectiveAcks[messageId]; ok &&
-		ack.sequenceNumber == sequenceNumber {
-		return true
-	}
-	_, contractMissing := self.contractMissingAcks[messageId]
-	return contractMissing
-}
-
-func (self *sequenceAckWindow) UpdateContractMissing(ack sequenceAck) {
-	self.ackLock.Lock()
-	defer self.ackLock.Unlock()
-	if prior, ok := self.contractMissingAcks[ack.messageId]; ok {
-		if prior.unwrapped {
-			ack.unwrapped = true
-		}
-		if prior.compactContractRecoverySupported {
-			ack.compactContractRecoverySupported = true
-		}
-		if ack.transportType == TransportTypeUnknown {
-			ack.transportType = prior.transportType
-		}
-	}
-	self.contractMissingAcks[ack.messageId] = ack
-	select {
-	case self.ackNotify <- struct{}{}:
-	default:
-	}
-}
-
-func (self *sequenceAckWindow) Update(ack sequenceAck) {
-	self.ackLock.Lock()
-	defer self.ackLock.Unlock()
-
-	if !self.hasHeadAck || self.headAck.sequenceNumber < ack.sequenceNumber {
-		if ack.selective {
-			if prior, ok := self.selectiveAcks[ack.messageId]; ok {
-				if prior.unwrapped {
-					// Coalesced selective Ack for the same message preserves any
-					// prior plaintext bit so one late wrapped resend cannot upgrade
-					// the Ack format past the sender's reach.
-					ack.unwrapped = true
-				}
-				if prior.compactContractRecoverySupported {
-					ack.compactContractRecoverySupported = true
-				}
-				if ack.transportType == TransportTypeUnknown {
-					ack.transportType = prior.transportType
-				}
-			}
-			self.selectiveAcks[ack.messageId] = ack
-			if self.gapSelectiveMax < ack.sequenceNumber {
-				self.gapSelectiveMax = ack.sequenceNumber
-			}
-			if 0 < self.gapWakeSelectiveCount && !self.gapWakeSignaled &&
-				!slices.Contains(self.gapEvidence, ack.sequenceNumber) {
-				self.gapEvidence = append(self.gapEvidence, ack.sequenceNumber)
-				if self.gapWakeSelectiveCount <= len(self.gapEvidence) {
-					self.signalGapWakeWithLock()
-				}
-			}
-		} else {
-			// a head advancing under outstanding selective acks is a hole
-			// filling; the sender's flight is head-blocked on this ack
-			self.gapWakeSignaled = false
-			self.gapEvidence = self.gapEvidence[:0]
-			if 0 < self.gapWakeSelectiveCount && self.gapSelectiveMax != 0 &&
-				(!self.hasHeadAck || self.headAck.sequenceNumber < self.gapSelectiveMax) {
-				self.signalGapWakeWithLock()
-			}
-			// cumulative head ack: or-in the prior head's plaintext bit
-			// (and any absorbed selective acks below the new head) so a
-			// single plaintext pack anywhere under the head keeps the
-			// ack plaintext. Selective acks at or below the new head are
-			// already dropped by the Snapshot pass.
-			if self.hasHeadAck && self.headAck.unwrapped {
-				ack.unwrapped = true
-			}
-			if self.hasHeadAck && self.headAck.compactContractRecoverySupported {
-				ack.compactContractRecoverySupported = true
-			}
-			if self.hasHeadAck && ack.transportType == TransportTypeUnknown {
-				ack.transportType = self.headAck.transportType
-			}
-			if !ack.unwrapped {
-				for _, sel := range self.selectiveAcks {
-					if sel.unwrapped && sel.sequenceNumber <= ack.sequenceNumber {
-						ack.unwrapped = true
-						break
-					}
-				}
-			}
-			if !ack.compactContractRecoverySupported {
-				for _, selectiveAck := range self.selectiveAcks {
-					if selectiveAck.compactContractRecoverySupported &&
-						selectiveAck.sequenceNumber <= ack.sequenceNumber {
-						ack.compactContractRecoverySupported = true
-						break
-					}
-				}
-			}
-			self.ackUpdateCount += 1
-			self.headAck = ack
-			self.hasHeadAck = true
-			// no need to clean up `selectiveAcks` here
-			// selective acks with sequence number <= head are ignored in a final pass during update
-		}
-	} else {
-		// past the head
-		// resend the head — fold this late ack's plaintext bit into the
-		// head so the resend covers it. Snapshots copy the value, so the
-		// internal value can be updated under ackLock without a published
-		// pointer or copy-on-write allocation.
-		if ack.unwrapped && self.hasHeadAck && !self.headAck.unwrapped {
-			self.headAck.unwrapped = true
-		}
-		if ack.compactContractRecoverySupported && self.hasHeadAck &&
-			!self.headAck.compactContractRecoverySupported {
-			self.headAck.compactContractRecoverySupported = true
-		}
-		self.ackUpdateCount += 1
-	}
-
-	select {
-	case self.ackNotify <- struct{}{}:
-	default:
-	}
-}
-
-// Snapshot is returned by value: it is consumed immediately by the caller and
-// never retained, so a heap allocation per snapshot is pure waste. The caller
-// always receives a copy of (or nil for) the selective acks, never the live
-// map, so the live map can be cleared and reused on reset.
-func (self *sequenceAckWindow) Snapshot(reset bool) sequenceAckWindowSnapshot {
-	self.ackLock.Lock()
-	defer self.ackLock.Unlock()
-
-	// build the selective-ack copy lazily so the common in-order case (a
-	// cumulative head ack with no selective acks) allocates no map.
-	var selectiveAcksAfterHead map[Id]sequenceAck
-	if 0 < self.ackUpdateCount {
-		for messageId, ack := range self.selectiveAcks {
-			if self.headAck.sequenceNumber < ack.sequenceNumber {
-				if selectiveAcksAfterHead == nil {
-					selectiveAcksAfterHead = map[Id]sequenceAck{}
-				}
-				selectiveAcksAfterHead[messageId] = ack
-			}
-		}
-	} else if 0 < len(self.selectiveAcks) {
-		selectiveAcksAfterHead = maps.Clone(self.selectiveAcks)
-	}
-
-	var contractMissingAcks map[Id]sequenceAck
-	if 0 < len(self.contractMissingAcks) {
-		contractMissingAcks = maps.Clone(self.contractMissingAcks)
-	}
-
-	snapshot := sequenceAckWindowSnapshot{
-		ackNotify:           self.ackNotify,
-		headAck:             self.headAck,
-		ackUpdateCount:      self.ackUpdateCount,
-		selectiveAcks:       selectiveAcksAfterHead,
-		contractMissingAcks: contractMissingAcks,
-	}
-
-	if reset {
-		// keep the head ack in place. clear() reuses the live map's storage
-		// instead of allocating a fresh map; the caller holds only a copy.
-		self.ackUpdateCount = 0
-		clear(self.selectiveAcks)
-		clear(self.contractMissingAcks)
-		// The signals correspond to state included in this snapshot. Drain
-		// them while ackLock excludes Update so the next empty snapshot cannot
-		// wake on a stale token. Gap evidence survives snapshots.
-		select {
-		case <-self.ackNotify:
-		default:
-		}
-		select {
-		case <-self.gapNotify:
-		default:
-		}
-	}
-
-	return snapshot
-}
-
-// takeResponse removes only the bounded response being sent. The caller owns
-// scratch; overflow stays pending and new cumulative progress can absorb it.
-// Selective entries are ordered even across responses, so a partial write
-// cannot manufacture multiple holes at the sender.
-func (self *sequenceAckWindow) takeResponse(scratch []sequenceAck, limit int) ([]sequenceAck, bool) {
-	self.ackLock.Lock()
-	defer self.ackLock.Unlock()
-	if limit <= 0 {
-		return scratch[:0], false
-	}
-	acks := scratch[:0]
-	if self.ackUpdateCount != 0 {
-		acks = append(acks, self.headAck)
-		self.ackUpdateCount = 0
-	}
-	headCount := len(acks)
-	for id, ack := range self.selectiveAcks {
-		if self.hasHeadAck && ack.sequenceNumber <= self.headAck.sequenceNumber {
-			delete(self.selectiveAcks, id)
-			continue
-		}
-		ack.messageId, ack.selective = id, true
-		index, _ := slices.BinarySearchFunc(acks[headCount:], ack, func(a, b sequenceAck) int {
-			return cmp.Compare(a.sequenceNumber, b.sequenceNumber)
-		})
-		index += headCount
-		if index < limit {
-			if len(acks) == limit {
-				acks = acks[:limit-1]
-			}
-			acks = slices.Insert(acks, index, ack)
-		}
-	}
-	for _, ack := range acks[headCount:] {
-		delete(self.selectiveAcks, ack.messageId)
-	}
-	for id, ack := range self.contractMissingAcks {
-		if len(acks) == limit {
-			break
-		}
-		ack.messageId, ack.contractMissing = id, true
-		acks = append(acks, ack)
-		delete(self.contractMissingAcks, id)
-	}
-	select {
-	case <-self.ackNotify:
-	default:
-	}
-	select {
-	case <-self.gapNotify:
-	default:
-	}
-	if len(self.selectiveAcks) != 0 || len(self.contractMissingAcks) != 0 {
-		self.ackNotify <- struct{}{}
-	}
-	return acks, len(self.selectiveAcks) != 0 || len(self.contractMissingAcks) != 0
 }
 
 type sequenceContract struct {

@@ -659,6 +659,21 @@ func tcpInboundNetworkProtocol(endpointId stack.TransportEndpointID) tcpip.Netwo
 	return ipv4.ProtocolNumber
 }
 
+// Called only for a packet validated by tcpInboundFlow. Pure ACKs do not
+// carry origin data. Waiting for their endpoint lock can
+// instead deadlock uploads: its processor holds that lock while filling the
+// outbound queue, whose drain waits for Transfer ACKs behind this callback.
+func tcpInboundAcknowledgementOnly(packet []byte) bool {
+	offset := Ipv6HeaderSize
+	if packet[0]>>4 == 4 {
+		offset = int(packet[0]&15) * 4
+	}
+	transport := packet[offset:]
+	headerSize := int(transport[12]>>4) * 4
+	return headerSize >= TcpHeaderSizeWithoutExtensions && headerSize == len(transport) &&
+		transport[13]&tcpFlagAck != 0 && transport[13]&(tcpFlagSyn|tcpFlagFin|tcpFlagRst) == 0
+}
+
 // addTcpInboundEndpointWithLock records an endpoint once in the current
 // bounded burst. The shard write lock must be held.
 func (self *Tun) addTcpInboundEndpointWithLock(shard *tunTcpInboundShard, endpointId stack.TransportEndpointID) {
@@ -1185,7 +1200,7 @@ func (self *Tun) WriteBatch(packets [][]byte) (int, error) {
 		pkb.DecRef()
 		total += len(packet)
 
-		if tcpInbound && self.advanceTcpInboundShardWithLock(shard, endpointId) {
+		if tcpInbound && !tcpInboundAcknowledgementOnly(packet) && self.advanceTcpInboundShardWithLock(shard, endpointId) {
 			// the shard's burst is full: deliver everything queued so far so
 			// the user-unlock handoff runs against enqueued segments
 			// (write()'s inject-then-synchronize order), and so the shard's
@@ -1204,8 +1219,8 @@ func (self *Tun) WriteBatch(packets [][]byte) (int, error) {
 	// trigger the mid-batch cadence above. gVisor can have queued one of those
 	// packets while a syscall owned the endpoint; without this final
 	// LockUser/UnlockUser handoff there may be no later packet to wake its TCP
-	// processor. The provider NAT has already consumed the upstream bytes, so
-	// that missed tail is permanent rather than recoverable by retransmission.
+	// processor. Complete this handoff promptly; provider TCP replay is the
+	// bounded recovery backstop if a data segment still fails to reach TCP.
 	finalHandoff := false
 	for shardIndex, locked := range lockedShards {
 		if !locked {
@@ -1246,7 +1261,9 @@ func (self *Tun) write(packet []byte, onRelease func()) (int, error) {
 	if tcpInbound {
 		tcpInboundShard = &self.tcpInboundShards[shardIndex]
 		tcpInboundShard.writeLock.Lock()
-		yieldProcessor = self.advanceTcpInboundShardWithLock(tcpInboundShard, endpointId)
+		if !tcpInboundAcknowledgementOnly(packet) {
+			yieldProcessor = self.advanceTcpInboundShardWithLock(tcpInboundShard, endpointId)
+		}
 	}
 
 	// copy the packet
@@ -1272,8 +1289,7 @@ func (self *Tun) write(packet []byte, onRelease func()) (int, error) {
 	if tcpInbound {
 		// A one-packet callback is itself a complete finite burst. Complete
 		// gVisor's user-unlock handoff before returning: deferred execution
-		// can strand a short H1/TLS response behind an unrelated shard or a
-		// worker scheduling delay, and the provider NAT cannot retransmit it.
+		// can delay a short H1/TLS response until provider TCP replay.
 		self.synchronizeTcpInboundProcessorsWithLock(tcpInboundShard)
 		if yieldProcessor {
 			runtime.Gosched()

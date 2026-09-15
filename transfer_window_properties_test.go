@@ -224,6 +224,9 @@ func TestAtEquilibriumOccupancyIsHalfTheWindow(t *testing.T) {
 			settings.TargetGoodputByteRate = 0
 		})
 	harness.receiveHold(mib(64))
+	// This identity is for immediate ACKs. A compressed receiver reserves
+	// additional residence, so occupancy need not be half that larger window.
+	harness.receiver.settings.ReceiveBufferSettings.AckCompressTimeout = 0
 
 	// paired at each tick: occupancy and the window as they stand together
 	ratioTotal := &atomic.Int64{}

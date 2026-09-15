@@ -4413,12 +4413,6 @@ func tcpRstForOrphan(ipVersion int, tcp *parsedTcp) []byte {
 	return packet
 }
 
-/*
-** Important implementation note **
-Packet flow from the user-NAT to the source is assumed to never require
-user-NAT retransmission; transfer must remain lossless. The source TCP stack
-can reorder packets that cross during a route promotion.
-*/
 // writeWithProgressDeadline writes to an upstream socket, bounding
 // ZERO-PROGRESS time rather than total time: the deadline re-arms whenever a
 // write advances, so a peer applying ordinary flow control (accepting data
@@ -4545,6 +4539,10 @@ type TcpSequence struct {
 	// Tests join the pure-acknowledgement worker before inspecting ownership. Nil is a
 	// production no-op.
 	afterPureAckWorkerStopForTest func()
+	// Tests can hold the upload producer while the socket writer enters its
+	// terminal drain. Nil callbacks do not change production scheduling.
+	beforeWritePayloadPublishForTest func([]byte)
+	beforeWritePayloadDrainForTest   func()
 	// Tests observe the exact Run boundary immediately before all child workers
 	// are joined. Nil is a production no-op.
 	beforeChildWorkersWaitForTest func()
@@ -5159,19 +5157,22 @@ func (self *TcpSequence) Run() {
 	}
 
 	writePayloads := make(chan writePayload, self.tcpBufferSettings.SequenceBufferSize)
+	writePayloadsClosed := false
+	defer func() {
+		if !writePayloadsClosed {
+			close(writePayloads)
+		}
+	}()
 	runChildWorker(func() {
-		// best effort return of queued payloads after cancel
+		// Run is the sole producer and closes the channel after its last
+		// publication. Cancellation alone cannot establish an empty queue:
+		// the producer may still be holding the next packet when we stop.
 		defer func() {
-			for {
-				select {
-				case writePayload, ok := <-writePayloads:
-					if !ok {
-						return
-					}
-					MessagePoolReturn(writePayload.ipPacket)
-				default:
-					return
-				}
+			if self.beforeWritePayloadDrainForTest != nil {
+				self.beforeWritePayloadDrainForTest()
+			}
+			for writePayload := range writePayloads {
+				MessagePoolReturn(writePayload.ipPacket)
 			}
 		}()
 		defer self.cancel()
@@ -5923,6 +5924,9 @@ func (self *TcpSequence) Run() {
 				// FIXME - if 0 blocking, double window size
 				// FIXME - if >half blocking, half the window size
 				// FIXME else leave the window size unchanged
+				if self.beforeWritePayloadPublishForTest != nil {
+					self.beforeWritePayloadPublishForTest(writePayload.ipPacket)
+				}
 				select {
 				case writePayloads <- writePayload:
 					nonBlockingByteCount += uint32(len(payload))
@@ -6082,6 +6086,7 @@ func (self *TcpSequence) Run() {
 				// Flush queued payload before propagating the FIN to the upstream
 				// socket and closing the sequence.
 				close(writePayloads)
+				writePayloadsClosed = true
 				fin = true
 				return false
 			}

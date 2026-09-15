@@ -1,8 +1,16 @@
 # Window rule on real paths: peer review and research plan
 
-Status: research plan, 2026-09-15. The new tests and candidate fixes below are
-proposed, not implemented. This review ran existing focused tests; it did not
-reproduce the remote rig measurements.
+Status: peer review and research plan, updated 2026-09-15. Implementation and
+local verification are recorded on `throughput-fix-2`. Sections 1–7 preserve
+the original hypotheses and acceptance criteria; §8 records their current
+disposition and §§9–10 include the requested `server/connect` and
+`server/proxy` regression review.
+See [THROUGHPUT-PR2-RESULTS.md](THROUGHPUT-PR2-RESULTS.md) for measured outcomes
+and [the run script](tools/throughput-fix-2.sh) for reproduction.
+
+The user explicitly directed us to proceed with our own tests without the
+native rig. Its missing source and P37–P44 ledger remain limits on attribution
+to the published measurements, rather than prerequisites for this work.
 
 ## 1. Verdict
 
@@ -48,7 +56,7 @@ Reviewed sources:
 | [THROUGHPUT-REPORT.md](THROUGHPUT-REPORT.md) | Especially §§3.23, 5–6, 8–9: in-process measurement limits, instrument calibration, compression residence, and test coverage. |
 | [THROUGHPUTFIX.md](THROUGHPUTFIX.md) | Especially §§36–38, 49, 53: estimator design, delivery boundary, short-path prediction, design-point measurements. Later corrections supersede earlier claims. |
 | This checkout | `d9eadf29`; nine commits ahead of its local `origin/main`. It has newer fixture repairs than the PR base. File line numbers below refer to this revision unless explicitly marked PR. |
-| Sibling server checkout | `0d91e29d4fdca05fd66794a31f5a16de2d39edb2`, `../server/connect/resident.go`. Confirms a candidate code path, not what the remote relay ran. |
+| Sibling server checkout | `77201554c49ec05bde83ec038bba6c600972892c`, `../server/connect/resident.go` and `../server/proxy`. The checkout is dirty from external work; this review did not modify it. |
 
 The saved presentation cites `REPORT-2026-09-15-UPSTREAM-WINDOW-RULE-AND-PRS.md`
 and ledger P37–P44. Neither is included in the supplied HTML or the published
@@ -453,8 +461,9 @@ path can change the burst or queue problem being measured.
 
 ### Statistical and instrument rules
 
-1. Obtain the missing raw run ledger and harness/configuration artifacts;
-   recompute medians, paired ratios and failure counts. Preserve binary hashes,
+1. Preserve our own raw run ledger, harness and configuration artifacts. If
+   the original ledger becomes available, recompute its medians, paired ratios
+   and failure counts separately. Preserve binary hashes,
    pair identities and all stalled runs. The HTML's expected option-A
    single-flow speed of roughly 750–800 Mb/s must be labeled conditional on a
    healthy run; its four-stack measured median was 248 with 3/4 stalled.
@@ -505,7 +514,7 @@ elsewhere and confirm below the instrument's limit.
 
 ## 7. Execution order and completion criteria
 
-1. **Evidence freeze:** recover ledger/harness, pin builds and relay revision,
+1. **Evidence freeze:** publish our ledger/harness, pin builds and relay revision,
    produce the actual settings/sequence-topology table, reconcile reported
    outcomes and define stall/invalid-run rules.
 2. **Correctness first:** build the H6 delivery-boundary discriminator and H5
@@ -546,6 +555,235 @@ if a median rises.
   attributed to the author. The opt-in `TestTheChainAtTheDesignPoint` campaign
   was not run; its existing environment knobs can seed the later RTT,
   compression and budget sweeps, but it remains a transfer-only instrument.
+
+## 8. Implementation disposition
+
+| Mechanism | Deterministic discriminator and current change |
+|---|---|
+| ACK residence missing from the window | `transfer_window_residence_test.go` checks both the target and delivery terms, absent/zero delay advertisements, timestamp-correct rate samples, sufficient history at 400 ms, and overflow-safe arithmetic. Both terms use minimum RTT plus the receiver's advertised compression bound. Resend timers retain the path RTT. |
+| ACK order, redundant cumulative ACKs, sustained gap wakes | `sequenceAckWindow` is factored into `transfer_ack_compression.go`. Direct tests coalesce interleaved heads into one head, send only ascending SACKs above it, and absorb unsent SACKs when it advances. Gap evidence survives drains, with one early proof per unchanged head. |
+| ACK response size and pacing | The compressor itself enforces a count bound. Worker tests decode actual wire responses, check the head/SACK invariant across overflow, repeat the cumulative head when metadata follows a SACK batch, and use virtual time to assert compression deadlines. Each response reserves at most 8 KiB and 32 entries; metadata reduces the usable count. Eviction lists retain overflow and send at most 512 sequence numbers per carrier. Both codecs and encrypted wrappers are checked with maximal varints. |
+| Fixed 2 ms admission polling | `transfer_capacity_wake_test.go` holds admission closed and proves that capacity release wakes a waiting publisher without advancing virtual time. Capacity changes now signal a generation channel. |
+| Loss after successful Transfer delivery | `ip_tcp_return_recovery_test.go` discards exact inner TCP segments after the Transfer success boundary. Middle, tail, wraparound, IPv6, EOF and healthy-flow controls verify exact bytes. A bounded provider replay cache retains origin chunks through the inner TCP ACK; duplicate ACKs or a bounded timer replay the oldest missing segment. |
+| Deep-window relay bursts | A finite FIFO test reproduces refusal and gap-repair amplification with pacing disabled. H1 data and recovery writes share a service clock and bounded opening probe. Pacing uses delivery evidence, probes spare capacity and leaves drain capacity when backlogged, capped by the configured target. Slow links, feedback delay and independently compressed sibling ACKs have separate controls in §10–11. This identifies the queue mechanism in our fixture; it does not identify the remote relay's drop site. |
+| Upload ACK handoff cycle | `tun_ack_handoff_test.go` holds a real gVisor endpoint lock and proves that pure ACK injection through both `Write` and `WriteBatch` returns. Pure ACKs no longer enter the data handoff's endpoint lock; IPv4/IPv6, options, ECN, payload and lifecycle flags are classified separately. |
+| Upload shutdown ownership | A TCP performance run exposed pooled packets retained after cancellation. `TestTcpSequenceCancelBeforeWritePublicationReturnsPacket` forces the producer to publish after the old consumer's empty drain. The producer now closes on every exit and the writer drains through closure before the worker join. |
+| Provider standby after unusable pinned addresses | Adopted PR standby changes are supplemented by changing-evidence tests for wrapped DNS errors, temporary failures, success, H3 and already-connected pins. |
+
+The default remains the delivery-sized window. A new optional wire field
+advertises compression delay: absent means the historical 10 ms, while
+explicit zero means immediate ACKs. Old decoders ignore the added field.
+
+The local performance fixture covers nine RTTs (0.3–400 ms), one/eight flows,
+and immediate/10 ms ACKs with virtual-time FIFO serialization. Its separate
+TCP workload includes a loopback socket origin, provider NAT, Transfer and
+gVisor TUN in both directions. It counts delivered application bytes over a
+common interval and retains A/A controls, ceiling controls and stalled runs.
+These fixtures do not substitute for native kernel TUN or deployed relay
+measurements. Remaining campaign dimensions in §5 keep that distinction.
+
+## 9. `server/connect` regression review
+
+Reviewed sibling server revision `77201554c49ec05bde83ec038bba6c600972892c`
+against this local connect branch via its existing `go.mod` replacement.
+Server files were reviewed without changing the sibling checkout.
+
+### Forwarding has two separate saturation boundaries
+
+1. `Resident.handleClientForward` shares a frame into destination-stable
+   callback ingress. Production defaults divide 4,096 entries over 16
+   shards: **256 entries per shard**, shared by destinations hashing there.
+   Full ingress returns ownership, increments the receive-boundary drop
+   metric and cancels the resident generation. The existing deterministic
+   `TestResidentForwardCallbackRetiresFullIngressWithoutWaiting` pins that
+   behavior.
+2. The owned `processClientForward` worker feeds a **4,096-entry**
+   `ResidentForward.send` queue. Production `ForwardTimeout=0` makes a full
+   queue increment `forwardDroppedCounter` and discard the frame. Transfer
+   must discover and recover this loss above the reliable socket.
+
+Both paths carry forwarded ACKs and Packs, and the relay can receive encrypted
+frames. A proposed server ACK-priority queue therefore needs authenticated,
+usable classification; it cannot assume plaintext visibility. The local FIFO
+test reproduces the second boundary. It does **not** cover shard collisions,
+resident generation retirement, contract lookup delays or multiple residents
+competing for an actual exchange writer. Server batching can also change
+messages/second at equal byte rate, so bytes alone cannot size these queues.
+
+**Follow-up experiment:** drive the actual resident with one/eight logical
+sequences and multiple destinations (including deliberate shard collisions),
+at the same link rates and RTTs as the local matrix. Record both boundary
+counters, reconnects, per-destination progress and ACK residence. Test loss
+and recovery at ingress and downstream queues separately before changing
+server admission or scheduling. Keep shared callbacks nonblocking.
+
+### Message-size and carrier compatibility
+
+`DefaultConnectHandlerSettings` gives the server framer the connect runtime's
+`MinimumMessageLenLimit()`; the WebSocket read limit includes its four-byte
+framing prefix. Resident exchange framing uses those same settings.
+`TestResidentAdmitsMinimumMessageLenLimit` passes against the branch. Combined
+with the connect tests of encoded ACKs and encrypted wrappers, this covers
+the producer/receiver size contract. H1 ready batches keep messages separately
+framed: their batch count/byte policy is distinct from ACK compression.
+
+Focused server tests for framing, exact carrier properties, exchange batching
+and ownership passed. A **race-enabled deterministic unit run passed**, including
+reliable receive saturation, cancellation, resident ingress retirement,
+bounded H1 batching/FIFO order and H3 ACK reserve configuration. The exact
+selection is reproducible with
+`tools/throughput-fix-2.sh server-connect-deterministic`.
+
+The local environment from `server/connect/test.sh` / `server/test-env.sh`
+was attempted with fail-fast enabled and the documented local endpoints. The
+launcher `ready` marker was absent, so the run used the permitted local
+service override. The Go integration preflight then rejected the checked-in
+test credential at `10.213.0.1:5432` before creating its disposable database.
+The six H1/H3 variants, pool-balance test and directional TCP test are
+therefore **deferred**, rather than reported as passing. This is an environment
+credential mismatch; it does not exercise or falsify the window changes.
+
+The earlier three-trial server TCP readings remain retained as historical
+evidence, but are not promoted to final validation because their source and
+environment differed. Re-run them after the local launcher credentials are
+reconciled, with the all-run ledger policy in §5.
+
+## 9a. `server/proxy` regression review
+
+The same sibling revision was reviewed in `../server/proxy`. The deterministic
+selection covers device memory admission, borrowed packet ownership, WireGuard
+and TUN handoff boundaries, manager close/join, drain coordination, lifecycle
+metrics, window identity restore and bounded traffic metrics. It passes without
+the race detector, matching `server/test.sh`'s explicit wall-clock proxy tier;
+reproduce it with `tools/throughput-fix-2.sh server-proxy`.
+
+The two database-backed WireGuard handoff tests were attempted separately and
+stopped at the same PostgreSQL authentication preflight. Keep that attempt as
+environment evidence and defer it with the `server/connect` integration run.
+The sibling proxy checkout remains unmodified.
+
+## 10. Service-pacing review prompted by deterministic tests
+
+The initial service-pacer hypothesis was incomplete. A configured-target
+limiter fixed the fast finite-relay row but collapsed a 100 Mb/s path. A
+whole-window delivery average avoided that collapse but imposed a second
+startup ramp at 200/400 ms. The next experiments therefore test the service
+estimator and the send schedule independently, followed by actual Transfer
+clients over deterministic serializers.
+
+The follow-up now includes 54 slower-service cells, six capacity changes and
+four logical sequences sharing one finite relay. The shared-path control
+exposed multiplied per-sequence startup allowances, ACK arrival/processing
+confusion, and independently compressed ACK phases being mistaken for a much
+faster serializer. The implementation uses one service budget per live logical
+sequence class, one bounded initial probe, original arrival intervals, and
+first-delivery wire-byte accounting. The probe can span two compressed reply
+intervals, capped at twice the ordinary initial window. A backlogged service
+leaves five percent of measured capacity for draining its queue; otherwise it
+may probe ten percent above observed service. Fresh cumulative progress protects a slow H1 FIFO
+from rewriting its initial train behind itself.
+
+Review and retain the controls for these mechanisms before interpreting host
+throughput: exact byte/time envelopes, rate transitions, initial and idle
+probe limits, shared-producer timing, cancellation and reference lifetime,
+ACK compression phase, SACK/head double-counting, stale fast-rate evidence,
+and a repaired head after slow service. `TestWindowPathGapDeadline` additionally
+pins an exact-deadline receiver spin found during the shared-service run.
+
+The final deterministic matrix and regression reruns are recorded in
+`THROUGHPUT-REPORT-PR2.md`; the earlier full
+suite failed the then-current long-RTT pacer and a structural ownership check.
+The [results report](THROUGHPUT-PR2-RESULTS.md) records the failed hypotheses and
+will distinguish final capacity results from startup/transition loss and the
+remaining actual-server pressure experiments in §9.
+
+## 11. Mismatched endpoint windows
+
+The original local fixture configured identical endpoint budgets. That cannot
+show whether a large sender respects a small receiver, or whether pacing adds
+a second throughput limit when a small sender targets a large receiver.
+
+The new matrix independently configures sender capacity and advertised receive
+capacity at **256 KiB, 2 MiB and 48 MiB**, in all nine ordered combinations.
+Crossing these with **0.3/100/400 ms RTT**, **0/10 ms ACK compression** and
+**one/eight flows** gives **108 cells**. Six further cells change a live receiver
+between **64 KiB and 2 MiB**, in both directions, with 0/10/50 ms compression.
+The estimator tests additionally cover 32 KiB advertisements, limits below the
+sender's working floor, initial sampling and later delivery sampling.
+
+Each performance cell has a constant-window reference clamped to the smaller
+endpoint. Its attainable rate must also agree with the physical service or
+window/residence bound; an underfilled reference cannot validate the candidate.
+The candidate must deliver at least 90% of that reference, make progress on
+every offered flow, respect both limits and avoid steady-state relay loss or
+receive-queue eviction. Window-limited measurements span at least twenty
+residences so a partial flight at an interval edge cannot dominate the result.
+The service and mismatch fixtures offer flows round-robin within each logical
+sequence; independent logical sequences retain separate producers.
+
+These controls already reproduced two defects:
+
+- A 256 KiB working floor overrode a peer advertising only 64 KiB, before and
+  after delivery sampling. An explicit peer/deployment ceiling now bounds the
+  working floor; the shared budget's existing guaranteed-memory policy remains.
+- A small immediate-ACK train could fit wholly inside a sampling bucket, or a
+  larger opening train could straddle its boundaries. Keeping paired first and
+  last arrival checkpoints prevents measuring the following idle gap as service.
+  A separate compressed-tail control covers a full interval followed by a
+  partial final reply, alongside sparse slow replies and independently phased
+  sibling compression.
+- Excess flight alone did not establish a queue: it could still be propagating
+  after a fast opening train. Before one service residence has been delivered,
+  the probe-stop condition also requires excess observed ACK residence.
+- A correct 125 MB/s observation expired after only 40–50 ms, before sends
+  using that rate could return ACKs over a 400 ms path. Retain the peak for a
+  full feedback interval based on stable minimum RTT, not growing queue RTT.
+- While a queue is observed, compressed ACK peaks can keep the sender above
+  actual service. Use a sustained average over a feedback interval and several
+  compression turns, then leave capacity to drain the queue. Tests at four
+  service rates check that newly paced writes actually permit that drain.
+
+An attempted compressed-tail extrapolation was rejected. Moving the previous
+reply's bytes into the following reply's interval doubled a controlled slow
+service estimate from 125,000 to 250,000 B/s, and a shared 1 Mb/s trial fell to
+0.717 Mb/s with recovery traffic. The estimator retains the conservative tail
+observation; queue evidence determines whether further capacity probing stops.
+
+The deterministic mismatch/model/race reruns, ACK benchmark and host TCP
+controls are complete. Preserve their manifests and failure-before logs. The
+configured server/connect and server/proxy integration tiers remain deferred
+until the local launcher and test resources agree on the PostgreSQL credential.
+
+## 12. Adjacent root-cause review and deterministic completion gate
+
+This review follows `CODESTYLE.md`'s bug-fix and test rules: inspect sibling
+paths for the same reasoning error, then force the broken state transition
+before changing production behavior. New positive cases use plain table loops;
+time-dependent cases use virtual time and lifecycle cases use explicit barriers.
+
+| Root-cause family | Adjacent paths reviewed and regression coverage |
+|---|---|
+| ACK residence and delivery arithmetic | Target and delivery window terms, contract announcement lead time, immediate/absent/maximum compression advertisements, checkpoint pairing and history span. A new long-residence contract case produced zero instead of 2 MiB before the sibling multiplication was fixed. |
+| Window limit ordering | Explicit local ceilings, peer limits, unsampled and unbudgeted fallbacks, legacy/zero advertisements, and changing receiver budgets. New tests reproduced unbudgeted 2 MiB sends against 64/32 KiB limits and stale delivery undoing a later 2 MiB capacity increase. Zero capacity retains only the queue's separate one-item progress allowance. |
+| Service sampling | Shared and standalone histories, bucket boundaries, short trains, partial compressed tails, delayed/out-of-order application, duplicate SACKs and cumulative absorption. A new standalone-history test reproduced the four-sample expiration defect. |
+| Queue detection and pacing | Propagation versus queue residence, startup and idle credit, capacity changes, sibling services, cancellation, recovery writes and every byte/time prefix. A new controlled idle-gap case read 31.5625 MB/s for a 125 MB/s active train before the sustained estimate rejected window-limited gaps. |
+| Send/receive clocks | First physical write, ACK arrival, worker application and retransmitted copies. A real paced-write/handoff test measured 110 ms for a 100 ms path because the wire tag preceded a 10 ms local wait. Service RTT now uses first actual write time; ambiguous retransmissions and changed/unreliable carriers cannot establish it. |
+| ACK response bounds and ordering | Struct drain, worker timer/drain, both codecs, encrypted wrappers, eviction metadata and contract-recovery requests. Existing deterministic cases enforce one head plus bounded oldest-first SACKs, absorption, overflow, maximum fields, deadlines and final owned drain. |
+| Gap recovery and admission wakeups | First head, repeated proof, split snapshots, exact gap expiry, related versus unrelated pending ACKs, and capacity notification. Existing tests force each boundary without wall-clock polling. |
+| Inner TCP loss and replay ownership | Middle/tail/EOF loss, wraparound, IPv6, healthy traffic, partial ACKs, already-ACKed read-ahead, shared budget, reserve-before-copy and cancellation. The retained chunk and replay callback boundaries have exact byte and pool-ownership checks. |
+| Upload/TUN lifecycle | Both single and batch TUN paths, pure ACK versus data/control flags, busy endpoint locks, cancellation before payload publication, producer close, writer drain and worker join. Sibling TCP/UDP input queues close under their producer lock before draining; they do not have the late-publication defect fixed in the upload queue. |
+| Standby recovery | H1/H3 dial evidence, wrapped DNS errors, temporary failures, changed evidence, successful reconnect, connected and absent pins. The deterministic transition test checks wakeups as well as the fallback predicate. |
+| Server ingress and lifecycle | Current sibling checkout's lazy forward-shard start, producer admission fence, worker registration, close/join and final late-callback drain; bounded H1 batching and H3 carrier configuration. The expanded server selection passed under the race detector after correcting the script's package working directory. |
+
+The adjacent tests are in `transfer_window_adjacent_test.go`. A large-target
+boundary control already passed and is not counted as a reproduced defect.
+Preserve the failure-before logs separately from passing controls.
+
+The full sweep also exposed an experimental lane-recovery completion-bound
+failure and a short-path host-throughput failure. These remain open until
+isolated; a model or process pass must not hide them. Complete the new model,
+race, host TCP and configured server checks against the final source before
+claiming validation.
 
 [pr213]: https://github.com/urnetwork/connect/pull/213
 [rig]: https://github.com/Ryanmello07/connect/blob/b54f9f72bec116c0986e6c51ed13cc2f01805bee/THROUGHPUT-RIG-REVIEW.md
