@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
@@ -150,6 +151,8 @@ type laneRecoveryLink struct {
 	// took earlier: a reliable lane must never do this, and the rows'
 	// verdicts rest on it (diagnostic).
 	relayInversions atomic.Uint64
+	// Successful data handoffs prove the optional direct lane was exercised.
+	directDelivered atomic.Uint64
 }
 
 // newLaneRecoveryLink connects a sender to a receiver over one reliable
@@ -245,68 +248,44 @@ func newLaneRecoveryLink(
 	link.start = start
 	var forwarders sync.WaitGroup
 	forward := func(from Route, to Route, paced bool) {
-		forwarders.Add(1)
-		var orderLock sync.Mutex
-		nextTicket := uint64(0)
 		lastDelivered := uint64(0)
-		go func() {
-			defer forwarders.Done()
-			for {
-				var frameBytes []byte
+		settings := flightGateTestLaneSettings{
+			latency: latency,
+			deliver: func(b []byte, ticket uint64) {
+				if ticket < lastDelivered {
+					if paced {
+						link.relayInversions.Add(1)
+					}
+				} else {
+					lastDelivered = ticket
+				}
+				directData := from == directOut && decodeFlightGatePackIsData(b)
 				select {
 				case <-ctx.Done():
-					return
-				case frameBytes = <-from:
-				}
-				if frameBytes == nil {
-					continue
-				}
-				nextTicket += 1
-				ticket := nextTicket
-				if paced {
-					pace := serialization
-					if 0 < stepSerialization && stepAfter <= time.Since(start) {
-						pace = stepSerialization
-					}
-					if 0 < stallFor {
-						since := time.Since(start)
-						if stallAfter <= since && since < stallAfter+stallFor {
-							pace += stallAfter + stallFor - since
-						}
-					}
-					select {
-					case <-ctx.Done():
-						MessagePoolReturn(frameBytes)
-						return
-					case <-time.After(pace):
+					MessagePoolReturn(b)
+				case to <- b:
+					if directData {
+						link.directDelivered.Add(1)
 					}
 				}
-				forwarders.Add(1)
-				go func(b []byte, ticket uint64) {
-					defer forwarders.Done()
-					select {
-					case <-ctx.Done():
-						MessagePoolReturn(b)
-						return
-					case <-time.After(latency):
+			},
+		}
+		if paced {
+			settings.serialization = func() time.Duration {
+				pace := serialization
+				if 0 < stepSerialization && stepAfter <= time.Since(start) {
+					pace = stepSerialization
+				}
+				if 0 < stallFor {
+					since := time.Since(start)
+					if stallAfter <= since && since < stallAfter+stallFor {
+						pace += stallAfter + stallFor - since
 					}
-					orderLock.Lock()
-					if ticket < lastDelivered {
-						if paced {
-							link.relayInversions.Add(1)
-						}
-					} else {
-						lastDelivered = ticket
-					}
-					orderLock.Unlock()
-					select {
-					case <-ctx.Done():
-						MessagePoolReturn(b)
-					case to <- b:
-					}
-				}(frameBytes, ticket)
+				}
+				return pace
 			}
-		}()
+		}
+		forwardFlightGateTestLane(ctx, &forwarders, from, settings)
 	}
 	forward(senderOut, receiverIn, true)
 	forward(receiverOut, senderIn, false)
@@ -318,9 +297,16 @@ func newLaneRecoveryLink(
 		cancel()
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer closeCancel()
-		link.sender.CloseAndWait(closeCtx)
-		link.receiver.CloseAndWait(closeCtx)
+		if err := link.sender.CloseAndWait(closeCtx); err != nil {
+			t.Errorf("close lane-recovery sender: %v", err)
+		}
+		if err := link.receiver.CloseAndWait(closeCtx); err != nil {
+			t.Errorf("close lane-recovery receiver: %v", err)
+		}
 		forwarders.Wait()
+		if inversions := link.relayInversions.Load(); inversions != 0 {
+			t.Errorf("reliable lane reordered %d frames", inversions)
+		}
 		for _, route := range []Route{senderOut, receiverIn, receiverOut, senderIn, directOut, directIn} {
 			if route == nil {
 				continue
@@ -643,6 +629,18 @@ func laneRecoverySend(
 	messageCount int,
 ) ClientSendRecoveryStatsSnapshot {
 	t.Helper()
+	return laneRecoverySendWithBarrier(t, link, messageCount, nil)
+}
+
+// An optional quiescence barrier fixes initial Pack admission under simulated
+// time, preventing goroutine scheduling from choosing the offered flight.
+func laneRecoverySendWithBarrier(
+	t testing.TB,
+	link *laneRecoveryLink,
+	messageCount int,
+	afterOffer func(),
+) ClientSendRecoveryStatsSnapshot {
+	t.Helper()
 	content := ""
 	for len(content) < 900 {
 		content += "lane-recovery-"
@@ -657,6 +655,9 @@ func laneRecoverySend(
 		if !link.sender.SendWithTimeout(frame, link.receiverId, nil, 60*time.Second) {
 			MessagePoolReturn(frame.MessageBytes)
 			t.Fatal("the sender refused a message")
+		}
+		if afterOffer != nil {
+			afterOffer()
 		}
 	}
 	delivered := 0
@@ -1027,16 +1028,13 @@ func TestLaneRecoveryRow11HeldItemsDoNotSpin(t *testing.T) {
 	}
 }
 
-// Row 10, both halves asserted separately so each column's failure is
-// legible. During a stall of the relay while the direct lane stays
-// healthy: delivery must continue, and nothing extra must be written into
-// the stalled lane. §29.4 expected merged to lead the first half, because
-// its whole-window rewrite goes p2p-first and the direct lane carries what
-// it can. Measured, it does not: the receiver's stream is ordered, so
-// nothing past the relay-carried head can be delivered however much is
-// rewritten, and the delivered count is the same on every arm at every
-// flight size. So the first half does not separate the trees, and the
-// second half does, by two orders of magnitude.
+// Row 10 compares identical lossless relay stalls beside a healthy direct
+// lane: the lane rule must deliver no less and avoid the baseline's rewrite
+// storm. Initial offers and time are controlled because an uncontrolled
+// wall-clock slice counts an arbitrary amount of traffic already in transit.
+// On this shape, that transit drains at the start of the stall; neither arm
+// then advances the ordered stream before the relay resumes. This establishes
+// no delivery cost for this stall, not ongoing healing or a universal rate.
 func TestLaneRecoveryRow10StallHealingAndWritesIntoTheStalledLane(t *testing.T) {
 	if testing.Short() {
 		t.Skip("lane recovery contract, live link")
@@ -1045,44 +1043,63 @@ func TestLaneRecoveryRow10StallHealingAndWritesIntoTheStalledLane(t *testing.T) 
 		messageCount = 2500
 		stallAfter   = 1500 * time.Millisecond
 		stallFor     = 2750 * time.Millisecond
+		latency      = 100 * time.Millisecond
 	)
-	// more than one direct-flight size, since the claim under test was that
-	// the healing rate should follow the flight
+	assertMessagePoolOwnership(t)
+	// Quiescence after each offer fixes the Pack boundaries; each arm owns a
+	// fresh virtual clock, so both arms see the same offered load and stall.
 	for _, flight := range []int{4, 32} {
 		delivered := map[string]int{}
-		written := map[string]uint64{}
 		for _, arm := range laneRecoveryArms() {
-			link := newLaneRecoveryLink(
-				t, 100*time.Millisecond, 2*time.Millisecond,
-				stallAfter, stallFor, 2048, 0, 0, flight, arm.configure)
-			stats := laneRecoverySend(t, link, messageCount)
-			link.deliveryLock.Lock()
-			times := append([]time.Time(nil), link.deliveryTimes...)
-			link.deliveryLock.Unlock()
-			during := 0
-			for _, at := range times {
-				if since := at.Sub(link.start); stallAfter <= since &&
-					since < stallAfter+stallFor {
-					during += 1
+			synctest.Test(t, func(t *testing.T) {
+				link := newLaneRecoveryLink(
+					t, latency, 2*time.Millisecond,
+					stallAfter, stallFor, 2048, 0, 0, flight, arm.configure)
+				stats := laneRecoverySendWithBarrier(t, link, messageCount, synctest.Wait)
+				link.deliveryLock.Lock()
+				times := append([]time.Time(nil), link.deliveryTimes...)
+				link.deliveryLock.Unlock()
+				during := 0
+				afterTransit := 0
+				for _, at := range times {
+					if since := at.Sub(link.start); stallAfter <= since &&
+						since < stallAfter+stallFor {
+						during += 1
+						if stallAfter+latency < since {
+							afterTransit += 1
+						}
+					}
 				}
-			}
-			delivered[arm.name] = during
-			written[arm.name] = stats.TimeoutResendWriteCount
-			t.Logf("%s: row 10 at flight %d: delivered %d frames during the stall, wrote %d%s, relay inversions %d",
-				arm.name, flight, during, stats.TimeoutResendWriteCount,
-				laneRecoveryDetailForTree(stats), link.relayInversions.Load())
+				delivered[arm.name] = during
+				t.Logf("%s: row 10 at flight %d: delivered %d frames during the stall (%d after transit drained), direct carried %d overall, wrote %d%s, relay inversions %d",
+					arm.name, flight, during, afterTransit, link.directDelivered.Load(), stats.TimeoutResendWriteCount,
+					laneRecoveryDetailForTree(stats), link.relayInversions.Load())
+				if afterTransit != 0 {
+					t.Errorf("%s: flight %d delivered %d frames after transit drained; the controlled stall changed", arm.name, flight, afterTransit)
+				}
+				if link.directDelivered.Load() == 0 {
+					t.Errorf("%s: flight %d did not exercise the direct lane", arm.name, flight)
+				}
+				if len(times) != messageCount || !times[len(times)-1].After(link.start.Add(stallAfter+stallFor)) {
+					t.Errorf("%s: flight %d did not deliver all %d frames across the stall", arm.name, flight, messageCount)
+				}
+				if !arm.readsLanes && stats.TimeoutResendWriteCount == 0 {
+					t.Errorf("%s: flight %d did not exercise the baseline rewrite", arm.name, flight)
+				}
 
-			// the second half: nothing extra written into the stalled lane
-			const bound = 10
-			if arm.readsLanes && bound < int(stats.TimeoutResendWriteCount) {
-				t.Errorf(
-					"%s: row 10 at flight %d: wrote %d retransmits into a stalled lane, want at "+
-						"most %d; the bound must hold at every flight size",
-					arm.name, flight, stats.TimeoutResendWriteCount, bound,
-				)
-			}
+				// the second half: nothing extra written into the stalled lane
+				const bound = 10
+				if arm.readsLanes && bound < int(stats.TimeoutResendWriteCount) {
+					t.Errorf(
+						"%s: row 10 at flight %d: wrote %d retransmits into a stalled lane, want at "+
+							"most %d; the bound must hold at every flight size",
+						arm.name, flight, stats.TimeoutResendWriteCount, bound,
+					)
+				}
+			})
 		}
-		// the first half: a tree that reads lanes must not deliver less
+		// Both arms see exactly the same pre-stall transit, so equality is an
+		// exact oracle here; an arbitrary ratio would hide a changed stimulus.
 		var perItem, perLane int
 		var havePerLane bool
 		for _, arm := range laneRecoveryArms() {
@@ -1092,10 +1109,10 @@ func TestLaneRecoveryRow10StallHealingAndWritesIntoTheStalledLane(t *testing.T) 
 				perItem = delivered[arm.name]
 			}
 		}
-		if havePerLane && 0 < perItem && perLane < perItem/2 {
+		if havePerLane && (perItem == 0 || perLane != perItem) {
 			t.Errorf(
-				"at flight %d a tree that reads lanes delivered %d frames during the stall "+
-					"against %d, so probing one item costs delivery the rewrite would have bought",
+				"at flight %d the lane rule delivered %d frames during the controlled stall "+
+					"against %d; want equal nonzero delivery from identical pre-stall transit",
 				flight, perLane, perItem,
 			)
 		}

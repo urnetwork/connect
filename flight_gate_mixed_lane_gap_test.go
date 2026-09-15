@@ -18,6 +18,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
@@ -194,6 +195,9 @@ type mixedLaneOptions struct {
 	blockFastReplies   bool
 	directLaneDisabled bool
 	deferTimeoutResend bool
+	// Borrows the slow-lane frame before delivery; deterministic ordering
+	// tests may hold the first handoff while later frames become ready.
+	beforeSlowDelivery func([]byte)
 	// fastDropFraction drops that share of the direct lane's frames, from a
 	// seeded source so a run repeats. The relay never drops.
 	fastDropFraction float64
@@ -497,63 +501,54 @@ func newMixedLaneHarnessWithOptions(
 		holeOpened.Store(true)
 		return true
 	}
-	// Held frames, released together once enough have piled up behind the hole.
-	// Counted rather than timed, so the release point is a property of the run
-	// rather than of how fast the machine is. Each is remembered with its own
-	// lane's delivery, so a release on one lane does not carry the other
-	// lane's frames down the wrong route, and the release is concurrent so it
-	// does not serialise a batch behind one lane's latency.
-	type heldFrame struct {
-		frameBytes []byte
-		deliver    func([]byte)
-	}
+	// Each lane retains its own ordered frames behind a shared counted hold.
+	// Once full, the batch propagates concurrently across lanes, once per
+	// lane's latency. No same-lane delivery may overtake the held prefix.
 	var holdLock sync.Mutex
-	var heldFrames []heldFrame
+	heldCount := 0
 	holdReleased := false
-	holdFrame := func(frameBytes []byte, deliver func([]byte)) bool {
+	holdReleases := map[time.Duration]chan struct{}{}
+	holdFrame := func(frameBytes []byte, latency time.Duration) <-chan struct{} {
 		if options.holdAfterFastDrop <= 0 ||
 			(options.fastDropOnce <= 0 && options.dataDropOnce <= 0) {
-			return false
+			return nil
 		}
 		if !decodeFlightGatePackIsData(frameBytes) {
-			return false
+			return nil
 		}
 		holdLock.Lock()
 		defer holdLock.Unlock()
 		if holdReleased {
-			return false
+			return nil
 		}
 		// only after the hole exists, so the held frames are the ones that
 		// cannot be delivered and must queue
 		if !holeOpened.Load() {
-			return false
-		}
-		heldFrames = append(heldFrames, heldFrame{frameBytes: frameBytes, deliver: deliver})
-		return true
-	}
-	takeHeldFrames := func() []heldFrame {
-		holdLock.Lock()
-		defer holdLock.Unlock()
-		if holdReleased || len(heldFrames) < options.holdAfterFastDrop {
 			return nil
 		}
-		holdReleased = true
-		released := heldFrames
-		heldFrames = nil
-		harness.holdReleasedCount.Store(int64(len(released)))
-		return released
-	}
-	// A run that ends before the count is reached leaves frames in the hold.
-	// Return them rather than leak their pool roots: this cleanup is
-	// registered before the harness's own, so it runs after the clients close.
-	t.Cleanup(func() {
-		holdLock.Lock()
-		defer holdLock.Unlock()
-		for _, held := range heldFrames {
-			MessagePoolReturn(held.frameBytes)
+		release := holdReleases[latency]
+		if release == nil {
+			release = make(chan struct{})
+			holdReleases[latency] = release
 		}
-		heldFrames = nil
-	})
+		heldCount += 1
+		if heldCount == options.holdAfterFastDrop {
+			holdReleased = true
+			harness.holdReleasedCount.Store(int64(heldCount))
+			for delay, released := range holdReleases {
+				harness.forwarders.Add(1)
+				go func() {
+					defer harness.forwarders.Done()
+					select {
+					case <-ctx.Done():
+					case <-time.After(delay):
+					}
+					close(released)
+				}()
+			}
+		}
+		return release
+	}
 
 	// a run of consecutive relay sequence positions is dropped, once each:
 	// the batch nothing can prove. Dropping by position rather than by a
@@ -607,11 +602,10 @@ func newMixedLaneHarnessWithOptions(
 		loss *laneLossProcess,
 		carried *atomic.Uint64,
 	) {
-		deliver := func(b []byte) {
+		prepare := func(b []byte) (bool, <-chan struct{}) {
 			if to == receiverInFast && dropOnce(b) {
 				harness.fastDropped.Add(1)
-				MessagePoolReturn(b)
-				return
+				return false, nil
 			}
 			if (to == receiverInFast || to == receiverInSlow) && dropDataOnce(b) {
 				if to == receiverInFast {
@@ -619,107 +613,65 @@ func newMixedLaneHarnessWithOptions(
 				} else {
 					harness.slowDropped.Add(1)
 				}
-				MessagePoolReturn(b)
-				return
+				return false, nil
 			}
 			if to == receiverInSlow && dropRun(b) {
 				harness.slowDropped.Add(1)
-				MessagePoolReturn(b)
-				return
+				return false, nil
 			}
 			if loss != nil {
 				dropLock.Lock()
 				dropIt := loss.lost()
 				dropLock.Unlock()
 				if dropIt {
-					harness.fastDropped.Add(1)
-					MessagePoolReturn(b)
-					return
+					if to == receiverInSlow {
+						harness.slowDropped.Add(1)
+					} else {
+						harness.fastDropped.Add(1)
+					}
+					return false, nil
 				}
 			}
 			if carried != nil {
 				carried.Add(1)
 			}
-			timer := time.NewTimer(latency)
-			defer timer.Stop()
-			select {
-			case <-ctx.Done():
-				MessagePoolReturn(b)
-				return
-			case <-timer.C:
-			}
-			select {
-			case <-ctx.Done():
-				MessagePoolReturn(b)
-			case to <- b:
-			}
-		}
-		deliverOrHold := func(b []byte) {
 			if to == receiverInFast || to == receiverInSlow {
-				if holdFrame(b, deliver) {
-					// held; released together once the count is reached, each on
-					// its own lane and concurrently
-					for _, released := range takeHeldFrames() {
-						harness.forwarders.Add(1)
-						go func(released heldFrame) {
-							defer harness.forwarders.Done()
-							released.deliver(released.frameBytes)
-						}(released)
-					}
-					return
-				}
+				return true, holdFrame(b, latency)
 			}
-			deliver(b)
+			return true, nil
 		}
-		harness.forwarders.Add(1)
-		go func() {
-			defer harness.forwarders.Done()
-			for {
+		settings := flightGateTestLaneSettings{
+			latency:     latency,
+			queueFrames: max(256, options.holdAfterFastDrop),
+			prepare:     prepare,
+			deliver: func(b []byte, _ uint64) {
+				if to == receiverInSlow && options.beforeSlowDelivery != nil {
+					options.beforeSlowDelivery(b)
+				}
 				select {
 				case <-ctx.Done():
-					return
-				case transferFrameBytes := <-from:
-					if transferFrameBytes == nil {
-						continue
-					}
-					if serialization <= 0 {
-						// unpaced: the lane has latency but no queue of its own
-						harness.forwarders.Add(1)
-						go func(b []byte) {
-							defer harness.forwarders.Done()
-							deliverOrHold(b)
-						}(transferFrameBytes)
-						continue
-					}
-					pace := serialization
-					if stepped := slowSerializationNow(); to == receiverInSlow && 0 < stepped {
-						pace = stepped
-					}
-					if to == receiverInSlow && 0 < options.slowStallFor {
-						// the relay holds everything for one stretch
-						since := time.Since(harnessStart)
-						if options.slowStallAfter <= since &&
-							since < options.slowStallAfter+options.slowStallFor {
-							pace += options.slowStallAfter + options.slowStallFor - since
-						}
-					}
-					timer := time.NewTimer(pace)
-					select {
-					case <-ctx.Done():
-						timer.Stop()
-						MessagePoolReturn(transferFrameBytes)
-						return
-					case <-timer.C:
-					}
-					timer.Stop()
-					harness.forwarders.Add(1)
-					go func(b []byte) {
-						defer harness.forwarders.Done()
-						deliverOrHold(b)
-					}(transferFrameBytes)
+					MessagePoolReturn(b)
+				case to <- b:
 				}
+			},
+		}
+		if 0 < serialization {
+			settings.serialization = func() time.Duration {
+				pace := serialization
+				if stepped := slowSerializationNow(); to == receiverInSlow && 0 < stepped {
+					pace = stepped
+				}
+				if to == receiverInSlow && 0 < options.slowStallFor {
+					since := time.Since(harnessStart)
+					if options.slowStallAfter <= since &&
+						since < options.slowStallAfter+options.slowStallFor {
+						pace += options.slowStallAfter + options.slowStallFor - since
+					}
+				}
+				return pace
 			}
-		}()
+		}
+		forwardFlightGateTestLane(ctx, &harness.forwarders, from, settings)
 	}
 	forward(senderOutFast, receiverInFast, fastDelay, options.fastSerialization, fastLoss, &harness.fastCarried)
 	forward(senderOutSlow, receiverInSlow, slowDelay, options.slowSerialization, slowLoss, &harness.slowCarried)
@@ -926,6 +878,74 @@ func TestDefaultSendBufferSettingsDeferTimeoutResendWhileProgressing(t *testing.
 	if settings.TimeoutResendDeferLimit <= 0 {
 		t.Fatalf("the defer limit is %d, so a stalled lane would never resend", settings.TimeoutResendDeferLimit)
 	}
+}
+
+// Exercise the shared FIFO through the actual mixed-lane fixture: a blocked
+// reliable handoff must keep every later frame out of the delivery callback.
+func TestMixedLaneReliableForwarderKeepsBlockedHeadAheadOfLaterDelivery(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		releaseHead := make(chan struct{})
+		var releaseOnce sync.Once
+		release := func() { releaseOnce.Do(func() { close(releaseHead) }) }
+		defer release()
+		var headEntered atomic.Bool
+		laterDeliveries := make(chan uint64, 2)
+		harness := newMixedLaneHarnessWithOptions(t, mixedLaneOptions{
+			directLaneDisabled: true,
+			slowLatency:        time.Second,
+			beforeSlowDelivery: func(frameBytes []byte) {
+				sequenceNumber, data := decodeFlightGatePackSequenceNumber(frameBytes)
+				if !data {
+					return
+				}
+				if headEntered.CompareAndSwap(false, true) {
+					<-releaseHead
+					return
+				}
+				laterDeliveries <- sequenceNumber
+			},
+		})
+		for index := range 2 {
+			sendTransferFlightTestMessage(t, harness.sender, harness.receiverId, index)
+			synctest.Wait()
+		}
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if !headEntered.Load() {
+			t.Error("the reliable lane never reached its held head")
+		}
+		select {
+		case position := <-laterDeliveries:
+			t.Errorf("reliable lane attempted position %d while its head delivery was blocked", position)
+		default:
+		}
+		release()
+		synctest.Wait()
+		select {
+		case <-laterDeliveries:
+		default:
+			t.Error("releasing the head did not admit the later delivery")
+		}
+	})
+}
+
+// The shared admission predicate must retain exact lane attribution when it
+// drops at the reliable endpoint; this is not a direct-lane loss.
+func TestMixedLaneReliableEndpointLossIsAttributedToSlowLane(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		harness := newMixedLaneHarnessWithOptions(t, mixedLaneOptions{
+			directLaneDisabled: true,
+			slowDropFraction:   1,
+		})
+		sendTransferFlightTestMessage(t, harness.sender, harness.receiverId, 0)
+		synctest.Wait()
+		if harness.slowDropped.Load() == 0 || harness.fastDropped.Load() != 0 {
+			t.Errorf("reliable endpoint loss: slow=%d fast=%d, want loss only on the slow lane",
+				harness.slowDropped.Load(), harness.fastDropped.Load())
+		}
+	})
 }
 
 // FLIGHTGATEFIX §19.6 pre-flight. A lossy direct lane at the campaign's
