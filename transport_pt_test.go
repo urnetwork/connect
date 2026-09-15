@@ -443,12 +443,17 @@ func ptEncodeDecodeTest(t *testing.T, ipVersion int, clientPtMode PacketTranslat
 				DisablePathMTUDiscovery: true,
 			}
 
-			serverCtx, serverCancel := context.WithCancel(handleCtx)
+			clientReadComplete := make(chan struct{})
+			serverReadComplete := make(chan struct{})
 			errCh := make(chan error, 4)
+			var reportErrOnce sync.Once
 			reportErr := func(err error) bool {
 				if err == nil {
 					return false
 				}
+				reportErrOnce.Do(func() {
+					t.Logf("dns iteration %d attempt %d: %v", i, currentAttemptIndex+1, err)
+				})
 				select {
 				case errCh <- err:
 				default:
@@ -509,7 +514,6 @@ func ptEncodeDecodeTest(t *testing.T, ipVersion int, clientPtMode PacketTranslat
 			serverDone := make(chan struct{})
 			go func() {
 				defer close(serverDone)
-				defer serverCancel()
 				// defer ptConn.Close()
 				// defer earlyListener.Close()
 
@@ -530,9 +534,9 @@ func ptEncodeDecodeTest(t *testing.T, ipVersion int, clientPtMode PacketTranslat
 					return
 				}
 
-				writeCtx, writeCancel := context.WithCancel(handleCtx)
+				writeComplete := make(chan struct{})
 				go func() {
-					defer writeCancel()
+					defer close(writeComplete)
 					stream.SetWriteDeadline(ioDeadline())
 					m, err := stream.Write(data)
 					if err != nil {
@@ -545,7 +549,7 @@ func ptEncodeDecodeTest(t *testing.T, ipVersion int, clientPtMode PacketTranslat
 				}()
 				defer func() {
 					closeEarlyConnection()
-					<-writeCtx.Done()
+					<-writeComplete
 				}()
 
 				readData := make([]byte, 0, len(data))
@@ -574,12 +578,11 @@ func ptEncodeDecodeTest(t *testing.T, ipVersion int, clientPtMode PacketTranslat
 					reportErr(fmt.Errorf("server read data mismatch"))
 					return
 				}
+				close(serverReadComplete)
 
-				select {
-				case err := <-errCh:
-					reportErr(err)
+				if err := waitForPacketTranslationTestExchange(handleCtx, writeComplete, clientReadComplete); err != nil {
+					reportErr(fmt.Errorf("server exchange: %w", err))
 					return
-				case <-writeCtx.Done():
 				}
 
 			}()
@@ -638,9 +641,9 @@ func ptEncodeDecodeTest(t *testing.T, ipVersion int, clientPtMode PacketTranslat
 				return false
 			}
 
-			writeCtx, writeCancel := context.WithCancel(handleCtx)
+			writeComplete := make(chan struct{})
 			go func() {
-				defer writeCancel()
+				defer close(writeComplete)
 				stream.SetWriteDeadline(ioDeadline())
 				m, err := stream.Write(data)
 				if err != nil {
@@ -653,7 +656,7 @@ func ptEncodeDecodeTest(t *testing.T, ipVersion int, clientPtMode PacketTranslat
 			}()
 			defer func() {
 				closeConnection()
-				<-writeCtx.Done()
+				<-writeComplete
 			}()
 
 			readData := make([]byte, 0, len(data))
@@ -686,23 +689,18 @@ func ptEncodeDecodeTest(t *testing.T, ipVersion int, clientPtMode PacketTranslat
 				reportErr(fmt.Errorf("client read data mismatch"))
 				return false
 			}
+			close(clientReadComplete)
 
-			select {
-			case err := <-errCh:
-				fmt.Printf("connection issue: %s\n", err)
+			if err := waitForPacketTranslationTestExchange(handleCtx, writeComplete, serverReadComplete); err != nil {
+				reportErr(fmt.Errorf("client exchange: %w", err))
 				return false
-			case <-writeCtx.Done():
-				// case <- time.After(60 * time.Second):
-				// 	t.FailNow()
 			}
 
 			select {
 			case err := <-errCh:
 				fmt.Printf("connection issue: %s\n", err)
 				return false
-			case <-serverCtx.Done():
-				// case <- time.After(60 * time.Second):
-				// 	t.FailNow()
+			case <-serverDone:
 			}
 			select {
 			case err := <-errCh:
@@ -719,6 +717,27 @@ func ptEncodeDecodeTest(t *testing.T, ipVersion int, clientPtMode PacketTranslat
 		}
 	}
 
+}
+
+// A stream Write can return with unsent or unacknowledged frames. Both endpoints
+// retain their connections until their writer is done and their peer has read
+// and verified the complete payload; cancellation releases a failed exchange.
+func waitForPacketTranslationTestExchange(
+	ctx context.Context,
+	writeComplete <-chan struct{},
+	peerReadComplete <-chan struct{},
+) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-writeComplete:
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-peerReadComplete:
+	}
+	return ctx.Err()
 }
 
 // runPacketTranslationAttempts reforms the sockets after a retryable QUIC
