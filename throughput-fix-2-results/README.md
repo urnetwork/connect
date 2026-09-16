@@ -175,6 +175,15 @@ run: eight readings and two accepted comparisons. Both use unchanged Transfer
 budgets, retain all calibration outcomes and record concurrent host load. Their
 FIFO/userspace-TUN scope is separate from physical H1 and SDK acceptance.
 
+`physical-h1-duplex-diagnostics` preserves the first isolated physical duplex
+extension: one cleanup interruption and two complete A/B/A attempts, each with
+a failed and excluded comparison. All six numerical readings, constructor
+settings, ownership outcomes and source/binary pins are retained. References
+also stall, so this is diagnostic evidence for further TUN/feedback investigation,
+not an accepted pacing comparison. It uses an owned unauthenticated relay,
+userspace TUN and disabled Transfer encryption; the final attempt uses one
+actual provider dispatcher and fixed synthetic flow ports.
+
 `sdk-ack-tail-v3-evidence` retains 14 complete diagnostic runs, all 122 numerical
 readings and 170 normalized outcomes. The candidate remains unlanded/rejected:
 improved SDK feedback recovery comes with a real RTT-growth regression. Passing

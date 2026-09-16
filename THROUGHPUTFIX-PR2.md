@@ -1238,6 +1238,17 @@ count to arrive before recognizing a slowdown; include bounded adaptation,
 small windows, shared services and compressed ACK bursts as controls. This is
 a hypothesis under test, not an accepted estimator change.
 
+The first cycle implementation still recomputed old samples using the current
+flight and RTT. Excluding the new partial ACK alone therefore did not provide
+zero-order hold. An isolated correction returns the last accepted rate unchanged
+until a real timestamp pair or fully accounted physical tail completes the
+cycle. It passes the exact RTT-growth case three times. Completion must use
+actually proved and applied bytes: a drained flag alone precedes coalesced
+ACK-byte application. Further review also requires a newer accepted cycle to
+retire older incomplete evidence, so delayed old bytes cannot restore an old
+rate. Force these orderings, epoch resets, read-only statistics, changed
+compression intervals and cycles longer than the bounded ring before landing.
+
 The induced host replay experiment now records one actual NAT replay per arm.
 Disabling only the source-idle delimiter drops the candidate's service estimate
 from 116,086,811 to 19,038 B/s; the corrected arm holds its preceding rate.
@@ -1280,6 +1291,36 @@ readings in `tcp-grouped-fixture` and `tcp-grouped-capacity`. The control change
 both the TCP buffer maximum and measurement duration, so it does not by itself
 attribute default underfill to either setting. These generic FIFO/userspace-TUN
 campaigns do not close physical SDK duplex or broader host confirmation.
+
+## 26. Break the full-duplex TUN handoff dependency
+
+The first physical duplex experiments cannot calibrate: reference arms can
+stall as well as the candidate. A fresh process with only one constant-window
+arm reproduces the stall, excluding prior-arm TCP port or TUN-address reuse
+as a necessary trigger. A captured stack identifies this dependency:
+
+1. A reliable Transfer receive worker injects TCP data carrying an ACK through
+   `Tun.WriteBatch`, holds the GRO lock, and waits for the TCP endpoint lock in
+   the explicit user-unlock handoff.
+2. That endpoint's TCP processor is waiting for outbound TUN queue space.
+3. The TUN drainer is waiting for Transfer send admission. Its capacity-release
+   ACK is behind receive work blocked by the first worker.
+
+The existing pure-ACK bypass tests do not cover data carrying ACKs. Force the
+cycle for both `Write` and `WriteBatch` against unchanged production, then
+review the explicit handoff against gVisor's own enqueue/unlock wake contract.
+The fix must retain finite-response progress without waiting for an endpoint
+lock inside the shared receive path. Keep outbound queues and any handoff state
+bounded, preserve borrowed packet ownership, and join all lifecycle work.
+
+Adjacent checks must include user-owned and processor-owned endpoint locks,
+GRO enabled and disabled, partial and full bursts, IPv4 and IPv6, same-flow
+ordering, unrelated flows sharing a shard, and cancellation with pending work.
+Retain finite-tail delivery and provider replay tests so removing the lock wait
+cannot silently reintroduce the original short-response failure. Update stale
+comments that assume the NAT has no return replay. After deterministic checks,
+repeat the same physical duplex controls with unchanged memory limits and
+per-direction calibration; preserve every interrupted and excluded attempt.
 
 [pr213]: https://github.com/urnetwork/connect/pull/213
 [rig]: https://github.com/Ryanmello07/connect/blob/b54f9f72bec116c0986e6c51ed13cc2f01805bee/THROUGHPUT-RIG-REVIEW.md

@@ -863,7 +863,29 @@ This is one 100 Mb/s download cell with 2.5 s warmup and 5 s measurement per
 arm, an owned unauthenticated relay, Transfer encryption disabled and userspace
 TUN. It does not complete native-TUN, actual-server, 1 Gb/s, bidirectional,
 multiple-peer or long-duration acceptance. Physical reproduction of the
-affected eight-flow SDK duplex cell is the next carrier experiment.
+affected eight-flow SDK duplex cell remains under investigation.
+
+The first duplex extension uses eight full-duplex TCP connections, a
+server-budget peer and the constrained H1 provider. One attempt stops during
+cleanup because the server profile has no Pack pool; it supplies no numerical
+comparison. After correcting that fixture assumption, the direct-callback
+and actual-provider A/B/A runs both fail their gates and are excluded by their
+controls. The direct-callback references stall. With the real provider
+dispatcher, the first reference reaches 539.159 Mb/s download and 471.976 Mb/s
+upload, while the candidate and final reference stall. Transfer and H1 record
+no drops, but TUN output and provider TCP-control return refusals occur. Pools
+reconcile. All six readings, both failed/excluded comparisons and the initial
+interruption remain in `physical-h1-duplex-diagnostics`; none is accepted
+throughput evidence or an isolated pacing comparison.
+
+A fresh-process, single constant-window arm also stalls, so prior-arm port or
+TUN reuse is not required. Its stack identifies an independent full-duplex
+dependency: the receive worker waits for a TCP endpoint lock after injecting
+data; that endpoint's processor waits for outbound TUN space; the TUN drainer
+waits for Transfer admission whose release feedback is behind blocked receive
+work. The pure-ACK bypass does not cover data carrying ACKs. Deterministic
+reproduction and the gVisor handoff review are tracked in research-plan §26.
+No TUN correction for this case has been accepted yet.
 
 ### Generic TCP matrix after correcting packet groups
 

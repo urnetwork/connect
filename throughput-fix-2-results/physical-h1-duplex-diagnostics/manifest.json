@@ -1,0 +1,102 @@
+{
+  "artifact": "sanitized frozen physical-H1 duplex diagnostic evidence",
+  "base_connect_canonical_source_sha256": "b6abfa4edec7ef3da125a9431a5231d8d7125c9f76072e4bdd8f375f03a8f8b4",
+  "contents": [
+    {
+      "bytes": 3877,
+      "name": "comparisons.jsonl",
+      "sha256": "b42bee1246d538d949e5ea64ae5f7bb4294bdd31bddf77cccdb371137df79e7f"
+    },
+    {
+      "bytes": 6539,
+      "name": "constructor-settings.json",
+      "sha256": "d030aa49711bf2cd2e87f19342e8a7be2011c841cb05fa65f154200a43a8e0ea"
+    },
+    {
+      "bytes": 4136,
+      "name": "outcomes.jsonl",
+      "sha256": "2c911b5a8752a52e04374b794f43b2d95d5c68a723e3d29b8dadfa77c136078e"
+    },
+    {
+      "bytes": 8615,
+      "name": "provenance.json",
+      "sha256": "0d944e0d373a2a9b1e0de34dc5ac29f611e1a2daca41c4c23f6e51fc6e17d4a9"
+    },
+    {
+      "bytes": 46943,
+      "name": "readings-actual-provider.jsonl",
+      "sha256": "828aa070424d8745b39477cb3d99cc31b6b5e8fa2c432037f7279108fd717d64"
+    },
+    {
+      "bytes": 45223,
+      "name": "readings-direct-callback.jsonl",
+      "sha256": "4851155f9e5de7ff0a247da03fb72268412edb835fce6c75ed3ee6f3e6daf553"
+    },
+    {
+      "bytes": 5303,
+      "name": "summary.json",
+      "sha256": "a760822927ea902a0ffe32c6e7c9f583871944504ceea6d07d33265e580cc95f"
+    }
+  ],
+  "copied_snapshot_git_head": "1bf11158c107b978a21eca5c9df0ad1ecf613985",
+  "copied_snapshot_git_head_interpretation": "Git metadata from the copied snapshot, distinct from the base canonical source and per-stage effective diagnostic source pins.",
+  "counts": {
+    "accepted_comparisons": 0,
+    "actual_provider_readings": 3,
+    "censored_comparisons": 2,
+    "comparisons": 2,
+    "completed_three_arm_attempts": 2,
+    "constructor_setting_sets": 1,
+    "direct_callback_readings": 3,
+    "failed_comparisons": 2,
+    "frozen_attempts": 3,
+    "full_numerical_readings": 6,
+    "initial_nil_pack_pool_interruptions": 1,
+    "unreported_arms_in_completed_attempts": 0
+  },
+  "current_production_fidelity_audit": {
+    "audited_current_commit_short": "01ce6a6b",
+    "expected_test_only_difference": {
+      "current_checkout_sha256": "f6b89c1adaeaba9de463b6e42af0276d69ace98ff37e4c41037ea7dc9ac12231",
+      "file": "transfer_window_h1_physical_test.go",
+      "frozen_isolated_snapshot_sha256": "bc7b10c6690c60bf0b6a7d583668caeb45a7c8e0f99b3f7ec7f0ac5080729fae"
+    },
+    "missing_tracked_go_files": 0,
+    "production_source_matches_base_b6_after_excluding_expected_test_only_difference": true,
+    "tracked_go_files_compared": 710
+  },
+  "effective_diagnostic_source_sha256s": [
+    {
+      "attempt_id": "initial-nil-pack-pool-interruption",
+      "sha256": "ffaf334b667667968c4e6fdce2e8b4fbafa4a9e81f61a2e7ef735310adc271a9"
+    },
+    {
+      "attempt_id": "direct-callback-calibration-censored",
+      "sha256": "65d3ee7abd5a6e911668014ddc1a44e5fd0fb86d6dc896c7fe5c1e0dadc64eea"
+    },
+    {
+      "attempt_id": "actual-provider-dispatcher-censored",
+      "sha256": "fc9e430c0e47e6c7e0339c503477e45de5561c864adde20138b770a5fc209d7c"
+    }
+  ],
+  "redaction": "No raw logs, source or overlay contents, binaries, commands, absolute paths, or trace text are copied. Raw inputs are represented only by hashes and normalized evidence. The generated TUN address is abstracted consistently while its cross-arm equality is retained.",
+  "schema": "throughput-fix-2/physical-h1-duplex-diagnostics-manifest-v1",
+  "source_handoff_sha256": "a981745cc3868200a658649dc007100ec8994bfc25787db0d863fbfff684d52e",
+  "status": "diagnostic/censored; no accepted paired throughput conclusion",
+  "verification": {
+    "all_censors_and_failure_reasons_retained": true,
+    "all_six_numerical_readings_match_handoff": true,
+    "all_stage_effective_source_and_binary_pins_match_handoff": true,
+    "all_stage_manifest_hashes_match_handoff": true,
+    "all_three_attempts_accounted_for": true,
+    "all_two_comparisons_exactly_match_handoff": true,
+    "constructor_settings_extracted_from_every_reading": true,
+    "copied_snapshot_git_head_distinguished_from_effective_source_pins_and_base_canonical_source": true,
+    "current_production_audit_records_710_tracked_go_files_no_missing_and_one_expected_test_only_difference": true,
+    "direct_callback_and_actual_provider_runs_retained_separately": true,
+    "generated_tun_address_literals_abstracted_with_equality_retained": true,
+    "initial_nil_pack_pool_interruption_retained": true,
+    "redaction_scan_passed": true,
+    "source_handoff_sha256_matches": true
+  }
+}

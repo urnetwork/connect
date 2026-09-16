@@ -83,6 +83,14 @@ separately; it does not replace the default-buffer exclusions or isolate the
 effect of the buffer change from measurement duration. Both campaigns ran
 under recorded concurrent work using the generic FIFO/userspace-TUN fixture.
 
+The first physical duplex extension does not calibrate: both three-arm runs
+fail and are excluded by their controls, including stalled reference arms.
+All six readings and an earlier cleanup interruption are retained in
+`physical-h1-duplex-diagnostics`. A fresh-process reference also exposes a TUN
+endpoint-lock dependency involving data carrying ACKs, extending the earlier
+pure-ACK case. Its deterministic reproduction and correction remain in progress;
+these diagnostic runs do not establish physical or SDK throughput acceptance.
+
 ### Burst follow-up checkpoint
 
 The controlled-drain correction passes 156 race-enabled correctness tests
