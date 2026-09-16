@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"google.golang.org/protobuf/encoding/protowire"
@@ -403,115 +404,110 @@ func ackFrameHasField(t *testing.T, frameBytes []byte, want protowire.Number) bo
 	return false
 }
 
-// THROUGHPUTFIX: the rule has to be inert where it should be inert, because a
-// rule that changes nothing on a short path is what makes it safe to enable
-// everywhere rather than selectively.
+// The active window rule must preserve a 100 Mb/s carrier's throughput on a
+// 5 ms path and respect the receiver's advertised capacity. These untyped
+// gateways exercise the compatibility window rule; H1 pacing has its own cells.
 //
-// On a short path the window is small whatever the permission, because the
-// path cannot fill a large one: permission is not occupancy. The claim is
-// therefore about throughput rather than about the window, and it is measured
-// as such here.
-//
-// The carrier has to be the binder for this cell to mean anything, which the
-// first attempt got wrong and is recorded because it is a trap for the
-// campaign too. Against an unpaced in-process carrier, throughput rises with
-// permission far above the bandwidth-delay product — the fixture runs a
-// goroutine per frame, so a larger window buys parallelism rather than
-// pipelining — and the rule measured 19.5 MB/s against the constant's 49.0 on
-// a 5 ms path purely because it computed a smaller number. Nothing about a real
-// path was being read. With the carrier paced below what either window
-// permits, both arms are bound by the carrier and the question the row asks is
-// the one it means to ask.
-//
-// Prediction, recorded before the run: on a 5 ms path bound at 100 Mb/s, where
-// the bandwidth-delay product is about 62 KiB and both windows are several
-// times that, the rule delivers within a tenth of the constant window's
-// throughput, and its window does not exceed what the receiver advertised.
-//
-// Measured, three runs: 0.96, 1.07 and 0.95 times the constant, with the rule
-// computing a window of 440 to 731 KiB against the constant's 2 MiB. The null
-// band was taken rather than assumed — two constant arms against two sized arms
-// in one run — and it is about one per cent, so the few per cent here is the
-// cell's own spread and the rule is inert, which is what makes it safe to
-// enable everywhere rather than selectively.
+// Virtual time keeps the carrier's configured service constant across arms.
+// The real-clock pump resets each departure after a late timer wake, which
+// previously charged host scheduling delays as serialization while data waited.
+// Calibrate both arms so equal underfilling cannot pass the relative gate.
 func TestTheWindowRuleIsInertOnAShortPath(t *testing.T) {
 	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		// The rule needs a process budget to draw on or it is not active at all,
+		// and the first version of this row did not set one: its "sized" arm was
+		// the constant arm and the row measured nothing. Asserted below rather
+		// than assumed, because that is exactly how it went unnoticed.
+		restore := MemoryBudget()
+		t.Cleanup(func() { SetMemoryBudget(restore) })
+		SetMemoryBudget(mib(256))
 
-	// The rule needs a process budget to draw on or it is not active at all,
-	// and the first version of this row did not set one: its "sized" arm was
-	// the constant arm and the row measured nothing. Asserted below rather
-	// than assumed, because that is exactly how it went unnoticed.
-	restore := MemoryBudget()
-	t.Cleanup(func() { SetMemoryBudget(restore) })
-	SetMemoryBudget(mib(256))
+		const propagation = 5 * time.Millisecond
+		// bound well below what either window permits, so the carrier is what
+		// decides throughput and the window is not the binder
+		const bytesPerSecond = ByteCount(100 * 1000 * 1000 / 8)
+		const hold = ByteCount(2 * 1024 * 1024)
+		const offerWindow = 3 * time.Second
+		const payloadByteCount = 4 * 1024
 
-	const propagation = 5 * time.Millisecond
-	// bound well below what either window permits, so the carrier is what
-	// decides throughput and the window is not the binder
-	const bytesPerSecond = ByteCount(100 * 1000 * 1000 / 8)
-	const hold = ByteCount(2 * 1024 * 1024)
-	const offerWindow = 3 * time.Second
-	const payloadByteCount = 4 * 1024
+		run := func(sizing WindowSizingPolicyKind) (float64, SendWindowEstimate) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			harness := newRateLimitedSendWindowHarness(t, ctx, propagation, bytesPerSecond,
+				func(settings *SendBufferSettings) {
+					settings.WindowSizing = sizing
+					settings.ApplyWindowSizing()
+				})
+			harness.receiveHold(hold)
+			if sizing == WindowSizingFromDelivery {
+				probe := DefaultSendBufferSettings()
+				probe.WindowSizing = sizing
+				probe.ApplyWindowSizing()
+				if !probe.WindowSizingActive() {
+					t.Fatal("the rule is not active, so the sized arm is the constant arm and this row measures nothing")
+				}
+			}
+			// Counted at the receiver. The sender's write count is admission
+			// rather than goodput, and against a carrier that queues, a larger
+			// window scores higher on it while delivering exactly the same bytes:
+			// measuring that way had the rule 29 per cent "slower" on a path where
+			// both windows were more than thirty times the bandwidth-delay
+			// product, which was the instrument and not the rule.
+			delivered := &atomic.Int64{}
+			harness.receiver.AddReceiveCallback(
+				func(_ TransferPath, frames []*protocol.Frame, _ Peer) {
+					delivered.Add(int64(len(frames)) * payloadByteCount)
+				},
+			)
+			start := time.Now()
+			harness.offer(t, payloadByteCount, offerWindow)
+			elapsed := time.Since(start)
+			synctest.Wait()
+			stats := harness.sender.DestinationSendStats(harness.receiverId)
+			if expired := harness.sender.ReceiveStats().SendPackDeadlineDropCount; expired != 0 {
+				t.Errorf("sizing=%d: fixture expired %d accepted frames", sizing, expired)
+			}
+			return float64(delivered.Load()) / elapsed.Seconds(), stats.SendWindow
+		}
 
-	run := func(sizing WindowSizingPolicyKind) (float64, SendWindowEstimate) {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		harness := newRateLimitedSendWindowHarness(t, ctx, propagation, bytesPerSecond,
-			func(settings *SendBufferSettings) {
-				settings.WindowSizing = sizing
-				settings.ApplyWindowSizing()
-			})
-		harness.receiveHold(hold)
-		if sizing == WindowSizingFromDelivery {
-			probe := DefaultSendBufferSettings()
-			probe.WindowSizing = sizing
-			probe.ApplyWindowSizing()
-			if !probe.WindowSizingActive() {
-				t.Fatal("the rule is not active, so the sized arm is the constant arm and this row measures nothing")
+		constantRate, constantEstimate := run(WindowSizingConstant)
+		sizedRate, sizedEstimate := run(WindowSizingFromDelivery)
+
+		t.Logf(
+			"constant window %d: %.1f MB/s; sized window %d (ceiling %d, reason %q): %.1f MB/s (%.2fx)",
+			constantEstimate.Window, constantRate/1e6,
+			sizedEstimate.Window, sizedEstimate.Ceiling, sizedEstimate.Reason,
+			sizedRate/1e6, sizedRate/constantRate,
+		)
+
+		for _, sample := range []struct {
+			name string
+			rate float64
+		}{
+			{name: "constant", rate: constantRate}, {name: "delivery", rate: sizedRate},
+		} {
+			if sample.rate < 0.9*float64(bytesPerSecond) || 1.01*float64(bytesPerSecond) < sample.rate {
+				t.Errorf("%s delivered %.0f B/s on a configured %d B/s carrier; the comparison requires a calibrated serializer", sample.name, sample.rate, bytesPerSecond)
 			}
 		}
-		// Counted at the receiver. The sender's write count is admission
-		// rather than goodput, and against a carrier that queues, a larger
-		// window scores higher on it while delivering exactly the same bytes:
-		// measuring that way had the rule 29 per cent "slower" on a path where
-		// both windows were more than thirty times the bandwidth-delay
-		// product, which was the instrument and not the rule.
-		delivered := &atomic.Int64{}
-		harness.receiver.AddReceiveCallback(
-			func(_ TransferPath, frames []*protocol.Frame, _ Peer) {
-				delivered.Add(int64(len(frames)) * payloadByteCount)
-			},
-		)
-		start := time.Now()
-		harness.offer(t, payloadByteCount, offerWindow)
-		elapsed := time.Since(start)
-		stats := harness.sender.DestinationSendStats(harness.receiverId)
-		return float64(delivered.Load()) / elapsed.Seconds(), stats.SendWindow
-	}
-
-	constantRate, constantEstimate := run(WindowSizingConstant)
-	sizedRate, sizedEstimate := run(WindowSizingFromDelivery)
-
-	t.Logf(
-		"constant window %d: %.1f MB/s; sized window %d (ceiling %d, reason %q): %.1f MB/s (%.2fx)",
-		constantEstimate.Window, constantRate/1e6,
-		sizedEstimate.Window, sizedEstimate.Ceiling, sizedEstimate.Reason,
-		sizedRate/1e6, sizedRate/constantRate,
-	)
-
-	if sizedRate < 0.9*constantRate {
-		t.Errorf(
-			"the rule delivered %.1f MB/s against the constant's %.1f on a %s path, %.2f times; a rule that costs throughput on short paths cannot be enabled everywhere and would have to be enabled selectively, which is the defect this program is removing",
-			sizedRate/1e6, constantRate/1e6, propagation, sizedRate/constantRate,
-		)
-	}
-	if hold < sizedEstimate.Window {
-		t.Errorf(
-			"the window is %d against a %d byte advertised capacity; the peer's capacity is the outermost clamp",
-			sizedEstimate.Window,
-			hold,
-		)
-	}
+		if !sizedEstimate.Sized {
+			t.Errorf("delivery rule did not engage: %+v", sizedEstimate)
+		}
+		if sizedRate < 0.9*constantRate {
+			t.Errorf(
+				"the rule delivered %.1f MB/s against the constant's %.1f on a %s path, %.2f times; a rule that costs throughput on short paths cannot be enabled everywhere and would have to be enabled selectively, which is the defect this program is removing",
+				sizedRate/1e6, constantRate/1e6, propagation, sizedRate/constantRate,
+			)
+		}
+		if hold < sizedEstimate.Window {
+			t.Errorf(
+				"the window is %d against a %d byte advertised capacity; the peer's capacity is the outermost clamp",
+				sizedEstimate.Window,
+				hold,
+			)
+		}
+	})
 }
 
 // THROUGHPUTFIX §37.22: the share must be a draw on the budget, proportional

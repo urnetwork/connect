@@ -1,0 +1,5 @@
+=== RUN   TestWindowPathSdkProfiles
+--- PASS: TestWindowPathSdkProfiles (231.34s)
+=== RUN   TestWindowPathSdkBidirectional
+--- PASS: TestWindowPathSdkBidirectional (43.89s)
+PASS

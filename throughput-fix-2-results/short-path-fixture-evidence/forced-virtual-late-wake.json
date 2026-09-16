@@ -1,0 +1,30 @@
+{
+  "constant_payload_bytes_per_second": 12195157.333333334,
+  "controlled_h1_drain_count": 0,
+  "delivery_lost_serialization_nanoseconds": 688400000,
+  "delivery_payload_bytes_per_second": 9396224.0,
+  "expected_failures": 3,
+  "interpretation": "A virtual 100us delayed wake is forced only in delivery; this scope does not validate H1 pacing.",
+  "outcomes": [
+    {
+      "duration": "0.20s",
+      "outcome": "FAIL",
+      "repetition": 1,
+      "test": "TestTheWindowRuleIsInertOnAShortPath"
+    },
+    {
+      "duration": "0.19s",
+      "outcome": "FAIL",
+      "repetition": 2,
+      "test": "TestTheWindowRuleIsInertOnAShortPath"
+    },
+    {
+      "duration": "0.22s",
+      "outcome": "FAIL",
+      "repetition": 3,
+      "test": "TestTheWindowRuleIsInertOnAShortPath"
+    }
+  ],
+  "schema": "throughput-fix-2/short-path-forced-virtual-late-wake-v1",
+  "test": "TestTheWindowRuleIsInertOnAShortPath"
+}

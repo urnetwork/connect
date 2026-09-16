@@ -1,0 +1,7 @@
+original real-clock failure: 9.9 MB/s constant vs 8.6 MB/s sized, ratio 0.87
+immutable baseline repeats: ratios 0.98, 1.10, 0.89; 2 PASS / 1 FAIL
+forced virtual late wake: 3 expected FAIL
+calibrated virtual old production: 3 PASS
+final fixture plus adjacent race: 12 PASS
+equal-underfill calibration: 3 expected FAIL
+scope: legacy TransportTypeUnknown fixture only; no H1 production or SDK duplex claim

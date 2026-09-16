@@ -1,0 +1,55 @@
+{
+  "artifact": "sanitized legacy short-path fixture evidence",
+  "contents": [
+    {
+      "bytes": 841,
+      "name": "equal-underfill-calibration.json",
+      "sha256": "d5b2bb84740a8880c3105fa28d6f863ef2fec98100c4b528fe3d5cf8d08b2b7a"
+    },
+    {
+      "bytes": 1233,
+      "name": "final-race-outcomes.jsonl",
+      "sha256": "4b42821258792bd54dfc3fa60025eff3fd460b74503eaf5f462230a59387a50a"
+    },
+    {
+      "bytes": 912,
+      "name": "forced-virtual-late-wake.json",
+      "sha256": "7c498820ad64874190444d3a57f03436946e6f090895f6ae4bcd5e2ba5b20dbf"
+    },
+    {
+      "bytes": 509,
+      "name": "original-failure.json",
+      "sha256": "c67d025c21bc02e873153b06402fb9d19be32be434324f0ac9d7b1b987dd032f"
+    },
+    {
+      "bytes": 403,
+      "name": "outcomes.txt",
+      "sha256": "d879965a2d87ab384b9cb849e499eb11927eac575026b67844257954afa63dae"
+    },
+    {
+      "bytes": 7888,
+      "name": "provenance.json",
+      "sha256": "78ee4bcf3364248463413d7714d67678125f769d411300c605325f49fa9161d8"
+    },
+    {
+      "bytes": 1330,
+      "name": "real-clock-repeats.json",
+      "sha256": "42e5363ffa809fefe072c205b68338bd45b775aeaff8b5e81f7d3fd440438337"
+    },
+    {
+      "bytes": 734,
+      "name": "virtual-old-production.json",
+      "sha256": "60a9f23f1f813ec972e85b43e3999141a011e6e010ac41494e440369148f147b"
+    }
+  ],
+  "counts": {
+    "equal_underfill_expected_failures": 3,
+    "final_race_passes": 12,
+    "forced_virtual_expected_failures": 3,
+    "original_failures": 1,
+    "real_clock_repetitions": 3,
+    "virtual_old_production_passes": 3
+  },
+  "redaction": "No raw logs, overlay content, source content, binaries, commands, or absolute paths are included.",
+  "schema": "throughput-fix-2/short-path-fixture-evidence-manifest-v1"
+}

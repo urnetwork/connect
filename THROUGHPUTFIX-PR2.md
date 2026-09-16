@@ -1138,22 +1138,104 @@ path achieve 0.82944 Mb/s against 0.94720 Mb/s for the reference. An isolated
 repeat of the same immutable binary also fails, so another test's global state
 is not required. Preserve this failure separately from the source-idle root.
 
-Investigation has forced a related ordering: a resumed controlled-drain probe
-is physically confirmed but awaits its own ACK; old coalesced heads are applied
-first and reduce the service used for queued sibling reservations. Later probe
-confirmation restores the hold after those reservations have already slowed.
-Require a deterministic test at the actual pacing handoff before a correction
-is accepted. Review missing probe replies, natural drains, failed/retried writes,
-cancellation and fresh faster/slower service. A provisional hold must not hide
-a real RTT or capacity increase; retain those transition tests as independent
-performance gates.
+The deterministic root now forces a resumed controlled-drain probe that is
+physically confirmed but awaits its own ACK. Old coalesced heads apply only
+part of the bytes already proven delivered. They lower the service used for
+sibling reservations before later probe confirmation restores the hold.
+The correction tracks the remaining old byte count, excludes its incomplete
+train provisionally, and accepts complete old evidence or fresh post-probe
+pairs. Only old-arrival timestamps pay off that count. A later probe ACK must
+not restore a rate superseded by valid sibling evidence.
+
+Five normal tests cover actual pacing waits, missing replies, natural drains,
+failed/retried writes, cancellation, fresh slower service, completed faster old
+trains and new bytes that must not complete an old train. They fail three times
+each before the correction. All 37 targeted performance comparisons pass;
+blanket hold alternatives were rejected because they regressed true RTT growth.
+The complete model on source `538e6248` subsequently passes 24 tests,
+423 paired cases and 810 rows. The separate SDK recovery failure remains open.
 
 The SDK provider duplex failure also remains after the source-idle fix: one of
 three exact-cell repetitions reaches 542.57664 versus 620.00128 Mb/s in the
-return direction. Preserve all repetitions and diagnose before attributing it
-to the controlled-probe root. The optional path trace queries the estimator and
-can update its held service value, so traced passes alone cannot establish that
-ordinary untraced traffic is correct.
+return direction. A complete 150-pair rerun passes once on `5605efa7`, but does
+not supersede those failures. Read-only tracing and forced feedback ordering
+reproduce reverse deficits after the pending-byte correction too. A fixed
+initial ACK-worker barrier yields about 431–447 versus 807–809 Mb/s three times,
+with unchanged warmup, duration, settings and directional gate. Matching early
+real ACK feedback across arms yields about 816 Mb/s; late offering lowers every
+control. The local ACK-priority companion cannot bypass data already queued in
+the opposite FIFO. Keep these phase and recovery controls separate and resolve
+the deficits before claiming an optimum or changing any acceptance gate.
+
+## 23. Public statistics must not change the pacing controller
+
+`DestinationSendStats` previously used the retaining estimator. A deterministic
+polled/unpolled pair captured 500 kB/s versus 10 MB/s in the next confirmed probe
+from the same delivery history. Admission and statistics now use one arithmetic
+implementation, with retention disabled for public snapshots. Both the service
+hold and pending probe's saved rate remain unchanged by polling.
+
+Three normal tests cover faster/slower evidence, nil/attached budgets, probe
+confirmation, shared lanes and duplicate sequence inventory. They fail three
+times each against pre-fix production. With the five pending-byte tests, the
+exact final tests produce 24 failures before the fix; corrected `538e6248`
+passes all 177 correctness tests under the race detector. The full model passes
+24 tests and 423 paired cases on the same frozen source. Rerun affected host/SDK diagnostics using
+this read-only interface; old traced passes cannot establish ordinary behavior.
+
+## 24. Freeze source audits and calibrate the legacy serializer
+
+The `5605efa7` root regression retains 3,011 passes, two failures and 24 skips.
+One failure read edited source from `538e6248` after compilation. The runner
+must compile and run in copied repository inputs so both relative reads and
+`runtime.Caller` inspect that binary's source. The synthetic before/after test
+edits the original input before both reads. Adjacent checks cover untracked
+new tests, symlinked fixture contents, copied module replacement declarations
+and rejection of changed snapshot files or source inventory. External local
+module replacements and host services remain explicit live dependencies.
+Use fresh output directories outside Git worktrees; direct, nested, aliased and
+sibling-worktree paths are rejected before a snapshot can add duplicate Go files.
+
+The other failure measured 9.9 versus 8.6 MB/s on a fake 100 Mb/s short path.
+Its unknown carrier does not execute H1 pacing. Late real-clock timer wakes
+reduced the serializer's effective capacity while its input was queued; an
+explicit virtual late wake forces the false relative deficit three times.
+The same actual-client fixture now uses virtual time and calibrates each arm,
+retaining the 90% relative gate, sizing activation and peer-window clamp.
+Equal underfilling must fail even when the two-arm ratio is one. The corrected
+row and three adjacent controls pass 12 race executions. Preserve the initial
+failure and forced reproductions, then repeat the broad root regression with
+both harness corrections. This repeat now passes 3,021 tests with zero failures
+and 24 skips on `7afd9e4b`, which also passes all 177 race correctness tests.
+Its production is unchanged from `538e6248`. These fixes do not close host or
+SDK acceptance.
+
+## 25. Validate recovery against real RTT changes and carrier limits
+
+A bounded head-only ACK-tail experiment improves the forced SDK feedback-delay
+case, while preserving the full-compression deadline for SACKs and eviction
+notices. It fails a separate 100 Mb/s, 0.3-to-100 ms RTT-growth cell at 6.8608
+versus 95.8054 Mb/s. Keep this candidate unlanded, preserve all controls, and
+force the interaction between shortened cumulative feedback, old ACK-byte
+application and service measurement before accepting another correction.
+
+The induced host replay experiment now records one actual NAT replay per arm.
+Disabling only the source-idle delimiter drops the candidate's service estimate
+from 116,086,811 to 19,038 B/s; the corrected arm holds its preceding rate.
+Both full throughput brackets pass their original controls, so the experiment
+establishes the sampler effect without proving a throughput improvement.
+Keep the older host failures open and retain all readings in
+`host-replay-confirmation`.
+
+An actual H1 carrier test exposes a separate fixture problem: sending a socket
+batch with `SendMultiWithTimeout` creates one Pack that can exceed H1's unchanged
+8 KiB cap. The production NAT path groups packets into carrier-safe messages.
+Use that same grouping in the host fixture, with a deterministic oversized-batch
+failure before the correction and actual-carrier delivery after it. Check
+ownership, rejection, replay and shutdown alongside message size. Keep generic
+TCP fixture budgets unchanged; apply SDK NAT shares only to explicitly profiled
+physical-carrier cases. Revalidate physical H1 with the corrected fixture and
+record its distinction from native TUN and the remaining relay campaigns.
 
 [pr213]: https://github.com/urnetwork/connect/pull/213
 [rig]: https://github.com/Ryanmello07/connect/blob/b54f9f72bec116c0986e6c51ed13cc2f01805bee/THROUGHPUT-RIG-REVIEW.md

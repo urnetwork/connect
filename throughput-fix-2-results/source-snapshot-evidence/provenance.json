@@ -1,0 +1,15 @@
+{
+  "after_files_sha256": {
+    "throughput-fix-2-snapshot-test.py": "68f399cbac4ea144fb3de62859a82eb0f3733b6eeb48f1930427fe0a91ee1759",
+    "throughput-fix-2-snapshot.py": "7692ebadbce051ba7dc6db72dd1a1e535956c599322e7d86b92e3cb8b0bce20f",
+    "throughput-fix-2.sh": "0b80e99a5825869e5f1d4bb6c3618575184a7ab581528f679ebd717a7fabb507"
+  },
+  "before_runner_sha256": "db3cfeac62e50c387873884078857be9fd510c5bf6e6048271abcf92224711c1",
+  "purpose": "Synthetic child test edits original source before both relative and runtime.Caller audits; expected before failure.",
+  "redaction": "Only hashes, synthetic outcome summaries, and normalized findings are retained. No raw logs, commands, local paths, source contents, or binaries are copied.",
+  "review_handoff_sha256": "e20db736e1e8862ef908f5fcafc244ef1739dea659e0c26adc7cd4bdba6d8557",
+  "runner_sha256": "0b80e99a5825869e5f1d4bb6c3618575184a7ab581528f679ebd717a7fabb507",
+  "schema": "throughput-fix-2/source-snapshot-evidence-provenance-v1",
+  "source_snapshot_tool_sha256": "7692ebadbce051ba7dc6db72dd1a1e535956c599322e7d86b92e3cb8b0bce20f",
+  "test_sha256": "f87a4574ead2e9467b08a8ad19bdf898c841e032cc4a6bd35fc748bd846def39"
+}

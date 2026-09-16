@@ -1,0 +1,39 @@
+{
+  "schema": "throughput-fix-2/snapshot-output-boundary-v1",
+  "handoff_sha256": "ea31777dc50353faa00c969147a66ac87d762aa73ca218a42c8193fff2e3bc70",
+  "scope": "Synthetic runner and helper output-directory boundary checks; no shared edits.",
+  "prior_runner": {
+    "sha256": "0b80e99a5825869e5f1d4bb6c3618575184a7ab581528f679ebd717a7fabb507",
+    "go_input_file_count_before": 2,
+    "go_input_file_count_after": 4,
+    "new_go_input_count": 2,
+    "outcome": "An in-worktree output snapshot was accepted and introduced two additional canonical Go inputs."
+  },
+  "guarded_runner": {
+    "sha256": "66f497152ebcdf99a0a875bd1caa67dc5be6e96cf7b8795dc7d9d46731bff8b8",
+    "rejected_cases": [
+      "equals_source",
+      "nested_source",
+      "symlink_into_source",
+      "sibling_checkout"
+    ],
+    "external_directory": {
+      "exit_code": 0,
+      "snapshot_created": true,
+      "source_go_inventory_unchanged": true
+    },
+    "rejected_case_properties": {
+      "exit_code": 1,
+      "snapshot_created": false,
+      "source_go_inventory_unchanged": true
+    }
+  },
+  "helper_rejections": [
+    "equals_source",
+    "nested_source",
+    "symlink_into_source"
+  ],
+  "source_walker_behavior": "The production Go input walk descends nonhidden output snapshot directories, so output must remain outside every Git worktree.",
+  "raw_local_evidence_sha256": "416ad7e97663b9bbcc20beb08336834e9fcb269801e2be3f3d754e6dba9af880",
+  "redaction": "Raw command output, local paths, source contents, and generated snapshot files are excluded."
+}

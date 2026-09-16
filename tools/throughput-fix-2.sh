@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Reproduce the local window research without the PR author's native rig.
 # Usage: tools/throughput-fix-2.sh MODE [output-dir]
+# Use a fresh output directory outside the connect/server source checkouts.
 # Modes: correctness, model, sdk-model, regression, ack, packet, tcp, server,
 #        server-integration, server-functional, server-tcp, server-proxy,
 #        server-connect-deterministic.
@@ -105,8 +106,17 @@ if [[ "$mode" == server* ]]; then
   source "$repo/../server/test-env.sh"
 fi
 python3 - "$repo" "$output" "$mode" "$pattern" "$package" "${build_flags[*]}" "${run_flags[@]}" <<'PY'
-import datetime, hashlib, json, os, pathlib, platform, subprocess, sys
+import datetime, hashlib, importlib.util, json, os, pathlib, platform, subprocess, sys
 repo, output, mode, pattern, package, build_flags, *run_flags = sys.argv[1:]
+sys.dont_write_bytecode = True
+worktree = subprocess.run(['git', '-C', output, 'rev-parse', '--is-inside-work-tree'],
+                         text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+if worktree.returncode == 0 and worktree.stdout.strip() == 'true':
+    raise SystemExit('output directory must be outside Git worktrees; use a fresh /tmp directory')
+snapshot_tool = pathlib.Path(repo, 'tools/throughput-fix-2-snapshot.py')
+spec = importlib.util.spec_from_file_location('throughput_snapshot', snapshot_tool)
+snapshot = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(snapshot)
 def command(*args, cwd=None):
     return subprocess.check_output(args, cwd=cwd, text=True).strip()
 def source_manifest(root):
@@ -143,41 +153,70 @@ if mode.startswith('server'):
             'WARP_ENV', 'WARP_SERVICE', 'WARP_BLOCK', 'WARP_VERSION',
             'WARP_TEST_ENV_FAIL_FAST', 'WARP_TEST_ENV_USE_PORTABLE_RESOURCES',
             'WARP_TEST_ENV_ALLOW_UNMANAGED_PORTABLE_SERVICES') if key in os.environ}
-pathlib.Path(output, 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
-PY
-
-go test "${build_flags[@]}" -c -o "$output/tests" "$package"
-python3 - "$repo" "$output" <<'PY'
-import hashlib, json, pathlib, subprocess, sys
-repo, output = map(pathlib.Path, sys.argv[1:])
-manifest_path = output / 'manifest.json'
-manifest = json.loads(manifest_path.read_text())
-for name in ('connect', 'server'):
-    if name not in manifest:
-        continue
-    root = repo if name == 'connect' else repo.parent / 'server'
-    names = subprocess.check_output(
-        ['git', 'ls-files', '--cached', '--others', '--exclude-standard',
-         '--', '*.go', '*.proto', 'go.mod', 'go.sum',
-         'testdata/window_sdk_profiles.json'], cwd=root, text=True).splitlines()
+snapshot_parent = pathlib.Path(output, 'source')
+snapshot_inputs = {}
+roots = {'connect': pathlib.Path(repo)}
+if mode.startswith('server'):
+    roots['server'] = pathlib.Path(repo).parent / 'server'
+if any(snapshot_parent.is_relative_to(root) for root in roots.values()):
+    raise SystemExit('output directory must be outside the source checkouts; use a fresh /tmp directory')
+for name, root in roots.items():
+    destination = snapshot_parent / name
+    snapshot_inputs[name] = snapshot.snapshot_repository(
+        root, destination, excluded=(pathlib.Path(output), root / 'throughput-fix-2-results'))
+    names = command('git', 'ls-files', '--cached', '--others', '--exclude-standard',
+                    '--', '*.go', '*.proto', 'go.mod', 'go.sum',
+                    'testdata/window_sdk_profiles.json', cwd=root).splitlines()
     digest = hashlib.sha256()
     for filename in sorted(set(names)):
-        path = root / filename
+        path = destination / filename
         if path.is_file():
             digest.update(filename.encode() + b'\0' + path.read_bytes() + b'\0')
     if digest.hexdigest() != manifest[name]['source_sha256']:
-        raise SystemExit(f'{name} sources changed during compilation; rerun for a consistent manifest')
+        raise SystemExit(f'{name} sources changed while snapshotting; rerun for a consistent manifest')
+external = []
+for name, root in roots.items():
+    external.extend(snapshot.link_local_replacements(root, snapshot_parent / name, snapshot_parent))
+manifest['source_snapshot'] = {
+    'repositories': {
+        name: {key: value for key, value in metadata.items() if key != 'file_sha256'}
+        for name, metadata in snapshot_inputs.items()},
+    'external_local_replacements': sorted(set(external)),
+    'scope': 'Compile and run inside copied repository inputs; external local replacements and host services are not frozen.',
+    'snapshot_tool_sha256': hashlib.sha256(snapshot_tool.read_bytes()).hexdigest(),
+}
+pathlib.Path(output, 'snapshot-inputs.json').write_text(json.dumps(snapshot_inputs, indent=2) + '\n')
+pathlib.Path(output, 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+PY
+
+build_repo="$output/source/connect"
+if [[ "$mode" == server* ]]; then build_repo="$output/source/server"; fi
+cd -- "$build_repo"
+go test "${build_flags[@]}" -c -o "$output/tests" "$package"
+python3 - "$output" <<'PY'
+import hashlib, importlib.util, json, pathlib, sys
+sys.dont_write_bytecode = True
+output = pathlib.Path(sys.argv[1])
+snapshot_tool = output / 'source/connect/tools/throughput-fix-2-snapshot.py'
+spec = importlib.util.spec_from_file_location('throughput_snapshot', snapshot_tool)
+snapshot = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(snapshot)
+manifest_path = output / 'manifest.json'
+manifest = json.loads(manifest_path.read_text())
+for name, metadata in json.loads((output / 'snapshot-inputs.json').read_text()).items():
+    snapshot.verify_snapshot(output / 'source' / name, metadata)
 manifest['binary_sha256'] = hashlib.sha256((output / 'tests').read_bytes()).hexdigest()
 manifest['sources_stable_during_build'] = True
+manifest['source_inspection_uses_build_snapshot'] = True
 manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
 PY
 
 status=0
-# Source-inspection tests use paths relative to their Go package, as go test does.
+# Both relative source reads and runtime.Caller use the same frozen build tree.
 if [[ "$mode" == server-proxy ]]; then
-  cd -- "$repo/../server/proxy"
+  cd -- "$build_repo/proxy"
 elif [[ "$mode" == server* ]]; then
-  cd -- "$repo/../server/connect"
+  cd -- "$build_repo/connect"
 fi
 "$output/tests" -test.v -test.run "$pattern" "${run_flags[@]}" -test.count=1 -test.timeout=30m > "$output/run.log" 2>&1 || status=$?
 python3 - "$output" "$status" <<'PY'

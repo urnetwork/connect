@@ -1,0 +1,140 @@
+{
+  "binary_sha256": "137ae226e843e84c3297c8da3ce1cff99bb64f7bd3033fc33d0f9b5a16ff5edc",
+  "canonical_package_cwd_attempt": {
+    "classification": "valid-frozen-snapshot-execution",
+    "short_path_log": {
+      "bytes": 267,
+      "sha256": "7048ac438fa7bdeaa7fd2a19f28a64e53483c229af6d222aa30ac83d855addff"
+    },
+    "short_path_outcomes": [
+      {
+        "duration": "2.80s",
+        "outcome": "PASS",
+        "repetition": 1,
+        "test": "TestTheWindowRuleIsInertOnAShortPath"
+      }
+    ],
+    "static_log": {
+      "bytes": 855,
+      "sha256": "3c95d961d58ceb53ba4d48ab418359b4f0a3f0712514aa458dcb3c039bca526a"
+    },
+    "static_outcomes": [
+      {
+        "duration": "1.50s",
+        "outcome": "PASS",
+        "repetition": 1,
+        "test": "TestControlDialSitesUseTheBoundDialer"
+      },
+      {
+        "duration": "1.46s",
+        "outcome": "PASS",
+        "repetition": 1,
+        "test": "TestEveryPoolBufferEntryPointDeclaresItsOwnership"
+      },
+      {
+        "duration": "1.64s",
+        "outcome": "PASS",
+        "repetition": 1,
+        "test": "TestProductionClientReceiveCallbacksAreAudited"
+      },
+      {
+        "duration": "1.52s",
+        "outcome": "PASS",
+        "repetition": 1,
+        "test": "TestSharedClientReceivePumpHandoffsUseCarrierPolicy"
+      },
+      {
+        "duration": "0.00s",
+        "outcome": "PASS",
+        "repetition": 1,
+        "test": "TestTestScriptPreservesPipelineFailures"
+      },
+      {
+        "duration": "1.54s",
+        "outcome": "PASS",
+        "repetition": 1,
+        "test": "TestWebRtcTestManagersHaveJoiningOwners"
+      },
+      {
+        "duration": "0.00s",
+        "outcome": "PASS",
+        "repetition": 1,
+        "test": "TestProductionCarrierReadersUseModeSpecificReceiveAdmission"
+      }
+    ],
+    "summary": {
+      "corrected_short_path_passed": 1,
+      "static_guards_failed": 0,
+      "static_guards_passed": 7
+    }
+  },
+  "invalid_parent_cwd_attempt": {
+    "classification": "invocation-cwd-mismatch",
+    "reason": "The binary was started from the snapshot repository parent instead of the copied package directory; source-inspection guards resolved repo-relative files one directory too high. Its source-path failures do not assess the frozen package source.",
+    "short_path_log": {
+      "bytes": 267,
+      "sha256": "e50f035ee5fe5ab7231b7ae473acfd3d0163d3f6ec700fe3f4f8e178d9b5676f"
+    },
+    "short_path_outcomes": [
+      {
+        "duration": "3.47s",
+        "outcome": "PASS",
+        "repetition": 1,
+        "test": "TestTheWindowRuleIsInertOnAShortPath"
+      }
+    ],
+    "static_log": {
+      "bytes": 6069,
+      "sha256": "4572d1511713d2c9e035ab8ea5232ef790796e7c25ade4443c7f60b166e0d290"
+    },
+    "static_outcomes": [
+      {
+        "duration": "0.00s",
+        "outcome": "PASS",
+        "repetition": 1,
+        "test": "TestControlDialSitesUseTheBoundDialer"
+      },
+      {
+        "duration": "0.00s",
+        "outcome": "FAIL",
+        "repetition": 1,
+        "test": "TestEveryPoolBufferEntryPointDeclaresItsOwnership"
+      },
+      {
+        "duration": "1.73s",
+        "outcome": "FAIL",
+        "repetition": 1,
+        "test": "TestProductionClientReceiveCallbacksAreAudited"
+      },
+      {
+        "duration": "1.53s",
+        "outcome": "FAIL",
+        "repetition": 1,
+        "test": "TestSharedClientReceivePumpHandoffsUseCarrierPolicy"
+      },
+      {
+        "duration": "0.00s",
+        "outcome": "FAIL",
+        "repetition": 1,
+        "test": "TestTestScriptPreservesPipelineFailures"
+      },
+      {
+        "duration": "1.83s",
+        "outcome": "PASS",
+        "repetition": 1,
+        "test": "TestWebRtcTestManagersHaveJoiningOwners"
+      },
+      {
+        "duration": "0.00s",
+        "outcome": "FAIL",
+        "repetition": 1,
+        "test": "TestProductionCarrierReadersUseModeSpecificReceiveAdmission"
+      }
+    ]
+  },
+  "redaction": "Raw logs, local paths, commands, source contents, and binaries are excluded. Hashes and sanitized outcomes are retained.",
+  "schema": "throughput-fix-2/snapshot-static-guard-followup-v1",
+  "snapshot_input_sha256": "699937882816ea24ea2d95e2a31eb32f752334231feb6030cba54c23aa88c071",
+  "snapshot_source_sha256": "7afd9e4bc98b0bfb038d14c96450a4423bd25d341a88cb1ae4128b467c6513c3",
+  "source_inspection_uses_build_snapshot": true
+}

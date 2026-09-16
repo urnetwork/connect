@@ -1,0 +1,55 @@
+{
+  "measurements": [
+    {
+      "constant_megabytes_per_second": 10.3,
+      "sized_megabytes_per_second": 10.1,
+      "sized_over_constant": 0.98,
+      "test": "TestTheWindowRuleIsInertOnAShortPath"
+    },
+    {
+      "constant_megabytes_per_second": 8.9,
+      "sized_megabytes_per_second": 9.8,
+      "sized_over_constant": 1.1,
+      "test": "TestTheWindowRuleIsInertOnAShortPath"
+    },
+    {
+      "constant_megabytes_per_second": 10.3,
+      "sized_megabytes_per_second": 9.1,
+      "sized_over_constant": 0.89,
+      "test": "TestTheWindowRuleIsInertOnAShortPath"
+    }
+  ],
+  "outcomes": [
+    {
+      "duration": "6.00s",
+      "outcome": "PASS",
+      "repetition": 1,
+      "test": "TestTheWindowRuleIsInertOnAShortPath"
+    },
+    {
+      "duration": "6.00s",
+      "outcome": "PASS",
+      "repetition": 2,
+      "test": "TestTheWindowRuleIsInertOnAShortPath"
+    },
+    {
+      "duration": "6.00s",
+      "outcome": "FAIL",
+      "repetition": 3,
+      "test": "TestTheWindowRuleIsInertOnAShortPath"
+    }
+  ],
+  "schema": "throughput-fix-2/short-path-real-clock-repeats-v1",
+  "summary": {
+    "failed": 1,
+    "passed": 2,
+    "ratios": [
+      0.98,
+      1.1,
+      0.89
+    ],
+    "repetitions": 3
+  },
+  "test": "TestTheWindowRuleIsInertOnAShortPath",
+  "units": "MB/s denotes million bytes per second."
+}

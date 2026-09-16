@@ -45,11 +45,15 @@ does not turn a censored comparison into proof of an optimum. In particular,
 the unbudgeted default gVisor buffer range limits the original 100 ms
 single-flow instrument.
 
-Reproduce with [tools/throughput-fix-2.sh](../tools/throughput-fix-2.sh).
-It checks that Go/protobuf/module sources stay unchanged during compilation,
-records the binary hash and safe experiment environment, and preserves every
-reading and the test process's exit status.
-The source digest also includes the embedded SDK profile fixture.
+Reproduce with [tools/throughput-fix-2.sh](../tools/throughput-fix-2.sh), using
+a fresh output directory outside Git worktrees (the default is temporary).
+It copies repository inputs and compiles/runs inside that snapshot, so source
+inspections cannot read later working-tree edits. It records source and binary
+hashes, snapshot verification, safe experiment environment, every reading and
+the test process's exit status. External local module replacements and host
+services remain live dependencies. The canonical source digest includes the
+embedded SDK profile fixture. Earlier archives predate the snapshot correction;
+`regression-source-idle` explicitly classifies the observed runtime-source drift.
 
 ## Burst and statistics follow-up
 
@@ -116,6 +120,38 @@ cases on source `3242678e`: the one-way test passes and the bidirectional test
 fails in the mobile H1 provider's return direction. This run precedes the
 source-idle correction and stronger per-direction/calibration checks; it does
 not validate those later edits or physical H1/TUN behavior.
+
+`correctness-pending-probe-observer` passes 177 race-enabled tests on source
+`538e6248`. `pending-probe-observer-evidence` retains 24 exact pre-fix failures,
+321 focused race passes and 37 scoped model pairs. The correction distinguishes
+pending old ACK bytes from complete or fresh evidence, and prevents public
+statistics polling from changing held service. `model-pending-probe-observer`
+then passes all 24 tests and 423 pairs with 810 rows on the same frozen source.
+Separately forced SDK feedback-recovery failures remain open.
+
+`sdk-transfer-source-idle` retains the complete 150-pair SDK pass on `5605efa7`.
+It does not erase exact-cell duplex failures. `regression-source-idle` retains
+3,011 passes, two failures and 24 skips, including a runtime-source mismatch
+and an independent short-path calibration failure. `short-path-fixture-evidence`
+retains forced late-wake failures, unchanged-production virtual-time passes,
+12 final race executions and a rejected equal-underfill control. These artifacts
+do not establish physical H1 or host performance acceptance.
+
+`regression-source-snapshot` retains all 3,021 root passes, 24 skips and no
+failures on `7afd9e4b`. `correctness-source-snapshot` passes all 177 race-enabled
+correctness tests on that source. Its production is unchanged from `538e6248`;
+the test-source change calibrates the short-path fixture. Both runs compile and
+execute inside copied repository inputs. `source-snapshot-evidence` preserves
+the synthetic source-drift, inventory and output-boundary checks.
+
+`host-replay-confirmation` retains both full passing throughput brackets and
+eight forced actual replay observations. The source-idle ablation collapses the
+candidate's rate estimate while the corrected arm holds its preceding rate.
+Both throughput comparisons pass, so there is no claimed repair throughput
+gain. The legacy helper can exceed actual H1's 8 KiB message cap; this remains
+FIFO/userspace-TUN and real-origin diagnostic evidence, not physical-H1
+acceptance. Noncanonical overlay keys invalidated an initial compile, which was
+rejected before execution; manifests retain the corrected build provenance.
 
 Only numerical ledgers, manifests, provenance and outcome excerpts are part of
 the committed evidence. Raw logs and test binaries remain local. The collector

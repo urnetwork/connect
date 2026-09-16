@@ -1,0 +1,23 @@
+{
+  "artifact": "sanitized server test-environment bootstrap block",
+  "contents": [
+    {
+      "bytes": 306,
+      "name": "outcomes.txt",
+      "sha256": "da8d33dfa92bd436b93f8a1053d30bd77804818eb3ed5ed7b745a568da45fa4d"
+    },
+    {
+      "bytes": 961,
+      "name": "provenance.json",
+      "sha256": "392e3fae530a64c5f057dfaffae4dfd14d43043ea560743e6116e9b80605f87d"
+    }
+  ],
+  "counts": {
+    "attempts": 2,
+    "blocked_before_snapshot": 2,
+    "compiled": 0,
+    "executed": 0
+  },
+  "redaction": "No raw logs, local paths, commands, source contents, or binaries are included.",
+  "schema": "throughput-fix-2/server-source-snapshot-preflight-manifest-v1"
+}

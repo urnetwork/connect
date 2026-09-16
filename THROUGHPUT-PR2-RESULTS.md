@@ -22,6 +22,39 @@ failure to a particular one of these mechanisms.
 The [peer review and research plan](THROUGHPUTFIX-PR2.md) preserves the source
 review, hypotheses, evidence limits and server follow-up work.
 
+### Pending ACK and statistics follow-up
+
+Commit `3ce605cb`, source `538e6248fb744795d9e829e97e503744ed70284d107ebad10da646b56bf6e460`,
+passes 177 race-enabled correctness tests. Eight new tests fail 24 times before
+the correction: incomplete old ACK trains cannot reprice sibling pacing, fresh
+and completed evidence still replace the hold, and public statistics cannot
+change rates captured by later probes. The combined focused selection passes
+321 executions; 37 targeted model pairs pass. The complete model then passes
+24 tests and 423 pairs, retaining all 810 rows. Separately forced SDK recovery
+failures remain open.
+
+The preceding `5605efa7` source passes the full 150-pair SDK matrix once, but
+separately reproduced bidirectional failures remain open. Its root regression
+retains 3,011 passes, two failures and 24 skips. One failure read edited runtime
+source; the other exposed a miscalibrated real-clock serializer. Source snapshots
+and a calibrated virtual-time short-path test address those harness defects.
+The corrected `7afd9e4b` test-source checkpoint passes 3,021 root tests with
+zero failures and 24 skips, and all 177 race-enabled correctness tests.
+Production is unchanged from `538e6248`.
+
+An induced host experiment now forces a real NAT replay in all eight arms.
+Without the source-idle delimiter, the candidate's service estimate falls from
+116,086,811 to 19,038 B/s; the corrected arm preserves its preceding rate.
+Both throughput brackets pass, so this confirms the estimator effect without
+establishing a throughput gain. The legacy packet batching also exceeds actual
+H1's message cap in a separate physical-carrier test; these FIFO results do not
+validate physical H1. Evidence remains in `host-replay-confirmation`.
+
+The unlanded ACK-tail candidate improves forced SDK duplex recovery but fails
+the real 100 Mb/s RTT-growth control at 6.8608 versus 95.8054 Mb/s. SDK recovery
+and host throughput acceptance remain open.
+See the report for failure-before evidence, source boundaries and remaining work.
+
 ### Burst follow-up checkpoint
 
 The controlled-drain correction passes 156 race-enabled correctness tests
@@ -57,7 +90,8 @@ or policy fields. The new Transfer matrix completes 150 paired cases: all
 provider's return-direction regression (428.41088 versus 587.20256 Mb/s, zero
 recorded drops). Its 300 readings are retained in `sdk-transfer-model-first`.
 That run predates the source-idle fix and stronger per-direction/calibration
-checks; the latest complete SDK matrix and physical SDK/H1 coverage remain open.
+checks. The subsequent `sdk-transfer-source-idle` run passes all 150 pairs once;
+exact-cell failures and physical SDK/H1 coverage remain open.
 
 The committed follow-up's final correctness run passes 152 tests under `-race`
 on source SHA-256

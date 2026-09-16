@@ -1,0 +1,41 @@
+{
+  "artifact": "sanitized forced idle-replay host diagnostic brackets",
+  "contents": [
+    {
+      "bytes": 973,
+      "name": "after-comparison.json",
+      "sha256": "6c67b0d2e207a9f010a00f1211ab3e8485c441534fcc1a7fd2f6524777e40998"
+    },
+    {
+      "bytes": 972,
+      "name": "before-comparison.json",
+      "sha256": "c7d129cc96cee1ca63ada2eac5e6f85ae40c253152ea1854d5dc62e314bae598"
+    },
+    {
+      "bytes": 1512,
+      "name": "forced-idle-replay-observations.jsonl",
+      "sha256": "e9ae40e9d1bb8cf0073e77edfa538e44281bc8789922df1898a4bebbd472504f"
+    },
+    {
+      "bytes": 597,
+      "name": "outcomes.json",
+      "sha256": "c26adf1a299723190f2f80006c2e87b316e4a976e90a40a5eb92056b2bd12bee"
+    },
+    {
+      "bytes": 4808,
+      "name": "provenance.json",
+      "sha256": "e753ec7966e17b61b03e5637a47beaed4c27798984d0504e4f659bc4bf21f34c"
+    }
+  ],
+  "counts": {
+    "brackets": 2,
+    "censored_comparisons": 0,
+    "comparison_rows": 2,
+    "failed_comparisons": 0,
+    "forced_idle_replay_observations": 8,
+    "held_replay_observations": 8,
+    "passed_comparisons": 2
+  },
+  "redaction": "No raw logs, binaries, overlays, source contents, commands, or local paths are included.",
+  "schema": "throughput-fix-2/host-replay-confirmation-manifest-v2"
+}

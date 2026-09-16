@@ -1,0 +1,203 @@
+{
+  "baseline_campaign_manifest_pin": {
+    "bytes": 1252,
+    "sha256": "35b29e4665380d662d58a0ec296a10b15b994e82757c9f74adb126f87703ed4e"
+  },
+  "cause_evidence": [
+    "The original rate-limited test carrier uses TransportTypeUnknown gateways; H1 service sampling, pending physical tails and controlled drains remain inactive.",
+    "The carrier serializes one frame, waits on its timer, then resets the following departure to current wall time. Late wakes become extra per-frame service time even with queued input.",
+    "Under the real-clock diagnostic, the pump lost472-758ms per3s arm, almost entirely while its input remained queued. Diagnostic polling occurred only after measurement.",
+    "A virtual-time100us delayed wake forced only in the delivery arm reproduces the original relative assertion deterministically3/3 with identical production code and configured capacity.",
+    "The proposed test runs both actual clients and the same carrier in virtual time, retains the90% relative gate and peer-capacity clamp, and additionally requires each arm to deliver90%-101% of configured carrier byte rate, sampled window activation and no expired accepted frames."
+  ],
+  "initial_failure_pin": {
+    "bytes": 548,
+    "sha256": "a8322a2cdb5911b3f12c860bdf54b2704574b789155d42c04a74538297c08412"
+  },
+  "proposal_pin": {
+    "bytes": 38070,
+    "sha256": "20dc5cd9156c6e97dfa96d316e98ff38f3aa2e53e8c64829df2b8a36de33994b"
+  },
+  "proposal_target": "transfer_window_sizing_switch_test.go",
+  "provenance_limits": [
+    "Only the baseline runner binary has an original stable-build manifest. Diagnostic and final scoped overlay commands are ad hoc builds; file hashes are captured at handoff.",
+    "The exact real-clock initial failure had no timer accounting attached. The diagnostic accounting and forced virtual failure establish the fixture vulnerability, without attributing every original lost byte to a captured timer event.",
+    "Forced delays and diagnostic counters remain only in temporary overlays; the proposed shared diff changes only the original test.",
+    "This result makes no claim about the SDK duplex phase failure or H1 host performance."
+  ],
+  "redaction": "Raw logs, overlay content, source content, binaries, commands, and absolute paths are excluded. This archive retains sanitized outcomes, numerical observations, hashes, and stated scope limits.",
+  "retained_overlay_source_pins": {
+    "baseline-transfer.go": {
+      "bytes": 613132,
+      "sha256": "2d3be0e06cb8d1e8c7a99a1a48f4b3941e147fa86947b97552deabdaaff23448"
+    },
+    "forced-fixture_test.go": {
+      "bytes": 39756,
+      "sha256": "ad4ed9be74f4bea458f4736dcfad5541a850a12939893a92a3bdf958abb725d7"
+    },
+    "forced-harness_test.go": {
+      "bytes": 47391,
+      "sha256": "f7a62ff8bab0e8c94bfaa27411b3518f0aae9d9adf0d2dfc03430282665090af"
+    },
+    "metrics-fixture_test.go": {
+      "bytes": 39607,
+      "sha256": "04a460f7cc22ff4578a971e72bb8bd47d09e77ef0ac5ef18585501013a4c6e60"
+    },
+    "metrics-harness_test.go": {
+      "bytes": 47117,
+      "sha256": "6f5166cd03d98134a894eef20f38ecf6713f16b5b385fea6154c86792b570752"
+    },
+    "metrics-pacing.go": {
+      "bytes": 39698,
+      "sha256": "aa3920ad0c7ab5433748471db6c2c144d418820bd3c63723b539d9e55bb6fa74"
+    },
+    "underfill-harness_test.go": {
+      "bytes": 47297,
+      "sha256": "5575e0cc5244d27bd3ebeb63dfbe56cf75b81bc043015ea69eff6346a30aa2c8"
+    },
+    "virtual-fixture_test.go": {
+      "bytes": 39443,
+      "sha256": "9ecdc37d5e5b70afc31486299f25e39b56ebc167c800c961b72e81cbab82111c"
+    }
+  },
+  "runs": [
+    {
+      "claim": "The original failure remains reproduced; later passes do not erase it.",
+      "log": {
+        "bytes": 1078,
+        "outcomes": {
+          "FAIL": 1,
+          "PASS": 2,
+          "SKIP": 0
+        },
+        "sha256": "499187264a2e9b67b707a730c99fe1fbed3934ece0251db0b08c0ad1b6a3ea26",
+        "test_names": [
+          "TestTheWindowRuleIsInertOnAShortPath"
+        ]
+      },
+      "manifest_pin": {
+        "bytes": 492,
+        "sha256": "b5decbe47e1ae1aa9938b16f82f6d9bd700fc163462478f5f0e7fa86a5ab31e7"
+      },
+      "name": "immutable_original_three_repetitions"
+    },
+    {
+      "diagnostic": true,
+      "log": {
+        "bytes": 4644,
+        "outcomes": {
+          "FAIL": 0,
+          "PASS": 3,
+          "SKIP": 0
+        },
+        "sha256": "fa8a28f5b715f8704c4ff4b4374a4076bb318ab14a01c9aab18f21f096ec3173",
+        "test_names": [
+          "TestTheWindowRuleIsInertOnAShortPath"
+        ]
+      },
+      "manifest_pin": {
+        "bytes": 506,
+        "sha256": "3f9efb02962eed00f77420e7d0df0eff2428efc5e4617936668448ac7371fac2"
+      },
+      "name": "real_clock_timer_accounting",
+      "overlay_pin": {
+        "bytes": 558,
+        "sha256": "b03cbc7c186471cbf4f9129171d98402a8f93386be829b838c16d8553cb543ff"
+      }
+    },
+    {
+      "constant_payload_Bps": 12195157.333333334,
+      "controlled_H1_drain_count": 0,
+      "delivery_lost_serialization_ns": 688400000,
+      "delivery_payload_Bps": 9396224.0,
+      "expected_exit": 1,
+      "log": {
+        "bytes": 5370,
+        "outcomes": {
+          "FAIL": 3,
+          "PASS": 0,
+          "SKIP": 0
+        },
+        "sha256": "8d60002014c6598952d4227750d8a764236bbf9b4e3d71e16222dcb602dde989",
+        "test_names": [
+          "TestTheWindowRuleIsInertOnAShortPath"
+        ]
+      },
+      "name": "forced_virtual_late_wake_before",
+      "overlay_pin": {
+        "bytes": 556,
+        "sha256": "a0039780a00f0f2b03b67e5422b3b8655ba14b26723447d71c1ff277c3e75ff2"
+      }
+    },
+    {
+      "expected_exit": 0,
+      "log": {
+        "bytes": 832,
+        "outcomes": {
+          "FAIL": 0,
+          "PASS": 3,
+          "SKIP": 0
+        },
+        "sha256": "ba6a7aa4129b3049103528358773aa6d7372ef59d4715c30abd98c338d1e3927",
+        "test_names": [
+          "TestTheWindowRuleIsInertOnAShortPath"
+        ]
+      },
+      "name": "virtual_clock_on_old_production",
+      "overlay_pin": {
+        "bytes": 418,
+        "sha256": "ecd07b698c17d2c5f6c1ab01930d9a5ea90ef2615cd0348a9ced191d767701f3"
+      }
+    },
+    {
+      "expected_exit": 0,
+      "log": {
+        "bytes": 3563,
+        "outcomes": {
+          "FAIL": 0,
+          "PASS": 12,
+          "SKIP": 0
+        },
+        "sha256": "1543eeff29f70ec33a621265ea1cc3f6a1dacd2b27dbd47a82a750e838723a44",
+        "test_names": [
+          "TestSizedWindowShrinksWhenThePathShrinks",
+          "TestTheTransferShareIsADrawOnTheBudget",
+          "TestTheWindowRuleIsInertOnAShortPath",
+          "TestTheWindowSizingSwitchOffIsTodaysBehaviour"
+        ]
+      },
+      "name": "final_fixture_and_adjacent_race",
+      "overlay_pin": {
+        "bytes": 168,
+        "sha256": "66b3a9f67a403e32b17073cfa9197415a8dd1024fa80a8c72c4ba6e9ee2ee0d2"
+      }
+    },
+    {
+      "both_payload_Bps": 9396224,
+      "claim": "The original relative comparison alone would accept equal underfilling; the new calibration rejects it.",
+      "expected_exit": 1,
+      "log": {
+        "bytes": 1815,
+        "outcomes": {
+          "FAIL": 3,
+          "PASS": 0,
+          "SKIP": 0
+        },
+        "sha256": "459a662fb2575071800f5c1d9696ecc358e160f7ba678b111d8564c6faff38e0",
+        "test_names": [
+          "TestTheWindowRuleIsInertOnAShortPath"
+        ]
+      },
+      "name": "equal_underfill_rejected_by_calibration",
+      "overlay_pin": {
+        "bytes": 309,
+        "sha256": "8df8b9bc214920443d83c0c2103b24260e16ceb4da1fc4782a6d0530dc2f1115"
+      },
+      "ratio": 1
+    }
+  ],
+  "schema": "throughput-fix-2/short-path-fixture-evidence-provenance-v1",
+  "scope": "Legacy short-path window fixture: virtual time and per-arm carrier calibration; no H1 production change.",
+  "shared_edits_by_debugger": false,
+  "shared_source_sha256_at_handoff": "538e6248fb744795d9e829e97e503744ed70284d107ebad10da646b56bf6e460"
+}

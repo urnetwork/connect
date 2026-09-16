@@ -1,0 +1,29 @@
+{
+  "configured_carrier_bytes_per_second": 12500000,
+  "constant_and_delivery_bytes_per_second": 9396224,
+  "expected_failures": 3,
+  "interpretation": "Equal underfilling meets the relative ratio but is rejected by the calibrated serializer gate.",
+  "outcomes": [
+    {
+      "duration": "0.19s",
+      "outcome": "FAIL",
+      "repetition": 1,
+      "test": "TestTheWindowRuleIsInertOnAShortPath"
+    },
+    {
+      "duration": "0.18s",
+      "outcome": "FAIL",
+      "repetition": 2,
+      "test": "TestTheWindowRuleIsInertOnAShortPath"
+    },
+    {
+      "duration": "0.19s",
+      "outcome": "FAIL",
+      "repetition": 3,
+      "test": "TestTheWindowRuleIsInertOnAShortPath"
+    }
+  ],
+  "relative_ratio": 1,
+  "schema": "throughput-fix-2/short-path-equal-underfill-calibration-v1",
+  "test": "TestTheWindowRuleIsInertOnAShortPath"
+}

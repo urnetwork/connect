@@ -1,0 +1,49 @@
+{
+  "created_utc": "2026-09-16T02:21:47.528694+00:00",
+  "mode": "correctness",
+  "test_pattern": "^(TestAckCompression.*|TestAckResponses.*|TestAckOverflow.*|TestAckWorkerBounds.*|TestEvictionAcknowledgementsFitEveryCarrier|TestGapWake.*|TestSequenceAckWindow.*|TestWindow(TargetIncludes|DeliveryIncludes|DeliveryLargeResidence|DeliveryContractLead).*|TestDeliveryRate.*|TestResendCapacityRelease.*|TestTcpReturn.*|TestTcpSequenceCancelBeforeWritePublication.*|TestTunAckHandoff.*|TestWindow(BurstPacing|Pacing|Mismatch).*|TestWindowPathGapDeadline|TestTheWindowHasOneOwner|TestLandingStructs.*|TestDecodedTransferFramePoolRetainedSizeStaysSmall|TestFamilyStandbyTracks.*)$|^TestWindowPerformance.*$|^TestWindowBucketStats.*$|^TestALegacyAcknowledgementCannotOverwriteAnAdvertisement$|^TestRelayInflationUsesConstantSendWindow$|^TestWebRtcNetworkPeerAdmissionWaitsOnDedicatedBudget$",
+  "run_flags": [
+    "-test.short=false"
+  ],
+  "connect": {
+    "revision": "1bf11158c107b978a21eca5c9df0ad1ecf613985",
+    "branch": "throughput-fix-2",
+    "source_sha256": "7afd9e4bc98b0bfb038d14c96450a4423bd25d341a88cb1ae4128b467c6513c3",
+    "dirty": true
+  },
+  "package": "./",
+  "build_flags": [
+    "-race"
+  ],
+  "runner_sha256": "0b80e99a5825869e5f1d4bb6c3618575184a7ab581528f679ebd717a7fabb507",
+  "host_load_average_at_start": [
+    8.9697265625,
+    13.27783203125,
+    16.37451171875
+  ],
+  "go": "go version go1.26.7 darwin/arm64",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "architecture": "arm64",
+  "logical_cpus": 10,
+  "environment": {
+    "CONNECT_WINDOW_RUN_CONTEXT": "validation-monitor: snapshot-backed correctness and regression launched concurrently under observed host load; no quiescence wait; original repository inputs frozen only during snapshot copy"
+  },
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN",
+  "source_snapshot": {
+    "repositories": {
+      "connect": {
+        "file_count": 780,
+        "input_sha256": "699937882816ea24ea2d95e2a31eb32f752334231feb6030cba54c23aa88c071"
+      }
+    },
+    "external_local_replacements": [
+      "/Users/brien/urnetwork/glog"
+    ],
+    "scope": "Compile and run inside copied repository inputs; external local replacements and host services are not frozen.",
+    "snapshot_tool_sha256": "7692ebadbce051ba7dc6db72dd1a1e535956c599322e7d86b92e3cb8b0bce20f"
+  },
+  "binary_sha256": "137ae226e843e84c3297c8da3ce1cff99bb64f7bd3033fc33d0f9b5a16ff5edc",
+  "sources_stable_during_build": true,
+  "source_inspection_uses_build_snapshot": true
+}

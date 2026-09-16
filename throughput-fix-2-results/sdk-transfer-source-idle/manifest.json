@@ -1,0 +1,35 @@
+{
+  "created_utc": "2026-09-16T01:41:38.564839+00:00",
+  "mode": "sdk-model",
+  "test_pattern": "^TestWindowPathSdk.*$",
+  "run_flags": [
+    "-test.short=false"
+  ],
+  "connect": {
+    "revision": "1bf11158c107b978a21eca5c9df0ad1ecf613985",
+    "branch": "throughput-fix-2",
+    "source_sha256": "5605efa750834abb352be42548f7c20cd55f56d154a2837dc5996e8b580180f7",
+    "dirty": true
+  },
+  "package": "./",
+  "build_flags": [
+    "-race=false"
+  ],
+  "runner_sha256": "db3cfeac62e50c387873884078857be9fd510c5bf6e6048271abcf92224711c1",
+  "host_load_average_at_start": [
+    15.91796875,
+    18.7197265625,
+    19.771484375
+  ],
+  "go": "go version go1.26.7 darwin/arm64",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "architecture": "arm64",
+  "logical_cpus": 10,
+  "environment": {
+    "CONNECT_WINDOW_RUN_CONTEXT": "validation-monitor: sdk-model and regression launched concurrently under observed host load; no quiescence wait; shared Go sources frozen; debugger work restricted to overlays"
+  },
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN",
+  "binary_sha256": "77381090b8e6fdd0b60bb7915913260e6dd0244d89c9d9a0a7f6cc0966584381",
+  "sources_stable_during_build": true
+}

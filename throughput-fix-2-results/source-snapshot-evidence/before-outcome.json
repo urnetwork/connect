@@ -1,0 +1,12 @@
+{
+  "exit_code": 1,
+  "interpretation": "The synthetic child modifies the original source before both audit forms. The old runner therefore executes a binary whose source inspections read mutable original input.",
+  "messages": [
+    "relative source inspection drifted from the compiled source after the original was edited",
+    "runtime.Caller source inspection drifted from the compiled source after the original was edited"
+  ],
+  "outcome": "expected failure",
+  "raw_log_sha256": "8aa315a56dbdb84736c2c7f65282f23d57e5c176a446a65b22c61e1e09f1fe55",
+  "schema": "throughput-fix-2/source-snapshot-synthetic-before-v1",
+  "test": "test_compiled_audits_keep_the_build_source"
+}
