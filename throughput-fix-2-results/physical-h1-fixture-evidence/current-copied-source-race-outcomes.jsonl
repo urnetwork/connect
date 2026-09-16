@@ -1,0 +1,12 @@
+{"classification":"copied_source_race_pass","duration_seconds":0.0,"occurrence":1,"stage":"current_copied_source_race","status":"PASS","test":"TestTcpSequenceCloseDeliversFlowLifecycleOnce"}
+{"classification":"copied_source_race_pass","duration_seconds":0.02,"occurrence":2,"stage":"current_copied_source_race","status":"PASS","test":"TestWindowTcpSocketBatchFitsPhysicalH1"}
+{"classification":"copied_source_race_pass","duration_seconds":0.0,"occurrence":3,"stage":"current_copied_source_race","status":"PASS","test":"TestWindowTcpCanceledBatchReturnsShares"}
+{"classification":"copied_source_race_pass","duration_seconds":0.0,"occurrence":4,"stage":"current_copied_source_race","status":"PASS","test":"TestWindowTcpWorkloadCancelUnblocksGroupAdmission"}
+{"classification":"copied_source_race_pass","duration_seconds":0.0,"occurrence":5,"stage":"current_copied_source_race","status":"PASS","test":"TestTcpSequenceCloseDeliversFlowLifecycleOnce"}
+{"classification":"copied_source_race_pass","duration_seconds":0.01,"occurrence":6,"stage":"current_copied_source_race","status":"PASS","test":"TestWindowTcpSocketBatchFitsPhysicalH1"}
+{"classification":"copied_source_race_pass","duration_seconds":0.0,"occurrence":7,"stage":"current_copied_source_race","status":"PASS","test":"TestWindowTcpCanceledBatchReturnsShares"}
+{"classification":"copied_source_race_pass","duration_seconds":0.0,"occurrence":8,"stage":"current_copied_source_race","status":"PASS","test":"TestWindowTcpWorkloadCancelUnblocksGroupAdmission"}
+{"classification":"copied_source_race_pass","duration_seconds":0.0,"occurrence":9,"stage":"current_copied_source_race","status":"PASS","test":"TestTcpSequenceCloseDeliversFlowLifecycleOnce"}
+{"classification":"copied_source_race_pass","duration_seconds":0.01,"occurrence":10,"stage":"current_copied_source_race","status":"PASS","test":"TestWindowTcpSocketBatchFitsPhysicalH1"}
+{"classification":"copied_source_race_pass","duration_seconds":0.0,"occurrence":11,"stage":"current_copied_source_race","status":"PASS","test":"TestWindowTcpCanceledBatchReturnsShares"}
+{"classification":"copied_source_race_pass","duration_seconds":0.0,"occurrence":12,"stage":"current_copied_source_race","status":"PASS","test":"TestWindowTcpWorkloadCancelUnblocksGroupAdmission"}

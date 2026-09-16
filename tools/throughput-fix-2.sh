@@ -2,7 +2,7 @@
 # Reproduce the local window research without the PR author's native rig.
 # Usage: tools/throughput-fix-2.sh MODE [output-dir]
 # Use a fresh output directory outside the connect/server source checkouts.
-# Modes: correctness, model, sdk-model, regression, ack, packet, tcp, server,
+# Modes: correctness, model, sdk-model, regression, ack, packet, tcp, physical-h1, server,
 #        server-integration, server-functional, server-tcp, server-proxy,
 #        server-connect-deterministic.
 set -euo pipefail
@@ -21,7 +21,7 @@ run_flags=(-test.short=false)
 case "$mode" in
   correctness)
     pattern='^(TestAckCompression.*|TestAckResponses.*|TestAckOverflow.*|TestAckWorkerBounds.*|TestEvictionAcknowledgementsFitEveryCarrier|TestGapWake.*|TestSequenceAckWindow.*|TestWindow(TargetIncludes|DeliveryIncludes|DeliveryLargeResidence|DeliveryContractLead).*|TestDeliveryRate.*|TestResendCapacityRelease.*|TestTcpReturn.*|TestTcpSequenceCancelBeforeWritePublication.*|TestTunAckHandoff.*|TestWindow(BurstPacing|Pacing|Mismatch).*|TestWindowPathGapDeadline|TestTheWindowHasOneOwner|TestLandingStructs.*|TestDecodedTransferFramePoolRetainedSizeStaysSmall|TestFamilyStandbyTracks.*)$'
-    pattern="$pattern|^TestWindowPerformance.*$|^TestWindowBucketStats.*$|^TestALegacyAcknowledgementCannotOverwriteAnAdvertisement$|^TestRelayInflationUsesConstantSendWindow$|^TestWebRtcNetworkPeerAdmissionWaitsOnDedicatedBudget$"
+    pattern="$pattern|^TestWindowPerformance.*$|^TestWindowBucketStats.*$|^TestALegacyAcknowledgementCannotOverwriteAnAdvertisement$|^TestRelayInflationUsesConstantSendWindow$|^TestWebRtcNetworkPeerAdmissionWaitsOnDedicatedBudget$|^TestWindowTcp(SocketBatch|CanceledBatch|WorkloadCancel).*$"
     build_flags=(-race)
     ;;
   model)
@@ -30,6 +30,11 @@ case "$mode" in
     ;;
   sdk-model)
     pattern='^TestWindowPathSdk.*$'
+    build_flags=(-race=false)
+    ;;
+  physical-h1)
+    export CONNECT_WINDOW_H1_MEASURE=1
+    pattern='^TestWindowPhysicalH1SdkSmoke$'
     build_flags=(-race=false)
     ;;
   regression)
@@ -143,7 +148,10 @@ manifest = {
     'logical_cpus': os.cpu_count(),
     'environment': {k: v for k, v in os.environ.items()
                     if k.startswith('CONNECT_WINDOW_') or k in ('GOMAXPROCS', 'GOGC')},
-    'instrument': 'local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN',
+    'instrument': ('owned TLS/WebSocket H1 relay, gVisor TUN and loopback socket origin; '
+                   'Transfer encryption disabled; no native kernel TUN or server authentication'
+                   if mode == 'physical-h1' else
+                   'local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN'),
 }
 if mode.startswith('server'):
     manifest['server'] = source_manifest(str(pathlib.Path(repo).parent / 'server'))
@@ -224,6 +232,12 @@ import datetime, json, os, pathlib, re, sys
 output = pathlib.Path(sys.argv[1])
 rows = []
 for line in (output / 'run.log').read_text().splitlines():
+    physical = re.search(r'physical-h1-(reading|comparison) (\{.*\})$', line)
+    if physical:
+        row = json.loads(physical[2])
+        row['Kind'] = 'comparison' if physical[1] == 'comparison' else 'physical-h1'
+        row['Instrument'] = 'physical-h1'
+        rows.append(row)
     service = re.search(r'service-reading (\{.*\})$', line)
     if service:
         row = json.loads(service[1])

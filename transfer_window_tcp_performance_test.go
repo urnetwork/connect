@@ -13,12 +13,40 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
+// Borrow packet buffers, retaining shares only when their logical group is
+// admitted. Production provider-return grouping lets SendSequence split a
+// socket batch into carrier-safe wire Packs. Workload cancellation ends waiting.
+func sendWindowTcpPackets(t *testing.T, ctx context.Context, client *Client, destination Id, messageType protocol.MessageType, packets [][]byte) {
+	t.Helper()
+	frames := make([]*protocol.Frame, 0, len(packets))
+	for _, packet := range packets {
+		frames = append(frames, &protocol.Frame{MessageType: messageType, MessageBytes: MessagePoolShareReadOnly(packet), Raw: true})
+	}
+	if success, _ := client.sendGroupWithTimeoutDetailed(frames, destination, nil, -1, Ctx(ctx)); !success {
+		for _, frame := range frames {
+			MessagePoolReturn(frame.MessageBytes)
+		}
+		if ctx.Err() == nil {
+			t.Error("TCP fixture Transfer admission failed")
+		}
+	}
+}
+
 // Runs real provider TCP against a loopback kernel origin and a gVisor source
 // socket through the same two Transfer clients and FIFO links as the packet
 // matrix. Only dialing the synthetic destination is redirected to the owned
 // origin. This adds both inner TCP windows, segmentation, ACK cadence, replay
 // retention and the final TUN handoff to the measured delivery boundary.
 func startWindowTcpWorkload(t *testing.T, ctx context.Context, provider, device *Client, counts []atomic.Int64, upload bool, natRefused *atomic.Int64, tcpBufferMax ByteCount) func() {
+	t.Helper()
+	settings := DefaultLocalUserNatSettings()
+	settings.TcpBufferSettings.ReturnQueueBudget = NewTransferMemoryBudget(mib(48))
+	return startWindowTcpWorkloadWithNatSettings(t, ctx, provider, device, counts, upload, natRefused, tcpBufferMax, settings)
+}
+
+// The caller supplies fresh, fixture-owned NAT settings. Only this workload
+// owns their redirected dialer and replay pool until the returned join closes.
+func startWindowTcpWorkloadWithNatSettings(t *testing.T, ctx context.Context, provider, device *Client, counts []atomic.Int64, upload bool, natRefused *atomic.Int64, tcpBufferMax ByteCount, settings *LocalUserNatSettings) func() {
 	t.Helper()
 	tunSettings := DefaultTunSettingsWithBufferSize(2048)
 	if tcpBufferMax > 0 {
@@ -40,10 +68,8 @@ func startWindowTcpWorkload(t *testing.T, ctx context.Context, provider, device 
 		listener.Close()
 		t.Fatal(err)
 	}
-	settings := DefaultLocalUserNatSettings()
 	settings.Log = NewNoopLogger()
 	settings.TcpBufferSettings.EnableSyntheticSpeed = false
-	settings.TcpBufferSettings.ReturnQueueBudget = NewTransferMemoryBudget(mib(48))
 	settings.TcpBufferSettings.DialContextSettings = &DialContextSettings{DialContext: func(dialCtx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(dialCtx, "tcp4", listener.Addr().String())
 	}}
@@ -51,18 +77,7 @@ func startWindowTcpWorkload(t *testing.T, ctx context.Context, provider, device 
 	var workers sync.WaitGroup
 	var sockets sync.Map
 	writePackets := func(client *Client, destination Id, messageType protocol.MessageType, packets [][]byte) {
-		frames := make([]*protocol.Frame, 0, len(packets))
-		for _, packet := range packets {
-			frames = append(frames, &protocol.Frame{MessageType: messageType, MessageBytes: MessagePoolShareReadOnly(packet), Raw: true})
-		}
-		if !client.SendMultiWithTimeout(frames, destination, nil, -1) {
-			for _, frame := range frames {
-				MessagePoolReturn(frame.MessageBytes)
-			}
-			if ctx.Err() == nil {
-				t.Error("TCP fixture Transfer admission failed")
-			}
-		}
+		sendWindowTcpPackets(t, ctx, client, destination, messageType, packets)
 	}
 	nat.AddReceivePacketCallback(func(source TransferPath, _ protocol.ProvideMode, _ *IpPath, packet []byte) {
 		writePackets(provider, source.SourceId, protocol.MessageType_IpIpPacketFromProvider, [][]byte{packet})
@@ -193,6 +208,12 @@ func startWindowTcpWorkload(t *testing.T, ctx context.Context, provider, device 
 		defer cancel()
 		if err := nat.CloseAndWait(joinCtx); err != nil {
 			t.Errorf("TCP fixture NAT cleanup: %v", err)
+		}
+		if budget := settings.TcpBufferSettings.ReturnQueueBudget; budget != nil {
+			reserved, released := budget.Counts()
+			if budget.UsedByteCount() != 0 || reserved != released {
+				t.Errorf("TCP fixture replay budget did not balance: used=%d reserved=%d released=%d", budget.UsedByteCount(), reserved, released)
+			}
 		}
 	}
 }

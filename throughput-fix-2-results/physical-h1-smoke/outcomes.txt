@@ -1,0 +1,3 @@
+=== RUN   TestWindowPhysicalH1SdkSmoke
+--- PASS: TestWindowPhysicalH1SdkSmoke (22.52s)
+PASS

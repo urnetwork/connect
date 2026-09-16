@@ -27,6 +27,12 @@ passes **3,021 root regression tests with zero failures and 24 skips**, plus
 the **177-test race selection**. Production is unchanged from `538e6248`.
 These runs compile and execute from copied source inputs.
 
+The corrected host fixture now also passes a bounded **physical H1** check on
+test-source `b6abfa4e`: a 100 Mb/s, 0.3 ms added-RTT, one-flow download over
+owned TLS/WebSockets reaches 91.469 Mb/s against a 91.550 Mb/s A/A reference.
+This uses a real TCP origin and userspace gVisor TUN. The new fixture/root tests
+are described below; production remains unchanged from `538e6248`.
+
 The preceding source-idle correction, committed in `1bf11158`, retains measured
 service across a proven sender pause. Its deterministic replay keeps 125 MB/s
 and reduces the next write's virtual pacing delay from 18.430482186 s to zero.
@@ -790,10 +796,75 @@ but the genuine 100 Mb/s, 0.3-to-100 ms RTT-growth control fails: 6.8608 versus
 failure and isolate its interaction with service sampling before changing
 production or any performance gate.
 
+The isolated sampler test reproduces the first collapse without a pending
+probe or unapplied old bytes: 2,672 bytes after a 49.06 ms feedback gap replace
+11,913,027 B/s with 54,459 B/s. Investigation now tests whether a gap ACK should
+remain provisional rate evidence until its measurement cycle completes. Its
+bytes still acknowledge delivery immediately. Any such rule must preserve
+zero hold for incomplete evidence while accepting genuinely slower completed
+cycles; the research plan records the symmetric gap/cycle and ACK-partition
+controls. No production estimator change for this case has been accepted.
+The rejected ACK-tail candidate's complete 14-run evidence, including all 122
+numerical readings and the passing unchanged-production RTT controls, is in
+`sdk-ack-tail-v3-evidence`.
+
+### Physical H1 and carrier-safe host packet groups
+
+The first owned TLS/WebSocket run exposed a host-fixture defect before any
+measurement: `SendMultiWithTimeout` encodes a whole socket batch as one Pack,
+which can exceed the actual H1 8 KiB read limit. The real provider uses logical
+group admission and lets `SendSequence` split it into carrier-safe messages.
+The common host helper now uses that same grouping path. A forced batch of
+16 packets, each 1,100 bytes, fails three times with the old helper. Afterward
+all 16 arrive through six physical H1 messages, largest 3,420 bytes, with the
+8,192-byte read cap unchanged.
+
+Adjacent review found that the helper's indefinite send waited on the client
+lifecycle even after its workload had been canceled. A durably blocked,
+zero-slot sequence admission reproduces that failure three times while the
+client stays alive. Passing the workload's `Ctx` to group admission fixes the
+wait. Three ordinary tests cover the carrier cap, already-canceled refusal
+ownership and cancellation during admission; all nine focused race executions
+pass. Callers keep their original packet buffers, admitted sends own shared
+copies, and refused sends return those copies.
+
+A final verified source copy passes those three tests plus
+`TestTcpSequenceCloseDeliversFlowLifecycleOnce`, each three times under the race
+detector: 12 passes. The prior reused-copy attempt also passed the tests but
+failed source-inventory verification because an import generated a bytecode
+file; it is retained as invalid provenance. Only the verified copy supports
+this final checkpoint. Failure-before and ownership evidence is retained in
+`physical-h1-fixture-evidence`.
+
+The generic TCP workload retains its existing default settings and 48 MiB
+replay pool. The physical SDK fixture separately supplies the actual provider
+share: one fifth of a 24 MiB target, with a constructor-sized 4 MiB replay pool.
+Its provider/device carrier ACK reserves remain zero/eight. Teardown reconciles
+NAT replay, all six Transfer pools, both carrier leases and pooled buffers.
+
+The normal runner's `physical-h1` mode compiles source `b6abfa4e` into frozen
+binary `a4d95e75`. Its predeclared A/B/A run measures 91.550/91.469/91.549 Mb/s,
+candidate/reference 99.912%, with A/A drift 0.001312%. Both references exceed
+the fixed 90 Mb/s capacity calibration. The candidate records 493/494 Transfer
+ACKs, costing 49,300/49,400 encoded bytes in the two directions over five
+seconds. No recorded carrier, Transfer or NAT refusals occur; ownership and
+budget checks pass. Host load averages are recorded at start and finish;
+the run did not wait for quiescence. All three readings and the full comparison
+are retained in `physical-h1-smoke`.
+
+This is one 100 Mb/s download cell with 2.5 s warmup and 5 s measurement per
+arm, an owned unauthenticated relay, Transfer encryption disabled and userspace
+TUN. It does not complete native-TUN, actual-server, 1 Gb/s, bidirectional,
+multiple-peer or long-duration acceptance. Physical reproduction of the
+affected eight-flow SDK duplex cell is the next carrier experiment.
+
 ### Deterministic tests for the new failure cases
 
 | Failure | Regression test and forced stimulus |
 |---|---|
+| A host socket batch exceeded the physical H1 message cap | `TestWindowTcpSocketBatchFitsPhysicalH1` sends 16 packets as one logical group through the actual TLS/WebSocket writer with an asserted 8,192-byte cap. |
+| Rejected fixture admission could lose borrowed packet ownership | `TestWindowTcpCanceledBatchReturnsShares` closes the client before group admission and reconciles caller buffers and retained shares. |
+| Workload cancellation left fixture admission waiting on a live client | `TestWindowTcpWorkloadCancelUnblocksGroupAdmission` holds the consumer before a zero-slot handoff, cancels only the workload and checks immediate release under virtual time. |
 | Compressed sparse heads doubled 125 kB/s to 250 kB/s | `TestWindowPacingBackloggedSparseHeadsKeepTheirTime` replays exact byte/time pairs in both application orders. |
 | A newer writer overtook an older reservation | `TestWindowPacingWaitingWritersKeepReservationOrder` blocks the older writer's timer dispatch at a channel barrier before starting its successor. |
 | Continuously occupied flight retained a 1 ms RTT floor after a 100 ms change | `TestWindowPacingContinuousFlightRefreshesChangedRoundTrip` supplies explicit virtual-time feedback and cumulative tail delivery. |
@@ -966,6 +1037,7 @@ tools/throughput-fix-2.sh model /tmp/window-model
 tools/throughput-fix-2.sh sdk-model /tmp/window-sdk-model
 tools/throughput-fix-2.sh regression /tmp/window-regression
 tools/throughput-fix-2.sh tcp /tmp/window-tcp
+tools/throughput-fix-2.sh physical-h1 /tmp/window-physical-h1
 CONNECT_WINDOW_TCP_BUFFER_MAX_MIB=48 tools/throughput-fix-2.sh tcp /tmp/window-tcp-48mib
 tools/throughput-fix-2.sh ack /tmp/window-ack
 tools/throughput-fix-2.sh server-connect-deterministic /tmp/window-server-connect
@@ -1001,6 +1073,12 @@ Final collected evidence is under [throughput-fix-2-results](throughput-fix-2-re
   passes, 24 skips, and 177 race passes on the corrected test-source checkpoint;
 - `host-replay-confirmation` — eight actual replay observations and both full
   passing host brackets, with estimator evidence and physical-carrier limits;
+- `physical-h1-smoke` — the corrected fixture's three physical H1 readings
+  and passing A/B/A comparison on `b6abfa4e`;
+- `physical-h1-fixture-evidence` — deterministic message-cap and cancellation
+  failures, the guarded handoff and 12 valid copied-source race passes;
+- `sdk-ack-tail-v3-evidence` — the rejected ACK-tail experiment's complete
+  14-run record, with 122 numerical readings and its real-RTT regressions;
 - `sdk-transfer-source-idle` — all 150 SDK pairs pass once with the stronger
   directional/calibration checks; exact-cell failures remain open;
 - `sdk-transfer-model-first` — 150 SDK Transfer pairs, including the original
@@ -1029,8 +1107,8 @@ ledger is in [THROUGHPUT-PR2-RESULTS.md](THROUGHPUT-PR2-RESULTS.md).
    The ACK-tail candidate passes those forced controls but fails real RTT growth;
    retain both results and add deterministic coverage for their interaction.
    The separate recovery-time difference also remains open.
-2. Correct the host fixture's packet grouping at the actual H1 message boundary,
-   then repeat affected physical-carrier checks. The induced source-idle replay
+2. Expand host comparisons with the corrected packet grouping beyond the
+   passing physical H1 smoke. The induced source-idle replay
    confirms the estimator effect, but both throughput brackets pass and the
    older host failures remain unattributed. Keep the original acceptance gates
    and retain failed and excluded comparisons under the current host load.
@@ -1044,7 +1122,7 @@ ledger is in [THROUGHPUT-PR2-RESULTS.md](THROUGHPUT-PR2-RESULTS.md).
    requires a local launcher readiness attestation that was absent. No new
    server test binary was built; earlier passing tiers do not validate this
    later connect checkpoint.
-5. Physical SDK/H1/native-TUN confirmation, longer actual-relay pressure,
+5. Broader physical SDK/H1 and native-TUN confirmation, longer actual-relay pressure,
    shard-collision and multiple-peer campaigns remain necessary
    before a deployment-wide claim. Continue with
    our own published fixtures as requested; obtaining the reporter's missing

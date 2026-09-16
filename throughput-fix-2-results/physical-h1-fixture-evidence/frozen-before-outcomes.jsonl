@@ -1,0 +1,6 @@
+{"classification":"expected_failure_before","duration_seconds":0.01,"occurrence":1,"stage":"initial_raw_batch_cap","status":"FAIL","test":"TestWindowTcpSocketBatchFitsPhysicalH1"}
+{"classification":"expected_failure_before","duration_seconds":0.0,"occurrence":2,"stage":"initial_raw_batch_cap","status":"FAIL","test":"TestWindowTcpSocketBatchFitsPhysicalH1"}
+{"classification":"expected_failure_before","duration_seconds":0.0,"occurrence":3,"stage":"initial_raw_batch_cap","status":"FAIL","test":"TestWindowTcpSocketBatchFitsPhysicalH1"}
+{"classification":"expected_failure_before","duration_seconds":0.0,"occurrence":1,"stage":"workload_context","status":"FAIL","test":"TestWindowTcpWorkloadCancelUnblocksGroupAdmission"}
+{"classification":"expected_failure_before","duration_seconds":0.0,"occurrence":2,"stage":"workload_context","status":"FAIL","test":"TestWindowTcpWorkloadCancelUnblocksGroupAdmission"}
+{"classification":"expected_failure_before","duration_seconds":0.0,"occurrence":3,"stage":"workload_context","status":"FAIL","test":"TestWindowTcpWorkloadCancelUnblocksGroupAdmission"}

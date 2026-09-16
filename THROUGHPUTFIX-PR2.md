@@ -1219,6 +1219,25 @@ versus 95.8054 Mb/s. Keep this candidate unlanded, preserve all controls, and
 force the interaction between shortened cumulative feedback, old ACK-byte
 application and service measurement before accepting another correction.
 
+The isolated sampler reproduction now excludes pending probes and delayed
+old-byte application. A 2,672-byte head after a 49.06 ms feedback gap replaces
+11,913,027 B/s with 54,459 B/s. The ordinary RTT observation leaves the existing
+propagation floor unchanged. The first returning portion of a new train is
+being treated as a completed measurement.
+
+Test the proposed symmetric cycle rule: keep a gap ACK as incomplete rate
+evidence until its associated measurement cycle completes. Acknowledge its
+bytes and release send capacity immediately; defer only replacing the service
+estimate. State the completion boundary explicitly and retain the bytes and
+timestamps needed to decide whether the gap belongs to the completed sample.
+Cover both gap-then-cycle and cycle-then-gap orderings, tiny first or last heads,
+and the same delivered train split across different cumulative ACKs. A lone
+incomplete cycle must preserve the last measured bucket. A genuinely slower
+completed cycle must replace it. Do not require the old rate's expected byte
+count to arrive before recognizing a slowdown; include bounded adaptation,
+small windows, shared services and compressed ACK bursts as controls. This is
+a hypothesis under test, not an accepted estimator change.
+
 The induced host replay experiment now records one actual NAT replay per arm.
 Disabling only the source-idle delimiter drops the candidate's service estimate
 from 116,086,811 to 19,038 B/s; the corrected arm holds its preceding rate.
@@ -1236,6 +1255,22 @@ ownership, rejection, replay and shutdown alongside message size. Keep generic
 TCP fixture budgets unchanged; apply SDK NAT shares only to explicitly profiled
 physical-carrier cases. Revalidate physical H1 with the corrected fixture and
 record its distinction from native TUN and the remaining relay campaigns.
+
+This fixture correction is now applied. The 16-by-1,100-byte batch fails three
+times before grouping and arrives in six bounded H1 messages afterward.
+Adjacent review forces a separate canceled-workload/live-client admission
+failure three times; passing the workload context to group admission fixes it.
+The three cap/refusal/cancellation tests pass nine race executions. Generic
+48 MiB replay settings remain unchanged, while the explicitly profiled physical
+fixture uses the constructor-sized 4 MiB provider replay budget.
+
+The ordinary `physical-h1` runner passes its first bounded A/B/A comparison on
+test-source `b6abfa4e`: 91.550/91.469/91.549 Mb/s on a 100 Mb/s, 0.3 ms added-RTT,
+one-flow download. All readings, calibration, ACK cost and lifecycle checks are
+retained in `physical-h1-smoke`. Expand this to the affected eight-flow duplex
+cell with the server-budget peer and constrained H1 provider. Keep each
+direction's acceptance gate and make the actual-carrier, userspace-TUN,
+unauthenticated-relay and disabled-Transfer-encryption scope explicit.
 
 [pr213]: https://github.com/urnetwork/connect/pull/213
 [rig]: https://github.com/Ryanmello07/connect/blob/b54f9f72bec116c0986e6c51ed13cc2f01805bee/THROUGHPUT-RIG-REVIEW.md

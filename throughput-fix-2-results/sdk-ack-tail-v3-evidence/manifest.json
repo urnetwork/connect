@@ -1,0 +1,134 @@
+{
+  "artifact": "sanitized unlanded SDK duplex ACK-tail v3 diagnostic evidence",
+  "candidate_status": "unlanded_rejected",
+  "contents": [
+    {
+      "bytes": 23264,
+      "name": "outcomes.jsonl",
+      "sha256": "c4feb81a7dd9397bd1f3b066c13dca96bd9c53fd7a5d127957ecbd7bf1bc42fa"
+    },
+    {
+      "bytes": 23853,
+      "name": "provenance.json",
+      "sha256": "0a404e99eba682cfb8a89ff638acfb41f6e056c304372c4a4e63a54fe5252ed7"
+    },
+    {
+      "bytes": 72672,
+      "name": "readings-early-original.jsonl",
+      "sha256": "f76b377c5fb8be28d028fc17190b637b6a2372faaa7f83be368139a9bbd6ad2a"
+    },
+    {
+      "bytes": 72601,
+      "name": "readings-early-v3.jsonl",
+      "sha256": "8907e4eed6275a6c84daa23ac9cae88597da7cca3a4d0f78090863d174951d0d"
+    },
+    {
+      "bytes": 33219,
+      "name": "readings-exact-rtt-before.jsonl",
+      "sha256": "fde0b5b050744d68410aa660f7cd3a3d5fb092802bba0d8e410097d54756faaf"
+    },
+    {
+      "bytes": 11073,
+      "name": "readings-exact-rtt-trace-v3.jsonl",
+      "sha256": "f1a0483e13f4ee48263f0fff50a04da477e471791f5ba0d9e369b1327888f150"
+    },
+    {
+      "bytes": 33183,
+      "name": "readings-exact-rtt-v3.jsonl",
+      "sha256": "0cee1456169f7cbb8c6e90128e30011e20a626bf56c82c831f78bd5a30624882"
+    },
+    {
+      "bytes": 48520,
+      "name": "readings-forced-original.jsonl",
+      "sha256": "3ea9a8ce6ad0cf6ba9ddeb68eb0b04f2c82847edfdb874316896642c501667da"
+    },
+    {
+      "bytes": 48475,
+      "name": "readings-forced-v3.jsonl",
+      "sha256": "f4c81db5b89fc3727c3da4ab1d3d602372d5a06c564c6862f5aac5653098957a"
+    },
+    {
+      "bytes": 72670,
+      "name": "readings-late-original.jsonl",
+      "sha256": "28ff95f02bf18e69d1e2c4c29dfcb35b0dbea355b621535aae38c9cea776c53c"
+    },
+    {
+      "bytes": 72599,
+      "name": "readings-late-v3.jsonl",
+      "sha256": "2c902ca5235355563268d0518ad194fab27d721891acc18aa792c6a5f00e12d7"
+    },
+    {
+      "bytes": 48311,
+      "name": "readings-natural-v3.jsonl",
+      "sha256": "39256edba5d6ee62ae517f9c601660e9f6f5dd0b26045429ce65932af8d56e37"
+    },
+    {
+      "bytes": 45302,
+      "name": "readings-service-controls-v3-01.jsonl",
+      "sha256": "74198867ec1b99a80b1b6258106d204f6164277457750acdee6072c49f1c972e"
+    },
+    {
+      "bytes": 45210,
+      "name": "readings-service-controls-v3-02.jsonl",
+      "sha256": "fd5a786fba969610c4260ef9622c23cb7ce2b92d603ba5c173ac82c758bab373"
+    },
+    {
+      "bytes": 45442,
+      "name": "readings-service-controls-v3-03.jsonl",
+      "sha256": "38a29c8a4e994582b01c4f5f701b9b8c3352f9dc6421096c7d5b0830d4a734ed"
+    },
+    {
+      "bytes": 44437,
+      "name": "readings-service-controls-v3-04.jsonl",
+      "sha256": "0a15c3e9536a094ba77eb8dd518e85894c52e40d1cef562b0a9c95aa643836d8"
+    },
+    {
+      "bytes": 44437,
+      "name": "readings-service-controls-v3-05.jsonl",
+      "sha256": "22734421a62cac5a11a695e9211d1d6df70845dcd2c949c4aefd60676ad1d13b"
+    },
+    {
+      "bytes": 44365,
+      "name": "readings-service-controls-v3-06.jsonl",
+      "sha256": "5e25819d9465a47d80aa1e1c4573e5a74a65cde46cf660703ba5c1fe5044f3cd"
+    },
+    {
+      "bytes": 33239,
+      "name": "readings-service-controls-v3-07.jsonl",
+      "sha256": "b1aa50449f8fe45d1bf8e9c7b25bdc3844908a45cbc16735965e09b0f3564e59"
+    },
+    {
+      "bytes": 2932,
+      "name": "summary.json",
+      "sha256": "916ee083d5431e486ea8c605d106b10fdfa11032e2569beae4eab0b2e359ab83"
+    }
+  ],
+  "counts": {
+    "completed_runs": 14,
+    "early_v3_passes": 3,
+    "exact_rtt_baseline_passes": 3,
+    "exact_rtt_trace_failures": 1,
+    "exact_rtt_v3_failures": 3,
+    "failed_outcomes": 11,
+    "forced_v3_passes": 3,
+    "full_numerical_readings": 122,
+    "late_v3_passes": 3,
+    "natural_v3_passes": 3,
+    "normalized_outcomes": 170,
+    "passed_outcomes": 159,
+    "service_control_failures": 1,
+    "service_control_passes": 6,
+    "worker_after_passes": 30,
+    "worker_before_expected_failures": 3,
+    "worker_race_passes": 102
+  },
+  "redaction": "No raw logs, source or overlay contents, binaries, commands, absolute paths, or trace text are included. The archive retains normalized outcomes, full numerical readings, and content hashes only.",
+  "schema": "throughput-fix-2/sdk-ack-tail-v3-evidence-manifest-v1",
+  "source_handoff_sha256": "8551af12d0b0062d0a8943c88e873b5500889451dd3080ba3f8d18d16e89ceee",
+  "verification": {
+    "all_full_numerical_readings_exactly_match_handoff": true,
+    "normalized_outcomes_exactly_match_handoff": true,
+    "redaction_scan_passed": true,
+    "source_handoff_sha256_matches": true
+  }
+}

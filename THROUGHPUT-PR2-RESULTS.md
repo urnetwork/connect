@@ -53,6 +53,24 @@ validate physical H1. Evidence remains in `host-replay-confirmation`.
 The unlanded ACK-tail candidate improves forced SDK duplex recovery but fails
 the real 100 Mb/s RTT-growth control at 6.8608 versus 95.8054 Mb/s. SDK recovery
 and host throughput acceptance remain open.
+
+### Physical H1 fixture checkpoint
+
+Test-source `b6abfa4e` adds actual TLS/WebSocket H1 coverage around the common
+TCP workload. The helper now admits logical packet groups, keeping a socket
+batch below H1's fixed 8 KiB message cap, and passes the workload cancellation
+context to a waiting send. Both defects fail three times before correction;
+the three new ownership/cap/cancellation tests and one existing NAT lifecycle
+test pass 12 focused race executions on a verified source copy.
+
+The ordinary `physical-h1` runner passes its 100 Mb/s, 0.3 ms added-RTT,
+one-flow download A/B/A: 91.550/91.469/91.549 Mb/s, with no recorded refusals and
+balanced replay, Transfer and carrier budgets. Full numerical readings remain
+in `physical-h1-smoke`. This uses an owned TCP origin, userspace gVisor TUN and
+an unauthenticated local relay with Transfer encryption disabled. Production
+is unchanged from `538e6248`; broader physical and native-TUN acceptance remains
+open. The rejected ACK-tail candidate's complete diagnostic evidence remains
+in `sdk-ack-tail-v3-evidence`.
 See the report for failure-before evidence, source boundaries and remaining work.
 
 ### Burst follow-up checkpoint

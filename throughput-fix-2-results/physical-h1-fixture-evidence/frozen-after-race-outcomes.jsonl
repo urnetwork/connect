@@ -1,0 +1,9 @@
+{"classification":"frozen_race_pass","duration_seconds":0.02,"occurrence":1,"stage":"grouped_after","status":"PASS","test":"TestWindowTcpSocketBatchFitsPhysicalH1"}
+{"classification":"frozen_race_pass","duration_seconds":0.0,"occurrence":2,"stage":"grouped_after","status":"PASS","test":"TestWindowTcpCanceledBatchReturnsShares"}
+{"classification":"frozen_race_pass","duration_seconds":0.0,"occurrence":3,"stage":"grouped_after","status":"PASS","test":"TestWindowTcpWorkloadCancelUnblocksGroupAdmission"}
+{"classification":"frozen_race_pass","duration_seconds":0.01,"occurrence":4,"stage":"grouped_after","status":"PASS","test":"TestWindowTcpSocketBatchFitsPhysicalH1"}
+{"classification":"frozen_race_pass","duration_seconds":0.0,"occurrence":5,"stage":"grouped_after","status":"PASS","test":"TestWindowTcpCanceledBatchReturnsShares"}
+{"classification":"frozen_race_pass","duration_seconds":0.0,"occurrence":6,"stage":"grouped_after","status":"PASS","test":"TestWindowTcpWorkloadCancelUnblocksGroupAdmission"}
+{"classification":"frozen_race_pass","duration_seconds":0.01,"occurrence":7,"stage":"grouped_after","status":"PASS","test":"TestWindowTcpSocketBatchFitsPhysicalH1"}
+{"classification":"frozen_race_pass","duration_seconds":0.0,"occurrence":8,"stage":"grouped_after","status":"PASS","test":"TestWindowTcpCanceledBatchReturnsShares"}
+{"classification":"frozen_race_pass","duration_seconds":0.0,"occurrence":9,"stage":"grouped_after","status":"PASS","test":"TestWindowTcpWorkloadCancelUnblocksGroupAdmission"}
