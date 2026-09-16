@@ -1,0 +1,8 @@
+{
+  "base_commit": "2a01635920605d974a99dd7303090d2d5adc415a",
+  "race": true,
+  "repetitions": 3,
+  "scope": "33 tests for original before/v6 comparison; 37 tests after adding the contract-order root and three controls. Assertions do not skip failures.",
+  "setup_exclusions": "Initial before-v6/v6 builds erroneously included two benchmark files specific to the excluded drain implementation. Both failed before execution. Those benchmark-only files were removed equally; no runtime assertion changed.",
+  "source_ownership": "Frozen source and glog; compile and run pins verified. Raw logs remain outside the repository."
+}

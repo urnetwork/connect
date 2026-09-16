@@ -18,7 +18,10 @@ func TestWindowPacingLifetimeWorkerExpiresBehindFifoHead(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 		synctest.Wait()
 		service := fixture.sequence.windowPacer.service
-		if service.waiterHead != &head.waiter || head.waiter.next != &fixture.sequence.windowPacer.waiter {
+		service.stateLock.Lock()
+		queued := service.waiterHead == &head.waiter && head.waiter.next == &fixture.sequence.windowPacer.waiter
+		service.stateLock.Unlock()
+		if !queued {
 			t.Fatal("fixture did not park the real sender behind the FIFO head")
 		}
 		time.Sleep(400 * time.Millisecond)
@@ -31,7 +34,10 @@ func TestWindowPacingLifetimeWorkerExpiresBehindFifoHead(t *testing.T) {
 		default:
 			t.Fatal("real sender's FIFO wait hid its ACK lifetime")
 		}
-		if len(fixture.route) != 0 || service.waiterHead != &head.waiter || service.waiterTail != &head.waiter {
+		service.stateLock.Lock()
+		headPreserved := service.waiterHead == &head.waiter && service.waiterTail == &head.waiter
+		service.stateLock.Unlock()
+		if len(fixture.route) != 0 || !headPreserved {
 			t.Fatal("expiration dispatched the message or removed the live FIFO head")
 		}
 	}, func(fixture *windowInitialLifetimeFixture) {
@@ -53,7 +59,10 @@ func TestWindowPacingLifetimeWorkerExpiresBehindFifoHead(t *testing.T) {
 func TestWindowPacingLifetimeWorkerExpiresInsideControlledDrain(t *testing.T) {
 	runWindowInitialLifetimeFixture(t, 0, 500*time.Millisecond, false, func(t *testing.T, fixture *windowInitialLifetimeFixture) {
 		service := fixture.sequence.windowPacer.service
-		if !service.drainUntil.After(fixture.start.Add(500*time.Millisecond)) || service.pendingWrites != 1 {
+		service.stateLock.Lock()
+		draining := service.drainUntil.After(fixture.start.Add(500*time.Millisecond)) && service.pendingWrites == 1
+		service.stateLock.Unlock()
+		if !draining {
 			t.Fatal("fixture did not enter a drain beyond the waiting message lifetime")
 		}
 		time.Sleep(500 * time.Millisecond)
@@ -66,7 +75,10 @@ func TestWindowPacingLifetimeWorkerExpiresInsideControlledDrain(t *testing.T) {
 		default:
 			t.Fatal("controlled drain hid the real sender's ACK lifetime")
 		}
-		if len(fixture.route) != 0 || service.drained || service.pendingWrites != 1 {
+		service.stateLock.Lock()
+		unproved := !service.drained && service.pendingWrites == 1
+		service.stateLock.Unlock()
+		if len(fixture.route) != 0 || !unproved {
 			t.Fatal("local expiration dispatched a message or supplied physical proof")
 		}
 	}, func(fixture *windowInitialLifetimeFixture) {

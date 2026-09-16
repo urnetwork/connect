@@ -6262,6 +6262,7 @@ type SendSequence struct {
 	ackWindow *sequenceAckWindow
 
 	resendQueue        *resendQueue
+	ackLifetimes       sendAckLifetimes
 	sendItems          []*sendItem
 	nextSequenceNumber uint64
 	flightController   *sendFlightController
@@ -8025,6 +8026,8 @@ func (self *SendSequence) Run() {
 			// self.client.ContractManager().FlushContractQueue(contractKey, true)
 		}
 
+		// Lifetime pointers must disappear before send-item pool ownership moves.
+		self.ackLifetimes.clear()
 		// drain the buffer, releasing any borrowed budget
 		for _, item := range self.resendQueue.Clear() {
 			item.acks.invoke(errors.New("Send sequence closed."))
@@ -8181,6 +8184,9 @@ sendSequenceLoop:
 		self.publishNoAckFastPath()
 
 		sendTime := time.Now()
+		if _, err := self.nextAckLifetime(sendTime); err != nil {
+			return
+		}
 		// before the recovery scans, so an evicted item is due on this pass
 		self.resendEvicted(self.takePendingEvictions())
 		if flightPolicyChanged {
@@ -8214,6 +8220,7 @@ sendSequenceLoop:
 					item.ackTimeout,
 					self.ackTimeoutForPolicy(item.unreliableRecoveryPolicy()),
 				)
+				self.ackLifetimes.update(item)
 				retainPastAckTimeout := item.acks.retainPastAckTimeout()
 				itemAckTimeout := item.sendTime.Add(item.ackTimeout).Sub(sendTime)
 				if self.sendBuffer != nil && self.sendBuffer.forceAckTimeoutForTest != nil &&
@@ -8467,6 +8474,9 @@ sendSequenceLoop:
 				previousPacedWrite := self.windowPacer.waiter.sentAt
 				var resendDisposition transferWriteDisposition
 				var resendErr error
+				// The immutable rewritten envelope keeps its ACK lookup and
+				// retained-byte ownership through pacing and the physical write.
+				self.addResendItem(item)
 				c := func() error {
 					var writeErr error
 					resendDisposition, writeErr = self.writeMaybeWrappedBytes(
@@ -8499,6 +8509,10 @@ sendSequenceLoop:
 						}
 					}
 				}
+				if errors.Is(resendErr, errWindowPacingAcknowledged) {
+					continue sendSequenceLoop
+				}
+				self.resendQueue.RemoveByMessageId(item.messageId)
 				if resendErr == nil {
 					if !item.transportWriteObserved {
 						item.transportWriteObserved = true
@@ -8875,6 +8889,11 @@ sendSequenceLoop:
 		// flight-limited. That exposes a newly active flow to the fair scheduler;
 		// a carrier with a reserve may send it immediately, while an isolation-only
 		// carrier gives it the next ordinary acknowledgement opening.
+		if deadline, err := self.nextAckLifetime(time.Now()); err != nil {
+			return
+		} else if !deadline.IsZero() {
+			timeout = min(timeout, time.Until(deadline))
+		}
 		idleTimer.Reset(timeout)
 		select {
 		case <-self.ctx.Done():
@@ -10196,6 +10215,7 @@ func (self *SendSequence) observeCarrierWrite(
 		item.ackTimeout,
 		self.ackTimeoutForPolicy(item.unreliableRecoveryPolicy()),
 	)
+	self.ackLifetimes.update(item)
 	self.trackUnreliableFlight(item)
 }
 
@@ -11429,6 +11449,7 @@ func (self *SendSequence) receiveAckFeedbackAt(
 }
 
 func (self *SendSequence) ackItem(item *sendItem) {
+	self.ackLifetimes.remove(item)
 	if item.contractId != nil {
 		if itemSendContract, ok := self.openSendContracts[*item.contractId]; ok {
 			itemSendContract.ack(item.messageByteCount)
@@ -11487,6 +11508,7 @@ func (self *SendSequence) addResendItem(item *sendItem) {
 		self.client.resendQueueUnackedItemCount.Add(1)
 	}
 	self.resendQueue.Add(item)
+	self.ackLifetimes.update(item)
 }
 
 func (self *SendSequence) writeTimeoutForPack(resend bool) time.Duration {
@@ -11521,6 +11543,10 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 		service.invalidateMessageProbe(self.sequenceId, item.messageId)
 	}
 	paced := false
+	writeStart := windowPacingWriteStart{owner: self, recovery: resend}
+	if item != nil {
+		writeStart.sequenceId, writeStart.messageId, writeStart.number = self.sequenceId, item.messageId, item.sequenceNumber
+	}
 	paceWrite := func(byteCount int) error {
 		if item != nil && item.expectsAck && policy.h1Only &&
 			self.sendBufferSettings.DeliverySizedWindowScale > 0 &&
@@ -11541,7 +11567,10 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 					item.pacingByteCount = ByteCount(byteCount)
 					self.resendQueue.stateLock.Unlock()
 				}
-				if err := self.windowPacer.waitForServiceMessage(self.ctx, byteCount, alreadyCounted, self.sequenceId, item.messageId, item.sequenceNumber); err != nil {
+				if err := self.windowPacer.waitForServiceWriteStarted(self.ctx, byteCount, alreadyCounted, &writeStart); err != nil {
+					if errors.Is(err, context.DeadlineExceeded) {
+						self.cancel()
+					}
 					return err
 				}
 				if !alreadyCounted {
@@ -11562,6 +11591,50 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 	// carrier is active: route the overflow reliable-only so it is neither
 	// tracked in the flight nor lost with the unreliable carrier.
 	reliableOnly = reliableOnly || self.reliableOnlyWrite(policy)
+	// Takes the share on success. A lifetime wake that received valid feedback
+	// retries the same unconsumed share within the original writer time budget.
+	writeWithLifetime := func(bytes []byte) (transferWriteDisposition, error) {
+		budget := self.writeTimeoutForPack(resend)
+		var until time.Time
+		if budget >= 0 {
+			until = time.Now().Add(budget)
+		}
+		for {
+			if err := self.ctx.Err(); err != nil {
+				return transferWriteDisposition{}, err
+			}
+			deadline, lifetimeErr := writeStart.lifetime(time.Now())
+			if lifetimeErr != nil {
+				if errors.Is(lifetimeErr, context.DeadlineExceeded) {
+					self.cancel()
+				}
+				return transferWriteDisposition{}, lifetimeErr
+			}
+			timeout := budget
+			if budget > 0 {
+				timeout = max(0, time.Until(until))
+			}
+			lifetimeBound := !deadline.IsZero() && (until.IsZero() || deadline.Before(until))
+			if lifetimeBound {
+				timeout = max(0, time.Until(deadline))
+			}
+			disposition, err := writeMultiRouteWithCarrier(writer, self.ctx, bytes, timeout, reliableOnly)
+			if err == nil {
+				return disposition, nil
+			}
+			if _, lifetimeErr = writeStart.lifetime(time.Now()); lifetimeErr != nil {
+				if errors.Is(lifetimeErr, context.DeadlineExceeded) {
+					self.cancel()
+				}
+				return transferWriteDisposition{}, lifetimeErr
+			}
+			if !lifetimeBound || !errors.Is(err, errTransferRouteWriteTimeout) || self.ctx.Err() != nil ||
+				time.Now().Before(deadline) ||
+				!until.IsZero() && !time.Now().Before(until) {
+				return disposition, err
+			}
+		}
+	}
 	var cipher *sequenceCipher
 	if self.session != nil && !forceUnwrapped {
 		cipher = self.session.Cipher()
@@ -11608,13 +11681,7 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 		self.beginReceiverRttWrite(item, resend)
 		self.observeTransferWireMessage(bytes, transferFrameBytes, item, resend)
 		shared := MessagePoolShareReadOnly(bytes)
-		disposition, err := writeMultiRouteWithCarrier(
-			writer,
-			self.ctx,
-			shared,
-			self.writeTimeoutForPack(resend),
-			reliableOnly,
-		)
+		disposition, err := writeWithLifetime(shared)
 		finishPacedWrite(disposition, err)
 		if err != nil {
 			// on failure (abort/timeout) no route consumer took the message, so
@@ -11654,13 +11721,7 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 	self.beginReceiverRttWrite(item, resend)
 	self.observeTransferWireMessage(wrapped, transferFrameBytes, item, resend)
 	shared := MessagePoolShareReadOnly(wrapped)
-	disposition, err := writeMultiRouteWithCarrier(
-		writer,
-		self.ctx,
-		shared,
-		self.writeTimeoutForPack(resend),
-		reliableOnly,
-	)
+	disposition, err := writeWithLifetime(shared)
 	finishPacedWrite(disposition, err)
 	if err != nil {
 		// see the plaintext branch: a failed write leaves ownership here
@@ -11962,11 +12023,10 @@ type sendItem struct {
 	transferItem
 
 	contractId         *Id
-	head               bool
-	hasContractFrame   bool
 	sendTime           time.Time
 	resendTime         time.Time
 	ackTimeout         time.Duration
+	ackLifetimeIndex   int
 	sendCount          int
 	transferFrameBytes []byte
 	acks               sendAckSet
@@ -11998,6 +12058,8 @@ type sendItem struct {
 	ackTailProbeCount    int
 	recoveryKind         sendRecoveryKind
 	promotedHead         bool
+	head                 bool
+	hasContractFrame     bool
 	// forceUnwrapped pins this item to plaintext on every (re)send, so the
 	// outer wrap is skipped even if the per-peer cipher becomes available
 	// between the initial send and a retransmit.

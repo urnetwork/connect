@@ -49,6 +49,20 @@ type windowPacingWriteStart struct {
 	sequenceId Id
 	messageId  Id
 	number     uint64
+	owner      *SendSequence
+	recovery   bool
+}
+
+// Standalone pacing has no message lifetime; production uses the send owner's
+// earliest retained deadline, including older messages and an active retry.
+func (self *windowPacingWriteStart) lifetime(now time.Time) (time.Time, error) {
+	if self == nil || self.owner == nil {
+		return time.Time{}, nil
+	}
+	if self.recovery && self.owner.ackWindow != nil && self.owner.ackWindow.pendingDeliveryFor(self.number, self.messageId) {
+		return time.Time{}, errWindowPacingAcknowledged
+	}
+	return self.owner.nextAckLifetime(now)
 }
 
 // A burst may take longer than the measurement it came from while service
@@ -253,17 +267,20 @@ func (self *windowBurstPacer) waitForServiceWriteStarted(ctx context.Context, by
 		self.serviceSent += ByteCount(byteCount)
 	}
 	deadline := self.service.reserve(time.Now(), byteCount, self.rate, self.estimateRate, self.probeRate, self.probeLimit, resend, &self.waiter)
-	err := self.waitUntil(ctx, deadline)
+	err := self.waitUntilChangedForWrite(ctx, deadline, nil, start)
 	if err == nil {
-		err = self.service.waitForTurn(ctx, &self.waiter)
+		err = self.waitForTurn(ctx, start)
 	}
 	for err == nil {
 		now := time.Now()
+		if _, err = start.lifetime(now); err != nil {
+			break
+		}
 		delay, update := self.service.admitBurst(now, ByteCount(byteCount), resend, &self.waiter)
 		if delay <= 0 {
 			break
 		}
-		err = self.waitUntilChanged(ctx, now.Add(delay), update)
+		err = self.waitUntilChangedForWrite(ctx, now.Add(delay), update, start)
 	}
 	self.service.stateLock.Lock()
 	if err == nil && start != nil {
@@ -281,6 +298,15 @@ func (self *windowBurstPacer) waitForServiceWriteStarted(ctx context.Context, by
 	self.service.stateLock.Unlock()
 	if err == nil && self.afterAdmissionForTest != nil {
 		self.afterAdmissionForTest()
+	}
+	if err == nil {
+		err = ctx.Err()
+		if err == nil {
+			_, err = start.lifetime(time.Now())
+		}
+		if err != nil && start != nil {
+			self.service.finishWrite(start.sequenceId, start.messageId, false)
+		}
 	}
 	return err
 }
@@ -307,23 +333,62 @@ func (self *windowBurstPacer) waitUntil(ctx context.Context, deadline time.Time)
 // Tail delivery can end a bounded drain before its timer. Timer-dispatch
 // instrumentation applies only when a timer actually releases the wait.
 func (self *windowBurstPacer) waitUntilChanged(ctx context.Context, deadline time.Time, update <-chan struct{}) error {
-	if delay := time.Until(deadline); delay > 0 {
-		if self.timer == nil {
-			self.timer = time.NewTimer(0)
+	if deadline.IsZero() {
+		return ctx.Err()
+	}
+	return self.waitUntilChangedForWrite(ctx, deadline, update, nil)
+}
+
+// One existing timer handles service waits and owner expiry. ACK feedback may
+// finish or renew the oldest lifetime without resetting the service deadline.
+// A zero service deadline waits only for a FIFO handoff or cancellation.
+func (self *windowBurstPacer) waitUntilChangedForWrite(ctx context.Context, deadline time.Time, update <-chan struct{}, start *windowPacingWriteStart) error {
+	var acknowledgements <-chan struct{}
+	if start != nil && start.owner != nil && start.owner.ackWindow != nil {
+		acknowledgements = start.owner.ackWindow.Notify()
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		self.timer.Reset(delay)
+		now := time.Now()
+		lifetime, err := start.lifetime(now)
+		if err != nil {
+			return err
+		}
+		if !deadline.IsZero() && !now.Before(deadline) {
+			return nil
+		}
+		wake := deadline
+		if !lifetime.IsZero() && (wake.IsZero() || lifetime.Before(wake)) {
+			wake = lifetime
+		}
+		var timer <-chan time.Time
+		if !wake.IsZero() {
+			if self.timer == nil {
+				self.timer = time.NewTimer(0)
+			}
+			self.timer.Reset(time.Until(wake))
+			timer = self.timer.C
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-update:
 			return ctx.Err()
-		case <-self.timer.C:
+		case <-acknowledgements:
+			// This nested wait and the outer snapshot have the same owner.
+			// Leave feedback intact; only consume its wakeup edge here.
+			continue
+		case <-timer:
 		}
-		if self.afterWaitForTest != nil {
+		if _, err := start.lifetime(time.Now()); err != nil {
+			return err
+		}
+		if wake == deadline && self.afterWaitForTest != nil {
 			self.afterWaitForTest()
 		}
 	}
-	return ctx.Err()
 }
 
 // Logical sequences to one destination share serialization capacity and one
@@ -691,16 +756,12 @@ func (self *windowPacingService) reserve(now time.Time, byteCount int, rate, est
 
 // Only the oldest reservation may spend release credit. Waiting producers
 // keep their own deadline and cancellation without allocating per write.
-func (self *windowPacingService) waitForTurn(ctx context.Context, waiter *windowPacingWaiter) error {
-	self.stateLock.Lock()
-	first := self.waiterHead == waiter
-	self.stateLock.Unlock()
+func (self *windowBurstPacer) waitForTurn(ctx context.Context, start *windowPacingWriteStart) error {
+	self.service.stateLock.Lock()
+	first := self.service.waiterHead == &self.waiter
+	self.service.stateLock.Unlock()
 	if !first {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-waiter.ready:
-		}
+		return self.waitUntilChangedForWrite(ctx, time.Time{}, self.waiter.ready, start)
 	}
 	return ctx.Err()
 }
