@@ -1,0 +1,12 @@
+=== RUN   TestTcpReturnReplayPreservesPacingServiceAcrossFeedbackIdle
+    transfer_window_host_feedback_test.go:92: a healthy inner replay priced feedback idle as service: service=3536 replay=1100 bulk-wait=18.430482186s
+--- FAIL: TestTcpReturnReplayPreservesPacingServiceAcrossFeedbackIdle (0.00s)
+=== RUN   TestTcpReturnReplayPreservesPacingServiceAcrossFeedbackIdle
+    transfer_window_host_feedback_test.go:92: a healthy inner replay priced feedback idle as service: service=3536 replay=1100 bulk-wait=18.430482186s
+--- FAIL: TestTcpReturnReplayPreservesPacingServiceAcrossFeedbackIdle (0.00s)
+=== RUN   TestTcpReturnReplayPreservesPacingServiceAcrossFeedbackIdle
+    transfer_window_host_feedback_test.go:92: a healthy inner replay priced feedback idle as service: service=3536 replay=1100 bulk-wait=18.430482186s
+--- FAIL: TestTcpReturnReplayPreservesPacingServiceAcrossFeedbackIdle (0.00s)
+FAIL
+FAIL	github.com/urnetwork/connect	0.707s
+FAIL

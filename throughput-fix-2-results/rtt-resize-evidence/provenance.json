@@ -1,0 +1,152 @@
+{
+  "final_source": {
+    "canonical_source_sha256": "56eec7b1968bac2214224b2d7975f849d0fe6efef53cd9322eb11a01b31bc6ef",
+    "final_controls_pairs": 23,
+    "final_controls_service_readings": 46,
+    "final_controls_top_level_passed": 7,
+    "focused_race_top_level_passed": 93,
+    "runner_sha256": "6af611e430a6efe1820dad4649d52cb06bb6edbd0215218523bba11957eff293"
+  },
+  "fixture": {
+    "f60_overlay_sha256": "c0f0545d113269fd60970c295f80e8b2a35b53cc12431f11f203bee0bfd332d5",
+    "test_only_sha256": "47f44539e086f606bff5f0f67249b1161065954c6ed9ba512a4a28f614f8eeec"
+  },
+  "input_sha256": {
+    "adjacent_before": "ec12778c05fbbe179e3d6befabdfc9ee6c3503c16ad8cf59f8e0492be5528ced",
+    "controls": "63abbfdd8f2a9a9a92ceffc3d689900084a12a40268a8c7bb804f1db052b7580",
+    "f60_exact": "0e31aa0a24a604bb421e9b606397c0a5670da123195f007e0ba966a130661bc5",
+    "focused": "1c5a27de256d51be9250d2b5c922b16f7724c2a52bd24af956d61ad0187d2a2c",
+    "pre_epoch_exact": "fc750e07b5ea7f60d81909d18ec24cb2c00e438bf75b2b29bb9e64f1d62f0a47",
+    "recovery_before": "74fb294eb0bdce20f8f2ba0e42d1b1b192179938668d9280bb0a3ac1c7c2d23b",
+    "resized_exact": "1ba761d602bb91d87cfb73f72e6dab8d6922588f4e546026cfcc146205de2aec",
+    "root_before": "6eab9da42e02f143068d6da0d29dccae6695dcb85da379174d26614dd506cf84"
+  },
+  "lineage": {
+    "committed_6a_direct_failures": {
+      "description": "Root unit and 20-second recovery transition failures against committed 6a production; no overlay.",
+      "revision": "6a212aeebee10c127720f6696e5c8ee9dc146f9e"
+    },
+    "f60_transition_control": {
+      "canonical_source_sha256": "f60cf11db4f0c7a928144ad78d1b9cebe96bbf8916fa620d1b58d01598fc613a",
+      "description": "Exact transition fixture against f60 pacing behavior; fixture overlay is test-only.",
+      "fixture_overlay_sha256": "c0f0545d113269fd60970c295f80e8b2a35b53cc12431f11f203bee0bfd332d5"
+    },
+    "intermediate_reordering_failure": {
+      "description": "An intermediate pre-reordering pacer reproduction for late-ACK shrink behavior; it is not the final source.",
+      "pacer_sha256": "3448eb834872c440f033fd7245dade89bcd7fb15d45409411062e79f50f040bc",
+      "reproduction_mapping": "transfer_window_pacing.go replaced by the intermediate pacer together with the final resize test."
+    },
+    "pre_service_epoch_control": {
+      "description": "Exact transition control with the pre-service-epoch pacer; compatibility overlay is not archived.",
+      "pacer_sha256": "047b0929fe1ea702e98639a36c5ba6912058184ced4671ed1ede2e5478960c6e"
+    }
+  },
+  "purpose": "Sanitized bounded evidence for RTT-aware pacing-stat rebucketing. Raw logs, generated overlays, test binaries, and source copies remain outside this archive.",
+  "redaction": "Only test outcomes, failure assertions, numerical service-reading ledgers, and hashes are retained. No raw diagnostics, binaries, overlay JSON, or source text is copied.",
+  "transition_measurements": {
+    "f60_exact": [
+      {
+        "arm": "ceiling",
+        "drops": 0,
+        "mbps": 10,
+        "min_flow_mbps": 1.25,
+        "payload": 65536,
+        "rate": 1250000,
+        "rate_after": 0,
+        "rate_change_after_ns": 0,
+        "seconds": 3.3554432,
+        "warmup_seconds": 50
+      },
+      {
+        "arm": "delivery",
+        "drops": 0,
+        "mbps": 7.34375,
+        "min_flow_mbps": 0.78125,
+        "payload": 65536,
+        "rate": 125000,
+        "rate_after": 1250000,
+        "rate_change_after_ns": 40000000000,
+        "seconds": 3.3554432,
+        "warmup_seconds": 50
+      }
+    ],
+    "pre_epoch_exact": [
+      {
+        "arm": "ceiling",
+        "drops": 0,
+        "mbps": 10,
+        "min_flow_mbps": 1.25,
+        "payload": 65536,
+        "rate": 1250000,
+        "rate_after": 0,
+        "rate_change_after_ns": 0,
+        "seconds": 3.3554432,
+        "warmup_seconds": 50
+      },
+      {
+        "arm": "delivery",
+        "drops": 0,
+        "mbps": 9.53125,
+        "min_flow_mbps": 1.09375,
+        "payload": 65536,
+        "rate": 125000,
+        "rate_after": 1250000,
+        "rate_change_after_ns": 40000000000,
+        "seconds": 3.3554432,
+        "warmup_seconds": 50
+      }
+    ],
+    "recovery_before": [
+      {
+        "arm": "ceiling",
+        "drops": 0,
+        "mbps": 9.987686400000001,
+        "min_flow_mbps": 1.2320768,
+        "payload": 65536,
+        "rate": 1250000,
+        "rate_after": 0,
+        "rate_change_after_ns": 0,
+        "seconds": 20,
+        "warmup_seconds": 40
+      },
+      {
+        "arm": "delivery",
+        "drops": 0,
+        "mbps": 5.8458112,
+        "min_flow_mbps": 0.7077888,
+        "payload": 65536,
+        "rate": 125000,
+        "rate_after": 1250000,
+        "rate_change_after_ns": 40000000000,
+        "seconds": 20,
+        "warmup_seconds": 40
+      }
+    ],
+    "resized_exact": [
+      {
+        "arm": "ceiling",
+        "drops": 0,
+        "mbps": 10,
+        "min_flow_mbps": 1.25,
+        "payload": 65536,
+        "rate": 1250000,
+        "rate_after": 0,
+        "rate_change_after_ns": 0,
+        "seconds": 3.3554432,
+        "warmup_seconds": 50
+      },
+      {
+        "arm": "delivery",
+        "drops": 0,
+        "mbps": 10,
+        "min_flow_mbps": 1.25,
+        "payload": 65536,
+        "rate": 125000,
+        "rate_after": 1250000,
+        "rate_change_after_ns": 40000000000,
+        "seconds": 3.3554432,
+        "warmup_seconds": 50
+      }
+    ]
+  }
+}

@@ -1,0 +1,6 @@
+=== RUN   TestWindowPathServiceCapacityIncreaseRecovery
+    transfer_window_pacing_capacity_test.go:90: capacity recovery after change=16s reference-10-to-14s=9.961472 candidate-10-to-14s=7.733248 intervals=[2.097152 1.048576 2.097152 1.572864 2.62144 2.62144 3.145728 3.145728 3.145728 5.24288 4.194304 7.86432 8.912896 9.961472 9.961472 9.961472 9.961472 8.912896 9.961472 10.48576]
+    transfer_window_pacing_capacity_test.go:93: capacity recovery reference=9.961 candidate=7.733 recovered=16s minimum=0.708 drops=0 queue=69/4529091
+--- FAIL: TestWindowPathServiceCapacityIncreaseRecovery (0.09s)
+FAIL
+FAIL	github.com/urnetwork/connect	0.793s

@@ -715,6 +715,19 @@ func (self *windowPacingService) observe(bytes ByteCount, at time.Time) {
 		self.newestBucket = bucket
 	}
 	self.hasSamples = true
+	if bucket < self.newestBucket {
+		// A smaller interval cannot split an existing aggregate exactly.
+		// Merge reordered ACKs into its real span, avoiding overlapping sums.
+		for offset := int64(0); offset < int64(len(self.samples)); offset++ {
+			retainedBucket := self.newestBucket - offset
+			index := (retainedBucket%int64(len(self.samples)) + int64(len(self.samples))) % int64(len(self.samples))
+			sample := &self.samples[index]
+			if sample.bucket == retainedBucket && sample.bytes > 0 && sample.firstAtNanos <= at.UnixNano() && at.UnixNano() <= sample.lastAtNanos {
+				bucket = retainedBucket
+				break
+			}
+		}
+	}
 	index := (bucket%int64(len(self.samples)) + int64(len(self.samples))) % int64(len(self.samples))
 	sample := &self.samples[index]
 	if sample.bucket != bucket {
@@ -895,9 +908,42 @@ func (self *windowPacingService) observeRoundTripWithLock(roundTrip, compression
 	slots := time.Duration(len(self.samples) - 2)
 	interval := max(deliverySizedWindowSampleInterval, self.compression/4, (self.minRoundTrip+self.compression+slots-1)/slots)
 	if interval != max(deliverySizedWindowSampleInterval, self.bucketInterval) {
+		// Bucket widths are bookkeeping. Preserve real ACK timestamps so
+		// a changed RTT cannot erase the pair that discovered new service.
+		previous := self.samples
+		newest := self.newestBucket
 		clear(self.samples[:])
 		self.hasSamples = false
 		self.newestBucket = 0
+		for offset := int64(0); offset < int64(len(previous)); offset++ {
+			bucket := newest - offset
+			index := (bucket%int64(len(previous)) + int64(len(previous))) % int64(len(previous))
+			sample := previous[index]
+			if sample.bucket != bucket || sample.bytes <= 0 || !self.serviceEpochAt.IsZero() && sample.firstAtNanos < self.serviceEpochAt.UnixNano() {
+				continue
+			}
+			bucket = sample.lastAtNanos / int64(interval)
+			if !self.hasSamples {
+				self.hasSamples, self.newestBucket = true, bucket
+			}
+			if bucket <= self.newestBucket-int64(len(self.samples)) {
+				continue
+			}
+			index = (bucket%int64(len(self.samples)) + int64(len(self.samples))) % int64(len(self.samples))
+			destination := &self.samples[index]
+			if destination.bytes == 0 {
+				*destination = sample
+				destination.bucket = bucket
+				continue
+			}
+			if sample.firstAtNanos < destination.firstAtNanos {
+				destination.firstAtNanos, destination.firstBytes = sample.firstAtNanos, sample.firstBytes
+			} else if sample.firstAtNanos == destination.firstAtNanos {
+				destination.firstBytes += sample.firstBytes
+			}
+			destination.lastAtNanos = max(destination.lastAtNanos, sample.lastAtNanos)
+			destination.bytes += sample.bytes
+		}
 	}
 	self.bucketInterval = interval
 }

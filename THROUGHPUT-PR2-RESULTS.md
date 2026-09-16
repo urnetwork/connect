@@ -24,13 +24,26 @@ review, hypotheses, evidence limits and server follow-up work.
 
 ### Burst follow-up checkpoint
 
-The latest controlled-drain correction passes 156 race-enabled correctness tests
-and nine focused performance pairs on source SHA-256
+The controlled-drain correction passes 156 race-enabled correctness tests
+and the full model (21 tests, 272 pairs, 508 ledger rows) on source SHA-256
 `f60cf11db4f0c7a928144ad78d1b9cebe96bbf8916fa620d1b58d01598fc613a`.
 It preserves serialization evidence across natural drains and fixes the settled
-64 KiB capacity increase from 1.094 to 10.000 Mb/s. Full matrix confirmation,
-recovery speed and host acceptance remain open; see the report for the retained
-diagnostics and deterministic failure-before tests.
+64 KiB capacity increase from 1.094 to 10.000 Mb/s. A subsequent recovery test
+exposed lost delivery checkpoints during RTT-driven bucket resizing. The new
+correction preserves those timestamps and first-arrival bytes; the fixed
+10–14 s recovery interval rises from 7.733248 to 10.092544 Mb/s against the
+9.961472 Mb/s reference. Its source and validation are separate from the
+completed `f60cf11d` model. Recovery-time differences and host acceptance remain
+open; see the report for retained failures and deterministic tests.
+The rebucketing source `56eec7b1968bac2214224b2d7975f849d0fe6efef53cd9322eb11a01b31bc6ef`
+passes 160 correctness tests under the race detector and 23 targeted performance
+pairs across seven tests; its full-model and host confirmation remain open.
+
+The new SDK probe captures eight actual constructor profiles, with stable
+SDK/connect manifests and allowlisted numerical settings. Those observations
+prepare the missing SDK-budget performance cells; they do not replace them.
+The separate induced host feedback-idle failure now has a deterministic
+`TcpSequence.runReturnRecovery` reproduction, retained as an unfixed diagnostic.
 
 The committed follow-up's final correctness run passes 152 tests under `-race`
 on source SHA-256

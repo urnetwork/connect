@@ -1,0 +1,35 @@
+{
+  "created_utc": "2026-09-16T00:32:17.929501+00:00",
+  "mode": "model",
+  "test_pattern": "^(TestWindowPathFifo.*|TestWindowPathGapDeadline|TestWindowCompressionResidence.*|TestWindowPathDeterministicPerformanceMatrix|TestWindowPathBoundsBurstsAtFiniteRelay|TestWindowPathSlowLinkKeepsCapacity|TestWindowPathService.*|TestWindowPathWindowMismatch.*)$",
+  "run_flags": [
+    "-test.short=false"
+  ],
+  "connect": {
+    "revision": "6a212aeebee10c127720f6696e5c8ee9dc146f9e",
+    "branch": "throughput-fix-2",
+    "source_sha256": "f60cf11db4f0c7a928144ad78d1b9cebe96bbf8916fa620d1b58d01598fc613a",
+    "dirty": true
+  },
+  "package": "./",
+  "build_flags": [
+    "-race=false"
+  ],
+  "runner_sha256": "6af611e430a6efe1820dad4649d52cb06bb6edbd0215218523bba11957eff293",
+  "host_load_average_at_start": [
+    16.16943359375,
+    14.55322265625,
+    20.73193359375
+  ],
+  "go": "go version go1.26.7 darwin/arm64",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "architecture": "arm64",
+  "logical_cpus": 10,
+  "environment": {
+    "CONNECT_WINDOW_RUN_CONTEXT": "Full deterministic f60 model validation started immediately while concurrent root coverage review, monitor work, and overlay-only pacing investigation were active; no quiescence wait."
+  },
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN",
+  "binary_sha256": "72decbed1f555d5cff000accd3d42565c0118290e3a570463482b6cd7b5f3bb5",
+  "sources_stable_during_build": true
+}

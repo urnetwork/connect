@@ -1,0 +1,250 @@
+{
+  "SchemaVersion": 1,
+  "CreatedUtc": "2026-09-16T00:57:51.628286+00:00",
+  "Status": "unfixed demonstrated replay/application-idle sampling root; diagnostic evidence only",
+  "SourceCommit": "6a212aeebee10c127720f6696e5c8ee9dc146f9e",
+  "SourcePins": {
+    "PacingFile": {
+      "RepositoryFile": "transfer_window_pacing.go",
+      "Sha256": "eb558a979ce50c341103c86dbf0b79a13dc979ad8cdc1157eaa99c23ba17c45e",
+      "Commit": "6a212aeebee10c127720f6696e5c8ee9dc146f9e"
+    },
+    "NatFile": {
+      "RepositoryFile": "ip.go",
+      "BaseCommit": "6a212aeebee10c127720f6696e5c8ee9dc146f9e",
+      "BaseSha256": "ffca0558cdd626e73c7af0756effaa3c239837196f33f8630d940e1b7ae8ac23"
+    }
+  },
+  "CompilationScope": "Pacing code was pinned by overlay to 6a212aee for every baseline binary. State binaries also overlay ip.go from that commit with a one-time sequence-observation hook. Other production files were from the 6a212aee workspace; no complete-tree compile fingerprint was captured. Binary and exact overlay-source hashes are retained below.",
+  "AfterFix": null,
+  "Counterfactual": "The no-generic-hold variant changes only measured() final latest = hold to latest = 0 * hold. It is a diagnostic counterfactual, not a proposed or validated fix, and still reproduces combined collapse.",
+  "HostProtocol": {
+    "Test": "TestWindowTcpDownloadPerformanceMatrix",
+    "ReferenceArm": "ceiling",
+    "CandidateArm": "delivery",
+    "Flows": 1,
+    "RoundTripUs": 300,
+    "AckCompressionMs": 10,
+    "LinkByteRate": 125000000,
+    "CellBudgetBytes": 50331648,
+    "MeasurementSeconds": 12,
+    "WarmupSeconds": 2.3015,
+    "Repetitions": 1,
+    "RawTransport": "kernel loopback TCP origin, production LocalUserNat/TcpSequence, gVisor receiver, two Transfer clients and FIFO simulated links",
+    "Perturbation": "One 80 ms pause before the device reverse producer calls SendMulti, triggered by its first write at or after 5 s from workload start. Selected rows additionally pin the window estimator RTT term to 1300 us. Pacing residence measurement itself is not overridden.",
+    "TraceCadenceMs": {
+      "Transfer": 10,
+      "TunAndNat": 100
+    },
+    "Execution": "Sequential completed runs on immutable binaries in the active development environment. No environment quiescence, server, database, or process-budget change."
+  },
+  "CommandTemplate": "CONNECT_WINDOW_TCP_MEASURE=1 CONNECT_WINDOW_PATH_RTT_US=300 CONNECT_WINDOW_PATH_FLOWS=1 CONNECT_WINDOW_PATH_ACK_MS=10 CONNECT_WINDOW_PATH_REPETITIONS=1 CONNECT_WINDOW_PATH_SECONDS=12 CONNECT_WINDOW_PATH_ARMS=<arm> CONNECT_WINDOW_PACING_TRACE=1 CONNECT_WINDOW_INNER_TCP_TRACE=1 [CONNECT_WINDOW_DIAGNOSTIC_WINDOW_RTT_US=1300] [CONNECT_WINDOW_TCP_REVERSE_DELAY_MS=80 CONNECT_WINDOW_TCP_REVERSE_DELAY_AFTER_MS=5000] <binary> -test.run ^TestWindowTcpDownloadPerformanceMatrix$ -test.count=1 -test.v -test.timeout=2m",
+  "Overlays": {
+    "overlay.json": {
+      "OriginalPath": "/tmp/throughput-fix-2-host-feedback-6a212aee/overlay.json",
+      "Sha256": "a2c538b5a8c5439a68de10cb1d81148e3c4a63fe2dd925f780d84465908d02fb",
+      "Replacements": [
+        {
+          "RepositoryFile": "transfer_window_pacing.go",
+          "OverlaySource": "/tmp/throughput-fix-2-host-feedback-6a212aee/transfer_window_pacing.go",
+          "Sha256": "eb558a979ce50c341103c86dbf0b79a13dc979ad8cdc1157eaa99c23ba17c45e"
+        },
+        {
+          "RepositoryFile": "transfer_window_tcp_performance_test.go",
+          "OverlaySource": "/tmp/throughput-fix-2-inner-tcp-trace-test.go",
+          "Sha256": "b2849b355e9b2926c074b17f473025c853eb9ef742a4f52d9c7dd899cf9113ee"
+        },
+        {
+          "RepositoryFile": "transfer_window_path_performance_test.go",
+          "OverlaySource": "/tmp/throughput-fix-2-inner-tcp-trace-path-test.go",
+          "Sha256": "b5f53d4e9b2754e5182391eb379d730709e25756a9321216a753d9782bfd6ce1"
+        }
+      ]
+    },
+    "state-overlay.json": {
+      "OriginalPath": "/tmp/throughput-fix-2-host-feedback-6a212aee/state-overlay.json",
+      "Sha256": "2463fc41020ea187962b7b5c1b18d07cffebfb2b2c5643267799d161e82bc955",
+      "Replacements": [
+        {
+          "RepositoryFile": "transfer_window_pacing.go",
+          "OverlaySource": "/tmp/throughput-fix-2-host-feedback-6a212aee/transfer_window_pacing.go",
+          "Sha256": "eb558a979ce50c341103c86dbf0b79a13dc979ad8cdc1157eaa99c23ba17c45e"
+        },
+        {
+          "RepositoryFile": "transfer_window_tcp_performance_test.go",
+          "OverlaySource": "/tmp/throughput-fix-2-host-feedback-6a212aee/tcp-state-trace_test.go",
+          "Sha256": "d982ef801bf154e7d03931cf85a574734d0df64bf6d1dfb17738f406dd7d8d0b"
+        },
+        {
+          "RepositoryFile": "transfer_window_path_performance_test.go",
+          "OverlaySource": "/tmp/throughput-fix-2-host-feedback-6a212aee/path-state-trace_test.go",
+          "Sha256": "5421cc26e9ebeb32f3aa42595ca576900471092265f53f5337714d01f9454b73"
+        },
+        {
+          "RepositoryFile": "ip.go",
+          "OverlaySource": "/tmp/throughput-fix-2-host-feedback-6a212aee/ip-state-trace.go",
+          "Sha256": "b6106882056ed96677e1210410d8ef9bb4dfc23f3ae81427a62c6007dd915314"
+        }
+      ]
+    },
+    "state-no-hold-overlay.json": {
+      "OriginalPath": "/tmp/throughput-fix-2-host-feedback-6a212aee/state-no-hold-overlay.json",
+      "Sha256": "d3fefea7c3d0ed48ed3036e3176b393fb2fdb13d4b05524739e32b7d4d537bf7",
+      "Replacements": [
+        {
+          "RepositoryFile": "transfer_window_pacing.go",
+          "OverlaySource": "/tmp/throughput-fix-2-capacity-epoch-only-pacing.go",
+          "Sha256": "719a5379be80c087d3e3e74d9e5f61c47aa6ac8ebdcd282632489783135aebac"
+        },
+        {
+          "RepositoryFile": "transfer_window_tcp_performance_test.go",
+          "OverlaySource": "/tmp/throughput-fix-2-host-feedback-6a212aee/tcp-state-trace_test.go",
+          "Sha256": "d982ef801bf154e7d03931cf85a574734d0df64bf6d1dfb17738f406dd7d8d0b"
+        },
+        {
+          "RepositoryFile": "transfer_window_path_performance_test.go",
+          "OverlaySource": "/tmp/throughput-fix-2-host-feedback-6a212aee/path-state-trace_test.go",
+          "Sha256": "5421cc26e9ebeb32f3aa42595ca576900471092265f53f5337714d01f9454b73"
+        },
+        {
+          "RepositoryFile": "ip.go",
+          "OverlaySource": "/tmp/throughput-fix-2-host-feedback-6a212aee/ip-state-trace.go",
+          "Sha256": "b6106882056ed96677e1210410d8ef9bb4dfc23f3ae81427a62c6007dd915314"
+        }
+      ]
+    },
+    "replay-root-overlay.json": {
+      "OriginalPath": "/tmp/throughput-fix-2-host-feedback-6a212aee/replay-root-overlay.json",
+      "Sha256": "fdc83307f98e9f2fb87c9e1ae6960183662d6c84dacd6ee26122906ff3e64e83",
+      "Replacements": [
+        {
+          "RepositoryFile": "transfer_window_pacing.go",
+          "OverlaySource": "/tmp/throughput-fix-2-host-feedback-6a212aee/transfer_window_pacing.go",
+          "Sha256": "eb558a979ce50c341103c86dbf0b79a13dc979ad8cdc1157eaa99c23ba17c45e"
+        },
+        {
+          "RepositoryFile": "transfer_window_host_feedback_test.go",
+          "OverlaySource": "/tmp/throughput-fix-2-host-feedback-6a212aee/replay-root_test.go",
+          "Sha256": "e8aeb4eacab96f385b087f1e6902beede6228385c357f6f02799549d6c232e39"
+        }
+      ]
+    },
+    "virtual-overlay.json": {
+      "OriginalPath": "/tmp/throughput-fix-2-host-feedback-6a212aee/virtual-overlay.json",
+      "Sha256": "976932e0f71198abaa47eaed752eea39c04a5cb615c7d9bcfd55d60b92c4ea2e",
+      "Replacements": [
+        {
+          "RepositoryFile": "transfer_window_pacing.go",
+          "OverlaySource": "/tmp/throughput-fix-2-host-feedback-6a212aee/transfer_window_pacing.go",
+          "Sha256": "eb558a979ce50c341103c86dbf0b79a13dc979ad8cdc1157eaa99c23ba17c45e"
+        },
+        {
+          "RepositoryFile": "transfer_window_tcp_performance_test.go",
+          "OverlaySource": "/tmp/throughput-fix-2-host-feedback-6a212aee/tcp-virtual-trace_test.go",
+          "Sha256": "487171448508dbc730ad09c20d195f1fbd84928876dbaa87cf02f31e65041424"
+        },
+        {
+          "RepositoryFile": "transfer_window_path_performance_test.go",
+          "OverlaySource": "/tmp/throughput-fix-2-host-feedback-6a212aee/path-state-trace_test.go",
+          "Sha256": "5421cc26e9ebeb32f3aa42595ca576900471092265f53f5337714d01f9454b73"
+        },
+        {
+          "RepositoryFile": "ip.go",
+          "OverlaySource": "/tmp/throughput-fix-2-host-feedback-6a212aee/ip-state-trace.go",
+          "Sha256": "b6106882056ed96677e1210410d8ef9bb4dfc23f3ae81427a62c6007dd915314"
+        }
+      ]
+    }
+  },
+  "Runs": [
+    {
+      "Run": "combined",
+      "RawLog": "/tmp/throughput-fix-2-host-feedback-6a212aee/combined.log",
+      "RawLogSha256": "539badd62fdedb689c5f7e73ecf7af2b18c998d30cd5591811757b5becacea6d",
+      "Binary": "/tmp/throughput-fix-2-host-feedback-6a212aee/connect.test",
+      "BinarySha256": "42c35be93e3076d48e4b1a0b2ef4b207b00470c6cb16fd4b0a6fb0c91b71e83d",
+      "Overlay": "/tmp/throughput-fix-2-host-feedback-6a212aee/overlay.json",
+      "OverlaySha256": "a2c538b5a8c5439a68de10cb1d81148e3c4a63fe2dd925f780d84465908d02fb",
+      "EnvironmentFile": null
+    },
+    {
+      "Run": "rtt-only",
+      "RawLog": "/tmp/throughput-fix-2-host-feedback-6a212aee/rtt-only.log",
+      "RawLogSha256": "e96eea52f7bead73ffb9d9728f0858af327a50e3a79af74d143eb7be3d9e3d56",
+      "Binary": "/tmp/throughput-fix-2-host-feedback-6a212aee/connect.test",
+      "BinarySha256": "42c35be93e3076d48e4b1a0b2ef4b207b00470c6cb16fd4b0a6fb0c91b71e83d",
+      "Overlay": "/tmp/throughput-fix-2-host-feedback-6a212aee/overlay.json",
+      "OverlaySha256": "a2c538b5a8c5439a68de10cb1d81148e3c4a63fe2dd925f780d84465908d02fb",
+      "EnvironmentFile": "/tmp/throughput-fix-2-host-feedback-6a212aee/rtt-only-env.json"
+    },
+    {
+      "Run": "reverse-pause-only",
+      "RawLog": "/tmp/throughput-fix-2-host-feedback-6a212aee/reverse-pause-only.log",
+      "RawLogSha256": "2a964f066f4228c9feec40a6658523e2c6f21216b4e1d2fa7f45da899192e833",
+      "Binary": "/tmp/throughput-fix-2-host-feedback-6a212aee/connect.test",
+      "BinarySha256": "42c35be93e3076d48e4b1a0b2ef4b207b00470c6cb16fd4b0a6fb0c91b71e83d",
+      "Overlay": "/tmp/throughput-fix-2-host-feedback-6a212aee/overlay.json",
+      "OverlaySha256": "a2c538b5a8c5439a68de10cb1d81148e3c4a63fe2dd925f780d84465908d02fb",
+      "EnvironmentFile": "/tmp/throughput-fix-2-host-feedback-6a212aee/reverse-pause-only-env.json"
+    },
+    {
+      "Run": "ceiling-combined",
+      "RawLog": "/tmp/throughput-fix-2-host-feedback-6a212aee/ceiling-combined.log",
+      "RawLogSha256": "6038aed1a3e8fe806d3e6f1d9cf96137669e40dd9ad896b1fb70f9301383e585",
+      "Binary": "/tmp/throughput-fix-2-host-feedback-6a212aee/connect.test",
+      "BinarySha256": "42c35be93e3076d48e4b1a0b2ef4b207b00470c6cb16fd4b0a6fb0c91b71e83d",
+      "Overlay": "/tmp/throughput-fix-2-host-feedback-6a212aee/overlay.json",
+      "OverlaySha256": "a2c538b5a8c5439a68de10cb1d81148e3c4a63fe2dd925f780d84465908d02fb",
+      "EnvironmentFile": "/tmp/throughput-fix-2-host-feedback-6a212aee/ceiling-combined-env.json"
+    },
+    {
+      "Run": "reverse-pause-state",
+      "RawLog": "/tmp/throughput-fix-2-host-feedback-6a212aee/reverse-pause-state.log",
+      "RawLogSha256": "e29ab70eae289479aa45340d2ce0e7d410e6364ae63499b418a498d10bb61519",
+      "Binary": "/tmp/throughput-fix-2-host-feedback-6a212aee/state.test",
+      "BinarySha256": "60bae3ab9b10e04fbd33e50c7b5ae70933651da37db8cbb7c3c013c4582c0ad0",
+      "Overlay": "/tmp/throughput-fix-2-host-feedback-6a212aee/state-overlay.json",
+      "OverlaySha256": "2463fc41020ea187962b7b5c1b18d07cffebfb2b2c5643267799d161e82bc955",
+      "EnvironmentFile": "/tmp/throughput-fix-2-host-feedback-6a212aee/reverse-pause-state-env.json"
+    },
+    {
+      "Run": "reverse-pause-no-hold",
+      "RawLog": "/tmp/throughput-fix-2-host-feedback-6a212aee/reverse-pause-no-hold.log",
+      "RawLogSha256": "f9705f18f48fb85c62db6c4827828d1f5d110d5f0a10896a7c204023b2bf7ebb",
+      "Binary": "/tmp/throughput-fix-2-host-feedback-6a212aee/state-no-hold.test",
+      "BinarySha256": "84c4a2b781befda89c80223de6b68f7da6827f5be278f1f389111a3949b6e579",
+      "Overlay": "/tmp/throughput-fix-2-host-feedback-6a212aee/state-no-hold-overlay.json",
+      "OverlaySha256": "d3fefea7c3d0ed48ed3036e3176b393fb2fdb13d4b05524739e32b7d4d537bf7",
+      "EnvironmentFile": "/tmp/throughput-fix-2-host-feedback-6a212aee/reverse-pause-no-hold-env.json"
+    },
+    {
+      "Run": "combined-state",
+      "RawLog": "/tmp/throughput-fix-2-host-feedback-6a212aee/combined-state.log",
+      "RawLogSha256": "a2544c50633db3838f79d0c4f0a0f5d0f130c26711d9cf86e78fb9859395c4d1",
+      "Binary": "/tmp/throughput-fix-2-host-feedback-6a212aee/state.test",
+      "BinarySha256": "60bae3ab9b10e04fbd33e50c7b5ae70933651da37db8cbb7c3c013c4582c0ad0",
+      "Overlay": "/tmp/throughput-fix-2-host-feedback-6a212aee/state-overlay.json",
+      "OverlaySha256": "2463fc41020ea187962b7b5c1b18d07cffebfb2b2c5643267799d161e82bc955",
+      "EnvironmentFile": "/tmp/throughput-fix-2-host-feedback-6a212aee/combined-state-env.json"
+    },
+    {
+      "Run": "combined-no-hold",
+      "RawLog": "/tmp/throughput-fix-2-host-feedback-6a212aee/combined-no-hold.log",
+      "RawLogSha256": "2fddc33238253a70e7b5bc8f0226d17ee1bf105799ffc2c1ae0a72cc5bf797cb",
+      "Binary": "/tmp/throughput-fix-2-host-feedback-6a212aee/state-no-hold.test",
+      "BinarySha256": "84c4a2b781befda89c80223de6b68f7da6827f5be278f1f389111a3949b6e579",
+      "Overlay": "/tmp/throughput-fix-2-host-feedback-6a212aee/state-no-hold-overlay.json",
+      "OverlaySha256": "d3fefea7c3d0ed48ed3036e3176b393fb2fdb13d4b05524739e32b7d4d537bf7",
+      "EnvironmentFile": "/tmp/throughput-fix-2-host-feedback-6a212aee/combined-no-hold-env.json"
+    }
+  ],
+  "AttributionLimits": [
+    "These are induced single-arm diagnostics, not completed A/A-bracketed matched performance comparisons. The comparison censor reasons are retained verbatim in each numerical row.",
+    "Only the estimator/replay failure is deterministic. The host outcome varies with ordering: reverse-pause-only collapsed in one run and recovered in the additional state trace.",
+    "The additional NAT snapshot takes the existing sequence mutex at 100 ms intervals; it does not read gVisor TcpInfo or modify data-path state. Diagnostic scheduling can affect the host outcome.",
+    "No row demonstrates the completed rebucketing correction or any fix for this host feedback root.",
+    "The result does not establish the cause of every historical paired host failure, including rows ending near 300 Mb/s with a healthy reported Transfer service rate.",
+    "NAT recovery is a legitimate response to missing inner acknowledgment progress. The demonstrated defect is the pacer pricing source/feedback idle as serialization when a small replay is acknowledged.",
+    "Absolute synthetic TCP sequence numbers, client IDs, addresses and wall-clock service-epoch values are omitted from the archive. Raw logs, binaries and overlay sources remain under /tmp."
+  ]
+}

@@ -28,6 +28,8 @@ depend on a host being idle or on a race happening by chance.
 | An established 64 KiB sender could not discover a later 1→10 Mb/s increase | [committed-b5-settled-capacity.txt](../controlled-epoch-final/failure-before/committed-b5-settled-capacity.txt) | `TestWindowPathServiceSettledLargeMessageCapacityChanges`, preserving the original settling allowance and throughput gate |
 | A proposed deadline clear discarded a successfully drained pause | [intermediate-late-dispatch.txt](../controlled-epoch-final/failure-before/intermediate-late-dispatch.txt) | `TestWindowPacingLateDispatchKeepsSuccessfulDrainEpoch` |
 | A proposed head-cancellation clear discarded its successor's inherited pause | [intermediate-canceled-head.txt](../controlled-epoch-final/failure-before/intermediate-canceled-head.txt) | `TestWindowPacingCanceledHeadTransfersControlledDrain`, with a third sequence owning the outstanding tail |
+| RTT-driven bucket resizing erased the checkpoints proving a faster service | [committed-6a-rtt-pair.txt](../rtt-resize-evidence/failure-before/committed-6a-rtt-pair.txt) and [committed-6a-capacity-recovery.txt](../rtt-resize-evidence/failure-before/committed-6a-capacity-recovery.txt) | `TestWindowPacingShorterRoundTripKeepsFasterServiceEvidence` and `TestWindowPathServiceCapacityIncreaseRecovery` |
+| A proposed rebucketing correction created overlapping sums for a reordered ACK | [intermediate-reordering.txt](../rtt-resize-evidence/failure-before/intermediate-reordering.txt) | `TestWindowPacingResizedSamplesKeepFirstBytesAndReordering`, with growth, retention and epoch controls alongside it |
 
 The surrounding tests cover canceled/reused waiters, missing and selective tail
 ACKs, carrier changes, bounded drain deadlines, duration overflow, startup probe
@@ -44,3 +46,10 @@ tools/throughput-fix-2.sh correctness /tmp/window-correctness
 The paired performance model is a separate gate. A reproduction passing does
 not excuse a failing performance cell; all measured comparisons and exclusions
 belong in that run's ledger.
+
+The separate [inner-TCP replay diagnostic](../host-feedback-controlled-epoch/replay-root.json)
+is **unfixed**. Its synthetic [test source](../host-feedback-controlled-epoch/replay-root-test.go.txt)
+and three identical failed outcomes are retained outside the normal Go test
+selection until a production correction passes it. A small replay across
+application idle replaces the service estimate and delays the next bulk write;
+this is distinct from the completed bucket-resize correction above.

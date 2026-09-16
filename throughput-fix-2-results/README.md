@@ -72,6 +72,28 @@ archive records the natural-drain correction, its deterministic failures and
 nine passing focused model pairs. Its adaptation diagnostics remain separate
 from settled-throughput acceptance. `correctness-burst-ring-final-controlled-epoch`
 passes all 156 tests under the race detector on source `f60cf11d`.
+The same source's `model-burst-ring-final-controlled-epoch` archive now retains
+21 passing tests, 272 paired cases and all 508 ledger rows. These runs started
+immediately under recorded concurrent host work.
+
+`correctness-burst-ring-rtt-resize` passes 160 race-enabled tests on source
+`56eec7b1`, after preserving delivery checkpoints across bucket-duration changes.
+The preceding full model does not validate this later source.
+`rtt-resize-evidence` retains the direct and intermediate failures, 93 focused
+race passes, 23 passing model pairs and the complete recovery comparison rows.
+
+`host-feedback-controlled-epoch` retains eight induced host readings and a
+three-run deterministic failure through the real inner-TCP replay worker.
+This root is explicitly unfixed. Its synthetic test source has a `.go.txt`
+extension so the diagnostic is reviewable without entering the normal passing
+suite. These single-arm diagnostics are not A/A-bracketed acceptance comparisons;
+their controls, scheduling limits and failed outcomes remain visible.
+
+`sdk-settings-current` records eight constructor profiles through the sibling
+SDK's real sizing helpers. Its manifests pin SDK `7fe75c69` and connect source
+`5f28f158`; the capture includes a newer recovery test and is not represented as
+the `f60cf11d` model source. It verifies resolved settings on the host, including
+selected mobile policy, without making a mobile-runtime performance claim.
 
 Only numerical ledgers, manifests, provenance and outcome excerpts are part of
 the committed evidence. Raw logs and test binaries remain local. The collector

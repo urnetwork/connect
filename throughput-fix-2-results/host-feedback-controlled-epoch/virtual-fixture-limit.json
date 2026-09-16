@@ -1,0 +1,8 @@
+{
+  "Status": "diagnostic fixture attempt timed out; not a product correctness result",
+  "RawLog": "/tmp/throughput-fix-2-host-feedback-6a212aee/virtual-combined.log",
+  "RawLogSha256": "f0635005e22af8e01445fab0ea4f043440f0441b57a13ff31c09725c046088e8",
+  "TimeoutSeconds": 90,
+  "CauseObservedInDump": "gVisor tcp.processor workers use sleep.Sleeper/sync.Gopark; the dump shows these workers in non-durable blocked states inside the synctest bubble, preventing virtual time from advancing. No model throughput reading was produced.",
+  "NextStepTaken": "Used the real NAT replay worker directly with the pacing boundary and explicit channel ordering; see replay-root.json."
+}

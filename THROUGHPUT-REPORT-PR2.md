@@ -11,14 +11,18 @@ The original full-suite results do not validate those later production edits.
 
 ## Current follow-up
 
-The latest correction distinguishes naturally empty flights from deliberate
-pacing pauses. It passes **156 tests under the race detector** and nine focused
-performance pairs on source SHA-256
+The controlled-drain correction distinguishes naturally empty flights from
+deliberate pacing pauses. It passes **156 tests under the race detector** and
+the full deterministic model: **21 tests, 272 paired cases and 508 ledger rows**
+on source SHA-256
 `f60cf11db4f0c7a928144ad78d1b9cebe96bbf8916fa620d1b58d01598fc613a`.
 The settled 64 KiB capacity-increase failure improves from 1.094 to 10.000 Mb/s.
-Full matrix confirmation on this source, convergence speed and host performance
-acceptance remain open. The completed broader checkpoint below tested the
-preceding source.
+A further recovery test found that changing the statistics bucket duration
+erased valid delivery evidence. The correction below preserves that evidence;
+it passes **160 race-enabled correctness tests and 23 targeted performance
+comparisons** on source `56eec7b1968bac2214224b2d7975f849d0fe6efef53cd9322eb11a01b31bc6ef`.
+That validation is separate from the completed controlled-drain matrix.
+Host performance acceptance remains open.
 
 The burst-ring follow-up adds deterministic failure-before tests for sparse
 ACK timing, FIFO fairness, continuous-flight RTT changes, the production
@@ -468,8 +472,9 @@ new settled pairs, four original large-message change pairs and exact
 previously failing settled 64 KiB increase reaches **10.000 Mb/s**, with every
 flow at 1.250 Mb/s, against the 10.000 Mb/s reference. The long-feedback case
 retains 95.846 Mb/s against 95.846 Mb/s. Full correctness passes all **156 tests
-under the race detector** on this source; the earlier full model and root runs remain attributed to
-`b5b40736`, not this later correction.
+under the race detector** on this source. Its full deterministic model has now
+completed: **21 tests, 272 paired cases and 508 ledger rows**, all passing.
+The earlier root regression and host runs remain attributed to `b5b40736`.
 
 Recovery speed remains a separate open measurement. In the retained diagnostic
 covering 10–13.3554432 s after the increase, the pre-service-epoch control reaches
@@ -479,6 +484,66 @@ The latter's complete one-second intervals are 4.194304, 7.864320 and
 change; that does not establish sustained 90% goodput at that time. The final
 settled test begins 34.05432 s after the change. Its pass closes the permanently
 held-rate failure while leaving convergence speed for a dedicated comparison.
+
+### Preserve delivery checkpoints when bucket durations change
+
+The new transition test retains twenty complete one-second intervals after a
+settled 1→10 Mb/s increase. Before this correction, the candidate averages
+7.733248 Mb/s during seconds 10–14, below 90% of its 9.961472 Mb/s reference.
+Three consecutive intervals above the gate complete at 16 s. This exposes a
+recovery defect that the later steady-state measurement cannot detect.
+
+At 40.663548673 s in the diagnostic trace, a shorter RTT changes the bucket
+duration from 10.243742 ms to 10 ms. Clearing the ring erases the preceding
+delivery checkpoint just as a faster ACK arrives. The old 125,000 B/s hold
+therefore survives despite new evidence of the increased capacity.
+
+The correction places retained aggregates into the new 64-slot ring using
+their actual arrival timestamps. Collisions preserve the first checkpoint's
+bytes exactly once. When shrinking makes an old aggregate span several new
+buckets, reordered arrivals join that aggregate instead of creating overlapping
+sums. Expired samples and aggregates crossing a confirmed service epoch stay
+excluded. The zero-order hold remains available when no new evidence exists.
+
+The direct regression changes RTT between two delivery checkpoints and requires
+the estimate to rise from 125,000 to 1,250,000 B/s. Adjacent tests cover shrinking
+and growing buckets, merged first-arrival bytes, reordered ACKs, retention
+expiry and epoch cutoffs. The transition candidate now averages 10.092544 Mb/s
+over seconds 10–14 against the same 9.961472 Mb/s reference; packet boundaries
+allow short intervals to exceed the nominal rate. Three consecutive accepted
+intervals complete at 13 s. The earlier pre-service-epoch control recovered at
+4 s, so this pass does not establish equal recovery speed.
+
+Final validation uses source SHA-256
+`56eec7b1968bac2214224b2d7975f849d0fe6efef53cd9322eb11a01b31bc6ef`.
+All **160 correctness tests pass under the race detector**, including 93 focused
+pacing/statistics tests. Seven targeted model tests pass all **23 comparisons**:
+original and settled large-message changes, the recovery ramp, long compressed
+feedback, capacity changes, shared service and RTT changes. Their 46 readings
+remain complete. In the original 10–13.3554432 s diagnostic, the corrected
+candidate reaches 10.000 Mb/s against its 10.000 Mb/s reference. The long-feedback
+control retains 95.857 Mb/s against 95.846 Mb/s. These runs started immediately
+under concurrent host work; full model and host confirmation of this source
+remain open.
+
+### Separate host feedback-idle failure
+
+An induced 80 ms pause in inner TCP ACK production reproduces a sustained
+host slowdown on the controlled-drain implementation. Delivery sizing with
+the pause reaches 216.65 Mb/s; adding a 1.3 ms window-RTT override reaches
+188.51 Mb/s. RTT-only and constant-window controls reach 936.01 and
+934.66 Mb/s. These are diagnostic perturbations, separate from the historical
+paired acceptance runs.
+
+The detailed trace shows a small NAT replay replacing a prior 1.87 MB/s service
+estimate with 3,722 B/s across application idle. Inner ACKs then reopen 717,904
+bytes of receive space, but the next 70,646-byte Transfer write waits about
+17 s. A deterministic test using the real `TcpSequence.runReturnRecovery`
+worker reproduces the same mechanism three times: a 1,100-byte replay replaces
+125 MB/s with 3,536 B/s and delays the next 70 KiB write by 18.430482186 s.
+The test and failed outcomes are retained as diagnostic evidence; the production
+correction and normal regression test remain open. This cause is distinct from
+bucket resizing and does not yet attribute all earlier host failures.
 
 ### Deterministic tests for the new failure cases
 
@@ -499,6 +564,8 @@ held-rate failure while leaving convergence speed for a dedicated comparison.
 | An earlier drain could affect a later unrelated probe | `TestWindowPacingAbandonedDrainCannotResetLaterService` covers timeout, retry, carrier change and cancellation; the existing hold test also checks one-shot consumption. |
 | A proposed deadline clear discarded a successful drain after a late wake | `TestWindowPacingLateDispatchKeepsSuccessfulDrainEpoch` ACKs the tail within the pause, then explicitly calls admission beyond its deadline. |
 | A proposed cancellation clear discarded the successor's inherited pause | `TestWindowPacingCanceledHeadTransfersControlledDrain` forces two queued writers and a third sequence's tail, cancels the head, and completes the successor's real pacing handoff. |
+| A changed bucket duration discarded the ACK pair proving faster service | `TestWindowPacingShorterRoundTripKeepsFasterServiceEvidence` changes RTT between exact delivery checkpoints and checks the new rate and subsequent hold. |
+| Rebucketed aggregates could overlap, double-count first bytes or retain an old epoch | `TestWindowPacingResizedSamplesKeepFirstBytesAndReordering`, `TestWindowPacingResizedSamplesExpireRetainedTime` and `TestWindowPacingResizedSamplesRespectServiceEpoch` force those boundaries. |
 
 Each case has a recorded failure-before run. The byte meter preserves actual
 spent bytes separately from credit withheld by an estimate increase. It also
@@ -622,6 +689,25 @@ external work.
 
 ## Reproduction and artifacts
 
+The SDK settings probe captures eight profiles through the sibling SDK's actual
+constructors and sizing helpers: unbudgeted and 384 MiB connect defaults, plus
+desktop/mobile device and provider defaults with providing enabled or disabled.
+Desktop defaults use a 20 MiB device target; the selected mobile profile uses
+a 24 MiB target and 32 MiB process budget. Resolved send, receive and Pack pools,
+queue limits and receive accounting are retained in `sdk-settings-current`.
+This is constructor coverage on the host, not a mobile-runtime performance run.
+Performance cells using those resolved profiles remain to be added.
+
+```sh
+python3 tools/throughput-fix-2-sdk-settings.py ../sdk /tmp/window-sdk-settings
+```
+
+The capture pins SDK revision `7fe75c6983dcea213a6f58d9cb0e9220be8b6534` and
+connect source `5f28f1587548882900d65383a1ec176f5346df688c266366dcdf37d76e645c91`.
+The latter includes the added recovery test and is distinct from the earlier
+`f60cf11d` model source. Both checkouts were stable during the capture build;
+the overlay leaves SDK files unchanged.
+
 The runner records source and binary hashes, revisions, Go/OS/CPU, selected
 environment, complete logs, status and JSONL ledgers:
 
@@ -640,6 +726,14 @@ Final collected evidence is under [throughput-fix-2-results](throughput-fix-2-re
 
 - `correctness-burst-ring-final-controlled-epoch` — 156 passing race-enabled
   correctness tests on the controlled-drain source;
+- `model-burst-ring-final-controlled-epoch` — its full passing 272-pair model;
+- `correctness-burst-ring-rtt-resize` — 160 passing race-enabled tests after
+  preserving delivery checkpoints across bucket-duration changes;
+- `rtt-resize-evidence` — direct and intermediate failures, 23 passing model
+  comparisons and the separate recovery diagnostics;
+- `host-feedback-controlled-epoch` — induced host diagnostics and an unfixed
+  deterministic inner-TCP replay reproduction;
+- `sdk-settings-current` — eight pinned, sanitized constructor profiles;
 - `controlled-epoch-final` — focused passes, natural-drain and intermediate
   correction failures, settled-capacity ledgers and separate recovery diagnostics;
 - `*-burst-ring-final-service-epoch` — the preceding source's complete
@@ -659,17 +753,19 @@ ledger is in [THROUGHPUT-PR2-RESULTS.md](THROUGHPUT-PR2-RESULTS.md).
 
 ## Remaining work
 
-1. Confirm the full matrix on the controlled-drain source and measure capacity
-   recovery speed as well as settled throughput. Keep each correction separate
-   from the source tested by an earlier binary.
-2. Resolve slow host cells against the explicit comparison gate. Keep
+1. Confirm the full matrix after the bucket-resize correction and investigate
+   the remaining recovery-time difference. The controlled-drain matrix is
+   complete; each later correction still needs its own source-pinned validation.
+2. Fix replay sampling across application idle, add its normal deterministic
+   regression, and resolve slow host cells against the explicit comparison gate. Keep
    instrumentation limits, shared host load and candidate performance effects
    independently testable; retain failed and excluded comparisons.
 3. The database-backed `server/connect` and `server/proxy` integration tiers
    are deferred by the user for a later environment-correct run through
    `server/test.sh`. Local credential repair is outside this run.
-4. Longer actual-relay pressure, shard-collision, bidirectional and multiple-peer
-   campaigns remain necessary before a deployment-wide claim. Continue with
+4. Resolved SDK-budget performance cells, longer actual-relay pressure,
+   shard-collision, bidirectional and multiple-peer campaigns remain necessary
+   before a deployment-wide claim. Continue with
    our own published fixtures as requested; obtaining the reporter's missing
    native rig is not a prerequisite for this work. Its missing traces still
    limit attribution of the reporter's specific failures.

@@ -1024,5 +1024,82 @@ controlled-only correction versus 9.53125 Mb/s before service epochs. Reaching
 the full service estimate at 11.41 s does not prove full goodput then; a separate
 convergence comparison must retain the lower interval readings.
 
+## 19. Retain delivery evidence across bucket-duration changes
+
+The dedicated transition test now records twenty full one-second intervals
+after the settled 1→10 Mb/s change. It compares seconds 10–14 against the
+constant-window reference and reports completion of three consecutive intervals
+above 90% of that reference. The controlled-drain source fails the fixed gate:
+7.733248 versus 9.961472 Mb/s, with recovery reported at 16 s.
+
+The root is a bookkeeping reset. When faster ACKs reduce RTT, the service ring's
+bucket duration can change; clearing the ring then erases the adjacent delivery
+checkpoints needed to replace the old held rate. Rebucket retained aggregates
+by their real arrival timestamps while preserving the 64-slot bound and the
+zero-order hold. Merge first-arrival bytes once, route reordered observations
+into an existing aggregate's real span, and exclude expired or mixed-epoch
+evidence. Shrinking and growing the interval need separate boundary controls.
+
+The direct faster-pair test fails before the correction. Adjacent review also
+reproduced rate inflation in the initial rebucketing attempt: an old aggregate
+spanned two new buckets, and a late ACK created overlapping sums. The corrected
+tests cover first-byte collisions, reordering, retention and epoch cutoffs.
+The fixed transition averages 10.092544 Mb/s against 9.961472 Mb/s; reported
+recovery improves to 13 s. The pre-service-epoch control reports 4 s, so the
+remaining adaptation difference stays open. Do not change the gate or substitute
+the later steady-state measurement for this recovery evidence.
+
+Final rebucketing source `56eec7b1968bac2214224b2d7975f849d0fe6efef53cd9322eb11a01b31bc6ef`
+passes all 160 race-enabled correctness tests and 23 targeted performance pairs
+across seven tests. The exact earlier 10–13.3554432 s diagnostic now reaches
+10.000 Mb/s, and the 400 ms/50 ms control retains 95.857 Mb/s against 95.846 Mb/s.
+Keep the direct pre-fix failure and intermediate overlapping-aggregate failure
+separate from the final results.
+
+The preceding controlled-drain source `f60cf11d` has also completed its full
+model run: 21 passing tests, 272 paired cases and 508 retained ledger rows.
+That result does not validate the later rebucketing source.
+
+## 20. Pin resolved SDK settings before adding budget cells
+
+The existing 48 MiB performance fixture does not exercise actual SDK constructor
+budgets. `tools/throughput-fix-2-sdk-settings.py` captures the real constructors
+and sizing helpers through an overlay without creating network clients or
+changing the sibling SDK checkout. Eight profiles cover connect's zero/384 MiB
+process budgets and desktop/mobile device/provider defaults with providing on
+or off. Nil pools remain distinct from non-nil zero budgets.
+
+The captured desktop device target is 20 MiB. The selected mobile profile uses
+a 24 MiB device target with a 32 MiB process budget, smaller queue bounds and
+retained receive accounting. The archive pins SDK revision `7fe75c69` and
+connect source `5f28f158`; this is host-selected policy observation, not evidence
+from a mobile runtime or application override.
+
+Next add bidirectional cells using the resolved profiles, including mixed peers,
+provider mode and shared pool pressure. Compare each against its attainable
+constant-window reference under the same explicit limits. Do not interpret
+a configured receive ceiling as a pacing defect or claim constructor capture
+supplies the missing performance evidence.
+
+## 21. Separate inner-TCP replay from sustained service evidence
+
+An 80 ms inner-ACK producer pause induces a host collapse on the controlled-drain
+source even without the diagnostic RTT override. Detailed tracing shows that
+a small NAT replay crosses application idle and replaces the useful service
+estimate; the reopened inner TCP window then waits behind a long pacing debt.
+The bucket duration remains 10 ms, separating this cause from section 19.
+
+An overlay regression using the real `TcpSequence.runReturnRecovery` worker
+reproduces the boundary three times under virtual time. A 1,100-byte replay
+reduces a 125 MB/s service estimate to 3,536 B/s; after inner ACK progress
+reopens the sender, its next 70 KiB write waits 18.430482186 s. Preserve this
+failure-before test as diagnostic source until a production correction passes
+it. The correction must distinguish application-limited gaps from valid sparse
+serialization and preserve zero-order hold and slower fresh evidence.
+
+After the deterministic fix, rerun affected host comparisons with their controls
+under the current load. These induced diagnostics do not identify every earlier
+paired host failure, and a favorable rerun cannot erase those failed outcomes.
+
 [pr213]: https://github.com/urnetwork/connect/pull/213
 [rig]: https://github.com/Ryanmello07/connect/blob/b54f9f72bec116c0986e6c51ed13cc2f01805bee/THROUGHPUT-RIG-REVIEW.md

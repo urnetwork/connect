@@ -1,0 +1,95 @@
+package connect
+
+import (
+	"context"
+	"net"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	"github.com/urnetwork/connect/protocol"
+)
+
+// Inner TCP recovery can emit one small packet while its application is
+// waiting for feedback. That isolated reply must not price the preceding
+// source idle as serialization and delay the resumed bulk write for seconds.
+func TestTcpReturnReplayPreservesPacingServiceAcrossFeedbackIdle(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		service := &windowPacingService{}
+		sequenceId, tail := NewId(), NewId()
+		pacer := &windowBurstPacer{service: service, serviceSequenceId: sequenceId, rate: 125000000, estimateRate: 125000000}
+		defer pacer.close()
+		replayed := make(chan int, 1)
+		settings := DefaultTcpBufferSettingsWithBufferSize(16)
+		settings.Log = NewNoopLogger()
+		settings.ReturnResendTimeout = time.Second
+		sequence := NewTcpSequence(ctx, func(_ TransferPath, _ protocol.ProvideMode, _ *IpPath, packet []byte) {
+			messageId := NewId()
+			if err := pacer.waitForServiceMessage(ctx, len(packet), false, sequenceId, messageId, 2); err != nil {
+				t.Errorf("replay pacing: %v", err)
+				return
+			}
+			service.finishWrite(sequenceId, messageId, true)
+			time.Sleep(time.Millisecond)
+			service.acknowledgeWrite(sequenceId, messageId, 2, false, 10*time.Millisecond, time.Now())
+			service.observe(ByteCount(len(packet)), time.Now())
+			replayed <- len(packet)
+		}, SourceId(NewId()), protocol.ProvideMode_Network, 4,
+			net.IPv4(192, 0, 2, 2).To4(), 41000, net.IPv4(198, 51, 100, 2).To4(), 443, 100, settings)
+		sequence.receiveSeq, sequence.receiveSeqAck = 1161, 101
+		sequence.receiveWindowSize = 1060
+		if !sequence.retainReturnChunk(make([]byte, 1060), 101, false) {
+			t.Fatal("return cache did not retain the unacknowledged inner segment")
+		}
+		defer sequence.releaseReturnChunks()
+		done := make(chan struct{})
+		go func() { defer close(done); sequence.runReturnRecovery() }()
+		defer func() { cancel(); <-done }()
+
+		// The inner ACK clock predates the last ordinary Transfer delivery.
+		// This leaves the recovery ACK inside the bounded measurement ring.
+		time.Sleep(680 * time.Millisecond)
+		service.observeRoundTrip(time.Millisecond, 10*time.Millisecond, time.Now())
+		service.beginWrite(sequenceId, tail, 1, time.Now(), false)
+		service.finishWrite(sequenceId, tail, true)
+		service.observe(1250000, time.Now())
+		time.Sleep(10 * time.Millisecond)
+		service.acknowledgeWrite(sequenceId, tail, 1, false, 10*time.Millisecond, time.Now())
+		service.observe(1250000, time.Now())
+		service.sent = service.total
+		if rate, _, _ := service.measured(time.Second, time.Now()); rate != 125000000 {
+			t.Fatalf("ordinary train did not establish its service: %d", rate)
+		}
+		if service.pendingWrites != 0 || service.pacingReservations != 0 {
+			t.Fatal("the ordinary source did not enter a feedback idle")
+		}
+		if count := <-replayed; count != 1100 {
+			t.Fatalf("unexpected replay packet: %d", count)
+		}
+		// Only after the replay crossed Transfer does the delayed inner ACK
+		// reopen the NAT window. No missing inner bytes remain to recover.
+		sequence.mutex.Lock()
+		changed := sequence.applySendAckWithLock(&parsedTcp{ack: true, ackNumber: 1161, windowSize: 4096})
+		available := int64(sequence.receiveWindowSize) - int64(sequence.receiveSeq-sequence.receiveSeqAck)
+		sequence.mutex.Unlock()
+		if !changed || available <= 0 {
+			t.Fatalf("the inner ACK did not reopen receive space: %d", available)
+		}
+		cancel()
+		<-done
+		rate, _, latest := service.measured(time.Second, time.Now())
+		estimate := SendWindowEstimate{ServiceByteRate: max(rate, latest), ServiceEstablished: true}
+		pacer.estimateRate = estimate.ServiceByteRate
+		pacer.rate = windowPacingRate(estimate, 125000000)
+		before := time.Now()
+		if err := pacer.waitForServiceMessage(context.Background(), 70*1024, false, sequenceId, NewId(), 3); err != nil {
+			t.Fatal(err)
+		}
+		if delay := time.Since(before); delay > 50*time.Millisecond {
+			t.Fatalf("a healthy inner replay priced feedback idle as service: service=%d replay=1100 bulk-wait=%s", estimate.ServiceByteRate, delay)
+		}
+	})
+}
