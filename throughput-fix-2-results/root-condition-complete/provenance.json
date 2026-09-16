@@ -1,0 +1,20 @@
+{
+  "base_commit": "17780670614df6519097049642812aceb7a377f6",
+  "method": "Race-enabled frozen build, exact timestamp sequences and virtual worker schedules, three repetitions; every failure is an ordinary failed assertion.",
+  "run_context": "Ordinary local host load; no system quiescence wait.",
+  "scope": "Exact committed source plus seven test files, including the previously uncommitted physical-drain liveness roots; excludes the working drain correction and every experimental receiver-service sampler.",
+  "selection": {
+    "base_commit": "17780670614df6519097049642812aceb7a377f6",
+    "new_tests": [
+      "transfer_window_compressed_flights_test.go",
+      "transfer_window_initial_lifetime_test.go",
+      "transfer_window_pacing_carrier_buffer_test.go",
+      "transfer_window_pacing_worker_lifetime_test.go",
+      "transfer_window_service_failure_cells_test.go",
+      "transfer_window_successful_drain_feedback_test.go",
+      "transfer_window_pacing_unprovable_drain_test.go"
+    ],
+    "pattern": "^(TestWindowPacingCompressedFlightsKeepMeasuredSerialization|TestWindowPacingInitialWriteKeepsOriginalAckLifetime|TestWindowPacingInitialRecoveryPrecedesLongerAckLifetime|TestWindowPacingInitialWaitCannotOutliveAckLifetime|TestWindowPacingInitialWaitRetainsNonRegenerableBytes|TestWindowPacingCarrierBufferedReadsDoNotInflateServiceBurst|TestWindowPacingCarrierUnqueuedTrainPreservesCapacity|TestWindowPacingCarrierFasterTrainRaisesMeasuredCapacity|TestWindowPacingCarrierBufferedReadsAcrossSamplerBuckets|TestWindowPacingLifetimeWorkerExpiresBehindFifoHead|TestWindowPacingLifetimeWorkerExpiresInsideControlledDrain|TestWindowPacingLifetimeWorkerRejectsLateTimerRelease|TestWindowPacingLifetimeWorkerPreservesCancellation|TestWindowPacingLifetimeBoundsRetryWait|TestWindowPacingLifetimeWaitPreservesOlderRecordDeadline|TestWindowPacingShortCompressedServiceKeepsMeasuredCapacity|TestWindowPacingSuccessfulDrainPartialReadKeepsService|TestWindowPacingSuccessfulDrainWithoutPartialReadControl|TestWindowPacingSuccessfulDrainPartialStatsReadControl|TestWindowPacingSuccessfulDrainLegacyPartialReadKeepsService|TestWindowPacingSuccessfulDrainLegacyWithoutPartialReadControl|TestWindowPacingSuccessfulDrainLegacyPartialStatsReadControl|TestWindowPacingRetriedTailCannotStartDrain|TestWindowPacingRetriedTailWakesDrain|TestWindowPacingInvalidatedTailCannotStartDrain|TestWindowPacingInvalidatedTailWakesDrain|TestWindowPacingUnconfirmedCarrierCannotStartDrain|TestWindowPacingUnconfirmedCarrierWakesDrain|TestWindowPacingCanceledTailCannotStartDrain|TestWindowPacingCanceledTailWakesDrain|TestWindowPacingFreshTailRestoresDrainedProbe|TestWindowPacingAbortedDrainPreservesUnrelatedProbe|TestWindowPacingRepeatedTailInvalidationAllowsFreshDrain)$",
+    "test_count": 33
+  }
+}

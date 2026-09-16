@@ -1,0 +1,12 @@
+{
+  "archive": "root-condition-complete",
+  "payload_sha256": {
+    "assertions-and-controls.jsonl": "e29c7ab8ff28e1ad7a7815d2e72e45197e9bdd213015a94d1480ff1bc610ba1e",
+    "ledger.jsonl": "4c4c07e6e6cd04d696b27f6ef66c3f85306b1246037fab3b46456ba1af12fa9d",
+    "outcomes.jsonl": "e9ed83040ee0c57f40934cfb0ae6e6137b84b004ed989d4923b0d997102ffff0",
+    "provenance.json": "57bc299e39f72f423d2b3b4af40915111565502fdd318f0a15d8850f5f964b7c",
+    "source-pins.json": "f11aad0c3a838bc4abd2525db23f2cefd50a2b9071a26b8fefe9a99eb2752f14",
+    "status.json": "f71808910e0cccd7d0d9eaa1d744274461990b0d02007f356478bfd966418a0a",
+    "worker-readings.jsonl": "71da909c57a459a562b6d487b62a93ad93dd4e84458706f85c17a81513eab52f"
+  }
+}

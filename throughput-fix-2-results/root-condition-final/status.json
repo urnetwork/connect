@@ -1,0 +1,6 @@
+{
+  "classification": "Known unresolved production regressions: 22 tests repeated three times, not a clean correctness result.",
+  "outcomes": 66,
+  "readings": 12,
+  "worker_readings": 21
+}

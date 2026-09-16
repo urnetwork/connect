@@ -1,0 +1,9 @@
+{
+  "outcomes": {
+    "FAIL": 78,
+    "PASS": 354
+  },
+  "worker_readings": 120,
+  "classification": "Failure-before and rejected experimental variants; no production fix or wire acceptance",
+  "setup_exclusion": "The first replay export failed compilation due to a duplicated fixture definition. It is not a production failure or test outcome."
+}

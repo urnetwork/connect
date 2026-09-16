@@ -1,0 +1,338 @@
+--- a/transfer.go
++++ b/transfer.go
+@@ -4173,7 +4173,9 @@
+ 		}
+ 
+ 		// Capture local ingress before decode, application handoff, and ACK compression.
+-		receivedAtNanos := self.feedbackTimeNanos(time.Now())
++		ingressAt := time.Now()
++		receivedAtNanos := self.feedbackTimeNanos(ingressAt)
++		ingressOuterBytes := ByteCount(len(transferFrameBytes))
+ 
+ 		// at this point, the route is expected to have already parsed the transfer frame
+ 		// and applied basic validation and source/destination checks
+@@ -4511,6 +4513,7 @@
+ 						}
+ 					}
+ 				}
++				recordIngressCounterDiagnostic(self.clientId, source.SourceId, pack, receiveRole, receiveCompanion, transportType, ingressOuterBytes, ingressAt)
+ 				messageByteCount := MessageByteCount(pack.Frames)
+ 				decodedOwner := decodedFrame.detachPackOwner()
+ 				c := func() bool {
+@@ -7175,6 +7178,7 @@
+ 			at = time.Unix(0, ack.receivedAtNanos)
+ 		}
+ 		service.acknowledgeWrite(self.sequenceId, ack.messageId, sequenceNumber, ack.selective, self.ackCompressionResidence(), at)
++		observeIngressCounterDiagnostic(self, ack)
+ 		self.publishAckServiceCredit(ack.messageId, ack.selective, at)
+ 	}
+ 	ackWindow.Update(sequenceAck)
+@@ -8875,6 +8879,7 @@
+ 		// flight-limited. That exposes a newly active flow to the fair scheduler;
+ 		// a carrier with a reserve may send it immediately, while an isolation-only
+ 		// carrier gives it the next ordinary acknowledgement opening.
++		recordIngressOfferWaitStart(self, time.Now(), !resendCapacity || flightBlocked, scheduler.Len())
+ 		idleTimer.Reset(timeout)
+ 		select {
+ 		case <-self.ctx.Done():
+@@ -8908,6 +8913,7 @@
+ 				}
+ 			}
+ 		}
++		recordIngressOfferWaitEnd(self, time.Now())
+ 		if !flightWaitStart.IsZero() {
+ 			self.client.observeUnreliableFlightWait(time.Since(flightWaitStart))
+ 		}
+@@ -11014,6 +11020,9 @@
+ 	// reads twice that and the cap does not bind, while a path carrying less
+ 	// comes down on its own evidence. The protection against oversizing is
+ 	// intact and it only ever acts downward.
++	if service := self.windowPacer.service; service != nil && self.transferFlightPolicy().h1Only {
++		stepAtNanos = max(stepAtNanos, service.windowDeliveryStep())
++	}
+ 	if spanStartNanos < stepAtNanos {
+ 		estimate.Reason = "delivery measured before the window stepped"
+ 		return estimate
+--- a/transfer_window_pacing.go
++++ b/transfer_window_pacing.go
+@@ -348,40 +348,42 @@
+ 	// Fixed summaries survive ACK gaps longer than the timestamp ring.
+ 	// An incomplete cycle holds service; actual timestamps or fully applied
+ 	// proved delivery complete it, independently of the old byte rate.
+-	feedbackAt           time.Time
+-	feedbackCycleBefore  time.Time
+-	feedbackCycle        windowServiceSample
+-	feedbackComplete     windowServiceSample
+-	feedbackFresh        windowServiceSample
+-	feedbackPending      bool
+-	feedbackInterval     time.Duration
+-	feedbackDrainAt      time.Time
+-	feedbackDrainPending ByteCount
+-	total                ByteCount
+-	sent                 ByteCount
+-	reservedByteCount    ByteCount
+-	pacingReservations   int
+-	maxMessageByteCount  ByteCount
+-	minRoundTrip         time.Duration
+-	latestRoundTrip      time.Duration
+-	compression          time.Duration
+-	lastRoundTrip        time.Time
+-	roundTripStats       windowBurstStats
+-	receiverRoundTrips   *windowReceiverRoundTrips
+-	drainMaximumTime     time.Duration
+-	drainStartedAt       time.Time
+-	drainCheckAt         time.Time
+-	drainUntil           time.Time
+-	drainWake            chan struct{}
+-	drainServiceEpoch    bool
+-	sourceIdleAt         time.Time
+-	bucketInterval       time.Duration
+-	writes               map[Id]windowPacingWrite
+-	pendingWrites        int
+-	drained              bool
+-	drainedSent          ByteCount
+-	drainGeneration      uint64
+-	roundTripProbe       windowPacingRoundTripProbe
++	feedbackAt               time.Time
++	feedbackCycleBefore      time.Time
++	feedbackCycle            windowServiceSample
++	feedbackComplete         windowServiceSample
++	feedbackFresh            windowServiceSample
++	feedbackPending          bool
++	feedbackInterval         time.Duration
++	feedbackDrainAt          time.Time
++	feedbackDrainPending     ByteCount
++	total                    ByteCount
++	sent                     ByteCount
++	reservedByteCount        ByteCount
++	pacingReservations       int
++	maxMessageByteCount      ByteCount
++	minRoundTrip             time.Duration
++	windowDeliveryAfterNanos int64
++	latestRoundTrip          time.Duration
++	compression              time.Duration
++	lastRoundTrip            time.Time
++	roundTripStats           windowBurstStats
++	receiverRoundTrips       *windowReceiverRoundTrips
++	drainMaximumTime         time.Duration
++	drainStartedAt           time.Time
++	drainCheckAt             time.Time
++	drainUntil               time.Time
++	drainWake                chan struct{}
++	drainServiceEpoch        bool
++	sourceIdleAt             time.Time
++	bucketInterval           time.Duration
++	writes                   map[Id]windowPacingWrite
++	pendingWrites            int
++	unprovableWriteCount     int
++	drained                  bool
++	drainedSent              ByteCount
++	drainGeneration          uint64
++	roundTripProbe           windowPacingRoundTripProbe
+ }
+ 
+ // One tail per live sequence bounds tracking independently of window size.
+@@ -433,7 +435,7 @@
+ 				}
+ 			}
+ 		}
+-		self.writes[sequenceId] = write
++		self.storeWriteWithLock(sequenceId, write)
+ 		self.notifyDrainWithLock()
+ 	}
+ 	probe := &self.roundTripProbe
+@@ -457,6 +459,7 @@
+ // Enrollment shares the release lock in production. Confirmation still
+ // comes from the actual writer, including its chosen carrier and any failure.
+ func (self *windowPacingService) beginWriteWithLock(sequenceId, messageId Id, number uint64, at time.Time, resend bool) {
++	recordIngressOfferDiagnosticWithLock(self, sequenceId, messageId, at, resend)
+ 	// A resumed write clears drained, but cannot erase the old flight's
+ 	// unapplied bytes. Newer ACKs cannot spend that earlier byte credit.
+ 	if self.feedbackPending && self.drained {
+@@ -473,7 +476,10 @@
+ 	if !self.writes[sequenceId].pending {
+ 		self.pendingWrites++
+ 	}
+-	self.writes[sequenceId] = windowPacingWrite{messageId: messageId, unambiguous: !resend, pending: true, generation: self.drainGeneration}
++	self.storeWriteWithLock(sequenceId, windowPacingWrite{messageId: messageId, unambiguous: !resend, pending: true, generation: self.drainGeneration})
++	if resend {
++		self.abortDrainWithLock()
++	}
+ 	if unqueued {
+ 		self.roundTripProbe = windowPacingRoundTripProbe{sequenceId: sequenceId, messageId: messageId, number: number, sentAt: at, serviceRate: self.serviceHoldRate, resetService: self.drainServiceEpoch, pendingByteCount: max(0, self.drainedSent-self.total), observedRoundTrip: self.latestRoundTrip}
+ 	} else if resend && self.roundTripProbe.messageId == messageId {
+@@ -522,8 +528,11 @@
+ 	}
+ 	if write, ok := self.writes[sequenceId]; ok {
+ 		write.unambiguous = false
+-		self.writes[sequenceId] = write
++		self.storeWriteWithLock(sequenceId, write)
+ 		self.drained = false
++		if write.pending {
++			self.abortDrainWithLock()
++		}
+ 	}
+ }
+ 
+@@ -535,6 +544,9 @@
+ 	if write, ok := self.writes[sequenceId]; ok && write.messageId == messageId {
+ 		write.written = h1
+ 		write.unambiguous = write.unambiguous && h1
++		if !h1 && write.pending {
++			self.abortDrainWithLock()
++		}
+ 		if write.written && write.unambiguous && write.acked && write.pending {
+ 			write.pending = false
+ 			self.pendingWrites--
+@@ -546,7 +558,7 @@
+ 				}
+ 			}
+ 		}
+-		self.writes[sequenceId] = write
++		self.storeWriteWithLock(sequenceId, write)
+ 	}
+ 	self.notifyDrainWithLock()
+ 	if self.roundTripProbe.sequenceId == sequenceId && self.roundTripProbe.messageId == messageId {
+@@ -573,10 +585,19 @@
+ 			self.feedbackCycle, self.feedbackComplete, self.feedbackFresh = windowServiceSample{}, windowServiceSample{}, windowServiceSample{}
+ 			self.feedbackPending, self.feedbackDrainAt, self.feedbackDrainPending, self.feedbackInterval = false, time.Time{}, 0, 0
+ 		}
++		evidenceAt := probe.ackedAt
++		if self.lastRoundTrip.After(evidenceAt) {
++			evidenceAt = self.lastRoundTrip
++		}
++		previousPath := self.roundTripEvidenceWithLock(evidenceAt).minimum
+ 		if probe.receiverTimingSet {
+ 			self.receiverRoundTrips.confirmBaseline(probe.receiverTiming)
+ 		}
+ 		self.observeRoundTripWithLock(probe.ackedAt.Sub(probe.sentAt), probe.compression, probe.ackedAt, true)
++		if currentPath := self.roundTripEvidenceWithLock(evidenceAt).minimum; previousPath > 0 && currentPath > previousPath {
++			// Delivery from the old, smaller flight cannot qualify the new path.
++			self.windowDeliveryAfterNanos = max(self.windowDeliveryAfterNanos, probe.ackedAt.UnixNano())
++		}
+ 	}
+ }
+ 
+@@ -763,7 +784,7 @@
+ 				mean, count = float64(timing.latest), timing.count
+ 				threshold = float64(timing.minimum) + float64(max(2*time.Millisecond, timing.minimum/4))
+ 			}
+-			if count > 0 && mean > threshold {
++			if count > 0 && mean > threshold && self.canDrainWithLock() {
+ 				// Residence is only a reason to test for a changed path.
+ 				// The cumulative tail ACK still has to prove an empty relay.
+ 				self.drainStartedAt = now
+@@ -775,6 +796,7 @@
+ 			}
+ 		}
+ 		if now.Before(self.drainUntil) {
++			recordIngressControlledPauseWithLock(self, now)
+ 			return self.drainUntil.Sub(now), self.drainWake
+ 		}
+ 	}
+@@ -795,6 +817,40 @@
+ 	return delay, nil
+ }
+ 
++// Maintain the number of tails that cannot prove an empty relay. Repeated
++// invalidations do not add debt, and a fresh original tail replaces it.
++func (self *windowPacingService) storeWriteWithLock(sequenceId Id, write windowPacingWrite) {
++	previous := self.writes[sequenceId]
++	if previous.pending && (!previous.unambiguous || previous.generation != self.drainGeneration) {
++		self.unprovableWriteCount--
++	}
++	if write.pending && (!write.unambiguous || write.generation != self.drainGeneration) {
++		self.unprovableWriteCount++
++	}
++	self.writes[sequenceId] = write
++}
++
++// A copied or abandoned tail cannot supply the physical proof a pause needs.
++// An in-progress writer remains eligible because confirmation can still arrive.
++func (self *windowPacingService) canDrainWithLock() bool {
++	return self.unprovableWriteCount == 0
++}
++
++// Abandon an impossible measurement without treating logical delivery or
++// cancellation as a drained relay. An unrelated live RTT probe remains valid.
++func (self *windowPacingService) abortDrainWithLock() {
++	self.drainServiceEpoch = false
++	if !self.drainUntil.IsZero() {
++		self.drainUntil = time.Time{}
++		if self.drainWake != nil {
++			select {
++			case self.drainWake <- struct{}{}:
++			default:
++			}
++		}
++	}
++}
++
+ // Only one FIFO head waits for a drain, so one reusable buffered wakeup is
+ // enough. Cancellation cannot manufacture the drained flag required by a probe.
+ func (self *windowPacingService) notifyDrainWithLock() {
+@@ -818,6 +874,16 @@
+ }
+ 
+ // Service publication and the publishing sequence's ownership move together.
++// Explicit offer arguments remain available to older diagnostic roots.
++func (self *windowPacingService) observeOffered(bytes ByteCount, at, earliestOffer time.Time) {
++	self.observe(bytes, at)
++}
++
++// The actual ACK-arrival ownership method already holds the service lock.
++func (self *windowPacingService) observeOfferedWithLock(bytes ByteCount, at, earliestOffer time.Time) {
++	self.observeWithLock(bytes, at)
++}
++
+ func (self *windowPacingService) observeWithLock(bytes ByteCount, at time.Time) {
+ 	if bytes <= 0 {
+ 		return
+@@ -950,6 +1016,16 @@
+ 	self.stateLock.Lock()
+ 	defer self.stateLock.Unlock()
+ 	timing := self.roundTripEvidenceWithLock(now)
++	intervalForDiagnostic := max(deliverySizedWindowSampleInterval, self.bucketInterval)
++	if rate, latest, available := ingressCounterDiagnosticEstimate(self, min(horizon, max(4*intervalForDiagnostic, timing.residence+2*intervalForDiagnostic)), now); available {
++		if retain {
++			self.serviceHoldRate = max(rate, latest)
++			if self.roundTripProbe.resetService {
++				self.roundTripProbe.serviceRate = self.serviceHoldRate
++			}
++		}
++		return rate, self.total, latest
++	}
+ 	roundTripCompression := self.compression
+ 	if timing.count > 0 {
+ 		roundTripCompression = 0
+@@ -1307,6 +1383,8 @@
+ 				// Cancellation releases memory, not physical delivery. An
+ 				// older sibling ACK cannot certify the canceled tail drained.
+ 				self.service.drainGeneration++
++				self.service.unprovableWriteCount = self.service.pendingWrites
++				self.service.abortDrainWithLock()
+ 				self.service.drained = false
+ 				self.service.sourceIdleAt = time.Time{}
+ 			}
+@@ -1321,3 +1399,11 @@
+ 		self.service.stateLock.Unlock()
+ 	}
+ }
++
++// A physically proved path increase shares one bounded history boundary.
++// Statistics only read it; ordinary queued observations cannot advance it.
++func (self *windowPacingService) windowDeliveryStep() int64 {
++	self.stateLock.Lock()
++	defer self.stateLock.Unlock()
++	return self.windowDeliveryAfterNanos
++}
+--- a/transfer_window_path_performance_test.go
++++ b/transfer_window_path_performance_test.go
+@@ -421,6 +421,7 @@
+ // a measurement of H1 sockets, a native kernel TUN, or provider TCP.
+ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Duration) windowPathReading {
+ 	t.Helper()
++	defer startIngressCounterDiagnostic(t)()
+ 	if cell.Bidirectional && cell.Tcp {
+ 		t.Fatal("bidirectional fixture currently requires the raw Transfer workload")
+ 	}
